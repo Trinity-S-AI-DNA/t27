@@ -6,7 +6,7 @@
 **Node URL:** https://osf.io/tza56
 
 ## OAuth2 Token
-Token: `4hZA5K0iVwvJ1hN9fYqaFVJG375xsG94UTfVAKhm7ziWPRbbKccRhM1xl8Xj9nh2iK4RJ3`
+Token: `[REDACTED rotate+see t27 issue 16]`
 Status: ✅ Valid (API accepts token)
 
 ## API Status
