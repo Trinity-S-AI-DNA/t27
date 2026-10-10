@@ -685,6 +685,26 @@ fn run_phase_with_failures(
     Ok((pass, fail, failures))
 }
 
+/// #8829: a phase whose per-spec work is one read-only `t27c` subprocess runs suite_jobs() of them at once;
+/// results fold in file order, so the counts, FAIL lines and failure list are the sequential run's.
+fn run_phase_par(repo: &Path, label: &str, f: impl Fn(&Path, &str) -> anyhow::Result<()> + Sync, files: &[PathBuf]) -> anyhow::Result<(usize, usize, Vec<String>)> {
+    let asked = std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let jobs = crate::suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), asked) as usize;
+    let one = |file: &PathBuf| match rel_arg(repo, file) {
+        Err(e) => Err((file.display().to_string().replace('\\', "/"), format!("FAIL {}: {}", file.display(), e))),
+        Ok(rel) => f(repo, &rel).map_err(|e| (rel.clone(), format!("FAIL {} ({}): {}", label, rel, e))),
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut res: Vec<(usize, Result<(), (String, String)>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| { let mut v = Vec::new(); loop { let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if i >= files.len() { break v; } v.push((i, one(&files[i]))); } })).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("suite worker panicked")).collect()
+    });
+    res.sort_by_key(|r| r.0);
+    let (mut pass, mut fail, mut failures) = (0usize, 0usize, Vec::new());
+    for (_, r) in res { match r { Ok(()) => pass += 1, Err((name, msg)) => { eprintln!("{}", msg); fail += 1; failures.push(name); } } }
+    Ok((pass, fail, failures))
+}
+
 /// W633: a parse that REACHED EOF is not a parse that read everything.
 /// Top-level drop-recovery resyncs past an unrecognised declaration, so
 /// `parse` returns success on input it consumed and threw away -- measured at
@@ -1956,7 +1976,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     };
 
     println!("--- Phase 1: Parse ---");
-    let (p1p, p1f, p1fail) = run_phase_with_failures(&repo, "parse", cmd_parse, &specs_compiler)?;
+    let (p1p, p1f, p1fail) = run_phase_par(&repo, "parse", cmd_parse, &specs_compiler)?;
     println!("Parse: {} passed, {} failed", p1p, p1f);
     record("parse", p1fail, &mut ledger, &mut upstream_failed);
     push_phase("parse", p1p, p1f, 0);
@@ -2025,7 +2045,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
 
     println!("--- Phase 1b: Typecheck ---");
     let (p1bp, p1bf, p1bfail) =
-        run_phase_with_failures(&repo, "typecheck", cmd_typecheck, &specs_compiler)?;
+        run_phase_par(&repo, "typecheck", cmd_typecheck, &specs_compiler)?;
     println!("Typecheck: {} passed, {} failed", p1bp, p1bf);
     record("typecheck", p1bfail, &mut ledger, &mut upstream_failed);
     push_phase("typecheck", p1bp, p1bf, 0);
@@ -2049,7 +2069,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gf16_conformance", 1 - gf16_fail, gf16_fail, 0);
 
     println!("--- Phase 2: Gen Zig ---");
-    let (p2p, p2f, p2fail) = run_phase_with_failures(
+    let (p2p, p2f, p2fail) = run_phase_par(
         &repo,
         "gen-zig",
         |r, rel| cmd_gen(r, rel, "gen"),
@@ -2060,7 +2080,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gen-zig", p2p, p2f, 0);
 
     println!("--- Phase 2b: Gen Rust ---");
-    let (p2bp, p2bf, p2bfail) = run_phase_with_failures(
+    let (p2bp, p2bf, p2bfail) = run_phase_par(
         &repo,
         "gen-rust",
         |r, rel| cmd_gen(r, rel, "gen-rust"),
@@ -2071,7 +2091,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gen-rust", p2bp, p2bf, 0);
 
     println!("--- Phase 3: Gen Verilog ---");
-    let (p3p, p3f, p3fail) = run_phase_with_failures(
+    let (p3p, p3f, p3fail) = run_phase_par(
         &repo,
         "gen-verilog",
         |r, rel| cmd_gen(r, rel, "gen-verilog"),
@@ -2301,7 +2321,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     }
 
     println!("--- Phase 4: Gen C ---");
-    let (p4p, p4f, p4fail) = run_phase_with_failures(
+    let (p4p, p4f, p4fail) = run_phase_par(
         &repo,
         "gen-c",
         |r, rel| cmd_gen(r, rel, "gen-c"),
@@ -2313,7 +2333,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
 
     println!("--- Phase 5: Seal Verify ---");
     let (p5p, p5f, p5fail) =
-        run_phase_with_failures(&repo, "seal-verify", cmd_seal_verify, &specs_only)?;
+        run_phase_par(&repo, "seal-verify", cmd_seal_verify, &specs_only)?;
     println!("Seal Verify: {} passed, {} failed", p5p, p5f);
     // W627: seal staleness is golden-file drift, not a defect population --
     // 1056 of 1064 are stale and ~940 have an UNCHANGED spec_hash. It is

@@ -125,6 +125,10 @@ mod gen_hash_cache;
 #[path = "../gen/rust/verified/digest_cache.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod digest_cache;
+// specs/verified/suite_jobs.t27 (#8829): how many per-spec subprocesses `t27c suite` runs at once.
+#[path = "../gen/rust/verified/suite_jobs.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod suite_jobs;
 // specs/verified/watch.t27 (#8737 H5): what `frontier --watch` reruns after a save.
 #[path = "../gen/rust/verified/watch.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
