@@ -5638,6 +5638,14 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     }
     thread_local!(static DIG: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default());
     fn digest(p: &str, d: u32) -> String { if let Some(x) = DIG.with(|m| m.borrow().get(p).cloned()) { return x } let src = std::fs::read_to_string(p).unwrap_or_default(); let mut h = src.clone(); for u in src.lines().filter_map(|l| l.trim().strip_prefix("use ")).filter(|_| d < 64) { h.push_str(&digest(&crate::use_spec_path(u), d + 1)) } let x = crate::sha256_hex(h.as_bytes()); DIG.with(|m| m.borrow_mut().insert(p.into(), x.clone())); x }
+    /// #8737 H1: a spec's four gen hashes, from ~/.cache/t27/genhash or generated and stored (gen_hash_cache.t27).
+    fn gen_cached(p: &str, tc: &serde_json::Value) -> Option<[String; 4]> {
+        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
+        let hit: Option<[String; 4]> = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|v| gc::gen_cache_use(true, v.len() as u32)).map(|v| [v[0].clone(), v[1].clone(), v[2].clone(), v[3].clone()]);
+        let cur = hit.clone().or_else(|| crate::compute_seal_hashes(p).ok().map(|h| [h.gen_hash_zig, h.gen_hash_verilog, h.gen_hash_c, h.gen_hash_rust]));
+        if let Some(c) = cur.as_ref().filter(|_| gc::gen_cache_store(true, hit.is_some())) { let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))); let _ = std::fs::write(&file, serde_json::to_string(c).unwrap_or_default()); }
+        cur
+    }
     fn decide(p: &str, tc: &serde_json::Value, memo: &mut std::collections::HashMap<String, u8>, depth: u32) -> Option<u8> {
         if let Some(d) = memo.get(p) { return Some(*d); }
         let src = std::fs::read_to_string(p).ok().filter(|_| depth < 64)?;
@@ -5649,10 +5657,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
             match decide(&crate::use_spec_path(u), tc, memo, depth + 1) { Some(d) => rebuilt |= d != si::REUSE, None => missing = true }
         }
         let spec = si::recorded_part(g("/spec_hash").is_some(), g("/spec_hash") == Some(format!("sha256:{}", crate::sha256_hex(src.as_bytes()))));
-        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
-        let hit: Option<[String; 4]> = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|v| gc::gen_cache_use(true, v.len() as u32)).map(|v| [v[0].clone(), v[1].clone(), v[2].clone(), v[3].clone()]);
-        let cur = hit.clone().or_else(|| crate::compute_seal_hashes(p).ok().map(|h| [h.gen_hash_zig, h.gen_hash_verilog, h.gen_hash_c, h.gen_hash_rust]));
-        if let Some(c) = cur.as_ref().filter(|_| gc::gen_cache_store(true, hit.is_some())) { let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))); let _ = std::fs::write(&file, serde_json::to_string(c).unwrap_or_default()); }
+        let cur = gen_cached(p, tc);
         let out = ["/gen_hash_zig", "/gen_hash_verilog", "/gen_hash_c", "/gen_hash_rust"].map(|k| g(k));
         let tools = ["test_runner", "zig"].map(|k| (g(&format!("/toolchain/{k}")), t(k)));
         let tool = si::toolchain_part(out.iter().all(|o| o.is_some()), cur.map_or(false, |c| out.iter().zip(c.iter()).all(|(o, c)| o.as_deref() == Some(c.as_str()))), tools.iter().all(|(r, _)| r.is_some()), tools.iter().all(|(r, c)| r == c));
@@ -5664,6 +5669,8 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     }
     let mut counts = [0u32; 7];
     specs.sort();
+    // #8846: a cold walk first fills the gen-hash cache with suite_jobs() workers (8 MiB stacks); decide() reads it
+    crate::suite::par_in_order(&specs, |p: &String| { gen_cached(p, &tc); });
     for p in &specs { let d = decide(p, &tc, &mut memo, 0).unwrap_or(si::REBUILD_MISSING); counts[d as usize] += 1; if list && d != si::REUSE { println!("{d} {p}") } }
     let total = specs.len() as u32;
     println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], total, si::reused_permille(counts[0], total), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
