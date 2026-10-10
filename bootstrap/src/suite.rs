@@ -687,7 +687,7 @@ fn run_phase_with_failures(
 
 /// #8829: `f` on every item with suite_jobs() workers (each item's own work stays on one worker); the
 /// results come back in input order, so whatever is folded from them is what a sequential run folds.
-fn par_in_order<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_in_order<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let asked = std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let jobs = crate::suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), asked) as usize;
     let next = std::sync::atomic::AtomicUsize::new(0);
