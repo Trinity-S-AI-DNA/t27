@@ -413,6 +413,10 @@ pub fn hi(nodes: &[u8], i: usize, f: usize) -> usize {
     return u32_at(nodes, (((i * REC) + 12) + (f * 8)));
 }
 
+pub fn ident_is(nodes: &[u8], text: &[u8], i: usize, name: &[u8]) -> bool {
+    return ((kind(nodes, i) == K_EXPR_IDENTIFIER) && field_is(nodes, text, i, F_NAME, name));
+}
+
 pub fn kind(nodes: &[u8], i: usize) -> u8 {
     return nodes[((i * REC)) as usize];
 }
@@ -606,6 +610,9 @@ pub fn is_hw_const(nodes: &[u8], text: &[u8], c: usize, depth: usize) -> bool {
     if ((kind(nodes, c) != K_CONST_DECL) || (depth > HW_DEPTH)) {
         return false;
     }
+    if is_input(nodes, text, c) {
+        return true;
+    }
     let mut j: usize = (c + 1);
     while (j < end(nodes, c)) {
         let k: u8 = kind(nodes, j);
@@ -626,5 +633,12 @@ pub fn is_hw_const(nodes: &[u8], text: &[u8], c: usize, depth: usize) -> bool {
         j = (j + 1);
     }
     return false;
+}
+
+pub fn is_input(nodes: &[u8], text: &[u8], i: usize) -> bool {
+    if (((kind(nodes, i) != K_CONST_DECL) || ((i + 1) >= end(nodes, i))) || (end(nodes, (i + 1)) != end(nodes, i))) {
+        return false;
+    }
+    return ident_is(nodes, text, (i + 1), b"undefined");
 }
 
