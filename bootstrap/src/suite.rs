@@ -4,9 +4,12 @@
 use anyhow::Context;
 use serde_json;
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::thread;
 use walkdir::WalkDir;
 
 /// Options for the comprehensive repository suite.
@@ -653,6 +656,31 @@ fn ratchet_compare(
     }
 }
 
+/// Maximum number of concurrent subprocess jobs allowed, regardless of core count
+const SUITE_JOBS_MAX: u32 = 16;
+
+/// Determine the number of concurrent jobs for suite subprocess phases
+/// Returns at least 1, respects T27_SUITE_JOBS env var, caps at SUITE_JOBS_MAX
+fn suite_jobs() -> usize {
+    // Check for T27_SUITE_JOBS environment variable override
+    if let Ok(env_jobs) = env::var("T27_SUITE_JOBS") {
+        if let Ok(jobs) = env_jobs.parse::<usize>() {
+            if jobs > 0 {
+                return std::cmp::min(jobs, SUITE_JOBS_MAX) as usize;
+            }
+        }
+    }
+    
+    // Get available CPU cores, default to 1 if unavailable
+    let cores = match thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(_) => 1,
+    };
+    
+    // Return min(cores, SUITE_JOBS_MAX), but at least 1
+    std::cmp::min(std::cmp::max(cores, 1), SUITE_JOBS_MAX) as usize
+}
+
 /// Like `run_phase`, but also returns the relative paths of failing files so the
 /// suite summary can expose them to CI consumers.
 fn run_phase_with_failures(
@@ -682,6 +710,90 @@ fn run_phase_with_failures(
             pass += 1;
         }
     }
+    Ok((pass, fail, failures))
+}
+
+/// Like `run_phase_with_failures`, but processes files in parallel for better performance.
+/// Only for the seven subprocess phases that are independent and don't write files.
+fn run_phase_with_failures_parallel(
+    repo: &Path,
+    label: &str,
+    f: impl Fn(&Path, &str) -> anyhow::Result<()> + Send + Sync,
+    files: &[PathBuf],
+) -> anyhow::Result<(usize, usize, Vec<String>)> {
+    if files.is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+    
+    let num_jobs = suite_jobs();
+    let chunk_size = std::cmp::max(files.len() / num_jobs, 1);
+    
+    // Create shared counters and collect results with indices
+    let pass_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+    
+    // Process files in chunks
+    let chunks: Vec<_> = files.chunks(chunk_size).collect();
+    let mut handles = Vec::new();
+    
+    for chunk in chunks {
+        let chunk = chunk.to_vec();
+        let repo = Arc::new(repo.to_path_buf());
+        let pass_counter = pass_counter.clone();
+        let fail_counter = fail_counter.clone();
+        let results = results.clone();
+        let f = Arc::new(f);
+        
+        let handle = thread::spawn(move || {
+            for (index, file) in chunk.iter().enumerate() {
+                let original_index = files.iter().position(|p| p == file).unwrap();
+                let rel = match rel_arg(&repo, file) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("FAIL {}: {}", file.display(), e);
+                        fail_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut results = results.lock().unwrap();
+                        results.push((original_index, file.display().to_string().replace('\\', "/"), None));
+                        continue;
+                    }
+                };
+                
+                match f(&repo, &rel) {
+                    Ok(_) => {
+                        pass_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut results = results.lock().unwrap();
+                        results.push((original_index, rel, None));
+                    }
+                    Err(e) => {
+                        eprintln!("FAIL {} ({}): {}", label, rel, e);
+                        fail_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut results = results.lock().unwrap();
+                        results.push((original_index, rel, Some(e.to_string())));
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap()?;
+    }
+    
+    // Sort results by original index to maintain deterministic order
+    let mut results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    results.sort_by_key(|(index, _, _)| *index);
+    
+    let pass = pass_counter.load(std::sync::atomic::Ordering::SeqCst);
+    let fail = fail_counter.load(std::sync::atomic::Ordering::SeqCst);
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter(|(_, _, error)| error.is_some())
+        .map(|(_, rel, _)| rel)
+        .collect();
+    
     Ok((pass, fail, failures))
 }
 
@@ -1956,7 +2068,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     };
 
     println!("--- Phase 1: Parse ---");
-    let (p1p, p1f, p1fail) = run_phase_with_failures(&repo, "parse", cmd_parse, &specs_compiler)?;
+    let (p1p, p1f, p1fail) = run_phase_with_failures_parallel(&repo, "parse", cmd_parse, &specs_compiler)?;
     println!("Parse: {} passed, {} failed", p1p, p1f);
     record("parse", p1fail, &mut ledger, &mut upstream_failed);
     push_phase("parse", p1p, p1f, 0);
@@ -2025,7 +2137,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
 
     println!("--- Phase 1b: Typecheck ---");
     let (p1bp, p1bf, p1bfail) =
-        run_phase_with_failures(&repo, "typecheck", cmd_typecheck, &specs_compiler)?;
+        run_phase_with_failures_parallel(&repo, "typecheck", cmd_typecheck, &specs_compiler)?;
     println!("Typecheck: {} passed, {} failed", p1bp, p1bf);
     record("typecheck", p1bfail, &mut ledger, &mut upstream_failed);
     push_phase("typecheck", p1bp, p1bf, 0);
@@ -2049,7 +2161,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gf16_conformance", 1 - gf16_fail, gf16_fail, 0);
 
     println!("--- Phase 2: Gen Zig ---");
-    let (p2p, p2f, p2fail) = run_phase_with_failures(
+    let (p2p, p2f, p2fail) = run_phase_with_failures_parallel(
         &repo,
         "gen-zig",
         |r, rel| cmd_gen(r, rel, "gen"),
@@ -2060,7 +2172,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gen-zig", p2p, p2f, 0);
 
     println!("--- Phase 2b: Gen Rust ---");
-    let (p2bp, p2bf, p2bfail) = run_phase_with_failures(
+    let (p2bp, p2bf, p2bfail) = run_phase_with_failures_parallel(
         &repo,
         "gen-rust",
         |r, rel| cmd_gen(r, rel, "gen-rust"),
@@ -2071,7 +2183,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("gen-rust", p2bp, p2bf, 0);
 
     println!("--- Phase 3: Gen Verilog ---");
-    let (p3p, p3f, p3fail) = run_phase_with_failures(
+    let (p3p, p3f, p3fail) = run_phase_with_failures_parallel(
         &repo,
         "gen-verilog",
         |r, rel| cmd_gen(r, rel, "gen-verilog"),
@@ -2301,7 +2413,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     }
 
     println!("--- Phase 4: Gen C ---");
-    let (p4p, p4f, p4fail) = run_phase_with_failures(
+    let (p4p, p4f, p4fail) = run_phase_with_failures_parallel(
         &repo,
         "gen-c",
         |r, rel| cmd_gen(r, rel, "gen-c"),
@@ -2313,7 +2425,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
 
     println!("--- Phase 5: Seal Verify ---");
     let (p5p, p5f, p5fail) =
-        run_phase_with_failures(&repo, "seal-verify", cmd_seal_verify, &specs_only)?;
+        run_phase_with_failures_parallel(&repo, "seal-verify", cmd_seal_verify, &specs_only)?;
     println!("Seal Verify: {} passed, {} failed", p5p, p5f);
     // W627: seal staleness is golden-file drift, not a defect population --
     // 1056 of 1064 are stale and ~940 have an UNCHANGED spec_hash. It is
