@@ -685,23 +685,34 @@ fn run_phase_with_failures(
     Ok((pass, fail, failures))
 }
 
+/// #8838: a shared helper that runs `f` on every item with `suite_jobs()` workers and returns results in input order.
+fn par_in_order<T, F>(items: &[T], f: F) -> Vec<(usize, F::Output)>
+where
+    T: Sync + Send,
+    F: Fn(&T) -> F::Output + Sync + Send,
+    F::Output: Send,
+{
+    let asked = std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let jobs = crate::suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), asked) as usize;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut res: Vec<(usize, F::Output)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| { let mut v = Vec::new(); loop { let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if i >= items.len() { break v; } v.push((i, f(&items[i]))); } })).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("suite worker panicked")).collect()
+    });
+    res.sort_by_key(|r| r.0);
+    res
+}
+
 /// #8829: a phase whose per-spec work is one read-only `t27c` subprocess runs suite_jobs() of them at once;
 /// results fold in file order, so the counts, FAIL lines and failure list are the sequential run's.
 fn run_phase_par(repo: &Path, label: &str, f: impl Fn(&Path, &str) -> anyhow::Result<()> + Sync, files: &[PathBuf]) -> anyhow::Result<(usize, usize, Vec<String>)> {
-    let asked = std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let jobs = crate::suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), asked) as usize;
     let one = |file: &PathBuf| match rel_arg(repo, file) {
         Err(e) => Err((file.display().to_string().replace('\\', "/"), format!("FAIL {}: {}", file.display(), e))),
         Ok(rel) => f(repo, &rel).map_err(|e| (rel.clone(), format!("FAIL {} ({}): {}", label, rel, e))),
     };
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut res: Vec<(usize, Result<(), (String, String)>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| { let mut v = Vec::new(); loop { let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if i >= files.len() { break v; } v.push((i, one(&files[i]))); } })).collect();
-        hs.into_iter().flat_map(|h| h.join().expect("suite worker panicked")).collect()
-    });
-    res.sort_by_key(|r| r.0);
+    let results = par_in_order(files, one);
     let (mut pass, mut fail, mut failures) = (0usize, 0usize, Vec::new());
-    for (_, r) in res { match r { Ok(()) => pass += 1, Err((name, msg)) => { eprintln!("{}", msg); fail += 1; failures.push(name); } } }
+    for (_, r) in results { match r { Ok(()) => pass += 1, Err((name, msg)) => { eprintln!("{}", msg); fail += 1; failures.push(name); } } }
     Ok((pass, fail, failures))
 }
 
@@ -2343,19 +2354,33 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("seal-verify", p5p, p5f, 0);
 
     println!("--- Phase 6: Fixed Point ---");
-    let mut fp_diff = 0usize;
-    for file in &specs_compiler {
-        let rel = rel_arg(&repo, file)?;
+    let check_spec = |file: &PathBuf| -> Result<bool, (String, String)> {
+        let rel = match rel_arg(&repo, file) {
+            Ok(r) => r,
+            Err(e) => return Err((file.display().to_string().replace('\\', "/"), format!("FAIL {}: {}", file.display(), e))),
+        };
         let a = match cmd_gen_stdout(&repo, &rel) {
             Ok(x) => x,
-            Err(_) => continue,
+            Err(e) => return Err((rel.clone(), format!("FAIL {} ({}): {}", "fixed-point", rel, e))),
         };
         let b = match cmd_gen_stdout(&repo, &rel) {
             Ok(x) => x,
-            Err(_) => continue,
+            Err(e) => return Err((rel.clone(), format!("FAIL {} ({}): {}", "fixed-point", rel, e))),
         };
-        if a != b {
-            fp_diff += 1;
+        Ok(a != b)
+    };
+    
+    let results = par_in_order(&specs_compiler, check_spec);
+    let mut fp_diff = 0usize;
+    let mut failures = Vec::new();
+    for (_, r) in results {
+        match r {
+            Ok(true) => fp_diff += 1,
+            Ok(false) => (),
+            Err((name, msg)) => {
+                eprintln!("{}", msg);
+                failures.push(name);
+            }
         }
     }
     println!("Fixed Point: {} divergences", fp_diff);
