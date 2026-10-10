@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/uart_echo_top.t27
+// UART Echo Top Module for QMTech XC7A100T FGG676C
+// Implements PING protocol: 0x03 -> 0x83
+// Ported from gHashTag/trinity fpga/openxc7-synth/uart_echo_top.v
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module uart_echo_top {
+
+    // === Constants ===
+    
+    pub const CLK_FREQ : u32 = 50_000_000;
+    pub const BAUD_RATE : u32 = 115_200;
+    pub const BIT_CYCLES : u32 = CLK_FREQ / BAUD_RATE;  // ~434 cycles per bit
+    pub const UART_IDLE : u8 = 1;
+    pub const UART_START : u8 = 0;
+    
+    // RX oversampling (16 samples per bit)
+    pub const OVERSAMPLE : u32 = 16;
+    pub const SAMPLE_CYCLES : u32 = BIT_CYCLES / OVERSAMPLE;  // ~27 cycles per sample
+    
+    // === State definitions ===
+    
+    pub const S_IDLE : u32 = 0;
+    pub const S_START : u32 = 1;
+    pub const S_DATA : u32 = 2;
+    pub const S_STOP : u32 = 3;
+    pub const S_WAIT : u32 = 4;
+    
+    // === RX State ===
+    
+    pub struct RxState {
+        rx_state : u32,
+        rx_shift : u32,
+        rx_bit_count : u32,
+        rx_sample : u32,
+        baud_counter : u32,
+    }
+    
+    // === TX State ===
+    
+    pub struct TxState {
+        tx_state : u32,
+        tx_shift : u32,
+        tx_bit_count : u32,
+        tx_counter : u32,
+        tx_busy : bool,
+    }
+    
+    // === Echo Response ===
+    
+    pub struct EchoState {
+        echo_data : u32,
+        echo_pending : bool,
+    }
+    
+    // === LED State ===
+    
+    pub struct LedState {
+        led_reg : u8,
+    }
+    
+    // === TX Output ===
+    
+    pub struct TxOutput {
+        uart_tx_reg : u8,
+    }
+    
+    // === Constructor helpers ===
+    
+    fn rx_state_default() -> RxState {
+        return RxState{
+            .rx_state = S_IDLE,
+            .rx_shift = 0,
+            .rx_bit_count = 0,
+            .rx_sample = 0,
+            .baud_counter = 0,
+        };
+    }
+    
+    fn tx_state_default() -> TxState {
+        return TxState{
+            .tx_state = S_IDLE,
+            .tx_shift = 0,
+            .tx_bit_count = 0,
+            .tx_counter = 0,
+            .tx_busy = false,
+        };
+    }
+    
+    fn echo_state_default() -> EchoState {
+        return EchoState{
+            .echo_data = 0,
+            .echo_pending = false,
+        };
+    }
+    
+    fn led_state_default() -> LedState {
+        return LedState{
+            .led_reg = UART_IDLE,
+        };
+    }
+    
+    fn tx_output_default() -> TxOutput {
+        return TxOutput{
+            .uart_tx_reg = UART_IDLE,
+        };
+    }
+    
+    // === RX State Machine Logic ===
+    
+    fn rx_idle_detect(uart_rx: u8, rx: RxState) -> RxState {
+        if (uart_rx == UART_START) {
+            return RxState{
+                .rx_state = S_START,
+                .rx_shift = 0,
+                .rx_bit_count = 0,
+                .rx_sample = 0,
+                .baud_counter = 0,
+            };
+        }
+        return rx;
+    }
+    
+    fn rx_sample_bit(uart_rx: u8, rx: RxState) -> RxState {
+        var new_rx : RxState = rx;
+        
+        // Sample in middle of bit period
+        if (rx.rx_sample == OVERSAMPLE/2) {
+            if (rx.rx_state == S_START) {
+                // Start bit detected, move to data
+                new_rx.rx_state = S_DATA;
+                new_rx.rx_bit_count = 0;
+                new_rx.rx_shift = 0;
+            } else if (rx.rx_state == S_DATA) {
+                // Capture data bit (LSB first)
+                new_rx.rx_shift = (rx.rx_shift & ~(1 << rx.rx_bit_count)) | ((uart_rx & 1) << rx.rx_bit_count);
+                if (rx.rx_bit_count == 7) {
+                    new_rx.rx_state = S_STOP;
+                } else {
+                    new_rx.rx_bit_count = rx.rx_bit_count + 1;
+                }
+            }
+        }
+        
+        // End of bit period
+        if (rx.rx_sample == OVERSAMPLE - 1) {
+            if (rx.rx_state == S_STOP) {
+                new_rx.rx_state = S_IDLE;
+                // Check for PING (0x03)
+                if (rx.rx_shift == 0x03) {
+                    // PONG response will be handled in TX logic
+                    return new_rx;
+                }
+            }
+        }
+        
+        return new_rx;
+    }
+    
+    fn rx_increment_counters(rx: RxState) -> RxState {
+        if (rx.rx_state != S_IDLE) {
+            if (rx.baud_counter < SAMPLE_CYCLES - 1) {
+                return RxState{
+                    .rx_state = rx.rx_state,
+                    .rx_shift = rx.rx_shift,
+                    .rx_bit_count = rx.rx_bit_count,
+                    .rx_sample = rx.rx_sample + 1,
+                    .baud_counter = rx.baud_counter + 1,
+                };
+            } else {
+                return RxState{
+                    .rx_state = rx.rx_state,
+                    .rx_shift = rx.rx_shift,
+                    .rx_bit_count = rx.rx_bit_count,
+                    .rx_sample = 0,
+                    .baud_counter = 0,
+                };
+            }
+        }
+        return rx;
+    }
+    
+    fn rx_state_machine(uart_rx: u8, rx: RxState) -> (RxState, EchoState) {
+        var new_rx : RxState = rx;
+        var echo : EchoState = echo_state_default();
+        
+        // Default: increment sample counter
+        if (rx.rx_state != S_IDLE) {
+            new_rx = rx_increment_counters(rx);
+            new_rx = rx_sample_bit(uart_rx, new_rx);
+        } else {
+            // IDLE state - look for start bit
+            new_rx = rx_idle_detect(uart_rx, rx);
+        }
+        
+        // Check for PING (0x03) and set echo response
+        if (rx.rx_state == S_STOP && rx.rx_sample == OVERSAMPLE - 1) {
+            if (rx.rx_shift == 0x03) {
+                echo = EchoState{
+                    .echo_data = 0x83,  // PONG response
+                    .echo_pending = true,
+                };
+            }
+        }
+        
+        return (new_rx, echo);
+    }
+    
+    // === TX State Machine Logic ===
+    
+    fn tx_idle_start(echo: EchoState, tx: TxState) -> TxState {
+        if (echo.echo_pending && !tx.tx_busy) {
+            return TxState{
+                .tx_state = S_START,
+                .tx_shift = echo.echo_data,
+                .tx_bit_count = 0,
+                .tx_counter = 0,
+                .tx_busy = true,
+            };
+        }
+        return tx;
+    }
+    
+    fn tx_start_bit(tx: TxState) -> TxState {
+        if (tx.tx_counter == BIT_CYCLES - 1) {
+            return TxState{
+                .tx_state = S_DATA,
+                .tx_shift = tx.tx_shift,
+                .tx_bit_count = tx.tx_bit_count,
+                .tx_counter = 0,
+                .tx_busy = tx.tx_busy,
+            };
+        } else {
+            return TxState{
+                .tx_state = tx.tx_state,
+                .tx_shift = tx.tx_shift,
+                .tx_bit_count = tx.tx_bit_count,
+                .tx_counter = tx.tx_counter + 1,
+                .tx_busy = tx.tx_busy,
+            };
+        }
+    }
+    
+    fn tx_data_bit(tx: TxState) -> TxState {
+        if (tx.tx_counter == BIT_CYCLES - 1) {
+            var new_shift : u32 = (tx.tx_shift >> 1);  // Shift right
+            var new_bit_count : u32 = tx.tx_bit_count;
+            if (tx.tx_bit_count == 7) {
+                new_bit_count = 0;
+                return TxState{
+                    .tx_state = S_STOP,
+                    .tx_shift = new_shift,
+                    .tx_bit_count = new_bit_count,
+                    .tx_counter = 0,
+                    .tx_busy = tx.tx_busy,
+                };
+            } else {
+                return TxState{
+                    .tx_state = tx.tx_state,
+                    .tx_shift = new_shift,
+                    .tx_bit_count = new_bit_count + 1,
+                    .tx_counter = 0,
+                    .tx_busy = tx.tx_busy,
+                };
+            }
+        } else {
+            return TxState{
+                .tx_state = tx.tx_state,
+                .tx_shift = tx.tx_shift,
+                .tx_bit_count = tx.tx_bit_count,
+                .tx_counter = tx.tx_counter + 1,
+                .tx_busy = tx.tx_busy,
+            };
+        }
+    }
+    
+    fn tx_stop_bit(tx: TxState) -> TxState {
+        if (tx.tx_counter == BIT_CYCLES - 1) {
+            return TxState{
+                .tx_state = S_IDLE,
+                .tx_shift = tx.tx_shift,
+                .tx_bit_count = tx.tx_bit_count,
+                .tx_counter = 0,
+                .tx_busy = false,
+            };
+        } else {
+            return TxState{
+                .tx_state = tx.tx_state,
+                .tx_shift = tx.tx_shift,
+                .tx_bit_count = tx.tx_bit_count,
+                .tx_counter = tx.tx_counter + 1,
+                .tx_busy = tx.tx_busy,
+            };
+        }
+    }
+    
+    fn tx_state_machine(echo: EchoState, tx: TxState) -> (TxState, EchoState) {
+        var new_tx : TxState = tx;
+        var new_echo : EchoState = echo;
+        
+        if (tx.tx_state == S_IDLE) {
+            new_tx = tx_idle_start(echo, tx);
+            if (new_tx.tx_state == S_START) {
+                new_echo = EchoState{
+                    .echo_data = echo.echo_data,
+                    .echo_pending = false,
+                };
+            }
+        } else if (tx.tx_state == S_START) {
+            new_tx = tx_start_bit(tx);
+        } else if (tx.tx_state == S_DATA) {
+            new_tx = tx_data_bit(tx);
+        } else if (tx.tx_state == S_STOP) {
+            new_tx = tx_stop_bit(tx);
+        } else {
+            new_tx = TxState{
+                .tx_state = S_IDLE,
+                .tx_shift = 0,
+                .tx_bit_count = 0,
+                .tx_counter = 0,
+                .tx_busy = false,
+            };
+        }
+        
+        return (new_tx, new_echo);
+    }
+    
+    // === LED Logic ===
+    
+    fn update_led(rx: RxState, tx: TxState, led: LedState) -> LedState {
+        var active : bool = (rx.rx_state != S_IDLE) || (tx.tx_state != S_IDLE);
+        return LedState{
+            .led_reg = if (active) { 1 } else { 0 },
+        };
+    }
+    
+    // === TX Output Logic ===
+    
+    fn get_tx_output(tx: TxState) -> TxOutput {
+        var tx_value : u8 = UART_IDLE;
+        if (tx.tx_state == S_IDLE) {
+            tx_value = UART_IDLE;
+        } else if (tx.tx_state == S_START) {
+            tx_value = UART_START;
+        } else if (tx.tx_state == S_DATA) {
+            tx_value = (tx.tx_shift & 1) as u8;
+        } else if (tx.tx_state == S_STOP) {
+            tx_value = UART_IDLE;
+        } else {
+            tx_value = UART_IDLE;
+        }
+        return TxOutput{
+            .uart_tx_reg = tx_value,
+        };
+    }
+    
+    // === Main Processing Function ===
+    
+    fn process_uart_cycle(clk: bool, uart_rx: u8, rx: RxState, tx: TxState, echo: EchoState, led: LedState) -> (RxState, TxState, EchoState, LedState, TxOutput) {
+        var new_rx : RxState = rx;
+        var new_tx : TxState = tx;
+        var new_echo : EchoState = echo;
+        var new_led : LedState = led;
+        var tx_output : TxOutput = get_tx_output(tx);
+        
+        // RX state machine (runs on positive clock edge)
+        if (clk) {
+            var (rx_result, echo_result) = rx_state_machine(uart_rx, rx);
+            new_rx = rx_result;
+            new_echo = echo_result;
+            
+            // TX state machine (runs on positive clock edge)
+            var (tx_result, echo_tx_result) = tx_state_machine(echo, tx);
+            new_tx = tx_result;
+            new_echo = echo_tx_result;
+            
+            // Update LED
+            new_led = update_led(new_rx, new_tx, led);
+        }
+        
+        // Get TX output
+        tx_output = get_tx_output(new_tx);
+        
+        return (new_rx, new_tx, new_echo, new_led, tx_output);
+    }
+    
+    // === Tests ===
+    
+    test rx_idle_to_start
+        given rx = rx_state_default()
+        and uart_rx = UART_START
+        then var (new_rx, _) = rx_state_machine(uart_rx, rx)
+        and new_rx.rx_state == S_START
+        and new_rx.rx_bit_count == 0
+        and new_rx.rx_sample == 0
+
+    test rx_data_capture
+        given rx = RxState{.rx_state = S_DATA, .rx_shift = 0, .rx_bit_count = 3, .rx_sample = OVERSAMPLE/2, .baud_counter = 0}
+        and uart_rx = 1
+        then var (new_rx, _) = rx_state_machine(uart_rx, rx)
+        and new_rx.rx_shift & (1 << 3) == (1 << 3)  // Bit 3 should be set
+
+    test rx_ping_detection
+        given rx = RxState{.rx_state = S_STOP, .rx_shift = 0x03, .rx_bit_count = 7, .rx_sample = OVERSAMPLE - 1, .baud_counter = 0}
+        then var (_, echo) = rx_state_machine(0, rx)
+        and echo.echo_pending == true
+        and echo.echo_data == 0x83
+
+    test rx_ping_rejection
+        given rx = RxState{.rx_state = S_STOP, .rx_shift = 0x55, .rx_bit_count = 7, .rx_sample = OVERSAMPLE - 1, .baud_counter = 0}
+        then var (_, echo) = rx_state_machine(0, rx)
+        and echo.echo_pending == false
+
+    test tx_idle_to_start
+        given tx = tx_state_default()
+        and echo = EchoState{.echo_data = 0x83, .echo_pending = true}
+        then var (new_tx, _) = tx_state_machine(echo, tx)
+        and new_tx.tx_state == S_START
+        and new_tx.tx_shift == 0x83
+        and new_tx.tx_busy == true
+
+    test tx_data_shift
+        given tx = TxState{.tx_state = S_DATA, .tx_shift = 0b11010101, .tx_bit_count = 2, .tx_counter = BIT_CYCLES - 1, .tx_busy = true}
+        and echo = echo_state_default()
+        then var (new_tx, _) = tx_state_machine(echo, tx)
+        and new_tx.tx_shift == 0b01101010  // Shifted right by 1
+        and new_tx.tx_bit_count == 3
+
+    test tx_stop_to_idle
+        given tx = TxState{.tx_state = S_STOP, .tx_shift = 0, .tx_bit_count = 0, .tx_counter = BIT_CYCLES - 1, .tx_busy = true}
+        and echo = echo_state_default()
+        then var (new_tx, _) = tx_state_machine(echo, tx)
+        and new_tx.tx_state == S_IDLE
+        and new_tx.tx_busy == false
+
+    test led_active_when_rx_busy
+        given rx = RxState{.rx_state = S_DATA, .rx_shift = 0, .rx_bit_count = 0, .rx_sample = 0, .baud_counter = 0}
+        and tx = tx_state_default()
+        and led = led_state_default()
+        then new_led = update_led(rx, tx, led)
+        and new_led.led_reg == 1
+
+    test led_inactive_when_idle
+        given rx = rx_state_default()
+        and tx = tx_state_default()
+        and led = led_state_default()
+        then new_led = update_led(rx, tx, led)
+        and new_led.led_reg == 0
+
+    test tx_output_idle
+        given tx = tx_state_default()
+        then tx_output = get_tx_output(tx)
+        and tx_output.uart_tx_reg == UART_IDLE
+
+    test tx_output_start
+        given tx = TxState{.tx_state = S_START, .tx_shift = 0, .tx_bit_count = 0, .tx_counter = 0, .tx_busy = true}
+        then tx_output = get_tx_output(tx)
+        and tx_output.uart_tx_reg == UART_START
+
+    test tx_output_data
+        given tx = TxState{.tx_state = S_DATA, .tx_shift = 0b10101010, .tx_bit_count = 0, .tx_counter = 0, .tx_busy = true}
+        then tx_output = get_tx_output(tx)
+        and tx_output.uart_tx_reg == 0  // LSB is 0
+
+    
+
+    test_state_machine_integration
+        // Test full cycle: PING detection -> TX response
+        given rx = rx_state_default()
+        and tx = tx_state_default()
+        and echo = echo_state_default()
+        and led = led_state_default()
+        
+        // Simulate start bit
+        var (new_rx, new_echo) = rx_state_machine(UART_START, rx)
+        rx = new_rx;
+        echo = new_echo;
+        
+        // Simulate data bits for 0x03
+        var i : u32 = 0;
+        while (i < 8) {
+            var bit_value : u8 = if ((0x03 >> i) & 1) { 1 } else { 0 };
+            (new_rx, new_echo) = rx_state_machine(bit_value, rx);
+            rx = new_rx;
+            echo = new_echo;
+            i = i + 1;
+        }
+        
+        // Check that echo is pending
+        and echo.echo_pending == true
+        and echo.echo_data == 0x83
+
+    // === Invariants ===
+
+    invariant rx_state_valid
+        given rx = rx_state_default()
+        assert rx.rx_state <= S_WAIT
+
+    invariant tx_state_valid
+        given tx = tx_state_default()
+        assert tx.tx_state <= S_WAIT
+
+    invariant bit_count_valid
+        given tx = tx_state_default()
+        assert tx.tx_bit_count <= 7
+
+    invariant baud_counter_valid
+        given rx = rx_state_default()
+        assert rx.baud_counter < SAMPLE_CYCLES
+
+    invariant sample_count_valid
+        given rx = rx_state_default()
+        assert rx.rx_sample < OVERSAMPLE
+
+    invariant echo_data_valid
+        given echo = echo_state_default()
+        assert echo.echo_data <= 0xFF
+
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY
