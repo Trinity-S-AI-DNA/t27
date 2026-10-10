@@ -604,6 +604,11 @@ fn lower_mode<'a>(
         let m = LIBM.get_or_init(|| crate::compiler::Compiler::parse_ast(&libm()).unwrap_or_default());
         items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
     }
+    static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's division routine, for `@divTrunc`
+    if named.contains(ip::DIV_BUILTIN) {
+        let m = I128.get_or_init(|| crate::compiler::Compiler::parse_ast(&include_str!("../../../specs/tri/t27b/i128_plan.t27").replace(ip::PORT, ip::HELPER)).unwrap_or_default());
+        items.extend(m.children.iter().filter(|c| c.name.starts_with(ip::HELPER)));
+    }
 
     // Struct declarations are laid out on first use, like Zig's lazy
     // analysis: an unused struct with an unsupported member rejects nothing.
@@ -625,7 +630,7 @@ fn lower_mode<'a>(
 
     // The fns Zig's lazy analysis reaches, and the `*` nodes t27c's strength reduction rewrites (ast_shape.t27).
     l.analyzed = marked(items.iter().copied(), sh::analyzed).map(|n| n.name.clone()).collect();
-    l.analyzed.extend(items.iter().filter(|c| c.name.starts_with(xp::HELPER)).map(|c| c.name.clone()));
+    l.analyzed.extend(items.iter().filter(|c| c.name.starts_with(xp::HELPER) || c.name.starts_with(ip::HELPER)).map(|c| c.name.clone()));
     l.float_field_names(&items);
     for item in &items {
         if item.kind == NodeKind::FnDecl && !item.name.is_empty() && item.extra_return_type.trim() == "bool" {
@@ -754,8 +759,9 @@ fn lower_mode<'a>(
     l.nfuncs = next_id;
     let mut const_names: Vec<String> = l.const_nodes.keys().cloned().collect();
     const_names.sort();
+    let hw: HashSet<&str> = marked(items.iter().copied(), vp::hw_consts).map(|n| n.name.as_str()).collect();
     for name in const_names {
-        if l.unreferenced_tuple_const(&items, &name) || l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
+        if l.unreferenced_tuple_const(&items, &name) || hw.contains(name.as_str()) || l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
             continue;
         }
         let _ = l.global(&name);
@@ -1420,7 +1426,7 @@ impl<'a> Lower<'a> {
             None => return self.reject("ConstDecl", format!("`{}` has no value", node.name)),
         };
         let ann = node.extra_type.trim();
-        let st = if !ann.is_empty() {
+        let st = if !ann.is_empty() && ann != ip::NAME { // an i128 is a pair constant (i128_plan.t27), as a scalar
             match self.lty(ann)? {
                 t @ (LTy::Struct(_) | LTy::Arr(..)) => Some(t),
                 LTy::Str => {
@@ -1465,7 +1471,7 @@ impl<'a> Lower<'a> {
         let v = if node.extra_type.trim().is_empty() {
             self.expr(init)?
         } else {
-            let ty = self.ty(&node.extra_type)?;
+            let ty = if ann == ip::NAME { Ty::I128 } else { self.ty(ann)? };
             let v = self.expr_as(init, &LTy::S(ty))?;
             Val::E(self.coerce(v, ty)?)
         };
@@ -2293,7 +2299,7 @@ impl<'a> Lower<'a> {
             None => ann,
         };
         if !ann.is_empty() {
-            let t = self.lty(&ann)?;
+            let t = if ann == ip::NAME { LTy::S(Ty::I128) } else { self.lty(&ann)? }; // a run-time i128 (i128_plan.t27)
             if is_agg(&t) || self.addr_taken.contains(&name) {
                 // In memory; the name is bound only after its initializer.
                 let k = self.new_slot(&t)?;
@@ -3776,9 +3782,11 @@ impl<'a> Lower<'a> {
     /// folds it to, or the plan's refusal under that constant's type. None when it names none.
     fn wide_fold(&mut self, n: &Node, to: Option<&str>) -> R<Option<Val>> {
         let v = self.wide(n);
-        if !wp::folds(v) {
+        let act = wp::run_time(v, to.is_some()); // an i128 constant at run time: a pair constant (i128_plan.t27)
+        if !wp::folds(v) || act == wp::AS_RUN {
             return Ok(None);
         }
+        if act == wp::AS_PAIR { return Ok(Some(Val::E(Expr { ty: Ty::I128, kind: ExprKind::Const(wp::pair_value(v)) }))); }
         let ty = match to { Some(t) => self.ty(t)?, None => Ty::Bool };
         match wp::verdict(v, to.is_some(), ty.is_int(), ty.bits(), ty.signed()) {
             wp::OK => Ok(Some(Val::E(Expr { ty, kind: ExprKind::Const(ty.wrap(wp::low64(v) as i128)) }))),
@@ -7375,6 +7383,24 @@ fn flat<'n>(ns: impl IntoIterator<Item = &'n Node>) -> (Vec<u8>, Vec<u8>) {
     (a, t)
 }
 const _: () = assert!(NodeKind::StmtExpr as u8 == aw::K_STMT_EXPR && NodeKind::ExprRange as u8 == aw::K_EXPR_RANGE);
+#[path = "../../../gen/rust/tri/t27b/verilog_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)]
+mod ve; // t27c gen-rust of specs/tri/t27b/verilog_emit.t27: `t27b verilog` (#8796)
+#[path = "../../../gen/rust/tri/t27b/verilog_plan.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)]
+mod vp; // t27c gen-rust of specs/tri/t27b/verilog_plan.t27: hw_consts, the consts only the hardware reads
+/// `t27b verilog`: `flat`'s bytes and per node four u32 (flags 1 var, 2 pub; line; its params' span in `p`).
+pub fn verilog(ast: &Node) -> Result<String, String> {
+    fn meta(n: &Node, m: &mut Vec<u8>, p: &mut Vec<u8>) {
+        let lo = p.len() as u32; n.params.iter().for_each(|(a, b)| p.extend(format!("{a}:{b}\n").bytes()));
+        for v in [n.extra_mutable as u32 | (n.extra_pub as u32) << 1, n.line, lo, p.len() as u32] { m.extend(v.to_le_bytes()) }
+        n.children.iter().for_each(|c| meta(c, m, p));
+    }
+    let ((a, t), mut m, mut p) = (flat([ast]), Vec::new(), Vec::new());
+    meta(ast, &mut m, &mut p);
+    let (mut w, mut out) = (vec![0u8; a.len() / aw::REC * 2 + 70], vec![0u8; 4 * (a.len() + t.len()) + (1 << 20)]);
+    let n = ve::emit(&a, &t, &m, &p, &mut w, &mut out);
+    let s = String::from_utf8_lossy(&out[..n.unsigned_abs() as usize]).into_owned();
+    (n >= 0).then(|| s.clone()).ok_or(s)
+}
 /// The nodes of `ns` in preorder that `scan`, a fn of specs/tri/t27b/ast_scan.t27, marks.
 fn marked<'n, I: IntoIterator<Item = &'n Node> + Clone>(ns: I, scan: impl Fn(&[u8], &[u8], &mut [u8])) -> impl Iterator<Item = &'n Node> {
     fn pre<'n>(n: &'n Node, v: &mut Vec<&'n Node>) { v.push(n); n.children.iter().for_each(|c| pre(c, v)) }

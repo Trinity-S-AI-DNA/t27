@@ -105,3 +105,37 @@ from 87 to 86 instead of blessing new conflicts.
 13. No hardware, complete inference, customer activity, reward or performance
     claim follows from these spec tests.
 14. This report and the PR retain completed work and remaining limitations.
+
+## Upstream refresh at 102fe3b6d (2026-10-10)
+
+The published head 8db413a0d had 30 successful CI checks and one failed
+Verilog widths check. Earlier cancelled duplicates of fix-carries-source and
+check-linked-issue each have a later successful check. No merge is claimed.
+
+A normal merge of upstream master 102fe3b6dcc242660df9d8903d0de93f6bd58010
+preserves its authors and the new extern-module root test in ast_shape. That
+test uses ast_scan's public helpers, as the existing repaired tests do. The
+native expectation conflict retains both the viewport pass and upstream vault
+passes. The upstream native failure cap is now 9; this repair does not raise it.
+The ast_shape seal is refreshed with the ordinary, unforced command, and Rust
+is regenerated from the combined specification.
+
+Executed checks on the combined source:
+- ast_shape: 13/13 in Zig and native --check, 104 runtime assertions in each,
+  no vacuous test; zero discarded tokens and all five seal hashes match.
+- All six related tracked Rust outputs remain byte-identical to t27c gen-rust.
+- Full cargo test --release -p t27b passes. Repaired viewport, counter, graph,
+  int-cast, opaque, orchestrator and structure-validator native tests pass.
+- Corpus ratchet CLEAN: 71 known primary failures, zero unexpected failure or
+  pass, expiry, discard drift or gate drift. This is not an all-pass corpus.
+- Seal coverage: 2393 scanned, 2272 hold and 121 known broken. Currency: 2296
+  current, zero stale generated hashes, 94 missing paths and three none hashes.
+- Duplicate and type-conflict ratchets pass; classification is 86/86.
+- Verilog widths still fails on the unchanged upstream big_frame specimen:
+  4799999/9599999-bit ranges. No exception or gate weakening is added.
+- rust_repeat_counts remains BLOCKED on the existing repetition-expression
+  generator error. It is not repaired or resealed as passing.
+
+Evidence: upstream-refresh-* and upstream-ast-shape-* files under
+/Users/ssdm4/trinity-results/spec-tests-7641/. Publication of the refreshed
+head and its CI still remain; the earlier CI does not certify this merge.

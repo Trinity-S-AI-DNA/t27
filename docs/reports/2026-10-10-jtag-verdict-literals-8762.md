@@ -54,3 +54,22 @@ source, literals-only probe, both damaged-result reports and seal verification.
     outside this literal restoration.
 13. No physical inference, customer activity or reward claim follows.
 14. This report retains completed tests and the remaining publication step.
+
+## Dependency refresh at upstream 102fe3b6d (2026-10-10)
+
+The normal merge of local dependency 4ea165b3d retains the JTAG pass row and
+upstream's new native failure cap 9 without increasing it. It contains the
+upstream extern-module root test and the combined ast_shape seal and generated
+Rust. JTAG source and values are unchanged by this refresh.
+
+The refreshed source again passes 18/18 reference tests with six compile-time
+invariants and the same two vacuous constant tests. Native --check passes
+18/18 with six held invariants and 38 runtime assertions. Complete parse
+reports zero discarded tokens; spec and all four generated hashes match the
+existing seal. No hardware execution is claimed. The dependency's full native
+suite, corpus ratchet, seals and duplicate/type gates pass locally. The known
+upstream Verilog widths failure still blocks an ordinary merge.
+
+Evidence: upstream-refresh-zig.log and upstream-refresh-native.log in
+/Users/ssdm4/trinity-results/jtag-verdict-spec/. Earlier CI at e10301252 is
+not a CI receipt for this refresh; publication and latest-head CI remain.
