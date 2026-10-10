@@ -54,7 +54,7 @@ pub fn bytes_at(v: &'static str, at: u32, w: &'static str) -> bool {
     return true;
 }
 
-pub fn digits_end(v: &'static str, at: u32) -> u32 {
+pub fn digit_run_end(v: &'static str, at: u32) -> u32 {
     let mut i: u32 = at;
     while (((i < (v.len() as u32)) && ((v.as_bytes()[(i) as usize] as u32) >= 48)) && ((v.as_bytes()[(i) as usize] as u32) <= 57)) {
         i = (i + 1);
@@ -81,7 +81,7 @@ pub fn name_byte(v: &'static str, i: u32) -> bool {
 
 pub fn decl_period(v: &'static str, at: u32) -> u32 {
     let p: u32 = (at + (PERIOD_ATTR.len() as u32));
-    let q: u32 = digits_end(v, p);
+    let q: u32 = digit_run_end(v, p);
     if ((q == p) || !(bytes_at(v, q, ATTR_CLOSE))) {
         return 0;
     }
@@ -94,7 +94,7 @@ pub fn decl_period(v: &'static str, at: u32) -> u32 {
 
 pub fn decl_net_lo(v: &'static str, at: u32) -> u32 {
     let p: u32 = (at + (PERIOD_ATTR.len() as u32));
-    let mut q: u32 = digits_end(v, p);
+    let mut q: u32 = digit_run_end(v, p);
     if ((q == p) || !(bytes_at(v, q, ATTR_CLOSE))) {
         return NOT_FOUND;
     }
@@ -144,39 +144,20 @@ pub fn decl_ok(v: &'static str, at: u32) -> bool {
     return ((decl_period(v, at) != 0) && (decl_net_lo(v, at) != NOT_FOUND));
 }
 
-pub fn dec_digits(v: u32) -> u32 {
-    let mut n: u32 = 1;
-    let mut x: u32 = v;
-    while (x >= 10) {
-        x = (x / 10);
-        n = (n + 1);
-    }
-    return n;
-}
-
 pub fn ns_len(ps: u32) -> u32 {
-    return (dec_digits((ps / 1000)) + 4);
+    return (dec_len((ps / 1000)) + 4);
 }
 
 pub fn ns_char(ps: u32, k: u32) -> u8 {
     let whole: u32 = (ps / 1000);
-    let d: u32 = dec_digits(whole);
+    let d: u32 = dec_len(whole);
+    if (k < d) {
+        return (dec_char(whole, d, k) as u8);
+    }
     if (k == d) {
         return 46;
     }
-    let mut x: u32 = (ps % 1000);
-    let mut place: u32 = 0;
-    if (k < d) {
-        x = whole;
-        place = ((d - 1) - k);
-    } else {
-        place = (3 - (k - d));
-    }
-    while (place > 0) {
-        x = (x / 10);
-        place = (place - 1);
-    }
-    return (((x % 10) + 48) as u8);
+    return (dec_char((ps % 1000), 3, ((k - d) - 1)) as u8);
 }
 
 pub fn xdc_piece_len(v: &'static str, at: u32, p: u32) -> u32 {
@@ -379,6 +360,28 @@ pub fn xdc_is(v: &'static str, w: &'static str) -> bool {
         k = (k + 1);
     }
     return true;
+}
+
+pub const CH_ZERO: u32 = 48;
+
+pub fn dec_char(v: u32, len: u32, j: u32) -> u32 {
+    let mut x: u32 = v;
+    let mut s: u32 = ((len - 1) - j);
+    while (s > 0) {
+        x = (x / 10);
+        s = (s - 1);
+    }
+    return (CH_ZERO + (x % 10));
+}
+
+pub fn dec_len(v: u32) -> u32 {
+    let mut n: u32 = 1;
+    let mut x: u32 = v;
+    while (x >= 10) {
+        x = (x / 10);
+        n = (n + 1);
+    }
+    return n;
 }
 
 pub const NOT_FOUND: u32 = 4294967295;
