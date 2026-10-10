@@ -13,6 +13,11 @@ use serde::Serialize;
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod verilog_aos_memory;
 
+// specs/compiler/verilog_entry_port_collision.t27 (#5649), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_entry_port_collision.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod verilog_entry_port_collision;
+
 // ============================================================================
 // AST Node Types (from parser.t27)
 // ============================================================================
@@ -11704,6 +11709,20 @@ impl VerilogCodegen {
         );
     }
 
+    /// #5649: the in-file half of a refusal for a parameter named like a
+    /// boilerplate port (specs/compiler/verilog_entry_port_collision.t27,
+    /// PORT_REFUSED). The stderr half is the same `main.rs` line.
+    fn write_entry_collision_comment(&mut self, what: &str) {
+        self.write_line("// ENTRY POINT REFUSED -- a parameter is named like a boilerplate port and is not 1 unsigned bit:");
+        self.write_line(&format!("//     {what}"));
+        self.write_line(
+            "// `clk`, `rst_n` and `en` are 1-bit inputs of every module. A parameter of that",
+        );
+        self.write_line(
+            "// name is that port only when it is 1 unsigned bit; narrowing it is not guessed here.",
+        );
+    }
+
     /// W699: the width of an entry-point port, or `None` -- never a default.
     ///
     /// `type_to_width` ends in `_ => 32`, which is right for a local register
@@ -14195,11 +14214,44 @@ impl VerilogCodegen {
         // so anything accepted can be sized.
         let mut input_ports: Vec<(String, u32, bool)> = Vec::new();
         let mut entry_refusal: Option<String> = None;
+        // W649: the boilerplate `(clk, rst_n, en)` header was emitted
+        // UNCONDITIONALLY, so a spec that declares `var clk : bool = false` --
+        // every testbench does, and drives it -- got `clk` as an input PORT and
+        // again as `reg clk;` in the same scope. iverilog:
+        // "'clk' has already been declared in this scope". 24 corpus specs.
+        //
+        // The spec's intent is unambiguous: it declares the signal and assigns
+        // it, so the `reg` is right and the PORT is wrong. Dropping the reg --
+        // the obvious reading of the error -- would have made a driven signal an
+        // undrivable input. See T62.
+        let declares = |n: &str| {
+            consts.iter().any(|c| c.name == n) || module_regs.iter().any(|r| r == n)
+        };
+        // #5649: an entry-point PARAMETER named like a boilerplate port the
+        // header emits was declared a second time -- the same iverilog error,
+        // from the other side (`fn on_comb(clk: bool)`, five corpus specs).
+        // specs/compiler/verilog_entry_port_collision.t27 decides: a 1-bit
+        // unsigned parameter IS that port and is declared once; anything else of
+        // that name is refused below, never narrowed into a 1-bit port.
+        let collides = |n: &str| ["clk", "rst_n", "en"].contains(&n) && !declares(n);
+        let mut entry_collision = false;
         if let Some(oc) = functions.iter().find(|f| f.name == "on_clock" || f.name == "on_comb") {
             let mut widths: Vec<(String, u32, bool)> = Vec::new();
             for (pname, ptype) in &oc.params {
                 match Self::entry_port_width(ptype, &self.struct_decls) {
-                    Some(w) => widths.push((pname.clone(), w, Self::type_is_signed(ptype))),
+                    Some(w) => {
+                        let signed = Self::type_is_signed(ptype);
+                        if verilog_entry_port_collision::entry_param_port(collides(pname), w, signed)
+                            == verilog_entry_port_collision::PORT_REFUSED
+                        {
+                            entry_refusal = Some(format!(
+                                "{pname}: {ptype} -- named like the 1-bit `{pname}` port"
+                            ));
+                            entry_collision = true;
+                            break;
+                        }
+                        widths.push((pname.clone(), w, signed));
+                    }
                     None => {
                         entry_refusal = Some(format!("{pname}: {ptype}"));
                         break;
@@ -14233,19 +14285,8 @@ impl VerilogCodegen {
         }
         self.entry_refusal = entry_refusal.clone();
 
-        // W649: the boilerplate `(clk, rst_n, en)` header was emitted
-        // UNCONDITIONALLY, so a spec that declares `var clk : bool = false` --
-        // every testbench does, and drives it -- got `clk` as an input PORT and
-        // again as `reg clk;` in the same scope. iverilog:
-        // "'clk' has already been declared in this scope". 24 corpus specs.
-        //
-        // The spec's intent is unambiguous: it declares the signal and assigns
-        // it, so the `reg` is right and the PORT is wrong. Dropping the reg --
-        // the obvious reading of the error -- would have made a driven signal an
-        // undrivable input. See T62.
-        let declares = |n: &str| {
-            consts.iter().any(|c| c.name == n) || module_regs.iter().any(|r| r == n)
-        };
+        // W649: `declares` (above) keeps a boilerplate port out of the header
+        // when the spec declares a signal of that name.
         self.write_line(&format!("module {} (", mod_name));
         self.indent();
         for p in ["clk", "rst_n", "en"] {
@@ -14256,6 +14297,13 @@ impl VerilogCodegen {
             self.write_line(&format!("input  wire        {},", p));
         }
         for (name, w, signed) in &input_ports {
+            // #5649: PORT_SHARED -- the boilerplate line above already declared
+            // this name, 1 bit, unsigned; the parameter is that port.
+            if verilog_entry_port_collision::entry_param_port(collides(name), *w, *signed)
+                == verilog_entry_port_collision::PORT_SHARED
+            {
+                continue;
+            }
             let range = Self::range_decl(*w);
             let signed_str = if *signed { "signed " } else { "" };
             // W650: the FOURTH unescaped emit site, and the one T53 predicted.
@@ -14336,7 +14384,11 @@ impl VerilogCodegen {
         // `var` as an output port got no comment at all -- only the stderr
         // line #5904 added. #5963: the refusal is written whenever it happens.
         if let Some(what) = &entry_refusal {
-            self.write_entry_refusal_comment(what);
+            if entry_collision {
+                self.write_entry_collision_comment(what);
+            } else {
+                self.write_entry_refusal_comment(what);
+            }
         }
         self.write_line("");
 
