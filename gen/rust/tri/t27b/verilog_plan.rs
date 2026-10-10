@@ -503,6 +503,15 @@ pub const C_TEST: u8 = 8;
 
 pub const C_TYPE: u8 = 9;
 
+pub const C_INPUT: u8 = 10;
+
+pub fn is_input(nodes: &[u8], text: &[u8], i: usize) -> bool {
+    if (((kind(nodes, i) != K_CONST_DECL) || ((i + 1) >= end(nodes, i))) || (end(nodes, (i + 1)) != end(nodes, i))) {
+        return false;
+    }
+    return ident_is(nodes, text, (i + 1), b"undefined");
+}
+
 pub fn is_extern(nodes: &[u8], i: usize) -> bool {
     return ((kind(nodes, i) == K_FN_DECL) && (end(nodes, i) == (i + 1)));
 }
@@ -552,6 +561,9 @@ pub const HW_DEPTH: usize = 32;
 pub fn is_hw_const(nodes: &[u8], text: &[u8], c: usize, depth: usize) -> bool {
     if ((kind(nodes, c) != K_CONST_DECL) || (depth > HW_DEPTH)) {
         return false;
+    }
+    if is_input(nodes, text, c) {
+        return true;
     }
     let mut j: usize = (c + 1);
     while (j < end(nodes, c)) {
@@ -608,6 +620,13 @@ pub fn param_role(name: &[u8], t: i64) -> u8 {
         return ROLE_PORT;
     }
     return ROLE_BAD;
+}
+
+pub fn port_name_end(ps: &[u8], a: usize, b: usize) -> usize {
+    if ((b > (a + 1)) && (ps[((b - 1)) as usize] == 95)) {
+        return (b - 1);
+    }
+    return b;
 }
 
 pub fn binds(ps: &[u8], a: usize, b: usize, text: &[u8], ia: usize, ib: usize, fa: usize, fb: usize) -> bool {
@@ -782,6 +801,8 @@ pub fn verilog_keyword(s: &[u8]) -> bool {
 
 pub const PT: &'static str = "i<16+=1body<=+jcontinue_expr";
 
+pub const PT2: &'static str = "i<16+=1body<=+jundefinedxxxx";
+
 pub fn vput32(buf: &mut [u8], at: usize, v: usize) -> () {
     buf[(at) as usize] = ((v % 256) as _);
     buf[((at + 1)) as usize] = (((v / 256) % 256) as _);
@@ -804,6 +825,8 @@ pub fn vset(buf: &mut [u8], i: usize, f: usize, a: usize, b: usize) -> () {
     vput32(buf, (((i * REC) + 8) + (f * 8)), a);
     vput32(buf, (((i * REC) + 12) + (f * 8)), b);
 }
+
+pub const B_DOT: u8 = 46;
 
 pub const FIELDS: usize = 8;
 
@@ -907,6 +930,15 @@ pub fn kind(nodes: &[u8], i: usize) -> u8 {
 
 pub fn lo(nodes: &[u8], i: usize, f: usize) -> usize {
     return u32_at(nodes, (((i * REC) + 8) + (f * 8)));
+}
+
+pub fn names(nodes: &[u8], text: &[u8], i: usize, name: &[u8]) -> bool {
+    let a: usize = lo(nodes, i, F_NAME);
+    let b: usize = hi(nodes, i, F_NAME);
+    if !(has_at(text, a, b, name)) {
+        return false;
+    }
+    return (((b - a) == name.len()) || (text[((a + name.len())) as usize] == B_DOT));
 }
 
 pub fn node(nodes: &mut [u8], i: usize, k: u8, e: usize, a: usize, b: usize) -> () {
