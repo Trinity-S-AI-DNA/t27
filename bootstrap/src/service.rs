@@ -5717,7 +5717,13 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         DIG.with(|m| m.borrow_mut().clear());
         let now: Vec<(String, String)> = specs.iter().map(|p| (p.clone(), digest(p, 0))).collect();
         let changed: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect();
-        for (p, d) in changed.iter().take(wt::watch_take(changed.len() as u32) as usize) { let r = crate::test_report::run(Path::new(p), Path::new("specs")); println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); last.insert(p.clone(), d.clone()); }
+        // #8852: reruns side by side, specs sharing a file stem on one worker (test_report names its scratch dir by stem and pid)
+        let batch: Vec<&(String, String)> = changed.iter().take(wt::watch_take(changed.len() as u32) as usize).copied().collect();
+        let mut stems: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, (p, _)) in batch.iter().enumerate() { let st = Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(); match stems.iter_mut().find(|g| g.0 == st) { Some(g) => g.1.push(i), None => stems.push((st, vec![i])) } }
+        let mut runs: Vec<(usize, crate::test_report::Report)> = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| (i, crate::test_report::run(Path::new(&batch[i].0), Path::new("specs")))).collect::<Vec<_>>()).into_iter().flatten().collect();
+        runs.sort_by_key(|r| r.0);
+        for (i, r) in runs { let (p, d) = batch[i]; println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); last.insert(p.clone(), d.clone()); }
         if changed.len() as u32 > wt::WATCH_BATCH { println!("watch: {} more changed specs wait for the next look", changed.len() as u32 - wt::WATCH_BATCH) }
         for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
         std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64));
