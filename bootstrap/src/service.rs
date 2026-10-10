@@ -4258,9 +4258,15 @@ pub fn run_silicon(
     use crate::bitstream_reuse as br;
     let bit_path = tmp.join(format!("{stem}.bit"));
     let tools = [chipdb.clone(), pnr.clone(), xr.join("utils/fasm2frames.py"), PathBuf::from(run(Command::new("which").arg("xc7frames2bit")).1.trim())];
-    let xdc_in = tops.last().map(|t| Path::new(t).with_extension("xdc")).filter(|p| p.exists());
+    // #8839: the top's declared clocks or its hand `<top>.xdc`, as specs/verified/clock_constraints.t27 decides.
+    use crate::clock_constraints as cc;
+    let (top_v, hand_xdc) = (spec_str(&tops.last().and_then(|t| std::fs::read_to_string(t).ok()).unwrap_or_default()), tops.last().map(|t| Path::new(t).with_extension("xdc")).filter(|p| p.exists()));
+    let (src, gen_xdc) = (cc::constraint_source(top_v, hand_xdc.is_some()), tmp.join(format!("{top_name}.xdc")));
+    if cc::source_refuses(src) { println!("REFUSED -- silicon: {}", cc::source_why(src)); std::process::exit(2); }
+    if src == cc::SRC_DECLARED { std::fs::write(&gen_xdc, (0..cc::xdc_len(top_v)).map(|k| cc::xdc_char(top_v, k) as char).collect::<String>())?; }
+    let xdc_in = if src == cc::SRC_DECLARED { Some(gen_xdc) } else { hand_xdc };
     let mut key_in = format!("{}|{}|{pnr_seed:?}|{}|{}", run(Command::new("yosys").arg("-V")).1.trim().to_owned() + &venv_identity(&root, &xr), run(Command::new("git").arg("-C").arg(&db).args(["rev-parse", "HEAD"])).1.trim(), br::BIT_RECIPE, env!("CARGO_PKG_VERSION"));
-    for f in sources.iter().map(PathBuf::from).chain(xdc_in).chain(tools) { key_in += &format!("|{}", file_digest(&f)); }
+    for f in sources.iter().map(PathBuf::from).chain(xdc_in.clone()).chain(tools) { key_in += &format!("|{}", file_digest(&f)); }
     let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/t27/bitstreams").join(crate::sha256_hex(key_in.as_bytes()));
     let (cached_bit, cached_chain) = (std::fs::read(cache.join("design.bit")).ok(), std::fs::read_to_string(cache.join("chain")).ok());
     let intact = cached_bit.as_deref().map(crate::sha256_hex) == std::fs::read_to_string(cache.join("bit.sha256")).ok();
@@ -4439,43 +4445,13 @@ pub fn run_silicon(
         });
 
         let t = Instant::now();
-        // W818 (T542): PLACE AGAINST THE CLOCK THE DIE ACTUALLY DELIVERS.
-        //
-        // With no `--freq` and no XDC, nextpnr-xilinx targets **12 MHz** -- a
-        // number from nowhere. T495 measured CFGMCLK on these three dice at
-        // 70.77 / 68.49 / 67.20 MHz, so every design this project has placed was
-        // checked against a frequency 5.7x below what it is driven at.
-        //
-        // Measured the day this was found, re-placing three existing designs at
-        // the real figure:
-        //     ternary_node        216.08 MHz  PASS
-        //     e8m0                 78.63 MHz  PASS
-        //     gft_bitnet_neuron    11.26 MHz  FAIL   <- and it had been declared
-        //                                               verified on three dice
-        //
-        // 67.20 MHz is used, not the mean: it is the SLOWEST of the three dice,
-        // and a design that must run on all of them has to meet the fastest
-        // clock, which is the largest number -- so the conservative choice for a
-        // timing TARGET is the highest measured value. Using 68.8 (the mean)
-        // would leave the fastest die unchecked; 70.77 is therefore the honest
-        // target and is what is passed.
-        // W819 (T544): a design that DIVIDES the clock needs its own constraint,
-        // and `--freq` is global. T541 measured that a BUFG divider changes
-        // nothing in the report -- the timing engine never learns the ratio -- so
-        // the only honest way to declare a slower domain is an XDC.
-        //
-        // Convention: if `<top>.xdc` sits beside the wrapper, it is passed. No
-        // file means the global `--freq` applies, which is the existing
-        // behaviour for every design that does not divide.
-        let xdc = tops
-            .last()
-            .map(|t| Path::new(t).with_extension("xdc"))
-            .filter(|p| p.exists());
+        // W818 (T542), W819 (T544), #8839: every clock at cc::GLOBAL_FREQ_MHZ, the fastest die's CFGMCLK, unless
+        // the top declares it (xdc_in above); why is in specs/verified/clock_constraints.t27.
         let mut pnr_args: Vec<String> = vec![
             "--chipdb".into(), chipdb.to_string_lossy().into_owned(),
             "--json".into(), json_path.to_string_lossy().into_owned(),
             "--fasm".into(), fasm_path.to_string_lossy().into_owned(),
-            "--freq".into(), "70.77".into(),
+            "--freq".into(), cc::GLOBAL_FREQ_MHZ.into(),
         ];
         // W842 (T616): a seed makes place-and-route a VARIABLE. nextpnr's default
         // is fixed, so every build of a given netlist places identically -- which
@@ -4487,10 +4463,7 @@ pub fn run_silicon(
             pnr_args.push("--seed".into());
             pnr_args.push(sd.to_string());
         }
-        if let Some(x) = &xdc {
-            pnr_args.push("--xdc".into());
-            pnr_args.push(x.to_string_lossy().into_owned());
-        }
+        pnr_args.extend(xdc_in.iter().flat_map(|x| ["--xdc".to_string(), x.to_string_lossy().into_owned()]));
         let (c, _, err) = run(Command::new(&pnr).args(&pnr_args));
         // W839 (T603): this stage printed the frequency it ASKED FOR as if it
         // were the frequency it GOT. nextpnr reports an achieved Fmax per clock
@@ -4508,14 +4481,14 @@ pub fn run_silicon(
             .filter(|l| l.contains("Max frequency for clock"))
             .map(|l| l.trim().trim_start_matches("Info: ").to_string())
             .collect();
-        let timing_fail = fmax.iter().any(|l| l.contains("FAIL"));
+        let gate = cc::timing_gate(spec_str(&err));
         let fmax_note = if fmax.is_empty() {
             "NO Fmax REPORTED -- cannot say the design met timing".to_string()
         } else {
             fmax.join(" | ")
         };
         pnr_stage = Some(Stage {
-            name: if xdc.is_some() { "nextpnr + XDC, Fmax" } else { "nextpnr @70.77MHz, Fmax" },
+            name: cc::source_stage(src),
             secs: t.elapsed().as_secs_f64(),
             code: c,
             // W823 (T557): a KILLED stage has no artefact, whatever is on disk.
@@ -4536,8 +4509,8 @@ pub fn run_silicon(
         }
         // A design that does not meet its own declared period cannot be asked a
         // question about arithmetic: it will answer about settling instead.
-        if timing_fail {
-            println!("FAIL -- nextpnr reports the design MISSES its declared period:");
+        if !cc::gate_loads(gate) {
+            println!("FAIL -- {}:", cc::gate_why(gate));
             for l in &fmax { println!("  {l}"); }
             println!("Nothing was loaded. Slow the wrapper's divider or declare the period it can hold.");
             std::process::exit(1);
