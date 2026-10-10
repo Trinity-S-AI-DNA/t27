@@ -30,16 +30,7 @@ pub const SYM_FN: i64 = 4;
 
 pub const NO_SYM: i64 = -1;
 
-pub fn put(out: &mut [u8], at: usize, w: &'static str) -> usize {
-    let mut k: usize = 0;
-    while (k < w.len()) {
-        out[((at + k)) as usize] = w.as_bytes()[(k) as usize];
-        k = (k + 1);
-    }
-    return (at + w.len());
-}
-
-pub fn put_span(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
+pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
     let mut k: usize = a;
     let mut q: usize = at;
     while (k < b) {
@@ -84,11 +75,11 @@ pub fn put_ind(out: &mut [u8], at: usize, n: usize) -> usize {
 
 pub fn put_name(out: &mut [u8], at: usize, text: &[u8], a: usize, b: usize) -> usize {
     if verilog_keyword(&text[(a) as usize..(b) as usize]) {
-        let mut q: usize = put(out, at, "\\");
-        q = put_span(out, q, text, a, b);
-        return put(out, q, " ");
+        let mut q: usize = put_text(out, at, "\\");
+        q = put_bytes(out, q, text, a, b);
+        return put_text(out, q, " ");
     }
-    return put_span(out, at, text, a, b);
+    return put_bytes(out, at, text, a, b);
 }
 
 pub fn put_range(out: &mut [u8], at: usize, t: i64) -> usize {
@@ -96,22 +87,22 @@ pub fn put_range(out: &mut [u8], at: usize, t: i64) -> usize {
     if (w <= 1) {
         return at;
     }
-    let mut q: usize = put(out, at, "[");
+    let mut q: usize = put_text(out, at, "[");
     let top: u64 = ((w - 1) as u64);
     q = put_dec(out, q, top);
-    return put(out, q, ":0] ");
+    return put_text(out, q, ":0] ");
 }
 
 pub fn put_lit(out: &mut [u8], at: usize, v: u64, t: i64) -> usize {
     if (t == TY_BOOL) {
         if (v == 0) {
-            return put(out, at, "1'b0");
+            return put_text(out, at, "1'b0");
         }
-        return put(out, at, "1'b1");
+        return put_text(out, at, "1'b1");
     }
     let w: u64 = (ty_width(t) as u64);
     let mut q: usize = put_dec(out, at, w);
-    q = put(out, q, "'d");
+    q = put_text(out, q, "'d");
     return put_dec(out, q, v);
 }
 
@@ -135,18 +126,18 @@ pub fn line_near(nodes: &[u8], meta: &[u8], i: usize) -> usize {
 
 pub fn fail(out: &mut [u8], nodes: &[u8], meta: &[u8], text: &[u8], i: usize, what: &'static str, a: usize, b: usize) -> i64 {
     let base: usize = (out.len() - MSG_ROOM);
-    let mut q: usize = put(out, base, "t27b: verilog: unsupported construct ");
-    q = put(out, q, what);
+    let mut q: usize = put_text(out, base, "t27b: verilog: unsupported construct ");
+    q = put_text(out, q, what);
     if (b > a) {
         let mut nb: usize = b;
         if ((nb - a) > NAME_CAP) {
             nb = (a + NAME_CAP);
         }
-        q = put(out, q, " `");
-        q = put_span(out, q, text, a, nb);
-        q = put(out, q, "`");
+        q = put_text(out, q, " `");
+        q = put_bytes(out, q, text, a, nb);
+        q = put_text(out, q, "`");
     }
-    q = put(out, q, " at line ");
+    q = put_text(out, q, " at line ");
     q = put_dec(out, q, (line_near(nodes, meta, i) as u64));
     let len: i64 = ((q - base) as _);
     return (0 - len);
@@ -595,6 +586,9 @@ pub fn item_class(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], c: usize
         if is_mut(meta, c) {
             return C_VAR;
         }
+        if is_input(nodes, text, c) {
+            return C_INPUT;
+        }
         if is_instance(nodes, text, meta, c) {
             return C_INSTANCE;
         }
@@ -637,9 +631,12 @@ pub fn has_net(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], name: &'sta
 pub fn declares_ports(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8]) -> bool {
     let mut c: usize = 1;
     while (c < end(nodes, 0)) {
-        if ((kind(nodes, c) == K_CONST_DECL) && is_pub(meta, c)) {
+        if (kind(nodes, c) == K_CONST_DECL) {
             let cl: u8 = item_class(nodes, text, meta, ptext, c);
-            if ((cl == C_VAR) || (cl == C_NET)) {
+            if (cl == C_INSTANCE) {
+                return true;
+            }
+            if (((cl == C_VAR) || (cl == C_NET)) && is_pub(meta, c)) {
                 return true;
             }
         }
@@ -754,25 +751,25 @@ pub fn put_sym(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8]
         let mut q: usize = at;
         let many: bool = (decl_count_in(nodes, text, item, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME)) > 1);
         if (mode == M_TEST) {
-            q = put(out, q, "t");
+            q = put_text(out, q, "t");
             q = put_dec(out, q, (item as u64));
-            q = put(out, q, "__");
-            q = put_span(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+            q = put_text(out, q, "__");
+            q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
         } else {
             if many {
-                q = put_span(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+                q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
             } else {
                 return put_name(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
             }
         }
         if many {
-            q = put(out, q, "__");
+            q = put_text(out, q, "__");
             q = put_dec(out, q, (d as u64));
         }
         return q;
     }
     if (mode == M_TEST) {
-        let q2: usize = put(out, at, "dut.");
+        let q2: usize = put_text(out, at, "dut.");
         return put_name(out, q2, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
     }
     return put_name(out, at, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
@@ -848,9 +845,9 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
                 let rc: i64 = (q as _);
                 return rc;
             }
-            if (cl == C_NET) {
+            if ((cl == C_NET) || (cl == C_INPUT)) {
                 if (((mode == M_FUNC) || (mode == M_TBFUNC)) || (mode == M_TEST)) {
-                    return fail(out, nodes, meta, text, i, "net read outside the module scope and on_clock", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+                    return fail(out, nodes, meta, text, i, "net or input read outside the module scope and on_clock", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
                 }
             } else {
                 if (cl == C_VAR) {
@@ -877,9 +874,9 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
             if (bi != NO_NODE) {
                 let bii: usize = (bi as _);
                 let nlen: usize = (hi(nodes, bii, F_NAME) - lo(nodes, bii, F_NAME));
-                q = put_span(out, q, text, lo(nodes, bii, F_NAME), hi(nodes, bii, F_NAME));
-                q = put(out, q, "__");
-                q = put_span(out, q, ptext, ((pa + nlen) + 1), pb);
+                q = put_bytes(out, q, text, lo(nodes, bii, F_NAME), hi(nodes, bii, F_NAME));
+                q = put_text(out, q, "__");
+                q = put_bytes(out, q, ptext, ((pa + nlen) + 1), pb);
                 let rb: i64 = (q as _);
                 return rb;
             }
@@ -913,36 +910,36 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
             return fail(out, nodes, meta, text, i, "operator", op_a, op_b);
         }
         if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
-            q = put(out, q, "{");
+            q = put_text(out, q, "{");
         } else {
-            q = put(out, q, "(");
+            q = put_text(out, q, "(");
         }
         let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, lw);
         if (r1 < 0) {
             return r1;
         }
         q = (r1 as _);
-        q = put(out, q, " ");
-        q = put(out, q, verilog_op(&text[(op_a) as usize..(op_b) as usize]));
-        q = put(out, q, " ");
+        q = put_text(out, q, " ");
+        q = put_text(out, q, verilog_op(&text[(op_a) as usize..(op_b) as usize]));
+        q = put_text(out, q, " ");
         let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, r, rw);
         if (r2 < 0) {
             return r2;
         }
         q = (r2 as _);
         if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
-            q = put(out, q, "}");
+            q = put_text(out, q, "}");
         } else {
-            q = put(out, q, ")");
+            q = put_text(out, q, ")");
         }
         let rbn: i64 = (q as _);
         return rbn;
     }
     if (k == K_EXPR_UNARY) {
         if field_eq(nodes, text, i, F_OP, "!") {
-            q = put(out, q, "(!");
+            q = put_text(out, q, "(!");
         } else {
-            q = put(out, q, "{~");
+            q = put_text(out, q, "{~");
         }
         let r3: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), own);
         if (r3 < 0) {
@@ -950,9 +947,9 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         }
         q = (r3 as _);
         if field_eq(nodes, text, i, F_OP, "!") {
-            q = put(out, q, ")");
+            q = put_text(out, q, ")");
         } else {
-            q = put(out, q, "}");
+            q = put_text(out, q, "}");
         }
         let ru: i64 = (q as _);
         return ru;
@@ -974,30 +971,30 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
             return ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
         }
         if (sw < dw) {
-            q = put(out, q, "{");
+            q = put_text(out, q, "{");
             let fillw: i64 = (dw - sw);
             q = put_lit(out, q, 0, fillw);
-            q = put(out, q, ", ");
+            q = put_text(out, q, ", ");
             let r4: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
             if (r4 < 0) {
                 return r4;
             }
             q = (r4 as _);
-            q = put(out, q, "}");
+            q = put_text(out, q, "}");
             let rw2: i64 = (q as _);
             return rw2;
         }
         let dwu: usize = (dw as _);
         work[(((2 * count(nodes)) + dwu)) as usize] = 1;
-        q = put(out, q, "t27_u");
+        q = put_text(out, q, "t27_u");
         q = put_dec(out, q, (dw as u64));
-        q = put(out, q, "(");
+        q = put_text(out, q, "(");
         let r5: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
         if (r5 < 0) {
             return r5;
         }
         q = (r5 as _);
-        q = put(out, q, ")");
+        q = put_text(out, q, ")");
         let rn: i64 = (q as _);
         return rn;
     }
@@ -1008,9 +1005,9 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         if ((mode != M_TOP) && (mode != M_CLOCK)) {
             return fail(out, nodes, meta, text, i, "instance output read outside the module scope and on_clock", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
         }
-        q = put_span(out, q, text, lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
-        q = put(out, q, "__");
-        q = put_span(out, q, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        q = put_bytes(out, q, text, lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
+        q = put_text(out, q, "__");
+        q = put_bytes(out, q, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
         let rf: i64 = (q as _);
         return rf;
     }
@@ -1018,25 +1015,25 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         let c0: usize = (i + 1);
         let a1: usize = end(nodes, c0);
         let a2: usize = end(nodes, a1);
-        q = put(out, q, "(");
+        q = put_text(out, q, "(");
         let r6: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, c0, TY_BOOL);
         if (r6 < 0) {
             return r6;
         }
         q = (r6 as _);
-        q = put(out, q, " ? ");
+        q = put_text(out, q, " ? ");
         let r7: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a1, own);
         if (r7 < 0) {
             return r7;
         }
         q = (r7 as _);
-        q = put(out, q, " : ");
+        q = put_text(out, q, " : ");
         let r8: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a2, own);
         if (r8 < 0) {
             return r8;
         }
         q = (r8 as _);
-        q = put(out, q, ")");
+        q = put_text(out, q, ")");
         let rif: i64 = (q as _);
         return rif;
     }
@@ -1060,15 +1057,15 @@ pub fn ex_call(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8]
         return fail(out, nodes, meta, text, i, "call with the wrong number of arguments", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
     }
     let mut q: usize = put_name(out, at, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
-    q = put(out, q, "(");
+    q = put_text(out, q, "(");
     if (np == 0) {
-        q = put(out, q, "1'b0");
+        q = put_text(out, q, "1'b0");
     }
     let mut a: usize = (i + 1);
     let mut kx: usize = 0;
     while (a < end(nodes, i)) {
         if (kx > 0) {
-            q = put(out, q, ", ");
+            q = put_text(out, q, ", ");
         }
         let pt: i64 = param_type(nodes, text, meta, ptext, fi, kx);
         if !(ty_scalar(pt)) {
@@ -1082,7 +1079,7 @@ pub fn ex_call(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8]
         a = end(nodes, a);
         kx = (kx + 1);
     }
-    q = put(out, q, ")");
+    q = put_text(out, q, ")");
     let rr: i64 = (q as _);
     return rr;
 }
@@ -1141,20 +1138,20 @@ pub fn needs_done(nodes: &[u8], item: usize) -> bool {
 }
 
 pub fn put_guard(out: &mut [u8], at: usize, m: u8, lp: usize, done_name: &'static str) -> usize {
-    let mut q: usize = put(out, at, "if (1'b1");
+    let mut q: usize = put_text(out, at, "if (1'b1");
     if ((m & X_RET) != 0) {
-        q = put(out, q, " && !");
-        q = put(out, q, done_name);
+        q = put_text(out, q, " && !");
+        q = put_text(out, q, done_name);
     }
     if (((m & X_BRK) != 0) && (lp > 0)) {
-        q = put(out, q, " && !t27_brk");
+        q = put_text(out, q, " && !t27_brk");
         q = put_dec(out, q, (lp as u64));
     }
     if (((m & X_CONT) != 0) && (lp > 0)) {
-        q = put(out, q, " && !t27_cont");
+        q = put_text(out, q, " && !t27_cont");
         q = put_dec(out, q, (lp as u64));
     }
-    return put(out, q, ") begin\n");
+    return put_text(out, q, ") begin\n");
 }
 
 pub fn done_flag(mode: u8) -> &'static str {
@@ -1187,7 +1184,7 @@ pub fn stmts(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
             }
             q = (r2 as _);
             q = put_ind(out, q, n);
-            q = put(out, q, "end\n");
+            q = put_text(out, q, "end\n");
             let rg: i64 = (q as _);
             return rg;
         }
@@ -1219,13 +1216,13 @@ pub fn stmt(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], p
         }
         q = put_ind(out, q, n);
         q = put_sym(out, q, nodes, text, meta, ptext, item, mode, sym_of(SYM_LOCAL, s));
-        q = put(out, q, " = ");
+        q = put_text(out, q, " = ");
         let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (s + 1), t);
         if (r1 < 0) {
             return r1;
         }
         q = (r1 as _);
-        q = put(out, q, ";\n");
+        q = put_text(out, q, ";\n");
         let rl: i64 = (q as _);
         return rl;
     }
@@ -1252,18 +1249,18 @@ pub fn stmt(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], p
             }
             q = put_ind(out, q, n);
             q = put_name(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
-            q = put(out, q, " = ");
+            q = put_text(out, q, " = ");
             let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (s + 1), fn_type(nodes, text, item));
             if (r2 < 0) {
                 return r2;
             }
             q = (r2 as _);
-            q = put(out, q, ";\n");
+            q = put_text(out, q, ";\n");
         }
         if guard_ret {
             q = put_ind(out, q, n);
-            q = put(out, q, done_flag(mode));
-            q = put(out, q, " = 1'b1;\n");
+            q = put_text(out, q, done_flag(mode));
+            q = put_text(out, q, " = 1'b1;\n");
         }
         let rr: i64 = (q as _);
         return rr;
@@ -1274,12 +1271,12 @@ pub fn stmt(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], p
         }
         q = put_ind(out, q, n);
         if (k == K_STMT_BREAK) {
-            q = put(out, q, "t27_brk");
+            q = put_text(out, q, "t27_brk");
         } else {
-            q = put(out, q, "t27_cont");
+            q = put_text(out, q, "t27_cont");
         }
         q = put_dec(out, q, (lp as u64));
-        q = put(out, q, " = 1'b1;\n");
+        q = put_text(out, q, " = 1'b1;\n");
         let rb: i64 = (q as _);
         return rb;
     }
@@ -1335,9 +1332,9 @@ pub fn assign(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8],
     q = put_ind(out, q, n);
     q = put_sym(out, q, nodes, text, meta, ptext, item, mode, sy);
     if nonblocking {
-        q = put(out, q, " <= ");
+        q = put_text(out, q, " <= ");
     } else {
-        q = put(out, q, " = ");
+        q = put_text(out, q, " = ");
     }
     let oa: usize = lo(nodes, s, F_OP);
     let ob: usize = hi(nodes, s, F_OP);
@@ -1347,11 +1344,11 @@ pub fn assign(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8],
         if ((oc != OP_ARITH) && (oc != OP_SHIFT)) {
             return fail(out, nodes, meta, text, s, "compound assignment", oa, ob);
         }
-        q = put(out, q, "{");
+        q = put_text(out, q, "{");
         q = put_sym(out, q, nodes, text, meta, ptext, item, mode, sy);
-        q = put(out, q, " ");
-        q = put(out, q, verilog_op(&text[(oa) as usize..((ob - 1)) as usize]));
-        q = put(out, q, " ");
+        q = put_text(out, q, " ");
+        q = put_text(out, q, verilog_op(&text[(oa) as usize..((ob - 1)) as usize]));
+        q = put_text(out, q, " ");
         let mut et: i64 = tt;
         if (oc == OP_SHIFT) {
             et = ty_of(nodes, text, meta, ptext, item, e, 0);
@@ -1364,7 +1361,7 @@ pub fn assign(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8],
             return r1;
         }
         q = (r1 as _);
-        q = put(out, q, "}");
+        q = put_text(out, q, "}");
     } else {
         let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, e, tt);
         if (r2 < 0) {
@@ -1372,7 +1369,7 @@ pub fn assign(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8],
         }
         q = (r2 as _);
     }
-    q = put(out, q, ";\n");
+    q = put_text(out, q, ";\n");
     let ra: i64 = (q as _);
     return ra;
 }
@@ -1384,7 +1381,7 @@ pub fn stmt_if(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8]
         return fail(out, nodes, meta, text, s, "if", 0, 0);
     }
     let mut q: usize = put_ind(out, at, n);
-    q = put(out, q, "if (");
+    q = put_text(out, q, "if (");
     let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, c0, TY_BOOL);
     if (r1 < 0) {
         return r1;
@@ -1393,25 +1390,25 @@ pub fn stmt_if(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8]
         return fail(out, nodes, meta, text, s, "if on a value that is no bool", 0, 0);
     }
     q = (r1 as _);
-    q = put(out, q, ") begin\n");
+    q = put_text(out, q, ") begin\n");
     let r2: i64 = stmts(out, q, nodes, text, meta, ptext, work, item, mode, th, (th + 1), (n + 4), lp, guard_ret);
     if (r2 < 0) {
         return r2;
     }
     q = (r2 as _);
     q = put_ind(out, q, n);
-    q = put(out, q, "end\n");
+    q = put_text(out, q, "end\n");
     let el: usize = end(nodes, th);
     if (el < end(nodes, s)) {
         q = put_ind(out, q, n);
-        q = put(out, q, "else begin\n");
+        q = put_text(out, q, "else begin\n");
         let r3: i64 = stmts(out, q, nodes, text, meta, ptext, work, item, mode, el, (el + 1), (n + 4), lp, guard_ret);
         if (r3 < 0) {
             return r3;
         }
         q = (r3 as _);
         q = put_ind(out, q, n);
-        q = put(out, q, "end\n");
+        q = put_text(out, q, "end\n");
     }
     let ri: i64 = (q as _);
     return ri;
@@ -1458,53 +1455,53 @@ pub fn stmt_while(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
     let mut q: usize = at;
     if ((m & X_BRK) != 0) {
         q = put_ind(out, q, n);
-        q = put(out, q, "t27_brk");
+        q = put_text(out, q, "t27_brk");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " = 1'b0;\n");
+        q = put_text(out, q, " = 1'b0;\n");
     }
     q = put_ind(out, q, n);
     if (bound != NO_BOUND) {
-        q = put(out, q, "for (t27_k");
+        q = put_text(out, q, "for (t27_k");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " = 0; t27_k");
+        q = put_text(out, q, " = 0; t27_k");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " < ");
+        q = put_text(out, q, " < ");
         q = put_dec(out, q, (bound as u64));
-        q = put(out, q, "; t27_k");
+        q = put_text(out, q, "; t27_k");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " = t27_k");
+        q = put_text(out, q, " = t27_k");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " + 1) begin\n");
+        q = put_text(out, q, " + 1) begin\n");
         q = put_ind(out, q, (n + 4));
-        q = put(out, q, "if (");
+        q = put_text(out, q, "if (");
     } else {
-        q = put(out, q, "while (");
+        q = put_text(out, q, "while (");
     }
     if (guard_ret && ((m & X_RET) != 0)) {
-        q = put(out, q, "!");
-        q = put(out, q, done_flag(mode));
-        q = put(out, q, " && ");
+        q = put_text(out, q, "!");
+        q = put_text(out, q, done_flag(mode));
+        q = put_text(out, q, " && ");
     }
     if ((m & X_BRK) != 0) {
-        q = put(out, q, "!t27_brk");
+        q = put_text(out, q, "!t27_brk");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " && ");
+        q = put_text(out, q, " && ");
     }
     let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (w + 1), TY_BOOL);
     if (r1 < 0) {
         return r1;
     }
     q = (r1 as _);
-    q = put(out, q, ") begin\n");
+    q = put_text(out, q, ") begin\n");
     let mut inner: usize = (n + 4);
     if (bound != NO_BOUND) {
         inner = (n + 8);
     }
     if ((m & X_CONT) != 0) {
         q = put_ind(out, q, inner);
-        q = put(out, q, "t27_cont");
+        q = put_text(out, q, "t27_cont");
         q = put_dec(out, q, (w as u64));
-        q = put(out, q, " = 1'b0;\n");
+        q = put_text(out, q, " = 1'b0;\n");
     }
     let r2: i64 = stmts(out, q, nodes, text, meta, ptext, work, item, mode, bi, (bi + 1), inner, w, guard_ret);
     if (r2 < 0) {
@@ -1515,9 +1512,9 @@ pub fn stmt_while(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
         let cei: usize = (ce as _);
         if (guard_ret && ((m & X_RET) != 0)) {
             q = put_ind(out, q, inner);
-            q = put(out, q, "if (!");
-            q = put(out, q, done_flag(mode));
-            q = put(out, q, ") begin\n");
+            q = put_text(out, q, "if (!");
+            q = put_text(out, q, done_flag(mode));
+            q = put_text(out, q, ") begin\n");
         }
         let r3: i64 = stmts(out, q, nodes, text, meta, ptext, work, item, mode, cei, (cei + 1), inner, 0, guard_ret);
         if (r3 < 0) {
@@ -1526,15 +1523,15 @@ pub fn stmt_while(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
         q = (r3 as _);
         if (guard_ret && ((m & X_RET) != 0)) {
             q = put_ind(out, q, inner);
-            q = put(out, q, "end\n");
+            q = put_text(out, q, "end\n");
         }
     }
     if (bound != NO_BOUND) {
         q = put_ind(out, q, (n + 4));
-        q = put(out, q, "end\n");
+        q = put_text(out, q, "end\n");
     }
     q = put_ind(out, q, n);
-    q = put(out, q, "end\n");
+    q = put_text(out, q, "end\n");
     let rw: i64 = (q as _);
     return rw;
 }
@@ -1558,54 +1555,54 @@ pub fn call_stmt(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u
             return fail(out, nodes, meta, text, i, "assert on a value that is no integer or bool", 0, 0);
         }
         q = put_ind(out, q, n);
-        q = put(out, q, "t27_n = t27_n + 1;\n");
+        q = put_text(out, q, "t27_n = t27_n + 1;\n");
         q = put_ind(out, q, n);
-        q = put(out, q, "if (!(");
+        q = put_text(out, q, "if (!(");
         let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a, pt);
         if (r1 < 0) {
             return r1;
         }
         q = (r1 as _);
         if eq {
-            q = put(out, q, " == ");
+            q = put_text(out, q, " == ");
             let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, end(nodes, a), pt);
             if (r2 < 0) {
                 return r2;
             }
             q = (r2 as _);
         }
-        q = put(out, q, ")) begin\n");
+        q = put_text(out, q, ")) begin\n");
         q = put_ind(out, q, (n + 4));
-        q = put(out, q, "if (t27_tf == 0) $display(\"FAIL ");
-        q = put_span(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
-        q = put(out, q, ": ");
+        q = put_text(out, q, "if (t27_tf == 0) $display(\"FAIL ");
+        q = put_bytes(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
+        q = put_text(out, q, ": ");
         if eq {
-            q = put(out, q, "assert_eq at line ");
+            q = put_text(out, q, "assert_eq at line ");
         } else {
-            q = put(out, q, "assert at line ");
+            q = put_text(out, q, "assert at line ");
         }
         q = put_dec(out, q, (line_near(nodes, meta, i) as u64));
         if eq {
-            q = put(out, q, ": %0d != %0d\", ");
+            q = put_text(out, q, ": %0d != %0d\", ");
             let r3: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a, pt);
             if (r3 < 0) {
                 return r3;
             }
             q = (r3 as _);
-            q = put(out, q, ", ");
+            q = put_text(out, q, ", ");
             let r4: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, end(nodes, a), pt);
             if (r4 < 0) {
                 return r4;
             }
             q = (r4 as _);
-            q = put(out, q, ");\n");
+            q = put_text(out, q, ");\n");
         } else {
-            q = put(out, q, "\");\n");
+            q = put_text(out, q, "\");\n");
         }
         q = put_ind(out, q, (n + 4));
-        q = put(out, q, "t27_tf = t27_tf + 1;\n");
+        q = put_text(out, q, "t27_tf = t27_tf + 1;\n");
         q = put_ind(out, q, n);
-        q = put(out, q, "end\n");
+        q = put_text(out, q, "end\n");
         let ra: i64 = (q as _);
         return ra;
     }
@@ -1629,48 +1626,48 @@ pub fn call_stmt(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u
             if (bi == NO_NODE) {
                 q = put_ind(out, q, n);
                 q = put_name(out, q, ptext, pa, pb);
-                q = put(out, q, " = ");
+                q = put_text(out, q, " = ");
                 let r5: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a2, pt2);
                 if (r5 < 0) {
                     return r5;
                 }
                 q = (r5 as _);
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             } else {
                 let bii: usize = (bi as _);
                 let nlen: usize = (hi(nodes, bii, F_NAME) - lo(nodes, bii, F_NAME));
                 q = put_ind(out, q, n);
-                q = put(out, q, "t27_n = t27_n + 1;\n");
+                q = put_text(out, q, "t27_n = t27_n + 1;\n");
                 q = put_ind(out, q, n);
-                q = put(out, q, "if (!(dut.");
-                q = put_span(out, q, text, lo(nodes, bii, F_NAME), hi(nodes, bii, F_NAME));
-                q = put(out, q, "__");
-                q = put_span(out, q, ptext, ((pa + nlen) + 1), pb);
-                q = put(out, q, " == ");
+                q = put_text(out, q, "if (!(dut.");
+                q = put_bytes(out, q, text, lo(nodes, bii, F_NAME), hi(nodes, bii, F_NAME));
+                q = put_text(out, q, "__");
+                q = put_bytes(out, q, ptext, ((pa + nlen) + 1), pb);
+                q = put_text(out, q, " == ");
                 let r6: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, a2, pt2);
                 if (r6 < 0) {
                     return r6;
                 }
                 q = (r6 as _);
-                q = put(out, q, ")) begin\n");
+                q = put_text(out, q, ")) begin\n");
                 q = put_ind(out, q, (n + 4));
-                q = put(out, q, "if (t27_tf == 0) $display(\"FAIL ");
-                q = put_span(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
-                q = put(out, q, ": the instance output ");
-                q = put_span(out, q, ptext, pa, pb);
-                q = put(out, q, " is not the value the test gives at line ");
+                q = put_text(out, q, "if (t27_tf == 0) $display(\"FAIL ");
+                q = put_bytes(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
+                q = put_text(out, q, ": the instance output ");
+                q = put_bytes(out, q, ptext, pa, pb);
+                q = put_text(out, q, " is not the value the test gives at line ");
                 q = put_dec(out, q, (line_near(nodes, meta, i) as u64));
-                q = put(out, q, "\");\n");
+                q = put_text(out, q, "\");\n");
                 q = put_ind(out, q, (n + 4));
-                q = put(out, q, "t27_tf = t27_tf + 1;\n");
+                q = put_text(out, q, "t27_tf = t27_tf + 1;\n");
                 q = put_ind(out, q, n);
-                q = put(out, q, "end\n");
+                q = put_text(out, q, "end\n");
             }
             a2 = end(nodes, a2);
             kx = (kx + 1);
         }
         q = put_ind(out, q, n);
-        q = put(out, q, "t27_clock;\n");
+        q = put_text(out, q, "t27_clock;\n");
         let rc: i64 = (q as _);
         return rc;
     }
@@ -1689,31 +1686,31 @@ pub fn decls(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
                     return fail(out, nodes, meta, text, j, "local that is no integer or bool", lo(nodes, j, F_NAME), hi(nodes, j, F_NAME));
                 }
                 q = put_ind(out, q, n);
-                q = put(out, q, "reg ");
+                q = put_text(out, q, "reg ");
                 q = put_range(out, q, t);
                 q = put_sym(out, q, nodes, text, meta, ptext, item, mode, sym_of(SYM_LOCAL, j));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
         }
         if (k == K_STMT_WHILE) {
             let m: u8 = exits(nodes, j);
             if (loop_bound(nodes, text, meta, ptext, item, j) != NO_BOUND) {
                 q = put_ind(out, q, n);
-                q = put(out, q, "integer t27_k");
+                q = put_text(out, q, "integer t27_k");
                 q = put_dec(out, q, (j as u64));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
             if ((m & X_BRK) != 0) {
                 q = put_ind(out, q, n);
-                q = put(out, q, "reg t27_brk");
+                q = put_text(out, q, "reg t27_brk");
                 q = put_dec(out, q, (j as u64));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
             if ((m & X_CONT) != 0) {
                 q = put_ind(out, q, n);
-                q = put(out, q, "reg t27_cont");
+                q = put_text(out, q, "reg t27_cont");
                 q = put_dec(out, q, (j as u64));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
         }
         if (((((((((((((((((k != K_STMT_LOCAL) && (k != K_STMT_WHILE)) && (k != K_STMT_IF)) && (k != K_MODULE)) && (k != K_STMT_ASSIGN)) && (k != K_EXPR_RETURN)) && (k != K_STMT_EXPR)) && (k != K_STMT_BREAK)) && (k != K_STMT_CONTINUE)) && (k != K_EXPR_LITERAL)) && (k != K_EXPR_IDENTIFIER)) && (k != K_EXPR_CALL)) && (k != K_EXPR_BINARY)) && (k != K_EXPR_UNARY)) && (k != K_EXPR_CAST)) && (k != K_EXPR_IF)) && (k != K_EXPR_FIELD_ACCESS)) {
@@ -1730,17 +1727,17 @@ pub fn function(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
     if !(ty_scalar(rt)) {
         return fail(out, nodes, meta, text, f, "fn whose result is no integer or bool", lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
     }
-    let mut q: usize = put(out, at, "\n    // fn ");
-    q = put_span(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
-    q = put(out, q, " (line ");
+    let mut q: usize = put_text(out, at, "\n    // fn ");
+    q = put_bytes(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, " (line ");
     q = put_dec(out, q, (line_of(meta, f) as u64));
-    q = put(out, q, ")\n    function ");
+    q = put_text(out, q, ")\n    function ");
     q = put_range(out, q, rt);
     q = put_name(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
-    q = put(out, q, ";\n");
+    q = put_text(out, q, ";\n");
     let np: usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
     if (np == 0) {
-        q = put(out, q, "        input t27_none;\n");
+        q = put_text(out, q, "        input t27_none;\n");
     }
     let mut kx: usize = 0;
     while (kx < np) {
@@ -1748,31 +1745,31 @@ pub fn function(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
         if !(ty_scalar(pt)) {
             return fail(out, nodes, meta, text, f, "fn with a parameter that is no integer or bool", lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
         }
-        q = put(out, q, "        input ");
+        q = put_text(out, q, "        input ");
         q = put_range(out, q, pt);
         q = put_name(out, q, ptext, param_name_lo(meta, ptext, f, kx), param_name_hi(meta, ptext, f, kx));
-        q = put(out, q, ";\n");
+        q = put_text(out, q, ";\n");
         kx = (kx + 1);
     }
     let gd: bool = needs_done(nodes, f);
     if gd {
-        q = put(out, q, "        reg t27_done;\n");
+        q = put_text(out, q, "        reg t27_done;\n");
     }
     let r1: i64 = decls(out, q, nodes, text, meta, ptext, f, mode, 8);
     if (r1 < 0) {
         return r1;
     }
     q = (r1 as _);
-    q = put(out, q, "        begin\n");
+    q = put_text(out, q, "        begin\n");
     if gd {
-        q = put(out, q, "            t27_done = 1'b0;\n");
+        q = put_text(out, q, "            t27_done = 1'b0;\n");
     }
     let r2: i64 = stmts(out, q, nodes, text, meta, ptext, work, f, mode, f, (f + 1), 12, 0, gd);
     if (r2 < 0) {
         return r2;
     }
     q = (r2 as _);
-    q = put(out, q, "        end\n    endfunction\n");
+    q = put_text(out, q, "        end\n    endfunction\n");
     let rf: i64 = (q as _);
     return rf;
 }
@@ -1793,15 +1790,15 @@ pub fn functions(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u
     let mut w: usize = 1;
     while (w <= 64) {
         if (work[(((2 * count(nodes)) + w)) as usize] != 0) {
-            q = put(out, q, "\n    function [");
+            q = put_text(out, q, "\n    function [");
             q = put_dec(out, q, ((w - 1) as u64));
-            q = put(out, q, ":0] t27_u");
+            q = put_text(out, q, ":0] t27_u");
             q = put_dec(out, q, (w as u64));
-            q = put(out, q, ";\n        input [63:0] x;\n        t27_u");
+            q = put_text(out, q, ";\n        input [63:0] x;\n        t27_u");
             q = put_dec(out, q, (w as u64));
-            q = put(out, q, " = x[");
+            q = put_text(out, q, " = x[");
             q = put_dec(out, q, ((w - 1) as u64));
-            q = put(out, q, ":0];\n    endfunction\n");
+            q = put_text(out, q, ":0];\n    endfunction\n");
         }
         w = (w + 1);
     }
@@ -1814,21 +1811,21 @@ pub fn ports(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
     let mut first: bool = true;
     if (oc != NO_NODE) {
         if !(has_net(nodes, text, meta, ptext, "clk")) {
-            q = put(out, q, "\n    input  wire clk");
+            q = put_text(out, q, "\n    input  wire clk");
             first = false;
         }
         if !(has_net(nodes, text, meta, ptext, "rst_n")) {
             if !(first) {
-                q = put(out, q, ",");
+                q = put_text(out, q, ",");
             }
-            q = put(out, q, "\n    input  wire rst_n");
+            q = put_text(out, q, "\n    input  wire rst_n");
             first = false;
         }
         if !(has_net(nodes, text, meta, ptext, "en")) {
             if !(first) {
-                q = put(out, q, ",");
+                q = put_text(out, q, ",");
             }
-            q = put(out, q, "\n    input  wire en");
+            q = put_text(out, q, "\n    input  wire en");
             first = false;
         }
         let oci: usize = (oc as _);
@@ -1843,15 +1840,32 @@ pub fn ports(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
                     return fail(out, nodes, meta, text, oci, "on_clock parameter that is no integer or bool", pa, pb);
                 }
                 if !(first) {
-                    q = put(out, q, ",");
+                    q = put_text(out, q, ",");
                 }
-                q = put(out, q, "\n    input  wire ");
+                q = put_text(out, q, "\n    input  wire ");
                 q = put_range(out, q, pt);
                 q = put_name(out, q, ptext, pa, pb);
                 first = false;
             }
             kx = (kx + 1);
         }
+    }
+    let mut ci: usize = 1;
+    while (ci < end(nodes, 0)) {
+        if ((item_class(nodes, text, meta, ptext, ci) == C_INPUT) && !(((oc != NO_NODE) && implicit_port(&text[(lo(nodes, ci, F_NAME)) as usize..(hi(nodes, ci, F_NAME)) as usize])))) {
+            let it: i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, ci), 0);
+            if !(ty_scalar(it)) {
+                return fail(out, nodes, meta, text, ci, "input that is no integer or bool", lo(nodes, ci, F_NAME), hi(nodes, ci, F_NAME));
+            }
+            if !(first) {
+                q = put_text(out, q, ",");
+            }
+            q = put_text(out, q, "\n    input  wire ");
+            q = put_range(out, q, it);
+            q = put_name(out, q, text, lo(nodes, ci, F_NAME), hi(nodes, ci, F_NAME));
+            first = false;
+        }
+        ci = end(nodes, ci);
     }
     let dp: bool = declares_ports(nodes, text, meta, ptext);
     let mut c: usize = 1;
@@ -1862,12 +1876,12 @@ pub fn ports(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
                 return fail(out, nodes, meta, text, c, "port that is no integer or bool", lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
             }
             if !(first) {
-                q = put(out, q, ",");
+                q = put_text(out, q, ",");
             }
             if (item_class(nodes, text, meta, ptext, c) == C_VAR) {
-                q = put(out, q, "\n    output reg  ");
+                q = put_text(out, q, "\n    output reg  ");
             } else {
-                q = put(out, q, "\n    output wire ");
+                q = put_text(out, q, "\n    output wire ");
             }
             q = put_range(out, q, t);
             q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
@@ -1879,7 +1893,7 @@ pub fn ports(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
     return rp;
 }
 
-pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], c: usize) -> i64 {
+pub fn put_instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], c: usize, wires: bool) -> i64 {
     let call: usize = (c + 1);
     let arg0: usize = (call + 1);
     let f: i64 = find_fn(nodes, text, lo(nodes, call, F_NAME), hi(nodes, call, F_NAME));
@@ -1890,30 +1904,34 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
     }
     let sd: i64 = result_struct(nodes, text, c);
     let mut q: usize = at;
-    q = put(out, q, "\n    // instance ");
-    q = put_span(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-    q = put(out, q, " of ");
-    q = put_span(out, q, text, lo(nodes, call, F_NAME), hi(nodes, call, F_NAME));
-    q = put(out, q, " (line ");
-    q = put_dec(out, q, (line_near(nodes, meta, c) as u64));
-    q = put(out, q, ")\n");
-    if (sd != NO_NODE) {
-        let sdi: usize = (sd as _);
-        let mut fl: usize = (sdi + 1);
-        while (fl < end(nodes, sdi)) {
-            let ft: i64 = type_code(text, lo(nodes, fl, F_TYPE), hi(nodes, fl, F_TYPE));
-            if !(ty_scalar(ft)) {
-                return fail(out, nodes, meta, text, c, "extern output that is no integer or bool", lo(nodes, fl, F_NAME), hi(nodes, fl, F_NAME));
+    if wires {
+        if (sd != NO_NODE) {
+            let sdw: usize = (sd as _);
+            let mut fw: usize = (sdw + 1);
+            while (fw < end(nodes, sdw)) {
+                let ftw: i64 = type_code(text, lo(nodes, fw, F_TYPE), hi(nodes, fw, F_TYPE));
+                if !(ty_scalar(ftw)) {
+                    return fail(out, nodes, meta, text, c, "extern output that is no integer or bool", lo(nodes, fw, F_NAME), hi(nodes, fw, F_NAME));
+                }
+                q = put_text(out, q, "    wire ");
+                q = put_range(out, q, ftw);
+                q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+                q = put_text(out, q, "__");
+                q = put_bytes(out, q, text, lo(nodes, fw, F_NAME), hi(nodes, fw, F_NAME));
+                q = put_text(out, q, ";\n");
+                fw = end(nodes, fw);
             }
-            q = put(out, q, "    wire ");
-            q = put_range(out, q, ft);
-            q = put_span(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, "__");
-            q = put_span(out, q, text, lo(nodes, fl, F_NAME), hi(nodes, fl, F_NAME));
-            q = put(out, q, ";\n");
-            fl = end(nodes, fl);
         }
+        let rw: i64 = (q as _);
+        return rw;
     }
+    q = put_text(out, q, "\n    // instance ");
+    q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+    q = put_text(out, q, " of ");
+    q = put_bytes(out, q, text, lo(nodes, call, F_NAME), hi(nodes, call, F_NAME));
+    q = put_text(out, q, " (line ");
+    q = put_dec(out, q, (line_near(nodes, meta, c) as u64));
+    q = put_text(out, q, ")\n");
     let mut nattr: usize = 0;
     let mut a: usize = arg0;
     let mut kx: usize = 0;
@@ -1930,11 +1948,11 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
             }
             if (fold_val(nodes, text, meta, ptext, 0, a, 0) == 1) {
                 if (nattr == 0) {
-                    q = put(out, q, "    (* ");
+                    q = put_text(out, q, "    (* ");
                 } else {
-                    q = put(out, q, ", ");
+                    q = put_text(out, q, ", ");
                 }
-                q = put_span(out, q, ptext, pa, pb);
+                q = put_bytes(out, q, ptext, pa, pb);
                 nattr = (nattr + 1);
             }
         }
@@ -1942,10 +1960,10 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
         kx = (kx + 1);
     }
     if (nattr > 0) {
-        q = put(out, q, " *)\n");
+        q = put_text(out, q, " *)\n");
     }
-    q = put(out, q, "    ");
-    q = put_span(out, q, text, lo(nodes, call, F_NAME), hi(nodes, call, F_NAME));
+    q = put_text(out, q, "    ");
+    q = put_bytes(out, q, text, lo(nodes, call, F_NAME), hi(nodes, call, F_NAME));
     let mut npar: usize = 0;
     a = arg0;
     kx = 0;
@@ -1955,30 +1973,30 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
         let pt2: i64 = param_type(nodes, text, meta, ptext, fi, kx);
         if (param_role(&ptext[(pa2) as usize..(pb2) as usize], pt2) == ROLE_PARAM) {
             if (npar == 0) {
-                q = put(out, q, " #(");
+                q = put_text(out, q, " #(");
             } else {
-                q = put(out, q, ", ");
+                q = put_text(out, q, ", ");
             }
-            q = put(out, q, ".");
-            q = put_span(out, q, ptext, pa2, pb2);
-            q = put(out, q, "(");
+            q = put_text(out, q, ".");
+            q = put_bytes(out, q, ptext, pa2, port_name_end(ptext, pa2, pb2));
+            q = put_text(out, q, "(");
             let r1: i64 = param_value(out, q, nodes, text, meta, ptext, a, pt2);
             if (r1 < 0) {
                 return r1;
             }
             q = (r1 as _);
-            q = put(out, q, ")");
+            q = put_text(out, q, ")");
             npar = (npar + 1);
         }
         a = end(nodes, a);
         kx = (kx + 1);
     }
     if (npar > 0) {
-        q = put(out, q, ")");
+        q = put_text(out, q, ")");
     }
-    q = put(out, q, " ");
+    q = put_text(out, q, " ");
     q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-    q = put(out, q, " (");
+    q = put_text(out, q, " (");
     let mut nport: usize = 0;
     a = arg0;
     kx = 0;
@@ -1988,17 +2006,17 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
         let pt3: i64 = param_type(nodes, text, meta, ptext, fi, kx);
         if (param_role(&ptext[(pa3) as usize..(pb3) as usize], pt3) == ROLE_PORT) {
             if (nport > 0) {
-                q = put(out, q, ",");
+                q = put_text(out, q, ",");
             }
-            q = put(out, q, "\n        .");
-            q = put_span(out, q, ptext, pa3, pb3);
-            q = put(out, q, "(");
+            q = put_text(out, q, "\n        .");
+            q = put_bytes(out, q, ptext, pa3, port_name_end(ptext, pa3, pb3));
+            q = put_text(out, q, "(");
             let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, 0, M_TOP, a, pt3);
             if (r2 < 0) {
                 return r2;
             }
             q = (r2 as _);
-            q = put(out, q, ")");
+            q = put_text(out, q, ")");
             nport = (nport + 1);
         }
         a = end(nodes, a);
@@ -2009,20 +2027,20 @@ pub fn instance(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8
         let mut fo: usize = (sdj + 1);
         while (fo < end(nodes, sdj)) {
             if (nport > 0) {
-                q = put(out, q, ",");
+                q = put_text(out, q, ",");
             }
-            q = put(out, q, "\n        .");
-            q = put_span(out, q, text, lo(nodes, fo, F_NAME), hi(nodes, fo, F_NAME));
-            q = put(out, q, "(");
-            q = put_span(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, "__");
-            q = put_span(out, q, text, lo(nodes, fo, F_NAME), hi(nodes, fo, F_NAME));
-            q = put(out, q, ")");
+            q = put_text(out, q, "\n        .");
+            q = put_bytes(out, q, text, lo(nodes, fo, F_NAME), hi(nodes, fo, F_NAME));
+            q = put_text(out, q, "(");
+            q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+            q = put_text(out, q, "__");
+            q = put_bytes(out, q, text, lo(nodes, fo, F_NAME), hi(nodes, fo, F_NAME));
+            q = put_text(out, q, ")");
             nport = (nport + 1);
             fo = end(nodes, fo);
         }
     }
-    q = put(out, q, ");\n");
+    q = put_text(out, q, ");\n");
     let ri: i64 = (q as _);
     return ri;
 }
@@ -2043,9 +2061,9 @@ pub fn param_value(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
         if ((kind(nodes, v) != K_EXPR_LITERAL) || !(field_eq(nodes, text, v, F_KIND, "string"))) {
             return fail(out, nodes, meta, text, a, "string parameter that is no string literal", 0, 0);
         }
-        q = put(out, q, "\"");
-        q = put_span(out, q, text, lo(nodes, v, F_VALUE), hi(nodes, v, F_VALUE));
-        q = put(out, q, "\"");
+        q = put_text(out, q, "\"");
+        q = put_bytes(out, q, text, lo(nodes, v, F_VALUE), hi(nodes, v, F_VALUE));
+        q = put_text(out, q, "\"");
         let rs: i64 = (q as _);
         return rs;
     }
@@ -2053,7 +2071,7 @@ pub fn param_value(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
         if ((kind(nodes, v) != K_EXPR_LITERAL) || !(float_text(text, lo(nodes, v, F_VALUE), hi(nodes, v, F_VALUE)))) {
             return fail(out, nodes, meta, text, a, "float parameter that is no float literal", 0, 0);
         }
-        q = put_span(out, q, text, lo(nodes, v, F_VALUE), hi(nodes, v, F_VALUE));
+        q = put_bytes(out, q, text, lo(nodes, v, F_VALUE), hi(nodes, v, F_VALUE));
         let rfl: i64 = (q as _);
         return rfl;
     }
@@ -2069,23 +2087,21 @@ pub fn module_text(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
     let oc: i64 = clock_fn(nodes, text);
     let dp: bool = declares_ports(nodes, text, meta, ptext);
     let mut q: usize = at;
-    q = put(out, q, "\nmodule ");
+    q = put_text(out, q, "\nmodule ");
     q = put_name(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
-    q = put(out, q, " (");
+    q = put_text(out, q, " (");
     let r1: i64 = ports(out, q, nodes, text, meta, ptext, oc);
     if (r1 < 0) {
         return r1;
     }
     q = (r1 as _);
-    q = put(out, q, "\n);\n");
+    q = put_text(out, q, "\n);\n");
     let mut c: usize = 1;
     while (c < end(nodes, 0)) {
         let cl: u8 = item_class(nodes, text, meta, ptext, c);
         let k: u8 = kind(nodes, c);
-        if ((((k == K_ENUM_DECL) || (k == K_STMT_LOCAL)) || (k == K_STMT_ASSIGN)) || (k == K_STMT_EXPR)) {
-            if (k != K_ENUM_DECL) {
-                return fail(out, nodes, meta, text, c, kind_label(k), lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            }
+        if (((k == K_STMT_LOCAL) || (k == K_STMT_ASSIGN)) || (k == K_STMT_EXPR)) {
+            return fail(out, nodes, meta, text, c, kind_label(k), lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
         }
         if (cl == C_VAR) {
             let t: i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c), 0);
@@ -2098,41 +2114,25 @@ pub fn module_text(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
                 }
             }
             if !(is_output(nodes, text, meta, ptext, c, dp)) {
-                q = put(out, q, "    reg ");
+                q = put_text(out, q, "    reg ");
                 q = put_range(out, q, t);
                 q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
         }
-        if (cl == C_NET) {
-            let tn: i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c), 0);
-            if !(is_output(nodes, text, meta, ptext, c, dp)) {
-                q = put(out, q, "    wire ");
-                q = put_range(out, q, tn);
-                q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-                q = put(out, q, ";\n");
-            }
-            q = put(out, q, "    assign ");
+        if ((cl == C_NET) && !(is_output(nodes, text, meta, ptext, c, dp))) {
+            q = put_text(out, q, "    wire ");
+            q = put_range(out, q, sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c), 0));
             q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, " = ");
-            let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, 0, M_TOP, (c + 1), tn);
-            if (r2 < 0) {
-                return r2;
-            }
-            q = (r2 as _);
-            q = put(out, q, ";\n");
+            q = put_text(out, q, ";\n");
         }
         if (((cl == C_CONST) && implicit_port(&text[(lo(nodes, c, F_NAME)) as usize..(hi(nodes, c, F_NAME)) as usize])) && (oc != NO_NODE)) {
-            q = put(out, q, "    wire ");
+            q = put_text(out, q, "    wire ");
             q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, ";\n    assign ");
-            q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, " = ");
-            q = put_lit(out, q, fold_val(nodes, text, meta, ptext, 0, (c + 1), 0), TY_BOOL);
-            q = put(out, q, ";\n");
+            q = put_text(out, q, ";\n");
         }
         if (cl == C_INSTANCE) {
-            let r3: i64 = instance(out, q, nodes, text, meta, ptext, work, c);
+            let r3: i64 = put_instance(out, q, nodes, text, meta, ptext, work, c, true);
             if (r3 < 0) {
                 return r3;
             }
@@ -2140,20 +2140,50 @@ pub fn module_text(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
         }
         c = end(nodes, c);
     }
-    q = put(out, q, "\n    initial begin\n");
+    let mut c1: usize = 1;
+    while (c1 < end(nodes, 0)) {
+        let cl1: u8 = item_class(nodes, text, meta, ptext, c1);
+        if (cl1 == C_NET) {
+            q = put_text(out, q, "    assign ");
+            q = put_name(out, q, text, lo(nodes, c1, F_NAME), hi(nodes, c1, F_NAME));
+            q = put_text(out, q, " = ");
+            let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, 0, M_TOP, (c1 + 1), sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c1), 0));
+            if (r2 < 0) {
+                return r2;
+            }
+            q = (r2 as _);
+            q = put_text(out, q, ";\n");
+        }
+        if (((cl1 == C_CONST) && implicit_port(&text[(lo(nodes, c1, F_NAME)) as usize..(hi(nodes, c1, F_NAME)) as usize])) && (oc != NO_NODE)) {
+            q = put_text(out, q, "    assign ");
+            q = put_name(out, q, text, lo(nodes, c1, F_NAME), hi(nodes, c1, F_NAME));
+            q = put_text(out, q, " = ");
+            q = put_lit(out, q, fold_val(nodes, text, meta, ptext, 0, (c1 + 1), 0), TY_BOOL);
+            q = put_text(out, q, ";\n");
+        }
+        if (cl1 == C_INSTANCE) {
+            let r4: i64 = put_instance(out, q, nodes, text, meta, ptext, work, c1, false);
+            if (r4 < 0) {
+                return r4;
+            }
+            q = (r4 as _);
+        }
+        c1 = end(nodes, c1);
+    }
+    q = put_text(out, q, "\n    initial begin\n");
     let mut c2: usize = 1;
     while (c2 < end(nodes, 0)) {
         if ((item_class(nodes, text, meta, ptext, c2) == C_VAR) && !(ident_is(nodes, text, (c2 + 1), b"undefined"))) {
             let t2: i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c2), 0);
-            q = put(out, q, "        ");
+            q = put_text(out, q, "        ");
             q = put_name(out, q, text, lo(nodes, c2, F_NAME), hi(nodes, c2, F_NAME));
-            q = put(out, q, " = ");
+            q = put_text(out, q, " = ");
             q = put_lit(out, q, fold_val(nodes, text, meta, ptext, 0, (c2 + 1), 0), t2);
-            q = put(out, q, ";\n");
+            q = put_text(out, q, ";\n");
         }
         c2 = end(nodes, c2);
     }
-    q = put(out, q, "    end\n");
+    q = put_text(out, q, "    end\n");
     if (oc != NO_NODE) {
         let oci: usize = (oc as _);
         let r4: i64 = clocked(out, q, nodes, text, meta, ptext, work, oci);
@@ -2167,47 +2197,47 @@ pub fn module_text(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &
         return r5;
     }
     q = (r5 as _);
-    q = put(out, q, "endmodule\n");
+    q = put_text(out, q, "endmodule\n");
     let rm: i64 = (q as _);
     return rm;
 }
 
 pub fn clocked(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], oc: usize) -> i64 {
-    let mut q: usize = put(out, at, "\n    // on_clock (line ");
+    let mut q: usize = put_text(out, at, "\n    // on_clock (line ");
     q = put_dec(out, q, (line_of(meta, oc) as u64));
-    q = put(out, q, "): its locals are registers written with `=` before they are read\n");
+    q = put_text(out, q, "): its locals are registers written with `=` before they are read\n");
     let gd: bool = needs_done(nodes, oc);
     if gd {
-        q = put(out, q, "    reg t27_oc_done;\n");
+        q = put_text(out, q, "    reg t27_oc_done;\n");
     }
     let r1: i64 = decls(out, q, nodes, text, meta, ptext, oc, M_CLOCK, 4);
     if (r1 < 0) {
         return r1;
     }
     q = (r1 as _);
-    q = put(out, q, "    always @(posedge clk or negedge rst_n) begin\n        if (!rst_n) begin\n");
+    q = put_text(out, q, "    always @(posedge clk or negedge rst_n) begin\n        if (!rst_n) begin\n");
     let mut c: usize = 1;
     while (c < end(nodes, 0)) {
         if ((item_class(nodes, text, meta, ptext, c) == C_VAR) && !(ident_is(nodes, text, (c + 1), b"undefined"))) {
             let t: i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c), 0);
-            q = put(out, q, "            ");
+            q = put_text(out, q, "            ");
             q = put_name(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
-            q = put(out, q, " <= ");
+            q = put_text(out, q, " <= ");
             q = put_lit(out, q, fold_val(nodes, text, meta, ptext, 0, (c + 1), 0), t);
-            q = put(out, q, ";\n");
+            q = put_text(out, q, ";\n");
         }
         c = end(nodes, c);
     }
-    q = put(out, q, "        end else if (en) begin\n");
+    q = put_text(out, q, "        end else if (en) begin\n");
     if gd {
-        q = put(out, q, "            t27_oc_done = 1'b0;\n");
+        q = put_text(out, q, "            t27_oc_done = 1'b0;\n");
     }
     let r2: i64 = stmts(out, q, nodes, text, meta, ptext, work, oc, M_CLOCK, oc, (oc + 1), 12, 0, gd);
     if (r2 < 0) {
         return r2;
     }
     q = (r2 as _);
-    q = put(out, q, "        end\n    end\n");
+    q = put_text(out, q, "        end\n    end\n");
     let rc: i64 = (q as _);
     return rc;
 }
@@ -2231,33 +2261,33 @@ pub fn test_bench(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
         let r0: i64 = (q as _);
         return r0;
     }
-    q = put(out, q, "\n`ifdef T27B_TESTBENCH\nmodule ");
-    q = put_span(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
-    q = put(out, q, "_tb;\n");
+    q = put_text(out, q, "\n`ifdef T27B_TESTBENCH\nmodule ");
+    q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
+    q = put_text(out, q, "_tb;\n");
     let mut c: usize = 1;
     while (c < end(nodes, 0)) {
         if (item_class(nodes, text, meta, ptext, c) == C_INSTANCE) {
-            q = put(out, q, "    // needs the simulation model of ");
-            q = put_span(out, q, text, lo(nodes, (c + 1), F_NAME), hi(nodes, (c + 1), F_NAME));
-            q = put(out, q, "\n");
+            q = put_text(out, q, "    // needs the simulation model of ");
+            q = put_bytes(out, q, text, lo(nodes, (c + 1), F_NAME), hi(nodes, (c + 1), F_NAME));
+            q = put_text(out, q, "\n");
         }
         c = end(nodes, c);
     }
-    q = put(out, q, "    integer t27_n = 0;\n    integer t27_n0 = 0;\n    integer t27_tf = 0;\n    integer t27_pass = 0;\n    integer t27_fail = 0;\n");
+    q = put_text(out, q, "    integer t27_n = 0;\n    integer t27_n0 = 0;\n    integer t27_tf = 0;\n    integer t27_pass = 0;\n    integer t27_fail = 0;\n");
     if (oc != NO_NODE) {
         let oci: usize = (oc as _);
-        q = put(out, q, "    reg clk = 1'b0;\n    reg rst_n = 1'b1;\n    reg en = 1'b1;\n");
+        q = put_text(out, q, "    reg clk = 1'b0;\n    reg rst_n = 1'b1;\n    reg en = 1'b1;\n");
         let np: usize = param_count(ptext, params_lo(meta, oci), params_hi(meta, oci));
         let mut kx: usize = 0;
         while (kx < np) {
             let pt: i64 = param_type(nodes, text, meta, ptext, oci, kx);
             if (bound_instance(nodes, text, meta, ptext, param_name_lo(meta, ptext, oci, kx), param_name_hi(meta, ptext, oci, kx)) == NO_NODE) {
-                q = put(out, q, "    reg ");
+                q = put_text(out, q, "    reg ");
                 q = put_range(out, q, pt);
                 q = put_name(out, q, ptext, param_name_lo(meta, ptext, oci, kx), param_name_hi(meta, ptext, oci, kx));
-                q = put(out, q, " = ");
+                q = put_text(out, q, " = ");
                 q = put_lit(out, q, 0, pt);
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
             kx = (kx + 1);
         }
@@ -2265,47 +2295,47 @@ pub fn test_bench(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
         let mut c3: usize = 1;
         while (c3 < end(nodes, 0)) {
             if ((kind(nodes, c3) == K_CONST_DECL) && is_output(nodes, text, meta, ptext, c3, dp)) {
-                q = put(out, q, "    wire ");
+                q = put_text(out, q, "    wire ");
                 q = put_range(out, q, sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, c3), 0));
                 q = put_name(out, q, text, lo(nodes, c3, F_NAME), hi(nodes, c3, F_NAME));
-                q = put(out, q, ";\n");
+                q = put_text(out, q, ";\n");
             }
             c3 = end(nodes, c3);
         }
-        q = put(out, q, "    ");
+        q = put_text(out, q, "    ");
         q = put_name(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
-        q = put(out, q, " dut (.clk(clk)");
+        q = put_text(out, q, " dut (.clk(clk)");
         if !(has_net(nodes, text, meta, ptext, "rst_n")) {
-            q = put(out, q, ", .rst_n(rst_n)");
+            q = put_text(out, q, ", .rst_n(rst_n)");
         }
         if !(has_net(nodes, text, meta, ptext, "en")) {
-            q = put(out, q, ", .en(en)");
+            q = put_text(out, q, ", .en(en)");
         }
         kx = 0;
         while (kx < np) {
             if (bound_instance(nodes, text, meta, ptext, param_name_lo(meta, ptext, oci, kx), param_name_hi(meta, ptext, oci, kx)) == NO_NODE) {
-                q = put(out, q, ", .");
+                q = put_text(out, q, ", .");
                 q = put_name(out, q, ptext, param_name_lo(meta, ptext, oci, kx), param_name_hi(meta, ptext, oci, kx));
-                q = put(out, q, "(");
+                q = put_text(out, q, "(");
                 q = put_name(out, q, ptext, param_name_lo(meta, ptext, oci, kx), param_name_hi(meta, ptext, oci, kx));
-                q = put(out, q, ")");
+                q = put_text(out, q, ")");
             }
             kx = (kx + 1);
         }
         c3 = 1;
         while (c3 < end(nodes, 0)) {
             if ((kind(nodes, c3) == K_CONST_DECL) && is_output(nodes, text, meta, ptext, c3, dp)) {
-                q = put(out, q, ", .");
+                q = put_text(out, q, ", .");
                 q = put_name(out, q, text, lo(nodes, c3, F_NAME), hi(nodes, c3, F_NAME));
-                q = put(out, q, "(");
+                q = put_text(out, q, "(");
                 q = put_name(out, q, text, lo(nodes, c3, F_NAME), hi(nodes, c3, F_NAME));
-                q = put(out, q, ")");
+                q = put_text(out, q, ")");
             }
             c3 = end(nodes, c3);
         }
-        q = put(out, q, ");\n");
-        q = put(out, q, "    task t27_clock;\n        begin\n            #1 clk = 1'b1;\n            #1 clk = 1'b0;\n            #1;\n        end\n    endtask\n");
-        q = put(out, q, "    task t27_reset;\n        begin\n            rst_n = 1'b0;\n            #1 rst_n = 1'b1;\n            #1;\n        end\n    endtask\n");
+        q = put_text(out, q, ");\n");
+        q = put_text(out, q, "    task t27_clock;\n        begin\n            #1 clk = 1'b1;\n            #1 clk = 1'b0;\n            #1;\n        end\n    endtask\n");
+        q = put_text(out, q, "    task t27_reset;\n        begin\n            rst_n = 1'b0;\n            #1 rst_n = 1'b1;\n            #1;\n        end\n    endtask\n");
     }
     let mut c4: usize = 1;
     while (c4 < end(nodes, 0)) {
@@ -2318,43 +2348,43 @@ pub fn test_bench(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
         }
         c4 = end(nodes, c4);
     }
-    q = put(out, q, "    initial begin\n");
+    q = put_text(out, q, "    initial begin\n");
     let mut ntests: usize = 0;
     let mut c5: usize = 1;
     while (c5 < end(nodes, 0)) {
         if (kind(nodes, c5) == K_TEST_BLOCK) {
-            q = put(out, q, "        // test ");
-            q = put_span(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
-            q = put(out, q, "\n");
+            q = put_text(out, q, "        // test ");
+            q = put_bytes(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
+            q = put_text(out, q, "\n");
             if (oc != NO_NODE) {
-                q = put(out, q, "        t27_reset;\n");
+                q = put_text(out, q, "        t27_reset;\n");
             }
-            q = put(out, q, "        t27_tf = 0;\n        t27_n0 = t27_n;\n");
+            q = put_text(out, q, "        t27_tf = 0;\n        t27_n0 = t27_n;\n");
             let r2: i64 = stmts(out, q, nodes, text, meta, ptext, work, c5, M_TEST, c5, (c5 + 1), 8, 0, false);
             if (r2 < 0) {
                 return r2;
             }
             q = (r2 as _);
-            q = put(out, q, "        if (t27_tf == 0) begin\n            t27_pass = t27_pass + 1;\n            $display(\"PASS ");
-            q = put_span(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
-            q = put(out, q, " (%0d runtime asserts)\", t27_n - t27_n0);\n        end else begin\n            t27_fail = t27_fail + 1;\n            $display(\"FAIL ");
-            q = put_span(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
-            q = put(out, q, " (%0d asserts failed)\", t27_tf);\n        end\n");
+            q = put_text(out, q, "        if (t27_tf == 0) begin\n            t27_pass = t27_pass + 1;\n            $display(\"PASS ");
+            q = put_bytes(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
+            q = put_text(out, q, " (%0d runtime asserts)\", t27_n - t27_n0);\n        end else begin\n            t27_fail = t27_fail + 1;\n            $display(\"FAIL ");
+            q = put_bytes(out, q, text, lo(nodes, c5, F_NAME), hi(nodes, c5, F_NAME));
+            q = put_text(out, q, " (%0d asserts failed)\", t27_tf);\n        end\n");
             ntests = (ntests + 1);
         }
         c5 = end(nodes, c5);
     }
-    q = put(out, q, "        $display(\"t27b verilog test bench ");
-    q = put_span(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
-    q = put(out, q, ": %0d passed, %0d failed, %0d tests, %0d runtime asserts\", t27_pass, t27_fail, ");
+    q = put_text(out, q, "        $display(\"t27b verilog test bench ");
+    q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
+    q = put_text(out, q, ": %0d passed, %0d failed, %0d tests, %0d runtime asserts\", t27_pass, t27_fail, ");
     q = put_dec(out, q, (ntests as u64));
-    q = put(out, q, ", t27_n);\n        $finish;\n    end\n");
+    q = put_text(out, q, ", t27_n);\n        $finish;\n    end\n");
     let r3: i64 = functions(out, q, nodes, text, meta, ptext, work, n, M_TBFUNC);
     if (r3 < 0) {
         return r3;
     }
     q = (r3 as _);
-    q = put(out, q, "endmodule\n`endif\n");
+    q = put_text(out, q, "endmodule\n`endif\n");
     let rb: i64 = (q as _);
     return rb;
 }
@@ -2364,10 +2394,10 @@ pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8
         return fail_front(out, "file with no module node");
     }
     closures(nodes, text, meta, ptext, work);
-    let mut q: usize = put(out, 0, "// Generated by t27b verilog from module ");
-    q = put_span(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
-    q = put(out, q, " -- DO NOT EDIT; the decisions are specs/tri/t27b/verilog_plan.t27\n");
-    q = put(out, q, "// phi^2 + 1/phi^2 = 3 | TRINITY\n`timescale 1ns / 1ps\n`default_nettype none\n");
+    let mut q: usize = put_text(out, 0, "// Generated by t27b verilog from module ");
+    q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
+    q = put_text(out, q, " -- DO NOT EDIT; the decisions are specs/tri/t27b/verilog_plan.t27\n");
+    q = put_text(out, q, "// phi^2 + 1/phi^2 = 3 | TRINITY\n`timescale 1ns / 1ps\n`default_nettype none\n");
     let r1: i64 = module_text(out, q, nodes, text, meta, ptext, work);
     if (r1 < 0) {
         let ml1: usize = ((0 - r1) as _);
@@ -2377,14 +2407,14 @@ pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8
     let keep: usize = q;
     let r2: i64 = test_bench(out, q, nodes, text, meta, ptext, work);
     if (r2 < 0) {
-        q = put(out, keep, "\n// The test bench does not lower: ");
+        q = put_text(out, keep, "\n// The test bench does not lower: ");
         let ml: usize = ((0 - r2) as _);
         q = copy_msg(out, q, ml);
-        q = put(out, q, "\n");
+        q = put_text(out, q, "\n");
     } else {
         q = (r2 as _);
     }
-    q = put(out, q, "`default_nettype wire\n");
+    q = put_text(out, q, "`default_nettype wire\n");
     if ((q + MSG_ROOM) > out.len()) {
         return fail_front(out, "output larger than the buffer");
     }
@@ -2393,42 +2423,30 @@ pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8
 }
 
 pub fn fail_front(out: &mut [u8], what: &'static str) -> i64 {
-    let mut q: usize = put(out, 0, "t27b: verilog: unsupported construct ");
-    q = put(out, q, what);
+    let mut q: usize = put_text(out, 0, "t27b: verilog: unsupported construct ");
+    q = put_text(out, q, what);
     let l: i64 = (q as _);
     return (0 - l);
 }
 
-pub fn tput32(buf: &mut [u8], at: usize, v: usize) -> () {
-    buf[(at) as usize] = ((v % 256) as _);
-    buf[((at + 1)) as usize] = (((v / 256) % 256) as _);
-    buf[((at + 2)) as usize] = (((v / 65536) % 256) as _);
-    buf[((at + 3)) as usize] = ((v / 16777216) as _);
-}
-
 pub fn tnode(buf: &mut [u8], i: usize, k: u8, e: usize, a: usize, b: usize) -> () {
     buf[((i * REC)) as usize] = k;
-    tput32(buf, ((i * REC) + 4), e);
+    vput32(buf, ((i * REC) + 4), e);
     let mut f: usize = 0;
     while (f < FIELDS) {
-        tput32(buf, (((i * REC) + 8) + (f * 8)), 0);
-        tput32(buf, (((i * REC) + 12) + (f * 8)), 0);
+        vput32(buf, (((i * REC) + 8) + (f * 8)), 0);
+        vput32(buf, (((i * REC) + 12) + (f * 8)), 0);
         f = (f + 1);
     }
-    tput32(buf, ((i * REC) + 8), a);
-    tput32(buf, ((i * REC) + 12), b);
-}
-
-pub fn tset(buf: &mut [u8], i: usize, f: usize, a: usize, b: usize) -> () {
-    tput32(buf, (((i * REC) + 8) + (f * 8)), a);
-    tput32(buf, (((i * REC) + 12) + (f * 8)), b);
+    vput32(buf, ((i * REC) + 8), a);
+    vput32(buf, ((i * REC) + 12), b);
 }
 
 pub fn tmeta(m: &mut [u8], i: usize, flags: usize, line: usize) -> () {
-    tput32(m, (i * META), flags);
-    tput32(m, ((i * META) + 4), line);
-    tput32(m, ((i * META) + 8), 0);
-    tput32(m, ((i * META) + 12), 0);
+    vput32(m, (i * META), flags);
+    vput32(m, ((i * META) + 4), line);
+    vput32(m, ((i * META) + 8), 0);
+    vput32(m, ((i * META) + 12), 0);
 }
 
 pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
@@ -2463,8 +2481,6 @@ pub const F_TYPE: usize = 2;
 pub const F_VALUE: usize = 1;
 
 pub const K_CONST_DECL: u8 = 2;
-
-pub const K_ENUM_DECL: u8 = 3;
 
 pub const K_EXPR_BINARY: u8 = 16;
 
@@ -2606,6 +2622,15 @@ pub fn u32_at(nodes: &[u8], at: usize) -> usize {
     let b2: usize = (nodes[((at + 2)) as usize] as usize);
     let b3: usize = (nodes[((at + 3)) as usize] as usize);
     return (((b0 + (b1 * 256)) + (b2 * 65536)) + (b3 * 16777216));
+}
+
+pub fn put_text(out: &mut [u8], at: usize, w: &'static str) -> usize {
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        out[((at + k)) as usize] = w.as_bytes()[(k) as usize];
+        k = (k + 1);
+    }
+    return (at + w.len());
 }
 
 pub const B_CR: u8 = 13;
@@ -2790,6 +2815,8 @@ pub const C_CONST: u8 = 2;
 pub const C_EXTERN: u8 = 5;
 
 pub const C_FN: u8 = 6;
+
+pub const C_INPUT: u8 = 10;
 
 pub const C_INSTANCE: u8 = 3;
 
@@ -3033,6 +3060,13 @@ pub fn is_extern(nodes: &[u8], i: usize) -> bool {
     return ((kind(nodes, i) == K_FN_DECL) && (end(nodes, i) == (i + 1)));
 }
 
+pub fn is_input(nodes: &[u8], text: &[u8], i: usize) -> bool {
+    if (((kind(nodes, i) != K_CONST_DECL) || ((i + 1) >= end(nodes, i))) || (end(nodes, (i + 1)) != end(nodes, i))) {
+        return false;
+    }
+    return ident_is(nodes, text, (i + 1), b"undefined");
+}
+
 pub fn is_instance(nodes: &[u8], text: &[u8], meta: &[u8], i: usize) -> bool {
     if (((kind(nodes, i) != K_CONST_DECL) || is_mut(meta, i)) || ((i + 1) >= end(nodes, i))) {
         return false;
@@ -3274,6 +3308,13 @@ pub fn peer(a: i64, b: i64) -> i64 {
     return TY_BAD;
 }
 
+pub fn port_name_end(ps: &[u8], a: usize, b: usize) -> usize {
+    if ((b > (a + 1)) && (ps[((b - 1)) as usize] == 95)) {
+        return (b - 1);
+    }
+    return b;
+}
+
 pub fn step_of(nodes: &[u8], text: &[u8], w: usize, va: usize, vb: usize) -> i64 {
     let body: i64 = loop_block(nodes, text, w, "body");
     if (body == NO_NODE) {
@@ -3509,5 +3550,17 @@ pub fn verilog_op(s: &[u8]) -> &'static str {
         return "||";
     }
     return "?";
+}
+
+pub fn vput32(buf: &mut [u8], at: usize, v: usize) -> () {
+    buf[(at) as usize] = ((v % 256) as _);
+    buf[((at + 1)) as usize] = (((v / 256) % 256) as _);
+    buf[((at + 2)) as usize] = (((v / 65536) % 256) as _);
+    buf[((at + 3)) as usize] = ((v / 16777216) as _);
+}
+
+pub fn vset(buf: &mut [u8], i: usize, f: usize, a: usize, b: usize) -> () {
+    vput32(buf, (((i * REC) + 8) + (f * 8)), a);
+    vput32(buf, (((i * REC) + 12) + (f * 8)), b);
 }
 

@@ -12,7 +12,10 @@
 ; - An EXTERN MODULE is a fn with an empty body: `pub fn BUFG(I: bool) -> BufgOut {}`. Its name is the Verilog
 ;   module (a device primitive, or another generated module). Its parameters are, by type: `str`, `f64`,
 ;   `f32` and `comptime_int` a Verilog parameter (ROLE_PARAM); `bool` named `keep` or `dont_touch` an
-;   attribute of the instance (ROLE_ATTR); any other `bool` or `uN` an input port (ROLE_PORT). Its result
+;   attribute of the instance (ROLE_ATTR); any other `bool` or `uN` an input port (ROLE_PORT). A trailing `_`
+;   is dropped from the name a parameter gives its port or Verilog parameter (port_name_end), so an extern
+;   can have a port `clk` while the module that instantiates it declares a `clk` of its own (t27c's Zig
+;   backend renames a parameter that shadows a declaration, and rewrites the instance's arguments too). Its result
 ;   is a struct declared in the same file whose fields are its output ports (`pub struct BufgOut { O: bool }`).
 ;   The reference never calls one: Zig analyses a declaration only when a test reaches it.
 ; - An INSTANCE is a module-level `const` bound to a call of an extern: `const gclk : BufgOut = BUFG(x);`.
@@ -21,11 +24,15 @@
 ; - A NET is any other module-level `const` whose value is not a compile-time constant: `const clk : bool =
 ;   gclk.O;`. A net named `clk`, `rst_n` or `en` replaces that implicit port of a clocked module.
 ; - A CONSTANT is a module-level `const` with a compile-time value; every use is folded to a sized literal.
+; - An INPUT is a module-level `const` whose value is `undefined`: a value this module does not define, which
+;   the hardware gives it (#8826). `const clk : bool = undefined;` names the implicit clk port, so an
+;   instance's connection can say `clk`; any other name is one more input port.
 ; Ports. A module with `fn on_clock` has the inputs clk, rst_n and en (each unless a net of that name
 ; exists) and one input per parameter of on_clock, except a parameter named `<instance>_<output>`, which is
 ; that instance's output (BOUND). The outputs are the `pub var`s (output reg) and the `pub const` nets
-; (output wire); when the module declares no `pub` var or net at all, every var is an output reg, as in
-; t27c's gen-verilog. So a module declares its ports, and every other var is an internal register.
+; (output wire); when the module declares no `pub` var or net at all and instantiates no extern, every var
+; is an output reg, as in t27c's gen-verilog. So a module declares its ports, and every other var is an
+; internal register; a top whose only outputs are a primitive's (a BSCANE2's TDO) has no port at all.
 ; The use closure. The module carries, as Verilog functions, exactly the fns its hardware reaches: on_clock,
 ; the nets and the instances' arguments, and every fn those call, transitively. `use` has already spliced
 ; each imported fn into the file (bootstrap/src/use_resolve.rs, as in every t27c path), so an imported fn
@@ -417,6 +424,14 @@ pub const C_CLOCK : u8 = 7;
 pub const C_TEST : u8 = 8;
 /// struct, enum, `use`, invariant, bench: nothing is emitted for it; a use of it is refused.
 pub const C_TYPE : u8 = 9;
+/// `const` whose value is `undefined`: an input port.
+pub const C_INPUT : u8 = 10;
+
+/// Is top-level node i a `const` whose one child is the name `undefined` (an input)?
+pub fn is_input(nodes: []const u8, text: []const u8, i: usize) -> bool {
+    if (kind(nodes, i) != K_CONST_DECL or i + 1 >= end(nodes, i) or end(nodes, i + 1) != end(nodes, i)) { return false; }
+    return ident_is(nodes, text, i + 1, "undefined");
+}
 
 /// Is top-level node i a fn with an empty body (an extern module)?
 pub fn is_extern(nodes: []const u8, i: usize) -> bool {
@@ -467,12 +482,13 @@ pub fn is_instance(nodes: []const u8, text: []const u8, meta: []const u8, i: usi
 /// such a const in the module's eager pass nor counts it as a root of the fns Zig analyses
 /// (ast_shape.t27's `analyzed`); it lowers one only when code it lowers names it, where it is refused as
 /// before. is_hw_const decides it for item c of a list of top-level items (ast_walk.t27's records, the items
-/// one after the other): a const whose value calls an extern of the list (a fn with an empty body) or names
-/// such a const, HW_DEPTH names deep at most.
+/// one after the other): an input (a const whose value is `undefined`), or a const whose value calls an extern
+/// of the list (a fn with an empty body) or names such a const, HW_DEPTH names deep at most.
 pub const HW_DEPTH : usize = 32;
 
 pub fn is_hw_const(nodes: []const u8, text: []const u8, c: usize, depth: usize) -> bool {
     if (kind(nodes, c) != K_CONST_DECL or depth > HW_DEPTH) { return false; }
+    if (is_input(nodes, text, c)) { return true; }
     var j : usize = c + 1;
     while (j < end(nodes, c)) {
         const k : u8 = kind(nodes, j);
@@ -516,6 +532,13 @@ pub fn param_role(name: []const u8, t: i64) -> u8 {
     if (t == TY_BOOL and (same(name, "keep") or same(name, "dont_touch"))) { return ROLE_ATTR; }
     if (ty_scalar(t)) { return ROLE_PORT; }
     return ROLE_BAD;
+}
+
+/// Where the port name an extern's parameter ps[a .. b] gives ends: before one trailing `_`, if it has one and
+/// is longer than it.
+pub fn port_name_end(ps: []const u8, a: usize, b: usize) -> usize {
+    if (b > a + 1 and ps[b - 1] == 95) { return b - 1; }
+    return b;
 }
 
 /// Is on_clock's parameter ps[a .. b] the output text[fa .. fb] of the instance named text[ia .. ib]: is it
@@ -679,8 +702,12 @@ pub fn verilog_keyword(s: []const u8) -> bool {
 // ----------------------------------------------------------------------------------------------------------
 
 const PT : str = "i<16+=1body<=+jcontinue_expr";
+/// PT, with `undefined` at 15..24 in place of `continue_expr`.
+const PT2 : str = "i<16+=1body<=+jundefinedxxxx";
 
-fn vput32(buf: []u8, at: usize, v: usize) -> void {
+/// Writes v at buf[at] as a little-endian u32 (the tests of this file and of verilog_emit.t27 build records
+/// with it).
+pub fn vput32(buf: []u8, at: usize, v: usize) -> void {
     buf[at] = @intCast(v % 256);
     buf[at + 1] = @intCast((v / 256) % 256);
     buf[at + 2] = @intCast((v / 65536) % 256);
@@ -699,8 +726,8 @@ fn vnode(buf: []u8, i: usize, k: u8, e: usize) -> void {
     }
 }
 
-/// Field f of node i is PT[a .. b].
-fn vset(buf: []u8, i: usize, f: usize, a: usize, b: usize) -> void {
+/// Field f of node i is the text span a .. b.
+pub fn vset(buf: []u8, i: usize, f: usize, a: usize, b: usize) -> void {
     vput32(buf, i * REC + 8 + f * 8, a);
     vput32(buf, i * REC + 12 + f * 8, b);
 }
@@ -793,6 +820,8 @@ test a_parameter_binds_to_an_instance_output_by_name {
     assert !binds(s, 0, 8, s, 9, 14, 14, 17);
     assert binds("bscan_TCK", 0, 9, s, 9, 14, 14, 17);
     assert implicit_port("clk") and implicit_port("rst_n") and implicit_port("en") and !implicit_port("clk2");
+    assert port_name_end("clk_", 0, 4) == 3 and port_name_end("clk", 0, 3) == 3 and port_name_end("_", 0, 1) == 1;
+    assert port_name_end("a__", 0, 3) == 2;
 }
 
 test meta_records_and_parameter_lines {
@@ -950,6 +979,13 @@ test hardware_only_consts_are_found_to_a_fixed_point {
     assert m[6] == 0 and m[10] == 0;
     assert m[0] == 0 and m[2] == 0 and m[5] == 0;
     assert is_hw_const(buf[0 .. 864], PT, 3, 0) and !is_hw_const(buf[0 .. 864], PT, 3, HW_DEPTH);
+    // `const <= = undefined;` is an input, and so hardware only
+    assert !is_input(buf[0 .. 864], PT, 6) and !is_hw_const(buf[0 .. 864], PT, 6, 0);
+    vnode(buf[0 .. 864], 7, K_EXPR_IDENTIFIER, 8);
+    vset(buf[0 .. 864], 7, F_NAME, 15, 24);
+    assert is_input(buf[0 .. 864], PT2, 6) and is_hw_const(buf[0 .. 864], PT2, 6, 0);
+    assert !is_input(buf[0 .. 864], PT2, 1);
+    vnode(buf[0 .. 864], 7, K_EXPR_LITERAL, 8);
     // two consts that name each other, and nothing else, are no hardware: the depth bound stops the walk
     vset(buf[0 .. 864], 2, F_NAME, 7, 11);
     vnode(buf[0 .. 864], 2, K_EXPR_IDENTIFIER, 3);
