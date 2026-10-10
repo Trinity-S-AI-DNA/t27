@@ -1698,15 +1698,6 @@ fn lab_launch(env: &LabEnv, run: &LabRun, d: &str, jobs: u32, zig_j: u32) -> Res
     lab_call(env, &script, true)
 }
 
-fn lab_state_name(state: u8) -> &'static str {
-    match state {
-        lab::RUN_NONE => "none",
-        lab::RUN_RUNNING => "running",
-        lab::RUN_DONE => "done",
-        _ => "lost",
-    }
-}
-
 /// `tri mutate spec --lab`: start the run on the lab unless the same request
 /// already has one, wait for it up to `run.wait` seconds, print its output,
 /// and clean up as specs/tri/mutate/lab.t27 allows. Returns `lab_exit`.
@@ -1757,7 +1748,7 @@ fn lab_mutate_spec(env: &LabEnv, run: &LabRun, out: &mut dyn std::io::Write, sle
             return Ok(lab::EXIT_NO_RESULT);
         }
     } else {
-        writeln!(out, "Reading the run already there ({}).", lab_state_name(p.state()))?;
+        writeln!(out, "Reading the run already there ({}).", lab::run_state_name(p.state()))?;
     }
     let (mut polls, mut waited) = (0u32, 0u64);
     while p.state() == lab::RUN_RUNNING {
