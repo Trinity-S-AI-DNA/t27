@@ -439,9 +439,9 @@ enum Commands {
     },
     /// #7576: `sign RUN.json T27B [--nonce N] [--runner CMD]` prints a signed corpus receipt of a t27b lab run;
     /// `compare BASE HEAD [--challenge N] [--challenge-head N]` checks two, names every changed file and judges the
-    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request.
+    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request; `schedule ROLE MOVED,ADMITTED,COUNT` picks its next step (#9026).
     CorpusReceipt {
-        #[arg(value_parser = ["sign", "compare", "admit"])] action: String,
+        #[arg(value_parser = ["sign", "compare", "admit", "schedule"])] action: String,
         a: String, b: String,
         #[arg(long, alias = "challenge")] nonce: Option<String>,
         #[arg(long)] challenge_head: Option<String>,
