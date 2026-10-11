@@ -143,3 +143,21 @@ These are native execution and generation checks; no physical JTAG, model
 inference or reward is confirmed. Earlier CI was30successful/1failed on
 missing native ledger entries, not a JTAG execution error; fresh-head CI
 and actual upstream access remain necessary before merge.
+
+
+## Verified pass enrollment dependency (2026-10-11)
+
+The owner explicitly authorized adding ten actually passing specs and
+refreshing both existing PRs without raising limits. A normal merge of
+dependency9e6cb1b9879f3cf14a741047350f05efcdcb3a00 adds only ten
+measured native pass rows and its evidence report. Nativecap0 and every
+existing ledger entry/metadata stay unchanged. Own JTAG row/source/seal
+are preserved; no source or workflow modification.
+
+This PR's own CI run38129931526 at7c468191c confirms the identical ten
+reference/native passes,103 tests/4342 assertions, no per-test disagreement.
+Normal ratchet replay of that downloaded run with the updated ledger is
+GREEN, all nine counters0 and no findings. Evidence native-ci-7c468191-artifact
+and enrollment-pass10-ratchet.json in /Users/ssdm4/trinity-results/jtag-verdict-spec.
+No already-passing execution suite is repeated; fresh published-head CI
+and actual upstream access still precede merge. No hardware/inference/reward claim.
