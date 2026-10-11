@@ -1860,24 +1860,6 @@ def physics_lqg_cs_bridge_module : Module := {
   benches := []
 }
 
-def physics_lqg_entropy_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [],
-  hostOnly := [],
-  reachable := []
-}
-
-def physics_lqg_entropy_module : Module := {
-  name := "physics_lqg_entropy",
-  imports := [],
-  globals := [],
-  functions := [],
-  tests := [{ name := "lqg_entropy_module_exists", params := [], ret := none, body := [] }, { name := "lqg_cs_gamma_origin_different_from_lqg", params := [], ret := none, body := [] }],
-  benches := []
-}
-
 def physics_quantum_env : Env := {
   structs := [],
   constructors := [],
@@ -4020,24 +4002,6 @@ def tri_utils_config_module : Module := {
   benches := []
 }
 
-def tri_utils_error_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_error_module : Module := {
-  name := "tri_utils_error",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_utils_exit_codes_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -4107,24 +4071,6 @@ def tri_utils_random_module : Module := {
   globals := [],
   functions := [{ name := "init", params := [("seed", (.u64))], ret := (some (.struct "void")), body := [] }, { name := "next", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range_inclusive", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
   tests := [{ name := "init_basic_case", params := [], ret := none, body := [] }, { name := "next_basic_case", params := [], ret := none, body := [] }, { name := "range_basic_case", params := [], ret := none, body := [] }, { name := "range_inclusive_basic_case", params := [], ret := none, body := [] }],
-  benches := []
-}
-
-def tri_utils_string_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_string_module : Module := {
-  name := "tri_utils_string",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
   benches := []
 }
 
@@ -4418,7 +4364,6 @@ theorem physics_e8_lqg_bridge_lowerable : Module.isLowerable physics_e8_lqg_brid
 theorem physics_gamma_conflict_lowerable : Module.isLowerable physics_gamma_conflict_env physics_gamma_conflict_module = true := by native_decide
 theorem physics_hslm_benchmark_lowerable : Module.isLowerable physics_hslm_benchmark_env physics_hslm_benchmark_module = true := by native_decide
 theorem physics_lqg_cs_bridge_lowerable : Module.isLowerable physics_lqg_cs_bridge_env physics_lqg_cs_bridge_module = true := by native_decide
-theorem physics_lqg_entropy_lowerable : Module.isLowerable physics_lqg_entropy_env physics_lqg_entropy_module = true := by native_decide
 theorem physics_quantum_lowerable : Module.isLowerable physics_quantum_env physics_quantum_module = true := by native_decide
 theorem physics_su2_chern_simons_lowerable : Module.isLowerable physics_su2_chern_simons_env physics_su2_chern_simons_module = false := by native_decide
 theorem queen_task_analysis_lowerable : Module.isLowerable queen_task_analysis_env queen_task_analysis_module = true := by native_decide
@@ -4538,12 +4483,10 @@ theorem tri_utils_args_lowerable : Module.isLowerable tri_utils_args_env tri_uti
 theorem tri_utils_bytes_lowerable : Module.isLowerable tri_utils_bytes_env tri_utils_bytes_module = true := by native_decide
 theorem tri_utils_color_lowerable : Module.isLowerable tri_utils_color_env tri_utils_color_module = false := by native_decide
 theorem tri_utils_config_lowerable : Module.isLowerable tri_utils_config_env tri_utils_config_module = false := by native_decide
-theorem tri_utils_error_lowerable : Module.isLowerable tri_utils_error_env tri_utils_error_module = true := by native_decide
 theorem tri_utils_exit_codes_lowerable : Module.isLowerable tri_utils_exit_codes_env tri_utils_exit_codes_module = false := by native_decide
 theorem tri_utils_help_lowerable : Module.isLowerable tri_utils_help_env tri_utils_help_module = false := by native_decide
 theorem tri_utils_logging_lowerable : Module.isLowerable tri_utils_logging_env tri_utils_logging_module = false := by native_decide
 theorem tri_utils_random_lowerable : Module.isLowerable tri_utils_random_env tri_utils_random_module = false := by native_decide
-theorem tri_utils_string_lowerable : Module.isLowerable tri_utils_string_env tri_utils_string_module = true := by native_decide
 theorem tri_utils_template_lowerable : Module.isLowerable tri_utils_template_env tri_utils_template_module = true := by native_decide
 theorem tri_utils_terminal_lowerable : Module.isLowerable tri_utils_terminal_env tri_utils_terminal_module = false := by native_decide
 theorem tri_utils_text_lowerable : Module.isLowerable tri_utils_text_env tri_utils_text_module = false := by native_decide
