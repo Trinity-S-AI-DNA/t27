@@ -45,6 +45,7 @@ pub enum NodeKind {
     ExprTuple,
     ExprCast,
     ExprRange, // start..end
+    ExprPrimitive, // STARTUPE2, BUFG, BSCANE2, DNA_PORT, LUT1, LUT2 with parameters and attributes
     // Statement nodes for fn bodies
     StmtLocal,  // const x = expr; or var x: T = expr;
     StmtAssign, // x = expr; or x.field = expr;
@@ -29557,6 +29558,7 @@ pub struct HirInstance {
     pub module_name: String,
     pub port_map: Vec<(String, String)>,
     pub param_map: Vec<(String, String)>,
+    pub attributes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34747,6 +34749,10 @@ impl AstToHir {
                 });
             }
         }
+        // Validate all function calls in this function
+        for stmt in &node.children {
+            Self::validate_stmt(stmt)?;
+        }
         for stmt in &node.children {
             if stmt.kind == NodeKind::StmtAssign {
                 if let (Some(lhs), Some(rhs)) = (stmt.children.first(), stmt.children.get(1)) {
@@ -34754,6 +34760,86 @@ impl AstToHir {
                         target: Self::expr_to_string(lhs),
                         value: Self::expr_to_string(rhs),
                     });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate an expression for primitive calls that should use proper instantiation syntax
+    fn validate_expr(node: &Node) -> Result<(), String> {
+        eprintln!("DEBUG: Validating expression: {:?} (kind: {:?}, name: {:?})", node, node.kind, node.name);
+        match node.kind {
+            NodeKind::ExprCall => {
+                eprintln!("DEBUG: Found ExprCall with name: {}", node.name);
+                let known_primitives = ["STARTUPE2", "BUFG", "BSCANE2", "DNA_PORT", "LUT1", "LUT2"];
+                if known_primitives.contains(&node.name.as_str()) {
+                    eprintln!("DEBUG: Found primitive call to {}, returning error", node.name);
+                    return Err(format!("Error: Primitive '{}' requires proper primitive instantiation syntax", node.name));
+                }
+                // Validate all child expressions recursively
+                for child in &node.children {
+                    Self::validate_expr(child)?;
+                }
+            }
+            NodeKind::ExprBinary | NodeKind::ExprUnary => {
+                // Validate operands recursively
+                for child in &node.children {
+                    Self::validate_expr(child)?;
+                }
+            }
+            NodeKind::ExprFieldAccess | NodeKind::ExprIndex => {
+                if let Some(obj) = node.children.first() {
+                    Self::validate_expr(obj)?;
+                }
+                for child in &node.children[1..] {
+                    Self::validate_expr(child)?;
+                }
+            }
+            // For other expression types, validate their children recursively
+            _ => {
+                for child in &node.children {
+                    Self::validate_expr(child)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a statement for primitive calls that should use proper instantiation syntax
+    fn validate_stmt(node: &Node) -> Result<(), String> {
+        match node.kind {
+            NodeKind::StmtAssign => {
+                if let (Some(lhs), Some(rhs)) = (node.children.first(), node.children.get(1)) {
+                    Self::validate_expr(lhs)?;
+                    Self::validate_expr(rhs)?;
+                }
+            }
+            NodeKind::StmtReturn => {
+                if let Some(expr) = node.children.first() {
+                    Self::validate_expr(expr)?;
+                }
+            }
+            NodeKind::StmtIf => {
+                if let Some(cond) = node.children.first() {
+                    Self::validate_expr(cond)?;
+                }
+                for child in &node.children[1..] {
+                    Self::validate_stmt(child)?;
+                }
+            }
+            NodeKind::StmtWhile => {
+                if let Some(cond) = node.children.first() {
+                    Self::validate_expr(cond)?;
+                }
+                for child in &node.children[1..] {
+                    Self::validate_stmt(child)?;
+                }
+            }
+            // For other statement types, validate their children recursively
+            _ => {
+                for child in &node.children {
+                    Self::validate_stmt(child)?;
                 }
             }
         }
@@ -34821,7 +34907,14 @@ impl AstToHir {
                     .iter()
                     .map(Self::expr_to_string)
                     .collect();
-                format!("{}({})", node.name, args.join(", "))
+                // Check if this is a call to an undeclared primitive
+                let known_primitives = ["STARTUPE2", "BUFG", "BSCANE2", "DNA_PORT", "LUT1", "LUT2"];
+                if known_primitives.contains(&node.name.as_str()) {
+                    // Return an error message for primitive calls - they need proper syntax
+                    format!("// ERROR: Primitive {}({}) requires proper primitive instantiation syntax", node.name, args.join(", "))
+                } else {
+                    format!("{}({})", node.name, args.join(", "))
+                }
             }
             _ => node.name.clone(),
         }
@@ -36060,11 +36153,29 @@ impl HirVerilogEmitter {
     }
 
     fn emit_instance(&mut self, inst: &HirInstance) {
-        self.write_line(&format!("{} {} (", inst.module_name, inst.name));
+        // Emit attributes if any
+        for attr in &inst.attributes {
+            self.write_line(&format!("(* {} *)", attr));
+        }
+        
+        // Handle parameters
+        if !inst.param_map.is_empty() {
+            self.write_line(&format!("{} #(", inst.module_name));
+            self.indent();
+            for (i, (param, value)) in inst.param_map.iter().enumerate() {
+                let comma = if i < inst.param_map.len() - 1 { "," } else { "" };
+                self.write_line(&format!(".{}({{}){}", param, value, comma));
+            }
+            self.dedent();
+            self.write_line(&format!(") {} (", inst.name));
+        } else {
+            self.write_line(&format!("{} {} (", inst.module_name, inst.name));
+        }
+        
         self.indent();
         for (i, (port, signal)) in inst.port_map.iter().enumerate() {
             let comma = if i < inst.port_map.len() - 1 { "," } else { "" };
-            self.write_line(&format!(".{}({}){}", port, signal, comma));
+            self.write_line(&format!(".{}({{}){}", port, signal, comma));
         }
         self.dedent();
         self.write_line(");");
@@ -37134,6 +37245,7 @@ mod tests_hir_verilog_emitter {
                     ("tx".into(), "uart_tx_pin".into()),
                 ],
                 param_map: vec![],
+                attributes: vec![],
             }],
             memories: vec![],
             clock_domains: vec![],
