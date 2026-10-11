@@ -38,8 +38,8 @@ pub enum Ty {
     /// `iN` for an N in 1..=31 other than 8 and 16: sign-extended in its W
     /// register, like i8/i16.
     IN(u8),
-    /// `i128`, a fn's result type: a pair of X registers in generated code, the low word first (x0:x1 for a
-    /// result), and 16 frame bytes for a variable (specs/tri/t27b/i128_plan.t27, `ip` below).
+    /// `i128`: a pair of X registers in generated code, the low word first (x0:x1 for a result, the next even
+    /// pair for a parameter), and 16 bytes in memory (specs/tri/t27b/i128_plan.t27, `ip` below).
     I128,
 }
 
@@ -351,23 +351,14 @@ pub enum CmpOp {
 
 #[path = "../../../gen/rust/tri/t27b/cmp_op.rs"]
 #[allow(dead_code, unused_parens)]
-mod co; // t27c gen-rust of specs/tri/t27b/cmp_op.t27: the comparisons by their CmpOp number
+pub(crate) mod co; // t27c gen-rust of specs/tri/t27b/cmp_op.t27: the comparisons by their CmpOp number; codegen's conditions
 const CMP_OPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge];
 const _: () = assert!(CmpOp::Eq as u8 == co::EQ && CmpOp::Lt as u8 == co::LT && CmpOp::Ge as u8 == co::GE);
 
 impl CmpOp {
     pub fn symbol(self) -> &'static str { co::symbol(self as u8) }
 
-    pub fn holds(self, a: i128, b: i128) -> bool {
-        match self {
-            CmpOp::Eq => a == b,
-            CmpOp::Ne => a != b,
-            CmpOp::Lt => a < b,
-            CmpOp::Le => a <= b,
-            CmpOp::Gt => a > b,
-            CmpOp::Ge => a >= b,
-        }
-    }
+    pub fn holds(self, a: i128, b: i128) -> bool { co::holds(self as u8, a, b) }
 
     pub fn negate(self) -> CmpOp { CMP_OPS[co::negate(self as u8) as usize] }
 
@@ -617,7 +608,7 @@ pub enum Stmt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotInfo {
     pub size: u32,
-    /// 1, 2, 4 or 8.
+    /// 1, 2, 4, 8, or 16 for a struct with an i128 in it.
     pub align: u32,
 }
 
@@ -687,8 +678,9 @@ impl Program {
                     di += 1;
                     (true, di - 1)
                 } else {
-                    xi += 1;
-                    (false, xi - 1)
+                    let k = ip::arg_reg(xi, v.ty == Ty::I128); // an i128 takes the next even pair (i128_plan.t27)
+                    xi = ip::arg_next(k, v.ty == Ty::I128);
+                    (false, k as usize)
                 }
             })
             .collect()

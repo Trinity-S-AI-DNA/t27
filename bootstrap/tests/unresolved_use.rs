@@ -58,3 +58,26 @@ fn a_use_the_splice_finds_prints_no_warning() {
     assert!(!err.contains("#7176"), "{err}");
     assert!(out.contains("const K"), "the spliced constant is in the output:\n{out}");
 }
+
+/// #8980: the spec tree is found from where the file IS, not from how its path is spelled. Called
+/// as a bare `in.t27` from its own directory (parent "") or as `../c/in.t27`, the walk never met
+/// `specs/`, nothing was spliced, and `test-report` was BLOCKED on an undeclared `constants`.
+#[test]
+fn a_use_resolves_however_the_spec_path_is_spelled() {
+    let root = scratch("spelled").join("specs");
+    std::fs::create_dir_all(root.join("a")).expect("dir");
+    std::fs::create_dir_all(root.join("c")).expect("dir");
+    std::fs::write(root.join("a/b.t27"), "module b;\npub const K : u8 = 3;\n").expect("write");
+    std::fs::write(root.join("c/in.t27"), IMPORTER).expect("write");
+    for spelled in ["in.t27", "../c/in.t27"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_t27c"))
+            .args(["gen", spelled])
+            .current_dir(root.join("c"))
+            .output()
+            .expect("t27c");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{spelled}: {stderr}");
+        assert!(!stderr.contains("#7176"), "{spelled}: {stderr}");
+        assert!(stdout.contains("const K"), "{spelled}: the spliced constant is in the output:\n{stdout}");
+    }
+}

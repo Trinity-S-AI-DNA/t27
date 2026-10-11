@@ -163,6 +163,7 @@ impl Mem {
     fn load(&self, addr: u64, ty: Ty) -> Result<i128, Stop> {
         let n = ty.bytes() as usize;
         let b = self.read(addr, n)?;
+        if n > 8 { return Ok(wide(b)); } // an i128, out of line (`wide`)
         let mut raw = [0u8; 8];
         raw[..n].copy_from_slice(b);
         let v = u64::from_le_bytes(raw);
@@ -173,11 +174,17 @@ impl Mem {
     }
 
     fn store(&mut self, addr: u64, ty: Ty, v: i128) -> Result<(), Stop> {
+        if ty == Ty::I128 { return self.store16(addr, v); }
         let n = ty.bytes() as usize;
         let raw = (v as u64).to_le_bytes();
         self.write(addr, &raw[..n])
     }
+
+    #[cold] #[inline(never)] fn store16(&mut self, addr: u64, v: i128) -> Result<(), Stop> { self.write(addr, &v.to_le_bytes()) }
 }
+
+/// An i128 in memory: 16 bytes, its two words, little-endian. Cold and out of line, so a scalar load stays as it was.
+#[cold] #[inline(never)] fn wide(b: &[u8]) -> i128 { i128::from_le_bytes(b.try_into().unwrap()) }
 
 enum Flow {
     Next,

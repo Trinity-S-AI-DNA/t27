@@ -7578,7 +7578,7 @@ fn lowerability_models_keep_real_source_signatures() {
     for (module, source, signatures) in [
         ("nn_phi_rope", "specs/nn/phi_rope.t27", vec![
             ("pub fn phi_rope_theta(i: usize, dim: usize) -> f64", r#"{ name := "phi_rope_theta", params := [("i", (.struct "usize")), ("dim", (.struct "usize"))], ret := (some (.struct "f64")), body := [] }"#),
-            ("pub fn phi_rope_rotate(x: Vec<f64>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
+            ("pub fn phi_rope_rotate(x: impl AsRef<[f64]>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
         ]),
         ("nn_sacred_attention", "specs/nn/sacred_attention.t27", vec![
             ("pub fn sacred_scale() -> f64", r#"{ name := "sacred_scale", params := [], ret := (some (.struct "f64")), body := [] }"#),
@@ -7842,10 +7842,10 @@ fn corpus_classifier_matches_lean_completeness() {
     // prose files moved `checked` 245 -> 225, so the floor is held on the SUM:
     // a spec may move from checked to skipped when it turns out to be Markdown,
     // but neither number may simply evaporate. #8054 deleted 22 empty generated stubs and #8222 their
-    // theorems, so the sum moved 245 -> 223 by deletion, not by a theorem going quiet.
+    // theorems, so the sum moved 245 -> 223 by deletion, not by a theorem going quiet; #8908 deleted 3 more, 220.
     assert!(
-        checked + skipped_prose >= 223,
-        "expected at least 223 corpus theorems reached, got {} checked + {} skipped as prose",
+        checked + skipped_prose >= 220,
+        "expected at least 220 corpus theorems reached, got {} checked + {} skipped as prose",
         checked,
         skipped_prose
     );

@@ -68,7 +68,7 @@ fn std_mem_eql_and_index_of_null() {
 fn std_mem_other_shapes_are_refused() {
     let head = "module a;\n\n";
     let cases: &[(&str, &str)] = &[
-        ("test t { const p = std.mem.indexOf(u8, \"ab\", \"b\"); assert(p != null); }", "call to `std.mem.indexOf`"),
+        ("test t { assert(std.mem.indexOf(u8, \"ab\") != null); }", "wrong number of operands"),
         ("test t { assert(std.mem.eql(u32, \"ab\", \"ab\")); }", "other than (u8, str, str)"),
         ("test t { const x: u32 = 1; assert(std.mem.eql(u8, x, \"ab\")); }", "not a string"),
     ];

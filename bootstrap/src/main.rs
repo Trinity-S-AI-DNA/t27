@@ -62,6 +62,10 @@ mod signed_receipt;
 #[path = "../gen/rust/verified/die_binding.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod die_binding;
+// specs/verified/bench_boards.t27 (#8662): the board table, the cable and die pick, the DNA reader, the BSCAN guard.
+#[path = "../gen/rust/verified/bench_boards.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod bench_boards;
 // specs/verified/corpus_receipt.t27 (#7576): corpus receipt layout and compare rules. Its RFC 6962 tree
 // (vectors: corpus_merkle.t27) runs below on the sha2 crate until gen-rust lowers slices (#7469).
 #[path = "../gen/rust/verified/corpus_receipt.rs"]
@@ -117,6 +121,14 @@ mod verdict_audit;
 #[path = "../gen/rust/verified/gen_hash_cache.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod gen_hash_cache;
+// specs/verified/digest_cache.t27 (#8805): when a large file's sha256 may come from the stat-keyed cache.
+#[path = "../gen/rust/verified/digest_cache.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod digest_cache;
+// specs/verified/suite_jobs.t27 (#8829): how many per-spec subprocesses `t27c suite` runs at once.
+#[path = "../gen/rust/verified/suite_jobs.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod suite_jobs;
 // specs/verified/watch.t27 (#8737 H5): what `frontier --watch` reruns after a save.
 #[path = "../gen/rust/verified/watch.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
@@ -133,6 +145,10 @@ mod bench_agent;
 #[path = "../gen/rust/verified/bitstream_reuse.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod bitstream_reuse;
+// specs/verified/clock_constraints.t27 (#8839): the clocks `t27c silicon` places against, and its timing gate.
+#[path = "../gen/rust/verified/clock_constraints.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod clock_constraints;
 mod phi_f64_literals;
 mod weight_bram;
 mod bitnet_pipeline;
@@ -255,6 +271,9 @@ enum Commands {
         /// this verifier and only AUTHOR for any other (signed_receipt.t27).
         #[arg(long)]
         nonce: Option<String>,
+        /// #8662: the board's row in specs/verified/bench_boards.t27 (part, cable, JTAG chain); none is artix200t
+        #[arg(long)]
+        board: Option<String>,
     },
 
     /// THE SERVICE: compare a table PRINTED in a paper against the script that
@@ -420,9 +439,9 @@ enum Commands {
     },
     /// #7576: `sign RUN.json T27B [--nonce N] [--runner CMD]` prints a signed corpus receipt of a t27b lab run;
     /// `compare BASE HEAD [--challenge N] [--challenge-head N]` checks two, names every changed file and judges the
-    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request.
+    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request; `schedule ROLE MOVED,ADMITTED,COUNT` picks its next step (#9026).
     CorpusReceipt {
-        #[arg(value_parser = ["sign", "compare", "admit"])] action: String,
+        #[arg(value_parser = ["sign", "compare", "admit", "schedule"])] action: String,
         a: String, b: String,
         #[arg(long, alias = "challenge")] nonce: Option<String>,
         #[arg(long)] challenge_head: Option<String>,
@@ -11965,6 +11984,7 @@ async fn main() -> anyhow::Result<()> {
             skip_hardware,
             pnr_seed,
             nonce,
+            board,
         } => service::run_silicon(
             &std::env::current_dir()?,
             &input,
@@ -11975,6 +11995,7 @@ async fn main() -> anyhow::Result<()> {
             skip_hardware,
             pnr_seed,
             nonce,
+            board,
         )?,
         Commands::RecomputeDiff { script, tex, label, tol } => {
             service::run_recompute_diff(&std::env::current_dir()?, script, tex, label, tol)?
@@ -12400,6 +12421,7 @@ fn main() -> anyhow::Result<()> {
             skip_hardware,
             pnr_seed,
             nonce,
+            board,
         } => service::run_silicon(
             &std::env::current_dir()?,
             &input,
@@ -12410,6 +12432,7 @@ fn main() -> anyhow::Result<()> {
             skip_hardware,
             pnr_seed,
             nonce,
+            board,
         )?,
         Commands::RecomputeDiff { script, tex, label, tol } => {
             service::run_recompute_diff(&std::env::current_dir()?, script, tex, label, tol)?

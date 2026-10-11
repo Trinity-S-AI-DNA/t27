@@ -2,6 +2,14 @@
 // t27/specs/
 // Regularization for over-confident predictions | φ² + 1/φ² = 3 | TRINITY
 
+// #8980: written with `f32.max` / `f32.log` and `if a && b {`, so it never
+// compiled; target held one row for the whole batch; backward returned
+// (p - t) / p = 1 - t/p where d/dp of -t log p is -t/p; and the tests asserted
+// `result != undefined`. Now predictions and target are both batch x classes
+// (row-major) and the loss is -sum_j t'_j log p_j per row, with label smoothing
+// t' = t (1 - s) + s / C. Mean averages over the batch. logits_grad gives the
+// softmax + cross-entropy gradient p - t'.
+
 module CrossEntropy;
     use base::types;
     use math::constants;
@@ -33,144 +41,176 @@ module CrossEntropy;
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // forward(predictions: []const f32, target: []const f32, output: []f32, config: CrossEntropyConfig) -> void
-    fn forward(predictions: []const f32, target: []const f32, output: []f32, config: CrossEntropyConfig) -> void {
-        var batch_size : u32 = 0;
-        var num_classes : u32 = 0;
-        
-        if predictions.len > 0 && target.len > 0 {
-            batch_size = predictions.len / target.len;
-            num_classes = target.len;
+    fn smoothed(t: f32, num_classes: usize, config: CrossEntropyConfig) -> f32 {
+        return t * (1.0 - config.label_smoothing) + config.label_smoothing / @as(f32, @floatFromInt(num_classes));
+    }
+
+    // Per-row loss -sum_j t'_j log max(p_j, eps) into output[row] (reduction None), or the
+    // mean / sum over rows into output[0]
+    fn forward(predictions: []const f32, target: []const f32, num_classes: usize, output: []f32, config: CrossEntropyConfig) -> void {
+        const batch = predictions.len / num_classes;
+        var total : f32 = 0.0;
+        var i : usize = 0;
+        while (i < batch) {
+            var row_loss : f32 = 0.0;
+            var j : usize = 0;
+            while (j < num_classes) {
+                const k = i * num_classes + j;
+                row_loss = row_loss - smoothed(target[k], num_classes, config) * log(@max(predictions[k], config.epsilon));
+                j = j + 1;
+            }
+            if (config.reduction == ReductionType.None) {
+                output[i] = row_loss;
+            }
+            total = total + row_loss;
+            i = i + 1;
         }
-        
-        var i : u32 = 0;
-        while i < batch_size {
-            var j : u32 = 0;
-            var batch_loss : f32 = 0.0;
-            
-            while j < num_classes {
-                var pred_idx : u32 = i * num_classes + j;
-                var target_val : f32 = target[j];
-                var pred_val : f32 = predictions[pred_idx];
-                
-                // Apply label smoothing
-                var smoothed_target : f32 = target_val * (1.0 - config.label_smoothing) + 
-                                          (config.label_smoothing / f32(num_classes));
-                
-                // Clip predictions to avoid log(0)
-                var clipped_pred : f32 = f32.max(pred_val, config.epsilon);
-                
-                // Compute cross entropy loss
-                var loss_val : f32 = -smoothed_target * f32.log(clipped_pred);
-                batch_loss += loss_val;
-                
-                j += 1;
-            }
-            
-            // Apply reduction
-            var reduced_loss : f32 = batch_loss;
-            if config.reduction == ReductionType.Mean {
-                reduced_loss = batch_loss / f32(num_classes);
-            } else if config.reduction == ReductionType.Sum {
-                reduced_loss = batch_loss;
-            }
-            // None reduction means we store per-class losses
-            
-            var output_idx : u32 = i;
-            output[output_idx] = reduced_loss;
-            
-            i += 1;
+        if (config.reduction == ReductionType.Mean) {
+            output[0] = total / @as(f32, @floatFromInt(batch));
+        }
+        if (config.reduction == ReductionType.Sum) {
+            output[0] = total;
         }
     }
 
-    fn backward(grad_output: []const f32, predictions: []const f32, target: []const f32, grad_input: []f32, config: CrossEntropyConfig) -> void {
-        var batch_size : u32 = 0;
-        var num_classes : u32 = 0;
-        
-        if predictions.len > 0 && target.len > 0 {
-            batch_size = predictions.len / target.len;
-            num_classes = target.len;
-        }
-        
-        var i : u32 = 0;
-        while i < batch_size {
-            var j : u32 = 0;
-            
-            while j < num_classes {
-                var pred_idx : u32 = i * num_classes + j;
-                var target_val : f32 = target[j];
-                var pred_val : f32 = predictions[pred_idx];
-                
-                // Apply label smoothing
-                var smoothed_target : f32 = target_val * (1.0 - config.label_smoothing) + 
-                                          (config.label_smoothing / f32(num_classes));
-                
-                // Clip predictions to avoid division by zero
-                var clipped_pred : f32 = f32.max(pred_val, config.epsilon);
-                
-                // Compute gradient: dL/dpred = (pred - smoothed_target) / pred
-                var grad_val : f32 = (clipped_pred - smoothed_target) / clipped_pred;
-                
-                // Apply grad_output scaling
-                if grad_output.len > 0 {
-                    var grad_output_idx : u32 = i;
-                    grad_val *= grad_output[grad_output_idx];
-                }
-                
-                // Apply reduction scaling
-                if config.reduction == ReductionType.Mean {
-                    grad_val /= f32(num_classes);
-                }
-                
-                grad_input[pred_idx] = grad_val;
-                
-                j += 1;
+    // dL/dp_k = -t'_k / max(p_k, eps), times grad_output[0] (Mean, Sum) or grad_output[row]
+    // (None), and divided by the batch for Mean
+    fn backward(grad_output: []const f32, predictions: []const f32, target: []const f32, num_classes: usize, grad_input: []f32, config: CrossEntropyConfig) -> void {
+        const batch = predictions.len / num_classes;
+        var k : usize = 0;
+        while (k < predictions.len) {
+            const row = k / num_classes;
+            var g = -smoothed(target[k], num_classes, config) / @max(predictions[k], config.epsilon);
+            if (config.reduction == ReductionType.None) {
+                g = g * grad_output[row];
+            } else {
+                g = g * grad_output[0];
             }
-            
-            i += 1;
+            if (config.reduction == ReductionType.Mean) {
+                g = g / @as(f32, @floatFromInt(batch));
+            }
+            grad_input[k] = g;
+            k = k + 1;
         }
+    }
+
+    // Softmax followed by cross-entropy, differentiated with respect to the logits of one
+    // row: softmax(z)_k - t'_k. The 1/p of backward and the softmax Jacobian cancel.
+    fn logits_grad(logits: []const f32, target: []const f32, config: CrossEntropyConfig, grad: []f32) -> void {
+        var max_val : f32 = logits[0];
+        var k : usize = 0;
+        while (k < logits.len) {
+            max_val = @max(max_val, logits[k]);
+            k = k + 1;
+        }
+        var sum : f32 = 0.0;
+        k = 0;
+        while (k < logits.len) {
+            grad[k] = exp(logits[k] - max_val);
+            sum = sum + grad[k];
+            k = k + 1;
+        }
+        k = 0;
+        while (k < logits.len) {
+            grad[k] = grad[k] / sum - smoothed(target[k], logits.len, config);
+            k = k + 1;
+        }
+    }
+
+    fn cfg(smoothing: f32, reduction: ReductionType) -> CrossEntropyConfig {
+        return CrossEntropyConfig{ .reduction = reduction, .label_smoothing = smoothing, .epsilon = MIN_LOG_PROB };
+    }
+
+    // Two rows of three classes: p = (0.7, 0.2, 0.1) labelled 0 and (0.1, 0.3, 0.6) labelled 2
+    fn loss_of(smoothing: f32, reduction: ReductionType, index: usize) -> f32 {
+        const predictions : [6]f32 = [0.7, 0.2, 0.1, 0.1, 0.3, 0.6];
+        const target : [6]f32 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        var output : [2]f32 = [0.0] ** 2;
+        forward(&predictions, &target, 3, &output, cfg(smoothing, reduction));
+        return output[index];
+    }
+
+    fn grad_of(smoothing: f32, index: usize) -> f32 {
+        const grad_output : [1]f32 = [1.0];
+        const predictions : [6]f32 = [0.7, 0.2, 0.1, 0.1, 0.3, 0.6];
+        const target : [6]f32 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        var grad_input : [6]f32 = [9.0] ** 6;
+        backward(&grad_output, &predictions, &target, 3, &grad_input, cfg(smoothing, ReductionType.Mean));
+        return grad_input[index];
+    }
+
+    // Mean loss with p0 of row 0 moved to x (the other entries fixed): for a finite difference
+    fn loss_at_p0(x: f32) -> f32 {
+        const predictions : [6]f32 = [x, 0.2, 0.1, 0.1, 0.3, 0.6];
+        const target : [6]f32 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        var output : [2]f32 = [0.0] ** 2;
+        forward(&predictions, &target, 3, &output, cfg(0.0, ReductionType.Mean));
+        return output[0];
+    }
+
+    fn logits_grad_at(smoothing: f32, index: usize) -> f32 {
+        const logits : [3]f32 = [2.0, 1.0, 0.0];
+        const target : [3]f32 = [1.0, 0.0, 0.0];
+        var grad : [3]f32 = [0.0] ** 3;
+        logits_grad(&logits, &target, cfg(smoothing, ReductionType.Mean), &grad);
+        return grad[index];
+    }
+
+    fn valid_input() -> f32 {
+        return loss_of(0.0, ReductionType.Mean, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Tests (from .tri behaviors)
     // ═══════════════════════════════════════════════════════════
 
+    // Rows cost -ln 0.7 = 0.3566749 and -ln 0.6 = 0.5108256; mean 0.4337503
     test forward_basic_case
-        given input = default_input()
-        when result = forward(input)
-        then result != undefined
+        given mean = loss_of(0.0, ReductionType.Mean, 0)
+        when row1 = loss_of(0.0, ReductionType.None, 1)
+        then @abs(mean - 0.4337503) < 0.000001 and @abs(row1 - 0.5108256) < 0.000001 and @abs(loss_of(0.0, ReductionType.Sum, 0) - 2.0 * mean) < 0.000001
 
+    // -t/p over the batch of 2: -1 / (0.7 * 2) = -0.7142857 on the label, 0 elsewhere,
+    // and it matches a finite difference of the mean loss
     test backward_basic_case
-        given input = default_input()
-        when result = backward(input)
-        then result != undefined
+        given g0 = grad_of(0.0, 0)
+        when slope = (loss_at_p0(0.7 + 0.001) - loss_at_p0(0.7 - 0.001)) / 0.002
+        then @abs(g0 + 0.7142857) < 0.000001 and grad_of(0.0, 1) == 0.0 and @abs(g0 - slope) < 0.001
 
+    // s = 0.1 over 3 classes: t' = (0.9333, 0.0333, 0.0333), so the loss grows by the
+    // cost of the off-label mass: row 0 = -(0.93333 ln 0.7 + 0.03333 ln 0.2 + 0.03333 ln 0.1)
     test forward_with_label_smoothing
-        given input = default_input()
-        when result = forward(input)
-        then result != undefined
+        given row0 = loss_of(DEFAULT_LABEL_SMOOTHING, ReductionType.None, 0)
+        when plain = loss_of(0.0, ReductionType.None, 0)
+        then row0 > plain and @abs(row0 - 0.4632974) < 0.000001
 
+    // With smoothing, an off-label class has a gradient too: -0.0333 / 0.2 / 2
     test backward_with_label_smoothing
-        given input = default_input()
-        when result = backward(input)
-        then result != undefined
+        given g1 = grad_of(DEFAULT_LABEL_SMOOTHING, 1)
+        then @abs(g1 + 0.0833333) < 0.000001
+
+    // softmax(2, 1, 0) = (0.6652410, 0.2447285, 0.0900306): the gradient is p - t
+    test logits_grad_is_p_minus_t
+        given g0 = logits_grad_at(0.0, 0)
+        when g2 = logits_grad_at(0.0, 2)
+        then @abs(g0 - (0.6652410 - 1.0)) < 0.000001 and @abs(g2 - 0.0900306) < 0.000001 and @abs(g0 + logits_grad_at(0.0, 1) + g2) < 0.000001
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Invariants (from .tri constraints)
     // ═══════════════════════════════════════════════════════════
 
+    // predictions are batch x num_classes: the mean is between the two row losses
     invariant cross_entropy_constraint_0
-        given input = valid_input()
-        then true // predictions.shape[0] == predictions.shape[1]  # batch, num_classes, ...
+        assert valid_input() > loss_of(0.0, ReductionType.None, 0) and valid_input() < loss_of(0.0, ReductionType.None, 1)
 
+    // target has the shape of predictions: one row per sample, rows independent
     invariant cross_entropy_constraint_1
-        given input = valid_input()
-        then true // target.shape[0] == predictions.shape[0]  # Batch dimension matches
+        assert loss_of(0.0, ReductionType.None, 0) > 0.0
 
+    // epsilon > 0
     invariant cross_entropy_constraint_2
-        given input = valid_input()
-        then true // epsilon > 0
+        assert MIN_LOG_PROB > 0.0
 
+    // 0 < label_smoothing <= 1
     invariant cross_entropy_constraint_3
-        given input = valid_input()
-        then true // 0 < label_smoothing <= 1
+        assert DEFAULT_LABEL_SMOOTHING > 0.0 and DEFAULT_LABEL_SMOOTHING <= 1.0
