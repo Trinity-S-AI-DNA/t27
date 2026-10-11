@@ -12,6 +12,10 @@ use serde::Serialize;
 #[path = "../gen/rust/compiler/verilog_aos_memory.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod verilog_aos_memory;
+// specs/compiler/cse_hoist.t27 (#8197), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/cse_hoist.rs"]
+#[allow(dead_code, unused_parens)]
+mod cse_hoist;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -9210,16 +9214,6 @@ impl Codegen {
             self.write_indent();
             self.write_line("@compileError(\"not yet implemented\");");
         } else {
-            // The CSE pass can leave its `_cse*` temp declarations AFTER their
-            // first use in this backend's statement order (the Rust path hoists
-            // them). They are pure expressions over consts/params, so emitting
-            // them first is always safe -- and required: Zig resolves locals
-            // lexically.
-            for stmt in node.children.iter() {
-                if stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse") {
-                    self.gen_stmt(stmt);
-                }
-            }
             // #6315: a non-void body's tail expression is its return value.
             let ret_ty = node.extra_return_type.trim();
             let mut body: Vec<Node> = node.children.clone();
@@ -9227,9 +9221,7 @@ impl Codegen {
                 Self::zig_tail_returns(&mut body);
             }
             for stmt in body.iter() {
-                if !(stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse")) {
-                    self.gen_stmt(stmt);
-                }
+                self.gen_stmt(stmt);
             }
         }
 
@@ -10758,7 +10750,7 @@ impl Codegen {
             NodeKind::ExprUnary => {
                 self.write(&node.extra_op);
                 if !node.children.is_empty() {
-                    self.gen_expr(&node.children[0]);
+                    self.gen_expr_maybe_paren(&node.children[0]); // #6549: -(a + b), never -a + b
                 }
             }
             NodeKind::ExprFieldAccess => {
@@ -25070,17 +25062,21 @@ fn unique_uncseable_key() -> String {
 
 fn common_subexpr_elim(stmts: &mut Vec<Node>, stats: &mut OptStats) {
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut counter: u32 = 0;
-    let mut new_stmts: Vec<Node> = Vec::new();
-    for stmt in stmts.iter_mut() {
+    let mut new_stmts: Vec<(usize, Node)> = Vec::new();
+    for u in 0..stmts.len() {
         let mut replacements: Vec<(String, String)> = Vec::new();
-        collect_cse_replacements(stmt, &seen, &mut replacements);
+        collect_cse_replacements(&stmts[u], &seen, &mut replacements);
+        // #8197: specs/compiler/cse_hoist.t27 decides; a refused repeat is forgotten, so it may be seen anew here.
+        replacements.retain(|(k, _)| cse_untouched(&stmts[..=u], k, seen_at[k]) || { seen.remove(k); false });
+        let stmt = &mut stmts[u];
         if !replacements.is_empty() {
             for (key, _) in &replacements {
                 let var_name = format!("_cse{}", counter);
                 counter += 1;
                 seen.insert(key.clone(), var_name.clone());
-                new_stmts.push(make_cse_local(&var_name, key));
+                new_stmts.push((u, make_cse_local(&var_name, stmt, key)));
                 stats.cse_eliminated += 1;
             }
             apply_cse_replacements(stmt, &seen);
@@ -25090,13 +25086,28 @@ fn common_subexpr_elim(stmts: &mut Vec<Node>, stats: &mut OptStats) {
                 let var_name = format!("_cse{}", counter);
                 counter += 1;
                 seen.insert(key.clone(), var_name);
+                seen_at.insert(key, u);
             }
         }
     }
-    let insert_pos = find_first_non_local(stmts);
-    for (i, local) in new_stmts.into_iter().enumerate() {
-        stmts.insert(insert_pos + i, local);
+    for (u, local) in new_stmts.into_iter().rev() {
+        stmts.insert(u, local);
     }
+}
+
+/// specs/compiler/cse_hoist.t27 for the repeat `key` in the last of `upto`, first seen at `seen_at`. A statement
+/// touches an operand when it assigns it, takes `&` of it, declares or captures it, or calls anything.
+fn cse_untouched(upto: &[Node], key: &str, seen_at: usize) -> bool {
+    fn touches(n: &Node, v: &str) -> bool {
+        let target = n.kind == NodeKind::StmtAssign || (n.kind == NodeKind::ExprUnary && n.extra_op == "&");
+        (target && count_ident_refs(&n.children[..n.children.len().min(1)], v) > 0)
+            || (matches!(n.kind, NodeKind::StmtLocal | NodeKind::StmtForRange) && n.name == v)
+            || n.params.iter().any(|(p, _)| p == v)
+            || n.kind == NodeKind::ExprCall
+            || n.children.iter().any(|c| touches(c, v))
+    }
+    let last = upto.iter().rposition(|s| key.split(' ').filter_map(|t| t.strip_prefix("ID:")).any(|v| touches(s, v)));
+    cse_hoist::repeat_takes_temp(seen_at as i64, upto.len() as i64 - 1, last.map_or(cse_hoist::UNTOUCHED, |t| t as i64))
 }
 
 fn stmt_cse_key(stmt: &Node) -> Option<String> {
@@ -25139,47 +25150,20 @@ fn apply_cse_replacements(node: &mut Node, seen: &std::collections::HashMap<Stri
     }
 }
 
-fn make_cse_local(var_name: &str, key: &str) -> Node {
-    let parts: Vec<&str> = key.splitn(3, ' ').collect();
-    let (op_str, left_str, right_str) = if parts.len() == 3 {
-        (parts[1], parts[0], parts[2])
-    } else {
-        return Node::new(NodeKind::StmtLocal);
-    };
+fn make_cse_local(var_name: &str, stmt: &Node, key: &str) -> Node {
     let mut local = Node::new(NodeKind::StmtLocal);
     local.name = var_name.to_string();
     local.extra_mutable = false;
-    let mut bin = Node::new(NodeKind::ExprBinary);
-    bin.extra_op = op_str.to_string();
-    if left_str.starts_with("ID:") {
-        let mut lid = Node::new(NodeKind::ExprIdentifier);
-        lid.name = left_str[3..].to_string();
-        bin.children.push(lid);
-    } else if left_str.starts_with("LIT:") {
-        let mut lit = Node::new(NodeKind::ExprLiteral);
-        lit.value = left_str[4..].to_string();
-        bin.children.push(lit);
-    }
-    if right_str.starts_with("ID:") {
-        let mut rid = Node::new(NodeKind::ExprIdentifier);
-        rid.name = right_str[3..].to_string();
-        bin.children.push(rid);
-    } else if right_str.starts_with("LIT:") {
-        let mut lit = Node::new(NodeKind::ExprLiteral);
-        lit.value = right_str[4..].to_string();
-        bin.children.push(lit);
-    }
-    local.children.push(bin);
+    // #7703: a copy of the repeat itself; rebuilding it from the key printed `ID:s >> LIT:16`.
+    local.children.extend(find_cse_expr(stmt, key));
     local
 }
 
-fn find_first_non_local(stmts: &[Node]) -> usize {
-    for (i, s) in stmts.iter().enumerate() {
-        if s.kind != NodeKind::StmtLocal {
-            return i;
-        }
+fn find_cse_expr(n: &Node, key: &str) -> Option<Node> {
+    if expr_key(n).as_deref() == Some(key) {
+        return Some(n.clone());
     }
-    stmts.len()
+    n.children.iter().find_map(|c| find_cse_expr(c, key))
 }
 
 fn collect_reads_in_stmts(stmts: &[Node], reads: &mut std::collections::HashSet<String>) {

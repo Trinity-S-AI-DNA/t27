@@ -239,3 +239,29 @@ a34891bd3/cdac218f0. No hardware, model inference or reward is claimed.
 The final full corpus recheck is CLEAN: 71 observed primary failures match
 71 known entries, zero unexpected failures/passes, expiries or drift.
 This remains a ratchet result, not an all-passing corpus.
+
+
+## Conflict refresh at 49a458676 (2026-10-11)
+
+Upstream compiler changes refreshed the big_frame seal and made both
+own PRs conflict. A normal merge preserves upstream compiler, FROZEN_HASH,
+optimizer lowering and executable tests without a local foreign-code edit.
+The only conflict was big_frame seal metadata and generated hashes; the
+source stays unchanged. An ordinary unforced seal on the rebuilt compiler
+passes5/5 tests and verifies all five hashes.
+
+Fresh checks: cargo native161 tests pass; targeted native34 tests/613 runtime
+assertions pass; full corpus ratchet CLEAN71/71 with zero unexpected failures,
+passes, expiries, discard or gate drift. Width1865 specs:2 known/0 new;
+duplicates671 bodies/195 groups CLEAN; type86/86 CLEAN. Seal coverage2399:
+2278 hold/121 known broken; currency2302 current/0 stale/94 missing/3 none.
+All six related generated Rust files remain byte-identical. Optimizer reference
+execution still BLOCKED by duplicate enum String; its matching seal is not a pass.
+
+No native cap increase or new missing-spec enrollment is made. Before this
+refresh, latest-head CI for3154c5626/b5d996130 was30 successful/1 failed;
+only native ratchet failed on four passing upstream files absent from the
+ledger. That remains an unresolved CI blocker. New-head CI must be checked
+after publication. Evidence: master-49a-* and NATIVE-CI-DIAGNOSIS-2026-10-11.md
+in /Users/ssdm4/trinity-results/spec-tests-7641. No hardware, model inference
+or reward is claimed.

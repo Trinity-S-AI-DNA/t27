@@ -125,3 +125,21 @@ check for the changed backend, not a repeated reference run or hardware
 execution. Evidence: master-c4fc-native.log and master-c4fc-seal.log under
 `/Users/ssdm4/trinity-results/jtag-verdict-spec/`. New published-head CI is
 required; old31green checks do not certify this dependency merge.
+
+
+## Dependency refresh at 49a458676 (2026-10-11)
+
+A normal merge of own dependency8a3a775844d717d23b48c0d86fc73a54e59cc12c
+resolves new upstream conflicts without rewriting history. Dependency source
+checks pass:161 native cargo tests, corpus ratchet71/71 CLEAN, width1865
+specs2known/0new, duplicates671/195groups CLEAN, seal currency2302current/0stale
+and all six generated files byte-identical. No nativecap0 increase or new
+missing-four enrollment is made.
+
+Own mvp_ternary_classifier_jtag_noport source and seal are unchanged. On the
+changed backend18 tests/6 invariants/38 runtime assertions pass and all five
+seal hashes MATCH (master-49a-own-native.log and master-49a-own-seal.log).
+These are native execution and generation checks; no physical JTAG, model
+inference or reward is confirmed. Earlier CI was30successful/1failed on
+missing native ledger entries, not a JTAG execution error; fresh-head CI
+and actual upstream access remain necessary before merge.
