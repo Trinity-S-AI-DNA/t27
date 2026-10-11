@@ -98,13 +98,13 @@ pub const K_STMT_EXPR: u8 = 34;
 
 pub const B_DOT: u8 = 46;
 
-pub fn has_at(s: &[u8], lo: usize, hi: usize, w: &[u8]) -> bool {
-    if ((hi - lo) < w.len()) {
+pub fn has_at(s: &[u8], from: usize, to: usize, w: &[u8]) -> bool {
+    if ((to - from) < w.len()) {
         return false;
     }
     let mut k: usize = 0;
     while (k < w.len()) {
-        if (s[((lo + k)) as usize] != w[(k) as usize]) {
+        if (s[((from + k)) as usize] != w[(k) as usize]) {
             return false;
         }
         k = (k + 1);
