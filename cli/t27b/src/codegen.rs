@@ -141,18 +141,8 @@ fn narrow_ext(ty: Ty) -> Option<Ext> {
     }
 }
 
-/// The one instruction that puts the low `ty.bits()` bits of `n` into `d`
-/// in canonical form, for a type narrower than 32 bits: the 8/16-bit extend,
-/// or for an odd width (`u21`, `i4`) an unsigned or signed bitfield extract
-/// (`ubfx` / `sbfx`). `sf` picks the X form, which reads all of `n`.
-fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> {
-    match ty {
-        Ty::UN(b) => Some(a64::ubfm(sf, d, n, 0, b as u32 - 1)),
-        Ty::IN(b) => Some(a64::sbfm(sf, d, n, 0, b as u32 - 1)),
-        _ if sf => None,
-        _ => narrow_ext(ty).map(|e| extend(d, n, e)),
-    }
-}
+/// The one instruction that puts the low `ty.bits()` bits of `n` into `d` in canonical form: a64.t27's `narrow_word`.
+fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> { Some(a64::narrow_word(sf, d, n, ty.bits(), ty.signed())).filter(|&w| w != 0) }
 
 /// The condition after `cmp` (`fcmp` for a float) that holds when `op` does: specs/tri/t27b/cmp_op.t27's `cond_bits`.
 fn cond_for(op: CmpOp, ty: Ty) -> Cond { Cond::from_bits(co::cond_bits(op as u8, ty.is_float(), ty.signed())) }
@@ -482,18 +472,8 @@ impl<'a> Gen<'a> {
         let nbytes = 8 * (self.nvar_slots as usize + ncallee + self.max_slot);
         let frame_bytes = ((nbytes + 15) & !15) + self.agg_bytes as usize;
         if frame {
-            let base = 8 * self.nvar_slots;
-            let mut k = 0;
-            while k < ncallee {
-                let off = base + 8 * k as u32;
-                if k + 1 < ncallee && off <= 504 {
-                    self.emit(a64::ldp_x(self.used_callee[k], self.used_callee[k + 1], SP, off as i32));
-                    k += 2;
-                } else {
-                    self.emit(a64::ldr_x(self.used_callee[k], SP, off));
-                    k += 1;
-                }
-            }
+            let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers back: a64.t27's `save_word`
+            while k < ncallee { let u = &self.used_callee; let w = a64::save_word(true, ncallee, base, k, u[k], u[(k + 1) % ncallee]); self.emit(w); k = a64::save_next(ncallee, base, k); }
             self.emit(a64::mov_sp(SP, 29));
             self.emit(a64::ldp_x_post(29, 30, SP, 16));
             self.emit(a64::ret());
@@ -582,18 +562,8 @@ impl<'a> Gen<'a> {
                     pro.push(a64::sub_const_at(SP, SP, frame_bytes as u64, i));
                 }
             }
-            let base = 8 * self.nvar_slots;
-            let mut k = 0;
-            while k < ncallee {
-                let off = base + 8 * k as u32;
-                if k + 1 < ncallee && off <= 504 {
-                    pro.push(a64::stp_x(self.used_callee[k], self.used_callee[k + 1], SP, off as i32));
-                    k += 2;
-                } else {
-                    pro.push(a64::str_x(self.used_callee[k], SP, off));
-                    k += 1;
-                }
-            }
+            let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers the fn uses: a64.t27's `save_word`
+            while k < ncallee { let u = &self.used_callee; pro.push(a64::save_word(false, ncallee, base, k, u[k], u[(k + 1) % ncallee])); k = a64::save_next(ncallee, base, k); }
         }
         // Parameters: normalise narrow ones and move them to their homes.
         let regs = Program::arg_regs(f);
@@ -1963,16 +1933,6 @@ fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
 }
 
 fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
-
-fn extend(d: Reg, n: Reg, e: Ext) -> u32 {
-    match e {
-        Ext::Uxtb => a64::uxtb(d, n),
-        Ext::Uxth => a64::uxth(d, n),
-        Ext::Sxtb => a64::sxtb(d, n),
-        Ext::Sxth => a64::sxth(d, n),
-        _ => unreachable!("only narrow extends"),
-    }
-}
 
 /// Conservative: false only when control certainly cannot reach the end.
 fn may_fall_through(ss: &[Stmt]) -> bool {
