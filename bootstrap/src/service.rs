@@ -4644,6 +4644,11 @@ pub fn run_silicon(
         std::fs::write(cache.join("chain"), derived_chain.map(|c| c.to_string()).unwrap_or_default())?;
         std::fs::write(cache.join("bit.sha256"), crate::sha256_hex(&bit))?; // last: a torn entry reads CORRUPT
         println!("  bitstream stored for reuse: {}", cache.display());
+        // #8933: keep the BIT_CACHE_KEEP entries used most recently (stored, or a reuse hit's `hits`), drop the rest
+        let used = |d: &Path| ["hits", "bit.sha256"].iter().filter_map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok()).max();
+        let mut all: Vec<(Option<std::time::SystemTime>, PathBuf)> = std::fs::read_dir(cache.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten().map(|e| (used(&e.path()), e.path())).collect();
+        all.sort_by(|a, b| b.0.cmp(&a.0));
+        for (rank, (_, d)) in all.iter().enumerate() { if !br::bit_cache_keep(rank as u32) && *d != cache { let _ = std::fs::remove_dir_all(d); } }
     }
     let stream = |b: &[u8]| b.windows(4).position(|w| w == br::BIT_SYNC_WORD.to_be_bytes()).map(|i| b[i..].to_vec());
     if audit && br::audit_verdict(std::fs::read(&bit_path).ok().and_then(|b| stream(&b)) == cached_bit.as_deref().and_then(stream)) == br::AUDIT_POISONED {
