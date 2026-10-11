@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/effects/clock_cap.t27 -- the clock capability: monotonic time and sleep through a handle passed
+; as an argument, with a simulated handler that keeps deterministic time under a seed (#9002, first
+; slice; the design is capability.t27's, the template fs_cap.t27's).
+; --
+; The contract. Two calls, ops 32 and 33 of the clock block:
+;   clock_now(c) -> u64              monotonic nanoseconds (Rust's Instant::now, as ns from an origin)
+;   clock_sleep(c, dt_ns) -> bool    let dt_ns pass (std::thread::sleep)
+; After each call c.status says how it went. The laws every handler keeps: a clock never runs
+; backwards; a time is never 0 when ST_OK, so 0 can mean "no time"; after clock_sleep(dt) the next
+; read is at least dt later. clock_now_post and clock_sleep_post are the contract as predicates.
+; --
+; The simulated handler. Time is a number the seed owns, as in FoundationDB's simulation and
+; TigerBeetle's VOPR: it starts at CLOCK_EPOCH_NS plus an offset drawn from the seed (never at 0, and
+; never the same timeline for two seeds), each read lets 1 .. CLOCK_MAX_TICK_NS pass -- the time the
+; code between two reads took -- drawn from the seed, and a sleep jumps at once: a simulated day costs
+; nothing. One seed, one timeline, on every backend. It moves to specs/effects/sim_clock.t27 (#9011,
+; the virtual clock with a timer queue) when that lands, by `use`, and keeps this contract.
+; The real handler's shape is clock_serve, as fs_serve is fs's.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module EffectsClock;
+
+use effects::capability;
+use queen::simulation;
+
+; --- 1. The contract -------------------------------------------------------------------------------
+
+pub const CLOCK_NOW : u8 = 32;
+pub const CLOCK_SLEEP : u8 = 33;
+
+pub const CLOCK_NS_MAX : u64 = 18446744073709551615;
+
+/// clock_now's outcome is allowed: a time exactly when ST_OK, and then never 0 and never before the
+/// last time read (before; 0 for the first read); 0 otherwise. ST_TOO_BIG is a sleep's only.
+pub fn clock_now_post(before: u64, status: u8, got: u64) -> bool {
+    if (status == ST_OK) { return got != 0 and got >= before; }
+    if (status == ST_TOO_BIG or status == ST_NOT_FOUND or status == ST_DENIED) { return false; }
+    return got == 0 and status <= ST_DIVERGED;
+}
+
+/// clock_sleep's outcome is allowed: true exactly when ST_OK; ST_TOO_BIG when the time would pass the
+/// end of u64.
+pub fn clock_sleep_post(status: u8, ok: bool) -> bool {
+    if (ok) { return status == ST_OK; }
+    if (status == ST_OK or status == ST_NOT_FOUND or status == ST_DENIED) { return false; }
+    return status <= ST_DIVERGED;
+}
+
+; --- 2. The handle ---------------------------------------------------------------------------------
+
+/// The seed's stream for the start offset (index 0) and the ticks (index 1, 2, ..).
+pub const CLOCK_STREAM_TICK : u32 = 32;
+
+/// 1000 s: a simulated clock starts here, plus up to 2^32 - 1 ns from the seed.
+pub const CLOCK_EPOCH_NS : u64 = 1000000000000;
+
+/// A read lets 1 .. CLOCK_MAX_TICK_NS pass.
+pub const CLOCK_MAX_TICK_NS : u64 = 1000;
+
+/// reads counts the draws taken (the start offset is draw 0); now_ns is the simulated time.
+pub const Clock = struct {
+    mode : u8,
+    status : u8,
+    seed : u32,
+    reads : u32,
+    now_ns : u64,
+    tape : *EffectTape,
+};
+
+fn clock_make(mode: u8, t: *EffectTape, seed: u32) -> Clock {
+    const start : u64 = CLOCK_EPOCH_NS + (sim_roll(seed, CLOCK_STREAM_TICK, 0) as u64);
+    return Clock{ .mode = mode, .status = ST_OK, .seed = seed, .reads = 1, .now_ns = start, .tape = t };
+}
+
+/// The simulated handler: deterministic time under a seed. It never touches the tape.
+pub fn clock_sim(t: *EffectTape, seed: u32) -> Clock {
+    return clock_make(CAP_SIM, t, seed);
+}
+
+/// The simulated handler, recording every call on the run's tape.
+pub fn clock_recorder(t: *EffectTape, seed: u32) -> Clock {
+    return clock_make(CAP_RECORD, t, seed);
+}
+
+/// A replayer of the recording on t, which the caller has rewound.
+pub fn clock_replayer(t: *EffectTape) -> Clock {
+    return clock_make(CAP_REPLAY, t, 0);
+}
+
+/// The real handler's handle: the host's loop answers it (capability.t27, CAP_HOST).
+pub fn clock_host(t: *EffectTape) -> Clock {
+    return clock_make(CAP_HOST, t, 0);
+}
+
+; --- 3. The calls ----------------------------------------------------------------------------------
+
+/// The time in ns, or 0 with c.status saying why.
+pub fn clock_now(c: *Clock) -> u64 {
+    if (cap_replays(c.mode)) {
+        if (!tape_take(c.tape, CLOCK_NOW, 0, "", "", c.mode == CAP_HOST)) {
+            c.status = c.tape.state;
+            return 0;
+        }
+        const i : u32 = tape_last(c.tape);
+        c.status = c.tape.status[i];
+        if (c.status != ST_OK) { return 0; }
+        return c.tape.ret[i];
+    }
+    const tick : u64 = 1 + (sim_roll(c.seed, CLOCK_STREAM_TICK, c.reads) as u64) % CLOCK_MAX_TICK_NS;
+    c.reads = c.reads + 1;
+    if (tick > CLOCK_NS_MAX - c.now_ns) {
+        c.status = ST_IO;
+        return 0;
+    }
+    c.now_ns = c.now_ns + tick;
+    c.status = ST_OK;
+    if (c.mode == CAP_RECORD) {
+        _ = tape_record(c.tape, CLOCK_NOW, 0, "", "", ST_OK, c.now_ns, "");
+    }
+    return c.now_ns;
+}
+
+/// Lets dt_ns pass; false with c.status saying why.
+pub fn clock_sleep(c: *Clock, dt_ns: u64) -> bool {
+    if (cap_replays(c.mode)) {
+        if (!tape_take(c.tape, CLOCK_SLEEP, dt_ns, "", "", c.mode == CAP_HOST)) {
+            c.status = c.tape.state;
+            return false;
+        }
+        c.status = c.tape.status[tape_last(c.tape)];
+        return c.status == ST_OK;
+    }
+    if (dt_ns > CLOCK_NS_MAX - c.now_ns) {
+        c.status = ST_TOO_BIG;
+    } else {
+        c.now_ns = c.now_ns + dt_ns;
+        c.status = ST_OK;
+    }
+    if (c.mode == CAP_RECORD) {
+        _ = tape_record(c.tape, CLOCK_SLEEP, dt_ns, "", "", c.status, 0, "");
+    }
+    return c.status == ST_OK;
+}
+
+; --- 4. Recordings and the host --------------------------------------------------------------------
+
+/// A recording written back as calls, the form the t27o oracle emits: one clock_now that read got.
+pub fn clock_tape_now(t: *EffectTape, got: u64) -> bool {
+    return tape_record(t, CLOCK_NOW, 0, "", "", ST_OK, got, "");
+}
+
+/// One clock_sleep of dt_ns that answered status.
+pub fn clock_tape_sleep(t: *EffectTape, dt_ns: u64, status: u8) -> bool {
+    return tape_record(t, CLOCK_SLEEP, dt_ns, "", "", status, 0, "");
+}
+
+/// The real handler's shape: perform the clock call waiting on the CAP_HOST tape t against world, and
+/// answer it. False when no call waits or it is not a clock call.
+pub fn clock_serve(t: *EffectTape, world: *Clock) -> bool {
+    if (!tape_pending(t)) { return false; }
+    const i : u32 = tape_pending_at(t);
+    if (t.op[i] == CLOCK_NOW) {
+        const got : u64 = clock_now(world);
+        return tape_answer(t, world.status, got, "");
+    }
+    if (t.op[i] == CLOCK_SLEEP) {
+        _ = clock_sleep(world, t.arg[i]);
+        return tape_answer(t, world.status, 0, "");
+    }
+    return false;
+}
+
+; --- tests -----------------------------------------------------------------------------------------
+
+/// A core that uses the capability: how long a sleep of dt took, read on either side.
+fn time_a_sleep(c: *Clock, dt: u64) -> u64 {
+    const before : u64 = clock_now(c);
+    if (c.status != ST_OK) { return 0; }
+    if (!clock_sleep(c, dt)) { return 0; }
+    const after : u64 = clock_now(c);
+    if (c.status != ST_OK) { return 0; }
+    return after - before;
+}
+
+test "one_seed_one_timeline" {
+    var t = tape_new();
+    var a = clock_sim(&t, 42);
+    var b = clock_sim(&t, 42);
+    var other = clock_sim(&t, 43);
+    assert clock_now(&a) != clock_now(&other);
+    assert clock_now(&b) == a.now_ns;
+    var last : u64 = a.now_ns;
+    var k : u32 = 0;
+    while (k < 100) {
+        const x : u64 = clock_now(&a);
+        assert x == clock_now(&b);
+        assert clock_now_post(last, a.status, x);
+        assert x > last;
+        assert x - last <= CLOCK_MAX_TICK_NS;
+        last = x;
+        k = k + 1;
+    }
+    // pinned: a change to the draws changes every seed's timeline, and that must be a decision
+    var p = clock_sim(&t, 7);
+    assert p.now_ns == CLOCK_EPOCH_NS + (sim_roll(7, CLOCK_STREAM_TICK, 0) as u64);
+    assert clock_now(&p) == CLOCK_EPOCH_NS + (sim_roll(7, CLOCK_STREAM_TICK, 0) as u64) + 1 + (sim_roll(7, CLOCK_STREAM_TICK, 1) as u64) % 1000;
+    assert t.len == 0;
+}
+
+test "time_starts_away_from_zero" {
+    var t = tape_new();
+    var seed : u32 = 0;
+    while (seed < 20) {
+        var c = clock_sim(&t, seed);
+        const x : u64 = clock_now(&c);
+        assert x > CLOCK_EPOCH_NS;
+        assert clock_now_post(0, c.status, x);
+        seed = seed + 1;
+    }
+}
+
+test "a_simulated_day_of_sleep_costs_nothing" {
+    var t = tape_new();
+    var c = clock_sim(&t, 3);
+    const day : u64 = 86400000000000;
+    const before : u64 = clock_now(&c);
+    assert clock_sleep(&c, day);
+    assert clock_sleep_post(c.status, true);
+    const after : u64 = clock_now(&c);
+    assert after - before > day;
+    assert after - before <= day + CLOCK_MAX_TICK_NS;
+    assert time_a_sleep(&c, 5) > 5;
+    // a sleep past the end of u64 is refused and moves nothing
+    const at : u64 = c.now_ns;
+    assert clock_sleep(&c, CLOCK_NS_MAX) == false;
+    assert c.status == ST_TOO_BIG;
+    assert clock_sleep_post(c.status, false);
+    assert c.now_ns == at;
+    // a sleep to the last nanosecond is not
+    assert clock_sleep(&c, CLOCK_NS_MAX - c.now_ns);
+    assert c.now_ns == CLOCK_NS_MAX;
+}
+
+test "a_clock_that_reaches_the_end_of_u64_stops" {
+    var t = tape_new();
+    var c = clock_sim(&t, 5);
+    // the next tick, set so that it lands on the last nanosecond exactly
+    const tick : u64 = 1 + (sim_roll(5, CLOCK_STREAM_TICK, c.reads) as u64) % CLOCK_MAX_TICK_NS;
+    c.now_ns = CLOCK_NS_MAX - tick;
+    assert clock_now(&c) == CLOCK_NS_MAX;
+    assert c.status == ST_OK;
+    // there is no later time to read
+    assert clock_now(&c) == 0;
+    assert c.status == ST_IO;
+    assert clock_now_post(CLOCK_NS_MAX, c.status, 0);
+    assert c.now_ns == CLOCK_NS_MAX;
+}
+
+test "a_replayed_failure_is_a_failure" {
+    var t = tape_new();
+    assert tape_record(&t, CLOCK_NOW, 0, "", "", ST_IO, 77, "");
+    tape_rewind(&t);
+    var c = clock_replayer(&t);
+    assert clock_now(&c) == 0;
+    assert c.status == ST_IO;
+    assert tape_done(&t);
+    // a core that stops at a failed read makes none of the calls after it
+    var first = tape_new();
+    assert tape_record(&first, CLOCK_NOW, 0, "", "", ST_IO, 0, "");
+    assert clock_tape_sleep(&first, 40, ST_OK);
+    assert clock_tape_now(&first, 5047);
+    tape_rewind(&first);
+    var f = clock_replayer(&first);
+    assert time_a_sleep(&f, 40) == 0;
+    assert f.status == ST_IO;
+    assert first.cursor == 1;
+    // a recording that ends before the run does is a divergence, not a time
+    var short = tape_new();
+    assert clock_tape_now(&short, 5000);
+    assert clock_tape_sleep(&short, 40, ST_OK);
+    tape_rewind(&short);
+    var s = clock_replayer(&short);
+    assert time_a_sleep(&s, 40) == 0;
+    assert s.status == ST_DIVERGED;
+    assert tape_done(&short) == false;
+}
+
+test "a_recording_replays_and_a_different_sleep_diverges" {
+    var t = tape_new();
+    var rec = clock_recorder(&t, 11);
+    const want : u64 = time_a_sleep(&rec, 250);
+    assert want > 250;
+    assert t.len == 3;
+    assert t.op[1] == CLOCK_SLEEP;
+    assert t.arg[1] == 250;
+    var again = t;
+    tape_rewind(&again);
+    var rep = clock_replayer(&again);
+    assert time_a_sleep(&rep, 250) == want;
+    assert tape_done(&again);
+    var wrong = t;
+    tape_rewind(&wrong);
+    var bad = clock_replayer(&wrong);
+    assert time_a_sleep(&bad, 251) == 0;
+    assert bad.status == ST_DIVERGED;
+    assert clock_now_post(0, bad.status, 0);
+    assert tape_done(&wrong) == false;
+}
+
+test "the_host_protocol_matches_the_simulation" {
+    var ts = tape_new();
+    var sim = clock_sim(&ts, 21);
+    const want : u64 = time_a_sleep(&sim, 1000000);
+    var tw = tape_new();
+    var world = clock_sim(&tw, 21);
+    var t = tape_new();
+    var host = clock_host(&t);
+    var runs : u32 = 0;
+    var got : u64 = 0;
+    var waiting : bool = true;
+    while (waiting and runs < TAPE_ENTRIES + 1) {
+        got = time_a_sleep(&host, 1000000);
+        runs = runs + 1;
+        waiting = tape_pending(&t);
+        if (waiting) {
+            assert clock_serve(&t, &world);
+            tape_rewind(&t);
+        }
+    }
+    assert got == want;
+    assert runs == 4;
+    assert world.reads == 3;
+    assert tape_done(&t);
+    assert clock_serve(&t, &world) == false;
+    assert world.reads == 3;
+}
+
+test "a_recording_written_as_calls_replays" {
+    var t = tape_new();
+    assert clock_tape_now(&t, 5000);
+    assert clock_tape_sleep(&t, 40, ST_OK);
+    assert clock_tape_now(&t, 5047);
+    tape_rewind(&t);
+    var c = clock_replayer(&t);
+    assert time_a_sleep(&c, 40) == 47;
+    assert tape_done(&t);
+}
+
+test "the_contract_predicates" {
+    assert clock_now_post(0, ST_OK, 1);
+    assert clock_now_post(10, ST_OK, 10);
+    assert clock_now_post(10, ST_OK, 9) == false;
+    assert clock_now_post(0, ST_OK, 0) == false;
+    assert clock_now_post(10, ST_PENDING, 0);
+    assert clock_now_post(10, ST_PENDING, 11) == false;
+    assert clock_now_post(10, ST_TOO_BIG, 0) == false;
+    assert clock_now_post(10, 8, 0) == false;
+    assert clock_now_post(10, ST_NOT_FOUND, 0) == false;
+    assert clock_now_post(10, ST_DENIED, 0) == false;
+    assert clock_now_post(10, ST_DIVERGED, 0);
+    assert clock_sleep_post(ST_OK, true);
+    assert clock_sleep_post(ST_TOO_BIG, false);
+    assert clock_sleep_post(ST_DIVERGED, false);
+    assert clock_sleep_post(8, false) == false;
+    assert clock_sleep_post(ST_NOT_FOUND, false) == false;
+    assert clock_sleep_post(ST_OK, false) == false;
+    assert clock_sleep_post(ST_IO, true) == false;
+    assert clock_sleep_post(ST_DENIED, false) == false;
+    assert cap_of_op(CLOCK_NOW) == CAP_CLOCK;
+    assert cap_of_op(CLOCK_SLEEP) == CAP_CLOCK;
+}

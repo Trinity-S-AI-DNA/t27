@@ -153,6 +153,11 @@ impl Q {
         cf::q_is_zero(self.0)
     }
 
+    /// Negative, as `@sqrt`'s refusal takes it: `-0.0` is zero first.
+    pub(super) fn is_neg(self) -> bool {
+        cf::q_is_neg(self.0)
+    }
+
     pub(super) fn neg(self) -> Q {
         Q(cf::q_neg(self.0))
     }
@@ -174,6 +179,12 @@ impl Q {
 
     pub(super) fn op(op: FOp, a: Q, b: Q) -> Option<Q> {
         let r = cf::q_op(op as u8, a.0, b.0);
+        r.ok.then_some(Q(r.q))
+    }
+
+    /// The square root, as Zig folds it: correctly rounded to binary128, zero's sign kept.
+    pub(super) fn sqrt(self) -> Option<Q> {
+        let r = cf::q_sqrt(self.0);
         r.ok.then_some(Q(r.q))
     }
 
