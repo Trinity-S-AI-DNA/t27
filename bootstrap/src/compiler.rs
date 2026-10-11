@@ -4646,31 +4646,6 @@ the parser used to read it as `{}` followed by a negation",
         Ok(node)
     }
 
-    fn parse_range_bound(&mut self) -> Result<Node, String> {
-        match self.current.kind {
-            TokenKind::Number => {
-                let (val, num_suffix) = split_number_suffix(&self.current.lexeme);
-                self.advance();
-                Ok(Node {
-                    kind: NodeKind::ExprLiteral,
-                    value: val,
-                    extra_type: num_suffix,
-                    ..Default::default()
-                })
-            }
-            TokenKind::Ident => {
-                let name = self.current.lexeme.clone();
-                self.advance();
-                Ok(Node {
-                    kind: NodeKind::ExprIdentifier,
-                    name,
-                    ..Default::default()
-                })
-            }
-            _ => self.parse_expr_additive(),
-        }
-    }
-
     // ========================================================================
     // Expression parser (Pratt-style, operates on current token)
     // ========================================================================
@@ -7115,16 +7090,6 @@ the parser used to read it as `{}` followed by a negation",
                 | TokenKind::KwOr
                 | TokenKind::Dot
         )
-    }
-
-    /// W655 (T95): is this a floating type? Verilog's synthesizable subset has
-    /// no float, and lowering `f32` to an integer vector produced a value that
-    /// COMPILES, SYNTHESIZES, RUNS and is wrong for every non-integral input
-    /// (T84/T85). Verilog `real` is IEEE double and is correct in simulation;
-    /// synthesis rejects it, which is truthful because `f32` arithmetic was
-    /// never synthesizable.
-    fn type_is_float(ty: &str) -> bool {
-        matches!(ty.trim(), "f32" | "f64")
     }
 
     fn opens_declaration(kind: TokenKind) -> bool {
@@ -12731,11 +12696,6 @@ impl VerilogCodegen {
             return Self::packed_struct_width_in(t, depth + 1, structs);
         }
         Self::type_to_width(t)
-    }
-
-    /// W671: total packed width of a struct, summing `field_type_width`.
-    fn packed_struct_width(&self, name: &str, depth: u32) -> u32 {
-        Self::packed_struct_width_in(name, depth, &self.struct_decls)
     }
 
     /// #5904: `packed_struct_width` with the struct map passed in.
@@ -29664,23 +29624,6 @@ impl HirMemory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum HwClkSrcKind {
-    External,
-    Pll,
-    Dcm,
-    Mmcm,
-}
-
-#[derive(Debug, Clone)]
-pub struct HirClkSource {
-    pub name: String,
-    pub kind: HwClkSrcKind,
-    pub freq_hz: u32,
-    pub phase_deg: u32,
-    pub jitter_ps: u32,
-}
-
 #[derive(Debug, Clone)]
 pub struct HirClockDomain {
     pub name: String,
@@ -30117,18 +30060,6 @@ impl HirApbBridge {
         }
         errors
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Gf16OpKind {
-    Mul,
-    Add,
-    Mac,
-    Dot,
-    Fft,
-    Ifft,
-    Matmul,
-    Inverse,
 }
 
 #[derive(Debug, Clone)]
