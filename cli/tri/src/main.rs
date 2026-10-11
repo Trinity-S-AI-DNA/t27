@@ -56,6 +56,8 @@ mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8
 mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
+#[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
 mod renum;
 mod reseal;
 mod rtl;
@@ -421,6 +423,16 @@ enum Commands {
         #[arg(long, default_value_t = payout::pay::DEFAULT_POOL)] pool: u64,
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
+    },
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27).
+    T27o {
+        file: String,
+        /// The module name; default the file's stem.
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] oracle: bool,
+        #[arg(long)] check: bool,
+        /// The t27c binary; default target/release/t27c, then t27c on PATH.
+        #[arg(long)] t27c: Option<String>,
     },
 }
 
@@ -1311,9 +1323,33 @@ fn main() -> Result<()> {
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
+        Commands::T27o { file, name, oracle, check, t27c } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref())? as i32),
     }
 
     Ok(())
+}
+
+/// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
+fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>) -> Result<u8> {
+    let src = fs::read(file).with_context(|| format!("reading {file}"))?;
+    let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
+    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], vec![0u8; 1 << 24]);
+    let n = if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+    if !check {
+        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
+        return Ok(0);
+    }
+    // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
+    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27")));
+    fs::write(&h, &out[..n.min(out.len())])?;
+    let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status();
+    fs::remove_file(&h)?;
+    anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
+    let m = t27o::convert(&src, stem.as_bytes(), &mut spec, &mut st);
+    fs::create_dir_all("specs/t27o_check")?;
+    fs::write(&path, [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat())?;
+    println!("{}", path.display());
+    Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
 
 /// `tri lanes`: gh's open pull requests into the base, the clone's worktrees and branch times, and what specs/tri/lanes/lanes.t27 reads in them.

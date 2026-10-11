@@ -185,11 +185,18 @@ claim is "here is a language worth writing" writes its own backend in it.
 with two signed corpus receipts, not a pasted table of lab numbers.
 
 - Base: `git merge-base origin/master HEAD`. Head: the PR's head, pushed to a
-  branch on origin. Use `https://t27b-lab-production.up.railway.app/runs/<sha>.receipt.json`
-  when it exists; otherwise request it with a fresh challenge you keep:
-  `c=$(openssl rand -hex 32); ssh t27b-lab "mkdir -p /srv/requests && printf %s $c > /srv/requests/<sha>"`.
-  The lab runs one request between master polls (about 10 minutes each, at most
-  4 waiting, dropped after 6 hours) and publishes `/runs/<sha>.json` and the receipt.
+  branch on origin. Take both receipts from the SAME lab: per-file timeouts differ
+  between the two machines, so a cross-lab pair shows changes no commit made.
+  Use t27b-lab-2 (`https://t27b-lab-2-production.up.railway.app`): it runs an
+  admitted request before a moved master, up to 4 in a row (#9026), where
+  t27b-lab runs master first. Use `<lab>/runs/<sha>.receipt.json` when it exists;
+  otherwise request it with a fresh challenge you keep, and request the base too
+  when that lab has no receipt for it:
+  `c=$(openssl rand -hex 32); ssh -o BatchMode=yes 805f6f82-71d1-40d2-88bd-004e271be5ef@ssh.railway.com "mkdir -p /srv/requests && printf %s $c > /srv/requests/<sha>"`
+  (the user is t27b-lab-2's Railway service instance; `ssh t27b-lab` reaches lab 1).
+  On a host-key mismatch, retry up to 10 times; never edit known_hosts. At most 8
+  requests wait, dropped after 6 hours; a run takes about 15 minutes and publishes
+  `/runs/<sha>.json` and the receipt.
 - From a master checkout's root: `t27c corpus-receipt compare BASE.json HEAD.json
   --challenge <base's> --challenge-head <head's>` (omit a challenge you did not
   write). Paste its output and exit code: `lane` lines name each changed file.
@@ -222,7 +229,7 @@ For agents:
 - A new layer, tool or service follows the same shape: spec first, generated, self-compiling, with receipts.
 - When a layer cannot yet compile its own source, file the gap as an issue under the layer's epic (#5980 for the compiler, #6198 for t27b). Never paper it over with hand-written code.
 - A layer is done when its own `.t27` passes under itself and two builds of it are bit-identical (#8920).
-- **t27o (Ouroboros)** converts code in other languages into `.t27` (`specs/tools/t27o/rust_convert.t27`, Rust first), so foreign layers are eaten into the matryoshka instead of rewritten by hand.
+- **t27o (Ouroboros)** converts code in other languages into `.t27` (`specs/tools/t27o/rust_convert.t27`, Rust first; the functions behind its Rust std table, each with its I/O proven against Rust, in `rust_std.t27`; run it as `tri t27o <file.rs> [--oracle] [--check]`), so foreign layers are eaten into the matryoshka instead of rewritten by hand.
 
 ## DRY: never add what already exists (owner rule, 2026-10-11)
 

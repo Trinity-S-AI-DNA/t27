@@ -429,19 +429,15 @@ fn an_out_parameter_threaded_through_a_call_is_still_an_out_parameter() {
 
 #[test]
 fn only_the_written_slice_parameter_changes() {
-    // The guard has THREE outcomes and the third one matters. An earlier draft
-    // made every slice parameter a reference; `[]T` then meant `&[T]` in
-    // parameter position and `Vec<T>` in return, field and local position, and
-    // `fn join(base: []u8) []u8 { var r : []u8 = base; }` emitted
-    // `base: &[u8]` beside `let mut r: Vec<u8> = base;` -- E0308. Zig renders
-    // `[]u8` in every position and C renders `uint8_t*` in every position; only
-    // Rust would have disagreed with itself. An unmarked parameter is a no-op.
-    let src = "module ro {\n    fn peek(a: []i32, b: []i32, c: [3]i32) -> i32 { a[0] = 1; return b[0] + c[0]; }\n}\n";
+    // A read-only slice is read through a slice view (#8971). One the body owns stays `Vec<T>`: `base: &[u8]`
+    // beside `let mut r: Vec<u8> = base;` would be E0308.
+    let src = "module ro {\n    fn peek(a: []i32, b: []i32, c: [3]i32) -> i32 { a[0] = 1; return b[0] + c[0]; }\n    fn join(base: []u8) -> []u8 { var r : []u8 = base; return r; }\n}\n";
     let Some(text) = rust_text(src, "rust-readonly-slice") else {
         return;
     };
     assert!(text.contains("a: &mut [i32]"), "written slice, got:\n{text}");
-    assert!(text.contains("b: Vec<i32>"), "read-only slice must be untouched, got:\n{text}");
+    assert!(text.contains("b: impl AsRef<[i32]>") && text.contains("let b: &[i32] = b.as_ref();"), "read-only slice view, got:\n{text}");
+    assert!(text.contains("base: Vec<u8>"), "an owned slice stays a Vec, got:\n{text}");
     assert!(text.contains("c: [i32; 3]"), "fixed array untouched, got:\n{text}");
 }
 

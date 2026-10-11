@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/effects/capability.t27 -- effects at the edge: how a t27 program reaches the world outside it.
+; Epic gHashTag/t27#9008; the capability interfaces of #9001; the simulation and replay of #9002.
+; --
+; THE RULE. t27's core stays pure and deterministic; that is what makes a spec testable, sealable and
+; receipt-checkable. Everything outside it -- files, the clock, randomness, the network, the
+; environment, stdout -- is a CAPABILITY with three parts:
+;   a contract        its own spec, specs/effects/<name>_cap.t27: op codes, the handle, the calls, the
+;                     statuses each call may return, and predicates every handler must satisfy;
+;   a simulated       written in t27, seeded and deterministic, used by tests and by the t27o oracle;
+;   handler
+;   a real handler    the host's, per backend: a loop of thin generated glue around the core (below).
+; This file holds what every capability shares: the handler kinds, the statuses, the op blocks, and
+; the TAPE -- the one record of calls and results at the boundary that recording, replay and the real
+; handler all use.
+; --
+; WHAT t27 CAN EXPRESS TODAY, and the choice that forces (read on master cc19d1fcd, 2026-10-11):
+; - No function values. No spec in the corpus has a fn type, the parser has no syntax for one, and
+;   t27b has no indirect call. So a capability cannot be a struct of fn values (Eio's objects, a
+;   vtable).
+; - No extern or bodiless fn: parse_fn_decl demands a body. So a capability cannot be a module of host
+;   imports (WIT's `import`) without a language change.
+; - `use` splices the names a spec needs into one self-contained file per spec, so a backend cannot
+;   swap a module's bodies at link time either.
+; - What there is: structs with array fields, pointer fields and pointers to them, optional slices,
+;   and modules. The probes of this design (a struct holding a struct, two structs sharing one through
+;   a pointer field, `?[]const u8` into an arena, transitive `use`) pass under both
+;   `t27c test-report` and `t27b test --check`.
+; So a capability is a HANDLE: a struct passed by pointer as an ordinary argument, whose calls are
+; ordinary fns that take it first. Which handler answers is a tag in the handle, set when the handle
+; is made. The set of handlers is closed and small, so a branch on the tag does the vtable's job. No
+; compiler change is needed, and every backend (Zig, C, Rust, JS, wasm, t27b's JIT) runs it as it is.
+; Every handle of one run points to that run's one tape, so the tape holds the run's calls to all its
+; capabilities in program order, as Temporal keeps one event history per workflow run.
+; --
+; PASSING. A capability is an argument, never ambient: WASI's preopens, Eio's env, Koka's effect rows
+; made visible as parameters. A fn that is not handed an *Fs cannot touch a file, so its signature is
+; its effect type. A handle can be narrowed (fs_restrict) and never widened, so a caller hands a
+; callee no more authority than it needs. A core may make a handle of its own, but only a simulated
+; one does anything there: a CAP_HOST handle is served by the host loop that made it, and nobody else.
+; --
+; THE HANDLERS, chosen where the handle is made: in a test, or in the host's main.
+;   CAP_SIM     the t27 model answers: an in-memory store, a virtual clock, every draw from one seed by
+;               simulation.t27's counter-based sim_roll. This is FoundationDB's and TigerBeetle's (VOPR)
+;               rule: the seed owns every source of nondeterminism, so seed + commit replays any run.
+;   CAP_RECORD  the model answers, and every call and its result is appended to the run's tape.
+;   CAP_REPLAY  the tape answers. A call that differs from the next entry, or one past the end, makes
+;               the tape DIVERGED: the oracle's verdict (below).
+;   CAP_HOST    the real world answers, by DURABLE EXECUTION (Temporal workflows, Azure Durable
+;               Functions). The tape replays what the host already did. A call past its end is
+;               appended unanswered and the tape turns PENDING; every later call, to any capability of
+;               the run, returns at once, so the host sees exactly one request per run and never one
+;               made on a path the core took only because an answer was missing. The host's loop: run
+;               the core; while the tape is PENDING, perform that one request for real (the serve fn of
+;               the capability that owns its op block), tape_answer it, tape_rewind, and run again.
+; Why CAP_HOST needs no FFI: t27 code never calls the host; it reads the tape, and the host writes the
+; tape between runs. The core is pure, so each rerun takes the same path to the same call, and the
+; tape is append-only, so every effect happens once, in program order, as the host performed it. The
+; cost is one rerun per effect (n effects, n + 1 runs). That fits request-sized work: a CLI step, a
+; handler, a compiler pass, an oracle case. A long-lived process is an actor whose every turn is one
+; such run (#9003). Calling the host directly from generated code is a later optimisation; it needs
+; the language change above (host imports, with the interface types of #9004), and nothing here
+; depends on it.
+; --
+; THE TAPE is the boundary's flat form, as the Component Model's canonical ABI flattens a WIT call:
+; one entry per call -- an op, a scalar argument, up to two byte strings in, a status, a scalar result
+; and one byte string out -- in fixed arrays and one byte arena. Op codes are global, one block of 16
+; per capability, so one tape can never confuse two capabilities:
+;   16..31 fs (fs_cap.t27)    32..47 clock (clock_cap.t27)    48..63 rand    64..79 net
+;   80..95 env                96..111 stdout                  112..255 free
+; --
+; THE ORACLE (t27o, #9002). Code with I/O has no oracle today: an oracle compares outputs on inputs,
+; and a file or the clock is neither. With a tape it is both. Record the original program's calls and
+; results at the boundary, then run the converted t27 with CAP_REPLAY handles on a copy of that tape.
+; The conversion is right when it returns the same value AND tape_done holds: it made every recorded
+; call, with the same arguments (a write's bytes included), in the same order across capabilities,
+; and nothing more.
+; A recording comes from a CAP_RECORD run of a simulated world, from a CAP_HOST run on the real one
+; (its final tape is the record), or, for Rust, from t27o's harness, whose shims print each call. The
+; oracle writes a recording back as t27 calls that build the tape (fs_tape_read and the like), so a
+; trace is a test block and needs no file format of its own.
+; --
+; EVERY CAPABILITY SPEC follows fs_cap.t27: its op block; a handle struct with mode, rights, status,
+; seed, its simulated state and a pointer to the run's tape (a CAP_SIM handle never touches it); a
+; constructor per handler; its calls, which check rights first (a denial is the handle's own decision
+; and is never recorded), then branch on the mode; contract predicates per call; a serve fn, the real
+; handler's shape in t27; and tests for the laws under CAP_SIM, RECORD -> REPLAY equality, the CAP_HOST
+; protocol and a divergence caught. Simulation primitives come from their own specs as they land, reused by `use`:
+; sim_rand.t27 (PCG32, #9010), sim_clock.t27 (timers, #9011), sim_fs.t27 (#9012). Library specs here
+; call what they use unqualified, so a spec that uses them inherits the names it needs.
+; --
+; Taken from: WASI 0.2 / WIT (typed capability imports, preopens); OCaml 5 Eio (capabilities passed as
+; arguments, no ambient authority); Koka (effects in the type, handlers chosen by the caller);
+; FoundationDB's simulation and TigerBeetle's VOPR (one seed owns all nondeterminism); the Component
+; Model's canonical ABI (one flat form at the boundary); Temporal and Azure Durable Functions (replay
+; of an event history as the continuation); sans-I/O protocol libraries (the core never does I/O).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module EffectsCapability;
+
+use tri::mutate::plant;
+use tri::t27b::macho;
+
+; --- 1. Handlers, statuses and op blocks -----------------------------------------------------------
+
+pub const CAP_SIM : u8 = 0;
+pub const CAP_RECORD : u8 = 1;
+pub const CAP_REPLAY : u8 = 2;
+pub const CAP_HOST : u8 = 3;
+
+/// Is the tape what answers a handle of this mode?
+pub fn cap_replays(mode: u8) -> bool {
+    return mode == CAP_REPLAY or mode == CAP_HOST;
+}
+
+/// A call's status: one code space for every capability, as WASI has one errno. ST_PENDING and
+/// ST_DIVERGED come from the tape, never from a world.
+pub const ST_OK : u8 = 0;
+pub const ST_NOT_FOUND : u8 = 1;
+pub const ST_DENIED : u8 = 2;
+pub const ST_FULL : u8 = 3;
+pub const ST_TOO_BIG : u8 = 4;
+pub const ST_IO : u8 = 5;
+pub const ST_PENDING : u8 = 6;
+pub const ST_DIVERGED : u8 = 7;
+
+/// The op blocks: capability k owns ops 16 k .. 16 k + 15. Block 0 is nobody's, so op 0 is no call.
+pub const OPS_PER_CAP : u8 = 16;
+pub const CAP_FS : u8 = 1;
+pub const CAP_CLOCK : u8 = 2;
+pub const CAP_RAND : u8 = 3;
+pub const CAP_NET : u8 = 4;
+pub const CAP_ENV : u8 = 5;
+pub const CAP_STDOUT : u8 = 6;
+
+pub fn cap_of_op(op: u8) -> u8 {
+    return op / OPS_PER_CAP;
+}
+
+; --- 2. The tape -----------------------------------------------------------------------------------
+
+/// Sixteen calls and 512 bytes per run: enough for a request-sized run, small enough that a tape
+/// is a value every backend copies. A run that needs more fills the tape, and the tape says so.
+pub const TAPE_ENTRIES : u32 = 16;
+pub const TAPE_ARENA : u32 = 512;
+
+/// Entry i: op[i] with arg[i] and the byte strings a and b in; status[i], ret[i] and the byte string
+/// out back. state is ST_OK, ST_PENDING (CAP_HOST: the last entry waits for the host), ST_DIVERGED or
+/// ST_FULL; once it is not ST_OK no call is taken. cursor is the next entry a replay takes.
+pub const EffectTape = struct {
+    len : u32,
+    cursor : u32,
+    used : u32,
+    state : u8,
+    op : [16]u8,
+    status : [16]u8,
+    arg : [16]u64,
+    ret : [16]u64,
+    a_at : [16]u32,
+    a_len : [16]u32,
+    b_at : [16]u32,
+    b_len : [16]u32,
+    out_at : [16]u32,
+    out_len : [16]u32,
+    arena : [512]u8,
+};
+
+pub fn tape_new() -> EffectTape {
+    return EffectTape{ .len = 0, .cursor = 0, .used = 0, .state = ST_OK, .op = [0] ** 16, .status = [0] ** 16,
+        .arg = [0] ** 16, .ret = [0] ** 16, .a_at = [0] ** 16, .a_len = [0] ** 16, .b_at = [0] ** 16,
+        .b_len = [0] ** 16, .out_at = [0] ** 16, .out_len = [0] ** 16, .arena = [0] ** 512 };
+}
+
+/// Room for one more entry with n more bytes?
+pub fn tape_room(t: *EffectTape, n: usize) -> bool {
+    if (t.len >= TAPE_ENTRIES) { return false; }
+    return (t.used as usize) + n <= (TAPE_ARENA as usize);
+}
+
+/// Copies bytes to the end of the arena, which the caller has checked has room; where they start.
+fn tape_keep(t: *EffectTape, bytes: []const u8) -> u32 {
+    const at : u32 = t.used;
+    t.used = put_bytes(t.arena[0 .. TAPE_ARENA], at as usize, bytes) as u32;
+    return at;
+}
+
+/// Opens entry len for a call: its inputs, status ST_PENDING, no output. False, and state ST_FULL,
+/// when it does not fit.
+fn tape_open(t: *EffectTape, op: u8, arg: u64, a: []const u8, b: []const u8) -> bool {
+    if (!tape_room(t, a.len + b.len)) {
+        t.state = ST_FULL;
+        return false;
+    }
+    const i : u32 = t.len;
+    t.op[i] = op;
+    t.arg[i] = arg;
+    t.a_len[i] = a.len as u32;
+    t.a_at[i] = tape_keep(t, a);
+    t.b_len[i] = b.len as u32;
+    t.b_at[i] = tape_keep(t, b);
+    t.status[i] = ST_PENDING;
+    t.ret[i] = 0;
+    t.out_at[i] = t.used;
+    t.out_len[i] = 0;
+    t.len = i + 1;
+    return true;
+}
+
+/// Answers the last entry. False, and state ST_FULL, when out does not fit.
+fn tape_close(t: *EffectTape, status: u8, ret: u64, out: []const u8) -> bool {
+    if ((t.used as usize) + out.len > (TAPE_ARENA as usize)) {
+        t.state = ST_FULL;
+        return false;
+    }
+    const i : u32 = t.len - 1;
+    t.status[i] = status;
+    t.ret[i] = ret;
+    t.out_len[i] = out.len as u32;
+    t.out_at[i] = tape_keep(t, out);
+    return true;
+}
+
+/// The byte strings of entry i, which must exist.
+pub fn tape_a(t: *EffectTape, i: u32) -> []const u8 {
+    return t.arena[t.a_at[i] .. t.a_at[i] + t.a_len[i]];
+}
+
+pub fn tape_b(t: *EffectTape, i: u32) -> []const u8 {
+    return t.arena[t.b_at[i] .. t.b_at[i] + t.b_len[i]];
+}
+
+pub fn tape_out(t: *EffectTape, i: u32) -> []const u8 {
+    return t.arena[t.out_at[i] .. t.out_at[i] + t.out_len[i]];
+}
+
+/// CAP_RECORD, and a recording written back as calls: one whole call, appended. The cursor follows,
+/// so a recording is done as it stands and a replayer of it starts from tape_rewind. False, appending
+/// nothing, when the tape is full (state ST_FULL): the recording is incomplete, and tape_done says so.
+pub fn tape_record(t: *EffectTape, op: u8, arg: u64, a: []const u8, b: []const u8, status: u8, ret: u64, out: []const u8) -> bool {
+    if (t.state != ST_OK) { return false; }
+    if (!tape_room(t, a.len + b.len + out.len)) {
+        t.state = ST_FULL;
+        return false;
+    }
+    _ = tape_open(t, op, arg, a, b);
+    _ = tape_close(t, status, ret, out);
+    t.cursor = t.len;
+    return true;
+}
+
+/// Is entry i this call: the same op, scalar argument and input bytes?
+pub fn tape_is(t: *EffectTape, i: u32, op: u8, arg: u64, a: []const u8, b: []const u8) -> bool {
+    if (t.op[i] != op or t.arg[i] != arg) { return false; }
+    if (!same_text(tape_a(t, i), a)) { return false; }
+    return same_text(tape_b(t, i), b);
+}
+
+/// CAP_REPLAY (host false) and CAP_HOST (host true): take the next entry for this call. True when it
+/// is this call and answered; the cursor moves past it and tape_last names it. Otherwise false, and
+/// the state says why:
+///   ST_DIVERGED  the next entry is another call, or a replay ran past the end;
+///   ST_PENDING   CAP_HOST ran past the end: the call is now the open last entry, for the host to
+///                answer; or the host has not answered it yet;
+///   ST_FULL      the call did not fit.
+/// Once the state is not ST_OK every call returns false and changes nothing.
+pub fn tape_take(t: *EffectTape, op: u8, arg: u64, a: []const u8, b: []const u8, host: bool) -> bool {
+    if (t.state != ST_OK) { return false; }
+    if (t.cursor < t.len) {
+        if (!tape_is(t, t.cursor, op, arg, a, b)) {
+            t.state = ST_DIVERGED;
+            return false;
+        }
+        if (t.status[t.cursor] == ST_PENDING) {
+            t.state = ST_PENDING;
+            return false;
+        }
+        t.cursor = t.cursor + 1;
+        return true;
+    }
+    if (!host) {
+        t.state = ST_DIVERGED;
+        return false;
+    }
+    if (!tape_open(t, op, arg, a, b)) { return false; }
+    t.state = ST_PENDING;
+    return false;
+}
+
+/// The entry the last successful tape_take took.
+pub fn tape_last(t: *EffectTape) -> u32 {
+    if (t.cursor == 0) { return 0; }
+    return t.cursor - 1;
+}
+
+; --- 3. The host's side of CAP_HOST ----------------------------------------------------------------
+
+/// Is a call waiting for the host? The host reads it with tape_pending_at and the accessors above.
+pub fn tape_pending(t: *EffectTape) -> bool {
+    return t.state == ST_PENDING;
+}
+
+pub fn tape_pending_at(t: *EffectTape) -> u32 {
+    if (t.len == 0) { return 0; }
+    return t.len - 1;
+}
+
+/// The host's answer to the waiting call. False when no call waits, when it is answered already, or
+/// when out does not fit (state ST_FULL).
+pub fn tape_answer(t: *EffectTape, status: u8, ret: u64, out: []const u8) -> bool {
+    if (t.state != ST_PENDING) { return false; }
+    if (t.status[t.len - 1] != ST_PENDING) { return false; }
+    return tape_close(t, status, ret, out);
+}
+
+/// Before the next run: back to the first entry. ST_PENDING clears; ST_DIVERGED and ST_FULL are
+/// verdicts and stay.
+pub fn tape_rewind(t: *EffectTape) -> void {
+    t.cursor = 0;
+    if (t.state == ST_PENDING) { t.state = ST_OK; }
+}
+
+/// The replay verdict: nothing diverged, waits or was lost, and every entry was taken -- the run made
+/// exactly the recorded calls, in order.
+pub fn tape_done(t: *EffectTape) -> bool {
+    return t.state == ST_OK and t.cursor == t.len;
+}
+
+; --- tests -----------------------------------------------------------------------------------------
+
+fn three_calls() -> EffectTape {
+    var t = tape_new();
+    _ = tape_record(&t, 16, 0, "cfg", "", ST_OK, 3, "abc");
+    _ = tape_record(&t, 32, 0, "", "", ST_OK, 1000000007, "");
+    _ = tape_record(&t, 17, 3, "out", "xyz", ST_FULL, 0, "");
+    return t;
+}
+
+test "a_recording_replays_entry_by_entry" {
+    var t = three_calls();
+    assert t.len == 3;
+    assert tape_done(&t);
+    tape_rewind(&t);
+    assert tape_done(&t) == false;
+    assert tape_take(&t, 16, 0, "cfg", "", false);
+    assert tape_last(&t) == 0;
+    assert same_text(tape_out(&t, 0), "abc");
+    assert t.ret[0] == 3;
+    assert tape_take(&t, 32, 0, "", "", false);
+    assert t.ret[tape_last(&t)] == 1000000007;
+    assert tape_take(&t, 17, 3, "out", "xyz", false);
+    assert t.status[tape_last(&t)] == ST_FULL;
+    assert same_text(tape_a(&t, 2), "out");
+    assert same_text(tape_b(&t, 2), "xyz");
+    assert tape_done(&t);
+}
+
+test "any_difference_diverges_and_the_verdict_stays" {
+    var op = three_calls();
+    tape_rewind(&op);
+    assert tape_take(&op, 17, 0, "cfg", "", false) == false;
+    assert op.state == ST_DIVERGED;
+    var arg = three_calls();
+    tape_rewind(&arg);
+    assert tape_take(&arg, 16, 1, "cfg", "", false) == false;
+    assert arg.state == ST_DIVERGED;
+    var first = three_calls();
+    tape_rewind(&first);
+    assert tape_take(&first, 16, 0, "cfh", "", false) == false;
+    assert first.state == ST_DIVERGED;
+    var bytes = three_calls();
+    tape_rewind(&bytes);
+    assert tape_take(&bytes, 16, 0, "cfg", "", false);
+    assert tape_take(&bytes, 32, 0, "", "", false);
+    assert tape_take(&bytes, 17, 3, "out", "xyw", false) == false;
+    assert bytes.state == ST_DIVERGED;
+    // a diverged tape takes nothing more, and a rewind does not clear the verdict
+    assert tape_take(&bytes, 16, 0, "cfg", "", false) == false;
+    tape_rewind(&bytes);
+    assert bytes.state == ST_DIVERGED;
+    assert tape_take(&bytes, 16, 0, "cfg", "", false) == false;
+    assert tape_done(&bytes) == false;
+}
+
+test "a_replay_past_the_end_diverges_and_a_short_run_is_not_done" {
+    var long = three_calls();
+    tape_rewind(&long);
+    assert tape_take(&long, 16, 0, "cfg", "", false);
+    assert tape_take(&long, 32, 0, "", "", false);
+    assert tape_take(&long, 17, 3, "out", "xyz", false);
+    assert tape_take(&long, 32, 0, "", "", false) == false;
+    assert long.state == ST_DIVERGED;
+    assert long.len == 3;
+    var short = three_calls();
+    tape_rewind(&short);
+    assert tape_take(&short, 16, 0, "cfg", "", false);
+    assert tape_done(&short) == false;
+    assert short.state == ST_OK;
+}
+
+test "the_host_sees_one_waiting_call_per_run" {
+    var t = tape_new();
+    // before any call there is nothing taken and nothing waiting
+    assert tape_last(&t) == 0;
+    assert tape_pending_at(&t) == 0;
+    assert tape_pending(&t) == false;
+    // run 1: the first call opens an entry and waits; a second call in the same run adds nothing
+    assert tape_take(&t, 16, 0, "cfg", "", true) == false;
+    assert tape_pending(&t);
+    assert t.len == 1;
+    assert t.status[0] == ST_PENDING;
+    assert tape_take(&t, 32, 0, "", "", true) == false;
+    assert t.len == 1;
+    // a rewind without an answer finds the same call waiting; until it is asked again, nothing is
+    // waiting for an answer
+    tape_rewind(&t);
+    assert tape_answer(&t, ST_OK, 3, "abc") == false;
+    assert t.status[0] == ST_PENDING;
+    assert tape_take(&t, 16, 0, "cfg", "", true) == false;
+    assert tape_pending(&t);
+    assert t.len == 1;
+    // the host performs it and answers; an answer is given once
+    assert tape_pending_at(&t) == 0;
+    assert t.op[tape_pending_at(&t)] == 16;
+    assert same_text(tape_a(&t, tape_pending_at(&t)), "cfg");
+    assert tape_answer(&t, ST_OK, 3, "abc");
+    assert tape_answer(&t, ST_OK, 3, "abc") == false;
+    // run 2: the answered call replays, the next one waits
+    tape_rewind(&t);
+    assert tape_take(&t, 16, 0, "cfg", "", true);
+    assert same_text(tape_out(&t, tape_last(&t)), "abc");
+    assert tape_take(&t, 32, 0, "", "", true) == false;
+    assert t.len == 2;
+    assert tape_pending_at(&t) == 1;
+    assert t.op[tape_pending_at(&t)] == 32;
+    assert tape_answer(&t, ST_OK, 1000000007, "");
+    // run 3: both replay and nothing waits
+    tape_rewind(&t);
+    assert tape_take(&t, 16, 0, "cfg", "", true);
+    assert tape_take(&t, 32, 0, "", "", true);
+    assert tape_done(&t);
+    // with nothing waiting there is nothing to answer
+    assert tape_answer(&t, ST_OK, 0, "") == false;
+}
+
+test "a_full_tape_refuses_and_says_so" {
+    var t = tape_new();
+    var i : u32 = 0;
+    while (i < TAPE_ENTRIES) {
+        assert tape_record(&t, 32, i as u64, "", "", ST_OK, 0, "");
+        i = i + 1;
+    }
+    assert tape_record(&t, 32, 99, "", "", ST_OK, 0, "") == false;
+    assert t.state == ST_FULL;
+    assert t.len == TAPE_ENTRIES;
+    assert tape_done(&t) == false;
+    tape_rewind(&t);
+    assert t.state == ST_FULL;
+    // the arena fills as well as the entries: 600 bytes do not fit in 512, and a full tape then
+    // refuses even a call that would fit
+    const wide : [600]u8 = [65] ** 600;
+    var big = tape_new();
+    assert tape_record(&big, 16, 0, "p", "", ST_OK, 0, wide[0 .. 600]) == false;
+    assert big.state == ST_FULL;
+    assert tape_record(&big, 32, 0, "", "", ST_OK, 0, "") == false;
+    assert big.len == 0;
+    // both inputs count: 300 and 300 bytes in do not fit
+    var two = tape_new();
+    assert tape_record(&two, 17, 0, wide[0 .. 300], wide[0 .. 300], ST_OK, 0, "") == false;
+    assert two.state == ST_FULL;
+    assert two.len == 0;
+    // exactly 512 bytes fit, in or out
+    var exact_in = tape_new();
+    assert tape_record(&exact_in, 17, 0, wide[0 .. 500], wide[0 .. 12], ST_OK, 0, "");
+    assert exact_in.used == TAPE_ARENA;
+    assert tape_done(&exact_in);
+    var exact_out = tape_new();
+    assert tape_record(&exact_out, 16, 0, "", "", ST_OK, 512, wide[0 .. 512]);
+    assert exact_out.used == TAPE_ARENA;
+    assert tape_out(&exact_out, 0).len == 512;
+    // the host's call fails the same way when its inputs are too big to open ...
+    var host = tape_new();
+    assert tape_take(&host, 16, 0, wide[0 .. 600], "", true) == false;
+    assert host.state == ST_FULL;
+    assert tape_pending(&host) == false;
+    var host2 = tape_new();
+    assert tape_take(&host2, 17, 0, wide[0 .. 300], wide[0 .. 300], true) == false;
+    assert host2.state == ST_FULL;
+    assert host2.len == 0;
+    // ... or its answer too big to keep; an answer that fills the arena exactly is kept
+    var fits = tape_new();
+    assert tape_take(&fits, 16, 0, wide[0 .. 500], "", true) == false;
+    assert tape_answer(&fits, ST_OK, 12, wide[0 .. 12]);
+    assert fits.used == TAPE_ARENA;
+    var over = tape_new();
+    assert tape_take(&over, 16, 0, wide[0 .. 500], "", true) == false;
+    assert tape_answer(&over, ST_OK, 13, wide[0 .. 13]) == false;
+    assert over.state == ST_FULL;
+}
+
+test "op_blocks_name_their_capability" {
+    assert cap_of_op(16) == CAP_FS;
+    assert cap_of_op(31) == CAP_FS;
+    assert cap_of_op(32) == CAP_CLOCK;
+    assert cap_of_op(48) == CAP_RAND;
+    assert cap_of_op(64) == CAP_NET;
+    assert cap_of_op(80) == CAP_ENV;
+    assert cap_of_op(96) == CAP_STDOUT;
+    assert cap_of_op(0) == 0;
+    assert cap_replays(CAP_REPLAY);
+    assert cap_replays(CAP_HOST);
+    assert cap_replays(CAP_SIM) == false;
+    assert cap_replays(CAP_RECORD) == false;
+}
