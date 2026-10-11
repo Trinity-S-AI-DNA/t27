@@ -28,6 +28,10 @@ mod operator_text;
 #[path = "../gen/rust/compiler/verilog_names.rs"]
 #[allow(dead_code, unused_parens)]
 mod verilog_names;
+// specs/compiler/hir_cost_models.t27 (t27o port, #9114), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/hir_cost_models.rs"]
+#[allow(dead_code, unused_parens)]
+mod hir_cost_models;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -32275,22 +32279,19 @@ impl TimingModel {
     pub const HOLD_TIME_PS: u32 = 50;
 
     pub fn est_comb_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS
+        hir_cost_models::est_comb_delay(num_luts)
     }
 
     pub fn est_reg_to_reg_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS + Self::SETUP_TIME_PS
+        hir_cost_models::est_reg_to_reg_delay(num_luts)
     }
 
     pub fn slack(delay_ps: u32, constraint_ps: u32) -> i64 {
-        constraint_ps as i64 - delay_ps as i64
+        hir_cost_models::slack(delay_ps, constraint_ps)
     }
 
     pub fn fmax_from_delay(delay_ps: u32) -> u32 {
-        if delay_ps == 0 {
-            return 0;
-        }
-        1_000_000_000 / delay_ps
+        hir_cost_models::fmax_from_delay(delay_ps)
     }
 
     pub fn analyze_module(module: &HirModule, constraint: &TimingConstraint) -> TimingReport {
@@ -32417,19 +32418,19 @@ impl PowerModel {
     pub const STATIC_PER_RESOURCE_UW: u32 = 100;
 
     pub fn est_lut_dynamic(luts: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        luts * Self::LUT_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_lut_dynamic(luts, clock_mhz, toggle_rate)
     }
     pub fn est_ff_dynamic(ffs: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        ffs * Self::FF_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_ff_dynamic(ffs, clock_mhz, toggle_rate)
     }
     pub fn est_bram_dynamic(brams: u32, clock_mhz: u32) -> u32 {
-        brams * Self::BRAM_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_bram_dynamic(brams, clock_mhz)
     }
     pub fn est_dsp_dynamic(dsps: u32, clock_mhz: u32) -> u32 {
-        dsps * Self::DSP_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_dsp_dynamic(dsps, clock_mhz)
     }
     pub fn est_static(total_resources: u32) -> u32 {
-        Self::STATIC_BASE_MW + total_resources * Self::STATIC_PER_RESOURCE_UW / 1000
+        hir_cost_models::est_static(total_resources)
     }
 
     pub fn estimate_module(module: &HirModule, clock_mhz: u32, toggle_rate: u32) -> PowerEstimate {
@@ -33056,19 +33057,11 @@ impl RouteModel {
     pub const LONG_WIRE_UM: u32 = 5000;
 
     pub fn est_wire_length(fanout: u32) -> u32 {
-        match fanout {
-            0 => 0,
-            1..=4 => Self::LOCAL_WIRE_UM,
-            5..=16 => Self::MEDIUM_WIRE_UM,
-            _ => Self::LONG_WIRE_UM,
-        }
+        hir_cost_models::est_wire_length(fanout)
     }
 
     pub fn est_congestion(nets: u32, die_area_mm2: u32) -> u32 {
-        if die_area_mm2 == 0 {
-            return 0;
-        }
-        nets / die_area_mm2
+        hir_cost_models::est_congestion(nets, die_area_mm2)
     }
 }
 
@@ -33476,20 +33469,10 @@ pub struct CtsModel;
 
 impl CtsModel {
     pub fn est_buffers_needed(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else {
-            num_sinks / 16 + 1
-        }
+        hir_cost_models::est_buffers_needed(num_sinks)
     }
     pub fn est_tree_levels(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else if num_sinks <= 256 {
-            2
-        } else {
-            3
-        }
+        hir_cost_models::est_tree_levels(num_sinks)
     }
 }
 
