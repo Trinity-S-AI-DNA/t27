@@ -182,8 +182,7 @@ impl Q {
         r.ok.then_some(Q(r.q))
     }
 
-    /// The square root, as Zig folds `@sqrt` of a comptime_float: correctly
-    /// rounded to binary128 (`q_sqrt`'s integer root), zero keeping its sign.
+    /// The square root, as Zig folds it: correctly rounded to binary128, zero's sign kept.
     pub(super) fn sqrt(self) -> Option<Q> {
         let r = cf::q_sqrt(self.0);
         r.ok.then_some(Q(r.q))
