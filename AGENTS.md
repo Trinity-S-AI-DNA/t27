@@ -223,6 +223,14 @@ For agents:
 - When a layer cannot yet compile its own source, file the gap as an issue under the layer's epic (#5980 for the compiler, #6198 for t27b). Never paper it over with hand-written code.
 - A layer is done when its own `.t27` passes under itself and two builds of it are bit-identical (#8920).
 
+## DRY: never add what already exists (owner rule, 2026-10-11)
+
+Every spec is a running cost: a seal, a ledger row, CI minutes on every pull request, and tokens for every agent that reads it. So:
+- **Search before adding a spec or a function.** Use `t27c dupes --name <fn>` / `--bodies`, `python3 tools/dupe_scan.py --name/--like <spec>` and `specs/tools/catalog.t27`. If a match exists, `use` it or extend it. Never copy it.
+- **Extend before creating.** Prefer extending an existing plan or conformance spec over a new file. Keep one conformance spec per area, not one per feature.
+- **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
+- **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
+
 ## Actors, not threads (owner rule, 2026-10-08)
 
 Owner's rule, 2026-10-08: the Queen and the swarm move to the actor model.
