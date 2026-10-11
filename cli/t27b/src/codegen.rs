@@ -41,6 +41,8 @@ pub enum TrapStyle {
     Jit,
     /// Object file: stubs are `brk #kind`.
     Brk,
+    /// ELF object file (specs/tri/t27b/elf.t27): `brk` stubs, and module-level vars in .data.
+    Elf,
 }
 
 /// Machine code of one function before linking.
@@ -339,7 +341,7 @@ impl<'a> Gen<'a> {
                 self.stub_by_site.insert(site, l);
                 l
             }
-            TrapStyle::Brk => {
+            TrapStyle::Brk | TrapStyle::Elf => {
                 let kind = self.prog.sites[site as usize].kind;
                 self.stub_brk(kind)
             }
@@ -852,7 +854,7 @@ impl<'a> Gen<'a> {
                         self.stubs.push((l, Stub::AssertEq(*site, ra, rb)));
                         l
                     }
-                    TrapStyle::Brk => self.stub_brk(TrapKind::AssertEq),
+                    TrapStyle::Brk | TrapStyle::Elf => self.stub_brk(TrapKind::AssertEq),
                 };
                 self.bcond(Cond::Ne, l);
             }
@@ -1288,9 +1290,9 @@ impl<'a> Gen<'a> {
             ExprKind::Global(k) => {
                 // The JIT appends one more blob after `Program::data`: a
                 // table of the absolute address of every global, which live
-                // in writable memory outside the executable image. An object
-                // file has no such table (no __DATA section yet).
-                if self.style != TrapStyle::Jit {
+                // in writable memory outside the executable image. An ELF object
+                // carries it in .data; a Mach-O object has none (no __DATA section yet).
+                if self.style == TrapStyle::Brk {
                     self.fail(format!("{} (no writable data section)", GLOBAL_IN_OBJECT));
                 }
                 if *k >= 4096 {
