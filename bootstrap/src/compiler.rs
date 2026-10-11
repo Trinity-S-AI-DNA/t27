@@ -9615,6 +9615,13 @@ impl Codegen {
         count_ident_assigns(&node.children, &mut assign_counts);
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         for stmt in &node.children {
+            // #8980: `then elapsed_time_ns < 100` names a clock a Zig 0.16 test lacks (no std.Io),
+            // and no bench_* fn is ever called; say the budget was not lowered, as for a bare `;`.
+            if mentions_clock(stmt) {
+                self.write_indent();
+                self.write_line("// bench budget not lowered: elapsed_time_* has no clock here (#8980)");
+                continue;
+            }
             let fresh_binding = self.block_fresh_binding(stmt, &mut bound);
             let tuple_binding = stmt.kind == NodeKind::StmtAssign
                 && stmt.children.len() >= 2
@@ -10433,6 +10440,12 @@ impl Codegen {
                         "round" => Some("@round"),
                         "min" => Some("@min"),
                         "max" => Some("@max"),
+                        // #8980: `exp(` 56 times, `log(` 28, `tanh(` 21 (Zig has no `@tanh`).
+                        "exp" => Some("@exp"),
+                        "log" => Some("@log"),
+                        "sin" => Some("@sin"),
+                        "cos" => Some("@cos"),
+                        "tanh" => Some("std.math.tanh"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -21001,16 +21014,6 @@ long double: fabsl, default: llabs)(x)",
         self.write_line("");
     }
 
-    /// C return type for a t27 return type: a tuple lowers to its hoisted
-    /// struct typedef name, everything else to the usual C type.
-    fn c_return_type(ty: &str) -> String {
-        if let Some((name, _)) = Self::c_tuple_info(ty) {
-            name
-        } else {
-            Self::param_type_to_c(ty)
-        }
-    }
-
     fn gen_c_fn_prototype(&mut self, node: &Node) {
         let ret_type = self.c_return_type_r(&node.extra_return_type);
         let ret_type = if ret_type.is_empty() {
@@ -24302,17 +24305,23 @@ fn collect_param_names(
     out: &mut std::collections::HashMap<String, Vec<(String, String)>>,
 ) {
     if node.kind == NodeKind::FnDecl {
-        out.insert(node.name.clone(), node.params.clone());
+        let text = |p: &String, t: &String| t.trim() == "[]const u8" && owns_slice(&node.children, p); // #8971
+        out.insert(node.name.clone(), node.params.iter().map(|(p, t)| (p.clone(), if text(p, t) { "str".into() } else { t.clone() })).collect());
     }
     for c in &node.children {
         collect_param_names(c, out);
     }
 }
 
-/// Does the file slice (`x[a..b]`)? Only then is a `[]const u8` parameter bytes, not text.
-fn has_slice(n: &Node) -> bool {
-    (n.kind == NodeKind::ExprIndex && n.children.get(1).is_some_and(|i| i.extra_op == ".."))
-        || n.children.iter().any(has_slice)
+/// #8971: does a body return the slice `name`, copy it, store it or loop over it? Then it is owned, not borrowed.
+fn owns_slice(nodes: &[Node], name: &str) -> bool {
+    let is = |c: Option<&Node>| c.is_some_and(|c| c.kind == NodeKind::ExprIdentifier && c.name == name);
+    nodes.iter().any(|n| match n.kind {
+        NodeKind::ExprReturn | NodeKind::StmtFor | NodeKind::StmtLocal => is(n.children.first()),
+        NodeKind::StmtAssign => is(n.children.get(1)),
+        NodeKind::ExprStructLit => n.children.iter().any(|f| is(f.children.first())),
+        _ => false,
+    } || owns_slice(&n.children, name))
 }
 
 fn collect_written_slice_params(
@@ -24622,6 +24631,10 @@ fn return_unsized(elem: String) -> String {
 /// Substring matching is wrong here and cheaply so: `T` occurs inside `Trit`,
 /// `TritCell` and `Vec<Trit>`, and adding `<T>` to every function mentioning any
 /// of those would break signatures that were already correct.
+fn mentions_clock(n: &Node) -> bool {
+    (n.kind == NodeKind::ExprIdentifier && n.name.starts_with("elapsed_time_")) || n.children.iter().any(mentions_clock)
+}
+
 fn mentions_type(hay: &str, name: &str) -> bool {
     let bytes = hay.as_bytes();
     let mut from = 0usize;
@@ -26867,8 +26880,6 @@ pub struct RustCodegen {
     /// Parameter names by position, per function. Pairs with the map above so a
     /// call site can ask "is argument 2 a `&mut [T]` slot?".
     param_names: std::collections::HashMap<String, Vec<(String, String)>>,
-    /// `has_slice(file)`: its `[]const u8` parameters are `&[u8]`, else `&'static str`.
-    byte_params: bool,
     /// The slice parameters of the function currently being emitted that are
     /// themselves `&mut [T]`. Passing one of those on is a reborrow and must
     /// NOT get another `&mut`.
@@ -26946,7 +26957,6 @@ impl RustCodegen {
             in_const_init: false,
             written_slice_params: std::collections::HashMap::new(),
             param_names: std::collections::HashMap::new(),
-            byte_params: false,
             field_names: std::collections::HashSet::new(),
             current_mut_slice_params: std::collections::HashSet::new(),
             bool_vars: std::collections::HashSet::new(),
@@ -27073,7 +27083,6 @@ impl RustCodegen {
         self.written_slice_params = collect_written_slice_params(ast);
         self.param_names.clear();
         collect_param_names(ast, &mut self.param_names);
-        self.byte_params = has_slice(ast);
         self.field_names.clear();
         collect_field_names(ast, &mut self.field_names);
 
@@ -27453,11 +27462,7 @@ impl RustCodegen {
         // slice parameter, 174 parse, and 23 emit Rust that index-assigns into
         // one. **Zero of those 23 compiled.** The path is uniformly broken, so
         // this cannot regress a working case -- there are none.
-        //
-        // Deliberately narrow: only the written-into slices move to `&mut [T]`.
-        // A read-only `Vec<T>` parameter is valid Rust that compiles today, and
-        // rewriting it to `&[T]` would change call sites for no defect.
-        let mut mut_slices: Vec<String> = Vec::new();
+        let (mut mut_slices, mut views): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         let empty = std::collections::HashSet::new();
         let written = self
             .written_slice_params
@@ -27494,19 +27499,12 @@ impl RustCodegen {
                             && e.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
                             && !matches!(*e, "const" | "mut" | "ref" | "dyn" | "impl" | "fn")
                     });
-                // THREE outcomes, not two. An experiment that made every
-                // slice parameter a reference was measured and reverted: `[]T`
-                // then meant `&[T]` in parameter position and `Vec<T>` in
-                // return, field and local position, so
-                //   fn join(base: []u8, name: []u8) []u8 { var r : []u8 = base; }
-                // emitted `base: &[u8]` beside `let mut r: Vec<u8> = base;`
-                // and E0308. Zig renders `[]u8` in every position and C renders
-                // `uint8_t*` in every position; only Rust would have disagreed
-                // with itself. A parameter the fixpoint does not mark is left
-                // EXACTLY as it was, which is the no-op this comment promises.
                 if let (true, true, Some(elem)) = (is_slice, written.contains(n), elem) {
                     mut_slices.push(n.clone());
                     format!("{}: &mut [{}]", rust_ident(n), elem)
+                } else if let (true, Some(elem), false) = (is_slice, elem, owns_slice(&node.children, n)) {
+                    views.push(format!("let {0}: &[{1}] = {0}.as_ref();", rust_ident(n), elem)); // #8971: a slice
+                    format!("{}: impl AsRef<[{}]>", rust_ident(n), elem)
                 } else if rust_ty.starts_with("*mut ") && t.trim_start().starts_with('*')
                     && !t.trim_start()[1..].trim_start().starts_with("const ")
                     && !t.trim_start()[1..].trim_start().starts_with("mut ")
@@ -27525,7 +27523,7 @@ impl RustCodegen {
                     // `&mut T` without a lifetime, and doing it everywhere
                     // introduced 9 errors across 3 specs against 1 revealed.
                     format!("{}: &mut {}", rust_ident(n), &rust_ty[5..])
-                } else if self.byte_params && t.trim() == "[]const u8" {
+                } else if t.trim() == "[]const u8" && !owns_slice(&node.children, n) {
                     format!("{}: &[u8]", rust_ident(n)) // `&'static str` cannot take `x[a..b]`
                 } else {
                     let binding = if mutable_params.contains(n) && !rust_ty.starts_with('&') {
@@ -27595,7 +27593,7 @@ impl RustCodegen {
         // `return` of a narrower/wider value can be cast to the return type.
         self.var_types.clear();
         for (pname, ptype) in &params {
-            if self.byte_params && ptype.trim() == "[]const u8" {
+            if ptype.trim() == "[]const u8" && !owns_slice(&node.children, pname) {
                 self.var_types.insert(pname.clone(), "&[u8]".to_string());
             } else if !ptype.trim().is_empty() {
                 self.var_types
@@ -27616,6 +27614,7 @@ impl RustCodegen {
         if has_body {
             self.output.push('\n');
             self.indent += 1;
+            views.iter().for_each(|v| self.write_line(v));
             if body_unsafe {
                 self.write_line("unsafe {");
                 self.indent += 1;
@@ -28761,6 +28760,8 @@ impl RustCodegen {
             {
                 if let Some(t) = self.infer_int_type(&n.children[0]) {
                     self.var_types.insert(n.name.clone(), t);
+                } else if n.children[0].extra_kind == "string" {
+                    self.var_types.insert(n.name.clone(), "&'static str".to_string()); // #8971: text
                 }
             }
             self.record_inferred_locals(&n.children);
@@ -28795,7 +28796,15 @@ impl RustCodegen {
     /// to have the *same* integer type; t27 does not. Cast the narrower side up
     /// so the emitted operator compiles. Shifts are exempt — Rust already
     /// accepts any integer type as the shift amount.
+    fn rust_type_of(&self, n: &Node) -> Option<&str> { // #8971: the declared Rust type of a name
+        self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).filter(|_| n.kind == NodeKind::ExprIdentifier).map(|t| t.as_str())
+    }
+
     fn coerce_binary_operands(&self, node: &Node, left: &mut String, right: &mut String) {
+        let text = |n: &Node, s: &mut String| if n.kind == NodeKind::ExprLiteral && n.extra_kind == "string" { s.insert(0, 'b') }
+            else if self.rust_type_of(n) == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
+        if self.rust_type_of(&node.children[0]) == Some("&[u8]") { text(&node.children[1], right) }
+        if self.rust_type_of(&node.children[1]) == Some("&[u8]") { text(&node.children[0], left) }
         if matches!(node.extra_op.as_str(), "<<" | ">>") {
             return;
         }
@@ -28874,6 +28883,7 @@ impl RustCodegen {
             NodeKind::ExprLiteral if node.extra_kind == "string" => {
                 format!("\"{}\"", Codegen::zig_escape(&node.value))
             }
+            NodeKind::ExprLiteral if node.value.starts_with('\'') => format!("b{}", node.value), // #8971: a u8
             NodeKind::ExprLiteral => node.value.clone(),
             // The source language spells the empty optional `null`; Rust spells
             // it `None`. It arrived as a bare identifier and rustc answered
@@ -29000,12 +29010,14 @@ impl RustCodegen {
                     for (i, a) in args.iter_mut().enumerate() {
                         let (Some((_, t)), Some(c)) = (callee_params.get(i), node.children.get(i)) else { continue };
                         let t = t.trim();
-                        if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
+                        if t == "[]const u8" && self.rust_type_of(c) == Some("&'static str") {
+                            a.push_str(".as_bytes()");
+                        } else if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
                             && !t[1..].trim_start().starts_with("const ")
                         {
                             *a = format!("&mut {}", &a[1..]);
                         } else if c.kind == NodeKind::ExprLiteral && c.extra_kind == "string"
-                            && self.byte_params && t == "[]const u8"
+                            && t == "[]const u8"
                         {
                             *a = format!("b{}", a);
                         }
@@ -29180,7 +29192,7 @@ impl RustCodegen {
                     {
                         format!("(({}) == 0)", self.expr_to_rust(operand))
                     } else {
-                        format!("{}({})", node.extra_op, self.expr_to_rust(operand))
+                        format!("{}({})", node.extra_op.replace('~', "!"), self.expr_to_rust(operand))
                     }
                 } else {
                     node.extra_op.clone()
