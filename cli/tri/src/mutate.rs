@@ -801,10 +801,6 @@ fn t27_fn_header(line: &str) -> Option<String> {
     }
 }
 
-fn is_word_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
-}
-
 /// The mutants of one line inside a function body.
 fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<SpecMutant>) {
     let b = line.as_bytes();
@@ -895,8 +891,8 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
             }
             b'a' if line[i..].starts_with("and")
                 && code(i, 3)
-                && !is_word_byte(prev(i))
-                && !is_word_byte(next(i + 3)) =>
+                && !plant::word_byte(prev(i))
+                && !plant::word_byte(next(i + 3)) =>
             {
                 push("swap-logic", i, 3, "or");
                 i += 3;
@@ -904,8 +900,8 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
             }
             b'o' if line[i..].starts_with("or")
                 && code(i, 2)
-                && !is_word_byte(prev(i))
-                && !is_word_byte(next(i + 2)) =>
+                && !plant::word_byte(prev(i))
+                && !plant::word_byte(next(i + 2)) =>
             {
                 push("swap-logic", i, 2, "and");
                 i += 2;
@@ -917,7 +913,7 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
                     && prev(i) == b' '
                     && line[i + 1..].starts_with(" 1")
                     && code(i - 1, 4)
-                    && !is_word_byte(next(i + 3))
+                    && !plant::word_byte(next(i + 3))
                     && next(i + 3) != b'.' =>
             {
                 push("drop-step", i - 1, 4, "");

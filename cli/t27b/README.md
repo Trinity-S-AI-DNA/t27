@@ -7,7 +7,10 @@ outputs:
 * `t27b test`: an in-process JIT test runner. The code is written into one
   executable region (`MAP_JIT` on macOS; `mmap` RW, then `mprotect` RX on
   Linux) and the module's `test` blocks run there.
-* `t27b build -o out.o`: a Mach-O `MH_OBJECT` for arm64. It links with
+* `t27b build -o out.o`: a relocatable object. On Linux it is an ELF64 `ET_REL` for
+  aarch64 (`--elf`, specs/tri/t27b/elf.t27), which links with
+  `aarch64-linux-gnu-gcc driver.c out.o`; elsewhere a Mach-O `MH_OBJECT` for arm64
+  (`--macho`, specs/tri/t27b/macho.t27), which links with
   `cc driver.c out.o`.
 
 The JIT runs on arm64 macOS and arm64 Linux. The Railway t27b lab
@@ -74,7 +77,7 @@ reference interpreter (see Verification).
 | `src/codegen.rs` | Instruction selection, register assignment, frames, trap stubs, linking |
 | `src/a64.rs` | AArch64 encoders and the disassembler |
 | `src/jit.rs` | `MAP_JIT` image, the `enter` trampoline and `trap_common` |
-| `src/macho.rs` | Hand-written Mach-O 64 relocatable object |
+| `src/macho.rs` | Glue: flattens a linked image for the object writers specs/tri/t27b/macho.t27 (Mach-O) and elf.t27 (ELF64) |
 | `src/main.rs` | Command line, `corpus` runner |
 | `src/timing.rs` | `--time` phase clock |
 
@@ -298,7 +301,7 @@ Each cell is the outcome of that test (`inc_max`, `shr_big`, `rem_neg`):
 
 ```
 t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
 t27b asm    <file.t27> [--overflow trap|wrap]
 t27b verilog <file.t27>
 t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]

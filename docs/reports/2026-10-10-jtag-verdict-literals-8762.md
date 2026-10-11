@@ -106,3 +106,22 @@ hashes (big-frame-dependency-jtag-verify.log in this report's evidence directory
 Earlier JTAG execution results remain applicable to that unchanged source;
 they are not described as new executions. Fresh published-head CI remains
 required, and upstream merge access is still absent.
+
+
+## Conflict refresh at c4fc14c2d (2026-10-11)
+
+A normal dependency merge of own #8749 head
+`3154c56264ef9c6f421693520e93d1ff52c40923` brings upstream
+`c4fc14c2d83f2470ca468f3d72a3f8457f17051f` without conflicts or history
+rewrites. Its full corpus ratchet is CLEAN at 71 known failures, width
+scan has two known and zero new violations, and native cargo161 tests pass.
+It removes obsolete upstream helper/big_frame exceptions and one now-fixed
+corpus entry, lowering72 to71; the native cap inherits upstream0.
+
+The JTAG source and its seal remain unchanged. On the rebuilt native
+backend, its18 tests and6 invariants pass with38 runtime assertions and
+JIT/interpreter agreement; all five seal hashes MATCH. This is a new native
+check for the changed backend, not a repeated reference run or hardware
+execution. Evidence: master-c4fc-native.log and master-c4fc-seal.log under
+`/Users/ssdm4/trinity-results/jtag-verdict-spec/`. New published-head CI is
+required; old31green checks do not certify this dependency merge.
