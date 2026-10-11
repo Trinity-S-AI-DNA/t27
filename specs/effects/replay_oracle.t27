@@ -1,0 +1,347 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/effects/replay_oracle.t27 -- the record/replay oracle on one function with effects (#9002,
+; first slice). take_lease depends on a file and on the clock, so no input/output oracle can check
+; it: what it returns depends on what the world held. Recorded once at the capability boundary, it
+; becomes checkable -- the recording is the input, and the calls it makes are part of the output.
+; --
+; The function, as the Rust it stands for would be written (t27o maps std::fs::read to fs_read, a
+; write to fs_write, Instant::now to clock_now, and adds the handles as parameters):
+;   fn take_lease(path: &str, ttl_ns: u64) -> u64 {
+;       let now = now_ns();
+;       match std::fs::read(path) {
+;           Ok(b) => if let Some(d) = parse_u64(&b) { if d > now { return 0; } },
+;           Err(e) if e.kind() == ErrorKind::NotFound => {}
+;           Err(_) => return 0,
+;       }
+;       let deadline = now + ttl_ns;
+;       if std::fs::write(path, deadline.to_string()).is_err() { return 0; }
+;       deadline
+;   }
+; --
+; What the tests show, each under both backends:
+; - recorded once under a seed (CAP_RECORD, faults injected), the run replays from a copy of its tape
+;   to the same results, twice, under seeds 1 to 5, with tape_done -- the same calls in the same order;
+; - a wrong conversion is caught where an oracle of results alone cannot catch it: one that drops
+;   `now +` writes other bytes, one that reads the file before the clock makes the calls in another
+;   order; both return the right number under the simulation, and both make the tape DIVERGED;
+; - the edges hold as vectors: a deadline equal to now has run out, a ttl to the last nanosecond is
+;   taken and one past it is not, a failed clock looks at no file, a failed write takes nothing;
+; - the recording written back as calls (clock_tape_now, fs_tape_read, fs_tape_write) is a test
+;   vector: the form the t27o oracle emits, with no trace file format of its own;
+; - CAP_HOST runs it to the simulation's answer with one rerun per effect, every effect performed
+;   once; serve_one is the host's dispatch, the loop a backend's real-handler glue implements.
+; Text is decimal: parse_u64 is t27o's Rust std entry (tools/t27o/rust_std.t27) and put_dec is
+; tri/t27b/macho.t27's, reused, not copied.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module EffectsReplayOracle;
+
+use effects::fs_cap;
+use effects::clock_cap;
+use tools::t27o::rust_std;
+
+; --- 1. The function -------------------------------------------------------------------------------
+
+/// Takes the lease at path for ttl_ns. A deadline in the file still ahead of now means another holder
+/// has it: 0. Otherwise writes now + ttl_ns and returns it. A missing file is no holder; any other
+/// failed effect is 0, and the handles' status says which.
+pub fn take_lease(fs: *Fs, clock: *Clock, path: []const u8, ttl_ns: u64) -> u64 {
+    const now : u64 = clock_now(clock);
+    if (clock.status != ST_OK) { return 0; }
+    const held : ?[]const u8 = fs_read(fs, path);
+    if (held == null and fs.status != ST_NOT_FOUND) { return 0; }
+    if (held != null) {
+        const until : ?u64 = parse_u64(held.?);
+        if (until != null and until.? > now) { return 0; }
+    }
+    if (ttl_ns > CLOCK_NS_MAX - now) { return 0; }
+    const deadline : u64 = now + ttl_ns;
+    var text : [20]u8 = [0] ** 20;
+    const n : usize = put_dec(text[0 .. 20], 0, deadline as usize);
+    if (!fs_write(fs, path, text[0 .. n])) { return 0; }
+    return deadline;
+}
+
+/// The entry a host runs: take "lease" for 30 s. A backend's real-handler glue runs it in the CAP_HOST
+/// loop, as the_host_runs_it_once_per_effect does here against a simulated world.
+pub const LEASE_TTL_NS : u64 = 30000000000;
+
+pub fn lease_main(fs: *Fs, clock: *Clock) -> u64 {
+    return take_lease(fs, clock, "lease", LEASE_TTL_NS);
+}
+
+/// The host's dispatch: the capability that owns the waiting call's op block serves it. Each serve fn
+/// answers only a call that waits, so with nothing waiting this does nothing.
+pub fn serve_one(t: *EffectTape, world_fs: *Fs, world_clock: *Clock) -> bool {
+    const cap : u8 = cap_of_op(t.op[tape_pending_at(t)]);
+    if (cap == CAP_FS) { return fs_serve(t, world_fs); }
+    if (cap == CAP_CLOCK) { return clock_serve(t, world_clock); }
+    return false;
+}
+
+; --- tests -----------------------------------------------------------------------------------------
+
+pub const TTL : u64 = 30000;
+
+/// Two wrong conversions the oracle must catch, each returning the right number on an empty store.
+/// One writes the ttl where now + ttl belongs ...
+fn take_lease_ttl_only(fs: *Fs, clock: *Clock, path: []const u8, ttl_ns: u64) -> u64 {
+    const now : u64 = clock_now(clock);
+    _ = fs_read(fs, path);
+    var text : [20]u8 = [0] ** 20;
+    const n : usize = put_dec(text[0 .. 20], 0, ttl_ns as usize);
+    _ = fs_write(fs, path, text[0 .. n]);
+    return now + ttl_ns;
+}
+
+/// ... and one looks at the file before the clock.
+fn take_lease_file_first(fs: *Fs, clock: *Clock, path: []const u8, ttl_ns: u64) -> u64 {
+    _ = fs_read(fs, path);
+    return take_lease(fs, clock, path, ttl_ns);
+}
+
+/// The scenario every run plays: take, take again at once, wait out the lease, take; the three
+/// results in got.
+fn scenario(fs: *Fs, clock: *Clock, got: []u64) -> void {
+    got[0] = take_lease(fs, clock, "lease", TTL);
+    got[1] = take_lease(fs, clock, "lease", TTL);
+    _ = clock_sleep(clock, TTL);
+    got[2] = take_lease(fs, clock, "lease", TTL);
+}
+
+test "the_lease_under_the_simulation" {
+    var t = tape_new();
+    var fs = fs_sim(&t, 1, 0);
+    var clock = clock_sim(&t, 1);
+    const first : u64 = take_lease(&fs, &clock, "lease", TTL);
+    assert first > CLOCK_EPOCH_NS;
+    assert parse_u64(fs_read(&fs, "lease").?).? == first;
+    // held: a second take inside the ttl gets nothing and changes nothing
+    assert take_lease(&fs, &clock, "lease", TTL) == 0;
+    assert parse_u64(fs_read(&fs, "lease").?).? == first;
+    // after the ttl it is free again
+    assert clock_sleep(&clock, TTL);
+    const second : u64 = take_lease(&fs, &clock, "lease", TTL);
+    assert second > first + TTL;
+    // a file that is not a number holds nothing
+    assert fs_write(&fs, "junk", "not a deadline");
+    assert take_lease(&fs, &clock, "junk", TTL) > second;
+    // a failed read that is not "missing" takes nothing
+    fs_restrict(&fs, FS_RIGHT_WRITE);
+    assert take_lease(&fs, &clock, "lease", TTL) == 0;
+    assert fs.status == ST_DENIED;
+}
+
+test "recorded_once_it_replays_repeatably_under_five_seeds" {
+    var seed : u32 = 1;
+    var last_time : u64 = 0;
+    var faults : u32 = 0;
+    var taken : u32 = 0;
+    while (seed <= 5) {
+        // record once, with one fs call in four failing
+        var t = tape_new();
+        var fs = fs_recorder(&t, seed, 250);
+        var clock = clock_recorder(&t, seed);
+        var want : [3]u64 = [0] ** 3;
+        scenario(&fs, &clock, want[0 .. 3]);
+        assert tape_done(&t);
+        assert t.len >= 7;
+        var i : u32 = 0;
+        while (i < t.len) {
+            if (t.status[i] == ST_IO) { faults = faults + 1; }
+            i = i + 1;
+        }
+        if (want[0] != 0) { taken = taken + 1; }
+        if (want[2] != 0) { taken = taken + 1; }
+        // replay it twice from copies of the tape: the same results and exactly the same calls
+        var round : u32 = 0;
+        while (round < 2) {
+            var again = t;
+            tape_rewind(&again);
+            var rfs = fs_replayer(&again);
+            var rclock = clock_replayer(&again);
+            var got : [3]u64 = [9] ** 3;
+            scenario(&rfs, &rclock, got[0 .. 3]);
+            assert got[0] == want[0];
+            assert got[1] == want[1];
+            assert got[2] == want[2];
+            assert tape_done(&again);
+            round = round + 1;
+        }
+        // the same seed records the same run again
+        var t2 = tape_new();
+        var fs2 = fs_recorder(&t2, seed, 250);
+        var clock2 = clock_recorder(&t2, seed);
+        var twice : [3]u64 = [9] ** 3;
+        scenario(&fs2, &clock2, twice[0 .. 3]);
+        assert twice[0] == want[0];
+        assert twice[1] == want[1];
+        assert twice[2] == want[2];
+        assert t2.len == t.len;
+        assert t2.ret[0] == t.ret[0];
+        // and another seed is another world: its first clock read differs
+        assert t.op[0] == CLOCK_NOW;
+        assert t.ret[0] != last_time;
+        last_time = t.ret[0];
+        seed = seed + 1;
+    }
+    // the five recordings held injected faults, replayed as recorded, and leases taken
+    assert faults > 0;
+    assert taken > 0;
+}
+
+test "the_oracle_catches_a_wrong_conversion" {
+    var t = tape_new();
+    var fs = fs_recorder(&t, 2, 0);
+    var clock = clock_recorder(&t, 2);
+    const want : u64 = take_lease(&fs, &clock, "lease", TTL);
+    assert want > 0;
+    // an oracle of results alone cannot tell either wrong one from the right one: under the same
+    // simulation each returns the same number ...
+    var ts = tape_new();
+    var sfs = fs_sim(&ts, 2, 0);
+    var sclock = clock_sim(&ts, 2);
+    assert take_lease_ttl_only(&sfs, &sclock, "lease", TTL) == want;
+    var ts2 = tape_new();
+    var sfs2 = fs_sim(&ts2, 2, 0);
+    var sclock2 = clock_sim(&ts2, 2);
+    assert take_lease_file_first(&sfs2, &sclock2, "lease", TTL) == want;
+    // ... and the tape can. Dropped `now +`: the same number back, but the bytes it writes are not the
+    // recorded ones
+    var a = t;
+    tape_rewind(&a);
+    var afs = fs_replayer(&a);
+    var aclock = clock_replayer(&a);
+    assert take_lease_ttl_only(&afs, &aclock, "lease", TTL) == want;
+    assert afs.status == ST_DIVERGED;
+    assert tape_done(&a) == false;
+    // the file before the clock: the calls in another order
+    var b = t;
+    tape_rewind(&b);
+    var bfs = fs_replayer(&b);
+    var bclock = clock_replayer(&b);
+    assert take_lease_file_first(&bfs, &bclock, "lease", TTL) == 0;
+    assert bfs.status == ST_DIVERGED;
+    assert tape_done(&b) == false;
+    // the right one passes on the same tape
+    var c = t;
+    tape_rewind(&c);
+    var cfs = fs_replayer(&c);
+    var cclock = clock_replayer(&c);
+    assert take_lease(&cfs, &cclock, "lease", TTL) == want;
+    assert tape_done(&c);
+}
+
+test "a_recording_written_as_calls_is_a_test_vector" {
+    // the form the t27o oracle writes: an expired lease on disk, the clock read, the new deadline written
+    var t = tape_new();
+    assert clock_tape_now(&t, 1700000000000000000);
+    assert fs_tape_read(&t, "lease", ST_OK, "1699999999000000000");
+    assert fs_tape_write(&t, "lease", "1700000030000000000", ST_OK);
+    tape_rewind(&t);
+    var fs = fs_replayer(&t);
+    var clock = clock_replayer(&t);
+    assert take_lease(&fs, &clock, "lease", 30000000000) == 1700000030000000000;
+    assert tape_done(&t);
+    // a live lease in the vector: nothing is written, so a vector without the write is complete
+    var held = tape_new();
+    assert clock_tape_now(&held, 1700000000000000000);
+    assert fs_tape_read(&held, "lease", ST_OK, "1700000000000000001");
+    tape_rewind(&held);
+    var hfs = fs_replayer(&held);
+    var hclock = clock_replayer(&held);
+    assert take_lease(&hfs, &hclock, "lease", 30000000000) == 0;
+    assert tape_done(&held);
+}
+
+test "vectors_at_the_edges" {
+    // a deadline equal to now has run out
+    var due = tape_new();
+    assert clock_tape_now(&due, 5000);
+    assert fs_tape_read(&due, "lease", ST_OK, "5000");
+    assert fs_tape_write(&due, "lease", "5007", ST_OK);
+    tape_rewind(&due);
+    var dfs = fs_replayer(&due);
+    var dclock = clock_replayer(&due);
+    assert take_lease(&dfs, &dclock, "lease", 7) == 5007;
+    assert tape_done(&due);
+    // a ttl that reaches the last nanosecond is taken; one past it is not, and nothing is written
+    var last = tape_new();
+    assert clock_tape_now(&last, 1000);
+    assert fs_tape_read(&last, "lease", ST_NOT_FOUND, "");
+    assert fs_tape_write(&last, "lease", "18446744073709551615", ST_OK);
+    tape_rewind(&last);
+    var lfs = fs_replayer(&last);
+    var lclock = clock_replayer(&last);
+    assert take_lease(&lfs, &lclock, "lease", CLOCK_NS_MAX - 1000) == CLOCK_NS_MAX;
+    assert tape_done(&last);
+    var past = tape_new();
+    assert clock_tape_now(&past, 1000);
+    assert fs_tape_read(&past, "lease", ST_NOT_FOUND, "");
+    tape_rewind(&past);
+    var pfs = fs_replayer(&past);
+    var pclock = clock_replayer(&past);
+    assert take_lease(&pfs, &pclock, "lease", CLOCK_NS_MAX - 999) == 0;
+    assert tape_done(&past);
+    // a clock that failed: no file is looked at
+    var dark = tape_new();
+    assert tape_record(&dark, CLOCK_NOW, 0, "", "", ST_IO, 0, "");
+    tape_rewind(&dark);
+    var kfs = fs_replayer(&dark);
+    var kclock = clock_replayer(&dark);
+    assert take_lease(&kfs, &kclock, "lease", TTL) == 0;
+    assert kclock.status == ST_IO;
+    assert tape_done(&dark);
+    // a write that failed takes nothing
+    var lost = tape_new();
+    assert clock_tape_now(&lost, 1000);
+    assert fs_tape_read(&lost, "lease", ST_NOT_FOUND, "");
+    assert fs_tape_write(&lost, "lease", "1007", ST_IO);
+    tape_rewind(&lost);
+    var wfs = fs_replayer(&lost);
+    var wclock = clock_replayer(&lost);
+    assert take_lease(&wfs, &wclock, "lease", 7) == 0;
+    assert wfs.status == ST_IO;
+    assert tape_done(&lost);
+}
+
+test "the_host_runs_it_once_per_effect" {
+    var ts = tape_new();
+    var sfs = fs_sim(&ts, 4, 0);
+    var sclock = clock_sim(&ts, 4);
+    const want : u64 = lease_main(&sfs, &sclock);
+    // the world the host performs calls against, in the same state as the simulation's
+    var tw = tape_new();
+    var wfs = fs_sim(&tw, 4, 0);
+    var wclock = clock_sim(&tw, 4);
+    var t = tape_new();
+    var fs = fs_host(&t);
+    var clock = clock_host(&t);
+    var runs : u32 = 0;
+    var got : u64 = 0;
+    var waiting : bool = true;
+    while (waiting and runs < TAPE_ENTRIES + 1) {
+        got = lease_main(&fs, &clock);
+        runs = runs + 1;
+        waiting = tape_pending(&t);
+        if (waiting) {
+            assert serve_one(&t, &wfs, &wclock);
+            tape_rewind(&t);
+        }
+    }
+    assert got == want;
+    assert got > 0;
+    // three effects, four runs; the world saw two fs calls and one clock read, each once
+    assert runs == 4;
+    assert wfs.calls == 2;
+    assert wclock.reads == 2;
+    assert tape_done(&t);
+    assert parse_u64(fs_read(&wfs, "lease").?).? == want;
+    // with nothing waiting, nothing is served and the world sees no call
+    assert serve_one(&t, &wfs, &wclock) == false;
+    assert wfs.calls == 3;
+    assert wclock.reads == 2;
+    var empty = tape_new();
+    assert serve_one(&empty, &wfs, &wclock) == false;
+}

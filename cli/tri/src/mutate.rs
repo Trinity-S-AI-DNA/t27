@@ -801,10 +801,6 @@ fn t27_fn_header(line: &str) -> Option<String> {
     }
 }
 
-fn is_word_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
-}
-
 /// The mutants of one line inside a function body.
 fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<SpecMutant>) {
     let b = line.as_bytes();
@@ -895,8 +891,8 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
             }
             b'a' if line[i..].starts_with("and")
                 && code(i, 3)
-                && !is_word_byte(prev(i))
-                && !is_word_byte(next(i + 3)) =>
+                && !plant::word_byte(prev(i))
+                && !plant::word_byte(next(i + 3)) =>
             {
                 push("swap-logic", i, 3, "or");
                 i += 3;
@@ -904,8 +900,8 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
             }
             b'o' if line[i..].starts_with("or")
                 && code(i, 2)
-                && !is_word_byte(prev(i))
-                && !is_word_byte(next(i + 2)) =>
+                && !plant::word_byte(prev(i))
+                && !plant::word_byte(next(i + 2)) =>
             {
                 push("swap-logic", i, 2, "and");
                 i += 2;
@@ -917,7 +913,7 @@ fn t27_line_mutants(lineno: usize, line: &str, mask: &[bool], out: &mut Vec<Spec
                     && prev(i) == b' '
                     && line[i + 1..].starts_with(" 1")
                     && code(i - 1, 4)
-                    && !is_word_byte(next(i + 3))
+                    && !plant::word_byte(next(i + 3))
                     && next(i + 3) != b'.' =>
             {
                 push("drop-step", i - 1, 4, "");
@@ -1698,15 +1694,6 @@ fn lab_launch(env: &LabEnv, run: &LabRun, d: &str, jobs: u32, zig_j: u32) -> Res
     lab_call(env, &script, true)
 }
 
-fn lab_state_name(state: u8) -> &'static str {
-    match state {
-        lab::RUN_NONE => "none",
-        lab::RUN_RUNNING => "running",
-        lab::RUN_DONE => "done",
-        _ => "lost",
-    }
-}
-
 /// `tri mutate spec --lab`: start the run on the lab unless the same request
 /// already has one, wait for it up to `run.wait` seconds, print its output,
 /// and clean up as specs/tri/mutate/lab.t27 allows. Returns `lab_exit`.
@@ -1757,7 +1744,7 @@ fn lab_mutate_spec(env: &LabEnv, run: &LabRun, out: &mut dyn std::io::Write, sle
             return Ok(lab::EXIT_NO_RESULT);
         }
     } else {
-        writeln!(out, "Reading the run already there ({}).", lab_state_name(p.state()))?;
+        writeln!(out, "Reading the run already there ({}).", lab::run_state_name(p.state()))?;
     }
     let (mut polls, mut waited) = (0u32, 0u64);
     while p.state() == lab::RUN_RUNNING {

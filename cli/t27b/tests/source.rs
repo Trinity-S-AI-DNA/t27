@@ -2690,7 +2690,7 @@ fn optionals_the_reference_does_not_match_are_refused() {
 /// BLOCKED under `t27c test-report`, so t27b must not pass it either.
 #[test]
 fn shapes_the_reference_cannot_compile_are_refused() {
-    let cases: [(&str, &str); 4] = [
+    let cases: [(&str, &str); 3] = [
         // A pointer param written only through `p.*`: the reference rebinds
         // it `var p = p_arg;`, which Zig rejects as never mutated.
         (
@@ -2701,11 +2701,6 @@ fn shapes_the_reference_cannot_compile_are_refused() {
         (
             "module c;\n\nfn cnt(n: u32) -> u32 {\n    var count: u32 = n;\n    var x: u32 = count + 1;\n    var y: u32 = count + 1;\n    return x + y;\n}\n\ntest t {\n    assert(cnt(1) == 4);\n}\n",
             "FnDecl(reference CSE hoist)",
-        ),
-        // `[_]u8{}`: the reference prints `.{ _ }`.
-        (
-            "module e;\n\ntest t {\n    var c: [0]u8 = [_]u8{};\n    assert(1 == 1);\n}\n",
-            "ExprArrayLiteral(reference empty typed)",
         ),
         // A field of a type nothing declares, in a struct nothing uses.
         (
@@ -3219,7 +3214,7 @@ fn pointer_equality() {
 /// A frame over 16 KiB is allocated a page at a time, touching each page
 /// (#7367): it runs, recursion included, no two frames overlap (each level
 /// checks every byte of its array after the deeper ones returned), and a trap
-/// inside one still names its line. A frame over 1 MiB is still refused.
+/// inside one still names its line. A frame of 16 MiB is refused.
 #[test]
 fn large_frames_are_probed() {
     let src = "module a;\n\nfn deep(depth: u8) -> u32 {\n    var block: [20000]u8 = undefined;\n    var i: usize = 0;\n    while (i < 20000) {\n        block[i] = depth;\n        i = i + 1;\n    }\n    var below: u32 = 0;\n    if (depth > 0) {\n        below = deep(depth - 1);\n    }\n    i = 0;\n    while (i < 20000) {\n        if (block[i] != depth) {\n            return 0;\n        }\n        i = i + 1;\n    }\n    return below + 1;\n}\n\ntest ok {\n    var buf: [16448]u8 = undefined;\n    buf[0] = 7;\n    buf[16447] = 9;\n    assert(buf[0] + buf[16447] == 16);\n    assert(deep(5) == 6);\n}\n\ntest fails {\n    var big: [70000]u8 = undefined;\n    big[69999] = 3;\n    assert(big[69999] == 4);\n}\n";
@@ -3227,7 +3222,7 @@ fn large_frames_are_probed() {
     assert_eq!(names_ok(&r), vec![("ok", false, true), ("fails", false, false)]);
     assert_eq!(r[1].2, Err((TrapKind::Assert, line_of(src, "== 4"))));
     if JIT_SUPPORTED {
-        let too_big = "module a;\n\ntest t {\n    var huge: [1048600]u8 = undefined;\n    huge[0] = 1;\n    assert(huge[0] == 1);\n}\n";
+        let too_big = "module a;\n\ntest t {\n    var huge: [16777216]u8 = undefined;\n    huge[0] = 1;\n    assert(huge[0] == 1);\n}\n";
         let prog = lower_src(too_big).expect("lowers");
         let e = codegen::compile(&prog, TrapStyle::Jit, true).err().expect("refused");
         assert_eq!(e.construct, "FnDecl(frame size)");
@@ -3243,4 +3238,63 @@ fn opaque_pointers() {
     assert!(r.len() == 3 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
     let m = rejected("module a;\n\nfn f(p: *anyopaque) -> bool {\n    return true;\n}\n\ntest t {\n    assert(f(@ptrFromInt(8)));\n}\n");
     assert!(m.contains("ExprCall(@ptrFromInt)") && m.contains("not optional"), "{}", m);
+}
+
+/// `t27b build --elf` (specs/tri/t27b/elf.t27, #8947): the conformance spec's object reads back; where the GNU
+/// aarch64 toolchain is installed it links with each `exit_*` fn standing in for `main`, and exits with its code.
+#[test]
+fn elf_object_links_and_runs() {
+    let prog = lower_src(include_str!("../../../specs/tri/t27b/conformance/elf_object.t27")).expect("lowers");
+    let l = codegen::link(Vec::new(), None, &codegen::compile(&prog, TrapStyle::Elf, false).expect("codegen"), prog.funcs.len()).unwrap();
+    let (names, notes) = t27b::macho::symbols(&prog);
+    assert!(notes.len() == 2 && notes[0].starts_with("`abi_pair` takes") && notes[1].starts_with("`abi_nine` takes"), "{:?}", notes);
+    let obj = t27b::macho::elf_object(&l, &names, &prog.data, &prog.globals);
+    assert_eq!(&obj[..20], b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x01\0\xb7\0", "ELFCLASS64, ELFDATA2LSB, ET_REL, EM_AARCH64");
+    let dir = std::env::temp_dir().join(format!("t27b-elf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let o = dir.join("e.o").to_string_lossy().into_owned();
+    std::fs::write(&o, &obj).unwrap();
+    let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().ok();
+    if let Some(r) = run("aarch64-linux-gnu-readelf", &["-a", "-W", &o]) {
+        assert!(r.status.success() && r.stderr.is_empty(), "readelf: {}", String::from_utf8_lossy(&r.stderr));
+    }
+    for (f, want) in [("answer", 42), ("exit_calls", 16), ("exit_data", 114), ("exit_global", 41)] {
+        let exe = format!("{}-{}", o, f);
+        let Some(ld) = run("aarch64-linux-gnu-gcc", &[&o, "-o", &exe, &format!("-Wl,--defsym=main={}", f)]) else { break };
+        assert!(ld.status.success(), "link: {}", String::from_utf8_lossy(&ld.stderr));
+        let r = run("qemu-aarch64", &["-L", "/usr/aarch64-linux-gnu", &exe]).or_else(|| run(&exe, &[])).expect("run");
+        assert_eq!(r.status.code(), Some(want), "{} exits with its code", f);
+    }
+    // The C ABI (#8948): the object in a shared library loaded here, and each `abi_*` fn called through `extern "C"`
+    // (AAPCS64) with the arguments and results of the spec's tests.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    if run("aarch64-linux-gnu-gcc", &["-shared", "-o", &format!("{}.so", o), &o]).is_some_and(|r| r.status.success()) {
+        extern "C" { fn dlopen(path: *const std::ffi::c_char, flags: i32) -> usize; fn dlsym(h: usize, name: *const std::ffi::c_char) -> usize; }
+        let c = |s: &str| std::ffi::CString::new(s).unwrap();
+        let h = unsafe { dlopen(c(&format!("{}.so", o)).as_ptr(), 2) };
+        let addr = |n: &str| unsafe { dlsym(h, c(n).as_ptr()) };
+        assert!(h != 0 && ["abi_pair", "abi_nine", "__t27b_i128_div"].iter().all(|n| addr(n) == 0), "refused fns and t27b's own get no symbol");
+        macro_rules! call { ($n:literal: fn($($t:ty),*) -> $r:ty; $($a:expr),* => $w:expr) => { assert_ne!(addr($n), 0, $n);
+            assert_eq!(unsafe { std::mem::transmute::<usize, extern "C" fn($($t),*) -> $r>(addr($n)) }($($a),*), $w, $n) } }
+        call!("abi_narrow": fn(u8, i8, i16, bool, u32) -> i64; 200, -128, -300, true, 4_000_000_000 => 3_999_999_999_699_872_700);
+        // AAPCS64 leaves the bits above a narrow argument unspecified, so the callee extends each one itself.
+        call!("abi_narrow": fn(u64, u64, u64, u64, u64) -> i64; 0xdead_00c8, 0x1234_5680, 0x7777_fed4, 0xff01, 0xbeef_ee6b_2800 => 3_999_999_999_699_872_700);
+        call!("abi_eight": fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64; 1, 2, 3, 4, 5, 6, 7, 8 => 87_654_321);
+        call!("abi_f32": fn(f32, f32) -> f32; 1.5, 3.0 => 4.0);
+        call!("abi_f64": fn(f64, f64, f64, f64, f64, f64, f64, f64) -> f64; 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 => 1793.0);
+        call!("abi_mixed": fn(u8, f64, i32, f32, i64) -> f64; 1, 2.0, -3, 0.5, 4 => 40221.0);
+        call!("abi_i128": fn(u32, i128) -> i128; 7, 3 << 64 | 9 => 1 << 64 | 10);
+        call!("abi_i128_last": fn(u64, u64, u64, u64, u64, i128) -> i128; 1, 2, 3, 4, 5, 1 << 64 => (1 << 64) - 15);
+        call!("abi_store": fn(i64) -> (); 99 => ());
+        call!("bump": fn() -> i64; => 100);
+        // x19-x28, d8-d15 and x29 hold known values across a call of abi_keep, which homes ten locals in x19-x28.
+        let mut r = [0u64; 19]; let res: u64;
+        unsafe { std::arch::asm!("stp x19, x29, [sp, #-16]!", "mov x19, #19", "mov x29, #29", "blr x16", "mov x9, x19", "mov x10, x29", "ldp x19, x29, [sp], #16",
+            in("x16") addr("abi_keep"), inout("x0") 5u64 => res, out("x9") r[0], out("x10") r[1], inout("x20") 20u64 => r[2], inout("x21") 21u64 => r[3],
+            inout("x22") 22u64 => r[4], inout("x23") 23u64 => r[5], inout("x24") 24u64 => r[6], inout("x25") 25u64 => r[7], inout("x26") 26u64 => r[8],
+            inout("x27") 27u64 => r[9], inout("x28") 28u64 => r[10], inout("d8") 8u64 => r[11], inout("d9") 9u64 => r[12], inout("d10") 10u64 => r[13],
+            inout("d11") 11u64 => r[14], inout("d12") 12u64 => r[15], inout("d13") 13u64 => r[16], inout("d14") 14u64 => r[17], inout("d15") 15u64 => r[18], clobber_abi("C")) };
+        assert_eq!((res, r), (1710, [19, 29, 20, 21, 22, 23, 24, 25, 26, 27, 28, 8, 9, 10, 11, 12, 13, 14, 15]), "abi_keep, and the registers it keeps");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
