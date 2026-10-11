@@ -74,8 +74,8 @@ const X17: Reg = 17;
 const TEMP_REGS: usize = 7; // x9..x15
 const CALLEE_SAVED: [Reg; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 const MAX_SLOT_BYTES: u32 = 32760;
-/// Largest aggregate area of one frame (#7367).
-pub const MAX_AGG_BYTES: u32 = 1 << 20;
+/// Largest aggregate area of one frame: each slot is then at most two SUB words below x29 (a64::sub_const).
+pub const MAX_AGG_BYTES: u32 = (a64::SUB_CONST_REACH - 16) as u32;
 /// Largest frame the prologue allocates in one step. It is kept below the
 /// stack guard size, so such a frame never reaches past the guard page
 /// without touching it. A larger frame is allocated in `PROBE_STEP` steps,
@@ -175,58 +175,8 @@ fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> {
     }
 }
 
-fn cond_for(op: CmpOp, ty: Ty) -> Cond {
-    if ty.is_float() {
-        return fcond_for(op);
-    }
-    let s = ty.signed();
-    match op {
-        CmpOp::Eq => Cond::Eq,
-        CmpOp::Ne => Cond::Ne,
-        CmpOp::Lt => {
-            if s {
-                Cond::Lt
-            } else {
-                Cond::Lo
-            }
-        }
-        CmpOp::Le => {
-            if s {
-                Cond::Le
-            } else {
-                Cond::Ls
-            }
-        }
-        CmpOp::Gt => {
-            if s {
-                Cond::Gt
-            } else {
-                Cond::Hi
-            }
-        }
-        CmpOp::Ge => {
-            if s {
-                Cond::Ge
-            } else {
-                Cond::Hs
-            }
-        }
-    }
-}
-
-/// The condition that holds after `fcmp dn, dm` when `dn op dm` is true.
-/// An unordered compare (a NaN operand) sets NZCV to 0011: none of these
-/// but NE holds then, and `Cond::invert` of each is its exact negation.
-fn fcond_for(op: CmpOp) -> Cond {
-    match op {
-        CmpOp::Eq => Cond::Eq,
-        CmpOp::Ne => Cond::Ne,
-        CmpOp::Lt => Cond::Mi,
-        CmpOp::Le => Cond::Ls,
-        CmpOp::Gt => Cond::Gt,
-        CmpOp::Ge => Cond::Ge,
-    }
-}
+/// The condition after `cmp` (`fcmp` for a float) that holds when `op` does: specs/tri/t27b/cmp_op.t27's `cond_bits`.
+fn cond_for(op: CmpOp, ty: Ty) -> Cond { Cond::from_bits(co::cond_bits(op as u8, ty.is_float(), ty.signed())) }
 
 /// d registers used as scratch for one floating point operation. Values
 /// live in X registers as bit patterns between operations; d8-d15 (callee
@@ -345,6 +295,8 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
             line: f.line,
             construct: if e.starts_with(GLOBAL_IN_OBJECT) {
                 "VarDecl(module, object file)"
+            } else if e.starts_with(ip::REFUSED) {
+                ip::REFUSED
             } else {
                 "FnDecl(frame or branch range)"
             },
@@ -449,6 +401,9 @@ impl<'a> Gen<'a> {
         order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
         let mut callee = CALLEE_SAVED.iter().copied();
         let mut slots = 0u32;
+        for &v in order.iter().filter(|&&v| f.vars[v].ty == Ty::I128) { // i128_plan.t27: 16 frame bytes, laid out first (16-aligned)
+            if w[v] > 0 { (self.homes[v], w[v], slots) = (Home::Slot(8 * slots), 0, slots + ip::HOME_WORDS); }
+        }
         if !has_call {
             // Leaf: parameters stay in their argument registers; the free
             // argument registers are homes too.
@@ -644,13 +599,8 @@ impl<'a> Gen<'a> {
                     pro.push(a64::str_x(ZR, SP, 0));
                 }
             } else if frame_bytes > 0 {
-                if frame_bytes < 4096 {
-                    pro.push(a64::sub_imm(true, SP, SP, frame_bytes as u32));
-                } else if frame_bytes <= (MAX_SLOT_BYTES + 16 + self.agg_bytes) as usize {
-                    a64::mov_imm(true, X16, frame_bytes as u64, &mut pro);
-                    pro.push(a64::addsub_ext(true, true, false, SP, SP, X16, Ext::Uxtx, 0));
-                } else {
-                    self.fail(format!("frame larger than {} bytes", MAX_SLOT_BYTES));
+                for i in 0..a64::sub_const_len(frame_bytes as u64) {
+                    pro.push(a64::sub_const_at(SP, SP, frame_bytes as u64, i));
                 }
             }
             let base = 8 * self.nvar_slots;
@@ -754,6 +704,7 @@ impl<'a> Gen<'a> {
     /// The register holding `v`; spilled temps and constants go to `scratch`.
     /// A zero constant is the zero register.
     fn use_(&mut self, v: V, scratch: Reg, ty: Ty) -> Reg {
+        if ty == Ty::I128 { self.fail(format!("{}: only literals, calls, variables and comparisons of one are lowered yet", ip::REFUSED)); }
         match v {
             V::Reg(r) => r,
             V::Temp(i) if i < TEMP_REGS => 9 + i as Reg,
@@ -820,6 +771,7 @@ impl<'a> Gen<'a> {
         match s {
             Stmt::Assign { var, value } => match self.homes[*var as usize] {
                 Home::Reg(h) => self.eval_into(value, h),
+                Home::Slot(off) if value.ty == Ty::I128 => self.pair_each(value, |g, k, r| g.str_slot(r, off + ip::HI_OFF * k)),
                 Home::Slot(off) => {
                     let v = self.eval(value);
                     let r = self.use_(v, X16, value.ty);
@@ -872,7 +824,9 @@ impl<'a> Gen<'a> {
                 self.jump(l_step);
             }
             Stmt::Return(e) => {
-                if let Some(e) = e {
+                if let Some(e) = e.as_ref().filter(|e| e.ty == Ty::I128) {
+                    self.pair_each(e, |g, k, r| g.emit(a64::mov(true, [ip::RET_LO, ip::RET_HI][k as usize], r)));
+                } else if let Some(e) = e {
                     self.eval_into(e, X0);
                     if e.ty.is_float() {
                         // AAPCS64 returns an F64 in d0, an F32 in s0.
@@ -976,14 +930,9 @@ impl<'a> Gen<'a> {
 
     /// `d = address of slot k` (x29 minus its distance below the frame pointer).
     fn slot_addr(&mut self, d: Reg, k: u32) {
-        let n = self.agg_bytes - self.agg_off[k as usize];
-        if n < 4096 {
-            self.emit(a64::sub_imm(true, d, FP, n));
-        } else {
-            self.emit(a64::addsub_imm(true, true, false, d, FP, n >> 12, true));
-            if n & 0xfff != 0 {
-                self.emit(a64::sub_imm(true, d, d, n & 0xfff));
-            }
+        let n = (self.agg_bytes - self.agg_off[k as usize]) as u64;
+        for i in 0..a64::sub_const_len(n) {
+            self.emit(a64::sub_const_at(d, FP, n, i));
         }
     }
 
@@ -1488,6 +1437,17 @@ impl<'a> Gen<'a> {
     fn compare(&mut self, op: CmpOp, lhs: &Expr, rhs: &Expr) -> Cond {
         let ty = lhs.ty;
         let s = ty.is64();
+        if ty == Ty::I128 {
+            // Two steps, one per word, low first, and the condition: all specs/tri/t27b/i128_plan.t27's.
+            let (a, b) = (self.pair(lhs), self.pair(rhs));
+            let (x, y) = if ip::cmp_swaps(op as u8) { (b, a) } else { (a, b) };
+            for k in 0..2 {
+                let (p, q) = (self.use_(x[k], X16, Ty::U64), self.use_(y[k], X17, Ty::U64));
+                self.emit(match ip::cmp_step(op as u8, k as u32) { ip::STEP_CMP => a64::cmp(true, p, q), ip::STEP_CCMP => a64::ccmp(true, p, q, ip::CCMP_NZCV, Cond::Eq), _ => a64::sbcs(true, ZR, p, q) });
+            }
+            for v in [b[1], b[0], a[1], a[0]] { self.release(v); }
+            return Cond::from_bits(ip::cmp_cond(op as u8));
+        }
         let a = self.eval(lhs);
         let b = self.eval(rhs);
         if ty.is_float() {
@@ -1498,7 +1458,7 @@ impl<'a> Gen<'a> {
             self.emit(fp_op(ty, a64::fcmp(D16, D17)));
             self.release(b);
             self.release(a);
-            return fcond_for(op);
+            return cond_for(op, ty);
         }
         let (mut x, mut y, mut op2) = (a, b, op);
         if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) {
@@ -1523,6 +1483,51 @@ impl<'a> Gen<'a> {
         self.release(b);
         self.release(a);
         cond_for(op2, ty)
+    }
+
+    /// An i128's low and high word (specs/tri/t27b/i128_plan.t27): a literal's two words, a variable's two frame
+    /// words, or a call's x0 and x1. Any other i128 expression is refused as not lowered yet.
+    fn pair(&mut self, e: &Expr) -> [V; 2] {
+        match &e.kind {
+            ExprKind::Const(c) => { let m = c.unsigned_abs(); [ip::lit_lo(*c < 0, m as u64), ip::lit_hi(*c < 0, m as u64, (m >> 64) as u64)].map(|w| V::Const(w as i128)) }
+            ExprKind::Var(v) => { let off = if let Home::Slot(o) = self.homes[*v as usize] { o } else { 0 }; [0, ip::HI_OFF].map(|k| { let (d, t) = self.dest(None); self.ldr_slot(d, off + k); self.done(d, t) }) }
+            ExprKind::Call { func, args } => { let lo = self.call(*func, args, None, true); let (d, t) = self.dest(None); self.emit(a64::mov(true, d, ip::RET_HI)); [lo, self.done(d, t)] }
+            ExprKind::Widen(x) => { let lo = self.eval(&Expr { ty: if x.ty.signed() { Ty::I64 } else { Ty::U64 }, kind: ExprKind::Widen(x.clone()) }); if !x.ty.signed() { return [lo, V::Const(0)]; } let r = self.use_(lo, X16, Ty::I64); let (d, t) = self.dest(None); self.emit(a64::asr_imm(true, d, r, 63)); [lo, self.done(d, t)] }
+            ExprKind::Arith { op, lhs, rhs, site } => self.pair_arith(ip::program(*op as u8), lhs, rhs, *site),
+            _ => { self.use_(V::Const(0), X16, e.ty); [V::Const(0); 2] }
+        }
+    }
+
+    /// Checked `+ - *` and `@divTrunc` of two i128s: i128_plan.t27's program on the four words, copied into temps
+    /// x(9 + base) up, the last first (a word sits at or below its temp); the result is in the first two.
+    fn pair_arith(&mut self, prog: u8, lhs: &Expr, rhs: &Expr, site: SiteId) -> [V; 2] {
+        let (base, div) = (self.depth, self.prog.func_index(ip::DIV_ROUTINE));
+        let w = [self.pair(lhs), self.pair(rhs)].concat();
+        for v in w.iter().rev() { self.release(*v); }
+        if prog == ip::PROG_NONE || base + ip::TEMPS as usize > TEMP_REGS || (ip::calls(prog) && div.is_none()) {
+            self.fail(format!("{}: this operator, or this deep, is not lowered yet", ip::REFUSED));
+            return [V::Const(0); 2];
+        }
+        let r0 = 9 + base as Reg;
+        for k in (0..4).rev() { let r = self.use_(w[k], r0 + k as Reg, Ty::U64); if r != r0 + k as Reg { self.emit(a64::mov(true, r0 + k as Reg, r)); } }
+        self.depth = base + ip::TEMPS as usize;
+        for k in 0..ip::steps(prog) {
+            let (x, saved) = (ip::step_word(prog, k, r0), 0..base as u32);
+            match ip::step_kind(prog, k) {
+                ip::K_WORD => self.emit(x),
+                ip::K_TRAP => { let l = self.stub_site(site + ip::trap_site(prog, k)); self.bcond(Cond::from_bits(x), l) }
+                _ => { for i in saved.clone() { let o = self.slot_of_temp(i as usize); self.str_slot(9 + i as Reg, o); } self.calls.push((self.code.len(), div.unwrap() as FuncId)); self.emit(a64::bl(0)); for i in saved { let o = self.slot_of_temp(i as usize); self.ldr_slot(9 + i as Reg, o); } }
+            }
+        }
+        self.depth = base + 2;
+        [V::Temp(base), V::Temp(base + 1)]
+    }
+
+    /// Evaluate an i128 and hand `put` each word in a register, the low one (k = 0) first.
+    fn pair_each(&mut self, e: &Expr, put: impl Fn(&mut Self, u32, Reg)) {
+        let p = self.pair(e);
+        for k in 0..2 { let r = self.use_(p[k], X16, Ty::U64); put(self, k as u32, r); }
+        for v in [p[1], p[0]] { self.release(v); }
     }
 
     /// Jump to `target` when `e` evaluates to `when`.
@@ -1957,15 +1962,7 @@ fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
     (size, opc)
 }
 
-fn overflow_cond(ty: Ty, sub: bool) -> Cond {
-    if ty.signed() {
-        Cond::Vs
-    } else if sub {
-        Cond::Lo
-    } else {
-        Cond::Hs
-    }
-}
+fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
 
 fn extend(d: Reg, n: Reg, e: Ext) -> u32 {
     match e {
@@ -2027,6 +2024,7 @@ fn weigh_stmts(ss: &[Stmt], depth: u32, w: &mut [u64], wr: &mut [u64], has_call:
 }
 
 fn weigh_expr(e: &Expr, unit: u64, w: &mut [u64], has_call: &mut bool) {
+    *has_call |= matches!(e.kind, ExprKind::Arith { op, .. } if e.ty == Ty::I128 && ip::calls(ip::program(op as u8)));
     match &e.kind {
         ExprKind::Const(_) => {}
         ExprKind::Var(v) => w[*v as usize] += unit,
