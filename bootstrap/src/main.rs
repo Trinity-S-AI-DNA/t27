@@ -145,6 +145,10 @@ mod bench_agent;
 #[path = "../gen/rust/verified/bitstream_reuse.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod bitstream_reuse;
+// specs/verified/clock_constraints.t27 (#8839): the clocks `t27c silicon` places against, and its timing gate.
+#[path = "../gen/rust/verified/clock_constraints.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod clock_constraints;
 mod phi_f64_literals;
 mod weight_bram;
 mod bitnet_pipeline;
