@@ -1,0 +1,434 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/embedding_lookup.t27
+// Embedding lookup engine for Trinity T27 FPGA HIR (openxc7 synthesis target)
+// Port of gHashTag/trinity rtl/embedding_lookup.v (171 lines)
+//
+// Streams a 243-element ternary embedding row for one 7-bit token out of a
+// 2^15 x 2-bit BRAM. Elements are +-1/0 (2-bit ternary codes); the row for
+// token t lives at BRAM words [t*243, t*243+242]. Latency is fixed at
+// DIM + 4 clocks (2 setup, 243 streamed, 1 tail, 1 done pulse).
+//
+// Modeling notes:
+// - The FSM register group (state_q, k_idx, base_addr, rd_addr, k_out_d1,
+//   out_data, out_addr, done, busy, out_valid, code_r) is captured as struct
+//   StreamState + pure function next_state() (one posedge clk per call),
+//   following the accepted sibling port PhiTemporalHeartbeatTop.
+// - The combinational decode path (BRAM code_r -> decoded_val) is on_comb().
+// - BRAM contents come from $readmemb("embedding_weights.mem"): that is ROM
+//   data, not logic, so the memory itself is out of scope here. Tests model
+//   its contents as (addr & 3) via mem_model() and assert the FSM consumes
+//   exactly the element the original would read.
+// - The multiply-by-243 base address is kept as the original's shift form:
+//   (tok << 8) - (tok << 4) + (tok << 2) - tok.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module embedding_lookup {
+
+    // === Module parameters (Verilog parameter list) ===
+
+    pub const VOCAB : u32 = 128;        // parameter VOCAB      = 7'd128
+    pub const DIM : u32 = 243;          // parameter DIM        = 8'd243 (3^5 weights)
+    pub const DATA_WIDTH : u32 = 20;    // parameter DATA_WIDTH = 5'd20
+    pub const ADDR_WIDTH : u32 = 15;    // parameter ADDR_WIDTH = 4'd15
+    pub const TOK_WIDTH : u32 = 7;      // parameter TOK_WIDTH  = 3'd7
+    pub const DIM_WIDTH : u32 = 8;      // parameter DIM_WIDTH  = 3'd8
+
+    // === Derived geometry ===
+
+    pub const MEM_DEPTH : u32 = 1 << ADDR_WIDTH;   // BRAM depth, 2^15 = 32768 words
+    pub const BRAM_BASE : u32 = 0;                 // original fixed base: 'd0
+    pub const LAST_K : u32 = DIM - 1;              // last streamed index, 242
+    pub const LAST_ADDR : u32 = (VOCAB - 1) * DIM + LAST_K;  // 31083, max word touched
+
+    // === FSM states (localparam [1:0]) ===
+
+    pub const S_IDLE : u8 = 0;
+    pub const S_CALC : u8 = 1;
+    pub const S_PREFETCH : u8 = 2;
+    pub const S_STREAM : u8 = 3;
+    pub const S_LAST : u8 = 4;
+    pub const S_DONE : u8 = 5;
+
+    // === Register group of the single always block ===
+
+    pub struct StreamState {
+        state : u8,        // state_q   [1:0]
+        k_idx : u32,       // k_idx     [DIM_WIDTH-1:0]
+        base_addr : u32,   // base_addr [ADDR_WIDTH-1:0]
+        rd_addr : u32,     // rd_addr   [ADDR_WIDTH-1:0]
+        k_out_d1 : u32,    // k_out_d1  [DIM_WIDTH-1:0]
+        out_data : i32,    // out_data  [DATA_WIDTH-1:0] signed ternary element
+        out_addr : u32,    // out_addr  [DIM_WIDTH-1:0]
+        done : bool,       // done, 1-cycle pulse
+        busy : bool,       // busy
+        out_valid : bool,  // out_valid, 1-cycle pulse
+        code_r : u8,       // code_r [1:0], registered BRAM output
+    }
+
+    // === Reset values (rst_n == 0) ===
+
+    fn init_state() -> StreamState {
+        return StreamState {
+            state : S_IDLE,
+            k_idx : 0,
+            base_addr : 0,
+            rd_addr : 0,
+            k_out_d1 : 0,
+            out_data : 0,
+            out_addr : 0,
+            done : false,
+            busy : false,
+            out_valid : false,
+            code_r : 0,
+        };
+    }
+
+    // === Combinational decode: 2-bit ternary code -> signed element ===
+    // 01 -> +1, 10 -> -1, 00/11 -> 0 (matches decoded_val in the original)
+
+    fn on_comb(code : u8) -> i32 {
+        var decoded : i32 = 0;
+        if (code == 1) {
+            decoded = 1;
+        } else {
+            if (code == 2) {
+                decoded = -1;
+            }
+        }
+        return decoded;
+    }
+
+    // === Base address of a token row (original shift decomposition of *243) ===
+
+    fn base_addr_for(token_id : u32) -> u32 {
+        return (token_id << 8) - (token_id << 4) + (token_id << 2) - token_id;
+    }
+
+    // === Row layout: element k of token t at BRAM word base + k ===
+
+    fn elem_addr(k : u32, token_id : u32) -> u32 {
+        return base_addr_for(token_id) + k;
+    }
+
+    // === The always @(posedge clk or negedge rst_n) block ===
+    // One clock edge per call. emb_code is what the BRAM put on its data
+    // port this edge, i.e. emb_mem[s.rd_addr] (code_r <= emb_mem[rd_addr]).
+    // decoded_val and out_addr consume the pre-edge values of code_r and
+    // k_out_d1 exactly like the original's non-blocking assignments.
+
+    fn next_state(s : StreamState, start : bool, token_id : u32, emb_code : u8) -> StreamState {
+        var next : StreamState = s;
+        next.code_r = emb_code;      // code_r <= emb_mem[rd_addr]
+        next.out_valid = false;      // out_valid <= 0 (pulses)
+        next.done = false;           // done <= 0 (pulses)
+        if (next.state == S_IDLE) {
+            if (start) {             // start accepted only from IDLE
+                next.state = S_CALC;
+                next.base_addr = base_addr_for(token_id);
+                next.k_idx = 0;
+                next.busy = true;
+            }
+        } else {
+            if (next.state == S_CALC) {
+                next.rd_addr = next.base_addr + BRAM_BASE;
+                next.state = S_PREFETCH;
+            } else {
+                if (next.state == S_PREFETCH) {
+                    next.state = S_STREAM;
+                    next.k_idx = 1;
+                    next.k_out_d1 = 0;
+                    next.rd_addr = next.base_addr + 1;
+                } else {
+                    if (next.state == S_STREAM) {
+                        next.out_data = on_comb(s.code_r);
+                        next.out_addr = next.k_out_d1;
+                        next.out_valid = true;
+                        next.k_out_d1 = next.k_idx;
+                        if (next.k_idx == LAST_K) {
+                            next.state = S_LAST;   // tail: hold rd_addr/k_idx
+                        } else {
+                            next.rd_addr = next.base_addr + next.k_idx + 1;
+                            next.k_idx = next.k_idx + 1;
+                        }
+                    } else {
+                        if (next.state == S_LAST) {
+                            next.out_data = on_comb(s.code_r);
+                            next.out_addr = next.k_out_d1;
+                            next.out_valid = true;
+                            next.state = S_DONE;
+                        } else {
+                            next.done = true;      // S_DONE: 1-cycle done pulse
+                            next.busy = false;
+                            next.state = S_IDLE;
+                        }
+                    }
+                }
+            }
+        }
+        return next;
+    }
+
+    // === Test-only BRAM content model (ROM data, not logic) ===
+    // emb_mem[addr] initialized by $readmemb("embedding_weights.mem"); the
+    // reference run uses the repeating pattern addr & 3 so every ternary
+    // code (+1, -1, 0) is exercised and outputs are computable.
+
+    fn mem_model(addr : u32) -> u8 {
+        return (addr & 3) as u8;
+    }
+
+    // === Tests: values the original module produces ===
+
+    test decode_plus_one {
+        assert_eq(on_comb(1), 1);
+    }
+
+    test decode_minus_one {
+        assert_eq(on_comb(2), -1);
+    }
+
+    test decode_zero_codes {
+        assert(on_comb(0) == 0 and on_comb(3) == 0);
+    }
+
+    test base_addr_token0 {
+        assert_eq(base_addr_for(0), 0);
+    }
+
+    test base_addr_token1 {
+        // (1<<8) - (1<<4) + (1<<2) - 1 = 256 - 16 + 4 - 1 = 243
+        assert_eq(base_addr_for(1), 243);
+    }
+
+    test base_addr_token2 {
+        assert_eq(base_addr_for(2), 486);
+        assert_eq(base_addr_for(2), 2 * DIM);
+    }
+
+    test base_addr_last_token {
+        assert_eq(base_addr_for(127), 30861);
+        assert_eq(base_addr_for(127), 127 * DIM);
+    }
+
+    test shift_decomposition_matches_product {
+        var t : u32 = 0;
+        while (t < VOCAB) {
+            assert_eq(base_addr_for(t), t * DIM);
+            t = t + 1;
+        }
+    }
+
+    test row_layout {
+        assert_eq(elem_addr(0, 0), 0);
+        assert_eq(elem_addr(242, 0), 242);
+        assert_eq(elem_addr(0, 1), 243);
+        assert_eq(elem_addr(242, 127), 31083);
+        assert(LAST_ADDR < MEM_DEPTH);
+    }
+
+    test idle_accepts_start {
+        var st = init_state();
+        let started = next_state(st, true, 1, 0);
+        assert_eq(started.state, S_CALC);
+        assert_eq(started.base_addr, 243);
+        assert_eq(started.k_idx, 0);
+        assert(started.busy and !started.done and !started.out_valid);
+    }
+
+    test idle_holds_without_start {
+        var st = init_state();
+        let held = next_state(st, false, 0, 0);
+        assert_eq(held.state, S_IDLE);
+        assert(!held.busy and !held.out_valid and !held.done);
+    }
+
+    test calc_to_prefetch {
+        var st = init_state();
+        st = next_state(st, true, 5, 0);          // -> CALC, base 1215
+        st = next_state(st, false, 0, 0);         // -> PREFETCH, issue base
+        assert_eq(st.state, S_PREFETCH);
+        assert_eq(st.rd_addr, 1215);
+    }
+
+    test prefetch_to_stream {
+        var st = init_state();
+        st = next_state(st, true, 2, 0);          // CALC
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        st = next_state(st, false, 0, 0);         // STREAM
+        assert_eq(st.state, S_STREAM);
+        assert_eq(st.k_idx, 1);
+        assert_eq(st.k_out_d1, 0);
+        assert_eq(st.rd_addr, 487);               // base + 1, k=1 prefetch
+        assert(!st.out_valid);                    // first element not out yet
+    }
+
+    test first_stream_output {
+        var st = init_state();
+        st = next_state(st, true, 1, 0);          // CALC
+        st = next_state(st, false, 0, 0);         // PREFETCH (rd_addr=243)
+        st = next_state(st, false, 0, 0);         // -> STREAM
+        // BRAM now returns emb_mem[rd_addr] = mem_model(243) = 3; the edge
+        // after that emits element 0 decoded from the prefetched code.
+        st = next_state(st, false, 0, mem_model(st.rd_addr));
+        assert(st.out_valid);
+        assert_eq(st.out_addr, 0);
+        assert_eq(st.out_data, on_comb(mem_model(243)));   // mem[243]&3 = 3 -> 0
+    }
+
+    test stream_middle_output {
+        var st = init_state();
+        st = next_state(st, true, 1, 0);          // CALC
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        st = next_state(st, false, 0, 0);         // -> STREAM
+        st = next_state(st, false, 0, mem_model(st.rd_addr));  // element 0 out
+        st = next_state(st, false, 0, mem_model(st.rd_addr));  // element 1 out
+        assert(st.out_valid);
+        assert_eq(st.out_addr, 1);
+        assert_eq(st.out_data, on_comb(mem_model(244)));   // mem[244]&3 = 0 -> 0
+    }
+
+    test stream_to_last {
+        var st = init_state();
+        st = next_state(st, true, 1, 0);          // CALC
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        st = next_state(st, false, 0, 0);         // -> STREAM
+        var c : u32 = 0;
+        while (c < LAST_K) {                      // elements 0..241 out
+            st = next_state(st, false, 0, mem_model(st.rd_addr));
+            c = c + 1;
+        }
+        assert_eq(st.state, S_STREAM);
+        assert_eq(st.k_idx, LAST_K);
+        st = next_state(st, false, 0, mem_model(st.rd_addr));  // element 242 out
+        assert_eq(st.state, S_LAST);
+        assert(st.out_valid);
+        assert_eq(st.out_addr, LAST_K);
+    }
+
+    test last_to_done_pulse {
+        var st = init_state();
+        st = next_state(st, true, 1, 0);          // CALC
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        st = next_state(st, false, 0, 0);         // -> STREAM
+        var c : u32 = 0;
+        while (c <= LAST_K) {                     // elements 0..242 out
+            st = next_state(st, false, 0, mem_model(st.rd_addr));
+            c = c + 1;
+        }
+        assert_eq(st.state, S_DONE);
+        st = next_state(st, false, 0, 0);         // DONE edge: done pulses
+        assert(st.done and !st.busy and !st.out_valid);
+        assert_eq(st.state, S_IDLE);              // back to IDLE, ready again
+        let again = next_state(st, true, 9, 0);   // restart accepted
+        assert_eq(again.state, S_CALC);
+        assert_eq(again.base_addr, 2187);         // 9 * 243
+    }
+
+    test full_stream {
+        // Full 245-clock transaction for token 1 against the ROM model:
+        // 2 setup edges, 243 streamed elements, 1 tail, 1 done pulse. Every
+        // element out must decode exactly the word the original reads.
+        var st = init_state();
+        var cyc : u32 = 0;
+        var seen : u32 = 0;
+        var aligned = true;
+        st = next_state(st, true, 1, 0);          // CALC, base 243
+        cyc = cyc + 1;
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        cyc = cyc + 1;
+        while (st.state != S_DONE and cyc < 700) {
+            st = next_state(st, false, 0, mem_model(st.rd_addr));
+            cyc = cyc + 1;
+            if (st.out_valid) {
+                if (st.out_data != on_comb(mem_model(st.base_addr + st.out_addr))) {
+                    aligned = false;
+                }
+                seen = seen + 1;
+            }
+        }
+        assert_eq(st.state, S_DONE);
+        assert_eq(seen, DIM);
+        assert_eq(cyc, 245);
+        assert(aligned);
+        // done pulse edge
+        st = next_state(st, false, 0, 0);
+        assert(st.done and st.state == S_IDLE);
+    }
+
+    test out_valid_pulse_masking {
+        // out_valid only during STREAM/LAST output edges
+        var st = init_state();
+        st = next_state(st, true, 3, 0);          // CALC
+        assert(!st.out_valid);
+        st = next_state(st, false, 0, 0);         // PREFETCH
+        assert(!st.out_valid);
+        st = next_state(st, false, 0, 0);         // -> STREAM
+        assert(!st.out_valid);
+        st = next_state(st, false, 0, mem_model(st.rd_addr));
+        assert(st.out_valid);                     // element 0 edge
+    }
+
+    // === Invariants ===
+
+    invariant state_sequence_valid {
+        let states = [S_IDLE, S_CALC, S_PREFETCH, S_STREAM, S_LAST, S_DONE];
+        var i : u32 = 0;
+        while (i < 6) {
+            assert(states[i] == i);
+            i = i + 1;
+        }
+    }
+
+    invariant decode_output_magnitude {
+        var c : u32 = 0;
+        while (c < 4) {
+            assert(on_comb(c) >= -1 and on_comb(c) <= 1);
+            c = c + 1;
+        }
+    }
+
+    invariant base_addr_fits_bram given t in 0..VOCAB
+        assert base_addr_for(t) + DIM <= MEM_DEPTH
+
+    invariant stream_addr_fits_bram given t in 0..VOCAB and k in 0..DIM
+        assert elem_addr(k, t) < MEM_DEPTH
+
+    invariant stream_latency_and_alignment given t in 0..VOCAB {
+        // Every token completes in exactly DIM + 4 clocks with DIM aligned
+        // elements out (checked against the ROM model).
+        var st = init_state();
+        var cyc : u32 = 0;
+        var seen : u32 = 0;
+        var aligned = true;
+        st = next_state(st, true, t, 0);
+        cyc = cyc + 1;
+        st = next_state(st, false, 0, 0);
+        cyc = cyc + 1;
+        while (st.state != S_DONE and cyc < 700) {
+            st = next_state(st, false, 0, mem_model(st.rd_addr));
+            cyc = cyc + 1;
+            if (st.out_valid) {
+                if (st.out_data != on_comb(mem_model(st.base_addr + st.out_addr))) {
+                    aligned = false;
+                }
+                seen = seen + 1;
+            }
+        }
+        assert_eq(seen, DIM);
+        assert_eq(cyc, DIM + 4);
+        assert(aligned);
+    }
+
+    // === Benchmarks ===
+
+    bench decode_latency
+        measure: nanoseconds to on_comb(2)
+        target: < 50ns
+
+    bench base_addr_latency
+        measure: nanoseconds to base_addr_for(127)
+        target: < 50ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY
