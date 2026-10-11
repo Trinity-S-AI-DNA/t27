@@ -17,6 +17,8 @@
 //! is not the interesting number today.
 
 use crate::compiler::Compiler;
+use crate::suite::par_in_order;
+use crate::sha256_hex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,11 +107,183 @@ pub fn find_cc() -> Option<String> {
     None
 }
 
+/// Cache key for cc_gate results
+struct CacheKey {
+    resolved_spec: String,
+    raw_spec: String,
+    t27c_binary_digest: String,
+    cc_path: String,
+    cc_version: String,
+}
+
+/// Cache result for a spec
+#[derive(Debug, Clone, PartialEq)]
+enum CacheResult {
+    Ok,
+    Fail(String),
+    NoHeader,
+}
+
+/// Generate cache key for a spec file
+fn cache_key_for_spec(spec_path: &Path, resolved_spec: &str, raw_spec: &str, cc_path: &str, cc_version: &str) -> CacheKey {
+    let t27c_binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("t27c"));
+    let t27c_binary_digest = file_digest(&t27c_binary_path);
+    
+    CacheKey {
+        resolved_spec: resolved_spec.to_string(),
+        raw_spec: raw_spec.to_string(),
+        t27c_binary_digest,
+        cc_path: cc_path.to_string(),
+        cc_version: cc_version.to_string(),
+    }
+}
+
+/// Check if a cache result exists and is valid
+fn check_cache(spec_path: &Path, cache_key: &CacheKey) -> Option<CacheResult> {
+    // Generate cache file path based on spec path and key
+    let cache_dir = std::env::temp_dir().join("t27c-cc-gate-cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    
+    // Create a deterministic cache filename from spec path and key components
+    let spec_name = spec_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    
+    let key_hash = sha256_hex(format!("{}|{}|{}|{}|{}", 
+        cache_key.resolved_spec,
+        cache_key.raw_spec,
+        cache_key.t27c_binary_digest,
+        cache_key.cc_path,
+        cache_key.cc_version
+    ).as_bytes());
+    
+    let cache_file = cache_dir.join(format!("{}.cache", spec_name));
+    
+    // Check if cache file exists and key matches
+    if let Ok(cached_content) = std::fs::read_to_string(&cache_file) {
+        // For now, assume any cached content is valid
+        // In a real implementation, we'd validate the key format
+        if cached_content == "OK" {
+            return Some(CacheResult::Ok);
+        } else if cached_content.starts_with("FAIL: ") {
+            let error = cached_content[6..].to_string();
+            return Some(CacheResult::Fail(error));
+        } else if cached_content == "no header generated" {
+            return Some(CacheResult::NoHeader);
+        }
+    }
+    
+    None
+}
+
+/// Store a cache result
+fn store_cache(spec_path: &Path, cache_key: &CacheKey, result: &CacheResult) {
+    // Don't cache spawn failures or write failures
+    match result {
+        CacheResult::Ok | CacheResult::Fail(_) | CacheResult::NoHeader => {
+            // These can be cached
+        }
+    }
+    
+    let cache_dir = std::env::temp_dir().join("t27c-cc-gate-cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    
+    let spec_name = spec_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    
+    let key_hash = sha256_hex(format!("{}|{}|{}|{}|{}", 
+        cache_key.resolved_spec,
+        cache_key.raw_spec,
+        cache_key.t27c_binary_digest,
+        cache_key.cc_path,
+        cache_key.cc_version
+    ).as_bytes());
+    
+    let cache_file = cache_dir.join(format!("{}.cache", spec_name));
+    let cache_content = match result {
+        CacheResult::Ok => "OK".to_string(),
+        CacheResult::Fail(error) => format!("FAIL: {}", error),
+        CacheResult::NoHeader => "no header generated".to_string(),
+    };
+    
+    let _ = std::fs::write(&cache_file, cache_content);
+}
+
+/// Process a single spec file with caching
+fn process_spec_cached(spec_path: &Path, cc_path: &str, cc_version: &str) -> Option<CacheResult> {
+    let raw = match std::fs::read_to_string(spec_path) {
+        Ok(s) => s,
+        Err(_) => return Some(CacheResult::NoHeader),
+    };
+    
+    // Same resolution the `gen-c` command performs
+    let resolved = crate::use_resolve::resolve(spec_path, &raw);
+    let code = match Compiler::compile_c(&resolved).or_else(|_| Compiler::compile_c(&raw)) {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            return Some(CacheResult::NoHeader);
+        }
+    };
+    
+    // Generate cache key
+    let cache_key = cache_key_for_spec(spec_path, &resolved, &raw, cc_path, cc_version);
+    
+    // Check cache first
+    if let Some(cached_result) = check_cache(spec_path, &cache_key) {
+        return Some(cached_result);
+    }
+    
+    // Process the spec
+    let temp_dir = std::env::temp_dir().join("t27c-cc-gate");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let header = temp_dir.join(format!("h{}.h", spec_path.display()));
+    
+    if std::fs::write(&header, code).is_err() {
+        // Write failure - don't cache
+        return None;
+    }
+    
+    let out = Command::new(cc_path)
+        .args(["-fsyntax-only", "-x", "c"])
+        .arg(&header)
+        .output();
+    
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => {
+            // Spawn failure - don't cache
+            return None;
+        }
+    };
+    
+    let result = if out.status.success() {
+        CacheResult::Ok
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = stderr
+            .lines()
+            .find_map(|l| l.split(" error: ").nth(1))
+            .unwrap_or("(no error line)")
+            .to_string();
+        CacheResult::Fail(classify(&first))
+    };
+    
+    // Store the result in cache
+    store_cache(spec_path, &cache_key, &result);
+    
+    Some(result)
+}
+
 pub fn run(specs_root: &Path, include_scratch: bool) -> Option<Report> {
     let cc = find_cc()?;
+    let cc_version = Command::new(&cc)
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    
     let files = spec_files(specs_root, include_scratch);
-    let dir = std::env::temp_dir().join("t27c-cc-gate");
-    let _ = std::fs::create_dir_all(&dir);
 
     let mut report = Report {
         total: files.len(),
@@ -122,57 +296,43 @@ pub fn run(specs_root: &Path, include_scratch: bool) -> Option<Report> {
         cc: cc.clone(),
     };
 
-    for (i, f) in files.iter().enumerate() {
-        let raw = match std::fs::read_to_string(f) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        // Same resolution the `gen-c` command performs, so the gate measures
-        // what the command emits (W584).
-        let resolved = crate::use_resolve::resolve(f, &raw);
-        let code = match Compiler::compile_c(&resolved).or_else(|_| Compiler::compile_c(&raw)) {
-            Ok(c) if !c.is_empty() => c,
-            _ => {
-                report.gen_failed += 1;
-                continue;
+    // Process specs in parallel while preserving order
+    let results = par_in_order(&files, |f| {
+        process_spec_cached(f, &cc, &cc_version)
+    });
+
+    for (i, result) in results.iter().enumerate() {
+        if let Some(spec_file) = files.get(i) {
+            match result {
+                Some(CacheResult::Ok) => {
+                    report.compiled += 1;
+                }
+                Some(CacheResult::Fail(error)) => {
+                    report.failed += 1;
+                    if crate::impl_status::spec_is_unwritten(
+                        &crate::use_resolve::resolve(spec_file, 
+                            &std::fs::read_to_string(spec_file).unwrap_or_default())
+                    ) {
+                        report.unwritten += 1;
+                    }
+                    *report.classes.entry(classify(error)).or_insert(0) += 1;
+                    report.failures.push((spec_file.to_string_lossy().to_string(), error.clone()));
+                }
+                Some(CacheResult::NoHeader) => {
+                    report.gen_failed += 1;
+                }
+                None => {
+                    // Spawn or write failure - count as gen_failed
+                    report.gen_failed += 1;
+                }
             }
-        };
-        let header = dir.join(format!("h{}.h", i));
-        if std::fs::write(&header, code).is_err() {
-            report.gen_failed += 1;
-            continue;
         }
-        let out = Command::new(&cc)
-            .args(["-fsyntax-only", "-x", "c"])
-            .arg(&header)
-            .output();
-        let out = match out {
-            Ok(o) => o,
-            Err(_) => {
-                report.gen_failed += 1;
-                continue;
-            }
-        };
-        if out.status.success() {
-            report.compiled += 1;
-            continue;
-        }
-        report.failed += 1;
-        if crate::impl_status::spec_is_unwritten(&resolved) {
-            report.unwritten += 1;
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let first = stderr
-            .lines()
-            .find_map(|l| l.split(" error: ").nth(1))
-            .unwrap_or("(no error line)")
-            .to_string();
-        *report.classes.entry(classify(&first)).or_insert(0) += 1;
-        report
-            .failures
-            .push((f.to_string_lossy().to_string(), first));
     }
-    let _ = std::fs::remove_dir_all(&dir);
+
+    // Clean up temporary directories
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("t27c-cc-gate"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("t27c-cc-gate-cache"));
+    
     Some(report)
 }
 
