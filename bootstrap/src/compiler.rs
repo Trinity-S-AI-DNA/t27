@@ -7955,6 +7955,24 @@ impl Codegen {
                 .map(|ret| Self::t27_array_type_to_zig(ret) == "[]const u8")
                 .unwrap_or(false);
         }
+        // #8704: a bare identifier names a parameter or a local of the
+        // function being emitted first, and zig_var_types holds the declared
+        // type of every one of those (cleared on entry to each fn, grown as
+        // params and typed locals are declared). When it knows the name, that
+        // fact outranks string_names: `domain` as a bool parameter shadows the
+        // `domain: str` field of some struct elsewhere in the spec, so
+        // `domain == false` must stay a boolean compare instead of being
+        // lowered into a string compare over the field's name. A field access
+        // (`row.domain`) is no binding of its trailing name, and a name
+        // zig_var_types does not know -- a module const, an enum value --
+        // still falls back to string_names below.
+        if node.kind == NodeKind::ExprIdentifier {
+            if let Some(ty) = self.zig_var_types.get(&node.name) {
+                if !ty.trim().is_empty() {
+                    return Self::t27_array_type_to_zig(ty) == "[]const u8";
+                }
+            }
+        }
         Self::trailing_name(node)
             .map(|n| self.string_names.contains(&n))
             .unwrap_or(false)
@@ -9344,6 +9362,12 @@ impl Codegen {
         // W625: len-taint is per-function; a name reused in the next function
         // must not inherit it.
         self.len_locals.clear();
+        // #8704: param/typed-local types are a per-fn-body scope too (W566).
+        // A test block is its own body: a bare identifier in it names a test
+        // local or a module const, never a parameter of the function emitted
+        // before this test, so any entry left behind by that function would
+        // mislabel the comparison here.
+        self.zig_var_types.clear();
         // #5162: string locals a test declares, scoped to the test.
         let mut test_string = Vec::new();
         for n in Self::collect_string_locals(&node.children) {
