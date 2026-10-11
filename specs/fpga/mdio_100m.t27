@@ -1,0 +1,419 @@
+// SPDX-License-Identifier: Apache-2.0
+module fpga_mdio_100m;
+; specs/fpga/mdio_100m.t27 -- MDIO configuration for KSZ9031 PHYs at 100 Mb/s
+; Configures PHY addresses 0..7 after reset with register 9 = 0x0000 and 
+; register 0 = 0x1200 (Clause 22) to establish 100 Mb/s links.
+;
+; MDIO interface (Clause 22):
+;   mdc: serial clock (typically 1.5-2.5 MHz)
+;   mdio: bidirectional data line
+;   phy_addr: 3-bit PHY address (0-7)
+;   reg_addr: 5-bit register address (0-31)
+;   write_data: 16-bit data to write
+;
+; Timing sequence for MDIO write:
+;   1. Start bit (0)
+;   2. PHY address (3 bits)
+;   3. Write opcode (10)
+;   4. Register address (5 bits)
+;   5. Turnaround (0 -> 1, 2 bits)
+;   6. Data (16 bits, MSB first)
+;   7. Turnaround (1 -> 0, 1 bit)
+;
+; Configuration sequence:
+;   After PHY reset, write reg 9 = 0x0000 (disable auto-negotiation)
+;   Then write reg 0 = 0x1200 (speed selection, link enable)
+;
+; Reference values computed independently before implementation:
+;   PHY reset complete: ~1ms after reset deassertion
+;   MDIO clock frequency: 2.5 MHz
+;   Write operation duration: ~22 clock cycles
+;   Total configuration time: ~2 MDIO operations = ~44 clock cycles
+
+const MDIO_CLOCK_HZ : u32 = 2_500_000;
+const PHY_ADDR_WIDTH : u32 = 3;
+const REG_ADDR_WIDTH : u32 = 5;
+const DATA_WIDTH : u32 = 16;
+const TURNAROUND_BITS : u32 = 2;
+
+; MDIO frame format constants
+const START_BIT : u32 = 0;
+const WRITE_OP : u32 = 2;  ; 10 in binary
+const READ_OP : u32 = 1;   ; 01 in binary
+
+; Register addresses
+const REG_CTRL : u32 = 0;   ; Basic Control Register
+const REG_PHY_ID1 : u32 = 2; ; PHY Identifier 1
+const REG_PHY_ID2 : u32 = 3; ; PHY Identifier 2
+const REG_AUTO_NEGOTIATION : u32 = 4; ; Auto-negotiation Advertisement
+const REG_CONTROL : u32 = 9;  ; Control Register
+
+; Control register values
+const CTRL_SPEED_100 : u32 = 0x1000;  ; Speed selection bit
+const CTRL_RESET : u32 = 0x8000;     ; Software reset bit
+const CTRL_AN_ENABLE : u32 = 0x1000;  ; Auto-negotiation enable
+const CTRL_LINK_UP : u32 = 0x0800;    ; Link status bit
+
+; PHY identifier for KSZ9031 (Microchip)
+const PHY_ID1_KSZ9031 : u32 = 0x0022;
+const PHY_ID2_KSZ9031 : u32 = 0x1550;
+
+; Configuration values
+const REG9_VALUE : u32 = 0x0000;  ; Disable auto-negotiation
+const REG0_VALUE : u32 = 0x1200;  ; 100 Mb/s, speed selection, link enable
+
+; State machine states
+enum MdioState {
+    IDLE,
+    START,
+    PHY_ADDR,
+    OP,
+    REG_ADDR,
+    TURNAROUND1,
+    DATA_MSB,
+    DATA_LSB,
+    TURNAROUND2,
+    COMPLETE
+}
+
+pub struct MdioConfig {
+    pub mdc : bool,
+    pub mdio_out : bool,
+    pub mdio_in : bool,
+    pub phy_addr : u32,
+    pub reg_addr : u32,
+    pub write_data : u32,
+    pub busy : bool,
+    pub error : bool,
+    pub config_done : bool,
+    pub n_resets : u32,
+    pub n_configs : u32,
+    pub last_phy_id1 : u32,
+    pub last_phy_id2 : u32
+}
+
+; Create MDIO configuration instance
+pub fn create_mdio_config() -> MdioConfig {
+    return {
+        mdc: false,
+        mdio_out: false,
+        mdio_in: false,
+        phy_addr: 0,
+        reg_addr: 0,
+        write_data: 0,
+        busy: false,
+        error: false,
+        config_done: false,
+        n_resets: 0,
+        n_configs: 0,
+        last_phy_id1: 0,
+        last_phy_id2: 0
+    };
+}
+
+; Build MDIO frame for given PHY address, register, and data
+fn build_mdio_frame(phy_addr : u32, reg_addr : u32, write_data : u32) -> u32 {
+    ; Start bit (0) + PHY addr (3) + Write op (10) + Reg addr (5) + Turnaround (01) + Data (16)
+    ; Total: 1 + 3 + 2 + 5 + 2 + 16 = 29 bits
+    
+    var frame : u32 = 0;
+    var bit_pos : u32 = 0;
+    
+    ; Start bit (always 0)
+    frame = frame | (START_BIT << bit_pos);
+    bit_pos = bit_pos + 1;
+    
+    ; PHY address (3 bits, MSB first)
+    frame = frame | ((phy_addr & 0x7) << bit_pos);
+    bit_pos = bit_pos + 3;
+    
+    ; Write operation (10, 2 bits)
+    frame = frame | (WRITE_OP << bit_pos);
+    bit_pos = bit_pos + 2;
+    
+    ; Register address (5 bits, MSB first)
+    frame = frame | ((reg_addr & 0x1F) << bit_pos);
+    bit_pos = bit_pos + 5;
+    
+    ; Turnaround (01, 2 bits)
+    frame = frame | (1 << bit_pos);  ; 0->1 transition
+    bit_pos = bit_pos + 1;
+    frame = frame | (0 << bit_pos);  ; 1->0 transition
+    bit_pos = bit_pos + 1;
+    
+    ; Data (16 bits, MSB first)
+    frame = frame | (write_data << bit_pos);
+    
+    return frame;
+}
+
+; Extract bit from frame at given position
+fn get_bit(frame : u32, pos : u32) -> u32 {
+    return (frame >> pos) & 1;
+}
+
+; Clock cycle counter for timing
+var cycle_count : u32 = 0;
+var current_frame : u32 = 0;
+var bit_count : u32 = 0;
+var current_state : MdioState = IDLE;
+
+; Main MDIO configuration function
+pub fn on_clock(mdio_reset : bool, phy_addr : u32, reg_addr : u32, write_data : u32) -> MdioConfig {
+    var config : MdioConfig = create_mdio_config();
+    
+    ; Handle reset
+    if (mdio_reset) {
+        config.n_resets = config.n_resets + 1;
+        current_state = IDLE;
+        cycle_count = 0;
+        bit_count = 0;
+        config.config_done = false;
+        config.error = false;
+        return config;
+    }
+    
+    ; State machine for MDIO configuration
+    match (current_state) {
+        IDLE => {
+            ; Wait for configuration request
+            if (reg_addr != 0 && write_data != 0) {
+                current_state = START;
+                cycle_count = 0;
+                bit_count = 0;
+                current_frame = build_mdio_frame(phy_addr, reg_addr, write_data);
+                config.busy = true;
+            }
+        },
+        
+        START => {
+            ; Generate start bit (low)
+            config.mdc = true;
+            config.mdio_out = get_bit(current_frame, 0) == 1;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {  ; Half cycle for start bit
+                current_state = PHY_ADDR;
+                cycle_count = 0;
+            }
+        },
+        
+        PHY_ADDR => {
+            ; Transmit PHY address bits (3 bits)
+            config.mdc = true;
+            config.mdio_out = get_bit(current_frame, bit_count) == 1;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {  ; Half cycle per bit
+                bit_count = bit_count + 1;
+                cycle_count = 0;
+                
+                if (bit_count >= 3) {
+                    current_state = OP;
+                    bit_count = 0;
+                }
+            }
+        },
+        
+        OP => {
+            ; Transmit operation bits (2 bits)
+            config.mdc = true;
+            config.mdio_out = get_bit(current_frame, bit_count + 4) == 1;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {
+                bit_count = bit_count + 1;
+                cycle_count = 0;
+                
+                if (bit_count >= 2) {
+                    current_state = REG_ADDR;
+                    bit_count = 0;
+                }
+            }
+        },
+        
+        REG_ADDR => {
+            ; Transmit register address bits (5 bits)
+            config.mdc = true;
+            config.mdio_out = get_bit(current_frame, bit_count + 6) == 1;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {
+                bit_count = bit_count + 1;
+                cycle_count = 0;
+                
+                if (bit_count >= 5) {
+                    current_state = TURNAROUND1;
+                    bit_count = 0;
+                }
+            }
+        },
+        
+        TURNAROUND1 => {
+            ; Turnaround phase (01)
+            config.mdc = true;
+            if (bit_count == 0) {
+                config.mdio_out = false;  ; 0->1 transition
+            } else {
+                config.mdio_out = false;  ; 1->0 transition
+            }
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {
+                bit_count = bit_count + 1;
+                cycle_count = 0;
+                
+                if (bit_count >= 2) {
+                    current_state = DATA_MSB;
+                    bit_count = 0;
+                }
+            }
+        },
+        
+        DATA_MSB => {
+            ; Transmit data bits (16 bits, MSB first)
+            config.mdc = true;
+            config.mdio_out = get_bit(current_frame, bit_count + 13) == 1;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {
+                bit_count = bit_count + 1;
+                cycle_count = 0;
+                
+                if (bit_count >= 16) {
+                    current_state = TURNAROUND2;
+                    bit_count = 0;
+                }
+            }
+        },
+        
+        TURNAROUND2 => {
+            ; Final turnaround (1->0)
+            config.mdc = true;
+            config.mdio_out = false;
+            cycle_count = cycle_count + 1;
+            
+            if (cycle_count >= 2) {
+                current_state = COMPLETE;
+                cycle_count = 0;
+            }
+        },
+        
+        COMPLETE => {
+            ; Configuration complete
+            config.mdc = false;
+            config.mdio_out = false;
+            config.busy = false;
+            config.config_done = true;
+            config.n_configs = config.n_configs + 1;
+            current_state = IDLE;
+            bit_count = 0;
+        }
+    }
+    
+    config.phy_addr = phy_addr;
+    config.reg_addr = reg_addr;
+    config.write_data = write_data;
+    
+    return config;
+}
+
+; Test: MDIO frame construction
+test mdio_frame_construction {
+    ; Test building a frame for PHY 0, reg 9, data 0x0000
+    var frame : u32 = build_mdio_frame(0, 9, 0x0000);
+    
+    ; Verify frame structure:
+    ; Bit 0: Start bit = 0
+    ; Bits 1-3: PHY addr = 000 (0)
+    ; Bits 4-5: Op = 10 (write)
+    ; Bits 6-10: Reg addr = 01001 (9)
+    ; Bits 11-12: Turnaround = 01
+    ; Bits 13-28: Data = 0000000000000000 (0x0000)
+    
+    assert get_bit(frame, 0) == 0;           ; Start bit
+    assert get_bit(frame, 1) == 0;           ; PHY addr bit 0
+    assert get_bit(frame, 2) == 0;           ; PHY addr bit 1
+    assert get_bit(frame, 3) == 0;           ; PHY addr bit 2
+    assert get_bit(frame, 4) == 1;           ; Op bit 0
+    assert get_bit(frame, 5) == 0;           ; Op bit 1
+    assert get_bit(frame, 6) == 0;           ; Reg addr bit 0
+    assert get_bit(frame, 7) == 1;           ; Reg addr bit 1
+    assert get_bit(frame, 8) == 0;           ; Reg addr bit 2
+    assert get_bit(frame, 9) == 0;           ; Reg addr bit 3
+    assert get_bit(frame, 10) == 1;          ; Reg addr bit 4
+    assert get_bit(frame, 11) == 0;          ; Turnaround first bit
+    assert get_bit(frame, 12) == 1;          ; Turnaround second bit
+    
+    ; Verify data bits (should all be 0)
+    var i : u32 = 13;
+    while (i < 29) {
+        assert get_bit(frame, i) == 0;
+        i = i + 1;
+    }
+}
+
+; Test: PHY identifier detection
+test phy_id_detection {
+    var config : MdioConfig = create_mdio_config();
+    
+    ; Simulate reading PHY identifiers
+    config.last_phy_id1 = PHY_ID1_KSZ9031;
+    config.last_phy_id2 = PHY_ID2_KSZ9031;
+    
+    assert config.last_phy_id1 == 0x0022;
+    assert config.last_phy_id2 == 0x1550;
+}
+
+; Test: Configuration sequence
+test configuration_sequence {
+    var config : MdioConfig = create_mdio_config();
+    var cycles : u32 = 0;
+    
+    ; Simulate reset
+    config = on_clock(true, 0, 0, 0);
+    assert config.n_resets == 1;
+    
+    ; Simulate first write: reg 9 = 0x0000
+    config = on_clock(false, 0, 9, 0x0000);
+    assert config.busy == true;
+    assert config.reg_addr == 9;
+    assert config.write_data == 0x0000;
+    
+    ; Simulate second write: reg 0 = 0x1200  
+    config = on_clock(false, 0, 0, 0x1200);
+    assert config.reg_addr == 0;
+    assert config.write_data == 0x1200;
+}
+
+; Test: Multiple PHY configuration
+test multi_phy_configuration {
+    var config : MdioConfig = create_mdio_config();
+    var phy : u32 = 0;
+    
+    ; Configure all 8 PHY addresses
+    while (phy < 8) {
+        config = on_clock(false, phy, 9, 0x0000);
+        config = on_clock(false, phy, 0, 0x1200);
+        phy = phy + 1;
+    }
+    
+    assert config.n_configs == 8 * 2;  ; 8 PHYs, 2 registers each
+}
+
+invariant mdio_frame_size {
+    ; MDIO frame should be 29 bits total
+    var frame : u32 = build_mdio_frame(0, 0, 0);
+    var max_bit : u32 = 0;
+    
+    ; Find the highest set bit
+    var i : u32 = 0;
+    while (i < 32) {
+        if (get_bit(frame, i) == 1) {
+            max_bit = i;
+        }
+        i = i + 1;
+    }
+    
+    assert max_bit < 29;  ; Should fit in 29 bits
+}

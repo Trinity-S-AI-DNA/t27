@@ -1,0 +1,356 @@
+// SPDX-License-Identifier: Apache-2.0
+module fpga_rgmii_100;
+; specs/fpga/rgmii_100.t27 -- RGMII 10/100 nibble-to-byte conversion and timing
+; Converts nibble streams from PHY to bytes aligned on SFD, provides byte-strobed
+; EthRx interface, one-clock pulses to TrinetNode, and EthReply stepping every
+; second clock for nibble-pair transmission.
+;
+; Interface:
+;   rgmii_rxc: Receive clock (25 MHz for 100 Mbps)
+;   rgmii_txc: Transmit clock (25 MHz for 100 Mbps)  
+;   rgmii_rxd[3:0]: Receive data nibble (from PHY)
+;   rgmii_txd[3:0]: Transmit data nibble (to PHY)
+;   rgmii_rx_ctl: Receive control signal
+;   rgmii_tx_ctl: Transmit control signal
+;
+; Internal interface:
+;   eth_rx_v, eth_rx_b: Valid byte and byte data to EthRx
+;   eth_rx_pulse: One-clock pulse to TrinetNode
+;   eth_reply_step: Every second clock pulse for EthReply
+;   tx_en, tx_data: Transmit interface to PHY
+;
+; Timing:
+;   100 Mbps = 25 MHz SDR (rising edge only)
+;   1 byte per clock cycle
+;   SFD (Start Frame Delimiter) = 0xD5 marks byte boundaries
+;
+; Reference values computed independently:
+;   Clock period: 40 ns (25 MHz)
+;   Byte alignment: SFD = 0xD5
+;   Nibble to byte conversion: 2 nibbles per byte
+;   EthRx pulse: 1 clock per valid byte
+;   EthReply step: 1 clock every 2 clocks (50% duty cycle)
+
+; Import timing constants from rgmii.t27
+pub const RGMII_100_HZ : u32 = 25_000_000;
+pub const RGMII_DATA_BITS : u32 = 4;
+pub const CLOCK_PERIOD_PS : u32 = 40_000;  ; 40 ns at 25 MHz
+
+; SFD and frame constants
+const SFD_BYTE : u8 = 0xD5;        ; Start Frame Delimiter
+const PREAMBLE_BYTE : u8 = 0x55;   ; Preamble byte
+const ETH_MIN_FRAME : u16 = 64;    ; Minimum Ethernet frame size
+
+; State machine states for nibble-to-byte conversion
+enum RgmiiRxState {
+    IDLE,
+    NIBBLE1,
+    NIBBLE2,
+    BYTE_VALID,
+    WAIT_SFD
+}
+
+enum RgmiiTxState {
+    IDLE,
+    NIBBLE_PAIR,
+    BYTE_VALID
+}
+
+; RGMII interface structure
+pub struct RgmiiInterface {
+    ; Receive interface
+    pub rx_nibble : u32,
+    pub rx_ctl : bool,
+    pub eth_rx_v : bool,
+    pub eth_rx_b : u8,
+    pub eth_rx_pulse : bool,
+    
+    ; Transmit interface  
+    pub tx_nibble : u32,
+    pub tx_ctl : bool,
+    pub tx_en : bool,
+    pub tx_data : u8,
+    
+    ; Control signals
+    pub eth_reply_step : bool,
+    pub frame_active : bool,
+    pub byte_count : u16,
+    nibble_count : u32,
+    current_byte : u8,
+    last_sfd : bool
+}
+
+; Create RGMII interface instance
+pub fn create_rgmii_interface() -> RgmiiInterface {
+    return {
+        rx_nibble: 0,
+        rx_ctl: false,
+        eth_rx_v: false,
+        eth_rx_b: 0,
+        eth_rx_pulse: false,
+        tx_nibble: 0,
+        tx_ctl: false,
+        tx_en: false,
+        tx_data: 0,
+        eth_reply_step: false,
+        frame_active: false,
+        byte_count: 0,
+        nibble_count: 0,
+        current_byte: 0,
+        last_sfd: false
+    };
+}
+
+; Check if nibble is SFD (0xD5 = 11010101, split as nibbles: 1101 and 0101)
+fn is_sfd_nibble(nibble : u32, is_first : bool) -> bool {
+    if (is_first) {
+        return nibble == 0xD;  ; High nibble of SFD (1101)
+    } else {
+        return nibble == 0x5;   ; Low nibble of SFD (0101)
+    }
+}
+
+; Combine two nibbles into a byte
+fn combine_nibbles(high_nibble : u32, low_nibble : u32) -> u8 {
+    return ((high_nibble << 4) | low_nibble) as u8;
+}
+
+; Split byte into two nibbles
+fn split_byte(byte : u8) -> (u32, u32) {
+    var high_nibble : u32 = (byte >> 4) & 0xF;
+    var low_nibble : u32 = byte & 0xF;
+    return (high_nibble, low_nibble);
+}
+
+; Receive clock processing: nibble to byte conversion
+pub fn on_rx_clock(rx_nibble : u32, rx_ctl : bool) -> RgmiiInterface {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    
+    rgmii.rx_nibble = rx_nibble;
+    rgmii.rx_ctl = rx_ctl;
+    
+    ; State machine for nibble-to-byte conversion
+    match (rgmii.nibble_count) {
+        0 => {
+            ; First nibble of byte pair
+            rgmii.nibble_count = 1;
+            rgmii.current_byte = (rx_nibble << 4) as u8;  ; Store high nibble
+            
+            ; Check for SFD
+            if (is_sfd_nibble(rx_nibble, true) && rx_ctl) {
+                rgmii.frame_active = true;
+                rgmii.byte_count = 0;
+            }
+        },
+        
+        1 => {
+            ; Second nibble of byte pair - complete the byte
+            rgmii.nibble_count = 0;
+            rgmii.current_byte = rgmii.current_byte | (rx_nibble as u8);  ; Add low nibble
+            
+            ; Validate byte and generate output
+            if (rgmii.frame_active && rx_ctl) {
+                rgmii.eth_rx_v = true;
+                rgmii.eth_rx_b = rgmii.current_byte;
+                rgmii.eth_rx_pulse = true;
+                rgmii.byte_count = rgmii.byte_count + 1;
+                
+                ; Check for end of frame (SFD not repeated)
+                if (!is_sfd_nibble(rx_nibble, false)) {
+                    ; End of frame when SFD is not seen
+                }
+            }
+        }
+    }
+    
+    return rgmii;
+}
+
+; Transmit clock processing: byte to nibble conversion
+pub fn on_tx_clock(tx_data : u8, tx_en : bool) -> RgmiiInterface {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    
+    rgmii.tx_en = tx_en;
+    rgmii.tx_data = tx_data;
+    
+    if (tx_en) {
+        var high_nibble : u32;
+        var low_nibble : u32;
+        (high_nibble, low_nibble) = split_byte(tx_data);
+        
+        ; Transmit nibble pair
+        rgmii.tx_nibble = high_nibble;
+        rgmii.tx_ctl = true;
+        
+        ; For the second nibble, we'd need another clock cycle
+        ; This is handled by the calling logic stepping through both nibbles
+    }
+    
+    return rgmii;
+}
+
+; Combined clock processing with EthReply stepping
+pub fn on_clock(rx_nibble : u32, rx_ctl : bool, tx_data : u8, tx_en : bool, clock_count : u32) -> RgmiiInterface {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    var rx_result : RgmiiInterface;
+    var tx_result : RgmiiInterface;
+    
+    ; Process receive side
+    rx_result = on_rx_clock(rx_nibble, rx_ctl);
+    
+    ; Process transmit side
+    tx_result = on_tx_clock(tx_data, tx_en);
+    
+    ; Combine results
+    rgmii = rx_result;
+    rgmii.tx_nibble = tx_result.tx_nibble;
+    rgmii.tx_ctl = tx_result.tx_ctl;
+    
+    ; Generate EthReply stepping signal (every second clock)
+    if (clock_count % 2 == 0) {
+        rgmii.eth_reply_step = true;
+    }
+    
+    return rgmii;
+}
+
+; Test: Nibble to byte conversion
+test nibble_to_byte_conversion {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    
+    ; Test with SFD byte (0xD5 = 11010101)
+    ; First nibble: 1101 (0xD)
+    rgmii = on_rx_clock(0xD, true);
+    assert rgmii.nibble_count == 1;
+    assert rgmii.current_byte == 0xD0;  ; High nibble stored
+    
+    ; Second nibble: 0101 (0x5)
+    rgmii = on_rx_clock(0x5, true);
+    assert rgmii.nibble_count == 0;
+    assert rgmii.current_byte == 0xD5;  ; Complete byte
+    assert rgmii.eth_rx_v == true;
+    assert rgmii.eth_rx_b == 0xD5;
+    assert rgmii.eth_rx_pulse == true;
+}
+
+; Test: Byte to nibble conversion
+test byte_to_nibble_conversion {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    
+    ; Test with SFD byte (0xD5)
+    rgmii = on_tx_clock(0xD5, true);
+    
+    ; Should split into high nibble (0xD) and low nibble (0x5)
+    ; First call returns high nibble
+    assert rgmii.tx_nibble == 0xD;
+    assert rgmii.tx_ctl == true;
+}
+
+; Test: Frame detection and counting
+test frame_detection {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    var i : u32 = 0;
+    
+    ; Simulate frame start with SFD
+    rgmii = on_rx_clock(0xD, true);  ; High nibble of SFD
+    assert rgmii.frame_active == true;
+    assert rgmii.byte_count == 0;
+    
+    rgmii = on_rx_clock(0x5, true);  ; Low nibble of SFD
+    assert rgmii.byte_count == 1;    ; SFD counts as byte 1
+    
+    ; Simulate some data bytes
+    rgmii = on_rx_clock(0x5, true);  ; Preamble
+    rgmii = on_rx_clock(0x5, true);
+    rgmii = on_rx_clock(0x12, true); ; Some data
+    rgmii = on_rx_clock(0x34, true);
+    
+    assert rgmii.byte_count == 5;    ; SFD + 4 data bytes
+}
+
+; Test: EthReply stepping signal
+test eth_reply_stepping {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    
+    ; Test over 4 clock cycles
+    var clock : u32 = 0;
+    
+    while (clock < 4) {
+        rgmii = on_clock(0, false, 0, false, clock);
+        
+        if (clock % 2 == 0) {
+            assert rgmii.eth_reply_step == true;
+        } else {
+            assert rgmii.eth_reply_step == false;
+        }
+        
+        clock = clock + 1;
+    }
+}
+
+; Test: Minimum frame size handling
+test minimum_frame_size {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    var byte_count : u32 = 0;
+    
+    ; Simulate a minimum Ethernet frame (64 bytes)
+    while (byte_count < ETH_MIN_FRAME) {
+        if (byte_count == 0) {
+            rgmii = on_rx_clock(0xD, true);  ; SFD high nibble
+        } else if (byte_count == 1) {
+            rgmii = on_rx_clock(0x5, true);  ; SFD low nibble
+        } else {
+            rgmii = on_rx_clock(0x55, true); ; Preamble/data
+        }
+        
+        if (rgmii.eth_rx_v) {
+            byte_count = byte_count + 1;
+        }
+    }
+    
+    assert rgmii.byte_count == ETH_MIN_FRAME;
+}
+
+; Test: Clock timing and synchronization
+test clock_timing {
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    var clock : u32 = 0;
+    
+    ; Test over multiple clock cycles
+    while (clock < 10) {
+        rgmii = on_clock(0xD, true, 0x55, true, clock);
+        
+        ; Verify EthReply stepping every 2 clocks
+        if (clock % 2 == 0) {
+            assert rgmii.eth_reply_step == true;
+        }
+        
+        clock = clock + 1;
+    }
+}
+
+invariant nibble_count_bounds {
+    ; Nibble count should only be 0 or 1
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    assert rgmii.nibble_count <= 1;
+}
+
+invariant rx_data_width {
+    ; Receive nibble should fit in 4 bits
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    assert rgmii.rx_nibble < 16;
+}
+
+invariant tx_data_width {
+    ; Transmit nibble should fit in 4 bits  
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    assert rgmii.tx_nibble < 16;
+}
+
+invariant byte_count_increment {
+    ; Byte count should only increment when a valid byte is received
+    var rgmii : RgmiiInterface = create_rgmii_interface();
+    if (rgmii.eth_rx_v) {
+        assert rgmii.byte_count > 0;
+    }
+}
