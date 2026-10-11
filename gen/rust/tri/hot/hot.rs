@@ -8,6 +8,16 @@ pub const FRONTIER_WARM_BUDGET_MS: u32 = 5000;
 
 pub const SILICON_REUSE_BUDGET_MS: u32 = 2000;
 
+pub const HOT_WATCH: &'static str = "frontier --watch";
+
+pub const HOT_FRONTIER: &'static str = "frontier --list";
+
+pub const HOT_PREBUILD: &'static str = "silicon";
+
+pub const HOT_NO_CABLE: &'static str = "--skip-hardware";
+
+pub const HOT_SUITE: &'static str = "suite --repo-root . --fast --corpus-only";
+
 pub const HOT_OK: u8 = 0;
 
 pub const HOT_OVER: u8 = 1;

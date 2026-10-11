@@ -604,8 +604,8 @@ fn lower_mode<'a>(
         let m = LIBM.get_or_init(|| crate::compiler::Compiler::parse_ast(&libm()).unwrap_or_default());
         items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
     }
-    static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's division routine, for `@divTrunc`
-    if named.contains(ip::DIV_BUILTIN) {
+    static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's routines, for `@divTrunc` and `@rem`
+    if ip::BUILTINS.split(' ').any(|b| named.contains(b)) {
         let m = I128.get_or_init(|| crate::compiler::Compiler::parse_ast(&include_str!("../../../specs/tri/t27b/i128_plan.t27").replace(ip::PORT, ip::HELPER)).unwrap_or_default());
         items.extend(m.children.iter().filter(|c| c.name.starts_with(ip::HELPER)));
     }
@@ -1035,7 +1035,6 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
-        zig_syntax_defects(&opt.children, 0, &mut found);
         found.sort_by_key(|f| f.0);
         for (line, construct, detail) in found {
             if line != 0 {
@@ -1137,7 +1136,7 @@ impl<'a> Lower<'a> {
             } else if unread_any(n, pname, pty) {
                 Ok(LTy::Struct(self.void_struct()))
             } else {
-                self.lty(pty)
+                if pty.trim() == ip::NAME { Ok(LTy::S(Ty::I128)) } else { self.lty(pty) } // a pair of registers (i128_plan.t27)
             };
             self.layout_err |= r.is_err() && self.lazy_sig(pty, true);
             self.sig_layout_only &= r.is_ok() || self.layout_err;
@@ -5136,7 +5135,7 @@ impl<'a> Lower<'a> {
             if fields.iter().any(|g| g.name == f.name) {
                 return self.reject("StructDecl", format!("`{}` has two fields `{}`", node.name, f.name));
             }
-            let ty = self.lty(&f.extra_type)?;
+            let ty = if f.extra_type.trim() == ip::NAME { LTy::S(Ty::I128) } else { self.lty(&f.extra_type)? }; // 16 bytes, aligned to 16 (i128_plan.t27)
             let (fs, fa) = self.size_align(&ty)?;
             let off = size.div_ceil(fa) * fa;
             size = off + fs;
@@ -6458,7 +6457,7 @@ impl<'a> Lower<'a> {
     /// when the place is read-only data), the place itself for a struct.
     fn place_value(&mut self, p: Place) -> R<Val> {
         let Some(ty) = reg_ty(&p.ty) else { return Ok(Val::M(p)) };
-        if let (ExprKind::Data(k), LTy::S(_) | LTy::Enum(..)) = (&p.addr.kind, &p.ty) {
+        if let (ExprKind::Data(k), LTy::S(_) | LTy::Enum(..), false) = (&p.addr.kind, &p.ty, ty == Ty::I128) { // an i128 is loaded, not folded
             let blob = &self.data[*k as usize];
             let mut raw = 0u64;
             for i in (0..ty.bytes() as usize).rev() {
@@ -7245,7 +7244,7 @@ impl<'a> Lower<'a> {
                 let ExprKind::Const(c) = e.kind else {
                     return self.reject("ConstDecl", "struct field is not a compile-time value".into());
                 };
-                let raw = c as u64;
+                let raw = c as u128;
                 for i in 0..ty.bytes() as usize {
                     buf[off + i] = (raw >> (8 * i)) as u8;
                 }
@@ -7729,35 +7728,6 @@ fn ref_mutable_names(ns: &[Node], out: &mut HashSet<String>) {
 /// a path, or a method call on it. Errs toward yes: a yes refuses nothing.
 fn zig_mutates(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::zig_mutates(&a, &t, name.as_bytes())
-}
-
-/// Syntax the reference prints that Zig cannot parse: a childless typed
-/// array literal (`[_]T{}`), whose dimension t27c prints as its element.
-/// (A field named for a Zig keyword is not one: since #6451 t27c's
-/// `zig_ident` writes it `@"align"` in the literal and the access too.)
-fn zig_syntax_defects(ns: &[Node], line: u32, found: &mut Vec<(u32, &'static str, String)>) {
-    for n in ns {
-        // Expressions carry no line; report the enclosing statement's.
-        let at = if n.line != 0 { n.line } else { line };
-        match n.kind {
-            NodeKind::ExprArrayLiteral
-                if n.children.is_empty() && !n.extra_type.trim().is_empty() && !n.extra_size.trim().is_empty() =>
-            {
-                found.push((
-                    at,
-                    "ExprArrayLiteral(reference empty typed)",
-                    format!(
-                        "`[{}]{}{{}}`: t27c's Zig backend prints the dimension `{}` as the literal's only element",
-                        n.extra_size.trim(),
-                        n.extra_type.trim(),
-                        n.extra_size.trim()
-                    ),
-                ));
-            }
-            _ => {}
-        }
-        zig_syntax_defects(&n.children, at, found);
-    }
 }
 
 /// `x.len()` and `len(x)` lower as the length FIELD, as t27c's Zig backend
