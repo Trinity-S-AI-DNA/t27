@@ -112,12 +112,12 @@ fn empty_anon_literal_spec_passes() {
     assert!(got.iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", got);
 }
 
-/// This frame's address stored through a parameter: the reference passes it
-/// only by reading a dead frame, so it is refused by name (#7735).
+/// This frame's address returned, or stored through a parameter: the reference passes both files only by reading
+/// a dead frame, so each is refused by name (#7550, #7735). Refusal tests, they sit here, not in the corpus ledger.
 #[test]
-fn frame_address_store_is_refused() {
-    let r = rejected(include_str!("../../../specs/tri/t27b/conformance/frame_address_store.t27"));
-    assert!(r.contains("StmtAssign(frame address)") && r.contains("`cell`"), "{}", r);
+fn frame_address_return_and_store_are_refused() {
+    let (r, s) = (rejected(include_str!("frame_address_return.t27")), rejected(include_str!("frame_address_store.t27")));
+    assert!(r.contains("ExprReturn(frame address)") && r.contains("`cells`") && s.contains("StmtAssign(frame address)") && s.contains("`cell`"), "{}\n{}", r, s);
 }
 
 /// Strings behind a slice field or a returned slice (wrapup-auto.t27's `files_modified: ["..."]`): a static
