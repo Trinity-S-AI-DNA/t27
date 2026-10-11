@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-//! t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+//! t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
 //! t27b asm    <file.t27> [--overflow trap|wrap]
 //! t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
 //!                   [--json <path>] [--runner "<cmd> [args]"]
@@ -65,7 +65,7 @@ macro_rules! errln {
 
 const USAGE: &str = "usage:
   t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-  t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+  t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
   t27b asm    <file.t27> [--overflow trap|wrap]
   t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
   t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
@@ -73,6 +73,8 @@ const USAGE: &str = "usage:
                     [--blockers [--reference <t27c> [--reference-cache <file>]
                                  [--reference-timeout-ms N]]]
 
+  --elf        build: an ELF64 object for aarch64 Linux (specs/tri/t27b/elf.t27), the default on
+               Linux; --macho: a Mach-O object for arm64 macOS, the default elsewhere
   --json       corpus: also write per-file results and totals to <path> as JSON
                (with --reference, the reference verdicts too)
   --runner     corpus: start each per-file `t27b test` as `<cmd> [args] <t27b> test ...`,
@@ -103,6 +105,7 @@ struct Opts {
     json: Option<String>,
     runner: Vec<String>,
     blockers: bool,
+    elf: bool,
     reference: Option<String>,
     reference_cache: Option<String>,
     reference_timeout_ms: u64,
@@ -133,6 +136,7 @@ fn parse_args() -> Result<Opts, String> {
         json: None,
         runner: Vec::new(),
         blockers: false,
+        elf: cfg!(target_os = "linux"),
         reference: None,
         reference_cache: None,
         reference_timeout_ms: 300_000,
@@ -152,6 +156,8 @@ fn parse_args() -> Result<Opts, String> {
             "--check" => o.check = true,
             "--list" => o.list = true,
             "--blockers" => o.blockers = true,
+            "--elf" => o.elf = true,
+            "--macho" => o.elf = false,
             "--reference" => o.reference = Some(args.next().ok_or("--reference needs the t27c binary")?),
             "--reference-cache" => o.reference_cache = Some(args.next().ok_or("--reference-cache needs a path")?),
             "--reference-timeout-ms" => {
@@ -465,28 +471,15 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let Some(out) = o.out.clone() else {
         return usage("build needs -o <out.o>");
     };
-    let code = ph.time("codegen", || codegen::compile(prog, TrapStyle::Brk, false));
+    let code = ph.time("codegen", || codegen::compile(prog, if o.elf { TrapStyle::Elf } else { TrapStyle::Brk }, false));
     let code = match code {
         Ok(c) => c,
         Err(e) => return codegen_error(&e),
     };
-    // A function taking or returning a struct or a str, or with stack
-    // parameters, uses t27b's own convention (an aggregate is passed by
-    // address, a stack parameter is one full word), not the platform's, so
-    // no C caller can link to it. `__t27b_*` helpers are never exported and
-    // need no note.
-    let mut names: Vec<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
-    for &id in &prog.internal_abi {
-        if !names[id as usize].starts_with("__t27b_") {
-            errln!(
-                "t27b: note: `{}` takes or returns a struct or a str, or takes more than 8 parameters of a class, and is not exported",
-                names[id as usize]
-            );
-        }
-        names[id as usize].clear();
-    }
+    let (names, notes) = macho::symbols(prog); // which fns get a symbol: specs/tri/t27b/elf.t27, "the C ABI"
+    notes.iter().for_each(|n| errln!("t27b: note: {}", n));
     let obj = ph.time("emit", || {
-        codegen::link(Vec::new(), None, &code, prog.funcs.len()).map(|l| (macho::object(&l, &names, &prog.data), l.code.len()))
+        codegen::link(Vec::new(), None, &code, prog.funcs.len()).map(|l| (if o.elf { macho::elf_object(&l, &names, &prog.data, &prog.globals) } else { macho::object(&l, &names, &prog.data) }, l.code.len()))
     });
     let (obj, words) = match obj {
         Ok(x) => x,
@@ -760,6 +753,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             json: None,
             runner: o.runner.clone(),
             blockers: o.blockers,
+            elf: false,
             reference: None,
             reference_cache: None,
             reference_timeout_ms: 0,
