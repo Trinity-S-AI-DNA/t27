@@ -204,3 +204,12 @@ fn a_unary_operator_keeps_its_operand_parenthesised() {
     assert!(zig.contains("return -(a + b);"), "{zig}");
     assert!(zig.contains("return !(p and q);"), "{zig}");
 }
+
+/// #8980: a bench budget `then elapsed_time_ns < 100` named a clock no Zig 0.16 test has, and the
+/// undeclared identifier killed the whole file. Like a prose body, it becomes a notice.
+#[test]
+fn a_bench_clock_budget_is_a_notice_not_an_undeclared_name() {
+    let zig = gen_zig("module m;\nconst K : u32 = 3;\ntest t\n    given k = K\n    then k == 3\nbench b\n    given k = K\n    then elapsed_time_ns < 100\n");
+    assert!(!zig.contains("(elapsed_time_ns"), "{zig}");
+    assert!(zig.contains("// bench budget not lowered: elapsed_time_* has no clock here (#8980)"), "{zig}");
+}
