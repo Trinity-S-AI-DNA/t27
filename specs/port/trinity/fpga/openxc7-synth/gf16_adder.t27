@@ -1,0 +1,336 @@
+// Port of fpga/openxc7-synth/gf16_adder.v to the t27 spec language (ticket
+// #8865). The upstream Verilog was transcribed from fpga/vivado/gf16_add.v;
+// line references below point at that file. The module is a combinational
+// adder for the 16-bit GF16 floating format: 1 sign bit, 6 exponent bits
+// (bias 31, 63 = Inf/NaN), 9 mantissa bits.
+//
+// Lowering notes:
+// - The top-level combinational datapath is `on_comb`, which gen-verilog
+//   lowers into the module ports (convention from uart_echo.t27).
+// - Helper functions use flat ifs with early returns (d_oscillator.t27
+//   idiom); gen-verilog inlines them into the generated always block.
+// - The 12-bit opposite-sign subtraction and the 7-bit exponent arithmetic
+//   of the original are reproduced with wrap idioms: `(x + BASE - y) & MASK`
+//   (same technique as the 6-bit wrap in gf16_add_top.t27).
+// - Original lines 165-176 (sticky rounding and rounding carry) are
+//   provably dead: r_bit/s_bit are assigned 0 at lines 121-122, 127-128 and
+//   160-162, so `g_bit && (r_bit || s_bit)` is constant-false and
+//   `rounded < norm` can never fire. They are omitted; behavior is identical.
+// - The alignment `default:` arm (line 103-104) zeroes the shifted smaller
+//   significand for shift amounts above 10; this quirk is preserved.
+//
+// Validated against the 14 golden vectors of gf16_adder_tb.v (upstream
+// inventory) plus extended vectors covering every normalization ladder tier,
+// both exponent clamps, cancellation and the alignment quirk.
+module gf16_adder {
+    // Original line 8: exponent all-ones marks Inf/NaN.
+    pub const EXP_MAX: u32 = 63;
+    // Original lines 60/62: canonical NaN.
+    pub const NAN_WORD: u16 = 0xFE01;
+    // Original lines 64/66: infinities.
+    pub const INF_POS: u16 = 0x7E00;
+    pub const INF_NEG: u16 = 0xFE00;
+
+    pub fn on_comb(a: u16, b: u16) -> u16 {
+        let av: u32 = a as u32;
+        let bv: u32 = b as u32;
+        let a_exp: u32 = exp_of(av);
+        let a_mant: u32 = mant_of(av);
+        let a_sign: u32 = sign_of(av);
+        let b_exp: u32 = exp_of(bv);
+        let b_mant: u32 = mant_of(bv);
+        let b_sign: u32 = sign_of(bv);
+
+        // Lines 59-60: any NaN operand yields the canonical NaN.
+        if (is_nan(av) || is_nan(bv)) {
+            return NAN_WORD;
+        }
+        // Lines 61-62: infinities of opposite sign cancel to NaN.
+        if (is_inf(av) && is_inf(bv) && (a_sign != b_sign)) {
+            return NAN_WORD;
+        }
+        // Lines 63-66: an infinite operand wins.
+        if (is_inf(av)) {
+            if (a_sign == 1) { return INF_NEG; }
+            return INF_POS;
+        }
+        if (is_inf(bv)) {
+            if (b_sign == 1) { return INF_NEG; }
+            return INF_POS;
+        }
+        // Lines 67-71: zero operands pass the other side through.
+        if (is_zero(av) && is_zero(bv)) { return 0; }
+        if (is_zero(av)) { return b; }
+        if (is_zero(bv)) { return a; }
+
+        // Line 78: bigger operand by exponent, then mantissa (tie -> a).
+        let a_larger: bool = (a_exp > b_exp) || ((a_exp == b_exp) && (a_mant >= b_mant));
+        var big_exp: u32 = 0;
+        var small_exp: u32 = 0;
+        var big_fm: u32 = 0;
+        var small_fm: u32 = 0;
+        var result_sign: u32 = 0;
+        if (a_larger) {
+            big_exp = a_exp;
+            small_exp = b_exp;
+            big_fm = 0x200 | a_mant;
+            small_fm = 0x200 | b_mant;
+            result_sign = a_sign;
+        } else {
+            big_exp = b_exp;
+            small_exp = a_exp;
+            big_fm = 0x200 | b_mant;
+            small_fm = 0x200 | a_mant;
+            result_sign = b_sign;
+        }
+
+        // Lines 80-88: 7-bit alignment shift; big_exp >= small_exp holds.
+        let shift: u32 = big_exp - small_exp;
+
+        // Lines 90-104: align the smaller significand. Shifts above 10 hit
+        // the original's default arm, which zeroes small_fm.
+        var small_shifted: u32 = 0;
+        if (shift <= 10) {
+            small_shifted = small_fm >> shift;
+        }
+
+        // Lines 106-128: 12-bit significand sum. The opposite-sign
+        // subtraction wraps at 12 bits in the original reg, hence the
+        // +0x1000 wrap idiom before masking.
+        var sum_m: u32 = 0;
+        if (a_sign == b_sign) {
+            sum_m = (big_fm + small_shifted) & 0xFFF;
+        } else {
+            sum_m = (big_fm + 0x1000 - small_shifted) & 0xFFF;
+            if (sum_m == 0) {
+                // Lines 112-114: exact cancellation -> zero.
+                return 0;
+            }
+        }
+
+        // Lines 126-163: normalization. The sum_m[11] and sum_m[10] branches
+        // of the original are identical, so they collapse onto one test.
+        var result_exp: u32 = big_exp;
+        var norm: u32 = 0;
+        var g_bit: u32 = 0;
+        if ((sum_m & 0xC00) != 0) {
+            // Lines 117-128: carry-out bit -> right shift, exponent +1.
+            result_exp = (result_exp + 1) & 0x7F;
+            norm = (sum_m >> 1) & 0x3FF;
+            g_bit = sum_m & 1;
+        } else {
+            // Lines 130-159: normalization ladder, one tier per msb of
+            // sum_m[9:0]; the exponent drops by (9 - msb). The 7-bit
+            // exponent reg wraps, hence the +128 idiom.
+            let msb: u32 = low_msb(sum_m);
+            norm = norm_down(sum_m);
+            result_exp = (result_exp + 128 - (9 - msb)) & 0x7F;
+        }
+        // Original lines 121-122, 127-128, 160-162 hardwire r_bit/s_bit to
+        // zero, so the sticky rounding at lines 165-168 and the carry
+        // correction at lines 170-176 are dead code (see header note).
+
+        // Lines 178-190: clamp and pack.
+        let final_exp: u32 = result_exp;
+        let final_mant: u32 = norm & 0x1FF;
+        if ((final_exp & 0x40) != 0) {
+            // Lines 179-181: exponent left the 6-bit range -> signed zero.
+            if (result_sign == 1) { return 0x8000; }
+            return 0;
+        }
+        if ((final_exp & 0x3F) >= EXP_MAX) {
+            // Lines 182-184: overflow to infinity.
+            if (result_sign == 1) { return INF_NEG; }
+            return INF_POS;
+        }
+        let fr: u32 = (result_sign << 15) | (final_exp << 9) | final_mant;
+        return fr as u16;
+    }
+
+    // Original lines 32-34: exponent field [14:9].
+    fn exp_of(w: u32) -> u32 {
+        return (w >> 9) & 0x3F;
+    }
+
+    // Original line 32: mantissa field [8:0].
+    fn mant_of(w: u32) -> u32 {
+        return w & 0x1FF;
+    }
+
+    // Original line 32: sign bit [15].
+    fn sign_of(w: u32) -> u32 {
+        return (w >> 15) & 1;
+    }
+
+    // Original lines 35/41: exponent all-ones.
+    fn is_special(w: u32) -> bool {
+        return exp_of(w) == EXP_MAX;
+    }
+
+    // Original lines 36/44: special with zero mantissa.
+    fn is_inf(w: u32) -> bool {
+        return is_special(w) && (mant_of(w) == 0);
+    }
+
+    // Original lines 37/43: special with nonzero mantissa.
+    fn is_nan(w: u32) -> bool {
+        return is_special(w) && (mant_of(w) != 0);
+    }
+
+    // Original lines 38-39/42: zero word.
+    fn is_zero(w: u32) -> bool {
+        return (exp_of(w) == 0) && (mant_of(w) == 0);
+    }
+
+    // Normalization ladder (original lines 130-159): position of the most
+    // significant set bit of sum_m restricted to bits [9:0]. Callers
+    // guarantee sum_m != 0, so bit 0 is the fallback tier.
+    fn low_msb(sum_m: u32) -> u32 {
+        if ((sum_m & 0x200) != 0) { return 9; }
+        if ((sum_m & 0x100) != 0) { return 8; }
+        if ((sum_m & 0x080) != 0) { return 7; }
+        if ((sum_m & 0x040) != 0) { return 6; }
+        if ((sum_m & 0x020) != 0) { return 5; }
+        if ((sum_m & 0x010) != 0) { return 4; }
+        if ((sum_m & 0x008) != 0) { return 3; }
+        if ((sum_m & 0x004) != 0) { return 2; }
+        if ((sum_m & 0x002) != 0) { return 1; }
+        return 0;
+    }
+
+    // Normalization ladder (original lines 130-159): left-align the value so
+    // its msb sits at bit 9, i.e. take sum_m[msb:0] and shift up by 9 - msb.
+    fn norm_down(sum_m: u32) -> u32 {
+        let msb: u32 = low_msb(sum_m);
+        let mask: u32 = (2 << msb) - 1;
+        return (sum_m & mask) << (9 - msb);
+    }
+
+    // Golden vectors 1-3 of gf16_adder_tb.v (exact-word NaN/Inf rules).
+    test golden_specials {
+        let got = on_comb(0xFE01, 0x3E00);
+        assert(got == 0xFE01);
+        let got2 = on_comb(0x7E00, 0x3E00);
+        assert(got2 == 0x7E00);
+        let got3 = on_comb(0x7E00, 0xFE00);
+        assert(got3 == 0xFE01);
+    }
+
+    // Golden vectors 4-14 of gf16_adder_tb.v (arithmetic cases).
+    test golden_arithmetic {
+        let got = on_comb(0x3E00, 0x3E00);
+        assert(got == 0x4000);
+        let got2 = on_comb(0x3E00, 0x0000);
+        assert(got2 == 0x3E00);
+        let got3 = on_comb(0x0000, 0x3E00);
+        assert(got3 == 0x3E00);
+        let got4 = on_comb(0x3E00, 0x4000);
+        assert(got4 == 0x4100);
+        let got5 = on_comb(0x4100, 0xBE00);
+        assert(got5 == 0x4000);
+        let got6 = on_comb(0x3E00, 0xBE00);
+        assert(got6 == 0x0000);
+        let got7 = on_comb(0xBE00, 0x4000);
+        assert(got7 == 0x3E00);
+        let got8 = on_comb(0x3C00, 0x3C00);
+        assert(got8 == 0x3E00);
+        let got9 = on_comb(0x3C00, 0x3A00);
+        assert(got9 == 0x3D00);
+        let got10 = on_comb(0x3F00, 0x3F00);
+        assert(got10 == 0x4100);
+        let got11 = on_comb(0x4B20, 0x4D20);
+        assert(got11 == 0x4E58);
+    }
+
+    // Extended special-case rules beyond the testbench: NaN in either
+    // operand, Inf dominance in all sign combinations, zero passthrough.
+    test special_matrix {
+        let got = on_comb(0x4100, 0xFFFF);
+        assert(got == 0xFE01);
+        let got2 = on_comb(0xFE00, 0x4100);
+        assert(got2 == 0xFE00);
+        let got3 = on_comb(0x4100, 0xFE00);
+        assert(got3 == 0xFE00);
+        let got4 = on_comb(0xFE00, 0xFE00);
+        assert(got4 == 0xFE00);
+        let got5 = on_comb(0x0000, 0x0000);
+        assert(got5 == 0x0000);
+        let got6 = on_comb(0x0000, 0x8200);
+        assert(got6 == 0x8200);
+        let got7 = on_comb(0x8200, 0x0000);
+        assert(got7 == 0x8200);
+    }
+
+    // Normalization ladder coverage: one vector per tier (msb 0..8 via
+    // opposite-sign mantissa differences at equal exponents, tier 9 via the
+    // same-sign path where the aligned-away smaller operand leaves bit 9).
+    test ladder_tiers {
+        let got = on_comb(0x2801, 0xA800);
+        assert(got == 0x1600);
+        let got2 = on_comb(0x2802, 0xA800);
+        assert(got2 == 0x1800);
+        let got3 = on_comb(0x2804, 0xA800);
+        assert(got3 == 0x1A00);
+        let got4 = on_comb(0x2808, 0xA800);
+        assert(got4 == 0x1C00);
+        let got5 = on_comb(0x2810, 0xA800);
+        assert(got5 == 0x1E00);
+        let got6 = on_comb(0x2820, 0xA800);
+        assert(got6 == 0x2000);
+        let got7 = on_comb(0x2840, 0xA800);
+        assert(got7 == 0x2200);
+        let got8 = on_comb(0x2880, 0xA800);
+        assert(got8 == 0x2400);
+        let got9 = on_comb(0x2900, 0xA800);
+        assert(got9 == 0x2600);
+        let got10 = on_comb(0x5000, 0x0200);
+        assert(got10 == 0x5000);
+        let got11 = on_comb(0x0200, 0x5000);
+        assert(got11 == 0x5000);
+        let got12 = on_comb(0xA801, 0x2800);
+        assert(got12 == 0x9600);
+    }
+
+    // Exponent clamps and quirky paths: 7-bit exponent wrap -> signed zero,
+    // 6-bit saturation -> infinity, g-bit set with dead sticky rounding,
+    // mantissa-tie cancellation, alignment default zeroing, subnormal-range
+    // words treated as normal numbers.
+    test clamps_and_quirks {
+        let got = on_comb(0x0101, 0x8100);
+        assert(got == 0x0000);
+        let got2 = on_comb(0x8101, 0x0100);
+        assert(got2 == 0x8000);
+        let got3 = on_comb(0x7C00, 0x7C00);
+        assert(got3 == 0x7E00);
+        let got4 = on_comb(0xFC00, 0xFC00);
+        assert(got4 == 0xFE00);
+        let got5 = on_comb(0x3E00, 0x3E01);
+        assert(got5 == 0x4000);
+        let got6 = on_comb(0x4100, 0xC100);
+        assert(got6 == 0x0000);
+        let got7 = on_comb(0x4100, 0x0201);
+        assert(got7 == 0x4100);
+        let got8 = on_comb(0x0001, 0x0001);
+        assert(got8 == 0x0201);
+        let got9 = on_comb(0x4000, 0x4000);
+        assert(got9 == 0x4200);
+    }
+
+    // Direct assertions on the decision helpers.
+    test helper_decisions {
+        assert(is_nan(0xFE01) == true);
+        assert(is_nan(0x7E00) == false);
+        assert(is_nan(0x4100) == false);
+        assert(is_inf(0x7E00) == true);
+        assert(is_inf(0xFFFF) == false);
+        assert(is_zero(0x0000) == true);
+        assert(is_zero(0x0001) == false);
+        assert(low_msb(0x001) == 0);
+        assert(low_msb(0x002) == 1);
+        assert(low_msb(0x080) == 7);
+        assert(low_msb(0x200) == 9);
+        assert(norm_down(0x001) == 0x200);
+        assert(norm_down(0x080) == 0x200);
+        assert(norm_down(0x201) == 0x201);
+    }
+}
