@@ -2712,6 +2712,9 @@ the parser used to read it as `{}` followed by a negation",
                 self.advance();
 
                 let mut value_str = String::new();
+                let mut payload_type = String::new();
+                
+                // Handle explicit values like Gap = 5
                 if self.current.kind == TokenKind::Equals {
                     self.advance(); // consume =
                                     // [BUG 10] Handle negative enum values
@@ -2727,10 +2730,25 @@ the parser used to read it as `{}` followed by a negation",
                         self.advance();
                     }
                 }
+                // Handle payload variants like Gap(u32)
+                else if self.current.kind == TokenKind::LParen {
+                    self.advance(); // consume (
+                    // Parse the payload type
+                    if self.current.kind == TokenKind::Ident {
+                        payload_type.push_str(&self.current.lexeme);
+                        self.advance();
+                    }
+                    // Expect closing parenthesis
+                    if self.current.kind != TokenKind::RParen {
+                        return Err(format!("Expected ')' after payload type in enum variant '{}'", name));
+                    }
+                    self.advance(); // consume )
+                }
 
                 let mut variant = Node::new(NodeKind::EnumVariant);
                 variant.name = name;
                 variant.value = value_str;
+                variant.extra_type = payload_type;
                 decl.children.push(variant);
 
                 if self.current.kind == TokenKind::Comma {
@@ -27232,19 +27250,47 @@ impl RustCodegen {
         );
         self.write_line(&format!("pub enum {} {{", node.name));
         self.indent += 1;
-        for child in &node.children {
+        let mut i = 0;
+        while i < node.children.len() {
+            let child = &node.children[i];
             if child.kind == NodeKind::EnumVariant {
-                // The Zig emitter escapes variant names and says why, one comment above
-                // its own call to `zig_ident`. The rule did not travel here, so a variant
-                // named with a Rust keyword reached rustc bare: `enum = 12,` and
-                // `continue = 5,` are what two corpus specs produced.
+                // Check if this variant has a payload in extra_type (parser fix)
                 let variant_name = rust_ident(&child.name);
-                if child.value.is_empty() {
-                    self.write_line(&format!("{},", variant_name));
+                
+                if !child.extra_type.is_empty() {
+                    // Variant has a payload type (parser correctly handled payload)
+                    self.write_line(&format!("{}({}),", variant_name, child.extra_type));
+                } else if i + 1 < node.children.len() {
+                    let next_child = &node.children[i + 1];
+                    if next_child.kind == NodeKind::EnumVariant 
+                        && next_child.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        // Try to detect payload pattern: Variant followed by type identifier
+                        // This handles the case where parser incorrectly splits Gap(u32) into Gap and u32
+                        let payload_type = rust_ident(&next_child.name);
+                        if payload_type.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            // Combine into a single variant with payload
+                            self.write_line(&format!("{}({}),", variant_name, payload_type));
+                            i += 2; // Skip both the variant and the payload type
+                            continue;
+                        }
+                    }
+                    
+                    // Regular variant without payload
+                    if child.value.is_empty() {
+                        self.write_line(&format!("{},", variant_name));
+                    } else {
+                        self.write_line(&format!("{} = {},", variant_name, child.value));
+                    }
                 } else {
-                    self.write_line(&format!("{} = {},", variant_name, child.value));
+                    // Last variant, no next child
+                    if child.value.is_empty() {
+                        self.write_line(&format!("{},", variant_name));
+                    } else {
+                        self.write_line(&format!("{} = {},", variant_name, child.value));
+                    }
                 }
             }
+            i += 1;
         }
         self.indent -= 1;
         self.write_line("}");
