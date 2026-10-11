@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: MIT
+//
+// Port of gHashTag/trinity fpga/openxc7-synth/gf16_mac_16_top.v into a T27
+// specification. The original Verilog source is quoted in gHashTag/t27#9185
+// (from gHashTag/trinity commit 5aabfbe8346f; the .v file itself is not in
+// this checkout).
+//
+// The original is a 16-lane GF16 dot product MAC: y = sum_i w[i] * x[i] with
+// saturation to +/-65504, a parameterized pipeline (LATENCY, default 2), a
+// 16-element multiplier array and a 4-level signed adder tree. GF16 lanes are
+// 1:5:10 (sign:exponent:mantissa) with exponent bias 15.
+//
+// Ported decisions (pure functions below):
+//   - lane decode: sign[15], exp[14:10], mant[9:0]
+//   - zero detection: exp == 0 and mant == 0 (sign ignored)
+//   - multiplier array element: implicit-1 9-bit mantissa {1'b1, lane[9:1]}
+//     (mantissa LSB dropped), 9x9 -> 18-bit product, sign = w_sign ^ x_sign,
+//     zero lanes force a zero product (mul_zero replacement)
+//   - adder tree: 16 products reduced over 4 levels with signed widening
+//     19 -> 20 -> 21 -> 22 -> 23 bits (all levels fit in i32)
+//   - normalize (simplified in the original, not ported as plumbing): sign
+//     check on acc_sum[22], clamp to +/-65504, pack {sign, exp = 31,
+//     acc_sum[8:0]} with the low 9 accumulator bits as mantissa
+//
+// Hardware I/O (clk, rst_n, valid, w[255:0], x[255:0] in; ready, y[15:0],
+// overflow out) and the pipeline registers are plumbing, not decisions: they
+// appear only as `return undefined;` bodies and are never called by tests.
+
+module gf16_mac_16_top {
+
+    // ---- constants: GF16 format and original parameters ----
+
+    pub const GF16_WIDTH : u32 = 16;      // bits per lane
+    pub const GF16_EXP_BITS : u32 = 5;    // exponent field [14:10]
+    pub const GF16_MANT_BITS : u32 = 10;  // mantissa field [9:0]
+    pub const GF16_EXP_BIAS : u32 = 15;   // exponent bias
+    pub const GF16_LANES : u32 = 16;      // w[255:0], x[255:0]
+
+    pub const PROD_WIDTH : u32 = 19;      // signed product width after stage 2
+    pub const ACC_WIDTH : u32 = 23;       // accumulator width after tree level 4
+
+    pub const LATENCY : u32 = 2;          // parameter LATENCY = 2 (default)
+
+    pub const SAT_LIMIT : i32 = 65504;    // positive saturation threshold
+    pub const SAT_LIMIT_NEG : i32 = -65504;  // negative saturation threshold
+    pub const GF16_MAX : u16 = 0x7BFF;    // packed +65504
+    pub const GF16_MIN : u16 = 0xFBFF;    // packed -65504
+
+    pub const PACK_EXP : u32 = 31;        // exponent field value when packing
+    pub const PACK_LOW_BITS : u32 = 9;    // acc_sum[8:0] stored in mantissa field
+
+    // ---- data structures: decode, multiplier output, packed result ----
+
+    pub struct Gf16Lane {
+        sign : bool,
+        exp : u8,
+        mant : u16,
+    }
+
+    pub struct LaneProduct {
+        value : i32,  // two's complement 18-bit mantissa product
+        zero : bool,  // either operand lane was zero
+    }
+
+    pub struct Gf16Vector {
+        l : [16]u16,  // 16 GF16 lanes; lane i is l[i]
+    }
+
+    pub struct MacResult {
+        y : u16,        // packed GF16 output word
+        overflow : bool,
+    }
+
+    pub const Saturate = enum(i8) {
+        pass = 0,
+        clamp_high = 1,
+        clamp_low = 2,
+    }
+
+    // ---- lane decode (pipeline stage 1 decision) ----
+
+    fn lane_sign(lane: u16) -> bool {
+        return (lane & 0x8000) != 0;
+    }
+
+    fn lane_exp(lane: u16) -> u8 {
+        return ((lane >> 10) & 0x1F) as u8;
+    }
+
+    fn lane_mant(lane: u16) -> u16 {
+        return lane & 0x03FF;
+    }
+
+    fn lane_is_zero(lane: u16) -> bool {
+        // zero = exp == 0 and mant == 0; the sign bit is ignored
+        return (lane & 0x7FFF) == 0;
+    }
+
+    fn decode_lane(lane: u16) -> Gf16Lane {
+        return Gf16Lane{ .sign = lane_sign(lane), .exp = lane_exp(lane), .mant = lane_mant(lane) };
+    }
+
+    // ---- multiplier array (pipeline stage 2 decision) ----
+
+    fn mul_mant9(lane: u16) -> u16 {
+        // {1'b1, lane[9:1]}: implicit leading 1 at bit 8, mantissa LSB dropped
+        return 256 | ((lane >> 1) & 0xFF);
+    }
+
+    fn mul_lanes(w: u16, x: u16) -> LaneProduct {
+        if (lane_is_zero(w) || lane_is_zero(x)) {
+            return LaneProduct{ .value = 0, .zero = true };
+        }
+        var prod : u32 = (mul_mant9(w) as u32) * (mul_mant9(x) as u32);  // 9x9 -> 18 bits
+        if (lane_sign(w) ^ lane_sign(x)) {
+            // prod_signed = ~prod + 1 in the original; 0 - prod here
+            return LaneProduct{ .value = 0 - (prod as i32), .zero = false };
+        }
+        return LaneProduct{ .value = prod as i32, .zero = false };
+    }
+
+    fn prod_or_zero(p: LaneProduct) -> i32 {
+        // mul_zero replacement: a zero lane contributes exactly 0 to the tree
+        if (p.zero) {
+            return 0;
+        }
+        return p.value;
+    }
+
+    // ---- adder tree (pipeline stage 3: 16 -> 8 -> 4 -> 2 -> 1) ----
+
+    fn dot16(w: Gf16Vector, x: Gf16Vector) -> i32 {
+        // level 1: 8 pair sums (20-bit signed)
+        var l1_0 : i32 = prod_or_zero(mul_lanes(w.l[0], x.l[0])) + prod_or_zero(mul_lanes(w.l[1], x.l[1]));
+        var l1_1 : i32 = prod_or_zero(mul_lanes(w.l[2], x.l[2])) + prod_or_zero(mul_lanes(w.l[3], x.l[3]));
+        var l1_2 : i32 = prod_or_zero(mul_lanes(w.l[4], x.l[4])) + prod_or_zero(mul_lanes(w.l[5], x.l[5]));
+        var l1_3 : i32 = prod_or_zero(mul_lanes(w.l[6], x.l[6])) + prod_or_zero(mul_lanes(w.l[7], x.l[7]));
+        var l1_4 : i32 = prod_or_zero(mul_lanes(w.l[8], x.l[8])) + prod_or_zero(mul_lanes(w.l[9], x.l[9]));
+        var l1_5 : i32 = prod_or_zero(mul_lanes(w.l[10], x.l[10])) + prod_or_zero(mul_lanes(w.l[11], x.l[11]));
+        var l1_6 : i32 = prod_or_zero(mul_lanes(w.l[12], x.l[12])) + prod_or_zero(mul_lanes(w.l[13], x.l[13]));
+        var l1_7 : i32 = prod_or_zero(mul_lanes(w.l[14], x.l[14])) + prod_or_zero(mul_lanes(w.l[15], x.l[15]));
+        // level 2: 4 sums (21-bit signed)
+        var l2_0 : i32 = l1_0 + l1_1;
+        var l2_1 : i32 = l1_2 + l1_3;
+        var l2_2 : i32 = l1_4 + l1_5;
+        var l2_3 : i32 = l1_6 + l1_7;
+        // level 3: 2 sums (22-bit signed)
+        var l3_0 : i32 = l2_0 + l2_1;
+        var l3_1 : i32 = l2_2 + l2_3;
+        // level 4: final accumulator (23-bit signed)
+        return l3_0 + l3_1;
+    }
+
+    // ---- normalize and saturation (pipeline stage 4 decision) ----
+
+    fn acc_low9(acc: i32) -> u16 {
+        // acc_sum[8:0]: low 9 bits of the two's complement accumulator.
+        // Mask in signed arithmetic; the result is always in 0..511, so the
+        // i32 -> u16 conversion can never see a negative value.
+        return (acc & 0x1FF) as u16;
+    }
+
+    fn pack_gf16(negative: bool, low9: u16) -> u16 {
+        // {sign, exp = 31, acc_sum[8:0]}
+        var v : u32 = (PACK_EXP << PACK_LOW_BITS) | (low9 as u32);
+        if (negative) {
+            v = v | 0x8000;
+        }
+        return v as u16;
+    }
+
+    fn saturate_verdict(acc: i32) -> Saturate {
+        if (acc < 0) {
+            if (acc < SAT_LIMIT_NEG) {
+                return Saturate.clamp_low;
+            }
+            return Saturate.pass;
+        }
+        if (acc >= SAT_LIMIT) {
+            return Saturate.clamp_high;
+        }
+        return Saturate.pass;
+    }
+
+    fn normalize_gf16(acc: i32) -> MacResult {
+        var verdict : Saturate = saturate_verdict(acc);
+        if (verdict == Saturate.clamp_low) {
+            return MacResult{ .y = GF16_MIN, .overflow = true };
+        }
+        if (verdict == Saturate.clamp_high) {
+            return MacResult{ .y = GF16_MAX, .overflow = true };
+        }
+        if (acc < 0) {
+            return MacResult{ .y = pack_gf16(true, acc_low9(acc)), .overflow = false };
+        }
+        return MacResult{ .y = pack_gf16(false, acc_low9(acc)), .overflow = false };
+    }
+
+    // ---- full datapath decision (what the LATENCY-stage pipeline computes) ----
+
+    pub fn compute_y(w: Gf16Vector, x: Gf16Vector) -> MacResult {
+        return normalize_gf16(dot16(w, x));
+    }
+
+    // ---- hardware interface (I/O only: undefined bodies, never called by tests) ----
+    // Original ports: clk, rst_n, valid, w[255:0], x[255:0] -> ready, y[15:0], overflow
+
+    fn hw_clk() -> bool {
+        return undefined;
+    }
+
+    fn hw_rst_n() -> bool {
+        return undefined;
+    }
+
+    fn hw_valid() -> bool {
+        return undefined;
+    }
+
+    fn hw_w() -> Gf16Vector {
+        return undefined;
+    }
+
+    fn hw_x() -> Gf16Vector {
+        return undefined;
+    }
+
+    fn hw_ready() -> bool {
+        return undefined;
+    }
+
+    fn hw_y() -> u16 {
+        return undefined;
+    }
+
+    fn hw_overflow() -> bool {
+        return undefined;
+    }
+
+    // ---- test helper: build a 16-lane vector from scalar lanes ----
+
+    fn vec16(l0: u16, l1: u16, l2: u16, l3: u16, l4: u16, l5: u16, l6: u16, l7: u16, l8: u16, l9: u16, l10: u16, l11: u16, l12: u16, l13: u16, l14: u16, l15: u16) -> Gf16Vector {
+        return Gf16Vector{
+            .l = [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15],
+        };
+    }
+
+    // ---- tests: hand-computed expectations from the original logic ----
+    // 0x3C00 encodes +1.0 (sign 0, exp field 0b01111 = 15 = bias, mant 0);
+    // 0xBC00 encodes -1.0.
+    // 0x0002 has exp 0, mant 2 -> 9-bit mantissa 257; 0x0004 -> mantissa 258.
+
+    test decode_1p0_lane
+        assert((decode_lane(0x3C00).sign == false) and (decode_lane(0x3C00).exp == 15) and (decode_lane(0x3C00).mant == 0))
+
+    test decode_negative_lane
+        assert((decode_lane(0xBC00).sign == true) and (decode_lane(0xBC00).exp == 15) and (decode_lane(0xFFFF).mant == 1023))
+
+    test zero_detection_ignores_sign
+        assert((lane_is_zero(0x0000) == true) and (lane_is_zero(0x8000) == true) and (lane_is_zero(0x3C00) == false))
+
+    test mantissa_implicit_one_and_lsb_drop
+        assert((mul_mant9(0x3C00) == 256) and (mul_mant9(0x0002) == 257) and (mul_mant9(0x0001) == 256))
+
+    test multiplier_products
+        assert((mul_lanes(0x3C00, 0x3C00).value == 65536) and (mul_lanes(0xBC00, 0x3C00).value == (0 - 65536)) and (mul_lanes(0x0001, 0x0003).value == 65792))
+
+    test multiplier_forces_zero_product
+        assert((mul_lanes(0x0000, 0x3C00).zero == true) and (mul_lanes(0x0000, 0x3C00).value == 0) and (mul_lanes(0x8000, 0x3C00).zero == true))
+
+    test acc_low9_takes_two_complement_low_bits
+        assert((acc_low9(65536) == 0) and (acc_low9(65792) == 256) and (acc_low9(0 - 256) == 256))
+
+    test pack_sets_exp_31_and_sign
+        assert((pack_gf16(false, 0x100) == 0x3F00) and (pack_gf16(true, 0x020) == 0xBE20))
+
+    test normalize_pass_boundary_below_limit
+        assert((normalize_gf16(65503).y == 0x3FDF) and (normalize_gf16(65503).overflow == false))
+
+    test normalize_pass_boundary_at_negative_limit
+        assert((normalize_gf16(0 - 65504).y == 0xBE20) and (normalize_gf16(0 - 65504).overflow == false))
+
+    test normalize_clamps_high_at_limit
+        assert((normalize_gf16(65504).y == GF16_MAX) and (normalize_gf16(65504).overflow == true))
+
+    test normalize_clamps_low_beyond_limit
+        assert((normalize_gf16(0 - 65505).y == GF16_MIN) and (normalize_gf16(0 - 65505).overflow == true))
+
+    test dot_of_all_zeros_packs_zero
+        assert((compute_y(vec16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == 0x3E00) and (compute_y(vec16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).overflow == false))
+
+    test zero_lane_forces_zero_contribution
+        // without zero detection the 0-lane would still produce 65536 and saturate
+        assert(compute_y(vec16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0x3C00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == 0x3E00)
+
+    test dot_cancels_to_representable_zero
+        // (+1.0 * +1.0) + (-1.0 * +1.0) = 0
+        assert(compute_y(vec16(0x3C00, 0xBC00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0x3C00, 0x3C00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == 0x3E00)
+
+    test dot_positive_residual_passes
+        // (+1.0 * 1.002) + (-1.0 * +1.0) = 65792 - 65536 = +256
+        assert(compute_y(vec16(0x3C00, 0xBC00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0x0002, 0x3C00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == 0x3F00)
+
+    test dot_negative_residual_passes
+        // (1.002 * 1.002) + (1.004 * -1.0) = 65792 - 66048 = -256
+        assert(compute_y(vec16(0x3C00, 0x0004, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0x0002, 0xBC00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == 0xBF00)
+
+    test dot_all_ones_saturates_high
+        // 16 x (1.0 * 1.0) = 1048576 -> clamp to +65504
+        assert((compute_y(vec16(0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00), vec16(0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00)).y == GF16_MAX) and (compute_y(vec16(0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00), vec16(0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00)).overflow == true))
+
+    test dot_two_negatives_saturates_low
+        // (-1.0 * +1.0) + (-1.0 * +1.0) = -131072 -> clamp to -65504
+        assert(compute_y(vec16(0xBC00, 0xBC00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), vec16(0x3C00, 0x3C00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).y == GF16_MIN)
+
+    // The packed result overflows exactly when the normalizer left the pass branch.
+    invariant normalize_overflow_tracks_verdict(acc: i32)
+        assert(normalize_gf16(acc).overflow == ((saturate_verdict(acc) == Saturate.clamp_high) or (saturate_verdict(acc) == Saturate.clamp_low)))
+}
