@@ -10441,6 +10441,12 @@ impl Codegen {
                         "round" => Some("@round"),
                         "min" => Some("@min"),
                         "max" => Some("@max"),
+                        // #8980: `exp(` 56 times, `log(` 28, `tanh(` 21 (Zig has no `@tanh`).
+                        "exp" => Some("@exp"),
+                        "log" => Some("@log"),
+                        "sin" => Some("@sin"),
+                        "cos" => Some("@cos"),
+                        "tanh" => Some("std.math.tanh"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
