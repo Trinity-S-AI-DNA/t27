@@ -232,6 +232,12 @@ The relationship, if any, would need to be shown through:
 
 This derivation pathway is **not established in literature** and requires research.
 
+The two theories give gamma different origins. In CS theory it would come from the quantum dimension
+d_tau = phi, a property of the anyons that emerges from the topological structure. In LQG it is the
+Barbero-Immirzi parameter, a quantization parameter fixed by the area spectrum (the Meissner gap below).
+How d_tau relates to the LQG gamma is unresolved (see Rovelli 2015, the LQG entropy review, and Perez 2017,
+LQG black hole spectroscopy).
+
 ### 5.2 Meissner Gap Comparison
 
 **Meissner (2004)** derived area gap formula for LQG:
@@ -342,7 +348,10 @@ Chern-Simons theories describe:
    - Jones polynomial at 5th root
    - Modular S-matrix computation
 
-2. **`specs/physics/lqg_entropy.t27`** — LQG bridge (research)
+2. **LQG bridge (research)** — section 5 of this note. `specs/physics/lqg_entropy.t27` held only this
+   prose and tests that asserted `true`, so it was deleted on 2026-10-11 (see gHashTag/t27#8766). The
+   quantities it named (phi^-3, d_tau = phi, the Immirzi gamma) are defined and tested in
+   `specs/physics/lqg_cs_bridge.t27`.
    - CS entropy → γ investigation
    - Meissner gap comparison
    - Honest assessment of γ = φ⁻³

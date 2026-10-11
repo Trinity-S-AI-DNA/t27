@@ -145,6 +145,10 @@ mod bench_agent;
 #[path = "../gen/rust/verified/bitstream_reuse.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod bitstream_reuse;
+// specs/verified/clock_constraints.t27 (#8839): the clocks `t27c silicon` places against, and its timing gate.
+#[path = "../gen/rust/verified/clock_constraints.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod clock_constraints;
 mod phi_f64_literals;
 mod weight_bram;
 mod bitnet_pipeline;
@@ -435,9 +439,9 @@ enum Commands {
     },
     /// #7576: `sign RUN.json T27B [--nonce N] [--runner CMD]` prints a signed corpus receipt of a t27b lab run;
     /// `compare BASE HEAD [--challenge N] [--challenge-head N]` checks two, names every changed file and judges the
-    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request.
+    /// pair as a lane (#7672); `admit SHA AGE,INDEX,ON_ORIGIN` judges a lab request; `schedule ROLE MOVED,ADMITTED,COUNT` picks its next step (#9026).
     CorpusReceipt {
-        #[arg(value_parser = ["sign", "compare", "admit"])] action: String,
+        #[arg(value_parser = ["sign", "compare", "admit", "schedule"])] action: String,
         a: String, b: String,
         #[arg(long, alias = "challenge")] nonce: Option<String>,
         #[arg(long)] challenge_head: Option<String>,

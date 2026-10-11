@@ -1,0 +1,789 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/hosting/panel.t27 -- what the trios macOS app shows about lending this Mac to the Queen, and
+; how it derives every value it shows: the agent it installs, the agent's life, what the agent did,
+; and what the public ledger credits it
+; Owner, 2026-10-11 (translated): "we have a Swift app in trios. Add this functionality to it, plus a
+; widget that shows which of the user's resources we use and what we pay him for that. And run it
+; locally!" Then: "write it in .t27 right away, build the bridge in .t27 right away".
+; --
+; THE BRIDGE. t27c has no Swift generator. The app runs `t27c gen-c` on this spec in its build (a
+; Make step), compiles the C into a static library and imports it into Swift as a Clang module. Swift
+; keeps the views, the child process, the HTTP reads and the calls into this card, and nothing else:
+; every rule below is a function or a constant here, never a line of Swift.
+; --
+; WHAT THE APP READS, and from where. Nothing here is computed from anything else:
+;   the agent's stdout     `trios-host join` (gHashTag/trios tools/trios-host, release AGENT_TAG). Its
+;                          lines are the agent's own log (hosting-agent.ts): "registered <host>
+;                          incarnation <n> tier <word> slots <n> isolation <word>", "receipt <lease>:
+;                          <code>, job <verdict>", "tick: <error>", "work: <error>", each after an
+;                          ISO-8601 instant; and before them "read key <id>" or "made key <id>";
+;   GET /hosting/ledger    the public ledger: one row per host (tier, balance_mtri, strikes, slashes,
+;                          agreed, probation, suspended) and one row per credit (host, kind, fee_kind,
+;                          mtri, epoch);
+;   GET /hosting/ledger/epochs   the signed epoch statements;
+;   `trios-host statement` this host's leaves of one epoch checked against its signed root
+;                          (statement.t27 section 4); exit 0 only when every leaf checks;
+;   proc_pid_rusage        the agent's CPU time and its finished jobs' (the jobs are its children).
+; --
+; WHAT trios-host 0.1.1 DOES NOT PRINT. A beat is silent: the agent beats every NODE_HEARTBEAT_SECONDS
+; and prints only when the Queen refuses it (it registers again: a new "registered" line) or when it
+; cannot reach the Queen for SELF_FENCE_SECONDS (a "tick:" line from the failed registration). So the
+; panel shows the beat period and the time since the last confirmation it saw, and calls a host
+; BEATING only after one quiet beat period with nothing failed. A request that hangs prints nothing,
+; and the panel cannot tell it from a quiet beat; an agent that prints its beats removes that gap.
+; The job running now is not printed either: the panel reads it from the agent's child processes, a
+; job being one `t27c test-report` or `t27b corpus` run in the job's directory (NAMES_SPEC_SUFFIX).
+; --
+; MONEY WORDS. The credit is test credit for verified work: off-chain mTRI, not transferable, with
+; settlement shut (statement.t27, credit.t27). The panel never calls it money, a dividend or income;
+; its one sentence about it is DISCLAIMER, and disclaimer_true() refuses to show that sentence over a
+; ledger that says otherwise.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module HostingPanel;
+
+use hosting::toolchain::SHA256_HEX_LEN;
+use hosting::toolchain::pin_well_formed;
+use hosting::toolchain::url_allowed;
+use hosting::toolchain::starts_with;
+use hosting::toolchain::ends_with;
+use hosting::toolchain::AGENT_DIR;
+use hosting::toolchain::KEY_FILE;
+use hosting::toolchain::GROUP_OTHER_BITS;
+use hosting::host::TIER_OWNER;
+use hosting::host::TIER_PUBLIC;
+use hosting::host::TIERS;
+use hosting::host::ISO_NONE;
+use hosting::host::ISO_JOBDIR;
+use hosting::host::ISO_LEVELS;
+use hosting::host::SLOTS_MAX_OWNER;
+use hosting::host::slots_admitted;
+use hosting::host::download_kept;
+use queen::netlink::NODE_HEARTBEAT_SECONDS;
+use queen::netlink::SELF_FENCE_SECONDS;
+use hosting::proof::RC_OK;
+use hosting::proof::RC_OUTPUT_MISMATCH;
+use hosting::proof::JV_PENDING;
+use hosting::proof::JV_AGREED;
+use hosting::proof::JV_TIEBREAK;
+use hosting::proof::JV_UNRESOLVED;
+use hosting::statement::KIND_WORDS;
+use hosting::statement::epoch_of;
+use verified::payout::EXECUTOR_FEE;
+use verified::payout::PROVIDER_FEE;
+use verified::payout::VERIFIER_FEE;
+use verified::payout::CREDIT_TRANSFERABLE;
+
+; --- 1. The agent the app installs, and where it may reach ---------------------------------------------
+; The app downloads trios-host from the release AGENT_URL and keeps the file only when its SHA-256 and
+; its size are these (host.t27 download_kept). The digest is the release's own (its SHA256SUMS asset).
+; toolchain.t27 TRIOS_HOST_* records release 0.1.0, which the agent never reads; 0.1.1 carries the same
+; toolchain pins (its release notes) and adds `statement`, which the panel runs. A new agent is a new
+; pin here, reviewed and sealed like any rule.
+
+pub const AGENT_TAG : str = "trios-host-v0.1.1";
+pub const AGENT_PLATFORM : str = "darwin-arm64";
+pub const AGENT_URL : str = "https://github.com/gHashTag/trios/releases/download/trios-host-v0.1.1/trios-host-darwin-arm64";
+pub const AGENT_SHA256 : str = "63dc58878b09e2af955176333412240e378b799eeafe65a7a5130e11df65cee7";
+pub const AGENT_BYTES : u64 = 61118752;
+
+/// The production Queen, and the Ed25519 key its epoch statements are signed with (the release notes
+/// of AGENT_TAG). A statement is checked against this key, never against the key a response names.
+pub const QUEEN_URL : str = "https://api.t27.ai";
+pub const QUEEN_KEY : str = "1d90f33e31d90296f6f05652b0e78e6d4c39d533dae62c91ba68b14d5d0a25e1";
+/// The Queen's two reads the panel makes itself, after QUEEN_URL. The proof of a leaf is read by the
+/// agent (`trios-host statement`), which checks it.
+pub const LEDGER_PATH : str = "/hosting/ledger";
+pub const EPOCHS_PATH : str = "/hosting/ledger/epochs";
+
+/// Whether two words are the same bytes: the same length, and one starts with the other. (corpus_receipt
+/// text_is is the same test. It is not imported: its module's own imports would bring more specs into
+/// the app's vendored closure than this card holds.)
+pub fn same_word(a: string, b: string) -> bool {
+    if (a.len != b.len) { return false; }
+    return starts_with(a, b);
+}
+
+/// The length of a word.
+pub fn word_len(word: string) -> u32 {
+    return word.len as u32;
+}
+
+/// Whether a downloaded agent is kept: its digest is the pin, written as 64 lowercase hex digits, and
+/// its size is the pinned size.
+pub fn agent_kept(digest: string, bytes: u64) -> bool {
+    var n : u32 = digest.len as u32;
+    var digest_ok : bool = n == SHA256_HEX_LEN and pin_well_formed(digest) and same_word(digest, AGENT_SHA256);
+    return download_kept(digest_ok, bytes == AGENT_BYTES);
+}
+
+/// Whether the key file's mode keeps it the owner's alone (toolchain.t27 KEY_FILE_MODE): no bit for
+/// the group or anyone else. The app reads the mode, never the file; the agent made it, in its home
+/// (TRIOS_HOST_HOME, else AGENT_DIR under the user's home), named KEY_FILE.
+pub fn key_file_private(mode: u32) -> bool {
+    return (mode & GROUP_OTHER_BITS) == 0;
+}
+
+/// The only addresses the app itself fetches: the agent's release asset, and the Queen's reads. The
+/// agent, once it runs, fetches its own pinned toolchain (toolchain.t27); that is its rule, not this.
+pub fn fetch_allowed(url: string) -> bool {
+    if (url_allowed(url) == false) { return false; }
+    if (same_word(url, AGENT_URL)) { return true; }
+    if (starts_with(url, QUEEN_URL) == false) { return false; }
+    var n : u32 = url.len as u32;
+    var q : u32 = word_len(QUEEN_URL);
+    if (n == q) { return true; }
+    return url[q] == 47;
+}
+
+; --- 2. The agent's life ----------------------------------------------------------------------------
+; One state per moment of the child process, moved only by the events below. The toggle is the user's;
+; the lines are the agent's; the quiet clock is the time since the last line that confirmed the agent
+; (a registration or a receipt).
+
+pub const ST_OFF : u8 = 0;
+pub const ST_STARTING : u8 = 1;
+pub const ST_REGISTERED : u8 = 2;
+pub const ST_BEATING : u8 = 3;
+pub const ST_LAPSED : u8 = 4;
+pub const ST_STOPPING : u8 = 5;
+pub const ST_EXITED : u8 = 6;
+pub const STATES : u8 = 7;
+pub const STATE_WORDS : [7]str = ["off", "starting", "registered", "beating", "lapsed", "stopping", "exited"];
+
+/// The events. EVENT_, not EV_: <sys/event.h> holds EV_RECEIPT, and every importer of this card's C
+/// also imports Darwin.
+pub const EVENT_TOGGLE_ON : u8 = 0;
+pub const EVENT_TOGGLE_OFF : u8 = 1;
+pub const EVENT_REGISTERED : u8 = 2;
+pub const EVENT_RECEIPT : u8 = 3;
+pub const EVENT_FAILURE : u8 = 4;
+pub const EVENT_QUIET : u8 = 5;
+pub const EVENT_CHILD_EXIT : u8 = 6;
+pub const EVENT_OTHER : u8 = 7;
+pub const EVENTS : u8 = 8;
+
+/// The seconds the app waits after SIGTERM before it sends SIGKILL; the agent stops on SIGTERM at once
+/// (trios-host.ts `quit`).
+pub const STOP_GRACE_SECONDS : u32 = 5;
+
+/// The word for a state, and "" for no state.
+pub fn state_word(state: u8) -> str {
+    if (state >= STATES) { return ""; }
+    return STATE_WORDS[state];
+}
+
+/// Whether the agent's child process runs in this state.
+pub fn child_runs(state: u8) -> bool {
+    return state == ST_STARTING or state == ST_REGISTERED or state == ST_BEATING or state == ST_LAPSED or state == ST_STOPPING;
+}
+
+/// Whether the Queen has confirmed this incarnation of the agent.
+pub fn registered(state: u8) -> bool {
+    return state == ST_REGISTERED or state == ST_BEATING or state == ST_LAPSED;
+}
+
+/// The next state. quiet_seconds is the time since the last confirming line; it matters only for
+/// EVENT_QUIET: one beat period with nothing failed is a beat the agent did not have to report.
+pub fn next_state(state: u8, event: u8, quiet_seconds: u32) -> u8 {
+    if (state >= STATES or event >= EVENTS) { return state; }
+    if (event == EVENT_TOGGLE_ON) {
+        if (state == ST_OFF or state == ST_EXITED) { return ST_STARTING; }
+        return state;
+    }
+    if (event == EVENT_TOGGLE_OFF) {
+        if (state == ST_EXITED) { return ST_OFF; }
+        if (child_runs(state)) { return ST_STOPPING; }
+        return state;
+    }
+    if (event == EVENT_CHILD_EXIT) {
+        if (state == ST_STOPPING) { return ST_OFF; }
+        if (child_runs(state)) { return ST_EXITED; }
+        return state;
+    }
+    if (state == ST_STOPPING or state == ST_OFF or state == ST_EXITED) { return state; }
+    if (event == EVENT_REGISTERED) { return ST_REGISTERED; }
+    if (event == EVENT_FAILURE) {
+        if (registered(state)) { return ST_LAPSED; }
+        return state;
+    }
+    if (event == EVENT_RECEIPT) {
+        if (state == ST_REGISTERED) { return ST_BEATING; }
+        return state;
+    }
+    if (event == EVENT_QUIET) {
+        if (state == ST_REGISTERED and quiet_seconds >= NODE_HEARTBEAT_SECONDS) { return ST_BEATING; }
+        return state;
+    }
+    return state;
+}
+
+/// The longest a quiet agent can have gone without a confirmed beat and not yet said so: it fences
+/// after SELF_FENCE_SECONDS unconfirmed, and it checks once per beat period.
+pub fn quiet_bound_seconds() -> u32 {
+    return SELF_FENCE_SECONDS + NODE_HEARTBEAT_SECONDS;
+}
+
+; --- 3. The agent's lines ---------------------------------------------------------------------------
+; The app splits a line at its spaces and asks this section what the words are. The agent prefixes
+; every line of its loop with an ISO-8601 instant (trios-host.ts `log`); the lines before the loop have
+; none. Positions are counted from the first word after the instant.
+
+/// Whether a word is the agent's instant: 20YY-...Z.
+pub fn is_instant(word: string) -> bool {
+    var n : u32 = word.len as u32;
+    if (n < 20) { return false; }
+    if (word[0] != 50 or word[1] != 48) { return false; }
+    return word[n - 1] == 90;
+}
+
+/// Where a line's first word is: after the instant, when it has one.
+pub fn first_word_at(word0: string) -> u32 {
+    if (is_instant(word0)) { return 1; }
+    return 0;
+}
+
+/// Whether `word` is `name`, with at most one trailing ',' or ':' (the agent writes "ok," and "tick:").
+pub fn word_is(word: string, name: string) -> bool {
+    if (same_word(word, name)) { return true; }
+    var n : u32 = word.len as u32;
+    var m : u32 = name.len as u32;
+    if (n != m + 1) { return false; }
+    var last : u32 = word[n - 1] as u32;
+    if (last != 44 and last != 58) { return false; }
+    return starts_with(word, name);
+}
+
+/// The event a line is, from its first word. "run failed:" is one job's failure, not the agent's: the
+/// receipt that follows it is the event.
+pub fn line_event(first: string) -> u8 {
+    if (same_word(first, "registered")) { return EVENT_REGISTERED; }
+    if (same_word(first, "receipt")) { return EVENT_RECEIPT; }
+    if (same_word(first, "tick:")) { return EVENT_FAILURE; }
+    if (same_word(first, "work:")) { return EVENT_FAILURE; }
+    return EVENT_OTHER;
+}
+
+/// Whether a line names the host key: "read key <id>" or "made key <id>".
+pub fn names_key(first: string, second: string) -> bool {
+    if (same_word(second, "key") == false) { return false; }
+    return same_word(first, "read") or same_word(first, "made");
+}
+
+/// Whether a line is `trios-host key`'s "host id <id>": the app reads the id that way while the agent
+/// is off, and only when the key file is there already (`key` makes one when it is not).
+pub fn names_host_id(first: string, second: string) -> bool {
+    return same_word(first, "host") and same_word(second, "id");
+}
+
+/// The positions of a registered line's values, after its first word.
+pub const REG_HOST_AT : u32 = 1;
+pub const REG_INCARNATION_AT : u32 = 3;
+pub const REG_TIER_AT : u32 = 5;
+pub const REG_SLOTS_AT : u32 = 7;
+pub const REG_ISOLATION_AT : u32 = 9;
+pub const REG_WORDS : u32 = 10;
+/// The positions of a receipt line's code and job verdict.
+pub const RECEIPT_CODE_AT : u32 = 2;
+pub const RECEIPT_VERDICT_AT : u32 = 4;
+pub const RECEIPT_WORDS : u32 = 5;
+/// The position of the host id in a key line and in a host id line.
+pub const KEY_ID_AT : u32 = 2;
+
+/// The words the Queen writes for a tier and an isolation level, by host.t27 code
+/// (hosting-queen.ts TIER_WORDS, ISOLATION_WORDS).
+pub const TIER_WORDS : [3]str = ["owner", "trusted", "public"];
+pub const ISOLATION_WORDS : [4]str = ["none", "no-network", "job-dir-only", "vm"];
+/// The words of a receipt's code, by proof.t27 RC_*, and of a job's verdict, by JV_*
+/// (hosting-queen.ts RECEIPT_CODE_WORDS, JOB_VERDICT_WORDS).
+pub const RECEIPT_CODE_WORDS : [10]str = ["ok", "unknown_host", "bad_signature", "not_leased", "duplicate", "equivocation", "late", "input_mismatch", "model_mismatch", "output_mismatch"];
+pub const JOB_VERDICT_WORDS : [4]str = ["pending", "agreed", "tiebreak", "unresolved"];
+/// No code: a word no table holds.
+pub const NO_CODE : u8 = 255;
+
+/// The word for a tier code, as `join --tier` takes it; "" for no tier.
+pub fn tier_word(tier: u8) -> str {
+    if (tier >= TIERS) { return ""; }
+    return TIER_WORDS[tier];
+}
+
+pub fn tier_of_word(word: string) -> u8 {
+    var k : u8 = 0;
+    while (k < TIERS) {
+        if (word_is(word, TIER_WORDS[k])) { return k; }
+        k = k + 1;
+    }
+    return NO_CODE;
+}
+
+pub fn isolation_of_word(word: string) -> u8 {
+    var k : u8 = 0;
+    while (k < ISO_LEVELS) {
+        if (word_is(word, ISOLATION_WORDS[k])) { return k; }
+        k = k + 1;
+    }
+    return NO_CODE;
+}
+
+pub fn receipt_code_of_word(word: string) -> u8 {
+    var k : u8 = 0;
+    while (k <= RC_OUTPUT_MISMATCH) {
+        if (word_is(word, RECEIPT_CODE_WORDS[k])) { return k; }
+        k = k + 1;
+    }
+    return NO_CODE;
+}
+
+pub fn job_verdict_of_word(word: string) -> u8 {
+    var k : u8 = 0;
+    while (k <= JV_UNRESOLVED) {
+        if (word_is(word, JOB_VERDICT_WORDS[k])) { return k; }
+        k = k + 1;
+    }
+    return NO_CODE;
+}
+
+; --- 4. What the agent did ---------------------------------------------------------------------------
+; A receipt line is one replica the agent ran and reported. Its bucket is what the Queen said at once:
+; REFUSED when the receipt was not accepted as it stood (any code but RC_OK), else the job's verdict
+; then. A pending job may agree later; the ledger's `agreed` is the count that stays.
+
+pub const JOBS_AGREED : u8 = 0;
+pub const JOBS_PENDING : u8 = 1;
+pub const JOBS_REFUSED : u8 = 2;
+pub const JOBS_UNRESOLVED : u8 = 3;
+pub const JOB_BUCKETS : u8 = 4;
+pub const JOB_BUCKET_WORDS : [4]str = ["agreed", "pending", "refused", "unresolved"];
+
+/// The word for a bucket, and "" for no bucket.
+pub fn bucket_word(bucket: u8) -> str {
+    if (bucket >= JOB_BUCKETS) { return ""; }
+    return JOB_BUCKET_WORDS[bucket];
+}
+
+pub fn receipt_bucket(code: u8, verdict: u8) -> u8 {
+    if (code != RC_OK) { return JOBS_REFUSED; }
+    if (verdict == JV_AGREED) { return JOBS_AGREED; }
+    if (verdict == JV_UNRESOLVED) { return JOBS_UNRESOLVED; }
+    if (verdict == JV_PENDING or verdict == JV_TIEBREAK) { return JOBS_PENDING; }
+    return JOBS_REFUSED;
+}
+
+/// One more in a bucket's count when the receipt fell in it.
+pub fn bucket_count_after(count: u32, bucket: u8, receipt_code: u8, receipt_verdict: u8) -> u32 {
+    if (receipt_bucket(receipt_code, receipt_verdict) != bucket) { return count; }
+    if (count == 4294967295) { return count; }
+    return count + 1;
+}
+
+/// Whether a child process argument is the spec a job runs: the jobs are `t27c test-report <spec>` and
+/// `t27b corpus` over the job's `specs/` files (row.t27 section 1).
+pub const NAMES_SPEC_SUFFIX : str = ".t27";
+pub fn names_spec(arg: string) -> bool {
+    return ends_with(arg, NAMES_SPEC_SUFFIX);
+}
+
+/// a + b, or the largest u64 when that does not fit.
+pub fn saturating_add(a: u64, b: u64) -> u64 {
+    if (b > 18446744073709551615 - a) { return 18446744073709551615; }
+    return a + b;
+}
+
+/// The CPU time the agent spent, in milliseconds: its own user and system time and its finished
+/// jobs' (rusage ri_child_*), each in mach ticks, scaled by the timebase numer/denom.
+pub fn cpu_millis(user: u64, system: u64, child_user: u64, child_system: u64, numer: u32, denom: u32) -> u64 {
+    if (denom == 0) { return 0; }
+    var ticks : u64 = saturating_add(saturating_add(user, system), saturating_add(child_user, child_system));
+    var micros : u64 = (ticks / 1000) * (numer as u64) / (denom as u64);
+    return micros / 1000;
+}
+
+/// The seconds this agent has been online: since the Queen first confirmed this run, while it runs.
+pub fn online_seconds(state: u8, registered_unix: u64, now_unix: u64) -> u64 {
+    if (registered(state) == false) { return 0; }
+    if (registered_unix == 0 or now_unix < registered_unix) { return 0; }
+    return now_unix - registered_unix;
+}
+
+/// The slots the app offers to claim: at least one, at most what the tier may be granted (host.t27).
+pub fn slots_offered(tier_claim: u8, wanted: u32) -> u32 {
+    var tier : u8 = tier_claim;
+    if (tier >= TIERS) { tier = TIER_PUBLIC; }
+    if (wanted == 0) { return 1; }
+    return slots_admitted(tier, wanted);
+}
+
+; --- 5. What the ledger credits this host ------------------------------------------------------------
+; The kinds a host's credit is shown by: statement.t27's fees a host earns, and the slash. A ledger row
+; names its fee kind by statement.t27 KIND_WORDS.
+
+/// The ledger's word for a slash row (statement.t27 KIND_WORDS at the slash's kind).
+pub const SLASH_WORD : str = "slash";
+pub const SHOWN_KIND_COUNT : u32 = 4;
+
+pub fn kind_of_word(word: string) -> u8 {
+    var k : u8 = 1;
+    while (k < 10) {
+        if (word_len(KIND_WORDS[k]) > 0) {
+            if (same_word(word, KIND_WORDS[k])) { return k; }
+        }
+        k = k + 1;
+    }
+    return NO_CODE;
+}
+
+/// The word a ledger row writes for a kind (statement.t27 KIND_WORDS), and "" for no kind.
+pub fn kind_word(kind: u8) -> str {
+    if (kind >= 10) { return ""; }
+    return KIND_WORDS[kind];
+}
+
+/// The kinds the panel shows, in order: the executor's fee, the verifier's, the provider's, the slash.
+pub fn shown_kind(k: u32) -> u8 {
+    if (k == 0) { return EXECUTOR_FEE; }
+    if (k == 1) { return VERIFIER_FEE; }
+    if (k == 2) { return PROVIDER_FEE; }
+    if (k == 3) { return kind_of_word(SLASH_WORD); }
+    return NO_CODE;
+}
+
+/// This host's total of one kind after one more ledger row: the row counts when it is this host's, of
+/// that kind, and (when one_epoch) of that epoch. A total saturates; it never wraps.
+pub fn kind_total_after(total: u64, row_host: string, my_host: string, row_fee_word: string, row_mtri: u64, kind: u8, row_epoch: u64, one_epoch: bool, epoch: u64) -> u64 {
+    var n : u32 = my_host.len as u32;
+    if (n == 0) { return total; }
+    if (same_word(row_host, my_host) == false) { return total; }
+    if (kind_of_word(row_fee_word) != kind) { return total; }
+    if (one_epoch and row_epoch != epoch) { return total; }
+    if (row_mtri > 18446744073709551615 - total) { return 18446744073709551615; }
+    return total + row_mtri;
+}
+
+/// The epoch the panel calls today (statement.t27 epoch_of).
+pub fn today_epoch(now_unix: u64) -> u64 {
+    return epoch_of(now_unix);
+}
+
+/// Whether an epoch of the Queen's listing counts as signed: the listing says it signs, and the epoch
+/// carries a signature. Whether the signature is good is the agent's check (section 6), not this.
+pub fn epoch_signed(listing_signed: bool, signature: string) -> bool {
+    return listing_signed and word_len(signature) > 0;
+}
+
+/// The latest signed epoch, seen one statement at a time: `best` is the latest so far and `have` says
+/// whether there is one.
+pub fn latest_signed_after(have: bool, best: u64, epoch: u64, is_signed: bool) -> u64 {
+    if (is_signed == false) { return best; }
+    if (have == false) { return epoch; }
+    if (epoch > best) { return epoch; }
+    return best;
+}
+
+; --- 6. The statement verdict ------------------------------------------------------------------------
+; `trios-host statement --queen QUEEN_URL --epoch <latest signed> --queen-key QUEEN_KEY` checks this
+; host's leaves against the signed root. It exits 0 only when it checked at least one leaf and every
+; one passed. A host with no credit in that epoch has no leaf, and the agent exits 1 for it too; that
+; is "nothing to verify", not "not verified".
+
+pub const SV_NO_EPOCH : u8 = 0;
+pub const SV_NOT_CHECKED : u8 = 1;
+pub const SV_NO_LEAF : u8 = 2;
+pub const SV_VERIFIED : u8 = 3;
+pub const SV_NOT_VERIFIED : u8 = 4;
+pub const VERDICTS : u8 = 5;
+pub const VERDICT_WORDS : [5]str = ["no signed epoch yet", "not checked", "no credit in that epoch", "verified", "not verified"];
+
+/// The words the panel shows for a verdict, and "" for no verdict.
+pub fn verdict_word(verdict: u8) -> str {
+    if (verdict >= VERDICTS) { return ""; }
+    return VERDICT_WORDS[verdict];
+}
+
+/// any_signed: the Queen lists a signed epoch. ran: the agent ran and printed its JSON. exit_code: its
+/// exit. leaves: the checks it printed.
+pub fn statement_verdict(any_signed: bool, ran: bool, exit_code: u32, leaves: u32) -> u8 {
+    if (any_signed == false) { return SV_NO_EPOCH; }
+    if (ran == false) { return SV_NOT_CHECKED; }
+    if (leaves == 0) { return SV_NO_LEAF; }
+    if (exit_code == 0) { return SV_VERIFIED; }
+    return SV_NOT_VERIFIED;
+}
+
+; --- 7. The words around the numbers ------------------------------------------------------------------
+
+/// The panel's one sentence about the credit. Shown only while disclaimer_true() holds.
+pub const DISCLAIMER : str = "Test credits for verified work. Not transferable. No payout yet.";
+/// The unit, as the ledger names it.
+pub const UNIT_WORD : str = "mTRI";
+
+/// Whether the Queen's ledger still says what DISCLAIMER says: off-chain, not transferable, no
+/// settlement, no value claimed.
+pub fn disclaimer_true(off_chain: bool, transferable: bool, settlement_enabled: bool, value_claimed: bool) -> bool {
+    if (transferable != CREDIT_TRANSFERABLE) { return false; }
+    return off_chain and transferable == false and settlement_enabled == false and value_claimed == false;
+}
+
+/// The badge shows the balance only for a host the ledger lists.
+pub fn badge_visible(host_known: bool, ledger_row: bool) -> bool {
+    return host_known and ledger_row;
+}
+
+/// How often the panel reads the ledger and checks the statement, while it is open.
+pub const LEDGER_POLL_SECONDS : u32 = 30;
+pub const STATEMENT_POLL_SECONDS : u32 = 600;
+
+; --- 8. Tests -----------------------------------------------------------------------------------------
+
+test the_agent_pin_is_the_release_asset {
+    assert pin_well_formed(AGENT_SHA256);
+    assert url_allowed(AGENT_URL);
+    assert starts_with(AGENT_URL, "https://github.com/gHashTag/trios/releases/download/");
+    assert ends_with(AGENT_URL, "/trios-host-v0.1.1/trios-host-darwin-arm64");
+    assert AGENT_BYTES == 61118752;
+    assert agent_kept("63dc58878b09e2af955176333412240e378b799eeafe65a7a5130e11df65cee7", 61118752) == true;
+}
+
+test a_wrong_agent_is_refused {
+    // one digit off, upper case, short, the right digest with the wrong size, 0.1.0's digest
+    assert agent_kept("63dc58878b09e2af955176333412240e378b799eeafe65a7a5130e11df65cee8", 61118752) == false;
+    assert agent_kept("63DC58878B09E2AF955176333412240E378B799EEAFE65A7A5130E11DF65CEE7", 61118752) == false;
+    assert agent_kept("63dc58878b09e2af955176333412240e378b799eeafe65a7a5130e11df65cee", 61118752) == false;
+    assert agent_kept("63dc58878b09e2af955176333412240e378b799eeafe65a7a5130e11df65cee7", 61118751) == false;
+    assert agent_kept("b1f072f4589eef53a3235c7be5fa6a4b3aa26832794d7762809acb2c83224164", 61118752) == false;
+    assert agent_kept("", 0) == false;
+}
+
+test the_key_file_is_the_owners_alone {
+    assert key_file_private(384) == true;
+    assert key_file_private(256) == true;
+    assert key_file_private(420) == false;
+    assert key_file_private(388) == false;
+    assert key_file_private(416) == false;
+    assert same_word(AGENT_DIR, ".trios-host");
+    assert same_word(KEY_FILE, "key");
+}
+
+test the_app_fetches_only_the_queen_and_the_release {
+    assert fetch_allowed("https://api.t27.ai/hosting/ledger") == true;
+    assert fetch_allowed("https://api.t27.ai/hosting/ledger/epochs") == true;
+    assert fetch_allowed("https://api.t27.ai") == true;
+    assert fetch_allowed("https://github.com/gHashTag/trios/releases/download/trios-host-v0.1.1/trios-host-darwin-arm64") == true;
+    // a look-alike host, plain http, another asset of the same release, anywhere else
+    assert fetch_allowed("https://api.t27.ai.example.org/hosting/ledger") == false;
+    assert fetch_allowed("http://api.t27.ai/hosting/ledger") == false;
+    assert fetch_allowed("https://github.com/gHashTag/trios/releases/download/trios-host-v0.1.1/trios-host-linux-x64") == false;
+    assert fetch_allowed("https://example.org/") == false;
+    assert fetch_allowed("") == false;
+}
+
+test the_agent_lives_only_while_the_toggle_is_on {
+    var s : u8 = ST_OFF;
+    assert child_runs(s) == false;
+    s = next_state(s, EVENT_TOGGLE_ON, 0);
+    assert s == ST_STARTING;
+    assert child_runs(s);
+    s = next_state(s, EVENT_REGISTERED, 0);
+    assert s == ST_REGISTERED;
+    s = next_state(s, EVENT_TOGGLE_OFF, 0);
+    assert s == ST_STOPPING;
+    assert child_runs(s);
+    // a line that arrives while it stops moves nothing
+    assert next_state(s, EVENT_REGISTERED, 0) == ST_STOPPING;
+    s = next_state(s, EVENT_CHILD_EXIT, 0);
+    assert s == ST_OFF;
+    assert child_runs(s) == false;
+    // a toggle on while it already runs starts nothing new
+    assert next_state(ST_BEATING, EVENT_TOGGLE_ON, 0) == ST_BEATING;
+}
+
+test a_quiet_beat_period_is_a_beat_and_a_failure_is_a_lapse {
+    assert next_state(ST_REGISTERED, EVENT_QUIET, NODE_HEARTBEAT_SECONDS - 1) == ST_REGISTERED;
+    assert next_state(ST_REGISTERED, EVENT_QUIET, NODE_HEARTBEAT_SECONDS) == ST_BEATING;
+    assert next_state(ST_REGISTERED, EVENT_RECEIPT, 0) == ST_BEATING;
+    assert next_state(ST_BEATING, EVENT_FAILURE, 0) == ST_LAPSED;
+    assert next_state(ST_REGISTERED, EVENT_FAILURE, 0) == ST_LAPSED;
+    // a receipt does not end a lapse; only a new registration does
+    assert next_state(ST_LAPSED, EVENT_RECEIPT, 0) == ST_LAPSED;
+    assert next_state(ST_LAPSED, EVENT_QUIET, 60) == ST_LAPSED;
+    assert next_state(ST_LAPSED, EVENT_REGISTERED, 0) == ST_REGISTERED;
+    // a failure before the first registration is no lapse: nothing was confirmed yet
+    assert next_state(ST_STARTING, EVENT_FAILURE, 0) == ST_STARTING;
+    assert quiet_bound_seconds() == 20;
+}
+
+test an_agent_that_dies_while_on_is_exited_not_off {
+    assert next_state(ST_BEATING, EVENT_CHILD_EXIT, 0) == ST_EXITED;
+    assert next_state(ST_STARTING, EVENT_CHILD_EXIT, 0) == ST_EXITED;
+    assert child_runs(ST_EXITED) == false;
+    assert next_state(ST_EXITED, EVENT_TOGGLE_ON, 0) == ST_STARTING;
+    assert next_state(ST_EXITED, EVENT_TOGGLE_OFF, 0) == ST_OFF;
+    assert next_state(ST_EXITED, EVENT_REGISTERED, 0) == ST_EXITED;
+    // an unknown state or event moves nothing
+    assert next_state(STATES, EVENT_TOGGLE_ON, 0) == STATES;
+    assert next_state(ST_OFF, EVENTS, 0) == ST_OFF;
+    assert same_word(state_word(ST_BEATING), "beating");
+    assert same_word(state_word(ST_EXITED), "exited");
+    assert word_len(state_word(STATES)) == 0;
+}
+
+test the_agents_lines_are_read_by_position {
+    assert first_word_at("2026-10-11T08:01:02.345Z") == 1;
+    assert first_word_at("registered") == 0;
+    assert first_word_at("zig") == 0;
+    assert line_event("registered") == EVENT_REGISTERED;
+    assert line_event("receipt") == EVENT_RECEIPT;
+    assert line_event("tick:") == EVENT_FAILURE;
+    assert line_event("work:") == EVENT_FAILURE;
+    assert line_event("tick") == EVENT_OTHER;
+    assert line_event("run") == EVENT_OTHER;
+    assert line_event("sandbox") == EVENT_OTHER;
+    assert names_key("read", "key") == true;
+    assert names_key("made", "key") == true;
+    assert names_key("read", "keys") == false;
+    assert names_host_id("host", "id") == true;
+    assert names_host_id("public", "key") == false;
+    assert names_host_id("host", "ids") == false;
+    assert word_is("ok,", "ok") == true;
+    assert word_is("ok", "ok") == true;
+    assert word_is("oks", "ok") == false;
+    assert word_is("ok,,", "ok") == false;
+}
+
+test the_queens_words_map_to_the_cards_codes {
+    assert tier_of_word("owner") == TIER_OWNER;
+    assert tier_of_word("public") == TIER_PUBLIC;
+    assert tier_of_word("root") == NO_CODE;
+    assert isolation_of_word("job-dir-only") == ISO_JOBDIR;
+    assert isolation_of_word("none") == ISO_NONE;
+    assert isolation_of_word("job-dir") == NO_CODE;
+    assert receipt_code_of_word("ok,") == RC_OK;
+    assert receipt_code_of_word("output_mismatch,") == RC_OUTPUT_MISMATCH;
+    assert receipt_code_of_word("fine,") == NO_CODE;
+    assert job_verdict_of_word("agreed") == JV_AGREED;
+    assert job_verdict_of_word("tiebreak") == JV_TIEBREAK;
+    assert job_verdict_of_word("undefined") == NO_CODE;
+    assert same_word(tier_word(TIER_OWNER), "owner");
+    assert tier_of_word(tier_word(TIER_PUBLIC)) == TIER_PUBLIC;
+    assert word_len(tier_word(TIERS)) == 0;
+}
+
+test a_receipt_falls_in_one_bucket {
+    assert receipt_bucket(RC_OK, JV_AGREED) == JOBS_AGREED;
+    assert receipt_bucket(RC_OK, JV_PENDING) == JOBS_PENDING;
+    assert receipt_bucket(RC_OK, JV_TIEBREAK) == JOBS_PENDING;
+    assert receipt_bucket(RC_OK, JV_UNRESOLVED) == JOBS_UNRESOLVED;
+    assert receipt_bucket(RC_OUTPUT_MISMATCH, JV_AGREED) == JOBS_REFUSED;
+    assert receipt_bucket(RC_OK, NO_CODE) == JOBS_REFUSED;
+    assert receipt_bucket(NO_CODE, JV_AGREED) == JOBS_REFUSED;
+    assert bucket_count_after(3, JOBS_AGREED, RC_OK, JV_AGREED) == 4;
+    assert bucket_count_after(3, JOBS_PENDING, RC_OK, JV_AGREED) == 3;
+    assert bucket_count_after(4294967295, JOBS_AGREED, RC_OK, JV_AGREED) == 4294967295;
+    assert same_word(bucket_word(JOBS_REFUSED), "refused");
+    assert word_len(bucket_word(JOB_BUCKETS)) == 0;
+}
+
+test a_job_is_named_by_its_spec_argument {
+    assert names_spec("specs/hosting/row.t27") == true;
+    assert names_spec("test-report") == false;
+    assert names_spec("--verbose") == false;
+    assert names_spec("specs") == false;
+}
+
+test cpu_time_adds_the_agent_and_its_finished_jobs {
+    // Apple silicon's timebase is 125/3: 24 ticks a microsecond
+    assert cpu_millis(24000000, 0, 0, 0, 125, 3) == 1000;
+    assert cpu_millis(12000000, 12000000, 24000000, 0, 125, 3) == 2000;
+    assert cpu_millis(1000000, 0, 0, 1000000, 1, 1) == 2;
+    assert cpu_millis(5, 5, 5, 5, 125, 0) == 0;
+    assert cpu_millis(18446744073709551615, 1, 0, 0, 1, 1) == 18446744073709;
+}
+
+test online_time_counts_only_a_confirmed_run {
+    assert online_seconds(ST_BEATING, 1000, 1600) == 600;
+    assert online_seconds(ST_LAPSED, 1000, 1600) == 600;
+    assert online_seconds(ST_STARTING, 1000, 1600) == 0;
+    assert online_seconds(ST_OFF, 1000, 1600) == 0;
+    assert online_seconds(ST_BEATING, 0, 1600) == 0;
+    assert online_seconds(ST_BEATING, 1700, 1600) == 0;
+}
+
+test slots_follow_the_tier {
+    assert slots_offered(TIER_PUBLIC, 0) == 1;
+    assert slots_offered(TIER_PUBLIC, 1) == 1;
+    assert slots_offered(TIER_PUBLIC, 8) == 2;
+    assert slots_offered(TIER_OWNER, 8) == 8;
+    assert slots_offered(TIER_OWNER, 99) == SLOTS_MAX_OWNER;
+    assert slots_offered(7, 8) == 2;
+}
+
+test the_ledger_is_tallied_by_kind_for_this_host_only {
+    assert kind_of_word("executor_fee") == EXECUTOR_FEE;
+    assert kind_of_word("verifier_fee") == VERIFIER_FEE;
+    assert kind_of_word("provider_fee") == PROVIDER_FEE;
+    assert kind_of_word("slash") == 9;
+    assert shown_kind(0) == EXECUTOR_FEE;
+    assert shown_kind(3) == kind_of_word("slash");
+    assert shown_kind(4) == NO_CODE;
+    assert same_word(kind_word(EXECUTOR_FEE), "executor_fee");
+    assert same_word(kind_word(shown_kind(3)), "slash");
+    assert word_len(kind_word(10)) == 0;
+    assert kind_of_word("bounty") == 1;
+    assert kind_of_word("") == NO_CODE;
+    assert kind_of_word("fee") == NO_CODE;
+    assert kind_total_after(5, "57c4f5d613622106", "57c4f5d613622106", "executor_fee", 1, EXECUTOR_FEE, 0, false, 0) == 6;
+    // another host, another kind, another epoch, no host id
+    assert kind_total_after(5, "a06e1180d10e025f", "57c4f5d613622106", "executor_fee", 1, EXECUTOR_FEE, 0, false, 0) == 5;
+    assert kind_total_after(5, "57c4f5d613622106", "57c4f5d613622106", "verifier_fee", 1, EXECUTOR_FEE, 0, false, 0) == 5;
+    assert kind_total_after(5, "57c4f5d613622106", "57c4f5d613622106", "executor_fee", 1, EXECUTOR_FEE, 0, true, 1) == 5;
+    assert kind_total_after(5, "57c4f5d613622106", "57c4f5d613622106", "executor_fee", 1, EXECUTOR_FEE, 1, true, 1) == 6;
+    assert kind_total_after(5, "57c4f5d613622106", "", "executor_fee", 1, EXECUTOR_FEE, 0, false, 0) == 5;
+    assert kind_total_after(18446744073709551615, "57c4f5d613622106", "57c4f5d613622106", "slash", 3, shown_kind(3), 0, false, 0) == 18446744073709551615;
+    var k : u32 = 0;
+    while (k < SHOWN_KIND_COUNT) {
+        assert shown_kind(k) < 10;
+        assert word_len(KIND_WORDS[shown_kind(k)]) > 0;
+        k = k + 1;
+    }
+}
+
+test today_and_the_latest_signed_epoch {
+    assert today_epoch(1791590400) == 0;
+    assert today_epoch(1791676800) == 1;
+    assert latest_signed_after(false, 0, 0, true) == 0;
+    assert latest_signed_after(true, 0, 3, true) == 3;
+    assert latest_signed_after(true, 3, 2, true) == 3;
+    assert latest_signed_after(true, 3, 9, false) == 3;
+    assert epoch_signed(true, "12cc5c71") == true;
+    assert epoch_signed(true, "") == false;
+    assert epoch_signed(false, "12cc5c71") == false;
+}
+
+test verified_means_every_leaf_checked {
+    assert statement_verdict(true, true, 0, 2) == SV_VERIFIED;
+    assert statement_verdict(true, true, 1, 2) == SV_NOT_VERIFIED;
+    // no leaf: the agent exits 1, and that is not "not verified"
+    assert statement_verdict(true, true, 1, 0) == SV_NO_LEAF;
+    assert statement_verdict(true, false, 0, 0) == SV_NOT_CHECKED;
+    assert statement_verdict(false, true, 0, 2) == SV_NO_EPOCH;
+    assert same_word(VERDICT_WORDS[SV_VERIFIED], "verified");
+    assert same_word(VERDICT_WORDS[SV_NOT_VERIFIED], "not verified");
+    assert same_word(verdict_word(SV_NO_LEAF), "no credit in that epoch");
+    assert word_len(verdict_word(VERDICTS)) == 0;
+}
+
+test the_disclaimer_is_shown_only_over_a_ledger_that_agrees {
+    assert disclaimer_true(true, false, false, false) == true;
+    assert disclaimer_true(true, true, false, false) == false;
+    assert disclaimer_true(true, false, true, false) == false;
+    assert disclaimer_true(true, false, false, true) == false;
+    assert disclaimer_true(false, false, false, false) == false;
+    assert same_word(DISCLAIMER, "Test credits for verified work. Not transferable. No payout yet.");
+    assert badge_visible(true, true) == true;
+    assert badge_visible(true, false) == false;
+    assert badge_visible(false, true) == false;
+}
+
+invariant the_credit_is_not_transferable {
+    assert CREDIT_TRANSFERABLE == false;
+}

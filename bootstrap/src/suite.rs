@@ -685,23 +685,30 @@ fn run_phase_with_failures(
     Ok((pass, fail, failures))
 }
 
-/// #8829: a phase whose per-spec work is one read-only `t27c` subprocess runs suite_jobs() of them at once;
-/// results fold in file order, so the counts, FAIL lines and failure list are the sequential run's.
-fn run_phase_par(repo: &Path, label: &str, f: impl Fn(&Path, &str) -> anyhow::Result<()> + Sync, files: &[PathBuf]) -> anyhow::Result<(usize, usize, Vec<String>)> {
+/// #8829: `f` on every item with suite_jobs() workers (each item's own work stays on one worker); the
+/// results come back in input order, so whatever is folded from them is what a sequential run folds.
+pub(crate) fn par_in_order<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let asked = std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let jobs = crate::suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), asked) as usize;
-    let one = |file: &PathBuf| match rel_arg(repo, file) {
-        Err(e) => Err((file.display().to_string().replace('\\', "/"), format!("FAIL {}: {}", file.display(), e))),
-        Ok(rel) => f(repo, &rel).map_err(|e| (rel.clone(), format!("FAIL {} ({}): {}", label, rel, e))),
-    };
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut res: Vec<(usize, Result<(), (String, String)>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| { let mut v = Vec::new(); loop { let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if i >= files.len() { break v; } v.push((i, one(&files[i]))); } })).collect();
+    let mut res: Vec<(usize, R)> = std::thread::scope(|s| {
+        // 8 MiB: the main thread's stack, which the in-process compiler phases ran on until now
+        let hs: Vec<_> = (0..jobs).map(|_| std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, || { let mut v = Vec::new(); loop { let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if i >= items.len() { break v; } v.push((i, f(&items[i]))); } }).expect("suite worker")).collect();
         hs.into_iter().flat_map(|h| h.join().expect("suite worker panicked")).collect()
     });
     res.sort_by_key(|r| r.0);
+    res.into_iter().map(|r| r.1).collect()
+}
+
+/// #8829: a phase whose per-spec work reads the spec and writes nothing -- one `t27c` subprocess, or the
+/// compiler in-process (it keeps no global state but an atomic key counter) -- run through par_in_order.
+fn run_phase_par(repo: &Path, label: &str, f: impl Fn(&Path, &str) -> anyhow::Result<()> + Sync, files: &[PathBuf]) -> anyhow::Result<(usize, usize, Vec<String>)> {
+    let res = par_in_order(files, |file: &PathBuf| match rel_arg(repo, file) {
+        Err(e) => Err((file.display().to_string().replace('\\', "/"), format!("FAIL {}: {}", file.display(), e))),
+        Ok(rel) => f(repo, &rel).map_err(|e| (rel.clone(), format!("FAIL {} ({}): {}", label, rel, e))),
+    });
     let (mut pass, mut fail, mut failures) = (0usize, 0usize, Vec::new());
-    for (_, r) in res { match r { Ok(()) => pass += 1, Err((name, msg)) => { eprintln!("{}", msg); fail += 1; failures.push(name); } } }
+    for r in res { match r { Ok(()) => pass += 1, Err((name, msg)) => { eprintln!("{}", msg); fail += 1; failures.push(name); } } }
     Ok((pass, fail, failures))
 }
 
@@ -1983,13 +1990,13 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
 
     println!("--- Phase 1a2: Parse completeness (no silent discard) ---");
     let (p1cp, p1cf, p1cfail) =
-        run_phase_with_failures(&repo, "parse-no-discard", cmd_parse_no_discard, &specs_compiler)?;
+        run_phase_par(&repo, "parse-no-discard", cmd_parse_no_discard, &specs_compiler)?;
     println!("Parse completeness: {} clean, {} discarding", p1cp, p1cf);
     record("parse-no-discard", p1cfail, &mut ledger, &mut upstream_failed);
     push_phase("parse-no-discard", p1cp, p1cf, 0);
 
     println!("--- Phase 1a3: Invariants lowered (no vacuous checks) ---");
-    let (p1dp, p1df, p1dfail) = run_phase_with_failures(
+    let (p1dp, p1df, p1dfail) = run_phase_par(
         &repo,
         "no-vacuous-invariant",
         cmd_no_vacuous_invariant,
@@ -2000,7 +2007,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("no-vacuous-invariant", p1dp, p1df, 0);
 
     println!("--- Phase 1a4: Verilog tests actually check something ---");
-    let (p1ep, p1ef, p1efail) = run_phase_with_failures(
+    let (p1ep, p1ef, p1efail) = run_phase_par(
         &repo,
         "no-vacuous-verilog-test",
         cmd_no_vacuous_verilog_test,
@@ -2011,7 +2018,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("no-vacuous-verilog-test", p1ep, p1ef, 0);
 
     println!("--- Phase 1a5: Backends declare their omissions ---");
-    let (p1gp, p1gf, p1gfail) = run_phase_with_failures(
+    let (p1gp, p1gf, p1gfail) = run_phase_par(
         &repo,
         "backends-declare-omissions",
         cmd_backends_declare_omissions,
@@ -2022,7 +2029,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("backends-declare-omissions", p1gp, p1gf, 0);
 
     println!("--- Phase 1a6: Verilog declares no bare keyword ---");
-    let (p1hp, p1hf, p1hfail) = run_phase_with_failures(
+    let (p1hp, p1hf, p1hfail) = run_phase_par(
         &repo,
         "verilog-no-keyword-decl",
         cmd_verilog_declares_no_keyword,
@@ -2033,7 +2040,7 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("verilog-no-keyword-decl", p1hp, p1hf, 0);
 
     println!("--- Phase 1a7: No literal-percent format strings ---");
-    let (p1ip, p1if, p1ifail) = run_phase_with_failures(
+    let (p1ip, p1if, p1ifail) = run_phase_par(
         &repo,
         "verilog-no-double-percent",
         cmd_verilog_no_double_percent,
@@ -2343,20 +2350,13 @@ pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result
     push_phase("seal-verify", p5p, p5f, 0);
 
     println!("--- Phase 6: Fixed Point ---");
+    // #8837 follow-up: specs side by side; each spec's two gens stay on one worker, one after the other.
     let mut fp_diff = 0usize;
-    for file in &specs_compiler {
+    for r in par_in_order(&specs_compiler, |file: &PathBuf| -> anyhow::Result<bool> {
         let rel = rel_arg(&repo, file)?;
-        let a = match cmd_gen_stdout(&repo, &rel) {
-            Ok(x) => x,
-            Err(_) => continue,
-        };
-        let b = match cmd_gen_stdout(&repo, &rel) {
-            Ok(x) => x,
-            Err(_) => continue,
-        };
-        if a != b {
-            fp_diff += 1;
-        }
+        Ok(match (cmd_gen_stdout(&repo, &rel), cmd_gen_stdout(&repo, &rel)) { (Ok(a), Ok(b)) => a != b, _ => false })
+    }) {
+        fp_diff += r? as usize;
     }
     println!("Fixed Point: {} divergences", fp_diff);
     push_phase("fixed-point", 0, fp_diff, 0);
