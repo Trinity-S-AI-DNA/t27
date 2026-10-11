@@ -16,6 +16,14 @@ mod verilog_aos_memory;
 #[path = "../gen/rust/compiler/cse_hoist.rs"]
 #[allow(dead_code, unused_parens)]
 mod cse_hoist;
+// specs/compiler/int_type_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/int_type_names.rs"]
+#[allow(dead_code, unused_parens)]
+mod int_type_names;
+// specs/compiler/operator_text.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/operator_text.rs"]
+#[allow(dead_code, unused_parens)]
+mod operator_text;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -7524,20 +7532,6 @@ impl Codegen {
         }
     }
 
-    /// W566: bit-width of a t27 UNSIGNED integer type, or None otherwise.
-    /// Restricted to unsigned because Zig's `@truncate` only lowers a narrowing
-    /// cast cleanly when both sides are unsigned; signed narrowing stays on the
-    /// checked `@intCast` path (its previous, working behaviour).
-    fn zig_uint_bits(ty: &str) -> Option<u32> {
-        match ty.trim() {
-            "u8" => Some(8),
-            "u16" => Some(16),
-            "u32" => Some(32),
-            "u64" | "usize" => Some(64),
-            _ => None,
-        }
-    }
-
     /// W566: best-effort bit-width of an expression that is provably an UNSIGNED
     /// integer, using the param/typed-local map. Returns None when the type is
     /// signed or unknown, so the cast emission falls back to `@intCast`.
@@ -7545,18 +7539,18 @@ impl Codegen {
         match node.kind {
             NodeKind::ExprIdentifier => {
                 let ty = self.zig_var_types.get(&node.name)?;
-                Self::zig_uint_bits(ty)
+                int_type_names::zig_uint_bits(ty.as_bytes())
             }
             NodeKind::ExprCast => {
                 let target = node.extra_type.split('[').next().unwrap_or("").trim();
-                Self::zig_uint_bits(target)
+                int_type_names::zig_uint_bits(target.as_bytes())
             }
             NodeKind::ExprLiteral => {
                 let ty = node.extra_type.as_str();
                 if ty.is_empty() {
                     None
                 } else {
-                    Self::zig_uint_bits(ty)
+                    int_type_names::zig_uint_bits(ty.as_bytes())
                 }
             }
             NodeKind::ExprBinary => {
@@ -8564,7 +8558,7 @@ impl Codegen {
     // rejects the bare name with "name shadows primitive". Applied at every
     // value-identifier emission site so declarations and uses stay consistent.
     fn is_numeric_type_suffix(t: &str) -> bool {
-        is_integer_type_suffix(t) || matches!(t, "f32" | "f64")
+        int_type_names::is_integer_type_suffix(t.as_bytes()) || matches!(t, "f32" | "f64")
     }
 
     /// Re-escape a string the lexer already unescaped, so it can be written
@@ -10417,7 +10411,7 @@ impl Codegen {
                         // Integers only: a float cast needs @floatCast or
                         // @intFromFloat, and guessing between them would be a
                         // silent semantic choice.
-                        if is_integer_type_suffix(target) {
+                        if int_type_names::is_integer_type_suffix(target.as_bytes()) {
                             self.write(&format!("@as({}, @intCast(", target));
                             self.gen_expr(&node.children[0]);
                             self.write("))");
@@ -11022,7 +11016,7 @@ impl Codegen {
                             (false, false) => unreachable!(),
                         }
                     } else {
-                        let target_bits = Self::zig_uint_bits(&target);
+                        let target_bits = int_type_names::zig_uint_bits(target.as_bytes());
                         let src_bits = self.zig_expr_uint_bits(&node.children[0]);
                         let narrowing = match (src_bits, target_bits) {
                             (Some(s), Some(t)) => s > t,
@@ -17587,7 +17581,7 @@ impl VerilogCodegen {
                         self.in_lvalue = true;
                         self.gen_verilog_expr(lhs);
                         self.in_lvalue = false;
-                        if let Some(op) = compound_binop(&node.extra_op) {
+                        if let Some(op) = operator_text::compound_binop(node.extra_op.as_bytes()) {
                             self.write(asn);
                             self.gen_verilog_expr(lhs);
                             self.write(&format!(" {} ", op));
@@ -19155,18 +19149,6 @@ pub struct CCodegen {
     local_tuple_counter: u32,
 }
 
-/// The integer width suffix of a typed builtin -- `cast_i8`, `abs_i16`.
-///
-/// A free function rather than a method: `gen-zig` has recognised these since
-/// W570 and `gen-c` learned it in #3497, and a second copy is how one backend
-/// grows a spelling the other refuses.
-fn is_integer_type_suffix(t: &str) -> bool {
-    matches!(
-        t,
-        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-    )
-}
-
 impl CCodegen {
     pub fn new() -> Self {
         Self {
@@ -20008,7 +19990,7 @@ long double: fabsl, default: llabs)(x)",
         // (#2846) -- must not be promoted from a comment to code. The comment
         // was hiding it; making it a `_Static_assert` turns one silent defect
         // into a syntax error that cascades through the rest of the file.
-        if Self::has_empty_operand(text) {
+        if operator_text::has_empty_operand(text.as_bytes()) {
             return false;
         }
         // `const_defs` alone is too narrow: requiring it rejects 1742
@@ -20028,32 +20010,6 @@ long double: fabsl, default: llabs)(x)",
         Self::identifiers_in(text)
             .iter()
             .all(|n| Self::is_c_word(n) || self.declares(n))
-    }
-
-    /// Does an operator in this rendered expression have nothing after it?
-    ///
-    /// `(BOARD_NAME != )` is the shape: the renderer dropped the right-hand
-    /// side. Ten specs in `boards/` and `fpga/` carry one.
-    fn has_empty_operand(text: &str) -> bool {
-        let b = text.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if matches!(b[i], b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' | b'^') {
-                let mut j = i + 1;
-                while j < b.len()
-                    && matches!(b[j], b'=' | b'<' | b'>' | b'&' | b'|' | b' ')
-                {
-                    j += 1;
-                }
-                if j >= b.len() || b[j] == b')' {
-                    return true;
-                }
-                i = j;
-                continue;
-            }
-            i += 1;
-        }
-        false
     }
 
     /// A repeated element this emitter writes as a C value: a non-string
@@ -22375,7 +22331,7 @@ long double: fabsl, default: llabs)(x)",
                 }
                 if node.children.len() == 1 && !self.fn_param_types.contains_key(&node.name) {
                     if let Some(target) = node.name.strip_prefix("cast_") {
-                        if is_integer_type_suffix(target) {
+                        if int_type_names::is_integer_type_suffix(target.as_bytes()) {
                             self.write(&format!("(({})(", Self::type_to_c(target)));
                             self.gen_c_expr(&node.children[0]);
                             self.write("))");
@@ -23028,37 +22984,6 @@ fn resolve_import_path(
 // Compiler Interface
 // ============================================================================
 
-/// The binary operator inside a compound assignment: "|=" -> "|".
-/// All three backends tested `extra_op == "+="` and fell through to " = " otherwise,
-/// so accepting a new compound operator without touching them would have emitted
-/// `x = rhs` for `x |= rhs` -- a miscompilation rather than an error.
-fn compound_binop(extra_op: &str) -> Option<&'static str> {
-    match extra_op {
-        "+=" => Some("+"),
-        "-=" => Some("-"),
-        "*=" => Some("*"),
-        // `/=` was missing, and the three call sites all fall back to a plain
-        // ` = `. So `scaled /= 2.0;` was emitted as `scaled = 2.0;` -- the
-        // division dropped and the variable overwritten with the divisor -- by
-        // the Zig, C AND Rust backends alike. Five occurrences in three specs
-        // (numeric/tf3.t27:139 and :253, ternary/hybrid_bigint.t27:168 and
-        // :235, server/sse.t27:265), every one of them valid output in the
-        // target language and none of them the stated program.
-        //
-        // `%=`, `<<=` and `>>=` do not occur in the corpus today. They are
-        // here because the failure mode of a missing entry is silence, and the
-        // next spec to use one must not pay for that.
-        "/=" => Some("/"),
-        "%=" => Some("%"),
-        "<<=" => Some("<<"),
-        ">>=" => Some(">>"),
-        "|=" => Some("|"),
-        "&=" => Some("&"),
-        "^=" => Some("^"),
-        _ => None,
-    }
-}
-
 /// A numeric lexeme split into its digits and its declared width.
 ///
 /// `1u64` -> `("1", "u64")`. The suffix rides in the lexeme so that `value`
@@ -23101,7 +23026,7 @@ fn unwrap_single(node: &Node) -> &Node {
 /// what the spec said, or the target compiler refuses it by name. Both are
 /// better than ` = `, which compiles and means something else.
 fn assign_op_text(extra_op: &str) -> String {
-    if let Some(op) = compound_binop(extra_op) {
+    if let Some(op) = operator_text::compound_binop(extra_op.as_bytes()) {
         return format!(" {}= ", op);
     }
     let t = extra_op.trim();
@@ -26268,28 +26193,6 @@ the parser reads the type as an array literal, and every backend loses it -- gen
     }
 }
 
-/// The number of value bits a t27 integer type holds, or `None` if the type is
-/// not a fixed-width integer.
-///
-/// Signed types report one bit fewer: `i32` holds 2^31 - 1, not 2^32 - 1. A
-/// check that used the full width would accept `const X: i32 = 3000000000`,
-/// which is the same defect with a smaller number.
-pub fn int_value_bits(ty: &str) -> Option<u32> {
-    match ty.trim() {
-        "u8" => Some(8),
-        "u16" => Some(16),
-        "u32" => Some(32),
-        "u64" => Some(64),
-        "usize" => Some(64),
-        "i8" => Some(7),
-        "i16" => Some(15),
-        "i32" => Some(31),
-        "i64" => Some(63),
-        "isize" => Some(63),
-        _ => None,
-    }
-}
-
 /// Whether a decimal literal fits a type of `bits` value bits.
 ///
 /// The `Err` arm is the load-bearing one, not a fallback. The values that
@@ -26320,7 +26223,7 @@ fn check_const_widths(node: &Node, result: &mut TypeCheckResult) {
             .filter(|c| c.kind == NodeKind::ExprLiteral)
             .map(|c| if c.value.is_empty() { c.name.clone() } else { c.value.clone() })
             .unwrap_or_default();
-        if let Some(bits) = int_value_bits(&node.extra_type) {
+        if let Some(bits) = int_type_names::int_value_bits(node.extra_type.as_bytes()) {
             // The lexer strips digit separators, so the literal arrives without
             // them. A filter here changed no test either -- verified by removing
             // it -- and `const A: u32 = 4_294_967_295` is checked end to end in
@@ -28768,24 +28671,11 @@ impl RustCodegen {
         }
     }
 
-    /// Bit width of a Rust integer type name. `usize`/`isize` are treated as
-    /// 64-bit, matching every target this repo builds for.
-    fn int_rank(ty: &str) -> u32 {
-        match ty.trim() {
-            "u8" | "i8" => 8,
-            "u16" | "i16" => 16,
-            "u32" | "i32" => 32,
-            "u64" | "i64" | "usize" | "isize" => 64,
-            "u128" | "i128" => 128,
-            _ => 0,
-        }
-    }
-
     /// Common type for a mixed-width binary operation: the wider operand wins.
     /// Equal ranks that still differ (`u32`/`i32`, `u64`/`usize`) resolve to
     /// the left operand, matching the left-biased inference above.
     fn join_int_types(a: &str, b: &str) -> String {
-        if Self::int_rank(a) >= Self::int_rank(b) {
+        if int_type_names::int_rank(a.as_bytes()) >= int_type_names::int_rank(b.as_bytes()) {
             a.to_string()
         } else {
             b.to_string()

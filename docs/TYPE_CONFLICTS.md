@@ -67,7 +67,6 @@ One concept, two definitions. These are the ones with a repair.
 
 | Name | Defs | Where | Suggested repair |
 |------|------|-------|------------------|
-| `AttentionOutput` | 2 | 2 files | Pick the rank (`[][]f32` is the defensible one -- one row per head) and define AttentionOutpu... |
 | `BenchmarkReport` | 2 | 2 files | Keep eval.t27's as the owner (benchmark.t27 already imports it), fold in pass_at_5/synth_rate... |
 | `BufgConfig` | 2 | 2 files | Hoist one BufgConfig (with fanout_capacity) into a shared openxc7-synth primitives module and... |
 | `CounterConfig` | 3 | 3 files | One CounterConfig in a shared openxc7-synth module (max_value is derivable from width; keep i... |
@@ -104,6 +103,7 @@ One concept, two definitions. These are the ones with a repair.
 | `SacredRule` | 2 | 2 files | Pick one governance spec as the owner of SacredRule (sacred_governance.t27 has the richer rul... |
 | `SearchResult` | 4 | 4 files | Have specs/vsa/similarity_search.t27 use `vsa::core::SearchResult` and decide once whether th... |
 | `Session` | 3 | 3 files | Extract the sandbox Session (plus Timestamp and SessionStatus) into one module both sandbox s... |
+| `SkillMeta` | 2 | 2 files | Keep loader.t27's record as the owner and rename catalog.t27's projection to CatalogSkillMeta -- it only ever renders name/description/location; the two halves are one ported crate. |
 | `Signal` | 2 | 2 files | Decide whether RACE emits through the Trinity HIR. If yes, delete rtl.t27's Signal/Assignment... |
 | `SkipList` | 2 | 2 files | Keep gen_skiplist_impl.t27 faithful to upstream trinity (its fixed [32]/[16] pools are the port's point), and let skip_list.t27 keep the generic `SkipList(T)`; if the shapes ever converge, have the port `use` the collections type. |
 | `SystemConfig` | 2 | 2 files | Make one board-integration template with the full SystemConfig and let each board supply valu... |
@@ -128,7 +128,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 36 names
+## DISTINCT -- 38 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -143,9 +143,11 @@ whether to rename.
 | `CompileResult` | 2 | 2 files | Rename eval.t27's to SandboxCompileResult; it is used by exactly one function. |
 | `Config` | 3 | 3 files | Rename the narrow two (MonitorConfig, ParsedConfig -- the third is really a parse result, not... |
 | `Diagnostic` | 2 | 2 files | Leave both, but rename the protocol one LspDiagnostic (or require the qualified `lsp-schema::... |
+| `Entry` | 2 | 2 files | Leave both: a consensus-chain step (mvp_v3) and a hash-table cell (port). If a reader ever collides, rename the port's to HashEntry -- port-side renames are established (#7491). |
 | `EnvVar` | 2 | 2 files | Two fixes, unrelated: (a) leave the types alone, they are genuinely different; (b) fix the fi... |
 | `Episode` | 2 | 2 files | Nothing to converge. If the name ever collides in one reader, rename lotus.t27's loop entry to `LotusStep`. |
 | `Info` | 3 | 3 files | Two things: have account/repo.t27 `use account::schema` instead of re-declaring Info and the ... |
+| `Inputs` | 4 | 4 files | Nothing to converge: the Verilog port-list convention -- every module's wire bundle is named Inputs the way every clock is clk. Follow blink_working.t27's BlinkInputs prefix if the noise ever matters. |
 | `Instance` | 3 | 3 files | Leave the three types; the ambiguity is in the name. If cross-spec resolution matters, qualif... |
 | `KnowledgeGraph` | 3 | 3 files | Delete specs/igla/coder/_tmp_pipeline_import.t27 — it is a leaked working copy, and removing ... |
 | `LedOutputs` | 2 | 2 files | No defect. If the type namespace is ever flattened, prefix with the module (HeartbeatLeds, Di... |
