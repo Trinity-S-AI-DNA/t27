@@ -12,6 +12,13 @@ outputs:
   `aarch64-linux-gnu-gcc driver.c out.o`; elsewhere a Mach-O `MH_OBJECT` for arm64
   (`--macho`, specs/tri/t27b/macho.t27), which links with
   `cc driver.c out.o`.
+  * Each fn whose parameters and result are scalars (integers up to 64 bits, bool,
+    f32, f64 and i128) is exported under its t27 name, as gen-c names it. C calls it by
+    its prototype and Rust through `extern "C"`, because for these types t27b's calling
+    convention is AAPCS64 (elf.t27, "the C ABI", #8948).
+  * A fn that passes or returns an aggregate, or takes a stack parameter, is not
+    exported, and `build` names it in a note (see #8972). t27b's own `__t27b_*`
+    routines are never exported.
 
 The JIT runs on arm64 macOS and arm64 Linux. The Railway t27b lab
 (`contrib/railway/t27b-lab`) runs the Linux build under qemu-user on x86_64.
