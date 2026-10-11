@@ -27535,8 +27535,8 @@ impl RustCodegen {
             )
         };
         self.current_mut_slice_params = mut_slices.into_iter().collect();
-        if let Some(body) = node.extra_return_type.trim().strip_prefix("struct").map(|b| b.trim().trim_start_matches('{').trim_end_matches('}')) {
-            let fields: Vec<String> = Self::split_type_list(body).unwrap_or_default().iter().filter_map(|f| f.split_once(':')).map(|(n, t)| format!("pub {}: {}", rust_ident(n.trim()), Self::t27_type_to_rust(t))).collect();
+        let anon = node.extra_return_type.trim().strip_prefix("struct").map(|b| b.trim().trim_start_matches('{').trim_end_matches('}').trim().trim_end_matches(','));
+        if let Some(fields) = anon.filter(|b| !b.contains('{')).and_then(Self::split_type_list).map(|v| v.iter().filter_map(|f| f.split_once(':')).map(|(n, t)| format!("pub {}: {}", rust_ident(n.trim()), Self::t27_type_to_rust(&t.replace("[ ", "[").replace(" ]", "]").replace("] ", "]").replace("? ", "?")))).collect::<Vec<_>>()).filter(|v| !v.is_empty()) {
             self.fn_ret_type = format!("{}_ret", node.name); // #8891: an anonymous struct return gets a name
             self.write(&format!("#[allow(non_camel_case_types)]\n#[derive(Debug, Clone)]\npub struct {} {{ {} }}\n\n", self.fn_ret_type, fields.join(", ")));
         }
@@ -28807,7 +28807,7 @@ impl RustCodegen {
         }
         if node.kind == NodeKind::ExprStructLit && node.name.is_empty() && !ty.contains([' ', '<', '[']) { // #8891: `.{ .. }` takes the type
             return self.expr_to_rust(&Node { name: ty.to_string(), ..node.clone() }); }
-        if ty.starts_with("Vec<") && node.kind == NodeKind::ExprIndex && node.children.get(1).is_some_and(|i| i.extra_op == "..") {
+        if ty.starts_with("Vec<") && !self.type_params.iter().any(|p| ty == format!("Vec<{p}>")) && node.kind == NodeKind::ExprIndex && node.children.get(1).is_some_and(|i| i.extra_op == "..") {
             return format!("({}).to_vec()", self.expr_to_rust(node)); } // #8891: a returned slice is an owned Vec
         let s = self.expr_to_rust(node);
         if !Self::is_int_type(ty) {
@@ -29072,7 +29072,8 @@ impl RustCodegen {
                     }
                 }
                 // The callee's name went through `rust_ident` at `gen_fn`; the call must too.
-                format!("{}({})", rust_ident(&node.name), args.join(", "))
+                let name = node.name.strip_prefix("self.").map_or_else(|| rust_ident(&node.name), |m| format!("self_.{m}")); // #8891
+                format!("{}({})", name, args.join(", "))
             }
             NodeKind::ExprArrayLiteral => {
                 if node.children.is_empty() && !node.extra_size.trim().is_empty() {
@@ -29144,9 +29145,7 @@ impl RustCodegen {
                     // return type of the function being emitted - exactly the
                     // case the shorthand is written for. Without it the variant
                     // was printed on the LEFT of the separator: `escalate::`.
-                    if let Some(e) = self.decl_types.get(&format!(".{}", node.name)).filter(|e| !e.is_empty()) {
-                        format!("{}::{}", e, node.name) // #8891: the one enum declaring the variant
-                    } else if self.enum_names.contains(&self.fn_ret_type) {
+                    if let Some(e) = self.decl_types.get(&format!(".{}", node.name)).filter(|e| !e.is_empty()) { format!("{}::{}", e, rust_ident(&node.name)) } else if self.enum_names.contains(&self.fn_ret_type) { // #8891: the one enum declaring it first
                         format!("{}::{}", self.fn_ret_type, node.name)
                     } else {
                         node.name.clone()
