@@ -7578,7 +7578,7 @@ fn lowerability_models_keep_real_source_signatures() {
     for (module, source, signatures) in [
         ("nn_phi_rope", "specs/nn/phi_rope.t27", vec![
             ("pub fn phi_rope_theta(i: usize, dim: usize) -> f64", r#"{ name := "phi_rope_theta", params := [("i", (.struct "usize")), ("dim", (.struct "usize"))], ret := (some (.struct "f64")), body := [] }"#),
-            ("pub fn phi_rope_rotate(x: Vec<f64>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
+            ("pub fn phi_rope_rotate(x: impl AsRef<[f64]>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
         ]),
         ("nn_sacred_attention", "specs/nn/sacred_attention.t27", vec![
             ("pub fn sacred_scale() -> f64", r#"{ name := "sacred_scale", params := [], ret := (some (.struct "f64")), body := [] }"#),
