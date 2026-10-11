@@ -476,21 +476,8 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         Ok(c) => c,
         Err(e) => return codegen_error(&e),
     };
-    // A function taking or returning a struct or a str, or with stack
-    // parameters, uses t27b's own convention (an aggregate is passed by
-    // address, a stack parameter is one full word), not the platform's, so
-    // no C caller can link to it. `__t27b_*` helpers are never exported and
-    // need no note.
-    let mut names: Vec<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
-    for &id in &prog.internal_abi {
-        if !names[id as usize].starts_with("__t27b_") {
-            errln!(
-                "t27b: note: `{}` takes or returns a struct or a str, or takes more than 8 parameters of a class, and is not exported",
-                names[id as usize]
-            );
-        }
-        names[id as usize].clear();
-    }
+    let (names, notes) = macho::symbols(prog); // which fns get a symbol: specs/tri/t27b/elf.t27, "the C ABI"
+    notes.iter().for_each(|n| errln!("t27b: note: {}", n));
     let obj = ph.time("emit", || {
         codegen::link(Vec::new(), None, &code, prog.funcs.len()).map(|l| (if o.elf { macho::elf_object(&l, &names, &prog.data, &prog.globals) } else { macho::object(&l, &names, &prog.data) }, l.code.len()))
     });

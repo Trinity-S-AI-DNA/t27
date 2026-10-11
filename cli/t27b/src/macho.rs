@@ -13,6 +13,13 @@ mod spec; // t27c gen-rust of specs/tri/t27b/macho.t27
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod elf; // t27c gen-rust of specs/tri/t27b/elf.t27
 
+/// Each function's symbol ("" for none), and a note for each one refused: elf.t27's `export_kind` (#8948).
+pub fn symbols(prog: &crate::ir::Program) -> (Vec<String>, Vec<String>) {
+    let k = |i: usize| elf::export_kind(prog.funcs[i].name.as_bytes(), prog.internal_abi.contains(&(i as u32)));
+    let notes = (0..prog.funcs.len()).filter(|&i| k(i) == elf::REFUSED).map(|i| format!("`{}` {}", prog.funcs[i].name, elf::REFUSED_NOTE)).collect();
+    ((0..prog.funcs.len()).map(|i| if k(i) == elf::EXPORT { prog.funcs[i].name.clone() } else { String::new() }).collect(), notes)
+}
+
 /// Serialise a linked image (no prefix) with one global symbol per function.
 /// `names[i]` is the t27 name of function i; the symbol is `_` + name. An
 /// empty name exports nothing (a function only other functions call).
