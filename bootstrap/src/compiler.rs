@@ -10758,7 +10758,7 @@ impl Codegen {
             NodeKind::ExprUnary => {
                 self.write(&node.extra_op);
                 if !node.children.is_empty() {
-                    self.gen_expr(&node.children[0]);
+                    self.gen_expr_maybe_paren(&node.children[0]); // #6549: -(a + b), never -a + b
                 }
             }
             NodeKind::ExprFieldAccess => {
