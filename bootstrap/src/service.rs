@@ -4282,6 +4282,9 @@ pub fn run_silicon(
         stages.push(Stage { name: "bitstream REUSED", secs: 0.0, code: Some(0), artefact: file_len(&bit_path), note });
         break 'build;
     }
+    // #8915: the DUT-alone synthesis of the datapath check reads only the generated Verilog, so it runs beside the main yosys
+    let dp_script = format!("read_verilog -sv {}; synth_xilinx -family xc7 -flatten -run :coarse; techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; alumacc; opt; memory -nomap; opt_clean; synth_xilinx -family xc7 -flatten -run map_memory:; stat", v_path.display());
+    let (mut dp_job, mut dp_res) = (Some(std::thread::spawn(move || run(Command::new("yosys").args(["-p", &dp_script])))), None::<(Option<i32>, String, String)>);
     for attempt in 0..6u32 {
         let t = Instant::now();
         let chparam = match chain_override {
@@ -4363,17 +4366,7 @@ pub fn run_silicon(
         // seconds, and that is cheap against four months of a silent wrong answer.
         let t_dp = Instant::now();
         let wrapper_carry = carry4_count(&log);
-        let (dc, dout, _) = run(Command::new("yosys").args([
-            "-p",
-            &format!(
-                "read_verilog -sv {}; \
-                 synth_xilinx -family xc7 -flatten -run :coarse; \
-                 techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; \
-                 alumacc; opt; memory -nomap; opt_clean; \
-                 synth_xilinx -family xc7 -flatten -run map_memory:; stat",
-                v_path.display()
-            ),
-        ]));
+        let (dc, dout, _) = dp_res.get_or_insert_with(|| dp_job.take().and_then(|j| j.join().ok()).unwrap_or_default()).clone();
         let dut_carry = if dc == Some(0) { Some(carry4_count(&dout)) } else { None };
         let (dp_code, dp_note) = match (wrapper_carry > WRAPPER_CARRY4_FLOOR, dut_carry) {
             // W822 (T553): report the EXERCISED FRACTION, not just "live".
@@ -4558,6 +4551,7 @@ pub fn run_silicon(
             _ => break,
         }
     }
+    if let Some(j) = dp_job.take() { let _ = j.join(); } // #8915: a failed main yosys never leaves the datapath one running
 
     if let Some(st) = yosys_stage { stages.push(st); }
     if let Some(st) = datapath_stage { stages.push(st); }
