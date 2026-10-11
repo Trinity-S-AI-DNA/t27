@@ -71,8 +71,6 @@ MERGE_CRITICAL = (
 #   len(MERGE_CRITICAL) + len(NOT_MERGE_CRITICAL) + len(unclassified)
 # should equal the number of workflow files present.
 #
-# Two of those unclassified carried `pull_request: branches: [master]` -- the very defect
-# this check exists to detect. 
 #
 # A ceiling rather than a refusal, because some files cannot be classified in the
 # commit that discovers them and a gate that is red on the day it lands teaches
@@ -96,6 +94,8 @@ NOT_MERGE_CRITICAL = {
     "needs-boundary.yml": "it labels issues that name no boundary; labelling gates no merge",
     "queen-export-push.yml": "it pushes bee branches from the container on a schedule; the gates on the pull requests they become are what gate a merge",
     "queen-publish.yml": "it opens pull requests on a schedule; the gates on those pull requests are what gate a merge",
+    "t27o-release.yml": "it publishes the signed t27o release on tag push; a tag is not a merge and it gates none",
+    "t27o-golden.yml": "a reusable golden-spec job other workflows call; the caller's own checks gate the merge, not this file",
     "queen-refile.yml": "it re-files issues no bee can take again; filing work gates no merge",
     "queen-watchdog.yml": "it asks whether the swarm answers and restarts it; nothing it does gates a merge",
     "pusher.yml": "it reads the system and writes one issue; it gates nothing and must never block a merge",
