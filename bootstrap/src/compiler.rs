@@ -9615,6 +9615,13 @@ impl Codegen {
         count_ident_assigns(&node.children, &mut assign_counts);
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         for stmt in &node.children {
+            // #8980: `then elapsed_time_ns < 100` names a clock a Zig 0.16 test lacks (no std.Io),
+            // and no bench_* fn is ever called; say the budget was not lowered, as for a bare `;`.
+            if mentions_clock(stmt) {
+                self.write_indent();
+                self.write_line("// bench budget not lowered: elapsed_time_* has no clock here (#8980)");
+                continue;
+            }
             let fresh_binding = self.block_fresh_binding(stmt, &mut bound);
             let tuple_binding = stmt.kind == NodeKind::StmtAssign
                 && stmt.children.len() >= 2
@@ -10433,6 +10440,12 @@ impl Codegen {
                         "round" => Some("@round"),
                         "min" => Some("@min"),
                         "max" => Some("@max"),
+                        // #8980: `exp(` 56 times, `log(` 28, `tanh(` 21 (Zig has no `@tanh`).
+                        "exp" => Some("@exp"),
+                        "log" => Some("@log"),
+                        "sin" => Some("@sin"),
+                        "cos" => Some("@cos"),
+                        "tanh" => Some("std.math.tanh"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -24622,6 +24635,10 @@ fn return_unsized(elem: String) -> String {
 /// Substring matching is wrong here and cheaply so: `T` occurs inside `Trit`,
 /// `TritCell` and `Vec<Trit>`, and adding `<T>` to every function mentioning any
 /// of those would break signatures that were already correct.
+fn mentions_clock(n: &Node) -> bool {
+    (n.kind == NodeKind::ExprIdentifier && n.name.starts_with("elapsed_time_")) || n.children.iter().any(mentions_clock)
+}
+
 fn mentions_type(hay: &str, name: &str) -> bool {
     let bytes = hay.as_bytes();
     let mut from = 0usize;
