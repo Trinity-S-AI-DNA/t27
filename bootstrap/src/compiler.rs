@@ -28155,7 +28155,13 @@ impl RustCodegen {
             | "@sin" | "@cos" | "@tan"
                 if one =>
             {
-                format!("({}).{}()", a(0), &name[1..])
+                // Check if the argument is an untyped float literal (contains '.' but no type suffix)
+                if a(0).contains('.') && !a(0).contains('_') {
+                    // Add f64 suffix to avoid "can't call method on ambiguous numeric type {float}"
+                    format!("({}_f64).{}()", a(0), &name[1..])
+                } else {
+                    format!("({}).{}()", a(0), &name[1..])
+                }
             }
             // Operators in Rust.
             "@rem" if two => format!("({} % {})", a(0), a(1)),
@@ -29070,7 +29076,11 @@ impl RustCodegen {
                     .first()
                     .map(|a| a.chars().any(|c| c.is_ascii_alphabetic()))
                     .unwrap_or(false);
-                if receiver_is_typed
+                let receiver_is_float_literal = args
+                    .first()
+                    .map(|a| a.contains('.') && !a.contains('_'))
+                    .unwrap_or(false);
+                if (receiver_is_typed || receiver_is_float_literal)
                     && !self.in_const_init
                     && !self.declared_fns.contains(&node.name)
                     && matches!(
