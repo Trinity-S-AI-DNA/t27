@@ -162,6 +162,10 @@ _k0:  ; line 3                          _k0:  ; line 3
   * `u8`, `u16`, `u32`, `u64`;
   * `i8`, `i16`, `i32`, `i64`;
   * `usize` (= `u64`) and `isize` (= `i64`).
+* Boundary declarations:
+  * `boundary Name { ... }` containing `extern fn name(...) -> T` declarations.
+  * Each extern function declares its name, parameters, and return type.
+  * Functions in a boundary are called through a C ABI interface.
 * Statements:
   * `var` / `const` locals;
   * `=` and the compound assignments `+= -= *= /= %= &= |= ^=` (the t27c
@@ -179,6 +183,21 @@ _k0:  ; line 3                          _k0:  ; line 3
 * `test name { ... }` blocks with `assert(c)` and `assert_eq(a, b)`. As in
   t27c's Zig backend, the first plain assignment to a fresh name in a test
   block declares it.
+
+### Boundary Interface
+
+t27b supports calling host functions through a named boundary interface:
+
+```t27
+boundary Host {
+    extern fn now_seconds() -> u32;
+    extern fn send(data: []u8) -> bool;
+}
+```
+
+- During `t27b test`, boundary functions are provided as fake implementations
+- During `t27b build`, boundary functions become unresolved C symbols
+- Calls use the C ABI: integers and pointers are passed directly, return values follow C conventions
 
 Everything else is rejected by name. That includes structs, enums, floats,
 strings, slices and arrays, casts to or from a float or to `bool`,
