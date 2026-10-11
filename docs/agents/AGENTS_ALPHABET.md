@@ -616,7 +616,7 @@ two domains, and a tool the Queen runs daily may still be N's or K's to answer f
 | **J** | 4 | 4 | `gHashTag/trinity:tri/swarm`, `mcp/inngest-dev`, `tri/loop`, `tri/topic`, *t27/wave-audit*, *trinity/board-sync*, *trinity/tech-tree*, *trinity/ux-wave* |
 | **K** | 7 | 1 | `gHashTag/trinity:tri/fpga`, `gHashTag/trinity:tri/sacred-const`, `tri/fleet`, `tri/fpga`, `tri/rtl`, `tri/sweep`, `tri/synth`, *trinity/fpga-synth* |
 | **L** | 2 | 0 | `tri/quantifiers`, `tri/unparsed` |
-| **M** | 4 | 5 | `gHashTag/trinity:tri/bench`, `tri/census`, `tri/issues`, `tri/window`, *t27/measure-corpus*, *trinity/cloud*, *trinity/god-mode*, *trinity/status*, *trinity/tri* |
+| **M** | 4 | 6 | `gHashTag/trinity:tri/bench`, `tri/census`, `tri/issues`, `tri/window`, *t27/hot-reload-steward*, *t27/measure-corpus*, *trinity/cloud*, *trinity/god-mode*, *trinity/status*, *trinity/tri* |
 | **N** | 5 | 2 | `gHashTag/trinity:tri/fib`, `gHashTag/trinity:tri/gematria`, `gHashTag/trinity:tri/lucas`, `gHashTag/trinity:tri/phi`, `gHashTag/trinity:tri/vsa`, *trinity/trinity-test*, *trinity/vsa-verify* |
 | **O** | 3 | 2 | `gHashTag/trinity:tri/omega`, `gHashTag/trinity:tri/swarm`, `tri/health`, *t27/phi-loop*, *t27/tri* |
 | **P** | 9 | 0 | `gHashTag/trinity:tri/bio`, `gHashTag/trinity:tri/blindspots`, `gHashTag/trinity:tri/conscious`, `gHashTag/trinity:tri/constants`, `gHashTag/trinity:tri/cosmos`, `gHashTag/trinity:tri/particles`, `gHashTag/trinity:tri/quantum`, `gHashTag/trinity:tri/sacred-const`, `gHashTag/trinity:tri/spiral` |
@@ -633,7 +633,7 @@ two domains, and a tool the Queen runs daily may still be N's or K's to answer f
 | **TI** | 1 | 0 | `gHashTag/trinity:tri/identity` |
 
 Tools are written in `code`, skills in *italics*. The Queen is not listed: she
-holds all 92 tools and all 27 skills by rule 1, which is why her own cards say so
+holds all 92 tools and all 28 skills by rule 1, which is why her own cards say so
 rather than repeating this table.
 
 Each binding is recorded twice and checked both ways: a tool card's `AGENTS` must
