@@ -20,6 +20,10 @@ mod cse_hoist;
 #[path = "../gen/rust/compiler/int_type_names.rs"]
 #[allow(dead_code, unused_parens)]
 mod int_type_names;
+// specs/compiler/operator_text.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/operator_text.rs"]
+#[allow(dead_code, unused_parens)]
+mod operator_text;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -17577,7 +17581,7 @@ impl VerilogCodegen {
                         self.in_lvalue = true;
                         self.gen_verilog_expr(lhs);
                         self.in_lvalue = false;
-                        if let Some(op) = compound_binop(&node.extra_op) {
+                        if let Some(op) = operator_text::compound_binop(node.extra_op.as_bytes()) {
                             self.write(asn);
                             self.gen_verilog_expr(lhs);
                             self.write(&format!(" {} ", op));
@@ -19986,7 +19990,7 @@ long double: fabsl, default: llabs)(x)",
         // (#2846) -- must not be promoted from a comment to code. The comment
         // was hiding it; making it a `_Static_assert` turns one silent defect
         // into a syntax error that cascades through the rest of the file.
-        if Self::has_empty_operand(text) {
+        if operator_text::has_empty_operand(text.as_bytes()) {
             return false;
         }
         // `const_defs` alone is too narrow: requiring it rejects 1742
@@ -20006,32 +20010,6 @@ long double: fabsl, default: llabs)(x)",
         Self::identifiers_in(text)
             .iter()
             .all(|n| Self::is_c_word(n) || self.declares(n))
-    }
-
-    /// Does an operator in this rendered expression have nothing after it?
-    ///
-    /// `(BOARD_NAME != )` is the shape: the renderer dropped the right-hand
-    /// side. Ten specs in `boards/` and `fpga/` carry one.
-    fn has_empty_operand(text: &str) -> bool {
-        let b = text.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if matches!(b[i], b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' | b'^') {
-                let mut j = i + 1;
-                while j < b.len()
-                    && matches!(b[j], b'=' | b'<' | b'>' | b'&' | b'|' | b' ')
-                {
-                    j += 1;
-                }
-                if j >= b.len() || b[j] == b')' {
-                    return true;
-                }
-                i = j;
-                continue;
-            }
-            i += 1;
-        }
-        false
     }
 
     /// A repeated element this emitter writes as a C value: a non-string
@@ -23006,37 +22984,6 @@ fn resolve_import_path(
 // Compiler Interface
 // ============================================================================
 
-/// The binary operator inside a compound assignment: "|=" -> "|".
-/// All three backends tested `extra_op == "+="` and fell through to " = " otherwise,
-/// so accepting a new compound operator without touching them would have emitted
-/// `x = rhs` for `x |= rhs` -- a miscompilation rather than an error.
-fn compound_binop(extra_op: &str) -> Option<&'static str> {
-    match extra_op {
-        "+=" => Some("+"),
-        "-=" => Some("-"),
-        "*=" => Some("*"),
-        // `/=` was missing, and the three call sites all fall back to a plain
-        // ` = `. So `scaled /= 2.0;` was emitted as `scaled = 2.0;` -- the
-        // division dropped and the variable overwritten with the divisor -- by
-        // the Zig, C AND Rust backends alike. Five occurrences in three specs
-        // (numeric/tf3.t27:139 and :253, ternary/hybrid_bigint.t27:168 and
-        // :235, server/sse.t27:265), every one of them valid output in the
-        // target language and none of them the stated program.
-        //
-        // `%=`, `<<=` and `>>=` do not occur in the corpus today. They are
-        // here because the failure mode of a missing entry is silence, and the
-        // next spec to use one must not pay for that.
-        "/=" => Some("/"),
-        "%=" => Some("%"),
-        "<<=" => Some("<<"),
-        ">>=" => Some(">>"),
-        "|=" => Some("|"),
-        "&=" => Some("&"),
-        "^=" => Some("^"),
-        _ => None,
-    }
-}
-
 /// A numeric lexeme split into its digits and its declared width.
 ///
 /// `1u64` -> `("1", "u64")`. The suffix rides in the lexeme so that `value`
@@ -23079,7 +23026,7 @@ fn unwrap_single(node: &Node) -> &Node {
 /// what the spec said, or the target compiler refuses it by name. Both are
 /// better than ` = `, which compiles and means something else.
 fn assign_op_text(extra_op: &str) -> String {
-    if let Some(op) = compound_binop(extra_op) {
+    if let Some(op) = operator_text::compound_binop(extra_op.as_bytes()) {
         return format!(" {}= ", op);
     }
     let t = extra_op.trim();
