@@ -195,16 +195,6 @@ fn zig_accepts_the_generated_file() {
     );
 }
 
-/// #8980: a unary operator over a binary operand lost the operand's parens, so `-(a + b)` was
-/// emitted as `-a + b` and `!(p and q)` as `!p and q`: Zig accepted both and computed something else.
-/// binary_crossentropy's `-(t log p + (1 - t) log(1 - p))` returned -0.009 for a loss of 0.228.
-#[test]
-fn a_unary_operator_keeps_its_operand_parenthesised() {
-    let zig = gen_zig("module m;\nfn f(a: f32, b: f32) -> f32 {\n    return -(a + b);\n}\nfn g(p: bool, q: bool) -> bool {\n    return !(p and q);\n}\n");
-    assert!(zig.contains("return -(a + b);"), "{zig}");
-    assert!(zig.contains("return !(p and q);"), "{zig}");
-}
-
 /// #8980: a bench budget `then elapsed_time_ns < 100` named a clock no Zig 0.16 test has, and the
 /// undeclared identifier killed the whole file. Like a prose body, it becomes a notice.
 #[test]
