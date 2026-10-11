@@ -145,6 +145,8 @@ mod tuple;
 mod aw; // t27c gen-rust of specs/tri/t27b/ast_walk.t27: walks of a list of nodes, read from `flat`'s bytes
 #[path = "../../../gen/rust/tri/t27b/ast_scan.rs"] #[allow(dead_code, unused_parens, unused_variables)]
 mod ax; // t27c gen-rust of specs/tri/t27b/ast_scan.t27: the nodes a scan of a list collects, as marks
+#[path = "../../../gen/rust/tri/t27b/zig_defects.rs"] #[allow(dead_code, unused_parens)]
+mod zd; // t27c gen-rust of specs/tri/t27b/zig_defects.t27: Zig-side defects the reference would hit
 #[path = "../../../gen/rust/tri/t27b/ast_shape.rs"] #[allow(dead_code, unused_parens, unused_variables)]
 mod sh; // t27c gen-rust of specs/tri/t27b/ast_shape.t27: a node's shape, and the scans of the top-level items
 
@@ -7723,9 +7725,6 @@ fn undeclared_field_type(ty: &str, declared: &HashSet<&str>) -> Option<String> {
 /// t27c's Zig backend writes every `_cse*` temporary the optimizer made at
 /// the very top of the fn body. One that reads a local of the body then
 /// names it before its declaration: "use of undeclared identifier".
-fn cse_hoist_defect(f: &Node) -> Option<String> {
-    marked(&f.children, ax::cse_reads).find(|n| !f.params.iter().any(|(p, _)| *p == n.name)).map(|n| n.name.clone())
-}
 
 /// The reference's `collect_mutable_names`, exactly: assignment targets that
 /// are a name, or whose immediate base (index or field) is one, looking into
@@ -7737,9 +7736,6 @@ fn ref_mutable_names(ns: &[Node], out: &mut HashSet<String>) {
 /// Does Zig count `var name` as mutated anywhere in `ns`? An assignment whose
 /// target reaches `name` through fields and indexes but no `.*`, `&` of such
 /// a path, or a method call on it. Errs toward yes: a yes refuses nothing.
-fn zig_mutates(ns: &[Node], name: &str) -> bool {
-    let (a, t) = flat(ns); aw::zig_mutates(&a, &t, name.as_bytes())
-}
 
 /// `x.len()` and `len(x)` lower as the length FIELD, as t27c's Zig backend
 /// prints both (W570; Zig has no `len` method on a slice or an array). Which
