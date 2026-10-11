@@ -41,6 +41,8 @@ pub enum TrapStyle {
     Jit,
     /// Object file: stubs are `brk #kind`.
     Brk,
+    /// ELF object file (specs/tri/t27b/elf.t27): `brk` stubs, and module-level vars in .data.
+    Elf,
 }
 
 /// Machine code of one function before linking.
@@ -123,34 +125,11 @@ pub fn canon(c: i128, ty: Ty) -> u64 {
     }
 }
 
-/// Move the register image of float `ty` from general register `rn` to FP
-/// register `rd`: `fmov dd, xn` for F64, `fmov sd, wn` for F32.
-fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 {
-    if ty == Ty::F32 {
-        a64::fmov_s_w(rd, rn)
-    } else {
-        a64::fmov_d_x(rd, rn)
-    }
-}
-
-/// Move float `ty` from FP register `rn` to general register `rd`, in
-/// canonical form (an F32 zero-extended, like a u32).
-fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 {
-    if ty == Ty::F32 {
-        a64::fmov_w_s(rd, rn)
-    } else {
-        a64::fmov_x_d(rd, rn)
-    }
-}
-
-/// A double-precision FP instruction `w` in the precision of float `ty`.
-fn fp_op(ty: Ty, w: u32) -> u32 {
-    if ty == Ty::F32 {
-        a64::single(w)
-    } else {
-        w
-    }
-}
+/// Float `ty` from general register `rn` to FP register `rd`, from FP register `rn` to general register `rd`
+/// in canonical form, and a double-precision FP instruction `w` in `ty`'s precision: a64.t27's choices.
+fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) }
+fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
+fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
 
 fn narrow_ext(ty: Ty) -> Option<Ext> {
     match ty {
@@ -263,7 +242,7 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
     };
     let mut top = 0u32;
     for sl in &f.slots {
-        let a = sl.align.clamp(1, 8);
+        let a = sl.align.clamp(1, ip::ALIGN);
         let off = (top + a - 1) / a * a;
         g.agg_off.push(off);
         top = off + sl.size;
@@ -362,7 +341,7 @@ impl<'a> Gen<'a> {
                 self.stub_by_site.insert(site, l);
                 l
             }
-            TrapStyle::Brk => {
+            TrapStyle::Brk | TrapStyle::Elf => {
                 let kind = self.prog.sites[site as usize].kind;
                 self.stub_brk(kind)
             }
@@ -410,11 +389,11 @@ impl<'a> Gen<'a> {
             // An F64 parameter arrives in a d register; it gets a home like
             // any other variable and the prologue moves it there.
             let regs = Program::arg_regs(f);
-            let nint = regs.iter().filter(|r| !r.0).count();
+            let nint = regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0);
             let mut caller: Vec<Reg> = ((nint as Reg)..8).collect();
             caller.reverse();
             for (p, &(fp, k)) in regs.iter().enumerate() {
-                if !fp && k < 8 {
+                if !fp && k < 8 && f.vars[p].ty != Ty::I128 { // a pair parameter is homed in the frame
                     self.homes[p] = Home::Reg(k as Reg);
                 }
             }
@@ -622,6 +601,10 @@ impl<'a> Gen<'a> {
         for p in 0..f.nparams {
             let ty = f.vars[p].ty;
             let (fp, k) = regs[p];
+            if ty == Ty::I128 { // a pair parameter: one stp of x(k), x(k + 1) to its home (i128_plan.t27)
+                match (self.homes[p], stack[p]) { (Home::Slot(off), None) if ip::pair_imm(off) => pro.push(ip::pair_word(false, k as Reg, k as Reg + 1, SP, off)), (Home::None, None) => {}, _ => self.fail(format!("{}: a pair parameter on the stack, or homed past stp's reach", ip::REFUSED)) }
+                continue;
+            }
             if let Some(s) = stack[p] {
                 // A stack parameter: one full word above the saved x29/x30
                 // (an F64 is its bit pattern, homed in an x register too).
@@ -871,9 +854,15 @@ impl<'a> Gen<'a> {
                         self.stubs.push((l, Stub::AssertEq(*site, ra, rb)));
                         l
                     }
-                    TrapStyle::Brk => self.stub_brk(TrapKind::AssertEq),
+                    TrapStyle::Brk | TrapStyle::Elf => self.stub_brk(TrapKind::AssertEq),
                 };
                 self.bcond(Cond::Ne, l);
+            }
+            Stmt::Store { addr, off, value } if value.ty == Ty::I128 => {
+                let (a, p) = (self.eval(addr), self.pair(value));
+                let (r, lo, hi) = (self.use_nz(a, X16, Ty::Ptr), self.use_(p[0], X17, Ty::U64), self.use_(p[1], X8, Ty::U64));
+                self.pair_mem(false, lo, hi, r, *off);
+                for v in [p[1], p[0], a] { self.release(v); }
             }
             Stmt::Store { addr, off, value } => {
                 let ty = value.ty;
@@ -1021,6 +1010,7 @@ impl<'a> Gen<'a> {
 
     fn compute(&mut self, e: &Expr, dst: Option<Reg>) -> V {
         let ty = e.ty;
+        if ty == Ty::I128 && !matches!(e.kind, ExprKind::Call { .. }) { self.use_(V::Const(0), X16, ty); return V::Const(0); } // a pair goes by `pair`
         match &e.kind {
             ExprKind::Const(_) | ExprKind::Var(_) => {
                 let v = self.eval(e);
@@ -1224,9 +1214,9 @@ impl<'a> Gen<'a> {
                 }
             }
             ExprKind::Cast { arg, site } => {
-                let from = arg.ty;
+                // An i128 operand: i128_plan.t27's check of its high word, then its low word cast as a u64 or an i64.
+                let (from, v) = if arg.ty == Ty::I128 { let p = self.pair_arith(ip::cast_program(ty.signed(), *site != 0), arg, &Expr { ty: Ty::I128, kind: ExprKind::Const(0) }, *site); self.release(p[1]); ([Ty::U64, Ty::I64][ty.signed() as usize], p[0]) } else { (arg.ty, self.eval(arg)) };
                 let wide = from.is64();
-                let v = self.eval(arg);
                 let ra = self.use_nz(v, X16, from);
                 if *site != 0 && !ty.can_widen_from(from) {
                     // The operand is canonical in a W register (32 bits or
@@ -1300,9 +1290,9 @@ impl<'a> Gen<'a> {
             ExprKind::Global(k) => {
                 // The JIT appends one more blob after `Program::data`: a
                 // table of the absolute address of every global, which live
-                // in writable memory outside the executable image. An object
-                // file has no such table (no __DATA section yet).
-                if self.style != TrapStyle::Jit {
+                // in writable memory outside the executable image. An ELF object
+                // carries it in .data; a Mach-O object has none (no __DATA section yet).
+                if self.style == TrapStyle::Brk {
                     self.fail(format!("{} (no writable data section)", GLOBAL_IN_OBJECT));
                 }
                 if *k >= 4096 {
@@ -1486,9 +1476,11 @@ impl<'a> Gen<'a> {
     }
 
     /// An i128's low and high word (specs/tri/t27b/i128_plan.t27): a literal's two words, a variable's two frame
-    /// words, or a call's x0 and x1. Any other i128 expression is refused as not lowered yet.
+    /// words, a call's x0 and x1, a field's ldp or an operator's program (a narrower operand extended); else refused.
     fn pair(&mut self, e: &Expr) -> [V; 2] {
         match &e.kind {
+            _ if e.ty != Ty::I128 => self.pair(&Expr { ty: Ty::I128, kind: ExprKind::Widen(Box::new(e.clone())) }), // a shift's amount
+            ExprKind::Load { addr, off } => { let a = self.eval(addr); let r = self.use_nz(a, X17, Ty::Ptr); self.release(a); let b = self.depth; self.depth = b + 2; self.pair_mem(true, 9 + b as Reg, 10 + b as Reg, r, *off); [V::Temp(b), V::Temp(b + 1)] }
             ExprKind::Const(c) => { let m = c.unsigned_abs(); [ip::lit_lo(*c < 0, m as u64), ip::lit_hi(*c < 0, m as u64, (m >> 64) as u64)].map(|w| V::Const(w as i128)) }
             ExprKind::Var(v) => { let off = if let Home::Slot(o) = self.homes[*v as usize] { o } else { 0 }; [0, ip::HI_OFF].map(|k| { let (d, t) = self.dest(None); self.ldr_slot(d, off + k); self.done(d, t) }) }
             ExprKind::Call { func, args } => { let lo = self.call(*func, args, None, true); let (d, t) = self.dest(None); self.emit(a64::mov(true, d, ip::RET_HI)); [lo, self.done(d, t)] }
@@ -1498,10 +1490,10 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Checked `+ - *` and `@divTrunc` of two i128s: i128_plan.t27's program on the four words, copied into temps
+    /// An operator on two i128s, or a cast's check: i128_plan.t27's program on the four words, copied into temps
     /// x(9 + base) up, the last first (a word sits at or below its temp); the result is in the first two.
     fn pair_arith(&mut self, prog: u8, lhs: &Expr, rhs: &Expr, site: SiteId) -> [V; 2] {
-        let (base, div) = (self.depth, self.prog.func_index(ip::DIV_ROUTINE));
+        let (base, div) = (self.depth, self.prog.func_index(ip::routine(prog)));
         let w = [self.pair(lhs), self.pair(rhs)].concat();
         for v in w.iter().rev() { self.release(*v); }
         if prog == ip::PROG_NONE || base + ip::TEMPS as usize > TEMP_REGS || (ip::calls(prog) && div.is_none()) {
@@ -1521,6 +1513,13 @@ impl<'a> Gen<'a> {
         }
         self.depth = base + 2;
         [V::Temp(base), V::Temp(base + 1)]
+    }
+
+    /// An i128's words in lo and hi to or from [base + off]: one ldp or stp (i128_plan.t27's `pair_word`). A load's
+    /// lo and hi are temps, so a pair past x15 is refused, as one past the instruction's reach is.
+    fn pair_mem(&mut self, load: bool, lo: Reg, hi: Reg, base: Reg, off: u32) {
+        if !ip::pair_imm(off) || (load && hi > 15) { self.fail(format!("{}: a pair this deep or this far into memory is not lowered yet", ip::REFUSED)); }
+        self.emit(ip::pair_word(load, lo, hi, base, off));
     }
 
     /// Evaluate an i128 and hand `put` each word in a register, the low one (k = 0) first.
@@ -1579,6 +1578,7 @@ impl<'a> Gen<'a> {
         let base = self.depth;
         let mut vals: Vec<(V, Ty)> = Vec::with_capacity(args.len());
         for a in args {
+            if a.ty == Ty::I128 { let p = self.pair(a); vals.extend([(p[0], Ty::U64), (p[1], Ty::U64)]); continue; }
             let v = self.eval(a);
             vals.push((v, a.ty));
         }
@@ -1588,7 +1588,7 @@ impl<'a> Gen<'a> {
             self.str_slot(9 + i as Reg, off);
         }
         let callee = &self.prog.funcs[func as usize];
-        let regs = Program::arg_regs(callee);
+        let regs: Vec<(bool, usize)> = Program::arg_regs(callee).into_iter().zip(&callee.vars).flat_map(|((fp, k), v)| (0..1 + (v.ty == Ty::I128) as usize).map(move |i| (fp, k + i))).collect(); // a pair: two words
         let (stack, nstack) = Program::stack_args(&regs);
         let ret_fp = callee.ret.filter(|t| t.is_float());
         // Register arguments first (they touch only x0-x7, d0-d7 and x16),

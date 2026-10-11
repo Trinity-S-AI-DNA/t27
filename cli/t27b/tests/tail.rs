@@ -112,8 +112,8 @@ fn int_cast_traps_outside_its_result_type() {
     assert!(rejected(&lit.replace("b: u8 = @intCast(300)", "b = @intCast(id(3))")).contains("ExprCall(@intCast) at line 8"));
 }
 
-/// #8763: i128_traps.t27's `_expect_trap` tests stop where Zig 0.16's Debug build panics, at the line whose comment
-/// names that panic, interpreter and JIT at one site (`run`); its `_expect_pass` tests run through.
+/// #8763, #8913: i128_traps.t27's `_expect_trap` tests stop where Zig 0.16's Debug build panics, at the line whose
+/// comment names the trap, interpreter and JIT at one site (`run`); its `_expect_pass` tests run through.
 #[test]
 fn i128_arithmetic_traps_where_zig_panics() {
     let src = include_str!("i128_traps.t27");
@@ -122,7 +122,7 @@ fn i128_arithmetic_traps_where_zig_panics() {
         let at = o.err().map(|(k, l)| src.lines().nth(l as usize - 1).is_some_and(|s| s.ends_with(&format!("// {}", k.describe()))));
         assert_eq!(at, name.ends_with("_expect_trap").then_some(true), "{}", name);
     }
-    assert_eq!(r.iter().filter(|t| t.2.is_err()).count(), 11);
+    assert_eq!(r.iter().filter(|t| t.2.is_err()).count(), 17);
 }
 
 // ------------------------------------------------------------- @exp

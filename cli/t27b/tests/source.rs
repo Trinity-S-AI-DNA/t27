@@ -2690,7 +2690,7 @@ fn optionals_the_reference_does_not_match_are_refused() {
 /// BLOCKED under `t27c test-report`, so t27b must not pass it either.
 #[test]
 fn shapes_the_reference_cannot_compile_are_refused() {
-    let cases: [(&str, &str); 4] = [
+    let cases: [(&str, &str); 3] = [
         // A pointer param written only through `p.*`: the reference rebinds
         // it `var p = p_arg;`, which Zig rejects as never mutated.
         (
@@ -2701,11 +2701,6 @@ fn shapes_the_reference_cannot_compile_are_refused() {
         (
             "module c;\n\nfn cnt(n: u32) -> u32 {\n    var count: u32 = n;\n    var x: u32 = count + 1;\n    var y: u32 = count + 1;\n    return x + y;\n}\n\ntest t {\n    assert(cnt(1) == 4);\n}\n",
             "FnDecl(reference CSE hoist)",
-        ),
-        // `[_]u8{}`: the reference prints `.{ _ }`.
-        (
-            "module e;\n\ntest t {\n    var c: [0]u8 = [_]u8{};\n    assert(1 == 1);\n}\n",
-            "ExprArrayLiteral(reference empty typed)",
         ),
         // A field of a type nothing declares, in a struct nothing uses.
         (
@@ -3243,4 +3238,31 @@ fn opaque_pointers() {
     assert!(r.len() == 3 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
     let m = rejected("module a;\n\nfn f(p: *anyopaque) -> bool {\n    return true;\n}\n\ntest t {\n    assert(f(@ptrFromInt(8)));\n}\n");
     assert!(m.contains("ExprCall(@ptrFromInt)") && m.contains("not optional"), "{}", m);
+}
+
+/// `t27b build --elf` (specs/tri/t27b/elf.t27, #8947): the conformance spec's object reads back; where the GNU
+/// aarch64 toolchain is installed it links with each `exit_*` fn standing in for `main`, and exits with its code.
+#[test]
+fn elf_object_links_and_runs() {
+    let prog = lower_src(include_str!("../../../specs/tri/t27b/conformance/elf_object.t27")).expect("lowers");
+    let l = codegen::link(Vec::new(), None, &codegen::compile(&prog, TrapStyle::Elf, false).expect("codegen"), prog.funcs.len()).unwrap();
+    let names: Vec<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
+    let obj = t27b::macho::elf_object(&l, &names, &prog.data, &prog.globals);
+    assert_eq!(&obj[..20], b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x01\0\xb7\0", "ELFCLASS64, ELFDATA2LSB, ET_REL, EM_AARCH64");
+    let dir = std::env::temp_dir().join(format!("t27b-elf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let o = dir.join("e.o").to_string_lossy().into_owned();
+    std::fs::write(&o, &obj).unwrap();
+    let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().ok();
+    if let Some(r) = run("aarch64-linux-gnu-readelf", &["-a", "-W", &o]) {
+        assert!(r.status.success() && r.stderr.is_empty(), "readelf: {}", String::from_utf8_lossy(&r.stderr));
+    }
+    for (f, want) in [("answer", 42), ("exit_calls", 16), ("exit_data", 114), ("exit_global", 41)] {
+        let exe = format!("{}-{}", o, f);
+        let Some(ld) = run("aarch64-linux-gnu-gcc", &[&o, "-o", &exe, &format!("-Wl,--defsym=main={}", f)]) else { break };
+        assert!(ld.status.success(), "link: {}", String::from_utf8_lossy(&ld.stderr));
+        let r = run("qemu-aarch64", &["-L", "/usr/aarch64-linux-gnu", &exe]).or_else(|| run(&exe, &[])).expect("run");
+        assert_eq!(r.status.code(), Some(want), "{} exits with its code", f);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

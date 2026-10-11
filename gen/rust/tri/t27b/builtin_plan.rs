@@ -274,7 +274,10 @@ pub fn abi_bytes(bits: u32) -> u32 {
     if (bits <= 32) {
         return 4;
     }
-    return 8;
+    if (bits <= 64) {
+        return 8;
+    }
+    return 16;
 }
 
 pub fn size_of(operands: usize, k: u8, size: u32) -> u8 {

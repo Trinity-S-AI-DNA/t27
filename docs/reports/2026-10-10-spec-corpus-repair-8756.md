@@ -197,3 +197,45 @@ all-pass corpus. Seal coverage remains 2394 scanned, 2273 hold, 121 known
 broken; currency has 2297 current and zero stale generated hashes (94 missing
 spec paths, three none hashes). Fresh published-head CI remains necessary
 before merge.
+
+
+## Conflict refresh at c4fc14c2d (2026-10-11)
+
+GitHub marked #8749 and dependent #8771 CONFLICTING after upstream
+repaired overlapping specs. A normal merge incorporates master
+`c4fc14c2d83f2470ca468f3d72a3f8457f17051f`, preserving upstream authors.
+The seven conflicts are resolved in the source specs and ordinary seals.
+The graph keeps the previously measured admission/disclosure policy and
+its twelve executable tests. The two fixtures keep distinct module names
+and their honest local-value assertions. Optimizer keeps upstream's new
+executable test blocks; its two true-valued placeholders remain deferred
+prose. Its reference execution still blocks on duplicate enum member
+`String`; a matching generated hash is not an optimizer pass.
+
+The helper refactors and big-frame memory declarations already remove
+the defects for which upstream added exceptions. This merge removes the
+obsolete `bits`, `same`, secondary `clear` and big_frame exceptions. The
+first complete corpus run found no new failure and one now-fixed entry,
+orchestrator_bench. Only that entry is removed; max_entries falls72 to71.
+The native failure cap inherits upstream0. No cap is raised, no check
+is disabled, and neither the frozen compiler nor its seal is edited.
+
+Fresh measured checks on the merged source:
+- Rebuilt t27c, tri and t27b; native cargo suite161 tests, zero failures.
+- Native fixture/graph/big_frame/structure tests34/34,613 runtime assertions.
+- Ordinary seals: fixtures1/1 each and graph12/12; five hashes MATCH.
+  Optimizer seal records BLOCKED, not failing or passing execution.
+- Width scan1858 specs: two known, zero new, without a big_frame exception.
+- Duplicate scan671 bodies in195 groups; no new or growing group.
+- Seal coverage2392 scanned,2271 hold,121 known broken. Currency2295
+  current,zero stale hashes,94 missing sources,3 none. Type ratchet86/86 CLEAN.
+- All six related tracked Rust copies are ordinary gen-rust byte-identical.
+
+Evidence: master-c4fc-* under
+`/Users/ssdm4/trinity-results/spec-tests-7641/`. The corpus recheck and new
+head CI must finish before any merge claim; old31green checks certify only
+a34891bd3/cdac218f0. No hardware, model inference or reward is claimed.
+
+The final full corpus recheck is CLEAN: 71 observed primary failures match
+71 known entries, zero unexpected failures/passes, expiries or drift.
+This remains a ratchet result, not an all-passing corpus.

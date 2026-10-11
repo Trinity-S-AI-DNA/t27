@@ -7842,10 +7842,10 @@ fn corpus_classifier_matches_lean_completeness() {
     // prose files moved `checked` 245 -> 225, so the floor is held on the SUM:
     // a spec may move from checked to skipped when it turns out to be Markdown,
     // but neither number may simply evaporate. #8054 deleted 22 empty generated stubs and #8222 their
-    // theorems, so the sum moved 245 -> 223 by deletion, not by a theorem going quiet.
+    // theorems, so the sum moved 245 -> 223 by deletion, not by a theorem going quiet; #8908 deleted 3 more, 220.
     assert!(
-        checked + skipped_prose >= 223,
-        "expected at least 223 corpus theorems reached, got {} checked + {} skipped as prose",
+        checked + skipped_prose >= 220,
+        "expected at least 220 corpus theorems reached, got {} checked + {} skipped as prose",
         checked,
         skipped_prose
     );
