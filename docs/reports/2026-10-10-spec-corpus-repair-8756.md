@@ -265,3 +265,25 @@ ledger. That remains an unresolved CI blocker. New-head CI must be checked
 after publication. Evidence: master-49a-* and NATIVE-CI-DIAGNOSIS-2026-10-11.md
 in /Users/ssdm4/trinity-results/spec-tests-7641. No hardware, model inference
 or reward is claimed.
+
+
+## Verified native pass enrollment (2026-10-11)
+
+The owner explicitly authorized adding these ten passing specs to the native
+expectation ledger and updating existing PRs#8749/#8771 without raising limits.
+Latest-head CI artifacts for8a3a77584 (run38129854938) and7c468191c
+(run38129931526) report the same ten UNLISTED files and no other ratchet violation.
+All ten execute and pass in reference and native, with identical per-test
+verdicts,103 tests and4342 runtime assertions. Their source blobs are
+unchanged upstream.
+
+Only ten `t27b: pass` rows are inserted; every existing entry, failure cap0
+and ledger metadata remains unchanged. This registers demonstrated success;
+no failed or unsupported spec is admitted, and no source, test, seal, compiler
+or workflow changes. New behavior/spec generation is therefore inapplicable.
+The normal ratchet replay of CI run8a3a77584 with the updated ledger is GREEN,
+all nine violation counters0 and no findings. Input execution belongs to the
+old source SHA; a new-head CI result is still required after this data-only edit.
+No passed execution suite is repeated. Evidence: native-ci-8a3a775-artifact,
+JTAG native-ci-7c468191-artifact and enrollment-pass10-ratchet.json under the
+respective /Users/ssdm4/trinity-results directories.
