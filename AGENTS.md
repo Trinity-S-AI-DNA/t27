@@ -222,7 +222,7 @@ For agents:
 - A new layer, tool or service follows the same shape: spec first, generated, self-compiling, with receipts.
 - When a layer cannot yet compile its own source, file the gap as an issue under the layer's epic (#5980 for the compiler, #6198 for t27b). Never paper it over with hand-written code.
 - A layer is done when its own `.t27` passes under itself and two builds of it are bit-identical (#8920).
-- **t27o (Ouroboros)** converts code in other languages into `.t27` (`specs/tools/t27o/rust_convert.t27`, Rust first; the functions behind its Rust std table, each with its I/O proven against Rust, in `rust_std.t27`), so foreign layers are eaten into the matryoshka instead of rewritten by hand.
+- **t27o (Ouroboros)** converts code in other languages into `.t27` (`specs/tools/t27o/rust_convert.t27`, Rust first; the functions behind its Rust std table, each with its I/O proven against Rust, in `rust_std.t27`; run it as `tri t27o <file.rs> [--oracle] [--check]`), so foreign layers are eaten into the matryoshka instead of rewritten by hand.
 
 ## DRY: never add what already exists (owner rule, 2026-10-11)
 
