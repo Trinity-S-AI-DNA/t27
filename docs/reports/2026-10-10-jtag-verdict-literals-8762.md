@@ -73,3 +73,20 @@ upstream Verilog widths failure still blocks an ordinary merge.
 Evidence: upstream-refresh-zig.log and upstream-refresh-native.log in
 /Users/ssdm4/trinity-results/jtag-verdict-spec/. Earlier CI at e10301252 is
 not a CI receipt for this refresh; publication and latest-head CI remain.
+
+## Publication refresh at upstream d2570f4a8 (2026-10-10)
+
+The owner approved updating this PR, and head 223115f2b was published with
+GitHub author and committer resolved to dmitrii-f-t27. Upstream advanced
+meanwhile. A normal merge of refreshed dependency a2028f8a7 incorporates
+d2570f4a8a391151e4a8ee246217ff02bbe6e767 without conflict. JTAG source,
+generated hashes and sealed values remain unchanged; its measured native
+pass row is retained and the upstream failure cap remains 9.
+
+The actual reference test-report passes 18/18 with six invariants and the
+same two vacuous constant tests; native test --check passes 18/18, six held
+invariants and 38 runtime assertions. All five seal hashes match. Evidence:
+publication-refresh-zig.log, publication-refresh-native.log and
+publication-refresh-seal.log under /Users/ssdm4/trinity-results/jtag-verdict-spec/.
+Latest-head CI is still required; the dependency's known Verilog widths
+failure remains. No merge, closure or hardware execution is claimed.

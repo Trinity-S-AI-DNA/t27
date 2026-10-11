@@ -139,3 +139,23 @@ Executed checks on the combined source:
 Evidence: upstream-refresh-* and upstream-ast-shape-* files under
 /Users/ssdm4/trinity-results/spec-tests-7641/. Publication of the refreshed
 head and its CI still remain; the earlier CI does not certify this merge.
+
+## Publication refresh at d2570f4a8 (2026-10-10)
+
+The owner approved updating the existing PR. Head 4ea165b3d was published
+with both GitHub author and committer resolved to dmitrii-f-t27. Upstream
+advanced meanwhile; a second normal merge incorporates
+d2570f4a8a391151e4a8ee246217ff02bbe6e767 and preserves upstream authorship.
+Its only conflict is the ast_shape seal for changed imported verilog_plan;
+the ordinary unforced seal command refreshes it. No source or generated
+Rust changes are needed for ast_shape, and all six related generated Rust
+outputs still match. Native ast_shape passes 13/13 with 104 assertions.
+
+The rebuilt native compiler suite passes. Corpus ratchet remains CLEAN with
+71 known primary failures. Seal coverage is 2394 scanned, 2273 hold and 121
+known broken; currency is 2297 current, zero stale hashes, 94 missing paths
+and three none hashes. Duplicate bodies and type-conflict classification
+86/86 pass. The unchanged big_frame Verilog width failure remains; no cap,
+ledger exception or gate weakening is added. Evidence: publication-refresh-*
+under /Users/ssdm4/trinity-results/spec-tests-7641/. CI for the new published
+head must still be checked; no merge or issue closure is claimed.
