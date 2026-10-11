@@ -24,6 +24,10 @@ mod int_type_names;
 #[path = "../gen/rust/compiler/operator_text.rs"]
 #[allow(dead_code, unused_parens)]
 mod operator_text;
+// specs/compiler/verilog_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_names.rs"]
+#[allow(dead_code, unused_parens)]
+mod verilog_names;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -11339,12 +11343,10 @@ impl VerilogCodegen {
         self.imported_enums = enums;
     }
 
-    // Restored from Wave Loop 455 (same botched merge).
+    // Restored from Wave Loop 455 (same botched merge). The body is
+    // specs/compiler/verilog_names.t27, lowered by `t27c gen-rust` (#9115).
     fn is_simple_tuple_type(ty: &str) -> bool {
-        ty.starts_with('(')
-            && ty.ends_with(')')
-            && !ty.contains(':')
-            && !ty.is_empty()
+        verilog_names::is_simple_tuple_type(ty.as_bytes())
     }
 
     // Restored from Wave Loop 455 (same botched merge).
@@ -23895,12 +23897,10 @@ impl Compiler {
     }
 
     /// W534: built-in functions that the Verilog backend handles without a
-    /// source-level definition.
+    /// source-level definition. The body is specs/compiler/verilog_names.t27,
+    /// lowered by `t27c gen-rust` (#9115).
     fn is_icarus_builtin(name: &str) -> bool {
-        matches!(
-            name,
-            "__mul_noop" // injected R-SI-1 multiplication helper
-        )
+        verilog_names::is_icarus_builtin(name.as_bytes())
     }
 }
 
