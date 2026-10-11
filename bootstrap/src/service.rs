@@ -4452,6 +4452,7 @@ pub fn run_silicon(
             "--json".into(), json_path.to_string_lossy().into_owned(),
             "--fasm".into(), fasm_path.to_string_lossy().into_owned(),
             "--freq".into(), cc::GLOBAL_FREQ_MHZ.into(),
+            "--router".into(), "router1".into(),
         ];
         // W842 (T616): a seed makes place-and-route a VARIABLE. nextpnr's default
         // is fixed, so every build of a given netlist places identically -- which
