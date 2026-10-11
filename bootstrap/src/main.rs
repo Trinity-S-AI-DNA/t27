@@ -1267,6 +1267,12 @@ enum Commands {
         input: String,
     },
 
+    /// Generate Swift code from .t27 file
+    GenSwift {
+        /// Input file path
+        input: String,
+    },
+
     /// Generate Rust code from .t27 file
     GenRust {
         /// Input file path
