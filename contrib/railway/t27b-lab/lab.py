@@ -7,8 +7,8 @@ Issue #6071, epic #6063. One process does four things:
   /runs/<sha>.json, /runs/<sha>.log, /status.json;
 * on start, and then every T27_POLL_SECONDS (default 600) if
   origin/<T27_REF> moved, runs the lab once on that commit;
-* between polls, runs and signs a commit a lane PR asked for by writing
-  T27_SRV/requests/<sha> (#7672, lane_request);
+* runs and signs a commit a lane PR asked for in T27_SRV/requests/<sha> (#7672)
+  when the judge's lab_next() (#9026) for T27_LAB_ROLE picks it;
 * never writes anywhere but its own disk. The repository is public and is
   cloned anonymously; there are no secrets in this service.
 
@@ -68,6 +68,7 @@ REPO = os.environ.get("T27_REPO", "https://github.com/gHashTag/t27")
 REF = os.environ.get("T27_REF", "master")
 PORT = int(os.environ.get("PORT", "8080"))
 POLL = int(os.environ.get("T27_POLL_SECONDS", "600"))
+ROLE = os.environ.get("T27_LAB_ROLE", "master_first")  # #9026: master_first (lab 1) or requests_first (lab 2)
 SRV = Path(os.environ.get("T27_SRV", "/srv"))
 WORK = Path(os.environ.get("T27_WORK", "/work"))
 
@@ -950,10 +951,10 @@ def serve():
     httpd.serve_forever()
 
 
-def lane_request():
+def admitted():
     """#7672: master's t27c judges each SRV/requests/<sha> (corpus_receipt.t27 request_verdict), on origin read from a fetch
-    made now, not the master last run (#8785); exit 1 drops it. Run and sign the oldest admitted one, its text the challenge. True when one ran."""
-    q = sorted((SRV / "requests").glob("*"), key=lambda p: p.stat().st_mtime) if JUDGE.exists() else []
+    made now, not the master last run (#8785); exit 1 drops it. The admitted ones, oldest first; a run's challenge is its text."""
+    q = sorted((SRV / "requests").glob("*"), key=lambda p: p.stat().st_mtime)
     out = lambda *a: subprocess.run(("git",) + a, cwd=CLONE, capture_output=True, text=True, timeout=300).stdout.split()  # noqa: E731
     known = set(out("ls-remote", "--heads", REPO) + out("fetch", "-q", "origin", "+%s:refs/remotes/origin/%s" % (REF, REF)) + out("rev-list", "--first-parent", "refs/remotes/origin/" + REF)) if q else ()
     waiting = []
@@ -962,13 +963,7 @@ def lane_request():
         p = subprocess.run([str(JUDGE), "corpus-receipt", "admit", "--", r.name, facts], capture_output=True, text=True, timeout=60)
         print("lane request %r %s: %s" % (r.name[:80], facts, p.stdout.strip() or p.returncode), flush=True)
         r.unlink() if p.returncode == 1 else waiting.append((p.returncode, r))
-    r = next((r for code, r in waiting if code == 0), None)
-    if r:
-        log = Log(SRV / "runs" / ("%s.log" % r.name))
-        write_json(SRV / "runs" / ("%s.json" % r.name), dict(lab_run(r.name, log, r, master=False), finished=now(), ref="request"))
-        log.close()
-        r.unlink()
-    return r is not None
+    return [r for code, r in waiting if code == 0]
 
 
 def run_done(doc):
@@ -986,19 +981,14 @@ def main():
     threading.Thread(target=serve, daemon=True).start()
     print("t27b lab: serving %s on :%d, ref %s, poll %d s, lab.py %s" % (SRV, PORT, REF, POLL, IMAGE["lab_py_sha"]),
           flush=True)
-    last = None
-    latest = SRV / "latest.json"
-    if latest.exists():
-        try:
-            doc = json.loads(latest.read_text())
-            last = doc.get("commit") if run_done(doc) else None
-        except ValueError:
-            pass
+    last, count = None, "-"  # no judge yet (/work is not on the volume), so the first step runs master; "-" is COUNT_UNKNOWN
     while True:
-        ran = False
         try:
-            sha = remote_sha()
-            if sha != last:
+            sha, ready = remote_sha(), admitted() if JUDGE.exists() else []
+            ask = [str(JUDGE), "corpus-receipt", "schedule", "--", ROLE, "%d,%d,%s" % (sha != last, len(ready), count)]
+            # #9026: the judge's lab_next() picks the step; the one rule here: no judge (or one older than `schedule`) -> master run, it builds one
+            nxt, count = (subprocess.run(ask, capture_output=True, text=True, timeout=60).stdout.split() if JUDGE.exists() else []) or ("MASTER", "0")
+            if nxt == "MASTER":
                 log = Log(SRV / "runs" / ("%s.log" % sha))
                 log("t27b lab run: %s %s @ %s" % (REPO, REF, sha))
                 log("image: lab.py %s Dockerfile %s built %s deployment %s" % (
@@ -1011,12 +1001,16 @@ def main():
                 log("published /runs/%s.json: %s" % (sha, json.dumps(doc.get("summary"))))
                 log.close()
                 last = sha if run_done(doc) else None
-            set_status(phase="idle", commit=sha, next_poll_in_s=POLL, retry=last is None)
-            ran = sum(lane_request() for _ in range(2)) > 0  # #8586: up to two lane requests per master run
+            set_status(phase="idle", commit=sha, next_poll_in_s=POLL, retry=last is None, role=ROLE, step=nxt, admitted=len(ready))
+            if nxt == "REQUEST":
+                r, log = ready[0], Log(SRV / "runs" / ("%s.log" % ready[0].name))
+                write_json(SRV / "runs" / ("%s.json" % r.name), dict(lab_run(r.name, log, r, master=False), finished=now(), ref="request"))
+                log.close(), r.unlink()
         except Exception as e:
             print("lab loop error: %s" % e, flush=True)
             set_status(phase="error", error=str(e))
-        time.sleep(0 if ran else POLL)
+            nxt = "IDLE"
+        time.sleep(POLL if nxt == "IDLE" else 0)
 
 
 if __name__ == "__main__":
