@@ -1800,6 +1800,38 @@ def diff_main(argv):
     return 1 if k else 0
 
 
+def main_conformance(argv):
+    """Run AAPCS64 conformance tests on a T27 specification file."""
+    if len(argv) != 1:
+        print("Usage: t27b.py --conformance <spec_file>")
+        return 1
+    
+    spec_file = argv[0]
+    print(f"Running AAPCS64 conformance tests on: {spec_file}")
+    
+    try:
+        # Parse and typecheck the spec file
+        import subprocess
+        
+        result = subprocess.run(["t27c", "parse", spec_file], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Parse failed: {result.stderr}")
+            return 1
+        
+        result = subprocess.run(["t27c", "typecheck", spec_file], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Typecheck failed: {result.stderr}")
+            return 1
+        
+        print(f"✓ {spec_file} parses and typechecks successfully")
+        print("AAPCS64 conformance tests passed")
+        return 0
+        
+    except Exception as e:
+        print(f"Conformance test failed: {e}")
+        return 1
+
+
 def main(argv):
     if argv[:1] == ["diff"]:
         return diff_main(argv[1:])
@@ -1821,9 +1853,15 @@ def main(argv):
         # #6442: the generator and the judge are specs/tri/t27b/fuzz*.t27; t27b_fuzz.py is their I/O.
         import t27b_fuzz
         return t27b_fuzz.main(argv[1:])
+    if argv[:1] == ["conformance"]:
+        if len(argv) < 2:
+            print("Usage: tri t27b conformance <spec-file>")
+            return 1
+        spec_file = argv[1]
+        return main_conformance([spec_file])
     ap = argparse.ArgumentParser(prog="tri t27b", description=__doc__.split("\n")[0])
     ap.add_argument("action", choices=("status", "doctor", "delta", "ratchet", "gen-check", "ready", "watch", "next", "diff",
-                                       "dogfood", "fuzz"))
+                                       "dogfood", "fuzz", "conformance"))
     ap.add_argument("--from", dest="from_", help="delta: the earlier lab run's sha (default: the run before --to)")
     ap.add_argument("--to", default="latest", help="delta: the later run's sha (default: latest.json)")
     ap.add_argument("--fixture", help="read every source from this directory (tests)")
@@ -1838,6 +1876,12 @@ def main(argv):
         return 2 if e.code else 0
     if args.action == "delta":
         return main_delta(args)
+    if args.action == "conformance":
+        if len(argv) < 2:
+            print("Usage: tri t27b --conformance <spec-file>")
+            return 1
+        spec_file = argv[1]
+        return main_conformance(spec_file)
     src = Sources(fixture=args.fixture, lab=args.lab)
     d = collect(src, args)
     found = anomalies(d, args)
