@@ -34,7 +34,10 @@
 ;    sample and edge inputs; rustc runs it (on the lab) and its output is t27 `test oracle_<fn>` blocks,
 ;    the behaviour the t27 bodies must reproduce. A Rust #[test] fn becomes a t27 `test` as well.
 ;    Up to five parameters are sampled (scalars, texts, bytes, String / Vec<u8>, a unit enum of this
-;    file and self of one, arrays and slices of scalars as typed locals of the test); a result is a
+;    file and self of one, arrays and slices of scalars as typed locals of the test); a direct text or
+;    integer parameter is also sampled with the literals its fn body compares against -- every string
+;    literal alone and wrapped in one space, every integer one below, at it, one above (#9102) -- so a
+;    match arm is reached and not only the default one; a result is a
 ;    scalar, a text, a unit enum or a struct of this file (field by field, array fields element by
 ;    element), bare or held by an Option or a Result (`f(x).? == v`, `f(x) == null`), or Result<(), E>.
 ; 4. Reuse, DRY: nothing that exists in t27 is written again. Text equality is tri::mutate::plant's
@@ -141,8 +144,27 @@ pub const TYARR : usize = 36;
 pub const LETTY : usize = 37;
 /// The slot of the name `named` found.
 pub const HIT : usize = 38;
-pub const STATE : usize = 40;
-pub const NAMES : usize = 40;
+/// The fn body the oracle's derived samples come from (src[FBLO .. FBHI); both src.len while vectors
+/// writes no fn, or the fn has no `{ .. }` to read).
+pub const FBLO : usize = 39;
+pub const FBHI : usize = 40;
+/// The derived sample `derived_at` found: for a text, src[DCLA .. DCLB), wrapped in one space when
+/// st[DCSP] is 1; for an integer, the magnitude st[DVAL], negative when st[DNEG] is 1.
+pub const DCLA : usize = 41;
+pub const DCLB : usize = 42;
+pub const DCSP : usize = 43;
+pub const DVAL : usize = 44;
+pub const DNEG : usize = 45;
+/// The slen cache: the kind, type and body of the parameter whose sample count st[CCNT] holds (the j
+/// loop of vectors asks for the same parameter again and again). Zeroes mean "nothing cached".
+pub const CKIND : usize = 46;
+pub const CTQ : usize = 47;
+pub const CFB : usize = 48;
+pub const CCNT : usize = 49;
+/// The most samples one parameter holds: its fixed ones plus the body-derived ones (FR-003 of #9102).
+pub const DCAP : usize = 64;
+pub const STATE : usize = 50;
+pub const NAMES : usize = 50;
 pub const NAME_SLOTS : usize = 5;
 
 pub const F_NONE : usize = 0;
@@ -4197,6 +4219,210 @@ pub fn vlen(src: []const u8, ilo: usize, ihi: usize, kind: usize, tq: usize) -> 
     return 7;
 }
 
+/// The width of the integer type named at src[tq] (a parameter's own type), 0 when it is not one of
+/// the names the converter knows.
+pub fn int_type_width(src: []const u8, tq: usize) -> usize {
+    const re : usize = tok_end(src, tq);
+    if (word_is(src, tq, re, "u8") or word_is(src, tq, re, "i8")) { return 8; }
+    if (word_is(src, tq, re, "u16") or word_is(src, tq, re, "i16")) { return 16; }
+    if (word_is(src, tq, re, "u32") or word_is(src, tq, re, "i32")) { return 32; }
+    if (word_is(src, tq, re, "u64") or word_is(src, tq, re, "i64") or word_is(src, tq, re, "u128") or word_is(src, tq, re, "i128") or word_is(src, tq, re, "usize") or word_is(src, tq, re, "isize")) { return 64; }
+    return 0;
+}
+
+/// Is the integer type named at src[tq] one of the signed names?
+pub fn int_type_signed(src: []const u8, tq: usize) -> bool {
+    const re : usize = tok_end(src, tq);
+    return word_is(src, tq, re, "i8") or word_is(src, tq, re, "i16") or word_is(src, tq, re, "i32") or word_is(src, tq, re, "i64") or word_is(src, tq, re, "i128") or word_is(src, tq, re, "isize");
+}
+
+/// Does an integer type of `w` bits (signed when `sg`) hold the sample m, or -m? Widths past 64 read
+/// as 64: every sample this file can build fits both, so no range is widened by the clamp.
+pub fn int_ok(w: usize, sg: bool, m: usize, neg: bool) -> bool {
+    if (w > 64) { w = 64; }
+    if (!sg) { return !neg and m < bit(w); }
+    if (neg) { return m <= bit(w - 1); }
+    return m < bit(w - 1);
+}
+
+/// Can the literal src[a .. b] be spliced between quotes as a sample, the same text in Rust and in
+/// t27: 1 to 64 bytes, printable, and neither `"` nor `\` (an escape would change its meaning)?
+pub fn clean_text(src: []const u8, a: usize, b: usize) -> bool {
+    if (a >= b or b - a > 64) { return false; }
+    var i : usize = a;
+    while (i < b) {
+        if (src[i] < B_SPACE or src[i] >= B_DEL or src[i] == B_QUOTE or src[i] == B_BACKSLASH) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The value of the number token src[q .. te): decimal, 0x, 0o and 0b, `_` separators skipped. A
+/// float (a `.` or an exponent) and anything at or above 2^62 read as src.len, "no sample": the low
+/// bits a boundary neighbour would test are gone by then.
+pub fn num_value(src: []const u8, q: usize, te: usize) -> usize {
+    var r : usize = 10;
+    var i : usize = q;
+    if (src[q] == B_ZERO and q + 2 < te) {
+        if (src[q + 1] == B_LOWER_X) { r = 16; i = q + 2; }
+        if (src[q + 1] == B_LOWER_O) { r = 8; i = q + 2; }
+        if (src[q + 1] == B_LOWER_B) { r = 2; i = q + 2; }
+    }
+    var v : usize = 0;
+    while (i < te) {
+        const c : u8 = src[i];
+        if (c == B_UNDERSCORE) { i = i + 1; continue; }
+        var g : usize = 99;
+        if (is_digit(c)) { g = (c - B_ZERO) as usize; }
+        if (r == 16 and c >= B_LOWER_A and c <= B_LOWER_F) { g = (c - B_LOWER_A + 10) as usize; }
+        if (r == 16 and c >= B_UPPER_A and c <= B_UPPER_A + 5) { g = (c - B_UPPER_A + 10) as usize; }
+        if (g == 99) {
+            // a suffix ends the number; a float part voids it
+            if (c == B_DOT or c == B_LOWER_E or c == B_UPPER_E) { return src.len; }
+            return v;
+        }
+        if (g >= r) { return v; }
+        v = v * r + g;
+        if (v >= bit(62)) { return src.len; }
+        i = i + 1;
+    }
+    if (v >= bit(62)) { return src.len; }
+    return v;
+}
+
+/// Derived sample `d` of a text or integer parameter whose type is src[tq], read from the fn body
+/// st[FBLO .. FBHI] (#9102): every string literal of the body twice -- alone, and wrapped in one
+/// space -- plus every byte and char literal once as a one-byte text; every integer literal (a `-`
+/// glued to it is its sign) three times -- one below, at it, one above -- each kept only when the
+/// type holds it. A match arm or an == / starts_with / ends_with / contains predicate names its
+/// discriminant, so the alone sample reaches that arm and the wrapped one reaches the default arm
+/// next to it. The sample found: a text src[DCLA .. DCLB), wrapped when st[DCSP] is 1; an integer of
+/// magnitude st[DVAL], negative when st[DNEG] is 1. False when `d` is past the last sample. A plain
+/// left-to-right token walk: deterministic, no clock, no randomness.
+pub fn derived_at(src: []const u8, st: []usize, kind: usize, tq: usize, d: usize) -> bool {
+    st[DCSP] = 0;
+    st[DNEG] = 0;
+    if (st[FBLO] >= st[FBHI]) { return false; }
+    const text : bool = kind == V_STR or kind == V_BYTES or kind == V_STRING or kind == V_RSTRING;
+    const ints : bool = kind == V_UNSIGNED or kind == V_SIGNED;
+    if (!text and !ints) { return false; }
+    var w : usize = 0;
+    var sg : bool = false;
+    if (ints) {
+        w = int_type_width(src, tq);
+        sg = int_type_signed(src, tq);
+        if (w == 0) { return false; }
+    }
+    var c : usize = 0;
+    var q : usize = st[FBLO];
+    var neg : bool = false;
+    while (q < st[FBHI]) {
+        var te : usize = tok_end(src, q);
+        // a `-` glued to the number it precedes is that number's sign
+        if (ints and !neg and src[q] == B_MINUS and te == q + 1) {
+            const nx : usize = skip_ws(src, te);
+            if (nx < st[FBHI] and is_digit(src[nx])) {
+                neg = true;
+                q = nx;
+                te = tok_end(src, q);
+            }
+        }
+        if (text and src[q] == B_QUOTE and clean_text(src, q + 1, te - 1)) {
+            if (c == d) { st[DCLA] = q + 1; st[DCLB] = te - 1; st[DCSP] = 0; return true; }
+            c = c + 1;
+            if (c == d) { st[DCLA] = q + 1; st[DCLB] = te - 1; st[DCSP] = 1; return true; }
+            c = c + 1;
+        }
+        // a byte string b"..." and a raw string r"..." / r#"..."#: one token, its content between
+        // the quotes (the hashes of the raw one are not content)
+        if (text and ((src[q] == B_LOWER_B and q + 1 < st[FBHI] and src[q + 1] == B_QUOTE) or (src[q] == B_LOWER_R and q + 1 < st[FBHI] and (src[q + 1] == B_QUOTE or src[q + 1] == B_HASH)))) {
+            var h : usize = 0;
+            while (src[q] == B_LOWER_R and q + 1 + h < te and src[q + 1 + h] == B_HASH) { h = h + 1; }
+            if (clean_text(src, q + 2 + h, te - 1 - h)) {
+                if (c == d) { st[DCLA] = q + 2 + h; st[DCLB] = te - 1 - h; st[DCSP] = 0; return true; }
+                c = c + 1;
+                if (c == d) { st[DCLA] = q + 2 + h; st[DCLB] = te - 1 - h; st[DCSP] = 1; return true; }
+                c = c + 1;
+            }
+        }
+        // a one-byte byte literal b'x' or char literal 'x' (a lifetime is a word, not three bytes)
+        if (text and src[q] == B_LOWER_B and q + 1 < st[FBHI] and src[q + 1] == B_APOS and te == q + 4 and src[q + 3] == B_APOS and clean_text(src, q + 2, q + 3)) {
+            if (c == d) { st[DCLA] = q + 2; st[DCLB] = q + 3; st[DCSP] = 0; return true; }
+            c = c + 1;
+        }
+        if (text and src[q] == B_APOS and te == q + 3 and src[q + 2] == B_APOS and clean_text(src, q + 1, q + 2)) {
+            if (c == d) { st[DCLA] = q + 1; st[DCLB] = q + 2; st[DCSP] = 0; return true; }
+            c = c + 1;
+        }
+        if (ints and src[q] >= B_ZERO and src[q] <= B_NINE) {
+            const v : usize = num_value(src, q, te);
+            if (v < src.len) {
+                var m : usize = 0;
+                var g : bool = false;
+                // one below
+                if (neg or v >= 1) {
+                    if (neg) { m = v + 1; g = true; } else { m = v - 1; g = false; }
+                    if (int_ok(w, sg, m, g)) {
+                        if (c == d) { st[DVAL] = m; if (g) { st[DNEG] = 1; } else { st[DNEG] = 0; } return true; }
+                        c = c + 1;
+                    }
+                }
+                // at it
+                m = v;
+                g = neg and v != 0;
+                if (int_ok(w, sg, m, g)) {
+                    if (c == d) { st[DVAL] = m; if (g) { st[DNEG] = 1; } else { st[DNEG] = 0; } return true; }
+                    c = c + 1;
+                }
+                // one above
+                if (neg) {
+                    if (v >= 2) { m = v - 1; g = true; } else { m = 1 - v; g = false; }
+                } else {
+                    m = v + 1; g = false;
+                }
+                if (int_ok(w, sg, m, g)) {
+                    if (c == d) { st[DVAL] = m; if (g) { st[DNEG] = 1; } else { st[DNEG] = 0; } return true; }
+                    c = c + 1;
+                }
+            }
+            neg = false;
+        }
+        q = skip_ws(src, te);
+    }
+    return false;
+}
+
+/// How many body-derived samples a text or integer parameter holds: the walk stops at the cap, so
+/// the first literals of the body win and no parameter holds more than DCAP samples in all.
+pub fn dcount(src: []const u8, st: []usize, kind: usize, tq: usize, base: usize) -> usize {
+    var d : usize = 0;
+    while (d < DCAP - base and derived_at(src, st, kind, tq, d)) { d = d + 1; }
+    return d;
+}
+
+/// The sample count of a parameter of `kind` at src[tq]: its fixed samples (vlen) plus the literals
+/// its fn body compares against (#9102). vectors sizes its j loop with it, so every sample of every
+/// parameter is called at least once.
+pub fn slen(src: []const u8, st: []usize, kind: usize, tq: usize) -> usize {
+    const base : usize = vlen(src, st[ILO], st[IHI], kind, tq);
+    if (kind != V_STR and kind != V_BYTES and kind != V_STRING and kind != V_RSTRING and kind != V_UNSIGNED and kind != V_SIGNED) { return base; }
+    return base + dcount(src, st, kind, tq, base);
+}
+
+/// The modulus put_value samples with: slen for a direct text or integer parameter, cached in st --
+/// the j loop of vectors asks for the same parameter again and again, and the walk is the whole body;
+/// vlen's fixed count for anything else (an element, a wrapped Vec, an enum).
+pub fn scount(src: []const u8, st: []usize, kind: usize, tq: usize, direct: bool, base: usize) -> usize {
+    if (!direct or (kind != V_STR and kind != V_BYTES and kind != V_STRING and kind != V_RSTRING and kind != V_UNSIGNED and kind != V_SIGNED)) { return base; }
+    if (st[CKIND] == kind and st[CTQ] == tq and st[CFB] == st[FBLO] and st[CCNT] != 0) { return st[CCNT]; }
+    const n : usize = slen(src, st, kind, tq);
+    st[CKIND] = kind;
+    st[CTQ] = tq;
+    st[CFB] = st[FBLO];
+    st[CCNT] = n;
+    return n;
+}
+
 /// A quote: `"` in Rust source, `\"` inside the Rust string literal that holds the t27 call.
 pub fn put_quote(st: []usize, out: []u8, rust: bool) -> void {
     if (!rust) { puts(st, out, "\\"); }
@@ -4204,11 +4430,15 @@ pub fn put_quote(st: []usize, out: []u8, rust: bool) -> void {
 }
 
 /// Sample value `idx` of a kind (the type at src[tq] for integer limits, an enum, an array's element and
-/// length): small values, the edges of the type, short texts, every variant. The same literal reads the
-/// same in Rust and in t27, but for a variant (`E::V` there, `E.V` here), a uniform array (`[v; N]`
-/// there, `[@as(T, v)] ** N` here) and an owned String or Vec (`String::from("a")`, `b"a".to_vec()`).
-pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize, idx: usize, rust: bool) -> void {
-    const k : usize = idx % vlen(src, st[ILO], st[IHI], kind, tq);
+/// length): small values, the edges of the type, short texts, every variant. A direct text or integer
+/// parameter (`direct`) also samples the literals its fn body compares against, each text alone and
+/// wrapped in one space (#9102), so a match arm is reached and not only the default one. The same
+/// literal reads the same in Rust and in t27, but for a variant (`E::V` there, `E.V` here), a uniform
+/// array (`[v; N]` there, `[@as(T, v)] ** N` here) and an owned String or Vec (`String::from("a")`,
+/// `b"a".to_vec()`).
+pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize, idx: usize, rust: bool, direct: bool) -> void {
+    const base : usize = vlen(src, st[ILO], st[IHI], kind, tq);
+    const k : usize = idx % scount(src, st, kind, tq, direct, base);
     if (kind == V_ENUM) {
         const en : usize = enum_at(src, st[ILO], st[IHI], tq);
         const v : usize = enum_variant(src, find_enum(src, en, tok_end(src, en)), k, false);
@@ -4227,7 +4457,7 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
         if (rust) {
             if (tok_is(src, tq, "&")) { puts(st, out, "&"); }
             puts(st, out, "[");
-            put_value(src, st, out, ek, el, k, rust);
+            put_value(src, st, out, ek, el, k, rust, false);
             puts(st, out, "; ");
             put_src(src, st, out, ns, ne);
             puts(st, out, "]");
@@ -4238,7 +4468,7 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
                 put_src(src, st, out, el, tok_end(src, el));
                 puts(st, out, ", ");
             }
-            put_value(src, st, out, ek, el, k, rust);
+            put_value(src, st, out, ek, el, k, rust, false);
             if (ek != V_BOOL) { puts(st, out, ")"); }
             puts(st, out, "] ** ");
             put_src(src, st, out, ns, ne);
@@ -4256,7 +4486,7 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
             put_src(src, st, out, se, tok_end(src, se));
             puts(st, out, ", ");
         }
-        put_value(src, st, out, sk, se, k, rust);
+        put_value(src, st, out, sk, se, k, rust, false);
         if (!rust and sk != V_BOOL) { puts(st, out, ")"); }
         if (rust) { puts(st, out, "; 3]"); } else { puts(st, out, "] ** 3"); }
         return;
@@ -4264,17 +4494,27 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
     if (kind == V_STRING or kind == V_RSTRING) {
         if (rust and kind == V_RSTRING) { puts(st, out, "&"); }
         if (rust) { puts(st, out, "String::from("); }
-        put_value(src, st, out, V_STR, tq, k, rust);
+        put_value(src, st, out, V_STR, tq, k, rust, direct);
         if (rust) { puts(st, out, ")"); }
         return;
     }
     if (kind == V_VEC or kind == V_RVEC) {
         if (rust and kind == V_RVEC) { puts(st, out, "&"); }
-        put_value(src, st, out, V_BYTES, tq, k, rust);
+        put_value(src, st, out, V_BYTES, tq, k, rust, direct);
         if (rust) { puts(st, out, ".to_vec()"); }
         return;
     }
     if (kind == V_UNSIGNED or kind == V_SIGNED) {
+        if (k >= base and derived_at(src, st, kind, tq, k - base)) {
+            if (st[DNEG] == 1) {
+                puts(st, out, "(-");
+                put_num(st, out, st[DVAL]);
+                puts(st, out, ")");
+            } else {
+                put_num(st, out, st[DVAL]);
+            }
+            return;
+        }
         if (k == 0) { puts(st, out, "0"); }
         if (k == 1) { puts(st, out, "1"); }
         if (k == 2 and kind == V_UNSIGNED) { puts(st, out, "2"); }
@@ -4285,6 +4525,7 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
         if (k == 5 and kind == V_UNSIGNED) { puts(st, out, "100"); }
         if (k == 5 and kind == V_SIGNED) { put_limit(src, st, out, tq, tok_end(src, tq), true); }
         if (k == 6) { put_limit(src, st, out, tq, tok_end(src, tq), kind == V_UNSIGNED); }
+        if (k >= base) { puts(st, out, "0"); }
         return;
     }
     if (kind == V_BOOL) {
@@ -4301,6 +4542,13 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
     }
     if (kind == V_BYTES and rust) { puts(st, out, "b"); }
     put_quote(st, out, rust);
+    if (k >= base and derived_at(src, st, kind, tq, k - base)) {
+        if (st[DCSP] == 1) { puts(st, out, " "); }
+        put_src(src, st, out, st[DCLA], st[DCLB]);
+        if (st[DCSP] == 1) { puts(st, out, " "); }
+        put_quote(st, out, rust);
+        return;
+    }
     if (k == 1) { puts(st, out, "a"); }
     if (k == 2) { puts(st, out, "abc"); }
     if (k == 3) { puts(st, out, "0"); }
@@ -4322,7 +4570,7 @@ pub fn put_arg(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize, 
         put_num(st, out, p);
         return;
     }
-    put_value(src, st, out, kind, tq, idx, rust);
+    put_value(src, st, out, kind, tq, idx, rust, true);
 }
 
 /// The declaration of an array argument's local, as Rust string text (`\n` escaped): `const t27o_<j>_<p>
@@ -4344,7 +4592,7 @@ pub fn put_pre(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize, 
     puts(st, out, "]");
     put_src(src, st, out, el, tok_end(src, el));
     puts(st, out, " = ");
-    put_value(src, st, out, kind, tq, idx, false);
+    put_value(src, st, out, kind, tq, idx, false, true);
     puts(st, out, ";\\n");
 }
 
@@ -4359,11 +4607,11 @@ pub fn put_dc(st: []usize, out: []u8, pre: bool) -> void {
     puts(st, out, "c");
 }
 
-/// One sampled call, parameter i taking sample j * (i + 1) + i. Rust: `Type::name(args)`, or
+/// One sampled call, parameter i taking sample j + i. Rust: `Type::name(args)`, or
 /// `Type::V.name(args)` for an enum's self; t27: `Type_name(args)` with the variant first.
 pub fn put_call(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, n: usize, k0: usize, t0: usize, k1: usize, t1: usize, k2: usize, t2: usize, k3: usize, t3: usize, k4: usize, t4: usize, j: usize, selfp: bool, rust: bool) -> void {
     if (rust and selfp) {
-        put_value(src, st, out, k0, t0, j, rust);
+        put_value(src, st, out, k0, t0, j, rust, true);
         puts(st, out, ".");
     } else if (st[ILO] != st[IHI]) {
         put_impl(src, st, out);
@@ -4378,20 +4626,20 @@ pub fn put_call(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, n
     }
     if (n > 1) {
         if (sep) { puts(st, out, ", "); }
-        put_arg(src, st, out, k1, t1, j * 2 + 1, j, 1, rust);
+        put_arg(src, st, out, k1, t1, j + 1, j, 1, rust);
         sep = true;
     }
     if (n > 2) {
         if (sep) { puts(st, out, ", "); }
-        put_arg(src, st, out, k2, t2, j * 3 + 2, j, 2, rust);
+        put_arg(src, st, out, k2, t2, j + 2, j, 2, rust);
     }
     if (n > 3) {
         puts(st, out, ", ");
-        put_arg(src, st, out, k3, t3, j * 4 + 3, j, 3, rust);
+        put_arg(src, st, out, k3, t3, j + 3, j, 3, rust);
     }
     if (n > 4) {
         puts(st, out, ", ");
-        put_arg(src, st, out, k4, t4, j * 5 + 4, j, 4, rust);
+        put_arg(src, st, out, k4, t4, j + 4, j, 4, rust);
     }
     puts(st, out, ")");
 }
@@ -4610,7 +4858,9 @@ pub fn put_fields(src: []const u8, st: []usize, out: []u8, o: usize, v: []const 
 
 /// The oracle harness's calls of a converted fn (Rust tests or not): each sample input run by the
 /// original Rust, its result printed as a t27 assert; an input on which Rust panics is skipped (it is
-/// outside the fn's contract). Up to five parameters: scalars, texts, bytes, arrays and slices of
+/// outside the fn's contract). A direct text or integer parameter is also sampled with the literals
+/// its fn body compares against (#9102), so every match arm is reached and a text predicate cannot
+/// pass vacuously. Up to five parameters: scalars, texts, bytes, arrays and slices of
 /// scalars (a typed local in the test), String and Vec<u8>, a unit enum of this file (and self of one:
 /// every variant). Results: a scalar, a text, a unit enum or a struct of this file (field by field),
 /// bare or in an Option or a Result (`v.?` when it holds one, `null` when not), and Result<(), E> (true
@@ -4712,12 +4962,28 @@ pub fn vectors(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, pn
         en = enum_at(src, st[ILO], st[IHI], bq);
         if (find_enum(src, en, tok_end(src, en)) >= src.len) { return; }
     }
+    // the fn's own body, where the literals a parameter is also sampled with come from (#9102): a
+    // match arm or an == / starts_with / ends_with / contains predicate names its discriminant, so a
+    // sample equal to it, or wrapped in one space, reaches that arm and not only the default one
+    var fb : usize = re;
+    while (fb < src.len and !tok_is(src, fb, "{") and !tok_is(src, fb, "where") and !tok_is(src, fb, ";")) {
+        fb = skip_ws(src, tok_end(src, fb));
+    }
+    st[FBLO] = src.len;
+    st[FBHI] = src.len;
+    if (tok_is(src, fb, "{")) {
+        const be : usize = block_end(src, fb);
+        if (be > fb + 1) {
+            st[FBLO] = fb + 1;
+            st[FBHI] = be - 1;
+        }
+    }
     var nv : usize = 1;
-    if (n > 0) { nv = vlen(src, st[ILO], st[IHI], k0, t0); }
-    if (n > 1 and vlen(src, st[ILO], st[IHI], k1, t1) > nv) { nv = vlen(src, st[ILO], st[IHI], k1, t1); }
-    if (n > 2 and vlen(src, st[ILO], st[IHI], k2, t2) > nv) { nv = vlen(src, st[ILO], st[IHI], k2, t2); }
-    if (n > 3 and vlen(src, st[ILO], st[IHI], k3, t3) > nv) { nv = vlen(src, st[ILO], st[IHI], k3, t3); }
-    if (n > 4 and vlen(src, st[ILO], st[IHI], k4, t4) > nv) { nv = vlen(src, st[ILO], st[IHI], k4, t4); }
+    if (n > 0) { nv = slen(src, st, k0, t0); }
+    if (n > 1 and slen(src, st, k1, t1) > nv) { nv = slen(src, st, k1, t1); }
+    if (n > 2 and slen(src, st, k2, t2) > nv) { nv = slen(src, st, k2, t2); }
+    if (n > 3 and slen(src, st, k3, t3) > nv) { nv = slen(src, st, k3, t3); }
+    if (n > 4 and slen(src, st, k4, t4) > nv) { nv = slen(src, st, k4, t4); }
     puts(st, out, "    {\n        let mut v: Vec<String> = Vec::new();\n");
     var j : usize = 0;
     while (j < nv) {
@@ -4731,10 +4997,10 @@ pub fn vectors(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, pn
         if (pre) {
             puts(st, out, "let d = \"");
             put_pre(src, st, out, k0, t0, j, j, 0);
-            if (n > 1) { put_pre(src, st, out, k1, t1, j * 2 + 1, j, 1); }
-            if (n > 2) { put_pre(src, st, out, k2, t2, j * 3 + 2, j, 2); }
-            if (n > 3) { put_pre(src, st, out, k3, t3, j * 4 + 3, j, 3); }
-            if (n > 4) { put_pre(src, st, out, k4, t4, j * 5 + 4, j, 4); }
+            if (n > 1) { put_pre(src, st, out, k1, t1, j + 1, j, 1); }
+            if (n > 2) { put_pre(src, st, out, k2, t2, j + 2, j, 2); }
+            if (n > 3) { put_pre(src, st, out, k3, t3, j + 3, j, 3); }
+            if (n > 4) { put_pre(src, st, out, k4, t4, j + 4, j, 4); }
             puts(st, out, "\"; ");
         }
         if (wrapk == 0) {
@@ -5684,12 +5950,109 @@ test the_oracle_samples_enums_arrays_and_results {
     var out : [4096]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
     const n : usize = oracle("#[derive(Clone, Copy, Debug)]\nenum K { A, B }\nfn pick(k: K, b: bool) -> Option<K> { if b { Some(k) } else { None } }\nfn head(a: &[i8; 2]) -> i32 { a[0] as i32 }\nfn ok(x: bool) -> Result<(), ()> { if x { Ok(()) } else { Err(()) } }", &out, &st);
-    assert(out_is(n, &out, 0, "// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\n#[derive(Clone, Copy, Debug)]\nenum K { A, B }\n\nfn pick(k: K, b: bool) -> Option<K> { if b { Some(k) } else { None } }\n\nfn head(a: &[i8; 2]) -> i32 { a[0] as i32 }\n\nfn ok(x: bool) -> Result<(), ()> { if x { Ok(()) } else { Err(()) } }\n\nfn main() {\n    std::panic::set_hook(Box::new(|_| {}));\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| pick(K::A, true)) { let c = \"pick(K.A, true)\"; match r { Some(x) => { v.push(format!(\"    assert({}.? == K.{});\", c, match x { K::A => \"A\", K::B => \"B\", })); } None => v.push(format!(\"    assert({} == null);\", c)) } }\n        if let Ok(r) = std::panic::catch_unwind(|| pick(K::B, true)) { let c = \"pick(K.B, true)\"; match r { Some(x) => { v.push(format!(\"    assert({}.? == K.{});\", c, match x { K::A => \"A\", K::B => \"B\", })); } None => v.push(format!(\"    assert({} == null);\", c)) } }\n        if !v.is_empty() { println!(\"test oracle_pick {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[0; 2])) { let c = \"head(&t27o_0_0)\"; let d = \"    const t27o_0_0 : [2]i8 = [@as(i8, 0)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[1; 2])) { let c = \"head(&t27o_1_0)\"; let d = \"    const t27o_1_0 : [2]i8 = [@as(i8, 1)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[-1; 2])) { let c = \"head(&t27o_2_0)\"; let d = \"    const t27o_2_0 : [2]i8 = [@as(i8, -1)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[7; 2])) { let c = \"head(&t27o_3_0)\"; let d = \"    const t27o_3_0 : [2]i8 = [@as(i8, 7)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[-100; 2])) { let c = \"head(&t27o_4_0)\"; let d = \"    const t27o_4_0 : [2]i8 = [@as(i8, -100)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[127; 2])) { let c = \"head(&t27o_5_0)\"; let d = \"    const t27o_5_0 : [2]i8 = [@as(i8, 127)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[(-128); 2])) { let c = \"head(&t27o_6_0)\"; let d = \"    const t27o_6_0 : [2]i8 = [@as(i8, (-128))] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if !v.is_empty() { println!(\"test oracle_head {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| ok(false)) { let c = \"ok(false)\"; match r { Ok(()) => v.push(format!(\"    assert({});\", c)), Err(_) => v.push(format!(\"    assert(({}) == false);\", c)) } }\n        if let Ok(r) = std::panic::catch_unwind(|| ok(true)) { let c = \"ok(true)\"; match r { Ok(()) => v.push(format!(\"    assert({});\", c)), Err(_) => v.push(format!(\"    assert(({}) == false);\", c)) } }\n        if !v.is_empty() { println!(\"test oracle_ok {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n}\n"));
+    assert(out_is(n, &out, 0, "// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\n#[derive(Clone, Copy, Debug)]\nenum K { A, B }\n\nfn pick(k: K, b: bool) -> Option<K> { if b { Some(k) } else { None } }\n\nfn head(a: &[i8; 2]) -> i32 { a[0] as i32 }\n\nfn ok(x: bool) -> Result<(), ()> { if x { Ok(()) } else { Err(()) } }\n\nfn main() {\n    std::panic::set_hook(Box::new(|_| {}));\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| pick(K::A, true)) { let c = \"pick(K.A, true)\"; match r { Some(x) => { v.push(format!(\"    assert({}.? == K.{});\", c, match x { K::A => \"A\", K::B => \"B\", })); } None => v.push(format!(\"    assert({} == null);\", c)) } }\n        if let Ok(r) = std::panic::catch_unwind(|| pick(K::B, false)) { let c = \"pick(K.B, false)\"; match r { Some(x) => { v.push(format!(\"    assert({}.? == K.{});\", c, match x { K::A => \"A\", K::B => \"B\", })); } None => v.push(format!(\"    assert({} == null);\", c)) } }\n        if !v.is_empty() { println!(\"test oracle_pick {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[0; 2])) { let c = \"head(&t27o_0_0)\"; let d = \"    const t27o_0_0 : [2]i8 = [@as(i8, 0)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[1; 2])) { let c = \"head(&t27o_1_0)\"; let d = \"    const t27o_1_0 : [2]i8 = [@as(i8, 1)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[-1; 2])) { let c = \"head(&t27o_2_0)\"; let d = \"    const t27o_2_0 : [2]i8 = [@as(i8, -1)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[7; 2])) { let c = \"head(&t27o_3_0)\"; let d = \"    const t27o_3_0 : [2]i8 = [@as(i8, 7)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[-100; 2])) { let c = \"head(&t27o_4_0)\"; let d = \"    const t27o_4_0 : [2]i8 = [@as(i8, -100)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[127; 2])) { let c = \"head(&t27o_5_0)\"; let d = \"    const t27o_5_0 : [2]i8 = [@as(i8, 127)] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| head(&[(-128); 2])) { let c = \"head(&t27o_6_0)\"; let d = \"    const t27o_6_0 : [2]i8 = [@as(i8, (-128))] ** 2;\\n\"; v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); }\n        if !v.is_empty() { println!(\"test oracle_head {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| ok(false)) { let c = \"ok(false)\"; match r { Ok(()) => v.push(format!(\"    assert({});\", c)), Err(_) => v.push(format!(\"    assert(({}) == false);\", c)) } }\n        if let Ok(r) = std::panic::catch_unwind(|| ok(true)) { let c = \"ok(true)\"; match r { Ok(()) => v.push(format!(\"    assert({});\", c)), Err(_) => v.push(format!(\"    assert(({}) == false);\", c)) } }\n        if !v.is_empty() { println!(\"test oracle_ok {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n}\n"));
 }
 
 test the_oracle_records_struct_fields_and_slices {
     var out : [8192]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
     const n : usize = oracle("pub struct Pt { pub x: i32, pub on: bool }\npub struct W(pub [u8; 2]);\nfn mk(x: i32) -> Pt { Pt { x, on: x > 0 } }\nfn w(b: u8) -> W { W([b, 0]) }\nfn total(v: &mut [f64], k: f64) -> f64 { v[0] = k; v[0] + v.len() as f64 }", &out, &st);
-    assert(out_is(n, &out, 0, "// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\npub struct Pt { pub x: i32, pub on: bool }\n\npub struct W(pub [u8; 2]);\n\nfn mk(x: i32) -> Pt { Pt { x, on: x > 0 } }\n\nfn w(b: u8) -> W { W([b, 0]) }\n\nfn total(v: &mut [f64], k: f64) -> f64 { v[0] = k; v[0] + v.len() as f64 }\n\nfn main() {\n    std::panic::set_hook(Box::new(|_| {}));\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| mk(0)) { let c = \"mk(0)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(1)) { let c = \"mk(1)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(-1)) { let c = \"mk(-1)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(7)) { let c = \"mk(7)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(-100)) { let c = \"mk(-100)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(2147483647)) { let c = \"mk(2147483647)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk((-2147483648))) { let c = \"mk((-2147483648))\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if !v.is_empty() { println!(\"test oracle_mk {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| w(0)) { let c = \"w(0)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(1)) { let c = \"w(1)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(2)) { let c = \"w(2)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(7)) { let c = \"w(7)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(10)) { let c = \"w(10)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(100)) { let c = \"w(100)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(255)) { let c = \"w(255)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if !v.is_empty() { println!(\"test oracle_w {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [0.0; 3], 1.0)) { let c = \"total(&t27o_0_0, 1.0)\"; let d = \"    var t27o_0_0 : [3]f64 = [@as(f64, 0.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [1.0; 3], 2.5)) { let c = \"total(&t27o_1_0, 2.5)\"; let d = \"    var t27o_1_0 : [3]f64 = [@as(f64, 1.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [-1.5; 3], 0.0)) { let c = \"total(&t27o_2_0, 0.0)\"; let d = \"    var t27o_2_0 : [3]f64 = [@as(f64, -1.5)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [2.5; 3], -1.5)) { let c = \"total(&t27o_3_0, -1.5)\"; let d = \"    var t27o_3_0 : [3]f64 = [@as(f64, 2.5)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [100.0; 3], 100.0)) { let c = \"total(&t27o_4_0, 100.0)\"; let d = \"    var t27o_4_0 : [3]f64 = [@as(f64, 100.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if !v.is_empty() { println!(\"test oracle_total {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n}\n"));
+    assert(out_is(n, &out, 0, "// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\npub struct Pt { pub x: i32, pub on: bool }\n\npub struct W(pub [u8; 2]);\n\nfn mk(x: i32) -> Pt { Pt { x, on: x > 0 } }\n\nfn w(b: u8) -> W { W([b, 0]) }\n\nfn total(v: &mut [f64], k: f64) -> f64 { v[0] = k; v[0] + v.len() as f64 }\n\nfn main() {\n    std::panic::set_hook(Box::new(|_| {}));\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| mk(0)) { let c = \"mk(0)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(1)) { let c = \"mk(1)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(-1)) { let c = \"mk(-1)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(7)) { let c = \"mk(7)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(-100)) { let c = \"mk(-100)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(2147483647)) { let c = \"mk(2147483647)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk((-2147483648))) { let c = \"mk((-2147483648))\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(0)) { let c = \"mk(0)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if let Ok(r) = std::panic::catch_unwind(|| mk(1)) { let c = \"mk(1)\"; v.push(format!(\"    assert({}.x == {:?});\", c, r.x)); v.push(format!(\"    assert({}.on == {:?});\", c, r.on)); }\n        if !v.is_empty() { println!(\"test oracle_mk {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| w(0)) { let c = \"w(0)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(1)) { let c = \"w(1)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(2)) { let c = \"w(2)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(7)) { let c = \"w(7)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(10)) { let c = \"w(10)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(100)) { let c = \"w(100)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(255)) { let c = \"w(255)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(0)) { let c = \"w(0)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if let Ok(r) = std::panic::catch_unwind(|| w(1)) { let c = \"w(1)\"; v.push(format!(\"    assert({}._0[0] == {:?});\", c, r.0[0])); v.push(format!(\"    assert({}._0[1] == {:?});\", c, r.0[1])); }\n        if !v.is_empty() { println!(\"test oracle_w {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [0.0; 3], 1.0)) { let c = \"total(&t27o_0_0, 1.0)\"; let d = \"    var t27o_0_0 : [3]f64 = [@as(f64, 0.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [1.0; 3], -1.5)) { let c = \"total(&t27o_1_0, -1.5)\"; let d = \"    var t27o_1_0 : [3]f64 = [@as(f64, 1.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [-1.5; 3], 2.5)) { let c = \"total(&t27o_2_0, 2.5)\"; let d = \"    var t27o_2_0 : [3]f64 = [@as(f64, -1.5)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [2.5; 3], 100.0)) { let c = \"total(&t27o_3_0, 100.0)\"; let d = \"    var t27o_3_0 : [3]f64 = [@as(f64, 2.5)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if let Ok(r) = std::panic::catch_unwind(|| total(&mut [100.0; 3], 0.0)) { let c = \"total(&t27o_4_0, 0.0)\"; let d = \"    var t27o_4_0 : [3]f64 = [@as(f64, 100.0)] ** 3;\\n\"; if r.is_finite() { v.push(format!(\"{}    assert({} == {:?});\", d, c, r)); } }\n        if !v.is_empty() { println!(\"test oracle_total {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n}\n"));
+}
+
+test body_string_literals_sample_alone_and_wrapped {
+    var st : [1024]usize = [0] ** 1024;
+    const src : []const u8 = "fn arm(s: &str) -> Option<&str> { match s { \"+=\" => Some(\"+\"), _ => None } }";
+    const fb : usize = find_at(src, 0, B_LBRACE);
+    st[FBLO] = fb + 1;
+    st[FBHI] = block_end(src, fb) - 1;
+    // the arm's discriminant alone and wrapped in one space, then the arm's own text the same way
+    assert(derived_at(src, &st, V_STR, 0, 0) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 2 and src[st[DCLA]] == B_PLUS);
+    assert(derived_at(src, &st, V_STR, 0, 1) and st[DCSP] == 1 and st[DCLB] - st[DCLA] == 2);
+    assert(derived_at(src, &st, V_STR, 0, 2) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 1 and src[st[DCLA]] == B_PLUS);
+    assert(derived_at(src, &st, V_STR, 0, 3) and st[DCSP] == 1 and st[DCLB] - st[DCLA] == 1);
+    assert(!derived_at(src, &st, V_STR, 0, 4));
+    assert(slen(src, &st, V_STR, 0) == 12);
+    // an escaped text and an empty one name no sample: neither reads the same between the quotes
+    const bad : []const u8 = "fn esc(s: &str) -> bool { s == \"a\\nb\" || s == \"\" }";
+    const bf : usize = find_at(bad, 0, B_LBRACE);
+    st[FBLO] = bf + 1;
+    st[FBHI] = block_end(bad, bf) - 1;
+    assert(!derived_at(bad, &st, V_STR, 0, 0));
+    assert(slen(bad, &st, V_STR, 0) == 8);
+}
+
+test body_integer_literals_sample_the_edges_the_type_holds {
+    var st : [1024]usize = [0] ** 1024;
+    const hi : []const u8 = "fn hi(x: u8) -> bool { x == 255 }";
+    const hq : usize = skip_ws(hi, tok_end(hi, skip_ws(hi, tok_end(hi, skip_ws(hi, find_at(hi, 0, B_LPAREN) + 1)))));
+    const hb : usize = find_at(hi, 0, B_LBRACE);
+    st[FBLO] = hb + 1;
+    st[FBHI] = block_end(hi, hb) - 1;
+    // one below and at it; 256 is past what a u8 holds, so the walk names no third sample
+    assert(derived_at(hi, &st, V_UNSIGNED, hq, 0) and st[DVAL] == 254 and st[DNEG] == 0);
+    assert(derived_at(hi, &st, V_UNSIGNED, hq, 1) and st[DVAL] == 255 and st[DNEG] == 0);
+    assert(!derived_at(hi, &st, V_UNSIGNED, hq, 2));
+    assert(slen(hi, &st, V_UNSIGNED, hq) == 9);
+    const lo : []const u8 = "fn lo(x: i32) -> bool { x == -3 }";
+    const lq : usize = skip_ws(lo, tok_end(lo, skip_ws(lo, tok_end(lo, skip_ws(lo, find_at(lo, 0, B_LPAREN) + 1)))));
+    const lb : usize = find_at(lo, 0, B_LBRACE);
+    st[FBLO] = lb + 1;
+    st[FBHI] = block_end(lo, lb) - 1;
+    // the `-` glued to the 3 is its sign: the samples are -4, -3 and -2
+    assert(derived_at(lo, &st, V_SIGNED, lq, 0) and st[DVAL] == 4 and st[DNEG] == 1);
+    assert(derived_at(lo, &st, V_SIGNED, lq, 1) and st[DVAL] == 3 and st[DNEG] == 1);
+    assert(derived_at(lo, &st, V_SIGNED, lq, 2) and st[DVAL] == 2 and st[DNEG] == 1);
+    assert(!derived_at(lo, &st, V_SIGNED, lq, 3));
+    assert(slen(lo, &st, V_SIGNED, lq) == 10);
+}
+
+test clean_text_and_num_value_gate_the_samples {
+    assert(clean_text("+=", 0, 2));
+    assert(!clean_text("a\\b", 0, 3));
+    assert(!clean_text("a\"b", 0, 3));
+    assert(!clean_text("xy", 1, 1));
+    // sixty-four bytes fit, sixty-five do not (FR-003 of #9102)
+    assert(!clean_text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, 65));
+    assert(clean_text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, 64));
+    assert(num_value("0x1f", 0, tok_end("0x1f", 0)) == 31);
+    assert(num_value("1_0", 0, tok_end("1_0", 0)) == 10);
+    assert(num_value("42u8", 0, tok_end("42u8", 0)) == 42);
+    // a float reads as src.len, "no sample": its low bits are gone by then
+    assert(num_value("1.5", 0, tok_end("1.5", 0)) == 3);
+    assert(num_value("3e2", 0, tok_end("3e2", 0)) == 3);
+}
+
+test byte_and_char_literals_are_one_byte_texts {
+    var st : [1024]usize = [0] ** 1024;
+    const src : []const u8 = "fn op(b: &[u8]) -> bool { b == b\"+\" || b[0] as char == '+' }";
+    const fb : usize = find_at(src, 0, B_LBRACE);
+    st[FBLO] = fb + 1;
+    st[FBHI] = block_end(src, fb) - 1;
+    // the byte string b\"+\" twice (alone, wrapped), the char '+' once: one-byte texts
+    assert(derived_at(src, &st, V_BYTES, 0, 0) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 1 and src[st[DCLA]] == B_PLUS);
+    assert(derived_at(src, &st, V_BYTES, 0, 1) and st[DCSP] == 1);
+    assert(derived_at(src, &st, V_BYTES, 0, 2) and st[DCSP] == 0 and src[st[DCLA]] == B_PLUS);
+    assert(!derived_at(src, &st, V_BYTES, 0, 3));
+    assert(slen(src, &st, V_BYTES, 0) == 8);
+}
+
+test the_sample_count_caps_at_64 {
+    var st : [1024]usize = [0] ** 1024;
+    const src : []const u8 = "fn many(s: &str) -> bool { s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || false }";
+    const fb : usize = find_at(src, 0, B_LBRACE);
+    st[FBLO] = fb + 1;
+    st[FBHI] = block_end(src, fb) - 1;
+    // thirty literals hold sixty samples; the count stops at DCAP: 8 fixed + 56 derived (FR-003 of #9102)
+    assert(slen(src, &st, V_STR, 0) == 64);
+    assert(derived_at(src, &st, V_STR, 0, 59));
+    assert(!derived_at(src, &st, V_STR, 0, 60));
+}
+
+test the_oracle_samples_the_arms_discriminants {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = oracle("fn tag(s: &str) -> bool { s == \"x\" }", &out, &st);
+    // the eight fixed texts, then the predicate's own \"x\" alone and wrapped in one space (#9102)
+    assert(out_is(n, &out, 0, "// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\nfn tag(s: &str) -> bool { s == \"x\" }\n\nfn main() {\n    std::panic::set_hook(Box::new(|_| {}));\n    {\n        let mut v: Vec<String> = Vec::new();\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"\")) { let c = \"tag(\\\"\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"a\")) { let c = \"tag(\\\"a\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"abc\")) { let c = \"tag(\\\"abc\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"0\")) { let c = \"tag(\\\"0\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"42\")) { let c = \"tag(\\\"42\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"0x1f\")) { let c = \"tag(\\\"0x1f\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"a b\")) { let c = \"tag(\\\"a b\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"-7\")) { let c = \"tag(\\\"-7\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\"x\")) { let c = \"tag(\\\"x\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if let Ok(r) = std::panic::catch_unwind(|| tag(\" x\")) { let c = \"tag(\\\" x\\\")\"; v.push(format!(\"    assert({} == {:?});\", c, r)); }\n        if !v.is_empty() { println!(\"test oracle_tag {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n}\n"));
 }
