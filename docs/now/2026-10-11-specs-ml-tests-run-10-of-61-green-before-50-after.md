@@ -1,0 +1,10 @@
+# NOW -- specs/ml tests run: 10 of 61 green before, 50 after (2026-10-11)
+
+## specs/ml tests run: 10 of 61 green before, 50 after (Refs #8980)
+
+- Measured with `t27c test-report` and zig 0.16.0 over specs/ml, specs/tri and specs/isa (371 specs) on origin/master 3d0f84d74 and on this branch. specs/ml: 10 green, 1 vacuous, 50 BLOCKED before; 50 green, 0 vacuous, 11 BLOCKED after (246 tests). specs/tri and specs/isa: unchanged.
+- `test-report` already lowered `use` imports. The module-name class (`constants`, ...) was `find_specs_root` walking the path as spelled: `x.t27` or `../x.t27` never reached `specs/`. It now falls back to the absolute path, with a regression test (bootstrap/tests/unresolved_use.rs).
+- Zig emitter: `-(a + b)` was emitted `-a + b` (unary operand lost its parens). Bare `exp/log/sin/cos/tanh` now lower to builtins. A bench's `elapsed_time_*` budget becomes a notice, no longer an undeclared name. Each has a regression test with a negative control. Over 1860 specs, `gen` output changes for 32 + 15 specs, and no test-report result moves backwards.
+- The specs/ml blockers were spec bugs: `math::exp` naming a module never imported, `range`/`alloc`/`append`, placeholder bodies, and tests asserting `result != undefined` or `true`. Each body now computes; each test checks values, finite differences or a training run (the MLP learns XOR).
+- Wrong formulas found once the tests ran, each corrected with a comment in its spec: GELU'(-1) > 0, the softmax VJP missing its off-diagonal terms, SGD adding weight decay, the BCE gradient sign, the CE gradient (p - t)/p, the PPO ratio and clip and loss sign, LAMB's v_hat correction and unapplied trust ratio, RNN double tanh, and the attention backward missing the softmax Jacobian.
+- Still BLOCKED in specs/ml (11): adamw, sgd_momentum (GF16 typed as u16; need gf16 arithmetic), lr_scheduler, ppo_actor, sac_actor, seq2seq, feed_forward, mha_block, multi_head_attn, norm, positional_enc (undeclared helpers over 300-750 line specs).
