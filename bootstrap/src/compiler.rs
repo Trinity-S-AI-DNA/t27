@@ -24275,6 +24275,18 @@ fn collect_field_names(node: &Node, out: &mut std::collections::HashSet<String>)
     }
 }
 
+/// #8891: `Struct.field` -> its Rust type, `.variant` -> its enum, or "" when two enums declare the variant.
+fn collect_decl_types(node: &Node, out: &mut std::collections::HashMap<String, String>) {
+    for c in &node.children {
+        if node.kind == NodeKind::StructDecl && c.kind == NodeKind::ExprIdentifier && !c.name.is_empty() {
+            out.insert(format!("{}.{}", node.name, c.name), RustCodegen::t27_type_to_rust(&c.extra_type));
+        } else if node.kind == NodeKind::EnumDecl && c.kind == NodeKind::EnumVariant {
+            let e = out.entry(format!(".{}", c.name)).or_insert_with(|| node.name.clone()); if *e != node.name { e.clear() }
+        }
+        collect_decl_types(c, out);
+    }
+}
+
 /// Each function's parameter names, in order. A call site knows argument
 /// POSITIONS; `written_slice_params` is keyed by parameter NAME, and this is
 /// the map between them.
@@ -24578,7 +24590,7 @@ fn collect_fn_ret_types(node: &Node, out: &mut std::collections::HashMap<String,
 /// the emitter wrote them bare, so the struct did not parse. Rust's raw-identifier
 /// syntax `r#type` is the exact spelling for this and needs no judgement.
 ///
-/// `crate`, `self`, `Self` and `super` are deliberately NOT escaped: `r#` is invalid
+/// `crate`, `Self` and `super` are deliberately NOT escaped: `r#` is invalid
 /// for them, so escaping would replace one parse error with another. They do not
 /// occur as field names in this corpus; if one appears, it stays bare and fails
 /// visibly rather than failing in a way that looks like this fix worked.
@@ -24592,6 +24604,7 @@ fn rust_ident(name: &str) -> String {
         "abstract", "become", "do", "final", "macro", "override", "priv", "try",
         "typeof", "unsized", "virtual",
     ];
+    if name == "self" { return "self_".to_string(); } // #8891: a free fn's `self` parameter; `r#self` is invalid
     if KEYWORDS.contains(&name) {
         format!("r#{}", name)
     } else {
@@ -26898,6 +26911,7 @@ pub struct RustCodegen {
     /// needs `unsafe`. Collected in a pre-pass because a function may be
     /// emitted before the declaration it reads.
     static_mut_names: std::collections::HashSet<String>,
+    decl_types: std::collections::HashMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -26925,6 +26939,7 @@ impl RustCodegen {
             enum_names: std::collections::HashSet::new(),
             type_params: std::collections::HashSet::new(),
             static_mut_names: std::collections::HashSet::new(),
+            decl_types: std::collections::HashMap::new(),
         }
     }
 
@@ -27041,6 +27056,7 @@ impl RustCodegen {
         collect_param_names(ast, &mut self.param_names);
         self.field_names.clear();
         collect_field_names(ast, &mut self.field_names);
+        self.decl_types.clear(); collect_decl_types(ast, &mut self.decl_types); // #8891
 
         // Whole-tree, because the `Copy` fixpoint follows struct fields across
         // declarations that may appear in any order.
@@ -27519,9 +27535,14 @@ impl RustCodegen {
             )
         };
         self.current_mut_slice_params = mut_slices.into_iter().collect();
+        if let Some(body) = node.extra_return_type.trim().strip_prefix("struct").map(|b| b.trim().trim_start_matches('{').trim_end_matches('}')) {
+            let fields: Vec<String> = Self::split_type_list(body).unwrap_or_default().iter().filter_map(|f| f.split_once(':')).map(|(n, t)| format!("pub {}: {}", rust_ident(n.trim()), Self::t27_type_to_rust(t))).collect();
+            self.fn_ret_type = format!("{}_ret", node.name); // #8891: an anonymous struct return gets a name
+            self.write(&format!("#[allow(non_camel_case_types)]\n#[derive(Debug, Clone)]\npub struct {} {{ {} }}\n\n", self.fn_ret_type, fields.join(", ")));
+        }
         self.write(&format!(
             "pub fn {}{}({}) -> {} {{",
-            fn_name, generics, params_str, ret_type
+            fn_name, generics, params_str, self.fn_ret_type
         ));
 
         // Check if there's a body
@@ -28091,7 +28112,7 @@ impl RustCodegen {
             "@min" if two => format!("({}).min({})", a(0), a(1)),
             "@max" if two => format!("({}).max({})", a(0), a(1)),
             "@sqrt" | "@abs" | "@round" | "@floor" | "@ceil" | "@trunc" | "@exp" | "@log"
-            | "@sin" | "@cos" | "@tan"
+            | "@sin" | "@cos" | "@tan" | "@log2" | "@log10" | "@exp2"
                 if one =>
             {
                 format!("({}).{}()", a(0), &name[1..])
@@ -28437,6 +28458,9 @@ impl RustCodegen {
                     None => t.to_string(),
                 }
             }
+            // #8891: `[N]T` whose T has brackets of its own (`[3][]const u8`) splits at the FIRST `]`.
+            t if t.starts_with('[') && t.matches(']').count() > 1 && t.find(']').is_some_and(|e| e > 1 && t[1..e].bytes().all(|b| b.is_ascii_digit())) => {
+                let e = t.find(']').unwrap(); format!("[{}; {}]", Self::t27_type_to_rust(&t[e + 1..]), &t[1..e]) }
             t if t.starts_with('[') && t.contains(']') => {
                 let end = t.rfind(']').unwrap();
                 let inside = &t[1..end];
@@ -28781,6 +28805,10 @@ impl RustCodegen {
             }
             return self.expr_to_rust(node);
         }
+        if node.kind == NodeKind::ExprStructLit && node.name.is_empty() && !ty.contains([' ', '<', '[']) { // #8891: `.{ .. }` takes the type
+            return self.expr_to_rust(&Node { name: ty.to_string(), ..node.clone() }); }
+        if ty.starts_with("Vec<") && node.kind == NodeKind::ExprIndex && node.children.get(1).is_some_and(|i| i.extra_op == "..") {
+            return format!("({}).to_vec()", self.expr_to_rust(node)); } // #8891: a returned slice is an owned Vec
         let s = self.expr_to_rust(node);
         if !Self::is_int_type(ty) {
             return s;
@@ -28811,7 +28839,8 @@ impl RustCodegen {
                 plain(self.var_types.get(&node.name).or_else(|| self.const_types.get(&node.name)))
             }
             NodeKind::ExprCall => plain(self.fn_ret_types.get(&node.name)),
-            NodeKind::ExprFieldAccess => node.name == "?", // `x.?` unwraps
+            NodeKind::ExprFieldAccess => node.name == "?" // `x.?` unwraps; #8891: `E.x` is a member of enum E
+                || node.children.first().is_some_and(|b| b.kind == NodeKind::ExprIdentifier && self.enum_names.contains(&b.name)),
             _ => false,
         }
     }
@@ -28846,6 +28875,7 @@ impl RustCodegen {
             {
                 "unreachable!()".to_string()
             }
+            NodeKind::ExprIdentifier if node.name == "self" => rust_ident(&node.name),
             NodeKind::ExprIdentifier => node.name.clone(),
             // Zig's repeat `[v] ** n` is Rust's `[v; n]`; verbatim, rustc read `[v] * (*n)`.
             // A sole literal or name element arrives as bracket TEXT, a typed one as a child.
@@ -29096,6 +29126,8 @@ impl RustCodegen {
                     .map(|c| {
                         let val = if c.children.is_empty() {
                             "{}".to_string()
+                        } else if let Some(t) = self.decl_types.get(&format!("{}.{}", node.name, c.name)) {
+                            self.expr_to_rust_as(&c.children[0], t) // #8891: a usize into a u64 field is cast
                         } else {
                             self.expr_to_rust(&c.children[0])
                         };
@@ -29112,7 +29144,9 @@ impl RustCodegen {
                     // return type of the function being emitted - exactly the
                     // case the shorthand is written for. Without it the variant
                     // was printed on the LEFT of the separator: `escalate::`.
-                    if self.enum_names.contains(&self.fn_ret_type) {
+                    if let Some(e) = self.decl_types.get(&format!(".{}", node.name)).filter(|e| !e.is_empty()) {
+                        format!("{}::{}", e, node.name) // #8891: the one enum declaring the variant
+                    } else if self.enum_names.contains(&self.fn_ret_type) {
                         format!("{}::{}", self.fn_ret_type, node.name)
                     } else {
                         node.name.clone()
