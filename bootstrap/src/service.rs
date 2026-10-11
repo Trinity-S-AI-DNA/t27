@@ -5698,9 +5698,9 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         let batch: Vec<&(String, String)> = changed.iter().take(wt::watch_take(changed.len() as u32) as usize).copied().collect();
         let mut stems: Vec<(String, Vec<usize>)> = Vec::new();
         for (i, (p, _)) in batch.iter().enumerate() { let st = Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(); match stems.iter_mut().find(|g| g.0 == st) { Some(g) => g.1.push(i), None => stems.push((st, vec![i])) } }
-        let mut runs: Vec<(usize, crate::test_report::Report)> = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| (i, crate::test_report::run(Path::new(&batch[i].0), Path::new("specs")))).collect::<Vec<_>>()).into_iter().flatten().collect();
-        runs.sort_by_key(|r| r.0);
-        for (i, r) in runs { let (p, d) = batch[i]; println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); last.insert(p.clone(), d.clone()); }
+        // #8956: each verdict prints the moment its rerun ends, from the worker that ran it; the digests are recorded after
+        let done = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| { let p = &batch[i].0; let r = crate::test_report::run(Path::new(p), Path::new("specs")); println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); i }).collect::<Vec<_>>());
+        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); }
         if changed.len() as u32 > wt::WATCH_BATCH { println!("watch: {} more changed specs wait for the next look", changed.len() as u32 - wt::WATCH_BATCH) }
         for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
         std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64));
