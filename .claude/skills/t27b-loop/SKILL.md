@@ -57,6 +57,8 @@ Then:
 
 ## 3. One plan step
 
+**DRY first (owner rule, 2026-10-11).** Before writing any spec or function, search for an existing one: `t27c dupes --name`, `tools/dupe_scan.py --like`, `specs/tools/catalog.t27`. Then reuse or extend it. Never add a new conformance spec per feature: put the cases in the area's existing one. `tools/duplicate_bodies_baseline.txt` only moves down.
+
 Take the first unchecked item of epic #8326 that is not already claimed, either by a branch (`git branch -a`) or by an open PR. Move it one PR forward, then tick it in the epic.
 
 - **Write the decision in `.t27`.** Generate it on the t27c lab:
