@@ -3510,9 +3510,9 @@ impl<'a> Lower<'a> {
             NodeKind::ExprCall if n.name == "@enumFromInt" => {
                 self.reject("ExprCall(@enumFromInt)", "with no enum result type".into())
             }
-            // `@sqrt(x)`: of a run-time float the IEEE square root as before; of a comptime_float
-            // (a comptime_int Zig coerces to one) Zig's own binary128 fold, `q_sqrt` of
-            // comptime_float.t27 (#8965); a negative or non-float stays refused, as Zig refuses it.
+            // `@sqrt(x)`: of a run-time float the IEEE square root; of a comptime_float (a comptime_int
+            // Zig coerces to one) Zig's binary128 fold, `q_sqrt` of comptime_float.t27 (#8965); a non-float
+            // is refused as Zig refuses it, a negative one because its fold yields a NaN the fold can't hold.
             NodeKind::ExprCall if n.name == "@sqrt" && n.children.len() == 1 => {
                 let v = self.expr(&n.children[0])?;
                 let (k, q) = match &v {
