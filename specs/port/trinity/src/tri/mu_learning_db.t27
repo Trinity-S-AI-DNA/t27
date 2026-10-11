@@ -1,0 +1,358 @@
+module port::trinity::src::tri::mu_learning_db;
+
+// Port of gHashTag/trinity src/tri/mu_learning_db.zig @ 5aabfbe8346f (91
+// lines, 4 functions: saveDB, applyFixes, runMuLearnCommand, runMuFixCommand).
+//
+// The original is the MU learning-pattern database: it serialises AutoFixRule
+// records to .trinity/mu/learning_db.json and dual-writes memory records into
+// the hippocampus store. Every function in it ends in the world - file
+// writes, hippocampus.write, std.debug.print - so the decisions they make
+// live here as pure helpers covered by tests, while the world-touching names
+// stay as thin plumbing wrappers:
+//
+//   saveDB             (original line 20) writes the save_db_json bytes to
+//                      DB_PATH and dual-writes the record from save_db_record
+//                      through hippocampus; both steps are I/O, so the body
+//                      is a no-test wrapper around undefined.
+//   applyFixes         (original line 57) dual-writes the record built from
+//                      apply_fixes_summary, apply_fixes_data and
+//                      apply_fixes_record through hippocampus; the write is
+//                      database I/O, so the body is a no-test wrapper.
+//   runMuLearnCommand  (original line 81) printed one banner line; it returns
+//                      the exact bytes now and the caller prints.
+//   runMuFixCommand    (original line 86) discarded its args (`_ = args`) and
+//                      printed one banner line; it returns the exact bytes
+//                      now and the caller prints.
+//
+// Gaps against the original, on purpose:
+//   - std.ArrayList(u8) grows; .t27 has no growable lists, so the serialisers
+//     fill a fixed 1024-byte JsonBuf (the fixed-capacity struct mapping) and
+//     stop at capacity.
+//   - the Allocator parameter is caller plumbing with no .t27 type; the
+//     original only uses it for the ArrayList and summary formatting.
+//   - hippocampus.MemoryKind is an external enum; only .learning is ever set
+//     here, so the kind is carried as the string "learning".
+
+const DB_PATH: []const u8 = ".trinity/mu/learning_db.json";
+
+// Capacities the original passes to hippocampus.copyToFixed, which truncates
+// each field to the record's fixed buffers (original lines 46-55 and 68-78).
+const AGENT_CAP: usize = 32;
+const SUMMARY_CAP: usize = 256;
+const DATA_CAP: usize = 2048;
+
+// AutoFixRule, as declared on lines 9-17 of the original.
+struct AutoFixRule {
+    id: []const u8,
+    pattern: []const u8,
+    replacement: []const u8,
+    category: []const u8,
+    description: []const u8,
+    apply_count: usize,
+    success_count: usize,
+}
+
+// Fixed-capacity byte buffer standing in for the original's ArrayList(u8):
+// data[0..len] is the text written so far.
+struct JsonBuf {
+    data: [1024]u8,
+    len: usize,
+}
+
+// The hippocampus record fields both writers decide on before the dual-write
+// (record.kind/.ttl/.agent_buf/.summary_buf/.data_buf/.tags/.tag_count in the
+// original). tags is the fixed [2][]const u8 the original fills, kept here as
+// two explicit slots.
+struct MuRecord {
+    kind: []const u8,
+    ttl: u64,
+    agent: []const u8,
+    summary: []const u8,
+    data: []const u8,
+    tag0: []const u8,
+    tag1: []const u8,
+    tag_count: usize,
+}
+
+// --- serialisation primitives (stand-ins for the original's ArrayList) -----
+
+fn mu_put_ch(out: JsonBuf, c: u8) -> JsonBuf {
+    var o: JsonBuf = out;
+    if (o.len < 1024) {
+        o.data[o.len] = c;
+        o.len += 1;
+    }
+    return o;
+}
+
+fn mu_put_str(out: JsonBuf, s: []const u8) -> JsonBuf {
+    var o: JsonBuf = out;
+    var i: usize = 0;
+    while (i < s.len and o.len < 1024) {
+        o.data[o.len] = s[i];
+        o.len += 1;
+        i += 1;
+    }
+    return o;
+}
+
+// Decimal rendering, as the original gets from `{d}` format specifiers.
+fn mu_fmt_u(v: usize) -> JsonBuf {
+    var r: JsonBuf = JsonBuf { data: [_]u8{0} ** 1024, len: 0 };
+    if (v == 0) {
+        r.data[0] = '0';
+        r.len = 1;
+        return r;
+    }
+    var x: usize = v;
+    while (x > 0) {
+        r.data[r.len] = '0' + (x % 10) as u8;
+        r.len += 1;
+        x = x / 10;
+    }
+    var i: usize = 0;
+    var j: usize = r.len;
+    while (i + 1 < j) {
+        j -= 1;
+        const t: u8 = r.data[i];
+        r.data[i] = r.data[j];
+        r.data[j] = t;
+        i += 1;
+    }
+    return r;
+}
+
+fn mu_put_u(out: JsonBuf, v: usize) -> JsonBuf {
+    var o: JsonBuf = out;
+    const d: JsonBuf = mu_fmt_u(v);
+    var i: usize = 0;
+    while (i < d.len and o.len < 1024) {
+        o.data[o.len] = d.data[i];
+        o.len += 1;
+        i += 1;
+    }
+    return o;
+}
+
+// Byte-exact comparison against a literal, for the tests.
+fn mu_eq_buf(out: JsonBuf, lit: []const u8) -> bool {
+    if (out.len != lit.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < lit.len) {
+        if (out.data[i] != lit[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// --- the decisions, as pure helpers -----------------------------------------
+
+pub fn db_path() -> []const u8 {
+    return DB_PATH;
+}
+
+// hippocampus.copyToFixed truncates the source to the destination capacity.
+pub fn mu_capped(len: usize, cap: usize) -> usize {
+    if (len > cap) {
+        return cap;
+    }
+    return len;
+}
+
+// The JSON serialisation saveDB performs (original lines 26-31): one line per
+// rule, two-space indent, no comma between elements, wrapped in "[\n"/"]\n".
+pub fn save_db_json(rules: []const AutoFixRule) -> JsonBuf {
+    var out: JsonBuf = JsonBuf { data: [_]u8{0} ** 1024, len: 0 };
+    out = mu_put_ch(out, '[');
+    out = mu_put_ch(out, '\n');
+    var i: usize = 0;
+    while (i < rules.len) {
+        out = mu_put_str(out, "  {\"id\":\"");
+        out = mu_put_str(out, rules[i].id);
+        out = mu_put_str(out, "\",\"pattern\":\"");
+        out = mu_put_str(out, rules[i].pattern);
+        out = mu_put_str(out, "\",\"replacement\":\"");
+        out = mu_put_str(out, rules[i].replacement);
+        out = mu_put_str(out, "\",\"category\":\"");
+        out = mu_put_str(out, rules[i].category);
+        out = mu_put_str(out, "\",\"description\":\"");
+        out = mu_put_str(out, rules[i].description);
+        out = mu_put_str(out, "\",\"apply_count\":");
+        out = mu_put_u(out, rules[i].apply_count);
+        out = mu_put_str(out, ",\"success_count\":");
+        out = mu_put_u(out, rules[i].success_count);
+        out = mu_put_str(out, "}\n");
+        i += 1;
+    }
+    out = mu_put_ch(out, ']');
+    out = mu_put_ch(out, '\n');
+    return out;
+}
+
+// The record saveDB dual-writes (original lines 39-55): kind learning, no
+// ttl, agent mu_pattern, summary "Pattern DB update", data = the JSON just
+// written, tags mu + pattern_db.
+pub fn save_db_record(data: []const u8) -> MuRecord {
+    return MuRecord { kind: "learning", ttl: 0, agent: "mu_pattern", summary: "Pattern DB update", data: data, tag0: "mu", tag1: "pattern_db", tag_count: 2 };
+}
+
+// The summary line applyFixes formats (original line 64): "Auto-fix: F/E".
+pub fn apply_fixes_summary(fixes_made: usize, total_errors: usize) -> JsonBuf {
+    var out: JsonBuf = JsonBuf { data: [_]u8{0} ** 1024, len: 0 };
+    out = mu_put_str(out, "Auto-fix: ");
+    out = mu_put_u(out, fixes_made);
+    out = mu_put_ch(out, '/');
+    out = mu_put_u(out, total_errors);
+    return out;
+}
+
+// The payload applyFixes formats (original line 65): {"fixes":F,"errors":E}.
+pub fn apply_fixes_data(fixes_made: usize, total_errors: usize) -> JsonBuf {
+    var out: JsonBuf = JsonBuf { data: [_]u8{0} ** 1024, len: 0 };
+    out = mu_put_str(out, "{\"fixes\":");
+    out = mu_put_u(out, fixes_made);
+    out = mu_put_str(out, ",\"errors\":");
+    out = mu_put_u(out, total_errors);
+    out = mu_put_ch(out, '}');
+    return out;
+}
+
+// The record applyFixes dual-writes (original lines 66-78): kind learning,
+// no ttl, agent mu, tags mu + auto_fix.
+pub fn apply_fixes_record(summary: []const u8, data: []const u8) -> MuRecord {
+    return MuRecord { kind: "learning", ttl: 0, agent: "mu", summary: summary, data: data, tag0: "mu", tag1: "auto_fix", tag_count: 2 };
+}
+
+// --- the four ported entry points -------------------------------------------
+
+// saveDB (original lines 20-55): makePath(".trinity/mu"), write the
+// save_db_json bytes to DB_PATH, then dual-write save_db_record through
+// hippocampus. File and database plumbing; the decisions above carry the
+// behaviour and the tests cover them. Not called by tests.
+pub fn saveDB(_rules: []const AutoFixRule) {
+    undefined;
+}
+
+// applyFixes (original lines 57-79): build the summary and payload with the
+// helpers above and dual-write apply_fixes_record through hippocampus. The
+// write is database plumbing. Not called by tests.
+pub fn applyFixes(_fixes_made: usize, _total_errors: usize) {
+    undefined;
+}
+
+// runMuLearnCommand (original lines 81-84) printed exactly this banner line;
+// the caller prints what comes back.
+pub fn runMuLearnCommand() -> []const u8 {
+    return "\n\x1b[33m🧠 MU LEARN\x1b[0m\n";
+}
+
+// runMuFixCommand (original lines 86-91) discarded its args (`_ = args`) and
+// printed exactly this banner line; the caller prints what comes back.
+pub fn runMuFixCommand(_args: []str) -> []const u8 {
+    return "\n\x1b[33m🧠 MU FIX\x1b[0m\n";
+}
+
+// --- tests -------------------------------------------------------------------
+
+test db_path_matches {
+    assert(db_path() == ".trinity/mu/learning_db.json");
+}
+
+test copy_to_fixed_caps {
+    assert(mu_capped(3000, DATA_CAP) == DATA_CAP);
+    assert(mu_capped(10, DATA_CAP) == 10);
+    assert(mu_capped(SUMMARY_CAP, SUMMARY_CAP) == 256);
+    assert(mu_capped(33, AGENT_CAP) == AGENT_CAP);
+}
+
+test fmt_u_digits {
+    var a = mu_fmt_u(0);
+    assert(a.len == 1);
+    assert(a.data[0] == '0');
+    var b = mu_fmt_u(37);
+    assert(b.len == 2);
+    assert(b.data[0] == '3');
+    assert(b.data[1] == '7');
+    var c = mu_fmt_u(2048);
+    assert(c.len == 4);
+    assert(c.data[0] == '2');
+    assert(c.data[3] == '8');
+}
+
+test save_db_json_empty {
+    var none: [0]AutoFixRule = [0]AutoFixRule{};
+    var out = save_db_json(&none);
+    assert(mu_eq_buf(out, "[\n]\n"));
+}
+
+test save_db_json_one_rule {
+    var rules: [1]AutoFixRule = [ AutoFixRule { id: "r1", pattern: "TODO", replacement: "DONE", category: "style", description: "d", apply_count: 3, success_count: 2 } ];
+    var out = save_db_json(&rules);
+    assert(mu_eq_buf(out, "[\n  {\"id\":\"r1\",\"pattern\":\"TODO\",\"replacement\":\"DONE\",\"category\":\"style\",\"description\":\"d\",\"apply_count\":3,\"success_count\":2}\n]\n"));
+}
+
+test save_db_json_two_rules_no_comma {
+    // The original writes one line per rule with no comma between the
+    // elements; port that byte for byte.
+    var rules: [2]AutoFixRule = [ AutoFixRule { id: "a", pattern: "", replacement: "", category: "", description: "", apply_count: 0, success_count: 0 }, AutoFixRule { id: "b", pattern: "", replacement: "", category: "", description: "", apply_count: 0, success_count: 0 } ];
+    var out = save_db_json(&rules);
+    assert(mu_eq_buf(out, "[\n  {\"id\":\"a\",\"pattern\":\"\",\"replacement\":\"\",\"category\":\"\",\"description\":\"\",\"apply_count\":0,\"success_count\":0}\n  {\"id\":\"b\",\"pattern\":\"\",\"replacement\":\"\",\"category\":\"\",\"description\":\"\",\"apply_count\":0,\"success_count\":0}\n]\n"));
+}
+
+test save_db_record_fields {
+    var rec = save_db_record("[\n]\n");
+    assert(rec.kind == "learning");
+    assert(rec.ttl == 0);
+    assert(rec.agent == "mu_pattern");
+    assert(rec.summary == "Pattern DB update");
+    assert(rec.data == "[\n]\n");
+    assert(rec.tag0 == "mu");
+    assert(rec.tag1 == "pattern_db");
+    assert(rec.tag_count == 2);
+}
+
+test apply_fixes_summary_format {
+    var s = apply_fixes_summary(3, 10);
+    assert(mu_eq_buf(s, "Auto-fix: 3/10"));
+    var z = apply_fixes_summary(0, 0);
+    assert(mu_eq_buf(z, "Auto-fix: 0/0"));
+}
+
+test apply_fixes_data_format {
+    var d = apply_fixes_data(12, 7);
+    assert(mu_eq_buf(d, "{\"fixes\":12,\"errors\":7}"));
+    var z = apply_fixes_data(0, 0);
+    assert(mu_eq_buf(z, "{\"fixes\":0,\"errors\":0}"));
+}
+
+test apply_fixes_record_fields {
+    var rec = apply_fixes_record("Auto-fix: 1/2", "{\"fixes\":1,\"errors\":2}");
+    assert(rec.kind == "learning");
+    assert(rec.ttl == 0);
+    assert(rec.agent == "mu");
+    assert(rec.summary == "Auto-fix: 1/2");
+    assert(rec.data == "{\"fixes\":1,\"errors\":2}");
+    assert(rec.tag0 == "mu");
+    assert(rec.tag1 == "auto_fix");
+    assert(rec.tag_count == 2);
+}
+
+// Direct coverage for the serialisation primitives (save_db_json calls them
+// transitively; this pins each one on its own).
+test mu_put_primitives {
+    var b: JsonBuf = JsonBuf { data: [_]u8{0} ** 1024, len: 0 };
+    b = mu_put_ch(b, 'a');
+    b = mu_put_str(b, "bc");
+    b = mu_put_u(b, 42);
+    assert(mu_eq_buf(b, "abc42"));
+}
+
+test command_banners {
+    assert(runMuLearnCommand() == "\n\x1b[33m🧠 MU LEARN\x1b[0m\n");
+    var one_arg: [1][]const u8 = [ "x" ]; // args are discarded; placeholder exercises the call
+    assert(runMuFixCommand(&one_arg) == "\n\x1b[33m🧠 MU FIX\x1b[0m\n");
+}
