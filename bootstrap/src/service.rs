@@ -2523,10 +2523,14 @@ use crate::{corpus_receipt as cr, cr_leaves as leaves, cr_pair as pair, cr_root,
 pub fn run_corpus_receipt(root: &Path, action: &str, a: &str, b: &str, nonce: Option<String>, head_challenge: Option<String>, runner: Option<String>) -> anyhow::Result<()> {
     let read = |p: &str| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?) };
     let (hx, hexarg) = (|p: &Path| std::fs::read(p).map(|d| hex_lower(&cr_sha(&[&d]))), |f, s: Option<String>| s.map(|s| parse_challenge_hex(f, &s)).transpose().map_err(anyhow::Error::msg));
+    let f = |k: usize| b.split(',').nth(k).and_then(|s| s.parse().ok()).unwrap_or(u32::MAX); // not a number: u32::MAX, spec COUNT_UNKNOWN
     if action == "admit" { // #7672: does the lab run request `a`? b is "age_s,index,on_origin"
-        let f = |k: usize| b.split(',').nth(k).and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
         let r = cr::request_verdict(spec_str(a), f(0), f(1), f(2) == 1);
         println!("{}", cr::REQUEST_NAMES[r as usize]); std::process::exit(cr::request_exit(r) as i32)
+    }
+    if action == "schedule" { // #9026: what the lab runs next, and its next count; a is T27_LAB_ROLE, b "master_moved,admitted,count"
+        let (role, judge_ready) = (cr::lab_role(spec_str(a)), true); let n = cr::lab_next(role, f(0) == 1, judge_ready, f(1), f(2)); // the judge answers
+        return Ok(println!("{} {}", cr::NEXT_NAMES[n as usize], cr::lab_count(role, n, f(2))));
     }
     if action == "sign" {
         let (run, mut l, argv) = (read(a)?, [vec![], vec![], vec![]], runner.unwrap_or_default());
