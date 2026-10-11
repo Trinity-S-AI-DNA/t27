@@ -48,6 +48,10 @@ mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of
 mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
 #[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
+mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
+#[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
+mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
 mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
@@ -395,6 +399,10 @@ enum Commands {
     Hot {
         /// The t27c binary; default target/release/t27c, then t27c on PATH.
         #[arg(long)] t27c: Option<String>,
+        /// check (default), watch, frontier, prebuild <spec> --top <v> [--pnr-seed N], suite, or caches.
+        #[arg(default_value = "check", value_parser = ["check", "watch", "frontier", "prebuild", "suite", "caches"])] action: String,
+        /// Passed on to t27c after the action's own arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)] rest: Vec<String>,
     },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
@@ -947,7 +955,29 @@ fn cmd_test(spec: &str, t27c: Option<&str>) -> Result<()> {
 }
 
 /// #8870: each hot path once to warm it, then once timed; one row each, judged by hot.t27. Silicon runs only with T27_OPENXC7.
-fn cmd_hot(t27c: Option<&str>) -> u32 {
+/// #8952: every speed-up of the hot-reload loop as one word (command strings: specs/tri/hot/hot.t27).
+fn cmd_hot(action: &str, rest: &[String], t27c: Option<&str>) -> u32 {
+    let t = mutate::resolve_t27c(t27c);
+    let pass = |base: &str, tail: &[&str]| Command::new(&t).args(base.split(' ')).args(rest).args(tail).status().map_or(1, |s| s.code().unwrap_or(1) as u32);
+    match action {
+        "watch" => pass(hot::HOT_WATCH, &[]),
+        "frontier" => pass(hot::HOT_FRONTIER, &[]),
+        "prebuild" => pass(hot::HOT_PREBUILD, &[hot::HOT_NO_CABLE]),
+        "suite" => pass(hot::HOT_SUITE, &[]),
+        "caches" => {
+            let c = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27");
+            for (name, keeps) in [("genhash", format!("{} binaries", gen_cache::GEN_CACHE_KEEP_BINARIES)), ("bitstreams", format!("{} bitstreams", bit_cache::BIT_CACHE_KEEP)), ("digests", "one 64-byte digest per stat".to_string())] {
+                let n = std::fs::read_dir(c.join(name)).map_or(0, |r| r.count());
+                let kb = Command::new("du").arg("-sk").arg(c.join(name)).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("0").to_string()).unwrap_or_default();
+                println!("{name:<11}{n:>6} entries {kb:>9} KB   keeps {keeps}");
+            }
+            0
+        }
+        _ => hot_check(t27c),
+    }
+}
+
+fn hot_check(t27c: Option<&str>) -> u32 {
     let t = mutate::resolve_t27c(t27c);
     let si = ["silicon", "specs/fpga/ternary_link.t27", "--top", "fpga/verilog/ternary_link_jtag.v", "--skip-hardware", "--pnr-seed", "11"];
     let run = |a: &[&str]| { let s = std::time::Instant::now(); let o = Command::new(&t).args(a).output().ok(); (o.as_ref().map_or(false, |o| o.status.success()), s.elapsed().as_millis() as u32, o.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("AUDIT:"))) };
@@ -1279,7 +1309,7 @@ fn main() -> Result<()> {
         Commands::Hooks { action } => hooks::run(action)?,
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
-        Commands::Hot { t27c } => std::process::exit(cmd_hot(t27c.as_deref()) as i32),
+        Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
     }
 
