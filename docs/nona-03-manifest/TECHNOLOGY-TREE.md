@@ -68,7 +68,7 @@ Eto derevo tekhnologij pokazyvaet put' evolyucii T27 ot bazovoj infrastruktury d
 ```
 +==============================================================+
 |              RINGS 18-24: AR Pipeline                         |
-|         Automated Reasoning for DARPA compliance              |
+|         Automated Reasoning for agency compliance              |
 +==============================================================+
 |                                                               |
 |  [v] Ring 18: Ternary Logic (K3 isomorphism)                 |

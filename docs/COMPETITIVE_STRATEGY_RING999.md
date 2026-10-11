@@ -74,7 +74,7 @@ Do **not** fork the long-form math into a second SSOT. Use:
 
 ## 4. “Competition-ready” checklist (Article COMPETITION-READY)
 
-Before grant text, DARPA-style proposals, or “we beat X” outreach, verify **all** items in **Article COMPETITION-READY** in `[docs/T27-CONSTITUTION.md](T27-CONSTITUTION.md)` (invariants, claims registry, repro/CI, Issue Gate, **TASK** protocol, honest competitor gaps).
+Before grant text, agency-style proposals, or “we beat X” outreach, verify **all** items in **Article COMPETITION-READY** in `[docs/T27-CONSTITUTION.md](T27-CONSTITUTION.md)` (invariants, claims registry, repro/CI, Issue Gate, **TASK** protocol, honest competitor gaps).
 
 
 ---

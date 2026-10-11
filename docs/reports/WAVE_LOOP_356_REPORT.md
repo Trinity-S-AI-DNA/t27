@@ -106,7 +106,7 @@ mac(mac(mac(mac(x, a, .zero), b, .plus), c, .minus), d, .plus) = mac(x, b - c + 
 - **US11966714B2** (Purdue): Granted ternary in-memory DNN accelerator patent (expires 2040). Not new.
 - **NativeTernary** (Indian Patent Office, 2026): Provisional filing for ternary weight encoding. Not hardware.
 - **NSF SHF Solicitation 25-543**: Active, welcomes formal methods and emerging hardware.
-- **DARPA-NSF AI Forge RFI**: Closes **June 22, 2026** ($750K–$3M). Focuses on AI interpretability, not ternary hardware.
+- **A federal AI RFI**: Closes **June 22, 2026** ($750K–$3M). Focuses on AI interpretability, not ternary hardware.
 
 ### 3.4 Key Assessment
 

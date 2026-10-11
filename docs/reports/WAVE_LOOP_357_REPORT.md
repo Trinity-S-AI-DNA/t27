@@ -126,7 +126,7 @@ Linear scaling holds: ~0.085s per variable. No timeout trend detected. Omega bou
 
 **No competitor has published generic ∀ ternary theorems.** The generic ternary theorem space remains unoccupied. Trinity's 172 generic ∀ = **172× competitor maximum**.
 
-**Critical vulnerability persists:** Trinity has no measured silicon evidence. ternfpga (Jun 8) and Balanced_Ternary (Jun 15–17) are building physical hardware. BoolSi raised **$6M seed** for AI-to-FPGA acceleration (not ternary-specific). No DARPA awards or NSF grants announced for ternary accelerators in June 2026.
+**Critical vulnerability persists:** Trinity has no measured silicon evidence. ternfpga (Jun 8) and Balanced_Ternary (Jun 15–17) are building physical hardware. BoolSi raised **$6M seed** for AI-to-FPGA acceleration (not ternary-specific). No federal awards or NSF grants announced for ternary accelerators in June 2026.
 
 **maniTLab patent stack** (Indian Patent Office, Apr 2026): Six patents covering photonic-ternary computing from SWCNT@MWCNT devices up to a `ManiT` compiler. Not granted yet but broadest 2026 patent filing in the space.
 

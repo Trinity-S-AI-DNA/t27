@@ -82,7 +82,7 @@ Each WP should yield **at least one** conference/journal paper and **one dissert
 
 **Working title:** *Spec-first ternary computing for explainable neurosymbolic AI (Trinity S³AI / t27)*
 
-1. **Introduction** — Motivation; gap in binary + script-soup stacks; DARPA-style explainability context.  
+1. **Introduction** — Motivation; gap in binary + script-soup stacks; agency-style explainability context.  
 2. **Theoretical base** — GoldenFloat / φ-structured numerics; error models; sacred constants as **specified** objects.  
 3. **Ternary logic** — K3, trits {−1,0,+1}, isomorphism statements **clearly scoped**; connection to t27 constructs.  
 4. **Language t27** — Grammar, types, invariants; soundness for a **core** fragment.  
