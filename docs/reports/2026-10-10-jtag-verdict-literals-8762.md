@@ -90,3 +90,19 @@ publication-refresh-zig.log, publication-refresh-native.log and
 publication-refresh-seal.log under /Users/ssdm4/trinity-results/jtag-verdict-spec/.
 Latest-head CI is still required; the dependency's known Verilog widths
 failure remains. No merge, closure or hardware execution is claimed.
+
+## Large-frame width dependency repair (local day 2026-10-10)
+
+Final CI at e6f94ca0b had 30 successes and only the inherited Verilog widths
+failure. A normal merge of dependency a34891bd3 brings its spec-only repair:
+three redundant undefined initializers on index-only large byte arrays are
+omitted, with the same lengths, tests and native/Zig behavior. The dependency
+report records identical Zig and native instructions, 5/5 tests, 16 assertions,
+normal seal, clean corpus ratchet and width scan with zero new violations.
+No compiler, gate, cap or exception change is included.
+
+JTAG source and seal are unchanged, and seal --verify still matches all five
+hashes (big-frame-dependency-jtag-verify.log in this report's evidence directory).
+Earlier JTAG execution results remain applicable to that unchanged source;
+they are not described as new executions. Fresh published-head CI remains
+required, and upstream merge access is still absent.

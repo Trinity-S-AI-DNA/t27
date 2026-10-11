@@ -159,3 +159,41 @@ and three none hashes. Duplicate bodies and type-conflict classification
 ledger exception or gate weakening is added. Evidence: publication-refresh-*
 under /Users/ssdm4/trinity-results/spec-tests-7641/. CI for the new published
 head must still be checked; no merge or issue closure is claimed.
+
+## Big-frame width restoration (#8756, local day 2026-10-10)
+
+Final CI at a2028f8a7 had 30 successful checks and one failure: Verilog
+widths, run 38097688423. Dependent #8771 at e6f94ca0b had the same result,
+run 38097752265. Both were MERGEABLE; no ordinary merge was performed.
+
+The reference Verilog emitter treats any explicit local array initializer,
+including `undefined`, as a packed value (compiler.rs, primitive local array
+lowering). In big_frame, this produced 4800000-bit low/high and 9600000-bit
+block registers. These function-local byte arrays are indexed only, never
+passed or returned whole. T27 supports an uninitialized typed declaration;
+the Zig emitter supplies `= undefined` and native lowering uses the same
+uninitialized aggregate path for either spelling.
+
+The spec now omits the three redundant initializers. Array lengths 600000
+and 1200000, every index/write/read, recursion and all five tests are intact.
+The generated Zig is byte-identical to the previous version, as is Rust.
+Native assembly instructions and addresses are identical; only source-line
+comments moved because of the added explanation. Verilog now emits 8-bit
+unpacked memories with the original numbers of elements. This restores this
+spec's layout; the general initializer decision in the frozen compiler is
+not changed. No compiler source, FROZEN_HASH, gate, baseline, cap or tracked
+foreign implementation is edited. No hardware execution is claimed.
+
+Executed: normal unforced seal --save gives 5/5, zero vacuous tests; seal
+--verify matches all five hashes. Native test --check gives 5/5 and 16 runtime
+assertions. The initial probe's reference test-report also executed all five
+tests and 16 assertions. Full check_verilog_widths.py --require scans 1854
+specs and reports two previously known specimens, zero new; its ledger is
+unchanged. Corpus and seal-wide checks are recorded below once complete.
+Evidence: big-frame-* under /Users/ssdm4/trinity-results/spec-tests-7641/.
+The complete corpus ratchet is CLEAN: 71 known primary failures, zero
+unexpected failures/passes, expiries, discard or gate drift. This is not an
+all-pass corpus. Seal coverage remains 2394 scanned, 2273 hold, 121 known
+broken; currency has 2297 current and zero stale generated hashes (94 missing
+spec paths, three none hashes). Fresh published-head CI remains necessary
+before merge.
