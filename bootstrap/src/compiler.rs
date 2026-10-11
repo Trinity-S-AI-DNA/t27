@@ -26224,25 +26224,54 @@ fn check_const_widths(node: &Node, result: &mut TypeCheckResult) {
             .map(|c| if c.value.is_empty() { c.name.clone() } else { c.value.clone() })
             .unwrap_or_default();
         if let Some(bits) = int_type_names::int_value_bits(node.extra_type.as_bytes()) {
-            // The lexer strips digit separators, so the literal arrives without
-            // them. A filter here changed no test either -- verified by removing
-            // it -- and `const A: u32 = 4_294_967_295` is checked end to end in
-            // tests/const_width.rs, where the lexer's behaviour is what the
-            // assertion actually rests on.
+            // Handle decimal literals with underscores, hex literals (0x), and binary literals (0b)
             let raw: String = lit.clone();
-            if !raw.is_empty() && raw.chars().all(|c| c.is_ascii_digit()) && !literal_fits(&raw, bits)
-            {
-                result.error_count += 1;
-                let line = if node.line > 0 {
-                    format!(":{}", node.line)
+            if !raw.is_empty() {
+                let (cleaned_literal, literal_value) = if raw.starts_with("0x") {
+                    // Handle hex literal
+                    let hex_str = &raw[2..];
+                    if hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                        let value = u128::from_str_radix(hex_str, 16).unwrap_or(0);
+                        (hex_str.to_string(), value)
+                    } else {
+                        (hex_str.to_string(), 0)
+                    }
+                } else if raw.starts_with("0b") {
+                    // Handle binary literal
+                    let bin_str = &raw[2..];
+                    if bin_str.chars().all(|c| c == '0' || c == '1') {
+                        let value = u128::from_str_radix(bin_str, 2).unwrap_or(0);
+                        (bin_str.to_string(), value)
+                    } else {
+                        (bin_str.to_string(), 0)
+                    }
                 } else {
-                    String::new()
+                    // Handle decimal literal (potentially with underscores)
+                    let dec_str = raw.replace("_", "");
+                    if dec_str.chars().all(|c| c.is_ascii_digit()) {
+                        let value = dec_str.parse::<u128>().unwrap_or(0);
+                        (dec_str, value)
+                    } else {
+                        (dec_str, 0)
+                    }
                 };
-                result.errors.push(format!(
-                    "error: constant '{}'{} declares {} but its value has {} digits, \
-                     which no {} can hold",
-                    node.name, line, node.extra_type, raw.len(), node.extra_type
-                ));
+
+                // Check if the literal fits in the type
+                let max_value = 1u128 << bits;
+                if !cleaned_literal.is_empty() && literal_value >= max_value
+                {
+                    result.error_count += 1;
+                    let line = if node.line > 0 {
+                        format!(":{}", node.line)
+                    } else {
+                        String::new()
+                    };
+                    result.errors.push(format!(
+                        "error: constant '{}'{} declares {} but its value has {} digits, \
+                         which no {} can hold",
+                        node.name, line, node.extra_type, cleaned_literal.len(), node.extra_type
+                    ));
+                }
             }
         }
     }
