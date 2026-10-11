@@ -10756,9 +10756,17 @@ impl Codegen {
                 }
             }
             NodeKind::ExprUnary => {
+                // #8343: the operand used to be emitted bare, so a
+                // parenthesized binary lost its parens: `~(x +% 1)` came out
+                // as `~x +% 1`, and Zig binds `~` tighter than any infix
+                // operator -- wrong value, and a runtime overflow panic for
+                // `x & ~(holes * 255)`. gen-c and gen-verilog keep the parens
+                // because their binary arms always wrap `(expr)`; the Zig arm
+                // emits minimal parens, so the unary arm re-adds them around
+                // a binary operand itself.
                 self.write(&node.extra_op);
                 if !node.children.is_empty() {
-                    self.gen_expr(&node.children[0]);
+                    self.gen_expr_maybe_paren(&node.children[0]);
                 }
             }
             NodeKind::ExprFieldAccess => {
