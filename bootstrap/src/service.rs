@@ -4282,6 +4282,9 @@ pub fn run_silicon(
         stages.push(Stage { name: "bitstream REUSED", secs: 0.0, code: Some(0), artefact: file_len(&bit_path), note });
         break 'build;
     }
+    // #8915: the DUT-alone synthesis of the datapath check reads only the generated Verilog, so it runs beside the main yosys
+    let dp_script = format!("read_verilog -sv {}; synth_xilinx -family xc7 -flatten -run :coarse; techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; alumacc; opt; memory -nomap; opt_clean; synth_xilinx -family xc7 -flatten -run map_memory:; stat", v_path.display());
+    let (mut dp_job, mut dp_res) = (Some(std::thread::spawn(move || run(Command::new("yosys").args(["-p", &dp_script])))), None::<(Option<i32>, String, String)>);
     for attempt in 0..6u32 {
         let t = Instant::now();
         let chparam = match chain_override {
@@ -4363,17 +4366,7 @@ pub fn run_silicon(
         // seconds, and that is cheap against four months of a silent wrong answer.
         let t_dp = Instant::now();
         let wrapper_carry = carry4_count(&log);
-        let (dc, dout, _) = run(Command::new("yosys").args([
-            "-p",
-            &format!(
-                "read_verilog -sv {}; \
-                 synth_xilinx -family xc7 -flatten -run :coarse; \
-                 techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; \
-                 alumacc; opt; memory -nomap; opt_clean; \
-                 synth_xilinx -family xc7 -flatten -run map_memory:; stat",
-                v_path.display()
-            ),
-        ]));
+        let (dc, dout, _) = dp_res.get_or_insert_with(|| dp_job.take().and_then(|j| j.join().ok()).unwrap_or_default()).clone();
         let dut_carry = if dc == Some(0) { Some(carry4_count(&dout)) } else { None };
         let (dp_code, dp_note) = match (wrapper_carry > WRAPPER_CARRY4_FLOOR, dut_carry) {
             // W822 (T553): report the EXERCISED FRACTION, not just "live".
@@ -4558,6 +4551,7 @@ pub fn run_silicon(
             _ => break,
         }
     }
+    if let Some(j) = dp_job.take() { let _ = j.join(); } // #8915: a failed main yosys never leaves the datapath one running
 
     if let Some(st) = yosys_stage { stages.push(st); }
     if let Some(st) = datapath_stage { stages.push(st); }
@@ -4650,6 +4644,11 @@ pub fn run_silicon(
         std::fs::write(cache.join("chain"), derived_chain.map(|c| c.to_string()).unwrap_or_default())?;
         std::fs::write(cache.join("bit.sha256"), crate::sha256_hex(&bit))?; // last: a torn entry reads CORRUPT
         println!("  bitstream stored for reuse: {}", cache.display());
+        // #8933: keep the BIT_CACHE_KEEP entries used most recently (stored, or a reuse hit's `hits`), drop the rest
+        let used = |d: &Path| ["hits", "bit.sha256"].iter().filter_map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok()).max();
+        let mut all: Vec<(Option<std::time::SystemTime>, PathBuf)> = std::fs::read_dir(cache.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten().map(|e| (used(&e.path()), e.path())).collect();
+        all.sort_by(|a, b| b.0.cmp(&a.0));
+        for (rank, (_, d)) in all.iter().enumerate() { if !br::bit_cache_keep(rank as u32) && *d != cache { let _ = std::fs::remove_dir_all(d); } }
     }
     let stream = |b: &[u8]| b.windows(4).position(|w| w == br::BIT_SYNC_WORD.to_be_bytes()).map(|i| b[i..].to_vec());
     if audit && br::audit_verdict(std::fs::read(&bit_path).ok().and_then(|b| stream(&b)) == cached_bit.as_deref().and_then(stream)) == br::AUDIT_POISONED {
@@ -5603,6 +5602,11 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     use crate::{gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
     let (mut tc, mut memo, mut stack, mut specs) = (crate::seal_toolchain(), std::collections::HashMap::new(), vec![std::path::PathBuf::from("specs")], Vec::new());
     tc["gen_cache_bin"] = std::fs::read(std::env::current_exe()?).map(|b| crate::sha256_hex(&b)).unwrap_or_default().into(); // #8737: the generator's identity
+    // #8928: one directory per binary; keep the current one and the newest others (gen_cache_keep), drop the rest and the old flat files
+    let (gh, cur) = (std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash"), tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none").to_string());
+    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&gh).into_iter().flatten().flatten().filter_map(|e| { let p = e.path(); if !p.is_dir() { let _ = std::fs::remove_file(&p); return None } (e.file_name().to_string_lossy() != cur).then(|| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p)) }).collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    for (rank, (_, p)) in others.iter().enumerate() { if !gc::gen_cache_keep(false, rank as u32) { let _ = std::fs::remove_dir_all(p); } }
     while let Some(d) = stack.pop() { for e in std::fs::read_dir(&d)?.flatten() { let p = e.path(); if p.is_dir() { stack.push(p) } else if p.extension().map_or(false, |x| x == "t27") { specs.push(p.to_string_lossy().to_string()) } } }
     fn seal_of(p: &str, src: &str) -> serde_json::Value {
         let module = crate::extract_module_name(src).unwrap_or_else(|| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
@@ -5613,7 +5617,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     fn digest(p: &str, d: u32) -> String { if let Some(x) = DIG.with(|m| m.borrow().get(p).cloned()) { return x } let src = std::fs::read_to_string(p).unwrap_or_default(); let mut h = src.clone(); for u in src.lines().filter_map(|l| l.trim().strip_prefix("use ")).filter(|_| d < 64) { h.push_str(&digest(&crate::use_spec_path(u), d + 1)) } let x = crate::sha256_hex(h.as_bytes()); DIG.with(|m| m.borrow_mut().insert(p.into(), x.clone())); x }
     /// #8737 H1: a spec's four gen hashes, from ~/.cache/t27/genhash or generated and stored (gen_hash_cache.t27).
     fn gen_cached(p: &str, tc: &serde_json::Value) -> Option<[String; 4]> {
-        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
+        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none")).join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
         let hit: Option<[String; 4]> = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|v| gc::gen_cache_use(true, v.len() as u32)).map(|v| [v[0].clone(), v[1].clone(), v[2].clone(), v[3].clone()]);
         let cur = hit.clone().or_else(|| crate::compute_seal_hashes(p).ok().map(|h| [h.gen_hash_zig, h.gen_hash_verilog, h.gen_hash_c, h.gen_hash_rust]));
         if let Some(c) = cur.as_ref().filter(|_| gc::gen_cache_store(true, hit.is_some())) { let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))); let _ = std::fs::write(&file, serde_json::to_string(c).unwrap_or_default()); }
