@@ -31,6 +31,7 @@ mod loopclaim;
 mod misread;
 mod night;
 mod oneaway;
+mod payout;
 mod window;
 mod modreach;
 mod mutate;
@@ -47,6 +48,8 @@ mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of
 mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
 #[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
+mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 mod renum;
@@ -388,6 +391,11 @@ enum Commands {
         /// A full master commit sha: its run instead of the newest. Twice: compare the two commits' receipts.
         #[arg(long)] sha: Vec<String>,
     },
+    /// The hot paths timed against their budgets -- a warm frontier, a bitstream reuse hit; OVER when a cache broke (rules: specs/tri/hot/hot.t27).
+    Hot {
+        /// The t27c binary; default target/release/t27c, then t27c on PATH.
+        #[arg(long)] t27c: Option<String>,
+    },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -396,6 +404,15 @@ enum Commands {
         #[arg(long, default_value_t = act::DEFAULT_BOUND)] bound: u32,
         /// Also read the decision log: list the records the sampling rule would refuse.
         #[arg(long)] replay: bool,
+    },
+    /// The AUTHOR_ROYALTY table of one epoch (a UTC day) from git history, GitHub's signature check and both labs' receipts, with SHA-256 digests of its facts and of the table; accounting only (rules: specs/tri/network/payout.t27 over specs/network/attribution.t27 and usage.t27).
+    Payout {
+        /// The epoch: unix time / 86400, so 2026-10-10 is 20736. Its commits are HEAD's first-parent commits of that day.
+        #[arg(long)] epoch: u64,
+        /// The epoch's AUTHOR_ROYALTY pool, in credits.
+        #[arg(long, default_value_t = payout::pay::DEFAULT_POOL)] pool: u64,
+        /// Print one JSON object instead of the table.
+        #[arg(long)] json: bool,
     },
 }
 
@@ -929,6 +946,22 @@ fn cmd_test(spec: &str, t27c: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// #8870: each hot path once to warm it, then once timed; one row each, judged by hot.t27. Silicon runs only with T27_OPENXC7.
+fn cmd_hot(t27c: Option<&str>) -> u32 {
+    let t = mutate::resolve_t27c(t27c);
+    let si = ["silicon", "specs/fpga/ternary_link.t27", "--top", "fpga/verilog/ternary_link_jtag.v", "--skip-hardware", "--pnr-seed", "11"];
+    let run = |a: &[&str]| { let s = std::time::Instant::now(); let o = Command::new(&t).args(a).output().ok(); (o.as_ref().map_or(false, |o| o.status.success()), s.elapsed().as_millis() as u32, o.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("AUDIT:"))) };
+    let mut over = 0;
+    for (name, args, can, budget) in [("frontier, warm", &["frontier", "--list"][..], true, hot::FRONTIER_WARM_BUDGET_MS), ("silicon, reuse hit", &si[..], std::env::var_os("T27_OPENXC7").is_some(), hot::SILICON_REUSE_BUDGET_MS)] {
+        let (mut ok, mut ms, aud) = if can { run(args); run(args) } else { (false, 0, false) };
+        if hot::hot_measure_again(aud, false) { (ok, ms, _) = run(args); } // the scheduled bitstream audit timed a build, not a hit
+        let v = hot::hot_verdict(can, ok, ms, budget);
+        over += (v == hot::HOT_OVER) as u32;
+        println!("{:<8} {name}: {ms} ms (budget {budget} ms){}", ["OK", "OVER", "SKIPPED"][v as usize], if can && !ok { " -- the command failed" } else { "" });
+    }
+    hot::hot_exit(over)
+}
+
 /// Run `<t27c> test-report <spec>`; the verdict is report.t27's, from the text and whether t27c exited 0.
 pub(crate) fn test_report(t27c: &str, spec: &Path, verbose: bool) -> Result<(&'static str, u8)> {
     let out = Command::new(t27c).arg("test-report").arg(spec).args(verbose.then_some("--verbose")).stderr(std::process::Stdio::inherit()).output().with_context(|| format!("cannot start `{t27c} test-report`"))?;
@@ -1246,6 +1279,8 @@ fn main() -> Result<()> {
         Commands::Hooks { action } => hooks::run(action)?,
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
+        Commands::Hot { t27c } => std::process::exit(cmd_hot(t27c.as_deref()) as i32),
+        Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
     }
 
     Ok(())

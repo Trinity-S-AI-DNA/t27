@@ -38,7 +38,13 @@ pub enum Ty {
     /// `iN` for an N in 1..=31 other than 8 and 16: sign-extended in its W
     /// register, like i8/i16.
     IN(u8),
+    /// `i128`, a fn's result type: a pair of X registers in generated code, the low word first (x0:x1 for a
+    /// result), and 16 frame bytes for a variable (specs/tri/t27b/i128_plan.t27, `ip` below).
+    I128,
 }
+
+#[path = "../../../gen/rust/tri/t27b/i128_plan.rs"] #[allow(dead_code, unused_parens)]
+pub(crate) mod ip; // t27c gen-rust of specs/tri/t27b/i128_plan.t27: a run-time i128 as a pair of X registers
 
 /// Names of the odd widths, so `Ty::name` stays a `&'static str`.
 const UN_NAMES: [&str; 32] = [
@@ -121,6 +127,7 @@ impl Ty {
             Ty::F32 => "f32",
             Ty::UN(n) => UN_NAMES[n as usize],
             Ty::IN(n) => IN_NAMES[n as usize],
+            Ty::I128 => "i128",
         }
     }
 
@@ -132,16 +139,9 @@ impl Ty {
         matches!(self, Ty::F64 | Ty::F32)
     }
 
-    /// Size in memory: a load or store of this type moves this many bytes.
+    /// Size in memory: a load or store of this type moves this many bytes, Zig's ABI size (specs/tri/t27b/builtin_plan.t27).
     pub fn bytes(self) -> u32 {
-        match self {
-            Ty::Bool => 1,
-            // Zig's ABI size: the next power-of-two byte count.
-            Ty::UN(n) | Ty::IN(n) if n <= 8 => 1,
-            Ty::UN(n) | Ty::IN(n) if n <= 16 => 2,
-            Ty::UN(_) | Ty::IN(_) => 4,
-            _ => self.bits() / 8,
-        }
+        crate::lower::bp::abi_bytes(self.bits())
     }
 
     /// Width in bits. `Bool` reports 8 (it is stored as a 0/1 byte value).
@@ -152,11 +152,12 @@ impl Ty {
             Ty::U32 | Ty::I32 | Ty::F32 => 32,
             Ty::U64 | Ty::I64 | Ty::Ptr | Ty::F64 => 64,
             Ty::UN(n) | Ty::IN(n) => n as u32,
+            Ty::I128 => 128,
         }
     }
 
     pub fn signed(self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_))
+        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128)
     }
 
     /// True when the value occupies a full 64-bit X register.
@@ -164,36 +165,15 @@ impl Ty {
         self.bits() == 64
     }
 
-    pub fn min(self) -> i128 {
-        match self {
-            Ty::Bool => 0,
-            _ if self.signed() => -(1i128 << (self.bits() - 1)),
-            _ => 0,
-        }
-    }
+    /// The bounds, as specs/tri/t27b/eval_arith.t27 has them (`ty_min`, `ty_max`, `fits`), an i128's too.
+    pub fn min(self) -> i128 { crate::eval::spec::ty_min(self.bits(), self.signed()) }
 
-    pub fn max(self) -> i128 {
-        match self {
-            Ty::Bool => 1,
-            _ if self.signed() => (1i128 << (self.bits() - 1)) - 1,
-            _ => (1i128 << self.bits()) - 1,
-        }
-    }
+    pub fn max(self) -> i128 { crate::eval::spec::ty_max(self.bits(), self.signed(), self == Ty::Bool) }
 
-    pub fn fits(self, v: i128) -> bool {
-        v >= self.min() && v <= self.max()
-    }
+    pub fn fits(self, v: i128) -> bool { crate::eval::spec::fits(v, self.bits(), self.signed(), self == Ty::Bool) }
 
     /// Two's-complement reduction of an arbitrary integer to this type's range.
-    pub fn wrap(self, v: i128) -> i128 {
-        let bits = self.bits();
-        let m = (v as u128) & ((1u128 << bits) - 1);
-        if self.signed() && (m >> (bits - 1)) & 1 == 1 {
-            (m as i128) - (1i128 << bits)
-        } else {
-            m as i128
-        }
-    }
+    pub fn wrap(self, v: i128) -> i128 { crate::eval::spec::wrap(v, self.bits(), self.signed()) }
 
     /// Interpret the low `bits` of a raw 64-bit register value as this type.
     pub fn from_raw(self, raw: u64) -> i128 {
@@ -371,7 +351,7 @@ pub enum CmpOp {
 
 #[path = "../../../gen/rust/tri/t27b/cmp_op.rs"]
 #[allow(dead_code, unused_parens)]
-mod co; // t27c gen-rust of specs/tri/t27b/cmp_op.t27: the comparisons by their CmpOp number
+pub(crate) mod co; // t27c gen-rust of specs/tri/t27b/cmp_op.t27: the comparisons by their CmpOp number; codegen's conditions
 const CMP_OPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge];
 const _: () = assert!(CmpOp::Eq as u8 == co::EQ && CmpOp::Lt as u8 == co::LT && CmpOp::Ge as u8 == co::GE);
 
