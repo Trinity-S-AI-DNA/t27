@@ -3287,6 +3287,16 @@ fn elf_object_links_and_runs() {
         call!("abi_i128_last": fn(u64, u64, u64, u64, u64, i128) -> i128; 1, 2, 3, 4, 5, 1 << 64 => (1 << 64) - 15);
         call!("abi_store": fn(i64) -> (); 99 => ());
         call!("bump": fn() -> i64; => 100);
+        // Test composite types with AAPCS64
+        call!("abi_pair": fn(u32) -> AbiPair; 42 => AbiPair { a: 42, b: 43 });
+        call!("abi_nine": fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64; 1, 2, 3, 4, 5, 6, 7, 8, 9 => 45);
+        call!("abi_hfa_3f32": fn(f32, f32, f32) -> f32; 1.0, 2.0, 3.0 => 5.0);
+        call!("abi_hva_2f64": fn(f64, f64) -> f64; 2.0, 3.0 => 6.0);
+        call!("abi_str_len": fn(str) -> usize; "hello" => 5);
+        call!("abi_slice_sum": fn([]const u32) -> u32; [1, 2, 3, 4, 5] => 15);
+        call!("abi_optional_u32": fn(?u32) -> ?u32; ?Some(42) => ?Some(42));
+        call!("abi_large_struct_result": fn(u64, u32, u32, u32) -> LargerStruct; 1000, 10, 20, 30 => LargerStruct { a: 1000, b: 10, c: 20, d: 30 });
+        call!("abi_large_struct_arg": fn(LargerStruct, u32) -> u64; LargerStruct { a: 500, b: 5, c: 10, d: 15 }, 100 => 730);
         // x19-x28, d8-d15 and x29 hold known values across a call of abi_keep, which homes ten locals in x19-x28.
         let mut r = [0u64; 19]; let res: u64;
         unsafe { std::arch::asm!("stp x19, x29, [sp, #-16]!", "mov x19, #19", "mov x29, #29", "blr x16", "mov x9, x19", "mov x10, x29", "ldp x19, x29, [sp], #16",
