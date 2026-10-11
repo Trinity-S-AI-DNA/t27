@@ -1,0 +1,425 @@
+// bbv_optimizer.t27 - VIBEEC BBV OPTIMIZER (port)
+// Port of gHashTag/trinity src/vibeec/bbv_optimizer.zig @ aa30f374eee0.
+// BBV: Basic Block Versioning. Pattern: HSH (Type Context Hashing), from
+// POPL 2021 research. The original targets 20-40% runtime improvement for
+// polymorphic code by versioning basic blocks per observed type context.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Port mapping (original -> here):
+//   TypeTag enum(u8)                -> TypeTag enum, same variants; type_tag_value
+//                                      carries the implicit 0..8 numbering the
+//                                      original's hash reads via @intFromEnum.
+//   BBVContext types/depth          -> same fields; depth widened to usize (a
+//                                      width is not a decision). The original's
+//                                      field defaults (all .unknown, depth 0)
+//                                      become BBVContext_new.
+//   push / pop / hash               -> same decisions: a push onto a full
+//                                      context is silently dropped, pop falls
+//                                      back to .unknown, hash folds h*31+tag
+//                                      over types[0..depth]. The original's
+//                                      wrapping ops (*% +%) never wrap here
+//                                      (depth <= 8, tags 0..8), so plain
+//                                      arithmetic is exact.
+//   std.ArrayList(u8) code buffer   -> dropped: no decision in this file
+//                                      reads the version's code bytes.
+//   std.mem.Allocator               -> dropped with the buffer and the map
+//                                      growth it fed.
+//   BBVersion.init(alloc, ctx)      -> BBVersion_init(ctx): a fresh version
+//                                      carries its type context and has
+//                                      executed zero times.
+//   BBVersion.deinit                -> keeps its name with an undefined body:
+//                                      pure resource release, no decision and
+//                                      no test calls either one.
+//   std.AutoHashMap(u64, BBVersion) -> BBVersionTable, a fixed-capacity table
+//                                      keyed by context hash; a full table is
+//                                      the stand-in for the original's
+//                                      OutOfMemory error from `try put`.
+//   getOrCreate                     -> same accounting: on a hit stats.hits
+//                                      and the version's exec_count grow; on
+//                                      a miss stats.misses and stats.versions
+//                                      bump BEFORE the fallible insert, exactly
+//                                      as the original orders them, so a full
+//                                      table still shows both counters moved.
+//   !*BBVersion error result        -> GetOrCreateResult with .index = -1.
+
+module port::trinity::src::vibeec::bbv_optimizer;
+
+pub const PHI : f64 = 1.618033988749895;
+pub const GOLDEN_IDENTITY : f64 = 3.0;
+
+pub const TypeTag = enum { unknown, int64, float64, bool_t, string, object, phi_t, pi_t, e_t, };
+
+// The original's `enum(u8)` numbers the variants 0..8 implicitly and the
+// context hash folds those numbers; the port carries them explicitly.
+fn type_tag_value(t: TypeTag) u64 {
+    return switch (t) {
+        .unknown => 0,
+        .int64 => 1,
+        .float64 => 2,
+        .bool_t => 3,
+        .string => 4,
+        .object => 5,
+        .phi_t => 6,
+        .pi_t => 7,
+        .e_t => 8,
+    };
+}
+
+pub const BBVContext = struct {
+    types: [8]TypeTag,
+    depth: usize,
+};
+
+// The original relies on field defaults: every tag .unknown, depth 0.
+pub fn BBVContext_new() BBVContext {
+    var types: [8]TypeTag = [TypeTag.unknown, TypeTag.unknown, TypeTag.unknown, TypeTag.unknown, TypeTag.unknown, TypeTag.unknown, TypeTag.unknown, TypeTag.unknown];
+    return BBVContext{ .types = types, .depth = 0 };
+}
+
+// Original: pub fn push(self: *BBVContext, t: TypeTag) void
+// A push onto a full context (depth == 8) is silently dropped.
+pub fn BBVContext_push(ctx: *BBVContext, t: TypeTag) void {
+    if (ctx.depth < 8) {
+        ctx.types[ctx.depth] = t;
+        ctx.depth += 1;
+    }
+}
+
+// Original: pub fn pop(self: *BBVContext) TypeTag
+// Popping an empty context returns .unknown and leaves the depth at 0.
+pub fn BBVContext_pop(ctx: *BBVContext) TypeTag {
+    var tag: TypeTag = TypeTag.unknown;
+    if (ctx.depth > 0) {
+        ctx.depth -= 1;
+        tag = ctx.types[ctx.depth];
+    }
+    return tag;
+}
+
+// Original: pub fn hash(self: *const BBVContext) u64
+// The port passes the context by value: the hash only reads it. Folds the
+// live tags with 31: h = h*31 + tag over types[0..depth]. The original's
+// wrapping ops (*% +%) never wrap at depth <= 8 with tags 0..8, so plain
+// arithmetic is exact here.
+pub fn BBVContext_hash(ctx: BBVContext) u64 {
+    var h: u64 = 0;
+    var i: usize = 0;
+    while (i < ctx.depth) {
+        h = h * 31 + type_tag_value(ctx.types[i]);
+        i += 1;
+    }
+    return h;
+}
+
+// The original also carries code: std.ArrayList(u8), the generated machine
+// code for the version. Its bytes are read by no decision here, so the
+// buffer and its allocator are plumbing and are not ported.
+pub const BBVersion = struct {
+    ctx: BBVContext,
+    exec_count: u64,
+};
+
+// Original: pub fn init(alloc: Allocator, ctx: BBVContext) BBVersion
+// The allocator parameter is dropped with the code buffer it fed: a fresh
+// version carries its type context and has executed zero times.
+pub fn BBVersion_init(ctx: BBVContext) BBVersion {
+    return BBVersion{ .ctx = ctx, .exec_count = 0 };
+}
+
+// Original: pub fn deinit(self: *BBVersion) void
+// Pure resource release (the ArrayList code buffer). Nothing to decide;
+// no test calls this.
+pub fn BBVersion_deinit(v: *BBVersion) void {
+    undefined;
+}
+
+// std.AutoHashMap(u64, BBVersion) as a fixed-capacity table keyed by the
+// context hash; only slots [0..len) are meaningful. The 16-slot cap is the
+// stand-in for the allocator's OutOfMemory in the original.
+pub const BBVersionTable = struct {
+    keys: [16]u64,
+    values: [16]BBVersion,
+    len: usize,
+};
+
+// The original's anonymous stats struct { hits, misses, versions }.
+pub const BBVStats = struct {
+    hits: u64,
+    misses: u64,
+    versions: u64,
+};
+
+pub const BBVOptimizer = struct {
+    versions: BBVersionTable,
+    stats: BBVStats,
+};
+
+// Original: pub fn init(alloc: Allocator) BBVOptimizer
+// An empty table and zeroed stats.
+pub fn BBVOptimizer_init() BBVOptimizer {
+    var keys: [16]u64 = undefined;
+    var values: [16]BBVersion = undefined;
+    for (0..16) |i| {
+        keys[i] = 0;
+        values[i] = BBVersion_init(BBVContext_new());
+    }
+    const table: BBVersionTable = BBVersionTable{ .keys = keys, .values = values, .len = 0 };
+    const stats: BBVStats = BBVStats{ .hits = 0, .misses = 0, .versions = 0 };
+    return BBVOptimizer{ .versions = table, .stats = stats };
+}
+
+// Original: pub fn deinit(self: *BBVOptimizer) void
+// Pure resource release (every version's ArrayList, then the map itself).
+// Nothing to decide; no test calls this.
+pub fn BBVOptimizer_deinit(opt: *BBVOptimizer) void {
+    undefined;
+}
+
+// The stand-in for getOrCreate's `!*BBVersion` result: index is the slot of
+// the version in the table, or -1 when the table could not take the context
+// (the original's OutOfMemory path). hit says whether an existing version
+// was reused.
+pub const GetOrCreateResult = struct {
+    index: i64,
+    hit: bool,
+};
+
+// The original's map lookup: the first slot whose key is the context hash.
+fn find_version(table: BBVersionTable, h: u64) i64 {
+    var i: usize = 0;
+    while (i < table.len) {
+        if (table.keys[i] == h) {
+            return i as i64;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// Original: pub fn getOrCreate(self: *BBVOptimizer, ctx: BBVContext) !*BBVersion
+// Hit: stats.hits += 1 and the version's exec_count += 1. Miss: stats.misses
+// and stats.versions bump BEFORE the fallible insert, exactly as the original
+// orders them, so a failed insert (full table) still shows both counters moved.
+pub fn BBVOptimizer_getOrCreate(opt: *BBVOptimizer, ctx: BBVContext) GetOrCreateResult {
+    const h: u64 = BBVContext_hash(ctx);
+    const found: i64 = find_version(opt.versions, h);
+    if (found >= 0) {
+        opt.stats.hits += 1;
+        var v: BBVersion = opt.versions.values[found as usize];
+        v.exec_count += 1;
+        opt.versions.values[found as usize] = v;
+        return GetOrCreateResult{ .index = found, .hit = true };
+    }
+    opt.stats.misses += 1;
+    opt.stats.versions += 1;
+    if (opt.versions.len < 16) {
+        opt.versions.keys[opt.versions.len] = h;
+        opt.versions.values[opt.versions.len] = BBVersion_init(ctx);
+        opt.versions.len += 1;
+        return GetOrCreateResult{ .index = (opt.versions.len - 1) as i64, .hit = false };
+    }
+    // Full table: the original would return the allocator's error here, with
+    // the miss counters already bumped.
+    return GetOrCreateResult{ .index = -1, .hit = false };
+}
+
+// The original's own test "BBVContext": push int64 then float64, depth is 2,
+// pop returns float64.
+test bbv_context_push_and_pop {
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.int64);
+    BBVContext_push(&ctx, TypeTag.float64);
+    assert(ctx.depth == 2);
+    assert(BBVContext_hash(ctx) == 33);
+    assert(BBVContext_pop(&ctx) == TypeTag.float64);
+    assert(ctx.depth == 1);
+}
+
+// Pushes onto a full context are dropped, not wrapped: the very first tag
+// still sits in slot 0 and the LIFO pop reads it first.
+test push_onto_full_context_is_dropped {
+    var ctx: BBVContext = BBVContext_new();
+    var n: usize = 0;
+    while (n < 10) {
+        BBVContext_push(&ctx, TypeTag.int64);
+        n += 1;
+    }
+    assert(ctx.depth == 8);
+    assert(BBVContext_pop(&ctx) == TypeTag.int64);
+    assert(ctx.depth == 7);
+}
+
+// Pop on an empty context returns .unknown.
+test pop_empty_returns_unknown {
+    var ctx: BBVContext = BBVContext_new();
+    assert(BBVContext_pop(&ctx) == TypeTag.unknown);
+    assert(ctx.depth == 0);
+}
+
+// Pop unwinds the stack in LIFO order down to the .unknown floor.
+test pop_is_lifo_to_empty {
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.int64);
+    BBVContext_push(&ctx, TypeTag.float64);
+    BBVContext_push(&ctx, TypeTag.bool_t);
+    assert(BBVContext_pop(&ctx) == TypeTag.bool_t);
+    assert(BBVContext_pop(&ctx) == TypeTag.float64);
+    assert(BBVContext_pop(&ctx) == TypeTag.int64);
+    assert(BBVContext_pop(&ctx) == TypeTag.unknown);
+    assert(ctx.depth == 0);
+}
+
+// An empty context folds nothing: the hash is 0.
+test hash_of_empty_context_is_zero {
+    const ctx: BBVContext = BBVContext_new();
+    assert(BBVContext_hash(ctx) == 0);
+}
+
+// The hash folds tag numbers with 31 and reads the push order.
+test hash_folds_tag_numbers_in_push_order {
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.int64);
+    BBVContext_push(&ctx, TypeTag.float64);
+    assert(BBVContext_hash(ctx) == 33);
+    var other: BBVContext = BBVContext_new();
+    BBVContext_push(&other, TypeTag.float64);
+    BBVContext_push(&other, TypeTag.int64);
+    assert(BBVContext_hash(other) == 63);
+    assert(BBVContext_hash(ctx) != BBVContext_hash(other));
+}
+
+// The hash folds exactly types[0..depth]: a popped slot is forgotten.
+test hash_reads_only_the_live_depth {
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.e_t);
+    assert(BBVContext_pop(&ctx) == TypeTag.e_t);
+    assert(ctx.depth == 0);
+    assert(BBVContext_hash(ctx) == 0);
+}
+
+// A fresh version carries its type context and has executed zero times.
+test bbversion_init_starts_at_zero_executions {
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.pi_t);
+    const v: BBVersion = BBVersion_init(ctx);
+    assert(v.exec_count == 0);
+    assert(v.ctx.depth == 1);
+    assert(BBVContext_hash(v.ctx) == 7);
+}
+
+// The optimizer starts with an empty table and zeroed stats.
+test bbvoptimizer_init_starts_empty {
+    const opt: BBVOptimizer = BBVOptimizer_init();
+    assert(opt.stats.hits == 0 and opt.stats.misses == 0 and opt.stats.versions == 0);
+    assert(opt.versions.len == 0);
+}
+
+// First contact with a type context: a miss that creates version 0, which
+// has not executed yet.
+test getOrCreate_first_context_misses_and_creates {
+    var opt: BBVOptimizer = BBVOptimizer_init();
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.int64);
+    const r: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, ctx);
+    assert(!r.hit);
+    assert(r.index == 0);
+    assert(opt.stats.misses == 1 and opt.stats.versions == 1 and opt.stats.hits == 0);
+    assert(opt.versions.len == 1);
+    assert(opt.versions.keys[0] == 1);
+    assert(opt.versions.values[0].exec_count == 0);
+    assert(BBVContext_hash(opt.versions.values[0].ctx) == 1);
+}
+
+// The same context again: a hit that counts one execution on the same version.
+test getOrCreate_same_context_hits_and_counts_execution {
+    var opt: BBVOptimizer = BBVOptimizer_init();
+    var ctx: BBVContext = BBVContext_new();
+    BBVContext_push(&ctx, TypeTag.int64);
+    BBVContext_push(&ctx, TypeTag.float64);
+    const first: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, ctx);
+    assert(!first.hit and first.index == 0);
+    const again: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, ctx);
+    assert(again.hit and again.index == 0);
+    assert(opt.stats.hits == 1 and opt.stats.misses == 1 and opt.stats.versions == 1);
+    assert(opt.versions.len == 1);
+    assert(opt.versions.values[0].exec_count == 1);
+}
+
+// Versioning keys on the type context hash, not on identity: two separately
+// built contexts with the same type stack share one version.
+test getOrCreate_equal_contexts_share_a_version {
+    var opt: BBVOptimizer = BBVOptimizer_init();
+    var a: BBVContext = BBVContext_new();
+    BBVContext_push(&a, TypeTag.string);
+    var b: BBVContext = BBVContext_new();
+    BBVContext_push(&b, TypeTag.string);
+    const ra: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, a);
+    const rb: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, b);
+    assert(!ra.hit and rb.hit and rb.index == ra.index);
+    assert(opt.stats.versions == 1 and opt.stats.hits == 1 and opt.stats.misses == 1);
+    assert(opt.versions.len == 1);
+}
+
+// Different type contexts get different versions, keyed by their hashes.
+test getOrCreate_different_contexts_get_different_versions {
+    var opt: BBVOptimizer = BBVOptimizer_init();
+    var a: BBVContext = BBVContext_new();
+    BBVContext_push(&a, TypeTag.int64);
+    var b: BBVContext = BBVContext_new();
+    BBVContext_push(&b, TypeTag.float64);
+    const ra: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, a);
+    const rb: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, b);
+    assert(!ra.hit and !rb.hit);
+    assert(ra.index == 0 and rb.index == 1);
+    assert(opt.stats.versions == 2 and opt.stats.misses == 2);
+    assert(opt.versions.len == 2);
+    assert(opt.versions.keys[0] == 1 and opt.versions.keys[1] == 2);
+}
+
+// A full table is the port's stand-in for the original's OutOfMemory: the
+// miss counters still move, no version is added, and the result reports the
+// failure with index -1.
+test getOrCreate_full_table_is_the_error_path {
+    var opt: BBVOptimizer = BBVOptimizer_init();
+    var filled: usize = 0;
+    // 16 distinct type contexts: depth 1..8 stacks of int64, then depth 1..8
+    // stacks of int64 under a float64 top.
+    while (filled < 16) {
+        var ctx: BBVContext = BBVContext_new();
+        var n: usize = 0;
+        while (n < (filled % 8)) {
+            BBVContext_push(&ctx, TypeTag.int64);
+            n += 1;
+        }
+        if (filled < 8) {
+            BBVContext_push(&ctx, TypeTag.int64);
+        } else {
+            BBVContext_push(&ctx, TypeTag.float64);
+        }
+        const r: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, ctx);
+        assert(!r.hit);
+        assert(r.index == filled as i64);
+        filled += 1;
+    }
+    assert(opt.versions.len == 16);
+    assert(opt.stats.versions == 16 and opt.stats.misses == 16 and opt.stats.hits == 0);
+    // One more distinct context: the table cannot grow, the version is not
+    // created, but the miss counters were bumped before the fallible insert,
+    // exactly as the original orders them.
+    var extra: BBVContext = BBVContext_new();
+    BBVContext_push(&extra, TypeTag.pi_t);
+    const rejected: GetOrCreateResult = BBVOptimizer_getOrCreate(&opt, extra);
+    assert(!rejected.hit and rejected.index == -1);
+    assert(opt.versions.len == 16);
+    assert(opt.stats.misses == 17 and opt.stats.versions == 17);
+}
+
+// The original's own test "golden identity": PHI^2 + 1/PHI^2 is 3. The phi
+// square is computed through a runtime variable so the assert cannot fold
+// away comptime (a pass with 0 runtime asserts is vacuous, T730).
+test golden_identity {
+    var phi: f64 = PHI;
+    const phi_sq: f64 = phi * phi;
+    const sum: f64 = phi_sq + 1.0 / phi_sq;
+    assert(sum > GOLDEN_IDENTITY - 0.0001 and sum < GOLDEN_IDENTITY + 0.0001);
+}
