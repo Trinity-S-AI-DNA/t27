@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-; specs/tri/t27b/i128_plan.t27 -- how t27b holds a run-time i128 (issues #8736 and #8763, stages 1 and 2 of the
-; three that #7915 tracks; t27b coverage epic #6063, written in t27 under the port epic #6198).
+; specs/tri/t27b/i128_plan.t27 -- how t27b holds a run-time i128 (issues #8736, #8763 and #8913, the three stages
+; that #7915 tracks; t27b coverage epic #6063, written in t27 under the port epic #6198).
 ; --
 ; The design the owner chose on 2026-10-10 (option A of the design comment on #7915): an i128 is a type of
 ; t27b's code generator in its own right, held in a pair of X registers, the low word in the first one, as
@@ -43,22 +43,36 @@
 ;     unless that result has the sign it should. `@divTrunc` traps on a zero divisor at its own site and on
 ;     minInt / -1 at the next, then calls the division routine.
 ;   - the division routine is written below (`t27b_i128_div`) and spliced into a program that names
-;     DIV_BUILTIN, renamed from PORT to HELPER, t27b's reserved prefix, as libm.t27's routines are: binary
+;     one of BUILTINS, renamed from PORT to HELPER, t27b's reserved prefix, as libm.t27's routines are: binary
 ;     long division of the magnitudes, with one division of words when both fit 64 bits and two 32-bit digits
 ;     per division of words when the divisor fits 32 bits. Every name in it starts with `t27b_`, so none
 ;     shadows a name of the program it joins.
 ;   - `run_steps` runs a program on a model of the twelve step registers and NZCV, and a test checks it
 ;     against exact i128 arithmetic (Zig's own under `t27c test-report`) for every pair of SAMPLES values.
-; Stage 3 (specs/tri/t27b/eval_arith.t27) adds parameters (`pair_first` and `pair_in_regs` are here already),
-; struct fields, `@rem`, the bitwise operators and the shifts; until then cli/t27b's Ty::bytes is never asked
-; for an i128.
+; Stage 3 is what specs/tri/t27b/eval_arith.t27 needs (the conformance spec is
+; specs/tri/t27b/conformance/i128_ops.t27; the new traps are in cli/t27b/tests/i128_traps.t27 too):
+;   - NAME is read as a parameter's type and a struct field's. A parameter takes the next even-numbered pair of
+;     argument registers (`arg_reg`, `arg_next`: AAPCS64 C.10 to C.13); the callee stores the pair in its home
+;     with one stp. A pair that would go on the stack is refused.
+;   - a struct field of type NAME is BYTES bytes, aligned to ALIGN (builtin_plan.t27's `abi_bytes`); its two
+;     words are loaded with one ldp and stored with one stp (`pair_word`) while the offset is in their reach
+;     (`pair_imm`), and refused past it.
+;   - `+%`, `-%` and `*%` are programs without a trap; `&`, `|` and `^` act word by word.
+;   - `@rem` traps on a zero divisor, as `@divTrunc` does, then calls the remainder routine
+;     (`t27b_i128_rem`, the division routine's remainder): minInt % -1 is 0, as Zig's Debug build leaves it.
+;   - `<<` and `>>` take the amount's word (a u32 extended to 64 bits). A checked shift traps unless the
+;     amount is below 128, where Zig's `<< @intCast(n)` panics; then both the shift below 64 and the shift from
+;     64 up are formed and bit 6 of the amount picks one with csel. `<<` drops the bits shifted out; `>>` is
+;     arithmetic. A wrapping shift reads only the amount's low seven bits.
+;   - a checked cast of an i128 to a narrower integer type (`amt as u32`) traps unless the high word is the low
+;     word's extension (`cast_program`); the glue then checks the low word as a cast from u64 or i64.
 ; --
 ; The oracle: AAPCS64 (section 6.8.2, rules C.10 to C.13: a 16-byte integer argument), Zig 0.16's layout and
 ; Debug traps (measured on the t27c lab for #7915), and the Arm ARM's ADDS, ADCS, SUBS, SBCS, CCMP, MUL and
 ; UMULH; the instruction words are a64.t27's, checked there against GNU as, and some step words here too.
 ; The tests' order of two integers is computed from their signs and magnitudes, apart from the flags, and
-; their sums, differences, products and quotients are the reference's i128 arithmetic. `overflow_cond` was the
-; hand-written `overflow_cond` of cli/t27b/src/codegen.rs (#8763 ports it).
+; their sums, differences, products, quotients, remainders, bitwise results and shifts are the reference's i128
+; arithmetic. `overflow_cond` was the hand-written `overflow_cond` of cli/t27b/src/codegen.rs (#8763 ports it).
 ; No unary operator (#6549), no wrapping operator and no char literal (#7604) below.
 ; ASCII only (L3)
 ; phi^2 + 1/phi^2 = 3 | TRINITY
@@ -100,6 +114,38 @@ pub fn pair_first(ngrn: u32) -> u32 {
 /// on the stack, 16-byte aligned, and no later integer argument takes a register.
 pub fn pair_in_regs(ngrn: u32) -> bool {
     return pair_first(ngrn) + 2 <= ARG_REGS;
+}
+
+/// The register an integer argument starts at, from the next general register number `ngrn`: ngrn itself, or
+/// for a pair `pair_first`. A pair that does not fit goes on the stack, as an argument past x7 does: its number
+/// is then ARG_REGS or more, which cli/t27b's Program::stack_args reads as a stack word.
+pub fn arg_reg(ngrn: u32, pair: bool) -> u32 {
+    if (pair == false) { return ngrn; }
+    if (pair_in_regs(ngrn)) { return pair_first(ngrn); }
+    if (ngrn < ARG_REGS) { return ARG_REGS; }
+    return ngrn;
+}
+
+/// The next general register number after an argument that starts at register k: two on for a pair in
+/// registers, one on otherwise, so no integer argument after a pair on the stack takes a register (C.13).
+pub fn arg_next(k: u32, pair: bool) -> u32 {
+    if (pair and k < ARG_REGS) { return k + 2; }
+    return k + 1;
+}
+
+// ---------------------------------------------------------------- memory
+
+/// Can one ldp or stp reach an i128 `off` bytes from its base? Their signed offset is a multiple of 8, at most
+/// 504. cli/t27b refuses a pair it cannot reach so (a field that far into a struct, a home past the 32nd pair).
+pub fn pair_imm(off: u32) -> bool {
+    return off <= 504 and off % 8 == 0;
+}
+
+/// The word that loads (`ldp lo, hi, [base, #off]`) or stores (`stp`) the two words of an i128 in memory, the low
+/// word first: a struct field, a parameter's home.
+pub fn pair_word(load: bool, lo: u8, hi: u8, base: u8, off: u32) -> u32 {
+    if (load) { return ldp_x(lo, hi, base, off as i32); }
+    return stp_x(lo, hi, base, off as i32);
 }
 
 // ---------------------------------------------------------------- literals
@@ -180,28 +226,84 @@ pub fn overflow_cond(signed: bool, sub: bool) -> u32 {
 const OP_ADD : u8 = 0;
 const OP_SUB : u8 = 1;
 const OP_MUL : u8 = 2;
+const OP_ADD_W : u8 = 3;
+const OP_SUB_W : u8 = 4;
+const OP_MUL_W : u8 = 5;
 const OP_DIV : u8 = 6;
+const OP_DIV_W : u8 = 7;
+const OP_REM : u8 = 8;
+const OP_AND : u8 = 9;
+const OP_OR : u8 = 10;
+const OP_XOR : u8 = 11;
+const OP_SHL : u8 = 12;
+const OP_SHR : u8 = 13;
+const OP_SHL_W : u8 = 14;
+const OP_SHR_W : u8 = 15;
 
-/// A program: the steps of one operator on two pairs.
+/// A program: the steps of one operator on two pairs. A shift's second pair is its amount, extended to 128
+/// bits; a cast's is 0.
 pub const PROG_NONE : u8 = 0;
 pub const PROG_ADD : u8 = 1;
 pub const PROG_SUB : u8 = 2;
 pub const PROG_MUL : u8 = 3;
 pub const PROG_DIV : u8 = 4;
+pub const PROG_ADD_W : u8 = 5;
+pub const PROG_SUB_W : u8 = 6;
+pub const PROG_MUL_W : u8 = 7;
+pub const PROG_REM : u8 = 8;
+pub const PROG_AND : u8 = 9;
+pub const PROG_OR : u8 = 10;
+pub const PROG_XOR : u8 = 11;
+pub const PROG_SHL : u8 = 12;
+pub const PROG_SHR : u8 = 13;
+pub const PROG_SHL_W : u8 = 14;
+pub const PROG_SHR_W : u8 = 15;
+pub const PROG_CAST_U : u8 = 16;
+pub const PROG_CAST_S : u8 = 17;
+pub const PROG_TRUNC : u8 = 18;
+/// The last program, for the tests.
+const PROG_LAST : u8 = 18;
 
-/// The program of ArithOp `op` on two i128s; PROG_NONE for the operators stage 3 adds (the wrapping ones,
-/// `@rem`, the bitwise operators, the shifts).
+/// The program of ArithOp `op` on two i128s; PROG_NONE for the wrapping division, which only the wrap mode of
+/// the differential test makes.
 pub fn program(op: u8) -> u8 {
     if (op == OP_ADD) { return PROG_ADD; }
     if (op == OP_SUB) { return PROG_SUB; }
     if (op == OP_MUL) { return PROG_MUL; }
     if (op == OP_DIV) { return PROG_DIV; }
+    if (op == OP_ADD_W) { return PROG_ADD_W; }
+    if (op == OP_SUB_W) { return PROG_SUB_W; }
+    if (op == OP_MUL_W) { return PROG_MUL_W; }
+    if (op == OP_REM) { return PROG_REM; }
+    if (op == OP_AND) { return PROG_AND; }
+    if (op == OP_OR) { return PROG_OR; }
+    if (op == OP_XOR) { return PROG_XOR; }
+    if (op == OP_SHL) { return PROG_SHL; }
+    if (op == OP_SHR) { return PROG_SHR; }
+    if (op == OP_SHL_W) { return PROG_SHL_W; }
+    if (op == OP_SHR_W) { return PROG_SHR_W; }
     return PROG_NONE;
 }
 
-/// Does the program call the division routine? A fn that runs it needs a frame, as a fn with a call does.
+/// The program of a cast of an i128 to a narrower integer type: a checked cast (`x as u32`) traps unless the
+/// high word is the low word's extension, 0 for an unsigned type and the low word's sign for a signed one; the
+/// glue then checks the low word as a cast from u64 or i64. A truncating cast has no steps.
+pub fn cast_program(signed: bool, checked: bool) -> u8 {
+    if (checked == false) { return PROG_TRUNC; }
+    if (signed) { return PROG_CAST_S; }
+    return PROG_CAST_U;
+}
+
+/// Does the program call a routine? A fn that runs one needs a frame, as a fn with a call does.
 pub fn calls(prog: u8) -> bool {
-    return prog == PROG_DIV;
+    return prog == PROG_DIV or prog == PROG_REM;
+}
+
+/// The routine the I_CALL step of program `prog` calls, by its spliced name; empty for a program without one.
+pub fn routine(prog: u8) -> str {
+    if (prog == PROG_DIV) { return DIV_ROUTINE; }
+    if (prog == PROG_REM) { return REM_ROUTINE; }
+    return "";
 }
 
 /// The registers a step names. R_A0, R_A1, R_B0 and R_B1 are the words of the operands a and b, the low word
@@ -234,8 +336,9 @@ pub fn reg_of(v: u8, first: u8) -> u8 {
 }
 
 /// What a step does: one instruction on X registers, destination d, operands n and m, and x the shift amount
-/// of I_ASR, imm16 + 65536 * hw of I_MOVZ, nzcv + 16 * cond of I_CCMP, the condition of I_TRAP. I_TRAP is a
-/// branch to the operator's site plus m when the condition holds; I_CALL calls the division routine.
+/// of I_ASR, I_LSL and I_LSR, imm16 + 65536 * hw of I_MOVZ, nzcv + 16 * cond of I_CCMP, the condition of I_TRAP
+/// and I_CSEL (which takes n when it holds, else m). I_TRAP is a branch to the operator's site plus m when the
+/// condition holds; I_CALL calls the program's routine. I_LSLV, I_LSRV and I_ASRV shift by m modulo 64.
 pub const I_ADDS : u8 = 1;
 pub const I_ADCS : u8 = 2;
 pub const I_SUBS : u8 = 3;
@@ -251,6 +354,13 @@ pub const I_MOVZ : u8 = 12;
 pub const I_CCMP : u8 = 13;
 pub const I_TRAP : u8 = 14;
 pub const I_CALL : u8 = 15;
+pub const I_LSLV : u8 = 16;
+pub const I_LSRV : u8 = 17;
+pub const I_ASRV : u8 = 18;
+pub const I_LSL : u8 = 19;
+pub const I_LSR : u8 = 20;
+pub const I_ANDS : u8 = 21;
+pub const I_CSEL : u8 = 22;
 
 /// A step, packed into a word: op, then d, n and m a byte each, then x in the high 32 bits.
 fn st(op: u8, d: u8, n: u8, m: u8, x: u32) -> u64 {
@@ -354,19 +464,111 @@ fn div_step(k: u32) -> u64 {
     return st(I_ORR, R_A1, R_ZR, R_X1, 0);
 }
 
+/// `@rem`: DIV's zero-divisor trap, then the remainder routine, the four words in x0 to x3 and the remainder back
+/// in x0:x1 (DIV's steps 11 to 17). minInt % -1 is 0: no second trap.
+fn rem_step(k: u32) -> u64 {
+    if (k < 3) { return div_step(k); }
+    return div_step(k + 8);
+}
+
+/// `*%`: the low 128 bits of the product, the same for signed and unsigned words in two's complement: A0 * B0 in
+/// full (mul and umulh), plus the low words of the two cross products in the high word.
+fn mul_w_step(k: u32) -> u64 {
+    if (k == 0) { return st(I_UMULH, R_S0, R_A0, R_B0, 0); }
+    if (k == 1) { return st(I_MUL, R_S1, R_A0, R_B1, 0); }
+    if (k == 2) { return st(I_ADDS, R_S0, R_S0, R_S1, 0); }
+    if (k == 3) { return st(I_MUL, R_S1, R_A1, R_B0, 0); }
+    if (k == 4) { return st(I_ADDS, R_A1, R_S0, R_S1, 0); }
+    return st(I_MUL, R_A0, R_A0, R_B0, 0);
+}
+
+/// `&`, `|` and `^` (`op` I_AND, I_ORR or I_EOR): word by word.
+fn logic_step(op: u8, k: u32) -> u64 {
+    if (k == 0) { return st(op, R_A0, R_A0, R_B0, 0); }
+    return st(op, R_A1, R_A1, R_B1, 0);
+}
+
+/// A checked shift's amount, in B0, below 128, or a trap at the operator's site (Zig's `<< @intCast(n)` panics
+/// when the u7 does not hold n). A negative amount is 2^63 or more in B0, so it traps too.
+fn shift_check(k: u32) -> u64 {
+    if (k == 0) { return st(I_MOVZ, R_S0, 0, 0, 128); }
+    if (k == 1) { return st(I_SUBS, R_ZR, R_B0, R_S0, 0); }
+    return st(I_TRAP, 0, 0, 0, COND_HS);
+}
+
+/// `<<` by n, the bits shifted out dropped: (hi << n | lo >> (64 - n), lo << n) below 64, (lo << (n - 64), 0)
+/// from 64 up; ANDS of n with 64 picks one. lslv and lsrv shift by n modulo 64, and `(lo >> 1) >> (63 - n)`
+/// is `lo >> (64 - n)` for n of 1 to 63 and 0 for n = 0; `63 - n` modulo 64 is `~n` (orn).
+fn shl_step(k: u32) -> u64 {
+    if (k == 0) { return st(I_LSLV, R_S0, R_A1, R_B0, 0); }
+    if (k == 1) { return st(I_ORN, R_S1, R_ZR, R_B0, 0); }
+    if (k == 2) { return st(I_LSR, R_S2, R_A0, 0, 1); }
+    if (k == 3) { return st(I_LSRV, R_S1, R_S2, R_S1, 0); }
+    if (k == 4) { return st(I_ORR, R_S0, R_S0, R_S1, 0); }
+    if (k == 5) { return st(I_LSLV, R_S1, R_A0, R_B0, 0); }
+    if (k == 6) { return st(I_MOVZ, R_S2, 0, 0, 64); }
+    if (k == 7) { return st(I_ANDS, R_ZR, R_B0, R_S2, 0); }
+    if (k == 8) { return st(I_CSEL, R_A1, R_S1, R_S0, COND_NE); }
+    return st(I_CSEL, R_A0, R_ZR, R_S1, COND_NE);
+}
+
+/// `>>` by n, arithmetic: (lo >> n | hi << (64 - n), hi >> n) below 64, (hi >> (n - 64), the sign) from 64 up.
+fn shr_step(k: u32) -> u64 {
+    if (k == 0) { return st(I_LSRV, R_S0, R_A0, R_B0, 0); }
+    if (k == 1) { return st(I_ORN, R_S1, R_ZR, R_B0, 0); }
+    if (k == 2) { return st(I_LSL, R_S2, R_A1, 0, 1); }
+    if (k == 3) { return st(I_LSLV, R_S1, R_S2, R_S1, 0); }
+    if (k == 4) { return st(I_ORR, R_S0, R_S0, R_S1, 0); }
+    if (k == 5) { return st(I_ASRV, R_S1, R_A1, R_B0, 0); }
+    if (k == 6) { return st(I_MOVZ, R_S2, 0, 0, 64); }
+    if (k == 7) { return st(I_ANDS, R_ZR, R_B0, R_S2, 0); }
+    if (k == 8) { return st(I_CSEL, R_A0, R_S1, R_S0, COND_NE); }
+    if (k == 9) { return st(I_ASR, R_S2, R_A1, 0, 63); }
+    return st(I_CSEL, R_A1, R_S2, R_S1, COND_NE);
+}
+
+/// A checked cast to a narrower type: the high word against 0 (`signed` false) or the low word's sign.
+fn cast_step(signed: bool, k: u32) -> u64 {
+    if (signed and k == 0) { return st(I_ASR, R_S0, R_A0, 0, 63); }
+    if (signed and k == 1) { return st(I_SUBS, R_ZR, R_A1, R_S0, 0); }
+    if (k == 0) { return st(I_SUBS, R_ZR, R_A1, R_ZR, 0); }
+    return st(I_TRAP, 0, 0, 0, COND_NE);
+}
+
 /// How many steps program `prog` has.
 pub fn steps(prog: u8) -> u32 {
     if (prog == PROG_ADD or prog == PROG_SUB) { return 3; }
     if (prog == PROG_MUL) { return 35; }
     if (prog == PROG_DIV) { return 18; }
+    if (prog == PROG_REM) { return 10; }
+    if (prog == PROG_MUL_W) { return 6; }
+    if (prog == PROG_ADD_W or prog == PROG_SUB_W or prog == PROG_AND or prog == PROG_OR or prog == PROG_XOR) { return 2; }
+    if (prog == PROG_SHL) { return 13; }
+    if (prog == PROG_SHR) { return 14; }
+    if (prog == PROG_SHL_W) { return 10; }
+    if (prog == PROG_SHR_W) { return 11; }
+    if (prog == PROG_CAST_U) { return 2; }
+    if (prog == PROG_CAST_S) { return 3; }
     return 0;
 }
 
 /// Step k of program `prog`, packed.
 fn step(prog: u8, k: u32) -> u64 {
-    if (prog == PROG_ADD) { return add_step(k); }
-    if (prog == PROG_SUB) { return sub_step(k); }
+    if (prog == PROG_ADD or prog == PROG_ADD_W) { return add_step(k); }
+    if (prog == PROG_SUB or prog == PROG_SUB_W) { return sub_step(k); }
     if (prog == PROG_MUL) { return mul_step(k); }
+    if (prog == PROG_MUL_W) { return mul_w_step(k); }
+    if (prog == PROG_REM) { return rem_step(k); }
+    if (prog == PROG_AND) { return logic_step(I_AND, k); }
+    if (prog == PROG_OR) { return logic_step(I_ORR, k); }
+    if (prog == PROG_XOR) { return logic_step(I_EOR, k); }
+    if ((prog == PROG_SHL or prog == PROG_SHR) and k < 3) { return shift_check(k); }
+    if (prog == PROG_SHL) { return shl_step(k - 3); }
+    if (prog == PROG_SHR) { return shr_step(k - 3); }
+    if (prog == PROG_SHL_W) { return shl_step(k); }
+    if (prog == PROG_SHR_W) { return shr_step(k); }
+    if (prog == PROG_CAST_U) { return cast_step(false, k); }
+    if (prog == PROG_CAST_S) { return cast_step(true, k); }
     return div_step(k);
 }
 
@@ -409,6 +611,13 @@ pub fn step_word(prog: u8, k: u32, first: u8) -> u32 {
     if (op == I_MOVZ) { return movz(true, d, x & 65535, x / 65536); }
     if (op == I_CCMP and x / 16 == COND_NE) { return ccmp(true, n, m, x & 15, Cond.Ne); }
     if (op == I_CCMP) { return ccmp(true, n, m, x & 15, Cond.Eq); }
+    if (op == I_LSLV) { return lslv(true, d, n, m); }
+    if (op == I_LSRV) { return lsrv(true, d, n, m); }
+    if (op == I_ASRV) { return asrv(true, d, n, m); }
+    if (op == I_LSL) { return lsl_imm(true, d, n, x); }
+    if (op == I_LSR) { return lsr_imm(true, d, n, x); }
+    if (op == I_ANDS) { return logic_reg(true, LogOp.Ands, false, d, n, m); }
+    if (op == I_CSEL) { return csel(true, d, n, m, Cond.Ne); }
     return x;
 }
 
@@ -525,10 +734,26 @@ pub fn holds(op: u8, x_lo: u64, x_hi: u64, y_lo: u64, y_hi: u64) -> bool {
     return cond_holds(cmp_cond(op), f1);
 }
 
+/// The flags ANDS leaves: N the sign of the result, Z a zero result, C and V clear.
+fn logic_flags(v: u64) -> u32 {
+    var f : u32 = 0;
+    if (v >= SIGN64) { f = f | FLAG_N; }
+    if (v == 0) { f = f | FLAG_Z; }
+    return f;
+}
+
 /// The value step `op` writes, from its operands' values vn and vm, its x and the flags f before it.
 fn value_of(op: u8, vn: u64, vm: u64, x: u32, f: u32) -> u64 {
     var c : u64 = 0;
     if ((f & FLAG_C) != 0) { c = 1; }
+    if (op == I_LSLV) { return vn << ((vm & 63) as u32); }
+    if (op == I_LSRV) { return vn >> ((vm & 63) as u32); }
+    if (op == I_ASRV) { return asr_word(vn, (vm & 63) as u32); }
+    if (op == I_LSL) { return vn << x; }
+    if (op == I_LSR) { return vn >> x; }
+    if (op == I_ANDS) { return vn & vm; }
+    if (op == I_CSEL and cond_holds(x, f)) { return vn; }
+    if (op == I_CSEL) { return vm; }
     if (op == I_ADDS) { return add_word(vn, vm, 0); }
     if (op == I_ADCS) { return add_word(vn, vm, c); }
     if (op == I_SUBS) { return sub_word(vn, vm, 0); }
@@ -551,6 +776,7 @@ fn flags_of(op: u8, vn: u64, vm: u64, f: u32) -> u32 {
     if (op == I_ADCS) { return add_flags(vn, vm, c); }
     if (op == I_SUBS) { return sub_flags(vn, vm, 0); }
     if (op == I_SBCS) { return sub_flags(vn, vm, 1 - c); }
+    if (op == I_ANDS) { return logic_flags(vn & vm); }
     return f;
 }
 
@@ -563,7 +789,8 @@ pub const PairRun = struct {
 pub const RUN_OK : u32 = 0;
 
 /// Program `prog` on the operands (a_lo, a_hi) and (b_lo, b_hi), step by step, on a model of the twelve step
-/// registers and NZCV. R_ZR reads 0 and ignores what is written to it; I_CALL runs the routine's words.
+/// registers and NZCV. R_ZR reads 0 and ignores what is written to it; I_CALL runs the routine's words (the
+/// remainder's for PROG_REM, the quotient's otherwise).
 pub fn run_steps(prog: u8, a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> PairRun {
     var x : [12]u64 = [0] ** 12;
     x[0] = a_lo;
@@ -581,7 +808,7 @@ pub fn run_steps(prog: u8, a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> PairRu
         if (op == I_TRAP) {
             if (cond_holds(s_x(s), f)) { return PairRun{ .trap = trap_site(prog, k) + 1, .lo = 0, .hi = 0 }; }
         } else if (op == I_CALL) {
-            const q : t27b_i128_words = t27b_i128_quot(x[R_X0], x[R_X1], x[R_X2], x[R_X3]);
+            const q : t27b_i128_words = t27b_i128_quot(x[R_X0], x[R_X1], x[R_X2], x[R_X3], prog == PROG_REM);
             x[R_X0] = q.lo;
             x[R_X1] = q.hi;
         } else if (op == I_CCMP) {
@@ -601,10 +828,11 @@ pub fn run_steps(prog: u8, a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> PairRu
 /// The routine's names in this file, and in a program it is spliced into (libm_plan.t27's PORT and HELPER).
 pub const PORT : str = "t27b_i128_";
 pub const HELPER : str = "__t27b_i128_";
-/// A program that names this builtin gets the routine spliced in.
-pub const DIV_BUILTIN : str = "@divTrunc";
-/// The fn the I_CALL step calls, by its spliced name.
+/// A program that names one of these builtins gets the routines spliced in.
+pub const BUILTINS : str = "@divTrunc @rem";
+/// The fns the I_CALL steps of PROG_DIV and PROG_REM call, by their spliced names.
 pub const DIV_ROUTINE : str = "__t27b_i128_div";
+pub const REM_ROUTINE : str = "__t27b_i128_rem";
 
 const t27b_i128_max64 : u64 = 18446744073709551615;
 const t27b_i128_sign64 : u64 = 9223372036854775808;
@@ -631,17 +859,22 @@ pub fn t27b_i128_neg(t27b_lo: u64, t27b_hi: u64, t27b_part: u32) -> u64 {
     return t27b_i128_max64 - t27b_hi;
 }
 
-/// The quotient of the magnitudes n = (t27b_nl, t27b_nh) and d = (t27b_dl, t27b_dh), d not 0 and both at most
-/// 2^127: one division of words when both fit 64 bits; when d fits 32 bits, the high word of n divided first and
-/// the low word in two 32-bit digits, each partial dividend below d * 2^32; otherwise binary long division, the
-/// remainder below d and so below 2^127 before each doubling.
-fn t27b_i128_udiv(t27b_nl: u64, t27b_nh: u64, t27b_dl: u64, t27b_dh: u64) -> t27b_i128_words {
+/// The quotient of the magnitudes n = (t27b_nl, t27b_nh) and d = (t27b_dl, t27b_dh), or their remainder when
+/// `t27b_rem`, d not 0 and both at most 2^127: one division of words when both fit 64 bits; when d fits 32 bits,
+/// the high word of n divided first and the low word in two 32-bit digits, each partial dividend below d * 2^32,
+/// the last digit's remainder the remainder; otherwise binary long division, the remainder below d and so below
+/// 2^127 before each doubling.
+fn t27b_i128_udiv(t27b_nl: u64, t27b_nh: u64, t27b_dl: u64, t27b_dh: u64, t27b_rem: bool) -> t27b_i128_words {
+    if (t27b_dh == 0 and t27b_nh == 0 and t27b_rem) {
+        return t27b_i128_words{ .lo = t27b_nl % t27b_dl, .hi = 0 };
+    }
     if (t27b_dh == 0 and t27b_nh == 0) {
         return t27b_i128_words{ .lo = t27b_nl / t27b_dl, .hi = 0 };
     }
     if (t27b_dh == 0 and t27b_dl <= t27b_i128_low32) {
         const t27b_u1 : u64 = ((t27b_nh % t27b_dl) << 32) | (t27b_nl >> 32);
         const t27b_u0 : u64 = ((t27b_u1 % t27b_dl) << 32) | (t27b_nl & t27b_i128_low32);
+        if (t27b_rem) { return t27b_i128_words{ .lo = t27b_u0 % t27b_dl, .hi = 0 }; }
         return t27b_i128_words{ .lo = ((t27b_u1 / t27b_dl) << 32) | (t27b_u0 / t27b_dl), .hi = t27b_nh / t27b_dl };
     }
     var t27b_rl : u64 = 0;
@@ -664,12 +897,15 @@ fn t27b_i128_udiv(t27b_nl: u64, t27b_nh: u64, t27b_dl: u64, t27b_dh: u64) -> t27
             t27b_ql = t27b_ql | 1;
         }
     }
+    if (t27b_rem) { return t27b_i128_words{ .lo = t27b_rl, .hi = t27b_rh }; }
     return t27b_i128_words{ .lo = t27b_ql, .hi = t27b_qh };
 }
 
-/// The words of `@divTrunc(a, b)`, two's complement, from the words of a and b: the quotient of the magnitudes,
-/// negated when exactly one operand is negative. b is not 0 and a / b is not minInt / -1 (DIV steps 0 to 10).
-pub fn t27b_i128_quot(t27b_al: u64, t27b_ah: u64, t27b_bl: u64, t27b_bh: u64) -> t27b_i128_words {
+/// The words of `@divTrunc(a, b)`, or of `@rem(a, b)` when `t27b_rem`, two's complement, from the words of a and
+/// b: the quotient of the magnitudes, negated when exactly one operand is negative; the remainder of the
+/// magnitudes, negated when a is (it takes the dividend's sign). b is not 0, and a quotient is not minInt / -1
+/// (DIV steps 0 to 10); minInt % -1 is the remainder of 2^127 by 1, 0.
+pub fn t27b_i128_quot(t27b_al: u64, t27b_ah: u64, t27b_bl: u64, t27b_bh: u64, t27b_rem: bool) -> t27b_i128_words {
     const t27b_an : bool = t27b_ah >= t27b_i128_sign64;
     const t27b_bn : bool = t27b_bh >= t27b_i128_sign64;
     var t27b_nl : u64 = t27b_al;
@@ -684,8 +920,9 @@ pub fn t27b_i128_quot(t27b_al: u64, t27b_ah: u64, t27b_bl: u64, t27b_bh: u64) ->
         t27b_dl = t27b_i128_neg(t27b_bl, t27b_bh, 0);
         t27b_dh = t27b_i128_neg(t27b_bl, t27b_bh, 1);
     }
-    const t27b_q : t27b_i128_words = t27b_i128_udiv(t27b_nl, t27b_nh, t27b_dl, t27b_dh);
-    if (t27b_an == t27b_bn) { return t27b_q; }
+    const t27b_q : t27b_i128_words = t27b_i128_udiv(t27b_nl, t27b_nh, t27b_dl, t27b_dh, t27b_rem);
+    if (t27b_rem and t27b_an == false) { return t27b_q; }
+    if (t27b_rem == false and t27b_an == t27b_bn) { return t27b_q; }
     return t27b_i128_words{ .lo = t27b_i128_neg(t27b_q.lo, t27b_q.hi, 0), .hi = t27b_i128_neg(t27b_q.lo, t27b_q.hi, 1) };
 }
 
@@ -701,8 +938,15 @@ pub fn t27b_i128_join(t27b_lo: u64, t27b_hi: u64) -> i128 {
 /// `@divTrunc(a, b)` of two i128s given as words, the low word first. t27b calls it as DIV_ROUTINE after DIV
 /// steps 0 to 10: the words in x0 to x3, as AAPCS64 passes two i128 arguments, the quotient back in x0:x1.
 pub fn t27b_i128_div(t27b_al: u64, t27b_ah: u64, t27b_bl: u64, t27b_bh: u64) -> i128 {
-    const t27b_q : t27b_i128_words = t27b_i128_quot(t27b_al, t27b_ah, t27b_bl, t27b_bh);
+    const t27b_q : t27b_i128_words = t27b_i128_quot(t27b_al, t27b_ah, t27b_bl, t27b_bh, false);
     return t27b_i128_join(t27b_q.lo, t27b_q.hi);
+}
+
+/// `@rem(a, b)` of two i128s given as words. t27b calls it as REM_ROUTINE after REM steps 0 to 2, as it calls
+/// t27b_i128_div; the remainder back in x0:x1.
+pub fn t27b_i128_rem(t27b_al: u64, t27b_ah: u64, t27b_bl: u64, t27b_bh: u64) -> i128 {
+    const t27b_r : t27b_i128_words = t27b_i128_quot(t27b_al, t27b_ah, t27b_bl, t27b_bh, true);
+    return t27b_i128_join(t27b_r.lo, t27b_r.hi);
 }
 
 // ---------------------------------------------------------------- tests
@@ -832,6 +1076,34 @@ test a_pair_argument_starts_at_an_even_register_and_fits_up_to_x6 {
     assert pair_in_regs(6);
     assert pair_in_regs(7) == false;
     assert pair_in_regs(8) == false;
+    // eval_arith.t27's `arith(op: u8, bits: u32, signed: bool, boolean: bool, a: i128, b: i128)`: x0 to x3, then
+    // a in x4:x5 and b in x6:x7; its hidden result pointer goes on the stack.
+    assert arg_reg(4, true) == 4;
+    assert arg_next(4, true) == 6;
+    assert arg_reg(6, true) == 6;
+    assert arg_next(6, true) == 8;
+    assert arg_reg(8, false) == 8;
+    // `holds(op: u8, a: i128, b: i128)`: a skips x1 for x2:x3.
+    assert arg_reg(1, true) == 2;
+    assert arg_next(2, true) == 4;
+    // A scalar keeps its register; a pair that does not fit goes on the stack and takes every later one with it.
+    assert arg_reg(3, false) == 3;
+    assert arg_next(3, false) == 4;
+    assert arg_reg(7, true) == 8;
+    assert arg_next(8, true) == 9;
+    assert arg_reg(9, true) == 9;
+}
+
+test a_pair_in_memory_is_one_ldp_or_stp {
+    assert pair_imm(0);
+    assert pair_imm(16);
+    assert pair_imm(504);
+    assert pair_imm(512) == false;
+    assert pair_imm(12) == false;
+    // ldp x9, x10, [x17, #16]; stp x16, x8, [x17]; stp x2, x3, [sp, #32]; from GNU as on the t27c lab.
+    assert pair_word(true, 9, 10, 17, 16) == 0xa9412a29;
+    assert pair_word(false, 16, 8, 17, 0) == 0xa9002230;
+    assert pair_word(false, 2, 3, 31, 32) == 0xa9020fe2;
 }
 
 test a_literal_splits_into_its_twos_complement_words {
@@ -972,39 +1244,61 @@ test the_overflow_condition_of_one_register {
     assert cond_holds(COND_MI, FLAG_C) == false;
 }
 
-test a_program_for_each_checked_operator {
+test a_program_for_each_operator_but_the_wrapping_division {
     assert program(OP_ADD) == PROG_ADD;
     assert program(OP_SUB) == PROG_SUB;
     assert program(OP_MUL) == PROG_MUL;
     assert program(OP_DIV) == PROG_DIV;
-    var op : u8 = 3;
-    while (op < 16) {
-        if (op != OP_DIV) { assert program(op) == PROG_NONE; }
-        op = op + 1;
-    }
+    assert program(OP_ADD_W) == PROG_ADD_W;
+    assert program(OP_SUB_W) == PROG_SUB_W;
+    assert program(OP_MUL_W) == PROG_MUL_W;
+    assert program(OP_DIV_W) == PROG_NONE;
+    assert program(OP_REM) == PROG_REM;
+    assert program(OP_AND) == PROG_AND;
+    assert program(OP_OR) == PROG_OR;
+    assert program(OP_XOR) == PROG_XOR;
+    assert program(OP_SHL) == PROG_SHL;
+    assert program(OP_SHR) == PROG_SHR;
+    assert program(OP_SHL_W) == PROG_SHL_W;
+    assert program(OP_SHR_W) == PROG_SHR_W;
+    assert program(16) == PROG_NONE;
+    assert cast_program(false, true) == PROG_CAST_U;
+    assert cast_program(true, true) == PROG_CAST_S;
+    assert cast_program(true, false) == PROG_TRUNC;
     assert steps(PROG_NONE) == 0;
+    assert steps(PROG_TRUNC) == 0;
     assert calls(PROG_DIV);
+    assert calls(PROG_REM);
     assert calls(PROG_MUL) == false;
-    // Every program has one trap step at least, and only DIV calls; MUL's and DIV's steps name only its registers.
+    assert std.mem.eql(u8, routine(PROG_DIV), DIV_ROUTINE);
+    assert std.mem.eql(u8, routine(PROG_REM), REM_ROUTINE);
+    assert routine(PROG_SHL).len == 0;
+    // A checked program traps at one step at least and a wrapping or bitwise one at none; DIV and REM call their
+    // routine once; every step names only the step registers, and a csel only NE.
     var prog : u8 = PROG_ADD;
-    while (prog <= PROG_DIV) {
+    while (prog <= PROG_LAST) {
         var k : u32 = 0;
         var traps : u32 = 0;
         var calls_seen : u32 = 0;
         while (k < steps(prog)) {
             if (step_kind(prog, k) == K_TRAP) { traps = traps + 1; }
             if (step_kind(prog, k) == K_CALL) { calls_seen = calls_seen + 1; }
+            if (s_part(step(prog, k), 0) == I_CSEL) { assert s_x(step(prog, k)) == COND_NE; }
             assert s_part(step(prog, k), 1) <= R_X3;
             assert s_part(step(prog, k), 2) <= R_X3;
             assert s_part(step(prog, k), 3) <= R_X3;
             k = k + 1;
         }
-        assert traps >= 1;
+        const checked : bool = prog <= PROG_DIV or prog == PROG_REM or prog == PROG_SHL or prog == PROG_SHR or prog == PROG_CAST_U or prog == PROG_CAST_S;
+        assert (traps >= 1) == checked;
         assert (calls_seen == 1) == calls(prog);
         prog = prog + 1;
     }
     assert trap_site(PROG_DIV, 2) == 0;
     assert trap_site(PROG_DIV, 10) == 1;
+    assert trap_site(PROG_REM, 2) == 0;
+    assert trap_site(PROG_SHL, 2) == 0;
+    assert step_kind(PROG_REM, 7) == K_CALL;
 }
 
 test the_step_registers_are_temps_scratch_zero_and_arguments {
@@ -1046,6 +1340,44 @@ test the_step_words_match_gas {
     assert step_word(PROG_DIV, 11, 9) == 0xaa0903e0;
     assert step_word(PROG_DIV, 14, 9) == 0xaa0c03e3;
     assert step_word(PROG_DIV, 16, 9) == 0xaa0003e9;
+    // mov x8, #128; cmp x11, x8; lsl x8, x10, x11; mvn x16, x11; lsr x17, x9, #1; lsr x16, x17, x16; lsl x16, x9, x11
+    assert step_word(PROG_SHL, 0, 9) == 0xd2801008;
+    assert step_word(PROG_SHL, 1, 9) == 0xeb08017f;
+    assert step_word(PROG_SHL, 3, 9) == 0x9acb2148;
+    assert step_word(PROG_SHL, 4, 9) == 0xaa2b03f0;
+    assert step_word(PROG_SHL, 5, 9) == 0xd341fd31;
+    assert step_word(PROG_SHL, 6, 9) == 0x9ad02630;
+    assert step_word(PROG_SHL, 8, 9) == 0x9acb2130;
+    // mov x17, #64; tst x11, x17; csel x10, x16, x8, ne; csel x9, xzr, x16, ne
+    assert step_word(PROG_SHL, 9, 9) == 0xd2800811;
+    assert step_word(PROG_SHL, 10, 9) == 0xea11017f;
+    assert step_word(PROG_SHL, 11, 9) == 0x9a88120a;
+    assert step_word(PROG_SHL, 12, 9) == 0x9a9013e9;
+    assert step_word(PROG_SHL_W, 0, 9) == 0x9acb2148;
+    // lsr x8, x9, x11; lsl x17, x10, #1; lsl x16, x17, x16; asr x16, x10, x11; csel x9, x16, x8, ne;
+    // asr x17, x10, #63; csel x10, x17, x16, ne
+    assert step_word(PROG_SHR, 3, 9) == 0x9acb2528;
+    assert step_word(PROG_SHR, 5, 9) == 0xd37ff951;
+    assert step_word(PROG_SHR, 6, 9) == 0x9ad02230;
+    assert step_word(PROG_SHR, 8, 9) == 0x9acb2950;
+    assert step_word(PROG_SHR, 11, 9) == 0x9a881209;
+    assert step_word(PROG_SHR, 12, 9) == 0x937ffd51;
+    assert step_word(PROG_SHR, 13, 9) == 0x9a90122a;
+    // umulh x8, x9, x11; mul x16, x9, x12; adds x8, x8, x16; mul x16, x10, x11; adds x10, x8, x16; mul x9, x9, x11
+    assert step_word(PROG_MUL_W, 0, 9) == 0x9bcb7d28;
+    assert step_word(PROG_MUL_W, 1, 9) == 0x9b0c7d30;
+    assert step_word(PROG_MUL_W, 2, 9) == 0xab100108;
+    assert step_word(PROG_MUL_W, 3, 9) == 0x9b0b7d50;
+    assert step_word(PROG_MUL_W, 4, 9) == 0xab10010a;
+    assert step_word(PROG_MUL_W, 5, 9) == 0x9b0b7d29;
+    // and x9, x9, x11; orr x10, x10, x12; eor x9, x9, x11; asr x8, x9, #63; cmp x10, x8; cmp x10, xzr; mov x0, x9
+    assert step_word(PROG_AND, 0, 9) == 0x8a0b0129;
+    assert step_word(PROG_OR, 1, 9) == 0xaa0c014a;
+    assert step_word(PROG_XOR, 0, 9) == 0xca0b0129;
+    assert step_word(PROG_CAST_S, 0, 9) == 0x937ffd28;
+    assert step_word(PROG_CAST_S, 1, 9) == 0xeb08015f;
+    assert step_word(PROG_CAST_U, 0, 9) == 0xeb1f015f;
+    assert step_word(PROG_REM, 3, 9) == 0xaa0903e0;
 }
 
 // The model of each program against the reference's own i128 arithmetic, for every pair of samples: the same
@@ -1089,12 +1421,102 @@ test every_program_against_i128_arithmetic {
             } else {
                 assert div.trap == RUN_OK and t27b_i128_join(div.lo, div.hi) == @divTrunc(x, y);
             }
+            // @rem traps only on a zero divisor: minInt % -1 is 0.
+            const rem : PairRun = run_steps(PROG_REM, al, ah, bl, bh);
+            if (y == 0) {
+                assert rem.trap == 1;
+            } else {
+                assert rem.trap == RUN_OK and t27b_i128_join(rem.lo, rem.hi) == @rem(x, y);
+            }
+            // The wrapping and bitwise programs never trap.
+            const add_w : PairRun = run_steps(PROG_ADD_W, al, ah, bl, bh);
+            assert add_w.trap == RUN_OK and t27b_i128_join(add_w.lo, add_w.hi) == x +% y;
+            const sub_w : PairRun = run_steps(PROG_SUB_W, al, ah, bl, bh);
+            assert sub_w.trap == RUN_OK and t27b_i128_join(sub_w.lo, sub_w.hi) == x -% y;
+            const mul_w : PairRun = run_steps(PROG_MUL_W, al, ah, bl, bh);
+            assert mul_w.trap == RUN_OK and t27b_i128_join(mul_w.lo, mul_w.hi) == x *% y;
+            const both : PairRun = run_steps(PROG_AND, al, ah, bl, bh);
+            assert both.trap == RUN_OK and t27b_i128_join(both.lo, both.hi) == (x & y);
+            const either : PairRun = run_steps(PROG_OR, al, ah, bl, bh);
+            assert either.trap == RUN_OK and t27b_i128_join(either.lo, either.hi) == (x | y);
+            const differ : PairRun = run_steps(PROG_XOR, al, ah, bl, bh);
+            assert differ.trap == RUN_OK and t27b_i128_join(differ.lo, differ.hi) == (x ^ y);
             checked = checked + 1;
             j = j + 1;
         }
         i = i + 1;
     }
     assert checked == SAMPLES * SAMPLES;
+}
+
+/// How many shift amounts the shift test takes.
+const AMOUNTS : u32 = 12;
+
+/// Shift amount j: both sides of 64 and of 128, a u32's greatest, and a negative i64's word.
+fn amount(j: u32) -> u64 {
+    if (j == 0) { return 0; }
+    if (j == 1) { return 1; }
+    if (j == 2) { return 31; }
+    if (j == 3) { return 63; }
+    if (j == 4) { return 64; }
+    if (j == 5) { return 65; }
+    if (j == 6) { return 100; }
+    if (j == 7) { return 127; }
+    if (j == 8) { return 128; }
+    if (j == 9) { return 129; }
+    if (j == 10) { return 4294967295; }
+    return MAX64;
+}
+
+// Each shift program against the reference's i128 shifts, for every sample and amount: a checked shift traps at
+// its site from 128 up; a wrapping one shifts by the amount modulo 128.
+test every_shift_against_i128_shifts {
+    var i : u32 = 0;
+    var checked : u32 = 0;
+    while (i < SAMPLES) {
+        var j : u32 = 0;
+        while (j < AMOUNTS) {
+            const al : u64 = sample_word(i, 0);
+            const ah : u64 = sample_word(i, 1);
+            const n : u64 = amount(j);
+            const x : i128 = sample_value(i);
+            const shl : PairRun = run_steps(PROG_SHL, al, ah, n, 0);
+            const shr : PairRun = run_steps(PROG_SHR, al, ah, n, 0);
+            if (n < 128) {
+                const k : u32 = n as u32;
+                assert shl.trap == RUN_OK and t27b_i128_join(shl.lo, shl.hi) == x << k;
+                assert shr.trap == RUN_OK and t27b_i128_join(shr.lo, shr.hi) == x >> k;
+            } else {
+                assert shl.trap == 1 and shr.trap == 1;
+            }
+            const m : u32 = (n & 127) as u32;
+            const shl_w : PairRun = run_steps(PROG_SHL_W, al, ah, n, 0);
+            const shr_w : PairRun = run_steps(PROG_SHR_W, al, ah, n, 0);
+            assert shl_w.trap == RUN_OK and t27b_i128_join(shl_w.lo, shl_w.hi) == x << m;
+            assert shr_w.trap == RUN_OK and t27b_i128_join(shr_w.lo, shr_w.hi) == x >> m;
+            checked = checked + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert checked == SAMPLES * AMOUNTS;
+}
+
+// A checked cast to a narrower type traps when the high word is not the low word's extension; a truncating one
+// never does. The low word's own check is codegen.rs's cast from u64 or i64.
+test a_cast_checks_the_high_word {
+    var i : u32 = 0;
+    while (i < SAMPLES) {
+        const lo : u64 = sample_word(i, 0);
+        const hi : u64 = sample_word(i, 1);
+        const x : i128 = sample_value(i);
+        assert (run_steps(PROG_CAST_U, lo, hi, 0, 0).trap == 1) == (hi != 0);
+        assert (run_steps(PROG_CAST_S, lo, hi, 0, 0).trap == 1) == (hi != asr_word(lo, 63));
+        assert run_steps(PROG_TRUNC, lo, hi, 0, 0).trap == RUN_OK;
+        assert (hi == 0) == (x >= 0 and x <= 18446744073709551615);
+        assert (hi == asr_word(lo, 63)) == (x >= 0 - 9223372036854775808 and x <= 9223372036854775807);
+        i = i + 1;
+    }
 }
 
 test the_division_routine_takes_each_path {
@@ -1120,5 +1542,24 @@ test the_division_routine_takes_each_path {
     // The routine's names are the ones the splice renames, and DIV_ROUTINE is this one renamed.
     assert std.mem.indexOf(u8, HELPER, PORT) != null;
     assert std.mem.eql(u8, DIV_ROUTINE, "__t27b_i128_div");
-    assert std.mem.eql(u8, DIV_BUILTIN, "@divTrunc");
+    assert std.mem.eql(u8, REM_ROUTINE, "__t27b_i128_rem");
+    assert std.mem.eql(u8, BUILTINS, "@divTrunc @rem");
+}
+
+test the_remainder_routine_takes_each_path_and_the_dividends_sign {
+    // Both fit 64 bits; a divisor of 32 bits; a wider one.
+    assert t27b_i128_rem(7, 0, 2, 0) == 1;
+    assert t27b_i128_rem(MAX64, SIGN64 - 1, 10, 0) == 7;
+    assert t27b_i128_rem(MAX64, SIGN64 - 1, MAX64, 0) == 9223372036854775807;
+    assert t27b_i128_rem(MAX64, SIGN64 - 1, 0, 1) == 18446744073709551615;
+    assert t27b_i128_rem(MAX64, SIGN64 - 1, 7, LOW32 + 1) == 79228162514264337578511564806;
+    // The sign of the dividend: -7 % 2 is -1, 7 % -2 is 1, -7 % -2 is -1.
+    assert t27b_i128_rem(MAX64 - 6, MAX64, 2, 0) == 0 - 1;
+    assert t27b_i128_rem(7, 0, MAX64 - 1, MAX64) == 1;
+    assert t27b_i128_rem(MAX64 - 6, MAX64, MAX64 - 1, MAX64) == 0 - 1;
+    // minInt % -1 and minInt % 1 are 0; minInt % 3 is -2.
+    assert t27b_i128_rem(0, SIGN64, MAX64, MAX64) == 0;
+    assert t27b_i128_rem(0, SIGN64, 1, 0) == 0;
+    assert t27b_i128_rem(0, SIGN64, 3, 0) == 0 - 2;
+    assert t27b_i128_rem(3, 0, 7, 0) == 3;
 }
