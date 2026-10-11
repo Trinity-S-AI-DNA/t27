@@ -5597,6 +5597,11 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     use crate::{gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
     let (mut tc, mut memo, mut stack, mut specs) = (crate::seal_toolchain(), std::collections::HashMap::new(), vec![std::path::PathBuf::from("specs")], Vec::new());
     tc["gen_cache_bin"] = std::fs::read(std::env::current_exe()?).map(|b| crate::sha256_hex(&b)).unwrap_or_default().into(); // #8737: the generator's identity
+    // #8928: one directory per binary; keep the current one and the newest others (gen_cache_keep), drop the rest and the old flat files
+    let (gh, cur) = (std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash"), tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none").to_string());
+    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&gh).into_iter().flatten().flatten().filter_map(|e| { let p = e.path(); if !p.is_dir() { let _ = std::fs::remove_file(&p); return None } (e.file_name().to_string_lossy() != cur).then(|| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p)) }).collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    for (rank, (_, p)) in others.iter().enumerate() { if !gc::gen_cache_keep(false, rank as u32) { let _ = std::fs::remove_dir_all(p); } }
     while let Some(d) = stack.pop() { for e in std::fs::read_dir(&d)?.flatten() { let p = e.path(); if p.is_dir() { stack.push(p) } else if p.extension().map_or(false, |x| x == "t27") { specs.push(p.to_string_lossy().to_string()) } } }
     fn seal_of(p: &str, src: &str) -> serde_json::Value {
         let module = crate::extract_module_name(src).unwrap_or_else(|| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
@@ -5607,7 +5612,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     fn digest(p: &str, d: u32) -> String { if let Some(x) = DIG.with(|m| m.borrow().get(p).cloned()) { return x } let src = std::fs::read_to_string(p).unwrap_or_default(); let mut h = src.clone(); for u in src.lines().filter_map(|l| l.trim().strip_prefix("use ")).filter(|_| d < 64) { h.push_str(&digest(&crate::use_spec_path(u), d + 1)) } let x = crate::sha256_hex(h.as_bytes()); DIG.with(|m| m.borrow_mut().insert(p.into(), x.clone())); x }
     /// #8737 H1: a spec's four gen hashes, from ~/.cache/t27/genhash or generated and stored (gen_hash_cache.t27).
     fn gen_cached(p: &str, tc: &serde_json::Value) -> Option<[String; 4]> {
-        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
+        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none")).join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
         let hit: Option<[String; 4]> = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|v| gc::gen_cache_use(true, v.len() as u32)).map(|v| [v[0].clone(), v[1].clone(), v[2].clone(), v[3].clone()]);
         let cur = hit.clone().or_else(|| crate::compute_seal_hashes(p).ok().map(|h| [h.gen_hash_zig, h.gen_hash_verilog, h.gen_hash_c, h.gen_hash_rust]));
         if let Some(c) = cur.as_ref().filter(|_| gc::gen_cache_store(true, hit.is_some())) { let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))); let _ = std::fs::write(&file, serde_json::to_string(c).unwrap_or_default()); }
