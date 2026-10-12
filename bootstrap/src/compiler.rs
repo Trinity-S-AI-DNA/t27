@@ -19135,6 +19135,10 @@ pub struct CCodegen {
     /// Emitting the operand of a `return`. A compound literal there is a
     /// block-scoped object, so the cast is refused (#3445).
     c_in_return: bool,
+    /// Emitting a module-level (static) initializer. C requires those to be
+    /// constant expressions, and gcc rejects a compound literal NESTED inside
+    /// one, so struct literals there are plain brace initializers (#8036).
+    c_in_static_init: bool,
     /// Identifiers (params + annotated locals) declared `string` in the item
     /// being emitted: `s.len` on one of them is `strlen(s)`, in both spellings.
     string_typed_names: std::collections::HashSet<String>,
@@ -19170,6 +19174,7 @@ impl CCodegen {
             c_declared_type_names: std::collections::HashSet::new(),
             c_struct_field_types: std::collections::HashMap::new(),
             c_in_return: false,
+            c_in_static_init: false,
             string_typed_names: std::collections::HashSet::new(),
             pointer_typed_names: std::collections::HashSet::new(),
             array_typed_names: std::collections::HashSet::new(),
@@ -20231,6 +20236,8 @@ long double: fabsl, default: llabs)(x)",
                 Some(decl) => self.write(&format!("static {} = ", decl)),
                 None => self.write(&format!("static {} {} = ", c_type, node.name)),
             }
+            let outer_static_init = self.c_in_static_init;
+            self.c_in_static_init = true;
             if let Some(child) = node.children.first() {
                 self.gen_c_expr(child);
             } else if !node.value.is_empty() {
@@ -20238,6 +20245,7 @@ long double: fabsl, default: llabs)(x)",
             } else {
                 self.write("0");
             }
+            self.c_in_static_init = outer_static_init;
             self.write_line(";");
             return;
         }
@@ -20272,7 +20280,10 @@ long double: fabsl, default: llabs)(x)",
                     Some(decl) => self.write(&format!("static const {} = ", decl)),
                     None => self.write(&format!("static const {} {} = ", c_type, node.name)),
                 }
+                let outer_static_init = self.c_in_static_init;
+                self.c_in_static_init = true;
                 self.gen_c_expr(child);
+                self.c_in_static_init = outer_static_init;
                 self.write_line(";");
             }
         } else if !node.value.is_empty() {
@@ -22745,8 +22756,19 @@ long double: fabsl, default: llabs)(x)",
                 }
             }
             NodeKind::ExprStructLit => {
-                // C99 compound literal
-                self.write(&format!("({}){{ ", node.name));
+                if self.c_in_static_init {
+                    // A static initializer must be a constant expression, and
+                    // gcc rejects a compound literal NESTED inside one ("initializer
+                    // element is not constant"), even though the outermost
+                    // compound literal itself is fine. A struct literal in that
+                    // spot is therefore a plain brace initializer: `{ .k = 2 }`,
+                    // not `(O){ .k = 2 }` (#8036). Function-level code keeps the
+                    // compound literal: a brace initializer is not an expression.
+                    self.write("{ ");
+                } else {
+                    // C99 compound literal
+                    self.write(&format!("({}){{ ", node.name));
+                }
                 for (i, field) in node.children.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
