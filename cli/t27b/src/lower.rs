@@ -139,6 +139,8 @@ mod ap; // t27c gen-rust of specs/tri/t27b/any_param_plan.t27: an `anytype` para
 mod tt; // t27c gen-rust of specs/tri/t27b/type_text.t27: a type's text, read without the file's declarations
 #[path = "../../../gen/rust/tri/t27b/source_text.rs"] #[allow(dead_code, unused_parens)]
 mod st; // t27c gen-rust of specs/tri/t27b/source_text.t27: literal text, header lines, prose labels
+#[path = "../../../gen/rust/tri/t27b/decl_text.rs"] #[allow(dead_code, unused_parens)]
+mod dt; // t27c gen-rust of specs/tri/t27b/decl_text.t27: declaration line finding and integer parsing
 mod refvars;
 mod tuple;
 #[path = "../../../gen/rust/tri/t27b/ast_walk.rs"] #[allow(dead_code, unused_parens)]
@@ -726,7 +728,7 @@ fn lower_mode<'a>(
             NodeKind::EnumDecl if !item.name.is_empty() => {}
             // `union(enum) { ... }`: t27c keeps only its text.
             NodeKind::ConstDecl if is_tagged_union(item) => {
-                if let Some(l2) = l.src.and_then(|s| decl_line(s, &item.name)) {
+                if let Some(l2) = l.src.and_then(|s| dt::decl_line(s, &item.name)) {
                     l.line = l2;
                 }
                 let _: R<()> = l.reject(
@@ -895,11 +897,7 @@ fn header_line(src: &str, keyword: &str, name: &str) -> Option<u32> {
     Some(st::header_line(src.as_bytes(), keyword.as_bytes(), name.as_bytes())).filter(|l| *l != st::NO_LINE)
 }
 
-/// Line (1-based) of the declaration of `name`: `const`, `pub const`,
-/// `enum` or `pub enum` (source_text.t27's `decl_line`).
-fn decl_line(src: &str, name: &str) -> Option<u32> {
-    Some(st::decl_line(src.as_bytes(), name.as_bytes())).filter(|l| *l != st::NO_LINE)
-}
+
 
 /// t27c reads `const U = union(enum) { ... };` as a `ConstDecl` with no value
 /// and the declaration's tokens as text.
@@ -937,10 +935,6 @@ fn is_char_literal(n: &Node) -> bool {
     let (a, t) = flat(std::slice::from_ref(n)); sh::char_literal(&a, &t, 0)
 }
 
-fn parse_int(s: &str) -> Option<i128> {
-    Some(st::parse_int(s.as_bytes())).filter(|v| *v != st::NO_INT)
-}
-
 /// The width t27c's Zig backend pins on an untyped `var` set to a bare
 /// integer literal, as Zig refuses a `var` of type comptime_int
 /// (`zig_int_literal_default_type` in bootstrap/src/compiler.rs): the
@@ -960,7 +954,7 @@ fn int_lit_width(n: &Node) -> Option<&'static str> {
 fn pow2_literal(n: &Node) -> bool {
     n.kind == NodeKind::ExprLiteral
         && n.extra_kind != "string"
-        && parse_int(n.value.trim()).is_some_and(|v| v > 1 && (v & (v - 1)) == 0)
+        && dt::parse_int(n.value.trim()).is_some_and(|v| v > 1 && (v & (v - 1)) == 0)
 }
 
 impl<'a> Lower<'a> {
@@ -998,7 +992,7 @@ impl<'a> Lower<'a> {
                 NodeKind::StructDecl => {
                     for f in &item.children {
                         if let Some(b) = undeclared_field_type(&f.extra_type, &declared) {
-                            let line = self.src.and_then(|s| decl_line(s, &item.name)).unwrap_or(item.line);
+                            let line = self.src.and_then(|s| dt::decl_line(s, &item.name)).unwrap_or(item.line);
                             found.push((
                                 line,
                                 "StructDecl(reference undeclared field type)",
@@ -3922,7 +3916,7 @@ impl<'a> Lower<'a> {
                 kind: ExprKind::Const((s == "true") as i128),
             }));
         }
-        let v = match parse_int(s) {
+        let v = match dt::parse_int(s) {
             Some(v) => v,
             None => {
                 // The t27c parser strips a string literal's quotes and marks
@@ -4580,7 +4574,7 @@ impl<'a> Lower<'a> {
     /// The length of array type `t`, spelled `len`: an integer expression, its names first replaced by the
     /// compile-time integers they name (specs/tri/t27b/type_text.t27, `len_value`).
     fn array_len(&mut self, t: &str, len: &str) -> R<u32> {
-        let (b, mut text, mut at, mut v) = (len.as_bytes(), String::new(), 0, parse_int(len));
+        let (b, mut text, mut at, mut v) = (len.as_bytes(), String::new(), 0, dt::parse_int(len));
         while v.is_none() {
             let lo = tt::name_lo(b, at);
             text += &len[at..lo];
@@ -4657,7 +4651,7 @@ impl<'a> Lower<'a> {
         self.line = 0;
         self.see(node);
         if node.line == 0 {
-            if let Some(l) = self.src.and_then(|s| decl_line(s, name)) {
+            if let Some(l) = self.src.and_then(|s| dt::decl_line(s, name)) {
                 self.line = l;
             }
         }
@@ -4751,7 +4745,7 @@ impl<'a> Lower<'a> {
                     Some(d) => (true, d),
                     None => (false, v.value.as_str()),
                 };
-                let c = if let Some(c) = parse_int(digits) {
+                let c = if let Some(c) = dt::parse_int(digits) {
                     c
                 } else {
                     match self.global(digits)? {
@@ -5598,8 +5592,8 @@ impl<'a> Lower<'a> {
                 }
                 (None, true) => {
                     let v = match name.strip_prefix('-') {
-                        Some(r) => parse_int(r).map(|v| -v),
-                        None => parse_int(name),
+                        Some(r) => dt::parse_int(r).map(|v| -v),
+                        None => dt::parse_int(name),
                     };
                     match v {
                         Some(v) if ty.fits(v) => v,
