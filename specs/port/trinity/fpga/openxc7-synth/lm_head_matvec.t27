@@ -1,0 +1,567 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/lm_head_matvec.t27
+// LM HEAD — Ternary Matrix-Vector for Language Model Output Projection
+// Computes logits[v] = sum_d W[d][v] * x[d] where W in {-1, 0, +1}
+// Ported from gHashTag/trinity fpga/openxc7-synth/lm_head_matvec.v
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module lm_head_matvec {
+
+    // === Module parameters ===
+    
+    pub const DIM : u32 = 243;           // hidden dim from last TrinityBlock
+    pub const VOCAB : u32 = 256;         // vocabulary size
+    pub const ACC_WIDTH : u32 = 32;      // wider for logits (no normalization downstream)
+    pub const ADDR_WIDTH : u32 = 16;     // 2^16 = 65536 >= 256*243 = 62208
+    pub const D_WIDTH : u32 = 8;         // ceil(log2(DIM))
+    pub const V_WIDTH : u32 = 8;         // ceil(log2(VOCAB))
+    pub const MEM_FILE : &str = "fpga/weights/lm_head_weights.mem";
+    pub const USE_EXT_X : u32 = 1;
+    
+    // === Derived constants ===
+    
+    pub const MEM_DEPTH : u32 = 1 << ADDR_WIDTH;  // 65536
+    pub const LAST_D : u32 = DIM - 1;
+    pub const LAST_V : u32 = VOCAB - 1;
+    
+    // === State machine enumeration ===
+    
+    pub const State = enum(u8) {
+        idle = 0,
+        prefetch = 1,
+        compute = 2,
+        last_acc = 3,
+        output = 4,
+        done = 5,
+    }
+    
+    // === Weight encoding ===
+    
+    pub const WeightCode = enum(u8) {
+        zero = 0,    // 2'b00 = 0
+        positive = 1, // 2'b01 = +1
+        negative = 2, // 2'b10 = -1
+    }
+    
+    // === Data structures ===
+    
+    pub struct ModuleConfig {
+        dim : u32,
+        vocab : u32,
+        acc_width : u32,
+        addr_width : u32,
+        d_width : u32,
+        v_width : u32,
+        mem_depth : u32,
+        last_d : u32,
+        last_v : u32,
+    }
+    
+    pub struct WeightMemory {
+        mem : [MEM_DEPTH]u8,  // 2-bit weights stored as u8
+        mem_file : &str,
+    }
+    
+    pub struct ComputationState {
+        state : State,
+        d_idx : u32,
+        v_idx : u32,
+        base_addr : u32,
+        acc : i32,
+        rd_addr : u32,
+        w_code_r : u8,
+        x_val_d1 : i32,
+        r_done : bool,
+        r_busy : bool,
+        r_valid : bool,
+        r_data : i32,
+        r_addr : u32,
+    }
+    
+    // === Constructor functions ===
+    
+    fn module_config() -> ModuleConfig {
+        return ModuleConfig{
+            .dim = DIM,
+            .vocab = VOCAB,
+            .acc_width = ACC_WIDTH,
+            .addr_width = ADDR_WIDTH,
+            .d_width = D_WIDTH,
+            .v_width = V_WIDTH,
+            .mem_depth = MEM_DEPTH,
+            .last_d = LAST_D,
+            .last_v = LAST_V,
+        };
+    }
+    
+    fn weight_memory() -> WeightMemory {
+        return WeightMemory{
+            .mem = [0]u8 ** MEM_DEPTH,
+            .mem_file = MEM_FILE,
+        };
+    }
+    
+    fn computation_state() -> ComputationState {
+        return ComputationState{
+            .state = State.idle,
+            .d_idx = 0,
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 0,
+            .rd_addr = 0,
+            .w_code_r = 0,
+            .x_val_d1 = 0,
+            .r_done = false,
+            .r_busy = false,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        };
+    }
+    
+    // === Weight encoding/decoding functions ===
+    
+    fn decode_weight(code: u8) -> i32 {
+        switch (code) {
+            .positive => 1,
+            .negative => -1,
+            else => 0,
+        }
+    }
+    
+    fn encode_weight(value: i32) -> u8 {
+        switch (value) {
+            1 => WeightCode.positive,
+            -1 => WeightCode.negative,
+            else => WeightCode.zero,
+        }
+    }
+    
+    // === Address computation functions ===
+    
+    fn compute_base_addr(v_idx: u32, cfg: ModuleConfig) -> u32 {
+        return v_idx * cfg.dim;
+    }
+    
+    fn compute_rd_addr(base_addr: u32, d_idx: u32, cfg: ModuleConfig) -> u32 {
+        return base_addr + d_idx;
+    }
+    
+    fn compute_next_base_addr(base_addr: u32, cfg: ModuleConfig) -> u32 {
+        return base_addr + cfg.dim;
+    }
+    
+    // === Sign extension function ===
+    
+    fn sign_extend_20_to_32(x: u32) -> i32 {
+        if (x & 0x80000) == 0x80000 {
+            (x | 0xFFF00000) as i32
+        } else {
+            x as i32
+        }
+    }
+    
+    // === State machine functions ===
+    
+    fn reset_state(state: ComputationState) -> ComputationState {
+        return ComputationState{
+            .state = State.idle,
+            .d_idx = 0,
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 0,
+            .rd_addr = 0,
+            .w_code_r = 0,
+            .x_val_d1 = 0,
+            .r_done = false,
+            .r_busy = false,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        };
+    }
+    
+    fn start_computation(state: ComputationState) -> ComputationState {
+        return ComputationState{
+            .state = State.prefetch,
+            .d_idx = 0,
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 0,
+            .rd_addr = 0,
+            .w_code_r = 0,
+            .x_val_d1 = 0,
+            .r_done = false,
+            .r_busy = true,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        };
+    }
+    
+    fn prefetch_state(state: ComputationState, x_val_ext: i32) -> ComputationState {
+        return ComputationState{
+            .state = State.compute,
+            .d_idx = 1,
+            .v_idx = state.v_idx,
+            .base_addr = state.base_addr,
+            .acc = state.acc,
+            .rd_addr = state.base_addr + 1,
+            .w_code_r = state.w_code_r,
+            .x_val_d1 = x_val_ext,
+            .r_done = state.r_done,
+            .r_busy = state.r_busy,
+            .r_valid = state.r_valid,
+            .r_data = state.r_data,
+            .r_addr = state.r_addr,
+        };
+    }
+    
+    fn compute_state(state: ComputationState, w_code_r: u8, x_val_d1: i32, cfg: ModuleConfig) -> ComputationState {
+        var new_acc : i32 = switch (w_code_r) {
+            .positive => state.acc + x_val_d1,
+            .negative => state.acc - x_val_d1,
+            else => state.acc,
+        };
+        
+        if (state.d_idx == cfg.last_d) {
+            ComputationState{
+                .state = State.last_acc,
+                .d_idx = state.d_idx,
+                .v_idx = state.v_idx,
+                .base_addr = state.base_addr,
+                .acc = new_acc,
+                .rd_addr = state.rd_addr,
+                .w_code_r = state.w_code_r,
+                .x_val_d1 = x_val_d1,
+                .r_done = state.r_done,
+                .r_busy = state.r_busy,
+                .r_valid = state.r_valid,
+                .r_data = state.r_data,
+                .r_addr = state.r_addr,
+            }
+        } else {
+            ComputationState{
+                .state = State.compute,
+                .d_idx = state.d_idx + 1,
+                .v_idx = state.v_idx,
+                .base_addr = state.base_addr,
+                .acc = new_acc,
+                .rd_addr = state.base_addr + (state.d_idx + 1),
+                .w_code_r = state.w_code_r,
+                .x_val_d1 = x_val_d1,
+                .r_done = state.r_done,
+                .r_busy = state.r_busy,
+                .r_valid = state.r_valid,
+                .r_data = state.r_data,
+                .r_addr = state.r_addr,
+            }
+        }
+    }
+    
+    fn last_acc_state(state: ComputationState, w_code_r: u8, x_val_d1: i32) -> ComputationState {
+        var new_acc : i32 = switch (w_code_r) {
+            .positive => state.acc + x_val_d1,
+            .negative => state.acc - x_val_d1,
+            else => state.acc,
+        };
+        
+        ComputationState{
+            .state = State.output,
+            .d_idx = state.d_idx,
+            .v_idx = state.v_idx,
+            .base_addr = state.base_addr,
+            .acc = new_acc,
+            .rd_addr = state.rd_addr,
+            .w_code_r = state.w_code_r,
+            .x_val_d1 = x_val_d1,
+            .r_done = state.r_done,
+            .r_busy = state.r_busy,
+            .r_valid = false,
+            .r_data = state.r_data,
+            .r_addr = state.r_addr,
+        }
+    }
+    
+    fn output_state(state: ComputationState, cfg: ModuleConfig) -> ComputationState {
+        if (state.v_idx == cfg.last_v) {
+            return ComputationState{
+                .state = State.done,
+                .d_idx = state.d_idx,
+                .v_idx = state.v_idx,
+                .base_addr = state.base_addr,
+                .acc = state.acc,
+                .rd_addr = state.rd_addr,
+                .w_code_r = state.w_code_r,
+                .x_val_d1 = state.x_val_d1,
+                .r_done = true,
+                .r_busy = false,
+                .r_valid = false,
+                .r_data = state.acc,
+                .r_addr = state.v_idx,
+            };
+        } else {
+            return ComputationState{
+                .state = State.prefetch,
+                .d_idx = 0,
+                .v_idx = state.v_idx + 1,
+                .base_addr = compute_next_base_addr(state.base_addr, cfg),
+                .acc = 0,
+                .rd_addr = compute_next_base_addr(state.base_addr, cfg),
+                .w_code_r = state.w_code_r,
+                .x_val_d1 = state.x_val_d1,
+                .r_done = state.r_done,
+                .r_busy = true,
+                .r_valid = true,
+                .r_data = state.acc,
+                .r_addr = state.v_idx,
+            };
+        }
+    }
+    
+    fn done_state(state: ComputationState) -> ComputationState {
+        return ComputationState{
+            .state = State.idle,
+            .d_idx = state.d_idx,
+            .v_idx = state.v_idx,
+            .base_addr = state.base_addr,
+            .acc = state.acc,
+            .rd_addr = state.rd_addr,
+            .w_code_r = state.w_code_r,
+            .x_val_d1 = state.x_val_d1,
+            .r_done = false,
+            .r_busy = false,
+            .r_valid = false,
+            .r_data = state.r_data,
+            .r_addr = state.r_addr,
+        };
+    }
+    
+    // === Main computation function ===
+    
+    fn compute_step(state: ComputationState, w_code_r: u8, x_val_ext: i32, cfg: ModuleConfig) -> ComputationState {
+        if (state.state == State.idle) {
+            if (state.r_busy) {
+                start_computation(state)
+            } else {
+                state
+            }
+        } else if (state.state == State.prefetch) {
+            prefetch_state(state, x_val_ext)
+        } else if (state.state == State.compute) {
+            compute_state(state, w_code_r, state.x_val_d1, cfg)
+        } else if (state.state == State.last_acc) {
+            last_acc_state(state, w_code_r, state.x_val_d1)
+        } else if (state.state == State.output) {
+            output_state(state, cfg)
+        } else if (state.state == State.done) {
+            done_state(state)
+        } else {
+            state
+        }
+    }
+    
+    // === Test functions ===
+    
+    test weight_encoding
+        assert(decode_weight(encode_weight(1)) == 1)
+        assert(decode_weight(encode_weight(-1)) == -1)
+        assert(decode_weight(encode_weight(0)) == 0)
+        assert(decode_weight(encode_weight(42)) == 0)  // invalid code
+    
+    test sign_extension
+        assert(sign_extend_20_to_32(0x12345) == 0x0012345)
+        assert(sign_extend_20_to_32(0xFFFFF) == 0xFFFFFFFF)  // -1
+        assert(sign_extend_20_to_32(0x80000) == 0xFFFF8000)  // -32768
+    
+    test_address_computation
+        given cfg = module_config()
+        assert(compute_base_addr(5, cfg) == 5 * 243)
+        assert(compute_base_addr(255, cfg) == 255 * 243)
+        assert(compute_rd_addr(100, 50, cfg) == 150)
+        assert(compute_next_base_addr(1000, cfg) == 1000 + 243)
+    
+    test_state_machine_reset
+        given state = computation_state()
+        given reset = reset_state(state)
+        assert(reset.state == State.idle)
+        assert(reset.r_busy == false)
+        assert(reset.r_valid == false)
+        assert(reset.acc == 0)
+    
+    test_state_machine_start
+        given state = computation_state()
+        given started = start_computation(state)
+        assert(started.state == State.prefetch)
+        assert(started.r_busy == true)
+        assert(started.acc == 0)
+        assert(started.d_idx == 0)
+        assert(started.v_idx == 0)
+    
+    test_compute_step_prefetch
+        given cfg = module_config()
+        given state = computation_state()
+        given state = start_computation(state)
+        given state = compute_step(state, 1, 42, cfg)  // w_code_r = 1 (positive)
+        assert(state.state == State.compute)
+        assert(state.d_idx == 1)
+        assert(state.x_val_d1 == 42)
+    
+    test_compute_step_compute
+        given cfg = module_config()
+        given state = ComputationState{
+            .state = State.compute,
+            .d_idx = 1,
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 10,
+            .rd_addr = 1,
+            .w_code_r = 1,  // positive
+            .x_val_d1 = 5,
+            .r_done = false,
+            .r_busy = true,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        }
+        given next_state = compute_step(state, 1, 42, cfg)
+        assert(next_state.state == State.compute)
+        assert(next_state.d_idx == 2)
+        assert(next_state.acc == 15)  // 10 + 5
+        assert(next_state.rd_addr == 2)
+    
+    test_compute_step_last_acc
+        given cfg = module_config()
+        given state = ComputationState{
+            .state = State.compute,
+            .d_idx = 242,  // LAST_D
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 100,
+            .rd_addr = 242,
+            .w_code_r = 2,  // negative
+            .x_val_d1 = 10,
+            .r_done = false,
+            .r_busy = true,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        }
+        given next_state = compute_step(state, 2, 42, cfg)
+        assert(next_state.state == State.last_acc)
+        assert(next_state.acc == 90)  // 100 - 10
+    
+    test_compute_step_output
+        given cfg = module_config()
+        given state = ComputationState{
+            .state = State.last_acc,
+            .d_idx = 242,
+            .v_idx = 0,
+            .base_addr = 0,
+            .acc = 200,
+            .rd_addr = 242,
+            .w_code_r = 1,
+            .x_val_d1 = 5,
+            .r_done = false,
+            .r_busy = true,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 0,
+        }
+        given next_state = compute_step(state, 1, 42, cfg)
+        assert(next_state.state == State.output)
+        assert(next_state.r_valid == true)
+        assert(next_state.r_data == 205)  // 200 + 5
+        assert(next_state.r_addr == 0)
+    
+    test_compute_step_output_last_vocab
+        given cfg = module_config()
+        given state = ComputationState{
+            .state = State.last_acc,
+            .d_idx = 242,
+            .v_idx = 255,  // LAST_V
+            .base_addr = 255 * 243,
+            .acc = 300,
+            .rd_addr = 242,
+            .w_code_r = 1,
+            .x_val_d1 = 10,
+            .r_done = false,
+            .r_busy = true,
+            .r_valid = false,
+            .r_data = 0,
+            .r_addr = 255,
+        }
+        given next_state = compute_step(state, 1, 42, cfg)
+        assert(next_state.state == State.done)
+        assert(next_state.r_done == true)
+        assert(next_state.r_busy == false)
+        assert(next_state.r_valid == false)
+    
+    test_matrix_vector_computation_small
+        given cfg = module_config()
+        // Test a small 3x3 matrix to verify the computation logic
+        // W = [[1, -1, 0], [0, 1, -1], [-1, 0, 1]]
+        // x = [1, 2, 3]
+        // Expected: [1*1 + (-1)*2 + 0*3, 0*1 + 1*2 + (-1)*3, (-1)*1 + 0*2 + 1*3] = [-1, -1, 2]
+        var weights: [9]u8 = [
+            encode_weight(1), encode_weight(-1), encode_weight(0),
+            encode_weight(0), encode_weight(1), encode_weight(-1),
+            encode_weight(-1), encode_weight(0), encode_weight(1),
+        ];
+        var x: [3]i32 = [1, 2, 3];
+        var expected: [3]i32 = [-1, -1, 2];
+        
+        var v_idx: u32 = 0;
+        var state = computation_state();
+        state = start_computation(state);
+        
+        for (v_idx < 3) {
+            var base_addr: u32 = compute_base_addr(v_idx, cfg);
+            var acc: i32 = 0;
+            
+            for (var d_idx: u32 = 0; d_idx < 3; d_idx++) {
+                var weight_idx: u32 = base_addr + d_idx;
+                var w_code: u8 = weights[weight_idx];
+                var w_val: i32 = decode_weight(w_code);
+                var x_val: i32 = x[d_idx];
+                acc = acc + (w_val * x_val);
+            }
+            
+            assert(acc == expected[v_idx]);
+            v_idx = v_idx + 1;
+        }
+    
+    // === Invariants ===
+    
+    invariant state_values_valid
+        given state = computation_state()
+        assert(state.state <= 5)  // State.done is 5
+        assert(state.d_idx < DIM)
+        assert(state.v_idx < VOCAB)
+        assert(state.base_addr < MEM_DEPTH)
+        assert(state.rd_addr < MEM_DEPTH)
+        assert(state.r_addr < VOCAB)
+    
+    invariant accumulator_width
+        given state = computation_state()
+        // Ensure accumulator stays within reasonable bounds
+        var max_val: i32 = (1 << (ACC_WIDTH - 1)) - 1;
+        var min_val: i32 = -(1 << (ACC_WIDTH - 1));
+        assert(state.acc >= min_val)
+        assert(state.acc <= max_val)
+    
+    invariant weight_encoding_consistency
+        assert(decode_weight(encode_weight(1)) == 1)
+        assert(decode_weight(encode_weight(-1)) == -1)
+        assert(decode_weight(encode_weight(0)) == 0)
+    
+    invariant address_computation_consistency
+        given cfg = module_config()
+        assert(compute_base_addr(0, cfg) == 0)
+        assert(compute_base_addr(VOCAB-1, cfg) == (VOCAB-1) * DIM)
+        assert(compute_rd_addr(0, 0, cfg) == 0)
+        assert(compute_rd_addr(1000, 500, cfg) == 1500)
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY
