@@ -1,0 +1,295 @@
+// t27/specs/port/trinity/src/tri/env_loader.t27
+// Port of gHashTag/trinity src/tri/env_loader.zig (commit b45da4ca055f) to .t27.
+//
+// env_loader.zig loads a .env file from the CWD into the process environment
+// at startup. This port keeps the decisions and drops the plumbing:
+//
+//   - parseLine is pure in the original and is ported in full. The Zig
+//     `?struct { key, value }` return becomes `?EnvKV`: null exactly where
+//     the original returned null (blank line, comment, missing '=', empty
+//     key), and slices into the original line otherwise.
+//
+//   - loadDotEnv touches the filesystem, the allocator and libc setenv. Its
+//     decision -- parse each line, skip it when the process environment
+//     already has the key, and never overwrite (setenv overwrite=0, so the
+//     process env always wins over .env) -- lives in planLine, which is
+//     tested. loadDotEnv keeps its name with an `undefined;` body that no
+//     test calls, per the port brief. Its `allocator: std.mem.Allocator`
+//     parameter only served that plumbing (readToEndAlloc, dupeZ) and is
+//     not representable here, so it is dropped.
+//
+// The std.mem trim/startsWith calls become small local helpers because .t27
+// has no standard library. '\r' cannot appear inside a .t27 string literal
+// (the escape silently produces something else), so the value-side
+// right-trim spells its character set out as comparisons instead.
+module port::env_loader;
+
+// One parsed .env line, as slices into the line it was parsed from.
+struct EnvKV {
+    key: []const u8,
+    value: []const u8,
+}
+
+// The verdict for one iteration of loadDotEnv's loop: whether setenv should
+// be called, and with what. `apply` is false for every line the original
+// skips -- comment, blank, no '=', empty key, or key already set.
+struct EnvAction {
+    apply: bool,
+    key: []const u8,
+    value: []const u8,
+}
+
+// std.mem.trimLeft(u8, s, " \t") starting at `from`.
+fn ltrimHTab(s: []const u8, from: usize) -> usize {
+    var i: usize = from;
+    while (i < s.len) {
+        const c: u8 = s[i];
+        if (c != ' ' and c != '\t') {
+            break;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+// std.mem.trimRight(u8, s, " \t"), `end` exclusive.
+fn rtrimHTab(s: []const u8, end: usize) -> usize {
+    var i: usize = end;
+    while (i > 0) {
+        const c: u8 = s[i - 1];
+        if (c != ' ' and c != '\t') {
+            break;
+        }
+        i -= 1;
+    }
+    return i;
+}
+
+// std.mem.trimRight(u8, s, " \t\r"), `end` exclusive. The '\r' of the set
+// cannot be written inside a .t27 string literal, hence the spelled-out set.
+fn rtrimHTabCR(s: []const u8, end: usize) -> usize {
+    var i: usize = end;
+    while (i > 0) {
+        const c: u8 = s[i - 1];
+        if (c != ' ' and c != '\t' and c != '\r') {
+            break;
+        }
+        i -= 1;
+    }
+    return i;
+}
+
+// std.mem.startsWith(u8, s[at..], prefix).
+fn startsWithAt(s: []const u8, at: usize, prefix: []const u8) -> bool {
+    if (prefix.len > s.len) {
+        return false;
+    }
+    if (at > s.len - prefix.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < prefix.len) {
+        if (s[at + i] != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Parse one .env line into key and value. Returns null where the original
+// returned null: comment or blank line, no '=', or an empty key.
+pub fn parseLine(line: []const u8) -> ?EnvKV {
+    // Skip leading whitespace.
+    var start: usize = ltrimHTab(line, 0);
+
+    // Skip empty lines and comments.
+    if (start >= line.len) {
+        return null;
+    }
+    if (line[start] == '#') {
+        return null;
+    }
+
+    // Skip optional "export " prefix, then trim leading whitespace again.
+    if (startsWithAt(line, start, "export ")) {
+        start = ltrimHTab(line, start + 7);
+    }
+
+    // Find '='. A line without one is invalid.
+    var eq: usize = start;
+    var found: bool = false;
+    while (eq < line.len) {
+        if (line[eq] == '=') {
+            found = true;
+            break;
+        }
+        eq += 1;
+    }
+    if (!found) {
+        return null;
+    }
+
+    // Key: right-trim " \t". An empty key is invalid.
+    const keyEnd: usize = rtrimHTab(line, eq);
+    if (keyEnd <= start) {
+        return null;
+    }
+
+    // Value: left-trim " \t", then right-trim " \t\r". The right-trim may
+    // cross left of vStart when everything after '=' is whitespace; the
+    // original trims an empty slice there, so clamp to get the same empty
+    // value instead of a usize underflow.
+    var vStart: usize = ltrimHTab(line, eq + 1);
+    var vEnd: usize = rtrimHTabCR(line, line.len);
+    if (vEnd < vStart) {
+        vEnd = vStart;
+    }
+
+    // Strip one pair of matching quotes ("..." or '...').
+    if (vEnd - vStart >= 2) {
+        const first: u8 = line[vStart];
+        const last: u8 = line[vEnd - 1];
+        if ((first == '"' and last == '"') or (first == 0x27 and last == 0x27)) {
+            vStart += 1;
+            vEnd -= 1;
+        }
+    }
+
+    return EnvKV { key: line[start..keyEnd], value: line[vStart..vEnd] };
+}
+
+// One iteration of loadDotEnv's loop, with the plumbing replaced by one
+// parameter: `alreadyInProcessEnv` stands in for the original's
+// std.posix.getenv(parsed.key) != null check. The original ends the
+// iteration with setenv(key, value, 0) -- overwrite=0, so the process
+// environment always wins over .env -- which here is the `apply` verdict.
+pub fn planLine(line: []const u8, alreadyInProcessEnv: bool) -> EnvAction {
+    const kv = parseLine(line);
+    if (kv == null) {
+        return EnvAction { apply: false, key: "", value: "" };
+    }
+    if (alreadyInProcessEnv) {
+        return EnvAction { apply: false, key: kv.?.key, value: kv.?.value };
+    }
+    return EnvAction { apply: true, key: kv.?.key, value: kv.?.value };
+}
+
+// The original opens .env from the CWD, reads up to 32 KiB, and setenv()s
+// every line that planLine would apply. The file read, the process
+// environment and the libc call are plumbing: per the port brief the body
+// stays `undefined` and no test calls it.
+pub fn loadDotEnv() void {
+    undefined;
+}
+
+// ----------------------------------------------------------------------
+// Tests, mirroring the original's test suite
+// ----------------------------------------------------------------------
+
+test parse_line_basic {
+    const r = parseLine("FOO=bar");
+    assert(r != null);
+    assert(r.?.key == "FOO");
+    assert(r.?.value == "bar");
+}
+
+test parse_line_quoted_value {
+    const r = parseLine("KEY=\"hello world\"");
+    assert(r != null);
+    assert(r.?.key == "KEY");
+    assert(r.?.value == "hello world");
+}
+
+test parse_line_single_quoted {
+    const r = parseLine("K='val'");
+    assert(r != null);
+    assert(r.?.value == "val");
+}
+
+test parse_line_comment {
+    const r = parseLine("# this is a comment");
+    assert(r == null);
+}
+
+test parse_line_blank {
+    const empty = parseLine("");
+    assert(empty == null);
+    const spaces = parseLine("   ");
+    assert(spaces == null);
+}
+
+test parse_line_export_prefix {
+    const r = parseLine("export MY_VAR=123");
+    assert(r != null);
+    assert(r.?.key == "MY_VAR");
+    assert(r.?.value == "123");
+}
+
+test parse_line_no_equals {
+    const r = parseLine("NOEQUALS");
+    assert(r == null);
+}
+
+test parse_line_empty_value {
+    const r = parseLine("EMPTY=");
+    assert(r != null);
+    assert(r.?.key == "EMPTY");
+    assert(r.?.value == "");
+}
+
+test parse_line_spaces_around_equals {
+    const r = parseLine("KEY = value");
+    assert(r != null);
+    assert(r.?.key == "KEY");
+    assert(r.?.value == "value");
+}
+
+test parse_line_cr_trimmed {
+    // The original feeds "KEY=value\r". "\r" inside a .t27 string is not a
+    // carriage return, so the line is built byte by byte.
+    var buf: [10]u8 = [0x4B, 0x45, 0x59, 0x3D, 0x76, 0x61, 0x6C, 0x75, 0x65, 0x0D];
+    const r = parseLine(&buf);
+    assert(r != null);
+    assert(r.?.value == "value");
+}
+
+test parse_line_mismatched_quotes_kept {
+    // Only matching quote pairs are stripped: the original compares first
+    // and last for each quote kind, so '"val'' survives as written.
+    const r = parseLine("KEY=\"val'");
+    assert(r != null);
+    assert(r.?.value == "\"val'");
+}
+
+test plan_line_decision {
+    // A key not yet in the process environment is applied from .env.
+    const fresh = planLine("FOO=bar", false);
+    assert(fresh.apply);
+    assert(fresh.key == "FOO");
+    assert(fresh.value == "bar");
+
+    // The process environment already has FOO: .env loses.
+    const taken = planLine("FOO=new", true);
+    assert(!taken.apply);
+
+    // Comments, blanks and lines without '=' are skipped before the
+    // environment is even consulted.
+    const comment = planLine("# note", false);
+    assert(!comment.apply);
+    const blank = planLine("", false);
+    assert(!blank.apply);
+    const invalid = planLine("NOEQUALS", false);
+    assert(!invalid.apply);
+}
+
+test trim_helpers {
+    var buf: [5]u8 = [0x20, 0x09, 0x61, 0x20, 0x20];
+    assert(ltrimHTab(&buf, 0) == 2);
+    assert(rtrimHTab(&buf, 5) == 3);
+    assert(rtrimHTabCR(&buf, 5) == 3);
+    var crbuf: [3]u8 = [0x61, 0x62, 0x0D];
+    assert(rtrimHTabCR(&crbuf, 3) == 2);
+    assert(startsWithAt(&crbuf, 0, "ab"));
+    assert(!startsWithAt(&crbuf, 1, "ab"));
+}
