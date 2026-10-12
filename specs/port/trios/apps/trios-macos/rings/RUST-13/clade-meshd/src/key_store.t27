@@ -1,0 +1,683 @@
+module port::trios::apps::trios_macos::rings::RUST_13::clade_meshd::src::key_store;
+
+// Port of apps/trios-macos/rings/RUST-13/clade-meshd/src/key_store.rs
+// (gHashTag/trios @ 8b229e9489ee, issue gHashTag/t27#9221) to .t27, so the
+// key store decisions are generated from this spec instead of hand-written
+// Zig.
+//
+// Ported as pure, tested decisions:
+//   base64 STANDARD decode/encode used by decode_secret, decode_public_key
+//   and public_key_base64; the exact 32-byte length checks; key directory
+//   priority (TRIOS_MESH_KEY_DIR -> home default -> relative fallback);
+//   key source priority (env var -> key file -> generate); the
+//   node_<node_id>.key file name; decode-error wrapping by origin; and the
+//   0o600/0o700 permission modes.
+//
+// Plumbing only (process env, filesystem, CSPRNG, X25519 derivation) stays
+// in three undefined shims that keep the original names and are never
+// called by tests; the generated target supplies the IO around them.
+
+const PRIVATE_KEY_ENV: []const u8 = "TRIOS_MESH_PRIVATE_KEY";
+const KEY_DIR_ENV: []const u8 = "TRIOS_MESH_KEY_DIR";
+const DEFAULT_KEY_DIR: []const u8 = ".trinity/mesh/keys";
+// 0o600 on the persisted key file.
+const KEY_FILE_MODE: u32 = 384;
+// 0o700 on the key directory.
+const KEY_DIR_MODE: u32 = 448;
+
+const ZEROS20: [20]u8 = [_]u8{0} ** 20;
+const ZEROS32: [32]u8 = [_]u8{0} ** 32;
+const ZEROS64: [64]u8 = [_]u8{0} ** 64;
+
+enum KeyDecodeError { None, InvalidBase64, BadLength }
+enum KeyDirSource { EnvOverride, HomeDefault, RelativeFallback }
+enum KeySource { FromEnv, FromFile, Generated }
+enum LoadError { None, EnvInvalidKey, FileUnreadable, FileInvalidKey, DirCreateFailed, DirPermFailed, FileWriteFailed, FilePermFailed }
+
+// Original: trios_mesh StaticKey (X25519 identity key); the ported logic
+// only needs its 32 encoded public bytes.
+struct StaticKey { public: [32]u8 }
+struct Bounds { start: usize, end: usize }
+struct B64Out { ok: bool, len: usize, data: [64]u8 }
+struct B64Text { len: usize, chars: [64]u8 }
+struct DecodedSecret { ok: bool, err: KeyDecodeError, got_len: usize, secret: [32]u8 }
+struct DecodedPublicKey { ok: bool, err: KeyDecodeError, got_len: usize, key: [32]u8 }
+struct KeyFileName { len: usize, chars: [32]u8 }
+struct LoadedKey { ok: bool, err: LoadError, key: StaticKey }
+
+fn is_space(c: u8) -> bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn trim_bounds(chars: []const u8, n: usize) -> Bounds {
+    var start: usize = 0;
+    while (start < n and is_space(chars[start])) {
+        start += 1;
+    }
+    var end: usize = n;
+    while (end > start and is_space(chars[end - 1])) {
+        end = end - 1;
+    }
+    return Bounds { start: start, end: end };
+}
+
+// 255 marks a byte outside the standard alphabet.
+fn b64_sextet(c: u8) -> u8 {
+    if (c >= 'A' and c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' and c <= 'z') {
+        return (c - 'a') + 26;
+    }
+    if (c >= '0' and c <= '9') {
+        return (c - '0') + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
+    return 255;
+}
+
+fn b64_char(v: u8) -> u8 {
+    if (v < 26) {
+        return 'A' + v;
+    }
+    if (v < 52) {
+        return 'a' + (v - 26);
+    }
+    if (v < 62) {
+        return '0' + (v - 52);
+    }
+    if (v == 62) {
+        return '+';
+    }
+    return '/';
+}
+
+fn base64_decode_n(chars: []const u8, n: usize) -> B64Out {
+    var data: [64]u8 = ZEROS64;
+    var t = trim_bounds(chars, n);
+    var m = t.end - t.start;
+    if ((m % 4) != 0) {
+        return B64Out { ok: false, len: 0, data: data };
+    }
+    var groups = m / 4;
+    var pad: usize = 0;
+    if (groups > 0) {
+        var last = t.start + ((groups - 1) * 4);
+        if (chars[last + 2] == '=') {
+            if (chars[last + 3] != '=') {
+                return B64Out { ok: false, len: 0, data: data };
+            }
+            pad = 2;
+        } else {
+            if (chars[last + 3] == '=') {
+                pad = 1;
+            }
+        }
+    }
+    var decoded_len = (groups * 3) - pad;
+    if (decoded_len > 64) {
+        return B64Out { ok: true, len: decoded_len, data: data };
+    }
+    var w: usize = 0;
+    var g: usize = 0;
+    while (g + 1 < groups) {
+        var p = t.start + (g * 4);
+        var v0 = b64_sextet(chars[p]);
+        var v1 = b64_sextet(chars[p + 1]);
+        var v2 = b64_sextet(chars[p + 2]);
+        var v3 = b64_sextet(chars[p + 3]);
+        if (v0 == 255 or v1 == 255 or v2 == 255 or v3 == 255) {
+            return B64Out { ok: false, len: 0, data: data };
+        }
+        data[w] = (v0 * 4) + (v1 / 16);
+        data[w + 1] = ((v1 % 16) * 16) + (v2 / 4);
+        data[w + 2] = ((v2 % 4) * 64) + v3;
+        w += 3;
+        g += 1;
+    }
+    if (groups > 0) {
+        var lp = t.start + (g * 4);
+        var v0 = b64_sextet(chars[lp]);
+        var v1 = b64_sextet(chars[lp + 1]);
+        if (v0 == 255 or v1 == 255) {
+            return B64Out { ok: false, len: 0, data: data };
+        }
+        if (chars[lp + 2] == '=') {
+            data[w] = (v0 * 4) + (v1 / 16);
+            w += 1;
+        } else {
+            var v2 = b64_sextet(chars[lp + 2]);
+            if (v2 == 255) {
+                return B64Out { ok: false, len: 0, data: data };
+            }
+            if (chars[lp + 3] == '=') {
+                data[w] = (v0 * 4) + (v1 / 16);
+                data[w + 1] = ((v1 % 16) * 16) + (v2 / 4);
+                w += 2;
+            } else {
+                var v3 = b64_sextet(chars[lp + 3]);
+                if (v3 == 255) {
+                    return B64Out { ok: false, len: 0, data: data };
+                }
+                data[w] = (v0 * 4) + (v1 / 16);
+                data[w + 1] = ((v1 % 16) * 16) + (v2 / 4);
+                data[w + 2] = ((v2 % 4) * 64) + v3;
+                w += 3;
+            }
+        }
+    }
+    return B64Out { ok: true, len: w, data: data };
+}
+
+fn base64_decode(text: []const u8) -> B64Out {
+    return base64_decode_n(text, text.len);
+}
+
+fn base64_encode(data: []const u8) -> B64Text {
+    var chars: [64]u8 = ZEROS64;
+    var w: usize = 0;
+    if (data.len > 48) {
+        return B64Text { len: 0, chars: chars };
+    }
+    var i: usize = 0;
+    while (i + 3 <= data.len) {
+        var b0 = data[i];
+        var b1 = data[i + 1];
+        var b2 = data[i + 2];
+        chars[w] = b64_char(b0 / 4);
+        chars[w + 1] = b64_char(((b0 % 4) * 16) + (b1 / 16));
+        chars[w + 2] = b64_char(((b1 % 16) * 4) + (b2 / 64));
+        chars[w + 3] = b64_char(b2 % 64);
+        w += 4;
+        i += 3;
+    }
+    if (data.len - i == 1) {
+        var b0 = data[i];
+        chars[w] = b64_char(b0 / 4);
+        chars[w + 1] = b64_char((b0 % 4) * 16);
+        chars[w + 2] = '=';
+        chars[w + 3] = '=';
+        w += 4;
+    }
+    if (data.len - i == 2) {
+        var b0 = data[i];
+        var b1 = data[i + 1];
+        chars[w] = b64_char(b0 / 4);
+        chars[w + 1] = b64_char(((b0 % 4) * 16) + (b1 / 16));
+        chars[w + 2] = b64_char((b1 % 16) * 4);
+        chars[w + 3] = '=';
+        w += 4;
+    }
+    return B64Text { len: w, chars: chars };
+}
+
+// The original reads TRIOS_MESH_KEY_DIR when set, else the home-relative
+// default, else the relative fallback when HOME is unusable.
+fn key_dir_source(env_set: bool, has_home: bool) -> KeyDirSource {
+    if (env_set) {
+        return KeyDirSource::EnvOverride;
+    }
+    if (has_home) {
+        return KeyDirSource::HomeDefault;
+    }
+    return KeyDirSource::RelativeFallback;
+}
+
+// The original checks TRIOS_MESH_PRIVATE_KEY, then the key file, else
+// generates a fresh key.
+fn key_source(env_present: bool, key_file_exists: bool) -> KeySource {
+    if (env_present) {
+        return KeySource::FromEnv;
+    }
+    if (key_file_exists) {
+        return KeySource::FromFile;
+    }
+    return KeySource::Generated;
+}
+
+// Original: key file name is format!("node_{}.key", node_id).
+fn key_file_name(node_id: u64) -> KeyFileName {
+    var chars: [32]u8 = ZEROS32;
+    chars[0] = 'n';
+    chars[1] = 'o';
+    chars[2] = 'd';
+    chars[3] = 'e';
+    chars[4] = '_';
+    var len: usize = 5;
+    var digits: [20]u8 = ZEROS20;
+    var nd: usize = 0;
+    var id = node_id;
+    if (id == 0) {
+        digits[0] = '0';
+        nd = 1;
+    }
+    while (id > 0) {
+        digits[nd] = '0' + ((id % 10) as u8);
+        nd += 1;
+        id = id / 10;
+    }
+    while (nd > 0) {
+        nd = nd - 1;
+        chars[len] = digits[nd];
+        len += 1;
+    }
+    chars[len] = '.';
+    len += 1;
+    chars[len] = 'k';
+    len += 1;
+    chars[len] = 'e';
+    len += 1;
+    chars[len] = 'y';
+    len += 1;
+    return KeyFileName { len: len, chars: chars };
+}
+
+// The original wraps decode failures by their origin: env var keys and
+// file keys produce distinguishable errors.
+fn wrap_decode_error(from_env: bool, decode_ok: bool) -> LoadError {
+    if (!decode_ok) {
+        if (from_env) {
+            return LoadError::EnvInvalidKey;
+        }
+        return LoadError::FileInvalidKey;
+    }
+    return LoadError::None;
+}
+
+fn env_name_is(value: []const u8, name: []const u8) -> bool {
+    if (value.len != name.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < value.len) {
+        if (value[i] != name[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn b64text_matches(t: B64Text, expected: []const u8) -> bool {
+    if (t.len != expected.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < t.len) {
+        if (t.chars[i] != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn decoded32_matches(dec: B64Out, expected: []const u8) -> bool {
+    if (dec.len != 32) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < 32) {
+        if (dec.data[i] != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn name_matches(n: KeyFileName, expected: []const u8) -> bool {
+    if (n.len != expected.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < n.len) {
+        if (n.chars[i] != expected[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Original: 32 bytes from the static key, standard base64 text.
+pub fn public_key_base64(key: StaticKey) -> B64Text {
+    var bytes: [32]u8 = key.public;
+    return base64_encode(&bytes);
+}
+
+fn decode_secret(text: []const u8) -> DecodedSecret {
+    var dec = base64_decode(text);
+    if (!dec.ok) {
+        return DecodedSecret { ok: false, err: KeyDecodeError::InvalidBase64, got_len: 0, secret: ZEROS32 };
+    }
+    if (dec.len != 32) {
+        return DecodedSecret { ok: false, err: KeyDecodeError::BadLength, got_len: dec.len, secret: ZEROS32 };
+    }
+    var secret: [32]u8 = ZEROS32;
+    var i: usize = 0;
+    while (i < 32) {
+        secret[i] = dec.data[i];
+        i += 1;
+    }
+    return DecodedSecret { ok: true, err: KeyDecodeError::None, got_len: 32, secret: secret };
+}
+
+pub fn decode_public_key(text: []const u8) -> DecodedPublicKey {
+    var dec = base64_decode(text);
+    if (!dec.ok) {
+        return DecodedPublicKey { ok: false, err: KeyDecodeError::InvalidBase64, got_len: 0, key: ZEROS32 };
+    }
+    if (dec.len != 32) {
+        return DecodedPublicKey { ok: false, err: KeyDecodeError::BadLength, got_len: dec.len, key: ZEROS32 };
+    }
+    var key: [32]u8 = ZEROS32;
+    var i: usize = 0;
+    while (i < 32) {
+        key[i] = dec.data[i];
+        i += 1;
+    }
+    return DecodedPublicKey { ok: true, err: KeyDecodeError::None, got_len: 32, key: key };
+}
+
+// ---------------------------------------------------------------------------
+// Original functions whose bodies are I/O plumbing. They keep their names
+// and signatures; the decision logic they drive is ported above. Tests
+// never call them.
+// ---------------------------------------------------------------------------
+
+pub fn default_key_dir() -> []const u8 {
+    undefined;
+}
+
+fn key_path(node_id: u64) -> []const u8 {
+    undefined;
+}
+
+pub fn load_or_generate(node_id: u64) -> LoadedKey {
+    undefined;
+}
+
+fn key_file_mode() -> u32 {
+    return KEY_FILE_MODE;
+}
+
+fn key_dir_mode() -> u32 {
+    return KEY_DIR_MODE;
+}
+
+test b64_sextet_maps_standard_alphabet {
+    assert(b64_sextet('A') == 0);
+    assert(b64_sextet('Z') == 25);
+    assert(b64_sextet('a') == 26);
+    assert(b64_sextet('z') == 51);
+    assert(b64_sextet('0') == 52);
+    assert(b64_sextet('9') == 61);
+    assert(b64_sextet('+') == 62);
+    assert(b64_sextet('/') == 63);
+    assert(b64_sextet('*') == 255);
+    assert(b64_sextet('=') == 255);
+    assert(b64_sextet(' ') == 255);
+    assert(b64_sextet('-') == 255);
+}
+
+test b64_char_roundtrip_alphabet {
+    assert(b64_char(0) == 'A');
+    assert(b64_char(25) == 'Z');
+    assert(b64_char(26) == 'a');
+    assert(b64_char(51) == 'z');
+    assert(b64_char(52) == '0');
+    assert(b64_char(61) == '9');
+    assert(b64_char(62) == '+');
+    assert(b64_char(63) == '/');
+    var v: u8 = 0;
+    while (v < 64) {
+        assert(b64_sextet(b64_char(v)) == v);
+        v += 1;
+    }
+}
+
+test base64_decode_known_vectors {
+    var abc = base64_decode("AAAB");
+    assert(abc.ok);
+    assert(abc.len == 3);
+    assert(abc.data[0] == 0);
+    assert(abc.data[1] == 0);
+    assert(abc.data[2] == 1);
+
+    var ff = base64_decode("/w==");
+    assert(ff.ok);
+    assert(ff.len == 1);
+    assert(ff.data[0] == 255);
+
+    var zero3 = base64_decode("AAAA");
+    assert(zero3.ok);
+    assert(zero3.len == 3);
+    assert(zero3.data[2] == 0);
+
+    var one = base64_decode("AA==");
+    assert(one.ok);
+    assert(one.len == 1);
+    assert(one.data[0] == 0);
+
+    var buf: [64]u8 = ZEROS64;
+    var k: usize = 0;
+    while (k < 43) {
+        buf[k] = 'A';
+        k += 1;
+    }
+    buf[43] = '=';
+    var dec32 = base64_decode_n(&buf, 44);
+    assert(dec32.ok);
+    assert(dec32.len == 32);
+    assert(dec32.data[0] == 0);
+    assert(dec32.data[31] == 0);
+}
+
+test base64_decode_rejects_bad_input {
+    var short = base64_decode("AAA");
+    assert(!short.ok);
+    var star = base64_decode("A*AA");
+    assert(!star.ok);
+    var early_pad = base64_decode("A===");
+    assert(!early_pad.ok);
+    var space_in = base64_decode("AB C");
+    assert(!space_in.ok);
+    var five = base64_decode("AAAAA");
+    assert(!five.ok);
+    var all_pad = base64_decode("====");
+    assert(!all_pad.ok);
+}
+
+test base64_decode_trims_surrounding_whitespace {
+    var padded = base64_decode("  AAAB\n\t");
+    assert(padded.ok);
+    assert(padded.len == 3);
+    assert(padded.data[2] == 1);
+    var nl = base64_decode("\n/w==\n");
+    assert(nl.ok);
+    assert(nl.len == 1);
+    assert(nl.data[0] == 255);
+}
+
+test base64_encode_known_vectors {
+    var bytes_001: [3]u8 = [0, 0, 1];
+    var e1 = base64_encode(&bytes_001);
+    assert(e1.len == 4);
+    assert(b64text_matches(e1, "AAAB"));
+
+    var bytes_ff: [1]u8 = [255];
+    var e2 = base64_encode(&bytes_ff);
+    assert(e2.len == 4);
+    assert(b64text_matches(e2, "/w=="));
+
+    var bytes_000: [3]u8 = [0, 0, 0];
+    var e3 = base64_encode(&bytes_000);
+    assert(e3.len == 4);
+    assert(b64text_matches(e3, "AAAA"));
+
+    var zeros32: [32]u8 = ZEROS32;
+    var e4 = base64_encode(&zeros32);
+    assert(e4.len == 44);
+    var k: usize = 0;
+    while (k < 43) {
+        assert(e4.chars[k] == 'A');
+        k += 1;
+    }
+    assert(e4.chars[43] == '=');
+
+    var big: [49]u8 = [_]u8{0} ** 49;
+    var e5 = base64_encode(&big);
+    assert(e5.len == 0);
+}
+
+test base64_roundtrip_32_byte_pattern {
+    var pattern: [32]u8 = ZEROS32;
+    var i: usize = 0;
+    while (i < 32) {
+        pattern[i] = i as u8;
+        i += 1;
+    }
+    var enc = base64_encode(&pattern);
+    assert(enc.len == 44);
+    var dec = base64_decode_n(&enc.chars, enc.len);
+    assert(dec.ok);
+    assert(dec.len == 32);
+    assert(decoded32_matches(dec, &pattern));
+}
+
+test decode_secret_accepts_32_bytes {
+    var dec = decode_secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    assert(dec.ok);
+    assert(dec.err == KeyDecodeError::None);
+    assert(dec.got_len == 32);
+    assert(dec.secret[0] == 0);
+    assert(dec.secret[31] == 0);
+}
+
+test decode_secret_rejects_bad_input {
+    var stars = decode_secret("****");
+    assert(!stars.ok);
+    assert(stars.err == KeyDecodeError::InvalidBase64);
+
+    var short = decode_secret("AAA");
+    assert(!short.ok);
+    assert(short.err == KeyDecodeError::InvalidBase64);
+
+    var empty = decode_secret("");
+    assert(!empty.ok);
+    assert(empty.err == KeyDecodeError::BadLength);
+    assert(empty.got_len == 0);
+
+    var bytes31 = decode_secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==");
+    assert(!bytes31.ok);
+    assert(bytes31.err == KeyDecodeError::BadLength);
+    assert(bytes31.got_len == 31);
+
+    var bytes33 = decode_secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert(!bytes33.ok);
+    assert(bytes33.err == KeyDecodeError::BadLength);
+    assert(bytes33.got_len == 33);
+
+    var bytes48 = decode_secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert(!bytes48.ok);
+    assert(bytes48.err == KeyDecodeError::BadLength);
+    assert(bytes48.got_len == 48);
+
+    var over = decode_secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert(!over.ok);
+    assert(over.err == KeyDecodeError::BadLength);
+    assert(over.got_len == 66);
+}
+
+test decode_secret_trims_whitespace {
+    var dec = decode_secret("  AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \n");
+    assert(dec.ok);
+    assert(dec.got_len == 32);
+    assert(dec.secret[7] == 0);
+}
+
+test decode_public_key_checks_length {
+    var ok = decode_public_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    assert(ok.ok);
+    assert(ok.err == KeyDecodeError::None);
+    assert(ok.got_len == 32);
+    assert(ok.key[15] == 0);
+
+    var padded = decode_public_key("  AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \t\n");
+    assert(padded.ok);
+    assert(padded.got_len == 32);
+
+    var bytes33 = decode_public_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert(!bytes33.ok);
+    assert(bytes33.err == KeyDecodeError::BadLength);
+    assert(bytes33.got_len == 33);
+
+    var stars = decode_public_key("****");
+    assert(!stars.ok);
+    assert(stars.err == KeyDecodeError::InvalidBase64);
+}
+
+test public_key_base64_encodes_public_bytes {
+    var key = StaticKey { public: ZEROS32 };
+    var t = public_key_base64(key);
+    assert(t.len == 44);
+    assert(b64text_matches(t, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+
+    var key2 = StaticKey { public: ZEROS32 };
+    key2.public[0] = 255;
+    var t2 = public_key_base64(key2);
+    assert(t2.len == 44);
+    assert(t2.chars[0] == '/');
+    assert(t2.chars[1] == 'w');
+    assert(t2.chars[2] == 'A');
+    assert(t2.chars[3] == 'A');
+}
+
+test key_dir_source_priority_and_constants {
+    assert(key_dir_source(true, true) == KeyDirSource::EnvOverride);
+    assert(key_dir_source(true, false) == KeyDirSource::EnvOverride);
+    assert(key_dir_source(false, true) == KeyDirSource::HomeDefault);
+    assert(key_dir_source(false, false) == KeyDirSource::RelativeFallback);
+    assert(env_name_is(PRIVATE_KEY_ENV, "TRIOS_MESH_PRIVATE_KEY"));
+    assert(env_name_is(KEY_DIR_ENV, "TRIOS_MESH_KEY_DIR"));
+    assert(env_name_is(DEFAULT_KEY_DIR, ".trinity/mesh/keys"));
+}
+
+test key_source_priority_and_error_wrapping {
+    assert(key_source(true, true) == KeySource::FromEnv);
+    assert(key_source(true, false) == KeySource::FromEnv);
+    assert(key_source(false, true) == KeySource::FromFile);
+    assert(key_source(false, false) == KeySource::Generated);
+    assert(wrap_decode_error(true, false) == LoadError::EnvInvalidKey);
+    assert(wrap_decode_error(false, false) == LoadError::FileInvalidKey);
+    assert(wrap_decode_error(true, true) == LoadError::None);
+}
+
+test key_file_name_embeds_node_id {
+    var n0 = key_file_name(0);
+    assert(n0.len == 10);
+    assert(name_matches(n0, "node_0.key"));
+
+    var n7 = key_file_name(7);
+    assert(n7.len == 10);
+    assert(name_matches(n7, "node_7.key"));
+
+    var nbig = key_file_name(123456789);
+    assert(nbig.len == 18);
+    assert(name_matches(nbig, "node_123456789.key"));
+
+    var nwide = key_file_name(4294967296);
+    assert(nwide.len == 19);
+    assert(name_matches(nwide, "node_4294967296.key"));
+}
+
+test key_store_permission_modes {
+    assert(key_file_mode() == 384);
+    assert(key_dir_mode() == 448);
+}
