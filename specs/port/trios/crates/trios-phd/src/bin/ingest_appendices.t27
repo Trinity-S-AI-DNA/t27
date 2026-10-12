@@ -1,0 +1,427 @@
+// Port of crates/trios-phd/src/bin/ingest_appendices.rs
+// (gHashTag/trios @ commit 8b229e9489ee, 148 lines).
+//
+// What the original does, mapped to this file:
+//   - clap parses --database-url and --dry-run (lines 19-32) -> IngestOptions;
+//   - the connection string is the flag, else $DATABASE_URL, else the run
+//     aborts with exit code 1 before touching anything (lines 45-48)
+//     -> has_database_url / choose_database_url / exit_for;
+//   - a static table maps the 14 appendix .tex file stems to chapter slugs,
+//     chapter numbers and display titles; the numbers 1001..1014 are
+//     deliberately reserved above the Flos Aurea chapters (1..34) so the
+//     ingest can never collide with them (lines 56-83) -> APPENDICES,
+//     chapter_nos_reserved;
+//   - per appendix the stem maps to slug "ap-" + lowercased stem with each
+//     ' ' and '·' mapped to '-'; a stem that does not start with a letter
+//     aborts the whole run (lines 85-91, 103-105)
+//     -> stem_maps_to_slug / stem_map_ok / table_slugs_match_stem_rule;
+//   - a missing <stem>.tex is skipped and counted, and that check precedes
+//     the dry-run branch, so a missing file skips even in a dry run
+//     (lines 93-104) -> next_action;
+//   - dry-run prints the plan (prefix DRY) and counts characters without
+//     writing; a real run writes (prefix OK) (lines 106-113)
+//     -> next_action / apply_action / count_chars;
+//   - the write is one idempotent UPSERT whose bind parameters carry the
+//     slug, chapter number, title and the full appendix body, and whose SET
+//     clause preserves the existing citations and coq_refs so a re-run can
+//     never fabricate provenance (R5); the hand-curated menu_entry is never
+//     touched (lines 115-138) -> UPSERT_SQL / prepare_upsert_params.
+//
+// Porting decisions per the triage notes:
+//   - decisions are pure functions with executable tests below;
+//   - the plumbing (tokio_postgres connection, std::fs reads, clap/env
+//     parsing, stderr logging) lives only in main, whose body is the
+//     `undefined;` placeholder -- spec tests exercise main's decision
+//     surface (exit code, per-file action, counters), never I/O;
+//   - AppendixSpec/IngestOptions/IngestCounters/UpsertParams are structs;
+//     the per-file outcome marker is the exact "SKIP"/"DRY"/"OK" prefix the
+//     original prints in its "[ingest_appendices] ..." log lines.
+module port::ingest_appendices;
+
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAIL: i32 = 1;
+
+// $DATABASE_URL fallback name from lines 45-48 of the original.
+pub const DATABASE_URL_ENV: []const u8 = "DATABASE_URL";
+
+// The stderr prefix the original prints for every appendix row.
+pub const LOG_PREFIX: []const u8 = "[ingest_appendices]";
+
+pub struct AppendixSpec {
+    file_stem: []const u8,
+    slug: []const u8,
+    chapter_no: i32,
+    title: []const u8,
+}
+
+// The static mapping from lines 56-83: 14 appendices, chapter numbers
+// reserved above the FA chapters 1..34. Slugs must satisfy
+// stem_maps_to_slug (asserted by table_slugs_match_stem_rule).
+pub const APPENDICES: [14]AppendixSpec = [
+    AppendixSpec { file_stem: "A-catalogue", slug: "ap-a-catalogue", chapter_no: 1001, title: "Appendix A — Catalogue of Editions" },
+    AppendixSpec { file_stem: "B-witnesses", slug: "ap-b-witnesses", chapter_no: 1002, title: "Appendix B — Witnesses and Sigla" },
+    AppendixSpec { file_stem: "C-concordance", slug: "ap-c-concordance", chapter_no: 1003, title: "Appendix C — Concordance of First Lines" },
+    AppendixSpec { file_stem: "D-golden-mirror", slug: "ap-d-golden-mirror", chapter_no: 1004, title: "Appendix D — Trinity ↔ Flos Symmetry" },
+    AppendixSpec { file_stem: "E-paralipomena", slug: "ap-e-paralipomena", chapter_no: 1005, title: "Appendix E — Paralipomena" },
+    AppendixSpec { file_stem: "F-itineraries", slug: "ap-f-itineraries", chapter_no: 1006, title: "Appendix F — Itineraries of the Bee" },
+    AppendixSpec { file_stem: "G-dispatch-table", slug: "ap-g-dispatch-table", chapter_no: 1007, title: "Appendix G — Dispatch Table" },
+    AppendixSpec { file_stem: "H-glossary", slug: "ap-h-glossary", chapter_no: 1008, title: "Appendix H — Glossary of Terms" },
+    AppendixSpec { file_stem: "I-manuscripts", slug: "ap-i-manuscripts", chapter_no: 1009, title: "Appendix I — Manuscript Sigla" },
+    AppendixSpec { file_stem: "Fa-annex", slug: "ap-fa-annex", chapter_no: 1010, title: "Appendix Fa — Annex of Sources" },
+    AppendixSpec { file_stem: "Fb-annex", slug: "ap-fb-annex", chapter_no: 1011, title: "Appendix Fb — Annex of Marginalia" },
+    AppendixSpec { file_stem: "J-plate-inventory", slug: "ap-j-plate-inventory", chapter_no: 1012, title: "Appendix J — Plate Inventory" },
+    AppendixSpec { file_stem: "K-corrections", slug: "ap-k-corrections", chapter_no: 1013, title: "Appendix K — Corrections" },
+    AppendixSpec { file_stem: "K2-symmetry-plane", slug: "ap-k2-symmetry-plane", chapter_no: 1014, title: "Appendix K2 — The Symmetry Plane" },
+];
+
+// The idempotent UPSERT from lines 115-138. $1..$4 are the params built by
+// prepare_upsert_params. Intentionally NO EXCLUDED.citations / NO
+// EXCLUDED.coq_refs (existing provenance is preserved on conflict, R5) and
+// NO menu_entry update (the menu stays hand-curated).
+pub const UPSERT_SQL: []const u8 = "INSERT INTO chapters (slug, chapter_no, title, body) VALUES ($1, $2, $3, $4) ON CONFLICT (slug) DO UPDATE SET chapter_no = EXCLUDED.chapter_no, title = EXCLUDED.title, body = EXCLUDED.body, citations = chapters.citations, coq_refs = chapters.coq_refs WHERE chapters.menu_entry = ''";
+
+pub struct IngestOptions {
+    dry_run: bool,
+    database_url: []const u8,
+}
+
+pub struct IngestCounters {
+    written: usize,
+    skipped_missing: usize,
+    total_chars: usize,
+}
+
+pub struct UpsertParams {
+    slug: []const u8,
+    chapter_no: i32,
+    title: []const u8,
+    body: []const u8,
+    body_chars: usize,
+}
+
+// ---- port helpers (not part of the original surface) ----
+
+fn has_substring(s: []const u8, needle: []const u8) -> bool {
+    if (needle.len == 0) {
+        return true;
+    }
+    if (needle.len > s.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i <= s.len - needle.len) : (i = i + 1) {
+        var j: usize = 0;
+        var ok = true;
+        while (j < needle.len) : (j = j + 1) {
+            if (s[i + j] != needle[j]) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn starts_with(s: []const u8, prefix: []const u8) -> bool {
+    if (prefix.len > s.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < prefix.len) : (i = i + 1) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Equality without string == on two computed values: same length and one
+// occurs in the other.
+fn same_string(a: []const u8, b: []const u8) -> bool {
+    return a.len == b.len and has_substring(a, b);
+}
+
+fn to_lower_byte(b: u8) -> u8 {
+    if (b >= 'A' and b <= 'Z') {
+        return b + 32;
+    }
+    return b;
+}
+
+fn spec_at(i: usize) -> AppendixSpec {
+    return APPENDICES[i];
+}
+
+// ---- ported decisions ----
+
+pub fn appendix_count() -> usize {
+    return APPENDICES.len;
+}
+
+// Lines 56-83: the chapter numbers are reserved above the FA chapters.
+pub fn chapter_nos_reserved() -> bool {
+    var i: usize = 0;
+    while (i < APPENDICES.len) : (i = i + 1) {
+        const spec = spec_at(i);
+        if (spec.chapter_no < 1001 or spec.chapter_no > 1014) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Lines 85-91: slug = "ap-" + lowercased stem with ' ' and '·' -> '-'.
+// Ported as a verifier so no string building is needed.
+pub fn stem_maps_to_slug(stem: []const u8, slug: []const u8) -> bool {
+    if (!starts_with(slug, "ap-")) {
+        return false;
+    }
+    var si: usize = 0;
+    var gi: usize = 3;
+    while (si < stem.len) : (si = si + 1) {
+        const b = stem[si];
+        if (b == 0xC2 and si + 1 < stem.len and stem[si + 1] == 0xB7) {
+            // '·' (U+00B7, two UTF-8 bytes) normalizes to one '-'.
+            if (gi >= slug.len or slug[gi] != '-') {
+                return false;
+            }
+            gi = gi + 1;
+            si = si + 1;
+        } else if (b == ' ') {
+            if (gi >= slug.len or slug[gi] != '-') {
+                return false;
+            }
+            gi = gi + 1;
+        } else {
+            if (gi >= slug.len or slug[gi] != to_lower_byte(b)) {
+                return false;
+            }
+            gi = gi + 1;
+        }
+    }
+    return gi == slug.len;
+}
+
+// Lines 103-105: a stem that does not start with a letter aborts the run.
+pub fn stem_map_ok(stem: []const u8) -> bool {
+    if (stem.len == 0) {
+        return false;
+    }
+    const b = stem[0];
+    return (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z');
+}
+
+pub fn table_slugs_match_stem_rule() -> bool {
+    var i: usize = 0;
+    while (i < APPENDICES.len) : (i = i + 1) {
+        const spec = spec_at(i);
+        if (!stem_maps_to_slug(spec.file_stem, spec.slug)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn slugs_unique() -> bool {
+    var i: usize = 0;
+    while (i < APPENDICES.len) : (i = i + 1) {
+        var j: usize = i + 1;
+        while (j < APPENDICES.len) : (j = j + 1) {
+            if (same_string(spec_at(i).slug, spec_at(j).slug)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Lines 45-48: flag, else $DATABASE_URL, else refuse.
+pub fn has_database_url(flag: []const u8, env: []const u8) -> bool {
+    return flag.len > 0 or env.len > 0;
+}
+
+pub fn choose_database_url(flag: []const u8, env: []const u8) -> []const u8 {
+    if (flag.len > 0) {
+        return flag;
+    }
+    if (env.len > 0) {
+        return env;
+    }
+    return "";
+}
+
+// Lines 45-48: no URL anywhere -> the run exits 1 before any write.
+pub fn exit_for(has_url: bool) -> i32 {
+    if (has_url) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// Lines 93-104: the exists check precedes the dry-run branch, so a missing
+// file skips even in a dry run. Returns the exact log prefix printed.
+pub fn next_action(file_exists: bool, dry_run: bool) -> []const u8 {
+    if (!file_exists) {
+        return "SKIP";
+    }
+    if (dry_run) {
+        return "DRY";
+    }
+    return "OK";
+}
+
+// Lines 93-113: counter accounting for one appendix; the original prints
+// written/skipped_missing/total_chars at the end.
+pub fn apply_action(written: usize, skipped_missing: usize, total_chars: usize, action: []const u8, body_len: usize) -> IngestCounters {
+    var w: usize = written;
+    var s: usize = skipped_missing;
+    var t: usize = total_chars;
+    if (action == "OK") {
+        w = w + 1;
+        t = t + body_len;
+    } else if (action == "SKIP") {
+        s = s + 1;
+    }
+    return IngestCounters { written: w, skipped_missing: s, total_chars: t };
+}
+
+// Lines 106-113: the original counts Unicode scalar values
+// (body.chars().count()), not bytes: every non-continuation byte starts
+// one char.
+pub fn count_chars(s: []const u8) -> usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i = i + 1) {
+        if (s[i] < 0x80 or s[i] >= 0xC0) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// Lines 115-138: the bind parameters for the idempotent UPSERT. The body is
+// bound in full; body_chars feeds the summary counter only. Provenance
+// columns are never parameters (R5: never fabricate citations/coq_refs).
+pub fn prepare_upsert_params(slug: []const u8, chapter_no: i32, title: []const u8, body: []const u8) -> UpsertParams {
+    return UpsertParams { slug: slug, chapter_no: chapter_no, title: title, body: body, body_chars: count_chars(body) };
+}
+
+pub fn main() -> i32 {
+    undefined;
+}
+
+test appendix_table_has_fourteen_entries {
+    assert(appendix_count() == 14);
+    const first = spec_at(0);
+    assert(first.file_stem == "A-catalogue");
+    assert(first.slug == "ap-a-catalogue");
+    assert(first.chapter_no == 1001);
+    assert(first.title == "Appendix A — Catalogue of Editions");
+    const mid = spec_at(6);
+    assert(mid.slug == "ap-g-dispatch-table");
+    assert(mid.chapter_no == 1007);
+    const last = spec_at(13);
+    assert(last.file_stem == "K2-symmetry-plane");
+    assert(last.slug == "ap-k2-symmetry-plane");
+    assert(last.chapter_no == 1014);
+    assert(last.title == "Appendix K2 — The Symmetry Plane");
+}
+
+test chapter_numbers_stay_in_the_reserved_band_above_the_fa_chapters {
+    assert(chapter_nos_reserved());
+    const first = spec_at(0);
+    assert(first.chapter_no == 1001);
+    const annex = spec_at(9);
+    assert(annex.file_stem == "Fa-annex");
+    assert(annex.chapter_no == 1010);
+}
+
+test appendix_slugs_are_unique_so_the_upsert_conflict_target_is_sound {
+    assert(slugs_unique());
+    assert(same_string(spec_at(3).slug, spec_at(3).slug));
+    assert(!same_string(spec_at(3).slug, spec_at(4).slug));
+}
+
+test every_table_slug_satisfies_the_ap_stem_mapping_rule {
+    assert(table_slugs_match_stem_rule());
+    assert(stem_maps_to_slug("A-catalogue", "ap-a-catalogue"));
+    assert(stem_maps_to_slug("K2-symmetry-plane", "ap-k2-symmetry-plane"));
+    assert(stem_maps_to_slug("Golden mirror", "ap-golden-mirror"));
+    assert(stem_maps_to_slug("Fa · annex", "ap-fa-annex"));
+    assert(stem_maps_to_slug("B-WITNESSES", "ap-b-witnesses"));
+    assert(!stem_maps_to_slug("A-catalogue", "ap-b-witnesses"));
+    assert(!stem_maps_to_slug("A-catalogue", "A-catalogue"));
+    assert(stem_maps_to_slug("", "ap-"));
+    assert(!stem_map_ok(""));
+    assert(!stem_map_ok("_under"));
+    assert(stem_map_ok("A-catalogue"));
+}
+
+test missing_database_url_refuses_before_any_write {
+    assert(!has_database_url("", ""));
+    assert(has_database_url("postgres://flag", ""));
+    assert(has_database_url("", "postgres://env"));
+    assert(choose_database_url("postgres://flag", "postgres://env") == "postgres://flag");
+    assert(choose_database_url("", "postgres://env") == "postgres://env");
+    assert(choose_database_url("", "") == "");
+    assert(exit_for(has_database_url("postgres://x", "")) == EXIT_OK);
+    assert(exit_for(has_database_url("", "")) == EXIT_FAIL);
+}
+
+test missing_file_skips_even_in_a_dry_run {
+    assert(next_action(false, false) == "SKIP");
+    assert(next_action(false, true) == "SKIP");
+}
+
+test dry_run_plans_but_never_writes {
+    assert(next_action(true, true) == "DRY");
+    assert(next_action(true, false) == "OK");
+}
+
+test counters_advance_only_on_real_writes {
+    const w = apply_action(1, 0, 40, "OK", 118);
+    assert(w.written == 2);
+    assert(w.skipped_missing == 0);
+    assert(w.total_chars == 158);
+    const s = apply_action(0, 0, 0, "SKIP", 999);
+    assert(s.written == 0);
+    assert(s.skipped_missing == 1);
+    assert(s.total_chars == 0);
+    const d = apply_action(2, 1, 300, "DRY", 77);
+    assert(d.written == 2);
+    assert(d.skipped_missing == 1);
+    assert(d.total_chars == 300);
+}
+
+test upsert_binds_derived_params_and_preserves_provenance {
+    const p = prepare_upsert_params("ap-fa-annex", 1010, "Appendix Fa — Annex of Sources", "Trinity ↔ Flos");
+    assert(p.slug == "ap-fa-annex");
+    assert(p.chapter_no == 1010);
+    assert(p.title == "Appendix Fa — Annex of Sources");
+    assert(p.body == "Trinity ↔ Flos");
+    assert(p.body_chars == 14);
+    assert(has_substring(UPSERT_SQL, "ON CONFLICT (slug) DO UPDATE"));
+    assert(has_substring(UPSERT_SQL, "citations = chapters.citations"));
+    assert(has_substring(UPSERT_SQL, "coq_refs = chapters.coq_refs"));
+    assert(!has_substring(UPSERT_SQL, "EXCLUDED.citations"));
+    assert(!has_substring(UPSERT_SQL, "EXCLUDED.coq_refs"));
+    assert(has_substring(UPSERT_SQL, "menu_entry = ''"));
+}
+
+test count_chars_counts_unicode_points_not_bytes {
+    assert(count_chars("") == 0);
+    assert(count_chars("abc") == 3);
+    assert(count_chars("Trinity ↔ Flos") == 14);
+    assert(count_chars("Fa · annex") == 10);
+}
+
+test dry_run_flag_defaults_off_until_cli_sets_it {
+    const opts = IngestOptions { dry_run: true, database_url: "postgres://env" };
+    assert(opts.dry_run);
+    assert(opts.database_url == "postgres://env");
+    const off = IngestOptions { dry_run: false, database_url: "postgres://flag" };
+    assert(!off.dry_run);
+    assert(off.database_url == "postgres://flag");
+}
