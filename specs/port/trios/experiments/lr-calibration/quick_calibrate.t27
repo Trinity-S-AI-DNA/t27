@@ -1,0 +1,479 @@
+// Port of gHashTag/trios `experiments/lr-calibration/quick_calibrate.rs` (192 lines,
+// quoted in gHashTag/t27#9250, as of 8b229e9489ee) to the t27 specification dialect,
+// following the sibling ports in specs/port/trios.
+//
+// The original is a cargo binary: for each of three LR schedules it simulates 500
+// training steps of synthetic gradient descent, writes one CSV per schedule, prints
+// a progress table and a ranked summary, and saves results.json.
+//
+// What is ported as testable decisions:
+//   - bpb = loss / ln(2)                                     -> bpb_from_loss()
+//   - the synthetic gradient step: the 0.01 base decay, the
+//     min(lr / BASE_LR, 2.0) LR clamp, the per-schedule
+//     factors (Flat plateaus past step 300; Cosine rises
+//     with step / MAX_STEPS; PhiDecay holds 1.0 below step
+//     100 then rises toward 1.5), the noise term and the
+//     0.5 loss floor                                          -> simulate_training_step()
+//   - the per-schedule run: 500 steps folding over the
+//     lr_schedule_54 values, starting from initial loss 5.0
+//     and tracking the final LR (run_schedule's loop)         -> simulate_schedule()
+//   - the schedule set, its order and its file/JSON names     -> schedule_at() +
+//     schedule_name() + result_at()
+//   - the summary ranking: sort_by BPB ascending (stable, so
+//     ties keep the run order) and the rank-1 winner marker   -> rank_of() + winner_status()
+//
+// What stays as plumbing stubs (never called by tests):
+//   - run_schedule(): File::create + writeln! of the CSV header and a row every
+//     LOG_EVERY steps, the println! progress lines, the Instant timing
+//   - main(): the banner println!s, fs::create_dir_all, the per-schedule CSV files,
+//     the serde_json results.json, the winner analysis prints
+// The stub names and signatures mirror the original so the port boundary stays visible.
+//
+// Named deviations:
+//   - rand::random::<f32>() in simulate_training_step becomes the `noise` parameter
+//     (the raw uniform sample the original would draw); 0.5 reproduces the noiseless
+//     step, and the per-schedule run uses the constant sample 0.5, i.e. the noiseless
+//     trajectory.
+//   - trios_phi_schedule::lr_schedule_54 is defined in another crate and its source is
+//     not quoted in the task; it is reconstructed from the labels the original prints
+//     for it: "flat (constant 3e-4)", "cosine (3e-4 -> 0)", "phi_decay (3e-4 ->
+//     alpha_phi)". Flat is exact; cosine is the standard raised-cosine anneal from
+//     BASE_LR to 0; phi_decay anneals from BASE_LR to alpha_phi = BASE_LR / phi with
+//     the same shape.
+//   - 2.0_f32.ln() becomes the constant LN_2 = 0.6931471805599453; .min/.max on f32
+//     become fmin()/fmax(); cos comes from a 12-term Taylor series because there is
+//     no math library in t27; the winner marker keeps the original's wording without
+//     the non-ASCII star.
+
+module port::trios_quick_calibrate;
+
+pub const MAX_STEPS: usize = 500;  // reduced for speed, as in the original
+pub const BASE_LR: f32 = 0.0003;   // 3e-4
+pub const LOG_EVERY: usize = 50;
+
+const LN_2: f32 = 0.6931471805599453;  // 2.0_f32.ln()
+const PI: f32 = 3.14159265;
+const PHI: f32 = 1.6180339887;         // golden ratio; alpha_phi = BASE_LR / PHI
+
+// The schedule axis the whole experiment switches on, from trios_phi_schedule.
+pub enum LrScheduleType { Flat, Cosine, PhiDecay, }
+
+// What main() collects per schedule: the name it files the CSV and the
+// results.json entry under, plus run_schedule's (final_bpb, final_loss, final_lr).
+pub struct ScheduleResult {
+    name: []const u8,
+    bpb: f32,
+    loss: f32,
+    lr: f32,
+}
+
+fn fmin(a: f32, b: f32) -> f32 {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+fn fmax(a: f32, b: f32) -> f32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn abs_f(a: f32) -> f32 {
+    if (a < 0.0) {
+        return 0.0 - a;
+    }
+    return a;
+}
+
+// cos(x) for x in [0, PI] via the Taylor series; the 12 terms after the constant
+// leave the truncation error around 1e-13, far under f32 precision on that range.
+fn cos_taylor(x: f32) -> f32 {
+    const x2: f32 = x * x;
+    var term: f32 = 1.0;
+    var sum: f32 = 1.0;
+    var sign: f32 = 0.0 - 1.0;
+    var k: usize = 1;
+    while (k < 13) {
+        const den_i: usize = (2 * k - 1) * (2 * k);
+        const denom: f32 = den_i as f32;
+        term = term * x2 / denom;
+        sum = sum + sign * term;
+        sign = 0.0 - sign;
+        k += 1;
+    }
+    return sum;
+}
+
+fn schedule_ordinal(schedule_type: LrScheduleType) -> i32 {
+    return switch (schedule_type) {
+        .Flat => 0,
+        .Cosine => 1,
+        .PhiDecay => 2,
+    };
+}
+
+// Reconstructed stand-in for trios_phi_schedule::lr_schedule_54; see the header
+// note. Flat reproduces its printed label exactly (constant 3e-4); cosine and
+// phi_decay reproduce the labelled endpoints and anneal monotonically between
+// them. The original calls this once per step inside run_schedule.
+pub fn lr_schedule_54(schedule_type: LrScheduleType, step: usize, max_steps: usize) -> f32 {
+    const ord: i32 = schedule_ordinal(schedule_type);
+    if (ord == 0) {
+        return BASE_LR;
+    }
+    const stepf: f32 = step as f32;
+    const maxf: f32 = max_steps as f32;
+    const t: f32 = stepf / maxf;
+    // Raised-cosine shape: 1.0 exactly at step 0, falling to 0.0 at max_steps.
+    const rise: f32 = 0.5 * (1.0 + cos_taylor(PI * t));
+    if (ord == 1) {
+        // "cosine (3e-4 -> 0)".
+        return BASE_LR * rise;
+    }
+    // "phi_decay (3e-4 -> alpha_phi)".
+    const alpha_phi: f32 = BASE_LR / PHI;
+    return BASE_LR - (BASE_LR - alpha_phi) * (1.0 - rise);
+}
+
+// Port of simulate_training_step: one synthetic gradient-descent step. The noise
+// sample the original draws from rand::random::<f32>() is the `noise` parameter
+// here (0.5 = zero noise); everything else is the original arithmetic, including
+// the LR-factor clamp at 2x and the 0.5 loss floor.
+pub fn simulate_training_step(step: usize, lr: f32, prev_loss: f32, schedule_type: LrScheduleType, noise: f32) -> f32 {
+    // Base decay rate: simulates gradient descent effectiveness.
+    const base_decay: f32 = 0.01;
+    // LR-dependent decay: higher LR means faster decay, clamped at 2x.
+    const lr_factor: f32 = fmin(lr / BASE_LR, 2.0);
+
+    // Schedule-dependent convergence behavior.
+    var schedule_factor: f32 = 1.0;
+    const ord: i32 = schedule_ordinal(schedule_type);
+    if (ord == 0) {
+        // Flat: consistent but may plateau.
+        if (step > 300) {
+            schedule_factor = 0.5;
+        } else {
+            schedule_factor = 1.0;
+        }
+    } else if (ord == 1) {
+        // Cosine: good final convergence; improves over time.
+        const stepf: f32 = step as f32;
+        const maxf: f32 = MAX_STEPS as f32;
+        const progress: f32 = stepf / maxf;
+        schedule_factor = 1.0 + 0.3 * progress;
+    } else {
+        // PhiDecay: warmup plateau then optimal decay.
+        if (step < 100) {
+            schedule_factor = 1.0;
+        } else {
+            const over: f32 = (step - 100) as f32;
+            const span: f32 = (MAX_STEPS - 100) as f32;
+            const decay_progress: f32 = fmin(over / span, 1.0);
+            schedule_factor = 1.0 + 0.5 * decay_progress;
+        }
+    }
+
+    const decay: f32 = base_decay * lr_factor * schedule_factor;
+    const new_loss: f32 = prev_loss * (1.0 - decay);
+    // Small noise term (simulates SGD stochasticity), then the 0.5 floor.
+    const noise_term: f32 = (noise - 0.5) * 0.001;
+    return fmax(new_loss + noise_term, 0.5);
+}
+
+// BPB from loss (bits per byte): loss / ln(2).
+pub fn bpb_from_loss(loss: f32) -> f32 {
+    return loss / LN_2;
+}
+
+// The decision inside run_schedule: fold MAX_STEPS simulate_training_step updates
+// over the lr_schedule_54 values, starting from the initial loss 5.0 and tracking
+// the final LR; returns run_schedule's (final_bpb, final_loss, final_lr). The
+// original interleaves the CSV header plus a row every LOG_EVERY steps, println!
+// progress lines and Instant timing into this loop; that is file, console and
+// clock plumbing and stays in run_schedule below. The constant noise sample 0.5
+// makes the run noiseless and deterministic.
+pub fn simulate_schedule(schedule_type: LrScheduleType, noise: f32) -> (f32, f32, f32) {
+    var loss: f32 = 5.0;  // initial loss, as in the original
+    var final_lr: f32 = BASE_LR;
+    var step: usize = 0;
+    while (step < MAX_STEPS) {
+        const lr: f32 = lr_schedule_54(schedule_type, step, MAX_STEPS);
+        final_lr = lr;
+        loss = simulate_training_step(step, lr, loss, schedule_type, noise);
+        step += 1;
+    }
+    return (bpb_from_loss(loss), loss, final_lr);
+}
+
+// run_schedule keeps its original name and its csv_path parameter; its body is
+// File::create + writeln! + println! + Instant plumbing that t27 does not carry,
+// so it keeps an `undefined;` body and no test calls it. The decision it computed
+// is simulate_schedule above.
+fn run_schedule(schedule_type: LrScheduleType, csv_path: []const u8) -> (f32, f32, f32) {
+    undefined;
+}
+
+// The schedules main() runs, in the original's order.
+fn schedule_at(i: usize) -> LrScheduleType {
+    if (i == 0) {
+        return .Flat;
+    }
+    if (i == 1) {
+        return .Cosine;
+    }
+    return .PhiDecay;
+}
+
+// The names main() uses for the CSV files and the results.json entries.
+fn schedule_name(i: usize) -> []const u8 {
+    if (i == 0) {
+        return "flat";
+    }
+    if (i == 1) {
+        return "cosine";
+    }
+    return "phi_decay";
+}
+
+// One collected result: schedule i run through simulate_schedule, tagged with the
+// name it is filed under. This is the body of main()'s per-schedule loop, minus
+// the CSV plumbing.
+fn result_at(i: usize, noise: f32) -> ScheduleResult {
+    const (bpb, loss, lr) = simulate_schedule(schedule_at(i), noise);
+    return ScheduleResult { name: schedule_name(i), bpb: bpb, loss: loss, lr: lr };
+}
+
+// The decision inside main()'s summary: results.sort_by(|a, b|
+// a.1.partial_cmp(&b.1).unwrap()) orders by BPB ascending and, being a stable
+// sort, breaks ties by the original run order; rank 1 is the lowest BPB.
+// rank_of returns one entry's rank under that ordering.
+fn rank_of(bpbs: []const f32, i: usize) -> usize {
+    var rank: usize = 1;
+    var j: usize = 0;
+    while (j < bpbs.len) {
+        if (bpbs[j] < bpbs[i]) {
+            rank += 1;
+        } else {
+            if (bpbs[j] == bpbs[i] and j < i) {
+                rank += 1;
+            }
+        }
+        j += 1;
+    }
+    return rank;
+}
+
+// The status column main() prints next to a rank: rank 1 carries the winner
+// marker (the original prints "★ WINNER"; the star is dropped), the other ranks
+// print nothing.
+fn winner_status(rank: usize) -> []const u8 {
+    if (rank == 1) {
+        return "WINNER";
+    }
+    return "";
+}
+
+// main() keeps its original name; everything it does is console and file plumbing
+// (banner println!s, fs::create_dir_all, the per-schedule CSV files, the
+// serde_json results.json) wrapped around the decisions ported above: run the
+// three schedules via result_at, rank their BPBs via rank_of, mark rank 1 with
+// winner_status, and report the winner. It keeps an `undefined;` body and no test
+// calls it.
+fn main() {
+    undefined;
+}
+
+test bpb_from_loss_scales_with_loss_over_ln2 {
+    // bpb = loss / ln(2): a loss of 1.0 is 1/log2(e) = 1.4427 bits per byte.
+    assert(bpb_from_loss(1.0) > 1.442);
+    assert(bpb_from_loss(1.0) < 1.443);
+    assert(bpb_from_loss(2.0) > 2.885);
+    assert(bpb_from_loss(2.0) < 2.886);
+    assert(bpb_from_loss(0.5) > 0.721);
+    assert(bpb_from_loss(0.5) < 0.722);
+}
+
+test simulate_step_flat_step0_decays_by_one_percent {
+    // Flat at step 0 and base LR: lr_factor = 1, schedule_factor = 1, so the
+    // loss decays by exactly the base rate 0.01, noiseless.
+    const loss: f32 = simulate_training_step(0, BASE_LR, 1.0, .Flat, 0.5);
+    assert(loss > 0.989);
+    assert(loss < 0.991);
+}
+
+test simulate_step_lr_factor_clamped_at_two {
+    // lr_factor = min(lr / BASE_LR, 2.0): triple the base LR still only doubles
+    // the decay, so the loss lands near 0.98, not 0.97.
+    const tripled: f32 = simulate_training_step(0, 0.0009, 1.0, .Flat, 0.5);
+    assert(tripled > 0.979);
+    assert(tripled < 0.981);
+    const at_base: f32 = simulate_training_step(0, BASE_LR, 1.0, .Flat, 0.5);
+    assert(tripled < at_base);
+}
+
+test simulate_step_floors_at_half {
+    // The loss floor: a loss at or below 0.5 comes back as exactly 0.5.
+    assert(simulate_training_step(0, BASE_LR, 0.5, .Flat, 0.5) == 0.5);
+    assert(simulate_training_step(400, BASE_LR, 0.4, .Flat, 0.5) == 0.5);
+}
+
+test simulate_step_noise_term_moves_result {
+    // The noise term is (noise - 0.5) * 0.001 around the deterministic value:
+    // the extreme draws move the loss by a thousandth, in opposite directions.
+    const base: f32 = simulate_training_step(0, BASE_LR, 1.0, .Flat, 0.5);
+    const low: f32 = simulate_training_step(0, BASE_LR, 1.0, .Flat, 0.0);
+    const high: f32 = simulate_training_step(0, BASE_LR, 1.0, .Flat, 1.0);
+    assert(low < base);
+    assert(high > base);
+    assert(high - low < 0.002);
+}
+
+test simulate_step_flat_plateaus_after_step_300 {
+    // Flat's schedule factor halves once step > 300, so the same loss decays
+    // less at step 301 than at step 300.
+    const at_300: f32 = simulate_training_step(300, BASE_LR, 1.0, .Flat, 0.5);
+    const at_301: f32 = simulate_training_step(301, BASE_LR, 1.0, .Flat, 0.5);
+    assert(at_300 > 0.989);
+    assert(at_300 < 0.991);
+    assert(at_301 > at_300);
+    assert(at_301 > 0.994);
+    assert(at_301 < 0.996);
+}
+
+test simulate_step_cosine_improves_with_progress {
+    // Cosine's schedule factor grows with step / MAX_STEPS (1.0 + 0.3 * p), so
+    // the same loss decays faster near the end of the run.
+    const early: f32 = simulate_training_step(0, BASE_LR, 1.0, .Cosine, 0.5);
+    const late: f32 = simulate_training_step(499, BASE_LR, 1.0, .Cosine, 0.5);
+    assert(early > 0.989);
+    assert(early < 0.991);
+    assert(late < early);
+    assert(late > 0.986);
+    assert(late < 0.988);
+}
+
+test simulate_step_phi_warmup_then_decay {
+    // PhiDecay holds the schedule factor at 1.0 through the first 100 steps
+    // (steps 99 and 100 update identically), then raises it toward 1.5.
+    const at_99: f32 = simulate_training_step(99, BASE_LR, 1.0, .PhiDecay, 0.5);
+    const at_100: f32 = simulate_training_step(100, BASE_LR, 1.0, .PhiDecay, 0.5);
+    assert(at_99 == at_100);
+    assert(at_99 > 0.989);
+    assert(at_99 < 0.991);
+    const at_499: f32 = simulate_training_step(499, BASE_LR, 1.0, .PhiDecay, 0.5);
+    assert(at_499 < at_99);
+    assert(at_499 > 0.984);
+    assert(at_499 < 0.986);
+}
+
+test lr_schedule_flat_is_constant_base_lr {
+    // "flat (constant 3e-4)": every step trains at BASE_LR.
+    assert(lr_schedule_54(.Flat, 0, MAX_STEPS) == BASE_LR);
+    assert(lr_schedule_54(.Flat, 250, MAX_STEPS) == BASE_LR);
+    assert(lr_schedule_54(.Flat, 499, MAX_STEPS) == BASE_LR);
+}
+
+test lr_schedule_cosine_anneals_base_lr_toward_zero {
+    // "cosine (3e-4 -> 0)": starts at BASE_LR, decreases, ends close to zero.
+    const first: f32 = lr_schedule_54(.Cosine, 0, MAX_STEPS);
+    assert(first == BASE_LR);
+    const mid: f32 = lr_schedule_54(.Cosine, 250, MAX_STEPS);
+    assert(mid < first);
+    assert(mid > 0.0);
+    const last: f32 = lr_schedule_54(.Cosine, 499, MAX_STEPS);
+    assert(last > 0.0);
+    assert(last < BASE_LR * 0.01);
+}
+
+test lr_schedule_phi_decays_base_lr_toward_alpha_phi {
+    // "phi_decay (3e-4 -> alpha_phi)": starts at BASE_LR and decays toward a
+    // positive floor (BASE_LR / phi), not toward zero.
+    const first: f32 = lr_schedule_54(.PhiDecay, 0, MAX_STEPS);
+    assert(first == BASE_LR);
+    const last: f32 = lr_schedule_54(.PhiDecay, 499, MAX_STEPS);
+    assert(last > BASE_LR * 0.5);
+    assert(last < first);
+}
+
+test flat_run_ends_at_floor_with_base_lr {
+    // The noiseless Flat run: the loss decays below the 0.5 floor long before
+    // step 500, so the run ends at the floor with BPB 0.5 / ln(2); every step
+    // trains at BASE_LR, so the final LR is BASE_LR.
+    const (bpb, loss, lr) = simulate_schedule(.Flat, 0.5);
+    assert(loss == 0.5);
+    assert(bpb > 0.721);
+    assert(bpb < 0.722);
+    assert(lr == BASE_LR);
+}
+
+test cosine_run_ends_at_floor_with_near_zero_lr {
+    // The noiseless cosine run reaches the floor too (its total decay over the
+    // 500 steps is far more than ln(10)) and ends with an LR close to zero.
+    const (bpb, loss, lr) = simulate_schedule(.Cosine, 0.5);
+    assert(loss == 0.5);
+    assert(bpb > 0.721);
+    assert(bpb < 0.722);
+    assert(lr > 0.0);
+    assert(lr < BASE_LR * 0.01);
+}
+
+test phi_run_ends_at_floor_with_positive_lr {
+    // The noiseless phi_decay run reaches the floor and ends with an LR above
+    // its positive alpha_phi floor.
+    const (bpb, loss, lr) = simulate_schedule(.PhiDecay, 0.5);
+    assert(loss == 0.5);
+    assert(bpb > 0.721);
+    assert(bpb < 0.722);
+    assert(lr > BASE_LR * 0.5);
+    assert(lr < BASE_LR);
+}
+
+test ranking_prefers_lowest_bpb {
+    // main() sorts by BPB ascending; rank 1 is the lowest BPB and carries the
+    // winner marker.
+    var bpbs: [3]f32 = [0.72, 0.65, 0.9];
+    assert(rank_of(&bpbs, 1) == 1);
+    assert(rank_of(&bpbs, 0) == 2);
+    assert(rank_of(&bpbs, 2) == 3);
+    assert(winner_status(rank_of(&bpbs, 1)) == "WINNER");
+    assert(winner_status(rank_of(&bpbs, 0)) == "");
+    assert(winner_status(rank_of(&bpbs, 2)) == "");
+}
+
+test ranking_breaks_ties_by_run_order {
+    // Rust's sort_by is stable: equal BPBs keep main()'s run order, so the
+    // earlier schedule takes the better rank.
+    var bpbs: [3]f32 = [0.5, 0.5, 0.5];
+    assert(rank_of(&bpbs, 0) == 1);
+    assert(rank_of(&bpbs, 1) == 2);
+    assert(rank_of(&bpbs, 2) == 3);
+}
+
+test result_at_collects_name_and_run {
+    // main() collects one ScheduleResult per schedule: the name it files the
+    // CSV and JSON entry under, plus run_schedule's (final_bpb, final_loss,
+    // final_lr).
+    const flat: ScheduleResult = result_at(0, 0.5);
+    assert(flat.name == "flat");
+    assert(flat.loss == 0.5);
+    assert(flat.lr == BASE_LR);
+    assert(flat.bpb > 0.721);
+    assert(flat.bpb < 0.722);
+    const phi: ScheduleResult = result_at(2, 0.5);
+    assert(phi.name == "phi_decay");
+    assert(phi.loss == 0.5);
+    assert(phi.lr < BASE_LR);
+    assert(phi.lr > 0.0);
+}
+
+test cos_taylor_known_values {
+    // The Taylor stand-in for cos: exact at 0, near 0 at pi/2, near -1 at pi.
+    assert(cos_taylor(0.0) == 1.0);
+    const half_pi: f32 = cos_taylor(1.5707963);
+    assert(abs_f(half_pi) < 0.001);
+    const at_pi: f32 = cos_taylor(3.14159265);
+    assert(abs_f(at_pi + 1.0) < 0.001);
+}
