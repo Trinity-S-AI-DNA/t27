@@ -1,0 +1,254 @@
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-02/src/chain_key_epoch_transition_timing_guard.rs @ 8b229e9489ee (272 lines).
+// Ring: CR-CHAT-02 (Wave-157 Lane A). Issue: gHashTag/t27#8882.
+// Domain: RATCHET — chain key epoch transitions must happen within a maximum
+// time window; delayed transitions expose messages to compromise
+// (compromise window, forward-secrecy gap, replay surface).
+// Anchor: `phi^2 + phi^-2 = 3 * TRINITY * CHAT * EPOCH-TIMELY`.
+//
+// Port decisions (t27):
+// * TransitionTimingError payloads (idx/delay_ms/max_ms/prev/got) are lowered
+//   to bare variants; the validator returns ?TransitionTimingError with null
+//   meaning Ok(()). Context is reconstructed in tests from the inputs.
+// * The BTreeSet<[u8; 16]> duplicate-ID tracker is replaced by a local
+//   seen-array with an O(n^2) membership scan (bounded by CKETT_MAX_TRANSITIONS).
+// * The u64::MAX delay sentinel for timestamp regression is kept implicit:
+//   ts < prev_ts reports DelayTooLarge directly (payload-free variant).
+// * u8 arrays are compared via a manual byte loop (eq16).
+
+module port::chain_key_epoch_transition_timing_guard;
+
+/// Maximum transition delay in milliseconds (30 minutes).
+pub const CKETT_MAX_DELAY_MS: u64 = 1_800_000;
+/// Maximum transitions per batch.
+pub const CKETT_MAX_TRANSITIONS: usize = 512;
+/// Transition ID length.
+pub const CKETT_TRANSITION_ID_LEN: usize = 16;
+
+/// An epoch transition timing record.
+pub struct TransitionTimingRecord {
+    transition_id: [16]u8,
+    epoch: u64,
+    timestamp_ms: u64,
+}
+
+/// All ways transition timing validation can fail.
+pub enum TransitionTimingError {
+    /// Delay exceeds maximum (or timestamps regress).
+    DelayTooLarge,
+    /// Epoch not strictly increasing.
+    NonMonotonicEpoch,
+    /// Zero transition ID.
+    ZeroTransitionId,
+    /// Duplicate transition ID.
+    DuplicateTransitionId,
+    /// Zero timestamp.
+    ZeroTimestamp,
+    /// Too many transitions in the batch.
+    TooMany,
+}
+
+/// `[VERIFIED]` Validate chain key epoch transition timing.
+/// Order of checks mirrors the Rust source: batch size, zero id,
+/// duplicate id, zero timestamp, epoch monotonicity, delay window.
+pub fn validate_transition_timing(transitions: []TransitionTimingRecord) -> ?TransitionTimingError {
+    if (transitions.len > CKETT_MAX_TRANSITIONS) {
+        return .TooMany;
+    }
+    var seen: [CKETT_MAX_TRANSITIONS][16]u8 = undefined;
+    var seen_len: usize = 0;
+    var has_prev_epoch = false;
+    var prev_epoch: u64 = 0;
+    var has_prev_ts = false;
+    var prev_ts: u64 = 0;
+    for (transitions) |t, i| {
+        if (all_zero16(t.transition_id)) {
+            return .ZeroTransitionId;
+        }
+        var j: usize = 0;
+        while (j < seen_len) {
+            if (eq16(seen[j], t.transition_id)) {
+                return .DuplicateTransitionId;
+            }
+            j += 1;
+        }
+        seen[seen_len] = t.transition_id;
+        seen_len += 1;
+        if (t.timestamp_ms == 0) {
+            return .ZeroTimestamp;
+        }
+        if (has_prev_epoch) {
+            if (t.epoch <= prev_epoch) {
+                return .NonMonotonicEpoch;
+            }
+        }
+        if (has_prev_ts) {
+            if (t.timestamp_ms < prev_ts) {
+                return .DelayTooLarge;
+            }
+            const delay = t.timestamp_ms - prev_ts;
+            if (delay > CKETT_MAX_DELAY_MS) {
+                return .DelayTooLarge;
+            }
+        }
+        prev_epoch = t.epoch;
+        has_prev_epoch = true;
+        prev_ts = t.timestamp_ms;
+        has_prev_ts = true;
+    }
+    return null;
+}
+
+fn all_zero16(id: [16]u8) bool {
+    var idx: usize = 0;
+    while (idx < CKETT_TRANSITION_ID_LEN) {
+        if (id[idx] != 0) {
+            return false;
+        }
+        idx += 1;
+    }
+    return true;
+}
+
+fn eq16(a: [16]u8, b: [16]u8) bool {
+    var idx: usize = 0;
+    while (idx < CKETT_TRANSITION_ID_LEN) {
+        if (a[idx] != b[idx]) {
+            return false;
+        }
+        idx += 1;
+    }
+    return true;
+}
+
+// ---- Tests CKETT-01..10 (ported from mod tests) ----
+
+fn tid(byte: u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    var idx: usize = 0;
+    while (idx < CKETT_TRANSITION_ID_LEN) {
+        out[idx] = byte;
+        idx += 1;
+    }
+    return out;
+}
+
+fn trans(id: u8, epoch: u64, ts: u64) TransitionTimingRecord {
+    return .{ .transition_id = tid(id), .epoch = epoch, .timestamp_ms = ts };
+}
+
+/// **CKETT-01** — delay too large rejected.
+test ckett_01_delay_too_large_rejected {
+    var ts: [2]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 1, 1_000_000);
+    ts[1] = trans(0x02, 2, 1_000_000 + CKETT_MAX_DELAY_MS + 1);
+    const result = validate_transition_timing(&ts);
+    assert(result == .DelayTooLarge);
+}
+
+/// **CKETT-02** — non-monotonic epoch rejected.
+test ckett_02_non_monotonic_rejected {
+    var ts: [2]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 2, 1_000_000);
+    ts[1] = trans(0x02, 1, 1_200_000);
+    const result = validate_transition_timing(&ts);
+    assert(result == .NonMonotonicEpoch);
+}
+
+/// **CKETT-03** — zero transition ID rejected.
+test ckett_03_zero_id_rejected {
+    var ts: [1]TransitionTimingRecord = undefined;
+    ts[0] = trans(0, 1, 1_000_000);
+    const result = validate_transition_timing(&ts);
+    assert(result == .ZeroTransitionId);
+}
+
+/// **CKETT-04** — duplicate transition ID rejected.
+test ckett_04_duplicate_rejected {
+    var ts: [2]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 1, 1_000_000);
+    ts[1] = trans(0x01, 2, 1_200_000);
+    const result = validate_transition_timing(&ts);
+    assert(result == .DuplicateTransitionId);
+}
+
+/// **CKETT-05** — zero timestamp rejected.
+test ckett_05_zero_ts_rejected {
+    var ts: [1]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 1, 0);
+    const result = validate_transition_timing(&ts);
+    assert(result == .ZeroTimestamp);
+}
+
+/// **CKETT-06** — too many transitions rejected (batch bound).
+test ckett_06_too_many_rejected {
+    var ts: [CKETT_MAX_TRANSITIONS + 1]TransitionTimingRecord = undefined;
+    var i: usize = 0;
+    while (i <= CKETT_MAX_TRANSITIONS) {
+        const val: u64 = @intCast(i + 1);
+        var id: [16]u8 = undefined;
+        var k: usize = 0;
+        while (k < CKETT_TRANSITION_ID_LEN) {
+            id[k] = 0;
+            k += 1;
+        }
+        id[0] = @intCast((val / 256) % 256);
+        id[1] = @intCast(val % 256);
+        ts[i] = .{ .transition_id = id, .epoch = val, .timestamp_ms = val * 100_000 };
+        i += 1;
+    }
+    const result = validate_transition_timing(&ts);
+    assert(result == .TooMany);
+}
+
+/// **CKETT-07** — valid transition sequence accepted.
+test ckett_07_valid_accepted {
+    var ts: [3]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 1, 1_000_000);
+    ts[1] = trans(0x02, 2, 1_200_000);
+    ts[2] = trans(0x03, 3, 1_500_000);
+    const result = validate_transition_timing(&ts);
+    assert(result == null);
+}
+
+/// **CKETT-08** — empty batch accepted.
+test ckett_08_empty_accepted {
+    var empty: [0]TransitionTimingRecord = undefined;
+    const result = validate_transition_timing(&empty);
+    assert(result == null);
+}
+
+/// **CKETT-09** — boundary delay (exactly the max window) accepted.
+test ckett_09_boundary_delay_accepted {
+    var ts: [2]TransitionTimingRecord = undefined;
+    ts[0] = trans(0x01, 1, 1_000_000);
+    ts[1] = trans(0x02, 2, 1_000_000 + CKETT_MAX_DELAY_MS);
+    const result = validate_transition_timing(&ts);
+    assert(result == null);
+}
+
+/// **CKETT-10** — many timely transitions accepted.
+test ckett_10_many_timely_accepted {
+    var ts: [20]TransitionTimingRecord = undefined;
+    var i: usize = 0;
+    while (i < 20) {
+        const id_byte: u8 = @intCast(i + 1);
+        const epoch: u64 = @intCast(i + 1);
+        ts[i] = trans(id_byte, epoch, 1_000_000 + @as(u64, @intCast(i)) * 50_000);
+        i += 1;
+    }
+    const result = validate_transition_timing(&ts);
+    assert(result == null);
+}
+
+pub fn main() void {
+    ckett_01_delay_too_large_rejected();
+    ckett_02_non_monotonic_rejected();
+    ckett_03_zero_id_rejected();
+    ckett_04_duplicate_rejected();
+    ckett_05_zero_ts_rejected();
+    ckett_06_too_many_rejected();
+    ckett_07_valid_accepted();
+    ckett_08_empty_accepted();
+    ckett_09_boundary_delay_accepted();
+    ckett_10_many_timely_accepted();
+}

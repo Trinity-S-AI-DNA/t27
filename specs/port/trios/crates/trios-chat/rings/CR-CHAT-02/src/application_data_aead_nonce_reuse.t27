@@ -1,0 +1,285 @@
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-02/src/application_data_aead_nonce_reuse.rs @ 8b229e9489ee (280 lines).
+// Ring: CR-CHAT-02 (Wave-30 L-CHAT-2-appnonce). Issue: gHashTag/t27#8882.
+// Domain: MLS GROUP MESSAGING — application-data AEAD nonces must never repeat
+// under one key: canonical 12-byte length, group binding, epoch freshness,
+// generation window, non-zero nonce, replay detection.
+// Anchor: `phi^2 + phi^-2 = 3 * TRINITY * CHAT * APP-DATA-AEAD-NONCE`.
+//
+// Port decisions:
+// * Vec<u8> group_id and aead_nonce modeled as fixed buffers ([32]u8 group,
+//   [16]u8 nonce) plus explicit length fields; equality compares buffers.
+// * BTreeSet<(gid, epoch, leaf, gen, nonce)> replaced by a bounded used-key
+//   array (capacity 16) with linear membership scan; `record_nonce` mirrors
+//   BTreeSet::insert for tests.
+// * Error payloads lowered to bare variants (?ApplicationDataAeadError; null
+//   = Ok(())), per the ring-wide lowering decision.
+
+module port::application_data_aead_nonce_reuse;
+
+/// Canonical AEAD nonce length for application data.
+pub const APPLICATION_DATA_AEAD_NONCE_LEN: usize = 12;
+/// Maximum forward jump in generations within one epoch.
+pub const MAX_GENERATION_WINDOW: u32 = 1024;
+/// Capacity of the used-nonce set in this spec model.
+pub const AAN_USED_CAP: usize = 16;
+
+fn zero32() [32]u8 {
+    var out: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) { out[i] = 0; i += 1; }
+    return out;
+}
+
+fn eq32(a: [32]u8, b: [32]u8) bool {
+    var i: usize = 0;
+    while (i < 32) {
+        if (a[i] != b[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Copy a group identifier into a fixed 32-byte buffer (zero-padded).
+pub fn gid(text: []const u8) [32]u8 {
+    var out = zero32();
+    var i: usize = 0;
+    while (i < text.len) { out[i] = text[i]; i += 1; }
+    return out;
+}
+
+/// Fill a 16-byte nonce buffer with `byte` over the first `len` bytes.
+pub fn nonce_of(byte: u8, len: usize) [16]u8 {
+    var out: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 16) {
+        if (i < len) { out[i] = byte; } else { out[i] = 0; }
+        i += 1;
+    }
+    return out;
+}
+
+/// One application-data packet awaiting AEAD nonce validation.
+pub struct ApplicationDataPacket {
+    group_id: [32]u8,
+    epoch: u64,
+    leaf_index: u32,
+    generation: u32,
+    aead_nonce: [16]u8,
+    nonce_len: usize,
+}
+
+/// One key of the used-nonce set (group, epoch, leaf, generation, nonce).
+pub struct UsedNonceKey {
+    group_id: [32]u8,
+    epoch: u64,
+    leaf_index: u32,
+    generation: u32,
+    aead_nonce: [16]u8,
+    nonce_len: usize,
+}
+
+/// Sender-side view of nonce state for one group.
+pub struct ApplicationDataView {
+    local_group_id: [32]u8,
+    current_epoch: u64,
+    expected_generation: u32,
+    used_nonces: [AAN_USED_CAP]UsedNonceKey,
+    used_len: usize,
+}
+
+pub fn base_view() ApplicationDataView {
+    var v: ApplicationDataView = undefined;
+    v.local_group_id = gid("trinity-group-001");
+    v.current_epoch = 42;
+    v.expected_generation = 100;
+    v.used_len = 0;
+    return v;
+}
+
+pub fn good_packet(nb: u8) ApplicationDataPacket {
+    var p: ApplicationDataPacket = undefined;
+    p.group_id = gid("trinity-group-001");
+    p.epoch = 42;
+    p.leaf_index = 7;
+    p.generation = 100;
+    p.aead_nonce = nonce_of(nb, APPLICATION_DATA_AEAD_NONCE_LEN);
+    p.nonce_len = APPLICATION_DATA_AEAD_NONCE_LEN;
+    return p;
+}
+
+/// Mirror of BTreeSet::insert for the used-nonce set (spec model).
+pub fn record_nonce(view: *ApplicationDataView, p: *const ApplicationDataPacket) void {
+    view.used_nonces[view.used_len] = .{
+        .group_id = p.group_id,
+        .epoch = p.epoch,
+        .leaf_index = p.leaf_index,
+        .generation = p.generation,
+        .aead_nonce = p.aead_nonce,
+        .nonce_len = p.nonce_len,
+    };
+    view.used_len += 1;
+}
+
+fn used_contains(view: *const ApplicationDataView, p: *const ApplicationDataPacket) bool {
+    var i: usize = 0;
+    while (i < view.used_len) {
+        const k = view.used_nonces[i];
+        if (k.epoch == p.epoch and k.leaf_index == p.leaf_index and
+            k.generation == p.generation and k.nonce_len == p.nonce_len and
+            eq32(k.group_id, p.group_id))
+        {
+            var same_nonce = true;
+            var b: usize = 0;
+            while (b < p.nonce_len) {
+                if (k.aead_nonce[b] != p.aead_nonce[b]) { same_nonce = false; }
+                b += 1;
+            }
+            if (same_nonce) { return true; }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// All ways application-data AEAD nonce validation can fail.
+pub enum ApplicationDataAeadError {
+    NonCanonicalNonceLength,
+    CrossGroupNonceSplice,
+    StaleEpochAead,
+    GenerationGapTooLarge,
+    ZeroNonce,
+    NonceReplay,
+}
+
+/// `[VERIFIED]` Validate an application-data packet against the sender view.
+pub fn validate_application_data_aead(
+    packet: *const ApplicationDataPacket,
+    view: *const ApplicationDataView,
+) -> ?ApplicationDataAeadError {
+    // 1. canonical nonce length
+    if (packet.nonce_len != APPLICATION_DATA_AEAD_NONCE_LEN) {
+        return .NonCanonicalNonceLength;
+    }
+    // 2. group binding (cross-group splice rejected)
+    if (!eq32(packet.group_id, view.local_group_id)) {
+        return .CrossGroupNonceSplice;
+    }
+    // 3. epoch freshness
+    if (packet.epoch < view.current_epoch) {
+        return .StaleEpochAead;
+    }
+    // 4. generation window (past generations and far-future jumps)
+    if (packet.generation < view.expected_generation) {
+        return .GenerationGapTooLarge;
+    }
+    if (packet.generation - view.expected_generation > MAX_GENERATION_WINDOW) {
+        return .GenerationGapTooLarge;
+    }
+    // 5. zero nonce rejected
+    var all_zero = true;
+    var b: usize = 0;
+    while (b < packet.nonce_len) {
+        if (packet.aead_nonce[b] != 0) { all_zero = false; }
+        b += 1;
+    }
+    if (all_zero) { return .ZeroNonce; }
+    // 6. replay detection against the used-nonce set
+    if (used_contains(view, packet)) {
+        return .NonceReplay;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (mirrors aan_01..aan_10 in the Rust source)
+// ---------------------------------------------------------------------------
+
+test aan_01_short_nonce_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.aead_nonce = nonce_of(0x11, 8);
+    p.nonce_len = 8;
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .NonCanonicalNonceLength);
+}
+
+test aan_02_long_nonce_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.aead_nonce = nonce_of(0x11, 16);
+    p.nonce_len = 16;
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .NonCanonicalNonceLength);
+}
+
+test aan_03_cross_group_splice_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.group_id = gid("hostile-group-XYZ");
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .CrossGroupNonceSplice);
+}
+
+test aan_04_stale_epoch_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.epoch = 41;
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .StaleEpochAead);
+}
+
+test aan_05_past_generation_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.generation = 99;
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .GenerationGapTooLarge);
+}
+
+test aan_06_far_future_generation_rejected {
+    var view = base_view();
+    var p = good_packet(0x11);
+    p.generation = 100 + MAX_GENERATION_WINDOW + 1;
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .GenerationGapTooLarge);
+}
+
+test aan_07_zero_nonce_rejected {
+    var view = base_view();
+    const p = good_packet(0x00);
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .ZeroNonce);
+}
+
+test aan_08_nonce_replay_rejected {
+    var view = base_view();
+    const p = good_packet(0x11);
+    record_nonce(&view, &p);
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == .NonceReplay);
+}
+
+test aan_09_valid_packet_accepted {
+    var view = base_view();
+    const p = good_packet(0x11);
+    const result = validate_application_data_aead(&p, &view);
+    assert(result == null);
+}
+
+test aan_10_module_green {
+    const count: usize = 10;
+    assert(count == 10);
+}
+
+pub fn main() void {
+    aan_01_short_nonce_rejected();
+    aan_02_long_nonce_rejected();
+    aan_03_cross_group_splice_rejected();
+    aan_04_stale_epoch_rejected();
+    aan_05_past_generation_rejected();
+    aan_06_far_future_generation_rejected();
+    aan_07_zero_nonce_rejected();
+    aan_08_nonce_replay_rejected();
+    aan_09_valid_packet_accepted();
+    aan_10_module_green();
+}

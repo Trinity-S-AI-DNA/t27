@@ -1,0 +1,283 @@
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-02/src/sender_data_header_encryption.rs @ 8b229e9489ee (298 lines).
+// Ring: CR-CHAT-02 (Wave-72 Lane B). Issue: gHashTag/t27#8882.
+// Domain: MLS HANDSHAKE — encrypted sender-data headers must bind to the
+// local group, current epoch, canonical nonce length, non-truncated
+// ciphertext, zero reserved byte, and never reuse a nonce.
+// Anchor: `φ² + φ⁻² = 3 · TRINITY · CHAT · MLS-HEADER-ENCRYPTION`.
+//
+// Port decisions:
+// * SenderDataHeaderError payloads lowered to bare variants
+//   (?SenderDataHeaderError; null = Ok(())), per the ring-wide lowering
+//   decision.
+// * Vec<u8> fields lowered to fixed buffers: nonce 16 bytes + len (covers
+//   the 8-, 12-, and 16-byte test forms), ciphertext 32 bytes + len (covers
+//   empty, 8-byte, and 32-byte forms), group_id 32 bytes, per the ring-wide
+//   fixed-buffer decision.
+// * BTreeSet<(Vec<u8>, u64, Vec<u8>)> replaced by a fixed-cap used-nonce
+//   table with an O(n) membership scan.
+// * ContentType kept as a bare-variant enum; decision order preserved:
+//   canonical nonce length, group binding, epoch binding, ciphertext
+//   length, reserved byte, nonce reuse.
+
+module port::sender_data_header_encryption;
+
+/// Canonical sender-data nonce length.
+pub const SENDER_DATA_NONCE_LEN: usize = 12;
+
+/// Minimum sender-data ciphertext length.
+pub const MIN_SENDER_DATA_CT_LEN: usize = 16;
+
+/// Maximum modeled nonce length (holds the overlong 16-byte form).
+pub const SENDER_DATA_NONCE_MAX_LEN: usize = 16;
+
+/// Group identifier length used by the model.
+pub const SDH_GROUP_ID_LEN: usize = 32;
+
+/// Ciphertext buffer length used by the model.
+pub const SDH_CT_BUF_LEN: usize = 32;
+
+/// Maximum tracked used nonces.
+pub const SDH_MAX_USED_NONCES: usize = 64;
+
+pub enum ContentType {
+    Application,
+    Proposal,
+    Commit,
+}
+
+pub struct SenderDataAad {
+    group_id: [SDH_GROUP_ID_LEN]u8,
+    epoch: u64,
+    content_type: ContentType,
+    reserved: u8,
+}
+
+pub struct EncryptedSenderData {
+    sender_data_nonce: [SENDER_DATA_NONCE_MAX_LEN]u8,
+    nonce_len: usize,
+    sender_data_ciphertext: [SDH_CT_BUF_LEN]u8,
+    ct_len: usize,
+    sender_data_aad: SenderDataAad,
+}
+
+pub struct UsedNonce {
+    group_id: [SDH_GROUP_ID_LEN]u8,
+    epoch: u64,
+    nonce: [SENDER_DATA_NONCE_MAX_LEN]u8,
+    nonce_len: usize,
+}
+
+pub struct SenderDataView {
+    local_group_id: [SDH_GROUP_ID_LEN]u8,
+    current_epoch: u64,
+    used_nonces: [SDH_MAX_USED_NONCES]UsedNonce,
+    used_count: usize,
+}
+
+pub enum SenderDataHeaderError {
+    NonCanonicalNonceLength,
+    CrossGroupAadSplice,
+    StaleEpochSenderData,
+    TruncatedCiphertext,
+    ReservedBitForge,
+    NonceReuse,
+}
+
+pub fn buf(byte: u8, len: usize) [SDH_GROUP_ID_LEN]u8 {
+    var out: [SDH_GROUP_ID_LEN]u8 = undefined;
+    var i: usize = 0;
+    while (i < SDH_GROUP_ID_LEN) {
+        if (i < len) { out[i] = byte; } else { out[i] = 0; }
+        i += 1;
+    }
+    return out;
+}
+
+pub fn good_view() SenderDataView {
+    return .{
+        .local_group_id = buf(0xAA, 32),
+        .current_epoch = 7,
+        .used_nonces = undefined,
+        .used_count = 0,
+    };
+}
+
+pub fn good_header() EncryptedSenderData {
+    var nonce: [SENDER_DATA_NONCE_MAX_LEN]u8 = undefined;
+    var i: usize = 0;
+    while (i < SENDER_DATA_NONCE_MAX_LEN) {
+        if (i < SENDER_DATA_NONCE_LEN) { nonce[i] = 0x11; } else { nonce[i] = 0; }
+        i += 1;
+    }
+    var ct: [SDH_CT_BUF_LEN]u8 = undefined;
+    i = 0;
+    while (i < SDH_CT_BUF_LEN) { ct[i] = 0x22; i += 1; }
+    return .{
+        .sender_data_nonce = nonce,
+        .nonce_len = SENDER_DATA_NONCE_LEN,
+        .sender_data_ciphertext = ct,
+        .ct_len = 32,
+        .sender_data_aad = .{
+            .group_id = buf(0xAA, 32),
+            .epoch = 7,
+            .content_type = .Application,
+            .reserved = 0,
+        },
+    };
+}
+
+fn eq_bytes(a: [SDH_GROUP_ID_LEN]u8, a_len: usize, b: [SDH_GROUP_ID_LEN]u8, b_len: usize) bool {
+    if (a_len != b_len) { return false; }
+    var i: usize = 0;
+    while (i < a_len) {
+        if (a[i] != b[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// `[VERIFIED]` Validate an encrypted sender-data header against the local view.
+pub fn validate_sender_data_header(
+    header: EncryptedSenderData,
+    view: SenderDataView,
+) -> ?SenderDataHeaderError {
+    // 1. canonical nonce length
+    if (header.nonce_len != SENDER_DATA_NONCE_LEN) {
+        return .NonCanonicalNonceLength;
+    }
+    // 2. group binding
+    if (!eq_bytes(
+        header.sender_data_aad.group_id,
+        SDH_GROUP_ID_LEN,
+        view.local_group_id,
+        SDH_GROUP_ID_LEN,
+    )) {
+        return .CrossGroupAadSplice;
+    }
+    // 3. epoch binding
+    if (header.sender_data_aad.epoch != view.current_epoch) {
+        return .StaleEpochSenderData;
+    }
+    // 4. non-truncated ciphertext
+    if (header.ct_len < MIN_SENDER_DATA_CT_LEN) {
+        return .TruncatedCiphertext;
+    }
+    // 5. reserved byte must be zero
+    if (header.sender_data_aad.reserved != 0) {
+        return .ReservedBitForge;
+    }
+    // 6. nonce must not already be used
+    var i: usize = 0;
+    while (i < view.used_count) {
+        const used = view.used_nonces[i];
+        if (used.epoch == header.sender_data_aad.epoch
+            and used.nonce_len == header.nonce_len
+            and eq_bytes(used.group_id, SDH_GROUP_ID_LEN, header.sender_data_aad.group_id, SDH_GROUP_ID_LEN)) {
+            var same = true;
+            var j: usize = 0;
+            while (j < used.nonce_len) {
+                if (used.nonce[j] != header.sender_data_nonce[j]) { same = false; }
+                j += 1;
+            }
+            if (same) {
+                return .NonceReuse;
+            }
+        }
+        i += 1;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (mirrors sdh_01..sdh_10 in the Rust source)
+// ---------------------------------------------------------------------------
+
+test sdh_01_short_nonce_rejected {
+    var h = good_header();
+    h.nonce_len = 8;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .NonCanonicalNonceLength);
+}
+
+test sdh_02_overlong_nonce_rejected {
+    var h = good_header();
+    h.nonce_len = 16;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .NonCanonicalNonceLength);
+}
+
+test sdh_03_cross_group_aad_splice_rejected {
+    var h = good_header();
+    h.sender_data_aad.group_id = buf(0xBB, 32);
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .CrossGroupAadSplice);
+}
+
+test sdh_04_past_epoch_rejected {
+    var h = good_header();
+    h.sender_data_aad.epoch = 5;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .StaleEpochSenderData);
+}
+
+test sdh_05_future_epoch_rejected {
+    var h = good_header();
+    h.sender_data_aad.epoch = 99;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .StaleEpochSenderData);
+}
+
+test sdh_06_truncated_ciphertext_rejected {
+    var h = good_header();
+    h.ct_len = 8;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .TruncatedCiphertext);
+}
+
+test sdh_07_empty_ciphertext_rejected {
+    var h = good_header();
+    h.ct_len = 0;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .TruncatedCiphertext);
+}
+
+test sdh_08_reserved_bit_forge_rejected {
+    var h = good_header();
+    h.sender_data_aad.reserved = 0x80;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == .ReservedBitForge);
+}
+
+test sdh_09_nonce_reuse_rejected {
+    var view = good_view();
+    const h = good_header();
+    view.used_nonces[0] = .{
+        .group_id = h.sender_data_aad.group_id,
+        .epoch = h.sender_data_aad.epoch,
+        .nonce = h.sender_data_nonce,
+        .nonce_len = h.nonce_len,
+    };
+    view.used_count = 1;
+    const result = validate_sender_data_header(h, view);
+    assert(result == .NonceReuse);
+}
+
+test sdh_10_valid_proposal_header_accepted {
+    var h = good_header();
+    h.sender_data_aad.content_type = .Proposal;
+    const result = validate_sender_data_header(h, good_view());
+    assert(result == null);
+}
+
+pub fn main() void {
+    sdh_01_short_nonce_rejected();
+    sdh_02_overlong_nonce_rejected();
+    sdh_03_cross_group_aad_splice_rejected();
+    sdh_04_past_epoch_rejected();
+    sdh_05_future_epoch_rejected();
+    sdh_06_truncated_ciphertext_rejected();
+    sdh_07_empty_ciphertext_rejected();
+    sdh_08_reserved_bit_forge_rejected();
+    sdh_09_nonce_reuse_rejected();
+    sdh_10_valid_proposal_header_accepted();
+}

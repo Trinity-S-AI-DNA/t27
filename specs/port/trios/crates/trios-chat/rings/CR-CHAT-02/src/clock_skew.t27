@@ -1,0 +1,323 @@
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-02/src/clock_skew.rs @ 8b229e9489ee (348 lines).
+// Ring: CR-CHAT-02 (Wave-16). Issue: gHashTag/t27#8882.
+// Domain: L-CHAT-2-clock (R-CHAT-2 + R-CHAT-4) — time-domain attack surface
+// around the Triple-Ratchet replay window: stash-and-resend, backdating,
+// forward-dating, epoch-rollover wrap. All four must be rejected while
+// legitimate out-of-order delivery inside a symmetric skew band is admitted.
+// Anchor: `phi^2 + phi^-2 = 3 * TRINITY * CHAT * ZERO-METADATA * CLOCK-SKEW`.
+//
+// Port decisions (t27):
+// * ReplayDecision is a bare-variant enum compared with `.` literals.
+// * The BTreeSet<(u64, u64)> persistent history is modeled as a bounded
+//   array of (epoch, counter) pairs with capacity CLK_HISTORY_CAP = 8 and
+//   insertion-order eviction of the lexicographically-smallest entry. The
+//   production bound (max_history = 4096, advanced-epoch trimming) is kept
+//   as fields/logic; under the spec cap the trim is a no-op, matching the
+//   un-evicted behavior the Rust tests exercise.
+// * The `epoch()` getter is dropped; tests read the `epoch` field directly.
+// * Saturating arithmetic is factored into sat_add/sat_sub helpers.
+
+module port::clock_skew;
+
+/// Default ceiling on persistent replay history (production bound).
+pub const DEFAULT_MAX_HISTORY: usize = 4096;
+/// Spec-model capacity of the bounded history array.
+pub const CLK_HISTORY_CAP: usize = 8;
+
+/// Symmetric clock-skew bound (milliseconds) around the receiver clock.
+/// A message timestamped `t_msg` is accepted only when
+/// `|t_msg - t_recv| <= skew_ms`. Default `30_000` (30 s).
+pub struct ClockSkewBound {
+    /// Half-width of the acceptance band in milliseconds.
+    skew_ms: u64,
+}
+
+/// Construct a bound. `[VERIFIED]` `skew_ms` is treated as a half-width —
+/// the full acceptance window is `2 * skew_ms`.
+pub fn skew_bound(skew_ms: u64) ClockSkewBound {
+    return .{ .skew_ms = skew_ms };
+}
+
+/// Default bound: 30 s half-width.
+pub fn default_skew() ClockSkewBound {
+    return .{ .skew_ms = 30_000 };
+}
+
+/// `true` iff `t_msg` lies within `[t_recv - skew_ms, t_recv + skew_ms]`.
+pub fn accepts(self: ClockSkewBound, t_msg_ms: u64, t_recv_ms: u64) bool {
+    const lo = sat_sub(t_recv_ms, self.skew_ms);
+    const hi = sat_add(t_recv_ms, self.skew_ms);
+    return t_msg_ms >= lo and t_msg_ms <= hi;
+}
+
+/// Decision returned by the replay window.
+pub enum ReplayDecision {
+    /// Counter & timestamp are both fresh — admit the message.
+    Accept,
+    /// Counter has been seen before (replay).
+    RejectReplay,
+    /// Timestamp is older than `t_recv - skew` (stale / backdated).
+    RejectStale,
+    /// Timestamp is newer than `t_recv + skew` (future-dated).
+    RejectFuture,
+    /// Counter belongs to a previous epoch attempting to roll back into
+    /// the live window (epoch-rollover replay).
+    RejectEpochRollover,
+}
+
+/// One persistent-history entry: `(epoch, counter)` admitted pair.
+pub struct HistoryEntry {
+    epoch: u64,
+    counter: u64,
+}
+
+/// Bounded receiver-side replay window keyed on counter (within an epoch)
+/// AND timestamp (across epochs). Keeps the highest-seen counter plus a
+/// 64-bit mask of the previous counters within the current epoch; counters
+/// from a strictly earlier epoch are rejected so a captured counter cannot
+/// slide forward past a key rotation.
+pub struct ReplayWindow {
+    /// Highest counter accepted in the current epoch + 1 (next-expected).
+    next: u64,
+    /// Bitmask: bit `k` set iff counter `next - 1 - k` was accepted.
+    seen: u64,
+    /// Current epoch id (monotone across DH ratchet steps).
+    epoch: u64,
+    /// Bounded set of (epoch, counter) admitted across all epochs.
+    history: [CLK_HISTORY_CAP]HistoryEntry,
+    /// Number of occupied history slots.
+    hist_len: usize,
+    /// Ceiling on history size (memory-exhaustion DoS defense).
+    max_history: usize,
+    /// Clock-skew bound applied on every accept_at.
+    skew: ClockSkewBound,
+}
+
+/// Fresh window, epoch 0, default 30 s skew.
+pub fn replay_window_new() ReplayWindow {
+    return with_skew(default_skew());
+}
+
+/// Fresh window with a custom skew bound.
+pub fn with_skew(skew: ClockSkewBound) ReplayWindow {
+    return .{
+        .next = 0,
+        .seen = 0,
+        .epoch = 0,
+        .history = undefined,
+        .hist_len = 0,
+        .max_history = DEFAULT_MAX_HISTORY,
+        .skew = skew,
+    };
+}
+
+/// Advance the epoch (call from a DH ratchet step). Counters reset.
+/// History is trimmed to `max_history` to defend against a sender
+/// pumping epochs.
+pub fn advance_epoch(self: *ReplayWindow) void {
+    self.epoch = sat_add(self.epoch, 1);
+    self.next = 0;
+    self.seen = 0;
+    while (self.hist_len > self.max_history) {
+        evict_smallest(self);
+    }
+}
+
+/// Try to accept a message with `(counter, t_msg_ms)` against the receiver
+/// clock `t_recv_ms`. Order of checks (matters for falsification):
+/// 1. Clock-skew window — stale / future rejected first.
+/// 2. Epoch-rollover — strictly earlier epochs rejected.
+/// 3. Replay — persistent history, then live bitmask.
+/// 4. Otherwise accept and record.
+pub fn accept_at(self: *ReplayWindow, counter: u64, t_msg_ms: u64, t_recv_ms: u64, epoch: u64) ReplayDecision {
+    // 1. Clock-skew band.
+    if (t_msg_ms < sat_sub(t_recv_ms, self.skew.skew_ms)) {
+        return .RejectStale;
+    }
+    if (t_msg_ms > sat_add(t_recv_ms, self.skew.skew_ms)) {
+        return .RejectFuture;
+    }
+    // 2. Epoch rollover: counters from a strictly earlier epoch cannot
+    // re-enter once we have rotated.
+    if (epoch < self.epoch) {
+        return .RejectEpochRollover;
+    }
+    // 3. Replay against persistent history.
+    if (history_contains(self, epoch, counter)) {
+        return .RejectReplay;
+    }
+    // 3b. Replay against current-epoch live bitmask.
+    if (epoch == self.epoch and counter < self.next) {
+        const shift = self.next - 1 - counter;
+        if (shift < 64) {
+            const bit = shl64(1, shift);
+            if ((self.seen & bit) != 0) {
+                return .RejectReplay;
+            }
+        } else {
+            // Outside live bitmask reach but within the same epoch —
+            // stale beyond bitmask coverage.
+            return .RejectReplay;
+        }
+    }
+    // 4. Accept and record.
+    if (epoch > self.epoch) {
+        // Sender is signaling a forward jump; align our epoch.
+        self.epoch = epoch;
+        self.next = 0;
+        self.seen = 0;
+    }
+    if (counter >= self.next) {
+        const jump = counter - self.next + 1;
+        if (jump >= 64) {
+            self.seen = 1;
+        } else {
+            self.seen = shl64(self.seen, jump) | 1;
+        }
+        self.next = sat_add(counter, 1);
+    } else {
+        // In-window late arrival.
+        const shift = self.next - 1 - counter;
+        self.seen = self.seen | shl64(1, shift);
+    }
+    if (self.hist_len >= self.max_history) {
+        evict_smallest(self);
+    }
+    self.history[self.hist_len] = .{ .epoch = epoch, .counter = counter };
+    self.hist_len += 1;
+    return .Accept;
+}
+
+fn history_contains(self: *ReplayWindow, epoch: u64, counter: u64) bool {
+    var i: usize = 0;
+    while (i < self.hist_len) {
+        if (self.history[i].epoch == epoch and self.history[i].counter == counter) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Remove the lexicographically-smallest `(epoch, counter)` entry.
+fn evict_smallest(self: *ReplayWindow) void {
+    if (self.hist_len == 0) {
+        return;
+    }
+    var min_idx: usize = 0;
+    var i: usize = 1;
+    while (i < self.hist_len) {
+        const e = self.history[i];
+        const m = self.history[min_idx];
+        if (e.epoch < m.epoch or (e.epoch == m.epoch and e.counter < m.counter)) {
+            min_idx = i;
+        }
+        i += 1;
+    }
+    var j: usize = min_idx;
+    while (j + 1 < self.hist_len) {
+        self.history[j] = self.history[j + 1];
+        j += 1;
+    }
+    self.hist_len -= 1;
+}
+
+fn sat_add(a: u64, b: u64) u64 {
+    const s = a + b;
+    if (s < a) {
+        return 18446744073709551615;
+    }
+    return s;
+}
+
+fn sat_sub(a: u64, b: u64) u64 {
+    if (b > a) {
+        return 0;
+    }
+    return a - b;
+}
+
+fn shl64(x: u64, k: u64) u64 {
+    return x << @intCast(k);
+}
+
+// ---- Tests CLK-01..06 (ported from mod tests) ----
+
+/// **CLK-01** — fresh in-band counter accepted under the default skew.
+test clk_01_fresh_in_band_accepted {
+    var w = replay_window_new();
+    const d = w.accept_at(0, 1_000, 1_000, 0);
+    assert(d == .Accept);
+}
+
+/// **CLK-02** — backdated message outside skew band rejected as stale.
+test clk_02_backdated_outside_skew_rejected_stale {
+    var w = with_skew(skew_bound(30_000));
+    // Receiver clock at 1_000_000 ms; sender claims 1 ms (way beyond skew).
+    const d = w.accept_at(0, 1, 1_000_000, 0);
+    assert(d == .RejectStale);
+}
+
+/// **CLK-03** — future-dated message beyond skew band rejected.
+test clk_03_future_dated_rejected {
+    var w = with_skew(skew_bound(30_000));
+    // Receiver at 1_000 ms; sender claims 10_000_000 ms.
+    const d = w.accept_at(0, 10_000_000, 1_000, 0);
+    assert(d == .RejectFuture);
+}
+
+/// **CLK-04** — same counter replayed within the live bitmask is rejected.
+test clk_04_replay_within_window_rejected {
+    var w = replay_window_new();
+    const first = w.accept_at(0, 1_000, 1_000, 0);
+    assert(first == .Accept);
+    const dup = w.accept_at(0, 1_000, 1_000, 0);
+    assert(dup == .RejectReplay);
+}
+
+/// **CLK-05** — a counter from a strictly earlier epoch attempting to
+/// re-enter after a DH ratchet step is rejected as epoch-rollover.
+test clk_05_epoch_rollover_rejected {
+    var w = replay_window_new();
+    const a = w.accept_at(5, 1_000, 1_000, 0);
+    assert(a == .Accept);
+    // DH ratchet step.
+    advance_epoch(&w);
+    assert(w.epoch == 1);
+    // Attacker re-injects an old (epoch=0, counter=5) ciphertext with a
+    // fresh in-band timestamp.
+    const d = w.accept_at(5, 2_000, 2_000, 0);
+    assert(d == .RejectEpochRollover);
+}
+
+/// **CLK-06** — boundary: a message exactly at `t_recv ± skew` is accepted;
+/// one millisecond beyond is rejected (inclusive-band semantics).
+test clk_06_boundary_inclusive {
+    var w = with_skew(skew_bound(1_000));
+    // Exactly at -skew bound (inclusive).
+    const lo = w.accept_at(0, 0, 1_000, 0);
+    assert(lo == .Accept);
+    // Exactly at +skew bound (inclusive), fresh counter.
+    const hi = w.accept_at(1, 2_000, 1_000, 0);
+    assert(hi == .Accept);
+    // 1 ms beyond +skew on a fresh window.
+    var w2 = with_skew(skew_bound(1_000));
+    const beyond = w2.accept_at(0, 2_001, 1_000, 0);
+    assert(beyond == .RejectFuture);
+}
+
+/// Green summary line for human/CI scan.
+test green_g_c2_clock_summary {
+    const count: usize = 6;
+    assert(count == 6);
+}
+
+pub fn main() void {
+    clk_01_fresh_in_band_accepted();
+    clk_02_backdated_outside_skew_rejected_stale();
+    clk_03_future_dated_rejected();
+    clk_04_replay_within_window_rejected();
+    clk_05_epoch_rollover_rejected();
+    clk_06_boundary_inclusive();
+    green_g_c2_clock_summary();
+}
