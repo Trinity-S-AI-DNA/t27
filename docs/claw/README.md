@@ -8,19 +8,19 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 
 | Piece | Where | Status |
 |---|---|---|
-| Gate inventory (SSOT) | `specs/claw/gates.t27` | T1, this branch |
-| `tri claw` CLI | `tri claw status / run / report` | T2, planned |
-| Unified reporting workflow | `.github/workflows/claw.yml` | T3, planned |
-| GitHub App manifest | `docs/claw/app-manifest.yml` | T4, planned |
-| Service skeleton | Railway, thin I/O glue only | T5, planned |
+| Gate inventory (SSOT) | `specs/claw/gates.t27` | T1, merged |
+| Drift audit law | `claw_status` in `specs/claw/gates.t27` | T2, this branch |
+| Drift audit in CI | `gate-topology` workflow, "claw drift" step | T3, this branch |
+| GitHub App manifest | release step, see `docs/claw/RELEASE.md` | T4, deferred to App setup |
+| Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
 ## The inventory spec and how to regenerate it
 
-`specs/claw/gates.t27` holds three parallel `[65]str`-shaped arrays — `NAMES`
+`specs/claw/gates.t27` holds three parallel `[66]str`-shaped arrays — `NAMES`
 (workflow file stems), `CLASSES` (0 blocking / 1 soft / 2 reporting), `EVENTS`
 (trigger keys, comma-joined). Rows stay alphabetical and aligned; tests pin
-the alignment, the census (60/3/2), pairwise name uniqueness, and the
+the alignment, the census (61/3/2), pairwise name uniqueness, and the
 merge-critical rows.
 
 The class rule is mechanical, so the regeneration is too:
@@ -45,10 +45,13 @@ done
 ```
 
 A workflow file that lands in `.github/workflows/` without its row in the
-inventory (or vice versa) is an inconsistency by construction: `tri claw
-status` (T2) lowers the spec with `t27c` and diffs `NAMES` against the
-directory, fail-closed on any unknown name — mirroring the ceiling discipline
-of `scripts/ci/check_pr_branch_filters.py`.
+inventory (or vice versa) is an inconsistency by construction: `claw_status`
+in the spec is lowered by `t27c gen-c` into `gen/c/claw/gates.c`, and the
+claw-drift step of the `gate-topology` workflow compiles a four-line harness
+around it that diffs `NAMES` against the directory and fails on any unknown
+name — mirroring the ceiling discipline of
+`scripts/ci/check_pr_branch_filters.py`. The law is the spec; the harness is
+machinery (owner rule 2026-10-13: everything new is .t27).
 
 ## Why this shape (own language first)
 
