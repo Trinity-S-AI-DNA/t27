@@ -163,6 +163,11 @@ pub fn same(s: &[u8], w: &'static str) -> bool {
     return true;
 }
 
+pub fn trim(s: &[u8]) -> &'static str {
+    let lo: usize = trim_lo(s, 0, s.len());
+    return &s[(lo) as usize..(trim_hi(s, lo, s.len())) as usize];
+}
+
 pub fn trim_hi(s: &[u8], lo: usize, hi: usize) -> usize {
     let mut j: usize = hi;
     while (j > lo) {
