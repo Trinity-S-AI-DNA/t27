@@ -1,0 +1,477 @@
+module port::trios_trinity_dashboard;
+
+// Port of gHashTag/trios `.trinity/bin/trinity-dashboard/src/main.rs`
+// (trinity-dashboard, the LEAD orchestrator polling loop for the Trinity
+// tailnet; 223 lines, 7 functions, at 8b229e9489ee).
+//
+// The original walks the 26-codename roster, hits each node's but-server
+// :7777 over the private tailnet, merges in `gh api /notifications`, and
+// prints the priority queue and heartbeat board to stdout every 5 minutes
+// (three seconds between node polls).
+//
+// Port the decision, not the plumbing: everything that touches the world
+// (the HTTP GET, the `gh` subprocess, the println!s, the poll/sleep loop)
+// keeps its original function name with an `undefined;` body that no test
+// calls; the decision inside each of those is a pure function below, and
+// every pure function is asserted on by a test:
+//
+//   poll_node           -> node_url, poll_err_offline
+//   poll_notifications  -> parse_or_default_count, count_repo_notes
+//   print_header        -> utc_parts, hh_mm
+//   print_node_state    -> char_len, take_chars, sha_width, trailer_or_q
+//   print_notifications -> no_events, shown_count
+//   run_one             -> roster_count, tally, default_repo/epic/interval
+//   main                -> ported in full (the --once dispatch is pure)
+//
+// Strings cannot be concatenated in .t27, so composed output (URLs,
+// header lines, rows) is expressed as its parts; the caller joins them.
+// The lexer re-encodes raw non-ASCII bytes in string literals, so every
+// literal here is ASCII-only.
+
+// anyhow::Result<()> on main/run_one becomes an exit code.
+const EXIT_OK: i32 = 0;
+const EXIT_FAIL: i32 = 1;
+// Without --once main polls forever and never returns; the sentinel
+// stands for that branch so the dispatch stays a total function.
+const EXIT_FOREVER: i32 = -1;
+
+// poll_node: format!("http://{codename}.{tailnet}:7777/api/state")
+const NODE_PORT: u16 = 7777;
+const NODE_PATH: []const u8 = "/api/state";
+
+// clap defaults on Cli.
+const DEFAULT_REPO: []const u8 = "gHashTag/trios";
+const DEFAULT_EPIC: u32 = 446;
+const DEFAULT_INTERVAL: u64 = 300;
+
+// Column widths on the board.
+const SHA_WIDTH: usize = 7;              // &sha[..7.min(sha.len())]
+const TITLE_MAX_CHARS: usize = 48;       // c.title.chars().take(48)
+const NOTE_TITLE_MAX_CHARS: usize = 70;  // n.subject.title.chars().take(70)
+const MAX_SHOWN_NOTES: usize = 15;       // notes.iter().take(15)
+
+// --- data model: only the facts the ported logic reads ---
+
+// Commit (serde: sha, title, ts, trailer_agent?).
+struct Commit {
+    sha: []const u8,
+    title: []const u8,
+    has_agent: bool,   // trailer_agent: Option<String>
+    agent: []const u8,
+}
+
+// AppliedBranch (name, head?). Only the print rows read name and head;
+// the ported decisions read the branch count, so ButState carries the
+// count and the rows themselves stay plumbing.
+struct AppliedBranch {
+    name: []const u8,
+    has_head: bool,
+    head: []const u8,
+}
+
+// ButState (applied_branches, last_commit?, wip_files).
+struct ButState {
+    n_applied: usize,  // applied_branches.len()
+    wip_files: u32,
+    has_commit: bool,  // last_commit: Option<Commit>
+    last: Commit,
+}
+
+// GhNotification folded flat: repository.full_name is the filter key,
+// subject.kind and subject.title feed the row, updated_at the %H:%M
+// column.
+struct Note {
+    full_name: []const u8,
+    kind: []const u8,  // #[serde(rename = "type")]
+    title: []const u8,
+    updated_secs: i64, // DateTime<Utc> as seconds since the epoch
+}
+
+// ts.format("%Y-%m-%d %H:%M:%S UTC") as its parts; the caller joins.
+struct TsParts {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+// clap's Cli: only the facts the logic reads.
+struct Cli {
+    tailnet: []const u8,
+    repo: []const u8,
+    epic: u32,
+    interval_secs: u64,
+    once: bool,
+}
+
+// --- poll_node ---
+
+// The URL decision, as parts: http://{codename}.{tailnet}:7777/api/state.
+struct NodeUrl {
+    codename: []const u8,
+    tailnet: []const u8,
+    port: u16,
+    path: []const u8,
+}
+
+fn node_url(tailnet: []const u8, codename: []const u8) -> NodeUrl {
+    return NodeUrl { codename: codename, tailnet: tailnet, port: NODE_PORT, path: NODE_PATH };
+}
+
+// The match on ureq::Error: Status and Transport are ureq's only error
+// kinds, and both decode as "no route / server down" -- the node shows
+// offline rather than the poll crashing the cycle.
+fn poll_err_offline(is_status_err: bool, is_transport_err: bool) -> bool {
+    return is_status_err or is_transport_err;
+}
+
+// The plumbing: GET the URL with a 3s timeout and decode ButState; a
+// status or transport failure decodes as null (offline), and run_one's
+// unwrap_or(None) maps any residue the same way. No test calls this.
+fn poll_node(tailnet: []const u8, codename: []const u8) -> ?ButState { undefined; }
+
+// --- poll_notifications ---
+
+// serde_json::from_slice(...).unwrap_or_default(): a payload that fails
+// to decode is no notifications, not a poll error.
+fn parse_or_default_count(parsed: bool, n: usize) -> usize {
+    if (parsed) {
+        return n;
+    }
+    return 0;
+}
+
+// The filter: keep only notifications whose repository.full_name equals
+// the repo the dashboard was started with.
+fn count_repo_notes(notes: []const Note, repo: []const u8) -> usize {
+    var n: usize = 0;
+    for note in notes {
+        if (note.full_name == repo) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// The plumbing: run `gh api /notifications?all=false&per_page=30 --jq .`,
+// bail on a failing exit code, decode the JSON (empty on garbage) and
+// keep the repo's notifications -- count_repo_notes is that filter, and
+// the returned count is what survives it. No test calls this.
+fn poll_notifications(repo: []const u8) -> usize { undefined; }
+
+// --- print_header ---
+
+// ts.format("%Y-%m-%d %H:%M:%S UTC") on a DateTime<Utc> held as seconds
+// since the epoch. Days-to-civil after Howard Hinnant's algorithm; valid
+// from 1970-01-01 on, which is all Utc::now() can produce.
+fn utc_parts(secs: i64) -> TsParts {
+    var days: i64 = secs / 86400;
+    var rem: i64 = secs % 86400;
+    var hour: i64 = rem / 3600;
+    var minute: i64 = (rem % 3600) / 60;
+    var second: i64 = rem % 60;
+    var z: i64 = days + 719468;
+    var era: i64 = z / 146097;
+    var doe: i64 = z - era * 146097;
+    var yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: i64 = yoe + era * 400;
+    var doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    var mp: i64 = (5 * doy + 2) / 153;
+    var d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = if (mp < 10) mp + 3 else mp - 9;
+    if (m <= 2) {
+        y = y + 1;
+    }
+    return TsParts { year: y, month: m, day: d, hour: hour, minute: minute, second: second };
+}
+
+// The %H:%M column on each notification row.
+fn hh_mm(secs: i64) -> (i64, i64) {
+    const p = utc_parts(secs);
+    const h: i64 = p.hour;
+    const m: i64 = p.minute;
+    return (h, m);
+}
+
+// The plumbing: the three println! calls (rule, the EPIC N * repo * stamp
+// line with the sunflower anchor phi^2 + phi^-2 = 3, rule). No test calls
+// this.
+fn print_header(epic: u32, repo: []const u8, ts_secs: i64) { undefined; }
+
+// --- print_node_state ---
+
+// UTF-8 code points in s -- Rust's .chars(): a byte in 0x80..=0xBF
+// continues a character and never starts one. .t27 literals cannot embed
+// non-ASCII bytes, so tests exercise the ASCII path; the continuation
+// branch carries the UTF-8 decision.
+fn char_len(s: []const u8) -> usize {
+    var n: usize = 0;
+    for c in s {
+        if (c < 0x80 or c >= 0xC0) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// .chars().take(max): how many characters of a title survive the cap.
+fn take_chars(s: []const u8, max_chars: usize) -> usize {
+    var n: usize = char_len(s);
+    if (n > max_chars) {
+        return max_chars;
+    }
+    return n;
+}
+
+// &sha[..7.min(sha.len())] -- the width of a truncated hash column, used
+// for both the commit sha and a branch head.
+fn sha_width(s: []const u8) -> usize {
+    if (s.len < SHA_WIDTH) {
+        return s.len;
+    }
+    return SHA_WIDTH;
+}
+
+// trailer_agent.as_deref().unwrap_or("?") -- the same fallback a branch
+// head gets: the shown string is the agent when present, "?" when not.
+fn trailer_or_q(has_agent: bool, agent: []const u8) -> []const u8 {
+    if (has_agent) {
+        return agent;
+    }
+    return "?";
+}
+
+// The plumbing: print! the uppercase codename column, then the
+// online/offline row with vbranches/wip_files, the truncated last_commit
+// line, and the branch rows. No test calls this.
+fn print_node_state(codename: []const u8, state: ?ButState) { undefined; }
+
+// --- print_notifications ---
+
+// notes.is_empty() decides the "(no new events)" row.
+fn no_events(total: usize) -> bool {
+    return total == 0;
+}
+
+// notes.iter().take(15): how many rows the board shows.
+fn shown_count(total: usize) -> usize {
+    if (total > MAX_SHOWN_NOTES) {
+        return MAX_SHOWN_NOTES;
+    }
+    return total;
+}
+
+// The plumbing: the println! calls (header, then hh_mm * kind * title
+// rows capped at 70 chars). No test calls this.
+fn print_notifications(notes: []const Note) { undefined; }
+
+// --- run_one ---
+
+// The CODENAMES roster: 26 Coptic-letter codenames; omega is LEAD itself
+// and is polled separately, so the summary says total=26.
+const CODENAMES: [26][]const u8 = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "koppa", "rho", "sigma", "tau", "upsilon", "phi", "khi", "psi", "sampi", "sho"];
+
+fn roster_count() -> usize {
+    return CODENAMES.len;
+}
+
+// The online/offline tally behind the summary line: each roster entry
+// polls to online (state present) or offline (null).
+fn tally(flags: []const bool) -> (u32, u32) {
+    var on: u32 = 0;
+    var off: u32 = 0;
+    for f in flags {
+        if (f) {
+            on += 1;
+        } else {
+            off += 1;
+        }
+    }
+    return (on, off);
+}
+
+// clap's --repo default.
+fn default_repo(given: bool, value: []const u8) -> []const u8 {
+    if (given) {
+        return value;
+    }
+    return DEFAULT_REPO;
+}
+
+// clap's --epic default (default_value_t = 446).
+fn default_epic(given: bool, value: u32) -> u32 {
+    if (given) {
+        return value;
+    }
+    return DEFAULT_EPIC;
+}
+
+// clap's --interval-secs default (default_value_t = 300).
+fn default_interval(given: bool, value: u64) -> u64 {
+    if (given) {
+        return value;
+    }
+    return DEFAULT_INTERVAL;
+}
+
+// The plumbing: Utc::now, print_header, the roster loop (poll_node +
+// print_node_state + tally + the summary line), poll_notifications +
+// print_notifications, and the next-poll footer. No test calls this.
+fn run_one(cli: Cli) { undefined; }
+
+// --- main ---
+
+// The dispatch: --once runs one cycle and its result is the exit code;
+// without --once a failed cycle is reported and the loop polls on
+// forever -- main never returns, which EXIT_FOREVER stands for.
+fn main(once: bool, cycle_ok: bool) -> i32 {
+    if (once) {
+        if (cycle_ok) {
+            return EXIT_OK;
+        }
+        return EXIT_FAIL;
+    }
+    return EXIT_FOREVER;
+}
+
+// --- tests ---
+
+test node_url_is_codename_tailnet_port_7777_api_state {
+    const u = node_url("tail-abc.ts.net", "alpha");
+    assert(u.port == 7777);
+    assert(u.path == "/api/state");
+    assert(u.codename == "alpha");
+    assert(u.tailnet == "tail-abc.ts.net");
+}
+
+test poll_failures_show_node_offline {
+    assert(poll_err_offline(true, false));
+    assert(poll_err_offline(false, true));
+    assert(!poll_err_offline(false, false));
+}
+
+test notifications_filtered_by_full_name {
+    const n0 = Note { full_name: "gHashTag/trios", kind: "Issue", title: "EPIC 446 stage 6", updated_secs: 1700000000 };
+    const n1 = Note { full_name: "gHashTag/t27", kind: "PullRequest", title: "stage 6 of 9", updated_secs: 1700000001 };
+    const n2 = Note { full_name: "gHashTag/trios", kind: "Release", title: "ONE-SHOT v2.0", updated_secs: 1700000002 };
+    var notes: [3]Note = [n0, n1, n2];
+    assert(count_repo_notes(&notes, "gHashTag/trios") == 2);
+    assert(count_repo_notes(&notes, "gHashTag/t27") == 1);
+    assert(count_repo_notes(&notes, "gHashTag/none") == 0);
+}
+
+test bad_gh_payload_decodes_to_no_notifications {
+    assert(parse_or_default_count(true, 7) == 7);
+    assert(parse_or_default_count(false, 7) == 0);
+    assert(parse_or_default_count(false, 0) == 0);
+}
+
+test notification_rows_capped_at_15_empty_means_none {
+    assert(no_events(0));
+    assert(!no_events(1));
+    assert(shown_count(0) == 0);
+    assert(shown_count(3) == 3);
+    assert(shown_count(15) == 15);
+    assert(shown_count(16) == 15);
+    assert(shown_count(30) == 15);
+}
+
+test title_columns_count_characters_not_bytes {
+    assert(char_len("hello") == 5);
+    assert(char_len("") == 0);
+    assert(take_chars("abcdefghij", NOTE_TITLE_MAX_CHARS) == 10);
+    assert(take_chars("abcdefghij", 3) == 3);
+    assert(take_chars("abcdefghij", TITLE_MAX_CHARS) == 10);
+    assert(take_chars("", 48) == 0);
+    assert(TITLE_MAX_CHARS == 48);
+    assert(NOTE_TITLE_MAX_CHARS == 70);
+}
+
+test sha_column_is_at_most_seven_chars {
+    assert(sha_width("abcdefg") == 7);
+    assert(sha_width("abcdefgh") == 7);
+    assert(sha_width("abc") == 3);
+    assert(sha_width("") == 0);
+    assert(SHA_WIDTH == 7);
+}
+
+test absent_trailer_shows_qmark {
+    assert(trailer_or_q(true, "worker-bee-27") == "worker-bee-27");
+    assert(trailer_or_q(false, "worker-bee-27") == "?");
+    assert(trailer_or_q(false, "") == "?");
+}
+
+test header_stamp_at_epoch_is_1970_01_01 {
+    const p = utc_parts(0);
+    assert(p.year == 1970);
+    assert(p.month == 1);
+    assert(p.day == 1);
+    assert(p.hour == 0);
+    assert(p.minute == 0);
+    assert(p.second == 0);
+}
+
+test header_stamp_known_instants {
+    const a = utc_parts(1700000000);
+    assert(a.year == 2023);
+    assert(a.month == 11);
+    assert(a.day == 14);
+    assert(a.hour == 22);
+    assert(a.minute == 13);
+    assert(a.second == 20);
+    const b = utc_parts(1000000000);
+    assert(b.year == 2001);
+    assert(b.month == 9);
+    assert(b.day == 9);
+    assert(b.hour == 1);
+    assert(b.minute == 46);
+    assert(b.second == 40);
+    const c = utc_parts(1709208000);
+    assert(c.year == 2024);
+    assert(c.month == 2);
+    assert(c.day == 29);
+    assert(c.hour == 12);
+    assert(c.minute == 0);
+}
+
+test notification_time_column_is_hh_mm {
+    const (h, m) = hh_mm(1700000000);
+    assert(h == 22);
+    assert(m == 13);
+    const (h0, m0) = hh_mm(0);
+    assert(h0 == 0);
+    assert(m0 == 0);
+}
+
+test roster_walks_26_coptics_without_omega {
+    assert(roster_count() == 26);
+}
+
+test summary_tallies_online_and_offline {
+    var flags: [5]bool = [true, true, false, true, false];
+    const (on, off) = tally(&flags);
+    assert(on == 3);
+    assert(off == 2);
+    var down: [2]bool = [false, false];
+    const (on2, off2) = tally(&down);
+    assert(on2 == 0);
+    assert(off2 == 2);
+}
+
+test cli_flags_fall_back_to_defaults {
+    assert(default_repo(false, "gHashTag/t27") == "gHashTag/trios");
+    assert(default_repo(true, "gHashTag/t27") == "gHashTag/t27");
+    assert(default_epic(false, 900) == 446);
+    assert(default_epic(true, 900) == 900);
+    assert(default_interval(false, 60) == 300);
+    assert(default_interval(true, 60) == 60);
+}
+
+test once_dispatch_exit_codes {
+    assert(main(true, true) == EXIT_OK);
+    assert(main(true, false) == EXIT_FAIL);
+    assert(main(false, true) == EXIT_FOREVER);
+    assert(main(false, false) == EXIT_FOREVER);
+}
