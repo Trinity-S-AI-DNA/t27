@@ -197,6 +197,19 @@ pub fn trim_hi(s: &[u8], lo: usize, hi: usize) -> usize {
     return j;
 }
 
+pub fn trim_start(s: &[u8]) -> &'static str {
+    return &s[(trim_lo(s, 0, s.len())) as usize..(s.len()) as usize];
+}
+
+pub fn trim_end(s: &[u8]) -> &'static str {
+    return &s[(0) as usize..(trim_hi(s, 0, s.len())) as usize];
+}
+
+pub fn trim(s: &[u8]) -> &'static str {
+    let lo: usize = trim_lo(s, 0, s.len());
+    return &s[(lo) as usize..(trim_hi(s, lo, s.len())) as usize];
+}
+
 pub fn trimmed_is(s: &[u8], w: &'static str) -> bool {
     let lo: usize = trim_lo(s, 0, s.len());
     return same(&s[(lo) as usize..(trim_hi(s, lo, s.len())) as usize], w);
