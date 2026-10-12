@@ -5,7 +5,7 @@ release of it contains and what must be true before it ships. The version of
 record is the line under this paragraph; a release PR changes it and ticks the
 boxes in the same commit.
 
-Current: **v0.1 (unreleased)**
+Current: **v0.1 -- tag `claw-v0.1`**
 
 ## What v0.1 is
 
@@ -46,10 +46,11 @@ Gates as a spec, running as CI, sold as a service later:
 
 ## Release steps
 
-1. Update the version line above and tick the boxes; land that PR.
-2. Tag `claw-v0.1` on master. The t27o cosign signing lane signs whatever the
-   tag carries; TRI CLAW's artifact is the repo state, so the tag is the
-   release.
+1. [x] Update the version line above and tick the boxes; land that PR
+      (#9304 ticked the boxes; this PR flips the version line).
+2. [x] Tag `claw-v0.1` on master. The t27o cosign signing lane signs whatever
+      the tag carries; TRI CLAW's artifact is the repo state, so the tag is
+      the release. Tag points at this PR's merge.
 3. Owner creates the GitHub App when the service ships (the manifest is a
    v0.2 step, written then, not carried dead now -- a manifest with no App
    behind it is a false claim).
