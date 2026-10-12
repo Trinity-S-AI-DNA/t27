@@ -413,8 +413,13 @@ def parse_verdict(text):
             v["criterion"].append(val)
         elif key == "discounted-check":
             name, _, why = val.partition(" -- ")
-            if name.strip() and why.strip() and not NONE_RE.fullmatch(name.strip()):
-                v["discounted"][name.strip()] = why.strip()
+            # The flash models wrap the name in quotes or backticks (2026-10-12:
+            # four approvals of the port wave died on `"cli-tri"`); the wrapper is
+            # markdown, not part of the name -- _block_line already says so for
+            # the key itself.
+            name = name.strip().strip("\"'`").strip()
+            if name and why.strip() and not NONE_RE.fullmatch(name):
+                v["discounted"][name] = why.strip()
         elif key == "blocking-check":
             # "-- (none)" names no check and gives none as the reason (#5783,
             # 2026-10-04T00:01Z); no name with a real reason still blocks.
@@ -2970,6 +2975,13 @@ def self_test():
     check("bold markup is markup, and `blocking-check: none` is no blocking check",
           v["verdict"] == ["APPROVE"] and v["summary"] == ["fine"] and not v["blocking"]
           and not v["discounted"] and judge(v, [])[0] == "approve")
+    q = parse_verdict("BEE-VERDICT: APPROVE\nsummary: s\ncriterion: c -- met -- a\n"
+                      'discounted-check: "Documented t27c subcommands exist" -- pre-existing on master\n'
+                      "discounted-check: `duplicate-bodies` -- pre-existing on master\n")
+    check("a discount name wrapped in quotes or backticks still names its check "
+          "(2026-10-12T00:40Z: four approvals of the port wave died on quoted names)",
+          list(q["discounted"]) == ["Documented t27c subcommands exist", "duplicate-bodies"]
+          and judge(q, ["Documented t27c subcommands exist", "duplicate-bodies"])[0] == "approve")
     check("a real blocking-check line still blocks",
           judge(parse_verdict("BEE-VERDICT: APPROVE\nsummary: s\ncriterion: c -- met -- a\n"
                               "blocking-check: none-such -- broke it"), [])[0] == "incomplete")
