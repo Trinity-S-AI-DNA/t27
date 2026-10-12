@@ -24,7 +24,7 @@ File name: `<repo>-<job slug>.t27`; module name: `cron_<file name with underscor
 | `KIND`          | `str`    | always `"cron"`                                                                           |
 | `ID`            | `str`    | `<host>/<repo>/<slug>`; must equal the id in the code manifest                            |
 | `NAME`          | `str`    | display name                                                                              |
-| `HOST`          | `str`    | `github-actions` \| `inngest` \| `railway-cron` \| `timer` \| `launchd` (see below)         |
+| `HOST`          | `str`    | `github-actions` \| `inngest` \| `railway-cron` \| `timer` \| `launchd` \| `mac-launchd` \| `mac-crontab` (see below)         |
 | `REPO`          | `str`    | short repo name                                                                           |
 | `SERVICE`       | `str`    | workflow file / Inngest function file / Railway service / `file:line` of the timer         |
 | `SUMMARY_EN`    | `str`    | what the job does (English)                                                               |
@@ -38,10 +38,10 @@ File name: `<repo>-<job slug>.t27`; module name: `cron_<file name with underscor
 | `ON_FAILURE`    | `str`    | `issue` \| `log` \| `unknown`                                                             |
 | `CONTROL`       | `str`    | `github-actions-dispatch` \| `railway-dashboard` \| `inngest-dashboard` \| `code-only`     |
 
-## HOST `launchd` (the owner's Mac)
+## HOST `launchd`, `mac-launchd`, `mac-crontab` (the owner's Mac)
 
 A job that runs on the owner's Mac -- a `~/Library/LaunchAgents/*.plist` or a
-`crontab` line -- has `HOST = "launchd"`. Nothing outside the Mac can see it
+`crontab` line -- has `HOST = "launchd"`, `"mac-launchd"`, or `"mac-crontab"`. Nothing outside the Mac can see it
 fire, so the card is the only record the page and the Queen have.
 
 - `SERVICE` is the launchd `Label` (`ai.t27.reviewer-bees`), or `crontab` for a crontab line.
@@ -52,7 +52,7 @@ fire, so the card is the only record the page and the Queen have.
 - `KeepAlive` with no schedule (a daemon) -> `SCHEDULE = ""` and a `SCHEDULE_NOTE` saying so.
 - `CONTROL = "code-only"`: there is no remote handle. The Queen serves these cards
   `tick-only` (reported), never `workflow-dispatch`.
-- `ID` is `launchd/<repo>/<label without ai.t27.>`. The code manifest does not scan
+- `ID` is `launchd/<repo>/<label without ai.t27.>`, `mac-launchd/<repo>/<label without ai.t27.>`, or `mac-crontab/<repo>/<command>`. The code manifest does not scan
   the Mac, so a launchd card is `spec-only` by construction and is not warned for it.
 
 How to answer "did it run?": `launchctl print gui/$(id -u)/<Label>` (`last exit code`,
