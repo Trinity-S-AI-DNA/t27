@@ -9245,6 +9245,11 @@ impl Codegen {
             self.string_names.remove(n);
         }
         self.zig_value_names.clear();
+        // #8831: parameter renames live only inside the function that
+        // declared them. Without this clear, a rename (clk -> clk_arg)
+        // survives into module-scope emission and rewrites call arguments
+        // that refer to a module-level declaration of the same name.
+        self.param_renames.clear();
     }
 
     /// #6295: the renames a test or bench block needs, set up the way
