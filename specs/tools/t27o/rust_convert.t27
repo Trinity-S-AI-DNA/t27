@@ -13,7 +13,9 @@
 ;    until no new name is refused, so no converted fn or test reaches a stub.
 ; 2. Normalisation into the subset: &mut self as a pointer (`self: *T`, calls `T_m(&x)`), for-each over
 ;    `s` / `s.iter()` / `&s` / an array literal, `.iter().enumerate()` as an index loop, `if let Some(v) = e`
-;    (and `Ok(v)`) as `e != null` and `e.?`, `*r` of a shared reference as `r`, `let _x = e` as a discard,
+;    (and `Ok(v)`) as `e != null` and `e.?`, `if let Err(_) = e` (payload not said in the block) as the
+;    failure arm `e == null`, `while let Some(v) = e` as a `while (true)` that reads e once into a temp
+;    (#9101), `*r` of a shared reference as `r`, `let _x = e` as a discard,
 ;    an unused parameter as `_ = p;`.
 ;    #[cfg(..)]: one variant is chosen, deterministically: the predicate is evaluated on the default host,
 ;    the one the oracle's rustc builds for -- not test, no features, no --cfg, unix / linux / x86_64,
@@ -2863,7 +2865,7 @@ pub fn stmt(src: []const u8, st: []usize, out: []u8, mode: u8) -> void {
     } else if (word_is(src, a, b, "while")) {
         step(src, st);
         if (at(src, st[P], "let")) {
-            refuse_here(src, st, R_IFLET);
+            while_let(src, st, out);
             return;
         }
         puts(st, out, "while (");
@@ -3169,9 +3171,126 @@ pub fn if_stmt(src: []const u8, st: []usize, out: []u8, mode: u8) -> void {
     else_chain(src, st, out, mode);
 }
 
-/// `if let Some(v) = e { .. }` (or `Ok(v)`, a Result being ?T) as `if (e != null) { const v = e.?; .. }`; e is read twice, so one
-/// that calls something is refused.
+/// Does the block src[lb .. lb's `}`] say the name src[va .. vb)? The payload of an `Err` binding.
+pub fn named_in_block(src: []const u8, lb: usize, va: usize, vb: usize) -> bool {
+    const cb : usize = block_end(src, lb);
+    var q : usize = skip_ws(src, lb + 1);
+    while (q < cb) {
+        const e : usize = tok_end(src, q);
+        if (same_text(src, q, e, va, vb)) { return true; }
+        q = skip_ws(src, e);
+    }
+    return false;
+}
+
+/// `if let Some(v) = e { .. }` (or `Ok(v)`, a Result being ?T) as `if (e != null) { const v = e.?; .. }`.
+/// e that emits a `(` is read once: `const v_t27o = e;` stands before the if and both reads say
+/// v_t27o (#9101). `if let Err(_) = e` (the payload unnamed, or named but never said in the block)
+/// is the failure arm, `if (e == null)` (`(e) == false` for a `Result<(), E>` call). A tuple
+/// pattern `Some((a, b))` is refused as a tuple.
 pub fn if_let(src: []const u8, st: []usize, out: []u8, mode: u8) -> void {
+    step(src, st);
+    if (!(at(src, st[P], "Some") or at(src, st[P], "Ok") or at(src, st[P], "Err")) or !peek_is(src, st[P], "(")) {
+        refuse_here(src, st, R_IFLET);
+        return;
+    }
+    const is_err : bool = at(src, st[P], "Err");
+    step(src, st);
+    step(src, st);
+    const va : usize = st[P];
+    const vb : usize = tok_end(src, va);
+    if (va >= src.len) {
+        refuse(st, R_IFLET, va, va, vb);
+        return;
+    }
+    if (src[va] == B_LPAREN) {
+        refuse(st, R_TUPLE, va, va, block_end(src, va));
+        return;
+    }
+    const bound : bool = is_alpha(src[va]);
+    if (!bound and !(is_err and tok_is(src, va, "_"))) {
+        refuse(st, R_IFLET, va, va, vb);
+        return;
+    }
+    step(src, st);
+    want(src, st, ")");
+    want(src, st, "=");
+    const ea : usize = st[P];
+    if (is_err) {
+        // the error arm: e said once decides it, the payload is gone (null, or false of a unit Result)
+        const unit : bool = unit_result_call(src, st, ea);
+        const xw : usize = st[W];
+        expr(src, st, out, true);
+        if (bad(st[ERR])) { return; }
+        if (bound and named_in_block(src, st[P], va, vb)) {
+            refuse(st, R_IFLET, va, va, vb);
+            return;
+        }
+        if (unit or out_has(st[W], out, xw, B_SPACE)) { wrap(st, out, xw); }
+        if (unit) { puts(st, out, " == false) "); } else { puts(st, out, " == null) "); }
+        block(src, st, out, mode);
+        else_chain(src, st, out, mode);
+        insert(st, out, xw, "if (");
+        return;
+    }
+    const iw : usize = st[W];
+    puts(st, out, "if (");
+    const xw : usize = st[W];
+    expr(src, st, out, true);
+    if (bad(st[ERR])) { return; }
+    const once : bool = out_has(st[W], out, xw, B_LPAREN);
+    const spaced : bool = out_has(st[W], out, xw, B_SPACE);
+    if (!once) {
+        if (spaced) { wrap(st, out, xw); }
+        puts(st, out, " != null) ");
+        if (open_block(src, st, out)) {
+            newline(st, out);
+            puts(st, out, "const ");
+            put_ident(src, st, out, va, vb);
+            puts(st, out, " = ");
+            const save : usize = st[P];
+            const vw : usize = st[W];
+            st[P] = ea;
+            expr(src, st, out, true);
+            st[P] = save;
+            if (spaced) { wrap(st, out, vw); }
+            puts(st, out, ".?;");
+            stmts(src, st, out, mode);
+            close_block(src, st, out);
+        }
+        else_chain(src, st, out, mode);
+        return;
+    }
+    // one read: the temp goes before the if, and both places say its name
+    st[W] = iw;
+    st[P] = ea;
+    puts(st, out, "const ");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, "_t27o = ");
+    expr(src, st, out, true);
+    if (bad(st[ERR])) { return; }
+    puts(st, out, ";");
+    newline(st, out);
+    puts(st, out, "if (");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, "_t27o != null) ");
+    if (open_block(src, st, out)) {
+        newline(st, out);
+        puts(st, out, "const ");
+        put_ident(src, st, out, va, vb);
+        puts(st, out, " = ");
+        put_ident(src, st, out, va, vb);
+        puts(st, out, "_t27o.?;");
+        stmts(src, st, out, mode);
+        close_block(src, st, out);
+    }
+    else_chain(src, st, out, mode);
+}
+
+/// `while let Some(v) = e { .. }` (or `Ok(v)`) as `while (true) { const v_t27o = e; if (v_t27o ==
+/// null) { break; } const v = v_t27o.?; .. }`: e is read once each round, so a call on the right
+/// keeps its meaning (#9101).
+pub fn while_let(src: []const u8, st: []usize, out: []u8) -> void {
     step(src, st);
     if (!(at(src, st[P], "Some") or at(src, st[P], "Ok")) or !peek_is(src, st[P], "(")) {
         refuse_here(src, st, R_IFLET);
@@ -3181,42 +3300,49 @@ pub fn if_let(src: []const u8, st: []usize, out: []u8, mode: u8) -> void {
     step(src, st);
     const va : usize = st[P];
     const vb : usize = tok_end(src, va);
-    if (va >= src.len or !is_alpha(src[va])) {
+    if (va >= src.len) {
+        refuse(st, R_IFLET, va, va, vb);
+        return;
+    }
+    if (src[va] == B_LPAREN) {
+        refuse(st, R_TUPLE, va, va, block_end(src, va));
+        return;
+    }
+    if (!is_alpha(src[va])) {
         refuse(st, R_IFLET, va, va, vb);
         return;
     }
     step(src, st);
     want(src, st, ")");
     want(src, st, "=");
-    const ea : usize = st[P];
-    puts(st, out, "if (");
-    const xw : usize = st[W];
+    puts(st, out, "while (true) {");
+    st[IND] = st[IND] + 1;
+    newline(st, out);
+    puts(st, out, "const ");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, "_t27o = ");
     expr(src, st, out, true);
     if (bad(st[ERR])) { return; }
-    const once : bool = out_has(st[W], out, xw, B_LPAREN);
-    const spaced : bool = out_has(st[W], out, xw, B_SPACE);
-    if (once) {
-        refuse(st, R_IFLET, ea, ea, tok_end(src, ea));
-        return;
-    }
-    if (spaced) { wrap(st, out, xw); }
-    puts(st, out, " != null) ");
-    if (open_block(src, st, out)) {
-        newline(st, out);
-        puts(st, out, "const ");
-        put_ident(src, st, out, va, vb);
-        puts(st, out, " = ");
-        const save : usize = st[P];
-        const vw : usize = st[W];
-        st[P] = ea;
-        expr(src, st, out, true);
-        st[P] = save;
-        if (spaced) { wrap(st, out, vw); }
-        puts(st, out, ".?;");
-        stmts(src, st, out, mode);
-        close_block(src, st, out);
-    }
-    else_chain(src, st, out, mode);
+    if (!take(src, st, "{")) { refuse_here(src, st, R_SYNTAX); return; }
+    puts(st, out, ";");
+    newline(st, out);
+    puts(st, out, "if (");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, "_t27o == null) {");
+    st[IND] = st[IND] + 1;
+    newline(st, out);
+    puts(st, out, "break;");
+    st[IND] = st[IND] - 1;
+    newline(st, out);
+    puts(st, out, "}");
+    newline(st, out);
+    puts(st, out, "const ");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, " = ");
+    put_ident(src, st, out, va, vb);
+    puts(st, out, "_t27o.?;");
+    stmts(src, st, out, M_STMT);
+    close_block(src, st, out);
 }
 
 /// The `else if` / `else` branches after an if's first block.
@@ -6036,6 +6162,38 @@ test a_selfless_member_of_a_refused_impl_type_converts {
     const n : usize = body("struct Gen { code: Vec<u8> }\nimpl Gen {\n    fn is_bin(op: &str) -> bool { matches!(op, \"+\" | \"-\") }\n    fn wide(w: u32, op: &str) -> u32 { if w > 8 { w } else if Self::is_bin(op) { 1 } else { 0 } }\n    fn same(a: &Self, b: u8) -> bool { b > 0 }\n}", &out, &st);
     assert(out_is(n, &out, 0, "use tri::mutate::plant;\n\n// t27o: refused struct Gen (line 1): type `Vec` at line 1\n\nfn Gen_is_bin(op: []const u8) -> bool {\n    return (plant::same_text(op, \"+\") or plant::same_text(op, \"-\"));\n}\n\nfn Gen_wide(w: u32, op: []const u8) -> u32 {\n    if (w > 8) {\n        return w;\n    } else if (Gen_is_bin(op)) {\n        return 1;\n    } else {\n        return 0;\n    }\n}\n\n// t27o: refused fn same (line 5): uses refused `Self` at line 5\n\n"));
     assert(st[NOK] == 2);
+}
+
+test while_let_reads_its_call_once_into_a_temp {
+    var out : [2048]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn next(i: u32) -> Option<u32> { if i < 4 { i + 1 } else { None } }\nfn walk(from: u32) -> u32 {\n    let mut at = from;\n    while let Some(v) = next(at) { at = v; }\n    at\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn next(i: u32) -> ?u32 {\n    if (i < 4) {\n        return i + 1;\n    } else {\n        return null;\n    }\n}\n\nfn walk(from: u32) -> u32 {\n    var at = from;\n    while (true) {\n        const v_t27o = next(at);\n        if (v_t27o == null) {\n            break;\n        }\n        const v = v_t27o.?;\n        at = v;\n    }\n    return at;\n}\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test if_let_of_a_call_reads_it_once_into_a_temp {
+    var out : [1024]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn len_of(v: &[u8]) -> Option<u32> { Some(v.len() as u32) }\nfn first_len(v: &[u8]) -> u32 { if let Some(n) = len_of(v) { n } else { 0 } }", &out, &st);
+    assert(out_is(n, &out, 0, "fn len_of(v: []const u8) -> ?u32 {\n    return (v.len as u32);\n}\n\nfn first_len(v: []const u8) -> u32 {\n    const n_t27o = len_of(v);\n    if (n_t27o != null) {\n        const n = n_t27o.?;\n        return n;\n    } else {\n        return 0;\n    }\n}\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test if_let_err_without_a_payload_is_the_failure_arm {
+    var out : [1024]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn check(s: &str) -> Result<u32, u32> { if s.len() > 1 { Ok(1) } else { Err(9) } }\nfn ok_long(s: &str) -> bool { if let Err(_) = check(s) { return false; } true }\nfn says_why(s: &str) -> bool { if let Err(e) = check(s) { return e == 9; } true }", &out, &st);
+    assert(out_is(n, &out, 0, "fn check(s: []const u8) -> ?u32 {\n    if (s.len > 1) {\n        return 1;\n    } else {\n        return null;\n    }\n}\n\nfn ok_long(s: []const u8) -> bool {\n    if (check(s) == null) {\n        return false;\n    }\n    return true;\n}\n\n// t27o: refused fn says_why (line 3): if let / while let `e` at line 3\n\nfn says_why(s: []const u8) -> bool {\n}\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test a_tuple_pattern_in_an_if_let_is_refused_as_a_tuple {
+    var out : [1024]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("struct Two(u32, u32);\nfn pick(o: Option<Two>) -> u32 { if let Some((a, b)) = o { a + b } else { 0 } }", &out, &st);
+    assert(out_is(n, &out, 0, "const Two = struct {\n    _0 : u32,\n    _1 : u32,\n};\n\n// t27o: refused fn pick (line 2): tuple `(a, b)` at line 2\n\nfn pick(o: ?Two) -> u32 {\n}\n\n"));
+    assert(st[NOK] == 0);
 }
 test the_whole_file_has_a_header_and_a_report {
     var out : [1024]u8 = undefined;
