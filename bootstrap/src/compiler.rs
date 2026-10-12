@@ -26722,6 +26722,9 @@ fn is_integer_type(t: &TypeInfo) -> bool {
         t,
         TypeInfo::I8 | TypeInfo::I16 | TypeInfo::I32 | TypeInfo::I64
             | TypeInfo::U8 | TypeInfo::U16 | TypeInfo::U32 | TypeInfo::U64
+            // usize resolves as u64 (see resolve_type_str, #8034), so u64's
+            // rank already covers it: widening up to usize and narrowing
+            // down from it are judged like u64.
     )
 }
 
@@ -26746,6 +26749,11 @@ fn resolve_type_str(s: &str) -> TypeInfo {
         "u16" => TypeInfo::U16,
         "u32" => TypeInfo::U32,
         "u64" => TypeInfo::U64,
+        // `usize` is a built-in unsigned integer, not a Custom type: without
+        // this arm it ranked 0 like Custom/bool, refusing safe widening
+        // (u8 -> usize) and accepting narrowing (usize -> u8, usize -> bool).
+        // On a 64-bit target it is pointer-width, so it carries u64's rank (#8034).
+        "usize" => TypeInfo::U64,
         "f32" => TypeInfo::F32,
         "f64" => TypeInfo::F64,
         "GF16" | "gf16" => TypeInfo::GF16,
