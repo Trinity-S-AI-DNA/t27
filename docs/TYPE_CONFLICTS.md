@@ -61,13 +61,12 @@ definition moves. `tri types classified` cross-checks the file against a live
 Non-empty drift in either direction exits non-zero. A classification nobody
 re-reads becomes a claim about a tree that no longer exists.
 
-## DRIFT -- 51 names
+## DRIFT -- 62 names
 
 One concept, two definitions. These are the ones with a repair.
 
 | Name | Defs | Where | Suggested repair |
 |------|------|-------|------------------|
-| `AttentionOutput` | 2 | 2 files | Pick the rank (`[][]f32` is the defensible one -- one row per head) and define AttentionOutpu... |
 | `BenchmarkReport` | 2 | 2 files | Keep eval.t27's as the owner (benchmark.t27 already imports it), fold in pass_at_5/synth_rate... |
 | `BufgConfig` | 2 | 2 files | Hoist one BufgConfig (with fanout_capacity) into a shared openxc7-synth primitives module and... |
 | `CounterConfig` | 3 | 3 files | One CounterConfig in a shared openxc7-synth module (max_value is derivable from width; keep i... |
@@ -104,6 +103,7 @@ One concept, two definitions. These are the ones with a repair.
 | `SacredRule` | 2 | 2 files | Pick one governance spec as the owner of SacredRule (sacred_governance.t27 has the richer rul... |
 | `SearchResult` | 4 | 4 files | Have specs/vsa/similarity_search.t27 use `vsa::core::SearchResult` and decide once whether th... |
 | `Session` | 3 | 3 files | Extract the sandbox Session (plus Timestamp and SessionStatus) into one module both sandbox s... |
+| `SkillMeta` | 2 | 2 files | Keep loader.t27's record as the owner and rename catalog.t27's projection to CatalogSkillMeta -- it only ever renders name/description/location; the two halves are one ported crate. |
 | `Signal` | 2 | 2 files | Decide whether RACE emits through the Trinity HIR. If yes, delete rtl.t27's Signal/Assignment... |
 | `SkipList` | 2 | 2 files | Keep gen_skiplist_impl.t27 faithful to upstream trinity (its fixed [32]/[16] pools are the port's point), and let skip_list.t27 keep the generic `SkipList(T)`; if the shapes ever converge, have the port `use` the collections type. |
 | `SystemConfig` | 2 | 2 files | Make one board-integration template with the full SystemConfig and let each board supply valu... |
@@ -119,6 +119,17 @@ One concept, two definitions. These are the ones with a repair.
 | `Url` | 2 | 2 files | Delete the Url declaration in specs/tri/net/http.t27 and import TriUrl; then decide once whet... |
 | `Usage` | 2 | 2 files | Normalize on the provider abstraction's Usage and have server/api.t27 import it, or add the m... |
 
+| `BlinkState` | 3 | 3 files | Hoist one BlinkState (u64 counter or a width const; led_state -> led) into the shared openxc7-synth... |
+| `IssueElement` | 2 | 2 files | Keep audits_new.t27's (the real decision port) and delete audits.t27's placeholder set when that stu... |
+| `JsonObject` | 2 | 2 files | Drop audits.t27's private JSON stand-ins; use tri::encoding::json (or audits_new's NodeView lifting)... |
+| `JsonValue` | 2 | 2 files | Retire audits.t27's stub JsonValue together with its JsonObject (same repair); tri::encoding::json o... |
+| `Metadata` | 2 | 2 files | Keep one SR-01 Metadata (snake_case the field) shared by audits_new.t27 and lighthouse.t27. |
+| `RunResult` | 2 | 2 files | Fold: sweep.t27 reuses run.t27's five-field RunResult; the sweep's pair is a projection of it. |
+| `Subscriber` | 2 | 2 files | Fold: funnel_client reuses subscriber.t27's Subscriber (id + inbox) instead of its id-only stand-in. |
+| `TableRow` | 2 | 2 files | report.t27 uses table.t27's five-field TableRow -- the same one-shape move the file already made for... |
+| `VcdChange` | 2 | 2 files | Fold: one VCD type set under specs/fpga/vcd_trace.t27 (keeping the port's typed VcdVarKind enum); th... |
+| `VcdHeader` | 2 | 2 files | Same fold as VcdVar/VcdChange: one VcdHeader (no _dummy), owned by specs/fpga/vcd_trace.t27. |
+| `VcdVar` | 2 | 2 files | Fold the VCD trio into one type set; keep the typed-enum spelling in the specs/fpga owner and drop t... |
 ### The one that was fixable with no cross-module decision
 
 `AdamWConfig` had **both definitions in one file**,
@@ -128,7 +139,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 36 names
+## DISTINCT -- 48 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -143,9 +154,11 @@ whether to rename.
 | `CompileResult` | 2 | 2 files | Rename eval.t27's to SandboxCompileResult; it is used by exactly one function. |
 | `Config` | 3 | 3 files | Rename the narrow two (MonitorConfig, ParsedConfig -- the third is really a parse result, not... |
 | `Diagnostic` | 2 | 2 files | Leave both, but rename the protocol one LspDiagnostic (or require the qualified `lsp-schema::... |
+| `Entry` | 2 | 2 files | Leave both: a consensus-chain step (mvp_v3) and a hash-table cell (port). If a reader ever collides, rename the port's to HashEntry -- port-side renames are established (#7491). |
 | `EnvVar` | 2 | 2 files | Two fixes, unrelated: (a) leave the types alone, they are genuinely different; (b) fix the fi... |
 | `Episode` | 2 | 2 files | Nothing to converge. If the name ever collides in one reader, rename lotus.t27's loop entry to `LotusStep`. |
 | `Info` | 3 | 3 files | Two things: have account/repo.t27 `use account::schema` instead of re-declaring Info and the ... |
+| `Inputs` | 4 | 4 files | Nothing to converge: the Verilog port-list convention -- every module's wire bundle is named Inputs the way every clock is clk. Follow blink_working.t27's BlinkInputs prefix if the noise ever matters. |
 | `Instance` | 3 | 3 files | Leave the three types; the ambiguity is in the name. If cross-spec resolution matters, qualif... |
 | `KnowledgeGraph` | 3 | 3 files | Delete specs/igla/coder/_tmp_pipeline_import.t27 — it is a leaked working copy, and removing ... |
 | `LedOutputs` | 2 | 2 files | No defect. If the type namespace is ever flattened, prefix with the module (HeartbeatLeds, Di... |
@@ -172,6 +185,16 @@ whether to rename.
 | `ValidationResult` | 2 | 2 files | No defect to fix today, but the name is unresolvable across specs: rename to ConfigValidation... |
 | `VerificationReport` | 2 | 2 files | No defect. If the name must resolve, GoldenFamilyAudit and FormulaConformanceTally describe w... |
 
+| `Args` | 2 | 2 files | Rename acm_ae_check's to ParsedCmd (one field, one consumer); the trainer's 15-field clap port keeps... |
+| `ErrorResponse` | 2 | 2 files | Rename rainbow_routes' to RainbowError (its five provenance fields name it); the one-field monitorin... |
+| `LoadResult` | 2 | 2 files | Rename tri_loader's to LoadedImage (it is the TRI binary's header); config's LoadResult keeps the ba... |
+| `Parts` | 2 | 2 files | Rename return_unsized's to TypeArgParts; both are file-private, so a rename is the whole repair. |
+| `Report` | 2 | 2 files | Rename test_framework's to ReportBuffer (it is Text's bigger sibling); the impl-status census keeps... |
+| `Server` | 2 | 2 files | Rename mcp-server's to McpServer (the SDK class it records); rename the empty stub to BackgroundAgen... |
+| `StatusResponse` | 2 | 2 files | Rename runtime's to InstanceStatus (a lifecycle record, not an HTTP body); the /api/status DTO keeps... |
+| `Step` | 2 | 2 files | Rename the attn block's to FsmRegs (init_state/hold return it; it is a register snapshot, not a step... |
+| `TypeEntry` | 2 | 2 files | Rename return_unsized's to TypeSpan (name -> buffer span; nothing about it is a type); the typecheck... |
+| `VersionInfo` | 2 | 2 files | Rename migrate's to ConfigVersionInfo and trios-server's to VersionResponse (the /version sibling of... |
 ## Four verdicts the tool did not earn
 
 `tri types dup` decides CONFLICTED by comparing field lists. For four names --
