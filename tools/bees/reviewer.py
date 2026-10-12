@@ -424,8 +424,16 @@ def parse_verdict(text):
             # "-- (none)" names no check and gives none as the reason (#5783,
             # 2026-10-04T00:01Z); no name with a real reason still blocks.
             rest = val.lstrip("- ").strip()
+            # The none-words arrive wrapped like any other name: `<none>`
+            # echoes the prompt's `<exact check name>` placeholder, and the
+            # separator is sometimes a single dash, which leaves the whole
+            # line as the "name" (2026-10-12T03:30Z: #8827 and #8878 of the
+            # port wave died on both). Strip the wrappers and take the name
+            # before either separator before deciding it names something.
+            name = val.partition(" -- ")[0] if " -- " in val else val.partition(" - ")[0]
+            name = name.strip().strip("\"'`<>").strip()
             none = (not rest or NONE_RE.fullmatch(rest)) if val.startswith("--") \
-                else NONE_RE.fullmatch(val.partition(" -- ")[0].strip())
+                else NONE_RE.fullmatch(name)
             if not none:
                 v["blocking"].append(val)
         else:
@@ -2985,6 +2993,15 @@ def self_test():
     check("a real blocking-check line still blocks",
           judge(parse_verdict("BEE-VERDICT: APPROVE\nsummary: s\ncriterion: c -- met -- a\n"
                               "blocking-check: none-such -- broke it"), [])[0] == "incomplete")
+    for none_line in ("<none>", "None - all acceptance criteria met, no red check introduced by this head",
+                      '`<none>`'):
+        q = parse_verdict("BEE-VERDICT: APPROVE\nsummary: s\ncriterion: c -- met -- a\n"
+                          "discounted-check: cli-tri -- pre-existing on master\n"
+                          f"blocking-check: {none_line}\n")
+        check(f"blocking-check {none_line[:24]!r}... means none, not a check "
+              "(2026-10-12T03:30Z: #8718/#8824/#8827/#8878 of the port wave died "
+              "on none-lines the parser read as names)",
+              judge(q, ["cli-tri"])[0] == "approve")
     head = "BEE-VERDICT: APPROVE\nsummary: s\ncriterion: c -- met -- a\nblocking-check: "
     check("`blocking-check: -- (none)` (#5783, 2026-10-04T00:01Z) is no blocking check: no name, and the reason is none",
           judge(parse_verdict(head + "-- (none)"), [])[0] == "approve"
