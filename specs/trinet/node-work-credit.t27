@@ -28,6 +28,21 @@
 // phi^2 + 1/phi^2 = 3 | TRINITY
 
 module trinet::node_work_credit {
+    // The settlement ledger this credit settles through: specs/trinet/ledger.t27, the t27 port of
+    // src/trinet/ledger.zig (issue #8611). One mTRI per accepted job, once per (node, nonce).
+    use trinet::ledger;
+    // The payout gate the credit passes before settlement: verified::payout's rules decide
+    // that a credit is payable. Imported by name only, so the ledger's OUT_* constants stay
+    // unambiguous (both modules declare OUT_CREDITED, with the same value).
+    use verified::payout::payout;
+    use verified::payout::PAY_NORMAL;
+    use verified::payout::PAY_NONE;
+    use verified::payout::receipt_award;
+    use verified::payout::AWARD_FEE;
+    use verified::payout::testnet_credit_allowed;
+    use verified::payout::ATT_REPRODUCED;
+    use verified::payout::ATT_SOFTWARE_SIGNED;
+
     pub const KIND : str = "trinet";
     pub const ID : str = "node-work-credit";
     pub const VERSION : u8 = 1;
@@ -249,7 +264,91 @@ module trinet::node_work_credit {
     }
 
     test "VERSION says what the header's last note says" {
+        // v1 (2026-10-09) named nine behaviors in the header note. Each is restated here as a call
+        // on the rules themselves, so the note is checked, not just named:
         assert(VERSION == 1);
+        // 1. record levels, and what each is worth:
+        assert(record_level(true, true, true, false, false) == LEVEL_VERIFIED);
+        assert(record_level(true, true, true, false, true) == LEVEL_ATTESTED);
+        assert(record_level(true, true, true, true, true) == LEVEL_SELF_REPORTED);
+        assert(creditable(LEVEL_VERIFIED));
+        assert(!creditable(LEVEL_SELF_REPORTED));
+        assert(mintable(LEVEL_ATTESTED));
+        // 2. no self-vouching:
+        assert(!quorum_without_payee(2, 1, 2));
+        assert(quorum_without_payee(3, 1, 2));
+        // 3. one credit per (node, nonce) across restarts by a durable nonce reservation:
+        assert(resume_nonce(3072) == 3072);
+        assert(!may_issue(3071, 3072, 4096));
+        assert(may_issue(3072, 3072, 4096));
+        assert(!may_issue(4096, 3072, 4096));
+        assert(next_mark(3072) == 4096);
+        // 4. write-before-credit, and an unreadable journal stops crediting:
+        assert(may_start_crediting(true, true));
+        assert(!may_start_crediting(false, true));
+        assert(may_credit(true, true, true, false, true));
+        assert(!may_credit(true, true, true, false, false));
+        // 5. the settlement rate:
+        assert(amount_mtri(1) == 1);
+        assert(amount_mtri(1280) == 1280);
+        // 6. one attestation per closed run:
+        assert(may_request_attestation(LEVEL_VERIFIED, true, 32, true));
+        assert(!may_mint_run(true, true));
+        // 7. a work id apart from spec earnings (the minter takes the run's id, never a Queen one).
+        // 8. the board not proven by its tag:
+        assert(!counts_as_hardware(false));
+        assert(counts_as_hardware(true));
+        // 9. production gated:
+        assert(!production_payout_open(TRUST_MODEL_AGREED, true, true));
+    }
+
+    // ---- the credit settles through the ledger ----
+    // The MVP's chain ends here: a coordinator-issued, independently recomputed job is verified,
+    // the payout computed, and trinet::ledger settles one credit per accepted job keyed by
+    // (node, nonce) -- so a receipt settled twice pays once, even if the coordinator restarts.
+
+    test "a verified receipt's credit settles through the ledger, once per (node, nonce)" {
+        var l = register_node(ledger_init(default_policy()), 0xA11CE, 1, true, 5000);
+        assert(l.last_err == ERR_NONE);
+        // The chain's payout gate runs first: a credited outcome pays only for verified work
+        // with a referenced verdict, the receipt award is the fee rather than a slash, and the
+        // attestation gate admits the testnet credit at reproduced strength but not at
+        // software-signed-only -- so the credit that settles below is the payout rule's yes.
+        assert(payout(OUT_CREDITED, true, true) == PAY_NORMAL);
+        assert(payout(OUT_CREDITED, false, true) == PAY_NONE);
+        assert(payout(OUT_CREDITED, true, false) == PAY_NONE);
+        assert(receipt_award(true, true, true) == AWARD_FEE);
+        assert(testnet_credit_allowed(ATT_REPRODUCED) == true);
+        assert(testnet_credit_allowed(ATT_SOFTWARE_SIGNED) == false);
+        // Three accepted jobs: the ledger pays this spec's settlement rate for each.
+        var n : u32 = 1;
+        while (n <= 3) {
+            l = settle(l, 0xA11CE, 0xA11CE, n, V_OK);
+            assert(l.last_outcome == OUT_CREDITED);
+            assert(l.last_credit_delta_mtri == amount_mtri(1));
+            n += 1;
+        }
+        assert(payout_of(l, 1) == amount_mtri(3));
+        // The same nonce again, under any verdict, moves nothing: no second bill, no slash.
+        var v : u8 = 0;
+        while (v < 8) {
+            l = settle(l, 0xA11CE, 0xA11CE, 1, v);
+            assert(l.last_outcome == OUT_ALREADY_SETTLED_NOT_CHARGED);
+            assert(l.last_credit_delta_mtri == 0);
+            v += 1;
+        }
+        assert(payout_of(l, 1) == amount_mtri(3));
+        // A different nonce still pays: the spent key is per (node, nonce), not per node.
+        l = settle(l, 0xA11CE, 0xA11CE, 4, V_OK);
+        assert(l.last_outcome == OUT_CREDITED);
+        assert(payout_of(l, 1) == amount_mtri(4));
+
+        // And a lying verdict is not a credit: the ledger slashes it and the node's payout
+        // stays at zero -- work credit only becomes ledger value through verified settlement.
+        var liar = register_node(ledger_init(default_policy()), 0xBAD07, 1, true, 5000);
+        liar = settle(liar, 0xBAD07, 0xBAD07, 1, V_WRONG_RESULT);
+        assert(liar.last_outcome == OUT_REJECTED_AND_SLASHED);
+        assert(payout_of(liar, 0xBAD07) == 0);
     }
 }
 
