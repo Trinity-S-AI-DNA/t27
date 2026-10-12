@@ -34,6 +34,10 @@ static const const char* LINE_PREFIX[3] = { "", "SPEC-ONLY  ", "DIR-ONLY   " };
 static const const char* LINE_SUFFIX[3] = { "", "  (workflow file gone; regenerate the spec)", "  (workflow not in the matrix; regenerate the spec)" };
 static const size_t PREFIX_LENS[3] = { 0, 11, 11 };
 static const size_t SUFFIX_LENS[3] = { 0, 43, 51 };
+#define COV_HEAD "claw: gate-class coverage, generated from specs/claw/gates.t27"
+#define COV_HEAD_LEN 62
+static const const char* CLASS_LABELS[3] = { "G_BLOCKING", "G_SOFT", "G_REPORTING" };
+static const size_t CLASS_LABEL_LENS[3] = { 10, 6, 11 };
 #define AUDIT_HEAD "claw: gate inventory vs .github/workflows (specs/claw/gates.t27)"
 #define HEAD_LEN 64
 #define OK_TAIL "claw: matrix is current"
@@ -58,7 +62,11 @@ bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name,
 bool dir_has(uint8_t* dir_text, size_t dir_len, const char* name, size_t name_len);
 bool line_in_names(uint8_t* dir_text, size_t start, size_t len);
 size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
+uint8_t digit_byte(uint32_t d);
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
 int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_cap);
+size_t claw_coverage_report(uint8_t* out, size_t out_cap);
 
 /* -------------------------------------------------------
    Function implementations
@@ -205,6 +213,83 @@ size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) 
     return (w + s_len);
 }
 
+uint8_t digit_byte(uint32_t d) {
+    uint8_t b = '0';
+    if ((d == 1)) {
+        b = '1';
+    }
+    if ((d == 2)) {
+        b = '2';
+    }
+    if ((d == 3)) {
+        b = '3';
+    }
+    if ((d == 4)) {
+        b = '4';
+    }
+    if ((d == 5)) {
+        b = '5';
+    }
+    if ((d == 6)) {
+        b = '6';
+    }
+    if ((d == 7)) {
+        b = '7';
+    }
+    if ((d == 8)) {
+        b = '8';
+    }
+    if ((d == 9)) {
+        b = '9';
+    }
+    return b;
+}
+
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
+    uint8_t tmp[16] = {0};
+    size_t n = 0;
+    uint32_t x = v;
+    if ((x == 0)) {
+        tmp[0] = digit_byte(0);
+        n = 1;
+    }
+    while ((x > 0)) {
+        tmp[n] = digit_byte((x % 10));
+        n += 1;
+        x = (x / 10);
+    }
+    size_t k = 0;
+    while ((k < n)) {
+        if (((w + k) < cap)) {
+            dst[(w + k)] = tmp[((n - 1) - k)];
+        }
+        k += 1;
+    }
+    return (w + n);
+}
+
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
+    if ((needle_len > buf_len)) {
+        return false;
+    }
+    size_t start = 0;
+    while (((start + needle_len) <= buf_len)) {
+        size_t k = 0;
+        size_t diff = 0;
+        while ((k < needle_len)) {
+            if ((buf[(start + k)] != needle[k])) {
+                diff += 1;
+            }
+            k += 1;
+        }
+        if ((diff == 0)) {
+            return true;
+        }
+        start += 1;
+    }
+    return false;
+}
+
 int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_cap) {
     size_t w = 0;
     int32_t problems = 0;
@@ -247,6 +332,48 @@ int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_
     }
     w = put_str(out, out_cap, w, "\n", 1);
     return problems;
+}
+
+size_t claw_coverage_report(uint8_t* out, size_t out_cap) {
+    size_t w = 0;
+    w = put_str(out, out_cap, w, COV_HEAD, COV_HEAD_LEN);
+    w = put_str(out, out_cap, w, "\n", 1);
+    size_t ci = 0;
+    uint8_t c = 0;
+    while ((ci < 3)) {
+        w = put_str(out, out_cap, w, CLASS_LABELS[ci], CLASS_LABEL_LENS[ci]);
+        w = put_str(out, out_cap, w, " n=", 3);
+        w = put_count(out, out_cap, w, count_class(c));
+        w = put_str(out, out_cap, w, " blocking=", 10);
+        size_t shown = 0;
+        size_t i = 0;
+        while ((i < 66)) {
+            if ((shown < 3)) {
+                if ((CLASSES[i] == c)) {
+                    if ((shown == 0)) {
+                        if ((is_blocking(NAMES[i], NAME_LENS[i]) == true)) {
+                            w = put_str(out, out_cap, w, "true", 4);
+                        } else {
+                            w = put_str(out, out_cap, w, "false", 5);
+                        }
+                        w = put_str(out, out_cap, w, " e.g. ", 6);
+                    } else {
+                        w = put_str(out, out_cap, w, ", ", 2);
+                    }
+                    w = put_str(out, out_cap, w, NAMES[i], NAME_LENS[i]);
+                    shown += 1;
+                }
+            }
+            i += 1;
+        }
+        w = put_str(out, out_cap, w, "\n", 1);
+        ci += 1;
+        c += 1;
+    }
+    w = put_str(out, out_cap, w, "G_UNKNOWN n=", 12);
+    w = put_count(out, out_cap, w, count_class(G_UNKNOWN));
+    w = put_str(out, out_cap, w, " blocking=false (lookup miss)\n", 30);
+    return w;
 }
 
 /* -------------------------------------------------------
@@ -390,6 +517,40 @@ void test_audit_prefixes_name_the_problem_kind(void) {
     assert((tail == "claw: DRIFT -- regenerate specs/claw/gates.t27 (docs/claw/README.md)"));
 }
 
+void test_every_row_round_trips_through_the_name_lookup(void) {
+    size_t i = 0;
+    while ((i < 66)) {
+        assert((class_of(NAMES[i], NAME_LENS[i]) == CLASSES[i]));
+        if ((CLASSES[i] == G_BLOCKING)) {
+            assert((is_blocking(NAMES[i], NAME_LENS[i]) == true));
+        } else {
+            assert((is_blocking(NAMES[i], NAME_LENS[i]) == false));
+        }
+        i += 1;
+    }
+}
+
+void test_soft_gates_report_their_events(void) {
+    assert((events_of("oracle-nightly", 14) == "schedule,workflow_dispatch"));
+    assert((events_of("queen-doctor", 12) == "schedule,workflow_dispatch"));
+    assert((events_of("rings-rust", 10) == "push,pull_request,workflow_dispatch"));
+}
+
+void test_coverage_report_carries_every_class(void) {
+    uint8_t out[4096] = {0};
+    size_t w = claw_coverage_report(&out, 4096);
+    assert((w > 100));
+    assert((buf_has(&out, w, "G_BLOCKING", 10) == true));
+    assert((buf_has(&out, w, "G_SOFT", 6) == true));
+    assert((buf_has(&out, w, "G_REPORTING", 11) == true));
+    assert((buf_has(&out, w, "n=61", 4) == true));
+    assert((buf_has(&out, w, "n=3", 3) == true));
+    assert((buf_has(&out, w, "n=2", 3) == true));
+    assert((buf_has(&out, w, "n=0", 3) == true));
+    assert((buf_has(&out, w, "n=62", 4) == false));
+    assert((buf_has(&out, w, "G_UNKNOWN", 9) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -413,7 +574,10 @@ int main(void) {
     test_audit_dir_only_for_an_unknown_workflow();
     test_audit_ignores_blank_lines_in_the_directory();
     test_audit_prefixes_name_the_problem_kind();
-    printf("All %d tests passed.\n", 15);
+    test_every_row_round_trips_through_the_name_lookup();
+    test_soft_gates_report_their_events();
+    test_coverage_report_carries_every_class();
+    printf("All %d tests passed.\n", 18);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
