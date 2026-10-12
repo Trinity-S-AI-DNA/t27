@@ -61,7 +61,7 @@ definition moves. `tri types classified` cross-checks the file against a live
 Non-empty drift in either direction exits non-zero. A classification nobody
 re-reads becomes a claim about a tree that no longer exists.
 
-## DRIFT -- 51 names
+## DRIFT -- 62 names
 
 One concept, two definitions. These are the ones with a repair.
 
@@ -119,6 +119,17 @@ One concept, two definitions. These are the ones with a repair.
 | `Url` | 2 | 2 files | Delete the Url declaration in specs/tri/net/http.t27 and import TriUrl; then decide once whet... |
 | `Usage` | 2 | 2 files | Normalize on the provider abstraction's Usage and have server/api.t27 import it, or add the m... |
 
+| `BlinkState` | 3 | 3 files | Hoist one BlinkState (u64 counter or a width const; led_state -> led) into the shared openxc7-synth... |
+| `IssueElement` | 2 | 2 files | Keep audits_new.t27's (the real decision port) and delete audits.t27's placeholder set when that stu... |
+| `JsonObject` | 2 | 2 files | Drop audits.t27's private JSON stand-ins; use tri::encoding::json (or audits_new's NodeView lifting)... |
+| `JsonValue` | 2 | 2 files | Retire audits.t27's stub JsonValue together with its JsonObject (same repair); tri::encoding::json o... |
+| `Metadata` | 2 | 2 files | Keep one SR-01 Metadata (snake_case the field) shared by audits_new.t27 and lighthouse.t27. |
+| `RunResult` | 2 | 2 files | Fold: sweep.t27 reuses run.t27's five-field RunResult; the sweep's pair is a projection of it. |
+| `Subscriber` | 2 | 2 files | Fold: funnel_client reuses subscriber.t27's Subscriber (id + inbox) instead of its id-only stand-in. |
+| `TableRow` | 2 | 2 files | report.t27 uses table.t27's five-field TableRow -- the same one-shape move the file already made for... |
+| `VcdChange` | 2 | 2 files | Fold: one VCD type set under specs/fpga/vcd_trace.t27 (keeping the port's typed VcdVarKind enum); th... |
+| `VcdHeader` | 2 | 2 files | Same fold as VcdVar/VcdChange: one VcdHeader (no _dummy), owned by specs/fpga/vcd_trace.t27. |
+| `VcdVar` | 2 | 2 files | Fold the VCD trio into one type set; keep the typed-enum spelling in the specs/fpga owner and drop t... |
 ### The one that was fixable with no cross-module decision
 
 `AdamWConfig` had **both definitions in one file**,
@@ -128,7 +139,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 38 names
+## DISTINCT -- 48 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -174,6 +185,16 @@ whether to rename.
 | `ValidationResult` | 2 | 2 files | No defect to fix today, but the name is unresolvable across specs: rename to ConfigValidation... |
 | `VerificationReport` | 2 | 2 files | No defect. If the name must resolve, GoldenFamilyAudit and FormulaConformanceTally describe w... |
 
+| `Args` | 2 | 2 files | Rename acm_ae_check's to ParsedCmd (one field, one consumer); the trainer's 15-field clap port keeps... |
+| `ErrorResponse` | 2 | 2 files | Rename rainbow_routes' to RainbowError (its five provenance fields name it); the one-field monitorin... |
+| `LoadResult` | 2 | 2 files | Rename tri_loader's to LoadedImage (it is the TRI binary's header); config's LoadResult keeps the ba... |
+| `Parts` | 2 | 2 files | Rename return_unsized's to TypeArgParts; both are file-private, so a rename is the whole repair. |
+| `Report` | 2 | 2 files | Rename test_framework's to ReportBuffer (it is Text's bigger sibling); the impl-status census keeps... |
+| `Server` | 2 | 2 files | Rename mcp-server's to McpServer (the SDK class it records); rename the empty stub to BackgroundAgen... |
+| `StatusResponse` | 2 | 2 files | Rename runtime's to InstanceStatus (a lifecycle record, not an HTTP body); the /api/status DTO keeps... |
+| `Step` | 2 | 2 files | Rename the attn block's to FsmRegs (init_state/hold return it; it is a register snapshot, not a step... |
+| `TypeEntry` | 2 | 2 files | Rename return_unsized's to TypeSpan (name -> buffer span; nothing about it is a type); the typecheck... |
+| `VersionInfo` | 2 | 2 files | Rename migrate's to ConfigVersionInfo and trios-server's to VersionResponse (the /version sibling of... |
 ## Four verdicts the tool did not earn
 
 `tri types dup` decides CONFLICTED by comparing field lists. For four names --
