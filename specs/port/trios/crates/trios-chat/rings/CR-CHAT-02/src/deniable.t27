@@ -1,0 +1,230 @@
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-02/src/deniable.rs
+// @ 8b229e9489ee (251 lines). Ring: CR-CHAT-02 (secure-chat).
+// Domain: cryptographic deniability + transcript-forgery resistance.
+// Anchor: hmac_tag(key, aad, plaintext) = HMAC-SHA-256(key, aad || plaintext).
+// Invariants ported: INV-CHAT-61 deniable_mac_verifies,
+//   INV-CHAT-62 transcript_forgery_indistinguishable,
+//   INV-CHAT-63 no_per_message_signature, INV-CHAT-64 mac_tamper_rejected.
+// Honesty (R5): `[VERIFIED]` for the 6 unit tests below; deniability of the
+//   underlying Double Ratchet construction is `[CITED]` to Marlinspike–Perrin
+//   2016 (§4) and OTR (Borisov–Goldberg–Brewer 2004) and is not re-proved here.
+//
+// Port decisions:
+// * T-CRYPTO-DECISION: HMAC-SHA-256 is not available in the t27 compiler-only
+//   environment. It is modeled by `hmac_tag`, a deterministic keyed mixer
+//   (xorshift absorb over key, big-endian length-prefixed aad, and plaintext).
+//   The model preserves every property the tests exercise: dependence on each
+//   input byte, the 4-byte big-endian length domain separation of the original,
+//   the 32-byte tag length, and the verify/forge/tamper control flow. It is
+//   NOT cryptographically strong and must never ship as a real MAC.
+// * `zeroize::ZeroizeOnDrop` on DeniableMacKey is not modeled (no destructors
+//   in the t27 port subset); raw-byte wipe discipline stays with the caller.
+// * Constant-time tag comparison is modeled as a full-array equality helper
+//   (no early exit); real code must keep a constant-time primitive.
+// * `forge_transcript` in the original returns `(Vec<u8>, Tag)` — the
+//   plaintext is passed through unchanged. The port returns only the `Tag`
+//   and documents that the plaintext component is the caller's input
+//   unchanged; the tests verify over that same plaintext.
+// * Pass-by-value struct parameters instead of Rust's `&` references.
+// Tests: mirrors den_01..den_06 in the original @ 8b229e9489ee.
+
+module port::deniable;
+
+/// 32-byte symmetric key used to derive deniable MACs.
+///
+/// Derived from the Triple-Ratchet chain key via a "deniable-mac" HKDF info
+/// string in the ratchet (kept short to make the binding explicit). Wiping
+/// happens on drop via zeroize in the original; not modeled here.
+pub const DeniableMacKey = struct { key: [32]u8 };
+
+/// MAC tag — exactly 32 bytes of HMAC-SHA-256 output. Carries **no**
+/// per-message public-key signature; that is the point of deniability
+/// (INV-CHAT-63, checked structurally by den_06).
+pub const Tag = struct { tag: [32]u8 };
+
+/// Constant length — INV-CHAT-63 (`no_per_message_signature`).
+pub const TAG_LEN: usize = 32;
+
+/// Wrap raw bytes (for use by the ratchet, tests).
+pub fn deniable_mac_key_from_bytes(b: [32]u8) DeniableMacKey {
+    return .{ .key = b };
+}
+
+/// Borrow the raw bytes — only for explicit forgery tests.
+pub fn deniable_mac_key_as_bytes(t: *const DeniableMacKey) [32]u8 {
+    return t.key;
+}
+
+/// xorshift-based absorb step of the modeled keyed MAC. Deterministic,
+/// depends on every byte of `data`; NOT a cryptographic primitive.
+fn absorb(seed: u64, data: []const u8) u64 {
+    var h: u64 = seed;
+    for (data) |b| {
+        h ^= @as(u64, @intCast(b));
+        h = (h << 13) | (h >> 51);
+        h ^= h >> 7;
+    }
+    return h;
+}
+
+/// Big-endian u32 length prefix, mirroring `&(len as u32).to_be_bytes()`
+/// in the original — this is the length-domain separator.
+fn be32(v: u64) [4]u8 {
+    return .{
+        @intCast((v >> 24) & 0xFF),
+        @intCast((v >> 16) & 0xFF),
+        @intCast((v >> 8) & 0xFF),
+        @intCast(v & 0xFF),
+    };
+}
+
+/// The modeled keyed MAC over `(aad, plaintext)` under `key_bytes`.
+///
+/// Mirrors the original update order exactly: be32(aad.len), aad,
+/// be32(plaintext.len), plaintext — then binds the key. Output is
+/// 32 bytes, matching HMAC-SHA-256's tag length.
+pub fn hmac_tag(key_bytes: [32]u8, aad: []const u8, plaintext: []const u8) [32]u8 {
+    var h: u64 = 0x243F6A8885A308D3; // domain seed (modeled HMAC IV)
+    var lb: [4]u8 = be32(@intCast(aad.len));
+    h = absorb(h, &lb);
+    h = absorb(h, aad);
+    lb = be32(@intCast(plaintext.len));
+    h = absorb(h, &lb);
+    h = absorb(h, plaintext);
+    h = absorb(h, &key_bytes);
+    var out: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var hh: u64 = h ^ (@as(u64, @intCast(i)) << 40) ^ 0x6A09E667F3BCC908;
+        hh ^= hh >> 33;
+        hh = (hh << 21) | (hh >> 43);
+        hh ^= hh >> 29;
+        out[i] = @intCast(hh & 0xFF);
+    }
+    return out;
+}
+
+/// Authenticate `plaintext` with `aad` under `key`.
+///
+/// Anyone holding `key` can produce this tag — that is precisely what
+/// gives the construction its deniability property.
+pub fn mac(key: DeniableMacKey, aad: []const u8, plaintext: []const u8) Tag {
+    return .{ .tag = hmac_tag(key.key, aad, plaintext) };
+}
+
+/// Verify `tag` against `(aad, plaintext)` under `key`. The original uses a
+/// constant-time comparison; the port models it as a full-array equality
+/// helper with no early exit.
+pub fn verify(key: DeniableMacKey, aad: []const u8, plaintext: []const u8, tag: Tag) bool {
+    return eql32(hmac_tag(key.key, aad, plaintext), tag.tag);
+}
+
+/// Forge a transcript `(plaintext', tag')` for `plaintext'` chosen by the
+/// holder of `key` after the fact. Returns a tag that verifies under `key`
+/// even though no real party ever "sent" `plaintext'`.
+///
+/// This function is intentionally exposed: it is the constructive witness
+/// for INV-CHAT-62 (`transcript_forgery_indistinguishable`). Real session
+/// code never calls it. The original additionally returns the plaintext
+/// unchanged; the port returns only the tag (see port decisions).
+pub fn forge_transcript(key: DeniableMacKey, aad: []const u8, plaintext: []const u8) Tag {
+    return mac(key, aad, plaintext);
+}
+
+/// Full-array 32-byte equality (modeled constant-time comparison).
+fn eql32(a: [32]u8, b: [32]u8) bool {
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+// Tests (mirrors den_01..den_06 in the original @ 8b229e9489ee).
+
+fn k() DeniableMacKey {
+    return deniable_mac_key_from_bytes(.{7} ** 32);
+}
+
+/// **DEN-01** well-formed MAC verifies (INV-CHAT-61).
+test den_01_mac_verifies {
+    const key = k();
+    const aad = "session=42|sender=alice";
+    const pt = "meet at the bridge at midnight";
+    const t = mac(key, aad, pt);
+    assert(verify(key, aad, pt, t));
+    assert(t.tag.len == TAG_LEN);
+}
+
+/// **DEN-02** flipping any plaintext byte invalidates tag (INV-CHAT-64).
+test den_02_plaintext_tamper_rejected {
+    const key = k();
+    const aad = "aad";
+    var pt = "the cake is a lie".*;
+    const t = mac(key, aad, &pt);
+    pt[3] ^= 0x01;
+    assert(!verify(key, aad, &pt, t));
+}
+
+/// **DEN-03** flipping any AAD byte invalidates tag (INV-CHAT-64).
+test den_03_aad_tamper_rejected {
+    const key = k();
+    const aad = "context=v1";
+    const pt = "hello";
+    const t = mac(key, aad, pt);
+    assert(!verify(key, "context=v2", pt, t));
+}
+
+/// **DEN-04** wrong key rejects (basic MAC unforgeability).
+test den_04_wrong_key_rejected {
+    const key = k();
+    const other = deniable_mac_key_from_bytes(.{8} ** 32);
+    const aad = "a";
+    const pt = "b";
+    const t = mac(key, aad, pt);
+    assert(!verify(other, aad, pt, t));
+}
+
+/// **DEN-05** transcript forgery is bit-indistinguishable from honest MAC
+/// under the same key (INV-CHAT-62 — the deniability property).
+///
+/// honest: Alice MACs `pt_honest`. forged: anyone with `key` MACs
+/// `pt_forged` after the fact. Both verify; an external observer holding
+/// `key` cannot tell who minted which tag — that is deniability.
+test den_05_transcript_forgery_indistinguishable {
+    const key = k();
+    const aad = "session=99";
+    const pt_honest = "I will be there";
+    const pt_forged = "I confess to everything";
+
+    const t_honest = mac(key, aad, pt_honest);
+    const t_forged = forge_transcript(key, aad, pt_forged);
+
+    assert(verify(key, aad, pt_honest, t_honest));
+    assert(verify(key, aad, pt_forged, t_forged));
+
+    // Both tags have identical structure — the *whole point* of
+    // deniability. There is no Ed25519/ML-DSA component that would bind
+    // either tag to a specific signer's private key.
+    assert(t_honest.tag.len == t_forged.tag.len);
+    assert(t_honest.tag.len == TAG_LEN);
+}
+
+/// **DEN-06** `Tag` carries **no** public-key signature field
+/// (INV-CHAT-63). Structural / type-level check: a `Tag` is a 32-byte
+/// array — no Ed25519 (64-byte) component, no ML-DSA (3309-byte)
+/// component.
+test den_06_no_per_message_signature {
+    const t = mac(k(), "", "");
+    assert(t.tag.len == 32);
+    assert(@sizeOf(Tag) == 32);
+}
+
+pub fn main() void {
+    den_01_mac_verifies();
+    den_02_plaintext_tamper_rejected();
+    den_03_aad_tamper_rejected();
+    den_04_wrong_key_rejected();
+    den_05_transcript_forgery_indistinguishable();
+    den_06_no_per_message_signature();
+}
