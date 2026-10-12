@@ -14761,7 +14761,18 @@ impl VerilogCodegen {
         // Type alias (e.g. `const GF16 = u16;`, `const TernaryWord = [N]u8;`).
         // Verilog has no typedef and the alias carries no runtime value, so emitting it
         // as `parameter [31:0] GF16 = u16;` is invalid (non-numeric RHS). Emit a comment.
-        if node.children.len() == 1 && node.children[0].kind == NodeKind::ExprIdentifier {
+        //
+        // #2830/#8340: a declaration that STATES ITS TYPE is not a type alias. A type
+        // alias has no annotation to state: `pub const PackedTrit = u8;` carries none,
+        // `pub const AUTO_SHUTDOWN_REASON : u8 = X_SHUTDOWN;` carries one, and that
+        // single bit separates them without guessing anything about the spelling of the
+        // right-hand side. Without this guard, constants initialized from other
+        // constants were emitted as comments, and every test referencing them failed to
+        // elaborate ("Unable to bind" in iverilog).
+        if node.extra_type.is_empty()
+            && node.children.len() == 1
+            && node.children[0].kind == NodeKind::ExprIdentifier
+        {
             let target = &node.children[0].name;
             // A pure type (alias). NOT a value: array literals like `[32]u16{0x..}` carry
             // a `{...}` initializer and are LUT constants, not type aliases — exclude those.
