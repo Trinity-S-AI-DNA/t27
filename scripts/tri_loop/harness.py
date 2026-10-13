@@ -16,6 +16,7 @@ so the next pass runs it instead of re-typing it.
     tri harness https://app.t27.ai/game/browser
     tri harness file:///tmp/page.html --width 375,768,1024
     tri harness URL --wait-for '#root main' --json
+    tri harness                              # no URL: the run-scan (RUN-SCAN)
 
 WHAT IT MEASURES, PER WIDTH
 ---------------------------
@@ -49,10 +50,41 @@ tab bar -- and called the page clean while a screenshot showed two controls it
 had never seen. So each visible frame is measured as its own document and
 printed under its URL; frames of 1px or less are skipped and counted.
 
-Exit 0: nothing found at any width. Exit 1: at least one finding. Exit 2: could
-not measure -- no Playwright, no browser, the URL did not load or answered an
-HTTP error, or a visible frame refused the measurement. An error page measured
-and called clean is the lie this refuses.
+    Exit 0: nothing found at any width. Exit 1: at least one finding. Exit 2: could
+    not measure -- no Playwright, no browser, the URL did not load or answered an
+    HTTP error, or a visible frame refused the measurement. An error page measured
+    and called clean is the lie this refuses. With no URL the harness runs the
+    scan (RUN-SCAN below): Exit 0 when the run left the tree clean, Exit 1 for
+    debris.
+
+RUN-SCAN (NO URL)
+-----------------
+`tri harness` with no URL is the run-scan: no browser, no network, nothing
+written anywhere but a scratch directory created outside the repo tree and
+removed on exit. It exists because the first run-scan wrote its generated Zig
+test files and build cache into the repo, and the debris went unnoticed until
+a tri review caught it (#9383, re-filed from #2675). A bare run does two
+things:
+
+  hygiene   the scratch is created outside the repo, that is verified rather
+            than assumed, then the scratch is removed and that is verified
+            too. Exit 1 on either failure: a scratch inside the tree, or one
+            that survived removal.
+
+  report    every statement-position call in specs/ whose result is not bound
+            to anything, classified the way the account fixes classify them:
+
+              void callee, result dropped    stays -- void carries nothing.
+              imported or unknown callee     stays -- the return type is not
+                                             declared here, so `_` cannot be
+                                             justified.
+              unbound non-void callee        defect -- bind the result to `_`
+                                             at the call site.
+
+`t27c parse` and `typecheck` remain the authority on whether a spec compiles;
+the scan is a source-level read of the discarded-call shape (single-line
+calls), not a parse. It reports, it does not judge the tree: fixing a defect
+is spec work, and this only refuses to lose sight of one.
 
 WHICH BROWSER
 -------------
@@ -112,14 +144,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import sys
 import tempfile
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 MOBILE_BELOW = 768
+
+# The run-scan reads the discarded-call shape straight from the spec source.
+# A statement call: a line that begins with the callee (so `let x = f()`,
+# `_ = f()` and `return f()` are not in it) and ends in `);`. A dotted callee
+# (`schema.save(x)`) counts as imported/unknown: its return type is never
+# declared in this file.
+CALL_RE = re.compile(r"^\s*((?:\w+\.)?[a-z_][a-z0-9_]*)\s*\([^;\n]*\)\s*;", re.M)
+# `fn name(...) → ret` -- the return type on the same or a later line.
+FN_RE = re.compile(
+    r"^\s*(?:pub\s+)?fn\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:→|->)\s*([^\s;{(]+)", re.M
+)
+# Bare names the language itself owns; not a spec's callees.
+SCAN_BUILTINS = frozenset({"assert"})
 
 CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -461,9 +508,91 @@ def could_not(msg: str, hint: str, as_json: bool) -> int:
     return 2
 
 
+def scan(as_json: bool) -> int:
+    """The run-scan: hygiene self-check, then the discarded-call report."""
+    root = Path(__file__).resolve().parents[2]
+
+    # FR-001: the run writes nothing into the repo. The scratch is created
+    # outside the tree (a private TMPDIR, like the browser's), removed on
+    # exit, and both facts are verified, not assumed.
+    scratch = tempfile.mkdtemp(prefix="tri-harness-scan-")
+    inside = Path(scratch).resolve().as_posix().startswith(str(root) + "/")
+    calls = {"void callee (stays)": 0,
+             "imported or unknown callee (stays)": 0,
+             "unbound non-void callee (defect)": 0}
+    files, defects = [], {}
+    try:
+        corpus = root / "specs"
+        if corpus.is_dir():
+            files = sorted(corpus.rglob("*.t27"))
+        for f in files:
+            try:
+                text = f.read_text()
+            except OSError:
+                continue
+            rel = f.relative_to(root).as_posix()
+            decl = dict(FN_RE.findall(text))
+            # Line by line, tracking paren depth, so a continuation line
+            # inside a call's arguments (`format("{}", f(x));`) is not read
+            # as a statement call of its own.
+            depth = 0
+            for ln, line in enumerate(text.split("\n"), 1):
+                if depth == 0:
+                    m = CALL_RE.match(line)
+                    if m and m.group(1) not in SCAN_BUILTINS:
+                        callee = m.group(1)
+                        ret = decl.get(callee)
+                        if "." in callee or ret is None:
+                            calls["imported or unknown callee (stays)"] += 1
+                        elif ret == "void":
+                            calls["void callee (stays)"] += 1
+                        else:
+                            calls["unbound non-void callee (defect)"] += 1
+                            defects.setdefault(rel, []).append(f"{ln}:{callee}")
+                depth = max(0, depth + line.count("(") - line.count(")"))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    removed = not os.path.lexists(scratch)
+
+    debris = []
+    if inside:
+        debris.append(f"scratch {scratch} is inside the repo ({root})")
+    if not removed:
+        debris.append(f"scratch {scratch} survived removal")
+
+    if as_json:
+        print(json.dumps({
+            "result": "scan",
+            "files": len(files),
+            "calls": calls,
+            "defects": {k: len(v) for k, v in defects.items()},
+            "hygiene": {
+                "scratch": scratch,
+                "inside_repo": inside,
+                "removed": removed,
+                "debris": debris,
+            },
+        }, sort_keys=True))
+    else:
+        print(f"tri harness scan: {len(files)} spec files under specs/")
+        for label in sorted(calls):
+            print(f"  {label}: {calls[label]}")
+        if defects:
+            print("  unbound non-void callees, by file:")
+            for path in sorted(defects):
+                print(f"    {path}: {len(defects[path])}")
+        if not files:
+            print("  no specs/ corpus found; ran from outside the repo?")
+        for d in debris:
+            print(f"  DEBRIS: {d}")
+        print(f"  hygiene: scratch {scratch} outside the repo, removed on exit")
+    return 1 if debris else 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="tri harness", description=__doc__.split("\n")[1])
-    ap.add_argument("url")
+    ap.add_argument("url", nargs="?", default=None,
+                    help="page to measure; omit it to run the scan (RUN-SCAN in --help)")
     ap.add_argument("--width", default="375,1024",
                     help="comma-separated CSS widths; under 768 is a phone (default 375,1024)")
     ap.add_argument("--browser", help="Chromium-family executable to drive")
@@ -480,6 +609,9 @@ def main(argv: list[str]) -> int:
                      help="open URL in a visible browser, you sign in, Enter saves the "
                           "session to FILE (mode 600); measures nothing")
     a = ap.parse_args(argv)
+
+    if a.url is None:
+        return scan(a.json)
 
     try:
         widths = [int(w) for w in a.width.split(",") if w.strip()]
