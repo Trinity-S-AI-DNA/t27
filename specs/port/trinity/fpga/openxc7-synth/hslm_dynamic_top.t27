@@ -1,104 +1,447 @@
-module hslm_dynamic_top;
+// SPDX-License-Identifier: Apache-2.0
+// specs/port/trinity/fpga/openxc7-synth/hslm_dynamic_top.t27
+//
+// Port of the lost FPGA project's hslm_dynamic_top.v (the demo top): it
+// divides the 50 MHz clock down to the UART baud tick (16x oversampling),
+// holds the fabric in a 256-cycle power-on reset window, runs the command
+// router that steers ESP32 bytes into the two subsystems (0x10-0x1F ->
+// inference, 0x01-0x0F -> weight loading, behind an 0xAA sync byte),
+// forwards further bytes to whichever subsystem is already active, walks
+// the RX/TX UART shift state machines, and drives the board LED (solid on
+// when ready, a fast blink while the LM runs inference, a slow blink
+// while weights load).
+//
+// Not claimed: the inference engine and the weight loader are other
+// modules (the original declares their interface wires but their logic
+// lives elsewhere); clock rate, bit widths, reset polarity and every other
+// exchange-specific decision are the Synthesizer's job, not this port's;
+// the shift/counter register plumbing (when values are clocked into
+// registers) stays in the Verilog backend. This file carries the
+// decisions: POR timing, command routing, LED control, and the RX/TX
+// frame state machines.
+//
+// Claim status: [salvage] -- hslm_dynamic_top.v is only known from the
+// salvage commit; the decisions below are a transcript of its register
+// transfer logic, with each function naming the statement it mirrors.
+//
+// TRINITY: decisions come from hslm_dynamic_top.v (lost FPGA project, demo
+// top); they are the original's rules *mutatis mutandis* -- the per-clock
+// register plumbing is omitted, the decision logic is kept one-to-one.
 
-// Constants from the original Verilog
-pub const N_SMALL = 243;
-pub const N_LARGE = 729;
-pub const ACC_WIDTH = 20;
-pub const FRAC_BITS = 8;
-pub const VOCAB = 128;
-pub const LM_ACC = 32;
-pub const CLK_DIV = 27;
+module hslm_dynamic_top {
 
-// State enums
-pub enum RxState {
-    idle,
-    start,
-    data,
-    stop,
-}
+    // ---- Clock / UART configuration (hslm_dynamic_top.v localparams) --------
+    // 16x oversampling: one oversample tick every CLK_DIV clocks
+    // (50 MHz / (16 * 115200) = 27).
+    const CLK_FREQ: u32 = 50_000_000;
+    const BAUD_RATE: u32 = 115200;
+    const OVERSAMPLE: u32 = 16;
+    const CLK_DIV: u32 = CLK_FREQ / (OVERSAMPLE * BAUD_RATE);
 
-pub enum CmdMode {
-    idle,
-    infer,
-    weight,
-}
+    // ---- Inference / weight-loader geometry (hslm_dynamic_top.v localparams)
+    // Sizing of the two subsystems the router steers bytes into.
+    const N_SMALL: u32 = 243;
+    const N_LARGE: u32 = 729;
+    const ACC_WIDTH: u32 = 20;
+    const FRAC_BITS: u32 = 8;
+    const VOCAB: u32 = 128;
+    const LM_ACC: u32 = 32;
 
-// Test basic constant values
-test constants_check {
-    assert(N_SMALL == 243);
-    assert(N_LARGE == 729);
-    assert(ACC_WIDTH == 20);
-    assert(FRAC_BITS == 8);
-    assert(VOCAB == 128);
-    assert(LM_ACC == 32);
-    assert(CLK_DIV == 27);
-}
+    // ---- Command router sync marker (hslm_dynamic_top.v SYNC_BYTE) ----------
+    const SYNC_BYTE: u8 = 0xAA;
 
-// Test enum values
-test enum_values {
-    assert(RxState.idle == RxState.idle);
-    assert(RxState.start == RxState.start);
-    assert(RxState.data == RxState.data);
-    assert(RxState.stop == RxState.stop);
-    
-    assert(CmdMode.infer == CmdMode.infer);
-    assert(CmdMode.weight == CmdMode.weight);
-}
+    // ---- Router mode (hslm_dynamic_top.v localparams MODE_*) -----------------
+    const MODE_IDLE: u8 = 0;
+    const MODE_INFER: u8 = 1;
+    const MODE_WEIGHT: u8 = 2;
 
-// Simple function that mimics some basic logic from the original
-pub fn calculate_debug_state(cmd_mode: CmdMode, weight_loading: bool) -> bool {
-    if (weight_loading) {
-        return true;
+    // ---- Route outcomes (one received byte's fate in the router) -------------
+    const ROUTE_SYNC: u8 = 0;
+    const ROUTE_INFER_CMD: u8 = 1;
+    const ROUTE_WEIGHT_CMD: u8 = 2;
+    const ROUTE_FWD_INFER: u8 = 3;
+    const ROUTE_FWD_WEIGHT: u8 = 4;
+    const ROUTE_DROP: u8 = 5;
+
+    // ---- RX FSM states (hslm_dynamic_top.v localparam RX_*) -------------------
+    const RX_IDLE: u8 = 0;
+    const RX_START: u8 = 1;
+    const RX_DATA: u8 = 2;
+    const RX_STOP: u8 = 3;
+
+    // ---- LED blink holds (hslm_dynamic_top.v LED counter arms) ----------------
+    // Toggles every LED_HOLD_* clocks while that program runs; 0 means the
+    // LED is held solid on.
+    const LED_HOLD_WEIGHT: u32 = 12_500_000;
+    const LED_HOLD_INFER: u32 = 3_125_000;
+
+    // ---- Power-on reset ---------------------------------------------------------
+
+    // hslm_dynamic_top.v: if (por_cnt < 8'd255) por_cnt <= por_cnt + 1'b1;
+    // else por_cnt <= 8'd255; -- the counter climbs to its wrap and holds.
+    fn por_counter_next(counter: u32) -> u32 {
+        if (counter < 255) { return counter + 1; }
+        return 255;
     }
-    return cmd_mode == CmdMode.infer;
-}
 
-test debug_state_logic {
-    assert(calculate_debug_state(CmdMode.infer, false) == true);
-    assert(calculate_debug_state(CmdMode.weight, false) == false);
-    assert(calculate_debug_state(CmdMode.idle, false) == false);
-    assert(calculate_debug_state(CmdMode.infer, true) == true);
-}
-
-// Simple LED state calculation
-pub fn calculate_led_state(cmd_mode: CmdMode, weight_loading: bool) -> bool {
-    if (weight_loading) {
-        return false;  // Slow blink during weight loading
+    // hslm_dynamic_top.v: rst <= (por_cnt < 8'd255); -- reset stays asserted
+    // while the counter is still climbing.
+    fn por_rst_active(counter: u32) -> bool {
+        return counter < 255;
     }
-    if (cmd_mode == CmdMode.infer) {
-        return false;  // Fast blink during inference
+
+    // ---- Baud tick ---------------------------------------------------------------
+
+    // hslm_dynamic_top.v: every state machine acts on
+    // (clk_div == CLK_DIV - 1) -- the tick fires every CLK_DIV clocks.
+    fn baud_tick(clk_div: u32) -> bool {
+        return clk_div == CLK_DIV - 1;
     }
-    return true;  // Solid ON = ready
+
+    // hslm_dynamic_top.v: clk_div <= (clk_div == CLK_DIV - 1) ? 16'd0 :
+    // clk_div + 1'b1;
+    fn baud_counter_next(clk_div: u32) -> u32 {
+        if (clk_div == CLK_DIV - 1) { return 0; }
+        return clk_div + 1;
+    }
+
+    // ---- Command router -------------------------------------------------------------
+
+    // hslm_dynamic_top.v: 8'h10 <= rx_byte && rx_byte <= 8'h1F selects the
+    // inference subsystem.
+    fn is_infer_command(cmd: u8) -> bool {
+        return cmd >= 0x10 and cmd <= 0x1F;
+    }
+
+    // hslm_dynamic_top.v: 8'h01 <= rx_byte && rx_byte <= 8'h0F selects the
+    // weight loader.
+    fn is_weight_command(cmd: u8) -> bool {
+        return cmd >= 0x01 and cmd <= 0x0F;
+    }
+
+    // hslm_dynamic_top.v: if (!got_sync) got_sync <= (rx_byte == SYNC_BYTE);
+    // else got_sync <= 1'b0; -- an 0xAA opens a one-byte command window.
+    fn router_next_sync(got_sync: bool, cmd: u8) -> bool {
+        if (!got_sync) { return cmd == SYNC_BYTE; }
+        return false;
+    }
+
+    // hslm_dynamic_top.v: if (got_sync) begin ... cmd_mode <= MODE_INFER /
+    // MODE_WEIGHT end -- the mode only changes on a routed command byte.
+    fn router_next_mode(cmd_mode: u8, got_sync: bool, cmd: u8) -> u8 {
+        if (!got_sync) { return cmd_mode; }
+        if (is_infer_command(cmd)) { return MODE_INFER; }
+        if (is_weight_command(cmd)) { return MODE_WEIGHT; }
+        return cmd_mode;
+    }
+
+    // hslm_dynamic_top.v router, one received byte at a time: a byte is
+    // either consumed as the 0xAA sync marker (ROUTE_SYNC), routed as a new
+    // command (ROUTE_INFER_CMD / ROUTE_WEIGHT_CMD), forwarded to whichever
+    // subsystem is already active (ROUTE_FWD_INFER / ROUTE_FWD_WEIGHT), or
+    // dropped (ROUTE_DROP).
+    fn route_byte(got_sync: bool, cmd_mode: u8, cmd: u8) -> u8 {
+        if (!got_sync) {
+            if (cmd == SYNC_BYTE) { return ROUTE_SYNC; }
+            if (cmd_mode == MODE_INFER) { return ROUTE_FWD_INFER; }
+            if (cmd_mode == MODE_WEIGHT) { return ROUTE_FWD_WEIGHT; }
+            return ROUTE_DROP;
+        }
+        if (is_infer_command(cmd)) { return ROUTE_INFER_CMD; }
+        if (is_weight_command(cmd)) { return ROUTE_WEIGHT_CMD; }
+        return ROUTE_DROP;
+    }
+
+    // ---- RX shift state machine -------------------------------------------------
+
+    // hslm_dynamic_top.v RX_IDLE: if (!uart_rx) rx_state <= RX_START; -- a
+    // falling edge on the line opens a frame.
+    // hslm_dynamic_top.v RX_START: at the baud tick with the 8th mid-bit
+    // sample taken, a still-low line confirms the start bit; a high line is
+    // a glitch and the machine falls back to idle.
+    // hslm_dynamic_top.v RX_DATA: at each baud tick with the 16th sample
+    // taken the next data bit is clocked in; after the 8th bit the machine
+    // moves to the stop state.
+    // hslm_dynamic_top.v RX_STOP: at the baud tick the byte is latched and
+    // the machine returns to idle.
+    fn rx_next_state(state: u8, clk_div: u32, sample_cnt: u32, bit_cnt: u32, rx_line: bool) -> u8 {
+        if (state == RX_IDLE) {
+            if (!rx_line) { return RX_START; }
+            return RX_IDLE;
+        }
+        if (state == RX_START) {
+            if (clk_div == CLK_DIV - 1) {
+                if (sample_cnt == 7) {
+                    if (!rx_line) { return RX_DATA; }
+                    return RX_IDLE;
+                }
+            }
+            return RX_START;
+        }
+        if (state == RX_DATA) {
+            if (clk_div == CLK_DIV - 1) {
+                if (sample_cnt == 15) {
+                    if (bit_cnt == 7) { return RX_STOP; }
+                    return RX_DATA;
+                }
+            }
+            return RX_DATA;
+        }
+        if (state == RX_STOP) {
+            if (clk_div == CLK_DIV - 1) { return RX_IDLE; }
+            return RX_STOP;
+        }
+        return RX_IDLE;
+    }
+
+    // hslm_dynamic_top.v: rx_shift <= {uart_rx, rx_shift[7:1]}; -- data bits
+    // arrive LSB-first and are shifted down from the top.
+    fn rx_shift_next(shift: u8, bit: bool) -> u8 {
+        var shifted: u8 = shift >> 1;
+        if (bit) { shifted = shifted | 0x80; }
+        return shifted;
+    }
+
+    // hslm_dynamic_top.v RX_DATA: rx_sample_cnt <= (rx_sample_cnt == 4'd15) ?
+    // 4'd0 : rx_sample_cnt + 1'b1; -- sixteen samples per data bit.
+    fn rx_sample_next(sample_cnt: u32) -> u32 {
+        if (sample_cnt == 15) { return 0; }
+        return sample_cnt + 1;
+    }
+
+    // hslm_dynamic_top.v RX_DATA: rx_bit_cnt <= rx_bit_cnt + 1'b1; -- the
+    // bit counter climbs once per completed data bit and restarts per frame.
+    fn rx_bit_next(bit_cnt: u32) -> u32 {
+        if (bit_cnt == 7) { return 0; }
+        return bit_cnt + 1;
+    }
+
+    // ---- TX serializer ------------------------------------------------------------
+
+    // hslm_dynamic_top.v: if (!tx_active && tx_send) tx_active <= 1'b1; --
+    // a byte is accepted only while the shifter is idle.
+    fn tx_accepts(tx_active: bool, tx_send: bool) -> bool {
+        return !tx_active and tx_send;
+    }
+
+    // hslm_dynamic_top.v: data bits 0-7 drive the line from the shift
+    // register LSB (uart_tx_reg <= tx_shift[0]), bit 8 emits the stop bit
+    // and bit 9 leaves the line idling high.
+    fn tx_line_level(bit_idx: u32, shift: u8) -> u8 {
+        if (bit_idx < 8) { return shift & 1; }
+        return 1;
+    }
+
+    // hslm_dynamic_top.v: tx_shift <= {1'b0, tx_shift[7:1]}; -- the shift
+    // register only moves while data bits are going out.
+    fn tx_shift_next(bit_idx: u32, shift: u8) -> u8 {
+        if (bit_idx < 8) { return shift >> 1; }
+        return shift;
+    }
+
+    // hslm_dynamic_top.v: tx_bit_idx <= tx_bit_idx + 1'b1; -- the index
+    // climbs through the stop bit and then holds.
+    fn tx_bit_idx_next(bit_idx: u32) -> u32 {
+        if (bit_idx <= 8) { return bit_idx + 1; }
+        return bit_idx;
+    }
+
+    // hslm_dynamic_top.v: tx_active <= 1'b0 once the stop bit has been on
+    // the line for a full period.
+    fn tx_next_active(bit_idx: u32) -> bool {
+        return bit_idx <= 8;
+    }
+
+    // ---- LED ------------------------------------------------------------------------
+
+    // hslm_dynamic_top.v: if (weight_loading) <hold> = 25'd12_500_000;
+    // else if (cmd_mode == MODE_INFER) <hold> = 25'd3_125_000; -- a loading
+    // run blinks slowly, an inference run blinks fast, and with neither the
+    // LED is held solid on.
+    fn led_blink_hold(weight_loading: bool, cmd_mode: u8) -> u32 {
+        if (weight_loading) { return LED_HOLD_WEIGHT; }
+        if (cmd_mode == MODE_INFER) { return LED_HOLD_INFER; }
+        return 0;
+    }
+
+    // hslm_dynamic_top.v: if (led_hold != 0 && led_counter == led_hold)
+    // led_state <= ~led_state; -- the toggle only fires while a blink
+    // program is active.
+    fn led_toggles(led_counter: u32, led_hold: u32) -> bool {
+        if (led_hold == 0) { return false; }
+        return led_counter == led_hold;
+    }
+
+    // hslm_dynamic_top.v: assign led = ~led_state; -- the LED is active-low.
+    fn led_output(led_state: bool) -> bool {
+        return !led_state;
+    }
+
+    // ---- Debug state ------------------------------------------------------------------
+
+    // hslm_dynamic_top.v: assign debug_state = {cmd_mode == MODE_INFER,
+    // weight_loading}; -- bit 1 lights for inference, bit 0 for weight
+    // loading.
+    fn debug_state(weight_loading: bool, cmd_mode: u8) -> u8 {
+        var value: u8 = 0;
+        if (weight_loading) { value = value | 1; }
+        if (cmd_mode == MODE_INFER) { value = value | 2; }
+        return value;
+    }
+
+    // ---- Tests ------------------------------------------------------------------------
+
+    test power_on_reset_holds_for_256_cycles {
+        assert(por_rst_active(0) == true);
+        assert(por_rst_active(254) == true);
+        assert(por_rst_active(255) == false);
+        assert(por_counter_next(0) == 1);
+        assert(por_counter_next(254) == 255);
+        assert(por_counter_next(255) == 255);
+    }
+
+    test baud_tick_fires_every_clk_div_cycles {
+        assert(baud_tick(25) == false);
+        assert(baud_tick(26) == true);
+        assert(baud_counter_next(0) == 1);
+        assert(baud_counter_next(25) == 26);
+        assert(baud_counter_next(26) == 0);
+    }
+
+    test command_ranges_split_inference_from_weight {
+        assert(is_infer_command(0x10) == true);
+        assert(is_infer_command(0x1F) == true);
+        assert(is_infer_command(0x0F) == false);
+        assert(is_infer_command(0x20) == false);
+        assert(is_weight_command(0x01) == true);
+        assert(is_weight_command(0x0F) == true);
+        assert(is_weight_command(0x00) == false);
+        assert(is_weight_command(0x10) == false);
+    }
+
+    test sync_byte_opens_a_one_byte_command_window {
+        assert(router_next_sync(false, 0xAA) == true);
+        assert(router_next_sync(false, 0x10) == false);
+        assert(router_next_sync(true, 0xAA) == false);
+        assert(router_next_sync(true, 0x00) == false);
+    }
+
+    test router_mode_changes_only_on_routed_commands {
+        assert(router_next_mode(MODE_IDLE, true, 0x10) == MODE_INFER);
+        assert(router_next_mode(MODE_IDLE, true, 0x1F) == MODE_INFER);
+        assert(router_next_mode(MODE_IDLE, true, 0x0F) == MODE_WEIGHT);
+        assert(router_next_mode(MODE_IDLE, true, 0x01) == MODE_WEIGHT);
+        assert(router_next_mode(MODE_IDLE, true, 0x42) == MODE_IDLE);
+        assert(router_next_mode(MODE_INFER, false, 0x42) == MODE_INFER);
+    }
+
+    test router_classifies_every_received_byte {
+        assert(route_byte(false, MODE_IDLE, 0xAA) == ROUTE_SYNC);
+        assert(route_byte(true, MODE_IDLE, 0x10) == ROUTE_INFER_CMD);
+        assert(route_byte(true, MODE_IDLE, 0x0F) == ROUTE_WEIGHT_CMD);
+        assert(route_byte(true, MODE_IDLE, 0x42) == ROUTE_DROP);
+        assert(route_byte(false, MODE_INFER, 0x57) == ROUTE_FWD_INFER);
+        assert(route_byte(false, MODE_WEIGHT, 0x57) == ROUTE_FWD_WEIGHT);
+        assert(route_byte(false, MODE_IDLE, 0x57) == ROUTE_DROP);
+    }
+
+    test rx_finds_the_start_bit {
+        assert(rx_next_state(RX_IDLE, 0, 0, 0, false) == RX_START);
+        assert(rx_next_state(RX_IDLE, 0, 0, 0, true) == RX_IDLE);
+        assert(rx_next_state(RX_START, 26, 7, 0, false) == RX_DATA);
+        assert(rx_next_state(RX_START, 26, 7, 0, true) == RX_IDLE);
+        assert(rx_next_state(RX_START, 26, 3, 0, false) == RX_START);
+        assert(rx_next_state(RX_START, 10, 7, 0, false) == RX_START);
+    }
+
+    test rx_data_bits_lead_to_the_stop_state {
+        assert(rx_next_state(RX_DATA, 26, 15, 7, true) == RX_STOP);
+        assert(rx_next_state(RX_DATA, 26, 15, 3, false) == RX_DATA);
+        assert(rx_next_state(RX_DATA, 26, 14, 7, true) == RX_DATA);
+        assert(rx_next_state(RX_DATA, 10, 15, 7, true) == RX_DATA);
+        assert(rx_next_state(RX_STOP, 26, 0, 7, true) == RX_IDLE);
+    }
+
+    test rx_shifts_data_bits_in_lsb_first {
+        assert(rx_shift_next(0x00, true) == 0x80);
+        assert(rx_shift_next(0x00, false) == 0x00);
+        assert(rx_shift_next(0x80, true) == 0xC0);
+        assert(rx_shift_next(0xFF, false) == 0x7F);
+        assert(rx_shift_next(0x55, true) == 0xAA);
+    }
+
+    test rx_counters_step_and_wrap {
+        assert(rx_sample_next(0) == 1);
+        assert(rx_sample_next(14) == 15);
+        assert(rx_sample_next(15) == 0);
+        assert(rx_bit_next(0) == 1);
+        assert(rx_bit_next(6) == 7);
+        assert(rx_bit_next(7) == 0);
+    }
+
+    test tx_accepts_a_byte_only_while_idle {
+        assert(tx_accepts(false, true) == true);
+        assert(tx_accepts(true, true) == false);
+        assert(tx_accepts(false, false) == false);
+    }
+
+    test tx_walks_data_bits_then_the_stop_bit {
+        assert(tx_line_level(0, 0x55) == 1);
+        assert(tx_line_level(1, 0x2A) == 0);
+        assert(tx_line_level(2, 0x15) == 1);
+        assert(tx_line_level(3, 0x0A) == 0);
+        assert(tx_line_level(4, 0x05) == 1);
+        assert(tx_line_level(5, 0x02) == 0);
+        assert(tx_line_level(6, 0x01) == 1);
+        assert(tx_line_level(7, 0x00) == 0);
+        assert(tx_line_level(8, 0x00) == 1);
+        assert(tx_line_level(9, 0x00) == 1);
+        assert(tx_shift_next(0, 0x55) == 0x2A);
+        assert(tx_shift_next(7, 0x01) == 0x00);
+        assert(tx_shift_next(8, 0x00) == 0x00);
+        assert(tx_bit_idx_next(0) == 1);
+        assert(tx_bit_idx_next(8) == 9);
+        assert(tx_bit_idx_next(9) == 9);
+        assert(tx_next_active(8) == true);
+        assert(tx_next_active(9) == false);
+    }
+
+    test led_blinks_fast_while_inferring_and_slow_while_loading {
+        assert(led_blink_hold(true, MODE_IDLE) == LED_HOLD_WEIGHT);
+        assert(led_blink_hold(true, MODE_INFER) == LED_HOLD_WEIGHT);
+        assert(led_blink_hold(false, MODE_INFER) == LED_HOLD_INFER);
+        assert(led_blink_hold(false, MODE_WEIGHT) == 0);
+        assert(led_blink_hold(false, MODE_IDLE) == 0);
+        assert(led_toggles(3_125_000, LED_HOLD_INFER) == true);
+        assert(led_toggles(3_124_999, LED_HOLD_INFER) == false);
+        assert(led_toggles(12_500_000, 0) == false);
+        assert(led_output(true) == false);
+        assert(led_output(false) == true);
+    }
+
+    test debug_state_reports_loading_and_inference {
+        assert(debug_state(true, MODE_WEIGHT) == 1);
+        assert(debug_state(false, MODE_INFER) == 2);
+        assert(debug_state(true, MODE_INFER) == 3);
+        assert(debug_state(false, MODE_WEIGHT) == 0);
+    }
+
+    test on_comb_routes_a_command_byte {
+        assert(on_comb(0x10) == MODE_INFER);
+        assert(on_comb(0x1F) == MODE_INFER);
+        assert(on_comb(0x0F) == MODE_WEIGHT);
+        assert(on_comb(0x01) == MODE_WEIGHT);
+        assert(on_comb(0x42) == MODE_IDLE);
+    }
 }
 
-test led_state_logic {
-    assert(calculate_led_state(CmdMode.idle, false) == true);
-    assert(calculate_led_state(CmdMode.infer, false) == false);
-    assert(calculate_led_state(CmdMode.weight, false) == false);
-    assert(calculate_led_state(CmdMode.idle, true) == false);
-}
-
-// Simple UART command router logic
-pub fn route_command(cmd_byte: u8, got_sync: bool) -> CmdMode {
-    if (!got_sync) {
-        return CmdMode.idle;
-    }
-    
-    if (cmd_byte >= 0x10 and cmd_byte <= 0x1F) {
-        return CmdMode.infer;
-    } else if (cmd_byte >= 0x01 and cmd_byte <= 0xF) {
-        return CmdMode.weight;
-    }
-    
-    return CmdMode.idle;
-}
-
-test command_routing {
-    assert(route_command(0x00, false) == CmdMode.idle);
-    assert(route_command(0xAA, false) == CmdMode.idle);
-    assert(route_command(0x10, true) == CmdMode.infer);
-    assert(route_command(0x1F, true) == CmdMode.infer);
-    assert(route_command(0x01, true) == CmdMode.weight);
-    assert(route_command(0x0F, true) == CmdMode.weight);
-    assert(route_command(0x20, true) == CmdMode.idle);
+// The hardware boundary (T187): the command router is the top's purely
+// combinational surface -- a routed command byte in, the subsystem it
+// belongs to out (MODE_INFER, MODE_WEIGHT, or MODE_IDLE when the byte is
+// not a command). specs/fpga/cts.t27 derives the same kind of port;
+// router_next_mode's arm is the logic behind it here.
+fn on_comb(cmd: u8) -> u8 {
+    if (is_infer_command(cmd)) { return MODE_INFER; }
+    if (is_weight_command(cmd)) { return MODE_WEIGHT; }
+    return MODE_IDLE;
 }
