@@ -4282,6 +4282,13 @@ theorem ar_datalog_engine_lowerable : Module.isLowerable ar_datalog_engine_env a
 theorem ar_explainability_lowerable : Module.isLowerable ar_explainability_env ar_explainability_module = true := by native_decide
 theorem ar_proof_trace_lowerable : Module.isLowerable ar_proof_trace_env ar_proof_trace_module = true := by native_decide
 theorem ar_restraint_lowerable : Module.isLowerable ar_restraint_env ar_restraint_module = true := by native_decide
+-- #6658 (re-filed as #9396) proposed deleting this model and theorem: at master
+-- 099ac2224 the model was vacuous (empty functions, globals, tests) and the
+-- theorem claimed `= true` while the classifier answers `false` (unsized
+-- `[Trit]` slices). 656a62505 (#6684) did the long-term repair instead: real
+-- signatures below, theorem `= false`, agreeing with the classifier. Do not
+-- delete them: `lowerability_models_keep_real_source_signatures` requires this
+-- module's real signature witnesses.
 theorem ar_ternary_logic_lowerable : Module.isLowerable ar_ternary_logic_env ar_ternary_logic_module = false := by native_decide
 theorem automation_wrapup_auto_lowerable : Module.isLowerable automation_wrapup_auto_env automation_wrapup_auto_module = true := by native_decide
 theorem base_debounce_lowerable : Module.isLowerable base_debounce_env base_debounce_module = true := by native_decide
