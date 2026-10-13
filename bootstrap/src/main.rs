@@ -2161,8 +2161,6 @@ use axum::{
     Router,
 };
 #[cfg(feature = "server")]
-use tower_http::services::{ServeDir, ServeFile};
-#[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
@@ -2228,6 +2226,21 @@ async fn health_handler() -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION"),
         healthy: true,
     })
+}
+
+/// Fallback for requests that match no route. The API deliberately returns a
+/// structured 404 instead of serving static files from disk, so the server
+/// starts identically everywhere regardless of what the working directory
+/// happens to contain.
+#[cfg(feature = "server")]
+async fn not_found_handler() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Not Found",
+            "message": "No route matched this request",
+        })),
+    )
 }
 
 #[cfg(feature = "server")]
@@ -3697,10 +3710,10 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
         .route("/global/sync-event", get(global_event_handler))
         .route("/project", get(project_list_handler))
         .route("/project/current", get(project_current_handler))
-        .route("/project/:id", axum::routing::patch(project_patch_handler))
+        .route("/project/{id}", axum::routing::patch(project_patch_handler))
         .route("/provider", get(provider_list_handler))
         .route("/provider/auth", get(provider_auth_handler).post(provider_auth_handler))
-        .route("/auth/:id", get(auth_id_handler).post(auth_id_handler).put(auth_id_handler))
+        .route("/auth/{id}", get(auth_id_handler).post(auth_id_handler).put(auth_id_handler))
         .route("/config", get(config_get_handler))
         .route("/config/providers", get(config_providers_handler))
         .route("/path", get(path_handler))
@@ -3708,12 +3721,12 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
         .route("/session", get(session_list_handler).post(session_create_handler))
         .route("/sessions", get(session_list_handler).post(session_create_handler))
         .route("/session/status", get(session_status_handler))
-        .route("/session/:id", get(session_id_handler).delete(session_delete_handler))
-        .route("/sessions/:id", get(session_id_handler).delete(session_delete_handler))
-        .route("/sessions/:id/token", post(session_create_sandbox_token_handler))
-        .route("/session/:id/message", get(session_message_list_handler).post(session_message_post_handler))
-        .route("/session/:id/prompt_async", post(prompt_async_handler))
-        .route("/session/:id/todo", get(session_todo_handler))
+        .route("/session/{id}", get(session_id_handler).delete(session_delete_handler))
+        .route("/sessions/{id}", get(session_id_handler).delete(session_delete_handler))
+        .route("/sessions/{id}/token", post(session_create_sandbox_token_handler))
+        .route("/session/{id}/message", get(session_message_list_handler).post(session_message_post_handler))
+        .route("/session/{id}/prompt_async", post(prompt_async_handler))
+        .route("/session/{id}/todo", get(session_todo_handler))
         .route("/agent", get(agent_list_handler))
         .route("/vcs", get(vcs_handler))
         .route("/command", get(generic_list_handler))
@@ -3743,11 +3756,8 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
         .route("/metrics", post(metrics_handler))
         .route("/coverage", post(coverage_handler))
         .route("/sandbox", any(proxy::sandbox_proxy_handler))
-        .route("/sandbox/*path", any(proxy::sandbox_proxy_handler))
-        .fallback_service(
-            ServeDir::new("public")
-                .not_found_service(ServeFile::new("public/index.html"))
-        )
+        .route("/sandbox/{*path}", any(proxy::sandbox_proxy_handler))
+        .fallback(not_found_handler)
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -12831,4 +12841,63 @@ fn run_classify(specs_dir: &str, include_scratch: bool, verbose: bool) -> anyhow
     println!("  Measured: 5 of the non-SOURCE files parse. `parse-complete` is the");
     println!("  authority on parsing; this one is the authority on what is code.");
     Ok(())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod fallback_tests {
+    use super::*;
+
+    /// Boots a minimal router built the same way `run_server` builds the
+    /// production one (explicit routes plus a structured-JSON fallback) on a
+    /// loopback port, and returns its base URL.
+    async fn spawn_test_router() -> String {
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .fallback(not_found_handler);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind loopback listener");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server failed");
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn unmatched_routes_get_structured_json_404() {
+        let base_url = spawn_test_router().await;
+        let client = reqwest::Client::new();
+
+        // Sanity check: a matched route still answers normally.
+        let health = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health request failed");
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+        // A route that matches nothing must fall through to the JSON 404
+        // handler, not to a static-file directory service.
+        let res = client
+            .get(format!("{base_url}/definitely/not/a/route"))
+            .send()
+            .await
+            .expect("fallback request failed");
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+        );
+
+        let body: serde_json::Value = res.json().await.expect("body was not valid JSON");
+        assert_eq!(body["error"], "Not Found");
+    }
 }
