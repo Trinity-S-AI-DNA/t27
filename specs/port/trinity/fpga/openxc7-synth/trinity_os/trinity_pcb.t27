@@ -1,0 +1,430 @@
+// Port of the T27 PCB (process control block) memory block to the
+// openxc7-synthesis FPGA target.
+//
+// The original is a 16-entry x 256-bit PCB store: ten fields per task,
+// a valid bit per entry, a field-select write path and a combinational
+// field-read mux feeding `field_rdata`, plus a `task_count` population
+// count over `valid[j] && pcb_memory[j].state != INVALID`.
+//
+// Port surface, per ../README.md ("port iff the spec declares on_comb
+// or on_clock", "port only what can be verified end-to-end"):
+//
+//   Decisions ported, one function each:
+//     - the F_*/SEL_* field map            -> field_offset / field_width
+//     - the 16x256-bit PCB word layout     -> struct Pcb (field order ==
+//                                            bit order of the original
+//                                            word; flags at bit 0)
+//     - reset value of a PCB word          -> new_pcb
+//     - valid-bit allocation on writes     -> next_valid_on_write
+//     - the task_count population count    -> task_count
+//     - the field_read mux (combinational) -> on_comb
+//
+//   Typed don't-care (not ported):
+//     - the storage always-blocks (pcb_memory / valid register plumbing
+//       and the registered task_count read-out).  The t27c Verilog
+//       backend has no sound lowering for clocked storage in this
+//       family yet; the pure decision functions above are the
+//       synthesis-visible surface.  The `on_comb` array parameter
+//       (`tasks: [16]Pcb`) carries the packed memory through the port,
+//       which keeps the generated module purely combinational.
+//
+// Calibration notes for the next port in this directory (see
+// trinity_interrupt.t27 for the first one):
+//   - loops use LITERAL bounds (`while (j < 16u32)`), not `MAX_TASKS`.
+//     A const bound defeats loop unrolling in the Verilog backend and
+//     yosys then rejects the function ("Function can only be called
+//     with constant arguments").
+//   - u16 fields are widened with `as u32` before any arithmetic: a
+//     u16 shifted by >= 16 fails Zig lowering (the shift amount must
+//     fit log2 of the width).
+//   - on_comb returns a single u32.  A tuple-returning on_comb
+//     generates broken Verilog (garbled header, output never
+//     connected), so the two original outputs stay separate: on_comb
+//     IS field_rdata, task_count stays a plain function.
+
+module trinity_pcb {
+
+    // ---------------------------------------------------------------
+    // Layout
+    // ---------------------------------------------------------------
+
+    pub const PCB_WIDTH: u32 = 256;
+    pub const PCB_WIDTH_BYTES: u32 = 32;
+    pub const MAX_TASKS: u32 = 16;
+
+    // Field select codes, one localparam each in the original.
+    pub const F_FLAGS: u32 = 0;
+    pub const F_STACK_PTR: u32 = 1;
+    pub const F_VSA_VECTOR_PTR: u32 = 2;
+    pub const F_TRIT_ACCUMULATOR: u32 = 3;
+    pub const F_SACRED_COUNTER: u32 = 4;
+    pub const F_CYCLE_COUNT: u32 = 5;
+    pub const F_PRIORITY: u32 = 6;
+    pub const F_STATE: u32 = 7;
+    pub const F_PARENT_ID: u32 = 8;
+    pub const F_TASK_ID: u32 = 9;
+
+    // Aliases, as in the original.
+    pub const SEL_FLAGS: u32 = 0;
+    pub const SEL_STACK_PTR: u32 = 1;
+    pub const SEL_VSA_VECTOR_PTR: u32 = 2;
+    pub const SEL_TRIT_ACCUMULATOR: u32 = 3;
+    pub const SEL_SACRED_COUNTER: u32 = 4;
+    pub const SEL_CYCLE_COUNT: u32 = 5;
+    pub const SEL_PRIORITY: u32 = 6;
+    pub const SEL_STATE: u32 = 7;
+    pub const SEL_PARENT_ID: u32 = 8;
+    pub const SEL_TASK_ID: u32 = 9;
+    pub const SEL_UNKNOWN: u32 = 15;
+
+    // Task state codes.  STATE_INVALID must stay 0: a reset PCB word is
+    // all-zero, and task_count counts entries whose state is not
+    // STATE_INVALID.
+    pub const STATE_INVALID: u16 = 0;
+    pub const STATE_READY: u16 = 1;
+    pub const STATE_RUNNING: u16 = 2;
+    pub const STATE_BLOCKED: u16 = 3;
+    pub const STATE_WAITING: u16 = 4;
+    pub const STATE_ZOMBIE: u16 = 0xFFFF;  // Sacred death number
+
+    // One PCB word, 256 bits, ten fields.  Field order here is the bit
+    // order of the original word: flags occupies bits 0..31, task_id
+    // bits 240..255.
+    pub struct Pcb {
+        flags: u32,
+        stack_ptr: u32,
+        vsa_vector_ptr: u32,
+        trit_accumulator: u32,
+        sacred_counter: u32,
+        cycle_count: u32,
+        priority: u16,
+        state: u16,
+        parent_id: u16,
+        task_id: u16,
+    }
+
+    // ---------------------------------------------------------------
+    // Ported decisions
+    // ---------------------------------------------------------------
+
+    // Reset value of a PCB word: all fields zero, state INVALID.
+    pub fn new_pcb() -> Pcb {
+        return Pcb{
+            .flags = 0,
+            .stack_ptr = 0,
+            .vsa_vector_ptr = 0,
+            .trit_accumulator = 0,
+            .sacred_counter = 0,
+            .cycle_count = 0,
+            .priority = 0,
+            .state = STATE_INVALID,
+            .parent_id = 0,
+            .task_id = 0,
+        };
+    }
+
+    // Bit offset of a field within the 256-bit word, selected by
+    // field_select.  Returns PCB_WIDTH as the sentinel for "no field":
+    // the original's write case statement simply ignores those codes.
+    pub fn field_offset(field_select: u32) -> u32 {
+        if (field_select == SEL_FLAGS) { return 0; }
+        if (field_select == SEL_STACK_PTR) { return 32; }
+        if (field_select == SEL_VSA_VECTOR_PTR) { return 64; }
+        if (field_select == SEL_TRIT_ACCUMULATOR) { return 96; }
+        if (field_select == SEL_SACRED_COUNTER) { return 128; }
+        if (field_select == SEL_CYCLE_COUNT) { return 160; }
+        if (field_select == SEL_PRIORITY) { return 192; }
+        if (field_select == SEL_STATE) { return 208; }
+        if (field_select == SEL_PARENT_ID) { return 224; }
+        if (field_select == SEL_TASK_ID) { return 240; }
+        return PCB_WIDTH;
+    }
+
+    // Field width in bits: 32 for the six wide fields, 16 for the four
+    // narrow ones, 0 for anything the original ignores.
+    pub fn field_width(field_select: u32) -> u32 {
+        if (field_select == SEL_PRIORITY) { return 16; }
+        if (field_select == SEL_STATE) { return 16; }
+        if (field_select == SEL_PARENT_ID) { return 16; }
+        if (field_select == SEL_TASK_ID) { return 16; }
+        if (field_select > SEL_TASK_ID) { return 0; }
+        return 32;
+    }
+
+    // Valid-bit allocation on a write to a task slot.
+    //   - a full 256-bit write always stores a formed PCB: valid.
+    //   - a state-field write to STATE_INVALID tears the task down:
+    //     no longer valid.
+    //   - a state-field write to anything else marks the slot valid.
+    //   - any other field write leaves the valid bit untouched.
+    pub fn next_valid_on_write(cur_valid: bool, full_write: bool, field_select: u32, wdata: u32) -> bool {
+        if (full_write) { return true; }
+        if (field_select == SEL_STATE) {
+            if ((wdata as u16) == STATE_INVALID) { return false; }
+            return true;
+        }
+        return cur_valid;
+    }
+
+    // The task_count output: number of entries that are valid AND not
+    // in the INVALID state.  The loop bound is a literal, not
+    // MAX_TASKS -- see the calibration notes in the file header.
+    pub fn task_count(valid: [16]bool, tasks: [16]Pcb) -> u32 {
+        var count: u32 = 0;
+        var j: u32 = 0;
+        while (j < 16u32) {
+            if (valid[j] == true) {
+                if (tasks[j].state != STATE_INVALID) {
+                    count += 1;
+                }
+            }
+            j += 1;
+        }
+        return count;
+    }
+
+    // The combinational field-read mux: the `field_rdata` output of the
+    // original.  Out-of-range task addresses and unknown field selects
+    // read as zero, matching the original's default arms.  Read strobes
+    // gate the registered output in the original's always block; the
+    // mux itself -- what this function computes -- is strobe-free.
+    pub fn on_comb(tasks: [16]Pcb, task_addr: u32, field_select: u32) -> u32 {
+        if (task_addr >= MAX_TASKS) { return 0; }
+        var task: Pcb = tasks[task_addr];
+        if (field_select == SEL_FLAGS) { return task.flags; }
+        if (field_select == SEL_STACK_PTR) { return task.stack_ptr; }
+        if (field_select == SEL_VSA_VECTOR_PTR) { return task.vsa_vector_ptr; }
+        if (field_select == SEL_TRIT_ACCUMULATOR) { return task.trit_accumulator; }
+        if (field_select == SEL_SACRED_COUNTER) { return task.sacred_counter; }
+        if (field_select == SEL_CYCLE_COUNT) { return task.cycle_count; }
+        if (field_select == SEL_PRIORITY) { return task.priority as u32; }
+        if (field_select == SEL_STATE) { return task.state as u32; }
+        if (field_select == SEL_PARENT_ID) { return task.parent_id as u32; }
+        if (field_select == SEL_TASK_ID) { return task.task_id as u32; }
+        return 0;
+    }
+
+    // ---------------------------------------------------------------
+    // FORMAL properties (comptime-checked)
+    // ---------------------------------------------------------------
+
+    invariant layout_matches_original given w = PCB_WIDTH assert w == 256;
+
+    invariant full_write_always_validates given v = next_valid_on_write(false, true, SEL_STATE, STATE_INVALID) assert v == true;
+
+    invariant invalid_state_write_tears_down given v = next_valid_on_write(true, false, SEL_STATE, STATE_INVALID) assert v == false;
+
+    invariant unknown_select_maps_no_field given o = field_offset(SEL_UNKNOWN) assert o == PCB_WIDTH;
+
+    // ---------------------------------------------------------------
+    // TESTS
+    // ---------------------------------------------------------------
+
+    fn fresh_tasks() -> [16]Pcb {
+        return [16]Pcb{
+            new_pcb(), new_pcb(), new_pcb(), new_pcb(),
+            new_pcb(), new_pcb(), new_pcb(), new_pcb(),
+            new_pcb(), new_pcb(), new_pcb(), new_pcb(),
+            new_pcb(), new_pcb(), new_pcb(), new_pcb(),
+        };
+    }
+
+    fn fresh_valid() -> [16]bool {
+        return [16]bool{
+            false, false, false, false,
+            false, false, false, false,
+            false, false, false, false,
+            false, false, false, false,
+        };
+    }
+
+    test layout_constants {
+        assert(PCB_WIDTH == 256);
+        assert(PCB_WIDTH_BYTES == 32);
+        assert(MAX_TASKS == 16);
+    }
+
+    test field_select_codes {
+        assert(F_FLAGS == 0);
+        assert(F_STACK_PTR == 1);
+        assert(F_VSA_VECTOR_PTR == 2);
+        assert(F_TRIT_ACCUMULATOR == 3);
+        assert(F_SACRED_COUNTER == 4);
+        assert(F_CYCLE_COUNT == 5);
+        assert(F_PRIORITY == 6);
+        assert(F_STATE == 7);
+        assert(F_PARENT_ID == 8);
+        assert(F_TASK_ID == 9);
+        assert(SEL_FLAGS == F_FLAGS);
+        assert(SEL_TASK_ID == F_TASK_ID);
+        assert(SEL_UNKNOWN == 15);
+    }
+
+    test state_codes {
+        assert(STATE_INVALID == 0);
+        assert(STATE_READY == 1);
+        assert(STATE_RUNNING == 2);
+        assert(STATE_BLOCKED == 3);
+        assert(STATE_WAITING == 4);
+        assert(STATE_ZOMBIE == 0xFFFF);
+    }
+
+    test field_offsets {
+        assert(field_offset(SEL_FLAGS) == 0);
+        assert(field_offset(SEL_STACK_PTR) == 32);
+        assert(field_offset(SEL_VSA_VECTOR_PTR) == 64);
+        assert(field_offset(SEL_TRIT_ACCUMULATOR) == 96);
+        assert(field_offset(SEL_SACRED_COUNTER) == 128);
+        assert(field_offset(SEL_CYCLE_COUNT) == 160);
+        assert(field_offset(SEL_PRIORITY) == 192);
+        assert(field_offset(SEL_STATE) == 208);
+        assert(field_offset(SEL_PARENT_ID) == 224);
+        assert(field_offset(SEL_TASK_ID) == 240);
+        assert(field_offset(SEL_UNKNOWN) == PCB_WIDTH);
+        assert(field_offset(10) == PCB_WIDTH);
+    }
+
+    test field_widths {
+        assert(field_width(SEL_FLAGS) == 32);
+        assert(field_width(SEL_STACK_PTR) == 32);
+        assert(field_width(SEL_VSA_VECTOR_PTR) == 32);
+        assert(field_width(SEL_TRIT_ACCUMULATOR) == 32);
+        assert(field_width(SEL_SACRED_COUNTER) == 32);
+        assert(field_width(SEL_CYCLE_COUNT) == 32);
+        assert(field_width(SEL_PRIORITY) == 16);
+        assert(field_width(SEL_STATE) == 16);
+        assert(field_width(SEL_PARENT_ID) == 16);
+        assert(field_width(SEL_TASK_ID) == 16);
+        assert(field_width(SEL_UNKNOWN) == 0);
+        assert(field_width(10) == 0);
+        assert(field_width(14) == 0);
+    }
+
+    test new_pcb_is_invalid {
+        var t: Pcb = new_pcb();
+        assert(t.state == STATE_INVALID);
+        assert(t.flags == 0);
+        assert(t.stack_ptr == 0);
+        assert(t.priority == 0);
+        assert(t.task_id == 0);
+    }
+
+    test field_read_mux_wide_fields {
+        var tasks: [16]Pcb = fresh_tasks();
+        tasks[2].flags = 0xDEADBEEF;
+        tasks[2].stack_ptr = 0x00010000;
+        tasks[2].vsa_vector_ptr = 0x12345678;
+        tasks[2].trit_accumulator = 0xAAAAAAAA;
+        tasks[2].sacred_counter = 7;
+        tasks[2].cycle_count = 4242;
+        assert(on_comb(tasks, 2, SEL_FLAGS) == 0xDEADBEEF);
+        assert(on_comb(tasks, 2, SEL_STACK_PTR) == 0x00010000);
+        assert(on_comb(tasks, 2, SEL_VSA_VECTOR_PTR) == 0x12345678);
+        assert(on_comb(tasks, 2, SEL_TRIT_ACCUMULATOR) == 0xAAAAAAAA);
+        assert(on_comb(tasks, 2, SEL_SACRED_COUNTER) == 7);
+        assert(on_comb(tasks, 2, SEL_CYCLE_COUNT) == 4242);
+    }
+
+    test field_read_mux_narrow_fields {
+        var tasks: [16]Pcb = fresh_tasks();
+        tasks[3].priority = 5;
+        tasks[3].state = STATE_RUNNING;
+        tasks[3].parent_id = 1;
+        tasks[3].task_id = 3;
+        // narrow fields zero-extend into the 32-bit read data
+        assert(on_comb(tasks, 3, SEL_PRIORITY) == 5);
+        assert(on_comb(tasks, 3, SEL_STATE) == 2);
+        assert(on_comb(tasks, 3, SEL_PARENT_ID) == 1);
+        assert(on_comb(tasks, 3, SEL_TASK_ID) == 3);
+    }
+
+    test field_read_mux_unknown_select {
+        var tasks: [16]Pcb = fresh_tasks();
+        tasks[1].flags = 0xFFFFFFFF;
+        assert(on_comb(tasks, 1, 10) == 0);
+        assert(on_comb(tasks, 1, 14) == 0);
+        assert(on_comb(tasks, 1, SEL_UNKNOWN) == 0);
+    }
+
+    test field_read_out_of_range {
+        var tasks: [16]Pcb = fresh_tasks();
+        tasks[15].flags = 0x0000FFFF;
+        assert(on_comb(tasks, 16, SEL_FLAGS) == 0);
+        assert(on_comb(tasks, 17, SEL_FLAGS) == 0);
+        assert(on_comb(tasks, 255, SEL_FLAGS) == 0);
+        assert(on_comb(tasks, 15, SEL_FLAGS) == 0x0000FFFF);
+    }
+
+    test next_valid_full_write {
+        assert(next_valid_on_write(false, true, SEL_FLAGS, 0) == true);
+        assert(next_valid_on_write(false, true, SEL_STATE, STATE_INVALID) == true);
+        assert(next_valid_on_write(true, true, SEL_PRIORITY, 0) == true);
+    }
+
+    test next_valid_state_writes {
+        // a fresh (invalid) slot becomes valid once a task takes it
+        assert(next_valid_on_write(false, false, SEL_STATE, STATE_READY) == true);
+        assert(next_valid_on_write(false, false, SEL_STATE, STATE_RUNNING) == true);
+        // writing INVALID tears the task down, even from a valid slot
+        assert(next_valid_on_write(true, false, SEL_STATE, STATE_INVALID) == false);
+        // other field writes leave the valid bit alone
+        assert(next_valid_on_write(false, false, SEL_PRIORITY, 9) == false);
+        assert(next_valid_on_write(true, false, SEL_FLAGS, 0xFF) == true);
+    }
+
+    test task_count_empty {
+        var valid: [16]bool = fresh_valid();
+        var tasks: [16]Pcb = fresh_tasks();
+        assert(task_count(valid, tasks) == 0);
+    }
+
+    test task_count_mixed {
+        var valid: [16]bool = fresh_valid();
+        var tasks: [16]Pcb = fresh_tasks();
+        valid[0] = true;
+        tasks[0].state = STATE_READY;
+        valid[1] = true;
+        tasks[1].state = STATE_RUNNING;
+        valid[2] = true;
+        tasks[2].state = STATE_INVALID;
+        valid[3] = true;
+        tasks[3].state = STATE_WAITING;
+        valid[5] = true;
+        tasks[5].state = STATE_INVALID;
+        valid[7] = true;
+        tasks[7].state = STATE_BLOCKED;
+        // 4 valid entries, 2 of them INVALID -> 2
+        assert(task_count(valid, tasks) == 2);
+    }
+
+    test task_count_all_ready {
+        var valid: [16]bool = fresh_valid();
+        var tasks: [16]Pcb = fresh_tasks();
+        var j: u32 = 0;
+        while (j < 16u32) {
+            valid[j] = true;
+            tasks[j].state = STATE_READY;
+            j += 1;
+        }
+        assert(task_count(valid, tasks) == 16);
+    }
+
+    test on_comb_roundtrip {
+        var tasks: [16]Pcb = fresh_tasks();
+        tasks[9].flags = 0xCAFEBABE;
+        tasks[9].stack_ptr = 0x00002000;
+        tasks[9].priority = 12;
+        tasks[9].state = STATE_WAITING;
+        tasks[9].parent_id = 4;
+        tasks[9].task_id = 9;
+        assert(on_comb(tasks, 9, SEL_FLAGS) == 0xCAFEBABE);
+        assert(on_comb(tasks, 9, SEL_STACK_PTR) == 0x00002000);
+        assert(on_comb(tasks, 9, SEL_PRIORITY) == 12);
+        assert(on_comb(tasks, 9, SEL_STATE) == 4);
+        assert(on_comb(tasks, 9, SEL_PARENT_ID) == 4);
+        assert(on_comb(tasks, 9, SEL_TASK_ID) == 9);
+        // untouched entries still read as reset values
+        assert(on_comb(tasks, 8, SEL_FLAGS) == 0);
+        assert(on_comb(tasks, 8, SEL_STATE) == 0);
+    }
+}
