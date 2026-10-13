@@ -1150,6 +1150,80 @@ def main_delta(args):
     return 1 if any(rules().is_red(f["code"]) for f in found) else 0
 
 
+# --- verify-fixed-point: matryoshka build verification -----------------------
+def main_verify_fixed_point(args):
+    """Verify the fixed-point property: stage2 (built by stage1) and stage3 (built by stage2) are bit-identical."""
+    print("Verifying fixed-point property...")
+    
+    # Check if stage2 and stage3 artifacts exist
+    stage2_path = "gen/rust/tri/t27b/stage2"
+    stage3_path = "gen/rust/tri/t27b/stage3"
+    
+    if not os.path.exists(stage2_path):
+        print(f"Error: Stage2 artifact not found at {stage2_path}")
+        return 1
+    
+    if not os.path.exists(stage3_path):
+        print(f"Error: Stage3 artifact not found at {stage3_path}")
+        return 1
+    
+    # Compare the artifacts byte-for-byte
+    try:
+        with open(stage2_path, 'rb') as f2, open(stage3_path, 'rb') as f3:
+            stage2_content = f2.read()
+            stage3_content = f3.read()
+            
+        if stage2_content == stage3_content:
+            print("Fixed-point verification: PASS - stage2 and stage3 are bit-identical")
+            print(f"Artifact size: {len(stage2_content)} bytes")
+            return 0
+        else:
+            print("Fixed-point verification: FAIL - stage2 and stage3 differ")
+            print(f"Stage2 size: {len(stage2_content)} bytes")
+            print(f"Stage3 size: {len(stage3_content)} bytes")
+            return 1
+    except Exception as e:
+        print(f"Error comparing artifacts: {e}")
+        return 1
+
+
+# --- verify-ddc: diverse double compilation verification --------------------
+def main_verify_ddc(args):
+    """Verify diverse double compilation produces byte-identical artifacts."""
+    print("Verifying diverse double compilation...")
+    
+    # Check if primary and DDC artifacts exist
+    primary_path = "gen/rust/tri/t27b/primary"
+    ddc_path = "gen/rust/tri/t27b/ddc"
+    
+    if not os.path.exists(primary_path):
+        print(f"Error: Primary artifact not found at {primary_path}")
+        return 1
+    
+    if not os.path.exists(ddc_path):
+        print(f"Error: DDC artifact not found at {ddc_path}")
+        return 1
+    
+    # Compare the artifacts byte-for-byte
+    try:
+        with open(primary_path, 'rb') as f1, open(ddc_path, 'rb') as f2:
+            primary_content = f1.read()
+            ddc_content = f2.read()
+            
+        if primary_content == ddc_content:
+            print("DDC verification: PASS - artifacts are byte-identical")
+            print(f"Artifact size: {len(primary_content)} bytes")
+            return 0
+        else:
+            print("DDC verification: FAIL - artifacts differ")
+            print(f"Primary size: {len(primary_content)} bytes")
+            print(f"DDC size: {len(ddc_content)} bytes")
+            return 1
+    except Exception as e:
+        print(f"Error comparing artifacts: {e}")
+        return 1
+
+
 # --- gen-check (#6231): is the committed C what master's t27c emits? ---------
 # t27c runs on the Railway lab t27c-lab, never on this machine (owner's rule,
 # 2026-10-04). The spec text goes there as base64 inside the ssh command; one
@@ -1823,7 +1897,7 @@ def main(argv):
         return t27b_fuzz.main(argv[1:])
     ap = argparse.ArgumentParser(prog="tri t27b", description=__doc__.split("\n")[0])
     ap.add_argument("action", choices=("status", "doctor", "delta", "ratchet", "gen-check", "ready", "watch", "next", "diff",
-                                       "dogfood", "fuzz"))
+                                       "dogfood", "fuzz", "verify-fixed-point", "verify-ddc"))
     ap.add_argument("--from", dest="from_", help="delta: the earlier lab run's sha (default: the run before --to)")
     ap.add_argument("--to", default="latest", help="delta: the later run's sha (default: latest.json)")
     ap.add_argument("--fixture", help="read every source from this directory (tests)")
@@ -1838,6 +1912,10 @@ def main(argv):
         return 2 if e.code else 0
     if args.action == "delta":
         return main_delta(args)
+    if args.action == "verify-fixed-point":
+        return main_verify_fixed_point(args)
+    if args.action == "verify-ddc":
+        return main_verify_ddc(args)
     src = Sources(fixture=args.fixture, lab=args.lab)
     d = collect(src, args)
     found = anomalies(d, args)
