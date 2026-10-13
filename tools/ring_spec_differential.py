@@ -296,6 +296,9 @@ def t27c() -> str:
     for p in ("target/release/t27c", "bootstrap/target/release/t27c"):
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
+    env = os.environ.get("TRI_T27C", "")
+    if env and os.access(env, os.X_OK):
+        return env
     print("ring_spec_differential: t27c not built. Exit 2 = COULD NOT RUN.", file=sys.stderr)
     sys.exit(2)
 
