@@ -10130,6 +10130,12 @@ impl Codegen {
 
     fn gen_if_stmt(&mut self, node: &Node) {
         // children[0] = condition, children[1] = then block, children[2] = optional else block
+        // Emit capture variables if any
+        for (param_name, param_type) in &node.params {
+            self.write_indent();
+            self.write(&format!("const {} = {};\n", param_name, param_type));
+        }
+        
         self.write_indent();
         self.write("if (");
         if !node.children.is_empty() {
@@ -10372,6 +10378,12 @@ impl Codegen {
                     self.gen_expr_maybe_paren(&node.children[0]);
                     if node.name == "len" && node.children.len() == 1 {
                         self.write(".len");
+                        return;
+                    }
+                    // Special handling for orelse: use "orelse" as keyword, not method
+                    if node.name == "orelse" && node.children.len() == 1 {
+                        self.write(" orelse ");
+                        self.gen_expr(&node.children[1]);
                         return;
                     }
                     self.write(&format!(".{}(", Self::zig_ident(&node.name)));
