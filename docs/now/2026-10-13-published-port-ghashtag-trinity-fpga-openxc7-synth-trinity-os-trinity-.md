@@ -1,9 +1,9 @@
-# NOW -- Port gHashTag/trinity:fpga/openxc7-synth/trinity_os/trinity_interrupt.v (Verilog, 1 module) to specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_interrupt.t27 (published 2026-10-13)
+# NOW -- Port gHashTag/trinity:fpga/openxc7-synth/trinity_os/trinity_os_top.v (Verilog, 1 module) to specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_os_top.t27 (published 2026-10-13)
 
-## A bee's work on #9334, published from `queen-9334` (Closes #9334)
+## A bee's work on #9375, published from `queen-9375` (Closes #9375)
 
-- The branch changes 1 file(s): `specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_interrupt.t27`.
-- `git diff --stat origin/master...queen-9334` reads: 1 file changed, 602 insertions(+)
+- The branch changes 1 file(s): `specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_os_top.t27`.
+- `git diff --stat origin/master...queen-9375` reads: 1 file changed, 396 insertions(+)
 - This entry is written by the publisher, not by the bee. A pull request must
   add exactly one `docs/now/` entry and a bee has no way to know that: its brief
   names a boundary file and acceptance criteria, and `docs/now/` is neither.
