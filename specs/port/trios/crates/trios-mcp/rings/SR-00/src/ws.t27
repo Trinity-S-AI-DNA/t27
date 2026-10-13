@@ -1,0 +1,425 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trios/crates/trios-mcp/rings/SR-00/src/ws.t27
+// Port of gHashTag/trios crates/trios-mcp/rings/SR-00/src/ws.rs to t27
+//
+// ws.rs is the WebSocket protocol layer between the MCP server and its Chrome
+// extension. The extension streams console, network, navigation and selection
+// events up; the server answers with screenshot requests and a shutdown
+// message. Inbound Text frames parse into an ExtensionMessage and merge into
+// the shared LogStore; outbound ServerMessages serialize under their serde
+// tag and go to the socket.
+//
+// WHAT THIS SPEC DELIBERATELY DOES NOT CONTAIN
+//
+// The plumbing. The tokio-tungstenite stream, the tokio Mutex around the
+// LogStore, serde_json, Uuid::new_v4, chrono::Utc::now and the tracing calls
+// are world access; .t27 has none of them. The three entry points whose job
+// is moving data through that machinery -- handle_message, send_to_extension
+// and ExtensionMessage_process -- keep their names with `undefined;` bodies,
+// and no test calls them. The LogStore itself lives in crate::logs and is not
+// part of this file; WebSocketState (an Arc around a Mutex around it) is a
+// container for that plumbing and is not ported.
+//
+// What is ported is every decision:
+// - the serde rename table: which wire tag each variant carries
+//   (extension_type_tag, server_type_tag);
+// - the match inside process(): which store operation each message kind
+//   triggers, including PageNavigated and CurrentUrlResponse both ending in
+//   set_current_url while the two screenshot kinds leave the store untouched
+//   (process_action);
+// - the log record each arm builds, with its fixed stamp -- "console-log",
+//   "console-error", and the "xhr" stamp every network request gets however
+//   it was issued -- plus the unwrap_or_else(|| Utc::now().to_rfc3339())
+//   timestamp default (timestamp_or and the *_record builders);
+// - the if-let-Ok gate on the SelectedElement arm: the element reaches
+//   set_selected_element only when its payload parsed
+//   (selected_element_stored);
+// - the only error path in handle_message: a Text frame whose payload does
+//   not parse is an error, while Close, Ping, Pong and the catch-all arm
+//   (Binary, Frame) are no-ops that still succeed (handle_message_verdict);
+// - the two ServerMessage shapes (create_screenshot_request,
+//   create_shutdown_message). create_shutdown_message is a pure const fn in
+//   the original and is ported whole. create_screenshot_request draws its
+//   request id from Uuid::new_v4(); randomness is the caller's, so the fresh
+//   id arrives as a parameter and the decision kept here is the shape.
+//
+// CONVENTIONS
+//
+// - The original's Option<String> payload fields are carried as plain str;
+//   an empty string stands for "absent" (serde None). That is exactly the
+//   sense in which timestamp_or reads an empty timestamp as "no timestamp,
+//   use the clock". Presence never decides which record is built, so no
+//   decision hides inside it.
+// - The Result<()> that handle_message returns is flattened to an exit code
+//   (EXIT_OK / EXIT_FAIL) in handle_message_verdict.
+
+module port::trios::crates::trios_mcp::rings::SR_00::src::ws;
+
+// The exit code handle_message_verdict returns: the original's Result<()>
+// flattened, Ok(()) versus the one error it can produce.
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAIL: i32 = 1;
+
+// One value per ExtensionMessage variant; the wire tag each carries is the
+// serde rename_all = "snake_case" name that extension_type_tag returns.
+pub enum ExtensionKind {
+    ConsoleLog,
+    ConsoleError,
+    NetworkRequest,
+    PageNavigated,
+    SelectedElement,
+    CurrentUrlResponse,
+    ScreenshotData,
+    ScreenshotError,
+}
+
+// One value per ServerMessage variant.
+pub enum ServerKind {
+    TakeScreenshot,
+    ServerShutdown,
+}
+
+// The kinds of tungstenite Message that handle_message matches on; Binary
+// and Frame fall into the original's catch-all arm, modeled here as Other.
+pub enum WsKind {
+    Text,
+    Close,
+    Ping,
+    Pong,
+    Other,
+}
+
+// What process() does to the log store for a given message kind.
+// SetCurrentUrl is shared by PageNavigated and CurrentUrlResponse; the two
+// screenshot kinds only log and leave the store untouched.
+pub enum StoreAction {
+    AddConsoleLog,
+    AddConsoleError,
+    AddNetworkRequest,
+    SetCurrentUrl,
+    SetSelectedElement,
+    Ignore,
+}
+
+// The facts the decision reads out of a "console-log" payload. Empty string
+// stands for an absent Option<String> field.
+pub struct ConsoleLogMsg {
+    level: str,
+    message: str,
+    url: str,
+    timestamp: str,
+}
+
+// The facts the decision reads out of a "console-error" payload; level and
+// message are required in the original.
+pub struct ConsoleErrorMsg {
+    level: str,
+    message: str,
+    timestamp: str,
+}
+
+// The facts the decision reads out of a "network-request" payload; status is
+// the original's Option<i64>, passed through untouched.
+pub struct NetworkRequestMsg {
+    url: str,
+    method: str,
+    status: i64,
+    timestamp: str,
+}
+
+// The log record the ConsoleLog arm hands to logs.add_console_log: the
+// crate::logs::ConsoleLog shape as this file's decision builds it. log_type
+// is the fixed stamp; empty string stands for an absent option field.
+pub struct ConsoleLogRecord {
+    log_type: str,
+    level: str,
+    message: str,
+    url: str,
+    timestamp: str,
+}
+
+// The log record the ConsoleError arm hands to logs.add_console_error.
+pub struct ConsoleErrorRecord {
+    error_type: str,
+    level: str,
+    message: str,
+    timestamp: str,
+}
+
+// The log record the NetworkRequest arm hands to logs.add_network_request.
+pub struct NetworkRequestRecord {
+    request_type: str,
+    url: str,
+    method: str,
+    status_code: i64,
+    timestamp: str,
+}
+
+// The message shape sent back to the extension. request_id is only set for
+// TakeScreenshot; an empty request_id on a shutdown message mirrors the
+// original's empty ServerShutdown {} payload.
+pub struct ServerMessage {
+    kind: ServerKind,
+    request_id: str,
+}
+
+// The unwrap_or_else(|| chrono::Utc::now().to_rfc3339()) that all three
+// add_* arms of process() share: which of the two timestamps is stored. The
+// clock is the caller's; an empty msg timestamp means the field was absent
+// and the current time is used.
+pub fn timestamp_or(msg_ts: str, now: str) -> str {
+    if (msg_ts == "") {
+        return now;
+    }
+    return msg_ts;
+}
+
+// The ConsoleLog arm of process(): the record that reaches
+// logs.add_console_log. The fixed "console-log" stamp and the now-defaulted
+// timestamp are the decisions; level, message and url pass through.
+pub fn console_log_record(msg: ConsoleLogMsg, now: str) -> ConsoleLogRecord {
+    return ConsoleLogRecord {
+        log_type: "console-log",
+        level: msg.level,
+        message: msg.message,
+        url: msg.url,
+        timestamp: timestamp_or(msg.timestamp, now),
+    };
+}
+
+// The ConsoleError arm of process(): the record that reaches
+// logs.add_console_error, stamped "console-error".
+pub fn console_error_record(msg: ConsoleErrorMsg, now: str) -> ConsoleErrorRecord {
+    return ConsoleErrorRecord {
+        error_type: "console-error",
+        level: msg.level,
+        message: msg.message,
+        timestamp: timestamp_or(msg.timestamp, now),
+    };
+}
+
+// The NetworkRequest arm of process(): the record that reaches
+// logs.add_network_request. The original stamps every request "xhr" however
+// it was issued -- that stamp is the decision here; method, status and url
+// pass through and the timestamp defaults to the clock.
+pub fn network_request_record(msg: NetworkRequestMsg, now: str) -> NetworkRequestRecord {
+    return NetworkRequestRecord {
+        request_type: "xhr",
+        url: msg.url,
+        method: msg.method,
+        status_code: msg.status,
+        timestamp: timestamp_or(msg.timestamp, now),
+    };
+}
+
+// The `match self` inside process(): which store operation each message kind
+// triggers. PageNavigated and CurrentUrlResponse both end in
+// logs.set_current_url; the screenshot variants only log and leave the store
+// untouched (the ScreenshotData arm is an explicit TODO in the original).
+pub fn process_action(kind: ExtensionKind) -> StoreAction {
+    switch (kind) {
+        .ConsoleLog => .AddConsoleLog,
+        .ConsoleError => .AddConsoleError,
+        .NetworkRequest => .AddNetworkRequest,
+        .PageNavigated => .SetCurrentUrl,
+        .SelectedElement => .SetSelectedElement,
+        .CurrentUrlResponse => .SetCurrentUrl,
+        .ScreenshotData => .Ignore,
+        .ScreenshotError => .Ignore,
+    }
+}
+
+// The `if let Ok(el) = serde_json::from_value(msg.element)` gate on the
+// SelectedElement arm: the element reaches logs.set_selected_element only
+// when its payload parsed; a malformed element is dropped silently. The
+// caller passes the parse outcome.
+pub fn selected_element_stored(element_parsed: bool) -> bool {
+    return element_parsed;
+}
+
+// The serde tag each ExtensionMessage variant carries on the wire
+// (rename_all = "snake_case"). The from_str dispatch in handle_message and
+// every test in the original that feeds JSON to the parser pin these exact
+// strings.
+pub fn extension_type_tag(kind: ExtensionKind) -> str {
+    switch (kind) {
+        .ConsoleLog => "console-log",
+        .ConsoleError => "console-error",
+        .NetworkRequest => "network-request",
+        .PageNavigated => "page-navigated",
+        .SelectedElement => "selected-element",
+        .CurrentUrlResponse => "current-url-response",
+        .ScreenshotData => "screenshot-data",
+        .ScreenshotError => "screenshot-error",
+    }
+}
+
+// The serde tag each ServerMessage variant serializes to; the original's
+// tests assert these exact strings in the JSON that reaches the socket.
+pub fn server_type_tag(kind: ServerKind) -> str {
+    switch (kind) {
+        .TakeScreenshot => "take-screenshot",
+        .ServerShutdown => "server-shutdown",
+    }
+}
+
+// The only error path in handle_message(): a Text frame whose payload does
+// not deserialize into an ExtensionMessage propagates an error (the `?` on
+// serde_json::from_str), while Close, Ping, Pong and the catch-all arm
+// return Ok without touching the parser. The caller passes whether the Text
+// payload parsed; the verdict is that Result<()>, flattened to an exit code.
+pub fn handle_message_verdict(kind: WsKind, text_parse_ok: bool) -> i32 {
+    if (kind == .Text and !text_parse_ok) {
+        return EXIT_FAIL;
+    }
+    return EXIT_OK;
+}
+
+// ServerMessage::TakeScreenshot { request_id }: the shape that asks the
+// extension for a screenshot. The original draws the id from
+// Uuid::new_v4(); randomness is the caller's, so the fresh id arrives as a
+// parameter and the decision kept here is the message shape and its tag.
+pub fn create_screenshot_request(request_id: str) -> ServerMessage {
+    return ServerMessage { kind: .TakeScreenshot, request_id: request_id };
+}
+
+// ServerMessage::ServerShutdown {}: a pure const fn in the original, so this
+// one is ported whole. The empty payload is the empty request_id.
+pub fn create_shutdown_message() -> ServerMessage {
+    return ServerMessage { kind: .ServerShutdown, request_id: "" };
+}
+
+// The data movement. process() takes a parsed ExtensionMessage and the
+// LogStore behind the tokio Mutex, and calls logs.add_console_log /
+// add_console_error / add_network_request / set_current_url /
+// set_selected_element per the match. The store lives in crate::logs and is
+// not ported; every decision in the match is the pure helper above
+// (process_action, the *_record builders, timestamp_or,
+// selected_element_stored). No test calls this.
+pub fn ExtensionMessage_process(kind: ExtensionKind) {
+    undefined;
+}
+
+// The data movement. handle_message() takes a tungstenite Message and the
+// WebSocketState, locks the tokio Mutex on a Text frame and dispatches to
+// process(); the frame text, the JSON parse and the lock are plumbing. The
+// decision -- which frame kinds do what, and that only an unparseable Text
+// payload errors -- is handle_message_verdict above. No test calls this.
+pub fn handle_message(text: str, kind: WsKind) {
+    undefined;
+}
+
+// The data movement. send_to_extension() serializes the ServerMessage with
+// serde_json and writes it to the WebSocket sink; both are plumbing. The
+// JSON shape it would produce -- the type tag the extension dispatches on --
+// is server_type_tag above. No test calls this.
+pub fn send_to_extension(ws: str, msg: ServerMessage) {
+    undefined;
+}
+
+// A "console-log" payload (the original's
+// test_extension_message_console_log): the record keeps the payload fields
+// and is stamped console-log; the message's own timestamp wins over the
+// clock when present.
+test process_console_log_record {
+    const rec = console_log_record(ConsoleLogMsg { level: "info", message: "test", url: "https://example.com", timestamp: "2026-01-01T00:00:00+00:00" }, "2026-02-02T00:00:00+00:00");
+    assert(rec.log_type == "console-log");
+    assert(rec.message == "test");
+    assert(rec.level == "info");
+    assert(rec.url == "https://example.com");
+    assert(rec.timestamp == "2026-01-01T00:00:00+00:00");
+}
+
+// The unwrap_or_else(|| Utc::now().to_rfc3339()) default shared by all three
+// add_* arms of process(): an absent timestamp (empty here) is replaced by
+// the caller's clock reading, a present one is kept.
+test process_timestamp_defaults_to_now {
+    assert(timestamp_or("", "2026-02-02T00:00:00+00:00") == "2026-02-02T00:00:00+00:00");
+    assert(timestamp_or("2026-01-01T00:00:00+00:00", "2026-02-02T00:00:00+00:00") == "2026-01-01T00:00:00+00:00");
+    const rec = console_log_record(ConsoleLogMsg { level: "info", message: "test", url: "", timestamp: "" }, "2026-02-02T00:00:00+00:00");
+    assert(rec.timestamp == "2026-02-02T00:00:00+00:00");
+}
+
+// A "console-error" payload (test_extension_message_console_error): stamped
+// console-error, level and message carried through, the clock when the
+// message carries no timestamp of its own.
+test process_console_error_record {
+    const rec = console_error_record(ConsoleErrorMsg { level: "error", message: "boom", timestamp: "" }, "NOW");
+    assert(rec.error_type == "console-error");
+    assert(rec.level == "error");
+    assert(rec.message == "boom");
+    assert(rec.timestamp == "NOW");
+}
+
+// A "network-request" payload (test_extension_message_network_request): the
+// record is stamped "xhr" whatever the method, url, method and status pass
+// through, and the timestamp defaults to the clock.
+test process_network_request_record {
+    const rec = network_request_record(NetworkRequestMsg { url: "https://example.com/api", method: "GET", status: 200, timestamp: "" }, "NOW");
+    assert(rec.request_type == "xhr");
+    assert(rec.url == "https://example.com/api");
+    assert(rec.method == "GET");
+    assert(rec.status_code == 200);
+    assert(rec.timestamp == "NOW");
+}
+
+// The match in process(): which store operation each kind triggers.
+// PageNavigated and CurrentUrlResponse share set_current_url; the two
+// screenshot kinds leave the store untouched.
+test process_dispatch {
+    assert(process_action(.ConsoleLog) == .AddConsoleLog);
+    assert(process_action(.ConsoleError) == .AddConsoleError);
+    assert(process_action(.NetworkRequest) == .AddNetworkRequest);
+    assert(process_action(.PageNavigated) == .SetCurrentUrl);
+    assert(process_action(.CurrentUrlResponse) == .SetCurrentUrl);
+    assert(process_action(.SelectedElement) == .SetSelectedElement);
+    assert(process_action(.ScreenshotData) == .Ignore);
+    assert(process_action(.ScreenshotError) == .Ignore);
+}
+
+// The SelectedElement arm stores the element only when its payload parsed
+// (if let Ok(el) = serde_json::from_value(...)); a malformed element is
+// dropped silently.
+test process_selected_element_gate {
+    assert(selected_element_stored(true));
+    assert(!selected_element_stored(false));
+}
+
+// The serde rename table the from_str dispatch runs on: the wire tag of
+// every ExtensionMessage variant, as pinned by the original's
+// test_extension_message_* tests.
+test extension_wire_tags {
+    assert(extension_type_tag(.ConsoleLog) == "console-log");
+    assert(extension_type_tag(.ConsoleError) == "console-error");
+    assert(extension_type_tag(.NetworkRequest) == "network-request");
+    assert(extension_type_tag(.PageNavigated) == "page-navigated");
+    assert(extension_type_tag(.SelectedElement) == "selected-element");
+    assert(extension_type_tag(.CurrentUrlResponse) == "current-url-response");
+    assert(extension_type_tag(.ScreenshotData) == "screenshot-data");
+    assert(extension_type_tag(.ScreenshotError) == "screenshot-error");
+}
+
+// The outcomes handle_message can produce: only a Text frame whose payload
+// does not parse is an error; Close, Ping, Pong and the catch-all arm
+// (Binary, Frame) never touch the parser and still succeed.
+test handle_message_outcomes {
+    assert(handle_message_verdict(.Text, true) == EXIT_OK);
+    assert(handle_message_verdict(.Text, false) == EXIT_FAIL);
+    assert(handle_message_verdict(.Close, false) == EXIT_OK);
+    assert(handle_message_verdict(.Ping, false) == EXIT_OK);
+    assert(handle_message_verdict(.Pong, false) == EXIT_OK);
+    assert(handle_message_verdict(.Other, false) == EXIT_OK);
+}
+
+// The two ServerMessage shapes (test_server_message_take_screenshot /
+// test_server_message_shutdown): the screenshot request carries its request
+// id under the take-screenshot tag; the shutdown message carries nothing
+// under server-shutdown.
+test create_server_messages {
+    const shot = create_screenshot_request("req-1");
+    assert(server_type_tag(shot.kind) == "take-screenshot");
+    assert(shot.request_id == "req-1");
+    const shutdown = create_shutdown_message();
+    assert(server_type_tag(shutdown.kind) == "server-shutdown");
+    assert(shutdown.request_id == "");
+}
