@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/tf3_add.t27
+// TF3-9 Adder - Ternary Float 9 Addition Specification
+// 18-bit ternary float (9 trits total): sign_trit:2, exp_trits:6, mant_trits:10
+// Pipeline stages: Decode → Align → Add → Normalize → Clamp → Encode
+// Reference: gHashTag/trinity fpga/openxc7-synth/tf3_add.v
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/φ² = 3 | TRINITY
+
+module tf3_add {
+
+    // === TF3-9 Format Constants ===
+
+    pub const TF3_TOTAL_WIDTH : u32 = 18;
+    pub const TF3_SIGN_WIDTH : u32 = 2;
+    pub const TF3_EXP_WIDTH : u32 = 6;
+    pub const TF3_MANT_WIDTH : u32 = 10;
+    pub const TF3_EXP_TRITS : u32 = 3;
+    pub const TF3_MANT_TRITS : u32 = 5;
+
+    // === Exponent Range ===
+    pub const TF3_MIN_EXP : i32 = -13;
+    pub const TF3_MAX_EXP : i32 = 13;
+
+    // === Trit Encoding ===
+    pub const TRIT_NEG : u32 = 0;  // 2'b00 = -1
+    pub const TRIT_ZERO : u32 = 1; // 2'b01 = 0
+    pub const TRIT_POS : u32 = 2;  // 2'b10 = +1
+    pub const TRIT_RESERVED : u32 = 3; // 2'b11 = reserved → 0
+
+    // === Trit Decode Functions ===
+
+    // Decode 2-bit trit to signed value: {-1, 0, +1}
+    fn trit_to_signed(trit: u32) -> i32 {
+        if (trit == 0) {
+            return -1;   // TRIT_NEG
+        } else if (trit == 1) {
+            return 0;    // TRIT_ZERO
+        } else if (trit == 2) {
+            return 1;    // TRIT_POS
+        } else {
+            return 0;    // Reserved → 0
+        }
+    }
+
+    // Decode 3 trits (6 bits) to signed value
+    fn trits3_to_signed(trits: u32) -> i32 {
+        var t0 : u32 = trits & 3;        // bits [1:0]
+        var t1 : u32 = (trits >> 2) & 3; // bits [3:2]
+        var t2 : u32 = (trits >> 4) & 3; // bits [5:4]
+
+        // Handle reserved trits
+        t0 = if (t0 == TRIT_RESERVED) TRIT_ZERO else t0;
+        t1 = if (t1 == TRIT_RESERVED) TRIT_ZERO else t1;
+        t2 = if (t2 == TRIT_RESERVED) TRIT_ZERO else t2;
+
+        return (trit_to_signed(t2) * 9) +  // t2 * 3^2
+               (trit_to_signed(t1) * 3) +  // t1 * 3^1
+               trit_to_signed(t0);         // t0 * 3^0
+    }
+
+    // Decode 5 trits (10 bits) to signed value
+    fn trits5_to_signed(trits: u32) -> i32 {
+        var result : i32 = 0;
+        var i : u32 = 0;
+
+        while (i < 5) {
+            var trit_val : u32 = (trits >> (i * 2)) & 3;
+            if (trit_val == TRIT_RESERVED) {
+                trit_val = TRIT_ZERO;
+            }
+            // Manual power calculation: 3^(4-i)
+            var power : i32 = 1;
+            var p : u32 = 0;
+            while (p < 4 - i) {
+                power = power * 3;
+                p = p + 1;
+            }
+            result += trit_to_signed(trit_val) * power;
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Encode signed value to 2-bit trit
+    fn signed_to_trit(val: i32) -> u32 {
+        if (val == -1) {
+            return TRIT_NEG;
+        } else if (val == 0) {
+            return TRIT_ZERO;
+        } else if (val == 1) {
+            return TRIT_POS;
+        } else {
+            return TRIT_ZERO; // Default → 0
+        }
+    }
+
+    // === Input/Output Structs ===
+
+    pub struct Tf3Input {
+        op : u32,        // 00=ADD, 01=SUB (future), 10=DOT (future), 11=reserved
+        a : u32,         // 18-bit TF3-9 value
+        b : u32,         // 18-bit TF3-9 value
+    }
+
+    pub struct Tf3Output {
+        valid : bool,
+        y : u32,         // 18-bit TF3-9 result
+    }
+
+    // === Decode Stage Functions ===
+
+    fn decode_tf3_fields(tf3_val: u32) -> (u32, u32, u32) {
+        var sign_trit : u32 = (tf3_val >> 16) & 3;
+        var exp_trits : u32 = (tf3_val >> 10) & 63;
+        var mant_trits : u32 = tf3_val & 1023;
+        return (sign_trit, exp_trits, mant_trits);
+    }
+
+    fn is_zero_tf3(tf3_val: u32) -> bool {
+        var (sign_trit, exp_trits, mant_trits) = decode_tf3_fields(tf3_val);
+        return (sign_trit == TRIT_ZERO) and (exp_trits == 0) and (mant_trits == 0);
+    }
+
+    fn decode_tf3_to_values(tf3_val: u32) -> (i32, i32, i32) {
+        var (sign_trit, exp_trits, mant_trits) = decode_tf3_fields(tf3_val);
+        var sign : i32 = trit_to_signed(sign_trit);
+        var exp : i32 = trits3_to_signed(exp_trits);
+        var mant : i32 = trits5_to_signed(mant_trits);
+        return (sign, exp, mant);
+    }
+
+    // === Exponent Alignment Functions ===
+
+    fn compute_exponent_shift(exp_a: i32, exp_b: i32) -> (u32, u32) {
+        var exp_diff : i32 = exp_a - exp_b;
+        var shift_a : u32 = 0;
+        var shift_b : u32 = 0;
+        
+        if (exp_diff < 0) {
+            shift_b = cast(u32) (-exp_diff);
+        }
+        
+        // Clamp shift to maximum 15
+        if (shift_b > 15) {
+            shift_b = 15;
+        }
+        
+        return (shift_a, shift_b);
+    }
+
+    fn shift_mantissa_right(mant: i32, shift: u32) -> i32 {
+        if (shift == 0) {
+            return mant;
+        }
+        
+        var shift_amount : i32 = cast(i32) shift;
+        
+        // Simple right shift (for positive mantissa)
+        if (mant >= 0) {
+            return mant >> shift_amount;
+        } else {
+            // For negative numbers, use arithmetic right shift
+            return mant >> shift_amount;
+        }
+    }
+
+    // === Core Addition Functions ===
+
+    fn add_mantissas(mant_a: i32, mant_b: i32) -> (i32, bool) {
+        var sum : i32 = mant_a + mant_b;
+        var carry_out : bool = if (sum > 31) true else if (sum < -32) true else false;
+        
+        // Clamp to 5-bit range
+        if (sum > 31) sum = 31;
+        if (sum < -32) sum = -32;
+        
+        return (sum, carry_out);
+    }
+
+    // === Normalization Functions ===
+
+    fn count_leading_zeros(mant: i32) -> u32 {
+        if (mant == 0) return 5;
+        if (mant < 0) mant = -mant;
+        
+        var count : u32 = 0;
+        var shifted : i32 = mant;
+        
+        while (shifted < 16 and count < 5) {  // 16 = 2^4, check if top bit is clear
+            shifted = shifted << 1;
+            count = count + 1;
+        }
+        
+        return count;
+    }
+
+    fn normalize_mantissa(mant: i32, lz_count: u32) -> i32 {
+        if (lz_count == 0) {
+            return mant;
+        }
+        
+        var shifted : i32 = mant << cast(i32) lz_count;
+        
+        // Clamp to 5-bit range
+        if (shifted > 31) shifted = 31;
+        if (shifted < -32) shifted = -32;
+        
+        return shifted;
+    }
+
+    // === Exponent Clamping Functions ===
+
+    fn clamp_exponent(exp: i32) -> i32 {
+        if (exp < TF3_MIN_EXP) {
+            return TF3_MIN_EXP;
+        }
+        if (exp > TF3_MAX_EXP) {
+            return TF3_MAX_EXP;
+        }
+        return exp;
+    }
+
+    // === Encoding Functions ===
+
+    fn encode_mantissa_to_trits(mant: i32) -> u32 {
+        var t0 : u32 = signed_to_trit(mant & 1);
+        var t1 : u32 = signed_to_trit((mant >> 1) & 1);
+        var t2 : u32 = signed_to_trit((mant >> 2) & 1);
+        var t3 : u32 = signed_to_trit((mant >> 3) & 1);
+        var t4 : u32 = signed_to_trit((mant >> 4) & 1);
+        
+        return (t4 << 8) | (t3 << 6) | (t2 << 4) | (t1 << 2) | t0;
+    }
+
+    fn encode_exponent_to_trits(exp: i32) -> u32 {
+        var t0 : u32 = signed_to_trit(exp & 1);
+        var t1 : u32 = signed_to_trit((exp >> 1) & 1);
+        var t2 : u32 = signed_to_trit((exp >> 2) & 1);
+        
+        return (t2 << 4) | (t1 << 2) | t0;
+    }
+
+    fn encode_tf3_from_components(sign: i32, exp: i32, mant: i32) -> u32 {
+        var sign_trit : u32 = signed_to_trit(sign);
+        var exp_trits : u32 = encode_exponent_to_trits(exp);
+        var mant_trits : u32 = encode_mantissa_to_trits(mant);
+        
+        return (sign_trit << 16) | (exp_trits << 10) | mant_trits;
+    }
+
+    // === Main Computation Function ===
+
+    fn tf3_add_compute(input: Tf3Input) -> Tf3Output {
+        var output : Tf3Output = undefined;
+        
+        // Decode inputs
+        var is_zero_a : bool = is_zero_tf3(input.a);
+        var is_zero_b : bool = is_zero_tf3(input.b);
+        var is_result_zero : bool = is_zero_a or is_zero_b;
+        
+        if (is_result_zero) {
+            output.valid = true;
+            output.y = 0;  // Zero representation
+            return output;
+        }
+        
+        var (sign_a, exp_a, mant_a) = decode_tf3_to_values(input.a);
+        var (sign_b, exp_b, mant_b) = decode_tf3_to_values(input.b);
+        
+        // Exponent alignment
+        var (shift_a, shift_b) = compute_exponent_shift(exp_a, exp_b);
+        var mant_b_shifted : i32 = shift_mantissa_right(mant_b, shift_b);
+        
+        // Core addition
+        var (mant_sum, carry_out) = add_mantissas(mant_a, mant_b_shifted);
+        var exp_aligned : i32 = if (exp_a >= exp_b) exp_a else exp_b;
+        
+        // Normalization
+        var lz_count : u32 = count_leading_zeros(mant_sum);
+        var mant_normalized : i32 = normalize_mantissa(mant_sum, lz_count);
+        var exp_adjusted : i32 = exp_aligned - cast(i32) lz_count;
+        
+        // Exponent clamping
+        var exp_final : i32 = clamp_exponent(exp_adjusted);
+        
+        // Check for zero result
+        var is_final_zero : bool = (exp_final == 0) and (mant_normalized == 0);
+        
+        // Encode result
+        if (is_final_zero) {
+            output.y = 0;  // Zero representation
+        } else {
+            var sign_add : i32 = sign_a ^ sign_b;  // XOR for addition
+            output.y = encode_tf3_from_components(sign_add, exp_final, mant_normalized);
+        }
+        
+        output.valid = true;
+        return output;
+    }
+
+    // === Tests ===
+
+    test trit_decode_negative
+        then trit_to_signed(TRIT_NEG) == -1
+
+    test trit_decode_zero
+        then trit_to_signed(TRIT_ZERO) == 0
+
+    test trit_decode_positive
+        then trit_to_signed(TRIT_POS) == 1
+
+    test trit_decode_reserved
+        then trit_to_signed(TRIT_RESERVED) == 0
+
+    test trits3_decode_simple
+        // 2'b01 2'b01 2'b01 = 0*9 + 0*3 + 0 = 0
+        then trits3_to_signed(0b010101) == 0
+
+    test trits3_decode_positive
+        // 2'b10 2'b00 2'b00 = 1*9 + (-1)*3 + (-1) = 9 - 3 - 1 = 5
+        then trits3_to_signed(0b100000) == 5
+
+    test trits5_decode_simple
+        // All zeros
+        then trits5_to_signed(0) == 0
+
+    test trits5_decode_mixed
+        // 2'b10 2'b00 2'b00 2'b00 2'b00 = 1*81 + (-1)*27 + (-1)*9 + (-1)*3 + (-1)*1 = 81 - 27 - 9 - 3 - 1 = 41
+        then trits5_to_signed(0b1000000000) == 41
+
+    test signed_encode_negative
+        then signed_to_trit(-1) == TRIT_NEG
+
+    test signed_encode_zero
+        then signed_to_trit(0) == TRIT_ZERO
+
+    test signed_encode_positive
+        then signed_to_trit(1) == TRIT_POS
+
+    test decode_fields
+        given tf3 = 0b01_010101_0101010101  // sign=01, exp=010101, mant=0101010101
+        then decode_tf3_fields(tf3) == (TRIT_ZERO, 0b010101, 0b0101010101)
+
+    test is_zero_detection
+        then is_zero_tf3(0) == true  // All zeros
+        and is_zero_tf3(0b01_000000_0000000000) == true  // Sign=0, exp=0, mant=0
+
+    test exponent_shift_positive_diff
+        then compute_exponent_shift(5, 3) == (0, 2)
+
+    test exponent_shift_negative_diff
+        then compute_exponent_shift(3, 5) == (0, 2)
+
+    test exponent_shift_zero_diff
+        then compute_exponent_shift(4, 4) == (0, 0)
+
+    test mantissa_shift_small
+        then shift_mantissa_right(16, 1) == 8
+
+    test mantissa_shift_large
+        then shift_mantissa_right(16, 4) == 1
+
+    test mantissa_shift_no_shift
+        then shift_mantissa_right(16, 0) == 16
+
+    test mantissa_addition_simple
+        then add_mantissas(10, 5) == (15, false)
+
+    test mantissa_addition_carry
+        then add_mantissas(20, 15) == (31, true)  // 35 → clamped to 31, carry out
+
+    test leading_zero_count_zero
+        then count_leading_zeros(0) == 5
+
+    test leading_zero_count_small
+        then count_leading_zeros(1) == 4
+
+    test leading_zero_count_medium
+        then count_leading_zeros(8) == 1
+
+    test leading_zero_count_large
+        then count_leading_zeros(16) == 0
+
+    test normalization_no_shift
+        then normalize_mantissa(16, 0) == 16
+
+    test normalization_shift
+        then normalize_mantissa(1, 2) == 4
+
+    test exponent_clamping_min
+        then clamp_exponent(-20) == TF3_MIN_EXP
+
+    test exponent_clamping_max
+        then clamp_exponent(20) == TF3_MAX_EXP
+
+    test exponent_clamping_normal
+        then clamp_exponent(5) == 5
+
+    test mantissa_encoding
+        // Encode mantissa 5 (0b00101)
+        then encode_mantissa_to_trits(5) == 0b0101010101  // All trits encode 0
+
+    test exponent_encoding
+        // Encode exponent 5
+        then encode_exponent_to_trits(5) == 0b010101  // All trits encode 0
+
+    test tf3_encoding_simple
+        // Encode sign=0, exp=0, mant=0
+        then encode_tf3_from_components(0, 0, 0) == 0
+
+    test tf3_add_computation_zero_input
+        given input = Tf3Input{.op = 0, .a = 0, .b = 0}
+        then tf3_add_compute(input).y == 0
+
+    test tf3_add_computation_simple
+        // Add two small positive numbers
+        // a: sign=0, exp=0, mant=1 → value = 1 * 3^0 = 1
+        // b: sign=0, exp=0, mant=2 → value = 2 * 3^0 = 2
+        // result should be 3 → sign=0, exp=0, mant=3
+        var a_encoded : u32 = encode_tf3_from_components(0, 0, 1);
+        var b_encoded : u32 = encode_tf3_from_components(0, 0, 2);
+        given input = Tf3Input{.op = 0, .a = a_encoded, .b = b_encoded}
+        var result : Tf3Output = tf3_add_compute(input);
+        then result.valid == true
+        and result.y == encode_tf3_from_components(0, 0, 3)
+
+    // === Invariants ===
+
+    invariant trit_encoding_valid
+        assert trit_to_signed(TRIT_NEG) == -1
+        and trit_to_signed(TRIT_ZERO) == 0
+        and trit_to_signed(TRIT_POS) == 1
+
+    invariant exponent_range_valid
+        assert clamp_exponent(TF3_MIN_EXP - 1) == TF3_MIN_EXP
+        and clamp_exponent(TF3_MAX_EXP + 1) == TF3_MAX_EXP
+
+    invariant tf3_encoding_consistent
+        // Encoding and decoding should be consistent for zero
+        var zero_encoded : u32 = encode_tf3_from_components(0, 0, 0);
+        then is_zero_tf3(zero_encoded) == true
+
+}
+
+// phi^2 + 1/φ² = 3 | TRINITY
