@@ -1,0 +1,324 @@
+module port::jepa_t_ingest;
+
+//! # jepa_t_ingest
+//!
+//! Plaintext → ternary-quantized triplet pipeline for JEPA-T training on Trinity silicon.
+//!
+//! ## Ternary Anchor
+//!
+//! - Ternary alphabet: {−1, 0, +1}
+//! - φ⁻² (Q1.15) = 12533 (0x30F4) — quantization threshold
+//! - φ² + φ⁻² = 3
+//! - DOI: 10.5281/zenodo.19227877
+//!
+//! ## Quantizer: Wave-9b RTL Byte-for-Byte Match
+//!
+//! Matches `phi_prior_quantizer.v` from Wave-9b exactly:
+//! - if fp >= +12533 → +1
+//! - if fp <= −12533 → −1
+//! - else → 0
+//!
+//! ## License
+//!
+//! Apache-2.0
+
+/// Configuration for the plaintext ingest pipeline.
+///
+/// Controls how text is windowed into anchor/positive/negative triplets.
+struct IngestConfig {
+    /// Number of tokens per context window (must be <= 64).
+    window_size: usize,
+    /// Stride between successive anchor windows.
+    stride: usize,
+}
+
+/// A ternary triplet for JEPA-T contrastive training.
+///
+/// Each field is a 64-element ternary vector with values in {-1, 0, +1}.
+struct Triplet {
+    /// Anchor context window (quantized token hashes).
+    anchor: [i8; 64],
+    /// Positive window — overlapping or adjacent to anchor.
+    positive: [i8; 64],
+    /// Negative window — non-overlapping, sampled from elsewhere in the corpus.
+    negative: [i8; 64],
+}
+
+/// Ternary quantizer — matches Wave-9b `phi_prior_quantizer.v` byte-for-byte.
+///
+/// Threshold is φ⁻² in Q1.15 fixed-point = 12533 (0x30F4).
+///
+/// # Arguments
+///
+/// * `fp_q15` — signed 16-bit Q1.15 fixed-point input
+///
+/// # Returns
+///
+/// * `+1` if `fp_q15 >= 12533`
+/// * `-1` if `fp_q15 <= -12533`
+/// * `0`  otherwise
+pub fn quantize_phi_prior(fp_q15: i16) -> i8 {
+    const THRESHOLD: i16 = 12533; // φ⁻² in Q1.15 = 0x30F4
+    if fp_q15 >= THRESHOLD {
+        return 1;
+    } else if fp_q15 <= -THRESHOLD {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
+fn IngestConfig_default() -> IngestConfig {
+    return IngestConfig {
+        window_size: 64,
+        stride: 32,
+    };
+}
+
+pub fn Triplet_to_bytes(triplet: &Triplet) -> []u8 {
+    var out: [192]u8 = undefined;
+    var i: usize = 0;
+    
+    for v in triplet.anchor {
+        out[i] = v as u8;
+        i += 1;
+    }
+    for v in triplet.positive {
+        out[i] = v as u8;
+        i += 1;
+    }
+    for v in triplet.negative {
+        out[i] = v as u8;
+        i += 1;
+    }
+    
+    return &out;
+}
+
+/// Hash a token (byte slice) into a Q1.15 signed integer, then ternary-quantize.
+///
+/// Uses a simple djb2-style accumulation to produce a reproducible i16 value.
+fn token_to_q15(token: []const u8) -> i16 {
+    var h: u32 = 5381;
+    for b in token {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    // Fold 32-bit hash into i16 range by XOR-folding, preserving sign distribution.
+    let folded = ((h >> 16) ^ (h & 0xFFFF)) as u16;
+    return folded as i16;
+}
+
+/// Convert a text window (slice of byte-token slices) into a 64-element ternary vector.
+///
+/// Tokens are hashed to Q1.15, then quantized with `quantize_phi_prior`.
+/// If the window has fewer than 64 tokens, the remainder is zero-padded.
+fn window_to_ternary(tokens: []const u8) -> [i8; 64] {
+    var out: [i8; 64] = [0i8; 64];
+    var i: usize = 0;
+    for b in tokens {
+        if (i < 64) {
+            // Create a single-byte token
+            var token: [1]u8 = [b];
+            out[i] = quantize_phi_prior(token_to_q15(&token));
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    return out;
+}
+
+/// Stream a plaintext string into a sequence of ternary [`Triplet`]s.
+///
+/// The algorithm:
+/// 1. Tokenise by whitespace into byte slices.
+/// 2. Slide an anchor window of `cfg.window_size` tokens with step `cfg.stride`.
+/// 3. Positive = next window (`anchor_start + cfg.stride`).
+/// 4. Negative = window from the opposite end of the corpus.
+/// 5. Each window is mapped to a 64-element ternary vector via [`quantize_phi_prior`].
+///
+/// At least 3 windows are required to form a triplet (anchor, positive, negative
+/// must all be distinct). Returns an empty Vec if the input is too short.
+///
+/// # Arguments
+///
+/// * `input` — raw UTF-8 text (any language, any encoding as UTF-8)
+/// * `cfg`   — windowing configuration
+pub fn ingest_text(input: []const u8, cfg: &IngestConfig) -> []Triplet {
+    let ws = cfg.window_size.min(64).max(1);
+    let stride = cfg.stride.max(1);
+
+    // Tokenise by whitespace — collect byte representations.
+    var raw_tokens: [1000]u8 = undefined; // Simplified: just collect individual bytes
+    var n: usize = 0;
+    
+    // Simple whitespace tokenization - collect individual bytes
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == ' ') {
+            if (i > start) {
+                if (n < 1000) {
+                    // Copy bytes from start to i-1
+                    var j: usize = start;
+                    while (j < i and n < 1000) {
+                        raw_tokens[n] = input[j];
+                        n += 1;
+                        j += 1;
+                    }
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    // Add last token
+    if (start < input.len and n < 1000) {
+        var j: usize = start;
+        while (j < input.len and n < 1000) {
+            raw_tokens[n] = input[j];
+            n += 1;
+            j += 1;
+        }
+    }
+
+    if (n < ws * 2) {
+        // Not enough tokens to form even one meaningful triplet.
+        return &[_]Triplet{};
+    }
+
+    // Build all windows.
+    var windows: [100][i8; 64] = undefined;
+    var num_windows: usize = 0;
+    
+    var window_start: usize = 0;
+    while (window_start + ws <= n) {
+        // Extract window as a single slice
+        var window_slice: [256]u8 = undefined;
+        var window_len: usize = 0;
+        var j: usize = 0;
+        while (j < ws and j < 64 and window_start + j < n) {
+            window_slice[window_len] = raw_tokens[window_start + j];
+            window_len += 1;
+            j += 1;
+        }
+        
+        windows[num_windows] = window_to_ternary(&window_slice[0..window_len]);
+        num_windows += 1;
+        window_start += stride;
+    }
+
+    if (num_windows < 3) {
+        return &[_]Triplet{};
+    }
+
+    var triplets: [100]Triplet = undefined;
+    var triplet_count: usize = 0;
+
+    for i in 0..num_windows - 2 {
+        let anchor = windows[i];
+        let positive = windows[i + 1];
+        // Negative: pick from the farthest window (opposite end from anchor).
+        let neg_idx = if (i < num_windows / 2) {
+            num_windows - 1
+        } else {
+            0
+        };
+        let negative = windows[neg_idx];
+
+        triplets[triplet_count] = Triplet {
+            anchor: anchor,
+            positive: positive,
+            negative: negative,
+        };
+        triplet_count += 1;
+    }
+
+    return &triplets[0..triplet_count];
+}
+
+// Test cases ported from the original Rust unit tests
+test quantize_zero {
+    assert(quantize_phi_prior(0) == 0);
+}
+
+test quantize_positive_boundary {
+    assert(quantize_phi_prior(12532) == 0, "+12532 must be 0");
+    assert(quantize_phi_prior(12533) == 1, "+12533 must be +1");
+}
+
+test quantize_negative_boundary {
+    assert(quantize_phi_prior(-12532) == 0, "-12532 must be 0");
+    assert(quantize_phi_prior(-12533) == -1, "-12533 must be -1");
+}
+
+test quantize_max_values {
+    assert(quantize_phi_prior(32767) == 1);  // i16::MAX
+    assert(quantize_phi_prior(-32768) == -1); // i16::MIN
+}
+
+test ingest_empty_returns_empty {
+    let cfg = IngestConfig_default();
+    let input = "";
+    let triplets = ingest_text(input, &cfg);
+    assert(triplets.len == 0);
+}
+
+test ingest_short_returns_empty {
+    let cfg = IngestConfig {
+        window_size: 64,
+        stride: 32,
+    };
+    let input = "hello world";
+    let triplets = ingest_text(input, &cfg);
+    assert(triplets.len == 0);
+}
+
+test ingest_produces_valid_ternary {
+    let cfg = IngestConfig {
+        window_size: 4,
+        stride: 2,
+    };
+    let input = "a b c d e f g h i j k l m n o p";
+    let triplets = ingest_text(input, &cfg);
+    assert(triplets.len > 0);
+    for t in triplets {
+        for v in t.anchor {
+            assert(v == -1 or v == 0 or v == 1, "non-ternary value: {}", v);
+        }
+        for v in t.positive {
+            assert(v == -1 or v == 0 or v == 1, "non-ternary value: {}", v);
+        }
+        for v in t.negative {
+            assert(v == -1 or v == 0 or v == 1, "non-ternary value: {}", v);
+        }
+    }
+}
+
+test triplet_to_bytes_length {
+    let t = Triplet {
+        anchor: [1i8; 64],
+        positive: [0i8; 64],
+        negative: [-1i8; 64],
+    };
+    let bytes = Triplet_to_bytes(&t);
+    assert(bytes.len == 192);
+}
+
+test token_to_q15_reproducible {
+    let token1 = "hello";
+    let token2 = "hello";
+    let token3 = "world";
+    assert(token_to_q15(token1) == token_to_q15(token2));
+    assert(token_to_q15(token1) != token_to_q15(token3));
+}
+
+test window_to_ternary_padding {
+    let tokens: [2]u8 = ['a', 'b'];
+    let ternary = window_to_ternary(&tokens);
+    assert(ternary[0] == quantize_phi_prior(token_to_q15(&['a'])));
+    assert(ternary[1] == quantize_phi_prior(token_to_q15(&['b'])));
+    // Remaining elements should be 0 (padded)
+    assert(ternary[2] == 0);
+    assert(ternary[63] == 0);
+}
