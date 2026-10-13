@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// trinity_v3_jtaguart.t27 - port of gHashTag/trinity fpga/openxc7-synth/trinity_v3_jtaguart.v
+// (Verilog, commit ee512359254b, 274 lines, one module).
+//
+// The original is a JTAG UART bridge module that combines JTAG communication with 
+// TRINITY V2 (VSA + TQNN), enabling FPGA communication via JTAG cable only. It includes
+// UART reception, command decoding state machine, and LED control logic.
+//
+// Mapping from the original Verilog:
+//
+//   input wire clk, rst                    -> module inputs clk, rst
+//   output wire led_d5, led_d6, led_d7     -> led_outputs function
+//   reg [2:0] rst_sync                     -> ResetSyncState struct, rst_n function
+//   reg [7:0] test_counter, [23:0] blink_divider -> TestCounters struct, update_counters function
+//   reg [2:0] state, [7:0] cmd_byte etc.  -> CommandDecoderState struct, command_step function
+//   reg [7:0] uart_rx_data, uart_rx_valid -> UARTReceiverState struct, uart_rx_step function
+//   always @(posedge clk or negedge rst_n) -> state update functions
+//   assign led_d5 = heartbeat; etc.        -> led_outputs function
+//
+// Porting notes:
+// - The original's clk and rst ports are synthesis plumbing; this spec keeps
+//   the pure decisions the original makes, in the shape the Verilog backend
+//   lowers (see specs/fpga/cts.t27 and specs/fpga/apb_bridge.t27): plain
+//   functions, no on_comb / on_clock.
+// - State machines are expressed as functions that compute next state from current state
+// - The 24-bit blink divider and 8-bit counter are expressed as u32 counters with comparison
+// - UART baud rate calculation (BAUD_DIV = 434) is kept as a constant
+// - Command decoder state machine with localparam values is ported to enum and functions
+// - LED patterns are computed by led_output function based on state and counter values
+// - Tests verify the state machine transitions and LED output behavior
+// - JTAG signals are internal synthesis plumbing, not tested here
+
+module trinity_v3_jtaguart {
+
+    // ---------------------------------------------------------------
+    // Constants (from the original's literals and parameters)
+    // ---------------------------------------------------------------
+
+    pub const BAUD_DIV : u32 = 434;        // 50MHz / 434 ≈ 115200 baud
+    pub const COUNTER_RESET : u32 = 0;      // Power-on reset value
+    pub const BLINK_DIVIDER_MAX : u32 = 0xFFFFFF; // 24-bit max value
+
+    // Command decoder state machine states (from localparam)
+    pub const IDLE : u32 = 0;
+    pub const HDR : u32 = 1;
+    pub const CMD : u32 = 2;
+    pub const LEN : u32 = 3;
+    pub const DATA : u32 = 4;
+    pub const CRC_L : u32 = 5;
+    pub const CRC_H : u32 = 6;
+    pub const EXECUTE : u32 = 7;
+
+    // Command opcodes
+    pub const CMD_PING : u32 = 0xFF;
+    pub const CMD_MODE : u32 = 0x01;
+
+    // ---------------------------------------------------------------
+    // Structs
+    // ---------------------------------------------------------------
+
+    // Reset synchronization state (rst_sync [2:0])
+    pub struct ResetSyncState {
+        sync_reg : u32,  // 3-bit register
+    }
+
+    // Test counters (test_counter [7:0], blink_divider [23:0])
+    pub struct TestCounters {
+        counter : u32,     // 8-bit counter
+        blink_div : u32,   // 24-bit divider
+    }
+
+    // UART receiver state (uart_rx_data, uart_rx_valid, uart_rx_busy)
+    pub struct UARTReceiverState {
+        rx_data : u32,     // 8-bit received data
+        rx_valid : bool,   // Data valid flag
+        rx_busy : bool,    // Receiver busy flag
+        baud_counter : u32, // 16-bit baud counter
+        bit_count : u32,   // 3-bit bit counter
+        shift_reg : u32,   // 8-bit shift register
+    }
+
+    // Command decoder state (state, cmd_byte, data_len, data_idx, vector_a, vector_b, similarity_score, led_mode_reg)
+    pub struct CommandDecoderState {
+        state : u32,           // 3-bit state machine
+        cmd_byte : u32,        // 8-bit command byte
+        data_len : u32,        // 8-bit data length
+        data_idx : u32,        // 8-bit data index
+        vector_a : u32,        // 32-bit vector A
+        vector_b : u32,        // 32-bit vector B
+        similarity_score : u32, // 8-bit similarity score
+        led_mode : u32,        // 3-bit LED mode
+    }
+
+    // Combined module state
+    pub struct ModuleState {
+        reset : ResetSyncState,
+        counters : TestCounters,
+        uart : UARTReceiverState,
+        cmd : CommandDecoderState,
+    }
+
+    // Module inputs
+    pub struct Inputs {
+        clk : bool,
+        rst : bool,
+        jtag_tx_to_trinity : bool,  // UART RX from JTAG
+    }
+
+    // Module outputs
+    pub struct Outputs {
+        led_d5 : bool,  // JTAG active
+        led_d6 : bool,  // TX/RX activity
+        led_d7 : bool,  // Fault/Error
+    }
+
+    // ---------------------------------------------------------------
+    // Functions
+    // ---------------------------------------------------------------
+
+    // Initialize reset synchronization state
+    fn init_reset_state() -> ResetSyncState {
+        return ResetSyncState{ .sync_reg = 0 };
+    }
+
+    // Compute active-low reset from sync register
+    fn rst_n(reset: ResetSyncState) -> bool {
+        return (reset.sync_reg & 4) == 0;  // ~reset_sync[2]
+    }
+
+    // Update reset synchronization on clock edge
+    fn update_reset(reset: ResetSyncState, rst: bool) -> ResetSyncState {
+        var next : ResetSyncState = reset;
+        var shifted: u32 = (reset.sync_reg << 1) & 6;
+        var rst_bit: u32 = if (rst) 1 else 0;
+        next.sync_reg = shifted | rst_bit;  // {sync_reg[1:0], rst}
+        return next;
+    }
+
+    // Initialize test counters
+    fn init_test_counters() -> TestCounters {
+        return TestCounters{ .counter = 0, .blink_div = 0 };
+    }
+
+    // Update test counters on clock edge
+    fn update_counters(counters: TestCounters) -> TestCounters {
+        var next : TestCounters = counters;
+        next.blink_div = counters.blink_div + 1;
+        
+        // Increment test_counter when blink_divider wraps
+        if (next.blink_div == 0) {
+            next.counter = counters.counter + 1;
+        }
+        
+        return next;
+    }
+
+    // Initialize UART receiver state
+    fn init_uart_state() -> UARTReceiverState {
+        return UARTReceiverState{
+            .rx_data = 0,
+            .rx_valid = false,
+            .rx_busy = false,
+            .baud_counter = 0,
+            .bit_count = 0,
+            .shift_reg = 0,
+        };
+    }
+
+    // Update UART receiver state (bit-banged UART receiver)
+    fn uart_rx_step(uart: UARTReceiverState, rst_n: bool, uart_rx_in: bool) -> UARTReceiverState {
+        if (!rst_n) {
+            return init_uart_state();
+        }
+
+        var next : UARTReceiverState = uart;
+        next.rx_valid = false;
+
+        // Simple bit-banged UART receiver logic
+        if (!uart.rx_busy && !uart_rx_in) {
+            // Start bit detected
+            next.rx_busy = true;
+            next.baud_counter = 0;
+            next.bit_count = 0;
+        } else if (uart.rx_busy) {
+            if (uart.baud_counter == BAUD_DIV - 1) {
+                next.baud_counter = 0;
+
+                if (uart.bit_count == 0) {
+                    // Start bit verified
+                    next.bit_count = uart.bit_count + 1;
+                } else if (uart.bit_count >= 1 && uart.bit_count <= 8) {
+                    // Data bit
+                    next.shift_reg = ((uart.shift_reg << 1) | (if (uart_rx_in) 1 else 0));
+                    next.bit_count = uart.bit_count + 1;
+                } else {
+                    // Stop bit - data ready
+                    next.rx_data = uart.shift_reg;
+                    next.rx_valid = true;
+                    next.rx_busy = false;
+                }
+            } else {
+                next.baud_counter = uart.baud_counter + 1;
+            }
+        }
+
+        return next;
+    }
+
+    // Initialize command decoder state
+    fn init_cmd_state() -> CommandDecoderState {
+        return CommandDecoderState{
+            .state = IDLE,
+            .cmd_byte = 0,
+            .data_len = 0,
+            .data_idx = 0,
+            .vector_a = 0,
+            .vector_b = 0,
+            .similarity_score = 0,
+            .led_mode = 0,
+        };
+    }
+
+    // Update command decoder state
+    fn command_step(cmd: CommandDecoderState, uart_rx_valid: bool, uart_rx_data: u32) -> CommandDecoderState {
+        if (!uart_rx_valid) {
+            return cmd;
+        }
+
+        var next : CommandDecoderState = cmd;
+
+        // Command processing state machine
+        if (cmd.state == IDLE) {
+            if (uart_rx_data == 0xAA) {
+                next.state = HDR;
+            }
+        } else if (cmd.state == HDR) {
+            next.cmd_byte = uart_rx_data;
+            next.state = CMD;
+        } else if (cmd.state == CMD) {
+            next.data_len = uart_rx_data;
+
+            if (cmd.cmd_byte == CMD_PING) {
+                next.state = IDLE;  // Auto-respond to PING
+            } else if (cmd.cmd_byte == CMD_MODE) {
+                next.state = DATA;
+                next.data_idx = 0;
+            } else {
+                if (uart_rx_data == 0) {
+                    next.state = EXECUTE;
+                } else {
+                    next.state = DATA;
+                }
+            }
+        } else if (cmd.state == DATA) {
+            if (cmd.cmd_byte == CMD_MODE) {
+                next.led_mode = uart_rx_data & 7;  // led_mode_reg[2:0]
+            }
+
+            next.data_idx = cmd.data_idx + 1;
+            if (next.data_idx >= cmd.data_len) {
+                next.state = CRC_L;
+            }
+        } else if (cmd.state == CRC_L) {
+            next.state = CRC_H;
+        } else if (cmd.state == CRC_H) {
+            next.state = EXECUTE;
+        } else if (cmd.state == EXECUTE) {
+            next.state = IDLE;  // Execute command - return to IDLE
+        } else {
+            next.state = IDLE;
+        }
+
+        return next;
+    }
+
+    // Compute heartbeat signal from blink divider
+    fn heartbeat(blink_div: u32) -> bool {
+        return (blink_div & 0x800000) == 0;  // blink_divider[23] == 0
+    }
+
+    // Compute LED pattern based on command mode and counters
+    fn cmd_led_pattern(led_mode: u32, blink_div: u32, test_counter: u32) -> bool {
+        switch (led_mode) {
+            0 => (blink_div & 0x02000000) != 0,  // Slow - blink_divider[25]
+            1 => (test_counter & 1) != 0,         // Fast toggle - test_counter[0]
+            2 => (blink_div & 0x00400000) != 0,  // Medium - blink_divider[22]
+            3 => (blink_div & 0x00200000) != 0,  // Fast - blink_divider[21]
+            else => heartbeat(blink_div),         // Default
+        }
+    }
+
+    // Compute LED outputs from module state
+    fn led_outputs(state: ModuleState) -> Outputs {
+        const hb = heartbeat(state.counters.blink_div);
+        const pattern = cmd_led_pattern(state.cmd.led_mode, state.counters.blink_div, state.counters.counter);
+        
+        return Outputs{
+            .led_d5 = hb,                    // JTAG alive
+            .led_d6 = pattern,               // Activity/Mode
+            .led_d7 = (state.cmd.state == EXECUTE), // Fault (active low - inverted)
+        };
+    }
+
+    // Initialize complete module state
+    fn init_module_state() -> ModuleState {
+        return ModuleState{
+            .reset = init_reset_state(),
+            .counters = init_test_counters(),
+            .uart = init_uart_state(),
+            .cmd = init_cmd_state(),
+        };
+    }
+
+    // Update module state on clock edge
+    fn update_module_state(state: ModuleState, inputs: Inputs) -> ModuleState {
+        var next : ModuleState = state;
+
+        // Update reset synchronization
+        next.reset = update_reset(state.reset, inputs.rst);
+
+        // Update test counters
+        next.counters = update_counters(state.counters);
+
+        // Update UART receiver
+        next.uart = uart_rx_step(state.uart, rst_n(state.reset), inputs.jtag_tx_to_trinity);
+
+        // Update command decoder
+        next.cmd = command_step(state.cmd, state.uart.rx_valid, state.uart.rx_data);
+
+        return next;
+    }
+
+    // ---------------------------------------------------------------
+    // Tests
+    // ---------------------------------------------------------------
+
+    test reset_sync_initial
+        given reset = init_reset_state()
+        then reset.sync_reg == 0
+        and rst_n(reset) == true
+
+    test reset_sync_update
+        given reset1 = ResetSyncState{ .sync_reg = 0b010 }
+        given reset2 = update_reset(reset1, true)
+        then reset2.sync_reg == 0b011
+        and rst_n(reset2) == false
+
+    test counters_initial
+        given counters = init_test_counters()
+        then counters.counter == 0
+        and counters.blink_div == 0
+
+    test_counters_increment
+        given counters1 = init_test_counters()
+        given counters2 = update_counters(counters1)
+        then counters2.blink_div == 1
+        and counters2.counter == 0
+
+    test_counters_wrap_increments_counter
+        given counters1 = TestCounters{ .counter = 10, .blink_div = BLINK_DIVIDER_MAX }
+        given counters2 = update_counters(counters1)
+        then counters2.blink_div == 0
+        and counters2.counter == 11
+
+    test_uart_initial
+        given uart = init_uart_state()
+        then uart.rx_data == 0
+        and uart.rx_valid == false
+        and uart.rx_busy == false
+
+    test_uart_detects_start_bit
+        given uart1 = init_uart_state()
+        given uart2 = uart_rx_step(uart1, true, false)  // Start bit detected
+        then uart2.rx_busy == true
+        and uart2.baud_counter == 0
+        and uart2.bit_count == 0
+
+    test_uart_receives_data_bit
+        given uart1 = UARTReceiverState{ .rx_busy = true, .baud_counter = 433, .bit_count = 1, .shift_reg = 0b10100000 }
+        given uart2 = uart_rx_step(uart1, true, true)  // Receive 1
+        then uart2.baud_counter == 0
+        and uart2.bit_count == 2
+        and uart2.shift_reg == 0b10100001
+
+    test_uart_completes Reception
+        given uart1 = UARTReceiverState{ .rx_busy = true, .baud_counter = 433, .bit_count = 8, .shift_reg = 0b10101010 }
+        given uart2 = uart_rx_step(uart1, true, true)  // Stop bit
+        then uart2.rx_valid == true
+        and uart2.rx_data == 0b10101010
+        and uart2.rx_busy == false
+
+    test_command_idle_to_hdr
+        given cmd = init_cmd_state()
+        given next = command_step(cmd, true, 0xAA)  // Header byte
+        then next.state == HDR
+        and next.cmd_byte == 0
+
+    test_command_hdr_to_cmd
+        given cmd = CommandDecoderState{ .state = HDR, .cmd_byte = 0 }
+        given next = command_step(cmd, true, 0x01)  // Command byte
+        then next.state == CMD
+        and next.cmd_byte == 0x01
+
+    test_command_ping_responds
+        given cmd = CommandDecoderState{ .state = CMD, .cmd_byte = CMD_PING }
+        given next = command_step(cmd, true, 0x00)  // PING command
+        then next.state == IDLE  // Auto-respond
+
+    test_command_mode_enters_data
+        given cmd = CommandDecoderState{ .state = CMD, .cmd_byte = CMD_MODE }
+        given next = command_step(cmd, true, 0x02)  // MODE command with length 2
+        then next.state == DATA
+        and next.data_len == 2
+        and next.data_idx == 0
+
+    test_command_mode_updates_led
+        given cmd = CommandDecoderState{ .state = DATA, .cmd_byte = CMD_MODE, .led_mode = 0 }
+        given next = command_step(cmd, true, 0x05)  // LED mode 5 (0b101)
+        then next.led_mode == 5
+        and next.data_idx == 1
+
+    test_heartbeat_signal
+        then heartbeat(0x000000) == true   // bit 23 = 0
+        and heartbeat(0x800000) == false  // bit 23 = 1
+        and heartbeat(0x7FFFFF) == true   // bit 23 = 0
+
+    test_cmd_led_pattern_modes
+        then cmd_led_pattern(0, 0x02000000, 0) == true    // Slow: bit 25 = 1
+        and cmd_led_pattern(1, 0, 1) == true              // Fast toggle: bit 0 = 1
+        and cmd_led_pattern(2, 0x00400000, 0) == true    // Medium: bit 22 = 1
+        and cmd_led_pattern(3, 0x00200000, 0) == true    // Fast: bit 21 = 1
+        and cmd_led_pattern(7, 0, 0) == true              // Default: heartbeat
+
+    test_led_outputs_initial
+        given state = init_module_state()
+        given outputs = led_outputs(state)
+        then outputs.led_d5 == true    // heartbeat true initially
+        and outputs.led_d6 == true    // pattern true initially
+        and outputs.led_d7 == true    // fault true initially (not in EXECUTE)
+
+    test_led_outputs_execute_state
+        given state = ModuleState{
+            .reset = init_reset_state(),
+            .counters = init_test_counters(),
+            .uart = init_uart_state(),
+            .cmd = CommandDecoderState{ .state = EXECUTE, .led_mode = 0 },
+        }
+        given outputs = led_outputs(state)
+        then outputs.led_d5 == true    // heartbeat true
+        and outputs.led_d6 == true    // pattern true (slow mode)
+        and outputs.led_d7 == false   // fault false (in EXECUTE)
+
+    test_module_state_update
+        given state = init_module_state()
+        given inputs = Inputs{ .clk = true, .rst = false, .jtag_tx_to_trinity = false }
+        given next = update_module_state(state, inputs)
+        then next.counters.blink_div == 1  // Counter incremented
+        and next.reset.sync_reg == 0      // Reset not asserted
+        and next.uart.rx_busy == false    // No start bit detected
+
+}
+
+// End of module trinity_v3_jtaguart
