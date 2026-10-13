@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Port of gHashTag/trinity `fpga/openxc7-synth/ternary_matvec_bram.v`
+//! (@ 341f1d150c70, 233 lines) to a spec-first .t27 module.
+//!
+//! Computes y[j] = sum_i W[i][j] * x[i], W[i][j] in {-1, 0, +1}, x[i] in i32.
+//! Architecture (from the original's header): sequential with a pipelined
+//! BRAM read -- one weight read per clock, 1 clock BRAM latency, a single
+//! accumulator and NO DSP48: the 2-bit ternary weights {01, 10, 00} decode
+//! to +1 / -1 / 0 and drive pure add / sub / nop.  Weights are stored
+//! column-major: addr = j * N_IN + i, so a column is one contiguous burst.
+//! Default shape 243 x 729 (the HSLM TrinityBlock up-projection):
+//! 177,147 weights, ~179K clocks @ 50 MHz = 3.6 ms per full output vector.
+//!
+//! The BRAM content itself is data, not logic: the real image is a
+//! $readmemb mem file the bench loads into the inferred RAM.  Here
+//! `weight_mem_read` is the deterministic stand-in for that image
+//! (adjacent columns see shifted weight patterns, enough to catch an
+//! addressing bug), and everything else -- the decode table, the
+//! column-major address arithmetic, the input mux and the 6-state
+//! pipeline -- is the original's decision, expressed as functions the
+//! tests drive.  `gen-verilog` lowers those to the module; the memory
+//! image stays the caller's concern.
+
+module ternary_matvec_bram {
+
+// --- Module parameters (original lines 32-40) ---
+const N_IN: i32 = 243;
+const N_OUT: i32 = 729;
+const ACC_WIDTH: i32 = 20;   // acc: signed 20 bits; worst case 243*243 = 59,049 < 2^19
+const ADDR_WIDTH: i32 = 18;  // 2^18 = 262,144 >= N_IN*N_OUT = 177,147
+const I_WIDTH: i32 = 8;      // 2^8  = 256 > LAST_I
+const J_WIDTH: i32 = 10;     // 2^10 = 1024 > LAST_J
+const USE_EXT_X: i32 = 0;    // 0 = x[i] = i+1 (self-test), 1 = external input
+
+// Power-of-2 BRAM depth for clean cascade address decode (original
+// MEM_DEPTH = 1 << ADDR_WIDTH); the 177,147 useful entries are
+// addr < N_IN * N_OUT, the rest read 0 -- no contribution.
+const MEM_DEPTH: i32 = 262144;
+
+// Width-safe comparison constants (original lines 82-83: written as
+// narrow literals to avoid a 32-bit literal promotion bug).
+const LAST_I: i32 = 242;  // N_IN  - 1, fits I_WIDTH  = 8 bits
+const LAST_J: i32 = 728;  // N_OUT - 1, fits J_WIDTH = 10 bits
+
+// Weight encoding (original line 24): 2-bit codes, stored as (i + j) % 3
+// by the stand-in image.
+const W_PLUS: i32 = 1;   // 2'b01
+const W_MINUS: i32 = 2;  // 2'b10
+const W_ZERO: i32 = 0;   // 2'b00 (2'b11 unused, decodes to 0)
+
+// State machine (original lines 104-109).
+const S_IDLE: i32 = 0;
+const S_PREFETCH: i32 = 1;
+const S_COMPUTE: i32 = 2;
+const S_LAST_ACC: i32 = 3;
+const S_OUTPUT: i32 = 4;
+const S_DONE: i32 = 5;
+
+/// Weight decode (original `case (w_code_r)`, lines 167-171 and 190-194):
+/// 2'b01 = +1, 2'b10 = -1, 2'b00 = 0; the default arm also covers 2'b11.
+pub fn weight_sign(w_code: i32) -> i32 {
+    if (w_code == W_PLUS) {
+        return 1;
+    } else {
+        if (w_code == W_MINUS) {
+            return -1;
+        } else {
+            return 0;
+        }
+    }
+}
+
+/// Stand-in for the $readmemb weight image (original `weight_mem`,
+/// lines 63-64, loaded by the bench): the 2-bit code at column-major
+/// address j * N_IN + i is (i + j) % 3, so adjacent columns see shifted
+/// weight patterns.  Entries past the 177,147 useful ones read 0,
+/// mirroring the original's default (lines 59-61).
+pub fn weight_mem_read(addr: i32) -> i32 {
+    if (addr >= N_IN * N_OUT) {
+        return W_ZERO;
+    }
+    return ((addr / N_IN) + (addr % N_IN)) % 3;
+}
+
+/// Input mux (original generate block, lines 93-99): the external
+/// buffer read when USE_EXT_X = 1, else the self-test vector x[i] = i + 1.
+pub fn input_value(i_idx: i32, x_ext_data: i32, use_ext_x: i32) -> i32 {
+    if (use_ext_x == 1) {
+        return x_ext_data;
+    } else {
+        return i_idx + 1;
+    }
+}
+
+/// Combinational external-buffer address (original line 89):
+/// `assign x_ext_addr = i_idx;` -- follows the index counter.
+pub fn x_ext_addr(i_idx: i32) -> i32 {
+    return i_idx;
+}
+
+/// The module's combinational data surface: `gen-verilog` lowers
+/// `on_comb` parameters to input ports and the return to the `result`
+/// output wire.  It carries the same decision as `x_ext_addr`.
+pub fn on_comb(i_idx: i32) -> i32 {
+    return x_ext_addr(i_idx);
+}
+
+/// Accumulate one term: acc += W * x with W in {-1, 0, +1} -- no
+/// multiplier (original `case (w_code_r)` bodies, lines 167-171).
+pub fn accumulate(acc: i32, w_code: i32, x: i32) -> i32 {
+    if (w_code == W_PLUS) {
+        return acc + x;
+    } else {
+        if (w_code == W_MINUS) {
+            return acc - x;
+        } else {
+            return acc;
+        }
+    }
+}
+
+/// Independent reference model the tests compare against:
+/// column_sum(j) = sum_i weight_sign(W[i][j]) * x[i] under the stand-in
+/// image and the self-test input.  Written loop-free (W702: yosys
+/// rejects functions containing while loops), as a closed form over the
+/// 81 (i, i+1, i+2) triples; `reference_matches_direct_accumulation`
+/// pins it against a direct accumulation over the image.
+pub fn column_sum(j: i32) -> i32 {
+    const triples = N_IN / 3;
+    if (j % 3 == 2) {
+        return 2 * triples;
+    } else {
+        return -1 * triples;
+    }
+}
+
+/// Register file (original lines 46-48, 52, 56-57, 62-66, 78-80,
+/// 110-113): state, column-major base address, the BRAM output
+/// register, the staged input, and the result pulse.
+pub struct Core {
+    state: i32,
+    i_idx: i32,
+    j_idx: i32,
+    base_addr: i32,
+    rd_addr: i32,
+    w_code_r: i32,
+    x_val_d1: i32,
+    acc: i32,
+    result_data: i32,
+    result_addr: i32,
+    result_valid: bool,
+    done: bool,
+    busy: bool,
+}
+
+/// Reset (original lines 117-135): clear the pipeline, keep the BRAM
+/// output register (the concurrent read below still lands this edge).
+pub fn core_reset() -> Core {
+    return Core{ .state = S_IDLE, .i_idx = 0, .j_idx = 0, .base_addr = 0, .rd_addr = 0, .w_code_r = 0, .x_val_d1 = 0, .acc = 0, .result_data = 0, .result_addr = 0, .result_valid = false, .done = false, .busy = false };
+}
+
+/// One clock of the 6-state pipeline (original lines 137-231), lowered
+/// to a Verilog task like the sibling port's step function.  `x_ext_data`
+/// is the external input buffer read; it is ignored while
+/// USE_EXT_X = 0.  Pulse `start` for one clock from S_IDLE.
+pub fn core_step(c: *Core, rst: bool, start: bool, x_ext_data: i32) -> void {
+    // Registered BRAM read (original lines 70-72): on every clock edge
+    // the word at the CURRENT rd_addr lands in w_code_r; the FSM below
+    // consumes the PREVIOUS edge's word.
+    const w_new = weight_mem_read(c.rd_addr);
+
+    if (rst) {
+        c.state = S_IDLE;
+        c.i_idx = 0;
+        c.j_idx = 0;
+        c.base_addr = 0;
+        c.rd_addr = 0;
+        c.acc = 0;
+        c.x_val_d1 = 0;
+        c.result_data = 0;
+        c.result_addr = 0;
+        c.result_valid = false;
+        c.done = false;
+        c.busy = false;
+        c.w_code_r = w_new;
+        return;
+    }
+
+    c.done = false;
+    c.result_valid = false;
+
+    if (c.state == S_IDLE) {
+        if (start) {
+            c.i_idx = 0;
+            c.j_idx = 0;
+            c.base_addr = 0;
+            c.acc = 0;
+            c.busy = true;
+            c.rd_addr = 0;  // weight[0][0]
+            c.state = S_PREFETCH;
+        }
+    } else {
+        if (c.state == S_PREFETCH) {
+            // Wait one clock for the BRAM: stage x for i = 0 (the word
+            // registered this edge belongs to i = 0) and point the next
+            // read at i = 1 (original lines 144-153).
+            c.x_val_d1 = input_value(c.i_idx, x_ext_data, USE_EXT_X);
+            c.i_idx = 1;
+            c.rd_addr = c.base_addr + 1;
+            c.state = S_COMPUTE;
+        } else {
+            if (c.state == S_COMPUTE) {
+                // Accumulate weight[i-1] * x[i-1] from the registered
+                // BRAM output; stage x for the current i and launch the
+                // read for the next one (original lines 163-185).
+                c.acc = accumulate(c.acc, c.w_code_r, c.x_val_d1);
+                c.x_val_d1 = input_value(c.i_idx, x_ext_data, USE_EXT_X);
+                if (c.i_idx == LAST_I) {
+                    c.state = S_LAST_ACC;  // final term still pending
+                } else {
+                    c.i_idx = c.i_idx + 1;
+                    c.rd_addr = c.base_addr + c.i_idx;
+                }
+            } else {
+                if (c.state == S_LAST_ACC) {
+                    // Last accumulation uses the final weight and the
+                    // staged x (original lines 187-198).
+                    c.acc = accumulate(c.acc, c.w_code_r, c.x_val_d1);
+                    c.state = S_OUTPUT;
+                } else {
+                    if (c.state == S_OUTPUT) {
+                        // Pulse the result and chain into the next
+                        // column (original lines 200-221).  rd_addr is
+                        // set from the OLD base so it equals the new
+                        // column's weight[0].
+                        c.result_data = c.acc;
+                        c.result_addr = c.j_idx;
+                        c.result_valid = true;
+                        if (c.j_idx == LAST_J) {
+                            c.state = S_DONE;
+                        } else {
+                            c.rd_addr = c.base_addr + N_IN;
+                            c.j_idx = c.j_idx + 1;
+                            c.i_idx = 0;
+                            c.base_addr = c.base_addr + N_IN;
+                            c.acc = 0;
+                            c.state = S_PREFETCH;
+                        }
+                    } else {
+                        // S_DONE (original lines 223-227): one-clock
+                        // pulse, back to IDLE.
+                        c.done = true;
+                        c.busy = false;
+                        c.state = S_IDLE;
+                    }
+                }
+            }
+        }
+    }
+
+    // Commit this edge's BRAM word.
+    c.w_code_r = w_new;
+}
+
+test weight_decode_matches_the_encoding {
+    // original case (w_code_r): 2'b01 = +1, 2'b10 = -1, 2'b00 = 0,
+    // default 0 (2'b11 unused).
+    assert(weight_sign(W_PLUS) == 1);
+    assert(weight_sign(W_MINUS) == -1);
+    assert(weight_sign(W_ZERO) == 0);
+    assert(weight_sign(3) == 0);
+}
+
+test weight_image_is_column_major {
+    // addr = j * N_IN + i; the stand-in code is (i + j) % 3.
+    assert(weight_mem_read(0) == 0);          // weight[0][0]
+    assert(weight_mem_read(1) == 1);          // weight[1][0]
+    assert(weight_mem_read(2) == 2);          // weight[2][0]
+    assert(weight_mem_read(N_IN) == 1);       // weight[0][1]: (0+1)%3
+    assert(weight_mem_read(N_IN + 1) == 2);   // weight[1][1]
+    assert(weight_mem_read(N_IN * 2) == 2);   // weight[0][2]: (0+2)%3
+    // beyond the 177,147 useful entries the image reads 0
+    assert(weight_mem_read(N_IN * N_OUT) == 0);
+    assert(weight_mem_read(MEM_DEPTH - 1) == 0);
+}
+
+test input_mux_selects_self_test_by_default {
+    // original generate block: USE_EXT_X = 0 wires x[i] = i + 1;
+    // USE_EXT_X = 1 wires the external buffer read.
+    assert(input_value(0, 999, 0) == 1);
+    assert(input_value(LAST_I, 999, 0) == 243);
+    assert(input_value(5, 999, 1) == 999);
+}
+
+test x_ext_addr_follows_the_index_counter {
+    // original line 89: assign x_ext_addr = i_idx (combinational).
+    assert(x_ext_addr(0) == 0);
+    assert(x_ext_addr(LAST_I) == 242);
+    assert(on_comb(17) == 17);
+}
+
+test accumulate_needs_no_multiplier {
+    // original case bodies: 01 -> add, 10 -> subtract, 00/11 -> nop.
+    assert(accumulate(10, W_PLUS, 3) == 13);
+    assert(accumulate(10, W_MINUS, 3) == 7);
+    assert(accumulate(10, W_ZERO, 3) == 10);
+    assert(accumulate(10, 3, 3) == 10);
+}
+
+test core_reset_zeroes_every_register {
+    var c = core_reset();
+    assert(c.state == S_IDLE);
+    assert(c.i_idx == 0);
+    assert(c.j_idx == 0);
+    assert(c.base_addr == 0);
+    assert(c.rd_addr == 0);
+    assert(c.w_code_r == 0);
+    assert(c.x_val_d1 == 0);
+    assert(c.acc == 0);
+    assert(c.result_data == 0);
+    assert(c.result_addr == 0);
+    assert(c.result_valid == false);
+    assert(c.done == false);
+    assert(c.busy == false);
+}
+
+test reference_matches_direct_accumulation {
+    // Pin the closed form against a direct accumulation over the
+    // stand-in image, for every column.
+    var j: i32 = 0;
+    while (j < N_OUT) {
+        var s: i32 = 0;
+        var i: i32 = 0;
+        while (i < N_IN) {
+            s = accumulate(s, weight_mem_read(j * N_IN + i), i + 1);
+            i += 1;
+        }
+        assert(s == column_sum(j));
+        j += 1;
+    }
+}
+
+test reference_model_matches_the_hand_computed_sums {
+    // 81 triples of (i, i+1, i+2); each contributes -1 except when the
+    // +1 code lands on i = 3k+2 (j % 3 == 2), which contributes +2.
+    assert(column_sum(0) == -81);
+    assert(column_sum(1) == -81);
+    assert(column_sum(2) == 162);
+    assert(column_sum(LAST_J) == 162);
+}
+
+test fsm_computes_the_first_column {
+    var c = core_reset();
+    core_step(&c, false, true, 0);           // IDLE -> PREFETCH
+    assert(c.state == S_PREFETCH);
+    assert(c.busy);
+    var steps: i32 = 1;
+    while (c.result_valid == false and steps < 400) {
+        core_step(&c, false, false, 0);
+        steps += 1;
+    }
+    assert(c.result_valid);
+    // per column: PREFETCH + 242 COMPUTE + LAST_ACC + OUTPUT = N_IN + 2
+    // clocks, plus the shared start clock.
+    assert(steps == N_IN + 3);
+    assert(c.result_addr == 0);
+    assert(c.result_data == column_sum(0));
+    assert(c.result_data == -81);
+    // the result is a one-clock pulse; the next column is prefetching
+    core_step(&c, false, false, 0);
+    assert(c.result_valid == false);
+    assert(c.state == S_PREFETCH);
+    assert(c.j_idx == 1);
+}
+
+test fsm_chains_into_columns_two_and_three {
+    var c = core_reset();
+    core_step(&c, false, true, 0);
+    var steps: i32 = 1;
+    var seen: i32 = 0;
+    while (seen < 2 and steps < 1000) {
+        core_step(&c, false, false, 0);
+        steps += 1;
+        if (c.result_valid) {
+            seen += 1;
+            if (seen == 1) {
+                assert(c.result_addr == 1);
+                assert(c.result_data == column_sum(1));
+                assert(c.result_data == -81);
+            } else {
+                assert(c.result_addr == 2);
+                assert(c.result_data == column_sum(2));
+                assert(c.result_data == 162);
+            }
+        }
+    }
+    assert(seen == 2);
+}
+
+test fsm_full_run_matches_the_reference {
+    var c = core_reset();
+    var results: [729]i32 = undefined;
+    var got: i32 = 0;
+    var saw_done: bool = false;
+    var steps: i32 = 0;
+    core_step(&c, false, true, 0);
+    steps += 1;
+    assert(c.busy);
+    while (saw_done == false and steps < 400000) {
+        core_step(&c, false, false, 0);
+        steps += 1;
+        if (c.result_valid) {
+            results[(c.result_addr) as usize] = c.result_data;
+            got += 1;
+        }
+        if (c.done) {
+            saw_done = true;
+        }
+    }
+    assert(saw_done);
+    assert(got == N_OUT);
+    assert(c.busy == false);
+    assert(c.state == S_IDLE);
+    // latency: 1 start + 729 x (N_IN + 2) + 1 DONE = 178,607 clocks
+    assert(steps == N_OUT * (N_IN + 2) + 2);
+    assert(c.result_addr == LAST_J);
+    assert(c.result_data == column_sum(LAST_J));
+    // spot-check the oracle across the output vector
+    assert(results[0] == -81);
+    assert(results[1] == -81);
+    assert(results[2] == 162);
+    assert(results[3] == -81);
+    assert(results[4] == -81);
+    assert(results[5] == 162);
+    assert(results[728] == 162);
+}
+
+test reset_dominates_any_state {
+    var c = core_reset();
+    core_step(&c, false, true, 0);
+    core_step(&c, false, false, 0);
+    core_step(&c, false, false, 0);
+    assert(c.busy);
+    assert(c.rd_addr == 2);
+    core_step(&c, true, false, 0);
+    assert(c.state == S_IDLE);
+    assert(c.busy == false);
+    assert(c.done == false);
+    assert(c.acc == 0);
+    assert(c.i_idx == 0);
+    assert(c.j_idx == 0);
+    assert(c.rd_addr == 0);
+    // the BRAM output register is not reset: the concurrent read at the
+    // pre-reset rd_addr = 2 still lands this edge, weight[2][0] = 2.
+    assert(c.w_code_r == 2);
+    // ... and the module restarts cleanly afterwards
+    core_step(&c, false, true, 0);
+    assert(c.state == S_PREFETCH);
+}
+
+test parameters_fit_their_widths {
+    // width-safe constants: LAST_I fits I_WIDTH = 8 bits, LAST_J fits
+    // J_WIDTH = 10 bits, the image fits the power-of-2 BRAM, and the
+    // worst self-test |acc| (all +1, x max = N_IN) fits signed
+    // ACC_WIDTH = 20 bits.
+    assert(LAST_I == 242 and LAST_I < 256);
+    assert(LAST_J == 728 and LAST_J < 1024);
+    assert(N_IN * N_OUT == 177147);
+    assert(N_IN * N_OUT <= MEM_DEPTH and MEM_DEPTH == 262144);
+    assert(N_IN * N_IN < 524288);
+}
+}
