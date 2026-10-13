@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/trinity_os/ternary_scheduler.t27
+// Ternary Scheduler Specification for Trinity T27 FPGA HIR
+// Trit-Based Round-Robin Scheduler with Phi-weighted time slicing
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ternary_scheduler {
+
+    // === Module Parameters ===
+
+    pub const MAX_TASKS : u32 = 16;
+    pub const BASE_CYCLES : u32 = 1000;  // Base time slice in cycles (20μs @ 50MHz)
+    pub const LOG2_MAX_TASKS : u32 = 4;
+
+    // === Priority Encoding ===
+    
+    pub const Priority = enum(u8) {
+        blocked = 0,   // 00 = BLOCKED  (-1) - Task will not be scheduled
+        normal = 1,    // 01 = NORMAL   ( 0) - Standard priority, base time slice
+        realtime = 2,  // 10 = REALTIME (+1) - High priority, φ-weighted time slice
+        reserved = 3,  // 11 = RESERVED
+    }
+
+    // === Phi Scaling for Realtime Tasks ===
+    // φ = 1.6180339887... ≈ 1 + 99/256 = 1.38671875 (close enough)
+    // More accurate: 1.6171875 = 1 + 158/256
+    pub const PHI_SCALE : u32 = 414;  // 1.6171875 * 256
+
+    // === Lucas Sequence for Preemption Points ===
+    pub const LUCAS_0 : u32 = 2;
+    pub const LUCAS_1 : u32 = 1;
+    pub const LUCAS_2 : u32 = 3;
+    pub const LUCAS_3 : u32 = 4;
+    pub const LUCAS_4 : u32 = 7;
+    pub const LUCAS_5 : u32 = 11;
+    pub const LUCAS_6 : u32 = 18;
+    pub const LUCAS_7 : u32 = 29;
+    pub const LUCAS_8 : u32 = 47;
+    pub const LUCAS_9 : u32 = 76;
+
+    // === Scheduler State Machine ===
+    
+    pub const SchedulerState = enum(u8) {
+        idle = 0,
+        schedule = 1,
+        running = 2,
+        preempting = 3,
+        yielding = 4,
+    }
+
+    // === Task Control Block ===
+    
+    pub struct TaskControlBlock {
+        valid : bool,
+        priority : Priority,
+        time_slice : u32,
+    }
+
+    // === Task Management ===
+    
+    pub struct TaskManager {
+        tasks : [MAX_TASKS]TaskControlBlock,
+        current_task : u32,
+        next_task_ptr : u32,
+        cycle_count : u32,
+        sacred_count : u32,
+        current_slice_remaining : u32,
+        state : SchedulerState,
+        task_switch : bool,
+        preemption_irq : bool,
+        scheduler_idle : bool,
+    }
+
+    // === Constructor Functions ===
+    
+    fn empty_task() -> TaskControlBlock {
+        return TaskControlBlock{
+            .valid = false,
+            .priority = Priority.blocked,
+            .time_slice = 0,
+        };
+    }
+
+    fn task_manager() -> TaskManager {
+        var tasks : [MAX_TASKS]TaskControlBlock = [empty_task()] ** MAX_TASKS;
+        return TaskManager{
+            .tasks = tasks,
+            .current_task = 0,
+            .next_task_ptr = 0,
+            .cycle_count = 0,
+            .sacred_count = 0,
+            .current_slice_remaining = 0,
+            .state = SchedulerState.idle,
+            .task_switch = false,
+            .preemption_irq = false,
+            .scheduler_idle = true,
+        };
+    }
+
+    // === Time Slice Calculation ===
+    
+    pub fn calculate_time_slice(priority: Priority) -> u32 {
+        if (priority == Priority.normal) {
+            return BASE_CYCLES;
+        } else if (priority == Priority.realtime) {
+            return (BASE_CYCLES * PHI_SCALE) >> 8;
+        } else {
+            return 0;
+        }
+    }
+
+    // === Sacred Preemption Check ===
+    
+    pub fn is_sacred_preemption_point(count: u32) -> bool {
+        return count == LUCAS_0 ||
+               count == LUCAS_2 ||
+               count == LUCAS_3 ||
+               count == LUCAS_4 ||
+               count == LUCAS_5 ||
+               count == LUCAS_6 ||
+               count == LUCAS_7 ||
+               count == LUCAS_8 ||
+               count == LUCAS_9;
+    }
+
+    // === Active Task Count ===
+    
+    fn count_active_tasks(manager: TaskManager) -> u32 {
+        var count : u32 = 0;
+        var i : u32 = 0;
+        while (i < MAX_TASKS) {
+            if (manager.tasks[i].valid and manager.tasks[i].priority != Priority.blocked) {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    // === Find Next Runnable Task (Round-Robin) ===
+    
+    fn find_next_runnable_task(manager: TaskManager, out_task_id: *u32, out_found: *bool) {
+        var i : u32 = 0;
+        while (i < MAX_TASKS) {
+            var idx : u32 = (manager.next_task_ptr + i) % MAX_TASKS;
+            if (manager.tasks[idx].valid and manager.tasks[idx].priority != Priority.blocked) {
+                out_task_id.* = idx;
+                out_found.* = true;
+                return;
+            }
+            i = i + 1;
+        }
+        out_task_id.* = manager.next_task_ptr;
+        out_found.* = false;
+    }
+
+    // === State Machine Logic ===
+    
+    fn update_state(manager: TaskManager, task_spawn: bool, task_kill: bool, task_yield: bool, task_id: u32, task_priority: Priority) -> TaskManager {
+        var updated_manager = manager;
+        
+        // Default signals
+        updated_manager.task_switch = false;
+        updated_manager.preemption_irq = false;
+        updated_manager.scheduler_idle = (manager.state == SchedulerState.idle) or (count_active_tasks(manager) == 0);
+
+        // Handle task spawn/kill
+        if (task_spawn) {
+            updated_manager.tasks[task_id] = TaskControlBlock{
+                .valid = true,
+                .priority = task_priority,
+                .time_slice = calculate_time_slice(task_priority),
+            };
+        }
+
+        if (task_kill and manager.tasks[task_id].valid) {
+            updated_manager.tasks[task_id].valid = false;
+            if (manager.current_task == task_id and manager.state == SchedulerState.running) {
+                updated_manager.state = SchedulerState.preempting;
+            }
+        }
+
+        // Simple state transitions
+        if (manager.state == SchedulerState.idle) {
+            if (count_active_tasks(manager) > 0) {
+                updated_manager.state = SchedulerState.schedule;
+            }
+        } else if (manager.state == SchedulerState.schedule) {
+            // For now, just transition to running
+            updated_manager.state = SchedulerState.running;
+        } else if (manager.state == SchedulerState.running) {
+            updated_manager.cycle_count = manager.cycle_count + 1;
+            updated_manager.sacred_count = manager.sacred_count + 1;
+
+            // Check for preemption conditions
+            if (task_yield or 
+                updated_manager.current_slice_remaining == 0 or
+                is_sacred_preemption_point(manager.sacred_count + 1)) {
+                
+                updated_manager.preemption_irq = true;
+                updated_manager.state = SchedulerState.preempting;
+            }
+
+            // Decrement time slice
+            if (updated_manager.current_slice_remaining != 0) {
+                updated_manager.current_slice_remaining = updated_manager.current_slice_remaining - 1;
+            }
+        } else if (manager.state == SchedulerState.preempting) {
+            updated_manager.state = SchedulerState.schedule;
+        } else {
+            updated_manager.state = SchedulerState.idle;
+        }
+
+        return updated_manager;
+    }
+
+    // === Query Functions ===
+    
+    pub fn get_current_task(manager: TaskManager) -> u32 {
+        return manager.current_task;
+    }
+
+    pub fn get_cycle_counter(manager: TaskManager) -> u32 {
+        return manager.cycle_count;
+    }
+
+    pub fn get_sacred_counter(manager: TaskManager) -> u32 {
+        return manager.sacred_count;
+    }
+
+    pub fn get_scheduler_state(manager: TaskManager) -> u32 {
+        return manager.state as u32;
+    }
+
+    pub fn get_active_count(manager: TaskManager) -> u32 {
+        return count_active_tasks(manager);
+    }
+
+    pub fn get_task_switch(manager: TaskManager) -> bool {
+        return manager.task_switch;
+    }
+
+    pub fn get_preemption_irq(manager: TaskManager) -> bool {
+        return manager.preemption_irq;
+    }
+
+    pub fn get_scheduler_idle(manager: TaskManager) -> bool {
+        return manager.scheduler_idle;
+    }
+
+    // === Tests ===
+    
+    test calculate_time_slice_normal
+        then calculate_time_slice(Priority.normal) == BASE_CYCLES
+
+    test calculate_time_slice_realtime
+        then calculate_time_slice(Priority.realtime) == (BASE_CYCLES * PHI_SCALE) >> 8
+
+    test calculate_time_slice_blocked
+        then calculate_time_slice(Priority.blocked) == 0
+
+    test calculate_time_slice_reserved
+        then calculate_time_slice(Priority.reserved) == 0
+
+    test is_sacred_preemption_point_known_values
+        then is_sacred_preemption_point(LUCAS_0) == true
+        and is_sacred_preemption_point(LUCAS_2) == true
+        and is_sacred_preemption_point(LUCAS_3) == true
+        and is_sacred_preemption_point(LUCAS_4) == true
+        and is_sacred_preemption_point(LUCAS_5) == true
+        and is_sacred_preemption_point(LUCAS_6) == true
+        and is_sacred_preemption_point(LUCAS_7) == true
+        and is_sacred_preemption_point(LUCAS_8) == true
+        and is_sacred_preemption_point(LUCAS_9) == true
+        and is_sacred_preemption_point(5) == false
+        and is_sacred_preemption_point(10) == false
+
+    test count_active_tasks_empty
+        given manager = task_manager()
+        then count_active_tasks(manager) == 0
+
+    test count_active_tasks_one_normal
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        then count_active_tasks(updated_manager) == 1
+
+    test count_active_tasks_one_blocked
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.blocked, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        then count_active_tasks(updated_manager) == 0
+
+    test count_active_tasks_mixed
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        tasks[1] = TaskControlBlock{.valid = true, .priority = Priority.blocked, .time_slice = 100};
+        tasks[2] = TaskControlBlock{.valid = true, .priority = Priority.realtime, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        then count_active_tasks(updated_manager) == 2
+
+    test find_next_runnable_task_empty
+        given manager = task_manager()
+        var task_id : u32 = 0;
+        var found : bool = false;
+        find_next_runnable_task(manager, &task_id, &found);
+        then found == false
+
+    test find_next_runnable_task_one_task
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[3] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.next_task_ptr = 0;
+        var task_id : u32 = 0;
+        var found : bool = false;
+        find_next_runnable_task(updated_manager, &task_id, &found);
+        then found == true and task_id == 3
+
+    test find_next_runnable_task_wrap_around
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[15] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.next_task_ptr = 14;
+        var task_id : u32 = 0;
+        var found : bool = false;
+        find_next_runnable_task(updated_manager, &task_id, &found);
+        then found == true and task_id == 15
+
+    test state_transition_idle_to_schedule
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        then update_state(updated_manager, false, false, false, 0, Priority.normal).state == SchedulerState.schedule
+
+    test state_transition_schedule_to_running
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.state = SchedulerState.schedule;
+        updated_manager.next_task_ptr = 0;
+        var result = update_state(updated_manager, false, false, false, 0, Priority.normal);
+        then result.state == SchedulerState.running
+        and result.task_switch == true
+        and result.current_task == 0
+        and result.current_slice_remaining == 100
+
+    test state_transition_running_preemption
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.state = SchedulerState.running;
+        updated_manager.current_task = 0;
+        updated_manager.current_slice_remaining = 100;
+        updated_manager.sacred_count = LUCAS_9 - 1;
+        var result = update_state(updated_manager, false, false, false, 0, Priority.normal);
+        then result.state == SchedulerState.preempting
+        and result.preemption_irq == true
+
+    test task_spawn
+        given manager = task_manager()
+        var result = update_state(manager, true, false, false, 5, Priority.realtime);
+        then result.tasks[5].valid == true
+        and result.tasks[5].priority == Priority.realtime
+        and result.tasks[5].time_slice == calculate_time_slice(Priority.realtime)
+
+    test task_kill
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[3] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.current_task = 3;
+        updated_manager.state = SchedulerState.running;
+        var result = update_state(updated_manager, false, true, false, 3, Priority.normal);
+        then result.tasks[3].valid == false
+        and result.state == SchedulerState.preempting
+
+    test task_yield
+        given manager = task_manager()
+        var tasks = manager.tasks;
+        tasks[0] = TaskControlBlock{.valid = true, .priority = Priority.normal, .time_slice = 100};
+        var updated_manager = manager;
+        updated_manager.tasks = tasks;
+        updated_manager.state = SchedulerState.running;
+        var result = update_state(updated_manager, false, false, true, 0, Priority.normal);
+        then result.state == SchedulerState.preempting
+        and result.preemption_irq == true
+
+    // === Invariants ===
+    
+    invariant phi_scaling_positive
+        then PHI_SCALE > 0
+
+    invariant base_cycles_positive
+        then BASE_CYCLES > 0
+
+    invariant max_tasks_positive
+        then MAX_TASKS > 0
+
+    invariant time_slice_normal_equals_base
+        then calculate_time_slice(Priority.normal) == BASE_CYCLES
+
+    invariant time_slice_realtime_greater_than_base
+        then calculate_time_slice(Priority.realtime) >= BASE_CYCLES
+
+    invariant lucas_sequence_increasing
+        then LUCAS_0 < LUCAS_2 and LUCAS_2 < LUCAS_3 and LUCAS_3 < LUCAS_4 and 
+               LUCAS_4 < LUCAS_5 and LUCAS_5 < LUCAS_6 and LUCAS_6 < LUCAS_7 and
+               LUCAS_7 < LUCAS_8 and LUCAS_8 < LUCAS_9
+
+    invariant active_count_non_negative
+        given manager = task_manager()
+        then count_active_tasks(manager) >= 0 and count_active_tasks(manager) <= MAX_TASKS
+
+    invariant scheduler_state_valid
+        given manager = task_manager()
+        then manager.state as u32 <= SchedulerState.yielding as u32
+
+    bench time_slice_calculation_latency
+        measure: nanoseconds to calculate_time_slice(Priority.realtime)
+        target: < 10ns
+
+    bench preemption_check_latency
+        measure: nanoseconds to is_sacred_preemption_point(LUCAS_5)
+        target: < 5ns
+
+    bench active_task_count_latency
+        measure: nanoseconds to count_active_tasks(task_manager())
+        target: < 50ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY
