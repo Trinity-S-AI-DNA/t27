@@ -20020,8 +20020,10 @@ long double: fabsl, default: llabs)(x)",
 
     /// A repeated element this emitter writes as a C value: a non-string
     /// literal, a name, a field or enum member, or a unary or cast over one.
-    /// Anything else keeps the old `{0}` rather than risk C that does not
-    /// compile.
+    /// A struct literal counts when every field initializer counts (#7960):
+    /// the emitter writes the compound literal `(P){ .x = 7 }`, which the GNU
+    /// range designator takes as-is. Anything else keeps the old `{0}` rather
+    /// than risk C that does not compile.
     fn c_repeat_value_lowers(v: &Node) -> bool {
         match v.kind {
             NodeKind::ExprLiteral => v.extra_kind != "string",
@@ -20029,15 +20031,33 @@ long double: fabsl, default: llabs)(x)",
             NodeKind::ExprUnary | NodeKind::ExprCast => {
                 v.children.first().map(Self::c_repeat_value_lowers).unwrap_or(false)
             }
+            // #7960: a field node wraps its initializer as the one child; a
+            // field with no initializer is malformed and does not count.
+            NodeKind::ExprStructLit => v
+                .children
+                .iter()
+                .all(|f| f.children.first().map(Self::c_repeat_value_lowers).unwrap_or(false)),
             _ => false,
         }
     }
 
     /// Is a repeated element one that `{0}` initialises exactly: a numeric
-    /// zero in any radix, `false`, or `undefined` (any value will do)?
+    /// zero in any radix, `false`, or `undefined` (any value will do)?  For a
+    /// struct value, `{0}` is exact only when every field initializer is
+    /// itself exactly `{0}`-initialised (#7960): `{0}` sets every field of
+    /// every element to zero, and only the all-zero literal means the same.
     fn c_repeat_value_is_zero(v: &Node) -> bool {
         if v.kind == NodeKind::ExprIdentifier {
             return v.name == "undefined";
+        }
+        // #7960: a struct literal is zero when every field initializer is.
+        // Checked before the literal test below, which would refuse any
+        // non-literal node out of hand.
+        if v.kind == NodeKind::ExprStructLit {
+            return v
+                .children
+                .iter()
+                .all(|f| f.children.first().map(Self::c_repeat_value_is_zero).unwrap_or(false));
         }
         if v.kind != NodeKind::ExprLiteral || v.extra_kind == "string" {
             return false;
@@ -23436,11 +23456,57 @@ impl Compiler {
         node.children.iter().find_map(|c| Self::c_int_switch_without_else(c, owner))
     }
 
+    /// #7960: gen-c writes `{0}` for a repeat whose element neither lowers
+    /// to a C value nor is zero. For a struct value that loses the fields:
+    /// `{0}` is exact only when every field is zero or `false`, and the GNU
+    /// range initializer needs every field initializer to lower to C. The
+    /// self-hosted core refuses any other struct repeat with `E_ARRAY` (9);
+    /// this scan refuses the same repeats here, before codegen, the way
+    /// #7308 refuses integer switches. All-zero struct repeats keep `{0}`;
+    /// lowerable ones take the GNU range in the `**` emitter arm.
+    fn c_struct_repeat_not_lowerable(node: &Node) -> Option<String> {
+        if node.kind == NodeKind::ExprBinary
+            && node.extra_op == "**"
+            && node.children.len() == 2
+        {
+            let lhs = &node.children[0];
+            let single = if lhs.kind == NodeKind::ExprArrayLiteral
+                && lhs.children.len() == 1
+            {
+                Some(&lhs.children[0])
+            } else {
+                None
+            };
+            if let Some(v) = single {
+                if v.kind == NodeKind::ExprStructLit
+                    && !Self::c_repeat_value_lowers(v)
+                    && !Self::c_repeat_value_is_zero(v)
+                {
+                    return Some(format!(
+                        "repeat of struct value `{}{{ ... }}` cannot lower to C: at least one \
+                         field initializer is neither zero nor a C value, and a `{{0}}` \
+                         fallback would lose it; spell the elements out, or repeat a value \
+                         whose fields are all literals or named constants (E_ARRAY) (#7960)",
+                        v.name
+                    ));
+                }
+            }
+        }
+        node.children
+            .iter()
+            .find_map(Self::c_struct_repeat_not_lowerable)
+    }
+
     pub fn compile_c(source: &str) -> Result<String, String> {
         let lexer = Lexer::new(source);
         let mut parser = Parser::new(lexer);
         let ast = parser.parse()?;
         if let Some(e) = Self::c_int_switch_without_else(&ast, "") {
+            return Err(e);
+        }
+        // #7960: refuse struct repeats gen-c cannot lower exactly, before
+        // codegen silently writes `{0}` over a value-bearing initializer.
+        if let Some(e) = Self::c_struct_repeat_not_lowerable(&ast) {
             return Err(e);
         }
         // Emit FAITHFUL C from the AST; the C compiler optimizes downstream. See
@@ -46617,5 +46683,87 @@ test t { assert(true); }
         // The default -- what gen-verilog runs -- is unchanged by #5984.
         assert!(!OptConfig::default().keep_call_discards);
         assert!(discard_rhs_kinds(&fn_f_stmts(src, &OptConfig::default())).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests_7960_struct_repeat_gen_c {
+    //! #7960 -- struct value repeats must not silently lower to zero.
+    //!
+    //! An array-of-structs repeat is exact only when the element literal is
+    //! all-zero, in which case gen-c keeps writing `{0}`; a value-bearing
+    //! element is emitted as a GNU range initializer instead, and an element
+    //! whose field values cannot lower to C is refused with E_ARRAY, matching
+    //! the self-hosted core's rule for inexact struct repeats.
+
+    use super::*;
+
+    const ISSUE_SAMPLE: &str = "module m;\nstruct P { x: i64, }\nvar a: [2]P = [_]P{P{ .x = 7 }} ** 2;\n";
+
+    #[test]
+    fn value_bearing_struct_repeat_emits_a_gnu_range_initializer() {
+        // The issue's sample must not lose `.x = 7` down to a zero fill.
+        let c = Compiler::compile_c(ISSUE_SAMPLE).expect("issue sample compiles");
+        assert!(
+            c.contains("[0 ... (2) - 1] = (P){ .x = 7 }"),
+            "expected a GNU range initializer, got:\n{}",
+            c
+        );
+        assert!(!c.contains("{0}"), "repeat must not lower to zero:\n{}", c);
+    }
+
+    #[test]
+    fn bool_field_struct_repeat_emits_a_gnu_range_initializer() {
+        // `true` is a value, so the repeat is inexact: GNU range, not zero.
+        let src = "module m;\nstruct P { x: i64, on: bool, }\nvar a: [2]P = [_]P{P{ .x = 0, .on = true }} ** 2;\n";
+        let c = Compiler::compile_c(src).expect("bool-field repeat compiles");
+        assert!(
+            c.contains("[0 ... (2) - 1] = (P){ .x = 0, .on = true }"),
+            "expected a GNU range initializer, got:\n{}",
+            c
+        );
+        assert!(!c.contains("{0}"), "bool-field repeat must not lower to zero:\n{}", c);
+    }
+
+    #[test]
+    fn all_zero_struct_repeat_still_lowers_to_zero() {
+        // The scalar rule from #6050 extends to structs: only an all-zero
+        // element literal is an exact repeat, and it keeps the zero fill.
+        let src = "module m;\nstruct P { x: i64, }\nvar a: [2]P = [_]P{P{ .x = 0 }} ** 2;\n";
+        let c = Compiler::compile_c(src).expect("all-zero repeat compiles");
+        assert!(c.contains("/* repeat:"), "repeat comment preserved:\n{}", c);
+        assert!(!c.contains("[0 ..."), "all-zero repeat must keep the zero fill:\n{}", c);
+        assert!(c.contains("{0}"), "all-zero repeat lowers to zero:\n{}", c);
+    }
+
+    #[test]
+    fn nested_all_zero_struct_repeat_still_lowers_to_zero() {
+        // The struct_values.t27 shape: nested struct fields, all zero.
+        let src = "module m;\nstruct Q { x: i64, y: i64, }\nstruct P { lo: Q, hi: Q, tag: i64, }\nvar a: [2]P = [_]P{P{ .lo = Q{ .x = 0, .y = 0 }, .hi = Q{ .x = 0, .y = 0 }, .tag = 0 }} ** 2;\n";
+        let c = Compiler::compile_c(src).expect("nested all-zero repeat compiles");
+        assert!(c.contains("{0}"), "nested all-zero repeat lowers to zero:\n{}", c);
+        assert!(
+            !c.contains("[0 ..."),
+            "nested all-zero repeat must keep the zero fill:\n{}",
+            c
+        );
+    }
+
+    #[test]
+    fn struct_repeat_with_a_field_that_cannot_lower_to_c_is_refused() {
+        // A call result cannot be repeated exactly and is not zero: refuse
+        // with E_ARRAY rather than emitting a wrong `{0}`.
+        let src = "module m;\nfn g() -> i64 { return 7; }\nstruct P { x: i64, }\nvar a: [2]P = [_]P{P{ .x = g() }} ** 2;\n";
+        let err = Compiler::compile_c(src).expect_err("inexact struct repeat is refused");
+        assert!(err.contains("E_ARRAY"), "error names E_ARRAY: {}", err);
+        assert!(err.contains("#7960"), "error cites the issue: {}", err);
+    }
+
+    #[test]
+    fn struct_repeat_with_a_string_field_is_refused() {
+        // A string value can neither be repeated exactly nor counted as zero.
+        let src = "module m;\nstruct P { s: str, }\nvar a: [2]P = [_]P{P{ .s = \"a\" }} ** 2;\n";
+        let err = Compiler::compile_c(src).expect_err("string-field struct repeat is refused");
+        assert!(err.contains("E_ARRAY"), "error names E_ARRAY: {}", err);
     }
 }
