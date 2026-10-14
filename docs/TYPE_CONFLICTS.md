@@ -139,7 +139,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 48 names
+## DISTINCT -- 47 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -156,7 +156,6 @@ whether to rename.
 | `Diagnostic` | 2 | 2 files | Leave both, but rename the protocol one LspDiagnostic (or require the qualified `lsp-schema::... |
 | `Entry` | 2 | 2 files | Leave both: a consensus-chain step (mvp_v3) and a hash-table cell (port). If a reader ever collides, rename the port's to HashEntry -- port-side renames are established (#7491). |
 | `EnvVar` | 2 | 2 files | Two fixes, unrelated: (a) leave the types alone, they are genuinely different; (b) fix the fi... |
-| `Episode` | 2 | 2 files | Nothing to converge. If the name ever collides in one reader, rename lotus.t27's loop entry to `LotusStep`. |
 | `Info` | 3 | 3 files | Two things: have account/repo.t27 `use account::schema` instead of re-declaring Info and the ... |
 | `Inputs` | 4 | 4 files | Nothing to converge: the Verilog port-list convention -- every module's wire bundle is named Inputs the way every clock is clk. Follow blink_working.t27's BlinkInputs prefix if the noise ever matters. |
 | `Instance` | 3 | 3 files | Leave the three types; the ambiguity is in the name. If cross-spec resolution matters, qualif... |
