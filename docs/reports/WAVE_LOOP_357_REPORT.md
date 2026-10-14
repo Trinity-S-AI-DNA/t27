@@ -118,7 +118,6 @@ Linear scaling holds: ~0.085s per variable. No timeout trend detected. Omega bou
 | Competitor | Status | Formal Verification | Generic ∀ Ternary |
 |------------|--------|---------------------|-------------------|
 | **Sparkle HDL** | Dormant since March 2026 | Lean 4, 60+ BitNet theorems | **ZERO** — all instance-specific |
-| **TRINITY CLARA** | Last commit May 30 | Coq, 162 theorems (32 `Admitted`) | **ZERO** — K3 logic, no MAC accumulation |
 | **CktFormalizer** | arXiv:2605.07782 | Lean 4, binary `BitVec` only | **ZERO** — no ternary support |
 | **ternfpga** | Jun 8–10 | cocotb/NumPy golden models | **NO** |
 | **Balanced_Ternary** | Jun 17 | None yet | **NO** |
@@ -127,7 +126,7 @@ Linear scaling holds: ~0.085s per variable. No timeout trend detected. Omega bou
 
 **No competitor has published generic ∀ ternary theorems.** The generic ternary theorem space remains unoccupied. Trinity's 172 generic ∀ = **172× competitor maximum**.
 
-**Critical vulnerability persists:** Trinity has no measured silicon evidence. ternfpga (Jun 8) and Balanced_Ternary (Jun 15–17) are building physical hardware. BoolSi raised **$6M seed** for AI-to-FPGA acceleration (not ternary-specific). No DARPA awards or NSF grants announced for ternary accelerators in June 2026.
+**Critical vulnerability persists:** Trinity has no measured silicon evidence. ternfpga (Jun 8) and Balanced_Ternary (Jun 15–17) are building physical hardware. BoolSi raised **$6M seed** for AI-to-FPGA acceleration (not ternary-specific). No federal awards or NSF grants announced for ternary accelerators in June 2026.
 
 **maniTLab patent stack** (Indian Patent Office, Apr 2026): Six patents covering photonic-ternary computing from SWCNT@MWCNT devices up to a `ManiT` compiler. Not granted yet but broadest 2026 patent filing in the space.
 

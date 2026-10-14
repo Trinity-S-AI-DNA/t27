@@ -252,7 +252,7 @@ pub fn analyzed(nodes: &[u8], text: &[u8], marks: &mut [u8]) -> () {
     let mut r: usize = 0;
     while (r < count(nodes)) {
         let k: u8 = kind(nodes, r);
-        if (((k != K_FN_DECL) && (k != K_BENCH_BLOCK)) && (k != K_STMT_EXPR)) {
+        if ((((k != K_FN_DECL) && (k != K_BENCH_BLOCK)) && (k != K_STMT_EXPR)) && !(is_hw_const(nodes, text, r, 0))) {
             reach_named(nodes, text, r, end(nodes, r), marks);
         }
         r = end(nodes, r);
@@ -289,7 +289,8 @@ pub fn wipe(marks: &mut [u8], n: usize) -> () {
     }
 }
 
-pub fn bits(marks: Vec<u8>, n: usize) -> u32 {
+pub fn bits(marks: impl AsRef<[u8]>, n: usize) -> u32 {
+    let marks: &[u8] = marks.as_ref();
     let mut m: u32 = 0;
     let mut bit: u32 = 1;
     let mut i: usize = 0;
@@ -411,6 +412,10 @@ pub fn has_at(s: &[u8], lo: usize, hi: usize, w: &[u8]) -> bool {
 
 pub fn hi(nodes: &[u8], i: usize, f: usize) -> usize {
     return u32_at(nodes, (((i * REC) + 12) + (f * 8)));
+}
+
+pub fn ident_is(nodes: &[u8], text: &[u8], i: usize, name: &[u8]) -> bool {
+    return ((kind(nodes, i) == K_EXPR_IDENTIFIER) && field_is(nodes, text, i, F_NAME, name));
 }
 
 pub fn kind(nodes: &[u8], i: usize) -> u8 {
@@ -598,5 +603,43 @@ pub fn ws_at(s: &[u8], i: usize, hi: usize) -> usize {
         return 3;
     }
     return 0;
+}
+
+pub const HW_DEPTH: usize = 32;
+
+pub fn is_hw_const(nodes: &[u8], text: &[u8], c: usize, depth: usize) -> bool {
+    if ((kind(nodes, c) != K_CONST_DECL) || (depth > HW_DEPTH)) {
+        return false;
+    }
+    if is_input(nodes, text, c) {
+        return true;
+    }
+    let mut j: usize = (c + 1);
+    while (j < end(nodes, c)) {
+        let k: u8 = kind(nodes, j);
+        if ((k == K_EXPR_CALL) || (k == K_EXPR_IDENTIFIER)) {
+            let mut t: usize = 0;
+            while (t < count(nodes)) {
+                if ((t != c) && field_is(nodes, text, t, F_NAME, &text[(lo(nodes, j, F_NAME)) as usize..(hi(nodes, j, F_NAME)) as usize])) {
+                    if (((k == K_EXPR_CALL) && (kind(nodes, t) == K_FN_DECL)) && (end(nodes, t) == (t + 1))) {
+                        return true;
+                    }
+                    if ((k == K_EXPR_IDENTIFIER) && is_hw_const(nodes, text, t, (depth + 1))) {
+                        return true;
+                    }
+                }
+                t = end(nodes, t);
+            }
+        }
+        j = (j + 1);
+    }
+    return false;
+}
+
+pub fn is_input(nodes: &[u8], text: &[u8], i: usize) -> bool {
+    if (((kind(nodes, i) != K_CONST_DECL) || ((i + 1) >= end(nodes, i))) || (end(nodes, (i + 1)) != end(nodes, i))) {
+        return false;
+    }
+    return ident_is(nodes, text, (i + 1), b"undefined");
 }
 

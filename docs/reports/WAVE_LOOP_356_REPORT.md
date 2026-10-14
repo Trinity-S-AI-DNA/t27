@@ -99,7 +99,6 @@ mac(mac(mac(mac(x, a, .zero), b, .plus), c, .minus), d, .plus) = mac(x, b - c + 
 ### 3.2 Existing Competitor Updates
 
 - **Sparkle HDL + Hesper** (Verilean): **Silent since March 2026.** No new commits or announcements. Still ~60+ BitNet theorems (ALL instance-specific, ZERO generic ∀ ternary).
-- **TRINITY CLARA (gHashTag/trinity-clara)**: Only competitor with formal verification + ternary hardware claims. 47 Coq theorems (K3 ternary logic, GF16 precision). **4 `Admitted` lemmas remain.** No generic ∀ MAC accumulation theorems.
 - **TorchLean v1.2** (Jun 18 2026): Lean 4.31 + PyTorch/ATen bridge. **Software-only, no hardware.** Still an opportunity for Trinity integration.
 
 ### 3.3 Patent & Grant Landscape
@@ -107,7 +106,7 @@ mac(mac(mac(mac(x, a, .zero), b, .plus), c, .minus), d, .plus) = mac(x, b - c + 
 - **US11966714B2** (Purdue): Granted ternary in-memory DNN accelerator patent (expires 2040). Not new.
 - **NativeTernary** (Indian Patent Office, 2026): Provisional filing for ternary weight encoding. Not hardware.
 - **NSF SHF Solicitation 25-543**: Active, welcomes formal methods and emerging hardware.
-- **DARPA-NSF AI Forge RFI**: Closes **June 22, 2026** ($750K–$3M). Focuses on AI interpretability, not ternary hardware.
+- **A federal AI RFI**: Closes **June 22, 2026** ($750K–$3M). Focuses on AI interpretability, not ternary hardware.
 
 ### 3.4 Key Assessment
 
