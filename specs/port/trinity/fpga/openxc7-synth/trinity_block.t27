@@ -1,0 +1,432 @@
+// =====================================================================
+// trinity_block — port of gHashTag/trinity trinity_block.v (288 lines)
+// to a t27 specification for the openXC7 synthesis flow.
+//
+// The original is the top-level pipeline block of the TernaryVL model:
+//
+//     MatVec1 (N_SMALL -> N_LARGE) -> ReLU -> Buffer -> MatVec2
+//     (N_LARGE -> N_SMALL) -> +input (Residual) -> RMSNorm -> out
+//
+// Everything that decides behaviour is ported here as pure t27:
+//   * the numeric Verilog parameters as consts (with a Config struct
+//     mirroring the parameter header; the two string MEM_FILE_*_PREFIX
+//     parameters are quoted as comments — see below),
+//   * the 8-state FSM as consts + a step_control function that mirrors
+//     the single always @(posedge clk) block,
+//   * the S_FILL address walk, the residual adder, and the ACC_WIDTH
+//     two's-complement wrap of the signed arithmetic.
+//
+// What stays out on purpose: the input_buffer / relu_buffer RAMs
+// (`(* ram_style = "registers" *)`, i.e. memory plumbing), the two
+// tmu_top instances, and the ternary_activation / ternary_rmsnorm
+// submodules — those are instantiations (wiring), not decisions of this
+// module; each is its own port target. `t27c gen-verilog` emits
+// `module trinity_block (` from this file.
+//
+// Ported by Trinity (t27#9330); issue gHashTag/trinity#62.
+// =====================================================================
+
+module trinity_block {
+
+    // =================================================================
+    // Parameters — the module trinity_block #( ... ) header, quoted:
+    //   parameter N_SMALL            = 243,
+    //   parameter N_LARGE            = 729,
+    //   parameter ACC_WIDTH          = 20,
+    //   parameter FRAC_BITS          = 8,
+    //   parameter ADDR_WIDTH         = 18,
+    //   // ceilling(log2(N_SMALL))
+    //   parameter I_UP_WIDTH         = 8,
+    //   // ceilling(log2(N_LARGE))
+    //   parameter J_UP_WIDTH         = 10,
+    //   // ceilling(log2(N_LARGE))
+    //   parameter I_DOWN_WIDTH       = 10,
+    //   // ceilling(log2(N_SMALL))
+    //   parameter J_DOWN_WIDTH       = 8,
+    //   parameter MEM_FILE_UP_PREFIX = "matvec_up_weights",
+    //   parameter MEM_FILE_DOWN_PREFIX = "matvec_down_weights"
+    // (phi^2 + 1/phi^2 = 3 = TRINITY  — header comment of the original)
+    // =================================================================
+    const N_SMALL: usize = 243;
+    const N_LARGE: usize = 729;
+    const ACC_WIDTH: usize = 20;
+    const FRAC_BITS: usize = 8;
+    const ADDR_WIDTH: usize = 18;
+    const I_UP_WIDTH: usize = 8;
+    const J_UP_WIDTH: usize = 10;
+    const I_DOWN_WIDTH: usize = 10;
+    const J_DOWN_WIDTH: usize = 8;
+    // Parameters not ported to consts: MEM_FILE_UP_PREFIX and
+    // MEM_FILE_DOWN_PREFIX ("matvec_up_weights", "matvec_down_weights").
+    // They are the $readmemh file-name prefixes handed to the tmu_top
+    // instances — string-valued memory configuration, not decisions this
+    // module makes, and the .t27 test backend cannot express string
+    // constants. They are named in the port report; the tmu_top instance
+    // wiring owns them.
+    const TRINITY: usize = 3;
+
+    // Fixed sub-module configuration of the original:
+    //   tmu_top #(.N(N_SMALL), .M(N_LARGE), .K(16), ...) matvec1
+    //   tmu_top #(.N(N_LARGE), .M(N_SMALL), .K(16), ...) matvec2
+    //   ternary_rmsnorm #(.N(N_SMALL), .FRAC_BITS(FRAC_BITS), .LOG2_N(8)) rms
+    //   (* ram_style = "registers" *) reg [I_UP_WIDTH-1:0] input_buffer [0:255];
+    //   (* ram_style = "registers" *) reg [ACC_WIDTH-1:0] relu_buffer [0:1023];
+    const TMU_K: usize = 16;
+    const LOG2_N: usize = 8;
+    const INPUT_BUF_DEPTH: usize = 256;
+    const RELU_BUF_DEPTH: usize = 1024;
+
+    // =================================================================
+    // State machine encodings — localparam S_* of the original:
+    //   localparam S_IDLE = 3'd0, S_FILL = 3'd1, S_START1 = 3'd2,
+    //   S_LAYER1 = 3'd3, S_START2 = 3'd4, S_LAYER2 = 3'd5,
+    //   S_NORM = 3'd6, S_DONE = 3'd7;
+    // =================================================================
+    const S_IDLE: u32 = 0;
+    const S_FILL: u32 = 1;
+    const S_START1: u32 = 2;
+    const S_LAYER1: u32 = 3;
+    const S_START2: u32 = 4;
+    const S_LAYER2: u32 = 5;
+    const S_NORM: u32 = 6;
+    const S_DONE: u32 = 7;
+
+    // Width-safe comparison constant:
+    //   localparam [J_DOWN_WIDTH-1:0] LAST_INPUT = N_SMALL - 1;
+    const LAST_INPUT: u32 = N_SMALL - 1;
+
+    // Two's-complement wrap constants of the ACC_WIDTH-bit signed regs:
+    // 2^20 = 1048576, 2^19 = 524288 (range [-2^19, 2^19-1]).
+    const ACC_MOD: i64 = 1048576;
+    const ACC_HALF: i64 = 524288;
+
+    // =============================================================
+    // Struct constants (module-level parameters, quoted from source)
+    // =============================================================
+
+    // The parameter header as data, so tests can assert the port
+    // exactly as the Verilog declares it.
+    struct Config {
+        n_small: usize,
+        n_large: usize,
+        acc_width: usize,
+        frac_bits: usize,
+        addr_width: usize,
+        i_up_width: usize,
+        j_up_width: usize,
+        i_down_width: usize,
+        j_down_width: usize,
+        tmu_k: usize,
+        log2_n: usize,
+        input_buf_depth: usize,
+        relu_buf_depth: usize,
+    }
+
+    pub fn config() -> Config {
+        return Config {
+            n_small: N_SMALL,
+            n_large: N_LARGE,
+            acc_width: ACC_WIDTH,
+            frac_bits: FRAC_BITS,
+            addr_width: ADDR_WIDTH,
+            i_up_width: I_UP_WIDTH,
+            j_up_width: J_UP_WIDTH,
+            i_down_width: I_DOWN_WIDTH,
+            j_down_width: J_DOWN_WIDTH,
+            tmu_k: TMU_K,
+            log2_n: LOG2_N,
+            input_buf_depth: INPUT_BUF_DEPTH,
+            relu_buf_depth: RELU_BUF_DEPTH,
+        };
+    }
+
+    // =============================================================
+    // Enum constants (state machine, quoted from source)
+    // =============================================================
+
+    // Control state of the block, one register vector in the original:
+    //   reg [2:0] state;
+    // plus the outputs the same always block drives.
+    struct Ctrl {
+        state: u32,
+        busy: bool,
+        done: bool,
+        mv1_start: bool,
+        mv2_start: bool,
+        x_rd_addr: u32,
+    }
+
+    // Reset values, quoted from the original:
+    //   state <= S_IDLE; busy <= 1'b0; done <= 1'b0;
+    //   mv1_start <= 1'b0; mv2_start <= 1'b0;
+    //   x_rd_addr <= {J_DOWN_WIDTH{1'b0}};
+    pub fn reset_ctrl() -> Ctrl {
+        return Ctrl {
+            state: S_IDLE,
+            busy: false,
+            done: false,
+            mv1_start: false,
+            mv2_start: false,
+            x_rd_addr: 0,
+        };
+    }
+
+    // The single always @(posedge clk) block, ported decision by decision:
+    //   case (state)
+    //     S_IDLE:   if (start) { x_rd_addr <= 0; state <= S_FILL; }
+    //     S_FILL:   input_buffer[x_rd_addr] <= x_rd_data;  // buffer write
+    //               if (x_rd_addr == LAST_INPUT) state <= S_START1;
+    //               else x_rd_addr <= x_rd_addr + 1;
+    //     S_START1: mv1_start <= 1'b1; state <= S_LAYER1;
+    //     S_LAYER1: if (relu_done) state <= S_START2;
+    //     S_START2: mv2_start <= 1'b1; state <= S_LAYER2;
+    //     S_LAYER2: if (mv2_done) state <= S_NORM;
+    //     S_NORM:   if (norm_done) { done <= 1'b1; busy <= 1'b0; state <= S_DONE; }
+    //     S_DONE:   state <= S_DONE;
+    //   endcase
+    // (no default arm: any value outside the case list holds state).
+    // The start/relu_done/mv2_done/norm_done pulses come from the
+    // instantiation plumbing; mv1_start/mv2_start go back out to tmu_top.
+    pub fn step_control(s: Ctrl, start: bool, relu_done: bool, mv2_done: bool, norm_done: bool) -> Ctrl {
+        var n: Ctrl = s;
+        n.done = false;
+        n.mv1_start = false;
+        n.mv2_start = false;
+        if (s.state == S_IDLE) {
+            if (start) {
+                n.busy = true;
+                n.x_rd_addr = 0;
+                n.state = S_FILL;
+            }
+        } else if (s.state == S_FILL) {
+            if (s.x_rd_addr == LAST_INPUT) {
+                n.state = S_START1;
+            } else {
+                n.x_rd_addr = s.x_rd_addr + 1;
+            }
+        } else if (s.state == S_START1) {
+            n.mv1_start = true;
+            n.state = S_LAYER1;
+        } else if (s.state == S_LAYER1) {
+            if (relu_done) {
+                n.state = S_START2;
+            }
+        } else if (s.state == S_START2) {
+            n.mv2_start = true;
+            n.state = S_LAYER2;
+        } else if (s.state == S_LAYER2) {
+            if (mv2_done) {
+                n.state = S_NORM;
+            }
+        } else if (s.state == S_NORM) {
+            if (norm_done) {
+                n.done = true;
+                n.busy = false;
+                n.state = S_DONE;
+            }
+        } else if (s.state == S_DONE) {
+            n.state = S_DONE;
+        }
+        return n;
+    }
+
+    // S_FILL read address walk (else arm of the case above):
+    //   x_rd_addr <= x_rd_addr + 1;  — and held at LAST_INPUT, where the
+    //   if arm moves to S_START1 instead.
+    pub fn fill_next_addr(addr: u32) -> u32 {
+        if (addr == LAST_INPUT) {
+            return addr;
+        }
+        return addr + 1;
+    }
+
+    // =============================================================
+    // Datapath decisions (the block's own arithmetic)
+    // =============================================================
+
+    // Residual connection, quoted:
+    //   assign residual_data = mv2_data + res_rd_data;
+    // 20-bit signed adds in hardware; the wrap is what the adder
+    // actually produces on overflow.
+    pub fn residual(mv2_out: i32, x: i32) -> i32 {
+        return mv2_out + x;
+    }
+
+    // Two's-complement wrap at ACC_WIDTH bits — the behaviour of the
+    // ACC_WIDTH-wide signed regs the original adds into.
+    pub fn wrap_acc(v: i64) -> i32 {
+        var m: i64 = v;
+        while (m >= ACC_HALF) {
+            m -= ACC_MOD;
+        }
+        while (m < -ACC_HALF) {
+            m += ACC_MOD;
+        }
+        return m as i32;
+    }
+
+    // ceilling(log2(n)) — the width computation named in the parameter
+    // comments of the original (I_UP_WIDTH / J_UP_WIDTH / etc.).
+    pub fn ceil_log2(n: u64) -> u32 {
+        var w: u32 = 0;
+        var cap: u64 = 1;
+        while (cap < n) {
+            cap = cap * 2;
+            w += 1;
+        }
+        return w;
+    }
+
+    // Combinational surface of the block for gen-verilog: the residual
+    // adder is the only combinational datapath the block itself computes
+    // (everything else is registered or inside the sub-modules).
+    pub fn on_comb(mv2_out: i32, x: i32) -> i32 {
+        return residual(mv2_out, x);
+    }
+}
+
+// =====================================================================
+// Tests — what trinity_block.v does, asserted at the decision level.
+// =====================================================================
+
+test config_matches_verilog_header {
+    var c: Config = config();
+    assert(c.n_small == 243 and c.n_large == 729);
+    assert(c.acc_width == 20 and c.frac_bits == 8);
+    assert(c.addr_width == 18);
+    assert(c.i_up_width == 8 and c.j_up_width == 10);
+    assert(c.i_down_width == 10 and c.j_down_width == 8);
+    assert(c.tmu_k == 16 and c.log2_n == 8);
+    assert(c.input_buf_depth == 256 and c.relu_buf_depth == 1024);
+}
+
+test port_widths_match_parameter_comments {
+    // ceilling(log2(N_SMALL)) = 8, ceilling(log2(N_LARGE)) = 10
+    assert(ceil_log2(243) == 8);
+    assert(ceil_log2(729) == 10);
+    assert(ceil_log2(256) == 8);
+    assert(ceil_log2(1) == 0);
+    assert(ceil_log2(N_SMALL as u64) == I_UP_WIDTH);
+    assert(ceil_log2(N_LARGE as u64) == J_UP_WIDTH);
+    assert(ceil_log2(N_LARGE as u64) == I_DOWN_WIDTH);
+    assert(ceil_log2(N_SMALL as u64) == J_DOWN_WIDTH);
+}
+
+test fill_walks_the_input_buffer {
+    assert(LAST_INPUT == 242);
+    assert(fill_next_addr(0) == 1);
+    assert(fill_next_addr(241) == LAST_INPUT);
+    assert(fill_next_addr(LAST_INPUT) == LAST_INPUT);
+    // The full 243-input walk is what S_FILL does between S_IDLE and S_START1.
+    var a: u32 = 0;
+    var steps: u32 = 0;
+    while (a < LAST_INPUT) {
+        a = fill_next_addr(a);
+        steps += 1;
+    }
+        assert(a == LAST_INPUT and steps == LAST_INPUT);
+}
+
+test fsm_waits_for_start_in_idle {
+    var c: Ctrl = reset_ctrl();
+    assert(c.state == S_IDLE and !c.busy and !c.done);
+    assert(!c.mv1_start and !c.mv2_start and c.x_rd_addr == 0);
+    c = step_control(c, false, false, false, false);
+    assert(c.state == S_IDLE);
+}
+
+test fsm_fills_then_kicks_off_matvec1 {
+    var c: Ctrl = reset_ctrl();
+    c = step_control(c, true, false, false, false);
+    assert(c.state == S_FILL and c.busy and !c.done);
+    assert(c.x_rd_addr == 0);
+    c = step_control(c, false, false, false, false);
+    assert(c.x_rd_addr == 1);
+    // Run S_FILL to its last address.
+    while (c.x_rd_addr < LAST_INPUT) {
+        c = step_control(c, false, false, false, false);
+    }
+    assert(c.x_rd_addr == LAST_INPUT);
+    c = step_control(c, false, false, false, false);
+    assert(c.x_rd_addr == LAST_INPUT and c.state == S_START1);
+    c = step_control(c, false, false, false, false);
+    assert(c.mv1_start and c.state == S_LAYER1);
+    // mv1_start is a single-cycle pulse.
+    c = step_control(c, false, false, false, false);
+    assert(!c.mv1_start and c.state == S_LAYER1);
+}
+
+test fsm_gates_layer1_on_relu {
+    var c: Ctrl = reset_ctrl();
+    c.state = S_LAYER1;
+    c.busy = true;
+    c = step_control(c, false, false, false, false);
+    assert(c.state == S_LAYER1);
+    c = step_control(c, false, true, false, false);
+    assert(c.state == S_START2);
+    c = step_control(c, false, false, false, false);
+    assert(c.mv2_start and c.state == S_LAYER2);
+}
+
+test fsm_gates_layer2_on_matvec2 {
+    var c: Ctrl = reset_ctrl();
+    c.state = S_LAYER2;
+    c.busy = true;
+    c = step_control(c, false, false, false, false);
+    assert(c.state == S_LAYER2);
+    c = step_control(c, false, false, true, false);
+    assert(c.state == S_NORM);
+}
+
+test fsm_resets_address_on_start {
+    // S_IDLE honours a fresh start by resetting x_rd_addr to 0.
+    var c: Ctrl = reset_ctrl();
+    c.x_rd_addr = 7;
+    c = step_control(c, true, false, false, false);
+    assert(c.x_rd_addr == 0 and c.state == S_FILL);
+}
+
+test fsm_finishes_with_a_done_pulse {
+    var c: Ctrl = reset_ctrl();
+    c.state = S_NORM;
+    c.busy = true;
+    c = step_control(c, false, false, false, false);
+    assert(c.state == S_NORM and !c.done and c.busy);
+    c = step_control(c, false, false, false, true);
+    assert(c.done and !c.busy and c.state == S_DONE);
+    // S_DONE stays put; done is a one-cycle pulse.
+    c = step_control(c, false, false, false, false);
+    assert(c.state == S_DONE and !c.done and !c.busy);
+    // A start outside S_IDLE does nothing.
+    c = step_control(c, true, false, false, false);
+    assert(c.state == S_DONE);
+}
+
+test fsm_holds_on_unknown_state {
+    // The original case list has no default: an encoding outside S_*
+    // holds the state register.
+    var c: Ctrl = reset_ctrl();
+    c.state = 9;
+    c = step_control(c, false, false, false, false);
+    assert(c.state == 9);
+}
+
+test residual_adds_matvec2_output_to_the_input {
+    assert(residual(100, -3) == 97);
+    assert(residual(0, 0) == 0);
+    assert(residual(-1, 1) == 0);
+    assert(residual(-524287, -1) == -524288);
+}
+
+test acc_wraps_at_twenty_bits {
+    assert(wrap_acc(524287) == 524287);
+    assert(wrap_acc(524288) == -524288);
+    assert(wrap_acc(1048581) == 5);
+    assert(wrap_acc(-524288) == -524288);
+    assert(wrap_acc(-524289) == 524287);
+}
+
+test on_comb_is_the_residual_adder {
+    assert(on_comb(100, -3) == 97);
+    assert(on_comb(-2, 5) == 3);
+}
