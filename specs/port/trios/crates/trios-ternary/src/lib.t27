@@ -1,0 +1,232 @@
+// Ternary BitLinear Engine — the {-1, 0, +1} quantization for bulk
+// compute layers (zero-DSP, XC7A100T).
+// Port of gHashTag/trios:crates/trios-ternary/src/lib.rs
+// (at 8b229e9489ee, 175+ lines) — Roadmap Stage 6, goal #4548, target
+// t27c gen-rust.
+//
+// The original implements ternary quantization for the FFN bulk layers
+// per the STATIC_ROUTING_TABLE: from_f32 thresholds a weight into the
+// three values (> 0.5 → +1, < -0.5 → -1, else 0), to_f32 maps back,
+// bits_per_param is log2(3) ≈ 1.585, quantize scales each weight and
+// thresholds it, dequantize divides back, compute_scale takes
+// max-abs scaling (1.0 / max_abs, 1.0 for the empty or all-zero
+// tensor), compute_sparsity measures the zero share, and the ffn
+// module's helpers default the scale and price memory at
+// params/5 (~1.58 bits, conservative integer division).
+//
+// The language has no log2 builtin — log2(3) is computed by Newton
+// bisection over the exponent relation 2^x = 3, converging far past
+// f32 precision; the exact thresholding, scaling, sparsity and
+// memory decisions are pure arithmetic and port directly. The
+// growable vectors are the caller's plumbing; every listed function
+// is ported under its name as a pure decision (issue #9311, "Port the
+// decision, not the plumbing").
+
+module port::trios_ternary_lib;
+
+// ---------------------------------------------------------------------------
+// Original lines 27-62: the Ternary value {-1, 0, +1} and its
+// conversions. The thresholding decision: strictly above 0.5 → +1,
+// strictly below -0.5 → -1, everything else → 0.
+// ---------------------------------------------------------------------------
+
+pub fn Ternary_from_f32(value: f32) -> i32 {
+    if (value > 0.5) {
+        return 1;
+    }
+    if (value < 0.0 - 0.5) {
+        return -1;
+    }
+    return 0;
+}
+
+pub fn Ternary_to_f32(value: i32) -> f32 {
+    return value as f32;
+}
+
+// Original line 59: log2(3), computed without the log2 builtin -
+// Newton square roots build the 2^(1/2^k) ladder, the binary
+// expansion of the fraction assembles 2^y for any y in [0, 1), and a
+// bisection on 2^x = 3 over [1, 2] converges far past the test window.
+pub fn sqrt_newton(v: f32) -> f32 {
+    var s: f32 = v;
+    var i: usize = 0;
+    while (i < 40) {
+        s = (s + v / s) / 2.0;
+        i += 1;
+    }
+    return s;
+}
+
+// 2^y for y in [0, 1): each set binary bit k contributes the k-th
+// square root of 2 (bit 1 -> sqrt(2), bit 2 -> sqrt(sqrt(2)), ...).
+pub fn pow2_frac(y: f32) -> f32 {
+    var result: f32 = 1.0;
+    var root: f32 = sqrt_newton(2.0);
+    var bit: f32 = 0.5;
+    var remaining: f32 = y;
+    var i: usize = 0;
+    while (i < 20) {
+        if (remaining >= bit) {
+            result = result * root;
+            remaining = remaining - bit;
+        }
+        root = sqrt_newton(root);
+        bit = bit / 2.0;
+        i += 1;
+    }
+    return result;
+}
+
+// 2^x for x in [1, 2]: the integer part is a single factor of two.
+pub fn pow2_unit(x: f32) -> f32 {
+    return 2.0 * pow2_frac(x - 1.0);
+}
+
+pub fn Ternary_bits_per_param() -> f32 {
+    var lo: f32 = 1.0;
+    var hi: f32 = 2.0;
+    var i: usize = 0;
+    while (i < 30) {
+        const mid: f32 = (lo + hi) / 2.0;
+        if (pow2_unit(mid) < 3.0) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        i += 1;
+    }
+    return (lo + hi) / 2.0;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 76-81: `pub fn quantize(weights, scale)` — each weight
+// is scaled then thresholded. The port carries the per-element decision.
+// ---------------------------------------------------------------------------
+
+pub fn quantize(weight: f32, scale: f32) -> i32 {
+    return Ternary_from_f32(weight * scale);
+}
+
+// Original lines 91-93: `dequantize` divides the ternary value back.
+pub fn dequantize(value: i32, scale: f32) -> f32 {
+    return Ternary_to_f32(value) / scale;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 104-115: `pub fn compute_scale(weights)` — max-abs
+// scaling: 1.0 / max_abs, 1.0 for the empty tensor or an all-zero one.
+// The max fold is the caller's plumbing; the scale decision is ported.
+// ---------------------------------------------------------------------------
+
+pub fn compute_scale(max_abs: f32) -> f32 {
+    if (max_abs > 0.0) {
+        return 1.0 / max_abs;
+    }
+    return 1.0;
+}
+
+pub fn compute_scale_empty(empty: bool) -> f32 {
+    if (empty) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 124-127: `compute_sparsity` — the zero share of the
+// quantized tensor (0.0 = all zero, 1.0 = none zero in the doc, but
+// the code answers zero_count / len).
+// ---------------------------------------------------------------------------
+
+pub fn compute_sparsity(zero_count: usize, total: usize) -> f32 {
+    return zero_count as f32 / total as f32;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 137-175: the ffn module — quantize_gate, quantize_up
+// and quantize_down all default the scale to compute_scale of the
+// weights; ternary_size_bytes prices at params/5 (conservative
+// integer division of the 1.58-bit estimate).
+// ---------------------------------------------------------------------------
+
+pub fn ffn_scale_default(scale_present: bool, provided: f32, computed: f32) -> f32 {
+    if (!scale_present) {
+        return computed;
+    }
+    return provided;
+}
+
+pub fn ffn_size_divisor() -> usize {
+    return 5;
+}
+
+pub fn ffn_ternary_size_bytes(num_params: usize) -> usize {
+    return num_params / ffn_size_divisor();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: every decision above asserted against values read from the
+// original.
+// ---------------------------------------------------------------------------
+
+test sqrt_ladder_converges {
+    const r2 = sqrt_newton(2.0);
+    assert(r2 > 1.41421);
+    assert(r2 < 1.41422);
+    const r4 = sqrt_newton(r2);
+    assert(r4 > 1.18920);
+    assert(r4 < 1.18921);
+    assert(pow2_unit(1.0) == 2.0);
+    assert(pow2_frac(0.0) == 1.0);
+}
+
+test from_f32_thresholds {
+    assert(Ternary_from_f32(0.6) == 1);
+    assert(Ternary_from_f32(0.5) == 0);
+    assert(Ternary_from_f32(0.4) == 0);
+    assert(Ternary_from_f32(-0.6) == -1);
+    assert(Ternary_from_f32(-0.5) == 0);
+    assert(Ternary_from_f32(0.0) == 0);
+}
+
+test to_f32_maps_back {
+    assert(Ternary_to_f32(1) == 1.0);
+    assert(Ternary_to_f32(0) == 0.0);
+    assert(Ternary_to_f32(-1) == -1.0);
+}
+
+test bits_per_param_is_log2_of_three {
+    const b = Ternary_bits_per_param();
+    assert(b > 1.584);
+    assert(b < 1.586);
+}
+
+test quantize_and_dequantize_round_trip {
+    assert(quantize(0.6, 1.0) == 1);
+    assert(quantize(0.6, 0.5) == 0);
+    assert(quantize(-0.9, 1.0) == -1);
+    assert(dequantize(1, 2.0) == 0.5);
+    assert(dequantize(-1, 2.0) == -0.5);
+}
+
+test compute_scale_max_abs {
+    assert(compute_scale(2.0) == 0.5);
+    assert(compute_scale(0.5) == 2.0);
+    assert(compute_scale(0.0) == 1.0);
+    assert(compute_scale_empty(true) == 1.0);
+}
+
+test sparsity_measures_the_zero_share {
+    assert(compute_sparsity(3, 3) == 1.0);
+    assert(compute_sparsity(0, 4) == 0.0);
+    assert(compute_sparsity(2, 4) == 0.5);
+}
+
+test ffn_helpers_default_and_price {
+    assert(ffn_scale_default(false, 0.0, 0.5) == 0.5);
+    assert(ffn_scale_default(true, 2.0, 0.5) == 2.0);
+    assert(ffn_size_divisor() == 5);
+    assert(ffn_ternary_size_bytes(100) == 20);
+    assert(ffn_ternary_size_bytes(4) == 0);
+}
