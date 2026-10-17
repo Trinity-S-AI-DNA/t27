@@ -7393,12 +7393,11 @@ fn flat<'n>(ns: impl IntoIterator<Item = &'n Node>) -> (Vec<u8>, Vec<u8>) {
     (a, t)
 }
 const _: () = assert!(NodeKind::StmtExpr as u8 == aw::K_STMT_EXPR && NodeKind::ExprRange as u8 == aw::K_EXPR_RANGE);
-#[path = "../../../gen/rust/tri/t27b/verilog_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)]
-mod ve; // t27c gen-rust of specs/tri/t27b/verilog_emit.t27: `t27b verilog` (#8796)
-#[path = "../../../gen/rust/tri/t27b/verilog_plan.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)]
-mod vp; // t27c gen-rust of specs/tri/t27b/verilog_plan.t27: hw_consts, the consts only the hardware reads
-/// `t27b verilog`: `flat`'s bytes and per node four u32 (flags 1 var, 2 pub; line; its params' span in `p`).
-pub fn verilog(ast: &Node) -> Result<String, String> {
+#[path = "../../../gen/rust/tri/t27b/verilog_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod ve; // t27c gen-rust of specs/tri/t27b/verilog_emit.t27: `t27b verilog` (#8796)
+#[path = "../../../gen/rust/tri/t27b/verilog_plan.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod vp; // t27c gen-rust of specs/tri/t27b/verilog_plan.t27: hw_consts, the consts only the hardware reads
+#[path = "../../../gen/rust/tri/t27b/ts_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod tse; // specs/tri/t27b/ts_emit.t27: `t27b ts` (#9994)
+/// `t27b verilog` (`t27b ts` when `ts`): `flat`'s bytes and per node four u32 (flags 1 var, 2 pub; line; its params' span in `p`).
+pub fn verilog(ast: &Node, ts: bool) -> Result<String, String> {
     fn meta(n: &Node, m: &mut Vec<u8>, p: &mut Vec<u8>) {
         let lo = p.len() as u32; n.params.iter().for_each(|(a, b)| p.extend(format!("{a}:{b}\n").bytes()));
         for v in [n.extra_mutable as u32 | (n.extra_pub as u32) << 1, n.line, lo, p.len() as u32] { m.extend(v.to_le_bytes()) }
@@ -7407,7 +7406,7 @@ pub fn verilog(ast: &Node) -> Result<String, String> {
     let ((a, t), mut m, mut p) = (flat([ast]), Vec::new(), Vec::new());
     meta(ast, &mut m, &mut p);
     let (mut w, mut out) = (vec![0u8; a.len() / aw::REC * 2 + 70], vec![0u8; 4 * (a.len() + t.len()) + (1 << 20)]);
-    let n = ve::emit(&a, &t, &m, &p, &mut w, &mut out);
+    let n = (if ts { tse::emit } else { ve::emit })(&a, &t, &m, &p, &mut w, &mut out);
     let s = String::from_utf8_lossy(&out[..n.unsigned_abs() as usize]).into_owned();
     (n >= 0).then(|| s.clone()).ok_or(s)
 }
