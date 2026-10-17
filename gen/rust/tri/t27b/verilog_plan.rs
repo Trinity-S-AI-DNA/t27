@@ -601,6 +601,10 @@ pub fn implicit_port(s: &[u8]) -> bool {
     return ((same(s, "clk") || same(s, "rst_n")) || same(s, "en"));
 }
 
+pub fn tie_folds(s: &[u8], v: u64) -> bool {
+    return ((same(s, "rst_n") || same(s, "en")) && (v != 0));
+}
+
 pub const ROLE_BAD: u8 = 0;
 
 pub const ROLE_PORT: u8 = 1;
