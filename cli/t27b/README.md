@@ -346,7 +346,9 @@ test-report. Anything outside that subset is refused, exit 2, with
 
 The decisions are in `specs/tri/t27b/ts_plan.t27`: the types, the operator
 forms, folding, reserved names, and the prelude and coda. The writer is
-`specs/tri/t27b/ts_emit.t27`. Node 24 runs the output as `.mts`:
+`specs/tri/t27b/ts_emit.t27`. It shares its byte writers, name resolver and
+test trees with the Verilog writer through `specs/tri/t27b/emit_kit.t27`.
+Node 24 runs the output as `.mts`:
 
 ```
 t27b ts specs/queen/key_failover.t27 > /tmp/kf.mts
