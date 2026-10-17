@@ -22,22 +22,40 @@
 //                                 logits = alpha_out (n @ W_out) / 243^(phi^-3) + b_out
 //   src/hslm/ste.zig              applyAlpha: the TWN scale, one per matrix
 //   src/hslm/trainer.zig          cross-entropy on the last position's logits
+//   src/hslm/model.zig            forwardTrain: per block and position, the VSA
+//                                 attention, the consciousness gate, and the
+//                                 0.1 * projectVsaToEmbed(reasoned) offset
+//   src/hslm/attention.zig        VSAAttention.forward, cosineSimilarityTrit
+//   src/hslm/consciousness.zig    ConsciousnessGate: max_sim >= phi^-1, EMA 0.1
+//   src/hslm/reasoning.zig        forward = blend([context, analogy], [0.618, 0.382])
 // Context 27: gHashTag/trinity @ ee512359254bcd7438bb6a79c8a4a7f8b554b620,
 // docs/experiments/FOUND_EXPERIMENTS_SUMMARY.md: ctx 18 -> PPL 5.58, ctx 27 ->
 // PPL 2.96 (run R5, the best), ctx 54 -> PPL 6.05; ctx must divide HEAD_DIM
 // (EXP-012). constants.zig still says CONTEXT_LEN 81; the run used 27.
 //
+// The VSA path (section 4b) is a second stream next to the float one: each
+// token also has a 1024-trit hypervector, rotated by its position; per block
+// the VSA attention bundles the earlier hypervectors by cosine similarity,
+// and when the gate fires the block's float output gets 0.1 * the projected
+// hypervector. That stream depends on tokens and positions only, never on a
+// float parameter, so it adds a constant per (block, position) and leaves
+// every gradient as it was; the gradient checks below run with it on. Two
+// facts of the trained code, checked here: the reasoning step returns the
+// context unchanged (blend 6 * c + 3 * c * current^2 has the sign of c), and
+// at position 0 the gate always fires (max_sim is the self-similarity, 1).
+//
 // What still differs from the trained model, named so nobody reads this spec
 // as more than it is:
-//   - The VSA path is not here: per block the trained model also runs VSA
-//     attention over 1024-trit hypervectors, and when its consciousness gate
-//     fires (similarity > phi^-1) adds 0.1 * projectVsaToEmbed(reasoned) to
-//     the block output.
 //   - Floats: the trained model computes in f32, this spec in f64.
+//   - The trit table of the VSA stream is Zig's PRNG there and a hash here.
+//   - The trainer's attention backward sums W_K / W_V gradients over every
+//     position of the sequence; this spec treats earlier positions' keys and
+//     values as cached constants (the gradient of the last position only).
 //   - Training: the trainer's STE backward leaves the alphas out of the input
 //     gradients and stops at the embedding (the table is never trained); this
 //     spec computes the exact gradient, embedding included. Alphas and the
-//     ternary requantize step are inputs here, not learned.
+//     ternary requantize step are inputs here, not learned; the STE update is
+//     its own spec (issue #10076).
 //
 // The backward pass is checked against central differences of the loss: on
 // inputs, embedding rows, gains, biases and, for ternary weights, a real-valued
@@ -60,7 +78,8 @@ module HSLM {
     const VOCAB_SIZE : usize = 729;      // 3^6 tokens
     const CONTEXT_LEN : usize = 27;      // 3^3, the PPL 2.96 run
     const ROPE_PAIRS : usize = 40;       // HEAD_DIM / 2; the last dim is unrotated
-    const VSA_DIM : usize = 1024;        // VSA hypervector dimension (path not specified here)
+    const VSA_DIM : usize = 1024;        // VSA hypervector dimension, section 4b
+    const VSA_RATIO : usize = 4;         // VSA_DIM / EMBED_DIM, integer division
 
     const RMS_EPS : f64 = 0.000001;
     // 1 / 81^(phi^-3), phi^-3 = 0.2360679775
@@ -71,6 +90,11 @@ module HSLM {
     const LN_PHI : f64 = 0.48121182505960347;
     // 3 / pi, the position encoding's frequency scale
     const TRINITY_SCALE : f64 = 0.954929658551372;
+    // phi^-1, the consciousness gate's threshold
+    const PHI_INV : f64 = 0.6180339887498949;
+    // The VSA offset's gain: next_float += projectVsaToEmbed(reasoned) * 0.1
+    const VSA_GAIN : f64 = 0.1;
+    const GATE_EMA : f64 = 0.1;
 
     // Layer phases
     const PHASE_NORM : u8 = 0;
@@ -192,6 +216,25 @@ module HSLM {
     var nudge_block : usize = 0;
     var nudge_index : usize = 0;
     var nudge_delta : f64 = 0.0;
+
+    // The VSA stream (section 4b). vsa_in holds each block's input hypervector
+    // per position: block 0 gets the token's rotated hypervector, block b + 1
+    // the one block b put out. On by default: the trained model has it.
+    var vsa_on : bool = true;
+    var vsa_in : [NUM_BLOCKS * CONTEXT_LEN * VSA_DIM]Trit = undefined;
+    var vsa_out : [NUM_BLOCKS * VSA_DIM]Trit = undefined;      // next_trit, last position
+    var vsa_ctx : [VSA_DIM]Trit = undefined;                    // VSA attention context
+    var vsa_reasoned : [VSA_DIM]Trit = undefined;
+    var vsa_temp : [VSA_DIM]Trit = undefined;
+    var vsa_temp2 : [VSA_DIM]Trit = undefined;
+    var vsa_sim : [CONTEXT_LEN]f64 = undefined;
+    var vsa_accum : [VSA_DIM]i64 = undefined;
+    var vsa_max_sim : [NUM_BLOCKS]f64 = undefined;
+    var vsa_fired : [NUM_BLOCKS]bool = undefined;
+    // ConsciousnessGate state, one gate per block; it does not change the output
+    var gate_total : [NUM_BLOCKS]usize = undefined;
+    var gate_conscious : [NUM_BLOCKS]usize = undefined;
+    var gate_ema : [NUM_BLOCKS]f64 = undefined;
 
     // ═════════════════════════════════════════════════════════════════
     // 3. Kernels
@@ -581,6 +624,9 @@ module HSLM {
             output[i] = act_r[eo + i] + output[i];
             i = i + 1;
         }
+        if (vsa_on) {
+            vsa_block_forward(block_idx, position, output);
+        }
     }
 
     // n = x / rms(x); logits = alpha_out (n @ W_out) * SACRED_LOGIT_SCALE + b_out
@@ -605,6 +651,9 @@ module HSLM {
     fn hslm_forward(token: usize, position: usize, logits: []f64) -> void {
         act_token = token;
         embed_into(token, position, &bw_tmp);
+        if (vsa_on) {
+            vsa_embed(token, position, vsa_in[position * VSA_DIM..(position + 1) * VSA_DIM]);
+        }
         hslm_block_forward(0, position, &bw_tmp, act_out[0..EMBED_DIM]);
         var block_idx : usize = 1;
         while (block_idx < NUM_BLOCKS) {
@@ -615,6 +664,240 @@ module HSLM {
         }
         const last = (NUM_BLOCKS - 1) * EMBED_DIM;
         head_forward(act_out[last..last + EMBED_DIM], logits);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4b. The VSA stream and the consciousness gate (model.zig forwardTrain)
+    // ═════════════════════════════════════════════════════════════════
+
+    // The token's base hypervector (embedding.zig trit_table, a PRNG there):
+    // a two-step multiplicative hash mod primes, about 2 in 3 trits nonzero
+    fn vsa_table(token: usize, d: usize) -> Trit {
+        const h1 = ((token * VSA_DIM + d + 1) * 2654435761) % 1000003;
+        const h2 = ((h1 + 7) * 48271) % 2147483647;
+        const m = h2 % 3;
+        if (m == 0) {
+            return Trit.pos;
+        }
+        if (m == 1) {
+            return Trit.neg;
+        }
+        return Trit.zero;
+    }
+
+    // embedTrit: the table row, cyclically permuted by the position.
+    // cyclicPermute (reverse all, reverse [0, shift), reverse [shift, n)) is a
+    // right rotation: out[(i + shift) % n] = in[i]
+    fn vsa_embed(token: usize, position: usize, out: []Trit) -> void {
+        const shift = position % VSA_DIM;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            out[(i + shift) % VSA_DIM] = vsa_table(token, i);
+            i = i + 1;
+        }
+    }
+
+    fn trit_int(t: Trit) -> i64 {
+        if (t == Trit.pos) {
+            return 1;
+        }
+        if (t == Trit.neg) {
+            return 0 - 1;
+        }
+        return 0;
+    }
+
+    fn copy_trits(src: []const Trit, dst: []Trit) -> void {
+        var i : usize = 0;
+        while (i < src.len) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    // cosineSimilarityTrit: integer dot and norms; 0 if either vector is zero
+    fn cosine_trit(a: []const Trit, b: []const Trit) -> f64 {
+        var dot : i64 = 0;
+        var norm_a : i64 = 0;
+        var norm_b : i64 = 0;
+        var i : usize = 0;
+        while (i < a.len) {
+            const x = trit_int(a[i]);
+            const y = trit_int(b[i]);
+            dot = dot + x * y;
+            norm_a = norm_a + x * x;
+            norm_b = norm_b + y * y;
+            i = i + 1;
+        }
+        if (norm_a == 0 or norm_b == 0) {
+            return 0.0;
+        }
+        return @as(f64, @floatFromInt(dot)) / (sqrt(@as(f64, @floatFromInt(norm_a))) * sqrt(@as(f64, @floatFromInt(norm_b))));
+    }
+
+    // @intFromFloat(@max(1.0, x)) for x >= 0: the largest integer w >= 1 with w <= x
+    fn vsa_weight(x: f64) -> i64 {
+        var w : i64 = 1;
+        while (@as(f64, @floatFromInt(w + 1)) <= x) {
+            w = w + 1;
+        }
+        return w;
+    }
+
+    // Majority vote: the sign of each accumulator
+    fn majority_vote(accum: []const i64, out: []Trit) -> void {
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            if (accum[d] > 0) {
+                out[d] = Trit.pos;
+            } else if (accum[d] < 0) {
+                out[d] = Trit.neg;
+            } else {
+                out[d] = Trit.zero;
+            }
+            d = d + 1;
+        }
+    }
+
+    // VSAAttention.forwardCausal over the block's input hypervectors 0..position:
+    // query, keys and values are all that sequence. max_sim leaves out the
+    // query's own position (it falls back to the self-similarity at position 0);
+    // the context bundles every value with a positive score, weight
+    // int(max(1, 10 score)), then takes the majority vote
+    fn vsa_attention(block_idx: usize, position: usize) -> f64 {
+        const base = block_idx * CONTEXT_LEN * VSA_DIM;
+        const qo = base + position * VSA_DIM;
+        var i : usize = 0;
+        while (i <= position) {
+            const ko = base + i * VSA_DIM;
+            vsa_sim[i] = cosine_trit(vsa_in[qo..qo + VSA_DIM], vsa_in[ko..ko + VSA_DIM]);
+            i = i + 1;
+        }
+        var max_sim : f64 = 0.0 - 1.0;
+        i = 0;
+        while (i < position) {
+            if (vsa_sim[i] > max_sim) {
+                max_sim = vsa_sim[i];
+            }
+            i = i + 1;
+        }
+        if (position == 0) {
+            max_sim = vsa_sim[0];
+        }
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            vsa_accum[d] = 0;
+            d = d + 1;
+        }
+        i = 0;
+        while (i <= position) {
+            const score = vsa_sim[i];
+            if (score > 0.0) {
+                const w = vsa_weight(score * 10.0);
+                const vo = base + i * VSA_DIM;
+                d = 0;
+                while (d < VSA_DIM) {
+                    vsa_accum[d] = vsa_accum[d] + trit_int(vsa_in[vo + d]) * w;
+                    d = d + 1;
+                }
+            }
+            i = i + 1;
+        }
+        majority_vote(&vsa_accum, &vsa_ctx);
+        return max_sim;
+    }
+
+    fn gate_reset() -> void {
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            gate_total[b] = 0;
+            gate_conscious[b] = 0;
+            gate_ema[b] = 0.0;
+            b = b + 1;
+        }
+    }
+
+    // ConsciousnessGate.isConscious: count, EMA 0.1, fire when max_sim >= phi^-1
+    fn gate_is_conscious(block_idx: usize, max_sim: f64) -> bool {
+        gate_total[block_idx] = gate_total[block_idx] + 1;
+        gate_ema[block_idx] = GATE_EMA * max_sim + (1.0 - GATE_EMA) * gate_ema[block_idx];
+        const activated = max_sim >= PHI_INV;
+        if (activated) {
+            gate_conscious[block_idx] = gate_conscious[block_idx] + 1;
+        }
+        return activated;
+    }
+
+    // bindVec: element-wise trit product
+    fn vsa_bind(a: []const Trit, b: []const Trit, out: []Trit) -> void {
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            const p = trit_int(a[d]) * trit_int(b[d]);
+            if (p > 0) {
+                out[d] = Trit.pos;
+            } else if (p < 0) {
+                out[d] = Trit.neg;
+            } else {
+                out[d] = Trit.zero;
+            }
+            d = d + 1;
+        }
+    }
+
+    // Reasoning.forward: temp2 = analogy(current, context, current)
+    // = bind(bind(context, current), current); out = blend([context, temp2],
+    // [0.618, 0.382]) with integer weights int(max(1, 10 |w|)) = 6 and 3
+    fn vsa_reasoning(current: []const Trit, context: []const Trit, out: []Trit) -> void {
+        vsa_bind(context, current, &vsa_temp);
+        vsa_bind(&vsa_temp, current, &vsa_temp2);
+        const w0 = vsa_weight(0.618 * 10.0);
+        const w1 = vsa_weight(0.382 * 10.0);
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            vsa_accum[d] = trit_int(context[d]) * w0 + trit_int(vsa_temp2[d]) * w1;
+            d = d + 1;
+        }
+        majority_vote(&vsa_accum, out);
+    }
+
+    // projectVsaToEmbed: dim i is the mean of trits 4i .. 4i + 3 (1024 / 243 = 4,
+    // so trits 972 .. 1023 are never read)
+    fn project_vsa(v: []const Trit, i: usize) -> f64 {
+        const start = i * VSA_RATIO;
+        var sum : f64 = 0.0;
+        var j : usize = start;
+        while (j < start + VSA_RATIO) {
+            sum = sum + @as(f64, @floatFromInt(trit_int(v[j])));
+            j = j + 1;
+        }
+        return sum / @as(f64, @floatFromInt(VSA_RATIO));
+    }
+
+    // After the block's float output: VSA attention, the gate, and when it fires
+    // the reasoning step and output += 0.1 * project(reasoned). The block's
+    // output hypervector (reasoned or context) is the next block's input.
+    fn vsa_block_forward(block_idx: usize, position: usize, output: []f64) -> void {
+        const max_sim = vsa_attention(block_idx, position);
+        vsa_max_sim[block_idx] = max_sim;
+        const qo = (block_idx * CONTEXT_LEN + position) * VSA_DIM;
+        const vo = block_idx * VSA_DIM;
+        const fired = gate_is_conscious(block_idx, max_sim);
+        vsa_fired[block_idx] = fired;
+        if (fired) {
+            vsa_reasoning(vsa_in[qo..qo + VSA_DIM], &vsa_ctx, &vsa_reasoned);
+            var i : usize = 0;
+            while (i < EMBED_DIM) {
+                output[i] = output[i] + project_vsa(&vsa_reasoned, i) * VSA_GAIN;
+                i = i + 1;
+            }
+            copy_trits(&vsa_reasoned, vsa_out[vo..vo + VSA_DIM]);
+        } else {
+            copy_trits(&vsa_ctx, vsa_out[vo..vo + VSA_DIM]);
+        }
+        if (block_idx + 1 < NUM_BLOCKS) {
+            const no = ((block_idx + 1) * CONTEXT_LEN + position) * VSA_DIM;
+            copy_trits(vsa_out[vo..vo + VSA_DIM], vsa_in[no..no + VSA_DIM]);
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -837,6 +1120,10 @@ module HSLM {
     var probe_logits : [VOCAB_SIZE]f64 = undefined;
     var probe_dl : [VOCAB_SIZE]f64 = undefined;
     var probe_gin : [EMBED_DIM]f64 = undefined;
+    // The position and token probe_loss and probe_backward run; a check that
+    // moves them puts them back
+    var probe_position : usize = 1;
+    var probe_token : usize = TOKEN_PROBE;
 
     // About 2 in 9 trits nonzero, a different pattern per matrix and block.
     // A multiplicative hash mod a prime: 243 and 729 are multiples of 9, so a
@@ -925,7 +1212,7 @@ module HSLM {
     }
 
     fn probe_loss(target: usize) -> f64 {
-        probe_run(1, TOKEN_PROBE);
+        probe_run(probe_position, probe_token);
         if (target < VOCAB_SIZE) {
             return cross_entropy(&probe_logits, target);
         }
@@ -946,7 +1233,7 @@ module HSLM {
 
     // Forward position 1 at the unperturbed point, then backward from the loss
     fn probe_backward(target: usize) -> void {
-        probe_run(1, TOKEN_PROBE);
+        probe_run(probe_position, probe_token);
         zero_weight_gradients();
         if (target < VOCAB_SIZE) {
             cross_entropy_backward(&probe_logits, target, &probe_dl);
@@ -963,19 +1250,19 @@ module HSLM {
     // Embedding entry k of the probed token, moved by +-1e-5
     fn embed_slope(k: usize, target: usize) -> f64 {
         probe_setup();
-        const e0 = model.embed[TOKEN_PROBE * EMBED_DIM + k];
-        model.embed[TOKEN_PROBE * EMBED_DIM + k] = e0 + 0.00001;
+        const e0 = model.embed[probe_token * EMBED_DIM + k];
+        model.embed[probe_token * EMBED_DIM + k] = e0 + 0.00001;
         const lp = probe_loss(target);
-        model.embed[TOKEN_PROBE * EMBED_DIM + k] = e0 - 0.00001;
+        model.embed[probe_token * EMBED_DIM + k] = e0 - 0.00001;
         const lm = probe_loss(target);
-        model.embed[TOKEN_PROBE * EMBED_DIM + k] = e0;
+        model.embed[probe_token * EMBED_DIM + k] = e0;
         return (lp - lm) / 0.00002;
     }
 
     fn embed_gradient(k: usize, target: usize) -> f64 {
         probe_setup();
         probe_backward(target);
-        return g_embed[TOKEN_PROBE * EMBED_DIM + k];
+        return g_embed[probe_token * EMBED_DIM + k];
     }
 
     // The input gradient hslm_backward returns is the embedding row's
@@ -1393,6 +1680,308 @@ module HSLM {
         return get_hslm_mode();
     }
 
+    // ── Probes for the VSA stream (section 4b) ──
+
+    var vsa_a : [VSA_DIM]Trit = undefined;
+    var vsa_b : [VSA_DIM]Trit = undefined;
+    var block_out_scratch : [EMBED_DIM]f64 = undefined;
+
+    fn trit_mismatches(a: []const Trit, b: []const Trit) -> usize {
+        var bad : usize = 0;
+        var i : usize = 0;
+        while (i < a.len) {
+            if (a[i] != b[i]) {
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    fn zero_trits(t: []Trit) -> void {
+        var i : usize = 0;
+        while (i < t.len) {
+            t[i] = Trit.zero;
+            i = i + 1;
+        }
+    }
+
+    // A token's hypervector against itself (kind 0), its negation (1), zero (2)
+    fn cosine_probe(kind: u8) -> f64 {
+        vsa_embed(TOKEN_PROBE, 0, &vsa_a);
+        if (kind == 0) {
+            copy_trits(&vsa_a, &vsa_b);
+        } else if (kind == 1) {
+            var d : usize = 0;
+            while (d < VSA_DIM) {
+                if (vsa_a[d] == Trit.pos) {
+                    vsa_b[d] = Trit.neg;
+                } else if (vsa_a[d] == Trit.neg) {
+                    vsa_b[d] = Trit.pos;
+                } else {
+                    vsa_b[d] = Trit.zero;
+                }
+                d = d + 1;
+            }
+        } else {
+            zero_trits(&vsa_b);
+        }
+        return cosine_trit(&vsa_a, &vsa_b);
+    }
+
+    // The embedded hypervector against the table row rotated right by position
+    fn rotation_mismatches(position: usize) -> usize {
+        vsa_embed(TOKEN_PROBE, position, &vsa_a);
+        var bad : usize = 0;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            if (vsa_a[(i + position) % VSA_DIM] != vsa_table(TOKEN_PROBE, i)) {
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    fn rotation_moves(position: usize) -> usize {
+        vsa_embed(TOKEN_PROBE, 0, &vsa_a);
+        vsa_embed(TOKEN_PROBE, position, &vsa_b);
+        return trit_mismatches(&vsa_a, &vsa_b);
+    }
+
+    fn table_nonzero(token: usize) -> usize {
+        var n : usize = 0;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            if (vsa_table(token, i) != Trit.zero) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    fn gate_probe(max_sim: f64) -> bool {
+        gate_reset();
+        return gate_is_conscious(0, max_sim);
+    }
+
+    // Three gate calls, 0.617, phi^-1, 0.9: total * 100 + conscious * 10 + fired
+    fn gate_counts() -> usize {
+        gate_reset();
+        var fired : usize = 0;
+        if (gate_is_conscious(1, 0.617)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(1, PHI_INV)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(1, 0.9)) {
+            fired = fired + 1;
+        }
+        return gate_total[1] * 100 + gate_conscious[1] * 10 + fired;
+    }
+
+    // The gate's EMA after max_sim 1.0, then 0.5: 0.1 * 0.5 + 0.9 * 0.1
+    fn gate_ema_probe() -> f64 {
+        gate_reset();
+        var fired : usize = 0;
+        if (gate_is_conscious(2, 1.0)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(2, 0.5)) {
+            fired = fired + 1;
+        }
+        if (fired != 1) {
+            return 0.0 - 1.0;
+        }
+        return gate_ema[2];
+    }
+
+    fn reasoning_inputs() -> void {
+        vsa_embed(TOKEN_PROBE, 3, &vsa_a);
+        vsa_embed(TOKEN_FIRST, 0, &vsa_b);
+    }
+
+    // Reasoning.forward against its context input
+    fn reasoning_mismatches() -> usize {
+        reasoning_inputs();
+        vsa_reasoning(&vsa_a, &vsa_b, &vsa_reasoned);
+        return trit_mismatches(&vsa_reasoned, &vsa_b);
+    }
+
+    fn reasoning_input_gap() -> usize {
+        reasoning_inputs();
+        return trit_mismatches(&vsa_a, &vsa_b);
+    }
+
+    // Trits 968 .. 971 at +1, trit 0 and the unread 972 and 1023 at -1
+    fn projection_probe(i: usize) -> f64 {
+        zero_trits(&vsa_a);
+        vsa_a[0] = Trit.neg;
+        vsa_a[968] = Trit.pos;
+        vsa_a[969] = Trit.pos;
+        vsa_a[970] = Trit.pos;
+        vsa_a[971] = Trit.pos;
+        vsa_a[972] = Trit.neg;
+        vsa_a[1023] = Trit.neg;
+        return project_vsa(&vsa_a, i);
+    }
+
+    // Blocks whose gate fired at position 0
+    fn fired_at_zero() -> usize {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        var n : usize = 0;
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            if (vsa_fired[b]) {
+                n = n + 1;
+            }
+            b = b + 1;
+        }
+        return n;
+    }
+
+    // At position 0 every block's output hypervector is its input
+    fn stream_identity_at_zero() -> usize {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        var bad : usize = 0;
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            const io = b * CONTEXT_LEN * VSA_DIM;
+            bad = bad + trit_mismatches(vsa_out[b * VSA_DIM..(b + 1) * VSA_DIM], vsa_in[io..io + VSA_DIM]);
+            b = b + 1;
+        }
+        return bad;
+    }
+
+    // The next block's input at position 1 is the block's output hypervector
+    fn stream_hand_off_gap() -> usize {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        var bad : usize = 0;
+        var b : usize = 0;
+        while (b + 1 < NUM_BLOCKS) {
+            const io = ((b + 1) * CONTEXT_LEN + 1) * VSA_DIM;
+            bad = bad + trit_mismatches(vsa_out[b * VSA_DIM..(b + 1) * VSA_DIM], vsa_in[io..io + VSA_DIM]);
+            b = b + 1;
+        }
+        return bad;
+    }
+
+    // Block 0's output at a position, VSA stream on minus off
+    fn vsa_on_minus_off(position: usize, token: usize, i: usize) -> f64 {
+        probe_setup();
+        probe_run(position, token);
+        copy_floats(act_out[0..EMBED_DIM], &block_out_scratch);
+        vsa_on = false;
+        probe_run(position, token);
+        vsa_on = true;
+        return block_out_scratch[i] - act_out[i];
+    }
+
+    fn copy_floats(src: []const f64, dst: []f64) -> void {
+        var i : usize = 0;
+        while (i < src.len) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    // Position 0, block 0: on minus off against 0.1 * project(the token's
+    // hypervector), summed over the dims
+    fn vsa_offset_gap() -> f64 {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        copy_floats(act_out[0..EMBED_DIM], &block_out_scratch);
+        vsa_on = false;
+        probe_run(0, TOKEN_FIRST);
+        vsa_on = true;
+        vsa_embed(TOKEN_FIRST, 0, &vsa_a);
+        var gap : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            gap = gap + @abs((block_out_scratch[i] - act_out[i]) - project_vsa(&vsa_a, i) * VSA_GAIN);
+            i = i + 1;
+        }
+        return gap;
+    }
+
+    fn vsa_offset_size() -> f64 {
+        vsa_embed(TOKEN_FIRST, 0, &vsa_a);
+        var size : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            size = size + @abs(project_vsa(&vsa_a, i) * VSA_GAIN);
+            i = i + 1;
+        }
+        return size;
+    }
+
+    // Position 1: block 0's gate and its similarity
+    fn block0_fired_at_one() -> bool {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        return vsa_fired[0];
+    }
+
+    fn block0_sim_at_one() -> f64 {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        return vsa_max_sim[0];
+    }
+
+    fn block0_gap_at_one() -> f64 {
+        var gap : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            gap = gap + @abs(vsa_on_minus_off(1, TOKEN_PROBE, i));
+            i = i + 27;
+        }
+        return gap;
+    }
+
+    // The gradient checks at position 0, where every gate fires
+    fn at_position_zero(on: bool) -> void {
+        if (on) {
+            probe_position = 0;
+            probe_token = TOKEN_FIRST;
+        } else {
+            probe_position = 1;
+            probe_token = TOKEN_PROBE;
+        }
+    }
+
+    fn embed_slope0(k: usize, target: usize) -> f64 {
+        at_position_zero(true);
+        const s = embed_slope(k, target);
+        at_position_zero(false);
+        return s;
+    }
+
+    fn embed_gradient0(k: usize, target: usize) -> f64 {
+        at_position_zero(true);
+        const g = embed_gradient(k, target);
+        at_position_zero(false);
+        return g;
+    }
+
+    fn gamma_slope0(block_idx: usize, index: usize) -> f64 {
+        at_position_zero(true);
+        const s = gamma_slope(block_idx, index);
+        at_position_zero(false);
+        return s;
+    }
+
+    fn gamma_gradient0(block_idx: usize, index: usize) -> f64 {
+        at_position_zero(true);
+        const g = gamma_gradient(block_idx, index);
+        at_position_zero(false);
+        return g;
+    }
+
     // ═════════════════════════════════════════════════════════════════
     // TDD-Inside-Spec: Tests and Invariants for HSLM
     // ═════════════════════════════════════════════════════════════════
@@ -1679,4 +2268,105 @@ module HSLM {
 
     invariant hslm_linear_loss_marker_is_vocab
         assert LINEAR_LOSS == VOCAB_SIZE and PROBE_TARGET < VOCAB_SIZE and TOKEN_PROBE < VOCAB_SIZE
+
+    // ── VSA stream: hypervectors, attention, the consciousness gate ──
+
+    test hslm_vsa_cosine_values
+        given same = cosine_probe(0)
+        when flipped = cosine_probe(1)
+        then @abs(same - 1.0) < 0.000000000000001 and @abs(flipped + 1.0) < 0.000000000000001 and cosine_probe(2) == 0.0
+
+    // The token hypervector is about 2 in 3 nonzero, and position p rotates
+    // it right by p
+    test hslm_vsa_embed_rotates_by_position
+        given at0 = rotation_mismatches(0)
+        when at5 = rotation_mismatches(5)
+        then at0 == 0 and at5 == 0 and rotation_moves(5) > 100 and table_nonzero(TOKEN_PROBE) > 600 and table_nonzero(TOKEN_PROBE) < 770
+
+    // The gate fires at max_sim >= phi^-1 and not below
+    test hslm_vsa_gate_threshold_is_phi_inverse
+        given below = gate_probe(0.617)
+        when at = gate_probe(PHI_INV)
+        then below == false and at and gate_probe(0.62)
+
+    // Three calls, two of them at or above phi^-1: total 3, conscious 2, fired 2
+    test hslm_vsa_gate_counts
+        given n = gate_counts()
+        when again = gate_counts()
+        then n == 322 and again == 322
+
+    // EMA 0.1: 0.1 * 1.0 = 0.1, then 0.1 * 0.5 + 0.9 * 0.1 = 0.14
+    test hslm_vsa_gate_ema
+        given ema = gate_ema_probe()
+        when same = gate_ema_probe()
+        then @abs(ema - 0.14) < 0.000000000000001 and ema == same
+
+    // int(max(1, 10 score)): the floor, at least 1
+    test hslm_vsa_attention_weight_is_floor_at_least_one
+        given small = vsa_weight(0.5)
+        when mid = vsa_weight(3.5)
+        then small == 1 and mid == 3 and vsa_weight(10.0) == 10 and vsa_weight(9.9) == 9 and vsa_weight(6.18) == 6 and vsa_weight(3.82) == 3
+
+    // Reasoning.forward as trained returns its context: bind(bind(c, x), x)
+    // is c where x is nonzero and 0 elsewhere, and 6 c + 3 that has c's sign
+    test hslm_vsa_reasoning_returns_context
+        given bad = reasoning_mismatches()
+        when inputs = reasoning_input_gap()
+        then bad == 0 and inputs > 100
+
+    // Dim i is the mean of trits 4i .. 4i + 3; trits 972 .. 1023 are not read
+    test hslm_vsa_projection_values
+        given top = projection_probe(242)
+        when below = projection_probe(241)
+        then top == 1.0 and below == 0.0 and projection_probe(0) == -0.25
+
+    // Position 0: every block's similarity is its self-similarity 1, every
+    // gate fires, and the stream passes the token hypervector through
+    test hslm_vsa_position_zero_fires_every_block
+        given fired = fired_at_zero()
+        when bad = stream_identity_at_zero()
+        then fired == NUM_BLOCKS and bad == 0
+
+    test hslm_vsa_stream_hands_off_between_blocks
+        given bad = stream_hand_off_gap()
+        when again = stream_hand_off_gap()
+        then bad == 0 and again == 0
+
+    // Position 0, block 0: the stream adds exactly 0.1 * project(token
+    // hypervector) to the block's output
+    test hslm_vsa_offset_is_gain_times_projection
+        given gap = vsa_offset_gap()
+        when size = vsa_offset_size()
+        then gap < 0.000000000001 and size > 1.0
+
+    // Position 1, block 0: the token's hypervector against TOKEN_FIRST's sits
+    // well under PHI_INV (measured between 0.2 and 0.5), the gate stays shut,
+    // and the output is the stream-off output
+    test hslm_vsa_block0_shut_at_position_one
+        given fired = block0_fired_at_one()
+        when sim = block0_sim_at_one()
+        then fired == false and @abs(sim) < 0.5 and block0_gap_at_one() == 0.0
+
+    // The offset does not depend on the float parameters, so the gradient
+    // matches the loss at position 0, where every gate fires
+    test hslm_vsa_embed_gradient_at_position_zero
+        given slope = embed_slope0(5, LINEAR_LOSS)
+        when grad = embed_gradient0(5, LINEAR_LOSS)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_vsa_embed_gradient_at_position_zero_cross_entropy
+        given slope = embed_slope0(77, PROBE_TARGET)
+        when grad = embed_gradient0(77, PROBE_TARGET)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_vsa_gamma_gradient_at_position_zero
+        given slope = gamma_slope0(1, 40)
+        when grad = gamma_gradient0(1, 40)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    invariant hslm_vsa_ratio
+        assert VSA_RATIO == VSA_DIM / EMBED_DIM and VSA_RATIO * EMBED_DIM <= VSA_DIM
+
+    invariant hslm_phi_inverse_identity
+        assert @abs(PHI_INV * (1.0 + PHI_INV) - 1.0) < 0.000000000000001
 }
