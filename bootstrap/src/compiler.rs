@@ -5020,7 +5020,7 @@ the parser used to read it as `{}` followed by a negation",
     /// Consume the type that follows an `as` cast, e.g. `u32`, `i8`, or an
     /// array form like `u8[4]`. Returns the textual type for diagnostics.
     /// The base type name is validated against the known scalar type set so
-    /// that a typo like `x as u3` or `x as banana` is rejected at parse time
+    /// that `x as u0` or `x as banana` (uN: specs/compiler/int_type_names.t27) is rejected at parse time
     /// instead of silently lowering to a 32-bit default.
     fn parse_cast_target_type(&mut self) -> Result<String, String> {
         if self.current.kind != TokenKind::Ident {
@@ -5046,7 +5046,7 @@ the parser used to read it as `{}` followed by a negation",
             "bool", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize",
             "f32", "f64",
         ];
-        if !VALID_CAST_TYPES.contains(&base.as_str()) {
+        if !VALID_CAST_TYPES.contains(&base.as_str()) && int_type_names::uint_bits(base.as_bytes()).is_none() {
             // f32/f64 parse in DECLARATIONS, so "unknown type" would be a lie here.
             // The truth is narrower: no backend lowers float arithmetic -- the C
             // generator emits the literal token `f32`, which is not a C type, and
@@ -5063,7 +5063,7 @@ the parser used to read it as `{}` followed by a negation",
                 ));
             }
             return Err(format!(
-                "unknown cast target type `{}`; expected one of {:?}",
+                "unknown cast target type `{}`; expected one of {:?} or uN, 1 <= N <= 64",
                 base, VALID_CAST_TYPES
             ));
         }
