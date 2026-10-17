@@ -14,65 +14,6 @@ pub const M_TEST: u8 = 3;
 
 pub const M_TBFUNC: u8 = 4;
 
-pub const MSG_ROOM: usize = 400;
-
-pub const NAME_CAP: usize = 120;
-
-pub const SYM_UNIT: i64 = 1099511627776;
-
-pub const SYM_LOCAL: i64 = 1;
-
-pub const SYM_PARAM: i64 = 2;
-
-pub const SYM_TOP: i64 = 3;
-
-pub const SYM_FN: i64 = 4;
-
-pub const NO_SYM: i64 = -1;
-
-pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
-    let mut k: usize = a;
-    let mut q: usize = at;
-    while (k < b) {
-        out[(q) as usize] = s[(k) as usize];
-        q = (q + 1);
-        k = (k + 1);
-    }
-    return q;
-}
-
-pub fn dec_len(v: u64) -> usize {
-    let mut n: usize = 1;
-    let mut x: u64 = v;
-    while (x >= 10) {
-        x = (x / 10);
-        n = (n + 1);
-    }
-    return n;
-}
-
-pub fn put_dec(out: &mut [u8], at: usize, v: u64) -> usize {
-    let n: usize = dec_len(v);
-    let mut x: u64 = v;
-    let mut k: usize = n;
-    while (k > 0) {
-        let db: u8 = (((x % 10) + 48) as _);
-        out[(((at + k) - 1)) as usize] = db;
-        x = (x / 10);
-        k = (k - 1);
-    }
-    return (at + n);
-}
-
-pub fn put_ind(out: &mut [u8], at: usize, n: usize) -> usize {
-    let mut k: usize = 0;
-    while (k < n) {
-        out[((at + k)) as usize] = 32;
-        k = (k + 1);
-    }
-    return (at + n);
-}
-
 pub fn put_name(out: &mut [u8], at: usize, text: &[u8], a: usize, b: usize) -> usize {
     if verilog_keyword(&text[(a) as usize..(b) as usize]) {
         let mut q: usize = put_text(out, at, "\\");
@@ -106,24 +47,6 @@ pub fn put_lit(out: &mut [u8], at: usize, v: u64, t: i64) -> usize {
     return put_dec(out, q, v);
 }
 
-pub fn line_near(nodes: &[u8], meta: &[u8], i: usize) -> usize {
-    let mut j: usize = i;
-    while (j < end(nodes, i)) {
-        if (line_of(meta, j) != 0) {
-            return line_of(meta, j);
-        }
-        j = (j + 1);
-    }
-    let mut k: usize = i;
-    while (k > 0) {
-        k = (k - 1);
-        if (line_of(meta, k) != 0) {
-            return line_of(meta, k);
-        }
-    }
-    return 0;
-}
-
 pub fn fail(out: &mut [u8], nodes: &[u8], meta: &[u8], text: &[u8], i: usize, what: &'static str, a: usize, b: usize) -> i64 {
     let base: usize = (out.len() - MSG_ROOM);
     let mut q: usize = put_text(out, base, "t27b: verilog: unsupported construct ");
@@ -153,75 +76,6 @@ pub fn copy_msg(out: &mut [u8], at: usize, n: usize) -> usize {
     return (at + n);
 }
 
-pub fn to_front(out: &mut [u8], n: usize) -> i64 {
-    let base: usize = (out.len() - MSG_ROOM);
-    let mut k: usize = 0;
-    while (k < n) {
-        out[(k) as usize] = out[((base + k)) as usize];
-        k = (k + 1);
-    }
-    let ni: i64 = (n as _);
-    return (0 - ni);
-}
-
-pub fn child_holding(nodes: &[u8], c: usize, d: usize) -> usize {
-    let mut x: usize = (c + 1);
-    while (x < end(nodes, c)) {
-        if (d < end(nodes, x)) {
-            return x;
-        }
-        x = end(nodes, x);
-    }
-    return c;
-}
-
-pub fn parent_of(nodes: &[u8], root: usize, d: usize) -> usize {
-    let mut cur: usize = root;
-    while true {
-        let nx: usize = child_holding(nodes, cur, d);
-        if ((nx == d) || (nx == cur)) {
-            return cur;
-        }
-        cur = nx;
-    }
-    return cur;
-}
-
-pub fn in_scope(nodes: &[u8], item: usize, d: usize, u: usize) -> bool {
-    if ((d >= u) || (u < end(nodes, d))) {
-        return false;
-    }
-    let pb: usize = parent_of(nodes, item, d);
-    return (u < end(nodes, pb));
-}
-
-pub fn param_index(text: &[u8], meta: &[u8], ptext: &[u8], item: usize, a: usize, b: usize) -> i64 {
-    let pa: usize = params_lo(meta, item);
-    let pb: usize = params_hi(meta, item);
-    let mut k: usize = 0;
-    let mut s: usize = pa;
-    while (s < pb) {
-        let e: usize = line_stop(ptext, s, pb);
-        let c: usize = colon_at(ptext, s, e);
-        if (((c - s) == (b - a)) && has_at(ptext, s, c, &text[(a) as usize..(b) as usize])) {
-            let ki: i64 = (k as _);
-            return ki;
-        }
-        k = (k + 1);
-        s = (e + 1);
-    }
-    return -(1);
-}
-
-pub fn param_name_lo(meta: &[u8], ptext: &[u8], item: usize, k: usize) -> usize {
-    return param_at(ptext, params_lo(meta, item), params_hi(meta, item), k);
-}
-
-pub fn param_name_hi(meta: &[u8], ptext: &[u8], item: usize, k: usize) -> usize {
-    let s: usize = param_name_lo(meta, ptext, item, k);
-    return colon_at(ptext, s, line_stop(ptext, s, params_hi(meta, item)));
-}
-
 pub fn param_type(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, k: usize) -> i64 {
     let s: usize = param_name_lo(meta, ptext, item, k);
     let e: usize = line_stop(ptext, s, params_hi(meta, item));
@@ -232,49 +86,8 @@ pub fn param_type(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: us
     return type_code(ptext, (c + 1), e);
 }
 
-pub fn resolve(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, u: usize, a: usize, b: usize) -> i64 {
-    if (item > 0) {
-        let mut j: usize = u;
-        while (j > (item + 1)) {
-            j = (j - 1);
-            if ((kind(nodes, j) == K_STMT_LOCAL) && field_is(nodes, text, j, F_NAME, &text[(a) as usize..(b) as usize])) {
-                if in_scope(nodes, item, j, u) {
-                    let ji: i64 = (j as _);
-                    return ((SYM_LOCAL * SYM_UNIT) + ji);
-                }
-            }
-        }
-        if (kind(nodes, item) == K_FN_DECL) {
-            let pk: i64 = param_index(text, meta, ptext, item, a, b);
-            if (pk >= 0) {
-                return ((SYM_PARAM * SYM_UNIT) + pk);
-            }
-        }
-    }
-    let d: i64 = find_decl(nodes, text, a, b);
-    if (d != NO_NODE) {
-        return ((SYM_TOP * SYM_UNIT) + d);
-    }
-    let f: i64 = find_fn(nodes, text, a, b);
-    if (f != NO_NODE) {
-        return ((SYM_FN * SYM_UNIT) + f);
-    }
-    return NO_SYM;
-}
-
-pub fn sym_of(tag: i64, at: usize) -> i64 {
-    let ai: i64 = (at as _);
-    return ((tag * SYM_UNIT) + ai);
-}
-
 pub fn sym_tag(s: i64) -> i64 {
     return (s / SYM_UNIT);
-}
-
-pub fn sym_at(s: i64) -> usize {
-    let r: i64 = (s % SYM_UNIT);
-    let ru: usize = (r as _);
-    return ru;
 }
 
 pub fn named_type(nodes: &[u8], text: &[u8], a: usize, b: usize) -> i64 {
@@ -2628,41 +2441,6 @@ pub fn fail_front(out: &mut [u8], what: &'static str) -> i64 {
     return (0 - l);
 }
 
-pub fn tnode(buf: &mut [u8], i: usize, k: u8, e: usize, a: usize, b: usize) -> () {
-    buf[((i * REC)) as usize] = k;
-    vput32(buf, ((i * REC) + 4), e);
-    let mut f: usize = 0;
-    while (f < FIELDS) {
-        vput32(buf, (((i * REC) + 8) + (f * 8)), 0);
-        vput32(buf, (((i * REC) + 12) + (f * 8)), 0);
-        f = (f + 1);
-    }
-    vput32(buf, ((i * REC) + 8), a);
-    vput32(buf, ((i * REC) + 12), b);
-}
-
-pub fn tmeta(m: &mut [u8], i: usize, flags: usize, line: usize) -> () {
-    vput32(m, (i * META), flags);
-    vput32(m, ((i * META) + 4), line);
-    vput32(m, ((i * META) + 8), 0);
-    vput32(m, ((i * META) + 12), 0);
-}
-
-pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
-    let mut i: usize = 0;
-    while ((i + w.len()) <= n) {
-        let mut k: usize = 0;
-        while ((k < w.len()) && (out[((i + k)) as usize] == w.as_bytes()[(k) as usize])) {
-            k = (k + 1);
-        }
-        if (k == w.len()) {
-            return true;
-        }
-        i = (i + 1);
-    }
-    return false;
-}
-
 pub fn tied_counter(nb: &mut [u8], mb: &mut [u8], rv_in: bool, rv_lo: usize, rv_hi: usize, ev_lo: usize, ev_hi: usize) -> () {
     tnode(nb, 0, K_MODULE, 13, 0, 1);
     tnode(nb, 1, K_CONST_DECL, 3, 1, 2);
@@ -2859,6 +2637,228 @@ pub fn u32_at(nodes: &[u8], at: usize) -> usize {
     let b2: usize = (nodes[((at + 2)) as usize] as usize);
     let b3: usize = (nodes[((at + 3)) as usize] as usize);
     return (((b0 + (b1 * 256)) + (b2 * 65536)) + (b3 * 16777216));
+}
+
+pub const MSG_ROOM: usize = 400;
+
+pub const NAME_CAP: usize = 120;
+
+pub const NO_SYM: i64 = -1;
+
+pub const SYM_FN: i64 = 4;
+
+pub const SYM_LOCAL: i64 = 1;
+
+pub const SYM_PARAM: i64 = 2;
+
+pub const SYM_TOP: i64 = 3;
+
+pub const SYM_UNIT: i64 = 1099511627776;
+
+pub fn child_holding(nodes: &[u8], c: usize, d: usize) -> usize {
+    let mut x: usize = (c + 1);
+    while (x < end(nodes, c)) {
+        if (d < end(nodes, x)) {
+            return x;
+        }
+        x = end(nodes, x);
+    }
+    return c;
+}
+
+pub fn dec_len(v: u64) -> usize {
+    let mut n: usize = 1;
+    let mut x: u64 = v;
+    while (x >= 10) {
+        x = (x / 10);
+        n = (n + 1);
+    }
+    return n;
+}
+
+pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
+    let mut i: usize = 0;
+    while ((i + w.len()) <= n) {
+        let mut k: usize = 0;
+        while ((k < w.len()) && (out[((i + k)) as usize] == w.as_bytes()[(k) as usize])) {
+            k = (k + 1);
+        }
+        if (k == w.len()) {
+            return true;
+        }
+        i = (i + 1);
+    }
+    return false;
+}
+
+pub fn in_scope(nodes: &[u8], item: usize, d: usize, u: usize) -> bool {
+    if ((d >= u) || (u < end(nodes, d))) {
+        return false;
+    }
+    let pb: usize = parent_of(nodes, item, d);
+    return (u < end(nodes, pb));
+}
+
+pub fn line_near(nodes: &[u8], meta: &[u8], i: usize) -> usize {
+    let mut j: usize = i;
+    while (j < end(nodes, i)) {
+        if (line_of(meta, j) != 0) {
+            return line_of(meta, j);
+        }
+        j = (j + 1);
+    }
+    let mut k: usize = i;
+    while (k > 0) {
+        k = (k - 1);
+        if (line_of(meta, k) != 0) {
+            return line_of(meta, k);
+        }
+    }
+    return 0;
+}
+
+pub fn param_index(text: &[u8], meta: &[u8], ptext: &[u8], item: usize, a: usize, b: usize) -> i64 {
+    let pa: usize = params_lo(meta, item);
+    let pb: usize = params_hi(meta, item);
+    let mut k: usize = 0;
+    let mut s: usize = pa;
+    while (s < pb) {
+        let e: usize = line_stop(ptext, s, pb);
+        let c: usize = colon_at(ptext, s, e);
+        if (((c - s) == (b - a)) && has_at(ptext, s, c, &text[(a) as usize..(b) as usize])) {
+            let ki: i64 = (k as _);
+            return ki;
+        }
+        k = (k + 1);
+        s = (e + 1);
+    }
+    return -(1);
+}
+
+pub fn param_name_hi(meta: &[u8], ptext: &[u8], item: usize, k: usize) -> usize {
+    let s: usize = param_name_lo(meta, ptext, item, k);
+    return colon_at(ptext, s, line_stop(ptext, s, params_hi(meta, item)));
+}
+
+pub fn param_name_lo(meta: &[u8], ptext: &[u8], item: usize, k: usize) -> usize {
+    return param_at(ptext, params_lo(meta, item), params_hi(meta, item), k);
+}
+
+pub fn parent_of(nodes: &[u8], root: usize, d: usize) -> usize {
+    let mut cur: usize = root;
+    while true {
+        let nx: usize = child_holding(nodes, cur, d);
+        if ((nx == d) || (nx == cur)) {
+            return cur;
+        }
+        cur = nx;
+    }
+    return cur;
+}
+
+pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
+    let mut k: usize = a;
+    let mut q: usize = at;
+    while (k < b) {
+        out[(q) as usize] = s[(k) as usize];
+        q = (q + 1);
+        k = (k + 1);
+    }
+    return q;
+}
+
+pub fn put_dec(out: &mut [u8], at: usize, v: u64) -> usize {
+    let n: usize = dec_len(v);
+    let mut x: u64 = v;
+    let mut k: usize = n;
+    while (k > 0) {
+        let db: u8 = (((x % 10) + 48) as _);
+        out[(((at + k) - 1)) as usize] = db;
+        x = (x / 10);
+        k = (k - 1);
+    }
+    return (at + n);
+}
+
+pub fn put_ind(out: &mut [u8], at: usize, n: usize) -> usize {
+    let mut k: usize = 0;
+    while (k < n) {
+        out[((at + k)) as usize] = 32;
+        k = (k + 1);
+    }
+    return (at + n);
+}
+
+pub fn resolve(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, u: usize, a: usize, b: usize) -> i64 {
+    if (item > 0) {
+        let mut j: usize = u;
+        while (j > (item + 1)) {
+            j = (j - 1);
+            if ((kind(nodes, j) == K_STMT_LOCAL) && field_is(nodes, text, j, F_NAME, &text[(a) as usize..(b) as usize])) {
+                if in_scope(nodes, item, j, u) {
+                    let ji: i64 = (j as _);
+                    return ((SYM_LOCAL * SYM_UNIT) + ji);
+                }
+            }
+        }
+        if (kind(nodes, item) == K_FN_DECL) {
+            let pk: i64 = param_index(text, meta, ptext, item, a, b);
+            if (pk >= 0) {
+                return ((SYM_PARAM * SYM_UNIT) + pk);
+            }
+        }
+    }
+    let d: i64 = find_decl(nodes, text, a, b);
+    if (d != NO_NODE) {
+        return ((SYM_TOP * SYM_UNIT) + d);
+    }
+    let f: i64 = find_fn(nodes, text, a, b);
+    if (f != NO_NODE) {
+        return ((SYM_FN * SYM_UNIT) + f);
+    }
+    return NO_SYM;
+}
+
+pub fn sym_at(s: i64) -> usize {
+    let r: i64 = (s % SYM_UNIT);
+    let ru: usize = (r as _);
+    return ru;
+}
+
+pub fn sym_of(tag: i64, at: usize) -> i64 {
+    let ai: i64 = (at as _);
+    return ((tag * SYM_UNIT) + ai);
+}
+
+pub fn tmeta(m: &mut [u8], i: usize, flags: usize, line: usize) -> () {
+    vput32(m, (i * META), flags);
+    vput32(m, ((i * META) + 4), line);
+    vput32(m, ((i * META) + 8), 0);
+    vput32(m, ((i * META) + 12), 0);
+}
+
+pub fn tnode(buf: &mut [u8], i: usize, k: u8, e: usize, a: usize, b: usize) -> () {
+    buf[((i * REC)) as usize] = k;
+    vput32(buf, ((i * REC) + 4), e);
+    let mut f: usize = 0;
+    while (f < FIELDS) {
+        vput32(buf, (((i * REC) + 8) + (f * 8)), 0);
+        vput32(buf, (((i * REC) + 12) + (f * 8)), 0);
+        f = (f + 1);
+    }
+    vput32(buf, ((i * REC) + 8), a);
+    vput32(buf, ((i * REC) + 12), b);
+}
+
+pub fn to_front(out: &mut [u8], n: usize) -> i64 {
+    let base: usize = (out.len() - MSG_ROOM);
+    let mut k: usize = 0;
+    while (k < n) {
+        out[(k) as usize] = out[((base + k)) as usize];
+        k = (k + 1);
+    }
+    let ni: i64 = (n as _);
+    return (0 - ni);
 }
 
 pub fn put_text(out: &mut [u8], at: usize, w: &'static str) -> usize {
