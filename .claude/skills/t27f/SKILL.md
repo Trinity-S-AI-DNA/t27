@@ -59,6 +59,7 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Layer | Where | State |
 |---|---|---|
 | Spec -> graph IR schema (the core) | `specs/t27f/spec_graph.t27` (t27#10020) | spec with tests: node / edge kinds, labels, spans, `validate_graph`, line -> node mapping, node -> ui_plan widget, one hand-read fixture (`specs/tutorial/08_modules_and_arrays.t27`) |
+| Graph view: layout of a spec graph | `specs/t27f/spec_graph_view.t27` (t27#10034) | spec with tests: one column per node kind, size / colour / dash / row order from the inference label, UNKNOWN nodes alone in a band, every edge with a source line, node -> widget through `node_widget`; numbers only, laid out on the hand-read fixture; no host draws it yet |
 | Spec -> graph IR exporter | none yet | **missing**. `t27c` has no graph export; AST/IR audit is trinity#1650, pilot choice #1651 |
 | UI plan IR + trusted widget catalog | `specs/t27f/ui_plan.t27` (t27#9962) | spec with tests; no renderer draws a plan yet |
 | Honeycomb focus+context geometry | `specs/t27f/reel.t27` | spec; stills drawn by the MCP tool `t27f_view` |
