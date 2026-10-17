@@ -30,10 +30,10 @@ Read the spec through the t27 MCP server, which is already installed in Claude C
   gHashTag/t27 checkout instead. Say which one you used.
 
 From the source, take: `LENS_NAMES`, `LENS_QUESTIONS`, `STAGE_NAMES`, the four `*_WORDS`
-vocabularies, the five `*_BEES` lists, `MAX_ACTIVE_BEES`, and the functions `intake_verdict`,
-`map_verdict`, `initial_status`, `route`, `dispatch_allowed`, `required_evidence`,
-`evidence_accepted`, `verify`, `counts_as_progress`, `needs_human_approval`, `action_allowed`,
-`after_action`. Evaluate them as written; they are small and total.
+vocabularies and `KEYWORD_MATCH`, the five `*_BEES` lists, `MAX_ACTIVE_BEES`, `GAP_BEE`, and the
+functions `intake_verdict`, `map_verdict`, `initial_status`, `ground`, `route`, `dispatch_allowed`,
+`bee_target`, `required_evidence`, `evidence_accepted`, `verify`, `counts_as_progress`,
+`needs_human_approval`, `action_allowed`, `after_action`. Evaluate them as written; they are small and total.
 
 Everything in `DETERMINISTIC_STEPS` is decided by those functions, never by your judgement.
 You write only what `LLM_WRITES` names.
@@ -49,8 +49,8 @@ Apply `intake_verdict(has_topic, source_count)`:
 
 ## 2. Route
 
-Count whole-word, case-insensitive hits of the brief against each `*_WORDS` list. Show the four
-counts, then apply `route(content, engineering, research, sales)`. Name the domain and the Bee list
+Count the brief's hits against each `*_WORDS` list exactly as `KEYWORD_MATCH` says. Show the four
+counts and the words that hit, then apply `route(content, engineering, research, sales)`. Name the domain and the Bee list
 it allows. Do not override the result; if it looks wrong, the vocabulary in the spec is what needs a
 PR.
 
@@ -64,14 +64,21 @@ the sources. A claim with no source is not written; it becomes a gap.
 Print a table of 27 rows, lens-major (`step_lens`, `step_stage`): step, lens, stage, lesson title,
 source, status.
 
-- For each lesson, `grounded` means at least one source supports it.
-- Status from `initial_status(grounded, first_grounded)`. A GAP row says **GAP: needs a source on
-  <what>** and nothing else. Never invent filler to make the map look complete.
+- For each lesson, `grounded` means at least one source from intake supports it. Sources you find
+  yourself are not intake; they arrive through the Bee task in step 5 and `ground`.
+- A GAP row keeps its lesson title (titles are in `LLM_WRITES`); its source cell is empty.
+- Status from `initial_status(grounded, first_grounded)`; `first_grounded` is the grounded lesson
+  with the lowest step. A GAP row's status cell says **GAP: needs a source on <what>** and nothing
+  else. Never invent filler to make the map look complete.
 - Count grounded lessons per lens and report `map_verdict(...)`.
 
 ## 5. One Bee task
 
-Pick the first OPEN lesson. Check `dispatch_allowed(active_bees)`. Choose one capability from the
+Apply `bee_target(open_lessons)`. `TARGET_OPEN_LESSON`: take the first OPEN lesson.
+`TARGET_FIRST_GAP` (nothing is OPEN, as when intake was `INTAKE_NO_SOURCES`): take the first GAP, the
+capability is `GAP_BEE`, and the task is to find a source for it; once one is attached, apply
+`ground`. `active_bees` counts the Bees of this journey still working; at the start it is 0. Check
+`dispatch_allowed(active_bees)`. Choose one capability from the
 domain's Bee list and write one task for it:
 
 - goal (one sentence), input (the lesson and its sources), output (the artifact),
@@ -97,7 +104,9 @@ approved)`.
 
 - Publish, send to a client, any payment, anything destructive: ask the user in chat and wait for a
   clear yes. A yes covers that one action only.
-- Publishing or sending needs a VERIFIED item. A draft is never published.
+- Publishing needs a VERIFIED item. A draft is never published. Sending to a client also takes a
+  DRAFT, because a client approval is the only evidence that verifies a sales or content DELIVER
+  lesson; the draft stays a DRAFT (`after_action`) until that approval comes back.
 
 ## 8. Keep the three layers apart
 
