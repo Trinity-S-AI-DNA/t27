@@ -1,0 +1,611 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/file_io_contract.t27 -- the file I/O contract t27c would have to implement, written as
+; pure t27 over a byte array, plus a checkpoint format whose round trip is tested.
+; Part of gHashTag/t27#10024 (our own model), cell 24 "Heap and file I/O in t27c" and cell 18
+; "Data loader and checkpoint I/O"; issue #10077.
+
+; WHY: a trainer has to save its weights and read them back, and read a token stream. t27 has no
+; open, read, write or close, so there is nothing for a checkpoint spec to call. This file says
+; what those four calls MEAN, as functions a test can run today, so that when t27c lowers them to
+; the host (open/read/write/close on a real descriptor) there is an executable spec to hold the
+; lowering against: the same tests, run against the real thing.
+
+; THE MODEL: a "volume" is a caller-owned byte array `data` cut into NFILES slots of FILE_CAP
+; bytes, and `lens` holds each slot's length, -1 while the slot has never been written. A slot
+; number stands for a path. A Handle is a value: slot, mode, position. Every call takes the
+; handle and returns a new one in an IoResult together with a count and a code; nothing is
+; global and nothing traps. Rules the tests pin down:
+;   - open for read of a slot that does not exist: IO_ERR_NOENT; open for write creates the slot
+;     or truncates it to length 0;
+;   - read returns min(n, len - pos) bytes; at the end it returns 0 bytes and IO_OK;
+;   - write is all or nothing: a write that would pass FILE_CAP is IO_ERR_FULL, writes no byte
+;     and leaves the length as it was;
+;   - read on a write handle and write on a read handle are IO_ERR_MODE; any call on a closed
+;     handle, including a second close, is IO_ERR_BADHANDLE.
+
+; THE CHECKPOINT (format "T27C", defined here, not the trainer's old .bin): 16 header bytes, then
+; count f32 weights, then a 4-byte checksum. All integers are 4 bytes little endian.
+;   [0..4)   magic   84 50 55 67  ("T27C")
+;   [4..8)   version
+;   [8..12)  step
+;   [12..16) count   (number of f32 weights)
+;   [16..16+4*count)  weights, each the f32 bit pattern (@bitCast), so a round trip is exact
+;   [16+4*count..+4)  checksum: the sum of every byte before it
+; An f32 goes through @bitCast to u32 and back; the lab shows t27c compiles that today, so the
+; round trip needs no new float lowering.
+
+; WHAT IS NOT CLAIMED: this is a model, not the host. It does not touch a disk; it does not model
+; two handles on one slot, seek, rename, permissions, or a partial write after a crash (a write
+; that fails part-way leaves the bytes it wrote, and a reader catches that through SHORT or SUM).
+; Mapping the one HSLM checkpoint that survives (trinity data/wave9/worker-2/hslm_step_10000.bin)
+; onto this format is a separate step and is not done here.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module file_io_contract;
+
+pub const NFILES : i32 = 4;
+pub const FILE_CAP : i32 = 256;
+pub const VOLUME_BYTES : i32 = 1024;
+
+pub const MODE_CLOSED : i32 = 0;
+pub const MODE_READ : i32 = 1;
+pub const MODE_WRITE : i32 = 2;
+
+pub const IO_OK : i32 = 0;
+pub const IO_ERR_NOENT : i32 = 1;
+pub const IO_ERR_BADHANDLE : i32 = 2;
+pub const IO_ERR_MODE : i32 = 3;
+pub const IO_ERR_FULL : i32 = 4;
+pub const IO_ERR_ARG : i32 = 5;
+
+pub const CKPT_OK : i32 = 0;
+pub const CKPT_ERR_MAGIC : i32 = 20;
+pub const CKPT_ERR_SHORT : i32 = 21;
+pub const CKPT_ERR_SIZE : i32 = 22;
+pub const CKPT_ERR_SUM : i32 = 23;
+
+pub const HEADER_BYTES : i32 = 16;
+pub const MAGIC0 : u8 = 84;
+pub const MAGIC1 : u8 = 50;
+pub const MAGIC2 : u8 = 55;
+pub const MAGIC3 : u8 = 67;
+
+pub const Handle = struct {
+    slot : i32,
+    mode : i32,
+    pos : i32,
+};
+
+pub const IoResult = struct {
+    handle : Handle,
+    n : i32,
+    code : i32,
+};
+
+pub const CkptInfo = struct {
+    code : i32,
+    version : i32,
+    step : i32,
+    count : i32,
+};
+
+fn closed_handle() -> Handle {
+    return Handle{ .slot = -1, .mode = MODE_CLOSED, .pos = 0 };
+}
+
+fn io_fail(h: Handle, code: i32) -> IoResult {
+    return IoResult{ .handle = h, .n = 0, .code = code };
+}
+
+/// A new volume: every slot absent.
+pub fn vol_init(lens: []i32) -> void {
+    var i : usize = 0;
+    while (i < lens.len) {
+        lens[i] = -1;
+        i = i + 1;
+    }
+}
+
+pub fn io_open(lens: []i32, slot: i32, mode: i32) -> IoResult {
+    if (slot < 0) {
+        return io_fail(closed_handle(), IO_ERR_ARG);
+    }
+    if (slot >= NFILES) {
+        return io_fail(closed_handle(), IO_ERR_ARG);
+    }
+    if (mode == MODE_READ) {
+        if (lens[@intCast(slot)] < 0) {
+            return io_fail(closed_handle(), IO_ERR_NOENT);
+        }
+        return IoResult{ .handle = Handle{ .slot = slot, .mode = MODE_READ, .pos = 0 }, .n = 0, .code = IO_OK };
+    }
+    if (mode == MODE_WRITE) {
+        lens[@intCast(slot)] = 0;
+        return IoResult{ .handle = Handle{ .slot = slot, .mode = MODE_WRITE, .pos = 0 }, .n = 0, .code = IO_OK };
+    }
+    return io_fail(closed_handle(), IO_ERR_ARG);
+}
+
+/// Append n bytes of src at the handle's position. All or nothing.
+pub fn io_write(data: []u8, lens: []i32, h: Handle, src: []const u8, n: i32) -> IoResult {
+    if (h.mode == MODE_CLOSED) {
+        return io_fail(h, IO_ERR_BADHANDLE);
+    }
+    if (h.mode != MODE_WRITE) {
+        return io_fail(h, IO_ERR_MODE);
+    }
+    if (n < 0) {
+        return io_fail(h, IO_ERR_ARG);
+    }
+    if (n > FILE_CAP - h.pos) {
+        return io_fail(h, IO_ERR_FULL);
+    }
+    const base : i32 = h.slot * FILE_CAP + h.pos;
+    var i : i32 = 0;
+    while (i < n) {
+        data[@intCast(base + i)] = src[@intCast(i)];
+        i = i + 1;
+    }
+    lens[@intCast(h.slot)] = h.pos + n;
+    return IoResult{ .handle = Handle{ .slot = h.slot, .mode = MODE_WRITE, .pos = h.pos + n }, .n = n, .code = IO_OK };
+}
+
+/// Read up to n bytes into dst: min(n, len - pos). At the end it returns 0 bytes and IO_OK.
+pub fn io_read(data: []u8, lens: []i32, h: Handle, dst: []u8, n: i32) -> IoResult {
+    if (h.mode == MODE_CLOSED) {
+        return io_fail(h, IO_ERR_BADHANDLE);
+    }
+    if (h.mode != MODE_READ) {
+        return io_fail(h, IO_ERR_MODE);
+    }
+    if (n < 0) {
+        return io_fail(h, IO_ERR_ARG);
+    }
+    var take : i32 = lens[@intCast(h.slot)] - h.pos;
+    if (take > n) {
+        take = n;
+    }
+    const base : i32 = h.slot * FILE_CAP + h.pos;
+    var i : i32 = 0;
+    while (i < take) {
+        dst[@intCast(i)] = data[@intCast(base + i)];
+        i = i + 1;
+    }
+    return IoResult{ .handle = Handle{ .slot = h.slot, .mode = MODE_READ, .pos = h.pos + take }, .n = take, .code = IO_OK };
+}
+
+pub fn io_close(h: Handle) -> IoResult {
+    if (h.mode == MODE_CLOSED) {
+        return io_fail(h, IO_ERR_BADHANDLE);
+    }
+    return IoResult{ .handle = closed_handle(), .n = 0, .code = IO_OK };
+}
+
+pub fn io_size(lens: []const i32, slot: i32) -> i32 {
+    return lens[@intCast(slot)];
+}
+
+// ---- 4-byte little endian integers ----
+
+pub fn put_u32(buf: []u8, off: i32, v: u32) -> void {
+    var x : u32 = v;
+    var k : i32 = 0;
+    while (k < 4) {
+        buf[@intCast(off + k)] = @intCast(@mod(x, 256));
+        x = @divTrunc(x, 256);
+        k = k + 1;
+    }
+}
+
+pub fn get_u32(buf: []const u8, off: i32) -> u32 {
+    var x : u32 = 0;
+    var k : i32 = 3;
+    while (k >= 0) {
+        const b : u32 = @intCast(buf[@intCast(off + k)]);
+        x = x * 256 + b;
+        k = k - 1;
+    }
+    return x;
+}
+
+fn byte_sum(buf: []const u8, n: i32) -> u32 {
+    var s : u32 = 0;
+    var i : i32 = 0;
+    while (i < n) {
+        const b : u32 = @intCast(buf[@intCast(i)]);
+        s = s + b;
+        i = i + 1;
+    }
+    return s;
+}
+
+// ---- the checkpoint ----
+
+/// Write a checkpoint of the first count weights into slot. Returns CKPT_OK, or the IO code of
+/// the call that failed (the slot is then left with the bytes written so far).
+pub fn ckpt_write(data: []u8, lens: []i32, slot: i32, version: i32, step: i32, weights: []const f32, count: i32) -> i32 {
+    const o : IoResult = io_open(lens, slot, MODE_WRITE);
+    if (o.code != IO_OK) {
+        return o.code;
+    }
+    var h : Handle = o.handle;
+    var hdr : [16]u8 = undefined;
+    hdr[0] = MAGIC0;
+    hdr[1] = MAGIC1;
+    hdr[2] = MAGIC2;
+    hdr[3] = MAGIC3;
+    put_u32(&hdr, 4, @intCast(version));
+    put_u32(&hdr, 8, @intCast(step));
+    put_u32(&hdr, 12, @intCast(count));
+    var sum : u32 = byte_sum(&hdr, HEADER_BYTES);
+    const wh : IoResult = io_write(data, lens, h, &hdr, HEADER_BYTES);
+    if (wh.code != IO_OK) {
+        return wh.code;
+    }
+    h = wh.handle;
+    var word : [4]u8 = undefined;
+    var i : i32 = 0;
+    while (i < count) {
+        const bits : u32 = @bitCast(weights[@intCast(i)]);
+        put_u32(&word, 0, bits);
+        sum = sum + byte_sum(&word, 4);
+        const ww : IoResult = io_write(data, lens, h, &word, 4);
+        if (ww.code != IO_OK) {
+            return ww.code;
+        }
+        h = ww.handle;
+        i = i + 1;
+    }
+    put_u32(&word, 0, sum);
+    const ws : IoResult = io_write(data, lens, h, &word, 4);
+    if (ws.code != IO_OK) {
+        return ws.code;
+    }
+    const c : IoResult = io_close(ws.handle);
+    return c.code;
+}
+
+fn info_fail(code: i32) -> CkptInfo {
+    return CkptInfo{ .code = code, .version = 0, .step = 0, .count = 0 };
+}
+
+/// Read the checkpoint in slot into out (room for max weights). On any error out may hold the
+/// weights read so far and the code says why; on CKPT_OK the file was complete and its checksum matched.
+pub fn ckpt_read(data: []u8, lens: []i32, slot: i32, out: []f32, max: i32) -> CkptInfo {
+    const o : IoResult = io_open(lens, slot, MODE_READ);
+    if (o.code != IO_OK) {
+        return info_fail(o.code);
+    }
+    var hdr : [16]u8 = undefined;
+    const rh : IoResult = io_read(data, lens, o.handle, &hdr, HEADER_BYTES);
+    if (rh.code != IO_OK) {
+        return info_fail(rh.code);
+    }
+    if (rh.n < HEADER_BYTES) {
+        return info_fail(CKPT_ERR_SHORT);
+    }
+    if (hdr[0] != MAGIC0 or hdr[1] != MAGIC1 or hdr[2] != MAGIC2 or hdr[3] != MAGIC3) {
+        return info_fail(CKPT_ERR_MAGIC);
+    }
+    const count_u : u32 = get_u32(&hdr, 12);
+    const max_u : u32 = @intCast(max);
+    if (count_u > max_u) {
+        return info_fail(CKPT_ERR_SIZE);
+    }
+    const count : i32 = @intCast(count_u);
+    var sum : u32 = byte_sum(&hdr, HEADER_BYTES);
+    var h : Handle = rh.handle;
+    var word : [4]u8 = undefined;
+    var i : i32 = 0;
+    while (i < count) {
+        const rw : IoResult = io_read(data, lens, h, &word, 4);
+        if (rw.code != IO_OK) {
+            return info_fail(rw.code);
+        }
+        if (rw.n < 4) {
+            return info_fail(CKPT_ERR_SHORT);
+        }
+        h = rw.handle;
+        sum = sum + byte_sum(&word, 4);
+        out[@intCast(i)] = @bitCast(get_u32(&word, 0));
+        i = i + 1;
+    }
+    const rs : IoResult = io_read(data, lens, h, &word, 4);
+    if (rs.code != IO_OK) {
+        return info_fail(rs.code);
+    }
+    if (rs.n < 4) {
+        return info_fail(CKPT_ERR_SHORT);
+    }
+    if (get_u32(&word, 0) != sum) {
+        return info_fail(CKPT_ERR_SUM);
+    }
+    const c : IoResult = io_close(rs.handle);
+    if (c.code != IO_OK) {
+        return info_fail(c.code);
+    }
+    return CkptInfo{ .code = CKPT_OK, .version = @intCast(get_u32(&hdr, 4)), .step = @intCast(get_u32(&hdr, 8)), .count = count };
+}
+
+// ---- helpers that exist only so the tests go through function calls ----
+
+fn zero_volume(data: []u8, lens: []i32) -> void {
+    var i : usize = 0;
+    while (i < data.len) {
+        data[i] = 0;
+        i = i + 1;
+    }
+    vol_init(lens);
+}
+
+/// Twelve weights chosen to be awkward: fractions that are not exact in binary, a negative, a
+/// tiny and a huge value, zero, and a value near the f32 maximum.
+fn fill_weights(w: []f32) -> void {
+    const src : [12]f32 = [0.1, -2.5, 1.0e-8, 3.0e30, 0.0, 0.333333, -0.7, 1.5, 65504.0, -1.0e-30, 123456.789, 3.4e38];
+    var i : usize = 0;
+    while (i < 12) {
+        w[i] = src[i];
+        i = i + 1;
+    }
+}
+
+/// How many of the first n weights differ in BIT PATTERN between a and b. 0 means an exact copy.
+fn bit_mismatches(a: []const f32, b: []const f32, n: i32) -> i32 {
+    var bad : i32 = 0;
+    var i : i32 = 0;
+    while (i < n) {
+        const x : u32 = @bitCast(a[@intCast(i)]);
+        const y : u32 = @bitCast(b[@intCast(i)]);
+        if (x != y) {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+/// Write five bytes, read 3 then 10 then 10 again; returns 100*first + 10*second + third, the
+/// byte counts, so the end-of-file behaviour is one number: 3, 2, 0 -> 320.
+fn read_pattern() -> i32 {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var src : [5]u8 = [1, 2, 3, 4, 5];
+    var dst : [10]u8 = undefined;
+    const o : IoResult = io_open(&lens, 2, MODE_WRITE);
+    const w : IoResult = io_write(&data, &lens, o.handle, &src, 5);
+    const closed : IoResult = io_close(w.handle);
+    const r : IoResult = io_open(&lens, 2, MODE_READ);
+    const a : IoResult = io_read(&data, &lens, r.handle, &dst, 3);
+    const b : IoResult = io_read(&data, &lens, a.handle, &dst, 10);
+    const c : IoResult = io_read(&data, &lens, b.handle, &dst, 10);
+    return 100 * a.n + 10 * b.n + c.n;
+}
+
+test little_endian_words_round_trip {
+    var buf : [8]u8 = undefined;
+    put_u32(&buf, 2, 305419896);
+    // 0x12345678 little endian
+    assert buf[2] == 120;
+    assert buf[3] == 86;
+    assert buf[4] == 52;
+    assert buf[5] == 18;
+    assert get_u32(&buf, 2) == 305419896;
+    put_u32(&buf, 0, 4294967295);
+    assert get_u32(&buf, 0) == 4294967295;
+    put_u32(&buf, 4, 0);
+    assert get_u32(&buf, 4) == 0;
+}
+
+test open_read_write_close_is_a_state_machine {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    // an absent slot cannot be opened for reading
+    assert io_open(&lens, 1, MODE_READ).code == IO_ERR_NOENT;
+    // a slot outside the volume, and an unknown mode, are argument errors
+    assert io_open(&lens, 4, MODE_WRITE).code == IO_ERR_ARG;
+    assert io_open(&lens, -1, MODE_WRITE).code == IO_ERR_ARG;
+    assert io_open(&lens, 1, 7).code == IO_ERR_ARG;
+    // open for write creates the slot, empty
+    const o : IoResult = io_open(&lens, 1, MODE_WRITE);
+    assert o.code == IO_OK;
+    assert o.handle.mode == MODE_WRITE;
+    assert o.handle.pos == 0;
+    assert io_size(&lens, 1) == 0;
+    var src : [3]u8 = [7, 8, 9];
+    const w : IoResult = io_write(&data, &lens, o.handle, &src, 3);
+    assert w.code == IO_OK;
+    assert w.n == 3;
+    assert w.handle.pos == 3;
+    assert io_size(&lens, 1) == 3;
+    // the bytes sit in slot 1: offset 1 * FILE_CAP
+    assert data[256] == 7;
+    assert data[258] == 9;
+    assert data[0] == 0;
+    const c : IoResult = io_close(w.handle);
+    assert c.code == IO_OK;
+    assert c.handle.mode == MODE_CLOSED;
+}
+
+test read_stops_at_the_end_without_an_error {
+    // 5 bytes written; reads of 3, 10, 10 return 3, 2, 0
+    assert read_pattern() == 320;
+}
+
+test the_wrong_mode_or_a_closed_handle_is_an_error {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var src : [2]u8 = [1, 2];
+    var dst : [2]u8 = undefined;
+    const ow : IoResult = io_open(&lens, 0, MODE_WRITE);
+    // read on a write handle
+    assert io_read(&data, &lens, ow.handle, &dst, 1).code == IO_ERR_MODE;
+    const cw : IoResult = io_close(ow.handle);
+    // a closed handle, and a second close
+    assert io_write(&data, &lens, cw.handle, &src, 1).code == IO_ERR_BADHANDLE;
+    assert io_close(cw.handle).code == IO_ERR_BADHANDLE;
+    assert io_read(&data, &lens, cw.handle, &dst, 1).code == IO_ERR_BADHANDLE;
+    // write on a read handle
+    const orr : IoResult = io_open(&lens, 0, MODE_READ);
+    assert orr.code == IO_OK;
+    assert io_write(&data, &lens, orr.handle, &src, 1).code == IO_ERR_MODE;
+    // a negative count is an argument error
+    assert io_read(&data, &lens, orr.handle, &dst, -1).code == IO_ERR_ARG;
+}
+
+test a_write_past_the_slot_is_all_or_nothing {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var chunk : [200]u8 = undefined;
+    var i : usize = 0;
+    while (i < 200) {
+        chunk[i] = 5;
+        i = i + 1;
+    }
+    const o : IoResult = io_open(&lens, 0, MODE_WRITE);
+    const w1 : IoResult = io_write(&data, &lens, o.handle, &chunk, 200);
+    assert w1.code == IO_OK;
+    // 200 + 57 > 256: refused, nothing written, length unchanged
+    const w2 : IoResult = io_write(&data, &lens, w1.handle, &chunk, 57);
+    assert w2.code == IO_ERR_FULL;
+    assert w2.n == 0;
+    assert io_size(&lens, 0) == 200;
+    assert data[200] == 0;
+    // exactly the 56 bytes that remain fit
+    const w3 : IoResult = io_write(&data, &lens, w1.handle, &chunk, 56);
+    assert w3.code == IO_OK;
+    assert io_size(&lens, 0) == 256;
+    // and slot 1 was not touched by the first slot filling up
+    assert data[256] == 0;
+}
+
+test a_checkpoint_round_trips_exactly {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var w : [12]f32 = undefined;
+    fill_weights(&w);
+    const code : i32 = ckpt_write(&data, &lens, 0, 3, 10000, &w, 12);
+    assert code == CKPT_OK;
+    // 16 header + 12 * 4 weights + 4 checksum
+    assert io_size(&lens, 0) == 68;
+    // the header is in the file: magic "T27C", then version 3
+    assert data[0] == 84;
+    assert data[3] == 67;
+    assert data[4] == 3;
+    var back : [12]f32 = undefined;
+    const info : CkptInfo = ckpt_read(&data, &lens, 0, &back, 12);
+    assert info.code == CKPT_OK;
+    assert info.version == 3;
+    assert info.step == 10000;
+    assert info.count == 12;
+    assert bit_mismatches(&w, &back, 12) == 0;
+    // a spot value, to show the comparison is not trivially true
+    assert back[1] == -2.5;
+    assert back[10] == 123456.789;
+}
+
+test the_bit_comparison_can_fail {
+    // a negative control: a one-bit difference is seen
+    var a : [12]f32 = undefined;
+    var b : [12]f32 = undefined;
+    fill_weights(&a);
+    fill_weights(&b);
+    assert bit_mismatches(&a, &b, 12) == 0;
+    b[4] = -0.0;
+    // 0.0 == -0.0 as numbers, but the bit patterns differ
+    assert b[4] == a[4];
+    assert bit_mismatches(&a, &b, 12) == 1;
+    b[7] = 1.5000001;
+    assert bit_mismatches(&a, &b, 12) == 2;
+}
+
+test a_second_write_truncates_and_slots_are_independent {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var w : [12]f32 = undefined;
+    fill_weights(&w);
+    assert ckpt_write(&data, &lens, 0, 1, 100, &w, 12) == CKPT_OK;
+    assert ckpt_write(&data, &lens, 1, 2, 200, &w, 5) == CKPT_OK;
+    // overwrite slot 0 with three weights: the file is now 16 + 12 + 4 = 32 bytes
+    assert ckpt_write(&data, &lens, 0, 9, 300, &w, 3) == CKPT_OK;
+    assert io_size(&lens, 0) == 32;
+    var back : [12]f32 = undefined;
+    const i0 : CkptInfo = ckpt_read(&data, &lens, 0, &back, 12);
+    assert i0.code == CKPT_OK;
+    assert i0.version == 9;
+    assert i0.step == 300;
+    assert i0.count == 3;
+    assert bit_mismatches(&w, &back, 3) == 0;
+    const i1 : CkptInfo = ckpt_read(&data, &lens, 1, &back, 12);
+    assert i1.code == CKPT_OK;
+    assert i1.version == 2;
+    assert i1.step == 200;
+    assert i1.count == 5;
+    assert bit_mismatches(&w, &back, 5) == 0;
+}
+
+test a_damaged_checkpoint_is_refused {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    var w : [12]f32 = undefined;
+    fill_weights(&w);
+    assert ckpt_write(&data, &lens, 0, 1, 100, &w, 12) == CKPT_OK;
+    var back : [12]f32 = undefined;
+    // a flipped payload byte: checksum mismatch
+    data[20] = data[20] + 1;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_ERR_SUM;
+    data[20] = data[20] - 1;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_OK;
+    // a flipped checksum byte
+    data[64] = data[64] + 1;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_ERR_SUM;
+    data[64] = data[64] - 1;
+    // a bad magic
+    data[1] = 0;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_ERR_MAGIC;
+    data[1] = 50;
+    // a truncated file: one byte short of the checksum
+    lens[0] = 67;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_ERR_SHORT;
+    // truncated inside the header
+    lens[0] = 10;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_ERR_SHORT;
+    lens[0] = 68;
+    // room for fewer weights than the file holds
+    assert ckpt_read(&data, &lens, 0, &back, 11).code == CKPT_ERR_SIZE;
+    // a slot that was never written
+    assert ckpt_read(&data, &lens, 3, &back, 12).code == IO_ERR_NOENT;
+    assert ckpt_read(&data, &lens, 0, &back, 12).code == CKPT_OK;
+}
+
+test a_checkpoint_too_big_for_a_slot_is_a_code {
+    var data : [1024]u8 = undefined;
+    var lens : [4]i32 = undefined;
+    zero_volume(&data, &lens);
+    // a slot holds 256 bytes: 16 header + 4 per weight + 4 checksum
+    var big : [64]f32 = undefined;
+    var i : usize = 0;
+    while (i < 64) {
+        big[i] = 1.0;
+        i = i + 1;
+    }
+    // 59 weights: 16 + 236 + 4 = 256 exactly fits
+    assert ckpt_write(&data, &lens, 2, 1, 1, &big, 59) == CKPT_OK;
+    assert io_size(&lens, 2) == 256;
+    // 60 weights: 260 bytes, the checksum word does not fit
+    assert ckpt_write(&data, &lens, 2, 1, 1, &big, 60) == IO_ERR_FULL;
+    var back : [64]f32 = undefined;
+    // the half-written slot is not a valid checkpoint
+    assert ckpt_read(&data, &lens, 2, &back, 64).code != CKPT_OK;
+}
+
+invariant a_checkpoint_has_a_fixed_overhead {
+    assert HEADER_BYTES + 4 == 20;
+    assert NFILES * FILE_CAP == VOLUME_BYTES;
+}
