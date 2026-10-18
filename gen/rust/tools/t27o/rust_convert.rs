@@ -110,7 +110,17 @@ pub const DCAP: usize = 64;
 
 pub const STATE: usize = 51;
 
-pub const NAMES: usize = 51;
+pub const IXHIT: usize = 51;
+
+pub const IXON: usize = 52;
+
+pub const IXB: usize = 53;
+
+pub const IXBN: usize = 54;
+
+pub const IXTOP: usize = 55;
+
+pub const NAMES: usize = 56;
 
 pub const NAME_SLOTS: usize = 5;
 
@@ -903,7 +913,11 @@ pub fn add_name(src: &[u8], st: &mut [usize], kind: usize, lo: usize, hi: usize,
         k = (k + 1);
     }
     let e: usize = (NAMES + (st[(NNAMES) as usize] * NAME_SLOTS));
-    if ((e + NAME_SLOTS) > st.len()) {
+    let mut lim: usize = st.len();
+    if (st[(IXON) as usize] == 1) {
+        lim = st[(IXTOP) as usize];
+    }
+    if ((e + NAME_SLOTS) > lim) {
         return ();
     }
     st[(e) as usize] = lo;
@@ -940,6 +954,137 @@ pub fn strloc_in(src: &[u8], st: &mut [usize], a: usize, b: usize) -> bool {
     }
     st[(HIT) as usize] = 0;
     return false;
+}
+
+pub const IX_STRUCT: usize = 0;
+
+pub const IX_CONST: usize = 1;
+
+pub const IX_FN: usize = 2;
+
+pub const IX_SLOTS: usize = 4;
+
+pub fn ix_hash(src: &[u8], a: usize, b: usize) -> usize {
+    let mut h: usize = 0;
+    let mut k: usize = a;
+    while (k < b) {
+        h = ((((h * 31) + (src[(k) as usize] as usize)) + 1) % 1000003);
+        k = (k + 1);
+    }
+    return h;
+}
+
+pub fn ix_get(src: &[u8], st: &mut [usize], kind: usize, a: usize, b: usize) -> usize {
+    st[(IXHIT) as usize] = 0;
+    if (b <= a) {
+        return src.len();
+    }
+    let bn: usize = st[(IXBN) as usize];
+    let mut s: usize = st[(((st[(IXB) as usize] + (kind * bn)) + (ix_hash(src, a, b) % bn))) as usize];
+    while (s != 0) {
+        if same_text(src, st[(s) as usize], st[((s + 1)) as usize], a, b) {
+            st[(IXHIT) as usize] = s;
+            return st[((s + 2)) as usize];
+        }
+        s = st[((s + 3)) as usize];
+    }
+    return src.len();
+}
+
+pub fn ix_put(src: &[u8], st: &mut [usize], kind: usize, lo: usize, hi: usize, val: usize) -> bool {
+    if (hi <= lo) {
+        return true;
+    }
+    let bn: usize = st[(IXBN) as usize];
+    let b: usize = ((st[(IXB) as usize] + (kind * bn)) + (ix_hash(src, lo, hi) % bn));
+    let mut s: usize = st[(b) as usize];
+    while (s != 0) {
+        if same_text(src, st[(s) as usize], st[((s + 1)) as usize], lo, hi) {
+            return true;
+        }
+        s = st[((s + 3)) as usize];
+    }
+    if (st[(IXTOP) as usize] < ((NAMES + ((st.len() - NAMES) / 2)) + IX_SLOTS)) {
+        return false;
+    }
+    let e: usize = (st[(IXTOP) as usize] - IX_SLOTS);
+    st[(e) as usize] = lo;
+    st[((e + 1)) as usize] = hi;
+    st[((e + 2)) as usize] = val;
+    st[((e + 3)) as usize] = st[(b) as usize];
+    st[(b) as usize] = e;
+    st[(IXTOP) as usize] = e;
+    return true;
+}
+
+pub fn index_decls(src: &[u8], st: &mut [usize]) -> () {
+    st[(IXON) as usize] = 0;
+    st[(IXHIT) as usize] = 0;
+    st[(IXTOP) as usize] = st.len();
+    if (st.len() < (NAMES + 64)) {
+        return ();
+    }
+    let mut bn: usize = (src.len() / 512);
+    if (bn > ((st.len() - NAMES) / 64)) {
+        bn = ((st.len() - NAMES) / 64);
+    }
+    if (bn < 1) {
+        bn = 1;
+    }
+    let top: usize = (st.len() - (3 * bn));
+    let mut z: usize = top;
+    while (z < st.len()) {
+        st[(z) as usize] = 0;
+        z = (z + 1);
+    }
+    st[(IXB) as usize] = top;
+    st[(IXBN) as usize] = bn;
+    st[(IXTOP) as usize] = top;
+    let mut whole: bool = true;
+    let mut q: usize = skip_ws(src, 0);
+    while ((q < src.len()) && whole) {
+        let e: usize = tok_end(src, q);
+        if word_is(src, q, e, b"struct") {
+            let mut n: usize = skip_ws(src, e);
+            let ne: usize = tok_end(src, n);
+            let lb: usize = skip_ws(src, ne);
+            if (tok_is(src, lb, b"{") && !(ix_put(src, st, IX_STRUCT, n, ne, lb))) {
+                whole = false;
+            }
+        }
+        if (word_is(src, q, e, b"const") || word_is(src, q, e, b"static")) {
+            let mut n: usize = skip_ws(src, e);
+            if tok_is(src, n, b"mut") {
+                n = skip_ws(src, tok_end(src, n));
+            }
+            let ne: usize = tok_end(src, n);
+            let c: usize = skip_ws(src, ne);
+            if (tok_is(src, c, b":") && !(ix_put(src, st, IX_CONST, n, ne, skip_ws(src, (c + 1))))) {
+                whole = false;
+            }
+        }
+        if word_is(src, q, e, b"fn") {
+            let mut n: usize = skip_ws(src, e);
+            let ne: usize = tok_end(src, n);
+            let lp: usize = find_at(src, ne, B_LPAREN);
+            if (lp < src.len()) {
+                let r: usize = skip_ws(src, block_end(src, lp));
+                let mut v: usize = src.len();
+                if tok_is(src, r, b"->") {
+                    v = skip_ws(src, tok_end(src, r));
+                }
+                if !(ix_put(src, st, IX_FN, n, ne, v)) {
+                    whole = false;
+                }
+            }
+        }
+        q = skip_ws(src, e);
+    }
+    if whole {
+        st[(IXON) as usize] = 1;
+    } else {
+        st[(IXTOP) as usize] = st.len();
+    }
 }
 
 pub fn record_fns(src: &[u8], st: &mut [usize], lo: usize, hi: usize, olo: usize, ohi: usize) -> () {
@@ -2093,7 +2238,14 @@ pub fn method_owner(src: &[u8], st: &mut [usize], na: usize, nb: usize, ola: usi
     return false;
 }
 
-pub fn const_type(src: &[u8], a: usize, b: usize) -> usize {
+pub fn const_type(src: &[u8], st: &mut [usize], a: usize, b: usize) -> usize {
+    if (st[(IXON) as usize] == 1) {
+        return ix_get(src, st, IX_CONST, a, b);
+    }
+    return const_type_scan(src, a, b);
+}
+
+pub fn const_type_scan(src: &[u8], a: usize, b: usize) -> usize {
     let mut q: usize = skip_ws(src, 0);
     while (q < src.len()) {
         let e: usize = tok_end(src, q);
@@ -2113,7 +2265,14 @@ pub fn const_type(src: &[u8], a: usize, b: usize) -> usize {
     return src.len();
 }
 
-pub fn fn_ret_type(src: &[u8], a: usize, b: usize) -> usize {
+pub fn fn_ret_type(src: &[u8], st: &mut [usize], a: usize, b: usize) -> usize {
+    if (st[(IXON) as usize] == 1) {
+        return ix_get(src, st, IX_FN, a, b);
+    }
+    return fn_ret_type_scan(src, a, b);
+}
+
+pub fn fn_ret_type_scan(src: &[u8], a: usize, b: usize) -> usize {
     let mut q: usize = skip_ws(src, 0);
     while (q < src.len()) {
         let e: usize = tok_end(src, q);
@@ -2135,7 +2294,7 @@ pub fn fn_ret_type(src: &[u8], a: usize, b: usize) -> usize {
 }
 
 pub fn unit_result_fn(src: &[u8], st: &mut [usize], a: usize, b: usize) -> bool {
-    let r: usize = fn_ret_type(src, a, b);
+    let r: usize = fn_ret_type(src, st, a, b);
     let re: usize = tok_end(src, r);
     if ((r >= src.len()) || !((word_is(src, r, re, b"Result") || named(src, st, K_RALIAS, r, re)))) {
         return false;
@@ -2214,7 +2373,7 @@ pub fn literal_class(src: &[u8], st: &mut [usize], q: usize) -> u8 {
 
 pub fn name_class(src: &[u8], st: &mut [usize], a: usize, b: usize, field: bool) -> u8 {
     if field {
-        let lb: usize = find_struct(src, st[(ILO) as usize], st[(IHI) as usize]);
+        let lb: usize = find_struct(src, st, st[(ILO) as usize], st[(IHI) as usize]);
         if (lb >= src.len()) {
             return C_ANY;
         }
@@ -2231,7 +2390,7 @@ pub fn name_class(src: &[u8], st: &mut [usize], a: usize, b: usize, field: bool)
     if (d < src.len()) {
         return type_class(src, st, d);
     }
-    let c: usize = const_type(src, a, b);
+    let c: usize = const_type(src, st, a, b);
     if (c < src.len()) {
         return type_class(src, st, c);
     }
@@ -2270,7 +2429,7 @@ pub fn name_class(src: &[u8], st: &mut [usize], a: usize, b: usize, field: bool)
         }
         let ie: usize = tok_end(src, init);
         if tok_is(src, skip_ws(src, ie), b"(") {
-            let r2: usize = fn_ret_type(src, init, ie);
+            let r2: usize = fn_ret_type(src, st, init, ie);
             if (r2 < src.len()) {
                 return type_class(src, st, r2);
             }
@@ -2305,7 +2464,14 @@ pub fn name_class(src: &[u8], st: &mut [usize], a: usize, b: usize, field: bool)
     return C_ANY;
 }
 
-pub fn find_struct(src: &[u8], a: usize, b: usize) -> usize {
+pub fn find_struct(src: &[u8], st: &mut [usize], a: usize, b: usize) -> usize {
+    if (st[(IXON) as usize] == 1) {
+        return ix_get(src, st, IX_STRUCT, a, b);
+    }
+    return find_struct_scan(src, a, b);
+}
+
+pub fn find_struct_scan(src: &[u8], a: usize, b: usize) -> usize {
     let mut q: usize = skip_ws(src, 0);
     while (q < src.len()) {
         let e: usize = tok_end(src, q);
@@ -2322,7 +2488,7 @@ pub fn find_struct(src: &[u8], a: usize, b: usize) -> usize {
 pub fn field_of_class(src: &[u8], st: &mut [usize], xa: usize, xe: usize, fa: usize, fe: usize) -> u8 {
     let mut d: usize = decl_type(src, st[(FLO) as usize], xa, xa, xe);
     if (d >= src.len()) {
-        d = const_type(src, xa, xe);
+        d = const_type(src, st, xa, xe);
     }
     if (d >= src.len()) {
         return C_ANY;
@@ -2340,7 +2506,7 @@ pub fn field_of_class(src: &[u8], st: &mut [usize], xa: usize, xe: usize, fa: us
     if ((d >= src.len()) || !(is_upper(src[(d) as usize]))) {
         return C_ANY;
     }
-    let lb: usize = find_struct(src, d, de);
+    let lb: usize = find_struct(src, st, d, de);
     if (lb >= src.len()) {
         return C_ANY;
     }
@@ -2457,7 +2623,7 @@ pub fn recv_class(src: &[u8], st: &mut [usize], ra: usize, rb: usize) -> u8 {
         if unit_result_fn(src, st, ra, e) {
             return C_BOOL;
         }
-        let r: usize = fn_ret_type(src, ra, e);
+        let r: usize = fn_ret_type(src, st, ra, e);
         if (r < src.len()) {
             return type_class(src, st, r);
         }
@@ -2476,7 +2642,7 @@ pub fn recv_class(src: &[u8], st: &mut [usize], ra: usize, rb: usize) -> u8 {
         } else {
             if ((is_alpha(src[(q) as usize]) && !(tok_is(src, prev, b"."))) && !(tok_is(src, prev, b"::"))) {
                 if tok_is(src, skip_ws(src, qe), b"(") {
-                    let r2: usize = fn_ret_type(src, q, qe);
+                    let r2: usize = fn_ret_type(src, st, q, qe);
                     if (r2 < src.len()) {
                         k = type_class(src, st, r2);
                     }
@@ -2563,7 +2729,7 @@ pub fn lit_at(src: &[u8], q: usize) -> bool {
     return (((src[(q) as usize] == B_LOWER_B) && ((q + 1) < src.len())) && ((src[((q + 1)) as usize] == B_QUOTE) || (src[((q + 1)) as usize] == B_APOS)));
 }
 
-pub fn head_struct(src: &[u8], flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
+pub fn head_struct(src: &[u8], st: &mut [usize], flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
     if word_is(src, xa, xe, b"self") {
         if (ilo == ihi) {
             return src.len();
@@ -2572,7 +2738,7 @@ pub fn head_struct(src: &[u8], flo: usize, ilo: usize, ihi: usize, xa: usize, xe
     }
     let mut d: usize = decl_type(src, flo, xa, xa, xe);
     if (d >= src.len()) {
-        d = const_type(src, xa, xe);
+        d = const_type(src, st, xa, xe);
     }
     if (d >= src.len()) {
         d = let_owner(src, xa, xe);
@@ -2724,7 +2890,7 @@ pub fn chain_class(src: &[u8], st: &mut [usize], a: usize, b: usize, deep: bool)
         return name_class(src, st, na, nb, false);
     }
     if (((kind == CK_FIELD) && (dots == 1)) && plain) {
-        let o: usize = head_struct(src, st[(FLO) as usize], st[(ILO) as usize], st[(IHI) as usize], xa, xe);
+        let o: usize = head_struct(src, st, st[(FLO) as usize], st[(ILO) as usize], st[(IHI) as usize], xa, xe);
         if (o >= src.len()) {
             return C_ANY;
         }
@@ -2748,7 +2914,7 @@ pub fn chain_class(src: &[u8], st: &mut [usize], a: usize, b: usize, deep: bool)
         return type_class(src, st, f);
     }
     if (kind == CK_PATH) {
-        let c: usize = const_type(src, na, nb);
+        let c: usize = const_type(src, st, na, nb);
         if (c < src.len()) {
             return type_class(src, st, c);
         }
@@ -3071,8 +3237,8 @@ pub fn unroll_contains(src: &[u8], st: &mut [usize], out: &mut [u8], start: usiz
     if (((ra < src.len()) && (src[(ra) as usize] == B_LBRACKET)) && (skip_ws(src, block_end(src, ra)) >= rb)) {
         lb = ra;
     }
-    if ((((ra < src.len()) && is_alpha(src[(ra) as usize])) && (skip_ws(src, re) >= rb)) && (const_type(src, ra, re) < src.len())) {
-        let t: usize = const_type(src, ra, re);
+    if ((((ra < src.len()) && is_alpha(src[(ra) as usize])) && (skip_ws(src, re) >= rb)) && (const_type(src, st, ra, re) < src.len())) {
+        let t: usize = const_type(src, st, ra, re);
         let eq: usize = find_at(src, t, B_EQ);
         if (eq < src.len()) {
             let v: usize = skip_ws(src, (eq + 1));
@@ -5509,7 +5675,7 @@ pub fn struct_value(src: &[u8], st: &mut [usize], e: usize) -> bool {
     let mut n: usize = e;
     let mut ne: usize = tok_end(src, n);
     let mut nx: usize = skip_ws(src, ne);
-    if ((is_upper(src[(n) as usize]) && (tok_is(src, nx, b"{") || tok_is(src, nx, b"("))) && ((find_struct(src, n, ne) < src.len()) || named(src, st, K_TUPLE, n, ne))) {
+    if ((is_upper(src[(n) as usize]) && (tok_is(src, nx, b"{") || tok_is(src, nx, b"("))) && ((find_struct(src, st, n, ne) < src.len()) || named(src, st, K_TUPLE, n, ne))) {
         return true;
     }
     if (tok_is(src, nx, b"::") || tok_is(src, nx, b".")) {
@@ -5520,15 +5686,15 @@ pub fn struct_value(src: &[u8], st: &mut [usize], e: usize) -> bool {
     if !(tok_is(src, nx, b"(")) {
         return false;
     }
-    let r: usize = fn_ret_type(src, n, ne);
+    let r: usize = fn_ret_type(src, st, n, ne);
     if (r >= src.len()) {
         return false;
     }
     let re: usize = tok_end(src, r);
     if (word_is(src, r, re, b"Self") && impl_around(src, st, r)) {
-        return ((find_struct(src, st[(OLO) as usize], st[(OHI) as usize]) < src.len()) || named(src, st, K_TUPLE, st[(OLO) as usize], st[(OHI) as usize]));
+        return ((find_struct(src, st, st[(OLO) as usize], st[(OHI) as usize]) < src.len()) || named(src, st, K_TUPLE, st[(OLO) as usize], st[(OHI) as usize]));
     }
-    return ((find_struct(src, r, re) < src.len()) || named(src, st, K_TUPLE, r, re));
+    return ((find_struct(src, st, r, re) < src.len()) || named(src, st, K_TUPLE, r, re));
 }
 
 pub fn result_arg(src: &[u8], p: usize) -> usize {
@@ -9251,6 +9417,7 @@ pub fn result_alias(src: &[u8], t: usize) -> bool {
 }
 
 pub fn prescan(src: &[u8], st: &mut [usize]) -> () {
+    index_decls(src, st);
     let mut q: usize = skip_ws(src, 0);
     while (q < src.len()) {
         let e: usize = tok_end(src, q);

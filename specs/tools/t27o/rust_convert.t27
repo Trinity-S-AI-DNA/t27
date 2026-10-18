@@ -88,8 +88,9 @@
 ; variants with data, labels, &mut of a scalar, `mut self`, unsafe, and if / match / blocks used as a
 ; value without a type annotation.
 ; --
-; The caller passes the source, an output buffer and a state vector: STATE slots, then the name table
-; (NAME_SLOTS a name, as many as fit). The result is the number of bytes the output needs; the buffer was
+; The caller passes the source, an output buffer and a state vector: STATE slots, the index slots (IXHIT ..
+; IXTOP), then the name table (NAME_SLOTS a name, as many as fit; the declaration index takes the top of
+; the vector, the table stops where it begins). The result is the number of bytes the output needs; the buffer was
 ; too small when that is above out.len (the bytes past the end are counted, not written). Every byte
 ; this spec reads or writes is a number, as in specs/tri/t27b/source_text.t27 (#7604): gen-rust reads a
 ; char literal as a Rust char.
@@ -183,7 +184,15 @@ pub const CCNT : usize = 50;
 /// The most samples one parameter holds: its fixed ones plus the body-derived ones (FR-003 of #9102).
 pub const DCAP : usize = 64;
 pub const STATE : usize = 51;
-pub const NAMES : usize = 51;
+/// The declaration index (#10544), slots the passes keep (STATE slots start every pass over): the slot of
+/// the entry the last lookup found (0 when none), 1 once the index is built and whole, where its buckets
+/// begin, how many buckets a kind has, and the lowest slot an entry takes (the name table stops there).
+pub const IXHIT : usize = 51;
+pub const IXON : usize = 52;
+pub const IXB : usize = 53;
+pub const IXBN : usize = 54;
+pub const IXTOP : usize = 55;
+pub const NAMES : usize = 56;
 pub const NAME_SLOTS : usize = 5;
 
 pub const F_NONE : usize = 0;
@@ -786,7 +795,10 @@ pub fn add_name(src: []const u8, st: []usize, kind: usize, lo: usize, hi: usize,
         k = k + 1;
     }
     const e : usize = NAMES + st[NNAMES] * NAME_SLOTS;
-    if (e + NAME_SLOTS > st.len) { return; }
+    // the name table stops where the declaration index begins, when one is built
+    var lim : usize = st.len;
+    if (st[IXON] == 1) { lim = st[IXTOP]; }
+    if (e + NAME_SLOTS > lim) { return; }
     st[e] = lo;
     st[e + 1] = hi;
     st[e + 2] = olo;
@@ -827,6 +839,126 @@ pub fn strloc_in(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
     }
     st[HIT] = 0;
     return false;
+}
+
+// ---------------------------------------------------------------- the declaration index (#10544)
+
+/// The kinds of declaration the index holds: `struct X {`, `const|static X :` and `fn X(..)`.
+pub const IX_STRUCT : usize = 0;
+pub const IX_CONST : usize = 1;
+pub const IX_FN : usize = 2;
+/// An entry takes four slots: the name's text (lo, hi), the value its lookup answers, and the next entry
+/// of its bucket (0 ends the chain).
+pub const IX_SLOTS : usize = 4;
+
+/// A hash of src[a .. b], kept below 1000003 so that no step overflows.
+pub fn ix_hash(src: []const u8, a: usize, b: usize) -> usize {
+    var h : usize = 0;
+    var k : usize = a;
+    while (k < b) {
+        h = (h * 31 + (src[k] as usize) + 1) % 1000003;
+        k = k + 1;
+    }
+    return h;
+}
+
+/// The value the index holds for the declaration `kind` named src[a .. b], src.len when it holds none.
+/// The slot of its entry goes to st[IXHIT] (0 when none).
+pub fn ix_get(src: []const u8, st: []usize, kind: usize, a: usize, b: usize) -> usize {
+    st[IXHIT] = 0;
+    if (b <= a) { return src.len; }
+    const bn : usize = st[IXBN];
+    var s : usize = st[st[IXB] + kind * bn + ix_hash(src, a, b) % bn];
+    while (s != 0) {
+        if (same_text(src, st[s], st[s + 1], a, b)) {
+            st[IXHIT] = s;
+            return st[s + 2];
+        }
+        s = st[s + 3];
+    }
+    return src.len;
+}
+
+/// Enter the declaration `kind` named src[lo .. hi] with the answer `val`; a name already entered keeps
+/// its first entry (a lookup answers the first declaration in file order). False when the entry does not
+/// fit: the index may take half of the free slots, no more.
+pub fn ix_put(src: []const u8, st: []usize, kind: usize, lo: usize, hi: usize, val: usize) -> bool {
+    if (hi <= lo) { return true; }
+    const bn : usize = st[IXBN];
+    const b : usize = st[IXB] + kind * bn + ix_hash(src, lo, hi) % bn;
+    var s : usize = st[b];
+    while (s != 0) {
+        if (same_text(src, st[s], st[s + 1], lo, hi)) { return true; }
+        s = st[s + 3];
+    }
+    if (st[IXTOP] < NAMES + (st.len - NAMES) / 2 + IX_SLOTS) { return false; }
+    const e : usize = st[IXTOP] - IX_SLOTS;
+    st[e] = lo;
+    st[e + 1] = hi;
+    st[e + 2] = val;
+    st[e + 3] = st[b];
+    st[b] = e;
+    st[IXTOP] = e;
+    return true;
+}
+
+/// Walk the file once, the way the three scans below do, and enter every `struct X {` (the answer: its
+/// `{`), `const|static X :` (the type token after the colon) and `fn X (..)` (the return type token
+/// after `->`, src.len when the fn has none). The index lives at the top of the state vector, buckets
+/// first; the name table stops where it begins. A file with more declarations than fit leaves the index
+/// off (IXON 0): the lookups then scan.
+pub fn index_decls(src: []const u8, st: []usize) -> void {
+    st[IXON] = 0;
+    st[IXHIT] = 0;
+    st[IXTOP] = st.len;
+    if (st.len < NAMES + 64) { return; }
+    var bn : usize = src.len / 512;
+    if (bn > (st.len - NAMES) / 64) { bn = (st.len - NAMES) / 64; }
+    if (bn < 1) { bn = 1; }
+    const top : usize = st.len - 3 * bn;
+    var z : usize = top;
+    while (z < st.len) {
+        st[z] = 0;
+        z = z + 1;
+    }
+    st[IXB] = top;
+    st[IXBN] = bn;
+    st[IXTOP] = top;
+    var whole : bool = true;
+    var q : usize = skip_ws(src, 0);
+    while (q < src.len and whole) {
+        const e : usize = tok_end(src, q);
+        if (word_is(src, q, e, "struct")) {
+            const n : usize = skip_ws(src, e);
+            const ne : usize = tok_end(src, n);
+            const lb : usize = skip_ws(src, ne);
+            if (tok_is(src, lb, "{") and !ix_put(src, st, IX_STRUCT, n, ne, lb)) { whole = false; }
+        }
+        if (word_is(src, q, e, "const") or word_is(src, q, e, "static")) {
+            var n : usize = skip_ws(src, e);
+            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+            const ne : usize = tok_end(src, n);
+            const c : usize = skip_ws(src, ne);
+            if (tok_is(src, c, ":") and !ix_put(src, st, IX_CONST, n, ne, skip_ws(src, c + 1))) { whole = false; }
+        }
+        if (word_is(src, q, e, "fn")) {
+            const n : usize = skip_ws(src, e);
+            const ne : usize = tok_end(src, n);
+            const lp : usize = find_at(src, ne, B_LPAREN);
+            if (lp < src.len) {
+                const r : usize = skip_ws(src, block_end(src, lp));
+                var v : usize = src.len;
+                if (tok_is(src, r, "->")) { v = skip_ws(src, tok_end(src, r)); }
+                if (!ix_put(src, st, IX_FN, n, ne, v)) { whole = false; }
+            }
+        }
+        q = skip_ws(src, e);
+    }
+    if (whole) {
+        st[IXON] = 1;
+    } else {
+        st[IXTOP] = st.len;
+    }
 }
 
 /// Each `fn <name>` in src[lo .. hi] as a refused member of the type src[olo .. ohi].
@@ -1863,8 +1995,15 @@ pub fn method_owner(src: []const u8, st: []usize, na: usize, nb: usize, ola : us
 
 // ---------------------------------------------------------------- what a receiver is
 
-/// The type token of the file-level `const` / `static` src[a .. b], src.len when there is none.
-pub fn const_type(src: []const u8, a: usize, b: usize) -> usize {
+/// The type token of the file-level `const` / `static` src[a .. b], src.len when there is none. Reads the
+/// declaration index; the scan is the answer when the index is off.
+pub fn const_type(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) { return ix_get(src, st, IX_CONST, a, b); }
+    return const_type_scan(src, a, b);
+}
+
+/// const_type by walking the file from byte 0 (what the index is built from, and checked against).
+pub fn const_type_scan(src: []const u8, a: usize, b: usize) -> usize {
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
         const e : usize = tok_end(src, q);
@@ -1880,8 +2019,15 @@ pub fn const_type(src: []const u8, a: usize, b: usize) -> usize {
     return src.len;
 }
 
-/// The return type token of the first `fn` src[a .. b] of the file, src.len when it has none.
-pub fn fn_ret_type(src: []const u8, a: usize, b: usize) -> usize {
+/// The return type token of the first `fn` src[a .. b] of the file, src.len when it has none. Reads the
+/// declaration index; the scan is the answer when the index is off.
+pub fn fn_ret_type(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) { return ix_get(src, st, IX_FN, a, b); }
+    return fn_ret_type_scan(src, a, b);
+}
+
+/// fn_ret_type by walking the file from byte 0.
+pub fn fn_ret_type_scan(src: []const u8, a: usize, b: usize) -> usize {
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
         const e : usize = tok_end(src, q);
@@ -1902,7 +2048,7 @@ pub fn fn_ret_type(src: []const u8, a: usize, b: usize) -> usize {
 
 /// Does `fn` src[a .. b] return `Result<(), E>` (or an alias of it), which t27o writes as a bool?
 pub fn unit_result_fn(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
-    const r : usize = fn_ret_type(src, a, b);
+    const r : usize = fn_ret_type(src, st, a, b);
     const re : usize = tok_end(src, r);
     if (r >= src.len or !(word_is(src, r, re, "Result") or named(src, st, K_RALIAS, r, re))) { return false; }
     const lt : usize = skip_ws(src, re);
@@ -1968,7 +2114,7 @@ pub fn literal_class(src: []const u8, st: []usize, q: usize) -> u8 {
 /// of the impl's struct after `self.`, a file-level const, or the literal an untyped `let` binds.
 pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool) -> u8 {
     if (field) {
-        const lb : usize = find_struct(src, st[ILO], st[IHI]);
+        const lb : usize = find_struct(src, st, st[ILO], st[IHI]);
         if (lb >= src.len) { return C_ANY; }
         const f : usize = decl_type(src, lb, block_end(src, lb), a, b);
         if (f >= src.len) { return C_ANY; }
@@ -1977,7 +2123,7 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
     if (prim(src, a, b) or word_is(src, a, b, "f32") or word_is(src, a, b, "f64")) { return type_class(src, st, a); }
     const d : usize = decl_type(src, st[FLO], a, a, b);
     if (d < src.len) { return type_class(src, st, d); }
-    const c : usize = const_type(src, a, b);
+    const c : usize = const_type(src, st, a, b);
     if (c < src.len) { return type_class(src, st, c); }
     // `let [mut] name = <literal>;`
     var q : usize = st[FLO];
@@ -2011,7 +2157,7 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
         if (str_chain(src, st, init, semi)) { return C_STR; }
         const ie : usize = tok_end(src, init);
         if (tok_is(src, skip_ws(src, ie), "(")) {
-            const r2 : usize = fn_ret_type(src, init, ie);
+            const r2 : usize = fn_ret_type(src, st, init, ie);
             if (r2 < src.len) { return type_class(src, st, r2); }
         }
     }
@@ -2044,8 +2190,15 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
     return C_ANY;
 }
 
-/// The `{` of `struct <name> {` in the file, src.len when there is none.
-pub fn find_struct(src: []const u8, a: usize, b: usize) -> usize {
+/// The `{` of `struct <name> {` in the file, src.len when there is none. Reads the declaration index; the
+/// scan is the answer when the index is off.
+pub fn find_struct(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) { return ix_get(src, st, IX_STRUCT, a, b); }
+    return find_struct_scan(src, a, b);
+}
+
+/// find_struct by walking the file from byte 0.
+pub fn find_struct_scan(src: []const u8, a: usize, b: usize) -> usize {
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
         const e : usize = tok_end(src, q);
@@ -2061,7 +2214,7 @@ pub fn find_struct(src: []const u8, a: usize, b: usize) -> usize {
 /// `node: &Node`), C_ANY when x has no declared struct type or the field is not one of its fields.
 pub fn field_of_class(src: []const u8, st: []usize, xa: usize, xe: usize, fa: usize, fe: usize) -> u8 {
     var d : usize = decl_type(src, st[FLO], xa, xa, xe);
-    if (d >= src.len) { d = const_type(src, xa, xe); }
+    if (d >= src.len) { d = const_type(src, st, xa, xe); }
     if (d >= src.len) { return C_ANY; }
     while (tok_is(src, d, "&") or tok_is(src, d, "&&")) {
         d = skip_ws(src, tok_end(src, d));
@@ -2070,7 +2223,7 @@ pub fn field_of_class(src: []const u8, st: []usize, xa: usize, xe: usize, fa: us
     }
     const de : usize = tok_end(src, d);
     if (d >= src.len or !is_upper(src[d])) { return C_ANY; }
-    const lb : usize = find_struct(src, d, de);
+    const lb : usize = find_struct(src, st, d, de);
     if (lb >= src.len) { return C_ANY; }
     const f : usize = decl_type(src, lb, block_end(src, lb), fa, fe);
     if (f >= src.len) { return C_ANY; }
@@ -2163,7 +2316,7 @@ pub fn recv_class(src: []const u8, st: []usize, ra: usize, rb: usize) -> u8 {
     }
     if (is_alpha(src[ra]) and tok_is(src, nx, "(") and skip_ws(src, block_end(src, nx)) >= rb) {
         if (unit_result_fn(src, st, ra, e)) { return C_BOOL; }
-        const r : usize = fn_ret_type(src, ra, e);
+        const r : usize = fn_ret_type(src, st, ra, e);
         if (r < src.len) { return type_class(src, st, r); }
         return C_ANY;
     }
@@ -2179,7 +2332,7 @@ pub fn recv_class(src: []const u8, st: []usize, ra: usize, rb: usize) -> u8 {
             k = literal_class(src, st, q);
         } else if (is_alpha(src[q]) and !tok_is(src, prev, ".") and !tok_is(src, prev, "::")) {
             if (tok_is(src, skip_ws(src, qe), "(")) {
-                const r2 : usize = fn_ret_type(src, q, qe);
+                const r2 : usize = fn_ret_type(src, st, q, qe);
                 if (r2 < src.len) { k = type_class(src, st, r2); }
             } else {
                 k = name_class(src, st, q, qe, false);
@@ -2259,13 +2412,13 @@ pub fn lit_at(src: []const u8, q: usize) -> bool {
 /// The `{` (or the `(` of a tuple struct) of the struct the name src[xa .. xe] is of: `self` is the impl's
 /// type, any other name the type it is declared with or the one a `let x = Type::new(..)` names; src.len
 /// when t27o cannot tell.
-pub fn head_struct(src: []const u8, flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
+pub fn head_struct(src: []const u8, st: []usize, flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
     if (word_is(src, xa, xe, "self")) {
         if (ilo == ihi) { return src.len; }
         return struct_open(src, ilo, ihi);
     }
     var d : usize = decl_type(src, flo, xa, xa, xe);
-    if (d >= src.len) { d = const_type(src, xa, xe); }
+    if (d >= src.len) { d = const_type(src, st, xa, xe); }
     if (d >= src.len) { d = let_owner(src, xa, xe); }
     if (d >= src.len) { return src.len; }
     while (tok_is(src, d, "&") or tok_is(src, d, "&&")) {
@@ -2373,7 +2526,7 @@ pub fn chain_class(src: []const u8, st: []usize, a: usize, b: usize, deep: bool)
     if (kind == CK_NAME) { return name_class(src, st, na, nb, false); }
     // `x.f` and `x.0` of a struct this file declares: the field's declared type
     if (kind == CK_FIELD and dots == 1 and plain) {
-        const o : usize = head_struct(src, st[FLO], st[ILO], st[IHI], xa, xe);
+        const o : usize = head_struct(src, st, st[FLO], st[ILO], st[IHI], xa, xe);
         if (o >= src.len) { return C_ANY; }
         if (is_digit(src[na])) {
             if (src[o] != B_LPAREN or nb != na + 1) { return C_ANY; }
@@ -2387,7 +2540,7 @@ pub fn chain_class(src: []const u8, st: []usize, a: usize, b: usize, deep: bool)
         return type_class(src, st, f);
     }
     if (kind == CK_PATH) {
-        const c : usize = const_type(src, na, nb);
+        const c : usize = const_type(src, st, na, nb);
         if (c < src.len) { return type_class(src, st, c); }
     }
     return C_ANY;
@@ -2689,8 +2842,8 @@ pub fn unroll_contains(src: []const u8, st: []usize, out: []u8, start: usize, ra
     var lb : usize = src.len;
     const re : usize = tok_end(src, ra);
     if (ra < src.len and src[ra] == B_LBRACKET and skip_ws(src, block_end(src, ra)) >= rb) { lb = ra; }
-    if (ra < src.len and is_alpha(src[ra]) and skip_ws(src, re) >= rb and const_type(src, ra, re) < src.len) {
-        const t : usize = const_type(src, ra, re);
+    if (ra < src.len and is_alpha(src[ra]) and skip_ws(src, re) >= rb and const_type(src, st, ra, re) < src.len) {
+        const t : usize = const_type(src, st, ra, re);
         const eq : usize = find_at(src, t, B_EQ);
         if (eq < src.len) {
             const v : usize = skip_ws(src, eq + 1);
@@ -4848,18 +5001,18 @@ pub fn struct_value(src: []const u8, st: []usize, e: usize) -> bool {
     var n : usize = e;
     var ne : usize = tok_end(src, n);
     var nx : usize = skip_ws(src, ne);
-    if (is_upper(src[n]) and (tok_is(src, nx, "{") or tok_is(src, nx, "(")) and (find_struct(src, n, ne) < src.len or named(src, st, K_TUPLE, n, ne))) { return true; }
+    if (is_upper(src[n]) and (tok_is(src, nx, "{") or tok_is(src, nx, "(")) and (find_struct(src, st, n, ne) < src.len or named(src, st, K_TUPLE, n, ne))) { return true; }
     if (tok_is(src, nx, "::") or tok_is(src, nx, ".")) {
         n = skip_ws(src, tok_end(src, nx));
         ne = tok_end(src, n);
         nx = skip_ws(src, ne);
     }
     if (!tok_is(src, nx, "(")) { return false; }
-    const r : usize = fn_ret_type(src, n, ne);
+    const r : usize = fn_ret_type(src, st, n, ne);
     if (r >= src.len) { return false; }
     const re : usize = tok_end(src, r);
-    if (word_is(src, r, re, "Self") and impl_around(src, st, r)) { return find_struct(src, st[OLO], st[OHI]) < src.len or named(src, st, K_TUPLE, st[OLO], st[OHI]); }
-    return find_struct(src, r, re) < src.len or named(src, st, K_TUPLE, r, re);
+    if (word_is(src, r, re, "Self") and impl_around(src, st, r)) { return find_struct(src, st, st[OLO], st[OHI]) < src.len or named(src, st, K_TUPLE, st[OLO], st[OHI]); }
+    return find_struct(src, st, r, re) < src.len or named(src, st, K_TUPLE, r, re);
 }
 
 /// Where the second argument of the assert_eq! / assert_ne! whose first argument starts at src[p] begins
@@ -7880,9 +8033,11 @@ pub fn result_alias(src: []const u8, t: usize) -> bool {
     return eq < find_at(src, n, B_SEMI) and tok_is(src, skip_ws(src, eq + 1), "Result");
 }
 
-/// Before the first pass: tuple structs, Result aliases and the caller's `//@t27o reuse <Name> <path>`
-/// lines go into the name table, so an item that uses one before its declaration reads it too.
+/// Before the first pass: the declaration index is built (every lookup of a struct, a const or a fn reads
+/// it instead of walking the file); tuple structs, Result aliases and the caller's `//@t27o reuse <Name>
+/// <path>` lines go into the name table, so an item that uses one before its declaration reads it too.
 pub fn prescan(src: []const u8, st: []usize) -> void {
+    index_decls(src, st);
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
         const e : usize = tok_end(src, q);
