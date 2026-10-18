@@ -437,6 +437,8 @@ enum Commands {
         /// The t27c binary; default target/release/t27c, then t27c on PATH.
         #[arg(long)] t27c: Option<String>,
     },
+    /// t27o over a tree (#10543): every tracked .rs file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
+    T27oSweep { paths: Vec<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long, default_value = t27o_ledger::SWEEP_CACHE)] cache: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
 }
 
 #[derive(Subcommand)]
@@ -1327,6 +1329,7 @@ fn main() -> Result<()> {
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref())? as i32),
+        Commands::T27oSweep { paths, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, *max_bytes, cache, *top)? as i32),
     }
 
     Ok(())
@@ -1356,6 +1359,37 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
     if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
+}
+
+/// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, root vs cascade, the ranking); this lists, hashes, converts in-process and keeps the cache.
+fn cmd_t27o_sweep(paths: &[String], max: usize, cache: &str, top: usize) -> Result<u8> {
+    let t0 = std::time::Instant::now(); let seal = |f: &str| -> Result<String> { Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(f)?)?["spec_hash"].as_str().with_context(|| format!("{f}: no spec_hash"))?.to_string()) };
+    let (conv, std) = (seal(".trinity/seals/t27o_T27oRust.json")?, seal(".trinity/seals/t27o_T27oRustStd.json")?);
+    let old: &'static str = fs::read_to_string(cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 10).map(|f| (f[0], f)).collect();
+    let listing: &'static str = String::from_utf8(Command::new("git").args(["ls-files", "--"]).args(paths).output()?.stdout)?.leak();
+    let (mut tab, mut kinds, mut tot, mut n) = (String::new(), std::collections::BTreeMap::<&'static str, usize>::new(), [0usize; 5], [0usize; 3]);
+    for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
+        let Ok(src) = fs::read(p) else { continue };
+        if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
+        let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
+        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == conv), r.is_some_and(|r| r[3] == std)));
+        let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
+            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], std::collections::BTreeMap::<&'static str, usize>::new());
+            let m = t27o::convert(&src, Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()).as_bytes(), &mut out, &mut st);
+            let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); for l in o.lines().filter(|l| t27o_ledger::is_refusal(l)) { *k.entry(&l[t27o_ledger::kind_from(l)..t27o_ledger::kind_to(l)]).or_default() += 1; }
+            format!("{p}\t{sha}\t{conv}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
+        };
+        n[reuse as usize] += 1; tab += &format!("{}\n", f.join("\t"));
+        (0..5).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0));
+        f[9].split(';').filter_map(|e| e.rsplit_once('=')).for_each(|(k, c)| *kinds.entry(k).or_default() += c.parse::<usize>().unwrap_or(0));
+        println!("{}  {} {} {}/{} {}  {}", f[0], f[4], f[5], f[6], f[7], f[8], if reuse { "reused" } else { "fresh" });
+    }
+    let cov = t27o_ledger::coverage_permille(tot[0], tot[1]); println!("total {} files  {} fn seen  {} converted  tests {}/{}  stubs {}  coverage {}", n[0] + n[1], tot[0], tot[1], tot[2], tot[3], tot[4], if t27o_ledger::coverage_known(cov) { format!("{}.{}%", cov / 10, cov % 10) } else { "unknown".into() });
+    let (casc, mut root): (Vec<_>, Vec<_>) = kinds.into_iter().partition(|(k, _)| t27o_ledger::is_cascade(*k));
+    root.sort_by(|a, b| t27o_ledger::rank_cmp(a.1, a.0, b.1, b.0).cmp(&0)); root.iter().take(top).for_each(|(k, c)| println!("{c:>7}  {k}"));
+    println!("{:>7}  cascade ({})\ncold {} / reused {} / skipped {}  wall {:.1} s", casc.iter().map(|k| k.1).sum::<usize>(), t27o_ledger::KIND_CASCADE, n[0], n[1], n[2], t0.elapsed().as_secs_f64());
+    if let Some(d) = Path::new(cache).parent() { fs::create_dir_all(d)?; }
+    fs::write(cache, tab)?; Ok(0)
 }
 
 /// `tri lanes`: gh's open pull requests into the base, the clone's worktrees and branch times, and what specs/tri/lanes/lanes.t27 reads in them.
