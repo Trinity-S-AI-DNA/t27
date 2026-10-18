@@ -40,12 +40,15 @@ def api_tri_net_api_module : Module := {
   benches := [{ name := "", params := [], ret := none, body := [] }, { name := "", params := [], ret := none, body := [] }]
 }
 
--- Negative signature projection from specs/ar/asp_solver.t27. Program has
--- variable-length Clause fields and solve returns variable-length AnswerSet.
--- This shallow AST keeps these unmodeled types under their source names.
--- The old unused marker left an empty module; it could not prove false.
+-- Negative signature projection from specs/ar/asp_solver.t27. Since #8980 its
+-- arrays are fixed (MAX_CLAUSES 16, MAX_CLAUSE_LITS 4, MAX_LARGS 2, MAX_LITS 16,
+-- MAX_ANSWERS 4); `string` (Literal.name/args, reached via Clause) keeps it
+-- unlowerable. Function bodies are left out.
 def ar_asp_solver_env : Env := {
-  structs := [("Program", [("clauses", (.struct "[Clause]")), ("constraints", (.struct "[Clause]"))])],
+  structs := [
+    ("Literal", [("name", .string), ("is_negated", .bool), ("args", (.array 2 .string)), ("nargs", .u32)]), ("Clause", [("lits", (.array 4 (.struct "Literal"))), ("count", .u32)]), ("LitList", [("items", (.array 16 (.struct "Literal"))), ("count", .u32)]),
+    ("Program", [("clauses", (.array 16 (.struct "Clause"))), ("nclauses", .u32), ("constraints", (.array 16 (.struct "Clause"))), ("nconstraints", .u32)]),
+    ("AnswerSet", [("literals", (.struct "LitList")), ("proven", .bool), ("cost", .i32)]), ("SolveResult", [("answers", (.array 4 (.struct "AnswerSet"))), ("count", .u32), ("steps", .u32), ("trace_len", .u32)])],
   constructors := [],
   enums := [],
   imports := [],
@@ -57,7 +60,7 @@ def ar_asp_solver_module : Module := {
   name := "ar_asp_solver",
   imports := [],
   globals := [],
-  functions := [{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "[AnswerSet]")), body := [] }],
+  functions := [{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "SolveResult")), body := [] }],
   tests := [],
   benches := []
 }
@@ -171,22 +174,13 @@ def ar_restraint_module : Module := {
 }
 
 -- Negative signature projection from specs/ar/ternary_logic.t27 (#6658).
--- The previous model was EMPTY (no functions, globals or tests), so
--- `native_decide` proved the empty module lowerable -- true of nothing in
--- the spec. This one keeps every declaration the classifier reads, with
--- unmodeled types under their source names, as ar_asp_solver does:
---   * `Trit` is neither a primitive nor a struct declared in this module,
---     so the Rust classifier already rejects k3_and's interface, and the
---     Lean predicate rejects `.struct "Trit"` (not in `structs`).
---   * resolve and apply_restraint take and return variable-length `[Trit]`;
---     backward_chain takes variable-length `[Rule]`. Those three stay
---     unlowerable even when `Trit` is declared as a lowerable type -- see
---     `ar_ternary_logic_slices_block_with_trit_declared` below.
--- Function bodies are left out (as for ar_asp_solver): the interfaces
--- alone decide the verdict, and they are the part a regenerated signature
--- can be compared against. Tests and benches carry the spec's names.
+-- Since #8980 a Trit is an `i8` (-1, 0, +1), so the scalar K3 functions are
+-- lowerable. Unlowerable, by name under their source types: resolve,
+-- apply_restraint and backward_chain (variable-length slices, no fixed width;
+-- see `ar_ternary_logic_slices_block`) and pool_take (`usize`). Bodies are
+-- left out; the interfaces alone decide.
 def ar_ternary_logic_env : Env := {
-  structs := [("Rule", [("antecedent", (.struct "Trit")), ("consequent", (.struct "Trit"))])],
+  structs := [("Rule", [("antecedent", .i8), ("consequent", .i8)])],
   constructors := [],
   enums := [],
   imports := [],
@@ -197,24 +191,19 @@ def ar_ternary_logic_env : Env := {
 def ar_ternary_logic_module : Module := {
   name := "ar_ternary_logic",
   imports := [],
-  globals := [.constDecl "K_FALSE" (.struct "Trit") (some (.enumVal "Trit" "FALSE")), .constDecl "K_UNKNOWN" (.struct "Trit") (some (.enumVal "Trit" "UNKNOWN")), .constDecl "K_TRUE" (.struct "Trit") (some (.enumVal "Trit" "TRUE"))],
-  functions := [{ name := "k3_and", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_or", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_not", params := [("a", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_implies", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_equiv", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "forward_chain", params := [("rule", (.struct "Rule")), ("fact", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "backward_chain", params := [("goal", (.struct "Trit")), ("rules", (.struct "[Rule]"))], ret := (some (.struct "Trit")), body := [] }, { name := "resolve", params := [("clause_a", (.struct "[Trit]")), ("clause_b", (.struct "[Trit]"))], ret := (some (.struct "[Trit]")), body := [] }, { name := "is_restraint", params := [("t", (.struct "Trit"))], ret := (some .bool), body := [] }, { name := "apply_restraint", params := [("values", (.struct "[Trit]"))], ret := (some (.struct "[Trit]")), body := [] }],
+  globals := [.constDecl "K_FALSE" .i8 (some (.intLit (-1))), .constDecl "K_UNKNOWN" .i8 (some (.intLit 0)), .constDecl "K_TRUE" .i8 (some (.intLit 1)), .constDecl "K3_VALUES" (.array 3 .i8) (some (.arrayLit .i8 [(.identifier "K_FALSE"), (.identifier "K_UNKNOWN"), (.identifier "K_TRUE")])), .varDecl "trit_pool" (.array 256 .i8) none, .varDecl "trit_pool_used" (.struct "usize") (some (.intLit 0))],
+  functions := [{ name := "pool_take", params := [("n", (.struct "usize"))], ret := (some (.struct "usize")), body := [] }, { name := "holds", params := [("t", .i8)], ret := (some .bool), body := [] }, { name := "k3_and", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_or", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_not", params := [("a", .i8)], ret := (some .i8), body := [] }, { name := "k3_implies", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_equiv", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "forward_chain", params := [("rule", (.struct "Rule")), ("fact", .i8)], ret := (some .i8), body := [] }, { name := "backward_chain", params := [("goal", .i8), ("rules", (.struct "[]const Rule"))], ret := (some .i8), body := [] }, { name := "resolve", params := [("clause_a", (.struct "[]const i8")), ("clause_b", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }, { name := "is_restraint", params := [("t", .i8)], ret := (some .bool), body := [] }, { name := "apply_restraint", params := [("values", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }],
   tests := [{ name := "k3_and_truth_table", params := [], ret := none, body := [] }, { name := "k3_or_truth_table", params := [], ret := none, body := [] }, { name := "k3_not_truth_table", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_false", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_true", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_unknown_violation", params := [], ret := none, body := [] }, { name := "k3_no_tautology_exists_violating_value", params := [], ret := none, body := [] }, { name := "k3_no_tautology_all_values_tested", params := [], ret := none, body := [] }, { name := "k3_restraint_from_no_tautology", params := [], ret := none, body := [] }, { name := "k3_implication_ex_falso", params := [], ret := none, body := [] }, { name := "k3_implication_when_antecedent_true", params := [], ret := none, body := [] }, { name := "k3_implication_when_consequent_true", params := [], ret := none, body := [] }, { name := "k3_implication_with_unknown", params := [], ret := none, body := [] }, { name := "k3_equiv_reflexive", params := [], ret := none, body := [] }, { name := "k3_equiv_symmetric", params := [], ret := none, body := [] }, { name := "k3_equiv_transitive", params := [], ret := none, body := [] }, { name := "k3_equiv_when_both_true", params := [], ret := none, body := [] }, { name := "k3_equiv_when_both_false", params := [], ret := none, body := [] }, { name := "k3_equiv_when_opposite", params := [], ret := none, body := [] }, { name := "forward_chain_modus_ponens_true", params := [], ret := none, body := [] }, { name := "forward_chain_modus_ponens_false_consequent", params := [], ret := none, body := [] }, { name := "forward_chain_with_unknown_fact", params := [], ret := none, body := [] }, { name := "forward_chain_no_match", params := [], ret := none, body := [] }, { name := "backward_chain_finds_support", params := [], ret := none, body := [] }, { name := "backward_chain_no_support", params := [], ret := none, body := [] }, { name := "backward_chain_multiple_rules", params := [], ret := none, body := [] }, { name := "resolve_complementary_literals", params := [], ret := none, body := [] }, { name := "resolve_non_complementary", params := [], ret := none, body := [] }, { name := "is_restraint_true_for_unknown", params := [], ret := none, body := [] }, { name := "is_restraint_false_for_false", params := [], ret := none, body := [] }, { name := "is_restraint_false_for_true", params := [], ret := none, body := [] }, { name := "apply_restraint_replaces_unknown", params := [], ret := none, body := [] }, { name := "apply_restraint_preserves_known", params := [], ret := none, body := [] }],
   benches := [{ name := "k3_and_latency", params := [], ret := none, body := [] }, { name := "k3_or_latency", params := [], ret := none, body := [] }, { name := "k3_not_latency", params := [], ret := none, body := [] }, { name := "k3_implies_latency", params := [], ret := none, body := [] }, { name := "k3_equiv_latency", params := [], ret := none, body := [] }, { name := "forward_chain_latency", params := [], ret := none, body := [] }, { name := "backward_chain_latency", params := [], ret := none, body := [] }, { name := "resolve_latency", params := [], ret := none, body := [] }, { name := "apply_restraint_latency", params := [], ret := none, body := [] }]
 }
 
-/-- #6658: the variable-length `[Trit]` / `[Rule]` interfaces block on their
-    own. Declare `Trit` as a lowerable one-field struct and every scalar K3
-    function becomes lowerable; exactly the three functions with a slice in
-    their signature still are not. -/
-def ar_ternary_logic_trit_declared_env : Env :=
-  { ar_ternary_logic_env with
-    structs := ("Trit", [("v", .i8)]) :: ar_ternary_logic_env.structs }
-
-theorem ar_ternary_logic_slices_block_with_trit_declared :
+/-- #6658: the slice interfaces block on their own. Exactly the three functions
+    with a slice in their signature, plus `pool_take` (which takes `usize`),
+    are unlowerable; every scalar K3 function over `i8` is lowerable. -/
+theorem ar_ternary_logic_slices_block :
     (ar_ternary_logic_module.functions.filter
-        (fun f => !Function.isLowerable ar_ternary_logic_trit_declared_env f)).map (fun f => f.name)
-      = ["backward_chain", "resolve", "apply_restraint"] := by native_decide
+        (fun f => !Function.isLowerable ar_ternary_logic_env f)).map (fun f => f.name)
+      = ["pool_take", "backward_chain", "resolve", "apply_restraint"] := by native_decide
 
 def automation_wrapup_auto_env : Env := {
   structs := [],
@@ -1857,24 +1846,6 @@ def physics_lqg_cs_bridge_module : Module := {
   globals := [],
   functions := [],
   tests := [{ name := "lqg_cs_bridge_module_exists", params := [], ret := none, body := [] }, { name := "lqg_cs_gamma_conclusion_documented", params := [], ret := none, body := [] }],
-  benches := []
-}
-
-def physics_lqg_entropy_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [],
-  hostOnly := [],
-  reachable := []
-}
-
-def physics_lqg_entropy_module : Module := {
-  name := "physics_lqg_entropy",
-  imports := [],
-  globals := [],
-  functions := [],
-  tests := [{ name := "lqg_entropy_module_exists", params := [], ret := none, body := [] }, { name := "lqg_cs_gamma_origin_different_from_lqg", params := [], ret := none, body := [] }],
   benches := []
 }
 
@@ -4020,24 +3991,6 @@ def tri_utils_config_module : Module := {
   benches := []
 }
 
-def tri_utils_error_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_error_module : Module := {
-  name := "tri_utils_error",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_utils_exit_codes_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -4107,24 +4060,6 @@ def tri_utils_random_module : Module := {
   globals := [],
   functions := [{ name := "init", params := [("seed", (.u64))], ret := (some (.struct "void")), body := [] }, { name := "next", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range_inclusive", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
   tests := [{ name := "init_basic_case", params := [], ret := none, body := [] }, { name := "next_basic_case", params := [], ret := none, body := [] }, { name := "range_basic_case", params := [], ret := none, body := [] }, { name := "range_inclusive_basic_case", params := [], ret := none, body := [] }],
-  benches := []
-}
-
-def tri_utils_string_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_string_module : Module := {
-  name := "tri_utils_string",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
   benches := []
 }
 
@@ -4418,7 +4353,6 @@ theorem physics_e8_lqg_bridge_lowerable : Module.isLowerable physics_e8_lqg_brid
 theorem physics_gamma_conflict_lowerable : Module.isLowerable physics_gamma_conflict_env physics_gamma_conflict_module = true := by native_decide
 theorem physics_hslm_benchmark_lowerable : Module.isLowerable physics_hslm_benchmark_env physics_hslm_benchmark_module = true := by native_decide
 theorem physics_lqg_cs_bridge_lowerable : Module.isLowerable physics_lqg_cs_bridge_env physics_lqg_cs_bridge_module = true := by native_decide
-theorem physics_lqg_entropy_lowerable : Module.isLowerable physics_lqg_entropy_env physics_lqg_entropy_module = true := by native_decide
 theorem physics_quantum_lowerable : Module.isLowerable physics_quantum_env physics_quantum_module = true := by native_decide
 theorem physics_su2_chern_simons_lowerable : Module.isLowerable physics_su2_chern_simons_env physics_su2_chern_simons_module = false := by native_decide
 theorem queen_task_analysis_lowerable : Module.isLowerable queen_task_analysis_env queen_task_analysis_module = true := by native_decide
@@ -4538,12 +4472,10 @@ theorem tri_utils_args_lowerable : Module.isLowerable tri_utils_args_env tri_uti
 theorem tri_utils_bytes_lowerable : Module.isLowerable tri_utils_bytes_env tri_utils_bytes_module = true := by native_decide
 theorem tri_utils_color_lowerable : Module.isLowerable tri_utils_color_env tri_utils_color_module = false := by native_decide
 theorem tri_utils_config_lowerable : Module.isLowerable tri_utils_config_env tri_utils_config_module = false := by native_decide
-theorem tri_utils_error_lowerable : Module.isLowerable tri_utils_error_env tri_utils_error_module = true := by native_decide
 theorem tri_utils_exit_codes_lowerable : Module.isLowerable tri_utils_exit_codes_env tri_utils_exit_codes_module = false := by native_decide
 theorem tri_utils_help_lowerable : Module.isLowerable tri_utils_help_env tri_utils_help_module = false := by native_decide
 theorem tri_utils_logging_lowerable : Module.isLowerable tri_utils_logging_env tri_utils_logging_module = false := by native_decide
 theorem tri_utils_random_lowerable : Module.isLowerable tri_utils_random_env tri_utils_random_module = false := by native_decide
-theorem tri_utils_string_lowerable : Module.isLowerable tri_utils_string_env tri_utils_string_module = true := by native_decide
 theorem tri_utils_template_lowerable : Module.isLowerable tri_utils_template_env tri_utils_template_module = true := by native_decide
 theorem tri_utils_terminal_lowerable : Module.isLowerable tri_utils_terminal_env tri_utils_terminal_module = false := by native_decide
 theorem tri_utils_text_lowerable : Module.isLowerable tri_utils_text_env tri_utils_text_module = false := by native_decide

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 ; specs/queen/simulation.t27 -- the actor runtime under a seeded deterministic simulation, as a CI gate
 ; Owner, 2026-10-09 (translated): "implement all the improvements" -- item 5 of gHashTag/trios#1712.
+; Extended (t27#8987, trios#1763): keyed actors and the bee dispatcher (section 7), the adaptive
+; reviewer pool with and without the lane queue (section 8).
 ; Why. The benchmark that cleared the actor reviewer for production (trios#1698) ran on a virtual clock
 ; and a seed, and it still missed the go-live hot loop: it modelled no unreadable row, so about 184
 ; visits a minute against 22 unreadable rows were found only in production (t27#7851, 2026-10-08
@@ -19,8 +21,9 @@
 ; runtime -- createActorSystem, the supervisor, createMemoryNet for nodes, the reviewer actors -- on
 ; the virtual clock. Each step it asks this card for the step's event and the virtual time that
 ; passes, applies the event, runs the clock, and checks every invariant below. Every random number
-; it uses is sim_roll(seed, stream, index); performance.now, the only wall clock the runtime reads (the
-; slice, actors.t27 section 8), is replaced for the run by a counter this card drives. Nothing here is
+; it uses is sim_roll(seed, stream, index); performance.now, the wall clock the runtime reads (the
+; slice, actors.t27 section 8; the store link's lease age), is replaced for the run by the virtual
+; clock plus work this card draws. Nothing here is
 ; a second runtime: this card decides what the simulation does and what fails the gate, and the
 ; runtime's own decisions stay in actors.t27 and reviewer.t27.
 ; ASCII only (L3).
@@ -30,10 +33,11 @@ module QueenSimulation;
 
 ; --- 1. The gate: how many seeds, how many steps, twice each ----------------------------------------
 
-/// Seeds one CI run tries. Measured 2026-10-10 on the Queen's Mac (Bun 1.3.11), 64 runs of
-/// STEPS_PER_RUN: 270 ms min, 420 ms p50, 721 ms max, 28.4 s in all. 16 seeds run twice are then about
-/// 15 s, inside the minute a check on every PR of the actor runtime may spend; on a host under load
-/// (load average 35, same day) one run took up to 21 s, so more seeds would not fit. A run with a
+/// Seeds one CI run tries. Measured 2026-10-10 on the Queen's Mac (Bun 1.3.11), 64 memory-net runs of
+/// STEPS_PER_RUN on a quiet host: 270 ms min, 420 ms p50, 721 ms max, 28.4 s in all. The whole gate --
+/// 16 seeds and STORE_SEEDS_PER_RUN store seeds, each run twice -- took 57.4 s with the host at a load
+/// average of 18 (memory runs 0.8-2.5 s, store runs 2.8-4.0 s), and one run took up to 21 s at a load
+/// of 35: more seeds would not fit the minute a check on every PR of the actor runtime may spend. A run with a
 /// seed of its own (SIM_SEED) or more seeds (SIM_SEEDS) is a replay or a soak, not the gate.
 pub const SEEDS_PER_RUN : u32 = 16;
 
@@ -48,8 +52,47 @@ pub const RUNS_PER_SEED : u32 = 2;
 /// is the epic's number.
 pub const GATE_BASE_SEED : u32 = 1712;
 
+/// Turns that really stop (turn_stop.t27, trios#1713) are behind a flag in production. Every second
+/// gate seed runs with it on, so the runtime that runs today and the one the flag turns on are both
+/// gated, at no extra run. A seed's features are a bit set.
+pub const FEATURE_TURN_STOP : u32 = 1;
+pub const TURN_STOP_EVERY : u32 = 2;
+
+/// The adaptive reviewer pool (reviewer_sizing.t27, TRIOS_QUEEN_REVIEWER_ADAPTIVE) and the review lane
+/// queue (review_lanes.t27, TRIOS_QUEEN_REVIEW_LANES=semaphore) are flags as well. The next two bits of
+/// a seed's index turn them on, so the 16 gate seeds hold every one of the eight combinations twice:
+/// the fixed 4 and the adaptive pool, each with and without the lane queue, each with and without turn
+/// stop. Again at no extra run (trios#1763: "the simulation gate does not yet simulate ... the adaptive
+/// reviewer pool"). The first two seeds, the ones the store model also plays, keep the fixed 4.
+pub const FEATURE_ADAPTIVE_POOL : u32 = 2;
+pub const FEATURE_LANE_QUEUE : u32 = 4;
+pub const ADAPTIVE_EVERY : u32 = 2;
+pub const LANE_QUEUE_EVERY : u32 = 4;
+
+pub fn seed_features(i: u32) -> u32 {
+    var f : u32 = 0;
+    if (i % TURN_STOP_EVERY == 1) { f = f | FEATURE_TURN_STOP; }
+    if ((i / ADAPTIVE_EVERY) % 2 == 1) { f = f | FEATURE_ADAPTIVE_POOL; }
+    if ((i / LANE_QUEUE_EVERY) % 2 == 1) { f = f | FEATURE_LANE_QUEUE; }
+    return f;
+}
+
+pub fn has_feature(features: u32, feature: u32) -> bool {
+    return (features & feature) == feature and feature != 0;
+}
+
+/// Seeds that also run on the store model of the node link: the real createPgLink (netlink.t27,
+/// trios#1714) over a store that answers its statements on the virtual clock. A store run polls
+/// every node's mail each second and reads every lease every heartbeat, so it costs about three memory
+/// runs (measured: p50 3.7 s against 1.3 s, same host, same load); two seeds, run twice, keep the gate
+/// near its minute.
+pub const STORE_SEEDS_PER_RUN : u32 = 2;
+
 /// After the step loop, a quiet tail: no new event, the clock runs on, so every stall, window and
-/// restart that is under way ends inside the run and is checked.
+/// restart that is under way ends inside the run and is checked. It runs a minute at a time from a fixed
+/// start, one hash a minute, never "while the clock is short of the end": a run whose clock picked up a
+/// fraction would otherwise take one more, empty minute and log one more hash (seen once in about
+/// twenty gate runs before this, never replayed).
 pub const TAIL_SECONDS : u32 = 3600;
 
 /// Lines of the log printed with a failure: the last ones that name the pid or the row that failed.
@@ -184,13 +227,14 @@ pub fn step_ms(roll: u32) -> u32 {
 
 ; --- 4. What each fault does, and the world it hits --------------------------------------------------
 
-/// A pool node comes back this long after it was lost: past the lease TTL (actors.t27
-/// NODE_TTL_SECONDS, 20 s), so its peers have seen it down and its monitors have fired before it
-/// returns. On the memory net nothing of the old node is left by then. On the store (the PgLink model)
-/// its mail waits in the table, and the new incarnation reissues the old pids to whoever starts first:
-/// the pid-reuse defect of gHashTag/trios#1712 item 6, reproduced from a seed until node incarnations
-/// land.
-pub const NODE_RESTART_MIN_SECONDS : u32 = 25;
+/// A pool node comes back this long after it was lost: from a quick container restart, inside the
+/// lease TTL (actors.t27 NODE_TTL_SECONDS, 20 s), when its peers have not yet seen it down and its
+/// mail still waits in the store, to three minutes. Before node incarnations (netlink.t27,
+/// trios#1714) a new process reissued its last incarnation's pids, and mail written for the old ones
+/// reached the new: reproduced from seed 3600507402 at step 7015 with restarts past the TTL only, which
+/// is all the first draft of this card allowed. With incarnations a restart inside the TTL is the
+/// case to search, so the range now spans it.
+pub const NODE_RESTART_MIN_SECONDS : u32 = 2;
 pub const NODE_RESTART_MAX_SECONDS : u32 = 180;
 
 /// A hung review: as the reviewer benchmark's stall (trios#1698), no timeout of its own.
@@ -233,6 +277,19 @@ pub const NET_LATENCY_MS : u32 = 5;
 /// One job of the pool.
 pub const JOB_MAX_MS : u32 = 2000;
 
+/// One job in STALE_JOB_EVERY goes to a pid remembered from earlier -- as a pid kept in a row or in
+/// another actor's state is -- whatever became of its process since. A stale pid must reach nobody: a
+/// pid reused by a later process (a restarted node handing out its last life's pids) would deliver it
+/// there. Without stale references no one ever addresses an old pid after its DOWN, and that reuse
+/// went unseen (measured: a mutant whose pids drop the incarnation passed every invariant).
+pub const STALE_JOB_EVERY : u32 = 4;
+/// The pids remembered for stale jobs: the latest this many.
+pub const STALE_PIDS_KEPT : u32 = 64;
+
+pub fn stale_job(roll: u32) -> bool {
+    return roll % STALE_JOB_EVERY == 0;
+}
+
 /// Model keys a review may take a lane on. Above the reviewer's 4 workers, so a lane held by an
 /// abandoned review still leaves one for every live turn.
 pub const REVIEW_KEYS : u32 = 6;
@@ -248,21 +305,25 @@ pub const POOL_PERIOD_SECONDS : u32 = 300;
 /// statement takes effect and its answer is lost -- the connection resets after the commit. Per
 /// ROLL_SPAN answers, and drawn per answer, so it hits one statement, not a whole node: a node lost at a
 /// step boundary almost never falls inside the few milliseconds between a DELETE and its answer
-/// (measured: 0 of 16 PgLink seeds with node loss alone), and that window is the defect.
+/// (measured: 0 of 16 PgLink seeds with node loss alone), and that window is the defect. With it, the
+/// link that deleted rows before handling them lost mail from 6 seeds of 6 tried (seed 1188652385 at
+/// step 463); the fixed link reads, handles, then acknowledges.
 pub const W_ANSWER_LOST : u32 = 10;
 
 pub fn answer_lost(roll: u32) -> bool {
     return roll % ROLL_SPAN < W_ANSWER_LOST;
 }
 
-/// A reviewer whose root gave up is started again this long after, as the next deploy would.
+/// A reviewer whose root gave up is started again this long after, as the next deploy would: in a new
+/// process, so the reviews the old one abandoned die with it and hold no row or lane any more.
 pub const GIVE_UP_REARM_SECONDS : u32 = 600;
 
-/// What performance.now advances per call during a run, at most: the slice (actors.t27 section 8) reads
-/// it, so a seed, not the host, decides when a scheduler yields. Up to 2 ms a read, about one read a
-/// turn: a scheduler then spends its 5 ms slice after a handful of turns, as a host whose turns parse
-/// and sort a queue does. At 200 us a read no run of 64 seeds ever yielded (measured, first draft of
-/// this card), and the slice went unexercised.
+/// During a run performance.now reads the virtual clock plus the work done since, and each read
+/// adds up to this much work. The slice (actors.t27 section 8) and the store link's lease age
+/// (netlink.t27, monoNow) read it, so a seed, not the host, decides when a scheduler yields and when a
+/// lease looks old. Up to 2 ms a read, about one read a turn: a scheduler then spends its 5 ms slice
+/// after a handful of turns, as a host whose turns parse and sort a queue does. At 200 us a read no
+/// run of 64 seeds ever yielded (measured, first draft of this card), and the slice went unexercised.
 pub const CLOCK_TICK_MAX_MICROS : u32 = 2000;
 
 ; --- 5. The invariants, and which of them fail the gate --------------------------------------------
@@ -287,11 +348,34 @@ pub const INV_RUNS_DIFFER : u8 = 7;
 /// A gate run whose seeds together never reached one of the rare states below: the faults stopped
 /// biting, and a green run would prove nothing.
 pub const INV_RARE_STATE_MISSED : u8 = 8;
-/// A node took mail off the wire -- deleted it from the store -- and it never reached a runtime: lost,
-/// and counted nowhere. The PgLink defect of trios#1712 item 6 (DELETE ... RETURNING before the
-/// handlers run), reproduced from a seed with W_ANSWER_LOST until it is fixed.
+/// A node took mail off the wire -- deleted it from the store -- and it never reached a runtime, nor
+/// was it expired by the card for an incarnation that is over: lost, and counted nowhere. The PgLink
+/// defect of trios#1712 item 6 (DELETE ... RETURNING before the handlers run).
 pub const INV_TAKEN_NOT_HANDLED : u8 = 9;
-pub const INV_KINDS : u8 = 10;
+/// A bee started on an issue while another bee on it still ran under a lease that was live: two
+/// dispatchers, or two incarnations of one issue's actor, both held the claim (keyed_guard.t27
+/// section 1). A bee whose lease lapsed first (its runner died) is not this: control.t27 lets the
+/// next claim land then.
+pub const INV_DUPLICATE_CLAIM : u8 = 10;
+/// More bees working for one dispatcher than its lanes, or more lanes on its board than it has.
+/// Counted after each step, from the bees themselves: a bee it asked to stop is on its way out (its
+/// runner ends it at the next poll) and is not counted, and one killed at its turn bound keeps its lane
+/// on the board until it ends (actors.t27 holds_after_kill), so no other bee works on that lane.
+pub const INV_OVER_LANES : u8 = 11;
+/// An issue that arrived and was neither done nor given up when the run ended: liveness.
+pub const INV_NOT_FINISHED : u8 = 12;
+/// A lane or a wait left behind: at the end a lane is still held on a board, by a review or in the
+/// lane queue with nothing that holds it; or an issue waited on a board with a lane free for
+/// WAITING_STUCK_SECONDS, which is an admission that nobody brings back.
+pub const INV_LANE_LEAK : u8 = 13;
+/// The call chain judged wrong: a call into a process on its own chain was not refused at once
+/// (keyed_guard.t27 section 3), or a call off the chain was refused as a cycle.
+pub const INV_CALL_CHAIN : u8 = 14;
+/// A stop that outlived its bound: a dispatcher's orderly stop took longer than its children's
+/// shutdowns (actors.t27 stop_signal), or the work of a turn deaf to its abort ran past the grace
+/// (turn_stop.t27). The early-timer defect of trios#1766 (#1809, #1811).
+pub const INV_STOP_OVERRAN : u8 = 15;
+pub const INV_KINDS : u8 = 16;
 
 /// Every invariant fails the gate. None of them is only reported: a check that cannot fail a run is a
 /// log line, and this card has no log lines.
@@ -348,12 +432,306 @@ pub const RARE_WAIT_BACKED_OFF : u8 = 4;
 pub const RARE_SLICE_YIELDED : u8 = 5;
 /// A child restarted on another node after its node was lost.
 pub const RARE_MOVED_NODE : u8 = 6;
-pub const RARE_KINDS : u8 = 7;
+/// A review stopped by its turn's abort (turn_stop.t27): only seeds with FEATURE_TURN_STOP reach it.
+pub const RARE_REVIEW_STOPPED : u8 = 7;
+/// The keyed world's (section 7). Two dispatchers met at one issue's claim, and one stood down.
+pub const RARE_STOOD_DOWN : u8 = 8;
+/// An admission crashed and its supervisor started it again (keyed_guard.t27 section 2).
+pub const RARE_ADMISSION_RESTARTED : u8 = 9;
+/// A runner died without a word, its lease lapsed, and the issue's bee started again.
+pub const RARE_LEASE_LAPSED : u8 = 10;
+/// A call cycle among keyed actors past slot 63 was refused at once.
+pub const RARE_CYCLE_REFUSED : u8 = 11;
+/// A dispatcher's stop found an actor busy past its shutdown and killed it at the timeout.
+pub const RARE_STOP_KILLED : u8 = 12;
+/// The work of a turn deaf to its abort was stopped by the escalation at the grace.
+pub const RARE_GROUP_KILLED : u8 = 13;
+/// An issue's actor crashed holding a lane with no bee running, and the lane went back.
+pub const RARE_LANE_FREED_ON_EXIT : u8 = 14;
+/// A grant whose answer reached nobody (the call timed out first) went back (grant_lands).
+pub const RARE_GRANT_TAKEN_BACK : u8 = 15;
+/// The pool's (section 8). The adaptive pool ran more workers than the fixed REVIEWER_CONCURRENCY.
+pub const RARE_POOL_GREW : u8 = 16;
+/// The adaptive pool stopped an idle worker (reviewer_sizing.t27 worker_retires).
+pub const RARE_POOL_RETIRED : u8 = 17;
+/// A review found no lane at its model call, waited in the lane queue, and was let through.
+pub const RARE_LANE_WAITED : u8 = 18;
+pub const RARE_KINDS : u8 = 19;
 
 /// Every rare state above is required.
 pub fn must_reach(state: u8) -> bool {
     return state < RARE_KINDS;
 }
+
+; --- 7. The keyed world: keyed actors and the bee dispatcher ---------------------------------------
+; t27#8987, trios#1763 (ledger trios#1729): the published actors post says "The simulation gate does not yet
+; simulate keyed actors or the adaptive reviewer pool, and nothing runs it nightly." This section is the
+; first half. What runs (gHashTag/trios tests/sim/queen-sim-keyed.ts) is the REAL bee dispatcher:
+; queen-bee-actors.ts with its keyed actors (keyed.t27), its admission under a supervisor and its lane
+; board (keyed_guard.t27 section 2), and the call chain of queen-actors-links.ts (section 3). It runs
+; twice over: KEYED_DISPATCHERS dispatchers of one deployment, under one process name, each holder
+; naming its process's boot (section 1), over one lease table the world keeps by keyed_guard.t27
+; claim_lands_for. What is simulated is what the dispatcher talks to: the store (the leases, the
+; policy's word), the bees (a runner's process: it works, fails, dies without a word or hangs), the
+; round that readies the open issues every minute, and the faults below.
+
+/// Keyed cases one gate run plays, each run twice like every case. Their seeds are run_seed over
+/// KEYED_BASE_SEED (the ledger's number), so they are not the reviewer world's seeds. Measured
+/// 2026-10-11 on the Queen's Mac (Bun 1.3.11, load 5-7): a keyed run of STEPS_PER_RUN steps and its
+/// eight-hour tail takes 0.2-0.9 s, so eight cases cost the gate about as much as eight memory runs.
+/// With four, the gate's keyed cases missed a rare state (a crashed issue actor giving its lane back)
+/// that 8 of 16 keyed seeds reach.
+pub const KEYED_SEEDS_PER_RUN : u32 = 8;
+pub const KEYED_BASE_SEED : u32 = 1729;
+
+/// Two replicas of one deployment: their pids are drawn alike (both count slots from 1), so only the
+/// boot in the holder tells their claims apart (keyed_guard.t27, 16 and 17 duplicate pickups in two
+/// runs with the pid alone, trios#1749).
+pub const KEYED_DISPATCHERS : u32 = 2;
+
+/// Lanes each dispatcher may fill. Few, so issues wait on the board and lanes free while the
+/// admission is down: the paths section 2 of keyed_guard.t27 is about.
+pub const KEYED_LANES : u32 = 4;
+
+/// The round readies every open issue on this period, as the round of queen-tick.ts still does with
+/// the actors (the actors-round runtime of the keyed benchmark); an arrival is also readied at once.
+pub const KEYED_ROUND_SECONDS : u32 = 60;
+
+/// The round reaps any runner task older than this (gHashTag/trios queen-runner-work.ts
+/// RUNNER_CAP_MINUTES, 360, a literal the harness checks): the one thing that frees an issue whose bee
+/// hangs on its runner after the process that started it is gone, since a redeploy takes the bee's
+/// turn bound with it and the runner keeps renewing the lease.
+pub const SIM_RUNNER_CAP_SECONDS : u32 = 21600;
+
+/// After the steps, a quiet tail long enough for the last arrival's bee to end, fail its way to a
+/// give-up, be found dead by its lapsed lease, or, orphaned by a redeploy while it hangs, be reaped at
+/// the runner cap and run again: eight hours, one hash a minute.
+pub const KEYED_TAIL_SECONDS : u32 = 28800;
+
+/// The keyed world's events, one a step, from a roll taken modulo ROLL_SPAN like step_event's.
+pub const K_TICK : u8 = 0;
+pub const K_ARRIVAL : u8 = 1;
+pub const KF_ADMISSION_CRASH : u8 = 2;
+pub const KF_ISSUE_CRASH : u8 = 3;
+pub const KF_POLICY_STALL : u8 = 4;
+pub const KF_DEPLOY : u8 = 5;
+pub const KF_CYCLE_PROBE : u8 = 6;
+pub const KF_DEAF_TURN : u8 = 7;
+pub const K_EVENT_KINDS : u8 = 8;
+
+/// An issue becomes ready: about 120 a run, 22 an hour at STEP_MAX_MS.
+pub const KW_ARRIVAL : u32 = 120;
+/// One dispatcher's admission throws in its next turn (its lane count cannot be read).
+pub const KW_ADMISSION_CRASH : u32 = 4;
+/// One live issue actor of one dispatcher crashes: one in a turn when there is one (admitting, or with
+/// its claim out to the store), since that is the crash a turn's await outlives. The first runs of this
+/// world found a dispatcher running 5 bees on 4 lanes this way (seed 1072413183): the actor died with
+/// its claim out, gave its lane back, and the claim then started a bee on no lane.
+pub const KW_ISSUE_CRASH : u32 = 40;
+/// One dispatcher's next policy answer takes POLICY_STALL_SECONDS, past the admission call's
+/// ADMIT_AFTER_SECONDS: the call ends first, and a grant written meanwhile reaches nobody.
+pub const KW_POLICY_STALL : u32 = 6;
+/// One dispatcher is redeployed while its claims hang: its actors are in claims when the stop comes.
+pub const KW_DEPLOY : u32 = 3;
+/// A chain of calls among keyed actors, closed into a cycle or not.
+pub const KW_CYCLE_PROBE : u32 = 30;
+/// A turn whose isolated work is deaf to its abort is killed at its bound.
+pub const KW_DEAF_TURN : u32 = 6;
+
+pub fn keyed_event(roll: u32) -> u8 {
+    let r : u32 = roll % ROLL_SPAN;
+    var edge : u32 = KW_ARRIVAL;
+    if (r < edge) { return K_ARRIVAL; }
+    edge = edge + KW_ADMISSION_CRASH;
+    if (r < edge) { return KF_ADMISSION_CRASH; }
+    edge = edge + KW_ISSUE_CRASH;
+    if (r < edge) { return KF_ISSUE_CRASH; }
+    edge = edge + KW_POLICY_STALL;
+    if (r < edge) { return KF_POLICY_STALL; }
+    edge = edge + KW_DEPLOY;
+    if (r < edge) { return KF_DEPLOY; }
+    edge = edge + KW_CYCLE_PROBE;
+    if (r < edge) { return KF_CYCLE_PROBE; }
+    edge = edge + KW_DEAF_TURN;
+    if (r < edge) { return KF_DEAF_TURN; }
+    return K_TICK;
+}
+
+/// A bee's fate, drawn per attempt (STREAM_ATTEMPT): it works; it fails and says so (a provider
+/// error); its runner dies without a word, so only its lease lapsing tells; or it hangs, alive and
+/// vouched for, until its turn bound kills it and a stop ends it at the runner's next poll.
+pub const BEE_OK : u8 = 0;
+pub const BEE_FAIL : u8 = 1;
+pub const BEE_CRASH : u8 = 2;
+pub const BEE_HANG : u8 = 3;
+pub const BEE_FAIL_PER_MILLE : u32 = 80;
+pub const BEE_CRASH_PER_MILLE : u32 = 50;
+pub const BEE_HANG_PER_MILLE : u32 = 30;
+
+pub fn bee_fate(roll: u32) -> u8 {
+    let r : u32 = roll % 1000;
+    if (r < BEE_FAIL_PER_MILLE) { return BEE_FAIL; }
+    if (r < BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE) { return BEE_CRASH; }
+    if (r < BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE + BEE_HANG_PER_MILLE) { return BEE_HANG; }
+    return BEE_OK;
+}
+
+/// A bee's work, one to thirty minutes; a failure comes 30 percent of the way, a silent death half way
+/// and a hang a fifth of the way, as the keyed benchmark's bees do (trios tests/api/queen-bee-sim.ts).
+pub const BEE_MIN_SECONDS : u32 = 60;
+pub const BEE_MAX_SECONDS : u32 = 1800;
+pub const BEE_FAIL_PERCENT : u32 = 30;
+pub const BEE_CRASH_PERCENT : u32 = 50;
+pub const BEE_HANG_PERCENT : u32 = 20;
+
+/// The bee actor's turn bound here: above every bee that works, so only a hang is killed.
+pub const BEE_TURN_MAX_SECONDS : u32 = 2400;
+
+/// A runner renews its bee's lease once a minute while it lives, and polls for a stop every 15 s.
+pub const HEARTBEAT_SECONDS : u32 = 60;
+pub const RUNNER_POLL_SECONDS : u32 = 15;
+
+/// The store's answers: the policy (queend) and a claim with its row and offer, as the keyed benchmark
+/// assumes them (trios tests/api/queen-bee-sim.ts QUEEND_MS, DISPATCH_MS).
+pub const POLICY_MS : u32 = 500;
+pub const CLAIM_MS : u32 = 1000;
+
+/// How long an issue's call to the admission waits (queen-bee-actors.ts admitAfterMs), and how long a
+/// stalled policy answer takes: longer, so the call ends first.
+pub const ADMIT_AFTER_SECONDS : u32 = 30;
+pub const POLICY_STALL_SECONDS : u32 = 40;
+
+/// A redeploy: from the step the dispatcher's claims (the dispatch row's statement) hang this long, every
+/// open issue is readied, and the stop begins DEPLOY_STOP_AFTER_MS later, so the issues granted a lane
+/// meanwhile are in their claim when it comes. Not the policy: the stop takes the admission down first,
+/// and a call to it ends at once with the admission's DOWN, so an actor waiting on the policy is never
+/// busy at its stop (measured, first draft of this world: every stop took 0 ms). The new process boots
+/// DEPLOY_GAP_SECONDS after its stop ended, and its holder names a new boot.
+pub const CLAIM_HANG_SECONDS : u32 = 30;
+pub const DEPLOY_STOP_AFTER_MS : u32 = 2000;
+pub const DEPLOY_GAP_SECONDS : u32 = 20;
+
+/// actors.t27 WORKER_SHUTDOWN_MS, a literal (the harness checks it against the actors card's own):
+/// what each issue actor gets to finish when its dispatcher stops, one after another.
+pub const SIM_WORKER_SHUTDOWN_MS : u32 = 5000;
+
+/// An orderly stop of `stopped` children, one after another, each given `shutdown_ms`, took
+/// `elapsed_ms`: overran when it took longer than all of them. The harness asks it of the whole stop and
+/// of each child alone (stopped = 1, from the exit before it): idle children end at once, so a busy one
+/// that outlives its own shutdown would hide inside the others' share of the whole.
+pub fn stop_overran(elapsed_ms: u32, stopped: u32, shutdown_ms: u32) -> bool {
+    let bound : u64 = (stopped as u64) * (shutdown_ms as u64);
+    return (elapsed_ms as u64) > bound;
+}
+
+/// The call-chain probe: keyed actors on a node of their own, which starts PROBE_FILLERS processes
+/// first (actors.t27 CHAIN_SLOTS, 64, a literal), so every probe's slot is past the slot chain of
+/// actors.t27 and only keyed_guard.t27's pid chain can see a cycle. Each probe is a chain of 2 to
+/// CHAIN_PROBE_MAX keyed actors, each calling the next while it serves the call before; the last one
+/// calls back into the chain (a cycle, and its callee may be itself) unless the roll says the chain
+/// ends at a fresh key. Calls wait PROBE_CALL_MS at most.
+pub const PROBE_FILLERS : u32 = 64;
+pub const CHAIN_PROBE_MAX : u32 = 5;
+pub const PROBE_CALL_MS : u32 = 5000;
+pub const PROBE_OPEN_EVERY : u32 = 4;
+
+pub fn probe_length(roll: u32) -> u32 {
+    return pick_between(roll, 2, CHAIN_PROBE_MAX);
+}
+
+/// Whether a probe ends at a fresh key instead of closing a cycle: one in PROBE_OPEN_EVERY.
+pub fn probe_open(roll: u32) -> bool {
+    return roll % PROBE_OPEN_EVERY == 0;
+}
+
+/// Which earlier link of a chain of `length` the last call goes back to.
+pub fn probe_back_to(roll: u32, length: u32) -> u32 {
+    if (length == 0) { return 0; }
+    return roll % length;
+}
+
+/// The deaf turn: its bound, and how long its isolated work would run if nothing stopped it. The work
+/// ignores its abort, so the escalation at turn_stop.t27 TURN_STOP_GRACE_MS (3000, a literal the
+/// harness checks) must stop it.
+pub const DEAF_TURN_SECONDS : u32 = 30;
+pub const DEAF_WORK_SECONDS : u32 = 3600;
+pub const SIM_TURN_STOP_GRACE_MS : u32 = 3000;
+
+/// Whether deaf work still running `ms_after_kill` after its turn's kill has outlived the grace.
+pub fn deaf_work_overran(ms_after_kill: u32) -> bool {
+    return ms_after_kill > SIM_TURN_STOP_GRACE_MS;
+}
+
+/// The host's timers come back early (trios#1766: Bun's setTimeout(fn, 3000) ran when Date.now said
+/// 2997-2999 ms had passed, 27 of 100 grace timers under a CPU burner). Every second keyed seed runs on
+/// a clock whose every timer fires up to TIMER_EARLY_MAX_MS early, drawn per timer (STREAM_EARLY), never
+/// below 1 ms for a timer asked for 1 ms or more.
+pub const FEATURE_EARLY_TIMERS : u32 = 8;
+pub const EARLY_TIMERS_EVERY : u32 = 2;
+pub const TIMER_EARLY_MAX_MS : u32 = 3;
+pub const STREAM_EARLY : u32 = 10;
+pub const STREAM_LANES : u32 = 11;
+
+pub fn keyed_features(i: u32) -> u32 {
+    if (i % EARLY_TIMERS_EVERY == 1) { return FEATURE_EARLY_TIMERS; }
+    return 0;
+}
+
+pub fn timer_early_ms(roll: u32, ms: u32) -> u32 {
+    if (ms == 0) { return 0; }
+    let early : u32 = pick_between(roll, 0, TIMER_EARLY_MAX_MS);
+    if (early >= ms) { return ms - 1; }
+    return early;
+}
+
+/// An open issue (neither done nor given up) that waits on a board while a lane is free is woken by the
+/// admission at once, or once the admission is back: its restart backoff (actors.t27, 10 s doubling) is
+/// well inside this bound, and the round readies it every KEYED_ROUND_SECONDS anyway. Past it the
+/// admission is not coming back. A done issue may wait longer and is not judged: a wake asks one waiting
+/// issue per free lane, and when those are refused (the other dispatcher did them) the rest wait until
+/// the next lane frees (found by a 64-seed soak, seed 782525349; keyed_guard.t27 has no rule for a
+/// wake after a refusal, a follow-up of trios#1763).
+pub const WAITING_STUCK_SECONDS : u32 = 600;
+
+pub fn waiting_stuck(seconds_with_lane_free: u32) -> bool {
+    return seconds_with_lane_free >= WAITING_STUCK_SECONDS;
+}
+
+/// A lane on a board belongs to an issue whose actor is in a turn (admitting, claiming), or whose bee
+/// runs. Between the two it is held only for a turn's length: the longest is a claim that hangs through
+/// a redeploy, CLAIM_HANG_SECONDS, or a policy answer that stalls, POLICY_STALL_SECONDS. A lane held
+/// with neither for LANE_IDLE_SECONDS is held by nobody: a grant that reached a caller who had already
+/// given up on it (an alias left alive by a call that ended early), or a give-back that never came.
+pub const LANE_IDLE_SECONDS : u32 = 120;
+
+pub fn lane_held_by_nobody(seconds_idle: u32) -> bool {
+    return seconds_idle >= LANE_IDLE_SECONDS;
+}
+
+; --- 8. The adaptive reviewer pool, with and without the lane queue ---------------------------------
+; The second half of the trios#1763 gap. The reviewer world of sections 3-4 runs, on the seeds
+; seed_features names, with the adaptive pool (a dynamic supervisor the intake sizes by reviewer_sizing.t27
+; pool_target, or review_lanes.t27 pool_target_queued with the queue) and with the lane queue (a review
+; that finds no lane at its model call waits for one). Both need lanes to be scarce at times, so on those
+; seeds bees hold some of the REVIEW_KEYS keys: a new count every LANE_EPOCH_STEPS steps, from 0 to
+; BEE_KEYS_MAX. A review with the queue spends its first WITNESS_PERCENT on no lane (its witness and
+; criteria), then asks for one, as the benchmark of review_lanes.t27 has it.
+
+pub const LANE_EPOCH_STEPS : u32 = 150;
+pub const BEE_KEYS_MAX : u32 = 5;
+pub const WITNESS_PERCENT : u32 = 30;
+
+/// The memory the pool is sized against: 8 GB free, and the review not measured, so reviewer_sizing.t27
+/// charges REVIEW_MB_UNTIL_MEASURED and memory admits REVIEWER_CEILING.
+pub const POOL_FREE_MB : u32 = 8192;
+
+pub fn bee_keys(roll: u32) -> u32 {
+    return pick_between(roll, 0, BEE_KEYS_MAX);
+}
+
+/// reviewer.t27 REVIEWER_CEILING (16), a literal the harness checks: the most review turns the
+/// adaptive pool may run at once, and the most reviews the lane queue may hold waiting.
+pub const SIM_REVIEWER_CEILING : u32 = 16;
 
 ; --- tests -----------------------------------------------------------------------------------------
 
@@ -430,12 +808,173 @@ test the_six_named_faults_and_the_crash_are_faults_and_work_is_not {
     assert is_fault(EVENT_KINDS) == false;
 }
 
+test every_second_seed_runs_with_turns_that_stop {
+    assert seed_features(0) == 0;
+    assert seed_features(1) == FEATURE_TURN_STOP;
+    assert has_feature(seed_features(2), FEATURE_TURN_STOP) == false;
+    assert has_feature(seed_features(15), FEATURE_TURN_STOP) == true;
+    assert has_feature(seed_features(4294967295), FEATURE_TURN_STOP) == true;
+    assert has_feature(seed_features(1), FEATURE_TURN_STOP) == true;
+    assert has_feature(seed_features(0), FEATURE_TURN_STOP) == false;
+    // no feature is not a feature every seed has
+    assert has_feature(3, 0) == false;
+    // half the gate's seeds, whatever SEEDS_PER_RUN is
+    var on : u32 = 0;
+    var i : u32 = 0;
+    while (i < SEEDS_PER_RUN) {
+        if (has_feature(seed_features(i), FEATURE_TURN_STOP)) { on = on + 1; }
+        i = i + 1;
+    }
+    assert on == SEEDS_PER_RUN / TURN_STOP_EVERY;
+}
+
+test the_gate_seeds_hold_every_reviewer_combination_twice {
+    // seed index -> its bits: turn stop, the adaptive pool, the lane queue
+    assert seed_features(2) == FEATURE_ADAPTIVE_POOL;
+    assert seed_features(3) == FEATURE_ADAPTIVE_POOL + FEATURE_TURN_STOP;
+    assert seed_features(4) == FEATURE_LANE_QUEUE;
+    assert seed_features(6) == FEATURE_ADAPTIVE_POOL + FEATURE_LANE_QUEUE;
+    assert seed_features(7) == FEATURE_ADAPTIVE_POOL + FEATURE_LANE_QUEUE + FEATURE_TURN_STOP;
+    assert seed_features(8) == 0;
+    assert seed_features(15) == FEATURE_ADAPTIVE_POOL + FEATURE_LANE_QUEUE + FEATURE_TURN_STOP;
+    // the store seeds keep the fixed 4 and no queue
+    var s : u32 = 0;
+    while (s < STORE_SEEDS_PER_RUN) {
+        assert has_feature(seed_features(s), FEATURE_ADAPTIVE_POOL) == false;
+        assert has_feature(seed_features(s), FEATURE_LANE_QUEUE) == false;
+        s = s + 1;
+    }
+    // each of the eight combinations on exactly SEEDS_PER_RUN / 8 seeds
+    var combo : u32 = 0;
+    while (combo < 8) {
+        var n : u32 = 0;
+        var i : u32 = 0;
+        while (i < SEEDS_PER_RUN) {
+            if (seed_features(i) == combo) { n = n + 1; }
+            i = i + 1;
+        }
+        assert n == SEEDS_PER_RUN / 8;
+        combo = combo + 1;
+    }
+    // the adaptive pool with and without the queue, both on half of the adaptive seeds
+    assert has_feature(seed_features(2), FEATURE_LANE_QUEUE) == false;
+    assert has_feature(seed_features(6), FEATURE_LANE_QUEUE) == true;
+}
+
+test the_keyed_mix_gives_each_event_its_band {
+    assert keyed_event(0) == K_ARRIVAL;
+    assert keyed_event(KW_ARRIVAL - 1) == K_ARRIVAL;
+    let a : u32 = KW_ARRIVAL;
+    assert keyed_event(a) == KF_ADMISSION_CRASH;
+    let b : u32 = a + KW_ADMISSION_CRASH;
+    assert keyed_event(b - 1) == KF_ADMISSION_CRASH;
+    assert keyed_event(b) == KF_ISSUE_CRASH;
+    let c : u32 = b + KW_ISSUE_CRASH;
+    assert keyed_event(c) == KF_POLICY_STALL;
+    let d : u32 = c + KW_POLICY_STALL;
+    assert keyed_event(d) == KF_DEPLOY;
+    let e : u32 = d + KW_DEPLOY;
+    assert keyed_event(e) == KF_CYCLE_PROBE;
+    let f : u32 = e + KW_CYCLE_PROBE;
+    assert keyed_event(f) == KF_DEAF_TURN;
+    let g : u32 = f + KW_DEAF_TURN;
+    assert keyed_event(g - 1) == KF_DEAF_TURN;
+    assert keyed_event(g) == K_TICK;
+    assert keyed_event(ROLL_SPAN - 1) == K_TICK;
+    assert keyed_event(ROLL_SPAN) == K_ARRIVAL;
+    assert keyed_event(4294967295) == keyed_event(4294967295 % ROLL_SPAN);
+}
+
+test a_bee_fate_takes_its_band_of_a_thousand {
+    assert bee_fate(0) == BEE_FAIL;
+    assert bee_fate(BEE_FAIL_PER_MILLE - 1) == BEE_FAIL;
+    assert bee_fate(BEE_FAIL_PER_MILLE) == BEE_CRASH;
+    assert bee_fate(BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE - 1) == BEE_CRASH;
+    assert bee_fate(BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE) == BEE_HANG;
+    assert bee_fate(BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE + BEE_HANG_PER_MILLE - 1) == BEE_HANG;
+    assert bee_fate(BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE + BEE_HANG_PER_MILLE) == BEE_OK;
+    assert bee_fate(999) == BEE_OK;
+    assert bee_fate(1000) == BEE_FAIL;
+}
+
+test a_stop_is_bounded_by_its_childrens_shutdowns {
+    assert stop_overran(0, 0, SIM_WORKER_SHUTDOWN_MS) == false;
+    assert stop_overran(1, 0, SIM_WORKER_SHUTDOWN_MS) == true;
+    assert stop_overran(15000, 3, 5000) == false;
+    assert stop_overran(15001, 3, 5000) == true;
+    // a child killed at its timeout, one millisecond late, overruns: the early-timer defect let a busy
+    // child live until its own call ended, 30 s for a stalled store
+    assert stop_overran(5001, 1, 5000) == true;
+    assert stop_overran(30000, 1, 5000) == true;
+    // no wrap
+    assert stop_overran(4294967295, 4294967295, 4294967295) == false;
+    // the deaf turn's work: stopped at the grace and no later
+    assert deaf_work_overran(SIM_TURN_STOP_GRACE_MS) == false;
+    assert deaf_work_overran(SIM_TURN_STOP_GRACE_MS + 1) == true;
+    assert deaf_work_overran(0) == false;
+}
+
+test a_probe_is_a_chain_that_closes_or_ends {
+    assert probe_length(0) == 2;
+    assert probe_length(CHAIN_PROBE_MAX - 2) == CHAIN_PROBE_MAX;
+    assert probe_length(CHAIN_PROBE_MAX - 1) == 2;
+    assert probe_open(0) == true;
+    assert probe_open(PROBE_OPEN_EVERY) == true;
+    assert probe_open(1) == false;
+    assert probe_back_to(7, 3) == 1;
+    assert probe_back_to(2, 3) == 2;
+    assert probe_back_to(5, 0) == 0;
+}
+
+test an_early_timer_is_a_few_ms_early_and_never_skipped {
+    assert timer_early_ms(0, 3000) == 0;
+    assert timer_early_ms(TIMER_EARLY_MAX_MS, 3000) == TIMER_EARLY_MAX_MS;
+    assert timer_early_ms(TIMER_EARLY_MAX_MS + 1, 3000) == 0;
+    // a 1 ms timer still waits its 1 ms, and so does a 0 ms one its 0
+    assert timer_early_ms(3, 1) == 0;
+    assert timer_early_ms(3, 0) == 0;
+    // a 2 ms timer fires after 1 ms at the earliest
+    assert timer_early_ms(3, 2) == 1;
+    assert keyed_features(0) == 0;
+    assert keyed_features(1) == FEATURE_EARLY_TIMERS;
+    assert has_feature(keyed_features(3), FEATURE_EARLY_TIMERS) == true;
+}
+
+test a_lane_with_no_turn_and_no_bee_is_held_by_nobody_past_the_longest_turn {
+    assert lane_held_by_nobody(0) == false;
+    assert lane_held_by_nobody(CLAIM_HANG_SECONDS) == false;
+    assert lane_held_by_nobody(POLICY_STALL_SECONDS) == false;
+    assert lane_held_by_nobody(LANE_IDLE_SECONDS - 1) == false;
+    assert lane_held_by_nobody(LANE_IDLE_SECONDS) == true;
+    assert lane_held_by_nobody(4294967295) == true;
+}
+
+test a_wait_with_a_lane_free_is_stuck_only_past_the_admissions_return {
+    assert waiting_stuck(0) == false;
+    assert waiting_stuck(WAITING_STUCK_SECONDS - 1) == false;
+    assert waiting_stuck(WAITING_STUCK_SECONDS) == true;
+    // the admission's restart backoffs, 10 + 20 + 40 s, are far inside the bound
+    assert waiting_stuck(70) == false;
+    assert bee_keys(0) == 0;
+    assert bee_keys(BEE_KEYS_MAX) == BEE_KEYS_MAX;
+    assert bee_keys(BEE_KEYS_MAX + 1) == 0;
+}
+
 test a_store_answer_is_lost_in_its_band_only {
     assert answer_lost(0) == true;
     assert answer_lost(W_ANSWER_LOST - 1) == true;
     assert answer_lost(W_ANSWER_LOST) == false;
     assert answer_lost(ROLL_SPAN - 1) == false;
     assert answer_lost(ROLL_SPAN) == true;
+}
+
+test one_job_in_four_goes_to_a_remembered_pid {
+    assert stale_job(0) == true;
+    assert stale_job(4) == true;
+    assert stale_job(1) == false;
+    assert stale_job(3) == false;
+    assert stale_job(4294967295) == false;
+    assert stale_job(4294967292) == true;
 }
 
 test a_burst_always_overflows_the_mailbox {
@@ -478,6 +1017,12 @@ test every_invariant_fails_the_gate_and_none_is_a_log_line {
     assert fails_gate(INV_RUNS_DIFFER);
     assert fails_gate(INV_RARE_STATE_MISSED);
     assert fails_gate(INV_TAKEN_NOT_HANDLED);
+    assert fails_gate(INV_DUPLICATE_CLAIM);
+    assert fails_gate(INV_OVER_LANES);
+    assert fails_gate(INV_NOT_FINISHED);
+    assert fails_gate(INV_LANE_LEAK);
+    assert fails_gate(INV_CALL_CHAIN);
+    assert fails_gate(INV_STOP_OVERRAN);
     assert fails_gate(INV_KINDS) == false;
 }
 
@@ -489,16 +1034,56 @@ test every_rare_state_is_required {
     assert must_reach(RARE_WAIT_BACKED_OFF);
     assert must_reach(RARE_SLICE_YIELDED);
     assert must_reach(RARE_MOVED_NODE);
+    assert must_reach(RARE_REVIEW_STOPPED);
+    assert must_reach(RARE_STOOD_DOWN);
+    assert must_reach(RARE_ADMISSION_RESTARTED);
+    assert must_reach(RARE_LEASE_LAPSED);
+    assert must_reach(RARE_CYCLE_REFUSED);
+    assert must_reach(RARE_STOP_KILLED);
+    assert must_reach(RARE_GROUP_KILLED);
+    assert must_reach(RARE_LANE_FREED_ON_EXIT);
+    assert must_reach(RARE_GRANT_TAKEN_BACK);
+    assert must_reach(RARE_POOL_GREW);
+    assert must_reach(RARE_POOL_RETIRED);
+    assert must_reach(RARE_LANE_WAITED);
     assert must_reach(RARE_KINDS) == false;
 }
 
 invariant the_gate_is_resonates_shape { assert STEPS_PER_RUN == 10000 and RUNS_PER_SEED == 2 and SEEDS_PER_RUN >= 8; }
+invariant some_jobs_are_stale_and_most_are_not { assert STALE_JOB_EVERY >= 2 and STALE_PIDS_KEPT >= POOL_WORKERS; }
+invariant the_store_runs_fewer_seeds_and_some { assert STORE_SEEDS_PER_RUN >= 1 and STORE_SEEDS_PER_RUN < SEEDS_PER_RUN and TURN_STOP_EVERY >= 2; }
 invariant the_mix_fits_its_span { assert W_ARRIVAL + W_JOB + W_NODE_LOSS + W_HUNG_TURN + W_MAILBOX_OVERFLOW + W_UNREADABLE_ROW + W_PROVIDER_429 + W_STALE_LEASE + W_CRASH < ROLL_SPAN; }
 invariant every_fault_happens_in_every_run { assert W_NODE_LOSS >= 1 and W_HUNG_TURN >= 1 and W_MAILBOX_OVERFLOW >= 1 and W_UNREADABLE_ROW >= 1 and W_PROVIDER_429 >= 1 and W_STALE_LEASE >= 1 and W_CRASH >= 1; }
-/// A node restart is past the lease TTL (actors.t27 NODE_TTL_SECONDS = 20).
-invariant a_restart_waits_out_the_lease { assert NODE_RESTART_MIN_SECONDS > 20 and NODE_RESTART_MIN_SECONDS <= NODE_RESTART_MAX_SECONDS; }
+/// Node restarts fall on both sides of the lease TTL (actors.t27 NODE_TTL_SECONDS = 20).
+invariant a_restart_spans_the_lease { assert NODE_RESTART_MIN_SECONDS < 20 and NODE_RESTART_MAX_SECONDS > 20 and NODE_RESTART_MIN_SECONDS >= 1; }
 /// A hung review outlives its turn (reviewer.t27 REVIEW_ROW_SECONDS = 300) and a readable one does not.
 invariant a_stall_outlives_its_turn_and_a_review_does_not { assert STALL_SECONDS > 300 and REVIEW_MAX_SECONDS < 300 and REVIEW_MIN_SECONDS >= 1; }
 invariant the_tail_outlives_every_window { assert TAIL_SECONDS >= STALL_SECONDS and TAIL_SECONDS >= PROVIDER_429_MAX_SECONDS and TAIL_SECONDS >= NODE_RESTART_MAX_SECONDS and TAIL_SECONDS >= GIVE_UP_REARM_SECONDS; }
-invariant the_streams_are_distinct { assert STREAM_SEED < STREAM_STEP and STREAM_STEP < STREAM_DELAY and STREAM_DELAY < STREAM_TARGET and STREAM_TARGET < STREAM_DURATION and STREAM_DURATION < STREAM_ATTEMPT and STREAM_ATTEMPT < STREAM_LATENCY and STREAM_LATENCY < STREAM_CLOCK and STREAM_CLOCK < STREAM_STORE; }
+invariant the_streams_are_distinct { assert STREAM_SEED < STREAM_STEP and STREAM_STEP < STREAM_DELAY and STREAM_DELAY < STREAM_TARGET and STREAM_TARGET < STREAM_DURATION and STREAM_DURATION < STREAM_ATTEMPT and STREAM_ATTEMPT < STREAM_LATENCY and STREAM_LATENCY < STREAM_CLOCK and STREAM_CLOCK < STREAM_STORE and STREAM_STORE < STREAM_EARLY and STREAM_EARLY < STREAM_LANES; }
 invariant a_lost_answer_is_rare { assert W_ANSWER_LOST >= 1 and W_ANSWER_LOST * 100 <= ROLL_SPAN; }
+/// The feature bits are distinct single bits.
+invariant the_features_are_bits { assert FEATURE_TURN_STOP == 1 and FEATURE_ADAPTIVE_POOL == 2 and FEATURE_LANE_QUEUE == 4 and FEATURE_EARLY_TIMERS == 8; }
+/// Two dispatchers at least, so claims meet; a few keyed cases, each with and without early timers.
+invariant the_keyed_world_has_two_dispatchers_and_both_clocks { assert KEYED_DISPATCHERS >= 2 and KEYED_LANES >= 1 and KEYED_SEEDS_PER_RUN >= EARLY_TIMERS_EVERY and KEYED_BASE_SEED != GATE_BASE_SEED; }
+invariant the_keyed_mix_fits_its_span { assert KW_ARRIVAL + KW_ADMISSION_CRASH + KW_ISSUE_CRASH + KW_POLICY_STALL + KW_DEPLOY + KW_CYCLE_PROBE + KW_DEAF_TURN < ROLL_SPAN; }
+invariant every_keyed_fault_happens_in_every_run { assert KW_ADMISSION_CRASH >= 1 and KW_ISSUE_CRASH >= 1 and KW_POLICY_STALL >= 1 and KW_DEPLOY >= 1 and KW_CYCLE_PROBE >= 1 and KW_DEAF_TURN >= 1 and BEE_CRASH_PER_MILLE >= 1 and BEE_HANG_PER_MILLE >= 1 and BEE_FAIL_PER_MILLE >= 1; }
+/// The fates fit a thousand, and a bee's failure, death and hang come inside its work.
+invariant the_fates_fit { assert BEE_FAIL_PER_MILLE + BEE_CRASH_PER_MILLE + BEE_HANG_PER_MILLE < 1000 and BEE_FAIL_PERCENT < 100 and BEE_CRASH_PERCENT < 100 and BEE_HANG_PERCENT < 100; }
+/// Only a hang outlives the bee turn's bound; a stalled policy outlives the admission call; the store's
+/// hang outlives the shutdown, so the stop needs its kill; the deaf work outlives its turn and grace.
+invariant the_faults_cross_their_bounds { assert BEE_MAX_SECONDS < BEE_TURN_MAX_SECONDS and POLICY_STALL_SECONDS > ADMIT_AFTER_SECONDS and CLAIM_HANG_SECONDS * 1000 > SIM_WORKER_SHUTDOWN_MS + DEPLOY_STOP_AFTER_MS and DEAF_WORK_SECONDS * 1000 > DEAF_TURN_SECONDS * 1000 + SIM_TURN_STOP_GRACE_MS; }
+/// The tail outlives an orphaned hang reaped at the runner cap, and two more bee lives after it: each
+/// its bound, a stop at the next poll and a lapsed lease.
+invariant the_keyed_tail_outlives_a_reaped_bee { assert KEYED_TAIL_SECONDS >= SIM_RUNNER_CAP_SECONDS + 2 * (BEE_TURN_MAX_SECONDS + RUNNER_POLL_SECONDS + 180) and KEYED_TAIL_SECONDS % 60 == 0; }
+/// The probe's chain fits actors.t27 CALL_MAX_DEPTH (8), and its node starts past the 64 chain slots.
+invariant the_probe_fits_the_chain { assert CHAIN_PROBE_MAX >= 2 and CHAIN_PROBE_MAX <= 8 and PROBE_FILLERS >= 64 and PROBE_OPEN_EVERY >= 2; }
+/// An early timer is early by a few ms, not by a heartbeat; a stuck wait outlasts the admission's backoff.
+invariant early_is_a_few_ms { assert TIMER_EARLY_MAX_MS >= 1 and TIMER_EARLY_MAX_MS < 10 and WAITING_STUCK_SECONDS > ADMIT_AFTER_SECONDS + 70; }
+/// A lane is idle-held by nobody only past every turn that may hold it, with a round of slack.
+invariant a_turn_fits_inside_the_idle_bound { assert LANE_IDLE_SECONDS > CLAIM_HANG_SECONDS + KEYED_ROUND_SECONDS and LANE_IDLE_SECONDS > POLICY_STALL_SECONDS + KEYED_ROUND_SECONDS; }
+/// Bees never hold every key, and the pool's memory admits the ceiling at the unmeasured 512 MB.
+invariant the_pool_world_leaves_a_lane { assert BEE_KEYS_MAX < REVIEW_KEYS and WITNESS_PERCENT < 100 and POOL_FREE_MB / 512 >= SIM_REVIEWER_CEILING and LANE_EPOCH_STEPS >= 1; }
+/// The literals owned elsewhere: actors.t27 WORKER_SHUTDOWN_MS, turn_stop.t27 TURN_STOP_GRACE_MS,
+/// reviewer.t27 REVIEWER_CEILING and queen-runner-work.ts RUNNER_CAP_MINUTES. The harness holds them
+/// equal to their owners' own constants.
+invariant the_literals_match_their_owners { assert SIM_WORKER_SHUTDOWN_MS == 5000 and SIM_TURN_STOP_GRACE_MS == 3000 and SIM_REVIEWER_CEILING == 16 and SIM_RUNNER_CAP_SECONDS == 360 * 60; }

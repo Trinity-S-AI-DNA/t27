@@ -39,6 +39,7 @@
 #define MSG_SCENARIOS "missing: ## User Scenarios -- at least one Given/When/Then scenario$"
 #define MSG_REQUIREMENTS "missing: ## Requirements -- numbered obligations, `FR-001: ... MUST ...`$"
 #define MSG_CRITERIA "missing: ## Success Criteria -- an outcome a machine can settle: a number with a unit, a backticked file, `exit 0`, or a backticked command$"
+#define PACK 4294967296
 
 /* -------------------------------------------------------
    Function prototypes
@@ -68,6 +69,14 @@ uint8_t judge(uint8_t* buf, size_t n);
 size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
 size_t put_line(uint8_t* out, size_t w, size_t cap, uint8_t* msg);
 uint32_t check_issue(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
+uint64_t boundary_line(uint8_t* buf, size_t n, uint32_t k);
+size_t path_token_end(uint8_t* buf, size_t f, size_t t);
+uint64_t line_path(uint8_t* buf, size_t f, size_t t);
+uint64_t line_region(uint8_t* buf, size_t f, size_t t);
+size_t skip_at(uint8_t* text, size_t n, size_t i);
+bool defines_at(uint8_t* text, size_t n, size_t i, uint8_t* name, size_t nlen);
+uint64_t item_span(uint8_t* text, size_t n, uint8_t* name, size_t nlen);
+bool edit_inside(uint32_t lo, uint32_t hi, uint32_t s, uint32_t e);
 
 /* -------------------------------------------------------
    Function implementations
@@ -447,6 +456,322 @@ uint32_t check_issue(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
     return missing;
 }
 
+uint64_t boundary_line(uint8_t* buf, size_t n, uint32_t k) {
+    bool inside = false;
+    uint32_t seen = 0;
+    size_t s = 0;
+    while ((s < n)) {
+        size_t e = s;
+        while (((e < n) && (buf[e] != '\n'))) {
+            e += 1;
+        }
+        size_t f = s;
+        size_t t = e;
+        while (((f < t) && is_space(buf[f]))) {
+            f += 1;
+        }
+        while (((t > f) && is_space(buf[(t - 1)]))) {
+            t -= 1;
+        }
+        if (((((t >= (f + 3)) && (buf[f] == '#')) && (buf[(f + 1)] == '#')) && (buf[(f + 2)] == ' '))) {
+            if (inside) {
+                return 0;
+            }
+            inside = heading_is_boundary(buf, f, t);
+        } else if (((inside && (t > f)) && line_has_path(buf, f, t))) {
+            if ((seen == k)) {
+                return ((((uint64_t)(f)) * PACK) + ((uint64_t)(t)));
+            }
+            seen += 1;
+        }
+        s = (e + 1);
+    }
+    return 0;
+}
+
+size_t path_token_end(uint8_t* buf, size_t f, size_t t) {
+    size_t i = f;
+    while ((i < t)) {
+        while (((i < t) && is_space(buf[i]))) {
+            i += 1;
+        }
+        size_t j = i;
+        while (((j < t) && (is_space(buf[j]) == false))) {
+            j += 1;
+        }
+        size_t a = i;
+        size_t b = j;
+        while (((a < b) && lead_strip(buf[a]))) {
+            a += 1;
+        }
+        while (((b > a) && tail_strip(buf[(b - 1)]))) {
+            b -= 1;
+        }
+        if (((b > a) && path_token(buf, a, b))) {
+            return j;
+        }
+        i = j;
+    }
+    return (t + 1);
+}
+
+uint64_t line_path(uint8_t* buf, size_t f, size_t t) {
+    size_t j = path_token_end(buf, f, t);
+    if ((j > t)) {
+        return 0;
+    }
+    size_t a = j;
+    while (((a > f) && (is_space(buf[(a - 1)]) == false))) {
+        a -= 1;
+    }
+    size_t b = j;
+    while (((a < b) && lead_strip(buf[a]))) {
+        a += 1;
+    }
+    while (((b > a) && tail_strip(buf[(b - 1)]))) {
+        b -= 1;
+    }
+    return ((((uint64_t)(a)) * PACK) + ((uint64_t)(b)));
+}
+
+uint64_t line_region(uint8_t* buf, size_t f, size_t t) {
+    size_t p = path_token_end(buf, f, t);
+    if ((p > t)) {
+        return 0;
+    }
+    while (((p < t) && is_space(buf[p]))) {
+        p += 1;
+    }
+    if (((p + 2) > t)) {
+        return 0;
+    }
+    if (((buf[p] != ':') || (buf[(p + 1)] != ':'))) {
+        return 0;
+    }
+    p += 2;
+    if (((p >= t) || (is_space(buf[p]) == false))) {
+        return 0;
+    }
+    while (((p < t) && is_space(buf[p]))) {
+        p += 1;
+    }
+    if (((p < t) && (buf[p] == '`'))) {
+        p += 1;
+    }
+    if ((((((p + 3) <= t) && (buf[p] == 'f')) && (buf[(p + 1)] == 'n')) && is_space(buf[(p + 2)]))) {
+        p += 3;
+        while (((p < t) && is_space(buf[p]))) {
+            p += 1;
+        }
+    }
+    size_t q = p;
+    while (((q < t) && is_word(buf[q]))) {
+        q += 1;
+    }
+    if ((q == p)) {
+        return 0;
+    }
+    if (is_digit(buf[p])) {
+        return 0;
+    }
+    if ((((((q < t) && (is_space(buf[q]) == false)) && (buf[q] != '(')) && (buf[q] != ')')) && (buf[q] != '`'))) {
+        return 0;
+    }
+    return ((((uint64_t)(p)) * PACK) + ((uint64_t)(q)));
+}
+
+size_t skip_at(uint8_t* text, size_t n, size_t i) {
+    uint8_t c = text[i];
+    if ((((c == '/') && ((i + 1) < n)) && (text[(i + 1)] == '/'))) {
+        size_t j = (i + 2);
+        while (((j < n) && (text[j] != '\n'))) {
+            j += 1;
+        }
+        return j;
+    }
+    if ((((c == '/') && ((i + 1) < n)) && (text[(i + 1)] == '*'))) {
+        size_t j = (i + 2);
+        while ((((j + 1) < n) && ((text[j] != '*') || (text[(j + 1)] != '/')))) {
+            j += 1;
+        }
+        if (((j + 1) >= n)) {
+            return n;
+        }
+        return (j + 2);
+    }
+    if ((c == 'r')) {
+        bool lone = (i == 0);
+        if ((i > 0)) {
+            lone = (is_word(text[(i - 1)]) == false);
+        }
+        if (((i > 0) && (text[(i - 1)] == 'b'))) {
+            lone = (i == 1);
+            if ((i > 1)) {
+                lone = (is_word(text[(i - 2)]) == false);
+            }
+        }
+        size_t h = (i + 1);
+        size_t hashes = 0;
+        while (((h < n) && (text[h] == '#'))) {
+            h += 1;
+            hashes += 1;
+        }
+        if (((lone && (h < n)) && (text[h] == '"'))) {
+            size_t j = (h + 1);
+            while ((j < n)) {
+                if ((text[j] == '"')) {
+                    size_t m = 0;
+                    while ((((m < hashes) && (((j + 1) + m) < n)) && (text[((j + 1) + m)] == '#'))) {
+                        m += 1;
+                    }
+                    if ((m == hashes)) {
+                        return ((j + 1) + hashes);
+                    }
+                }
+                j += 1;
+            }
+            return n;
+        }
+    }
+    if ((c == '"')) {
+        size_t j = (i + 1);
+        while (((j < n) && (text[j] != '"'))) {
+            if ((text[j] == '\\')) {
+                j += 1;
+            }
+            j += 1;
+        }
+        if ((j >= n)) {
+            return n;
+        }
+        return (j + 1);
+    }
+    if ((c == '\'')) {
+        if (((((i + 2) < n) && (text[(i + 1)] != '\\')) && (text[(i + 2)] == '\''))) {
+            return (i + 3);
+        }
+        if ((((i + 1) < n) && (text[(i + 1)] == '\\'))) {
+            size_t j = (i + 2);
+            while ((((j < n) && (j < (i + 12))) && (text[j] != '\''))) {
+                j += 1;
+            }
+            if (((j < n) && (text[j] == '\''))) {
+                return (j + 1);
+            }
+        }
+    }
+    return i;
+}
+
+bool defines_at(uint8_t* text, size_t n, size_t i, uint8_t* name, size_t nlen) {
+    if ((((i + 3) + nlen) > n)) {
+        return false;
+    }
+    if (((text[i] != 'f') || (text[(i + 1)] != 'n'))) {
+        return false;
+    }
+    if (((i > 0) && is_word(text[(i - 1)]))) {
+        return false;
+    }
+    size_t p = (i + 2);
+    if (((text[p] != ' ') && (text[p] != '\t'))) {
+        return false;
+    }
+    while (((p < n) && ((text[p] == ' ') || (text[p] == '\t')))) {
+        p += 1;
+    }
+    if (((p + nlen) > n)) {
+        return false;
+    }
+    size_t k = 0;
+    while ((k < nlen)) {
+        if ((text[(p + k)] != name[k])) {
+            return false;
+        }
+        k += 1;
+    }
+    return (word_at(text, n, (p + nlen)) == false);
+}
+
+uint64_t item_span(uint8_t* text, size_t n, uint8_t* name, size_t nlen) {
+    if ((nlen == 0)) {
+        return 0;
+    }
+    uint32_t count = 0;
+    size_t found = 0;
+    size_t i = 0;
+    while ((i < n)) {
+        size_t j = skip_at(text, n, i);
+        if ((j != i)) {
+            i = j;
+        } else {
+            if (defines_at(text, n, i, name, nlen)) {
+                count += 1;
+                found = i;
+            }
+            i += 1;
+        }
+    }
+    if ((count != 1)) {
+        return 0;
+    }
+    uint32_t depth = 0;
+    bool opened = false;
+    size_t close = n;
+    size_t p = found;
+    while (((p < n) && (close == n))) {
+        size_t q = skip_at(text, n, p);
+        if ((q != p)) {
+            p = q;
+        } else {
+            uint8_t c = text[p];
+            if ((c == '{')) {
+                depth += 1;
+                opened = true;
+            }
+            if ((c == '}')) {
+                if ((depth == 0)) {
+                    return 0;
+                }
+                depth -= 1;
+                if ((opened && (depth == 0))) {
+                    close = p;
+                }
+            }
+            if (((c == ';') && (opened == false))) {
+                close = p;
+            }
+            p += 1;
+        }
+    }
+    if ((close == n)) {
+        return 0;
+    }
+    uint64_t line = 1;
+    uint64_t first = 1;
+    size_t k = 0;
+    while ((k < close)) {
+        if ((k == found)) {
+            first = line;
+        }
+        if ((text[k] == '\n')) {
+            line += 1;
+        }
+        k += 1;
+    }
+    return ((first * PACK) + (line + 1));
+}
+
+bool edit_inside(uint32_t lo, uint32_t hi, uint32_t s, uint32_t e) {
+    if ((s >= e)) {
+        return false;
+    }
+    if ((lo == hi)) {
+        return ((s < lo) && (lo < e));
+    }
+    return ((s <= lo) && (hi <= e));
+}
+
 /* -------------------------------------------------------
    Invariants (compile-time assertions)
    ------------------------------------------------------- */
@@ -546,6 +871,84 @@ void test_check_issue_never_writes_past_cap(void) {
     assert((check_issue("x", 1, &out, 4) == 4));
 }
 
+void test_a_boundary_line_is_found_by_its_place(void) {
+    const uint8_t body[] = "intro\n## Boundary\n\n- specs/a.t27\nprose only\n- bootstrap/src/compiler.rs :: fn emit\n## Next\n- specs/b.t27\n";
+    assert((boundary_line(body, 105, 0) == ((19 * PACK) + 32)));
+    assert((boundary_line(body, 105, 1) == ((44 * PACK) + 82)));
+    assert((boundary_line(body, 105, 2) == 0));
+    assert((boundary_line("## Scope\n- specs/a.t27\n", 23, 0) == 0));
+}
+
+void test_a_line_names_its_path_and_maybe_one_item(void) {
+    const uint8_t whole[] = "- `bootstrap/src/compiler.rs`";
+    assert((line_path(whole, 0, 29) == ((3 * PACK) + 28)));
+    assert((line_region(whole, 0, 29) == 0));
+    const uint8_t item[] = "- bootstrap/src/compiler.rs :: fn gen_verilog_let_destructuring";
+    assert((line_path(item, 0, 63) == ((2 * PACK) + 27)));
+    assert((line_region(item, 0, 63) == ((34 * PACK) + 63)));
+    const uint8_t bare[] = "- bootstrap/src/compiler.rs :: emit_instance";
+    assert((line_region(bare, 0, 44) == ((31 * PACK) + 44)));
+    const uint8_t ticked[] = "- bootstrap/src/compiler.rs :: `fn on_clock`";
+    assert((line_region(ticked, 0, 44) == ((35 * PACK) + 43)));
+    const uint8_t called[] = "- bootstrap/src/compiler.rs :: fn on_clock()";
+    assert((line_region(called, 0, 44) == ((34 * PACK) + 42)));
+}
+
+void test_anything_else_after_a_path_is_the_whole_file(void) {
+    assert((line_region("- a/b.rs : fn x", 0, 15) == 0));
+    assert((line_region("- a/b.rs ::fn x", 0, 15) == 0));
+    assert((line_region("- a/b.rs :: 9x", 0, 14) == 0));
+    assert((line_region("- a/b.rs :: c/d.rs", 0, 18) == 0));
+    assert((line_region("- a/b.rs :: x, y", 0, 16) == 0));
+    assert((line_region("- a/b.rs and more prose", 0, 23) == 0));
+    assert((line_region("- a/b.rs ::", 0, 11) == 0));
+    assert((line_region("no path here :: fn x", 0, 20) == 0));
+    assert((line_region("- a/b.rs or fn x", 0, 16) == 0));
+}
+
+void test_an_item_runs_from_its_fn_to_the_brace_that_closes_it(void) {
+    const uint8_t src[] = "fn a() {\n    x();\n}\n\nfn b(s: &str) {\n    if s == \"}\" { y(); }\n}\n";
+    assert((item_span(src, 64, "a", 1) == ((1 * PACK) + 4)));
+    assert((item_span(src, 64, "b", 1) == ((5 * PACK) + 8)));
+    assert((item_span(src, 64, "y", 1) == 0));
+    assert((item_span(src, 64, "", 0) == 0));
+}
+
+void test_a_raw_string_ends_only_at_its_own_hashes(void) {
+    const uint8_t src[] = "fn m() {\n    let t = r#\"x\"}\"#;\n}\n";
+    assert((item_span(src, 33, "m", 1) == ((1 * PACK) + 4)));
+}
+
+void test_braces_in_comments_and_literals_do_not_count(void) {
+    const uint8_t src[] = "pub fn c() {\n    // }\n    let s = r#\"}\"#;\n    let k = '}';\n    /* } */\n}\nfn d() {}\n";
+    assert((item_span(src, 83, "c", 1) == ((1 * PACK) + 7)));
+    assert((item_span(src, 83, "d", 1) == ((7 * PACK) + 8)));
+}
+
+void test_an_ambiguous_or_unclosed_item_resolves_to_nothing(void) {
+    const uint8_t twice[] = "fn e() {}\nfn e() {}\n";
+    assert((item_span(twice, 20, "e", 1) == 0));
+    const uint8_t open_body[] = "fn f() {\n";
+    assert((item_span(open_body, 9, "f", 1) == 0));
+    const uint8_t quoted[] = "let s = \"fn g() {\";\nfn h() {}\n";
+    assert((item_span(quoted, 30, "g", 1) == 0));
+    const uint8_t longer[] = "fn gg() {}\nfn_x g() {}\n";
+    assert((item_span(longer, 23, "g", 1) == 0));
+    const uint8_t decl[] = "fn k(a: u8) -> u8;\n";
+    assert((item_span(decl, 19, "k", 1) == ((1 * PACK) + 2)));
+}
+
+void test_a_hunk_must_stay_inside_its_region(void) {
+    assert((edit_inside(10, 12, 5, 20) == true));
+    assert((edit_inside(5, 20, 5, 20) == true));
+    assert((edit_inside(4, 6, 5, 20) == false));
+    assert((edit_inside(19, 21, 5, 20) == false));
+    assert((edit_inside(12, 12, 5, 20) == true));
+    assert((edit_inside(5, 5, 5, 20) == false));
+    assert((edit_inside(20, 20, 5, 20) == false));
+    assert((edit_inside(5, 6, 5, 5) == false));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -561,7 +964,15 @@ int main(void) {
     test_an_outcome_is_one_of_four_patterns();
     test_check_issue_names_every_missing_section();
     test_check_issue_never_writes_past_cap();
-    printf("All %d tests passed.\n", 7);
+    test_a_boundary_line_is_found_by_its_place();
+    test_a_line_names_its_path_and_maybe_one_item();
+    test_anything_else_after_a_path_is_the_whole_file();
+    test_an_item_runs_from_its_fn_to_the_brace_that_closes_it();
+    test_a_raw_string_ends_only_at_its_own_hashes();
+    test_braces_in_comments_and_literals_do_not_count();
+    test_an_ambiguous_or_unclosed_item_resolves_to_nothing();
+    test_a_hunk_must_stay_inside_its_region();
+    printf("All %d tests passed.\n", 15);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

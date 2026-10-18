@@ -41,6 +41,8 @@ pub enum TrapStyle {
     Jit,
     /// Object file: stubs are `brk #kind`.
     Brk,
+    /// ELF object file (specs/tri/t27b/elf.t27): `brk` stubs, and module-level vars in .data.
+    Elf,
 }
 
 /// Machine code of one function before linking.
@@ -74,8 +76,8 @@ const X17: Reg = 17;
 const TEMP_REGS: usize = 7; // x9..x15
 const CALLEE_SAVED: [Reg; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 const MAX_SLOT_BYTES: u32 = 32760;
-/// Largest aggregate area of one frame (#7367).
-pub const MAX_AGG_BYTES: u32 = 1 << 20;
+/// Largest aggregate area of one frame: each slot is then at most two SUB words below x29 (a64::sub_const).
+pub const MAX_AGG_BYTES: u32 = (a64::SUB_CONST_REACH - 16) as u32;
 /// Largest frame the prologue allocates in one step. It is kept below the
 /// stack guard size, so such a frame never reaches past the guard page
 /// without touching it. A larger frame is allocated in `PROBE_STEP` steps,
@@ -123,34 +125,11 @@ pub fn canon(c: i128, ty: Ty) -> u64 {
     }
 }
 
-/// Move the register image of float `ty` from general register `rn` to FP
-/// register `rd`: `fmov dd, xn` for F64, `fmov sd, wn` for F32.
-fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 {
-    if ty == Ty::F32 {
-        a64::fmov_s_w(rd, rn)
-    } else {
-        a64::fmov_d_x(rd, rn)
-    }
-}
-
-/// Move float `ty` from FP register `rn` to general register `rd`, in
-/// canonical form (an F32 zero-extended, like a u32).
-fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 {
-    if ty == Ty::F32 {
-        a64::fmov_w_s(rd, rn)
-    } else {
-        a64::fmov_x_d(rd, rn)
-    }
-}
-
-/// A double-precision FP instruction `w` in the precision of float `ty`.
-fn fp_op(ty: Ty, w: u32) -> u32 {
-    if ty == Ty::F32 {
-        a64::single(w)
-    } else {
-        w
-    }
-}
+/// Float `ty` from general register `rn` to FP register `rd`, from FP register `rn` to general register `rd`
+/// in canonical form, and a double-precision FP instruction `w` in `ty`'s precision: a64.t27's choices.
+fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) }
+fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
+fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
 
 fn narrow_ext(ty: Ty) -> Option<Ext> {
     match ty {
@@ -162,71 +141,11 @@ fn narrow_ext(ty: Ty) -> Option<Ext> {
     }
 }
 
-/// The one instruction that puts the low `ty.bits()` bits of `n` into `d`
-/// in canonical form, for a type narrower than 32 bits: the 8/16-bit extend,
-/// or for an odd width (`u21`, `i4`) an unsigned or signed bitfield extract
-/// (`ubfx` / `sbfx`). `sf` picks the X form, which reads all of `n`.
-fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> {
-    match ty {
-        Ty::UN(b) => Some(a64::ubfm(sf, d, n, 0, b as u32 - 1)),
-        Ty::IN(b) => Some(a64::sbfm(sf, d, n, 0, b as u32 - 1)),
-        _ if sf => None,
-        _ => narrow_ext(ty).map(|e| extend(d, n, e)),
-    }
-}
+/// The one instruction that puts the low `ty.bits()` bits of `n` into `d` in canonical form: a64.t27's `narrow_word`.
+fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> { Some(a64::narrow_word(sf, d, n, ty.bits(), ty.signed())).filter(|&w| w != 0) }
 
-fn cond_for(op: CmpOp, ty: Ty) -> Cond {
-    if ty.is_float() {
-        return fcond_for(op);
-    }
-    let s = ty.signed();
-    match op {
-        CmpOp::Eq => Cond::Eq,
-        CmpOp::Ne => Cond::Ne,
-        CmpOp::Lt => {
-            if s {
-                Cond::Lt
-            } else {
-                Cond::Lo
-            }
-        }
-        CmpOp::Le => {
-            if s {
-                Cond::Le
-            } else {
-                Cond::Ls
-            }
-        }
-        CmpOp::Gt => {
-            if s {
-                Cond::Gt
-            } else {
-                Cond::Hi
-            }
-        }
-        CmpOp::Ge => {
-            if s {
-                Cond::Ge
-            } else {
-                Cond::Hs
-            }
-        }
-    }
-}
-
-/// The condition that holds after `fcmp dn, dm` when `dn op dm` is true.
-/// An unordered compare (a NaN operand) sets NZCV to 0011: none of these
-/// but NE holds then, and `Cond::invert` of each is its exact negation.
-fn fcond_for(op: CmpOp) -> Cond {
-    match op {
-        CmpOp::Eq => Cond::Eq,
-        CmpOp::Ne => Cond::Ne,
-        CmpOp::Lt => Cond::Mi,
-        CmpOp::Le => Cond::Ls,
-        CmpOp::Gt => Cond::Gt,
-        CmpOp::Ge => Cond::Ge,
-    }
-}
+/// The condition after `cmp` (`fcmp` for a float) that holds when `op` does: specs/tri/t27b/cmp_op.t27's `cond_bits`.
+fn cond_for(op: CmpOp, ty: Ty) -> Cond { Cond::from_bits(co::cond_bits(op as u8, ty.is_float(), ty.signed())) }
 
 /// d registers used as scratch for one floating point operation. Values
 /// live in X registers as bit patterns between operations; d8-d15 (callee
@@ -313,7 +232,7 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
     };
     let mut top = 0u32;
     for sl in &f.slots {
-        let a = sl.align.clamp(1, 8);
+        let a = sl.align.clamp(1, ip::ALIGN);
         let off = (top + a - 1) / a * a;
         g.agg_off.push(off);
         top = off + sl.size;
@@ -345,6 +264,8 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
             line: f.line,
             construct: if e.starts_with(GLOBAL_IN_OBJECT) {
                 "VarDecl(module, object file)"
+            } else if e.starts_with(ip::REFUSED) {
+                ip::REFUSED
             } else {
                 "FnDecl(frame or branch range)"
             },
@@ -410,7 +331,7 @@ impl<'a> Gen<'a> {
                 self.stub_by_site.insert(site, l);
                 l
             }
-            TrapStyle::Brk => {
+            TrapStyle::Brk | TrapStyle::Elf => {
                 let kind = self.prog.sites[site as usize].kind;
                 self.stub_brk(kind)
             }
@@ -449,17 +370,20 @@ impl<'a> Gen<'a> {
         order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
         let mut callee = CALLEE_SAVED.iter().copied();
         let mut slots = 0u32;
+        for &v in order.iter().filter(|&&v| f.vars[v].ty == Ty::I128) { // i128_plan.t27: 16 frame bytes, laid out first (16-aligned)
+            if w[v] > 0 { (self.homes[v], w[v], slots) = (Home::Slot(8 * slots), 0, slots + ip::HOME_WORDS); }
+        }
         if !has_call {
             // Leaf: parameters stay in their argument registers; the free
             // argument registers are homes too.
             // An F64 parameter arrives in a d register; it gets a home like
             // any other variable and the prologue moves it there.
             let regs = Program::arg_regs(f);
-            let nint = regs.iter().filter(|r| !r.0).count();
+            let nint = regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0);
             let mut caller: Vec<Reg> = ((nint as Reg)..8).collect();
             caller.reverse();
             for (p, &(fp, k)) in regs.iter().enumerate() {
-                if !fp && k < 8 {
+                if !fp && k < 8 && f.vars[p].ty != Ty::I128 { // a pair parameter is homed in the frame
                     self.homes[p] = Home::Reg(k as Reg);
                 }
             }
@@ -548,18 +472,8 @@ impl<'a> Gen<'a> {
         let nbytes = 8 * (self.nvar_slots as usize + ncallee + self.max_slot);
         let frame_bytes = ((nbytes + 15) & !15) + self.agg_bytes as usize;
         if frame {
-            let base = 8 * self.nvar_slots;
-            let mut k = 0;
-            while k < ncallee {
-                let off = base + 8 * k as u32;
-                if k + 1 < ncallee && off <= 504 {
-                    self.emit(a64::ldp_x(self.used_callee[k], self.used_callee[k + 1], SP, off as i32));
-                    k += 2;
-                } else {
-                    self.emit(a64::ldr_x(self.used_callee[k], SP, off));
-                    k += 1;
-                }
-            }
+            let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers back: a64.t27's `save_word`
+            while k < ncallee { let u = &self.used_callee; let w = a64::save_word(true, ncallee, base, k, u[k], u[(k + 1) % ncallee]); self.emit(w); k = a64::save_next(ncallee, base, k); }
             self.emit(a64::mov_sp(SP, 29));
             self.emit(a64::ldp_x_post(29, 30, SP, 16));
             self.emit(a64::ret());
@@ -644,27 +558,12 @@ impl<'a> Gen<'a> {
                     pro.push(a64::str_x(ZR, SP, 0));
                 }
             } else if frame_bytes > 0 {
-                if frame_bytes < 4096 {
-                    pro.push(a64::sub_imm(true, SP, SP, frame_bytes as u32));
-                } else if frame_bytes <= (MAX_SLOT_BYTES + 16 + self.agg_bytes) as usize {
-                    a64::mov_imm(true, X16, frame_bytes as u64, &mut pro);
-                    pro.push(a64::addsub_ext(true, true, false, SP, SP, X16, Ext::Uxtx, 0));
-                } else {
-                    self.fail(format!("frame larger than {} bytes", MAX_SLOT_BYTES));
+                for i in 0..a64::sub_const_len(frame_bytes as u64) {
+                    pro.push(a64::sub_const_at(SP, SP, frame_bytes as u64, i));
                 }
             }
-            let base = 8 * self.nvar_slots;
-            let mut k = 0;
-            while k < ncallee {
-                let off = base + 8 * k as u32;
-                if k + 1 < ncallee && off <= 504 {
-                    pro.push(a64::stp_x(self.used_callee[k], self.used_callee[k + 1], SP, off as i32));
-                    k += 2;
-                } else {
-                    pro.push(a64::str_x(self.used_callee[k], SP, off));
-                    k += 1;
-                }
-            }
+            let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers the fn uses: a64.t27's `save_word`
+            while k < ncallee { let u = &self.used_callee; pro.push(a64::save_word(false, ncallee, base, k, u[k], u[(k + 1) % ncallee])); k = a64::save_next(ncallee, base, k); }
         }
         // Parameters: normalise narrow ones and move them to their homes.
         let regs = Program::arg_regs(f);
@@ -672,6 +571,10 @@ impl<'a> Gen<'a> {
         for p in 0..f.nparams {
             let ty = f.vars[p].ty;
             let (fp, k) = regs[p];
+            if ty == Ty::I128 { // a pair parameter: one stp of x(k), x(k + 1) to its home (i128_plan.t27)
+                match (self.homes[p], stack[p]) { (Home::Slot(off), None) if ip::pair_imm(off) => pro.push(ip::pair_word(false, k as Reg, k as Reg + 1, SP, off)), (Home::None, None) => {}, _ => self.fail(format!("{}: a pair parameter on the stack, or homed past stp's reach", ip::REFUSED)) }
+                continue;
+            }
             if let Some(s) = stack[p] {
                 // A stack parameter: one full word above the saved x29/x30
                 // (an F64 is its bit pattern, homed in an x register too).
@@ -754,6 +657,7 @@ impl<'a> Gen<'a> {
     /// The register holding `v`; spilled temps and constants go to `scratch`.
     /// A zero constant is the zero register.
     fn use_(&mut self, v: V, scratch: Reg, ty: Ty) -> Reg {
+        if ty == Ty::I128 { self.fail(format!("{}: only literals, calls, variables and comparisons of one are lowered yet", ip::REFUSED)); }
         match v {
             V::Reg(r) => r,
             V::Temp(i) if i < TEMP_REGS => 9 + i as Reg,
@@ -820,6 +724,7 @@ impl<'a> Gen<'a> {
         match s {
             Stmt::Assign { var, value } => match self.homes[*var as usize] {
                 Home::Reg(h) => self.eval_into(value, h),
+                Home::Slot(off) if value.ty == Ty::I128 => self.pair_each(value, |g, k, r| g.str_slot(r, off + ip::HI_OFF * k)),
                 Home::Slot(off) => {
                     let v = self.eval(value);
                     let r = self.use_(v, X16, value.ty);
@@ -872,7 +777,9 @@ impl<'a> Gen<'a> {
                 self.jump(l_step);
             }
             Stmt::Return(e) => {
-                if let Some(e) = e {
+                if let Some(e) = e.as_ref().filter(|e| e.ty == Ty::I128) {
+                    self.pair_each(e, |g, k, r| g.emit(a64::mov(true, [ip::RET_LO, ip::RET_HI][k as usize], r)));
+                } else if let Some(e) = e {
                     self.eval_into(e, X0);
                     if e.ty.is_float() {
                         // AAPCS64 returns an F64 in d0, an F32 in s0.
@@ -917,9 +824,15 @@ impl<'a> Gen<'a> {
                         self.stubs.push((l, Stub::AssertEq(*site, ra, rb)));
                         l
                     }
-                    TrapStyle::Brk => self.stub_brk(TrapKind::AssertEq),
+                    TrapStyle::Brk | TrapStyle::Elf => self.stub_brk(TrapKind::AssertEq),
                 };
                 self.bcond(Cond::Ne, l);
+            }
+            Stmt::Store { addr, off, value } if value.ty == Ty::I128 => {
+                let (a, p) = (self.eval(addr), self.pair(value));
+                let (r, lo, hi) = (self.use_nz(a, X16, Ty::Ptr), self.use_(p[0], X17, Ty::U64), self.use_(p[1], X8, Ty::U64));
+                self.pair_mem(false, lo, hi, r, *off);
+                for v in [p[1], p[0], a] { self.release(v); }
             }
             Stmt::Store { addr, off, value } => {
                 let ty = value.ty;
@@ -976,14 +889,9 @@ impl<'a> Gen<'a> {
 
     /// `d = address of slot k` (x29 minus its distance below the frame pointer).
     fn slot_addr(&mut self, d: Reg, k: u32) {
-        let n = self.agg_bytes - self.agg_off[k as usize];
-        if n < 4096 {
-            self.emit(a64::sub_imm(true, d, FP, n));
-        } else {
-            self.emit(a64::addsub_imm(true, true, false, d, FP, n >> 12, true));
-            if n & 0xfff != 0 {
-                self.emit(a64::sub_imm(true, d, d, n & 0xfff));
-            }
+        let n = (self.agg_bytes - self.agg_off[k as usize]) as u64;
+        for i in 0..a64::sub_const_len(n) {
+            self.emit(a64::sub_const_at(d, FP, n, i));
         }
     }
 
@@ -1072,6 +980,7 @@ impl<'a> Gen<'a> {
 
     fn compute(&mut self, e: &Expr, dst: Option<Reg>) -> V {
         let ty = e.ty;
+        if ty == Ty::I128 && !matches!(e.kind, ExprKind::Call { .. }) { self.use_(V::Const(0), X16, ty); return V::Const(0); } // a pair goes by `pair`
         match &e.kind {
             ExprKind::Const(_) | ExprKind::Var(_) => {
                 let v = self.eval(e);
@@ -1275,9 +1184,9 @@ impl<'a> Gen<'a> {
                 }
             }
             ExprKind::Cast { arg, site } => {
-                let from = arg.ty;
+                // An i128 operand: i128_plan.t27's check of its high word, then its low word cast as a u64 or an i64.
+                let (from, v) = if arg.ty == Ty::I128 { let p = self.pair_arith(ip::cast_program(ty.signed(), *site != 0), arg, &Expr { ty: Ty::I128, kind: ExprKind::Const(0) }, *site); self.release(p[1]); ([Ty::U64, Ty::I64][ty.signed() as usize], p[0]) } else { (arg.ty, self.eval(arg)) };
                 let wide = from.is64();
-                let v = self.eval(arg);
                 let ra = self.use_nz(v, X16, from);
                 if *site != 0 && !ty.can_widen_from(from) {
                     // The operand is canonical in a W register (32 bits or
@@ -1351,9 +1260,9 @@ impl<'a> Gen<'a> {
             ExprKind::Global(k) => {
                 // The JIT appends one more blob after `Program::data`: a
                 // table of the absolute address of every global, which live
-                // in writable memory outside the executable image. An object
-                // file has no such table (no __DATA section yet).
-                if self.style != TrapStyle::Jit {
+                // in writable memory outside the executable image. An ELF object
+                // carries it in .data; a Mach-O object has none (no __DATA section yet).
+                if self.style == TrapStyle::Brk {
                     self.fail(format!("{} (no writable data section)", GLOBAL_IN_OBJECT));
                 }
                 if *k >= 4096 {
@@ -1488,6 +1397,17 @@ impl<'a> Gen<'a> {
     fn compare(&mut self, op: CmpOp, lhs: &Expr, rhs: &Expr) -> Cond {
         let ty = lhs.ty;
         let s = ty.is64();
+        if ty == Ty::I128 {
+            // Two steps, one per word, low first, and the condition: all specs/tri/t27b/i128_plan.t27's.
+            let (a, b) = (self.pair(lhs), self.pair(rhs));
+            let (x, y) = if ip::cmp_swaps(op as u8) { (b, a) } else { (a, b) };
+            for k in 0..2 {
+                let (p, q) = (self.use_(x[k], X16, Ty::U64), self.use_(y[k], X17, Ty::U64));
+                self.emit(match ip::cmp_step(op as u8, k as u32) { ip::STEP_CMP => a64::cmp(true, p, q), ip::STEP_CCMP => a64::ccmp(true, p, q, ip::CCMP_NZCV, Cond::Eq), _ => a64::sbcs(true, ZR, p, q) });
+            }
+            for v in [b[1], b[0], a[1], a[0]] { self.release(v); }
+            return Cond::from_bits(ip::cmp_cond(op as u8));
+        }
         let a = self.eval(lhs);
         let b = self.eval(rhs);
         if ty.is_float() {
@@ -1498,7 +1418,7 @@ impl<'a> Gen<'a> {
             self.emit(fp_op(ty, a64::fcmp(D16, D17)));
             self.release(b);
             self.release(a);
-            return fcond_for(op);
+            return cond_for(op, ty);
         }
         let (mut x, mut y, mut op2) = (a, b, op);
         if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) {
@@ -1523,6 +1443,60 @@ impl<'a> Gen<'a> {
         self.release(b);
         self.release(a);
         cond_for(op2, ty)
+    }
+
+    /// An i128's low and high word (specs/tri/t27b/i128_plan.t27): a literal's two words, a variable's two frame
+    /// words, a call's x0 and x1, a field's ldp or an operator's program (a narrower operand extended); else refused.
+    fn pair(&mut self, e: &Expr) -> [V; 2] {
+        match &e.kind {
+            _ if e.ty != Ty::I128 => self.pair(&Expr { ty: Ty::I128, kind: ExprKind::Widen(Box::new(e.clone())) }), // a shift's amount
+            ExprKind::Load { addr, off } => { let a = self.eval(addr); let r = self.use_nz(a, X17, Ty::Ptr); self.release(a); let b = self.depth; self.depth = b + 2; self.pair_mem(true, 9 + b as Reg, 10 + b as Reg, r, *off); [V::Temp(b), V::Temp(b + 1)] }
+            ExprKind::Const(c) => { let m = c.unsigned_abs(); [ip::lit_lo(*c < 0, m as u64), ip::lit_hi(*c < 0, m as u64, (m >> 64) as u64)].map(|w| V::Const(w as i128)) }
+            ExprKind::Var(v) => { let off = if let Home::Slot(o) = self.homes[*v as usize] { o } else { 0 }; [0, ip::HI_OFF].map(|k| { let (d, t) = self.dest(None); self.ldr_slot(d, off + k); self.done(d, t) }) }
+            ExprKind::Call { func, args } => { let lo = self.call(*func, args, None, true); let (d, t) = self.dest(None); self.emit(a64::mov(true, d, ip::RET_HI)); [lo, self.done(d, t)] }
+            ExprKind::Widen(x) => { let lo = self.eval(&Expr { ty: if x.ty.signed() { Ty::I64 } else { Ty::U64 }, kind: ExprKind::Widen(x.clone()) }); if !x.ty.signed() { return [lo, V::Const(0)]; } let r = self.use_(lo, X16, Ty::I64); let (d, t) = self.dest(None); self.emit(a64::asr_imm(true, d, r, 63)); [lo, self.done(d, t)] }
+            ExprKind::Arith { op, lhs, rhs, site } => self.pair_arith(ip::program(*op as u8), lhs, rhs, *site),
+            _ => { self.use_(V::Const(0), X16, e.ty); [V::Const(0); 2] }
+        }
+    }
+
+    /// An operator on two i128s, or a cast's check: i128_plan.t27's program on the four words, copied into temps
+    /// x(9 + base) up, the last first (a word sits at or below its temp); the result is in the first two.
+    fn pair_arith(&mut self, prog: u8, lhs: &Expr, rhs: &Expr, site: SiteId) -> [V; 2] {
+        let (base, div) = (self.depth, self.prog.func_index(ip::routine(prog)));
+        let w = [self.pair(lhs), self.pair(rhs)].concat();
+        for v in w.iter().rev() { self.release(*v); }
+        if prog == ip::PROG_NONE || base + ip::TEMPS as usize > TEMP_REGS || (ip::calls(prog) && div.is_none()) {
+            self.fail(format!("{}: this operator, or this deep, is not lowered yet", ip::REFUSED));
+            return [V::Const(0); 2];
+        }
+        let r0 = 9 + base as Reg;
+        for k in (0..4).rev() { let r = self.use_(w[k], r0 + k as Reg, Ty::U64); if r != r0 + k as Reg { self.emit(a64::mov(true, r0 + k as Reg, r)); } }
+        self.depth = base + ip::TEMPS as usize;
+        for k in 0..ip::steps(prog) {
+            let (x, saved) = (ip::step_word(prog, k, r0), 0..base as u32);
+            match ip::step_kind(prog, k) {
+                ip::K_WORD => self.emit(x),
+                ip::K_TRAP => { let l = self.stub_site(site + ip::trap_site(prog, k)); self.bcond(Cond::from_bits(x), l) }
+                _ => { for i in saved.clone() { let o = self.slot_of_temp(i as usize); self.str_slot(9 + i as Reg, o); } self.calls.push((self.code.len(), div.unwrap() as FuncId)); self.emit(a64::bl(0)); for i in saved { let o = self.slot_of_temp(i as usize); self.ldr_slot(9 + i as Reg, o); } }
+            }
+        }
+        self.depth = base + 2;
+        [V::Temp(base), V::Temp(base + 1)]
+    }
+
+    /// An i128's words in lo and hi to or from [base + off]: one ldp or stp (i128_plan.t27's `pair_word`). A load's
+    /// lo and hi are temps, so a pair past x15 is refused, as one past the instruction's reach is.
+    fn pair_mem(&mut self, load: bool, lo: Reg, hi: Reg, base: Reg, off: u32) {
+        if !ip::pair_imm(off) || (load && hi > 15) { self.fail(format!("{}: a pair this deep or this far into memory is not lowered yet", ip::REFUSED)); }
+        self.emit(ip::pair_word(load, lo, hi, base, off));
+    }
+
+    /// Evaluate an i128 and hand `put` each word in a register, the low one (k = 0) first.
+    fn pair_each(&mut self, e: &Expr, put: impl Fn(&mut Self, u32, Reg)) {
+        let p = self.pair(e);
+        for k in 0..2 { let r = self.use_(p[k], X16, Ty::U64); put(self, k as u32, r); }
+        for v in [p[1], p[0]] { self.release(v); }
     }
 
     /// Jump to `target` when `e` evaluates to `when`.
@@ -1574,6 +1548,7 @@ impl<'a> Gen<'a> {
         let base = self.depth;
         let mut vals: Vec<(V, Ty)> = Vec::with_capacity(args.len());
         for a in args {
+            if a.ty == Ty::I128 { let p = self.pair(a); vals.extend([(p[0], Ty::U64), (p[1], Ty::U64)]); continue; }
             let v = self.eval(a);
             vals.push((v, a.ty));
         }
@@ -1583,7 +1558,7 @@ impl<'a> Gen<'a> {
             self.str_slot(9 + i as Reg, off);
         }
         let callee = &self.prog.funcs[func as usize];
-        let regs = Program::arg_regs(callee);
+        let regs: Vec<(bool, usize)> = Program::arg_regs(callee).into_iter().zip(&callee.vars).flat_map(|((fp, k), v)| (0..1 + (v.ty == Ty::I128) as usize).map(move |i| (fp, k + i))).collect(); // a pair: two words
         let (stack, nstack) = Program::stack_args(&regs);
         let ret_fp = callee.ret.filter(|t| t.is_float());
         // Register arguments first (they touch only x0-x7, d0-d7 and x16),
@@ -1957,25 +1932,7 @@ fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
     (size, opc)
 }
 
-fn overflow_cond(ty: Ty, sub: bool) -> Cond {
-    if ty.signed() {
-        Cond::Vs
-    } else if sub {
-        Cond::Lo
-    } else {
-        Cond::Hs
-    }
-}
-
-fn extend(d: Reg, n: Reg, e: Ext) -> u32 {
-    match e {
-        Ext::Uxtb => a64::uxtb(d, n),
-        Ext::Uxth => a64::uxth(d, n),
-        Ext::Sxtb => a64::sxtb(d, n),
-        Ext::Sxth => a64::sxth(d, n),
-        _ => unreachable!("only narrow extends"),
-    }
-}
+fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
 
 /// Conservative: false only when control certainly cannot reach the end.
 fn may_fall_through(ss: &[Stmt]) -> bool {
@@ -2027,6 +1984,7 @@ fn weigh_stmts(ss: &[Stmt], depth: u32, w: &mut [u64], wr: &mut [u64], has_call:
 }
 
 fn weigh_expr(e: &Expr, unit: u64, w: &mut [u64], has_call: &mut bool) {
+    *has_call |= matches!(e.kind, ExprKind::Arith { op, .. } if e.ty == Ty::I128 && ip::calls(ip::program(op as u8)));
     match &e.kind {
         ExprKind::Const(_) => {}
         ExprKind::Var(v) => w[*v as usize] += unit,
