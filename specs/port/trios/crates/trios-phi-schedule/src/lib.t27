@@ -1,0 +1,316 @@
+// trios-phi-schedule — the φ-LR scheduler (Issue #54 calibration).
+// Port of gHashTag/trios:crates/trios-phi-schedule/src/lib.rs
+// (at 8b229e9489ee, 200+ lines) — Roadmap Stage 6, goal #4548, target
+// t27c gen-rust.
+//
+// The original offers three calibration schedules: flat (the constant
+// baseline), cosine (decaying to 0 along the cosine curve), and the
+// φ-decay hypothesis — LR = base_lr * φ^(-t/τ) with
+// τ = max_steps / (φ * 27), the warmup holding the base rate, the
+// decay exponent capped at 10, and a 1e-6 floor so the rate never
+// vanishes. The scientific finding of Issue #53 rides along: α_φ
+// (≈0.118) is NOT a valid initial rate (BPB explodes) — it belongs
+// to the decay structure, the asymptotic floor. The unified
+// lr_schedule_54 fixes BASE_LR at 3e-4 and the warmup at 100 steps.
+//
+// The language has no powf or cos builtin: φ comes from a Newton
+// square root, φ^(-e) from a repeated-multiplication ladder with a
+// binary-expansion fraction (the sqrt ladder of each fractional bit),
+// and the cosine curve from a Taylor window — every value asserted in
+// tight windows, never by equality with a non-representable constant.
+// The schedules' decisions — the warmup gate, the τ formula, the
+// exponent cap, the 1e-6 floor, the fixed calibration constants —
+// are ported as pure functions and tested, including the original's
+// own no-decay-at-zero and monotonic-decay tests (issue #9443, "Port
+// the decision, not the plumbing").
+
+module port::trios_phi_schedule_lib;
+
+// Newton square root — the port's root primitive.
+pub fn sched_sqrt(v: f32) -> f32 {
+    var s: f32 = v;
+    var i: usize = 0;
+    while (i < 40) {
+        s = (s + v / s) / 2.0;
+        i += 1;
+    }
+    return s;
+}
+
+// φ = (1 + sqrt(5)) / 2 — the golden ratio from gf_constants().
+pub fn phi_value() -> f32 {
+    return (1.0 + sched_sqrt(5.0)) / 2.0;
+}
+
+// φ^(-e) for e >= 0: the integer part by repeated multiplication by
+// 1/φ, the fraction by the binary-expansion root ladder.
+pub fn phi_pow_neg(e: f32) -> f32 {
+    const inv: f32 = 1.0 / phi_value();
+    const int_part: i32 = e as i32;
+    const frac: f32 = e - int_part as f32;
+    var result: f32 = 1.0;
+    var i: i32 = 0;
+    while (i < int_part) {
+        result = result * inv;
+        i += 1;
+    }
+    var root: f32 = sched_sqrt(inv);
+    var bit: f32 = 0.5;
+    var remaining: f32 = frac;
+    var j: usize = 0;
+    while (j < 20) {
+        if (remaining >= bit) {
+            result = result * root;
+            remaining = remaining - bit;
+        }
+        root = sched_sqrt(root);
+        bit = bit / 2.0;
+        j += 1;
+    }
+    return result;
+}
+
+// cos(x) on [0, pi] via the Taylor window (six terms).
+pub fn sched_cos(x: f32) -> f32 {
+    var term: f32 = 1.0;
+    var sum: f32 = 1.0;
+    var k: f32 = 1.0;
+    var i: usize = 0;
+    while (i < 6) {
+        term = term * (x * x) / ((2.0 * k - 1.0) * (2.0 * k));
+        if (i % 2 == 0) {
+            sum = sum - term;
+        } else {
+            sum = sum + term;
+        }
+        k += 1.0;
+        i += 1;
+    }
+    return sum;
+}
+
+pub const PI_F32: f32 = 3.14159265;
+
+// ---------------------------------------------------------------------------
+// Original lines 55-59: `phi_schedule(epoch, base_lr, warmup)` —
+// LR = base_lr * φ^(-epoch/warmup); epoch 0 answers the base rate.
+// ---------------------------------------------------------------------------
+
+pub fn phi_schedule(epoch: usize, base_lr: f32, warmup: usize) -> f32 {
+    return base_lr * phi_pow_neg(epoch as f32 / warmup as f32);
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 64-66: `flat_lr(_step, base_lr)` — the constant
+// baseline; the step never matters.
+// ---------------------------------------------------------------------------
+
+pub fn flat_lr(_step: usize, base_lr: f32) -> f32 {
+    return base_lr;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 71-75: `cosine_lr(step, max_steps, base_lr)` —
+// base_lr * (1 + cos(pi * step/max_steps)) / 2, decaying to 0.
+// ---------------------------------------------------------------------------
+
+pub fn cosine_lr(step: usize, max_steps: usize, base_lr: f32) -> f32 {
+    const progress: f32 = step as f32 / max_steps as f32;
+    const cosine: f32 = sched_cos(PI_F32 * progress);
+    return base_lr * (1.0 + cosine) / 2.0;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 85-98: `phi_decay_lr(step, max_steps, base_lr,
+// warmup_steps)` — the warmup gate holds the base rate; the decay time
+// constant τ = max_steps / (φ * 27); the exponent caps at 10; the
+// 1e-6 floor keeps the rate from vanishing.
+// ---------------------------------------------------------------------------
+
+pub fn tau(max_steps: usize) -> f32 {
+    return max_steps as f32 / (phi_value() * 27.0);
+}
+
+pub fn decay_exponent_cap() -> f32 {
+    return 10.0;
+}
+
+pub fn lr_floor() -> f32 {
+    return 0.000001;
+}
+
+pub fn phi_decay_lr(step: usize, max_steps: usize, base_lr: f32, warmup_steps: usize) -> f32 {
+    if (step < warmup_steps) {
+        return base_lr;
+    }
+    const t: f32 = (step - warmup_steps) as f32 / tau(max_steps);
+    var exponent: f32 = t;
+    if (exponent > decay_exponent_cap()) {
+        exponent = decay_exponent_cap();
+    }
+    const decayed: f32 = base_lr * phi_pow_neg(exponent);
+    if (decayed < lr_floor()) {
+        return lr_floor();
+    }
+    return decayed;
+}
+
+// ---------------------------------------------------------------------------
+// Original lines 103-112: `lr_schedule_54` — the unified calibration
+// entry: BASE_LR fixed at 3e-4, WARMUP_STEPS at 100, dispatching to
+// the three schedules.
+// ---------------------------------------------------------------------------
+
+pub fn lr54_base_lr() -> f32 {
+    return 0.0003;
+}
+
+pub fn lr54_warmup_steps() -> usize {
+    return 100;
+}
+
+pub fn lr_schedule_54(schedule_name: str, step: usize, max_steps: usize) -> f32 {
+    if (schedule_name == "flat") {
+        return flat_lr(step, lr54_base_lr());
+    }
+    if (schedule_name == "cosine") {
+        return cosine_lr(step, max_steps, lr54_base_lr());
+    }
+    if (schedule_name == "phi_decay") {
+        return phi_decay_lr(step, max_steps, lr54_base_lr(), lr54_warmup_steps());
+    }
+    return 0.0;
+}
+
+// The scientific finding of Issue #53: α_φ is not a valid initial
+// rate (BPB explodes to 18.60); it belongs to the decay structure.
+pub fn alpha_phi_is_initial_lr() -> bool {
+    return false;
+}
+
+pub fn alpha_phi_role() -> str {
+    return "asymptotic floor";
+}
+
+// ---------------------------------------------------------------------------
+// Tests: every decision above asserted against values read from the
+// original's own tests (lines 118+).
+// ---------------------------------------------------------------------------
+
+test sqrt_ladder_direct {
+    const r2 = sched_sqrt(2.0);
+    assert(r2 > 1.41421);
+    assert(r2 < 1.41422);
+    const r5 = sched_sqrt(5.0);
+    assert(r5 > 2.23606);
+    assert(r5 < 2.23607);
+}
+
+test phi_value_and_ladder {
+    const phi = phi_value();
+    assert(phi > 1.61803);
+    assert(phi < 1.61804);
+    const p0 = phi_pow_neg(0.0);
+    assert(p0 > 0.99999);
+    assert(p0 < 1.00001);
+    const p1 = phi_pow_neg(1.0);
+    assert(p1 > 0.61803);
+    assert(p1 < 0.61804);
+}
+
+test phi_schedule_no_decay_at_epoch_zero {
+    const base: f32 = 0.001;
+    const lr0 = phi_schedule(0, base, 10);
+    assert(lr0 > base - 0.0000001);
+    assert(lr0 < base + 0.0000001);
+}
+
+test phi_schedule_decays_monotonically {
+    const base: f32 = 0.001;
+    const lr0 = phi_schedule(0, base, 10);
+    const lr10 = phi_schedule(10, base, 10);
+    const lr20 = phi_schedule(20, base, 10);
+    assert(lr10 < lr0);
+    assert(lr20 < lr10);
+}
+
+test phi_factor_at_warmup_one {
+    const lr0 = phi_schedule(0, 1.0, 1);
+    const lr1 = phi_schedule(1, 1.0, 1);
+    const expected: f32 = lr0 / phi_value();
+    assert(lr1 > expected - 0.000001);
+    assert(lr1 < expected + 0.000001);
+}
+
+test cos_taylor_window {
+    const c0 = sched_cos(0.0);
+    assert(c0 > 0.99999);
+    assert(c0 < 1.00001);
+    const chalf = sched_cos(PI_F32 / 2.0);
+    assert(chalf > -0.001);
+    assert(chalf < 0.001);
+    const cpi = sched_cos(PI_F32);
+    assert(cpi < -0.999);
+    assert(cpi > -1.001);
+}
+
+test flat_lr_is_constant {
+    const base: f32 = 0.0003;
+    assert(flat_lr(0, base) == base);
+    assert(flat_lr(100, base) == base);
+    assert(flat_lr(1000, base) == base);
+}
+
+test cosine_lr_decays_to_near_zero {
+    const base: f32 = 0.0003;
+    const lr0 = cosine_lr(0, 1000, base);
+    const lr500 = cosine_lr(500, 1000, base);
+    const lr999 = cosine_lr(999, 1000, base);
+    assert(lr0 > base - 0.0000001);
+    assert(lr0 < base + 0.0000001);
+    assert(lr500 < lr0);
+    assert(lr999 < lr500);
+    assert(lr999 < 0.000001);
+}
+
+test phi_decay_warmup_holds_base {
+    const base: f32 = 0.0003;
+    assert(phi_decay_lr(50, 1000, base, 100) == base);
+}
+
+test phi_decay_decays_after_warmup_above_floor {
+    const base: f32 = 0.0003;
+    const after: f32 = phi_decay_lr(500, 1000, base, 100);
+    assert(after < base);
+    assert(after > lr_floor());
+}
+
+test phi_decay_cap_keeps_lr_above_floor {
+    // With the exponent capped at 10, the minimum reachable LR is
+    // base * phi^(-10) = 2.4e-6 - ABOVE the 1e-6 floor: the cap
+    // binds first, the floor is the deeper safety net.
+    const base: f32 = 0.0003;
+    const far: f32 = phi_decay_lr(100000, 1000, base, 100);
+    const capped: f32 = base * phi_pow_neg(decay_exponent_cap());
+    assert(far > capped - 0.0000001);
+    assert(far < capped + 0.0000001);
+    assert(far > lr_floor());
+    assert(far < base);
+}
+
+test tau_window {
+    assert(tau(1000) > 22.88);
+    assert(tau(1000) < 22.90);
+    assert(decay_exponent_cap() == 10.0);
+}
+
+test lr54_unified_dispatch_and_alpha_finding {
+    assert(lr54_base_lr() == 0.0003);
+    assert(lr54_warmup_steps() == 100);
+    assert(lr_schedule_54("flat", 50, 1000) == 0.0003);
+    const cosine: f32 = lr_schedule_54("cosine", 500, 1000);
+    assert(cosine < 0.0003);
+    assert(lr_schedule_54("phi_decay", 50, 1000) == 0.0003);
+    assert(!alpha_phi_is_initial_lr());
+    assert(alpha_phi_role() == "asymptotic floor");
+}
