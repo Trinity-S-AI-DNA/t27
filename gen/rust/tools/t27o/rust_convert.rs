@@ -294,6 +294,18 @@ pub const R_EMPTY: usize = 32;
 
 pub const R_NOTYPE: usize = 33;
 
+pub const R_VECMUT: usize = 34;
+
+pub const R_VECMOVE: usize = 35;
+
+pub const R_VECTYPE: usize = 36;
+
+pub const VU_READ: usize = 0;
+
+pub const VU_CHANGED: usize = 1;
+
+pub const VU_MOVED: usize = 2;
+
 pub const B_TAB: u8 = 9;
 
 pub const B_NL: u8 = 10;
@@ -2016,6 +2028,12 @@ pub fn array_local(src: &[u8], flo: usize, a: usize, b: usize) -> bool {
             if (((word_is(src, n1, e1, b":") || word_is(src, n1, e1, b"=")) && (n2 < src.len())) && (src[(n2) as usize] == B_LBRACKET)) {
                 return true;
             }
+            if (word_is(src, n1, e1, b"=") && vec_init(src, n2)) {
+                return true;
+            }
+            if ((word_is(src, n1, e1, b":") && tok_is(src, n2, b"Vec")) && vec_init(src, init_at(src, q))) {
+                return true;
+            }
         }
         q = skip_ws(src, e);
     }
@@ -2251,30 +2269,35 @@ pub fn slice_param_elem(src: &[u8], na: usize, nb: usize, method: bool, k: usize
     return found;
 }
 
+pub fn site_elem(src: &[u8], lp: usize, k: usize) -> usize {
+    if (lp >= src.len()) {
+        return src.len();
+    }
+    let mut ne: usize = lp;
+    while ((ne > 0) && is_space(src[((ne - 1)) as usize])) {
+        ne = (ne - 1);
+    }
+    let mut na: usize = ne;
+    while ((na > 0) && is_word(src[((na - 1)) as usize])) {
+        na = (na - 1);
+    }
+    if (na >= ne) {
+        return src.len();
+    }
+    let mut m: usize = na;
+    while ((m > 0) && is_space(src[((m - 1)) as usize])) {
+        m = (m - 1);
+    }
+    let method: bool = (((m > 0) && (src[((m - 1)) as usize] == B_DOT)) && !(((m > 1) && (src[((m - 2)) as usize] == B_DOT))));
+    return slice_param_elem(src, na, ne, method, k);
+}
+
 pub fn empty_arg(src: &[u8], st: &mut [usize], out: &mut [u8], lp: usize, k: usize) -> () {
     let a: usize = st[(P) as usize];
     let b: usize = skip_ws(src, tok_end(src, a));
     let c: usize = skip_ws(src, tok_end(src, b));
     let d: usize = tok_end(src, c);
-    let mut elem: usize = src.len();
-    if (lp < src.len()) {
-        let mut ne: usize = lp;
-        while ((ne > 0) && is_space(src[((ne - 1)) as usize])) {
-            ne = (ne - 1);
-        }
-        let mut na: usize = ne;
-        while ((na > 0) && is_word(src[((na - 1)) as usize])) {
-            na = (na - 1);
-        }
-        if (na < ne) {
-            let mut m: usize = na;
-            while ((m > 0) && is_space(src[((m - 1)) as usize])) {
-                m = (m - 1);
-            }
-            let method: bool = (((m > 0) && (src[((m - 1)) as usize] == B_DOT)) && !(((m > 1) && (src[((m - 2)) as usize] == B_DOT))));
-            elem = slice_param_elem(src, na, ne, method, k);
-        }
-    }
+    let elem: usize = site_elem(src, lp, k);
     if (elem >= src.len()) {
         refuse(st, R_EMPTY, a, a, d);
         return ();
@@ -5062,6 +5085,11 @@ pub fn let_stmt(src: &[u8], st: &mut [usize], out: &mut [u8]) -> () {
     if typed {
         st[(LETTY) as usize] = skip_ws(src, tok_end(src, st[(P) as usize]));
     }
+    if ((init < src.len()) && vec_init(src, init)) {
+        let_vec(src, st, out, mutable, na, nb, typed, init);
+        st[(LETTY) as usize] = 0;
+        return ();
+    }
     if ((init < src.len()) && ends_in_try(src, init)) {
         let_try(src, st, out, mutable, na, nb, init);
         st[(LETTY) as usize] = 0;
@@ -5138,6 +5166,368 @@ pub fn let_value(src: &[u8], st: &mut [usize], out: &mut [u8], mutable: bool, na
             puts(st, out, b" = ");
             expr(src, st, out, false);
         }
+    }
+    want(src, st, b";");
+    puts(st, out, b";");
+}
+
+pub fn vec_init(src: &[u8], p: usize) -> bool {
+    if ((p >= src.len()) || !(tok_is(src, p, b"vec"))) {
+        return false;
+    }
+    let bang: usize = skip_ws(src, tok_end(src, p));
+    let lb: usize = skip_ws(src, tok_end(src, bang));
+    if (!(tok_is(src, bang, b"!")) || !(tok_is(src, lb, b"["))) {
+        return false;
+    }
+    return tok_is(src, skip_ws(src, block_end(src, lb)), b";");
+}
+
+pub fn vec_scope_end(src: &[u8], lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    let mut q: usize = lo;
+    while (q < hi) {
+        let e: usize = tok_end(src, q);
+        if word_is(src, q, e, b"let") {
+            let mut n: usize = skip_ws(src, e);
+            if tok_is(src, n, b"mut") {
+                n = skip_ws(src, tok_end(src, n));
+            }
+            let ne: usize = tok_end(src, n);
+            if same_text(src, n, ne, na, nb) {
+                let semi: usize = find_at(src, ne, B_SEMI);
+                if (semi < hi) {
+                    return semi;
+                }
+                return hi;
+            }
+        }
+        q = skip_ws(src, e);
+    }
+    return hi;
+}
+
+pub fn vec_mention(src: &[u8], prev: usize, q: usize, e: usize) -> usize {
+    if ((prev < src.len()) && (tok_is(src, prev, b".") || tok_is(src, prev, b"::"))) {
+        return VU_READ;
+    }
+    let nx: usize = skip_ws(src, e);
+    if tok_is(src, nx, b":") {
+        return VU_READ;
+    }
+    if ((prev < src.len()) && tok_is(src, prev, b"mut")) {
+        return VU_CHANGED;
+    }
+    if assign_op(src, nx) {
+        return VU_CHANGED;
+    }
+    if tok_is(src, nx, b".") {
+        let m: usize = skip_ws(src, (nx + 1));
+        let reads: &'static str = " len is_empty iter as_slice first last get contains starts_with ends_with to_vec clone windows chunks concat join binary_search ";
+        if listed(reads, &src[(m) as usize..(tok_end(src, m)) as usize]) {
+            return VU_READ;
+        }
+        return VU_CHANGED;
+    }
+    if tok_is(src, nx, b"[") {
+        let mut a: usize = skip_ws(src, block_end(src, nx));
+        while (tok_is(src, a, b".") || tok_is(src, a, b"[")) {
+            if tok_is(src, a, b"[") {
+                a = skip_ws(src, block_end(src, a));
+            } else {
+                a = skip_ws(src, tok_end(src, skip_ws(src, (a + 1))));
+            }
+        }
+        if assign_op(src, a) {
+            return VU_CHANGED;
+        }
+        return VU_READ;
+    }
+    if ((prev < src.len()) && (tok_is(src, prev, b"&") || tok_is(src, prev, b"&&"))) {
+        return VU_READ;
+    }
+    if (((prev < src.len()) && tok_is(src, prev, b"in")) && tok_is(src, nx, b"{")) {
+        return VU_READ;
+    }
+    return VU_MOVED;
+}
+
+pub fn vec_use(src: &[u8], lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    let mut worst: usize = VU_READ;
+    let mut prev: usize = src.len();
+    let mut q: usize = lo;
+    while (q < hi) {
+        let e: usize = tok_end(src, q);
+        if same_text(src, q, e, na, nb) {
+            let u: usize = vec_mention(src, prev, q, e);
+            if (u == VU_CHANGED) {
+                return VU_CHANGED;
+            }
+            if (u > worst) {
+                worst = u;
+            }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return worst;
+}
+
+pub fn paren_around(src: &[u8], from: usize, q: usize) -> usize {
+    let mut found: usize = src.len();
+    let mut p: usize = from;
+    while (p < q) {
+        let e: usize = tok_end(src, p);
+        if (((e == (p + 1)) && (src[(p) as usize] == B_LPAREN)) && (block_end(src, p) > q)) {
+            found = p;
+        }
+        p = skip_ws(src, e);
+    }
+    return found;
+}
+
+pub fn arg_slot(src: &[u8], lp: usize, q: usize) -> usize {
+    let mut k: usize = 0;
+    let mut depth: usize = 0;
+    let mut p: usize = skip_ws(src, (lp + 1));
+    while (p < q) {
+        let e: usize = tok_end(src, p);
+        if (e == (p + 1)) {
+            if is_open(src[(p) as usize]) {
+                depth = (depth + 1);
+            }
+            if is_close(src[(p) as usize]) {
+                if (depth == 0) {
+                    return src.len();
+                }
+                depth = (depth - 1);
+            }
+            if ((src[(p) as usize] == B_COMMA) && (depth == 0)) {
+                k = (k + 1);
+            }
+        }
+        p = skip_ws(src, e);
+    }
+    if (depth != 0) {
+        return src.len();
+    }
+    return k;
+}
+
+pub fn vec_arg_elem(src: &[u8], lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    let mut prev: usize = src.len();
+    let mut q: usize = lo;
+    while (q < hi) {
+        let e: usize = tok_end(src, q);
+        if ((same_text(src, q, e, na, nb) && (prev < src.len())) && tok_is(src, prev, b"&")) {
+            let nx: usize = skip_ws(src, e);
+            if (tok_is(src, nx, b",") || tok_is(src, nx, b")")) {
+                let lp: usize = paren_around(src, lo, prev);
+                if (lp < src.len()) {
+                    let k: usize = arg_slot(src, lp, prev);
+                    if (k < src.len()) {
+                        let el: usize = site_elem(src, lp, k);
+                        if (el < src.len()) {
+                            return el;
+                        }
+                    }
+                }
+            }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return src.len();
+}
+
+pub fn ret_word(src: &[u8], na: usize, nb: usize) -> usize {
+    let mut found: usize = src.len();
+    let mut q: usize = skip_ws(src, 0);
+    while (q < src.len()) {
+        let e: usize = tok_end(src, q);
+        if fn_hit(src, q, na, nb) {
+            let r: usize = fn_ret_of(src, q);
+            if (((r >= src.len()) || !(is_alpha(src[(r) as usize]))) || tok_is(src, r, b"Self")) {
+                return src.len();
+            }
+            let re: usize = tok_end(src, r);
+            if !(tok_is(src, skip_ws(src, re), b"{")) {
+                return src.len();
+            }
+            if ((found < src.len()) && !(same_text(src, found, tok_end(src, found), r, re))) {
+                return src.len();
+            }
+            found = r;
+        }
+        q = skip_ws(src, e);
+    }
+    return found;
+}
+
+pub fn put_elem_ty(src: &[u8], st: &mut [usize], out: &mut [u8], tp: usize) -> () {
+    let save: usize = st[(P) as usize];
+    st[(P) as usize] = tp;
+    ty(src, st, out);
+    st[(P) as usize] = save;
+}
+
+pub fn vec_first_type(src: &[u8], st: &mut [usize], out: &mut [u8], e0: usize) -> bool {
+    let mut t0: usize = e0;
+    if tok_is(src, t0, b"-") {
+        t0 = skip_ws(src, (t0 + 1));
+    }
+    let te: usize = tok_end(src, t0);
+    let c: u8 = head(src, t0);
+    if is_digit(c) {
+        let k: usize = suffix_len(src, t0, te);
+        if (k == 0) {
+            return false;
+        }
+        put_src(src, st, out, (te - k), te);
+        return true;
+    }
+    if ((c == B_QUOTE) || raw_str_at(src, t0)) {
+        puts(st, out, b"[]const u8");
+        return true;
+    }
+    if (tok_is(src, t0, b"true") || tok_is(src, t0, b"false")) {
+        puts(st, out, b"bool");
+        return true;
+    }
+    if ((is_upper(c) && peek_is(src, t0, b"::")) && (find_enum(src, t0, te) < src.len())) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if ((is_upper(c) && peek_is(src, t0, b"{")) && (find_struct(src, st, t0, te) < src.len())) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if ((is_alpha(c) && !(is_upper(c))) && peek_is(src, t0, b"(")) {
+        let r: usize = ret_word(src, t0, te);
+        if (r < src.len()) {
+            put_elem_ty(src, st, out, r);
+            return !(bad(st[(ERR) as usize]));
+        }
+    }
+    return false;
+}
+
+pub fn put_vec_elem(src: &[u8], st: &mut [usize], out: &mut [u8], typed: bool, e0: usize, lo: usize, hi: usize, na: usize, nb: usize) -> bool {
+    if typed {
+        let t: usize = st[(LETTY) as usize];
+        let lt: usize = skip_ws(src, tok_end(src, t));
+        let tp: usize = skip_ws(src, tok_end(src, lt));
+        if ((tok_is(src, t, b"Vec") && tok_is(src, lt, b"<")) && !(tok_is(src, tp, b"_"))) {
+            put_elem_ty(src, st, out, tp);
+            return !(bad(st[(ERR) as usize]));
+        }
+    }
+    if vec_first_type(src, st, out, e0) {
+        return true;
+    }
+    if bad(st[(ERR) as usize]) {
+        return false;
+    }
+    let el: usize = vec_arg_elem(src, lo, hi, na, nb);
+    if (el < src.len()) {
+        put_elem_ty(src, st, out, el);
+        return !(bad(st[(ERR) as usize]));
+    }
+    return false;
+}
+
+pub fn list_count(src: &[u8], lo: usize, hi: usize) -> usize {
+    let mut n: usize = 0;
+    let mut q: usize = lo;
+    while (q < hi) {
+        n = (n + 1);
+        let c: usize = find_at(src, q, B_COMMA);
+        if (c >= hi) {
+            q = hi;
+        } else {
+            q = skip_ws(src, (c + 1));
+        }
+    }
+    return n;
+}
+
+pub fn const_len(src: &[u8], st: &mut [usize], lo: usize, hi: usize) -> bool {
+    if (lo >= hi) {
+        return false;
+    }
+    let mut q: usize = lo;
+    while (q < hi) {
+        let e: usize = tok_end(src, q);
+        let c: u8 = src[(q) as usize];
+        if is_digit(c) {
+            if (suffix_len(src, q, e) > 0) {
+                return false;
+            }
+        } else {
+            if is_upper(c) {
+                if (const_type(src, st, q, e) >= src.len()) {
+                    return false;
+                }
+            } else {
+                if !(((e == (q + 1)) && (((((((c == B_PLUS) || (c == B_MINUS)) || (c == B_STAR)) || (c == B_SLASH)) || (c == B_PCT)) || (c == B_LPAREN)) || (c == B_RPAREN)))) {
+                    return false;
+                }
+            }
+        }
+        q = skip_ws(src, e);
+    }
+    return true;
+}
+
+pub fn let_vec(src: &[u8], st: &mut [usize], out: &mut [u8], mutable: bool, na: usize, nb: usize, typed: bool, init: usize) -> () {
+    let bang: usize = skip_ws(src, tok_end(src, init));
+    let lb: usize = skip_ws(src, tok_end(src, bang));
+    let close: usize = block_end(src, lb);
+    let rb: usize = (close - 1);
+    let e0: usize = skip_ws(src, (lb + 1));
+    let hi: usize = item_end(src, st[(FLO) as usize]);
+    let scope: usize = vec_scope_end(src, close, hi, na, nb);
+    let how: usize = vec_use(src, close, scope, na, nb);
+    if (how == VU_CHANGED) {
+        refuse(st, R_VECMUT, init, init, tok_end(src, init));
+        return ();
+    }
+    if (how == VU_MOVED) {
+        refuse(st, R_VECMOVE, init, init, tok_end(src, init));
+        return ();
+    }
+    let empty: bool = (e0 >= rb);
+    let semi: usize = find_at(src, e0, B_SEMI);
+    let repeat: bool = (!(empty) && (semi < rb));
+    if mutable {
+        puts(st, out, b"var ");
+    } else {
+        puts(st, out, b"const ");
+    }
+    put_ident(src, st, out, na, nb);
+    puts(st, out, b" : [");
+    if repeat {
+        let n0: usize = skip_ws(src, (semi + 1));
+        if !(const_len(src, st, n0, rb)) {
+            refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+            return ();
+        }
+        st[(P) as usize] = n0;
+        expr(src, st, out, false);
+    } else {
+        put_num(st, out, list_count(src, e0, rb));
+    }
+    puts(st, out, b"]");
+    if !(put_vec_elem(src, st, out, typed, e0, close, scope, na, nb)) {
+        refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+        return ();
+    }
+    puts(st, out, b" = ");
+    if empty {
+        puts(st, out, b"[]");
+        st[(P) as usize] = close;
+    } else {
+        st[(P) as usize] = lb;
+        array_lit(src, st, out);
     }
     want(src, st, b";");
     puts(st, out, b";");
@@ -6337,10 +6727,22 @@ pub fn put_reason(src: &[u8], st: &mut [usize], out: &mut [u8]) -> () {
                                                                                                                             if (c == R_NOTYPE) {
                                                                                                                                 puts(st, out, b"`!` of an operand whose type t27o cannot tell");
                                                                                                                             } else {
-                                                                                                                                if (c == R_SPLICE) {
-                                                                                                                                    puts(st, out, b"a used module's own use t27c does not splice (its type_text:: names stay unresolved, the gap specs/compiler/int_type_names.t27 records)");
+                                                                                                                                if (c == R_VECMUT) {
+                                                                                                                                    puts(st, out, b"a vec! the fn changes (push, resize, assign into, &mut)");
                                                                                                                                 } else {
-                                                                                                                                    puts(st, out, b"syntax");
+                                                                                                                                    if (c == R_VECMOVE) {
+                                                                                                                                        puts(st, out, b"a vec! the fn hands on or returns");
+                                                                                                                                    } else {
+                                                                                                                                        if (c == R_VECTYPE) {
+                                                                                                                                            puts(st, out, b"a vec! whose element type or length t27o cannot tell");
+                                                                                                                                        } else {
+                                                                                                                                            if (c == R_SPLICE) {
+                                                                                                                                                puts(st, out, b"a used module's own use t27c does not splice (its type_text:: names stay unresolved, the gap specs/compiler/int_type_names.t27 records)");
+                                                                                                                                            } else {
+                                                                                                                                                puts(st, out, b"syntax");
+                                                                                                                                            }
+                                                                                                                                        }
+                                                                                                                                    }
                                                                                                                                 }
                                                                                                                             }
                                                                                                                         }
