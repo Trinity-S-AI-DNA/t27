@@ -1352,12 +1352,9 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     fs::create_dir_all("specs/t27o_check")?;
     fs::write(&path, [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat())?;
     println!("{}", path.display());
-    // t27b's JIT judges first; t27c test-report only when t27b's run is not a verdict (rules: specs/tools/t27o/ledger.t27, #10525)
-    let t27b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b");
-    let code = Command::new(t27b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
-    let o = t27o_ledger::t27b_outcome(code);
-    if !t27o_ledger::needs_reference(o) { return Ok(code as u8); }
-    eprintln!("t27o: {t27b} test exited {code} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[o as usize]);
+    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
+    let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
+    if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
 
