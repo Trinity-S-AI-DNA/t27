@@ -133,6 +133,8 @@ mod suite_jobs;
 #[path = "../gen/rust/verified/watch.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod watch;
+#[path = "../gen/rust/verified/frontier_scope.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod frontier_scope; // specs/verified/frontier_scope.t27 (#10236): whether, and how far, a scoped frontier narrows its walk.
+#[path = "../gen/rust/ci/affected.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod affected; // specs/ci/affected.t27 (#7565): the specs a change can move; CI's rule, here the selection behind `frontier --only/--since`.
 // specs/verified/silicon_queue.t27 (#8095 step 5): the bench queue and the reseal guard.
 #[path = "../gen/rust/verified/silicon_queue.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
@@ -387,16 +389,12 @@ enum Commands {
         #[arg(long, value_delimiter = ',', default_value = "1,7,42")]
         seeds: Vec<u32>,
     },
-    /// THE SERVICE (R2-4): read the receipts a spec's hardware runs wrote
-    /// (.trinity/receipts) and judge, by specs/verified/run_record.t27, whether
-    /// they are ONE verified run a verdict record may cite as its run
-    /// reference. Collects the facts, never repairs the record.
     /// #8095: every spec, REUSE or the reason to rebuild (specs/verified/seal_identity.t27).
     Frontier { /// Also print each spec that must be rebuilt, with its reason code.
         #[arg(long)] list: bool, /// Seal again each spec with a stale part; keep only a seal remint_keeps allows.
         #[arg(long)] reseal: bool, /// Rerun the reused specs verdict_audit.t27 picks for this round; exit 1 on a disagreement.
         #[arg(long)] audit: Option<u32>, /// Keep running: rerun each spec whose closure changed since the last look (watch.t27).
-        #[arg(long)] watch: bool },
+        #[arg(long)] watch: bool, #[arg(long, num_args = 1.., conflicts_with = "since", help = "Walk only these specs and the specs that import them (frontier_scope.t27)")] only: Vec<String>, #[arg(long, help = "Walk only the specs `git diff --name-status REV` names and the specs that import them")] since: Option<String> },
     /// #8095 step 5: what the bench does about each spec with a silicon run (specs/verified/silicon_queue.t27).
     SiliconQueue,
     /// #8153: the agent next to a board (specs/verified/bench_agent.t27). Runs owner-approved jobs (open
@@ -11980,7 +11978,7 @@ async fn main() -> anyhow::Result<()> {
             service::run_prove(&std::env::current_dir()?, &input, mutate)?
         }
         Commands::Seal { input, save, verify, force } => run_seal(&input, save, verify, force)?,
-        Commands::Frontier { list, reseal, audit, watch } => service::run_frontier(list, reseal, audit, watch)?,
+        Commands::Frontier { list, reseal, audit, watch, only, since } => service::run_frontier(list, reseal, audit, watch, only, since)?,
         Commands::SiliconQueue => service::run_silicon_queue()?,
         Commands::BenchAgent { busdev_num, wrong_part, once } => service::run_bench_agent(&std::env::current_dir()?, busdev_num, wrong_part, once)?,
         Commands::Compile { input, backend, output } => {
@@ -12417,7 +12415,7 @@ fn main() -> anyhow::Result<()> {
             service::run_prove(&std::env::current_dir()?, &input, mutate)?
         }
         Commands::Seal { input, save, verify, force } => run_seal(&input, save, verify, force)?,
-        Commands::Frontier { list, reseal, audit, watch } => service::run_frontier(list, reseal, audit, watch)?,
+        Commands::Frontier { list, reseal, audit, watch, only, since } => service::run_frontier(list, reseal, audit, watch, only, since)?,
         Commands::SiliconQueue => service::run_silicon_queue()?,
         Commands::BenchAgent { busdev_num, wrong_part, once } => service::run_bench_agent(&std::env::current_dir()?, busdev_num, wrong_part, once)?,
         Commands::Compile { input, backend, output } => {
