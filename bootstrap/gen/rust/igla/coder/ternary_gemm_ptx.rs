@@ -57,8 +57,9 @@ pub fn put_u(out: &mut [u8], cap: usize, w: usize, v: u32) -> usize {
 }
 
 pub fn ins(out: &mut [u8], cap: usize, w: usize, s: &'static str) -> usize {
-    let x: usize = put_s(out, cap, w, "    ");
-    return put_s(out, cap, put_s(out, cap, x, s), "\n");
+    let mut x: usize = put_s(out, cap, w, "    ");
+    x = put_s(out, cap, x, s);
+    return put_s(out, cap, x, "\n");
 }
 
 pub fn put_quad(out: &mut [u8], cap: usize, w: usize, name: &'static str, first: u32) -> usize {
@@ -68,7 +69,8 @@ pub fn put_quad(out: &mut [u8], cap: usize, w: usize, name: &'static str, first:
         if (j > 0) {
             x = put_s(out, cap, x, ", ");
         }
-        x = put_u(out, cap, put_s(out, cap, x, name), (first + j));
+        x = put_s(out, cap, x, name);
+        x = put_u(out, cap, x, (first + j));
         j += 1;
     }
     return put_s(out, cap, x, "}");
@@ -149,7 +151,9 @@ pub fn emit_prologue(out: &mut [u8], cap: usize, w: usize) -> usize {
     x = ins(out, cap, x, "mov.u32 %r28, 0;");
     let mut i: u32 = 0;
     while (i < 64) {
-        x = put_s(out, cap, put_u(out, cap, put_s(out, cap, x, "    mov.b32 %acc"), i), ", 0;\n");
+        x = put_s(out, cap, x, "    mov.b32 %acc");
+        x = put_u(out, cap, x, i);
+        x = put_s(out, cap, x, ", 0;\n");
         i += 1;
     }
     return x;
@@ -178,21 +182,30 @@ pub fn emit_tile_loads(out: &mut [u8], cap: usize, w: usize) -> usize {
     x = ins(out, cap, x, "@%p5 ld.global.u32 %r35, [%rd9];");
     let mut j: u32 = 0;
     while (j < 16) {
-        x = put_s(out, cap, put_u(out, cap, put_s(out, cap, x, "    shr.u32 %r36, %r35, "), (2 * j)), ";\n");
+        x = put_s(out, cap, x, "    shr.u32 %r36, %r35, ");
+        x = put_u(out, cap, x, (2 * j));
+        x = put_s(out, cap, x, ";\n");
         x = ins(out, cap, x, "and.b32 %r37, %r36, 1;");
         x = ins(out, cap, x, "shr.u32 %r38, %r36, 1;");
         x = ins(out, cap, x, "and.b32 %r38, %r38, 1;");
         x = ins(out, cap, x, "sub.s32 %r37, %r37, %r38;");
-        x = put_s(out, cap, put_u(out, cap, put_s(out, cap, x, "    st.shared.u8 [%r16+"), (j * SMEM_STRIDE)), "], %r37;\n");
+        x = put_s(out, cap, x, "    st.shared.u8 [%r16+");
+        x = put_u(out, cap, x, (j * SMEM_STRIDE));
+        x = put_s(out, cap, x, "], %r37;\n");
         j += 1;
     }
     return x;
 }
 
 pub fn emit_lds(out: &mut [u8], cap: usize, w: usize, reg: &'static str, i: u32, base: &'static str, off: u32) -> usize {
-    let mut x: usize = put_u(out, cap, put_s(out, cap, put_s(out, cap, w, "    ld.shared.u32 "), reg), i);
-    x = put_s(out, cap, put_s(out, cap, put_s(out, cap, x, ", ["), base), "+");
-    return put_s(out, cap, put_u(out, cap, x, off), "];\n");
+    let mut x: usize = put_s(out, cap, w, "    ld.shared.u32 ");
+    x = put_s(out, cap, x, reg);
+    x = put_u(out, cap, x, i);
+    x = put_s(out, cap, x, ", [");
+    x = put_s(out, cap, x, base);
+    x = put_s(out, cap, x, "+");
+    x = put_u(out, cap, x, off);
+    return put_s(out, cap, x, "];\n");
 }
 
 pub fn emit_mma_step(out: &mut [u8], cap: usize, w: usize) -> usize {
@@ -218,10 +231,16 @@ pub fn emit_mma_step(out: &mut [u8], cap: usize, w: usize) -> usize {
         while (ni < 4) {
             let b: u32 = (((mi * 4) + ni) * 4);
             x = put_s(out, cap, x, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ");
-            x = put_s(out, cap, put_quad(out, cap, x, "%acc", b), ", ");
-            x = put_s(out, cap, put_quad(out, cap, x, "%fa", (mi * 4)), ", {%fb");
-            x = put_u(out, cap, put_s(out, cap, put_u(out, cap, x, (ni * 2)), ", %fb"), ((ni * 2) + 1));
-            x = put_s(out, cap, put_quad(out, cap, put_s(out, cap, x, "}, "), "%acc", b), ";\n");
+            x = put_quad(out, cap, x, "%acc", b);
+            x = put_s(out, cap, x, ", ");
+            x = put_quad(out, cap, x, "%fa", (mi * 4));
+            x = put_s(out, cap, x, ", {%fb");
+            x = put_u(out, cap, x, (ni * 2));
+            x = put_s(out, cap, x, ", %fb");
+            x = put_u(out, cap, x, ((ni * 2) + 1));
+            x = put_s(out, cap, x, "}, ");
+            x = put_quad(out, cap, x, "%acc", b);
+            x = put_s(out, cap, x, ";\n");
             ni += 1;
         }
         mi += 1;
@@ -230,8 +249,12 @@ pub fn emit_mma_step(out: &mut [u8], cap: usize, w: usize) -> usize {
 }
 
 pub fn emit_store(out: &mut [u8], cap: usize, w: usize, dr: u32, dc: u32, b: u32) -> usize {
-    let mut x: usize = put_s(out, cap, put_u(out, cap, put_s(out, cap, w, "    add.u32 %r41, %r39, "), dr), ";\n");
-    x = put_s(out, cap, put_u(out, cap, put_s(out, cap, x, "    add.u32 %r42, %r40, "), dc), ";\n");
+    let mut x: usize = put_s(out, cap, w, "    add.u32 %r41, %r39, ");
+    x = put_u(out, cap, x, dr);
+    x = put_s(out, cap, x, ";\n");
+    x = put_s(out, cap, x, "    add.u32 %r42, %r40, ");
+    x = put_u(out, cap, x, dc);
+    x = put_s(out, cap, x, ";\n");
     x = ins(out, cap, x, "setp.lt.u32 %p6, %r41, %r1;");
     x = ins(out, cap, x, "setp.lt.u32 %p7, %r42, %r2;");
     x = ins(out, cap, x, "and.pred %p6, %p6, %p7;");
@@ -239,8 +262,11 @@ pub fn emit_store(out: &mut [u8], cap: usize, w: usize, dr: u32, dc: u32, b: u32
     x = ins(out, cap, x, "mad.wide.u32 %rd10, %r41, %r2, %rd10;");
     x = ins(out, cap, x, "shl.b64 %rd10, %rd10, 2;");
     x = ins(out, cap, x, "add.u64 %rd10, %rd10, %rd3;");
-    x = put_u(out, cap, put_s(out, cap, x, "    @%p6 st.global.v2.u32 [%rd10], {%acc"), b);
-    return put_s(out, cap, put_u(out, cap, put_s(out, cap, x, ", %acc"), (b + 1)), "};\n");
+    x = put_s(out, cap, x, "    @%p6 st.global.v2.u32 [%rd10], {%acc");
+    x = put_u(out, cap, x, b);
+    x = put_s(out, cap, x, ", %acc");
+    x = put_u(out, cap, x, (b + 1));
+    return put_s(out, cap, x, "};\n");
 }
 
 pub fn emit_epilogue(out: &mut [u8], cap: usize, w: usize) -> usize {
