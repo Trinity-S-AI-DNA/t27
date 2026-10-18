@@ -349,7 +349,7 @@ fn a_comptime_int_rounds_in_float_from_int() {
 fn f32_rounding_and_rem_call_their_ports() {
     let src = "module a;\n\nfn f(x: f32) -> f32 {\n    return @round(x) + @floor(x) + @ceil(x) + @trunc(x) + @rem(x, 2.0);\n}\n\ntest t {\n    assert(f(-2.5) == -10.5);\n}\n";
     assert_eq!(names_ok(&run(src)), vec![("t", false, true)]);
-    for (from, to, what, why) in [("x: f32) -> f32", "x: f64) -> f64", "@trunc", "no f64 routine"), ("@rem(x, 2.0)", "@rem(x)", "@rem", "`@rem` two")] {
+    for (from, to, what, why) in [("x: f32) -> f32", "x: f64) -> f64", "@trunc", "no f64 routine"), ("@rem(x, 2.0)", "@rem(x)", "@rem", "`@rem` and `@mod` two")] {
         let m = rejected(&src.replace(from, to));
         assert!(m.contains(&format!("construct ExprCall({}) at line 4", what)) && m.contains(why), "{}", m);
     }

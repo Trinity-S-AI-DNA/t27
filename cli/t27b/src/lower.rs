@@ -3807,7 +3807,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A builtin of libm_plan.t27 (`@exp`, `@log`, an i64 `@mod`; an integer `@rem` is t27b's `%`): a call of its routine from libm.t27, compiler_rt's
+    /// A builtin of libm_plan.t27 (`@exp`, `@log`, a signed `@mod`; an integer `@rem` is t27b's `%`): a call of its routine from libm.t27, compiler_rt's
     /// algorithm, so the bits are the reference's, folded or not. What is refused instead is the plan's.
     fn libm_call(&mut self, n: &Node) -> R<Val> {
         self.see(n);
@@ -3829,12 +3829,11 @@ impl<'a> Lower<'a> {
         match (v, self.sigs.get(xp::routine(b, a)).filter(|s| !s.poisoned).map(|s| (s.id, s.ret.clone()))) {
             (v, _) if a == xp::OPERATOR => { let r = self.expr(&n.children[1])?; self.binary(xp::OPERATOR_TEXT, v, r) }
             (v, Some((func, Some(LTy::S(ty))))) if t || matches!(v, Val::E(_) | Val::Cf(..)) => {
-                let mut args = if t { vec![] } else { vec![self.coerce(v, ty0)?] }; // `@log(10.0)`: the literal, one rounding to f64
-                for c in &n.children[at + 1..] {
-                    let r = self.expr_as(c, &LTy::S(ty0))?; // `@rem(x, 2.0)`, `@mod(i, 2147483648)`: the first one's type
-                    args.push(self.reg(r)?);
-                }
-                Ok(Val::E(Expr { ty, kind: ExprKind::Call { func, args } }))
+                let w = |e: Expr| if xp::widens(a) { Expr { ty, kind: ExprKind::Widen(Box::new(e)) } } else { e }; // an i32 `@mod`: to the i64 routine's type
+                let mut args = if t { vec![] } else { vec![w(self.coerce(v, ty0)?)] }; // `@log(10.0)`: the literal, one rounding to f64
+                for c in &n.children[at + 1..] { let r = self.expr_as(c, &LTy::S(ty0))?; args.push(w(self.reg(r)?)); } // `@rem(x, 2.0)`, `@mod(i, 2147483648)`: the first one's type
+                let call = Expr { ty, kind: ExprKind::Call { func, args } }; // and back to the operands' type, which holds 0 <= r < b
+                Ok(Val::E(if xp::widens(a) { Expr { ty: ty0, kind: ExprKind::Cast { arg: Box::new(call), site: 0 } } } else { call }))
             }
             _ => self.reject(xp::what(b), format!("`{}`: {}", n.name, xp::why(a))),
         }
