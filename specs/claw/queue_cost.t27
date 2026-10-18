@@ -1,0 +1,548 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/queue_cost.t27 -- where the Actions queue's time goes, and what is waiting in it (#10600).
+; --
+; On 2026-10-18 the queue held 922 runs and lane PRs stayed BLOCKED for hours. The first guess was
+; stale runs on superseded heads (#10590). Measured, they were 25 of 922; 798 were on the PR's current
+; head, and one workflow, t27b native, held 88% of the job time. That measurement was taken by hand
+; with jq and awk. This module is the measurement, so the next person who asks why the queue is long
+; gets the same answer from the same rule and does not blame the wrong cause.
+; --
+; Question 1, cost_plan: which workflow holds the runners. Input, one line per finished job, two TAB
+; fields:   workflow name TAB seconds the job ran (completed_at minus started_at; queue wait excluded)
+; Output:
+;     M TAB queue-cost: <minutes> min of job time in <jobs> jobs, <bad> unreadable
+;     H TAB <workflow> TAB <share in percent>          the top holder, when any job time was read
+;     M TAB queue-cost: one workflow holds <share>% of job time; ...   when that share is HOT_PCT or more
+; Jobs of one workflow are summed across rows. Ties go to the workflow seen first. Shares round half up.
+; --
+; Question 2, class_plan: what the queued runs are waiting for. Input, one line per queued run, five
+; TAB fields:   event TAB PR state TAB PR isDraft TAB PR head sha TAB run head sha
+; Fields a run has no value for are `-`. The class, first match wins:
+;     other       the event is not pull_request or pull_request_target (push, schedule, issues, ...)
+;     closed      the PR is CLOSED or MERGED; its run will judge nothing anybody waits for
+;     superseded  the run is for a head the PR no longer has: a concurrency block would cancel it,
+;                 draft or not
+;     draft       the PR is a draft, and the run is for its current head
+;     current     the run is for the PR's current head: real demand
+; Output:
+;     M TAB queue-class: <n> current head, <n> superseded head, <n> closed PR, <n> draft PR,
+;           <n> other event, <n> unreadable
+;     M TAB queue-class: cancelling the runs on superseded heads frees <share>% of the queue
+; --
+; Fail closed: a row that is not the right number of fields, an empty name, seconds that are not one
+; to six digits or exceed MAX_SECS, a state that is not OPEN, CLOSED or MERGED, a draft flag that is
+; not `true` or `false`, a sha that is not 40 lowercase hex digits, or a row past MAX_ROWS is counted
+; as unreadable. It is never summed as job time and never counted as a class. A trailing carriage
+; return makes the last field unreadable.
+; The honest limit: the answer is about the rows it is given. Which runs and jobs were listed, and
+; when, is the caller's choice and belongs in the report next to this output.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawQueueCost;
+
+use claw::text;
+
+/// Rows one answer reads; more are counted as unreadable, never silently dropped.
+pub const MAX_ROWS : u32 = 4096;
+/// Distinct workflows cost_plan keeps; a row of a further workflow is counted as unreadable.
+pub const MAX_WF : usize = 64;
+/// The longest a job can run on a self-hosted runner (5 days); a larger value is a misread.
+pub const MAX_SECS : i32 = 432000;
+/// At this share or more of the job time, one workflow is named as the lever.
+pub const HOT_PCT : u32 = 50;
+
+/// Run classes. C_BAD is an unreadable row.
+pub const C_CURRENT : u8 = 0;
+pub const C_SUPERSEDED : u8 = 1;
+pub const C_CLOSED : u8 = 2;
+pub const C_DRAFT : u8 = 3;
+pub const C_OTHER : u8 = 4;
+pub const C_BAD : u8 = 5;
+pub const C_COUNT : usize = 6;
+
+pub const COST_HEAD : str = "M\tqueue-cost: ";
+pub const COST_HEAD_LEN : usize = 14;
+pub const COST_MIN : str = " min of job time in ";
+pub const COST_MIN_LEN : usize = 20;
+pub const COST_JOBS : str = " jobs, ";
+pub const COST_JOBS_LEN : usize = 7;
+pub const UNREADABLE : str = " unreadable\n";
+pub const UNREADABLE_LEN : usize = 12;
+pub const HOT_HEAD : str = "M\tqueue-cost: one workflow holds ";
+pub const HOT_HEAD_LEN : usize = 33;
+pub const HOT_TAIL : str = "% of job time; its runtime is the lever, not stale runs\n";
+pub const HOT_TAIL_LEN : usize = 56;
+
+pub const CLASS_HEAD : str = "M\tqueue-class: ";
+pub const CLASS_HEAD_LEN : usize = 15;
+/// After each count, in class order; the last one is UNREADABLE.
+pub const CLASS_TEXTS : [5]str = [
+    " current head, ", " superseded head, ", " closed PR, ", " draft PR, ", " other event, "
+];
+pub const CLASS_LENS : [5]usize = [15, 18, 12, 11, 14];
+pub const FREE_HEAD : str = "M\tqueue-class: cancelling the runs on superseded heads frees ";
+pub const FREE_HEAD_LEN : usize = 61;
+pub const FREE_TAIL : str = "% of the queue\n";
+pub const FREE_TAIL_LEN : usize = 15;
+
+// ---- bytes and fields ----
+
+fn qc_put_byte(dst : []u8, cap : usize, w : usize, b : u8) -> usize {
+    if (w < cap) { dst[w] = b; }
+    return w + 1;
+}
+
+/// raw[s..e) into dst at w, clipped at cap; the cursor still advances.
+fn qc_put_range(dst : []u8, cap : usize, w : usize, raw : []const u8, s : usize, e : usize) -> usize {
+    var x : usize = w;
+    var i : usize = s;
+    while (i < e) {
+        x = qc_put_byte(dst, cap, x, raw[i]);
+        i += 1;
+    }
+    return x;
+}
+
+/// The newline that ends the line starting at s, or n.
+fn qc_line_end(raw : []const u8, n : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < n) {
+        if (raw[i] == '\n') { return i; }
+        i += 1;
+    }
+    return n;
+}
+
+fn qc_field_end(raw : []const u8, e : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < e) {
+        if (raw[i] == '\t') { return i; }
+        i += 1;
+    }
+    return e;
+}
+
+/// Split raw[ls..le) into exactly nf TAB fields: f[2k], f[2k+1] are the bounds of field k.
+fn qc_split(raw : []const u8, ls : usize, le : usize, f : []usize, nf : usize) -> bool {
+    var k : usize = 0;
+    var s : usize = ls;
+    while (k < nf) {
+        const e : usize = qc_field_end(raw, le, s);
+        f[2 * k] = s;
+        f[2 * k + 1] = e;
+        k += 1;
+        if (k < nf) {
+            if (e >= le) { return false; }
+            s = e + 1;
+        } else {
+            return e == le;
+        }
+    }
+    return false;
+}
+
+/// raw[a..ae) and raw[b..be) hold the same bytes.
+pub fn qc_range_eq(raw : []const u8, a : usize, ae : usize, b : usize, be : usize) -> bool {
+    if (ae - a != be - b) { return false; }
+    var i : usize = 0;
+    while (a + i < ae) {
+        if (raw[a + i] != raw[b + i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// raw[s..e) is exactly the literal.
+pub fn qc_range_is(raw : []const u8, s : usize, e : usize, lit : str, lit_len : usize) -> bool {
+    if (e - s != lit_len) { return false; }
+    var i : usize = 0;
+    while (i < lit_len) {
+        if (raw[s + i] != lit[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Seconds in raw[s..e): one to six decimal digits, at most MAX_SECS; -1 otherwise.
+pub fn qc_secs(raw : []const u8, s : usize, e : usize) -> i32 {
+    if (e <= s or e - s > 6) { return -1; }
+    var v : i32 = 0;
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = raw[i];
+        if (b < '0' or b > '9') { return -1; }
+        v = v * 10 + ((b - '0') as i32);
+        i += 1;
+    }
+    if (v > MAX_SECS) { return -1; }
+    return v;
+}
+
+/// raw[s..e) is 40 lowercase hex digits.
+pub fn qc_sha_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e - s != 40) { return false; }
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = raw[i];
+        const dig : bool = b >= '0' and b <= '9';
+        const hex : bool = b >= 'a' and b <= 'f';
+        if (dig == false and hex == false) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// part of total in whole percent, rounded half up; 0 when total is 0.
+pub fn share_pct(part : u64, total : u64) -> u32 {
+    if (total == 0) { return 0; }
+    return ((part * 200 + total) / (total * 2)) as u32;
+}
+
+// ---- question 1: which workflow holds the runners ----
+
+/// The answer for the job rows in raw[0..n), into out. Returns the bytes it needs; when that exceeds
+/// cap the buffer holds a clipped answer.
+pub fn cost_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var ns : [64]usize = undefined;
+    var ne : [64]usize = undefined;
+    var sec : [64]u64 = undefined;
+    var f : [4]usize = undefined;
+    var nw : usize = 0;
+    var jobs : u32 = 0;
+    var bad : u32 = 0;
+    var total : u64 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var ok : bool = false;
+            if (jobs + bad < MAX_ROWS and qc_split(raw, ls, le, &f, 2)) {
+                const s : i32 = qc_secs(raw, f[2], f[3]);
+                if (s >= 0 and f[1] > f[0]) {
+                    var hit : usize = nw;
+                    var k : usize = 0;
+                    while (k < nw) {
+                        if (hit == nw and qc_range_eq(raw, ns[k], ne[k], f[0], f[1])) { hit = k; }
+                        k += 1;
+                    }
+                    if (hit == nw and nw < MAX_WF) {
+                        ns[nw] = f[0];
+                        ne[nw] = f[1];
+                        sec[nw] = 0;
+                        nw += 1;
+                    }
+                    if (hit < nw) {
+                        sec[hit] = sec[hit] + (s as u64);
+                        total = total + (s as u64);
+                        jobs += 1;
+                        ok = true;
+                    }
+                }
+            }
+            if (ok == false) { bad += 1; }
+        }
+        ls = le + 1;
+    }
+    var w : usize = put_str(out, cap, 0, COST_HEAD, COST_HEAD_LEN);
+    w = put_count(out, cap, w, (total / 60) as u32);
+    w = put_str(out, cap, w, COST_MIN, COST_MIN_LEN);
+    w = put_count(out, cap, w, jobs);
+    w = put_str(out, cap, w, COST_JOBS, COST_JOBS_LEN);
+    w = put_count(out, cap, w, bad);
+    w = put_str(out, cap, w, UNREADABLE, UNREADABLE_LEN);
+    if (total == 0) { return w; }
+    var top : usize = 0;
+    var j : usize = 1;
+    while (j < nw) {
+        if (sec[j] > sec[top]) { top = j; }
+        j += 1;
+    }
+    const pct : u32 = share_pct(sec[top], total);
+    w = qc_put_byte(out, cap, w, 'H');
+    w = qc_put_byte(out, cap, w, '\t');
+    w = qc_put_range(out, cap, w, raw, ns[top], ne[top]);
+    w = qc_put_byte(out, cap, w, '\t');
+    w = put_count(out, cap, w, pct);
+    w = qc_put_byte(out, cap, w, '\n');
+    if (pct >= HOT_PCT) {
+        w = put_str(out, cap, w, HOT_HEAD, HOT_HEAD_LEN);
+        w = put_count(out, cap, w, pct);
+        w = put_str(out, cap, w, HOT_TAIL, HOT_TAIL_LEN);
+    }
+    return w;
+}
+
+// ---- question 2: what the queued runs wait for ----
+
+/// The class of one split run row (ten bounds in f).
+pub fn run_class(raw : []const u8, f : []const usize) -> u8 {
+    const pr : bool = qc_range_is(raw, f[0], f[1], "pull_request", 12) or qc_range_is(raw, f[0], f[1], "pull_request_target", 19);
+    if (pr == false) {
+        if (f[1] > f[0]) { return C_OTHER; }
+        return C_BAD;
+    }
+    const open : bool = qc_range_is(raw, f[2], f[3], "OPEN", 4);
+    const closed : bool = qc_range_is(raw, f[2], f[3], "CLOSED", 6) or qc_range_is(raw, f[2], f[3], "MERGED", 6);
+    if (closed) { return C_CLOSED; }
+    if (open == false) { return C_BAD; }
+    const dt : bool = qc_range_is(raw, f[4], f[5], "true", 4);
+    const df : bool = qc_range_is(raw, f[4], f[5], "false", 5);
+    if (dt == false and df == false) { return C_BAD; }
+    if (qc_sha_ok(raw, f[6], f[7]) == false or qc_sha_ok(raw, f[8], f[9]) == false) { return C_BAD; }
+    if (qc_range_eq(raw, f[6], f[7], f[8], f[9]) == false) { return C_SUPERSEDED; }
+    if (dt) { return C_DRAFT; }
+    return C_CURRENT;
+}
+
+/// The answer for the queued-run rows in raw[0..n), into out. Returns the bytes it needs.
+pub fn class_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [6]u32 = undefined;
+    var f : [10]usize = undefined;
+    var c : usize = 0;
+    while (c < C_COUNT) {
+        st[c] = 0;
+        c += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var d : u8 = C_BAD;
+            if (rows < MAX_ROWS and qc_split(raw, ls, le, &f, 5)) { d = run_class(raw, &f); }
+            st[d] += 1;
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    var w : usize = put_str(out, cap, 0, CLASS_HEAD, CLASS_HEAD_LEN);
+    var i : usize = 0;
+    while (i < 5) {
+        w = put_count(out, cap, w, st[i]);
+        w = put_str(out, cap, w, CLASS_TEXTS[i], CLASS_LENS[i]);
+        i += 1;
+    }
+    w = put_count(out, cap, w, st[C_BAD]);
+    w = put_str(out, cap, w, UNREADABLE, UNREADABLE_LEN);
+    const read : u64 = (rows - st[C_BAD]) as u64;
+    if (read > 0) {
+        w = put_str(out, cap, w, FREE_HEAD, FREE_HEAD_LEN);
+        w = put_count(out, cap, w, share_pct(st[C_SUPERSEDED] as u64, read));
+        w = put_str(out, cap, w, FREE_TAIL, FREE_TAIL_LEN);
+    }
+    return w;
+}
+
+// ---- test helpers: a row from small codes, so a test states the case and not the bytes ----
+
+fn t_job(dst : []u8, cap : usize, w : usize, name : str, name_len : usize, secs : u32) -> usize {
+    var x : usize = put_str(dst, cap, w, name, name_len);
+    x = qc_put_byte(dst, cap, x, '\t');
+    x = put_count(dst, cap, x, secs);
+    return qc_put_byte(dst, cap, x, '\n');
+}
+
+fn t_sha(dst : []u8, cap : usize, w : usize, b : u8) -> usize {
+    var x : usize = w;
+    var i : usize = 0;
+    while (i < 40) {
+        x = qc_put_byte(dst, cap, x, b);
+        i += 1;
+    }
+    return x;
+}
+
+/// Test-only kind: a draft PR's run on a head it no longer has.
+const T_DRAFT_OLD : u8 = 6;
+
+/// One queued run of class kind (the C_ codes, or T_DRAFT_OLD); C_BAD writes a run whose shas are
+/// three digits.
+fn t_run(dst : []u8, cap : usize, w : usize, kind : u8) -> usize {
+    var x : usize = w;
+    if (kind == C_OTHER) { return put_str(dst, cap, x, "push\t-\t-\t-\t-\n", 13); }
+    if (kind == C_CLOSED) { return put_str(dst, cap, x, "pull_request_target\tMERGED\t-\t-\t-\n", 33); }
+    if (kind == C_BAD) { return put_str(dst, cap, x, "pull_request\tOPEN\tfalse\tabc\tabc\n", 32); }
+    x = put_str(dst, cap, x, "pull_request\tOPEN\t", 18);
+    if (kind == C_DRAFT or kind == T_DRAFT_OLD) { x = put_str(dst, cap, x, "true\t", 5); } else { x = put_str(dst, cap, x, "false\t", 6); }
+    x = t_sha(dst, cap, x, 'a');
+    x = qc_put_byte(dst, cap, x, '\t');
+    if (kind == C_SUPERSEDED or kind == T_DRAFT_OLD) { x = t_sha(dst, cap, x, 'b'); } else { x = t_sha(dst, cap, x, 'a'); }
+    return qc_put_byte(dst, cap, x, '\n');
+}
+
+fn t_runs(dst : []u8, cap : usize, w : usize, kind : u8, count : u32) -> usize {
+    var x : usize = w;
+    var i : u32 = 0;
+    while (i < count) {
+        x = t_run(dst, cap, x, kind);
+        i += 1;
+    }
+    return x;
+}
+
+// ---- tests: the arithmetic ----
+
+test a_share_rounds_half_up_and_is_zero_without_time {
+    assert share_pct(637, 726) == 88;
+    assert share_pct(1, 2) == 50;
+    assert share_pct(1, 3) == 33;
+    assert share_pct(2, 3) == 67;
+    assert share_pct(25, 922) == 3;
+    assert share_pct(5, 0) == 0;
+    assert share_pct(7, 7) == 100;
+}
+
+test seconds_are_one_to_six_digits_and_at_most_five_days {
+    var r : [64]u8 = undefined;
+    const n : usize = put_str(&r, 64, 0, "0 504 432000 432001 1234567 5a  ", 32);
+    assert n == 32;
+    assert qc_secs(&r, 0, 1) == 0;
+    assert qc_secs(&r, 2, 5) == 504;
+    assert qc_secs(&r, 6, 12) == 432000;
+    assert qc_secs(&r, 13, 19) == -1;
+    assert qc_secs(&r, 20, 27) == -1;
+    assert qc_secs(&r, 28, 30) == -1;
+    assert qc_secs(&r, 30, 30) == -1;
+}
+
+// ---- tests: question 1 ----
+
+test the_2026_10_18_job_time_names_t27b_native_at_88_percent {
+    var r : [512]u8 = undefined;
+    var n : usize = t_job(&r, 512, 0, "t27b native", 11, 30240);
+    n = t_job(&r, 512, n, "Emit Bit-Exact Gate", 19, 2100);
+    n = t_job(&r, 512, n, "t27b native", 11, 7980);
+    n = t_job(&r, 512, n, "Seal Coverage", 13, 1440);
+    n = t_job(&r, 512, n, "t27b native", 11, 0);
+    n = t_job(&r, 512, n, "every other workflow", 20, 1800);
+    var out : [512]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &out, 512);
+    assert d <= 512;
+    assert buf_has(&out, d, "M\tqueue-cost: 726 min of job time in 6 jobs, 0 unreadable\n", 58) == true;
+    assert buf_has(&out, d, "H\tt27b native\t88\n", 17) == true;
+    assert buf_has(&out, d, "M\tqueue-cost: one workflow holds 88% of job time; its runtime is the lever, not stale runs\n", 91) == true;
+}
+
+test a_workflow_under_half_the_time_is_named_without_a_verdict {
+    var r : [256]u8 = undefined;
+    var n : usize = t_job(&r, 256, 0, "a", 1, 40);
+    n = t_job(&r, 256, n, "b", 1, 35);
+    n = t_job(&r, 256, n, "c", 1, 25);
+    var out : [512]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, "H\ta\t40\n", 7) == true;
+    assert buf_has(&out, d, "one workflow holds", 18) == false;
+}
+
+test a_tie_goes_to_the_workflow_seen_first {
+    var r : [256]u8 = undefined;
+    var n : usize = t_job(&r, 256, 0, "late", 4, 10);
+    n = t_job(&r, 256, n, "early", 5, 60);
+    n = t_job(&r, 256, n, "late", 4, 50);
+    var out : [512]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, "H\tlate\t50\n", 10) == true;
+    assert buf_has(&out, d, "H\tearly", 7) == false;
+}
+
+test an_unreadable_job_row_is_counted_and_never_summed {
+    var r : [256]u8 = undefined;
+    const n : usize = put_str(&r, 256, 0, "x\t12a\nx\n\t5\nx\t5\textra\nx\t9999999\nx\t-1\n", 36);
+    var out : [512]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, "M\tqueue-cost: 0 min of job time in 0 jobs, 6 unreadable\n", 56) == true;
+    assert t_has_line(&out, d, 'H') == false;
+}
+
+test a_carriage_return_makes_the_seconds_unreadable {
+    var r : [64]u8 = undefined;
+    const n : usize = put_str(&r, 64, 0, "x\t600\r\ny\t60\n", 12);
+    var out : [512]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, " in 1 jobs, 1 unreadable\n", 25) == true;
+    assert buf_has(&out, d, "H\ty\t100\n", 8) == true;
+}
+
+test a_clipped_answer_still_reports_its_full_length {
+    var r : [64]u8 = undefined;
+    const n : usize = t_job(&r, 64, 0, "w", 1, 120);
+    var big : [512]u8 = undefined;
+    const full : usize = cost_plan(&r, n, &big, 512);
+    var small : [8]u8 = undefined;
+    const d : usize = cost_plan(&r, n, &small, 8);
+    assert d == full;
+    assert d > 8;
+    assert small[0] == 'M';
+}
+
+// ---- tests: question 2 ----
+
+test each_kind_of_queued_run_gets_its_class {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_run(&r, 1024, 0, C_CURRENT);
+    n = t_run(&r, 1024, n, C_SUPERSEDED);
+    n = t_run(&r, 1024, n, C_CLOSED);
+    n = t_run(&r, 1024, n, C_DRAFT);
+    n = t_run(&r, 1024, n, C_OTHER);
+    n = t_run(&r, 1024, n, C_BAD);
+    var out : [512]u8 = undefined;
+    const d : usize = class_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, "M\tqueue-class: 1 current head, 1 superseded head, 1 closed PR, 1 draft PR, 1 other event, 1 unreadable\n", 103) == true;
+}
+
+test a_short_sha_is_unreadable_and_never_current {
+    var r : [256]u8 = undefined;
+    const n : usize = t_run(&r, 256, 0, C_BAD);
+    var out : [512]u8 = undefined;
+    const d : usize = class_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, " 0 current head, ", 17) == true;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+    assert buf_has(&out, d, "frees", 5) == false;
+}
+
+test an_unknown_state_or_flag_is_unreadable {
+    var r : [256]u8 = undefined;
+    var n : usize = put_str(&r, 256, 0, "pull_request\tOPENED\tfalse\t-\t-\n", 30);
+    n = put_str(&r, 256, n, "pull_request\tOPEN\tmaybe\t-\t-\n", 28);
+    n = put_str(&r, 256, n, "\t-\t-\t-\t-\n", 9);
+    n = put_str(&r, 256, n, "push\t-\t-\t-\n", 11);
+    var out : [512]u8 = undefined;
+    const d : usize = class_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, " 0 other event, 4 unreadable\n", 29) == true;
+}
+
+test a_draft_run_on_a_superseded_head_counts_as_superseded {
+    var r : [256]u8 = undefined;
+    const n : usize = t_run(&r, 256, 0, T_DRAFT_OLD);
+    var out : [512]u8 = undefined;
+    const d : usize = class_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, " 1 superseded head, 0 closed PR, 0 draft PR, ", 45) == true;
+}
+
+/// The 2026-10-18 18:25 UTC queue: 922 runs. The first table published in #10590 counted the 97
+/// draft runs twice (94 on a current head, 3 on a superseded one) and summed to 1019; one row is
+/// one class here, so the counts below sum to 922.
+test the_2026_10_18_queue_is_mostly_current_heads {
+    var r : [131072]u8 = undefined;
+    var n : usize = t_runs(&r, 131072, 0, C_CURRENT, 704);
+    n = t_runs(&r, 131072, n, C_SUPERSEDED, 22);
+    n = t_runs(&r, 131072, n, T_DRAFT_OLD, 3);
+    n = t_runs(&r, 131072, n, C_CLOSED, 13);
+    n = t_runs(&r, 131072, n, C_DRAFT, 94);
+    n = t_runs(&r, 131072, n, C_OTHER, 86);
+    assert n <= 131072;
+    var out : [512]u8 = undefined;
+    const d : usize = class_plan(&r, n, &out, 512);
+    assert buf_has(&out, d, "M\tqueue-class: 704 current head, 25 superseded head, 13 closed PR, 94 draft PR, 86 other event, 0 unreadable\n", 109) == true;
+    assert buf_has(&out, d, "M\tqueue-class: cancelling the runs on superseded heads frees 3% of the queue\n", 77) == true;
+}
+
+/// Some line of out[0..n) starts with byte b.
+fn t_has_line(out : []const u8, n : usize, b : u8) -> bool {
+    var i : usize = 0;
+    while (i < n) {
+        if (out[i] == b and (i == 0 or out[i - 1] == '\n')) { return true; }
+        i += 1;
+    }
+    return false;
+}
