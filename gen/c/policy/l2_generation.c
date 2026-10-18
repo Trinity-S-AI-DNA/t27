@@ -31,8 +31,8 @@
 #define K_ADDED 4
 #define BY_USE 0
 #define BY_STEM 1
-#define BACKENDS "c,verilog,rust,zig,$"
-#define SUBCOMMANDS "gen-c,gen-verilog,gen-rust,gen,$"
+#define BACKENDS "c,verilog,rust,zig,json,$"
+#define SUBCOMMANDS "gen-c,gen-verilog,gen-rust,gen,gen-json,$"
 #define NOT_FOUND 65535
 #define GEN_ROOT "gen/$"
 #define GEN_ROOT_LEN 4
@@ -799,12 +799,13 @@ size_t text_end(uint8_t* buf, size_t s, size_t e) {
    ------------------------------------------------------- */
 
 /* invariant: the_backend_table_is_pinned */
-/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(BACKENDS) == 4) */
-/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(SUBCOMMANDS) == 4) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(BACKENDS) == 5) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(SUBCOMMANDS) == 5) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "c", 0, 1) == list_index(SUBCOMMANDS, "gen-c", 0, 5)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "verilog", 0, 7) == list_index(SUBCOMMANDS, "gen-verilog", 0, 11)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "rust", 0, 4) == list_index(SUBCOMMANDS, "gen-rust", 0, 8)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "zig", 0, 3) == list_index(SUBCOMMANDS, "gen", 0, 3)) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "json", 0, 4) == list_index(SUBCOMMANDS, "gen-json", 0, 8)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(SUBCOMMANDS, "gen-zig", 0, 7) == NOT_FOUND) */
 
 /* invariant: the_fixed_lengths_are_the_pieces_lengths */
@@ -822,6 +823,8 @@ void test_a_copy_maps_to_its_backend_and_stem(void) {
     assert((copy_reason("gen/c/queen/priority.c", 0, 22) == R_MAPPED));
     assert((copy_reason("gen/verilog/numeric/gf16.v", 0, 26) == R_MAPPED));
     assert((copy_reason("gen/zig/a.zig", 0, 13) == R_MAPPED));
+    assert((copy_reason("gen/json/igla/own_model_board.json", 0, 34) == R_MAPPED));
+    assert((copy_reason("gen/jsonl/a.json", 0, 16) == R_UNKNOWN_BACKEND));
     assert((copy_reason("gen/README.md", 0, 13) == R_NO_BACKEND));
     assert((copy_reason("gen/c", 0, 5) == R_NO_BACKEND));
     assert((copy_reason("specs/a.t27", 0, 11) == R_NO_BACKEND));
