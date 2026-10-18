@@ -54,19 +54,19 @@ bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
 bool every_row_filled(void);
-bool str_eq(const char* a, size_t alen, const char* b, size_t blen);
 bool all_names_unique(void);
 bool all_classes_known(void);
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start);
 bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name, size_t name_len);
 bool dir_has(uint8_t* dir_text, size_t dir_len, const char* name, size_t name_len);
 bool line_in_names(uint8_t* dir_text, size_t start, size_t len);
-size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
-uint8_t digit_byte(uint32_t d);
-size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
-bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
 int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_cap);
 size_t claw_coverage_report(uint8_t* out, size_t out_cap);
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
+uint8_t digit_byte(uint32_t d);
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
+size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
+bool str_eq(const char* a, size_t alen, const char* b, size_t blen);
 
 /* -------------------------------------------------------
    Function implementations
@@ -114,21 +114,6 @@ bool every_row_filled(void) {
         }
     }
     return true;
-}
-
-bool str_eq(const char* a, size_t alen, const char* b, size_t blen) {
-    if ((alen != blen)) {
-        return false;
-    }
-    size_t diff = 0;
-    size_t i = 0;
-    while ((i < alen)) {
-        if ((a[i] != b[i])) {
-            diff += 1;
-        }
-        i += 1;
-    }
-    return (diff == 0);
 }
 
 bool all_names_unique(void) {
@@ -198,94 +183,6 @@ bool line_in_names(uint8_t* dir_text, size_t start, size_t len) {
         if (line_eq_name(dir_text, start, len, NAMES[i], NAME_LENS[i])) {
             return true;
         }
-    }
-    return false;
-}
-
-size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) {
-    size_t i = 0;
-    while ((i < s_len)) {
-        if (((w + i) < cap)) {
-            dst[(w + i)] = s[i];
-        }
-        i += 1;
-    }
-    return (w + s_len);
-}
-
-uint8_t digit_byte(uint32_t d) {
-    uint8_t b = '0';
-    if ((d == 1)) {
-        b = '1';
-    }
-    if ((d == 2)) {
-        b = '2';
-    }
-    if ((d == 3)) {
-        b = '3';
-    }
-    if ((d == 4)) {
-        b = '4';
-    }
-    if ((d == 5)) {
-        b = '5';
-    }
-    if ((d == 6)) {
-        b = '6';
-    }
-    if ((d == 7)) {
-        b = '7';
-    }
-    if ((d == 8)) {
-        b = '8';
-    }
-    if ((d == 9)) {
-        b = '9';
-    }
-    return b;
-}
-
-size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
-    uint8_t tmp[16] = {0};
-    size_t n = 0;
-    uint32_t x = v;
-    if ((x == 0)) {
-        tmp[0] = digit_byte(0);
-        n = 1;
-    }
-    while ((x > 0)) {
-        tmp[n] = digit_byte((x % 10));
-        n += 1;
-        x = (x / 10);
-    }
-    size_t k = 0;
-    while ((k < n)) {
-        if (((w + k) < cap)) {
-            dst[(w + k)] = tmp[((n - 1) - k)];
-        }
-        k += 1;
-    }
-    return (w + n);
-}
-
-bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
-    if ((needle_len > buf_len)) {
-        return false;
-    }
-    size_t start = 0;
-    while (((start + needle_len) <= buf_len)) {
-        size_t k = 0;
-        size_t diff = 0;
-        while ((k < needle_len)) {
-            if ((buf[(start + k)] != needle[k])) {
-                diff += 1;
-            }
-            k += 1;
-        }
-        if ((diff == 0)) {
-            return true;
-        }
-        start += 1;
     }
     return false;
 }
@@ -374,6 +271,109 @@ size_t claw_coverage_report(uint8_t* out, size_t out_cap) {
     w = put_count(out, out_cap, w, count_class(G_UNKNOWN));
     w = put_str(out, out_cap, w, " blocking=false (lookup miss)\n", 30);
     return w;
+}
+
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
+    if ((needle_len > buf_len)) {
+        return false;
+    }
+    size_t start = 0;
+    while (((start + needle_len) <= buf_len)) {
+        size_t k = 0;
+        size_t diff = 0;
+        while ((k < needle_len)) {
+            if ((buf[(start + k)] != needle[k])) {
+                diff += 1;
+            }
+            k += 1;
+        }
+        if ((diff == 0)) {
+            return true;
+        }
+        start += 1;
+    }
+    return false;
+}
+
+uint8_t digit_byte(uint32_t d) {
+    uint8_t b = '0';
+    if ((d == 1)) {
+        b = '1';
+    }
+    if ((d == 2)) {
+        b = '2';
+    }
+    if ((d == 3)) {
+        b = '3';
+    }
+    if ((d == 4)) {
+        b = '4';
+    }
+    if ((d == 5)) {
+        b = '5';
+    }
+    if ((d == 6)) {
+        b = '6';
+    }
+    if ((d == 7)) {
+        b = '7';
+    }
+    if ((d == 8)) {
+        b = '8';
+    }
+    if ((d == 9)) {
+        b = '9';
+    }
+    return b;
+}
+
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
+    uint8_t tmp[16] = {0};
+    size_t n = 0;
+    uint32_t x = v;
+    if ((x == 0)) {
+        tmp[0] = digit_byte(0);
+        n = 1;
+    }
+    while ((x > 0)) {
+        tmp[n] = digit_byte((x % 10));
+        n += 1;
+        x = (x / 10);
+    }
+    size_t k = 0;
+    while ((k < n)) {
+        if (((w + k) < cap)) {
+            dst[(w + k)] = tmp[((n - 1) - k)];
+        }
+        k += 1;
+    }
+    return (w + n);
+}
+
+size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) {
+    size_t i = 0;
+    while ((i < s_len)) {
+        if (((w + i) < cap)) {
+            dst[(w + i)] = s[i];
+        }
+        i += 1;
+    }
+    return (w + s_len);
+}
+
+bool str_eq(const char* a, size_t alen, const char* b, size_t blen) {
+    if ((alen != blen)) {
+        return false;
+    }
+    size_t diff = 0;
+    size_t i = 0;
+    while ((i < alen)) {
+        if ((a[i] != b[i])) {
+            diff += 1;
+        }
+        i += 1;
+    }
+    return (diff == 0);
 }
 
 /* -------------------------------------------------------
