@@ -20,6 +20,14 @@
 
 #define MAX_PRS 512
 #define REFRESH_CAP 30
+#define QUEUE_ROOM 100
+#define RUNS_PER_REFRESH 25
+#define QUEUE_HEAD "M\tclaw-refresh: the Actions queue holds "
+#define QUEUE_HEAD_LEN 40
+#define QUEUE_MID " runs, so this merge refreshes at most "
+#define QUEUE_MID_LEN 39
+#define QUEUE_UNREAD "M\tclaw-refresh: the Actions queue could not be read, so this merge refreshes none\n"
+#define QUEUE_UNREAD_LEN 82
 #define NFIELDS 11
 #define D_NONE 0
 #define D_REFRESH 1
@@ -69,6 +77,9 @@ bool rf_split(uint8_t* raw, size_t ls, size_t le, size_t* f);
 uint8_t rf_classify(uint8_t* raw, size_t* f);
 size_t rf_put_sha(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t s);
 size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap);
+uint32_t refresh_budget(int32_t queued);
+size_t refresh_plan_queued(uint8_t* raw, size_t n, uint8_t* out, size_t cap, int32_t queued);
+size_t refresh_plan_within(uint8_t* raw, size_t n, uint8_t* out, size_t cap, uint32_t lim_in);
 bool refresh_fits(size_t needed, size_t out_cap);
 size_t t_put2(uint8_t* dst, size_t cap, size_t w, uint32_t v);
 size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool draft, uint32_t labels, bool cross, bool modify, uint32_t mg, uint32_t sc, uint32_t behind);
@@ -290,6 +301,42 @@ size_t rf_put_sha(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t s) {
 }
 
 size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap) {
+    return refresh_plan_within(raw, n, out, cap, REFRESH_CAP);
+}
+
+uint32_t refresh_budget(int32_t queued) {
+    if ((queued < 0)) {
+        return 0;
+    }
+    uint32_t q = ((uint32_t)(queued));
+    if ((q >= QUEUE_ROOM)) {
+        return 0;
+    }
+    uint32_t b = ((QUEUE_ROOM - q) / RUNS_PER_REFRESH);
+    if ((b > REFRESH_CAP)) {
+        return REFRESH_CAP;
+    }
+    return b;
+}
+
+size_t refresh_plan_queued(uint8_t* raw, size_t n, uint8_t* out, size_t cap, int32_t queued) {
+    uint32_t b = refresh_budget(queued);
+    size_t w = refresh_plan_within(raw, n, out, cap, b);
+    if ((queued < 0)) {
+        return put_str(out, cap, w, QUEUE_UNREAD, QUEUE_UNREAD_LEN);
+    }
+    w = put_str(out, cap, w, QUEUE_HEAD, QUEUE_HEAD_LEN);
+    w = put_count(out, cap, w, ((uint32_t)(queued)));
+    w = put_str(out, cap, w, QUEUE_MID, QUEUE_MID_LEN);
+    w = put_count(out, cap, w, b);
+    return put_byte(out, cap, w, '\n');
+}
+
+size_t refresh_plan_within(uint8_t* raw, size_t n, uint8_t* out, size_t cap, uint32_t lim_in) {
+    uint32_t lim = lim_in;
+    if ((lim > REFRESH_CAP)) {
+        lim = REFRESH_CAP;
+    }
     uint8_t dec[512] = {0};
     uint32_t num[512] = {0};
     size_t cs[512] = {0};
@@ -355,7 +402,7 @@ size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap) {
     }
     i = 0;
     while ((i < cnt)) {
-        if (((dec[i] == D_REFRESH) && (rk[i] >= REFRESH_CAP))) {
+        if (((dec[i] == D_REFRESH) && (rk[i] >= lim))) {
             dec[i] = D_CAPPED;
         }
         i += 1;
@@ -373,7 +420,7 @@ size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap) {
     st[((size_t)(D_BAD))] += extra;
     size_t w = 0;
     uint32_t r = 0;
-    while ((r < REFRESH_CAP)) {
+    while ((r < lim)) {
         i = 0;
         while ((i < cnt)) {
             if (((dec[i] == D_REFRESH) && (rk[i] == r))) {
@@ -1284,6 +1331,106 @@ void test_the_second_digits_decide_the_order(void) {
     assert((out[47] == '3'));
 }
 
+void test_the_budget_shrinks_as_the_queue_grows_and_is_zero_from_the_room_up(void) {
+    int32_t q = -1;
+    while ((q <= 1000)) {
+        uint32_t b = refresh_budget(q);
+        if ((q < 0)) {
+            assert((b == 0));
+        }
+        if ((q == 0)) {
+            assert((b == 4));
+        }
+        if (((q >= 1) && (q <= 25))) {
+            assert((b == 3));
+        }
+        if (((q >= 26) && (q <= 50))) {
+            assert((b == 2));
+        }
+        if (((q >= 51) && (q <= 75))) {
+            assert((b == 1));
+        }
+        if ((q >= 76)) {
+            assert((b == 0));
+        }
+        assert((b <= REFRESH_CAP));
+        q += 1;
+    }
+}
+
+void test_a_busy_queue_refreshes_nothing_and_says_how_busy(void) {
+    uint8_t r[4096] = {0};
+    size_t n = 0;
+    uint32_t i = 1;
+    while ((i <= 5)) {
+        n = t_rec(&r, 4096, n, (500 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+        i += 1;
+    }
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan_queued(&r, n, &out, 4096, 886);
+    assert((refresh_fits(d, 4096) == true));
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 0 to update, ", 14) == true));
+    assert((buf_has(&out, d, " 5 over the cap, ", 17) == true));
+    assert((buf_has(&out, d, "M\tclaw-refresh: the Actions queue holds 886 runs, so this merge refreshes at most 0\n", 84) == true));
+}
+
+void test_a_quiet_queue_refreshes_the_oldest_within_its_budget(void) {
+    uint8_t r[8192] = {0};
+    size_t n = 0;
+    uint32_t i = 10;
+    while ((i > 0)) {
+        n = t_rec(&r, 8192, n, (600 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+        i -= 1;
+    }
+    uint8_t out[8192] = {0};
+    size_t d = refresh_plan_queued(&r, n, &out, 8192, 30);
+    assert((t_lines(&out, d, 'R') == 2));
+    assert((buf_has(&out, d, "R\t601\t", 6) == true));
+    assert((buf_has(&out, d, "R\t602\t", 6) == true));
+    assert((buf_has(&out, d, "R\t603\t", 6) == false));
+    assert((buf_has(&out, d, " 8 over the cap, ", 17) == true));
+    assert((buf_has(&out, d, "holds 30 runs, so this merge refreshes at most 2\n", 49) == true));
+}
+
+void test_an_unread_queue_refreshes_nothing_and_says_it_could_not_read(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 701, 100, false, 0, false, false, 0, 0, 2);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan_queued(&r, n, &out, 4096, -1);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, QUEUE_UNREAD, QUEUE_UNREAD_LEN) == true));
+    assert((buf_has(&out, d, "holds", 5) == false));
+}
+
+void test_the_plan_within_a_limit_never_passes_the_cap(void) {
+    uint8_t r[16384] = {0};
+    size_t n = 0;
+    uint32_t i = 1;
+    while ((i <= 35)) {
+        n = t_rec(&r, 16384, n, (800 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+        i += 1;
+    }
+    uint8_t out[16384] = {0};
+    size_t d = refresh_plan_within(&r, n, &out, 16384, 1000);
+    assert((t_lines(&out, d, 'R') == 30));
+}
+
+void test_the_queue_texts_are_pinned_by_their_lengths(void) {
+    uint8_t b[128] = {0};
+    size_t w = put_str(&b, 128, 0, QUEUE_HEAD, QUEUE_HEAD_LEN);
+    assert((w == QUEUE_HEAD_LEN));
+    assert((b[(w - 1)] == ' '));
+    assert((b[(w - 2)] == 's'));
+    w = put_str(&b, 128, 0, QUEUE_MID, QUEUE_MID_LEN);
+    assert((b[(w - 1)] == ' '));
+    assert((b[(w - 2)] == 't'));
+    w = put_str(&b, 128, 0, QUEUE_UNREAD, QUEUE_UNREAD_LEN);
+    assert((b[(w - 1)] == '\n'));
+    assert((b[(w - 2)] == 'e'));
+    assert((b[(w - 3)] == 'n'));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1336,7 +1483,13 @@ int main(void) {
     test_the_513th_record_is_counted_as_unreadable_and_not_stored();
     test_the_hour_digits_decide_the_order();
     test_the_second_digits_decide_the_order();
-    printf("All %d tests passed.\n", 44);
+    test_the_budget_shrinks_as_the_queue_grows_and_is_zero_from_the_room_up();
+    test_a_busy_queue_refreshes_nothing_and_says_how_busy();
+    test_a_quiet_queue_refreshes_the_oldest_within_its_budget();
+    test_an_unread_queue_refreshes_nothing_and_says_it_could_not_read();
+    test_the_plan_within_a_limit_never_passes_the_cap();
+    test_the_queue_texts_are_pinned_by_their_lengths();
+    printf("All %d tests passed.\n", 50);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

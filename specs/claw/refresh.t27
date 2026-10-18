@@ -29,6 +29,12 @@
 ;     refresh    behind and conflict-free
 ; Then at most REFRESH_CAP of the refresh ones are kept, oldest createdAt first (ties: lower number),
 ; the rest are counted as over the cap and wait for the next merge.
+; The queue budget (refresh_plan_queued, which the job calls; #10588): every update-branch moves a
+; head, and a moved head starts about RUNS_PER_REFRESH workflow runs. On 2026-10-18 the repository
+; had 886 runs queued against 17 running, and 30 refreshes a merge would have added 750 more. So the
+; job also passes the number of queued runs: at QUEUE_ROOM or more nothing is refreshed, below it at
+; most (QUEUE_ROOM - queued) / RUNS_PER_REFRESH, and an unread count refreshes nothing. The ruleset
+; does not require a PR to be up to date, so a refresh that waits costs freshness, never a merge.
 ; --
 ; Fail closed: a record that is not eleven fields, a number that is not a positive integer, a sha that
 ; is not 40 lowercase hex digits, a createdAt that is not YYYY-MM-DDTHH:MM:SSZ, a flag that is not
@@ -47,6 +53,16 @@ use claw::text;
 pub const MAX_PRS : usize = 512;
 /// FR-002: the most pull requests one run refreshes, so one merge cannot flood the Actions queue.
 pub const REFRESH_CAP : u32 = 30;
+/// Queued workflow runs at which a merge refreshes nothing.
+pub const QUEUE_ROOM : u32 = 100;
+/// Workflow runs one moved pull request head starts (23 to 27 on 2026-10-18).
+pub const RUNS_PER_REFRESH : u32 = 25;
+pub const QUEUE_HEAD : str = "M\tclaw-refresh: the Actions queue holds ";
+pub const QUEUE_HEAD_LEN : usize = 40;
+pub const QUEUE_MID : str = " runs, so this merge refreshes at most ";
+pub const QUEUE_MID_LEN : usize = 39;
+pub const QUEUE_UNREAD : str = "M\tclaw-refresh: the Actions queue could not be read, so this merge refreshes none\n";
+pub const QUEUE_UNREAD_LEN : usize = 82;
 /// Fields of one record.
 pub const NFIELDS : usize = 11;
 
@@ -252,6 +268,37 @@ fn rf_put_sha(dst : []u8, cap : usize, w : usize, raw : []const u8, s : usize) -
 /// Returns the bytes it needs; when that exceeds cap the buffer holds a clipped answer that must not
 /// be acted on.
 pub fn refresh_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    return refresh_plan_within(raw, n, out, cap, REFRESH_CAP);
+}
+
+/// How many pull requests one merge may refresh with `queued` workflow runs waiting (-1: unread).
+pub fn refresh_budget(queued : i32) -> u32 {
+    if (queued < 0) { return 0; }
+    const q : u32 = queued as u32;
+    if (q >= QUEUE_ROOM) { return 0; }
+    const b : u32 = (QUEUE_ROOM - q) / RUNS_PER_REFRESH;
+    if (b > REFRESH_CAP) { return REFRESH_CAP; }
+    return b;
+}
+
+/// What the job calls: refresh_plan held to refresh_budget(queued), then one line that says why.
+pub fn refresh_plan_queued(raw : []const u8, n : usize, out : []u8, cap : usize, queued : i32) -> usize {
+    const b : u32 = refresh_budget(queued);
+    var w : usize = refresh_plan_within(raw, n, out, cap, b);
+    if (queued < 0) {
+        return put_str(out, cap, w, QUEUE_UNREAD, QUEUE_UNREAD_LEN);
+    }
+    w = put_str(out, cap, w, QUEUE_HEAD, QUEUE_HEAD_LEN);
+    w = put_count(out, cap, w, queued as u32);
+    w = put_str(out, cap, w, QUEUE_MID, QUEUE_MID_LEN);
+    w = put_count(out, cap, w, b);
+    return put_byte(out, cap, w, '\n');
+}
+
+/// refresh_plan with the cap lowered to lim (never raised past REFRESH_CAP).
+pub fn refresh_plan_within(raw : []const u8, n : usize, out : []u8, cap : usize, lim_in : u32) -> usize {
+    var lim : u32 = lim_in;
+    if (lim > REFRESH_CAP) { lim = REFRESH_CAP; }
     var dec : [512]u8 = undefined;
     var num : [512]u32 = undefined;
     var cs : [512]usize = undefined;
@@ -311,7 +358,7 @@ pub fn refresh_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usi
     }
     i = 0;
     while (i < cnt) {
-        if (dec[i] == D_REFRESH and rk[i] >= REFRESH_CAP) { dec[i] = D_CAPPED; }
+        if (dec[i] == D_REFRESH and rk[i] >= lim) { dec[i] = D_CAPPED; }
         i += 1;
     }
     var c : usize = 0;
@@ -327,7 +374,7 @@ pub fn refresh_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usi
     st[D_BAD as usize] += extra;
     var w : usize = 0;
     var r : u32 = 0;
-    while (r < REFRESH_CAP) {
+    while (r < lim) {
         i = 0;
         while (i < cnt) {
             if (dec[i] == D_REFRESH and rk[i] == r) {
@@ -1017,4 +1064,94 @@ test the_second_digits_decide_the_order {
     assert t_lines(&out, d, 'R') == 2;
     assert out[2] == '9';
     assert out[47] == '3';
+}
+
+// ---- tests: the queue budget (#10588) ----
+
+test the_budget_shrinks_as_the_queue_grows_and_is_zero_from_the_room_up {
+    var q : i32 = -1;
+    while (q <= 1000) {
+        const b : u32 = refresh_budget(q);
+        if (q < 0) { assert b == 0; }
+        if (q == 0) { assert b == 4; }
+        if (q >= 1 and q <= 25) { assert b == 3; }
+        if (q >= 26 and q <= 50) { assert b == 2; }
+        if (q >= 51 and q <= 75) { assert b == 1; }
+        if (q >= 76) { assert b == 0; }
+        assert b <= REFRESH_CAP;
+        q += 1;
+    }
+}
+
+test a_busy_queue_refreshes_nothing_and_says_how_busy {
+    var r : [4096]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 5) {
+        n = t_rec(&r, 4096, n, 500 + i, i * 60, false, 0, false, false, 0, 0, 2);
+        i += 1;
+    }
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan_queued(&r, n, &out, 4096, 886);
+    assert refresh_fits(d, 4096) == true;
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 0 to update, ", 14) == true;
+    assert buf_has(&out, d, " 5 over the cap, ", 17) == true;
+    assert buf_has(&out, d, "M\tclaw-refresh: the Actions queue holds 886 runs, so this merge refreshes at most 0\n", 84) == true;
+}
+
+test a_quiet_queue_refreshes_the_oldest_within_its_budget {
+    var r : [8192]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 10;
+    while (i > 0) {
+        n = t_rec(&r, 8192, n, 600 + i, i * 60, false, 0, false, false, 0, 0, 2);
+        i -= 1;
+    }
+    var out : [8192]u8 = undefined;
+    const d : usize = refresh_plan_queued(&r, n, &out, 8192, 30);
+    assert t_lines(&out, d, 'R') == 2;
+    assert buf_has(&out, d, "R\t601\t", 6) == true;
+    assert buf_has(&out, d, "R\t602\t", 6) == true;
+    assert buf_has(&out, d, "R\t603\t", 6) == false;
+    assert buf_has(&out, d, " 8 over the cap, ", 17) == true;
+    assert buf_has(&out, d, "holds 30 runs, so this merge refreshes at most 2\n", 49) == true;
+}
+
+test an_unread_queue_refreshes_nothing_and_says_it_could_not_read {
+    var r : [512]u8 = undefined;
+    const n : usize = t_rec(&r, 512, 0, 701, 100, false, 0, false, false, 0, 0, 2);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan_queued(&r, n, &out, 4096, -1);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, QUEUE_UNREAD, QUEUE_UNREAD_LEN) == true;
+    assert buf_has(&out, d, "holds", 5) == false;
+}
+
+test the_plan_within_a_limit_never_passes_the_cap {
+    var r : [16384]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 35) {
+        n = t_rec(&r, 16384, n, 800 + i, i * 60, false, 0, false, false, 0, 0, 2);
+        i += 1;
+    }
+    var out : [16384]u8 = undefined;
+    const d : usize = refresh_plan_within(&r, n, &out, 16384, 1000);
+    assert t_lines(&out, d, 'R') == 30;
+}
+
+test the_queue_texts_are_pinned_by_their_lengths {
+    var b : [128]u8 = undefined;
+    var w : usize = put_str(&b, 128, 0, QUEUE_HEAD, QUEUE_HEAD_LEN);
+    assert w == QUEUE_HEAD_LEN;
+    assert b[w - 1] == ' ';
+    assert b[w - 2] == 's';
+    w = put_str(&b, 128, 0, QUEUE_MID, QUEUE_MID_LEN);
+    assert b[w - 1] == ' ';
+    assert b[w - 2] == 't';
+    w = put_str(&b, 128, 0, QUEUE_UNREAD, QUEUE_UNREAD_LEN);
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == 'e';
+    assert b[w - 3] == 'n';
 }
