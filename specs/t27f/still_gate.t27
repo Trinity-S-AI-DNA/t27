@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/still_gate.t27 -- the anomaly gate of the T27F content factory. It renders the 27
+// stills of course 0 from the factory's own plan (reel_factory.t27 picks the archetype, accent,
+// motion and layout of each lesson; scene_still.t27 draws it), compares every pair with a block
+// SSIM, and refuses the course when the most similar pair is above SIMILAR_MAX_PERMILLE.
+// Issue gHashTag/t27#10571 (R3), epic #10560.
+//
+// WHY: the owner's complaint was that every reel looks the same. reel_factory.t27 plans 27
+// different scenes, but a plan is not a picture: two renderers can still draw near-identical
+// frames. This is the gate that looks at the pictures, so "they are all different" is measured
+// instead of believed.
+//
+// THE METRIC: structural similarity on the luma of a 108 x 192 still, in 12 x 12 blocks (9 x 16 of
+// them), the mean over the blocks, in permille. For one block with n = 144 pixels, sums Sa, Sb,
+// Saa, Sbb, Sab of the two stills' luma, and C1 = 7, C2 = 59 (the usual (0.01 * 255)^2 and
+// (0.03 * 255)^2, rounded up to integers):
+//   SSIM = (2 Sa Sb + C1 n^2) (2 (n Sab - Sa Sb) + C2 n^2)
+//          / ((Sa^2 + Sb^2 + C1 n^2) (n Saa - Sa^2 + n Sbb - Sb^2 + C2 n^2))
+// which is the textbook formula multiplied through by n^2 so that it needs no division until the
+// end. Integers only, in i64, so the gate gives the same number on every machine.
+//
+// THE GATE: gate() renders the 27 stills into a caller-owned buffer, scores all 351 pairs and
+// reports the worst pair in out[0..3] = (lesson a, lesson b, permille). It returns 1 when that
+// score is above SIMILAR_MAX_PERMILLE (the course is refused) and 0 when it is not.
+//
+// NOT CLAIMED: SSIM on luma sees layout and contrast, not meaning; two stills with different
+// words in the same boxes would pass. The 850 bound is reel_factory's, now measured (see the
+// test that pins the worst pair of course 0). No file is written and nothing is printed: a
+// scratch driver can print the table, the module itself holds no main.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module still_gate;
+
+use t27f::reel_factory::arche;
+use t27f::reel_factory::accent;
+use t27f::reel_factory::motion;
+use t27f::reel_factory::layout;
+use t27f::reel_factory::content;
+use t27f::reel_factory::too_similar;
+use t27f::reel_factory::SIMILAR_MAX_PERMILLE;
+use t27f::scene_still::pixel;
+use t27f::scene_raster::luma;
+
+pub const GATE_W : i32 = 108;
+pub const GATE_H : i32 = 192;
+pub const GATE_PIX : usize = 20736;
+pub const GATE_BLOCK : i32 = 12;
+pub const GATE_BX : i32 = 9;
+pub const GATE_BY : i32 = 16;
+pub const GATE_BLOCKS : usize = 144;
+pub const GATE_STILLS : usize = 27;
+pub const GATE_PAIRS : usize = 351;
+
+// The scale of one block: n = 144 pixels, n^2 = 20736.
+pub const SSIM_N : i64 = 144;
+pub const SSIM_NN : i64 = 20736;
+pub const SSIM_C1 : i64 = 7;
+pub const SSIM_C2 : i64 = 59;
+
+// Draw lesson t's still from the plan into img[base .. base + GATE_PIX], as luma.
+pub fn render_luma(t: usize, img: []u8, base: usize) -> void {
+    const a = arche(t);
+    const ac = accent(t);
+    const mo = motion(t);
+    const ly = layout(t);
+    const n = @as(i32, @intCast(content(t, a)));
+    var y : i32 = 0;
+    while (y < GATE_H) {
+        var x : i32 = 0;
+        while (x < GATE_W) {
+            const c = pixel(t, a, ac, mo, ly, n, x, y, GATE_W, GATE_H);
+            img[base + @as(usize, @intCast(y * GATE_W + x))] = @as(u8, @intCast(luma(c)));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// The index in img of pixel (i, j) of block (bx, by) of the still that starts at base.
+pub fn at(base: usize, bx: i32, by: i32, i: i32, j: i32) -> usize {
+    return base + @as(usize, @intCast((by * GATE_BLOCK + j) * GATE_W + bx * GATE_BLOCK + i));
+}
+
+// Fill sum[s * 144 + b] and sq[s * 144 + b] for still s, whose pixels start at base.
+pub fn block_stats(img: []u8, s: usize, base: usize, sum: []i64, sq: []i64) -> void {
+    var by : i32 = 0;
+    while (by < GATE_BY) {
+        var bx : i32 = 0;
+        while (bx < GATE_BX) {
+            var a : i64 = 0;
+            var q : i64 = 0;
+            var j : i32 = 0;
+            while (j < GATE_BLOCK) {
+                var i : i32 = 0;
+                while (i < GATE_BLOCK) {
+                    const v = @as(i64, img[at(base, bx, by, i, j)]);
+                    a = a + v;
+                    q = q + v * v;
+                    i = i + 1;
+                }
+                j = j + 1;
+            }
+            const b = @as(usize, @intCast(by * GATE_BX + bx));
+            sum[s * GATE_BLOCKS + b] = a;
+            sq[s * GATE_BLOCKS + b] = q;
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+}
+
+// The SSIM, in permille, of two blocks from their sums, sums of squares and sum of products.
+pub fn block_ssim(sa: i64, sb: i64, qa: i64, qb: i64, sab: i64) -> i64 {
+    const l1 = 2 * sa * sb + SSIM_C1 * SSIM_NN;
+    const l2 = 2 * (SSIM_N * sab - sa * sb) + SSIM_C2 * SSIM_NN;
+    const d1 = sa * sa + sb * sb + SSIM_C1 * SSIM_NN;
+    const d2 = (SSIM_N * qa - sa * sa) + (SSIM_N * qb - sb * sb) + SSIM_C2 * SSIM_NN;
+    const q1 = @divTrunc(l1 * 1000, d1);
+    return @divTrunc(q1 * l2, d2);
+}
+
+// The mean block SSIM, in permille, of stills a and b (their images are at a * GATE_PIX and b *
+// GATE_PIX in img, their block statistics already in sum and sq).
+pub fn pair_ssim(img: []u8, a: usize, b: usize, sum: []i64, sq: []i64) -> i32 {
+    const ba = a * GATE_PIX;
+    const bb = b * GATE_PIX;
+    var total : i64 = 0;
+    var by : i32 = 0;
+    while (by < GATE_BY) {
+        var bx : i32 = 0;
+        while (bx < GATE_BX) {
+            var sab : i64 = 0;
+            var j : i32 = 0;
+            while (j < GATE_BLOCK) {
+                var i : i32 = 0;
+                while (i < GATE_BLOCK) {
+                    sab = sab + @as(i64, img[at(ba, bx, by, i, j)]) * @as(i64, img[at(bb, bx, by, i, j)]);
+                    i = i + 1;
+                }
+                j = j + 1;
+            }
+            const k = @as(usize, @intCast(by * GATE_BX + bx));
+            total = total + block_ssim(sum[a * GATE_BLOCKS + k], sum[b * GATE_BLOCKS + k], sq[a * GATE_BLOCKS + k], sq[b * GATE_BLOCKS + k], sab);
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return @as(i32, @intCast(@divTrunc(total, @as(i64, @intCast(GATE_BLOCKS)))));
+}
+
+// Render the 27 stills of the course into img (27 * 20736 bytes) and their block statistics into
+// sum and sq (27 * 144 each).
+pub fn render_course(img: []u8, sum: []i64, sq: []i64) -> void {
+    var s : usize = 0;
+    while (s < GATE_STILLS) {
+        render_luma(s, img, s * GATE_PIX);
+        block_stats(img, s, s * GATE_PIX, sum, sq);
+        s = s + 1;
+    }
+}
+
+// Score every pair; out[0] = lesson a, out[1] = lesson b, out[2] = permille of the most similar.
+pub fn worst_pair(img: []u8, sum: []i64, sq: []i64, out: []i32) -> void {
+    var best : i32 = 0 - 2000;
+    var ba : usize = 0;
+    var bb : usize = 1;
+    var a : usize = 0;
+    while (a < GATE_STILLS) {
+        var b : usize = a + 1;
+        while (b < GATE_STILLS) {
+            const v = pair_ssim(img, a, b, sum, sq);
+            if (v > best) {
+                best = v;
+                ba = a;
+                bb = b;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    out[0] = @as(i32, @intCast(ba));
+    out[1] = @as(i32, @intCast(bb));
+    out[2] = best;
+}
+
+// The whole gate. 1 when the course is refused, 0 when every pair is told apart.
+pub fn gate(img: []u8, sum: []i64, sq: []i64, out: []i32) -> i32 {
+    render_course(img, sum, sq);
+    worst_pair(img, sum, sq, out);
+    if (too_similar(@as(u32, @intCast(out[2] + 0)))) { return 1; }
+    return 0;
+}
+
+// ---- tests ----
+
+test "one block against itself is 1000 and against its negative is far below" {
+    // a block of mixed luma: half 40, half 200
+    const sa = 72 * 40 + 72 * 200;
+    const qa = 72 * 40 * 40 + 72 * 200 * 200;
+    assert(block_ssim(sa, sa, qa, qa, qa) == 1000);
+    // the same block against its inverse (40 <-> 200): same mean, covariance negative
+    const sab = 144 * 40 * 200;
+    assert(block_ssim(sa, sa, qa, qa, sab) < 0);
+    // a flat block against another flat block of the same luma is 1000 (nothing to tell apart)
+    assert(block_ssim(144 * 30, 144 * 30, 144 * 900, 144 * 900, 144 * 900) == 1000);
+    // flat dark against flat bright: the luminance term separates them
+    assert(block_ssim(144 * 30, 144 * 200, 144 * 900, 144 * 40000, 144 * 6000) < 500);
+}
+
+test "the gate scores the 27 stills of course 0 and reports the most similar pair" {
+    var img : [559872]u8 = undefined;
+    var sum : [3888]i64 = undefined;
+    var sq : [3888]i64 = undefined;
+    var out : [3]i32 = undefined;
+    const refused = gate(&img, &sum, &sq, &out);
+    assert(out[0] >= 0 && out[0] < 26);
+    assert(out[1] > out[0] && out[1] < 27);
+    assert(out[2] > 0 - 1000 && out[2] <= 1000);
+    // the pair really is the maximum: it is not beaten by the pair (0, 1) or the pair (25, 26)
+    assert(out[2] >= pair_ssim(&img, 0, 1, &sum, &sq));
+    assert(out[2] >= pair_ssim(&img, 25, 26, &sum, &sq));
+    // the verdict follows the bound
+    assert((refused == 1) == too_similar(@as(u32, @intCast(out[2] + 0))));
+    assert(refused == 0);
+    assert(out[2] <= @as(i32, @intCast(SIMILAR_MAX_PERMILLE)));
+}
+
+test "negative control: a still against itself is 1000 and the gate would refuse a repeat" {
+    var img : [41472]u8 = undefined;
+    var sum : [288]i64 = undefined;
+    var sq : [288]i64 = undefined;
+    render_luma(5, &img, 0);
+    render_luma(5, &img, GATE_PIX);
+    block_stats(&img, 0, 0, &sum, &sq);
+    block_stats(&img, 1, GATE_PIX, &sum, &sq);
+    const same = pair_ssim(&img, 0, 1, &sum, &sq);
+    assert(same == 1000);
+    assert(too_similar(@as(u32, @intCast(same))));
+}
+
+test "negative control: two different lessons are scored below a repeat" {
+    var img : [41472]u8 = undefined;
+    var sum : [288]i64 = undefined;
+    var sq : [288]i64 = undefined;
+    render_luma(5, &img, 0);
+    render_luma(6, &img, GATE_PIX);
+    block_stats(&img, 0, 0, &sum, &sq);
+    block_stats(&img, 1, GATE_PIX, &sum, &sq);
+    assert(pair_ssim(&img, 0, 1, &sum, &sq) < 1000);
+}
