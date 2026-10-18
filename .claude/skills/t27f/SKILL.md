@@ -207,6 +207,13 @@ Traps from this tick (ffmpeg on the lab):
    import, and nothing was copied. Then compare `test-report` against **master**, not against
    "passes". The igla race specs are BLOCKED at a zig error on master, so the right claim is
    "the same verdict as before", not "the tests pass".
+   Then run the corpus ratchet on the lab (`t27c suite --repo-root . --ratchet --corpus-only`).
+   `test-report` cannot see text moving between two specs that the ledger pins. #10689 moved an
+   invariant the parser discards, so 15 tokens moved from `rtl` to `backend`. The ratchet went
+   red (`DISCARD WORSENED` +15 on one spec, `IMPROVED` -15 on the other), and the gate merged it
+   red anyway (#10695, fixed in #10699). To re-pin, run `--bless-expectations` to measure, then
+   copy only the moved numbers into master's file: the bless also deletes the
+   `_why_entries_fell` history field.
 7. Before you open a PR that adds a spec, run `python3 tools/dupe_scan.py` on the lab. The
    issue gate auto-merges non-draft PRs even when a check is red: #10681 merged with a copy of
    `lit_len` that was red on `duplicate-bodies` until #10688. Reuse the existing body through
