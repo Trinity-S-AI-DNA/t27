@@ -100,17 +100,19 @@ is not progress on the core.
 
 ## Visual in every output (Claude Code and TRI CLAW)
 
-**The law is `specs/claw/visual_output.t27`.** This section is the order of steps; which output
-carries which visual, where it is made and where the file goes are the spec's, not repeated here.
+**The rule is `specs/t27mcp/visual_output.t27`** (its `RULE_CLAUDE_CODE` and `RULE_TRI_CLAW` lines
+are what each host reads). **Its particle-still layer is `specs/claw/visual_output.t27`.** This
+section is the order of steps; which answer carries which visual and how it reaches each host are
+the specs', not repeated here.
 
-1. Decide the output's kind (`OUT_*`). Only a reply that just talks goes without a visual.
-2. Particle still or reel: render on the Railway lab (never the Mac), take the still at `STILL_MS`
-   with `ffmpeg -ss 9 -frames:v 1`, and bring it into the session folder (`out-reels/`, gitignored,
-   never `git add`). Open it in the Browser pane as `file://`, so the user sees it.
-3. Spec output: also `mcp__t27__t27f_graph` on the spec. If the corpus answers 404, say it is a
-   manual reading (`GRAPH_MANUAL`); if it is over the caps, fold it, never cut it.
-4. `t27f_view` stills: at most two headline lines per slide; pass `out` inside the session folder.
-5. Anything not made: say which and why in the answer. Never show an older file as this turn's.
+1. Decide the answer's kind (`K_*` in the t27mcp spec). A one-sentence reply or a question back
+   goes without a visual.
+2. Spec, flow or numbers: draw from t27f tool rows (`t27f_outline`, `t27f_graph`, `t27f_view`),
+   labelled, with the legend and the source file, as `answer_verdict` checks.
+3. A report of a piece of work: a particle still (`takes_still`). Render the reel on the Railway lab
+   (never the Mac), take the frame at `STILL_MS` with `ffmpeg -ss 9 -frames:v 1`, and bring it into
+   the session folder (`out-reels/`, gitignored, never `git add`).
+4. Anything not made: say which and why in the answer. Never show an older file as this turn's.
 
 ## Application: topic map (gHashTag/trinity#1677)
 
