@@ -20,6 +20,18 @@ mod cse_hoist;
 #[path = "../gen/rust/compiler/int_type_names.rs"]
 #[allow(dead_code, unused_parens)]
 mod int_type_names;
+// specs/compiler/operator_text.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/operator_text.rs"]
+#[allow(dead_code, unused_parens)]
+mod operator_text;
+// specs/compiler/verilog_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_names.rs"]
+#[allow(dead_code, unused_parens)]
+mod verilog_names;
+// specs/compiler/hir_cost_models.t27 (t27o port, #9114), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/hir_cost_models.rs"]
+#[allow(dead_code, unused_parens)]
+mod hir_cost_models;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -5008,7 +5020,7 @@ the parser used to read it as `{}` followed by a negation",
     /// Consume the type that follows an `as` cast, e.g. `u32`, `i8`, or an
     /// array form like `u8[4]`. Returns the textual type for diagnostics.
     /// The base type name is validated against the known scalar type set so
-    /// that a typo like `x as u3` or `x as banana` is rejected at parse time
+    /// that `x as u0` or `x as banana` (uN: specs/compiler/int_type_names.t27) is rejected at parse time
     /// instead of silently lowering to a 32-bit default.
     fn parse_cast_target_type(&mut self) -> Result<String, String> {
         if self.current.kind != TokenKind::Ident {
@@ -5034,7 +5046,7 @@ the parser used to read it as `{}` followed by a negation",
             "bool", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize",
             "f32", "f64",
         ];
-        if !VALID_CAST_TYPES.contains(&base.as_str()) {
+        if !VALID_CAST_TYPES.contains(&base.as_str()) && int_type_names::uint_bits(base.as_bytes()).is_none() {
             // f32/f64 parse in DECLARATIONS, so "unknown type" would be a lie here.
             // The truth is narrower: no backend lowers float arithmetic -- the C
             // generator emits the literal token `f32`, which is not a C type, and
@@ -5051,7 +5063,7 @@ the parser used to read it as `{}` followed by a negation",
                 ));
             }
             return Err(format!(
-                "unknown cast target type `{}`; expected one of {:?}",
+                "unknown cast target type `{}`; expected one of {:?} or uN, 1 <= N <= 64",
                 base, VALID_CAST_TYPES
             ));
         }
@@ -7393,6 +7405,19 @@ the parser used to read it as `{}` followed by a negation",
 // Code Generator
 // ============================================================================
 
+/// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
+const HOST_IO_ZIG: &str = r#"
+const __t27_posix = @import("std").posix;
+fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
+    const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
+    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+}
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -8277,6 +8302,12 @@ impl Codegen {
             if decl.kind != NodeKind::UseDecl {
                 self.gen_decl(decl);
             }
+        }
+        // `--backend ml`: the host's file syscalls, only for a spec that calls them.
+        let mut host = false;
+        Self::visit_calls(&ast.children, &mut |c| host |= matches!(c.name.as_str(), "host_open" | "host_read" | "host_write" | "host_close"));
+        if host {
+            self.write(HOST_IO_ZIG);
         }
     }
 
@@ -10436,6 +10467,10 @@ impl Codegen {
                         "sin" => Some("@sin"),
                         "cos" => Some("@cos"),
                         "tanh" => Some("std.math.tanh"),
+                        "host_open" => Some("__t27_host_open"),
+                        "host_read" => Some("__t27_host_read"),
+                        "host_write" => Some("__t27_host_write"),
+                        "host_close" => Some("__t27_host_close"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -10779,13 +10814,13 @@ impl Codegen {
             NodeKind::ExprIndex => {
                 // children[0] = base, children[1] = index
                 // W605: a slice carries a third child (the end) and lowers to
-                // Zig's `[a..b]` -- the same half-open range the source means.
-                if node.extra_op == "slice" && node.children.len() >= 3 {
+                // Zig's `[a..b]`; `slice_open` has no end and is `[a..]` (#8200).
+                if node.extra_op.starts_with("slice") && node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
                     self.write("[");
                     self.gen_expr(&node.children[1]);
                     self.write("..");
-                    self.gen_expr(&node.children[2]);
+                    if let Some(end) = node.children.get(2) { self.gen_expr(end); }
                     self.write("]");
                 } else if node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
@@ -11335,12 +11370,10 @@ impl VerilogCodegen {
         self.imported_enums = enums;
     }
 
-    // Restored from Wave Loop 455 (same botched merge).
+    // Restored from Wave Loop 455 (same botched merge). The body is
+    // specs/compiler/verilog_names.t27, lowered by `t27c gen-rust` (#9115).
     fn is_simple_tuple_type(ty: &str) -> bool {
-        ty.starts_with('(')
-            && ty.ends_with(')')
-            && !ty.contains(':')
-            && !ty.is_empty()
+        verilog_names::is_simple_tuple_type(ty.as_bytes())
     }
 
     // Restored from Wave Loop 455 (same botched merge).
@@ -17577,7 +17610,7 @@ impl VerilogCodegen {
                         self.in_lvalue = true;
                         self.gen_verilog_expr(lhs);
                         self.in_lvalue = false;
-                        if let Some(op) = compound_binop(&node.extra_op) {
+                        if let Some(op) = operator_text::compound_binop(node.extra_op.as_bytes()) {
                             self.write(asn);
                             self.gen_verilog_expr(lhs);
                             self.write(&format!(" {} ", op));
@@ -19986,7 +20019,7 @@ long double: fabsl, default: llabs)(x)",
         // (#2846) -- must not be promoted from a comment to code. The comment
         // was hiding it; making it a `_Static_assert` turns one silent defect
         // into a syntax error that cascades through the rest of the file.
-        if Self::has_empty_operand(text) {
+        if operator_text::has_empty_operand(text.as_bytes()) {
             return false;
         }
         // `const_defs` alone is too narrow: requiring it rejects 1742
@@ -20006,32 +20039,6 @@ long double: fabsl, default: llabs)(x)",
         Self::identifiers_in(text)
             .iter()
             .all(|n| Self::is_c_word(n) || self.declares(n))
-    }
-
-    /// Does an operator in this rendered expression have nothing after it?
-    ///
-    /// `(BOARD_NAME != )` is the shape: the renderer dropped the right-hand
-    /// side. Ten specs in `boards/` and `fpga/` carry one.
-    fn has_empty_operand(text: &str) -> bool {
-        let b = text.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if matches!(b[i], b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' | b'^') {
-                let mut j = i + 1;
-                while j < b.len()
-                    && matches!(b[j], b'=' | b'<' | b'>' | b'&' | b'|' | b' ')
-                {
-                    j += 1;
-                }
-                if j >= b.len() || b[j] == b')' {
-                    return true;
-                }
-                i = j;
-                continue;
-            }
-            i += 1;
-        }
-        false
     }
 
     /// A repeated element this emitter writes as a C value: a non-string
@@ -23006,37 +23013,6 @@ fn resolve_import_path(
 // Compiler Interface
 // ============================================================================
 
-/// The binary operator inside a compound assignment: "|=" -> "|".
-/// All three backends tested `extra_op == "+="` and fell through to " = " otherwise,
-/// so accepting a new compound operator without touching them would have emitted
-/// `x = rhs` for `x |= rhs` -- a miscompilation rather than an error.
-fn compound_binop(extra_op: &str) -> Option<&'static str> {
-    match extra_op {
-        "+=" => Some("+"),
-        "-=" => Some("-"),
-        "*=" => Some("*"),
-        // `/=` was missing, and the three call sites all fall back to a plain
-        // ` = `. So `scaled /= 2.0;` was emitted as `scaled = 2.0;` -- the
-        // division dropped and the variable overwritten with the divisor -- by
-        // the Zig, C AND Rust backends alike. Five occurrences in three specs
-        // (numeric/tf3.t27:139 and :253, ternary/hybrid_bigint.t27:168 and
-        // :235, server/sse.t27:265), every one of them valid output in the
-        // target language and none of them the stated program.
-        //
-        // `%=`, `<<=` and `>>=` do not occur in the corpus today. They are
-        // here because the failure mode of a missing entry is silence, and the
-        // next spec to use one must not pay for that.
-        "/=" => Some("/"),
-        "%=" => Some("%"),
-        "<<=" => Some("<<"),
-        ">>=" => Some(">>"),
-        "|=" => Some("|"),
-        "&=" => Some("&"),
-        "^=" => Some("^"),
-        _ => None,
-    }
-}
-
 /// A numeric lexeme split into its digits and its declared width.
 ///
 /// `1u64` -> `("1", "u64")`. The suffix rides in the lexeme so that `value`
@@ -23079,7 +23055,7 @@ fn unwrap_single(node: &Node) -> &Node {
 /// what the spec said, or the target compiler refuses it by name. Both are
 /// better than ` = `, which compiles and means something else.
 fn assign_op_text(extra_op: &str) -> String {
-    if let Some(op) = compound_binop(extra_op) {
+    if let Some(op) = operator_text::compound_binop(extra_op.as_bytes()) {
         return format!(" {}= ", op);
     }
     let t = extra_op.trim();
@@ -23948,12 +23924,10 @@ impl Compiler {
     }
 
     /// W534: built-in functions that the Verilog backend handles without a
-    /// source-level definition.
+    /// source-level definition. The body is specs/compiler/verilog_names.t27,
+    /// lowered by `t27c gen-rust` (#9115).
     fn is_icarus_builtin(name: &str) -> bool {
-        matches!(
-            name,
-            "__mul_noop" // injected R-SI-1 multiplication helper
-        )
+        verilog_names::is_icarus_builtin(name.as_bytes())
     }
 }
 
@@ -32328,22 +32302,19 @@ impl TimingModel {
     pub const HOLD_TIME_PS: u32 = 50;
 
     pub fn est_comb_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS
+        hir_cost_models::est_comb_delay(num_luts)
     }
 
     pub fn est_reg_to_reg_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS + Self::SETUP_TIME_PS
+        hir_cost_models::est_reg_to_reg_delay(num_luts)
     }
 
     pub fn slack(delay_ps: u32, constraint_ps: u32) -> i64 {
-        constraint_ps as i64 - delay_ps as i64
+        hir_cost_models::slack(delay_ps, constraint_ps)
     }
 
     pub fn fmax_from_delay(delay_ps: u32) -> u32 {
-        if delay_ps == 0 {
-            return 0;
-        }
-        1_000_000_000 / delay_ps
+        hir_cost_models::fmax_from_delay(delay_ps)
     }
 
     pub fn analyze_module(module: &HirModule, constraint: &TimingConstraint) -> TimingReport {
@@ -32470,19 +32441,19 @@ impl PowerModel {
     pub const STATIC_PER_RESOURCE_UW: u32 = 100;
 
     pub fn est_lut_dynamic(luts: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        luts * Self::LUT_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_lut_dynamic(luts, clock_mhz, toggle_rate)
     }
     pub fn est_ff_dynamic(ffs: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        ffs * Self::FF_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_ff_dynamic(ffs, clock_mhz, toggle_rate)
     }
     pub fn est_bram_dynamic(brams: u32, clock_mhz: u32) -> u32 {
-        brams * Self::BRAM_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_bram_dynamic(brams, clock_mhz)
     }
     pub fn est_dsp_dynamic(dsps: u32, clock_mhz: u32) -> u32 {
-        dsps * Self::DSP_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_dsp_dynamic(dsps, clock_mhz)
     }
     pub fn est_static(total_resources: u32) -> u32 {
-        Self::STATIC_BASE_MW + total_resources * Self::STATIC_PER_RESOURCE_UW / 1000
+        hir_cost_models::est_static(total_resources)
     }
 
     pub fn estimate_module(module: &HirModule, clock_mhz: u32, toggle_rate: u32) -> PowerEstimate {
@@ -33109,19 +33080,11 @@ impl RouteModel {
     pub const LONG_WIRE_UM: u32 = 5000;
 
     pub fn est_wire_length(fanout: u32) -> u32 {
-        match fanout {
-            0 => 0,
-            1..=4 => Self::LOCAL_WIRE_UM,
-            5..=16 => Self::MEDIUM_WIRE_UM,
-            _ => Self::LONG_WIRE_UM,
-        }
+        hir_cost_models::est_wire_length(fanout)
     }
 
     pub fn est_congestion(nets: u32, die_area_mm2: u32) -> u32 {
-        if die_area_mm2 == 0 {
-            return 0;
-        }
-        nets / die_area_mm2
+        hir_cost_models::est_congestion(nets, die_area_mm2)
     }
 }
 
@@ -33529,20 +33492,10 @@ pub struct CtsModel;
 
 impl CtsModel {
     pub fn est_buffers_needed(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else {
-            num_sinks / 16 + 1
-        }
+        hir_cost_models::est_buffers_needed(num_sinks)
     }
     pub fn est_tree_levels(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else if num_sinks <= 256 {
-            2
-        } else {
-            3
-        }
+        hir_cost_models::est_tree_levels(num_sinks)
     }
 }
 
@@ -41120,16 +41073,16 @@ mod tests_compiler_rejects {
         assert!(r.is_err(), "malformed input must fail to compile, got Ok");
     }
 
-    // Case 3: invalid width. `u3` is not a real integer width and is not in
-    // VALID_CAST_TYPES -> rejected; `u3` never reaches codegen.
+    // Case 3: invalid width. `u65` is past the 64 bits a uN cast may name (int_type_names.t27)
+    // and is not in VALID_CAST_TYPES -> rejected; `u65` never reaches codegen.
     #[test]
-    fn rejects_invalid_width_u3() {
+    fn rejects_invalid_width_u65() {
         // Hardened contract (t27#1940): a malformed statement/declaration
         // is a COMPILE ERROR, not a silent drop.
         let r = try_emit(
             r#"module RejBadWidth {
     pub fn h(x: u8) -> u8 {
-        return x as u3
+        return x as u65
     }
 }"#,
         );

@@ -289,7 +289,8 @@ pub fn wipe(marks: &mut [u8], n: usize) -> () {
     }
 }
 
-pub fn bits(marks: Vec<u8>, n: usize) -> u32 {
+pub fn bits(marks: impl AsRef<[u8]>, n: usize) -> u32 {
+    let marks: &[u8] = marks.as_ref();
     let mut m: u32 = 0;
     let mut bit: u32 = 1;
     let mut i: usize = 0;
