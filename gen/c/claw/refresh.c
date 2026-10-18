@@ -839,6 +839,10 @@ void test_a_sha_is_forty_lowercase_hex_digits(void) {
     assert((rf_sha_ok(&b, 0, 40) == false));
     b[7] = '9';
     assert((rf_sha_ok(&b, 0, 40) == true));
+    b[7] = 'f';
+    assert((rf_sha_ok(&b, 0, 40) == true));
+    b[7] = 'g';
+    assert((rf_sha_ok(&b, 0, 40) == false));
 }
 
 void test_a_created_stamp_has_exactly_the_sortable_shape(void) {
@@ -1164,6 +1168,122 @@ void test_one_record_splits_into_eleven_fields_and_classifies_as_refresh(void) {
     assert((rf_classify(&r, &f) == D_REFRESH));
 }
 
+void test_a_created_stamp_is_checked_at_every_separator_and_at_its_length(void) {
+    uint8_t b[32] = {0};
+    size_t n = put_str(&b, 32, 0, "2026-10-18T09:05:01Zx", 21);
+    assert((rf_created_ok(&b, 0, n) == false));
+    n = put_str(&b, 32, 0, "2026/10-18T09:05:01Z", 20);
+    assert((rf_created_ok(&b, 0, n) == false));
+    n = put_str(&b, 32, 0, "2026-10/18T09:05:01Z", 20);
+    assert((rf_created_ok(&b, 0, n) == false));
+    n = put_str(&b, 32, 0, "2026-10-18T09-05:01Z", 20);
+    assert((rf_created_ok(&b, 0, n) == false));
+    n = put_str(&b, 32, 0, "2026-10-18T09:05-01Z", 20);
+    assert((rf_created_ok(&b, 0, n) == false));
+}
+
+void test_older_ignores_the_byte_after_the_stamp(void) {
+    uint8_t b[64] = {0};
+    size_t w = put_str(&b, 64, 0, "2026-10-18T09:05:01Zz", 21);
+    w = put_str(&b, 64, w, "2026-10-18T09:05:01Za", 21);
+    assert((rf_older(&b, 0, 1, 21, 2) == true));
+    assert((rf_older(&b, 21, 2, 0, 1) == false));
+}
+
+void test_one_unreadable_field_alone_makes_the_record_unreadable(void) {
+    uint8_t r[256] = {0};
+    size_t n = t_rec(&r, 256, 0, 720, 100, false, 0, false, false, 0, 0, 5);
+    assert((r[45] == '2'));
+    assert((r[73] == 'f'));
+    assert((r[92] == 'f'));
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 1));
+    r[45] = 'x';
+    d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+    r[45] = '2';
+    r[73] = 'F';
+    d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+    r[73] = 'f';
+    r[92] = 'F';
+    d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+}
+
+void test_a_record_one_field_short_is_unreadable_not_merely_undecidable(void) {
+    uint8_t r[256] = {0};
+    size_t n = t_rec(&r, 256, 0, 730, 100, false, 0, false, false, 0, 0, 5);
+    r[(n - 3)] = '\n';
+    n -= 2;
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+    assert((buf_has(&out, d, " 0 not decidable yet, ", 22) == true));
+}
+
+void test_a_blank_line_is_not_a_record(void) {
+    uint8_t r[512] = {0};
+    size_t n = put_byte(&r, 512, 0, '\n');
+    n = t_rec(&r, 512, n, 740, 100, false, 0, false, false, 0, 0, 5);
+    n = put_byte(&r, 512, n, '\n');
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 1));
+    assert((buf_has(&out, d, " 0 unreadable\n", 14) == true));
+}
+
+void test_pull_request_number_zero_is_unreadable(void) {
+    uint8_t r[256] = {0};
+    size_t n = t_rec(&r, 256, 0, 0, 100, false, 0, false, false, 0, 0, 5);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+}
+
+void test_the_513th_record_is_counted_as_unreadable_and_not_stored(void) {
+    uint8_t r[65536] = {0};
+    size_t n = 0;
+    uint32_t i = 1;
+    while ((i <= 513)) {
+        n = t_rec(&r, 65536, n, i, 100, false, 0, false, false, 0, 0, 0);
+        i += 1;
+    }
+    assert((n < 65536));
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((buf_has(&out, d, "512 already up to date, ", 24) == true));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+}
+
+void test_the_hour_digits_decide_the_order(void) {
+    uint8_t r[1024] = {0};
+    size_t n = t_rec(&r, 1024, 0, 9, 39600, false, 0, false, false, 0, 0, 1);
+    n = t_rec(&r, 1024, n, 3, 43200, false, 0, false, false, 0, 0, 1);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 2));
+    assert((out[2] == '9'));
+    assert((out[47] == '3'));
+}
+
+void test_the_second_digits_decide_the_order(void) {
+    uint8_t r[1024] = {0};
+    size_t n = t_rec(&r, 1024, 0, 9, 3610, false, 0, false, false, 0, 0, 1);
+    n = t_rec(&r, 1024, n, 3, 3659, false, 0, false, false, 0, 0, 1);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096);
+    assert((t_lines(&out, d, 'R') == 2));
+    assert((out[2] == '9'));
+    assert((out[47] == '3'));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1207,7 +1327,16 @@ int main(void) {
     test_a_buffer_too_small_is_reported_not_trusted();
     test_the_summary_texts_are_pinned_by_their_lengths();
     test_one_record_splits_into_eleven_fields_and_classifies_as_refresh();
-    printf("All %d tests passed.\n", 35);
+    test_a_created_stamp_is_checked_at_every_separator_and_at_its_length();
+    test_older_ignores_the_byte_after_the_stamp();
+    test_one_unreadable_field_alone_makes_the_record_unreadable();
+    test_a_record_one_field_short_is_unreadable_not_merely_undecidable();
+    test_a_blank_line_is_not_a_record();
+    test_pull_request_number_zero_is_unreadable();
+    test_the_513th_record_is_counted_as_unreadable_and_not_stored();
+    test_the_hour_digits_decide_the_order();
+    test_the_second_digits_decide_the_order();
+    printf("All %d tests passed.\n", 44);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
