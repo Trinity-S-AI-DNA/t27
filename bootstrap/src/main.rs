@@ -90,6 +90,11 @@ mod sha256;
 #[path = "../gen/rust/tri/crypto/ed25519.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod ed25519;
+// specs/tri/fmt_source.t27 (#10365), lowered by `t27c gen-rust`: the lossless formatter behind `t27c fmt`.
+// Never hand-edit it; regenerate.
+#[path = "../gen/rust/tri/fmt_source.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod fmt_source;
 mod memory;
 mod trit_stdlib;
 mod behavior_sva;
@@ -1543,7 +1548,7 @@ enum Commands {
         input: String,
     },
 
-    /// Pretty-print .t27 from AST
+    /// Normalise .t27 whitespace, keeping every comment and token (specs/tri/fmt_source.t27)
     Fmt {
         input: String,
     },
@@ -8703,250 +8708,15 @@ fn run_explain(input_path: &str) -> anyhow::Result<()> {
 }
 
 fn run_fmt(input_path: &str) -> anyhow::Result<()> {
-    let source = fs::read_to_string(input_path)?;
-    let ast = compiler::Compiler::parse_ast(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    fn fmt_expr(node: &compiler::Node) -> String {
-        match node.kind {
-            compiler::NodeKind::ExprLiteral => node.value.clone(),
-            compiler::NodeKind::ExprIdentifier => node.name.clone(),
-            compiler::NodeKind::ExprBinary => {
-                if node.children.len() >= 2 {
-                    let l = fmt_expr(&node.children[0]);
-                    let r = fmt_expr(&node.children[1]);
-                    format!("{} {} {}", l, node.extra_op, r)
-                } else {
-                    "()".to_string()
-                }
-            }
-            compiler::NodeKind::ExprUnary => {
-                if !node.children.is_empty() {
-                    format!("{}{}", node.extra_op, fmt_expr(&node.children[0]))
-                } else {
-                    node.extra_op.clone()
-                }
-            }
-            compiler::NodeKind::ExprCall => {
-                let args: Vec<String> = node.children.iter().map(fmt_expr).collect();
-                format!("{}({})", node.name, args.join(", "))
-            }
-            compiler::NodeKind::ExprFieldAccess => {
-                if !node.children.is_empty() {
-                    format!("{}.{}", fmt_expr(&node.children[0]), node.name)
-                } else {
-                    node.name.clone()
-                }
-            }
-            compiler::NodeKind::ExprIndex => {
-                if node.children.len() >= 2 {
-                    format!("{}[{}]", fmt_expr(&node.children[0]), fmt_expr(&node.children[1]))
-                } else {
-                    "()".to_string()
-                }
-            }
-            compiler::NodeKind::ExprEnumValue => format!("{}::{}", node.name, node.extra_field),
-            compiler::NodeKind::ExprStructLit => {
-                let fields: Vec<String> = node.children.iter().map(|c| {
-                    let val = if c.children.is_empty() { "".to_string() } else { format!(" = {}", fmt_expr(&c.children[0])) };
-                    format!("{}:{}", c.name, val)
-                }).collect();
-                format!("{} {{ {} }}", node.name, fields.join(", "))
-            }
-            compiler::NodeKind::ExprArrayLiteral => {
-                let elems: Vec<String> = node.children.iter().map(fmt_expr).collect();
-                format!("[{}]", elems.join(", "))
-            }
-            _ => format!("/* {:?} */", node.kind),
-        }
+    // The formatter is specs/tri/fmt_source.t27 (lossless: whitespace only); this is its I/O glue.
+    let src = fs::read(input_path)?;
+    let cap = src.len() * 4 + 1;
+    let mut out = vec![0u8; cap];
+    let m = fmt_source::fmt_source(&src, src.len(), &mut out, cap);
+    if !fmt_source::fmt_accept(&src, src.len(), &out, m, cap) {
+        anyhow::bail!("fmt: refused, the output would not keep every non-whitespace byte of {}", input_path);
     }
-
-    fn fmt_stmt(node: &compiler::Node, indent: usize) -> String {
-        let pad = "    ".repeat(indent);
-        let mut out = String::new();
-        match node.kind {
-            compiler::NodeKind::StmtLocal => {
-                let kw = if node.extra_mutable { "var" } else { "const" };
-                if node.children.is_empty() {
-                    if node.extra_type.is_empty() {
-                        out.push_str(&format!("{}{} {};\n", pad, kw, node.name));
-                    } else {
-                        out.push_str(&format!("{}{} {}: {};\n", pad, kw, node.name, node.extra_type));
-                    }
-                } else {
-                    let val = fmt_expr(&node.children[0]);
-                    if node.extra_type.is_empty() {
-                        out.push_str(&format!("{}{} {} = {};\n", pad, kw, node.name, val));
-                    } else {
-                        out.push_str(&format!("{}{} {}: {} = {};\n", pad, kw, node.name, node.extra_type, val));
-                    }
-                }
-            }
-            compiler::NodeKind::StmtAssign => {
-                if node.children.len() >= 2 {
-                    let target = fmt_expr(&node.children[0]);
-                    let val = fmt_expr(&node.children[1]);
-                    out.push_str(&format!("{}{} = {};\n", pad, target, val));
-                }
-            }
-            compiler::NodeKind::ExprReturn => {
-                if node.children.is_empty() {
-                    out.push_str(&format!("{}return;\n", pad));
-                } else {
-                    out.push_str(&format!("{}return {};\n", pad, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::StmtExpr => {
-                if node.children.len() == 1 {
-                    out.push_str(&format!("{}{};\n", pad, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::StmtIf => {
-                out.push_str(&pad);
-                out.push_str("if (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                out.push_str(") {\n");
-                if node.children.len() > 1 {
-                    for s in &node.children[1].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-                if node.children.len() > 2 {
-                    out.push_str(&format!("{} else {{\n", pad));
-                    for s in &node.children[2].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                    out.push_str(&format!("{}}}\n", pad));
-                }
-            }
-            compiler::NodeKind::StmtWhile => {
-                out.push_str(&pad);
-                out.push_str("while (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                out.push_str(") {\n");
-                if node.children.len() > 1 {
-                    for s in &node.children[1].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StmtFor => {
-                out.push_str(&pad);
-                out.push_str("for (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                if node.children.len() > 1 {
-                    out.push_str(&format!(") |{}| {{\n", node.children[1].name));
-                } else {
-                    out.push_str(") {\n");
-                }
-                if node.children.len() > 2 {
-                    for s in &node.children[2].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StmtBreak => {
-                out.push_str(&format!("{}break;\n", pad));
-            }
-            compiler::NodeKind::StmtContinue => {
-                out.push_str(&format!("{}continue;\n", pad));
-            }
-            _ => {
-                out.push_str(&format!("{}// {:?}\n", pad, node.kind));
-            }
-        }
-        out
-    }
-
-    fn fmt_node(node: &compiler::Node, indent: usize) -> String {
-        let pad = "    ".repeat(indent);
-        let mut out = String::new();
-        match node.kind {
-            compiler::NodeKind::Module => {
-                out.push_str(&format!("{}module {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_node(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::UseDecl => {
-                out.push_str(&format!("{}using {};\n", pad, node.value));
-            }
-            compiler::NodeKind::ConstDecl => {
-                if node.children.is_empty() {
-                    out.push_str(&format!("{}const {}: {};\n", pad, node.name, node.extra_type));
-                } else {
-                    out.push_str(&format!("{}const {} = {};\n", pad, node.name, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::EnumDecl => {
-                out.push_str(&format!("{}enum {} {{\n", pad, node.name));
-                for child in &node.children {
-                    if child.kind == compiler::NodeKind::EnumVariant {
-                        if child.value.is_empty() {
-                            out.push_str(&format!("    {}{},\n", pad, child.name));
-                        } else {
-                            out.push_str(&format!("    {}{} = {},\n", pad, child.name, child.value));
-                        }
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StructDecl => {
-                out.push_str(&format!("{}struct {} {{\n", pad, node.name));
-                for child in &node.children {
-                    if child.kind == compiler::NodeKind::ExprIdentifier && !child.name.is_empty() {
-                        out.push_str(&format!("    {}{}: {},\n", pad, child.name, child.extra_type));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::FnDecl => {
-                let params: Vec<String> = node.params.iter().map(|(n, t)| {
-                    if t.is_empty() { n.clone() } else { format!("{}: {}", n, t) }
-                }).collect();
-                let ret = if node.extra_return_type.is_empty() { String::new() } else { format!(" -> {}", node.extra_return_type) };
-                out.push_str(&format!("{}fn {}({}){} {{\n", pad, node.name, params.join(", "), ret));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            compiler::NodeKind::TestBlock => {
-                out.push_str(&format!("{}test {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            compiler::NodeKind::InvariantBlock => {
-                out.push_str(&format!("{}invariant {} {}\n\n", pad, node.name, node.value));
-            }
-            compiler::NodeKind::BenchBlock => {
-                out.push_str(&format!("{}bench {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            _ => {
-                for child in &node.children {
-                    out.push_str(&fmt_node(child, indent));
-                }
-            }
-        }
-        out
-    }
-
-    print!("{}", fmt_node(&ast, 0));
+    std::io::Write::write_all(&mut std::io::stdout(), &out[..m])?;
     Ok(())
 }
 
