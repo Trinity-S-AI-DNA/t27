@@ -73,6 +73,14 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 When asked "how is T27F going", report against the core rows first. Progress on the applications
 is not progress on the core.
 
+**Trap: a name declared in two specs cannot be imported (t27#10556).** Measured on t27c 0.5.2:
+`use t27f::lesson_reel::phrase_start` returns `UNRESOLVED ... ambiguous, not spliced`, because
+`token_floor_mux.t27` declares a private `fn phrase_start`. The same happens to `cta_from` and
+`voice_fits`. The explicit path does not help. Before you plan a new module on top of a reel spec,
+grep `specs/` for every name it would import. If any of them collides, put the new code inside the
+spec that owns those names, under a prefix such as `beat_`. The beat clock (t27#10596, PR #10598)
+lives in `lesson_reel.t27` for this reason.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
