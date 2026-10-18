@@ -54,6 +54,8 @@ mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#89
 mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
 mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
+#[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)]
+mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525)
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
@@ -430,6 +432,7 @@ enum Commands {
         /// The module name; default the file's stem.
         #[arg(long)] name: Option<String>,
         #[arg(long)] oracle: bool,
+        /// Run the oracle and test the spec: `t27b test` judges, `t27c test-report` only when t27b cannot (specs/tools/t27o/ledger.t27).
         #[arg(long)] check: bool,
         /// The t27c binary; default target/release/t27c, then t27c on PATH.
         #[arg(long)] t27c: Option<String>,
@@ -1349,6 +1352,12 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     fs::create_dir_all("specs/t27o_check")?;
     fs::write(&path, [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat())?;
     println!("{}", path.display());
+    // t27b's JIT judges first; t27c test-report only when t27b's run is not a verdict (rules: specs/tools/t27o/ledger.t27, #10525)
+    let t27b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b");
+    let code = Command::new(t27b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let o = t27o_ledger::t27b_outcome(code);
+    if !t27o_ledger::needs_reference(o) { return Ok(code as u8); }
+    eprintln!("t27o: {t27b} test exited {code} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[o as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
 
