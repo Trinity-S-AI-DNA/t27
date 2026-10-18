@@ -96,6 +96,16 @@ Hurting:
 - Copilot bundling: if free test generation ships broadly, the
   test-generation category compresses to $0 — position as spec/conformance
   infrastructure, never "another AI test tool".
+- A gate that cannot judge must not block. Codacy's coverage gate waits
+  forever ("Waiting for coverage reports", action_required) on a pull request
+  with no source change, with no setting to skip it
+  (facioquo/stock-indicators-dotnet#2344, Oct 2026); CodeRabbit skips or fails
+  reviews when the installation lacks a permission (its KB, "Troubleshoot why
+  reviews might not trigger"). TRI CLAW had the same defect: claw-sarif was
+  red on every pull request for want of security_events write (#10501). The
+  answer is a law, not a fix per job: specs/claw/token_shape.t27 names every
+  job that mints an App token without continue-on-error and a step-summary
+  note.
 - The word "spec" is being colonized by prose (Spec Kit/OpenSpec); establish
   the sealed-hash + oracle-witness vocabulary early.
 - DSL adoption cost is real; the counter (specs arrive as reviewable PRs you
