@@ -5602,8 +5602,8 @@ mod unresolved_is_not_a_rejection {
 
 /// #8095 step 3: every spec under specs/, REUSE or why it must be rebuilt. Each decision is the generated
 /// specs/verified/seal_identity.t27 node_decision(); this walks the `use` graph only (#8102 blocks frontier.t27).
-pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -> anyhow::Result<()> {
-    use crate::{gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
+pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool, only: Vec<String>, since: Option<String>) -> anyhow::Result<()> {
+    use crate::{affected, frontier_scope as sc, gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
     let (mut tc, mut memo, mut stack, mut specs) = (crate::seal_toolchain(), std::collections::HashMap::new(), vec![std::path::PathBuf::from("specs")], Vec::new());
     tc["gen_cache_bin"] = std::fs::read(std::env::current_exe()?).map(|b| crate::sha256_hex(&b)).unwrap_or_default().into(); // #8737: the generator's identity
     // #8928: one directory per binary; keep the current one and the newest others (gen_cache_keep), drop the rest and the old flat files
@@ -5648,13 +5648,14 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         memo.insert(p.to_string(), d);
         Some(d)
     }
-    let mut counts = [0u32; 7];
-    specs.sort();
+    let mut counts = [0u32; 7]; specs.sort();
+    // #10236: --only / --since walk the specs frontier_scope.t27 picks (affected.t27: the seeds and their transitive importers), not the corpus; each closure is still read in full
+    let diff = sc::scope_wanted(!only.is_empty(), since.is_some()).then(|| -> anyhow::Result<String> { Ok(match &since { Some(r) => { let o = std::process::Command::new("git").args(["diff", "--name-status", r]).output()?; anyhow::ensure!(o.status.success(), "git diff --name-status {r} failed"); String::from_utf8_lossy(&o.stdout).into_owned() } None => only.iter().map(|o| format!("M\t{o}\n")).collect() }) }).transpose()?;
+    if let Some(d) = diff { let (all, edges) = (specs.len(), specs.iter().flat_map(|p| std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| l.trim().strip_prefix("use ")).map(|u| format!("{p}\t{}\n", crate::use_spec_path(u))).collect::<Vec<_>>()).collect::<String>()); let buf = format!("{d}--graph\n{edges}--corpus\n{}", specs.iter().map(|p| format!("{p}\n")).collect::<String>()); let (mut set, mut out) = (vec![0u8; buf.len() + 1], vec![0u8; buf.len() + 1]); let k = affected::select_affected(buf.as_bytes(), buf.len(), &mut set, buf.len() + 1, &mut out, buf.len() + 1); let narrows = sc::scope_narrows(k, affected::RUN_ALL); if narrows { let keep: std::collections::HashSet<&str> = std::str::from_utf8(&out).unwrap_or("").lines().collect(); specs.retain(|p| keep.contains(p.as_str())) } println!("frontier: scope {}", if narrows { format!("{k} of {all} specs") } else { "the whole corpus (a changed path outside specs/ cannot be judged)".into() }) }
     // #8846: a cold walk first fills the gen-hash cache with suite_jobs() workers (8 MiB stacks); decide() reads it
     crate::suite::par_in_order(&specs, |p: &String| { gen_cached(p, &tc); });
     for p in &specs { let d = decide(p, &tc, &mut memo, 0).unwrap_or(si::REBUILD_MISSING); counts[d as usize] += 1; if list && d != si::REUSE { println!("{d} {p}") } }
-    let total = specs.len() as u32;
-    println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], total, si::reused_permille(counts[0], total), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
+    println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], specs.len(), si::reused_permille(counts[0], specs.len() as u32), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
     // --reseal (#8095): seal again what remint_wants names; keep the new seal only where remint_keeps allows,
     // copied onto every twin, else write the old seal back. `seal` exits on a refusal, so it runs as a child.
     let mut twins: std::collections::HashMap<String, Vec<std::path::PathBuf>> = Default::default();
