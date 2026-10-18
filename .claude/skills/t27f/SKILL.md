@@ -113,6 +113,18 @@ Traps from this tick:
 - `fs-lab.sh "echo $b64a ... ; echo $b64b ..."` with two large files exits 0 and writes nothing. Upload one file per call and compare md5 on both sides.
 - zsh does not word-split `set -- $p`. Write one call per file.
 
+**Keeping overlays off a crossfade (t27#10614, PR #10627).**
+
+- Work in whole frames, not seconds. Give each scene a function for the frames it owns outside its crossfades, clip each overlay to it, and print exactly those frames as `between(n,lo,hi)` terms joined with `+`. A test checks that the printed frames equal the frames `between(t,a,b)` showed before.
+- Drop a piece that has no room; never squeeze it. Name the cost in a test: count what is dropped, assert that each drop is on a crossfade, and assert that every phrase keeps at least one caption.
+- To check the pixels, render lossless from solid-colour clips. Crop a full-width band 40 rows tall over the text, split the raw file per frame, and count the distinct colours per frame with `od -An -tu1 -w3 -v | sort -u | wc -l`. Crossfade frames must show 1. The frames with text are the control: they must be many.
+
+Traps from this tick:
+
+- A minimum-length rule silently drops spoken captions. A short chunk that straddles a crossfade leaves two pieces under the minimum, and the voice speaks words that are never shown. A grid test that says "no overlay on a crossfade" stays green while this happens. Only a count of what was dropped finds it.
+- Lab scripts run under `sh`, which is dash: `$((10#$x))` fails with "expecting EOF". Strip leading zeros with `sed 's/^0*//'` and default with `${i:-0}`.
+- The Mac hook reads the whole Bash command. A heredoc PR body that names the report command gets refused. Write the body with the Write tool and pass `--body-file`.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
