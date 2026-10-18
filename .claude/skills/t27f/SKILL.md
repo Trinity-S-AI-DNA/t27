@@ -49,11 +49,6 @@ executable visual diagrams").
   as a navigable program, linked to source, tests, issues and real task status; each cell is both a
   spec and a learning entry point.
 
-**The particle video is T27F too** (owner, 2026-10-18: "t27f is the particle video, the thing you
-were doing"). The token_floor reels (`specs/t27f/token_floor*.t27`, `lesson_reel.t27`) are the
-form of T27F the owner means when asking for a visual. The graph IR below is the inspectable form.
-Both are T27F; neither replaces the other.
-
 **What T27F is not:** it is not the topic-to-value engine. gHashTag/trinity#1677 (topic or client
 brief -> 27-lesson map -> Bee -> verified artifact) is an *application* built on T27F, and so are
 the reels. Describing T27F as #1677 is the error this section exists to stop (owner correction,
