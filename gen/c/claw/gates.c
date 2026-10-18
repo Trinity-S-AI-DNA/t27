@@ -53,8 +53,11 @@ uint8_t class_of(const char* name, size_t name_len);
 bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
+bool rows_filled(const char* names[static 67], const char* events[static 67]);
 bool every_row_filled(void);
+bool names_unique_in(const char* names[static 67], size_t lens[static 67]);
 bool all_names_unique(void);
+bool classes_known(uint8_t cl[static 67]);
 bool all_classes_known(void);
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start);
 bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name, size_t name_len);
@@ -104,22 +107,26 @@ uint32_t count_class(uint8_t c) {
     return n;
 }
 
-bool every_row_filled(void) {
+bool rows_filled(const char* names[static 67], const char* events[static 67]) {
     for (size_t i = 0; i < 67; i++) {
-        if ((NAMES[i] == "")) {
+        if ((names[i] == "")) {
             return false;
         }
-        if ((EVENTS[i] == "")) {
+        if ((events[i] == "")) {
             return false;
         }
     }
     return true;
 }
 
-bool all_names_unique(void) {
+bool every_row_filled(void) {
+    return rows_filled(NAMES, EVENTS);
+}
+
+bool names_unique_in(const char* names[static 67], size_t lens[static 67]) {
     for (size_t i = 0; i < 67; i++) {
         for (size_t j = (i + 1); j < 67; j++) {
-            if (str_eq(NAMES[i], NAME_LENS[i], NAMES[j], NAME_LENS[j])) {
+            if (str_eq(names[i], lens[i], names[j], lens[j])) {
                 return false;
             }
         }
@@ -127,17 +134,25 @@ bool all_names_unique(void) {
     return true;
 }
 
-bool all_classes_known(void) {
+bool all_names_unique(void) {
+    return names_unique_in(NAMES, NAME_LENS);
+}
+
+bool classes_known(uint8_t cl[static 67]) {
     for (size_t i = 0; i < 67; i++) {
-        if ((CLASSES[i] != G_BLOCKING)) {
-            if ((CLASSES[i] != G_SOFT)) {
-                if ((CLASSES[i] != G_REPORTING)) {
+        if ((cl[i] != G_BLOCKING)) {
+            if ((cl[i] != G_SOFT)) {
+                if ((cl[i] != G_REPORTING)) {
                     return false;
                 }
             }
         }
     }
     return true;
+}
+
+bool all_classes_known(void) {
+    return classes_known(CLASSES);
 }
 
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start) {
@@ -588,6 +603,63 @@ void test_coverage_report_lines_are_exact(void) {
     assert((buf_has(&out, w, "G_REPORTING n=2 blocking=false e.g. auto-merge-ready-prs, queen-publish\n", 72) == true));
 }
 
+void test_a_hole_in_either_column_fails_the_filled_check(void) {
+    assert((rows_filled(NAMES, EVENTS) == true));
+    const char* n[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        n[i] = NAMES[i];
+    }
+    n[66] = "";
+    assert((rows_filled(n, EVENTS) == false));
+    const char* e[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        e[i] = EVENTS[i];
+    }
+    e[0] = "";
+    assert((rows_filled(NAMES, e) == false));
+}
+
+void test_a_repeated_name_is_caught_wherever_it_sits(void) {
+    const char* n[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        n[i] = NAMES[i];
+    }
+    size_t l[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        l[i] = NAME_LENS[i];
+    }
+    n[5] = n[4];
+    l[5] = l[4];
+    assert((names_unique_in(n, l) == false));
+    const char* m[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        m[i] = NAMES[i];
+    }
+    size_t k[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        k[i] = NAME_LENS[i];
+    }
+    m[66] = m[0];
+    k[66] = k[0];
+    assert((names_unique_in(m, k) == false));
+}
+
+void test_a_class_outside_the_three_is_unknown(void) {
+    assert((classes_known(CLASSES) == true));
+    uint8_t c[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        c[i] = CLASSES[i];
+    }
+    c[66] = G_UNKNOWN;
+    assert((classes_known(c) == false));
+    c[66] = G_BLOCKING;
+    assert((classes_known(c) == true));
+    c[66] = G_SOFT;
+    assert((classes_known(c) == true));
+    c[66] = G_REPORTING;
+    assert((classes_known(c) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -616,7 +688,10 @@ int main(void) {
     test_coverage_report_carries_every_class();
     test_audit_tail_line_matches_the_count();
     test_coverage_report_lines_are_exact();
-    printf("All %d tests passed.\n", 20);
+    test_a_hole_in_either_column_fails_the_filled_check();
+    test_a_repeated_name_is_caught_wherever_it_sits();
+    test_a_class_outside_the_three_is_unknown();
+    printf("All %d tests passed.\n", 23);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
