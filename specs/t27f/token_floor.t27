@@ -42,6 +42,19 @@
 // THE OUTPUT: `main` writes FRAMES frames of FRAME_W x FRAME_H raw RGB24 to stderr, row by row, as
 // specs/t27f/reel_particles.t27 does; ffmpeg reads them with plain flags
 // (`-f rawvideo -pix_fmt rgb24 -s 1080x1920 -r 30 -i frames.rgb`).
+// Each row of a frame visits only the splats a per-frame row index lists for it, in the order they
+// were splatted; the raster's own check (touches_row) still decides, so the index only skips rows a
+// splat cannot light and the bytes are those of a scan over every splat. Without the index each of
+// the 1920 rows checked all ~42k splats and one process took 51 s; with it, 33 s on one core.
+// The empty scene is the same in every frame, so its bytes and each row's light factors are
+// computed once; a row exposes only the pixels a splat visited and copies the rest, 19 s.
+// To use more cores, `main` renders shard k of N
+// (environment TF_SHARD and TF_SHARDS; unset, 0 of 1, the whole reel): the frames
+// [shard_a(k, N), shard_b(k, N)). Frame f's state is the integral from frame 0, so every shard steps
+// the physics from frame 0 and skips only the splats and the raster before its range. The shards
+// of one N tile [0, FRAMES) in order, so their outputs concatenated are the one-process output
+// byte for byte. Unchanged frames need no render at all: specs/t27f/frame_cache.t27 keys them by
+// this spec's seal.
 //
 // NOT CLAIMED: the ball mass, the drop height, the tube and the light levels are design choices,
 // labelled as such. The balls are not a model of any computer; they are a bar chart that obeys
@@ -161,6 +174,7 @@ pub const TICK_DELAY : f64 = 3.0;
 pub const MAX_DOTS : usize = 22528;
 pub const MAX_SPLATS : usize = 45312;       // every dot, its mirror image, and 256 more
 pub const ROW_BYTES : usize = 3240;
+pub const INDEX_CAP : usize = 524288;       // entries of the row index; index_bound() fits
 
 // Splat kinds.
 pub const K_DOT : u8 = 0;
@@ -671,6 +685,35 @@ fn back_light(kx: f64, ky: f64, gx: f64, gy: f64, below: bool) -> f64 {
     return BG * FLOOR_DIM + KEY * FLOOR_KEY * kx * ky + GLINT * gx * gy;
 }
 
+// What the row whose centre is y gives the light of the empty scene, from y alone: the key light's
+// vertical factor (seen in the mirror below the floor), the horizon glint's, and the share of a
+// mirror image that survives at that depth. Above the floor the glint and the fade are 0.
+pub fn row_key(y: f64) -> f64 {
+    if (y > FLOOR_PX) {
+        return key_w(2.0 * FLOOR_PX - y - KEY_Y);
+    }
+    return key_w(y - KEY_Y);
+}
+
+pub fn row_glint(y: f64) -> f64 {
+    if (y > FLOOR_PX) {
+        return glint_y(y - FLOOR_PX);
+    }
+    return 0.0;
+}
+
+pub fn row_fade(y: f64) -> f64 {
+    if (y > FLOOR_PX) {
+        return @exp(0.0 - (y - FLOOR_PX) / FADE);
+    }
+    return 0.0;
+}
+
+// The byte one channel of light l is written as.
+pub fn light_byte(l: f64) -> u8 {
+    return quantize(expose(l));
+}
+
 fn backdrop(x: f64, y: f64) -> f64 {
     if (y <= FLOOR_PX) {
         return back_light(key_w(x - KEY_X), key_w(y - KEY_Y), 0.0, 0.0, false);
@@ -711,9 +754,141 @@ fn frame_bytes() -> i32 {
     return FRAME_W * FRAME_H * 3;
 }
 
+// ---- shards ----
+
+// The first frame of shard k of n, for 0 <= k <= n; shard_a(n, n) is FRAMES. Shard k renders
+// [shard_a(k, n), shard_a(k + 1, n)), so shard k + 1 starts where shard k stops.
+pub fn shard_a(k: i32, n: i32) -> i32 {
+    return @divTrunc(k * FRAMES, n);
+}
+
+pub fn shard_b(k: i32, n: i32) -> i32 {
+    return shard_a(k + 1, n);
+}
+
+// The decimal number at the head of s, or dflt when s has no digit first. At most four digits are
+// read, so no input overflows.
+pub fn count_or(s: [*:0]const u8, dflt: i32) -> i32 {
+    var v : i32 = 0;
+    var i : usize = 0;
+    while (i < 4 && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + @as(i32, @intCast(s[i] - 48));
+        i = i + 1;
+    }
+    if (i == 0) {
+        return dflt;
+    }
+    return v;
+}
+
+// The shard main renders, from k and n as read: an n out of 1..FRAMES, or a k out of 0..n - 1,
+// is the whole reel, never an empty or a partial one.
+pub fn shard_n(k: i32, n: i32) -> i32 {
+    if (n < 1 || n > FRAMES || k < 0 || k >= n) {
+        return 1;
+    }
+    return n;
+}
+
+pub fn shard_k(k: i32, n: i32) -> i32 {
+    if (shard_n(k, n) == 1) {
+        return 0;
+    }
+    return k;
+}
+
+// The environment variable `name` as a count; dflt when it is unset. Only main calls this, so the
+// tests, which never link libc, do not reach getenv.
+fn env_count(name: [*:0]const u8, dflt: i32) -> i32 {
+    const p = std.c.getenv(name);
+    if (p == null) {
+        return dflt;
+    }
+    return count_or(p.?, dflt);
+}
+
+// ---- the row index ----
+
+// Whether a splat of kind k (m 1 for a mirror image) can light the row whose centre is y: an image
+// lives only below the floor, a vertical line between its ends sy and sw, anything else within its
+// reach sc of its centre sy. This is the raster's test, and the only one it makes.
+pub fn touches_row(k: u8, m: u8, sy: f64, sw: f64, sc: f64, y: f64) -> bool {
+    if (m == 1 && (y > FLOOR_PX) == false) {
+        return false;
+    }
+    if (k == K_VLINE) {
+        if (y < sy || y > sw) {
+            return false;
+        }
+        return true;
+    }
+    if (@abs(y - sy) > sc) {
+        return false;
+    }
+    return true;
+}
+
+// The top and the bottom of the band of row centres a splat can touch, px.
+pub fn splat_top(k: u8, sy: f64, sc: f64) -> f64 {
+    if (k == K_VLINE) {
+        return sy;
+    }
+    return sy - sc;
+}
+
+pub fn splat_bot(k: u8, sy: f64, sw: f64, sc: f64) -> f64 {
+    if (k == K_VLINE) {
+        return sw;
+    }
+    return sy + sc;
+}
+
+// The rows the index lists a splat under: every row whose centre lies in [top, bot], and one more
+// on each side, clipped to the frame. The margin covers rounding; the raster still asks touches_row,
+// so a listed row the splat misses costs a test and changes no byte. row_lo > row_hi lists none.
+pub fn row_lo(top: f64) -> i32 {
+    var r : f64 = @floor(top - 0.5) - 1.0;
+    if (r < 0.0) { r = 0.0; }
+    if (r > @as(f64, @floatFromInt(FRAME_H))) { r = @as(f64, @floatFromInt(FRAME_H)); }
+    return @as(i32, @intFromFloat(r));
+}
+
+pub fn row_hi(bot: f64) -> i32 {
+    var r : f64 = @ceil(bot - 0.5) + 1.0;
+    if (r < -1.0) { r = -1.0; }
+    if (r > @as(f64, @floatFromInt(FRAME_H - 1))) { r = @as(f64, @floatFromInt(FRAME_H - 1)); }
+    return @as(i32, @intFromFloat(r));
+}
+
+// The most rows the index can list a splat under whose band is ext px tall.
+pub fn span_max(ext: f64) -> i64 {
+    return @as(i64, @intFromFloat(@ceil(ext))) + 5;
+}
+
+// The most entries the index can hold in any frame: every dot and its image, the counter's pool,
+// each ball's halo, body and image, and the five vertical lines, each at its tallest band.
+pub fn index_bound() -> i64 {
+    var b : i64 = 0;
+    var l : usize = 0;
+    while (l < LABELS) {
+        if (is_counter(l) == false) {
+            b = b + 2 * label_dots(l) * span_max(2.0 * (DOT_R * grid(lbl_f(l, 2)) + 1.0));
+        }
+        l = l + 1;
+    }
+    b = b + @as(i64, @intCast(POOL)) * span_max(2.0 * (DOT_R * grid(EXP_PITCH) + 1.0));
+    b = b + @as(i64, @intCast(BALLS)) * (span_max(2.0 * 3.0 * HALO_R * R_PX) + 2 * span_max(2.0 * (R_PX + 1.0)));
+    b = b + 2 * span_max(REFLECT_SPAN) + 3 * span_max(FLOOR_PX - TUBE_TOP);
+    return b;
+}
+
 // ---- the engine ----
 
 pub fn main() -> void {
+    const sk0 = env_count("TF_SHARD", 0);
+    const sn0 = env_count("TF_SHARDS", 1);
+    const fa = shard_a(shard_k(sk0, sn0), shard_n(sk0, sn0));
+    const fb = shard_b(shard_k(sk0, sn0), shard_n(sk0, sn0));
     var by : [20]f64 = undefined;
     var bv : [20]f64 = undefined;
     var ba : [20]f64 = undefined;
@@ -827,6 +1002,9 @@ pub fn main() -> void {
     var kxa : [1080]f64 = undefined;
     var gxa : [1080]f64 = undefined;
     var row : [3240]u8 = undefined;
+    var roff : [1921]usize = undefined;
+    var rcur : [1920]usize = undefined;
+    var rsp : [524288]u16 = undefined;
     var px : usize = 0;
     while (px < 1080) {
         const x = @as(f64, @floatFromInt(px)) + 0.5;
@@ -834,10 +1012,40 @@ pub fn main() -> void {
         gxa[px] = glint_x(x - TUBE_X);
         px = px + 1;
     }
+    // the empty scene is the same in every frame: its row factors and its bytes are computed once,
+    // and a pixel no splat visits in a frame is written from them
+    var kya : [1920]f64 = undefined;
+    var gya : [1920]f64 = undefined;
+    var fra : [1920]f64 = undefined;
+    var bgq : [6220800]u8 = undefined;
+    var dirty : [1080]bool = undefined;
+    var py0 : usize = 0;
+    while (py0 < 1920) {
+        const y = @as(f64, @floatFromInt(py0)) + 0.5;
+        kya[py0] = row_key(y);
+        gya[py0] = row_glint(y);
+        fra[py0] = row_fade(y);
+        px = 0;
+        while (px < 1080) {
+            const b = back_light(kxa[px], kya[py0], gxa[px], gya[py0], y > FLOOR_PX);
+            const o = py0 * ROW_BYTES + px * 3;
+            bgq[o] = light_byte(b * TINT_R);
+            bgq[o + 1] = light_byte(b * TINT_G);
+            bgq[o + 2] = light_byte(b * TINT_B);
+            px = px + 1;
+        }
+        py0 = py0 + 1;
+    }
+    px = 0;
+    while (px < 1080) {
+        dirty[px] = false;
+        px = px + 1;
+    }
     const mir0 = reflect_alpha(FLOOR_PX);
 
+    // the physics runs from frame 0 to the shard's last frame; the picture only inside [fa, fb)
     var frame : i32 = 0;
-    while (frame < FRAMES) {
+    while (frame < fb) {
         // ---- physics: the column, then what its landings start and stop ----
         stack_step(&by, &bv, &ba, &landed, &bext, frame);
         l = 0;
@@ -936,6 +1144,10 @@ pub fn main() -> void {
         }
 
         // ---- splats, back to front ----
+        if (frame < fa) {
+            frame = frame + 1;
+            continue;
+        }
         var n : usize = 0;
         // the tube's image in the floor
         var w : usize = 0;
@@ -1022,40 +1234,63 @@ pub fn main() -> void {
             j = j + 1;
         }
 
-        // ---- raster: one row at a time ----
+        // ---- the row index: each row lists the splats that can touch it, in splat order ----
+        var ri : usize = 0;
+        while (ri <= 1920) {
+            roff[ri] = 0;
+            ri = ri + 1;
+        }
+        j = 0;
+        while (j < n) {
+            var rq : i32 = row_lo(splat_top(sk[j], sy[j], sc[j]));
+            const rh = row_hi(splat_bot(sk[j], sy[j], sw[j], sc[j]));
+            while (rq <= rh) {
+                const ru = @as(usize, @intCast(rq));
+                roff[ru + 1] = roff[ru + 1] + 1;
+                rq = rq + 1;
+            }
+            j = j + 1;
+        }
+        ri = 0;
+        while (ri < 1920) {
+            roff[ri + 1] = roff[ri + 1] + roff[ri];
+            rcur[ri] = roff[ri];
+            ri = ri + 1;
+        }
+        j = 0;
+        while (j < n) {
+            var rq : i32 = row_lo(splat_top(sk[j], sy[j], sc[j]));
+            const rh = row_hi(splat_bot(sk[j], sy[j], sw[j], sc[j]));
+            while (rq <= rh) {
+                const ru = @as(usize, @intCast(rq));
+                rsp[rcur[ru]] = @as(u16, @intCast(j));
+                rcur[ru] = rcur[ru] + 1;
+                rq = rq + 1;
+            }
+            j = j + 1;
+        }
+
+        // ---- raster: one row at a time, over the splats its index lists ----
+        // A pixel takes the empty scene's light the first time a splat visits it in the row and is
+        // marked dirty; only dirty pixels are exposed, the rest are copied from bgq. A visit that adds
+        // nothing leaves the light as it was, so a dirty pixel writes the byte bgq holds for it.
         var py : i32 = 0;
         while (py < FRAME_H) {
             const y = @as(f64, @floatFromInt(py)) + 0.5;
             const below = y > FLOOR_PX;
-            var ky : f64 = key_w(y - KEY_Y);
-            var gy : f64 = 0.0;
-            var fr : f64 = 0.0;
-            if (below) {
-                ky = key_w(2.0 * FLOOR_PX - y - KEY_Y);
-                gy = glint_y(y - FLOOR_PX);
-                fr = @exp(0.0 - (y - FLOOR_PX) / FADE);
-            }
-            px = 0;
-            while (px < 1080) {
-                const b = back_light(kxa[px], ky, gxa[px], gy, below);
-                accr[px] = b * TINT_R;
-                accg[px] = b * TINT_G;
-                accb[px] = b * TINT_B;
-                px = px + 1;
-            }
-            j = 0;
-            while (j < n) {
+            const pu = @as(usize, @intCast(py));
+            const ky = kya[pu];
+            const gy = gya[pu];
+            const fr = fra[pu];
+            var ei : usize = roff[pu];
+            while (ei < roff[pu + 1]) {
+                j = @as(usize, @intCast(rsp[ei]));
                 const k = sk[j];
-                var on_row : bool = true;
-                if (sm[j] == 1 && below == false) { on_row = false; }
                 var dyy : f64 = y - sy[j];
                 if (k == K_VLINE) {
-                    if (y < sy[j] || y > sw[j]) { on_row = false; }
                     dyy = 0.0;
-                } else {
-                    if (@abs(dyy) > sc[j]) { on_row = false; }
                 }
-                if (on_row) {
+                if (touches_row(k, sm[j], sy[j], sw[j], sc[j], y)) {
                     var mf : f64 = 1.0;
                     if (sm[j] == 1) { mf = fr; }
                     var x0 : f64 = @floor(sx[j] - sc[j]);
@@ -1067,6 +1302,13 @@ pub fn main() -> void {
                     while (q <= qe) {
                         const ddx = @as(f64, @floatFromInt(q)) + 0.5 - sx[j];
                         const kk = @as(usize, @intCast(q));
+                        if (dirty[kk] == false) {
+                            const b = back_light(kxa[kk], ky, gxa[kk], gy, below);
+                            accr[kk] = b * TINT_R;
+                            accg[kk] = b * TINT_G;
+                            accb[kk] = b * TINT_B;
+                            dirty[kk] = true;
+                        }
                         if (k == K_BALL || k == K_BALLF) {
                             const dd = @sqrt(ddx * ddx + dyy * dyy);
                             const cov = clamp01(sr[j] - dd + 0.5) * sa[j];
@@ -1106,13 +1348,21 @@ pub fn main() -> void {
                         q = q + 1;
                     }
                 }
-                j = j + 1;
+                ei = ei + 1;
             }
+            const o = pu * ROW_BYTES;
             px = 0;
             while (px < 1080) {
-                row[px * 3] = quantize(expose(accr[px]));
-                row[px * 3 + 1] = quantize(expose(accg[px]));
-                row[px * 3 + 2] = quantize(expose(accb[px]));
+                if (dirty[px]) {
+                    row[px * 3] = light_byte(accr[px]);
+                    row[px * 3 + 1] = light_byte(accg[px]);
+                    row[px * 3 + 2] = light_byte(accb[px]);
+                    dirty[px] = false;
+                } else {
+                    row[px * 3] = bgq[o + px * 3];
+                    row[px * 3 + 1] = bgq[o + px * 3 + 1];
+                    row[px * 3 + 2] = bgq[o + px * 3 + 2];
+                }
                 px = px + 1;
             }
             std.debug.print("{s}", .{row});
@@ -1238,6 +1488,67 @@ test "every dot and its image fit the buffers" {
     assert(POOL + 3 * BALLS + 5 <= 256);
 }
 
+test "the row index lists every row a splat touches, and no more than span_max rows" {
+    // a dot, a halo, a ball and a vertical line, each at 300 centres from above the frame to below
+    // it, a third of a pixel apart, then as mirror images
+    var touched : i64 = 0;
+    var missed : i64 = 0;
+    var wide : i64 = 0;
+    var m : u8 = 0;
+    while (m < 2) {
+        var c : i64 = 0;
+        while (c < 4) {
+            var k : u8 = K_DOT;
+            var sc : f64 = DOT_R * grid(9.0) + 1.0;
+            if (c == 1) { k = K_GLOW; sc = 3.0 * HALO_R * R_PX; }
+            if (c == 2) { k = K_BALL; sc = R_PX + 1.0; }
+            if (c == 3) { k = K_VLINE; sc = 0.8 + 1.0; }
+            var t : i64 = 0;
+            while (t < 300) {
+                const sy = 0.0 - 200.0 + @as(f64, @floatFromInt(t)) * 7.7 + @as(f64, @floatFromInt(t)) / 3.0;
+                const sw = sy + 360.25;
+                const lo = row_lo(splat_top(k, sy, sc));
+                const hi = row_hi(splat_bot(k, sy, sw, sc));
+                if (hi - lo + 1 > span_max(splat_bot(k, sy, sw, sc) - splat_top(k, sy, sc))) {
+                    wide = wide + 1;
+                }
+                var py : i32 = 0;
+                while (py < FRAME_H) {
+                    if (touches_row(k, m, sy, sw, sc, @as(f64, @floatFromInt(py)) + 0.5)) {
+                        touched = touched + 1;
+                        if (py < lo || py > hi) {
+                            missed = missed + 1;
+                        }
+                    }
+                    py = py + 1;
+                }
+                t = t + 1;
+            }
+            c = c + 1;
+        }
+        m = m + 1;
+    }
+    assert(missed == 0);
+    assert(wide == 0);
+    assert(touched > 100000);
+    // a splat wholly above the frame is listed under no row; one at its last row only there
+    assert(row_lo(splat_top(K_DOT, 0.0 - 300.0, 3.0)) > row_hi(splat_bot(K_DOT, 0.0 - 300.0, 0.0, 3.0)));
+    assert(row_hi(splat_bot(K_DOT, 1919.5, 0.0, 0.25)) == FRAME_H - 1);
+    // an image is never on a row above the floor, a vertical line never off its ends
+    assert(touches_row(K_DOT, 1, FLOOR_PX, 0.0, 3.0, FLOOR_PX - 0.5) == false);
+    assert(touches_row(K_DOT, 0, FLOOR_PX, 0.0, 3.0, FLOOR_PX - 0.5));
+    assert(touches_row(K_VLINE, 0, TUBE_TOP, FLOOR_PX, 1.8, TUBE_TOP - 0.5) == false);
+    assert(touches_row(K_VLINE, 0, TUBE_TOP, FLOOR_PX, 1.8, TUBE_TOP + 0.5));
+}
+
+test "the row index fits its buffer in every frame, and a u16 names every splat" {
+    assert(index_bound() <= @as(i64, @intCast(INDEX_CAP)));
+    assert(index_bound() > 2 * total_dots() * 5);
+    assert(MAX_SPLATS <= 65536);
+    assert(span_max(70.0) == 75);
+    assert(span_max(70.25) == 76);
+}
+
 test "a dot reaches its letter on the critically damped path and never overshoots" {
     // 0.5 s: the integrated controller is within 0.5 percent of x0 (1 + w t) e^(-w t)
     assert(@abs(pd_after(240, 500.0, 0, 1.0) - pd_closed(0.5, 500.0, 1.0)) < 2.5);
@@ -1321,6 +1632,61 @@ test "the field is near-black and a lit dot is bright without clipping" {
     assert(expose(COL[2]) < expose(COL[1]));
 }
 
+test "a row's light comes from its centre alone" {
+    // on the key light's centre line its factor is exactly 1, and the mirror sees that line as far
+    // below the floor as the key is above it
+    assert(row_key(KEY_Y) == 1.0);
+    assert(row_key(2.0 * FLOOR_PX - KEY_Y) == 1.0);
+    assert(row_key(FLOOR_PX + 0.5) == key_w(FLOOR_PX - 0.5 - KEY_Y));
+    // no glint and no image above the floor or on the floor line itself
+    assert(row_glint(FLOOR_PX) == 0.0);
+    assert(row_fade(FLOOR_PX) == 0.0);
+    assert(row_glint(FLOOR_PX - 0.5) == 0.0);
+    assert(row_fade(FLOOR_PX - 0.5) == 0.0);
+    // one glint width below the floor the glint is e^-1/2, one fade length below the image e^-1
+    assert(row_glint(FLOOR_PX + GLINT_W) == @exp(0.0 - 0.5));
+    assert(row_fade(FLOOR_PX + FADE) == @exp(0.0 - 1.0));
+    // the raster's row factors give the backdrop, bit for bit, on every 7th row and 13th column
+    var bad : i64 = 0;
+    var seen : i64 = 0;
+    var py : i32 = 0;
+    while (py < FRAME_H) {
+        const y = @as(f64, @floatFromInt(py)) + 0.5;
+        var px : i32 = 0;
+        while (px < FRAME_W) {
+            const x = @as(f64, @floatFromInt(px)) + 0.5;
+            const b = back_light(key_w(x - KEY_X), row_key(y), glint_x(x - TUBE_X), row_glint(y), y > FLOOR_PX);
+            if (b != backdrop(x, y)) {
+                bad = bad + 1;
+            }
+            seen = seen + 1;
+            px = px + 13;
+        }
+        py = py + 7;
+    }
+    assert(bad == 0);
+    assert(seen == 23100);
+}
+
+test "the empty scene's bytes are the ones the reel writes where no splat has been" {
+    assert(light_byte(0.0) == 0);
+    assert(light_byte(100.0) == 255);
+    assert(light_byte(BG) == 10);
+    // read off frame 0 of the reel, whose pixels here no splat reaches: the corners, the key
+    // light's centre, and the floor line by the tube, just above it and just below
+    assert(light_byte(backdrop(0.5, 0.5) * TINT_R) == 11);
+    assert(light_byte(backdrop(0.5, 0.5) * TINT_G) == 10);
+    assert(light_byte(backdrop(0.5, 0.5) * TINT_B) == 9);
+    assert(light_byte(backdrop(1079.5, 0.5) * TINT_R) == 12);
+    assert(light_byte(backdrop(1079.5, 1919.5) * TINT_G) == 8);
+    assert(light_byte(backdrop(0.5, 1919.5) * TINT_B) == 7);
+    assert(light_byte(backdrop(760.5, 979.5) * TINT_R) == 18);
+    assert(light_byte(backdrop(859.5, 1639.5) * TINT_R) == 14);
+    assert(light_byte(backdrop(859.5, 1640.5) * TINT_R) == 35);
+    assert(light_byte(backdrop(859.5, 1640.5) * TINT_G) == 32);
+    assert(light_byte(backdrop(859.5, 1640.5) * TINT_B) == 29);
+}
+
 test "a ball is lit from up-left, has a rim, and its mirror image is lit from below" {
     const hx = -0.23;
     const hy = -0.30;
@@ -1339,4 +1705,57 @@ test "the last ball lands in time for the closing lines to settle" {
     // the closing lines start 66 frames after the last landing and need about 90 frames to settle
     assert(land_frame(19) + 66 + 90 < FRAMES);
     assert(release_frame(19) == 258);
+}
+
+test "the shards of every n from 1 to 64 tile the reel in order, with no gap and no overlap" {
+    var n : i32 = 1;
+    while (n <= 64) {
+        assert(shard_a(0, n) == 0);
+        assert(shard_b(n - 1, n) == FRAMES);
+        var total : i32 = 0;
+        var k : i32 = 0;
+        while (k < n) {
+            assert(shard_b(k, n) > shard_a(k, n));
+            if (k > 0) {
+                assert(shard_a(k, n) == shard_b(k - 1, n));
+            }
+            total = total + shard_b(k, n) - shard_a(k, n);
+            k = k + 1;
+        }
+        assert(total == FRAMES);
+        n = n + 1;
+    }
+}
+
+test "48 shards are 9 or 10 frames each, and FRAMES shards are one frame each" {
+    assert(shard_b(0, 48) - shard_a(0, 48) == 9);
+    assert(shard_b(47, 48) - shard_a(47, 48) == 10);
+    var k : i32 = 0;
+    while (k < FRAMES) {
+        assert(shard_a(k, FRAMES) == k);
+        assert(shard_b(k, FRAMES) == k + 1);
+        k = k + 1;
+    }
+}
+
+test "a count is read from its leading digits, and anything else falls back" {
+    assert(count_or("", 7) == 7);
+    assert(count_or("x3", 7) == 7);
+    assert(count_or("12", 7) == 12);
+    assert(count_or("48\n", 7) == 48);
+    assert(count_or("0", 7) == 0);
+    assert(count_or("123456", 7) == 1234);
+}
+
+test "a shard that cannot be rendered as asked renders the whole reel" {
+    assert(shard_n(0, 1) == 1);
+    assert(shard_n(48, 48) == 1);
+    assert(shard_n(0, 0) == 1);
+    assert(shard_n(0 - 1, 4) == 1);
+    assert(shard_n(0, FRAMES + 1) == 1);
+    assert(shard_k(48, 48) == 0);
+    assert(shard_n(3, 48) == 48);
+    assert(shard_k(3, 48) == 3);
+    assert(shard_a(shard_k(9, 4), shard_n(9, 4)) == 0);
+    assert(shard_b(shard_k(9, 4), shard_n(9, 4)) == FRAMES);
 }
