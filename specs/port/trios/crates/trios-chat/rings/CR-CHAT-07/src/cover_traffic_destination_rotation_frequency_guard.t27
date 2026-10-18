@@ -1,0 +1,453 @@
+module port::trios::crates::trios-chat::rings::CR-CHAT-07::src::cover_traffic_destination_rotation_frequency_guard;
+
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-07/src/cover_traffic_destination_rotation_frequency_guard.rs
+// (CR-CHAT-07 - Cover traffic destination rotation frequency
+// guard, Wave-133 Lane A, R-CHAT-10).
+//
+// Cover traffic must rotate destinations: one destination
+// always receiving cover reads as the real recipient, cover
+// frequency matched against real timing correlates them, and
+// watching which destinations are active while the user types
+// narrows the candidate set by intersection. The rules, in the
+// original's order: the batch ceiling, then per emission the
+// zero-destination probe, the repeated-emission-id scan and the
+// strictly-increasing timestamp, then over the whole batch the
+// per-destination ceiling and the unique-destination floor.
+//
+// The original returns Result<(), DestRotationError>. This port
+// carries the verdict as a named struct (owner decision D5): Ok
+// first, then the six variants in the original's declaration
+// order - TooManyPerDest, ZeroDest, TooFewDests, NonMonotonic,
+// DuplicateEmissionId, TooMany - with every payload field: the
+// offending destination bytes, its count and the ceiling for
+// TooManyPerDest, idx with prev and current for NonMonotonic,
+// idx for the zero and duplicate rules, and got with min or max
+// for the batch bounds.
+//
+// The BTreeSet id dedup becomes a scan over the emissions
+// already visited; the BTreeMap destination counter becomes the
+// per-emission scan - the count of a destination is the number
+// of earlier-or-equal emissions sharing its bytes, so the
+// per-destination ceiling check walks every emission once and
+// counts. The unique-destination count is the distinct-value
+// scan of the distribution lane.
+
+// Maximum emissions per destination.
+pub const CDRF_MAX_PER_DEST: usize = 10;
+
+// Minimum unique destinations.
+pub const CDRF_MIN_DESTINATIONS: usize = 3;
+
+// Maximum emissions per batch.
+pub const CDRF_MAX_EMISSIONS: usize = 1024;
+
+// Destination hash length.
+pub const CDRF_DEST_LEN: usize = 16;
+
+// Emission ID length.
+pub const CDRF_EMISSION_ID_LEN: usize = 32;
+
+// A cover traffic emission to a destination.
+pub struct DestEmission {
+    emission_id: [32]u8,
+    dest: [16]u8,
+    timestamp_ms: u64,
+}
+
+// Verdict codes: Ok(()) and DestRotationError's variants, in declaration order.
+pub enum DestRotationCode {
+    Ok,
+    TooManyPerDest,
+    ZeroDest,
+    TooFewDests,
+    NonMonotonic,
+    DuplicateEmissionId,
+    TooMany,
+}
+
+// The verdict of the destination rotation validation, with every
+// error payload field.
+pub struct DestRotationVerdict {
+    code: DestRotationCode,
+    idx: usize,
+    got: usize,
+    bound: usize,
+    got64: u64,
+    prev: [16]u8,
+    current: [16]u8,
+    prev_ts: u64,
+    current_ts: u64,
+}
+
+// Whole-form equality over the fixed thirty-two emission-id
+// bytes.
+pub fn emission_ids_equal(a: [32]u8, b: [32]u8) -> bool {
+    for i in 0..32 {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whole-form equality over the fixed sixteen destination bytes.
+pub fn dests_equal(a: [16]u8, b: [16]u8) -> bool {
+    for i in 0..16 {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The all-zero destination - the original's [0u8; 16] probe.
+pub fn dest_zero(d: [16]u8) -> bool {
+    for i in 0..16 {
+        if (d[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether emission i repeats an earlier emission id - the
+// original's BTreeSet insert probe, answered by a scan.
+pub fn emission_seen_before(emissions: []const DestEmission, i: usize) -> bool {
+    for j in 0..i {
+        if (emission_ids_equal(emissions[j].emission_id, emissions[i].emission_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// How many emissions of the batch carry this destination - the
+// original's BTreeMap counter, answered by a scan.
+pub fn dest_count(emissions: []const DestEmission, d: [16]u8) -> usize {
+    var count: usize = 0;
+    for i in 0..emissions.len {
+        if (dests_equal(emissions[i].dest, d)) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+// The number of distinct destinations in the batch - the
+// original's BTreeMap key count, answered by the first-occurrence
+// scan of the distribution lane.
+pub fn distinct_dests(emissions: []const DestEmission) -> usize {
+    var distinct: usize = 0;
+    for i in 0..emissions.len {
+        var seen_before: bool = false;
+        for j in 0..i {
+            if (dests_equal(emissions[j].dest, emissions[i].dest)) {
+                seen_before = true;
+            }
+        }
+        if (!seen_before) {
+            distinct = distinct + 1;
+        }
+    }
+    return distinct;
+}
+
+// [VERIFIED] Validate cover traffic destination rotation
+// frequency. Returns Ok only when every rule holds, checked in
+// the original's order: the batch ceiling, then per emission the
+// zero destination, the repeated id and the strictly-increasing
+// timestamp, then over the whole batch the per-destination
+// ceiling and the unique-destination floor.
+pub fn validate_dest_rotation(emissions: []const DestEmission) -> DestRotationVerdict {
+    if (emissions.len > CDRF_MAX_EMISSIONS) {
+        return DestRotationVerdict { code: DestRotationCode.TooMany, idx: 0, got: emissions.len, bound: CDRF_MAX_EMISSIONS, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: 0, current_ts: 0, };
+    }
+    var prev_ts: u64 = 0;
+    for i in 0..emissions.len {
+        if (dest_zero(emissions[i].dest)) {
+            return DestRotationVerdict { code: DestRotationCode.ZeroDest, idx: i, got: 0, bound: 0, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: 0, current_ts: 0, };
+        }
+        if (emission_seen_before(emissions, i)) {
+            return DestRotationVerdict { code: DestRotationCode.DuplicateEmissionId, idx: i, got: 0, bound: 0, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: 0, current_ts: 0, };
+        }
+        if (i > 0) {
+            if (emissions[i].timestamp_ms <= prev_ts) {
+                return DestRotationVerdict { code: DestRotationCode.NonMonotonic, idx: i, got: 0, bound: 0, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: prev_ts, current_ts: emissions[i].timestamp_ms, };
+            }
+        }
+        prev_ts = emissions[i].timestamp_ms;
+    }
+    for i in 0..emissions.len {
+        const count: usize = dest_count(emissions, emissions[i].dest);
+        if (count > CDRF_MAX_PER_DEST) {
+            return DestRotationVerdict { code: DestRotationCode.TooManyPerDest, idx: i, got: count, bound: CDRF_MAX_PER_DEST, got64: 0, prev: ZERO_DEST, current: emissions[i].dest, prev_ts: 0, current_ts: 0, };
+        }
+    }
+    if (emissions.len > 0) {
+        const unique: usize = distinct_dests(emissions);
+        if (unique < CDRF_MIN_DESTINATIONS) {
+            return DestRotationVerdict { code: DestRotationCode.TooFewDests, idx: 0, got: unique, bound: CDRF_MIN_DESTINATIONS, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: 0, current_ts: 0, };
+        }
+    }
+    return DestRotationVerdict { code: DestRotationCode.Ok, idx: 0, got: 0, bound: 0, got64: 0, prev: ZERO_DEST, current: ZERO_DEST, prev_ts: 0, current_ts: 0, };
+}
+
+// The all-zero destination form.
+pub const ZERO_DEST: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+// The emission ids and destinations of the fixtures, one byte
+// repeated - the original's eid(byte) and dest(byte) helpers,
+// entry by entry.
+pub const EID_01: [32]u8 = [32]u8{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,};
+pub const EID_02: [32]u8 = [32]u8{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,};
+pub const EID_03: [32]u8 = [32]u8{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,};
+pub const EID_04: [32]u8 = [32]u8{4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,};
+pub const EID_05: [32]u8 = [32]u8{5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,};
+pub const EID_06: [32]u8 = [32]u8{6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,};
+pub const EID_07: [32]u8 = [32]u8{7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,};
+pub const EID_08: [32]u8 = [32]u8{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,};
+pub const EID_09: [32]u8 = [32]u8{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,};
+pub const EID_10: [32]u8 = [32]u8{10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,};
+pub const EID_11: [32]u8 = [32]u8{11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,};
+pub const DEST_1: [16]u8 = [16]u8{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,};
+pub const DEST_2: [16]u8 = [16]u8{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,};
+pub const DEST_3: [16]u8 = [16]u8{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,};
+
+// The rotating id bytes of the loop fixtures: i + 1 wrapped mod
+// 256 for the many-rotating walk, and the leading id bytes of
+// the max-per-dest boundary.
+pub const CDRF_ID_BYTES_30: [30]u8 = [30]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,};
+pub const CDRF_ID_BYTES_50: [50]u8 = [50]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,};
+
+// The destination bytes of the loop fixtures: ((i mod 5) + 1).
+pub const CDRF_DEST_BYTES_11: [11]u8 = [11]u8{1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,};
+pub const CDRF_DEST_BYTES_50: [50]u8 = [50]u8{1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5,};
+
+pub const CDRF_EID6_1025: [1025]u8 = [1025]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4,};
+pub const CDRF_EID7_1025: [1025]u8 = [1025]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 0, 1,};
+
+// **CDRF-01** - too many per destination rejected: eleven
+// emissions all to destination one.
+test cdrf_01_too_many_per_dest_rejected {
+    var es: [11]DestEmission;
+    for i in 0..11 {
+        var id: [32]u8 = [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        id[0] = CDRF_ID_BYTES_30[i];
+        es[i] = DestEmission { emission_id: id, dest: DEST_1, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.TooManyPerDest);
+    assert(v.got == 11);
+    assert(v.bound == 10);
+    assert(dests_equal(v.current, DEST_1));
+}
+
+// **CDRF-02** - the zero destination rejected.
+test cdrf_02_zero_dest_rejected {
+    const es: [1]DestEmission = [1]DestEmission{
+        DestEmission { emission_id: EID_01, dest: ZERO_DEST, timestamp_ms: 1000, },
+    };
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.ZeroDest);
+    assert(v.idx == 0);
+}
+
+// **CDRF-03** - too few unique destinations rejected: three
+// emissions, one destination.
+test cdrf_03_too_few_dests_rejected {
+    const es: [3]DestEmission = [3]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 1000, },
+        DestEmission { emission_id: EID_02, dest: DEST_1, timestamp_ms: 2000, },
+        DestEmission { emission_id: EID_03, dest: DEST_1, timestamp_ms: 3000, },
+    };
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.TooFewDests);
+    assert(v.got == 1);
+    assert(v.bound == 3);
+}
+
+// **CDRF-04** - a non-monotonic timestamp rejected: 1000 after
+// 2000.
+test cdrf_04_non_monotonic_rejected {
+    const es: [2]DestEmission = [2]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 2000, },
+        DestEmission { emission_id: EID_02, dest: DEST_2, timestamp_ms: 1000, },
+    };
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.NonMonotonic);
+    assert(v.idx == 1);
+    assert(v.prev_ts == 2000);
+    assert(v.current_ts == 1000);
+}
+
+// **CDRF-05** - a duplicate emission id rejected.
+test cdrf_05_duplicate_id_rejected {
+    const es: [2]DestEmission = [2]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 1000, },
+        DestEmission { emission_id: EID_01, dest: DEST_2, timestamp_ms: 2000, },
+    };
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.DuplicateEmissionId);
+    assert(v.idx == 1);
+}
+
+// **CDRF-06** - too many rejected: 1025 emissions of a maximum
+// 1024, built in a loop like the original's, ids carrying the
+// big-endian u64 of their index plus one, destinations rotating
+// over five values. The batch rule fires before any emission is
+// examined.
+test cdrf_06_too_many_rejected {
+    var es: [1025]DestEmission;
+    for i in 0..1025 {
+        var id: [32]u8 = [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        id[6] = CDRF_EID6_1025[i];
+        id[7] = CDRF_EID7_1025[i];
+        var d: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        d[0] = CDRF_DEST_BYTES_50[i % 50];
+        es[i] = DestEmission { emission_id: id, dest: d, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.TooMany);
+    assert(v.got == 1025);
+    assert(v.bound == 1024);
+}
+
+// **CDRF-07** - the valid batch accepted: two rounds over three
+// destinations, timestamps strictly increasing.
+test cdrf_07_valid_accepted {
+    const es: [6]DestEmission = [6]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 1000, },
+        DestEmission { emission_id: EID_02, dest: DEST_2, timestamp_ms: 2000, },
+        DestEmission { emission_id: EID_03, dest: DEST_3, timestamp_ms: 3000, },
+        DestEmission { emission_id: EID_04, dest: DEST_1, timestamp_ms: 4000, },
+        DestEmission { emission_id: EID_05, dest: DEST_2, timestamp_ms: 5000, },
+        DestEmission { emission_id: EID_06, dest: DEST_3, timestamp_ms: 6000, },
+    };
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.Ok);
+}
+
+// **CDRF-08** - an empty batch accepted.
+test cdrf_08_empty_accepted {
+    const es: [0]DestEmission = [0]DestEmission{};
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.Ok);
+}
+
+// **CDRF-09** - the max-per-dest boundary accepted: three
+// destinations, ten emissions each, ids walking one to thirty.
+test cdrf_09_max_per_dest_accepted {
+    var es: [30]DestEmission;
+    for i in 0..30 {
+        var id: [32]u8 = [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        id[0] = CDRF_ID_BYTES_30[i];
+        var d: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        if (i < 10) {
+            d[0] = 1;
+        }
+        if (i >= 10) {
+            if (i < 20) {
+                d[0] = 2;
+            }
+        }
+        if (i >= 20) {
+            d[0] = 3;
+        }
+        es[i] = DestEmission { emission_id: id, dest: d, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.Ok);
+}
+
+// **CDRF-10** - many rotating destinations accepted: fifty
+// emissions over five destinations.
+test cdrf_10_many_rotating_accepted {
+    var es: [50]DestEmission;
+    for i in 0..50 {
+        var id: [32]u8 = [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        id[0] = CDRF_ID_BYTES_50[i];
+        var d: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        d[0] = CDRF_DEST_BYTES_50[i];
+        es[i] = DestEmission { emission_id: id, dest: d, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_rotation(&es);
+    assert(v.code == DestRotationCode.Ok);
+}
+
+// The five helpers have direct tests (coverage: Untested 0).
+test cdrf_helpers_answer {
+    assert(emission_ids_equal(EID_01, EID_01));
+    assert(!emission_ids_equal(EID_01, EID_02));
+    assert(dests_equal(DEST_1, DEST_1));
+    assert(!dests_equal(DEST_1, DEST_2));
+    assert(dest_zero(ZERO_DEST));
+    assert(!dest_zero(DEST_1));
+    const three: [3]DestEmission = [3]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 1, },
+        DestEmission { emission_id: EID_02, dest: DEST_2, timestamp_ms: 2, },
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 3, },
+    };
+    assert(!emission_seen_before(&three, 0));
+    assert(!emission_seen_before(&three, 1));
+    assert(emission_seen_before(&three, 2));
+    assert(dest_count(&three, DEST_1) == 2);
+    assert(dest_count(&three, DEST_2) == 1);
+    assert(dest_count(&three, DEST_3) == 0);
+    assert(distinct_dests(&three) == 2);
+}
+
+// Rule order is the original's: the zero destination before the
+// repeated id, the repeated id before the timestamp, the
+// timestamp before the per-destination ceiling, the ceiling
+// before the unique-destination floor.
+test rule_order_matches_original {
+    const zero_dup: [2]DestEmission = [2]DestEmission{
+        DestEmission { emission_id: EID_01, dest: ZERO_DEST, timestamp_ms: 1, },
+        DestEmission { emission_id: EID_02, dest: ZERO_DEST, timestamp_ms: 1, },
+    };
+    const v1 = validate_dest_rotation(&zero_dup);
+    assert(v1.code == DestRotationCode.ZeroDest);
+    assert(v1.idx == 0);
+
+    const dup_backstep: [2]DestEmission = [2]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 2000, },
+        DestEmission { emission_id: EID_01, dest: DEST_2, timestamp_ms: 1000, },
+    };
+    const v2 = validate_dest_rotation(&dup_backstep);
+    assert(v2.code == DestRotationCode.DuplicateEmissionId);
+    assert(v2.idx == 1);
+
+    const backstep_crowded: [11]DestEmission = [11]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 2000, },
+        DestEmission { emission_id: EID_02, dest: DEST_1, timestamp_ms: 1000, },
+        DestEmission { emission_id: EID_03, dest: DEST_1, timestamp_ms: 3000, },
+        DestEmission { emission_id: EID_04, dest: DEST_1, timestamp_ms: 4000, },
+        DestEmission { emission_id: EID_05, dest: DEST_1, timestamp_ms: 5000, },
+        DestEmission { emission_id: EID_06, dest: DEST_1, timestamp_ms: 6000, },
+        DestEmission { emission_id: EID_07, dest: DEST_1, timestamp_ms: 7000, },
+        DestEmission { emission_id: EID_08, dest: DEST_1, timestamp_ms: 8000, },
+        DestEmission { emission_id: EID_09, dest: DEST_1, timestamp_ms: 9000, },
+        DestEmission { emission_id: EID_10, dest: DEST_1, timestamp_ms: 10000, },
+        DestEmission { emission_id: EID_11, dest: DEST_1, timestamp_ms: 11000, },
+    };
+    const v3 = validate_dest_rotation(&backstep_crowded);
+    assert(v3.code == DestRotationCode.NonMonotonic);
+    assert(v3.idx == 1);
+
+    const crowded_few: [11]DestEmission = [11]DestEmission{
+        DestEmission { emission_id: EID_01, dest: DEST_1, timestamp_ms: 1, },
+        DestEmission { emission_id: EID_02, dest: DEST_1, timestamp_ms: 2, },
+        DestEmission { emission_id: EID_03, dest: DEST_1, timestamp_ms: 3, },
+        DestEmission { emission_id: EID_04, dest: DEST_1, timestamp_ms: 4, },
+        DestEmission { emission_id: EID_05, dest: DEST_1, timestamp_ms: 5, },
+        DestEmission { emission_id: EID_06, dest: DEST_1, timestamp_ms: 6, },
+        DestEmission { emission_id: EID_07, dest: DEST_1, timestamp_ms: 7, },
+        DestEmission { emission_id: EID_08, dest: DEST_1, timestamp_ms: 8, },
+        DestEmission { emission_id: EID_09, dest: DEST_1, timestamp_ms: 9, },
+        DestEmission { emission_id: EID_10, dest: DEST_1, timestamp_ms: 10, },
+        DestEmission { emission_id: EID_11, dest: DEST_1, timestamp_ms: 11, },
+    };
+    const v4 = validate_dest_rotation(&crowded_few);
+    assert(v4.code == DestRotationCode.TooManyPerDest);
+    assert(v4.got == 11);
+}
