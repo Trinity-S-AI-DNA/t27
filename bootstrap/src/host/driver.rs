@@ -315,7 +315,7 @@ pub fn ptx_run(m: usize, n: usize, k: usize, iters: u32, stride: usize) -> anyho
     anyhow::ensure!(t::shape_ok(m, n, k), "m={} n={} k={}: refused by shape_ok in ternary_gemm_ptx.t27", m, n, k);
     let ck = |r: i32| if r == 0 { Ok(()) } else { Err(anyhow::anyhow!("CUDA driver error {}", r)) };
     let mut ptx = vec![0u8; t::PTX_CAP + 1];
-    ptx.truncate(t::emit_ptx(&mut ptx, t::PTX_CAP)); ptx.push(0);
+    let len = t::emit_ptx(&mut ptx, t::PTX_CAP); ptx.truncate(len); ptx.push(0);
     let (mut a, mut wp, mut c, mut acc) = (vec![0i8; m * k], vec![0u8; k * n / 4], vec![0i32; m * n], vec![0i32; n]);
     t::gen_wp(&mut wp, k * n, t::gen_a(&mut a, m * k, 1));
     let (mut dev, mut ctx, mut module, mut f, mut da, mut dw, mut dc, mut pm, mut pn, mut pk) = (0i32, 0usize, 0usize, 0usize, 0u64, 0u64, 0u64, m as u32, n as u32, k as u32);
