@@ -68,6 +68,7 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
 | Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; procedure below |
 | Application: reels and deck | `specs/t27f/reel.t27`, `deck.t27`, `reel_*.t27` | spec; two reels |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". A printing `main` makes t27b reject the spec |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
 When asked "how is T27F going", report against the core rows first. Progress on the applications

@@ -25,21 +25,30 @@ description: The exact commands of the t27 toolchain (tri, t27c, t27b, tri t27o)
 
 Use `./target/release/tri` and `./target/release/t27c` by path when the difference matters.
 
-## One spec, end to end
+## One spec, end to end -- fast path first
+
+The native JIT for the inner loop, the seal to skip what did not change, the Zig reference once at the end. Measured on the bench Mac, 2026-10-18, under load:
+
+| Step | Command | Cost |
+|---|---|---|
+| parse + typecheck | `./target/release/t27c check <spec>` | under 1 s |
+| inner loop, after every edit | `./target/release/t27b test <spec>` | rust_std.t27 0.89 s; rust_convert.t27 (66 tests) 13.5 s |
+| specs you did not change | `./target/release/t27c frontier --only <specs> --list` | about 5 s for 3 specs; REUSE = seal, closure and toolchain still match, so the sealed verdict stands: do not re-run its tests |
+| final gate, once | `./target/release/t27c test-report <spec>` and `tri test <spec>` | rust_std.t27 94 s; per-test assert counts and `vacuous passes N of M` |
+| seal | `./target/release/t27c seal <spec> --save`, then `--verify` | writes `.trinity/seals/<dir>_<Module>.json`; must print "all hashes MATCH"; the seal is also the REUSE key |
 
 ```bash
-export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local   # sandboxed sessions
-./target/release/t27c check specs/<dir>/<name>.t27          # parse + typecheck, fast
-./target/release/t27c test-report specs/<dir>/<name>.t27    # runs every test; per-test assert counts; "vacuous passes N of M"
-./target/release/tri test specs/<dir>/<name>.t27            # exit code gate over test-report (does not yet fail on vacuous: #10497)
-./target/release/t27c seal specs/<dir>/<name>.t27 --save    # writes .trinity/seals/<dir>_<Module>.json
-./target/release/t27c seal specs/<dir>/<name>.t27 --verify   # must print "all hashes MATCH"
+export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local   # every sandboxed shell, every time
 ```
 
+- **Do not build what already exists.** If another worktree of this checkout has release binaries, symlink them: `mkdir -p target/release && ln -sf <that worktree>/target/release/{t27c,t27b,tri} target/release/`. Build only the crate you changed, into one shared `CARGO_TARGET_DIR` (cargo's lock serializes builds), and copy the binary out right after.
+- **t27b's exit code** (`cli/t27b/README.md`): 0 pass, 1 a test failed, 2 unsupported construct, 3 front end, 4 JIT and interpreter disagree (`--check`), 5 codegen limit. Only 0 and 1 are a verdict; on any other code run `test-report` (the rule is `t27b_outcome` in `specs/tools/t27o/ledger.t27`, #10525).
+- Without the two `ZIG_*` variables, `test-report` says BLOCKED and `seal --save` refuses with "does not compile: failed to create output directory ... PermissionDenied". That is the sandbox, not the spec.
 - `t27c test <spec>` only LISTS the test blocks; it runs nothing. Never quote it as a test result.
-- A pass with 0 runtime asserts is vacuous. Read the `vacuous passes` line of `test-report` yourself until #10497 lands.
-- Negative control: copy the spec to `$TMPDIR`, break one constant, run `test-report`, and see a FAIL before you claim the tests mean anything.
+- A pass with 0 runtime asserts is vacuous; `tri test` fails on it since #10507. t27b prints only the total assert count, so the vacuity number comes from `test-report`.
+- Negative control: copy the spec to `$TMPDIR` (or beside it when it has a `use`), break one constant, run `t27b test`, and see a FAIL before you claim the tests mean anything.
 - `t27c test-report` exits 1 on FAIL and 2 on BLOCKED (did not compile).
+- `gen/` is in `.gitignore`: a generated file a crate includes by `#[path]` is committed with `git add -f`.
 
 ## Generate and lower
 
@@ -51,6 +60,7 @@ export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-lo
 ## Foreign code in
 
 - `tri t27o <file.rs> [--name N] [--oracle] [--check]` turns a Rust file into a `.t27` skeleton; refused bodies keep their signature and a comment naming the refused construct. Rules: `specs/tools/t27o/rust_convert.t27`. Rust is the only front end today; a new language is a new `specs/tools/t27o/<lang>_convert.t27` beside it (the SPICE front end for #10486 goes there).
+- The last line of every conversion is the file's count (`t27o: N fn seen, M converted ...`). Coverage on the roadmap repositories, the refusal kinds and the ten weaknesses: `docs/nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md`. How to change the converter and measure it: the `t27o` skill.
 
 ## Is someone already on it?
 
@@ -59,6 +69,7 @@ export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-lo
 
 ## Pull requests and CI
 
+- The required check `own-language` fails a PR whose hand-written foreign lines (Rust, Python, shell, ...; not specs, not `gen/`) gain more than they lose over the whole diff, beside the 40-per-file / 80-per-PR cap: glue is paid for by deleting as much hand code in the same diff. Check with `git diff --numstat origin/master...HEAD` before the first push (the `t27o` skill has the one-liner).
 - `tri pr ready <N> [--wait --required-only]` prints one `VERDICT:` line (safe to merge, DO NOT MERGE, WAIT, CANNOT TELL, NEW REASON) after classifying every failing check.
 - `tri pr landed <N> --probe S --file P` -- did the content actually reach the default branch.
 - `tri night`, `tri red now|why`, `tri ci baseline`, `tri gates ...`, `tri merging`, `tri lanes --repo t27 --base master`.

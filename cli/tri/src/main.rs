@@ -54,10 +54,14 @@ mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#89
 mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
 mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
+#[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)]
+mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525)
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
+#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
 mod renum;
 mod reseal;
 mod rtl;
@@ -424,12 +428,13 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal (rules: specs/tools/t27o/spice_convert.t27).
     T27o {
         file: String,
         /// The module name; default the file's stem.
         #[arg(long)] name: Option<String>,
         #[arg(long)] oracle: bool,
+        /// Run the oracle and test the spec: `t27b test` judges, `t27c test-report` only when t27b cannot (specs/tools/t27o/ledger.t27).
         #[arg(long)] check: bool,
         /// The t27c binary; default target/release/t27c, then t27c on PATH.
         #[arg(long)] t27c: Option<String>,
@@ -1332,6 +1337,12 @@ fn main() -> Result<()> {
 /// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
 fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>) -> Result<u8> {
     let src = fs::read(file).with_context(|| format!("reading {file}"))?;
+    if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
+        let (mut work, mut out, mut st) = (vec![0u8; 2 * src.len() + 8192], vec![0u8; 1 << 24], vec![0usize; 1 << 16]);
+        let n = spice::inventory(&src, &mut work, &mut out, &mut st);
+        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
+        return Ok(spice::exit_code(&st));
+    }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
     let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], vec![0u8; 1 << 24]);
     let n = if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
@@ -1349,6 +1360,9 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     fs::create_dir_all("specs/t27o_check")?;
     fs::write(&path, [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat())?;
     println!("{}", path.display());
+    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
+    let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
+    if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
 
