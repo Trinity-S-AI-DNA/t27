@@ -8014,6 +8014,14 @@ fn run_fpga_build(
     for module in &modules {
         let spec_file = specs_dir.join(format!("{}.t27", module));
         let out_file = gen_dir.join(format!("{}.v", module));
+        // #10300: a pin attribute (`const x_LOC : str`) marks t27b's bitstream idiom. Its
+        // pins and primitive instances are lowered by `t27b verilog`, which builds the
+        // board RTL; gen-verilog has no such lowering and would lint a file nobody ships.
+        let src = fs::read_to_string(&spec_file).with_context(|| format!("read {}", spec_file.display()))?;
+        if src.lines().any(|l| l.starts_with("const ") && l.contains("_LOC : str")) {
+            println!("  SKIP {}.v (t27b bitstream spec; `t27b verilog` lowers it)", module);
+            continue;
+        }
         let gen_cmd = if use_hir { "gen-verilog-hir" } else { "gen-verilog" };
         let status = std::process::Command::new(&t27c)
             .arg(gen_cmd)
@@ -8180,6 +8188,26 @@ endmodule
 
     let synth_json = synth_dir.join("synth.json");
 
+    let synth_script = build_dir.join("synth.ys");
+    let verilog_files = if minimal {
+        format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
+    } else {
+        format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
+    };
+    fs::write(
+        &synth_script,
+        format!(
+            // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
+            // SIMULATION` bench blocks whose $display carries non-constant
+            // args that synthesis cannot evaluate (mac.v:535; the repo
+            // convention, see suite.rs and verify_emit_bitexact.py).
+            "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
+            files = verilog_files,
+            top = top,
+            json = synth_json.display(),
+        ),
+    )?;
+
     if use_docker {
         if std::process::Command::new("docker")
             .arg("--version")
@@ -8191,25 +8219,6 @@ endmodule
             anyhow::bail!("Docker is required for synthesis but not installed. Use --smoke for gen-only, or install Yosys locally and pass --docker false.");
         }
         println!("=== Synthesizing with Yosys (Docker) ===");
-        let synth_script = build_dir.join("synth.ys");
-        let verilog_files = if minimal {
-            format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
-        } else {
-            format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
-        };
-        fs::write(
-            &synth_script,
-            format!(
-                // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
-                // SIMULATION` bench blocks whose $display carries non-constant
-                // args that synthesis cannot evaluate (mac.v:535; the repo
-                // convention, see suite.rs and verify_emit_bitexact.py).
-                "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
-                files = verilog_files,
-                top = top,
-                json = synth_json.display(),
-            ),
-        )?;
         let status = std::process::Command::new("docker")
             .args(["run", "--rm", "-v", &format!("{}:/project", repo_root.display()), "-w", "/project", "hdlc/oss-cad-suite:latest", "yosys", "-s", &format!("{}", synth_script.display())])
             .status()
@@ -8220,25 +8229,6 @@ endmodule
         println!("Synthesis complete (Docker).");
     } else {
         println!("=== Synthesizing with local Yosys ===");
-        let synth_script = build_dir.join("synth.ys");
-        let verilog_files = if minimal {
-            format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
-        } else {
-            format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
-        };
-        fs::write(
-            &synth_script,
-            format!(
-                // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
-                // SIMULATION` bench blocks whose $display carries non-constant
-                // args that synthesis cannot evaluate (mac.v:535; the repo
-                // convention, see suite.rs and verify_emit_bitexact.py).
-                "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
-                files = verilog_files,
-                top = top,
-                json = synth_json.display(),
-            ),
-        )?;
         let status = std::process::Command::new("yosys")
             .arg("-s")
             .arg(&synth_script)

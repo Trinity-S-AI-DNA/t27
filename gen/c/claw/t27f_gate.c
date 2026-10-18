@@ -68,6 +68,15 @@ static const const char* DECISION_LABELS[4] = { "reuse$", "rebuild_spec$", "rebu
 #define TABLE_HEAD "| path | digest | nodes | edges | verdict | decision | graph |$"
 #define TABLE_RULE "|---|---|---|---|---|---|---|$"
 #define SUMMARY_FOOT "nodes and edges are not measured here: the T27F exporter is t27f.wasm in the viewer, not t27c. The graph link passes the spec's raw URL as src=; the viewer does not read src= yet and opens its own spec list.$"
+#define ANNOTATIONS_PER_PATCH 50
+#define ANNOTATION_LINE 1
+#define MARK_BATCH "--batch$"
+#define LEVEL_NOTICE 0
+#define LEVEL_WARNING 1
+#define LEVEL_FAILURE 2
+static const const char* LEVEL_NAMES[3] = { "notice$", "warning$", "failure$" };
+#define ANNOTATION_TITLE "T27F seal: $"
+static const const char* VERDICT_TEXTS[6] = { "The spec matches its saved seal.$", "The spec bytes match the saved seal, but its generated code does not: the compiler moved since sealing. Reseal it with t27c seal <path> --save.$", "This spec has no saved seal under .trinity/seals/. Seal it with t27c seal <path> --save; until then this check cannot show it sealed.$", "The saved seal was made for other bytes of this spec. Reseal it with t27c seal <path> --save once its tests hold.$", "The saved seal is vacuous: the spec tests assert nothing that can fail. Add such a test, then reseal.$", "t27c seal --verify printed nothing this check can read for this spec, or its record line was malformed.$" };
 #define ROLE_CHECK 0
 #define ROLE_REPORT 1
 #define CONSUMERS 16
@@ -120,6 +129,9 @@ size_t put_query(uint8_t* out, size_t w, size_t cap, uint8_t* buf, size_t f, siz
 size_t put_row(uint8_t* out, size_t w, size_t cap, uint8_t* buf, size_t r, size_t b);
 size_t put_overflow(uint8_t* out, size_t cap);
 size_t t27f_report(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
+uint8_t verdict_level(uint8_t v, uint8_t role);
+size_t put_annotation(uint8_t* out, size_t w, size_t cap, uint8_t* buf, size_t r, size_t b, uint8_t role);
+size_t t27f_annotations(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
 bool scope_spec(uint8_t* buf, size_t f, size_t t);
 size_t t27f_scope(uint8_t* buf, size_t n, uint8_t* set, size_t scap);
 uint32_t census_specs(void);
@@ -563,6 +575,65 @@ size_t t27f_report(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
     p = put(out, p, cap, '\n');
     if ((p > cap)) {
         return put_overflow(out, cap);
+    }
+    return p;
+}
+
+uint8_t verdict_level(uint8_t v, uint8_t role) {
+    uint8_t c = verdict_conclusion(v);
+    if ((c != CONCL_FAILURE)) {
+        return LEVEL_NOTICE;
+    }
+    if ((role == ROLE_REPORT)) {
+        return LEVEL_WARNING;
+    }
+    return LEVEL_FAILURE;
+}
+
+size_t put_annotation(uint8_t* out, size_t w, size_t cap, uint8_t* buf, size_t r, size_t b, uint8_t role) {
+    size_t e = line_end(buf, r, b);
+    size_t x = text_end(buf, r, e);
+    size_t p1 = first_tab(buf, r, x);
+    size_t p2 = first_tab(buf, (p1 + 1), x);
+    uint8_t v = record_verdict(buf, r, b);
+    size_t p = put_range(out, w, cap, buf, (p1 + 1), p2);
+    p = put(out, p, cap, '\t');
+    p = put_decimal(out, p, cap, ANNOTATION_LINE);
+    p = put(out, p, cap, '\t');
+    p = put_msg(out, p, cap, LEVEL_NAMES[verdict_level(v, role)]);
+    p = put(out, p, cap, '\t');
+    p = put_msg(out, p, cap, ANNOTATION_TITLE);
+    p = put_msg(out, p, cap, VERDICT_NAMES[v]);
+    p = put(out, p, cap, '\t');
+    p = put_msg(out, p, cap, VERDICT_TEXTS[v]);
+    return put(out, p, cap, '\n');
+}
+
+size_t t27f_annotations(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
+    if ((input_readable(buf, n) == false)) {
+        return 0;
+    }
+    uint8_t role = input_role(buf, n);
+    size_t p = 0;
+    uint32_t k = 0;
+    size_t r = next_record(buf, 0, n);
+    while ((r < n)) {
+        size_t b = next_record(buf, (line_end(buf, r, n) + 1), n);
+        size_t x = text_end(buf, r, line_end(buf, r, b));
+        size_t p1 = first_tab(buf, r, x);
+        size_t p2 = first_tab(buf, (p1 + 1), x);
+        if (((record_verdict(buf, r, b) != V_SEALED) && (p2 > (p1 + 1)))) {
+            if (((k > 0) && ((k % ANNOTATIONS_PER_PATCH) == 0))) {
+                p = put_msg(out, p, cap, MARK_BATCH);
+                p = put(out, p, cap, '\n');
+            }
+            p = put_annotation(out, p, cap, buf, r, b, role);
+            k += 1;
+        }
+        r = b;
+    }
+    if ((p > cap)) {
+        return 0;
     }
     return p;
 }
@@ -1110,6 +1181,105 @@ void test_numbers_and_query_values_are_written_exactly(void) {
     assert((holds(&out, 0, w, "a%20b%26c/d:e%23$") == true));
 }
 
+void test_every_row_that_is_not_sealed_gets_one_annotation_line(void) {
+    uint8_t out[4096] = {0};
+    const char* inp = "repo\tgHashTag/tt-trinity-phi\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n@\tspecs/b.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: No saved seal found at .trinity/seals/B.json. Run with --save first.\n@\tspecs/c.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MISMATCH (saved=sha256:aa, current=sha256:bb)\n$";
+    size_t w = t27f_annotations(inp, lit_len(inp), &out, 4096);
+    assert((w > 0));
+    assert((holds(&out, 0, w, "specs/b.t27\t1\tnotice\tT27F seal: unsealed\tThis spec has no saved seal under .trinity/seals/.$") == true));
+    assert((holds(&out, 0, w, "specs/c.t27\t1\tfailure\tT27F seal: stale-seal\tThe saved seal was made for other bytes of this spec.$") == true));
+    assert((holds(&out, 0, w, "specs/a.t27$") == false));
+    assert((holds(&out, 0, w, "--batch$") == false));
+    uint32_t lines = 0;
+    size_t i = 0;
+    while ((i < w)) {
+        if ((out[i] == '\n')) {
+            lines += 1;
+        }
+        i += 1;
+    }
+    assert((lines == 2));
+}
+
+void test_the_published_copy_annotates_a_failure_as_a_warning(void) {
+    uint8_t out[4096] = {0};
+    const char* stale = "repo\tgHashTag/ghashtag.github.io\n@\tt27/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MISMATCH (saved=sha256:aa, current=sha256:bb)\n$";
+    size_t w = t27f_annotations(stale, lit_len(stale), &out, 4096);
+    assert((holds(&out, 0, w, "t27/a.t27\t1\twarning\tT27F seal: stale-seal\t$") == true));
+    assert((verdict_level(V_STALE, ROLE_CHECK) == LEVEL_FAILURE));
+    assert((verdict_level(V_UNREADABLE, ROLE_REPORT) == LEVEL_WARNING));
+    assert((verdict_level(V_TOOLCHAIN, ROLE_REPORT) == LEVEL_NOTICE));
+}
+
+void test_the_annotations_are_cut_into_batches_of_fifty(void) {
+    uint8_t inp[16384] = {0};
+    uint8_t out[32768] = {0};
+    uint32_t rows = 100;
+    while ((rows <= 101)) {
+        size_t n = put_msg(&inp, 0, 16384, "repo\tgHashTag/trios\n$");
+        uint32_t j = 0;
+        while ((j < rows)) {
+            n = put_msg(&inp, n, 16384, "@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: No saved seal found\n$");
+            j += 1;
+        }
+        assert((n < 16384));
+        size_t w = t27f_annotations(&inp, n, &out, 32768);
+        uint32_t marks = 0;
+        uint32_t before = 0;
+        uint32_t lines = 0;
+        size_t s = 0;
+        while ((s < w)) {
+            size_t e = line_end(&out, s, w);
+            if (has_prefix(MARK_BATCH, &out, s, e)) {
+                if ((marks == 0)) {
+                    before = lines;
+                }
+                marks += 1;
+            } else {
+                lines += 1;
+            }
+            s = (e + 1);
+        }
+        assert((lines == rows));
+        assert((before == ANNOTATIONS_PER_PATCH));
+        if ((rows == 100)) {
+            assert((marks == 1));
+        }
+        if ((rows == 101)) {
+            assert((marks == 2));
+        }
+        rows += 1;
+    }
+}
+
+void test_negative_control_unreadable_input_or_no_room_writes_no_annotation(void) {
+    uint8_t out[4096] = {0};
+    const char* marked = "repo\tgHashTag/trios\n--unreadable\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: parse error\n$";
+    assert((t27f_annotations(marked, lit_len(marked), &out, 4096) == 0));
+    const char* inp = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: parse error\n$";
+    assert((t27f_annotations(inp, lit_len(inp), &out, 4096) > 0));
+    assert((t27f_annotations(inp, lit_len(inp), &out, 20) == 0));
+    const char* no_path = "repo\tgHashTag/trios\n@\t\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: parse error\n$";
+    assert((t27f_annotations(no_path, lit_len(no_path), &out, 4096) == 0));
+    const char* few_tabs = "repo\tgHashTag/trios\n@\tspecs/a.t27\nspec_hash: MATCH\n$";
+    size_t w = t27f_annotations(few_tabs, lit_len(few_tabs), &out, 4096);
+    assert((holds(&out, 0, w, "specs/a.t27\t1\tfailure\tT27F seal: unreadable\t$") == true));
+}
+
+void test_no_annotation_text_can_break_its_line(void) {
+    size_t v = 0;
+    while ((v < 6)) {
+        size_t k = 0;
+        while ((VERDICT_TEXTS[v][k] != LIST_END)) {
+            assert((VERDICT_TEXTS[v][k] != '\t'));
+            assert((VERDICT_TEXTS[v][k] != '\n'));
+            k += 1;
+        }
+        assert((k > 20));
+        v += 1;
+    }
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1141,7 +1311,12 @@ int main(void) {
     test_negative_control_an_import_does_not_put_what_it_imports_in_scope();
     test_negative_control_a_scope_without_its_marker_or_room_fails_closed();
     test_numbers_and_query_values_are_written_exactly();
-    printf("All %d tests passed.\n", 23);
+    test_every_row_that_is_not_sealed_gets_one_annotation_line();
+    test_the_published_copy_annotates_a_failure_as_a_warning();
+    test_the_annotations_are_cut_into_batches_of_fifty();
+    test_negative_control_unreadable_input_or_no_room_writes_no_annotation();
+    test_no_annotation_text_can_break_its_line();
+    printf("All %d tests passed.\n", 28);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
