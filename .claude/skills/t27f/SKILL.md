@@ -49,6 +49,11 @@ executable visual diagrams").
   as a navigable program, linked to source, tests, issues and real task status; each cell is both a
   spec and a learning entry point.
 
+**The particle video is T27F too** (owner, 2026-10-18: "t27f is the particle video, the thing you
+were doing"). The token_floor reels (`specs/t27f/token_floor*.t27`, `lesson_reel.t27`) are the
+form of T27F the owner means when asking for a visual. The graph IR below is the inspectable form.
+Both are T27F; neither replaces the other.
+
 **What T27F is not:** it is not the topic-to-value engine. gHashTag/trinity#1677 (topic or client
 brief -> 27-lesson map -> Bee -> verified artifact) is an *application* built on T27F, and so are
 the reels. Describing T27F as #1677 is the error this section exists to stop (owner correction,
@@ -92,6 +97,20 @@ is not progress on the core.
    and UNKNOWN opaque nodes for undeclared qualified call targets, by its three stated rules.
    Anything the rules do not reach (SUGGESTED explanations, call-result flow, anything larger)
    is still a manual reading, and no host runs either pass yet. Name that gap rather than hide it.
+
+## Visual in every output (Claude Code and TRI CLAW)
+
+**The law is `specs/claw/visual_output.t27`.** This section is the order of steps; which output
+carries which visual, where it is made and where the file goes are the spec's, not repeated here.
+
+1. Decide the output's kind (`OUT_*`). Only a reply that just talks goes without a visual.
+2. Particle still or reel: render on the Railway lab (never the Mac), take the still at `STILL_MS`
+   with `ffmpeg -ss 9 -frames:v 1`, and bring it into the session folder (`out-reels/`, gitignored,
+   never `git add`). Open it in the Browser pane as `file://`, so the user sees it.
+3. Spec output: also `mcp__t27__t27f_graph` on the spec. If the corpus answers 404, say it is a
+   manual reading (`GRAPH_MANUAL`); if it is over the caps, fold it, never cut it.
+4. `t27f_view` stills: at most two headline lines per slide; pass `out` inside the session folder.
+5. Anything not made: say which and why in the answer. Never show an older file as this turn's.
 
 ## Application: topic map (gHashTag/trinity#1677)
 
