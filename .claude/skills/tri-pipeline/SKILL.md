@@ -69,6 +69,7 @@ export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-lo
 
 ## Pull requests and CI
 
+- The required check `own-language` fails a PR whose hand-written foreign lines (Rust, Python, shell, ...; not specs, not `gen/`) gain more than they lose over the whole diff, beside the 40-per-file / 80-per-PR cap: glue is paid for by deleting as much hand code in the same diff. Check with `git diff --numstat origin/master...HEAD` before the first push (the `t27o` skill has the one-liner).
 - `tri pr ready <N> [--wait --required-only]` prints one `VERDICT:` line (safe to merge, DO NOT MERGE, WAIT, CANNOT TELL, NEW REASON) after classifying every failing check.
 - `tri pr landed <N> --probe S --file P` -- did the content actually reach the default branch.
 - `tri night`, `tri red now|why`, `tri ci baseline`, `tri gates ...`, `tri merging`, `tri lanes --repo t27 --base master`.

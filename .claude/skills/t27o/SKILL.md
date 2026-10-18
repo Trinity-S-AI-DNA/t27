@@ -59,9 +59,20 @@ DRY: a std call goes through `rust_std.t27`, which names an existing t27 fn with
 4. Merge only green; enable auto-merge after reading the diff. To change a PR under auto-merge, disable it, push, enable it again.
 5. Edit the ledger row last; add a trap here when it cost more than one try.
 
+## Hand-written glue must net to zero
+
+The required check `own-language` (`check_budget` in `specs/policy/own_language.t27`) fails a pull request when the counted hand-written foreign files gain more lines than they lose over the whole diff -- on top of the 40-per-file / 80-per-PR cap. Specs and `gen/` do not count. A `#[path]` mount plus a few lines in `cmd_t27o` therefore needs an equal deletion in the same diff: dead code in `cli/tri/src` (`cargo check -p tri` lists it), or hand logic moved into a spec and replaced by a call. Check before the first push:
+
+```bash
+git diff --numstat origin/master...HEAD -- cli bootstrap/src tools scripts | awk '{a+=$1; d+=$2} END {print "added", a, "deleted", d}'
+```
+
+PR #10538 failed it with +9 / -0 at 1e20cfb34.
+
 ## Traps met on this Mac
 
-- `.claude/skills/**` is not writable from the session's own worktree in the sandbox; a checkout that touches it half-applies (index changed, file unchanged). Work in a worktree under the scratchpad: `git worktree add --no-track -b <branch> $SCRATCH/wt-x origin/master`, then `git -C $SCRATCH/wt-x config --worktree core.hooksPath .githooks`.
+- `.claude/skills/**` is not writable from the session's own worktree in the sandbox; a checkout that touches it half-applies (index changed, file unchanged). Work in a separate worktree: `git worktree add --no-track -b <branch> $TMPDIR/t27o-loop/wt-x origin/master`, then `git -C $TMPDIR/t27o-loop/wt-x config --worktree core.hooksPath .githooks`.
+- The session scratchpad is wiped when the session resumes (2026-10-18 23:53: lane worktrees, the cargo target and raw measurements gone; pushed branches survived). `$TMPDIR` survived: keep worktrees and data under `$TMPDIR/t27o-loop/`, and commit + push after every working step.
 - `--no-track` matters: the shared `.git/config` cannot be locked from the sandbox, so `-B` with tracking fails after creating the branch.
 - `gh` fails on TLS in the sandbox: use the REST and GraphQL APIs with `curl -H "Authorization: Bearer $(gh auth token)"`; write bodies to a file and build JSON with `python3`, never with backticks inside double quotes.
 - Auto-merge by API: the GraphQL mutation `enablePullRequestAutoMerge` with the PR's `node_id` and `mergeMethod: SQUASH`.
