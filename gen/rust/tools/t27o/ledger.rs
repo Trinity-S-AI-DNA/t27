@@ -230,13 +230,6 @@ pub const COVERAGE_UNKNOWN: usize = 1001;
 
 pub const KIND_CASCADE: &'static str = "uses refused";
 
-pub fn starts_at(text: &'static str, at: usize, lit: &'static str) -> bool {
-    if ((at + lit.len()) > text.len()) {
-        return false;
-    }
-    return span_is(text, at, (at + lit.len()), lit);
-}
-
 pub fn reuse_row(state: u32) -> bool {
     return (state == K_FRESH);
 }
@@ -369,6 +362,109 @@ pub const V_VACUOUS: u8 = 1;
 
 pub const V_VERIFIED: u8 = 0;
 
+pub fn cell_from(text: &'static str, o: usize, e: usize, k: u8) -> usize {
+    return value_from(text, key_at(text, o, e, 3, column(k)));
+}
+
+pub fn cell_to(text: &'static str, o: usize, e: usize, k: u8) -> usize {
+    return value_to(text, key_at(text, o, e, 3, column(k)));
+}
+
+pub fn column(k: u8) -> &'static str {
+    if (k == 0) {
+        return "file";
+    }
+    if (k == 1) {
+        return "reference";
+    }
+    if (k == 2) {
+        return "t27b";
+    }
+    if (k == 3) {
+        return "tests";
+    }
+    return "asserts";
+}
+
+pub fn glob(pat: &'static str, s: &'static str, from: usize, to: usize) -> bool {
+    let mut p: usize = 0;
+    let mut i: usize = from;
+    let mut star: usize = pat.len();
+    let mut mark: usize = from;
+    while (i < to) {
+        if ((p < pat.len()) && ((pat.as_bytes()[(p) as usize] == 63) || (pat.as_bytes()[(p) as usize] == s.as_bytes()[(i) as usize]))) {
+            p = (p + 1);
+            i = (i + 1);
+        } else {
+            if ((p < pat.len()) && (pat.as_bytes()[(p) as usize] == 42)) {
+                star = p;
+                mark = i;
+                p = (p + 1);
+            } else {
+                if (star == pat.len()) {
+                    return false;
+                }
+                p = (star + 1);
+                mark = (mark + 1);
+                i = mark;
+            }
+        }
+    }
+    while ((p < pat.len()) && (pat.as_bytes()[(p) as usize] == 42)) {
+        p = (p + 1);
+    }
+    return (p == pat.len());
+}
+
+pub fn key_at(text: &'static str, from: usize, stop: usize, ind: usize, key: &'static str) -> usize {
+    let mut at: usize = from;
+    while ((at < stop) && (at < text.len())) {
+        let end: usize = line_end(text, at);
+        let v: usize = key_value(text, at, end, ind, key);
+        if (v <= end) {
+            return v;
+        }
+        at = (end + 1);
+    }
+    return (text.len() + 1);
+}
+
+pub fn key_value(text: &'static str, at: usize, end: usize, ind: usize, key: &'static str) -> usize {
+    let v: usize = (((at + ind) + key.len()) + 4);
+    if (v > end) {
+        return (end + 1);
+    }
+    let mut k: usize = 0;
+    while (k < ind) {
+        if (text.as_bytes()[((at + k)) as usize] != 32) {
+            return (end + 1);
+        }
+        k = (k + 1);
+    }
+    if (text.as_bytes()[((at + ind)) as usize] != 34) {
+        return (end + 1);
+    }
+    if (span_is(text, ((at + ind) + 1), (((at + ind) + 1) + key.len()), key) == false) {
+        return (end + 1);
+    }
+    if (((text.as_bytes()[((v - 3)) as usize] != 34) || (text.as_bytes()[((v - 2)) as usize] != 58)) || (text.as_bytes()[((v - 1)) as usize] != 32)) {
+        return (end + 1);
+    }
+    return v;
+}
+
+pub fn line_end(text: &'static str, at: usize) -> usize {
+    let mut k: usize = at;
+    while ((k < text.len()) && (text.as_bytes()[(k) as usize] != 10)) {
+        k = (k + 1);
+    }
+    return k;
+}
+
+pub fn matches(text: &'static str, o: usize, e: usize, pat: &'static str) -> bool {
+    return glob(pat, text, cell_from(text, o, e, 0), cell_to(text, o, e, 0));
+}
+
 pub fn name(v: u8) -> &'static str {
     if (v == V_VERIFIED) {
         return "verified";
@@ -403,5 +499,120 @@ pub fn span_is(text: &'static str, from: usize, to: usize, lit: &'static str) ->
         k = (k + 1);
     }
     return true;
+}
+
+pub fn value_from(text: &'static str, v: usize) -> usize {
+    if (v >= text.len()) {
+        return text.len();
+    }
+    if (text.as_bytes()[(v) as usize] == 34) {
+        return (v + 1);
+    }
+    return v;
+}
+
+pub fn value_to(text: &'static str, v: usize) -> usize {
+    if (v >= text.len()) {
+        return text.len();
+    }
+    let mut e: usize = line_end(text, v);
+    if ((e > v) && (text.as_bytes()[((e - 1)) as usize] == 44)) {
+        e = (e - 1);
+    }
+    if (((text.as_bytes()[(v) as usize] == 34) && (e > (v + 1))) && (text.as_bytes()[((e - 1)) as usize] == 34)) {
+        e = (e - 1);
+    }
+    if (e < value_from(text, v)) {
+        return value_from(text, v);
+    }
+    return e;
+}
+
+pub const HAVE: &'static str = "$HAVE";
+
+pub const V_CHECK_CONFLICT: u8 = 0;
+
+pub const V_CHECK_DRIFT: u8 = 2;
+
+pub const V_CHECK_MATCH: u8 = 1;
+
+pub const V_WRITE_CONFLICT: u8 = 3;
+
+pub const V_WRITE_MATCH: u8 = 4;
+
+pub const WANT: &'static str = "$WANT";
+
+pub fn line(v: u8, k: u8) -> &'static str {
+    if (v == V_CHECK_CONFLICT) {
+        if (k == 0) {
+            return "bootstrap/stage0/FROZEN_HASH still holds conflict markers.";
+        }
+        if (k == 1) {
+            return "Neither side is right after a merge: each hash describes its own";
+        }
+        return "side's bootstrap/src/compiler.rs, not the merged bytes. Run `tri reseal write`.";
+    }
+    if (v == V_CHECK_MATCH) {
+        return "seal matches: $WANT";
+    }
+    if (v == V_CHECK_DRIFT) {
+        if (k == 0) {
+            return "seal:   $HAVE";
+        }
+        if (k == 1) {
+            return "actual: $WANT";
+        }
+        if (k == 2) {
+            return "";
+        }
+        if (k == 3) {
+            return "`cargo build` in bootstrap/ reads the first token and will refuse";
+        }
+        if (k == 4) {
+            return "until these agree.";
+        }
+        return "If the change to bootstrap/src/compiler.rs is deliberate: tri reseal write";
+    }
+    if (v == V_WRITE_MATCH) {
+        return "seal already matches ($WANT); nothing written.";
+    }
+    if (k == 0) {
+        if (v == V_WRITE_CONFLICT) {
+            return "bootstrap/stage0/FROZEN_HASH held conflict markers; both candidates discarded.";
+        }
+        return "was:  $HAVE";
+    }
+    if (k == 1) {
+        return "now:  $WANT";
+    }
+    return "sealed bootstrap/src/compiler.rs";
+}
+
+pub fn starts_at(raw: &'static str, at: usize, lit: &'static str) -> bool {
+    if ((at + lit.len()) > raw.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < lit.len()) {
+        if (raw.as_bytes()[((at + k)) as usize] != lit.as_bytes()[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
+}
+
+pub fn verdict(conflicted: bool, matches: bool, write: bool) -> u8 {
+    let mut base: u8 = V_CHECK_CONFLICT;
+    if write {
+        base = V_WRITE_CONFLICT;
+    }
+    if conflicted {
+        return base;
+    }
+    if matches {
+        return (base + 1);
+    }
+    return (base + 2);
 }
 
