@@ -121,6 +121,14 @@ This triggers automatic branch creation for the next phase.
 
 Load these skills when their functionality matches the task.
 
+### Model routing (owner directive 2026-10-18)
+
+The orchestrating session runs on **Opus 5.5**; every sub-task it delegates (implement, port, search,
+test, docs, fix) runs on **Sonnet 5.5**, and escalates to Opus only after 2 failed attempts or on the
+owner's word. The law is `specs/claw/model_route.t27`; how to follow it is the `model-routing` skill.
+`.claude/settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL` and each agent in `.claude/agents/` names its
+model.
+
 ---
 
 ## FPGA hardware & flashing (SSOT)
@@ -178,6 +186,17 @@ See [`docs/T27-CONSTITUTION.md`](docs/T27-CONSTITUTION.md#2--invariant-laws-neve
 ---
 
 **Repository:** Trinity S³AI — **t27** (spec-first ternary / TRI-27). **φ² + 1/φ² = 3 | TRINITY**
+
+## T27F is the visual spec of `.t27`
+
+T27F means one thing: every `.t27` spec gets a visual form -- one spec, one synchronized model,
+many views (source, architecture, data flow, dependencies, tests), every node labelled exact,
+derived, suggested or unknown and linked to its source span (gHashTag/trinity#1648, RFC
+gHashTag/trinity#1649). It is **not** the topic-to-value engine: gHashTag/trinity#1677 and the
+reels are applications built on T27F. Owner correction, 2026-10-17.
+
+This is a pointer. The definition, and what exists versus what is still missing, live in one
+place: `.claude/skills/t27f/SKILL.md`, section "What T27F is".
 
 ## Own language first
 
