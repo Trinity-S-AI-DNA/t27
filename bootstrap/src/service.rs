@@ -5687,7 +5687,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     }
     if poisoned > 0 { anyhow::bail!("{poisoned} reused verdict(s) disagree with their rerun (specs/verified/verdict_audit.t27)") }
     // --watch (#8737 H5): rerun every spec whose closure digest changed since the last look (watch.t27).
-    let mut last: std::collections::HashMap<String, String> = Default::default();
+    let (mut last, mut gens): (std::collections::HashMap<String, String>, std::collections::HashMap<String, [String; 4]>) = Default::default(); // gens (#10237): the four gen hashes at the first look or last rerun; a moved digest over unchanged ones is not rerun (watch_skip), its digest is still recorded
     // #8821: stat every file the last walk read, before walking, and walk only when one moved (watch_walk)
     let stat = |p: &str| { use std::os::unix::fs::MetadataExt; std::fs::metadata(p).map(|m| (m.mtime(), m.mtime_nsec(), m.len(), m.ino())).unwrap_or_default() };
     let mut seen: std::collections::HashMap<String, (i64, i64, u64, u64)> = Default::default();
@@ -5697,16 +5697,16 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         seen = looked;
         DIG.with(|m| m.borrow_mut().clear());
         let now: Vec<(String, String)> = specs.iter().map(|p| (p.clone(), digest(p, 0))).collect();
-        let changed: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect();
+        let (changed, skipped): (Vec<&(String, String)>, Vec<&(String, String)>) = { let cand: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect(); let gn = crate::suite::par_in_order(&cand, |c| gen_cached(&c.0, &tc)); let (a, b): (Vec<_>, Vec<_>) = cand.into_iter().zip(gn).partition(|(c, g)| !wt::watch_skip(gens.contains_key(&c.0), g.is_some(), g.as_ref() == gens.get(&c.0))); (a.into_iter().map(|x| x.0).collect(), b.into_iter().map(|x| x.0).collect()) };
         // #8852: reruns side by side, specs sharing a file stem on one worker (test_report names its scratch dir by stem and pid)
         let batch: Vec<&(String, String)> = changed.iter().take(wt::watch_take(changed.len() as u32) as usize).copied().collect();
         let mut stems: Vec<(String, Vec<usize>)> = Vec::new();
         for (i, (p, _)) in batch.iter().enumerate() { let st = Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(); match stems.iter_mut().find(|g| g.0 == st) { Some(g) => g.1.push(i), None => stems.push((st, vec![i])) } }
         // #8956: each verdict prints the moment its rerun ends, from the worker that ran it; the digests are recorded after
         let done = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| { let p = &batch[i].0; let r = crate::test_report::run(Path::new(p), Path::new("specs")); println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); i }).collect::<Vec<_>>());
-        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); }
+        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); if let Some(g) = gen_cached(p, &tc) { gens.insert(p.clone(), g); } } for (p, d) in &skipped { last.insert(p.clone(), d.clone()); }
         if changed.len() as u32 > wt::WATCH_BATCH { println!("watch: {} more changed specs wait for the next look", changed.len() as u32 - wt::WATCH_BATCH) }
-        for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
+        if last.is_empty() { for (p, g) in specs.iter().zip(crate::suite::par_in_order(&specs, |p| gen_cached(p, &tc))) { if let Some(g) = g { gens.insert(p.clone(), g); } } } for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
         std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64));
     }
     Ok(())
