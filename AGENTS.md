@@ -142,6 +142,7 @@ reusable workflow. Epic #9271.
 | Docs, release checklist, competitors | [`docs/claw/`](docs/claw/README.md) |
 | The GitHub App | [github.com/apps/tri-claw](https://github.com/apps/tri-claw), id 5166765, installed on all repositories. It is the reviewer-bee identity ([`tools/bees/README.md`](tools/bees/README.md)): bees approve under its name, so a review is never the author approving itself. It also posts the `claw/t27f` check below |
 | T27F check `claw/t27f` (#10268): changed specs and their direct importers, judged by their seals | law [`specs/claw/t27f_gate.t27`](specs/claw/t27f_gate.t27), lowered to `gen/c/claw/t27f_gate.c`; run every 10 minutes by the `claw-t27f` job of `.github/workflows/gate-topology.yml` |
+| SARIF alerts `claw/sarif` (#10356): a changed spec that does not parse or is unwritten, as a code-scanning alert | adapter [`specs/claw/sarif_feed.t27`](specs/claw/sarif_feed.t27) over [`specs/claw/sarif.t27`](specs/claw/sarif.t27), lowered to `gen/c/claw/sarif_feed.c`; run on every pull request by the `claw-sarif` job of `.github/workflows/gate-topology.yml` |
 
 The `claw/t27f` check: one scheduled job in this repository posts it on every
 open pull request that touches `.t27`, in each repository the App is installed

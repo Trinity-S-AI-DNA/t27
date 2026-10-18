@@ -13,6 +13,7 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Drift audit in CI | `gate-topology` workflow, "claw drift" step | T3, this branch |
 | GitHub App manifest | release step, see `docs/claw/RELEASE.md` | T4, deferred to App setup |
 | T27F check in every `.t27` repository | `specs/claw/t27f_gate.t27`, the `claw-t27f` job of `gate-topology.yml` | #10268, live once the owner steps below are done |
+| SARIF code-scanning alerts on a pull request | `specs/claw/sarif_feed.t27` over `specs/claw/sarif.t27`, the `claw-sarif` job of `gate-topology.yml` | #10356, live once the owner steps below are done |
 | Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
@@ -30,6 +31,18 @@ steps, it posts nothing:
 2. Accept the new permission on the App's installation for gHashTag.
 3. Set the secret `CLAW_APP_PRIVATE_KEY` in gHashTag/t27 to the App's private key.
 4. Set the variable `CLAW_APP_ID` in gHashTag/t27 to `5166765`.
+
+## SARIF code-scanning alerts on a pull request (#10356)
+
+On every pull request in gHashTag/t27 the `claw-sarif` job of `gate-topology.yml` runs the signed t27o-v0.1.0
+t27c (`spec-status` and `parse`) over each changed `.t27` file and uploads one SARIF run
+(category `claw/sarif`) with the token of the `code-scanning-sarif` row of `specs/claw/github_surface.t27`:
+`security_events` write and `contents` read, nothing else. A spec that does not parse is rule T27C001 (error,
+at the line:col t27c names); a spec with unwritten functions is T27C004 (warning). The adapter is
+`specs/claw/sarif_feed.t27` (lowered to `gen/c/claw/sarif_feed.c`); the document is `specs/claw/sarif.t27`.
+Rules T27C002 and T27C003 need the t27c test runner, which needs zig, and are not fed yet. It needs the secret and
+variable of steps 3 and 4 above, the App permission `security_events: write`, and code scanning enabled on the
+repository; without them the job uploads nothing and says so in its step summary.
 
 ## The inventory spec and how to regenerate it
 
