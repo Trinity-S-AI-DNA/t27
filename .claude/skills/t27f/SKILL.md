@@ -100,6 +100,19 @@ The runs are the scene lengths and must equal the spec's frame counts. Expect on
 
 Lesson main functions read `std.c.getenv`, so build them on the lab with `zig build-exe -lc`.
 
+**Adding a mode to a graph printer without moving the old ones (t27#10609, PR #10610).**
+
+- Pass the old callers a flag (`graph(..., false)`) instead of copying the printer.
+- Give the input numbers a function with a test that every input is used exactly once, in each layout.
+- Prove the old output did not move: on the lab, build the old spec (from `git show <ref>:path`) and the new one, run both on a grid of lessons, languages and voices, and `cmp -s` every graph. PR #10610 compared 96 graphs and 0 differed.
+- For a large frame, render lossless (`-c:v libx264 -qp 0`) and crop a 2x2 pixel outside every text box (`crop=2:2:x:y,format=rgb24`). The solid runs must still equal the spec's frame counts.
+
+Traps from this tick:
+
+- An untyped array literal in a test (`var a = [_]usize{...}`) becomes a Zig tuple, which cannot be indexed at runtime ("tuple field index must be comptime-known"). Declare `var a : [8]usize = undefined;` and fill it in a loop.
+- `fs-lab.sh "echo $b64a ... ; echo $b64b ..."` with two large files exits 0 and writes nothing. Upload one file per call and compare md5 on both sides.
+- zsh does not word-split `set -- $p`. Write one call per file.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
