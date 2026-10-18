@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/check_state.t27 -- whether a PR's checks are red, green or still waiting (#10617).
+; --
+; pr-dashboard.yml posts a line per open PR: "<n> failing / <m> total". On 2026-10-18 at 19:40 UTC it
+; said 21 failing for #10585, whose rollup held 21 QUEUED checks, 3 SKIPPED, 3 SUCCESS and no failure.
+; Its rule counts a check as failing when conclusion is not SUCCESS, not SKIPPED and not null; a
+; queued check's conclusion is the empty string, not null, so every queued check read as a failure.
+; A commit status has no conclusion at all (its verdict is in state), so a failed one never did.
+; A reader who trusts such a line pushes a "fix", and the push restarts every check at the back of
+; the queue (#10606). This module is the rule, stated once.
+; --
+; Input, one line per statusCheckRollup item, two TAB fields:
+;     status TAB conclusion        a check run; conclusion is `-` while it has none
+;     CONTEXT TAB state            a commit status
+; The class, per row:
+;     wait   a check run whose status is QUEUED, IN_PROGRESS, WAITING, PENDING or REQUESTED, with
+;            conclusion `-`; a commit status PENDING or EXPECTED
+;     pass   COMPLETED with SUCCESS, SKIPPED or NEUTRAL; a commit status SUCCESS
+;     fail   COMPLETED with FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE or STALE;
+;            a commit status FAILURE or ERROR
+;     bad    anything else: an unknown word, a waiting check that carries a conclusion, a COMPLETED one
+;            that does not, a row that is not two fields, a trailing carriage return, a row past
+;            CHECK_MAX_ROWS
+; Output, check_plan:
+;     C TAB checks: <p> pass, <f> failing, <w> pending, <b> unreadable of <total>
+;     V TAB red | pending | none | green
+; The verdict, first match wins: red if any check fails; pending if any waits or is unreadable (a
+; row this module cannot read is never green); none if there are no rows (no check has run, which
+; is not green either, #3248); green otherwise.
+; dashboard_counts_failing is the dashboard's per-PR rule as written in pr-dashboard.yml on
+; 2026-10-18, kept so the test that says it reads 21 failing on #10585 is the measurement itself.
+; The honest limit: the rows are the caller's reading of one PR's rollup at one moment.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawCheckState;
+
+use claw::text;
+use claw::queue_cost;
+
+pub const CHECK_MAX_ROWS : u32 = 1024;
+
+/// Classes.
+pub const K_PASS : u8 = 0;
+pub const K_FAIL : u8 = 1;
+pub const K_WAIT : u8 = 2;
+pub const K_BAD : u8 = 3;
+
+/// Verdicts.
+pub const V_RED : u8 = 0;
+pub const V_PENDING : u8 = 1;
+pub const V_NONE : u8 = 2;
+pub const V_GREEN : u8 = 3;
+
+pub const ST_COMPLETED : str = "COMPLETED";
+pub const ST_CONTEXT : str = "CONTEXT";
+pub const NO_CONCLUSION : str = "-";
+
+pub const HEAD : str = "C\tchecks: ";
+pub const HEAD_LEN : usize = 10;
+pub const COUNT_TEXTS : [4]str = [" pass, ", " failing, ", " pending, ", " unreadable of "];
+pub const COUNT_LENS : [4]usize = [7, 10, 10, 15];
+
+pub const VERDICT_TEXTS : [4]str = ["V\tred\n", "V\tpending\n", "V\tnone\n", "V\tgreen\n"];
+pub const VERDICT_LENS : [4]usize = [6, 10, 7, 8];
+
+/// A check run's status while it has no verdict.
+pub fn is_wait_status(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, "QUEUED", 6) or qc_range_is(raw, s, e, "IN_PROGRESS", 11)
+        or qc_range_is(raw, s, e, "WAITING", 7) or qc_range_is(raw, s, e, "PENDING", 7)
+        or qc_range_is(raw, s, e, "REQUESTED", 9);
+}
+
+pub fn is_pass_conclusion(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, "SUCCESS", 7) or qc_range_is(raw, s, e, "SKIPPED", 7)
+        or qc_range_is(raw, s, e, "NEUTRAL", 7);
+}
+
+pub fn is_fail_conclusion(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, "FAILURE", 7) or qc_range_is(raw, s, e, "CANCELLED", 9)
+        or qc_range_is(raw, s, e, "TIMED_OUT", 9) or qc_range_is(raw, s, e, "ACTION_REQUIRED", 15)
+        or qc_range_is(raw, s, e, "STARTUP_FAILURE", 15) or qc_range_is(raw, s, e, "STALE", 5);
+}
+
+/// The class of one row; f holds the bounds of its two fields.
+pub fn check_class(raw : []const u8, f : []const usize) -> u8 {
+    const s0 : usize = f[0];
+    const s1 : usize = f[1];
+    const c0 : usize = f[2];
+    const c1 : usize = f[3];
+    if (qc_range_is(raw, s0, s1, ST_CONTEXT, 7)) {
+        if (qc_range_is(raw, c0, c1, "SUCCESS", 7)) { return K_PASS; }
+        if (qc_range_is(raw, c0, c1, "FAILURE", 7) or qc_range_is(raw, c0, c1, "ERROR", 5)) { return K_FAIL; }
+        if (qc_range_is(raw, c0, c1, "PENDING", 7) or qc_range_is(raw, c0, c1, "EXPECTED", 8)) { return K_WAIT; }
+        return K_BAD;
+    }
+    if (qc_range_is(raw, s0, s1, ST_COMPLETED, 9)) {
+        if (is_pass_conclusion(raw, c0, c1)) { return K_PASS; }
+        if (is_fail_conclusion(raw, c0, c1)) { return K_FAIL; }
+        return K_BAD;
+    }
+    if (is_wait_status(raw, s0, s1)) {
+        if (qc_range_is(raw, c0, c1, NO_CONCLUSION, 1)) { return K_WAIT; }
+        return K_BAD;
+    }
+    return K_BAD;
+}
+
+/// The dashboard's per-PR rule (pr-dashboard.yml, 2026-10-18): failing when conclusion is not
+/// SUCCESS, not SKIPPED and not null. A commit status has no conclusion key (null); a check run
+/// with none has the empty string, which this module's rows write as `-`.
+pub fn dashboard_counts_failing(raw : []const u8, f : []const usize) -> bool {
+    if (qc_range_is(raw, f[0], f[1], ST_CONTEXT, 7)) { return false; }
+    if (qc_range_is(raw, f[2], f[3], "SUCCESS", 7)) { return false; }
+    if (qc_range_is(raw, f[2], f[3], "SKIPPED", 7)) { return false; }
+    return true;
+}
+
+pub fn check_verdict(pass : u32, fail : u32, wait : u32, bad : u32) -> u8 {
+    if (fail > 0) { return V_RED; }
+    if (wait > 0 or bad > 0) { return V_PENDING; }
+    if (pass == 0) { return V_NONE; }
+    return V_GREEN;
+}
+
+/// Counts in st[K_PASS..K_BAD]; returns the number of rows.
+pub fn check_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [4]usize = undefined;
+    var k : usize = 0;
+    while (k < 4) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var d : u8 = K_BAD;
+            if (rows < CHECK_MAX_ROWS and qc_split(raw, ls, le, &f, 2)) { d = check_class(raw, &f); }
+            st[d] += 1;
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The dashboard's failing count over the same rows; an unsplittable row is not counted.
+pub fn dashboard_failing(raw : []const u8, n : usize) -> u32 {
+    var f : [4]usize = undefined;
+    var c : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls and qc_split(raw, ls, le, &f, 2)) {
+            if (dashboard_counts_failing(raw, &f)) { c += 1; }
+        }
+        ls = le + 1;
+    }
+    return c;
+}
+
+/// The two output lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn check_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [4]u32 = undefined;
+    const rows : u32 = check_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, HEAD, HEAD_LEN);
+    var i : usize = 0;
+    while (i < 4) {
+        w = put_count(out, cap, w, st[i]);
+        w = put_str(out, cap, w, COUNT_TEXTS[i], COUNT_LENS[i]);
+        i += 1;
+    }
+    w = put_count(out, cap, w, rows);
+    w = put_str(out, cap, w, "\n", 1);
+    const v : usize = check_verdict(st[K_PASS], st[K_FAIL], st[K_WAIT], st[K_BAD]) as usize;
+    return put_str(out, cap, w, VERDICT_TEXTS[v], VERDICT_LENS[v]);
+}
+
+// ---- test helpers ----
+
+fn t_rows(dst : []u8, cap : usize, w : usize, row : str, row_len : usize, count : u32) -> usize {
+    var x : usize = w;
+    var i : u32 = 0;
+    while (i < count) {
+        x = put_str(dst, cap, x, row, row_len);
+        i += 1;
+    }
+    return x;
+}
+
+/// The rollup of #10585 at 2026-10-18 19:40 UTC.
+fn t_10585(dst : []u8, cap : usize) -> usize {
+    var x : usize = t_rows(dst, cap, 0, "QUEUED\t-\n", 9, 21);
+    x = t_rows(dst, cap, x, "COMPLETED\tSKIPPED\n", 18, 3);
+    return t_rows(dst, cap, x, "COMPLETED\tSUCCESS\n", 18, 3);
+}
+
+fn t_class(row : str, row_len : usize) -> u8 {
+    var st : [4]u32 = undefined;
+    const rows : u32 = check_counts(row, row_len, &st);
+    if (rows != 1) { return 9; }
+    var k : u8 = 0;
+    while (k < 4) {
+        if (st[k as usize] == 1) { return k; }
+        k += 1;
+    }
+    return 9;
+}
+
+// ---- tests ----
+
+test the_dashboard_reads_21_failing_on_10585_which_had_no_failure {
+    var raw : [512]u8 = undefined;
+    const n : usize = t_10585(&raw, 512);
+    assert n == 189 + 54 + 54;
+    assert dashboard_failing(&raw, n) == 21;
+    var st : [4]u32 = undefined;
+    assert check_counts(&raw, n, &st) == 27;
+    assert st[K_FAIL] == 0;
+    assert st[K_WAIT] == 21;
+    assert st[K_PASS] == 6;
+    assert st[K_BAD] == 0;
+}
+
+test the_10585_plan_says_pending_not_red {
+    var raw : [512]u8 = undefined;
+    const n : usize = t_10585(&raw, 512);
+    var out : [128]u8 = undefined;
+    const w : usize = check_plan(&raw, n, &out, 128);
+    assert buf_has(&out, w, "C\tchecks: 6 pass, 0 failing, 21 pending, 0 unreadable of 27\n", 60) == true;
+    assert buf_has(&out, w, "V\tpending\n", 10) == true;
+    assert buf_has(&out, w, "V\tred\n", 6) == false;
+}
+
+test a_failed_commit_status_is_failing_here_and_invisible_to_the_dashboard {
+    assert t_class("CONTEXT\tFAILURE\n", 16) == K_FAIL;
+    assert t_class("CONTEXT\tERROR\n", 14) == K_FAIL;
+    assert dashboard_failing("CONTEXT\tFAILURE\n", 16) == 0;
+}
+
+test each_conclusion_has_its_class {
+    assert t_class("COMPLETED\tSUCCESS\n", 18) == K_PASS;
+    assert t_class("COMPLETED\tNEUTRAL\n", 18) == K_PASS;
+    assert t_class("COMPLETED\tCANCELLED\n", 20) == K_FAIL;
+    assert t_class("COMPLETED\tTIMED_OUT\n", 20) == K_FAIL;
+    assert t_class("COMPLETED\tSTARTUP_FAILURE\n", 26) == K_FAIL;
+    assert t_class("COMPLETED\tSTALE\n", 16) == K_FAIL;
+    assert t_class("IN_PROGRESS\t-\n", 14) == K_WAIT;
+    assert t_class("CONTEXT\tEXPECTED\n", 17) == K_WAIT;
+    assert t_class("CONTEXT\tSUCCESS\n", 16) == K_PASS;
+}
+
+test an_unknown_or_inconsistent_row_is_unreadable {
+    assert t_class("QUEUED\tSUCCESS\n", 15) == K_BAD;
+    assert t_class("COMPLETED\t-\n", 12) == K_BAD;
+    assert t_class("COMPLETED\tMAYBE\n", 16) == K_BAD;
+    assert t_class("DONE\tSUCCESS\n", 13) == K_BAD;
+    assert t_class("COMPLETED\tSUCCESS\textra\n", 24) == K_BAD;
+    assert t_class("COMPLETED\tSUCCESS\r\n", 19) == K_BAD;
+    assert t_class("completed\tsuccess\n", 18) == K_BAD;
+}
+
+test an_unreadable_row_is_never_green {
+    assert check_verdict(5, 0, 0, 1) == V_PENDING;
+    var out : [128]u8 = undefined;
+    const w : usize = check_plan("COMPLETED\tSUCCESS\nCOMPLETED\tMAYBE\n", 34, &out, 128);
+    assert buf_has(&out, w, "V\tpending\n", 10) == true;
+}
+
+test no_checks_is_none_and_not_green {
+    var out : [128]u8 = undefined;
+    const w : usize = check_plan("", 0, &out, 128);
+    assert buf_has(&out, w, "0 unreadable of 0\nV\tnone\n", 25) == true;
+    assert check_verdict(0, 0, 0, 0) == V_NONE;
+}
+
+test one_failure_makes_it_red_whatever_else_waits {
+    assert check_verdict(3, 1, 20, 2) == V_RED;
+    var out : [128]u8 = undefined;
+    const w : usize = check_plan("QUEUED\t-\nCOMPLETED\tFAILURE\n", 27, &out, 128);
+    assert buf_has(&out, w, "V\tred\n", 6) == true;
+}
+
+test all_concluded_and_passing_is_green {
+    var out : [128]u8 = undefined;
+    const w : usize = check_plan("COMPLETED\tSUCCESS\nCOMPLETED\tSKIPPED\nCONTEXT\tSUCCESS\n", 52, &out, 128);
+    assert buf_has(&out, w, "3 pass, 0 failing, 0 pending, 0 unreadable of 3\nV\tgreen\n", 56) == true;
+}
+
+test the_dashboard_and_this_module_agree_once_nothing_waits {
+    const raw : str = "COMPLETED\tSUCCESS\nCOMPLETED\tFAILURE\nCOMPLETED\tSKIPPED\n";
+    assert dashboard_failing(raw, 54) == 1;
+    var st : [4]u32 = undefined;
+    assert check_counts(raw, 54, &st) == 3;
+    assert st[K_FAIL] == 1;
+}
+
+test blank_lines_are_not_rows {
+    var st : [4]u32 = undefined;
+    assert check_counts("\n\nQUEUED\t-\n\n", 12, &st) == 1;
+    assert st[K_WAIT] == 1;
+}
+
+test a_clipped_plan_still_advances_the_cursor {
+    var out : [4]u8 = undefined;
+    const w : usize = check_plan("COMPLETED\tSUCCESS\n", 18, &out, 4);
+    assert w == 10 + 1 + 7 + 1 + 10 + 1 + 10 + 1 + 15 + 1 + 1 + 8;
+    assert out[0] == 'C';
+    assert out[1] == '\t';
+}
