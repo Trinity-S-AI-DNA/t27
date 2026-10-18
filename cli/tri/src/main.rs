@@ -58,6 +58,8 @@ mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri h
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
+#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
 mod renum;
 mod reseal;
 mod rtl;
@@ -424,7 +426,7 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal (rules: specs/tools/t27o/spice_convert.t27).
     T27o {
         file: String,
         /// The module name; default the file's stem.
@@ -1332,6 +1334,12 @@ fn main() -> Result<()> {
 /// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
 fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>) -> Result<u8> {
     let src = fs::read(file).with_context(|| format!("reading {file}"))?;
+    if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
+        let (mut work, mut out, mut st) = (vec![0u8; 2 * src.len() + 8192], vec![0u8; 1 << 24], vec![0usize; 1 << 16]);
+        let n = spice::inventory(&src, &mut work, &mut out, &mut st);
+        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
+        return Ok(spice::exit_code(&st));
+    }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
     let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], vec![0u8; 1 << 24]);
     let n = if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
