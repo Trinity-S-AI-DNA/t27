@@ -298,3 +298,42 @@ mod tests {
         assert_eq!(snap.weight_addr_64(), 0x2000_0000_1000_0000);
     }
 }
+
+// `t27c ptx-run` (#10404): load the PTX that specs/igla/coder/ternary_gemm_ptx.t27 wrote, run it, count mismatches with its reference.
+#[cfg(feature = "cuda")] #[link(name = "cuda")]
+extern "C" {
+    fn cuInit(flags: u32) -> i32; fn cuDeviceGet(dev: *mut i32, ordinal: i32) -> i32;
+    fn cuCtxCreate_v2(ctx: *mut usize, flags: u32, dev: i32) -> i32; fn cuCtxSynchronize() -> i32;
+    fn cuModuleLoadData(module: *mut usize, image: *const u8) -> i32; fn cuModuleGetFunction(func: *mut usize, module: usize, name: *const u8) -> i32;
+    fn cuMemAlloc_v2(ptr: *mut u64, bytes: usize) -> i32; fn cuMemcpyHtoD_v2(dst: u64, src: *const u8, bytes: usize) -> i32;
+    fn cuMemcpyDtoH_v2(dst: *mut u8, src: u64, bytes: usize) -> i32;
+    fn cuLaunchKernel(f: usize, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32, smem: u32, stream: usize, params: *mut *mut u8, extra: usize) -> i32;
+}
+#[cfg(feature = "cuda")]
+pub fn ptx_run(m: usize, n: usize, k: usize, iters: u32, stride: usize) -> anyhow::Result<()> {
+    use crate::ternary_gemm_ptx as t;
+    anyhow::ensure!(t::shape_ok(m, n, k), "m={} n={} k={}: refused by shape_ok in ternary_gemm_ptx.t27", m, n, k);
+    let ck = |r: i32| if r == 0 { Ok(()) } else { Err(anyhow::anyhow!("CUDA driver error {}", r)) };
+    let mut ptx = vec![0u8; t::PTX_CAP + 1];
+    ptx.truncate(t::emit_ptx(&mut ptx, t::PTX_CAP)); ptx.push(0);
+    let (mut a, mut wp, mut c, mut acc) = (vec![0i8; m * k], vec![0u8; k * n / 4], vec![0i32; m * n], vec![0i32; n]);
+    t::gen_wp(&mut wp, k * n, t::gen_a(&mut a, m * k, 1));
+    let (mut dev, mut ctx, mut module, mut f, mut da, mut dw, mut dc, mut pm, mut pn, mut pk) = (0i32, 0usize, 0usize, 0usize, 0u64, 0u64, 0u64, m as u32, n as u32, k as u32);
+    let ms = unsafe {
+        ck(cuInit(0))?; ck(cuDeviceGet(&mut dev, 0))?; ck(cuCtxCreate_v2(&mut ctx, 0, dev))?;
+        ck(cuModuleLoadData(&mut module, ptx.as_ptr()))?; ck(cuModuleGetFunction(&mut f, module, b"ternary_gemm_s8\0".as_ptr()))?;
+        ck(cuMemAlloc_v2(&mut da, a.len()))?; ck(cuMemAlloc_v2(&mut dw, wp.len()))?; ck(cuMemAlloc_v2(&mut dc, c.len() * 4))?;
+        ck(cuMemcpyHtoD_v2(da, a.as_ptr() as *const u8, a.len()))?; ck(cuMemcpyHtoD_v2(dw, wp.as_ptr(), wp.len()))?;
+        let mut args: [*mut u8; 6] = [&mut da as *mut u64 as *mut u8, &mut dw as *mut u64 as *mut u8, &mut dc as *mut u64 as *mut u8,
+            &mut pm as *mut u32 as *mut u8, &mut pn as *mut u32 as *mut u8, &mut pk as *mut u32 as *mut u8];
+        let mut launch = || ck(cuLaunchKernel(f, t::grid_dim(n), t::grid_dim(m), 1, t::THREADS, 1, 1, 0, 0, args.as_mut_ptr(), 0));
+        launch()?; ck(cuCtxSynchronize())?; ck(cuMemcpyDtoH_v2(c.as_mut_ptr() as *mut u8, dc, c.len() * 4))?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { launch()?; } ck(cuCtxSynchronize())?;
+        t0.elapsed().as_secs_f64() * 1e3 / iters.max(1) as f64
+    };
+    let bad = t::mismatches(&a, &wp, &c, m, n, k, stride, &mut acc);
+    println!("ptx-run m={} n={} k={} rows_checked_every={} mismatches={} iters={} ms_per_call={:.4} tops={:.2}", m, n, k, stride.max(1), bad, iters, ms, 2.0 * (m * n * k) as f64 / ms / 1e9);
+    anyhow::ensure!(bad == 0, "{} entries differ from the t27 reference", bad);
+    Ok(())
+}
