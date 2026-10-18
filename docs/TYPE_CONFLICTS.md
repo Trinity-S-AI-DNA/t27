@@ -61,7 +61,7 @@ definition moves. `tri types classified` cross-checks the file against a live
 Non-empty drift in either direction exits non-zero. A classification nobody
 re-reads becomes a claim about a tree that no longer exists.
 
-## DRIFT -- 62 names
+## DRIFT -- 60 names
 
 One concept, two definitions. These are the ones with a repair.
 
@@ -78,7 +78,6 @@ One concept, two definitions. These are the ones with a repair.
 | `Graph` | 2 | 2 files | Have graph_bfs.t27 `use` tri::graph::graph and drop its local Graph; separately, teach the re... |
 | `HttpRequest` | 2 | 2 files | Extract one http-types module (HttpMethod, HttpHeader/HttpHeaders, HttpStatus) and have both ... |
 | `HttpResponse` | 3 | 3 files | Delete router.t27's stub and import server/http.t27's HttpResponse; then reconcile adapters.t... |
-| `HttpStatus` | 2 | 2 files | Pick `[]const u8` and have server/http.t27 import tri::net::http::HttpStatus. This is the che... |
 | `HybridBigInt` | 2 | 2 files | Highest-value fix in this slice. Choose one representation (the Option-cache + dirty version ... |
 | `Hypervector` | 2 | 2 files | Qualify the type in the contract doc (`hybrid_arithmetic::HybridBigInt`) or regenerate that s... |
 | `Issue` | 2 | 2 files | Have specs/port/scripts/tri-search.t27 use the github::issues Issue and add url there, or ren... |
@@ -90,7 +89,6 @@ One concept, two definitions. These are the ones with a repair.
 | `Match` | 2 | 2 files | Collapse Match/MatchResult/RegexMatch onto regex_advanced.t27's RegexMatch (it is already the... |
 | `MemPort` | 2 | 2 files | Make fpga/hir.t27 import Memory's MemPort rather than restate it; reconcile MAX_MEM_PORTS (4 ... |
 | `Message` | 3 | 3 files | Pick one Message and one MessageRole (with fixed discriminants) in provider/schema.t27; have ... |
-| `OptimizerStepResult` | 3 | 2 files | Two fixes: (1) delete the second body of adamw.t27 (lines ~460-end duplicate lines ~14-459) o... |
 | `PinAssignment` | 3 | 3 files | Hoist one PinAssignment (the 9-field version) into a shared boards module and have all three ... |
 | `PinMapping` | 2 | 2 files | Either give each board its own name (ArtyA7PinMapping / QMTechA100TPinMapping) or use the spe... |
 | `PolicyOutput` | 2 | 2 files | Rename to PPOPolicyOutput / SACPolicyOutput, matching the SACActorConfig convention already i... |
@@ -139,7 +137,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 48 names
+## DISTINCT -- 47 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -156,7 +154,6 @@ whether to rename.
 | `Diagnostic` | 2 | 2 files | Leave both, but rename the protocol one LspDiagnostic (or require the qualified `lsp-schema::... |
 | `Entry` | 2 | 2 files | Leave both: a consensus-chain step (mvp_v3) and a hash-table cell (port). If a reader ever collides, rename the port's to HashEntry -- port-side renames are established (#7491). |
 | `EnvVar` | 2 | 2 files | Two fixes, unrelated: (a) leave the types alone, they are genuinely different; (b) fix the fi... |
-| `Episode` | 2 | 2 files | Nothing to converge. If the name ever collides in one reader, rename lotus.t27's loop entry to `LotusStep`. |
 | `Info` | 3 | 3 files | Two things: have account/repo.t27 `use account::schema` instead of re-declaring Info and the ... |
 | `Inputs` | 4 | 4 files | Nothing to converge: the Verilog port-list convention -- every module's wire bundle is named Inputs the way every clock is clk. Follow blink_working.t27's BlinkInputs prefix if the noise ever matters. |
 | `Instance` | 3 | 3 files | Leave the three types; the ambiguity is in the name. If cross-spec resolution matters, qualif... |

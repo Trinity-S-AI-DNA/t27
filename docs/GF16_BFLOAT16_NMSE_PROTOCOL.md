@@ -148,6 +148,22 @@ The schema requires, at minimum:
 A run that omits any required field is non-conforming and must not be
 cited in TRI-NET documentation.
 
+### 6.1 Reference run harness
+
+`specs/benchmarks/gf16_bfloat16_nmse_run.t27` is the run procedure in t27:
+witness first, the two quantisers, xoshiro256pp seeded by splitmix64, the
+five distributions, and the manifest text. Its header says how it is
+driven (`t27c gen-c` plus the one-line stdin/stdout main that
+`lefthook.yml` already uses), and each manifest records the command in
+`x_extension.driver`. Two readings this document leaves open are fixed
+there and declared in every manifest's `x_extension`:
+
+- `D_PHI` reads `N(phi, 1/phi)` as mean and **variance**, so the standard
+  deviation is `sqrt(1/phi)`.
+- GF16 rounds ties to even, as section 3 asks. The frozen SSOT encoder
+  rounds ties toward zero instead. The two rules differ only on exact
+  ties, and the manifest counts those per distribution (`gf16_ties`).
+
 ---
 
 ## 7. Test obligations (L4)
