@@ -1,0 +1,553 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/suggest.t27 -- one-click formatter suggestions on a pull request: the law behind the
+; github_surface rows pr-files (pull_requests read, GET /pulls/{n}/files) and pr-suggestions
+; (pull_requests write, POST /pulls/{n}/reviews). Epic #9271.
+; Owner, 2026-10-18, translated: the App holds write on about 40 permissions; connect the GitHub
+; API where it gives .t27 value. Owner rule, standing: agents never approve a pull request.
+; --
+; The job. When a PR changes a .t27 file that `t27c fmt` would rewrite, TRI CLAW posts ONE review
+; whose comments are ```suggestion blocks; the author accepts each in one click. Everything that
+; decides WHETHER and WHERE a comment may be posted is in this file; the plumbing (fetch the file
+; list, run the formatter, diff, POST) is a thin workflow around it.
+; --
+; The five laws, each pinned by a test:
+; 1. EVENT is COMMENT and nothing else. APPROVE, REQUEST_CHANGES, PENDING, an empty string, a
+;    wrong-case string: event_for returns "" and the caller posts nothing. A review that cannot be
+;    COMMENT does not exist.
+; 2. RIGHT side only. A suggestion edits the PR head, so it anchors on the head file's lines; the
+;    LEFT side is the base and a suggestion there would propose to edit code the PR deleted.
+; 3. Lines outside the diff are skipped. GitHub rejects a review comment whose line is not in the
+;    PR diff, and one rejected comment rejects the whole review; a multi-line range must also sit
+;    inside ONE diff hunk. The diff ranges come from the `@@ -a,b +c,d @@` headers of the `patch`
+;    field of pr-files (header_new_range).
+; 4. Capped. At most MAX_COMMENTS per review and MAX_SPAN lines per suggestion; a bigger rewrite
+;    is not a one-click change and is left to `t27c fmt` on the author's side.
+; 5. Fail closed on unknown hunks. A hunk the planner cannot interpret (unknown kind, line 0,
+;    inconsistent count, overlapping another hunk of the same file) poisons its file: nothing is
+;    posted for that file, because a hunk list we cannot read is not one we may anchor on. An
+;    unknown fact never becomes a comment.
+; --
+; Hunk model: a formatter hunk says "head-file lines [start, start+count) become the replacement".
+; K_REPLACE and K_DELETE cover count >= 1 original lines (a delete suggestion has an empty body).
+; K_INSERT has count 0 (new lines go BEFORE line start); GitHub cannot anchor on nothing, so the
+; comment anchors on line `start` itself and the replacement text must repeat that line -- the
+; plumbing's job; widened() says which hunks need it.
+; The honest limit: this file decides placement, not text. It does not compute the formatter's
+; replacement lines, escape them into JSON, or call GitHub; and an adjacent insert/replace pair
+; (insert before line 5 beside a replace ending at line 5) reads as overlapping and poisons the
+; file -- fail closed costs a missed suggestion, never a wrong one.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawSuggest;
+
+/// The only review event this module ever lets through.
+pub const EVENT : str = "COMMENT";
+/// The only side a suggestion anchors on.
+pub const SIDE : str = "RIGHT";
+/// The Markdown fence that opens a suggestion block; it closes with a bare fence line.
+pub const FENCE : str = "```suggestion";
+
+/// Comments per review and lines per suggestion (law 4).
+pub const MAX_COMMENTS : u32 = 20;
+pub const MAX_SPAN : u32 = 40;
+
+/// Hunk kinds.
+pub const K_REPLACE : u8 = 0;
+pub const K_DELETE : u8 = 1;
+pub const K_INSERT : u8 = 2;
+
+/// Per-hunk verdicts. V_UNKNOWN is far from the real ones: a partial read cannot mistake it
+/// for a verdict.
+pub const V_POST : u8 = 0;
+pub const V_OUTSIDE : u8 = 1;
+pub const V_CAP : u8 = 2;
+pub const V_TOO_BIG : u8 = 3;
+pub const V_UNKNOWN : u8 = 255;
+
+/// Byte equality for two counted strings (the idiom of specs/claw/gates.t27).
+pub fn str_eq(a : str, alen : usize, b : str, blen : usize) -> bool {
+    if (alen != blen) { return false; }
+    var diff : usize = 0;
+    var i : usize = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { diff += 1; }
+        i += 1;
+    }
+    return diff == 0;
+}
+
+/// Law 1. The event a review may carry: "COMMENT" when COMMENT was asked for, "" otherwise.
+/// "" means the caller posts nothing. Nothing else can be returned, so no input reaches APPROVE.
+pub fn event_for(requested : str, requested_len : usize) -> str {
+    if (str_eq(requested, requested_len, EVENT, 7)) { return EVENT; }
+    return "";
+}
+
+/// Law 2. The side a comment may use for `side`: RIGHT when RIGHT was asked for, "" otherwise.
+pub fn side_for(requested : str, requested_len : usize) -> str {
+    if (str_eq(requested, requested_len, SIDE, 5)) { return SIDE; }
+    return "";
+}
+
+/// Whether a path names a .t27 file (only those are formatted, so only those get suggestions).
+pub fn path_is_t27(path : str, n : usize) -> bool {
+    if (n < 5) { return false; }
+    if (path[n - 4] != '.') { return false; }
+    if (path[n - 3] != 't') { return false; }
+    if (path[n - 2] != '2') { return false; }
+    if (path[n - 1] != '7') { return false; }
+    return true;
+}
+
+fn byte_at(t : []const u8, n : usize, i : usize) -> u8 {
+    if (i >= n) { return 0; }
+    return t[i];
+}
+
+fn is_digit(b : u8) -> bool {
+    return b >= '0' and b <= '9';
+}
+
+/// End index of the digit run that starts at p (p itself when there is none).
+fn num_end(t : []const u8, n : usize, p : usize) -> usize {
+    var e : usize = p;
+    while (e < n) {
+        if (is_digit(t[e]) == false) { return e; }
+        e += 1;
+    }
+    return e;
+}
+
+fn num_val(t : []const u8, p : usize, e : usize) -> u32 {
+    var v : u32 = 0;
+    var i : usize = p;
+    while (i < e) {
+        v = v * 10 + ((t[i] - '0')) as u32;
+        i += 1;
+    }
+    return v;
+}
+
+/// Law 3 input. Parse the head side of a unified-diff hunk header, `@@ -a,b +c,d @@ ...`,
+/// into out[0] = c (first head line) and out[1] = d (head line count; 1 when ",d" is omitted).
+/// false on anything malformed or on a number longer than 7 digits: no range, no comments.
+pub fn header_new_range(t : []const u8, n : usize, out : []u32) -> bool {
+    if (byte_at(t, n, 0) != '@') { return false; }
+    if (byte_at(t, n, 1) != '@') { return false; }
+    if (byte_at(t, n, 2) != ' ') { return false; }
+    if (byte_at(t, n, 3) != '-') { return false; }
+    var p : usize = 4;
+    var e : usize = num_end(t, n, p);
+    if (e == p) { return false; }
+    p = e;
+    if (byte_at(t, n, p) == ',') {
+        p += 1;
+        e = num_end(t, n, p);
+        if (e == p) { return false; }
+        p = e;
+    }
+    if (byte_at(t, n, p) != ' ') { return false; }
+    if (byte_at(t, n, p + 1) != '+') { return false; }
+    p += 2;
+    e = num_end(t, n, p);
+    if (e == p) { return false; }
+    if (e - p > 7) { return false; }
+    const start = num_val(t, p, e);
+    p = e;
+    var len : u32 = 1;
+    if (byte_at(t, n, p) == ',') {
+        p += 1;
+        e = num_end(t, n, p);
+        if (e == p) { return false; }
+        if (e - p > 7) { return false; }
+        len = num_val(t, p, e);
+        p = e;
+    }
+    if (byte_at(t, n, p) != ' ') { return false; }
+    if (byte_at(t, n, p + 1) != '@') { return false; }
+    if (byte_at(t, n, p + 2) != '@') { return false; }
+    out[0] = start;
+    out[1] = len;
+    return true;
+}
+
+/// Whether the hunk shape is one the planner can interpret: known kind, start >= 1, count
+/// consistent with kind (INSERT has none, REPLACE/DELETE have at least one).
+pub fn shape_ok(kind : u8, start : u32, count : u32) -> bool {
+    if (start < 1) { return false; }
+    if (kind == K_INSERT) { return count == 0; }
+    if (kind == K_REPLACE or kind == K_DELETE) { return count >= 1; }
+    return false;
+}
+
+/// First head line the comment anchors on. Only meaningful when shape_ok.
+pub fn first_line(start : u32) -> u32 {
+    return start;
+}
+
+/// Last head line the comment anchors on: an INSERT anchors on its own start line.
+pub fn last_line(start : u32, count : u32) -> u32 {
+    if (count == 0) { return start; }
+    return start + count - 1;
+}
+
+/// The review-comment `line` field (the last line of the range).
+pub fn comment_line(start : u32, count : u32) -> u32 {
+    return last_line(start, count);
+}
+
+/// The review-comment `start_line` field; 0 means "omit it" -- a one-line comment has none,
+/// and GitHub requires start_line < line when present.
+pub fn comment_start_line(start : u32, count : u32) -> u32 {
+    if (last_line(start, count) > start) { return start; }
+    return 0;
+}
+
+/// Whether the replacement text must repeat the anchor line (an INSERT, which has no line).
+pub fn widened(count : u32) -> bool {
+    return count == 0;
+}
+
+/// Law 3. Whether [first, last] of `file` lies inside ONE head-side diff range. The ranges are
+/// parallel arrays: dfile[k], dstart[k], dlen[k] for k < nd. An empty range (dlen 0, a pure
+/// deletion hunk) covers no head line.
+pub fn in_one_range(file : u32, first : u32, last : u32, dfile : []const u32, dstart : []const u32, dlen : []const u32, nd : usize) -> bool {
+    var k : usize = 0;
+    while (k < nd) {
+        if (dfile[k] == file and dlen[k] >= 1) {
+            if (dstart[k] <= first and last <= dstart[k] + dlen[k] - 1) { return true; }
+        }
+        k += 1;
+    }
+    return false;
+}
+
+/// Whether hunk i of nh is unreadable: bad shape, or its anchor range overlaps another hunk of
+/// the same file (two suggestions on one line cannot both be accepted).
+pub fn hunk_unknown(i : usize, nh : usize, hfile : []const u32, hstart : []const u32, hcount : []const u32, hkind : []const u8) -> bool {
+    if (shape_ok(hkind[i], hstart[i], hcount[i]) == false) { return true; }
+    const f1 = first_line(hstart[i]);
+    const l1 = last_line(hstart[i], hcount[i]);
+    var j : usize = 0;
+    while (j < nh) {
+        if (j != i and hfile[j] == hfile[i]) {
+            if (shape_ok(hkind[j], hstart[j], hcount[j])) {
+                const f2 = first_line(hstart[j]);
+                const l2 = last_line(hstart[j], hcount[j]);
+                if (f1 <= l2 and f2 <= l1) { return true; }
+            }
+        }
+        j += 1;
+    }
+    return false;
+}
+
+/// Law 5. Whether any hunk of `file` is unknown: the whole file is withheld.
+pub fn file_poisoned(file : u32, nh : usize, hfile : []const u32, hstart : []const u32, hcount : []const u32, hkind : []const u8) -> bool {
+    var i : usize = 0;
+    while (i < nh) {
+        if (hfile[i] == file) {
+            if (hunk_unknown(i, nh, hfile, hstart, hcount, hkind)) { return true; }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// The planner. Fills out[i] with the verdict of hunk i (V_POST, V_OUTSIDE, V_CAP, V_TOO_BIG or
+/// V_UNKNOWN) and returns how many hunks get a comment. Hunks post in input order until
+/// MAX_COMMENTS; an unknown hunk (law 5) takes its whole file down with it.
+pub fn plan(nh : usize, hfile : []const u32, hstart : []const u32, hcount : []const u32, hkind : []const u8, nd : usize, dfile : []const u32, dstart : []const u32, dlen : []const u32, out : []u8) -> u32 {
+    var posted : u32 = 0;
+    var i : usize = 0;
+    while (i < nh) {
+        out[i] = V_UNKNOWN;
+        if (file_poisoned(hfile[i], nh, hfile, hstart, hcount, hkind) == false) {
+            const f = first_line(hstart[i]);
+            const l = last_line(hstart[i], hcount[i]);
+            if (l - f + 1 > MAX_SPAN) {
+                out[i] = V_TOO_BIG;
+            } else if (in_one_range(hfile[i], f, l, dfile, dstart, dlen, nd) == false) {
+                out[i] = V_OUTSIDE;
+            } else if (posted >= MAX_COMMENTS) {
+                out[i] = V_CAP;
+            } else {
+                out[i] = V_POST;
+                posted += 1;
+            }
+        }
+        i += 1;
+    }
+    return posted;
+}
+
+/// A review with no comment is never posted.
+pub fn should_post(posted : u32) -> bool {
+    return posted >= 1;
+}
+
+/// How many hunks carry verdict v.
+pub fn count_verdict(v : u8, nh : usize, out : []const u8) -> u32 {
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < nh) {
+        if (out[i] == v) { n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+test event_is_never_approve {
+    // Runtime loop over every event name a caller could pass; none may come back as APPROVE
+    // (or as anything but COMMENT or the refusal).
+    var names : [8]str = ["APPROVE", "approve", "REQUEST_CHANGES", "PENDING", "", "COMMENT ", "comment", "DISMISS"];
+    for i in 0..8 {
+        const e = event_for(names[i], names[i].len);
+        assert str_eq(e, e.len, "APPROVE", 7) == false;
+        assert str_eq(e, e.len, "REQUEST_CHANGES", 15) == false;
+        assert e.len == 0;
+    }
+    const ok = event_for("COMMENT", 7);
+    assert str_eq(ok, ok.len, "COMMENT", 7) == true;
+    assert str_eq(EVENT, EVENT.len, "APPROVE", 7) == false;
+}
+
+test side_is_right_only {
+    var names : [4]str = ["LEFT", "left", "", "RIGHT "];
+    for i in 0..4 {
+        const s = side_for(names[i], names[i].len);
+        assert s.len == 0;
+    }
+    const r = side_for("RIGHT", 5);
+    assert str_eq(r, r.len, "RIGHT", 5) == true;
+    assert str_eq(SIDE, SIDE.len, "LEFT", 4) == false;
+}
+
+test lengths_pinned_to_the_bytes {
+    // event_for and side_for pass these lengths as literals; a loop keeps the asserts at runtime.
+    var names : [3]str = [EVENT, SIDE, FENCE];
+    var lens : [3]usize = [7, 5, 13];
+    for i in 0..3 { assert names[i].len == lens[i]; }
+}
+
+test only_t27_paths_are_formatted {
+    var yes : [3]str = ["specs/claw/suggest.t27", "a.t27", "x/y/z.t27"];
+    var no : [6]str = ["a.rs", "t27", ".t27", "specs/a.t27x", "specs/a.T27", "gen/a.zig"];
+    for i in 0..3 { assert path_is_t27(yes[i], yes[i].len) == true; }
+    for i in 0..6 { assert path_is_t27(no[i], no[i].len) == false; }
+}
+
+test header_parse_reads_the_head_side {
+    var out : [2]u32 = [0, 0];
+    var h1 : str = "@@ -1,4 +1,5 @@ module X";
+    assert header_new_range(h1, h1.len, out) == true;
+    assert out[0] == 1;
+    assert out[1] == 5;
+    var h2 : str = "@@ -10 +10 @@";
+    assert header_new_range(h2, h2.len, out) == true;
+    assert out[0] == 10;
+    assert out[1] == 1;
+    var h3 : str = "@@ -0,0 +1,3 @@";
+    assert header_new_range(h3, h3.len, out) == true;
+    assert out[0] == 1;
+    assert out[1] == 3;
+    var h4 : str = "@@ -5,2 +4,0 @@";
+    assert header_new_range(h4, h4.len, out) == true;
+    assert out[0] == 4;
+    assert out[1] == 0;
+    var h5 : str = "@@ -120,33 +2048,17 @@ fn f()";
+    assert header_new_range(h5, h5.len, out) == true;
+    assert out[0] == 2048;
+    assert out[1] == 17;
+}
+
+test header_parse_fails_closed {
+    var out : [2]u32 = [7, 7];
+    var bad : [9]str = ["", "@@", "@ -1 +1 @@", "@@ -1,2 +x @@", "@@ -a +1 @@", "@@ -1 +1", "@@ -1,2 +1,@@", "@@ -1 +12345678 @@", "diff --git a b"];
+    for i in 0..9 {
+        assert header_new_range(bad[i], bad[i].len, out) == false;
+        // A failed parse writes nothing.
+        assert out[0] == 7;
+        assert out[1] == 7;
+    }
+}
+
+test anchors_follow_the_hunk_kind {
+    // REPLACE of lines 10..12.
+    assert comment_line(10, 3) == 12;
+    assert comment_start_line(10, 3) == 10;
+    assert widened(3) == false;
+    // One-line REPLACE: single `line`, no start_line.
+    assert comment_line(10, 1) == 10;
+    assert comment_start_line(10, 1) == 0;
+    // INSERT before line 10 anchors on line 10 and must repeat it.
+    assert comment_line(10, 0) == 10;
+    assert comment_start_line(10, 0) == 0;
+    assert widened(0) == true;
+    // start_line < line whenever it is present.
+    for c in 0..8 {
+        const n = (c) as u32;
+        const s = comment_start_line(20, n);
+        if (s != 0) { assert s < comment_line(20, n); }
+    }
+}
+
+test shape_rejects_what_it_cannot_read {
+    assert shape_ok(K_REPLACE, 5, 2) == true;
+    assert shape_ok(K_DELETE, 5, 1) == true;
+    assert shape_ok(K_INSERT, 5, 0) == true;
+    assert shape_ok(K_REPLACE, 0, 2) == false;
+    assert shape_ok(K_REPLACE, 5, 0) == false;
+    assert shape_ok(K_DELETE, 5, 0) == false;
+    assert shape_ok(K_INSERT, 5, 1) == false;
+    var k : u8 = 3;
+    for n in 0..4 {
+        assert shape_ok(k, 5, (n) as u32) == false;
+        k += 40;
+    }
+}
+
+test planner_poisoned_file_posts_nothing_other_file_unaffected {
+    // File 1: head diff ranges [10..19] and [40..44]. File 2: [1..3].
+    var df : [3]u32 = [1, 1, 2];
+    var ds : [3]u32 = [10, 40, 1];
+    var dl : [3]u32 = [10, 5, 3];
+    // Hunks: 0 inside range 1; 1 straddles the gap (18..21); 2 inside range 2; 3 outside all;
+    // 4 an INSERT before line 12 (anchor 12, inside); 5 on file 2 inside; 6 on file 2 outside.
+    var hf : [7]u32 = [1, 1, 1, 1, 1, 2, 2];
+    var hs : [7]u32 = [11, 18, 41, 30, 12, 2, 9];
+    var hc : [7]u32 = [2, 4, 1, 1, 0, 1, 1];
+    var hk : [7]u8 = [K_REPLACE, K_REPLACE, K_DELETE, K_REPLACE, K_INSERT, K_REPLACE, K_REPLACE];
+    var out : [7]u8 = [9, 9, 9, 9, 9, 9, 9];
+    // Hunk 4 (anchor 12) overlaps hunk 0 (11..12): that poisons file 1 entirely.
+    const posted = plan(7, hf, hs, hc, hk, 3, df, ds, dl, out);
+    for i in 0..5 { assert out[i] == V_UNKNOWN; }
+    assert out[5] == V_POST;
+    assert out[6] == V_OUTSIDE;
+    assert posted == 1;
+}
+
+test planner_clean_file_classifies_each_hunk {
+    var df : [2]u32 = [1, 1];
+    var ds : [2]u32 = [10, 40];
+    var dl : [2]u32 = [10, 5];
+    // 0 inside; 1 straddles the gap 18..21 (two diff ranges: not ONE hunk); 2 delete inside;
+    // 3 outside; 4 insert before 15 (anchor 15 inside).
+    var hf : [5]u32 = [1, 1, 1, 1, 1];
+    var hs : [5]u32 = [11, 18, 41, 30, 15];
+    var hc : [5]u32 = [2, 4, 1, 1, 0];
+    var hk : [5]u8 = [K_REPLACE, K_REPLACE, K_DELETE, K_REPLACE, K_INSERT];
+    var out : [5]u8 = [9, 9, 9, 9, 9];
+    const posted = plan(5, hf, hs, hc, hk, 2, df, ds, dl, out);
+    assert out[0] == V_POST;
+    assert out[1] == V_OUTSIDE;
+    assert out[2] == V_POST;
+    assert out[3] == V_OUTSIDE;
+    assert out[4] == V_POST;
+    assert posted == 3;
+    assert count_verdict(V_POST, 5, out) == 3;
+    assert count_verdict(V_OUTSIDE, 5, out) == 2;
+    assert count_verdict(V_UNKNOWN, 5, out) == 0;
+    assert should_post(posted) == true;
+}
+
+test a_range_across_two_diff_hunks_is_not_one_hunk {
+    // Diff ranges [10..19] and [20..29] touch but are two hunks of the diff: a multi-line
+    // comment across them is rejected by GitHub, so it is skipped.
+    var df : [2]u32 = [1, 1];
+    var ds : [2]u32 = [10, 20];
+    var dl : [2]u32 = [10, 10];
+    assert in_one_range(1, 18, 21, df, ds, dl, 2) == false;
+    assert in_one_range(1, 18, 19, df, ds, dl, 2) == true;
+    assert in_one_range(1, 20, 21, df, ds, dl, 2) == true;
+    // Same line numbers on another file never match.
+    assert in_one_range(2, 18, 19, df, ds, dl, 2) == false;
+    // A deletion-only diff range (len 0) covers nothing.
+    var zl : [2]u32 = [0, 0];
+    assert in_one_range(1, 10, 10, df, ds, zl, 2) == false;
+}
+
+test the_cap_stops_the_twenty_first_comment {
+    // 25 one-line hunks, lines 1,3,5,...,49 (no overlap), diff covers lines 1..60.
+    var df : [1]u32 = [1];
+    var ds : [1]u32 = [1];
+    var dl : [1]u32 = [60];
+    var hf : [25]u32 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    var hs : [25]u32 = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49];
+    var hc : [25]u32 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    var hk : [25]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var out : [25]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    const posted = plan(25, hf, hs, hc, hk, 1, df, ds, dl, out);
+    assert posted == MAX_COMMENTS;
+    assert count_verdict(V_POST, 25, out) == 20;
+    assert count_verdict(V_CAP, 25, out) == 5;
+    for i in 0..20 { assert out[i] == V_POST; }
+    for i in 20..25 { assert out[i] == V_CAP; }
+}
+
+test a_rewrite_over_the_span_cap_is_left_to_the_author {
+    var df : [1]u32 = [1];
+    var ds : [1]u32 = [1];
+    var dl : [1]u32 = [200];
+    var hf : [2]u32 = [1, 1];
+    var hs : [2]u32 = [10, 100];
+    var hc : [2]u32 = [41, 40];
+    var hk : [2]u8 = [K_REPLACE, K_REPLACE];
+    var out : [2]u8 = [9, 9];
+    const posted = plan(2, hf, hs, hc, hk, 1, df, ds, dl, out);
+    assert out[0] == V_TOO_BIG;
+    assert out[1] == V_POST;
+    assert posted == 1;
+}
+
+test an_unknown_hunk_poisons_only_its_own_file {
+    var df : [2]u32 = [1, 2];
+    var ds : [2]u32 = [1, 1];
+    var dl : [2]u32 = [50, 50];
+    // File 1: a good hunk and a hunk of unknown kind 7. File 2: one good hunk.
+    var hf : [3]u32 = [1, 1, 2];
+    var hs : [3]u32 = [5, 20, 5];
+    var hc : [3]u32 = [1, 1, 1];
+    var hk : [3]u8 = [K_REPLACE, 7, K_REPLACE];
+    var out : [3]u8 = [9, 9, 9];
+    const posted = plan(3, hf, hs, hc, hk, 2, df, ds, dl, out);
+    assert out[0] == V_UNKNOWN;
+    assert out[1] == V_UNKNOWN;
+    assert out[2] == V_POST;
+    assert posted == 1;
+    assert file_poisoned(1, 3, hf, hs, hc, hk) == true;
+    assert file_poisoned(2, 3, hf, hs, hc, hk) == false;
+}
+
+test overlapping_hunks_are_unknown {
+    var hf : [2]u32 = [1, 1];
+    var hs : [2]u32 = [5, 6];
+    var hc : [2]u32 = [3, 1];
+    var hk : [2]u8 = [K_REPLACE, K_REPLACE];
+    assert hunk_unknown(0, 2, hf, hs, hc, hk) == true;
+    assert hunk_unknown(1, 2, hf, hs, hc, hk) == true;
+    // The same lines on different files do not collide.
+    var hf2 : [2]u32 = [1, 2];
+    assert hunk_unknown(0, 2, hf2, hs, hc, hk) == false;
+    assert hunk_unknown(1, 2, hf2, hs, hc, hk) == false;
+    // Touching but disjoint: 5..7 and 8..8.
+    var hs3 : [2]u32 = [5, 8];
+    assert hunk_unknown(0, 2, hf, hs3, hc, hk) == false;
+}
+
+test no_hunks_and_no_ranges_post_nothing {
+    var df : [1]u32 = [1];
+    var ds : [1]u32 = [1];
+    var dl : [1]u32 = [10];
+    var hf : [1]u32 = [1];
+    var hs : [1]u32 = [5];
+    var hc : [1]u32 = [1];
+    var hk : [1]u8 = [K_REPLACE];
+    var out : [1]u8 = [9];
+    // No hunks at all.
+    assert plan(0, hf, hs, hc, hk, 1, df, ds, dl, out) == 0;
+    assert should_post(0) == false;
+    // A hunk but no diff ranges (pr-files gave no patch, e.g. a binary or oversized file).
+    assert plan(1, hf, hs, hc, hk, 0, df, ds, dl, out) == 0;
+    assert out[0] == V_OUTSIDE;
+}
