@@ -180,14 +180,142 @@ pub fn ledger_status(total: u32, out_of_scope: u32, blocked: u32, contradicted: 
     return L_OPEN;
 }
 
-; Whether a recorded verdict still holds. same_source is the caller's comparison of the full source
-; digests; a truncated digest is not a digest and must be passed as recorded == false.
-pub fn key_state(recorded: bool, same_source: bool, converter_version: u32, std_table_version: u32) -> u32 {
+; Whether a recorded verdict still holds: THE rule of staleness, from four booleans. same_source is
+; the caller's comparison of the full source digests; a truncated digest is not a digest and must be
+; passed as recorded == false. same_converter and same_std say the converter and the std table the
+; row was made with are the ones in force: a version number compared with CONVERTER_VERSION below,
+; or, for `tri t27o-sweep` (#10543), the spec_hash of rust_convert.t27's and rust_std.t27's seals
+; compared with the recorded ones, so a changed converter makes every row stale with no constant to bump.
+pub fn key_check(recorded: bool, same_source: bool, same_converter: bool, same_std: bool) -> u32 {
     if (recorded == false) { return K_NONE; }
     if (same_source == false) { return K_STALE_SOURCE; }
-    if (converter_version != CONVERTER_VERSION) { return K_STALE_CONVERTER; }
-    if (std_table_version != STD_TABLE_VERSION) { return K_STALE_STD; }
+    if (same_converter == false) { return K_STALE_CONVERTER; }
+    if (same_std == false) { return K_STALE_STD; }
     return K_FRESH;
+}
+
+; The same rule keyed by the two version constants.
+pub fn key_state(recorded: bool, same_source: bool, converter_version: u32, std_table_version: u32) -> u32 {
+    return key_check(recorded, same_source, converter_version == CONVERTER_VERSION, std_table_version == STD_TABLE_VERSION);
+}
+
+; --- `tri t27o-sweep` (#10543): t27o over a tree, with a cache of every file's result ------------
+; One row per file. A row is reused only when its key holds; the glue computes the booleans by string
+; equality of the SHA-256 of the file and of the two seals' spec_hash, and this spec decides. Every
+; other decision of the command is below too: which files, which are too big, the coverage share,
+; the kind of a refusal and whether it is a cascade, and the order of the ranking.
+
+use tri::lab::receipt::span_is;
+
+pub const SWEEP_MAX_BYTES : usize = 300000;
+pub const SWEEP_TOP : usize = 15;
+pub const SWEEP_CACHE : str = "target/t27o-sweep.tsv";
+; seen == 0 has no share: unknown, one above 100.0 percent, never a number inside the scale.
+pub const COVERAGE_UNKNOWN : usize = 1001;
+; The kind (see kind_to) of a refusal whose reason is another refusal.
+pub const KIND_CASCADE : str = "uses refused";
+
+pub fn starts_at(text: string, at: usize, lit: string) -> bool {
+    if (at + lit.len > text.len) { return false; }
+    return span_is(text, at, at + lit.len, lit);
+}
+
+; A row whose key holds is reused; any other state, including none, converts again.
+pub fn reuse_row(state: u32) -> bool {
+    return state == K_FRESH;
+}
+
+; Is this tracked path one the sweep converts: a .rs file with no gen/ or target/ directory above it
+; (generated Rust is gen-rust of a .t27 spec, build output is neither).
+pub fn sweep_path(path: string) -> bool {
+    if (path.len < 3) { return false; }
+    if (span_is(path, path.len - 3, path.len, ".rs") == false) { return false; }
+    var from : usize = 0;
+    var k : usize = 0;
+    while (k < path.len) {
+        if (path[k] == 47) {
+            if (span_is(path, from, k, "gen")) { return false; }
+            if (span_is(path, from, k, "target")) { return false; }
+            from = k + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+; A file over the cap is reported as skipped, not converted: the converter has no time cap.
+pub fn over_cap(size: usize, cap: usize) -> bool {
+    return size > cap;
+}
+
+; The share of functions converted, per mille. No function seen is unknown, never 1000; a count of
+; converted above the count seen does not add up and is unknown too.
+pub fn coverage_permille(seen: usize, converted: usize) -> usize {
+    if (seen == 0) { return COVERAGE_UNKNOWN; }
+    if (converted > seen) { return COVERAGE_UNKNOWN; }
+    return converted * 1000 / seen;
+}
+
+pub fn coverage_known(permille: usize) -> bool {
+    return permille < COVERAGE_UNKNOWN;
+}
+
+; Is this output line a refusal: `// t27o: refused <what> <name> (line N): <reason> `<text>` at line M`.
+pub fn is_refusal(line: string) -> bool {
+    return starts_at(line, 0, "// t27o: refused ");
+}
+
+; Where the reason starts: after the first "): " that follows "(line "; line.len when there is none.
+pub fn reason_from(line: string) -> usize {
+    var seen_line : bool = false;
+    var k : usize = 0;
+    while (k < line.len) {
+        if (starts_at(line, k, "(line ")) { seen_line = true; }
+        if (seen_line and starts_at(line, k, "): ")) { return k + 3; }
+        k = k + 1;
+    }
+    return line.len;
+}
+
+; The kind of a refusal is the reason's words before the first backtick (the quoted text that follows
+; them differs from one refusal to the next). A line with no reason is its own kind, whole.
+pub fn kind_from(line: string) -> usize {
+    if (reason_from(line) == line.len) { return 0; }
+    return reason_from(line);
+}
+
+pub fn kind_to(line: string) -> usize {
+    if (reason_from(line) == line.len) { return line.len; }
+    var k : usize = reason_from(line);
+    while (k < line.len and line[k] != 96) { k = k + 1; }
+    if (k > reason_from(line) and line[k - 1] == 32) { return k - 1; }
+    return k;
+}
+
+; A cascade refusal is an item refused because it uses a refused one: fixing it is fixing the
+; refusal it names, so it is counted apart and never ranked among the root kinds.
+pub fn is_cascade(kind: string) -> bool {
+    return starts_at(kind, 0, KIND_CASCADE);
+}
+
+; The order of two texts, byte by byte, a shorter prefix first: -1, 0 or 1.
+pub fn text_order(a: string, b: string) -> i32 {
+    var k : usize = 0;
+    while (k < a.len and k < b.len) {
+        if (a[k] < b[k]) { return 0 - 1; }
+        if (a[k] > b[k]) { return 1; }
+        k = k + 1;
+    }
+    if (a.len < b.len) { return 0 - 1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+; The ranking of kinds: more refusals first, equal counts by the kind's text. -1 puts a before b.
+pub fn rank_cmp(count_a: usize, kind_a: string, count_b: usize, kind_b: string) -> i32 {
+    if (count_a > count_b) { return 0 - 1; }
+    if (count_a < count_b) { return 1; }
+    return text_order(kind_a, kind_b);
 }
 
 ; --- Tests ----------------------------------------------------------------------------------
@@ -283,4 +411,110 @@ test negative_control_a_code_outside_t27b_table_is_unknown_never_a_pass {
     assert(t27b_outcome(0 - 1) == ORC_UNKNOWN);
     assert(needs_reference(t27b_outcome(0 - 1)));
     assert(ORC_NAMES[t27b_outcome(T27B_DISAGREE)] == "unknown");
+}
+
+test the_version_rule_and_the_hash_rule_are_one_rule {
+    assert(key_check(true, true, true, true) == K_FRESH);
+    assert(key_check(false, true, true, true) == K_NONE);
+    assert(key_check(true, false, true, true) == K_STALE_SOURCE);
+    assert(key_check(true, true, false, true) == K_STALE_CONVERTER);
+    assert(key_check(true, true, true, false) == K_STALE_STD);
+    assert(key_check(true, false, false, false) == K_STALE_SOURCE);
+    assert(key_check(true, true, false, false) == K_STALE_CONVERTER);
+    assert(key_state(true, true, CONVERTER_VERSION, STD_TABLE_VERSION) == key_check(true, true, true, true));
+    assert(key_state(true, true, CONVERTER_VERSION + 1, STD_TABLE_VERSION) == key_check(true, true, false, true));
+}
+
+test negative_control_a_stale_or_missing_key_is_never_reused {
+    assert(reuse_row(key_check(true, true, true, true)));
+    assert(reuse_row(key_check(false, true, true, true)) == false);
+    assert(reuse_row(key_check(true, false, true, true)) == false);
+    assert(reuse_row(key_check(true, true, false, true)) == false);
+    assert(reuse_row(key_check(true, true, true, false)) == false);
+    assert(reuse_row(key_check(true, false, false, false)) == false);
+    assert(reuse_row(K_NONE) == false);
+    assert(reuse_row(K_STALE_SOURCE) == false);
+    assert(reuse_row(K_STALE_CONVERTER) == false);
+    assert(reuse_row(K_STALE_STD) == false);
+}
+
+test the_sweep_takes_rust_files_outside_gen_and_target {
+    assert(sweep_path("cli/tri/src/main.rs"));
+    assert(sweep_path("bootstrap/src/compiler.rs"));
+    assert(sweep_path("build.rs"));
+    assert(sweep_path("gen.rs"));
+    assert(sweep_path("src/generator/x.rs"));
+    assert(sweep_path("src/targets/x.rs"));
+    assert(sweep_path("src/gen/x.rs") == false);
+    assert(sweep_path("gen/rust/tools/t27o/ledger.rs") == false);
+    assert(sweep_path("target/release/build/x/out.rs") == false);
+    assert(sweep_path("a/b/target/c.rs") == false);
+}
+
+test negative_control_a_path_that_is_not_rust_or_is_empty_is_not_swept {
+    assert(sweep_path("") == false);
+    assert(sweep_path("rs") == false);
+    assert(sweep_path("main.rs.bak") == false);
+    assert(sweep_path("specs/tools/t27o/ledger.t27") == false);
+    assert(sweep_path("README.md") == false);
+}
+
+test a_file_over_the_cap_is_skipped_and_one_at_the_cap_is_converted {
+    assert(over_cap(300001, SWEEP_MAX_BYTES));
+    assert(over_cap(300000, SWEEP_MAX_BYTES) == false);
+    assert(over_cap(0, SWEEP_MAX_BYTES) == false);
+}
+
+test coverage_is_per_mille_and_a_tree_with_no_fn_is_unknown_not_complete {
+    assert(coverage_permille(7108, 627) == 88);
+    assert(coverage_permille(3, 3) == 1000);
+    assert(coverage_permille(5, 0) == 0);
+    assert(coverage_known(coverage_permille(5, 0)));
+    assert(coverage_known(coverage_permille(3, 3)));
+}
+
+test negative_control_no_fn_seen_is_never_one_hundred_percent {
+    assert(coverage_permille(0, 0) == COVERAGE_UNKNOWN);
+    assert(coverage_known(coverage_permille(0, 0)) == false);
+    assert(coverage_permille(0, 0) != 1000);
+    assert(coverage_permille(2, 3) == COVERAGE_UNKNOWN);
+}
+
+test a_refusal_kind_is_the_words_before_the_first_backtick {
+    const a : string = "// t27o: refused fn ids (line 65): type `Vec` at line 65";
+    assert(is_refusal(a));
+    assert(span_is(a, kind_from(a), kind_to(a), "type"));
+    const b : string = "// t27o: refused enum JumpsCmd (line 47): enum variant with data `Census` at line 50";
+    assert(span_is(b, kind_from(b), kind_to(b), "enum variant with data"));
+    const c : string = "// t27o: refused fn run (line 58): uses refused `JumpsCmd::Census` at line 60; 3 fn inside";
+    assert(span_is(c, kind_from(c), kind_to(c), "uses refused"));
+    const d : string = "// t27o: refused fn eq (line 9): == of structs `a == b` at line 11";
+    assert(span_is(d, kind_from(d), kind_to(d), "== of structs"));
+}
+
+test only_a_reason_that_names_a_refused_item_is_a_cascade {
+    assert(is_cascade("uses refused"));
+    assert(is_cascade("type") == false);
+    assert(is_cascade("uses external") == false);
+    assert(is_cascade("") == false);
+    assert(is_cascade("uses") == false);
+}
+
+test negative_control_a_line_that_is_not_a_refusal_or_has_no_reason_is_not_misread {
+    assert(is_refusal("// t27o: 11 fn seen, 0 converted") == false);
+    assert(is_refusal("") == false);
+    assert(is_refusal("pub fn run() -> void {") == false);
+    const e : string = "// t27o: refused fn x (line 1) no reason";
+    assert(is_refusal(e));
+    assert(span_is(e, kind_from(e), kind_to(e), e));
+}
+
+test the_ranking_puts_more_refusals_first_and_equal_counts_in_text_order {
+    assert(rank_cmp(9, "type", 3, "method") == 0 - 1);
+    assert(rank_cmp(3, "type", 9, "method") == 1);
+    assert(rank_cmp(5, "method", 5, "type") == 0 - 1);
+    assert(rank_cmp(5, "type", 5, "method") == 1);
+    assert(rank_cmp(5, "type", 5, "type") == 0);
+    assert(text_order("type", "types") == 0 - 1);
+    assert(text_order("types", "type") == 1);
 }
