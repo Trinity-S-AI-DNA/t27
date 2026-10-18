@@ -35,6 +35,7 @@ Use **domain directories**, not “one folder per agent.” Primary contact for 
 3. **English + ASCII** — first-party Markdown and source comments per **LANG-EN** and **ADR-004**; grandfathered paths only in [`docs/.legacy-non-english-docs`](docs/.legacy-non-english-docs).
 4. **No new Python on the verification critical path** — see **SSOT-MATH** and [`docs/nona-02-organism/TZ-T27-001-NO-PYTHON-CRITICAL-PATH.md`](docs/nona-02-organism/TZ-T27-001-NO-PYTHON-CRITICAL-PATH.md).
 5. **Issue gate** — PRs should link issues (`Closes #N`) where project policy requires it.
+   **Issue shape** -- a new issue stays open only if [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) (#7498) passes; otherwise `needs-boundary.yml` closes it seconds after filing, labelled `shape-refused`. That spec is the rule. Before `gh issue create`, load the skill [`.claude/skills/issue-shape/SKILL.md`](.claude/skills/issue-shape/SKILL.md): it explains the sections, the Boundary path trap, checking a body on the Railway lab, and recovery with `gh issue edit`.
 6. **Ring / gold work** — follow [`docs/nona-01-foundation/GOLDEN-RINGS-CANON.md`](docs/nona-01-foundation/GOLDEN-RINGS-CANON.md) for parser/compiler/spec changes; compiler seal path: `bootstrap/stage0/FROZEN_HASH`.
 
 ---
@@ -120,6 +121,124 @@ Gaps that are open until a PR closes them. Do not assume otherwise:
 
 ---
 
+## 8. Developer toolkit: what we built and where it lives
+
+Start here before you write a script or a new tool. Most of what a developer
+needs already exists as a `.t27` spec with a front door. This section is a map,
+and every row links to the rule's one home. Measured numbers carry their date.
+
+### TRI CLAW: every CI gate behind one front door
+
+TRI CLAW (TRI-27 -- Trinity S3AI) packages this repository's CI gates as a
+product. The gate logic is `.t27`, and the delivery is a GitHub App plus a
+reusable workflow. Epic #9271.
+
+| Piece | Where |
+|---|---|
+| Gate inventory (SSOT): every workflow as data, with its class and events | [`specs/claw/gates.t27`](specs/claw/gates.t27) |
+| Drift law `claw_status`: workflows directory vs inventory | same spec, lowered to `gen/c/claw/gates.c`, run by the claw-drift step of `gate-topology.yml` |
+| Service contract: modes, exit codes, release tag `claw-v*`, check prefix `claw/` | [`specs/claw/service.t27`](specs/claw/service.t27) |
+| Auto-fix recipes and the fix engine: which red check gets which deterministic fix | [`specs/claw/recipes.t27`](specs/claw/recipes.t27), [`specs/claw/engine.t27`](specs/claw/engine.t27) |
+| Docs, release checklist, competitors | [`docs/claw/`](docs/claw/README.md) |
+| The GitHub App | [github.com/apps/tri-claw](https://github.com/apps/tri-claw), id 5166765, installed on all repositories. It is the reviewer-bee identity ([`tools/bees/README.md`](tools/bees/README.md)): bees approve under its name, so a review is never the author approving itself. It also posts the `claw/t27f` check below |
+| T27F check `claw/t27f` (#10268): changed specs and their direct importers, judged by their seals | law [`specs/claw/t27f_gate.t27`](specs/claw/t27f_gate.t27), lowered to `gen/c/claw/t27f_gate.c`; run every 10 minutes by the `claw-t27f` job of `.github/workflows/gate-topology.yml` |
+| SARIF alerts `claw/sarif` (#10356): a changed spec that does not parse or is unwritten, as a code-scanning alert | adapter [`specs/claw/sarif_feed.t27`](specs/claw/sarif_feed.t27) over [`specs/claw/sarif.t27`](specs/claw/sarif.t27), lowered to `gen/c/claw/sarif_feed.c`; run on every pull request by the `claw-sarif` job of `.github/workflows/gate-topology.yml` |
+| Suggestion review (#10365): a changed spec that `t27c fmt` would reformat, as a "Commit suggestion" review | driver [`specs/claw/suggest_feed.t27`](specs/claw/suggest_feed.t27) over [`specs/claw/suggest.t27`](specs/claw/suggest.t27) and the lossless formatter [`specs/tri/fmt_source.t27`](specs/tri/fmt_source.t27), lowered to `gen/c/claw/suggest_feed.c`; run on every pull request by the `claw-suggest` job of `.github/workflows/gate-topology.yml` |
+
+The `claw/t27f` check: one scheduled job in this repository posts it on every
+open pull request that touches `.t27`, in each repository the App is installed
+on. No consumer repository carries a workflow file. An unsealed spec is neutral
+and a stale seal is failure; each summary row links to the spec's T27F graph.
+It posts nothing until the owner finishes the four steps in
+[`docs/claw/README.md`](docs/claw/README.md#the-t27f-check-in-every-t27-repository-10268):
+App permission checks: write, accepting that permission, secret
+`CLAW_APP_PRIVATE_KEY`, variable `CLAW_APP_ID`. That section has the status.
+
+Adding a workflow file means adding its row to `gates.t27` in the same commit.
+The drift gate refuses anything else.
+
+### T27F: the visual spec of every `.t27`
+
+One spec gives one graph model and many views: source, architecture, data flow,
+dependencies and tests. Every node is labelled exact, derived, suggested or
+unknown, and links back to its source lines. The definition lives in one place:
+[`.claude/skills/t27f/SKILL.md`](.claude/skills/t27f/SKILL.md), "What T27F is".
+
+- **Specs:** [`specs/t27f/`](specs/t27f/). The IR is `spec_graph.t27`. The
+  exporter (`.t27` source to graph) is `spec_graph_export.t27`, and its derived
+  edges are `spec_graph_derive.t27`. Fold, expand and hit-test for big specs are
+  `spec_graph_fold.t27`. Layout is `spec_graph_view.t27`, and the agent-sized
+  text view is `spec_graph_outline.t27`.
+- **See it:** [t27.ai/t27f/graph/](https://t27.ai/t27f/graph/), and the graph
+  layer of the Spec Explorer at app.t27.ai/game/specs.
+- **Read a spec cheaply:** the MCP tool `t27f_outline` returns one line per
+  node and edge instead of the whole file. Use it before reading a big spec in
+  full.
+
+### Hot reload and incremental work: only what changed is redone
+
+The rule: key every result on the content hash of its inputs and reuse it while
+the key matches. Seals are those keys.
+
+| Tool | What it does | Measured |
+|---|---|---|
+| `t27c seal <spec> --save / --verify` | Seal v2 in `.trinity/seals/*.json`: spec hash, the four gen hashes, the `use` closure and the toolchain | -- |
+| `t27c frontier [--list] [--reseal] [--audit] [--watch]` | Decides which specs must be rebuilt. The seven decisions are [`specs/verified/seal_identity.t27`](specs/verified/seal_identity.t27). `--watch` polls with a stat gate and reruns the importers | the gen-hash cache (`~/.cache/t27/genhash`) cut a full run from 67.7 s to 3.0 s; a warm run takes about 1 s |
+| `t27c use-edges <specs_dir>` | The import graph. [`specs/ci/affected.t27`](specs/ci/affected.t27) turns it into "which specs does this diff touch" | -- |
+| T27F hot loop | [`specs/t27f/hot.t27`](specs/t27f/hot.t27). The reuse key is sha256(spec) plus sha256(exporter wasm). Debounce is 20 ms quiet and 60 ms at most, and the budget is 100 ms per save | -- |
+| `node server.mjs --watch <dir> --port 2727` in [gHashTag/t27-mcp](https://github.com/gHashTag/t27-mcp) | Watches any directory of `.t27` files, in any repository. `GET /events` streams one `t27f` event per changed spec; `GET /graph?path=` returns the graph or a refusal | save to event: p50 24 ms, max 59 ms (2026-10-18) |
+
+Measured cost, 2227 specs (2026-10-18, #10232): exporting a graph takes
+milliseconds (p50 0.09 ms, worst 18.8 ms). The slow parts were the network and
+manual rebuilds, so fix those before you optimise the exporter.
+
+### The t27 MCP server: reuse a validated spec before writing one
+
+[gHashTag/t27-mcp](https://github.com/gHashTag/t27-mcp) serves the published
+corpus to agents. Its README lists every tool. The ones that save the most work:
+
+- `t27_find` and `t27_specs` find an existing spec by intent or filter.
+- `t27_spec` returns one spec's record, its source and its seal.
+- `t27_check` parses and typechecks with the real front end and gives hints for
+  foreign syntax.
+- `t27_examples` returns short worked idioms, and `t27f_outline` /
+  `t27f_graph` show a spec's structure.
+
+DRY (above) says: search before adding. This server is the fastest way to do it.
+
+### Gates you will meet on a pull request
+
+Each gate is a spec. Read the spec, not a summary of it.
+
+| Gate | Rule | What trips it |
+|---|---|---|
+| Only t27 / SHRINK | `specs/policy/own_language.t27` (section "Only t27" above) | a new foreign file, or more foreign lines added than deleted |
+| Issue shape | [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) | an issue without Boundary / Scenarios / Requirements / Criteria; it is closed as `shape-refused` |
+| PR budget | [`specs/policy/pr_budget.t27`](specs/policy/pr_budget.t27) | more than 20 open PRs per author; batch port waves per ring or crate |
+| Compiler preflight | [`specs/tri/pr/preflight.t27`](specs/tri/pr/preflight.t27) | a bee PR whose specs do not pass the compiler |
+| Duplicate bodies | `tools/duplicate_bodies_baseline.txt` (DRY above) | a copied function body |
+| Gate drift | `specs/claw/gates.t27` | a workflow file without its inventory row |
+
+### Traps we paid for
+
+- **gen-c and strings.** `.len` on `str` reaches C verbatim, so it cannot appear
+  anywhere in a spec that is lowered by gen-c, test bodies included. `==` on
+  `str` is a byte compare in Zig but a pointer compare in C. The cross-backend
+  idiom is explicit length parameters, a `str_eq` loop function, and length
+  pins in a Zig-only companion module (`specs/claw/gates_pins.t27`). Filed on
+  #5980.
+- **A parse is not a proof.** A typecheck stays green for `assert 1 > 2`. Only
+  the spec's own `test` blocks, run to completion with 0 vacuous, show it is
+  true.
+- **Heavy runs do not go on a laptop.** Builds, corpus sweeps and mutation runs
+  go to the Railway lab. A local Mac run has panicked the machine
+  (2026-10-09).
+- **A merge is not a deploy.** A trinity merge is live on t27.ai only after the
+  `gHashTag/ghashtag.github.io` publish workflow runs and its Pages build is
+  `built`.
+
+---
+
 **φ² + 1/φ² = 3 | TRINITY**
 
 ---
@@ -132,18 +251,25 @@ another language; the hooks must stop it. It binds people, bees and agents alike
 - **Allowed:** `.t27` specs; files `t27c` generated under a generated root
   (`gen/`, `bootstrap/gen/`, `bootstrap/src/memory/generated/`); prose and data
   (`.md`, `.txt`, `.json`); and **deletions**.
-- **Denied:** adding or modifying hand-written code in any other language --
+- **Denied:** adding a new hand-written file in any other language --
   `.rs .py .ts .js .sh .zig .c .go .v .lean .yml .toml`, Dockerfile, Makefile and
-  the rest of the list in the spec. A change to existing Rust
-  (`bootstrap/src/compiler.rs`, `cli/t27b`) or Python is denied too.
+  the rest of the list in the spec.
+- **Allowed without the label since 2026-10-18:** editing a foreign file that
+  already exists (`bootstrap/src/compiler.rs`, `cli/t27b`, a workflow `.yml`).
+  Owner rule, 2026-10-18 (translated): the label is not for every pull request,
+  only for the most important files. The edit is still held by `check_budget()`:
+  at most 40 added foreign lines per file and 80 per pull request, and never more
+  added than deleted. No label lifts that.
 - **The rule is** `specs/policy/own_language.t27`; its `t27c gen-c` output
   `gen/c/policy/own_language.c` runs in `lefthook.yml` (pre-commit, pre-push)
   and in `.github/workflows/own-language.yml` on every pull request. Read the
   spec for the exact list; do not copy it here.
-- **The only override** is the label `owner-approved-foreign`. It is applied
-  only on the owner's explicit approval, and the pull request body quotes that
-  approval (in English, with its date and where it was given). Changing the gate
-  itself needs the label as well.
+- **The only override** is the label `owner-approved-foreign`, and it is needed
+  only for the most important files: a new foreign file, and the gate itself
+  (the spec, its generated C, `lefthook.yml`, `.github/workflows/own-language.yml`,
+  `tools/policy/foreign-exceptions.txt`). It is applied only on the owner's
+  explicit approval, and the pull request body quotes that approval (in English,
+  with its date and where it was given).
 - **Owner-approved exceptions** live in `tools/policy/foreign-exceptions.txt`:
   data, one path prefix per line, each under a comment naming the approval. On
   an approved branch, add the entry in the same branch; the local hooks read the
@@ -167,9 +293,10 @@ measure it are written in **t27**, not in Rust or Python by hand.
   file is never hand-edited (L2).
 - What gen cannot express yet is a defect of the self-host work (#5980): file
   it there. Do not work around it in a hand-written file.
-- A hand-written addition or modification is denied by the gate in "Only t27"
-  above unless the owner labels the pull request `owner-approved-foreign`; such
-  a PR still names the spec that will replace it and links the port epic #6198.
+- A new hand-written file is denied by the gate in "Only t27" above unless the
+  owner labels the pull request `owner-approved-foreign`; an edit to an existing
+  one passes within the budget. Either way the PR names the spec that will
+  replace it and links the port epic #6198.
 - The debt only shrinks, and the gate enforces it: since #8236 `check_budget()` refuses
   any pull request that adds more hand-written foreign lines than it deletes. On
   2026-10-10 (master 1a7c8b939, `wc -l`) it is `cli/t27b/src/**/*.rs` 15627 lines and
@@ -321,3 +448,25 @@ documents addressed to other people's agents, the six negative controls, and the
 `;`-alone-on-a-line trap that silently discards a `module` declaration. This
 section is a pointer, not a copy -- the recorded defect in this codebase family
 is the hand-copied rule that only two of its three homes knew about.
+
+## New functionality is written in .t27 only
+
+**Owner, 2026-10-11:** new functionality is added on `t27c` / `t27b`, and the
+outdated logic that lives outside `.t27` is abandoned, not extended.
+
+1. **Spec first, `.t27` only.** A new rule, number, threshold, limit, price,
+   access decision or order of steps is written as a `.t27` spec and executed
+   by `t27c` / `t27b`. It is not written in TypeScript, Rust, Python or
+   hand-written Zig.
+2. **Existing logic outside `.t27` is legacy.** It is not extended. When it is
+   touched for a fix, the rule moves into a spec first and the host keeps only
+   plumbing.
+3. **Plumbing may stay in the host language**: transport, HTTP, database
+   drivers, rendering, wiring. Plumbing never decides a rule. A host function
+   that only looks like a rule is a defect, not plumbing.
+4. **Concurrency uses the actor model of `specs/queen/actors.t27`** (pids,
+   mailboxes, links, monitors, supervisors), not hand-written threads or
+   queues.
+5. **A claim that `t27b` can host a runtime is verified by running it.** Where
+   it cannot yet, the existing host stays as a thin transitional host and the
+   gap is recorded as an issue, not hidden.
