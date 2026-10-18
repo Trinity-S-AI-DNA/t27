@@ -153,6 +153,12 @@ size_t class_name(uint8_t* dst, size_t cap, size_t w, size_t cl);
 size_t criteria_report(uint8_t* t, size_t n, uint8_t* out, size_t cap);
 size_t plan_of(const char* body, size_t bl, uint8_t* out);
 size_t report_of(uint8_t* inp, size_t n, uint8_t* out);
+size_t class_of(const char* text, size_t tl);
+size_t body_report(const char* body, size_t bl, uint8_t* out);
+size_t put_issue(uint8_t* dst, size_t cap, size_t w, uint32_t iss, const char* body, size_t bl);
+size_t put_run(uint8_t* dst, size_t cap, size_t w, const char* head, size_t hl, const char* body, size_t bl);
+size_t issues_report(size_t ni, uint8_t* out);
+size_t many_report(const char* line, size_t ll, size_t nl, uint8_t* out);
 bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
 uint8_t digit_byte(uint32_t d);
 size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
@@ -1372,6 +1378,80 @@ size_t report_of(uint8_t* inp, size_t n, uint8_t* out) {
     return criteria_report(inp, n, out, 8192);
 }
 
+size_t class_of(const char* text, size_t tl) {
+    uint8_t inp[1024] = {0};
+    size_t crit[1200] = {0};
+    size_t cmd[2304] = {0};
+    size_t cnt[5] = {0};
+    size_t bl = (tl + 23);
+    size_t w = put_str(&inp, 1024, 0, "I\t7\t", 4);
+    w = put_count(&inp, 1024, w, ((uint32_t)(bl)));
+    w = put_byte(&inp, 1024, w, '\n');
+    w = put_str(&inp, 1024, w, "## Success Criteria\n- ", 22);
+    w = put_str(&inp, 1024, w, text, tl);
+    w = put_byte(&inp, 1024, w, '\n');
+    if ((collect(&inp, w, &crit, &cmd, &cnt) == false)) {
+        return 99;
+    }
+    if ((cnt[CN_CRIT] != 1)) {
+        return 98;
+    }
+    return crit[CF_CLASS];
+}
+
+size_t body_report(const char* body, size_t bl, uint8_t* out) {
+    uint8_t inp[2048] = {0};
+    size_t w = put_str(&inp, 2048, 0, "I\t7\t", 4);
+    w = put_count(&inp, 2048, w, ((uint32_t)(bl)));
+    w = put_byte(&inp, 2048, w, '\n');
+    w = put_str(&inp, 2048, w, body, bl);
+    return criteria_report(&inp, w, out, 8192);
+}
+
+size_t put_issue(uint8_t* dst, size_t cap, size_t w, uint32_t iss, const char* body, size_t bl) {
+    size_t x = put_str(dst, cap, w, "I\t", 2);
+    x = put_count(dst, cap, x, iss);
+    x = put_byte(dst, cap, x, '\t');
+    x = put_count(dst, cap, x, ((uint32_t)(bl)));
+    x = put_byte(dst, cap, x, '\n');
+    return put_str(dst, cap, x, body, bl);
+}
+
+size_t put_run(uint8_t* dst, size_t cap, size_t w, const char* head, size_t hl, const char* body, size_t bl) {
+    size_t x = put_str(dst, cap, w, head, hl);
+    x = put_count(dst, cap, x, ((uint32_t)(bl)));
+    x = put_byte(dst, cap, x, '\n');
+    return put_str(dst, cap, x, body, bl);
+}
+
+size_t issues_report(size_t ni, uint8_t* out) {
+    uint8_t inp[4096] = {0};
+    size_t w = 0;
+    size_t k = 0;
+    while ((k < ni)) {
+        size_t iss = (k + 1);
+        w = put_issue(&inp, 4096, w, ((uint32_t)(iss)), "## Success Criteria\n- `t27c parse specs/a.t27`\n", 47);
+        k += 1;
+    }
+    w = put_run(&inp, 4096, w, "X\tparse\tspecs/a.t27\t0\t", 22, "", 0);
+    return criteria_report(&inp, w, out, 16384);
+}
+
+size_t many_report(const char* line, size_t ll, size_t nl, uint8_t* out) {
+    uint8_t inp[8192] = {0};
+    size_t bl = (20 + (ll * nl));
+    size_t w = put_str(&inp, 8192, 0, "I\t7\t", 4);
+    w = put_count(&inp, 8192, w, ((uint32_t)(bl)));
+    w = put_byte(&inp, 8192, w, '\n');
+    w = put_str(&inp, 8192, w, "## Success Criteria\n", 20);
+    size_t k = 0;
+    while ((k < nl)) {
+        w = put_str(&inp, 8192, w, line, ll);
+        k += 1;
+    }
+    return criteria_report(&inp, w, out, 65536);
+}
+
 bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
     if ((needle_len > buf_len)) {
         return false;
@@ -1823,6 +1903,426 @@ void test_the_summary_stays_under_the_check_run_cap(void) {
     assert((buf_has(&out, m, "- C1 #7 judge machine:", 22) == true));
 }
 
+void test_the_byte_helpers_at_their_edges(void) {
+    assert((lower('Z') == 'z'));
+    assert((lower('A') == 'a'));
+    assert((lower('[') == '['));
+    assert((lower('@') == '@'));
+    assert((is_alnum('Z') == true));
+    assert((is_alnum('z') == true));
+    assert((is_alnum('[') == false));
+    assert((is_space('\t') == true));
+    assert((is_space('\n') == true));
+    assert((is_space('\r') == true));
+    assert((is_space('x') == false));
+    uint8_t one[4] = {0};
+    assert((put_byte(&one, 4, 4, 'x') == 5));
+    assert((put_byte(&one, 4, 3, 'x') == 4));
+    assert((one[3] == 'x'));
+    uint8_t ab[3] = {0};
+    assert((put_str(&ab, 3, 0, "a\tb", 3) == 3));
+    assert((line_end(&ab, 3, 0) == 3));
+    assert((tab_end(&ab, 3, 0) == 1));
+    assert((tab_end(&ab, 3, 2) == 3));
+}
+
+void test_numbers_read_to_their_edges(void) {
+    uint8_t d[10] = {0};
+    assert((put_str(&d, 10, 0, "1234567890", 10) == 10));
+    assert((dec(&d, 0, 10) == NO_NUM));
+    assert((dec(&d, 0, 9) == 123456789));
+    assert((dec(&d, 3, 3) == NO_NUM));
+    assert((num_word(&d, 0, 7) == NO_NUM));
+    assert((num_word(&d, 0, 6) == 123456));
+    uint8_t two[2] = {0};
+    assert((put_str(&two, 2, 0, "12", 2) == 2));
+    assert((ratio_word(&two, 0, 2) == NO_NUM));
+    uint8_t r[3] = {0};
+    assert((put_str(&r, 3, 0, "5/5", 3) == 3));
+    assert((ratio_word(&r, 0, 3) == 5));
+    assert((ratio_word(&r, 0, 2) == NO_NUM));
+    assert((ratio_word(&r, 1, 3) == NO_NUM));
+    assert((put_str(&r, 3, 0, "3/4", 3) == 3));
+    assert((ratio_word(&r, 0, 3) == EXIT_NONZERO));
+}
+
+void test_words_match_at_their_edges(void) {
+    uint8_t h[9] = {0};
+    assert((put_str(&h, 9, 0, "Done when", 9) == 9));
+    assert((is_head(&h, 0, 9) == true));
+    assert((is_head(&h, 0, 4) == false));
+    assert((starts(&h, 0, 9, "Done when", 9) == true));
+    assert((starts(&h, 0, 4, "Done when", 9) == false));
+    assert((word_is(&h, 5, 9, "when", 4) == true));
+    assert((word_is(&h, 4, 9, "when", 4) == false));
+    assert((holds(&h, 0, 9, "when", 4) == true));
+    assert((holds(&h, 0, 8, "when", 4) == false));
+    uint8_t d4[4] = {0};
+    assert((put_str(&d4, 4, 0, "Done", 4) == 4));
+    assert((is_head(&d4, 0, 4) == false));
+    uint8_t st[6] = {0};
+    assert((put_str(&st, 6, 0, "status", 6) == 6));
+    assert((in_list(EXIT_WORDS, EXIT_WORDS_LEN, &st, 0, 6) == true));
+    assert((in_list(EXIT_WORDS, EXIT_WORDS_LEN, &st, 0, 5) == false));
+    uint8_t an[2] = {0};
+    assert((put_str(&an, 2, 0, "an", 2) == 2));
+    assert((in_list(FILLER_WORDS, FILLER_WORDS_LEN, &an, 0, 2) == true));
+}
+
+void test_a_spec_path_at_its_edges(void) {
+    uint8_t b[64] = {0};
+    size_t w = put_str(&b, 64, 0, "specs/a.t27", 11);
+    assert((path_ok(&b, 0, w) == true));
+    w = put_str(&b, 64, 0, "specs/.t27", 10);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specsxa.t27", 11);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specx/a.t27", 11);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specs/abXt27", 12);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specs/ab.X27", 12);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specs/ab.tX7", 12);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specs/ab.t2X", 12);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "specs/a_b-c/d.t27", 17);
+    assert((path_ok(&b, 0, w) == true));
+    w = put_str(&b, 64, 0, "specs/a b.t27", 13);
+    assert((path_ok(&b, 0, w) == false));
+    w = put_str(&b, 64, 0, "xspecs/a.t27", 12);
+    assert((path_ok(&b, 1, w) == true));
+    assert((path_ok(&b, 0, w) == false));
+    uint8_t p[201] = {0};
+    w = put_str(&p, 201, 0, "specs/", 6);
+    size_t k = 0;
+    while ((k < 190)) {
+        w = put_byte(&p, 201, w, 'a');
+        k += 1;
+    }
+    w = put_str(&p, 201, w, ".t27", 4);
+    assert((w == 200));
+    assert((path_ok(&p, 0, 200) == true));
+    w = put_str(&p, 201, 0, "specs/", 6);
+    k = 0;
+    while ((k < 191)) {
+        w = put_byte(&p, 201, w, 'a');
+        k += 1;
+    }
+    w = put_str(&p, 201, w, ".t27", 4);
+    assert((w == 201));
+    assert((path_ok(&p, 0, 201) == false));
+}
+
+void test_a_clause_at_its_edges(void) {
+    size_t q[10] = {0};
+    uint8_t u[22] = {0};
+    assert((put_str(&u, 22, 0, "`t27c test specs/a.t27", 22) == 22));
+    read_clause(&u, 0, 22, &q);
+    assert((q[Q_CMD] == 0));
+    assert((q[Q_DIRTY] == 1));
+    uint8_t b[64] = {0};
+    size_t w = put_str(&b, 64, 0, "0 `t27c test specs/a.t27`", 25);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_CMD] == 0));
+    assert((q[Q_DIRTY] == 1));
+    w = put_str(&b, 64, 0, "4/4 pass 4/4 pass", 17);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_NN] == 4));
+    assert((q[Q_NOUT] == 4));
+    w = put_str(&b, 64, 0, "4/4 pass 5/5 pass", 17);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    w = put_str(&b, 64, 0, "3 vacuous", 9);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    assert((q[Q_VAC0] == 0));
+    w = put_str(&b, 64, 0, "0 vacuous", 9);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_VAC0] == 1));
+    assert((q[Q_NOUT] == 1));
+    w = put_str(&b, 64, 0, "vacuous", 7);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    assert((q[Q_NOUT] == 0));
+    w = put_str(&b, 64, 0, "3 FAIL", 6);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    assert((q[Q_FAIL0] == 0));
+    w = put_str(&b, 64, 0, "0 failures", 10);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_FAIL0] == 1));
+    w = put_str(&b, 64, 0, "fails", 5);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_EXIT] == ((size_t)(EXIT_NONZERO))));
+    w = put_str(&b, 64, 0, "exits 0 exits 1", 15);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    w = put_str(&b, 64, 0, "passes exits 0", 14);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_EXIT] == 0));
+    w = put_str(&b, 64, 0, "0 0 FAIL", 8);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+    w = put_str(&b, 64, 0, "- / -", 5);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 0));
+    assert((q[Q_NOUT] == 0));
+    assert((q[Q_EXIT] == NONE));
+    w = put_str(&b, 64, 0, "exits 7", 7);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_EXIT] == 7));
+    assert((q[Q_NOUT] == 1));
+    w = put_str(&b, 64, 0, "7", 1);
+    read_clause(&b, 0, w, &q);
+    assert((q[Q_DIRTY] == 1));
+}
+
+void test_a_clause_ends_at_its_edges(void) {
+    uint8_t d2[2] = {0};
+    assert((put_str(&d2, 2, 0, "x.", 2) == 2));
+    assert((clause_end(&d2, 0, 2) == 1));
+    uint8_t a4[4] = {0};
+    assert((put_str(&a4, 4, 0, " and", 4) == 4));
+    assert((clause_end(&a4, 0, 4) == 0));
+    assert((sep_len(&a4, 0, 4) == 4));
+    assert((sep_len(&a4, 4, 4) == 0));
+    uint8_t b[32] = {0};
+    size_t w = put_str(&b, 32, 0, "band x", 6);
+    assert((clause_end(&b, 0, w) == 6));
+    w = put_str(&b, 32, 0, " xnd x", 6);
+    assert((clause_end(&b, 0, w) == 6));
+    w = put_str(&b, 32, 0, " axd x", 6);
+    assert((clause_end(&b, 0, w) == 6));
+    w = put_str(&b, 32, 0, " anx x", 6);
+    assert((clause_end(&b, 0, w) == 6));
+    w = put_str(&b, 32, 0, " andx", 5);
+    assert((clause_end(&b, 0, w) == 5));
+    w = put_str(&b, 32, 0, "x AND y", 7);
+    assert((clause_end(&b, 0, w) == 1));
+    w = put_str(&b, 32, 0, "a, b", 4);
+    assert((clause_end(&b, 0, w) == 1));
+    assert((sep_len(&b, 1, w) == 1));
+    w = put_str(&b, 32, 0, "a; b", 4);
+    assert((clause_end(&b, 0, w) == 1));
+    w = put_str(&b, 32, 0, "a.b c", 5);
+    assert((clause_end(&b, 0, w) == 5));
+}
+
+void test_outcome_clauses_attach_to_the_command_before_them(void) {
+    assert((class_of("`t27c test specs/a.t27` exits 0, exits 0", 40) == CL_MACHINE));
+    assert((class_of("`t27c test specs/a.t27` exits 0, exits 1", 40) == CL_PARTIAL));
+    assert((class_of("`t27c test-report specs/a.t27` 4/4 pass, 4/4 pass", 49) == CL_MACHINE));
+    assert((class_of("`t27c test-report specs/a.t27` 4/4 pass, 5/5 pass", 49) == CL_PARTIAL));
+    assert((class_of("`t27c test specs/a.t27`, 0 FAIL", 31) == CL_PARTIAL));
+    assert((class_of("`t27c test specs/a.t27`, 0 vacuous", 34) == CL_PARTIAL));
+    assert((class_of("`t27c test specs/a.t27`, 2/2 pass", 33) == CL_PARTIAL));
+    assert((class_of("`t27c test-report specs/a.t27`, 0 FAIL, 0 vacuous", 49) == CL_MACHINE));
+    assert((class_of("0 FAIL, `t27c test-report specs/a.t27`", 38) == CL_PARTIAL));
+    assert((class_of("`t27c parse specs/a.t27`, the", 29) == CL_MACHINE));
+    assert((class_of("`t27c parse specs/a.t27`, exits 0 on the lab", 44) == CL_PARTIAL));
+    assert((class_of("`t27c test-report specs/a.t27`; `t27c test specs/b.t27`, 0 FAIL", 63) == CL_PARTIAL));
+    assert((class_of("`t27c test specs/a.t27`; `t27c test-report specs/b.t27`, 0 FAIL", 63) == CL_MACHINE));
+    assert((class_of("`t27c test specs/a.t27`; `t27c test-report specs/b.t27` 0 vacuous", 65) == CL_MACHINE));
+    assert((class_of("`t27c test specs/a.t27`; `t27c test specs/b.t27` 3/3 pass", 57) == CL_PARTIAL));
+}
+
+void test_every_bullet_shape_is_one_criterion(void) {
+    uint8_t out[8192] = {0};
+    size_t m = body_report("## Success Criteria\n-x no bullet\n* star\n+ plus\n12. twelve\n1) paren\n1234. four digits\n1.x dot\n- [x] done\n- [X] big\n- [ ] open\n- [y] why\n- SC-12: named\n- SC-: bare\n- SC-7 nocolon\n- \n  continued\n- base\n  more\nnext\n|---|:-:|\n| a | b |\n<!-- one line -->\n- after comment\n#### Deep\n- after deep\n## Notes\n- outside\n", 307, &out);
+    assert((buf_has(&out, m, "0 of 20 criteria settled by command: 0 met, 0 unmet; 20 left to judge\n", 70) == true));
+    assert((buf_has(&out, m, "- C1 #7 judge judgment: -x no bullet\n- C2 #7 judge judgment: star\n- C3 #7 judge judgment: plus\n- C4 #7 judge judgment: twelve\n- C5 #7 judge judgment: paren\n- C6 #7 judge judgment: 1234. four digits\n- C7 #7 judge judgment: 1.x dot\n- C8 #7 judge judgment: done\n- C9 #7 judge judgment: big\n- C10 #7 judge judgment: open\n", 317) == true));
+    assert((buf_has(&out, m, "- C11 #7 judge judgment: [y] why\n- C12 #7 judge judgment: named\n- C13 #7 judge judgment: SC-: bare\n- C14 #7 judge judgment: nocolon\n- C15 #7 judge judgment: continued\n- C16 #7 judge judgment: base   more\n- C17 #7 judge judgment: next\n- C18 #7 judge judgment: | a | b |\n- C19 #7 judge judgment: after comment\n- C20 #7 judge judgment: after deep\n\nmet/unmet", 354) == true));
+    m = body_report("#### Success Criteria\n- four\n#\n## Done when\n- in\n#\n- out\n##Success Criteria\n- nospace\n", 86, &out);
+    assert((buf_has(&out, m, "1 criteria from 1 issue(s)", 26) == true));
+    assert((buf_has(&out, m, "- C1 #7 judge judgment: in\n\nmet/unmet", 37) == true));
+}
+
+void test_crlf_lines_read_like_lf_lines(void) {
+    uint8_t inp[128] = {0};
+    uint8_t out[8192] = {0};
+    size_t w = put_str(&inp, 128, 0, "I\t7\t46\n## Success Criteria", 26);
+    w = put_byte(&inp, 128, w, 13);
+    w = put_byte(&inp, 128, w, 10);
+    w = put_str(&inp, 128, w, "- crlf", 6);
+    w = put_byte(&inp, 128, w, 13);
+    w = put_byte(&inp, 128, w, 10);
+    w = put_str(&inp, 128, w, "## Notes", 8);
+    w = put_byte(&inp, 128, w, 13);
+    w = put_byte(&inp, 128, w, 10);
+    w = put_str(&inp, 128, w, "- out", 5);
+    w = put_byte(&inp, 128, w, 13);
+    w = put_byte(&inp, 128, w, 10);
+    size_t m = report_of(&inp, w, &out);
+    assert((buf_has(&out, m, "1 criteria from 1 issue(s)", 26) == true));
+    assert((buf_has(&out, m, "- C1 #7 judge judgment: crlf\n\nmet/unmet", 39) == true));
+}
+
+void test_a_stream_record_at_its_edges(void) {
+    uint8_t out[8192] = {0};
+    uint8_t i2[2] = {0};
+    assert((put_str(&i2, 2, 0, "I\t", 2) == 2));
+    size_t m = report_of(&i2, 2, &out);
+    assert((buf_has(&out, m, "unreadable input", 16) == true));
+    uint8_t e11[11] = {0};
+    assert((put_str(&e11, 11, 0, "I\t7\t5\nabcde", 11) == 11));
+    m = report_of(&e11, 11, &out);
+    assert((buf_has(&out, m, "neutral\nno criteria in the linked issues\n", 41) == true));
+    assert((put_str(&e11, 11, 0, "I\t7\t6\nabcde", 11) == 11));
+    m = report_of(&e11, 11, &out);
+    assert((buf_has(&out, m, "unreadable input", 16) == true));
+    uint8_t x24[24] = {0};
+    assert((put_str(&x24, 24, 0, "X\tparse\tspecs/a.t27\t0\t0\n", 24) == 24));
+    m = report_of(&x24, 24, &out);
+    assert((buf_has(&out, m, "neutral\nno linked issue, nothing to settle\n", 43) == true));
+    uint8_t x20[20] = {0};
+    assert((put_str(&x20, 20, 0, "X\tparse\tspecs/a.t27\n", 20) == 20));
+    m = report_of(&x20, 20, &out);
+    assert((buf_has(&out, m, "unreadable input", 16) == true));
+}
+
+void test_a_count_line_has_its_exact_shape(void) {
+    uint8_t c5[5] = {0};
+    assert((put_str(&c5, 5, 0, "tests", 5) == 5));
+    assert((count_line(&c5, 0, 5, "tests", 5) == NO_NUM));
+    uint8_t c7[7] = {0};
+    assert((put_str(&c7, 7, 0, "tests  ", 7) == 7));
+    assert((count_line(&c7, 0, 7, "tests", 5) == NO_NUM));
+    uint8_t c9[9] = {0};
+    assert((put_str(&c9, 9, 0, "  tests 3", 9) == 9));
+    assert((count_line(&c9, 0, 9, "tests", 5) == 3));
+    uint8_t b[64] = {0};
+    size_t w = put_str(&b, 64, 0, "  tests       3", 15);
+    w = put_byte(&b, 64, w, 13);
+    w = put_byte(&b, 64, w, 10);
+    assert((count_line(&b, 0, w, "tests", 5) == 3));
+    w = put_str(&b, 64, 0, "tests3\n", 7);
+    assert((count_line(&b, 0, w, "tests", 5) == NO_NUM));
+    w = put_str(&b, 64, 0, "tests 3x\n", 9);
+    assert((count_line(&b, 0, w, "tests", 5) == NO_NUM));
+    w = put_str(&b, 64, 0, "pass  t_one\n  pass        2\n", 28);
+    assert((count_line(&b, 0, w, "pass", 4) == 2));
+    w = put_str(&b, 64, 0, "  vacuous passes  0 of 3\n", 25);
+    assert((count_line(&b, 0, w, "vacuous passes", 14) == 0));
+}
+
+void test_two_issues_many_commands_one_report(void) {
+    uint8_t inp[4096] = {0};
+    uint8_t out[8192] = {0};
+    uint8_t plan[1024] = {0};
+    size_t w = put_issue(&inp, 4096, 0, 21, "## Success Criteria\n- `t27c parse specs/p.t27` exits 0\n- `t27c test-report specs/rr.t27`; exits 0, 0 FAIL, 0 vacuous, 4/4 pass\n- `t27c test specs/t.t27` exits non-zero\n- `t27c seal specs/s.t27 --verify` exits 0\n- the docs say why\n", 230);
+    w = put_run(&inp, 4096, w, "X\tparse\tspecs/p.t27\t0\t", 22, "", 0);
+    w = put_issue(&inp, 4096, w, 22, "## Done when\n- `t27c test-report specs/rr.t27` 4/4 pass\n- `t27c test-report specs/uuu.t27` 2/2 pass\n- `t27c test-report specs/v.t27` 3/3 pass\n- `t27c test-report specs/w.t27` 3/3 pass\n- `t27c test-report specs/x.t27` 3/3 pass\n- `t27c test specs/rr.t27` passes\n- `t27c test-report specs/uuu.t27` 0 FAIL\n- `t27c test-report specs/v.t27` 0 vacuous\n- `t27c parse specs/q.t27` exits 1 on the lab\n- `t27c test-report specs/x.t27/y.t27` passes\n", 437);
+    w = put_run(&inp, 4096, w, "X\ttest-report\tspecs/rr.t27\t0\t", 29, "  tests       4\n  pass        4\n  FAIL        0\n  vacuous passes  0 of 4\n", 73);
+    w = put_run(&inp, 4096, w, "X\ttest\tspecs/t.t27\t123\t", 23, "", 0);
+    w = put_run(&inp, 4096, w, "X\tseal-verify\tspecs/s.t27\t1\t", 28, "", 0);
+    w = put_run(&inp, 4096, w, "X\ttest-report\tspecs/uuu.t27\t0\t", 30, "  tests       2\n  pass        1\n", 32);
+    w = put_run(&inp, 4096, w, "X\ttest-report\tspecs/v.t27\t0\t", 28, "  tests       4\n  pass        3\n", 32);
+    w = put_run(&inp, 4096, w, "X\ttest-report\tspecs/w.t27\t0\t", 28, "  pass        3\n", 16);
+    w = put_run(&inp, 4096, w, "X\ttest-report\tspecs/x.t27\t0\t", 28, "  tests       3\n", 16);
+    w = put_run(&inp, 4096, w, "X\tparse\tspecs/p.t27\t1\t", 22, "", 0);
+    size_t pm = criteria_plan(&inp, w, &plan, 1024);
+    assert((pm == 198));
+    assert((buf_has(&plan, pm, "R\tparse\tspecs/p.t27\nR\ttest-report\tspecs/rr.t27\nR\ttest\tspecs/t.t27\nR\tseal-verify\tspecs/s.t27\nR\ttest-report\tspecs/uuu.t27\nR\ttest-report\tspecs/v.t27\nR\ttest-report\tspecs/w.t27\nR\ttest-report\tspecs/x.t27\n", 198) == true));
+    size_t m = report_of(&inp, w, &out);
+    assert((buf_has(&out, m, "failure\n7 of 15 criteria settled by command: 4 met, 3 unmet; 8 left to judge\nclaw/criteria v1: 15 criteria from 2 issue(s): 13 machine, 1 partial, 1 judgment.\n\n- C1 #21 met machine: `t27c parse specs/p.t27` exits 0\n  - `t27c parse specs/p.t27` expects exit 0: met -- exit 0\n", 274) == true));
+    assert((buf_has(&out, m, "- C2 #21 met machine: `t27c test-report specs/rr.t27`; exits 0, 0 FAIL, 0 vacuous, 4/4 pass\n  - `t27c test-report specs/rr.t27` expects exit 0, 0 FAIL, 0 vacuous, 4/4 pass: met -- exit 0, tests 4, pass 4, FAIL 0, vacuous 0\n", 223) == true));
+    assert((buf_has(&out, m, "- C3 #21 met machine: `t27c test specs/t.t27` exits non-zero\n  - `t27c test specs/t.t27` expects a non-zero exit: met -- exit 123\n", 130) == true));
+    assert((buf_has(&out, m, "- C4 #21 unmet machine: `t27c seal specs/s.t27 --verify` exits 0\n  - `t27c seal specs/s.t27 --verify` expects exit 0: unmet -- exit 1\n", 134) == true));
+    assert((buf_has(&out, m, "- C5 #21 judge judgment: the docs say why\n- C6 #22 met machine: `t27c test-report specs/rr.t27` 4/4 pass\n  - `t27c test-report specs/rr.t27` expects exit 0, 4/4 pass: met -- exit 0, tests 4, pass 4, FAIL 0, vacuous 0\n", 217) == true));
+    assert((buf_has(&out, m, "- C7 #22 unmet machine: `t27c test-report specs/uuu.t27` 2/2 pass\n  - `t27c test-report specs/uuu.t27` expects exit 0, 2/2 pass: unmet -- exit 0, tests 2, pass 1, FAIL ?, vacuous ?\n", 181) == true));
+    assert((buf_has(&out, m, "- C8 #22 unmet machine: `t27c test-report specs/v.t27` 3/3 pass\n  - `t27c test-report specs/v.t27` expects exit 0, 3/3 pass: unmet -- exit 0, tests 4, pass 3, FAIL ?, vacuous ?\n", 177) == true));
+    assert((buf_has(&out, m, "- C9 #22 judge machine: `t27c test-report specs/w.t27` 3/3 pass\n  - `t27c test-report specs/w.t27` expects exit 0, 3/3 pass: unsettled -- exit 0, tests ?, pass 3, FAIL ?, vacuous ?\n", 181) == true));
+    assert((buf_has(&out, m, "- C10 #22 judge machine: `t27c test-report specs/x.t27` 3/3 pass\n  - `t27c test-report specs/x.t27` expects exit 0, 3/3 pass: unsettled -- exit 0, tests 3, pass ?, FAIL ?, vacuous ?\n", 182) == true));
+    assert((buf_has(&out, m, "- C11 #22 judge machine: `t27c test specs/rr.t27` passes\n  - `t27c test specs/rr.t27` expects exit 0: not run\n", 110) == true));
+    assert((buf_has(&out, m, "- C12 #22 judge machine: `t27c test-report specs/uuu.t27` 0 FAIL\n  - `t27c test-report specs/uuu.t27` expects exit 0, 0 FAIL: unsettled -- exit 0, tests 2, pass 1, FAIL ?, vacuous ?\n", 182) == true));
+    assert((buf_has(&out, m, "- C13 #22 judge machine: `t27c test-report specs/v.t27` 0 vacuous\n  - `t27c test-report specs/v.t27` expects exit 0, 0 vacuous: unsettled -- exit 0, tests 4, pass 3, FAIL ?, vacuous ?\n", 184) == true));
+    assert((buf_has(&out, m, "- C14 #22 judge partial: `t27c parse specs/q.t27` exits 1 on the lab\n  - `t27c parse specs/q.t27` expects exit 1: not run\n", 122) == true));
+    assert((buf_has(&out, m, "- C15 #22 judge machine: `t27c test-report specs/x.t27/y.t27` passes\n  - `t27c test-report specs/x.t27/y.t27` expects exit 0: not run\n\nmet/unmet", 144) == true));
+    assert((buf_has(&out, m, " more criteria not listed", 25) == false));
+    assert((buf_has(&out, m, "issues past", 11) == false));
+}
+
+void test_six_commands_are_listed_and_a_seventh_is_counted(void) {
+    uint8_t out[8192] = {0};
+    size_t m = body_report("## Success Criteria\n- `t27c test specs/b0.t27`; `t27c test specs/b1.t27`; `t27c test specs/b2.t27`; `t27c test specs/b3.t27`; `t27c test specs/b4.t27`; `t27c test specs/b5.t27`\n- `t27c test specs/c0.t27`; `t27c test specs/c1.t27`; `t27c test specs/c2.t27`; `t27c test specs/c3.t27`; `t27c test specs/c4.t27`; `t27c test specs/c5.t27`; `t27c test specs/c6.t27`\n", 360, &out);
+    assert((buf_has(&out, m, "  - `t27c test specs/b5.t27` expects exit 0: not run\n- C2 #7 judge machine:", 75) == true));
+    assert((buf_has(&out, m, "  - `t27c test specs/c5.t27` expects exit 0: not run\n  - and 1 more commands\n\nmet/unmet", 87) == true));
+    assert((buf_has(&out, m, "specs/c6.t27` expects", 21) == false));
+}
+
+void test_thirty_two_issues_are_read_and_the_thirty_third_is_not(void) {
+    uint8_t out[16384] = {0};
+    size_t m = issues_report(32, &out);
+    assert((buf_has(&out, m, "success\n32 of 32 criteria settled by command: 32 met, 0 unmet; 0 left to judge\nclaw/criteria v1: 32 criteria from 32 issue(s): 32 machine, 0 partial, 0 judgment.\n", 162) == true));
+    assert((buf_has(&out, m, "- C32 #32 met machine:", 22) == true));
+    assert((buf_has(&out, m, "issues past", 11) == false));
+    m = issues_report(33, &out);
+    assert((buf_has(&out, m, "neutral\n32 of 32 criteria settled by command: 32 met, 0 unmet; 0 left to judge\nclaw/criteria v1: 32 criteria from 33 issue(s): 32 machine, 0 partial, 0 judgment.\n", 162) == true));
+    assert((buf_has(&out, m, "#33", 3) == false));
+    assert((buf_has(&out, m, "- issues past the first 32 were not read.\n", 42) == true));
+}
+
+void test_the_criteria_and_command_caps_hold_at_their_edges(void) {
+    uint8_t out[65536] = {0};
+    size_t m = many_report("- x\n", 4, 200, &out);
+    assert((buf_has(&out, m, "0 of 200 criteria", 17) == true));
+    assert((buf_has(&out, m, " more criteria not listed", 25) == false));
+    m = many_report("- x\n", 4, 201, &out);
+    assert((buf_has(&out, m, "0 of 200 criteria", 17) == true));
+    assert((buf_has(&out, m, "- 1 more criteria not listed (over the caps); judge them from the issue.\n", 73) == true));
+    m = many_report("- `t27c test specs/a.t27`; `t27c test specs/a.t27`\n", 51, 128, &out);
+    assert((buf_has(&out, m, "128 criteria from 1 issue(s): 128 machine, 0 partial, 0 judgment.", 65) == true));
+    m = many_report("- `t27c test specs/a.t27`; `t27c test specs/a.t27`\n", 51, 129, &out);
+    assert((buf_has(&out, m, "129 criteria from 1 issue(s): 128 machine, 0 partial, 1 judgment.", 65) == true));
+}
+
+void test_a_row_text_is_cut_at_two_hundred_bytes(void) {
+    uint8_t inp[1024] = {0};
+    uint8_t out[8192] = {0};
+    size_t w = put_str(&inp, 1024, 0, "I\t7\t434\n## Success Criteria\n- ", 30);
+    size_t k = 0;
+    while ((k < 200)) {
+        w = put_byte(&inp, 1024, w, 'd');
+        k += 1;
+    }
+    w = put_str(&inp, 1024, w, "\n- ", 3);
+    k = 0;
+    while ((k < 201)) {
+        w = put_byte(&inp, 1024, w, 'e');
+        k += 1;
+    }
+    w = put_str(&inp, 1024, w, "\n- a~b", 6);
+    w = put_byte(&inp, 1024, w, 127);
+    w = put_byte(&inp, 1024, w, '\n');
+    size_t m = report_of(&inp, w, &out);
+    size_t c1 = NONE;
+    size_t c2 = NONE;
+    size_t i = 0;
+    while ((i < m)) {
+        if (starts(&out, i, m, "- C1 #7 judge judgment: ", 24)) {
+            c1 = (i + 24);
+        }
+        if (starts(&out, i, m, "- C2 #7 judge judgment: ", 24)) {
+            c2 = (i + 24);
+        }
+        i += 1;
+    }
+    assert((c1 != NONE));
+    assert((c2 != NONE));
+    assert((out[(c1 + 199)] == 'd'));
+    assert((out[(c1 + 200)] == '\n'));
+    assert((out[(c2 + 199)] == 'e'));
+    assert((out[(c2 + 200)] == '.'));
+    assert((buf_has(&out, m, "...\n- C3 #7 judge judgment: a~b?\n", 33) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1852,7 +2352,23 @@ int main(void) {
     test_a_row_never_starts_a_second_row();
     test_no_issue_no_criteria_and_an_unreadable_stream_are_neutral();
     test_the_summary_stays_under_the_check_run_cap();
-    printf("All %d tests passed.\n", 21);
+    test_the_byte_helpers_at_their_edges();
+    test_numbers_read_to_their_edges();
+    test_words_match_at_their_edges();
+    test_a_spec_path_at_its_edges();
+    test_a_clause_at_its_edges();
+    test_a_clause_ends_at_its_edges();
+    test_outcome_clauses_attach_to_the_command_before_them();
+    test_every_bullet_shape_is_one_criterion();
+    test_crlf_lines_read_like_lf_lines();
+    test_a_stream_record_at_its_edges();
+    test_a_count_line_has_its_exact_shape();
+    test_two_issues_many_commands_one_report();
+    test_six_commands_are_listed_and_a_seventh_is_counted();
+    test_thirty_two_issues_are_read_and_the_thirty_third_is_not();
+    test_the_criteria_and_command_caps_hold_at_their_edges();
+    test_a_row_text_is_cut_at_two_hundred_bytes();
+    printf("All %d tests passed.\n", 37);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
