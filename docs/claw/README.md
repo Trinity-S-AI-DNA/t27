@@ -18,6 +18,7 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
 | Model routing: Opus 5.5 orchestrates, Sonnet 5.5 runs sub-tasks | `specs/claw/model_route.t27`, skill `model-routing`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-18 |
 | A T27F visual in every answer that needs one | rule `specs/t27mcp/visual_output.t27`, particle-still layer `specs/claw/visual_output.t27`, procedure in skill `t27f`, "Visual in every output" | owner directive 2026-10-18 |
+| `reel_still`: one particle still (PNG at STILL_MS of a token_floor reel) from TRI CLAW's `/mcp` | `specs/claw/reel_still.t27`, rendered on the Railway lab only | follow-up of the row above |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
 ## The T27F check in every `.t27` repository (#10268)
