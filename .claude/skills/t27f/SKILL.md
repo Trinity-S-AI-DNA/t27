@@ -147,6 +147,25 @@ Traps from this tick:
 - Lab scripts run under `sh`, which is dash: `$((10#$x))` fails with "expecting EOF". Strip leading zeros with `sed 's/^0*//'` and default with `${i:-0}`.
 - The Mac hook reads the whole Bash command. A heredoc PR body that names the report command gets refused. Write the body with the Write tool and pass `--body-file`.
 
+**Sweeping every crossfade frame, not one band of one lesson (t27#10651).** A band check on one lesson proves one lesson. To cover every lesson, run a whole-frame sweep:
+
+1. For each lesson, language, voice and orientation, print the graph and write the text files it reads (`textfile=` gives the directory).
+2. Take each `offset=` and compute the crossfade's first frame in integer ms: ceil(offset x 30).
+3. Append `;[v]select='between(n\,s\,s+15)+...',scale=W/4:H/4:flags=area,format=rgb24[w]` to the graph.
+4. Map `[w]` to `-fps_mode passthrough -f rawvideo`. Map `[a]` to `-f null -`, because the graph must still consume its audio.
+5. Feed it three solid `color=` clips, split the raw file per frame and count the distinct colours of each frame.
+
+Every frame must have exactly 1 colour: area scaling turns a blend of two solid clips into one colour, so anything drawn on top adds more. Run the parent binary as the negative control; it must flag frames.
+
+Measured for mode 5 with PR #10647's binary: 27 lessons x 2 languages x 3 voices x 2 orientations is 324 renders and 10368 crossfade frames, and 0 frames were flagged. The #10632 binary was flagged on all 162 tall renders, 1350 frames in total. On voices 1300/4200/6800 and 700/4200/8000 it flags frames 20..31: the last card sits over crossfade 1. On 900/2600/4100 it flags only frame 31. A control that flags a single frame catches bugs that a check of one hand-picked frame would miss. The sweep takes about 5 s per render, 40 min in total.
+
+Traps from this tick (ffmpeg on the lab):
+
+- Pass `-nostdin`. Under `nohup ... < script`, ffmpeg reads the script as keyboard commands ("Parse error"), and the render stops after 16 or 17 frames.
+- The lab cgroup has `pids.max` 1000, and a graph with many `drawtext` filters starts 400 to 700 threads. Cap them with `-threads 2 -filter_threads 2 -filter_complex_threads 2` and `-threads 1` on the output. Never run two renders at once. "ff_frame_thread_encoder_init failed" means the cap was hit. Look for a stuck ffmpeg and kill it by pid.
+- lavfi rejects `d=.900`. Print the duration as `$((m/1000)).$(printf %03d $((m%1000)))`.
+- `pkill -f` on the loop script leaves its child renders running. Find them with `ps -eo pid,args | grep '[s]h xf'` and kill them by pid.
+
 **Holding the address when the voice runs long (t27#10629).** If an overlay must stay on screen for a minimum time and must also stay off a crossfade, then the crossfade has to move; the overlay cannot. Work out in frames the latest cut that still leaves the last scene its minimum: cut 1 is capped at `BEAT_CUT1_LAST_MS` = 13249. Prove it is the latest with a one-ms-later control. Only the voices the reel speeds up are affected, so the `cmp` diff is limited to those voices and to crossfade 1's offset. The cost is real: the crossfade starts up to 184 ms under the task's last word, and lesson 1's measured voice (1300/4200/6800) is one of the affected voices. Write a test that bounds that overlap.
 
 - Before trusting a "fast voice" grid result, work out which fixture voices are fast. `voice_room_ms(3)` is 12250 ms, so the measured lesson 1 voice (raw 12300) is already sped up. A change aimed at "fast voices" therefore changes the reel everyone actually sees.
