@@ -1,0 +1,445 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/preview.t27 -- the "T27F preview" deployment of a pull request, as law (issue #10282,
+; lane t27f-preview of specs/claw/github_surface.t27, epic #9271).
+; Goal. Every PR that changes a .t27 spec gets an environment on its PR page. The environment's
+; link opens the T27F graph view (/t27f/graph/, gHashTag/trinity#1648) of the changed spec at the
+; PR head: one spec, one graph, every node labelled exact / derived / suggested / unknown. No new
+; renderer exists or is needed; the page already runs spec_graph_export.t27 and
+; spec_graph_view.t27 as WebAssembly.
+; --
+; What this file is. Pure logic over strings and numbers; it makes no API call. The App's token
+; for the job is the row "t27f-preview" of github_surface.t27: deployments write, plus the
+; contents read of the "spec-read" row (not imported here: gen inlines an imported module's bodies
+; without rewriting their own `recipes::` calls, so a second `use` breaks the build). A deployment is two calls: POST /deployments (environment,
+; ref, auto_merge=false, required_contexts=[]) and POST /deployments/{id}/statuses (state,
+; environment_url, description). The caller composes the JSON; this file decides WHETHER and WHAT.
+; --
+; The rules.
+; - Which PRs: open, same-repository head (a fork head is another owner's bytes under our
+;   name), and at least one changed file that is a .t27 file under specs/. A deleted spec has no
+;   bytes at the head to draw, so the caller lists only added, modified and renamed files.
+; - Name: t27f-preview-pr-<n>. One environment per PR, so GitHub groups every commit's deployment
+;   of that PR under one entry on the PR page.
+; - States (GitHub spells them): queued, in_progress, success, failure, inactive. Illegal moves
+;   are refused; inactive is final.
+; - Supersede: a newer deployment of the same PR retires the older ones to inactive, and closing
+;   or merging the PR retires all of them. Two "success" lines next to each other would point at
+;   two different heads.
+; - A URL is published only on success, and success only after the URL answered HTTP 200 (a
+;   probe the caller makes). A preview URL that does not resolve is worse than none.
+; - The URL pins the repository, the head sha (40 hex digits) and the spec path, so it keeps
+;   showing the commit it was made for; a branch name would drift under it.
+; --
+; Honest limit. This is the law of the lifecycle. It does not prove the page can draw a spec from
+; an arbitrary repository and sha: at the time of writing /t27f/graph/ offers a fixed list of
+; vendored specs and reads no query string. Until it does, no workflow may call this law's
+; success path. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawPreview;
+
+use claw::recipes;
+
+/// Deployment states. S_NONE is "no deployment yet" and also the answer to an illegal move,
+/// kept far from the real states so a missed check cannot pass for a state.
+pub const S_QUEUED : u8 = 0;
+pub const S_IN_PROGRESS : u8 = 1;
+pub const S_SUCCESS : u8 = 2;
+pub const S_FAILURE : u8 = 3;
+pub const S_INACTIVE : u8 = 4;
+pub const S_NONE : u8 = 255;
+
+/// Events that move a deployment.
+pub const E_QUEUE : u8 = 0;
+pub const E_START : u8 = 1;
+pub const E_PROBE_OK : u8 = 2;
+pub const E_PROBE_FAIL : u8 = 3;
+pub const E_SUPERSEDE : u8 = 4;
+pub const E_CLOSE : u8 = 5;
+
+/// The environment name is this prefix and the PR number in decimal.
+pub const ENV_PREFIX : str = "t27f-preview-pr-";
+
+/// The page that draws a spec; the query string names the repository, the head sha and the path.
+pub const PAGE : str = "https://t27.ai/t27f/graph/?";
+
+/// GitHub limits a status description to 140 characters.
+pub const DESCRIPTION_MAX : usize = 140;
+
+/// Length of a git sha in hex.
+pub const SHA_LEN : usize = 40;
+
+/// The surface row this lane serves, in github_surface.t27.
+pub const SURFACE : str = "t27f-preview";
+
+/// The state's name as the API spells it; "" for anything else.
+pub fn state_name(s : u8) -> str {
+    if (s == S_QUEUED) { return "queued"; }
+    if (s == S_IN_PROGRESS) { return "in_progress"; }
+    if (s == S_SUCCESS) { return "success"; }
+    if (s == S_FAILURE) { return "failure"; }
+    if (s == S_INACTIVE) { return "inactive"; }
+    return "";
+}
+
+/// The state after an event; S_NONE for a move that is not allowed. A new deployment starts from
+/// S_NONE only. Retiring (supersede or close) is allowed from every live state, never twice.
+pub fn next_state(s : u8, e : u8) -> u8 {
+    if (s == S_NONE) {
+        if (e == E_QUEUE) { return S_QUEUED; }
+        return S_NONE;
+    }
+    if (s == S_INACTIVE) { return S_NONE; }
+    if (e == E_SUPERSEDE) { return S_INACTIVE; }
+    if (e == E_CLOSE) { return S_INACTIVE; }
+    if (s == S_QUEUED) {
+        if (e == E_START) { return S_IN_PROGRESS; }
+        return S_NONE;
+    }
+    if (s == S_IN_PROGRESS) {
+        if (e == E_PROBE_OK) { return S_SUCCESS; }
+        if (e == E_PROBE_FAIL) { return S_FAILURE; }
+        return S_NONE;
+    }
+    return S_NONE;
+}
+
+/// A state the PR page still shows as live, so a newer deployment must retire it.
+pub fn is_live(s : u8) -> bool {
+    return s == S_QUEUED || s == S_IN_PROGRESS || s == S_SUCCESS || s == S_FAILURE;
+}
+
+/// Only a probed success carries environment_url. Everything else leaves the field empty.
+pub fn status_carries_url(s : u8) -> bool {
+    return s == S_SUCCESS;
+}
+
+/// The id of a newer deployment of the same PR is larger; a stale webhook replay or a slow job
+/// that finishes late is the older id and must not retire the newer one.
+pub fn supersedes(newer_id : u64, older_id : u64) -> bool {
+    return newer_id > older_id;
+}
+
+/// A description fits the API limit and is not empty.
+pub fn description_ok(d : str) -> bool {
+    return d.len > 0 && d.len <= DESCRIPTION_MAX;
+}
+
+/// Does `s` start with `p`?
+pub fn starts_with(s : str, p : str) -> bool {
+    if (s.len < p.len) { return false; }
+    var i : usize = 0;
+    while (i < p.len) {
+        if (s[i] != p[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Does `s` end with `p`?
+pub fn ends_with(s : str, p : str) -> bool {
+    if (s.len < p.len) { return false; }
+    const off : usize = s.len - p.len;
+    var i : usize = 0;
+    while (i < p.len) {
+        if (s[off + i] != p[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Is `path` a .t27 file under specs/? The name part must be non-empty (".t27" alone is not).
+pub fn is_spec_path(path : str) -> bool {
+    return starts_with(path, "specs/") && ends_with(path, ".t27") && path.len > 10;
+}
+
+/// How many lines of `list` are spec paths. `list` is the changed files, one path per line.
+pub fn spec_paths_in(list : str) -> u32 {
+    var n : u32 = 0;
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= list.len) {
+        if (i == list.len || list[i] == 10) {
+            if (i > start) {
+                const line : str = list[start..i];
+                if (is_spec_path(line)) { n += 1; }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+/// Does this PR get a preview? Open, head in this repository, and at least one changed spec.
+pub fn wants_preview(is_open : bool, same_repo : bool, changed : str) -> bool {
+    if (!is_open) { return false; }
+    if (!same_repo) { return false; }
+    return spec_paths_in(changed) > 0;
+}
+
+/// Number of decimal digits of n (1 for 0).
+pub fn digits_of(n : u32) -> usize {
+    var d : usize = 1;
+    var m : u32 = n;
+    while (m >= 10) {
+        m = m / 10;
+        d += 1;
+    }
+    return d;
+}
+
+/// Is `name` exactly ENV_PREFIX followed by the decimal of the PR number? PR numbers start at 1.
+pub fn env_name_ok(pr : u32, name : str) -> bool {
+    if (pr == 0) { return false; }
+    const d : usize = digits_of(pr);
+    if (name.len != ENV_PREFIX.len + d) { return false; }
+    if (!starts_with(name, ENV_PREFIX)) { return false; }
+    var p : u32 = 1;
+    var k : usize = 1;
+    while (k < d) {
+        p = p * 10;
+        k += 1;
+    }
+    var i : usize = 0;
+    var rest : u32 = pr;
+    while (i < d) {
+        const digit : u32 = rest / p;
+        if ((name[ENV_PREFIX.len + i]) as u32 != 48 + digit) { return false; }
+        rest = rest - digit * p;
+        if (p >= 10) { p = p / 10; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Index of the first occurrence of `needle` in `hay` at or after `from`; -1 when absent.
+pub fn find_from(hay : str, needle : str, from : usize) -> i32 {
+    if (needle.len == 0) { return -1; }
+    if (hay.len < needle.len) { return -1; }
+    var i : usize = from;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < needle.len) {
+            if (hay[i + j] != needle[j]) { same = false; }
+            j += 1;
+        }
+        if (same) { return (i) as i32; }
+        i += 1;
+    }
+    return -1;
+}
+
+/// A lowercase hex digit.
+pub fn is_hex(c : u8) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102);
+}
+
+/// Are the SHA_LEN bytes of `s` from `at` all lowercase hex, followed by the end or '&'?
+pub fn sha_at(s : str, at : usize) -> bool {
+    if (at + SHA_LEN > s.len) { return false; }
+    var i : usize = 0;
+    while (i < SHA_LEN) {
+        if (!is_hex(s[at + i])) { return false; }
+        i += 1;
+    }
+    if (at + SHA_LEN == s.len) { return true; }
+    return s[at + SHA_LEN] == 38;
+}
+
+/// A preview URL is the page, with repo=, a 40-hex sha= and path= in the query. A URL that does
+/// not pin the commit is refused: a branch name would show tomorrow's spec under today's check.
+pub fn url_ok(url : str) -> bool {
+    if (!starts_with(url, PAGE)) { return false; }
+    if (find_from(url, "repo=", PAGE.len) < 0) { return false; }
+    if (find_from(url, "path=specs/", PAGE.len) < 0) { return false; }
+    const at : i32 = find_from(url, "sha=", PAGE.len);
+    if (at < 0) { return false; }
+    return sha_at(url, ((at) as usize) + 4);
+}
+
+/// May this status be sent? A state with a URL needs a URL that passed url_ok and a probe that
+/// answered 200; every other state must carry no URL at all.
+pub fn status_ok(s : u8, url : str, probe : u32) -> bool {
+    if (status_carries_url(s)) {
+        return probe == 200 && url_ok(url);
+    }
+    return url.len == 0;
+}
+
+const SHA_A : str = "0123456789abcdef0123456789abcdef01234567";
+const SHA_UPPER : str = "0123456789ABCDEF0123456789abcdef01234567";
+
+test environment_name_is_the_prefix_and_the_pr_number {
+    assert env_name_ok(7, "t27f-preview-pr-7") == true;
+    assert env_name_ok(10282, "t27f-preview-pr-10282") == true;
+    assert env_name_ok(100, "t27f-preview-pr-100") == true;
+    assert env_name_ok(100, "t27f-preview-pr-10") == false;
+    assert env_name_ok(100, "t27f-preview-pr-1000") == false;
+    assert env_name_ok(7, "t27f-preview-pr-8") == false;
+    assert env_name_ok(12, "t27f-preview-pr-21") == false;
+    assert env_name_ok(7, "t27f-preview-7") == false;
+    assert env_name_ok(7, "") == false;
+    assert env_name_ok(0, "t27f-preview-pr-0") == false;
+}
+
+test digits_of_counts_decimal_digits {
+    assert digits_of(0) == 1;
+    assert digits_of(9) == 1;
+    assert digits_of(10) == 2;
+    assert digits_of(99999) == 5;
+    assert digits_of(100000) == 6;
+}
+
+test the_lifecycle_walks_queued_to_success {
+    var s : u8 = next_state(S_NONE, E_QUEUE);
+    assert s == S_QUEUED;
+    s = next_state(s, E_START);
+    assert s == S_IN_PROGRESS;
+    s = next_state(s, E_PROBE_OK);
+    assert s == S_SUCCESS;
+    s = next_state(s, E_SUPERSEDE);
+    assert s == S_INACTIVE;
+    assert recipes::str_eq(state_name(s), "inactive") == true;
+}
+
+test a_failed_probe_ends_in_failure_and_failure_can_retire {
+    var s : u8 = next_state(S_QUEUED, E_START);
+    s = next_state(s, E_PROBE_FAIL);
+    assert s == S_FAILURE;
+    assert next_state(s, E_CLOSE) == S_INACTIVE;
+}
+
+test illegal_moves_are_refused {
+    // no skipping the probe, no success from queued, no restart of a finished deployment
+    assert next_state(S_QUEUED, E_PROBE_OK) == S_NONE;
+    assert next_state(S_QUEUED, E_PROBE_FAIL) == S_NONE;
+    assert next_state(S_IN_PROGRESS, E_START) == S_NONE;
+    assert next_state(S_SUCCESS, E_START) == S_NONE;
+    assert next_state(S_SUCCESS, E_PROBE_FAIL) == S_NONE;
+    assert next_state(S_FAILURE, E_PROBE_OK) == S_NONE;
+    assert next_state(S_NONE, E_START) == S_NONE;
+    assert next_state(S_NONE, E_SUPERSEDE) == S_NONE;
+}
+
+test inactive_is_final {
+    for e in 0..6 {
+        assert next_state(S_INACTIVE, (e) as u8) == S_NONE;
+    }
+}
+
+test every_live_state_can_be_retired_exactly_once {
+    for s in 0..4 {
+        assert is_live((s) as u8) == true;
+        assert next_state((s) as u8, E_SUPERSEDE) == S_INACTIVE;
+        assert next_state((s) as u8, E_CLOSE) == S_INACTIVE;
+    }
+    assert is_live(S_INACTIVE) == false;
+    assert is_live(S_NONE) == false;
+}
+
+test only_the_newer_deployment_supersedes {
+    assert supersedes(200, 100) == true;
+    assert supersedes(100, 200) == false;
+    assert supersedes(100, 100) == false;
+}
+
+test only_success_carries_a_url {
+    assert status_carries_url(S_SUCCESS) == true;
+    assert status_carries_url(S_QUEUED) == false;
+    assert status_carries_url(S_IN_PROGRESS) == false;
+    assert status_carries_url(S_FAILURE) == false;
+    assert status_carries_url(S_INACTIVE) == false;
+}
+
+test spec_path_means_a_t27_file_under_specs {
+    assert is_spec_path("specs/claw/gates.t27") == true;
+    assert is_spec_path("specs/a.t27") == true;
+    assert is_spec_path("specs/.t27") == false;
+    assert is_spec_path("docs/specs/a.t27") == false;
+    assert is_spec_path("specs/claw/gates.md") == false;
+    assert is_spec_path("gen/c/claw/gates.c") == false;
+    assert is_spec_path("") == false;
+}
+
+test spec_paths_are_counted_per_line {
+    assert spec_paths_in("") == 0;
+    assert spec_paths_in("README.md") == 0;
+    assert spec_paths_in("specs/claw/gates.t27") == 1;
+    assert spec_paths_in("README.md\nspecs/claw/gates.t27\nspecs/t27f/ui_plan.t27\n") == 2;
+    assert spec_paths_in("a.rs\n\n\nspecs/a/b.t27") == 1;
+}
+
+test a_pr_gets_a_preview_only_when_open_same_repo_and_touching_a_spec {
+    assert wants_preview(true, true, "specs/claw/gates.t27\nREADME.md") == true;
+    assert wants_preview(false, true, "specs/claw/gates.t27") == false;
+    assert wants_preview(true, false, "specs/claw/gates.t27") == false;
+    assert wants_preview(true, true, "docs/a.md\nsrc/b.rs") == false;
+    assert wants_preview(true, true, "") == false;
+}
+
+test the_url_must_pin_the_commit {
+    const good : str = "https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef01234567&path=specs/claw/gates.t27";
+    assert url_ok(good) == true;
+    // a branch name instead of a sha
+    assert url_ok("https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=master&path=specs/claw/gates.t27") == false;
+    // 39 hex digits
+    assert url_ok("https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef0123456&path=specs/claw/gates.t27") == false;
+    // 41 hex digits run on
+    assert url_ok("https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef012345670&path=specs/claw/gates.t27") == false;
+    // upper-case hex is not what git prints
+    assert url_ok("https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789ABCDEF0123456789abcdef01234567&path=specs/claw/gates.t27") == false;
+    // missing repo, missing path, another host
+    assert url_ok("https://t27.ai/t27f/graph/?sha=0123456789abcdef0123456789abcdef01234567&path=specs/claw/gates.t27") == false;
+    assert url_ok("https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef01234567") == false;
+    assert url_ok("https://example.com/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef01234567&path=specs/a.t27") == false;
+    assert url_ok("") == false;
+}
+
+test sha_at_reads_exactly_forty_hex_digits {
+    assert sha_at(SHA_A, 0) == true;
+    assert sha_at(SHA_UPPER, 0) == false;
+    assert sha_at("x0123456789abcdef0123456789abcdef01234567", 1) == true;
+    assert sha_at("0123456789abcdef0123456789abcdef0123456", 0) == false;
+}
+
+test find_from_finds_the_first_hit_after_the_start {
+    assert find_from("abcabc", "bc", 0) == 1;
+    assert find_from("abcabc", "bc", 2) == 4;
+    assert find_from("abcabc", "xx", 0) == -1;
+    assert find_from("ab", "abc", 0) == -1;
+    assert find_from("abc", "", 0) == -1;
+}
+
+test a_status_is_sent_only_when_its_url_rule_holds {
+    const good : str = "https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=0123456789abcdef0123456789abcdef01234567&path=specs/claw/gates.t27";
+    // success needs both a 200 probe and a pinned URL
+    assert status_ok(S_SUCCESS, good, 200) == true;
+    assert status_ok(S_SUCCESS, good, 404) == false;
+    assert status_ok(S_SUCCESS, good, 0) == false;
+    assert status_ok(S_SUCCESS, "https://t27.ai/t27f/graph/?repo=gHashTag/t27&sha=master&path=specs/a.t27", 200) == false;
+    assert status_ok(S_SUCCESS, "", 200) == false;
+    // every other state carries no URL
+    assert status_ok(S_IN_PROGRESS, "", 0) == true;
+    assert status_ok(S_IN_PROGRESS, good, 200) == false;
+    assert status_ok(S_FAILURE, "", 404) == true;
+    assert status_ok(S_FAILURE, good, 404) == false;
+    assert status_ok(S_INACTIVE, "", 0) == true;
+}
+
+test descriptions_fit_the_api_limit {
+    assert description_ok("T27F graph of 2 changed specs") == true;
+    assert description_ok("") == false;
+    assert description_ok("01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789") == true;
+    assert description_ok("012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890") == false;
+}
+
+test the_surface_slug_and_state_names_are_the_api_spelling {
+    assert recipes::str_eq(SURFACE, "t27f-preview") == true;
+    assert recipes::str_eq(state_name(S_QUEUED), "queued") == true;
+    assert recipes::str_eq(state_name(S_IN_PROGRESS), "in_progress") == true;
+    assert recipes::str_eq(state_name(S_SUCCESS), "success") == true;
+    assert recipes::str_eq(state_name(S_FAILURE), "failure") == true;
+    assert recipes::str_eq(state_name(S_NONE), "") == true;
+}
