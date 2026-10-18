@@ -10814,13 +10814,13 @@ impl Codegen {
             NodeKind::ExprIndex => {
                 // children[0] = base, children[1] = index
                 // W605: a slice carries a third child (the end) and lowers to
-                // Zig's `[a..b]` -- the same half-open range the source means.
-                if node.extra_op == "slice" && node.children.len() >= 3 {
+                // Zig's `[a..b]`; `slice_open` has no end and is `[a..]` (#8200).
+                if node.extra_op.starts_with("slice") && node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
                     self.write("[");
                     self.gen_expr(&node.children[1]);
                     self.write("..");
-                    self.gen_expr(&node.children[2]);
+                    if let Some(end) = node.children.get(2) { self.gen_expr(end); }
                     self.write("]");
                 } else if node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
