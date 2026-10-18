@@ -53,6 +53,7 @@ static const size_t CLASS_LABEL_LENS[3] = { 10, 6, 11 };
 uint8_t class_of(const char* name, size_t name_len);
 bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
+size_t events_len_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
 bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]);
 bool every_row_filled(void);
@@ -96,6 +97,15 @@ const char* events_of(const char* name, size_t name_len) {
         }
     }
     return "";
+}
+
+size_t events_len_of(const char* name, size_t name_len) {
+    for (size_t i = 0; i < 67; i++) {
+        if (str_eq(NAMES[i], NAME_LENS[i], name, name_len)) {
+            return EVENT_LENS[i];
+        }
+    }
+    return 0;
 }
 
 uint32_t count_class(uint8_t c) {
@@ -442,20 +452,26 @@ void test_rows_stay_aligned_name_class_events(void) {
     const char* ol = "own-language";
     const char* ev_qp = "push,schedule,workflow_dispatch";
     const char* ev_ol = "pull_request";
-    assert((NAMES[1] == want1));
+    assert((str_eq(NAMES[1], NAME_LENS[1], want1, 20) == true));
     assert((CLASSES[1] == G_REPORTING));
-    assert((NAMES[42] == want42));
+    assert((str_eq(NAMES[42], NAME_LENS[42], want42, 13) == true));
     assert((CLASSES[42] == G_REPORTING));
-    assert((NAMES[29] == want29));
+    assert((str_eq(NAMES[29], NAME_LENS[29], want29, 14) == true));
     assert((CLASSES[29] == G_SOFT));
-    assert((events_of(qp, 13) == ev_qp));
-    assert((events_of(ol, 12) == ev_ol));
+    assert((str_eq(events_of(qp, 13), events_len_of(qp, 13), ev_qp, 31) == true));
+    assert((str_eq(events_of(ol, 12), events_len_of(ol, 12), ev_ol, 12) == true));
 }
 
 void test_unknown_name_is_unknown_and_not_blocking(void) {
     assert((class_of("no-such-gate", 12) == G_UNKNOWN));
     assert((is_blocking("no-such-gate", 12) == false));
-    assert((events_of("no-such-gate", 12) == ""));
+    assert((events_len_of("no-such-gate", 12) == 0));
+}
+
+void test_events_len_of_answers_every_row(void) {
+    for (size_t i = 0; i < 67; i++) {
+        assert((events_len_of(NAMES[i], NAME_LENS[i]) == EVENT_LENS[i]));
+    }
 }
 
 void test_nightly_pair_contrast(void) {
@@ -523,14 +539,10 @@ void test_audit_ignores_blank_lines_in_the_directory(void) {
 }
 
 void test_audit_prefixes_name_the_problem_kind(void) {
-    const char* spec_only = LINE_PREFIX[P_SPEC_ONLY];
-    assert((spec_only == "SPEC-ONLY  "));
-    const char* dir_only = LINE_PREFIX[P_DIR_ONLY];
-    assert((dir_only == "DIR-ONLY   "));
-    const char* ok = LINE_PREFIX[P_OK];
-    assert((ok == ""));
-    const char* tail = DRIFT_TAIL;
-    assert((tail == "claw: DRIFT -- regenerate specs/claw/gates.t27 (docs/claw/README.md)"));
+    assert((str_eq(LINE_PREFIX[P_SPEC_ONLY], PREFIX_LENS[P_SPEC_ONLY], "SPEC-ONLY  ", 11) == true));
+    assert((str_eq(LINE_PREFIX[P_DIR_ONLY], PREFIX_LENS[P_DIR_ONLY], "DIR-ONLY   ", 11) == true));
+    assert((PREFIX_LENS[P_OK] == 0));
+    assert((str_eq(DRIFT_TAIL, DRIFT_TAIL_LEN, "claw: DRIFT -- regenerate specs/claw/gates.t27 (docs/claw/README.md)", 68) == true));
 }
 
 void test_every_row_round_trips_through_the_name_lookup(void) {
@@ -547,9 +559,9 @@ void test_every_row_round_trips_through_the_name_lookup(void) {
 }
 
 void test_soft_gates_report_their_events(void) {
-    assert((events_of("oracle-nightly", 14) == "schedule,workflow_dispatch"));
-    assert((events_of("queen-doctor", 12) == "schedule,workflow_dispatch"));
-    assert((events_of("rings-rust", 10) == "push,pull_request,workflow_dispatch"));
+    assert((str_eq(events_of("oracle-nightly", 14), events_len_of("oracle-nightly", 14), "schedule,workflow_dispatch", 26) == true));
+    assert((str_eq(events_of("queen-doctor", 12), events_len_of("queen-doctor", 12), "schedule,workflow_dispatch", 26) == true));
+    assert((str_eq(events_of("rings-rust", 10), events_len_of("rings-rust", 10), "push,pull_request,workflow_dispatch", 35) == true));
 }
 
 void test_coverage_report_carries_every_class(void) {
@@ -679,6 +691,7 @@ int main(void) {
     test_class_census_62_3_2();
     test_rows_stay_aligned_name_class_events();
     test_unknown_name_is_unknown_and_not_blocking();
+    test_events_len_of_answers_every_row();
     test_nightly_pair_contrast();
     test_reporting_gates_never_block_a_merge();
     test_audit_clean_when_directory_matches_inventory();
@@ -694,7 +707,7 @@ int main(void) {
     test_a_hole_in_either_column_fails_the_filled_check();
     test_a_repeated_name_is_caught_wherever_it_sits();
     test_a_class_outside_the_three_is_unknown();
-    printf("All %d tests passed.\n", 23);
+    printf("All %d tests passed.\n", 24);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
