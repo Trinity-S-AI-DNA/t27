@@ -37,13 +37,42 @@ Each milestone follows M0's shape. Do not mark one done until all five hold:
 4. **Board receipt.** Bitstream from `t27b verilog` (no hand HDL, no XDC), run on the AX7203 bench (`board-eye`, `bench-agent` skills). Record LUT, FF, DSP, BRAM, Fmax and the UART line.
 5. **Oracle.** From M3 on, ngspice with the named PDK revision and corner. From M5 on, Symbiotic EDA's self-checking evaluator decides.
 
-Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next milestone's sub-issue in the same Goal / Boundary / Scenarios / Requirements shape, update the dashboard, and draft a report.
+Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next milestone's sub-issue in the same Goal / Boundary / Scenarios / Requirements / Success Criteria shape (the issue-shape bot closes an issue without `## Success Criteria`), update the dashboard, and draft a report.
 
 ### Technical choices that are already decided
 
-- **Fixed step, compile-time matrices.** Linear MNA `(G + C/dt) x' = (C/dt) x + B u` folds to `x' = M x + N u` with constants; no solve and no division in fabric. M0 is the 1x1 case (`g = 1/21`). The stability invariant (quantized `M`, spectral radius < 1) belongs in the spec's tests.
+- **Fixed step, compile-time matrices, delta form.** Linear MNA `(G + C/dt) x' = (C/dt) x + B u` folds to `x' = x + rnd(D x + N u)` with `D = M - I` and `N` quantized to Q.24, the sum accumulated exactly and rounded once, half away from zero. M0 is the 1x1 case (`D = -798915`, `N = 798915`), so M0 is reproduced bit for bit by construction. No solve and no division in fabric.
+- **Stability is proved:** `||M_q^256||_inf < 1` in the tests (bounds the spectral radius); `||M_q||_inf < 1` alone fails for an underdamped RLC.
+- **Unsigned in hardware.** `t27b verilog` refuses signed types, so the step keeps a sign flag per term with unsigned magnitudes, as M0 does. f64 is fine inside tests.
 - **Nonlinear devices as per-corner tables first.** `Id(Vgs, Vds)` from the PDK's PSP103 in ngspice, one table per corner (tt ff ss fs sf), one bitstream per corner. Compact-model (Verilog-A) ingest is post-v0.1 research; never promise it for v0.1.
-- **Designers keep their netlist.** The entry point is a SPICE subset read by a t27 program. Unsupported input is refused with the line and the reason, never approximated silently.
+- **Designers keep their netlist; the reader is a t27o front end.** The SPICE subset reader is `specs/tools/t27o/spice_convert.t27` beside `rust_convert.t27`, run as `tri t27o <deck>`, so the project has one converter, not two (DRY). Unsupported input is refused with the line and the reason, never approximated silently. Real IHP decks need `.subckt`, instance parameters (`w`, `l`, `ng`) and `.lib` corner selection early, not late.
+
+## Toolchain for an analog milestone
+
+| Step | Command | Note |
+|---|---|---|
+| syntax | `./target/release/t27c check <spec>` or MCP `t27_check` | parse + typecheck only |
+| tests | `./target/release/t27c test-report <spec>` | per-test assert counts; read `vacuous passes` (must be 0); `tri test` does not check vacuity yet (#10497) |
+| negative control | copy to `$TMPDIR`, break one constant, `test-report` | must FAIL before the PR |
+| seal | `t27c seal <spec> --save`, then `--verify` | commit `.trinity/seals/<dir>_<Module>.json` |
+| board top | `t27b verilog <top spec>` | pin attributes in the spec, no XDC; no signed types |
+| board run | M0's flow, AX7203 = `xc7a200tfbg484-2`, `openFPGALoader -c digilent_hs2` | `t27c fpga-build/fpga-flash` default to Wukong (#10498) |
+| converter | `tri t27o <file> [--check]` | Rust only today; SPICE front end is M2 |
+| who else | `tri topic analog spice <keyword>` | before opening an issue or a lane |
+| PR verdict | `tri pr ready <N> --required-only` | one VERDICT line |
+
+Sandboxed sessions: `export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local`; commit with `git -c core.hooksPath=.githooks commit`; `gh` fails TLS, use curl with `$(gh auth token)`. There is no `t27t` in this repository (searched 2026-10-18); do not invent one.
+
+## The overnight loop tick
+
+A `/loop` tick on this epic follows this order, so a new tick never undoes or duplicates the last one:
+
+1. **Read state.** The ledger is a comment on #10486 (the one headed "Loop ledger"). Read it, `CronList` (delete duplicate crons after a restart), and list running subagents. A lane the ledger says is running is not started again.
+2. **Look for anomalies before new work.** Open PRs of this epic that are red, conflicting or stale (`tri pr ready`); a subagent that reported done but whose PR does not exist (`git ls-remote`); a merged PR whose spec is missing on master (`tri pr landed`); a seal that no longer verifies (`tri seals drift`); a ledger row older than 45 minutes still "running". Fix or file each one first (self-repair beats new work).
+3. **Review on Opus, implement on Sonnet** (`specs/claw/model_route.t27`): at most 3 subagents on the 8 GB Mac; each lane in its own worktree and branch; the orchestrator reads every diff before auto-merge is enabled.
+4. **Merge only green.** Auto-merge after the required checks pass. A red is inherited only if it is a subset of master's failures; `claw-sarif` failing on "permissions requested are not granted to this installation" is the known App-permission red (owner steps in `docs/claw/README.md`).
+5. **Write state.** Edit the ledger row, tick the epic's Progress table, republish the dashboard, and add a learning to this skill when a trap cost more than one try.
+6. **Reports** to the partner are drafted into the dashboard; they are sent only after the owner's explicit yes in chat.
 
 ## Claim guard
 
