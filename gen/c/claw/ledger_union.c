@@ -176,9 +176,6 @@ uint32_t lu_frame(uint8_t* x, size_t n, size_t* fr) {
             s = (e + 1);
         }
     }
-    if ((hs == n)) {
-        return U_SHAPE;
-    }
     if ((hs < (ENTRIES_OPEN_LEN + 1))) {
         return U_SHAPE;
     }
@@ -485,9 +482,6 @@ size_t lu_find(uint8_t* x, size_t n, uint8_t g, size_t fs, size_t fe) {
 bool lu_seal_ok(uint8_t* x, size_t n, size_t ps, size_t pe) {
     size_t sp = lu_find(x, n, 'S', ps, pe);
     size_t se = lu_eol(x, n, sp);
-    if ((sp >= se)) {
-        return false;
-    }
     if ((lu_port_spec(x, (sp + 1), se) == false)) {
         return false;
     }
@@ -971,6 +965,25 @@ void test_additions_at_either_end_of_the_ledger_are_kept(void) {
     assert((lu_cmp(&out, 0, m, &x, 0, xn) == 0));
 }
 
+void test_an_addition_of_theirs_after_ours_is_spent_is_kept(void) {
+    uint8_t b[256] = {0};
+    size_t bn = fixture_pair(&b, 256, "aa", "pass", 4, "cc", "pass", 4);
+    uint8_t t[512] = {0};
+    size_t tn = put_str(&t, 512, 0, FIX_HEAD, FIX_HEAD_LEN);
+    tn = fixture_line(&t, 512, tn, "aa", 2, "pass", 4, false);
+    tn = fixture_line(&t, 512, tn, "cc", 2, "pass", 4, false);
+    tn = fixture_line(&t, 512, tn, "dd", 2, "pass", 4, true);
+    tn = put_str(&t, 512, tn, FIX_FOOT, FIX_FOOT_LEN);
+    uint8_t out[1024] = {0};
+    uint32_t st[4] = {0};
+    size_t m = ledger_union(&b, bn, &t, tn, &b, bn, &out, 1024, &st);
+    assert((st[0] == U_OK));
+    assert((st[1] == 1));
+    assert((st[2] == 3));
+    assert((m == tn));
+    assert((lu_cmp(&out, 0, m, &t, 0, tn) == 0));
+}
+
 void test_both_sides_removing_one_entry_agree(void) {
     uint8_t b[256] = {0};
     size_t bn = fixture_pair(&b, 256, "aa", "pass", 4, "cc", "pass", 4);
@@ -1108,6 +1121,9 @@ void test_the_scope_rule_reads_each_record_exactly(void) {
     n = put_str(&x, 512, 0, "F\tspecs/port/a.t27\nS\t\tspecs/port/a.t27\n", 39);
     m = pr_scope(&x, n, &out, 256, &st);
     assert((st[0] == SC_BAD));
+    n = put_str(&x, 512, 0, "F\tspecs/port/a.t27\nSab\tc\n", 25);
+    m = pr_scope(&x, n, &out, 256, &st);
+    assert((st[0] == SC_BAD));
     n = put_str(&x, 512, 0, "F\t.trinity/seals/a.json\nS\t.trinity/seals/a.json\n", 48);
     m = pr_scope(&x, n, &out, 256, &st);
     assert((st[0] == SC_SEAL));
@@ -1157,6 +1173,7 @@ int main(void) {
     test_the_header_must_end_with_the_entries_key();
     test_a_footer_theirs_changed_is_refused_and_a_frame_both_changed_agrees();
     test_additions_at_either_end_of_the_ledger_are_kept();
+    test_an_addition_of_theirs_after_ours_is_spent_is_kept();
     test_both_sides_removing_one_entry_agree();
     test_marker_lines_counts_only_full_markers_at_a_line_start();
     test_a_port_spec_its_seal_and_the_ledger_are_in_scope();
@@ -1165,7 +1182,7 @@ int main(void) {
     test_an_empty_or_unreadable_file_list_is_refused();
     test_the_scope_rule_reads_each_record_exactly();
     test_the_reason_tables_match_their_lengths();
-    printf("All %d tests passed.\n", 24);
+    printf("All %d tests passed.\n", 25);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
