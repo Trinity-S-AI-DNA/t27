@@ -1,0 +1,695 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/rc_filter_ax7203.t27 -- an analog RC low-pass, emulated in fixed point on the ALINX AX7203
+; The first analog cell: a circuit that C++HDL analog describes and checks against its own solver, written
+; here as a t27 spec, proved in the spec's tests against the same reference, and lowered by `t27b verilog`
+; into a board top that runs it and prints what it got on the UART. Everything hand-written is this file.
+; -
+; THE CIRCUIT. The reference is mirekez/cpphdl, analog/examples/rc_filter: R = 1 kOhm from IN to OUT,
+; C = 1 nF from OUT to ground, OUT starts at 0 V, IN is a 1 V source. cpphdl elaborates the KCL equation
+; (Vout - Vin) / R + C * dVout/dt = 0 and integrates it with backward Euler, 50 ns steps, to 5 us. Its
+; README states the result: 1 - (1/1.05)^100 = 0.992396 V at 5 us, against the continuous 1 - exp(-5) =
+; 0.993262 V; the gap is integration error, and halving the step closes it.
+; -
+; THE STEP. tau = R * C = 1 us and a = dt / tau = 0.05. Backward Euler is v' = (v + a * vin) / (1 + a),
+; which is v' = v + g * (vin - v) with g = a / (1 + a) = 0.05 / 1.05 = 1/21 exactly. In 2^-24 volts,
+; round(2^24 / 21) = 798915, and 798915 * 21 = 2^24 - 1: the binary fraction of 1/21 repeats 000011, so
+; d * 798915 = 3 * (d<<18 + d<<12 + d<<6 + d). The device constant becomes four shifted adds; no
+; multiplier and no DSP slice. The product is rounded half up back to 2^-24 V.
+; -
+; THE NUMBERS. Voltages are u32 in units of 2^-24 V (1 V = 16777216). Charging, |vin - v| <= 1 V, so the
+; difference fits 25 bits and every product fits 44. The direction is kept as a flag, so the same step
+; charges and discharges with no signed type.
+; -
+; THE RUN. 200 steps: IN = 1 V for steps 0..99 (charge, 0 .. 5 us), IN = 0 V for steps 100..199
+; (discharge, 5 .. 10 us). A = OUT after step 99 (5 us), B = OUT after step 199 (10 us), S = an
+; order-sensitive fold of all 200 samples, C = the clocks the run took.
+; -
+; THE MACHINE. One adder per clock, six clocks a step, at 100 MHz (a PLL from the 200 MHz oscillator): P0 the difference and
+; its sign, P1 two pair sums of shifted copies, P2 their sum, P3 times three, P4 the rounding shift, P5
+; the new OUT and the fold. on_clock reads every register before it writes it, so the tests in this file
+; and the clock edge agree.
+; -
+; THE RECEIPT. 115200 baud on N15 (divider 868 from 100 MHz), one line, sent again and again:
+;   T27 RC A=<16 hex> B=<16 hex> S=<16 hex> C=<16 hex> L=<16 hex> PASS
+; L is the line's number; the word is PASS when A, B and S are the values this file's tests derive, else
+; FAIL. LEDs (active low): B13 the run is over, C13 FAIL, D14 PASS, D15 a heartbeat. The button T6
+; (active low) resets and so runs it again.
+; -
+; WHAT A PASS SAYS. This board, running RTL generated from this file, integrated the RC circuit of the
+; cpphdl example for 200 steps and produced the same 200 samples, bit for bit, that the spec's model
+; produces; those samples are within 3 LSB (1.6e-7 V) of the double-precision backward Euler solution.
+; WHAT IT DOES NOT SAY. Nothing about power: nothing on the board measures it. Nothing about circuits
+; other than this one: R, C and dt are compiled into the coefficient, so another RC needs another
+; coefficient, and a nonlinear device needs a device model this cell does not have. Nothing about
+; Verilog-A or SPICE netlists: the circuit was written as t27 by hand from the example.
+; ASCII only, English only.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module FpgaRcFilter;
+
+pub const KIND : str = "board-cell";
+pub const ID : str = "fpga/rc_filter_ax7203";
+pub const REFERENCE : str = "mirekez/cpphdl analog/examples/rc_filter";
+pub const BOARD : str = "ALINX AX7203";
+pub const PART : str = "xc7a200tfbg484-2";
+
+; --- the circuit --------------------------------------------------------------------------------
+pub const R_OHM : u32 = 1000;
+pub const C_PF : u32 = 1000;
+pub const DT_NS : u32 = 50;
+pub const TAU_NS : u32 = 1000;
+
+; --- the numbers --------------------------------------------------------------------------------
+/// 1 V in units of 2^-24 V.
+pub const ONE : u32 = 16777216;
+/// round(2^24 / 21): g = dt / (tau + dt) = 1/21 in units of 2^-24.
+pub const G21 : u64 = 798915;
+/// Half an LSB of the product's 2^-48 V scale, for rounding half up.
+pub const HALF_LSB : u64 = 8388608;
+
+; --- the run ------------------------------------------------------------------------------------
+pub const STEPS : u32 = 200;
+pub const CHARGE_STEPS : u32 = 100;
+pub const PHASES : u8 = 6;
+pub const RUN_CLOCKS : u32 = 1200;
+pub const SYS_MHZ : u32 = 100;
+
+; --- what the board must report, derived by the tests below ---------------------------------------
+pub const EXP_A : u32 = 16649635;
+pub const EXP_B : u32 = 126610;
+pub const EXP_S : u64 = 0x77EDFF0295C3FE9E;
+
+; --- the reference numbers the cpphdl README states ---------------------------------------------------
+/// 1 - (1/1.05)^100: cpphdl's backward Euler at 5 us, to the 6 places its README prints.
+pub const CPPHDL_5US : f64 = 0.992396;
+/// 1 - exp(-5): the continuous answer at 5 us.
+pub const ANALYTIC_5US : f64 = 0.9932620530009145;
+
+pub const V_PASS : u8 = 0;
+pub const V_FAIL : u8 = 1;
+
+pub const ST_RUN : u8 = 0;
+pub const ST_JUDGE : u8 = 1;
+pub const ST_REPORT : u8 = 2;
+
+pub const BAUD_DIV : u16 = 868;
+pub const LINE_SEGS : u8 = 7;
+pub const LINE_CHARS : u32 = 108;
+
+; --- the step ------------------------------------------------------------------------------------
+
+/// The input source at step n: 1 V while charging, then 0 V.
+pub fn vin_at(n: u32) -> u32 {
+    if (n < CHARGE_STEPS) { return ONE; }
+    return 0;
+}
+
+/// |a - b|.
+pub fn absdiff(a: u32, b: u32) -> u32 {
+    if (a >= b) { return a - b; }
+    return b - a;
+}
+
+/// d * 798915 as four shifted adds and a times three: 798915 = 3 * (2^18 + 2^12 + 2^6 + 1).
+pub fn mul_g21(d: u32) -> u64 {
+    const w : u64 = d as u64;
+    const s : u64 = ((w << 18) + (w << 12)) + ((w << 6) + w);
+    return (s << 1) + s;
+}
+
+/// The product back to 2^-24 V, rounded half up.
+pub fn round_back(t: u64) -> u32 {
+    return ((t + HALF_LSB) >> 24) as u32;
+}
+
+/// OUT after one step: up by u when charging (vin >= v), else down by u.
+pub fn next_v(v: u32, u: u32, up: bool) -> u32 {
+    if (up) { return v + u; }
+    return v - u;
+}
+
+/// One backward Euler step of the RC, as the board computes it.
+pub fn rc_step(v: u32, vin: u32) -> u32 {
+    return next_v(v, round_back(mul_g21(absdiff(vin, v))), vin >= v);
+}
+
+/// The same step for any coefficient g (units 2^-24), with a multiplier: the reference for other steps.
+pub fn rc_step_g(v: u32, vin: u32, g: u64) -> u32 {
+    return next_v(v, round_back((absdiff(vin, v) as u64) * g), vin >= v);
+}
+
+/// The fold after one more sample: rotate left by one, xor the sample in. Order matters.
+pub fn fold(sum: u64, x: u32) -> u64 {
+    return ((sum << 1) | (sum >> 63)) ^ (x as u64);
+}
+
+/// PASS when the run gave the derived A, B and S.
+pub fn verdict_of(a: u32, b: u32, s: u64) -> u8 {
+    if (a == EXP_A and b == EXP_B and s == EXP_S) { return V_PASS; }
+    return V_FAIL;
+}
+
+; --- the double-precision references live in the tests ----------------------------------------------
+; t27c gen-verilog turns a module-level f64 fn into a Verilog `function real`, which yosys refuses,
+; so the f64 backward-Euler runs are written inline in the tests and compared as squares:
+; |d| < t is d * d < t * t.
+
+/// Volts per raw unit is 1 / SCALE.
+pub const SCALE : f64 = 16777216.0;
+
+; --- the receipt --------------------------------------------------------------------------------
+
+/// The ASCII digit of a nibble, 0-9 A-F.
+pub fn hex_digit(n: u8) -> u8 {
+    if ((n & 15) < 10) { return 48 + (n & 15); }
+    return 55 + (n & 15);
+}
+
+/// The key letter of field s (1..5): A B S C L.
+pub fn key_of(s: u8) -> u8 {
+    if (s == 1) { return 65; }
+    if (s == 2) { return 66; }
+    if (s == 3) { return 83; }
+    if (s == 4) { return 67; }
+    return 76;
+}
+
+/// Character p of "T27 RC".
+pub fn prefix_char(p: u8) -> u8 {
+    if (p == 0) { return 84; }
+    if (p == 1) { return 50; }
+    if (p == 2) { return 55; }
+    if (p == 3) { return 32; }
+    if (p == 4) { return 82; }
+    return 67;
+}
+
+/// Character p of " PASS\r\n" or " FAIL\r\n".
+pub fn verdict_char(v: u8, p: u8) -> u8 {
+    if (p == 0) { return 32; }
+    if (p == 5) { return 13; }
+    if (p == 6) { return 10; }
+    if (v == V_PASS) {
+        if (p == 1) { return 80; }
+        if (p == 2) { return 65; }
+        return 83;
+    }
+    if (p == 1) { return 70; }
+    if (p == 2) { return 65; }
+    if (p == 3) { return 73; }
+    return 76;
+}
+
+/// The character at segment s, position p; `fsr` holds the field being written, its next nibble on top.
+pub fn line_char(s: u8, p: u8, fsr: u64, v: u8) -> u8 {
+    if (s == 0) { return prefix_char(p); }
+    if (s == 6) { return verdict_char(v, p); }
+    if (p == 0) { return 32; }
+    if (p == 1) { return key_of(s); }
+    if (p == 2) { return 61; }
+    return hex_digit((fsr >> 60) as u8);
+}
+
+/// The last position of segment s.
+pub fn seg_last(s: u8) -> u8 {
+    if (s == 0) { return 5; }
+    if (s == 6) { return 6; }
+    return 18;
+}
+
+/// A UART frame, sent low bit first: a start bit 0, the 8 data bits, a stop bit 1.
+pub fn frame(ch: u8) -> u16 {
+    return ((ch as u16) << 1) | 512;
+}
+
+/// The value of receipt field s (1..5), A B S C L.
+pub fn field(s: u8, a: u32, b: u32, sum: u64, c: u32, l: u32) -> u64 {
+    if (s == 1) { return a as u64; }
+    if (s == 2) { return b as u64; }
+    if (s == 3) { return sum; }
+    if (s == 4) { return c as u64; }
+    return l as u64;
+}
+
+; --- the board ----------------------------------------------------------------------------------
+
+/// A differential input buffer (the 200 MHz oscillator on R4/T4).
+pub struct IbufdsOut { O: bool }
+pub fn IBUFDS(I: bool, IB: bool) -> IbufdsOut {}
+
+/// A global clock buffer.
+pub struct BufgOut { O: bool }
+pub fn BUFG(I: bool) -> BufgOut {}
+
+/// A PLL: 200 MHz in, VCO = 200 * 8 = 1600 MHz, CLKOUT0 = 1600 / 16 = 100 MHz; CLKFBOUT feeds CLKFBIN.
+/// The settings are the ones LiteDRAM's S7PLL used on this board for the DDR3 cell, which locked.
+pub struct PllOut { CLKOUT0: bool, CLKFBOUT: bool, LOCKED: bool }
+/// CLKIN1_PERIOD and REF_JITTER1 are f64, not comptime_float: t27b, which runs these tests and lowers this file to the
+/// board RTL, rejects a comptime_float parameter (#10313); gen-verilog no longer reads t27b bitstream specs (#10302).
+pub fn PLLE2_ADV(CLKIN1: bool, CLKFBIN: bool, RST: bool, PWRDWN: bool, CLKIN1_PERIOD: f64, REF_JITTER1: f64, CLKFBOUT_MULT: comptime_int, DIVCLK_DIVIDE: comptime_int, CLKOUT0_DIVIDE: comptime_int, CLKOUT0_PHASE: comptime_int, STARTUP_WAIT: str) -> PllOut {}
+
+/// An input buffer, so the button reaches on_clock as an instance output (btn_O).
+pub struct IbufOut { O: bool }
+pub fn IBUF(I: bool) -> IbufOut {}
+
+; --- the pins in --------------------------------------------------------------------------------
+const clk200_p : bool = undefined;
+const clk200_p_LOC : str = "R4";
+const clk200_p_IOSTANDARD : str = "DIFF_SSTL15";
+const clk200_n : bool = undefined;
+const clk200_n_LOC : str = "T4";
+const clk200_n_IOSTANDARD : str = "DIFF_SSTL15";
+const cpu_reset_n : bool = undefined;
+const cpu_reset_n_LOC : str = "T6";
+const cpu_reset_n_IOSTANDARD : str = "LVCMOS15";
+
+; --- the clock and the reset --------------------------------------------------------------------
+const clkbuf : IbufdsOut = IBUFDS(clk200_p, clk200_n);
+const clkbuf_O_PERIOD_PS : u32 = 5000;
+const pll : PllOut = PLLE2_ADV(clkbuf.O, pll.CLKFBOUT, false, false, 5.0, 0.01, 8, 1, 16, 0, "FALSE");
+const gclk : BufgOut = BUFG(pll.CLKOUT0);
+const gclk_O_PERIOD_PS : u32 = 10000;
+
+const btn : IbufOut = IBUF(cpu_reset_n);
+
+// No asynchronous reset: an async clear released between two edges lets some registers start one clock
+// before the others (a lab mutant printed C=1199 that way). The button and LOCKED pass two registers,
+// and while they say no, on_clock puts every register back to its start on the edge.
+const clk : bool = gclk.O;
+const rst_n : bool = true;
+const en : bool = true;
+
+; --- the registers ------------------------------------------------------------------------------
+var st : u8 = 0;
+var ph : u8 = 0;
+var step_n : u32 = 0;
+var vout : u32 = 0;
+var vup : bool = true;
+var dlt : u32 = 0;
+var pa : u64 = 0;
+var pb : u64 = 0;
+var psum : u64 = 0;
+var ptri : u64 = 0;
+var pinc : u32 = 0;
+var va : u32 = 0;
+var vb : u32 = 0;
+var cs : u64 = 0;
+var cyc : u32 = 0;
+var verdict : u8 = 1;
+var baud_div : u16 = 868;
+var tx_cnt : u16 = 0;
+var tx_sh : u16 = 1023;
+var tx_left : u8 = 0;
+var seg : u8 = 0;
+var pos : u8 = 0;
+var fsr : u64 = 0;
+var lines : u32 = 0;
+var hb : u32 = 0;
+var go0 : bool = false;
+var go1 : bool = false;
+
+; --- the pins out: registers, set from the state one clock later (a pub var is an output reg) ----
+pub var uart_tx : bool = true;
+const uart_tx_LOC : str = "N15";
+const uart_tx_IOSTANDARD : str = "LVCMOS33";
+pub var led_0 : bool = true;
+const led_0_LOC : str = "B13";
+const led_0_IOSTANDARD : str = "LVCMOS33";
+pub var led_1 : bool = true;
+const led_1_LOC : str = "C13";
+const led_1_IOSTANDARD : str = "LVCMOS33";
+pub var led_2 : bool = true;
+const led_2_LOC : str = "D14";
+const led_2_IOSTANDARD : str = "LVCMOS33";
+pub var led_3 : bool = false;
+const led_3_LOC : str = "D15";
+const led_3_IOSTANDARD : str = "LVCMOS33";
+
+// Every var is read before it is written, so the test's order and the clock edge agree.
+fn on_clock(pll_LOCKED: bool, btn_O: bool) {
+    uart_tx = st != ST_REPORT or (tx_sh & 1) == 1;
+    led_0 = st != ST_REPORT;
+    led_1 = !(st == ST_REPORT and verdict == V_FAIL);
+    led_2 = !(st == ST_REPORT and verdict == V_PASS);
+    led_3 = ((hb >> 27) & 1) == 1;
+    hb = hb + 1;
+    if (!go1) {
+        st = ST_RUN;
+        ph = 0;
+        step_n = 0;
+        vout = 0;
+        cs = 0;
+        cyc = 0;
+        va = 0;
+        vb = 0;
+        verdict = V_FAIL;
+        tx_cnt = 0;
+        tx_sh = 1023;
+        tx_left = 0;
+        seg = 0;
+        pos = 0;
+        fsr = 0;
+        lines = 0;
+    } else if (st == ST_RUN) {
+        cyc = cyc + 1;
+        if (ph == 0) {
+            vup = vin_at(step_n) >= vout;
+            dlt = absdiff(vin_at(step_n), vout);
+        } else if (ph == 1) {
+            pa = ((dlt as u64) << 18) + ((dlt as u64) << 12);
+            pb = ((dlt as u64) << 6) + (dlt as u64);
+        } else if (ph == 2) {
+            psum = pa + pb;
+        } else if (ph == 3) {
+            ptri = (psum << 1) + psum;
+        } else if (ph == 4) {
+            pinc = round_back(ptri);
+        } else {
+            cs = fold(cs, next_v(vout, pinc, vup));
+            if (step_n == CHARGE_STEPS - 1) { va = next_v(vout, pinc, vup); }
+            if (step_n == STEPS - 1) {
+                vb = next_v(vout, pinc, vup);
+                st = ST_JUDGE;
+            }
+            vout = next_v(vout, pinc, vup);
+            step_n = step_n + 1;
+        }
+        if (ph == PHASES - 1) {
+            ph = 0;
+        } else {
+            ph = ph + 1;
+        }
+    } else if (st == ST_JUDGE) {
+        verdict = verdict_of(va, vb, cs);
+        st = ST_REPORT;
+    } else {
+        if (tx_cnt != 0) {
+            tx_cnt = tx_cnt - 1;
+        } else {
+            tx_cnt = baud_div - 1;
+            if (tx_left != 0) {
+                tx_sh = (tx_sh >> 1) | 512;
+                tx_left = tx_left - 1;
+            } else {
+                tx_sh = frame(line_char(seg, pos, fsr, verdict));
+                tx_left = 9;
+                if (pos == seg_last(seg)) {
+                    fsr = field(seg + 1, va, vb, cs, cyc, lines);
+                    pos = 0;
+                    if (seg == LINE_SEGS - 1) {
+                        seg = 0;
+                        lines = lines + 1;
+                    } else {
+                        seg = seg + 1;
+                    }
+                } else {
+                    if (seg != 0 and seg != LINE_SEGS - 1 and pos >= 3) { fsr = fsr << 4; }
+                    pos = pos + 1;
+                }
+            }
+        }
+    }
+    go1 = go0;
+    go0 = pll_LOCKED and btn_O;
+}
+
+; --- the tests ----------------------------------------------------------------------------------
+
+test the_coefficient_is_one_over_21 {
+    assert_eq(G21 * 21, (ONE as u64) - 1);
+    assert_eq(TAU_NS, R_OHM * C_PF / 1000);
+    const dg : f64 = 0.05 / 1.05 - 1.0 / 21.0;
+    assert dg * dg < 0.000000000000001 * 0.000000000000001;
+    assert_eq(mul_g21(1), G21);
+    assert_eq(mul_g21(ONE), (ONE as u64) * G21);
+    assert_eq(mul_g21(12345678), 12345678 * G21);
+    assert_eq(mul_g21(16777215), 16777215 * G21);
+    assert_eq(round_back(mul_g21(ONE)), 798915);
+    assert_eq(round_back(8388607), 0);
+    assert_eq(round_back(8388608), 1);
+}
+
+test the_first_steps_are_backward_euler {
+    assert_eq(rc_step(0, ONE), 798915);
+    assert_eq(rc_step(798915, ONE), 1559786);
+    assert_eq(rc_step(ONE, 0), ONE - 798915);
+    assert_eq(rc_step(ONE, ONE), ONE);
+    assert_eq(rc_step(0, 0), 0);
+    assert_eq(rc_step_g(1559786, ONE, G21), rc_step(1559786, ONE));
+    const x1 : f64 = 0.05 / 1.05;
+    const x2 : f64 = (x1 + 0.05) / 1.05;
+    const r1 : u32 = rc_step(0, ONE);
+    const r2 : u32 = rc_step(798915, ONE);
+    const d1 : f64 = (r1 as f64) / SCALE - x1;
+    const d2 : f64 = (r2 as f64) / SCALE - x2;
+    assert d1 * d1 < 0.00000006 * 0.00000006;
+    assert d2 * d2 < 0.00000006 * 0.00000006;
+}
+
+test the_charge_at_5_us_is_cpphdls_0_992396 {
+    var v : u32 = 0;
+    var x : f64 = 0.0;
+    var k : u32 = 0;
+    while (k < CHARGE_STEPS) {
+        v = rc_step(v, ONE);
+        x = (x + 0.05) / 1.05;
+        k = k + 1;
+    }
+    assert_eq(v, EXP_A);
+    const vv : f64 = (v as f64) / SCALE;
+    const dc : f64 = vv - CPPHDL_5US;
+    const dx : f64 = vv - x;
+    const xc : f64 = x - CPPHDL_5US;
+    const xa : f64 = x - ANALYTIC_5US;
+    assert dc * dc < 0.0000005 * 0.0000005;
+    assert dx * dx < 0.0000002 * 0.0000002;
+    assert xc * xc < 0.0000005 * 0.0000005;
+    assert xa * xa > 0.0008 * 0.0008;
+    assert xa * xa < 0.0009 * 0.0009;
+}
+
+test the_whole_run_stays_within_3_lsb_of_f64 {
+    var v : u32 = 0;
+    var x : f64 = 0.0;
+    var sum : u64 = 0;
+    var worst : f64 = 0.0;
+    var k : u32 = 0;
+    var d : f64 = 0.0;
+    var u : u32 = 0;
+    while (k < STEPS) {
+        u = vin_at(k);
+        v = rc_step(v, u);
+        x = (x + 0.05 * ((u as f64) / SCALE)) / 1.05;
+        sum = fold(sum, v);
+        d = (v as f64) / SCALE - x;
+        if (d * d > worst) { worst = d * d; }
+        k = k + 1;
+    }
+    assert_eq(v, EXP_B);
+    assert_eq(sum, EXP_S);
+    assert worst < (3.0 / SCALE) * (3.0 / SCALE);
+    assert worst > 0.0;
+    assert_eq(verdict_of(EXP_A, v, sum), V_PASS);
+}
+
+test halving_the_step_converges_toward_the_analytic {
+    var x1 : f64 = 0.0;
+    var x2 : f64 = 0.0;
+    var v : u32 = 0;
+    var k : u32 = 0;
+    while (k < 200) {
+        if (k < 100) { x1 = (x1 + 0.05) / 1.05; }
+        x2 = (x2 + 0.025) / 1.025;
+        v = rc_step_g(v, ONE, 409200);
+        k = k + 1;
+    }
+    const d1 : f64 = x1 - ANALYTIC_5US;
+    const d2 : f64 = x2 - ANALYTIC_5US;
+    const q1 : f64 = d1 * d1;
+    const q2 : f64 = d2 * d2;
+    assert q2 < q1;
+    assert q1 / q2 > 1.9 * 1.9;
+    assert q1 / q2 < 2.1 * 2.1;
+    const vv : f64 = (v as f64) / SCALE;
+    const dv : f64 = vv - x2;
+    const da : f64 = vv - ANALYTIC_5US;
+    assert dv * dv < 0.000002 * 0.000002;
+    assert da * da < q1;
+}
+
+test the_fold_knows_the_order_and_a_wrong_rounding_fails {
+    assert fold(fold(0, 1), 2) != fold(fold(0, 2), 1);
+    assert_eq(fold(0x8000000000000000, 0), 1);
+    var v : u32 = 0;
+    var k : u32 = 0;
+    while (k < CHARGE_STEPS) {
+        v = next_v(v, (mul_g21(absdiff(ONE, v)) >> 24) as u32, ONE >= v);
+        k = k + 1;
+    }
+    assert v != EXP_A;
+    assert_eq(v, 16649624);
+    assert_eq(verdict_of(v, EXP_B, EXP_S), V_FAIL);
+    assert_eq(verdict_of(EXP_A, EXP_B, EXP_S ^ 1), V_FAIL);
+    assert_eq(verdict_of(EXP_A, EXP_B + 1, EXP_S), V_FAIL);
+}
+
+test the_board_machine_gives_the_same_200_samples {
+    st = ST_RUN;
+    ph = 0;
+    step_n = 0;
+    vout = 0;
+    cs = 0;
+    cyc = 0;
+    va = 0;
+    vb = 0;
+    verdict = V_FAIL;
+    go0 = true;
+    go1 = true;
+    var ticks : u32 = 0;
+    var model : u32 = 0;
+    while (st == ST_RUN) {
+        on_clock(true, true);
+        ticks = ticks + 1;
+        if (ph == 0) {
+            model = rc_step(model, vin_at(step_n - 1));
+            assert_eq(vout, model);
+        }
+    }
+    assert_eq(ticks, RUN_CLOCKS);
+    assert_eq(cyc, RUN_CLOCKS);
+    assert_eq(step_n, STEPS);
+    assert_eq(va, EXP_A);
+    assert_eq(vb, EXP_B);
+    assert_eq(cs, EXP_S);
+    assert_eq(st, ST_JUDGE);
+    on_clock(true, true);
+    assert_eq(st, ST_REPORT);
+    assert_eq(verdict, V_PASS);
+    assert_eq((RUN_CLOCKS as u64) * 1000 / (SYS_MHZ as u64), 12000);
+    assert_eq((SYS_MHZ as u32) * 1000000 / (BAUD_DIV as u32), 115207);
+}
+
+test the_run_starts_two_clocks_after_lock_and_button_and_restarts_on_the_button {
+    go0 = false;
+    go1 = false;
+    st = ST_REPORT;
+    cyc = 77;
+    lines = 5;
+    on_clock(false, true);
+    on_clock(true, false);
+    on_clock(false, false);
+    assert_eq(st, ST_RUN);
+    assert_eq(cyc, 0);
+    assert_eq(lines, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 1);
+    var k : u32 = 0;
+    while (st != ST_REPORT) {
+        on_clock(true, true);
+        k = k + 1;
+    }
+    assert_eq(k, RUN_CLOCKS);
+    assert_eq(cyc, RUN_CLOCKS);
+    assert_eq(verdict, V_PASS);
+    on_clock(true, false);
+    on_clock(true, true);
+    assert_eq(st, ST_REPORT);
+    on_clock(true, true);
+    assert_eq(st, ST_RUN);
+    assert_eq(cyc, 0);
+    assert_eq(verdict, V_FAIL);
+}
+
+test the_receipt_line_reads_back {
+    st = ST_REPORT;
+    va = EXP_A;
+    vb = EXP_B;
+    cs = EXP_S;
+    cyc = RUN_CLOCKS;
+    lines = 0;
+    verdict = V_PASS;
+    baud_div = 1;
+    tx_cnt = 0;
+    tx_sh = 1023;
+    tx_left = 0;
+    seg = 0;
+    pos = 0;
+    fsr = 0;
+    go0 = true;
+    go1 = true;
+    var got : u32 = 0;
+    var bits : u32 = 0;
+    var ch : u8 = 0;
+    var line : u32 = 0;
+    while (line < 2) {
+        on_clock(true, true);
+        bits = bits + 1;
+        if (tx_left == 9) {
+            assert_eq(tx_sh & 1, 0);
+            assert_eq(tx_sh >> 9, 1);
+            ch = ((tx_sh >> 1) & 255) as u8;
+            if (got == 0) { assert_eq(ch, 84); }
+            if (got == 4) { assert_eq(ch, 82); }
+            if (got == 5) { assert_eq(ch, 67); }
+            if (got == 7) { assert_eq(ch, 65); }
+            if (got == 8) { assert_eq(ch, 61); }
+            if (got == 9) { assert_eq(ch, 48); }
+            if (got == 19) { assert_eq(ch, 70); }
+            if (got == 20) { assert_eq(ch, 69); }
+            if (got == 24) { assert_eq(ch, 51); }
+            if (got == 26) { assert_eq(ch, 66); }
+            if (got == 43) { assert_eq(ch, 50); }
+            if (got == 45) { assert_eq(ch, 83); }
+            if (got == 47) { assert_eq(ch, 55); }
+            if (got == 62) { assert_eq(ch, 69); }
+            if (got == 64) { assert_eq(ch, 67); }
+            if (got == 80) { assert_eq(ch, 66); }
+            if (got == 83) { assert_eq(ch, 76); }
+            if (line == 0 and got == 100) { assert_eq(ch, 48); }
+            if (line == 1 and got == 100) { assert_eq(ch, 49); }
+            if (got == 102) { assert_eq(ch, 80); }
+            if (got == 105) { assert_eq(ch, 83); }
+            if (got == 106) { assert_eq(ch, 13); }
+            if (ch == 10) {
+                assert_eq(got + 1, LINE_CHARS);
+                got = 0;
+                line = line + 1;
+            } else {
+                got = got + 1;
+            }
+        }
+    }
+    assert_eq(lines, 2);
+    assert_eq(bits, (2 * LINE_CHARS - 1) * 10 + 1);
+}
+
+test the_pins_show_the_state_one_clock_later {
+    st = ST_REPORT;
+    verdict = V_PASS;
+    tx_sh = 1022;
+    tx_cnt = 5;
+    hb = 0x08000000;
+    go0 = true;
+    go1 = true;
+    on_clock(true, true);
+    assert(!uart_tx);
+    assert(!led_0);
+    assert(led_1);
+    assert(!led_2);
+    assert(led_3);
+    verdict = V_FAIL;
+    tx_sh = 1023;
+    on_clock(true, true);
+    assert(uart_tx);
+    assert(!led_1);
+    assert(led_2);
+    st = ST_JUDGE;
+    on_clock(true, true);
+    assert(uart_tx);
+    assert(led_0);
+    assert(led_1);
+}
