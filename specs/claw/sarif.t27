@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/sarif.t27 -- t27c findings as a SARIF 2.1.0 document, so they land in the GitHub
+; Security tab and inline on the PR diff instead of dying in a job log (epic #9271, surface row
+; `code-scanning-sarif` of specs/claw/github_surface.t27: security_events write,
+; POST /repos/{o}/{r}/code-scanning/sarifs).
+; --
+; What is LOGIC and lives here: the rule table (id, slug, text), the severity mapping, the path
+; and region rules, the JSON escaping, the result cap, and the document itself. What is NOT here:
+; any I/O. The caller hands in the findings as text and gets the document back in a buffer; the
+; upload is `github/codeql-action/upload-sarif` with the job's own GITHUB_TOKEN
+; (`security-events: write`), which needs no App token at all.
+; --
+; Input contract, one finding per line, six TAB-separated fields:
+;   severity  slug  path  line  col  message
+; severity is t27c's own word (specs/compiler/diagnostics.t27 Severity): error, warning, info;
+; `note` is accepted because SARIF spells info that way. slug is one of the four rules below.
+; path is repo-relative. line and col are decimal; 0 means "t27c did not say" and is clamped to 1,
+; because SARIF regions start at 1 and a region GitHub cannot place drops the alert from the diff.
+; message is the rest of the line, tabs included.
+; --
+; Fail closed, never guess. A line whose severity, slug, path, line, col or message does not
+; check is DROPPED, never downgraded to `note` or pinned to line 1 of some file. The count of
+; dropped lines (sarif_dropped) is also written into the document as
+; invocations[0].executionSuccessful = false, so a partial upload says it is partial. A buffer
+; too small for the document is detected by sarif_fits; the caller must not upload then.
+; --
+; Paths are accepted only when they are plain: printable ASCII, no space, none of  " \ % # ? :
+; and no `..`. A path that needs escaping is a path nobody can click through to, so it is a
+; finding to fix upstream, not one to encode. Messages are escaped: " and \ are backslashed and
+; every byte outside printable ASCII becomes `?`, so the JSON is valid whatever t27c printed and
+; a clipped multi-byte sequence cannot break it. A message is cut at MSG_MAX bytes with `...`.
+; --
+; gen-c lowers str to const char* and cannot express .len, so every string carries its length
+; explicitly (the specs/claw/gates.t27 idiom); the pins that tie each length to the bytes live in
+; specs/claw/sarif_pins.t27, which is never passed to gen-c. put_str, digit_byte, put_count and
+; buf_has are the shared writers of specs/claw/text.t27; `use claw::text;` splices them in before
+; gen-c runs, so this file still lowers alone without a second copy of them.
+; The honest limit: this shapes a document that follows the SARIF 2.1.0 fields GitHub reads. It
+; does not prove GitHub accepts a given upload (size and result limits are GitHub's), and t27c
+; does not print the TSV above today -- the adapter from its output is the wiring step.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawSarif;
+
+use claw::text;
+
+/// Severity classes, in SARIF level order. SEV_NONE is deliberately far from the real values so
+/// an unknown word cannot be mistaken for a level.
+pub const SEV_ERROR : u8 = 0;
+pub const SEV_WARNING : u8 = 1;
+pub const SEV_NOTE : u8 = 2;
+pub const SEV_NONE : u8 = 255;
+
+/// SARIF level spelling of each severity class, with lengths.
+pub const LEVELS : [3]str = ["error", "warning", "note"];
+pub const LEVEL_LENS : [3]usize = [5, 7, 4];
+
+/// Rule table, one row per rule. IDs are stable: a code-scanning alert is keyed by its rule id,
+/// so renumbering a row would close every open alert of that rule.
+pub const RULE_COUNT : u32 = 4;
+pub const RULE_IDS : [4]str = ["T27C001", "T27C002", "T27C003", "T27C004"];
+pub const ID_LEN : usize = 7;
+pub const RULE_SLUGS : [4]str = ["parse-error", "test-failed", "vacuous-test", "unwritten-spec"];
+pub const RULE_SLUG_LENS : [4]usize = [11, 11, 12, 14];
+pub const RULE_TEXTS : [4]str = [
+    "t27c could not parse the spec",
+    "a test block of the spec failed when t27c test-report ran it",
+    "a test passed with zero runtime asserts executed, so it checks nothing",
+    "the spec declares functions with no body (spec-status UNWRITTEN)",
+];
+pub const RULE_TEXT_LENS : [4]usize = [29, 60, 70, 64];
+
+/// Fixed fragments of the document, with lengths.
+pub const SCHEMA_URL : str = "https://json.schemastore.org/sarif-2.1.0.json";
+pub const SCHEMA_URL_LEN : usize = 45;
+pub const INFO_URL : str = "https://github.com/gHashTag/t27";
+pub const INFO_URL_LEN : usize = 31;
+
+/// Most results one document carries; the rest are dropped and counted. GitHub shows the top
+/// 5000 and refuses a run past 25000, so a smaller cap keeps the upload fast and the PR readable.
+pub const DEFAULT_MAX_RESULTS : u32 = 1000;
+/// Longest message kept, in bytes.
+pub const MSG_MAX : usize = 500;
+
+fn put_byte(dst : []u8, cap : usize, w : usize, b : u8) -> usize {
+    if (w < cap) { dst[w] = b; }
+    return w + 1;
+}
+
+/// `"s"` -- s must already be JSON-safe (every caller passes a literal of this file).
+fn put_q(dst : []u8, cap : usize, w : usize, s : str, n : usize) -> usize {
+    var x : usize = put_byte(dst, cap, w, 34);
+    x = put_str(dst, cap, x, s, n);
+    x = put_byte(dst, cap, x, 34);
+    return x;
+}
+
+/// `"key":`
+fn put_key(dst : []u8, cap : usize, w : usize, s : str, n : usize) -> usize {
+    var x : usize = put_q(dst, cap, w, s, n);
+    x = put_byte(dst, cap, x, ':');
+    return x;
+}
+
+/// Message text, escaped: `"` and `\` get a backslash, every byte outside printable ASCII
+/// becomes `?`, and at most maxn bytes are read; a longer message ends in `...`.
+fn put_json_text(dst : []u8, cap : usize, w : usize, text : []const u8, s : usize, e : usize, maxn : usize) -> usize {
+    var x : usize = w;
+    var i : usize = s;
+    while (i < e and i - s < maxn) {
+        const b : u8 = text[i];
+        if (b == 34) {
+            x = put_byte(dst, cap, x, 92);
+            x = put_byte(dst, cap, x, 34);
+        } else if (b == 92) {
+            x = put_byte(dst, cap, x, 92);
+            x = put_byte(dst, cap, x, 92);
+        } else if (b < 32 or b > 126) {
+            x = put_byte(dst, cap, x, '?');
+        } else {
+            x = put_byte(dst, cap, x, b);
+        }
+        i += 1;
+    }
+    if (i < e) { x = put_str(dst, cap, x, "...", 3); }
+    return x;
+}
+
+fn digit_val(b : u8) -> i32 {
+    if (b == '0') { return 0; }
+    if (b == '1') { return 1; }
+    if (b == '2') { return 2; }
+    if (b == '3') { return 3; }
+    if (b == '4') { return 4; }
+    if (b == '5') { return 5; }
+    if (b == '6') { return 6; }
+    if (b == '7') { return 7; }
+    if (b == '8') { return 8; }
+    if (b == '9') { return 9; }
+    return -1;
+}
+
+/// Decimal field text[s..e) as a number; -1 when empty, longer than nine digits, or not all digits.
+pub fn parse_num(text : []const u8, s : usize, e : usize) -> i32 {
+    if (e <= s) { return -1; }
+    if (e - s > 9) { return -1; }
+    var v : i32 = 0;
+    var i : usize = s;
+    while (i < e) {
+        const d : i32 = digit_val(text[i]);
+        if (d < 0) { return -1; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    return v;
+}
+
+/// SARIF regions start at 1; t27c's 0 ("not said") is clamped, not dropped.
+pub fn region_of(n : i32) -> u32 {
+    if (n < 1) { return 1; }
+    return (n) as u32;
+}
+
+/// Whether text[s..e) is exactly the n bytes of name.
+fn field_eq(text : []const u8, s : usize, e : usize, name : str, n : usize) -> bool {
+    if (e < s) { return false; }
+    if (e - s != n) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (text[s + i] != name[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Severity class of the field text[s..e); SEV_NONE when the word is unknown. Case matters:
+/// t27c prints lowercase, and a word it does not print is a word to refuse.
+pub fn sev_of(text : []const u8, s : usize, e : usize) -> u8 {
+    if (field_eq(text, s, e, "error", 5)) { return SEV_ERROR; }
+    if (field_eq(text, s, e, "warning", 7)) { return SEV_WARNING; }
+    if (field_eq(text, s, e, "info", 4)) { return SEV_NOTE; }
+    if (field_eq(text, s, e, "note", 4)) { return SEV_NOTE; }
+    return SEV_NONE;
+}
+
+/// Row of the rule whose slug is text[s..e); -1 when unknown.
+pub fn rule_of(text : []const u8, s : usize, e : usize) -> i32 {
+    for i in 0..4 {
+        if (field_eq(text, s, e, RULE_SLUGS[i], RULE_SLUG_LENS[i])) { return (i) as i32; }
+    }
+    return -1;
+}
+
+/// A plain repo-relative path: printable ASCII without space, none of  " \ % # ? :  and no `..`
+/// anywhere (a name like a..b is refused too -- fail closed beats a traversal check that guesses).
+pub fn path_ok(text : []const u8, s : usize, e : usize) -> bool {
+    if (e <= s) { return false; }
+    if (text[s] == '/') { return false; }
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = text[i];
+        if (b < 33 or b > 126) { return false; }
+        if (b == 34 or b == 92 or b == 37 or b == 35 or b == 63 or b == 58) { return false; }
+        if (b == '.' and i + 1 < e) {
+            if (text[i + 1] == '.') { return false; }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Index of the first byte at or after s that is `want` or a newline, bounded by e; e if none.
+fn field_end(text : []const u8, e : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < e) {
+        if (text[i] == '\t') { return i; }
+        i += 1;
+    }
+    return e;
+}
+
+/// End of the line starting at s: the newline, or len. A trailing carriage return is not part
+/// of the line.
+fn line_end(text : []const u8, len : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < len) {
+        if (text[i] == '\n') { break; }
+        i += 1;
+    }
+    if (i > s) {
+        if (text[i - 1] == 13) { return i - 1; }
+    }
+    return i;
+}
+
+/// Split the line text[ls..le) into six fields, f[2k] .. f[2k+1] being field k; the sixth runs to
+/// the end of the line. False when a field is missing or any field fails its check.
+pub fn parse_line(text : []const u8, ls : usize, le : usize, f : []usize) -> bool {
+    var pos : usize = ls;
+    var k : usize = 0;
+    while (k < 6) {
+        var fe : usize = le;
+        if (k < 5) {
+            fe = field_end(text, le, pos);
+            if (fe >= le) { return false; }
+        }
+        f[2 * k] = pos;
+        f[2 * k + 1] = fe;
+        pos = fe + 1;
+        k += 1;
+    }
+    if (sev_of(text, f[0], f[1]) == SEV_NONE) { return false; }
+    if (rule_of(text, f[2], f[3]) < 0) { return false; }
+    if (path_ok(text, f[4], f[5]) == false) { return false; }
+    if (parse_num(text, f[6], f[7]) < 0) { return false; }
+    if (parse_num(text, f[8], f[9]) < 0) { return false; }
+    if (f[11] <= f[10]) { return false; }
+    return true;
+}
+
+/// How many non-blank lines of the input are valid findings.
+pub fn sarif_valid(text : []const u8, len : usize) -> u32 {
+    var f : [12]usize = undefined;
+    var n : u32 = 0;
+    var ls : usize = 0;
+    while (ls < len) {
+        const le : usize = line_end(text, len, ls);
+        if (le > ls) {
+            if (parse_line(text, ls, le, &f)) { n += 1; }
+        }
+        var nx : usize = le;
+        while (nx < len and text[nx] != '\n') { nx += 1; }
+        ls = nx + 1;
+    }
+    return n;
+}
+
+/// How many non-blank lines of the input are not valid findings.
+pub fn sarif_invalid(text : []const u8, len : usize) -> u32 {
+    var f : [12]usize = undefined;
+    var n : u32 = 0;
+    var ls : usize = 0;
+    while (ls < len) {
+        const le : usize = line_end(text, len, ls);
+        if (le > ls) {
+            if (parse_line(text, ls, le, &f) == false) { n += 1; }
+        }
+        var nx : usize = le;
+        while (nx < len and text[nx] != '\n') { nx += 1; }
+        ls = nx + 1;
+    }
+    return n;
+}
+
+/// Findings left out of the document: the invalid lines plus the valid ones past max_results.
+pub fn sarif_dropped(text : []const u8, len : usize, max_results : u32) -> u32 {
+    const valid : u32 = sarif_valid(text, len);
+    var over : u32 = 0;
+    if (valid > max_results) { over = valid - max_results; }
+    return sarif_invalid(text, len) + over;
+}
+
+fn put_rule(dst : []u8, cap : usize, w : usize, i : usize) -> usize {
+    var x : usize = put_byte(dst, cap, w, '{');
+    x = put_key(dst, cap, x, "id", 2);
+    x = put_q(dst, cap, x, RULE_IDS[i], ID_LEN);
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "name", 4);
+    x = put_q(dst, cap, x, RULE_SLUGS[i], RULE_SLUG_LENS[i]);
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "shortDescription", 16);
+    x = put_byte(dst, cap, x, '{');
+    x = put_key(dst, cap, x, "text", 4);
+    x = put_q(dst, cap, x, RULE_TEXTS[i], RULE_TEXT_LENS[i]);
+    x = put_byte(dst, cap, x, '}');
+    x = put_byte(dst, cap, x, '}');
+    return x;
+}
+
+fn put_result(dst : []u8, cap : usize, w : usize, text : []const u8, f : []const usize) -> usize {
+    const rule : usize = (rule_of(text, f[2], f[3])) as usize;
+    const sev : usize = (sev_of(text, f[0], f[1])) as usize;
+    var x : usize = put_byte(dst, cap, w, '{');
+    x = put_key(dst, cap, x, "ruleId", 6);
+    x = put_q(dst, cap, x, RULE_IDS[rule], ID_LEN);
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "ruleIndex", 9);
+    x = put_count(dst, cap, x, (rule) as u32);
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "level", 5);
+    x = put_q(dst, cap, x, LEVELS[sev], LEVEL_LENS[sev]);
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "message", 7);
+    x = put_byte(dst, cap, x, '{');
+    x = put_key(dst, cap, x, "text", 4);
+    x = put_byte(dst, cap, x, 34);
+    x = put_json_text(dst, cap, x, text, f[10], f[11], MSG_MAX);
+    x = put_byte(dst, cap, x, 34);
+    x = put_byte(dst, cap, x, '}');
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "locations", 9);
+    x = put_str(dst, cap, x, "[{", 2);
+    x = put_key(dst, cap, x, "physicalLocation", 16);
+    x = put_byte(dst, cap, x, '{');
+    x = put_key(dst, cap, x, "artifactLocation", 16);
+    x = put_byte(dst, cap, x, '{');
+    x = put_key(dst, cap, x, "uri", 3);
+    x = put_byte(dst, cap, x, 34);
+    var i : usize = f[4];
+    while (i < f[5]) {
+        x = put_byte(dst, cap, x, text[i]);
+        i += 1;
+    }
+    x = put_byte(dst, cap, x, 34);
+    x = put_str(dst, cap, x, "},", 2);
+    x = put_key(dst, cap, x, "region", 6);
+    x = put_byte(dst, cap, x, '{');
+    x = put_key(dst, cap, x, "startLine", 9);
+    x = put_count(dst, cap, x, region_of(parse_num(text, f[6], f[7])));
+    x = put_byte(dst, cap, x, ',');
+    x = put_key(dst, cap, x, "startColumn", 11);
+    x = put_count(dst, cap, x, region_of(parse_num(text, f[8], f[9])));
+    x = put_str(dst, cap, x, "}}}]}", 5);
+    return x;
+}
+
+/// The SARIF 2.1.0 document for the findings in text[0..len), at most max_results of them, into
+/// out. Returns the bytes the document needs; when that exceeds out_cap the buffer holds a
+/// clipped document and sarif_fits says so. Empty or all-invalid input is still a valid run:
+/// `results` is `[]`, and executionSuccessful says whether anything was dropped.
+pub fn sarif_render(text : []const u8, len : usize, max_results : u32, out : []u8, out_cap : usize) -> usize {
+    var w : usize = 0;
+    w = put_byte(out, out_cap, w, '{');
+    w = put_key(out, out_cap, w, "$schema", 7);
+    w = put_q(out, out_cap, w, SCHEMA_URL, SCHEMA_URL_LEN);
+    w = put_byte(out, out_cap, w, ',');
+    w = put_key(out, out_cap, w, "version", 7);
+    w = put_q(out, out_cap, w, "2.1.0", 5);
+    w = put_byte(out, out_cap, w, ',');
+    w = put_key(out, out_cap, w, "runs", 4);
+    w = put_str(out, out_cap, w, "[{", 2);
+    w = put_key(out, out_cap, w, "tool", 4);
+    w = put_byte(out, out_cap, w, '{');
+    w = put_key(out, out_cap, w, "driver", 6);
+    w = put_byte(out, out_cap, w, '{');
+    w = put_key(out, out_cap, w, "name", 4);
+    w = put_q(out, out_cap, w, "t27c", 4);
+    w = put_byte(out, out_cap, w, ',');
+    w = put_key(out, out_cap, w, "informationUri", 14);
+    w = put_q(out, out_cap, w, INFO_URL, INFO_URL_LEN);
+    w = put_byte(out, out_cap, w, ',');
+    w = put_key(out, out_cap, w, "rules", 5);
+    w = put_byte(out, out_cap, w, '[');
+    for r in 0..4 {
+        if (r > 0) { w = put_byte(out, out_cap, w, ','); }
+        w = put_rule(out, out_cap, w, r);
+    }
+    w = put_str(out, out_cap, w, "]}},", 4);
+    w = put_key(out, out_cap, w, "results", 7);
+    w = put_byte(out, out_cap, w, '[');
+    var f : [12]usize = undefined;
+    var emitted : u32 = 0;
+    var ls : usize = 0;
+    while (ls < len) {
+        const le : usize = line_end(text, len, ls);
+        if (le > ls and emitted < max_results) {
+            if (parse_line(text, ls, le, &f)) {
+                if (emitted > 0) { w = put_byte(out, out_cap, w, ','); }
+                w = put_result(out, out_cap, w, text, &f);
+                emitted += 1;
+            }
+        }
+        var nx : usize = le;
+        while (nx < len and text[nx] != '\n') { nx += 1; }
+        ls = nx + 1;
+    }
+    w = put_str(out, out_cap, w, "],", 2);
+    w = put_key(out, out_cap, w, "invocations", 11);
+    w = put_str(out, out_cap, w, "[{", 2);
+    w = put_key(out, out_cap, w, "executionSuccessful", 19);
+    if (sarif_dropped(text, len, max_results) == 0) {
+        w = put_str(out, out_cap, w, "true", 4);
+    } else {
+        w = put_str(out, out_cap, w, "false", 5);
+    }
+    w = put_str(out, out_cap, w, "}]}]}", 5);
+    return w;
+}
+
+/// Whether a document of `needed` bytes fit in a buffer of out_cap; a clipped document is not
+/// to be uploaded.
+pub fn sarif_fits(needed : usize, out_cap : usize) -> bool {
+    return needed <= out_cap;
+}
+
+/// Brackets and braces of a written document pair up outside strings, and it ends closed: the
+/// cheap structural check a valid-JSON claim can stand on without a parser.
+fn balanced(buf : []const u8, n : usize) -> bool {
+    var depth : i32 = 0;
+    var in_str : bool = false;
+    var i : usize = 0;
+    while (i < n) {
+        const b : u8 = buf[i];
+        if (in_str) {
+            if (b == 92) { i += 1; } else if (b == 34) { in_str = false; }
+        } else {
+            if (b == 34) { in_str = true; }
+            if (b == '{' or b == '[') { depth += 1; }
+            if (b == '}' or b == ']') {
+                depth -= 1;
+                if (depth < 0) { return false; }
+            }
+        }
+        i += 1;
+    }
+    return depth == 0 and in_str == false and n > 0;
+}
+
+test severity_mapping_follows_the_sarif_levels {
+    var b : [64]u8 = undefined;
+    var n : usize = put_str(&b, 64, 0, "error", 5);
+    assert sev_of(&b, 0, n) == SEV_ERROR;
+    n = put_str(&b, 64, 0, "warning", 7);
+    assert sev_of(&b, 0, n) == SEV_WARNING;
+    n = put_str(&b, 64, 0, "info", 4);
+    assert sev_of(&b, 0, n) == SEV_NOTE;
+    n = put_str(&b, 64, 0, "note", 4);
+    assert sev_of(&b, 0, n) == SEV_NOTE;
+    assert LEVEL_LENS[SEV_ERROR] == 5;
+    assert LEVEL_LENS[SEV_WARNING] == 7;
+    assert LEVEL_LENS[SEV_NOTE] == 4;
+}
+
+test severity_shows_in_the_document_as_the_sarif_level {
+    var t : [256]u8 = undefined;
+    var w : usize = put_str(&t, 256, 0, "warning\tvacuous-test\tspecs/a.t27\t7\t3\tzero asserts\n", 50);
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert sarif_fits(n, 4096) == true;
+    assert buf_has(&out, n, "\"level\":\"warning\"", 17) == true;
+    assert buf_has(&out, n, "\"ruleId\":\"T27C003\"", 18) == true;
+    assert buf_has(&out, n, "\"ruleIndex\":2", 13) == true;
+    assert buf_has(&out, n, "\"uri\":\"specs/a.t27\"", 19) == true;
+    assert buf_has(&out, n, "\"startLine\":7,\"startColumn\":3", 29) == true;
+    assert buf_has(&out, n, "\"executionSuccessful\":true", 26) == true;
+    assert balanced(&out, n) == true;
+}
+
+test unknown_severity_fails_closed {
+    var b : [64]u8 = undefined;
+    var n : usize = put_str(&b, 64, 0, "fatal", 5);
+    assert sev_of(&b, 0, n) == SEV_NONE;
+    n = put_str(&b, 64, 0, "ERROR", 5);
+    assert sev_of(&b, 0, n) == SEV_NONE;
+    n = put_str(&b, 64, 0, "warn", 4);
+    assert sev_of(&b, 0, n) == SEV_NONE;
+    assert sev_of(&b, 0, 0) == SEV_NONE;
+    // a line with an unknown severity is dropped, never downgraded to a note
+    var t : [256]u8 = undefined;
+    const w : usize = put_str(&t, 256, 0, "fatal\tparse-error\tspecs/a.t27\t3\t1\tboom\n", 39);
+    var out : [4096]u8 = undefined;
+    const m : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert sarif_valid(&t, w) == 0;
+    assert sarif_invalid(&t, w) == 1;
+    assert buf_has(&out, m, "\"results\":[]", 12) == true;
+    assert buf_has(&out, m, "\"level\"", 7) == false;
+    // and the document says it is partial
+    assert buf_has(&out, m, "\"executionSuccessful\":false", 27) == true;
+    assert balanced(&out, m) == true;
+}
+
+test empty_input_is_a_valid_empty_run {
+    var t : [4]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, 0, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert sarif_fits(n, 4096) == true;
+    assert out[0] == '{';
+    assert out[n - 1] == '}';
+    assert buf_has(&out, n, "\"version\":\"2.1.0\"", 17) == true;
+    assert buf_has(&out, n, "\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\"", 57) == true;
+    assert buf_has(&out, n, "\"results\":[]", 12) == true;
+    assert buf_has(&out, n, "\"executionSuccessful\":true", 26) == true;
+    // all four rules are declared even with no result, so a closed alert still has its rule
+    assert buf_has(&out, n, "\"id\":\"T27C001\"", 14) == true;
+    assert buf_has(&out, n, "\"id\":\"T27C004\"", 14) == true;
+    assert balanced(&out, n) == true;
+    assert sarif_dropped(&t, 0, DEFAULT_MAX_RESULTS) == 0;
+}
+
+test blank_lines_are_not_findings_and_not_drops {
+    var t : [16]u8 = undefined;
+    var w : usize = put_byte(&t, 16, 0, '\n');
+    w = put_byte(&t, 16, w, 13);
+    w = put_byte(&t, 16, w, '\n');
+    w = put_byte(&t, 16, w, '\n');
+    assert sarif_valid(&t, w) == 0;
+    assert sarif_invalid(&t, w) == 0;
+}
+
+test regions_clamp_to_one_and_never_to_nothing {
+    assert region_of(0) == 1;
+    assert region_of(-1) == 1;
+    assert region_of(1) == 1;
+    assert region_of(412) == 412;
+    var t : [256]u8 = undefined;
+    const w : usize = put_str(&t, 256, 0, "error\tparse-error\tspecs/a.t27\t0\t0\tat eof\n", 41);
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert buf_has(&out, n, "\"startLine\":1,\"startColumn\":1", 29) == true;
+    // a number that is not digits is a bad line, not a line 1
+    const w2 : usize = put_str(&t, 256, 0, "error\tparse-error\tspecs/a.t27\tx\t1\tat eof\n", 41);
+    assert sarif_valid(&t, w2) == 0;
+}
+
+test rules_map_slug_to_a_stable_id {
+    var b : [32]u8 = undefined;
+    var n : usize = put_str(&b, 32, 0, "parse-error", 11);
+    assert rule_of(&b, 0, n) == 0;
+    n = put_str(&b, 32, 0, "test-failed", 11);
+    assert rule_of(&b, 0, n) == 1;
+    n = put_str(&b, 32, 0, "vacuous-test", 12);
+    assert rule_of(&b, 0, n) == 2;
+    n = put_str(&b, 32, 0, "unwritten-spec", 14);
+    assert rule_of(&b, 0, n) == 3;
+    n = put_str(&b, 32, 0, "parse-errors", 12);
+    assert rule_of(&b, 0, n) == -1;
+    n = put_str(&b, 32, 0, "", 0);
+    assert rule_of(&b, 0, n) == -1;
+    assert RULE_COUNT == 4;
+}
+
+test paths_must_be_plain_repo_relative {
+    var b : [64]u8 = undefined;
+    var n : usize = put_str(&b, 64, 0, "specs/claw/sarif.t27", 20);
+    assert path_ok(&b, 0, n) == true;
+    n = put_str(&b, 64, 0, "/etc/passwd", 11);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "../x.t27", 8);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "specs/../x.t27", 14);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "specs\\x.t27", 11);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "a b.t27", 7);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "C:x.t27", 7);
+    assert path_ok(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "a%2e.t27", 8);
+    assert path_ok(&b, 0, n) == false;
+    assert path_ok(&b, 0, 0) == false;
+}
+
+test messages_are_escaped_and_the_document_stays_valid {
+    var t : [256]u8 = undefined;
+    // message: say "hi" \ then a tab, a high byte and a control byte
+    var w : usize = put_str(&t, 256, 0, "error\ttest-failed\tspecs/a.t27\t2\t4\tsay ", 38);
+    w = put_byte(&t, 256, w, 34);
+    w = put_str(&t, 256, w, "hi", 2);
+    w = put_byte(&t, 256, w, 34);
+    w = put_byte(&t, 256, w, 92);
+    w = put_byte(&t, 256, w, '\t');
+    w = put_byte(&t, 256, w, 200);
+    w = put_byte(&t, 256, w, 7);
+    w = put_byte(&t, 256, w, '\n');
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert sarif_valid(&t, w) == 1;
+    assert buf_has(&out, n, "say \\\"hi\\\"\\\\???\"}", 17) == true;
+    assert balanced(&out, n) == true;
+}
+
+test long_messages_are_cut_with_an_ellipsis {
+    var t : [1024]u8 = undefined;
+    var w : usize = put_str(&t, 1024, 0, "error\tparse-error\tspecs/a.t27\t1\t1\t", 34);
+    var i : usize = 0;
+    while (i < 600) {
+        w = put_byte(&t, 1024, w, 'x');
+        i += 1;
+    }
+    w = put_byte(&t, 1024, w, '\n');
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert sarif_fits(n, 4096) == true;
+    assert buf_has(&out, n, "x...\"}", 6) == true;
+    assert n < 2500;
+    assert balanced(&out, n) == true;
+}
+
+test one_bad_line_does_not_sink_the_good_ones {
+    var t : [512]u8 = undefined;
+    var w : usize = put_str(&t, 512, 0, "error\tparse-error\tspecs/a.t27\t3\t1\tone\n", 38);
+    w = put_str(&t, 512, w, "bogus\tparse-error\tspecs/b.t27\t3\t1\ttwo\n", 38);
+    w = put_str(&t, 512, w, "note\tunwritten-spec\tspecs/c.t27\t1\t1\tthree\n", 42);
+    var out : [8192]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 8192);
+    assert sarif_valid(&t, w) == 2;
+    assert sarif_invalid(&t, w) == 1;
+    assert sarif_dropped(&t, w, DEFAULT_MAX_RESULTS) == 1;
+    assert buf_has(&out, n, "specs/a.t27", 11) == true;
+    assert buf_has(&out, n, "specs/b.t27", 11) == false;
+    assert buf_has(&out, n, "specs/c.t27", 11) == true;
+    assert buf_has(&out, n, "\"executionSuccessful\":false", 27) == true;
+    assert balanced(&out, n) == true;
+}
+
+test the_result_cap_drops_and_says_so {
+    var t : [512]u8 = undefined;
+    var w : usize = put_str(&t, 512, 0, "error\tparse-error\tspecs/a.t27\t1\t1\tone\n", 38);
+    w = put_str(&t, 512, w, "error\tparse-error\tspecs/b.t27\t1\t1\ttwo\n", 38);
+    w = put_str(&t, 512, w, "error\tparse-error\tspecs/c.t27\t1\t1\tthree\n", 40);
+    var out : [8192]u8 = undefined;
+    const n : usize = sarif_render(&t, w, 2, &out, 8192);
+    assert sarif_dropped(&t, w, 2) == 1;
+    assert sarif_dropped(&t, w, DEFAULT_MAX_RESULTS) == 0;
+    assert buf_has(&out, n, "specs/b.t27", 11) == true;
+    assert buf_has(&out, n, "specs/c.t27", 11) == false;
+    assert buf_has(&out, n, "\"executionSuccessful\":false", 27) == true;
+    assert balanced(&out, n) == true;
+}
+
+test a_clipped_document_is_detected_not_uploaded {
+    var t : [256]u8 = undefined;
+    const w : usize = put_str(&t, 256, 0, "error\tparse-error\tspecs/a.t27\t3\t1\tboom\n", 39);
+    var out : [128]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 128);
+    assert n > 128;
+    assert sarif_fits(n, 128) == false;
+    assert sarif_fits(n, n) == true;
+}
+
+test crlf_input_is_read_like_lf {
+    var t : [256]u8 = undefined;
+    var w : usize = put_str(&t, 256, 0, "error\tparse-error\tspecs/a.t27\t3\t1\tboom", 38);
+    w = put_byte(&t, 256, w, 13);
+    w = put_byte(&t, 256, w, '\n');
+    assert sarif_valid(&t, w) == 1;
+    var out : [4096]u8 = undefined;
+    const n : usize = sarif_render(&t, w, DEFAULT_MAX_RESULTS, &out, 4096);
+    assert buf_has(&out, n, "\"text\":\"boom\"}", 14) == true;
+}
+
+test every_rule_row_is_filled {
+    for i in 0..4 {
+        assert RULE_IDS[i] != "";
+        assert RULE_SLUGS[i] != "";
+        assert RULE_TEXTS[i] != "";
+        assert RULE_SLUG_LENS[i] > 0;
+        assert RULE_TEXT_LENS[i] > 0;
+    }
+}
