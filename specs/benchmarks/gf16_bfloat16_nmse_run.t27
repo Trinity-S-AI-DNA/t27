@@ -1,0 +1,1181 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/benchmarks/gf16_bfloat16_nmse_run.t27 -- the run harness of the GF16 vs bfloat16 NMSE protocol
+; Closes the gap PUB-02 names (docs/SCIENTIFIC_IMPROVEMENT_PLAN.md): one manifest under
+; schemas/nmse-protocol-v1.json, produced by t27 code, not asserted by hand. ASCII only (L3).
+; --
+; Protocol: specs/benchmarks/gf16_bfloat16_nmse.t27 and its mirror docs/GF16_BFLOAT16_NMSE_PROTOCOL.md.
+; This file is the procedure that the protocol's "bench block" names: draw x from each of the five
+; reference distributions, round-trip x through GF16 and through bfloat16, and accumulate
+; E[(x - Q(x))^2] and E[x^2] over the SAME samples for both formats.
+; --
+; What is decided here, in t27:
+;   - the L5 witnesses, checked first; a failed witness aborts and no manifest is written;
+;   - the GF16 and bfloat16 quantisers (round to nearest, ties to even, section 3 of the protocol);
+;   - the xoshiro256++ generator seeded by splitmix64, uniform and normal sampling;
+;   - the five distributions, the accumulation, the NMSE, the ratio;
+;   - the manifest text, byte by byte, and every refusal (missing policy, unsafe text, short buffer).
+; What is not here: reading stdin, writing stdout, the clock, the host name, the sha256 of the
+; compiler source. t27 has no I/O yet (as in specs/tri/t27b/fuzz.t27); the caller passes those facts
+; in as `key=value` lines and the harness only checks and copies them.
+; --
+; How the committed manifest was produced (Railway lab, never the owner's Mac): `t27c gen-c` of this
+; file, then the same one-line plumbing main that lefthook.yml wraps around gen/c/policy/own_language.c
+; -- read stdin into a buffer, call nmse_manifest(in, n, out, cap), write the returned bytes to stdout,
+; exit 1 when it returned 0. The exact command is recorded in the manifest's x_extension.driver.
+; --
+; Two choices the protocol leaves open, made here and declared in the manifest:
+;   D_PHI   "x ~ N(phi, 1/phi)" is read as N(mean, variance): standard deviation sqrt(1/phi).
+;   GF16    the protocol asks for ties-to-even; the frozen SSOT encoder (gf16.t27 gf16_encode_f32,
+;           FORMAT-SPEC-001 frozen_silicon_anchor) rounds ties toward zero. The two differ ONLY on an
+;           exact tie, so the harness counts ties per distribution; with zero ties the NMSE is the same
+;           under both rules. Layout, range and flush-to-zero below 2^-31 follow the SSOT (#6940 D1):
+;           E = 0 with M != 0 is normal, 2^-31 itself has no code, |x| >= (2 - 2^-10) * 2^31 is Inf.
+;   Inputs are rounded once, from f64 to the format, never through f32 first (a double rounding
+;   would bias the error the protocol measures).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module gf16_bfloat16_nmse_run;
+
+pub const PROTOCOL_VERSION : str = "1.0$";
+pub const SCHEMA_VERSION : str = "1.0$";
+pub const RNG_FAMILY : str = "xoshiro256pp$";
+
+pub const PHI : f64 = 1.618033988749895;
+pub const WITNESS_TOLERANCE : f64 = 1e-15;
+pub const TWO_PI : f64 = 6.283185307179586;
+pub const LN2 : f64 = 0.6931471805599453;
+pub const INV_2_53 : f64 = 0.00000000000000011102230246251565;
+
+pub const LIST_END : u8 = 36;
+
+/// Exit codes of the run, as the caller reports them.
+pub const RUN_OK : u32 = 0;
+pub const ABORT_WITNESS : u32 = 1;
+pub const ABORT_POLICY : u32 = 2;
+pub const ABORT_INPUT : u32 = 3;
+pub const ABORT_BUFFER : u32 = 4;
+pub const ABORT_RANGE : u32 = 5;
+
+/// Distribution tags, in the order they are drawn from one generator stream.
+pub const D_NORM : u32 = 0;
+pub const D_LOG : u32 = 1;
+pub const D_RELU : u32 = 2;
+pub const D_PHI : u32 = 3;
+pub const D_DEEP : u32 = 4;
+pub const N_DIST : u32 = 5;
+
+pub const D_DEEP_NORM_WEIGHT : f64 = 0.7;
+
+/// splitmix64 constants (Steele, Lea, Flood 2014), used only to seed xoshiro256++.
+pub const SM_GAMMA : u64 = 0x9E3779B97F4A7C15;
+pub const SM_MIX1 : u64 = 0xBF58476D1CE4E5B9;
+pub const SM_MIX2 : u64 = 0x94D049BB133111EB;
+
+// ============================================================================
+// Generator: xoshiro256++ (Blackman, Vigna 2018), seeded by splitmix64
+// ============================================================================
+
+pub struct Xoshiro {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+    sm: u64,
+    have: bool,
+    spare: f64,
+}
+
+pub fn splitmix_next(r: *Xoshiro) -> u64 {
+    r.sm = r.sm +% SM_GAMMA;
+    var z : u64 = r.sm;
+    z = (z ^ (z >> 30)) *% SM_MIX1;
+    z = (z ^ (z >> 27)) *% SM_MIX2;
+    return z ^ (z >> 31);
+}
+
+pub fn rng_seed(seed: u64) -> Xoshiro {
+    var r = Xoshiro { s0: 0, s1: 0, s2: 0, s3: 0, sm: seed, have: false, spare: 0.0 };
+    r.s0 = splitmix_next(&r);
+    r.s1 = splitmix_next(&r);
+    r.s2 = splitmix_next(&r);
+    r.s3 = splitmix_next(&r);
+    return r;
+}
+
+pub fn rotl23(x: u64) -> u64 {
+    return (x << 23) | (x >> 41);
+}
+
+pub fn rotl45(x: u64) -> u64 {
+    return (x << 45) | (x >> 19);
+}
+
+pub fn rng_next(r: *Xoshiro) -> u64 {
+    const result : u64 = rotl23(r.s0 +% r.s3) +% r.s0;
+    const t : u64 = r.s1 << 17;
+    r.s2 = r.s2 ^ r.s0;
+    r.s3 = r.s3 ^ r.s1;
+    r.s1 = r.s1 ^ r.s2;
+    r.s0 = r.s0 ^ r.s3;
+    r.s2 = r.s2 ^ t;
+    r.s3 = rotl45(r.s3);
+    return result;
+}
+
+/// Uniform on [0, 1): the top 53 bits.
+pub fn uniform(r: *Xoshiro) -> f64 {
+    const top : u64 = rng_next(r) >> 11;
+    return (top as f64) * INV_2_53;
+}
+
+/// Uniform on (0, 1]: never 0, so log() is finite.
+pub fn uniform_open0(r: *Xoshiro) -> f64 {
+    const top : u64 = (rng_next(r) >> 11) + 1;
+    return (top as f64) * INV_2_53;
+}
+
+/// Standard normal, Box-Muller; both values of a pair are used, the second is kept in `spare`.
+pub fn normal(r: *Xoshiro) -> f64 {
+    if (r.have) {
+        r.have = false;
+        return r.spare;
+    }
+    const u1 : f64 = uniform_open0(r);
+    const u2 : f64 = uniform(r);
+    const rad : f64 = sqrt(-2.0 * log(u1));
+    const th : f64 = TWO_PI * u2;
+    r.spare = rad * sin(th);
+    r.have = true;
+    return rad * cos(th);
+}
+
+/// D_LOG: log2|x| ~ U(-10, 10), sign uniform.
+pub fn draw_log(r: *Xoshiro) -> f64 {
+    const t : f64 = -10.0 + 20.0 * uniform(r);
+    const mag : f64 = exp(t * LN2);
+    if ((rng_next(r) >> 63) == 1) {
+        return -mag;
+    }
+    return mag;
+}
+
+pub fn draw(r: *Xoshiro, d: u32, phi_sd: f64) -> f64 {
+    if (d == D_NORM) {
+        return normal(r);
+    }
+    if (d == D_LOG) {
+        return draw_log(r);
+    }
+    if (d == D_RELU) {
+        const z : f64 = normal(r);
+        if (z > 0.0) {
+            return z;
+        }
+        return 0.0;
+    }
+    if (d == D_PHI) {
+        return PHI + phi_sd * normal(r);
+    }
+    // D_DEEP: 0.7 D_NORM + 0.3 D_LOG, the component chosen per sample.
+    if (uniform(r) < D_DEEP_NORM_WEIGHT) {
+        return normal(r);
+    }
+    return draw_log(r);
+}
+
+// ============================================================================
+// Quantisers, f64 -> format -> f64, exact arithmetic on powers of two
+// ============================================================================
+
+/// a > 0, finite: m in [1, 2), s a power of two with m = a * s exactly, e = -log2(s).
+pub struct F64Split {
+    m: f64,
+    s: f64,
+    e: i32,
+}
+
+pub fn split(a: f64) -> F64Split {
+    var m : f64 = a;
+    var s : f64 = 1.0;
+    var e : i32 = 0;
+    while (m >= 65536.0) {
+        m = m * 0.0000152587890625;
+        s = s * 0.0000152587890625;
+        e = e + 16;
+    }
+    while (m >= 2.0) {
+        m = m * 0.5;
+        s = s * 0.5;
+        e = e + 1;
+    }
+    while (m < 0.0000152587890625) {
+        m = m * 65536.0;
+        s = s * 65536.0;
+        e = e - 16;
+    }
+    while (m < 1.0) {
+        m = m * 2.0;
+        s = s * 2.0;
+        e = e - 1;
+    }
+    return F64Split { m: m, s: s, e: e };
+}
+
+/// q >= 0: is q exactly halfway between two integers?
+pub fn is_tie(q: f64) -> bool {
+    return q - floor(q) == 0.5;
+}
+
+/// Round to nearest integer, ties to even. q >= 0, q < 2^52.
+pub fn rne(q: f64) -> f64 {
+    const f : f64 = floor(q);
+    const d : f64 = q - f;
+    if (d > 0.5) {
+        return f + 1.0;
+    }
+    if (d < 0.5) {
+        return f;
+    }
+    const half : f64 = f * 0.5;
+    if (floor(half) == half) {
+        return f;
+    }
+    return f + 1.0;
+}
+
+pub fn pow2(n: i32) -> f64 {
+    var v : f64 = 1.0;
+    var k : i32 = 0;
+    if (n >= 0) {
+        while (k < n) {
+            v = v * 2.0;
+            k = k + 1;
+        }
+        return v;
+    }
+    while (k > n) {
+        v = v * 0.5;
+        k = k - 1;
+    }
+    return v;
+}
+
+/// Quantisation outcome: the value and what happened on the way.
+pub struct Quant {
+    v: f64,
+    tie: bool,
+    flushed: bool,
+    sub: bool,
+    inf: bool,
+}
+
+/// GF16 [S(1) | E(6) | M(9)], bias 31 (FORMAT-SPEC-001.json, gf16.t27). Ties to even.
+pub fn q_gf16(x: f64) -> Quant {
+    var out = Quant { v: 0.0, tie: false, flushed: false, sub: false, inf: false };
+    if (x == 0.0) {
+        return out;
+    }
+    var a : f64 = x;
+    if (x < 0.0) {
+        a = -x;
+    }
+    const sp = split(a);
+    // |x| < 2^-31 has no nonzero code: signed zero (#6940 D1).
+    if (sp.e < -31) {
+        out.flushed = true;
+        return out;
+    }
+    if (sp.e > 31) {
+        out.inf = true;
+        return out;
+    }
+    const q : f64 = sp.m * 512.0;
+    out.tie = is_tie(q);
+    const r : f64 = rne(q);
+    var e : i32 = sp.e;
+    if (r == 1024.0) {
+        e = e + 1;
+    }
+    if (e > 31) {
+        out.inf = true;
+        return out;
+    }
+    // E = 0, M = 0 would be 2^-31, which has no code: flush to signed zero (#6940 D1).
+    if (e == -31 and r == 512.0) {
+        out.flushed = true;
+        return out;
+    }
+    var v : f64 = (r / 512.0) / sp.s;
+    if (x < 0.0) {
+        v = -v;
+    }
+    out.v = v;
+    return out;
+}
+
+/// bfloat16 [S(1) | E(8) | M(7)], bias 127. Ties to even. ftz = false keeps IEEE subnormals
+/// (k * 2^-133, k in 1..127); ftz = true flushes every result below 2^-126 to signed zero.
+pub fn q_bf16(x: f64, ftz: bool) -> Quant {
+    var out = Quant { v: 0.0, tie: false, flushed: false, sub: false, inf: false };
+    if (x == 0.0) {
+        return out;
+    }
+    var a : f64 = x;
+    if (x < 0.0) {
+        a = -x;
+    }
+    const sp = split(a);
+    var v : f64 = 0.0;
+    if (sp.e >= -126) {
+        if (sp.e > 127) {
+            out.inf = true;
+            return out;
+        }
+        const q : f64 = sp.m * 128.0;
+        out.tie = is_tie(q);
+        const r : f64 = rne(q);
+        if (sp.e == 127 and r == 256.0) {
+            out.inf = true;
+            return out;
+        }
+        v = (r / 128.0) / sp.s;
+    } else {
+        out.sub = true;
+        if (ftz) {
+            out.flushed = true;
+            return out;
+        }
+        const q : f64 = a * pow2(133);
+        out.tie = is_tie(q);
+        const k : f64 = rne(q);
+        v = k * pow2(-133);
+    }
+    if (x < 0.0) {
+        v = -v;
+    }
+    out.v = v;
+    return out;
+}
+
+// ============================================================================
+// Accumulation: Neumaier-compensated sums over the same samples for both formats
+// ============================================================================
+
+pub struct NeumaierSum {
+    s: f64,
+    c: f64,
+}
+
+pub fn sum_add(acc: *NeumaierSum, v: f64) {
+    const t : f64 = acc.s + v;
+    var big : f64 = acc.s;
+    var small : f64 = v;
+    if (abs(v) > abs(acc.s)) {
+        big = v;
+        small = acc.s;
+    }
+    acc.c = acc.c + ((big - t) + small);
+    acc.s = t;
+}
+
+pub fn sum_value(acc: NeumaierSum) -> f64 {
+    return acc.s + acc.c;
+}
+
+pub struct NmseAcc {
+    ref2: NeumaierSum,
+    err_g: NeumaierSum,
+    err_b: NeumaierSum,
+    ties_g: u64,
+    ties_b: u64,
+    flush_g: u64,
+    sub_b: u64,
+    flush_b: u64,
+    inf_g: u64,
+    inf_b: u64,
+    zeros: u64,
+}
+
+pub fn acc_new() -> NmseAcc {
+    return NmseAcc {
+        ref2: NeumaierSum { s: 0.0, c: 0.0 },
+        err_g: NeumaierSum { s: 0.0, c: 0.0 },
+        err_b: NeumaierSum { s: 0.0, c: 0.0 },
+        ties_g: 0, ties_b: 0, flush_g: 0, sub_b: 0, flush_b: 0, inf_g: 0, inf_b: 0, zeros: 0,
+    };
+}
+
+pub fn acc_sample(acc: *NmseAcc, x: f64, ftz: bool) {
+    const g = q_gf16(x);
+    const b = q_bf16(x, ftz);
+    sum_add(&acc.ref2, x * x);
+    if (x == 0.0) {
+        acc.zeros = acc.zeros + 1;
+    }
+    if (g.inf) {
+        acc.inf_g = acc.inf_g + 1;
+    } else {
+        const dg : f64 = x - g.v;
+        sum_add(&acc.err_g, dg * dg);
+    }
+    if (b.inf) {
+        acc.inf_b = acc.inf_b + 1;
+    } else {
+        const db : f64 = x - b.v;
+        sum_add(&acc.err_b, db * db);
+    }
+    if (g.tie) { acc.ties_g = acc.ties_g + 1; }
+    if (b.tie) { acc.ties_b = acc.ties_b + 1; }
+    if (g.flushed) { acc.flush_g = acc.flush_g + 1; }
+    if (b.sub) { acc.sub_b = acc.sub_b + 1; }
+    if (b.flushed) { acc.flush_b = acc.flush_b + 1; }
+}
+
+pub fn run_dist(r: *Xoshiro, d: u32, n: u64, phi_sd: f64, ftz: bool) -> NmseAcc {
+    var acc = acc_new();
+    var i : u64 = 0;
+    while (i < n) {
+        acc_sample(&acc, draw(r, d, phi_sd), ftz);
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// NMSE is undefined when the reference has no energy (the protocol reports null).
+pub fn nmse_defined(mean_sq_ref: f64) -> bool {
+    return mean_sq_ref > 0.0;
+}
+
+// ============================================================================
+// L5 witnesses, checked before any sample is drawn
+// ============================================================================
+
+pub fn phi_residual(p: f64) -> f64 {
+    return abs(p * p - (p + 1.0));
+}
+
+pub fn trinity_residual(p: f64) -> f64 {
+    return abs(p * p + 1.0 / (p * p) - 3.0);
+}
+
+pub fn witness_holds(p: f64) -> bool {
+    return phi_residual(p) < WITNESS_TOLERANCE and trinity_residual(p) < WITNESS_TOLERANCE;
+}
+
+// ============================================================================
+// Output: a byte writer that keeps counting past the end, so a short buffer is detected
+// ============================================================================
+
+pub fn put(out: []u8, w: usize, cap: usize, c: u8) -> usize {
+    if (w < cap) { out[w] = c; }
+    return w + 1;
+}
+
+/// Write a '$'-terminated literal without its '$'.
+pub fn put_lit(out: []u8, w: usize, cap: usize, msg: []const u8) -> usize {
+    var p : usize = w;
+    var i : usize = 0;
+    while (msg[i] != LIST_END) {
+        p = put(out, p, cap, msg[i]);
+        i += 1;
+    }
+    return p;
+}
+
+pub fn put_range(out: []u8, w: usize, cap: usize, s: []const u8, from: usize, to: usize) -> usize {
+    var p : usize = w;
+    var i : usize = from;
+    while (i < to) {
+        p = put(out, p, cap, s[i]);
+        i += 1;
+    }
+    return p;
+}
+
+pub fn put_u64(out: []u8, w: usize, cap: usize, v: u64) -> usize {
+    var digits : [20]u8 = [_]u8{0} ** 20;
+    var n : usize = 0;
+    var x : u64 = v;
+    if (x == 0) {
+        return put(out, w, cap, 48);
+    }
+    while (x > 0) {
+        digits[n] = @as(u8, @truncate(x % 10)) + 48;
+        x = x / 10;
+        n += 1;
+    }
+    var p : usize = w;
+    while (n > 0) {
+        n -= 1;
+        p = put(out, p, cap, digits[n]);
+    }
+    return p;
+}
+
+pub fn pow10(k: i32) -> f64 {
+    var v : f64 = 1.0;
+    var i : i32 = 0;
+    while (i < k) {
+        v = v * 10.0;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The digits not yet written, as an exact integer in f64.
+pub struct DigitRest {
+    v: f64,
+}
+
+/// One decimal digit of the rest at place p (both exact integers in f64): the digit, by subtraction.
+pub fn digit_at(d: *DigitRest, p: f64) -> u8 {
+    var c : u8 = 0;
+    while (d.v >= p) {
+        d.v = d.v - p;
+        c += 1;
+    }
+    return c;
+}
+
+/// v >= 0, finite, as ten significant digits in scientific notation: 1.234567890e-06.
+/// The scaling is one multiply or divide by an exact power of ten (|k| <= 22), so the printed
+/// value is v to within one unit in the tenth digit; 0 prints as 0.0.
+pub fn put_f64(out: []u8, w: usize, cap: usize, v: f64) -> usize {
+    if (v == 0.0) {
+        return put_lit(out, w, cap, "0.0$");
+    }
+    var k : i32 = 0;
+    var t : f64 = v;
+    while (t >= 10.0) {
+        t = t / 10.0;
+        k = k + 1;
+    }
+    while (t < 1.0) {
+        t = t * 10.0;
+        k = k - 1;
+    }
+    var m : f64 = v;
+    if (k >= 0) {
+        m = v / pow10(k);
+    } else {
+        m = v * pow10(-k);
+    }
+    var d : f64 = rne(m * 1000000000.0);
+    if (d >= 10000000000.0) {
+        d = 1000000000.0;
+        k = k + 1;
+    }
+    if (d < 1000000000.0) {
+        d = 9999999999.0;
+        k = k - 1;
+    }
+    var rest = DigitRest { v: d };
+    var p : usize = w;
+    var place : f64 = 1000000000.0;
+    p = put(out, p, cap, digit_at(&rest, place) + 48);
+    p = put(out, p, cap, 46);
+    var i : u32 = 0;
+    while (i < 9) {
+        place = place / 10.0;
+        p = put(out, p, cap, digit_at(&rest, place) + 48);
+        i += 1;
+    }
+    p = put(out, p, cap, 101);
+    var ek : i32 = k;
+    if (k < 0) {
+        p = put(out, p, cap, 45);
+        ek = -k;
+    } else {
+        p = put(out, p, cap, 43);
+    }
+    if (ek < 10) {
+        p = put(out, p, cap, 48);
+    }
+    return put_u64(out, p, cap, @as(u64, @intCast(ek)));
+}
+
+// ============================================================================
+// Input: `key=value` lines from the caller
+// ============================================================================
+
+/// Where the value of `key` starts in buf (just after "key="), or n when the key is absent.
+pub fn find_key(buf: []const u8, n: usize, key: []const u8) -> usize {
+    var line : usize = 0;
+    while (line < n) {
+        var j : usize = 0;
+        var ok : bool = true;
+        while (key[j] != LIST_END) {
+            if (line + j >= n or buf[line + j] != key[j]) {
+                ok = false;
+                break;
+            }
+            j += 1;
+        }
+        if (ok and line + j < n and buf[line + j] == 61) {
+            return line + j + 1;
+        }
+        while (line < n and buf[line] != 10) {
+            line += 1;
+        }
+        line += 1;
+    }
+    return n;
+}
+
+pub fn value_end(buf: []const u8, n: usize, from: usize) -> usize {
+    var i : usize = from;
+    while (i < n and buf[i] != 10 and buf[i] != 13) {
+        i += 1;
+    }
+    return i;
+}
+
+/// Characters a caller-provided value may carry into the manifest: no quote, no backslash,
+/// no control byte, so the value needs no JSON escaping.
+pub fn safe_char(c: u8) -> bool {
+    if (c >= 48 and c <= 57) { return true; }
+    if (c >= 65 and c <= 90) { return true; }
+    if (c >= 97 and c <= 122) { return true; }
+    return c == 32 or c == 43 or c == 45 or c == 46 or c == 47 or c == 58 or c == 95 or c == 40 or c == 41 or c == 44;
+}
+
+pub fn safe_value(buf: []const u8, from: usize, to: usize) -> bool {
+    if (to <= from) {
+        return false;
+    }
+    var i : usize = from;
+    while (i < to) {
+        if (!safe_char(buf[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+pub fn hex_digit(c: u8) -> u64 {
+    if (c >= 48 and c <= 57) { return @as(u64, c - 48); }
+    if (c >= 97 and c <= 102) { return @as(u64, c - 87); }
+    if (c >= 65 and c <= 70) { return @as(u64, c - 55); }
+    return 16;
+}
+
+/// "0x" followed by 1 to 16 hex digits, as the schema's rng.seed pattern; 16 hex digits = ok.
+pub fn parse_seed_ok(buf: []const u8, from: usize, to: usize) -> bool {
+    if (to < from + 3 or to > from + 18) { return false; }
+    if (buf[from] != 48 or buf[from + 1] != 120) { return false; }
+    var i : usize = from + 2;
+    while (i < to) {
+        if (hex_digit(buf[i]) > 15) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+pub fn parse_seed(buf: []const u8, from: usize, to: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = from + 2;
+    while (i < to) {
+        v = (v << 4) | hex_digit(buf[i]);
+        i += 1;
+    }
+    return v;
+}
+
+pub fn parse_u64(buf: []const u8, from: usize, to: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = from;
+    while (i < to) {
+        const c : u8 = buf[i];
+        if (c < 48 or c > 57) { return 0; }
+        v = v * 10 + @as(u64, c - 48);
+        i += 1;
+    }
+    return v;
+}
+
+/// Two byte ranges are equal.
+pub fn same_range(a: []const u8, af: usize, at: usize, b: []const u8, bf: usize, bt: usize) -> bool {
+    if (at - af != bt - bf) { return false; }
+    var i : usize = 0;
+    while (af + i < at) {
+        if (a[af + i] != b[bf + i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// 64 lowercase hex digits, as the schema's seal_hash pattern.
+pub fn is_sha256_hex(buf: []const u8, from: usize, to: usize) -> bool {
+    if (to - from != 64) { return false; }
+    var i : usize = from;
+    while (i < to) {
+        const c : u8 = buf[i];
+        if (!((c >= 48 and c <= 57) or (c >= 97 and c <= 102))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// YYYY-MM-DDTHH:MM:SSZ, the RFC3339 UTC form the schema's timestamp takes.
+pub fn is_utc_timestamp(buf: []const u8, from: usize, to: usize) -> bool {
+    if (to - from != 20) { return false; }
+    var i : usize = 0;
+    while (i < 20) {
+        const c : u8 = buf[from + i];
+        if (i == 4 or i == 7) {
+            if (c != 45) { return false; }
+        } else if (i == 10) {
+            if (c != 84) { return false; }
+        } else if (i == 13 or i == 16) {
+            if (c != 58) { return false; }
+        } else if (i == 19) {
+            if (c != 90) { return false; }
+        } else if (c < 48 or c > 57) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Length of a '$'-terminated literal, the terminator not counted.
+pub fn lit_len(s: []const u8) -> usize {
+    var i : usize = 0;
+    while (s[i] != LIST_END) {
+        i += 1;
+    }
+    return i;
+}
+
+// ============================================================================
+// The manifest
+// ============================================================================
+
+pub fn put_dist_name(out: []u8, w: usize, cap: usize, d: u32) -> usize {
+    if (d == D_NORM) { return put_lit(out, w, cap, "D_NORM$"); }
+    if (d == D_LOG) { return put_lit(out, w, cap, "D_LOG$"); }
+    if (d == D_RELU) { return put_lit(out, w, cap, "D_RELU$"); }
+    if (d == D_PHI) { return put_lit(out, w, cap, "D_PHI$"); }
+    return put_lit(out, w, cap, "D_DEEP$");
+}
+
+pub fn put_counts(out: []u8, w: usize, cap: usize, d: u32, a: NmseAcc) -> usize {
+    var p : usize = put_lit(out, w, cap, "      \"$");
+    p = put_dist_name(out, p, cap, d);
+    p = put_lit(out, p, cap, "\": { \"gf16_ties\": $");
+    p = put_u64(out, p, cap, a.ties_g);
+    p = put_lit(out, p, cap, ", \"bf16_ties\": $");
+    p = put_u64(out, p, cap, a.ties_b);
+    p = put_lit(out, p, cap, ", \"gf16_flushed\": $");
+    p = put_u64(out, p, cap, a.flush_g);
+    p = put_lit(out, p, cap, ", \"bf16_subnormal\": $");
+    p = put_u64(out, p, cap, a.sub_b);
+    p = put_lit(out, p, cap, ", \"gf16_inf\": $");
+    p = put_u64(out, p, cap, a.inf_g);
+    p = put_lit(out, p, cap, ", \"bf16_inf\": $");
+    p = put_u64(out, p, cap, a.inf_b);
+    p = put_lit(out, p, cap, ", \"exact_zero_samples\": $");
+    p = put_u64(out, p, cap, a.zeros);
+    p = put_lit(out, p, cap, ", \"sum_x2\": $");
+    p = put_f64(out, p, cap, sum_value(a.ref2));
+    return put_lit(out, p, cap, " }$");
+}
+
+pub fn put_result(out: []u8, w: usize, cap: usize, d: u32, a: NmseAcc) -> usize {
+    const ref2 : f64 = sum_value(a.ref2);
+    var p : usize = put_lit(out, w, cap, "    \"$");
+    p = put_dist_name(out, p, cap, d);
+    p = put_lit(out, p, cap, "\": { \"nmse_gf16\": $");
+    if (!nmse_defined(ref2)) {
+        return put_lit(out, p, cap, "null, \"nmse_bf16\": null, \"ratio\": null }$");
+    }
+    const ng : f64 = sum_value(a.err_g) / ref2;
+    const nb : f64 = sum_value(a.err_b) / ref2;
+    p = put_f64(out, p, cap, ng);
+    p = put_lit(out, p, cap, ", \"nmse_bf16\": $");
+    p = put_f64(out, p, cap, nb);
+    p = put_lit(out, p, cap, ", \"ratio\": $");
+    if (nb > 0.0 and ng > 0.0) {
+        p = put_f64(out, p, cap, ng / nb);
+    } else {
+        p = put_lit(out, p, cap, "null$");
+    }
+    return put_lit(out, p, cap, " }$");
+}
+
+/// The run. `buf[0..n]` holds the caller's facts as `key=value` lines:
+///   seed, samples, subnormal_policy (ieee or ftz), timestamp, host_arch, compiler,
+///   frozen_hash (bootstrap/stage0/FROZEN_HASH, first field), source_sha256 (sha256 of
+///   bootstrap/src/compiler.rs as built), harness_sha256 (sha256 of this file as lowered),
+///   driver (the command, recorded verbatim).
+/// Writes the manifest to out and returns its length; returns 0 and writes nothing usable on any
+/// abort -- a failed witness, a missing or unknown subnormal policy, a malformed fact, a short
+/// buffer, or an infinite result (which JSON cannot carry). The caller exits non-zero on 0.
+pub fn nmse_manifest(buf: []const u8, n: usize, out: []u8, cap: usize) -> usize {
+    return nmse_manifest_with(buf, n, out, cap, PHI);
+}
+
+pub fn nmse_status(buf: []const u8, n: usize, p: f64) -> u32 {
+    if (!witness_holds(p)) {
+        return ABORT_WITNESS;
+    }
+    const pol : usize = find_key(buf, n, "subnormal_policy$");
+    const pol_end : usize = value_end(buf, n, pol);
+    if (pol >= n) {
+        return ABORT_POLICY;
+    }
+    if (!same_range(buf, pol, pol_end, "ieee", 0, 4) and !same_range(buf, pol, pol_end, "ftz", 0, 3)) {
+        return ABORT_POLICY;
+    }
+    const sd : usize = find_key(buf, n, "seed$");
+    if (sd >= n or !parse_seed_ok(buf, sd, value_end(buf, n, sd))) {
+        return ABORT_INPUT;
+    }
+    const sm : usize = find_key(buf, n, "samples$");
+    if (sm >= n or parse_u64(buf, sm, value_end(buf, n, sm)) < 1000) {
+        return ABORT_INPUT;
+    }
+    const ts : usize = find_key(buf, n, "timestamp$");
+    if (ts >= n or !is_utc_timestamp(buf, ts, value_end(buf, n, ts))) {
+        return ABORT_INPUT;
+    }
+    const hs : usize = find_key(buf, n, "harness_sha256$");
+    if (hs >= n or !is_sha256_hex(buf, hs, value_end(buf, n, hs))) {
+        return ABORT_INPUT;
+    }
+    const ha : usize = find_key(buf, n, "host_arch$");
+    if (ha >= n or !safe_value(buf, ha, value_end(buf, n, ha))) {
+        return ABORT_INPUT;
+    }
+    const cc : usize = find_key(buf, n, "compiler$");
+    if (cc >= n or !safe_value(buf, cc, value_end(buf, n, cc))) {
+        return ABORT_INPUT;
+    }
+    const dr : usize = find_key(buf, n, "driver$");
+    if (dr >= n or !safe_value(buf, dr, value_end(buf, n, dr))) {
+        return ABORT_INPUT;
+    }
+    return RUN_OK;
+}
+
+pub fn nmse_manifest_with(buf: []const u8, n: usize, out: []u8, cap: usize, p_phi: f64) -> usize {
+    if (nmse_status(buf, n, p_phi) != RUN_OK) {
+        return 0;
+    }
+    const pol : usize = find_key(buf, n, "subnormal_policy$");
+    const pol_end : usize = value_end(buf, n, pol);
+    const ftz : bool = same_range(buf, pol, pol_end, "ftz", 0, 3);
+    const sd : usize = find_key(buf, n, "seed$");
+    const sd_end : usize = value_end(buf, n, sd);
+    const seed : u64 = parse_seed(buf, sd, sd_end);
+    const sm : usize = find_key(buf, n, "samples$");
+    const samples : u64 = parse_u64(buf, sm, value_end(buf, n, sm));
+
+    // Sealed only when the compiler source that was built is the frozen one.
+    const fh : usize = find_key(buf, n, "frozen_hash$");
+    const fh_end : usize = value_end(buf, n, fh);
+    const sh : usize = find_key(buf, n, "source_sha256$");
+    const sh_end : usize = value_end(buf, n, sh);
+    var sealed : bool = false;
+    if (fh < n and sh < n and is_sha256_hex(buf, fh, fh_end) and same_range(buf, fh, fh_end, buf, sh, sh_end)) {
+        sealed = true;
+    }
+
+    const phi_sd : f64 = sqrt(1.0 / p_phi);
+    var r = rng_seed(seed);
+    const a0 = run_dist(&r, D_NORM, samples, phi_sd, ftz);
+    const a1 = run_dist(&r, D_LOG, samples, phi_sd, ftz);
+    const a2 = run_dist(&r, D_RELU, samples, phi_sd, ftz);
+    const a3 = run_dist(&r, D_PHI, samples, phi_sd, ftz);
+    const a4 = run_dist(&r, D_DEEP, samples, phi_sd, ftz);
+    if (a0.inf_g + a0.inf_b + a1.inf_g + a1.inf_b + a2.inf_g + a2.inf_b + a3.inf_g + a3.inf_b + a4.inf_g + a4.inf_b > 0) {
+        return 0;
+    }
+
+    var p : usize = put_lit(out, 0, cap, "{\n  \"schema_version\": \"$");
+    p = put_lit(out, p, cap, SCHEMA_VERSION);
+    p = put_lit(out, p, cap, "\",\n  \"protocol_version\": \"$");
+    p = put_lit(out, p, cap, PROTOCOL_VERSION);
+    p = put_lit(out, p, cap, "\",\n  \"seal_hash\": \"$");
+    if (sealed) {
+        p = put_range(out, p, cap, buf, fh, fh_end);
+    } else {
+        p = put_lit(out, p, cap, "unsealed$");
+    }
+    p = put_lit(out, p, cap, "\",\n  \"rng\": { \"family\": \"$");
+    p = put_lit(out, p, cap, RNG_FAMILY);
+    p = put_lit(out, p, cap, "\", \"seed\": \"$");
+    p = put_range(out, p, cap, buf, sd, sd_end);
+    p = put_lit(out, p, cap, "\" },\n  \"samples_per_distribution\": $");
+    p = put_u64(out, p, cap, samples);
+    p = put_lit(out, p, cap, ",\n  \"bf16_subnormal_policy\": \"$");
+    p = put_range(out, p, cap, buf, pol, pol_end);
+    p = put_lit(out, p, cap, "\",\n  \"identity_witness\": { \"phi_squared_residual_f64\": $");
+    p = put_f64(out, p, cap, phi_residual(p_phi));
+    p = put_lit(out, p, cap, ", \"trinity_residual_f64\": $");
+    p = put_f64(out, p, cap, trinity_residual(p_phi));
+    p = put_lit(out, p, cap, " },\n  \"results\": {\n$");
+    p = put_result(out, p, cap, D_NORM, a0);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_result(out, p, cap, D_LOG, a1);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_result(out, p, cap, D_RELU, a2);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_result(out, p, cap, D_PHI, a3);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_result(out, p, cap, D_DEEP, a4);
+    p = put_lit(out, p, cap, "\n  },\n  \"runner\": { \"host_arch\": \"$");
+    const ha : usize = find_key(buf, n, "host_arch$");
+    p = put_range(out, p, cap, buf, ha, value_end(buf, n, ha));
+    p = put_lit(out, p, cap, "\", \"compiler\": \"$");
+    const cc : usize = find_key(buf, n, "compiler$");
+    p = put_range(out, p, cap, buf, cc, value_end(buf, n, cc));
+    p = put_lit(out, p, cap, "\" },\n  \"timestamp\": \"$");
+    const ts : usize = find_key(buf, n, "timestamp$");
+    p = put_range(out, p, cap, buf, ts, value_end(buf, n, ts));
+    p = put_lit(out, p, cap, "\",\n  \"x_extension\": {\n    \"harness\": \"specs/benchmarks/gf16_bfloat16_nmse_run.t27\",\n    \"harness_sha256\": \"$");
+    const hs : usize = find_key(buf, n, "harness_sha256$");
+    p = put_range(out, p, cap, buf, hs, value_end(buf, n, hs));
+    p = put_lit(out, p, cap, "\",\n    \"driver\": \"$");
+    const dr : usize = find_key(buf, n, "driver$");
+    p = put_range(out, p, cap, buf, dr, value_end(buf, n, dr));
+    p = put_lit(out, p, cap, "\",\n    \"stream\": \"one xoshiro256pp stream seeded by splitmix64(seed); D_NORM, D_LOG, D_RELU, D_PHI, D_DEEP drawn in that order, samples_per_distribution each\",\n$");
+    p = put_lit(out, p, cap, "    \"normal_sampler\": \"Box-Muller on 53-bit uniforms, both values of a pair used\",\n$");
+    p = put_lit(out, p, cap, "    \"d_phi_reading\": \"N(mean, variance): mean phi, standard deviation sqrt(1/phi)\",\n$");
+    p = put_lit(out, p, cap, "    \"d_deep_reading\": \"per sample: D_NORM with probability 0.7, else D_LOG\",\n$");
+    p = put_lit(out, p, cap, "    \"rounding\": \"both formats round to nearest, ties to even, once from f64; the frozen GF16 SSOT encoder rounds ties toward zero, which differs from this only on the samples counted in gf16_ties\",\n$");
+    p = put_lit(out, p, cap, "    \"gf16_range\": \"FORMAT-SPEC-001 GF16, no subnormals: |x| < 2^-31 and values rounding to 2^-31 flush to signed zero; E = 63 is Inf\",\n$");
+    p = put_lit(out, p, cap, "    \"accumulation\": \"Neumaier-compensated f64 sums; nmse = sum (x - Q(x))^2 / sum x^2\",\n$");
+    p = put_lit(out, p, cap, "    \"number_text\": \"ten significant digits, the last within one unit\",\n$");
+    p = put_lit(out, p, cap, "    \"counts\": {\n$");
+    p = put_counts(out, p, cap, D_NORM, a0);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_counts(out, p, cap, D_LOG, a1);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_counts(out, p, cap, D_RELU, a2);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_counts(out, p, cap, D_PHI, a3);
+    p = put_lit(out, p, cap, ",\n$");
+    p = put_counts(out, p, cap, D_DEEP, a4);
+    p = put_lit(out, p, cap, "\n    }\n  }\n}\n$");
+    if (p > cap) {
+        return 0;
+    }
+    return p;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "witness_holds_for_phi_and_fails_for_a_wrong_phi" {
+    assert(witness_holds(PHI));
+    assert(witness_holds(1.6180339887) == false);
+    assert(phi_residual(PHI) < WITNESS_TOLERANCE);
+    assert(trinity_residual(PHI) < WITNESS_TOLERANCE);
+}
+
+test "splitmix64_known_vector_from_seed_zero" {
+    var r = Xoshiro { s0: 0, s1: 0, s2: 0, s3: 0, sm: 0, have: false, spare: 0.0 };
+    assert(splitmix_next(&r) == 0xE220A8397B1DCDAF);
+    assert(splitmix_next(&r) == 0x6E789E6AA1B965F4);
+    assert(splitmix_next(&r) == 0x06C45D188009454F);
+    assert(splitmix_next(&r) == 0xF88BB8A8724C81EC);
+}
+
+test "xoshiro256pp_first_output_from_splitmix_seed_zero" {
+    var r = rng_seed(0);
+    // rotl(s0 + s3, 23) + s0 with s0 = 0xE220A8397B1DCDAF, s3 = 0xF88BB8A8724C81EC.
+    assert(rng_next(&r) == XO_FIRST_FROM_ZERO);
+}
+
+pub const XO_FIRST_FROM_ZERO : u64 = 0x53175D61490B23DF;
+
+test "uniform_stays_in_range" {
+    var r = rng_seed(0x2545F4914F6CDD1D);
+    var i : u32 = 0;
+    while (i < 1000) {
+        const u : f64 = uniform(&r);
+        assert(u >= 0.0 and u < 1.0);
+        const v : f64 = uniform_open0(&r);
+        assert(v > 0.0 and v <= 1.0);
+        i += 1;
+    }
+}
+
+test "rne_ties_go_to_even" {
+    assert(rne(2.5) == 2.0);
+    assert(rne(3.5) == 4.0);
+    assert(rne(2.4999) == 2.0);
+    assert(rne(2.5001) == 3.0);
+    assert(is_tie(512.5));
+    assert(is_tie(512.25) == false);
+}
+
+test "split_is_exact" {
+    const a = split(1.0);
+    assert(a.m == 1.0 and a.e == 0);
+    const b = split(3.0);
+    assert(b.m == 1.5 and b.e == 1);
+    const c = split(0.375);
+    assert(c.m == 1.5 and c.e == -2);
+    const d = split(1048576.0);
+    assert(d.m == 1.0 and d.e == 20);
+    assert(d.m == 1048576.0 * d.s);
+}
+
+test "gf16_representable_values_are_fixed_points" {
+    assert(q_gf16(1.0).v == 1.0);
+    assert(q_gf16(-1.0).v == -1.0);
+    assert(q_gf16(1.0 + 1.0 / 512.0).v == 1.0 + 1.0 / 512.0);
+    // 0x7DFF, the largest finite GF16: (2 - 2^-9) * 2^31.
+    const mx : f64 = (2.0 - 1.0 / 512.0) * pow2(31);
+    assert(q_gf16(mx).v == mx);
+    // 0x0001, the smallest positive GF16: (1 + 2^-9) * 2^-31.
+    const mn : f64 = (1.0 + 1.0 / 512.0) * pow2(-31);
+    assert(q_gf16(mn).v == mn);
+}
+
+test "gf16_ties_to_even_and_counts_the_tie" {
+    // 1 + 2^-10 is halfway between M = 0 and M = 1: even M = 0 wins.
+    const t1 = q_gf16(1.0 + 1.0 / 1024.0);
+    assert(t1.v == 1.0);
+    assert(t1.tie);
+    // 1 + 3 * 2^-10 is halfway between M = 1 and M = 2: even M = 2 wins.
+    const t2 = q_gf16(1.0 + 3.0 / 1024.0);
+    assert(t2.v == 1.0 + 2.0 / 512.0);
+    // just above a tie rounds up, and is not a tie
+    const t3 = q_gf16(1.0 + 1.0 / 1024.0 + 1.0 / 1048576.0);
+    assert(t3.v == 1.0 + 1.0 / 512.0);
+    assert(t3.tie == false);
+}
+
+test "gf16_range_edges_follow_the_ssot" {
+    // |x| < 2^-31 flushes to zero; 2^-31 itself has no code.
+    assert(q_gf16(pow2(-32)).flushed);
+    assert(q_gf16(pow2(-31)).flushed);
+    assert(q_gf16(pow2(-31)).v == 0.0);
+    // (2 - 2^-10) * 2^31 is a tie between 0x7DFF and 2^32; ties-to-even goes to 2^32 = Inf.
+    assert(q_gf16((2.0 - 1.0 / 1024.0) * pow2(31)).inf);
+    assert(q_gf16(pow2(32)).inf);
+    assert(q_gf16(0.0).v == 0.0);
+}
+
+test "bf16_rounds_to_seven_mantissa_bits" {
+    assert(q_bf16(1.0, false).v == 1.0);
+    assert(q_bf16(1.0 + 1.0 / 256.0, false).v == 1.0);
+    assert(q_bf16(1.0 + 3.0 / 256.0, false).v == 1.0 + 2.0 / 128.0);
+    assert(q_bf16(1.0 + 1.0 / 512.0, false).v == 1.0);
+    assert(q_bf16(-3.0, false).v == -3.0);
+    // 3.140625 = 1.5703125 * 2 is exact in bf16 (M = 73).
+    assert(q_bf16(3.140625, false).v == 3.140625);
+}
+
+test "bf16_subnormals_ieee_and_ftz" {
+    const tiny : f64 = 3.0 * pow2(-133);
+    const s = q_bf16(tiny, false);
+    assert(s.sub);
+    assert(s.v == tiny);
+    const f = q_bf16(tiny, true);
+    assert(f.flushed);
+    assert(f.v == 0.0);
+    // 2^-126, the smallest normal, is not subnormal.
+    assert(q_bf16(pow2(-126), false).sub == false);
+    assert(q_bf16(pow2(-126), false).v == pow2(-126));
+    assert(q_bf16(pow2(128), false).inf);
+}
+
+test "gf16_keeps_two_more_mantissa_bits_than_bf16_near_one" {
+    // 1 + 2^-9 is a GF16 value and rounds away in bf16.
+    const x : f64 = 1.0 + 1.0 / 512.0;
+    assert(q_gf16(x).v == x);
+    assert(q_bf16(x, false).v != x);
+}
+
+test "neumaier_sum_keeps_small_terms" {
+    var s = NeumaierSum { s: 0.0, c: 0.0 };
+    sum_add(&s, 1.0);
+    sum_add(&s, 0.0000000000000001);
+    sum_add(&s, -1.0);
+    assert(sum_value(s) == 0.0000000000000001);
+}
+
+test "a_small_run_accumulates_non_negative_errors" {
+    var r = rng_seed(0x9E3779B97F4A7C15);
+    const a = run_dist(&r, D_NORM, 2000, sqrt(1.0 / PHI), false);
+    assert(sum_value(a.ref2) > 0.0);
+    assert(sum_value(a.err_g) >= 0.0);
+    assert(sum_value(a.err_b) >= 0.0);
+    assert(sum_value(a.err_g) < sum_value(a.ref2));
+    assert(a.inf_g == 0 and a.inf_b == 0);
+    const z = run_dist(&r, D_RELU, 2000, sqrt(1.0 / PHI), false);
+    assert(z.zeros > 0);
+}
+
+test "f64_text_has_ten_significant_digits" {
+    var o : [64]u8 = [_]u8{0} ** 64;
+    const n1 : usize = put_f64(&o, 0, 64, 1.0);
+    assert(n1 == 15);
+    assert(o[0] == 49 and o[1] == 46 and o[11] == 101 and o[12] == 43 and o[13] == 48 and o[14] == 48);
+    const n2 : usize = put_f64(&o, 0, 64, 0.000001234567891);
+    assert(n2 == 15);
+    // 1.234567891e-06
+    assert(o[0] == 49 and o[2] == 50 and o[10] == 49 and o[12] == 45 and o[13] == 48 and o[14] == 54);
+    const n3 : usize = put_f64(&o, 0, 64, 0.0);
+    assert(n3 == 3);
+}
+
+test "seed_and_count_parse" {
+    const b : []const u8 = "seed=0x2545F4914F6CDD1D\nsamples=10000000\n$";
+    const m : usize = lit_len(b);
+    assert(m == 41);
+    const s : usize = find_key(b, m, "seed$");
+    assert(s == 5);
+    assert(parse_seed_ok(b, s, value_end(b, m, s)));
+    assert(parse_seed(b, s, value_end(b, m, s)) == 0x2545F4914F6CDD1D);
+    const c : usize = find_key(b, m, "samples$");
+    assert(parse_u64(b, c, value_end(b, m, c)) == 10000000);
+    assert(find_key(b, m, "timestamp$") == m);
+}
+
+test "timestamp_and_harness_hash_shapes" {
+    const t : []const u8 = "2026-10-17T16:35:17Z$";
+    assert(is_utc_timestamp(t, 0, lit_len(t)));
+    const z : []const u8 = "2026-10-17T16:35:17+00:00$";
+    assert(!is_utc_timestamp(z, 0, lit_len(z)));
+    const d : []const u8 = "2026-10-17 16:35:17Z$";
+    assert(!is_utc_timestamp(d, 0, lit_len(d)));
+    const h : []const u8 = "e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8$";
+    assert(is_sha256_hex(h, 0, lit_len(h)));
+    const k : []const u8 = "E769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8$";
+    assert(!is_sha256_hex(k, 0, lit_len(k)));
+}
+
+test "missing_policy_and_failed_witness_abort_with_no_manifest" {
+    const b : []const u8 = "seed=0x1\nsamples=1000\ntimestamp=2026-10-17T00:00:00Z\nharness_sha256=e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    assert(nmse_status(b, lit_len(b), PHI) == ABORT_POLICY);
+    const g : []const u8 = "seed=0x1\nsamples=1000\nsubnormal_policy=ieee\ntimestamp=2026-10-17T00:00:00Z\nharness_sha256=e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    assert(nmse_status(g, lit_len(g), PHI) == RUN_OK);
+    assert(nmse_status(g, lit_len(g), 1.6180339887) == ABORT_WITNESS);
+    const u : []const u8 = "seed=0x1\nsamples=1000\nsubnormal_policy=none\ntimestamp=2026-10-17T00:00:00Z\nharness_sha256=e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    assert(nmse_status(u, lit_len(u), PHI) == ABORT_POLICY);
+    const nh : []const u8 = "seed=0x1\nsamples=1000\nsubnormal_policy=ieee\ntimestamp=2026-10-17T00:00:00Z\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    assert(nmse_status(nh, lit_len(nh), PHI) == ABORT_INPUT);
+    const bt : []const u8 = "seed=0x1\nsamples=1000\nsubnormal_policy=ieee\ntimestamp=yesterday\nharness_sha256=e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    assert(nmse_status(bt, lit_len(bt), PHI) == ABORT_INPUT);
+    var o : [8192]u8 = [_]u8{0} ** 8192;
+    assert(nmse_manifest_with(g, lit_len(g), &o, 8192, 1.6180339887) == 0);
+    assert(nmse_manifest_with(b, lit_len(b), &o, 8192, PHI) == 0);
+    assert(nmse_manifest_with(nh, lit_len(nh), &o, 8192, PHI) == 0);
+}
+
+test "a_thousand_sample_manifest_is_written_and_unsealed_without_hashes" {
+    const g : []const u8 = "seed=0x1\nsamples=1000\nsubnormal_policy=ieee\ntimestamp=2026-10-17T00:00:00Z\nharness_sha256=e769ef0217136b9bfdcb3dd783f02d8a8e23e91b70367416d02cdf61af4727e8\nhost_arch=x\ncompiler=c\ndriver=d\n$";
+    var o : [8192]u8 = [_]u8{0} ** 8192;
+    const n : usize = nmse_manifest_with(g, lit_len(g), &o, 8192, PHI);
+    assert(n > 1000);
+    assert(o[0] == 123 and o[n - 2] == 125 and o[n - 1] == 10);
+    // a buffer one byte short refuses rather than truncates
+    assert(nmse_manifest_with(g, lit_len(g), &o, n - 1, PHI) == 0);
+}
