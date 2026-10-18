@@ -1,0 +1,583 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/hslm_backward.t27
+// One HSLM training step on shadow weights: the output head of specs/nn/hslm.t27 (a ternary
+// matrix with a TWN alpha, a bias and cross-entropy), trained the way trinity-training trains
+// it. Forward on trits, backward straight-through to the float shadow weights, gradient clip,
+// SGD step on the shadow weights, requantize. The backward is checked against a central finite
+// difference, and the loss is shown to fall.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Source of truth: gHashTag/trinity-training @ 3e9648c1817a97c5f9b8c727b0f8e2291928eead
+//   src/hslm/ste.zig       the quantizers (here: nn/ternary_ste.t27)
+//   src/hslm/autograd.zig  clipGradNorm
+//   src/hslm/trainer.zig   train step: forward, loss, backward, clip, optimizer on the shadow
+//                          weights, requantize
+//
+// What is in it and what is not, so nobody reads it as more:
+//   - It is the head only: 9 inputs, 27 classes, 243 trits. The three transformer blocks
+//     already have their backward in nn/hslm.t27 (46/46 pass, every gradient checked there). A
+//     step through all of them needs a shadow copy of ~2 M weights next to the trits; this spec
+//     does not claim that. It claims the step is right on the layer shape the blocks are built
+//     of: ternary matmul with alpha, a bias, softmax cross-entropy.
+//   - The kernels (ternary_matmul, ternary_matmul_t_add, outer_add, cross_entropy) are the ones
+//     in nn/hslm.t27, copied here because that module carries 2 M trits of state that a tiny
+//     step does not need to load. If one changes, the other must.
+//   - The optimizer is plain SGD with no momentum, the trainer uses AdamW.
+//   - The gradient is d loss / d trit, as in nn/hslm.t27 (gw = alpha * x (x) dlogits), and it is
+//     handed to the shadow weight unchanged: the straight-through estimator.
+//   - Resonance Law: ctx 27 = 3^3, three heads of head_dim 3, which divides ctx; the model width
+//     is 3 * 3 = 9.
+
+module HslmBackward {
+    use base::types;
+    use nn::ternary_ste;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 1. Shape
+    // ═════════════════════════════════════════════════════════════════
+
+    const CTX : usize = 27;          // 3^3
+    const NUM_HEADS : usize = 3;
+    const HEAD_DIM : usize = 3;      // a divisor of CTX
+    const IN_DIM : usize = 9;        // NUM_HEADS * HEAD_DIM
+    const OUT_DIM : usize = 27;      // classes, one per context position
+    const N_EXAMPLES : usize = 9;    // a batch: tokens 0..8
+    const LOGIT_SCALE : f64 = 1.0;   // nn/hslm.t27 uses 0.2734 (SACRED_LOGIT_SCALE); 1.0 keeps a 9-wide head learnable
+    const CLIP_NORM : f64 = 5.0;
+    const LEARNING_RATE : f64 = 2.0;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 2. State
+    // ═════════════════════════════════════════════════════════════════
+
+    var shadow : [243]f64 = undefined;     // IN_DIM * OUT_DIM float weights, row-major j * OUT_DIM + i
+    var trits : [243]Trit = undefined;     // what the forward pass sees
+    var alpha : f64 = 1.0;
+    var bias : [27]f64 = undefined;
+    var gw : [243]f64 = undefined;         // d loss / d trit
+    var gs : [243]f64 = undefined;         // the gradient the shadow weights receive
+    var gb : [27]f64 = undefined;
+    var act_x : [9]f64 = undefined;
+    var logits : [27]f64 = undefined;
+    var dl : [27]f64 = undefined;          // d loss / d logits
+    var dz : [27]f64 = undefined;          // d loss / d (x @ W)
+    var dx : [9]f64 = undefined;           // d loss / d x
+
+    // Real-valued nudges for the gradient checks: a trit, a bias entry, an input entry
+    var nudge_index : usize = 0;
+    var nudge_delta : f64 = 0.0;
+    var x_index : usize = 0;
+    var x_delta : f64 = 0.0;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 3. Kernels (as in nn/hslm.t27)
+    // ═════════════════════════════════════════════════════════════════
+
+    fn fill(x: []f64, value: f64) -> void {
+        var i : usize = 0;
+        while (i < x.len) {
+            x[i] = value;
+            i = i + 1;
+        }
+    }
+
+    // output[i] = sum_j input[j] * w[j * out_dim + i], trits as -1 / 0 / +1
+    fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+        var i : usize = 0;
+        while (i < out_dim) {
+            var acc : f64 = 0.0;
+            var j : usize = 0;
+            while (j < in_dim) {
+                const w = weights[j * out_dim + i];
+                if (w == Trit.pos) {
+                    acc = acc + input[j];
+                } else if (w == Trit.neg) {
+                    acc = acc - input[j];
+                }
+                j = j + 1;
+            }
+            output[i] = acc;
+            i = i + 1;
+        }
+    }
+
+    // The transpose, accumulated: dx[j] += sum_i w[j * out_dim + i] * dy[i]
+    fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx_out: []f64, in_dim: usize, out_dim: usize) -> void {
+        var j : usize = 0;
+        while (j < in_dim) {
+            var acc : f64 = 0.0;
+            var i : usize = 0;
+            while (i < out_dim) {
+                const w = weights[j * out_dim + i];
+                if (w == Trit.pos) {
+                    acc = acc + dy[i];
+                } else if (w == Trit.neg) {
+                    acc = acc - dy[i];
+                }
+                i = i + 1;
+            }
+            dx_out[j] = dx_out[j] + acc;
+            j = j + 1;
+        }
+    }
+
+    // Weight gradient of a matmul: gw[j * out_dim + i] += x[j] * dy[i]
+    fn outer_add(x: []const f64, dy: []const f64, g: []f64, in_dim: usize, out_dim: usize) -> void {
+        var j : usize = 0;
+        while (j < in_dim) {
+            var i : usize = 0;
+            while (i < out_dim) {
+                g[j * out_dim + i] = g[j * out_dim + i] + x[j] * dy[i];
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+    }
+
+    // loss = log(sum_j exp(l_j)) - l_target
+    fn cross_entropy(l: []const f64, target: usize) -> f64 {
+        var max_logit : f64 = l[0];
+        var j : usize = 1;
+        while (j < l.len) {
+            if (l[j] > max_logit) {
+                max_logit = l[j];
+            }
+            j = j + 1;
+        }
+        var sum : f64 = 0.0;
+        j = 0;
+        while (j < l.len) {
+            sum = sum + exp(l[j] - max_logit);
+            j = j + 1;
+        }
+        return log(sum) + max_logit - l[target];
+    }
+
+    // d loss / d l_j = softmax_j - [j == target]
+    fn cross_entropy_backward(l: []const f64, target: usize, d: []f64) -> void {
+        var max_logit : f64 = l[0];
+        var j : usize = 1;
+        while (j < l.len) {
+            if (l[j] > max_logit) {
+                max_logit = l[j];
+            }
+            j = j + 1;
+        }
+        var sum : f64 = 0.0;
+        j = 0;
+        while (j < l.len) {
+            d[j] = exp(l[j] - max_logit);
+            sum = sum + d[j];
+            j = j + 1;
+        }
+        j = 0;
+        while (j < l.len) {
+            d[j] = d[j] / sum;
+            j = j + 1;
+        }
+        d[target] = d[target] - 1.0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4. Model: init, forward, backward, train step
+    // ═════════════════════════════════════════════════════════════════
+
+    // A small signed pattern in [-scale/2, scale/2); a multiplicative hash mod a prime, as in
+    // nn/hslm.t27, so no row or column repeats
+    fn small(seed: usize, scale: f64) -> f64 {
+        const m = ((seed * 2654435761) % 1000003) % 13;
+        return scale * (@as(f64, @floatFromInt(m)) / 13.0 - 0.5);
+    }
+
+    // A token's input vector: nine distinct small floats, a stand-in for an embedding row
+    fn embed(token: usize, out: []f64) -> void {
+        var j : usize = 0;
+        while (j < IN_DIM) {
+            out[j] = small(token * IN_DIM + j + 1, 4.0);
+            j = j + 1;
+        }
+    }
+
+    // The class a token has to map to: a permutation of 0..26 (5 is coprime to 27)
+    fn target_of(token: usize) -> usize {
+        return (token * 5 + 2) % OUT_DIM;
+    }
+
+    fn requantize_all() -> void {
+        alpha = ternary_ste::requantize(&shadow, &trits);
+    }
+
+    fn init_model() -> void {
+        var k : usize = 0;
+        while (k < IN_DIM * OUT_DIM) {
+            shadow[k] = small(k + 7, 0.6);
+            k = k + 1;
+        }
+        fill(&bias, 0.0);
+        nudge_delta = 0.0;
+        x_delta = 0.0;
+        requantize_all();
+    }
+
+    // logits = alpha * (x @ W_trits) * LOGIT_SCALE + bias
+    fn forward(token: usize) -> void {
+        embed(token, &act_x);
+        act_x[x_index] = act_x[x_index] + x_delta;
+        ternary_matmul(&act_x, &trits, &logits, IN_DIM, OUT_DIM);
+        // the trit nudge: the output moves as if trit `nudge_index` were one plus nudge_delta
+        const nj = nudge_index / OUT_DIM;
+        const ni = nudge_index % OUT_DIM;
+        logits[ni] = logits[ni] + nudge_delta * act_x[nj];
+        var i : usize = 0;
+        while (i < OUT_DIM) {
+            logits[i] = alpha * logits[i] * LOGIT_SCALE + bias[i];
+            i = i + 1;
+        }
+    }
+
+    fn zero_gradients() -> void {
+        fill(&gw, 0.0);
+        fill(&gs, 0.0);
+        fill(&gb, 0.0);
+    }
+
+    // Adds one example's gradients to gw, gb; dx is this example's input gradient
+    fn backward(target: usize) -> void {
+        cross_entropy_backward(&logits, target, &dl);
+        var i : usize = 0;
+        while (i < OUT_DIM) {
+            gb[i] = gb[i] + dl[i];
+            dz[i] = alpha * LOGIT_SCALE * dl[i];
+            i = i + 1;
+        }
+        outer_add(&act_x, &dz, &gw, IN_DIM, OUT_DIM);
+        fill(&dx, 0.0);
+        ternary_matmul_t_add(&dz, &trits, &dx, IN_DIM, OUT_DIM);
+    }
+
+    // Mean loss over the batch, no gradients
+    fn mean_loss() -> f64 {
+        var total : f64 = 0.0;
+        var e : usize = 0;
+        while (e < N_EXAMPLES) {
+            forward(e);
+            total = total + cross_entropy(&logits, target_of(e));
+            e = e + 1;
+        }
+        return total / @as(f64, @floatFromInt(N_EXAMPLES));
+    }
+
+    fn correct_count() -> usize {
+        var hits : usize = 0;
+        var e : usize = 0;
+        while (e < N_EXAMPLES) {
+            forward(e);
+            var best : usize = 0;
+            var j : usize = 1;
+            while (j < OUT_DIM) {
+                if (logits[j] > logits[best]) {
+                    best = j;
+                }
+                j = j + 1;
+            }
+            if (best == target_of(e)) {
+                hits = hits + 1;
+            }
+            e = e + 1;
+        }
+        return hits;
+    }
+
+    // One training step: returns the mean loss before it. Forward and backward over the batch,
+    // average, straight-through to the shadow weights, clip, SGD, requantize.
+    fn train_step(lr: f64) -> f64 {
+        zero_gradients();
+        var total : f64 = 0.0;
+        var e : usize = 0;
+        while (e < N_EXAMPLES) {
+            forward(e);
+            total = total + cross_entropy(&logits, target_of(e));
+            backward(target_of(e));
+            e = e + 1;
+        }
+        const inv = 1.0 / @as(f64, @floatFromInt(N_EXAMPLES));
+        var k : usize = 0;
+        while (k < IN_DIM * OUT_DIM) {
+            gw[k] = gw[k] * inv;
+            k = k + 1;
+        }
+        var i : usize = 0;
+        while (i < OUT_DIM) {
+            gb[i] = gb[i] * inv;
+            i = i + 1;
+        }
+        ternary_ste::ste_pass_through(&gw, &gs);
+        ternary_ste::clip_grad_norm(&gs, CLIP_NORM);
+        ternary_ste::sgd_shadow_step(&shadow, &gs, lr);
+        ternary_ste::sgd_shadow_step(&bias, &gb, lr);
+        requantize_all();
+        return total * inv;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 5. Probes
+    // ═════════════════════════════════════════════════════════════════
+
+    // d loss / d trit at idx for one example (token 3, class 7), by a central difference
+    fn fd_trit(idx: usize) -> f64 {
+        const eps = 0.00001;
+        nudge_index = idx;
+        nudge_delta = eps;
+        forward(3);
+        const up = cross_entropy(&logits, 7);
+        nudge_delta = 0.0 - eps;
+        forward(3);
+        const down = cross_entropy(&logits, 7);
+        nudge_delta = 0.0;
+        return (up - down) / (2.0 * eps);
+    }
+
+    fn analytic_one() -> void {
+        init_model();
+        zero_gradients();
+        forward(3);
+        backward(7);
+    }
+
+    fn trit_grad_error(idx: usize) -> f64 {
+        analytic_one();
+        const analytic = gw[idx];
+        return @abs(analytic - fd_trit(idx));
+    }
+
+    fn trit_grad_size(idx: usize) -> f64 {
+        analytic_one();
+        return @abs(gw[idx]);
+    }
+
+    fn bias_grad_error(idx: usize) -> f64 {
+        analytic_one();
+        const analytic = gb[idx];
+        const eps = 0.00001;
+        bias[idx] = bias[idx] + eps;
+        forward(3);
+        const up = cross_entropy(&logits, 7);
+        bias[idx] = bias[idx] - 2.0 * eps;
+        forward(3);
+        const down = cross_entropy(&logits, 7);
+        bias[idx] = bias[idx] + eps;
+        return @abs(analytic - (up - down) / (2.0 * eps));
+    }
+
+    fn input_grad_error(idx: usize) -> f64 {
+        analytic_one();
+        const analytic = dx[idx];
+        const eps = 0.00001;
+        x_index = idx;
+        x_delta = eps;
+        forward(3);
+        const up = cross_entropy(&logits, 7);
+        x_delta = 0.0 - eps;
+        forward(3);
+        const down = cross_entropy(&logits, 7);
+        x_delta = 0.0;
+        x_index = 0;
+        return @abs(analytic - (up - down) / (2.0 * eps));
+    }
+
+    fn input_grad_size(idx: usize) -> f64 {
+        analytic_one();
+        return @abs(dx[idx]);
+    }
+
+    // The softmax gradient sums to zero over the classes
+    fn dl_sum() -> f64 {
+        analytic_one();
+        var s : f64 = 0.0;
+        var i : usize = 0;
+        while (i < OUT_DIM) {
+            s = s + dl[i];
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // gw[j * OUT_DIM + i] = alpha * x[j] * dl[i], the whole gradient in one formula
+    fn gw_formula_error() -> f64 {
+        analytic_one();
+        var worst : f64 = 0.0;
+        var j : usize = 0;
+        while (j < IN_DIM) {
+            var i : usize = 0;
+            while (i < OUT_DIM) {
+                const want = alpha * LOGIT_SCALE * act_x[j] * dl[i];
+                const gap = @abs(gw[j * OUT_DIM + i] - want);
+                if (gap > worst) {
+                    worst = gap;
+                }
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+        return worst;
+    }
+
+    fn init_loss() -> f64 {
+        init_model();
+        return mean_loss();
+    }
+
+    fn init_hits() -> usize {
+        init_model();
+        return correct_count();
+    }
+
+    // Loss after `steps` steps of learning rate lr
+    fn loss_after(steps: u32, lr: f64) -> f64 {
+        init_model();
+        var n : u32 = 0;
+        while (n < steps) {
+            const before = train_step(lr);
+            n = n + 1;
+        }
+        return mean_loss();
+    }
+
+    fn hits_after(steps: u32, lr: f64) -> usize {
+        init_model();
+        var n : u32 = 0;
+        while (n < steps) {
+            const before = train_step(lr);
+            n = n + 1;
+        }
+        return correct_count();
+    }
+
+    // How many of the 243 trits differ after `steps` steps from where they started
+    fn trits_flipped(steps: u32, lr: f64) -> usize {
+        init_model();
+        var start : [243]Trit = undefined;
+        var k : usize = 0;
+        while (k < IN_DIM * OUT_DIM) {
+            start[k] = trits[k];
+            k = k + 1;
+        }
+        var n : u32 = 0;
+        while (n < steps) {
+            const before = train_step(lr);
+            n = n + 1;
+        }
+        var flipped : usize = 0;
+        k = 0;
+        while (k < IN_DIM * OUT_DIM) {
+            if (trits[k] != start[k]) {
+                flipped = flipped + 1;
+            }
+            k = k + 1;
+        }
+        return flipped;
+    }
+
+    // The clipped gradient norm after one step's worth of backward, for a tight bound
+    fn clipped_norm(bound: f64) -> f64 {
+        analytic_one();
+        ternary_ste::ste_pass_through(&gw, &gs);
+        ternary_ste::clip_grad_norm(&gs, bound);
+        return ternary_ste::grad_norm(&gs);
+    }
+
+    fn raw_norm() -> f64 {
+        analytic_one();
+        return ternary_ste::grad_norm(&gw);
+    }
+
+    fn nonzero_trits() -> usize {
+        init_model();
+        return IN_DIM * OUT_DIM - ternary_ste::count_zero(&trits);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants
+    // ═════════════════════════════════════════════════════════════════
+
+    // Each backward entry against a central difference of the forward pass: a trit at the first
+    // row, a trit in the middle, the last trit. A zero trit is checked too: its gradient is the
+    // straight-through one, the slope of the loss in the trit's value.
+    test backward_trit_gradient_matches_finite_difference
+        given e0 = trit_grad_error(0)
+        when e1 = trit_grad_error(100)
+        then e0 < 0.000001 and e1 < 0.000001 and trit_grad_error(242) < 0.000001 and trit_grad_error(7) < 0.000001
+
+    // the check above is not about zeros: the gradients it compares are not tiny
+    test backward_trit_gradients_are_not_zero
+        given s0 = trit_grad_size(0)
+        then s0 > 0.00001 and trit_grad_size(100) > 0.00001 and trit_grad_size(7) > 0.00001
+
+    test backward_bias_gradient_matches_finite_difference
+        given e0 = bias_grad_error(0)
+        when e7 = bias_grad_error(7)
+        then e0 < 0.000001 and e7 < 0.000001 and bias_grad_error(26) < 0.000001
+
+    test backward_input_gradient_matches_finite_difference
+        given e0 = input_grad_error(0)
+        when e4 = input_grad_error(4)
+        then e0 < 0.000001 and e4 < 0.000001 and input_grad_error(8) < 0.000001 and input_grad_size(4) > 0.00001
+
+    test backward_logits_gradient_sums_to_zero
+        given s = dl_sum()
+        then @abs(s) < 0.000000000001
+
+    // the straight-through gradient is exactly alpha * x (x) dlogits
+    test backward_weight_gradient_is_alpha_x_outer_dlogits
+        given gap = gw_formula_error()
+        then gap < 0.000000000001
+
+    test clip_leaves_a_small_norm_alone
+        given n = clipped_norm(1000.0)
+        then @abs(n - raw_norm()) < 0.000000000001
+
+    test clip_pulls_a_large_norm_down_to_the_bound
+        given n = clipped_norm(0.01)
+        then @abs(n - 0.01) < 0.000000000001 and raw_norm() > 0.01
+
+    test init_quantization_uses_both_signs_and_zeros
+        given nz = nonzero_trits()
+        then nz > 20 and nz < 243
+
+    test init_loss_is_near_uniform
+        given l = init_loss()
+        then l > 2.0 and l < 5.0
+
+    test a_zero_learning_rate_changes_nothing
+        given l0 = loss_after(0, LEARNING_RATE)
+        when l1 = loss_after(3, 0.0)
+        then @abs(l0 - l1) < 0.000000000001
+
+    test one_step_lowers_the_loss
+        given l0 = loss_after(0, LEARNING_RATE)
+        when l1 = loss_after(1, LEARNING_RATE)
+        then l1 < l0
+
+    test training_lowers_the_loss_a_lot
+        given l0 = loss_after(0, LEARNING_RATE)
+        when l20 = loss_after(20, LEARNING_RATE)
+        then l20 < l0 * 0.5
+
+    test training_flips_trits
+        given f = trits_flipped(20, LEARNING_RATE)
+        then f > 0
+
+    test training_makes_predictions_right
+        given h0 = hits_after(0, LEARNING_RATE)
+        when h20 = hits_after(20, LEARNING_RATE)
+        then h20 > h0 and h20 >= 7
+
+    invariant resonance_ctx_is_three_cubed
+        assert CTX == 27 and CTX == 3 * 3 * 3
+
+    invariant resonance_head_dim_divides_ctx
+        assert CTX % HEAD_DIM == 0 and IN_DIM == NUM_HEADS * HEAD_DIM
+
+    invariant batch_fits_the_context
+        assert N_EXAMPLES <= CTX and OUT_DIM == CTX
+}
