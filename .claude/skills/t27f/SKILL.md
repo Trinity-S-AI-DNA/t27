@@ -194,6 +194,29 @@ approved)`.
 Keep drafts, verified results and published items under separate headings (`layer_of`). If the
 journey is saved, save it as a `.t27` data module, not JSON. Saving follows the user's instruction.
 
+## Application: content factory, beats (t27#10584)
+
+`specs/t27f/reel_beats.t27` plans every reel of course 0 as three beats: open, main and close.
+Main is `arche(t)` from `reel_factory.t27`. Open is the best other construct, with a generic
+fallback. Close is a rotating generic. No two reels share the ordered pair (open, main), and
+neighbouring reels differ in every beat.
+
+Before you change a uniqueness rule, measure what it can draw from:
+
+- **Count the pool before you promise uniqueness.** 21 of 27 course-0 lessons have content only
+  for graph and tests among the constructs. This is measured, not a detection bug: course 0's
+  snippets have no `while` or `if`. Six archetypes make only 15 unordered pairs for 27 reels,
+  so an unordered rule fails 4 of 7 tests. Ordered pairs (30) hold. Print the content matrix
+  (lesson by archetype `content()`) first.
+- **A generated printer needs a test block.** `t27c gen` emits `const std = @import("std")`
+  only when the module has a test. Without one, `std.debug.print` fails in zig with "use of
+  undeclared identifier 'std'". Give a lab-only printer one trivial `test`.
+- **Keep scratch printers on the lab.** Copy them into `specs/` for `t27c gen`, then `rm` them
+  in the same command. Never commit them.
+- **Write PR bodies with the Write tool.** The Mac hook matches words in a
+  shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
+  pass `--body-file`.
+
 ## What this skill does not claim
 
 The graph IR is a schema (`specs/t27f/spec_graph.t27`) and `specs/t27f/spec_graph_export.t27` turns source into it, but only exact declarations, spans and edges within the IR's capacity, with `specs/t27f/spec_graph_derive.t27` adding the derived and unknown part by stated rules, and no host calls either yet; no renderer draws a T27F view in the Trinity UI, no
