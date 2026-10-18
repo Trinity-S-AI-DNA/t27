@@ -12,15 +12,60 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Drift audit law | `claw_status` in `specs/claw/gates.t27` | T2, this branch |
 | Drift audit in CI | `gate-topology` workflow, "claw drift" step | T3, this branch |
 | GitHub App manifest | release step, see `docs/claw/RELEASE.md` | T4, deferred to App setup |
+| T27F check in every `.t27` repository | `specs/claw/t27f_gate.t27`, the `claw-t27f` job of `gate-topology.yml` | #10268, live once the owner steps below are done |
+| SARIF code-scanning alerts on a pull request | `specs/claw/sarif_feed.t27` over `specs/claw/sarif.t27`, the `claw-sarif` job of `gate-topology.yml` | #10356, live once the owner steps below are done |
+| Suggestion review on a pull request | `specs/claw/suggest_feed.t27` over `specs/claw/suggest.t27` and `specs/tri/fmt_source.t27`, the `claw-suggest` job of `gate-topology.yml` | #10365, live once the owner steps below are done |
 | Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
+| Model routing: Opus 5.5 orchestrates, Sonnet 5.5 runs sub-tasks | `specs/claw/model_route.t27`, skill `model-routing`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-18 |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
+
+## The T27F check in every `.t27` repository (#10268)
+
+Every 10 minutes the `claw-t27f` job of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
+is installed on, and for each open pull request that touches `.t27` posts one `claw/t27f`
+check-run on its head commit: the changed specs and their direct importers, each judged by
+`t27c seal --verify` from the signed t27o-v0.1.0 release. The law is `specs/claw/t27f_gate.t27`:
+unsealed is neutral; a stale, vacuous or unreadable seal is failure; gHashTag/ghashtag.github.io
+only reports. No consumer repository carries a workflow file. Until the owner does these four
+steps, it posts nothing:
+
+1. Give the App the permission checks: write at https://github.com/settings/apps/tri-claw.
+2. Accept the new permission on the App's installation for gHashTag.
+3. Set the secret `CLAW_APP_PRIVATE_KEY` in gHashTag/t27 to the App's private key.
+4. Set the variable `CLAW_APP_ID` in gHashTag/t27 to `5166765`.
+
+## SARIF code-scanning alerts on a pull request (#10356)
+
+On every pull request in gHashTag/t27 the `claw-sarif` job of `gate-topology.yml` runs the signed t27o-v0.1.0
+t27c (`spec-status` and `parse`) over each changed `.t27` file and uploads one SARIF run
+(category `claw/sarif`) with the token of the `code-scanning-sarif` row of `specs/claw/github_surface.t27`:
+`security_events` write and `contents` read, nothing else. A spec that does not parse is rule T27C001 (error,
+at the line:col t27c names); a spec with unwritten functions is T27C004 (warning). The adapter is
+`specs/claw/sarif_feed.t27` (lowered to `gen/c/claw/sarif_feed.c`); the document is `specs/claw/sarif.t27`.
+Rules T27C002 and T27C003 need the t27c test runner, which needs zig, and are not fed yet. It needs the secret and
+variable of steps 3 and 4 above, the App permission `security_events: write`, and code scanning enabled on the
+repository; without them the job uploads nothing and says so in its step summary.
+
+## Suggestion reviews on a pull request (#10365)
+
+On every pull request in gHashTag/t27 the `claw-suggest` job of `gate-topology.yml` reads each changed `.t27` file
+from the head commit (`git show`, so a symlink is never followed) and gives it, with the `@@` headers of the
+GitHub diff, to `specs/claw/suggest_feed.t27` (lowered to `gen/c/claw/suggest_feed.c`). The driver formats the file with
+`specs/tri/fmt_source.t27` -- the formatter behind `t27c fmt`, which only normalises whitespace (leading tab to four
+spaces, no trailing space or CR, one final newline) and refuses to print anything if a single non-whitespace byte
+differs -- compares the two texts line by line, and hands the changed ranges to `specs/claw/suggest.t27`, which
+decides placement: event COMMENT only, right side only, lines outside the diff skipped, at most 20 comments, and a
+hunk it cannot place poisons its whole file. The job posts the review it prints as one pull request review with the
+token of the `pr-suggestions` row of `specs/claw/github_surface.t27`: `pull_requests` write and `contents` read.
+An already formatted spec posts nothing. It needs the secret and variable of steps 3 and 4 above and the App
+permission `pull_requests: write`; without them the job posts nothing and says so in its step summary.
 
 ## The inventory spec and how to regenerate it
 
-`specs/claw/gates.t27` holds three parallel `[66]str`-shaped arrays — `NAMES`
+`specs/claw/gates.t27` holds three parallel `[67]str`-shaped arrays — `NAMES`
 (workflow file stems), `CLASSES` (0 blocking / 1 soft / 2 reporting), `EVENTS`
 (trigger keys, comma-joined). Rows stay alphabetical and aligned; tests pin
-the alignment, the census (61/3/2), pairwise name uniqueness, and the
+the alignment, the census (62/3/2), pairwise name uniqueness, and the
 merge-critical rows.
 
 The class rule is mechanical, so the regeneration is too:
