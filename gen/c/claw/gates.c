@@ -26,6 +26,7 @@
 static const const char* NAMES[67] = { "agent-runner-docker", "auto-merge-ready-prs", "bootstrap-tests", "build-paper", "build-vivado-image", "catalog-count-gate", "cli-tri", "conflict-markers", "conformance-integrity-gate", "coq-kernel", "coq-proofs", "corpus-ratchet", "damage-negatives", "deploy-api", "documented-commands", "dupe-ratchet", "emit-bitexact-gate", "exhaustive-nightly", "fix-carries-source", "fpga-build", "gate-topology", "gf-wide-conformance", "gf16-conformance", "harness-scratch", "issue-gate", "l1-traceability", "lean-proofs", "loop-tools-gate", "needs-boundary", "oracle-nightly", "orphan-modules", "own-language", "pack-index-consistency-gate", "phi-loop-ci", "pr-budget", "pr-dashboard", "pusher", "queen-doctor", "queen-export-push", "queen-feed-empty-bodies", "queen-feed-roadmap", "queen-feed-untested", "queen-publish", "queen-refile", "queen-watchdog", "release", "rings-rust", "sandbox-docker", "sbom", "schema-validation", "scorecard", "seal-coverage", "seal-staleness-warn", "secret-scan", "sign-release", "spec-guards", "spec-parse-ratchet", "t27b-native", "t27o-golden", "t27o-release", "untrusted-input-gate", "verilog-widths", "vivado-synth", "wasm-explorer", "withdrawn-live-gate", "xilinx7-l3-bench", "zenodo-publish" };
 static const size_t NAME_LENS[67] = { 19, 20, 15, 11, 18, 18, 7, 16, 26, 10, 10, 14, 16, 10, 19, 12, 18, 18, 18, 10, 13, 19, 16, 15, 10, 15, 11, 15, 14, 14, 14, 12, 27, 11, 9, 12, 6, 12, 17, 23, 18, 19, 13, 12, 14, 7, 10, 14, 4, 17, 9, 13, 19, 11, 12, 11, 18, 11, 11, 12, 20, 14, 12, 13, 19, 16, 14 };
 static const uint8_t CLASSES[67] = { 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const size_t EVENT_LENS[67] = { 22, 46, 35, 35, 17, 30, 17, 35, 35, 35, 35, 35, 35, 22, 35, 35, 30, 26, 30, 35, 44, 35, 35, 35, 37, 30, 30, 35, 26, 26, 35, 12, 35, 30, 19, 30, 26, 26, 26, 26, 26, 26, 31, 26, 26, 7, 35, 22, 30, 35, 54, 35, 30, 35, 25, 35, 35, 35, 13, 4, 35, 35, 17, 17, 35, 30, 25 };
 static const const char* EVENTS[67] = { "push,workflow_dispatch", "schedule,pull_request_target,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch,schedule", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request_target,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request", "push,pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request_target", "workflow_dispatch,pull_request", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "push,schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "release", "push,pull_request,workflow_dispatch", "push,workflow_dispatch", "push,release,workflow_dispatch", "pull_request,push,workflow_dispatch", "branch_protection_rule,schedule,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "release,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_call", "push", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_dispatch", "push,pull_request", "pull_request,push,workflow_dispatch", "workflow_dispatch,pull_request", "release,workflow_dispatch" };
 #define P_OK 0
 #define P_SPEC_ONLY 1
@@ -53,7 +54,7 @@ uint8_t class_of(const char* name, size_t name_len);
 bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
-bool rows_filled(const char* names[static 67], const char* events[static 67]);
+bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]);
 bool every_row_filled(void);
 bool names_unique_in(const char* names[static 67], size_t lens[static 67]);
 bool all_names_unique(void);
@@ -107,12 +108,12 @@ uint32_t count_class(uint8_t c) {
     return n;
 }
 
-bool rows_filled(const char* names[static 67], const char* events[static 67]) {
+bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]) {
     for (size_t i = 0; i < 67; i++) {
-        if ((names[i] == "")) {
+        if ((name_lens[i] == 0)) {
             return false;
         }
-        if ((events[i] == "")) {
+        if ((event_lens[i] == 0)) {
             return false;
         }
     }
@@ -120,7 +121,7 @@ bool rows_filled(const char* names[static 67], const char* events[static 67]) {
 }
 
 bool every_row_filled(void) {
-    return rows_filled(NAMES, EVENTS);
+    return rows_filled(NAME_LENS, EVENT_LENS);
 }
 
 bool names_unique_in(const char* names[static 67], size_t lens[static 67]) {
@@ -604,19 +605,21 @@ void test_coverage_report_lines_are_exact(void) {
 }
 
 void test_a_hole_in_either_column_fails_the_filled_check(void) {
-    assert((rows_filled(NAMES, EVENTS) == true));
-    const char* n[67] = {0};
+    assert((rows_filled(NAME_LENS, EVENT_LENS) == true));
+    size_t n[67] = {0};
     for (size_t i = 0; i < 67; i++) {
-        n[i] = NAMES[i];
+        n[i] = NAME_LENS[i];
     }
-    n[66] = "";
-    assert((rows_filled(n, EVENTS) == false));
-    const char* e[67] = {0};
+    n[66] = 0;
+    assert((rows_filled(n, EVENT_LENS) == false));
+    size_t e[67] = {0};
     for (size_t i = 0; i < 67; i++) {
-        e[i] = EVENTS[i];
+        e[i] = EVENT_LENS[i];
     }
-    e[0] = "";
-    assert((rows_filled(NAMES, e) == false));
+    e[0] = 0;
+    assert((rows_filled(NAME_LENS, e) == false));
+    e[0] = 1;
+    assert((rows_filled(NAME_LENS, e) == true));
 }
 
 void test_a_repeated_name_is_caught_wherever_it_sits(void) {
