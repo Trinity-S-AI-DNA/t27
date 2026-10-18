@@ -1,0 +1,719 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/eval_hslm.t27 -- main() measures a trained HSLM checkpoint on held-out tokens, two ways.
+; Issue: gHashTag/t27#10372 (epic #10024, own_model cell 25).
+; THE TWO MEASURES, on the same windows of /tmp/hslm/valid.tok (28 tokens each: 27 inputs, then
+; the targets are tokens 1..27):
+;   last_loss  the cross-entropy of the LAST position only (input token 26, target token 27), the
+;              number train_hslm prints as valid_loss and run R5 reported as PPL 2.96;
+;   full_loss  the cross-entropy at EVERY position (27 terms per window, the mean over all of them).
+;   *_ppl      exp of the loss. positions = 27 x windows.
+; Position 26's term is the same number in both: the last position's loss is one of the 27 terms of
+; the full one, so full_loss measures what the model does on the 26 positions the trainer never
+; scores, and last_loss is exactly the trainer's yardstick.
+; WHAT IS REUSED, NOT COPIED: the forward pass (hslm_forward and everything under it),
+; cross_entropy, the checkpoint reader (tr_load_state reads ckpt_<step>.state: the .bin of MSLH
+; holds only the ternary shadows and biases, the state holds every parameter), the HTOK reader
+; (tr_read_tok), the held-out loss of the trainer (tr_valid_loss, run as the cross-check), and the
+; line formatters and file helpers of train_hslm. They are reached through `use ml::train_hslm`;
+; nothing in train_hslm.t27 is changed by this module and no training path moves.
+; WHAT IS LOCAL: the shape consts and the module-level state the spliced code binds to (use_resolve
+; splices no `var`, see train_hslm.t27), two kernels (ternary_matmul, trit_int) because the name is
+; declared by both nn/hslm and train_hslm and a name two imports declare is not resolved, and the
+; evaluation itself.
+; THE CONFIG /tmp/hslm/eval.cfg: key=value lines of integers, unknown keys ignored, a missing file
+; or key means the default:
+;   step     the checkpoint, /tmp/hslm/ckpt_<step>.state (default 0)
+;   windows  how many windows (default 243, the trainer's EVAL_WINDOWS)
+;   stride   0 (default): windows evenly spaced over the file exactly as tr_valid_loss spaces them,
+;            start k * ((N - 28) / windows); otherwise window k starts at k * stride, and a stride
+;            below 28 is raised to 28 so that windows never overlap
+;   check    1: after the evaluation also run tr_valid_loss(windows) and print both numbers
+;            (only meaningful with stride 0, otherwise the check line says it was skipped)
+; A window that does not fit in the file (fewer than 28 tokens left at its start) is refused and
+; not counted.
+; THE OUTPUT, to stdout and to /tmp/hslm/eval_<step>.txt (the file holds this one line):
+;   eval step <s> windows <n> positions <p> last_loss <x> last_ppl <x> full_loss <x> full_ppl <x>
+; main() fails (assert, a nonzero exit) when the token file or the checkpoint cannot be read, no
+; window fits, a loss is NaN, or the result file does not read back as written.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module eval_hslm;
+
+use base::types;
+use ml::train_hslm;
+
+; THE SHAPE. nn/hslm and nn/hslm_data both declare these; this module declares them once, with the
+; same type and value as both (train_hslm.t27 does the same).
+const CONTEXT_LEN : usize = 27;
+const VOCAB_SIZE : usize = 729;
+const EMBED_DIM : usize = 243;
+const FF_DIM : usize = 729;
+const NUM_BLOCKS : usize = 3;
+const HEADER_BYTES : usize = 16;
+
+const EV_WINDOW : usize = 28;
+const EV_DEFAULT_WINDOWS : u64 = 243;
+
+; Exit codes of ev_main
+const EV_RC_OK : i32 = 0;
+const EV_RC_DATA : i32 = 10;
+const EV_RC_WRITE : i32 = 20;
+const EV_RC_STATE : i32 = 30;
+const EV_RC_NAN : i32 = 40;
+const EV_RC_NONE : i32 = 50;
+
+; THE STATE OF nn/hslm.t27 (as in train_hslm.t27: names, types and initial values, nothing else).
+var model : HSLMWeights = undefined;
+var kv_k : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var kv_v : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var act_token : usize = 0;
+var act_pos : [NUM_BLOCKS]usize = undefined;
+var act_x : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_n1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_rms1 : [NUM_BLOCKS]f64 = undefined;
+var act_q : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_attn : [NUM_BLOCKS * NUM_HEADS * CONTEXT_LEN]f64 = undefined;
+var act_ctx : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_r : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_pre : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var act_h : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var act_out : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_hn : [EMBED_DIM]f64 = undefined;
+var act_hrms : f64 = 1.0;
+var gw_q : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_k : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_v : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_o : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_up : [NUM_BLOCKS * EMBED_DIM * FF_DIM]f64 = undefined;
+var gw_down : [NUM_BLOCKS * FF_DIM * EMBED_DIM]f64 = undefined;
+var gw_out : [EMBED_DIM * VOCAB_SIZE]f64 = undefined;
+var g_gamma1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var g_b_up : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var g_b_down : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var g_b_out : [VOCAB_SIZE]f64 = undefined;
+var g_embed : [VOCAB_SIZE * EMBED_DIM]f64 = undefined;
+var bw_out : [EMBED_DIM]f64 = undefined;
+var bw_h : [FF_DIM]f64 = undefined;
+var bw_pre : [FF_DIM]f64 = undefined;
+var bw_sf : [FF_DIM]f64 = undefined;
+var bw_se : [EMBED_DIM]f64 = undefined;
+var bw_n : [EMBED_DIM]f64 = undefined;
+var bw_tmp : [EMBED_DIM]f64 = undefined;
+var bw_r : [EMBED_DIM]f64 = undefined;
+var bw_ctx : [EMBED_DIM]f64 = undefined;
+var bw_q : [EMBED_DIM]f64 = undefined;
+var bw_k : [EMBED_DIM]f64 = undefined;
+var bw_v : [EMBED_DIM]f64 = undefined;
+var bw_da : [CONTEXT_LEN]f64 = undefined;
+var bw_x : [EMBED_DIM]f64 = undefined;
+var bw_dz : [VOCAB_SIZE]f64 = undefined;
+var nudge_which : u8 = MAT_NONE;
+var nudge_block : usize = 0;
+var nudge_index : usize = 0;
+var nudge_delta : f64 = 0.0;
+var vsa_on : bool = true;
+var vsa_in : [NUM_BLOCKS * CONTEXT_LEN * VSA_DIM]Trit = undefined;
+var vsa_out : [NUM_BLOCKS * VSA_DIM]Trit = undefined;
+var vsa_ctx : [VSA_DIM]Trit = undefined;
+var vsa_reasoned : [VSA_DIM]Trit = undefined;
+var vsa_temp : [VSA_DIM]Trit = undefined;
+var vsa_temp2 : [VSA_DIM]Trit = undefined;
+var vsa_sim : [CONTEXT_LEN]f64 = undefined;
+var vsa_accum : [VSA_DIM]i64 = undefined;
+var vsa_max_sim : [NUM_BLOCKS]f64 = undefined;
+var vsa_fired : [NUM_BLOCKS]bool = undefined;
+var gate_total : [NUM_BLOCKS]usize = undefined;
+var gate_conscious : [NUM_BLOCKS]usize = undefined;
+var gate_ema : [NUM_BLOCKS]f64 = undefined;
+
+; THE STATE OF train_hslm.t27 that the spliced reader, forward driver and formatters bind to.
+var p_val : [NPARAM]f64 = undefined;
+var g_val : [NPARAM]f64 = undefined;
+var m_val : [NPARAM]f64 = undefined;
+var v_val : [NPARAM]f64 = undefined;
+var seg_off : [NSEG]usize = undefined;
+var seg_len : [NSEG]usize = undefined;
+var seg_kind : [NSEG]u8 = undefined;
+var seg_block : [NSEG]usize = undefined;
+var beta1_pow : f64 = 1.0;
+var beta2_pow : f64 = 1.0;
+var rng_state : u64 = 1;
+var speed_level : u8 = 2;
+var last_loss : f64 = 0.0;
+var io_fail : u32 = 0;
+var valid_tok : [VALID_CAP]u16 = undefined;
+var nvalid : usize = 0;
+var win_logits : [VOCAB_SIZE]f64 = undefined;
+var kv_n1 : [EMBED_DIM]f64 = undefined;
+var io_chunk : [IO_CHUNK]u8 = undefined;
+var io_back : [IO_CHUNK]u8 = undefined;
+var io_hdr : [STATE_HEADER]u8 = undefined;
+var io_hdr_back : [STATE_HEADER]u8 = undefined;
+var path_buf : [96]u8 = undefined;
+var cfg_buf : [4096]u8 = undefined;
+var ln_buf : [512]u8 = undefined;
+var ln_n : usize = 0;
+
+; THIS MODULE'S STATE
+var ev_cfg_step : u64 = 0;
+var ev_cfg_windows : u64 = EV_DEFAULT_WINDOWS;
+var ev_cfg_stride : u64 = 0;
+var ev_cfg_check : u64 = 0;
+var ev_term : [CONTEXT_LEN]f64 = undefined;
+var ev_sum_last : f64 = 0.0;
+var ev_sum_full : f64 = 0.0;
+var ev_nwin : u64 = 0;
+var ev_npos : u64 = 0;
+
+; ---------------------------------------------------------------------------------------------
+; 1. Kernels. The two names are nn/hslm.t27's and train_hslm.t27's; the local declaration wins.
+; These are train_hslm.t27's speed-1 forms, which it tests to give the reference logits to the bit.
+; ---------------------------------------------------------------------------------------------
+
+/// output[i] = sum_j input[j] * w[j * out_dim + i], as an axpy over the rows of W (per output the
+/// terms are added in the order j = 0, 1, ..., the same bits as nn/hslm.t27's dot per output)
+fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    var i : usize = 0;
+    while (i < out_dim) {
+        output[i] = 0.0;
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < in_dim) {
+        const xj : f64 = input[j];
+        if (xj != 0.0) {
+            const row : usize = j * out_dim;
+            var c : usize = 0;
+            while (c < out_dim) {
+                const wf : f64 = @floatFromInt(@intFromEnum(weights[row + c]));
+                output[c] = output[c] + xj * wf;
+                c = c + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+/// -1 / 0 / +1 of a trit: the enum's own value
+fn trit_int(t: Trit) -> i64 {
+    return @as(i64, @intFromEnum(t));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 2. The config
+; ---------------------------------------------------------------------------------------------
+
+fn ev_cfg_reset() -> void {
+    ev_cfg_step = 0;
+    ev_cfg_windows = EV_DEFAULT_WINDOWS;
+    ev_cfg_stride = 0;
+    ev_cfg_check = 0;
+}
+
+fn ev_cfg_set(off: usize, len: usize, value: u64) -> void {
+    if (tr_key_is(off, len, "step")) {
+        ev_cfg_step = value;
+    } else if (tr_key_is(off, len, "windows")) {
+        ev_cfg_windows = value;
+    } else if (tr_key_is(off, len, "stride")) {
+        ev_cfg_stride = value;
+    } else if (tr_key_is(off, len, "check")) {
+        ev_cfg_check = value;
+    }
+}
+
+/// The key=value lines in cfg_buf[0..len]; unknown keys are ignored
+fn ev_parse_cfg(len: usize) -> void {
+    var i : usize = 0;
+    while (i < len) {
+        const key_off : usize = i;
+        while (i < len and cfg_buf[i] != 61 and cfg_buf[i] != 10) {
+            i = i + 1;
+        }
+        if (i < len and cfg_buf[i] == 61) {
+            const key_len : usize = i - key_off;
+            i = i + 1;
+            var value : u64 = 0;
+            while (i < len and cfg_buf[i] >= 48 and cfg_buf[i] <= 57) {
+                value = value * 10 + @as(u64, cfg_buf[i] - 48);
+                i = i + 1;
+            }
+            ev_cfg_set(key_off, key_len, value);
+        }
+        while (i < len and cfg_buf[i] != 10) {
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// /tmp/hslm/eval.cfg, if the file exists
+fn ev_read_cfg() -> void {
+    const fd : i32 = host_open("/tmp/hslm/eval.cfg", 0);
+    if (fd < 0) {
+        return;
+    }
+    const got : i64 = tr_read_full(fd, &cfg_buf);
+    tr_note(host_close(fd));
+    if (got <= 0) {
+        return;
+    }
+    ev_parse_cfg(@intCast(got));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 3. The measure
+; ---------------------------------------------------------------------------------------------
+
+fn ev_acc_reset() -> void {
+    ev_sum_last = 0.0;
+    ev_sum_full = 0.0;
+    ev_nwin = 0;
+    ev_npos = 0;
+}
+
+/// The term of position p (target already chosen): kept in ev_term, added to the full sum; the
+/// last position's term also goes to the last-position sum and closes the window
+fn ev_add_term(p: usize, logits: []const f64, target: usize) -> void {
+    const ce : f64 = cross_entropy(logits, target);
+    ev_term[p] = ce;
+    ev_sum_full = ev_sum_full + ce;
+    ev_npos = ev_npos + 1;
+    if (p + 1 == CONTEXT_LEN) {
+        ev_sum_last = ev_sum_last + ce;
+        ev_nwin = ev_nwin + 1;
+    }
+}
+
+fn ev_mean_last() -> f64 {
+    return ev_sum_last / @as(f64, @floatFromInt(ev_nwin));
+}
+
+fn ev_mean_full() -> f64 {
+    return ev_sum_full / @as(f64, @floatFromInt(ev_npos));
+}
+
+/// One window of 28 tokens starting at `start`: forward at every position in order (each attends
+/// to the cache of the earlier ones), the term at position p is scored against token p + 1. A
+/// window that does not fit is refused: false, nothing counted.
+fn ev_try_window(tokens: []const u16, start: usize) -> bool {
+    if (start + EV_WINDOW > tokens.len) {
+        return false;
+    }
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        const tok : usize = @intCast(tokens[start + p]);
+        hslm_forward(tok, p, &win_logits);
+        const target : usize = @intCast(tokens[start + p + 1]);
+        ev_add_term(p, &win_logits, target);
+        p = p + 1;
+    }
+    return true;
+}
+
+/// Start spacing: the config's stride (raised to 28 so windows never overlap), or 0 = evenly
+/// spaced over n tokens exactly as tr_valid_loss spaces `count` windows
+fn ev_stride_for(count: usize, n: usize) -> usize {
+    if (ev_cfg_stride > 0) {
+        if (ev_cfg_stride < @as(u64, EV_WINDOW)) {
+            return EV_WINDOW;
+        }
+        return @intCast(ev_cfg_stride);
+    }
+    if (n <= CONTEXT_LEN + 1 or count == 0) {
+        return 1;
+    }
+    var stride : usize = (n - CONTEXT_LEN - 1) / count;
+    if (stride == 0) {
+        stride = 1;
+    }
+    return stride;
+}
+
+/// Windows k = 0..count-1 at k * stride; the number that fit
+fn ev_run(tokens: []const u16, count: usize, stride: usize) -> usize {
+    var used : usize = 0;
+    var k : usize = 0;
+    while (k < count) {
+        if (ev_try_window(tokens, k * stride)) {
+            used = used + 1;
+        }
+        k = k + 1;
+    }
+    return used;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 4. Output, data, main
+; ---------------------------------------------------------------------------------------------
+
+/// /tmp/hslm/eval_<step>.txt into path_buf (NUL ended); clobbers ln_buf
+fn ev_path(step: u64) -> void {
+    ln_reset();
+    ln_str("/tmp/hslm/eval_");
+    ln_u64(step);
+    ln_str(".txt");
+    var i : usize = 0;
+    while (i < ln_n) {
+        path_buf[i] = ln_buf[i];
+        i = i + 1;
+    }
+    path_buf[ln_n] = 0;
+    ln_n = 0;
+}
+
+/// The result line, without its newline, in ln_buf
+fn ev_compose_line(step: u64) -> void {
+    ln_reset();
+    ln_str("eval step ");
+    ln_u64(step);
+    ln_str(" windows ");
+    ln_u64(ev_nwin);
+    ln_str(" positions ");
+    ln_u64(ev_npos);
+    ln_str(" last_loss ");
+    ln_f64(ev_mean_last(), 4);
+    ln_str(" last_ppl ");
+    ln_f64(exp(ev_mean_last()), 2);
+    ln_str(" full_loss ");
+    ln_f64(ev_mean_full(), 4);
+    ln_str(" full_ppl ");
+    ln_f64(exp(ev_mean_full()), 2);
+}
+
+/// ln_buf + newline to stdout and to the file at path_buf, then the file is read back and compared
+fn ev_emit() -> i32 {
+    ln_byte(10);
+    const len : usize = ln_n;
+    tr_note(tr_write_all(1, ln_buf[0..len]));
+    const fd : i32 = host_open(@ptrCast(&path_buf), 1);
+    if (fd < 0) {
+        return EV_RC_WRITE;
+    }
+    const wrote : i32 = tr_write_all(fd, ln_buf[0..len]);
+    tr_note(host_close(fd));
+    if (wrote != 0) {
+        return EV_RC_WRITE;
+    }
+    const rd : i32 = host_open(@ptrCast(&path_buf), 0);
+    if (rd < 0) {
+        return EV_RC_WRITE;
+    }
+    const got : i64 = tr_read_full(rd, io_back[0..512]);
+    tr_note(host_close(rd));
+    if (got != @as(i64, @intCast(len))) {
+        return EV_RC_WRITE;
+    }
+    var i : usize = 0;
+    while (i < len) {
+        if (io_back[i] != ln_buf[i]) {
+            return EV_RC_WRITE;
+        }
+        i = i + 1;
+    }
+    return EV_RC_OK;
+}
+
+/// valid.tok into valid_tok / nvalid
+fn ev_load_valid() -> i32 {
+    const nv : i64 = tr_read_tok(1, &valid_tok);
+    if (nv < @as(i64, @intCast(EV_WINDOW))) {
+        return EV_RC_DATA;
+    }
+    nvalid = @intCast(nv);
+    return EV_RC_OK;
+}
+
+fn ev_say(text: []const u8) -> void {
+    ln_reset();
+    ln_str(text);
+    ln_flush();
+}
+
+/// check=1: the trainer's own tr_valid_loss on the same windows, next to ours, and whether the
+/// two f64 are the same bits
+fn ev_check_line(count: usize) -> void {
+    ln_reset();
+    if (ev_cfg_stride != 0) {
+        ln_str("check skipped: stride is set, tr_valid_loss spaces its windows evenly");
+        ln_flush();
+        return;
+    }
+    const theirs : f64 = tr_valid_loss(count);
+    const ours : f64 = ev_mean_last();
+    const a : u64 = @bitCast(theirs);
+    const b : u64 = @bitCast(ours);
+    ln_str("check tr_valid_loss ");
+    ln_f64(theirs, 6);
+    ln_str(" last_loss ");
+    ln_f64(ours, 6);
+    ln_str(" same_bits ");
+    if (a == b) {
+        ln_str("1");
+    } else {
+        ln_str("0");
+    }
+    ln_flush();
+}
+
+fn ev_main() -> i32 {
+    ev_cfg_reset();
+    ev_read_cfg();
+    const rc_data : i32 = ev_load_valid();
+    if (rc_data != EV_RC_OK) {
+        ev_say("eval_hslm: /tmp/hslm/valid.tok missing or bad");
+        return rc_data;
+    }
+    tr_init(1);
+    if (tr_load_state(ev_cfg_step) != RC_OK) {
+        ev_say("eval_hslm: /tmp/hslm/ckpt_<step>.state missing or bad (step from eval.cfg)");
+        return EV_RC_STATE;
+    }
+    ev_acc_reset();
+    var count : usize = @intCast(ev_cfg_windows);
+    if (count == 0) {
+        count = 1;
+    }
+    const used : usize = ev_run(valid_tok[0..nvalid], count, ev_stride_for(count, nvalid));
+    if (used == 0) {
+        ev_say("eval_hslm: no window fits in valid.tok");
+        return EV_RC_NONE;
+    }
+    const lf : f64 = ev_mean_last();
+    const ff : f64 = ev_mean_full();
+    if (lf != lf or ff != ff) {
+        ev_say("eval_hslm: a loss is NaN");
+        return EV_RC_NAN;
+    }
+    ev_path(ev_cfg_step);
+    ev_compose_line(ev_cfg_step);
+    const rc : i32 = ev_emit();
+    if (ev_cfg_check == 1) {
+        ev_check_line(count);
+    }
+    return rc;
+}
+
+/// The program `t27c compile --backend ml` builds
+pub fn main() -> void {
+    assert ev_main() == EV_RC_OK;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 5. Test helpers (each returns the number its test checks) and the tests
+; ---------------------------------------------------------------------------------------------
+
+/// A small synthetic held-out set in valid_tok and a fresh random model
+fn ev_tiny_setup(seed: u64) -> void {
+    tr_synth(valid_tok[0..2048], 98);
+    nvalid = 2048;
+    tr_init(seed);
+    ev_cfg_reset();
+    ev_acc_reset();
+}
+
+/// All-zero logits for every position of `windows` windows, through the real accumulator
+fn ev_uniform_feed(windows: usize) -> void {
+    ev_acc_reset();
+    var i : usize = 0;
+    while (i < VOCAB_SIZE) {
+        win_logits[i] = 0.0;
+        i = i + 1;
+    }
+    var w : usize = 0;
+    while (w < windows) {
+        var p : usize = 0;
+        while (p < CONTEXT_LEN) {
+            ev_add_term(p, &win_logits, (7 * w + 11 * p) % VOCAB_SIZE);
+            p = p + 1;
+        }
+        w = w + 1;
+    }
+}
+
+fn ev_uniform_last_gap() -> f64 {
+    ev_uniform_feed(3);
+    return abs(ev_mean_last() - log(729.0));
+}
+
+fn ev_uniform_full_gap() -> f64 {
+    ev_uniform_feed(3);
+    return abs(ev_mean_full() - log(729.0));
+}
+
+fn ev_uniform_positions() -> u64 {
+    ev_uniform_feed(3);
+    return ev_npos;
+}
+
+fn ev_uniform_windows() -> u64 {
+    ev_uniform_feed(3);
+    return ev_nwin;
+}
+
+/// |term at position 26 of the full measure - the trainer's last-position loss| on one window
+fn ev_p26_gap() -> f64 {
+    ev_tiny_setup(5);
+    if (!ev_try_window(valid_tok[0..nvalid], 300)) {
+        return 1.0;
+    }
+    const theirs : f64 = tr_window_loss(valid_tok[0..nvalid], 300);
+    return abs(ev_term[26] - theirs);
+}
+
+/// |mean of the 27 terms - ev_mean_full| after one window, and the first term differs from the last
+fn ev_full_is_the_mean_gap() -> f64 {
+    ev_tiny_setup(5);
+    if (!ev_try_window(valid_tok[0..nvalid], 300)) {
+        return 1.0;
+    }
+    var s : f64 = 0.0;
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        s = s + ev_term[p];
+        p = p + 1;
+    }
+    return abs(s / 27.0 - ev_mean_full());
+}
+
+fn ev_first_last_differ() -> bool {
+    ev_tiny_setup(5);
+    if (!ev_try_window(valid_tok[0..nvalid], 300)) {
+        return false;
+    }
+    return ev_term[0] != ev_term[26];
+}
+
+/// |our last-position mean over 7 evenly spaced windows - tr_valid_loss(7)| on a tiny model: the
+/// trainer's own yardstick and ours agree to the bit (the trainer runs its speed-2 shortcut here)
+fn ev_vs_train_gap() -> f64 {
+    ev_tiny_setup(5);
+    const used : usize = ev_run(valid_tok[0..nvalid], 7, ev_stride_for(7, nvalid));
+    if (used != 7) {
+        return 1.0;
+    }
+    return abs(ev_mean_last() - tr_valid_loss(7));
+}
+
+/// A window of 27 tokens (one short) is refused and counts nothing; one of 28 is taken
+fn ev_short_refused() -> u64 {
+    ev_tiny_setup(5);
+    var r : u64 = 0;
+    if (ev_try_window(valid_tok[0..27], 0)) {
+        r = r + 1;
+    }
+    if (ev_try_window(valid_tok[0..28], 1)) {
+        r = r + 10;
+    }
+    if (ev_try_window(valid_tok[0..0], 0)) {
+        r = r + 100;
+    }
+    if (ev_nwin != 0 or ev_npos != 0) {
+        r = r + 1000;
+    }
+    return r;
+}
+
+fn ev_exact_fit_taken() -> u64 {
+    ev_tiny_setup(5);
+    if (!ev_try_window(valid_tok[0..28], 0)) {
+        return 0;
+    }
+    return ev_npos * 100 + ev_nwin;
+}
+
+/// Parse `text` as an eval.cfg and read one value back: which = 0 step, 1 windows, 2 stride, 3 check
+fn ev_cfg_value(text: []const u8, which: u8) -> u64 {
+    ev_cfg_reset();
+    var i : usize = 0;
+    while (i < text.len) {
+        cfg_buf[i] = text[i];
+        i = i + 1;
+    }
+    ev_parse_cfg(text.len);
+    if (which == 0) {
+        return ev_cfg_step;
+    }
+    if (which == 1) {
+        return ev_cfg_windows;
+    }
+    if (which == 2) {
+        return ev_cfg_stride;
+    }
+    return ev_cfg_check;
+}
+
+/// ev_stride_for with the config's stride set to `cfg_stride`
+fn ev_stride_with(cfg_stride: u64, count: usize, n: usize) -> usize {
+    ev_cfg_reset();
+    ev_cfg_stride = cfg_stride;
+    return ev_stride_for(count, n);
+}
+
+test uniform_logits_give_ln_729_for_the_last_position_measure
+    given gap = ev_uniform_last_gap()
+    and   wins = ev_uniform_windows()
+    then  gap < 1e-12
+    and   wins == 3
+
+test uniform_logits_give_ln_729_for_the_full_measure
+    given gap = ev_uniform_full_gap()
+    and   pos = ev_uniform_positions()
+    then  gap < 1e-12
+    and   pos == 81
+
+test position_26_of_the_full_measure_is_the_last_position_loss
+    given gap = ev_p26_gap()
+    then  gap == 0.0
+
+test the_full_loss_is_the_mean_of_27_terms_and_not_only_the_last
+    given gap = ev_full_is_the_mean_gap()
+    and   differ = ev_first_last_differ()
+    then  gap < 1e-12
+    and   differ
+
+test last_loss_equals_the_trainers_valid_loss_on_the_same_windows
+    given gap = ev_vs_train_gap()
+    then  gap == 0.0
+
+test a_window_shorter_than_28_tokens_is_refused
+    given r = ev_short_refused()
+    then  r == 0
+
+test a_window_of_exactly_28_tokens_is_taken
+    given r = ev_exact_fit_taken()
+    then  r == 2701
+
+test config_defaults_when_nothing_is_set
+    given step = ev_cfg_value("", 0)
+    and   windows = ev_cfg_value("", 1)
+    and   stride = ev_cfg_value("", 2)
+    and   check = ev_cfg_value("", 3)
+    then  step == 0
+    and   windows == 243
+    and   stride == 0
+    and   check == 0
+
+test config_reads_its_four_keys_and_ignores_the_rest
+    given step = ev_cfg_value("step=2000\nwindows=50\nstride=100\ncheck=1\n", 0)
+    and   windows = ev_cfg_value("step=2000\nwindows=50\nstride=100\ncheck=1\n", 1)
+    and   stride = ev_cfg_value("step=2000\nwindows=50\nstride=100\ncheck=1\n", 2)
+    and   check = ev_cfg_value("step=2000\nwindows=50\nstride=100\ncheck=1\n", 3)
+    and   other = ev_cfg_value("speed=1\nsteps=9\nwindows=7", 1)
+    and   keep = ev_cfg_value("speed=1\nsteps=9\nwindows=7", 0)
+    then  step == 2000
+    and   windows == 50
+    and   stride == 100
+    and   check == 1
+    and   other == 7
+    and   keep == 0
+
+test stride_zero_spaces_windows_as_the_trainer_does_and_a_short_stride_is_raised
+    given even = ev_stride_with(0, 243, 7689354)
+    and   small = ev_stride_with(5, 243, 7689354)
+    and   exact = ev_stride_with(28, 243, 7689354)
+    and   wide = ev_stride_with(1000, 243, 7689354)
+    then  even == 31643
+    and   small == 28
+    and   exact == 28
+    and   wide == 1000
