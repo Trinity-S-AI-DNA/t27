@@ -118,6 +118,9 @@ mod test_report_exit;
 #[path = "../gen/rust/verified/seal_identity.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod seal_identity;
+// specs/verified/seal_write.t27 (#10457): what `seal --save` must check before and after its write.
+#[path = "../gen/rust/verified/seal_write.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod seal_write;
 // specs/verified/verdict_audit.t27 (#8542): which reused verdicts `frontier --audit` reruns.
 #[path = "../gen/rust/verified/verdict_audit.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
@@ -6115,28 +6118,20 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
             "tests": tests_record
         });
 
-        // The derived name and the file on disk can differ ONLY IN CASE: the
-        // tool would write `ar_restraint.json` where `ar_Restraint.json` is
-        // tracked. macOS resolves those to one file and hides it; on the
-        // case-sensitive filesystem CI runs on, `--save` would create a SECOND
-        // seal for the same spec and neither would be wrong-looking. Measured
-        // over the store: 751 filenames match the derived name exactly, 4
-        // differ only by case, 558 use the older bare-`<module>` scheme.
-        //
-        // An existing file wins, so the store cannot grow a case-variant twin.
+        // An existing file wins, even one that differs only in case: seal_write.t27 names_collide() says why.
         let derived = seal_file_path(&hashes.module, &hashes.spec_path);
-        let seal_path = fs::read_dir(&seals_dir)
-            .ok()
-            .and_then(|entries| {
-                let want = derived.file_name()?.to_string_lossy().to_lowercase();
-                entries.flatten().find_map(|e| {
-                    let p = e.path();
-                    (p.file_name()?.to_string_lossy().to_lowercase() == want).then_some(p)
-                })
-            })
-            .unwrap_or(derived);
+        let want = derived.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let seal_path = fs::read_dir(&seals_dir).ok().and_then(|es| es.flatten().map(|e| e.path()).find(|p| p.file_name().map_or(false, |n| seal_write::names_collide(n.to_string_lossy() == want, n.to_string_lossy().to_lowercase() == want.to_lowercase())))).unwrap_or(derived);
+        // seal_write.t27 dest_check: a file another spec owns, or whose owner cannot be read, is refused before any write.
+        let owner = fs::read_to_string(&seal_path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| v.get("spec_path")?.as_str().map(String::from));
+        if seal_write::dest_check(seal_path.exists(), owner.is_some(), owner.as_deref() == Some(hashes.spec_path.as_str())) != seal_write::WRITE_OK { eprintln!("refusing to seal {}: {} belongs to {} (seal_write.t27 dest_check). Two specs derive one seal file; rename one of them.", hashes.spec_path, seal_path.display(), owner.as_deref().unwrap_or("an unreadable owner")); std::process::exit(1); }
         let pretty = serde_json::to_string_pretty(&seal_obj)?;
-        fs::write(&seal_path, &pretty)?;
+        // seal_write.t27 post_write_check on a staged file, then one rename: a cut leaves the old seal or this checked one.
+        let staged = seal_path.with_extension("json.staged"); fs::write(&staged, &pretty)?;
+        let moved = |h: &str| (h != hashes.spec_hash) as u64;
+        let code = seal_write::post_write_check(0, moved(&format!("sha256:{}", sha256_hex(&fs::read(input_path)?))), report.read.as_ref().map_or(0, |h| moved(&format!("sha256:{h}"))), fs::read_to_string(&staged).ok().as_deref() == Some(pretty.as_str()));
+        if code != seal_write::WRITE_OK { let _ = fs::remove_file(&staged); eprintln!("refusing to seal {}: {} (seal_write.t27 code {}); the old seal is untouched. Seal again once the spec is still.", hashes.spec_path, if code == seal_write::WRITE_TESTED_OTHER { "the tests read other bytes than the hash" } else if code == seal_write::WRITE_SPEC_MOVED { "the spec changed during the seal" } else { "the staged seal did not read back" }, code); std::process::exit(1); }
+        fs::rename(&staged, &seal_path)?;
 
         // A spec can own MORE THAN ONE seal file, and writing only the
         // canonical name leaves the others describing output that no longer
