@@ -121,6 +121,14 @@ This triggers automatic branch creation for the next phase.
 
 Load these skills when their functionality matches the task.
 
+### Model routing (owner directive 2026-10-18)
+
+The orchestrating session runs on **Opus 5.5**; every sub-task it delegates (implement, port, search,
+test, docs, fix) runs on **Sonnet 5.5**, and escalates to Opus only after 2 failed attempts or on the
+owner's word. The law is `specs/claw/model_route.t27`; how to follow it is the `model-routing` skill.
+`.claude/settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL` and each agent in `.claude/agents/` names its
+model.
+
 ---
 
 ## FPGA hardware & flashing (SSOT)
