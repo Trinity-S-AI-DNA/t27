@@ -14,6 +14,7 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | GitHub App manifest | release step, see `docs/claw/RELEASE.md` | T4, deferred to App setup |
 | T27F check in every `.t27` repository | `specs/claw/t27f_gate.t27`, the `claw-t27f` job of `gate-topology.yml` | #10268, live once the owner steps below are done |
 | SARIF code-scanning alerts on a pull request | `specs/claw/sarif_feed.t27` over `specs/claw/sarif.t27`, the `claw-sarif` job of `gate-topology.yml` | #10356, live once the owner steps below are done |
+| Suggestion review on a pull request | `specs/claw/suggest_feed.t27` over `specs/claw/suggest.t27` and `specs/tri/fmt_source.t27`, the `claw-suggest` job of `gate-topology.yml` | #10365, live once the owner steps below are done |
 | Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
@@ -43,6 +44,20 @@ at the line:col t27c names); a spec with unwritten functions is T27C004 (warning
 Rules T27C002 and T27C003 need the t27c test runner, which needs zig, and are not fed yet. It needs the secret and
 variable of steps 3 and 4 above, the App permission `security_events: write`, and code scanning enabled on the
 repository; without them the job uploads nothing and says so in its step summary.
+
+## Suggestion reviews on a pull request (#10365)
+
+On every pull request in gHashTag/t27 the `claw-suggest` job of `gate-topology.yml` reads each changed `.t27` file
+from the head commit (`git show`, so a symlink is never followed) and gives it, with the `@@` headers of the
+GitHub diff, to `specs/claw/suggest_feed.t27` (lowered to `gen/c/claw/suggest_feed.c`). The driver formats the file with
+`specs/tri/fmt_source.t27` -- the formatter behind `t27c fmt`, which only normalises whitespace (leading tab to four
+spaces, no trailing space or CR, one final newline) and refuses to print anything if a single non-whitespace byte
+differs -- compares the two texts line by line, and hands the changed ranges to `specs/claw/suggest.t27`, which
+decides placement: event COMMENT only, right side only, lines outside the diff skipped, at most 20 comments, and a
+hunk it cannot place poisons its whole file. The job posts the review it prints as one pull request review with the
+token of the `pr-suggestions` row of `specs/claw/github_surface.t27`: `pull_requests` write and `contents` read.
+An already formatted spec posts nothing. It needs the secret and variable of steps 3 and 4 above and the App
+permission `pull_requests: write`; without them the job posts nothing and says so in its step summary.
 
 ## The inventory spec and how to regenerate it
 
