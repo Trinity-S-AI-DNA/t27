@@ -1,10 +1,10 @@
 ---
 id: t27f
-name: T27F Visual Spec
-description: T27F is the visual spec of a .t27 file -- one spec, one synchronized model, many views (source, architecture, data flow, dependencies, tests and benchmarks), every node labelled exact, derived, suggested or unknown and linked to its source span (gHashTag/trinity#1648, RFC gHashTag/trinity#1649). Use when the user says "t27f", "visual spec", "show / visualize / draw this spec", or opens a .t27 file to see its structure. Also runs the topic-map application built on T27F (gHashTag/trinity#1677) when the user gives a topic or a client brief.
+name: T27F Frontend
+description: T27F is t27's frontend -- the one tool through which t27 shows anything visual, made through several tools (spec graph and outline, honeycomb map stills, the t27.ai graph page, particle reels and stills, the hot-reload stream, the claw/t27f check-run), with its surfaces, their status and the intent-to-surface routing in specs/t27f/frontend.t27. Its core is the visual spec of a .t27 file (gHashTag/trinity#1648, RFC gHashTag/trinity#1649). TRI CLAW serves its MCP tools. Use when the user says "t27f", "visual", "visual spec", "show / visualize / draw this spec", "reel", "still", or opens a .t27 file to see its structure. Also runs the topic-map application (gHashTag/trinity#1677) when the user gives a topic or a client brief.
 ---
 
-# T27F Visual Spec
+# T27F Frontend
 
 <!-- only-t27-rule -->
 > **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
@@ -17,44 +17,64 @@ description: T27F is the visual spec of a .t27 file -- one spec, one synchronize
 
 ## What T27F is
 
-**This section is the one home of the definition.** `CLAUDE.md`, `specs/OWNERS.md`, the skill card
-`specs/skills/t27-t27f.t27` and the spec headers point here; they do not restate it.
+**This section is the one home of the definition.** `CLAUDE.md`, `AGENTS.md`, `specs/OWNERS.md`,
+the skill card `specs/skills/t27-t27f.t27` and the spec headers point here; they do not restate it.
 
-T27F is the **visual spec of `.t27`**: every t27 specification has a first-class visual form, an
-interactive, inspectable diagram built from reusable widgets. Sources: epic gHashTag/trinity#1648
-("native generative UI and visual application engine") and RFC gHashTag/trinity#1649 ("specs as
-executable visual diagrams").
+T27F is **t27's frontend: its native visualization, made through several tools.** Everything t27
+shows -- a spec as a diagram, a topic as a map, a lesson as a particle reel, a report as a still, a
+pull request as a check-run -- is a T27F surface. Owner, 2026-10-18: everything visual is gathered
+into T27F as one tool, and T27F goes into TRI CLAW.
 
-- **One spec -> one synchronized source model -> many views**: source, architecture diagram, data
-  flow, dependency graph, tests/benchmarks, docs. Every view is derived from the real spec
-  (AST/IR plus metadata), never a hand-drawn picture that can drift from the code.
-- **Graph IR**: versioned, typed nodes (module, function, step, input/output/parameter/constant,
-  type/numeric format, branch/loop, operator, dependency, test/invariant/oracle, benchmark/hardware,
-  paper/dataset, opaque region) and typed edges (data flow, control flow, calls/depends on,
-  produces/consumes, constrains, tested by, measured by, implemented by, cited by). The full lists
-  are in #1649.
-- **Every node carries one inference label**: `exact` (present in the AST/IR), `derived` (safe from
-  symbol and type resolution), `suggested` (a model's explanation, visibly marked, linked to source
-  ranges) or `unknown`. A model's guess is never drawn as a verified property of the program.
-- **Bidirectional source mapping**: select a node, see its source span; select a line, see its
-  node. Generation is deterministic for a fixed source and toolchain, and two revisions produce a
-  graph diff.
-- **Read-only viewer first.** Editing comes after the schema survives two structurally different
-  specs. GF16 (`specs/numeric/gf16.t27`) is a *candidate* pilot pending the comparison in #1651.
-- **The pipeline (#1648)**: intent -> versioned system description -> domain model and computation
-  -> renderer-neutral UI plan (trusted widget ids, bindings, layout, actions, theme, a11y,
-  provenance) -> T27F renderer -> verification loop. A model never ships code to the renderer: no
-  eval, no generated JS, only widgets from an allowlist.
-- **In the map** (#1648 comments, 2026-10-16): zooming into a honeycomb cell opens that cell's spec
-  as a navigable program, linked to source, tests, issues and real task status; each cell is both a
-  spec and a learning entry point.
+**The law is `specs/t27f/frontend.t27`.** It lists the surfaces, what draws each today (LIVE, LAB,
+PARTIAL, BLOCKED, SPEC), which surface answers an intent (`route`), the stand-in when the wanted one
+cannot be made this turn (`pick`), the rule that nothing undrawn is claimed made (`claim_ok`), and
+which surfaces TRI CLAW serves (`claw_serves`). Read the table there; this section does not copy it.
+The rules of each surface stay in the spec that decides it.
+
+The surfaces, by family:
+
+- **Spec diagram (the core).** Every t27 specification has a first-class visual form, an
+  interactive, inspectable diagram (epic gHashTag/trinity#1648, RFC gHashTag/trinity#1649). Drawn as
+  SVG by `t27f_graph`, as text by `t27f_outline`, and on t27.ai/t27f/graph/ and the Spec Explorer.
+  - **One spec -> one synchronized source model -> many views**: source, architecture, data flow,
+    dependencies, tests/benchmarks, docs. Every view is derived from the real spec (AST/IR plus
+    metadata), never a hand-drawn picture that can drift from the code.
+  - **Graph IR**: versioned, typed nodes and edges; the full lists are in #1649 and
+    `specs/t27f/spec_graph.t27`.
+  - **Every node carries one inference label**: `exact`, `derived`, `suggested` (a model's
+    explanation, visibly marked) or `unknown`. A model's guess is never drawn as a verified property.
+  - **Bidirectional source mapping**, deterministic generation, graph diffs between revisions.
+  - **Read-only viewer first.** GF16 (`specs/numeric/gf16.t27`) is a *candidate* pilot (#1651).
+  - **The pipeline (#1648)**: intent -> system description -> domain model -> renderer-neutral UI
+    plan (trusted widget ids only, `specs/t27f/ui_plan.t27`) -> T27F renderer -> verification. A model
+    never ships code to the renderer.
+- **Maps.** The 27-cell honeycomb (`specs/t27f/reel.t27`, look `deck.t27`): stills by `t27f_view`
+  today; the video and live player are spec only.
+- **Particle reels and stills.** The token_floor world (`token_floor*.t27`, `lesson_reel.t27`,
+  `reel_particles*.t27`, `particle_engine.t27`): every pixel is a sum a spec computes and every motion
+  a step of an integrator. Rendered on the Railway lab; a still is one frame of a reel. T27F Live
+  (`particle_field.t27`) is the same physics driven by an agent's events, spec only.
+- **Live editing and review.** The hot-reload stream (`hot.t27`, `build.t27`), the `claw/t27f`
+  check-run the TRI CLAW App posts on a pull request (`specs/claw/t27f_gate.t27`), the PR preview
+  (`specs/claw/preview.t27`).
+- **Health.** The MCP dashboard (`specs/t27mcp/dashboard.t27`, tool `t27_dashboard`).
+
+**In TRI CLAW.** `specs/t27mcp/service.t27` gives every `t27_` and `t27f_` tool to the t27 home and
+mounts it into TRI CLAW's `/mcp`. `frontend.t27` checks that every T27F tool lands there and names
+the drawing set TRI CLAW's chat agent carries (`claw_visual_tool`), next to the coder persona's
+`CODER_TOOLS`. Whether the deployed `/mcp` mounts them today is not measured.
 
 **What T27F is not:** it is not the topic-to-value engine. gHashTag/trinity#1677 (topic or client
-brief -> 27-lesson map -> Bee -> verified artifact) is an *application* built on T27F, and so are
-the reels. Describing T27F as #1677 is the error this section exists to stop (owner correction,
-2026-10-17).
+brief -> 27-lesson map -> Bee -> verified artifact) is an *application*: its decisions live in
+`specs/t27f/topic_engine.t27`, and what it shows is drawn through T27F's map surface. T27F is also
+not one diagram: an answer asked for "a T27F visual" picks the surface `frontend.t27` routes it to.
+Owner corrections: 2026-10-17 (not the topic engine), 2026-10-18 (the frontend, through several
+tools, reels included).
 
 ## What exists and what does not
+
+The status of every surface is `SURFACE_STATUS` in `specs/t27f/frontend.t27`. The rows below give
+the diagram core in detail, then the other surfaces and the topic-map application.
 
 | Layer | Where | State |
 |---|---|---|
@@ -65,13 +85,67 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Graph IR derive pass | `specs/t27f/spec_graph_derive.t27` (t27#10191) | spec with tests: `derive_graph(g, src)` appends what the exporter must not claim and changes nothing it holds. R1 DERIVED `tested_by` = every EXACT CALLS edge from a test, invariant or bench to a fn read backwards (no line). R2 DERIVED `data_flow` = a const or `use` that an EXACT USES edge ties to a fn and that is named inside one of the fn's return statements (from `return` to the next `;`), on the line of the first such name. R3 UNKNOWN opaque node = an undeclared qualified call target of three or more segments (`std.testing.expectEqual(` names `std.testing`), spanning the lines that call through it. Exporter plus derive equal the tutorial 08 fixture as sets: 15 of 15 nodes, 16 of 16 edges, no special case. Limits: names matched as text; call results and flow through locals are not derived; R3 needs 3 or more segments (two cannot be told from a method call); a graph that does not validate, or a source of another line count, comes back unchanged; past 1024 nodes or 4096 edges the result is refused with the too-many verdict. Not wired to a host: the MCP tool does not call it |
 | UI plan IR + trusted widget catalog | `specs/t27f/ui_plan.t27` (t27#9962) | spec with tests; no renderer draws a plan yet |
 | Honeycomb focus+context geometry | `specs/t27f/reel.t27` | spec; stills drawn by the MCP tool `t27f_view` |
-| Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
-| Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; procedure below |
-| Application: reels and deck | `specs/t27f/reel.t27`, `deck.t27`, `reel_*.t27` | spec; two reels |
+| Renderer in the Trinity UI | gHashTag/trinity, t27.ai/t27f/graph/ and the Spec Explorer graph layer | live for the spec graph; it ignores a `src=` parameter, and no page draws a UI plan yet |
+| Surface: particle reels and stills | `specs/t27f/token_floor*.t27`, `lesson_reel.t27`, `reel_particles*.t27` | rendered on the Railway lab (lesson 1 EN and RU); no renderer in the repo, no MCP tool yet |
+| Surface: honeycomb map video and deck | `specs/t27f/reel.t27`, `deck.t27` | spec; stills only, through `t27f_view` |
+| Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; drawn through the map surface; procedure below |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
-When asked "how is T27F going", report against the core rows first. Progress on the applications
-is not progress on the core.
+When asked "how is T27F going", report against the core rows first, then the other surfaces.
+Progress on a reel or on the topic map is not progress on the diagram core.
+
+**Trap: a name declared in two specs cannot be imported (t27#10556).** Measured on t27c 0.5.2:
+`use t27f::lesson_reel::phrase_start` returns `UNRESOLVED ... ambiguous, not spliced`, because
+`token_floor_mux.t27` declares a private `fn phrase_start`. The same happens to `cta_from` and
+`voice_fits`. The explicit path does not help. Before you plan a new module on top of a reel spec,
+grep `specs/` for every name it would import. If any of them collides, put the new code inside the
+spec that owns those names, under a prefix such as `beat_`. The beat clock (t27#10596, PR #10598)
+lives in `lesson_reel.t27` for this reason.
+
+**Cutting video at a ms time: land on a frame, then measure the runs (t27#10603, PR #10605).**
+
+ffmpeg `xfade` starts on the first frame whose time is at or after `offset`. This is how to get the cut you planned:
+
+- Floor the cut to a base frame: `f = (c - half) * fps / 1000`.
+- Print the offset as `trunc(f * 1000 / fps)` ms. Rounding up misses frame f on 2 frames in 3.
+- Put every input through `fps=30,settb=AVTB` so the offset is not rounded again.
+- Chained `xfade` offsets are absolute reel times when each clip starts at its own frame 0.
+
+To check a graph without looking at pictures:
+
+1. Feed it solid `color=` inputs at `s=2x2`.
+2. Write `-f rawvideo -pix_fmt rgb24`.
+3. Count the runs with `od -An -tu1 -w12 -v | cut -c1-12 | uniq -c`.
+
+The runs are the scene lengths and must equal the spec's frame counts. Expect one extra frame when the offset falls on a whole ms.
+
+Lesson main functions read `std.c.getenv`, so build them on the lab with `zig build-exe -lc`.
+
+**Adding a mode to a graph printer without moving the old ones (t27#10609, PR #10610).**
+
+- Pass the old callers a flag (`graph(..., false)`) instead of copying the printer.
+- Give the input numbers a function with a test that every input is used exactly once, in each layout.
+- Prove the old output did not move: on the lab, build the old spec (from `git show <ref>:path`) and the new one, run both on a grid of lessons, languages and voices, and `cmp -s` every graph. PR #10610 compared 96 graphs and 0 differed.
+- For a large frame, render lossless (`-c:v libx264 -qp 0`) and crop a 2x2 pixel outside every text box (`crop=2:2:x:y,format=rgb24`). The solid runs must still equal the spec's frame counts.
+
+Traps from this tick:
+
+- An untyped array literal in a test (`var a = [_]usize{...}`) becomes a Zig tuple, which cannot be indexed at runtime ("tuple field index must be comptime-known"). Declare `var a : [8]usize = undefined;` and fill it in a loop.
+- `fs-lab.sh "echo $b64a ... ; echo $b64b ..."` with two large files exits 0 and writes nothing. Upload one file per call and compare md5 on both sides.
+- zsh does not word-split `set -- $p`. Write one call per file.
+
+**Keeping overlays off a crossfade (t27#10614, PR #10627).**
+
+- Work in whole frames, not seconds. Give each scene a function for the frames it owns outside its crossfades, clip each overlay to it, and print exactly those frames as `between(n,lo,hi)` terms joined with `+`. A test checks that the printed frames equal the frames `between(t,a,b)` showed before.
+- Drop a piece that has no room; never squeeze it. Name the cost in a test: count what is dropped, assert that each drop is on a crossfade, and assert that every phrase keeps at least one caption.
+- To check the pixels, render lossless from solid-colour clips. Crop a full-width band 40 rows tall over the text, split the raw file per frame, and count the distinct colours per frame with `od -An -tu1 -w3 -v | sort -u | wc -l`. Crossfade frames must show 1. The frames with text are the control: they must be many.
+
+Traps from this tick:
+
+- A minimum-length rule silently drops spoken captions. A short chunk that straddles a crossfade leaves two pieces under the minimum, and the voice speaks words that are never shown. A grid test that says "no overlay on a crossfade" stays green while this happens. Only a count of what was dropped finds it.
+- Lab scripts run under `sh`, which is dash: `$((10#$x))` fails with "expecting EOF". Strip leading zeros with `sed 's/^0*//'` and default with `${i:-0}`.
+- The Mac hook reads the whole Bash command. A heredoc PR body that names the report command gets refused. Write the body with the Write tool and pass `--body-file`.
 
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
@@ -192,6 +266,29 @@ approved)`.
 
 Keep drafts, verified results and published items under separate headings (`layer_of`). If the
 journey is saved, save it as a `.t27` data module, not JSON. Saving follows the user's instruction.
+
+## Application: content factory, beats (t27#10584)
+
+`specs/t27f/reel_beats.t27` plans every reel of course 0 as three beats: open, main and close.
+Main is `arche(t)` from `reel_factory.t27`. Open is the best other construct, with a generic
+fallback. Close is a rotating generic. No two reels share the ordered pair (open, main), and
+neighbouring reels differ in every beat.
+
+Before you change a uniqueness rule, measure what it can draw from:
+
+- **Count the pool before you promise uniqueness.** 21 of 27 course-0 lessons have content only
+  for graph and tests among the constructs. This is measured, not a detection bug: course 0's
+  snippets have no `while` or `if`. Six archetypes make only 15 unordered pairs for 27 reels,
+  so an unordered rule fails 4 of 7 tests. Ordered pairs (30) hold. Print the content matrix
+  (lesson by archetype `content()`) first.
+- **A generated printer needs a test block.** `t27c gen` emits `const std = @import("std")`
+  only when the module has a test. Without one, `std.debug.print` fails in zig with "use of
+  undeclared identifier 'std'". Give a lab-only printer one trivial `test`.
+- **Keep scratch printers on the lab.** Copy them into `specs/` for `t27c gen`, then `rm` them
+  in the same command. Never commit them.
+- **Write PR bodies with the Write tool.** The Mac hook matches words in a
+  shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
+  pass `--body-file`.
 
 ## What this skill does not claim
 
