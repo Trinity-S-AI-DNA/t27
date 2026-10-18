@@ -81,7 +81,7 @@ the diagram core in detail, then the other surfaces and the topic-map applicatio
 | Spec -> graph IR schema (the core) | `specs/t27f/spec_graph.t27` (t27#10020) | spec with tests: node / edge kinds, labels, spans, `validate_graph`, line -> node mapping, node -> ui_plan widget, one hand-read fixture (`specs/tutorial/08_modules_and_arrays.t27`) |
 | Graph view: layout of a spec graph | `specs/t27f/spec_graph_view.t27` (t27#10034) | spec with tests: one column per node kind, size / colour / dash / row order from the inference label, UNKNOWN nodes alone in a band, every edge with a source line, node -> widget through `node_widget`; numbers only, laid out on the hand-read fixture; drawn by the MCP tool `t27f_graph` (gHashTag/t27-mcp#9) |
 | Graph view for big specs: wrap, fold, expand, hit | `specs/t27f/spec_graph_fold.t27` (t27#10218) | spec with tests: a kind column taller than N = 12 rows wraps into sub-columns so the canvas aspect is near phi (identical to the view when nothing wraps); a fold to one box per kind with the exact count and one arc per pair of kinds with the exact edge count, each labelled by its weakest member; `expand_graph` = one kind plus its direct neighbours, copied verbatim with an origin map; `wrap_hit` / `wrap_hit_line_start` / `wrap_hit_line_end` take a click to a node and its lines; numbers only, the view's colours are not touched |
-| Dependencies view: the specs around one spec | `specs/t27f/spec_deps.t27` (t27#10680) | spec with tests: reads `t27c use-edges --specs-dir specs`; layer 0 is the focus, +k the specs k imports away (right), -k the specs k importers away (left), each spec once in its shortest-path layer; every edge-list line between two drawn specs is one `exact` edge, a repeated line drawn once; `cycle=1` when the focus imports itself or is imported by a spec in its own import closure; a walk past the caller's room or depth is refused whole (`refused\tfull` / `refused\tdeep`), never cut. Limits: `use` lines t27c does not resolve are not drawn (#7176); cycles that miss the focus are not reported; a spec on a cycle through the focus is drawn on both sides; no host draws it yet. Corpus on master e607228f7: 806 specs, 2461 edge lines, nothing refused at depth 32, deepest walks 6, one real cycle (igla race `backend` <-> `rtl`) |
+| Dependencies view: the specs around one spec | `specs/t27f/spec_deps.t27` (t27#10680) | spec with tests: reads `t27c use-edges --specs-dir specs`; layer 0 is the focus, +k the specs k imports away (right), -k the specs k importers away (left), each spec once in its shortest-path layer; every edge-list line between two drawn specs is one `exact` edge, a repeated line drawn once; `cycle=1` when the focus imports itself or is imported by a spec in its own import closure; a walk past the caller's room or depth is refused whole (`refused\tfull` / `refused\tdeep`), never cut. Limits: `use` lines t27c does not resolve are not drawn (#7176); the view flags only the focus, and `deps_cycles` (t27#10693) lists every spec on a cycle, each once, refused whole (`cap + 1`) if anything does not fit; a spec on a cycle through the focus is drawn on both sides; no host draws it yet. Corpus on master e607228f7: 806 specs, 2461 edge lines, nothing refused at depth 32, deepest walks 6, one real cycle (igla race `backend` <-> `rtl`), which `deps_cycles` lists exactly on master f7efbc232 and lists as empty with #10689 |
 | Spec -> graph IR exporter | `specs/t27f/spec_graph_export.t27` (t27#10162) | spec with tests: `export_graph(path, src)` is a deterministic byte scanner over the source, `export_verdict` is `validate_graph` of the result. One node per top-level declaration (a leading `pub ` is allowed), spans to the matching closing brace, every node and edge EXACT or (unclassifiable) OPAQUE + UNKNOWN, CALLS / USES / CONSTRAINS edges with the line of the use, refusal past 1024 nodes or 4096 edges. On the tutorial 08 snapshot it equals the hand-read fixture on all 14 declaration nodes and all 9 EXACT edges; it does not emit the fixture's `std.testing` UNKNOWN node, nor its 7 DERIVED edges (4 data flow, 3 tested_by), because a scanner never derives; the derive pass below adds them. Limits: textual matching without scope or type resolution, no block comments, no struct/enum bodies, no cross-spec `use` resolution, capacity 1024 nodes and 4096 edges, u16 indices (all 2225 specs in specs/ fit, largest 775 nodes and 3194 edges after derive; anything past the cap is refused, never truncated), takes a `[]const u8` slice rather than `[65536]u8` plus a length. AST/IR audit is trinity#1650, pilot choice #1651 |
 | Graph IR derive pass | `specs/t27f/spec_graph_derive.t27` (t27#10191) | spec with tests: `derive_graph(g, src)` appends what the exporter must not claim and changes nothing it holds. R1 DERIVED `tested_by` = every EXACT CALLS edge from a test, invariant or bench to a fn read backwards (no line). R2 DERIVED `data_flow` = a const or `use` that an EXACT USES edge ties to a fn and that is named inside one of the fn's return statements (from `return` to the next `;`), on the line of the first such name. R3 UNKNOWN opaque node = an undeclared qualified call target of three or more segments (`std.testing.expectEqual(` names `std.testing`), spanning the lines that call through it. Exporter plus derive equal the tutorial 08 fixture as sets: 15 of 15 nodes, 16 of 16 edges, no special case. Limits: names matched as text; call results and flow through locals are not derived; R3 needs 3 or more segments (two cannot be told from a method call); a graph that does not validate, or a source of another line count, comes back unchanged; past 1024 nodes or 4096 edges the result is refused with the too-many verdict. Not wired to a host: the MCP tool does not call it |
 | UI plan IR + trusted widget catalog | `specs/t27f/ui_plan.t27` (t27#9962) | spec with tests; no renderer draws a plan yet |
@@ -334,6 +334,30 @@ Before you change a uniqueness rule, measure what it can draw from:
 - **Write PR bodies with the Write tool.** The Mac hook matches words in a
   shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
   pass `--body-file`.
+
+## Check the whole corpus for import cycles (t27#10693)
+
+dependency-cruiser's `no-circular` and madge's `--circular` list every module on a cycle.
+`deps_cycles` in `specs/t27f/spec_deps.t27` gives the same answer for the `use-edges` list.
+No t27c subcommand runs a main (t27#10692), so the only host today is a scratch test on the
+Railway lab. Do not commit it.
+
+1. On the lab, write `t27c use-edges --specs-dir specs` to a file **before** you put the
+   scratch spec in `specs/`. Otherwise its own `use` lines join the list, which is harmless but
+   changes the count.
+2. Build the scratch spec from three parts:
+   - a head: `use policy::text_lines; use ci::affected; use claw::t27f_gate; use
+     t27f::spec_deps;`, then a test that opens `const g : str = "`;
+   - the edges, converted with `sed 's/\t/\\t/g; s/$/\\n/' | tr -d '\n'` (in an `fs-lab.sh`
+     string the backslashes are doubled again);
+   - a tail that closes with `$";` and asserts on the result.
+   Room: the 2462-line corpus fits `set` 16384, `done` 65536 and `out` 4096.
+3. Assert `w <= cap` first, so that a refusal is told apart from a wrong list. Then run a
+   **negative control**: the same edges with the opposite expectation must FAIL. On master
+   f7efbc232 the list was exactly `backend.t27` and `rtl.t27`. With #10689 it was empty, and
+   the control that expected the pair failed.
+4. Remove the scratch spec, and `git checkout` any spec you swapped in, before you seal
+   anything.
 
 ## What this skill does not claim
 
