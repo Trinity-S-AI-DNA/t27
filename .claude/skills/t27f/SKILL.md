@@ -1,10 +1,10 @@
 ---
 id: t27f
-name: T27F Visual Spec
-description: T27F is the visual spec of a .t27 file -- one spec, one synchronized model, many views (source, architecture, data flow, dependencies, tests and benchmarks), every node labelled exact, derived, suggested or unknown and linked to its source span (gHashTag/trinity#1648, RFC gHashTag/trinity#1649). Use when the user says "t27f", "visual spec", "show / visualize / draw this spec", or opens a .t27 file to see its structure. Also runs the topic-map application built on T27F (gHashTag/trinity#1677) when the user gives a topic or a client brief.
+name: T27F Frontend
+description: T27F is t27's frontend -- the one tool through which t27 shows anything visual, made through several tools (spec graph and outline, honeycomb map stills, the t27.ai graph page, particle reels and stills, the hot-reload stream, the claw/t27f check-run), with its surfaces, their status and the intent-to-surface routing in specs/t27f/frontend.t27. Its core is the visual spec of a .t27 file (gHashTag/trinity#1648, RFC gHashTag/trinity#1649). TRI CLAW serves its MCP tools. Use when the user says "t27f", "visual", "visual spec", "show / visualize / draw this spec", "reel", "still", or opens a .t27 file to see its structure. Also runs the topic-map application (gHashTag/trinity#1677) when the user gives a topic or a client brief.
 ---
 
-# T27F Visual Spec
+# T27F Frontend
 
 <!-- only-t27-rule -->
 > **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
@@ -17,44 +17,64 @@ description: T27F is the visual spec of a .t27 file -- one spec, one synchronize
 
 ## What T27F is
 
-**This section is the one home of the definition.** `CLAUDE.md`, `specs/OWNERS.md`, the skill card
-`specs/skills/t27-t27f.t27` and the spec headers point here; they do not restate it.
+**This section is the one home of the definition.** `CLAUDE.md`, `AGENTS.md`, `specs/OWNERS.md`,
+the skill card `specs/skills/t27-t27f.t27` and the spec headers point here; they do not restate it.
 
-T27F is the **visual spec of `.t27`**: every t27 specification has a first-class visual form, an
-interactive, inspectable diagram built from reusable widgets. Sources: epic gHashTag/trinity#1648
-("native generative UI and visual application engine") and RFC gHashTag/trinity#1649 ("specs as
-executable visual diagrams").
+T27F is **t27's frontend: its native visualization, made through several tools.** Everything t27
+shows -- a spec as a diagram, a topic as a map, a lesson as a particle reel, a report as a still, a
+pull request as a check-run -- is a T27F surface. Owner, 2026-10-18: everything visual is gathered
+into T27F as one tool, and T27F goes into TRI CLAW.
 
-- **One spec -> one synchronized source model -> many views**: source, architecture diagram, data
-  flow, dependency graph, tests/benchmarks, docs. Every view is derived from the real spec
-  (AST/IR plus metadata), never a hand-drawn picture that can drift from the code.
-- **Graph IR**: versioned, typed nodes (module, function, step, input/output/parameter/constant,
-  type/numeric format, branch/loop, operator, dependency, test/invariant/oracle, benchmark/hardware,
-  paper/dataset, opaque region) and typed edges (data flow, control flow, calls/depends on,
-  produces/consumes, constrains, tested by, measured by, implemented by, cited by). The full lists
-  are in #1649.
-- **Every node carries one inference label**: `exact` (present in the AST/IR), `derived` (safe from
-  symbol and type resolution), `suggested` (a model's explanation, visibly marked, linked to source
-  ranges) or `unknown`. A model's guess is never drawn as a verified property of the program.
-- **Bidirectional source mapping**: select a node, see its source span; select a line, see its
-  node. Generation is deterministic for a fixed source and toolchain, and two revisions produce a
-  graph diff.
-- **Read-only viewer first.** Editing comes after the schema survives two structurally different
-  specs. GF16 (`specs/numeric/gf16.t27`) is a *candidate* pilot pending the comparison in #1651.
-- **The pipeline (#1648)**: intent -> versioned system description -> domain model and computation
-  -> renderer-neutral UI plan (trusted widget ids, bindings, layout, actions, theme, a11y,
-  provenance) -> T27F renderer -> verification loop. A model never ships code to the renderer: no
-  eval, no generated JS, only widgets from an allowlist.
-- **In the map** (#1648 comments, 2026-10-16): zooming into a honeycomb cell opens that cell's spec
-  as a navigable program, linked to source, tests, issues and real task status; each cell is both a
-  spec and a learning entry point.
+**The law is `specs/t27f/frontend.t27`.** It lists the surfaces, what draws each today (LIVE, LAB,
+PARTIAL, BLOCKED, SPEC), which surface answers an intent (`route`), the stand-in when the wanted one
+cannot be made this turn (`pick`), the rule that nothing undrawn is claimed made (`claim_ok`), and
+which surfaces TRI CLAW serves (`claw_serves`). Read the table there; this section does not copy it.
+The rules of each surface stay in the spec that decides it.
+
+The surfaces, by family:
+
+- **Spec diagram (the core).** Every t27 specification has a first-class visual form, an
+  interactive, inspectable diagram (epic gHashTag/trinity#1648, RFC gHashTag/trinity#1649). Drawn as
+  SVG by `t27f_graph`, as text by `t27f_outline`, and on t27.ai/t27f/graph/ and the Spec Explorer.
+  - **One spec -> one synchronized source model -> many views**: source, architecture, data flow,
+    dependencies, tests/benchmarks, docs. Every view is derived from the real spec (AST/IR plus
+    metadata), never a hand-drawn picture that can drift from the code.
+  - **Graph IR**: versioned, typed nodes and edges; the full lists are in #1649 and
+    `specs/t27f/spec_graph.t27`.
+  - **Every node carries one inference label**: `exact`, `derived`, `suggested` (a model's
+    explanation, visibly marked) or `unknown`. A model's guess is never drawn as a verified property.
+  - **Bidirectional source mapping**, deterministic generation, graph diffs between revisions.
+  - **Read-only viewer first.** GF16 (`specs/numeric/gf16.t27`) is a *candidate* pilot (#1651).
+  - **The pipeline (#1648)**: intent -> system description -> domain model -> renderer-neutral UI
+    plan (trusted widget ids only, `specs/t27f/ui_plan.t27`) -> T27F renderer -> verification. A model
+    never ships code to the renderer.
+- **Maps.** The 27-cell honeycomb (`specs/t27f/reel.t27`, look `deck.t27`): stills by `t27f_view`
+  today; the video and live player are spec only.
+- **Particle reels and stills.** The token_floor world (`token_floor*.t27`, `lesson_reel.t27`,
+  `reel_particles*.t27`, `particle_engine.t27`): every pixel is a sum a spec computes and every motion
+  a step of an integrator. Rendered on the Railway lab; a still is one frame of a reel. T27F Live
+  (`particle_field.t27`) is the same physics driven by an agent's events, spec only.
+- **Live editing and review.** The hot-reload stream (`hot.t27`, `build.t27`), the `claw/t27f`
+  check-run the TRI CLAW App posts on a pull request (`specs/claw/t27f_gate.t27`), the PR preview
+  (`specs/claw/preview.t27`).
+- **Health.** The MCP dashboard (`specs/t27mcp/dashboard.t27`, tool `t27_dashboard`).
+
+**In TRI CLAW.** `specs/t27mcp/service.t27` gives every `t27_` and `t27f_` tool to the t27 home and
+mounts it into TRI CLAW's `/mcp`. `frontend.t27` checks that every T27F tool lands there and names
+the drawing set TRI CLAW's chat agent carries (`claw_visual_tool`), next to the coder persona's
+`CODER_TOOLS`. Whether the deployed `/mcp` mounts them today is not measured.
 
 **What T27F is not:** it is not the topic-to-value engine. gHashTag/trinity#1677 (topic or client
-brief -> 27-lesson map -> Bee -> verified artifact) is an *application* built on T27F, and so are
-the reels. Describing T27F as #1677 is the error this section exists to stop (owner correction,
-2026-10-17).
+brief -> 27-lesson map -> Bee -> verified artifact) is an *application*: its decisions live in
+`specs/t27f/topic_engine.t27`, and what it shows is drawn through T27F's map surface. T27F is also
+not one diagram: an answer asked for "a T27F visual" picks the surface `frontend.t27` routes it to.
+Owner corrections: 2026-10-17 (not the topic engine), 2026-10-18 (the frontend, through several
+tools, reels included).
 
 ## What exists and what does not
+
+The status of every surface is `SURFACE_STATUS` in `specs/t27f/frontend.t27`. The rows below give
+the diagram core in detail, then the other surfaces and the topic-map application.
 
 | Layer | Where | State |
 |---|---|---|
@@ -65,13 +85,14 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Graph IR derive pass | `specs/t27f/spec_graph_derive.t27` (t27#10191) | spec with tests: `derive_graph(g, src)` appends what the exporter must not claim and changes nothing it holds. R1 DERIVED `tested_by` = every EXACT CALLS edge from a test, invariant or bench to a fn read backwards (no line). R2 DERIVED `data_flow` = a const or `use` that an EXACT USES edge ties to a fn and that is named inside one of the fn's return statements (from `return` to the next `;`), on the line of the first such name. R3 UNKNOWN opaque node = an undeclared qualified call target of three or more segments (`std.testing.expectEqual(` names `std.testing`), spanning the lines that call through it. Exporter plus derive equal the tutorial 08 fixture as sets: 15 of 15 nodes, 16 of 16 edges, no special case. Limits: names matched as text; call results and flow through locals are not derived; R3 needs 3 or more segments (two cannot be told from a method call); a graph that does not validate, or a source of another line count, comes back unchanged; past 1024 nodes or 4096 edges the result is refused with the too-many verdict. Not wired to a host: the MCP tool does not call it |
 | UI plan IR + trusted widget catalog | `specs/t27f/ui_plan.t27` (t27#9962) | spec with tests; no renderer draws a plan yet |
 | Honeycomb focus+context geometry | `specs/t27f/reel.t27` | spec; stills drawn by the MCP tool `t27f_view` |
-| Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
-| Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; procedure below |
-| Application: reels and deck | `specs/t27f/reel.t27`, `deck.t27`, `reel_*.t27` | spec; two reels |
+| Renderer in the Trinity UI | gHashTag/trinity, t27.ai/t27f/graph/ and the Spec Explorer graph layer | live for the spec graph; it ignores a `src=` parameter, and no page draws a UI plan yet |
+| Surface: particle reels and stills | `specs/t27f/token_floor*.t27`, `lesson_reel.t27`, `reel_particles*.t27` | rendered on the Railway lab (lesson 1 EN and RU); no renderer in the repo, no MCP tool yet |
+| Surface: honeycomb map video and deck | `specs/t27f/reel.t27`, `deck.t27` | spec; stills only, through `t27f_view` |
+| Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; drawn through the map surface; procedure below |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
-When asked "how is T27F going", report against the core rows first. Progress on the applications
-is not progress on the core.
+When asked "how is T27F going", report against the core rows first, then the other surfaces.
+Progress on a reel or on the topic map is not progress on the diagram core.
 
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
