@@ -187,13 +187,14 @@ See [`docs/T27-CONSTITUTION.md`](docs/T27-CONSTITUTION.md#2--invariant-laws-neve
 
 **Repository:** Trinity S³AI — **t27** (spec-first ternary / TRI-27). **φ² + 1/φ² = 3 | TRINITY**
 
-## T27F is the visual spec of `.t27`
+## T27F is t27's frontend
 
-T27F means one thing: every `.t27` spec gets a visual form -- one spec, one synchronized model,
-many views (source, architecture, data flow, dependencies, tests), every node labelled exact,
-derived, suggested or unknown and linked to its source span (gHashTag/trinity#1648, RFC
-gHashTag/trinity#1649). It is **not** the topic-to-value engine: gHashTag/trinity#1677 and the
-reels are applications built on T27F. Owner correction, 2026-10-17.
+T27F is t27's native visualization, made through several tools: the spec diagram (its core, the
+visual spec of `.t27`, gHashTag/trinity#1648, RFC gHashTag/trinity#1649), map stills, the graph
+page, particle reels and stills, the hot-reload stream and the `claw/t27f` check-run. TRI CLAW
+serves its MCP tools. Its surfaces, their status and which one answers an intent are the law in
+`specs/t27f/frontend.t27`. It is **not** the topic-to-value engine: gHashTag/trinity#1677 is an
+application drawn through T27F. Owner corrections, 2026-10-17 and 2026-10-18.
 
 This is a pointer. The definition, and what exists versus what is still missing, live in one
 place: `.claude/skills/t27f/SKILL.md`, section "What T27F is".
