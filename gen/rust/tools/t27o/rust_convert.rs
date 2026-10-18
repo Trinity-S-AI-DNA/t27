@@ -9668,3 +9668,11 @@ pub fn out_text_has(out: &[u8], n: usize, s: &[u8]) -> bool {
     return false;
 }
 
+pub fn pin_clear_bit(value: u32, bit: u8) -> u32 {
+    return (value & !(((1 as u32) << bit)));
+}
+
+pub fn pin_clear_mask(value: u32, m: u32) -> u32 {
+    return (value & !(m));
+}
+
