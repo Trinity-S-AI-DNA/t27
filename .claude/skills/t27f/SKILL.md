@@ -68,11 +68,19 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
 | Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; procedure below |
 | Application: reels and deck | `specs/t27f/reel.t27`, `deck.t27`, `reel_*.t27` | spec; two reels |
-| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". A printing `main` makes t27b reject the spec |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
 When asked "how is T27F going", report against the core rows first. Progress on the applications
 is not progress on the core.
+
+**Trap: a name declared in two specs cannot be imported (t27#10556).** Measured on t27c 0.5.2:
+`use t27f::lesson_reel::phrase_start` returns `UNRESOLVED ... ambiguous, not spliced`, because
+`token_floor_mux.t27` declares a private `fn phrase_start`. The same happens to `cta_from` and
+`voice_fits`. The explicit path does not help. Before you plan a new module on top of a reel spec,
+grep `specs/` for every name it would import. If any of them collides, put the new code inside the
+spec that owns those names, under a prefix such as `beat_`. The beat clock (t27#10596, PR #10598)
+lives in `lesson_reel.t27` for this reason.
 
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
