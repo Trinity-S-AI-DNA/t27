@@ -65,7 +65,6 @@ bool has_prefix_at(uint8_t* buf, size_t s, size_t e, uint8_t* p, size_t pn);
 bool is_exempt_at(uint8_t* buf, size_t s, size_t e, bool fork);
 bool is_exempt(uint8_t* branch, size_t bn, bool fork);
 bool is_digit(uint8_t c);
-size_t line_end(uint8_t* buf, size_t n, size_t s);
 size_t digits_end(uint8_t* buf, size_t s, size_t e);
 bool row_ok(uint8_t* buf, size_t s, size_t e);
 uint32_t row_number(uint8_t* buf, size_t s, size_t e);
@@ -76,6 +75,7 @@ size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
 size_t put_act(uint8_t* out, size_t w, size_t cap, uint8_t* act, uint32_t v);
 uint32_t budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
 uint32_t budget_with(uint8_t* buf, size_t n, uint8_t* out, size_t cap, uint32_t limit);
+size_t line_end(uint8_t* buf, size_t s, size_t n);
 
 /* -------------------------------------------------------
    Function implementations
@@ -186,14 +186,6 @@ bool is_digit(uint8_t c) {
     return ((c >= '0') && (c <= '9'));
 }
 
-size_t line_end(uint8_t* buf, size_t n, size_t s) {
-    size_t e = s;
-    while (((e < n) && (buf[e] != '\n'))) {
-        e += 1;
-    }
-    return e;
-}
-
 size_t digits_end(uint8_t* buf, size_t s, size_t e) {
     size_t i = (s + 4);
     while (((i < e) && is_digit(buf[i]))) {
@@ -246,9 +238,9 @@ bool row_counts(uint8_t* buf, size_t s, size_t e, uint8_t st) {
 
 uint32_t count_state(uint8_t* buf, size_t n, uint8_t st) {
     uint32_t c = 0;
-    size_t s = (line_end(buf, n, 0) + 1);
+    size_t s = (line_end(buf, 0, n) + 1);
     while ((s < n)) {
-        size_t e = line_end(buf, n, s);
+        size_t e = line_end(buf, s, n);
         if (row_counts(buf, s, e, st)) {
             c += 1;
         }
@@ -293,7 +285,7 @@ uint32_t budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
 }
 
 uint32_t budget_with(uint8_t* buf, size_t n, uint8_t* out, size_t cap, uint32_t limit) {
-    size_t e0 = line_end(buf, n, 0);
+    size_t e0 = line_end(buf, 0, n);
     if ((row_ok(buf, 0, e0) == false)) {
         return 0;
     }
@@ -318,7 +310,7 @@ uint32_t budget_with(uint8_t* buf, size_t n, uint8_t* out, size_t cap, uint32_t 
     size_t w = 0;
     size_t s = (e0 + 1);
     while (((s < n) && (acts < k))) {
-        size_t e = line_end(buf, n, s);
+        size_t e = line_end(buf, s, n);
         if (row_counts(buf, s, e, 'H')) {
             w = put_act(out, w, cap, ACT_READY, row_number(buf, s, e));
             acts += 1;
@@ -326,6 +318,14 @@ uint32_t budget_with(uint8_t* buf, size_t n, uint8_t* out, size_t cap, uint32_t 
         s = (e + 1);
     }
     return acts;
+}
+
+size_t line_end(uint8_t* buf, size_t s, size_t n) {
+    size_t e = s;
+    while (((e < n) && (buf[e] != '\n'))) {
+        e += 1;
+    }
+    return e;
 }
 
 /* -------------------------------------------------------
