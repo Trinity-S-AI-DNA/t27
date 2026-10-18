@@ -8305,7 +8305,7 @@ impl Codegen {
         }
         // `--backend ml`: the host's file syscalls, only for a spec that calls them.
         let mut host = false;
-        Self::visit_calls(&ast.children, &mut |c| host |= c.name.starts_with("host_"));
+        Self::visit_calls(&ast.children, &mut |c| host |= matches!(c.name.as_str(), "host_open" | "host_read" | "host_write" | "host_close"));
         if host {
             self.write(HOST_IO_ZIG);
         }
