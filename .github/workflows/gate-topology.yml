@@ -165,3 +165,42 @@ jobs:
             done; } | /tmp/feed > /tmp/review.json 2> /tmp/stats || { echo "::warning::claw/suggest could not build a review"; exit 0; }
           cat /tmp/stats >> "$GITHUB_STEP_SUMMARY"
           if [ -s /tmp/review.json ]; then gh api -X POST "repos/$R/pulls/$N/reviews" --input /tmp/review.json -q .html_url >> "$GITHUB_STEP_SUMMARY"; fi
+
+  # #10397: after a push to master, bring every conflict-free open PR that fell behind up to date.
+  # The decision (which PRs, which order, the cap of 30, every skip) is specs/claw/refresh.t27 lowered
+  # to gen/c/claw/refresh.c; this job lists, feeds the C, and calls the endpoint for each `R` line.
+  # The token is the update-branch row of specs/claw/github_surface.t27: pull_requests write and
+  # nothing else. If GitHub answers 403 here, the App also needs contents:write for update-branch
+  # (REST docs); the failure is a warning with GitHub's own text, never a red job.
+  claw-refresh:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, pull-requests: read}
+    concurrency: {group: claw-refresh, cancel-in-progress: true}
+    steps:
+      - id: have
+        env: {K: "${{ secrets.CLAW_APP_PRIVATE_KEY }}", I: "${{ vars.CLAW_APP_ID || secrets.CLAW_APP_ID }}"}
+        run: if [ -n "$K" ] && [ -n "$I" ]; then echo ok=1 >> "$GITHUB_OUTPUT"; else echo "claw/refresh updated nothing - secret CLAW_APP_PRIVATE_KEY or CLAW_APP_ID (variable or secret) is not set (docs/claw/README.md)." >> "$GITHUB_STEP_SUMMARY"; fi
+      - {id: tok, if: steps.have.outputs.ok, uses: actions/create-github-app-token@v2, with: {app-id: "${{ vars.CLAW_APP_ID || secrets.CLAW_APP_ID }}", private-key: "${{ secrets.CLAW_APP_PRIVATE_KEY }}", owner: gHashTag, repositories: t27, permission-pull-requests: write}}
+      - {if: steps.have.outputs.ok, uses: actions/checkout@v6, with: {persist-credentials: false}}
+      - if: steps.have.outputs.ok
+        env: {GH_TOKEN: "${{ github.token }}", CLAW_TOKEN: "${{ steps.tok.outputs.token }}", R: "${{ github.repository }}"}
+        run: |
+          printf '#include "gen/c/claw/refresh.c"\n#include <stdio.h>\n#include <stdlib.h>\nint main(void){size_t k=1<<22,n;uint8_t*b=malloc(k),*o=malloc(k);n=fread(b,1,k,stdin);if(n==k)return 3;size_t m=refresh_plan(b,n,o,k);if(m>k)return 4;fwrite(o,1,m,stdout);return 0;}\n' | cc -O1 -w -I . -x c -o /tmp/feed -
+          list() { gh api graphql --paginate -F owner="${R%/*}" -F name="${R#*/}" -f query='query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:100,after:$endCursor,orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor} nodes{number headRefOid createdAt isDraft isCrossRepository maintainerCanModify mergeable mergeStateStatus baseRefName headRepository{nameWithOwner} labels(first:50){nodes{name}}}}}}' --jq '.data.repository.pullRequests.nodes[]|[.number,.headRefOid,.createdAt,.isDraft,([.labels.nodes[].name]|join(",")),.isCrossRepository,(.headRepository.nameWithOwner//""),.maintainerCanModify,.mergeable,.mergeStateStatus,.baseRefName]|@tsv'; }
+          # GitHub computes mergeability lazily after a push: ask once, wait, ask again.
+          list > /dev/null
+          sleep 30
+          list > /tmp/prs.tsv
+          # Copy the facts; behind_by is the one thing the listing lacks (the ruleset is not strict, so no PR is ever reported BEHIND).
+          while IFS= read -r line; do
+            sha=$(printf '%s' "$line" | cut -f2); base=$(printf '%s' "$line" | cut -f11)
+            bh=$(gh api "repos/$R/compare/$base...$sha" -q .behind_by 2>/dev/null </dev/null) || bh=-
+            printf '%s\t%s\n' "$(printf '%s' "$line" | cut -f1-10)" "${bh:--}"
+          done < /tmp/prs.tsv | /tmp/feed > /tmp/plan || { echo "::warning::claw/refresh could not build a plan"; exit 0; }
+          while IFS=$'\t' read -r k a b; do
+            case "$k" in
+              R) if err=$(GH_TOKEN="$CLAW_TOKEN" gh api -X PUT "repos/$R/pulls/$a/update-branch" -f expected_head_sha="$b" 2>&1 </dev/null); then echo "claw/refresh: #$a updated"; else echo "::warning::claw/refresh could not update #$a: $err"; fi; sleep 1;;
+              M) printf '%s\n' "$a" >> "$GITHUB_STEP_SUMMARY";;
+            esac
+          done < /tmp/plan
