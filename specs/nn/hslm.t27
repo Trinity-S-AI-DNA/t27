@@ -1,31 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 // t27/specs/nn/hslm.t27
 // HSLM (Hierarchical Sacred Learning Model) Specification
-// Ternary transformer: RMSNorm, causal multi-head attention with a KV cache,
-// ternary feed-forward network, and the backward pass for one position.
+// The ternary language model trinity-training trained: a token embedding with
+// a phi position encoding, three Trinity blocks (sacred attention, then a
+// ternary ReLU FFN), and a vocab-729 output head; and the backward pass for
+// the last position, from the logits back to the embedding.
 // φ² + 1/φ² = 3 | TRINITY
 //
-// This spec used to inline nn::attention, which reads constants::PHI_CUBED_INV;
-// math::constants does not define it, so the generated Zig never compiled
-// ("use of undeclared identifier 'constants'"). The layer is written out here
-// instead, with the sacred attention scale 1 / HEAD_DIM^(phi^-3) as a number.
+// Source of truth: gHashTag/trinity-training @ 3e9648c1817a97c5f9b8c727b0f8e2291928eead
+//   src/hslm/constants.zig        VOCAB_SIZE 729, EMBED_DIM 243, HIDDEN_DIM 729,
+//                                 DEFAULT_BLOCKS 3, NUM_HEADS 3, HEAD_DIM 81
+//   src/hslm/embedding.zig        x = table[token] + phi position encoding:
+//                                 freq = phi^(-2(i/2)/243) * 3/pi, sin even, cos odd
+//   src/hslm/sacred_attention.zig RMSNorm with gamma (eps 1e-6), Q/K/V = alpha W n,
+//                                 phi-RoPE on Q and K (pairs i, i+40 per head, angle
+//                                 pos * phi^(-2i/81), dim 80 unrotated), causal softmax
+//                                 of q.k / 81^(phi^-3), out = x + alpha_o (ctx @ Wo)
+//   src/hslm/trinity_block.zig    TernaryDense: h = relu(alpha_up (r @ W_up) + b_up),
+//                                 out = alpha_down (h @ W_down) + b_down + r; no norm
+//   src/hslm/model.zig            head: n = x / sqrt(mean(x^2) + 1e-6), no gamma;
+//                                 logits = alpha_out (n @ W_out) / 243^(phi^-3) + b_out
+//   src/hslm/ste.zig              applyAlpha: the TWN scale, one per matrix
+//   src/hslm/trainer.zig          cross-entropy on the last position's logits
+//   src/hslm/model.zig            forwardTrain: per block and position, the VSA
+//                                 attention, the consciousness gate, and the
+//                                 0.1 * projectVsaToEmbed(reasoned) offset
+//   src/hslm/attention.zig        VSAAttention.forward, cosineSimilarityTrit
+//   src/hslm/consciousness.zig    ConsciousnessGate: max_sim >= phi^-1, EMA 0.1
+//   src/hslm/reasoning.zig        forward = blend([context, analogy], [0.618, 0.382])
+// Context 27: gHashTag/trinity @ ee512359254bcd7438bb6a79c8a4a7f8b554b620,
+// docs/experiments/FOUND_EXPERIMENTS_SUMMARY.md: ctx 18 -> PPL 5.58, ctx 27 ->
+// PPL 2.96 (run R5, the best), ctx 54 -> PPL 6.05; ctx must divide HEAD_DIM
+// (EXP-012). constants.zig still says CONTEXT_LEN 81; the run used 27.
 //
-// The four backward functions used to fill gradients with zeros. They now
-// compute them, and the tests check every gradient against a finite
-// difference of the loss: a central difference with a small step for inputs
-// and RMSNorm gains, and the -1 / +1 trit flip for ternary weights (exact for
-// the last layer's W2, where the loss is linear in the weight).
+// The VSA path (section 4b) is a second stream next to the float one: each
+// token also has a 1024-trit hypervector, rotated by its position; per block
+// the VSA attention bundles the earlier hypervectors by cosine similarity,
+// and when the gate fires the block's float output gets 0.1 * the projected
+// hypervector. That stream depends on tokens and positions only, never on a
+// float parameter, so it adds a constant per (block, position) and leaves
+// every gradient as it was; the gradient checks below run with it on. Two
+// facts of the trained code, checked here: the reasoning step returns the
+// context unchanged (blend 6 * c + 3 * c * current^2 has the sign of c), and
+// at position 0 the gate always fires (max_sim is the self-similarity, 1).
 //
-// Measured against the trained model (gHashTag/trinity-training,
-// src/hslm/constants.zig and trinity_block.zig), this spec does not describe
-// it yet:
-//   - NUM_LAYERS 6 here; the trained model has DEFAULT_BLOCKS 3.
-//   - CONTEXT_LEN 81 here; the best run (PPL 2.96) trained at context 27.
-//   - The FFN here is 243 -> 972 -> 243 with GELU and no bias; the trained
-//     block is 243 -> 729 -> 243 with ReLU, a TWN alpha scale per matrix, and
-//     a bias after each projection.
-//   - No token embedding and no vocab-729 output head here.
-//   - Attention matches: 3 heads x 81, pre-RMSNorm, sacred scale, residual.
+// What still differs from the trained model, named so nobody reads this spec
+// as more than it is:
+//   - Floats: the trained model computes in f32, this spec in f64.
+//   - The trit table of the VSA stream is Zig's PRNG there and a hash here.
+//   - The trainer's attention backward sums W_K / W_V gradients over every
+//     position of the sequence; this spec treats earlier positions' keys and
+//     values as cached constants (the gradient of the last position only).
+//   - Training: the trainer's STE backward leaves the alphas out of the input
+//     gradients and stops at the embedding (the table is never trained); this
+//     spec computes the exact gradient, embedding included. Alphas and the
+//     ternary requantize step are inputs here, not learned; the STE update is
+//     its own spec (issue #10076).
+//
+// The backward pass is checked against central differences of the loss: on
+// inputs, embedding rows, gains, biases and, for ternary weights, a real-valued
+// nudge of one weight (the straight-through gradient is d loss / d weight as if
+// it were real). Trit flips (-1 / +1) stay for W_out, where the loss is linear
+// in the weight and the flip is exact, and for the last block's W_down.
 
 module HSLM {
     use base::types;
@@ -34,20 +70,31 @@ module HSLM {
     // 1. HSLM Configuration
     // ═════════════════════════════════════════════════════════════════
 
-    const NUM_LAYERS : usize = 6;        // transformer layers
-    const NUM_HEADS : usize = 3;         // attention heads per layer
+    const NUM_BLOCKS : usize = 3;        // DEFAULT_BLOCKS: Trinity blocks
+    const NUM_HEADS : usize = 3;         // attention heads per block
     const HEAD_DIM : usize = 81;         // 3^4 per head
     const EMBED_DIM : usize = 243;       // NUM_HEADS * HEAD_DIM
-    const FF_DIM : usize = 972;          // 4 * EMBED_DIM
-    const CONTEXT_LEN : usize = 81;      // KV cache positions
-    const VSA_DIM : usize = 1024;        // VSA hypervector dimension
+    const FF_DIM : usize = 729;          // HIDDEN_DIM, 3^6
+    const VOCAB_SIZE : usize = 729;      // 3^6 tokens
+    const CONTEXT_LEN : usize = 27;      // 3^3, the PPL 2.96 run
+    const ROPE_PAIRS : usize = 40;       // HEAD_DIM / 2; the last dim is unrotated
+    const VSA_DIM : usize = 1024;        // VSA hypervector dimension, section 4b
+    const VSA_RATIO : usize = 4;         // VSA_DIM / EMBED_DIM, integer division
 
     const RMS_EPS : f64 = 0.000001;
     // 1 / 81^(phi^-3), phi^-3 = 0.2360679775
     const SACRED_ATTN_SCALE : f64 = 0.3543788557382518;
-    // sqrt(2 / pi) and the cubic term of the tanh GELU approximation
-    const SQRT_2_OVER_PI : f64 = 0.7978845608028654;
-    const GELU_CUBIC : f64 = 0.044715;
+    // 1 / 243^(phi^-3)
+    const SACRED_LOGIT_SCALE : f64 = 0.2734228160400333;
+    // ln(phi), for phi^-t = exp(-t ln phi)
+    const LN_PHI : f64 = 0.48121182505960347;
+    // 3 / pi, the position encoding's frequency scale
+    const TRINITY_SCALE : f64 = 0.954929658551372;
+    // phi^-1, the consciousness gate's threshold
+    const PHI_INV : f64 = 0.6180339887498949;
+    // The VSA offset's gain: next_float += projectVsaToEmbed(reasoned) * 0.1
+    const VSA_GAIN : f64 = 0.1;
+    const GATE_EMA : f64 = 0.1;
 
     // Layer phases
     const PHASE_NORM : u8 = 0;
@@ -55,84 +102,102 @@ module HSLM {
     const PHASE_FFN : u8 = 2;
     const PHASE_RESIDUAL : u8 = 3;
 
-    // Activation functions
-    const ACT_RELU : u8 = 0;
-    const ACT_GELU : u8 = 1;
-    const ACT_SWISH : u8 = 2;
-    const ACT_TERNARY : u8 = 3;
-
     // Training phases
     const PHASE_FORWARD : u8 = 0;
     const PHASE_BACKWARD : u8 = 1;
     const PHASE_UPDATE : u8 = 2;
 
-    // Weight matrices, for the test probes
+    // Weight matrices and biases, for the test probes
     const MAT_Q : u8 = 0;
     const MAT_K : u8 = 1;
     const MAT_V : u8 = 2;
     const MAT_O : u8 = 3;
-    const MAT_W1 : u8 = 4;
-    const MAT_W2 : u8 = 5;
+    const MAT_UP : u8 = 4;
+    const MAT_DOWN : u8 = 5;
+    const MAT_OUT : u8 = 6;
+    const MAT_NONE : u8 = 255;
+    const BIAS_UP : u8 = 0;
+    const BIAS_DOWN : u8 = 1;
+    const BIAS_OUT : u8 = 2;
 
     // ═════════════════════════════════════════════════════════════════
     // 2. Weights and state
     // ═════════════════════════════════════════════════════════════════
 
-    // Ternary weights, row-major in_dim x out_dim: w[j * out_dim + i]
-    struct LayerWeights {
+    // Ternary weights, row-major in_dim x out_dim: w[j * out_dim + i].
+    // Each matrix has one TWN alpha: y = alpha * (x @ W).
+    struct BlockWeights {
         w_q : [EMBED_DIM * EMBED_DIM]Trit,
         w_k : [EMBED_DIM * EMBED_DIM]Trit,
         w_v : [EMBED_DIM * EMBED_DIM]Trit,
         w_o : [EMBED_DIM * EMBED_DIM]Trit,
-        w1 : [EMBED_DIM * FF_DIM]Trit,
-        w2 : [FF_DIM * EMBED_DIM]Trit,
+        w_up : [EMBED_DIM * FF_DIM]Trit,
+        w_down : [FF_DIM * EMBED_DIM]Trit,
         norm1_gamma : [EMBED_DIM]f64,
-        norm2_gamma : [EMBED_DIM]f64,
+        b_up : [FF_DIM]f64,
+        b_down : [EMBED_DIM]f64,
+        alpha_q : f64,
+        alpha_k : f64,
+        alpha_v : f64,
+        alpha_o : f64,
+        alpha_up : f64,
+        alpha_down : f64,
     }
 
     struct HSLMWeights {
-        layers : [NUM_LAYERS]LayerWeights,
+        embed : [VOCAB_SIZE * EMBED_DIM]f64,
+        blocks : [NUM_BLOCKS]BlockWeights,
+        w_out : [EMBED_DIM * VOCAB_SIZE]Trit,
+        b_out : [VOCAB_SIZE]f64,
+        alpha_out : f64,
     }
 
     var hslm_mode : u8 = PHASE_FORWARD;
 
-    // The model (about 4.3 MB of trits) lives in module storage, not on a stack
+    // The model (about 2 M trits and 180 k floats) lives in module storage
     var model : HSLMWeights = undefined;
 
-    // KV cache per layer: [layer][position][EMBED_DIM]
-    var kv_k : [NUM_LAYERS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
-    var kv_v : [NUM_LAYERS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+    // KV cache per block: [block][position][EMBED_DIM]; keys after RoPE
+    var kv_k : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+    var kv_v : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
 
-    // Activations of the last position each layer processed, kept for backward
-    var act_pos : [NUM_LAYERS]usize = undefined;
-    var act_x : [NUM_LAYERS * EMBED_DIM]f64 = undefined;     // layer input
-    var act_n1 : [NUM_LAYERS * EMBED_DIM]f64 = undefined;    // RMSNorm 1 output
-    var act_rms1 : [NUM_LAYERS]f64 = undefined;
-    var act_q : [NUM_LAYERS * EMBED_DIM]f64 = undefined;
-    var act_attn : [NUM_LAYERS * NUM_HEADS * CONTEXT_LEN]f64 = undefined;  // softmax
-    var act_ctx : [NUM_LAYERS * EMBED_DIM]f64 = undefined;   // attention context
-    var act_r : [NUM_LAYERS * EMBED_DIM]f64 = undefined;     // input + attention
-    var act_n2 : [NUM_LAYERS * EMBED_DIM]f64 = undefined;    // RMSNorm 2 output
-    var act_rms2 : [NUM_LAYERS]f64 = undefined;
-    var act_pre : [NUM_LAYERS * FF_DIM]f64 = undefined;      // n2 @ W1
-    var act_h : [NUM_LAYERS * FF_DIM]f64 = undefined;        // gelu(pre)
-    var act_out : [NUM_LAYERS * EMBED_DIM]f64 = undefined;   // layer output
+    // Activations of the last position each block processed, kept for backward
+    var act_token : usize = 0;
+    var act_pos : [NUM_BLOCKS]usize = undefined;
+    var act_x : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;     // block input
+    var act_n1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;    // RMSNorm output
+    var act_rms1 : [NUM_BLOCKS]f64 = undefined;
+    var act_q : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;     // query after RoPE
+    var act_attn : [NUM_BLOCKS * NUM_HEADS * CONTEXT_LEN]f64 = undefined;  // softmax
+    var act_ctx : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;   // attention context
+    var act_r : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;     // input + attention
+    var act_pre : [NUM_BLOCKS * FF_DIM]f64 = undefined;      // alpha_up (r @ W_up) + b_up
+    var act_h : [NUM_BLOCKS * FF_DIM]f64 = undefined;        // relu(pre)
+    var act_out : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;   // block output
+    var act_hn : [EMBED_DIM]f64 = undefined;                 // head RMSNorm output
+    var act_hrms : f64 = 1.0;
 
-    // Weight gradients (straight-through: d loss / d weight as if it were real),
-    // accumulated until zero_weight_gradients
-    var gw_q : [NUM_LAYERS * EMBED_DIM * EMBED_DIM]f64 = undefined;
-    var gw_k : [NUM_LAYERS * EMBED_DIM * EMBED_DIM]f64 = undefined;
-    var gw_v : [NUM_LAYERS * EMBED_DIM * EMBED_DIM]f64 = undefined;
-    var gw_o : [NUM_LAYERS * EMBED_DIM * EMBED_DIM]f64 = undefined;
-    var gw_1 : [NUM_LAYERS * EMBED_DIM * FF_DIM]f64 = undefined;
-    var gw_2 : [NUM_LAYERS * FF_DIM * EMBED_DIM]f64 = undefined;
-    var g_gamma1 : [NUM_LAYERS * EMBED_DIM]f64 = undefined;
-    var g_gamma2 : [NUM_LAYERS * EMBED_DIM]f64 = undefined;
+    // Gradients (straight-through for trits: d loss / d weight as if it were
+    // real), accumulated until zero_weight_gradients
+    var gw_q : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+    var gw_k : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+    var gw_v : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+    var gw_o : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+    var gw_up : [NUM_BLOCKS * EMBED_DIM * FF_DIM]f64 = undefined;
+    var gw_down : [NUM_BLOCKS * FF_DIM * EMBED_DIM]f64 = undefined;
+    var gw_out : [EMBED_DIM * VOCAB_SIZE]f64 = undefined;
+    var g_gamma1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+    var g_b_up : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+    var g_b_down : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+    var g_b_out : [VOCAB_SIZE]f64 = undefined;
+    var g_embed : [VOCAB_SIZE * EMBED_DIM]f64 = undefined;
 
-    // Backward scratch for the layer being processed
-    var bw_out : [EMBED_DIM]f64 = undefined;   // d loss / d layer output
-    var bw_h : [FF_DIM]f64 = undefined;        // d loss / d gelu output
-    var bw_pre : [FF_DIM]f64 = undefined;      // d loss / d W1 output
+    // Backward scratch for the block being processed
+    var bw_out : [EMBED_DIM]f64 = undefined;   // d loss / d block output
+    var bw_h : [FF_DIM]f64 = undefined;        // d loss / d relu output
+    var bw_pre : [FF_DIM]f64 = undefined;      // d loss / d pre-activation
+    var bw_sf : [FF_DIM]f64 = undefined;       // an alpha-scaled gradient, FF_DIM wide
+    var bw_se : [EMBED_DIM]f64 = undefined;    // an alpha-scaled gradient, EMBED_DIM wide
     var bw_n : [EMBED_DIM]f64 = undefined;     // d loss / d RMSNorm output
     var bw_tmp : [EMBED_DIM]f64 = undefined;
     var bw_r : [EMBED_DIM]f64 = undefined;     // d loss / d (input + attention)
@@ -141,7 +206,35 @@ module HSLM {
     var bw_k : [EMBED_DIM]f64 = undefined;     // current position's key
     var bw_v : [EMBED_DIM]f64 = undefined;     // current position's value
     var bw_da : [CONTEXT_LEN]f64 = undefined;
-    var bw_x : [EMBED_DIM]f64 = undefined;     // d loss / d layer input
+    var bw_x : [EMBED_DIM]f64 = undefined;     // d loss / d block input
+    var bw_dz : [VOCAB_SIZE]f64 = undefined;   // d loss / d (n @ W_out)
+
+    // A real-valued nudge of one ternary weight, for the gradient checks:
+    // the forward pass computes as if weight `nudge_index` of matrix
+    // `nudge_which` in block `nudge_block` were w + nudge_delta. Off by default.
+    var nudge_which : u8 = MAT_NONE;
+    var nudge_block : usize = 0;
+    var nudge_index : usize = 0;
+    var nudge_delta : f64 = 0.0;
+
+    // The VSA stream (section 4b). vsa_in holds each block's input hypervector
+    // per position: block 0 gets the token's rotated hypervector, block b + 1
+    // the one block b put out. On by default: the trained model has it.
+    var vsa_on : bool = true;
+    var vsa_in : [NUM_BLOCKS * CONTEXT_LEN * VSA_DIM]Trit = undefined;
+    var vsa_out : [NUM_BLOCKS * VSA_DIM]Trit = undefined;      // next_trit, last position
+    var vsa_ctx : [VSA_DIM]Trit = undefined;                    // VSA attention context
+    var vsa_reasoned : [VSA_DIM]Trit = undefined;
+    var vsa_temp : [VSA_DIM]Trit = undefined;
+    var vsa_temp2 : [VSA_DIM]Trit = undefined;
+    var vsa_sim : [CONTEXT_LEN]f64 = undefined;
+    var vsa_accum : [VSA_DIM]i64 = undefined;
+    var vsa_max_sim : [NUM_BLOCKS]f64 = undefined;
+    var vsa_fired : [NUM_BLOCKS]bool = undefined;
+    // ConsciousnessGate state, one gate per block; it does not change the output
+    var gate_total : [NUM_BLOCKS]usize = undefined;
+    var gate_conscious : [NUM_BLOCKS]usize = undefined;
+    var gate_ema : [NUM_BLOCKS]f64 = undefined;
 
     // ═════════════════════════════════════════════════════════════════
     // 3. Kernels
@@ -151,6 +244,14 @@ module HSLM {
         var i : usize = 0;
         while (i < x.len) {
             x[i] = value;
+            i = i + 1;
+        }
+    }
+
+    fn scale_into(x: []const f64, alpha: f64, out: []f64) -> void {
+        var i : usize = 0;
+        while (i < x.len) {
+            out[i] = alpha * x[i];
             i = i + 1;
         }
     }
@@ -200,6 +301,22 @@ module HSLM {
         while (i < x.len) {
             dx[i] = gamma[i] * dy[i] / rms - x[i] * s / (n * rms * rms * rms);
             dgamma[i] = dgamma[i] + dy[i] * x[i] / rms;
+            i = i + 1;
+        }
+    }
+
+    // The head's RMSNorm has no gamma: y_i = x_i / r
+    fn rms_norm_plain_backward(x: []const f64, rms: f64, dy: []const f64, dx: []f64) -> void {
+        const n = @as(f64, @floatFromInt(x.len));
+        var s : f64 = 0.0;
+        var i : usize = 0;
+        while (i < x.len) {
+            s = s + dy[i] * x[i];
+            i = i + 1;
+        }
+        i = 0;
+        while (i < x.len) {
+            dx[i] = dy[i] / rms - x[i] * s / (n * rms * rms * rms);
             i = i + 1;
         }
     }
@@ -257,49 +374,161 @@ module HSLM {
         }
     }
 
-    // GELU, tanh approximation: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
-    fn gelu(x: f64) -> f64 {
-        const inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
-        return 0.5 * x * (1.0 + tanh(inner));
+    // Applies the gradient-check nudge, if it targets this matrix: the output
+    // moves as if the weight were w + nudge_delta. Runs before the alpha scale.
+    fn nudge(which: u8, block_idx: usize, input: []const f64, output: []f64, out_dim: usize) -> void {
+        if (which == nudge_which and block_idx == nudge_block) {
+            const j = nudge_index / out_dim;
+            const i = nudge_index % out_dim;
+            output[i] = output[i] + nudge_delta * input[j];
+        }
     }
 
-    // d gelu / dx = 0.5 (1 + t) + 0.5 x (1 - t^2) sqrt(2/pi) (1 + 3 * 0.044715 x^2)
-    fn gelu_derivative(x: f64) -> f64 {
-        const inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
-        const t = tanh(inner);
-        return 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * SQRT_2_OVER_PI * (1.0 + 3.0 * GELU_CUBIC * x * x);
+    fn relu(x: f64) -> f64 {
+        if (x > 0.0) {
+            return x;
+        }
+        return 0.0;
     }
 
-    fn gelu_activation(x: []f64) -> void {
+    // d relu / dx: 1 above zero, 0 at and below it (the trainer zeroes the
+    // gradient where the cached output is 0)
+    fn relu_derivative(x: f64) -> f64 {
+        if (x > 0.0) {
+            return 1.0;
+        }
+        return 0.0;
+    }
+
+    // embedding.zig: t = 2 (i / 2) / 243, freq = phi^-t * 3/pi, angle = position * freq;
+    // sin for even i, cos for odd i
+    fn pos_encoding(position: usize, i: usize) -> f64 {
+        const t = @as(f64, @floatFromInt(2 * (i / 2))) / @as(f64, @floatFromInt(EMBED_DIM));
+        const angle = @as(f64, @floatFromInt(position)) * exp(0.0 - t * LN_PHI) * TRINITY_SCALE;
+        if (i % 2 == 0) {
+            return sin(angle);
+        }
+        return cos(angle);
+    }
+
+    // x = table[token] + pos_encoding(position)
+    fn embed_into(token: usize, position: usize, out: []f64) -> void {
         var i : usize = 0;
-        while (i < x.len) {
-            x[i] = gelu(x[i]);
+        while (i < EMBED_DIM) {
+            out[i] = model.embed[token * EMBED_DIM + i] + pos_encoding(position, i);
             i = i + 1;
         }
+    }
+
+    // phi-RoPE angle of pair i: position * phi^(-2 i / HEAD_DIM)
+    fn rope_angle(position: usize, i: usize) -> f64 {
+        const t = 2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(HEAD_DIM));
+        return @as(f64, @floatFromInt(position)) * exp(0.0 - t * LN_PHI);
+    }
+
+    // Rotates pairs (h + i, h + i + 40) of every head by the position's angles;
+    // inverse rotates the other way, which is the transpose (backward)
+    fn rope(x: []f64, position: usize, inverse: bool) -> void {
+        var i : usize = 0;
+        while (i < ROPE_PAIRS) {
+            const angle = rope_angle(position, i);
+            const c = cos(angle);
+            var s = sin(angle);
+            if (inverse) {
+                s = 0.0 - s;
+            }
+            var head : usize = 0;
+            while (head < NUM_HEADS) {
+                const i0 = head * HEAD_DIM + i;
+                const i1 = i0 + ROPE_PAIRS;
+                const x0 = x[i0];
+                const x1 = x[i1];
+                x[i0] = x0 * c - x1 * s;
+                x[i1] = x0 * s + x1 * c;
+                head = head + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // loss = log(sum_j exp(l_j)) - l_target
+    fn cross_entropy(logits: []const f64, target: usize) -> f64 {
+        var max_logit : f64 = logits[0];
+        var j : usize = 1;
+        while (j < logits.len) {
+            if (logits[j] > max_logit) {
+                max_logit = logits[j];
+            }
+            j = j + 1;
+        }
+        var sum : f64 = 0.0;
+        j = 0;
+        while (j < logits.len) {
+            sum = sum + exp(logits[j] - max_logit);
+            j = j + 1;
+        }
+        return log(sum) + max_logit - logits[target];
+    }
+
+    // d loss / d l_j = softmax_j - [j == target]
+    fn cross_entropy_backward(logits: []const f64, target: usize, dl: []f64) -> void {
+        var max_logit : f64 = logits[0];
+        var j : usize = 1;
+        while (j < logits.len) {
+            if (logits[j] > max_logit) {
+                max_logit = logits[j];
+            }
+            j = j + 1;
+        }
+        var sum : f64 = 0.0;
+        j = 0;
+        while (j < logits.len) {
+            dl[j] = exp(logits[j] - max_logit);
+            sum = sum + dl[j];
+            j = j + 1;
+        }
+        j = 0;
+        while (j < logits.len) {
+            dl[j] = dl[j] / sum;
+            j = j + 1;
+        }
+        dl[target] = dl[target] - 1.0;
     }
 
     // ═════════════════════════════════════════════════════════════════
     // 4. Forward pass (one position, causal, KV cache)
     // ═════════════════════════════════════════════════════════════════
 
-    // q, k, v = n1 @ Wq, Wk, Wv; k and v go into the cache at `position`;
-    // per head, softmax(q . k_j * scale) over j <= position weights the v_j;
-    // out = context @ Wo
-    fn attention_forward(layer_idx: usize, position: usize, out: []f64) -> void {
-        const w = &model.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        const ko = (layer_idx * CONTEXT_LEN + position) * EMBED_DIM;
-        ternary_matmul(act_n1[eo..eo + EMBED_DIM], &w.w_q, act_q[eo..eo + EMBED_DIM], EMBED_DIM, EMBED_DIM);
-        ternary_matmul(act_n1[eo..eo + EMBED_DIM], &w.w_k, kv_k[ko..ko + EMBED_DIM], EMBED_DIM, EMBED_DIM);
-        ternary_matmul(act_n1[eo..eo + EMBED_DIM], &w.w_v, kv_v[ko..ko + EMBED_DIM], EMBED_DIM, EMBED_DIM);
+    // q, k, v = alpha (n1 @ Wq, Wk, Wv); RoPE on q and k; k and v go into the
+    // cache at `position`; per head, softmax(q . k_j * scale) over j <= position
+    // weights the v_j; out = alpha_o (context @ Wo)
+    fn attention_forward(block_idx: usize, position: usize, out: []f64) -> void {
+        const w = &model.blocks[block_idx];
+        const eo = block_idx * EMBED_DIM;
+        const ko = (block_idx * CONTEXT_LEN + position) * EMBED_DIM;
+        const n1 = act_n1[eo..eo + EMBED_DIM];
+        const q = act_q[eo..eo + EMBED_DIM];
+        const k = kv_k[ko..ko + EMBED_DIM];
+        const v = kv_v[ko..ko + EMBED_DIM];
+        ternary_matmul(n1, &w.w_q, q, EMBED_DIM, EMBED_DIM);
+        nudge(MAT_Q, block_idx, n1, q, EMBED_DIM);
+        scale_into(q, w.alpha_q, q);
+        ternary_matmul(n1, &w.w_k, k, EMBED_DIM, EMBED_DIM);
+        nudge(MAT_K, block_idx, n1, k, EMBED_DIM);
+        scale_into(k, w.alpha_k, k);
+        ternary_matmul(n1, &w.w_v, v, EMBED_DIM, EMBED_DIM);
+        nudge(MAT_V, block_idx, n1, v, EMBED_DIM);
+        scale_into(v, w.alpha_v, v);
+        rope(q, position, false);
+        rope(k, position, false);
 
         var head : usize = 0;
         while (head < NUM_HEADS) {
             const ho = head * HEAD_DIM;
-            const ao = (layer_idx * NUM_HEADS + head) * CONTEXT_LEN;
+            const ao = (block_idx * NUM_HEADS + head) * CONTEXT_LEN;
             var j : usize = 0;
             while (j <= position) {
-                const kj = (layer_idx * CONTEXT_LEN + j) * EMBED_DIM + ho;
+                const kj = (block_idx * CONTEXT_LEN + j) * EMBED_DIM + ho;
                 var dot : f64 = 0.0;
                 var d : usize = 0;
                 while (d < HEAD_DIM) {
@@ -334,7 +563,7 @@ module HSLM {
                 var acc : f64 = 0.0;
                 var m : usize = 0;
                 while (m <= position) {
-                    acc = acc + act_attn[ao + m] * kv_v[(layer_idx * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
+                    acc = acc + act_attn[ao + m] * kv_v[(block_idx * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
                     m = m + 1;
                 }
                 act_ctx[eo + ho + c] = acc;
@@ -343,182 +572,466 @@ module HSLM {
             head = head + 1;
         }
         ternary_matmul(act_ctx[eo..eo + EMBED_DIM], &w.w_o, out, EMBED_DIM, EMBED_DIM);
+        nudge(MAT_O, block_idx, act_ctx[eo..eo + EMBED_DIM], out, EMBED_DIM);
+        scale_into(out, w.alpha_o, out);
     }
 
-    // f = gelu(n2 @ W1) @ W2
-    fn ffn_forward(layer_idx: usize, out: []f64) -> void {
-        const w = &model.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        const fo = layer_idx * FF_DIM;
-        ternary_matmul(act_n2[eo..eo + EMBED_DIM], &w.w1, act_pre[fo..fo + FF_DIM], EMBED_DIM, FF_DIM);
+    // TernaryDense: h = relu(alpha_up (r @ W_up) + b_up); f = alpha_down (h @ W_down) + b_down
+    fn ffn_forward(block_idx: usize, out: []f64) -> void {
+        const w = &model.blocks[block_idx];
+        const eo = block_idx * EMBED_DIM;
+        const fo = block_idx * FF_DIM;
+        const r = act_r[eo..eo + EMBED_DIM];
+        const pre = act_pre[fo..fo + FF_DIM];
+        ternary_matmul(r, &w.w_up, pre, EMBED_DIM, FF_DIM);
+        nudge(MAT_UP, block_idx, r, pre, FF_DIM);
         var i : usize = 0;
         while (i < FF_DIM) {
-            act_h[fo + i] = gelu(act_pre[fo + i]);
+            act_pre[fo + i] = w.alpha_up * act_pre[fo + i] + w.b_up[i];
+            act_h[fo + i] = relu(act_pre[fo + i]);
             i = i + 1;
         }
-        ternary_matmul(act_h[fo..fo + FF_DIM], &w.w2, out, FF_DIM, EMBED_DIM);
+        ternary_matmul(act_h[fo..fo + FF_DIM], &w.w_down, out, FF_DIM, EMBED_DIM);
+        nudge(MAT_DOWN, block_idx, act_h[fo..fo + FF_DIM], out, EMBED_DIM);
+        i = 0;
+        while (i < EMBED_DIM) {
+            out[i] = w.alpha_down * out[i] + w.b_down[i];
+            i = i + 1;
+        }
     }
 
-    // r = x + attention(rms_norm(x)); out = r + ffn(rms_norm(r))
-    fn hslm_layer_forward(layer_idx: usize, position: usize, input: []const f64, output: []f64) -> void {
-        const w = &model.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        act_pos[layer_idx] = position;
+    // r = x + attention(rms_norm(x)); out = r + ffn(r). The trained block has
+    // no norm in front of the FFN.
+    fn hslm_block_forward(block_idx: usize, position: usize, input: []const f64, output: []f64) -> void {
+        const w = &model.blocks[block_idx];
+        const eo = block_idx * EMBED_DIM;
+        act_pos[block_idx] = position;
         var i : usize = 0;
         while (i < EMBED_DIM) {
             act_x[eo + i] = input[i];
             i = i + 1;
         }
-        act_rms1[layer_idx] = rms_norm_into(input, &w.norm1_gamma, act_n1[eo..eo + EMBED_DIM]);
-        attention_forward(layer_idx, position, output);
+        act_rms1[block_idx] = rms_norm_into(input, &w.norm1_gamma, act_n1[eo..eo + EMBED_DIM]);
+        attention_forward(block_idx, position, output);
         i = 0;
         while (i < EMBED_DIM) {
             act_r[eo + i] = input[i] + output[i];
             i = i + 1;
         }
-        act_rms2[layer_idx] = rms_norm_into(act_r[eo..eo + EMBED_DIM], &w.norm2_gamma, act_n2[eo..eo + EMBED_DIM]);
-        ffn_forward(layer_idx, output);
+        ffn_forward(block_idx, output);
         i = 0;
         while (i < EMBED_DIM) {
             output[i] = act_r[eo + i] + output[i];
             i = i + 1;
         }
+        if (vsa_on) {
+            vsa_block_forward(block_idx, position, output);
+        }
     }
 
-    // All layers at one position; earlier positions must already be in the cache
-    fn hslm_forward(input: []const f64, position: usize, output: []f64) -> void {
-        hslm_layer_forward(0, position, input, act_out[0..EMBED_DIM]);
-        var layer_idx : usize = 1;
-        while (layer_idx < NUM_LAYERS) {
-            const prev = (layer_idx - 1) * EMBED_DIM;
-            const cur = layer_idx * EMBED_DIM;
-            hslm_layer_forward(layer_idx, position, act_out[prev..prev + EMBED_DIM], act_out[cur..cur + EMBED_DIM]);
-            layer_idx = layer_idx + 1;
-        }
-        const last = (NUM_LAYERS - 1) * EMBED_DIM;
+    // n = x / rms(x); logits = alpha_out (n @ W_out) * SACRED_LOGIT_SCALE + b_out
+    fn head_forward(x: []const f64, logits: []f64) -> void {
+        act_hrms = rms_of(x);
         var i : usize = 0;
         while (i < EMBED_DIM) {
-            output[i] = act_out[last + i];
+            act_hn[i] = x[i] / act_hrms;
+            i = i + 1;
+        }
+        ternary_matmul(&act_hn, &model.w_out, logits, EMBED_DIM, VOCAB_SIZE);
+        nudge(MAT_OUT, 0, &act_hn, logits, VOCAB_SIZE);
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            logits[j] = model.alpha_out * logits[j] * SACRED_LOGIT_SCALE + model.b_out[j];
+            j = j + 1;
+        }
+    }
+
+    // Token at one position to logits; earlier positions must already be in
+    // the cache
+    fn hslm_forward(token: usize, position: usize, logits: []f64) -> void {
+        act_token = token;
+        embed_into(token, position, &bw_tmp);
+        if (vsa_on) {
+            vsa_embed(token, position, vsa_in[position * VSA_DIM..(position + 1) * VSA_DIM]);
+        }
+        hslm_block_forward(0, position, &bw_tmp, act_out[0..EMBED_DIM]);
+        var block_idx : usize = 1;
+        while (block_idx < NUM_BLOCKS) {
+            const prev = (block_idx - 1) * EMBED_DIM;
+            const cur = block_idx * EMBED_DIM;
+            hslm_block_forward(block_idx, position, act_out[prev..prev + EMBED_DIM], act_out[cur..cur + EMBED_DIM]);
+            block_idx = block_idx + 1;
+        }
+        const last = (NUM_BLOCKS - 1) * EMBED_DIM;
+        head_forward(act_out[last..last + EMBED_DIM], logits);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4b. The VSA stream and the consciousness gate (model.zig forwardTrain)
+    // ═════════════════════════════════════════════════════════════════
+
+    // The token's base hypervector (embedding.zig trit_table, a PRNG there):
+    // a two-step multiplicative hash mod primes, about 2 in 3 trits nonzero
+    fn vsa_table(token: usize, d: usize) -> Trit {
+        const h1 = ((token * VSA_DIM + d + 1) * 2654435761) % 1000003;
+        const h2 = ((h1 + 7) * 48271) % 2147483647;
+        const m = h2 % 3;
+        if (m == 0) {
+            return Trit.pos;
+        }
+        if (m == 1) {
+            return Trit.neg;
+        }
+        return Trit.zero;
+    }
+
+    // embedTrit: the table row, cyclically permuted by the position.
+    // cyclicPermute (reverse all, reverse [0, shift), reverse [shift, n)) is a
+    // right rotation: out[(i + shift) % n] = in[i]
+    fn vsa_embed(token: usize, position: usize, out: []Trit) -> void {
+        const shift = position % VSA_DIM;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            out[(i + shift) % VSA_DIM] = vsa_table(token, i);
             i = i + 1;
         }
     }
 
+    fn trit_int(t: Trit) -> i64 {
+        if (t == Trit.pos) {
+            return 1;
+        }
+        if (t == Trit.neg) {
+            return 0 - 1;
+        }
+        return 0;
+    }
+
+    fn copy_trits(src: []const Trit, dst: []Trit) -> void {
+        var i : usize = 0;
+        while (i < src.len) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    // cosineSimilarityTrit: integer dot and norms; 0 if either vector is zero
+    fn cosine_trit(a: []const Trit, b: []const Trit) -> f64 {
+        var dot : i64 = 0;
+        var norm_a : i64 = 0;
+        var norm_b : i64 = 0;
+        var i : usize = 0;
+        while (i < a.len) {
+            const x = trit_int(a[i]);
+            const y = trit_int(b[i]);
+            dot = dot + x * y;
+            norm_a = norm_a + x * x;
+            norm_b = norm_b + y * y;
+            i = i + 1;
+        }
+        if (norm_a == 0 or norm_b == 0) {
+            return 0.0;
+        }
+        return @as(f64, @floatFromInt(dot)) / (sqrt(@as(f64, @floatFromInt(norm_a))) * sqrt(@as(f64, @floatFromInt(norm_b))));
+    }
+
+    // @intFromFloat(@max(1.0, x)) for x >= 0: the largest integer w >= 1 with w <= x
+    fn vsa_weight(x: f64) -> i64 {
+        var w : i64 = 1;
+        while (@as(f64, @floatFromInt(w + 1)) <= x) {
+            w = w + 1;
+        }
+        return w;
+    }
+
+    // Majority vote: the sign of each accumulator
+    fn majority_vote(accum: []const i64, out: []Trit) -> void {
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            if (accum[d] > 0) {
+                out[d] = Trit.pos;
+            } else if (accum[d] < 0) {
+                out[d] = Trit.neg;
+            } else {
+                out[d] = Trit.zero;
+            }
+            d = d + 1;
+        }
+    }
+
+    // VSAAttention.forwardCausal over the block's input hypervectors 0..position:
+    // query, keys and values are all that sequence. max_sim leaves out the
+    // query's own position (it falls back to the self-similarity at position 0);
+    // the context bundles every value with a positive score, weight
+    // int(max(1, 10 score)), then takes the majority vote
+    fn vsa_attention(block_idx: usize, position: usize) -> f64 {
+        const base = block_idx * CONTEXT_LEN * VSA_DIM;
+        const qo = base + position * VSA_DIM;
+        var i : usize = 0;
+        while (i <= position) {
+            const ko = base + i * VSA_DIM;
+            vsa_sim[i] = cosine_trit(vsa_in[qo..qo + VSA_DIM], vsa_in[ko..ko + VSA_DIM]);
+            i = i + 1;
+        }
+        var max_sim : f64 = 0.0 - 1.0;
+        i = 0;
+        while (i < position) {
+            if (vsa_sim[i] > max_sim) {
+                max_sim = vsa_sim[i];
+            }
+            i = i + 1;
+        }
+        if (position == 0) {
+            max_sim = vsa_sim[0];
+        }
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            vsa_accum[d] = 0;
+            d = d + 1;
+        }
+        i = 0;
+        while (i <= position) {
+            const score = vsa_sim[i];
+            if (score > 0.0) {
+                const w = vsa_weight(score * 10.0);
+                const vo = base + i * VSA_DIM;
+                d = 0;
+                while (d < VSA_DIM) {
+                    vsa_accum[d] = vsa_accum[d] + trit_int(vsa_in[vo + d]) * w;
+                    d = d + 1;
+                }
+            }
+            i = i + 1;
+        }
+        majority_vote(&vsa_accum, &vsa_ctx);
+        return max_sim;
+    }
+
+    fn gate_reset() -> void {
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            gate_total[b] = 0;
+            gate_conscious[b] = 0;
+            gate_ema[b] = 0.0;
+            b = b + 1;
+        }
+    }
+
+    // ConsciousnessGate.isConscious: count, EMA 0.1, fire when max_sim >= phi^-1
+    fn gate_is_conscious(block_idx: usize, max_sim: f64) -> bool {
+        gate_total[block_idx] = gate_total[block_idx] + 1;
+        gate_ema[block_idx] = GATE_EMA * max_sim + (1.0 - GATE_EMA) * gate_ema[block_idx];
+        const activated = max_sim >= PHI_INV;
+        if (activated) {
+            gate_conscious[block_idx] = gate_conscious[block_idx] + 1;
+        }
+        return activated;
+    }
+
+    // bindVec: element-wise trit product
+    fn vsa_bind(a: []const Trit, b: []const Trit, out: []Trit) -> void {
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            const p = trit_int(a[d]) * trit_int(b[d]);
+            if (p > 0) {
+                out[d] = Trit.pos;
+            } else if (p < 0) {
+                out[d] = Trit.neg;
+            } else {
+                out[d] = Trit.zero;
+            }
+            d = d + 1;
+        }
+    }
+
+    // Reasoning.forward: temp2 = analogy(current, context, current)
+    // = bind(bind(context, current), current); out = blend([context, temp2],
+    // [0.618, 0.382]) with integer weights int(max(1, 10 |w|)) = 6 and 3
+    fn vsa_reasoning(current: []const Trit, context: []const Trit, out: []Trit) -> void {
+        vsa_bind(context, current, &vsa_temp);
+        vsa_bind(&vsa_temp, current, &vsa_temp2);
+        const w0 = vsa_weight(0.618 * 10.0);
+        const w1 = vsa_weight(0.382 * 10.0);
+        var d : usize = 0;
+        while (d < VSA_DIM) {
+            vsa_accum[d] = trit_int(context[d]) * w0 + trit_int(vsa_temp2[d]) * w1;
+            d = d + 1;
+        }
+        majority_vote(&vsa_accum, out);
+    }
+
+    // projectVsaToEmbed: dim i is the mean of trits 4i .. 4i + 3 (1024 / 243 = 4,
+    // so trits 972 .. 1023 are never read)
+    fn project_vsa(v: []const Trit, i: usize) -> f64 {
+        const start = i * VSA_RATIO;
+        var sum : f64 = 0.0;
+        var j : usize = start;
+        while (j < start + VSA_RATIO) {
+            sum = sum + @as(f64, @floatFromInt(trit_int(v[j])));
+            j = j + 1;
+        }
+        return sum / @as(f64, @floatFromInt(VSA_RATIO));
+    }
+
+    // After the block's float output: VSA attention, the gate, and when it fires
+    // the reasoning step and output += 0.1 * project(reasoned). The block's
+    // output hypervector (reasoned or context) is the next block's input.
+    fn vsa_block_forward(block_idx: usize, position: usize, output: []f64) -> void {
+        const max_sim = vsa_attention(block_idx, position);
+        vsa_max_sim[block_idx] = max_sim;
+        const qo = (block_idx * CONTEXT_LEN + position) * VSA_DIM;
+        const vo = block_idx * VSA_DIM;
+        const fired = gate_is_conscious(block_idx, max_sim);
+        vsa_fired[block_idx] = fired;
+        if (fired) {
+            vsa_reasoning(vsa_in[qo..qo + VSA_DIM], &vsa_ctx, &vsa_reasoned);
+            var i : usize = 0;
+            while (i < EMBED_DIM) {
+                output[i] = output[i] + project_vsa(&vsa_reasoned, i) * VSA_GAIN;
+                i = i + 1;
+            }
+            copy_trits(&vsa_reasoned, vsa_out[vo..vo + VSA_DIM]);
+        } else {
+            copy_trits(&vsa_ctx, vsa_out[vo..vo + VSA_DIM]);
+        }
+        if (block_idx + 1 < NUM_BLOCKS) {
+            const no = ((block_idx + 1) * CONTEXT_LEN + position) * VSA_DIM;
+            copy_trits(vsa_out[vo..vo + VSA_DIM], vsa_in[no..no + VSA_DIM]);
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════
-    // 5. Backward pass (the last position each layer processed)
+    // 5. Backward pass (the last position each block processed)
     // ═════════════════════════════════════════════════════════════════
     //
-    // The gradient is that of the current position's output. Keys and values
+    // The gradient is that of the current position's logits. Keys and values
     // of earlier positions are cached constants: no gradient flows into them.
     // The `grads` argument of the backward functions carries the ternary weights
-    // the gradient flows back through; the f64 gradients land in gw_*, g_gamma*.
+    // the gradient flows back through; the f64 gradients land in gw_*, g_*.
 
     fn zero_weight_gradients() -> void {
         fill(&gw_q, 0.0);
         fill(&gw_k, 0.0);
         fill(&gw_v, 0.0);
         fill(&gw_o, 0.0);
-        fill(&gw_1, 0.0);
-        fill(&gw_2, 0.0);
+        fill(&gw_up, 0.0);
+        fill(&gw_down, 0.0);
+        fill(&gw_out, 0.0);
         fill(&g_gamma1, 0.0);
-        fill(&g_gamma2, 0.0);
+        fill(&g_b_up, 0.0);
+        fill(&g_b_down, 0.0);
+        fill(&g_b_out, 0.0);
+        fill(&g_embed, 0.0);
     }
 
-    // grad_input = d loss / d input, given grad_output = d loss / d output
-    fn hslm_backward(grad_output: []const f64, grad_input: []f64) -> void {
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            bw_out[i] = grad_output[i];
-            i = i + 1;
-        }
-        var layer_idx : usize = NUM_LAYERS;
-        while (layer_idx > 0) {
-            layer_idx = layer_idx - 1;
-            hslm_layer_backward(&model, layer_idx);
-            i = 0;
-            while (i < EMBED_DIM) {
-                bw_out[i] = bw_x[i];
-                i = i + 1;
+    // grad_input = d loss / d embedded input, given grad_logits = d loss / d logits;
+    // the input gradient also lands in the token's embedding row
+    fn hslm_backward(grad_logits: []const f64, grad_input: []f64) -> void {
+        head_backward(&model, grad_logits);
+        var block_idx : usize = NUM_BLOCKS;
+        while (block_idx > 0) {
+            block_idx = block_idx - 1;
+            hslm_block_backward(&model, block_idx);
+            var c : usize = 0;
+            while (c < EMBED_DIM) {
+                bw_out[c] = bw_x[c];
+                c = c + 1;
             }
         }
-        i = 0;
+        var i : usize = 0;
         while (i < EMBED_DIM) {
             grad_input[i] = bw_x[i];
+            g_embed[act_token * EMBED_DIM + i] = g_embed[act_token * EMBED_DIM + i] + bw_x[i];
             i = i + 1;
         }
     }
 
-    // bw_out -> bw_x through FFN, RMSNorm 2, attention, RMSNorm 1 and both residuals
-    fn hslm_layer_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
-        ffn_backward(grads, layer_idx);
-        attention_backward(grads, layer_idx);
+    // logits -> bw_out (d loss / d last block output): bias, W_out, plain RMSNorm
+    fn head_backward(grads: *HSLMWeights, grad_logits: []const f64) -> void {
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            g_b_out[j] = g_b_out[j] + grad_logits[j];
+            bw_dz[j] = grads.alpha_out * SACRED_LOGIT_SCALE * grad_logits[j];
+            j = j + 1;
+        }
+        outer_add(&act_hn, &bw_dz, &gw_out, EMBED_DIM, VOCAB_SIZE);
+        fill(&bw_n, 0.0);
+        ternary_matmul_t_add(&bw_dz, &grads.w_out, &bw_n, EMBED_DIM, VOCAB_SIZE);
+        const last = (NUM_BLOCKS - 1) * EMBED_DIM;
+        rms_norm_plain_backward(act_out[last..last + EMBED_DIM], act_hrms, &bw_n, &bw_out);
     }
 
-    // bw_out -> bw_r = bw_out + d loss / d r through the FFN and RMSNorm 2
-    fn ffn_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
-        const w = &grads.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        ffn_backward_w2(grads, layer_idx);
-        gelu_backward(layer_idx);
-        ffn_backward_w1(grads, layer_idx);
-        rms_norm_backward(act_r[eo..eo + EMBED_DIM], &w.norm2_gamma, act_rms2[layer_idx], &bw_n, &bw_tmp, g_gamma2[eo..eo + EMBED_DIM]);
+    // bw_out -> bw_x through the FFN, attention, RMSNorm and both residuals
+    fn hslm_block_backward(grads: *HSLMWeights, block_idx: usize) -> void {
+        ffn_backward(grads, block_idx);
+        attention_backward(grads, block_idx);
+    }
+
+    // bw_out -> bw_r = bw_out + d loss / d r through the FFN
+    fn ffn_backward(grads: *HSLMWeights, block_idx: usize) -> void {
+        const w = &grads.blocks[block_idx];
+        const eo = block_idx * EMBED_DIM;
+        const fo = block_idx * FF_DIM;
+        const go = block_idx * FF_DIM * EMBED_DIM;
+        // f = alpha_down (h @ W_down) + b_down
         var i : usize = 0;
         while (i < EMBED_DIM) {
-            bw_r[i] = bw_out[i] + bw_tmp[i];
+            g_b_down[eo + i] = g_b_down[eo + i] + bw_out[i];
             i = i + 1;
         }
-    }
-
-    // f = h @ W2: dW2 += h (x) bw_out, bw_h = W2^T bw_out
-    fn ffn_backward_w2(grads: *HSLMWeights, layer_idx: usize) -> void {
-        const w = &grads.layers[layer_idx];
-        const fo = layer_idx * FF_DIM;
-        const go = layer_idx * FF_DIM * EMBED_DIM;
-        outer_add(act_h[fo..fo + FF_DIM], &bw_out, gw_2[go..go + FF_DIM * EMBED_DIM], FF_DIM, EMBED_DIM);
+        scale_into(&bw_out, w.alpha_down, &bw_se);
+        outer_add(act_h[fo..fo + FF_DIM], &bw_se, gw_down[go..go + FF_DIM * EMBED_DIM], FF_DIM, EMBED_DIM);
         fill(&bw_h, 0.0);
-        ternary_matmul_t_add(&bw_out, &w.w2, &bw_h, FF_DIM, EMBED_DIM);
+        ternary_matmul_t_add(&bw_se, &w.w_down, &bw_h, FF_DIM, EMBED_DIM);
+        relu_backward(block_idx);
+        // pre = alpha_up (r @ W_up) + b_up
+        i = 0;
+        while (i < FF_DIM) {
+            g_b_up[fo + i] = g_b_up[fo + i] + bw_pre[i];
+            i = i + 1;
+        }
+        scale_into(&bw_pre, w.alpha_up, &bw_sf);
+        outer_add(act_r[eo..eo + EMBED_DIM], &bw_sf, gw_up[go..go + EMBED_DIM * FF_DIM], EMBED_DIM, FF_DIM);
+        i = 0;
+        while (i < EMBED_DIM) {
+            bw_r[i] = bw_out[i];
+            i = i + 1;
+        }
+        ternary_matmul_t_add(&bw_sf, &w.w_up, &bw_r, EMBED_DIM, FF_DIM);
     }
 
-    // h = gelu(pre): bw_pre = gelu'(pre) * bw_h
-    fn gelu_backward(layer_idx: usize) -> void {
-        const fo = layer_idx * FF_DIM;
+    // h = relu(pre): bw_pre = relu'(pre) * bw_h
+    fn relu_backward(block_idx: usize) -> void {
+        const fo = block_idx * FF_DIM;
         var i : usize = 0;
         while (i < FF_DIM) {
-            bw_pre[i] = gelu_derivative(act_pre[fo + i]) * bw_h[i];
+            bw_pre[i] = relu_derivative(act_pre[fo + i]) * bw_h[i];
             i = i + 1;
         }
     }
 
-    // pre = n2 @ W1: dW1 += n2 (x) bw_pre, bw_n = W1^T bw_pre
-    fn ffn_backward_w1(grads: *HSLMWeights, layer_idx: usize) -> void {
-        const w = &grads.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        const go = layer_idx * EMBED_DIM * FF_DIM;
-        outer_add(act_n2[eo..eo + EMBED_DIM], &bw_pre, gw_1[go..go + EMBED_DIM * FF_DIM], EMBED_DIM, FF_DIM);
-        fill(&bw_n, 0.0);
-        ternary_matmul_t_add(&bw_pre, &w.w1, &bw_n, EMBED_DIM, FF_DIM);
-    }
+    // bw_r -> bw_x: Wo, softmax, the current position's q, k, v, RoPE,
+    // Wq/Wk/Wv, RMSNorm, and the residual around the block
+    fn attention_backward(grads: *HSLMWeights, block_idx: usize) -> void {
+        const w = &grads.blocks[block_idx];
+        const eo = block_idx * EMBED_DIM;
+        const go = block_idx * EMBED_DIM * EMBED_DIM;
+        const position = act_pos[block_idx];
 
-    // bw_r -> bw_x: Wo, softmax, the current position's q, k, v, Wq/Wk/Wv,
-    // RMSNorm 1, and the residual around the block
-    fn attention_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
-        const w = &grads.layers[layer_idx];
-        const eo = layer_idx * EMBED_DIM;
-        const go = layer_idx * EMBED_DIM * EMBED_DIM;
-        const position = act_pos[layer_idx];
-
-        outer_add(act_ctx[eo..eo + EMBED_DIM], &bw_r, gw_o[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
+        scale_into(&bw_r, w.alpha_o, &bw_se);
+        outer_add(act_ctx[eo..eo + EMBED_DIM], &bw_se, gw_o[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
         fill(&bw_ctx, 0.0);
-        ternary_matmul_t_add(&bw_r, &w.w_o, &bw_ctx, EMBED_DIM, EMBED_DIM);
+        ternary_matmul_t_add(&bw_se, &w.w_o, &bw_ctx, EMBED_DIM, EMBED_DIM);
 
         var head : usize = 0;
         while (head < NUM_HEADS) {
             const ho = head * HEAD_DIM;
-            const ao = (layer_idx * NUM_HEADS + head) * CONTEXT_LEN;
+            const ao = (block_idx * NUM_HEADS + head) * CONTEXT_LEN;
             // da_j = dctx . v_j, then the softmax: ds_j = a_j (da_j - sum_m a_m da_m)
             var mean_da : f64 = 0.0;
             var j : usize = 0;
             while (j <= position) {
-                const vj = (layer_idx * CONTEXT_LEN + j) * EMBED_DIM + ho;
+                const vj = (block_idx * CONTEXT_LEN + j) * EMBED_DIM + ho;
                 var dot : f64 = 0.0;
                 var d : usize = 0;
                 while (d < HEAD_DIM) {
@@ -540,7 +1053,7 @@ module HSLM {
                 var acc : f64 = 0.0;
                 var m : usize = 0;
                 while (m <= position) {
-                    acc = acc + bw_da[m] * kv_k[(layer_idx * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
+                    acc = acc + bw_da[m] * kv_k[(block_idx * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
                     m = m + 1;
                 }
                 bw_q[ho + c] = SACRED_ATTN_SCALE * acc;
@@ -551,15 +1064,24 @@ module HSLM {
             head = head + 1;
         }
 
-        outer_add(act_n1[eo..eo + EMBED_DIM], &bw_q, gw_q[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
-        outer_add(act_n1[eo..eo + EMBED_DIM], &bw_k, gw_k[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
-        outer_add(act_n1[eo..eo + EMBED_DIM], &bw_v, gw_v[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
+        // Back through RoPE (a rotation: its transpose is the inverse), then
+        // through the alphas: d (x @ W) = alpha * d y
+        rope(&bw_q, position, true);
+        rope(&bw_k, position, true);
+        scale_into(&bw_q, w.alpha_q, &bw_q);
+        scale_into(&bw_k, w.alpha_k, &bw_k);
+        scale_into(&bw_v, w.alpha_v, &bw_v);
+
+        const n1 = act_n1[eo..eo + EMBED_DIM];
+        outer_add(n1, &bw_q, gw_q[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
+        outer_add(n1, &bw_k, gw_k[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
+        outer_add(n1, &bw_v, gw_v[go..go + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM);
         fill(&bw_n, 0.0);
         ternary_matmul_t_add(&bw_q, &w.w_q, &bw_n, EMBED_DIM, EMBED_DIM);
         ternary_matmul_t_add(&bw_k, &w.w_k, &bw_n, EMBED_DIM, EMBED_DIM);
         ternary_matmul_t_add(&bw_v, &w.w_v, &bw_n, EMBED_DIM, EMBED_DIM);
 
-        rms_norm_backward(act_x[eo..eo + EMBED_DIM], &w.norm1_gamma, act_rms1[layer_idx], &bw_n, &bw_tmp, g_gamma1[eo..eo + EMBED_DIM]);
+        rms_norm_backward(act_x[eo..eo + EMBED_DIM], &w.norm1_gamma, act_rms1[block_idx], &bw_n, &bw_tmp, g_gamma1[eo..eo + EMBED_DIM]);
         var i : usize = 0;
         while (i < EMBED_DIM) {
             bw_x[i] = bw_r[i] + bw_tmp[i];
@@ -586,13 +1108,25 @@ module HSLM {
     // 7. Test probes
     // ═════════════════════════════════════════════════════════════════
 
-    var probe_x : [EMBED_DIM]f64 = undefined;
-    var probe_out : [EMBED_DIM]f64 = undefined;
-    var probe_up : [EMBED_DIM]f64 = undefined;
-    var probe_gin : [EMBED_DIM]f64 = undefined;
+    // Position 0 holds TOKEN_FIRST; position 1, the probed one, TOKEN_PROBE.
+    // A target of VOCAB_SIZE means the linear loss sum_j logits_j * upstream(j);
+    // a smaller one, cross-entropy against that token.
+    const TOKEN_FIRST : usize = 5;
+    const TOKEN_PROBE : usize = 42;
+    const LINEAR_LOSS : usize = 729;
+    const PROBE_TARGET : usize = 3;
 
-    // About 2 in 9 trits nonzero, a different pattern per matrix and layer.
-    // A multiplicative hash mod a prime: 243 and 972 are multiples of 9, so a
+    var probe_vec : [EMBED_DIM]f64 = undefined;
+    var probe_logits : [VOCAB_SIZE]f64 = undefined;
+    var probe_dl : [VOCAB_SIZE]f64 = undefined;
+    var probe_gin : [EMBED_DIM]f64 = undefined;
+    // The position and token probe_loss and probe_backward run; a check that
+    // moves them puts them back
+    var probe_position : usize = 1;
+    var probe_token : usize = TOKEN_PROBE;
+
+    // About 2 in 9 trits nonzero, a different pattern per matrix and block.
+    // A multiplicative hash mod a prime: 243 and 729 are multiples of 9, so a
     // linear pattern mod 9 repeats down every column (measured: whole columns
     // of one trit, and weight gradients that were exactly zero).
     fn trit_pattern(seed: usize) -> Trit {
@@ -614,180 +1148,455 @@ module HSLM {
         }
     }
 
-    // Small gains keep the attention scores and GELU inputs near 1, where the
-    // softmax and GELU are far from saturated
-    fn init_model(gain: f64) -> void {
-        var l : usize = 0;
-        while (l < NUM_LAYERS) {
-            const w = &model.layers[l];
-            const salt = l * 1000003;
+    // A small signed pattern in [-scale/2, scale/2)
+    fn small(seed: usize, scale: f64) -> f64 {
+        return scale * (@as(f64, @floatFromInt((seed * 7) % 13)) / 13.0 - 0.5);
+    }
+
+    // Alphas below 1 (a TWN alpha is a mean |shadow weight|) keep the
+    // attention scores and the ReLU inputs near 1; none is 1, so a dropped
+    // alpha shows in the gradient checks
+    fn init_model() -> void {
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            const w = &model.blocks[b];
+            const salt = b * 1000003;
             init_matrix(&w.w_q, salt + 11);
             init_matrix(&w.w_k, salt + 23);
             init_matrix(&w.w_v, salt + 37);
             init_matrix(&w.w_o, salt + 41);
-            init_matrix(&w.w1, salt + 53);
-            init_matrix(&w.w2, salt + 67);
+            init_matrix(&w.w_up, salt + 53);
+            init_matrix(&w.w_down, salt + 67);
             var i : usize = 0;
             while (i < EMBED_DIM) {
-                w.norm1_gamma[i] = gain * (1.0 + 0.01 * @as(f64, @floatFromInt(i % 7)));
-                w.norm2_gamma[i] = gain * (1.0 + 0.01 * @as(f64, @floatFromInt(i % 5)));
+                w.norm1_gamma[i] = 0.5 * (1.0 + 0.01 * @as(f64, @floatFromInt(i % 7)));
+                w.b_down[i] = small(i + b * 3 + 1, 0.04);
                 i = i + 1;
             }
-            l = l + 1;
+            i = 0;
+            while (i < FF_DIM) {
+                w.b_up[i] = small(i + b * 5 + 2, 0.1);
+                i = i + 1;
+            }
+            w.alpha_q = 0.1;
+            w.alpha_k = 0.11;
+            w.alpha_v = 0.09;
+            w.alpha_o = 0.8;
+            w.alpha_up = 0.1;
+            w.alpha_down = 0.15;
+            b = b + 1;
         }
+        init_matrix(&model.w_out, 3 * 1000003 + 79);
+        var e : usize = 0;
+        while (e < VOCAB_SIZE * EMBED_DIM) {
+            model.embed[e] = small(e, 0.12);
+            e = e + 1;
+        }
+        e = 0;
+        while (e < VOCAB_SIZE) {
+            model.b_out[e] = small(e + 4, 0.02);
+            e = e + 1;
+        }
+        model.alpha_out = 0.5;
+        nudge_which = MAT_NONE;
+        nudge_delta = 0.0;
     }
 
-    fn set_trit(which: u8, layer_idx: usize, index: usize, t: Trit) -> void {
-        const w = &model.layers[layer_idx];
-        if (which == MAT_Q) {
-            w.w_q[index] = t;
-        } else if (which == MAT_K) {
-            w.w_k[index] = t;
-        } else if (which == MAT_V) {
-            w.w_v[index] = t;
-        } else if (which == MAT_O) {
-            w.w_o[index] = t;
-        } else if (which == MAT_W1) {
-            w.w1[index] = t;
-        } else {
-            w.w2[index] = t;
-        }
+    // The linear loss's upstream gradient
+    fn upstream(j: usize) -> f64 {
+        return 0.01 * @as(f64, @floatFromInt((j * 5) % 11)) - 0.05;
     }
 
-    fn weight_gradient(which: u8, layer_idx: usize, index: usize) -> f64 {
-        if (which == MAT_Q) {
-            return gw_q[layer_idx * EMBED_DIM * EMBED_DIM + index];
-        }
-        if (which == MAT_K) {
-            return gw_k[layer_idx * EMBED_DIM * EMBED_DIM + index];
-        }
-        if (which == MAT_V) {
-            return gw_v[layer_idx * EMBED_DIM * EMBED_DIM + index];
-        }
-        if (which == MAT_O) {
-            return gw_o[layer_idx * EMBED_DIM * EMBED_DIM + index];
-        }
-        if (which == MAT_W1) {
-            return gw_1[layer_idx * EMBED_DIM * FF_DIM + index];
-        }
-        return gw_2[layer_idx * FF_DIM * EMBED_DIM + index];
+    fn probe_run(position: usize, token: usize) -> void {
+        hslm_forward(token, position, &probe_logits);
     }
 
-    // The upstream gradient: loss = sum_i out_i * upstream(i)
-    fn upstream(i: usize) -> f64 {
-        return 0.01 * @as(f64, @floatFromInt((i * 5) % 11)) - 0.05;
-    }
-
-    // Run one position with input element k moved by delta
-    fn probe_run(position: usize, k: usize, delta: f64) -> void {
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            probe_x[i] = 0.1 * @as(f64, @floatFromInt((i * 3 + position * 7) % 13)) - 0.6;
-            i = i + 1;
+    fn probe_loss(target: usize) -> f64 {
+        probe_run(probe_position, probe_token);
+        if (target < VOCAB_SIZE) {
+            return cross_entropy(&probe_logits, target);
         }
-        probe_x[k] = probe_x[k] + delta;
-        hslm_forward(&probe_x, position, &probe_out);
-    }
-
-    // The same, returning the loss
-    fn probe_loss(position: usize, k: usize, delta: f64) -> f64 {
-        probe_run(position, k, delta);
         var loss : f64 = 0.0;
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            loss = loss + probe_out[i] * upstream(i);
-            i = i + 1;
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            loss = loss + probe_logits[j] * upstream(j);
+            j = j + 1;
         }
         return loss;
     }
 
-    // Model at gain 0.05 with position 0 in the cache; position 1 is probed
+    // The probe model with position 0 in the cache; position 1 is probed
     fn probe_setup() -> void {
-        init_model(0.05);
-        probe_run(0, 0, 0.0);
+        init_model();
+        probe_run(0, TOKEN_FIRST);
     }
 
-    // Forward position 1 at the unperturbed point, then backward from upstream
-    fn probe_backward() -> void {
-        probe_run(1, 0, 0.0);
+    // Forward position 1 at the unperturbed point, then backward from the loss
+    fn probe_backward(target: usize) -> void {
+        probe_run(probe_position, probe_token);
         zero_weight_gradients();
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            probe_up[i] = upstream(i);
-            i = i + 1;
-        }
-        hslm_backward(&probe_up, &probe_gin);
-    }
-
-    fn input_slope(k: usize) -> f64 {
-        probe_setup();
-        return (probe_loss(1, k, 0.0001) - probe_loss(1, k, -0.0001)) / 0.0002;
-    }
-
-    fn input_gradient(k: usize) -> f64 {
-        probe_setup();
-        probe_backward();
-        return probe_gin[k];
-    }
-
-    // Flip one trit to +1 and -1 (position 0 cached with it at 0):
-    // (loss(+1) - loss(-1)) / 2
-    fn weight_slope(which: u8, layer_idx: usize, index: usize) -> f64 {
-        init_model(0.05);
-        set_trit(which, layer_idx, index, Trit.zero);
-        probe_run(0, 0, 0.0);
-        set_trit(which, layer_idx, index, Trit.pos);
-        const lp = probe_loss(1, 0, 0.0);
-        set_trit(which, layer_idx, index, Trit.neg);
-        const lm = probe_loss(1, 0, 0.0);
-        return (lp - lm) / 2.0;
-    }
-
-    fn weight_grad_at(which: u8, layer_idx: usize, index: usize) -> f64 {
-        init_model(0.05);
-        set_trit(which, layer_idx, index, Trit.zero);
-        probe_run(0, 0, 0.0);
-        probe_backward();
-        return weight_gradient(which, layer_idx, index);
-    }
-
-    fn gamma_slope(second: bool, layer_idx: usize, index: usize) -> f64 {
-        probe_setup();
-        const w = &model.layers[layer_idx];
-        var g0 : f64 = w.norm1_gamma[index];
-        if (second) {
-            g0 = w.norm2_gamma[index];
-        }
-        if (second) {
-            w.norm2_gamma[index] = g0 + 0.00001;
+        if (target < VOCAB_SIZE) {
+            cross_entropy_backward(&probe_logits, target, &probe_dl);
         } else {
-            w.norm1_gamma[index] = g0 + 0.00001;
+            var j : usize = 0;
+            while (j < VOCAB_SIZE) {
+                probe_dl[j] = upstream(j);
+                j = j + 1;
+            }
         }
-        const lp = probe_loss(1, 0, 0.0);
-        if (second) {
-            w.norm2_gamma[index] = g0 - 0.00001;
-        } else {
-            w.norm1_gamma[index] = g0 - 0.00001;
-        }
-        const lm = probe_loss(1, 0, 0.0);
+        hslm_backward(&probe_dl, &probe_gin);
+    }
+
+    // Embedding entry k of the probed token, moved by +-1e-5
+    fn embed_slope(k: usize, target: usize) -> f64 {
+        probe_setup();
+        const e0 = model.embed[probe_token * EMBED_DIM + k];
+        model.embed[probe_token * EMBED_DIM + k] = e0 + 0.00001;
+        const lp = probe_loss(target);
+        model.embed[probe_token * EMBED_DIM + k] = e0 - 0.00001;
+        const lm = probe_loss(target);
+        model.embed[probe_token * EMBED_DIM + k] = e0;
         return (lp - lm) / 0.00002;
     }
 
-    fn gamma_gradient(second: bool, layer_idx: usize, index: usize) -> f64 {
+    fn embed_gradient(k: usize, target: usize) -> f64 {
         probe_setup();
-        probe_backward();
-        if (second) {
-            return g_gamma2[layer_idx * EMBED_DIM + index];
-        }
-        return g_gamma1[layer_idx * EMBED_DIM + index];
+        probe_backward(target);
+        return g_embed[probe_token * EMBED_DIM + k];
     }
 
-    // gelu_backward on layer 2 with pre = x and an upstream gradient of 3
-    fn gelu_backward_at(x: f64) -> f64 {
+    // The input gradient hslm_backward returns is the embedding row's
+    fn input_gradient(k: usize) -> f64 {
+        probe_setup();
+        probe_backward(LINEAR_LOSS);
+        return probe_gin[k];
+    }
+
+    // One ternary weight nudged by +-1e-5 as a real number, position 1 only
+    fn nudge_slope(which: u8, block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        nudge_which = which;
+        nudge_block = block_idx;
+        nudge_index = index;
+        nudge_delta = 0.00001;
+        const lp = probe_loss(LINEAR_LOSS);
+        nudge_delta = -0.00001;
+        const lm = probe_loss(LINEAR_LOSS);
+        nudge_which = MAT_NONE;
+        nudge_delta = 0.0;
+        return (lp - lm) / 0.00002;
+    }
+
+    fn weight_gradient(which: u8, block_idx: usize, index: usize) -> f64 {
+        if (which == MAT_Q) {
+            return gw_q[block_idx * EMBED_DIM * EMBED_DIM + index];
+        }
+        if (which == MAT_K) {
+            return gw_k[block_idx * EMBED_DIM * EMBED_DIM + index];
+        }
+        if (which == MAT_V) {
+            return gw_v[block_idx * EMBED_DIM * EMBED_DIM + index];
+        }
+        if (which == MAT_O) {
+            return gw_o[block_idx * EMBED_DIM * EMBED_DIM + index];
+        }
+        if (which == MAT_UP) {
+            return gw_up[block_idx * EMBED_DIM * FF_DIM + index];
+        }
+        if (which == MAT_DOWN) {
+            return gw_down[block_idx * FF_DIM * EMBED_DIM + index];
+        }
+        return gw_out[index];
+    }
+
+    fn weight_grad_at(which: u8, block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        probe_backward(LINEAR_LOSS);
+        return weight_gradient(which, block_idx, index);
+    }
+
+    fn set_trit(which: u8, block_idx: usize, index: usize, t: Trit) -> void {
+        if (which == MAT_OUT) {
+            model.w_out[index] = t;
+        } else {
+            model.blocks[block_idx].w_down[index] = t;
+        }
+    }
+
+    // Flip one trit (W_out or W_down) to +1 and -1, position 0 cached with it
+    // at 0: (loss(+1) - loss(-1)) / 2
+    fn flip_slope(which: u8, block_idx: usize, index: usize) -> f64 {
+        init_model();
+        set_trit(which, block_idx, index, Trit.zero);
+        probe_run(0, TOKEN_FIRST);
+        set_trit(which, block_idx, index, Trit.pos);
+        const lp = probe_loss(LINEAR_LOSS);
+        set_trit(which, block_idx, index, Trit.neg);
+        const lm = probe_loss(LINEAR_LOSS);
+        return (lp - lm) / 2.0;
+    }
+
+    fn flip_grad_at(which: u8, block_idx: usize, index: usize) -> f64 {
+        init_model();
+        set_trit(which, block_idx, index, Trit.zero);
+        probe_run(0, TOKEN_FIRST);
+        probe_backward(LINEAR_LOSS);
+        return weight_gradient(which, block_idx, index);
+    }
+
+    fn gamma_slope(block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        const w = &model.blocks[block_idx];
+        const g0 = w.norm1_gamma[index];
+        w.norm1_gamma[index] = g0 + 0.00001;
+        const lp = probe_loss(LINEAR_LOSS);
+        w.norm1_gamma[index] = g0 - 0.00001;
+        const lm = probe_loss(LINEAR_LOSS);
+        w.norm1_gamma[index] = g0;
+        return (lp - lm) / 0.00002;
+    }
+
+    fn gamma_gradient(block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        probe_backward(LINEAR_LOSS);
+        return g_gamma1[block_idx * EMBED_DIM + index];
+    }
+
+    fn set_bias(kind: u8, block_idx: usize, index: usize, value: f64) -> void {
+        if (kind == BIAS_UP) {
+            model.blocks[block_idx].b_up[index] = value;
+        } else if (kind == BIAS_DOWN) {
+            model.blocks[block_idx].b_down[index] = value;
+        } else {
+            model.b_out[index] = value;
+        }
+    }
+
+    fn get_bias(kind: u8, block_idx: usize, index: usize) -> f64 {
+        if (kind == BIAS_UP) {
+            return model.blocks[block_idx].b_up[index];
+        }
+        if (kind == BIAS_DOWN) {
+            return model.blocks[block_idx].b_down[index];
+        }
+        return model.b_out[index];
+    }
+
+    fn bias_slope(kind: u8, block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        const b0 = get_bias(kind, block_idx, index);
+        set_bias(kind, block_idx, index, b0 + 0.00001);
+        const lp = probe_loss(LINEAR_LOSS);
+        set_bias(kind, block_idx, index, b0 - 0.00001);
+        const lm = probe_loss(LINEAR_LOSS);
+        set_bias(kind, block_idx, index, b0);
+        return (lp - lm) / 0.00002;
+    }
+
+    fn bias_gradient(kind: u8, block_idx: usize, index: usize) -> f64 {
+        probe_setup();
+        probe_backward(LINEAR_LOSS);
+        if (kind == BIAS_UP) {
+            return g_b_up[block_idx * FF_DIM + index];
+        }
+        if (kind == BIAS_DOWN) {
+            return g_b_down[block_idx * EMBED_DIM + index];
+        }
+        return g_b_out[index];
+    }
+
+    // The first hidden unit of a block whose pre-activation at the probed
+    // position is above `margin` (active) or below -margin (dead); FF_DIM if none
+    fn first_unit(block_idx: usize, active: bool, margin: f64) -> usize {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        var j : usize = 0;
+        while (j < FF_DIM) {
+            const pre = act_pre[block_idx * FF_DIM + j];
+            if (active and pre > margin) {
+                return j;
+            }
+            if (active == false and pre < 0.0 - margin) {
+                return j;
+            }
+            j = j + 1;
+        }
+        return FF_DIM;
+    }
+
+    // W_up entry (row, an active unit): its gradient is not trivially zero
+    fn active_up_index(block_idx: usize, row: usize) -> usize {
+        return row * FF_DIM + first_unit(block_idx, true, 0.1);
+    }
+
+    // relu_backward on block 2 with pre = x and an upstream gradient of 3
+    fn relu_backward_at(x: f64) -> f64 {
         act_pre[2 * FF_DIM + 7] = x;
         bw_h[7] = 3.0;
-        gelu_backward(2);
+        relu_backward(2);
         return bw_pre[7];
+    }
+
+    // The ReLU kills a dead unit's output: count units of block 0 with h == 0
+    // where pre <= 0, and with h == pre where pre > 0
+    fn relu_mismatches() -> usize {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        var bad : usize = 0;
+        var j : usize = 0;
+        while (j < FF_DIM) {
+            const pre = act_pre[j];
+            const h = act_h[j];
+            if (pre > 0.0 and h != pre) {
+                bad = bad + 1;
+            }
+            if (pre <= 0.0 and h != 0.0) {
+                bad = bad + 1;
+            }
+            j = j + 1;
+        }
+        return bad;
+    }
+
+    fn dead_units(block_idx: usize) -> usize {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        var dead : usize = 0;
+        var j : usize = 0;
+        while (j < FF_DIM) {
+            if (act_h[block_idx * FF_DIM + j] == 0.0) {
+                dead = dead + 1;
+            }
+            j = j + 1;
+        }
+        return dead;
+    }
+
+    // embed_into minus the table row: the position encoding alone
+    fn embed_probe(token: usize, position: usize, i: usize) -> f64 {
+        init_model();
+        embed_into(token, position, &probe_vec);
+        return probe_vec[i] - model.embed[token * EMBED_DIM + i];
+    }
+
+    // |rope(x)|^2 - |x|^2 at a position, and rope then its inverse, for a
+    // fixed x
+    fn rope_norm_change(position: usize) -> f64 {
+        var before : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            probe_vec[i] = small(i * 3 + 1, 2.0);
+            before = before + probe_vec[i] * probe_vec[i];
+            i = i + 1;
+        }
+        rope(&probe_vec, position, false);
+        var after : f64 = 0.0;
+        i = 0;
+        while (i < EMBED_DIM) {
+            after = after + probe_vec[i] * probe_vec[i];
+            i = i + 1;
+        }
+        return after - before;
+    }
+
+    fn rope_round_trip_gap(position: usize) -> f64 {
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            probe_vec[i] = small(i * 3 + 1, 2.0);
+            i = i + 1;
+        }
+        rope(&probe_vec, position, false);
+        rope(&probe_vec, position, true);
+        var gap : f64 = 0.0;
+        i = 0;
+        while (i < EMBED_DIM) {
+            gap = gap + @abs(probe_vec[i] - small(i * 3 + 1, 2.0));
+            i = i + 1;
+        }
+        return gap;
+    }
+
+    // Element i of rope(e_k) for a unit vector e_k
+    fn rope_unit(position: usize, k: usize, i: usize) -> f64 {
+        fill(&probe_vec, 0.0);
+        probe_vec[k] = 1.0;
+        rope(&probe_vec, position, false);
+        return probe_vec[i];
+    }
+
+    // Head logit j with W_out set to zero: alpha_out * 0 * scale + b_out[j]
+    fn head_bias_only(j: usize) -> f64 {
+        init_model();
+        var i : usize = 0;
+        while (i < EMBED_DIM * VOCAB_SIZE) {
+            model.w_out[i] = Trit.zero;
+            i = i + 1;
+        }
+        probe_run(0, TOKEN_FIRST);
+        return probe_logits[j] - model.b_out[j];
+    }
+
+    // Logit j minus b_out[j], divided by alpha_out * SACRED_LOGIT_SCALE: the
+    // raw n @ W_out, recomputed by hand for column j
+    fn head_scale_gap(j: usize) -> f64 {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        var z : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            const w = model.w_out[i * VOCAB_SIZE + j];
+            if (w == Trit.pos) {
+                z = z + act_hn[i];
+            } else if (w == Trit.neg) {
+                z = z - act_hn[i];
+            }
+            i = i + 1;
+        }
+        return probe_logits[j] - (0.5 * z * SACRED_LOGIT_SCALE + model.b_out[j]);
+    }
+
+    // RMS of the head's normalized vector: 1 up to eps
+    fn head_norm_rms() -> f64 {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        return rms_of(&act_hn);
+    }
+
+    fn ce_uniform() -> f64 {
+        fill(&probe_logits, 0.3);
+        return cross_entropy(&probe_logits, 17);
+    }
+
+    fn ce_pattern(j: usize, delta: f64) -> f64 {
+        var i : usize = 0;
+        while (i < VOCAB_SIZE) {
+            probe_logits[i] = 0.1 * @as(f64, @floatFromInt((i * 7) % 17)) - 0.8;
+            i = i + 1;
+        }
+        probe_logits[j] = probe_logits[j] + delta;
+        return cross_entropy(&probe_logits, PROBE_TARGET);
+    }
+
+    fn ce_slope(j: usize) -> f64 {
+        return (ce_pattern(j, 0.00001) - ce_pattern(j, -0.00001)) / 0.00002;
+    }
+
+    fn ce_gradient(j: usize) -> f64 {
+        const unused = ce_pattern(j, 0.0);
+        cross_entropy_backward(&probe_logits, PROBE_TARGET, &probe_dl);
+        return probe_dl[j] + 0.0 * unused;
+    }
+
+    fn ce_gradient_sum() -> f64 {
+        const unused = ce_pattern(0, 0.0);
+        cross_entropy_backward(&probe_logits, PROBE_TARGET, &probe_dl);
+        var sum : f64 = 0.0;
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            sum = sum + probe_dl[j];
+            j = j + 1;
+        }
+        return sum + 0.0 * unused;
     }
 
     fn rms_norm_probe(index: usize) -> f64 {
@@ -828,40 +1637,40 @@ module HSLM {
         return output[index];
     }
 
-    // Sum of the softmax weights of layer 0, head 1, after position 1
+    // Sum of the softmax weights of block 0, head 1, after position 1
     fn attention_weight_sum() -> f64 {
         probe_setup();
-        probe_run(1, 0, 0.0);
+        probe_run(1, TOKEN_PROBE);
         const ao = (0 * NUM_HEADS + 1) * CONTEXT_LEN;
         return act_attn[ao] + act_attn[ao + 1];
     }
 
     fn attention_weight(j: usize) -> f64 {
         probe_setup();
-        probe_run(1, 0, 0.0);
+        probe_run(1, TOKEN_PROBE);
         return act_attn[(0 * NUM_HEADS + 1) * CONTEXT_LEN + j];
     }
 
     // At position 0 a head can only attend to itself: its context is v_0
     fn self_attention_gap() -> f64 {
-        init_model(0.05);
-        probe_run(0, 0, 0.0);
+        init_model();
+        probe_run(0, TOKEN_FIRST);
         var gap : f64 = 0.0;
         var i : usize = 0;
         while (i < EMBED_DIM) {
-            gap = gap + @abs(act_ctx[3 * EMBED_DIM + i] - kv_v[(3 * CONTEXT_LEN + 0) * EMBED_DIM + i]);
+            gap = gap + @abs(act_ctx[2 * EMBED_DIM + i] - kv_v[(2 * CONTEXT_LEN + 0) * EMBED_DIM + i]);
             i = i + 1;
         }
         return gap;
     }
 
-    // The output of position 1 depends on what position 0 left in the cache
+    // The output of position 1 depends on which token position 0 left in the cache
     fn context_effect() -> f64 {
-        init_model(0.05);
-        probe_run(0, 0, 0.0);
-        const with_first = probe_loss(1, 0, 0.0);
-        probe_run(0, 0, 0.5);
-        const with_other_first = probe_loss(1, 0, 0.0);
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        const with_first = probe_loss(LINEAR_LOSS);
+        probe_run(0, 600);
+        const with_other_first = probe_loss(LINEAR_LOSS);
         return with_first - with_other_first;
     }
 
@@ -869,6 +1678,309 @@ module HSLM {
         hslm_phase(PHASE_FORWARD);
         hslm_phase(phase);
         return get_hslm_mode();
+    }
+
+    // ── Probes for the VSA stream (section 4b) ──
+
+    var vsa_a : [VSA_DIM]Trit = undefined;
+    var vsa_b : [VSA_DIM]Trit = undefined;
+    var block_out_scratch : [EMBED_DIM]f64 = undefined;
+
+    fn trit_mismatches(a: []const Trit, b: []const Trit) -> usize {
+        var bad : usize = 0;
+        var i : usize = 0;
+        while (i < a.len) {
+            if (a[i] != b[i]) {
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    fn zero_trits(t: []Trit) -> void {
+        var i : usize = 0;
+        while (i < t.len) {
+            t[i] = Trit.zero;
+            i = i + 1;
+        }
+    }
+
+    // A token's hypervector against itself (kind 0), its negation (1), zero (2)
+    fn cosine_probe(kind: u8) -> f64 {
+        vsa_embed(TOKEN_PROBE, 0, &vsa_a);
+        if (kind == 0) {
+            copy_trits(&vsa_a, &vsa_b);
+        } else if (kind == 1) {
+            var d : usize = 0;
+            while (d < VSA_DIM) {
+                if (vsa_a[d] == Trit.pos) {
+                    vsa_b[d] = Trit.neg;
+                } else if (vsa_a[d] == Trit.neg) {
+                    vsa_b[d] = Trit.pos;
+                } else {
+                    vsa_b[d] = Trit.zero;
+                }
+                d = d + 1;
+            }
+        } else {
+            zero_trits(&vsa_b);
+        }
+        return cosine_trit(&vsa_a, &vsa_b);
+    }
+
+    // The embedded hypervector against the table row rotated right by position
+    fn rotation_mismatches(position: usize) -> usize {
+        vsa_embed(TOKEN_PROBE, position, &vsa_a);
+        var bad : usize = 0;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            if (vsa_a[(i + position) % VSA_DIM] != vsa_table(TOKEN_PROBE, i)) {
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    fn rotation_moves(position: usize) -> usize {
+        vsa_embed(TOKEN_PROBE, 0, &vsa_a);
+        vsa_embed(TOKEN_PROBE, position, &vsa_b);
+        return trit_mismatches(&vsa_a, &vsa_b);
+    }
+
+    fn table_nonzero(token: usize) -> usize {
+        var n : usize = 0;
+        var i : usize = 0;
+        while (i < VSA_DIM) {
+            if (vsa_table(token, i) != Trit.zero) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    fn gate_probe(max_sim: f64) -> bool {
+        gate_reset();
+        return gate_is_conscious(0, max_sim);
+    }
+
+    // Three gate calls, 0.617, phi^-1, 0.9: total * 100 + conscious * 10 + fired
+    fn gate_counts() -> usize {
+        gate_reset();
+        var fired : usize = 0;
+        if (gate_is_conscious(1, 0.617)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(1, PHI_INV)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(1, 0.9)) {
+            fired = fired + 1;
+        }
+        return gate_total[1] * 100 + gate_conscious[1] * 10 + fired;
+    }
+
+    // The gate's EMA after max_sim 1.0, then 0.5: 0.1 * 0.5 + 0.9 * 0.1
+    fn gate_ema_probe() -> f64 {
+        gate_reset();
+        var fired : usize = 0;
+        if (gate_is_conscious(2, 1.0)) {
+            fired = fired + 1;
+        }
+        if (gate_is_conscious(2, 0.5)) {
+            fired = fired + 1;
+        }
+        if (fired != 1) {
+            return 0.0 - 1.0;
+        }
+        return gate_ema[2];
+    }
+
+    fn reasoning_inputs() -> void {
+        vsa_embed(TOKEN_PROBE, 3, &vsa_a);
+        vsa_embed(TOKEN_FIRST, 0, &vsa_b);
+    }
+
+    // Reasoning.forward against its context input
+    fn reasoning_mismatches() -> usize {
+        reasoning_inputs();
+        vsa_reasoning(&vsa_a, &vsa_b, &vsa_reasoned);
+        return trit_mismatches(&vsa_reasoned, &vsa_b);
+    }
+
+    fn reasoning_input_gap() -> usize {
+        reasoning_inputs();
+        return trit_mismatches(&vsa_a, &vsa_b);
+    }
+
+    // Trits 968 .. 971 at +1, trit 0 and the unread 972 and 1023 at -1
+    fn projection_probe(i: usize) -> f64 {
+        zero_trits(&vsa_a);
+        vsa_a[0] = Trit.neg;
+        vsa_a[968] = Trit.pos;
+        vsa_a[969] = Trit.pos;
+        vsa_a[970] = Trit.pos;
+        vsa_a[971] = Trit.pos;
+        vsa_a[972] = Trit.neg;
+        vsa_a[1023] = Trit.neg;
+        return project_vsa(&vsa_a, i);
+    }
+
+    // Blocks whose gate fired at position 0
+    fn fired_at_zero() -> usize {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        var n : usize = 0;
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            if (vsa_fired[b]) {
+                n = n + 1;
+            }
+            b = b + 1;
+        }
+        return n;
+    }
+
+    // At position 0 every block's output hypervector is its input
+    fn stream_identity_at_zero() -> usize {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        var bad : usize = 0;
+        var b : usize = 0;
+        while (b < NUM_BLOCKS) {
+            const io = b * CONTEXT_LEN * VSA_DIM;
+            bad = bad + trit_mismatches(vsa_out[b * VSA_DIM..(b + 1) * VSA_DIM], vsa_in[io..io + VSA_DIM]);
+            b = b + 1;
+        }
+        return bad;
+    }
+
+    // The next block's input at position 1 is the block's output hypervector
+    fn stream_hand_off_gap() -> usize {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        var bad : usize = 0;
+        var b : usize = 0;
+        while (b + 1 < NUM_BLOCKS) {
+            const io = ((b + 1) * CONTEXT_LEN + 1) * VSA_DIM;
+            bad = bad + trit_mismatches(vsa_out[b * VSA_DIM..(b + 1) * VSA_DIM], vsa_in[io..io + VSA_DIM]);
+            b = b + 1;
+        }
+        return bad;
+    }
+
+    // Block 0's output at a position, VSA stream on minus off
+    fn vsa_on_minus_off(position: usize, token: usize, i: usize) -> f64 {
+        probe_setup();
+        probe_run(position, token);
+        save_block_out();
+        vsa_on = false;
+        probe_run(position, token);
+        vsa_on = true;
+        return block_out_scratch[i] - act_out[i];
+    }
+
+    // Keep block 0's output aside before the stream-off run overwrites it
+    fn save_block_out() -> void {
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            block_out_scratch[i] = act_out[i];
+            i = i + 1;
+        }
+    }
+
+    // Position 0, block 0: on minus off against 0.1 * project(the token's
+    // hypervector), summed over the dims
+    fn vsa_offset_gap() -> f64 {
+        init_model();
+        probe_run(0, TOKEN_FIRST);
+        save_block_out();
+        vsa_on = false;
+        probe_run(0, TOKEN_FIRST);
+        vsa_on = true;
+        vsa_embed(TOKEN_FIRST, 0, &vsa_a);
+        var gap : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            gap = gap + @abs((block_out_scratch[i] - act_out[i]) - project_vsa(&vsa_a, i) * VSA_GAIN);
+            i = i + 1;
+        }
+        return gap;
+    }
+
+    fn vsa_offset_size() -> f64 {
+        vsa_embed(TOKEN_FIRST, 0, &vsa_a);
+        var size : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            size = size + @abs(project_vsa(&vsa_a, i) * VSA_GAIN);
+            i = i + 1;
+        }
+        return size;
+    }
+
+    // Position 1: block 0's gate and its similarity
+    fn block0_fired_at_one() -> bool {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        return vsa_fired[0];
+    }
+
+    fn block0_sim_at_one() -> f64 {
+        probe_setup();
+        probe_run(1, TOKEN_PROBE);
+        return vsa_max_sim[0];
+    }
+
+    fn block0_gap_at_one() -> f64 {
+        var gap : f64 = 0.0;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            gap = gap + @abs(vsa_on_minus_off(1, TOKEN_PROBE, i));
+            i = i + 27;
+        }
+        return gap;
+    }
+
+    // The gradient checks at position 0, where every gate fires
+    fn at_position_zero(on: bool) -> void {
+        if (on) {
+            probe_position = 0;
+            probe_token = TOKEN_FIRST;
+        } else {
+            probe_position = 1;
+            probe_token = TOKEN_PROBE;
+        }
+    }
+
+    fn embed_slope0(k: usize, target: usize) -> f64 {
+        at_position_zero(true);
+        const s = embed_slope(k, target);
+        at_position_zero(false);
+        return s;
+    }
+
+    fn embed_gradient0(k: usize, target: usize) -> f64 {
+        at_position_zero(true);
+        const g = embed_gradient(k, target);
+        at_position_zero(false);
+        return g;
+    }
+
+    fn gamma_slope0(block_idx: usize, index: usize) -> f64 {
+        at_position_zero(true);
+        const s = gamma_slope(block_idx, index);
+        at_position_zero(false);
+        return s;
+    }
+
+    fn gamma_gradient0(block_idx: usize, index: usize) -> f64 {
+        at_position_zero(true);
+        const g = gamma_gradient(block_idx, index);
+        at_position_zero(false);
+        return g;
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -909,31 +2021,96 @@ module HSLM {
         when c1 = matmul_rect_probe(1)
         then c0 == -2.0 and c1 == -2.0
 
-    test hslm_gelu_values
-        given at_one = gelu(1.0)
-        when at_minus_one = gelu(-1.0)
-        then @abs(at_one - 0.8411919906) < 0.0000001 and @abs(at_minus_one + 0.1588080094) < 0.0000001 and gelu(0.0) == 0.0
+    // ── Embedding: table row + phi position encoding ──
 
-    // #7778: the derivative against a central difference at -2.0, 0.0 and 1.5
-    test hslm_gelu_derivative_matches_finite_difference
-        given at_minus_two = (gelu(-2.0 + 0.00001) - gelu(-2.0 - 0.00001)) / 0.00002
-        when at_zero = (gelu(0.00001) - gelu(-0.00001)) / 0.00002
-        then @abs(gelu_derivative(-2.0) - at_minus_two) < 0.000001 and @abs(gelu_derivative(0.0) - at_zero) < 0.000001 and @abs(gelu_derivative(1.5) - (gelu(1.5 + 0.00001) - gelu(1.5 - 0.00001)) / 0.00002) < 0.000001
+    // Position 0: sin(0) on even dims, cos(0) on odd dims
+    test hslm_position_encoding_at_zero
+        given even = embed_probe(TOKEN_PROBE, 0, 100)
+        when odd = embed_probe(TOKEN_PROBE, 0, 101)
+        then even == 0.0 and @abs(odd - 1.0) < 0.000000000000001
 
-    test hslm_gelu_derivative_at_zero_is_one_half
-        given d = gelu_derivative(0.0)
-        then d == 0.5
+    // Position 1, dims 0 and 1: angle 3/pi; position 5, dim 100:
+    // sin(5 phi^(-100/243) 3/pi); position 26, dims 241 and 242 share t = 240/243
+    test hslm_position_encoding_values
+        given p1 = embed_probe(TOKEN_PROBE, 1, 0)
+        when p26 = embed_probe(TOKEN_PROBE, 26, 242)
+        then @abs(p1 - 0.8162731085894214) < 0.000000000001 and @abs(embed_probe(7, 1, 1) - 0.5776661771246112) < 0.000000000001 and @abs(embed_probe(7, 5, 100) + 0.6999082937334531) < 0.000000000001 and @abs(p26 - 0.32677817087282596) < 0.000000000001 and @abs(embed_probe(7, 26, 241) + 0.9632684200661288) < 0.000000000001
 
-    test hslm_gelu_backward_scales_upstream_by_slope
-        given y = gelu_backward_at(1.5)
-        when slope = 3.0 * (gelu(1.5 + 0.00001) - gelu(1.5 - 0.00001)) / 0.00002
-        then @abs(y - slope) < 0.000001
+    // The position encoding does not depend on the token
+    test hslm_position_encoding_is_token_independent
+        given a = embed_probe(0, 9, 33)
+        when b = embed_probe(728, 9, 33)
+        then @abs(a - b) < 0.000000000000001 and @abs(a) > 0.01
 
-    // gelu_backward multiplies the upstream gradient by gelu'(pre)
-    test hslm_gelu_backward_uses_gelu_derivative
-        given at_minus_two = gelu_backward_at(-2.0)
-        when at_zero = gelu_backward_at(0.0)
-        then @abs(at_minus_two - 3.0 * gelu_derivative(-2.0)) < 0.000000001 and at_zero == 1.5
+    // ── phi-RoPE ──
+
+    test hslm_rope_is_identity_at_position_zero
+        given same = rope_unit(0, 10, 10)
+        when other = rope_unit(0, 10, 50)
+        then same == 1.0 and other == 0.0
+
+    // Pair (10, 50) at position 3: angle 3 phi^(-20/81)
+    test hslm_rope_rotates_pair_i_with_i_plus_40
+        given c = rope_unit(3, 10, 10)
+        when s = rope_unit(3, 10, 50)
+        then @abs(c + 0.8880621352130498) < 0.000000000001 and @abs(s - 0.4597234429533031) < 0.000000000001 and rope_unit(3, 80, 80) == 1.0 and rope_unit(3, 161, 161) == 1.0
+
+    test hslm_rope_preserves_norm_and_inverts
+        given change = rope_norm_change(19)
+        when gap = rope_round_trip_gap(19)
+        then @abs(change) < 0.000000001 and gap < 0.000000001
+
+    // ── TernaryDense: ReLU, biases ──
+
+    test hslm_relu_values
+        given pos = relu(1.5)
+        when neg = relu(-2.0)
+        then pos == 1.5 and neg == 0.0 and relu(0.0) == 0.0
+
+    test hslm_relu_backward_masks_dead_units
+        given live = relu_backward_at(1.5)
+        when dead = relu_backward_at(-0.5)
+        then live == 3.0 and dead == 0.0 and relu_backward_at(0.0) == 0.0
+
+    // The forward pass applies the ReLU to every unit, and the probe model
+    // has both live and dead units in every block
+    test hslm_ffn_relu_applied
+        given bad = relu_mismatches()
+        when dead = dead_units(0)
+        then bad == 0 and dead > 100 and dead < 629 and dead_units(2) > 100 and dead_units(2) < 629
+
+    // ── Head: plain RMSNorm, W_out, alpha, 1 / 243^(phi^-3), bias ──
+
+    test hslm_head_rmsnorm_has_unit_rms
+        given rms = head_norm_rms()
+        then @abs(rms - 1.0) < 0.000001
+
+    test hslm_head_logit_is_scaled_matmul_plus_bias
+        given gap = head_scale_gap(100)
+        when gap_last = head_scale_gap(728)
+        then @abs(gap) < 0.000000000001 and @abs(gap_last) < 0.000000000001
+
+    test hslm_head_with_zero_weights_is_the_bias
+        given rest = head_bias_only(250)
+        then rest == 0.0
+
+    // ── Cross-entropy ──
+
+    // Equal logits: loss = ln 729
+    test hslm_cross_entropy_uniform_is_ln_vocab
+        given loss = ce_uniform()
+        then @abs(loss - 6.591673732008658) < 0.000000000001
+
+    test hslm_cross_entropy_gradient_matches_finite_difference
+        given at_target = ce_gradient(PROBE_TARGET)
+        when other = ce_gradient(200)
+        then @abs(at_target - ce_slope(PROBE_TARGET)) < 0.00000001 and @abs(other - ce_slope(200)) < 0.00000001 and at_target < -0.9 and other > 0.0
+
+    test hslm_cross_entropy_gradient_sums_to_zero
+        given total = ce_gradient_sum()
+        then @abs(total) < 0.000000000001
+
+    // ── Attention ──
 
     test hslm_attention_softmax_sums_to_one
         given total = attention_weight_sum()
@@ -948,65 +2125,118 @@ module HSLM {
         given effect = context_effect()
         then @abs(effect) > 0.000001
 
-    // Through all six layers: d loss / d input against a central difference
-    test hslm_backward_input_gradient_matches_finite_difference
-        given slope = input_slope(5)
-        when grad = input_gradient(5)
+    // ── Backward pass against central differences ──
+
+    // Through the head and all three blocks: d loss / d embedding entry
+    test hslm_backward_embedding_gradient_matches_finite_difference
+        given slope = embed_slope(5, LINEAR_LOSS)
+        when grad = embed_gradient(5, LINEAR_LOSS)
         then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
 
-    test hslm_backward_input_gradient_second_element
-        given slope = input_slope(200)
-        when grad = input_gradient(200)
+    test hslm_backward_embedding_gradient_second_element
+        given slope = embed_slope(200, LINEAR_LOSS)
+        when grad = embed_gradient(200, LINEAR_LOSS)
         then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
 
-    // The loss is linear in the last layer's W2, so the trit flip is exact.
-    // Measured on the lab (2026-10-18): input and gain gradients agree with the
-    // central difference to 2e-11, W2 to 1e-16, the other trit flips to 7e-4
-    // relative (the flip is a step of 1, so curvature shows).
-    test hslm_ffn_backward_w2_matches_trit_flip
-        given slope = weight_slope(MAT_W2, NUM_LAYERS - 1, 100 * EMBED_DIM + 7)
-        when grad = weight_grad_at(MAT_W2, NUM_LAYERS - 1, 100 * EMBED_DIM + 7)
+    // The trainer's loss: cross-entropy against the next token
+    test hslm_backward_cross_entropy_matches_finite_difference
+        given slope = embed_slope(77, PROBE_TARGET)
+        when grad = embed_gradient(77, PROBE_TARGET)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    // The input gradient hslm_backward returns is the one the embedding row gets
+    test hslm_backward_input_gradient_is_embedding_row
+        given gin = input_gradient(5)
+        when grad = embed_gradient(5, LINEAR_LOSS)
+        then gin == grad and @abs(gin) > 0.000001
+
+    // The loss is linear in W_out, so the trit flip is exact
+    test hslm_head_w_out_matches_trit_flip
+        given slope = flip_slope(MAT_OUT, 0, 100 * VOCAB_SIZE + 7)
+        when grad = flip_grad_at(MAT_OUT, 0, 100 * VOCAB_SIZE + 7)
         then @abs(grad - slope) < 0.000000000001 and @abs(slope) > 0.000001
 
-    test hslm_ffn_backward_w1_matches_trit_flip
-        given slope = weight_slope(MAT_W1, NUM_LAYERS - 1, 9 * FF_DIM + 40)
-        when grad = weight_grad_at(MAT_W1, NUM_LAYERS - 1, 9 * FF_DIM + 40)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    test hslm_attention_backward_wo_matches_trit_flip
-        given slope = weight_slope(MAT_O, NUM_LAYERS - 1, 12 * EMBED_DIM + 30)
-        when grad = weight_grad_at(MAT_O, NUM_LAYERS - 1, 12 * EMBED_DIM + 30)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    test hslm_attention_backward_wq_matches_trit_flip
-        given slope = weight_slope(MAT_Q, NUM_LAYERS - 1, 20 * EMBED_DIM + 90)
-        when grad = weight_grad_at(MAT_Q, NUM_LAYERS - 1, 20 * EMBED_DIM + 90)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    test hslm_attention_backward_wk_matches_trit_flip
-        given slope = weight_slope(MAT_K, NUM_LAYERS - 1, 20 * EMBED_DIM + 90)
-        when grad = weight_grad_at(MAT_K, NUM_LAYERS - 1, 20 * EMBED_DIM + 90)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    test hslm_attention_backward_wv_matches_trit_flip
-        given slope = weight_slope(MAT_V, NUM_LAYERS - 1, 20 * EMBED_DIM + 170)
-        when grad = weight_grad_at(MAT_V, NUM_LAYERS - 1, 20 * EMBED_DIM + 170)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    // A first-layer weight: the gradient crosses five more layers
-    test hslm_backward_first_layer_w1_matches_trit_flip
-        given slope = weight_slope(MAT_W1, 0, 3 * FF_DIM + 500)
-        when grad = weight_grad_at(MAT_W1, 0, 3 * FF_DIM + 500)
-        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
-
-    test hslm_backward_norm1_gamma_matches_finite_difference
-        given slope = gamma_slope(false, 2, 17)
-        when grad = gamma_gradient(false, 2, 17)
+    test hslm_head_w_out_matches_nudge
+        given slope = nudge_slope(MAT_OUT, 0, 31 * VOCAB_SIZE + 500)
+        when grad = weight_grad_at(MAT_OUT, 0, 31 * VOCAB_SIZE + 500)
         then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
 
-    test hslm_backward_norm2_gamma_matches_finite_difference
-        given slope = gamma_slope(true, 4, 101)
-        when grad = gamma_gradient(true, 4, 101)
+    // d loss / d b_out[j] is the upstream gradient itself
+    test hslm_head_bias_gradient_is_upstream
+        given slope = bias_slope(BIAS_OUT, 0, 300)
+        when grad = bias_gradient(BIAS_OUT, 0, 300)
+        then grad == upstream(300) and @abs(grad - slope) < 0.000000001 and @abs(slope) > 0.000001
+
+    test hslm_ffn_backward_w_down_matches_trit_flip
+        given slope = flip_slope(MAT_DOWN, NUM_BLOCKS - 1, first_unit(NUM_BLOCKS - 1, true, 0.1) * EMBED_DIM + 7)
+        when grad = flip_grad_at(MAT_DOWN, NUM_BLOCKS - 1, first_unit(NUM_BLOCKS - 1, true, 0.1) * EMBED_DIM + 7)
+        then @abs(grad - slope) < 0.002 * @abs(slope) and @abs(slope) > 0.0000005
+
+    test hslm_ffn_backward_w_down_matches_nudge
+        given slope = nudge_slope(MAT_DOWN, NUM_BLOCKS - 1, first_unit(NUM_BLOCKS - 1, true, 0.1) * EMBED_DIM + 30)
+        when grad = weight_grad_at(MAT_DOWN, NUM_BLOCKS - 1, first_unit(NUM_BLOCKS - 1, true, 0.1) * EMBED_DIM + 30)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_ffn_backward_w_up_matches_nudge
+        given slope = nudge_slope(MAT_UP, NUM_BLOCKS - 1, active_up_index(NUM_BLOCKS - 1, 20))
+        when grad = weight_grad_at(MAT_UP, NUM_BLOCKS - 1, active_up_index(NUM_BLOCKS - 1, 20))
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    // A first-block weight: the gradient crosses two more blocks and the head
+    test hslm_backward_first_block_w_up_matches_nudge
+        given slope = nudge_slope(MAT_UP, 0, active_up_index(0, 3))
+        when grad = weight_grad_at(MAT_UP, 0, active_up_index(0, 3))
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_attention_backward_wo_matches_nudge
+        given slope = nudge_slope(MAT_O, NUM_BLOCKS - 1, 12 * EMBED_DIM + 30)
+        when grad = weight_grad_at(MAT_O, NUM_BLOCKS - 1, 12 * EMBED_DIM + 30)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_attention_backward_wq_matches_nudge
+        given slope = nudge_slope(MAT_Q, NUM_BLOCKS - 1, 20 * EMBED_DIM + 90)
+        when grad = weight_grad_at(MAT_Q, NUM_BLOCKS - 1, 20 * EMBED_DIM + 90)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.0000001
+
+    test hslm_attention_backward_wk_matches_nudge
+        given slope = nudge_slope(MAT_K, NUM_BLOCKS - 1, 20 * EMBED_DIM + 90)
+        when grad = weight_grad_at(MAT_K, NUM_BLOCKS - 1, 20 * EMBED_DIM + 90)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.0000001
+
+    test hslm_attention_backward_wv_matches_nudge
+        given slope = nudge_slope(MAT_V, NUM_BLOCKS - 1, 20 * EMBED_DIM + 170)
+        when grad = weight_grad_at(MAT_V, NUM_BLOCKS - 1, 20 * EMBED_DIM + 170)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_attention_backward_first_block_wq_matches_nudge
+        given slope = nudge_slope(MAT_Q, 0, 40 * EMBED_DIM + 15)
+        when grad = weight_grad_at(MAT_Q, 0, 40 * EMBED_DIM + 15)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.0000001
+
+    test hslm_backward_b_up_matches_finite_difference
+        given slope = bias_slope(BIAS_UP, 0, first_unit(0, true, 0.1))
+        when grad = bias_gradient(BIAS_UP, 0, first_unit(0, true, 0.1))
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    // A dead unit passes no gradient, and moving its bias changes nothing
+    test hslm_backward_b_up_dead_unit_is_zero
+        given slope = bias_slope(BIAS_UP, 1, first_unit(1, false, 0.1))
+        when grad = bias_gradient(BIAS_UP, 1, first_unit(1, false, 0.1))
+        then slope == 0.0 and grad == 0.0 and first_unit(1, false, 0.1) < FF_DIM
+
+    test hslm_backward_b_down_matches_finite_difference
+        given slope = bias_slope(BIAS_DOWN, 1, 111)
+        when grad = bias_gradient(BIAS_DOWN, 1, 111)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_backward_norm1_gamma_matches_finite_difference
+        given slope = gamma_slope(0, 17)
+        when grad = gamma_gradient(0, 17)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_backward_last_block_gamma_matches_finite_difference
+        given slope = gamma_slope(NUM_BLOCKS - 1, 101)
+        when grad = gamma_gradient(NUM_BLOCKS - 1, 101)
         then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
 
     invariant hslm_embedding_dimensional_consistency
@@ -1015,15 +2245,129 @@ module HSLM {
     invariant hslm_head_dim_is_three_pow_four
         assert HEAD_DIM == 3 * 3 * 3 * 3
 
-    invariant hslm_ffn_expansion_ratio
-        assert FF_DIM == 4 * EMBED_DIM
+    invariant hslm_three_trinity_blocks
+        assert NUM_BLOCKS == 3
 
-    invariant hslm_context_fits_cache
-        assert CONTEXT_LEN == HEAD_DIM
+    invariant hslm_ffn_is_three_pow_six
+        assert FF_DIM == 3 * EMBED_DIM and VOCAB_SIZE == FF_DIM
+
+    // EXP-012: the context divides the head dimension; EXP-014: it is a power of 3
+    invariant hslm_context_divides_head_dim
+        assert CONTEXT_LEN == 3 * 3 * 3 and HEAD_DIM % CONTEXT_LEN == 0
+
+    invariant hslm_rope_pairs_leave_one_dim
+        assert 2 * ROPE_PAIRS + 1 == HEAD_DIM
 
     invariant hslm_phase_constants_are_unique
         assert PHASE_FORWARD != PHASE_BACKWARD and PHASE_BACKWARD != PHASE_UPDATE and PHASE_FORWARD != PHASE_UPDATE
 
     invariant hslm_attention_scale_is_sacred
         assert SACRED_ATTN_SCALE > 0.3543788 and SACRED_ATTN_SCALE < 0.3543789
+
+    invariant hslm_logit_scale_is_sacred
+        assert SACRED_LOGIT_SCALE > 0.2734228 and SACRED_LOGIT_SCALE < 0.2734229
+
+    invariant hslm_linear_loss_marker_is_vocab
+        assert LINEAR_LOSS == VOCAB_SIZE and PROBE_TARGET < VOCAB_SIZE and TOKEN_PROBE < VOCAB_SIZE
+
+    // ── VSA stream: hypervectors, attention, the consciousness gate ──
+
+    test hslm_vsa_cosine_values
+        given same = cosine_probe(0)
+        when flipped = cosine_probe(1)
+        then @abs(same - 1.0) < 0.000000000000001 and @abs(flipped + 1.0) < 0.000000000000001 and cosine_probe(2) == 0.0
+
+    // The token hypervector is about 2 in 3 nonzero, and position p rotates
+    // it right by p
+    test hslm_vsa_embed_rotates_by_position
+        given at0 = rotation_mismatches(0)
+        when at5 = rotation_mismatches(5)
+        then at0 == 0 and at5 == 0 and rotation_moves(5) > 100 and table_nonzero(TOKEN_PROBE) > 600 and table_nonzero(TOKEN_PROBE) < 770
+
+    // The gate fires at max_sim >= phi^-1 and not below
+    test hslm_vsa_gate_threshold_is_phi_inverse
+        given below = gate_probe(0.617)
+        when at = gate_probe(PHI_INV)
+        then below == false and at and gate_probe(0.62)
+
+    // Three calls, two of them at or above phi^-1: total 3, conscious 2, fired 2
+    test hslm_vsa_gate_counts
+        given n = gate_counts()
+        when again = gate_counts()
+        then n == 322 and again == 322
+
+    // EMA 0.1: 0.1 * 1.0 = 0.1, then 0.1 * 0.5 + 0.9 * 0.1 = 0.14
+    test hslm_vsa_gate_ema
+        given ema = gate_ema_probe()
+        when same = gate_ema_probe()
+        then @abs(ema - 0.14) < 0.000000000000001 and ema == same
+
+    // int(max(1, 10 score)): the floor, at least 1
+    test hslm_vsa_attention_weight_is_floor_at_least_one
+        given small = vsa_weight(0.5)
+        when mid = vsa_weight(3.5)
+        then small == 1 and mid == 3 and vsa_weight(10.0) == 10 and vsa_weight(9.9) == 9 and vsa_weight(6.18) == 6 and vsa_weight(3.82) == 3
+
+    // Reasoning.forward as trained returns its context: bind(bind(c, x), x)
+    // is c where x is nonzero and 0 elsewhere, and 6 c + 3 that has c's sign
+    test hslm_vsa_reasoning_returns_context
+        given bad = reasoning_mismatches()
+        when inputs = reasoning_input_gap()
+        then bad == 0 and inputs > 100
+
+    // Dim i is the mean of trits 4i .. 4i + 3; trits 972 .. 1023 are not read
+    test hslm_vsa_projection_values
+        given top = projection_probe(242)
+        when below = projection_probe(241)
+        then top == 1.0 and below == 0.0 and projection_probe(0) == -0.25
+
+    // Position 0: every block's similarity is its self-similarity 1, every
+    // gate fires, and the stream passes the token hypervector through
+    test hslm_vsa_position_zero_fires_every_block
+        given fired = fired_at_zero()
+        when bad = stream_identity_at_zero()
+        then fired == NUM_BLOCKS and bad == 0
+
+    test hslm_vsa_stream_hands_off_between_blocks
+        given bad = stream_hand_off_gap()
+        when again = stream_hand_off_gap()
+        then bad == 0 and again == 0
+
+    // Position 0, block 0: the stream adds exactly 0.1 * project(token
+    // hypervector) to the block's output
+    test hslm_vsa_offset_is_gain_times_projection
+        given gap = vsa_offset_gap()
+        when size = vsa_offset_size()
+        then gap < 0.000000000001 and size > 1.0
+
+    // Position 1, block 0: the token's hypervector against TOKEN_FIRST's sits
+    // well under PHI_INV (measured between 0.2 and 0.5), the gate stays shut,
+    // and the output is the stream-off output
+    test hslm_vsa_block0_shut_at_position_one
+        given fired = block0_fired_at_one()
+        when sim = block0_sim_at_one()
+        then fired == false and @abs(sim) < 0.5 and block0_gap_at_one() == 0.0
+
+    // The offset does not depend on the float parameters, so the gradient
+    // matches the loss at position 0, where every gate fires
+    test hslm_vsa_embed_gradient_at_position_zero
+        given slope = embed_slope0(5, LINEAR_LOSS)
+        when grad = embed_gradient0(5, LINEAR_LOSS)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_vsa_embed_gradient_at_position_zero_cross_entropy
+        given slope = embed_slope0(77, PROBE_TARGET)
+        when grad = embed_gradient0(77, PROBE_TARGET)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    test hslm_vsa_gamma_gradient_at_position_zero
+        given slope = gamma_slope0(1, 40)
+        when grad = gamma_gradient0(1, 40)
+        then @abs(grad - slope) < 0.000000001 * (1.0 + @abs(slope)) and @abs(slope) > 0.000001
+
+    invariant hslm_vsa_ratio
+        assert VSA_RATIO == VSA_DIM / EMBED_DIM and VSA_RATIO * EMBED_DIM <= VSA_DIM
+
+    invariant hslm_phi_inverse_identity
+        assert @abs(PHI_INV * (1.0 + PHI_INV) - 1.0) < 0.000000000000001
 }

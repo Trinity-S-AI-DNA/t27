@@ -59,7 +59,9 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Layer | Where | State |
 |---|---|---|
 | Spec -> graph IR schema (the core) | `specs/t27f/spec_graph.t27` (t27#10020) | spec with tests: node / edge kinds, labels, spans, `validate_graph`, line -> node mapping, node -> ui_plan widget, one hand-read fixture (`specs/tutorial/08_modules_and_arrays.t27`) |
-| Spec -> graph IR exporter | none yet | **missing**. `t27c` has no graph export; AST/IR audit is trinity#1650, pilot choice #1651 |
+| Graph view: layout of a spec graph | `specs/t27f/spec_graph_view.t27` (t27#10034) | spec with tests: one column per node kind, size / colour / dash / row order from the inference label, UNKNOWN nodes alone in a band, every edge with a source line, node -> widget through `node_widget`; numbers only, laid out on the hand-read fixture; drawn by the MCP tool `t27f_graph` (gHashTag/t27-mcp#9) |
+| Spec -> graph IR exporter | `specs/t27f/spec_graph_export.t27` (t27#10162) | spec with tests: `export_graph(path, src)` is a deterministic byte scanner over the source, `export_verdict` is `validate_graph` of the result. One node per top-level declaration (a leading `pub ` is allowed), spans to the matching closing brace, every node and edge EXACT or (unclassifiable) OPAQUE + UNKNOWN, CALLS / USES / CONSTRAINS edges with the line of the use, refusal past 192 nodes or 254 edges. On the tutorial 08 snapshot it equals the hand-read fixture on all 14 declaration nodes and all 9 EXACT edges; it does not emit the fixture's `std.testing` UNKNOWN node, nor its 7 DERIVED edges (4 data flow, 3 tested_by), because a scanner never derives; the derive pass below adds them. Limits: textual matching without scope or type resolution, no block comments, no struct/enum bodies, no cross-spec `use` resolution, capacity 192 nodes and 254 edges (about 98 percent of specs in specs/ fit; the rest are refused), takes a `[]const u8` slice rather than `[65536]u8` plus a length. Not wired to a host: the MCP tool does not call it. AST/IR audit is trinity#1650, pilot choice #1651 |
+| Graph IR derive pass | `specs/t27f/spec_graph_derive.t27` (t27#10191) | spec with tests: `derive_graph(g, src)` appends what the exporter must not claim and changes nothing it holds. R1 DERIVED `tested_by` = every EXACT CALLS edge from a test, invariant or bench to a fn read backwards (no line). R2 DERIVED `data_flow` = a const or `use` that an EXACT USES edge ties to a fn and that is named inside one of the fn's return statements (from `return` to the next `;`), on the line of the first such name. R3 UNKNOWN opaque node = an undeclared qualified call target of three or more segments (`std.testing.expectEqual(` names `std.testing`), spanning the lines that call through it. Exporter plus derive equal the tutorial 08 fixture as sets: 15 of 15 nodes, 16 of 16 edges, no special case. Limits: names matched as text; call results and flow through locals are not derived; R3 needs 3 or more segments (two cannot be told from a method call); a graph that does not validate, or a source of another line count, comes back unchanged; past 192 nodes or 254 edges the result is refused with the too-many verdict. Not wired to a host: the MCP tool does not call it |
 | UI plan IR + trusted widget catalog | `specs/t27f/ui_plan.t27` (t27#9962) | spec with tests; no renderer draws a plan yet |
 | Honeycomb focus+context geometry | `specs/t27f/reel.t27` | spec; stills drawn by the MCP tool `t27f_view` |
 | Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
@@ -70,7 +72,7 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 When asked "how is T27F going", report against the core rows first. Progress on the applications
 is not progress on the core.
 
-## Show a spec (the core, read by hand until an exporter exists)
+## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
    gHashTag/t27 checkout. Say which one you used.
@@ -82,8 +84,13 @@ is not progress on the core.
    fixture is a worked example).
 3. Show it as a table (node, kind, span, label) and, if useful, a diagram whose every arrow is a
    row of that table. Nothing is drawn that the table does not back.
-4. Say plainly that this is a manual reading, not T27F output: the graph-IR schema exists, but no
-   tool generates a graph from a spec yet. Name that gap rather than hide it.
+4. Say plainly that this is a manual reading unless a graph came out of `export_graph`
+   (`specs/t27f/spec_graph_export.t27`), with `derive_graph` (`specs/t27f/spec_graph_derive.t27`)
+   on top. The exporter reads declarations, spans and exact CALLS / USES / CONSTRAINS edges only,
+   within 192 nodes and 254 edges; the derive pass adds DERIVED tested_by and data_flow edges
+   and UNKNOWN opaque nodes for undeclared qualified call targets, by its three stated rules.
+   Anything the rules do not reach (SUGGESTED explanations, call-result flow, anything larger)
+   is still a manual reading, and no host runs either pass yet. Name that gap rather than hide it.
 
 ## Application: topic map (gHashTag/trinity#1677)
 
@@ -187,6 +194,6 @@ journey is saved, save it as a `.t27` data module, not JSON. Saving follows the 
 
 ## What this skill does not claim
 
-The graph IR is a schema (`specs/t27f/spec_graph.t27`), but no tool turns a spec into it yet, no renderer draws a T27F view in the Trinity UI, no
+The graph IR is a schema (`specs/t27f/spec_graph.t27`) and `specs/t27f/spec_graph_export.t27` turns source into it, but only exact declarations, spans and edges within the IR's capacity, with `specs/t27f/spec_graph_derive.t27` adding the derived and unknown part by stated rules, and no host calls either yet; no renderer draws a T27F view in the Trinity UI, no
 runtime dispatches Bees from a spec, and nothing publishes on its own. If a step needs one of
 them, say that it is missing; do not simulate it.

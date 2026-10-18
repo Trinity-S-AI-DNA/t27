@@ -1339,7 +1339,7 @@ enum Commands {
     Compile {
         /// Input file path
         input: String,
-        /// Backend: zig, verilog, or c
+        /// Backend: zig, verilog, c, or ml
         #[arg(long, default_value = "zig")]
         backend: String,
         /// Output file path (default: input with backend extension)
@@ -6248,7 +6248,10 @@ fn compile_source(source: &str, backend: &str) -> Result<String, String> {
 
 fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow::Result<()> {
     let path = Path::new(input_path);
-    let source = fs::read_to_string(path)?;
+    let mut source = fs::read_to_string(path)?;
+    if backend == "ml" {
+        source = use_resolve::resolve(path, &source);
+    }
 
     let ast = compiler::Compiler::parse_ast(&source)
         .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
@@ -6297,6 +6300,13 @@ fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow:
     }
     fs::write(&out_path, &code)?;
     println!("wrote {}", out_path.display());
+    if backend == "ml" {
+        let exe = out_path.with_extension("");
+        let mut zig = std::process::Command::new("zig");
+        zig.arg("build-exe").arg(&out_path).arg(format!("-femit-bin={}", exe.display()));
+        anyhow::ensure!(zig.status()?.success(), "zig build-exe failed");
+        println!("built {}", exe.display());
+    }
     Ok(())
 }
 
