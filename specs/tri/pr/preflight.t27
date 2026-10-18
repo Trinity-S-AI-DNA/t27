@@ -1,0 +1,933 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/pr/preflight.t27 -- what must hold before a pull request opens (#10190)
+; On 2026-10-18 about 190 pull requests were open and most were red: some for reasons master already
+; had, others for their own defects -- vacuous tests, copied bodies, type conflicts, deleted
+; tests, missing ledger rows, stale bases. specs/policy/pr_budget.t27 (#10070, #10087) caps how many
+; may be open; this spec is the other half. `tri pr preflight` runs the commands below on the branch
+; in the current directory, against origin/master, and decides from their output whether the branch
+; may become a pull request. tools/queen/publish.py runs it before `gh pr create`.
+; The glue (cli/tri/src/prcheck.rs `preflight`, through `t27c gen-rust` in gen/rust/tri/pr/preflight.rs)
+; holds no rule. It runs `sh -c step_cmd(k)` for every step that step_runs, with SPEC set to the
+; target's path (path_start..path_end of entry n of the CHANGES output) for a per-target step, and T27C
+; and TRI set to the two binaries. It writes each run into one evidence text as a section
+;   @@ preflight <k> <n> <exit> <len>\n<len bytes of output>\n
+; (n is 0 for a step that runs once; exit is 255 when a signal ended it), hands that text and the
+; CHANGES output to the functions here, prints rule_name, name and rule_why for every rule with the
+; evidence_from..evidence_to slice of a rule that did not pass, and exits with preflight_exit.
+; Three rules of reading:
+;   fail closed -- a section that is missing, or whose output is not the shape this spec expects, is UNREAD,
+;     never a pass, and UNREAD exits 2.
+;   own defects only -- master is red on its own (8 inherited corpus-ratchet findings and a moved
+;     census on 2026-10-18). A finding that does not mention a spec the branch changes does not fail it.
+;   the length is in the header -- an output that holds a line opening "@@ preflight " (this spec's
+;     own text does) cannot start a section, because a section ends where its length says.
+; Fixture text is the commands' real output on master 92178c87d (2026-10-18), shortened.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriPrPreflight;
+
+use tri::lab::receipt::line_end;
+use tri::lab::receipt::span_is;
+use tri::test::report::opens_with;
+use tri::lanes::lanes::digits;
+
+// The steps, in the order they run. Every per-target step runs after CHANGES, which names the targets.
+pub const STEP_FETCH : u8 = 0;
+pub const STEP_CHANGES : u8 = 1;
+pub const STEP_BEHIND : u8 = 2;
+pub const STEP_CHECK : u8 = 3;
+pub const STEP_REPORT : u8 = 4;
+pub const STEP_SEAL : u8 = 5;
+pub const STEP_BASE : u8 = 6;
+pub const STEP_HEAD : u8 = 7;
+pub const STEP_LIKE : u8 = 8;
+pub const STEP_CLASSIFIED : u8 = 9;
+pub const STEP_RATCHET : u8 = 10;
+pub const STEP_DUPES : u8 = 11;
+pub const STEP_CENSUS : u8 = 12;
+pub const STEP_SUITE_ROWS : u8 = 13;
+pub const STEP_T27B_ROWS : u8 = 14;
+pub const STEP_SUITE : u8 = 15;
+pub const STEPS : u8 = 16;
+// A rule whose evidence is in no single step's output (the ledgers, the test tally).
+pub const NO_STEP : u8 = 16;
+
+// The rules, in the order they print.
+pub const R_CHANGES : u8 = 0;
+pub const R_BASE : u8 = 1;
+pub const R_CHECK : u8 = 2;
+pub const R_TESTS : u8 = 3;
+pub const R_SEAL : u8 = 4;
+pub const R_TYPES : u8 = 5;
+pub const R_DUPES : u8 = 6;
+pub const R_LEDGERS : u8 = 7;
+pub const R_SUITE : u8 = 8;
+pub const R_CENSUS : u8 = 9;
+pub const R_COUNT : u8 = 10;
+pub const RULES : u8 = 11;
+
+// A rule's outcome. They are numbered worst last, so the outcome of many is the largest.
+pub const P_PASS : u8 = 0;
+pub const P_NOT_RUN : u8 = 1;
+pub const P_UNREAD : u8 = 2;
+pub const P_FAIL : u8 = 3;
+
+pub const PF_OK : u8 = 0;
+pub const PF_FAIL : u8 = 1;
+pub const PF_UNREAD : u8 = 2;
+
+// The exit of a step that has no section: it did not run.
+pub const NO_EXIT : u64 = 256;
+// A header field of more digits than this is not one the glue wrote; 18 digits always fit in u64.
+pub const MAX_DIGITS : usize = 18;
+// The most evidence one rule prints.
+pub const MAX_EVIDENCE : usize = 4000;
+
+/// The steps and rules are numbered as the glue and the tests below call them, every per-target step
+/// runs after the one that names the targets, and the verdicts rank PASS < NOT_RUN < UNREAD < FAIL.
+invariant the_steps_rules_and_verdicts_are_numbered { assert STEP_CHANGES < STEP_CHECK and STEP_LIKE < STEP_CLASSIFIED and STEP_SUITE == STEPS - 1 and NO_STEP == STEPS and R_COUNT == RULES - 1 and P_PASS < P_NOT_RUN and P_NOT_RUN < P_UNREAD and P_UNREAD < P_FAIL and PF_UNREAD == 2 and NO_EXIT == 256; }
+
+/// The shell command of step k. It runs at the repository root; every one ends in 2>&1, so the
+/// section holds what a person would have seen.
+pub fn step_cmd(k: u8) -> string {
+    if (k == STEP_FETCH) { return "git fetch -q origin master 2>&1"; }
+    if (k == STEP_CHANGES) { return "git diff --name-status --no-renames origin/master...HEAD 2>&1"; }
+    if (k == STEP_BEHIND) { return "git merge-base --is-ancestor origin/master HEAD 2>&1"; }
+    if (k == STEP_CHECK) { return "\"$T27C\" check \"$SPEC\" 2>&1"; }
+    if (k == STEP_REPORT) { return "\"$T27C\" test-report \"$SPEC\" --specs-dir specs 2>&1"; }
+    if (k == STEP_SEAL) { return "\"$T27C\" seal \"$SPEC\" --verify 2>&1"; }
+    if (k == STEP_BASE) { return "git show \"origin/master:$SPEC\" 2>&1"; }
+    if (k == STEP_HEAD) { return "cat \"$SPEC\" 2>&1"; }
+    if (k == STEP_LIKE) { return "python3 tools/dupe_scan.py --like \"$SPEC\" 2>&1"; }
+    if (k == STEP_CLASSIFIED) { return "\"$TRI\" types classified 2>&1"; }
+    if (k == STEP_RATCHET) { return "\"$TRI\" types ratchet 2>&1"; }
+    if (k == STEP_DUPES) { return "python3 tools/dupe_scan.py 2>&1"; }
+    if (k == STEP_CENSUS) { return "\"$TRI\" census pin --gate 2>&1"; }
+    if (k == STEP_SUITE_ROWS) { return "cat docs/reports/suite_expectations.json 2>&1"; }
+    if (k == STEP_T27B_ROWS) { return "cat docs/reports/t27b_expectations.json 2>&1"; }
+    return "\"$T27C\" suite --repo-root . --ratchet --corpus-only 2>&1";
+}
+
+/// Does step k run once per target (with SPEC set) rather than once?
+pub fn step_each(k: u8) -> bool {
+    return k >= STEP_CHECK and k <= STEP_LIKE;
+}
+
+/// Does step k run at all? --quick leaves out the corpus ratchet, which takes minutes.
+pub fn step_runs(k: u8, quick: bool) -> bool {
+    return k < STEPS and (k != STEP_SUITE or quick == false);
+}
+
+// ---- the CHANGES output: one `<status>\t<path>` line per changed file -------------------------
+
+/// The offset of the n-th non-empty line (from 0), or c.len when there are fewer.
+pub fn entry_at(c: string, n: u64) -> usize {
+    var at : usize = 0;
+    var seen : u64 = 0;
+    while (at < c.len) {
+        const end : usize = line_end(c, at);
+        if (end > at) {
+            if (seen == n) { return at; }
+            seen = seen + 1;
+        }
+        at = end + 1;
+    }
+    return c.len;
+}
+
+/// How many entries the CHANGES output has.
+pub fn entries(c: string) -> u64 {
+    var n : u64 = 0;
+    while (entry_at(c, n) < c.len) {
+        n = n + 1;
+    }
+    return n;
+}
+
+/// The status letter of entry n: A, M, D or T as git writes them; 0 when there is no entry n.
+pub fn status(c: string, n: u64) -> u8 {
+    const at : usize = entry_at(c, n);
+    if (at >= c.len) { return 0; }
+    return c[at];
+}
+
+/// Is entry n one status letter, a tab and a path, with a status this spec knows?
+pub fn well_formed(c: string, n: u64) -> bool {
+    const at : usize = entry_at(c, n);
+    if (at >= c.len or line_end(c, at) < at + 3 or c[at + 1] != 9) { return false; }
+    const s : u8 = c[at];
+    return s == 65 or s == 77 or s == 68 or s == 84;
+}
+
+/// Where entry n's path begins and ends; both c.len when it has none.
+pub fn path_start(c: string, n: u64) -> usize {
+    if (well_formed(c, n) == false) { return c.len; }
+    return entry_at(c, n) + 2;
+}
+
+pub fn path_end(c: string, n: u64) -> usize {
+    if (well_formed(c, n) == false) { return c.len; }
+    return line_end(c, entry_at(c, n));
+}
+
+/// Is every byte of entry n's path one of [A-Za-z0-9._/+-], so it can go to a shell in SPEC as is?
+/// git writes a path with any other byte in quotes and escapes, which is not the file label itself.
+pub fn path_safe(c: string, n: u64) -> bool {
+    const from : usize = path_start(c, n);
+    const to : usize = path_end(c, n);
+    if (from >= to) { return false; }
+    var k : usize = from;
+    while (k < to) {
+        const b : u8 = c[k];
+        const ok : bool = (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57) or b == 46 or b == 95 or b == 47 or b == 43 or b == 45;
+        if (ok == false) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Does entry n's path start with lit, and end with tail?
+pub fn path_is(c: string, n: u64, lit: string, tail: string) -> bool {
+    const from : usize = path_start(c, n);
+    const to : usize = path_end(c, n);
+    if (from >= to or to - from < lit.len + tail.len) { return false; }
+    return span_is(c, from, from + lit.len, lit) and span_is(c, to - tail.len, to, tail);
+}
+
+/// A spec the branch adds or modifies: a .t27 under specs/, scratch aside.
+pub fn is_spec(c: string, n: u64) -> bool {
+    const s : u8 = status(c, n);
+    if (s != 65 and s != 77) { return false; }
+    return path_is(c, n, "specs/", ".t27") and path_is(c, n, "specs/scratch/", "") == false;
+}
+
+/// A spec the per-target steps run on: a spec whose path is safe to hand to a shell.
+pub fn is_target(c: string, n: u64) -> bool {
+    return is_spec(c, n) and path_safe(c, n);
+}
+
+/// A spec the branch deletes.
+pub fn is_gone(c: string, n: u64) -> bool {
+    return status(c, n) == 68 and path_is(c, n, "specs/", ".t27");
+}
+
+/// Does the branch add a workflow?
+pub fn adds_workflow(c: string) -> bool {
+    var n : u64 = 0;
+    while (n < entries(c)) {
+        if (status(c, n) == 65 and path_is(c, n, ".github/workflows/", ".yml")) { return true; }
+        n = n + 1;
+    }
+    return false;
+}
+
+/// Does the branch change the census ledger, tools/census/?
+pub fn touches_census(c: string) -> bool {
+    var n : u64 = 0;
+    while (n < entries(c)) {
+        if (path_is(c, n, "tools/census/", "")) { return true; }
+        n = n + 1;
+    }
+    return false;
+}
+
+// ---- the evidence: `@@ preflight <k> <n> <exit> <len>` sections ------------------------------
+
+/// The offset of the first byte at or after `at` (and before `to`) that is not a digit.
+pub fn digits_end(text: string, at: usize, to: usize) -> usize {
+    var k : usize = at;
+    while (k < to and text[k] >= 48 and text[k] <= 57) {
+        k = k + 1;
+    }
+    return k;
+}
+
+/// The offset just past the header line of the section that begins at `at` -- "@@ preflight ", four
+/// numbers of 1 to MAX_DIGITS digits split by one space, '\n' -- or ev.len + 1 when `at` holds none.
+pub fn header_end(ev: string, at: usize) -> usize {
+    if (at >= ev.len) { return ev.len + 1; }
+    const end : usize = line_end(ev, at);
+    if (end >= ev.len or opens_with(ev, at, end, "@@ preflight ") == false) { return ev.len + 1; }
+    var k : usize = at + 13;
+    var f : u64 = 0;
+    while (f < 4) {
+        const e : usize = digits_end(ev, k, end);
+        if (e == k or e - k > MAX_DIGITS) { return ev.len + 1; }
+        k = e;
+        if (f < 3) {
+            if (k >= end or ev[k] != 32) { return ev.len + 1; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    if (k != end) { return ev.len + 1; }
+    return end + 1;
+}
+
+/// Field f (0 step, 1 entry, 2 exit, 3 length) of the header at `at`, which header_end accepted.
+pub fn field(ev: string, at: usize, f: u64) -> u64 {
+    var k : usize = at + 13;
+    var i : u64 = 0;
+    while (i < f) {
+        k = digits_end(ev, k, ev.len) + 1;
+        i = i + 1;
+    }
+    return digits(ev, k, digits_end(ev, k, ev.len));
+}
+
+/// The offset of the section after the one at `at`, or ev.len + 1 when this one is broken: its
+/// length runs past the text, or the byte after its output is not the '\n' that closes it.
+pub fn next_section(ev: string, at: usize) -> usize {
+    const he : usize = header_end(ev, at);
+    if (he > ev.len) { return ev.len + 1; }
+    const len : u64 = field(ev, at, 3);
+    if (len >= ((ev.len - he) as u64)) { return ev.len + 1; }
+    const to : usize = he + (len as usize);
+    if (ev[to] != 10) { return ev.len + 1; }
+    return to + 1;
+}
+
+/// The offset of step k's section for entry n, or ev.len + 1 when it has none. The walk stops at the
+/// first broken section: nothing after it can be told from output.
+pub fn section(ev: string, k: u8, n: u64) -> usize {
+    var at : usize = 0;
+    while (at < ev.len) {
+        const nx : usize = next_section(ev, at);
+        if (nx > ev.len) { return ev.len + 1; }
+        if (field(ev, at, 0) == (k as u64) and field(ev, at, 1) == n) { return at; }
+        at = nx;
+    }
+    return ev.len + 1;
+}
+
+/// The exit of step k for entry n; NO_EXIT when it did not run.
+pub fn exit_of(ev: string, k: u8, n: u64) -> u64 {
+    const s : usize = section(ev, k, n);
+    if (s >= ev.len) { return NO_EXIT; }
+    return field(ev, s, 2);
+}
+
+/// Where that run's output begins and ends; both ev.len when it did not run.
+pub fn body_from(ev: string, k: u8, n: u64) -> usize {
+    const s : usize = section(ev, k, n);
+    if (s >= ev.len) { return ev.len; }
+    return header_end(ev, s);
+}
+
+pub fn body_to(ev: string, k: u8, n: u64) -> usize {
+    const s : usize = section(ev, k, n);
+    if (s >= ev.len) { return ev.len; }
+    return header_end(ev, s) + (field(ev, s, 3) as usize);
+}
+
+// ---- reading one output ------------------------------------------------------------------------
+
+/// The offset just past lit on the first line of text[from..to] that opens with lit once its leading
+/// blanks are skipped; text.len + 1 when no line does.
+pub fn line_after(text: string, from: usize, to: usize, lit: string) -> usize {
+    var at : usize = from;
+    while (at < to) {
+        var end : usize = line_end(text, at);
+        if (end > to) { end = to; }
+        var k : usize = at;
+        while (k < end and (text[k] == 32 or text[k] == 9)) {
+            k = k + 1;
+        }
+        if (opens_with(text, k, end, lit)) { return k + lit.len; }
+        at = end + 1;
+    }
+    return text.len + 1;
+}
+
+pub fn has_line(text: string, from: usize, to: usize, lit: string) -> bool {
+    return line_after(text, from, to, lit) <= text.len;
+}
+
+/// The offset of the first lit inside text[from..to], or text.len + 1.
+pub fn find_in(text: string, from: usize, to: usize, lit: string) -> usize {
+    var k : usize = from;
+    while (k + lit.len <= to) {
+        if (span_is(text, k, k + lit.len, lit)) { return k; }
+        k = k + 1;
+    }
+    return text.len + 1;
+}
+
+/// Do the bytes of a from af equal b[bf..bt]?
+pub fn same(a: string, af: usize, b: string, bf: usize, bt: usize) -> bool {
+    if (bt < bf or af + (bt - bf) > a.len) { return false; }
+    var i : usize = 0;
+    while (i < bt - bf) {
+        if (a[af + i] != b[bf + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Does ledger step k's output hold a row `"path": "<entry n's path>"`?
+pub fn has_row(ev: string, k: u8, c: string, n: u64) -> bool {
+    const to : usize = body_to(ev, k, 0);
+    const pf : usize = path_start(c, n);
+    const pt : usize = path_end(c, n);
+    var at : usize = find_in(ev, body_from(ev, k, 0), to, "\"path\": \"");
+    while (at < ev.len) {
+        const p : usize = at + 9;
+        if (p + (pt - pf) < to and same(ev, p, c, pf, pt) and ev[p + (pt - pf)] == 34) { return true; }
+        at = find_in(ev, p, to, "\"path\": \"");
+    }
+    return false;
+}
+
+/// How many `test` blocks the spec text in step k's output for entry n declares.
+pub fn tests_in(ev: string, k: u8, n: u64) -> u64 {
+    const to : usize = body_to(ev, k, n);
+    var at : usize = body_from(ev, k, n);
+    var seen : u64 = 0;
+    while (at < to) {
+        var end : usize = line_end(ev, at);
+        if (end > to) { end = to; }
+        if (opens_with(ev, at, end, "test ")) { seen = seen + 1; }
+        at = end + 1;
+    }
+    return seen;
+}
+
+/// Where the corpus ratchet's own lines start in the suite output; ev.len + 1 when they are not there.
+pub fn ratchet_at(ev: string) -> usize {
+    return find_in(ev, body_from(ev, STEP_SUITE, 0), body_to(ev, STEP_SUITE, 0), "--- Ratchet (W628) ---");
+}
+
+/// A mark the ratchet puts before a finding: + - ! > < ? ~ (suite.rs `show`).
+pub fn is_mark(b: u8) -> bool {
+    return b == 43 or b == 45 or b == 33 or b == 62 or b == 60 or b == 63 or b == 126;
+}
+
+/// Does a finding line in ev[from..to] -- four spaces, a mark, a space, a path, then a space or the
+/// line's end -- mention entry n's path?
+pub fn names_path(ev: string, from: usize, to: usize, c: string, n: u64) -> bool {
+    const pf : usize = path_start(c, n);
+    const pl : usize = path_end(c, n) - pf;
+    var at : usize = from;
+    while (at < to) {
+        var end : usize = line_end(ev, at);
+        if (end > to) { end = to; }
+        if (end - at >= 6 + pl and span_is(ev, at, at + 4, "    ") and is_mark(ev[at + 4]) and ev[at + 5] == 32 and same(ev, at + 6, c, pf, pf + pl)) {
+            if (at + 6 + pl == end or ev[at + 6 + pl] == 32) { return true; }
+        }
+        at = end + 1;
+    }
+    return false;
+}
+
+// ---- the rules ----------------------------------------------------------------------------------
+
+/// A step's exit as a outcome: 0 is green; no run, 126 (not executable) and 127 (not found) are no outcome.
+pub fn exit_verdict(x: u64) -> u8 {
+    if (x == 0) { return P_PASS; }
+    if (x == NO_EXIT or x == 126 or x == 127) { return P_UNREAD; }
+    return P_FAIL;
+}
+
+/// The part of rule r that is about the branch as a whole.
+pub fn once_verdict(c: string, ev: string, r: u8, quick: bool) -> u8 {
+    if (r == R_CHANGES) {
+        if (exit_of(ev, STEP_FETCH, 0) != 0 or exit_of(ev, STEP_CHANGES, 0) != 0) { return P_UNREAD; }
+        if (entries(c) == 0) { return P_FAIL; }
+        return P_PASS;
+    }
+    if (r == R_BASE) {
+        const x : u64 = exit_of(ev, STEP_BEHIND, 0);
+        if (x == 0) { return P_PASS; }
+        if (x == 1) { return P_FAIL; }
+        return P_UNREAD;
+    }
+    if (r == R_TYPES) {
+        const a : u64 = exit_of(ev, STEP_CLASSIFIED, 0);
+        if (a != 0) { return exit_verdict(a); }
+        const b : u64 = exit_of(ev, STEP_RATCHET, 0);
+        if (b != 0) { return exit_verdict(b); }
+        if (has_line(ev, body_from(ev, STEP_RATCHET, 0), body_to(ev, STEP_RATCHET, 0), "RATCHET: CLEAN")) { return P_PASS; }
+        return P_UNREAD;
+    }
+    if (r == R_DUPES) {
+        const d : u64 = exit_of(ev, STEP_DUPES, 0);
+        if (d != 0) { return exit_verdict(d); }
+        if (has_line(ev, body_from(ev, STEP_DUPES, 0), body_to(ev, STEP_DUPES, 0), "ok: no new duplicate body")) { return P_PASS; }
+        return P_UNREAD;
+    }
+    if (r == R_LEDGERS) {
+        if (exit_of(ev, STEP_SUITE_ROWS, 0) != 0 or exit_of(ev, STEP_T27B_ROWS, 0) != 0) { return P_UNREAD; }
+        return P_PASS;
+    }
+    if (r == R_SUITE) {
+        if (quick) { return P_NOT_RUN; }
+        const s : u64 = exit_of(ev, STEP_SUITE, 0);
+        if (s == NO_EXIT or s == 126 or s == 127 or ratchet_at(ev) > ev.len) { return P_UNREAD; }
+        return P_PASS;
+    }
+    if (r == R_CENSUS) {
+        if (adds_workflow(c) == false) { return P_PASS; }
+        if (touches_census(c) == false) { return P_FAIL; }
+        return exit_verdict(exit_of(ev, STEP_CENSUS, 0));
+    }
+    return P_PASS;
+}
+
+/// The part of rule r that is about entry n; PASS when the rule does not apply to it.
+pub fn entry_verdict(c: string, ev: string, r: u8, n: u64, quick: bool) -> u8 {
+    if (r == R_CHANGES) {
+        if (well_formed(c, n) == false) { return P_FAIL; }
+        if (path_safe(c, n) == false and (is_spec(c, n) or path_is(c, n, "\"specs/", ""))) { return P_FAIL; }
+        return P_PASS;
+    }
+    if (r == R_LEDGERS) {
+        if (exit_of(ev, STEP_SUITE_ROWS, 0) != 0 or exit_of(ev, STEP_T27B_ROWS, 0) != 0) { return P_PASS; }
+        if (is_gone(c, n)) {
+            if (has_row(ev, STEP_SUITE_ROWS, c, n) or has_row(ev, STEP_T27B_ROWS, c, n)) { return P_FAIL; }
+            return P_PASS;
+        }
+        if (is_target(c, n) and status(c, n) == 65 and has_row(ev, STEP_T27B_ROWS, c, n) == false) { return P_FAIL; }
+        return P_PASS;
+    }
+    if (is_target(c, n) == false) { return P_PASS; }
+    if (r == R_CHECK) { return exit_verdict(exit_of(ev, STEP_CHECK, n)); }
+    if (r == R_TESTS) {
+        const x : u64 = exit_of(ev, STEP_REPORT, n);
+        if (x != 0) { return exit_verdict(x); }
+        const bf : usize = body_from(ev, STEP_REPORT, n);
+        const bt : usize = body_to(ev, STEP_REPORT, n);
+        if (has_line(ev, bf, bt, "tests ") == false) { return P_UNREAD; }
+        var k : usize = line_after(ev, bf, bt, "vacuous pass");
+        if (k > ev.len) { return P_PASS; }
+        while (k < bt and (ev[k] == 32 or ev[k] == 101 or ev[k] == 115)) {
+            k = k + 1;
+        }
+        const e : usize = digits_end(ev, k, bt);
+        if (e == k) { return P_UNREAD; }
+        if (digits(ev, k, e) == 0) { return P_PASS; }
+        return P_FAIL;
+    }
+    if (r == R_SEAL) {
+        const x : u64 = exit_of(ev, STEP_SEAL, n);
+        if (x != 0) { return exit_verdict(x); }
+        if (has_line(ev, body_from(ev, STEP_SEAL, n), body_to(ev, STEP_SEAL, n), "all hashes MATCH")) { return P_PASS; }
+        return P_UNREAD;
+    }
+    if (r == R_DUPES) {
+        if (status(c, n) != 65) { return P_PASS; }
+        const x : u64 = exit_of(ev, STEP_LIKE, n);
+        if (x != 0) { return exit_verdict(x); }
+        const bf : usize = body_from(ev, STEP_LIKE, n);
+        const bt : usize = body_to(ev, STEP_LIKE, n);
+        if (find_in(ev, bf, bt, " is already written in ") <= ev.len) { return P_FAIL; }
+        if (find_in(ev, bf, bt, ": nothing in this file is written elsewhere") <= ev.len) { return P_PASS; }
+        return P_UNREAD;
+    }
+    if (r == R_SUITE) {
+        if (quick) { return P_NOT_RUN; }
+        const from : usize = ratchet_at(ev);
+        if (from > ev.len) { return P_UNREAD; }
+        const to : usize = body_to(ev, STEP_SUITE, 0);
+        if (names_path(ev, from, to, c, n)) { return P_FAIL; }
+        if (find_in(ev, from, to, " more NOT SHOWN") <= ev.len) { return P_UNREAD; }
+        return P_PASS;
+    }
+    if (r == R_COUNT) {
+        if (status(c, n) != 77) { return P_PASS; }
+        if (exit_of(ev, STEP_BASE, n) != 0 or exit_of(ev, STEP_HEAD, n) != 0) { return P_UNREAD; }
+        if (tests_in(ev, STEP_HEAD, n) < tests_in(ev, STEP_BASE, n)) { return P_FAIL; }
+        return P_PASS;
+    }
+    return P_PASS;
+}
+
+/// Rule r's outcome: the worst of its branch-wide part and of every entry.
+pub fn rule_verdict(c: string, ev: string, r: u8, quick: bool) -> u8 {
+    var v : u8 = once_verdict(c, ev, r, quick);
+    var n : u64 = 0;
+    while (n < entries(c)) {
+        const e : u8 = entry_verdict(c, ev, r, n, quick);
+        if (e > v) { v = e; }
+        n = n + 1;
+    }
+    return v;
+}
+
+/// The entry rule r's outcome is about: the first that has it, or entries(c) when the outcome is the
+/// branch-wide part's (or a pass).
+pub fn rule_at(c: string, ev: string, r: u8, quick: bool) -> u64 {
+    const v : u8 = rule_verdict(c, ev, r, quick);
+    if (v == P_PASS or once_verdict(c, ev, r, quick) == v) { return entries(c); }
+    var n : u64 = 0;
+    while (n < entries(c)) {
+        if (entry_verdict(c, ev, r, n, quick) == v) { return n; }
+        n = n + 1;
+    }
+    return entries(c);
+}
+
+/// The step whose output is rule r's evidence at entry n; NO_STEP when no one output is.
+pub fn evidence_step(c: string, ev: string, r: u8, n: u64) -> u8 {
+    if (r == R_CHANGES) {
+        if (exit_of(ev, STEP_FETCH, 0) != 0) { return STEP_FETCH; }
+        return STEP_CHANGES;
+    }
+    if (r == R_BASE) { return STEP_BEHIND; }
+    if (r == R_CHECK) { return STEP_CHECK; }
+    if (r == R_TESTS) { return STEP_REPORT; }
+    if (r == R_SEAL) { return STEP_SEAL; }
+    if (r == R_TYPES) {
+        if (exit_of(ev, STEP_CLASSIFIED, 0) != 0) { return STEP_CLASSIFIED; }
+        return STEP_RATCHET;
+    }
+    if (r == R_DUPES) {
+        if (n < entries(c)) { return STEP_LIKE; }
+        return STEP_DUPES;
+    }
+    if (r == R_SUITE) { return STEP_SUITE; }
+    if (r == R_CENSUS and touches_census(c)) { return STEP_CENSUS; }
+    return NO_STEP;
+}
+
+/// Where that evidence begins: the output of step k (for entry n when k runs per target), from the
+/// ratchet's own lines for the suite.
+pub fn evidence_from(ev: string, k: u8, n: u64) -> usize {
+    var m : u64 = 0;
+    if (step_each(k)) { m = n; }
+    const bf : usize = body_from(ev, k, m);
+    if (k == STEP_SUITE) {
+        const at : usize = ratchet_at(ev);
+        if (at <= ev.len) { return at; }
+    }
+    return bf;
+}
+
+/// Where it ends: at most MAX_EVIDENCE bytes on, and never inside a UTF-8 character.
+pub fn evidence_to(ev: string, k: u8, n: u64) -> usize {
+    var m : u64 = 0;
+    if (step_each(k)) { m = n; }
+    const from : usize = evidence_from(ev, k, n);
+    return cut_at(ev, from, body_to(ev, k, m), MAX_EVIDENCE);
+}
+
+/// Is b a UTF-8 continuation byte (10xxxxxx), one that cannot begin a character?
+pub fn is_tail(b: u8) -> bool {
+    return b >= 128 and b < 192;
+}
+
+/// text[from..to] cut to at most max bytes, backed off so it never ends inside a UTF-8 character.
+pub fn cut_at(text: string, from: usize, to: usize, max: usize) -> usize {
+    if (to <= from + max) { return to; }
+    var t : usize = from + max;
+    while (t > from and is_tail(text[t])) {
+        t = t - 1;
+    }
+    return t;
+}
+
+/// The exit: 1 when any rule FAILs, else 2 when any could not be parsed, else 0.
+pub fn preflight_exit(c: string, ev: string, quick: bool) -> u8 {
+    var worst : u8 = P_PASS;
+    var r : u8 = 0;
+    while (r < RULES) {
+        const v : u8 = rule_verdict(c, ev, r, quick);
+        if (v > worst) { worst = v; }
+        r = r + 1;
+    }
+    if (worst == P_FAIL) { return PF_FAIL; }
+    if (worst == P_UNREAD) { return PF_UNREAD; }
+    return PF_OK;
+}
+
+pub fn rule_name(r: u8) -> string {
+    if (r == R_CHANGES) { return "changes"; }
+    if (r == R_BASE) { return "base"; }
+    if (r == R_CHECK) { return "check"; }
+    if (r == R_TESTS) { return "tests"; }
+    if (r == R_SEAL) { return "seal"; }
+    if (r == R_TYPES) { return "types"; }
+    if (r == R_DUPES) { return "dupes"; }
+    if (r == R_LEDGERS) { return "ledgers"; }
+    if (r == R_SUITE) { return "suite"; }
+    if (r == R_CENSUS) { return "census"; }
+    return "kept";
+}
+
+pub fn name(v: u8) -> string {
+    if (v == P_PASS) { return "PASS"; }
+    if (v == P_NOT_RUN) { return "NOT RUN"; }
+    if (v == P_UNREAD) { return "UNREAD"; }
+    return "FAIL";
+}
+
+/// What a outcome on rule r means, and for a FAIL what to do about it.
+pub fn rule_why(r: u8, v: u8) -> string {
+    if (v == P_PASS) { return "ok"; }
+    if (v == P_NOT_RUN) { return "not run: --quick leaves the corpus ratchet out; the full preflight runs it"; }
+    if (v == P_UNREAD) { return "undecided: the command did not run, or its output is not the shape this rule reads"; }
+    if (r == R_CHANGES) { return "the diff against origin/master is empty, or names a spec whose path is not [A-Za-z0-9._/+-] only"; }
+    if (r == R_BASE) { return "origin/master is not an ancestor of HEAD: merge origin/master into the branch and run the preflight again"; }
+    if (r == R_CHECK) { return "t27c check failed: the spec does not parse or typecheck"; }
+    if (r == R_TESTS) { return "a test FAILs, the spec is BLOCKED, or a test passed with 0 runtime asserts (vacuous, T730): make every test assert something that runs"; }
+    if (r == R_SEAL) { return "the seal is missing or does not MATCH: regenerate, run `t27c seal <spec> --save`, commit the seal"; }
+    if (r == R_TYPES) { return "the types ratchet is not CLEAN: rename the type in the newer spec, never bless the ledger"; }
+    if (r == R_DUPES) { return "a body is already written elsewhere: delete the copy and `use` the one the evidence names"; }
+    if (r == R_LEDGERS) { return "a ledger row is wrong: a deleted spec leaves docs/reports/suite_expectations.json and t27b_expectations.json, an added spec needs a t27b_expectations.json row"; }
+    if (r == R_SUITE) { return "the corpus ratchet names this spec: fix the spec, or drop its suite_expectations.json row if it was fixed"; }
+    if (r == R_CENSUS) { return "a new workflow moves the census: run `tri census pin --bless` and commit tools/census/ in the same change"; }
+    return "the spec has fewer test blocks than on origin/master: deleting tests is not a fix";
+}
+
+pub fn preflight_exit_why(x: u8) -> string {
+    if (x == PF_OK) { return "exit 0: every rule that ran passed"; }
+    if (x == PF_FAIL) { return "exit 1: a rule FAILed -- do not open the pull request"; }
+    return "exit 2: undecided -- a rule's evidence could not be parsed; this is never a pass";
+}
+
+const C : string = "A\tspecs/x/new.t27\nM\tspecs/x/old.t27\nD\tspecs/x/gone.t27\nM\tdocs/a.md\n";
+
+// Scenario: every step has a command, the per-target ones are CHECK..LIKE, and --quick drops only the suite.
+test the_steps_are_named_and_ordered {
+    assert step_each(STEP_CHECK) and step_each(STEP_LIKE) and step_each(STEP_CHANGES) == false and step_each(STEP_CLASSIFIED) == false;
+    assert span_is(step_cmd(STEP_SEAL), 0, 29, "\"$T27C\" seal \"$SPEC\" --verify");
+    assert span_is(step_cmd(STEP_SUITE), 0, 14, "\"$T27C\" suite ");
+    assert step_runs(STEP_SUITE, false) and step_runs(STEP_SUITE, true) == false and step_runs(STEP_T27B_ROWS, true);
+    assert step_runs(STEPS, false) == false;
+    var k : u8 = 0;
+    var each : u8 = 0;
+    while (k < STEPS) {
+        assert step_cmd(k).len > 10;
+        if (step_each(k)) { each = each + 1; }
+        k = k + 1;
+    }
+    assert each == 6;
+}
+
+// Scenario: the four entries of C are parsed with their status, path and kind.
+test the_changes_are_read_entry_by_entry {
+    assert entries(C) == 4 and entries("") == 0 and entries("\n\n") == 0;
+    assert status(C, 0) == 65 and status(C, 1) == 77 and status(C, 2) == 68 and status(C, 4) == 0;
+    assert span_is(C, path_start(C, 0), path_end(C, 0), "specs/x/new.t27");
+    assert span_is(C, path_start(C, 2), path_end(C, 2), "specs/x/gone.t27");
+    assert span_is(C, path_start(C, 3), path_end(C, 3), "docs/a.md");
+    assert path_start(C, 4) == C.len and path_end(C, 4) == C.len;
+    assert is_target(C, 0) and is_target(C, 1) and is_target(C, 2) == false and is_target(C, 3) == false;
+    assert is_gone(C, 2) and is_gone(C, 0) == false;
+    assert adds_workflow(C) == false and touches_census(C) == false;
+    const w : string = "A\t.github/workflows/new.yml\nM\ttools/census/quiet.txt\n";
+    assert adds_workflow(w) and touches_census(w);
+    assert adds_workflow("M\t.github/workflows/old.yml\n") == false;
+}
+
+// Scenario: a path git had to quote, a scratch spec and a .t27 outside specs/ are not targets.
+test only_safe_spec_paths_are_targets {
+    const q : string = "A\t\"specs/x/a b.t27\"\nA\tspecs/scratch/s.t27\nA\tdocs/x.t27\nM\tspecs/a/b_c-d+e.t27\nX\tspecs/x/y.t27\nA\t\n";
+    assert is_spec(q, 0) == false and path_safe(q, 0) == false;
+    assert is_spec(q, 1) == false and is_spec(q, 2) == false;
+    assert is_target(q, 3) and path_safe(q, 3);
+    assert well_formed(q, 4) == false and is_spec(q, 4) == false;
+    assert well_formed(q, 5) == false and path_safe(q, 5) == false;
+    assert well_formed(q, 6) == false;
+}
+
+const EV : string = "@@ preflight 0 0 0 0\n\n@@ preflight 1 0 0 3\nA\tx\n@@ preflight 3 1 1 5\nbad!\n\n@@ preflight 2 0 1 0\n\n";
+
+// Scenario: sections are found by step and entry, with their exit and output.
+test sections_are_found_by_step_and_entry {
+    assert section(EV, 0, 0) == 0 and exit_of(EV, 0, 0) == 0;
+    assert body_from(EV, 0, 0) == body_to(EV, 0, 0);
+    assert span_is(EV, body_from(EV, 1, 0), body_to(EV, 1, 0), "A\tx");
+    assert exit_of(EV, 3, 1) == 1 and span_is(EV, body_from(EV, 3, 1), body_to(EV, 3, 1), "bad!\n");
+    assert exit_of(EV, 2, 0) == 1;
+    assert exit_of(EV, 3, 0) == NO_EXIT and section(EV, 3, 0) == EV.len + 1;
+    assert body_from(EV, 9, 0) == EV.len and body_to(EV, 9, 0) == EV.len;
+    const own : string = "@@ preflight 7 0 0 20\n@@ preflight 2 0 0 0\n\n";
+    assert exit_of(own, 7, 0) == 0 and exit_of(own, 2, 0) == NO_EXIT;
+}
+
+// Scenario: a header that is not the glue's, or a length that runs past the text, ends the evidence.
+test a_broken_section_is_not_evidence {
+    assert header_end("@@ preflight 1 0 0\n\n", 0) == 21;
+    assert header_end("@@ preflight 1 0 0 0 \n\n", 0) == 24;
+    assert header_end("@@ preflight 1  0 0 0\n\n", 0) == 24;
+    assert header_end("@@ preflight 1 0 0 0", 0) == 21;
+    assert header_end("@@ preflight 1 0 0 1234567890123456789\n", 0) == 40;
+    assert header_end("@@ preflight 1 0 0 0\n\n", 0) == 21;
+    assert exit_of("@@ preflight 1 0 0 9\nshort\n", 1, 0) == NO_EXIT;
+    assert exit_of("@@ preflight 1 0 0 2\nabc\n", 1, 0) == NO_EXIT;
+    assert exit_of("@@ preflight 1 0 0 2\nab\n@@ preflight 2 0 0 9\nx\n@@ preflight 3 0 0 0\n\n", 3, 0) == NO_EXIT;
+    assert exit_of("", 1, 0) == NO_EXIT and next_section("", 0) == 1;
+}
+
+// Scenario: the diff must be parsed, and must not be empty.
+test rule_changes_needs_a_readable_diff {
+    const ok : string = "@@ preflight 0 0 0 0\n\n@@ preflight 1 0 0 0\n\n";
+    assert rule_verdict(C, ok, R_CHANGES, false) == P_PASS;
+    assert rule_verdict("", ok, R_CHANGES, false) == P_FAIL;
+    const fetch : string = "@@ preflight 0 0 128 5\nno ne\n@@ preflight 1 0 0 0\n\n";
+    assert rule_verdict(C, fetch, R_CHANGES, false) == P_UNREAD and evidence_step(C, fetch, R_CHANGES, 4) == STEP_FETCH;
+    assert rule_verdict(C, "", R_CHANGES, false) == P_UNREAD;
+    assert rule_verdict("A\t\"specs/x/a b.t27\"\n", ok, R_CHANGES, false) == P_FAIL;
+    assert rule_at("M\tdocs/a.md\nA\t\"specs/x/a b.t27\"\n", ok, R_CHANGES, false) == 1;
+}
+
+// Scenario: origin/master an ancestor of HEAD is green, 1 from --is-ancestor fails, anything else is no outcome.
+test rule_base_needs_master_merged {
+    assert rule_verdict(C, "@@ preflight 2 0 0 0\n\n", R_BASE, false) == P_PASS;
+    assert rule_verdict(C, "@@ preflight 2 0 1 0\n\n", R_BASE, false) == P_FAIL;
+    assert rule_verdict(C, "@@ preflight 2 0 128 0\n\n", R_BASE, false) == P_UNREAD;
+    assert rule_verdict(C, "", R_BASE, false) == P_UNREAD;
+    assert rule_at(C, "@@ preflight 2 0 1 0\n\n", R_BASE, false) == 4;
+}
+
+// Scenario: each target's check is its exit; a target that was not checked is no outcome.
+test rule_check_reads_the_exit {
+    const both : string = "@@ preflight 3 0 0 0\n\n@@ preflight 3 1 0 0\n\n";
+    assert rule_verdict(C, both, R_CHECK, false) == P_PASS;
+    const red : string = "@@ preflight 3 0 0 0\n\n@@ preflight 3 1 1 0\n\n";
+    assert rule_verdict(C, red, R_CHECK, false) == P_FAIL and rule_at(C, red, R_CHECK, false) == 1;
+    assert rule_verdict(C, "@@ preflight 3 0 0 0\n\n", R_CHECK, false) == P_UNREAD;
+    assert rule_verdict(C, "@@ preflight 3 0 127 0\n\n@@ preflight 3 1 0 0\n\n", R_CHECK, false) == P_UNREAD;
+    assert rule_verdict("M\tdocs/a.md\n", "", R_CHECK, false) == P_PASS;
+}
+
+// Scenario: a green report is green; a vacuous pass, a FAIL exit and a report with no totals do not.
+test rule_tests_refuses_a_vacuous_pass {
+    const c : string = "M\tspecs/x/old.t27\n";
+    const green : string = "@@ preflight 4 0 0 61\n  tests       2\n  pass        2\n  vacuous passes  0 of 2  (x)\n";
+    assert rule_verdict(c, green, R_TESTS, false) == P_PASS;
+    const vac : string = "@@ preflight 4 0 0 61\n  tests       2\n  pass        2\n  vacuous passes  1 of 2  (x)\n";
+    assert rule_verdict(c, vac, R_TESTS, false) == P_FAIL;
+    const failed : string = "@@ preflight 4 0 1 28\n  FAIL  pos\n  tests       2\n\n";
+    assert rule_verdict(c, failed, R_TESTS, false) == P_FAIL;
+    assert rule_verdict(c, "@@ preflight 4 0 0 3\nok\n\n", R_TESTS, false) == P_UNREAD;
+    assert rule_verdict(c, "@@ preflight 4 0 0 16\n  tests       0\n\n", R_TESTS, false) == P_PASS;
+    assert rule_verdict(c, "@@ preflight 4 0 0 35\n  tests       1\n  vacuous passes x\n\n", R_TESTS, false) == P_UNREAD;
+    assert evidence_step(c, vac, R_TESTS, 0) == STEP_REPORT;
+}
+
+// Scenario: every hash MATCH is green; a mismatch and a missing seal fail.
+test rule_seal_needs_every_hash_to_match {
+    const c : string = "A\tspecs/zz/zz.t27\n";
+    assert rule_verdict(c, "@@ preflight 5 0 0 35\nspec_hash: MATCH\n\nall hashes MATCH\n\n", R_SEAL, false) == P_PASS;
+    assert rule_verdict(c, "@@ preflight 5 0 1 33\nspec_hash: MISMATCH (saved=a, c)\n\n", R_SEAL, false) == P_FAIL;
+    assert rule_verdict(c, "@@ preflight 5 0 1 33\nError: No saved seal found at x.\n\n", R_SEAL, false) == P_FAIL;
+    assert rule_verdict(c, "@@ preflight 5 0 0 17\nspec_hash: MATCH\n\n", R_SEAL, false) == P_UNREAD;
+}
+
+// Scenario: both type commands exit 0 and the ratchet says CLEAN; anything else is not a pass.
+test rule_types_needs_a_clean_ratchet {
+    const clean : string = "@@ preflight 9 0 0 4\n  OK\n@@ preflight 10 0 0 50\n  ledger 108 names, observed 108\n  RATCHET: CLEAN\n\n";
+    assert rule_verdict(C, clean, R_TYPES, false) == P_PASS;
+    const red : string = "@@ preflight 9 0 0 4\n  OK\n@@ preflight 10 0 1 16\n  RATCHET: FAIL\n\n";
+    assert rule_verdict(C, red, R_TYPES, false) == P_FAIL and evidence_step(C, red, R_TYPES, 4) == STEP_RATCHET;
+    const cls : string = "@@ preflight 9 0 1 4\n  NO\n@@ preflight 10 0 0 17\n  RATCHET: CLEAN\n\n";
+    assert rule_verdict(C, cls, R_TYPES, false) == P_FAIL and evidence_step(C, cls, R_TYPES, 4) == STEP_CLASSIFIED;
+    assert rule_verdict(C, "@@ preflight 9 0 0 0\n\n@@ preflight 10 0 0 3\nok\n\n", R_TYPES, false) == P_UNREAD;
+}
+
+// Scenario: a copy in an added spec fails and its evidence is the --like output naming the existing body.
+test rule_dupes_names_where_the_body_lives {
+    const g : string = "@@ preflight 11 0 0 61\nok: no new duplicate body, and none of the known groups grew.\n";
+    const copy : string = "@@ preflight 11 0 0 61\nok: no new duplicate body, and none of the known groups grew.\n@@ preflight 8 0 0 94\nspecs/x/new.t27:2 line_end is already written in 2 place(s):\n    specs/tri/lab/receipt.t27:84\n\n";
+    assert rule_verdict(C, copy, R_DUPES, false) == P_FAIL and rule_at(C, copy, R_DUPES, false) == 0;
+    assert evidence_step(C, copy, R_DUPES, 0) == STEP_LIKE;
+    assert find_in(copy, evidence_from(copy, STEP_LIKE, 0), evidence_to(copy, STEP_LIKE, 0), "receipt.t27:84") < copy.len;
+    const clean : string = "@@ preflight 11 0 0 61\nok: no new duplicate body, and none of the known groups grew.\n@@ preflight 8 0 0 59\nspecs/x/new.t27: nothing in this file is written elsewhere\n\n";
+    assert rule_verdict(C, clean, R_DUPES, false) == P_PASS;
+    assert rule_verdict(C, g, R_DUPES, false) == P_UNREAD;
+    assert rule_verdict("M\tspecs/x/old.t27\n", g, R_DUPES, false) == P_PASS;
+    assert rule_verdict("M\tspecs/x/old.t27\n", "@@ preflight 11 0 1 4\nnew\n\n", R_DUPES, false) == P_FAIL;
+}
+
+// Scenario: a deleted spec must leave both ledgers; an added spec needs its t27b row.
+test rule_ledgers_rows_follow_the_specs {
+    const s0 : string = "@@ preflight 13 0 0 2\n[]\n@@ preflight 14 0 0 38\n{\"path\": \"specs/x/new.t27\", \"t27b\": 1}\n";
+    assert rule_verdict(C, s0, R_LEDGERS, false) == P_PASS;
+    const stale : string = "@@ preflight 13 0 0 27\n{\"path\": \"specs/x/gone.t27\"\n@@ preflight 14 0 0 38\n{\"path\": \"specs/x/new.t27\", \"t27b\": 1}\n";
+    assert rule_verdict(C, stale, R_LEDGERS, false) == P_FAIL and rule_at(C, stale, R_LEDGERS, false) == 2;
+    const none : string = "@@ preflight 13 0 0 2\n[]\n@@ preflight 14 0 0 39\n{\"path\": \"specs/x/new.t27x\", \"t27b\": 1}\n";
+    assert rule_verdict(C, none, R_LEDGERS, false) == P_FAIL and rule_at(C, none, R_LEDGERS, false) == 0;
+    assert rule_verdict(C, "@@ preflight 13 0 0 2\n[]\n", R_LEDGERS, false) == P_UNREAD;
+    assert evidence_step(C, none, R_LEDGERS, 0) == NO_STEP;
+}
+
+const SUITE_OUT : string = "@@ preflight 15 0 1 244\n    - specs/x/new.t27 [gen]\n--- Ratchet (W628) ---\n  UNEXPECTED PASSES  : 3\n    - specs/igla/coder/arch.t27 [parse] (fixed -- remove from the ledger)\n    - specs/x/old.t27x [parse]\n    - specs/x/old.t27 [parse-no-discard] (fixed)\nRATCHET: FAIL\n\n";
+
+// Scenario: the corpus ratchet fails the branch only for a finding that names a spec it changes.
+test rule_suite_judges_only_changed_specs {
+    assert ratchet_at(SUITE_OUT) < SUITE_OUT.len;
+    assert entry_verdict(C, SUITE_OUT, R_SUITE, 0, false) == P_PASS;
+    assert entry_verdict(C, SUITE_OUT, R_SUITE, 1, false) == P_FAIL;
+    assert rule_verdict(C, SUITE_OUT, R_SUITE, false) == P_FAIL and rule_at(C, SUITE_OUT, R_SUITE, false) == 1;
+    assert rule_verdict("A\tspecs/x/new.t27\n", SUITE_OUT, R_SUITE, false) == P_PASS;
+    assert rule_verdict(C, SUITE_OUT, R_SUITE, true) == P_NOT_RUN;
+    assert rule_verdict(C, "", R_SUITE, false) == P_UNREAD;
+    assert rule_verdict(C, "@@ preflight 15 0 0 3\nok\n\n", R_SUITE, false) == P_UNREAD;
+    assert span_is(SUITE_OUT, evidence_from(SUITE_OUT, STEP_SUITE, 0), evidence_from(SUITE_OUT, STEP_SUITE, 0) + 3, "---");
+    const cut : string = "@@ preflight 15 0 1 71\n--- Ratchet (W628) ---\n    ... and 3 more NOT SHOWN -- see the ledger\n\n";
+    assert rule_verdict("A\tspecs/x/new.t27\n", cut, R_SUITE, false) == P_UNREAD;
+}
+
+// Scenario: a new workflow needs tools/census/ in the same change and a clean census gate.
+test rule_census_follows_a_new_workflow {
+    const w : string = "A\t.github/workflows/new.yml\n";
+    const wc : string = "A\t.github/workflows/new.yml\nM\ttools/census/quiet.txt\n";
+    const red : string = "@@ preflight 12 0 1 5\nFAIL\n\n";
+    const green : string = "@@ preflight 12 0 0 0\n\n";
+    assert rule_verdict(C, red, R_CENSUS, false) == P_PASS;
+    assert rule_verdict(w, green, R_CENSUS, false) == P_FAIL and evidence_step(w, green, R_CENSUS, 1) == NO_STEP;
+    assert rule_verdict(wc, red, R_CENSUS, false) == P_FAIL and evidence_step(wc, red, R_CENSUS, 2) == STEP_CENSUS;
+    assert rule_verdict(wc, green, R_CENSUS, false) == P_PASS;
+    assert rule_verdict(wc, "", R_CENSUS, false) == P_UNREAD;
+}
+
+// Scenario: PR #8879 took 12 of 26 tests out of a spec; fewer test blocks than master fails.
+test rule_count_refuses_deleted_tests {
+    const c : string = "M\tspecs/x/old.t27\n";
+    const fewer : string = "@@ preflight 6 0 0 32\ntest a {\n}\ntest b {\n}\ntest c {\n}\n@@ preflight 7 0 0 33\ntest a {\n}\n// test b\n  test c {\n}\n";
+    assert tests_in(fewer, STEP_BASE, 0) == 3 and tests_in(fewer, STEP_HEAD, 0) == 1;
+    assert rule_verdict(c, fewer, R_COUNT, false) == P_FAIL and rule_at(c, fewer, R_COUNT, false) == 0;
+    const more : string = "@@ preflight 6 0 0 10\ntest a {\n}\n@@ preflight 7 0 0 21\ntest a {\n}\ntest b {\n}\n";
+    assert rule_verdict(c, more, R_COUNT, false) == P_PASS;
+    assert rule_verdict(c, "@@ preflight 6 0 128 0\n\n@@ preflight 7 0 0 0\n\n", R_COUNT, false) == P_UNREAD;
+    assert rule_verdict("A\tspecs/x/new.t27\n", "", R_COUNT, false) == P_PASS;
+}
+
+// Scenario: the exit is 1 for any FAIL, 2 for no outcome and no FAIL, and 0 only when all ran green.
+test the_exit_is_the_worst_rule {
+    const c : string = "M\tdocs/a.md\n";
+    const green : string = "@@ preflight 0 0 0 0\n\n@@ preflight 1 0 0 0\n\n@@ preflight 2 0 0 0\n\n@@ preflight 9 0 0 0\n\n@@ preflight 10 0 0 15\nRATCHET: CLEAN\n\n@@ preflight 11 0 0 26\nok: no new duplicate body\n\n@@ preflight 13 0 0 0\n\n@@ preflight 14 0 0 0\n\n";
+    assert preflight_exit(c, green, true) == PF_OK;
+    assert preflight_exit(c, green, false) == PF_UNREAD;
+    const behind : string = "@@ preflight 0 0 0 0\n\n@@ preflight 1 0 0 0\n\n@@ preflight 2 0 1 0\n\n";
+    assert preflight_exit(c, behind, true) == PF_FAIL;
+    assert preflight_exit(c, "", true) == PF_UNREAD;
+}
+
+// Scenario: evidence stops at MAX_EVIDENCE bytes, never on a UTF-8 continuation byte (source is ASCII,
+// so the back-off is shown through is_tail).
+test the_evidence_is_cut_at_max_bytes {
+    assert evidence_from(EV, STEP_CHECK, 1) == body_from(EV, STEP_CHECK, 1);
+    assert evidence_to(EV, STEP_CHECK, 1) == body_to(EV, STEP_CHECK, 1);
+    assert evidence_from(EV, STEP_CHANGES, 3) == body_from(EV, STEP_CHANGES, 0);
+    assert evidence_from(EV, STEP_SUITE, 0) == EV.len and evidence_to(EV, STEP_SUITE, 0) == EV.len;
+    assert is_tail(128) and is_tail(191) and is_tail(192) == false and is_tail(127) == false and is_tail(0) == false;
+    const u : string = "abcdefgh";
+    assert cut_at(u, 0, 8, 100) == 8 and cut_at(u, 0, 8, 8) == 8 and cut_at(u, 0, 8, 3) == 3 and cut_at(u, 2, 8, 3) == 5;
+    assert cut_at(u, 3, 8, 0) == 3 and cut_at(u, 8, 8, 0) == 8;
+}
+
+// Scenario: every rule and outcome has a label, and every FAIL says what to do.
+test each_rule_and_verdict_says_what_it_means {
+    var r : u8 = 0;
+    while (r < RULES) {
+        assert rule_name(r).len >= 4 and rule_why(r, P_FAIL).len > 40;
+        assert span_is(rule_why(r, P_PASS), 0, 2, "ok");
+        r = r + 1;
+    }
+    assert span_is(name(P_FAIL), 0, 4, "FAIL") and span_is(name(P_UNREAD), 0, 6, "UNREAD");
+    assert span_is(rule_why(R_TYPES, P_FAIL), 0, 30, "the types ratchet is not CLEAN");
+    assert span_is(preflight_exit_why(PF_UNREAD), 0, 6, "exit 2") and span_is(preflight_exit_why(PF_FAIL), 0, 6, "exit 1");
+}
