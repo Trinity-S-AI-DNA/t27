@@ -1016,10 +1016,10 @@ pub(crate) fn report_names(t: &'static str, k: u8) -> String {
     (0..report::count(t, k)).map(|n| &t[report::name_from(t, k, n)..report::name_to(t, k, n)]).collect::<Vec<_>>().join(", ")
 }
 
-/// The one greppable line: `tests: N, pass: P, fail: F (names)`, or `, BLOCKED: <why>`.
+/// The one greppable line: `tests: N, pass: P, fail: F (names)`, or `, BLOCKED: <why>`, or `, vacuous: <names>` (#10497).
 pub(crate) fn report_summary(t: &'static str) -> String {
-    let (b, f, n) = (report_names(t, report::LINE_BLOCKED), report_names(t, report::LINE_FAIL_NAME), |k| report::total(t, k));
-    let tail = if !b.is_empty() { format!(", BLOCKED: {b}") } else if !f.is_empty() { format!(" ({f})") } else { String::new() };
+    let (b, f, v, n) = (report_names(t, report::LINE_BLOCKED), report_names(t, report::LINE_FAIL_NAME), report_names(t, report::LINE_VACUOUS_NAME), |k| report::total(t, k));
+    let tail = if !b.is_empty() { format!(", BLOCKED: {b}") } else if !f.is_empty() { format!(" ({f})") } else if !v.is_empty() { format!(", vacuous: {v}") } else { String::new() };
     format!("tests: {}, pass: {}, fail: {}{tail}", n(report::LINE_TESTS), n(report::LINE_PASS), n(report::LINE_FAIL))
 }
 
