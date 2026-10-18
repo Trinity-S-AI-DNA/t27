@@ -29,6 +29,12 @@
 ;    bool (gen-rust and t27b refuse `?void`): `Ok(())` is `true`, an error `false`.
 ;    A read-only `String` / `&String` / `Vec<T>` / `&Vec<T>` parameter is `[]const u8` / `[]const T`; a
 ;    Vec anywhere else, and an owned String outside the out-buffer form (next paragraph), stays refused.
+;    A `vec![a, b, c]` or `vec![x; N]` that the fn only reads (#10643) is a typed array, `let v = vec![..];`
+;    as `const v : [3]T = [..];` (`[N]T = [x] ** N` for a repeat; N one number or one const of the file):
+;    t27 holds no growing list, so T must come from the source -- the `Vec<T>` annotation, the first element
+;    (a suffixed number, a text, a bool, a variant, a struct literal, a call of a fn that returns one plain
+;    type) or the `&[T]` parameter of the call that takes `&v` -- and a vec the fn pushes to, assigns into,
+;    takes by `&mut`, hands on whole, or of an unknown type or length stays refused, the reason saying which.
 ;    A tuple struct is a struct with fields `_0`, `_1`,
 ;    .., built by `Name{ ._0 = a }` and read as `x._0`. `impl Default for T` is an inherent impl
 ;    (`T_default`). `matches!(e, P | Q)` is the patterns' condition.
@@ -88,8 +94,9 @@
 ; variants with data, labels, &mut of a scalar, `mut self`, unsafe, and if / match / blocks used as a
 ; value without a type annotation.
 ; --
-; The caller passes the source, an output buffer and a state vector: STATE slots, then the name table
-; (NAME_SLOTS a name, as many as fit). The result is the number of bytes the output needs; the buffer was
+; The caller passes the source, an output buffer and a state vector: STATE slots, the index slots (IXHIT ..
+; IXTOP), then the name table (NAME_SLOTS a name, as many as fit; the declaration index takes the top of
+; the vector, the table stops where it begins). The result is the number of bytes the output needs; the buffer was
 ; too small when that is above out.len (the bytes past the end are counted, not written). Every byte
 ; this spec reads or writes is a number, as in specs/tri/t27b/source_text.t27 (#7604): gen-rust reads a
 ; char literal as a Rust char.
@@ -182,8 +189,19 @@ pub const CFB : usize = 49;
 pub const CCNT : usize = 50;
 /// The most samples one parameter holds: its fixed ones plus the body-derived ones (FR-003 of #9102).
 pub const DCAP : usize = 64;
-pub const STATE : usize = 51;
-pub const NAMES : usize = 51;
+/// The line cache of line_at: the position of the last line asked for, and the newlines before it.
+pub const LNPOS : usize = 51;
+pub const LNNL : usize = 52;
+pub const STATE : usize = 53;
+/// The declaration index (#10544), slots the passes keep (STATE slots start every pass over): the slot of
+/// the entry the last lookup found (0 when none), 1 once the index is built and whole, where its buckets
+/// begin, how many buckets a kind has, and the lowest slot an entry takes (the name table stops there).
+pub const IXHIT : usize = 53;
+pub const IXON : usize = 54;
+pub const IXB : usize = 55;
+pub const IXBN : usize = 56;
+pub const IXTOP : usize = 57;
+pub const NAMES : usize = 58;
 pub const NAME_SLOTS : usize = 5;
 
 pub const F_NONE : usize = 0;
@@ -297,6 +315,16 @@ pub const R_EMPTY : usize = 32;
 /// A unary `!` whose operand is neither a bool nor an integer t27o can name: Rust's `!` is a boolean NOT
 /// on the first and a bitwise NOT on the second, t27's `!` and `~` are the two, and a guess is a rewrite.
 pub const R_NOTYPE : usize = 33;
+/// A `vec![..]` the fn changes (pushes to, resizes, assigns into, takes by `&mut`), hands on whole (a
+/// call argument by value, a struct field, a return) or whose element type or length t27o cannot tell:
+/// t27 holds no growing list, so only a vec! the fn reads is an array (#10643).
+pub const R_VECMUT : usize = 34;
+pub const R_VECMOVE : usize = 35;
+pub const R_VECTYPE : usize = 36;
+/// How a fn uses a vec! local: VU_READ only reads it, VU_CHANGED changes it, VU_MOVED hands it on.
+pub const VU_READ : usize = 0;
+pub const VU_CHANGED : usize = 1;
+pub const VU_MOVED : usize = 2;
 
 // The bytes the converter reads, as numbers (#7604).
 pub const B_TAB : u8 = 9;
@@ -566,6 +594,27 @@ pub fn line_of(src: []const u8, pos: usize) -> usize {
     return n;
 }
 
+/// line_of with a cache: the position of the last line asked for is kept in the state with the newlines
+/// before it, and a later position counts on from there (the refusals of a pass come in file order, so
+/// all of them together walk the file once); an earlier one counts from byte 0, as line_of does.
+pub fn line_at(src: []const u8, st: []usize, pos: usize) -> usize {
+    var i : usize = 0;
+    var n : usize = 0;
+    if (st[LNPOS] <= pos) {
+        i = st[LNPOS];
+        n = st[LNNL];
+    }
+    var end : usize = pos;
+    if (end > src.len) { end = src.len; }
+    while (i < end) {
+        if (src[i] == B_NL) { n = n + 1; }
+        i = i + 1;
+    }
+    st[LNPOS] = end;
+    st[LNNL] = n;
+    return n + 1;
+}
+
 /// Where the bracket that opens at src[o] closes: past its match, every bracket kind counted.
 pub fn block_end(src: []const u8, o: usize) -> usize {
     var depth : usize = 0;
@@ -604,9 +653,16 @@ pub fn find_at(src: []const u8, from: usize, c: u8) -> usize {
 
 /// The token `s` at bracket depth 0 from `from`, before any unmatched closer; src.len when none.
 pub fn find_tok(src: []const u8, from: usize, s: []const u8) -> usize {
+    return find_tok_to(src, from, src.len, s);
+}
+
+/// find_tok that reads no token at or past src[hi]: src.len when `s` is not before it. (An impl's header
+/// looks for its `for` before the `{`; without the bound the walk ran on to the next top-level `for` of
+/// the file, once per impl.)
+pub fn find_tok_to(src: []const u8, from: usize, hi: usize, s: []const u8) -> usize {
     var depth : usize = 0;
     var q : usize = from;
-    while (q < src.len) {
+    while (q < src.len and q < hi) {
         const e : usize = tok_end(src, q);
         if (depth == 0 and word_is(src, q, e, s)) { return q; }
         if (e == q + 1 and is_open(src[q])) { depth = depth + 1; }
@@ -786,7 +842,10 @@ pub fn add_name(src: []const u8, st: []usize, kind: usize, lo: usize, hi: usize,
         k = k + 1;
     }
     const e : usize = NAMES + st[NNAMES] * NAME_SLOTS;
-    if (e + NAME_SLOTS > st.len) { return; }
+    // the name table stops where the declaration index begins, when one is built
+    var lim : usize = st.len;
+    if (st[IXON] == 1) { lim = st[IXTOP]; }
+    if (e + NAME_SLOTS > lim) { return; }
     st[e] = lo;
     st[e + 1] = hi;
     st[e + 2] = olo;
@@ -829,6 +888,246 @@ pub fn strloc_in(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
     return false;
 }
 
+// ---------------------------------------------------------------- the declaration index (#10544)
+
+/// A lookup of a declaration by name used to walk the file token by token from byte 0 and test every
+/// keyword it met. The index holds, per name, the position of each keyword token that has that name
+/// next to it, in file order, and a lookup runs the very same test on those tokens alone. Three kinds
+/// of chain: IXK_ITEM the `struct` `enum` `type` `trait` `union` `const` `static` tokens (by the name
+/// that follows; a `const mut` / `static mut` also by the one after `mut`), IXK_FN the `fn` tokens (by
+/// the name that follows), IXK_LET the `let` tokens that bind a name to a type (by the name that
+/// follows, `mut` skipped). The impls have a chain of their own, in file order, without a name.
+pub const IXK_ITEM : usize = 0;
+pub const IXK_FN : usize = 1;
+pub const IXK_LET : usize = 2;
+pub const IXK_KINDS : usize = 3;
+/// An entry takes four slots: the text of its name (lo, hi), the position of its keyword token, and the
+/// next entry of its chain (0 ends the chain). An impl entry has the `{` of an inherent impl and its end
+/// where the name would be (both 0 for an impl that is not `impl Name {`).
+pub const IX_SLOTS : usize = 4;
+
+/// A hash of src[a .. b], kept below 1000003 so that no step overflows.
+pub fn ix_hash(src: []const u8, a: usize, b: usize) -> usize {
+    var h : usize = 0;
+    var k : usize = a;
+    while (k < b) {
+        h = (h * 31 + (src[k] as usize) + 1) % 1000003;
+        k = k + 1;
+    }
+    return h;
+}
+
+/// Link the entry at slot e after the last one of the chain whose first slot is st[head].
+pub fn ix_link(st: []usize, head: usize, e: usize) -> void {
+    var s : usize = st[head];
+    if (s == 0) {
+        st[head] = e;
+        return;
+    }
+    while (st[s + 3] != 0) { s = st[s + 3]; }
+    st[s + 3] = e;
+}
+
+/// Take the next entry's four slots from the index's room (it may take half of the free slots, no more)
+/// and chain it at st[head]. False when it does not fit.
+pub fn ix_enter(st: []usize, head: usize, lo: usize, hi: usize, q: usize) -> bool {
+    if (st[IXTOP] < NAMES + (st.len - NAMES) / 2 + IX_SLOTS) { return false; }
+    const e : usize = st[IXTOP] - IX_SLOTS;
+    st[e] = lo;
+    st[e + 1] = hi;
+    st[e + 2] = q;
+    st[e + 3] = 0;
+    ix_link(st, head, e);
+    st[IXTOP] = e;
+    return true;
+}
+
+/// Enter the keyword token src[q] of chain `kind` under the name src[lo .. hi].
+pub fn ix_add(src: []const u8, st: []usize, kind: usize, lo: usize, hi: usize, q: usize) -> bool {
+    if (hi <= lo) { return true; }
+    const head : usize = st[IXB] + kind * st[IXBN] + ix_hash(src, lo, hi) % st[IXBN];
+    return ix_enter(st, head, lo, hi, q);
+}
+
+/// The first entry of chain `kind` named src[a .. b], 0 when there is none. Its slot goes to st[IXHIT]
+/// (what a test reads to know the index answered); the position of its keyword token is st[slot + 2].
+pub fn ix_first(src: []const u8, st: []usize, kind: usize, a: usize, b: usize) -> usize {
+    st[IXHIT] = 0;
+    if (b <= a) { return 0; }
+    var s : usize = st[st[IXB] + kind * st[IXBN] + ix_hash(src, a, b) % st[IXBN]];
+    while (s != 0 and !same_text(src, st[s], st[s + 1], a, b)) { s = st[s + 3]; }
+    st[IXHIT] = s;
+    return s;
+}
+
+/// The entry after slot s0 with the same name.
+pub fn ix_next(src: []const u8, st: []usize, s0: usize, a: usize, b: usize) -> usize {
+    var s : usize = st[s0 + 3];
+    while (s != 0 and !same_text(src, st[s], st[s + 1], a, b)) { s = st[s + 3]; }
+    st[IXHIT] = s;
+    return s;
+}
+
+/// Is the token at src[q] one of the keywords that declare an item?
+pub fn item_kw(src: []const u8, q: usize, e: usize) -> bool {
+    return word_is(src, q, e, "struct") or word_is(src, q, e, "enum") or word_is(src, q, e, "type") or word_is(src, q, e, "trait") or word_is(src, q, e, "union") or word_is(src, q, e, "const") or word_is(src, q, e, "static");
+}
+
+/// The type token a `let` binds src[ra .. rb] to, when the token at src[q] is that `let`: `let r =
+/// Type::new(..)` (a builder chain may follow), `let r = Type {`, `let r: Type =`; src.len otherwise.
+pub fn let_at(src: []const u8, q: usize, ra: usize, rb: usize) -> usize {
+    var best : usize = src.len;
+    const e : usize = tok_end(src, q);
+    if (word_is(src, q, e, "let")) {
+        var n : usize = skip_ws(src, e);
+        if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+        const ne : usize = tok_end(src, n);
+        if (same_text(src, n, ne, ra, rb)) {
+            var t : usize = skip_ws(src, ne);
+            // `let r: Type = ..` says the type between the colon and the equals
+            if (tok_is(src, t, ":")) {
+                t = skip_ws(src, tok_end(src, t));
+                while (tok_is(src, t, "&") or tok_is(src, t, "mut")) { t = skip_ws(src, tok_end(src, t)); }
+                const te : usize = tok_end(src, t);
+                if (t < src.len and is_upper(src[t]) and tok_is(src, skip_ws(src, te), "=")) { best = t; }
+            }
+            if (tok_is(src, t, "=")) {
+                var v : usize = skip_ws(src, tok_end(src, t));
+                while (tok_is(src, v, "&") or tok_is(src, v, "mut")) { v = skip_ws(src, tok_end(src, v)); }
+                const ve : usize = tok_end(src, v);
+                if (v < src.len and is_upper(src[v])) {
+                    // `Type::new(..)` names its own type, and so do `Type {` and `Type(`
+                    const nx : usize = skip_ws(src, ve);
+                    if (tok_is(src, nx, "::") or src[nx] == B_LBRACE or src[nx] == B_LPAREN) { best = v; }
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// Walk the file once, the way the lookups did, and enter what they will look for. The index lives at
+/// the top of the state vector, the buckets first; the name table stops where it begins. A file with
+/// more declarations than fit leaves the index off (IXON 0): the lookups then walk the file as before.
+pub fn index_decls(src: []const u8, st: []usize) -> void {
+    st[IXON] = 0;
+    st[IXHIT] = 0;
+    st[IXTOP] = st.len;
+    if (st.len < NAMES + 64) { return; }
+    var bn : usize = src.len / 512;
+    if (bn > (st.len - NAMES) / 64) { bn = (st.len - NAMES) / 64; }
+    if (bn < 1) { bn = 1; }
+    const top : usize = st.len - IXK_KINDS * bn - 1;
+    var z : usize = top;
+    while (z < st.len) {
+        st[z] = 0;
+        z = z + 1;
+    }
+    st[IXB] = top;
+    st[IXBN] = bn;
+    st[IXTOP] = top;
+    const impls : usize = top + IXK_KINDS * bn;
+    var whole : bool = true;
+    var q : usize = skip_ws(src, 0);
+    while (q < src.len and whole) {
+        const e : usize = tok_end(src, q);
+        if (item_kw(src, q, e)) {
+            const n : usize = skip_ws(src, e);
+            if (!ix_add(src, st, IXK_ITEM, n, tok_end(src, n), q)) { whole = false; }
+            if ((word_is(src, q, e, "const") or word_is(src, q, e, "static")) and tok_is(src, n, "mut")) {
+                const m : usize = skip_ws(src, tok_end(src, n));
+                if (!ix_add(src, st, IXK_ITEM, m, tok_end(src, m), q)) { whole = false; }
+            }
+        } else if (word_is(src, q, e, "fn")) {
+            const n : usize = skip_ws(src, e);
+            if (!ix_add(src, st, IXK_FN, n, tok_end(src, n), q)) { whole = false; }
+        } else if (word_is(src, q, e, "let")) {
+            var n : usize = skip_ws(src, e);
+            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+            const ne : usize = tok_end(src, n);
+            if (let_at(src, q, n, ne) < src.len and !ix_add(src, st, IXK_LET, n, ne, q)) { whole = false; }
+        } else if (word_is(src, q, e, "impl")) {
+            const t : usize = skip_ws(src, e);
+            const o : usize = skip_ws(src, tok_end(src, t));
+            var lb : usize = 0;
+            var hb : usize = 0;
+            if (t < src.len and is_alpha(src[t]) and o < src.len and src[o] == B_LBRACE) {
+                lb = o;
+                hb = block_end(src, o);
+            }
+            if (!ix_enter(st, impls, lb, hb, q)) { whole = false; }
+        }
+        q = skip_ws(src, e);
+    }
+    if (whole) {
+        st[IXON] = 1;
+    } else {
+        st[IXTOP] = st.len;
+    }
+}
+
+/// Do the lookups answer the same with the index as with the walk of the file, for the name src[a .. b]?
+/// (What the index tests compare: the index is switched off for the walk, and back on.)
+pub fn lookups_agree(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
+    const on : usize = st[IXON];
+    const fs : usize = find_struct(src, st, a, b);
+    const so : usize = struct_open(src, st, a, b);
+    const ct : usize = const_type(src, st, a, b);
+    const fr : usize = fn_ret_type(src, st, a, b);
+    const rc : u8 = ret_class(src, st, a, b);
+    const lo : usize = let_owner(src, st, a, b);
+    const dt : bool = declared_type(src, st, a, b);
+    const df : bool = declared_fn(src, st, a, b);
+    st[IXON] = 0;
+    var same : bool = fs == find_struct(src, st, a, b) and so == struct_open(src, st, a, b) and ct == const_type(src, st, a, b);
+    same = same and fr == fn_ret_type(src, st, a, b) and rc == ret_class(src, st, a, b) and lo == let_owner(src, st, a, b);
+    same = same and dt == declared_type(src, st, a, b) and df == declared_fn(src, st, a, b);
+    st[IXON] = on;
+    return same;
+}
+
+/// Do method_owner (the method src[na .. nb], a receiver typed src[ola .. ohb]) and impl_around (the impl
+/// around src[na]) answer the same, and leave the same in the state, with the index as with the walk?
+pub fn owners_agree(src: []const u8, st: []usize, na: usize, nb: usize, ola: usize, ohb: usize) -> bool {
+    const on : usize = st[IXON];
+    const m1 : bool = method_owner(src, st, na, nb, ola, ohb);
+    const lo1 : usize = st[OLO];
+    const hi1 : usize = st[OHI];
+    const k1 : usize = st[OKIND];
+    const i1 : bool = impl_around(src, st, na);
+    const ilo1 : usize = st[OLO];
+    const ihi1 : usize = st[OHI];
+    st[IXON] = 0;
+    const m0 : bool = method_owner(src, st, na, nb, ola, ohb);
+    const lo0 : usize = st[OLO];
+    const hi0 : usize = st[OHI];
+    const k0 : usize = st[OKIND];
+    const i0 : bool = impl_around(src, st, na);
+    st[IXON] = on;
+    return m1 == m0 and i1 == i0 and ilo1 == st[OLO] and ihi1 == st[OHI] and (!m1 or (lo1 == lo0 and hi1 == hi0 and k1 == k0));
+}
+
+/// Do they agree on every name src spells, declared or not -- and every method name against every type
+/// name for the impl that owns it?
+pub fn all_names_agree(src: []const u8, st: []usize) -> bool {
+    var q : usize = skip_ws(src, 0);
+    while (q < src.len) {
+        const e : usize = tok_end(src, q);
+        if (is_alpha(src[q])) {
+            if (!lookups_agree(src, st, q, e)) { return false; }
+            if (!owners_agree(src, st, q, e, 0, 0)) { return false; }
+            var r : usize = skip_ws(src, 0);
+            while (r < src.len) {
+                const re : usize = tok_end(src, r);
+                if (is_alpha(src[r]) and !owners_agree(src, st, q, e, r, re)) { return false; }
+                r = skip_ws(src, re);
+            }
+        }
+        q = skip_ws(src, e);
+    }
+    return true;
+}
+
 /// Each `fn <name>` in src[lo .. hi] as a refused member of the type src[olo .. ohi].
 pub fn record_fns(src: []const u8, st: []usize, lo: usize, hi: usize, olo: usize, ohi: usize) -> void {
     var q : usize = lo;
@@ -860,33 +1159,42 @@ pub fn use_names(src: []const u8, st: []usize, u: usize, end: usize) -> void {
 }
 
 /// Is there a `fn <name>` anywhere in the file?
-pub fn declared_fn(src: []const u8, a: usize, b: usize) -> bool {
+pub fn declared_fn(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
+    if (st[IXON] == 1) { return ix_first(src, st, IXK_FN, a, b) != 0; }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "fn")) {
-            const n : usize = skip_ws(src, e);
-            if (same_text(src, n, tok_end(src, n), a, b)) { return true; }
-        }
-        q = skip_ws(src, e);
+        if (fn_named(src, q, a, b)) { return true; }
+        q = skip_ws(src, tok_end(src, q));
     }
     return false;
+}
+
+/// Is the keyword token at src[q] one that declares the item src[a .. b] (the name right after it)?
+pub fn item_named(src: []const u8, q: usize, a: usize, b: usize) -> bool {
+    const e : usize = tok_end(src, q);
+    if (!item_kw(src, q, e)) { return false; }
+    const n : usize = skip_ws(src, e);
+    return same_text(src, n, tok_end(src, n), a, b);
 }
 
 /// Is the capitalized name src[a .. b] declared in the file (struct, enum, type, trait, union, const,
 /// static), or one Rust always has (Self, Option, Some, None, Result, Ok, Err, String, Vec; ty refuses the
 /// last two outside a parameter)?
-pub fn declared_type(src: []const u8, a: usize, b: usize) -> bool {
+pub fn declared_type(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
     if (word_is(src, a, b, "Self") or word_is(src, a, b, "Option") or word_is(src, a, b, "Some") or word_is(src, a, b, "None")) { return true; }
     if (word_is(src, a, b, "Result") or word_is(src, a, b, "Ok") or word_is(src, a, b, "Err") or word_is(src, a, b, "String") or word_is(src, a, b, "Vec")) { return true; }
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_ITEM, a, b);
+        while (s != 0) {
+            if (item_named(src, st[s + 2], a, b)) { return true; }
+            s = ix_next(src, st, s, a, b);
+        }
+        return false;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "struct") or word_is(src, q, e, "enum") or word_is(src, q, e, "type") or word_is(src, q, e, "trait") or word_is(src, q, e, "union") or word_is(src, q, e, "const") or word_is(src, q, e, "static")) {
-            const n : usize = skip_ws(src, e);
-            if (same_text(src, n, tok_end(src, n), a, b)) { return true; }
-        }
-        q = skip_ws(src, e);
+        if (item_named(src, q, a, b)) { return true; }
+        q = skip_ws(src, tok_end(src, q));
     }
     return false;
 }
@@ -934,7 +1242,7 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
         if ((st[s0 + 4] == K_ITEM or st[s0 + 4] == K_EXT) and same_text(src, st[s0], st[s0 + 1], st[ILO], st[IHI])) { self_bad = true; }
         k0 = k0 + 1;
     }
-    if (st[ILO] != st[IHI] and st[ERR] == 0 and !declared_type(src, st[ILO], st[IHI])) { refuse(st, R_UNDECL, st[ILO], st[ILO], st[IHI]); }
+    if (st[ILO] != st[IHI] and st[ERR] == 0 and !declared_type(src, st, st[ILO], st[IHI])) { refuse(st, R_UNDECL, st[ILO], st[ILO], st[IHI]); }
     // a member that takes `self` still belongs to the type that is not in the output: its t27
     // form would carry a parameter of the missing type. The acceptance here is the self-less
     // associated fn, which names neither the type nor a field of it.
@@ -955,7 +1263,10 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
             const nx : usize = skip_ws(src, e);
             const call : bool = tok_is(src, nx, "(");
             const after_dot : bool = tok_is(src, p0, ".");
-            const after_path : bool = tok_is(src, p0, "::");
+            // `super::f(..)`, `self::f(..)` and `crate::f(..)` name f of this file's own module, flattened: a use
+            // of f like a bare call (a test that reached a refused f through `super::` reached its stub)
+            const own_path : bool = tok_is(src, p0, "::") and p1 < src.len and (tok_is(src, p1, "super") or tok_is(src, p1, "self") or tok_is(src, p1, "crate"));
+            const after_path : bool = tok_is(src, p0, "::") and !own_path;
             // the name a declaration declares is no use of it
             const after_fn : bool = tok_is(src, p0, "fn") or tok_is(src, p0, "struct") or tok_is(src, p0, "enum") or tok_is(src, p0, "const") or tok_is(src, p0, "static") or tok_is(src, p0, "type") or tok_is(src, p0, "trait");
             var k : usize = 0;
@@ -981,14 +1292,14 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
             if (st[ERR] == 0 and self_bad and word_is(src, q, e, "Self")) {
                 const c1 : usize = skip_ws(src, e);
                 const c2 : usize = skip_ws(src, tok_end(src, c1));
-                const self_call : bool = tok_is(src, c1, "::") and c2 < src.len and is_alpha(src[c2]) and !is_upper(src[c2]) and tok_is(src, skip_ws(src, tok_end(src, c2)), "(") and declared_fn(src, c2, tok_end(src, c2));
+                const self_call : bool = tok_is(src, c1, "::") and c2 < src.len and is_alpha(src[c2]) and !is_upper(src[c2]) and tok_is(src, skip_ws(src, tok_end(src, c2)), "(") and declared_fn(src, st, c2, tok_end(src, c2));
                 if (!self_call) { refuse(st, R_DEPENDS, q, q, e); }
             }
-            if (st[ERR] == 0 and call and !after_dot and !after_path and !after_fn and !is_upper(src[q]) and !call_keyword(src, q, e) and !declared_fn(src, q, e)) {
+            if (st[ERR] == 0 and call and !after_dot and !after_path and !after_fn and !is_upper(src[q]) and !call_keyword(src, q, e) and !declared_fn(src, st, q, e)) {
                 refuse(st, R_UNDECL, q, q, e);
             }
             // a capitalized name nobody here declares came through a glob `use` or from another file
-            if (st[ERR] == 0 and is_upper(src[q]) and !after_dot and !after_path and !prim(src, q, e) and !declared_type(src, q, e)) {
+            if (st[ERR] == 0 and is_upper(src[q]) and !after_dot and !after_path and !prim(src, q, e) and !declared_type(src, st, q, e)) {
                 refuse(st, R_UNDECL, q, q, e);
             }
         }
@@ -1492,7 +1803,7 @@ pub fn expr_bp(src: []const u8, st: []usize, out: []u8, min: usize, ns: bool) ->
     return lvl;
 }
 
-/// Was the name src[a .. b] declared as an array (`name: [`, `name = [`) earlier in this fn? A Rust
+/// Was the name src[a .. b] declared as an array (`name: [`, `name = [`, `name = vec![`) earlier in this fn? A Rust
 /// borrow of it passes a slice, which t27 writes as `&name`; a borrow of anything else is dropped.
 pub fn array_local(src: []const u8, flo: usize, a: usize, b: usize) -> bool {
     var q : usize = flo;
@@ -1503,6 +1814,9 @@ pub fn array_local(src: []const u8, flo: usize, a: usize, b: usize) -> bool {
             const e1 : usize = tok_end(src, n1);
             const n2 : usize = skip_ws(src, e1);
             if ((word_is(src, n1, e1, ":") or word_is(src, n1, e1, "=")) and n2 < src.len and src[n2] == B_LBRACKET) { return true; }
+            // a vec! the fn only reads is an array too (let_vec): `v = vec![..]`, `v: Vec<T> = vec![..]`
+            if (word_is(src, n1, e1, "=") and vec_init(src, n2)) { return true; }
+            if (word_is(src, n1, e1, ":") and tok_is(src, n2, "Vec") and vec_init(src, init_at(src, q))) { return true; }
         }
         q = skip_ws(src, e);
     }
@@ -1704,6 +2018,22 @@ pub fn slice_param_elem(src: []const u8, na: usize, nb: usize, method: bool, k: 
     return found;
 }
 
+/// The element type token T of the `&[T]` parameter that argument k of the call whose `(` is src[lp] lands
+/// on: the callee (a name, or a method after a `.`) is read off the source before the `(`, its parameter
+/// off this file's own declarations (slice_param_elem). src.len when either is not there.
+pub fn site_elem(src: []const u8, lp: usize, k: usize) -> usize {
+    if (lp >= src.len) { return src.len; }
+    var ne : usize = lp;
+    while (ne > 0 and is_space(src[ne - 1])) { ne = ne - 1; }
+    var na : usize = ne;
+    while (na > 0 and is_word(src[na - 1])) { na = na - 1; }
+    if (na >= ne) { return src.len; }
+    var m : usize = na;
+    while (m > 0 and is_space(src[m - 1])) { m = m - 1; }
+    const method : bool = m > 0 and src[m - 1] == B_DOT and !(m > 1 and src[m - 2] == B_DOT);
+    return slice_param_elem(src, na, ne, method, k);
+}
+
 /// The empty slice `&[]` at st[P], argument number k of the call whose `(` is src[lp]: the empty array
 /// of the element type its parameter names, `[0]T{}`, which a `[]const T` parameter takes. The
 /// parameter is found in this file's own declarations of the callee; when it is not, `&[]` is refused
@@ -1713,19 +2043,7 @@ pub fn empty_arg(src: []const u8, st: []usize, out: []u8, lp: usize, k: usize) -
     const b : usize = skip_ws(src, tok_end(src, a));
     const c : usize = skip_ws(src, tok_end(src, b));
     const d : usize = tok_end(src, c);
-    var elem : usize = src.len;
-    if (lp < src.len) {
-        var ne : usize = lp;
-        while (ne > 0 and is_space(src[ne - 1])) { ne = ne - 1; }
-        var na : usize = ne;
-        while (na > 0 and is_word(src[na - 1])) { na = na - 1; }
-        if (na < ne) {
-            var m : usize = na;
-            while (m > 0 and is_space(src[m - 1])) { m = m - 1; }
-            const method : bool = m > 0 and src[m - 1] == B_DOT and !(m > 1 and src[m - 2] == B_DOT);
-            elem = slice_param_elem(src, na, ne, method, k);
-        }
-    }
+    const elem : usize = site_elem(src, lp, k);
     if (elem >= src.len) {
         refuse(st, R_EMPTY, a, a, d);
         return;
@@ -1752,34 +2070,53 @@ pub fn no_args(src: []const u8, st: []usize) -> void {
     want(src, st, ")");
 }
 
+/// The receiver of the `fn <name>(..self` the token at src[q] begins, the name src[na .. nb] and the
+/// parameters inside src[.. hi]: 1 for self or &self, 2 for &mut self, 0 when it is not such a method.
+pub fn kind_at(src: []const u8, q: usize, hi: usize, na: usize, nb: usize) -> usize {
+    const e : usize = tok_end(src, q);
+    if (word_is(src, q, e, "fn")) {
+        const n : usize = skip_ws(src, e);
+        const ne : usize = tok_end(src, n);
+        const lp : usize = skip_ws(src, ne);
+        if (ne - n == nb - na and same_at(src, n, ne, na) and lp < hi and src[lp] == B_LPAREN) {
+            var s : usize = skip_ws(src, lp + 1);
+            var amp : bool = false;
+            var mutable : bool = false;
+            if (s < hi and src[s] == B_AMP) {
+                amp = true;
+                s = skip_ws(src, s + 1);
+            }
+            if (s < hi and src[s] == B_APOS) { s = skip_ws(src, tok_end(src, s)); }
+            if (tok_is(src, s, "mut")) {
+                mutable = true;
+                s = skip_ws(src, tok_end(src, s));
+            }
+            if (tok_is(src, s, "self") and amp and mutable) { return 2; }
+            if (tok_is(src, s, "self")) { return 1; }
+        }
+    }
+    return 0;
+}
+
 /// The receiver of `fn <name>(..self` in src[lo .. hi]: 1 for self or &self, 2 for &mut self, 0 when
-/// there is no such method.
-pub fn method_kind(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+/// there is no such method. The index holds the `fn` tokens by name, in file order.
+pub fn method_kind(src: []const u8, st: []usize, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_FN, na, nb);
+        while (s != 0 and st[s + 2] < hi) {
+            if (st[s + 2] >= lo) {
+                const k : usize = kind_at(src, st[s + 2], hi, na, nb);
+                if (k != 0) { return k; }
+            }
+            s = ix_next(src, st, s, na, nb);
+        }
+        return 0;
+    }
     var q : usize = lo;
     while (q < hi) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "fn")) {
-            const n : usize = skip_ws(src, e);
-            const ne : usize = tok_end(src, n);
-            const lp : usize = skip_ws(src, ne);
-            if (ne - n == nb - na and same_at(src, n, ne, na) and lp < hi and src[lp] == B_LPAREN) {
-                var s : usize = skip_ws(src, lp + 1);
-                var amp : bool = false;
-                var mutable : bool = false;
-                if (s < hi and src[s] == B_AMP) {
-                    amp = true;
-                    s = skip_ws(src, s + 1);
-                }
-                if (s < hi and src[s] == B_APOS) { s = skip_ws(src, tok_end(src, s)); }
-                if (tok_is(src, s, "mut")) {
-                    mutable = true;
-                    s = skip_ws(src, tok_end(src, s));
-                }
-                if (tok_is(src, s, "self") and amp and mutable) { return 2; }
-                if (tok_is(src, s, "self")) { return 1; }
-            }
-        }
-        q = skip_ws(src, e);
+        const k : usize = kind_at(src, q, hi, na, nb);
+        if (k != 0) { return k; }
+        q = skip_ws(src, tok_end(src, q));
     }
     return 0;
 }
@@ -1789,71 +2126,68 @@ pub fn method_kind(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) 
 /// `let r: Type =`. The last binding wins because Rust shadows: one file binds the same name to many
 /// types (`let r = HirSimResult::ok(..)` after an earlier `let r = HirResourceEstimate::zero()`), and
 /// the binding in scope at a use is the one textually before it.
-pub fn let_owner(src: []const u8, ra: usize, rb: usize) -> usize {
+pub fn let_owner(src: []const u8, st: []usize, ra: usize, rb: usize) -> usize {
     var best : usize = src.len;
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_LET, ra, rb);
+        while (s != 0 and st[s + 2] < ra) {
+            const v : usize = let_at(src, st[s + 2], ra, rb);
+            if (v < src.len) { best = v; }
+            s = ix_next(src, st, s, ra, rb);
+        }
+        return best;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len and q < ra) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "let")) {
-            var n : usize = skip_ws(src, e);
-            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
-            const ne : usize = tok_end(src, n);
-            if (same_text(src, n, ne, ra, rb)) {
-                var t : usize = skip_ws(src, ne);
-                // `let r: Type = ..` says the type between the colon and the equals
-                if (tok_is(src, t, ":")) {
-                    t = skip_ws(src, tok_end(src, t));
-                    while (tok_is(src, t, "&") or tok_is(src, t, "mut")) { t = skip_ws(src, tok_end(src, t)); }
-                    const te : usize = tok_end(src, t);
-                    if (t < src.len and is_upper(src[t]) and tok_is(src, skip_ws(src, te), "=")) { best = t; }
-                }
-                if (tok_is(src, t, "=")) {
-                    var v : usize = skip_ws(src, tok_end(src, t));
-                    while (tok_is(src, v, "&") or tok_is(src, v, "mut")) { v = skip_ws(src, tok_end(src, v)); }
-                    const ve : usize = tok_end(src, v);
-                    if (v < src.len and is_upper(src[v])) {
-                        // `Type::new(..)` names its own type, and so do `Type {` and `Type(`
-                        const nx : usize = skip_ws(src, ve);
-                        if (tok_is(src, nx, "::") or src[nx] == B_LBRACE or src[nx] == B_LPAREN) { best = v; }
-                    }
-                }
-            }
-        }
-        q = skip_ws(src, e);
+        const v : usize = let_at(src, q, ra, rb);
+        if (v < src.len) { best = v; }
+        q = skip_ws(src, tok_end(src, q));
     }
     return best;
+}
+
+/// Does the token at src[q] begin an inherent impl block (`impl Name {`) that has a method src[na .. nb]
+/// taking self -- in the first pass, with a receiver type src[ola .. ohb] known, one of that type? Its type
+/// goes to st[OLO .. OHI], the receiver kind to st[OKIND]. `hi` is the end of the block when the caller has
+/// it, 0 when not.
+pub fn impl_owner_at(src: []const u8, st: []usize, q: usize, pass: usize, na: usize, nb: usize, ola: usize, ohb: usize, hi: usize) -> bool {
+    const e : usize = tok_end(src, q);
+    if (!word_is(src, q, e, "impl")) { return false; }
+    const t : usize = skip_ws(src, e);
+    const te : usize = tok_end(src, t);
+    const o : usize = skip_ws(src, te);
+    if (t >= src.len or !is_alpha(src[t]) or o >= src.len or src[o] != B_LBRACE) { return false; }
+    if (pass == 0 and ola < ohb and !same_text(src, t, te, ola, ohb)) { return false; }
+    var end : usize = hi;
+    if (end == 0) { end = block_end(src, o); }
+    const kind : usize = method_kind(src, st, o, end, na, nb);
+    if (kind == 0) { return false; }
+    st[OLO] = t;
+    st[OHI] = te;
+    st[OKIND] = kind;
+    return true;
 }
 
 /// The type of the first inherent impl block (`impl Name {`) with a method `name` taking self, into
 /// st[OLO .. OHI], its receiver kind into st[OKIND]. src[ola .. ohb] is the type a `let` bound the
 /// receiver to when one is known: the impls of that type are searched first, so two types that share a
-/// method name (`passed` of LinkResult and HirSimResult) keep their own methods.
+/// method name (`passed` of LinkResult and HirSimResult) keep their own methods. The index holds the
+/// impls in file order.
 pub fn method_owner(src: []const u8, st: []usize, na: usize, nb: usize, ola : usize, ohb : usize) -> bool {
     var pass : usize = 0;
     while (pass < 2) {
-        var q : usize = skip_ws(src, 0);
-        while (q < src.len) {
-            const e : usize = tok_end(src, q);
-            if (word_is(src, q, e, "impl")) {
-                const t : usize = skip_ws(src, e);
-                const te : usize = tok_end(src, t);
-                const o : usize = skip_ws(src, te);
-                if (t < src.len and is_alpha(src[t]) and o < src.len and src[o] == B_LBRACE) {
-                    const own : bool = pass == 0 and ola < ohb and same_text(src, t, te, ola, ohb);
-                    if (pass == 0 and ola < ohb and !own) {
-                        q = skip_ws(src, e);
-                        continue;
-                    }
-                    const kind : usize = method_kind(src, o, block_end(src, o), na, nb);
-                    if (kind != 0) {
-                        st[OLO] = t;
-                        st[OHI] = te;
-                        st[OKIND] = kind;
-                        return true;
-                    }
-                }
+        if (st[IXON] == 1) {
+            var s : usize = st[st[IXB] + IXK_KINDS * st[IXBN]];
+            while (s != 0) {
+                if (st[s + 1] != 0 and impl_owner_at(src, st, st[s + 2], pass, na, nb, ola, ohb, st[s + 1])) { return true; }
+                s = st[s + 3];
             }
-            q = skip_ws(src, e);
+        } else {
+            var q : usize = skip_ws(src, 0);
+            while (q < src.len) {
+                if (impl_owner_at(src, st, q, pass, na, nb, ola, ohb, 0)) { return true; }
+                q = skip_ws(src, tok_end(src, q));
+            }
         }
         if (ola >= ohb) { return false; }
         pass = pass + 1;
@@ -1863,46 +2197,92 @@ pub fn method_owner(src: []const u8, st: []usize, na: usize, nb: usize, ola : us
 
 // ---------------------------------------------------------------- what a receiver is
 
-/// The type token of the file-level `const` / `static` src[a .. b], src.len when there is none.
-pub fn const_type(src: []const u8, a: usize, b: usize) -> usize {
+/// Is the token at src[q] a `const` or `static` (an optional `mut` after it) of the name src[a .. b] with a
+/// type: `const NAME :`?
+pub fn const_hit(src: []const u8, q: usize, a: usize, b: usize) -> bool {
+    const e : usize = tok_end(src, q);
+    if (!(word_is(src, q, e, "const") or word_is(src, q, e, "static"))) { return false; }
+    var n : usize = skip_ws(src, e);
+    if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+    const ne : usize = tok_end(src, n);
+    return same_text(src, n, ne, a, b) and tok_is(src, skip_ws(src, ne), ":");
+}
+
+/// The type token of the file-level `const` / `static` src[a .. b], src.len when there is none. The index
+/// holds the keyword tokens by name; with it off the file is walked from byte 0.
+pub fn const_type(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_ITEM, a, b);
+        while (s != 0) {
+            const q : usize = st[s + 2];
+            if (const_hit(src, q, a, b)) { return const_of(src, q); }
+            s = ix_next(src, st, s, a, b);
+        }
+        return src.len;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "const") or word_is(src, q, e, "static")) {
-            var n : usize = skip_ws(src, e);
-            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
-            const ne : usize = tok_end(src, n);
-            const c : usize = skip_ws(src, ne);
-            if (same_text(src, n, ne, a, b) and tok_is(src, c, ":")) { return skip_ws(src, c + 1); }
-        }
-        q = skip_ws(src, e);
+        if (const_hit(src, q, a, b)) { return const_of(src, q); }
+        q = skip_ws(src, tok_end(src, q));
     }
     return src.len;
 }
 
-/// The return type token of the first `fn` src[a .. b] of the file, src.len when it has none.
-pub fn fn_ret_type(src: []const u8, a: usize, b: usize) -> usize {
+/// The type token of the `const` / `static` at src[q] that const_hit found: the one after its colon.
+pub fn const_of(src: []const u8, q: usize) -> usize {
+    var n : usize = skip_ws(src, tok_end(src, q));
+    if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+    return skip_ws(src, skip_ws(src, tok_end(src, n)) + 1);
+}
+
+/// Is the token at src[q] a `fn` of the name src[a .. b] that has a `(` to read its parameters from?
+pub fn fn_hit(src: []const u8, q: usize, a: usize, b: usize) -> bool {
+    if (!fn_named(src, q, a, b)) { return false; }
+    return find_at(src, tok_end(src, skip_ws(src, tok_end(src, q))), B_LPAREN) < src.len;
+}
+
+/// Is the token at src[q] a `fn` of the name src[a .. b]?
+pub fn fn_named(src: []const u8, q: usize, a: usize, b: usize) -> bool {
+    const e : usize = tok_end(src, q);
+    if (!word_is(src, q, e, "fn")) { return false; }
+    const n : usize = skip_ws(src, e);
+    return same_text(src, n, tok_end(src, n), a, b);
+}
+
+/// The return type token of the `fn` at src[q] that fn_hit found: the one after `->`, src.len when it has
+/// none.
+pub fn fn_ret_of(src: []const u8, q: usize) -> usize {
+    const n : usize = skip_ws(src, tok_end(src, q));
+    const lp : usize = find_at(src, tok_end(src, n), B_LPAREN);
+    if (lp >= src.len) { return src.len; }
+    const r : usize = skip_ws(src, block_end(src, lp));
+    if (tok_is(src, r, "->")) { return skip_ws(src, tok_end(src, r)); }
+    return src.len;
+}
+
+/// The return type token of the first `fn` src[a .. b] of the file, src.len when it has none. The index
+/// holds the `fn` tokens by name; with it off the file is walked from byte 0.
+pub fn fn_ret_type(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_FN, a, b);
+        while (s != 0) {
+            const q : usize = st[s + 2];
+            if (fn_hit(src, q, a, b)) { return fn_ret_of(src, q); }
+            s = ix_next(src, st, s, a, b);
+        }
+        return src.len;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "fn")) {
-            const n : usize = skip_ws(src, e);
-            const ne : usize = tok_end(src, n);
-            const lp : usize = find_at(src, ne, B_LPAREN);
-            if (same_text(src, n, ne, a, b) and lp < src.len) {
-                const r : usize = skip_ws(src, block_end(src, lp));
-                if (tok_is(src, r, "->")) { return skip_ws(src, tok_end(src, r)); }
-                return src.len;
-            }
-        }
-        q = skip_ws(src, e);
+        if (fn_hit(src, q, a, b)) { return fn_ret_of(src, q); }
+        q = skip_ws(src, tok_end(src, q));
     }
     return src.len;
 }
 
 /// Does `fn` src[a .. b] return `Result<(), E>` (or an alias of it), which t27o writes as a bool?
 pub fn unit_result_fn(src: []const u8, st: []usize, a: usize, b: usize) -> bool {
-    const r : usize = fn_ret_type(src, a, b);
+    const r : usize = fn_ret_type(src, st, a, b);
     const re : usize = tok_end(src, r);
     if (r >= src.len or !(word_is(src, r, re, "Result") or named(src, st, K_RALIAS, r, re))) { return false; }
     const lt : usize = skip_ws(src, re);
@@ -1968,7 +2348,7 @@ pub fn literal_class(src: []const u8, st: []usize, q: usize) -> u8 {
 /// of the impl's struct after `self.`, a file-level const, or the literal an untyped `let` binds.
 pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool) -> u8 {
     if (field) {
-        const lb : usize = find_struct(src, st[ILO], st[IHI]);
+        const lb : usize = find_struct(src, st, st[ILO], st[IHI]);
         if (lb >= src.len) { return C_ANY; }
         const f : usize = decl_type(src, lb, block_end(src, lb), a, b);
         if (f >= src.len) { return C_ANY; }
@@ -1977,7 +2357,7 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
     if (prim(src, a, b) or word_is(src, a, b, "f32") or word_is(src, a, b, "f64")) { return type_class(src, st, a); }
     const d : usize = decl_type(src, st[FLO], a, a, b);
     if (d < src.len) { return type_class(src, st, d); }
-    const c : usize = const_type(src, a, b);
+    const c : usize = const_type(src, st, a, b);
     if (c < src.len) { return type_class(src, st, c); }
     // `let [mut] name = <literal>;`
     var q : usize = st[FLO];
@@ -2011,7 +2391,7 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
         if (str_chain(src, st, init, semi)) { return C_STR; }
         const ie : usize = tok_end(src, init);
         if (tok_is(src, skip_ws(src, ie), "(")) {
-            const r2 : usize = fn_ret_type(src, init, ie);
+            const r2 : usize = fn_ret_type(src, st, init, ie);
             if (r2 < src.len) { return type_class(src, st, r2); }
         }
     }
@@ -2044,15 +2424,38 @@ pub fn name_class(src: []const u8, st: []usize, a: usize, b: usize, field: bool)
     return C_ANY;
 }
 
-/// The `{` of `struct <name> {` in the file, src.len when there is none.
-pub fn find_struct(src: []const u8, a: usize, b: usize) -> usize {
+/// Is the token at src[q] the `struct` of `struct <name> {`, the name src[a .. b]? (`(` instead of `{`
+/// too when `paren` is set: a tuple struct.)
+pub fn struct_hit(src: []const u8, q: usize, a: usize, b: usize, paren: bool) -> bool {
+    const e : usize = tok_end(src, q);
+    if (!word_is(src, q, e, "struct")) { return false; }
+    const n : usize = skip_ws(src, e);
+    const ne : usize = tok_end(src, n);
+    const o : usize = skip_ws(src, ne);
+    return same_text(src, n, ne, a, b) and (tok_is(src, o, "{") or (paren and tok_is(src, o, "(")));
+}
+
+/// The `{` after the name of the `struct` at src[q] that struct_hit found.
+pub fn struct_brace(src: []const u8, q: usize) -> usize {
+    return skip_ws(src, tok_end(src, skip_ws(src, tok_end(src, q))));
+}
+
+/// The `{` of `struct <name> {` in the file, src.len when there is none. The index holds the keyword
+/// tokens by name; with it off the file is walked from byte 0.
+pub fn find_struct(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_ITEM, a, b);
+        while (s != 0) {
+            const q : usize = st[s + 2];
+            if (struct_hit(src, q, a, b, false)) { return struct_brace(src, q); }
+            s = ix_next(src, st, s, a, b);
+        }
+        return src.len;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        const n : usize = skip_ws(src, e);
-        const ne : usize = tok_end(src, n);
-        if (word_is(src, q, e, "struct") and same_text(src, n, ne, a, b) and tok_is(src, skip_ws(src, ne), "{")) { return skip_ws(src, ne); }
-        q = skip_ws(src, e);
+        if (struct_hit(src, q, a, b, false)) { return struct_brace(src, q); }
+        q = skip_ws(src, tok_end(src, q));
     }
     return src.len;
 }
@@ -2061,7 +2464,7 @@ pub fn find_struct(src: []const u8, a: usize, b: usize) -> usize {
 /// `node: &Node`), C_ANY when x has no declared struct type or the field is not one of its fields.
 pub fn field_of_class(src: []const u8, st: []usize, xa: usize, xe: usize, fa: usize, fe: usize) -> u8 {
     var d : usize = decl_type(src, st[FLO], xa, xa, xe);
-    if (d >= src.len) { d = const_type(src, xa, xe); }
+    if (d >= src.len) { d = const_type(src, st, xa, xe); }
     if (d >= src.len) { return C_ANY; }
     while (tok_is(src, d, "&") or tok_is(src, d, "&&")) {
         d = skip_ws(src, tok_end(src, d));
@@ -2070,7 +2473,7 @@ pub fn field_of_class(src: []const u8, st: []usize, xa: usize, xe: usize, fa: us
     }
     const de : usize = tok_end(src, d);
     if (d >= src.len or !is_upper(src[d])) { return C_ANY; }
-    const lb : usize = find_struct(src, d, de);
+    const lb : usize = find_struct(src, st, d, de);
     if (lb >= src.len) { return C_ANY; }
     const f : usize = decl_type(src, lb, block_end(src, lb), fa, fe);
     if (f >= src.len) { return C_ANY; }
@@ -2163,7 +2566,7 @@ pub fn recv_class(src: []const u8, st: []usize, ra: usize, rb: usize) -> u8 {
     }
     if (is_alpha(src[ra]) and tok_is(src, nx, "(") and skip_ws(src, block_end(src, nx)) >= rb) {
         if (unit_result_fn(src, st, ra, e)) { return C_BOOL; }
-        const r : usize = fn_ret_type(src, ra, e);
+        const r : usize = fn_ret_type(src, st, ra, e);
         if (r < src.len) { return type_class(src, st, r); }
         return C_ANY;
     }
@@ -2179,7 +2582,7 @@ pub fn recv_class(src: []const u8, st: []usize, ra: usize, rb: usize) -> u8 {
             k = literal_class(src, st, q);
         } else if (is_alpha(src[q]) and !tok_is(src, prev, ".") and !tok_is(src, prev, "::")) {
             if (tok_is(src, skip_ws(src, qe), "(")) {
-                const r2 : usize = fn_ret_type(src, q, qe);
+                const r2 : usize = fn_ret_type(src, st, q, qe);
                 if (r2 < src.len) { k = type_class(src, st, r2); }
             } else {
                 k = name_class(src, st, q, qe, false);
@@ -2208,29 +2611,37 @@ pub fn std_bool(src: []const u8, a: usize, b: usize) -> bool {
     return listed(w, src[a .. b]);
 }
 
+/// One fn token of ret_class: the class of its return type folded into cls (C_NONE: none yet, C_ANY: they
+/// disagree), when src[q] is a `fn` named src[a .. b] with a `->`.
+pub fn ret_step(src: []const u8, st: []usize, q: usize, a: usize, b: usize, cls: u8) -> u8 {
+    if (!fn_hit(src, q, a, b)) { return cls; }
+    // a fn with no `->` returns `()`, which no `!` can be applied to: a test named like a
+    // method (`fn is_readonly()` beside `fn is_readonly(&self) -> bool`) says nothing of it
+    const r : usize = skip_ws(src, block_end(src, find_at(src, tok_end(src, skip_ws(src, tok_end(src, q))), B_LPAREN)));
+    if (!tok_is(src, r, "->")) { return cls; }
+    const c : u8 = type_class(src, st, skip_ws(src, tok_end(src, r)));
+    if (cls == C_NONE) { return c; }
+    if (cls != c) { return C_ANY; }
+    return cls;
+}
+
 /// The class of what the fns named src[a .. b] in the file return: C_NONE when it declares none that
 /// returns a value, C_ANY when they disagree or return a type t27o does not class (two impls may share
 /// a method name).
 pub fn ret_class(src: []const u8, st: []usize, a: usize, b: usize) -> u8 {
     var cls : u8 = C_NONE;
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_FN, a, b);
+        while (s != 0) {
+            cls = ret_step(src, st, st[s + 2], a, b, cls);
+            s = ix_next(src, st, s, a, b);
+        }
+        return cls;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        if (word_is(src, q, e, "fn")) {
-            const n : usize = skip_ws(src, e);
-            const ne : usize = tok_end(src, n);
-            const lp : usize = find_at(src, ne, B_LPAREN);
-            if (same_text(src, n, ne, a, b) and lp < src.len) {
-                // a fn with no `->` returns `()`, which no `!` can be applied to: a test named like a
-                // method (`fn is_readonly()` beside `fn is_readonly(&self) -> bool`) says nothing of it
-                const r : usize = skip_ws(src, block_end(src, lp));
-                if (tok_is(src, r, "->")) {
-                    const c : u8 = type_class(src, st, skip_ws(src, tok_end(src, r)));
-                    if (cls == C_NONE) { cls = c; } else if (cls != c) { cls = C_ANY; }
-                }
-            }
-        }
-        q = skip_ws(src, e);
+        cls = ret_step(src, st, q, a, b, cls);
+        q = skip_ws(src, tok_end(src, q));
     }
     return cls;
 }
@@ -2259,14 +2670,14 @@ pub fn lit_at(src: []const u8, q: usize) -> bool {
 /// The `{` (or the `(` of a tuple struct) of the struct the name src[xa .. xe] is of: `self` is the impl's
 /// type, any other name the type it is declared with or the one a `let x = Type::new(..)` names; src.len
 /// when t27o cannot tell.
-pub fn head_struct(src: []const u8, flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
+pub fn head_struct(src: []const u8, st: []usize, flo: usize, ilo: usize, ihi: usize, xa: usize, xe: usize) -> usize {
     if (word_is(src, xa, xe, "self")) {
         if (ilo == ihi) { return src.len; }
-        return struct_open(src, ilo, ihi);
+        return struct_open(src, st, ilo, ihi);
     }
     var d : usize = decl_type(src, flo, xa, xa, xe);
-    if (d >= src.len) { d = const_type(src, xa, xe); }
-    if (d >= src.len) { d = let_owner(src, xa, xe); }
+    if (d >= src.len) { d = const_type(src, st, xa, xe); }
+    if (d >= src.len) { d = let_owner(src, st, xa, xe); }
     if (d >= src.len) { return src.len; }
     while (tok_is(src, d, "&") or tok_is(src, d, "&&")) {
         d = skip_ws(src, tok_end(src, d));
@@ -2274,7 +2685,7 @@ pub fn head_struct(src: []const u8, flo: usize, ilo: usize, ihi: usize, xa: usiz
         if (tok_is(src, d, "mut")) { d = skip_ws(src, tok_end(src, d)); }
     }
     if (d >= src.len or !is_upper(src[d])) { return src.len; }
-    return struct_open(src, d, tok_end(src, d));
+    return struct_open(src, st, d, tok_end(src, d));
 }
 
 /// The class of the expression src[a .. b] that has no binary operator at its top: a prefix `!`, `*`, `&`
@@ -2373,7 +2784,7 @@ pub fn chain_class(src: []const u8, st: []usize, a: usize, b: usize, deep: bool)
     if (kind == CK_NAME) { return name_class(src, st, na, nb, false); }
     // `x.f` and `x.0` of a struct this file declares: the field's declared type
     if (kind == CK_FIELD and dots == 1 and plain) {
-        const o : usize = head_struct(src, st[FLO], st[ILO], st[IHI], xa, xe);
+        const o : usize = head_struct(src, st, st[FLO], st[ILO], st[IHI], xa, xe);
         if (o >= src.len) { return C_ANY; }
         if (is_digit(src[na])) {
             if (src[o] != B_LPAREN or nb != na + 1) { return C_ANY; }
@@ -2387,7 +2798,7 @@ pub fn chain_class(src: []const u8, st: []usize, a: usize, b: usize, deep: bool)
         return type_class(src, st, f);
     }
     if (kind == CK_PATH) {
-        const c : usize = const_type(src, na, nb);
+        const c : usize = const_type(src, st, na, nb);
         if (c < src.len) { return type_class(src, st, c); }
     }
     return C_ANY;
@@ -2689,8 +3100,8 @@ pub fn unroll_contains(src: []const u8, st: []usize, out: []u8, start: usize, ra
     var lb : usize = src.len;
     const re : usize = tok_end(src, ra);
     if (ra < src.len and src[ra] == B_LBRACKET and skip_ws(src, block_end(src, ra)) >= rb) { lb = ra; }
-    if (ra < src.len and is_alpha(src[ra]) and skip_ws(src, re) >= rb and const_type(src, ra, re) < src.len) {
-        const t : usize = const_type(src, ra, re);
+    if (ra < src.len and is_alpha(src[ra]) and skip_ws(src, re) >= rb and const_type(src, st, ra, re) < src.len) {
+        const t : usize = const_type(src, st, ra, re);
         const eq : usize = find_at(src, t, B_EQ);
         if (eq < src.len) {
             const v : usize = skip_ws(src, eq + 1);
@@ -2802,7 +3213,7 @@ pub fn method(src: []const u8, st: []usize, out: []u8, start: usize, ra: usize, 
         return;
     }
     // a `let`-bound receiver says which impl its method belongs to (two types may share a method name)
-    var oa : usize = let_owner(src, ra, rb);
+    var oa : usize = let_owner(src, st, ra, rb);
     var ob : usize = src.len;
     if (oa < src.len) { ob = tok_end(src, oa); }
     // a path receiver names its own owner before any `let` fallback: `AsmRelocKind::Abs32.to_i8()`
@@ -3398,7 +3809,7 @@ pub fn path(src: []const u8, st: []usize, out: []u8, a0: usize, b0: usize) -> vo
     // would shadow it (t27c's use splices flat, see #7176)
     if (named(src, st, K_MODPATH, a, b) or named(src, st, K_MODUSED, a, b)) {
         const s : usize = st[HIT];
-        if (declared_fn(src, ma, mb) or declared_type(src, ma, mb)) {
+        if (declared_fn(src, st, ma, mb) or declared_type(src, st, ma, mb)) {
             refuse(st, R_CLASH, ma, ma, mb);
             return;
         }
@@ -4037,6 +4448,11 @@ pub fn let_stmt(src: []const u8, st: []usize, out: []u8) -> void {
     // the type a `.parse()` in the value gives its result
     st[LETTY] = 0;
     if (typed) { st[LETTY] = skip_ws(src, tok_end(src, st[P])); }
+    if (init < src.len and vec_init(src, init)) {
+        let_vec(src, st, out, mutable, na, nb, typed, init);
+        st[LETTY] = 0;
+        return;
+    }
     if (init < src.len and ends_in_try(src, init)) {
         let_try(src, st, out, mutable, na, nb, init);
         st[LETTY] = 0;
@@ -4105,6 +4521,331 @@ pub fn let_value(src: []const u8, st: []usize, out: []u8, mutable: bool, na: usi
     } else {
         puts(st, out, " = ");
         expr(src, st, out, false);
+    }
+    want(src, st, ";");
+    puts(st, out, ";");
+}
+
+// ---------------------------------------------------------------- vec! read only (#10643)
+
+/// Is src[p] the `vec` of a `vec![..]` with square brackets that a `;` follows (the init of a `let`)?
+pub fn vec_init(src: []const u8, p: usize) -> bool {
+    if (p >= src.len or !tok_is(src, p, "vec")) { return false; }
+    const bang : usize = skip_ws(src, tok_end(src, p));
+    const lb : usize = skip_ws(src, tok_end(src, bang));
+    if (!tok_is(src, bang, "!") or !tok_is(src, lb, "[")) { return false; }
+    return tok_is(src, skip_ws(src, block_end(src, lb)), ";");
+}
+
+/// Where the scope of the vec! local src[na .. nb) ends within src[lo .. hi): the `let` that binds the name
+/// again (its init still reads the old one, vec_shadow_use), else hi.
+pub fn vec_scope_end(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (word_is(src, q, e, "let")) {
+            var n : usize = skip_ws(src, e);
+            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+            if (same_text(src, n, tok_end(src, n), na, nb)) { return q; }
+        }
+        q = skip_ws(src, e);
+    }
+    return hi;
+}
+
+/// How the token src[q .. e], the name of a vec! local, is used (VU_*); prev is the token before it, src.len
+/// at the start. A field, a method or a struct field label of the same name is not a use of the local. A
+/// read is `&v`, `v[i]` (not assigned to), `for x in v`, and the methods that only look at it; a change is
+/// `&mut v`, `v = ..`, `v[i] = ..`, and any other method (push, insert, sort, extend, iter_mut ..); anything
+/// else hands the vec on whole.
+pub fn vec_mention(src: []const u8, prev: usize, q: usize, e: usize) -> usize {
+    if (prev < src.len and (tok_is(src, prev, ".") or tok_is(src, prev, "::"))) { return VU_READ; }
+    const nx : usize = skip_ws(src, e);
+    if (tok_is(src, nx, ":")) { return VU_READ; }
+    if (prev < src.len and tok_is(src, prev, "mut")) { return VU_CHANGED; }
+    if (assign_op(src, nx)) { return VU_CHANGED; }
+    if (tok_is(src, nx, ".")) {
+        const m : usize = skip_ws(src, nx + 1);
+        const reads : str = " len is_empty iter as_slice first last get contains starts_with ends_with to_vec clone windows chunks concat join binary_search ";
+        if (listed(reads, src[m .. tok_end(src, m)])) { return VU_READ; }
+        return VU_CHANGED;
+    }
+    if (tok_is(src, nx, "[")) {
+        // `v[i]` reads; `v[i] = e`, `v[i].f = e` and `v[i] += e` write
+        var a : usize = skip_ws(src, block_end(src, nx));
+        while (tok_is(src, a, ".") or tok_is(src, a, "[")) {
+            if (tok_is(src, a, "[")) {
+                a = skip_ws(src, block_end(src, a));
+            } else {
+                a = skip_ws(src, tok_end(src, skip_ws(src, a + 1)));
+            }
+        }
+        if (assign_op(src, a)) { return VU_CHANGED; }
+        return VU_READ;
+    }
+    if (prev < src.len and (tok_is(src, prev, "&") or tok_is(src, prev, "&&"))) { return VU_READ; }
+    if (prev < src.len and tok_is(src, prev, "in") and tok_is(src, nx, "{")) { return VU_READ; }
+    return VU_MOVED;
+}
+
+/// How src[lo .. hi) uses the vec! local src[na .. nb): VU_CHANGED when any use changes it, else VU_MOVED
+/// when any hands it on, else VU_READ.
+pub fn vec_use(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var worst : usize = VU_READ;
+    var prev : usize = src.len;
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (same_text(src, q, e, na, nb)) {
+            const u : usize = vec_mention(src, prev, q, e);
+            if (u == VU_CHANGED) { return VU_CHANGED; }
+            if (u > worst) { worst = u; }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return worst;
+}
+
+/// vec_use over the whole life of the vec! local src[na .. nb) that src[close ..] follows in the fn ending at
+/// hi: up to the `let` that binds the name again, and that let's init, which still reads this one.
+pub fn vec_life(src: []const u8, close: usize, hi: usize, na: usize, nb: usize) -> usize {
+    const end : usize = vec_scope_end(src, close, hi, na, nb);
+    const how : usize = vec_use(src, close, end, na, nb);
+    if (end >= hi or how == VU_CHANGED) { return how; }
+    const ia : usize = init_at(src, end);
+    if (ia >= src.len) { return how; }
+    const tail : usize = vec_use(src, ia, find_at(src, ia, B_SEMI), na, nb);
+    if (tail == VU_CHANGED or tail > how) { return tail; }
+    return how;
+}
+
+/// The `(` that encloses src[q] most closely among those that open between `from` and q; src.len when
+/// none does.
+pub fn paren_around(src: []const u8, from: usize, q: usize) -> usize {
+    var found : usize = src.len;
+    var p : usize = from;
+    while (p < q) {
+        const e : usize = tok_end(src, p);
+        if (e == p + 1 and src[p] == B_LPAREN and block_end(src, p) > q) { found = p; }
+        p = skip_ws(src, e);
+    }
+    return found;
+}
+
+/// The number of the argument that src[q] starts in the list that opens at src[lp] (its depth-0 commas
+/// before q); src.len when q does not stand at the top of that list.
+pub fn arg_slot(src: []const u8, lp: usize, q: usize) -> usize {
+    var k : usize = 0;
+    var depth : usize = 0;
+    var p : usize = skip_ws(src, lp + 1);
+    while (p < q) {
+        const e : usize = tok_end(src, p);
+        if (e == p + 1) {
+            if (is_open(src[p])) { depth = depth + 1; }
+            if (is_close(src[p])) {
+                if (depth == 0) { return src.len; }
+                depth = depth - 1;
+            }
+            if (src[p] == B_COMMA and depth == 0) { k = k + 1; }
+        }
+        p = skip_ws(src, e);
+    }
+    if (depth != 0) { return src.len; }
+    return k;
+}
+
+/// The element type token T of the `&[T]` parameter that the first `&v` handed to a call in src[lo .. hi)
+/// lands on, v the name src[na .. nb): the callee's own declaration in this file says what the vec! holds.
+/// src.len when no such argument names a type.
+pub fn vec_arg_elem(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var prev : usize = src.len;
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (same_text(src, q, e, na, nb) and prev < src.len and tok_is(src, prev, "&")) {
+            const nx : usize = skip_ws(src, e);
+            if (tok_is(src, nx, ",") or tok_is(src, nx, ")")) {
+                const lp : usize = paren_around(src, lo, prev);
+                if (lp < src.len) {
+                    const k : usize = arg_slot(src, lp, prev);
+                    if (k < src.len) {
+                        const el : usize = site_elem(src, lp, k);
+                        if (el < src.len) { return el; }
+                    }
+                }
+            }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return src.len;
+}
+
+/// The return type token of the fn src[na .. nb) when every declaration of the name returns the same plain
+/// word followed by the body's `{` (a struct, an enum or a scalar; not Self); src.len otherwise.
+pub fn ret_word(src: []const u8, na: usize, nb: usize) -> usize {
+    var found : usize = src.len;
+    var q : usize = skip_ws(src, 0);
+    while (q < src.len) {
+        const e : usize = tok_end(src, q);
+        if (fn_hit(src, q, na, nb)) {
+            const r : usize = fn_ret_of(src, q);
+            if (r >= src.len or !is_alpha(src[r]) or tok_is(src, r, "Self")) { return src.len; }
+            const re : usize = tok_end(src, r);
+            if (!tok_is(src, skip_ws(src, re), "{")) { return src.len; }
+            if (found < src.len and !same_text(src, found, tok_end(src, found), r, re)) { return src.len; }
+            found = r;
+        }
+        q = skip_ws(src, e);
+    }
+    return found;
+}
+
+/// The type at src[tp], written as ty writes it; the reader is left where it was.
+pub fn put_elem_ty(src: []const u8, st: []usize, out: []u8, tp: usize) -> void {
+    const save : usize = st[P];
+    st[P] = tp;
+    ty(src, st, out);
+    st[P] = save;
+}
+
+/// The type the first element src[e0] of a vec! says by itself, written; false when it does not: a number
+/// with a suffix, a text, a bool, a variant of this file's enum, a struct literal of this file's struct, a
+/// call of a fn of this file whose return type is one plain word.
+pub fn vec_first_type(src: []const u8, st: []usize, out: []u8, e0: usize) -> bool {
+    var t0 : usize = e0;
+    if (tok_is(src, t0, "-")) { t0 = skip_ws(src, t0 + 1); }
+    const te : usize = tok_end(src, t0);
+    const c : u8 = head(src, t0);
+    if (is_digit(c)) {
+        const k : usize = suffix_len(src, t0, te);
+        if (k == 0) { return false; }
+        put_src(src, st, out, te - k, te);
+        return true;
+    }
+    if (c == B_QUOTE or raw_str_at(src, t0)) {
+        puts(st, out, "[]const u8");
+        return true;
+    }
+    if (tok_is(src, t0, "true") or tok_is(src, t0, "false")) {
+        puts(st, out, "bool");
+        return true;
+    }
+    if (is_upper(c) and peek_is(src, t0, "::") and find_enum(src, t0, te) < src.len) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if (is_upper(c) and peek_is(src, t0, "{") and find_struct(src, st, t0, te) < src.len) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if (is_alpha(c) and !is_upper(c) and peek_is(src, t0, "(")) {
+        const r : usize = ret_word(src, t0, te);
+        if (r < src.len) {
+            put_elem_ty(src, st, out, r);
+            return !bad(st[ERR]);
+        }
+    }
+    return false;
+}
+
+/// Write the element type of the vec! local src[na .. nb) whose first element is src[e0]: the annotation
+/// `Vec<T>` first (typed; st[LETTY] is its start), then what the first element says, then the parameter
+/// of the call that takes `&v` (within src[lo .. hi)). false when none of them tells.
+pub fn put_vec_elem(src: []const u8, st: []usize, out: []u8, typed: bool, e0: usize, lo: usize, hi: usize, na: usize, nb: usize) -> bool {
+    if (typed) {
+        const t : usize = st[LETTY];
+        const lt : usize = skip_ws(src, tok_end(src, t));
+        const tp : usize = skip_ws(src, tok_end(src, lt));
+        if (tok_is(src, t, "Vec") and tok_is(src, lt, "<") and !tok_is(src, tp, "_")) {
+            put_elem_ty(src, st, out, tp);
+            return !bad(st[ERR]);
+        }
+    }
+    if (vec_first_type(src, st, out, e0)) { return true; }
+    if (bad(st[ERR])) { return false; }
+    const el : usize = vec_arg_elem(src, lo, hi, na, nb);
+    if (el < src.len) {
+        put_elem_ty(src, st, out, el);
+        return !bad(st[ERR]);
+    }
+    return false;
+}
+
+/// How many elements the list src[lo .. hi) holds: its depth-0 commas, a trailing one adding none.
+pub fn list_count(src: []const u8, lo: usize, hi: usize) -> usize {
+    var n : usize = 0;
+    var q : usize = lo;
+    while (q < hi) {
+        n = n + 1;
+        const c : usize = find_at(src, q, B_COMMA);
+        if (c >= hi) { q = hi; } else { q = skip_ws(src, c + 1); }
+    }
+    return n;
+}
+
+/// Is src[lo .. hi) a length t27b can repeat an element by: one number without a suffix, or one const of
+/// this file (`** n` takes a literal or a name, not an expression)?
+pub fn vec_len_ok(src: []const u8, st: []usize, lo: usize, hi: usize) -> bool {
+    if (lo >= hi) { return false; }
+    const e : usize = tok_end(src, lo);
+    if (skip_ws(src, e) < hi) { return false; }
+    if (is_digit(src[lo])) { return suffix_len(src, lo, e) == 0; }
+    return is_upper(src[lo]) and const_type(src, st, lo, e) < src.len;
+}
+
+/// `let [mut] v [: Vec<T>] = vec![a, b, c];` or `vec![x; N]` that the fn only reads: a typed array,
+/// `const v : [3]T = [a, b, c];` / `const v : [N]T = [x] ** N;`, which t27 hands to a slice parameter as
+/// `&v`. The vec is refused when the fn changes it (R_VECMUT) or hands it on whole (R_VECMOVE), and when
+/// neither its element type nor its length is known (R_VECTYPE) -- t27 holds no growing list, and a
+/// length or a type not in the source is not guessed. st[P] is after the name; init is the `vec`.
+pub fn let_vec(src: []const u8, st: []usize, out: []u8, mutable: bool, na: usize, nb: usize, typed: bool, init: usize) -> void {
+    const bang : usize = skip_ws(src, tok_end(src, init));
+    const lb : usize = skip_ws(src, tok_end(src, bang));
+    const close : usize = block_end(src, lb);
+    const rb : usize = close - 1;
+    const e0 : usize = skip_ws(src, lb + 1);
+    const hi : usize = item_end(src, st[FLO]);
+    const scope : usize = vec_scope_end(src, close, hi, na, nb);
+    const how : usize = vec_life(src, close, hi, na, nb);
+    if (how == VU_CHANGED) {
+        refuse(st, R_VECMUT, init, init, tok_end(src, init));
+        return;
+    }
+    if (how == VU_MOVED) {
+        refuse(st, R_VECMOVE, init, init, tok_end(src, init));
+        return;
+    }
+    const empty : bool = e0 >= rb;
+    const semi : usize = find_at(src, e0, B_SEMI);
+    const repeat : bool = !empty and semi < rb;
+    if (mutable) { puts(st, out, "var "); } else { puts(st, out, "const "); }
+    put_ident(src, st, out, na, nb);
+    puts(st, out, " : [");
+    if (repeat) {
+        const n0 : usize = skip_ws(src, semi + 1);
+        if (!vec_len_ok(src, st, n0, rb)) {
+            refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+            return;
+        }
+        st[P] = n0;
+        expr(src, st, out, false);
+    } else {
+        put_num(st, out, list_count(src, e0, rb));
+    }
+    puts(st, out, "]");
+    if (!put_vec_elem(src, st, out, typed, e0, close, scope, na, nb)) {
+        refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+        return;
+    }
+    puts(st, out, " = ");
+    if (empty) {
+        puts(st, out, "[]");
+        st[P] = close;
+    } else {
+        st[P] = lb;
+        array_lit(src, st, out);
     }
     want(src, st, ";");
     puts(st, out, ";");
@@ -4821,19 +5562,40 @@ pub fn match_stmt(src: []const u8, st: []usize, out: []u8, mode: u8) -> void {
     want(src, st, "}");
 }
 
+/// The type of the `impl` whose header the token at src[q] begins, as src[OLO .. OHI] (the type after
+/// `for` when there is one).
+pub fn impl_header(src: []const u8, st: []usize, q: usize) -> void {
+    var t : usize = skip_ws(src, tok_end(src, q));
+    if (tok_is(src, t, "<")) { t = skip_ws(src, find_at(src, t + 1, B_GT) + 1); }
+    const lbr : usize = find_at(src, t, B_LBRACE);
+    const fr : usize = find_tok_to(src, t, lbr, "for");
+    if (fr < lbr) { t = skip_ws(src, tok_end(src, fr)); }
+    st[OLO] = t;
+    st[OHI] = tok_end(src, t);
+}
+
 /// The type of the impl block around src[r], as src[OLO .. OHI] (the nearest `impl` before it).
 pub fn impl_around(src: []const u8, st: []usize, r: usize) -> bool {
-    var q : usize = skip_ws(src, 0);
     var found : bool = false;
+    if (st[IXON] == 1) {
+        // the last `impl` before r decides: each one overwrites what the one before it left
+        var last : usize = src.len;
+        var s : usize = st[st[IXB] + IXK_KINDS * st[IXBN]];
+        while (s != 0 and st[s + 2] < r) {
+            last = st[s + 2];
+            s = st[s + 3];
+        }
+        if (last < src.len) {
+            impl_header(src, st, last);
+            found = true;
+        }
+        return found;
+    }
+    var q : usize = skip_ws(src, 0);
     while (q < r) {
         const e : usize = tok_end(src, q);
         if (word_is(src, q, e, "impl")) {
-            var t : usize = skip_ws(src, e);
-            if (tok_is(src, t, "<")) { t = skip_ws(src, find_at(src, t + 1, B_GT) + 1); }
-            const fr : usize = find_tok(src, t, "for");
-            if (fr < find_at(src, t, B_LBRACE)) { t = skip_ws(src, tok_end(src, fr)); }
-            st[OLO] = t;
-            st[OHI] = tok_end(src, t);
+            impl_header(src, st, q);
             found = true;
         }
         q = skip_ws(src, e);
@@ -4848,18 +5610,18 @@ pub fn struct_value(src: []const u8, st: []usize, e: usize) -> bool {
     var n : usize = e;
     var ne : usize = tok_end(src, n);
     var nx : usize = skip_ws(src, ne);
-    if (is_upper(src[n]) and (tok_is(src, nx, "{") or tok_is(src, nx, "(")) and (find_struct(src, n, ne) < src.len or named(src, st, K_TUPLE, n, ne))) { return true; }
+    if (is_upper(src[n]) and (tok_is(src, nx, "{") or tok_is(src, nx, "(")) and (find_struct(src, st, n, ne) < src.len or named(src, st, K_TUPLE, n, ne))) { return true; }
     if (tok_is(src, nx, "::") or tok_is(src, nx, ".")) {
         n = skip_ws(src, tok_end(src, nx));
         ne = tok_end(src, n);
         nx = skip_ws(src, ne);
     }
     if (!tok_is(src, nx, "(")) { return false; }
-    const r : usize = fn_ret_type(src, n, ne);
+    const r : usize = fn_ret_type(src, st, n, ne);
     if (r >= src.len) { return false; }
     const re : usize = tok_end(src, r);
-    if (word_is(src, r, re, "Self") and impl_around(src, st, r)) { return find_struct(src, st[OLO], st[OHI]) < src.len or named(src, st, K_TUPLE, st[OLO], st[OHI]); }
-    return find_struct(src, r, re) < src.len or named(src, st, K_TUPLE, r, re);
+    if (word_is(src, r, re, "Self") and impl_around(src, st, r)) { return find_struct(src, st, st[OLO], st[OHI]) < src.len or named(src, st, K_TUPLE, st[OLO], st[OHI]); }
+    return find_struct(src, st, r, re) < src.len or named(src, st, K_TUPLE, r, re);
 }
 
 /// Where the second argument of the assert_eq! / assert_ne! whose first argument starts at src[p] begins
@@ -5151,6 +5913,12 @@ pub fn put_reason(src: []const u8, st: []usize, out: []u8) -> void {
         puts(st, out, "empty slice with no known element type");
     } else if (c == R_NOTYPE) {
         puts(st, out, "`!` of an operand whose type t27o cannot tell");
+    } else if (c == R_VECMUT) {
+        puts(st, out, "a vec! the fn changes (push, resize, assign into, &mut)");
+    } else if (c == R_VECMOVE) {
+        puts(st, out, "a vec! the fn hands on or returns");
+    } else if (c == R_VECTYPE) {
+        puts(st, out, "a vec! whose element type or length t27o cannot tell");
     } else if (c == R_SPLICE) {
         puts(st, out, "a used module's own use t27c does not splice (its type_text:: names stay unresolved, the gap specs/compiler/int_type_names.t27 records)");
     } else {
@@ -5159,7 +5927,8 @@ pub fn put_reason(src: []const u8, st: []usize, out: []u8) -> void {
     puts(st, out, " `");
     put_text(src, st, out, st[NLO], st[NHI], 40);
     puts(st, out, "` at line ");
-    put_num(st, out, line_of(src, st[AT]));
+    const at_line : usize = line_at(src, st, st[AT]);
+    put_num(st, out, at_line);
 }
 
 /// The comment that stands where a refused item was.
@@ -5169,7 +5938,8 @@ pub fn put_refusal(src: []const u8, st: []usize, out: []u8, what: []const u8, na
     puts(st, out, " ");
     put_text(src, st, out, na, nb, 60);
     puts(st, out, " (line ");
-    put_num(st, out, line_of(src, pos));
+    const ref_line : usize = line_at(src, st, pos);
+    put_num(st, out, ref_line);
     puts(st, out, "): ");
     put_reason(src, st, out);
     puts(st, out, "\n\n");
@@ -5186,7 +5956,8 @@ pub fn skip_refused(src: []const u8, st: []usize, out: []u8, start: usize, a: us
         puts(st, out, "// t27o: refused ");
         put_text(src, st, out, a, b, 40);
         puts(st, out, " (line ");
-        put_num(st, out, line_of(src, a));
+        const item_line : usize = line_at(src, st, a);
+        put_num(st, out, item_line);
         puts(st, out, "): ");
         put_reason(src, st, out);
         if (nf > 0) {
@@ -6171,15 +6942,20 @@ pub fn put_print(src: []const u8, st: []usize, out: []u8, rk: usize, en: usize, 
 }
 
 /// The `{` (or the `(` of a tuple struct) of `struct <name>` in the file, src.len when there is none.
-pub fn struct_open(src: []const u8, a: usize, b: usize) -> usize {
+pub fn struct_open(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    if (st[IXON] == 1) {
+        var s : usize = ix_first(src, st, IXK_ITEM, a, b);
+        while (s != 0) {
+            const q : usize = st[s + 2];
+            if (struct_hit(src, q, a, b, true)) { return struct_brace(src, q); }
+            s = ix_next(src, st, s, a, b);
+        }
+        return src.len;
+    }
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
-        const e : usize = tok_end(src, q);
-        const n : usize = skip_ws(src, e);
-        const ne : usize = tok_end(src, n);
-        const o : usize = skip_ws(src, ne);
-        if (word_is(src, q, e, "struct") and same_text(src, n, ne, a, b) and (tok_is(src, o, "{") or tok_is(src, o, "("))) { return o; }
-        q = skip_ws(src, e);
+        if (struct_hit(src, q, a, b, true)) { return struct_brace(src, q); }
+        q = skip_ws(src, tok_end(src, q));
     }
     return src.len;
 }
@@ -6379,7 +7155,7 @@ pub fn vectors(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, pn
     if (wrapk != 3) {
         var sn : usize = bq;
         if (tok_is(src, bq, "Self") and st[ILO] != st[IHI]) { sn = st[ILO]; }
-        so = struct_open(src, sn, tok_end(src, sn));
+        so = struct_open(src, st, sn, tok_end(src, sn));
         if (so < src.len) {
             if (!fields_printable(src, st, so)) { return; }
             rk = V_STRUCT;
@@ -7398,7 +8174,7 @@ pub fn out_str_return(src: []const u8, st: []usize, out: []u8) -> bool {
 /// Does the struct named by the type token at src[q] (`Self` is the impl's type) have a text field? The
 /// oracle records one with type_text::same, so a fn that returns the struct makes the spec use it (#10534:
 /// FieldDesc::new -> Self, whose `name: &'static str` the appended oracle test compares).
-pub fn struct_text(src: []const u8, ilo: usize, ihi: usize, q: usize) -> bool {
+pub fn struct_text(src: []const u8, st: []usize, ilo: usize, ihi: usize, q: usize) -> bool {
     if (q >= src.len or !is_upper(src[q])) { return false; }
     var na : usize = q;
     var nb : usize = tok_end(src, q);
@@ -7407,7 +8183,7 @@ pub fn struct_text(src: []const u8, ilo: usize, ihi: usize, q: usize) -> bool {
         na = ilo;
         nb = ihi;
     }
-    const o : usize = struct_open(src, na, nb);
+    const o : usize = struct_open(src, st, na, nb);
     if (o >= src.len) { return false; }
     const close : usize = block_end(src, o);
     var t : usize = skip_ws(src, o + 1);
@@ -7420,7 +8196,7 @@ pub fn struct_text(src: []const u8, ilo: usize, ihi: usize, q: usize) -> bool {
 
 /// Does the return type of the fn whose parameters open at src[pn] name `str`, an owned String, or a
 /// struct of this file with a text field? The oracle compares each with type_text::same.
-pub fn ret_has_str(src: []const u8, ilo: usize, ihi: usize, pn: usize) -> bool {
+pub fn ret_has_str(src: []const u8, st: []usize, ilo: usize, ihi: usize, pn: usize) -> bool {
     if (!tok_is(src, pn, "(")) { return false; }
     // an owned String held by an Option or a Result is a text the oracle samples, and so is the
     // out-buffer form (the fn returns how many bytes it wrote into the caller's buffer)
@@ -7429,7 +8205,7 @@ pub fn ret_has_str(src: []const u8, ilo: usize, ihi: usize, pn: usize) -> bool {
     if (!tok_is(src, r, "->")) { return false; }
     var q : usize = skip_ws(src, tok_end(src, r));
     while (q < src.len and !tok_is(src, q, "{") and !tok_is(src, q, "where") and !tok_is(src, q, ";")) {
-        if (tok_is(src, q, "str") or struct_text(src, ilo, ihi, q)) { return true; }
+        if (tok_is(src, q, "str") or struct_text(src, st, ilo, ihi, q)) { return true; }
         q = skip_ws(src, tok_end(src, q));
     }
     return false;
@@ -7540,7 +8316,7 @@ pub fn fn_item(src: []const u8, st: []usize, out: []u8, start: usize, is_test: b
     st[NOK] = st[NOK] + 1;
     if (is_test) { st[NTEST] = st[NTEST] + 1; }
     // the oracle compares a text result with type_text::same, so the spec uses it
-    if (!is_test and ret_has_str(src, st[ILO], st[IHI], pn)) { st[NEQ] = 1; }
+    if (!is_test and ret_has_str(src, st, st[ILO], st[IHI], pn)) { st[NEQ] = 1; }
     if (st[MODE] == M_T27) { puts(st, out, "\n\n"); } else { st[W] = w0; }
     if (st[MODE] == M_SOURCE and !is_test) {
         put_item_source(src, st, out, start, item_end(src, start));
@@ -7716,7 +8492,7 @@ pub fn impl_item(src: []const u8, st: []usize, out: []u8, start: usize) -> void 
     const ta : usize = st[P];
     const tb : usize = tok_end(src, ta);
     const lb : usize = find_at(src, ta, B_LBRACE);
-    const fr : usize = find_tok(src, ta, "for");
+    const fr : usize = find_tok_to(src, ta, lb, "for");
     if (lb >= src.len) {
         st[ERR] = 0;
         skip_refused(src, st, out, start, ipos, tok_end(src, ipos), R_SYNTAX);
@@ -7880,9 +8656,11 @@ pub fn result_alias(src: []const u8, t: usize) -> bool {
     return eq < find_at(src, n, B_SEMI) and tok_is(src, skip_ws(src, eq + 1), "Result");
 }
 
-/// Before the first pass: tuple structs, Result aliases and the caller's `//@t27o reuse <Name> <path>`
-/// lines go into the name table, so an item that uses one before its declaration reads it too.
+/// Before the first pass: the declaration index is built (every lookup of a struct, a const or a fn reads
+/// it instead of walking the file); tuple structs, Result aliases and the caller's `//@t27o reuse <Name>
+/// <path>` lines go into the name table, so an item that uses one before its declaration reads it too.
 pub fn prescan(src: []const u8, st: []usize) -> void {
+    index_decls(src, st);
     var q : usize = skip_ws(src, 0);
     while (q < src.len) {
         const e : usize = tok_end(src, q);
@@ -8458,7 +9236,7 @@ test a_wrapping_call_keeps_the_t27_operator {
 test the_whole_file_has_a_header_and_a_report {
     var out : [1024]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
-    const n : usize = convert("/// One.\nconst ONE: u64 = 1_000;\nfn neg(x: i32) -> i32 { -x }\nfn bad() { let v = vec![1]; }", "Demo", &out, &st);
+    const n : usize = convert("/// One.\nconst ONE: u64 = 1_000;\nfn neg(x: i32) -> i32 { -x }\nfn bad() { let v = vec![1].len(); }", "Demo", &out, &st);
     assert(out_is(n, &out, 0, "// SPDX-License-Identifier: Apache-2.0\n; Demo.t27 -- converted from Rust by t27o (Ouroboros), specs/tools/t27o/rust_convert.t27; read it before it lands.\n; ASCII only (L3)\n\nmodule Demo;\n\n/// One.\nconst ONE : u64 = 1000;\n\nfn neg(x: i32) -> i32 {\n    return -x;\n}\n\n// t27o: refused fn bad (line 4): macro `vec` at line 4\n\nfn bad() -> void {\n}\n\n// t27o: 2 fn seen, 1 converted (0 of 0 tests), 1 refused (1 kept as stubs); coverage 50%\n"));
 }
 
@@ -8964,6 +9742,54 @@ test negative_control_a_mutable_or_unsuffixed_or_iterated_array_literal_loop_sta
     assert(st[NOK] == 0);
 }
 
+test a_vec_the_fn_only_reads_is_a_typed_array_read_by_index_or_iterated {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn at(v: &[u8], i: usize) -> u8 { v[i] }\n#[test]\nfn by_index() {\n    let v: Vec<u8> = vec![1, 2, 3];\n    assert_eq!(v[1], 2);\n    assert_eq!(v.len(), 3);\n}\n#[test]\nfn iterated() {\n    let v = vec![1u8, 2, 3];\n    let mut s = 0u32;\n    for x in &v { s += *x as u32; }\n    assert_eq!(s, 6);\n    for y in v.iter() { assert!(*y > 0); }\n}\n#[test]\nfn mutable_but_never_changed() {\n    let mut v = vec![7u16, 8];\n    assert_eq!(v[0], 7);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn at(v: []const u8, i: usize) -> u8 {\n    return v[i];\n}\n\ntest by_index {\n    const v : [3]u8 = [1, 2, 3];\n    assert(v[1] == 2);\n    assert(v.len == 3);\n}\n\ntest iterated {\n    const v : [3]u8 = [@as(u8, 1), 2, 3];\n    var s : u32 = 0;\n    for x in v {\n        s += x as u32;\n    }\n    assert(s == 6);\n    for y in v {\n        assert(y > 0);\n    }\n}\n\ntest mutable_but_never_changed {\n    var v : [2]u16 = [@as(u16, 7), 8];\n    assert(v[0] == 7);\n}\n\n"));
+    assert(st[NOK] == 4);
+}
+
+test a_vec_passed_as_a_borrow_takes_its_type_from_the_parameter_and_a_repeat_is_a_filled_array {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("struct Rec { a: u8 }\nfn rec(a: u8) -> Rec { Rec { a } }\nfn total(rs: &[Rec]) -> u32 { let mut t = 0u32; for r in rs { t += r.a as u32; } t }\nfn sum(v: &[u64]) -> u64 { let mut t = 0u64; for x in v { t += *x; } t }\nfn bytes(v: &[u8]) -> usize { v.len() }\nconst N: usize = 4;\n#[test]\nfn a_call_gives_the_type() {\n    let rs = vec![rec(1), rec(2)];\n    assert_eq!(total(&rs), 3);\n    let one = vec![Rec { a: 5 }];\n    assert_eq!(total(&one), 5);\n}\n#[test]\nfn the_parameter_gives_the_type() {\n    let v = vec![10, 20, 30];\n    assert_eq!(sum(&v), 60);\n}\n#[test]\nfn repeated() {\n    let z = vec![0u8; 4];\n    assert_eq!(bytes(&z), 4);\n    let y = vec![0xFF; N];\n    assert_eq!(bytes(&y), 4);\n    let e: Vec<u8> = vec![];\n    assert_eq!(bytes(&e), 0);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "const Rec = struct {\n    a : u8,\n};\n\nfn rec(a: u8) -> Rec {\n    return Rec{ .a = a };\n}\n\nfn total(rs: []const Rec) -> u32 {\n    var t : u32 = 0;\n    for r in rs {\n        t += r.a as u32;\n    }\n    return t;\n}\n\nfn sum(v: []const u64) -> u64 {\n    var t : u64 = 0;\n    for x in v {\n        t += x;\n    }\n    return t;\n}\n\nfn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nconst N : usize = 4;\n\ntest a_call_gives_the_type {\n    const rs : [2]Rec = [rec(1), rec(2)];\n    assert(total(&rs) == 3);\n    const one : [1]Rec = [Rec{ .a = 5 }];\n    assert(total(&one) == 5);\n}\n\ntest the_parameter_gives_the_type {\n    const v : [3]u64 = [10, 20, 30];\n    assert(sum(&v) == 60);\n}\n\ntest repeated {\n    const z : [4]u8 = [@as(u8, 0)] ** 4;\n    assert(bytes(&z) == 4);\n    const y : [N]u8 = [0xFF] ** N;\n    assert(bytes(&y) == 4);\n    const e : [0]u8 = [];\n    assert(bytes(&e) == 0);\n}\n\n"));
+    assert(st[NOK] == 7);
+}
+
+test negative_control_a_vec_the_fn_pushes_to_assigns_into_or_takes_by_mut_stays_refused {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn consume(v: Vec<u8>) -> usize { v.len() }\n#[test]\nfn pushed() {\n    let mut v = vec![1u8];\n    v.push(2);\n    assert_eq!(v.len(), 2);\n}\n#[test]\nfn assigned() {\n    let mut v = vec![1u8, 2];\n    v[0] = 5;\n    assert_eq!(bytes(&v), 2);\n}\n#[test]\nfn taken_by_mut() {\n    let mut v = vec![1u8, 2];\n    let r = &mut v;\n    assert_eq!(bytes(&v), 2);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nfn consume(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn pushed (line 4): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 5\n\n// t27o: refused fn assigned (line 10): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 11\n\n// t27o: refused fn taken_by_mut (line 16): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 17\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test negative_control_a_vec_the_fn_hands_on_whole_stays_refused_and_a_shadowing_let_ends_its_scope {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn consume(v: Vec<u8>) -> usize { v.len() }\n#[test]\nfn moved() {\n    let v = vec![1u8, 2];\n    assert_eq!(consume(v), 2);\n}\n#[test]\nfn rebound() {\n    let v = vec![1u8, 2];\n    let w = v;\n    assert_eq!(bytes(&w), 2);\n}\n#[test]\nfn shadowed_then_pushed() {\n    let v = vec![1u8, 2];\n    assert_eq!(bytes(&v), 2);\n    let mut v = vec![7u8];\n    v.push(1);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nfn consume(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn moved (line 4): a vec! the fn hands on or returns `vec` at line 5\n\n// t27o: refused fn rebound (line 9): a vec! the fn hands on or returns `vec` at line 10\n\n// t27o: refused fn shadowed_then_pushed (line 15): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 18\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test negative_control_an_unknown_element_type_or_length_and_a_vec_that_is_no_let_value_stay_refused {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn runtime(n: usize) -> usize {\n    let v = vec![0u8; n];\n    v.len()\n}\nfn expr_count() {\n    let v = vec![0u8; 2 + 2];\n    assert_eq!(bytes(&v), 4);\n}\n#[test]\nfn unknown_type() {\n    let v = vec![1, 2, 3];\n    assert_eq!(v.len(), 3);\n}\n#[test]\nfn a_call_argument_is_not_a_let() {\n    let u = bytes(&vec![1u8]);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn runtime (line 2): a vec! whose element type or length t27o cannot tell `vec` at line 3\n\nfn runtime(n: usize) -> usize {\n}\n\n// t27o: refused fn expr_count (line 6): a vec! whose element type or length t27o cannot tell `vec` at line 7\n\nfn expr_count() -> void {\n}\n\n// t27o: refused fn unknown_type (line 11): a vec! whose element type or length t27o cannot tell `vec` at line 12\n\n// t27o: refused fn a_call_argument_is_not_a_let (line 16): macro `vec` at line 17\n\n"));
+    assert(st[NOK] == 1);
+}
+
+test negative_control_a_test_that_reaches_a_refused_fn_through_super_is_refused_with_it {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bad(s: &str) -> usize { s.len().saturating_sub(1) }\nfn good(s: &str) -> usize { s.len() }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn through_super_to_a_refused_fn() { assert_eq!(super::bad(\"ab\"), 1); }\n    #[test]\n    fn through_super_to_a_converted_fn() { assert_eq!(super::good(\"ab\"), 2); }\n    #[test]\n    fn through_super_to_a_fn_nobody_here_declares() { assert_eq!(super::elsewhere(\"ab\"), 2); }\n}", &out, &st);
+    assert(out_is(n, &out, 0, "// t27o: refused fn bad (line 1): method `saturating_sub` at line 1\n\nfn bad(s: []const u8) -> usize {\n}\n\nfn good(s: []const u8) -> usize {\n    return s.len;\n}\n\n// t27o: refused fn through_super_to_a_refused_fn (line 6): uses refused `bad` at line 6\n\ntest through_super_to_a_converted_fn {\n    assert(good(\"ab\") == 2);\n}\n\n// t27o: refused fn through_super_to_a_fn_nobody_here_declares (line 10): undeclared `elsewhere` at line 10\n\n"));
+    assert(st[NOK] == 2);
+}
+
 test ok_and_err_comparisons_in_a_test_read_a_result_as_an_optional {
     var out : [4096]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
@@ -9122,4 +9948,226 @@ test negative_control_a_method_two_types_share_and_a_field_of_an_untyped_local_s
     assert(out_text_has(&out, n, "refused fn a (line 9): `!` of an operand whose type t27o cannot tell `c.dup()` at line 9"));
     assert(out_text_has(&out, n, "refused fn b (line 10): `!` of an operand whose type t27o cannot tell `s.on` at line 10"));
     assert(!out_text_has(&out, n, "== false"));
+}
+
+test the_declaration_index_answers_the_three_lookups_as_the_scans_do {
+    var st : [1024]usize = [0] ** 1024;
+    // shadowing: the first `struct A {` is the one with x, the first `fn f` the free one (u32, the impl's
+    // is bool), and the first `fn g` the impl's -- it has no `->`, though the free `g` returns A
+    const src : str = "struct A { x: u32 }\nconst K: u32 = 3;\nstatic mut S : u8 = 0;\nconst fn cf() -> u8 { 1 }\nfn f(a: u32) -> u32 { a }\nfn mk() -> Ghost { Ghost { } }\nimpl A {\n    fn f(&self) -> bool { true }\n    fn g(&self) { }\n}\nstruct A { y: u8 }\nstruct U;\nstruct T(u8);\n// struct Remark { }\nfn rm() -> Remark { Remark }\nfn q() -> Quoted { let s = \"struct Quoted { }\"; s }\nfn g() -> A { A { x: 1 } }\nfn ptr(p: fn(u32) -> u32) -> u32 { p(1) }\n";
+    index_decls(src, &st);
+    assert(st[IXON] == 1);
+    assert(all_names_agree(src, &st));
+    const a : usize = find_tok(src, 0, "A");
+    const lb : usize = find_struct(src, &st, a, tok_end(src, a));
+    assert(lb < src.len and src[lb] == B_LBRACE and src[lb + 2] == B_LOWER_X);
+    assert(st[IXHIT] != 0);
+    const f : usize = find_tok(src, 0, "f");
+    const fr : usize = fn_ret_type(src, &st, f, tok_end(src, f));
+    assert(word_is(src, fr, tok_end(src, fr), "u32"));
+    const g : usize = find_tok(src, 0, "g");
+    assert(fn_ret_type(src, &st, g, tok_end(src, g)) == src.len);
+    const mk : usize = find_tok(src, 0, "mk");
+    const mr : usize = fn_ret_type(src, &st, mk, tok_end(src, mk));
+    assert(word_is(src, mr, tok_end(src, mr), "Ghost"));
+    const cf : usize = find_tok(src, 0, "cf");
+    const cr : usize = fn_ret_type(src, &st, cf, tok_end(src, cf));
+    assert(word_is(src, cr, tok_end(src, cr), "u8"));
+    assert(const_type(src, &st, cf, tok_end(src, cf)) == src.len);
+    const k : usize = find_tok(src, 0, "K");
+    const kt : usize = const_type(src, &st, k, tok_end(src, k));
+    assert(word_is(src, kt, tok_end(src, kt), "u32"));
+    const s : usize = find_tok(src, 0, "S");
+    const sy : usize = const_type(src, &st, s, tok_end(src, s));
+    assert(word_is(src, sy, tok_end(src, sy), "u8"));
+}
+
+test negative_control_names_that_only_look_declared_are_not_in_the_index {
+    var st : [1024]usize = [0] ** 1024;
+    // a unit or tuple struct has no `{`, a struct in a comment or a text is no declaration, a name used
+    // but never declared is nowhere, `fn(u32) -> u32` is a type, and a const is not a fn nor a struct
+    const src : str = "struct A { x: u32 }\nconst K: u32 = 3;\nfn mk() -> Ghost { Ghost { } }\nstruct U;\nstruct T(u8);\n// struct Remark { }\nfn rm() -> Remark { Remark }\nfn q() -> Quoted { let s = \"struct Quoted { }\"; s }\nfn ptr(p: fn(u32) -> u32) -> u32 { p(1) }\n";
+    index_decls(src, &st);
+    assert(st[IXON] == 1);
+    const names : [5]str = ["Ghost", "U", "T", "Remark", "Quoted"];
+    var i : usize = 0;
+    while (i < 5) {
+        const n : usize = find_tok(src, 0, names[i]);
+        assert(n < src.len);
+        assert(find_struct(src, &st, n, tok_end(src, n)) == src.len);
+        assert(st[IXHIT] == 0);
+        i = i + 1;
+    }
+    const kk : usize = find_tok(src, 0, "K");
+    assert(fn_ret_type(src, &st, kk, tok_end(src, kk)) == src.len);
+    assert(find_struct(src, &st, kk, tok_end(src, kk)) == src.len);
+    const aa : usize = find_tok(src, 0, "A");
+    assert(const_type(src, &st, aa, tok_end(src, aa)) == src.len);
+    assert(fn_ret_type(src, &st, aa, tok_end(src, aa)) == src.len);
+    assert(all_names_agree(src, &st));
+}
+
+test negative_control_a_wrong_entry_makes_the_lookup_disagree_with_its_scan {
+    var st : [1024]usize = [0] ** 1024;
+    // the index is what the lookups read: point the entry of `struct A` into the middle of its keyword and
+    // the check that holds above fails, so it can fail
+    const src : str = "struct A { x: u32 }\nfn f(a: &A) -> u32 { a.x }\n";
+    index_decls(src, &st);
+    assert(all_names_agree(src, &st));
+    const a : usize = find_tok(src, 0, "A");
+    assert(find_struct(src, &st, a, tok_end(src, a)) < src.len);
+    const hit : usize = st[IXHIT];
+    assert(hit != 0);
+    st[hit + 2] = st[hit + 2] + 1;
+    assert(!lookups_agree(src, &st, a, tok_end(src, a)));
+    assert(!all_names_agree(src, &st));
+}
+
+test a_file_with_more_declarations_than_fit_leaves_the_index_off_and_the_scans_answer {
+    var big : [140]usize = [0] ** 140;
+    var tiny : [100]usize = [0] ** 100;
+    const src : str = "struct A { x: u32 }\nconst K: u32 = 3;\nstatic mut S : u8 = 0;\nconst fn cf() -> u8 { 1 }\nfn f(a: u32) -> u32 { a }\nfn mk() -> Ghost { Ghost { } }\nimpl A {\n    fn f(&self) -> bool { true }\n    fn g(&self) { }\n}\nstruct A { y: u8 }\nfn rm() -> Remark { Remark }\nfn q() -> Quoted { Quoted }\nfn g() -> A { A { x: 1 } }\nfn ptr(p: fn(u32) -> u32) -> u32 { p(1) }\n";
+    // 140 slots: the index may take half of what is free, eleven entries do not fit; 100: no room to start
+    index_decls(src, &big);
+    assert(big[IXON] == 0);
+    assert(big[IXTOP] == big.len);
+    assert(all_names_agree(src, &big));
+    index_decls(src, &tiny);
+    assert(tiny[IXON] == 0);
+    assert(all_names_agree(src, &tiny));
+    const f : usize = find_tok(src, 0, "f");
+    const fr : usize = fn_ret_type(src, &big, f, tok_end(src, f));
+    assert(word_is(src, fr, tok_end(src, fr), "u32"));
+    assert(big[IXHIT] == 0);
+}
+
+test the_name_table_stops_where_the_index_begins {
+    var st : [1024]usize = [0] ** 1024;
+    const src : str = "struct A { x: u32 }\nconst K: u32 = 3;\nfn f(a: u32) -> u32 { a }\n";
+    index_decls(src, &st);
+    assert(st[IXON] == 1);
+    assert(st[IXTOP] < st.len);
+    const a : usize = find_tok(src, 0, "A");
+    // far more names than fit: the table fills up to the index and drops the rest, the index is intact
+    var kind : usize = 100;
+    while (kind < 400) {
+        add_name(src, &st, kind, a, tok_end(src, a), 0, 0);
+        kind = kind + 1;
+    }
+    assert(st[NNAMES] > 100);
+    assert(st[NNAMES] < 300);
+    assert(NAMES + st[NNAMES] * NAME_SLOTS <= st[IXTOP]);
+    assert(all_names_agree(src, &st));
+    assert(st[IXON] == 1);
+}
+
+test a_conversion_reads_the_same_with_the_index_on_and_off {
+    var out_on : [2048]u8 = undefined;
+    var out_off : [2048]u8 = undefined;
+    var on : [1024]usize = [0] ** 1024;
+    var off : [100]usize = [0] ** 100;
+    // a struct field, a const and a fn the bang reads its operands' types from: found by the index in one
+    // run, by the scans in the other (a state vector of 100 slots has no room for an index)
+    const src : str = "pub struct Cfg { pub on: bool }\nconst FLAG: bool = true;\nfn ready() -> bool { true }\npub fn go(c: &Cfg) -> bool { !c.on && !ready() && !FLAG }\n";
+    const want : str = "pub const Cfg = struct {\n    on : bool,\n};\n\nconst FLAG : bool = true;\n\nfn ready() -> bool {\n    return true;\n}\n\npub fn go(c: Cfg) -> bool {\n    return !c.on and !ready() and !FLAG;\n}\n\n";
+    const n : usize = body(src, &out_on, &on);
+    assert(on[IXON] == 1);
+    assert(out_is(n, &out_on, 0, want));
+    const m : usize = body(src, &out_off, &off);
+    assert(off[IXON] == 0);
+    assert(out_is(m, &out_off, 0, want));
+    assert(on[NOK] == 2);
+    assert(off[NOK] == 2);
+}
+
+test line_at_counts_on_from_the_last_position_and_agrees_with_line_of {
+    var st : [1024]usize = [0] ** 1024;
+    const src : str = "a\nbb\n\nccc\ndd\n";
+    // forward, past the end, then back down: the cache keeps the last position, a position before it
+    // counts from byte 0, and either way the line is line_of's
+    var p : usize = 0;
+    while (p < src.len + 3) {
+        assert(line_at(src, &st, p) == line_of(src, p));
+        p = p + 1;
+    }
+    p = src.len + 3;
+    while (p > 0) {
+        p = p - 1;
+        assert(line_at(src, &st, p) == line_of(src, p));
+    }
+    assert(line_at(src, &st, 9) == 4);
+    assert(line_at(src, &st, 2) == 2);
+    assert(line_at(src, &st, 9) == 4);
+    assert(st[LNPOS] == 9);
+}
+
+test negative_control_a_new_pass_starts_the_line_cache_over {
+    var out : [2048]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // the cache sits in the slots every pass clears, so a refusal late in the file does not leave a
+    // position the next pass's first refusal would count from: both lines come out right
+    const n : usize = body("fn a() -> u32 { 1 }\nfn b(x: u32) -> u32 { let y = || x; y() }\nfn c() { }\n", &out, &st);
+    assert(out_text_has(&out, n, "refused fn b (line 2): closure"));
+    assert(st[NFN] == 3);
+}
+
+test find_tok_to_reads_no_token_past_its_bound {
+    // the `for` of a trait impl header is before the `{`; the `for` of the loop inside the block, and the
+    // one of the next impl, are not looked for
+    const src : str = "impl A { fn f() { for i in 0..2 { } } }\nimpl B for C { }\n";
+    const a : usize = find_tok(src, 0, "A");
+    const lb : usize = find_at(src, a, B_LBRACE);
+    assert(find_tok_to(src, a, lb, "for") == src.len);
+    const b : usize = find_tok(src, lb, "B");
+    assert(find_tok_to(src, b, find_at(src, b, B_LBRACE), "for") == find_tok(src, b, "for"));
+    assert(find_tok_to(src, b, find_at(src, b, B_LBRACE), "for") < src.len);
+}
+
+test negative_control_find_tok_still_runs_on_past_a_block_when_no_bound_is_given {
+    const src : str = "impl A { }\nimpl B for C { }\n";
+    const a : usize = find_tok(src, 0, "A");
+    // unbounded, the walk from A finds the next impl's `for` (the cost the bound removes); bounded by A's
+    // own `{` it finds nothing
+    assert(find_tok(src, a, "for") < src.len);
+    assert(find_tok_to(src, a, find_at(src, a, B_LBRACE), "for") == src.len);
+}
+
+test the_index_names_the_impl_that_owns_a_method_and_the_last_let_that_types_a_name {
+    var st : [1024]usize = [0] ** 1024;
+    // `get` is in both impls: with no receiver type the first impl owns it, with a receiver typed Q the
+    // second; `p` is bound to P and then to Q, and the use after both is Q's (Rust shadows)
+    const src : str = "pub struct P { pub n: u32 }\npub struct Q { pub n: u32 }\nimpl P {\n    pub fn get(&self) -> u32 { self.n }\n    pub fn set(&mut self, v: u32) { self.n = v; }\n}\nimpl Q {\n    pub fn get(&self) -> bool { true }\n}\nimpl Default for Q { fn default() -> Q { Q { n: 0 } } }\nfn run() -> bool {\n    let p = P { n: 1 };\n    let q: Q = Q { n: 2 };\n    let r = Q::default();\n    let p = Q { n: 3 };\n    p.get() && q.get() && r.get()\n}\n";
+    index_decls(src, &st);
+    assert(st[IXON] == 1);
+    assert(all_names_agree(src, &st));
+    var g : usize = 0;
+    var q : usize = skip_ws(src, 0);
+    var last_p : usize = 0;
+    var qty : usize = 0;
+    while (q < src.len) {
+        const e : usize = tok_end(src, q);
+        if (word_is(src, q, e, "get") and g == 0) { g = q; }
+        if (word_is(src, q, e, "p")) { last_p = q; }
+        if (word_is(src, q, e, "Q") and qty == 0) { qty = q; }
+        q = skip_ws(src, e);
+    }
+    assert(g > 0 and last_p > 0 and qty > 0);
+    // no receiver type: the first impl with a `get` taking self is P's
+    assert(method_owner(src, &st, g, tok_end(src, g), 0, 0));
+    assert(word_is(src, st[OLO], st[OHI], "P"));
+    assert(st[OKIND] == 1);
+    // a receiver typed Q: Q's impl
+    assert(method_owner(src, &st, g, tok_end(src, g), qty, tok_end(src, qty)));
+    assert(word_is(src, st[OLO], st[OHI], "Q"));
+    // the last `let p` that types p before its use is `let p = Q {`
+    const lp : usize = let_owner(src, &st, last_p, tok_end(src, last_p));
+    assert(lp < src.len and word_is(src, lp, tok_end(src, lp), "Q"));
+    assert(lp > find_tok(src, 0, "run"));
+    // a name no `let` types, and a method no impl has
+    const run : usize = find_tok(src, 0, "run");
+    assert(let_owner(src, &st, run, tok_end(src, run)) == src.len);
+    assert(!method_owner(src, &st, run, tok_end(src, run), 0, 0));
+    // the impl around a point inside `impl Default for Q` is the type after the `for`
+    assert(impl_around(src, &st, src.len - 40));
+    assert(word_is(src, st[OLO], st[OHI], "Q"));
 }
