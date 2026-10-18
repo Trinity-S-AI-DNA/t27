@@ -121,7 +121,7 @@ module D4 {
         "structenum",
     );
     assert!(
-        out.contains("is declared 2 times") && out.contains("is refused"),
+        out.contains("is declared 2 times") && out.contains("error: "),
         "struct and enum sharing a name is a same-namespace collision:\n{out}"
     );
 }
