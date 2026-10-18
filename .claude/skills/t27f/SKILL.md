@@ -200,7 +200,17 @@ Traps from this tick (ffmpeg on the lab):
    Trap: `tsort` prints loops on **stderr** and still prints an order on stdout, so "tsort gave
    an order" is not "acyclic". An earlier issue body said there was no cycle, and the
    spec's corpus run found igla race `backend.t27` <-> `rtl.t27`. Read stderr, or use the
-   spec's `cycle=` flag.
+   spec's `cycle=` flag. That cycle is broken in #10689. Since then, a loop on stderr is a new
+   regression.
+6. Breaking a cycle the view finds. First count the names that cross the back edge. In #10689,
+   one invariant used one function, so the invariant moved to the side that already had the
+   import, and nothing was copied. Then compare `test-report` against **master**, not against
+   "passes". The igla race specs are BLOCKED at a zig error on master, so the right claim is
+   "the same verdict as before", not "the tests pass".
+7. Before you open a PR that adds a spec, run `python3 tools/dupe_scan.py` on the lab. The
+   issue gate auto-merges non-draft PRs even when a check is red: #10681 merged with a copy of
+   `lit_len` that was red on `duplicate-bodies` until #10688. Reuse the existing body through
+   `use`, and do not `--bless` a copy you made by accident.
 
 ## Application: topic map (gHashTag/trinity#1677)
 
