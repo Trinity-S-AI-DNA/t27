@@ -146,6 +146,16 @@ pub fn step_runs(k: u8, quick: bool) -> bool {
     return ((k < STEPS) && ((k != STEP_SUITE) || (quick == false)));
 }
 
+pub fn opens_with(text: &'static str, at: usize, end: usize, lit: &'static str) -> bool {
+    if (at > end) {
+        return false;
+    }
+    if (lit.len() > (end - at)) {
+        return false;
+    }
+    return span_is(text, at, (at + lit.len()), lit);
+}
+
 pub fn entry_at(c: &'static str, n: u64) -> usize {
     let mut at: usize = 0;
     let mut seen: u64 = 0;
@@ -996,26 +1006,6 @@ pub fn digits(text: &'static str, from: usize, to: usize) -> u64 {
         i = (i + 1);
     }
     return n;
-}
-
-pub const V_GREEN: u8 = 0;
-
-pub fn opens_with(text: &'static str, at: usize, end: usize, lit: &'static str) -> bool {
-    if ((at > end) || (lit.len() > (end - at))) {
-        return false;
-    }
-    let mut k: usize = 0;
-    while (k < lit.len()) {
-        if (text.as_bytes()[((at + k)) as usize] != lit.as_bytes()[(k) as usize]) {
-            return false;
-        }
-        k = (k + 1);
-    }
-    return true;
-}
-
-pub fn passes(v: u8) -> bool {
-    return (v == V_GREEN);
 }
 
 pub const FAIL: u8 = 1;
