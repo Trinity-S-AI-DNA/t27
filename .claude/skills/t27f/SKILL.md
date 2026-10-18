@@ -68,7 +68,7 @@ the reels. Describing T27F as #1677 is the error this section exists to stop (ow
 | Renderer in the Trinity UI | gHashTag/trinity | **missing**; no T27F widget is live |
 | Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; procedure below |
 | Application: reels and deck | `specs/t27f/reel.t27`, `deck.t27`, `reel_*.t27` | spec; two reels |
-| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". A printing `main` makes t27b reject the spec |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
 When asked "how is T27F going", report against the core rows first. Progress on the applications
@@ -249,6 +249,29 @@ approved)`.
 
 Keep drafts, verified results and published items under separate headings (`layer_of`). If the
 journey is saved, save it as a `.t27` data module, not JSON. Saving follows the user's instruction.
+
+## Application: content factory, beats (t27#10584)
+
+`specs/t27f/reel_beats.t27` plans every reel of course 0 as three beats: open, main and close.
+Main is `arche(t)` from `reel_factory.t27`. Open is the best other construct, with a generic
+fallback. Close is a rotating generic. No two reels share the ordered pair (open, main), and
+neighbouring reels differ in every beat.
+
+Before you change a uniqueness rule, measure what it can draw from:
+
+- **Count the pool before you promise uniqueness.** 21 of 27 course-0 lessons have content only
+  for graph and tests among the constructs. This is measured, not a detection bug: course 0's
+  snippets have no `while` or `if`. Six archetypes make only 15 unordered pairs for 27 reels,
+  so an unordered rule fails 4 of 7 tests. Ordered pairs (30) hold. Print the content matrix
+  (lesson by archetype `content()`) first.
+- **A generated printer needs a test block.** `t27c gen` emits `const std = @import("std")`
+  only when the module has a test. Without one, `std.debug.print` fails in zig with "use of
+  undeclared identifier 'std'". Give a lab-only printer one trivial `test`.
+- **Keep scratch printers on the lab.** Copy them into `specs/` for `t27c gen`, then `rm` them
+  in the same command. Never commit them.
+- **Write PR bodies with the Write tool.** The Mac hook matches words in a
+  shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
+  pass `--body-file`.
 
 ## What this skill does not claim
 
