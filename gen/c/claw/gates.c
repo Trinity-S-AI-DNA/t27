@@ -551,6 +551,43 @@ void test_coverage_report_carries_every_class(void) {
     assert((buf_has(&out, w, "G_UNKNOWN", 9) == true));
 }
 
+void test_audit_tail_line_matches_the_count(void) {
+    uint8_t dir[8192] = {0};
+    size_t w = 0;
+    for (size_t i = 0; i < 67; i++) {
+        w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
+        w = put_str(&dir, 8192, w, "\n", 1);
+    }
+    uint8_t out[8192] = {0};
+    for (size_t i = 0; i < 8192; i++) {
+        out[i] = 0;
+    }
+    assert((claw_status(&dir, w, &out, 8192) == 0));
+    assert((buf_has(&out, 8192, "claw: matrix is current\n", 24) == true));
+    assert((buf_has(&out, 8192, DRIFT_TAIL, DRIFT_TAIL_LEN) == false));
+    uint8_t gone[8192] = {0};
+    size_t g = 0;
+    for (size_t i = 1; i < 67; i++) {
+        g = put_str(&gone, 8192, g, NAMES[i], NAME_LENS[i]);
+        g = put_str(&gone, 8192, g, "\n", 1);
+    }
+    uint8_t red[8192] = {0};
+    for (size_t i = 0; i < 8192; i++) {
+        red[i] = 0;
+    }
+    assert((claw_status(&gone, g, &red, 8192) == 1));
+    assert((buf_has(&red, 8192, DRIFT_TAIL, DRIFT_TAIL_LEN) == true));
+    assert((buf_has(&red, 8192, OK_TAIL, OK_TAIL_LEN) == false));
+}
+
+void test_coverage_report_lines_are_exact(void) {
+    uint8_t out[4096] = {0};
+    size_t w = claw_coverage_report(&out, 4096);
+    assert((buf_has(&out, w, "G_BLOCKING n=62 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
+    assert((buf_has(&out, w, "G_SOFT n=3 blocking=false e.g. oracle-nightly, queen-doctor, rings-rust\n", 72) == true));
+    assert((buf_has(&out, w, "G_REPORTING n=2 blocking=false e.g. auto-merge-ready-prs, queen-publish\n", 72) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -577,7 +614,9 @@ int main(void) {
     test_every_row_round_trips_through_the_name_lookup();
     test_soft_gates_report_their_events();
     test_coverage_report_carries_every_class();
-    printf("All %d tests passed.\n", 18);
+    test_audit_tail_line_matches_the_count();
+    test_coverage_report_lines_are_exact();
+    printf("All %d tests passed.\n", 20);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
