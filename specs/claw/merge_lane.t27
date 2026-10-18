@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/merge_lane.t27 -- is the merger starved? Read from its own runs (#10393).
+; --
+; TRI CLAW's merger is the workflow "Auto Merge Ready PRs". Its merge job runs on ubuntu-latest,
+; the same pool every pull_request job waits for. On 2026-10-18 at 20:22 UTC, 34 of its runs were
+; queued, and the oldest was 6598 s old. Run 39158684665 was created at 19:25 and its job got a runner
+; at 20:22. Of its last 200 completed runs, 22 succeeded, 88 were skipped, and 90 were cancelled by
+; its concurrency groups. A green, reviewed PR therefore waits about an hour for a runner, not for review.
+; The merge services built for this (GitHub merge queue, Mergify, Kodiak, bors, Aviator) decide outside
+; the CI runner pool, so merging never waits behind CI. This module only measures; it moves nothing.
+; --
+; Input: one row per merger run, status TAB conclusion TAB age.
+;   status      queued, waiting, requested, pending (all open and not started), in_progress, completed
+;   conclusion  `-` unless completed; when completed, success, skipped, cancelled or another
+;               GitHub conclusion (failure, neutral, timed_out, action_required, stale,
+;               startup_failure)
+;   age         whole seconds since the run was created, 0..432000 (queue_cost's MAX_SECS)
+; Output, merge_plan:
+;     G TAB merger: <q> queued, <r> running, <s> success, <k> skipped, <c> cancelled, <o> other,
+;                   <b> unreadable; oldest open <a> s
+;     F TAB merger TAB idle | flowing | starved | unknown
+; starved: an open run is older than ML_STARVE_SECS. A known starve wins over an unreadable row.
+; unknown: not starved, and some row is unreadable. idle: no open run. flowing: otherwise.
+; The honest limit: age is creation age. A queued run's age is how long it has waited. An
+; in_progress run's age also includes the time it has run, and a merge job takes under a minute.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawMergeLane;
+
+use claw::text;
+use claw::queue_cost;
+
+pub const ML_QUEUED : usize = 0;
+pub const ML_RUNNING : usize = 1;
+pub const ML_SUCCESS : usize = 2;
+pub const ML_SKIPPED : usize = 3;
+pub const ML_CANCELLED : usize = 4;
+pub const ML_OTHER : usize = 5;
+pub const ML_BAD : usize = 6;
+/// The slot after the classes holds the oldest open age, in seconds.
+pub const ML_OLDEST : usize = 7;
+pub const ML_SLOTS : usize = 8;
+
+pub const ML_MAX_ROWS : u32 = 4096;
+/// Thirty minutes: the backstop sweep runs every twenty, so an older open run is not a sweep gap.
+pub const ML_STARVE_SECS : u32 = 1800;
+
+pub const ML_IDLE : u8 = 0;
+pub const ML_FLOWING : u8 = 1;
+pub const ML_STARVED : u8 = 2;
+pub const ML_UNKNOWN : u8 = 3;
+
+pub const ML_HEAD : str = "G\tmerger: ";
+pub const ML_HEAD_LEN : usize = 10;
+pub const ML_COUNT_TEXTS : [7]str = [" queued, ", " running, ", " success, ", " skipped, ", " cancelled, ", " other, ", " unreadable; oldest open "];
+pub const ML_COUNT_LENS : [7]usize = [9, 10, 10, 10, 12, 8, 25];
+pub const ML_FLAG_HEAD : str = "F\tmerger\t";
+pub const ML_FLAG_HEAD_LEN : usize = 9;
+pub const ML_FLAG_TEXTS : [4]str = ["idle\n", "flowing\n", "starved\n", "unknown\n"];
+pub const ML_FLAG_LENS : [4]usize = [5, 8, 8, 8];
+
+/// The class of one row from its status and conclusion ranges, or ML_BAD.
+pub fn ml_class(raw : []const u8, f : []const usize) -> usize {
+    const dash : bool = qc_range_is(raw, f[2], f[3], "-", 1);
+    const open : bool = qc_range_is(raw, f[0], f[1], "queued", 6) or qc_range_is(raw, f[0], f[1], "waiting", 7) or qc_range_is(raw, f[0], f[1], "requested", 9) or qc_range_is(raw, f[0], f[1], "pending", 7);
+    if (open) {
+        if (dash) { return ML_QUEUED; }
+        return ML_BAD;
+    }
+    if (qc_range_is(raw, f[0], f[1], "in_progress", 11)) {
+        if (dash) { return ML_RUNNING; }
+        return ML_BAD;
+    }
+    if (qc_range_is(raw, f[0], f[1], "completed", 9) == false) { return ML_BAD; }
+    if (qc_range_is(raw, f[2], f[3], "success", 7)) { return ML_SUCCESS; }
+    if (qc_range_is(raw, f[2], f[3], "skipped", 7)) { return ML_SKIPPED; }
+    if (qc_range_is(raw, f[2], f[3], "cancelled", 9)) { return ML_CANCELLED; }
+    const other : bool = qc_range_is(raw, f[2], f[3], "failure", 7) or qc_range_is(raw, f[2], f[3], "neutral", 7) or qc_range_is(raw, f[2], f[3], "timed_out", 9) or qc_range_is(raw, f[2], f[3], "action_required", 15) or qc_range_is(raw, f[2], f[3], "stale", 5) or qc_range_is(raw, f[2], f[3], "startup_failure", 15);
+    if (other) { return ML_OTHER; }
+    return ML_BAD;
+}
+
+/// Rows by class in st[ML_QUEUED..ML_BAD]; the oldest open age in st[ML_OLDEST]. Returns the
+/// number of rows.
+pub fn ml_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [6]usize = undefined;
+    var k : usize = 0;
+    while (k < ML_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var cls : usize = ML_BAD;
+            var age : i32 = -1;
+            if (rows < ML_MAX_ROWS and qc_split(raw, ls, le, &f, 3)) {
+                age = qc_secs(raw, f[4], f[5]);
+                if (age >= 0) { cls = ml_class(raw, &f); }
+            }
+            st[cls] += 1;
+            const is_open : bool = cls == ML_QUEUED or cls == ML_RUNNING;
+            if (is_open and (age as u32) > st[ML_OLDEST]) { st[ML_OLDEST] = age as u32; }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The verdict from the counts: a known starve wins over an unreadable row.
+pub fn ml_verdict_of(st : []const u32) -> u8 {
+    if (st[ML_OLDEST] > ML_STARVE_SECS) { return ML_STARVED; }
+    if (st[ML_BAD] > 0) { return ML_UNKNOWN; }
+    if (st[ML_QUEUED] + st[ML_RUNNING] == 0) { return ML_IDLE; }
+    return ML_FLOWING;
+}
+
+pub fn ml_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [8]u32 = undefined;
+    const rows : u32 = ml_counts(raw, n, &st);
+    if (rows == 0) { return ML_IDLE; }
+    return ml_verdict_of(&st);
+}
+
+/// The two output lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn merge_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [8]u32 = undefined;
+    const rows : u32 = ml_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, ML_HEAD, ML_HEAD_LEN);
+    var k : usize = 0;
+    while (k < 7) {
+        w = put_count(out, cap, w, st[k]);
+        w = put_str(out, cap, w, ML_COUNT_TEXTS[k], ML_COUNT_LENS[k]);
+        k += 1;
+    }
+    w = put_count(out, cap, w, st[ML_OLDEST]);
+    w = put_str(out, cap, w, " s\n", 3);
+    w = put_str(out, cap, w, ML_FLAG_HEAD, ML_FLAG_HEAD_LEN);
+    var v : usize = ML_IDLE as usize;
+    if (rows > 0) { v = ml_verdict_of(&st) as usize; }
+    return put_str(out, cap, w, ML_FLAG_TEXTS[v], ML_FLAG_LENS[v]);
+}
+
+// ---- test helpers ----
+
+/// The merger on 2026-10-18 at 20:22 UTC, in miniature: the oldest queued run (6598 s), the
+/// in_progress run created at 19:25 (3425 s), and one each of success, skipped and cancelled.
+fn t_starved(dst : []u8, cap : usize) -> usize {
+    var x : usize = put_str(dst, cap, 0, "queued\t-\t6598\n", 14);
+    x = put_str(dst, cap, x, "in_progress\t-\t3425\n", 19);
+    x = put_str(dst, cap, x, "completed\tsuccess\t120\n", 22);
+    x = put_str(dst, cap, x, "completed\tskipped\t7\n", 20);
+    return put_str(dst, cap, x, "completed\tcancelled\t900\n", 24);
+}
+
+fn t_verdict2(a : str, al : usize, b : str, bl : usize) -> u8 {
+    var raw : [96]u8 = undefined;
+    var x : usize = put_str(&raw, 96, 0, a, al);
+    x = put_str(&raw, 96, x, b, bl);
+    return ml_verdict(&raw, x);
+}
+
+// ---- tests ----
+
+test the_merger_on_2026_10_18_is_starved {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    assert n == 99;
+    var st : [8]u32 = undefined;
+    assert ml_counts(&raw, n, &st) == 5;
+    assert st[ML_QUEUED] == 1;
+    assert st[ML_RUNNING] == 1;
+    assert st[ML_SUCCESS] == 1;
+    assert st[ML_SKIPPED] == 1;
+    assert st[ML_CANCELLED] == 1;
+    assert st[ML_OTHER] == 0;
+    assert st[ML_BAD] == 0;
+    assert st[ML_OLDEST] == 6598;
+    assert ml_verdict(&raw, n) == ML_STARVED;
+}
+
+test the_starved_plan_text {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    var out : [160]u8 = undefined;
+    const w : usize = merge_plan(&raw, n, &out, 160);
+    assert w == 125;
+    assert buf_has(&out, w, "G\tmerger: 1 queued, 1 running, 1 success, 1 skipped, 1 cancelled, 0 other, 0 unreadable; oldest open 6598 s\n", 108) == true;
+    assert buf_has(&out, w, "F\tmerger\tstarved\n", 17) == true;
+}
+
+test the_age_of_a_completed_run_does_not_starve {
+    assert t_verdict2("completed\tsuccess\t9000\n", 23, "queued\t-\t60\n", 12) == ML_FLOWING;
+    assert t_verdict2("completed\tcancelled\t9000\n", 25, "completed\tskipped\t9000\n", 23) == ML_IDLE;
+}
+
+test the_limit_is_strict {
+    assert t_verdict2("queued\t-\t1800\n", 14, "in_progress\t-\t5\n", 16) == ML_FLOWING;
+    assert t_verdict2("queued\t-\t1801\n", 14, "in_progress\t-\t5\n", 16) == ML_STARVED;
+    assert t_verdict2("pending\t-\t5\n", 12, "in_progress\t-\t1801\n", 19) == ML_STARVED;
+}
+
+test an_open_run_needs_a_dash_and_a_completed_run_needs_a_conclusion {
+    assert t_verdict2("queued\tsuccess\t5\n", 17, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("completed\t-\t5\n", 14, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("in_progress\tsuccess\t5\n", 22, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("completed\tfailure\t5\n", 20, "completed\ttimed_out\t5\n", 22) == ML_IDLE;
+}
+
+test an_unreadable_row_makes_it_unknown_and_a_known_starve_still_wins {
+    assert t_verdict2("queued\t-\t9x\n", 12, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("queued\t-\t432001\n", 16, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("Queued\t-\t5\n", 11, "queued\t-\t2000\n", 14) == ML_STARVED;
+    assert t_verdict2("queued\t-\n", 9, "queued\t-\t2000\n", 14) == ML_STARVED;
+}
+
+test no_rows_is_idle {
+    assert ml_verdict("", 0) == ML_IDLE;
+    var out : [160]u8 = undefined;
+    const w : usize = merge_plan("", 0, &out, 160);
+    assert w == 119;
+    assert buf_has(&out, w, "F\tmerger\tidle\n", 14) == true;
+}
+
+test a_clipped_plan_still_advances_the_cursor {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    var out : [160]u8 = undefined;
+    assert merge_plan(&raw, n, &out, 40) == 125;
+}
