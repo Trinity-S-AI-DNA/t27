@@ -12,8 +12,24 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Drift audit law | `claw_status` in `specs/claw/gates.t27` | T2, this branch |
 | Drift audit in CI | `gate-topology` workflow, "claw drift" step | T3, this branch |
 | GitHub App manifest | release step, see `docs/claw/RELEASE.md` | T4, deferred to App setup |
+| T27F check in every `.t27` repository | `specs/claw/t27f_gate.t27`, the `claw-t27f` job of `gate-topology.yml` | #10268, live once the owner steps below are done |
 | Service skeleton | Railway, thin I/O glue only | T5, merged (spec contract) |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
+
+## The T27F check in every `.t27` repository (#10268)
+
+Every 10 minutes the `claw-t27f` job of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
+is installed on, and for each open pull request that touches `.t27` posts one `claw/t27f`
+check-run on its head commit: the changed specs and their direct importers, each judged by
+`t27c seal --verify` from the signed t27o-v0.1.0 release. The law is `specs/claw/t27f_gate.t27`:
+unsealed is neutral; a stale, vacuous or unreadable seal is failure; gHashTag/ghashtag.github.io
+only reports. No consumer repository carries a workflow file. Until the owner does these four
+steps, it posts nothing:
+
+1. Give the App the permission checks: write at https://github.com/settings/apps/tri-claw.
+2. Accept the new permission on the App's installation for gHashTag.
+3. Set the secret `CLAW_APP_PRIVATE_KEY` in gHashTag/t27 to the App's private key.
+4. Set the variable `CLAW_APP_ID` in gHashTag/t27 to `5166765`.
 
 ## The inventory spec and how to regenerate it
 
