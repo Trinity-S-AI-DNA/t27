@@ -99,6 +99,15 @@ fn run(cmd: &mut Command) -> (Option<i32>, String, String) {
     run_bounded(cmd, STAGE_TIMEOUT)
 }
 
+/// Stop `pid` so it spawns nothing more, kill its descendants depth-first, then kill it (#8815).
+fn kill_tree(pid: u32) {
+    let sig = |s: &str, p: u32| { let _ = Command::new("kill").args([s, &p.to_string()]).status(); };
+    sig("-STOP", pid);
+    let kids = Command::new("pgrep").args(["-P", &pid.to_string()]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    kids.split_whitespace().filter_map(|k| k.parse().ok()).for_each(kill_tree);
+    sig("-KILL", pid);
+}
+
 fn run_bounded(cmd: &mut Command, limit: Duration) -> (Option<i32>, String, String) {
     let mut child = match cmd
         .stdout(std::process::Stdio::piped())
@@ -138,7 +147,7 @@ fn run_bounded(cmd: &mut Command, limit: Duration) -> (Option<i32>, String, Stri
             Ok(Some(s)) => break Some(s),
             Ok(None) => {
                 if start.elapsed() >= limit {
-                    let _ = child.kill();
+                    kill_tree(child.id()); // #8815: the child's own children too, or they outlive it
                     let _ = child.wait();
                     break None;
                 }
@@ -1946,43 +1955,11 @@ fn synth_xilinx_noshare(top: &str) -> String {
     )
 }
 
-/// The run of decimal digits at the start of `s`, or `None`.
-fn leading_number(s: &str) -> Option<u32> {
-    let d: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if d.is_empty() { None } else { d.parse().ok() }
-}
-
-/// Extract `(chain, site)` from a FASM file: the enabled JTAG chain and the
-/// BSCAN site whose signals are actually routed. They must be equal.
-fn fasm_bscan_chain_and_site(fasm: &str) -> (Option<u32>, Vec<u32>) {
-    let mut chain = None;
-    let mut sites: Vec<u32> = Vec::new();
-    for line in fasm.lines() {
-        // W693: take ALL leading digits, not the first one. A single
-        // `chars().next()` reads site 12 as site 1 and reports "agree" -- a
-        // false PASS on the one guard this project says nothing else checks.
-        if let Some(i) = line.find("BSCAN.JTAG_CHAIN_") {
-            if let Some(n) = leading_number(&line[i + "BSCAN.JTAG_CHAIN_".len()..]) {
-                chain = Some(n);
-            }
-        }
-        if let Some(i) = line.find("CFG_CENTER_BSCAN") {
-            if let Some(n) = leading_number(&line[i + "CFG_CENTER_BSCAN".len()..]) {
-                if !sites.contains(&n) {
-                    sites.push(n);
-                }
-            }
-        }
-    }
-    sites.sort_unstable();
-    (chain, sites)
-}
-
 /// One `openFPGALoader` load. Returns the DONE bit the loader reports.
-fn load_bitstream(bit: &Path, busdev: &str) -> (Option<i32>, Option<u8>, String) {
+fn load_bitstream(bit: &Path, cable: &str, busdev: &str) -> (Option<i32>, Option<u8>, String) {
     let (c, out, err) = run(Command::new("openFPGALoader").args([
         "--cable",
-        "digilent_hs2",
+        cable,
         "--busdev-num",
         busdev,
         &bit.to_string_lossy(),
@@ -2095,28 +2072,24 @@ fn read_verdict(repo_root: &Path, chain: u32) -> (Vec<usize>, Option<u32>, Strin
 /// The whole `idcode 0x03636093` line from a detect/load log, trimmed. The
 /// receipt carries the line the tool read, not a re-typed constant -- the
 /// constant was wrong once (2026-08-14: docs said 100T, all boards said 200T).
-fn silicon_full_idcode_line(log: &str) -> Option<String> {
-    log.lines().find(|l| l.contains("idcode")).map(|l| l.trim().to_string())
+fn silicon_full_idcode_line(log: &str, pl_pos: u32) -> Option<String> {
+    log.lines().filter(|l| l.contains("idcode")).nth(pl_pos as usize).map(|l| l.trim().to_string())
 }
 
 /// R3-2 (#7452): one (FUSE_DNA, XSC_DNA) read, or None. Two commands; the cable
-/// rule, the script and the parse are generated from specs/verified/die_binding.t27.
-fn silicon_dna_pair() -> Option<(u64, u64)> {
-    use crate::die_binding as db;
+/// and die pick, the script and the parse are generated from specs/verified/bench_boards.t27 (#8662).
+fn silicon_dna_pair(b: u8, detect: &str) -> Option<(u64, u64)> {
+    use crate::bench_boards as bb;
     let (_, scan, scan_err) = run(Command::new("openFPGALoader").arg("--scan-usb"));
-    let cables = db::cables_listed(spec_str(&(scan + &scan_err)));
-    if !db::dna_read_allowed(cables) {
-        println!("  DNA not read: {cables} cables attached (die_binding.t27 reads with exactly one)");
-        return None;
+    let reader: String = (0..bb::reader_len(b)).map(|k| char::from(bb::reader_char(b, k) as u8)).collect();
+    let out = match bb::dna_pick(spec_str(&(scan + &scan_err)), spec_str(detect), b) {
+        bb::PICK_OK => { let (_, out, err) = run(Command::new("openocd").args(["-c", &reader])); spec_str(&(out + &err)) }
+        why => { println!("  DNA not read: {}", bb::pick_why(why)); return None; }
+    };
+    match bb::reader_first_wrong(out, b) {
+        bb::PICK_OK => Some((bb::reader_raw(out, bb::READER_FUSE_TAG), bb::reader_raw(out, bb::READER_XSC_TAG))),
+        why => { println!("  DNA not read: {}", bb::pick_why(why)); None }
     }
-    let (_, out, err) = run(Command::new("openocd").args(["-c", db::DNA_READER]));
-    let out = spec_str(&(out + &err));
-    let (f, x) = (db::reader_raw(out, db::READER_FUSE_TAG), db::reader_raw(out, db::READER_XSC_TAG));
-    if f == db::HEX_NONE || x == db::HEX_NONE {
-        println!("  DNA not read: openocd printed no tagged read");
-        return None;
-    }
-    Some((f, x))
 }
 
 /// The receipt's device_dna: the reads before and after the run name one die, or null.
@@ -2550,10 +2523,14 @@ use crate::{corpus_receipt as cr, cr_leaves as leaves, cr_pair as pair, cr_root,
 pub fn run_corpus_receipt(root: &Path, action: &str, a: &str, b: &str, nonce: Option<String>, head_challenge: Option<String>, runner: Option<String>) -> anyhow::Result<()> {
     let read = |p: &str| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?) };
     let (hx, hexarg) = (|p: &Path| std::fs::read(p).map(|d| hex_lower(&cr_sha(&[&d]))), |f, s: Option<String>| s.map(|s| parse_challenge_hex(f, &s)).transpose().map_err(anyhow::Error::msg));
+    let f = |k: usize| b.split(',').nth(k).and_then(|s| s.parse().ok()).unwrap_or(u32::MAX); // not a number: u32::MAX, spec COUNT_UNKNOWN
     if action == "admit" { // #7672: does the lab run request `a`? b is "age_s,index,on_origin"
-        let f = |k: usize| b.split(',').nth(k).and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
         let r = cr::request_verdict(spec_str(a), f(0), f(1), f(2) == 1);
         println!("{}", cr::REQUEST_NAMES[r as usize]); std::process::exit(cr::request_exit(r) as i32)
+    }
+    if action == "schedule" { // #9026: what the lab runs next, and its next count; a is T27_LAB_ROLE, b "master_moved,admitted,count"
+        let (role, judge_ready) = (cr::lab_role(spec_str(a)), true); let n = cr::lab_next(role, f(0) == 1, judge_ready, f(1), f(2)); // the judge answers
+        return Ok(println!("{} {}", cr::NEXT_NAMES[n as usize], cr::lab_count(role, n, f(2))));
     }
     if action == "sign" {
         let (run, mut l, argv) = (read(a)?, [vec![], vec![], vec![]], runner.unwrap_or_default());
@@ -4111,6 +4088,36 @@ pub fn run_run_record(
     std::process::exit(if citable { 0 } else { 1 });
 }
 
+/// #8805: a file's sha256, taken from ~/.cache/t27/digests while its stat is unchanged (specs/verified/digest_cache.t27).
+fn file_digest(p: &Path) -> String {
+    use crate::digest_cache as dc;
+    use std::os::unix::fs::MetadataExt;
+    let hash = || crate::sha256_hex(&std::fs::read(p).unwrap_or_default());
+    let Ok(m) = std::fs::metadata(p) else { return hash() };
+    let mib = (m.len() >> 20).min(u32::MAX as u64) as u32;
+    let id = format!("{}|{}|{}|{}.{}|{}.{}|{}", dc::DIGEST_CACHE_VERSION, p.display(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), m.ino());
+    let entry = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/t27/digests").join(crate::sha256_hex(id.as_bytes()));
+    let cached = std::fs::read_to_string(&entry).ok();
+    if dc::digest_cache_use(mib, cached.is_some(), cached.as_deref().map_or(0, |c| c.len() as u32)) { return cached.unwrap_or_default(); }
+    let d = hash();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_secs() as i64);
+    if dc::digest_cache_store(mib, (now - m.mtime().max(m.ctime())).clamp(0, u32::MAX as i64) as u32) {
+        let _ = std::fs::create_dir_all(entry.with_file_name("")).and_then(|_| std::fs::write(&entry, &d));
+    }
+    d
+}
+
+/// #8811: the python fasm2frames runs on -- each distribution's dist-info entry in the venv, and prjxray's own
+/// sources by content. Not `pip freeze`: it named the editable prjxray by the enclosing t27 checkout's HEAD.
+fn venv_identity(root: &Path, xr: &Path) -> String {
+    let ls = |d: PathBuf| -> Vec<PathBuf> { let mut v: Vec<PathBuf> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect(); v.sort(); v };
+    let name = |p: &PathBuf| p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let mut id: Vec<String> = ls(root.join("venv/lib")).iter().flat_map(|py| ls(py.join("site-packages")).into_iter().map(move |e| (py.clone(), e)))
+        .filter(|(_, e)| name(e).ends_with(".dist-info") || name(e).starts_with("__editable__")).map(|(py, e)| format!("{}/{}", name(&py), name(&e))).collect();
+    id.extend(ls(xr.join("prjxray")).iter().filter(|p| name(p).ends_with(".py")).map(|p| format!("{}={}", name(p), file_digest(p))));
+    id.join(",")
+}
+
 pub fn run_silicon(
     repo_root: &Path,
     spec: &str,
@@ -4121,7 +4128,12 @@ pub fn run_silicon(
     skip_hardware: bool,
     pnr_seed: Option<u32>,
     nonce: Option<String>,
+    board: Option<String>,
 ) -> anyhow::Result<()> {
+    // #8662: the board's row (bench_boards.t27) names the part, the cable and the JTAG chain.
+    use crate::bench_boards as bb;
+    let b = bb::board_by_name(spec_str(board.as_deref().unwrap_or("")));
+    if b == bb::BOARD_NONE { println!("REFUSED -- silicon: --board {} is no row of specs/verified/bench_boards.t27", board.unwrap_or_default()); std::process::exit(2); }
     // R3-1 (#7332): a bad nonce or an unusable key is refused BEFORE the
     // boards are touched -- a run whose receipt cannot be what was asked for
     // is not started. No key at all is not a refusal: the run is written
@@ -4155,8 +4167,8 @@ pub fn run_silicon(
     let me = std::env::current_exe()?;
     let mut stages: Vec<Stage> = Vec::new();
 
-    let db = repo_root.join("build/fpga/openxc7/prjxray-db/artix7");
-    let chipdb = repo_root.join("build/fpga/openxc7/xc7a200tfbg676-1.bin");
+    let (part, cable) = (bb::board_part(b), bb::board_cable(b));
+    let (db, chipdb) = (repo_root.join("build/fpga/openxc7/prjxray-db").join(bb::board_family(b)), repo_root.join(format!("build/fpga/openxc7/{part}.bin")));
     // These live outside the worktree because they are multi-gigabyte checkouts
     // shared across worktrees, so the root is per-machine and comes from the
     // environment rather than from one developer's home directory.
@@ -4171,7 +4183,7 @@ pub fn run_silicon(
     let venv = root.join("venv/bin/python");
     let pnr = root.join("nextpnr-xilinx/build/nextpnr-xilinx");
 
-    println!("=== t27c silicon: {spec} ===");
+    println!("=== t27c silicon: {spec} on {} ({part}) ===", bb::board_name(b));
     // W706: this loop checked three of the five paths the run needs. `xr` and
     // `venv` were used twenty lines later without ever being tested, and their
     // absence surfaced as `could not spawn` with sixty characters of stderr that
@@ -4246,6 +4258,37 @@ pub fn run_silicon(
     let mut derived_chain: Option<u32> = None;
 
     let mut seen_sites: Vec<u32> = Vec::new();
+    // #8095: load a bitstream built before from the same inputs by the same tools (specs/verified/bitstream_reuse.t27).
+    use crate::bitstream_reuse as br;
+    let bit_path = tmp.join(format!("{stem}.bit"));
+    let tools = [chipdb.clone(), pnr.clone(), xr.join("utils/fasm2frames.py"), PathBuf::from(run(Command::new("which").arg("xc7frames2bit")).1.trim())];
+    // #8839: the top's declared clocks or its hand `<top>.xdc`, as specs/verified/clock_constraints.t27 decides.
+    use crate::clock_constraints as cc;
+    let (top_v, hand_xdc) = (spec_str(&tops.last().and_then(|t| std::fs::read_to_string(t).ok()).unwrap_or_default()), tops.last().map(|t| Path::new(t).with_extension("xdc")).filter(|p| p.exists()));
+    let (src, gen_xdc) = (cc::constraint_source(top_v, hand_xdc.is_some()), tmp.join(format!("{top_name}.xdc")));
+    if cc::source_refuses(src) { println!("REFUSED -- silicon: {}", cc::source_why(src)); std::process::exit(2); }
+    if src == cc::SRC_DECLARED { std::fs::write(&gen_xdc, (0..cc::xdc_len(top_v)).map(|k| cc::xdc_char(top_v, k) as char).collect::<String>())?; }
+    let xdc_in = if src == cc::SRC_DECLARED { Some(gen_xdc) } else { hand_xdc };
+    let mut key_in = format!("{}|{}|{pnr_seed:?}|{}|{}", run(Command::new("yosys").arg("-V")).1.trim().to_owned() + &venv_identity(&root, &xr), run(Command::new("git").arg("-C").arg(&db).args(["rev-parse", "HEAD"])).1.trim(), br::BIT_RECIPE, env!("CARGO_PKG_VERSION"));
+    for f in sources.iter().map(PathBuf::from).chain(xdc_in.clone()).chain(tools) { key_in += &format!("|{}", file_digest(&f)); }
+    let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/t27/bitstreams").join(crate::sha256_hex(key_in.as_bytes()));
+    let (cached_bit, cached_chain) = (std::fs::read(cache.join("design.bit")).ok(), std::fs::read_to_string(cache.join("chain")).ok());
+    let intact = cached_bit.as_deref().map(crate::sha256_hex) == std::fs::read_to_string(cache.join("bit.sha256")).ok();
+    let decision = br::bit_decision(std::env::var_os("T27_SILICON_REBUILD").is_some(), cached_bit.is_some(), cached_chain.is_some(), intact);
+    let hits: u32 = std::fs::read_to_string(cache.join("hits")).ok().and_then(|h| h.trim().parse().ok()).unwrap_or(0);
+    let audit = decision == br::BIT_REUSE && br::audit_due(hits);
+    'build: {
+    if decision == br::BIT_REUSE && !audit {
+        std::fs::write(cache.join("hits"), (hits + 1).to_string())?;
+        std::fs::write(&bit_path, cached_bit.as_deref().unwrap_or_default())?;
+        derived_chain = cached_chain.and_then(|c| c.trim().parse().ok());
+        let note = format!("same inputs, same tools: {} (T27_SILICON_REBUILD=1 rebuilds)", cache.display());
+        stages.push(Stage { name: "bitstream REUSED", secs: 0.0, code: Some(0), artefact: file_len(&bit_path), note });
+        break 'build;
+    }
+    // #8915: the DUT-alone synthesis of the datapath check reads only the generated Verilog, so it runs beside the main yosys
+    let dp_script = format!("read_verilog -sv {}; synth_xilinx -family xc7 -flatten -run :coarse; techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; alumacc; opt; memory -nomap; opt_clean; synth_xilinx -family xc7 -flatten -run map_memory:; stat", v_path.display());
+    let (mut dp_job, mut dp_res) = (Some(std::thread::spawn(move || run(Command::new("yosys").args(["-p", &dp_script])))), None::<(Option<i32>, String, String)>);
     for attempt in 0..6u32 {
         let t = Instant::now();
         let chparam = match chain_override {
@@ -4327,17 +4370,7 @@ pub fn run_silicon(
         // seconds, and that is cheap against four months of a silent wrong answer.
         let t_dp = Instant::now();
         let wrapper_carry = carry4_count(&log);
-        let (dc, dout, _) = run(Command::new("yosys").args([
-            "-p",
-            &format!(
-                "read_verilog -sv {}; \
-                 synth_xilinx -family xc7 -flatten -run :coarse; \
-                 techmap -map +/cmp2lut.v -map +/cmp2lcu.v -D LUT_WIDTH=6; \
-                 alumacc; opt; memory -nomap; opt_clean; \
-                 synth_xilinx -family xc7 -flatten -run map_memory:; stat",
-                v_path.display()
-            ),
-        ]));
+        let (dc, dout, _) = dp_res.get_or_insert_with(|| dp_job.take().and_then(|j| j.join().ok()).unwrap_or_default()).clone();
         let dut_carry = if dc == Some(0) { Some(carry4_count(&dout)) } else { None };
         let (dp_code, dp_note) = match (wrapper_carry > WRAPPER_CARRY4_FLOOR, dut_carry) {
             // W822 (T553): report the EXERCISED FRACTION, not just "live".
@@ -4409,43 +4442,13 @@ pub fn run_silicon(
         });
 
         let t = Instant::now();
-        // W818 (T542): PLACE AGAINST THE CLOCK THE DIE ACTUALLY DELIVERS.
-        //
-        // With no `--freq` and no XDC, nextpnr-xilinx targets **12 MHz** -- a
-        // number from nowhere. T495 measured CFGMCLK on these three dice at
-        // 70.77 / 68.49 / 67.20 MHz, so every design this project has placed was
-        // checked against a frequency 5.7x below what it is driven at.
-        //
-        // Measured the day this was found, re-placing three existing designs at
-        // the real figure:
-        //     ternary_node        216.08 MHz  PASS
-        //     e8m0                 78.63 MHz  PASS
-        //     gft_bitnet_neuron    11.26 MHz  FAIL   <- and it had been declared
-        //                                               verified on three dice
-        //
-        // 67.20 MHz is used, not the mean: it is the SLOWEST of the three dice,
-        // and a design that must run on all of them has to meet the fastest
-        // clock, which is the largest number -- so the conservative choice for a
-        // timing TARGET is the highest measured value. Using 68.8 (the mean)
-        // would leave the fastest die unchecked; 70.77 is therefore the honest
-        // target and is what is passed.
-        // W819 (T544): a design that DIVIDES the clock needs its own constraint,
-        // and `--freq` is global. T541 measured that a BUFG divider changes
-        // nothing in the report -- the timing engine never learns the ratio -- so
-        // the only honest way to declare a slower domain is an XDC.
-        //
-        // Convention: if `<top>.xdc` sits beside the wrapper, it is passed. No
-        // file means the global `--freq` applies, which is the existing
-        // behaviour for every design that does not divide.
-        let xdc = tops
-            .last()
-            .map(|t| Path::new(t).with_extension("xdc"))
-            .filter(|p| p.exists());
+        // W818 (T542), W819 (T544), #8839: every clock at cc::GLOBAL_FREQ_MHZ, the fastest die's CFGMCLK, unless
+        // the top declares it (xdc_in above); why is in specs/verified/clock_constraints.t27.
         let mut pnr_args: Vec<String> = vec![
             "--chipdb".into(), chipdb.to_string_lossy().into_owned(),
             "--json".into(), json_path.to_string_lossy().into_owned(),
             "--fasm".into(), fasm_path.to_string_lossy().into_owned(),
-            "--freq".into(), "70.77".into(),
+            "--freq".into(), cc::GLOBAL_FREQ_MHZ.into(),
         ];
         // W842 (T616): a seed makes place-and-route a VARIABLE. nextpnr's default
         // is fixed, so every build of a given netlist places identically -- which
@@ -4457,10 +4460,7 @@ pub fn run_silicon(
             pnr_args.push("--seed".into());
             pnr_args.push(sd.to_string());
         }
-        if let Some(x) = &xdc {
-            pnr_args.push("--xdc".into());
-            pnr_args.push(x.to_string_lossy().into_owned());
-        }
+        pnr_args.extend(xdc_in.iter().flat_map(|x| ["--xdc".to_string(), x.to_string_lossy().into_owned()]));
         let (c, _, err) = run(Command::new(&pnr).args(&pnr_args));
         // W839 (T603): this stage printed the frequency it ASKED FOR as if it
         // were the frequency it GOT. nextpnr reports an achieved Fmax per clock
@@ -4478,14 +4478,14 @@ pub fn run_silicon(
             .filter(|l| l.contains("Max frequency for clock"))
             .map(|l| l.trim().trim_start_matches("Info: ").to_string())
             .collect();
-        let timing_fail = fmax.iter().any(|l| l.contains("FAIL"));
+        let gate = cc::timing_gate(spec_str(&err));
         let fmax_note = if fmax.is_empty() {
             "NO Fmax REPORTED -- cannot say the design met timing".to_string()
         } else {
             fmax.join(" | ")
         };
         pnr_stage = Some(Stage {
-            name: if xdc.is_some() { "nextpnr + XDC, Fmax" } else { "nextpnr @70.77MHz, Fmax" },
+            name: cc::source_stage(src),
             secs: t.elapsed().as_secs_f64(),
             code: c,
             // W823 (T557): a KILLED stage has no artefact, whatever is on disk.
@@ -4506,15 +4506,15 @@ pub fn run_silicon(
         }
         // A design that does not meet its own declared period cannot be asked a
         // question about arithmetic: it will answer about settling instead.
-        if timing_fail {
-            println!("FAIL -- nextpnr reports the design MISSES its declared period:");
+        if !cc::gate_loads(gate) {
+            println!("FAIL -- {}:", cc::gate_why(gate));
             for l in &fmax { println!("  {l}"); }
             println!("Nothing was loaded. Slow the wrapper's divider or declare the period it can hold.");
             std::process::exit(1);
         }
 
-        let fasm = std::fs::read_to_string(&fasm_path).unwrap_or_default();
-        let (chain, sites) = fasm_bscan_chain_and_site(&fasm);
+        let fasm = spec_str(&std::fs::read_to_string(&fasm_path).unwrap_or_default());
+        let (chain, sites): (Option<u32>, Vec<u32>) = (Some(bb::fasm_chain(fasm)).filter(|&c| c != bb::NOT_FOUND), (0..bb::fasm_site_count(fasm)).map(|n| bb::fasm_site(fasm, n)).collect());
         let agree = match (chain, sites.as_slice()) {
             (Some(ch), [s]) => ch == *s,
             (None, []) => true,
@@ -4555,6 +4555,7 @@ pub fn run_silicon(
             _ => break,
         }
     }
+    if let Some(j) = dp_job.take() { let _ = j.join(); } // #8915: a failed main yosys never leaves the datapath one running
 
     if let Some(st) = yosys_stage { stages.push(st); }
     if let Some(st) = datapath_stage { stages.push(st); }
@@ -4590,7 +4591,7 @@ pub fn run_silicon(
         Command::new(&venv)
             .env("PYTHONPATH", &xr)
             .arg(xr.join("utils/fasm2frames.py"))
-            .args(["--db-root", &db.to_string_lossy(), "--part", "xc7a200tfbg676-1"])
+            .args(["--db-root", &db.to_string_lossy(), "--part", part])
             .arg(&fasm_path),
     );
     if c == Some(0) {
@@ -4609,13 +4610,12 @@ pub fn run_silicon(
     });
 
     // ---- bitstream, ONLY from non-empty frames ----
-    let bit_path = tmp.join(format!("{stem}.bit"));
     let frames_ok = file_len(&frames_path).map(|(_, n)| n > 0).unwrap_or(false);
     let t = Instant::now();
     let c = if frames_ok {
         let (c, _, _) = run(Command::new("xc7frames2bit").args([
-            "--part_file", &db.join("xc7a200tfbg676-1/part.yaml").to_string_lossy(),
-            "--part_name", "xc7a200tfbg676-1",
+            "--part_file", &db.join(part).join("part.yaml").to_string_lossy(),
+            "--part_name", part,
             "--frm_file", &frames_path.to_string_lossy(),
             "--output_file", &bit_path.to_string_lossy(),
         ]));
@@ -4634,11 +4634,33 @@ pub fn run_silicon(
             "SKIPPED: empty frames would still yield a 9.7 MB .bit (T169)".into()
         },
     });
+    }
 
     let build_ok = print_table(&stages);
     if !build_ok {
         println!("FAIL -- the build did not complete. Nothing was loaded.");
         std::process::exit(1);
+    }
+    if br::may_store(decision, build_ok, stages.iter().any(|s| s.name == "BSCAN chain == site" && s.ok())) {
+        let bit = std::fs::read(&bit_path)?;
+        std::fs::create_dir_all(&cache)?;
+        std::fs::write(cache.join("design.bit"), &bit)?;
+        std::fs::write(cache.join("chain"), derived_chain.map(|c| c.to_string()).unwrap_or_default())?;
+        std::fs::write(cache.join("bit.sha256"), crate::sha256_hex(&bit))?; // last: a torn entry reads CORRUPT
+        println!("  bitstream stored for reuse: {}", cache.display());
+        // #8933: keep the BIT_CACHE_KEEP entries used most recently (stored, or a reuse hit's `hits`), drop the rest
+        let used = |d: &Path| ["hits", "bit.sha256"].iter().filter_map(|f| std::fs::metadata(d.join(f)).and_then(|m| m.modified()).ok()).max();
+        let mut all: Vec<(Option<std::time::SystemTime>, PathBuf)> = std::fs::read_dir(cache.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten().map(|e| (used(&e.path()), e.path())).collect();
+        all.sort_by(|a, b| b.0.cmp(&a.0));
+        for (rank, (_, d)) in all.iter().enumerate() { if !br::bit_cache_keep(rank as u32) && *d != cache { let _ = std::fs::remove_dir_all(d); } }
+    }
+    let stream = |b: &[u8]| b.windows(4).position(|w| w == br::BIT_SYNC_WORD.to_be_bytes()).map(|i| b[i..].to_vec());
+    if audit && br::audit_verdict(std::fs::read(&bit_path).ok().and_then(|b| stream(&b)) == cached_bit.as_deref().and_then(stream)) == br::AUDIT_POISONED {
+        std::fs::remove_dir_all(&cache)?;
+        println!("  AUDIT: the rebuilt bitstream differs from the cached one -- entry deleted, the key missed an input");
+    } else if audit {
+        std::fs::write(cache.join("hits"), (hits + 1).to_string())?;
+        println!("  AUDIT: the rebuilt bitstream is byte-identical to the cached one");
     }
 
     if skip_hardware {
@@ -4656,24 +4678,24 @@ pub fn run_silicon(
     // measured. The detect runs before any load, so a load failure cannot take
     // the device record with it.
     let (_, dout, _) = run(Command::new("openFPGALoader")
-        .args(["-c", "digilent_hs2", "--busdev-num", &busdev, "--detect"]));
-    let full_idcode = silicon_full_idcode_line(&dout);
+        .args(["-c", cable, "--busdev-num", &busdev, "--detect"]));
+    let full_idcode = silicon_full_idcode_line(&dout, bb::pl_pos(b));
     match &full_idcode {
         Some(l) => println!("  idcode on {busdev}: {l}"),
         None => println!("  idcode on {busdev}: UNREADABLE -- the receipt carries null"),
     }
     // die_binding.t27 (#7452): the DNA is read before any load and again after the run.
-    let dna_before = silicon_dna_pair();
+    let dna_before = silicon_dna_pair(b, &dout);
 
     if let Some(wp) = &wrong_part {
-        let (_, done, _) = load_bitstream(Path::new(wp), &busdev);
+        let (_, done, _) = load_bitstream(Path::new(wp), cable, &busdev);
         let ok = done == Some(0);
         hw_ok &= ok;
         println!("  {} A1 wrong part      Done {:?}  (must be 0 -- `done 1` alone proves nothing)",
                  if ok { "OK  " } else { "FAIL" }, done);
     }
 
-    let (_, done, _) = load_bitstream(&bit_path, &busdev);
+    let (_, done, _) = load_bitstream(&bit_path, cable, &busdev);
     let ok = done == Some(1);
     hw_ok &= ok;
     println!("  {} B1 our bitstream   Done {:?}  (must be 1)",
@@ -4776,7 +4798,7 @@ pub fn run_silicon(
         // stops answering -- not that every board does. The index that loses the
         // magic IS the libftdi handle for this --busdev-num, derived rather than
         // assumed.
-        let (_, _, _) = load_bitstream(Path::new(nb), &busdev);
+        let (_, _, _) = load_bitstream(Path::new(nb), cable, &busdev);
         let (during, _, _, _) = read_verdict(repo_root, chain);
         let lost: Vec<usize> = before.iter().copied().filter(|i| !during.contains(i)).collect();
         let ok = lost.len() == 1;
@@ -4789,7 +4811,7 @@ pub fn run_silicon(
             println!("       -> --busdev-num {busdev} is libftdi index {}", lost[0]);
         }
 
-        let (_, _, _) = load_bitstream(&bit_path, &busdev);
+        let (_, _, _) = load_bitstream(&bit_path, cable, &busdev);
         let (after, _, _, _) = read_verdict(repo_root, chain);
         let returned = lost.iter().all(|i| after.contains(i));
         hw_ok &= returned;
@@ -4808,7 +4830,7 @@ pub fn run_silicon(
     let receipt = SiliconReceipt {
         device_record: Some(format!("--busdev-num {busdev}")),
         full_idcode,
-        device_dna: silicon_device_dna(dna_before, silicon_dna_pair()),
+        device_dna: silicon_device_dna(dna_before, silicon_dna_pair(b, &dout)),
         verdict_word: silicon_receipt_word(run_pass),
         seal_hash: silicon_seal_verify(&me, repo_root, spec),
         seeds: pnr_seed.into_iter().collect(),
@@ -4851,38 +4873,6 @@ pub fn run_silicon(
     } else {
         println!("FAIL -- see the line above. A read without its control is not a result.");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod w693_bscan_parser {
-    use super::*;
-
-    /// W693: `chars().next()` read site 12 as site 1 and called it agreement.
-    #[test]
-    fn a_two_digit_site_is_not_read_as_one_digit() {
-        let fasm = "TILE.BSCAN.JTAG_CHAIN_1\nTILE.X.CFG_CENTER_BSCAN12_TDI\n";
-        let (chain, sites) = fasm_bscan_chain_and_site(fasm);
-        assert_eq!(chain, Some(1));
-        assert_eq!(sites, vec![12], "site 12 must not collapse to 1");
-    }
-
-    #[test]
-    fn agreement_and_mismatch_are_distinguished() {
-        let ok = "A.BSCAN.JTAG_CHAIN_3\nB.CFG_CENTER_BSCAN3_TDI\nC.CFG_CENTER_BSCAN3_TDO\n";
-        let (c, s) = fasm_bscan_chain_and_site(ok);
-        assert_eq!((c, s.as_slice()), (Some(3), [3].as_slice()));
-
-        let bad = "A.BSCAN.JTAG_CHAIN_3\nB.CFG_CENTER_BSCAN2_TDI\n";
-        let (c, s) = fasm_bscan_chain_and_site(bad);
-        assert_eq!((c, s.as_slice()), (Some(3), [2].as_slice()));
-    }
-
-    #[test]
-    fn a_design_with_no_bscan_is_not_a_mismatch() {
-        let (c, s) = fasm_bscan_chain_and_site("SOME.OTHER.FEATURE\n");
-        assert_eq!(c, None);
-        assert!(s.is_empty());
     }
 }
 
@@ -4934,8 +4924,8 @@ mod r2_silicon_receipt {
     #[test]
     fn idcode_is_the_line_the_tool_read_or_nothing() {
         let log = "Board 1:4\nidcode 0x03636093\nfamily artix a7 200t\n";
-        assert_eq!(silicon_full_idcode_line(log).as_deref(), Some("idcode 0x03636093"));
-        assert_eq!(silicon_full_idcode_line("family artix a7 200t"), None);
+        assert_eq!(silicon_full_idcode_line(log, 0).as_deref(), Some("idcode 0x03636093"));
+        assert_eq!(silicon_full_idcode_line("family artix a7 200t", 0), None);
     }
 
     /// The receipt's toolchain IS the seal's built_by vocabulary (#7076): one
@@ -5607,5 +5597,194 @@ mod unresolved_is_not_a_rejection {
             ],
             "one line per (reason, tool), first spec each, timeout excluded"
         );
+    }
+}
+
+/// #8095 step 3: every spec under specs/, REUSE or why it must be rebuilt. Each decision is the generated
+/// specs/verified/seal_identity.t27 node_decision(); this walks the `use` graph only (#8102 blocks frontier.t27).
+pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool, only: Vec<String>, since: Option<String>) -> anyhow::Result<()> {
+    use crate::{affected, frontier_scope as sc, gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
+    let (mut tc, mut memo, mut stack, mut specs) = (crate::seal_toolchain(), std::collections::HashMap::new(), vec![std::path::PathBuf::from("specs")], Vec::new());
+    tc["gen_cache_bin"] = std::fs::read(std::env::current_exe()?).map(|b| crate::sha256_hex(&b)).unwrap_or_default().into(); // #8737: the generator's identity
+    // #8928: one directory per binary; keep the current one and the newest others (gen_cache_keep), drop the rest and the old flat files
+    let (gh, cur) = (std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash"), tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none").to_string());
+    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&gh).into_iter().flatten().flatten().filter_map(|e| { let p = e.path(); if !p.is_dir() { let _ = std::fs::remove_file(&p); return None } (e.file_name().to_string_lossy() != cur).then(|| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p)) }).collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    for (rank, (_, p)) in others.iter().enumerate() { if !gc::gen_cache_keep(false, rank as u32) { let _ = std::fs::remove_dir_all(p); } }
+    while let Some(d) = stack.pop() { for e in std::fs::read_dir(&d)?.flatten() { let p = e.path(); if p.is_dir() { stack.push(p) } else if p.extension().map_or(false, |x| x == "t27") { specs.push(p.to_string_lossy().to_string()) } } }
+    fn seal_of(p: &str, src: &str) -> serde_json::Value {
+        let module = crate::extract_module_name(src).unwrap_or_else(|| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        [crate::seal_file_path(&module, p), std::path::Path::new(".trinity/seals").join(format!("{module}.json"))].iter()
+            .find_map(|f| std::fs::read_to_string(f).ok().and_then(|s| serde_json::from_str(&s).ok())).unwrap_or_default()
+    }
+    thread_local!(static DIG: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default());
+    fn digest(p: &str, d: u32) -> String { if let Some(x) = DIG.with(|m| m.borrow().get(p).cloned()) { return x } let src = std::fs::read_to_string(p).unwrap_or_default(); let mut h = src.clone(); for u in src.lines().filter_map(|l| l.trim().strip_prefix("use ")).filter(|_| d < 64) { h.push_str(&digest(&crate::use_spec_path(u), d + 1)) } let x = crate::sha256_hex(h.as_bytes()); DIG.with(|m| m.borrow_mut().insert(p.into(), x.clone())); x }
+    /// #8737 H1: a spec's four gen hashes, from ~/.cache/t27/genhash or generated and stored (gen_hash_cache.t27).
+    fn gen_cached(p: &str, tc: &serde_json::Value) -> Option<[String; 4]> {
+        let file = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27/genhash").join(tc["gen_cache_bin"].as_str().and_then(|b| b.get(..16)).unwrap_or("none")).join(crate::sha256_hex(format!("{}{}{}", digest(p, 0), tc["gen_cache_bin"].as_str().unwrap_or(""), gc::GEN_CACHE_VERSION).as_bytes()));
+        let hit: Option<[String; 4]> = std::fs::read_to_string(&file).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|v| gc::gen_cache_use(true, v.len() as u32)).map(|v| [v[0].clone(), v[1].clone(), v[2].clone(), v[3].clone()]);
+        let cur = hit.clone().or_else(|| crate::compute_seal_hashes(p).ok().map(|h| [h.gen_hash_zig, h.gen_hash_verilog, h.gen_hash_c, h.gen_hash_rust]));
+        if let Some(c) = cur.as_ref().filter(|_| gc::gen_cache_store(true, hit.is_some())) { let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))); let _ = std::fs::write(&file, serde_json::to_string(c).unwrap_or_default()); }
+        cur
+    }
+    fn decide(p: &str, tc: &serde_json::Value, memo: &mut std::collections::HashMap<String, u8>, depth: u32) -> Option<u8> {
+        if let Some(d) = memo.get(p) { return Some(*d); }
+        let src = std::fs::read_to_string(p).ok().filter(|_| depth < 64)?;
+        let seal = seal_of(p, &src);
+        let g = |k: &str| seal.pointer(k).and_then(|v| v.as_str()).map(String::from);
+        let t = |k: &str| tc.get(k).and_then(|v| v.as_str()).map(String::from);
+        let (mut rebuilt, mut missing) = (false, false);
+        for u in src.lines().filter_map(|l| l.trim().strip_prefix("use ")) {
+            match decide(&crate::use_spec_path(u), tc, memo, depth + 1) { Some(d) => rebuilt |= d != si::REUSE, None => missing = true }
+        }
+        let spec = si::recorded_part(g("/spec_hash").is_some(), g("/spec_hash") == Some(format!("sha256:{}", crate::sha256_hex(src.as_bytes()))));
+        let cur = gen_cached(p, tc);
+        let out = ["/gen_hash_zig", "/gen_hash_verilog", "/gen_hash_c", "/gen_hash_rust"].map(|k| g(k));
+        let tools = ["test_runner", "zig"].map(|k| (g(&format!("/toolchain/{k}")), t(k)));
+        let tool = si::toolchain_part(out.iter().all(|o| o.is_some()), cur.map_or(false, |c| out.iter().zip(c.iter()).all(|(o, c)| o.as_deref() == Some(c.as_str()))), tools.iter().all(|(r, _)| r.is_some()), tools.iter().all(|(r, c)| r == c));
+        let config = si::recorded_part(g("/config").is_some(), g("/config").as_deref() == Some(si::SEAL_CONFIG));
+        let tests = si::checks_pass(seal.pointer("/tests/failed").and_then(|v| v.as_u64()) == Some(0), seal.pointer("/tests/forced").and_then(|v| v.as_bool()) == Some(true), seal.pointer("/tests/total").and_then(|v| v.as_u64()).unwrap_or(0) as u32, src.lines().filter(|l| l.trim_start().starts_with("invariant ")).count() as u32, seal.pointer("/tests/vacuous").and_then(|v| v.as_u64()).unwrap_or(0) as u32);
+        let d = si::node_decision(spec, rebuilt, missing, tool, config, tests, false, si::HW_UNPROVEN);
+        memo.insert(p.to_string(), d);
+        Some(d)
+    }
+    let mut counts = [0u32; 7]; specs.sort();
+    // #10236: --only / --since walk the specs frontier_scope.t27 picks (affected.t27: the seeds and their transitive importers), not the corpus; each closure is still read in full
+    let diff = sc::scope_wanted(!only.is_empty(), since.is_some()).then(|| -> anyhow::Result<String> { Ok(match &since { Some(r) => { let o = std::process::Command::new("git").args(["diff", "--name-status", r]).output()?; anyhow::ensure!(o.status.success(), "git diff --name-status {r} failed"); String::from_utf8_lossy(&o.stdout).into_owned() } None => only.iter().map(|o| format!("M\t{o}\n")).collect() }) }).transpose()?;
+    if let Some(d) = diff { let (all, edges) = (specs.len(), specs.iter().flat_map(|p| std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| l.trim().strip_prefix("use ")).map(|u| format!("{p}\t{}\n", crate::use_spec_path(u))).collect::<Vec<_>>()).collect::<String>()); let buf = format!("{d}--graph\n{edges}--corpus\n{}", specs.iter().map(|p| format!("{p}\n")).collect::<String>()); let (mut set, mut out) = (vec![0u8; buf.len() + 1], vec![0u8; buf.len() + 1]); let k = affected::select_affected(buf.as_bytes(), buf.len(), &mut set, buf.len() + 1, &mut out, buf.len() + 1); let narrows = sc::scope_narrows(k, affected::RUN_ALL); if narrows { let keep: std::collections::HashSet<&str> = std::str::from_utf8(&out).unwrap_or("").lines().collect(); specs.retain(|p| keep.contains(p.as_str())) } println!("frontier: scope {}", if narrows { format!("{k} of {all} specs") } else { "the whole corpus (a changed path outside specs/ cannot be judged)".into() }) }
+    // #8846: a cold walk first fills the gen-hash cache with suite_jobs() workers (8 MiB stacks); decide() reads it
+    crate::suite::par_in_order(&specs, |p: &String| { gen_cached(p, &tc); });
+    for p in &specs { let d = decide(p, &tc, &mut memo, 0).unwrap_or(si::REBUILD_MISSING); counts[d as usize] += 1; if list && d != si::REUSE { println!("{d} {p}") } }
+    println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], specs.len(), si::reused_permille(counts[0], specs.len() as u32), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
+    // --reseal (#8095): seal again what remint_wants names; keep the new seal only where remint_keeps allows,
+    // copied onto every twin, else write the old seal back. `seal` exits on a refusal, so it runs as a child.
+    let mut twins: std::collections::HashMap<String, Vec<std::path::PathBuf>> = Default::default();
+    for e in std::fs::read_dir(".trinity/seals").into_iter().flatten().flatten().filter(|_| reseal) { if let Some(s) = std::fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v["spec_path"].as_str().map(String::from)) { twins.entry(s).or_default().push(e.path()) } }
+    let zc = std::env::temp_dir().join(format!("t27c-reseal-{}", std::process::id()));
+    for (i, p) in specs.iter().filter(|p| reseal && memo.get(p.as_str()).map_or(false, |d| si::remint_wants(*d, twins.contains_key(p.as_str())))).enumerate() {
+        let src = std::fs::read_to_string(p)?;
+        let primary = crate::seal_file_path(&crate::extract_module_name(&src).unwrap_or_else(|| Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()), p);
+        let mut old: Vec<(std::path::PathBuf, String, bool)> = twins.get(p.as_str()).into_iter().flatten().filter_map(|f| Some((f.clone(), std::fs::read_to_string(f).ok()?, true))).collect();
+        if let Some(o) = std::fs::read_to_string(&primary).ok().filter(|_| !old.iter().any(|(f, ..)| f == &primary)) { old.push((primary.clone(), o, false)) }
+        let sealed = std::process::Command::new(std::env::current_exe()?).args(["seal", p.as_str(), "--save"]).envs([("ZIG_GLOBAL_CACHE_DIR", &zc), ("ZIG_LOCAL_CACHE_DIR", &zc)]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map_or(false, |s| s.success());
+        if (i as u32 + 1) % si::REMINT_CACHE_EVERY == 0 { let _ = std::fs::remove_dir_all(&zc); }
+        let new: serde_json::Value = std::fs::read_to_string(&primary).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let keep = sealed && si::remint_keeps(new["seal_schema"].as_u64().unwrap_or(0) as u32, new.pointer("/tests/failed").and_then(|v| v.as_u64()) == Some(0), new.pointer("/tests/forced").and_then(|v| v.as_bool()) == Some(true), new.pointer("/tests/total").and_then(|v| v.as_u64()).unwrap_or(0) as u32, src.lines().filter(|l| l.trim_start().starts_with("invariant ")).count() as u32, new.pointer("/tests/vacuous").and_then(|v| v.as_u64()).unwrap_or(0) as u32, !old.iter().any(|(f, _, mine)| f == &primary && !mine));
+        let same = |o: &str| serde_json::from_str::<serde_json::Value>(o).map_or(false, |mut v| { v["sealed_at"] = new["sealed_at"].clone(); v["built_by"] = new["built_by"].clone(); v == new }); // only when and by which build: no change
+        if !keep && !old.iter().any(|(f, ..)| f == &primary) { let _ = std::fs::remove_file(&primary); }
+        for (f, o, mine) in &old { let b = if keep && *mine && !same(o) { serde_json::to_string_pretty(&new)? } else { o.clone() }; anyhow::ensure!(crate::write_seal_atomic(f, b.as_bytes(), crate::staged_is(b.as_bytes()))? == crate::seal_write::WRITE_OK, "{} read back other bytes", f.display()) } // #10454 seal_write.t27 STAGE_THEN_RENAME: a killed reseal leaves no torn seal
+        println!("{} {p}", if keep { "resealed" } else { "kept the old seal" });
+    }
+    let _ = std::fs::remove_dir_all(&zc);
+    // --audit ROUND (#8542): rerun the REUSE specs verdict_audit.t27 picks; a disagreement poisons the seal.
+    let mut poisoned = 0;
+    for p in specs.iter().filter(|p| audit.is_some() && memo.get(p.as_str()) == Some(&si::REUSE)) {
+        let src = std::fs::read_to_string(p)?;
+        if !va::audit_pick(u32::from_str_radix(&crate::sha256_hex(src.as_bytes())[..8], 16).unwrap_or(0), audit.unwrap_or(0)) { continue }
+        let (r, sealed) = (crate::test_report::run(Path::new(p), Path::new("specs")), seal_of(p, &src).pointer("/tests/total").and_then(|v| v.as_u64()).unwrap_or(0) as u32);
+        let bad = va::audit_result(r.blocked.is_none(), r.failed as u32, r.total as u32, sealed, r.total > r.vacuous() || src.lines().any(|l| l.trim_start().starts_with("invariant "))) == va::AUDIT_POISONED;
+        poisoned += bad as u32;
+        println!("{} {p}: rerun {} of {} failed, sealed {}{}", if bad { "POISONED" } else { "agrees" }, r.failed, r.total, sealed, r.blocked.map(|b| format!(", blocked: {}", b.lines().next().unwrap_or(""))).unwrap_or_default());
+    }
+    if poisoned > 0 { anyhow::bail!("{poisoned} reused verdict(s) disagree with their rerun (specs/verified/verdict_audit.t27)") }
+    // --watch (#8737 H5): rerun every spec whose closure digest changed since the last look (watch.t27).
+    let (mut last, mut gens): (std::collections::HashMap<String, String>, std::collections::HashMap<String, [String; 4]>) = Default::default(); // gens (#10237): the four gen hashes at the first look or last rerun; a moved digest over unchanged ones is not rerun (watch_skip), its digest is still recorded
+    // #8821: stat every file the last walk read, before walking, and walk only when one moved (watch_walk)
+    let stat = |p: &str| { use std::os::unix::fs::MetadataExt; std::fs::metadata(p).map(|m| (m.mtime(), m.mtime_nsec(), m.len(), m.ino())).unwrap_or_default() };
+    let mut seen: std::collections::HashMap<String, (i64, i64, u64, u64)> = Default::default();
+    while watch {
+        let looked: std::collections::HashMap<String, (i64, i64, u64, u64)> = specs.iter().cloned().chain(DIG.with(|m| m.borrow().keys().cloned().collect::<Vec<_>>())).map(|p| { let s = stat(&p); (p, s) }).collect();
+        if !wt::watch_walk(last.is_empty(), looked != seen) { std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64)); continue; }
+        seen = looked;
+        DIG.with(|m| m.borrow_mut().clear());
+        let now: Vec<(String, String)> = specs.iter().map(|p| (p.clone(), digest(p, 0))).collect();
+        let (changed, skipped): (Vec<&(String, String)>, Vec<&(String, String)>) = { let cand: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect(); let gn = crate::suite::par_in_order(&cand, |c| gen_cached(&c.0, &tc)); let (a, b): (Vec<_>, Vec<_>) = cand.into_iter().zip(gn).partition(|(c, g)| !wt::watch_skip(gens.contains_key(&c.0), g.is_some(), g.as_ref() == gens.get(&c.0))); (a.into_iter().map(|x| x.0).collect(), b.into_iter().map(|x| x.0).collect()) };
+        // #8852: reruns side by side, specs sharing a file stem on one worker (test_report names its scratch dir by stem and pid)
+        let batch: Vec<&(String, String)> = changed.iter().take(wt::watch_take(changed.len() as u32) as usize).copied().collect();
+        let mut stems: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, (p, _)) in batch.iter().enumerate() { let st = Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(); match stems.iter_mut().find(|g| g.0 == st) { Some(g) => g.1.push(i), None => stems.push((st, vec![i])) } }
+        // #8956: each verdict prints the moment its rerun ends, from the worker that ran it; the digests are recorded after
+        let done = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| { let p = &batch[i].0; let r = crate::test_report::run(Path::new(p), Path::new("specs")); println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); i }).collect::<Vec<_>>());
+        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); if let Some(g) = gen_cached(p, &tc) { gens.insert(p.clone(), g); } } for (p, d) in &skipped { last.insert(p.clone(), d.clone()); }
+        if changed.len() as u32 > wt::WATCH_BATCH { println!("watch: {} more changed specs wait for the next look", changed.len() as u32 - wt::WATCH_BATCH) }
+        if last.is_empty() { for (p, g) in specs.iter().zip(crate::suite::par_in_order(&specs, |p| gen_cached(p, &tc))) { if let Some(g) = g { gens.insert(p.clone(), g); } } } for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
+        std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64));
+    }
+    Ok(())
+}
+
+/// #8095 step 5: every spec in the public silicon-runs index and what the bench does about it. A run stands
+/// for the current seal when it is citable at INDEP_DIES or higher and every receipt ran this seal's Verilog
+/// (seal_hash == gen_hash_verilog) built by this seal's producer -- run_record.t27's own rule.
+pub fn run_silicon_queue() -> anyhow::Result<()> {
+    use crate::{seal_identity as si, silicon_queue as sq};
+    let idx: Vec<serde_json::Value> = std::fs::read_to_string("docs/reports/silicon-runs/index.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let mut specs: Vec<String> = idx.iter().filter_map(|e| e["spec"].as_str().map(String::from)).collect();
+    specs.sort();
+    specs.dedup();
+    for p in &specs {
+        let module = std::fs::read_to_string(p).ok().and_then(|s| crate::extract_module_name(&s)).unwrap_or_default();
+        let seal: serde_json::Value = std::fs::read_to_string(crate::seal_file_path(&module, p)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let ready = seal.pointer("/tests/failed").and_then(|v| v.as_u64()) == Some(0);
+        let hw = idx.iter().filter(|e| e["spec"].as_str() == Some(p.as_str())).map(|e| {
+            let ind = e["independence"].as_str().unwrap_or("");
+            let level = if ind.starts_with("INDEP_OPERATORS") { si::INDEP_OPERATORS } else if ind.starts_with("INDEP_DIES") { si::INDEP_DIES } else { si::INDEP_NONE };
+            let same = |k: &str, f: &str| e["receipts"].as_array().map_or(false, |r| !r.is_empty() && r.iter().all(|x| x[k] == seal[f]));
+            si::silicon_state(true, e["citable"] == true, same("seal_hash", "gen_hash_verilog"), same("toolchain", "built_by"), true, level)
+        }).max().unwrap_or(si::HW_UNPROVEN);
+        println!("{} {p}", ["none", "wait-software", "queue", "bench-blocked"][sq::queue_state(true, ready, hw) as usize]);
+    }
+    Ok(())
+}
+
+/// #8153: the agent next to a board. Every decision is specs/verified/bench_agent.t27; this is its I/O.
+/// Outbound only: jobs are open issues labelled bench-job, answers are comments carrying the receipt.
+pub fn run_bench_agent(repo_root: &Path, busdev: String, wrong_part: String, once: bool) -> anyhow::Result<()> {
+    use crate::bench_agent as ba;
+    let (_, who, _) = run(Command::new("gh").args(["api", "user", "-q", ".login"]));
+    let mark = format!("bench-agent {}/{busdev}:", who.trim());
+    loop {
+        let (_, out, _) = run(Command::new("gh").args(["issue", "list", "--repo", ba::JOB_REPO, "--label", ba::JOB_LABEL, "--state", "open", "--json", "number,author,body,comments"]));
+        let mut pre: Vec<Vec<String>> = Vec::new(); // #8792: owner's jobs built before their approval
+        for j in serde_json::from_str::<Vec<serde_json::Value>>(&out).unwrap_or_default() {
+            let n = j["number"].as_u64().unwrap_or(0).to_string();
+            let cs = j["comments"].as_array().cloned().unwrap_or_default();
+            let body = j["body"].as_str().unwrap_or("");
+            let field = |k: &str| body.lines().find_map(|l| l.trim().strip_prefix(k)).map(|v| v.trim().to_string());
+            let (Some(spec), Some(top)) = (field("spec:"), field("top:")) else { continue };
+            if cs.iter().any(|c| c["body"].as_str().unwrap_or("").starts_with(&mark)) { continue; }
+            let approved = j["author"]["login"] == ba::OWNER_LOGIN && cs.iter().any(|c| c["author"]["login"] == ba::OWNER_LOGIN && c["body"].as_str().map(str::trim) == Some(ba::APPROVE_WORD));
+            // the cable is not touched for a job the owner did not approve
+            let det = if approved { run(Command::new("openFPGALoader").args(["-c", "digilent_hs2", "--busdev-num", &busdev, "--detect"])).1 } else { String::new() };
+            let busy = run(Command::new("pgrep").args(["-f", &format!("(silicon|openFPGALoader).*--busdev-num {busdev}")])).0 == Some(0);
+            let paused = std::env::temp_dir().join("t27-bench-agent-paused").exists();
+            let act = ba::job_action(!paused, approved, det.contains("idcode"), det.contains(ba::BOARD_IDCODE), busy, field("flash:").is_some());
+            println!("bench-agent: #{n} on {busdev}: {}", ["run", "wait", "refuse"][act as usize]);
+            let tried = std::env::temp_dir().join(format!("t27-bench-prebuilt-{n}-{}", &crate::sha256_hex(format!("{spec}|{top}|{:?}", field("seed:")).as_bytes())[..16]));
+            if ba::job_prebuild(!paused, j["author"]["login"] == ba::OWNER_LOGIN, approved, field("flash:").is_some(), tried.exists(), pre.len() as u32) {
+                std::fs::write(&tried, "")?; // tried once even if it fails: the approved run builds and reports it
+                let mut a: Vec<String> = ["silicon", spec.as_str(), "--top", top.as_str(), "--skip-hardware"].map(String::from).to_vec();
+                a.extend(field("seed:").map(|s| ["--pnr-seed".to_string(), s]).into_iter().flatten());
+                pre.push(a);
+            }
+            if act != ba::JOB_RUN { continue; }
+            let mut cmd = Command::new(std::env::current_exe()?);
+            cmd.current_dir(repo_root).args(["silicon", &spec, "--top", &top, "--busdev-num", &busdev, "--wrong-part", &wrong_part]);
+            cmd.args([("--nonce", field("nonce:")), ("--pnr-seed", field("seed:"))].into_iter().filter_map(|(f, v)| v.map(|v| [f.to_string(), v])).flatten());
+            let (_, sout, _) = run_bounded(&mut cmd, Duration::from_secs(3600));
+            print!("{sout}");
+            let has = |a: &str, b: &str| sout.lines().any(|l| l.contains(a) && l.contains(b));
+            let receipt = sout.lines().find_map(|l| l.trim().strip_prefix("receipt: ")).and_then(|p| std::fs::read_to_string(repo_root.join(p)).ok());
+            let dna = receipt.as_deref().map_or(false, |r| !r.contains("\"device_dna\":null"));
+            let o = ba::run_outcome(has("A1 wrong part", "Done Some(0)"), has("B1 our bitstream", "Done Some(1)"), sout.contains("\nPASS --"), dna);
+            let say = format!("{mark} {}\n\n```json\n{}```\n", ["receipt", "the spec FAILED", "BENCH problem, not the spec's"][o as usize], receipt.unwrap_or_else(|| format!("no receipt -- {}\n", sout.lines().last().unwrap_or(""))));
+            run(Command::new("gh").args(["issue", "comment", &n, "--repo", ba::JOB_REPO, "--body", &say]));
+        }
+        for a in pre {
+            let (c, _, _) = run_bounded(Command::new(std::env::current_exe()?).current_dir(repo_root).args(&a), Duration::from_secs(3600));
+            println!("bench-agent: prebuilt {} for its approval (no cable touched): exit {c:?}", a[1]);
+        }
+        if once { return Ok(()); }
+        std::thread::sleep(Duration::from_secs(ba::POLL_SECONDS as u64));
     }
 }

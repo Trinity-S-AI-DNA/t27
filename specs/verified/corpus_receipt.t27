@@ -80,7 +80,28 @@
 ; admits it: a 40-digit lowercase hex sha, among the first REQUEST_QUEUE_MAX requests by age, not
 ; older than REQUEST_AGE_MAX_S, and on origin (a branch head, or a commit on master's first-parent
 ; line). On origin bounds who can put code in front of the signing step: the people who can
-; already push to master. The judge is master's t27c, never the requested commit's.
+; already push to master. The judge is master's t27c, never the requested commit's. The lab reads
+; on origin from a fetch of origin's master made as it judges (#8785), never from the master it last
+; ran, so a squash commit is on origin as soon as it lands. A sha not on origin yet waits up to
+; REQUEST_ORIGIN_GRACE_S before it is dropped (#8320), and waiting never runs it.
+; --
+; A lab's next step (#9026). Between runs the lab asks lab_next() what runs next, a master run, the
+; oldest admitted request or nothing for a poll, and keeps lab_count()'s count for the next ask. The
+; facts: its role (T27_LAB_ROLE, read by lab_role()), whether origin's master moved since the lab last
+; ran it, whether it has a judge, and how many waiting requests request_verdict() admits.
+; - ROLE_MASTER_FIRST is the loop every lab ran before this rule (#8588), step for step: a moved
+;   master runs first, then up to REQUESTS_PER_MASTER admitted requests, then master is looked at
+;   again. A master run with no request after it waits a poll even when master moved meanwhile, and
+;   a request run with none after it goes straight back to a moved master. The count is the requests
+;   run since master was last looked at.
+; - ROLE_REQUESTS_FIRST serves lanes: an admitted request runs before a master run. After
+;   REQUEST_BURST_MAX steps since the last master run a moved master runs once, so the lab's judge
+;   and its master receipts fall at most one burst behind. Master runs keep the old pacing: with no
+;   request waiting, a master run is followed by a poll's wait, never by the next master run at once
+;   (a commit whose checkout keeps failing is retried once a poll, not in a tight loop). The count is
+;   the steps since the last master run: the requests run, and the one wait right after it.
+; - A lab with no judge cannot admit a request, so it runs master, which builds one.
+; - A fresh process has no count: COUNT_UNKNOWN reads as a full one, so master is looked at first.
 ; phi^2 + 1/phi^2 = 3 | TRINITY
 
 module VerifiedCorpusReceipt;
@@ -175,14 +196,37 @@ pub const REQ_BAD_NAME : u8 = 1;
 pub const REQ_QUEUE_FULL : u8 = 2;
 pub const REQ_EXPIRED : u8 = 3;
 pub const REQ_NOT_ON_ORIGIN : u8 = 4;
-pub const REQUEST_NAMES : [5]str = ["ADMIT", "BAD_NAME", "QUEUE_FULL", "EXPIRED", "NOT_ON_ORIGIN"];
+pub const REQ_WAIT_ORIGIN : u8 = 5;
+pub const REQUEST_NAMES : [6]str = ["ADMIT", "BAD_NAME", "QUEUE_FULL", "EXPIRED", "NOT_ON_ORIGIN", "WAIT_ORIGIN"];
 
 /// A request names a full commit sha, in git's lowercase spelling.
 pub const REQUEST_SHA_LEN : u32 = 40;
-/// At most this many requests wait; a lab run takes about 10 minutes.
-pub const REQUEST_QUEUE_MAX : u32 = 4;
+/// At most this many requests wait (#8637): a master-first lab follows a master run with up to
+/// REQUESTS_PER_MASTER requests, so eight drain in about four master cycles, inside REQUEST_AGE_MAX_S.
+pub const REQUEST_QUEUE_MAX : u32 = 8;
 /// A request not started within 6 hours of being written is dropped unrun.
 pub const REQUEST_AGE_MAX_S : u32 = 21600;
+/// A request whose sha is not on origin waits this long before it is dropped (#8320). The lab reads
+/// "on origin" from a fresh fetch as it judges (#8785), so the grace now covers only a commit that has
+/// not reached origin yet, or a fetch that failed; it keeps the two hours of #8715.
+pub const REQUEST_ORIGIN_GRACE_S : u32 = 7200;
+
+/// A lab's role (T27_LAB_ROLE) and its spelling; lab_role() reads it.
+pub const ROLE_MASTER_FIRST : u8 = 0;
+pub const ROLE_REQUESTS_FIRST : u8 = 1;
+pub const ROLE_NAMES : [2]str = ["master_first", "requests_first"];
+/// lab_next() answers and their names; `t27c corpus-receipt schedule` prints the name.
+pub const NEXT_MASTER : u8 = 0;
+pub const NEXT_REQUEST : u8 = 1;
+pub const NEXT_IDLE : u8 = 2;
+pub const NEXT_NAMES : [3]str = ["MASTER", "REQUEST", "IDLE"];
+/// A master-first lab runs up to this many requests before it looks at master again (#8588).
+pub const REQUESTS_PER_MASTER : u32 = 2;
+/// A requests-first lab runs a moved master after this many steps since its last master run: half
+/// of REQUEST_QUEUE_MAX, so a full queue drains with one master run in its middle.
+pub const REQUEST_BURST_MAX : u32 = 4;
+/// The count of a lab that has kept none yet. It reads as a full count.
+pub const COUNT_UNKNOWN : u32 = 4294967295;
 
 ; --- The message ---------------------------------------------------------------------------------
 
@@ -428,15 +472,58 @@ pub fn request_verdict(name: string, age_s: u32, index: u32, on_origin: bool) ->
     if (request_name_ok(name) == false) { return REQ_BAD_NAME; }
     if (index >= REQUEST_QUEUE_MAX) { return REQ_QUEUE_FULL; }
     if (age_s > REQUEST_AGE_MAX_S) { return REQ_EXPIRED; }
+    if (on_origin == false and age_s <= REQUEST_ORIGIN_GRACE_S) { return REQ_WAIT_ORIGIN; }
     if (on_origin == false) { return REQ_NOT_ON_ORIGIN; }
     return REQ_ADMIT;
 }
 
-/// `admit` exits 0 to run the request and 1 to drop it. Any other exit (an older t27c with no
-/// `admit`) leaves the request waiting, so a judge that cannot judge never drops one.
+/// `admit` exits 0 to run the request, 2 to leave it waiting (WAIT_ORIGIN) and 1 to drop it. Any
+/// other exit (an older t27c with no `admit`) also leaves it waiting, so a judge that cannot judge
+/// never drops one.
 pub fn request_exit(verdict: u8) -> u8 {
     if (verdict == REQ_ADMIT) { return 0; }
+    if (verdict == REQ_WAIT_ORIGIN) { return 2; }
     return 1;
+}
+
+; --- A lab's next step ---------------------------------------------------------------------------
+
+/// The role a name picks. Any name but requests_first keeps the lab master first, as before #9026.
+pub fn lab_role(name: string) -> u8 {
+    if (text_is(name, ROLE_NAMES[ROLE_REQUESTS_FIRST])) { return ROLE_REQUESTS_FIRST; }
+    return ROLE_MASTER_FIRST;
+}
+
+/// What the lab runs next. `master_moved`: origin's master is not the commit the lab last ran;
+/// `judge_ready`: the lab has master's t27c to admit requests with; `admitted`: how many waiting
+/// requests request_verdict() admits; `count`: lab_count() after the lab's previous step.
+pub fn lab_next(role: u8, master_moved: bool, judge_ready: bool, admitted: u32, count: u32) -> u8 {
+    if (judge_ready == false) { return NEXT_MASTER; }
+    if (role == ROLE_REQUESTS_FIRST) {
+        if (admitted > 0 and (count < REQUEST_BURST_MAX or master_moved == false)) { return NEXT_REQUEST; }
+        if (count > 0 and master_moved) { return NEXT_MASTER; }
+        return NEXT_IDLE;
+    }
+    if (count >= REQUESTS_PER_MASTER and master_moved) { return NEXT_MASTER; }
+    if (admitted > 0) { return NEXT_REQUEST; }
+    if (count > 0 and master_moved) { return NEXT_MASTER; }
+    return NEXT_IDLE;
+}
+
+/// The count lab_next() reads at the lab's next step, once it has answered `next`. A master-first
+/// lab counts the requests since master was looked at: a wait ends with master looked at next, and
+/// a request run there starts a new count. A requests-first lab counts the steps since its last
+/// master run, a wait only right after it, and stops counting at REQUEST_BURST_MAX.
+pub fn lab_count(role: u8, next: u8, count: u32) -> u32 {
+    if (next == NEXT_MASTER) { return 0; }
+    if (role == ROLE_REQUESTS_FIRST) {
+        if (next == NEXT_IDLE and count > 0) { return count; }
+        if (count < REQUEST_BURST_MAX) { return count + 1; }
+        return count;
+    }
+    if (next == NEXT_IDLE) { return REQUESTS_PER_MASTER; }
+    if (count >= REQUESTS_PER_MASTER) { return 1; }
+    return count + 1;
 }
 
 ; --- Tests ---------------------------------------------------------------------------------------
@@ -750,8 +837,11 @@ test "a request runs only when every bound holds, its name judged first" {
     assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 0, true) == REQ_ADMIT;
     assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 21600, 3, true) == REQ_ADMIT;
     assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 21601, 0, true) == REQ_EXPIRED;
-    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 4, true) == REQ_QUEUE_FULL;
-    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 0, false) == REQ_NOT_ON_ORIGIN;
+    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 8, true) == REQ_QUEUE_FULL;
+    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 7, true) == REQ_ADMIT;
+    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 0, 0, false) == REQ_WAIT_ORIGIN;
+    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 7200, 3, false) == REQ_WAIT_ORIGIN;
+    assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 7201, 0, false) == REQ_NOT_ON_ORIGIN;
     assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 99999, 9, false) == REQ_QUEUE_FULL;
     assert request_verdict("5f308712519557028d680357280bcc941e0ec222", 99999, 0, false) == REQ_EXPIRED;
     assert request_verdict("HEAD", 0, 0, true) == REQ_BAD_NAME;
@@ -761,7 +851,148 @@ test "a request runs only when every bound holds, its name judged first" {
     assert request_exit(REQ_ADMIT) == 0;
     assert request_exit(REQ_BAD_NAME) == 1;
     assert request_exit(REQ_NOT_ON_ORIGIN) == 1;
+    assert request_exit(REQ_WAIT_ORIGIN) == 2;
+    assert request_exit(REQ_QUEUE_FULL) == 1;
+    assert text_is(REQUEST_NAMES[REQ_WAIT_ORIGIN], "WAIT_ORIGIN") == true;
+    assert REQUEST_ORIGIN_GRACE_S == 7200;
     assert REQUEST_SHA_LEN == 40;
-    assert REQUEST_QUEUE_MAX == 4;
+    assert REQUEST_QUEUE_MAX == 8;
     assert REQUEST_AGE_MAX_S == 21600;
+}
+
+test "a squash newer than the last master run: read on origin it runs at any age to the max, read stale it is dropped" {
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 0, 0, true) == REQ_ADMIT;
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 7201, 1, true) == REQ_ADMIT;
+    assert request_exit(request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 7201, 1, true)) == 0;
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 21600, 7, true) == REQ_ADMIT;
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 21601, 0, true) == REQ_EXPIRED;
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 60, 1, false) == REQ_WAIT_ORIGIN;
+    assert request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 7201, 1, false) == REQ_NOT_ON_ORIGIN;
+    assert request_exit(request_verdict("6a7b774d1f5685088d70cc8f1e3ba7d902921751", 7201, 1, false)) == 1;
+}
+
+test "a role is read by its exact name; any other name keeps the lab master first" {
+    assert lab_role("requests_first") == ROLE_REQUESTS_FIRST;
+    assert lab_role("master_first") == ROLE_MASTER_FIRST;
+    assert lab_role("") == ROLE_MASTER_FIRST;
+    assert lab_role("requests-first") == ROLE_MASTER_FIRST;
+    assert lab_role("REQUESTS_FIRST") == ROLE_MASTER_FIRST;
+    assert lab_role("requests_first ") == ROLE_MASTER_FIRST;
+    assert text_is(ROLE_NAMES[ROLE_MASTER_FIRST], "master_first") == true;
+    assert text_is(ROLE_NAMES[ROLE_REQUESTS_FIRST], "requests_first") == true;
+    assert text_is(NEXT_NAMES[NEXT_MASTER], "MASTER") == true;
+    assert text_is(NEXT_NAMES[NEXT_REQUEST], "REQUEST") == true;
+    assert text_is(NEXT_NAMES[NEXT_IDLE], "IDLE") == true;
+}
+
+test "a lab without a judge runs master, whatever its role, queue and count" {
+    assert lab_next(ROLE_MASTER_FIRST, true, false, 3, 0) == NEXT_MASTER;
+    assert lab_next(ROLE_MASTER_FIRST, false, false, 0, COUNT_UNKNOWN) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, false, 3, 1) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, false, 0, COUNT_UNKNOWN) == NEXT_MASTER;
+}
+
+test "master first: a moved master runs when master is looked at, and up to two requests run between" {
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 3, 2) == NEXT_MASTER;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 2) == NEXT_MASTER;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 3, COUNT_UNKNOWN) == NEXT_MASTER;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 3, 2) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 0, 2) == NEXT_IDLE;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 1, 0) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 0) == NEXT_IDLE;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 0, 0) == NEXT_IDLE;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 1, 1) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 1, 1) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 1) == NEXT_MASTER;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 0, 1) == NEXT_IDLE;
+}
+
+test "master first replays the loop it replaces (#8588) step by step" {
+    // The loop: A. a moved master runs; B, C. lane_request() twice; then a poll's sleep if B and C ran
+    // nothing, else straight back to A. A fresh process, master moved, three requests admitted:
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 3, COUNT_UNKNOWN) == NEXT_MASTER;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_MASTER, COUNT_UNKNOWN) == 0;
+    // master moved again during that run; B and C still run two requests before A looks at it.
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 3, 0) == NEXT_REQUEST;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 0) == 1;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 2, 1) == NEXT_REQUEST;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 1) == 2;
+    // A: master moved, so it runs before the third request.
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 1, 2) == NEXT_MASTER;
+    // B runs the third; C finds none, and since B ran, the loop is back at A at once.
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 1, 0) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 1) == NEXT_MASTER;
+    // B and C find none after that master run: a poll's sleep, though master moved again.
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 0) == NEXT_IDLE;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_IDLE, 0) == 2;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 2) == NEXT_MASTER;
+    // B and C find none, master stays quiet: a poll's sleep.
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 0, 0) == NEXT_IDLE;
+    // Three requests came during the sleep, master quiet: A runs nothing, B and C run two, A looks
+    // again and B runs the third; C finds none, A looks, B and C find none: a poll's sleep.
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 3, 2) == NEXT_REQUEST;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 2) == 1;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 2, 1) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 1, 2) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 0, 1) == NEXT_IDLE;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_IDLE, 1) == 2;
+    // Two more came; master moves while B runs the first: C runs the second before A runs master.
+    assert lab_next(ROLE_MASTER_FIRST, false, true, 2, 2) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 1, 1) == NEXT_REQUEST;
+    assert lab_next(ROLE_MASTER_FIRST, true, true, 0, 2) == NEXT_MASTER;
+}
+
+test "requests first: an admitted request runs before a moved master, up to a burst" {
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 1, 0) == NEXT_REQUEST;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, true, 1, 0) == NEXT_REQUEST;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 8, 3) == NEXT_REQUEST;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 8, 4) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, true, 8, 4) == NEXT_REQUEST;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, true, 8, COUNT_UNKNOWN) == NEXT_REQUEST;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 8, COUNT_UNKNOWN) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 0, 1) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 0, 4) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, true, 0, 0) == NEXT_IDLE;
+    assert lab_next(ROLE_REQUESTS_FIRST, false, true, 0, 4) == NEXT_IDLE;
+    // a busy master and a full queue: four requests, one master run, four requests.
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_REQUEST, 3) == 4;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 4, lab_count(ROLE_REQUESTS_FIRST, NEXT_REQUEST, 3)) == NEXT_MASTER;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 4, lab_count(ROLE_REQUESTS_FIRST, NEXT_MASTER, 4)) == NEXT_REQUEST;
+}
+
+test "requests first keeps the master pacing: a poll's wait after a master run with nothing waiting" {
+    // master moved again during its run and no request waits: wait a poll, then run it.
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 0, 0) == NEXT_IDLE;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, 0) == 1;
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 0, 1) == NEXT_MASTER;
+    // a request that came during the wait still goes first.
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 1, 1) == NEXT_REQUEST;
+    // a commit whose checkout failed reads as moved; it is retried after a poll, not at once.
+    assert lab_next(ROLE_REQUESTS_FIRST, true, true, 0, lab_count(ROLE_REQUESTS_FIRST, NEXT_MASTER, 1)) == NEXT_IDLE;
+    // a quiet lab keeps its count while it waits.
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, 3) == 3;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, 1) == 1;
+}
+
+test "the count after each answer" {
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_MASTER, 2) == 0;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_MASTER, 1) == 0;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_IDLE, 0) == REQUESTS_PER_MASTER;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_IDLE, 1) == REQUESTS_PER_MASTER;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_IDLE, COUNT_UNKNOWN) == REQUESTS_PER_MASTER;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 0) == 1;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 1) == 2;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, 2) == 1;
+    assert lab_count(ROLE_MASTER_FIRST, NEXT_REQUEST, COUNT_UNKNOWN) == 1;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_MASTER, COUNT_UNKNOWN) == 0;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_REQUEST, 0) == 1;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_REQUEST, 4) == 4;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_REQUEST, COUNT_UNKNOWN) == COUNT_UNKNOWN;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, 3) == 3;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, 0) == 1;
+    assert lab_count(ROLE_REQUESTS_FIRST, NEXT_IDLE, COUNT_UNKNOWN) == COUNT_UNKNOWN;
+    assert REQUESTS_PER_MASTER == 2;
+    assert REQUEST_BURST_MAX == 4;
+    assert REQUEST_BURST_MAX * 2 == REQUEST_QUEUE_MAX;
+    assert COUNT_UNKNOWN == 4294967295;
 }

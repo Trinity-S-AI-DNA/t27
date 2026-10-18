@@ -7,8 +7,8 @@ Issue #6071, epic #6063. One process does four things:
   /runs/<sha>.json, /runs/<sha>.log, /status.json;
 * on start, and then every T27_POLL_SECONDS (default 600) if
   origin/<T27_REF> moved, runs the lab once on that commit;
-* between polls, runs and signs a commit a lane PR asked for by writing
-  T27_SRV/requests/<sha> (#7672, lane_request);
+* runs and signs a commit a lane PR asked for in T27_SRV/requests/<sha> (#7672)
+  when the judge's lab_next() (#9026) for T27_LAB_ROLE picks it;
 * never writes anywhere but its own disk. The repository is public and is
   cloned anonymously; there are no secrets in this service.
 
@@ -22,14 +22,14 @@ One run, in order:
    because there is no binfmt_misc in the container, so the corpus driver
    cannot exec its own aarch64 binary directly;
 5. the reference path natively, per file: `t27c test-report <file>`
-   (t27c gen + zig test, one test per process), unless the corpus run
-   already carried reference verdicts;
+   (t27c gen + zig test, one test per process);
 6. `cargo test --release -p t27b` for aarch64 under qemu-user (the JIT
    differential tests);
 7. the per-spec ratchet (#6115): `python3 scripts/tri_loop/t27b.py ratchet`
    of that same commit diffs the merged per-file verdicts against
    docs/reports/t27b_expectations.json; its verdict and findings go into
    steps.ratchet, which is ok=false on any UNEXPECTED FAILURE / PASS;
+   on a master run the ledger steward (#9091) reads it: /ledger/<sha>.json;
 8. the differential fuzzer (#6442): `python3 scripts/tri_loop/t27b.py fuzz`
    of that same commit generates T27_FUZZ_CASES programs from a fresh seed
    (specs/tri/t27b/fuzz.t27), runs t27b and the reference on them and judges
@@ -48,6 +48,7 @@ deployed lab is not master's contrib/railway/t27b-lab.
 """
 
 import concurrent.futures
+import ctypes
 import datetime
 import functools
 import hashlib
@@ -68,6 +69,7 @@ REPO = os.environ.get("T27_REPO", "https://github.com/gHashTag/t27")
 REF = os.environ.get("T27_REF", "master")
 PORT = int(os.environ.get("PORT", "8080"))
 POLL = int(os.environ.get("T27_POLL_SECONDS", "600"))
+ROLE = os.environ.get("T27_LAB_ROLE", "master_first")  # #9026: master_first (lab 1) or requests_first (lab 2)
 SRV = Path(os.environ.get("T27_SRV", "/srv"))
 WORK = Path(os.environ.get("T27_WORK", "/work"))
 
@@ -396,6 +398,7 @@ def reference_one(worker, file, tests=None):
     env["ZIG_GLOBAL_CACHE_DIR"] = str(scratch / "zig-global")
     env["ZIG_LOCAL_CACHE_DIR"] = str(scratch / "zig-local")
     env["TMPDIR"] = str(tmp)
+    env["T27C_TEST_REPORT_EXIT_ZERO"] = "1"  # #7370: the verdict is read from the words below
     for attempt in range(3):
         try:
             out = run_group(
@@ -436,34 +439,7 @@ def reference_one(worker, file, tests=None):
 REF_CACHE = SRV / "refcache.json"
 
 
-def specs_root(path):
-    """bootstrap/src/use_resolve.rs find_specs_root, for an absolute path."""
-    d = path.parent
-    while True:
-        if (d / "specs").is_dir():
-            return d / "specs"
-        if d.name == "specs" and d.is_dir():
-            return d
-        if d.parent == d:
-            return None
-        d = d.parent
-
-
-def use_targets(text, root):
-    """bootstrap/src/use_resolve.rs use_targets: `use a::b::c;` -> root/a/b/c.t27."""
-    out = []
-    for line in text.splitlines():
-        t = line.strip()
-        if not t.startswith("use "):
-            continue
-        rest = t[4:].split("//", 1)[0].strip().rstrip(";").strip()
-        segs = [x for part in rest.split("::") for x in part.split(".")]
-        if not segs or not all(segs):
-            continue
-        p = root.joinpath(*segs).with_suffix(".t27")
-        if p.is_file():
-            out.append(p)
-    return out
+EDGES = {}  # importer -> imported by t27c's resolver (`t27c use-edges`); a Python copy missed some in 86 specs.
 
 
 def use_closure(path):
@@ -474,14 +450,7 @@ def use_closure(path):
         if p in seen:
             continue
         seen.append(p)
-        root = specs_root(p)
-        if root is None:
-            continue
-        try:
-            text = p.read_text(errors="replace")
-        except OSError:
-            continue
-        todo.extend(reversed(use_targets(text, root)))
+        todo.extend((CLONE / q).resolve() for q in EDGES.get(os.path.relpath(p, CLONE.resolve()), EDGES.get("*", [])))
     return [seen[0]] + sorted(seen[1:])
 
 
@@ -529,6 +498,10 @@ def reference_all(files, log, tests=None):
     stamp = reference_stamp()
     known = read_ref_cache()
     keep, stats = {}, {"hits": 0, "misses": 0, "not_cached": 0}
+    EDGES.clear()  # a t27c that cannot run cannot say what is imported: then every spec is ("*"), and no key hits stale
+    for e in (subprocess.run([str(T27C), "use-edges", "--specs-dir", CORPUS_DIR], cwd=CLONE, capture_output=True, text=True, check=True).stdout.splitlines()
+              if os.access(T27C, os.X_OK) else ["*\t" + str(p.relative_to(CLONE)) for p in (CLONE / CORPUS_DIR).rglob("*.t27")]):
+        EDGES.setdefault(e.split("\t")[0], []).append(e.split("\t")[-1])
     keys = {f: reference_key(stamp, f) for f in files}
     results = {}
     for f in files:
@@ -654,11 +627,6 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
     corpus = {}
 
     def t27b_corpus():
-        usage = subprocess.run(QEMU + [str(T27B), "help"], capture_output=True, text=True, timeout=120)
-        text = usage.stdout + usage.stderr
-        missing = [o for o in ("--json", "--runner") if o not in text]
-        if missing:
-            raise RuntimeError("t27b at this commit has no corpus %s" % " ".join(missing))
         out = WORK / "corpus.json"
         if out.exists():
             out.unlink()
@@ -688,12 +656,6 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
     ref_tests = {}
 
     def reference_path():
-        if corpus.get("totals", {}).get("reference", {}).get("ran"):
-            for r in corpus["results"]:
-                reference[r["file"]] = (r["reference"], r.get("reference_detail", ""))
-                if isinstance(r.get("reference_tests"), dict):
-                    ref_tests[r["file"]] = r["reference_tests"]
-            return {"source": "t27b corpus (reference verdicts in its JSON)"}
         if corpus.get("results"):
             files = [r["file"] for r in corpus["results"]]
         else:
@@ -708,6 +670,7 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
             % (CORPUS_DIR, REF_JOBS, REF_TIMEOUT_S),
             "totals": tot,
             "cache": cache,
+            "reused": "%d of %d" % (cache["hits"], sum(cache.values())),  # #8095
         }
 
     if have_t27c:
@@ -728,8 +691,6 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
         step("cargo_test_t27b", cargo_test)
 
     def fuzz():
-        if not (CLONE / "scripts" / "tri_loop" / "t27b_fuzz.py").exists():
-            return {"skipped": "no tri t27b fuzz at this commit"}
         seed = int(time.time())
         out = WORK / "fuzz.json"
         if out.exists():
@@ -747,7 +708,7 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
                 "command": "python3 scripts/tri_loop/t27b.py fuzz --cases %d --seed %d --jobs %d"
                 % (FUZZ_CASES, seed, REF_JOBS)}
 
-    if have_t27b and have_t27c and FUZZ_CASES > 0:
+    if have_t27b and have_t27c and FUZZ_CASES > 0 and master:  # #8267: a lane request is judged by its receipt
         step("fuzz", fuzz)
 
     def receipt():  # #7576: sign the run with T27_RECEIPT_SEED (trust NAMED); the nonce is the challenge file's text, if any
@@ -765,6 +726,36 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
             raise RuntimeError("t27c corpus-receipt exited %s: %s" % (p.returncode, p.stderr.strip()[-300:]))
         write_json(SRV / "runs" / ("%s.receipt.json" % sha), json.loads(p.stdout))
         return {"json": "/runs/%s.receipt.json" % sha, "nonce": nonce[1:]}
+
+    def steward():  # #9091: steps 0, 2 and 4 of specs/jobs/t27b_ledger_steward.t27, each decision ledger_steward.t27's
+        led, out, rat, so = "docs/reports/t27b_expectations.json", SRV / "ledger", steps["ratchet"], WORK / f"ls-{sha}.so"
+        py = lambda code, data=None: subprocess.run([sys.executable, "-c", "import json, sys; sys.path[:0] = ['scripts/tri_loop']; " + code],  # noqa: E731
+                                                    cwd=CLONE, input=data, capture_output=True, text=True, check=True).stdout  # the commit's own tools
+        subprocess.run(f"{T27C} gen-c specs/tri/t27b/ledger_steward.t27 > {so}.c && cc -shared -fPIC -w -o {so} {so}.c", shell=True, cwd=CLONE, check=True)
+        ls, (names, kinds, reasons) = ctypes.CDLL(str(so)), json.loads(py("import t27b_rules as r; print(json.dumps([r.VERDICTS, r.RATCHETS, r.REASONS]))"))
+        if not ls.run_starts_job(True, rat.get("verdict") == "red", (out / f"{sha}.json").exists()) & 1:
+            return {"skipped": "the ratchet is not red, or this commit was read"}
+        old, by, found, t = json.loads((CLONE / led).read_text()), {r["file"]: r for r in doc["results"]}, [], [0, 0, 0, 0]
+        code, rows = (lambda xs, x: xs.index(x) if x in xs else 255), {e["path"]: e for e in old["entries"]}  # an unknown name: 255, refused
+        for f, rec in ((f, by.get(f["path"], {})) for f in rat.get("findings") or []):
+            c, g, got = code(kinds, f["kind"]), code(names, rec.get("t27b")), rec.get("t27b")
+            act = ("KEEP", "ADD", "SET", "DROP", "REFUSE")[ls.finding_action(c, g) & 255]
+            t = [ls.tally_refused(t[0], c, g, 1), ls.tally_applied(t[1], c, g, 1), ls.tally_new_not_pass(t[2], c, g, 1), ls.tally_stale(t[3], c, 1)]
+            found.append(dict(f, t27b=got, action=act, refusal_reason=ls.refusal_reason(c, g) & 255))
+            why = {} if ls.is_pass(g) & 1 else {"blocker": (rec.get("blockers") or [rec.get("detail") or ""])[0][:200], "reason": reasons[ls.row_reason(g) & 255]}
+            rows.update({f["path"]: dict(path=f["path"], t27b=got, **why)}) if act in ("ADD", "SET") else rows.pop(f["path"], None) if act == "DROP" else None
+        entries, cap = sorted(rows.values(), key=lambda e: e["path"]), old["max_not_pass"]
+        np = sum(not ls.is_pass(code(names, e["t27b"])) & 1 for e in entries)
+        same = subprocess.run(f"git fetch -q origin {REF} && git diff --quiet FETCH_HEAD -- {led}", shell=True, cwd=CLONE).returncode == 0
+        fits, ok = ls.cap_fits(np, cap, t[2]) & 1, ls.run_stewardable(True, any("asserts" in r for r in doc["results"]), same) & 1
+        v, _ = ("NOTHING", "APPLY", "REFUSE", "SKIP")[ls.run_verdict(ok, t[0], t[1], t[3], fits) & 255], out.mkdir(exist_ok=True)
+        if v == "APPLY":  # master's ledger, the run's rows, the card's GENERATED_BY and cap_after, in dump_ledger's layout
+            gen = re.search(r'GENERATED_BY : str = "([^"]*)"', (CLONE / "specs/jobs/t27b_ledger_steward.t27").read_text())[1]
+            new = dict(old, generated_by=gen, source=dict(old["source"], commit=sha, ref=REF, finished=now()), max_not_pass=ls.cap_after(np, cap, t[2]), entries=entries)
+            (CLONE / led).write_text(py("import t27b; sys.stdout.write(t27b.dump_ledger(json.load(sys.stdin)))", json.dumps(new)))
+            (out / f"{sha}.patch").write_text(subprocess.run(f"git diff -- {led}; git checkout -- {led}", shell=True, cwd=CLONE, capture_output=True, text=True).stdout)
+        write_json(out / f"{sha}.json", {"commit": sha, "verdict": v, "run_refusal": ls.run_refusal(t[0], t[3], fits) & 255, "counts": dict(zip(("refused", "applied", "new_not_pass", "stale"), t)), "findings": found})
+        return {"verdict": v, "json": f"/ledger/{sha}.json"}
 
     # Per-file merge and the honest ratio: t27b passes over reference passes.
     results = []
@@ -819,6 +810,7 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
         doc["results"] = results
         if reference:
             steps["ratchet"] = ratchet(doc, log)
+            step("steward", steward) if master else None
         if SEED:
             step("receipt", receipt)
     elif reference:
@@ -948,25 +940,19 @@ def serve():
     httpd.serve_forever()
 
 
-def lane_request(master):
-    """#7672: master's t27c judges each SRV/requests/<sha> (corpus_receipt.t27 request_verdict), exit 1 drops it; run and
-    sign the oldest admitted one, its text the challenge, into /runs/<sha>.json and its receipt. True when one ran."""
-    q = sorted((SRV / "requests").glob("*"), key=lambda p: p.stat().st_mtime) if JUDGE.exists() else []
-    out = lambda *a, **kw: subprocess.run(a, capture_output=True, text=True, timeout=300, **kw).stdout.split()  # noqa: E731
-    known = set(out("git", "ls-remote", "--heads", REPO) + out("git", "rev-list", "--first-parent", master, cwd=CLONE)) if q else ()
+def admitted():
+    """#7672: master's t27c judges each SRV/requests/<sha> (corpus_receipt.t27 request_verdict), on origin read from a fetch
+    made now, not the master last run (#8785); exit 1 drops it. The admitted ones, oldest first; a run's challenge is its text."""
+    q = sorted((SRV / "requests").glob("*"), key=lambda p: p.stat().st_mtime)
+    out = lambda *a: subprocess.run(("git",) + a, cwd=CLONE, capture_output=True, text=True, timeout=300).stdout.split()  # noqa: E731
+    known = set(out("ls-remote", "--heads", REPO) + out("fetch", "-q", "origin", "+%s:refs/remotes/origin/%s" % (REF, REF)) + out("rev-list", "--first-parent", "refs/remotes/origin/" + REF)) if q else ()
     waiting = []
     for r in q:
         facts = "%d,%d,%d" % (time.time() - r.stat().st_mtime, len(waiting), r.name in known)
         p = subprocess.run([str(JUDGE), "corpus-receipt", "admit", "--", r.name, facts], capture_output=True, text=True, timeout=60)
         print("lane request %r %s: %s" % (r.name[:80], facts, p.stdout.strip() or p.returncode), flush=True)
         r.unlink() if p.returncode == 1 else waiting.append((p.returncode, r))
-    r = next((r for code, r in waiting if code == 0), None)
-    if r:
-        log = Log(SRV / "runs" / ("%s.log" % r.name))
-        write_json(SRV / "runs" / ("%s.json" % r.name), dict(lab_run(r.name, log, r, master=False), finished=now(), ref="request"))
-        log.close()
-        r.unlink()
-    return r is not None
+    return [r for code, r in waiting if code == 0]
 
 
 def run_done(doc):
@@ -984,19 +970,14 @@ def main():
     threading.Thread(target=serve, daemon=True).start()
     print("t27b lab: serving %s on :%d, ref %s, poll %d s, lab.py %s" % (SRV, PORT, REF, POLL, IMAGE["lab_py_sha"]),
           flush=True)
-    last = None
-    latest = SRV / "latest.json"
-    if latest.exists():
-        try:
-            doc = json.loads(latest.read_text())
-            last = doc.get("commit") if run_done(doc) else None
-        except ValueError:
-            pass
+    last, count = None, "-"  # no judge yet (/work is not on the volume), so the first step runs master; "-" is COUNT_UNKNOWN
     while True:
-        ran = False
         try:
-            sha = remote_sha()
-            if sha != last:
+            sha, ready = remote_sha(), admitted() if JUDGE.exists() else []
+            ask = [str(JUDGE), "corpus-receipt", "schedule", "--", ROLE, "%d,%d,%s" % (sha != last, len(ready), count)]
+            # #9026: the judge's lab_next() picks the step; the one rule here: no judge (or one older than `schedule`) -> master run, it builds one
+            nxt, count = (subprocess.run(ask, capture_output=True, text=True, timeout=60).stdout.split() if JUDGE.exists() else []) or ("MASTER", "0")
+            if nxt == "MASTER":
                 log = Log(SRV / "runs" / ("%s.log" % sha))
                 log("t27b lab run: %s %s @ %s" % (REPO, REF, sha))
                 log("image: lab.py %s Dockerfile %s built %s deployment %s" % (
@@ -1009,12 +990,16 @@ def main():
                 log("published /runs/%s.json: %s" % (sha, json.dumps(doc.get("summary"))))
                 log.close()
                 last = sha if run_done(doc) else None
-            set_status(phase="idle", commit=sha, next_poll_in_s=POLL, retry=last is None)
-            ran = lane_request(sha)
+            set_status(phase="idle", commit=sha, next_poll_in_s=POLL, retry=last is None, role=ROLE, step=nxt, admitted=len(ready))
+            if nxt == "REQUEST":
+                r, log = ready[0], Log(SRV / "runs" / ("%s.log" % ready[0].name))
+                write_json(SRV / "runs" / ("%s.json" % r.name), dict(lab_run(r.name, log, r, master=False), finished=now(), ref="request"))
+                log.close(), r.unlink()
         except Exception as e:
             print("lab loop error: %s" % e, flush=True)
             set_status(phase="error", error=str(e))
-        time.sleep(0 if ran else POLL)
+            nxt = "IDLE"
+        time.sleep(POLL if nxt == "IDLE" else 0)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,18 @@ outputs:
 * `t27b test`: an in-process JIT test runner. The code is written into one
   executable region (`MAP_JIT` on macOS; `mmap` RW, then `mprotect` RX on
   Linux) and the module's `test` blocks run there.
-* `t27b build -o out.o`: a Mach-O `MH_OBJECT` for arm64. It links with
+* `t27b build -o out.o`: a relocatable object. On Linux it is an ELF64 `ET_REL` for
+  aarch64 (`--elf`, specs/tri/t27b/elf.t27), which links with
+  `aarch64-linux-gnu-gcc driver.c out.o`; elsewhere a Mach-O `MH_OBJECT` for arm64
+  (`--macho`, specs/tri/t27b/macho.t27), which links with
   `cc driver.c out.o`.
+  * Each fn whose parameters and result are scalars (integers up to 64 bits, bool,
+    f32, f64 and i128) is exported under its t27 name, as gen-c names it. C calls it by
+    its prototype and Rust through `extern "C"`, because for these types t27b's calling
+    convention is AAPCS64 (elf.t27, "the C ABI", #8948).
+  * A fn that passes or returns an aggregate, or takes a stack parameter, is not
+    exported, and `build` names it in a note (see #8972). t27b's own `__t27b_*`
+    routines are never exported.
 
 The JIT runs on arm64 macOS and arm64 Linux. The Railway t27b lab
 (`contrib/railway/t27b-lab`) runs the Linux build under qemu-user on x86_64.
@@ -74,7 +84,7 @@ reference interpreter (see Verification).
 | `src/codegen.rs` | Instruction selection, register assignment, frames, trap stubs, linking |
 | `src/a64.rs` | AArch64 encoders and the disassembler |
 | `src/jit.rs` | `MAP_JIT` image, the `enter` trampoline and `trap_common` |
-| `src/macho.rs` | Hand-written Mach-O 64 relocatable object |
+| `src/macho.rs` | Glue: flattens a linked image for the object writers specs/tri/t27b/macho.t27 (Mach-O) and elf.t27 (ELF64) |
 | `src/main.rs` | Command line, `corpus` runner |
 | `src/timing.rs` | `--time` phase clock |
 
@@ -298,13 +308,55 @@ Each cell is the outcome of that test (`inc_max`, `shr_big`, `rem_neg`):
 
 ```
 t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
 t27b asm    <file.t27> [--overflow trap|wrap]
+t27b verilog <file.t27>
+t27b ts     <file.t27>
 t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
                   [--json <path>] [--runner "<cmd> [args]"]
                   [--blockers [--reference <t27c> [--reference-cache <file>]
                                [--reference-timeout-ms N]]]
 ```
+
+`t27b verilog` writes a Verilog module for the spec to stdout, and after it, under
+`` `ifdef T27B_TESTBENCH ``, a test bench that runs the spec's own tests against
+that module (`iverilog -DT27B_TESTBENCH`). A construct it does not lower is
+refused by name, exit 2. Every decision is in `specs/tri/t27b/verilog_plan.t27`:
+
+* what lowers;
+* how a spec declares an extern module, an instance and a net;
+* the port derivation;
+* the use closure;
+* exact widths;
+* the static loop bound.
+
+The writer is `specs/tri/t27b/verilog_emit.t27`. The fixtures are
+`specs/tri/t27b/conformance/verilog_*.t27` (#8796).
+
+`t27b ts` writes the spec's consts, its pure fns over `u8`..`u32`, `i8`..`i32`
+and `bool`, and its tests as one TypeScript module to stdout (#9994). Each
+`test` is an exported self-check that returns how many asserts it ran, and
+`t27_report()` prints the assert table of `t27c test-report`, line for line.
+Each `invariant` is an exported self-check too. `t27_failures()` names each
+check that throws. The integers keep Zig's meaning: `+ - *` throw on overflow,
+`+% -% *%` wrap, and a narrowing cast truncates. An assert whose operands are
+all compile-time constants is checked but not counted, the same as
+test-report. Anything outside that subset is refused, exit 2, with
+``t27b: ts: unsupported construct <what> `<name>` at line <n>``.
+
+The decisions are in `specs/tri/t27b/ts_plan.t27`: the types, the operator
+forms, folding, reserved names, and the prelude and coda. The writer is
+`specs/tri/t27b/ts_emit.t27`. It shares its byte writers, name resolver and
+test trees with the Verilog writer through `specs/tri/t27b/emit_kit.t27`.
+Node 24 runs the output as `.mts`:
+
+```
+t27b ts specs/queen/key_failover.t27 > /tmp/kf.mts
+node -e 'import("/tmp/kf.mts").then(m => console.log(m.t27_report()))'
+```
+
+A top-level declaration that is refused reports `at line 0`, because the t27c
+parser records no line for it.
 
 Options:
 

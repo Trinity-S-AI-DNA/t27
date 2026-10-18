@@ -39,6 +39,12 @@ struct Decl {
 
 /// Locate the repository's `specs/` directory by walking up from the input.
 fn find_specs_root(input: &Path) -> Option<PathBuf> {
+    // #8980: a bare `x.t27` (parent "") or `../x.t27` never reaches `specs/` as spelled, so nothing
+    // was spliced; the absolute path finds the tree the file sits in.
+    spelled_specs_root(input).or_else(|| spelled_specs_root(&std::path::absolute(input).ok()?))
+}
+
+fn spelled_specs_root(input: &Path) -> Option<PathBuf> {
     let mut dir = input.parent()?.to_path_buf();
     loop {
         let candidate = dir.join("specs");
