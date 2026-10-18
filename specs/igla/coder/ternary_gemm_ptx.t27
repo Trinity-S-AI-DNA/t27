@@ -14,26 +14,38 @@
 ; Why int8 tensor cores and not dp4a. On the RTX 4090 bench of #10360 (CUTLASS 3.5.1, one pod),
 ; int8 tensor cores ran 2.9-3.5x bf16 and dp4a ran 0.91-0.94x bf16; only the mma path can win.
 ; --
-; The kernel, v1.
+; The kernel, v2 (v1 was the first kernel that ran; v2 is the first that is meant to be fast).
 ;   C[m][n] = sum_k A[m][k] * w(k, n); A is i8 row-major (m x k); W is the k x n code matrix of
 ;   ternary_gemm_gpu.t27, row-major, four 2-bit codes per byte, code i at byte i/4, lane i%4, lane 0
 ;   in the low bits; C is i32 row-major (m x n).
-;   Grid (ceil(n/128), ceil(m/128)), 256 threads. Each block computes a 128 x 128 tile of C in k-steps
-;   of 32. Per k-step:
-;     - A tile: 128 rows x 32 bytes; thread t loads 16 bytes, row t/2, bytes (t%2)*16, zero past m
-;       and past k, and stores them in sA at row * 48 + chunk;
-;     - W tile: 32 k-rows x 128 columns of codes = 256 words; thread t loads one u32 (16 codes) at
-;       k-row t/8, columns (t%8)*16, decodes each code once as w = (c & 1) - ((c >> 1) & 1), and
-;       stores it TRANSPOSED as an s8 in sB at column * 48 + k-row ("col" operand of the mma);
+;   Grid (ceil(n/128), ceil(m/128)), 256 threads. Each block computes a 128 x 128 tile of C in k-tiles
+;   of 64, two stages of shared memory, ONE bar.sync per k-tile. Per k-tile:
+;     - A tile: 128 rows x 64 bytes arrives by cp.async.cg (16 bytes, src-size 0 zero-fills past m
+;       and past k) straight into sA at row * 80 + chunk; thread t issues rows t/4 and t/4 + 64,
+;       bytes (t%4)*16; cp.async.wait_group 0 at the top of the next k-tile;
+;     - W tile: 64 k-rows x 128 columns. The four k-rows 4q..4q+3 of eight columns are four
+;       halfwords (8 codes each) that thread t loads into registers one tile ahead (q = t/16,
+;       columns (t%16)*8). After the mma of the current tile it decodes them with prmt (a 4-entry
+;       table in a register turns four 2-bit codes at once into four s8, 0 -> 0, 1 -> +1, 2 -> -1,
+;       3 -> 0 = (c & 1) - ((c >> 1) & 1)), transposes the 4 x 4 bytes with 8 prmt so that each
+;       column has its four k as one word, and stores 8 words into the other stage of sB at
+;       column * 80 + k ("col" operand of the mma);
 ;     - warp v = t/32 owns the 64 x 32 sub-tile at rows (v/4)*64, columns (v%4)*32: 4 x 4 mma tiles
-;       of 16 x 8, so 16 mma.sync per k-step and 64 i32 accumulators per thread.
-;   The 48-byte row stride (32 data bytes + 16 pad) puts the 32 lanes of every fragment load on 32
-;   distinct banks: lane (g, t) reads word 12g + t, and 12g mod 32 for g = 0..7 is 0,12,24,4,16,28,8,20.
+;       of 16 x 8, so 2 x 16 mma.sync per k-tile and 64 i32 accumulators per thread.
+;   The 80-byte row stride (64 data bytes + 16 pad) puts the 32 lanes of every fragment load on 32
+;   distinct banks: lane (g, t) reads word 20g + t, and 20g mod 32 for g = 0..7 is 0,20,8,28,16,4,24,12.
+;   The W stores would hit one bank 16 times (lanes of a warp write 16 columns of one k-word), so the
+;   eight columns of a group are stored rotated: logical column c of group q lives at row
+;   8q + ((c + q) & 7), and the B fragment loads apply the same rotation; the loads stay conflict
+;   free (g -> (g + q) & 7 is a permutation) and the stores drop to a 2-way conflict.
 ;   Fragment layouts are the PTX ISA's for m16n8k32 .s8 (g = lane/4, t = lane%4):
 ;     A: a0 = row g, k 4t..4t+3; a1 = row g+8; a2 = row g, k 16+4t..; a3 = row g+8, k 16+4t..
 ;     B: b0 = column g, k 4t..4t+3; b1 = column g, k 16+4t..
 ;     C: c0, c1 = row g, columns 2t, 2t+1; c2, c3 = row g+8, same columns.
-;   v1 has no cp.async and no double buffering: it is the first kernel that runs, not the fastest.
+;   Block pipeline: the barrier at the top of tile i guarantees that tile i is complete in shared
+;   memory and that every warp has finished the mma of tile i-1, so the other stage is free; the
+;   fetch of tile i+1 (cp.async + W registers) is issued before the mma of tile i and the W decode
+;   after it, which hides the global latency behind 32 mma per warp.
 ; Preconditions, checked by shape_ok() before a launch: n and k are multiples of 16 (aligned 16-byte
 ; A loads and 4-byte W loads; a k chunk or a 16-column W word is then either wholly inside or wholly
 ; outside), 1 <= m, and k <= K_MAX_I32 so that no i32 partial sum can overflow.
@@ -52,18 +64,21 @@ pub const KERNEL_NAME : str = "ternary_gemm_s8";
 /// Block tile and k-step of the kernel, and its thread count.
 pub const BM : u32 = 128;
 pub const BN : u32 = 128;
-pub const BK : u32 = 32;
+pub const BK : u32 = 64;
 pub const THREADS : u32 = 256;
-/// Bytes per row of a shared tile: 32 data bytes and 16 bytes of padding.
-pub const SMEM_STRIDE : u32 = 48;
-/// mma.sync instructions per k-step: 4 x 4 tiles of 16 x 8 per warp.
+/// Bytes per row of a shared tile: 64 data bytes and 16 bytes of padding.
+pub const SMEM_STRIDE : u32 = 80;
+/// Shared-memory stages of the pipeline, and the bytes of one stage of one operand.
+pub const STAGES : u32 = 2;
+pub const STAGE_BYTES : u32 = 10240;
+/// mma.sync instructions per 32-wide k-step: 4 x 4 tiles of 16 x 8 per warp.
 pub const MMA_PER_STEP : u32 = 16;
 /// Largest k for which no i32 partial sum can overflow: 128 * 16777215 = 2147483520.
 pub const K_MAX_I32 : usize = 16777215;
 /// Largest grid y the driver accepts.
 pub const GRID_Y_MAX : usize = 65535;
 /// Buffer the emitted text needs, with room to spare; emit_ptx returns the exact length.
-pub const PTX_CAP : usize = 32768;
+pub const PTX_CAP : usize = 65536;
 /// tern-tc-500m: d_model and d_ff (read from the trainer config, see #10360).
 pub const D_MODEL_500M : usize = 1280;
 pub const D_FF_500M : usize = 4096;
@@ -121,25 +136,49 @@ fn put_quad(out : []u8, cap : usize, w : usize, name : str, first : u32) -> usiz
 // 2. The kernel, section by section
 // ============================================================================
 
+/// "    <pre><n><post>\n": one instruction line with one number to fill in.
+fn ins_u(out : []u8, cap : usize, w : usize, pre : str, n : u32, post : str) -> usize {
+    var x : usize = put_s(out, cap, w, "    ");
+    x = put_s(out, cap, x, pre);
+    x = put_u(out, cap, x, n);
+    x = put_s(out, cap, x, post);
+    return put_s(out, cap, x, "\n");
+}
+
+/// "    <pre><a><mid><b><post>\n": one instruction line with two numbers to fill in.
+fn ins_uu(out : []u8, cap : usize, w : usize, pre : str, a : u32, mid : str, b : u32, post : str) -> usize {
+    var x : usize = put_s(out, cap, w, "    ");
+    x = put_s(out, cap, x, pre);
+    x = put_u(out, cap, x, a);
+    x = put_s(out, cap, x, mid);
+    x = put_u(out, cap, x, b);
+    x = put_s(out, cap, x, post);
+    return put_s(out, cap, x, "\n");
+}
+
 fn emit_header(out : []u8, cap : usize, w : usize) -> usize {
     var x : usize = put_s(out, cap, w, "// ternary_gemm_s8 -- emitted by t27c from specs/igla/coder/ternary_gemm_ptx.t27 (#10404). Do not edit.\n");
     x = put_s(out, cap, x, ".version 7.0\n.target sm_80\n.address_size 64\n\n");
     x = put_s(out, cap, x, ".visible .entry ternary_gemm_s8(\n");
     x = put_s(out, cap, x, "    .param .u64 p_a,\n    .param .u64 p_w,\n    .param .u64 p_c,\n");
     x = put_s(out, cap, x, "    .param .u32 p_m,\n    .param .u32 p_n,\n    .param .u32 p_k\n)\n");
-    x = put_s(out, cap, x, ".maxntid 256, 1, 1\n{\n");
-    x = ins(out, cap, x, ".reg .pred %p<8>;");
-    x = ins(out, cap, x, ".reg .b32 %r<48>;");
+    x = put_s(out, cap, x, ".maxntid 256, 1, 1\n.minnctapersm 2\n{\n");
+    x = ins(out, cap, x, ".reg .pred %p<12>;");
+    x = ins(out, cap, x, ".reg .b32 %r<72>;");
     x = ins(out, cap, x, ".reg .b32 %acc<64>;");
     x = ins(out, cap, x, ".reg .b32 %fa<16>;");
     x = ins(out, cap, x, ".reg .b32 %fb<8>;");
-    x = ins(out, cap, x, ".reg .b64 %rd<12>;");
-    x = ins(out, cap, x, ".shared .align 16 .b8 sA[6144];");
-    x = ins(out, cap, x, ".shared .align 16 .b8 sB[6144];");
+    x = ins(out, cap, x, ".reg .b64 %rd<16>;");
+    x = ins(out, cap, x, ".shared .align 16 .b8 sA[20480];");
+    x = ins(out, cap, x, ".shared .align 16 .b8 sB[20480];");
     return x;
 }
 
-/// Parameters, thread coordinates, and the addresses each thread reuses every k-step.
+/// Parameters, thread coordinates, and the addresses each thread reuses every k-tile.
+/// Register map (all %r): 1 m, 2 n, 3 k, 4 tid; A loader 8 chunk byte, 12 cp.async destination,
+/// rd4/rd5 the two source pointers; W loader 16 column group, 17 4 x k-group, 20 sB store base,
+/// rd6 the source pointer, rd7 = n/4, rd8 = 61 n/4; 22..25 the four prefetched W halfwords;
+/// 32 the A fragment base, 33..36 the four B fragment bases; 37 k0; 39 stage delta; 40 prmt table.
 fn emit_prologue(out : []u8, cap : usize, w : usize) -> usize {
     var x : usize = ins(out, cap, w, "ld.param.u64 %rd1, [p_a];");
     x = ins(out, cap, x, "ld.param.u64 %rd2, [p_w];");
@@ -153,52 +192,75 @@ fn emit_prologue(out : []u8, cap : usize, w : usize) -> usize {
     x = ins(out, cap, x, "mov.u32 %r4, %tid.x;");
     x = ins(out, cap, x, "mov.u32 %r5, %ctaid.x;");
     x = ins(out, cap, x, "mov.u32 %r6, %ctaid.y;");
-    // A tile: row r7 = tid/2, chunk r8 = (tid%2)*16, global row r9, p1 = row inside m.
-    x = ins(out, cap, x, "shr.u32 %r7, %r4, 1;");
-    x = ins(out, cap, x, "and.b32 %r8, %r4, 1;");
+    // A loader: rows r7 = tid/4 and r7 + 64, chunk byte r8 = (tid%4)*16; p1, p2 = rows inside m.
+    x = ins(out, cap, x, "shr.u32 %r7, %r4, 2;");
+    x = ins(out, cap, x, "and.b32 %r8, %r4, 3;");
     x = ins(out, cap, x, "shl.b32 %r8, %r8, 4;");
     x = ins(out, cap, x, "shl.b32 %r9, %r6, 7;");
     x = ins(out, cap, x, "add.u32 %r9, %r9, %r7;");
+    x = ins(out, cap, x, "add.u32 %r10, %r9, 64;");
     x = ins(out, cap, x, "setp.lt.u32 %p1, %r9, %r1;");
-    x = ins(out, cap, x, "mov.u32 %r10, sA;");
-    x = ins(out, cap, x, "mad.lo.u32 %r11, %r7, 48, %r8;");
-    x = ins(out, cap, x, "add.u32 %r11, %r11, %r10;");
+    x = ins(out, cap, x, "setp.lt.u32 %p2, %r10, %r1;");
+    x = ins(out, cap, x, "mov.u32 %r11, sA;");
+    x = ins(out, cap, x, "mad.lo.u32 %r12, %r7, 80, %r8;");
+    x = ins(out, cap, x, "add.u32 %r12, %r12, %r11;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd9, %r8;");
     x = ins(out, cap, x, "mul.wide.u32 %rd4, %r9, %r3;");
     x = ins(out, cap, x, "add.u64 %rd4, %rd4, %rd1;");
-    x = ins(out, cap, x, "cvt.u64.u32 %rd5, %r8;");
-    x = ins(out, cap, x, "add.u64 %rd4, %rd4, %rd5;");
-    // W tile: k-row r12 = tid/8, column group r13 = (tid%8)*16, global column r14, p2 = inside n.
-    x = ins(out, cap, x, "shr.u32 %r12, %r4, 3;");
-    x = ins(out, cap, x, "and.b32 %r13, %r4, 7;");
-    x = ins(out, cap, x, "shl.b32 %r13, %r13, 4;");
-    x = ins(out, cap, x, "shl.b32 %r14, %r5, 7;");
-    x = ins(out, cap, x, "add.u32 %r14, %r14, %r13;");
-    x = ins(out, cap, x, "setp.lt.u32 %p2, %r14, %r2;");
-    x = ins(out, cap, x, "mov.u32 %r15, sB;");
-    x = ins(out, cap, x, "mad.lo.u32 %r16, %r13, 48, %r12;");
-    x = ins(out, cap, x, "add.u32 %r16, %r16, %r15;");
-    x = ins(out, cap, x, "shr.u32 %r17, %r2, 2;");
-    x = ins(out, cap, x, "shr.u32 %r18, %r14, 2;");
-    // Warp r19, lane r20, g r21, t r22, warp row r23, warp column r24.
-    x = ins(out, cap, x, "shr.u32 %r19, %r4, 5;");
-    x = ins(out, cap, x, "and.b32 %r20, %r4, 31;");
-    x = ins(out, cap, x, "shr.u32 %r21, %r20, 2;");
-    x = ins(out, cap, x, "and.b32 %r22, %r20, 3;");
-    x = ins(out, cap, x, "shr.u32 %r23, %r19, 2;");
-    x = ins(out, cap, x, "and.b32 %r24, %r19, 3;");
-    // Fragment bases: r25 = sA + (64 wm + g) * 48 + 4t, r27 = sB + (32 wn + g) * 48 + 4t.
-    x = ins(out, cap, x, "shl.b32 %r26, %r22, 2;");
-    x = ins(out, cap, x, "shl.b32 %r25, %r23, 6;");
-    x = ins(out, cap, x, "add.u32 %r25, %r25, %r21;");
-    x = ins(out, cap, x, "mul.lo.u32 %r25, %r25, 48;");
-    x = ins(out, cap, x, "add.u32 %r25, %r25, %r26;");
-    x = ins(out, cap, x, "add.u32 %r25, %r25, %r10;");
-    x = ins(out, cap, x, "shl.b32 %r27, %r24, 5;");
-    x = ins(out, cap, x, "add.u32 %r27, %r27, %r21;");
-    x = ins(out, cap, x, "mul.lo.u32 %r27, %r27, 48;");
-    x = ins(out, cap, x, "add.u32 %r27, %r27, %r26;");
-    x = ins(out, cap, x, "add.u32 %r27, %r27, %r15;");
-    x = ins(out, cap, x, "mov.u32 %r28, 0;");
+    x = ins(out, cap, x, "add.u64 %rd4, %rd4, %rd9;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd5, %r10, %r3;");
+    x = ins(out, cap, x, "add.u64 %rd5, %rd5, %rd1;");
+    x = ins(out, cap, x, "add.u64 %rd5, %rd5, %rd9;");
+    // W loader: column group r16 = tid%16 (8 columns = one halfword of codes), k-group r17 = 4 (tid/16),
+    // global column r18, p6 = group inside n, r19 = n/4 bytes per code row.
+    x = ins(out, cap, x, "and.b32 %r16, %r4, 15;");
+    x = ins(out, cap, x, "shr.u32 %r17, %r4, 4;");
+    x = ins(out, cap, x, "shl.b32 %r17, %r17, 2;");
+    x = ins(out, cap, x, "shl.b32 %r18, %r5, 7;");
+    x = ins(out, cap, x, "shl.b32 %r19, %r16, 3;");
+    x = ins(out, cap, x, "add.u32 %r18, %r18, %r19;");
+    x = ins(out, cap, x, "setp.lt.u32 %p6, %r18, %r2;");
+    x = ins(out, cap, x, "shr.u32 %r19, %r2, 2;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd6, %r17, %r19;");
+    x = ins(out, cap, x, "shr.u32 %r21, %r18, 2;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd9, %r21;");
+    x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd9;");
+    x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd2;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd7, %r19;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd8, %r19, 61;");
+    x = ins(out, cap, x, "mov.u32 %r21, sB;");
+    x = ins(out, cap, x, "mul.lo.u32 %r20, %r16, 640;");
+    x = ins(out, cap, x, "add.u32 %r20, %r20, %r17;");
+    x = ins(out, cap, x, "add.u32 %r20, %r20, %r21;");
+    x = ins(out, cap, x, "mov.u32 %r40, 0x00FF0100;");
+    // Warp r26, lane r27, g r28, t r29, warp row r30, warp column r31, 4t in r41.
+    x = ins(out, cap, x, "shr.u32 %r26, %r4, 5;");
+    x = ins(out, cap, x, "and.b32 %r27, %r4, 31;");
+    x = ins(out, cap, x, "shr.u32 %r28, %r27, 2;");
+    x = ins(out, cap, x, "and.b32 %r29, %r27, 3;");
+    x = ins(out, cap, x, "shr.u32 %r30, %r26, 2;");
+    x = ins(out, cap, x, "and.b32 %r31, %r26, 3;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r29, 2;");
+    // A fragment base r32 = sA + (64 wm + g) * 80 + 4t.
+    x = ins(out, cap, x, "shl.b32 %r32, %r30, 6;");
+    x = ins(out, cap, x, "add.u32 %r32, %r32, %r28;");
+    x = ins(out, cap, x, "mul.lo.u32 %r32, %r32, 80;");
+    x = ins(out, cap, x, "add.u32 %r32, %r32, %r41;");
+    x = ins(out, cap, x, "add.u32 %r32, %r32, %r11;");
+    // B fragment bases r33..r36: column group q = 4 wn + ni; its column g sits at row 8 q + ((g + q) & 7).
+    x = ins(out, cap, x, "add.u32 %r42, %r21, %r41;");
+    x = ins(out, cap, x, "shl.b32 %r43, %r31, 2;");
+    var ni : u32 = 0;
+    while (ni < 4) {
+        x = ins_u(out, cap, x, "add.u32 %r44, %r43, ", ni, ";");
+        x = ins(out, cap, x, "add.u32 %r45, %r44, %r28;");
+        x = ins(out, cap, x, "and.b32 %r45, %r45, 7;");
+        x = ins(out, cap, x, "mad.lo.u32 %r45, %r44, 8, %r45;");
+        x = ins_u(out, cap, x, "mad.lo.u32 %r", 33 + ni, ", %r45, 80, %r42;");
+        ni += 1;
+    }
+    x = ins(out, cap, x, "mov.u32 %r37, 0;");
+    x = ins(out, cap, x, "mov.u32 %r39, 10240;");
     var i : u32 = 0;
     while (i < 64) {
         x = put_s(out, cap, x, "    mov.b32 %acc");
@@ -209,73 +271,71 @@ fn emit_prologue(out : []u8, cap : usize, w : usize) -> usize {
     return x;
 }
 
-/// The cooperative tile loads of one k-step (k0 in r28), A first, then W decoded into sB.
-fn emit_tile_loads(out : []u8, cap : usize, w : usize) -> usize {
-    var x : usize = ins(out, cap, w, "add.u32 %r29, %r28, %r8;");
-    x = ins(out, cap, x, "setp.lt.u32 %p4, %r29, %r3;");
-    x = ins(out, cap, x, "and.pred %p4, %p4, %p1;");
-    x = ins(out, cap, x, "mov.b32 %r30, 0;");
-    x = ins(out, cap, x, "mov.b32 %r31, 0;");
-    x = ins(out, cap, x, "mov.b32 %r32, 0;");
-    x = ins(out, cap, x, "mov.b32 %r33, 0;");
-    x = ins(out, cap, x, "cvt.u64.u32 %rd5, %r28;");
-    x = ins(out, cap, x, "add.u64 %rd6, %rd4, %rd5;");
-    x = ins(out, cap, x, "@%p4 ld.global.v4.u32 {%r30, %r31, %r32, %r33}, [%rd6];");
-    x = ins(out, cap, x, "st.shared.v4.u32 [%r11], {%r30, %r31, %r32, %r33};");
-    x = ins(out, cap, x, "add.u32 %r34, %r28, %r12;");
-    x = ins(out, cap, x, "setp.lt.u32 %p5, %r34, %r3;");
-    x = ins(out, cap, x, "and.pred %p5, %p5, %p2;");
-    x = ins(out, cap, x, "mov.b32 %r35, 0;");
-    x = ins(out, cap, x, "mul.wide.u32 %rd7, %r34, %r17;");
-    x = ins(out, cap, x, "cvt.u64.u32 %rd8, %r18;");
-    x = ins(out, cap, x, "add.u64 %rd7, %rd7, %rd8;");
-    x = ins(out, cap, x, "add.u64 %rd9, %rd7, %rd2;");
-    x = ins(out, cap, x, "@%p5 ld.global.u32 %r35, [%rd9];");
-    var j : u32 = 0;
-    while (j < 16) {
-        x = put_s(out, cap, x, "    shr.u32 %r36, %r35, ");
-        x = put_u(out, cap, x, 2 * j);
-        x = put_s(out, cap, x, ";\n");
-        x = ins(out, cap, x, "and.b32 %r37, %r36, 1;");
-        x = ins(out, cap, x, "shr.u32 %r38, %r36, 1;");
-        x = ins(out, cap, x, "and.b32 %r38, %r38, 1;");
-        x = ins(out, cap, x, "sub.s32 %r37, %r37, %r38;");
-        x = put_s(out, cap, x, "    st.shared.u8 [%r16+");
-        x = put_u(out, cap, x, j * SMEM_STRIDE);
-        x = put_s(out, cap, x, "], %r37;\n");
-        j += 1;
+/// Start the fetch of the k-tile whose first k is in register kreg: two 16-byte cp.async of A (zero
+/// filled past m and past k), then four halfword loads of W into r22..r25 (zero past n and past k).
+/// The source pointers step to the next tile.
+fn emit_fetch(out : []u8, cap : usize, w : usize, kreg : u32) -> usize {
+    var x : usize = ins_u(out, cap, w, "add.u32 %r13, %r", kreg, ", %r8;");
+    x = ins(out, cap, x, "setp.lt.u32 %p4, %r13, %r3;");
+    x = ins(out, cap, x, "and.pred %p5, %p4, %p1;");
+    x = ins(out, cap, x, "and.pred %p4, %p4, %p2;");
+    x = ins(out, cap, x, "selp.b32 %r14, 16, 0, %p5;");
+    x = ins(out, cap, x, "selp.b32 %r15, 16, 0, %p4;");
+    x = ins(out, cap, x, "cp.async.cg.shared.global [%r12], [%rd4], 16, %r14;");
+    x = ins(out, cap, x, "cp.async.cg.shared.global [%r12+5120], [%rd5], 16, %r15;");
+    x = ins(out, cap, x, "add.u64 %rd4, %rd4, 64;");
+    x = ins(out, cap, x, "add.u64 %rd5, %rd5, 64;");
+    x = ins(out, cap, x, "cp.async.commit_group;");
+    x = ins_u(out, cap, x, "add.u32 %r21, %r", kreg, ", %r17;");
+    x = ins(out, cap, x, "setp.lt.u32 %p7, %r21, %r3;");
+    x = ins(out, cap, x, "and.pred %p7, %p7, %p6;");
+    var r : u32 = 0;
+    while (r < 4) {
+        x = ins_u(out, cap, x, "mov.b32 %r", 22 + r, ", 0;");
+        r += 1;
+    }
+    r = 0;
+    while (r < 4) {
+        x = ins_u(out, cap, x, "@%p7 ld.global.u16 %r", 22 + r, ", [%rd6];");
+        if (r < 3) {
+            x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd7;");
+        } else {
+            x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd8;");
+        }
+        r += 1;
     }
     return x;
 }
 
-/// "    ld.shared.u32 %<reg><i>, [%<base>+<off>];"
-fn emit_lds(out : []u8, cap : usize, w : usize, reg : str, i : u32, base : str, off : u32) -> usize {
+/// "    ld.shared.u32 %<reg><i>, [%r<base>+<off>];"
+fn emit_lds(out : []u8, cap : usize, w : usize, reg : str, i : u32, base : u32, off : u32) -> usize {
     var x : usize = put_s(out, cap, w, "    ld.shared.u32 ");
     x = put_s(out, cap, x, reg);
     x = put_u(out, cap, x, i);
-    x = put_s(out, cap, x, ", [");
-    x = put_s(out, cap, x, base);
+    x = put_s(out, cap, x, ", [%r");
+    x = put_u(out, cap, x, base);
     x = put_s(out, cap, x, "+");
     x = put_u(out, cap, x, off);
     return put_s(out, cap, x, "];\n");
 }
 
-/// The fragment loads and the 16 mma.sync of one k-step.
-fn emit_mma_step(out : []u8, cap : usize, w : usize) -> usize {
+/// The fragment loads and the 16 mma.sync of one 32-wide k-step (ks = 0 or 1) of the k-tile.
+fn emit_mma_step(out : []u8, cap : usize, w : usize, ks : u32) -> usize {
     var x : usize = w;
+    const kb : u32 = ks * 32;
     var mi : u32 = 0;
     while (mi < 4) {
-        const off : u32 = mi * 16 * SMEM_STRIDE;
-        x = emit_lds(out, cap, x, "%fa", mi * 4, "%r25", off);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 1, "%r25", off + 8 * SMEM_STRIDE);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 2, "%r25", off + 16);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 3, "%r25", off + 8 * SMEM_STRIDE + 16);
+        const off : u32 = mi * 16 * SMEM_STRIDE + kb;
+        x = emit_lds(out, cap, x, "%fa", mi * 4, 32, off);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 1, 32, off + 8 * SMEM_STRIDE);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 2, 32, off + 16);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 3, 32, off + 8 * SMEM_STRIDE + 16);
         mi += 1;
     }
     var ni : u32 = 0;
     while (ni < 4) {
-        x = emit_lds(out, cap, x, "%fb", ni * 2, "%r27", ni * 8 * SMEM_STRIDE);
-        x = emit_lds(out, cap, x, "%fb", ni * 2 + 1, "%r27", ni * 8 * SMEM_STRIDE + 16);
+        x = emit_lds(out, cap, x, "%fb", ni * 2, 33 + ni, kb);
+        x = emit_lds(out, cap, x, "%fb", ni * 2 + 1, 33 + ni, kb + 16);
         ni += 1;
     }
     mi = 0;
@@ -301,39 +361,90 @@ fn emit_mma_step(out : []u8, cap : usize, w : usize) -> usize {
     return x;
 }
 
+/// Decode the four prefetched halfwords r22..r25 (8 codes each, row i of 4 k-rows) and store them
+/// transposed into sB. Half 0 decodes the even codes (columns 0, 2, 4, 6 of the group), half 1 the
+/// odd ones. prmt maps a nibble holding a code to its s8 weight through the table r40 = 0x00FF0100
+/// (0 -> 0, 1 -> +1, 2 -> -1, 3 -> 0), four codes per instruction; a 4 x 4 byte transpose
+/// (8 prmt) turns the four k-rows into one word of 4 consecutive k per column.
+fn emit_decode_store(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = w;
+    var h : u32 = 0;
+    while (h < 2) {
+        var i : u32 = 0;
+        while (i < 4) {
+            if (h == 0) {
+                x = ins_uu(out, cap, x, "and.b32 %r", 41 + i, ", %r", 22 + i, ", 0x3333;");
+            } else {
+                x = ins_uu(out, cap, x, "shr.u32 %r", 41 + i, ", %r", 22 + i, ", 2;");
+                x = ins_uu(out, cap, x, "and.b32 %r", 41 + i, ", %r", 41 + i, ", 0x3333;");
+            }
+            x = ins_uu(out, cap, x, "prmt.b32 %r", 41 + i, ", %r40, 0, %r", 41 + i, ";");
+            i += 1;
+        }
+        x = ins(out, cap, x, "prmt.b32 %r45, %r41, %r42, 0x5140;");
+        x = ins(out, cap, x, "prmt.b32 %r46, %r43, %r44, 0x5140;");
+        x = ins(out, cap, x, "prmt.b32 %r47, %r41, %r42, 0x7362;");
+        x = ins(out, cap, x, "prmt.b32 %r48, %r43, %r44, 0x7362;");
+        x = ins(out, cap, x, "prmt.b32 %r49, %r45, %r46, 0x5410;");
+        x = ins(out, cap, x, "prmt.b32 %r50, %r45, %r46, 0x7632;");
+        x = ins(out, cap, x, "prmt.b32 %r51, %r47, %r48, 0x5410;");
+        x = ins(out, cap, x, "prmt.b32 %r52, %r47, %r48, 0x7632;");
+        var j : u32 = 0;
+        while (j < 4) {
+            x = ins_u(out, cap, x, "add.u32 %r53, %r16, ", 2 * j + h, ";");
+            x = ins(out, cap, x, "and.b32 %r53, %r53, 7;");
+            x = ins(out, cap, x, "mad.lo.u32 %r53, %r53, 80, %r20;");
+            x = ins_u(out, cap, x, "st.shared.b32 [%r53], %r", 49 + j, ";");
+            j += 1;
+        }
+        h += 1;
+    }
+    return x;
+}
+
 /// One guarded pair store: accumulators b, b+1 to C[row0 + dr][col0 + dc .. +1].
 fn emit_store(out : []u8, cap : usize, w : usize, dr : u32, dc : u32, b : u32) -> usize {
-    var x : usize = put_s(out, cap, w, "    add.u32 %r41, %r39, ");
+    var x : usize = put_s(out, cap, w, "    add.u32 %r70, %r67, ");
     x = put_u(out, cap, x, dr);
     x = put_s(out, cap, x, ";\n");
-    x = put_s(out, cap, x, "    add.u32 %r42, %r40, ");
+    x = put_s(out, cap, x, "    add.u32 %r71, %r69, ");
     x = put_u(out, cap, x, dc);
     x = put_s(out, cap, x, ";\n");
-    x = ins(out, cap, x, "setp.lt.u32 %p6, %r41, %r1;");
-    x = ins(out, cap, x, "setp.lt.u32 %p7, %r42, %r2;");
-    x = ins(out, cap, x, "and.pred %p6, %p6, %p7;");
-    x = ins(out, cap, x, "cvt.u64.u32 %rd10, %r42;");
-    x = ins(out, cap, x, "mad.wide.u32 %rd10, %r41, %r2, %rd10;");
+    x = ins(out, cap, x, "setp.lt.u32 %p8, %r70, %r1;");
+    x = ins(out, cap, x, "setp.lt.u32 %p9, %r71, %r2;");
+    x = ins(out, cap, x, "and.pred %p8, %p8, %p9;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd10, %r71;");
+    x = ins(out, cap, x, "mad.wide.u32 %rd10, %r70, %r2, %rd10;");
     x = ins(out, cap, x, "shl.b64 %rd10, %rd10, 2;");
     x = ins(out, cap, x, "add.u64 %rd10, %rd10, %rd3;");
-    x = put_s(out, cap, x, "    @%p6 st.global.v2.u32 [%rd10], {%acc");
+    x = put_s(out, cap, x, "    @%p8 st.global.v2.u32 [%rd10], {%acc");
     x = put_u(out, cap, x, b);
     x = put_s(out, cap, x, ", %acc");
     x = put_u(out, cap, x, b + 1);
     return put_s(out, cap, x, "};\n");
 }
 
-/// Row base r39 = 128 by + 64 wm + g and column base r40 = 128 bx + 32 wn + 2t, then 32 stores.
+/// Thread coordinates again (so the loop does not keep them live), row base r67 = 128 by + 64 wm + g
+/// and column base r69 = 128 bx + 32 wn + 2t, then 32 stores.
 fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
-    var x : usize = ins(out, cap, w, "shl.b32 %r39, %r6, 7;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r23, 6;");
-    x = ins(out, cap, x, "add.u32 %r39, %r39, %r41;");
-    x = ins(out, cap, x, "add.u32 %r39, %r39, %r21;");
-    x = ins(out, cap, x, "shl.b32 %r40, %r5, 7;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r24, 5;");
-    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r22, 1;");
-    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
+    var x : usize = ins(out, cap, w, "mov.u32 %r60, %tid.x;");
+    x = ins(out, cap, x, "shr.u32 %r61, %r60, 5;");
+    x = ins(out, cap, x, "and.b32 %r62, %r60, 31;");
+    x = ins(out, cap, x, "shr.u32 %r63, %r62, 2;");
+    x = ins(out, cap, x, "and.b32 %r64, %r62, 3;");
+    x = ins(out, cap, x, "shr.u32 %r65, %r61, 2;");
+    x = ins(out, cap, x, "and.b32 %r66, %r61, 3;");
+    x = ins(out, cap, x, "mov.u32 %r67, %ctaid.y;");
+    x = ins(out, cap, x, "shl.b32 %r67, %r67, 7;");
+    x = ins(out, cap, x, "shl.b32 %r68, %r65, 6;");
+    x = ins(out, cap, x, "add.u32 %r67, %r67, %r68;");
+    x = ins(out, cap, x, "add.u32 %r67, %r67, %r63;");
+    x = ins(out, cap, x, "mov.u32 %r69, %ctaid.x;");
+    x = ins(out, cap, x, "shl.b32 %r69, %r69, 7;");
+    x = ins(out, cap, x, "shl.b32 %r68, %r66, 5;");
+    x = ins(out, cap, x, "add.u32 %r69, %r69, %r68;");
+    x = ins(out, cap, x, "shl.b32 %r68, %r64, 1;");
+    x = ins(out, cap, x, "add.u32 %r69, %r69, %r68;");
     var mi : u32 = 0;
     while (mi < 4) {
         var ni : u32 = 0;
@@ -353,16 +464,33 @@ fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
 pub fn emit_ptx(out : []u8, cap : usize) -> usize {
     var x : usize = emit_header(out, cap, 0);
     x = emit_prologue(out, cap, x);
+    // Tile 0 goes to stage 0 (A by cp.async, W decoded by hand); the loop then fills the other stage.
+    x = emit_fetch(out, cap, x, 37);
+    x = emit_decode_store(out, cap, x);
+    x = ins(out, cap, x, "add.u32 %r12, %r12, 10240;");
+    x = ins(out, cap, x, "add.u32 %r20, %r20, 10240;");
     x = put_s(out, cap, x, "LOOP_K:\n");
-    x = ins(out, cap, x, "setp.ge.u32 %p3, %r28, %r3;");
+    x = ins(out, cap, x, "setp.ge.u32 %p3, %r37, %r3;");
     x = ins(out, cap, x, "@%p3 bra DONE_K;");
-    x = emit_tile_loads(out, cap, x);
+    x = ins(out, cap, x, "cp.async.wait_group 0;");
     x = ins(out, cap, x, "bar.sync 0;");
-    x = emit_mma_step(out, cap, x);
-    x = ins(out, cap, x, "bar.sync 0;");
-    x = ins(out, cap, x, "add.u32 %r28, %r28, 32;");
+    x = ins(out, cap, x, "add.u32 %r38, %r37, 64;");
+    x = emit_fetch(out, cap, x, 38);
+    x = emit_mma_step(out, cap, x, 0);
+    x = emit_mma_step(out, cap, x, 1);
+    x = emit_decode_store(out, cap, x);
+    var q : u32 = 32;
+    while (q < 37) {
+        x = ins_uu(out, cap, x, "add.u32 %r", q, ", %r", q, ", %r39;");
+        q += 1;
+    }
+    x = ins(out, cap, x, "sub.u32 %r12, %r12, %r39;");
+    x = ins(out, cap, x, "sub.u32 %r20, %r20, %r39;");
+    x = ins(out, cap, x, "neg.s32 %r39, %r39;");
+    x = ins(out, cap, x, "add.u32 %r37, %r37, 64;");
     x = ins(out, cap, x, "bra LOOP_K;");
     x = put_s(out, cap, x, "DONE_K:\n");
+    x = ins(out, cap, x, "cp.async.wait_group 0;");
     x = emit_epilogue(out, cap, x);
     x = ins(out, cap, x, "ret;");
     return put_s(out, cap, x, "}\n");
@@ -514,89 +642,113 @@ fn count_text(t : []const u8, n : usize, s : str) -> usize {
 // ============================================================================
 
 test the_text_opens_with_the_ptx_header {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
     assert at_text(&out, m, 0, "// ternary_gemm_s8 -- emitted by t27c from specs/igla/coder/ternary_gemm_ptx.t27");
     assert count_text(&out, m, "\n.version 7.0\n.target sm_80\n.address_size 64\n\n") == 1;
 }
 
 test the_entry_takes_three_pointers_and_three_sizes {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
-    assert count_text(&out, m, ".visible .entry ternary_gemm_s8(\n    .param .u64 p_a,\n    .param .u64 p_w,\n    .param .u64 p_c,\n    .param .u32 p_m,\n    .param .u32 p_n,\n    .param .u32 p_k\n)\n.maxntid 256, 1, 1\n{\n") == 1;
-    assert count_text(&out, m, "    .shared .align 16 .b8 sA[6144];\n") == 1;
-    assert count_text(&out, m, "    .shared .align 16 .b8 sB[6144];\n") == 1;
+    assert count_text(&out, m, ".visible .entry ternary_gemm_s8(\n    .param .u64 p_a,\n    .param .u64 p_w,\n    .param .u64 p_c,\n    .param .u32 p_m,\n    .param .u32 p_n,\n    .param .u32 p_k\n)\n.maxntid 256, 1, 1\n.minnctapersm 2\n{\n") == 1;
+    assert count_text(&out, m, "    .shared .align 16 .b8 sA[20480];\n") == 1;
+    assert count_text(&out, m, "    .shared .align 16 .b8 sB[20480];\n") == 1;
 }
 
-test sixteen_int8_mma_per_k_step {
-    var out : [32768]u8 = undefined;
+test thirty_two_int8_mma_per_k_tile {
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
-    assert count_text(&out, m, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ") == 16;
-    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc0, %acc1, %acc2, %acc3}, {%fa0, %fa1, %fa2, %fa3}, {%fb0, %fb1}, {%acc0, %acc1, %acc2, %acc3};\n") == 1;
-    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc20, %acc21, %acc22, %acc23}, {%fa4, %fa5, %fa6, %fa7}, {%fb2, %fb3}, {%acc20, %acc21, %acc22, %acc23};\n") == 1;
-    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc60, %acc61, %acc62, %acc63}, {%fa12, %fa13, %fa14, %fa15}, {%fb6, %fb7}, {%acc60, %acc61, %acc62, %acc63};\n") == 1;
+    // Two 32-wide k-steps of 16 mma each; both steps use the same register names.
+    assert count_text(&out, m, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ") == 32;
+    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc0, %acc1, %acc2, %acc3}, {%fa0, %fa1, %fa2, %fa3}, {%fb0, %fb1}, {%acc0, %acc1, %acc2, %acc3};\n") == 2;
+    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc20, %acc21, %acc22, %acc23}, {%fa4, %fa5, %fa6, %fa7}, {%fb2, %fb3}, {%acc20, %acc21, %acc22, %acc23};\n") == 2;
+    assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc60, %acc61, %acc62, %acc63}, {%fa12, %fa13, %fa14, %fa15}, {%fb6, %fb7}, {%acc60, %acc61, %acc62, %acc63};\n") == 2;
     assert count_text(&out, m, "dp4a") == 0;
 }
 
 test every_accumulator_starts_at_zero_once {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
     assert count_text(&out, m, "    mov.b32 %acc") == 64;
     assert count_text(&out, m, "    mov.b32 %acc0, 0;\n") == 1;
     assert count_text(&out, m, "    mov.b32 %acc63, 0;\n") == 1;
 }
 
-test fragment_offsets_follow_the_48_byte_stride {
-    var out : [32768]u8 = undefined;
+test fragment_offsets_follow_the_80_byte_stride {
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
-    assert count_text(&out, m, "    ld.shared.u32 ") == 24;
-    // A: tile mi at 16 rows x 48 = 768 bytes, the g+8 rows 384 further, the upper k half 16 further.
-    assert count_text(&out, m, "    ld.shared.u32 %fa0, [%r25+0];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fa1, [%r25+384];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fa2, [%r25+16];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fa3, [%r25+400];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fa13, [%r25+2688];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fa15, [%r25+2704];\n") == 1;
-    // B: tile ni at 8 columns x 48 = 384 bytes.
-    assert count_text(&out, m, "    ld.shared.u32 %fb6, [%r27+1152];\n") == 1;
-    assert count_text(&out, m, "    ld.shared.u32 %fb7, [%r27+1168];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 ") == 48;
+    // A: tile mi at 16 rows x 80 = 1280 bytes, the g+8 rows 640 further, the upper k half 16 further,
+    // the second 32-wide k-step 32 further.
+    assert count_text(&out, m, "    ld.shared.u32 %fa0, [%r32+0];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa0, [%r32+32];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa1, [%r32+640];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa2, [%r32+16];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa3, [%r32+656];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa13, [%r32+4480];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fa15, [%r32+4528];\n") == 1;
+    // B: one base register per 8-column group (the rows are rotated, so the group is not an offset).
+    assert count_text(&out, m, "    ld.shared.u32 %fb0, [%r33+0];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fb1, [%r33+48];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fb6, [%r36+32];\n") == 1;
+    assert count_text(&out, m, "    ld.shared.u32 %fb7, [%r36+16];\n") == 1;
 }
 
-test sixteen_codes_decoded_per_thread_per_k_step {
-    var out : [32768]u8 = undefined;
+test a_k_tile_is_fetched_by_cp_async_and_decoded_by_prmt {
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
-    assert count_text(&out, m, "    st.shared.u8 ") == 16;
-    assert count_text(&out, m, "    shr.u32 %r36, %r35, 0;\n") == 1;
-    assert count_text(&out, m, "    shr.u32 %r36, %r35, 30;\n") == 1;
-    assert count_text(&out, m, "    st.shared.u8 [%r16+0], %r37;\n") == 1;
-    assert count_text(&out, m, "    st.shared.u8 [%r16+720], %r37;\n") == 1;
-    assert count_text(&out, m, "    sub.s32 %r37, %r37, %r38;\n") == 16;
+    // Two fetches (the prologue's tile 0 and the loop's tile i + 1), two 16-byte copies each.
+    assert count_text(&out, m, "    cp.async.cg.shared.global ") == 4;
+    assert count_text(&out, m, "    cp.async.cg.shared.global [%r12+5120], [%rd5], 16, %r15;\n") == 2;
+    assert count_text(&out, m, "    cp.async.commit_group;\n") == 2;
+    assert count_text(&out, m, "    cp.async.wait_group 0;\n") == 2;
+    assert count_text(&out, m, " ld.global.u16 ") == 8;
+    assert count_text(&out, m, "ld.global.v4") == 0;
+    assert count_text(&out, m, "st.shared.u8") == 0;
+    // Decode: 4 selectors + 8 transpose prmt per half, two halves, two emissions.
+    assert count_text(&out, m, "    prmt.b32 ") == 48;
+    assert count_text(&out, m, "0x00FF0100") == 1;
+    assert count_text(&out, m, "    and.b32 %r41, %r22, 0x3333;\n") == 2;
+    assert count_text(&out, m, "    shr.u32 %r41, %r22, 2;\n") == 2;
+    assert count_text(&out, m, "    prmt.b32 %r41, %r40, 0, %r41;\n") == 4;
+    assert count_text(&out, m, "    prmt.b32 %r45, %r41, %r42, 0x5140;\n") == 4;
+    assert count_text(&out, m, "    prmt.b32 %r52, %r47, %r48, 0x7632;\n") == 4;
+    assert count_text(&out, m, "    st.shared.b32 [%r53], %r49;\n") == 4;
+    assert count_text(&out, m, "    st.shared.b32 ") == 16;
+    assert count_text(&out, m, "    add.u32 %r53, %r16, 7;\n") == 2;
 }
 
 test thirty_two_guarded_pair_stores {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
     assert count_text(&out, m, "st.global.v2.u32 ") == 32;
-    assert count_text(&out, m, "    @%p6 st.global.v2.u32 [%rd10], {%acc0, %acc1};\n") == 1;
-    assert count_text(&out, m, "    @%p6 st.global.v2.u32 [%rd10], {%acc62, %acc63};\n") == 1;
-    assert count_text(&out, m, "    add.u32 %r41, %r39, 56;\n") == 4;
-    assert count_text(&out, m, "    add.u32 %r42, %r40, 24;\n") == 8;
+    assert count_text(&out, m, "    @%p8 st.global.v2.u32 [%rd10], {%acc0, %acc1};\n") == 1;
+    assert count_text(&out, m, "    @%p8 st.global.v2.u32 [%rd10], {%acc62, %acc63};\n") == 1;
+    assert count_text(&out, m, "    add.u32 %r70, %r67, 56;\n") == 4;
+    assert count_text(&out, m, "    add.u32 %r71, %r69, 24;\n") == 8;
 }
 
-test one_loop_two_barriers_one_return {
-    var out : [32768]u8 = undefined;
+test one_loop_one_barrier_one_return {
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
     assert count_text(&out, m, "\nLOOP_K:\n") == 1;
     assert count_text(&out, m, "\nDONE_K:\n") == 1;
-    assert count_text(&out, m, "    bar.sync 0;\n") == 2;
-    assert count_text(&out, m, "    add.u32 %r28, %r28, 32;\n    bra LOOP_K;\n") == 1;
+    assert count_text(&out, m, "    bar.sync 0;\n") == 1;
+    assert count_text(&out, m, "    add.u32 %r37, %r37, 64;\n    bra LOOP_K;\n") == 1;
+    // The stage toggle: reads move by the delta, writes move back by it, the delta flips sign.
+    assert count_text(&out, m, "    add.u32 %r32, %r32, %r39;\n") == 1;
+    assert count_text(&out, m, "    add.u32 %r36, %r36, %r39;\n") == 1;
+    assert count_text(&out, m, "    sub.u32 %r12, %r12, %r39;\n") == 1;
+    assert count_text(&out, m, "    sub.u32 %r20, %r20, %r39;\n") == 1;
+    assert count_text(&out, m, "    neg.s32 %r39, %r39;\n") == 1;
     assert at_text(&out, m, m - 11, "    ret;\n}\n");
 }
 
 test the_text_is_ascii_and_fits_its_buffer {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
-    assert m == 21403;
+    assert m == 29178;
     assert m < PTX_CAP;
     var i : usize = 0;
     while (i < m) {
@@ -606,7 +758,7 @@ test the_text_is_ascii_and_fits_its_buffer {
 }
 
 test a_short_buffer_reports_the_full_length_and_writes_nothing_past_cap {
-    var out : [32768]u8 = undefined;
+    var out : [65536]u8 = undefined;
     const m : usize = emit_ptx(&out, PTX_CAP);
     var small : [64]u8 = [7; 64];
     const s : usize = emit_ptx(&small, 32);
@@ -617,8 +769,8 @@ test a_short_buffer_reports_the_full_length_and_writes_nothing_past_cap {
 }
 
 test emitting_twice_gives_the_same_bytes {
-    var a : [32768]u8 = undefined;
-    var b : [32768]u8 = undefined;
+    var a : [65536]u8 = undefined;
+    var b : [65536]u8 = undefined;
     const m : usize = emit_ptx(&a, PTX_CAP);
     const k : usize = emit_ptx(&b, PTX_CAP);
     assert k == m;
@@ -626,6 +778,46 @@ test emitting_twice_gives_the_same_bytes {
     while (i < m) {
         assert a[i] == b[i];
         i += 1;
+    }
+}
+
+test the_fragment_stride_is_bank_conflict_free {
+    // An LDS.32 fragment load of lane (g, t) reads word (SMEM_STRIDE / 4) g + t: 32 lanes, 32 banks.
+    var seen : [32]u32 = [0; 32];
+    var g : u32 = 0;
+    while (g < 8) {
+        var t : u32 = 0;
+        while (t < 4) {
+            const bank : u32 = (g * (SMEM_STRIDE / 4) + t) % 32;
+            seen[bank] += 1;
+            t += 1;
+        }
+        g += 1;
+    }
+    var b : u32 = 0;
+    while (b < 32) {
+        assert seen[b] == 1;
+        b += 1;
+    }
+}
+
+test the_column_rotation_of_a_group_is_a_permutation {
+    // Logical column c of group q is stored at row slot (c + q) & 7 and read back at the same slot,
+    // so every group still fills its eight slots exactly once.
+    var q : u32 = 0;
+    while (q < 16) {
+        var seen : [8]u32 = [0; 8];
+        var c : u32 = 0;
+        while (c < 8) {
+            seen[(c + q) % 8] += 1;
+            c += 1;
+        }
+        var i : u32 = 0;
+        while (i < 8) {
+            assert seen[i] == 1;
+            i += 1;
+        }
+        q += 1;
     }
 }
 
@@ -776,10 +968,14 @@ test the_grid_covers_every_row_and_column {
 
 invariant accumulator_cannot_overflow { 128 * K_MAX_I32 <= 2147483647 }
 
-invariant shared_tiles_fit_static_shared_memory { 2 * BM * SMEM_STRIDE <= 49152 }
+invariant shared_tiles_fit_static_shared_memory { 2 * STAGES * BM * SMEM_STRIDE <= 49152 }
 
-invariant the_stride_holds_a_k_step_and_keeps_16_byte_rows { SMEM_STRIDE >= BK and SMEM_STRIDE % 16 == 0 }
+invariant a_stage_is_128_rows_of_the_stride { STAGE_BYTES == BM * SMEM_STRIDE }
+
+invariant the_stride_holds_a_k_tile_and_keeps_16_byte_rows { SMEM_STRIDE >= BK and SMEM_STRIDE % 16 == 0 }
+
+invariant an_odd_number_of_four_word_units_per_row_spreads_the_banks { (SMEM_STRIDE / 16) % 2 == 1 }
 
 invariant eight_warps_cover_the_block { (THREADS / 32) * 64 * 32 == BM * BN }
 
-invariant the_500m_shapes_are_whole_blocks { D_MODEL_500M % 128 == 0 and D_FF_500M % 128 == 0 and D_MODEL_500M % BK == 0 }
+invariant the_500m_shapes_are_whole_blocks { D_MODEL_500M % 128 == 0 and D_FF_500M % 128 == 0 and D_MODEL_500M % BK == 0 and D_FF_500M % BK == 0 }
