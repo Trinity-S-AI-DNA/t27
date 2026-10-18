@@ -7405,6 +7405,19 @@ the parser used to read it as `{}` followed by a negation",
 // Code Generator
 // ============================================================================
 
+/// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
+const HOST_IO_ZIG: &str = r#"
+const __t27_posix = @import("std").posix;
+fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
+    const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
+    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+}
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -8289,6 +8302,12 @@ impl Codegen {
             if decl.kind != NodeKind::UseDecl {
                 self.gen_decl(decl);
             }
+        }
+        // `--backend ml`: the host's file syscalls, only for a spec that calls them.
+        let mut host = false;
+        Self::visit_calls(&ast.children, &mut |c| host |= matches!(c.name.as_str(), "host_open" | "host_read" | "host_write" | "host_close"));
+        if host {
+            self.write(HOST_IO_ZIG);
         }
     }
 
@@ -10448,6 +10467,10 @@ impl Codegen {
                         "sin" => Some("@sin"),
                         "cos" => Some("@cos"),
                         "tanh" => Some("std.math.tanh"),
+                        "host_open" => Some("__t27_host_open"),
+                        "host_read" => Some("__t27_host_read"),
+                        "host_write" => Some("__t27_host_write"),
+                        "host_close" => Some("__t27_host_close"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
