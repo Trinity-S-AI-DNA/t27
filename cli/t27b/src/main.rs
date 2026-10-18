@@ -68,6 +68,7 @@ const USAGE: &str = "usage:
   t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
   t27b asm    <file.t27> [--overflow trap|wrap]
   t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
+  t27b ts      <file.t27>   (consts, scalar fns and tests as TypeScript; specs/tri/t27b/ts_emit.t27)
   t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
                     [--json <path>] [--runner \"<cmd> [args]\"]
                     [--blockers [--reference <t27c> [--reference-cache <file>]
@@ -212,7 +213,7 @@ fn main() -> ExitCode {
         Err(e) => return usage(&e),
     };
     match o.cmd.as_str() {
-        "test" | "build" | "asm" | "verilog" => {
+        "test" | "build" | "asm" | "verilog" | "ts" => {
             let Some(input) = o.input.clone() else {
                 return usage("missing input file");
             };
@@ -267,8 +268,8 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
         }
         return Err(EXIT_FRONTEND);
     }
-    if o.cmd == "verilog" {
-        return Err(lower::verilog(&parsed.ast).map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
+    if o.cmd == "verilog" || o.cmd == "ts" {
+        return Err(lower::verilog(&parsed.ast, o.cmd == "ts").map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
     }
     if o.blockers {
         // Every unsupported construct, not just the first; a file with none
