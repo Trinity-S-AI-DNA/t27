@@ -29,6 +29,12 @@
 ;    bool (gen-rust and t27b refuse `?void`): `Ok(())` is `true`, an error `false`.
 ;    A read-only `String` / `&String` / `Vec<T>` / `&Vec<T>` parameter is `[]const u8` / `[]const T`; a
 ;    Vec anywhere else, and an owned String outside the out-buffer form (next paragraph), stays refused.
+;    A `vec![a, b, c]` or `vec![x; N]` that the fn only reads (#10643) is a typed array, `let v = vec![..];`
+;    as `const v : [3]T = [..];` (`[N]T = [x] ** N` for a repeat; N one number or one const of the file):
+;    t27 holds no growing list, so T must come from the source -- the `Vec<T>` annotation, the first element
+;    (a suffixed number, a text, a bool, a variant, a struct literal, a call of a fn that returns one plain
+;    type) or the `&[T]` parameter of the call that takes `&v` -- and a vec the fn pushes to, assigns into,
+;    takes by `&mut`, hands on whole, or of an unknown type or length stays refused, the reason saying which.
 ;    A tuple struct is a struct with fields `_0`, `_1`,
 ;    .., built by `Name{ ._0 = a }` and read as `x._0`. `impl Default for T` is an inherent impl
 ;    (`T_default`). `matches!(e, P | Q)` is the patterns' condition.
@@ -309,6 +315,16 @@ pub const R_EMPTY : usize = 32;
 /// A unary `!` whose operand is neither a bool nor an integer t27o can name: Rust's `!` is a boolean NOT
 /// on the first and a bitwise NOT on the second, t27's `!` and `~` are the two, and a guess is a rewrite.
 pub const R_NOTYPE : usize = 33;
+/// A `vec![..]` the fn changes (pushes to, resizes, assigns into, takes by `&mut`), hands on whole (a
+/// call argument by value, a struct field, a return) or whose element type or length t27o cannot tell:
+/// t27 holds no growing list, so only a vec! the fn reads is an array (#10643).
+pub const R_VECMUT : usize = 34;
+pub const R_VECMOVE : usize = 35;
+pub const R_VECTYPE : usize = 36;
+/// How a fn uses a vec! local: VU_READ only reads it, VU_CHANGED changes it, VU_MOVED hands it on.
+pub const VU_READ : usize = 0;
+pub const VU_CHANGED : usize = 1;
+pub const VU_MOVED : usize = 2;
 
 // The bytes the converter reads, as numbers (#7604).
 pub const B_TAB : u8 = 9;
@@ -1247,7 +1263,10 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
             const nx : usize = skip_ws(src, e);
             const call : bool = tok_is(src, nx, "(");
             const after_dot : bool = tok_is(src, p0, ".");
-            const after_path : bool = tok_is(src, p0, "::");
+            // `super::f(..)`, `self::f(..)` and `crate::f(..)` name f of this file's own module, flattened: a use
+            // of f like a bare call (a test that reached a refused f through `super::` reached its stub)
+            const own_path : bool = tok_is(src, p0, "::") and p1 < src.len and (tok_is(src, p1, "super") or tok_is(src, p1, "self") or tok_is(src, p1, "crate"));
+            const after_path : bool = tok_is(src, p0, "::") and !own_path;
             // the name a declaration declares is no use of it
             const after_fn : bool = tok_is(src, p0, "fn") or tok_is(src, p0, "struct") or tok_is(src, p0, "enum") or tok_is(src, p0, "const") or tok_is(src, p0, "static") or tok_is(src, p0, "type") or tok_is(src, p0, "trait");
             var k : usize = 0;
@@ -1784,7 +1803,7 @@ pub fn expr_bp(src: []const u8, st: []usize, out: []u8, min: usize, ns: bool) ->
     return lvl;
 }
 
-/// Was the name src[a .. b] declared as an array (`name: [`, `name = [`) earlier in this fn? A Rust
+/// Was the name src[a .. b] declared as an array (`name: [`, `name = [`, `name = vec![`) earlier in this fn? A Rust
 /// borrow of it passes a slice, which t27 writes as `&name`; a borrow of anything else is dropped.
 pub fn array_local(src: []const u8, flo: usize, a: usize, b: usize) -> bool {
     var q : usize = flo;
@@ -1795,6 +1814,9 @@ pub fn array_local(src: []const u8, flo: usize, a: usize, b: usize) -> bool {
             const e1 : usize = tok_end(src, n1);
             const n2 : usize = skip_ws(src, e1);
             if ((word_is(src, n1, e1, ":") or word_is(src, n1, e1, "=")) and n2 < src.len and src[n2] == B_LBRACKET) { return true; }
+            // a vec! the fn only reads is an array too (let_vec): `v = vec![..]`, `v: Vec<T> = vec![..]`
+            if (word_is(src, n1, e1, "=") and vec_init(src, n2)) { return true; }
+            if (word_is(src, n1, e1, ":") and tok_is(src, n2, "Vec") and vec_init(src, init_at(src, q))) { return true; }
         }
         q = skip_ws(src, e);
     }
@@ -1996,6 +2018,22 @@ pub fn slice_param_elem(src: []const u8, na: usize, nb: usize, method: bool, k: 
     return found;
 }
 
+/// The element type token T of the `&[T]` parameter that argument k of the call whose `(` is src[lp] lands
+/// on: the callee (a name, or a method after a `.`) is read off the source before the `(`, its parameter
+/// off this file's own declarations (slice_param_elem). src.len when either is not there.
+pub fn site_elem(src: []const u8, lp: usize, k: usize) -> usize {
+    if (lp >= src.len) { return src.len; }
+    var ne : usize = lp;
+    while (ne > 0 and is_space(src[ne - 1])) { ne = ne - 1; }
+    var na : usize = ne;
+    while (na > 0 and is_word(src[na - 1])) { na = na - 1; }
+    if (na >= ne) { return src.len; }
+    var m : usize = na;
+    while (m > 0 and is_space(src[m - 1])) { m = m - 1; }
+    const method : bool = m > 0 and src[m - 1] == B_DOT and !(m > 1 and src[m - 2] == B_DOT);
+    return slice_param_elem(src, na, ne, method, k);
+}
+
 /// The empty slice `&[]` at st[P], argument number k of the call whose `(` is src[lp]: the empty array
 /// of the element type its parameter names, `[0]T{}`, which a `[]const T` parameter takes. The
 /// parameter is found in this file's own declarations of the callee; when it is not, `&[]` is refused
@@ -2005,19 +2043,7 @@ pub fn empty_arg(src: []const u8, st: []usize, out: []u8, lp: usize, k: usize) -
     const b : usize = skip_ws(src, tok_end(src, a));
     const c : usize = skip_ws(src, tok_end(src, b));
     const d : usize = tok_end(src, c);
-    var elem : usize = src.len;
-    if (lp < src.len) {
-        var ne : usize = lp;
-        while (ne > 0 and is_space(src[ne - 1])) { ne = ne - 1; }
-        var na : usize = ne;
-        while (na > 0 and is_word(src[na - 1])) { na = na - 1; }
-        if (na < ne) {
-            var m : usize = na;
-            while (m > 0 and is_space(src[m - 1])) { m = m - 1; }
-            const method : bool = m > 0 and src[m - 1] == B_DOT and !(m > 1 and src[m - 2] == B_DOT);
-            elem = slice_param_elem(src, na, ne, method, k);
-        }
-    }
+    const elem : usize = site_elem(src, lp, k);
     if (elem >= src.len) {
         refuse(st, R_EMPTY, a, a, d);
         return;
@@ -4422,6 +4448,11 @@ pub fn let_stmt(src: []const u8, st: []usize, out: []u8) -> void {
     // the type a `.parse()` in the value gives its result
     st[LETTY] = 0;
     if (typed) { st[LETTY] = skip_ws(src, tok_end(src, st[P])); }
+    if (init < src.len and vec_init(src, init)) {
+        let_vec(src, st, out, mutable, na, nb, typed, init);
+        st[LETTY] = 0;
+        return;
+    }
     if (init < src.len and ends_in_try(src, init)) {
         let_try(src, st, out, mutable, na, nb, init);
         st[LETTY] = 0;
@@ -4490,6 +4521,331 @@ pub fn let_value(src: []const u8, st: []usize, out: []u8, mutable: bool, na: usi
     } else {
         puts(st, out, " = ");
         expr(src, st, out, false);
+    }
+    want(src, st, ";");
+    puts(st, out, ";");
+}
+
+// ---------------------------------------------------------------- vec! read only (#10643)
+
+/// Is src[p] the `vec` of a `vec![..]` with square brackets that a `;` follows (the init of a `let`)?
+pub fn vec_init(src: []const u8, p: usize) -> bool {
+    if (p >= src.len or !tok_is(src, p, "vec")) { return false; }
+    const bang : usize = skip_ws(src, tok_end(src, p));
+    const lb : usize = skip_ws(src, tok_end(src, bang));
+    if (!tok_is(src, bang, "!") or !tok_is(src, lb, "[")) { return false; }
+    return tok_is(src, skip_ws(src, block_end(src, lb)), ";");
+}
+
+/// Where the scope of the vec! local src[na .. nb) ends within src[lo .. hi): the `let` that binds the name
+/// again (its init still reads the old one, vec_shadow_use), else hi.
+pub fn vec_scope_end(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (word_is(src, q, e, "let")) {
+            var n : usize = skip_ws(src, e);
+            if (tok_is(src, n, "mut")) { n = skip_ws(src, tok_end(src, n)); }
+            if (same_text(src, n, tok_end(src, n), na, nb)) { return q; }
+        }
+        q = skip_ws(src, e);
+    }
+    return hi;
+}
+
+/// How the token src[q .. e], the name of a vec! local, is used (VU_*); prev is the token before it, src.len
+/// at the start. A field, a method or a struct field label of the same name is not a use of the local. A
+/// read is `&v`, `v[i]` (not assigned to), `for x in v`, and the methods that only look at it; a change is
+/// `&mut v`, `v = ..`, `v[i] = ..`, and any other method (push, insert, sort, extend, iter_mut ..); anything
+/// else hands the vec on whole.
+pub fn vec_mention(src: []const u8, prev: usize, q: usize, e: usize) -> usize {
+    if (prev < src.len and (tok_is(src, prev, ".") or tok_is(src, prev, "::"))) { return VU_READ; }
+    const nx : usize = skip_ws(src, e);
+    if (tok_is(src, nx, ":")) { return VU_READ; }
+    if (prev < src.len and tok_is(src, prev, "mut")) { return VU_CHANGED; }
+    if (assign_op(src, nx)) { return VU_CHANGED; }
+    if (tok_is(src, nx, ".")) {
+        const m : usize = skip_ws(src, nx + 1);
+        const reads : str = " len is_empty iter as_slice first last get contains starts_with ends_with to_vec clone windows chunks concat join binary_search ";
+        if (listed(reads, src[m .. tok_end(src, m)])) { return VU_READ; }
+        return VU_CHANGED;
+    }
+    if (tok_is(src, nx, "[")) {
+        // `v[i]` reads; `v[i] = e`, `v[i].f = e` and `v[i] += e` write
+        var a : usize = skip_ws(src, block_end(src, nx));
+        while (tok_is(src, a, ".") or tok_is(src, a, "[")) {
+            if (tok_is(src, a, "[")) {
+                a = skip_ws(src, block_end(src, a));
+            } else {
+                a = skip_ws(src, tok_end(src, skip_ws(src, a + 1)));
+            }
+        }
+        if (assign_op(src, a)) { return VU_CHANGED; }
+        return VU_READ;
+    }
+    if (prev < src.len and (tok_is(src, prev, "&") or tok_is(src, prev, "&&"))) { return VU_READ; }
+    if (prev < src.len and tok_is(src, prev, "in") and tok_is(src, nx, "{")) { return VU_READ; }
+    return VU_MOVED;
+}
+
+/// How src[lo .. hi) uses the vec! local src[na .. nb): VU_CHANGED when any use changes it, else VU_MOVED
+/// when any hands it on, else VU_READ.
+pub fn vec_use(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var worst : usize = VU_READ;
+    var prev : usize = src.len;
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (same_text(src, q, e, na, nb)) {
+            const u : usize = vec_mention(src, prev, q, e);
+            if (u == VU_CHANGED) { return VU_CHANGED; }
+            if (u > worst) { worst = u; }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return worst;
+}
+
+/// vec_use over the whole life of the vec! local src[na .. nb) that src[close ..] follows in the fn ending at
+/// hi: up to the `let` that binds the name again, and that let's init, which still reads this one.
+pub fn vec_life(src: []const u8, close: usize, hi: usize, na: usize, nb: usize) -> usize {
+    const end : usize = vec_scope_end(src, close, hi, na, nb);
+    const how : usize = vec_use(src, close, end, na, nb);
+    if (end >= hi or how == VU_CHANGED) { return how; }
+    const ia : usize = init_at(src, end);
+    if (ia >= src.len) { return how; }
+    const tail : usize = vec_use(src, ia, find_at(src, ia, B_SEMI), na, nb);
+    if (tail == VU_CHANGED or tail > how) { return tail; }
+    return how;
+}
+
+/// The `(` that encloses src[q] most closely among those that open between `from` and q; src.len when
+/// none does.
+pub fn paren_around(src: []const u8, from: usize, q: usize) -> usize {
+    var found : usize = src.len;
+    var p : usize = from;
+    while (p < q) {
+        const e : usize = tok_end(src, p);
+        if (e == p + 1 and src[p] == B_LPAREN and block_end(src, p) > q) { found = p; }
+        p = skip_ws(src, e);
+    }
+    return found;
+}
+
+/// The number of the argument that src[q] starts in the list that opens at src[lp] (its depth-0 commas
+/// before q); src.len when q does not stand at the top of that list.
+pub fn arg_slot(src: []const u8, lp: usize, q: usize) -> usize {
+    var k : usize = 0;
+    var depth : usize = 0;
+    var p : usize = skip_ws(src, lp + 1);
+    while (p < q) {
+        const e : usize = tok_end(src, p);
+        if (e == p + 1) {
+            if (is_open(src[p])) { depth = depth + 1; }
+            if (is_close(src[p])) {
+                if (depth == 0) { return src.len; }
+                depth = depth - 1;
+            }
+            if (src[p] == B_COMMA and depth == 0) { k = k + 1; }
+        }
+        p = skip_ws(src, e);
+    }
+    if (depth != 0) { return src.len; }
+    return k;
+}
+
+/// The element type token T of the `&[T]` parameter that the first `&v` handed to a call in src[lo .. hi)
+/// lands on, v the name src[na .. nb): the callee's own declaration in this file says what the vec! holds.
+/// src.len when no such argument names a type.
+pub fn vec_arg_elem(src: []const u8, lo: usize, hi: usize, na: usize, nb: usize) -> usize {
+    var prev : usize = src.len;
+    var q : usize = lo;
+    while (q < hi) {
+        const e : usize = tok_end(src, q);
+        if (same_text(src, q, e, na, nb) and prev < src.len and tok_is(src, prev, "&")) {
+            const nx : usize = skip_ws(src, e);
+            if (tok_is(src, nx, ",") or tok_is(src, nx, ")")) {
+                const lp : usize = paren_around(src, lo, prev);
+                if (lp < src.len) {
+                    const k : usize = arg_slot(src, lp, prev);
+                    if (k < src.len) {
+                        const el : usize = site_elem(src, lp, k);
+                        if (el < src.len) { return el; }
+                    }
+                }
+            }
+        }
+        prev = q;
+        q = skip_ws(src, e);
+    }
+    return src.len;
+}
+
+/// The return type token of the fn src[na .. nb) when every declaration of the name returns the same plain
+/// word followed by the body's `{` (a struct, an enum or a scalar; not Self); src.len otherwise.
+pub fn ret_word(src: []const u8, na: usize, nb: usize) -> usize {
+    var found : usize = src.len;
+    var q : usize = skip_ws(src, 0);
+    while (q < src.len) {
+        const e : usize = tok_end(src, q);
+        if (fn_hit(src, q, na, nb)) {
+            const r : usize = fn_ret_of(src, q);
+            if (r >= src.len or !is_alpha(src[r]) or tok_is(src, r, "Self")) { return src.len; }
+            const re : usize = tok_end(src, r);
+            if (!tok_is(src, skip_ws(src, re), "{")) { return src.len; }
+            if (found < src.len and !same_text(src, found, tok_end(src, found), r, re)) { return src.len; }
+            found = r;
+        }
+        q = skip_ws(src, e);
+    }
+    return found;
+}
+
+/// The type at src[tp], written as ty writes it; the reader is left where it was.
+pub fn put_elem_ty(src: []const u8, st: []usize, out: []u8, tp: usize) -> void {
+    const save : usize = st[P];
+    st[P] = tp;
+    ty(src, st, out);
+    st[P] = save;
+}
+
+/// The type the first element src[e0] of a vec! says by itself, written; false when it does not: a number
+/// with a suffix, a text, a bool, a variant of this file's enum, a struct literal of this file's struct, a
+/// call of a fn of this file whose return type is one plain word.
+pub fn vec_first_type(src: []const u8, st: []usize, out: []u8, e0: usize) -> bool {
+    var t0 : usize = e0;
+    if (tok_is(src, t0, "-")) { t0 = skip_ws(src, t0 + 1); }
+    const te : usize = tok_end(src, t0);
+    const c : u8 = head(src, t0);
+    if (is_digit(c)) {
+        const k : usize = suffix_len(src, t0, te);
+        if (k == 0) { return false; }
+        put_src(src, st, out, te - k, te);
+        return true;
+    }
+    if (c == B_QUOTE or raw_str_at(src, t0)) {
+        puts(st, out, "[]const u8");
+        return true;
+    }
+    if (tok_is(src, t0, "true") or tok_is(src, t0, "false")) {
+        puts(st, out, "bool");
+        return true;
+    }
+    if (is_upper(c) and peek_is(src, t0, "::") and find_enum(src, t0, te) < src.len) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if (is_upper(c) and peek_is(src, t0, "{") and find_struct(src, st, t0, te) < src.len) {
+        put_owner(src, st, out, t0, te);
+        return true;
+    }
+    if (is_alpha(c) and !is_upper(c) and peek_is(src, t0, "(")) {
+        const r : usize = ret_word(src, t0, te);
+        if (r < src.len) {
+            put_elem_ty(src, st, out, r);
+            return !bad(st[ERR]);
+        }
+    }
+    return false;
+}
+
+/// Write the element type of the vec! local src[na .. nb) whose first element is src[e0]: the annotation
+/// `Vec<T>` first (typed; st[LETTY] is its start), then what the first element says, then the parameter
+/// of the call that takes `&v` (within src[lo .. hi)). false when none of them tells.
+pub fn put_vec_elem(src: []const u8, st: []usize, out: []u8, typed: bool, e0: usize, lo: usize, hi: usize, na: usize, nb: usize) -> bool {
+    if (typed) {
+        const t : usize = st[LETTY];
+        const lt : usize = skip_ws(src, tok_end(src, t));
+        const tp : usize = skip_ws(src, tok_end(src, lt));
+        if (tok_is(src, t, "Vec") and tok_is(src, lt, "<") and !tok_is(src, tp, "_")) {
+            put_elem_ty(src, st, out, tp);
+            return !bad(st[ERR]);
+        }
+    }
+    if (vec_first_type(src, st, out, e0)) { return true; }
+    if (bad(st[ERR])) { return false; }
+    const el : usize = vec_arg_elem(src, lo, hi, na, nb);
+    if (el < src.len) {
+        put_elem_ty(src, st, out, el);
+        return !bad(st[ERR]);
+    }
+    return false;
+}
+
+/// How many elements the list src[lo .. hi) holds: its depth-0 commas, a trailing one adding none.
+pub fn list_count(src: []const u8, lo: usize, hi: usize) -> usize {
+    var n : usize = 0;
+    var q : usize = lo;
+    while (q < hi) {
+        n = n + 1;
+        const c : usize = find_at(src, q, B_COMMA);
+        if (c >= hi) { q = hi; } else { q = skip_ws(src, c + 1); }
+    }
+    return n;
+}
+
+/// Is src[lo .. hi) a length t27b can repeat an element by: one number without a suffix, or one const of
+/// this file (`** n` takes a literal or a name, not an expression)?
+pub fn vec_len_ok(src: []const u8, st: []usize, lo: usize, hi: usize) -> bool {
+    if (lo >= hi) { return false; }
+    const e : usize = tok_end(src, lo);
+    if (skip_ws(src, e) < hi) { return false; }
+    if (is_digit(src[lo])) { return suffix_len(src, lo, e) == 0; }
+    return is_upper(src[lo]) and const_type(src, st, lo, e) < src.len;
+}
+
+/// `let [mut] v [: Vec<T>] = vec![a, b, c];` or `vec![x; N]` that the fn only reads: a typed array,
+/// `const v : [3]T = [a, b, c];` / `const v : [N]T = [x] ** N;`, which t27 hands to a slice parameter as
+/// `&v`. The vec is refused when the fn changes it (R_VECMUT) or hands it on whole (R_VECMOVE), and when
+/// neither its element type nor its length is known (R_VECTYPE) -- t27 holds no growing list, and a
+/// length or a type not in the source is not guessed. st[P] is after the name; init is the `vec`.
+pub fn let_vec(src: []const u8, st: []usize, out: []u8, mutable: bool, na: usize, nb: usize, typed: bool, init: usize) -> void {
+    const bang : usize = skip_ws(src, tok_end(src, init));
+    const lb : usize = skip_ws(src, tok_end(src, bang));
+    const close : usize = block_end(src, lb);
+    const rb : usize = close - 1;
+    const e0 : usize = skip_ws(src, lb + 1);
+    const hi : usize = item_end(src, st[FLO]);
+    const scope : usize = vec_scope_end(src, close, hi, na, nb);
+    const how : usize = vec_life(src, close, hi, na, nb);
+    if (how == VU_CHANGED) {
+        refuse(st, R_VECMUT, init, init, tok_end(src, init));
+        return;
+    }
+    if (how == VU_MOVED) {
+        refuse(st, R_VECMOVE, init, init, tok_end(src, init));
+        return;
+    }
+    const empty : bool = e0 >= rb;
+    const semi : usize = find_at(src, e0, B_SEMI);
+    const repeat : bool = !empty and semi < rb;
+    if (mutable) { puts(st, out, "var "); } else { puts(st, out, "const "); }
+    put_ident(src, st, out, na, nb);
+    puts(st, out, " : [");
+    if (repeat) {
+        const n0 : usize = skip_ws(src, semi + 1);
+        if (!vec_len_ok(src, st, n0, rb)) {
+            refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+            return;
+        }
+        st[P] = n0;
+        expr(src, st, out, false);
+    } else {
+        put_num(st, out, list_count(src, e0, rb));
+    }
+    puts(st, out, "]");
+    if (!put_vec_elem(src, st, out, typed, e0, close, scope, na, nb)) {
+        refuse(st, R_VECTYPE, init, init, tok_end(src, init));
+        return;
+    }
+    puts(st, out, " = ");
+    if (empty) {
+        puts(st, out, "[]");
+        st[P] = close;
+    } else {
+        st[P] = lb;
+        array_lit(src, st, out);
     }
     want(src, st, ";");
     puts(st, out, ";");
@@ -5557,6 +5913,12 @@ pub fn put_reason(src: []const u8, st: []usize, out: []u8) -> void {
         puts(st, out, "empty slice with no known element type");
     } else if (c == R_NOTYPE) {
         puts(st, out, "`!` of an operand whose type t27o cannot tell");
+    } else if (c == R_VECMUT) {
+        puts(st, out, "a vec! the fn changes (push, resize, assign into, &mut)");
+    } else if (c == R_VECMOVE) {
+        puts(st, out, "a vec! the fn hands on or returns");
+    } else if (c == R_VECTYPE) {
+        puts(st, out, "a vec! whose element type or length t27o cannot tell");
     } else if (c == R_SPLICE) {
         puts(st, out, "a used module's own use t27c does not splice (its type_text:: names stay unresolved, the gap specs/compiler/int_type_names.t27 records)");
     } else {
@@ -8874,7 +9236,7 @@ test a_wrapping_call_keeps_the_t27_operator {
 test the_whole_file_has_a_header_and_a_report {
     var out : [1024]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
-    const n : usize = convert("/// One.\nconst ONE: u64 = 1_000;\nfn neg(x: i32) -> i32 { -x }\nfn bad() { let v = vec![1]; }", "Demo", &out, &st);
+    const n : usize = convert("/// One.\nconst ONE: u64 = 1_000;\nfn neg(x: i32) -> i32 { -x }\nfn bad() { let v = vec![1].len(); }", "Demo", &out, &st);
     assert(out_is(n, &out, 0, "// SPDX-License-Identifier: Apache-2.0\n; Demo.t27 -- converted from Rust by t27o (Ouroboros), specs/tools/t27o/rust_convert.t27; read it before it lands.\n; ASCII only (L3)\n\nmodule Demo;\n\n/// One.\nconst ONE : u64 = 1000;\n\nfn neg(x: i32) -> i32 {\n    return -x;\n}\n\n// t27o: refused fn bad (line 4): macro `vec` at line 4\n\nfn bad() -> void {\n}\n\n// t27o: 2 fn seen, 1 converted (0 of 0 tests), 1 refused (1 kept as stubs); coverage 50%\n"));
 }
 
@@ -9378,6 +9740,54 @@ test negative_control_a_mutable_or_unsuffixed_or_iterated_array_literal_loop_sta
     const n : usize = body("fn t() {\n    for y in &mut [1u8, 2] { assert!(*y > 0); }\n}\nfn u() { for k in &[1, 2] { assert!(*k > 0); } }\nfn w() { for k in &[1u8, 2].iter() { assert!(*k > 0); } }", &out, &st);
     assert(out_is(n, &out, 0, "// t27o: refused fn t (line 1): &mut of a value `[` at line 2\n\nfn t() -> void {\n}\n\n// t27o: refused fn u (line 4): for over an iterator `[` at line 4\n\nfn u() -> void {\n}\n\n// t27o: refused fn w (line 5): for over an iterator `[` at line 5\n\nfn w() -> void {\n}\n\n"));
     assert(st[NOK] == 0);
+}
+
+test a_vec_the_fn_only_reads_is_a_typed_array_read_by_index_or_iterated {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn at(v: &[u8], i: usize) -> u8 { v[i] }\n#[test]\nfn by_index() {\n    let v: Vec<u8> = vec![1, 2, 3];\n    assert_eq!(v[1], 2);\n    assert_eq!(v.len(), 3);\n}\n#[test]\nfn iterated() {\n    let v = vec![1u8, 2, 3];\n    let mut s = 0u32;\n    for x in &v { s += *x as u32; }\n    assert_eq!(s, 6);\n    for y in v.iter() { assert!(*y > 0); }\n}\n#[test]\nfn mutable_but_never_changed() {\n    let mut v = vec![7u16, 8];\n    assert_eq!(v[0], 7);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn at(v: []const u8, i: usize) -> u8 {\n    return v[i];\n}\n\ntest by_index {\n    const v : [3]u8 = [1, 2, 3];\n    assert(v[1] == 2);\n    assert(v.len == 3);\n}\n\ntest iterated {\n    const v : [3]u8 = [@as(u8, 1), 2, 3];\n    var s : u32 = 0;\n    for x in v {\n        s += x as u32;\n    }\n    assert(s == 6);\n    for y in v {\n        assert(y > 0);\n    }\n}\n\ntest mutable_but_never_changed {\n    var v : [2]u16 = [@as(u16, 7), 8];\n    assert(v[0] == 7);\n}\n\n"));
+    assert(st[NOK] == 4);
+}
+
+test a_vec_passed_as_a_borrow_takes_its_type_from_the_parameter_and_a_repeat_is_a_filled_array {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("struct Rec { a: u8 }\nfn rec(a: u8) -> Rec { Rec { a } }\nfn total(rs: &[Rec]) -> u32 { let mut t = 0u32; for r in rs { t += r.a as u32; } t }\nfn sum(v: &[u64]) -> u64 { let mut t = 0u64; for x in v { t += *x; } t }\nfn bytes(v: &[u8]) -> usize { v.len() }\nconst N: usize = 4;\n#[test]\nfn a_call_gives_the_type() {\n    let rs = vec![rec(1), rec(2)];\n    assert_eq!(total(&rs), 3);\n    let one = vec![Rec { a: 5 }];\n    assert_eq!(total(&one), 5);\n}\n#[test]\nfn the_parameter_gives_the_type() {\n    let v = vec![10, 20, 30];\n    assert_eq!(sum(&v), 60);\n}\n#[test]\nfn repeated() {\n    let z = vec![0u8; 4];\n    assert_eq!(bytes(&z), 4);\n    let y = vec![0xFF; N];\n    assert_eq!(bytes(&y), 4);\n    let e: Vec<u8> = vec![];\n    assert_eq!(bytes(&e), 0);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "const Rec = struct {\n    a : u8,\n};\n\nfn rec(a: u8) -> Rec {\n    return Rec{ .a = a };\n}\n\nfn total(rs: []const Rec) -> u32 {\n    var t : u32 = 0;\n    for r in rs {\n        t += r.a as u32;\n    }\n    return t;\n}\n\nfn sum(v: []const u64) -> u64 {\n    var t : u64 = 0;\n    for x in v {\n        t += x;\n    }\n    return t;\n}\n\nfn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nconst N : usize = 4;\n\ntest a_call_gives_the_type {\n    const rs : [2]Rec = [rec(1), rec(2)];\n    assert(total(&rs) == 3);\n    const one : [1]Rec = [Rec{ .a = 5 }];\n    assert(total(&one) == 5);\n}\n\ntest the_parameter_gives_the_type {\n    const v : [3]u64 = [10, 20, 30];\n    assert(sum(&v) == 60);\n}\n\ntest repeated {\n    const z : [4]u8 = [@as(u8, 0)] ** 4;\n    assert(bytes(&z) == 4);\n    const y : [N]u8 = [0xFF] ** N;\n    assert(bytes(&y) == 4);\n    const e : [0]u8 = [];\n    assert(bytes(&e) == 0);\n}\n\n"));
+    assert(st[NOK] == 7);
+}
+
+test negative_control_a_vec_the_fn_pushes_to_assigns_into_or_takes_by_mut_stays_refused {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn consume(v: Vec<u8>) -> usize { v.len() }\n#[test]\nfn pushed() {\n    let mut v = vec![1u8];\n    v.push(2);\n    assert_eq!(v.len(), 2);\n}\n#[test]\nfn assigned() {\n    let mut v = vec![1u8, 2];\n    v[0] = 5;\n    assert_eq!(bytes(&v), 2);\n}\n#[test]\nfn taken_by_mut() {\n    let mut v = vec![1u8, 2];\n    let r = &mut v;\n    assert_eq!(bytes(&v), 2);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nfn consume(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn pushed (line 4): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 5\n\n// t27o: refused fn assigned (line 10): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 11\n\n// t27o: refused fn taken_by_mut (line 16): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 17\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test negative_control_a_vec_the_fn_hands_on_whole_stays_refused_and_a_shadowing_let_ends_its_scope {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn consume(v: Vec<u8>) -> usize { v.len() }\n#[test]\nfn moved() {\n    let v = vec![1u8, 2];\n    assert_eq!(consume(v), 2);\n}\n#[test]\nfn rebound() {\n    let v = vec![1u8, 2];\n    let w = v;\n    assert_eq!(bytes(&w), 2);\n}\n#[test]\nfn shadowed_then_pushed() {\n    let v = vec![1u8, 2];\n    assert_eq!(bytes(&v), 2);\n    let mut v = vec![7u8];\n    v.push(1);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\nfn consume(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn moved (line 4): a vec! the fn hands on or returns `vec` at line 5\n\n// t27o: refused fn rebound (line 9): a vec! the fn hands on or returns `vec` at line 10\n\n// t27o: refused fn shadowed_then_pushed (line 15): a vec! the fn changes (push, resize, assign into, &mut) `vec` at line 18\n\n"));
+    assert(st[NOK] == 2);
+}
+
+test negative_control_an_unknown_element_type_or_length_and_a_vec_that_is_no_let_value_stay_refused {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bytes(v: &[u8]) -> usize { v.len() }\nfn runtime(n: usize) -> usize {\n    let v = vec![0u8; n];\n    v.len()\n}\nfn expr_count() {\n    let v = vec![0u8; 2 + 2];\n    assert_eq!(bytes(&v), 4);\n}\n#[test]\nfn unknown_type() {\n    let v = vec![1, 2, 3];\n    assert_eq!(v.len(), 3);\n}\n#[test]\nfn a_call_argument_is_not_a_let() {\n    let u = bytes(&vec![1u8]);\n}", &out, &st);
+    assert(out_is(n, &out, 0, "fn bytes(v: []const u8) -> usize {\n    return v.len;\n}\n\n// t27o: refused fn runtime (line 2): a vec! whose element type or length t27o cannot tell `vec` at line 3\n\nfn runtime(n: usize) -> usize {\n}\n\n// t27o: refused fn expr_count (line 6): a vec! whose element type or length t27o cannot tell `vec` at line 7\n\nfn expr_count() -> void {\n}\n\n// t27o: refused fn unknown_type (line 11): a vec! whose element type or length t27o cannot tell `vec` at line 12\n\n// t27o: refused fn a_call_argument_is_not_a_let (line 16): macro `vec` at line 17\n\n"));
+    assert(st[NOK] == 1);
+}
+
+test negative_control_a_test_that_reaches_a_refused_fn_through_super_is_refused_with_it {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    const n : usize = body("fn bad(s: &str) -> usize { s.len().saturating_sub(1) }\nfn good(s: &str) -> usize { s.len() }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn through_super_to_a_refused_fn() { assert_eq!(super::bad(\"ab\"), 1); }\n    #[test]\n    fn through_super_to_a_converted_fn() { assert_eq!(super::good(\"ab\"), 2); }\n    #[test]\n    fn through_super_to_a_fn_nobody_here_declares() { assert_eq!(super::elsewhere(\"ab\"), 2); }\n}", &out, &st);
+    assert(out_is(n, &out, 0, "// t27o: refused fn bad (line 1): method `saturating_sub` at line 1\n\nfn bad(s: []const u8) -> usize {\n}\n\nfn good(s: []const u8) -> usize {\n    return s.len;\n}\n\n// t27o: refused fn through_super_to_a_refused_fn (line 6): uses refused `bad` at line 6\n\ntest through_super_to_a_converted_fn {\n    assert(good(\"ab\") == 2);\n}\n\n// t27o: refused fn through_super_to_a_fn_nobody_here_declares (line 10): undeclared `elsewhere` at line 10\n\n"));
+    assert(st[NOK] == 2);
 }
 
 test ok_and_err_comparisons_in_a_test_read_a_result_as_an_optional {
