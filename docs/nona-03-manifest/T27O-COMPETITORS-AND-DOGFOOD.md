@@ -55,6 +55,11 @@ First refused construct per item, 17,015 refusals in total, by kind:
 The single largest reasons: type `Vec` 1,419, macro `vec!` 1,363, type `String` 680, type `Err` 612,
 tuple 550, type `Ok` 473, `self` of a refused type 412, type `Path` 402, for over `&...` 380.
 
+After the five classes of #10526 (PR #10593, measured on its branch against master 0c98c9641 with the
+same files and caps): 1,667 fns converted (was 1,573) and 593 tests (was 504); first refusals type `Ok`
+474 -> 2, `Err` 609 -> 0, for over `&...` 380 -> 4, `]` 306 -> 59, raw strings 154 -> 0, line
+continuations 88 -> 0.
+
 What the numbers say [I]: owned heap values (`Vec`, `vec!`, `String`, `Path`) are about a quarter of
 all first refusals, and the cascade multiplies every root refusal. Five classes need no new type at
 all (#10526: `Ok`/`Err` in test asserts, `for x in &[..]`, `&[]` arguments, raw strings, line
@@ -145,3 +150,40 @@ tests execute, but no test pins them one by one.
    of refusals.
 2. Vector quality: coverage-guided samples and a mutation score in the golden criteria (5 and 6).
 3. A Charon/MIR spike for the Rust front end (1).
+
+## 7. Beyond Rust: what the roadmap is written in [M; coarse where marked]
+
+Measured 2026-10-19 at the commits of section 1, tracked files only, excluding `node_modules`, vendored,
+`gen/`, `dist/`, `build/`, `target/`. "Distinct" deduplicates function bodies across the five
+repositories (trinity and trinity-fpga share most files). A first subset is ours, stated per language
+below; "pass" means the structure passes it, not that a converter ran. The measurement scripts were
+throw-away (Python's `ast`, the TypeScript 5.9.3 compiler API from a local cache, regex for Zig and
+shell); they are not committed, by the Only-t27 rule. #10543's sweep is the committed instrument for Rust.
+
+| Language | Files | Distinct fns | In a first subset | Top first blockers |
+|---|---|---|---|---|
+| Rust | 1,388 | 16,775 | 1,573 converted (9.4 %), 1,667 after #10593 | types (heap values), methods, macros |
+| Zig (coarse) | 2,644 | 36,495 | 3,797 (10.4 %) scalar and slice only; 7,767 (21.3 %) with same-file named types; 13,900 (38.1 %) with `*T` self | error union 41.8 %, pointer 29.9 %, named type 16.8 %, std or allocator 6.9 % |
+| TypeScript | 3,654 | 9,746 | 243 (2.5 %); 123 (1.3 %) also fully annotated | async / await 26.4 %, object literal, import, destructured parameter |
+| Python | 1,641 | 6,468 | 237 (3.7 %); 58 (0.9 %) also annotated inside the subset | import use, tuple, method outside the table, the cascade, `self` state |
+| Shell (coarse) | 812 | - | pure computation is 1.4-2.1 % of scripts | 74-82 % are orchestration (git, gh, curl, docker, cargo) |
+
+Subsets: Rust is `rust_convert.t27`'s. Zig: primitive scalars and slices in signature and body. Python:
+no async, yield, lambda, nested def, decorators other than `@staticmethod`, `*args`, `with`, `try`,
+`global`; calls only to pure builtins, `math`, a table of str and bytes methods and same-module
+functions; no tuple, dict or set, I/O or import use. TypeScript: the same idea on its syntax tree
+(no type checker). Zig's 1,947 of 2,644 files carry `test` blocks (19,594 `expectEqual`), which can be
+the oracle a Zig front end replays.
+
+Roadmap stages: stage 1 (#4543, the swarm's Python and shell tools) holds 2,395 distinct Python fns, 110
+passing (4.6 %); stage 3 (#4545, app.t27.ai backends) 4,027 TypeScript fns, 92 passing; stage 5 (#4547,
+the Zig core) 24,062 Zig fns in trinity `src` and 5,828 in trios crates; stage 6 (#4548) is the Rust of
+section 1. Stages 2 and 4 live in repositories that were not checked out (unknown); stage 7's 4,899
+Verilog files were not measured.
+
+The ranking this gives [I]: (1) a Zig front end (#10597): the largest pool, the closest grammar, its own
+tests as the oracle; (2) deeper Rust (`Vec` without a heap #10546, tuples, traits): no new parser;
+(3) Python (#8995, #9006): small pool, mostly numeric format models; (4) TypeScript: a quarter of the
+fns are async, so progress there means pulling pure decisions out of I/O code, not a subset front end;
+(5) shell: orchestration, almost nothing to convert.
+
