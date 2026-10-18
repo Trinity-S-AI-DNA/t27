@@ -724,7 +724,7 @@ void read_body(uint8_t* t, size_t bs, size_t be, size_t issue, size_t* crit, siz
         } else if (fence) {
             last = NONE;
         } else if (starts(t, s, le, "<!--", 4)) {
-            if ((holds(t, (s + 4), le, "-->", 3) == false)) {
+            if ((holds(t, (s + 2), le, "-->", 3) == false)) {
                 comment = true;
             }
             last = NONE;
@@ -2323,6 +2323,66 @@ void test_a_row_text_is_cut_at_two_hundred_bytes(void) {
     assert((buf_has(&out, m, "...\n- C3 #7 judge judgment: a~b?\n", 33) == true));
 }
 
+void test_later_commands_keep_their_own_outcomes(void) {
+    uint8_t out[8192] = {0};
+    size_t m = body_report("## Success Criteria\n- `t27c test specs/a.t27`\n- `t27c test specs/b.t27`, exits 1\n", 81, &out);
+    assert((buf_has(&out, m, "- C1 #7 judge machine: `t27c test specs/a.t27`\n  - `t27c test specs/a.t27` expects exit 0: not run\n- C2 #7 judge machine: `t27c test specs/b.t27`, exits 1\n  - `t27c test specs/b.t27` expects exit 1: not run\n", 207) == true));
+    m = body_report("## Success Criteria\n- `t27c test specs/a.t27` exits 0\n- `t27c test specs/b.t27` exits 1, exits 0\n", 97, &out);
+    assert((buf_has(&out, m, "- C1 #7 judge machine: `t27c test specs/a.t27` exits 0\n", 55) == true));
+    assert((buf_has(&out, m, "- C2 #7 judge partial: `t27c test specs/b.t27` exits 1, exits 0\n", 64) == true));
+    m = body_report("## Success Criteria\n- `t27c test specs/a.t27`\n- `t27c test-report specs/b.t27` 3/3 pass, 4/4 pass\n", 98, &out);
+    assert((buf_has(&out, m, "- C2 #7 judge partial: `t27c test-report specs/b.t27` 3/3 pass, 4/4 pass\n", 73) == true));
+    m = body_report("## Success Criteria\n- `t27c test-report specs/a.t27` 4/4 pass\n- `t27c test-report specs/b.t27` 3/3 pass, 4/4 pass\n", 114, &out);
+    assert((buf_has(&out, m, "- C1 #7 judge machine: `t27c test-report specs/a.t27` 4/4 pass\n", 63) == true));
+    assert((buf_has(&out, m, "- C2 #7 judge partial: `t27c test-report specs/b.t27` 3/3 pass, 4/4 pass\n", 73) == true));
+}
+
+void test_a_planned_run_with_no_result_is_not_run(void) {
+    uint8_t inp[1024] = {0};
+    uint8_t out[8192] = {0};
+    size_t w = put_issue(&inp, 1024, 0, 7, "## Success Criteria\n- `t27c parse specs/a.t27`\n- `t27c parse specs/b.t27`\n", 74);
+    w = put_run(&inp, 1024, w, "X\tparse\tspecs/a.t27\t0\t", 22, "", 0);
+    size_t m = report_of(&inp, w, &out);
+    assert((buf_has(&out, m, "- C1 #7 met machine: `t27c parse specs/a.t27`\n  - `t27c parse specs/a.t27` expects exit 0: met -- exit 0\n- C2 #7 judge machine: `t27c parse specs/b.t27`\n  - `t27c parse specs/b.t27` expects exit 0: not run\n", 206) == true));
+}
+
+void test_records_cut_at_their_last_byte(void) {
+    uint8_t inp[1024] = {0};
+    uint8_t out[8192] = {0};
+    size_t w = put_issue(&inp, 1024, 0, 7, "## Success Criteria\n- `t27c test-report specs/a.t27` 2/2 pass", 61);
+    w = put_run(&inp, 1024, w, "X\ttest-report\tspecs/a.t27\t0\t", 28, "  tests       2\n  pass        2", 31);
+    size_t m = report_of(&inp, w, &out);
+    assert((buf_has(&out, m, "- C1 #7 met machine: `t27c test-report specs/a.t27` 2/2 pass\n  - `t27c test-report specs/a.t27` expects exit 0, 2/2 pass: met -- exit 0, tests 2, pass 2, FAIL ?, vacuous ?\n", 172) == true));
+    uint8_t x26[26] = {0};
+    assert((put_str(&x26, 26, 0, "X\tparse\tspecs/a.t27\t0\t3\nab", 26) == 26));
+    m = report_of(&x26, 26, &out);
+    assert((buf_has(&out, m, "unreadable input", 16) == true));
+}
+
+void test_body_lines_at_their_edges(void) {
+    uint8_t out[8192] = {0};
+    size_t m = body_report("## Success Criteria\n| --- | :-: |\n|a|\n- base\n   \n  more\n. dot\n123. three\n- SC-7x tail\n<!-->\n- shown\n", 100, &out);
+    assert((buf_has(&out, m, "0 of 7 criteria settled by command: 0 met, 0 unmet; 7 left to judge\n", 68) == true));
+    assert((buf_has(&out, m, "- C1 #7 judge judgment: |a|\n- C2 #7 judge judgment: base\n- C3 #7 judge judgment: more\n- C4 #7 judge judgment: . dot\n- C5 #7 judge judgment: three\n- C6 #7 judge judgment: x tail\n- C7 #7 judge judgment: shown\n\nmet/unmet", 217) == true));
+}
+
+void test_helpers_hold_off_center(void) {
+    uint8_t hx[32] = {0};
+    assert((put_str(&hx, 32, 0, "xxxxxDone when", 14) == 14));
+    assert((is_head(&hx, 5, 9) == false));
+    assert((is_head(&hx, 5, 14) == true));
+    uint8_t sx[4] = {0};
+    assert((put_str(&sx, 4, 0, "xabc", 4) == 4));
+    assert((starts(&sx, 1, 2, "abc", 3) == false));
+    assert((starts(&sx, 1, 4, "abc", 3) == true));
+    uint8_t px[11] = {0};
+    assert((put_str(&px, 11, 0, "xspecs/.t27", 11) == 11));
+    assert((path_ok(&px, 1, 11) == false));
+    uint8_t cx[21] = {0};
+    assert((put_str(&cx, 21, 0, "  tests   \n  tests 3\n", 21) == 21));
+    assert((count_line(&cx, 0, 21, "tests", 5) == 3));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -2368,7 +2428,12 @@ int main(void) {
     test_thirty_two_issues_are_read_and_the_thirty_third_is_not();
     test_the_criteria_and_command_caps_hold_at_their_edges();
     test_a_row_text_is_cut_at_two_hundred_bytes();
-    printf("All %d tests passed.\n", 37);
+    test_later_commands_keep_their_own_outcomes();
+    test_a_planned_run_with_no_result_is_not_run();
+    test_records_cut_at_their_last_byte();
+    test_body_lines_at_their_edges();
+    test_helpers_hold_off_center();
+    printf("All %d tests passed.\n", 42);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
