@@ -19,6 +19,7 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Queue cost: which workflow holds the runners, and what the queued runs wait for | `specs/claw/queue_cost.t27` (job rows and queued-run rows in, two summary lines out; not wired to a job yet) | #10600 |
 | Push gate: whether a lane push helps the PR or only restarts its required checks | `specs/claw/push_gate.t27` (push kind and three flags in, one `V` line out: push, hold or skip; not wired to a job yet) | #10606 |
 | Check state: whether a PR's checks are red, pending, none or green, with a queued check read as pending and a commit status read by its state | `specs/claw/check_state.t27` (rollup rows in, a count line and one `V` line out; keeps the PR Dashboard's current per-PR rule as a named function; not wired to a job yet) | #10617 |
+| Check latest: a re-run supersedes the run it replaces, so an old failure next to its queued re-run reads pending, not red | `specs/claw/check_latest.t27` (rollup rows with name and run id in; per name the largest run id is live, classed by check_state; three lines out; not wired to a job yet) | #10617 |
 | Model routing: Opus 5.5 orchestrates, Sonnet 5.5 runs sub-tasks | `specs/claw/model_route.t27`, skill `model-routing`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-18 |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
