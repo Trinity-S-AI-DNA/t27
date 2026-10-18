@@ -27,6 +27,7 @@
 #define R_DATA 5
 #define R_NOT_CODE 6
 #define R_EXCEPTION 7
+#define R_MODIFIED 8
 #define DENY_FROM 16
 #define R_FOREIGN_EXT 16
 #define R_FOREIGN_NAME 17
@@ -67,6 +68,7 @@ bool has_prefix(uint8_t* list, uint8_t* s, size_t from, size_t to);
 bool is_letter_of(uint8_t* list, uint8_t c);
 size_t base_start(uint8_t* s, size_t from, size_t to);
 size_t ext_dot(uint8_t* s, size_t from, size_t to);
+uint8_t existing(uint8_t kind, uint8_t r);
 uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to);
 uint8_t verdict(uint8_t r);
 uint8_t classify(uint8_t kind, uint8_t* s, size_t from, size_t to);
@@ -184,6 +186,13 @@ size_t ext_dot(uint8_t* s, size_t from, size_t to) {
     return d;
 }
 
+uint8_t existing(uint8_t kind, uint8_t r) {
+    if ((kind == 'M')) {
+        return R_MODIFIED;
+    }
+    return r;
+}
+
 uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to) {
     if ((is_letter_of(KINDS, kind) == false)) {
         return R_MALFORMED;
@@ -214,14 +223,14 @@ uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to) {
         return R_SPEC;
     }
     if (in_list(FOREIGN_NAMES, s, b, t, false)) {
-        return R_FOREIGN_NAME;
+        return existing(kind, R_FOREIGN_NAME);
     }
     if (has_prefix(FOREIGN_NAME_PREFIXES, s, b, t)) {
-        return R_FOREIGN_NAME;
+        return existing(kind, R_FOREIGN_NAME);
     }
     if ((d < t)) {
         if (in_list(FOREIGN_EXTS, s, (d + 1), t, true)) {
-            return R_FOREIGN_EXT;
+            return existing(kind, R_FOREIGN_EXT);
         }
         if (in_list(PROSE_EXTS, s, (d + 1), t, true)) {
             return R_PROSE;
@@ -232,7 +241,7 @@ uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to) {
         return R_NOT_CODE;
     }
     if (has_prefix(SCRIPT_DIRS, s, f, t)) {
-        return R_SCRIPT_NO_EXT;
+        return existing(kind, R_SCRIPT_NO_EXT);
     }
     return R_NOT_CODE;
 }
@@ -419,7 +428,7 @@ uint32_t check_all(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
 }
 
 bool counts_against_budget(uint8_t* s, size_t from, size_t to) {
-    uint8_t r = reason('M', s, from, to);
+    uint8_t r = reason('A', s, from, to);
     if ((((r == R_FOREIGN_EXT) || (r == R_FOREIGN_NAME)) || (r == R_SCRIPT_NO_EXT))) {
         return true;
     }
@@ -540,6 +549,7 @@ uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_DATA) == ALLOW) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_NOT_CODE) == ALLOW) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_EXCEPTION) == ALLOW) */
+/* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_MODIFIED) == ALLOW) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_FOREIGN_EXT) == DENY) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_FOREIGN_NAME) == DENY) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_SCRIPT_NO_EXT) == DENY) */
@@ -562,9 +572,33 @@ void test_negative_control_hand_written_rust_is_denied(void) {
     assert((reason('A', "tools/new_tool.rs", 0, 17) == R_FOREIGN_EXT));
 }
 
-void test_modifying_t27b_rust_is_denied(void) {
-    assert((classify('M', "cli/t27b/src/lower.rs", 0, 21) == DENY));
-    assert((classify('M', "bootstrap/src/compiler.rs", 0, 25) == DENY));
+void test_modifying_existing_foreign_code_needs_no_label(void) {
+    assert((classify('M', "cli/t27b/src/lower.rs", 0, 21) == ALLOW));
+    assert((reason('M', "bootstrap/src/compiler.rs", 0, 25) == R_MODIFIED));
+    assert((reason('M', "Dockerfile", 0, 10) == R_MODIFIED));
+    assert((reason('M', "scripts/tri", 0, 11) == R_MODIFIED));
+    assert((reason('M', ".github/workflows/cli-tri.yml", 0, 29) == R_MODIFIED));
+}
+
+void test_a_new_foreign_file_still_needs_the_label(void) {
+    assert((classify('A', "cli/t27b/src/lower.rs", 0, 21) == DENY));
+    assert((reason('R', "cli/t27b/src/lower.rs", 0, 21) == R_FOREIGN_EXT));
+    assert((reason('C', "scripts/tri", 0, 11) == R_SCRIPT_NO_EXT));
+    assert((reason('T', "Dockerfile", 0, 10) == R_FOREIGN_NAME));
+}
+
+void test_the_most_important_files_still_need_the_label(void) {
+    assert((reason('M', "specs/policy/own_language.t27", 0, 29) == R_PROTECTED));
+    assert((reason('M', ".github/workflows/own-language.yml", 0, 34) == R_PROTECTED));
+    assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED));
+}
+
+void test_a_modified_foreign_file_is_still_held_by_the_budget(void) {
+    uint8_t out[512] = {0};
+    assert((counts_against_budget("cli/tri/src/gates.rs", 0, 20) == true));
+    assert((counts_against_budget("Dockerfile", 0, 10) == true));
+    assert((check_budget("1\t0\tcli/tri/src/main.rs\n", 24, &out, 512) == 1));
+    assert((check_budget("0\t19\tcli/tri/src/gates.rs\n", 26, &out, 512) == 0));
 }
 
 void test_generated_zig_is_allowed(void) {
@@ -609,14 +643,14 @@ void test_prose_and_data_are_allowed(void) {
 
 void test_configuration_is_code(void) {
     assert((reason('A', "tools/x/lefthook.yml", 0, 20) == R_FOREIGN_EXT));
-    assert((reason('M', ".github/workflows/ci.yaml", 0, 25) == R_FOREIGN_EXT));
-    assert((reason('M', "bootstrap/Cargo.toml", 0, 20) == R_FOREIGN_EXT));
+    assert((reason('A', ".github/workflows/ci.yaml", 0, 25) == R_FOREIGN_EXT));
+    assert((reason('A', "bootstrap/Cargo.toml", 0, 20) == R_FOREIGN_EXT));
 }
 
 void test_build_files_are_code_by_name(void) {
     assert((reason('A', "Dockerfile", 0, 10) == R_FOREIGN_NAME));
     assert((reason('A', "deploy/Dockerfile.dev", 0, 21) == R_FOREIGN_NAME));
-    assert((reason('M', "fpga/Makefile", 0, 13) == R_FOREIGN_NAME));
+    assert((reason('A', "fpga/Makefile", 0, 13) == R_FOREIGN_NAME));
     assert((reason('A', "x/CMakeLists.txt", 0, 16) == R_FOREIGN_NAME));
     assert((reason('A', "tools/win.ps1", 0, 13) == R_FOREIGN_EXT));
 }
@@ -627,8 +661,8 @@ void test_extensions_fold_case(void) {
 }
 
 void test_an_extensionless_script_is_code(void) {
-    assert((reason('M', "scripts/tri", 0, 11) == R_SCRIPT_NO_EXT));
-    assert((reason('M', ".githooks/pre-commit", 0, 20) == R_SCRIPT_NO_EXT));
+    assert((reason('A', "scripts/tri", 0, 11) == R_SCRIPT_NO_EXT));
+    assert((reason('A', ".githooks/pre-commit", 0, 20) == R_SCRIPT_NO_EXT));
     assert((reason('M', "LICENSE", 0, 7) == R_NOT_CODE));
 }
 
@@ -676,9 +710,9 @@ void test_check_all_never_writes_past_cap(void) {
 }
 
 void test_an_owner_exception_allows_its_paths_only(void) {
-    assert((judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, false) == R_EXCEPTION));
-    assert((judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, true) == R_EXCEPTION));
-    assert((judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 0, false) == R_FOREIGN_EXT));
+    assert((judge('A', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, false) == R_EXCEPTION));
+    assert((judge('A', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, true) == R_EXCEPTION));
+    assert((judge('A', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 0, false) == R_FOREIGN_EXT));
     assert((excepted("cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 0, 34, 34, 55) == true));
 }
 
@@ -804,7 +838,10 @@ void test_check_budget_never_writes_past_cap(void) {
 #include <stdio.h>
 int main(void) {
     test_negative_control_hand_written_rust_is_denied();
-    test_modifying_t27b_rust_is_denied();
+    test_modifying_existing_foreign_code_needs_no_label();
+    test_a_new_foreign_file_still_needs_the_label();
+    test_the_most_important_files_still_need_the_label();
+    test_a_modified_foreign_file_is_still_held_by_the_budget();
     test_generated_zig_is_allowed();
     test_a_generated_root_is_a_prefix_not_a_substring();
     test_deleting_python_is_allowed();
@@ -836,7 +873,7 @@ int main(void) {
     test_many_small_files_meet_the_total();
     test_a_binary_file_adds_nothing_and_garbage_fails_closed();
     test_check_budget_never_writes_past_cap();
-    printf("All %d tests passed.\n", 33);
+    printf("All %d tests passed.\n", 36);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

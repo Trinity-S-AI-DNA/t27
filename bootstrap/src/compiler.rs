@@ -12,6 +12,26 @@ use serde::Serialize;
 #[path = "../gen/rust/compiler/verilog_aos_memory.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod verilog_aos_memory;
+// specs/compiler/cse_hoist.t27 (#8197), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/cse_hoist.rs"]
+#[allow(dead_code, unused_parens)]
+mod cse_hoist;
+// specs/compiler/int_type_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/int_type_names.rs"]
+#[allow(dead_code, unused_parens)]
+mod int_type_names;
+// specs/compiler/operator_text.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/operator_text.rs"]
+#[allow(dead_code, unused_parens)]
+mod operator_text;
+// specs/compiler/verilog_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_names.rs"]
+#[allow(dead_code, unused_parens)]
+mod verilog_names;
+// specs/compiler/hir_cost_models.t27 (t27o port, #9114), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/hir_cost_models.rs"]
+#[allow(dead_code, unused_parens)]
+mod hir_cost_models;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -5000,7 +5020,7 @@ the parser used to read it as `{}` followed by a negation",
     /// Consume the type that follows an `as` cast, e.g. `u32`, `i8`, or an
     /// array form like `u8[4]`. Returns the textual type for diagnostics.
     /// The base type name is validated against the known scalar type set so
-    /// that a typo like `x as u3` or `x as banana` is rejected at parse time
+    /// that `x as u0` or `x as banana` (uN: specs/compiler/int_type_names.t27) is rejected at parse time
     /// instead of silently lowering to a 32-bit default.
     fn parse_cast_target_type(&mut self) -> Result<String, String> {
         if self.current.kind != TokenKind::Ident {
@@ -5026,7 +5046,7 @@ the parser used to read it as `{}` followed by a negation",
             "bool", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize",
             "f32", "f64",
         ];
-        if !VALID_CAST_TYPES.contains(&base.as_str()) {
+        if !VALID_CAST_TYPES.contains(&base.as_str()) && int_type_names::uint_bits(base.as_bytes()).is_none() {
             // f32/f64 parse in DECLARATIONS, so "unknown type" would be a lie here.
             // The truth is narrower: no backend lowers float arithmetic -- the C
             // generator emits the literal token `f32`, which is not a C type, and
@@ -5043,7 +5063,7 @@ the parser used to read it as `{}` followed by a negation",
                 ));
             }
             return Err(format!(
-                "unknown cast target type `{}`; expected one of {:?}",
+                "unknown cast target type `{}`; expected one of {:?} or uN, 1 <= N <= 64",
                 base, VALID_CAST_TYPES
             ));
         }
@@ -7385,6 +7405,19 @@ the parser used to read it as `{}` followed by a negation",
 // Code Generator
 // ============================================================================
 
+/// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
+const HOST_IO_ZIG: &str = r#"
+const __t27_posix = @import("std").posix;
+fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
+    const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
+    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+}
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -7520,20 +7553,6 @@ impl Codegen {
         }
     }
 
-    /// W566: bit-width of a t27 UNSIGNED integer type, or None otherwise.
-    /// Restricted to unsigned because Zig's `@truncate` only lowers a narrowing
-    /// cast cleanly when both sides are unsigned; signed narrowing stays on the
-    /// checked `@intCast` path (its previous, working behaviour).
-    fn zig_uint_bits(ty: &str) -> Option<u32> {
-        match ty.trim() {
-            "u8" => Some(8),
-            "u16" => Some(16),
-            "u32" => Some(32),
-            "u64" | "usize" => Some(64),
-            _ => None,
-        }
-    }
-
     /// W566: best-effort bit-width of an expression that is provably an UNSIGNED
     /// integer, using the param/typed-local map. Returns None when the type is
     /// signed or unknown, so the cast emission falls back to `@intCast`.
@@ -7541,18 +7560,18 @@ impl Codegen {
         match node.kind {
             NodeKind::ExprIdentifier => {
                 let ty = self.zig_var_types.get(&node.name)?;
-                Self::zig_uint_bits(ty)
+                int_type_names::zig_uint_bits(ty.as_bytes())
             }
             NodeKind::ExprCast => {
                 let target = node.extra_type.split('[').next().unwrap_or("").trim();
-                Self::zig_uint_bits(target)
+                int_type_names::zig_uint_bits(target.as_bytes())
             }
             NodeKind::ExprLiteral => {
                 let ty = node.extra_type.as_str();
                 if ty.is_empty() {
                     None
                 } else {
-                    Self::zig_uint_bits(ty)
+                    int_type_names::zig_uint_bits(ty.as_bytes())
                 }
             }
             NodeKind::ExprBinary => {
@@ -8284,6 +8303,12 @@ impl Codegen {
                 self.gen_decl(decl);
             }
         }
+        // `--backend ml`: the host's file syscalls, only for a spec that calls them.
+        let mut host = false;
+        Self::visit_calls(&ast.children, &mut |c| host |= matches!(c.name.as_str(), "host_open" | "host_read" | "host_write" | "host_close"));
+        if host {
+            self.write(HOST_IO_ZIG);
+        }
     }
 
     /// Generate Zig code with project-aware import resolution.
@@ -8560,7 +8585,7 @@ impl Codegen {
     // rejects the bare name with "name shadows primitive". Applied at every
     // value-identifier emission site so declarations and uses stay consistent.
     fn is_numeric_type_suffix(t: &str) -> bool {
-        is_integer_type_suffix(t) || matches!(t, "f32" | "f64")
+        int_type_names::is_integer_type_suffix(t.as_bytes()) || matches!(t, "f32" | "f64")
     }
 
     /// Re-escape a string the lexer already unescaped, so it can be written
@@ -9031,10 +9056,12 @@ impl Codegen {
         // every body reference keeps its spec name.
         let mut body_muts: std::collections::HashSet<String> = std::collections::HashSet::new();
         collect_mutable_names(&node.children, &mut body_muts);
+        // #8641: a write THROUGH a pointer or slice parameter (`p.* = `, `s[i] = `) is no reassignment of it.
+        fn reassigned(nodes: &[Node], name: &str) -> bool { nodes.iter().any(|n| (n.kind == NodeKind::StmtAssign && n.children.first().map_or(false, |l| l.kind == NodeKind::ExprIdentifier && l.name == name)) || reassigned(&n.children, name)) }
         let shadowed: Vec<String> = node
             .params
             .iter()
-            .filter(|(pname, _)| pname != "self" && body_muts.contains(pname))
+            .filter(|(pname, ptype)| pname != "self" && body_muts.contains(pname) && (!(ptype.trim_start().starts_with('*') || ptype.trim_start().starts_with("[]")) || reassigned(&node.children, pname)))
             .map(|(pname, _)| pname.clone())
             .collect();
 
@@ -9208,16 +9235,6 @@ impl Codegen {
             self.write_indent();
             self.write_line("@compileError(\"not yet implemented\");");
         } else {
-            // The CSE pass can leave its `_cse*` temp declarations AFTER their
-            // first use in this backend's statement order (the Rust path hoists
-            // them). They are pure expressions over consts/params, so emitting
-            // them first is always safe -- and required: Zig resolves locals
-            // lexically.
-            for stmt in node.children.iter() {
-                if stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse") {
-                    self.gen_stmt(stmt);
-                }
-            }
             // #6315: a non-void body's tail expression is its return value.
             let ret_ty = node.extra_return_type.trim();
             let mut body: Vec<Node> = node.children.clone();
@@ -9225,9 +9242,7 @@ impl Codegen {
                 Self::zig_tail_returns(&mut body);
             }
             for stmt in body.iter() {
-                if !(stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse")) {
-                    self.gen_stmt(stmt);
-                }
+                self.gen_stmt(stmt);
             }
         }
 
@@ -9621,6 +9636,13 @@ impl Codegen {
         count_ident_assigns(&node.children, &mut assign_counts);
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         for stmt in &node.children {
+            // #8980: `then elapsed_time_ns < 100` names a clock a Zig 0.16 test lacks (no std.Io),
+            // and no bench_* fn is ever called; say the budget was not lowered, as for a bare `;`.
+            if mentions_clock(stmt) {
+                self.write_indent();
+                self.write_line("// bench budget not lowered: elapsed_time_* has no clock here (#8980)");
+                continue;
+            }
             let fresh_binding = self.block_fresh_binding(stmt, &mut bound);
             let tuple_binding = stmt.kind == NodeKind::StmtAssign
                 && stmt.children.len() >= 2
@@ -9979,11 +10001,14 @@ impl Codegen {
                         } else {
                             None
                         };
-                        match slice_elem {
+                        // #8602: a local DECLARED `[]T` gets the `@constCast(&[_]T{...})` slice fields get; `.{...}` is no slice
+                        let typed = Self::slice_element_type(&Self::t27_array_type_to_zig(&node.extra_type)).filter(|_| slice_elem.is_none() && node.children[0].kind == NodeKind::ExprArrayLiteral);
+                        match slice_elem.or(typed.clone()) {
                             Some(t) => {
-                                self.write(&format!("[_]{}", t));
+                                self.write(&format!("{}[_]{}", if typed.is_some() { "@constCast(&" } else { "" }, t));
                                 let lit = node.children[0].clone();
                                 self.gen_array_literal_braces(&lit);
+                                if typed.is_some() { self.write(")"); }
                             }
                             None => {
                                 // W624: `let n : u32 = s.len();`. Third of the
@@ -10003,7 +10028,7 @@ impl Codegen {
                                     if self.len_tainted_int_expr(&init) {
                                         self.len_locals.insert(node.name.clone());
                                     }
-                                    self.gen_expr(&node.children[0]);
+                                    let own = self.param_renames.remove(&node.name); self.gen_expr(&node.children[0]); if let Some(r) = own { self.param_renames.insert(node.name.clone(), r); } // #8416: an initializer never reads its own local (`const PI = constants::PI;` is the outer PI)
                                 }
                             }
                         }
@@ -10357,7 +10382,7 @@ impl Codegen {
             }
             NodeKind::ExprEnumValue => {
                 self.write(".");
-                self.write(&node.name);
+                self.write(&Self::zig_ident(&node.name));
             }
             NodeKind::ExprCall => {
                 // W572: a method call whose receiver could not be folded into
@@ -10413,7 +10438,7 @@ impl Codegen {
                         // Integers only: a float cast needs @floatCast or
                         // @intFromFloat, and guessing between them would be a
                         // silent semantic choice.
-                        if is_integer_type_suffix(target) {
+                        if int_type_names::is_integer_type_suffix(target.as_bytes()) {
                             self.write(&format!("@as({}, @intCast(", target));
                             self.gen_expr(&node.children[0]);
                             self.write("))");
@@ -10436,6 +10461,16 @@ impl Codegen {
                         "round" => Some("@round"),
                         "min" => Some("@min"),
                         "max" => Some("@max"),
+                        // #8980: `exp(` 56 times, `log(` 28, `tanh(` 21 (Zig has no `@tanh`).
+                        "exp" => Some("@exp"),
+                        "log" => Some("@log"),
+                        "sin" => Some("@sin"),
+                        "cos" => Some("@cos"),
+                        "tanh" => Some("std.math.tanh"),
+                        "host_open" => Some("__t27_host_open"),
+                        "host_read" => Some("__t27_host_read"),
+                        "host_write" => Some("__t27_host_write"),
+                        "host_close" => Some("__t27_host_close"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -10753,7 +10788,7 @@ impl Codegen {
             NodeKind::ExprUnary => {
                 self.write(&node.extra_op);
                 if !node.children.is_empty() {
-                    self.gen_expr(&node.children[0]);
+                    self.gen_expr_maybe_paren(&node.children[0]); // #6549: -(a + b), never -a + b
                 }
             }
             NodeKind::ExprFieldAccess => {
@@ -10779,13 +10814,13 @@ impl Codegen {
             NodeKind::ExprIndex => {
                 // children[0] = base, children[1] = index
                 // W605: a slice carries a third child (the end) and lowers to
-                // Zig's `[a..b]` -- the same half-open range the source means.
-                if node.extra_op == "slice" && node.children.len() >= 3 {
+                // Zig's `[a..b]`; `slice_open` has no end and is `[a..]` (#8200).
+                if node.extra_op.starts_with("slice") && node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
                     self.write("[");
                     self.gen_expr(&node.children[1]);
                     self.write("..");
-                    self.gen_expr(&node.children[2]);
+                    if let Some(end) = node.children.get(2) { self.gen_expr(end); }
                     self.write("]");
                 } else if node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
@@ -10814,7 +10849,7 @@ impl Codegen {
                             if is_numeric {
                                 self.write(&case_node.name);
                             } else {
-                                self.write(&format!(".{}", case_node.name));
+                                self.write(&format!(".{}", Self::zig_ident(&case_node.name))); // #8621: `.error` is `.@"error"`
                             }
                         } else {
                             self.write("else");
@@ -11012,7 +11047,7 @@ impl Codegen {
                             (false, false) => unreachable!(),
                         }
                     } else {
-                        let target_bits = Self::zig_uint_bits(&target);
+                        let target_bits = int_type_names::zig_uint_bits(target.as_bytes());
                         let src_bits = self.zig_expr_uint_bits(&node.children[0]);
                         let narrowing = match (src_bits, target_bits) {
                             (Some(s), Some(t)) => s > t,
@@ -11335,12 +11370,10 @@ impl VerilogCodegen {
         self.imported_enums = enums;
     }
 
-    // Restored from Wave Loop 455 (same botched merge).
+    // Restored from Wave Loop 455 (same botched merge). The body is
+    // specs/compiler/verilog_names.t27, lowered by `t27c gen-rust` (#9115).
     fn is_simple_tuple_type(ty: &str) -> bool {
-        ty.starts_with('(')
-            && ty.ends_with(')')
-            && !ty.contains(':')
-            && !ty.is_empty()
+        verilog_names::is_simple_tuple_type(ty.as_bytes())
     }
 
     // Restored from Wave Loop 455 (same botched merge).
@@ -17577,7 +17610,7 @@ impl VerilogCodegen {
                         self.in_lvalue = true;
                         self.gen_verilog_expr(lhs);
                         self.in_lvalue = false;
-                        if let Some(op) = compound_binop(&node.extra_op) {
+                        if let Some(op) = operator_text::compound_binop(node.extra_op.as_bytes()) {
                             self.write(asn);
                             self.gen_verilog_expr(lhs);
                             self.write(&format!(" {} ", op));
@@ -19145,18 +19178,6 @@ pub struct CCodegen {
     local_tuple_counter: u32,
 }
 
-/// The integer width suffix of a typed builtin -- `cast_i8`, `abs_i16`.
-///
-/// A free function rather than a method: `gen-zig` has recognised these since
-/// W570 and `gen-c` learned it in #3497, and a second copy is how one backend
-/// grows a spelling the other refuses.
-fn is_integer_type_suffix(t: &str) -> bool {
-    matches!(
-        t,
-        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-    )
-}
-
 impl CCodegen {
     pub fn new() -> Self {
         Self {
@@ -19998,7 +20019,7 @@ long double: fabsl, default: llabs)(x)",
         // (#2846) -- must not be promoted from a comment to code. The comment
         // was hiding it; making it a `_Static_assert` turns one silent defect
         // into a syntax error that cascades through the rest of the file.
-        if Self::has_empty_operand(text) {
+        if operator_text::has_empty_operand(text.as_bytes()) {
             return false;
         }
         // `const_defs` alone is too narrow: requiring it rejects 1742
@@ -20018,32 +20039,6 @@ long double: fabsl, default: llabs)(x)",
         Self::identifiers_in(text)
             .iter()
             .all(|n| Self::is_c_word(n) || self.declares(n))
-    }
-
-    /// Does an operator in this rendered expression have nothing after it?
-    ///
-    /// `(BOARD_NAME != )` is the shape: the renderer dropped the right-hand
-    /// side. Ten specs in `boards/` and `fpga/` carry one.
-    fn has_empty_operand(text: &str) -> bool {
-        let b = text.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if matches!(b[i], b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' | b'^') {
-                let mut j = i + 1;
-                while j < b.len()
-                    && matches!(b[j], b'=' | b'<' | b'>' | b'&' | b'|' | b' ')
-                {
-                    j += 1;
-                }
-                if j >= b.len() || b[j] == b')' {
-                    return true;
-                }
-                i = j;
-                continue;
-            }
-            i += 1;
-        }
-        false
     }
 
     /// A repeated element this emitter writes as a C value: a non-string
@@ -21002,16 +20997,6 @@ long double: fabsl, default: llabs)(x)",
         self.dedent();
         self.write_line("};");
         self.write_line("");
-    }
-
-    /// C return type for a t27 return type: a tuple lowers to its hoisted
-    /// struct typedef name, everything else to the usual C type.
-    fn c_return_type(ty: &str) -> String {
-        if let Some((name, _)) = Self::c_tuple_info(ty) {
-            name
-        } else {
-            Self::param_type_to_c(ty)
-        }
     }
 
     fn gen_c_fn_prototype(&mut self, node: &Node) {
@@ -22375,7 +22360,7 @@ long double: fabsl, default: llabs)(x)",
                 }
                 if node.children.len() == 1 && !self.fn_param_types.contains_key(&node.name) {
                     if let Some(target) = node.name.strip_prefix("cast_") {
-                        if is_integer_type_suffix(target) {
+                        if int_type_names::is_integer_type_suffix(target.as_bytes()) {
                             self.write(&format!("(({})(", Self::type_to_c(target)));
                             self.gen_c_expr(&node.children[0]);
                             self.write("))");
@@ -23028,37 +23013,6 @@ fn resolve_import_path(
 // Compiler Interface
 // ============================================================================
 
-/// The binary operator inside a compound assignment: "|=" -> "|".
-/// All three backends tested `extra_op == "+="` and fell through to " = " otherwise,
-/// so accepting a new compound operator without touching them would have emitted
-/// `x = rhs` for `x |= rhs` -- a miscompilation rather than an error.
-fn compound_binop(extra_op: &str) -> Option<&'static str> {
-    match extra_op {
-        "+=" => Some("+"),
-        "-=" => Some("-"),
-        "*=" => Some("*"),
-        // `/=` was missing, and the three call sites all fall back to a plain
-        // ` = `. So `scaled /= 2.0;` was emitted as `scaled = 2.0;` -- the
-        // division dropped and the variable overwritten with the divisor -- by
-        // the Zig, C AND Rust backends alike. Five occurrences in three specs
-        // (numeric/tf3.t27:139 and :253, ternary/hybrid_bigint.t27:168 and
-        // :235, server/sse.t27:265), every one of them valid output in the
-        // target language and none of them the stated program.
-        //
-        // `%=`, `<<=` and `>>=` do not occur in the corpus today. They are
-        // here because the failure mode of a missing entry is silence, and the
-        // next spec to use one must not pay for that.
-        "/=" => Some("/"),
-        "%=" => Some("%"),
-        "<<=" => Some("<<"),
-        ">>=" => Some(">>"),
-        "|=" => Some("|"),
-        "&=" => Some("&"),
-        "^=" => Some("^"),
-        _ => None,
-    }
-}
-
 /// A numeric lexeme split into its digits and its declared width.
 ///
 /// `1u64` -> `("1", "u64")`. The suffix rides in the lexeme so that `value`
@@ -23101,7 +23055,7 @@ fn unwrap_single(node: &Node) -> &Node {
 /// what the spec said, or the target compiler refuses it by name. Both are
 /// better than ` = `, which compiles and means something else.
 fn assign_op_text(extra_op: &str) -> String {
-    if let Some(op) = compound_binop(extra_op) {
+    if let Some(op) = operator_text::compound_binop(extra_op.as_bytes()) {
         return format!(" {}= ", op);
     }
     let t = extra_op.trim();
@@ -23170,7 +23124,7 @@ impl Compiler {
         for i in (0..lines.len()).rev() {
             block_end[i] = next_top;
             let l = lines[i];
-            if !l.is_empty() && !l.starts_with(' ') && !l.starts_with('}') {
+            if !l.is_empty() && !l.starts_with(' ') && !l.starts_with('}') && !matches!(l, "break;" | "continue;") { // #8565: an unindented break is not a new top-level block
                 next_top = i;
             }
         }
@@ -23970,12 +23924,10 @@ impl Compiler {
     }
 
     /// W534: built-in functions that the Verilog backend handles without a
-    /// source-level definition.
+    /// source-level definition. The body is specs/compiler/verilog_names.t27,
+    /// lowered by `t27c gen-rust` (#9115).
     fn is_icarus_builtin(name: &str) -> bool {
-        matches!(
-            name,
-            "__mul_noop" // injected R-SI-1 multiplication helper
-        )
+        verilog_names::is_icarus_builtin(name.as_bytes())
     }
 }
 
@@ -24305,17 +24257,23 @@ fn collect_param_names(
     out: &mut std::collections::HashMap<String, Vec<(String, String)>>,
 ) {
     if node.kind == NodeKind::FnDecl {
-        out.insert(node.name.clone(), node.params.clone());
+        let text = |p: &String, t: &String| t.trim() == "[]const u8" && owns_slice(&node.children, p); // #8971
+        out.insert(node.name.clone(), node.params.iter().map(|(p, t)| (p.clone(), if text(p, t) { "str".into() } else { t.clone() })).collect());
     }
     for c in &node.children {
         collect_param_names(c, out);
     }
 }
 
-/// Does the file slice (`x[a..b]`)? Only then is a `[]const u8` parameter bytes, not text.
-fn has_slice(n: &Node) -> bool {
-    (n.kind == NodeKind::ExprIndex && n.children.get(1).is_some_and(|i| i.extra_op == ".."))
-        || n.children.iter().any(has_slice)
+/// #8971: does a body return the slice `name`, copy it, store it or loop over it? Then it is owned, not borrowed.
+fn owns_slice(nodes: &[Node], name: &str) -> bool {
+    let is = |c: Option<&Node>| c.is_some_and(|c| c.kind == NodeKind::ExprIdentifier && c.name == name);
+    nodes.iter().any(|n| match n.kind {
+        NodeKind::ExprReturn | NodeKind::StmtFor | NodeKind::StmtLocal => is(n.children.first()),
+        NodeKind::StmtAssign => is(n.children.get(1)),
+        NodeKind::ExprStructLit => n.children.iter().any(|f| is(f.children.first())),
+        _ => false,
+    } || owns_slice(&n.children, name))
 }
 
 fn collect_written_slice_params(
@@ -24625,6 +24583,10 @@ fn return_unsized(elem: String) -> String {
 /// Substring matching is wrong here and cheaply so: `T` occurs inside `Trit`,
 /// `TritCell` and `Vec<Trit>`, and adding `<T>` to every function mentioning any
 /// of those would break signatures that were already correct.
+fn mentions_clock(n: &Node) -> bool {
+    (n.kind == NodeKind::ExprIdentifier && n.name.starts_with("elapsed_time_")) || n.children.iter().any(mentions_clock)
+}
+
 fn mentions_type(hay: &str, name: &str) -> bool {
     let bytes = hay.as_bytes();
     let mut from = 0usize;
@@ -25065,17 +25027,21 @@ fn unique_uncseable_key() -> String {
 
 fn common_subexpr_elim(stmts: &mut Vec<Node>, stats: &mut OptStats) {
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut counter: u32 = 0;
-    let mut new_stmts: Vec<Node> = Vec::new();
-    for stmt in stmts.iter_mut() {
+    let mut new_stmts: Vec<(usize, Node)> = Vec::new();
+    for u in 0..stmts.len() {
         let mut replacements: Vec<(String, String)> = Vec::new();
-        collect_cse_replacements(stmt, &seen, &mut replacements);
+        collect_cse_replacements(&stmts[u], &seen, &mut replacements);
+        // #8197: specs/compiler/cse_hoist.t27 decides; a refused repeat is forgotten, so it may be seen anew here.
+        replacements.retain(|(k, _)| cse_untouched(&stmts[..=u], k, seen_at[k]) || { seen.remove(k); false });
+        let stmt = &mut stmts[u];
         if !replacements.is_empty() {
             for (key, _) in &replacements {
                 let var_name = format!("_cse{}", counter);
                 counter += 1;
                 seen.insert(key.clone(), var_name.clone());
-                new_stmts.push(make_cse_local(&var_name, key));
+                new_stmts.push((u, make_cse_local(&var_name, stmt, key)));
                 stats.cse_eliminated += 1;
             }
             apply_cse_replacements(stmt, &seen);
@@ -25085,13 +25051,28 @@ fn common_subexpr_elim(stmts: &mut Vec<Node>, stats: &mut OptStats) {
                 let var_name = format!("_cse{}", counter);
                 counter += 1;
                 seen.insert(key.clone(), var_name);
+                seen_at.insert(key, u);
             }
         }
     }
-    let insert_pos = find_first_non_local(stmts);
-    for (i, local) in new_stmts.into_iter().enumerate() {
-        stmts.insert(insert_pos + i, local);
+    for (u, local) in new_stmts.into_iter().rev() {
+        stmts.insert(u, local);
     }
+}
+
+/// specs/compiler/cse_hoist.t27 for the repeat `key` in the last of `upto`, first seen at `seen_at`. A statement
+/// touches an operand when it assigns it, takes `&` of it, declares or captures it, or calls anything.
+fn cse_untouched(upto: &[Node], key: &str, seen_at: usize) -> bool {
+    fn touches(n: &Node, v: &str) -> bool {
+        let target = n.kind == NodeKind::StmtAssign || (n.kind == NodeKind::ExprUnary && n.extra_op == "&");
+        (target && count_ident_refs(&n.children[..n.children.len().min(1)], v) > 0)
+            || (matches!(n.kind, NodeKind::StmtLocal | NodeKind::StmtForRange) && n.name == v)
+            || n.params.iter().any(|(p, _)| p == v)
+            || n.kind == NodeKind::ExprCall
+            || n.children.iter().any(|c| touches(c, v))
+    }
+    let last = upto.iter().rposition(|s| key.split(' ').filter_map(|t| t.strip_prefix("ID:")).any(|v| touches(s, v)));
+    cse_hoist::repeat_takes_temp(seen_at as i64, upto.len() as i64 - 1, last.map_or(cse_hoist::UNTOUCHED, |t| t as i64))
 }
 
 fn stmt_cse_key(stmt: &Node) -> Option<String> {
@@ -25134,47 +25115,20 @@ fn apply_cse_replacements(node: &mut Node, seen: &std::collections::HashMap<Stri
     }
 }
 
-fn make_cse_local(var_name: &str, key: &str) -> Node {
-    let parts: Vec<&str> = key.splitn(3, ' ').collect();
-    let (op_str, left_str, right_str) = if parts.len() == 3 {
-        (parts[1], parts[0], parts[2])
-    } else {
-        return Node::new(NodeKind::StmtLocal);
-    };
+fn make_cse_local(var_name: &str, stmt: &Node, key: &str) -> Node {
     let mut local = Node::new(NodeKind::StmtLocal);
     local.name = var_name.to_string();
     local.extra_mutable = false;
-    let mut bin = Node::new(NodeKind::ExprBinary);
-    bin.extra_op = op_str.to_string();
-    if left_str.starts_with("ID:") {
-        let mut lid = Node::new(NodeKind::ExprIdentifier);
-        lid.name = left_str[3..].to_string();
-        bin.children.push(lid);
-    } else if left_str.starts_with("LIT:") {
-        let mut lit = Node::new(NodeKind::ExprLiteral);
-        lit.value = left_str[4..].to_string();
-        bin.children.push(lit);
-    }
-    if right_str.starts_with("ID:") {
-        let mut rid = Node::new(NodeKind::ExprIdentifier);
-        rid.name = right_str[3..].to_string();
-        bin.children.push(rid);
-    } else if right_str.starts_with("LIT:") {
-        let mut lit = Node::new(NodeKind::ExprLiteral);
-        lit.value = right_str[4..].to_string();
-        bin.children.push(lit);
-    }
-    local.children.push(bin);
+    // #7703: a copy of the repeat itself; rebuilding it from the key printed `ID:s >> LIT:16`.
+    local.children.extend(find_cse_expr(stmt, key));
     local
 }
 
-fn find_first_non_local(stmts: &[Node]) -> usize {
-    for (i, s) in stmts.iter().enumerate() {
-        if s.kind != NodeKind::StmtLocal {
-            return i;
-        }
+fn find_cse_expr(n: &Node, key: &str) -> Option<Node> {
+    if expr_key(n).as_deref() == Some(key) {
+        return Some(n.clone());
     }
-    stmts.len()
+    n.children.iter().find_map(|c| find_cse_expr(c, key))
 }
 
 fn collect_reads_in_stmts(stmts: &[Node], reads: &mut std::collections::HashSet<String>) {
@@ -26266,28 +26220,6 @@ the parser reads the type as an array literal, and every backend loses it -- gen
     }
 }
 
-/// The number of value bits a t27 integer type holds, or `None` if the type is
-/// not a fixed-width integer.
-///
-/// Signed types report one bit fewer: `i32` holds 2^31 - 1, not 2^32 - 1. A
-/// check that used the full width would accept `const X: i32 = 3000000000`,
-/// which is the same defect with a smaller number.
-pub fn int_value_bits(ty: &str) -> Option<u32> {
-    match ty.trim() {
-        "u8" => Some(8),
-        "u16" => Some(16),
-        "u32" => Some(32),
-        "u64" => Some(64),
-        "usize" => Some(64),
-        "i8" => Some(7),
-        "i16" => Some(15),
-        "i32" => Some(31),
-        "i64" => Some(63),
-        "isize" => Some(63),
-        _ => None,
-    }
-}
-
 /// Whether a decimal literal fits a type of `bits` value bits.
 ///
 /// The `Err` arm is the load-bearing one, not a fallback. The values that
@@ -26318,7 +26250,7 @@ fn check_const_widths(node: &Node, result: &mut TypeCheckResult) {
             .filter(|c| c.kind == NodeKind::ExprLiteral)
             .map(|c| if c.value.is_empty() { c.name.clone() } else { c.value.clone() })
             .unwrap_or_default();
-        if let Some(bits) = int_value_bits(&node.extra_type) {
+        if let Some(bits) = int_type_names::int_value_bits(node.extra_type.as_bytes()) {
             // The lexer strips digit separators, so the literal arrives without
             // them. A filter here changed no test either -- verified by removing
             // it -- and `const A: u32 = 4_294_967_295` is checked end to end in
@@ -26878,8 +26810,6 @@ pub struct RustCodegen {
     /// Parameter names by position, per function. Pairs with the map above so a
     /// call site can ask "is argument 2 a `&mut [T]` slot?".
     param_names: std::collections::HashMap<String, Vec<(String, String)>>,
-    /// `has_slice(file)`: its `[]const u8` parameters are `&[u8]`, else `&'static str`.
-    byte_params: bool,
     /// The slice parameters of the function currently being emitted that are
     /// themselves `&mut [T]`. Passing one of those on is a reborrow and must
     /// NOT get another `&mut`.
@@ -26957,7 +26887,6 @@ impl RustCodegen {
             in_const_init: false,
             written_slice_params: std::collections::HashMap::new(),
             param_names: std::collections::HashMap::new(),
-            byte_params: false,
             field_names: std::collections::HashSet::new(),
             current_mut_slice_params: std::collections::HashSet::new(),
             bool_vars: std::collections::HashSet::new(),
@@ -27084,7 +27013,6 @@ impl RustCodegen {
         self.written_slice_params = collect_written_slice_params(ast);
         self.param_names.clear();
         collect_param_names(ast, &mut self.param_names);
-        self.byte_params = has_slice(ast);
         self.field_names.clear();
         collect_field_names(ast, &mut self.field_names);
 
@@ -27464,11 +27392,7 @@ impl RustCodegen {
         // slice parameter, 174 parse, and 23 emit Rust that index-assigns into
         // one. **Zero of those 23 compiled.** The path is uniformly broken, so
         // this cannot regress a working case -- there are none.
-        //
-        // Deliberately narrow: only the written-into slices move to `&mut [T]`.
-        // A read-only `Vec<T>` parameter is valid Rust that compiles today, and
-        // rewriting it to `&[T]` would change call sites for no defect.
-        let mut mut_slices: Vec<String> = Vec::new();
+        let (mut mut_slices, mut views): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         let empty = std::collections::HashSet::new();
         let written = self
             .written_slice_params
@@ -27505,19 +27429,12 @@ impl RustCodegen {
                             && e.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
                             && !matches!(*e, "const" | "mut" | "ref" | "dyn" | "impl" | "fn")
                     });
-                // THREE outcomes, not two. An experiment that made every
-                // slice parameter a reference was measured and reverted: `[]T`
-                // then meant `&[T]` in parameter position and `Vec<T>` in
-                // return, field and local position, so
-                //   fn join(base: []u8, name: []u8) []u8 { var r : []u8 = base; }
-                // emitted `base: &[u8]` beside `let mut r: Vec<u8> = base;`
-                // and E0308. Zig renders `[]u8` in every position and C renders
-                // `uint8_t*` in every position; only Rust would have disagreed
-                // with itself. A parameter the fixpoint does not mark is left
-                // EXACTLY as it was, which is the no-op this comment promises.
                 if let (true, true, Some(elem)) = (is_slice, written.contains(n), elem) {
                     mut_slices.push(n.clone());
                     format!("{}: &mut [{}]", rust_ident(n), elem)
+                } else if let (true, Some(elem), false) = (is_slice, elem, owns_slice(&node.children, n)) {
+                    views.push(format!("let {0}: &[{1}] = {0}.as_ref();", rust_ident(n), elem)); // #8971: a slice
+                    format!("{}: impl AsRef<[{}]>", rust_ident(n), elem)
                 } else if rust_ty.starts_with("*mut ") && t.trim_start().starts_with('*')
                     && !t.trim_start()[1..].trim_start().starts_with("const ")
                     && !t.trim_start()[1..].trim_start().starts_with("mut ")
@@ -27536,7 +27453,7 @@ impl RustCodegen {
                     // `&mut T` without a lifetime, and doing it everywhere
                     // introduced 9 errors across 3 specs against 1 revealed.
                     format!("{}: &mut {}", rust_ident(n), &rust_ty[5..])
-                } else if self.byte_params && t.trim() == "[]const u8" {
+                } else if t.trim() == "[]const u8" && !owns_slice(&node.children, n) {
                     format!("{}: &[u8]", rust_ident(n)) // `&'static str` cannot take `x[a..b]`
                 } else {
                     let binding = if mutable_params.contains(n) && !rust_ty.starts_with('&') {
@@ -27606,7 +27523,7 @@ impl RustCodegen {
         // `return` of a narrower/wider value can be cast to the return type.
         self.var_types.clear();
         for (pname, ptype) in &params {
-            if self.byte_params && ptype.trim() == "[]const u8" {
+            if ptype.trim() == "[]const u8" && !owns_slice(&node.children, pname) {
                 self.var_types.insert(pname.clone(), "&[u8]".to_string());
             } else if !ptype.trim().is_empty() {
                 self.var_types
@@ -27627,6 +27544,7 @@ impl RustCodegen {
         if has_body {
             self.output.push('\n');
             self.indent += 1;
+            views.iter().for_each(|v| self.write_line(v));
             if body_unsafe {
                 self.write_line("unsafe {");
                 self.indent += 1;
@@ -28772,22 +28690,11 @@ impl RustCodegen {
             {
                 if let Some(t) = self.infer_int_type(&n.children[0]) {
                     self.var_types.insert(n.name.clone(), t);
+                } else if n.children[0].extra_kind == "string" {
+                    self.var_types.insert(n.name.clone(), "&'static str".to_string()); // #8971: text
                 }
             }
             self.record_inferred_locals(&n.children);
-        }
-    }
-
-    /// Bit width of a Rust integer type name. `usize`/`isize` are treated as
-    /// 64-bit, matching every target this repo builds for.
-    fn int_rank(ty: &str) -> u32 {
-        match ty.trim() {
-            "u8" | "i8" => 8,
-            "u16" | "i16" => 16,
-            "u32" | "i32" => 32,
-            "u64" | "i64" | "usize" | "isize" => 64,
-            "u128" | "i128" => 128,
-            _ => 0,
         }
     }
 
@@ -28795,7 +28702,7 @@ impl RustCodegen {
     /// Equal ranks that still differ (`u32`/`i32`, `u64`/`usize`) resolve to
     /// the left operand, matching the left-biased inference above.
     fn join_int_types(a: &str, b: &str) -> String {
-        if Self::int_rank(a) >= Self::int_rank(b) {
+        if int_type_names::int_rank(a.as_bytes()) >= int_type_names::int_rank(b.as_bytes()) {
             a.to_string()
         } else {
             b.to_string()
@@ -28806,7 +28713,15 @@ impl RustCodegen {
     /// to have the *same* integer type; t27 does not. Cast the narrower side up
     /// so the emitted operator compiles. Shifts are exempt — Rust already
     /// accepts any integer type as the shift amount.
+    fn rust_type_of(&self, n: &Node) -> Option<&str> { // #8971: the declared Rust type of a name
+        self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).filter(|_| n.kind == NodeKind::ExprIdentifier).map(|t| t.as_str())
+    }
+
     fn coerce_binary_operands(&self, node: &Node, left: &mut String, right: &mut String) {
+        let text = |n: &Node, s: &mut String| if n.kind == NodeKind::ExprLiteral && n.extra_kind == "string" { s.insert(0, 'b') }
+            else if self.rust_type_of(n) == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
+        if self.rust_type_of(&node.children[0]) == Some("&[u8]") { text(&node.children[1], right) }
+        if self.rust_type_of(&node.children[1]) == Some("&[u8]") { text(&node.children[0], left) }
         if matches!(node.extra_op.as_str(), "<<" | ">>") {
             return;
         }
@@ -28885,6 +28800,7 @@ impl RustCodegen {
             NodeKind::ExprLiteral if node.extra_kind == "string" => {
                 format!("\"{}\"", Codegen::zig_escape(&node.value))
             }
+            NodeKind::ExprLiteral if node.value.starts_with('\'') => format!("b{}", node.value), // #8971: a u8
             NodeKind::ExprLiteral => node.value.clone(),
             // The source language spells the empty optional `null`; Rust spells
             // it `None`. It arrived as a bare identifier and rustc answered
@@ -29011,12 +28927,14 @@ impl RustCodegen {
                     for (i, a) in args.iter_mut().enumerate() {
                         let (Some((_, t)), Some(c)) = (callee_params.get(i), node.children.get(i)) else { continue };
                         let t = t.trim();
-                        if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
+                        if t == "[]const u8" && self.rust_type_of(c) == Some("&'static str") {
+                            a.push_str(".as_bytes()");
+                        } else if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
                             && !t[1..].trim_start().starts_with("const ")
                         {
                             *a = format!("&mut {}", &a[1..]);
                         } else if c.kind == NodeKind::ExprLiteral && c.extra_kind == "string"
-                            && self.byte_params && t == "[]const u8"
+                            && t == "[]const u8"
                         {
                             *a = format!("b{}", a);
                         }
@@ -29191,7 +29109,7 @@ impl RustCodegen {
                     {
                         format!("(({}) == 0)", self.expr_to_rust(operand))
                     } else {
-                        format!("{}({})", node.extra_op, self.expr_to_rust(operand))
+                        format!("{}({})", node.extra_op.replace('~', "!"), self.expr_to_rust(operand))
                     }
                 } else {
                     node.extra_op.clone()
@@ -32384,22 +32302,19 @@ impl TimingModel {
     pub const HOLD_TIME_PS: u32 = 50;
 
     pub fn est_comb_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS
+        hir_cost_models::est_comb_delay(num_luts)
     }
 
     pub fn est_reg_to_reg_delay(num_luts: u32) -> u32 {
-        num_luts * Self::LUT_DELAY_PS + Self::ROUTING_DELAY_PS + Self::SETUP_TIME_PS
+        hir_cost_models::est_reg_to_reg_delay(num_luts)
     }
 
     pub fn slack(delay_ps: u32, constraint_ps: u32) -> i64 {
-        constraint_ps as i64 - delay_ps as i64
+        hir_cost_models::slack(delay_ps, constraint_ps)
     }
 
     pub fn fmax_from_delay(delay_ps: u32) -> u32 {
-        if delay_ps == 0 {
-            return 0;
-        }
-        1_000_000_000 / delay_ps
+        hir_cost_models::fmax_from_delay(delay_ps)
     }
 
     pub fn analyze_module(module: &HirModule, constraint: &TimingConstraint) -> TimingReport {
@@ -32526,19 +32441,19 @@ impl PowerModel {
     pub const STATIC_PER_RESOURCE_UW: u32 = 100;
 
     pub fn est_lut_dynamic(luts: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        luts * Self::LUT_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_lut_dynamic(luts, clock_mhz, toggle_rate)
     }
     pub fn est_ff_dynamic(ffs: u32, clock_mhz: u32, toggle_rate: u32) -> u32 {
-        ffs * Self::FF_POWER_UW_PER_MHZ * clock_mhz * toggle_rate / 1000 / 100
+        hir_cost_models::est_ff_dynamic(ffs, clock_mhz, toggle_rate)
     }
     pub fn est_bram_dynamic(brams: u32, clock_mhz: u32) -> u32 {
-        brams * Self::BRAM_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_bram_dynamic(brams, clock_mhz)
     }
     pub fn est_dsp_dynamic(dsps: u32, clock_mhz: u32) -> u32 {
-        dsps * Self::DSP_POWER_UW_PER_MHZ * clock_mhz / 1000
+        hir_cost_models::est_dsp_dynamic(dsps, clock_mhz)
     }
     pub fn est_static(total_resources: u32) -> u32 {
-        Self::STATIC_BASE_MW + total_resources * Self::STATIC_PER_RESOURCE_UW / 1000
+        hir_cost_models::est_static(total_resources)
     }
 
     pub fn estimate_module(module: &HirModule, clock_mhz: u32, toggle_rate: u32) -> PowerEstimate {
@@ -33165,19 +33080,11 @@ impl RouteModel {
     pub const LONG_WIRE_UM: u32 = 5000;
 
     pub fn est_wire_length(fanout: u32) -> u32 {
-        match fanout {
-            0 => 0,
-            1..=4 => Self::LOCAL_WIRE_UM,
-            5..=16 => Self::MEDIUM_WIRE_UM,
-            _ => Self::LONG_WIRE_UM,
-        }
+        hir_cost_models::est_wire_length(fanout)
     }
 
     pub fn est_congestion(nets: u32, die_area_mm2: u32) -> u32 {
-        if die_area_mm2 == 0 {
-            return 0;
-        }
-        nets / die_area_mm2
+        hir_cost_models::est_congestion(nets, die_area_mm2)
     }
 }
 
@@ -33585,20 +33492,10 @@ pub struct CtsModel;
 
 impl CtsModel {
     pub fn est_buffers_needed(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else {
-            num_sinks / 16 + 1
-        }
+        hir_cost_models::est_buffers_needed(num_sinks)
     }
     pub fn est_tree_levels(num_sinks: u32) -> u32 {
-        if num_sinks <= 16 {
-            1
-        } else if num_sinks <= 256 {
-            2
-        } else {
-            3
-        }
+        hir_cost_models::est_tree_levels(num_sinks)
     }
 }
 
@@ -41176,16 +41073,16 @@ mod tests_compiler_rejects {
         assert!(r.is_err(), "malformed input must fail to compile, got Ok");
     }
 
-    // Case 3: invalid width. `u3` is not a real integer width and is not in
-    // VALID_CAST_TYPES -> rejected; `u3` never reaches codegen.
+    // Case 3: invalid width. `u65` is past the 64 bits a uN cast may name (int_type_names.t27)
+    // and is not in VALID_CAST_TYPES -> rejected; `u65` never reaches codegen.
     #[test]
-    fn rejects_invalid_width_u3() {
+    fn rejects_invalid_width_u65() {
         // Hardened contract (t27#1940): a malformed statement/declaration
         // is a COMPILE ERROR, not a silent drop.
         let r = try_emit(
             r#"module RejBadWidth {
     pub fn h(x: u8) -> u8 {
-        return x as u3
+        return x as u65
     }
 }"#,
         );

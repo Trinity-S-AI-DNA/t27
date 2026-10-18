@@ -23,13 +23,16 @@ earlier tick, and it is cheap when nothing changed. Do the steps in order, and s
 Read the plan limits with `get_usage`.
 - **Weekly use >= 95%:** cancel the 15-minute cron and create a one-shot cron 5 minutes after the weekly reset that re-creates it. Write one ledger line, then stop. A loop that runs out of budget stops every session on the account, this one included.
 - **Weekly use >= 85%:** no new agents. Run steps 1-3 and the agents already running.
+- **Pace:** the week has 168 hours, so stay under about 0.6% per hour. If use exceeds `hours since reset x 0.6 + 5`, run no new agent this tick.
+  - On 2026-10-09, three agents burned about 4.5% per hour, and the loop hit 98% in two hours.
+  - Prefer one agent at a time, and a model whose separate weekly bucket has room (compare the `Weekly - <model>` windows in `get_usage`).
 - **Otherwise:** run at most 3-4 agents at once, each in its own fresh worktree.
 
 ## 1. Health, with self-repair (#8325)
 
 | check | healthy | repair |
 |---|---|---|
-| `git config --get core.hooksPath` (any worktree: they share the config) | `.githooks` (relative) | Set it back to `.githooks`. The absolute path runs the main checkout's uncommitted hooks, which need an unbuilt t27c and refuse every worktree commit. It flipped twice on 2026-10-09; the owner wants it relative. Agents never touch it; only the main session does. |
+| `git config --get core.hooksPath` (any worktree: they share the config) | `.githooks` (relative) | Set it back to `.githooks`. The absolute path runs the main checkout's uncommitted hooks, which need an unbuilt t27c and refuse every worktree commit. It flipped four times from 2026-10-09 to 2026-10-10; the owner wants it relative. Durable fix: right after every `git worktree add`, run `git -C <wt> config --worktree core.hooksPath .githooks`. `extensions.worktreeConfig` is on, so the worktree's own setting wins over the shared one. Agents never touch the shared config. |
 | failing checks on master's head commit | none, except Scorecard | Each red check makes every PR UNSTABLE, and GitHub then refuses `--auto`. Fix the cause in a small PR: #8277 (a type name defined twice), #8289 (ledger rows). |
 | t27b-lab `status.json` | `phase` moves, `updated` < 30 min old | If it is stale, read `ssh t27b-lab` logs before redeploying. A redeploy kills the run in flight, so time it right after a run publishes. |
 | t27b-lab `image.lab_py_sha` | equals `git hash-object` of master's `contrib/railway/t27b-lab/lab.py` | `railway up` from a clean `git archive` of `contrib/railway/t27b-lab` |
@@ -54,6 +57,8 @@ Then:
 
 ## 3. One plan step
 
+**DRY first (owner rule, 2026-10-11).** Before writing any spec or function, search for an existing one: `t27c dupes --name`, `tools/dupe_scan.py --like`, `specs/tools/catalog.t27`. Then reuse or extend it. Never add a new conformance spec per feature: put the cases in the area's existing one. `tools/duplicate_bodies_baseline.txt` only moves down.
+
 Take the first unchecked item of epic #8326 that is not already claimed, either by a branch (`git branch -a`) or by an open PR. Move it one PR forward, then tick it in the epic.
 
 - **Write the decision in `.t27`.** Generate it on the t27c lab:
@@ -62,7 +67,9 @@ Take the first unchecked item of epic #8326 that is not already claimed, either 
   - a fresh `git worktree add --detach /data/w-<topic> FETCH_HEAD` from the lab clone;
   - `cargo build --release -p t27c` with a shared `CARGO_TARGET_DIR`.
 - **Bring the files back to a sparse worktree on the Mac.** `git worktree add --no-checkout`, `git sparse-checkout set --no-cone <paths>`, then copy each file with `ssh ... cat`. `gen/` is gitignored: use `git add -f`.
-- **Every new spec in a PR also gets its row** in `docs/reports/t27b_expectations.json`. A missing row turns master's `t27b-native-ratchet` red for everyone (UNLISTED). That happened 6 times in 30 minutes on 2026-10-09.
+- **Ledger rows: the steward writes them.** The t27b ledger steward (`specs/jobs/t27b_ledger_steward.t27`, rules in `specs/tri/t27b/ledger_steward.t27`, #8654) adds the row from master's next run after a spec PR merges, and opens one ledger PR with auto-merge. Once the Queen runs that card (see gHashTag/trios#1751), spec PRs leave `docs/reports/t27b_expectations.json` alone.
+  - **Until then, every new spec in a PR still gets its row.** A missing row turns master's `t27b-native-ratchet` red for everyone (UNLISTED). That happened 6 times in 30 minutes on 2026-10-09.
+  - **The steward refuses** UNEXPECTED FAILURE, MOVED, BAD REASON, OVER CAP, a defect where the reference passes, a cap rise larger than the new rows, and more than 16 STALE rows. A refused finding no longer holds the run back: the steward applies its other rows, leaves the refused row as master has it, and lists it in the ledger PR's table. Only a run with nothing else to apply, a cap rise or a STALE flood gets one issue labelled `t27b-ledger-steward` and no PR. Those issues and the REFUSE rows in steward PRs are this loop's to read.
 - **Receipts:** while master moves every 10-20 minutes, compare a lane's squash commit on master against its parent after the merge:
   - `cd /work/t27 && /work/t27c-master corpus-receipt compare BASE.receipt.json HEAD.receipt.json --challenge-head <nonce>` on t27b-lab;
   - a master receipt carries no nonce and is accepted as BASE;
@@ -78,4 +85,5 @@ Append one line to the loop ledger memory (`t27b-loop-ledger.md`): the time, wha
 - **zsh treats `$n:r` as a modifier, which breaks refspecs.** Write `${n}`, and verify a push with `git ls-remote`.
 - **The classifier denies `gh pr merge --squash` in auto mode** ("Merge Without Review"). `--auto` passes.
 - **The lab drops a request whose head moved.** It also dropped requests it had not fetched yet; since #8320 those wait 30 min.
-- **An unrelated session can change shared `.git/config`.** Verify the setting; do not trust that it was restored.
+- **An unrelated session can change shared `.git/config`.** Verify the setting; do not trust that it was restored. Pin per worktree instead of fighting over the shared value.
+- **Other sessions' spec rewrites can turn master's native ratchet red with UNEXPECTED FAILURE**, even when t27b did not regress (c7570433e and c9d36f314 on 2026-10-10). Before suspecting t27b, check with `git log` whether the spec changed.

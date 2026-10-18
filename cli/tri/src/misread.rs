@@ -44,7 +44,8 @@
 //! match. The refused reproducer must be refused by every backend read here --
 //! that proves the gate, not the detectors. The silent reproducer carries the
 //! shape `typecheck` still accepts (`Vec<>`) and must fire on real output.
-//! The detectors for the refused shapes are held by the unit tests below,
+//! The detectors (specs/tri/misread/shapes.t27, #8967) for the refused shapes are
+//! held by its tests and the unit tests below,
 //! against the exact text the backends printed before the gate.
 //!
 //! Each spec-shape pair is still reported as REFUSED or SILENT; with the gate a
@@ -58,6 +59,8 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
+#[path = "../../../gen/rust/tri/misread/shapes.rs"] #[allow(dead_code, unused_parens)]
+mod ms; // t27c gen-rust of specs/tri/misread/shapes.t27: the five shapes, each anchored on the whole line
 use std::process::Command;
 
 #[derive(Args, Debug)]
@@ -121,104 +124,6 @@ impl Shape {
     }
 }
 
-/// Does this line of generated Rust declare a field whose type slot is empty?
-///
-/// Anchored on the whole line rather than on a substring: `pub f: ,` inside a
-/// comment or a string would otherwise count, and a census that counts prose is
-/// the defect this repository names most often.
-pub fn rust_empty_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    is_ident(name.trim()) && ty.trim() == ","
-}
-
-/// Does this line declare a field whose type is an integer literal?
-///
-/// `pub bad: 0,` — accepted by `parse`, refused by `typecheck` since #3225, and
-/// unparseable as Rust. A negative literal counts: the sign does not make it a
-/// type.
-pub fn rust_literal_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    if !is_ident(name.trim()) {
-        return false;
-    }
-    let ty = ty.trim().trim_end_matches(',').trim();
-    is_int_literal(ty)
-}
-
-/// `Vec<>` — the element type was dropped on the way in.
-pub fn rust_empty_generic(line: &str) -> bool {
-    line.contains("Vec<>")
-}
-
-/// Does this line declare a field whose TYPE contains a bare colon?
-///
-/// A Rust type never does: a path spells its separator `::` and no other type
-/// syntax admits a lone `:`. So the line is wreckage either way -- but the shape
-/// does NOT say which wreck, and naming it for one cause was wrong. Measured on
-/// this corpus it arrives two ways:
-///
-///   * a field swallowed by the one before it. An inline `#` comment on a field
-///     consumes the rest of the line AND the next declaration, so
-///     `id : U8  # note,` followed by three fields yields the single field
-///     `pub id: U8command:Stringargs:Stringgroup_id:U8status:JobStatus`. Four
-///     declarations gone, and `parse` and `typecheck` both accept the spec.
-///   * a map type the emitter cannot spell. `[str: str]` comes out as
-///     `Vec<str:str>`, which is a different defect with the same footprint.
-///
-/// The detector reports the shape and leaves the cause to whoever reads the spec,
-/// which is the rule this module states at the top and which I broke by calling
-/// this `RustSwallowedField` first.
-pub fn rust_colon_in_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    if !is_ident(name.trim()) {
-        return false;
-    }
-    let ty = ty.trim().trim_end_matches(',');
-    // Strip every `::` before looking for a lone `:`, so a legitimate path type
-    // cannot be reported.
-    let without_paths = ty.replace("::", "");
-    without_paths.contains(':')
-}
-
-/// The C half: `0 field;` — a literal where a type specifier must stand.
-pub fn c_literal_type(line: &str) -> bool {
-    let t = line.trim().trim_end_matches(';');
-    let mut parts = t.split_whitespace();
-    let (Some(first), Some(second), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    is_int_literal(first) && is_ident(second)
-}
-
-fn is_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn is_int_literal(s: &str) -> bool {
-    let s = s.strip_prefix('-').unwrap_or(s);
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-}
-
 /// Apply every shape to one generated file, returning the ones present.
 pub fn shapes_in(text: &str, backend: &str) -> Vec<Shape> {
     let mut found = Vec::new();
@@ -227,11 +132,11 @@ pub fn shapes_in(text: &str, backend: &str) -> Vec<Shape> {
             continue;
         }
         let hit = text.lines().any(|l| match shape {
-            Shape::RustEmptyType => rust_empty_type(l),
-            Shape::RustLiteralType => rust_literal_type(l),
-            Shape::RustEmptyGeneric => rust_empty_generic(l),
-            Shape::CLiteralType => c_literal_type(l),
-            Shape::RustColonInType => rust_colon_in_type(l),
+            Shape::RustEmptyType => ms::rust_empty_type(l.as_bytes()),
+            Shape::RustLiteralType => ms::rust_literal_type(l.as_bytes()),
+            Shape::RustEmptyGeneric => ms::rust_empty_generic(l.as_bytes()),
+            Shape::CLiteralType => ms::c_literal_type(l.as_bytes()),
+            Shape::RustColonInType => ms::rust_colon_in_type(l.as_bytes()),
         });
         if hit {
             found.push(shape);
@@ -573,63 +478,6 @@ pub fn run(args: &Misread) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_empty_type_slot_is_found() {
-        assert!(rust_empty_type("    pub variants: ,"));
-        assert!(rust_empty_type("pub f: ,"));
-    }
-
-    #[test]
-    fn a_real_field_is_not_an_empty_type_slot() {
-        assert!(!rust_empty_type("    pub kind: u8,"));
-        assert!(!rust_empty_type("    pub name: String,"));
-        assert!(!rust_empty_type("// pub f: ,"));
-    }
-
-    #[test]
-    fn a_literal_in_type_position_is_found_with_either_sign() {
-        assert!(rust_literal_type("    pub success: 0,"));
-        assert!(rust_literal_type("    pub offset: -1,"));
-    }
-
-    #[test]
-    fn a_numeric_looking_type_name_is_not_a_literal() {
-        assert!(!rust_literal_type("    pub v: u8,"));
-        assert!(!rust_literal_type("    pub v: i32,"));
-        assert!(!rust_literal_type("    pub v: f64,"));
-    }
-
-    #[test]
-    fn the_c_half_needs_exactly_a_literal_and_a_name() {
-        assert!(c_literal_type("    0 bad;"));
-        assert!(!c_literal_type("    int32_t good;"));
-        // Three tokens is a declaration with a qualifier, not this defect.
-        assert!(!c_literal_type("    const int x;"));
-    }
-
-    #[test]
-    fn a_bare_colon_in_a_type_is_found_whatever_wrecked_it() {
-        // A swallowed field...
-        assert!(rust_colon_in_type("    pub a: Floatb:String,"));
-        // ...and a map type the emitter could not spell. Same shape, other cause.
-        assert!(rust_colon_in_type("    pub env: Vec<str:str>,"));
-    }
-
-    #[test]
-    fn a_path_type_is_not_a_bare_colon() {
-        // `::` is how a Rust path spells its separator and must not be read as
-        // the wreckage of two declarations.
-        assert!(!rust_colon_in_type("    pub a: std::mem::Allocator,"));
-        assert!(!rust_colon_in_type("    pub v: Vec<HashMap<K, V>>,"));
-        assert!(!rust_colon_in_type("    pub p: *mut (),"));
-    }
-
-    #[test]
-    fn an_empty_generic_is_found_anywhere_in_the_line() {
-        assert!(rust_empty_generic("    pub adj: Vec<>,"));
-        assert!(!rust_empty_generic("    pub adj: Vec<u8>,"));
-    }
 
     #[test]
     fn shapes_are_read_only_from_the_backend_that_can_show_them() {

@@ -2244,7 +2244,7 @@ test nan_to_int {
     );
 }
 
-/// What stays refused, each named: `@sqrt` of a literal, `std.math.*`, a
+/// What stays refused, each named: `@sqrt` of a negative literal (a non-negative one folds), `std.math.*`, a
 /// conversion with no result type, f16, `as` from an f64 t27c gen does not
 /// spell as a float (here an array element; a spelled one, a call of a fn
 /// declared `-> f64` included, is lowered, see `float_as_plan.t27`) or from a bool to f64 (an integer `as f64` is
@@ -2261,7 +2261,7 @@ fn f64_refusals_name_the_construct() {
         }
     };
     for (body, want) in [
-        ("return @sqrt(2.0) + x;", "ExprCall(@sqrt)"),
+        ("return @sqrt(-2.0) + x;", "ExprCall(@sqrt)"),
         ("return std.math.sqrt(x);", "ExprCall(std.*)"),
         ("return @floatFromInt(n) + x;", "ExprCall(@floatFromInt)"),
         ("const y: f16 = 1.0;\nreturn x;", "type f16"),
