@@ -61,7 +61,7 @@ fn a_name_declared_twice_is_reported_with_its_count() {
         "the finding must name the kind, the name and the count:\n{out}"
     );
     assert!(
-        out.contains("error: ") && out.contains("a redeclaration is refused"),
+        out.contains("error: ") && out.contains("every backend rejects a redeclaration"),
         "and say what the consequence is:\n{out}"
     );
 }

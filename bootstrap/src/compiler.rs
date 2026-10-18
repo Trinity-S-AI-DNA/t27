@@ -25950,7 +25950,7 @@ drop the parameter from the declaration and keep it at each use, where it is und
         if let DuplicateDecl::SameNamespace(name, kind, n) = &d { // an error, as E_NAME is in the self-hosted core (#10421); a bench stays a warning
             if *kind != "bench" {
                 result.error_count += 1;
-                result.errors.push(format!("error: `{kind} {name}` is declared {n} times -- a redeclaration is refused (gen-js keeps the first copy, gen-c the last, zig and rust reject it)"));
+                result.errors.push(format!("error: `{kind} {name}` is declared {n} times -- every backend rejects a redeclaration (gen-js kept the first copy, gen-c the last, before check refused it)"));
                 continue;
             }
         }
