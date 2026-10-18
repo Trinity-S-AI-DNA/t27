@@ -128,3 +128,31 @@ VibeCheck (arXiv 2609.05978); Tessl $125M (Maginative); GitHub API stars and
 pushed_at for infer, kani, creusot, prusti-dev, gobra, keploy, hypothesis,
 fast-check, spec-kit (2026-10-12). Full research transcript in the loop
 ledger, ~/t27-lanes/claw/STATE.md.
+
+## Addendum 2026-10-18: who decides when a PR's checks run again
+
+The lane's PRs wait on required checks in a queue of 800 to 900 runs, and every
+push to a head restarts them (#10590, #10600, #10606). The tools that land PRs
+for other teams take one of three answers to that cost:
+
+- **GitHub merge queue.** Required checks run on the `merge_group` event,
+  against the base branch plus the PRs ahead in the queue. Authors never update
+  their branch by hand. "Build concurrency" caps how many groups are built at
+  once (1 to 100), and "merge limits" set the group size. t27 has none of this
+  yet: the `t27-master-protection` ruleset has no merge-queue rule, and none of
+  the 67 workflows triggers on `merge_group`.
+- **Kodiak.** With `update.always` (default `false`), it updates every
+  out-of-date PR that carries the automerge label. Its own docs warn this costs
+  at least N(N-1)/2 updates for N PRs, against N-1 when the option is off.
+- **TRI CLAW.** `refresh.t27` updates only what the merger lands next, caps the
+  batch at 5, and stops above 150 queued runs. `push_gate.t27` decides each lane
+  push: it skips a push whose only effect would be to restart required checks.
+  The decision is a spec with tests, not a config flag.
+
+The lesson TRI CLAW takes: a merge queue moves the expensive checks from every
+push to once per group. Whether to turn it on is a ruleset change for the owner,
+and it pairs with #10193. The decision is #10607.
+
+Sources: GitHub Docs, "Managing a merge queue"; Kodiak config reference
+(`update.always`, `update.require_automerge_label`), both read 2026-10-18;
+`gh api repos/gHashTag/t27/rulesets` and a grep of `.github/workflows`, same day.

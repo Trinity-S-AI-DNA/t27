@@ -170,6 +170,11 @@ Traps from this tick (ffmpeg on the lab):
 
 - Before trusting a "fast voice" grid result, work out which fixture voices are fast. `voice_room_ms(3)` is 12250 ms, so the measured lesson 1 voice (raw 12300) is already sped up. A change aimed at "fast voices" therefore changes the reel everyone actually sees.
 
+**Letting a caller reach a printer in another spec (t27#10628).** When an overlay's `enable=` is printed in an imported spec, the importing spec cannot clip it. Split the printer into a form that takes the window (`print_alpha(lo, hi)`, `print_rise_from(o, lo, dy)` in token_floor_mux) and the old form as a thin wrapper that passes the spec's own window (`print_fade(c)`, `print_rise(o, c, dy)`). Then run `cmp` on the imported spec's own graph: it must be byte-identical (token_floor_mux: 28336 bytes, 0 differences). Run `cmp` on every mode of the importer that does not use the window too (modes 3 and 4: 0 of 162 graphs differ).
+
+- Move the ramp along with the window. A card's rise and fade-in start at its first kept frame (`beat_first_lo`), and its fade-out ends at its last kept frame (`beat_last_hi`). If you clip only `enable=`, the card pops in fully risen on the close beat's first frame, because the ramp started on frame 392, under the crossfade.
+- A window can end past the reel. `CARD_ON` gives the last card frames 392..450, but the reel's last frame is 449. Clamp the window (`card_hi`) and assert the clamp in a test.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
