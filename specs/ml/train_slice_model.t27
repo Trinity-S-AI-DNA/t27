@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/train_slice_model.t27 -- a model spec that TRAINS one 3-head slice and writes the result to a REAL file.
+; Part of gHashTag/t27#10024 (our own model), cell 25 "t27c --backend ml"; issue #10183.
+
+; WHY: specs/ml/host_io_model.t27 showed that `t27c compile --backend ml` can lower a spec whose
+; main() touches a real file. This spec is the next step: main() trains. The training step is not
+; copied here: init_model, mean_loss and train_step are the ones in specs/nn/hslm_backward.t27
+; (forward, backward, straight-through gradient, clip, SGD on the shadow weights, requantize on a
+; 9-input 27-class ternary slice of three heads of width three), reached through `use`. What this
+; file adds is the part a trainer needs and that spec lacks: run N steps, refuse a run that did not
+; learn, and leave the trained slice on a disk.
+
+; THE CHECKPOINT (379 bytes at /tmp/t27_train_slice.bin, all little endian):
+;     0  magic "T27C" (the contract's MAGIC0..MAGIC3)
+;     4  version u32 (1)
+;     8  steps u32
+;    12  first loss, f32 bits
+;    16  last loss, f32 bits
+;    20  alpha, f32 bits
+;    24  27 biases, f32 bits each (108 bytes)
+;   132  243 trits, one byte each: 0 = neg, 1 = zero, 2 = pos
+;   375  checksum u32: the sum of bytes 0..374
+; The file is written whole with host_open / host_write / host_close, read back with host_read,
+; and accepted only if every byte equals what was written and the losses decoded from the FILE
+; (not from memory) still show the loss cut below half.
+; Not claimed here: the 379 bytes do not fit one slot of ml::file_io_contract (FILE_CAP 256), so
+; ckpt_write is not used; put_u32 and get_u32 are. This is the head slice only, as in
+; nn/hslm_backward.t27, not the three transformer blocks.
+
+; HOST CALLS (the contract with t27c, as in host_io_model.t27): host_open(path, mode) with mode 0
+; reads and 1 creates or truncates; host_read(fd, buf); host_write(fd, buf); host_close(fd).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module train_slice_model;
+
+use base::types;
+use ml::file_io_contract;
+use nn::ternary_ste;
+use nn::hslm_backward;
+
+; THE STATE: t27c's import splice (use_resolve) pulls the fn, struct, enum, const and type
+; declarations a spec uses from its imports, but not module-level `var`. The step in
+; nn/hslm_backward.t27 works on sixteen of them, so this module declares the same sixteen (names,
+; types and initial values) and the spliced init_model, mean_loss and train_step bind to them.
+; Only the declarations are repeated, none of the logic. If hslm_backward adds a variable this
+; file stops compiling with "use of undeclared identifier", it does not drift silently.
+var shadow : [243]f64 = undefined;
+var trits : [243]Trit = undefined;
+var alpha : f64 = 1.0;
+var bias : [27]f64 = undefined;
+var gw : [243]f64 = undefined;
+var gs : [243]f64 = undefined;
+var gb : [27]f64 = undefined;
+var act_x : [9]f64 = undefined;
+var logits : [27]f64 = undefined;
+var dl : [27]f64 = undefined;
+var dz : [27]f64 = undefined;
+var dx : [9]f64 = undefined;
+var nudge_index : usize = 0;
+var nudge_delta : f64 = 0.0;
+var x_index : usize = 0;
+var x_delta : f64 = 0.0;
+
+pub const STEPS : u32 = 20;
+pub const LR : f64 = 2.0;
+pub const CKPT_BYTES : i32 = 379;
+pub const CKPT_VERSION : u32 = 1;
+pub const OFF_VERSION : i32 = 4;
+pub const OFF_STEPS : i32 = 8;
+pub const OFF_FIRST : i32 = 12;
+pub const OFF_LAST : i32 = 16;
+pub const OFF_ALPHA : i32 = 20;
+pub const OFF_BIAS : i32 = 24;
+pub const OFF_TRITS : i32 = 132;
+pub const OFF_SUM : i32 = 375;
+
+pub const TRAIN_OK : i32 = 0;
+pub const TRAIN_ERR_LOSS : i32 = 60;
+pub const TRAIN_ERR_OPEN : i32 = 61;
+pub const TRAIN_ERR_IO : i32 = 62;
+pub const TRAIN_ERR_MISMATCH : i32 = 63;
+pub const TRAIN_ERR_MAGIC : i32 = 64;
+pub const TRAIN_ERR_SUM : i32 = 65;
+pub const TRAIN_ERR_LOSS_FILE : i32 = 66;
+
+fn put_f32(buf: []u8, off: i32, x: f64) -> void {
+    const f : f32 = @floatCast(x);
+    const bits : u32 = @bitCast(f);
+    put_u32(buf, off, bits);
+}
+
+fn get_f32(buf: []const u8, off: i32) -> f64 {
+    const bits : u32 = get_u32(buf, off);
+    const f : f32 = @bitCast(bits);
+    return @floatCast(f);
+}
+
+fn byte_total(buf: []const u8, n: i32) -> u32 {
+    var s : u32 = 0;
+    var i : i32 = 0;
+    while (i < n) {
+        const b : u32 = @intCast(buf[@intCast(i)]);
+        s = s + b;
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Train the slice for `steps` steps of learning rate `lr` from its fixed initial state.
+/// losses[0] is the mean loss before any step, losses[1] the mean loss after the last one.
+pub fn train(steps: u32, lr: f64, losses: []f64) -> void {
+    init_model();
+    losses[0] = mean_loss();
+    var n : u32 = 0;
+    var seen : f64 = 0.0;
+    while (n < steps) {
+        seen = train_step(lr);
+        n = n + 1;
+    }
+    losses[1] = mean_loss();
+}
+
+/// Lay the trained slice (the module state of nn/hslm_backward) out as the 379 checkpoint bytes.
+pub fn pack(buf: []u8, steps: u32, losses: []const f64) -> void {
+    buf[0] = MAGIC0;
+    buf[1] = MAGIC1;
+    buf[2] = MAGIC2;
+    buf[3] = MAGIC3;
+    put_u32(buf, OFF_VERSION, CKPT_VERSION);
+    put_u32(buf, OFF_STEPS, steps);
+    put_f32(buf, OFF_FIRST, losses[0]);
+    put_f32(buf, OFF_LAST, losses[1]);
+    put_f32(buf, OFF_ALPHA, alpha);
+    var b : i32 = 0;
+    while (b < 27) {
+        put_f32(buf, OFF_BIAS + 4 * b, bias[@intCast(b)]);
+        b = b + 1;
+    }
+    var k : i32 = 0;
+    while (k < 243) {
+        const t : Trit = trits[@intCast(k)];
+        var code : u8 = 1;
+        if (t == Trit.pos) {
+            code = 2;
+        } else if (t == Trit.neg) {
+            code = 0;
+        }
+        buf[@intCast(OFF_TRITS + k)] = code;
+        k = k + 1;
+    }
+    put_u32(buf, OFF_SUM, byte_total(buf, OFF_SUM));
+}
+
+/// Accept a checkpoint image only if its magic, its checksum and the losses it carries are right:
+/// the first loss is above 2.0 (a slice that had not learned) and the last is below half of it.
+pub fn check_image(buf: []const u8) -> i32 {
+    if (buf[0] != MAGIC0 or buf[1] != MAGIC1 or buf[2] != MAGIC2 or buf[3] != MAGIC3) {
+        return TRAIN_ERR_MAGIC;
+    }
+    if (get_u32(buf, OFF_SUM) != byte_total(buf, OFF_SUM)) {
+        return TRAIN_ERR_SUM;
+    }
+    const first : f64 = get_f32(buf, OFF_FIRST);
+    const last : f64 = get_f32(buf, OFF_LAST);
+    if (first > 2.0 and last * 2.0 < first) {
+        return TRAIN_OK;
+    }
+    return TRAIN_ERR_LOSS_FILE;
+}
+
+/// Write the image to /tmp/t27_train_slice.bin (created or truncated).
+pub fn flush_image(buf: []const u8) -> i32 {
+    const fd : i32 = host_open("/tmp/t27_train_slice.bin", 1);
+    if (fd < 0) {
+        return TRAIN_ERR_OPEN;
+    }
+    const w : i32 = host_write(fd, buf[0 .. @as(usize, @intCast(CKPT_BYTES))]);
+    const c : i32 = host_close(fd);
+    if (w != CKPT_BYTES or c != 0) {
+        return TRAIN_ERR_IO;
+    }
+    return TRAIN_OK;
+}
+
+/// Read /tmp/t27_train_slice.bin into back (room for 512 bytes). Returns the byte count, or a negative code.
+pub fn load_image(back: []u8) -> i32 {
+    const fd : i32 = host_open("/tmp/t27_train_slice.bin", 0);
+    if (fd < 0) {
+        return 0 - TRAIN_ERR_OPEN;
+    }
+    const got : i32 = host_read(fd, back[0 .. 512]);
+    const c : i32 = host_close(fd);
+    if (got < 0 or c != 0) {
+        return 0 - TRAIN_ERR_IO;
+    }
+    return got;
+}
+
+/// Train `steps` steps; refuse a run whose loss did not halve; write the checkpoint; read it back;
+/// compare every byte; check the image again from the bytes that came off the disk.
+/// Returns TRAIN_OK or the first failing code.
+pub fn run(steps: u32) -> i32 {
+    var losses : [2]f64 = undefined;
+    train(steps, LR, &losses);
+    if (!(losses[1] * 2.0 < losses[0])) {
+        return TRAIN_ERR_LOSS;
+    }
+    var image : [512]u8 = undefined;
+    var back : [512]u8 = undefined;
+    var z : usize = 0;
+    while (z < 512) {
+        image[z] = 0;
+        back[z] = 0;
+        z = z + 1;
+    }
+    pack(&image, steps, &losses);
+    const fc : i32 = flush_image(&image);
+    if (fc != TRAIN_OK) {
+        return fc;
+    }
+    const got : i32 = load_image(&back);
+    if (got < 0) {
+        return 0 - got;
+    }
+    if (got != CKPT_BYTES) {
+        return TRAIN_ERR_MISMATCH;
+    }
+    var i : usize = 0;
+    while (i < 379) {
+        if (back[i] != image[i]) {
+            return TRAIN_ERR_MISMATCH;
+        }
+        i = i + 1;
+    }
+    return check_image(&back);
+}
+
+/// The program `t27c compile --backend ml` builds: train 20 steps, write the checkpoint, read it back, die loudly on any difference.
+pub fn main() -> void {
+    assert run(STEPS) == TRAIN_OK;
+}
+
+test twenty_steps_train_and_the_checkpoint_survives_a_real_file {
+    assert run(20) == TRAIN_OK;
+}
+
+test zero_steps_do_not_halve_the_loss {
+    // the check can fail: with no step the last loss equals the first, so nothing reaches the disk
+    assert run(0) == TRAIN_ERR_LOSS;
+}
+
+test the_image_carries_the_trained_slice {
+    var losses : [2]f64 = undefined;
+    train(20, LR, &losses);
+    var image : [512]u8 = undefined;
+    var z : usize = 0;
+    while (z < 512) {
+        image[z] = 0;
+        z = z + 1;
+    }
+    pack(&image, 20, &losses);
+    assert check_image(&image) == TRAIN_OK;
+    assert get_u32(&image, OFF_STEPS) == 20;
+    assert get_f32(&image, OFF_FIRST) > 2.0;
+    assert get_f32(&image, OFF_LAST) * 2.0 < get_f32(&image, OFF_FIRST);
+    // every trit byte is one of the three codes, and the slice is not all zeros
+    var k : usize = 0;
+    var nonzero : i32 = 0;
+    var bad : i32 = 0;
+    while (k < 243) {
+        const code : u8 = image[132 + k];
+        if (code > 2) {
+            bad = bad + 1;
+        }
+        if (code != 1) {
+            nonzero = nonzero + 1;
+        }
+        k = k + 1;
+    }
+    assert bad == 0;
+    assert nonzero > 20;
+}
+
+test training_changes_the_trits_in_the_image {
+    // the image after 20 steps differs from the image of the untrained slice in the trit bytes
+    var losses : [2]f64 = undefined;
+    train(0, LR, &losses);
+    var before : [512]u8 = undefined;
+    var after : [512]u8 = undefined;
+    var z : usize = 0;
+    while (z < 512) {
+        before[z] = 0;
+        after[z] = 0;
+        z = z + 1;
+    }
+    pack(&before, 0, &losses);
+    train(20, LR, &losses);
+    pack(&after, 20, &losses);
+    var k : usize = 0;
+    var changed : i32 = 0;
+    while (k < 243) {
+        if (before[132 + k] != after[132 + k]) {
+            changed = changed + 1;
+        }
+        k = k + 1;
+    }
+    assert changed > 0;
+}
+
+test a_flipped_byte_is_refused {
+    var losses : [2]f64 = undefined;
+    train(20, LR, &losses);
+    var image : [512]u8 = undefined;
+    var z : usize = 0;
+    while (z < 512) {
+        image[z] = 0;
+        z = z + 1;
+    }
+    pack(&image, 20, &losses);
+    assert check_image(&image) == TRAIN_OK;
+    image[200] = 7 - image[200];
+    assert check_image(&image) == TRAIN_ERR_SUM;
+    image[200] = 7 - image[200];
+    image[0] = 0;
+    assert check_image(&image) == TRAIN_ERR_MAGIC;
+}
