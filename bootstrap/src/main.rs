@@ -1626,14 +1626,6 @@ enum Commands {
         right: String,
     },
 
-    /// Watch .t27 files for changes and recompile
-    Watch {
-        #[arg(long, default_value = ".")]
-        repo_root: String,
-        #[arg(long, default_value = "2")]
-        interval_secs: u64,
-    },
-
     /// Run full CI checks (parse + typecheck + gen + seal)
     Ci {
         #[arg(long, default_value = ".")]
@@ -11179,102 +11171,6 @@ fn run_ci(repo_root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_watch(repo_root: &str, interval_secs: u64) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-    println!("t27c watch: monitoring .t27 files in {} (interval: {}s)", repo_root, interval_secs);
-    println!("Press Ctrl+C to stop.");
-
-    let mut file_hashes: HashMap<String, u64> = HashMap::new();
-
-    fn scan_t27_files(repo_root: &str) -> Vec<String> {
-        let mut files = Vec::new();
-        for dir in &["specs", "compiler"] {
-            let base = format!("{}/{}", repo_root, dir);
-            if std::path::Path::new(&base).exists() {
-                collect_t27_recursive(&base, &mut files);
-            }
-        }
-        files
-    }
-
-    fn collect_t27_recursive(dir: &str, files: &mut Vec<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    collect_t27_recursive(&path.to_string_lossy(), files);
-                } else if path.extension().map(|e| e == "t27").unwrap_or(false) {
-                    files.push(path.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    let mut iteration: u32 = 0;
-    loop {
-        let files = scan_t27_files(repo_root);
-        let mut changed = Vec::new();
-        let mut new_files = Vec::new();
-
-        for file in &files {
-            if let Ok(content) = std::fs::read_to_string(file) {
-                let hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    hasher.finish()
-                };
-                if let Some(prev) = file_hashes.get(file) {
-                    if *prev != hash {
-                        changed.push(file.clone());
-                    }
-                } else {
-                    new_files.push(file.clone());
-                }
-                file_hashes.insert(file.clone(), hash);
-            }
-        }
-
-        if iteration == 0 {
-            println!("[watch] Initial scan: {} files tracked", files.len());
-            for f in &new_files {
-                let short = f.strip_prefix(repo_root).unwrap_or(f);
-                println!("  + {}", short);
-            }
-        } else if !changed.is_empty() {
-            println!("[watch] {} file(s) changed:", changed.len());
-            for f in &changed {
-                let short = f.strip_prefix(repo_root).unwrap_or(f);
-                println!("  ~ {}", short);
-            }
-            let _now = std::time::SystemTime::now();
-            let duration = std::time::Duration::from_secs(interval_secs);
-            std::thread::sleep(duration);
-            continue;
-        }
-
-        if !changed.is_empty() || iteration == 0 {
-            let suite_result = std::process::Command::new("./bootstrap/target/release/t27c")
-                .args(["suite", "--repo-root", repo_root])
-                .output();
-            match suite_result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if line.contains("FAIL") || line.contains("TOTAL FAILURES") || line.contains("ALL TESTS PASSED") {
-                            println!("[suite] {}", line);
-                        }
-                    }
-                }
-                Err(e) => println!("[watch] suite error: {}", e),
-            }
-        }
-
-        iteration += 1;
-        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
-    }
-}
-
 fn run_diff(left_path: &str, right_path: &str) -> anyhow::Result<()> {
     let left_src = fs::read_to_string(left_path)?;
     let right_src = fs::read_to_string(right_path)?;
@@ -12149,7 +12045,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Size { input } => run_size(&input)?,
         Commands::Analyze { repo_root, json, top } => run_analyze(&repo_root, json, top)?,
         Commands::Diff { left, right } => run_diff(&left, &right)?,
-        Commands::Watch { repo_root, interval_secs } => run_watch(&repo_root, interval_secs)?,
         Commands::Ci { repo_root } => run_ci(&repo_root)?,
         Commands::Inspect { input } => run_inspect(&input)?,
         Commands::Outline { input } => run_outline(&input)?,
@@ -12592,7 +12487,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Size { input } => run_size(&input)?,
         Commands::Analyze { repo_root, json, top } => run_analyze(&repo_root, json, top)?,
         Commands::Diff { left, right } => run_diff(&left, &right)?,
-        Commands::Watch { repo_root, interval_secs } => run_watch(&repo_root, interval_secs)?,
         Commands::Ci { repo_root } => run_ci(&repo_root)?,
         Commands::Inspect { input } => run_inspect(&input)?,
         Commands::Outline { input } => run_outline(&input)?,
