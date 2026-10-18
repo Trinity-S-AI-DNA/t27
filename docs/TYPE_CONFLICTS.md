@@ -61,7 +61,7 @@ definition moves. `tri types classified` cross-checks the file against a live
 Non-empty drift in either direction exits non-zero. A classification nobody
 re-reads becomes a claim about a tree that no longer exists.
 
-## DRIFT -- 62 names
+## DRIFT -- 61 names
 
 One concept, two definitions. These are the ones with a repair.
 
@@ -90,7 +90,6 @@ One concept, two definitions. These are the ones with a repair.
 | `Match` | 2 | 2 files | Collapse Match/MatchResult/RegexMatch onto regex_advanced.t27's RegexMatch (it is already the... |
 | `MemPort` | 2 | 2 files | Make fpga/hir.t27 import Memory's MemPort rather than restate it; reconcile MAX_MEM_PORTS (4 ... |
 | `Message` | 3 | 3 files | Pick one Message and one MessageRole (with fixed discriminants) in provider/schema.t27; have ... |
-| `OptimizerStepResult` | 3 | 2 files | Two fixes: (1) delete the second body of adamw.t27 (lines ~460-end duplicate lines ~14-459) o... |
 | `PinAssignment` | 3 | 3 files | Hoist one PinAssignment (the 9-field version) into a shared boards module and have all three ... |
 | `PinMapping` | 2 | 2 files | Either give each board its own name (ArtyA7PinMapping / QMTechA100TPinMapping) or use the spe... |
 | `PolicyOutput` | 2 | 2 files | Rename to PPOPolicyOutput / SACPolicyOutput, matching the SACActorConfig convention already i... |
