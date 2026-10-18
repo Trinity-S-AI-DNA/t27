@@ -23,6 +23,21 @@
 ; unknown: not starved, and some row is unreadable. idle: no open run. flowing: otherwise.
 ; The honest limit: age is creation age. A queued run's age is how long it has waited. An
 ; in_progress run's age also includes the time it has run, and a merge job takes under a minute.
+; --
+; Yield: does a merger run merge anything? (tick 14, 2026-10-18)
+; Only 1 of the last 40 merges came through the merger workflow; the other 39 had GitHub's
+; native auto-merge enabled (auto_squash_enabled in the PR timeline). The last 10 successful merger
+; runs merged 0 PRs. 9 of them were workflow_run runs that each took a runner to log "no
+; bee-reviewed label" for one PR. The schedule sweep skipped 6 old PRs whose label came from the wrong hand.
+; Input: one row per merger run, event TAB merged TAB no_label TAB other. merged counts the PRs it
+; merged. no_label counts PRs it skipped for a missing bee-reviewed label. other counts PRs it
+; skipped for any other reason. event is workflow_run, schedule, pull_request_target or
+; workflow_dispatch.
+; Output, yield_plan:
+;     Y TAB merger yield: <m> PRs merged in <r> runs; <e> merged nothing, <l> of them only for a
+;                         missing label; <b> unreadable
+;     F TAB merger-yield TAB zero | some | unknown | none
+; A known merge wins over an unreadable row; with no merge, an unreadable row makes it unknown.
 ; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
 
 module ClawMergeLane;
@@ -145,6 +160,107 @@ pub fn merge_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize
     return put_str(out, cap, w, ML_FLAG_TEXTS[v], ML_FLAG_LENS[v]);
 }
 
+// ---- yield ----
+
+pub const MY_RUNS : usize = 0;
+pub const MY_MERGED : usize = 1;
+pub const MY_EMPTY : usize = 2;
+pub const MY_LABEL_ONLY : usize = 3;
+pub const MY_BAD : usize = 4;
+pub const MY_SLOTS : usize = 5;
+
+pub const MY_ZERO : u8 = 0;
+pub const MY_SOME : u8 = 1;
+pub const MY_UNKNOWN : u8 = 2;
+pub const MY_NONE : u8 = 3;
+
+pub const MY_HEAD : str = "Y\tmerger yield: ";
+pub const MY_HEAD_LEN : usize = 16;
+pub const MY_TEXTS : [5]str = [" PRs merged in ", " runs; ", " merged nothing, ", " of them only for a missing label; ", " unreadable\n"];
+pub const MY_LENS : [5]usize = [15, 7, 17, 35, 12];
+pub const MY_FLAG_HEAD : str = "F\tmerger-yield\t";
+pub const MY_FLAG_HEAD_LEN : usize = 15;
+pub const MY_FLAG_TEXTS : [4]str = ["zero\n", "some\n", "unknown\n", "none\n"];
+pub const MY_FLAG_LENS : [4]usize = [5, 5, 8, 5];
+
+/// raw[s..e) is an event that starts the merger.
+pub fn my_event_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, "workflow_run", 12) or qc_range_is(raw, s, e, "schedule", 8) or qc_range_is(raw, s, e, "pull_request_target", 19) or qc_range_is(raw, s, e, "workflow_dispatch", 17);
+}
+
+/// Yield counts in st[MY_RUNS..MY_BAD]. Returns the number of rows.
+pub fn my_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [8]usize = undefined;
+    var k : usize = 0;
+    while (k < MY_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var ok : bool = false;
+            if (rows < ML_MAX_ROWS and qc_split(raw, ls, le, &f, 4)) {
+                const m : i32 = qc_secs(raw, f[2], f[3]);
+                const nl : i32 = qc_secs(raw, f[4], f[5]);
+                const ot : i32 = qc_secs(raw, f[6], f[7]);
+                if (my_event_ok(raw, f[0], f[1]) and m >= 0 and nl >= 0 and ot >= 0) {
+                    ok = true;
+                    st[MY_RUNS] += 1;
+                    st[MY_MERGED] += m as u32;
+                    if (m == 0) {
+                        st[MY_EMPTY] += 1;
+                        if (nl > 0 and ot == 0) { st[MY_LABEL_ONLY] += 1; }
+                    }
+                }
+            }
+            if (ok == false) { st[MY_BAD] += 1; }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The yield verdict from the counts: a known merge wins over an unreadable row.
+pub fn my_verdict_of(st : []const u32) -> u8 {
+    if (st[MY_MERGED] > 0) { return MY_SOME; }
+    if (st[MY_BAD] > 0) { return MY_UNKNOWN; }
+    if (st[MY_RUNS] == 0) { return MY_NONE; }
+    return MY_ZERO;
+}
+
+pub fn my_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [5]u32 = undefined;
+    const rows : u32 = my_counts(raw, n, &st);
+    if (rows == 0) { return MY_NONE; }
+    return my_verdict_of(&st);
+}
+
+/// The two yield lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn yield_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [5]u32 = undefined;
+    const rows : u32 = my_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, MY_HEAD, MY_HEAD_LEN);
+    w = put_count(out, cap, w, st[MY_MERGED]);
+    w = put_str(out, cap, w, MY_TEXTS[0], MY_LENS[0]);
+    w = put_count(out, cap, w, st[MY_RUNS]);
+    w = put_str(out, cap, w, MY_TEXTS[1], MY_LENS[1]);
+    w = put_count(out, cap, w, st[MY_EMPTY]);
+    w = put_str(out, cap, w, MY_TEXTS[2], MY_LENS[2]);
+    w = put_count(out, cap, w, st[MY_LABEL_ONLY]);
+    w = put_str(out, cap, w, MY_TEXTS[3], MY_LENS[3]);
+    w = put_count(out, cap, w, st[MY_BAD]);
+    w = put_str(out, cap, w, MY_TEXTS[4], MY_LENS[4]);
+    w = put_str(out, cap, w, MY_FLAG_HEAD, MY_FLAG_HEAD_LEN);
+    var v : usize = MY_NONE as usize;
+    if (rows > 0) { v = my_verdict_of(&st) as usize; }
+    return put_str(out, cap, w, MY_FLAG_TEXTS[v], MY_FLAG_LENS[v]);
+}
+
 // ---- test helpers ----
 
 /// The merger on 2026-10-18 at 20:22 UTC, in miniature: the oldest queued run (6598 s), the
@@ -231,4 +347,85 @@ test a_clipped_plan_still_advances_the_cursor {
     const n : usize = t_starved(&raw, 128);
     var out : [160]u8 = undefined;
     assert merge_plan(&raw, n, &out, 40) == 125;
+}
+
+// ---- yield tests ----
+
+/// The last 10 successful merger runs on 2026-10-18: nine workflow_run runs that each skipped one
+/// PR for a missing label, and the schedule sweep that skipped six PRs for other reasons.
+fn t_yield_today(dst : []u8, cap : usize) -> usize {
+    var x : usize = 0;
+    var i : u32 = 0;
+    while (i < 9) {
+        x = put_str(dst, cap, x, "workflow_run\t0\t1\t0\n", 19);
+        i += 1;
+    }
+    return put_str(dst, cap, x, "schedule\t0\t0\t6\n", 15);
+}
+
+fn t_yield2(a : str, al : usize, b : str, bl : usize) -> u8 {
+    var raw : [96]u8 = undefined;
+    var x : usize = put_str(&raw, 96, 0, a, al);
+    x = put_str(&raw, 96, x, b, bl);
+    return my_verdict(&raw, x);
+}
+
+test the_merger_yield_on_2026_10_18_is_zero {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    assert n == 186;
+    var st : [5]u32 = undefined;
+    assert my_counts(&raw, n, &st) == 10;
+    assert st[MY_RUNS] == 10;
+    assert st[MY_MERGED] == 0;
+    assert st[MY_EMPTY] == 10;
+    assert st[MY_LABEL_ONLY] == 9;
+    assert st[MY_BAD] == 0;
+    assert my_verdict(&raw, n) == MY_ZERO;
+}
+
+test the_zero_yield_plan_text {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    var out : [160]u8 = undefined;
+    const w : usize = yield_plan(&raw, n, &out, 160);
+    assert w == 129;
+    assert buf_has(&out, w, "Y\tmerger yield: 0 PRs merged in 10 runs; 10 merged nothing, 9 of them only for a missing label; 0 unreadable\n", 109) == true;
+    assert buf_has(&out, w, "F\tmerger-yield\tzero\n", 20) == true;
+}
+
+test a_known_merge_wins_over_an_unreadable_row {
+    assert t_yield2("pull_request_target\t1\t0\t0\n", 26, "workflow_run\tx\t1\t0\n", 19) == MY_SOME;
+    assert t_yield2("workflow_run\tx\t1\t0\n", 19, "workflow_run\t0\t1\t0\n", 19) == MY_UNKNOWN;
+}
+
+test label_only_needs_no_other_skip {
+    var st : [5]u32 = undefined;
+    assert my_counts("schedule\t0\t1\t2\n", 15, &st) == 1;
+    assert st[MY_EMPTY] == 1;
+    assert st[MY_LABEL_ONLY] == 0;
+    assert my_counts("workflow_run\t2\t1\t0\n", 19, &st) == 1;
+    assert st[MY_EMPTY] == 0;
+    assert st[MY_LABEL_ONLY] == 0;
+    assert st[MY_MERGED] == 2;
+}
+
+test an_unknown_event_is_unreadable {
+    assert t_yield2("push\t0\t1\t0\n", 11, "schedule\t0\t0\t6\n", 15) == MY_UNKNOWN;
+    assert t_yield2("workflow_dispatch\t0\t0\t0\n", 24, "schedule\t0\t0\t6\n", 15) == MY_ZERO;
+    assert t_yield2("schedule\t0\t0\n", 13, "schedule\t0\t0\t6\n", 15) == MY_UNKNOWN;
+}
+
+test no_yield_rows_is_none {
+    assert my_verdict("", 0) == MY_NONE;
+    var out : [160]u8 = undefined;
+    const w : usize = yield_plan("", 0, &out, 160);
+    assert buf_has(&out, w, "F\tmerger-yield\tnone\n", 20) == true;
+}
+
+test a_clipped_yield_plan_still_advances_the_cursor {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    var out : [160]u8 = undefined;
+    assert yield_plan(&raw, n, &out, 30) == 129;
 }
