@@ -1,107 +1,77 @@
 ---
 id: tri-pipeline
 name: TRI Pipeline
-description: Execute tri commands (gen, test, verify, seal, verdict) for spec-first development
+description: The exact commands of the t27 toolchain (tri, t27c, t27b, tri t27o) for spec-first work -- check, test with per-test counts and vacuity, seal, lower to Verilog, convert foreign code, gate a PR. Every command named here exists; checked against --help on 2026-10-18.
 ---
 
 # TRI Pipeline Skill
 
-Execute the canonical t27 toolchain commands.
+<!-- only-t27-rule -->
+> **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
+> - New logic starts as a `.t27` spec with `test` / `invariant` blocks. It reaches Rust, C, Zig, JS or Python only through `t27c gen-*`, and generated files are never hand-edited (L2).
+> - Hand-written code in any other language is denied by the hooks and by CI: `.rs .py .ts .js .sh .zig .c .go .v .yml .toml`, Dockerfile, Makefile; the full list is in `specs/policy/own_language.t27`.
+> - Existing foreign code is debt that only shrinks. Delete it, or replace it with a spec and its generated output.
+> - Thin hand-written glue is capped at 40 added lines per file and 80 per PR. No label lifts the cap. Never split a PR to slip under it.
+> - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
+> - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
 
-## Commands
+## Three things called `tri`
 
-### `tri gen`
-Generate code from .t27 specifications.
+| Name | What it is | Note |
+|---|---|---|
+| `scripts/tri` | bash front door; runs `scripts/tri_loop/*.py` helpers first (`pr-state`, `priority`, `triage`, `tick`, `t27b`, `toolbelt`, `damage`, `swarm`; list: `tri loop-help`), else forwards to `t27c` | `scripts/tri test` is the WHOLE-REPO `t27c suite`, not one spec |
+| `target/release/tri` | Rust CLI, `cargo build --release -p tri`, ~55 subcommands; `--help` is the authority | `tri test <spec>` is the one-spec runner |
+| `t27c` | the compiler, `cargo build --release -p t27c` | lands at `./target/release/t27c` (workspace root) |
 
-```bash
-tri gen specs/ring-NNN-name.t27
-```
+Use `./target/release/tri` and `./target/release/t27c` by path when the difference matters.
 
-**Output**: Generated files in `gen/` directory
-**Laws**: L2 (GENERATION) - gen/ is read-only
-**Verification**: Hash verification during seal phase
-
-### `tri test`
-Run conformance tests from specifications.
-
-```bash
-tri test specs/ring-NNN-name.t27
-```
-
-**Output**: Test results, pass/fail status
-**Laws**: L4 (TESTABILITY) - specs must have tests
-**Success Criteria**: All tests pass, invariants satisfied
-
-### `tri verify`
-Verify all 7 invariant laws.
+## One spec, end to end
 
 ```bash
-tri verify
+export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local   # sandboxed sessions
+./target/release/t27c check specs/<dir>/<name>.t27          # parse + typecheck, fast
+./target/release/t27c test-report specs/<dir>/<name>.t27    # runs every test; per-test assert counts; "vacuous passes N of M"
+./target/release/tri test specs/<dir>/<name>.t27            # exit code gate over test-report (does not yet fail on vacuous: #10497)
+./target/release/t27c seal specs/<dir>/<name>.t27 --save    # writes .trinity/seals/<dir>_<Module>.json
+./target/release/t27c seal specs/<dir>/<name>.t27 --verify   # must print "all hashes MATCH"
 ```
 
-**Checks**:
-- L1: Commits have issue references
-- L2: No manual edits to gen/
-- L3: ASCII-only source files
-- L4: All specs have tests
-- L5: φ identity constraints
-- L6: FORMAT-SPEC-001.json authority
-- L7: No new shell scripts on critical path
+- `t27c test <spec>` only LISTS the test blocks; it runs nothing. Never quote it as a test result.
+- A pass with 0 runtime asserts is vacuous. Read the `vacuous passes` line of `test-report` yourself until #10497 lands.
+- Negative control: copy the spec to `$TMPDIR`, break one constant, run `test-report`, and see a FAIL before you claim the tests mean anything.
+- `t27c test-report` exits 1 on FAIL and 2 on BLOCKED (did not compile).
 
-**Output**: Pass/fail for each law
-**Block**: Non-compliant commits are blocked
+## Generate and lower
 
-### `tri seal`
-Generate and verify seal hash.
+- `t27c gen-verilog | gen-c | gen-rust | gen <spec>` print to stdout (`gen` is Zig). `tri gen <spec>` runs gen-verilog, gen-c and gen-rust to stdout and writes nothing.
+- `t27b verilog <spec>` (native backend, `cargo build --release -p t27b`) is the path for FPGA board tops: it can instantiate primitives and other modules, takes pin attributes `<port>_LOC|IOSTANDARD|SLEW|IN_TERM` (no XDC), and writes a testbench under `-DT27B_TESTBENCH`. It **refuses signed types** (exit 2): fixed-point hardware specs keep a sign flag with unsigned magnitudes.
+- `t27b test <spec> [--check]` is the AArch64 JIT runner (fast; prints total runtime asserts, not per test). Exit 4 means the JIT and the interpreter disagree.
+- AX7203 caveat (#10498): `t27c fpga-build` defaults to the Wukong fgg676 part and `t27c fpga-flash` has no ax7203 board; the AX7203 is `xc7a200tfbg484-2` (`fpga/HARDWARE_SSOT.md`). Follow M0 (`specs/fpga/rc_filter_ax7203.t27`, #10276) for the board flow.
 
-```bash
-tri seal specs/ring-NNN-name.t27
-```
+## Foreign code in
 
-**Output**: Hash of generated artifacts
-**Purpose**: Immutable snapshot for verification
+- `tri t27o <file.rs> [--name N] [--oracle] [--check]` turns a Rust file into a `.t27` skeleton; refused bodies keep their signature and a comment naming the refused construct. Rules: `specs/tools/t27o/rust_convert.t27`. Rust is the only front end today; a new language is a new `specs/tools/t27o/<lang>_convert.t27` beside it (the SPICE front end for #10486 goes there).
 
-### `tri verdict`
-Generate formal pass/fail verdict.
+## Is someone already on it?
 
-```bash
-tri verdict
-```
+- `tri topic <keywords>` -- open issues, PRs and recent commits that match. Run it before opening an issue or a lane.
+- `tri loop claim <name>` -- take a named claim so two loop ticks or sessions cannot pick the same task.
 
-**Output**:
-- Overall status: PASS | FAIL
-- Law compliance breakdown
-- Required fixes for failures
+## Pull requests and CI
 
-### `tri experience save`
-Save episode to experience log.
+- `tri pr ready <N> [--wait --required-only]` prints one `VERDICT:` line (safe to merge, DO NOT MERGE, WAIT, CANNOT TELL, NEW REASON) after classifying every failing check.
+- `tri pr landed <N> --probe S --file P` -- did the content actually reach the default branch.
+- `tri night`, `tri red now|why`, `tri ci baseline`, `tri gates ...`, `tri merging`, `tri lanes --repo t27 --base master`.
+- `tri seals fresh|drift|twins|hollow` -- seal health across the tree.
+- `tri hooks pre-commit|commit-msg|pre-push|l1-check|status` -- the commit gates, runnable by hand.
+- Commit in a worktree with `git -c core.hooksPath=.githooks commit`: the configured hooks path is the main checkout's.
 
-```bash
-tri experience save --ring 72 --phase verify --outcome success
-```
+## Experience
 
-**Output**: Entry in `~/.trinity/experience/episodes.jsonl`
+- `tri experience save` (no flags) is the only experience command. There is no `tri experience query` and no `tri verify`.
 
-### `tri experience query`
-Search past episodes.
+## MCP servers
 
-```bash
-tri experience query "how to fix L5 violation"
-```
-
-**Output**: Relevant past episodes with solutions
-
-## Error Handling
-
-If a command fails:
-1. Log error with context
-2. Suggest fix based on error type
-3. Check experience for similar past issues
-4. Retry with modified inputs if applicable
-
-## Success Indicators
-
-- Command exits with code 0
-- Output contains expected patterns
-- No law violations detected
-- Artifacts are generated correctly
+- **t27 MCP** (gHashTag/t27-mcp, local stdio): `t27_check` (compiler front end in wasm: parse + typecheck only, no tests), `t27_spec`, `t27_specs`, `t27_grep`, `t27_find`, `t27_examples`, `t27f_outline`, `t27f_graph`, `t27_dashboard` and more. Use `t27_check` for a fast syntax check without a build.
+- **TRI CLAW** (`/mcp` of the vibee-render service): about 170 tools; `t27_specs` and `hdl_run` (verilator lint, iverilog sim, yosys synth_xilinx) are the ones spec work uses. The t27 tools are being mounted there (#10483, gHashTag/t27-mcp#26).
+- `cli/tri-mcp` is not buildable (not a workspace member, #5395) and its `tri_test` only lists tests (#8140, fix in #8149). Do not rely on it.

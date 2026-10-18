@@ -5,6 +5,15 @@ description: How a CI gate lies. Six confirmed cases from one day in this reposi
 
 # How a gate lies
 
+<!-- only-t27-rule -->
+> **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
+> - New logic starts as a `.t27` spec with `test` / `invariant` blocks. It reaches Rust, C, Zig, JS or Python only through `t27c gen-*`, and generated files are never hand-edited (L2).
+> - Hand-written code in any other language is denied by the hooks and by CI: `.rs .py .ts .js .sh .zig .c .go .v .yml .toml`, Dockerfile, Makefile; the full list is in `specs/policy/own_language.t27`.
+> - Existing foreign code is debt that only shrinks. Delete it, or replace it with a spec and its generated output.
+> - Thin hand-written glue is capped at 40 added lines per file and 80 per PR. No label lifts the cap. Never split a PR to slip under it.
+> - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
+> - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
+
 Every rule below is a specific failure found in this repository on 2026-08-18, with the
 path. None is a principle someone liked.
 
@@ -44,9 +53,9 @@ a claim that isn't true.
 
 Replacing one `echo` with *does every tracked JSON parse* — the weakest question worth
 asking, chosen because it carries no theory that could itself be wrong — immediately found
-`clara-bridge/audit-trail/experience-schema.json` with a literal `...` on line 40, which
-`clara-bridge/tests/run_tests.py:152` loads with `json.load()`. **3 of its 11 tests were
-failing** and no workflow ran that suite at all.
+a vendored audit-trail schema with a literal `...` on line 40, which its own test
+runner loaded with `json.load()` (both files have since been deleted). **3 of that
+suite's 11 tests were failing** and no workflow ran it at all.
 
 ## 2. A gate is green until proven otherwise — check its SCOPE separately from its result
 

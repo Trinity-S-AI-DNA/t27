@@ -1,0 +1,587 @@
+// HC-01 — executes SR-03 `BrowserCommand`s against a CDP endpoint.
+// Port of gHashTag/trios:crates/trios-host-cdp/rings/HC-01/src/lib.rs
+// (at 8b229e9489ee, 278 lines) — Roadmap Stage 6, goal #4548, target t27c gen-rust.
+//
+// The original is a CDP transport with a dispatch table: every one of the 12
+// `browser_*` host tools is mapped onto minimal CDP calls (`Page.navigate`,
+// `Runtime.evaluate`, `Page.captureScreenshot`, `Target.createTarget` /
+// `closeTarget`); DOM interactions go through `Runtime.evaluate` so no extra
+// CDP domains have to be enabled. The WebSocket round-trips are plumbing; the
+// decisions the file makes — which CDP method a command maps to, which JS
+// expression it builds, which params are required with which defaults, and
+// which responses count as failures — are ported here as pure functions and
+// tested. The transports keep their names with `undefined;` bodies that no
+// test calls (issue #9560, "Port the decision, not the plumbing").
+//
+// `BrowserCommand`s arrive in the original from `BrowserCommand::from_tool_name`
+// (trios-a2a); the port identifies them by that tool name, exactly as the
+// original's own tests do (`cmd("browser_navigate", ...)`).
+
+module port::trios_host_cdp_hc01_lib;
+
+// ---------------------------------------------------------------------------
+// Original line 22: `impl CdpCall for trios_host_cdp_hc00::CdpClient`.
+// The whole body hands `method` and `params` to HC-00's client and awaits its
+// WebSocket round-trip. Pure transport: no decision lives here.
+// ---------------------------------------------------------------------------
+
+pub fn trios_host_cdp_hc00_call(method: str, params_len: usize) -> ?str {
+    return undefined; // plumbing: HC-00 CdpClient WebSocket round-trip (lines 22-25)
+}
+
+// ---------------------------------------------------------------------------
+// Original line 50: `fn js_str(raw: &str) -> String`.
+// JSON-escape a CSS selector (or any string) for safe embedding into a JS
+// expression: `serde_json::to_string(raw)`. serde_json wraps the input in
+// `"`, escapes `"` and `\`, emits \n \r \t \b \f as two-char escapes, every
+// other control below 0x20 as a lowercase \u00xx, and passes all other bytes
+// through. The `unwrap_or_else(|_| "\"\"")` arm is unreachable for a &str
+// input and is not ported. The original returns a growable String; this port
+// uses the fixed-capacity idiom with `len` as the live length.
+// ---------------------------------------------------------------------------
+
+pub const JS_STR_CAPACITY: usize = 256;
+
+pub struct JsonEscaped {
+    bytes: [256]u8,
+    len: usize,
+}
+
+/// One hex digit of a \u00xx escape, lowercase as serde_json emits it.
+pub fn hex_digit(v: u8) -> u8 {
+    if (v < 10) {
+        return '0' + v;
+    }
+    return 'a' + v - 10;
+}
+
+/// serde_json gives the named controls two-char escapes; every other byte
+/// below 0x20 becomes a six-byte \u00xx (original line 51).
+pub fn needs_unicode_escape(c: u8) -> bool {
+    if (c == '\n') {
+        return false;
+    }
+    if (c == '\r') {
+        return false;
+    }
+    if (c == '\t') {
+        return false;
+    }
+    if (c == 0x08) {
+        return false;
+    }
+    if (c == 0x0C) {
+        return false;
+    }
+    return c < 0x20;
+}
+
+pub fn js_str(raw: str) -> JsonEscaped {
+    var out: JsonEscaped = undefined;
+    out.bytes[0] = '"';
+    out.len = 1;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c: u8 = raw[i];
+        // worst case one source byte emits six output bytes (\u00xx)
+        if (out.len + 6 > JS_STR_CAPACITY) {
+            break;
+        }
+        if (c == '"') {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = '"';
+            out.len += 1;
+        } else if (c == '\\') {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+        } else if (c == '\n') {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 'n';
+            out.len += 1;
+        } else if (c == '\r') {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 'r';
+            out.len += 1;
+        } else if (c == '\t') {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 't';
+            out.len += 1;
+        } else if (c == 0x08) {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 'b';
+            out.len += 1;
+        } else if (c == 0x0C) {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 'f';
+            out.len += 1;
+        } else if (needs_unicode_escape(c)) {
+            out.bytes[out.len] = '\\';
+            out.len += 1;
+            out.bytes[out.len] = 'u';
+            out.len += 1;
+            out.bytes[out.len] = '0';
+            out.len += 1;
+            out.bytes[out.len] = '0';
+            out.len += 1;
+            out.bytes[out.len] = hex_digit(c / 16);
+            out.len += 1;
+            out.bytes[out.len] = hex_digit(c % 16);
+            out.len += 1;
+        } else {
+            out.bytes[out.len] = c;
+            out.len += 1;
+        }
+        i += 1;
+    }
+    if (out.len < JS_STR_CAPACITY) {
+        out.bytes[out.len] = '"';
+        out.len += 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Original line 54: `fn required_str<'a>(params: &'a Value, key: &str)
+// -> Result<&'a str>` — read `params[key]` as a string or fail with
+// "missing required param `{key}`". The JSON map lookup is plumbing; the
+// decision is: present means the value passes, absent means the call fails
+// and the key names the missing param. The error message itself is a fixed
+// template around the key — print-shaped, left to the caller — so the port
+// carries the verdict and the key.
+// ---------------------------------------------------------------------------
+
+pub struct RequiredStr {
+    ok: bool,
+    value: str,
+    key: str,
+}
+
+pub fn required_str(present: bool, value: str, key: str) -> RequiredStr {
+    if (present) {
+        return RequiredStr { ok: true, value: value, key: key };
+    }
+    return RequiredStr { ok: false, value: "", key: key };
+}
+
+// ---------------------------------------------------------------------------
+// Original line 28: `async fn eval(cdp: &dyn CdpCall, expression: &str)
+// -> Result<Value>`. The CDP round-trip is plumbing; the decision inside is:
+// a response carrying `exceptionDetails` FAILS, with the exception's
+// `description`, else its `text`, else "JS exception" (lines 39-47);
+// otherwise the value under `result.value` is the answer (line 46).
+// ---------------------------------------------------------------------------
+
+pub fn eval(cdp_ready: bool, expression: str) -> ?str {
+    return undefined; // plumbing: Runtime.evaluate round-trip (lines 29-38)
+}
+
+/// Lines 39-44: the failure text of an evaluate answer — `description` wins,
+/// `text` is the fallback, "JS exception" when neither is present.
+pub fn eval_failure_text(has_description: bool, description: str, has_text: bool, text: str) -> str {
+    if (has_description) {
+        return description;
+    }
+    if (has_text) {
+        return text;
+    }
+    return "JS exception";
+}
+
+/// Lines 39-46: an evaluate answer succeeds exactly when it carries no
+/// `exceptionDetails`.
+pub fn eval_ok(has_exception_details: bool) -> bool {
+    return !has_exception_details;
+}
+
+// ---------------------------------------------------------------------------
+// Original line 62: `pub async fn execute_command(cdp: &dyn CdpCall,
+/// command: &BrowserCommand) -> Result<Value>` — the dispatch table over the
+/// 12 SR-03 commands. Every arm sends CDP round-trips (plumbing); the
+/// decisions each arm makes are ported as the pure helpers below and tested.
+// ---------------------------------------------------------------------------
+
+pub fn execute_command(cdp_ready: bool, command: str) -> ?str {
+    return undefined; // plumbing: per-arm CDP round-trips (lines 63-165)
+}
+
+/// Lines 63-165 and the module header: which CDP method each command maps
+/// onto. GetUrl, GetTitle, GetDom, QuerySelector, Click, Type, Scroll and
+/// Eval all go through `Runtime.evaluate` — "DOM interactions go through
+/// Runtime.evaluate so no extra CDP domains have to be enabled".
+pub fn cdp_method_for(command: str) -> str {
+    if (command == "browser_navigate") {
+        return "Page.navigate";
+    }
+    if (command == "browser_screenshot") {
+        return "Page.captureScreenshot";
+    }
+    if (command == "browser_open_tab") {
+        return "Target.createTarget";
+    }
+    if (command == "browser_close_tab") {
+        return "Target.closeTarget";
+    }
+    return "Runtime.evaluate";
+}
+
+/// Lines 66 and 73: GetUrl and GetTitle evaluate one fixed expression each.
+pub fn direct_eval_expression(command: str) -> str {
+    if (command == "browser_get_url") {
+        return "location.href";
+    }
+    if (command == "browser_get_title") {
+        return "document.title";
+    }
+    return "";
+}
+
+/// Lines 74-77: Navigate reports `errorText` exactly when it failed; the
+/// success payload reports ok, the requested url and the frameId the
+/// endpoint returned (the original test pins frame_id "F7" for ok).
+pub struct NavigateOutcome {
+    ok: bool,
+    url: str,
+    frame_id: str,
+}
+
+pub fn navigate_outcome(error_text_present: bool, url: str, frame_id: str) -> NavigateOutcome {
+    if (error_text_present) {
+        return NavigateOutcome { ok: false, url: url, frame_id: "" };
+    }
+    return NavigateOutcome { ok: true, url: url, frame_id: frame_id };
+}
+
+/// Lines 80-88: GetDom evaluates the document's outerHTML, or one element's
+/// outerHTML when a selector is given — the selector is JSON-escaped by
+/// js_str before it is embedded (the same rule the original's
+/// click_escapes_the_selector test pins).
+pub struct DomExpressionPlan {
+    whole_document: bool,
+    selector: JsonEscaped,
+}
+
+pub fn get_dom_expression(selector_present: bool, selector: str) -> DomExpressionPlan {
+    if (selector_present) {
+        return DomExpressionPlan { whole_document: false, selector: js_str(selector) };
+    }
+    return DomExpressionPlan { whole_document: true, selector: js_str("") };
+}
+
+/// Lines 89-97: QuerySelector requires a selector and reports `count` plus
+/// the first element's outerHTML capped at 4096 bytes.
+pub const QUERY_SELECTOR_HTML_CAP: usize = 4096;
+
+pub struct QuerySelectorPlan {
+    selector: JsonEscaped,
+    first_html_cap: usize,
+}
+
+pub fn query_selector_plan(selector: str) -> QuerySelectorPlan {
+    return QuerySelectorPlan { selector: js_str(selector), first_html_cap: QUERY_SELECTOR_HTML_CAP };
+}
+
+/// Lines 125-130: Scroll takes `x` defaulting to 0.0 and `y` defaulting to
+/// 600.0 when absent.
+pub fn scroll_deltas(x_present: bool, x: f64, y_present: bool, y: f64) -> (f64, f64) {
+    const dx: f64 = if (x_present) x else 0.0;
+    const dy: f64 = if (y_present) y else 600.0;
+    return (dx, dy);
+}
+
+/// Lines 134-141: Eval takes `expression`, falls back to `code`, and fails
+/// naming `expression` when neither is present (the original's
+/// eval_requires_expression test).
+pub fn eval_expression(has_expression: bool, expression: str, has_code: bool, code: str) -> RequiredStr {
+    const direct = required_str(has_expression, expression, "expression");
+    if (direct.ok) {
+        return direct;
+    }
+    const fallback = required_str(has_code, code, "code");
+    if (fallback.ok) {
+        return fallback;
+    }
+    return RequiredStr { ok: false, value: "", key: "expression" };
+}
+
+/// Lines 141-148: Screenshot defaults its format to "png" and must answer
+/// with a `data` string — without it the command fails with
+/// "captureScreenshot returned no data".
+pub fn screenshot_format(format_present: bool, format: str) -> str {
+    if (format_present) {
+        return format;
+    }
+    return "png";
+}
+
+pub struct ScreenshotOutcome {
+    ok: bool,
+    data: str,
+    format: str,
+}
+
+pub fn screenshot_outcome(data_present: bool, data: str, format_present: bool, format: str) -> ScreenshotOutcome {
+    const fmt: str = screenshot_format(format_present, format);
+    if (!data_present) {
+        return ScreenshotOutcome { ok: false, data: "", format: fmt };
+    }
+    return ScreenshotOutcome { ok: true, data: data, format: fmt };
+}
+
+/// Line 151: OpenTab's url defaults to "about:blank".
+pub fn open_tab_url(url_present: bool, url: str) -> str {
+    if (url_present) {
+        return url;
+    }
+    return "about:blank";
+}
+
+/// Lines 158-159: CloseTab requires `target_id` and falls back to the
+/// camelCase `targetId` spelling; when both are absent the surfaced error
+/// names the second key.
+pub fn close_tab_target_id(has_target_id: bool, target_id: str, has_target_id_alt: bool, target_id_alt: str) -> RequiredStr {
+    const primary = required_str(has_target_id, target_id, "target_id");
+    if (primary.ok) {
+        return primary;
+    }
+    return required_str(has_target_id_alt, target_id_alt, "targetId");
+}
+
+// ---------------------------------------------------------------------------
+// Tests — each asserts a behaviour read in the original (lines refer to
+// crates/trios-host-cdp/rings/HC-01/src/lib.rs at 8b229e9489ee).
+// ---------------------------------------------------------------------------
+
+test js_str_wraps_in_quotes_and_escapes {
+    // serde_json::to_string("") is `""` — two bytes.
+    const empty = js_str("");
+    assert(empty.len == 2);
+    assert(empty.bytes[0] == '"');
+    assert(empty.bytes[1] == '"');
+    // "a" -> "a" — three bytes, wrapped.
+    const one = js_str("a");
+    assert(one.len == 3);
+    assert(one.bytes[0] == '"');
+    assert(one.bytes[1] == 'a');
+    assert(one.bytes[2] == '"');
+    // The embedded quote is escaped (line 51).
+    const quoted = js_str("a\"b");
+    assert(quoted.len == 6);
+    assert(quoted.bytes[2] == '\\');
+    assert(quoted.bytes[3] == '"');
+    assert(quoted.bytes[5] == '"');
+    // The backslash is escaped too.
+    const slashed = js_str("\\");
+    assert(slashed.len == 4);
+    assert(slashed.bytes[1] == '\\');
+    assert(slashed.bytes[2] == '\\');
+    // Newline is a two-char escape.
+    const nl = js_str("\n");
+    assert(nl.len == 4);
+    assert(nl.bytes[1] == '\\');
+    assert(nl.bytes[2] == 'n');
+}
+
+test js_str_original_evil_selector {
+    // The original's click test pins: the selector `a[href="x"] ' ` + backtick
+    // must be JSON-escaped before embedding — its quotes become \" while the
+    // apostrophe and the backtick pass through raw.
+    const r = js_str("a[href=\"x\"] ' `");
+    // 15 source bytes, two escaped quotes add two backslashes, two wrapper
+    // quotes: 19 bytes out.
+    assert(r.len == 19);
+    assert(r.bytes[0] == '"');
+    assert(r.bytes[8] == '\\');
+    assert(r.bytes[9] == '"');
+    assert(r.bytes[11] == '\\');
+    assert(r.bytes[12] == '"');
+    assert(r.bytes[15] == 39); // apostrophe passes through raw
+    assert(r.bytes[17] == '`');
+    assert(r.bytes[18] == '"');
+}
+
+test js_str_control_characters {
+    // Tab is a named escape (line 51).
+    const t = js_str("\t");
+    assert(t.len == 4);
+    assert(t.bytes[2] == 't');
+    // Every control below 0x20 outside the named set becomes \u00xx with
+    // lowercase hex digits; the named ones never do.
+    assert(needs_unicode_escape(0x01));
+    assert(needs_unicode_escape(0x0B));
+    assert(needs_unicode_escape(0x1F));
+    assert(!needs_unicode_escape('\n'));
+    assert(!needs_unicode_escape('\r'));
+    assert(!needs_unicode_escape('\t'));
+    assert(!needs_unicode_escape(0x08));
+    assert(!needs_unicode_escape(0x0C));
+    assert(!needs_unicode_escape('a'));
+    assert(hex_digit(0) == '0');
+    assert(hex_digit(1) == '1');
+    assert(hex_digit(9) == '9');
+    assert(hex_digit(10) == 'a');
+    assert(hex_digit(15) == 'f');
+}
+
+test required_str_present_or_missing {
+    // Line 54-57: a present param passes its value through.
+    const ok_url = required_str(true, "https://x", "url");
+    assert(ok_url.ok);
+    assert(ok_url.value == "https://x");
+    assert(ok_url.key == "url");
+    // An absent param fails and the key names what is missing — the decision
+    // the "missing required param `{key}`" message encodes.
+    const missing_selector = required_str(false, "", "selector");
+    assert(!missing_selector.ok);
+    assert(missing_selector.key == "selector");
+    const missing_text = required_str(false, "", "text");
+    assert(!missing_text.ok);
+    assert(missing_text.key == "text");
+}
+
+test close_tab_target_id_falls_back_to_camel_case {
+    // Lines 158-159: target_id first...
+    const primary = close_tab_target_id(true, "T1", false, "");
+    assert(primary.ok);
+    assert(primary.value == "T1");
+    assert(primary.key == "target_id");
+    // ...targetId as the fallback spelling...
+    const alt = close_tab_target_id(false, "", true, "T2");
+    assert(alt.ok);
+    assert(alt.value == "T2");
+    assert(alt.key == "targetId");
+    // ...and when both are absent the surfaced error names the second key.
+    const neither = close_tab_target_id(false, "", false, "");
+    assert(!neither.ok);
+    assert(neither.key == "targetId");
+}
+
+test eval_failure_text_precedence {
+    // Lines 39-44: description wins over text.
+    assert(eval_failure_text(true, "TypeError: x is not a function", true, "Uncaught") == "TypeError: x is not a function");
+    // text is the fallback when there is no description.
+    assert(eval_failure_text(false, "", true, "Uncaught") == "Uncaught");
+    // "JS exception" when neither is present (line 43).
+    assert(eval_failure_text(false, "", false, "") == "JS exception");
+    // Lines 39-46: the answer fails exactly when it carries exceptionDetails.
+    assert(!eval_ok(true));
+    assert(eval_ok(false));
+}
+
+test cdp_method_per_command {
+    // The dispatch table (lines 63-165), as the original's
+    // navigate_maps_to_page_navigate and tabs_map_to_target_domain tests pin.
+    assert(cdp_method_for("browser_navigate") == "Page.navigate");
+    assert(cdp_method_for("browser_screenshot") == "Page.captureScreenshot");
+    assert(cdp_method_for("browser_open_tab") == "Target.createTarget");
+    assert(cdp_method_for("browser_close_tab") == "Target.closeTarget");
+    // Everything else goes through Runtime.evaluate (module header).
+    assert(cdp_method_for("browser_get_url") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_get_title") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_get_dom") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_query_selector") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_click") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_type") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_scroll") == "Runtime.evaluate");
+    assert(cdp_method_for("browser_eval") == "Runtime.evaluate");
+}
+
+test fixed_expressions_for_url_and_title {
+    // Lines 66 and 73.
+    assert(direct_eval_expression("browser_get_url") == "location.href");
+    assert(direct_eval_expression("browser_get_title") == "document.title");
+}
+
+test navigate_outcome_reports_error_text {
+    // Lines 74-77: no errorText means ok, with the frameId passed through
+    // (the original test pins frame_id "F7").
+    const good = navigate_outcome(false, "https://x", "F7");
+    assert(good.ok);
+    assert(good.url == "https://x");
+    assert(good.frame_id == "F7");
+    // An errorText means the navigation failed.
+    const bad = navigate_outcome(true, "https://x", "F7");
+    assert(!bad.ok);
+}
+
+test get_dom_expression_shape {
+    // Lines 80-88: without a selector the whole document's outerHTML;
+    const doc = get_dom_expression(false, "");
+    assert(doc.whole_document);
+    assert(doc.selector.len == 2);
+    // with a selector, one element — and the selector is JSON-escaped
+    // before it is embedded.
+    const sel = get_dom_expression(true, "a[href=\"x\"]");
+    assert(!sel.whole_document);
+    assert(sel.selector.len == 15);
+    assert(sel.selector.bytes[0] == '"');
+    assert(sel.selector.bytes[8] == '\\');
+    assert(sel.selector.bytes[9] == '"');
+    assert(sel.selector.bytes[14] == '"');
+    // Lines 91-94: the querySelector plan caps the first element's outerHTML
+    // at 4096 bytes.
+    const plan = query_selector_plan("div.main");
+    assert(plan.first_html_cap == 4096);
+    assert(plan.selector.len == 10);
+    assert(plan.selector.bytes[0] == '"');
+    assert(plan.selector.bytes[9] == '"');
+}
+
+test scroll_deltas_default_when_absent {
+    // Lines 125-130: x defaults to 0.0, y to 600.0.
+    const (def_x, def_y) = scroll_deltas(false, 0.0, false, 0.0);
+    assert(def_x == 0.0);
+    assert(def_y == 600.0);
+    const (one_x, one_y) = scroll_deltas(true, 12.5, false, 0.0);
+    assert(one_x == 12.5);
+    assert(one_y == 600.0);
+    const (both_x, both_y) = scroll_deltas(true, -3.0, true, 0.0);
+    assert(both_x == -3.0);
+    assert(both_y == 0.0);
+}
+
+test eval_expression_falls_back_to_code {
+    // Lines 134-141.
+    const direct = eval_expression(true, "1 + 1", true, "2 + 2");
+    assert(direct.ok);
+    assert(direct.value == "1 + 1");
+    const via_code = eval_expression(false, "", true, "2 + 2");
+    assert(via_code.ok);
+    assert(via_code.value == "2 + 2");
+    // The original's eval_requires_expression test: both absent fails naming
+    // `expression`.
+    const neither = eval_expression(false, "", false, "");
+    assert(!neither.ok);
+    assert(neither.key == "expression");
+}
+
+test screenshot_defaults_and_data_check {
+    // Lines 141-148: format defaults to "png"; the shot must carry data.
+    const plain = screenshot_outcome(true, "aGVsbG8=", false, "");
+    assert(plain.ok);
+    assert(plain.data == "aGVsbG8=");
+    assert(plain.format == "png");
+    const jpeg = screenshot_outcome(true, "x", true, "jpeg");
+    assert(jpeg.ok);
+    assert(jpeg.format == "jpeg");
+    // "captureScreenshot returned no data" — without data the command fails.
+    const empty = screenshot_outcome(false, "", false, "");
+    assert(!empty.ok);
+    assert(empty.format == "png");
+    // The format decision on its own (line 145).
+    assert(screenshot_format(false, "") == "png");
+    assert(screenshot_format(true, "jpeg") == "jpeg");
+}
+
+test open_tab_url_defaults_to_about_blank {
+    // Line 151.
+    assert(open_tab_url(false, "") == "about:blank");
+    assert(open_tab_url(true, "https://y") == "https://y");
+}

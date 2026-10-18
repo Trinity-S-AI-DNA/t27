@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-//! t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+//! t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
 //! t27b asm    <file.t27> [--overflow trap|wrap]
 //! t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
 //!                   [--json <path>] [--runner "<cmd> [args]"]
@@ -25,7 +25,10 @@ use t27b::eval::{Interp, Stop};
 use t27b::ir::{OverflowMode, Program, Ty};
 use t27b::jit::Jit;
 use t27b::timing::Phases;
-use t27b::blockers::{self, Reference};
+#[path = "../../../gen/rust/tri/t27b/check_budget.rs"]
+#[allow(dead_code, unused_parens)]
+mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
+use t27b::blockers::{self, Reference, Verdicts};
 use t27b::{a64, front, lower, macho};
 
 const EXIT_FAIL: u8 = 1;
@@ -62,13 +65,17 @@ macro_rules! errln {
 
 const USAGE: &str = "usage:
   t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-  t27b build  <file.t27> -o <out.o> [--overflow trap|wrap] [--time]
+  t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
   t27b asm    <file.t27> [--overflow trap|wrap]
+  t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
+  t27b ts      <file.t27>   (consts, scalar fns and tests as TypeScript; specs/tri/t27b/ts_emit.t27)
   t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
                     [--json <path>] [--runner \"<cmd> [args]\"]
                     [--blockers [--reference <t27c> [--reference-cache <file>]
                                  [--reference-timeout-ms N]]]
 
+  --elf        build: an ELF64 object for aarch64 Linux (specs/tri/t27b/elf.t27), the default on
+               Linux; --macho: a Mach-O object for arm64 macOS, the default elsewhere
   --json       corpus: also write per-file results and totals to <path> as JSON
                (with --reference, the reference verdicts too)
   --runner     corpus: start each per-file `t27b test` as `<cmd> [args] <t27b> test ...`,
@@ -79,7 +86,11 @@ const USAGE: &str = "usage:
                order in which supporting them unlocks the most whole files.
   --reference  corpus: also run the reference path (`<t27c> test-report`,
                t27c's Zig backend) on every file, and leave the files it fails
-               out of the denominator.";
+               out of the denominator. Where both sides ran a file's tests,
+               compare them test by test: `reference_disagree` counts files
+               where a test's verdict differs or only one side has it (#6441).
+               `mismatch` (= `jit_interp_mismatch`) is t27b's JIT against
+               t27b's own interpreter, not against the reference.";
 
 struct Opts {
     cmd: String,
@@ -95,6 +106,7 @@ struct Opts {
     json: Option<String>,
     runner: Vec<String>,
     blockers: bool,
+    elf: bool,
     reference: Option<String>,
     reference_cache: Option<String>,
     reference_timeout_ms: u64,
@@ -125,6 +137,7 @@ fn parse_args() -> Result<Opts, String> {
         json: None,
         runner: Vec::new(),
         blockers: false,
+        elf: cfg!(target_os = "linux"),
         reference: None,
         reference_cache: None,
         reference_timeout_ms: 300_000,
@@ -144,6 +157,8 @@ fn parse_args() -> Result<Opts, String> {
             "--check" => o.check = true,
             "--list" => o.list = true,
             "--blockers" => o.blockers = true,
+            "--elf" => o.elf = true,
+            "--macho" => o.elf = false,
             "--reference" => o.reference = Some(args.next().ok_or("--reference needs the t27c binary")?),
             "--reference-cache" => o.reference_cache = Some(args.next().ok_or("--reference-cache needs a path")?),
             "--reference-timeout-ms" => {
@@ -190,12 +205,15 @@ fn parse_args() -> Result<Opts, String> {
 }
 
 fn main() -> ExitCode {
+    // #7370: the reference runner (blockers.rs) reads `t27c test-report`'s words and takes any non-zero
+    // exit for a broken tool, so every test-report it spawns keeps the exit of before #7370.
+    std::env::set_var("T27C_TEST_REPORT_EXIT_ZERO", "1");
     let o = match parse_args() {
         Ok(o) => o,
         Err(e) => return usage(&e),
     };
     match o.cmd.as_str() {
-        "test" | "build" | "asm" => {
+        "test" | "build" | "asm" | "verilog" | "ts" => {
             let Some(input) = o.input.clone() else {
                 return usage("missing input file");
             };
@@ -249,6 +267,9 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
             errln!("t27b: typecheck error in {}: {}", input, e);
         }
         return Err(EXIT_FRONTEND);
+    }
+    if o.cmd == "verilog" || o.cmd == "ts" {
+        return Err(lower::verilog(&parsed.ast, o.cmd == "ts").map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
     }
     if o.blockers {
         // Every unsupported construct, not just the first; a file with none
@@ -316,9 +337,15 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let mut runtime_asserts = 0u64;
     let mut asserts_known = true;
     let mut lines: Vec<String> = Vec::new();
+    let mut fuel_left = check_budget::FILE_FUEL;
     let t0 = Instant::now();
     for (id, f) in prog.tests() {
+        let t1 = Instant::now();
         let r = jit.call(id as u32, &[]);
+        if o.time {
+            // One in-process iteration per test, for the warmup series (#7596).
+            lines.push(format!("TIME {} {}", f.name, t1.elapsed().as_nanos()));
+        }
         // An invariant runs exactly like a test and is reported apart from
         // the tests, prefixed `INVARIANT`.
         let tag = if f.is_invariant { "INVARIANT " } else { "" };
@@ -352,7 +379,9 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         if o.check {
             // Cross-check against the reference interpreter.
             let mut it = Interp::new(prog);
+            it.fuel = check_budget::test_fuel(fuel_left);
             let want = it.call(id, &[]);
+            fuel_left = check_budget::spend(fuel_left, it.fuel);
             runtime_asserts += it.asserts;
             if matches!(want, Err(Stop::Fuel) | Err(Stop::Depth)) {
                 // The interpreter stopped early: its count is a lower bound,
@@ -443,28 +472,15 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let Some(out) = o.out.clone() else {
         return usage("build needs -o <out.o>");
     };
-    let code = ph.time("codegen", || codegen::compile(prog, TrapStyle::Brk, false));
+    let code = ph.time("codegen", || codegen::compile(prog, if o.elf { TrapStyle::Elf } else { TrapStyle::Brk }, false));
     let code = match code {
         Ok(c) => c,
         Err(e) => return codegen_error(&e),
     };
-    // A function taking or returning a struct or a str, or with stack
-    // parameters, uses t27b's own convention (an aggregate is passed by
-    // address, a stack parameter is one full word), not the platform's, so
-    // no C caller can link to it. `__t27b_*` helpers are never exported and
-    // need no note.
-    let mut names: Vec<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
-    for &id in &prog.internal_abi {
-        if !names[id as usize].starts_with("__t27b_") {
-            errln!(
-                "t27b: note: `{}` takes or returns a struct or a str, or takes more than 8 parameters of a class, and is not exported",
-                names[id as usize]
-            );
-        }
-        names[id as usize].clear();
-    }
+    let (names, notes) = macho::symbols(prog); // which fns get a symbol: specs/tri/t27b/elf.t27, "the C ABI"
+    notes.iter().for_each(|n| errln!("t27b: note: {}", n));
     let obj = ph.time("emit", || {
-        codegen::link(Vec::new(), None, &code, prog.funcs.len()).map(|l| (macho::object(&l, &names, &prog.data), l.code.len()))
+        codegen::link(Vec::new(), None, &code, prog.funcs.len()).map(|l| (if o.elf { macho::elf_object(&l, &names, &prog.data, &prog.globals) } else { macho::object(&l, &names, &prog.data) }, l.code.len()))
     });
     let (obj, words) = match obj {
         Ok(x) => x,
@@ -525,6 +541,31 @@ fn cmd_asm(prog: &Program) -> ExitCode {
 
 // ------------------------------------------------------------------ corpus
 
+/// One file of a corpus run: t27b's outcome and per-test verdicts, and the
+/// reference path's verdict and per-test verdicts when `--reference` ran.
+struct Row {
+    i: usize,
+    r: Outcome,
+    tests: Option<Verdicts>,
+    rf: Option<Reference>,
+    ref_tests: Option<Verdicts>,
+    reused: bool, // the reference verdict came from --reference-cache
+}
+
+impl Row {
+    /// The per-test differential against the reference (#6441), when both
+    /// sides ran the file's tests: `Some(empty)` is agreement test by test.
+    fn disagree(&self) -> Option<Vec<String>> {
+        Some(blockers::disagreements(self.tests.as_ref()?, self.ref_tests.as_ref()?))
+    }
+}
+
+/// A `{"name": true, ...}` JSON object of per-test verdicts.
+fn verdicts_json(v: &[(String, bool)]) -> String {
+    let items: Vec<String> = v.iter().map(|(n, ok)| format!("{}: {}", json_str(n), ok)).collect();
+    format!("{{{}}}", items.join(", "))
+}
+
 #[derive(Clone, Debug)]
 enum Outcome {
     /// Tests run, invariants run, runtime asserts executed (None: not
@@ -566,28 +607,11 @@ impl Outcome {
     }
 }
 
-/// A JSON string literal (RFC 8259 escaping; the output stays ASCII).
+/// A JSON string literal (RFC 8259 escaping; the output stays ASCII): specs/tri/t27b/text_escape.t27.
 fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
-                let mut buf = [0u16; 2];
-                for u in c.encode_utf16(&mut buf) {
-                    o.push_str(&format!("\\u{:04x}", u));
-                }
-            }
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
+    let mut o = vec![0u8; 6 * s.len() + 2];
+    let n = blockers::te::json_quote(s.as_bytes(), &mut o);
+    String::from_utf8_lossy(&o[..n]).into_owned()
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -603,14 +627,15 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Construct name from a reject line `t27b: unsupported construct X at line N (...)`.
+/// Construct name from a reject line `t27b: unsupported construct X at line N (...)`: text_escape.t27.
 fn construct_of(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("t27b: unsupported construct ")?;
-    let end = rest.find(" at line ")?;
-    Some(rest[..end].to_string())
+    let r = blockers::te::construct_span(line.as_bytes());
+    (r >= 0).then(|| line[(r >> 32) as usize..(r & 0xffff_ffff) as usize].to_string())
 }
 
-fn run_one(exe: &Path, file: &Path, o: &Opts) -> Outcome {
+/// One `t27b test --check` run of `file`, with its per-test verdicts when the
+/// tests ran (a pass, a test failure, or a JIT/interpreter mismatch).
+fn run_one(exe: &Path, file: &Path, o: &Opts) -> (Outcome, Option<Verdicts>) {
     let mut cmd = match o.runner.split_first() {
         Some((prog, args)) => {
             let mut c = Command::new(prog);
@@ -619,7 +644,8 @@ fn run_one(exe: &Path, file: &Path, o: &Opts) -> Outcome {
         }
         None => Command::new(exe),
     };
-    cmd.arg("test").arg(file).arg("--quiet").arg("--check");
+    // Not --quiet: the PASS lines are the per-test verdicts (#6441).
+    cmd.arg("test").arg(file).arg("--check");
     if o.mode == OverflowMode::Wrap {
         cmd.arg("--overflow").arg("wrap");
     }
@@ -628,12 +654,13 @@ fn run_one(exe: &Path, file: &Path, o: &Opts) -> Outcome {
     }
     let c = match blockers::run_capture(&mut cmd, Duration::from_millis(o.timeout_ms)) {
         Ok(Some(c)) => c,
-        Ok(None) => return Outcome::Timeout,
-        Err(e) => return Outcome::Crash(e),
+        Ok(None) => return (Outcome::Timeout, None),
+        Err(e) => return (Outcome::Crash(e), None),
     };
     let (stdout, stderr) = (&c.stdout, &c.stderr);
     let first_err = stderr.lines().next().unwrap_or("").to_string();
-    match c.code {
+    let tests = matches!(c.code, Some(0) | Some(1) | Some(4)).then(|| blockers::t27b_verdicts(stdout));
+    let outcome = match c.code {
         Some(0) => {
             let total = stdout
                 .lines()
@@ -667,7 +694,8 @@ fn run_one(exe: &Path, file: &Path, o: &Opts) -> Outcome {
         Some(5) => Outcome::Codegen(first_err),
         Some(code) => Outcome::Crash(format!("exit {}: {}", code, first_err)),
         None => Outcome::Crash(format!("signal {:?}: {}", c.signal, first_err)),
-    }
+    };
+    (outcome, tests)
 }
 
 fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
@@ -707,7 +735,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     let t0 = Instant::now();
     let files = Arc::new(files);
     let next = Arc::new(Mutex::new(0usize));
-    let results: Arc<Mutex<Vec<(usize, Outcome, Option<Reference>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let results: Arc<Mutex<Vec<Row>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
     for worker in 0..o.jobs {
         let (files, next, results, exe) = (files.clone(), next.clone(), results.clone(), exe.clone());
@@ -726,6 +754,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             json: None,
             runner: o.runner.clone(),
             blockers: o.blockers,
+            elf: false,
             reference: None,
             reference_cache: None,
             reference_timeout_ms: 0,
@@ -740,11 +769,17 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             if i >= files.len() {
                 break;
             }
-            let r = run_one(&exe, &files[i], &opts);
+            let (r, tests) = run_one(&exe, &files[i], &opts);
             let rf = reference.as_ref().map(|rr| rr.run(worker, &files[i]));
+            let fresh = matches!(rf, Some((_, _, false)));
+            let reused = matches!(rf, Some((_, _, true)));
+            let (rf, ref_tests) = match rf {
+                Some((v, t, _)) => (Some(v), t),
+                None => (None, None),
+            };
             let mut res = results.lock().unwrap();
-            res.push((i, r, rf.as_ref().map(|x| x.0.clone())));
-            if let Some((_, false)) = rf {
+            res.push(Row { i, r, tests, rf, ref_tests, reused });
+            if fresh {
                 // Reference runs take seconds each: show progress.
                 if res.len() % 25 == 0 {
                     errln!("t27b: {} of {} files ({:.0} s)", res.len(), files.len(), t0.elapsed().as_secs_f64());
@@ -759,20 +794,20 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
         let _ = std::fs::remove_dir_all(&r.scratch);
     }
     let mut results = std::mem::take(&mut *results.lock().unwrap());
-    results.sort_by_key(|r| r.0);
+    results.sort_by_key(|r| r.i);
 
     // A timeout in the parallel pass may be contention, not the file: on the
     // lab at --jobs 24 a file that passes natively in 4 ms timed out at 60 s
     // (#6063). Each one gets one sequential retry with the same timeout; the
     // retry's verdict is final, and the record says it was retried.
-    let n_timeout = results.iter().filter(|r| matches!(r.1, Outcome::Timeout)).count();
+    let n_timeout = results.iter().filter(|r| matches!(r.r, Outcome::Timeout)).count();
     if n_timeout > 0 {
         errln!("t27b: retrying {} timed-out file(s) one at a time", n_timeout);
     }
     let retried = blockers::retry_timeouts_once(
         &mut results,
-        |r| matches!(r.1, Outcome::Timeout),
-        |r| r.1 = run_one(&exe, &files[r.0], o),
+        |r| matches!(r.r, Outcome::Timeout),
+        |r| (r.r, r.tests) = run_one(&exe, &files[r.i], o),
     );
     let timeout_retried = retried.iter().filter(|x| **x).count();
 
@@ -781,7 +816,8 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     let (mut fail, mut unsup, mut fe, mut mism, mut cg, mut tout, mut crash) = (0, 0, 0, 0, 0, 0, 0);
     let mut first: HashMap<String, usize> = HashMap::new();
     let mut all: HashMap<String, usize> = HashMap::new();
-    for ((i, r, _), again) in results.iter().zip(&retried) {
+    for (row, again) in results.iter().zip(&retried) {
+        let (i, r) = (&row.i, &row.r);
         let name = files[*i].display();
         if *again {
             outln!("RETRIED     {}: timeout, then {} on a sequential retry", name, r.label());
@@ -846,6 +882,18 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             }
         }
     }
+    // The per-test differential against the reference (#6441). Kept apart
+    // from `mism`, which is t27b's JIT against t27b's own interpreter.
+    let (mut ref_compared, mut ref_disagree, mut ref_disagree_tests) = (0usize, 0usize, 0usize);
+    for row in &results {
+        if let Some(d) = row.disagree() {
+            ref_compared += 1;
+            if !d.is_empty() {
+                ref_disagree += 1;
+                ref_disagree_tests += d.len();
+            }
+        }
+    }
     let mut top: Vec<(String, usize)> = first.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let secs = t0.elapsed().as_secs_f64();
@@ -859,7 +907,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     outln!("  supported, a test fails   : {} (a test or an invariant)", fail);
     outln!("  rejected (unsupported)    : {}", unsup);
     outln!("  front-end error           : {}", fe);
-    outln!("  JIT/interpreter mismatch  : {}", mism);
+    outln!("  JIT/interpreter mismatch  : {} (t27b's JIT against t27b's interpreter, same IR)", mism);
     outln!("  codegen limit             : {}", cg);
     outln!("  {:26}: {}", format!("timeout ({} ms)", o.timeout_ms), tout);
     outln!("  crash                     : {}", crash);
@@ -871,14 +919,19 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     for (c, n) in top.iter().take(15) {
         outln!("  {:5} {:5}  {}", n, all.get(c).copied().unwrap_or(0), c);
     }
+    // #8095: how much of the reference sweep the cache saved.
+    let reused = results.iter().filter(|r| r.reused).count();
+    if reference.is_some() {
+        outln!("reference reused {} of {} from the cache", reused, results.len());
+    }
     if let Some(path) = &o.json {
         // The same counts as the text summary above, plus one record per file.
         // With `--reference`, each record carries the reference path's verdict
         // (`pass` / `blocked` / `fail` / `timeout`) and `totals.reference.ran`
         // is true; without it every file's `reference` is `skip`.
         let (mut r_pass, mut r_blocked, mut r_fail, mut r_tout, mut r_skip) = (0, 0, 0, 0, 0);
-        for (_, _, rf) in &results {
-            match rf {
+        for row in &results {
+            match &row.rf {
                 None => r_skip += 1,
                 Some(Reference::Pass) => r_pass += 1,
                 Some(Reference::Blocked(_)) => r_blocked += 1,
@@ -889,10 +942,11 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
         let totals = format!(
             concat!(
                 "{{\"pass\": {}, \"pass_vacuous\": {}, \"tests\": {}, \"invariants\": {}, \"pass_no_tests\": {}, ",
-                "\"fail\": {}, \"blocked\": {}, \"frontend\": {}, \"mismatch\": {}, ",
+                "\"fail\": {}, \"blocked\": {}, \"frontend\": {}, \"mismatch\": {}, \"jit_interp_mismatch\": {}, ",
+                "\"reference_disagree\": {}, \"reference_disagree_tests\": {}, \"reference_compared\": {}, ",
                 "\"codegen\": {}, \"timeout\": {}, \"timeout_retried\": {}, \"crash\": {}, ",
                 "\"reference\": {{\"ran\": {}, \"pass\": {}, \"blocked\": {}, \"fail\": {}, ",
-                "\"timeout\": {}, \"skip\": {}}}}}"
+                "\"timeout\": {}, \"skip\": {}, \"reused\": {}}}}}"
             ),
             pass,
             pass_vacuous,
@@ -903,6 +957,11 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             unsup,
             fe,
             mism,
+            mism,
+            // null without --reference: not measured is not 0.
+            if reference.is_some() { ref_disagree.to_string() } else { "null".into() },
+            if reference.is_some() { ref_disagree_tests.to_string() } else { "null".into() },
+            if reference.is_some() { ref_compared.to_string() } else { "null".into() },
             cg,
             tout,
             timeout_retried,
@@ -912,7 +971,8 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             r_blocked,
             r_fail,
             r_tout,
-            r_skip
+            r_skip,
+            if reference.is_some() { reused.to_string() } else { "null".into() }
         );
         let tops: Vec<String> = top
             .iter()
@@ -928,7 +988,8 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
         let recs: Vec<String> = results
             .iter()
             .zip(&retried)
-            .map(|((i, r, rf), again)| {
+            .map(|(row, again)| {
+                let (i, r, rf) = (&row.i, &row.r, &row.rf);
                 let (tests, inv, asserts) = if let Outcome::Pass(n, inv, a) = r { (*n, *inv, *a) } else { (0, 0, None) };
                 // Each construct once, in the order the lowering reported them.
                 let mut blockers: Vec<&str> = Vec::new();
@@ -949,8 +1010,20 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
                         }
                     }
                 };
+                // Per-test fields only where they exist (#6441).
+                let mut per_test = String::new();
+                if let Some(t) = &row.tests {
+                    per_test.push_str(&format!(", \"test_verdicts\": {}", verdicts_json(t)));
+                }
+                if let Some(t) = &row.ref_tests {
+                    per_test.push_str(&format!(", \"reference_tests\": {}", verdicts_json(t)));
+                }
+                if let Some(d) = row.disagree() {
+                    let d: Vec<String> = d.iter().map(|x| json_str(x)).collect();
+                    per_test.push_str(&format!(", \"reference_disagree\": [{}]", d.join(", ")));
+                }
                 format!(
-                    "{{\"file\": {}, \"reference\": \"{}\", \"reference_detail\": {}, \"t27b\": \"{}\", \"tests\": {}, \"invariants\": {}, \"asserts\": {}, \"blockers\": [{}], \"detail\": {}{}}}",
+                    "{{\"file\": {}, \"reference\": \"{}\", \"reference_detail\": {}, \"t27b\": \"{}\", \"tests\": {}, \"invariants\": {}, \"asserts\": {}, \"blockers\": [{}], \"detail\": {}{}{}}}",
                     json_str(&files[*i].display().to_string()),
                     rtag,
                     json_str(&rwhy),
@@ -960,6 +1033,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
                     asserts.map_or("null".to_string(), |a| a.to_string()),
                     blockers.iter().map(|b| json_str(b)).collect::<Vec<_>>().join(", "),
                     json_str(r.detail()),
+                    per_test,
                     // Only on a retried file, so other records stay byte-identical.
                     if *again { ", \"retried_after_timeout\": true" } else { "" }
                 )
@@ -987,7 +1061,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     if o.blockers {
         report_blockers(&results, reference.is_some(), pass + pass_vacuous);
     }
-    if crash > 0 || mism > 0 {
+    if crash > 0 || mism > 0 || ref_disagree > 0 {
         ExitCode::from(EXIT_MISMATCH)
     } else {
         ExitCode::SUCCESS
@@ -995,11 +1069,24 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
 }
 
 /// The reference path's verdict on the corpus, beside t27b's.
-fn report_reference(files: &[PathBuf], results: &[(usize, Outcome, Option<Reference>)]) {
+fn report_reference(files: &[PathBuf], results: &[Row]) {
     let (mut pass, mut blocked, mut failed, mut tout) = (0, 0, 0, 0);
     let mut lines = Vec::new();
-    for (i, r, rf) in results {
-        let Some(rf) = rf else { continue };
+    let (mut compared, mut disagree, mut disagree_tests) = (0usize, 0usize, 0usize);
+    let mut dlines = Vec::new();
+    for row in results {
+        let (i, r) = (&row.i, &row.r);
+        let Some(rf) = &row.rf else { continue };
+        if let Some(d) = row.disagree() {
+            compared += 1;
+            if !d.is_empty() {
+                disagree += 1;
+                disagree_tests += d.len();
+                for x in d {
+                    dlines.push(format!("REFDISAGREE {}: {}", files[*i].display(), x));
+                }
+            }
+        }
         let t27b = match r {
             Outcome::Pass(..) => "t27b passes",
             Outcome::TestFail(_) => "t27b test fails",
@@ -1033,12 +1120,21 @@ fn report_reference(files: &[PathBuf], results: &[(usize, Outcome, Option<Refere
     for l in &lines {
         outln!("  {}", l);
     }
+    // #6441: test by test, where both t27b and the reference ran the tests.
+    // A file both sides fail agrees only if the same tests fail.
+    outln!(
+        "reference disagree (per test, t27b against t27c + zig): {} files, {} tests, of {} files compared",
+        disagree, disagree_tests, compared
+    );
+    for l in &dlines {
+        outln!("  {}", l);
+    }
 }
 
 /// Every construct each rejected file needs, and the greedy order in which
 /// supporting them unlocks the most whole files.
 fn report_blockers(
-    results: &[(usize, Outcome, Option<Reference>)],
+    results: &[Row],
     with_reference: bool,
     passing: usize,
 ) {
@@ -1047,7 +1143,8 @@ fn report_blockers(
     let mut sets: Vec<BTreeSet<String>> = Vec::new();
     let mut good: Vec<bool> = Vec::new();
     let mut passing_good = 0usize;
-    for (_, r, rf) in results {
+    for row in results {
+        let (r, rf) = (&row.r, &row.rf);
         let ref_ok = rf.as_ref().map_or(true, |x| x.passes());
         let set: BTreeSet<String> = match r {
             Outcome::Unsupported(cs) => cs.iter().cloned().collect(),
