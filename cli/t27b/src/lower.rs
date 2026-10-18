@@ -131,6 +131,8 @@ mod lp; // t27c gen-rust of specs/tri/t27b/literal_plan.t27: a literal's text as
 mod rv; // t27c gen-rust of specs/tri/t27b/ref_var_plan.t27: a local the body assigns is a `var`, scalars too
 #[path = "../../../gen/rust/tri/t27b/discard_plan.rs"] #[allow(dead_code, unused_parens)]
 mod dp; // t27c gen-rust of specs/tri/t27b/discard_plan.t27: `_ = e;`, deleted where the reference deletes it
+#[path = "../../../gen/rust/tri/t27b/debug_print_plan.rs"] #[allow(dead_code, unused_parens)]
+mod dbg; // t27c gen-rust of specs/tri/t27b/debug_print_plan.t27: `std.debug.print`
 #[path = "../../../gen/rust/tri/t27b/lazy_sig_plan.rs"] #[allow(dead_code, unused_parens)]
 mod ls; // t27c gen-rust of specs/tri/t27b/lazy_sig_plan.t27: `anytype`, `[*]T` on a fn nothing analyzed reaches
 #[path = "../../../gen/rust/tri/t27b/any_param_plan.rs"] #[allow(dead_code, unused_parens)]
@@ -2618,7 +2620,33 @@ impl<'a> Lower<'a> {
             out.push(Stmt::Eval(call));
             return Ok(());
         }
-        match self.expr(e)? {
+        let v = self.expr(e)?;
+        self.drop_value(v, out)
+    }
+
+    /// `std.debug.print(fmt, .{ args })` (debug_print_plan.t27): its arguments run in order, once the format fits them.
+    fn debug_print(&mut self, c: &Node, out: &mut Vec<Stmt>) -> R<()> {
+        self.see(c);
+        let (lit, tup) = (c.children.first().filter(|f| f.kind == NodeKind::ExprLiteral && f.extra_kind == "string"), c.children.get(1).filter(|t| t.kind == NodeKind::ExprTuple));
+        let mut act = dbg::plan(!self.unanalyzed_fn, c.children.len(), lit.is_some(), tup.is_some());
+        if let (dbg::CHECK, Some(t), Some(f)) = (act, tup, lit) {
+            let mut kinds = Vec::new();
+            for a in &t.children {
+                let v = self.expr(a)?;
+                kinds.push(match &v {
+                    Val::Ct(_) => dbg::K_INT, Val::Cf(_) => dbg::K_FLOAT,
+                    Val::E(Expr { ty, .. }) | Val::M(Place { ty: LTy::S(ty), .. }) => dbg::scalar(*ty == Ty::Bool, ty.is_float(), ty.is_int()),
+                    _ if self.is_str(&v) || matches!(&v, Val::M(Place { ty: LTy::Slice(e, _) | LTy::Arr(e, _), .. }) if **e == LTy::S(Ty::U8)) => dbg::K_BYTES, _ => dbg::K_OTHER,
+                });
+                self.drop_value(v, out)?;
+            }
+            act = dbg::check(f.value.as_bytes(), &kinds);
+        }
+        if matches!(act, dbg::SKIP | dbg::EVAL) { Ok(()) } else { self.reject(dbg::what(act), dbg::why(act).to_string()) }
+    }
+
+    fn drop_value(&mut self, v: Val, out: &mut Vec<Stmt>) -> R<()> {
+        match v {
             Val::Poison => return Err(()),
             Val::E(x) | Val::P(x, _) => out.push(Stmt::Eval(x)),
             Val::M(p) if !pure_addr(&p.addr) => out.push(Stmt::Eval(p.addr)),
@@ -2627,7 +2655,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `undefined;`, the body stub a port leaves where plumbing was. t27c's
     /// Zig backend emits it as is, and Zig rejects it ("value of type
     /// '@TypeOf(undefined)' ignored") only in a fn it analyzes, i.e. one
     /// something analyzed references. In a fn nothing reaches, the reference
@@ -2951,71 +2978,24 @@ impl<'a> Lower<'a> {
     fn call_stmt(&mut self, c: &Node, discard: bool, out: &mut Vec<Stmt>) -> R<()> {
         self.see(c);
         match c.name.as_str() {
-            // `@compileAssert` is not a separate construct in the reference:
-            // t27c's Zig backend lowers it through the very arm that lowers
-            // `assert` (`node.name == "@compileAssert" || node.name ==
-            // "assert"`), so both give the same `if (!(cond))` check. Inside
-            // an `invariant` that check sits in a `comptime` block and a false
-            // condition fails the reference's compile; here it fails the
-            // invariant when run. Either way the file does not pass, and the
-            // operands are held to the same comptime rules (`self.comptime`).
+            // `@compileAssert` is `assert` in the reference (builtin_plan.t27), under the same comptime rules.
             "assert" | "@compileAssert" => {
-                // `assert(cond, "msg")`: t27c's Zig backend emits
-                // `if (!(cond)) @panic("msg")` and never evaluates the
-                // message, so the verdict is the one-argument assert's. Only a
-                // string-literal message is accepted: anything else would be a
-                // value the reference silently drops, and matching that is a
-                // claim this backend has not checked.
-                match c.children.len() {
-                    1 => {}
-                    2 => {
-                        let m = &c.children[1];
-                        if m.kind != NodeKind::ExprLiteral || m.extra_kind != "string" {
-                            return self.reject(
-                                "ExprCall(assert with non-literal message)",
-                                format!("assert message is a {:?}, not a string literal", m.kind),
-                            );
-                        }
-                    }
-                    n => {
-                        return self.reject("ExprCall(assert with message)", format!("assert with {} arguments", n));
-                    }
-                }
+                let act = bp::assert_stmt(c.children.len(), c.children.get(1).is_some_and(|m| m.kind == NodeKind::ExprLiteral && m.extra_kind == "string"));
+                if act != bp::A_OK { return self.reject(bp::assert_what(act), bp::assert_why(act).to_string()); }
                 let cond = self.cond(&c.children[0])?;
                 let site = self.site(TrapKind::Assert, "assert".into(), Ty::Bool);
                 out.push(Stmt::Assert { cond, site });
                 Ok(())
             }
-            // `@setEvalBranchQuota(n);` raises the backward-branch budget of
-            // Zig's compile-time evaluation and does nothing at run time. t27b
-            // does not model that budget, so a higher one opens no gap: the
-            // statement lowers to nothing. Zig wants a compile-time `u32`
-            // operand; anything else is refused.
             "@setEvalBranchQuota" => {
-                if c.children.len() != 1 {
-                    return self.reject(
-                        "ExprCall(@setEvalBranchQuota)",
-                        format!("with {} arguments", c.children.len()),
-                    );
-                }
-                let arg = &c.children[0];
-                let v = self.expr(arg)?;
-                let n = match &v {
-                    Val::Poison => return Err(()),
-                    Val::Ct(n) => Some(*n),
-                    Val::E(Expr { ty, kind: ExprKind::Const(n) }) if ty.is_int() => {
-                        Some(*n)
-                    }
+                let n = match c.children.first().map(|a| self.expr(a)).transpose()? {
+                    Some(Val::Poison) => return Err(()),
+                    Some(Val::Ct(n)) => Some(n),
+                    Some(Val::E(Expr { ty, kind: ExprKind::Const(n) })) if ty.is_int() => Some(n),
                     _ => None,
                 };
-                match n {
-                    Some(n) if (0..=u32::MAX as i128).contains(&n) => Ok(()),
-                    Some(n) => self.reject("ExprCall(@setEvalBranchQuota)", format!("of {}, outside u32", n)),
-                    None => {
-                        let d = self.val_desc(&v);
-                        self.reject("ExprCall(@setEvalBranchQuota)", format!("of {}, not a compile-time integer", d))
-                    }
-                }
+                let act = bp::quota_stmt(c.children.len(), n.is_some(), n.map_or(0, |n| i64::try_from(n).unwrap_or(-1)));
+                if act == bp::Q_OK { Ok(()) } else { self.reject(bp::QUOTA, bp::quota_why(act).to_string()) }
             }
             // `@panic("m");` the reference does not return (builtin_plan.t27): a trap that always fires.
             "@panic" => {
@@ -3028,6 +3008,7 @@ impl<'a> Lower<'a> {
                 out.push(Stmt::Assert { cond: Expr { ty: Ty::Bool, kind: ExprKind::Const(0) }, site });
                 Ok(())
             }
+            "std.debug.print" => self.debug_print(c, out),
             "assert_eq" => {
                 if c.children.len() != 2 {
                     return self.reject(
@@ -3132,15 +3113,7 @@ impl<'a> Lower<'a> {
             }
         };
         if c.children.len() != params.len() {
-            return self.reject(
-                "ExprCall",
-                format!(
-                    "`{}` takes {} arguments, {} given",
-                    c.name,
-                    params.len(),
-                    c.children.len()
-                ),
-            );
+            return self.reject("ExprCall", format!("`{}` takes {} arguments, {} given", c.name, params.len(), c.children.len()));
         }
         let mut args = Vec::new();
         for (i, a) in c.children.iter().enumerate() {
@@ -3807,7 +3780,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A builtin of libm_plan.t27 (`@exp`, `@log`, an i64 `@mod`; an integer `@rem` is t27b's `%`): a call of its routine from libm.t27, compiler_rt's
+    /// A builtin of libm_plan.t27 (`@exp`, `@log`, a signed `@mod`; an integer `@rem` is t27b's `%`): a call of its routine from libm.t27, compiler_rt's
     /// algorithm, so the bits are the reference's, folded or not. What is refused instead is the plan's.
     fn libm_call(&mut self, n: &Node) -> R<Val> {
         self.see(n);
@@ -3829,12 +3802,11 @@ impl<'a> Lower<'a> {
         match (v, self.sigs.get(xp::routine(b, a)).filter(|s| !s.poisoned).map(|s| (s.id, s.ret.clone()))) {
             (v, _) if a == xp::OPERATOR => { let r = self.expr(&n.children[1])?; self.binary(xp::OPERATOR_TEXT, v, r) }
             (v, Some((func, Some(LTy::S(ty))))) if t || matches!(v, Val::E(_) | Val::Cf(..)) => {
-                let mut args = if t { vec![] } else { vec![self.coerce(v, ty0)?] }; // `@log(10.0)`: the literal, one rounding to f64
-                for c in &n.children[at + 1..] {
-                    let r = self.expr_as(c, &LTy::S(ty0))?; // `@rem(x, 2.0)`, `@mod(i, 2147483648)`: the first one's type
-                    args.push(self.reg(r)?);
-                }
-                Ok(Val::E(Expr { ty, kind: ExprKind::Call { func, args } }))
+                let w = |e: Expr| if xp::widens(a) { Expr { ty, kind: ExprKind::Widen(Box::new(e)) } } else { e }; // an i32 `@mod`: to the i64 routine's type
+                let mut args = if t { vec![] } else { vec![w(self.coerce(v, ty0)?)] }; // `@log(10.0)`: the literal, one rounding to f64
+                for c in &n.children[at + 1..] { let r = self.expr_as(c, &LTy::S(ty0))?; args.push(w(self.reg(r)?)); } // `@rem(x, 2.0)`, `@mod(i, 2147483648)`: the first one's type
+                let call = Expr { ty, kind: ExprKind::Call { func, args } }; // and back to the operands' type, which holds 0 <= r < b
+                Ok(Val::E(if xp::widens(a) { Expr { ty: ty0, kind: ExprKind::Cast { arg: Box::new(call), site: 0 } } } else { call }))
             }
             _ => self.reject(xp::what(b), format!("`{}`: {}", n.name, xp::why(a))),
         }
