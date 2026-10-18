@@ -65,7 +65,7 @@ Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next m
 | who else | `tri topic analog spice <keyword>` | before opening an issue or a lane |
 | PR verdict | `tri pr ready <N> --required-only` | one VERDICT line |
 
-**The board flow is local; the Railway lab is not needed.** `O=/Users/playom/t27/build/fpga/openxc7` holds `np-main/build/nextpnr-xilinx`, the AX7203 chipdb `xc7a200tfbg484-2.bin`, `prjxray/utils/fasm2frames.py` (run with `$O/venv/bin/python3`) and `px-main/build/tools/xc7frames2bit`; yosys and openFPGALoader come from Homebrew. nextpnr on this Mac takes about 22 s and 2.4 GB: check `memory_pressure` (>= 25 % free) and `df -h /` (>= 8 GB) first and never run two at once. Read the memory notes before declaring a blocker: the recipe was there.
+**The board flow is local; the Railway lab is not needed.** `O="$(git rev-parse --git-common-dir)/../build/fpga/openxc7"` (the main checkout's `build/`, from any worktree) holds `np-main/build/nextpnr-xilinx`, the AX7203 chipdb `xc7a200tfbg484-2.bin`, `prjxray/utils/fasm2frames.py` (run with `$O/venv/bin/python3`) and `px-main/build/tools/xc7frames2bit`; yosys and openFPGALoader come from Homebrew. nextpnr on this Mac takes about 22 s and 2.4 GB: check `memory_pressure` (>= 25 % free) and `df -h /` (>= 8 GB) first and never run two at once. Read the memory notes before declaring a blocker: the recipe was there.
 
 Sandboxed sessions: `export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local`; commit with `git -c core.hooksPath=.githooks commit`; `gh` fails TLS, use curl with `$(gh auth token)`. There is no `t27t` in this repository (searched 2026-10-18); do not invent one.
 
@@ -124,3 +124,4 @@ The page is a single HTML file whose data sits in four arrays at the top of its 
 - `t27b-native-ratchet` red with only UNLISTED rows for new specs is expected: spec PRs do not edit the ledger; the steward lists them from master runs (#8656).
 - uberWAVE reads ngspice RAW (binary or ASCII). Its `wp2-parser/golden/top.spice` (SAR ADC, xschem, IHP SG13G2) is GPL-2.0: test against it at run time, never vendor it.
 - A module-level one-element array literal `[798915]` lowers to a Zig array type (#10512); write `[798915] ** 1` until it is fixed.
+- Seal only with `ZIG_GLOBAL_CACHE_DIR` set in a sandboxed session: otherwise the seal's test run cannot create the zig cache and the seal records a false "blocked" verdict plus a home path, which turns `scan` red (#10521). Never write a home path into a committed file; derive it from `git rev-parse`.
