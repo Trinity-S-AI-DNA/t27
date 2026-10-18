@@ -121,6 +121,118 @@ Gaps that are open until a PR closes them. Do not assume otherwise:
 
 ---
 
+## 8. Developer toolkit: what we built and where it lives
+
+Start here before you write a script or a new tool. Most of what a developer
+needs already exists as a `.t27` spec with a front door. This section is a map,
+and every row links to the rule's one home. Measured numbers carry their date.
+
+### TRI CLAW: every CI gate behind one front door
+
+TRI CLAW (TRI-27 -- Trinity S3AI) packages this repository's CI gates as a
+product. The gate logic is `.t27`, and the delivery is a GitHub App plus a
+reusable workflow. Epic #9271.
+
+| Piece | Where |
+|---|---|
+| Gate inventory (SSOT): every workflow as data, with its class and events | [`specs/claw/gates.t27`](specs/claw/gates.t27) |
+| Drift law `claw_status`: workflows directory vs inventory | same spec, lowered to `gen/c/claw/gates.c`, run by the claw-drift step of `gate-topology.yml` |
+| Service contract: modes, exit codes, release tag `claw-v*`, check prefix `claw/` | [`specs/claw/service.t27`](specs/claw/service.t27) |
+| Auto-fix recipes and the fix engine: which red check gets which deterministic fix | [`specs/claw/recipes.t27`](specs/claw/recipes.t27), [`specs/claw/engine.t27`](specs/claw/engine.t27) |
+| Docs, release checklist, competitors | [`docs/claw/`](docs/claw/README.md) |
+| The GitHub App | [github.com/apps/tri-claw](https://github.com/apps/tri-claw), id 5166765. Today it is the reviewer-bee identity ([`tools/bees/README.md`](tools/bees/README.md)): bees approve under its name, so a review is never the author approving itself |
+
+In flight (2026-10-18): a `claw/t27f` check that the App posts on pull requests
+in every gHashTag repository that holds `.t27` specs. It is seal-gated, so only
+changed specs and their importers are checked again, and the summary links to
+each spec's T27F graph. No file is added to consumer repositories. Until it
+lands, read `docs/claw/README.md` for the status, not this paragraph.
+
+Adding a workflow file means adding its row to `gates.t27` in the same commit.
+The drift gate refuses anything else.
+
+### T27F: the visual spec of every `.t27`
+
+One spec gives one graph model and many views: source, architecture, data flow,
+dependencies and tests. Every node is labelled exact, derived, suggested or
+unknown, and links back to its source lines. The definition lives in one place:
+[`.claude/skills/t27f/SKILL.md`](.claude/skills/t27f/SKILL.md), "What T27F is".
+
+- **Specs:** [`specs/t27f/`](specs/t27f/). The IR is `spec_graph.t27`. The
+  exporter (`.t27` source to graph) is `spec_graph_export.t27`, and its derived
+  edges are `spec_graph_derive.t27`. Fold, expand and hit-test for big specs are
+  `spec_graph_fold.t27`. Layout is `spec_graph_view.t27`, and the agent-sized
+  text view is `spec_graph_outline.t27`.
+- **See it:** [t27.ai/t27f/graph/](https://t27.ai/t27f/graph/), and the graph
+  layer of the Spec Explorer at app.t27.ai/game/specs.
+- **Read a spec cheaply:** the MCP tool `t27f_outline` returns one line per
+  node and edge instead of the whole file. Use it before reading a big spec in
+  full.
+
+### Hot reload and incremental work: only what changed is redone
+
+The rule: key every result on the content hash of its inputs and reuse it while
+the key matches. Seals are those keys.
+
+| Tool | What it does | Measured |
+|---|---|---|
+| `t27c seal <spec> --save / --verify` | Seal v2 in `.trinity/seals/*.json`: spec hash, the four gen hashes, the `use` closure and the toolchain | -- |
+| `t27c frontier [--list] [--reseal] [--audit] [--watch]` | Decides which specs must be rebuilt. The seven decisions are [`specs/verified/seal_identity.t27`](specs/verified/seal_identity.t27). `--watch` polls with a stat gate and reruns the importers | the gen-hash cache (`~/.cache/t27/genhash`) cut a full run from 67.7 s to 3.0 s; a warm run takes about 1 s |
+| `t27c use-edges <specs_dir>` | The import graph. [`specs/ci/affected.t27`](specs/ci/affected.t27) turns it into "which specs does this diff touch" | -- |
+| T27F hot loop | [`specs/t27f/hot.t27`](specs/t27f/hot.t27). The reuse key is sha256(spec) plus sha256(exporter wasm). Debounce is 20 ms quiet and 60 ms at most, and the budget is 100 ms per save | -- |
+| `node server.mjs --watch <dir> --port 2727` in [gHashTag/t27-mcp](https://github.com/gHashTag/t27-mcp) | Watches any directory of `.t27` files, in any repository. `GET /events` streams one `t27f` event per changed spec; `GET /graph?path=` returns the graph or a refusal | save to event: p50 24 ms, max 59 ms (2026-10-18) |
+
+Measured cost, 2227 specs (2026-10-18, #10232): exporting a graph takes
+milliseconds (p50 0.09 ms, worst 18.8 ms). The slow parts were the network and
+manual rebuilds, so fix those before you optimise the exporter.
+
+### The t27 MCP server: reuse a validated spec before writing one
+
+[gHashTag/t27-mcp](https://github.com/gHashTag/t27-mcp) serves the published
+corpus to agents. Its README lists every tool. The ones that save the most work:
+
+- `t27_find` and `t27_specs` find an existing spec by intent or filter.
+- `t27_spec` returns one spec's record, its source and its seal.
+- `t27_check` parses and typechecks with the real front end and gives hints for
+  foreign syntax.
+- `t27_examples` returns short worked idioms, and `t27f_outline` /
+  `t27f_graph` show a spec's structure.
+
+DRY (above) says: search before adding. This server is the fastest way to do it.
+
+### Gates you will meet on a pull request
+
+Each gate is a spec. Read the spec, not a summary of it.
+
+| Gate | Rule | What trips it |
+|---|---|---|
+| Only t27 / SHRINK | `specs/policy/own_language.t27` (section "Only t27" above) | a new foreign file, or more foreign lines added than deleted |
+| Issue shape | [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) | an issue without Boundary / Scenarios / Requirements / Criteria; it is closed as `shape-refused` |
+| PR budget | [`specs/policy/pr_budget.t27`](specs/policy/pr_budget.t27) | more than 20 open PRs per author; batch port waves per ring or crate |
+| Compiler preflight | [`specs/tri/pr/preflight.t27`](specs/tri/pr/preflight.t27) | a bee PR whose specs do not pass the compiler |
+| Duplicate bodies | `tools/duplicate_bodies_baseline.txt` (DRY above) | a copied function body |
+| Gate drift | `specs/claw/gates.t27` | a workflow file without its inventory row |
+
+### Traps we paid for
+
+- **gen-c and strings.** `.len` on `str` reaches C verbatim, so it cannot appear
+  anywhere in a spec that is lowered by gen-c, test bodies included. `==` on
+  `str` is a byte compare in Zig but a pointer compare in C. The cross-backend
+  idiom is explicit length parameters, a `str_eq` loop function, and length
+  pins in a Zig-only companion module (`specs/claw/gates_pins.t27`). Filed on
+  #5980.
+- **A parse is not a proof.** A typecheck stays green for `assert 1 > 2`. Only
+  the spec's own `test` blocks, run to completion with 0 vacuous, show it is
+  true.
+- **Heavy runs do not go on a laptop.** Builds, corpus sweeps and mutation runs
+  go to the Railway lab. A local Mac run has panicked the machine
+  (2026-10-09).
+- **A merge is not a deploy.** A trinity merge is live on t27.ai only after the
+  `gHashTag/ghashtag.github.io` publish workflow runs and its Pages build is
+  `built`.
+
+---
+
 **φ² + 1/φ² = 3 | TRINITY**
 
 ---
