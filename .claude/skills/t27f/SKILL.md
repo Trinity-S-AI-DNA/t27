@@ -81,6 +81,25 @@ grep `specs/` for every name it would import. If any of them collides, put the n
 spec that owns those names, under a prefix such as `beat_`. The beat clock (t27#10596, PR #10598)
 lives in `lesson_reel.t27` for this reason.
 
+**Cutting video at a ms time: land on a frame, then measure the runs (t27#10603, PR #10605).**
+
+ffmpeg `xfade` starts on the first frame whose time is at or after `offset`. This is how to get the cut you planned:
+
+- Floor the cut to a base frame: `f = (c - half) * fps / 1000`.
+- Print the offset as `trunc(f * 1000 / fps)` ms. Rounding up misses frame f on 2 frames in 3.
+- Put every input through `fps=30,settb=AVTB` so the offset is not rounded again.
+- Chained `xfade` offsets are absolute reel times when each clip starts at its own frame 0.
+
+To check a graph without looking at pictures:
+
+1. Feed it solid `color=` inputs at `s=2x2`.
+2. Write `-f rawvideo -pix_fmt rgb24`.
+3. Count the runs with `od -An -tu1 -w12 -v | cut -c1-12 | uniq -c`.
+
+The runs are the scene lengths and must equal the spec's frame counts. Expect one extra frame when the offset falls on a whole ms.
+
+Lesson main functions read `std.c.getenv`, so build them on the lab with `zig build-exe -lc`.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
