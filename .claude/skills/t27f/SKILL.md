@@ -82,6 +82,50 @@ grep `specs/` for every name it would import. If any of them collides, put the n
 spec that owns those names, under a prefix such as `beat_`. The beat clock (t27#10596, PR #10598)
 lives in `lesson_reel.t27` for this reason.
 
+**Cutting video at a ms time: land on a frame, then measure the runs (t27#10603, PR #10605).**
+
+ffmpeg `xfade` starts on the first frame whose time is at or after `offset`. This is how to get the cut you planned:
+
+- Floor the cut to a base frame: `f = (c - half) * fps / 1000`.
+- Print the offset as `trunc(f * 1000 / fps)` ms. Rounding up misses frame f on 2 frames in 3.
+- Put every input through `fps=30,settb=AVTB` so the offset is not rounded again.
+- Chained `xfade` offsets are absolute reel times when each clip starts at its own frame 0.
+
+To check a graph without looking at pictures:
+
+1. Feed it solid `color=` inputs at `s=2x2`.
+2. Write `-f rawvideo -pix_fmt rgb24`.
+3. Count the runs with `od -An -tu1 -w12 -v | cut -c1-12 | uniq -c`.
+
+The runs are the scene lengths and must equal the spec's frame counts. Expect one extra frame when the offset falls on a whole ms.
+
+Lesson main functions read `std.c.getenv`, so build them on the lab with `zig build-exe -lc`.
+
+**Adding a mode to a graph printer without moving the old ones (t27#10609, PR #10610).**
+
+- Pass the old callers a flag (`graph(..., false)`) instead of copying the printer.
+- Give the input numbers a function with a test that every input is used exactly once, in each layout.
+- Prove the old output did not move: on the lab, build the old spec (from `git show <ref>:path`) and the new one, run both on a grid of lessons, languages and voices, and `cmp -s` every graph. PR #10610 compared 96 graphs and 0 differed.
+- For a large frame, render lossless (`-c:v libx264 -qp 0`) and crop a 2x2 pixel outside every text box (`crop=2:2:x:y,format=rgb24`). The solid runs must still equal the spec's frame counts.
+
+Traps from this tick:
+
+- An untyped array literal in a test (`var a = [_]usize{...}`) becomes a Zig tuple, which cannot be indexed at runtime ("tuple field index must be comptime-known"). Declare `var a : [8]usize = undefined;` and fill it in a loop.
+- `fs-lab.sh "echo $b64a ... ; echo $b64b ..."` with two large files exits 0 and writes nothing. Upload one file per call and compare md5 on both sides.
+- zsh does not word-split `set -- $p`. Write one call per file.
+
+**Keeping overlays off a crossfade (t27#10614, PR #10627).**
+
+- Work in whole frames, not seconds. Give each scene a function for the frames it owns outside its crossfades, clip each overlay to it, and print exactly those frames as `between(n,lo,hi)` terms joined with `+`. A test checks that the printed frames equal the frames `between(t,a,b)` showed before.
+- Drop a piece that has no room; never squeeze it. Name the cost in a test: count what is dropped, assert that each drop is on a crossfade, and assert that every phrase keeps at least one caption.
+- To check the pixels, render lossless from solid-colour clips. Crop a full-width band 40 rows tall over the text, split the raw file per frame, and count the distinct colours per frame with `od -An -tu1 -w3 -v | sort -u | wc -l`. Crossfade frames must show 1. The frames with text are the control: they must be many.
+
+Traps from this tick:
+
+- A minimum-length rule silently drops spoken captions. A short chunk that straddles a crossfade leaves two pieces under the minimum, and the voice speaks words that are never shown. A grid test that says "no overlay on a crossfade" stays green while this happens. Only a count of what was dropped finds it.
+- Lab scripts run under `sh`, which is dash: `$((10#$x))` fails with "expecting EOF". Strip leading zeros with `sed 's/^0*//'` and default with `${i:-0}`.
+- The Mac hook reads the whole Bash command. A heredoc PR body that names the report command gets refused. Write the body with the Write tool and pass `--body-file`.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
