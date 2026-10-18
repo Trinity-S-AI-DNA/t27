@@ -42,7 +42,11 @@
 // THE OUTPUT: `main` writes FRAMES frames of FRAME_W x FRAME_H raw RGB24 to stderr, row by row, as
 // specs/t27f/reel_particles.t27 does; ffmpeg reads them with plain flags
 // (`-f rawvideo -pix_fmt rgb24 -s 1080x1920 -r 30 -i frames.rgb`).
-// One process renders the whole reel in 52 s on one core. To use more, `main` renders shard k of N
+// Each row of a frame visits only the splats a per-frame row index lists for it, in the order they
+// were splatted; the raster's own check (touches_row) still decides, so the index only skips rows a
+// splat cannot light and the bytes are those of a scan over every splat. Without the index each of
+// the 1920 rows checked all ~42k splats and one process took 51 s; with it, 33 s on one core.
+// To use more cores, `main` renders shard k of N
 // (environment TF_SHARD and TF_SHARDS; unset, 0 of 1, the whole reel): the frames
 // [shard_a(k, N), shard_b(k, N)). Frame f's state is the integral from frame 0, so every shard steps
 // the physics from frame 0 and skips only the splats and the raster before its range. The shards
@@ -168,6 +172,7 @@ pub const TICK_DELAY : f64 = 3.0;
 pub const MAX_DOTS : usize = 22528;
 pub const MAX_SPLATS : usize = 45312;       // every dot, its mirror image, and 256 more
 pub const ROW_BYTES : usize = 3240;
+pub const INDEX_CAP : usize = 524288;       // entries of the row index; index_bound() fits
 
 // Splat kinds.
 pub const K_DOT : u8 = 0;
@@ -771,6 +776,81 @@ fn env_count(name: [*:0]const u8, dflt: i32) -> i32 {
     return count_or(p.?, dflt);
 }
 
+// ---- the row index ----
+
+// Whether a splat of kind k (m 1 for a mirror image) can light the row whose centre is y: an image
+// lives only below the floor, a vertical line between its ends sy and sw, anything else within its
+// reach sc of its centre sy. This is the raster's test, and the only one it makes.
+pub fn touches_row(k: u8, m: u8, sy: f64, sw: f64, sc: f64, y: f64) -> bool {
+    if (m == 1 && (y > FLOOR_PX) == false) {
+        return false;
+    }
+    if (k == K_VLINE) {
+        if (y < sy || y > sw) {
+            return false;
+        }
+        return true;
+    }
+    if (@abs(y - sy) > sc) {
+        return false;
+    }
+    return true;
+}
+
+// The top and the bottom of the band of row centres a splat can touch, px.
+pub fn splat_top(k: u8, sy: f64, sc: f64) -> f64 {
+    if (k == K_VLINE) {
+        return sy;
+    }
+    return sy - sc;
+}
+
+pub fn splat_bot(k: u8, sy: f64, sw: f64, sc: f64) -> f64 {
+    if (k == K_VLINE) {
+        return sw;
+    }
+    return sy + sc;
+}
+
+// The rows the index lists a splat under: every row whose centre lies in [top, bot], and one more
+// on each side, clipped to the frame. The margin covers rounding; the raster still asks touches_row,
+// so a listed row the splat misses costs a test and changes no byte. row_lo > row_hi lists none.
+pub fn row_lo(top: f64) -> i32 {
+    var r : f64 = @floor(top - 0.5) - 1.0;
+    if (r < 0.0) { r = 0.0; }
+    if (r > @as(f64, @floatFromInt(FRAME_H))) { r = @as(f64, @floatFromInt(FRAME_H)); }
+    return @as(i32, @intFromFloat(r));
+}
+
+pub fn row_hi(bot: f64) -> i32 {
+    var r : f64 = @ceil(bot - 0.5) + 1.0;
+    if (r < -1.0) { r = -1.0; }
+    if (r > @as(f64, @floatFromInt(FRAME_H - 1))) { r = @as(f64, @floatFromInt(FRAME_H - 1)); }
+    return @as(i32, @intFromFloat(r));
+}
+
+// The most rows the index can list a splat under whose band is ext px tall.
+pub fn span_max(ext: f64) -> i64 {
+    return @as(i64, @intFromFloat(@ceil(ext))) + 5;
+}
+
+// The most entries the index can hold in any frame: every dot and its image, the counter's pool,
+// each ball's halo, body and image, and the five vertical lines, each at its tallest band.
+pub fn index_bound() -> i64 {
+    var b : i64 = 0;
+    var l : usize = 0;
+    while (l < LABELS) {
+        if (is_counter(l) == false) {
+            b = b + 2 * label_dots(l) * span_max(2.0 * (DOT_R * grid(lbl_f(l, 2)) + 1.0));
+        }
+        l = l + 1;
+    }
+    b = b + @as(i64, @intCast(POOL)) * span_max(2.0 * (DOT_R * grid(EXP_PITCH) + 1.0));
+    b = b + @as(i64, @intCast(BALLS)) * (span_max(2.0 * 3.0 * HALO_R * R_PX) + 2 * span_max(2.0 * (R_PX + 1.0)));
+    b = b + 2 * span_max(REFLECT_SPAN) + 3 * span_max(FLOOR_PX - TUBE_TOP);
+    return b;
+}
+
 // ---- the engine ----
 
 pub fn main() -> void {
@@ -891,6 +971,9 @@ pub fn main() -> void {
     var kxa : [1080]f64 = undefined;
     var gxa : [1080]f64 = undefined;
     var row : [3240]u8 = undefined;
+    var roff : [1921]usize = undefined;
+    var rcur : [1920]usize = undefined;
+    var rsp : [524288]u16 = undefined;
     var px : usize = 0;
     while (px < 1080) {
         const x = @as(f64, @floatFromInt(px)) + 0.5;
@@ -1091,7 +1174,43 @@ pub fn main() -> void {
             j = j + 1;
         }
 
-        // ---- raster: one row at a time ----
+        // ---- the row index: each row lists the splats that can touch it, in splat order ----
+        var ri : usize = 0;
+        while (ri <= 1920) {
+            roff[ri] = 0;
+            ri = ri + 1;
+        }
+        j = 0;
+        while (j < n) {
+            var rq : i32 = row_lo(splat_top(sk[j], sy[j], sc[j]));
+            const rh = row_hi(splat_bot(sk[j], sy[j], sw[j], sc[j]));
+            while (rq <= rh) {
+                const ru = @as(usize, @intCast(rq));
+                roff[ru + 1] = roff[ru + 1] + 1;
+                rq = rq + 1;
+            }
+            j = j + 1;
+        }
+        ri = 0;
+        while (ri < 1920) {
+            roff[ri + 1] = roff[ri + 1] + roff[ri];
+            rcur[ri] = roff[ri];
+            ri = ri + 1;
+        }
+        j = 0;
+        while (j < n) {
+            var rq : i32 = row_lo(splat_top(sk[j], sy[j], sc[j]));
+            const rh = row_hi(splat_bot(sk[j], sy[j], sw[j], sc[j]));
+            while (rq <= rh) {
+                const ru = @as(usize, @intCast(rq));
+                rsp[rcur[ru]] = @as(u16, @intCast(j));
+                rcur[ru] = rcur[ru] + 1;
+                rq = rq + 1;
+            }
+            j = j + 1;
+        }
+
+        // ---- raster: one row at a time, over the splats its index lists ----
         var py : i32 = 0;
         while (py < FRAME_H) {
             const y = @as(f64, @floatFromInt(py)) + 0.5;
@@ -1112,19 +1231,16 @@ pub fn main() -> void {
                 accb[px] = b * TINT_B;
                 px = px + 1;
             }
-            j = 0;
-            while (j < n) {
+            const pu = @as(usize, @intCast(py));
+            var ei : usize = roff[pu];
+            while (ei < roff[pu + 1]) {
+                j = @as(usize, @intCast(rsp[ei]));
                 const k = sk[j];
-                var on_row : bool = true;
-                if (sm[j] == 1 && below == false) { on_row = false; }
                 var dyy : f64 = y - sy[j];
                 if (k == K_VLINE) {
-                    if (y < sy[j] || y > sw[j]) { on_row = false; }
                     dyy = 0.0;
-                } else {
-                    if (@abs(dyy) > sc[j]) { on_row = false; }
                 }
-                if (on_row) {
+                if (touches_row(k, sm[j], sy[j], sw[j], sc[j], y)) {
                     var mf : f64 = 1.0;
                     if (sm[j] == 1) { mf = fr; }
                     var x0 : f64 = @floor(sx[j] - sc[j]);
@@ -1175,7 +1291,7 @@ pub fn main() -> void {
                         q = q + 1;
                     }
                 }
-                j = j + 1;
+                ei = ei + 1;
             }
             px = 0;
             while (px < 1080) {
@@ -1305,6 +1421,67 @@ test "every dot and its image fit the buffers" {
     assert(total_dots() <= @as(i64, @intCast(MAX_DOTS)));
     assert(2 * MAX_DOTS + 256 == MAX_SPLATS);
     assert(POOL + 3 * BALLS + 5 <= 256);
+}
+
+test "the row index lists every row a splat touches, and no more than span_max rows" {
+    // a dot, a halo, a ball and a vertical line, each at 300 centres from above the frame to below
+    // it, a third of a pixel apart, then as mirror images
+    var touched : i64 = 0;
+    var missed : i64 = 0;
+    var wide : i64 = 0;
+    var m : u8 = 0;
+    while (m < 2) {
+        var c : i64 = 0;
+        while (c < 4) {
+            var k : u8 = K_DOT;
+            var sc : f64 = DOT_R * grid(9.0) + 1.0;
+            if (c == 1) { k = K_GLOW; sc = 3.0 * HALO_R * R_PX; }
+            if (c == 2) { k = K_BALL; sc = R_PX + 1.0; }
+            if (c == 3) { k = K_VLINE; sc = 0.8 + 1.0; }
+            var t : i64 = 0;
+            while (t < 300) {
+                const sy = 0.0 - 200.0 + @as(f64, @floatFromInt(t)) * 7.7 + @as(f64, @floatFromInt(t)) / 3.0;
+                const sw = sy + 360.25;
+                const lo = row_lo(splat_top(k, sy, sc));
+                const hi = row_hi(splat_bot(k, sy, sw, sc));
+                if (hi - lo + 1 > span_max(splat_bot(k, sy, sw, sc) - splat_top(k, sy, sc))) {
+                    wide = wide + 1;
+                }
+                var py : i32 = 0;
+                while (py < FRAME_H) {
+                    if (touches_row(k, m, sy, sw, sc, @as(f64, @floatFromInt(py)) + 0.5)) {
+                        touched = touched + 1;
+                        if (py < lo || py > hi) {
+                            missed = missed + 1;
+                        }
+                    }
+                    py = py + 1;
+                }
+                t = t + 1;
+            }
+            c = c + 1;
+        }
+        m = m + 1;
+    }
+    assert(missed == 0);
+    assert(wide == 0);
+    assert(touched > 100000);
+    // a splat wholly above the frame is listed under no row; one at its last row only there
+    assert(row_lo(splat_top(K_DOT, 0.0 - 300.0, 3.0)) > row_hi(splat_bot(K_DOT, 0.0 - 300.0, 0.0, 3.0)));
+    assert(row_hi(splat_bot(K_DOT, 1919.5, 0.0, 0.25)) == FRAME_H - 1);
+    // an image is never on a row above the floor, a vertical line never off its ends
+    assert(touches_row(K_DOT, 1, FLOOR_PX, 0.0, 3.0, FLOOR_PX - 0.5) == false);
+    assert(touches_row(K_DOT, 0, FLOOR_PX, 0.0, 3.0, FLOOR_PX - 0.5));
+    assert(touches_row(K_VLINE, 0, TUBE_TOP, FLOOR_PX, 1.8, TUBE_TOP - 0.5) == false);
+    assert(touches_row(K_VLINE, 0, TUBE_TOP, FLOOR_PX, 1.8, TUBE_TOP + 0.5));
+}
+
+test "the row index fits its buffer in every frame, and a u16 names every splat" {
+    assert(index_bound() <= @as(i64, @intCast(INDEX_CAP)));
+    assert(index_bound() > 2 * total_dots() * 5);
+    assert(MAX_SPLATS <= 65536);
+    assert(span_max(70.0) == 75);
+    assert(span_max(70.25) == 76);
 }
 
 test "a dot reaches its letter on the critically damped path and never overshoots" {
