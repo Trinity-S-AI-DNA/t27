@@ -126,6 +126,10 @@ Traps from this tick:
 - Lab scripts run under `sh`, which is dash: `$((10#$x))` fails with "expecting EOF". Strip leading zeros with `sed 's/^0*//'` and default with `${i:-0}`.
 - The Mac hook reads the whole Bash command. A heredoc PR body that names the report command gets refused. Write the body with the Write tool and pass `--body-file`.
 
+**Holding the address when the voice runs long (t27#10629).** If an overlay must stay on screen for a minimum time and must also stay off a crossfade, then the crossfade has to move; the overlay cannot. Work out in frames the latest cut that still leaves the last scene its minimum: cut 1 is capped at `BEAT_CUT1_LAST_MS` = 13249. Prove it is the latest with a one-ms-later control. Only the voices the reel speeds up are affected, so the `cmp` diff is limited to those voices and to crossfade 1's offset. The cost is real: the crossfade starts up to 184 ms under the task's last word, and lesson 1's measured voice (1300/4200/6800) is one of the affected voices. Write a test that bounds that overlap.
+
+- Before trusting a "fast voice" grid result, work out which fixture voices are fast. `voice_room_ms(3)` is 12250 ms, so the measured lesson 1 voice (raw 12300) is already sped up. A change aimed at "fast voices" therefore changes the reel everyone actually sees.
+
 ## Show a spec (the core: exporter for what it reads, by hand for the rest)
 
 1. Load the spec: `mcp__t27__t27_spec` with `path` and `source: true`, or the file from a
