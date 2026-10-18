@@ -1,0 +1,253 @@
+// Port of gHashTag/trinity fpga/openxc7-synth/trinity_os/trinity_os_core.v
+// (at 341f1d150c70, 267 lines) to T27.
+//
+// The original is the Phase 1 "Kernel Foundation" integration module: it wires
+// external interrupt lines into the interrupt controller, configures the
+// ternary scheduler, ties every RISC-V-side control off (TODO in the source),
+// maps status outputs, and carries the golden identity constant
+// PHI^2 + 1/PHI^2 = 3. The submodules it instantiates (ternary_scheduler,
+// trinity_pcb, trinity_interrupt) are separate files with their own ports.
+//
+// What is ported here are the decisions the module makes in hardware:
+//   - the interrupt source wiring (bit 4 - TIMER/PREEMPT - is driven by the
+//     scheduler's preemption line, never by ext_irq_request[4])
+//   - the default per-source priority table (UART/VSA = HIGH, the rest NORMAL)
+//   - the default enable mask (all eight sources enabled)
+//   - the yield line (the scheduler yields on irq_ack[5])
+//   - the status-output width fixups (state [3:0], 4b task id to 16b, 3b
+//     vector zero-extended with a constant 0 top bit)
+//   - the golden identity check (2.99 <= PHI^2 + 1/PHI^2 <= 3.01)
+//   - the Phase 1 RISC-V tie-offs (task id 0, priority NORMAL, everything
+//     else disabled) and the scheduler timing (1000 cycles = 20us @ 50MHz)
+//
+// Pure pass-through status wires (active_task_count, cycle_counter,
+// sacred_counter, system_idle, irq_count, pcb_task_count, task_valid_mask)
+// connect submodule outputs to top-level outputs unchanged in the original;
+// they carry no decision and are not functions here.
+//
+// `t27c gen-verilog` lowers this module; on_comb is its combinational
+// surface: the internal irq_request byte that the interrupt controller sees.
+
+module trinity_os_core {
+
+    // Verilog localparams, lines 60-63 of the original.
+    const MAX_TASKS: u32 = 16;
+    const LOG2_MAX_TASKS: u32 = 4;
+    const NUM_IRQS: u32 = 8;
+    const LOG2_NUM_IRQS: u32 = 3;
+
+    // Scheduler tuning: BASE_CYCLES = 1000, "20us @ 50MHz" (line 137).
+    const BASE_CYCLES: u32 = 1000;
+    const CLOCK_HZ: u32 = 50_000_000;
+
+    // Golden identity, lines 241-242 of the original.
+    const PHI: f64 = 1.6180339887498948482;
+
+    // Default priority encoding, lines 117-126 of the original:
+    // 2'b10 = HIGH, 2'b01 = NORMAL.
+    const PRIORITY_NORMAL: u8 = 0x1;
+    const PRIORITY_HIGH: u8 = 0x2;
+
+    // The eight IRQ sources of the interrupt controller, in bit order.
+    enum IrqSource { UartRx, UartTx, VsaComplete, TqnnComplete, TimerPreempt, Yield, Fault, Spare, }
+
+    // The IRQ plumbing this module computes combinationally: the request byte
+    // fed to the interrupt controller and the scheduler yield line.
+    struct IrqRouting {
+        request: u8,
+        task_yield: bool,
+    }
+
+    // Lines 107-114 of the original: map the external IRQ byte to the
+    // internal request byte. Every source passes through except bit 4
+    // (TIMER/PREEMPT), which is driven by the scheduler's preemption line.
+    pub fn wire_irq_request(ext: u8, preempt: bool) -> u8 {
+        const from_pins: u8 = ext & 0xEF;
+        if (preempt) {
+            return from_pins | 0x10;
+        }
+        return from_pins;
+    }
+
+    // Line 147: the scheduler yields on the YIELD source's acknowledge,
+    // task_yield = irq_ack[5].
+    pub fn task_yield_on_ack(irq_ack: u8) -> bool {
+        return (irq_ack & 0x20) != 0;
+    }
+
+    // The full combinational routing bundle.
+    pub fn route_irqs(ext: u8, preempt: bool, irq_ack: u8) -> IrqRouting {
+        const routing: IrqRouting = IrqRouting {
+            request: wire_irq_request(ext, preempt),
+            task_yield: task_yield_on_ack(irq_ack),
+        };
+        return routing;
+    }
+
+    // Lines 117-126: the default priority table, source by source.
+    // UART_RX, UART_TX, FAULT and SPARE run HIGH; VSA_COMPLETE,
+    // TQNN_COMPLETE, TIMER and YIELD run NORMAL.
+    pub fn default_priority(source: IrqSource) -> u8 {
+        switch (source) {
+            .UartRx => PRIORITY_HIGH,
+            .UartTx => PRIORITY_HIGH,
+            .VsaComplete => PRIORITY_NORMAL,
+            .TqnnComplete => PRIORITY_NORMAL,
+            .TimerPreempt => PRIORITY_NORMAL,
+            .Yield => PRIORITY_NORMAL,
+            .Fault => PRIORITY_HIGH,
+            .Spare => PRIORITY_HIGH,
+        }
+    }
+
+    // Line 129: irq_enable = {NUM_IRQS{1'b1}} - every source enabled.
+    pub fn default_enable(source: IrqSource) -> bool {
+        return true;
+    }
+
+    pub fn default_enable_mask() -> u8 {
+        return 0xFF;
+    }
+
+    // Line 228: scheduler_state output carries sched_state[3:0].
+    pub fn scheduler_state_out(sched_state: u8) -> u8 {
+        return sched_state & 0x0F;
+    }
+
+    // Line 232: the 4-bit current task id, zero-extended into the 16-bit
+    // current_task_id output.
+    pub fn current_task_id_out(task: u8) -> u16 {
+        return task as u16;
+    }
+
+    // Line 234: irq_vector = {1'b0, irq_vector_out} - the 3-bit vector from
+    // the controller, zero-extended into the 4-bit output.
+    pub fn irq_vector_out(controller_vector: u8) -> u8 {
+        return controller_vector & 0x07;
+    }
+
+    // Lines 240-249: the golden identity PHI^2 + 1/PHI^2 = 3 and its
+    // elaboration-time check (2.99 <= value <= 3.01).
+    pub fn golden_identity() -> f64 {
+        const phi_squared: f64 = PHI * PHI;
+        return phi_squared + 1.0 / phi_squared;
+    }
+
+    pub fn golden_identity_ok(identity: f64) -> bool {
+        return identity >= 2.99 and identity <= 3.01;
+    }
+
+    // Lines 143-146 and 172-184: in Phase 1 every RISC-V-side control is
+    // tied off - task id 0, priority NORMAL, no spawn/kill, no PCB read,
+    // write or field access, no runtime priority or enable changes.
+    pub fn task_id_tieoff() -> u8 {
+        return 0;
+    }
+
+    pub fn task_priority_tieoff() -> u8 {
+        return PRIORITY_NORMAL;
+    }
+
+    pub fn riscv_side_connected() -> bool {
+        return false;
+    }
+
+    // Lines 137 and 13-14: 1000 scheduler base cycles over a 20ns clock -
+    // a 20us round-robin slice.
+    pub fn base_cycles() -> u32 {
+        return BASE_CYCLES;
+    }
+
+    pub fn clock_period_ns() -> u32 {
+        return 1_000_000_000 / CLOCK_HZ;
+    }
+
+    // The combinational surface of the module: ext_irq_request[7:0] in,
+    // sched_preemption_irq in, irq_request[7:0] out (lines 107-114).
+    fn on_comb(ext: u8, preempt: bool) -> u8 {
+        return wire_irq_request(ext, preempt);
+    }
+
+    test golden_identity_holds {
+        assert(golden_identity_ok(golden_identity()));
+        assert(golden_identity() > 2.99);
+        assert(golden_identity() < 3.01);
+        assert(!golden_identity_ok(2.5));
+        assert(!golden_identity_ok(3.5));
+    }
+
+    test wire_irq_request_routes {
+        assert(on_comb(0x10, false) == 0x00); // the combinational surface
+        assert(on_comb(0x00, true) == 0x10);
+        assert(wire_irq_request(0x01, false) == 0x01); // UART_RX passes through
+        assert(wire_irq_request(0x0F, false) == 0x0F);
+        assert(wire_irq_request(0x10, false) == 0x00); // bit 4 never from the pins
+        assert(wire_irq_request(0xFF, false) == 0xEF);
+        assert(wire_irq_request(0x00, true) == 0x10); // preemption drives bit 4
+        assert(wire_irq_request(0xFF, true) == 0xFF);
+        assert(wire_irq_request(0x21, true) == 0x31);
+    }
+
+    test task_yield_on_ack_bit5 {
+        assert(task_yield_on_ack(0x20));
+        assert(task_yield_on_ack(0xFF));
+        assert(!task_yield_on_ack(0x00));
+        assert(!task_yield_on_ack(0x1F));
+    }
+
+    test route_irqs_bundles {
+        const r: IrqRouting = route_irqs(0x11, false, 0x20);
+        assert(r.request == 0x01);
+        assert(r.task_yield);
+        const s: IrqRouting = route_irqs(0x00, true, 0x00);
+        assert(s.request == 0x10);
+        assert(!s.task_yield);
+    }
+
+    test default_priority_table {
+        assert(default_priority(.UartRx) == PRIORITY_HIGH);
+        assert(default_priority(.UartTx) == PRIORITY_HIGH);
+        assert(default_priority(.VsaComplete) == PRIORITY_NORMAL);
+        assert(default_priority(.TqnnComplete) == PRIORITY_NORMAL);
+        assert(default_priority(.TimerPreempt) == PRIORITY_NORMAL);
+        assert(default_priority(.Yield) == PRIORITY_NORMAL);
+        assert(default_priority(.Fault) == PRIORITY_HIGH);
+        assert(default_priority(.Spare) == PRIORITY_HIGH);
+    }
+
+    test default_enable_all {
+        assert(default_enable(.UartRx));
+        assert(default_enable(.UartTx));
+        assert(default_enable(.VsaComplete));
+        assert(default_enable(.TqnnComplete));
+        assert(default_enable(.TimerPreempt));
+        assert(default_enable(.Yield));
+        assert(default_enable(.Fault));
+        assert(default_enable(.Spare));
+        assert(default_enable_mask() == 0xFF);
+    }
+
+    test status_width_fixups {
+        assert(scheduler_state_out(0xAB) == 0x0B); // low 4 bits only
+        assert(current_task_id_out(0x0D) == 0x0D); // zero-extended into 16 bits
+        assert(current_task_id_out(0x0D) < 0x100);
+        assert(irq_vector_out(0x0F) == 0x07); // {1'b0, vector[2:0]}
+        assert(irq_vector_out(0x05) == 0x05);
+    }
+
+    test riscv_tieoffs_phase1 {
+        assert(task_id_tieoff() == 0);
+        assert(task_priority_tieoff() == PRIORITY_NORMAL);
+        assert(!riscv_side_connected());
+    }
+
+    test scheduler_timing {
+        assert(MAX_TASKS == 16);
+        assert(NUM_IRQS == 8);
+        assert(LOG2_MAX_TASKS == 4);
+        assert(LOG2_NUM_IRQS == 3);
+        assert(base_cycles() == 1000);
+        assert(clock_period_ns() == 20);
+        assert(base_cycles() * clock_period_ns() == 20_000); // 20us
+    }
+}
