@@ -35,6 +35,7 @@ Use **domain directories**, not “one folder per agent.” Primary contact for 
 3. **English + ASCII** — first-party Markdown and source comments per **LANG-EN** and **ADR-004**; grandfathered paths only in [`docs/.legacy-non-english-docs`](docs/.legacy-non-english-docs).
 4. **No new Python on the verification critical path** — see **SSOT-MATH** and [`docs/nona-02-organism/TZ-T27-001-NO-PYTHON-CRITICAL-PATH.md`](docs/nona-02-organism/TZ-T27-001-NO-PYTHON-CRITICAL-PATH.md).
 5. **Issue gate** — PRs should link issues (`Closes #N`) where project policy requires it.
+   **Issue shape** -- a new issue stays open only if [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) (#7498) passes; otherwise `needs-boundary.yml` closes it seconds after filing, labelled `shape-refused`. That spec is the rule. Before `gh issue create`, load the skill [`.claude/skills/issue-shape/SKILL.md`](.claude/skills/issue-shape/SKILL.md): it explains the sections, the Boundary path trap, checking a body on the Railway lab, and recovery with `gh issue edit`.
 6. **Ring / gold work** — follow [`docs/nona-01-foundation/GOLDEN-RINGS-CANON.md`](docs/nona-01-foundation/GOLDEN-RINGS-CANON.md) for parser/compiler/spec changes; compiler seal path: `bootstrap/stage0/FROZEN_HASH`.
 
 ---
