@@ -140,13 +140,18 @@ reusable workflow. Epic #9271.
 | Service contract: modes, exit codes, release tag `claw-v*`, check prefix `claw/` | [`specs/claw/service.t27`](specs/claw/service.t27) |
 | Auto-fix recipes and the fix engine: which red check gets which deterministic fix | [`specs/claw/recipes.t27`](specs/claw/recipes.t27), [`specs/claw/engine.t27`](specs/claw/engine.t27) |
 | Docs, release checklist, competitors | [`docs/claw/`](docs/claw/README.md) |
-| The GitHub App | [github.com/apps/tri-claw](https://github.com/apps/tri-claw), id 5166765. Today it is the reviewer-bee identity ([`tools/bees/README.md`](tools/bees/README.md)): bees approve under its name, so a review is never the author approving itself |
+| The GitHub App | [github.com/apps/tri-claw](https://github.com/apps/tri-claw), id 5166765, installed on all repositories. It is the reviewer-bee identity ([`tools/bees/README.md`](tools/bees/README.md)): bees approve under its name, so a review is never the author approving itself. It also posts the `claw/t27f` check below |
+| T27F check `claw/t27f` (#10268): changed specs and their direct importers, judged by their seals | law [`specs/claw/t27f_gate.t27`](specs/claw/t27f_gate.t27), lowered to `gen/c/claw/t27f_gate.c`; run every 10 minutes by the `claw-t27f` job of `.github/workflows/gate-topology.yml` |
+| SARIF alerts `claw/sarif` (#10356): a changed spec that does not parse or is unwritten, as a code-scanning alert | adapter [`specs/claw/sarif_feed.t27`](specs/claw/sarif_feed.t27) over [`specs/claw/sarif.t27`](specs/claw/sarif.t27), lowered to `gen/c/claw/sarif_feed.c`; run on every pull request by the `claw-sarif` job of `.github/workflows/gate-topology.yml` |
 
-In flight (2026-10-18): a `claw/t27f` check that the App posts on pull requests
-in every gHashTag repository that holds `.t27` specs. It is seal-gated, so only
-changed specs and their importers are checked again, and the summary links to
-each spec's T27F graph. No file is added to consumer repositories. Until it
-lands, read `docs/claw/README.md` for the status, not this paragraph.
+The `claw/t27f` check: one scheduled job in this repository posts it on every
+open pull request that touches `.t27`, in each repository the App is installed
+on. No consumer repository carries a workflow file. An unsealed spec is neutral
+and a stale seal is failure; each summary row links to the spec's T27F graph.
+It posts nothing until the owner finishes the four steps in
+[`docs/claw/README.md`](docs/claw/README.md#the-t27f-check-in-every-t27-repository-10268):
+App permission checks: write, accepting that permission, secret
+`CLAW_APP_PRIVATE_KEY`, variable `CLAW_APP_ID`. That section has the status.
 
 Adding a workflow file means adding its row to `gates.t27` in the same commit.
 The drift gate refuses anything else.
