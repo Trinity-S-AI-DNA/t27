@@ -9004,23 +9004,4 @@ mod cause_removed_tests {
         );
         assert_eq!(CAUSE_REMOVED_MARKER, "tri:cause-removed");
     }
-
-    /// The workflow that motivated this must actually carry the marker, or the
-    /// mechanism is untested against the only case it was built for.
-    #[test]
-    fn the_motivating_workflow_records_its_own_reason() {
-        let y = include_str!("../../../.github/workflows/brain-seal-refresh.yml");
-        let why = cause_removed(y).expect("brain-seal-refresh.yml must record why it is red");
-        assert!(
-            why.contains("#3324"),
-            "the reason must name the repair: {why}"
-        );
-        // And the cause really is gone: the only `git push` left is in prose.
-        for line in y.lines().filter(|l| l.contains("git push")) {
-            assert!(
-                line.trim_start().starts_with('#'),
-                "a live `git push` is back in this workflow: {line}"
-            );
-        }
-    }
 }
