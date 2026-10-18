@@ -133,18 +133,25 @@ another language; the hooks must stop it. It binds people, bees and agents alike
 - **Allowed:** `.t27` specs; files `t27c` generated under a generated root
   (`gen/`, `bootstrap/gen/`, `bootstrap/src/memory/generated/`); prose and data
   (`.md`, `.txt`, `.json`); and **deletions**.
-- **Denied:** adding or modifying hand-written code in any other language --
+- **Denied:** adding a new hand-written file in any other language --
   `.rs .py .ts .js .sh .zig .c .go .v .lean .yml .toml`, Dockerfile, Makefile and
-  the rest of the list in the spec. A change to existing Rust
-  (`bootstrap/src/compiler.rs`, `cli/t27b`) or Python is denied too.
+  the rest of the list in the spec.
+- **Allowed without the label since 2026-10-18:** editing a foreign file that
+  already exists (`bootstrap/src/compiler.rs`, `cli/t27b`, a workflow `.yml`).
+  Owner rule, 2026-10-18 (translated): the label is not for every pull request,
+  only for the most important files. The edit is still held by `check_budget()`:
+  at most 40 added foreign lines per file and 80 per pull request, and never more
+  added than deleted. No label lifts that.
 - **The rule is** `specs/policy/own_language.t27`; its `t27c gen-c` output
   `gen/c/policy/own_language.c` runs in `lefthook.yml` (pre-commit, pre-push)
   and in `.github/workflows/own-language.yml` on every pull request. Read the
   spec for the exact list; do not copy it here.
-- **The only override** is the label `owner-approved-foreign`. It is applied
-  only on the owner's explicit approval, and the pull request body quotes that
-  approval (in English, with its date and where it was given). Changing the gate
-  itself needs the label as well.
+- **The only override** is the label `owner-approved-foreign`, and it is needed
+  only for the most important files: a new foreign file, and the gate itself
+  (the spec, its generated C, `lefthook.yml`, `.github/workflows/own-language.yml`,
+  `tools/policy/foreign-exceptions.txt`). It is applied only on the owner's
+  explicit approval, and the pull request body quotes that approval (in English,
+  with its date and where it was given).
 - **Owner-approved exceptions** live in `tools/policy/foreign-exceptions.txt`:
   data, one path prefix per line, each under a comment naming the approval. On
   an approved branch, add the entry in the same branch; the local hooks read the
@@ -168,9 +175,10 @@ measure it are written in **t27**, not in Rust or Python by hand.
   file is never hand-edited (L2).
 - What gen cannot express yet is a defect of the self-host work (#5980): file
   it there. Do not work around it in a hand-written file.
-- A hand-written addition or modification is denied by the gate in "Only t27"
-  above unless the owner labels the pull request `owner-approved-foreign`; such
-  a PR still names the spec that will replace it and links the port epic #6198.
+- A new hand-written file is denied by the gate in "Only t27" above unless the
+  owner labels the pull request `owner-approved-foreign`; an edit to an existing
+  one passes within the budget. Either way the PR names the spec that will
+  replace it and links the port epic #6198.
 - The debt only shrinks, and the gate enforces it: since #8236 `check_budget()` refuses
   any pull request that adds more hand-written foreign lines than it deletes. On
   2026-10-10 (master 1a7c8b939, `wc -l`) it is `cli/t27b/src/**/*.rs` 15627 lines and
