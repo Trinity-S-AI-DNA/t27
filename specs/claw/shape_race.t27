@@ -1,0 +1,422 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/shape_race.t27 -- the issue-shape gate judges a stale payload (tick 16, 2026-10-19).
+; --
+; The workflow "Needs boundary" (.github/workflows/needs-boundary.yml) runs on issues opened, edited
+; and reopened, one concurrency group per issue. It reads the body, the shape-refused label and the
+; state from the event payload, which GitHub fixes when the event is created, not when the job runs.
+; A failing body closes the issue and labels it shape-refused. A passing body reopens it only if the
+; payload already carried shape-refused.
+; On 2026-10-18 the queue made runners wait about twenty minutes, and #10644 showed what a stale
+; payload does. Times below are seconds after 20:00:00 UTC:
+;   1689  opened, body without the sections; its job ran at 2875 and closed the issue
+;   1776  edit by tri-claw, body passes; cancelled by the next event in the group
+;   2657  edit, body passes; its job ran at 3834, read REFUSED false and STATE open from the
+;         payload, and did nothing, so the issue stayed closed with a passing body
+;   3387  edit, body passes; its job ran at 4121 and reopened the issue
+; The issue was closed for 1246 s with a passing body, and only the third edit undid it. Five more
+; lane issues were closed the same night.
+; Bots that gate on live state (Mergify, bors, Kodiak) read it again when they act, not from the
+; event that woke them. This module replays a timeline under both readings; it moves nothing.
+; --
+; Input: one row per gate event, created TAB ran TAB ok.
+;   created  whole seconds, 0..432000 (queue_cost's MAX_SECS), when the event was created
+;   ran      whole seconds when its job started, not before created; `-` when it was cancelled
+;   ok       1 when the body as of that event passes the shape check, 0 when it fails
+; Each row is also an edit of the body, so a cancelled row still changes the live body.
+; The gate is the only thing that closes or reopens the issue, and it closes and refuses together.
+; Jobs are replayed in ran order (ties: input order).
+;   payload  the job sees the shape-refused label as it stood just before created (state changes
+;            strictly earlier). It closes on a failing body, and reopens on a passing body only if
+;            that old label was there.
+;   live     the job sees the body and the label as they stand when it runs. The body is that of the
+;            latest row created at or before ran (ties: the later row). It closes on a failing body
+;            and reopens on a passing one.
+; A job leaves the issue wrong when the issue is closed and the live body passes, or open and the
+; live body fails. The end is stuck (closed, last body passes), loose (open, last body fails) or right.
+; Output, race_plan:
+;     R TAB shape-race: <e> events, <c> cancelled, <b> unreadable; payload leaves it wrong after
+;           <p> runs, ends <end>; live leaves it wrong after <l> runs, ends <end>
+;     F TAB shape-race TAB clean | race | unknown | none
+; race: the payload reading leaves some job wrong or ends wrong. unknown: some row is unreadable,
+; because one missing event changes the order of everything after it. none: no rows.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawShapeRace;
+
+use claw::text;
+use claw::queue_cost;
+
+/// Rows kept for the replay; a row past this is unreadable.
+pub const SR_MAX : usize = 64;
+/// The latest second a row can carry, so a body lookup at SR_END sees every row.
+pub const SR_END : i32 = 432000;
+
+pub const SR_ROWS : usize = 0;
+pub const SR_CANCELLED : usize = 1;
+pub const SR_BAD : usize = 2;
+pub const SR_SLOTS : usize = 3;
+
+pub const SR_WRONG : usize = 0;
+pub const SR_ENDS : usize = 1;
+
+pub const SR_RIGHT : u8 = 0;
+pub const SR_STUCK : u8 = 1;
+pub const SR_LOOSE : u8 = 2;
+
+pub const SR_CLEAN : u8 = 0;
+pub const SR_RACE : u8 = 1;
+pub const SR_UNKNOWN : u8 = 2;
+pub const SR_NONE : u8 = 3;
+
+pub const SR_HEAD : str = "R\tshape-race: ";
+pub const SR_HEAD_LEN : usize = 14;
+pub const SR_TEXTS : [6]str = [" events, ", " cancelled, ", " unreadable; payload leaves it wrong after ", " runs, ends ", "; live leaves it wrong after ", "\n"];
+pub const SR_LENS : [6]usize = [9, 12, 43, 12, 29, 1];
+pub const SR_END_TEXTS : [3]str = ["right", "stuck", "loose"];
+pub const SR_END_LENS : [3]usize = [5, 5, 5];
+pub const SR_FLAG_HEAD : str = "F\tshape-race\t";
+pub const SR_FLAG_HEAD_LEN : usize = 13;
+pub const SR_FLAG_TEXTS : [4]str = ["clean\n", "race\n", "unknown\n", "none\n"];
+pub const SR_FLAG_LENS : [4]usize = [6, 5, 8, 5];
+
+/// Read the rows into cr, rn (-1 when cancelled) and okv; counts in st[SR_ROWS..SR_BAD]. Returns
+/// the number of readable rows kept, at most SR_MAX.
+pub fn sr_parse(raw : []const u8, n : usize, cr : []i32, rn : []i32, okv : []u8, st : []u32) -> usize {
+    var f : [6]usize = undefined;
+    var k : usize = 0;
+    while (k < SR_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var m : usize = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var ok : bool = false;
+            if (m < SR_MAX and qc_split(raw, ls, le, &f, 3)) {
+                const c : i32 = qc_secs(raw, f[0], f[1]);
+                const dash : bool = qc_range_is(raw, f[2], f[3], "-", 1);
+                var r : i32 = -1;
+                if (dash == false) { r = qc_secs(raw, f[2], f[3]); }
+                const pass : bool = qc_range_is(raw, f[4], f[5], "1", 1);
+                const fail : bool = qc_range_is(raw, f[4], f[5], "0", 1);
+                const ran_ok : bool = dash or r >= c;
+                if (c >= 0 and ran_ok and (pass or fail)) {
+                    cr[m] = c;
+                    rn[m] = r;
+                    okv[m] = 0;
+                    if (pass) { okv[m] = 1; }
+                    if (dash) { st[SR_CANCELLED] += 1; }
+                    m += 1;
+                    ok = true;
+                }
+            }
+            if (ok == false) { st[SR_BAD] += 1; }
+            st[SR_ROWS] += 1;
+        }
+        ls = le + 1;
+    }
+    return m;
+}
+
+/// The body at second t: ok of the latest row created at or before t, the later row on a tie;
+/// 1 when no row is that early.
+pub fn sr_body_at(cr : []const i32, okv : []const u8, m : usize, t : i32) -> u8 {
+    var b : u8 = 1;
+    var best : i32 = -1;
+    var i : usize = 0;
+    while (i < m) {
+        if (cr[i] <= t and cr[i] >= best) {
+            best = cr[i];
+            b = okv[i];
+        }
+        i += 1;
+    }
+    return b;
+}
+
+/// The label just before second t: the state a replayed job left behind, taking the latest job
+/// that ran strictly before t (the later one on a tie); 0 when none did.
+pub fn sr_shut_at(rn : []const i32, after : []const u8, done : []const u8, m : usize, t : i32) -> u8 {
+    var s : u8 = 0;
+    var best : i32 = -1;
+    var i : usize = 0;
+    while (i < m) {
+        if (done[i] == 1 and rn[i] < t and rn[i] >= best) {
+            best = rn[i];
+            s = after[i];
+        }
+        i += 1;
+    }
+    return s;
+}
+
+/// Replay the jobs in ran order under one reading. res[SR_WRONG] counts the jobs that left the
+/// issue wrong; res[SR_ENDS] is SR_RIGHT, SR_STUCK or SR_LOOSE.
+pub fn sr_replay(cr : []const i32, rn : []const i32, okv : []const u8, m : usize, live : bool, res : []u32) -> void {
+    var after : [64]u8 = undefined;
+    var done : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < SR_MAX) {
+        after[i] = 0;
+        done[i] = 0;
+        i += 1;
+    }
+    var shut : u8 = 0;
+    var wrong : u32 = 0;
+    var step : usize = 0;
+    while (step < m) {
+        var j : usize = m;
+        i = 0;
+        while (i < m) {
+            if (done[i] == 0 and rn[i] >= 0) {
+                if (j == m) {
+                    j = i;
+                } else if (rn[i] < rn[j]) {
+                    j = i;
+                }
+            }
+            i += 1;
+        }
+        if (j == m) {
+            step = m;
+        } else {
+            const body : u8 = sr_body_at(cr, okv, m, rn[j]);
+            if (live) {
+                shut = 0;
+                if (body == 0) { shut = 1; }
+            } else {
+                if (okv[j] == 0) {
+                    shut = 1;
+                } else if (sr_shut_at(rn, &after, &done, m, cr[j]) == 1) {
+                    shut = 0;
+                }
+            }
+            after[j] = shut;
+            done[j] = 1;
+            if (shut == body) { wrong += 1; }
+            step += 1;
+        }
+    }
+    res[SR_WRONG] = wrong;
+    res[SR_ENDS] = SR_RIGHT as u32;
+    if (m > 0) {
+        const last : u8 = sr_body_at(cr, okv, m, SR_END);
+        if (shut == 1 and last == 1) { res[SR_ENDS] = SR_STUCK as u32; }
+        if (shut == 0 and last == 0) { res[SR_ENDS] = SR_LOOSE as u32; }
+    }
+}
+
+pub fn sr_verdict_of(st : []const u32, pay : []const u32) -> u8 {
+    if (st[SR_ROWS] == 0) { return SR_NONE; }
+    if (st[SR_BAD] > 0) { return SR_UNKNOWN; }
+    if (pay[SR_WRONG] > 0 or pay[SR_ENDS] != (SR_RIGHT as u32)) { return SR_RACE; }
+    return SR_CLEAN;
+}
+
+pub fn sr_verdict(raw : []const u8, n : usize) -> u8 {
+    var cr : [64]i32 = undefined;
+    var rn : [64]i32 = undefined;
+    var okv : [64]u8 = undefined;
+    var st : [3]u32 = undefined;
+    var pay : [2]u32 = undefined;
+    const m : usize = sr_parse(raw, n, &cr, &rn, &okv, &st);
+    sr_replay(&cr, &rn, &okv, m, false, &pay);
+    return sr_verdict_of(&st, &pay);
+}
+
+pub fn race_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var cr : [64]i32 = undefined;
+    var rn : [64]i32 = undefined;
+    var okv : [64]u8 = undefined;
+    var st : [3]u32 = undefined;
+    var pay : [2]u32 = undefined;
+    var liv : [2]u32 = undefined;
+    const m : usize = sr_parse(raw, n, &cr, &rn, &okv, &st);
+    sr_replay(&cr, &rn, &okv, m, false, &pay);
+    sr_replay(&cr, &rn, &okv, m, true, &liv);
+    var w : usize = put_str(out, cap, 0, SR_HEAD, SR_HEAD_LEN);
+    w = put_count(out, cap, w, st[SR_ROWS]);
+    w = put_str(out, cap, w, SR_TEXTS[0], SR_LENS[0]);
+    w = put_count(out, cap, w, st[SR_CANCELLED]);
+    w = put_str(out, cap, w, SR_TEXTS[1], SR_LENS[1]);
+    w = put_count(out, cap, w, st[SR_BAD]);
+    w = put_str(out, cap, w, SR_TEXTS[2], SR_LENS[2]);
+    w = put_count(out, cap, w, pay[SR_WRONG]);
+    w = put_str(out, cap, w, SR_TEXTS[3], SR_LENS[3]);
+    const pe : usize = pay[SR_ENDS] as usize;
+    w = put_str(out, cap, w, SR_END_TEXTS[pe], SR_END_LENS[pe]);
+    w = put_str(out, cap, w, SR_TEXTS[4], SR_LENS[4]);
+    w = put_count(out, cap, w, liv[SR_WRONG]);
+    w = put_str(out, cap, w, SR_TEXTS[3], SR_LENS[3]);
+    const le : usize = liv[SR_ENDS] as usize;
+    w = put_str(out, cap, w, SR_END_TEXTS[le], SR_END_LENS[le]);
+    w = put_str(out, cap, w, SR_TEXTS[5], SR_LENS[5]);
+    w = put_str(out, cap, w, SR_FLAG_HEAD, SR_FLAG_HEAD_LEN);
+    const v : usize = sr_verdict_of(&st, &pay) as usize;
+    return put_str(out, cap, w, SR_FLAG_TEXTS[v], SR_FLAG_LENS[v]);
+}
+
+// ---- test helpers ----
+
+/// #10644 on 2026-10-18, seconds after 20:00:00 UTC, from the run and job API.
+fn t_10644(dst : []u8, cap : usize) -> usize {
+    var x : usize = put_str(dst, cap, 0, "1689\t2875\t0\n", 12);
+    x = put_str(dst, cap, x, "1776\t-\t1\n", 9);
+    x = put_str(dst, cap, x, "2657\t3834\t1\n", 12);
+    return put_str(dst, cap, x, "3387\t4121\t1\n", 12);
+}
+
+/// Replay raw under one reading; returns wrong * 10 + end, so one assert pins both.
+fn t_replay(raw : []const u8, n : usize, live : bool) -> u32 {
+    var cr : [64]i32 = undefined;
+    var rn : [64]i32 = undefined;
+    var okv : [64]u8 = undefined;
+    var st : [3]u32 = undefined;
+    var res : [2]u32 = undefined;
+    const m : usize = sr_parse(raw, n, &cr, &rn, &okv, &st);
+    sr_replay(&cr, &rn, &okv, m, live, &res);
+    return res[SR_WRONG] * 10 + res[SR_ENDS];
+}
+
+// ---- tests ----
+
+test the_10644_timeline_reads_four_events_one_cancelled {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    assert n == 45;
+    var cr : [64]i32 = undefined;
+    var rn : [64]i32 = undefined;
+    var okv : [64]u8 = undefined;
+    var st : [3]u32 = undefined;
+    assert sr_parse(&raw, n, &cr, &rn, &okv, &st) == 4;
+    assert st[SR_ROWS] == 4;
+    assert st[SR_CANCELLED] == 1;
+    assert st[SR_BAD] == 0;
+    assert rn[1] == -1;
+    assert okv[0] == 0;
+    assert okv[3] == 1;
+}
+
+test the_payload_gate_left_10644_wrong_twice_and_a_live_read_never {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    assert t_replay(&raw, n, false) == 20;
+    assert t_replay(&raw, n, true) == 0;
+    assert sr_verdict(&raw, n) == SR_RACE;
+}
+
+test without_the_third_edit_the_payload_gate_stays_stuck {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    assert t_replay(&raw, 33, false) == 21;
+    assert t_replay(&raw, 33, true) == 0;
+    assert n == 45;
+}
+
+test the_10644_plan_text {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    var out : [200]u8 = undefined;
+    const w : usize = race_plan(&raw, n, &out, 200);
+    assert w == 165;
+    assert buf_has(&out, w, "R\tshape-race: 4 events, 1 cancelled, 0 unreadable; payload leaves it wrong after 2 runs, ends right; live leaves it wrong after 0 runs, ends right\n", 147) == true;
+    assert buf_has(&out, w, "F\tshape-race\trace\n", 18) == true;
+}
+
+test jobs_replay_in_ran_order_not_input_order {
+    var raw : [64]u8 = undefined;
+    var x : usize = put_str(&raw, 64, 0, "3387\t4121\t1\n", 12);
+    x = put_str(&raw, 64, x, "2657\t3834\t1\n", 12);
+    x = put_str(&raw, 64, x, "1776\t-\t1\n", 9);
+    x = put_str(&raw, 64, x, "1689\t2875\t0\n", 12);
+    assert t_replay(&raw, x, false) == 20;
+    assert t_replay(&raw, x, true) == 0;
+}
+
+test a_cancelled_failing_edit_leaves_the_payload_gate_loose {
+    assert t_replay("10\t100\t1\n20\t-\t0\n", 16, false) == 12;
+    assert t_replay("10\t100\t1\n20\t-\t0\n", 16, true) == 0;
+}
+
+test the_old_label_is_strictly_before_the_event {
+    assert t_replay("10\t50\t0\n50\t60\t1\n", 16, false) == 21;
+    assert t_replay("10\t50\t0\n51\t60\t1\n", 16, false) == 0;
+}
+
+test the_live_body_includes_an_edit_in_the_same_second {
+    assert t_replay("10\t50\t1\n50\t-\t0\n", 15, true) == 0;
+    assert t_replay("10\t50\t1\n51\t-\t0\n", 15, true) == 2;
+}
+
+test one_passing_event_is_clean {
+    assert sr_verdict("5\t9\t1\n", 6) == SR_CLEAN;
+    assert t_replay("5\t9\t1\n", 6, false) == 0;
+    assert t_replay("5\t9\t0\n", 6, false) == 0;
+    assert sr_verdict("5\t9\t0\n", 6) == SR_CLEAN;
+    assert sr_verdict("5\t5\t1\n", 6) == SR_CLEAN;
+}
+
+test an_unreadable_row_makes_it_unknown {
+    assert sr_verdict("9\t5\t1\n", 6) == SR_UNKNOWN;
+    assert sr_verdict("5\t9\t2\n", 6) == SR_UNKNOWN;
+    assert sr_verdict("5\tx\t1\n", 6) == SR_UNKNOWN;
+    assert sr_verdict("x\t9\t1\n", 6) == SR_UNKNOWN;
+    assert sr_verdict("5\t9\n", 4) == SR_UNKNOWN;
+    assert sr_verdict("5\t9\t1\r\n", 7) == SR_UNKNOWN;
+    assert sr_verdict("5\t9\t1\n9\t5\t1\n", 12) == SR_UNKNOWN;
+}
+
+test rows_past_the_cap_are_unreadable {
+    var raw : [400]u8 = undefined;
+    var x : usize = 0;
+    var k : usize = 0;
+    while (k < 65) {
+        x = put_str(&raw, 400, x, "1\t2\t1\n", 6);
+        k += 1;
+    }
+    assert x == 390;
+    var cr : [64]i32 = undefined;
+    var rn : [64]i32 = undefined;
+    var okv : [64]u8 = undefined;
+    var st : [3]u32 = undefined;
+    assert sr_parse(&raw, x, &cr, &rn, &okv, &st) == 64;
+    assert st[SR_ROWS] == 65;
+    assert st[SR_BAD] == 1;
+    assert sr_verdict(&raw, x) == SR_UNKNOWN;
+}
+
+test no_rows_is_none {
+    assert sr_verdict("", 0) == SR_NONE;
+    var out : [200]u8 = undefined;
+    const w : usize = race_plan("", 0, &out, 200);
+    assert buf_has(&out, w, "F\tshape-race\tnone\n", 18) == true;
+    assert buf_has(&out, w, "0 events, 0 cancelled, 0 unreadable", 35) == true;
+}
+
+test a_clipped_race_plan_still_advances_the_cursor {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    var out : [200]u8 = undefined;
+    assert race_plan(&raw, n, &out, 30) == 165;
+}
+
+test a_same_second_edit_wins_the_tie {
+    assert t_replay("10\t50\t1\n10\t-\t0\n", 15, false) == 12;
+}
+
+test the_later_of_two_same_second_jobs_sets_the_old_label {
+    assert t_replay("1\t10\t0\n20\t50\t1\n30\t50\t0\n60\t70\t1\n", 31, false) == 10;
+}
+
+test the_plan_prints_each_reading_its_own_end {
+    var raw : [64]u8 = undefined;
+    const n : usize = t_10644(&raw, 64);
+    var out : [200]u8 = undefined;
+    const w : usize = race_plan(&raw, 33, &out, 200);
+    assert w == 165;
+    assert buf_has(&out, w, "3 events, 1 cancelled", 21) == true;
+    assert buf_has(&out, w, "ends stuck; live leaves it wrong after 0 runs, ends right\n", 58) == true;
+    assert n == 45;
+}

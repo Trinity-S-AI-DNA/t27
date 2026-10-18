@@ -157,11 +157,14 @@ App permission checks: write, accepting that permission, secret
 Adding a workflow file means adding its row to `gates.t27` in the same commit.
 The drift gate refuses anything else.
 
-### T27F: the visual spec of every `.t27`
+### T27F: t27's frontend
 
-One spec gives one graph model and many views: source, architecture, data flow,
-dependencies and tests. Every node is labelled exact, derived, suggested or
-unknown, and links back to its source lines. The definition lives in one place:
+T27F is how t27 shows anything visual, through several tools: spec diagrams,
+map stills, particle reels and stills, the hot-reload stream and the
+`claw/t27f` check-run. TRI CLAW serves its MCP tools. Its core is the visual
+spec of every `.t27`: one graph model, many views, every node labelled exact,
+derived, suggested or unknown. The surfaces and their status are
+[`specs/t27f/frontend.t27`](specs/t27f/frontend.t27); the definition lives in
 [`.claude/skills/t27f/SKILL.md`](.claude/skills/t27f/SKILL.md), "What T27F is".
 
 - **Specs:** [`specs/t27f/`](specs/t27f/). The IR is `spec_graph.t27`. The
