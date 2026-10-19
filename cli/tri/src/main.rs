@@ -48,18 +48,18 @@ mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of
 mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
 #[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
 mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
-#[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)]
-mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525)
+#[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)] mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525), which front end reads a file, what a .zig file is judged by (#10823)
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
-#[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
-mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
+#[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
 #[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
 #[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
 mod renum;
@@ -410,6 +410,8 @@ enum Commands {
         /// Passed on to t27c after the action's own arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)] rest: Vec<String>,
     },
+    /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
+    Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -428,7 +430,7 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27). A .zig file prints the spec and its count line (rules: specs/tools/t27o/zig_convert.t27); its own tests are the oracle, so run `t27b test` on the spec (--oracle and --check are for Rust).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27). A .zig file prints the spec and its count line (rules: specs/tools/t27o/zig_convert.t27); its own tests are the oracle, so --check writes the spec and judges it by them, and --oracle says it does not apply.
     T27o {
         file: String,
         /// The module name; default the file's stem.
@@ -441,7 +443,7 @@ enum Commands {
         /// A netlist: print the M1 cell constants (CELL_N, CELL_D, CELL_NV) folded from it, or the refusal, instead of the inventory.
         #[arg(long)] emit_cell: bool,
     },
-    /// t27o over a tree (#10543): every tracked .rs file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
+    /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
 }
 
@@ -1066,6 +1068,16 @@ fn cmd_lab(specs: Option<&str>, sha: &[String]) -> Result<u8> {
     let x = lab::exit_code(n.iter().sum(), n[lab::V_RED as usize], n[lab::V_UNREAD as usize]); println!("{}", lab::exit_why(x)); Ok(x)
 }
 
+/// `tri raw` (#10909): every rule is specs/analog/raw_writer.t27; this allocates its buffers and writes the file.
+fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
+    let d = date.map_or_else(|| chrono::Local::now().format("%a %b %e %H:%M:%S  %Y").to_string(), str::to_string);
+    let (mut buf, mut vals, mut limbs, mut dig) = (vec![0u8; 1 << 16], vec![0f64; raw::RLC_VALS], vec![0u64; raw::RAW_LIMBS], vec![0u8; raw::RAW_DIGITS]);
+    let n = raw::raw_rlc_file(&mut buf, d.as_bytes(), binary, &mut vals, &mut limbs, &mut dig);
+    anyhow::ensure!(n > 0 && n <= buf.len(), "raw: the trace is not the RLC cell's pinned simulation, or the file does not fit");
+    fs::write(out, &buf[..n])?;
+    Ok(0)
+}
+
 /// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
 fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
     let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
@@ -1330,6 +1342,7 @@ fn main() -> Result<()> {
         Commands::Hooks { action } => hooks::run(action)?,
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
+        Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
@@ -1340,6 +1353,12 @@ fn main() -> Result<()> {
 }
 
 /// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
+fn zig_source(file: &Path, src: &[u8]) -> Vec<u8> { // a .zig source with the consts it imports from files of its own directory tree written in: zig_convert.t27 `imports` names the files, `inline_imports` writes the values, this only reads (a symlink out of the tree is not followed; #10823)
+    let (dir, mut want, mut ext, mut flat, mut st) = (file.parent().and_then(|d| fs::canonicalize(d).ok()).unwrap_or_default(), vec![0u8; src.len() + 64], Vec::new(), vec![0u8; 4 * src.len() + 64], vec![0usize; zig::ZI_SLOTS]);
+    let w = zig::imports(src, &mut want, &mut st).min(want.len()); for rel in String::from_utf8_lossy(&want[..w]).lines() { if let Some(t) = fs::canonicalize(dir.join(rel)).ok().filter(|f| f.starts_with(&dir)).and_then(|f| fs::read(f).ok()) { ext.extend([&[zig::Z_B_REC][..], rel.as_bytes(), b"\n", &t].concat()); } }
+    let n = zig::inline_imports(src, &ext, &mut flat, &mut st).min(flat.len()); flat.truncate(n); flat
+}
+
 fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>, emit_cell: bool) -> Result<u8> {
     let src = fs::read(file).with_context(|| format!("reading {file}"))?;
     if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
@@ -1349,24 +1368,19 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
         return Ok(spice::exit_code(&st));
     }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
+    let zig = t27o_ledger::front_end(file.as_bytes()) == t27o_ledger::FE_ZIG; if zig && oracle { println!("{}", t27o_ledger::NOTE_ZIG_ORACLE); return Ok(0); } // a .zig file: its own tests are the oracle (ledger.t27, #10823)
+    let src = if zig { zig_source(Path::new(file), &src) } else { src };
     let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], vec![0u8; 1 << 24]);
-    let n = if zig::is_zig_name(file.as_bytes()) { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
-    if !check {
-        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
-        return Ok(0);
+    let mut n = if zig { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+    if !check { std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?; return Ok(0); }
+    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27"))); // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
+    if !zig { // a Rust file: the harness rustc builds is run and its samples follow the spec
+        fs::write(&h, &out[..n.min(out.len())])?; let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status(); fs::remove_file(&h)?; anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
+        let m = t27o::convert(&src, stem.as_bytes(), &mut spec, &mut st); out = [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat(); n = out.len();
     }
-    // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
-    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27")));
-    fs::write(&h, &out[..n.min(out.len())])?;
-    let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status();
-    fs::remove_file(&h)?;
-    anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
-    let m = t27o::convert(&src, stem.as_bytes(), &mut spec, &mut st);
-    fs::create_dir_all("specs/t27o_check")?;
-    fs::write(&path, [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat())?;
-    println!("{}", path.display());
-    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
-    let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
+    fs::create_dir_all("specs/t27o_check")?; fs::write(&path, &out[..n.min(out.len())])?; println!("{}", path.display());
+    if !t27o_ledger::has_evidence(zig, st[zig::Z_NTEST]) { eprintln!("{}", t27o_ledger::NOTE_ZIG_UNJUDGED); return Ok(t27o_ledger::EXIT_UNJUDGED as u8); }
+    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
     if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
@@ -1374,7 +1388,7 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
 /// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, root vs cascade, the ranking); this lists, hashes, converts in-process and keeps the cache.
 fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>, top: usize) -> Result<u8> {
     let t0 = std::time::Instant::now(); let seal = |f: &str| -> Result<String> { let p = std::env::current_dir()?.join(f); Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(&p).with_context(|| format!("{}: cannot read the seal; {}", p.display(), t27o_ledger::SEAL_HINT))?)?["spec_hash"].as_str().with_context(|| format!("{}: no spec_hash", p.display()))?.to_string()) };
-    let (conv, std) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
+    let (conv, std, zs) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?, seal(t27o_ledger::SEAL_ZIG)?); let zk = format!("{conv}+{zs}"); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
     let root: &'static str = if t27o_ledger::repo_is_here(repo) { t27o_ledger::SWEEP_HERE } else { fs::canonicalize(repo).with_context(|| format!("{repo}: cannot open the repository"))?.to_string_lossy().into_owned().leak() }; let cache = cache.map_or_else(|| { let mut b = vec![0u8; 4096]; let n = t27o_ledger::cache_path(root, &mut b); String::from_utf8_lossy(&b[..n]).into_owned() }, str::to_string);
     let old: &'static str = fs::read_to_string(&cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 10).map(|f| (f[0], f)).collect();
     let ls = Command::new("git").args(["-C", root, "ls-files", "--"]).args(paths).output()?; anyhow::ensure!(ls.status.success(), "{root}: git ls-files failed: {}", String::from_utf8_lossy(&ls.stderr).trim()); let listing: &'static str = String::from_utf8(ls.stdout)?.leak();
@@ -1382,13 +1396,14 @@ fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>,
     for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
         let Ok(src) = fs::read(Path::new(root).join(p)) else { continue };
         if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
-        let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
-        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == conv), r.is_some_and(|r| r[3] == std)));
+        let z = t27o_ledger::front_end(p.as_bytes()) == t27o_ledger::FE_ZIG; let ck = if z { &zk } else { &conv }; // a .zig row is keyed by both converters' seals, and by the source with its imported consts written in (#10823)
+        let src = if z { zig_source(&Path::new(root).join(p), &src) } else { src }; let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
+        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == *ck), r.is_some_and(|r| r[3] == std)));
         let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
-            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], std::collections::BTreeMap::<&'static str, usize>::new());
-            let m = t27o::convert(&src, Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()).as_bytes(), &mut out, &mut st);
+            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new()); let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
+            let m = if z { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
             let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); for l in o.lines().filter(|l| t27o_ledger::is_refusal(l)) { *k.entry(&l[t27o_ledger::kind_from(l)..t27o_ledger::kind_to(l)]).or_default() += 1; }
-            format!("{p}\t{sha}\t{conv}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
+            format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
         };
         n[reuse as usize] += 1; tab += &format!("{}\n", f.join("\t"));
         (0..5).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0));
