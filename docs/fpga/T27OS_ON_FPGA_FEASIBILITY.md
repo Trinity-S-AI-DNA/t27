@@ -64,7 +64,7 @@ From `fpga/HARDWARE_SSOT.md` (the bench board is an ALINX AX7203, `xc7a200tfbg48
   That is the stage 2 transport.
 - **LEDs**: B13 C13 D14 D15, active low. The shell uses them as blocked / working / done / heartbeat.
 - **Button**: T6 (active low), LVCMOS15; resets the shell.
-- **HDMI output**: an SiI9134 transmitter fed by a parallel RGB bus, pins second-hand (section 5b); not yet checked against the official manual.
+- **HDMI output**: an SiI9134 transmitter fed by a parallel RGB bus, 29 pins checked against the official AX7203 manual pp. 31-32 (section 5b); I2C balls still second-hand.
 - **DDR3**: 1 GB present; two DDR3 cells exist (`ddr3_head_bandwidth`, `ddr3_ternary_matvec`). Not needed before a
   scrollback ring per pane (stage 3).
 
@@ -97,14 +97,14 @@ encoder and 10:1 serialiser in `.t27` would have no pin to drive on this board. 
 scanout** (what the core already is) plus an **I2C initialiser** for the SiI9134. The adapter then sees an
 ordinary HDMI/DVI signal from the transmitter chip.
 
-Sources (second-hand, **not yet checked against the official PDF**, which this session could not read: the
-browser pane shows no PDF, and downloading it needs the owner's yes):
+Sources: the pin table below is **checked against the official manual** (see the record under the table); the
+first two were the second-hand sources it was found in:
 
 - `LilithSemi/harbor`, `packages/harbor/lib/src/soc/board.dart` (AX7203 pin table, "p.31-32").
 - `adilsondias-engineer/20-fpga-order-book`, `constraints/ax7203_rgmii.xdc` (lines 324-345 and after).
-- The ALINX manual itself: `https://www.alinx.com/public/upload/file/AX7203_User_Manual.pdf`.
+- The ALINX manual itself (see the record under the table).
 
-Both lists agree on every one of these (all LVCMOS33):
+Both lists agree, and so does the manual (Table 3.4.1, pp. 31-32), on every HDMI-output ball below (all LVCMOS33). Only the two I2C rows are not in the manual text:
 
 | signal | ball | signal | ball |
 |---|---|---|---|
@@ -126,6 +126,16 @@ Both lists agree on every one of these (all LVCMOS33):
 | hdmi_d[10] | L16 | | |
 | hdmi_d[11] | K16 | | |
 
+**Record of the check (2026-10-19).** File `AX7203 V1.0 User Manual.pdf`, 2,814,987 bytes, sha256
+`361a512dc683be0f7f7d415362259ea8ed34aedff55f6469e20542fe6f4ddce8`, 43 pages, "Copyright Alinx 2026", body text
+names the AX7203 (the PDF's Subject metadata says AX7101; it is a copy-over, the content is the AX7203). Source:
+ALINX's own Download page (`https://www.en.alinx.com/` > Download), which links the public ALINX Dropbox folder
+`_Standard Products / Artix-7 / AX7203 / AX7203_2023.1`. The PDF is not committed (licence); this table is.
+Section 3.4 "HDMI Output Interface" names the chip as the SIL9134 ("supports up to 1080P@60Hz output and 3D
+output"), says its IIC configuration interface is wired to FPGA I/O and that it is "initialized and controlled
+through FPGA programming", and lists the 29 balls in Table 3.4.1 on pp. 31-32. Every one equals the table above.
+Section 3.5 is the HDMI **input** (SIL9013), a different connector.
+
 The data bits are not named by colour in the manual: the chip's input setup (over I2C) decides which group is
 red, green or blue. The I2C balls come from LiteX, not from the manual ("the manual draws the nets but gives no
 balls"), and the manual gives no I2C address. The initialiser in `harbor` (`sii9134_initializer.dart`) writes
@@ -134,7 +144,8 @@ sequence is **third-party and not run on this bench**.
 
 ### What is still missing before a board top
 
-1. The pin table checked against the official manual (or the owner's yes to download that one PDF).
+1. ~~The pin table checked against the official manual~~ **Done 2026-10-19** for the 29 HDMI-output pins. Still
+   open: the two I2C balls (E16, F16), which the manual draws only in Figure 3.4.1 and does not list.
 2. The SiI9134 input setup for 24-bit RGB with separate syncs, and the I2C address and registers, from the
    manual or the chip's reference. The two-register sequence above is not a verified picture-on sequence.
 3. A way to drive an open-drain I2C pad from `.t27`: no tristate primitive was found in the repository, and
