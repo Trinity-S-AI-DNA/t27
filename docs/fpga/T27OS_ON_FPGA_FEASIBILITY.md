@@ -78,6 +78,31 @@ From `fpga/HARDWARE_SSOT.md` (the bench board is an ALINX AX7203, `xc7a200tfbg48
 | 3 | `windows.t27` (spaces, sidebar) and a grid (`vt`) on the board | rewrite loops as FSMs or run them on the wasm cell; `f64` to fixed point; DDR3 for scrollback | later |
 | 4 | display | an HDMI pin table and a TMDS transmitter, none of which the repository has | **not established** |
 
+## 5b. Stage 4 in progress: a VGA text screen (owner has a VGA monitor, 2026-10-19)
+
+`specs/fpga/vga_text_core.t27` is the part that does not depend on the connector: 640x480@60 timing (800x525
+total, syncs low), an 8x8 glyph ROM and a text scanout, one `on_clock` per pixel. **Measured** on the lab: 7 tests
+pass (96 low hsync ticks a line, 800 ticks a line, 2 low vsync lines, 525 lines, 307200 visible pixels, the first
+glyph row of "T" on the stream, the stream equal to `pixel_at` for 8 lines, blanking black); `t27b verilog`
+lowers it (636 lines); yosys `synth_xilinx` passes (392 cells).
+
+**How VGA reaches the board is not established.** No VGA, HDMI or DVI pin appears in `fpga/HARDWARE_SSOT.md` or in
+any `.xdc` in the repository, and there is no AX7203 schematic. So there is deliberately no board top and no pin
+attribute, and no pin is guessed: a wrong pin map can damage the board or the monitor. The owner must confirm
+one of these routes (and supply its pin table, from the schematic or the adapter's documentation):
+
+1. **An on-board HDMI/DVI connector** (if the AX7203 revision on the bench has one): a TMDS encoder in `.t27`
+   (8b/10b-style encoding plus a 10:1 serializer on `OSERDESE2`) drives it; the monitor needs an HDMI-to-VGA
+   converter or an HDMI/DVI input. Cheaper in parts (no adapter board), dearer in logic and in timing closure
+   (a 250 MHz bit clock).
+2. **A VGA board on a PMOD, FMC or expansion header** (resistor-ladder DAC, 4 to 5 bits a color): the logic is
+   the core above plus a pin table; cheapest in logic and in risk, since the colour outputs are plain LVCMOS
+   and a black-and-white screen needs only one pin for all three colors. Needs the adapter's pinout and the
+   header's pin map.
+
+Plug the monitor in only after the board top for the confirmed route is in a merged spec and its bitstream is
+programmed; before that there is nothing to show.
+
 ## 6. Why there is no bench transcript in this PR
 
 What was done: the spec's 8 tests pass at run time (`t27b test` under qemu-aarch64 on the lab, since the t27b JIT
