@@ -396,6 +396,52 @@ Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 t
   `foreign-budget` hook on master's own Rust lines (t27#10414). Merge the old branch into a
   master-based branch instead. The result still fast-forwards the old branch.
 
+## Application: idea factory, the OS particle design system (t27#10771)
+
+The owner wants one factory that unpacks any idea in any style preset, with every element made
+of particles, and runnable in the OS itself and on FPGA. Two specs do this:
+
+- **`specs/t27f/particle_ds.t27` is the design system.** A preset is a column in integer tables:
+  `BG`, `COL_A/B/C`, `RADIUS`, `GAIN`, `SPRING`, `DAMP`, `LAW`, `FORCE`, `KICK`, `CARD`. The five
+  are noir, neon, trit, paper and rain. **Add a preset by adding a column, never a branch in code.**
+- **`specs/t27f/idea_factory.t27` is the factory**, `(IDEA, PRESET) -> RGB24 frames`. It wraps
+  (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in the 3x5 font,
+  assigns particles to glyph sub-slots and the card border, and closes on `CTA`.
+
+**Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
+multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
+Divide by a variable at most once per scene cut, never per pixel. The seals then carry
+`gen_hash_verilog`. That proves Verilog is emitted, not that it was synthesised. Say so.
+
+**Render the preset sweep on the lab:**
+
+1. For each preset, `sed` the `PRESET` constant. Also rename the module (for example
+   `idea_factory_p`), so the gen output does not overwrite the committed module's.
+2. Run `t27c gen`, then `zig build-exe -O ReleaseFast`.
+3. Run `./f 2>&1 1>fo.txt | ffmpeg -f rawvideo -pix_fmt rgb24 -s 1080x1920 -r 30 -i - ...`
+   (libx264, crf 19). The frames go to stderr. Send stdout to a file, **never to `/dev/null`**:
+   the lab replays `/dev/null` writes.
+4. Concatenate the five, scale to 720 and make a tile sheet. Fetch them as `B64:...:END` and
+   check sha256 on both ends.
+
+Measured: each preset takes 14 to 35 s for 216 frames, with 3072 particles.
+
+**Check legibility by numbers, because the Mac cannot read images.** Crop the settled frame at
+t = 2.2 s with ffmpeg and read `signalstats` YAVG for three regions: the text block, a gap row
+between lines, and the empty bottom. On a dark preset you want block > gap > bottom (rain:
+44.8 > 25.4 > 19.0). On paper the order flips (block 187 < gap 211). A flat triple means the
+particles never settled into letters.
+
+**Traps:**
+
+- **Read the `test-report` tail, not a grep.** A grep for pass and fail counts miscounts the
+  summary lines (`tests N`, `pass N`, `FAIL 0`, `vacuous passes 0 of N`).
+- **Rename loop variables by line range.** A rename that only changes the declaration leaves the
+  body pointing at the old name. Give each top-level loop in `main` its own name (`ia`, `ib`,
+  `ic`).
+- **Base the branch on master's tip before the PR.** If the base PR (R3) merged first, reset the branch onto
+  `origin/master`. Untracked new specs survive the reset.
+
 ## Check the whole corpus for import cycles (t27#10693)
 
 dependency-cruiser's `no-circular` and madge's `--circular` list every module on a cycle.
