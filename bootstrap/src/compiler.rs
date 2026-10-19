@@ -517,6 +517,13 @@ impl Lexer {
                             b't' => s.push('\t'),
                             b'\\' => s.push('\\'),
                             b'"' => s.push('"'),
+                            // #10793: `\xNN` (two hex digits) is one byte, held as the char of that value.
+                            b'x' if (1..3).all(|i| self.peek_offset(i).is_ascii_hexdigit()) => {
+                                let hex = |i| (self.peek_offset(i) as char).to_digit(16).unwrap_or(0);
+                                s.push(char::from((hex(1) * 16 + hex(2)) as u8));
+                                self.advance();
+                                self.advance();
+                            }
                             _ => {
                                 s.push('\\');
                                 s.push(escaped as char);
@@ -3640,44 +3647,6 @@ the parser used to read it as `{}` followed by a negation",
             }
         }
         Ok(())
-    }
-
-    /// Skip tokens to recover to next statement boundary (semicolon or closing brace)
-    #[allow(dead_code)]
-    fn recover_to_stmt_boundary(&mut self) {
-        let mut brace_depth: i32 = 0;
-        loop {
-            // W646: statement-level recovery is the second discard channel.
-            // Everything it walks past is a statement the AST never sees.
-            // W899: record the span too -- see the note in skip_brace_body.
-            if self.current.kind != TokenKind::Eof {
-                self.dropped_top_level_tokens += 1;
-                if self.dropped_spans.len() < 20000 {
-                    self.dropped_spans
-                        .push((self.current.line as u32, self.current.lexeme.clone()));
-                    self.dropped_channels.push("stmt-recovery");
-                }
-            }
-            match self.current.kind {
-                TokenKind::Eof => break,
-                TokenKind::Semicolon if brace_depth == 0 => {
-                    self.advance();
-                    break;
-                }
-                TokenKind::RBrace if brace_depth == 0 => break,
-                TokenKind::LBrace => {
-                    brace_depth += 1;
-                    self.advance();
-                }
-                TokenKind::RBrace => {
-                    brace_depth -= 1;
-                    self.advance();
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
     }
 
     /// Parse a single statement inside a function body
@@ -8590,7 +8559,7 @@ impl Codegen {
 
     /// Re-escape a string the lexer already unescaped, so it can be written
     /// back between quotes.
-    fn zig_escape(raw: &str) -> String {
+    fn zig_escape(raw: &str, octal: bool) -> String {
         let mut out = String::with_capacity(raw.len());
         for c in raw.chars() {
             match c {
@@ -8599,10 +8568,28 @@ impl Codegen {
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
+                // #10793: a lexeme char is a byte (U+0000..U+00FF). Zig, Rust
+                // take `\xNN`; C and Verilog take octal (a C `\x` eats digits).
+                c if (c as u32) < 0x20 || (0x7f..=0xff).contains(&(c as u32)) => {
+                    out.push_str(&match octal {
+                        true => format!("\\{:03o}", c as u32),
+                        false => format!("\\x{:02x}", c as u32),
+                    })
+                }
                 _ => out.push(c),
             }
         }
         out
+    }
+
+    /// A Rust `&str` literal for a lexeme of bytes: a `str` cannot hold a lone
+    /// byte above 0x7F, so non-ASCII must be valid UTF-8 (#10793).
+    fn rust_str_literal(raw: &str) -> String {
+        match String::from_utf8(raw.chars().map(|c| c as u32 as u8).collect()) {
+            Ok(text) if !raw.is_ascii() => format!("\"{}\"", text.escape_default()),
+            Err(_) => "compile_error!(\"string literal is not valid UTF-8\")".to_string(),
+            _ => format!("\"{}\"", Self::zig_escape(raw, false)),
+        }
     }
 
     fn zig_is_primitive(name: &str) -> bool {
@@ -10366,7 +10353,7 @@ impl Codegen {
                     // 154 escape sequences across 19 specs. The W576 lexer
                     // conformance table records the unescaping as a boundary,
                     // which is how this was found.
-                    self.write(&format!("\"{}\"", Self::zig_escape(&node.value)));
+                    self.write(&format!("\"{}\"", Self::zig_escape(&node.value, false)));
                 } else {
                     self.write(&node.value);
                 }
@@ -18173,11 +18160,7 @@ impl VerilogCodegen {
                 // otherwise Yosys emits "unterminated string" / "unknown escape
                 // sequence" warnings.
                 if node.extra_kind == "string" {
-                    let escaped = val
-                        .replace('\\', "\\\\")
-                        .replace('\n', "\\n")
-                        .replace('\t', "\\t")
-                        .replace('"', "\\\"");
+                    let escaped = Codegen::zig_escape(val, true);
                     self.write(&format!("\"{}\"", escaped));
                     return;
                 }
@@ -20275,7 +20258,7 @@ long double: fabsl, default: llabs)(x)",
                 // a bare word is valid C. It lands in the output and fails
                 // wherever it is used, or expands to something else entirely.
                 let text = if child.extra_kind == "string" {
-                    format!("\"{}\"", Codegen::zig_escape(&child.value))
+                    format!("\"{}\"", Codegen::zig_escape(&child.value, true))
                 } else {
                     Self::c_literal(&child.value)
                 };
@@ -22253,7 +22236,7 @@ long double: fabsl, default: llabs)(x)",
                 // The lexer UNESCAPES as it reads, so the value here holds real
                 // newlines and quotes; they have to be written back escaped.
                 if node.extra_kind == "string" {
-                    self.write(&format!("\"{}\"", Codegen::zig_escape(&node.value)));
+                    self.write(&format!("\"{}\"", Codegen::zig_escape(&node.value, true)));
                     return;
                 }
                 // Zig and Rust write `100_000_000`; C does not. The separator
@@ -28798,7 +28781,7 @@ impl RustCodegen {
             // `let s = hello world;` and `const NAME : str = "trinity"` became
             // `pub const NAME: String = trinity;`.
             NodeKind::ExprLiteral if node.extra_kind == "string" => {
-                format!("\"{}\"", Codegen::zig_escape(&node.value))
+                Codegen::rust_str_literal(&node.value)
             }
             NodeKind::ExprLiteral if node.value.starts_with('\'') => format!("b{}", node.value), // #8971: a u8
             NodeKind::ExprLiteral => node.value.clone(),
