@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/push_gate.t27 -- whether a lane push helps the PR or only costs it its place (#10606).
+; --
+; Every push to a PR head starts its checks again, the required ones included, at the back of the
+; Actions queue. On 2026-10-18 that queue held 800 to 900 runs, and the four required checks of a lane
+; PR waited hours for a runner. An Auto-fix event then reported a red claw-sarif on #10585. The red was
+; a token error master had already fixed (#10568), and claw-sarif is not a required check. The lane
+; merged master and pushed. The push fixed nothing that would land, because the squash merge takes
+; master's job anyway. It sent the PR's four pending required checks to the back of the queue.
+; This module is the rule that push should have been checked against.
+; --
+; push_reason(kind, req_red, own_red, master_fixed, queued), first match wins:
+;   kind K_NEW (opening a PR or pushing a held branch: a whole new run set)
+;     queued unread (< 0) or above QUEUE_LIMIT  -> hold  R_NEW_HELD
+;     otherwise                                 -> push  R_NEW_OK
+;   kind K_FIX (a push to an open PR because a check on its head is red)
+;     a required check is red                   -> push  R_REQ_RED     the PR cannot merge without it
+;     the PR's own diff causes the red          -> push  R_OWN_RED     auto-merge would land the break
+;     master already fixed the red job          -> skip  R_MASTER_FIXED
+;     otherwise                                 -> skip  R_MASTER_RED  the break is master's; fix it there
+; A K_FIX push is never held for the queue: a fix that has to land must land, and one that need not
+; land is skipped, not held. Any other kind is unreadable and holds (R_BAD), so an unknown caller
+; never pushes.
+; push_line writes   V TAB <push|hold|skip> TAB <why>\n   for one reason.
+; The honest limit: the three flags are the caller's reading of the PR (which checks are required,
+; which job the diff touches, what master's job says). This module decides from them; it does not
+; read GitHub.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawPushGate;
+
+use claw::text;
+use claw::refresh;
+
+/// What the push is.
+pub const K_NEW : u8 = 0;
+pub const K_FIX : u8 = 1;
+
+/// Verdicts.
+pub const V_PUSH : u8 = 0;
+pub const V_HOLD : u8 = 1;
+pub const V_SKIP : u8 = 2;
+
+/// Reasons, one per verdict line.
+pub const R_NEW_OK : u8 = 0;
+pub const R_NEW_HELD : u8 = 1;
+pub const R_REQ_RED : u8 = 2;
+pub const R_OWN_RED : u8 = 3;
+pub const R_MASTER_FIXED : u8 = 4;
+pub const R_MASTER_RED : u8 = 5;
+pub const R_BAD : u8 = 6;
+pub const R_COUNT : usize = 7;
+
+/// The verdict of each reason, in reason order.
+pub const REASON_VERDICT : [7]u8 = [0, 1, 0, 0, 2, 2, 1];
+
+pub const VERDICT_TEXTS : [3]str = ["V\tpush\t", "V\thold\t", "V\tskip\t"];
+pub const VERDICT_LENS : [3]usize = [7, 7, 7];
+
+pub const WHY_TEXTS : [7]str = [
+    "a new run set fits under the queue limit\n",
+    "a new PR adds a whole run set; hold it until the queue is at or under the limit\n",
+    "a required check is red, and the PR cannot merge until a push fixes it\n",
+    "the PR's own diff breaks the check, and auto-merge would land the break\n",
+    "master already fixed the red job and the PR does not touch it; the squash lands master's job, so a push would only restart the required checks\n",
+    "the red job is master's, not this PR's; fix it on master\n",
+    "unknown push kind; hold\n"
+];
+pub const WHY_LENS : [7]usize = [41, 80, 71, 72, 143, 57, 24];
+
+/// The reason for one push; its verdict is REASON_VERDICT[reason].
+pub fn push_reason(kind : u8, req_red : bool, own_red : bool, master_fixed : bool, queued : i32) -> u8 {
+    if (kind == K_NEW) {
+        if (queued < 0 or queued > QUEUE_LIMIT) { return R_NEW_HELD; }
+        return R_NEW_OK;
+    }
+    if (kind != K_FIX) { return R_BAD; }
+    if (req_red) { return R_REQ_RED; }
+    if (own_red) { return R_OWN_RED; }
+    if (master_fixed) { return R_MASTER_FIXED; }
+    return R_MASTER_RED;
+}
+
+pub fn push_verdict(kind : u8, req_red : bool, own_red : bool, master_fixed : bool, queued : i32) -> u8 {
+    return REASON_VERDICT[push_reason(kind, req_red, own_red, master_fixed, queued)];
+}
+
+/// The verdict line for reason r into out at w, clipped at cap; returns the new cursor, which still
+/// advances when clipped. A reason out of range writes the R_BAD line.
+pub fn push_line(r : u8, out : []u8, cap : usize, w : usize) -> usize {
+    var k : usize = r as usize;
+    if (k >= R_COUNT) { k = R_BAD as usize; }
+    const v : usize = REASON_VERDICT[k] as usize;
+    const x : usize = put_str(out, cap, w, VERDICT_TEXTS[v], VERDICT_LENS[v]);
+    return put_str(out, cap, x, WHY_TEXTS[k], WHY_LENS[k]);
+}
+
+// ---- tests: the cases the lane met on 2026-10-18 ----
+
+test the_10585_push_restarted_required_checks_for_a_job_master_had_fixed {
+    // claw-sarif red, not required, not touched by the PR, fixed on master by #10568; 812 queued.
+    assert push_reason(K_FIX, false, false, true, 812) == R_MASTER_FIXED;
+    assert push_verdict(K_FIX, false, false, true, 812) == V_SKIP;
+}
+
+test a_held_new_pr_waits_while_the_queue_is_above_the_limit {
+    assert push_verdict(K_NEW, false, false, false, 862) == V_HOLD;
+    assert push_reason(K_NEW, false, false, false, 151) == R_NEW_HELD;
+}
+
+test a_new_pr_goes_at_or_under_the_limit {
+    assert push_reason(K_NEW, false, false, false, 150) == R_NEW_OK;
+    assert push_verdict(K_NEW, false, false, false, 0) == V_PUSH;
+}
+
+test an_unread_queue_holds_a_new_pr {
+    assert push_verdict(K_NEW, false, false, false, -1) == V_HOLD;
+}
+
+test the_limit_is_refresh_limit_and_not_a_copy {
+    assert QUEUE_LIMIT == 150;
+    assert push_reason(K_NEW, false, false, false, QUEUE_LIMIT) == R_NEW_OK;
+    assert push_reason(K_NEW, false, false, false, QUEUE_LIMIT + 1) == R_NEW_HELD;
+}
+
+test a_red_required_check_is_fixed_whatever_the_queue {
+    assert push_verdict(K_FIX, true, false, true, 900) == V_PUSH;
+    assert push_reason(K_FIX, true, true, false, -1) == R_REQ_RED;
+}
+
+test the_prs_own_break_is_fixed_before_auto_merge_lands_it {
+    assert push_reason(K_FIX, false, true, true, 900) == R_OWN_RED;
+    assert push_verdict(K_FIX, false, true, false, 900) == V_PUSH;
+}
+
+test a_break_that_is_masters_is_not_fixed_on_a_pr {
+    assert push_reason(K_FIX, false, false, false, 10) == R_MASTER_RED;
+    assert push_verdict(K_FIX, false, false, false, 10) == V_SKIP;
+}
+
+test a_fix_push_is_never_held_for_the_queue {
+    var rq : u32 = 0;
+    while (rq < 2) {
+        var ow : u32 = 0;
+        while (ow < 2) {
+            var mf : u32 = 0;
+            while (mf < 2) {
+                assert push_verdict(K_FIX, rq == 1, ow == 1, mf == 1, 900) != V_HOLD;
+                assert push_verdict(K_FIX, rq == 1, ow == 1, mf == 1, -1) != V_HOLD;
+                mf += 1;
+            }
+            ow += 1;
+        }
+        rq += 1;
+    }
+}
+
+test an_unknown_kind_never_pushes {
+    assert push_reason(7, true, true, true, 0) == R_BAD;
+    assert push_verdict(2, false, false, false, 0) == V_HOLD;
+}
+
+test every_reason_has_one_verdict_line {
+    var out : [256]u8 = undefined;
+    var r : u8 = 0;
+    while (r < 7) {
+        const n : usize = push_line(r, &out, 256, 0);
+        assert n == 7 + WHY_LENS[r as usize];
+        assert out[n - 1] == '\n';
+        r += 1;
+    }
+}
+
+test the_skip_line_says_why_in_full {
+    var out : [256]u8 = undefined;
+    const n : usize = push_line(R_MASTER_FIXED, &out, 256, 0);
+    assert n == 150;
+    assert buf_has(&out, n, "V\tskip\tmaster already fixed the red job", 39) == true;
+    assert buf_has(&out, n, "only restart the required checks\n", 33) == true;
+}
+
+test a_clipped_line_still_advances_the_cursor {
+    var out : [8]u8 = undefined;
+    const n : usize = push_line(R_NEW_OK, &out, 8, 0);
+    assert n == 48;
+    assert out[0] == 'V';
+    assert out[6] == '\t';
+    assert out[7] == 'a';
+}
+
+test an_out_of_range_reason_writes_the_hold_line {
+    var out : [64]u8 = undefined;
+    const n : usize = push_line(42, &out, 64, 0);
+    assert n == 31;
+    assert buf_has(&out, n, "V\thold\tunknown push kind; hold\n", 31) == true;
+}
