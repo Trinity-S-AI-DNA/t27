@@ -1149,6 +1149,36 @@ void test_the_reason_tables_match_their_lengths(void) {
     assert((buf_has(&r, s, "same pull request", 17) == true));
 }
 
+void test_a_path_with_no_closing_quote_at_the_end_of_a_full_buffer_is_refused_without_reading_past_it(void) {
+    uint8_t x[30] = {0};
+    size_t n = put_str(&x, 30, 0, FIX_HEAD, FIX_HEAD_LEN);
+    n = put_str(&x, 30, n, ENTRY_HEAD, ENTRY_HEAD_LEN);
+    n = put_str(&x, 30, n, "aa", 2);
+    assert((n == 30));
+    size_t fr[2] = {0};
+    assert((lu_frame(&x, 30, &fr) == U_SHAPE));
+    uint8_t out[128] = {0};
+    uint32_t st[4] = {0};
+    size_t m = ledger_union(&x, 30, &x, 30, &x, 30, &out, 128, &st);
+    assert((st[0] == U_SHAPE));
+    assert((st[3] == 0));
+    assert((m == 52));
+}
+
+void test_a_lone_tag_byte_at_the_end_of_a_full_record_buffer_is_not_read_past(void) {
+    uint8_t x[25] = {0};
+    size_t n = put_str(&x, 25, 0, "F\t.trinity/seals/a.json\n", 24);
+    n = put_str(&x, 25, n, "S", 1);
+    assert((n == 25));
+    assert((lu_find(&x, 25, 'S', 2, 23) == 25));
+    uint8_t out[128] = {0};
+    uint32_t st[2] = {0};
+    size_t m = pr_scope(&x, 25, &out, 128, &st);
+    assert((st[0] == SC_SEAL));
+    assert((st[1] == 1));
+    assert((m == 100));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1182,7 +1212,9 @@ int main(void) {
     test_an_empty_or_unreadable_file_list_is_refused();
     test_the_scope_rule_reads_each_record_exactly();
     test_the_reason_tables_match_their_lengths();
-    printf("All %d tests passed.\n", 25);
+    test_a_path_with_no_closing_quote_at_the_end_of_a_full_buffer_is_refused_without_reading_past_it();
+    test_a_lone_tag_byte_at_the_end_of_a_full_record_buffer_is_not_read_past();
+    printf("All %d tests passed.\n", 27);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
