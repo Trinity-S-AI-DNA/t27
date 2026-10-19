@@ -19,8 +19,9 @@
    ------------------------------------------------------- */
 
 #define MAX_PRS 512
-#define REFRESH_CAP 30
-#define NFIELDS 11
+#define REFRESH_CAP 5
+#define QUEUE_LIMIT 150
+#define NFIELDS 12
 #define D_NONE 0
 #define D_REFRESH 1
 #define D_CONFLICT 2
@@ -31,7 +32,8 @@
 #define D_UNKNOWN 7
 #define D_CAPPED 8
 #define D_BAD 9
-#define D_COUNT 10
+#define D_LATER 10
+#define D_COUNT 11
 #define M_OK 0
 #define M_CONFLICT 1
 #define M_UNKNOWN 2
@@ -40,10 +42,18 @@
 #define T_BAD 2
 #define HELD_LABEL "no-auto-merge"
 #define HELD_LABEL_LEN 13
+#define NEXT_LABEL "bee-reviewed"
+#define NEXT_LABEL_LEN 12
 #define SUM_HEAD "M\tclaw-refresh: "
 #define SUM_HEAD_LEN 16
-static const const char* SUM_TEXTS[8] = { " to update, ", " in conflict, ", " held or draft, ", " fork without maintainer edits, ", " already up to date, ", " not decidable yet, ", " over the cap, ", " unreadable\n" };
-static const size_t SUM_LENS[8] = { 12, 14, 16, 32, 21, 20, 15, 12 };
+static const const char* SUM_TEXTS[9] = { " to update, ", " in conflict, ", " held or draft, ", " fork without maintainer edits, ", " already up to date, ", " not decidable yet, ", " over the cap, ", " not next to land, ", " unreadable\n" };
+static const size_t SUM_LENS[9] = { 12, 14, 16, 32, 21, 20, 15, 19, 12 };
+#define SKIP_HEAD "M\tclaw-refresh: skipped, "
+#define SKIP_HEAD_LEN 25
+#define SKIP_BUSY " Actions runs are queued, above the limit of 150\n"
+#define SKIP_BUSY_LEN 49
+#define SKIP_UNREAD "the Actions queue size could not be read\n"
+#define SKIP_UNREAD_LEN 41
 #define CONFLICT_HEAD "M\t- #"
 #define CONFLICT_HEAD_LEN 5
 #define CONFLICT_TAIL " conflicts with its base branch and was left alone\n"
@@ -55,7 +65,8 @@ static const size_t SUM_LENS[8] = { 12, 14, 16, 32, 21, 20, 15, 12 };
    Function prototypes
    ------------------------------------------------------- */
 
-uint8_t decide(bool held, bool draft, bool fork_blocked, uint8_t mc, int32_t bh);
+uint8_t decide(bool held, bool draft, bool fork_blocked, uint8_t mc, int32_t bh, bool next);
+bool rf_has_label(uint8_t* raw, size_t s, size_t e, const char* label, size_t ll);
 bool rf_label_held(uint8_t* raw, size_t s, size_t e);
 uint8_t rf_flag(uint8_t* raw, size_t s, size_t e);
 uint8_t rf_merge_class(uint8_t* raw, size_t ms, size_t me, size_t ss, size_t se);
@@ -68,10 +79,10 @@ bool rf_older(uint8_t* raw, size_t ca, uint32_t na, size_t cb, uint32_t nb);
 bool rf_split(uint8_t* raw, size_t ls, size_t le, size_t* f);
 uint8_t rf_classify(uint8_t* raw, size_t* f);
 size_t rf_put_sha(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t s);
-size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap);
+size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap, int32_t queued);
 bool refresh_fits(size_t needed, size_t out_cap);
 size_t t_put2(uint8_t* dst, size_t cap, size_t w, uint32_t v);
-size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool draft, uint32_t labels, bool cross, bool modify, uint32_t mg, uint32_t sc, uint32_t behind);
+size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool draft, uint32_t labels, bool cross, bool modify, uint32_t mg, uint32_t sc, uint32_t behind, uint32_t am);
 uint32_t t_lines(uint8_t* out, size_t n, uint8_t b);
 int32_t digit_val(uint8_t b);
 size_t field_end(uint8_t* text, size_t e, size_t s);
@@ -88,7 +99,7 @@ size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
    Function implementations
    ------------------------------------------------------- */
 
-uint8_t decide(bool held, bool draft, bool fork_blocked, uint8_t mc, int32_t bh) {
+uint8_t decide(bool held, bool draft, bool fork_blocked, uint8_t mc, int32_t bh, bool next) {
     if (held) {
         return D_HELD;
     }
@@ -110,22 +121,29 @@ uint8_t decide(bool held, bool draft, bool fork_blocked, uint8_t mc, int32_t bh)
     if ((bh == 0)) {
         return D_CURRENT;
     }
+    if ((next == false)) {
+        return D_LATER;
+    }
     return D_REFRESH;
 }
 
-bool rf_label_held(uint8_t* raw, size_t s, size_t e) {
+bool rf_has_label(uint8_t* raw, size_t s, size_t e, const char* label, size_t ll) {
     size_t p = s;
     while ((p <= e)) {
         size_t q = p;
         while (((q < e) && (raw[q] != ','))) {
             q += 1;
         }
-        if (field_eq(raw, p, q, HELD_LABEL, HELD_LABEL_LEN)) {
+        if (field_eq(raw, p, q, label, ll)) {
             return true;
         }
         p = (q + 1);
     }
     return false;
+}
+
+bool rf_label_held(uint8_t* raw, size_t s, size_t e) {
+    return rf_has_label(raw, s, e, HELD_LABEL, HELD_LABEL_LEN);
 }
 
 uint8_t rf_flag(uint8_t* raw, size_t s, size_t e) {
@@ -268,7 +286,8 @@ uint8_t rf_classify(uint8_t* raw, size_t* f) {
     uint8_t draft = rf_flag(raw, f[6], f[7]);
     uint8_t cross = rf_flag(raw, f[10], f[11]);
     uint8_t modify = rf_flag(raw, f[14], f[15]);
-    if ((((draft == T_BAD) || (cross == T_BAD)) || (modify == T_BAD))) {
+    uint8_t armed = rf_flag(raw, f[22], f[23]);
+    if (((((draft == T_BAD) || (cross == T_BAD)) || (modify == T_BAD)) || (armed == T_BAD))) {
         return D_BAD;
     }
     bool held = rf_label_held(raw, f[8], f[9]);
@@ -276,7 +295,8 @@ uint8_t rf_classify(uint8_t* raw, size_t* f) {
     bool fork_blocked = (((cross == T_TRUE) || gone) && (modify != T_TRUE));
     uint8_t mc = rf_merge_class(raw, f[16], f[17], f[18], f[19]);
     int32_t bh = rf_behind(raw, f[20], f[21], f[18], f[19]);
-    return decide(held, (draft == T_TRUE), fork_blocked, mc, bh);
+    bool next = ((armed == T_TRUE) || rf_has_label(raw, f[8], f[9], NEXT_LABEL, NEXT_LABEL_LEN));
+    return decide(held, (draft == T_TRUE), fork_blocked, mc, bh, next);
 }
 
 size_t rf_put_sha(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t s) {
@@ -289,14 +309,25 @@ size_t rf_put_sha(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t s) {
     return x;
 }
 
-size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap) {
+size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap, int32_t queued) {
+    if ((queued < 0)) {
+        size_t u = put_str(out, cap, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+        u = put_str(out, cap, u, SKIP_UNREAD, SKIP_UNREAD_LEN);
+        return u;
+    }
+    if ((queued > QUEUE_LIMIT)) {
+        size_t y = put_str(out, cap, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+        y = put_count(out, cap, y, ((uint32_t)(queued)));
+        y = put_str(out, cap, y, SKIP_BUSY, SKIP_BUSY_LEN);
+        return y;
+    }
     uint8_t dec[512] = {0};
     uint32_t num[512] = {0};
     size_t cs[512] = {0};
     size_t ss[512] = {0};
     uint32_t rk[512] = {0};
-    size_t f[22] = {0};
-    uint32_t st[10] = {0};
+    size_t f[24] = {0};
+    uint32_t st[11] = {0};
     size_t cnt = 0;
     uint32_t extra = 0;
     size_t ls = 0;
@@ -402,8 +433,10 @@ size_t refresh_plan(uint8_t* raw, size_t n, uint8_t* out, size_t cap) {
     w = put_str(out, cap, w, SUM_TEXTS[5], SUM_LENS[5]);
     w = put_count(out, cap, w, st[((size_t)(D_CAPPED))]);
     w = put_str(out, cap, w, SUM_TEXTS[6], SUM_LENS[6]);
-    w = put_count(out, cap, w, st[((size_t)(D_BAD))]);
+    w = put_count(out, cap, w, st[((size_t)(D_LATER))]);
     w = put_str(out, cap, w, SUM_TEXTS[7], SUM_LENS[7]);
+    w = put_count(out, cap, w, st[((size_t)(D_BAD))]);
+    w = put_str(out, cap, w, SUM_TEXTS[8], SUM_LENS[8]);
     if ((st[((size_t)(D_CONFLICT))] > 0)) {
         w = put_str(out, cap, w, BLANK_LINE, BLANK_LINE_LEN);
         i = 0;
@@ -429,7 +462,7 @@ size_t t_put2(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
     return x;
 }
 
-size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool draft, uint32_t labels, bool cross, bool modify, uint32_t mg, uint32_t sc, uint32_t behind) {
+size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool draft, uint32_t labels, bool cross, bool modify, uint32_t mg, uint32_t sc, uint32_t behind, uint32_t am) {
     size_t x = put_count(dst, cap, w, num);
     x = put_byte(dst, cap, x, '\t');
     x = put_byte(dst, cap, x, digit_byte((num % 10)));
@@ -465,6 +498,12 @@ size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool
     }
     if ((labels == 5)) {
         x = put_str(dst, cap, x, "bug,x", 5);
+    }
+    if ((labels == 6)) {
+        x = put_str(dst, cap, x, "bug,bee-reviewed", 16);
+    }
+    if ((labels == 7)) {
+        x = put_str(dst, cap, x, "bee-reviewed-2", 14);
     }
     x = put_byte(dst, cap, x, '\t');
     if (cross) {
@@ -504,6 +543,16 @@ size_t t_rec(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t ts, bool
         x = put_byte(dst, cap, x, '-');
     } else {
         x = put_count(dst, cap, x, behind);
+    }
+    x = put_byte(dst, cap, x, '\t');
+    if ((am == 0)) {
+        x = put_str(dst, cap, x, "false", 5);
+    }
+    if ((am == 1)) {
+        x = put_str(dst, cap, x, "true", 4);
+    }
+    if ((am == 2)) {
+        x = put_str(dst, cap, x, "maybe", 5);
     }
     return put_byte(dst, cap, x, '\n');
 }
@@ -718,42 +767,58 @@ size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) 
    ------------------------------------------------------- */
 
 void test_a_behind_conflict_free_pull_request_is_refreshed(void) {
-    assert((decide(false, false, false, M_OK, 3) == D_REFRESH));
-    assert((decide(false, false, false, M_OK, 1) == D_REFRESH));
+    assert((decide(false, false, false, M_OK, 3, true) == D_REFRESH));
+    assert((decide(false, false, false, M_OK, 1, true) == D_REFRESH));
 }
 
 void test_a_pull_request_that_is_not_behind_is_left_alone(void) {
-    assert((decide(false, false, false, M_OK, 0) == D_CURRENT));
+    assert((decide(false, false, false, M_OK, 0, true) == D_CURRENT));
 }
 
 void test_a_conflicting_pull_request_is_never_refreshed(void) {
-    assert((decide(false, false, false, M_CONFLICT, 5) == D_CONFLICT));
-    assert((decide(false, false, false, M_CONFLICT, 0) == D_CONFLICT));
+    assert((decide(false, false, false, M_CONFLICT, 5, true) == D_CONFLICT));
+    assert((decide(false, false, false, M_CONFLICT, 0, true) == D_CONFLICT));
 }
 
 void test_a_held_pull_request_is_never_touched_whatever_else_is_true(void) {
-    assert((decide(true, false, false, M_OK, 5) == D_HELD));
-    assert((decide(true, false, false, M_CONFLICT, 5) == D_HELD));
-    assert((decide(true, true, true, M_UNKNOWN, 0) == D_HELD));
+    assert((decide(true, false, false, M_OK, 5, true) == D_HELD));
+    assert((decide(true, false, false, M_CONFLICT, 5, true) == D_HELD));
+    assert((decide(true, true, true, M_UNKNOWN, 0, true) == D_HELD));
 }
 
 void test_a_draft_is_never_touched(void) {
-    assert((decide(false, true, false, M_OK, 5) == D_DRAFT));
-    assert((decide(false, true, false, M_CONFLICT, 5) == D_DRAFT));
+    assert((decide(false, true, false, M_OK, 5, true) == D_DRAFT));
+    assert((decide(false, true, false, M_CONFLICT, 5, true) == D_DRAFT));
 }
 
 void test_a_fork_without_maintainer_edits_is_skipped_not_failed(void) {
-    assert((decide(false, false, true, M_OK, 5) == D_FORK));
-    assert((decide(false, false, true, M_CONFLICT, 5) == D_FORK));
+    assert((decide(false, false, true, M_OK, 5, true) == D_FORK));
+    assert((decide(false, false, true, M_CONFLICT, 5, true) == D_FORK));
 }
 
 void test_a_fork_with_maintainer_edits_is_refreshed_like_any_other(void) {
-    assert((decide(false, false, false, M_OK, 5) == D_REFRESH));
+    assert((decide(false, false, false, M_OK, 5, true) == D_REFRESH));
 }
 
 void test_unread_facts_never_become_a_refresh(void) {
-    assert((decide(false, false, false, M_UNKNOWN, 5) == D_UNKNOWN));
-    assert((decide(false, false, false, M_OK, -1) == D_UNKNOWN));
+    assert((decide(false, false, false, M_UNKNOWN, 5, true) == D_UNKNOWN));
+    assert((decide(false, false, false, M_OK, -1, true) == D_UNKNOWN));
+}
+
+void test_a_pull_request_the_merger_will_not_land_next_waits(void) {
+    assert((decide(false, false, false, M_OK, 3, false) == D_LATER));
+    assert((decide(false, false, false, M_OK, 1, false) == D_LATER));
+    assert((decide(false, false, false, M_OK, 1, true) == D_REFRESH));
+}
+
+void test_every_other_reason_outranks_waiting_for_the_merger(void) {
+    assert((decide(true, false, false, M_OK, 5, false) == D_HELD));
+    assert((decide(false, true, false, M_OK, 5, false) == D_DRAFT));
+    assert((decide(false, false, true, M_OK, 5, false) == D_FORK));
+    assert((decide(false, false, false, M_CONFLICT, 5, false) == D_CONFLICT));
+    assert((decide(false, false, false, M_UNKNOWN, 5, false) == D_UNKNOWN));
+    assert((decide(false, false, false, M_OK, -1, false) == D_UNKNOWN));
+    assert((decide(false, false, false, M_OK, 0, false) == D_CURRENT));
 }
 
 void test_the_held_label_matches_only_as_a_whole_entry(void) {
@@ -772,6 +837,24 @@ void test_the_held_label_matches_only_as_a_whole_entry(void) {
     assert((rf_label_held(&b, 0, n) == false));
     n = put_str(&b, 64, 0, "bug,x", 5);
     assert((rf_label_held(&b, 0, n) == false));
+    assert((rf_label_held(&b, 0, 0) == false));
+}
+
+void test_the_merger_label_matches_only_as_a_whole_entry(void) {
+    uint8_t b[64] = {0};
+    size_t n = put_str(&b, 64, 0, "bee-reviewed", 12);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == true));
+    n = put_str(&b, 64, 0, "bug,bee-reviewed,x", 18);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == true));
+    n = put_str(&b, 64, 0, "bee-reviewed-2", 14);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false));
+    n = put_str(&b, 64, 0, "x-bee-reviewed", 14);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false));
+    n = put_str(&b, 64, 0, "bee-reviewe", 11);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false));
+    n = put_str(&b, 64, 0, "bug,x", 5);
+    assert((rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false));
+    assert((rf_has_label(&b, 0, 0, NEXT_LABEL, NEXT_LABEL_LEN) == false));
     assert((rf_label_held(&b, 0, 0) == false));
 }
 
@@ -873,23 +956,23 @@ void test_older_goes_by_time_then_by_number(void) {
 
 void test_a_behind_clean_pull_request_gets_an_R_line_with_its_sha(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3);
+    size_t n = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((refresh_fits(d, 4096) == true));
     assert((out[0] == 'R'));
     assert((out[1] == '\t'));
     assert((buf_has(&out, d, "R\t4217\t7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 48) == true));
     assert((t_lines(&out, d, 'R') == 1));
-    assert((buf_has(&out, d, "M\tclaw-refresh: 1 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 unreadable\n", 166) == true));
+    assert((buf_has(&out, d, "M\tclaw-refresh: 1 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 not next to land, 0 unreadable\n", 186) == true));
 }
 
 void test_a_conflicting_pull_request_is_listed_once_and_not_refreshed(void) {
     uint8_t r[512] = {0};
-    size_t n = t_rec(&r, 512, 0, 300, 100, false, 0, false, false, 1, 1, 7);
-    n = t_rec(&r, 512, n, 301, 200, false, 0, false, false, 0, 0, 2);
+    size_t n = t_rec(&r, 512, 0, 300, 100, false, 0, false, false, 1, 1, 7, 1);
+    n = t_rec(&r, 512, n, 301, 200, false, 0, false, false, 0, 0, 2, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 1));
     assert((buf_has(&out, d, "R\t301\t", 6) == true));
     assert((buf_has(&out, d, "R\t300\t", 6) == false));
@@ -900,23 +983,23 @@ void test_a_conflicting_pull_request_is_listed_once_and_not_refreshed(void) {
 
 void test_a_dirty_state_word_alone_is_a_conflict(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 310, 100, false, 0, false, false, 0, 1, 4);
+    size_t n = t_rec(&r, 256, 0, 310, 100, false, 0, false, false, 0, 1, 4, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, "M\t- #310 ", 9) == true));
 }
 
 void test_a_draft_and_a_held_pull_request_are_not_touched(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 400, 100, true, 0, false, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 401, 110, false, 1, false, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 402, 120, false, 2, false, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 403, 130, false, 3, false, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 404, 140, false, 4, false, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 405, 150, false, 5, false, false, 0, 0, 9);
+    size_t n = t_rec(&r, 1024, 0, 400, 100, true, 0, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 401, 110, false, 1, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 402, 120, false, 2, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 403, 130, false, 3, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 404, 140, false, 4, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 405, 150, false, 5, false, false, 0, 0, 9, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((buf_has(&out, d, "R\t400\t", 6) == false));
     assert((buf_has(&out, d, "R\t401\t", 6) == false));
     assert((buf_has(&out, d, "R\t402\t", 6) == false));
@@ -929,10 +1012,10 @@ void test_a_draft_and_a_held_pull_request_are_not_touched(void) {
 
 void test_a_fork_without_maintainer_edits_is_skipped_and_one_with_edits_is_refreshed(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 500, 100, false, 0, true, false, 0, 0, 9);
-    n = t_rec(&r, 1024, n, 501, 110, false, 0, true, true, 0, 0, 9);
+    size_t n = t_rec(&r, 1024, 0, 500, 100, false, 0, true, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 501, 110, false, 0, true, true, 0, 0, 9, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((buf_has(&out, d, "R\t500\t", 6) == false));
     assert((buf_has(&out, d, "R\t501\t", 6) == true));
     assert((t_lines(&out, d, 'R') == 1));
@@ -947,20 +1030,20 @@ void test_a_deleted_head_repository_counts_as_a_fork_that_cannot_be_edited(void)
         n = put_byte(&r, 256, n, 'b');
         k += 1;
     }
-    n = put_str(&r, 256, n, "\t2026-10-18T00:01:00Z\tfalse\t\tfalse\t\tfalse\tMERGEABLE\tBLOCKED\t5\n", 62);
+    n = put_str(&r, 256, n, "\t2026-10-18T00:01:00Z\tfalse\t\tfalse\t\tfalse\tMERGEABLE\tBLOCKED\t5\ttrue\n", 67);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 fork without maintainer edits, ", 34) == true));
 }
 
 void test_a_pull_request_that_is_current_or_not_computed_is_counted_and_left_alone(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 600, 100, false, 0, false, false, 0, 0, 0);
-    n = t_rec(&r, 1024, n, 601, 110, false, 0, false, false, 2, 3, 5);
-    n = t_rec(&r, 1024, n, 602, 120, false, 0, false, false, 0, 0, 9999);
+    size_t n = t_rec(&r, 1024, 0, 600, 100, false, 0, false, false, 0, 0, 0, 1);
+    n = t_rec(&r, 1024, n, 601, 110, false, 0, false, false, 2, 3, 5, 1);
+    n = t_rec(&r, 1024, n, 602, 120, false, 0, false, false, 0, 0, 9999, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 already up to date, ", 23) == true));
     assert((buf_has(&out, d, " 2 not decidable yet, ", 22) == true));
@@ -968,19 +1051,19 @@ void test_a_pull_request_that_is_current_or_not_computed_is_counted_and_left_alo
 
 void test_a_record_that_cannot_be_read_is_counted_and_never_refreshed(void) {
     uint8_t r[2048] = {0};
-    size_t n = put_str(&r, 2048, 0, "700\tnotasha\t2026-10-18T00:01:00Z\tfalse\t\tfalse\tx/y\tfalse\tMERGEABLE\tBLOCKED\t5\n", 76);
+    size_t n = put_str(&r, 2048, 0, "700\tnotasha\t2026-10-18T00:01:00Z\tfalse\t\tfalse\tx/y\tfalse\tMERGEABLE\tBLOCKED\t5\ttrue\n", 81);
     n = put_str(&r, 2048, n, "701\tshort record\n", 17);
     n = put_str(&r, 2048, n, "abc\tdef\n", 8);
     n = put_str(&r, 2048, n, "0\t", 2);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 4 unreadable\n", 14) == true));
 }
 
 void test_a_flag_that_is_not_true_or_false_makes_the_record_unreadable(void) {
     uint8_t r[512] = {0};
-    size_t n = t_rec(&r, 512, 0, 710, 100, false, 0, false, false, 0, 0, 5);
+    size_t n = t_rec(&r, 512, 0, 710, 100, false, 0, false, false, 0, 0, 5, 1);
     size_t k = 0;
     while ((k < n)) {
         if ((((((r[k] == 'f') && (r[(k + 1)] == 'a')) && (r[(k + 2)] == 'l')) && (r[(k + 3)] == 's')) && (r[(k + 4)] == 'e'))) {
@@ -990,28 +1073,28 @@ void test_a_flag_that_is_not_true_or_false_makes_the_record_unreadable(void) {
         k += 1;
     }
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
 
 void test_a_number_seen_twice_is_refused_the_second_time(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 800, 100, false, 0, false, false, 0, 0, 5);
-    n = t_rec(&r, 1024, n, 800, 200, false, 0, false, false, 0, 0, 5);
+    size_t n = t_rec(&r, 1024, 0, 800, 100, false, 0, false, false, 0, 0, 5, 1);
+    n = t_rec(&r, 1024, n, 800, 200, false, 0, false, false, 0, 0, 5, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 1));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
 
 void test_the_oldest_pull_request_comes_first_whatever_the_input_order(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 903, 3000, false, 0, false, false, 0, 0, 1);
-    n = t_rec(&r, 1024, n, 901, 1000, false, 0, false, false, 0, 0, 1);
-    n = t_rec(&r, 1024, n, 902, 2000, false, 0, false, false, 0, 0, 1);
+    size_t n = t_rec(&r, 1024, 0, 903, 3000, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 901, 1000, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 902, 2000, false, 0, false, false, 0, 0, 1, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 3));
     assert((out[0] == 'R'));
     assert((buf_has(&out, d, "R\t901\t", 6) == true));
@@ -1028,45 +1111,45 @@ void test_the_oldest_pull_request_comes_first_whatever_the_input_order(void) {
 
 void test_equal_timestamps_are_ordered_by_number(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 952, 500, false, 0, false, false, 0, 0, 1);
-    n = t_rec(&r, 1024, n, 951, 500, false, 0, false, false, 0, 0, 1);
+    size_t n = t_rec(&r, 1024, 0, 952, 500, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 951, 500, false, 0, false, false, 0, 0, 1, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((out[4] == '1'));
     assert((out[5] == '\t'));
 }
 
-void test_at_most_thirty_are_refreshed_and_they_are_the_oldest(void) {
+void test_at_most_five_are_refreshed_and_they_are_the_oldest(void) {
     uint8_t r[8192] = {0};
     size_t n = 0;
-    uint32_t i = 35;
+    uint32_t i = 8;
     while ((i > 0)) {
-        n = t_rec(&r, 8192, n, (100 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+        n = t_rec(&r, 8192, n, (100 + i), (i * 60), false, 0, false, false, 0, 0, 2, 1);
         i -= 1;
     }
     uint8_t out[16384] = {0};
-    size_t d = refresh_plan(&r, n, &out, 16384);
+    size_t d = refresh_plan(&r, n, &out, 16384, 0);
     assert((refresh_fits(d, 16384) == true));
-    assert((t_lines(&out, d, 'R') == 30));
+    assert((t_lines(&out, d, 'R') == 5));
     assert((buf_has(&out, d, "R\t101\t", 6) == true));
-    assert((buf_has(&out, d, "R\t130\t", 6) == true));
-    assert((buf_has(&out, d, "R\t131\t", 6) == false));
-    assert((buf_has(&out, d, "R\t135\t", 6) == false));
-    assert((buf_has(&out, d, " 30 to update, ", 15) == true));
-    assert((buf_has(&out, d, " 5 over the cap, ", 17) == true));
+    assert((buf_has(&out, d, "R\t105\t", 6) == true));
+    assert((buf_has(&out, d, "R\t106\t", 6) == false));
+    assert((buf_has(&out, d, "R\t108\t", 6) == false));
+    assert((buf_has(&out, d, " 5 to update, ", 14) == true));
+    assert((buf_has(&out, d, " 3 over the cap, ", 17) == true));
 }
 
-void test_thirty_exactly_is_not_capped(void) {
+void test_five_exactly_is_not_capped(void) {
     uint8_t r[8192] = {0};
     size_t n = 0;
     uint32_t i = 1;
-    while ((i <= 30)) {
-        n = t_rec(&r, 8192, n, (200 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+    while ((i <= 5)) {
+        n = t_rec(&r, 8192, n, (200 + i), (i * 60), false, 0, false, false, 0, 0, 2, 1);
         i += 1;
     }
     uint8_t out[16384] = {0};
-    size_t d = refresh_plan(&r, n, &out, 16384);
-    assert((t_lines(&out, d, 'R') == 30));
+    size_t d = refresh_plan(&r, n, &out, 16384, 0);
+    assert((t_lines(&out, d, 'R') == 5));
     assert((buf_has(&out, d, " 0 over the cap, ", 17) == true));
 }
 
@@ -1075,51 +1158,156 @@ void test_held_and_conflicting_ones_do_not_use_up_the_cap(void) {
     size_t n = 0;
     uint32_t i = 1;
     while ((i <= 10)) {
-        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 1, false, false, 0, 0, 2);
+        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 1, false, false, 0, 0, 2, 1);
         i += 1;
     }
     i = 11;
     while ((i <= 20)) {
-        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 0, false, false, 1, 1, 2);
+        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 0, false, false, 1, 1, 2, 1);
         i += 1;
     }
     i = 21;
     while ((i <= 50)) {
-        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 0, false, false, 0, 0, 2);
+        n = t_rec(&r, 16384, n, (300 + i), (i * 60), false, 0, false, false, 0, 0, 2, 1);
         i += 1;
     }
     uint8_t out[16384] = {0};
-    size_t d = refresh_plan(&r, n, &out, 16384);
-    assert((t_lines(&out, d, 'R') == 30));
+    size_t d = refresh_plan(&r, n, &out, 16384, 0);
+    assert((t_lines(&out, d, 'R') == 5));
     assert((buf_has(&out, d, "R\t321\t", 6) == true));
-    assert((buf_has(&out, d, "R\t350\t", 6) == true));
+    assert((buf_has(&out, d, "R\t325\t", 6) == true));
+    assert((buf_has(&out, d, "R\t326\t", 6) == false));
     assert((t_lines(&out, d, 'M') == 12));
+}
+
+void test_the_merger_signal_is_auto_merge_armed_or_the_bee_label(void) {
+    uint8_t r[2048] = {0};
+    size_t n = t_rec(&r, 2048, 0, 401, 100, false, 0, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 402, 200, false, 0, false, false, 0, 0, 2, 1);
+    n = t_rec(&r, 2048, n, 403, 300, false, 6, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 404, 400, false, 7, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 405, 500, false, 5, false, false, 0, 0, 2, 0);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
+    assert((t_lines(&out, d, 'R') == 2));
+    assert((buf_has(&out, d, "R\t402\t", 6) == true));
+    assert((buf_has(&out, d, "R\t403\t", 6) == true));
+    assert((buf_has(&out, d, "R\t401\t", 6) == false));
+    assert((buf_has(&out, d, "R\t404\t", 6) == false));
+    assert((buf_has(&out, d, "R\t405\t", 6) == false));
+    assert((buf_has(&out, d, " 2 to update, ", 14) == true));
+    assert((buf_has(&out, d, " 3 not next to land, ", 21) == true));
+}
+
+void test_pull_requests_that_wait_do_not_use_up_the_cap(void) {
+    uint8_t r[8192] = {0};
+    size_t n = 0;
+    uint32_t i = 1;
+    while ((i <= 10)) {
+        n = t_rec(&r, 8192, n, (500 + i), (i * 60), false, 0, false, false, 0, 0, 2, 0);
+        i += 1;
+    }
+    i = 11;
+    while ((i <= 16)) {
+        n = t_rec(&r, 8192, n, (500 + i), (i * 60), false, 0, false, false, 0, 0, 2, 1);
+        i += 1;
+    }
+    uint8_t out[16384] = {0};
+    size_t d = refresh_plan(&r, n, &out, 16384, 0);
+    assert((t_lines(&out, d, 'R') == 5));
+    assert((buf_has(&out, d, "R\t511\t", 6) == true));
+    assert((buf_has(&out, d, "R\t515\t", 6) == true));
+    assert((buf_has(&out, d, "R\t516\t", 6) == false));
+    assert((buf_has(&out, d, " 10 not next to land, ", 22) == true));
+    assert((buf_has(&out, d, " 1 over the cap, ", 17) == true));
+}
+
+void test_the_auto_merge_flag_must_be_true_or_false(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 410, 100, false, 0, false, false, 0, 0, 2, 2);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+    assert((buf_has(&out, d, " 0 not next to land, ", 21) == true));
+}
+
+void test_a_queue_above_the_limit_stops_every_refresh(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 420, 100, false, 0, false, false, 0, 0, 2, 1);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 151);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((t_lines(&out, d, 'M') == 1));
+    assert((d == ((25 + 3) + 49)));
+    assert((buf_has(&out, d, "M\tclaw-refresh: skipped, 151 Actions runs are queued, above the limit of 150\n", 77) == true));
+    d = refresh_plan(&r, n, &out, 4096, 396);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((buf_has(&out, d, "skipped, 396 Actions runs are queued", 36) == true));
+}
+
+void test_a_queue_at_the_limit_still_refreshes(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 421, 100, false, 0, false, false, 0, 0, 2, 1);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 150);
+    assert((t_lines(&out, d, 'R') == 1));
+    assert((buf_has(&out, d, "skipped", 7) == false));
+    d = refresh_plan(&r, n, &out, 4096, 0);
+    assert((t_lines(&out, d, 'R') == 1));
+}
+
+void test_an_unread_queue_size_stops_every_refresh(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 422, 100, false, 0, false, false, 0, 0, 2, 1);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, -1);
+    assert((t_lines(&out, d, 'R') == 0));
+    assert((t_lines(&out, d, 'M') == 1));
+    assert((d == (25 + 41)));
+    assert((buf_has(&out, d, "M\tclaw-refresh: skipped, the Actions queue size could not be read\n", 66) == true));
+}
+
+void test_the_skip_texts_are_pinned_by_their_lengths(void) {
+    uint8_t b[96] = {0};
+    size_t w = put_str(&b, 96, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+    assert((b[(w - 1)] == ' '));
+    assert((b[(w - 2)] == ','));
+    w = put_str(&b, 96, 0, SKIP_BUSY, SKIP_BUSY_LEN);
+    assert((b[0] == ' '));
+    assert((b[(w - 1)] == '\n'));
+    assert((b[(w - 2)] == '0'));
+    w = put_str(&b, 96, 0, SKIP_UNREAD, SKIP_UNREAD_LEN);
+    assert((b[(w - 1)] == '\n'));
+    assert((b[(w - 2)] == 'd'));
+    assert((QUEUE_LIMIT == 150));
+    assert((REFRESH_CAP == 5));
 }
 
 void test_an_empty_list_is_a_valid_empty_answer(void) {
     uint8_t r[4] = {0};
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, 0, &out, 4096);
+    size_t d = refresh_plan(&r, 0, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
-    assert((buf_has(&out, d, "M\tclaw-refresh: 0 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 unreadable\n", 166) == true));
+    assert((buf_has(&out, d, "M\tclaw-refresh: 0 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 not next to land, 0 unreadable\n", 186) == true));
     assert((t_lines(&out, d, 'M') == 1));
 }
 
 void test_a_carriage_return_does_not_hide_a_record(void) {
     uint8_t r[512] = {0};
-    size_t n = t_rec(&r, 512, 0, 970, 100, false, 0, false, false, 0, 0, 2);
+    size_t n = t_rec(&r, 512, 0, 970, 100, false, 0, false, false, 0, 0, 2, 1);
     r[(n - 1)] = 13;
     n = put_byte(&r, 512, n, '\n');
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 1));
 }
 
 void test_a_buffer_too_small_is_reported_not_trusted(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 980, 100, false, 0, false, false, 0, 0, 2);
+    size_t n = t_rec(&r, 256, 0, 980, 100, false, 0, false, false, 0, 0, 2, 1);
     uint8_t out[32] = {0};
-    size_t d = refresh_plan(&r, n, &out, 32);
+    size_t d = refresh_plan(&r, n, &out, 32, 0);
     assert((refresh_fits(d, 32) == false));
     assert((refresh_fits(d, d) == true));
 }
@@ -1127,13 +1315,13 @@ void test_a_buffer_too_small_is_reported_not_trusted(void) {
 void test_the_summary_texts_are_pinned_by_their_lengths(void) {
     uint8_t b[64] = {0};
     size_t k = 0;
-    while ((k < 8)) {
+    while ((k < 9)) {
         size_t w = put_str(&b, 64, 0, SUM_TEXTS[k], SUM_LENS[k]);
         assert((w == SUM_LENS[k]));
         assert((b[0] == ' '));
         k += 1;
     }
-    size_t w = put_str(&b, 64, 0, SUM_TEXTS[7], SUM_LENS[7]);
+    size_t w = put_str(&b, 64, 0, SUM_TEXTS[8], SUM_LENS[8]);
     assert((b[(w - 1)] == '\n'));
     assert((b[(w - 2)] == 'e'));
     w = put_str(&b, 64, 0, CONFLICT_TAIL, CONFLICT_TAIL_LEN);
@@ -1149,10 +1337,10 @@ void test_the_summary_texts_are_pinned_by_their_lengths(void) {
     assert((b[(w - 2)] == '\t'));
 }
 
-void test_one_record_splits_into_eleven_fields_and_classifies_as_refresh(void) {
+void test_one_record_splits_into_twelve_fields_and_classifies_as_refresh(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3);
-    size_t f[22] = {0};
+    size_t n = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    size_t f[24] = {0};
     size_t le = line_end(&r, n, 0);
     assert((le == (n - 1)));
     assert((rf_split(&r, 0, le, &f) == true));
@@ -1165,6 +1353,8 @@ void test_one_record_splits_into_eleven_fields_and_classifies_as_refresh(void) {
     assert((rf_flag(&r, f[14], f[15]) == T_FALSE));
     assert((rf_merge_class(&r, f[16], f[17], f[18], f[19]) == M_OK));
     assert((rf_behind(&r, f[20], f[21], f[18], f[19]) == 1));
+    assert((rf_flag(&r, f[22], f[23]) == T_TRUE));
+    assert((f[23] == (n - 1)));
     assert((rf_classify(&r, &f) == D_REFRESH));
 }
 
@@ -1192,36 +1382,36 @@ void test_older_ignores_the_byte_after_the_stamp(void) {
 
 void test_one_unreadable_field_alone_makes_the_record_unreadable(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 720, 100, false, 0, false, false, 0, 0, 5);
+    size_t n = t_rec(&r, 256, 0, 720, 100, false, 0, false, false, 0, 0, 5, 1);
     assert((r[45] == '2'));
     assert((r[73] == 'f'));
     assert((r[92] == 'f'));
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 1));
     r[45] = 'x';
-    d = refresh_plan(&r, n, &out, 4096);
+    d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
     r[45] = '2';
     r[73] = 'F';
-    d = refresh_plan(&r, n, &out, 4096);
+    d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
     r[73] = 'f';
     r[92] = 'F';
-    d = refresh_plan(&r, n, &out, 4096);
+    d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
 
 void test_a_record_one_field_short_is_unreadable_not_merely_undecidable(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 730, 100, false, 0, false, false, 0, 0, 5);
-    r[(n - 3)] = '\n';
-    n -= 2;
+    size_t n = t_rec(&r, 256, 0, 730, 100, false, 0, false, false, 0, 0, 5, 1);
+    r[(n - 6)] = '\n';
+    n -= 5;
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
     assert((buf_has(&out, d, " 0 not decidable yet, ", 22) == true));
@@ -1230,19 +1420,19 @@ void test_a_record_one_field_short_is_unreadable_not_merely_undecidable(void) {
 void test_a_blank_line_is_not_a_record(void) {
     uint8_t r[512] = {0};
     size_t n = put_byte(&r, 512, 0, '\n');
-    n = t_rec(&r, 512, n, 740, 100, false, 0, false, false, 0, 0, 5);
+    n = t_rec(&r, 512, n, 740, 100, false, 0, false, false, 0, 0, 5, 1);
     n = put_byte(&r, 512, n, '\n');
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 1));
     assert((buf_has(&out, d, " 0 unreadable\n", 14) == true));
 }
 
 void test_pull_request_number_zero_is_unreadable(void) {
     uint8_t r[256] = {0};
-    size_t n = t_rec(&r, 256, 0, 0, 100, false, 0, false, false, 0, 0, 5);
+    size_t n = t_rec(&r, 256, 0, 0, 100, false, 0, false, false, 0, 0, 5, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 0));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
@@ -1252,22 +1442,22 @@ void test_the_513th_record_is_counted_as_unreadable_and_not_stored(void) {
     size_t n = 0;
     uint32_t i = 1;
     while ((i <= 513)) {
-        n = t_rec(&r, 65536, n, i, 100, false, 0, false, false, 0, 0, 0);
+        n = t_rec(&r, 65536, n, i, 100, false, 0, false, false, 0, 0, 0, 1);
         i += 1;
     }
     assert((n < 65536));
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((buf_has(&out, d, "512 already up to date, ", 24) == true));
     assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
 
 void test_the_hour_digits_decide_the_order(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 9, 39600, false, 0, false, false, 0, 0, 1);
-    n = t_rec(&r, 1024, n, 3, 43200, false, 0, false, false, 0, 0, 1);
+    size_t n = t_rec(&r, 1024, 0, 9, 39600, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 3, 43200, false, 0, false, false, 0, 0, 1, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 2));
     assert((out[2] == '9'));
     assert((out[47] == '3'));
@@ -1275,13 +1465,25 @@ void test_the_hour_digits_decide_the_order(void) {
 
 void test_the_second_digits_decide_the_order(void) {
     uint8_t r[1024] = {0};
-    size_t n = t_rec(&r, 1024, 0, 9, 3610, false, 0, false, false, 0, 0, 1);
-    n = t_rec(&r, 1024, n, 3, 3659, false, 0, false, false, 0, 0, 1);
+    size_t n = t_rec(&r, 1024, 0, 9, 3610, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 3, 3659, false, 0, false, false, 0, 0, 1, 1);
     uint8_t out[4096] = {0};
-    size_t d = refresh_plan(&r, n, &out, 4096);
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
     assert((t_lines(&out, d, 'R') == 2));
     assert((out[2] == '9'));
     assert((out[47] == '3'));
+}
+
+void test_a_record_cut_after_its_number_does_not_borrow_the_previous_fields(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    n = put_str(&r, 512, n, "8\n", 2);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
+    assert((t_lines(&out, d, 'R') == 1));
+    assert((buf_has(&out, d, "R\t8\t", 4) == false));
+    assert((buf_has(&out, d, "M\tclaw-refresh: 1 to update, ", 29) == true));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
 }
 
 
@@ -1300,7 +1502,10 @@ int main(void) {
     test_a_fork_without_maintainer_edits_is_skipped_not_failed();
     test_a_fork_with_maintainer_edits_is_refreshed_like_any_other();
     test_unread_facts_never_become_a_refresh();
+    test_a_pull_request_the_merger_will_not_land_next_waits();
+    test_every_other_reason_outranks_waiting_for_the_merger();
     test_the_held_label_matches_only_as_a_whole_entry();
+    test_the_merger_label_matches_only_as_a_whole_entry();
     test_a_flag_is_true_false_or_refused();
     test_mergeability_folds_conflict_and_unknown_apart();
     test_behind_reads_the_state_word_then_the_count();
@@ -1319,14 +1524,21 @@ int main(void) {
     test_a_number_seen_twice_is_refused_the_second_time();
     test_the_oldest_pull_request_comes_first_whatever_the_input_order();
     test_equal_timestamps_are_ordered_by_number();
-    test_at_most_thirty_are_refreshed_and_they_are_the_oldest();
-    test_thirty_exactly_is_not_capped();
+    test_at_most_five_are_refreshed_and_they_are_the_oldest();
+    test_five_exactly_is_not_capped();
     test_held_and_conflicting_ones_do_not_use_up_the_cap();
+    test_the_merger_signal_is_auto_merge_armed_or_the_bee_label();
+    test_pull_requests_that_wait_do_not_use_up_the_cap();
+    test_the_auto_merge_flag_must_be_true_or_false();
+    test_a_queue_above_the_limit_stops_every_refresh();
+    test_a_queue_at_the_limit_still_refreshes();
+    test_an_unread_queue_size_stops_every_refresh();
+    test_the_skip_texts_are_pinned_by_their_lengths();
     test_an_empty_list_is_a_valid_empty_answer();
     test_a_carriage_return_does_not_hide_a_record();
     test_a_buffer_too_small_is_reported_not_trusted();
     test_the_summary_texts_are_pinned_by_their_lengths();
-    test_one_record_splits_into_eleven_fields_and_classifies_as_refresh();
+    test_one_record_splits_into_twelve_fields_and_classifies_as_refresh();
     test_a_created_stamp_is_checked_at_every_separator_and_at_its_length();
     test_older_ignores_the_byte_after_the_stamp();
     test_one_unreadable_field_alone_makes_the_record_unreadable();
@@ -1336,7 +1548,8 @@ int main(void) {
     test_the_513th_record_is_counted_as_unreadable_and_not_stored();
     test_the_hour_digits_decide_the_order();
     test_the_second_digits_decide_the_order();
-    printf("All %d tests passed.\n", 44);
+    test_a_record_cut_after_its_number_does_not_borrow_the_previous_fields();
+    printf("All %d tests passed.\n", 55);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
