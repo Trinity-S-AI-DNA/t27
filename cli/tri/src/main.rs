@@ -48,6 +48,8 @@ mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of
 mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
 #[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -410,6 +412,8 @@ enum Commands {
         /// Passed on to t27c after the action's own arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)] rest: Vec<String>,
     },
+    /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
+    Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -1066,6 +1070,16 @@ fn cmd_lab(specs: Option<&str>, sha: &[String]) -> Result<u8> {
     let x = lab::exit_code(n.iter().sum(), n[lab::V_RED as usize], n[lab::V_UNREAD as usize]); println!("{}", lab::exit_why(x)); Ok(x)
 }
 
+/// `tri raw` (#10909): every rule is specs/analog/raw_writer.t27; this allocates its buffers and writes the file.
+fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
+    let d = date.map_or_else(|| chrono::Local::now().format("%a %b %e %H:%M:%S  %Y").to_string(), str::to_string);
+    let (mut buf, mut vals, mut limbs, mut dig) = (vec![0u8; 1 << 16], vec![0f64; raw::RLC_VALS], vec![0u64; raw::RAW_LIMBS], vec![0u8; raw::RAW_DIGITS]);
+    let n = raw::raw_rlc_file(&mut buf, d.as_bytes(), binary, &mut vals, &mut limbs, &mut dig);
+    anyhow::ensure!(n > 0 && n <= buf.len(), "raw: the trace is not the RLC cell's pinned simulation, or the file does not fit");
+    fs::write(out, &buf[..n])?;
+    Ok(0)
+}
+
 /// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
 fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
     let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
@@ -1330,6 +1344,7 @@ fn main() -> Result<()> {
         Commands::Hooks { action } => hooks::run(action)?,
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
+        Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
