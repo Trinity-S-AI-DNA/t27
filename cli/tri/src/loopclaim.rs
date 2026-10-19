@@ -19,6 +19,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::process::Command;
+#[path = "../../../gen/rust/tri/loop/tick.rs"] #[allow(dead_code, unused_parens)]
+mod tick; // t27c gen-rust of specs/tri/loop/tick.t27: every rule of `tri loop plan`
 
 #[derive(Subcommand)]
 pub enum LoopCmd {
@@ -36,6 +38,11 @@ pub enum LoopCmd {
         /// Say who holds it without trying to take it.
         #[arg(long)]
         who: bool,
+    },
+    /// The next actions of the overnight loop, one `ACTION key  reason` line each, from a snapshot of its state (ledger rows, wanted lanes, pull requests, agents, crons, requests out) read from FILE or stdin. Rules: specs/tri/loop/tick.t27. Runs no command, contacts no network or machine. The same snapshot prints the same lines; the last line, `HASH n`, goes into the next snapshot as `last n`, and a tick whose state and plan it matches prints NOOP.
+    Plan {
+        /// The snapshot file; stdin when absent or `-`.
+        file: Option<std::path::PathBuf>,
     },
 }
 
@@ -83,7 +90,23 @@ fn holder(name: &str) -> Option<String> {
 pub fn run(cmd: &LoopCmd) -> Result<()> {
     match cmd {
         LoopCmd::Claim { name, release, who } => claim(name, *release, *who),
+        LoopCmd::Plan { file } => plan(file.as_deref()),
     }
+}
+
+/// `tri loop plan`: the generated rules judge the snapshot, this prints what they return.
+fn plan(file: Option<&std::path::Path>) -> Result<()> {
+    let text = match file.filter(|f| f.to_str() != Some("-")) { Some(f) => std::fs::read_to_string(f).with_context(|| f.display().to_string())?, None => std::io::read_to_string(std::io::stdin())? };
+    let s: &'static str = text.leak();
+    let (mut at, noop) = (tick::next_record(s, 0), tick::is_noop(s));
+    if noop { println!("{}  {}", tick::action_name(tick::A_NOOP), tick::why(tick::A_NOOP)); }
+    while !noop && at < s.len() {
+        let a = tick::action(s, at);
+        if a != tick::A_NONE { println!("{} {}  {}", tick::action_name(a), &s[tick::key_from(s, at)..tick::key_to(s, at)], tick::why(a)); }
+        at = tick::next_record(s, tick::line_end(s, at) + 1);
+    }
+    println!("HASH {}", tick::plan_hash(s));
+    Ok(())
 }
 
 fn claim(name: &str, release: bool, who: bool) -> Result<()> {
