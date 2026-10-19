@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/lab/prune.t27 -- which finished runs and which scratch build directories the t27c lab deletes (gHashTag/t27#11041, #11040)
+; The t27c lab (infra/t27c-lab/lab.py) keeps what it publishes and what it builds on one volume, and two rules keep that volume
+; from filling (2026-10-07: it filled to 99% and the queue stopped on ENOSPC, #7090). Both are decisions about names, ages and
+; numbers, ported here as pure functions with the Python as the oracle until the cutover; they know no host, no path and no cloud:
+;   prune()                  runs[KEEP_RUNS:] by modification time, newest first, except the commits a watched head points at
+;                            lab_prune_start, lab_run_rank, lab_prune_runs
+;   reap_scratch_targets()   when free space is under min_free of the volume, a directory `<name>-target` that nobody wrote in
+;                            idle_s seconds is dropped; the lab's own `target` is never matched, nor a link, nor a file
+;                            lab_reap_pressure, lab_scratch_name, lab_reap_decision
+; THE RUNS. `runs` is one finished run per line, `<stem> TAB <mtime>`: the file name without `.json` and its modification time as
+; an unsigned decimal integer of at most 18 digits in any one unit (only the order is read). A line that is not that is not a
+; run. They are ranked as sorted(..., key=mtime, reverse=True) ranks them: newest first, equal times in listing order (Python's
+; reverse sort is stable). KEEP_RUNS is a Python slice start, so a negative value counts from the end: with -5 the candidates are
+; the OLDEST five and nothing else is ever deleted, the lab's own quirk, ported as it is. `live` is the shas of the watched
+; heads, one per line.
+; lab_prune_runs writes the stems to delete, one per line: those at rank KEEP_RUNS or after that are not live.
+; THE SCRATCH TARGETS. Free space is `free` of `total` bytes. `free >= total * min_free` means room: nothing is reaped, whatever
+; the directories are (float arithmetic as Python does it, the comparison in f64). Then a name that does not end in `-target` is
+; not a scratch target (pathlib's `*-target` matches `-target` and a dot name too, and is case sensitive on Linux); a symbolic link
+; and a non-directory are kept; a directory whose newest write is less than idle_s seconds old is kept; the rest is deleted. The
+; age is `now - newest mtime` over the directory and every file under it, which the host computes (it reads the file system); this
+; file decides from the number. lab_reap_decision names the first rule that applies.
+; THE LAB DISK GATE. specs/claw/lab_disk.t27 holds a CHECK before it runs when the volume is full (under 1 GiB) and warns under
+; 5 GiB or 10%; the reaper starts earlier, at 15% free. The tests below tie the two: whatever lab_disk calls low by the percent
+; line, the reaper is already running.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LabPrune;
+
+use tri::lab::receipt::span_is;
+use lab::text::LAB_NO;
+use lab::text::LAB_DEC_BAD;
+use lab::text::lab_line_end;
+use lab::text::lab_line_next;
+use lab::text::lab_find_byte;
+use lab::text::lab_count_of;
+use lab::text::lab_set_has;
+use lab::text::lab_put_span;
+use lab::text::lab_put_lit;
+use claw::lab_disk::disk_reason;
+use claw::lab_disk::R_OK;
+use claw::lab_disk::R_LOW;
+use claw::lab_disk::R_FULL;
+
+/// KEEP_RUNS's default.
+pub const LAB_KEEP_RUNS : i64 = 200;
+/// reap_scratch_targets()'s defaults: under 15% free, a directory idle for a day.
+pub const LAB_REAP_MIN_FREE : f64 = 0.15;
+pub const LAB_REAP_IDLE_S : f64 = 86400.0;
+
+/// What reap_scratch_targets() does with one entry of the data directory, the first rule that applies.
+pub const LAB_REAP_KEEP_ROOM : u8 = 0;
+pub const LAB_REAP_KEEP_NAME : u8 = 1;
+pub const LAB_REAP_KEEP_LINK : u8 = 2;
+pub const LAB_REAP_KEEP_NOT_DIR : u8 = 3;
+pub const LAB_REAP_KEEP_RECENT : u8 = 4;
+pub const LAB_REAP_DELETE : u8 = 5;
+
+/// The index of the first run `runs[KEEP_RUNS:]` takes out of n runs: Python's slice start, a negative one counting from the end.
+pub fn lab_prune_start(n: usize, keep: i64) -> usize {
+    if (keep >= 0) {
+        if ((keep as usize) >= n) { return n; }
+        return keep as usize;
+    }
+    if (keep < 0 - 4611686018427387904) { return 0; }
+    const back : usize = (0 - keep) as usize;
+    if (back >= n) { return 0; }
+    return n - back;
+}
+
+/// The modification time on the run line runs[s..e]: LAB_DEC_BAD when the line is not `<stem> TAB <count>`.
+pub fn lab_run_mtime(runs: string, s: usize, e: usize) -> u64 {
+    const tab : usize = lab_find_byte(runs, s, e, 9);
+    if (tab == LAB_NO) { return LAB_DEC_BAD; }
+    return lab_count_of(runs, tab + 1, e);
+}
+
+/// How many lines of `runs` are runs.
+pub fn lab_run_count(runs: string) -> usize {
+    var n : usize = 0;
+    var s : usize = 0;
+    while (s < runs.len) {
+        const e : usize = lab_line_end(runs, s);
+        if (lab_run_mtime(runs, s, e) != LAB_DEC_BAD) { n = n + 1; }
+        s = lab_line_next(runs, e);
+    }
+    return n;
+}
+
+/// The rank, 0 for the newest, of the run on the line that starts at s: the runs strictly newer, and the ones listed before it
+/// with the same time.
+pub fn lab_run_rank(runs: string, s: usize) -> usize {
+    const mine : u64 = lab_run_mtime(runs, s, lab_line_end(runs, s));
+    var rank : usize = 0;
+    var k : usize = 0;
+    while (k < runs.len) {
+        const e : usize = lab_line_end(runs, k);
+        const m : u64 = lab_run_mtime(runs, k, e);
+        if (m != LAB_DEC_BAD and (m > mine or (m == mine and k < s))) { rank = rank + 1; }
+        k = lab_line_next(runs, e);
+    }
+    return rank;
+}
+
+/// prune(): the stems of the runs to delete, one per line, into dst at w, clipped at cap; the new cursor.
+pub fn lab_prune_runs(runs: string, live: string, keep: i64, dst: []u8, cap: usize, w: usize) -> usize {
+    const start : usize = lab_prune_start(lab_run_count(runs), keep);
+    var x : usize = w;
+    var s : usize = 0;
+    while (s < runs.len) {
+        const e : usize = lab_line_end(runs, s);
+        if (lab_run_mtime(runs, s, e) != LAB_DEC_BAD) {
+            const tab : usize = lab_find_byte(runs, s, e, 9);
+            if (lab_run_rank(runs, s) >= start and lab_set_has(live, runs, s, tab) == false) {
+                x = lab_put_span(dst, cap, x, runs, s, tab);
+                x = lab_put_lit(dst, cap, x, "\n");
+            }
+        }
+        s = lab_line_next(runs, e);
+    }
+    return x;
+}
+
+/// reap_scratch_targets(): is there room? Free space at or above min_free of the volume means nothing is reaped.
+pub fn lab_reap_pressure(total: u64, free: u64, min_free: f64) -> bool {
+    return (free as f64) < (total as f64) * min_free;
+}
+
+/// root.glob("*-target"): a name that ends in `-target` (a name of just `-target` too).
+pub fn lab_scratch_name(t: string, from: usize, to: usize) -> bool {
+    if (to < from or to - from < 7) { return false; }
+    return span_is(t, to - 7, to, "-target");
+}
+
+/// reap_scratch_targets(): what to do with the entry name[nf..nt] of the data directory.
+pub fn lab_reap_decision(name: string, nf: usize, nt: usize, is_link: bool, is_dir: bool, age_s: f64, total: u64, free: u64, min_free: f64, idle_s: f64) -> u8 {
+    if (lab_reap_pressure(total, free, min_free) == false) { return LAB_REAP_KEEP_ROOM; }
+    if (lab_scratch_name(name, nf, nt) == false) { return LAB_REAP_KEEP_NAME; }
+    if (is_link) { return LAB_REAP_KEEP_LINK; }
+    if (is_dir == false) { return LAB_REAP_KEEP_NOT_DIR; }
+    if (age_s < idle_s) { return LAB_REAP_KEEP_RECENT; }
+    return LAB_REAP_DELETE;
+}
+
+// ---- tests ----
+// The oracle is infra/t27c-lab/lab.py. The cases below are its answers (Python 3.14.6): prune() was run for real on a directory
+// of run files with chosen modification times (the data directory and the reaper patched out), and reap_scratch_targets() was
+// run for real on a directory of entries (a directory, a link to one, a file; old and new; min_free 2.0 to reap and 0.0 not to).
+// Its self_check() case (old-target goes; new-target and target stay) is the first test of the reaper, one to one.
+
+fn lab_test_prune(runs: string, live: string, keep: i64, want: string) -> bool {
+    var out : [1024]u8 = undefined;
+    const w : usize = lab_prune_runs(runs, live, keep, &out, 1024, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+/// One entry of the data directory under pressure (total 100, free 0, min_free 2.0), idle limit 1000 s.
+fn lab_test_reap(name: string, is_link: bool, is_dir: bool, age: f64, want: u8) -> bool {
+    return lab_reap_decision(name, 0, name.len, is_link, is_dir, age, 100, 0, 2.0, 1000.0) == want;
+}
+
+// <<< pinned table: prune_self_check
+test lab_py_self_check_the_reaper_drops_the_old_scratch_target_and_nothing_else {
+    assert lab_test_reap("old-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("new-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("target", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", false, true, 0.5, LAB_REAP_KEEP_NAME);
+}
+
+// >>> pinned table: prune_self_check
+// <<< pinned table: prune_reap
+// reap_scratch_targets() on one entry at a time: a directory, a link to one, a file, each old (written long ago) and new, under pressure.
+test lab_py_table_the_reaper_on_every_kind_of_entry {
+    assert lab_test_reap("old-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("old-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("old-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("old-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("old-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("old-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("new-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("new-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("new-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("new-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("new-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("new-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("target", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("a-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("a-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("a-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("a-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("a-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap(".x-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap(".x-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap(".x-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap(".x-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap(".x-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap(".x-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("a-targets", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-targets", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-targets", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-targets", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-targets", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-targets", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("x-target-y", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a-target.", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("a b-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("a b-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("a b-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("a b-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("a b-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("a b-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("x-target-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("x-target-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("x-target-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("x-target-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("x-target-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("x-target-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("--target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("--target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("--target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("--target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("--target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("--target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("target-", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target-", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target-", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target-", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target-", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("target-", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("-targe", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("atarget", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("b-Target", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("TARGET", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("scratch-target", false, true, 1700000000.0, LAB_REAP_DELETE);
+    assert lab_test_reap("scratch-target", false, true, 0.5, LAB_REAP_KEEP_RECENT);
+    assert lab_test_reap("scratch-target", true, true, 1700000000.0, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("scratch-target", true, true, 0.5, LAB_REAP_KEEP_LINK);
+    assert lab_test_reap("scratch-target", false, false, 1700000000.0, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("scratch-target", false, false, 0.5, LAB_REAP_KEEP_NOT_DIR);
+    assert lab_test_reap("www", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("www", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("www", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("www", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("www", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("www", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", false, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", false, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", true, true, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", true, true, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", false, false, 1700000000.0, LAB_REAP_KEEP_NAME);
+    assert lab_test_reap("requests", false, false, 0.5, LAB_REAP_KEEP_NAME);
+    assert lab_reap_decision("old-target", 0, 10, false, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("old-target", 0, 10, true, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("old-target", 0, 10, false, false, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("a-target", 0, 8, true, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("a-target", 0, 8, false, false, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("target", 0, 6, false, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("target", 0, 6, true, true, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+    assert lab_reap_decision("target", 0, 6, false, false, 1700000000.0, 100, 0, 0.0, 1000.0) == LAB_REAP_KEEP_ROOM;
+}
+
+// >>> pinned table: prune_reap
+// <<< pinned table: prune_pressure
+// `du.free >= du.total * min_free` returns before anything is deleted; `time.time() - newest < idle_s` keeps a directory.
+test lab_py_table_pressure_and_idle {
+    assert lab_reap_pressure(100, 15, 0.15) == false;
+    assert lab_reap_pressure(100, 14, 0.15) == true;
+    assert lab_reap_pressure(100, 16, 0.15) == false;
+    assert lab_reap_pressure(100, 0, 0.15) == true;
+    assert lab_reap_pressure(100, 100, 0.15) == false;
+    assert lab_reap_pressure(0, 0, 0.15) == false;
+    assert lab_reap_pressure(47745772, 0, 0.15) == true;
+    assert lab_reap_pressure(48891670528, 0, 0.15) == true;
+    assert lab_reap_pressure(2079065522176, 535033524224, 0.15) == false;
+    assert lab_reap_pressure(2079065522176, 307200000000, 0.15) == true;
+    assert lab_reap_pressure(100, 100, 2.0) == true;
+    assert lab_reap_pressure(100, 0, 2.0) == true;
+    assert lab_reap_pressure(100, 0, 0.0) == false;
+    assert lab_reap_pressure(100, 1, 0.0) == false;
+    assert lab_reap_pressure(3, 1, 0.34) == true;
+    assert lab_reap_pressure(3, 1, 0.33) == false;
+    assert lab_reap_pressure(3, 1, 0.3333333333333333) == false;
+    assert lab_reap_pressure(20, 3, 0.15) == false;
+    assert lab_reap_pressure(20, 4, 0.15) == false;
+    assert lab_reap_pressure(1000, 150, 0.15) == false;
+    assert lab_reap_pressure(1000, 149, 0.15) == true;
+    assert lab_reap_pressure(1000, 151, 0.15) == false;
+    assert lab_reap_pressure(10, 1, 0.1) == false;
+    assert lab_reap_pressure(10, 2, 0.1) == false;
+    assert lab_reap_pressure(53687091200, 8053063680, 0.15) == false;
+    assert lab_reap_pressure(53687091200, 8053063679, 0.15) == true;
+    assert lab_reap_pressure(53687091200, 8053063681, 0.15) == false;
+    assert lab_reap_pressure(9007199254740992, 9007199254740992, 1.0) == false;
+    assert lab_reap_pressure(9007199254740992, 9007199254740991, 1.0) == true;
+    assert lab_reap_pressure(1000000000000000, 100000000000000, 0.1) == false;
+    assert lab_reap_pressure(1000000000000000, 99999999999999, 0.1) == true;
+    assert lab_reap_pressure(1, 0, 0.5) == true;
+    assert lab_reap_pressure(1, 1, 0.5) == false;
+    assert lab_reap_pressure(2, 1, 0.5) == false;
+    assert lab_reap_pressure(7, 1, 0.15) == true;
+    assert lab_reap_pressure(7, 2, 0.15) == false;
+    assert lab_reap_pressure(6, 1, 0.17) == true;
+    assert lab_reap_pressure(6, 1, 0.16) == false;
+    // Under pressure the decision follows the age: `age < idle_s` keeps the directory, an age equal to the limit does not.
+    assert lab_reap_decision("a-target", 0, 8, false, true, 0.0, 100, 0, 2.0, 86400.0) == LAB_REAP_KEEP_RECENT;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 86399.9, 100, 0, 2.0, 86400.0) == LAB_REAP_KEEP_RECENT;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 86400.0, 100, 0, 2.0, 86400.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 86400.1, 100, 0, 2.0, 86400.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 1.0, 100, 0, 2.0, 1.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 0.99, 100, 0, 2.0, 1.0) == LAB_REAP_KEEP_RECENT;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 1000.0, 100, 0, 2.0, 1000.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 999.999, 100, 0, 2.0, 1000.0) == LAB_REAP_KEEP_RECENT;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 1000000000.0, 100, 0, 2.0, 86400.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 5e-07, 100, 0, 2.0, 1e-06) == LAB_REAP_KEEP_RECENT;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 0.0, 100, 0, 2.0, 0.0) == LAB_REAP_DELETE;
+    assert lab_reap_decision("a-target", 0, 8, false, true, 1.0, 100, 0, 2.0, 0.0) == LAB_REAP_DELETE;
+    assert LAB_REAP_MIN_FREE == 0.15 and LAB_REAP_IDLE_S == 86400.0 and LAB_KEEP_RUNS == 200;
+    assert lab_reap_pressure(100, 15, LAB_REAP_MIN_FREE) == false;
+    assert lab_reap_pressure(100, 14, LAB_REAP_MIN_FREE) == true;
+}
+
+// >>> pinned table: prune_pressure
+// <<< pinned table: prune_runs
+// prune(): the runs at rank KEEP_RUNS or after, newest first by modification time, that no watched head points at.
+test lab_py_table_prune {
+    assert lab_test_prune("", "", 200, "");
+    assert lab_test_prune("", "", 0, "");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t5\n", "", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t5\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 0, "");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t5\n", "", 1, "");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t5\n", "", -1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t5\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", -1, "");
+    assert lab_test_prune("ffffffffffffffffffffffffffffffffffffffff\t1000000034\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000068\ncccccccccccccccccccccccccccccccccccccccc\t1000000027\nx\t1000000021\n", "dddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", 1, "ffffffffffffffffffffffffffffffffffffffff\ncccccccccccccccccccccccccccccccccccccccc\nx\n");
+    assert lab_test_prune("x\t1000000001\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000069\ndddddddddddddddddddddddddddddddddddddddd\t1000000052\nrun-1\t1000000070\n0123456789abcdef0123456789abcdef01234567\t1000000092\ny\t1000000068\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n0123456789abcdef0123456789abcdef01234567\ny\n", -100, "x\ndddddddddddddddddddddddddddddddddddddddd\nrun-1\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000023\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000085\ndddddddddddddddddddddddddddddddddddddddd\t1000000033\nx\t1000000069\ny\t1000000083\n", "ffffffffffffffffffffffffffffffffffffffff\n", -5, "0123456789abcdef0123456789abcdef01234567\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\nx\ny\n");
+    assert lab_test_prune("y\t1000000009\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000007\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000061\ncccccccccccccccccccccccccccccccccccccccc\t1000000010\n0123456789abcdef0123456789abcdef01234567\t1000000066\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000026\n", "y\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 100, "");
+    assert lab_test_prune("", "dddddddddddddddddddddddddddddddddddddddd\nffffffffffffffffffffffffffffffffffffffff\ny\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 7, "");
+    assert lab_test_prune("dddddddddddddddddddddddddddddddddddddddd\t1000000026\ny\t1000000002\nx\t1000000081\nffffffffffffffffffffffffffffffffffffffff\t1000000055\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000028\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000084\n0123456789abcdef0123456789abcdef01234567\t1000000029\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\nffffffffffffffffffffffffffffffffffffffff\ny\nrun-1\n", 1, "x\n0123456789abcdef0123456789abcdef01234567\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000097\n", "0123456789abcdef0123456789abcdef01234567\nx\ny\n", 4, "");
+    assert lab_test_prune("dddddddddddddddddddddddddddddddddddddddd\t1000000069\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000091\ny\t1000000040\nrun-2\t1000000061\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000039\n", "ffffffffffffffffffffffffffffffffffffffff\n0123456789abcdef0123456789abcdef01234567\nx\ny\nrun-1\nrun-2\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 9, "");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000064\n", "cccccccccccccccccccccccccccccccccccccccc\n", 100, "");
+    assert lab_test_prune("run-2\t1000000066\ndddddddddddddddddddddddddddddddddddddddd\t1000000045\nx\t1000000044\nrun-1\t1000000091\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nffffffffffffffffffffffffffffffffffffffff\n0123456789abcdef0123456789abcdef01234567\ny\n", -3, "run-2\ndddddddddddddddddddddddddddddddddddddddd\nx\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000081\nffffffffffffffffffffffffffffffffffffffff\t1000000017\ncccccccccccccccccccccccccccccccccccccccc\t1000000080\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000050\ndddddddddddddddddddddddddddddddddddddddd\t1000000064\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000039\nrun-2\t1000000013\ny\t1000000041\n", "dddddddddddddddddddddddddddddddddddddddd\nffffffffffffffffffffffffffffffffffffffff\nrun-2\n", -8, "0123456789abcdef0123456789abcdef01234567\ncccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\ny\n");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000036\nffffffffffffffffffffffffffffffffffffffff\t1000000097\nrun-2\t1000000071\ny\t1000000008\ndddddddddddddddddddddddddddddddddddddddd\t1000000091\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", -100, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nffffffffffffffffffffffffffffffffffffffff\nrun-2\ny\ndddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000063\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000014\ndddddddddddddddddddddddddddddddddddddddd\t1000000049\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nx\ny\nrun-1\nrun-2\n", 200, "");
+    assert lab_test_prune("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000046\nrun-1\t1000000063\n0123456789abcdef0123456789abcdef01234567\t1000000020\nx\t1000000036\nffffffffffffffffffffffffffffffffffffffff\t1000000080\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n0123456789abcdef0123456789abcdef01234567\ny\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 2, "x\n");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000025\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000083\nrun-1\t1000000030\ndddddddddddddddddddddddddddddddddddddddd\t1000000019\ny\t1000000066\nrun-2\t1000000028\n", "dddddddddddddddddddddddddddddddddddddddd\ny\nrun-2\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", -1, "");
+    assert lab_test_prune("run-1\t1000000030\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000038\nffffffffffffffffffffffffffffffffffffffff\t1000000083\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000089\ndddddddddddddddddddddddddddddddddddddddd\t1000000040\ny\t1000000053\ncccccccccccccccccccccccccccccccccccccccc\t1000000056\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\nx\nrun-2\n", -5, "run-1\ny\ncccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000041\ndddddddddddddddddddddddddddddddddddddddd\t1000000029\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000008\nrun-1\t1000000033\nrun-2\t1000000021\ny\t1000000035\ncccccccccccccccccccccccccccccccccccccccc\t1000000064\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000091\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\n0123456789abcdef0123456789abcdef01234567\nrun-1\n", -5, "dddddddddddddddddddddddddddddddddddddddd\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrun-2\ny\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000004\nx\t1000000007\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000031\nffffffffffffffffffffffffffffffffffffffff\t1000000083\nrun-2\t1000000058\nrun-1\t1000000080\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nrun-2\n", -5, "0123456789abcdef0123456789abcdef01234567\nx\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nrun-1\n");
+    assert lab_test_prune("run-1\t1000000080\ncccccccccccccccccccccccccccccccccccccccc\t1000000037\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000022\n", "dddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nrun-2\n", 5, "");
+    assert lab_test_prune("", "dddddddddddddddddddddddddddddddddddddddd\n", 8, "");
+    assert lab_test_prune("y\t1000000075\nrun-1\t1000000010\n0123456789abcdef0123456789abcdef01234567\t1000000079\ndddddddddddddddddddddddddddddddddddddddd\t1000000018\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n0123456789abcdef0123456789abcdef01234567\ny\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 9, "");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000042\ndddddddddddddddddddddddddddddddddddddddd\t1000000006\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000047\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\n", 5, "");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000037\nffffffffffffffffffffffffffffffffffffffff\t1000000006\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000051\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000047\nrun-1\t1000000067\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000059\ncccccccccccccccccccccccccccccccccccccccc\t1000000017\ndddddddddddddddddddddddddddddddddddddddd\t1000000014\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", -5, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nffffffffffffffffffffffffffffffffffffffff\ndddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_prune("run-2\t1000000065\nffffffffffffffffffffffffffffffffffffffff\t1000000023\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n0123456789abcdef0123456789abcdef01234567\nrun-1\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", -5, "run-2\nffffffffffffffffffffffffffffffffffffffff\n");
+    assert lab_test_prune("x\t1000000009\ny\t1000000014\ndddddddddddddddddddddddddddddddddddddddd\t1000000054\n", "y\n", -100, "x\ndddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_prune("ffffffffffffffffffffffffffffffffffffffff\t1000000022\nrun-2\t1000000096\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000078\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000015\ndddddddddddddddddddddddddddddddddddddddd\t1000000058\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000088\nx\t1000000030\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nffffffffffffffffffffffffffffffffffffffff\nx\ny\nrun-1\n", -9, "run-2\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
+    assert lab_test_prune("0123456789abcdef0123456789abcdef01234567\t1000000069\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000070\nx\t1000000032\nrun-2\t1000000005\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000041\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000006\ncccccccccccccccccccccccccccccccccccccccc\t1000000049\n", "cccccccccccccccccccccccccccccccccccccccc\ny\nrun-2\n", 200, "");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000096\n", "run-2\n", 200, "");
+    assert lab_test_prune("ffffffffffffffffffffffffffffffffffffffff\t1000000016\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000067\n0123456789abcdef0123456789abcdef01234567\t1000000072\nx\t1000000037\ndddddddddddddddddddddddddddddddddddddddd\t1000000087\nrun-1\t1000000066\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000097\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000056\n", "0123456789abcdef0123456789abcdef01234567\n", 9, "");
+    assert lab_test_prune("", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nffffffffffffffffffffffffffffffffffffffff\n0123456789abcdef0123456789abcdef01234567\nx\nrun-1\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 7, "");
+    assert lab_test_prune("", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\nffffffffffffffffffffffffffffffffffffffff\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", -3, "");
+    assert lab_test_prune("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000026\nrun-2\t1000000015\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000085\n0123456789abcdef0123456789abcdef01234567\t1000000035\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\nffffffffffffffffffffffffffffffffffffffff\n0123456789abcdef0123456789abcdef01234567\nx\nrun-1\n", -9, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nrun-2\n");
+    assert lab_test_prune("ffffffffffffffffffffffffffffffffffffffff\t1000000019\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000072\ny\t1000000037\nrun-1\t1000000006\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000035\ncccccccccccccccccccccccccccccccccccccccc\t1000000005\n", "cccccccccccccccccccccccccccccccccccccccc\n", -5, "ffffffffffffffffffffffffffffffffffffffff\ny\nrun-1\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000012\ndddddddddddddddddddddddddddddddddddddddd\t1000000073\ncccccccccccccccccccccccccccccccccccccccc\t1000000020\nrun-1\t1000000079\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000080\ny\t1000000035\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000034\nffffffffffffffffffffffffffffffffffffffff\t1000000043\n", "dddddddddddddddddddddddddddddddddddddddd\nx\n", 100, "");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000068\n", "run-2\n", 9, "");
+    assert lab_test_prune("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000065\nrun-1\t1000000096\n", "dddddddddddddddddddddddddddddddddddddddd\n", 8, "");
+    assert lab_test_prune("cccccccccccccccccccccccccccccccccccccccc\t1000000036\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000007\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nffffffffffffffffffffffffffffffffffffffff\n", 3, "");
+    assert lab_test_prune("y\t1000000055\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n0123456789abcdef0123456789abcdef01234567\ny\n", 5, "");
+    assert lab_test_prune("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000062\ncccccccccccccccccccccccccccccccccccccccc\t1000000035\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000073\nrun-1\t1000000087\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000026\nx\t1000000076\ny\t1000000095\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", -1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_prune("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000060\nffffffffffffffffffffffffffffffffffffffff\t1000000066\ny\t1000000056\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nx\nrun-1\nrun-2\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 1, "y\n");
+    assert lab_test_prune("", "", 1, "");
+    assert lab_test_prune("dddddddddddddddddddddddddddddddddddddddd\t1000000054\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000013\n0123456789abcdef0123456789abcdef01234567\t1000000036\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000075\ny\t1000000092\nx\t1000000021\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", -100, "dddddddddddddddddddddddddddddddddddddddd\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n0123456789abcdef0123456789abcdef01234567\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ny\nx\n");
+    assert lab_test_prune("", "ffffffffffffffffffffffffffffffffffffffff\n0123456789abcdef0123456789abcdef01234567\n", -2, "");
+    assert lab_test_prune("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000004\ncccccccccccccccccccccccccccccccccccccccc\t1000000040\nrun-2\t1000000044\nx\t1000000057\n0123456789abcdef0123456789abcdef01234567\t1000000092\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nffffffffffffffffffffffffffffffffffffffff\nrun-1\n", 2, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\ncccccccccccccccccccccccccccccccccccccccc\nrun-2\n");
+    assert lab_test_prune("x\t1000000061\n0123456789abcdef0123456789abcdef01234567\t1000000078\nffffffffffffffffffffffffffffffffffffffff\t1000000069\ndddddddddddddddddddddddddddddddddddddddd\t1000000042\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000017\n", "dddddddddddddddddddddddddddddddddddddddd\ny\nrun-1\n", 8, "");
+    assert lab_test_prune("run-1\t1000000094\ny\t1000000011\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000078\ncccccccccccccccccccccccccccccccccccccccc\t1000000053\ndddddddddddddddddddddddddddddddddddddddd\t1000000058\n", "cccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\ny\nrun-1\n", 200, "");
+    assert lab_test_prune("ffffffffffffffffffffffffffffffffffffffff\t1000000015\ny\t1000000011\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000051\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000027\nrun-1\t1000000058\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000041\n0123456789abcdef0123456789abcdef01234567\t1000000081\ndddddddddddddddddddddddddddddddddddddddd\t1000000073\n", "x\nrun-1\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", 9, "");
+    assert lab_test_prune("run-1\t1000000072\nffffffffffffffffffffffffffffffffffffffff\t1000000066\ndddddddddddddddddddddddddddddddddddddddd\t1000000037\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000098\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000077\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", 9, "");
+    assert lab_test_prune("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t1000000028\n0123456789abcdef0123456789abcdef01234567\t1000000057\ncccccccccccccccccccccccccccccccccccccccc\t1000000071\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1000000056\nx\t1000000000\ndddddddddddddddddddddddddddddddddddddddd\t1000000017\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", -2, "x\ndddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_prune("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1000000099\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t1000000080\n0123456789abcdef0123456789abcdef01234567\t1000000025\ndddddddddddddddddddddddddddddddddddddddd\t1000000002\nx\t1000000050\ncccccccccccccccccccccccccccccccccccccccc\t1000000044\ny\t1000000015\n", "cccccccccccccccccccccccccccccccccccccccc\nffffffffffffffffffffffffffffffffffffffff\n", 2, "0123456789abcdef0123456789abcdef01234567\ndddddddddddddddddddddddddddddddddddddddd\nx\ny\n");
+}
+
+// prune(): the slice start of runs[KEEP_RUNS:], for every length and every sign.
+test lab_py_table_the_slice_start {
+    assert lab_prune_start(0, -9) == 0;
+    assert lab_prune_start(0, -7) == 0;
+    assert lab_prune_start(0, -6) == 0;
+    assert lab_prune_start(0, -3) == 0;
+    assert lab_prune_start(0, -2) == 0;
+    assert lab_prune_start(0, -1) == 0;
+    assert lab_prune_start(0, 0) == 0;
+    assert lab_prune_start(0, 1) == 0;
+    assert lab_prune_start(0, 2) == 0;
+    assert lab_prune_start(0, 5) == 0;
+    assert lab_prune_start(0, 6) == 0;
+    assert lab_prune_start(0, 7) == 0;
+    assert lab_prune_start(0, 200) == 0;
+    assert lab_prune_start(1, -9) == 0;
+    assert lab_prune_start(1, -7) == 0;
+    assert lab_prune_start(1, -6) == 0;
+    assert lab_prune_start(1, -3) == 0;
+    assert lab_prune_start(1, -2) == 0;
+    assert lab_prune_start(1, -1) == 0;
+    assert lab_prune_start(1, 0) == 0;
+    assert lab_prune_start(1, 1) == 1;
+    assert lab_prune_start(1, 2) == 1;
+    assert lab_prune_start(1, 5) == 1;
+    assert lab_prune_start(1, 6) == 1;
+    assert lab_prune_start(1, 7) == 1;
+    assert lab_prune_start(1, 200) == 1;
+    assert lab_prune_start(2, -9) == 0;
+    assert lab_prune_start(2, -7) == 0;
+    assert lab_prune_start(2, -6) == 0;
+    assert lab_prune_start(2, -3) == 0;
+    assert lab_prune_start(2, -2) == 0;
+    assert lab_prune_start(2, -1) == 1;
+    assert lab_prune_start(2, 0) == 0;
+    assert lab_prune_start(2, 1) == 1;
+    assert lab_prune_start(2, 2) == 2;
+    assert lab_prune_start(2, 5) == 2;
+    assert lab_prune_start(2, 6) == 2;
+    assert lab_prune_start(2, 7) == 2;
+    assert lab_prune_start(2, 200) == 2;
+    assert lab_prune_start(3, -9) == 0;
+    assert lab_prune_start(3, -7) == 0;
+    assert lab_prune_start(3, -6) == 0;
+    assert lab_prune_start(3, -3) == 0;
+    assert lab_prune_start(3, -2) == 1;
+    assert lab_prune_start(3, -1) == 2;
+    assert lab_prune_start(3, 0) == 0;
+    assert lab_prune_start(3, 1) == 1;
+    assert lab_prune_start(3, 2) == 2;
+    assert lab_prune_start(3, 5) == 3;
+    assert lab_prune_start(3, 6) == 3;
+    assert lab_prune_start(3, 7) == 3;
+    assert lab_prune_start(3, 200) == 3;
+    assert lab_prune_start(4, -9) == 0;
+    assert lab_prune_start(4, -7) == 0;
+    assert lab_prune_start(4, -6) == 0;
+    assert lab_prune_start(4, -3) == 1;
+    assert lab_prune_start(4, -2) == 2;
+    assert lab_prune_start(4, -1) == 3;
+    assert lab_prune_start(4, 0) == 0;
+    assert lab_prune_start(4, 1) == 1;
+    assert lab_prune_start(4, 2) == 2;
+    assert lab_prune_start(4, 5) == 4;
+    assert lab_prune_start(4, 6) == 4;
+    assert lab_prune_start(4, 7) == 4;
+    assert lab_prune_start(4, 200) == 4;
+    assert lab_prune_start(5, -9) == 0;
+    assert lab_prune_start(5, -7) == 0;
+    assert lab_prune_start(5, -6) == 0;
+    assert lab_prune_start(5, -3) == 2;
+    assert lab_prune_start(5, -2) == 3;
+    assert lab_prune_start(5, -1) == 4;
+    assert lab_prune_start(5, 0) == 0;
+    assert lab_prune_start(5, 1) == 1;
+    assert lab_prune_start(5, 2) == 2;
+    assert lab_prune_start(5, 5) == 5;
+    assert lab_prune_start(5, 6) == 5;
+    assert lab_prune_start(5, 7) == 5;
+    assert lab_prune_start(5, 200) == 5;
+    assert lab_prune_start(6, -9) == 0;
+    assert lab_prune_start(6, -7) == 0;
+    assert lab_prune_start(6, -6) == 0;
+    assert lab_prune_start(6, -3) == 3;
+    assert lab_prune_start(6, -2) == 4;
+    assert lab_prune_start(6, -1) == 5;
+    assert lab_prune_start(6, 0) == 0;
+    assert lab_prune_start(6, 1) == 1;
+    assert lab_prune_start(6, 2) == 2;
+    assert lab_prune_start(6, 5) == 5;
+    assert lab_prune_start(6, 6) == 6;
+    assert lab_prune_start(6, 7) == 6;
+    assert lab_prune_start(6, 200) == 6;
+    assert lab_prune_start(5, -9223372036854775807) == 0 and lab_prune_start(5, 9223372036854775807) == 5;
+}
+
+// >>> pinned table: prune_runs
+
+/// The volumes of the grid below, in KiB.
+const LAB_TEST_TOTALS : [5]u64 = [104857600, 47745772, 6000000, 50000000, 2030337424];
+
+// Scenario: specs/claw/lab_disk.t27 holds a check at under 1 GiB free and warns under 5 GiB or 10%; this reaper starts at 15%.
+// The tick-40 volume (47745772 KiB, 0 free) is full for the gate and under pressure for the reaper; a volume at 12% free is
+// still `go` for the gate while the reaper already works; and over the whole grid, whatever the gate calls low by the percent
+// line (avail * 10 < blocks) the reaper is already running on, and a full volume of 7 GiB or more is under pressure too.
+test the_reaper_starts_before_the_lab_disk_gate_holds_a_check {
+    assert disk_reason(47745772, 0) == R_FULL;
+    assert lab_reap_pressure(47745772 * 1024, 0, LAB_REAP_MIN_FREE) == true;
+    assert disk_reason(104857600, 12582912) == R_OK;
+    assert lab_reap_pressure(104857600 * 1024, 12582912 * 1024, LAB_REAP_MIN_FREE) == true;
+    assert disk_reason(104857600, 9437184) == R_LOW;
+    assert lab_reap_pressure(104857600 * 1024, 9437184 * 1024, LAB_REAP_MIN_FREE) == true;
+    assert disk_reason(104857600, 20971520) == R_OK;
+    assert lab_reap_pressure(104857600 * 1024, 20971520 * 1024, LAB_REAP_MIN_FREE) == false;
+    var i : usize = 0;
+    while (i < 5) {
+        const total : u64 = LAB_TEST_TOTALS[i];
+        var pct : u64 = 0;
+        while (pct <= 100) {
+            const avail : u64 = total * pct / 100;
+            const under_ten : bool = avail * 10 < total;
+            if (under_ten) {
+                assert lab_reap_pressure(total * 1024, avail * 1024, LAB_REAP_MIN_FREE) == true;
+            }
+            if (disk_reason(total, avail) == R_FULL and total >= 7340032) {
+                assert lab_reap_pressure(total * 1024, avail * 1024, LAB_REAP_MIN_FREE) == true;
+            }
+            if (disk_reason(total, avail) == R_OK) {
+                // `go` means 10% or more free and 5 GiB or more; the reaper may still be running between 10% and 15%.
+                assert under_ten == false;
+            }
+            pct = pct + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Scenario: equal modification times rank in listing order (Python's reverse sort is stable; which order the directory lists
+// them in is the file system's, so this is the port's rule, not a Python answer); a line that is not a run is not counted.
+test equal_times_rank_in_listing_order_and_a_bad_line_is_no_run {
+    assert lab_test_prune("x\t5\ny\t5\nz\t5\n", "", 1, "y\nz\n");
+    assert lab_test_prune("x\t5\ny\t5\nz\t5\n", "", 2, "z\n");
+    assert lab_test_prune("x\t5\ny\t5\nz\t5\n", "y\n", 1, "z\n");
+    assert lab_run_count("x\t5\nbad\ny\t\nz\t12a\nw\t9\n") == 2;
+    assert lab_run_count("") == 0;
+    assert lab_run_count("\n") == 0;
+    assert lab_run_count("x\t1234567890123456789\n") == 0;
+    assert lab_run_count("x\t999999999999999999\n") == 1;
+    assert lab_run_rank("x\t5\nbad\nw\t9\n", 0) == 1;
+    assert lab_run_rank("x\t5\nbad\nw\t9\n", 8) == 0;
+    assert lab_test_prune("x\t5\nbad\ny\t\nz\t12a\nw\t9\n", "", 1, "x\n");
+    assert lab_test_prune("x\t5\nw\t9\n", "x\nw\n", 0, "");
+    assert lab_test_prune("x\t5\nw\t9\n", "xx\nw \n", 0, "x\nw\n");
+}
+
+// Scenario: the scratch name is the last seven bytes of the entry's name, not a prefix and not a word inside it.
+test a_scratch_target_name_ends_in_dash_target {
+    assert lab_scratch_name("xx a-target yy", 3, 11) == true;
+    assert lab_scratch_name("-target", 0, 7) == true;
+    assert lab_scratch_name("target", 0, 6) == false;
+    assert lab_scratch_name("xtarget", 0, 7) == false;
+    assert lab_scratch_name("-targe", 0, 6) == false;
+    assert lab_scratch_name("a-targets", 0, 9) == false;
+    assert lab_scratch_name("a-target", 3, 1) == false;
+    assert lab_scratch_name("", 0, 0) == false;
+}
