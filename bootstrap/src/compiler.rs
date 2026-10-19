@@ -8262,7 +8262,7 @@ impl Codegen {
             self.write(HOST_IO_ZIG);
         }
         let mut threads = false;
-        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores"));
+        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores") && !self.declared_fns.contains(&c.name));
         if threads {
             self.write(THREAD_ZIG);
         }
