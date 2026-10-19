@@ -408,6 +408,12 @@ of particles, and runnable in the OS itself and on FPGA. Two specs do this:
 - **`specs/t27f/idea_factory.t27` is the factory**, `(IDEA, PRESET) -> RGB24 frames`. It wraps
   (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in glyph57's 5x7 font,
   assigns particles to glyph sub-slots and the card border, and closes on `CTA`.
+- **A batch of ideas: set `PRESET = PRESET_AUTO`** (255). `main` runs `pick_preset(IDEA, PRESET)`,
+  and AUTO means `preset_of(IDEA)` = FNV-1a 32 of the idea's bytes mod `PRESETS`. The same idea
+  always gets the same style, and different ideas spread across all five; A..Z hit every preset.
+  This is Remotion's `random(seed)` applied to style. Any other `PRESET` value is used as given
+  (gHashTag/t27#10803). Test hashes against the published FNV vectors (`""`, `a`, `b`, `foobar`),
+  never against a value the spec computes itself.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
