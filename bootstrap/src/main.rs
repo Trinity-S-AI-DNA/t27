@@ -176,8 +176,6 @@ mod host;
 mod tt_debug;
 mod tt_manifest;
 mod tt_profile;
-// mod runtime_minimal;
-// mod runtime_minimal_test;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

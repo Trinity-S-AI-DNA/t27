@@ -23,6 +23,8 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::process::Command;
+#[path = "../../../gen/rust/tri/worktrees/reap.rs"] #[allow(dead_code, unused_parens)]
+mod reap; // t27c gen-rust of specs/tri/worktrees/reap.t27: every rule of `--reap-plan`
 
 /// One checkout, as `git worktree list --porcelain` describes it.
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -32,7 +34,7 @@ pub struct Tree {
     pub branch: Option<String>,
     pub detached: bool,
     pub bare: bool,
-    pub locked: bool,
+    pub locked: Option<String>,
     pub prunable: bool,
 }
 
@@ -137,7 +139,7 @@ pub fn parse_porcelain(text: &str) -> Vec<Tree> {
             "branch" => cur.branch = Some(rest.trim_start_matches("refs/heads/").to_string()),
             "detached" => cur.detached = true,
             "bare" => cur.bare = true,
-            "locked" => cur.locked = true,
+            "locked" => cur.locked = Some(rest.to_string()),
             "prunable" => cur.prunable = true,
             _ => {}
         }
@@ -248,6 +250,39 @@ pub struct Worktrees {
     /// Print every tree, not only those holding work or unreadable.
     #[arg(long)]
     all: bool,
+    /// Print the `git worktree remove` line of every checkout that is REMOVABLE (rules: specs/tri/worktrees/reap.t27): its PR is merged or closed (asked of GitHub once per branch), it holds nothing but the untracked target link, and no live pid holds its lock. Still deletes nothing.
+    #[arg(long)]
+    reap_plan: bool,
+}
+
+/// The `--reap-plan` section: each checkout judged by `reap`, and the line that removes each REMOVABLE one. GitHub is asked only about a tree a merged PR would make removable.
+fn reap_plan(trees: &[Tree], all: bool) {
+    let token = std::env::var("GITHUB_TOKEN").ok().or_else(|| Command::new("gh").args(["auth", "token"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()));
+    let auth = token.filter(|t| !t.is_empty()).map(|t| format!("Authorization: Bearer {t}\n")).unwrap_or_default();
+    let (main, mut counts) = (trees.first().map_or("", |t| t.path.as_str()), [0usize; reap::VERDICTS as usize]);
+    println!();
+    for (i, t) in trees.iter().enumerate() {
+        let (path, branch): (&'static str, &'static str) = (t.path.clone().leak(), t.branch.clone().unwrap_or_default().leak());
+        let dirty = !git_in(path, &["status", "--porcelain"]).map_or(false, |s| reap::only_target(s.leak()));
+        let pid = reap::lock_pid(t.locked.clone().unwrap_or_default().leak());
+        let gone = pid != 0 && Command::new("kill").args(["-0", &pid.to_string()]).output().map_or(false, |o| String::from_utf8_lossy(&o.stderr).contains("No such process"));
+        let lock = reap::lock_state(t.locked.is_some(), pid, !gone);
+        let judge = |pr| reap::verdict(i == 0, dirty, lock, pr, reap::plain(path));
+        let mut v = judge(reap::PR_MERGED);
+        if v == reap::V_REMOVABLE {
+            let url = format!("{}{branch}", reap::PULLS_URL);
+            let pulls = if reap::plain(branch) { crate::payout::sh("curl", &["-fsSL", "--max-time", "30", "-H", "@-", &url], &auth) } else { "" };
+            v = judge(reap::pr_state(serde_json::from_str::<serde_json::Value>(pulls).ok().and_then(|j| serde_json::to_string_pretty(&j).ok()).unwrap_or_default().leak()));
+        }
+        counts[v as usize] += 1;
+        if v == reap::V_REMOVABLE || all {
+            println!("  {:14} {:28.28}  {branch:34.34}  {}", reap::verdict_name(v), path.rsplit('/').next().unwrap_or(path), reap::why(v));
+        }
+        if v == reap::V_REMOVABLE {
+            println!("    {}{main}{}{} {path}", reap::REMOVE_HEAD, reap::REMOVE_MID, reap::remove_flags(lock));
+        }
+    }
+    println!("  reap plan: {}", (0..reap::VERDICTS).map(|v| format!("{} {}", counts[v as usize], reap::verdict_name(v))).collect::<Vec<_>>().join(", "));
 }
 
 pub fn run(a: &Worktrees) -> Result<()> {
@@ -355,6 +390,7 @@ pub fn run(a: &Worktrees) -> Result<()> {
             gib(keep_kb)
         );
     }
+    if a.reap_plan { reap_plan(&trees, a.all); }
     println!("  Nothing was deleted. A clean tree is not a tree you own.");
     Ok(())
 }
@@ -398,7 +434,7 @@ mod porcelain_tests {
     fn locked_bare_and_prunable_are_read() {
         let t = parse_porcelain("worktree /r\nbare\n\nworktree /l\nHEAD a\nlocked\n\nworktree /p\nHEAD b\nprunable gitdir file points to non-existent location\n");
         assert!(t[0].bare);
-        assert!(t[1].locked);
+        assert!(t[1].locked.is_some());
         assert!(t[2].prunable);
     }
 
