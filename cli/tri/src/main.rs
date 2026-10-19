@@ -428,7 +428,7 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal (rules: specs/tools/t27o/spice_convert.t27).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27).
     T27o {
         file: String,
         /// The module name; default the file's stem.
@@ -438,6 +438,8 @@ enum Commands {
         #[arg(long)] check: bool,
         /// The t27c binary; default target/release/t27c, then t27c on PATH.
         #[arg(long)] t27c: Option<String>,
+        /// A netlist: print the M1 cell constants (CELL_N, CELL_D, CELL_NV) folded from it, or the refusal, instead of the inventory.
+        #[arg(long)] emit_cell: bool,
     },
     /// t27o over a tree (#10543): every tracked .rs file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
@@ -1330,7 +1332,7 @@ fn main() -> Result<()> {
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
-        Commands::T27o { file, name, oracle, check, t27c } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref())? as i32),
+        Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
     }
 
@@ -1338,11 +1340,11 @@ fn main() -> Result<()> {
 }
 
 /// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
-fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>) -> Result<u8> {
+fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>, emit_cell: bool) -> Result<u8> {
     let src = fs::read(file).with_context(|| format!("reading {file}"))?;
     if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
         let (mut work, mut out, mut st) = (vec![0u8; 2 * src.len() + 8192], vec![0u8; 1 << 24], vec![0usize; 1 << 16]);
-        let n = spice::inventory(&src, &mut work, &mut out, &mut st);
+        let n = if emit_cell { spice::emit_cell(&src, &mut work, &mut out, &mut st) } else { spice::inventory(&src, &mut work, &mut out, &mut st) };
         std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
         return Ok(spice::exit_code(&st));
     }
