@@ -33420,6 +33420,12 @@ pub struct CtsReport {
 }
 
 
+impl CtsReport {
+    pub fn passed(&self) -> bool {
+        !self.has_violations
+    }
+}
+
 pub struct CtsModel;
 
 impl CtsModel {
@@ -41889,6 +41895,19 @@ mod tests_hir_cts {
         assert_eq!(t.tree_delay_ps(100), 200);
         assert!(t.skew_ok(200));
         assert!(!t.skew_ok(50));
+    }
+
+    #[test]
+    fn test_cts_report_passed() {
+        let r = CtsReport {
+            num_clocks: 2,
+            num_plls: 1,
+            total_buffers: 10,
+            worst_skew_ps: 80,
+            worst_latency_ps: 300,
+            has_violations: false,
+        };
+        assert!(r.passed());
     }
 
     #[test]
