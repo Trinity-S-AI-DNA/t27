@@ -309,6 +309,7 @@ Each cell is the outcome of that test (`inc_max`, `shr_big`, `rem_neg`):
 ```
 t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
 t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
+t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then "<cmd>"]
 t27b asm    <file.t27> [--overflow trap|wrap]
 t27b verilog <file.t27>
 t27b ts     <file.t27>
@@ -317,6 +318,16 @@ t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
                   [--blockers [--reference <t27c> [--reference-cache <file>]
                                [--reference-timeout-ms N]]]
 ```
+
+`t27b watch` builds the object once, then again after every settled save to the spec or to any
+spec in its `use` closure (#10859). An idle look only stats the files the last build read; a
+save is built after `HOT_DEBOUNCE_MS` of quiet or `HOT_MAX_WAIT_MS` after its first event, so a
+save is rebuilt within `WATCH_POLL_MS` + `HOT_MAX_WAIT_MS` + the build. The object is written to
+`<out>.watch-tmp` and renamed over `<out>` only when the build succeeded: a type error prints the
+error and keeps the old object, and a hot-reloading app (`specs/t27os/hot_reload.t27`) never maps a
+half-written one. `--then "<cmd>"` runs through `sh -c` once per successful build, never after a
+failed one; its exit code is printed and never stops the watch. The decisions are
+`specs/tri/t27b/watch_build.t27`, reusing `specs/verified/watch.t27` and `specs/t27f/hot.t27`.
 
 `t27b verilog` writes a Verilog module for the spec to stdout, and after it, under
 `` `ifdef T27B_TESTBENCH ``, a test bench that runs the spec's own tests against

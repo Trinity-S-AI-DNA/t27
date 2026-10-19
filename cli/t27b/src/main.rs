@@ -3,6 +3,7 @@
 //! ```text
 //! t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
 //! t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
+//! t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then "<cmd>"]
 //! t27b asm    <file.t27> [--overflow trap|wrap]
 //! t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
 //!                   [--json <path>] [--runner "<cmd> [args]"]
@@ -28,6 +29,7 @@ use t27b::timing::Phases;
 #[path = "../../../gen/rust/tri/t27b/check_budget.rs"]
 #[allow(dead_code, unused_parens)]
 mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
+#[path = "../../../gen/rust/tri/t27b/watch_build.rs"] #[allow(dead_code, unused_parens)] mod watch_build; // `t27b watch`: when to build, the temp path, when --then runs (#10859)
 use t27b::blockers::{self, Reference, Verdicts};
 use t27b::{a64, front, lower, macho};
 
@@ -66,6 +68,7 @@ macro_rules! errln {
 const USAGE: &str = "usage:
   t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
   t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
+  t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then \"<cmd>\"]
   t27b asm    <file.t27> [--overflow trap|wrap]
   t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
   t27b ts      <file.t27>   (consts, scalar fns and tests as TypeScript; specs/tri/t27b/ts_emit.t27)
@@ -92,7 +95,9 @@ const USAGE: &str = "usage:
                `mismatch` (= `jit_interp_mismatch`) is t27b's JIT against
                t27b's own interpreter, not against the reference.";
 
+#[derive(Clone)]
 struct Opts {
+    then: Option<String>,
     cmd: String,
     input: Option<String>,
     out: Option<String>,
@@ -125,6 +130,7 @@ fn parse_args() -> Result<Opts, String> {
     let cmd = args.next().ok_or("missing command")?;
     let mut o = Opts {
         cmd,
+        then: None,
         input: None,
         out: None,
         mode: OverflowMode::Trap,
@@ -152,6 +158,7 @@ fn parse_args() -> Result<Opts, String> {
                     _ => return Err("--overflow takes trap or wrap".into()),
                 }
             }
+            "--then" => o.then = Some(args.next().ok_or("--then needs a command")?),
             "--time" => o.time = true,
             "--quiet" | "-q" => o.quiet = true,
             "--check" => o.check = true,
@@ -226,6 +233,7 @@ fn main() -> ExitCode {
                 Err(code) => ExitCode::from(code),
             }
         }
+        "watch" => cmd_watch(&o),
         "corpus" => {
             let Some(dir) = o.input.clone() else {
                 return usage("missing directory");
@@ -499,6 +507,38 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         errln!("t27b code: __text {} bytes, object {} bytes", words * 4, obj.len());
     }
     ExitCode::SUCCESS
+}
+
+/// `t27b watch` (#10859): I/O only; when to build, the temp path and when --then runs are watch_build.t27.
+fn cmd_watch(o: &Opts) -> ExitCode {
+    let (Some(input), Some(out)) = (o.input.clone(), o.out.clone()) else { return usage("watch needs <file.t27> -o <out.o>") };
+    let (tmp, ms) = (format!("{}{}", out, watch_build::WATCH_TMP_SUFFIX), |t: Instant| t.elapsed().as_millis().min(u32::MAX as u128) as u32);
+    let stamp = |p: &PathBuf| std::fs::metadata(p).and_then(|m| Ok((m.modified()?, m.len()))).ok();
+    let (mut files, mut seen, mut first, mut last, mut opened) = (Vec::<PathBuf>::new(), Vec::new(), true, Instant::now(), None::<Instant>);
+    loop {
+        let now: Vec<_> = files.iter().map(stamp).collect();
+        if now != seen { (seen, last) = (now, Instant::now()); opened.get_or_insert(last); }
+        let (quiet, waited) = (ms(last), opened.map_or(0, ms));
+        if watch_build::watch_build_now(first, opened.is_some(), quiet, waited) {
+            (first, opened, files) = (false, None, use_closure(Path::new(&input)));
+            seen = files.iter().map(stamp).collect(); // stats before the build: a save during it is seen next look
+            let _ = std::fs::remove_file(&tmp);
+            let ok = compile_front(&input, o).map(|(prog, mut ph)| cmd_build(&prog, &mut ph, &Opts { out: Some(tmp.clone()), ..o.clone() })).is_ok() && Path::new(&tmp).exists();
+            if watch_build::watch_publish(ok) && std::fs::rename(&tmp, &out).is_ok() { errln!("t27b watch: built {} ({} files)", out, files.len()); }
+            if watch_build::watch_run_then(ok, o.then.is_some()) { errln!("t27b watch: then exited {:?}", Command::new("sh").arg("-c").arg(o.then.as_deref().unwrap_or("")).status().ok().and_then(|s| s.code())); }
+        }
+        std::thread::sleep(Duration::from_millis(watch_build::watch_sleep_ms(opened.is_some(), quiet, waited) as u64));
+    }
+}
+
+fn use_closure(input: &Path) -> Vec<PathBuf> { // the spec and every spec its `use` lines reach (t27c's resolver)
+    let root = input.ancestors().find(|a| a.ends_with("specs")).map(Path::to_path_buf).unwrap_or_default();
+    let (mut files, mut i) = (vec![input.to_path_buf()], 0);
+    while let Some(f) = files.get(i).cloned() {
+        for t in t27b::use_resolve::use_edges(&std::fs::read_to_string(f).unwrap_or_default(), &root) { if !files.contains(&t) { files.push(t) } }
+        i += 1;
+    }
+    files
 }
 
 fn cmd_asm(prog: &Program) -> ExitCode {
