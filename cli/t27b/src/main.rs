@@ -530,7 +530,6 @@ fn cmd_watch(o: &Opts) -> ExitCode {
         std::thread::sleep(Duration::from_millis(watch_build::watch_sleep_ms(opened.is_some(), quiet, waited) as u64));
     }
 }
-
 fn use_closure(input: &Path) -> Vec<PathBuf> { // the spec and every spec its `use` lines reach (t27c's resolver)
     let root = input.ancestors().find(|a| a.ends_with("specs")).map(Path::to_path_buf).unwrap_or_default();
     let (mut files, mut i) = (vec![input.to_path_buf()], 0);
