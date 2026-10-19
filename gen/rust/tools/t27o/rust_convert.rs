@@ -1169,14 +1169,11 @@ pub fn index_decls(src: &[u8], st: &mut [usize]) -> () {
         let e: usize = tok_end(src, q);
         if item_kw(src, q, e) {
             let mut n: usize = skip_ws(src, e);
+            if ((word_is(src, q, e, b"const") || word_is(src, q, e, b"static")) && tok_is(src, n, b"mut")) {
+                n = skip_ws(src, tok_end(src, n));
+            }
             if !(ix_add(src, st, IXK_ITEM, n, tok_end(src, n), q)) {
                 whole = false;
-            }
-            if ((word_is(src, q, e, b"const") || word_is(src, q, e, b"static")) && tok_is(src, n, b"mut")) {
-                let m: usize = skip_ws(src, tok_end(src, n));
-                if !(ix_add(src, st, IXK_ITEM, m, tok_end(src, m), q)) {
-                    whole = false;
-                }
             }
         } else {
             if word_is(src, q, e, b"fn") {
@@ -1363,7 +1360,10 @@ pub fn item_named(src: &[u8], q: usize, a: usize, b: usize) -> bool {
     if !(item_kw(src, q, e)) {
         return false;
     }
-    let n: usize = skip_ws(src, e);
+    let mut n: usize = skip_ws(src, e);
+    if ((word_is(src, q, e, b"const") || word_is(src, q, e, b"static")) && tok_is(src, n, b"mut")) {
+        n = skip_ws(src, tok_end(src, n));
+    }
     return same_text(src, n, tok_end(src, n), a, b);
 }
 
@@ -10908,6 +10908,7 @@ pub fn const_item(src: &[u8], st: &mut [usize], out: &mut [u8], start: usize, is
     step(src, st);
     if at(src, st[(P) as usize], b"mut") {
         refuse_here(src, st, R_ITEM);
+        step(src, st);
     }
     let na: usize = st[(P) as usize];
     let nb: usize = tok_end(src, na);
