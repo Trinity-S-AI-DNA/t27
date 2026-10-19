@@ -167,6 +167,7 @@ Traps from this tick (ffmpeg on the lab):
 - lavfi rejects `d=.900`. Print the duration as `$((m/1000)).$(printf %03d $((m%1000)))`.
 - `pkill -f` on the loop script leaves its child renders running. Find them with `ps -eo pid,args | grep '[s]h xf'` and kill them by pid.
 - Through `fs-lab.sh`, `pkill -f 'why_seal'` also matches the ssh command line that carries it and kills your own session; the output comes back empty. Bracket the first letter (`pkill -f '[w]hy_seal'`) so the pattern does not match itself. A killed session leaves the detached ratchets it started running, so several end up writing one log; list them with `ps -eo pid,etimes,args | grep '[c]orpus-only'` before you read a verdict.
+- **A new spec needs its own row in `docs/reports/t27b_expectations.json`**, or `t27b-native-ratchet` fails with UNLISTED. The issue gate still auto-merges the PR red: #10784 landed that way and left five unlisted specs for #10792 to carry. The lab is x86_64, and `t27b test` there ends with "the t27b JIT runs only on arm64". The front end still runs first: `t27b test <spec> --check` prints every blocker before that line. Run a blocked control next to your spec; `specs/t27f/frame_shard.t27` prints `unsupported construct ExprCall(rejected fn)`. If your spec reaches the JIT line with no blocker, and `t27c test-report` passes it, write a pass row. The PR's own arm64 run confirms or refutes the row. Keep the PR a draft until the row is in. Never guess "pass" without that check: a `[N]T` or `ExprCall` blocker turns a guessed row into a regression. Measured on glyph57, idea_factory and petal_menu (#10792).
 
 **Holding the address when the voice runs long (t27#10629).** If an overlay must stay on screen for a minimum time and must also stay off a crossfade, then the crossfade has to move; the overlay cannot. Work out in frames the latest cut that still leaves the last scene its minimum: cut 1 is capped at `BEAT_CUT1_LAST_MS` = 13249. Prove it is the latest with a one-ms-later control. Only the voices the reel speeds up are affected, so the `cmp` diff is limited to those voices and to crossfade 1's offset. The cost is real: the crossfade starts up to 184 ms under the task's last word, and lesson 1's measured voice (1300/4200/6800) is one of the affected voices. Write a test that bounds that overlap.
 
@@ -399,14 +400,22 @@ Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 t
 ## Application: idea factory, the OS particle design system (t27#10771)
 
 The owner wants one factory that unpacks any idea in any style preset, with every element made
-of particles, and runnable in the OS itself and on FPGA. Two specs do this:
+of particles, and runnable in the OS itself and on FPGA. Two specs do this. TRI CLAW's card for
+them is `specs/skills/t27-idea-factory.t27` (t27#10796). If you add a preset, also add it to the
+card's `PRESETS`; its lab check compares that list to `PRESET_NAMES` byte for byte.
 
 - **`specs/t27f/particle_ds.t27` is the design system.** A preset is a column in integer tables:
   `BG`, `COL_A/B/C`, `RADIUS`, `GAIN`, `SPRING`, `DAMP`, `LAW`, `FORCE`, `KICK`, `CARD`. The five
   are noir, neon, trit, paper and rain. **Add a preset by adding a column, never a branch in code.**
 - **`specs/t27f/idea_factory.t27` is the factory**, `(IDEA, PRESET) -> RGB24 frames`. It wraps
-  (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in the 3x5 font,
+  (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in glyph57's 5x7 font,
   assigns particles to glyph sub-slots and the card border, and closes on `CTA`.
+- **A batch of ideas: set `PRESET = PRESET_AUTO`** (255). `main` runs `pick_preset(IDEA, PRESET)`,
+  and AUTO means `preset_of(IDEA)` = FNV-1a 32 of the idea's bytes mod `PRESETS`. The same idea
+  always gets the same style, and different ideas spread across all five; A..Z hit every preset.
+  This is Remotion's `random(seed)` applied to style. Any other `PRESET` value is used as given
+  (gHashTag/t27#10803). Test hashes against the published FNV vectors (`""`, `a`, `b`, `foobar`),
+  never against a value the spec computes itself.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
@@ -441,6 +450,28 @@ particles never settled into letters.
   `ic`).
 - **Base the branch on master's tip before the PR.** If the base PR (R3) merged first, reset the branch onto
   `origin/master`. Untracked new specs survive the reset.
+
+### Russian text: UTF-8 and the 5x7 font (t27#10788)
+
+`specs/t27f/glyph57.t27` gives the factory Cyrillic. It decodes UTF-8 (`cp_len`, `cp_at`,
+`cp_count`), folds lower case to capitals, and stores a 5x7 font. The font holds ASCII 32..95
+and only the 21 Cyrillic capitals that have no Latin twin. The 11 look-alikes (A, Ve, Ie, Ka, Em,
+En, O, Er, Es, Te, Ha) and Yo reuse the Latin glyph through the 32-entry `CYR_MAP`.
+
+- **Write non-ASCII text as a `u8` array, never as `"\xNN"`.** L3 keeps sources ASCII. The t27c
+  lexer lowers only `\n`, `\t`, `\\` and `\"`, and keeps `\xD0` as four characters, so a
+  `\xNN` test fails with no error. Use `pub const RU_IDEA : [80]u8 = [208, 167, ...];` and pass
+  `RU_IDEA[0..80]` to a `[]const u8` parameter. `specs/tri/utils/terminal.t27` records the same
+  trap for `\x1b`.
+- **Count widths in characters, keep positions in bytes.** Wrapping compares `cp_count` with
+  `MAXC`. The line start and end stay byte offsets, and the layout loop steps by
+  `bi = bi + cp_len(t, bi)`. An ASCII idea's numbers do not change, so the old tests still pin
+  the old layout.
+- **Guard the font with a duplicate-bitmap test.** Every pair of stored glyphs must differ, and
+  every look-alike must light exactly its Latin twin's pixels.
+- **Render a Russian idea without touching the committed constant.** In the lab copy, `sed`
+  `reel_frames(IDEA)` and `reel_cell(IDEA,` to use `RU_IDEA[0..80]`, next to the `PRESET` and
+  module renames.
 
 ## Check the whole corpus for import cycles (t27#10693)
 

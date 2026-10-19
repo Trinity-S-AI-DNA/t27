@@ -30,7 +30,8 @@
 ;   /tmp/hslm/train.cfg             optional, key=value lines of integers: steps, total, warmup,
 ;                                   eval_every, ckpt_every, seed, speed, resume, synth, eval_windows,
 ;                                   loss_positions (1..27, default 27), gradcheck (1: print the
-;                                   gradient checks and exit)
+;                                   gradient checks and exit), profile (1: time the parts of every
+;                                   step and print them at the end; section 1 says how)
 ;   /tmp/hslm/ckpt_<step>.bin       MSLH: nn/hslm_data's header (magic 0x484C534D, version 1, step,
 ;                                   f32 loss = the last minibatch loss under the k-position
 ;                                   objective) and its layout, f32: output shadow (243 x 729,
@@ -57,9 +58,11 @@
 ; kernel that is not bit-identical; it only runs in backward). speed=2 (the default) also skips work
 ; whose result nobody reads: the head at positions 0..25 and, in the last block at those positions,
 ; everything but the key and value that the last position attends to. Under loss_positions = k only
-; positions 0..26-k are unscored, so k = 27 runs the full forward everywhere and skips nothing. The
-; tests check that speed 1 and speed 2 produce the same logits as speed 0 to the bit. The model is
-; not reduced.
+; positions 0..26-k are unscored, so k = 27 runs the full forward everywhere and skips nothing. speed=3 (#10849)
+; computes the speed 2 window layer by layer over all 27 positions, so each ternary matrix and each
+; gradient row is read once per window instead of once per position, with every sum in speed 2's
+; order. The tests check that speed 1, 2 and 3 produce the same logits as speed 0 to the bit, and that
+; speed 3 produces the same logits, loss and gradients as speed 2 to the bit. The model is not reduced.
 ; WHAT DIFFERS FROM THE ZIG TRAINER (trinity-training @ 3e9648c, run R5): f64, not f32; LAMB, not
 ; AdamW; one global clip, not per tensor; linear warmup + cosine to 1e-6, not the phi schedule; the
 ; embedding table and RMSNorm gains are trained (the trainer froze the table); the gradient is that of
@@ -273,16 +276,133 @@ var cfg_synth : u64 = 0;
 var cfg_eval_windows : u64 = DEFAULT_EVAL_WINDOWS;
 var cfg_loss_positions : u64 = DEFAULT_LOSS_POSITIONS;
 var cfg_gradcheck : u64 = 0;
+var cfg_profile : u64 = 0;
+
+; THE PROFILE (profile=1 or 2 in train.cfg; gHashTag/t27#10850). Where a training step's time goes,
+; read off the monotonic clock (1) or the thread's CPU clock (2) with interval attribution: every
+; mark charges the time since the previous mark to one part. The four local kernels mark their own
+; entry and exit, so a kernel's part holds
+; exactly its calls; the gap before a kernel goes to the region the call order puts there. Forward,
+; per position: Q K V O up down per block (calls 0..17), then the head (18); the gap before each O
+; matmul (calls 3, 9, 15) is the attention core with RoPE. Backward, per position: the head's
+; outer_add and t_add (calls 0, 1), then per block from the last: outer down, t_add down, outer up,
+; t_add up, outer O, t_add O, outer Q K V, t_add Q K V (12 calls); the gap before outer Q (local
+; call 6) is the attention core's backward with the inverse RoPE. Profile off costs one branch per
+; kernel call and changes no bit (a test runs one step both ways and compares the parameters).
+const PR_FWD_MM : usize = 0;
+const PR_ATT_FWD : usize = 1;
+const PR_FWD_OTHER : usize = 2;
+const PR_BWD_TADD : usize = 3;
+const PR_BWD_OUTER : usize = 4;
+const PR_ATT_BWD : usize = 5;
+const PR_BWD_OTHER : usize = 6;
+const PR_LOSS : usize = 7;
+const PR_ZERO : usize = 8;
+const PR_GATHER_CLIP : usize = 9;
+const PR_LAMB : usize = 10;
+const PR_REQUANT : usize = 11;
+const PR_STEP_OTHER : usize = 12;
+const PR_PARTS : usize = 13;
+const PR_FWD_CALLS : usize = 19;
+const PR_CALIBRATE : usize = 1000000;
+var prof_on : bool = false;
+var prof_ns : [PR_PARTS]u64 = undefined;
+var prof_calls : [PR_PARTS]u64 = undefined;
+var prof_last : u64 = 0;
+var prof_fcall : usize = 0;
+var prof_bcall : usize = 0;
+var prof_sink : u64 = 0;
+var prof_cpu : bool = false;
 
 ; ---------------------------------------------------------------------------------------------
 ; 1. Kernels. The four names below are nn/hslm.t27's; a local declaration wins over the spliced
 ; one, also inside the spliced forward and backward. speed 0 runs nn/hslm.t27's code unchanged.
 ; ---------------------------------------------------------------------------------------------
 
+/// The monotonic clock in ns (profile=1), or this thread's CPU time (profile=2)
+fn prof_now() -> u64 {
+    var ts: std.os.linux.timespec = undefined;
+    var rc : usize = 0;
+    if (prof_cpu) {
+        rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.THREAD_CPUTIME_ID, &ts);
+    } else {
+        rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    }
+    if (rc != 0) {
+        return prof_last;
+    }
+    return @as(u64, @intCast(ts.sec)) * 1000000000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn prof_reset() -> void {
+    var i : usize = 0;
+    while (i < PR_PARTS) {
+        prof_ns[i] = 0;
+        prof_calls[i] = 0;
+        i = i + 1;
+    }
+    prof_fcall = 0;
+    prof_bcall = 0;
+}
+
+/// Charge the time since the last mark to `part`
+fn prof_mark(part: usize) -> void {
+    const now : u64 = prof_now();
+    if (now >= prof_last) {
+        prof_ns[part] = prof_ns[part] + (now - prof_last);
+    }
+    prof_calls[part] = prof_calls[part] + 1;
+    prof_last = now;
+}
+
+/// The part that owns the gap before forward kernel call `c` of a position
+fn prof_fwd_gap_part(c: usize) -> usize {
+    if (c < 18 and c % 6 == 3) {
+        return PR_ATT_FWD;
+    }
+    return PR_FWD_OTHER;
+}
+
+/// The part that owns the gap before backward kernel call `c` of a position
+fn prof_bwd_gap_part(c: usize) -> usize {
+    if (c >= 2 and (c - 2) % 12 == 6) {
+        return PR_ATT_BWD;
+    }
+    return PR_BWD_OTHER;
+}
+
+fn prof_fwd_enter() -> void {
+    prof_mark(prof_fwd_gap_part(prof_fcall));
+}
+
+fn prof_fwd_leave() -> void {
+    prof_mark(PR_FWD_MM);
+    prof_fcall = prof_fcall + 1;
+}
+
+fn prof_bwd_enter() -> void {
+    prof_mark(prof_bwd_gap_part(prof_bcall));
+}
+
+fn prof_bwd_leave(part: usize) -> void {
+    prof_mark(part);
+    prof_bcall = prof_bcall + 1;
+}
+
 /// output[i] = sum_j input[j] * w[j * out_dim + i]. Speed 0: nn/hslm.t27's branchy dot per output.
 /// Otherwise: zero the output, then add x_j * trit row by row (an axpy the compiler vectorizes);
 /// per output the terms are added in the same order j = 0, 1, ..., so the result is the same bits.
 fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_fwd_enter();
+    }
+    tr_matmul_fast(input, weights, output, in_dim, out_dim);
+    if (prof_on) {
+        prof_fwd_leave();
+    }
+}
+
+fn tr_matmul_fast(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
     if (speed_level == 0) {
         tr_matmul_ref(input, weights, output, in_dim, out_dim);
         return;
@@ -331,6 +451,16 @@ fn tr_matmul_ref(input: []const f64, weights: []const Trit, output: []f64, in_di
 /// dx[j] += sum_i w[j * out_dim + i] * dy[i]. Speed 0: nn/hslm.t27's branchy sum. Otherwise four
 /// partial sums of trit * dy (the only kernel whose rounding differs from the reference).
 fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_bwd_enter();
+    }
+    tr_t_add_fast(dy, weights, dx, in_dim, out_dim);
+    if (prof_on) {
+        prof_bwd_leave(PR_BWD_TADD);
+    }
+}
+
+fn tr_t_add_fast(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize) -> void {
     var j : usize = 0;
     while (j < in_dim) {
         const row : usize = j * out_dim;
@@ -378,6 +508,16 @@ fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_di
 /// gw[j * out_dim + i] += x[j] * dy[i], with x[j] read once per row; above speed 0 a row whose
 /// x[j] is 0 (half the ReLU outputs) is skipped, which adds nothing either way
 fn outer_add(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_bwd_enter();
+    }
+    tr_outer_add_fast(x, dy, gw, in_dim, out_dim);
+    if (prof_on) {
+        prof_bwd_leave(PR_BWD_OUTER);
+    }
+}
+
+fn tr_outer_add_fast(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize) -> void {
     var j : usize = 0;
     while (j < in_dim) {
         const xj : f64 = x[j];
@@ -448,6 +588,11 @@ fn tr_prefix_forward(token: usize, position: usize) -> void {
 /// One 27-token window: every position in order (each attends to the cache of the earlier ones);
 /// the logits of the last position land in `logits`, its activations stay for hslm_backward
 fn tr_window_forward(tokens: []const u16, start: usize, logits: []f64) -> void {
+    if (speed_level == 3) {
+        tr3_forward(tokens, start, CONTEXT_LEN - 1, CONTEXT_LEN - 1);
+        hslm_forward(@as(usize, @intCast(tokens[start + CONTEXT_LEN - 1])), CONTEXT_LEN - 1, logits);
+        return;
+    }
     var p : usize = 0;
     while (p < CONTEXT_LEN) {
         const tok : usize = @intCast(tokens[start + p]);
@@ -488,13 +633,20 @@ fn tr_window_loss(tokens: []const u16, start: usize) -> f64 {
 /// Forward, loss and backward of one window under the k-position objective (1 <= k <= 27);
 /// gradients accumulate in nn/hslm's gw_* and g_*; returns the mean of the k losses
 fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
+    if (speed_level == 3) {
+        return tr3_window_grad(tokens, start, k);
+    }
     const inv_k : f64 = 1.0 / @as(f64, @floatFromInt(k));
     var sum : f64 = 0.0;
     var p : usize = 0;
     while (p < CONTEXT_LEN) {
         const tok : usize = @intCast(tokens[start + p]);
         if (p + k >= CONTEXT_LEN) {
+            prof_fcall = 0;
             hslm_forward(tok, p, &win_logits);
+            if (prof_on) {
+                prof_mark(PR_FWD_OTHER);
+            }
             const target : usize = @intCast(tokens[start + p + 1]);
             sum = sum + cross_entropy(&win_logits, target);
             cross_entropy_backward(&win_logits, target, &win_dl);
@@ -503,11 +655,24 @@ fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
                 win_dl[j] = win_dl[j] * inv_k;
                 j = j + 1;
             }
+            if (prof_on) {
+                prof_mark(PR_LOSS);
+            }
+            prof_bcall = 0;
             hslm_backward(&win_dl, &win_gin);
-        } else if (speed_level < 2) {
-            hslm_forward(tok, p, &win_logits);
+            if (prof_on) {
+                prof_mark(PR_BWD_OTHER);
+            }
         } else {
-            tr_prefix_forward(tok, p);
+            prof_fcall = 0;
+            if (speed_level < 2) {
+                hslm_forward(tok, p, &win_logits);
+            } else {
+                tr_prefix_forward(tok, p);
+            }
+            if (prof_on) {
+                prof_mark(PR_FWD_OTHER);
+            }
         }
         p = p + 1;
     }
@@ -518,6 +683,21 @@ fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
 /// cross-entropy of each of the last k against its next token, their mean
 fn tr_window_loss_k(tokens: []const u16, start: usize, k: usize) -> f64 {
     var sum : f64 = 0.0;
+    if (speed_level == 3) {
+        tr3_forward(tokens, start, CONTEXT_LEN, 0);
+        var q : usize = CONTEXT_LEN - k;
+        while (q < CONTEXT_LEN) {
+            const lo2 : usize = q * VOCAB_SIZE;
+            sum = sum + cross_entropy(b3_logits[lo2..lo2 + VOCAB_SIZE], @as(usize, @intCast(tokens[start + q + 1])));
+            q = q + 1;
+        }
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            ref_logits[j] = b3_logits[(CONTEXT_LEN - 1) * VOCAB_SIZE + j];
+            j = j + 1;
+        }
+        return sum * (1.0 / @as(f64, @floatFromInt(k)));
+    }
     var p : usize = 0;
     while (p < CONTEXT_LEN) {
         const tok : usize = @intCast(tokens[start + p]);
@@ -529,6 +709,617 @@ fn tr_window_loss_k(tokens: []const u16, start: usize, k: usize) -> f64 {
         p = p + 1;
     }
     return sum * (1.0 / @as(f64, @floatFromInt(k)));
+}
+
+; SPEED 3: ONE MATRIX OVER THE 27 POSITIONS (#10849). Speed 2 runs a window one position at a time,
+; so every position reads every ternary matrix again, and every scored position's backward streams
+; the whole 17 MB of f64 weight gradients through outer_add. Speed 3 runs the same window layer by
+; layer: the embedding, the norms, Q/K/V, O, the MLP and the head of all positions in one pass over
+; each matrix, then the backward of all scored positions the same way, so each gradient row stays
+; in L1 while every position adds to it. Nothing else moves: attention stays causal (position p
+; reads the keys and values of 0..p, which the pass over K and V has already put in the cache), the
+; VSA stream runs per block in position order, the last block at an unscored position still makes
+; only its key and value, and earlier keys and values stay constants of a position's backward (no
+; position's backward reads anything a later position's forward writes). Every output element is
+; summed in the order speed 2 sums it -- j = 0, 1, ... from +0.0 in the forward, the same four
+; partial sums in the transpose, positions in ascending order into every gradient -- so speed 3 is
+; speed 2 to the bit, and the tests compare the bits.
+; MEASURED (Railway lab, 2026-10-19, 48 cores under a load average of 59-66 from other sessions):
+; train.cfg loss_positions=27 steps=10 total=32000 seed=1729 eval_every=10 eval_windows=1, the
+; ReleaseFast binary of this spec, speed=2 and speed=3 started at the same moment, twice. Both runs
+; printed the same losses (first 6.6079, last 6.6012, valid 6.5947) and wrote byte-equal ckpt_10.bin
+; and ckpt_10.state. tok/s is 66 windows x 27 positions x 10 steps over train_s.
+const TR3_LAB_TOKENS : f64 = 17820.0;
+const TR3_LAB_S2_TRAIN_S : f64 = 55.09;
+const TR3_LAB_S3_TRAIN_S : f64 = 37.27;
+const TR3_LAB_S2_TOK_S : f64 = 323.5;
+const TR3_LAB_S3_TOK_S : f64 = 478.1;
+const TR3_LAB_S2_TRAIN_S_AGAIN : f64 = 55.62;
+const TR3_LAB_S3_TRAIN_S_AGAIN : f64 = 37.27;
+const TR3_LAB_SPEEDUP : f64 = 1.478;
+const TR3_TILE : usize = 81;
+var b3_tok : [CONTEXT_LEN]usize = undefined;
+var b3_x : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_n1 : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_rms1 : [NUM_BLOCKS * CONTEXT_LEN]f64 = undefined;
+var b3_q : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_attn : [NUM_BLOCKS * CONTEXT_LEN * NUM_HEADS * CONTEXT_LEN]f64 = undefined;
+var b3_ctx : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_r : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_pre : [NUM_BLOCKS * CONTEXT_LEN * FF_DIM]f64 = undefined;
+var b3_h : [NUM_BLOCKS * CONTEXT_LEN * FF_DIM]f64 = undefined;
+var b3_out : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_hn : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_hrms : [CONTEXT_LEN]f64 = undefined;
+var b3_logits : [CONTEXT_LEN * VOCAB_SIZE]f64 = undefined;
+var b3_y : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_wt : [VOCAB_SIZE]f64 = undefined;
+var b3_dl : [CONTEXT_LEN * VOCAB_SIZE]f64 = undefined;
+var b3_dz : [CONTEXT_LEN * VOCAB_SIZE]f64 = undefined;
+var b3_bo : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_br : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bctx : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bq : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bk : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bv : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bn : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_tmp : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_se : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var b3_bh : [CONTEXT_LEN * FF_DIM]f64 = undefined;
+var b3_bpre : [CONTEXT_LEN * FF_DIM]f64 = undefined;
+var b3_sf : [CONTEXT_LEN * FF_DIM]f64 = undefined;
+var b3_da : [CONTEXT_LEN]f64 = undefined;
+
+/// y[p] = x[p] W for rows p_lo..p_hi (x rows in_dim wide, y rows out_dim wide). Each weight row is
+/// read once for all rows; a column tile of TR3_TILE keeps that tile of every row in L1. Per output
+/// the terms are added in the order j = 0, 1, ... from +0.0, as ternary_matmul adds them.
+fn tr3_matmul(x: []const f64, weights: []const Trit, y: []f64, in_dim: usize, out_dim: usize, p_lo: usize, p_hi: usize) -> void {
+    if (p_lo >= p_hi) {
+        return;
+    }
+    var p : usize = p_lo;
+    while (p < p_hi) {
+        var c : usize = 0;
+        while (c < out_dim) {
+            y[p * out_dim + c] = 0.0;
+            c = c + 1;
+        }
+        p = p + 1;
+    }
+    var c0 : usize = 0;
+    while (c0 < out_dim) {
+        var c1 : usize = c0 + TR3_TILE;
+        if (c1 > out_dim) {
+            c1 = out_dim;
+        }
+        const width : usize = c1 - c0;
+        var j : usize = 0;
+        while (j < in_dim) {
+            const row : usize = j * out_dim + c0;
+            var c : usize = 0;
+            while (c < width) {
+                const wf : f64 = @floatFromInt(@intFromEnum(weights[row + c]));
+                b3_wt[c] = wf;
+                c = c + 1;
+            }
+            p = p_lo;
+            while (p < p_hi) {
+                const xj : f64 = x[p * in_dim + j];
+                if (xj != 0.0) {
+                    const yo : usize = p * out_dim + c0;
+                    c = 0;
+                    while (c < width) {
+                        y[yo + c] = y[yo + c] + xj * b3_wt[c];
+                        c = c + 1;
+                    }
+                }
+                p = p + 1;
+            }
+            j = j + 1;
+        }
+        c0 = c1;
+    }
+}
+
+/// dx[p] += W dy[p] for rows p_lo..p_hi: the weight row j is turned into floats once, then each row
+/// takes the four partial sums of ternary_matmul_t_add
+fn tr3_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize, p_lo: usize, p_hi: usize) -> void {
+    if (p_lo >= p_hi) {
+        return;
+    }
+    var j : usize = 0;
+    while (j < in_dim) {
+        const row : usize = j * out_dim;
+        var i : usize = 0;
+        while (i < out_dim) {
+            const wf : f64 = @floatFromInt(@intFromEnum(weights[row + i]));
+            b3_wt[i] = wf;
+            i = i + 1;
+        }
+        var p : usize = p_lo;
+        while (p < p_hi) {
+            const yo : usize = p * out_dim;
+            var a0 : f64 = 0.0;
+            var a1 : f64 = 0.0;
+            var a2 : f64 = 0.0;
+            var a3 : f64 = 0.0;
+            i = 0;
+            while (i + 4 <= out_dim) {
+                a0 = a0 + b3_wt[i] * dy[yo + i];
+                a1 = a1 + b3_wt[i + 1] * dy[yo + i + 1];
+                a2 = a2 + b3_wt[i + 2] * dy[yo + i + 2];
+                a3 = a3 + b3_wt[i + 3] * dy[yo + i + 3];
+                i = i + 4;
+            }
+            while (i < out_dim) {
+                a0 = a0 + b3_wt[i] * dy[yo + i];
+                i = i + 1;
+            }
+            dx[p * in_dim + j] = dx[p * in_dim + j] + ((a0 + a1) + (a2 + a3));
+            p = p + 1;
+        }
+        j = j + 1;
+    }
+}
+
+/// gw[j * out_dim + i] += x[p][j] * dy[p][i] over rows p_lo..p_hi in ascending order, the gradient
+/// row held while every row adds to it; a row whose x[p][j] is 0 is skipped, as outer_add skips it
+fn tr3_outer(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize, p_lo: usize, p_hi: usize) -> void {
+    if (p_lo >= p_hi) {
+        return;
+    }
+    var j : usize = 0;
+    while (j < in_dim) {
+        const row : usize = j * out_dim;
+        var p : usize = p_lo;
+        while (p < p_hi) {
+            const xj : f64 = x[p * in_dim + j];
+            if (xj != 0.0) {
+                const yo : usize = p * out_dim;
+                var i : usize = 0;
+                while (i < out_dim) {
+                    gw[row + i] = gw[row + i] + xj * dy[yo + i];
+                    i = i + 1;
+                }
+            }
+            p = p + 1;
+        }
+        j = j + 1;
+    }
+}
+
+/// Rows p_lo..p_hi of a buffer of `width`-wide rows set to 0
+fn tr3_zero(buf: []f64, width: usize, p_lo: usize, p_hi: usize) -> void {
+    var i : usize = p_lo * width;
+    while (i < p_hi * width) {
+        buf[i] = 0.0;
+        i = i + 1;
+    }
+}
+
+/// attention_forward's softmax and context for block b at position p, from the query of p and the
+/// cached keys and values of positions 0..p
+fn tr3_attend(b: usize, p: usize) -> void {
+    const qo : usize = (b * CONTEXT_LEN + p) * EMBED_DIM;
+    var head : usize = 0;
+    while (head < NUM_HEADS) {
+        const ho : usize = head * HEAD_DIM;
+        const ao : usize = ((b * CONTEXT_LEN + p) * NUM_HEADS + head) * CONTEXT_LEN;
+        var j : usize = 0;
+        while (j <= p) {
+            const kj : usize = (b * CONTEXT_LEN + j) * EMBED_DIM + ho;
+            var dot : f64 = 0.0;
+            var d : usize = 0;
+            while (d < HEAD_DIM) {
+                dot = dot + b3_q[qo + ho + d] * kv_k[kj + d];
+                d = d + 1;
+            }
+            b3_attn[ao + j] = dot * SACRED_ATTN_SCALE;
+            j = j + 1;
+        }
+        var max_score : f64 = b3_attn[ao];
+        j = 1;
+        while (j <= p) {
+            if (b3_attn[ao + j] > max_score) {
+                max_score = b3_attn[ao + j];
+            }
+            j = j + 1;
+        }
+        var sum : f64 = 0.0;
+        j = 0;
+        while (j <= p) {
+            b3_attn[ao + j] = exp(b3_attn[ao + j] - max_score);
+            sum = sum + b3_attn[ao + j];
+            j = j + 1;
+        }
+        j = 0;
+        while (j <= p) {
+            b3_attn[ao + j] = b3_attn[ao + j] / sum;
+            j = j + 1;
+        }
+        var c : usize = 0;
+        while (c < HEAD_DIM) {
+            var acc : f64 = 0.0;
+            var m : usize = 0;
+            while (m <= p) {
+                acc = acc + b3_attn[ao + m] * kv_v[(b * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
+                m = m + 1;
+            }
+            b3_ctx[qo + ho + c] = acc;
+            c = c + 1;
+        }
+        head = head + 1;
+    }
+}
+
+/// hslm_block_forward of block b at positions 0..npos-1 at once; positions below `lo` (the last
+/// block's unscored ones) make only their key and value, as tr_kv_only does
+fn tr3_block_forward(b: usize, npos: usize, lo: usize) -> void {
+    const bw = &model.blocks[b];
+    const eb : usize = b * CONTEXT_LEN * EMBED_DIM;
+    const fb : usize = b * CONTEXT_LEN * FF_DIM;
+    const span : usize = CONTEXT_LEN * EMBED_DIM;
+    const fspan : usize = CONTEXT_LEN * FF_DIM;
+    var p : usize = 0;
+    while (p < npos) {
+        const o : usize = eb + p * EMBED_DIM;
+        if (b > 0) {
+            var i : usize = 0;
+            while (i < EMBED_DIM) {
+                b3_x[o + i] = b3_out[o - span + i];
+                i = i + 1;
+            }
+        }
+        b3_rms1[b * CONTEXT_LEN + p] = rms_norm_into(b3_x[o..o + EMBED_DIM], &bw.norm1_gamma, b3_n1[o..o + EMBED_DIM]);
+        p = p + 1;
+    }
+    const ns = b3_n1[eb..eb + span];
+    tr3_matmul(ns, &bw.w_k, kv_k[eb..eb + span], EMBED_DIM, EMBED_DIM, 0, npos);
+    tr3_matmul(ns, &bw.w_v, kv_v[eb..eb + span], EMBED_DIM, EMBED_DIM, 0, npos);
+    tr3_matmul(ns, &bw.w_q, b3_q[eb..eb + span], EMBED_DIM, EMBED_DIM, lo, npos);
+    p = 0;
+    while (p < npos) {
+        const o : usize = eb + p * EMBED_DIM;
+        const n1 = b3_n1[o..o + EMBED_DIM];
+        const kk = kv_k[o..o + EMBED_DIM];
+        const vv = kv_v[o..o + EMBED_DIM];
+        nudge(MAT_K, b, n1, kk, EMBED_DIM);
+        scale_into(kk, bw.alpha_k, kk);
+        nudge(MAT_V, b, n1, vv, EMBED_DIM);
+        scale_into(vv, bw.alpha_v, vv);
+        rope(kk, p, false);
+        if (p >= lo) {
+            const qq = b3_q[o..o + EMBED_DIM];
+            nudge(MAT_Q, b, n1, qq, EMBED_DIM);
+            scale_into(qq, bw.alpha_q, qq);
+            rope(qq, p, false);
+        }
+        p = p + 1;
+    }
+    p = lo;
+    while (p < npos) {
+        tr3_attend(b, p);
+        p = p + 1;
+    }
+    tr3_matmul(b3_ctx[eb..eb + span], &bw.w_o, &b3_y, EMBED_DIM, EMBED_DIM, lo, npos);
+    p = lo;
+    while (p < npos) {
+        const o : usize = eb + p * EMBED_DIM;
+        const yo : usize = p * EMBED_DIM;
+        const yy = b3_y[yo..yo + EMBED_DIM];
+        nudge(MAT_O, b, b3_ctx[o..o + EMBED_DIM], yy, EMBED_DIM);
+        scale_into(yy, bw.alpha_o, yy);
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_r[o + i] = b3_x[o + i] + b3_y[yo + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_matmul(b3_r[eb..eb + span], &bw.w_up, b3_pre[fb..fb + fspan], EMBED_DIM, FF_DIM, lo, npos);
+    p = lo;
+    while (p < npos) {
+        const o : usize = eb + p * EMBED_DIM;
+        const f : usize = fb + p * FF_DIM;
+        nudge(MAT_UP, b, b3_r[o..o + EMBED_DIM], b3_pre[f..f + FF_DIM], FF_DIM);
+        var i : usize = 0;
+        while (i < FF_DIM) {
+            b3_pre[f + i] = bw.alpha_up * b3_pre[f + i] + bw.b_up[i];
+            b3_h[f + i] = relu(b3_pre[f + i]);
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_matmul(b3_h[fb..fb + fspan], &bw.w_down, &b3_y, FF_DIM, EMBED_DIM, lo, npos);
+    p = lo;
+    while (p < npos) {
+        const o : usize = eb + p * EMBED_DIM;
+        const f : usize = fb + p * FF_DIM;
+        const yo : usize = p * EMBED_DIM;
+        nudge(MAT_DOWN, b, b3_h[f..f + FF_DIM], b3_y[yo..yo + EMBED_DIM], EMBED_DIM);
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_y[yo + i] = bw.alpha_down * b3_y[yo + i] + bw.b_down[i];
+            b3_out[o + i] = b3_r[o + i] + b3_y[yo + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    if (vsa_on) {
+        p = lo;
+        while (p < npos) {
+            const o : usize = eb + p * EMBED_DIM;
+            vsa_block_forward(b, p, b3_out[o..o + EMBED_DIM]);
+            p = p + 1;
+        }
+    }
+}
+
+/// Positions 0..npos-1 of a window, layer by layer; the last block runs in full and the head runs
+/// at positions lo_full..npos-1, the logits of position p in row p of b3_logits
+fn tr3_forward(tokens: []const u16, start: usize, npos: usize, lo_full: usize) -> void {
+    var p : usize = 0;
+    while (p < npos) {
+        const tok : usize = @intCast(tokens[start + p]);
+        b3_tok[p] = tok;
+        embed_into(tok, p, b3_x[p * EMBED_DIM..(p + 1) * EMBED_DIM]);
+        if (vsa_on) {
+            vsa_embed(tok, p, vsa_in[p * VSA_DIM..(p + 1) * VSA_DIM]);
+        }
+        p = p + 1;
+    }
+    var b : usize = 0;
+    while (b < NUM_BLOCKS) {
+        var lo : usize = 0;
+        if (b + 1 == NUM_BLOCKS) {
+            lo = lo_full;
+        }
+        tr3_block_forward(b, npos, lo);
+        b = b + 1;
+    }
+    const lb : usize = (NUM_BLOCKS - 1) * CONTEXT_LEN * EMBED_DIM;
+    p = lo_full;
+    while (p < npos) {
+        const xo : usize = lb + p * EMBED_DIM;
+        const hrms : f64 = rms_of(b3_out[xo..xo + EMBED_DIM]);
+        b3_hrms[p] = hrms;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_hn[p * EMBED_DIM + i] = b3_out[xo + i] / hrms;
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_matmul(&b3_hn, &model.w_out, &b3_logits, EMBED_DIM, VOCAB_SIZE, lo_full, npos);
+    p = lo_full;
+    while (p < npos) {
+        const lo2 : usize = p * VOCAB_SIZE;
+        nudge(MAT_OUT, 0, b3_hn[p * EMBED_DIM..(p + 1) * EMBED_DIM], b3_logits[lo2..lo2 + VOCAB_SIZE], VOCAB_SIZE);
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            b3_logits[lo2 + j] = model.alpha_out * b3_logits[lo2 + j] * SACRED_LOGIT_SCALE + model.b_out[j];
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+}
+
+/// attention_backward's softmax part for block b at position p: from d context (b3_bctx row p) to
+/// the gradients of p's query, key and value, through RoPE and the alphas
+fn tr3_attend_backward(b: usize, p: usize) -> void {
+    const bw = &model.blocks[b];
+    const qo : usize = (b * CONTEXT_LEN + p) * EMBED_DIM;
+    const ro : usize = p * EMBED_DIM;
+    var head : usize = 0;
+    while (head < NUM_HEADS) {
+        const ho : usize = head * HEAD_DIM;
+        const ao : usize = ((b * CONTEXT_LEN + p) * NUM_HEADS + head) * CONTEXT_LEN;
+        var mean_da : f64 = 0.0;
+        var j : usize = 0;
+        while (j <= p) {
+            const vj : usize = (b * CONTEXT_LEN + j) * EMBED_DIM + ho;
+            var dot : f64 = 0.0;
+            var d : usize = 0;
+            while (d < HEAD_DIM) {
+                dot = dot + b3_bctx[ro + ho + d] * kv_v[vj + d];
+                d = d + 1;
+            }
+            b3_da[j] = dot;
+            mean_da = mean_da + b3_attn[ao + j] * dot;
+            j = j + 1;
+        }
+        j = 0;
+        while (j <= p) {
+            b3_da[j] = b3_attn[ao + j] * (b3_da[j] - mean_da);
+            j = j + 1;
+        }
+        var c : usize = 0;
+        while (c < HEAD_DIM) {
+            var acc : f64 = 0.0;
+            var m : usize = 0;
+            while (m <= p) {
+                acc = acc + b3_da[m] * kv_k[(b * CONTEXT_LEN + m) * EMBED_DIM + ho + c];
+                m = m + 1;
+            }
+            b3_bq[ro + ho + c] = SACRED_ATTN_SCALE * acc;
+            b3_bk[ro + ho + c] = SACRED_ATTN_SCALE * b3_da[p] * b3_q[qo + ho + c];
+            b3_bv[ro + ho + c] = b3_attn[ao + p] * b3_bctx[ro + ho + c];
+            c = c + 1;
+        }
+        head = head + 1;
+    }
+    const bq = b3_bq[ro..ro + EMBED_DIM];
+    const bk = b3_bk[ro..ro + EMBED_DIM];
+    const bv = b3_bv[ro..ro + EMBED_DIM];
+    rope(bq, p, true);
+    rope(bk, p, true);
+    scale_into(bq, bw.alpha_q, bq);
+    scale_into(bk, bw.alpha_k, bk);
+    scale_into(bv, bw.alpha_v, bv);
+}
+
+/// hslm_block_backward of block b at the scored positions lo..26 at once: b3_bo (d loss / d block
+/// output) in, b3_bo (d loss / d block input) out
+fn tr3_block_backward(b: usize, lo: usize) -> void {
+    const bw = &model.blocks[b];
+    const eo : usize = b * EMBED_DIM;
+    const fo : usize = b * FF_DIM;
+    const eb : usize = b * CONTEXT_LEN * EMBED_DIM;
+    const fb : usize = b * CONTEXT_LEN * FF_DIM;
+    const span : usize = CONTEXT_LEN * EMBED_DIM;
+    const fspan : usize = CONTEXT_LEN * FF_DIM;
+    const ge : usize = b * EMBED_DIM * EMBED_DIM;
+    const gf : usize = b * EMBED_DIM * FF_DIM;
+    const hi : usize = CONTEXT_LEN;
+    var p : usize = lo;
+    while (p < hi) {
+        const ro : usize = p * EMBED_DIM;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            g_b_down[eo + i] = g_b_down[eo + i] + b3_bo[ro + i];
+            b3_se[ro + i] = bw.alpha_down * b3_bo[ro + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_outer(b3_h[fb..fb + fspan], &b3_se, gw_down[gf..gf + FF_DIM * EMBED_DIM], FF_DIM, EMBED_DIM, lo, hi);
+    tr3_zero(&b3_bh, FF_DIM, lo, hi);
+    tr3_t_add(&b3_se, &bw.w_down, &b3_bh, FF_DIM, EMBED_DIM, lo, hi);
+    p = lo;
+    while (p < hi) {
+        const rf : usize = p * FF_DIM;
+        var i : usize = 0;
+        while (i < FF_DIM) {
+            b3_bpre[rf + i] = relu_derivative(b3_pre[fb + rf + i]) * b3_bh[rf + i];
+            g_b_up[fo + i] = g_b_up[fo + i] + b3_bpre[rf + i];
+            b3_sf[rf + i] = bw.alpha_up * b3_bpre[rf + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_outer(b3_r[eb..eb + span], &b3_sf, gw_up[gf..gf + EMBED_DIM * FF_DIM], EMBED_DIM, FF_DIM, lo, hi);
+    p = lo;
+    while (p < hi) {
+        const ro : usize = p * EMBED_DIM;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_br[ro + i] = b3_bo[ro + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_t_add(&b3_sf, &bw.w_up, &b3_br, EMBED_DIM, FF_DIM, lo, hi);
+    p = lo;
+    while (p < hi) {
+        const ro : usize = p * EMBED_DIM;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_se[ro + i] = bw.alpha_o * b3_br[ro + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    tr3_outer(b3_ctx[eb..eb + span], &b3_se, gw_o[ge..ge + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_zero(&b3_bctx, EMBED_DIM, lo, hi);
+    tr3_t_add(&b3_se, &bw.w_o, &b3_bctx, EMBED_DIM, EMBED_DIM, lo, hi);
+    p = lo;
+    while (p < hi) {
+        tr3_attend_backward(b, p);
+        p = p + 1;
+    }
+    const ns = b3_n1[eb..eb + span];
+    tr3_outer(ns, &b3_bq, gw_q[ge..ge + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_outer(ns, &b3_bk, gw_k[ge..ge + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_outer(ns, &b3_bv, gw_v[ge..ge + EMBED_DIM * EMBED_DIM], EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_zero(&b3_bn, EMBED_DIM, lo, hi);
+    tr3_t_add(&b3_bq, &bw.w_q, &b3_bn, EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_t_add(&b3_bk, &bw.w_k, &b3_bn, EMBED_DIM, EMBED_DIM, lo, hi);
+    tr3_t_add(&b3_bv, &bw.w_v, &b3_bn, EMBED_DIM, EMBED_DIM, lo, hi);
+    p = lo;
+    while (p < hi) {
+        const ro : usize = p * EMBED_DIM;
+        const o : usize = eb + ro;
+        rms_norm_backward(b3_x[o..o + EMBED_DIM], &bw.norm1_gamma, b3_rms1[b * CONTEXT_LEN + p], b3_bn[ro..ro + EMBED_DIM], b3_tmp[ro..ro + EMBED_DIM], g_gamma1[eo..eo + EMBED_DIM]);
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            b3_bo[ro + i] = b3_br[ro + i] + b3_tmp[ro + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+}
+
+/// tr_window_grad_k at speed 3: the forward of the whole window, then the cross-entropy of each
+/// scored position in order, then one backward over all of them; the last position's logits,
+/// d loss / d logits and input gradient land where speed 2 leaves them
+fn tr3_window_grad(tokens: []const u16, start: usize, k: usize) -> f64 {
+    const inv_k : f64 = 1.0 / @as(f64, @floatFromInt(k));
+    const lo : usize = CONTEXT_LEN - k;
+    tr3_forward(tokens, start, CONTEXT_LEN, lo);
+    var sum : f64 = 0.0;
+    var p : usize = lo;
+    while (p < CONTEXT_LEN) {
+        const target : usize = @intCast(tokens[start + p + 1]);
+        const lo2 : usize = p * VOCAB_SIZE;
+        sum = sum + cross_entropy(b3_logits[lo2..lo2 + VOCAB_SIZE], target);
+        cross_entropy_backward(b3_logits[lo2..lo2 + VOCAB_SIZE], target, b3_dl[lo2..lo2 + VOCAB_SIZE]);
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            b3_dl[lo2 + j] = b3_dl[lo2 + j] * inv_k;
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    p = lo;
+    while (p < CONTEXT_LEN) {
+        const lo2 : usize = p * VOCAB_SIZE;
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            g_b_out[j] = g_b_out[j] + b3_dl[lo2 + j];
+            b3_dz[lo2 + j] = model.alpha_out * SACRED_LOGIT_SCALE * b3_dl[lo2 + j];
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    tr3_outer(&b3_hn, &b3_dz, &gw_out, EMBED_DIM, VOCAB_SIZE, lo, CONTEXT_LEN);
+    tr3_zero(&b3_bn, EMBED_DIM, lo, CONTEXT_LEN);
+    tr3_t_add(&b3_dz, &model.w_out, &b3_bn, EMBED_DIM, VOCAB_SIZE, lo, CONTEXT_LEN);
+    const lb : usize = (NUM_BLOCKS - 1) * CONTEXT_LEN * EMBED_DIM;
+    p = lo;
+    while (p < CONTEXT_LEN) {
+        const ro : usize = p * EMBED_DIM;
+        rms_norm_plain_backward(b3_out[lb + ro..lb + ro + EMBED_DIM], b3_hrms[p], b3_bn[ro..ro + EMBED_DIM], b3_bo[ro..ro + EMBED_DIM]);
+        p = p + 1;
+    }
+    var b : usize = NUM_BLOCKS;
+    while (b > 0) {
+        b = b - 1;
+        tr3_block_backward(b, lo);
+    }
+    p = lo;
+    while (p < CONTEXT_LEN) {
+        const ro : usize = p * EMBED_DIM;
+        const eo : usize = b3_tok[p] * EMBED_DIM;
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            g_embed[eo + i] = g_embed[eo + i] + b3_bo[ro + i];
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+    const last : usize = CONTEXT_LEN - 1;
+    var i : usize = 0;
+    while (i < EMBED_DIM) {
+        win_gin[i] = b3_bo[last * EMBED_DIM + i];
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < VOCAB_SIZE) {
+        win_logits[j] = b3_logits[last * VOCAB_SIZE + j];
+        win_dl[j] = b3_dl[last * VOCAB_SIZE + j];
+        j = j + 1;
+    }
+    return sum * inv_k;
 }
 
 ; ---------------------------------------------------------------------------------------------
@@ -917,7 +1708,13 @@ fn tr_train_step(t: u64, batch: usize, lr_fixed: f64, fixed: bool) -> f64 {
 /// tr_train_step under the k-position objective: the same windows, averaging, clip, LAMB and
 /// requantize; each window's loss and gradient come from tr_window_grad_k
 fn tr_train_step_k(t: u64, batch: usize, lr_fixed: f64, fixed: bool, k: usize) -> f64 {
+    if (prof_on) {
+        prof_mark(PR_STEP_OTHER);
+    }
     zero_weight_gradients();
+    if (prof_on) {
+        prof_mark(PR_ZERO);
+    }
     var loss_sum : f64 = 0.0;
     var wi : usize = 0;
     while (wi < batch) {
@@ -930,16 +1727,28 @@ fn tr_train_step_k(t: u64, batch: usize, lr_fixed: f64, fixed: bool, k: usize) -
         loss_sum = loss_sum + tr_window_grad_k(train_tok[0..ntrain], start, k);
         wi = wi + 1;
     }
+    if (prof_on) {
+        prof_mark(PR_STEP_OTHER);
+    }
     const inv : f64 = 1.0 / @as(f64, @floatFromInt(batch));
     tr_gather(inv);
     last_gnorm = tr_clip_global(g_val[0..NPARAM], CLIP_NORM);
+    if (prof_on) {
+        prof_mark(PR_GATHER_CLIP);
+    }
     var lr : f64 = lr_fixed;
     if (lr <= 0.0) {
         lr = tr_lr_at(t, cfg_warmup, cfg_total);
     }
     last_lr = lr;
     tr_lamb(lr);
+    if (prof_on) {
+        prof_mark(PR_LAMB);
+    }
     tr_scatter_all();
+    if (prof_on) {
+        prof_mark(PR_REQUANT);
+    }
     last_loss = loss_sum * inv;
     return last_loss;
 }
@@ -1225,6 +2034,8 @@ fn tr_cfg_set(off: usize, len: usize, value: u64) -> void {
         }
     } else if (tr_key_is(off, len, "gradcheck")) {
         cfg_gradcheck = value;
+    } else if (tr_key_is(off, len, "profile")) {
+        cfg_profile = value;
     }
 }
 
@@ -1767,7 +2578,7 @@ fn tr_eval_line(step: u64, have_train: bool, avg_loss: f64, valid: f64, valid_fu
 fn tr_main() -> i32 {
     const t_begin : f64 = tr_now();
     tr_read_cfg();
-    speed_level = @intCast(cfg_speed % 3);
+    speed_level = @intCast(cfg_speed % 4);
     if (cfg_gradcheck > 0) {
         return tr_gradcheck();
     }
@@ -1828,9 +2639,16 @@ fn tr_main() -> i32 {
     var run_steps : u64 = 0;
     var first_loss : f64 = 0.0;
     var rc : i32 = RC_OK;
+    prof_reset();
+    prof_cpu = cfg_profile == 2;
     while (rc == RC_OK and step < cfg_steps) {
         const t0 : f64 = tr_now();
+        if (cfg_profile != 0) {
+            prof_on = true;
+            prof_last = prof_now();
+        }
         const loss : f64 = tr_train_step_k(step, BATCH, 0.0, false, k_obj);
+        prof_on = false;
         const t1 : f64 = tr_now();
         step = step + 1;
         train_secs = train_secs + (t1 - t0);
@@ -1896,7 +2714,115 @@ fn tr_main() -> i32 {
     ln_str(" rc ");
     ln_u64(@intCast(rc));
     ln_flush();
+    if (cfg_profile != 0) {
+        tr_profile_lines(run_steps);
+    }
     return rc;
+}
+
+fn prof_name(part: usize) -> []const u8 {
+    if (part == PR_FWD_MM) {
+        return "fwd_matmul";
+    } else if (part == PR_ATT_FWD) {
+        return "attn_fwd_core";
+    } else if (part == PR_FWD_OTHER) {
+        return "fwd_other";
+    } else if (part == PR_BWD_TADD) {
+        return "bwd_matmul_t";
+    } else if (part == PR_BWD_OUTER) {
+        return "bwd_outer";
+    } else if (part == PR_ATT_BWD) {
+        return "attn_bwd_core";
+    } else if (part == PR_BWD_OTHER) {
+        return "bwd_other";
+    } else if (part == PR_LOSS) {
+        return "loss";
+    } else if (part == PR_ZERO) {
+        return "zero_grad";
+    } else if (part == PR_GATHER_CLIP) {
+        return "gather_clip";
+    } else if (part == PR_LAMB) {
+        return "lamb";
+    } else if (part == PR_REQUANT) {
+        return "requantize";
+    }
+    return "step_other";
+}
+
+/// The profile: per part the raw ns and the number of marks charged to it, then the cost of
+/// one clock read, measured over PR_CALIBRATE back-to-back reads (in ps)
+fn tr_profile_lines(steps: u64) -> void {
+    var total : u64 = 0;
+    var reads : u64 = 0;
+    var part : usize = 0;
+    while (part < PR_PARTS) {
+        ln_reset();
+        ln_str("profile part ");
+        ln_str(prof_name(part));
+        ln_str(" ns ");
+        ln_u64(prof_ns[part]);
+        ln_str(" marks ");
+        ln_u64(prof_calls[part]);
+        ln_flush();
+        total = total + prof_ns[part];
+        reads = reads + prof_calls[part];
+        part = part + 1;
+    }
+    const c0 : u64 = prof_now();
+    var i : usize = 0;
+    while (i < PR_CALIBRATE) {
+        prof_sink = prof_now();
+        i = i + 1;
+    }
+    const c1 : u64 = prof_now();
+    ln_reset();
+    ln_str("profile steps ");
+    ln_u64(steps);
+    ln_str(" total_ns ");
+    ln_u64(total);
+    ln_str(" marks ");
+    ln_u64(reads);
+    ln_str(" ps_per_read ");
+    ln_u64((c1 - c0) * 1000 / @as(u64, PR_CALIBRATE));
+    ln_flush();
+}
+
+/// One fixed k = 27 step on the tiny slice with the profile on or off; a digest of every parameter
+/// bit afterwards (the profile must not move a bit)
+fn tr_prof_step_digest(on: bool) -> u64 {
+    speed_level = 2;
+    tr_tiny_setup(11);
+    fixed_starts[0] = 300;
+    fixed_starts[1] = 1700;
+    prof_reset();
+    prof_on = on;
+    prof_last = prof_now();
+    const seen : f64 = tr_train_step_k(0, 2, 0.01, true, CONTEXT_LEN);
+    prof_on = false;
+    var h : u64 = 1469598103;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        h = (h * 31 + (@as(u64, @bitCast(p_val[i])) % 4294967291)) % 4294967291;
+        i = i + 1;
+    }
+    if (seen != seen) {
+        return 0;
+    }
+    return h;
+}
+
+/// The digest of a step with the profile off, then with it on
+fn tr_prof_digest_off() -> u64 {
+    return tr_prof_step_digest(false);
+}
+
+fn tr_prof_digest_on() -> u64 {
+    return tr_prof_step_digest(true);
+}
+
+/// After tr_prof_digest_on: the marks charged to `part` (2 windows x 27 positions)
+fn tr_prof_marks(part: usize) -> u64 {
+    return prof_calls[part];
 }
 
 /// The program `t27c compile --backend ml` builds: train, evaluate, checkpoint; any checkpoint
@@ -2062,6 +2988,134 @@ fn tr_speed_grad_reldiff() -> f64 {
         return 1.0;
     }
     return sqrt(num / den);
+}
+
+var s3_grad : [NPARAM]f64 = undefined;
+var s3_gin : [EMBED_DIM]f64 = undefined;
+
+/// 1 if the two floats differ in any bit, else 0
+fn tr_bits_differ(a: f64, b: f64) -> usize {
+    const x : u64 = @bitCast(a);
+    const y : u64 = @bitCast(b);
+    if (x != y) {
+        return 1;
+    }
+    return 0;
+}
+
+/// The logits of all 27 positions of one window, at speed 2 (hslm_forward at each position) and
+/// at speed 3 (one tr3_forward with the head at every position): the number of logits whose bits
+/// differ
+fn tr_speed3_logit_bitdiff() -> usize {
+    tr_tiny_setup(5);
+    speed_level = 3;
+    tr3_forward(train_tok[0..ntrain], 700, CONTEXT_LEN, 0);
+    speed_level = 2;
+    var diff : usize = 0;
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        hslm_forward(@as(usize, @intCast(train_tok[700 + p])), p, &ref_logits);
+        var j : usize = 0;
+        while (j < VOCAB_SIZE) {
+            diff = diff + tr_bits_differ(ref_logits[j], b3_logits[p * VOCAB_SIZE + j]);
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    return diff;
+}
+
+/// One window of the k-position objective at speed 2 and at speed 3 from the same model: the
+/// number of values whose bits differ among every gradient (all NPARAM of them, gathered unscaled),
+/// the input gradient, the last position's logits and the loss
+fn tr_speed3_grad_bitdiff(k: usize) -> usize {
+    tr_tiny_setup(5);
+    speed_level = 2;
+    zero_weight_gradients();
+    const l2 : f64 = tr_window_grad_k(train_tok[0..ntrain], 700, k);
+    tr_gather(1.0);
+    var i : usize = 0;
+    while (i < NPARAM) {
+        s3_grad[i] = g_val[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < EMBED_DIM) {
+        s3_gin[i] = win_gin[i];
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < VOCAB_SIZE) {
+        ref_logits[j] = win_logits[j];
+        j = j + 1;
+    }
+    speed_level = 3;
+    zero_weight_gradients();
+    const l3 : f64 = tr_window_grad_k(train_tok[0..ntrain], 700, k);
+    tr_gather(1.0);
+    speed_level = 2;
+    var diff : usize = tr_bits_differ(l2, l3);
+    i = 0;
+    while (i < NPARAM) {
+        diff = diff + tr_bits_differ(s3_grad[i], g_val[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < EMBED_DIM) {
+        diff = diff + tr_bits_differ(s3_gin[i], win_gin[i]);
+        i = i + 1;
+    }
+    j = 0;
+    while (j < VOCAB_SIZE) {
+        diff = diff + tr_bits_differ(ref_logits[j], win_logits[j]);
+        j = j + 1;
+    }
+    return diff;
+}
+
+/// How many gradient values the speed 2 window of tr_speed3_grad_bitdiff left nonzero (the
+/// comparison is not one of zeros)
+fn tr_speed3_nonzero() -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        if (s3_grad[i] != 0.0) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The forward-only k-position loss of one window at speed 2 and at speed 3: 1 if the bits differ
+fn tr_speed3_loss_bitdiff(k: usize) -> usize {
+    tr_tiny_setup(5);
+    speed_level = 2;
+    const l2 : f64 = tr_window_loss_k(train_tok[0..ntrain], 900, k);
+    speed_level = 3;
+    const l3 : f64 = tr_window_loss_k(train_tok[0..ntrain], 900, k);
+    speed_level = 2;
+    return tr_bits_differ(l2, l3);
+}
+
+/// The largest gap between a recorded speed 2 / speed 3 tok/s and the one its train_s gives
+fn tr_speed3_toks_gap() -> f64 {
+    const a : f64 = abs(TR3_LAB_TOKENS / TR3_LAB_S2_TRAIN_S - TR3_LAB_S2_TOK_S);
+    const b : f64 = abs(TR3_LAB_TOKENS / TR3_LAB_S3_TRAIN_S - TR3_LAB_S3_TOK_S);
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+/// |recorded speed-up - the ratio of the recorded tok/s|
+fn tr_speed3_ratio_gap() -> f64 {
+    return abs(TR3_LAB_S3_TOK_S / TR3_LAB_S2_TOK_S - TR3_LAB_SPEEDUP);
+}
+
+/// The speed-up of the second pair of runs, from its train_s
+fn tr_speed3_speedup_again() -> f64 {
+    return TR3_LAB_S2_TRAIN_S_AGAIN / TR3_LAB_S3_TRAIN_S_AGAIN;
 }
 
 /// Bytes that differ between an MSLH image and the image packed again from its own decoded floats
@@ -2596,6 +3650,40 @@ test speed_two_input_gradient_matches_the_reference
     given rel = tr_speed_grad_reldiff()
     then  rel < 1e-12
 
+test speed_three_gives_the_reference_logits_to_the_bit
+    given diff = tr_speed_logit_diff(3)
+    then  diff == 0.0
+
+test speed_three_gives_the_logits_of_every_position_of_speed_two_to_the_bit
+    given diff = tr_speed3_logit_bitdiff()
+    then  diff == 0
+
+test speed_three_gives_every_gradient_of_speed_two_to_the_bit_at_k_27
+    given diff = tr_speed3_grad_bitdiff(27)
+    and   nonzero = tr_speed3_nonzero()
+    then  diff == 0
+    and   nonzero > 1000000
+
+test speed_three_gives_every_gradient_of_speed_two_to_the_bit_at_k_1
+    given diff = tr_speed3_grad_bitdiff(1)
+    and   nonzero = tr_speed3_nonzero()
+    then  diff == 0
+    and   nonzero > 100000
+
+test speed_three_gives_the_k_position_loss_of_speed_two_to_the_bit
+    given d27 = tr_speed3_loss_bitdiff(27)
+    and   d1 = tr_speed3_loss_bitdiff(1)
+    then  d27 == 0
+    and   d1 == 0
+
+test speed_three_lab_tok_s_and_its_speed_up_follow_from_the_measured_times
+    given toks = tr_speed3_toks_gap()
+    and   ratio = tr_speed3_ratio_gap()
+    and   again = tr_speed3_speedup_again()
+    then  toks < 0.05
+    and   ratio < 0.0005
+    and   again > 1.4
+
 test a_few_steps_on_a_tiny_fixed_slice_lower_the_loss
     given after = tr_tiny_after()
     and   before = tr_tiny_before()
@@ -2675,3 +3763,43 @@ test the_27_position_gradient_of_deep_parameters_matches_stop_gradient_differenc
     and   mag_u > 1e-7
     and   rel_e < 1e-4
     and   mag_e > 1e-7
+
+test the_profile_charges_attention_to_the_gap_before_the_o_matmul
+    given f3 = prof_fwd_gap_part(3)
+    and   f9 = prof_fwd_gap_part(9)
+    and   f15 = prof_fwd_gap_part(15)
+    and   f2 = prof_fwd_gap_part(2)
+    and   f18 = prof_fwd_gap_part(18)
+    and   b8 = prof_bwd_gap_part(8)
+    and   b20 = prof_bwd_gap_part(20)
+    and   b32 = prof_bwd_gap_part(32)
+    and   b7 = prof_bwd_gap_part(7)
+    and   b0 = prof_bwd_gap_part(0)
+    then  f3 == PR_ATT_FWD
+    and   f9 == PR_ATT_FWD
+    and   f15 == PR_ATT_FWD
+    and   f2 == PR_FWD_OTHER
+    and   f18 == PR_FWD_OTHER
+    and   b8 == PR_ATT_BWD
+    and   b20 == PR_ATT_BWD
+    and   b32 == PR_ATT_BWD
+    and   b7 == PR_BWD_OTHER
+    and   b0 == PR_BWD_OTHER
+
+test the_profile_moves_no_bit_and_sees_the_call_order
+    given off = tr_prof_digest_off()
+    and   on = tr_prof_digest_on()
+    and   mm = tr_prof_marks(PR_FWD_MM)
+    and   ta = tr_prof_marks(PR_BWD_TADD)
+    and   ou = tr_prof_marks(PR_BWD_OUTER)
+    and   af = tr_prof_marks(PR_ATT_FWD)
+    and   ab = tr_prof_marks(PR_ATT_BWD)
+    and   la = tr_prof_marks(PR_LAMB)
+    then  off == on
+    and   off != 0
+    and   mm == 1026
+    and   ta == 1026
+    and   ou == 1026
+    and   af == 162
+    and   ab == 162
+    and   la == 1
