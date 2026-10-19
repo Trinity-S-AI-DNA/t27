@@ -52,6 +52,8 @@ mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri ac
 mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
 #[path = "../../../gen/rust/tri/remote/remote_job.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
+#[path = "../../../gen/rust/tri/land/land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -449,6 +451,8 @@ enum Commands {
     },
     /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
+    /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
+    Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
 }
 
 #[derive(Subcommand)]
@@ -1368,6 +1372,7 @@ fn main() -> Result<()> {
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
+        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
     }
 
     Ok(())
@@ -1489,4 +1494,36 @@ fn cmd_serve(addr: &str) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
+fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result<u8> {
+    let leak = |s: String| -> &'static str { s.leak() };
+    let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan };
+    let (mut ev, mut buf, mut code, mut at) = ("", vec![0u8; land::CMD_MAX], land::request_refusal(r), (0u8, 0u64));
+    let argv = |b: &[u8]| -> Vec<String> { String::from_utf8_lossy(b).lines().map(str::to_string).collect() };
+    if plan && code == land::L_OK { for k in 0..land::LAND_STEPS { let n = land::step_argv(r, "", k, 0, &mut buf); println!("{k:2} {:<17} {}", land::step_name(k), argv(&buf[..n]).join(" ")); } return Ok(0); }
+    while code == land::L_OK {
+        let s = land::next_slot(r, ev);
+        if s >= land::DONE { code = if check { land::L_CHECKED } else { land::L_LANDED }; break; }
+        at = ((s / land::SLOT) as u8, s % land::SLOT);
+        let n = land::step_argv(r, ev, at.0, at.1, &mut buf);
+        anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
+        let a = argv(&buf[..n]);
+        let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
+        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::in_scratch(at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
+        let text = leak(text);
+        let mut sec = vec![0u8; text.len() + 128];
+        let m = land::emit_section(&mut sec, 0, at.0, at.1, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..m])));
+        if at.0 == land::L_CHANGES { r.changes = text; }
+        code = land::judge(r, ev, at.0, at.1);
+        println!("{:<17} exit {x}", land::step_name(at.0));
+    }
+    let m = land::step_argv(r, ev, land::L_CLEAN, 0, &mut buf);
+    if m > 0 { let a = argv(&buf[..m]); let _ = Command::new(&a[0]).args(&a[1..]).output(); }
+    let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
+    println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
+    Ok(land::exit_code(code))
 }
