@@ -30,8 +30,10 @@ against `specs/fpga/`), or a `gen_*` port of code generated from a `specs/tri/`
 spec (`LockFreeStack`, `RTree`, `Point`).
 Three more arrived with the 2026-10-19 CR-CHAT-03 wave-3 batch and the sar_adc
 merge (`Range`, `TreeNode`, `UpdatePathRecord`) and were read the same day:
-3 DISTINCT. Two of the three are module-scoped facts of the trios-chat crate
-carried into the port by keeping the original Rust modules' own struct names.
+3 DISTINCT. `Range` has since been repaired on master by sar_adc's rename to
+`ErrRange` (#10892) and its row dropped. The other two are module-scoped
+facts of the trios-chat crate carried into the port by keeping the original
+Rust modules' own struct names.
 
     DRIFT     51
     DISTINCT  36
@@ -141,7 +143,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 50 names
+## DISTINCT -- 49 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -177,7 +179,6 @@ whether to rename.
 | `Point` | 2 | 2 files | None. The basics lesson's Point is quoted by its course page; TriBezier's could become BezierP... |
 | `Promise` | 2 | 2 files | None urgent. Note the report's field list for the async site is wrong — see the pattern note ... |
 | `ProofStep` | 3 | 3 files | Rename the math one to DerivationStep (and share the single copy between phi_split_optimality... |
-| `Range` | 2 | 2 files | Rename sar_adc's to MeasRange, or accept the collision: lsp-schema's Range is the LSP protocol's own name and sar_adc's mirrors its Rust source; nothing outside each file depends on the bare name. |
 | `QueryResult` | 3 | 3 files | Rename per subsystem (DatalogAnswer / NotebookAnswer / SimilarityHit); no shared meaning to p... |
 | `Response` | 3 | 3 files | Rename to JsonRpcResponse / CompletionResponse / MdnsResponse; three protocols in one binary ... |
 | `Result` | 2 | 2 files | Rename git's to GitCommandOutput, and decide whether Result<T,E> is a builtin — if it is, com... |
