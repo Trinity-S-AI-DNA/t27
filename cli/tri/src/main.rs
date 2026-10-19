@@ -26,7 +26,6 @@ mod jumps;
 mod kinddrift;
 mod leanreach;
 mod leanvac;
-mod learn;
 mod ledgers;
 mod loopclaim;
 mod misread;
@@ -455,7 +454,7 @@ enum Commands {
     /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
     /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
-    Learn { #[command(subcommand)] action: learn::LearnCmd },
+    Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
 }
 
 #[derive(Subcommand)]
@@ -1376,7 +1375,7 @@ fn main() -> Result<()> {
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
-        Commands::Learn { action } => learn::run(action)?,
+        Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
 
     Ok(())
