@@ -83,7 +83,7 @@ Each row was run on the binaries named above; "X1" is the module of section 4, "
 | slice parameter `[]T`, `[]const T`, `.len` | works | `&[T]`, `&mut [T]`; `.len` is left unconverted when the module declares a struct field named `len` (D1) | `T*` and the length is gone; `x.len` is invalid C (D4) | length unbound |
 | slice as a struct field | works (`stack` 11/11 in both) | `Vec<T>`, the struct takes the caller's storage by value (D2; 2 rustc type errors on `stack`) | `T*`, 7 `cc` errors on `stack` | not measured |
 | struct with an array field and a count, by value, and `*Struct` parameters | works (X1) | works (X1) | works for the struct; slice parameters of the same module do not | the pointer parameter's fields are unbound (D7) |
-| `?T`, unit enums, `[N]str` constants | works | works; a `[N]str` element passed as `[]const u8` mismatches (D3) | works | not measured |
+| `?T`, unit enums, `[N]str` constants | works | works; a `[N]str` element passed as `[]const u8` mismatches (D3) | works (a duplicate `const` warning on the `str` table) | not measured |
 | generics `Name(T)` | no: `Ring(T)` in `specs/tri/collections/ring_buffer.t27` stops `t27c` with "use of undeclared identifier 'T'"; `t27b` reports an unsupported construct | - | - | - |
 | closure literal `\|y\| y + 1` | no: parse error "Unexpected token in expression: Pipe" in `t27c parse` and `t27b` | - | - | - |
 | heap | none. The converter says so in its header: "t27 holds no growing list" (rust_convert.t27) and "t27 has no heap text" (#9098). 77 specs name `alloc`, `create_buffer` or `ArrayList`; the two checked are stubs that `t27b` rejects (`allocator.alloc` in `specs/tri/collections/interval.t27`, `create_buffer` in `ring_buffer.t27`) | - | - | - |
@@ -114,9 +114,9 @@ repositories (t27 7496ed220, trios 483dd9ee, trinity 0770abb9, trinity-fpga 20bf
 The refusal lines were read back with a scratch reader (not committed): the line `// t27o: refused <item> <name> (line N):
 <reason>` gives the kind (`type`, `method`, `macro`, `tuple`, `path`, `closure`, `uses refused` ...) and its token; a cascade
 (`uses refused X`) is followed to the first refusal line of the item named X in the same file, at most 64 hops
-(`root_of` of `specs/tools/t27o/ledger.t27`, #11127). The reader reproduces the published counts exactly: `type Vec` 1,289,
-`Path` 435, `String` 232, `PathBuf` 230, `std` 212, `anyhow` 144, root-attributed `type` 6,180 and `method` 3,325 (the pull
-request of #11127 prints 3,323).
+(`root_of` of `specs/tools/t27o/ledger.t27`, #11127). The reader reproduces the published counts: `type Vec` 1,289,
+`Path` 435, `String` 232, `PathBuf` 230, `std` 212, `anyhow` 144 and root-attributed `type` 6,180 exactly, root-attributed `method`
+as 3,325 against the 3,323 that the pull request of #11127 prints.
 
 A caveat about the headline share. "`type` 38.5%" is 6,180 divided by 16,057, where 6,180 counts every refused item (fn, struct,
 enum, const) and 16,057 counts fns. Counting fns alone, `type` is 3,049 direct first refusals (19.0%) and 4,949 once cascades
