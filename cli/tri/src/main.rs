@@ -50,6 +50,8 @@ mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab r
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
 #[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
+#[path = "../../../gen/rust/tri/remote/remote_job.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -412,6 +414,8 @@ enum Commands {
     },
     /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
     Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
+    /// An analog reference job on a remote Docker host over SSH (host: TRI_REMOTE_HOST): ping | run <deck> [--golden] [--threads N] | status <id> | logs <id> | stop <id> | fetch <id> <file> [--to dir]; --print shows the command lines and sends nothing (rules: specs/tri/remote/remote_job.t27, #11020).
+    Remote { action: String, name: Option<String>, file: Option<String>, #[arg(long)] to: Option<String>, #[arg(long)] golden: bool, #[arg(long, default_value_t = rj::DEFAULT_THREADS)] threads: u64, #[arg(long)] print: bool },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -1078,6 +1082,22 @@ fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
     Ok(0)
 }
 
+/// `tri remote` (#11020): every command line is specs/tri/remote/remote_job.t27; this reads TRI_REMOTE_HOST / _IMAGE / _DECK_URL, prints each line the spec builds and, without --print, runs it (no shell), stopping at the first that fails.
+fn cmd_remote(action: &str, name: Option<&str>, file: Option<&str>, to: Option<&str>, threads: u64, golden: bool, print: bool) -> Result<u8> {
+    let (env, arg) = (|k: &str, d: &str| -> &'static str { std::env::var(k).unwrap_or_else(|_| d.to_string()).leak() }, |o: Option<&str>| -> &'static str { o.unwrap_or("").to_string().leak() });
+    let r = rj::TriRemoteReq { op: rj::action_op(arg(Some(action))), host: env(rj::HOST_VAR, ""), image: env(rj::IMAGE_VAR, rj::DEFAULT_IMAGE), name: arg(name), file: arg(file), dest: arg(to), url: env(rj::URL_VAR, ""), threads, counter: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), golden };
+    let (mut buf, mut line, why) = (vec![0u8; rj::CMD_MAX], vec![0u8; rj::CMD_MAX], rj::refusal(r));
+    anyhow::ensure!(why == rj::R_OK, "tri remote: refused, nothing sent: {}", rj::refusal_text(why));
+    let id = rj::job_id(r, &mut buf); if id > 0 { println!("job {}", String::from_utf8_lossy(&buf[..id])); }
+    for step in 0u8.. {
+        let n = rj::command(r, step, &mut buf); if n == 0 { break; }
+        let m = rj::shell_form(&buf, n, &mut line); println!("{}", String::from_utf8_lossy(&line[..m]));
+        let argv: Vec<&str> = std::str::from_utf8(&buf[..n])?.lines().collect();
+        if !print { let s = Command::new(argv[0]).args(&argv[1..]).status()?; if !s.success() { return Ok(s.code().unwrap_or(1) as u8); } }
+    }
+    Ok(0)
+}
+
 /// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
 fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
     let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
@@ -1343,6 +1363,7 @@ fn main() -> Result<()> {
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
         Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
+        Commands::Remote { action, name, file, to, golden, threads, print } => std::process::exit(cmd_remote(action, name.as_deref(), file.as_deref(), to.as_deref(), *threads, *golden, *print)? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
