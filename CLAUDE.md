@@ -118,6 +118,7 @@ This triggers automatic branch creation for the next phase.
 - `/phi-loop` - Execute 9-phase PHI LOOP
 - `/tri-pipeline` - Execute tri commands (gen, test, verify, seal)
 - `/experience-save` - Save learnings to persistent memory
+- `/self-cleanup` - Remove your own merged lane worktrees, review checkouts and caches; end of every tick and after every merge
 
 Load these skills when their functionality matches the task.
 

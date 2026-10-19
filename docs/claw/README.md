@@ -1,3 +1,4 @@
+| Move gate: whether a Railway service can move to another project, checked before anything is created there (private hosts, doubled outbound loops, state volumes, a target with no plan) | `specs/claw/move_gate.t27` (move kind and five readings in, one `V` line out: go or hold; not wired to a job yet) | #10794 |
 # TRI CLAW
 
 TRI CLAW — TRI-27 — Trinity S3AI: every CI gate of this repository, packaged
@@ -24,6 +25,8 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Merge lane: is the merger starved, and does it merge anything? Counts its runs, the oldest open age, the PRs each run merged, and its share of the whole queue, so an hour-long wait, a zero yield or a tenth of the queue shows up as data | `specs/claw/merge_lane.t27` (rows per merger run or per queued run; `F merger`, `F merger-yield` and `F merger-share low/high/unknown/none` out) | #10644 |
 | Shape race: the issue-shape gate judges the event payload, which can be twenty minutes old; replays a gate timeline under the payload reading and a live reading, so an issue closed with a passing body shows up as data | `specs/claw/shape_race.t27` (rows `created TAB ran TAB ok` per gate event; an `R` line and `F shape-race clean/race/unknown/none` out; #10644 is the fixture; the workflow change is the owner's decision) | #10662 |
 | Model routing: Opus 5.5 orchestrates, Sonnet 5.5 runs sub-tasks | `specs/claw/model_route.t27`, skill `model-routing`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-18 |
+| A T27F visual in every answer that needs one | rule `specs/t27mcp/visual_output.t27`, particle-still layer `specs/claw/visual_output.t27`, procedure in skill `t27f`, "Visual in every output" | owner directive 2026-10-18 |
+| `reel_still`: one particle still (PNG at STILL_MS of a token_floor reel) from TRI CLAW's `/mcp` | `specs/claw/reel_still.t27`, rendered on the Railway lab only | follow-up of the row above |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
 ## The T27F check in every `.t27` repository (#10268)

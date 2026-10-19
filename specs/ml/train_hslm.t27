@@ -1,0 +1,2635 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/train_hslm.t27 -- main() trains the whole 3-block HSLM of specs/nn/hslm.t27 on real
+; tokens: straight-through shadow weights, LAMB, a warmup-cosine schedule, global-norm clipping,
+; held-out evaluation, and MSLH checkpoints that are read back and compared byte for byte.
+; Issue: gHashTag/t27#10372.
+; WHAT IS REUSED, NOT COPIED: the forward pass (hslm_forward, hslm_block_forward, the sacred
+; attention, the FFN, the VSA stream and its gate), the backward pass (hslm_backward: the exact
+; gradient of the current position's cross-entropy, embedding included), cross_entropy, the TWN
+; quantizer (nn/ternary_ste quantize_twn) and the checkpoint header and layout (nn/hslm_data
+; write_header, parse_header, the section offsets). They are reached through `use`.
+; THE MODEL: ctx 27, vocab 729, embed 243, ff 729, 3 blocks, 3 heads of 81. Every ternary matrix
+; (Q, K, V, O, up, down per block, and the output head: 19 matrices, 1771470 trits) has an f64
+; shadow; after every update the shadow is requantized with TWN (delta = 0.7 mean |w|, alpha = mean
+; |w| over the kept entries), one alpha per matrix. The float parameters (embedding table 729 x 243,
+; RMSNorm gains, FFN biases, output bias) are trained directly. NPARAM = 2130138 f64 in one flat
+; vector, 30 segments.
+; THE STEP: 66 windows of 27 tokens, starts drawn by a xorshift64 PRNG (pinned seed); per window,
+; 27 forward positions; the loss is the mean cross-entropy of the last k positions, each against the
+; token after it, k = loss_positions (default 27: every position; 1: the last position against the
+; 28th token, the objective of the first run, kept to the bit). Each scored position runs its
+; hslm_backward right after its forward, with d loss / d logits scaled by 1/k.
+; Gradients are averaged over the 66 windows, clipped to global L2 norm 1.0, and handed to LAMB
+; (beta1 0.9, beta2 0.999, eps 1e-6, decoupled weight decay 0.01 on the matrices and the embedding,
+; none on gains and biases, trust ratio ||w|| / ||r|| per segment, clamped to 10, 1 when either norm
+; is 0 -- trinity-training autograd.zig lambStepSlice). Learning rate: 1e-3, linear warmup over
+; 2000 updates, then cosine down to 1e-6 at TOTAL updates.
+; THE FILES (all little endian):
+;   /tmp/hslm/train.tok, valid.tok  "HTOK", u32 version 1, u32 N, N u16 ids below 729 (input)
+;   /tmp/hslm/train.cfg             optional, key=value lines of integers: steps, total, warmup,
+;                                   eval_every, ckpt_every, seed, speed, resume, synth, eval_windows,
+;                                   loss_positions (1..27, default 27), gradcheck (1: print the
+;                                   gradient checks and exit)
+;   /tmp/hslm/ckpt_<step>.bin       MSLH: nn/hslm_data's header (magic 0x484C534D, version 1, step,
+;                                   f32 loss = the last minibatch loss under the k-position
+;                                   objective) and its layout, f32: output shadow (243 x 729,
+;                                   row-major [in][out]), then per block shadow_up (243 x 729),
+;                                   shadow_down (729 x 243), bias_up 729, bias_down 243.
+;                                   4971796 bytes, the size of hslm_step_10000.bin.
+;   /tmp/hslm/ckpt_<step>.state     the full resumable state, since MSLH holds no attention matrices,
+;                                   embedding, gains or output bias: a 64-byte header ("T27S", version
+;                                   1, step, nparam, rng u64, beta1^t f64, beta2^t f64, loss f64,
+;                                   nseg) then the parameters, LAMB m and LAMB v, f64 each.
+; Both files are read back after they are written and compared with what was meant to be on disk;
+; any difference makes main() fail (assert, a nonzero exit). resume=<step> in train.cfg restarts
+; from ckpt_<step>.state and continues bit-identically (same windows, same updates).
+; EVERY EVAL_EVERY STEPS one line goes to stdout: step, the objective (last<k>), the step's minibatch
+; loss under it and its exp (train_loss_last<k>, train_ppl_last<k>), the mean minibatch loss since the
+; last line, the loss on EVAL_WINDOWS fixed held-out windows (evenly spaced starts in valid.tok) at
+; the last position (valid_loss, valid_ppl: the first run's number) and over all 27 positions of the
+; same windows (valid_full_loss, valid_full_ppl), tokens/s (66 x 27 tokens per step over the
+; training time only), s/step, the learning rate and the gradient norm before clipping.
+; SPEED, HONESTLY: speed=0 runs the reference kernels of nn/hslm.t27 as they are. speed=1 replaces
+; four kernels by local ones with the same results: ternary_matmul as a branch-free axpy over the
+; rows of W (bit-identical: same summation order per output, x * 0.0 adds +0.0 to a sum that is never
+; -0.0), trit_int and outer_add branch-free, and ternary_matmul_t_add with four partial sums (the one
+; kernel that is not bit-identical; it only runs in backward). speed=2 (the default) also skips work
+; whose result nobody reads: the head at positions 0..25 and, in the last block at those positions,
+; everything but the key and value that the last position attends to. Under loss_positions = k only
+; positions 0..26-k are unscored, so k = 27 runs the full forward everywhere and skips nothing. The
+; tests check that speed 1 and speed 2 produce the same logits as speed 0 to the bit. The model is
+; not reduced.
+; WHAT DIFFERS FROM THE ZIG TRAINER (trinity-training @ 3e9648c, run R5): f64, not f32; LAMB, not
+; AdamW; one global clip, not per tensor; linear warmup + cosine to 1e-6, not the phi schedule; the
+; embedding table and RMSNorm gains are trained (the trainer froze the table); the gradient is that of
+; the k-position mean, each position's with earlier keys and values as constants (nn/hslm.t27
+; section 5; the tests check it against central differences); alphas are recomputed by TWN, not
+; learned; the VSA table is nn/hslm.t27's hash, not Zig's PRNG; the MSLH body floats are IEEE f32 casts (round to nearest even), the header loss is hslm_data's encode_f32.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module train_hslm;
+
+use base::types;
+use nn::hslm;
+use nn::ternary_ste;
+use nn::hslm_data;
+
+; THE SHAPE. nn/hslm and nn/hslm_data both declare these five; a name two imports declare is not
+; resolved, so this module declares them once, with the same type and value as both.
+const CONTEXT_LEN : usize = 27;
+const VOCAB_SIZE : usize = 729;
+const EMBED_DIM : usize = 243;
+const FF_DIM : usize = 729;
+const NUM_BLOCKS : usize = 3;
+const HEADER_BYTES : usize = 16;
+
+; THE STATE OF nn/hslm.t27. use_resolve splices fns, structs, enums and consts but not module-level
+; `var`; the spliced forward and backward bind to these, which repeat nn/hslm.t27 section 2 (names,
+; types, initial values) and nothing else. A variable added there and missing here stops the build
+; with "use of undeclared identifier"; it cannot drift silently.
+var model : HSLMWeights = undefined;
+var kv_k : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var kv_v : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+var act_token : usize = 0;
+var act_pos : [NUM_BLOCKS]usize = undefined;
+var act_x : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_n1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_rms1 : [NUM_BLOCKS]f64 = undefined;
+var act_q : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_attn : [NUM_BLOCKS * NUM_HEADS * CONTEXT_LEN]f64 = undefined;
+var act_ctx : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_r : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_pre : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var act_h : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var act_out : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var act_hn : [EMBED_DIM]f64 = undefined;
+var act_hrms : f64 = 1.0;
+var gw_q : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_k : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_v : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_o : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+var gw_up : [NUM_BLOCKS * EMBED_DIM * FF_DIM]f64 = undefined;
+var gw_down : [NUM_BLOCKS * FF_DIM * EMBED_DIM]f64 = undefined;
+var gw_out : [EMBED_DIM * VOCAB_SIZE]f64 = undefined;
+var g_gamma1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var g_b_up : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+var g_b_down : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+var g_b_out : [VOCAB_SIZE]f64 = undefined;
+var g_embed : [VOCAB_SIZE * EMBED_DIM]f64 = undefined;
+var bw_out : [EMBED_DIM]f64 = undefined;
+var bw_h : [FF_DIM]f64 = undefined;
+var bw_pre : [FF_DIM]f64 = undefined;
+var bw_sf : [FF_DIM]f64 = undefined;
+var bw_se : [EMBED_DIM]f64 = undefined;
+var bw_n : [EMBED_DIM]f64 = undefined;
+var bw_tmp : [EMBED_DIM]f64 = undefined;
+var bw_r : [EMBED_DIM]f64 = undefined;
+var bw_ctx : [EMBED_DIM]f64 = undefined;
+var bw_q : [EMBED_DIM]f64 = undefined;
+var bw_k : [EMBED_DIM]f64 = undefined;
+var bw_v : [EMBED_DIM]f64 = undefined;
+var bw_da : [CONTEXT_LEN]f64 = undefined;
+var bw_x : [EMBED_DIM]f64 = undefined;
+var bw_dz : [VOCAB_SIZE]f64 = undefined;
+var nudge_which : u8 = MAT_NONE;
+var nudge_block : usize = 0;
+var nudge_index : usize = 0;
+var nudge_delta : f64 = 0.0;
+var vsa_on : bool = true;
+var vsa_in : [NUM_BLOCKS * CONTEXT_LEN * VSA_DIM]Trit = undefined;
+var vsa_out : [NUM_BLOCKS * VSA_DIM]Trit = undefined;
+var vsa_ctx : [VSA_DIM]Trit = undefined;
+var vsa_reasoned : [VSA_DIM]Trit = undefined;
+var vsa_temp : [VSA_DIM]Trit = undefined;
+var vsa_temp2 : [VSA_DIM]Trit = undefined;
+var vsa_sim : [CONTEXT_LEN]f64 = undefined;
+var vsa_accum : [VSA_DIM]i64 = undefined;
+var vsa_max_sim : [NUM_BLOCKS]f64 = undefined;
+var vsa_fired : [NUM_BLOCKS]bool = undefined;
+var gate_total : [NUM_BLOCKS]usize = undefined;
+var gate_conscious : [NUM_BLOCKS]usize = undefined;
+var gate_ema : [NUM_BLOCKS]f64 = undefined;
+
+; THE TRAINING CONSTANTS (the issue's numbers). Steps, schedule length, warmup, intervals, seed,
+; speed level and resume step can be overridden in /tmp/hslm/train.cfg; these are the defaults.
+const BATCH : usize = 66;
+const LR_PEAK : f64 = 0.001;
+const LR_FLOOR : f64 = 0.000001;
+const WARMUP_STEPS : u64 = 2000;
+const DEFAULT_STEPS : u64 = 32000;
+const DEFAULT_EVAL_EVERY : u64 = 500;
+const DEFAULT_CKPT_EVERY : u64 = 2000;
+const DEFAULT_SEED : u64 = 1729;
+const DEFAULT_EVAL_WINDOWS : u64 = 243;
+const DEFAULT_LOSS_POSITIONS : u64 = 27;
+const CLIP_NORM : f64 = 1.0;
+const WEIGHT_DECAY : f64 = 0.01;
+const LAMB_BETA1 : f64 = 0.9;
+const LAMB_BETA2 : f64 = 0.999;
+const LAMB_EPS : f64 = 0.000001;
+const TRUST_CLAMP : f64 = 10.0;
+const TR_PI : f64 = 3.141592653589793;
+const INIT_SALT : u64 = 7046029254386353131;
+
+; Parameter segments: per block Q K V O up down gamma b_up b_down, then out, b_out, embed
+const K_Q : u8 = 0;
+const K_K : u8 = 1;
+const K_V : u8 = 2;
+const K_O : u8 = 3;
+const K_UP : u8 = 4;
+const K_DOWN : u8 = 5;
+const K_GAMMA : u8 = 6;
+const K_BUP : u8 = 7;
+const K_BDOWN : u8 = 8;
+const K_OUT : u8 = 9;
+const K_BOUT : u8 = 10;
+const K_EMBED : u8 = 11;
+const KINDS_PER_BLOCK : usize = 9;
+const NSEG : usize = 30;
+const NPARAM : usize = 2130138;
+
+; Token buffers, sized for the real corpus (train 8557893, valid 7689354 tokens)
+const TRAIN_CAP : usize = 16777216;
+const VALID_CAP : usize = 8388608;
+const SYN_TRAIN : usize = 262144;
+const SYN_VALID : usize = 32768;
+const IO_CHUNK : usize = 1048576;
+const MSLH_BYTES : usize = 4971796;
+const STATE_HEADER : usize = 64;
+const STATE_MAGIC : u32 = 0x53373254;
+const STATE_VERSION : u32 = 1;
+const HTOK_MAGIC : u32 = 0x4B4F5448;
+const HTOK_VERSION : u32 = 1;
+
+; Exit codes of tr_main
+const RC_OK : i32 = 0;
+const RC_TRAIN_TOK : i32 = 10;
+const RC_VALID_TOK : i32 = 11;
+const RC_SYNTH_WRITE : i32 = 12;
+const RC_CKPT_WRITE : i32 = 20;
+const RC_CKPT_VERIFY : i32 = 21;
+const RC_STATE_WRITE : i32 = 22;
+const RC_STATE_VERIFY : i32 = 23;
+const RC_RESUME : i32 = 30;
+const RC_NAN : i32 = 40;
+
+; Trainer state
+var p_val : [NPARAM]f64 = undefined;
+var g_val : [NPARAM]f64 = undefined;
+var m_val : [NPARAM]f64 = undefined;
+var v_val : [NPARAM]f64 = undefined;
+var seg_off : [NSEG]usize = undefined;
+var seg_len : [NSEG]usize = undefined;
+var seg_kind : [NSEG]u8 = undefined;
+var seg_block : [NSEG]usize = undefined;
+var beta1_pow : f64 = 1.0;
+var beta2_pow : f64 = 1.0;
+var rng_state : u64 = 1;
+var speed_level : u8 = 2;
+var last_lr : f64 = 0.0;
+var last_gnorm : f64 = 0.0;
+var last_loss : f64 = 0.0;
+var io_fail : u32 = 0;
+
+var train_tok : [TRAIN_CAP]u16 = undefined;
+var valid_tok : [VALID_CAP]u16 = undefined;
+var ntrain : usize = 0;
+var nvalid : usize = 0;
+var data_synthetic : bool = false;
+var fixed_starts : [8]usize = undefined;
+var win_logits : [VOCAB_SIZE]f64 = undefined;
+var win_dl : [VOCAB_SIZE]f64 = undefined;
+var win_gin : [EMBED_DIM]f64 = undefined;
+var ref_logits : [VOCAB_SIZE]f64 = undefined;
+var ref_gin : [EMBED_DIM]f64 = undefined;
+var kv_n1 : [EMBED_DIM]f64 = undefined;
+
+var io_chunk : [IO_CHUNK]u8 = undefined;
+var io_back : [IO_CHUNK]u8 = undefined;
+var io_hdr : [STATE_HEADER]u8 = undefined;
+var io_hdr_back : [STATE_HEADER]u8 = undefined;
+var ck_buf : [MSLH_BYTES]u8 = undefined;
+var ck_back : [MSLH_BYTES]u8 = undefined;
+var path_buf : [96]u8 = undefined;
+var up_buf : [64]u8 = undefined;
+var cfg_buf : [4096]u8 = undefined;
+var ln_buf : [512]u8 = undefined;
+var ln_n : usize = 0;
+var clip_buf : [1000]f64 = undefined;
+var clip_ref : [1000]f64 = undefined;
+var st_save : [131072]f64 = undefined;
+var tiny_before : f64 = 0.0;
+
+var cfg_steps : u64 = DEFAULT_STEPS;
+var cfg_total : u64 = DEFAULT_STEPS;
+var cfg_warmup : u64 = WARMUP_STEPS;
+var cfg_eval_every : u64 = DEFAULT_EVAL_EVERY;
+var cfg_ckpt_every : u64 = DEFAULT_CKPT_EVERY;
+var cfg_seed : u64 = DEFAULT_SEED;
+var cfg_speed : u64 = 2;
+var cfg_resume : u64 = 0;
+var cfg_synth : u64 = 0;
+var cfg_eval_windows : u64 = DEFAULT_EVAL_WINDOWS;
+var cfg_loss_positions : u64 = DEFAULT_LOSS_POSITIONS;
+var cfg_gradcheck : u64 = 0;
+
+; ---------------------------------------------------------------------------------------------
+; 1. Kernels. The four names below are nn/hslm.t27's; a local declaration wins over the spliced
+; one, also inside the spliced forward and backward. speed 0 runs nn/hslm.t27's code unchanged.
+; ---------------------------------------------------------------------------------------------
+
+/// output[i] = sum_j input[j] * w[j * out_dim + i]. Speed 0: nn/hslm.t27's branchy dot per output.
+/// Otherwise: zero the output, then add x_j * trit row by row (an axpy the compiler vectorizes);
+/// per output the terms are added in the same order j = 0, 1, ..., so the result is the same bits.
+fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (speed_level == 0) {
+        tr_matmul_ref(input, weights, output, in_dim, out_dim);
+        return;
+    }
+    var i : usize = 0;
+    while (i < out_dim) {
+        output[i] = 0.0;
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < in_dim) {
+        const xj : f64 = input[j];
+        if (xj != 0.0) {
+            const row : usize = j * out_dim;
+            var c : usize = 0;
+            while (c < out_dim) {
+                const wf : f64 = @floatFromInt(@intFromEnum(weights[row + c]));
+                output[c] = output[c] + xj * wf;
+                c = c + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+/// nn/hslm.t27's ternary_matmul, verbatim
+fn tr_matmul_ref(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    var i : usize = 0;
+    while (i < out_dim) {
+        var acc : f64 = 0.0;
+        var j : usize = 0;
+        while (j < in_dim) {
+            const wt = weights[j * out_dim + i];
+            if (wt == Trit.pos) {
+                acc = acc + input[j];
+            } else if (wt == Trit.neg) {
+                acc = acc - input[j];
+            }
+            j = j + 1;
+        }
+        output[i] = acc;
+        i = i + 1;
+    }
+}
+
+/// dx[j] += sum_i w[j * out_dim + i] * dy[i]. Speed 0: nn/hslm.t27's branchy sum. Otherwise four
+/// partial sums of trit * dy (the only kernel whose rounding differs from the reference).
+fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize) -> void {
+    var j : usize = 0;
+    while (j < in_dim) {
+        const row : usize = j * out_dim;
+        if (speed_level == 0) {
+            var acc : f64 = 0.0;
+            var i : usize = 0;
+            while (i < out_dim) {
+                const wt = weights[row + i];
+                if (wt == Trit.pos) {
+                    acc = acc + dy[i];
+                } else if (wt == Trit.neg) {
+                    acc = acc - dy[i];
+                }
+                i = i + 1;
+            }
+            dx[j] = dx[j] + acc;
+        } else {
+            var a0 : f64 = 0.0;
+            var a1 : f64 = 0.0;
+            var a2 : f64 = 0.0;
+            var a3 : f64 = 0.0;
+            var i : usize = 0;
+            while (i + 4 <= out_dim) {
+                const w0 : f64 = @floatFromInt(@intFromEnum(weights[row + i]));
+                const w1 : f64 = @floatFromInt(@intFromEnum(weights[row + i + 1]));
+                const w2 : f64 = @floatFromInt(@intFromEnum(weights[row + i + 2]));
+                const w3 : f64 = @floatFromInt(@intFromEnum(weights[row + i + 3]));
+                a0 = a0 + w0 * dy[i];
+                a1 = a1 + w1 * dy[i + 1];
+                a2 = a2 + w2 * dy[i + 2];
+                a3 = a3 + w3 * dy[i + 3];
+                i = i + 4;
+            }
+            while (i < out_dim) {
+                const wr : f64 = @floatFromInt(@intFromEnum(weights[row + i]));
+                a0 = a0 + wr * dy[i];
+                i = i + 1;
+            }
+            dx[j] = dx[j] + ((a0 + a1) + (a2 + a3));
+        }
+        j = j + 1;
+    }
+}
+
+/// gw[j * out_dim + i] += x[j] * dy[i], with x[j] read once per row; above speed 0 a row whose
+/// x[j] is 0 (half the ReLU outputs) is skipped, which adds nothing either way
+fn outer_add(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize) -> void {
+    var j : usize = 0;
+    while (j < in_dim) {
+        const xj : f64 = x[j];
+        if (speed_level == 0 or xj != 0.0) {
+            const row : usize = j * out_dim;
+            var i : usize = 0;
+            while (i < out_dim) {
+                gw[row + i] = gw[row + i] + xj * dy[i];
+                i = i + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+/// -1 / 0 / +1 of a trit; above speed 0 the enum's own value, without branches
+fn trit_int(t: Trit) -> i64 {
+    if (speed_level == 0) {
+        if (t == Trit.pos) {
+            return 1;
+        }
+        if (t == Trit.neg) {
+            return 0 - 1;
+        }
+        return 0;
+    }
+    return @as(i64, @intFromEnum(t));
+}
+
+/// The last block at a position before the last: only its key and value are ever read (by the
+/// last position's attention). Same calls, in the same order, as attention_forward.
+fn tr_kv_only(block_idx: usize, position: usize, input: []const f64) -> void {
+    const bw = &model.blocks[block_idx];
+    const ko : usize = (block_idx * CONTEXT_LEN + position) * EMBED_DIM;
+    const rms : f64 = rms_norm_into(input, &bw.norm1_gamma, &kv_n1);
+    const kk = kv_k[ko..ko + EMBED_DIM];
+    const vv = kv_v[ko..ko + EMBED_DIM];
+    ternary_matmul(&kv_n1, &bw.w_k, kk, EMBED_DIM, EMBED_DIM);
+    nudge(MAT_K, block_idx, &kv_n1, kk, EMBED_DIM);
+    scale_into(kk, bw.alpha_k, kk);
+    ternary_matmul(&kv_n1, &bw.w_v, vv, EMBED_DIM, EMBED_DIM);
+    nudge(MAT_V, block_idx, &kv_n1, vv, EMBED_DIM);
+    scale_into(vv, bw.alpha_v, vv);
+    rope(kk, position, false);
+    if (rms < 0.0) {
+        io_fail = io_fail + 1;
+    }
+}
+
+/// hslm_forward at a position before the last, without the work nobody reads
+fn tr_prefix_forward(token: usize, position: usize) -> void {
+    embed_into(token, position, &bw_tmp);
+    if (vsa_on) {
+        vsa_embed(token, position, vsa_in[position * VSA_DIM..(position + 1) * VSA_DIM]);
+    }
+    hslm_block_forward(0, position, &bw_tmp, act_out[0..EMBED_DIM]);
+    var b : usize = 1;
+    while (b + 1 < NUM_BLOCKS) {
+        const prev : usize = (b - 1) * EMBED_DIM;
+        const cur : usize = b * EMBED_DIM;
+        hslm_block_forward(b, position, act_out[prev..prev + EMBED_DIM], act_out[cur..cur + EMBED_DIM]);
+        b = b + 1;
+    }
+    const last_in : usize = (NUM_BLOCKS - 2) * EMBED_DIM;
+    tr_kv_only(NUM_BLOCKS - 1, position, act_out[last_in..last_in + EMBED_DIM]);
+}
+
+/// One 27-token window: every position in order (each attends to the cache of the earlier ones);
+/// the logits of the last position land in `logits`, its activations stay for hslm_backward
+fn tr_window_forward(tokens: []const u16, start: usize, logits: []f64) -> void {
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        const tok : usize = @intCast(tokens[start + p]);
+        if (speed_level < 2 or p + 1 == CONTEXT_LEN) {
+            hslm_forward(tok, p, logits);
+        } else {
+            tr_prefix_forward(tok, p);
+        }
+        p = p + 1;
+    }
+}
+
+/// Forward, loss and backward of one window; gradients accumulate in nn/hslm's gw_* and g_*
+fn tr_window_grad(tokens: []const u16, start: usize) -> f64 {
+    tr_window_forward(tokens, start, &win_logits);
+    const target : usize = @intCast(tokens[start + CONTEXT_LEN]);
+    const loss : f64 = cross_entropy(&win_logits, target);
+    cross_entropy_backward(&win_logits, target, &win_dl);
+    hslm_backward(&win_dl, &win_gin);
+    return loss;
+}
+
+/// Loss of one window, forward only
+fn tr_window_loss(tokens: []const u16, start: usize) -> f64 {
+    tr_window_forward(tokens, start, &win_logits);
+    const target : usize = @intCast(tokens[start + CONTEXT_LEN]);
+    return cross_entropy(&win_logits, target);
+}
+
+; THE K-POSITION OBJECTIVE (owner, 2026-10-18). The loss of a window is the mean cross-entropy of
+; its last k positions, k = loss_positions in train.cfg: position p predicts token start + p + 1.
+; k = 1 is tr_window_grad above, to the bit (a test checks it); k = 27, the default, trains every
+; position. Each scored position runs the full forward, then its backward at once, while its
+; activations are the live ones; d loss / d logits is scaled by 1 / k, so the accumulated gradient
+; is that of the mean. As before, keys and values of earlier positions are constants of a
+; position's backward; a position's own key and value are not.
+
+/// Forward, loss and backward of one window under the k-position objective (1 <= k <= 27);
+/// gradients accumulate in nn/hslm's gw_* and g_*; returns the mean of the k losses
+fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
+    const inv_k : f64 = 1.0 / @as(f64, @floatFromInt(k));
+    var sum : f64 = 0.0;
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        const tok : usize = @intCast(tokens[start + p]);
+        if (p + k >= CONTEXT_LEN) {
+            hslm_forward(tok, p, &win_logits);
+            const target : usize = @intCast(tokens[start + p + 1]);
+            sum = sum + cross_entropy(&win_logits, target);
+            cross_entropy_backward(&win_logits, target, &win_dl);
+            var j : usize = 0;
+            while (j < VOCAB_SIZE) {
+                win_dl[j] = win_dl[j] * inv_k;
+                j = j + 1;
+            }
+            hslm_backward(&win_dl, &win_gin);
+        } else if (speed_level < 2) {
+            hslm_forward(tok, p, &win_logits);
+        } else {
+            tr_prefix_forward(tok, p);
+        }
+        p = p + 1;
+    }
+    return sum * inv_k;
+}
+
+/// The k-position loss of one window, forward only: the full forward at every position, the
+/// cross-entropy of each of the last k against its next token, their mean
+fn tr_window_loss_k(tokens: []const u16, start: usize, k: usize) -> f64 {
+    var sum : f64 = 0.0;
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        const tok : usize = @intCast(tokens[start + p]);
+        hslm_forward(tok, p, &ref_logits);
+        if (p >= CONTEXT_LEN - k) {
+            const target : usize = @intCast(tokens[start + p + 1]);
+            sum = sum + cross_entropy(&ref_logits, target);
+        }
+        p = p + 1;
+    }
+    return sum * (1.0 / @as(f64, @floatFromInt(k)));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 2. Parameters: the flat vector, its segments, init, requantize
+; ---------------------------------------------------------------------------------------------
+
+fn tr_kind_len(kind: u8) -> usize {
+    if (kind <= K_O) {
+        return EMBED_DIM * EMBED_DIM;
+    }
+    if (kind == K_UP or kind == K_DOWN or kind == K_OUT or kind == K_EMBED) {
+        return EMBED_DIM * FF_DIM;
+    }
+    if (kind == K_BUP or kind == K_BOUT) {
+        return FF_DIM;
+    }
+    return EMBED_DIM;
+}
+
+fn tr_kind_ternary(kind: u8) -> bool {
+    return kind <= K_DOWN or kind == K_OUT;
+}
+
+/// Weight decay on the matrices and the embedding table, not on gains and biases
+fn tr_kind_decay(kind: u8) -> bool {
+    return kind <= K_DOWN or kind == K_OUT or kind == K_EMBED;
+}
+
+fn tr_seg(kind: u8, block_idx: usize) -> usize {
+    if (kind == K_OUT) {
+        return NUM_BLOCKS * KINDS_PER_BLOCK;
+    }
+    if (kind == K_BOUT) {
+        return NUM_BLOCKS * KINDS_PER_BLOCK + 1;
+    }
+    if (kind == K_EMBED) {
+        return NUM_BLOCKS * KINDS_PER_BLOCK + 2;
+    }
+    return block_idx * KINDS_PER_BLOCK + @as(usize, kind);
+}
+
+fn tr_build_segments() -> usize {
+    var off : usize = 0;
+    var s : usize = 0;
+    var b : usize = 0;
+    while (b < NUM_BLOCKS) {
+        var k : u8 = 0;
+        while (k < 9) {
+            seg_kind[s] = k;
+            seg_block[s] = b;
+            seg_off[s] = off;
+            seg_len[s] = tr_kind_len(k);
+            off = off + seg_len[s];
+            s = s + 1;
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var tail : u8 = K_OUT;
+    while (tail <= K_EMBED) {
+        seg_kind[s] = tail;
+        seg_block[s] = 0;
+        seg_off[s] = off;
+        seg_len[s] = tr_kind_len(tail);
+        off = off + seg_len[s];
+        s = s + 1;
+        tail = tail + 1;
+    }
+    return off;
+}
+
+/// The gradient nn/hslm's backward accumulated for segment s
+fn tr_grad_of(s: usize) -> []f64 {
+    const kind : u8 = seg_kind[s];
+    const b : usize = seg_block[s];
+    const ee : usize = EMBED_DIM * EMBED_DIM;
+    const ef : usize = EMBED_DIM * FF_DIM;
+    if (kind == K_Q) {
+        return gw_q[b * ee..(b + 1) * ee];
+    }
+    if (kind == K_K) {
+        return gw_k[b * ee..(b + 1) * ee];
+    }
+    if (kind == K_V) {
+        return gw_v[b * ee..(b + 1) * ee];
+    }
+    if (kind == K_O) {
+        return gw_o[b * ee..(b + 1) * ee];
+    }
+    if (kind == K_UP) {
+        return gw_up[b * ef..(b + 1) * ef];
+    }
+    if (kind == K_DOWN) {
+        return gw_down[b * ef..(b + 1) * ef];
+    }
+    if (kind == K_GAMMA) {
+        return g_gamma1[b * EMBED_DIM..(b + 1) * EMBED_DIM];
+    }
+    if (kind == K_BUP) {
+        return g_b_up[b * FF_DIM..(b + 1) * FF_DIM];
+    }
+    if (kind == K_BDOWN) {
+        return g_b_down[b * EMBED_DIM..(b + 1) * EMBED_DIM];
+    }
+    if (kind == K_OUT) {
+        return gw_out[0..ef];
+    }
+    if (kind == K_BOUT) {
+        return g_b_out[0..VOCAB_SIZE];
+    }
+    return g_embed[0..ef];
+}
+
+/// dst.len float parameters of the flat vector, from element off, into dst
+fn tr_from_flat(off: usize, dst: []f64) -> void {
+    var i : usize = 0;
+    while (i < dst.len) {
+        dst[i] = p_val[off + i];
+        i = i + 1;
+    }
+}
+
+/// Segment s of the flat vector into the model: TWN trits and alpha for a ternary matrix (the STE
+/// requantize), a plain copy for the float parameters
+fn tr_scatter(s: usize) -> void {
+    const kind : u8 = seg_kind[s];
+    const off : usize = seg_off[s];
+    const src = p_val[off..off + seg_len[s]];
+    const bw = &model.blocks[seg_block[s]];
+    if (kind == K_Q) {
+        bw.alpha_q = quantize_twn(src, &bw.w_q);
+    } else if (kind == K_K) {
+        bw.alpha_k = quantize_twn(src, &bw.w_k);
+    } else if (kind == K_V) {
+        bw.alpha_v = quantize_twn(src, &bw.w_v);
+    } else if (kind == K_O) {
+        bw.alpha_o = quantize_twn(src, &bw.w_o);
+    } else if (kind == K_UP) {
+        bw.alpha_up = quantize_twn(src, &bw.w_up);
+    } else if (kind == K_DOWN) {
+        bw.alpha_down = quantize_twn(src, &bw.w_down);
+    } else if (kind == K_GAMMA) {
+        tr_from_flat(off, &bw.norm1_gamma);
+    } else if (kind == K_BUP) {
+        tr_from_flat(off, &bw.b_up);
+    } else if (kind == K_BDOWN) {
+        tr_from_flat(off, &bw.b_down);
+    } else if (kind == K_OUT) {
+        model.alpha_out = quantize_twn(src, &model.w_out);
+    } else if (kind == K_BOUT) {
+        tr_from_flat(off, &model.b_out);
+    } else {
+        tr_from_flat(off, &model.embed);
+    }
+}
+
+fn tr_scatter_all() -> void {
+    var s : usize = 0;
+    while (s < NSEG) {
+        tr_scatter(s);
+        s = s + 1;
+    }
+}
+
+/// One xorshift64 step; a zero state (a fixed point of xorshift) restarts at 1
+fn tr_xs(seed: u64) -> u64 {
+    var x : u64 = seed;
+    if (x == 0) {
+        x = 1;
+    }
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    return x;
+}
+
+/// A uniform number in [0, 1) from the top 53 bits of a state
+fn tr_unit(x: u64) -> f64 {
+    const top : u64 = x >> 11;
+    return @as(f64, @floatFromInt(top)) * (1.0 / 9007199254740992.0);
+}
+
+/// Fresh model from a seed: shadows and the embedding uniform in +-1/sqrt(fan_in), gains 1,
+/// biases 0, LAMB moments 0; trits and alphas by TWN. The window PRNG starts at the seed.
+fn tr_init(seed: u64) -> void {
+    const total : usize = tr_build_segments();
+    var x : u64 = seed ^ INIT_SALT;
+    if (x == 0) {
+        x = INIT_SALT;
+    }
+    var s : usize = 0;
+    while (s < NSEG) {
+        const kind : u8 = seg_kind[s];
+        const off : usize = seg_off[s];
+        const n : usize = seg_len[s];
+        var value : f64 = 0.0;
+        var bound : f64 = 0.0;
+        if (tr_kind_ternary(kind) or kind == K_EMBED) {
+            var fan_in : usize = EMBED_DIM;
+            if (kind == K_DOWN) {
+                fan_in = FF_DIM;
+            }
+            bound = 1.0 / sqrt(@as(f64, @floatFromInt(fan_in)));
+        } else if (kind == K_GAMMA) {
+            value = 1.0;
+        }
+        var i : usize = 0;
+        while (i < n) {
+            if (bound > 0.0) {
+                x = tr_xs(x);
+                p_val[off + i] = bound * (2.0 * tr_unit(x) - 1.0);
+            } else {
+                p_val[off + i] = value;
+            }
+            i = i + 1;
+        }
+        s = s + 1;
+    }
+    var k : usize = 0;
+    while (k < total) {
+        m_val[k] = 0.0;
+        v_val[k] = 0.0;
+        g_val[k] = 0.0;
+        k = k + 1;
+    }
+    beta1_pow = 1.0;
+    beta2_pow = 1.0;
+    rng_state = seed;
+    if (rng_state == 0) {
+        rng_state = 1;
+    }
+    nudge_which = MAT_NONE;
+    vsa_on = true;
+    gate_reset();
+    tr_scatter_all();
+}
+
+; ---------------------------------------------------------------------------------------------
+; 3. The optimizer: schedule, global clip, LAMB
+; ---------------------------------------------------------------------------------------------
+
+/// Learning rate of update t (0-based): linear warmup to the peak over `warmup` updates, then a
+/// cosine from the peak to the floor at update `total`, and the floor after it
+fn tr_lr_at(t: u64, warmup: u64, total: u64) -> f64 {
+    if (t < warmup) {
+        return LR_PEAK * @as(f64, @floatFromInt(t + 1)) / @as(f64, @floatFromInt(warmup));
+    }
+    if (total <= warmup) {
+        return LR_FLOOR;
+    }
+    var prog : f64 = @as(f64, @floatFromInt(t - warmup)) / @as(f64, @floatFromInt(total - warmup));
+    if (prog > 1.0) {
+        prog = 1.0;
+    }
+    return LR_FLOOR + 0.5 * (LR_PEAK - LR_FLOOR) * (1.0 + cos(TR_PI * prog));
+}
+
+fn tr_norm(g: []const f64) -> f64 {
+    var s0 : f64 = 0.0;
+    var s1 : f64 = 0.0;
+    var s2 : f64 = 0.0;
+    var s3 : f64 = 0.0;
+    var i : usize = 0;
+    while (i + 4 <= g.len) {
+        s0 = s0 + g[i] * g[i];
+        s1 = s1 + g[i + 1] * g[i + 1];
+        s2 = s2 + g[i + 2] * g[i + 2];
+        s3 = s3 + g[i + 3] * g[i + 3];
+        i = i + 4;
+    }
+    while (i < g.len) {
+        s0 = s0 + g[i] * g[i];
+        i = i + 1;
+    }
+    return sqrt((s0 + s1) + (s2 + s3));
+}
+
+/// Scale g down to L2 norm max_norm when it is above it; returns the norm before
+fn tr_clip_global(g: []f64, max_norm: f64) -> f64 {
+    const norm : f64 = tr_norm(g);
+    if (norm > max_norm) {
+        const scale : f64 = max_norm / norm;
+        var i : usize = 0;
+        while (i < g.len) {
+            g[i] = g[i] * scale;
+            i = i + 1;
+        }
+    }
+    return norm;
+}
+
+/// The averaged gradient of the batch into the flat vector
+fn tr_gather(scale: f64) -> void {
+    var s : usize = 0;
+    while (s < NSEG) {
+        const src = tr_grad_of(s);
+        const off : usize = seg_off[s];
+        var i : usize = 0;
+        while (i < src.len) {
+            g_val[off + i] = src[i] * scale;
+            i = i + 1;
+        }
+        s = s + 1;
+    }
+}
+
+/// One LAMB update of every segment (autograd.zig lambStepSlice): Adam moments with bias
+/// correction, r = m_hat / (sqrt(v_hat) + eps) + wd w, trust = ||w|| / ||r|| clamped to 10,
+/// w -= lr trust r. The update direction r is kept in g_val.
+fn tr_lamb(lr: f64) -> void {
+    beta1_pow = beta1_pow * LAMB_BETA1;
+    beta2_pow = beta2_pow * LAMB_BETA2;
+    const bc1 : f64 = 1.0 - beta1_pow;
+    const bc2 : f64 = 1.0 - beta2_pow;
+    var s : usize = 0;
+    while (s < NSEG) {
+        const off : usize = seg_off[s];
+        const end : usize = off + seg_len[s];
+        var wd : f64 = 0.0;
+        if (tr_kind_decay(seg_kind[s])) {
+            wd = WEIGHT_DECAY;
+        }
+        var i : usize = off;
+        while (i < end) {
+            const g : f64 = g_val[i];
+            const m : f64 = LAMB_BETA1 * m_val[i] + (1.0 - LAMB_BETA1) * g;
+            const v : f64 = LAMB_BETA2 * v_val[i] + (1.0 - LAMB_BETA2) * g * g;
+            m_val[i] = m;
+            v_val[i] = v;
+            g_val[i] = (m / bc1) / (sqrt(v / bc2) + LAMB_EPS) + wd * p_val[i];
+            i = i + 1;
+        }
+        const w_norm : f64 = tr_norm(p_val[off..end]);
+        const r_norm : f64 = tr_norm(g_val[off..end]);
+        var trust : f64 = 1.0;
+        if (w_norm > 0.0 and r_norm > 0.0) {
+            trust = min(w_norm / r_norm, TRUST_CLAMP);
+        }
+        const rate : f64 = lr * trust;
+        i = off;
+        while (i < end) {
+            p_val[i] = p_val[i] - rate * g_val[i];
+            i = i + 1;
+        }
+        s = s + 1;
+    }
+}
+
+/// A window start in [0, n - 28]: the 27 inputs and the target lie inside the n tokens
+fn tr_next_start(n: usize) -> usize {
+    rng_state = tr_xs(rng_state);
+    const span : u64 = @intCast(n - CONTEXT_LEN);
+    return @intCast(rng_state % span);
+}
+
+/// One training step: `batch` windows (sampled, or fixed_starts), mean loss, averaged gradient,
+/// global clip, LAMB at update t's rate (or at lr_fixed when it is positive), requantize
+fn tr_train_step(t: u64, batch: usize, lr_fixed: f64, fixed: bool) -> f64 {
+    zero_weight_gradients();
+    var loss_sum : f64 = 0.0;
+    var wi : usize = 0;
+    while (wi < batch) {
+        var start : usize = 0;
+        if (fixed) {
+            start = fixed_starts[wi];
+        } else {
+            start = tr_next_start(ntrain);
+        }
+        loss_sum = loss_sum + tr_window_grad(train_tok[0..ntrain], start);
+        wi = wi + 1;
+    }
+    const inv : f64 = 1.0 / @as(f64, @floatFromInt(batch));
+    tr_gather(inv);
+    last_gnorm = tr_clip_global(g_val[0..NPARAM], CLIP_NORM);
+    var lr : f64 = lr_fixed;
+    if (lr <= 0.0) {
+        lr = tr_lr_at(t, cfg_warmup, cfg_total);
+    }
+    last_lr = lr;
+    tr_lamb(lr);
+    tr_scatter_all();
+    last_loss = loss_sum * inv;
+    return last_loss;
+}
+
+/// tr_train_step under the k-position objective: the same windows, averaging, clip, LAMB and
+/// requantize; each window's loss and gradient come from tr_window_grad_k
+fn tr_train_step_k(t: u64, batch: usize, lr_fixed: f64, fixed: bool, k: usize) -> f64 {
+    zero_weight_gradients();
+    var loss_sum : f64 = 0.0;
+    var wi : usize = 0;
+    while (wi < batch) {
+        var start : usize = 0;
+        if (fixed) {
+            start = fixed_starts[wi];
+        } else {
+            start = tr_next_start(ntrain);
+        }
+        loss_sum = loss_sum + tr_window_grad_k(train_tok[0..ntrain], start, k);
+        wi = wi + 1;
+    }
+    const inv : f64 = 1.0 / @as(f64, @floatFromInt(batch));
+    tr_gather(inv);
+    last_gnorm = tr_clip_global(g_val[0..NPARAM], CLIP_NORM);
+    var lr : f64 = lr_fixed;
+    if (lr <= 0.0) {
+        lr = tr_lr_at(t, cfg_warmup, cfg_total);
+    }
+    last_lr = lr;
+    tr_lamb(lr);
+    tr_scatter_all();
+    last_loss = loss_sum * inv;
+    return last_loss;
+}
+
+/// Mean 27-position loss of the same held-out windows tr_valid_loss scores at the last position
+fn tr_valid_full_loss(count: usize) -> f64 {
+    var stride : usize = (nvalid - CONTEXT_LEN - 1) / count;
+    if (stride == 0) {
+        stride = 1;
+    }
+    var sum : f64 = 0.0;
+    var used : usize = 0;
+    var k : usize = 0;
+    while (k < count) {
+        const start : usize = k * stride;
+        if (start + CONTEXT_LEN < nvalid) {
+            sum = sum + tr_window_loss_k(valid_tok[0..nvalid], start, CONTEXT_LEN);
+            used = used + 1;
+        }
+        k = k + 1;
+    }
+    return sum / @as(f64, @floatFromInt(used));
+}
+
+/// Mean loss of `count` fixed held-out windows, evenly spaced over valid.tok
+fn tr_valid_loss(count: usize) -> f64 {
+    var stride : usize = (nvalid - CONTEXT_LEN - 1) / count;
+    if (stride == 0) {
+        stride = 1;
+    }
+    var sum : f64 = 0.0;
+    var used : usize = 0;
+    var k : usize = 0;
+    while (k < count) {
+        const start : usize = k * stride;
+        if (start + CONTEXT_LEN < nvalid) {
+            sum = sum + tr_window_loss(valid_tok[0..nvalid], start);
+            used = used + 1;
+        }
+        k = k + 1;
+    }
+    return sum / @as(f64, @floatFromInt(used));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 4. Host I/O: whole reads and writes, the clock, stdout lines, the config
+; ---------------------------------------------------------------------------------------------
+
+fn tr_note(rc: i32) -> void {
+    if (rc < 0) {
+        io_fail = io_fail + 1;
+    }
+}
+
+/// Read until buf is full or the file ends; the byte count, or a negative errno
+fn tr_read_full(fd: i32, buf: []u8) -> i64 {
+    var got : usize = 0;
+    var done : bool = false;
+    while (!done and got < buf.len) {
+        const r : i32 = host_read(fd, buf[got..buf.len]);
+        if (r < 0) {
+            return @as(i64, r);
+        }
+        if (r == 0) {
+            done = true;
+        } else {
+            got = got + @as(usize, @intCast(r));
+        }
+    }
+    return @as(i64, @intCast(got));
+}
+
+/// Write all of buf; 0, or a negative errno
+fn tr_write_all(fd: i32, buf: []const u8) -> i32 {
+    var put : usize = 0;
+    while (put < buf.len) {
+        const r : i32 = host_write(fd, buf[put..buf.len]);
+        if (r <= 0) {
+            return 0 - 1;
+        }
+        put = put + @as(usize, @intCast(r));
+    }
+    return 0;
+}
+
+/// Seconds since boot from /proc/uptime (10 ms resolution): the wall clock of the timings
+fn tr_now() -> f64 {
+    const fd : i32 = host_open("/proc/uptime", 0);
+    if (fd < 0) {
+        return 0.0;
+    }
+    const n : i32 = host_read(fd, &up_buf);
+    tr_note(host_close(fd));
+    if (n <= 0) {
+        return 0.0;
+    }
+    const len : usize = @intCast(n);
+    var secs : f64 = 0.0;
+    var frac : f64 = 0.0;
+    var i : usize = 0;
+    while (i < len) {
+        const ch : u8 = up_buf[i];
+        if (ch == 46) {
+            frac = 0.1;
+        } else if (ch >= 48 and ch <= 57) {
+            const d : f64 = @floatFromInt(ch - 48);
+            if (frac == 0.0) {
+                secs = secs * 10.0 + d;
+            } else {
+                secs = secs + d * frac;
+                frac = frac * 0.1;
+            }
+        } else {
+            i = len;
+        }
+        i = i + 1;
+    }
+    return secs;
+}
+
+fn ln_reset() -> void {
+    ln_n = 0;
+}
+
+fn ln_byte(ch: u8) -> void {
+    if (ln_n < 511) {
+        ln_buf[ln_n] = ch;
+        ln_n = ln_n + 1;
+    }
+}
+
+fn ln_str(text: []const u8) -> void {
+    var i : usize = 0;
+    while (i < text.len) {
+        ln_byte(text[i]);
+        i = i + 1;
+    }
+}
+
+fn ln_u64(value: u64) -> void {
+    if (value == 0) {
+        ln_byte(48);
+        return;
+    }
+    var digits : [24]u8 = undefined;
+    var n : usize = 0;
+    var x : u64 = value;
+    while (x > 0) {
+        digits[n] = @intCast(48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        ln_byte(digits[n]);
+    }
+}
+
+/// x with `places` decimals, rounded half up; nan and values above 1e15 by name
+fn ln_f64(x: f64, places: u32) -> void {
+    if (x != x) {
+        ln_str("nan");
+        return;
+    }
+    var y : f64 = x;
+    if (y < 0.0) {
+        ln_byte(45);
+        y = 0.0 - y;
+    }
+    if (y > 1000000000000000.0) {
+        ln_str("inf");
+        return;
+    }
+    var scale : f64 = 1.0;
+    var unit : u64 = 1;
+    var k : u32 = 0;
+    while (k < places) {
+        scale = scale * 10.0;
+        unit = unit * 10;
+        k = k + 1;
+    }
+    const all : u64 = @intFromFloat(y * scale + 0.5);
+    ln_u64(all / unit);
+    if (places > 0) {
+        ln_byte(46);
+        var rest : u64 = all % unit;
+        var div : u64 = unit / 10;
+        while (div > 0) {
+            ln_byte(@intCast(48 + rest / div));
+            rest = rest % div;
+            div = div / 10;
+        }
+    }
+}
+
+/// x as m.mmm e+NN with `places` mantissa decimals: gradient-check numbers span many decades
+fn ln_sci(x: f64, places: u32) -> void {
+    if (x != x) {
+        ln_str("nan");
+        return;
+    }
+    var y : f64 = x;
+    if (y < 0.0) {
+        ln_byte(45);
+        y = 0.0 - y;
+    }
+    if (y == 0.0) {
+        ln_f64(0.0, places);
+        ln_str("e+00");
+        return;
+    }
+    if (y > 1.0e300) {
+        ln_str("inf");
+        return;
+    }
+    var e : i64 = 0;
+    while (y >= 10.0) {
+        y = y / 10.0;
+        e = e + 1;
+    }
+    while (y < 1.0) {
+        y = y * 10.0;
+        e = e - 1;
+    }
+    ln_f64(y, places);
+    ln_byte(101);
+    if (e < 0) {
+        ln_byte(45);
+        e = 0 - e;
+    } else {
+        ln_byte(43);
+    }
+    if (e < 10) {
+        ln_byte(48);
+    }
+    ln_u64(@intCast(e));
+}
+
+fn ln_flush() -> void {
+    ln_byte(10);
+    tr_note(tr_write_all(1, ln_buf[0..ln_n]));
+    ln_n = 0;
+}
+
+fn tr_key_is(off: usize, len: usize, key: []const u8) -> bool {
+    if (len != key.len) {
+        return false;
+    }
+    var i : usize = 0;
+    while (i < len) {
+        if (cfg_buf[off + i] != key[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tr_cfg_set(off: usize, len: usize, value: u64) -> void {
+    if (tr_key_is(off, len, "steps")) {
+        cfg_steps = value;
+    } else if (tr_key_is(off, len, "total")) {
+        cfg_total = value;
+    } else if (tr_key_is(off, len, "warmup")) {
+        cfg_warmup = value;
+    } else if (tr_key_is(off, len, "eval_every")) {
+        cfg_eval_every = value;
+    } else if (tr_key_is(off, len, "ckpt_every")) {
+        cfg_ckpt_every = value;
+    } else if (tr_key_is(off, len, "seed")) {
+        cfg_seed = value;
+    } else if (tr_key_is(off, len, "speed")) {
+        cfg_speed = value;
+    } else if (tr_key_is(off, len, "resume")) {
+        cfg_resume = value;
+    } else if (tr_key_is(off, len, "synth")) {
+        cfg_synth = value;
+    } else if (tr_key_is(off, len, "eval_windows")) {
+        cfg_eval_windows = value;
+    } else if (tr_key_is(off, len, "loss_positions")) {
+        if (value >= 1 and value <= 27) {
+            cfg_loss_positions = value;
+        }
+    } else if (tr_key_is(off, len, "gradcheck")) {
+        cfg_gradcheck = value;
+    }
+}
+
+/// key=value lines of /tmp/hslm/train.cfg, if the file exists; unknown keys are ignored
+fn tr_read_cfg() -> void {
+    const fd : i32 = host_open("/tmp/hslm/train.cfg", 0);
+    if (fd < 0) {
+        return;
+    }
+    const got : i64 = tr_read_full(fd, &cfg_buf);
+    tr_note(host_close(fd));
+    if (got <= 0) {
+        return;
+    }
+    const len : usize = @intCast(got);
+    var i : usize = 0;
+    while (i < len) {
+        const key_off : usize = i;
+        while (i < len and cfg_buf[i] != 61 and cfg_buf[i] != 10) {
+            i = i + 1;
+        }
+        if (i < len and cfg_buf[i] == 61) {
+            const key_len : usize = i - key_off;
+            i = i + 1;
+            var value : u64 = 0;
+            while (i < len and cfg_buf[i] >= 48 and cfg_buf[i] <= 57) {
+                value = value * 10 + @as(u64, cfg_buf[i] - 48);
+                i = i + 1;
+            }
+            tr_cfg_set(key_off, key_len, value);
+        }
+        while (i < len and cfg_buf[i] != 10) {
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+; ---------------------------------------------------------------------------------------------
+; 5. Tokens: HTOK files, and a synthetic corpus written by this binary when asked (synth=1)
+; ---------------------------------------------------------------------------------------------
+
+fn tr_open_tok(which: u8, mode: i32) -> i32 {
+    if (which == 0) {
+        return host_open("/tmp/hslm/train.tok", mode);
+    }
+    if (which == 1) {
+        return host_open("/tmp/hslm/valid.tok", mode);
+    }
+    if (which == 2) {
+        return host_open("/tmp/hslm/synth_train.tok", mode);
+    }
+    return host_open("/tmp/hslm/synth_valid.tok", mode);
+}
+
+/// Read an HTOK file into dst; the token count, or -1 (no file), -2 (bad header or size),
+/// -3 (an id of 729 or more), -4 (more tokens than dst holds)
+fn tr_read_tok(which: u8, dst: []u16) -> i64 {
+    const fd : i32 = tr_open_tok(which, 0);
+    if (fd < 0) {
+        return 0 - 1;
+    }
+    const hg : i64 = tr_read_full(fd, io_hdr[0..12]);
+    if (hg != 12 or read_u32_le(&io_hdr, 0) != HTOK_MAGIC or read_u32_le(&io_hdr, 4) != HTOK_VERSION) {
+        tr_note(host_close(fd));
+        return 0 - 2;
+    }
+    const count : usize = @intCast(read_u32_le(&io_hdr, 8));
+    if (count > dst.len) {
+        tr_note(host_close(fd));
+        return 0 - 4;
+    }
+    var idx : usize = 0;
+    var bad : bool = false;
+    while (idx < count and !bad) {
+        var want : usize = 2 * (count - idx);
+        if (want > IO_CHUNK) {
+            want = IO_CHUNK;
+        }
+        const got : i64 = tr_read_full(fd, io_chunk[0..want]);
+        if (got != @as(i64, @intCast(want))) {
+            tr_note(host_close(fd));
+            return 0 - 2;
+        }
+        var b : usize = 0;
+        while (b < want) {
+            const lo : u16 = @as(u16, io_chunk[b]);
+            const hi : u16 = @as(u16, io_chunk[b + 1]);
+            const id : u16 = lo | (hi << 8);
+            if (id >= 729) {
+                bad = true;
+            }
+            dst[idx] = id;
+            idx = idx + 1;
+            b = b + 2;
+        }
+    }
+    const extra : i64 = tr_read_full(fd, io_hdr[0..1]);
+    tr_note(host_close(fd));
+    if (bad) {
+        return 0 - 3;
+    }
+    if (extra != 0) {
+        return 0 - 2;
+    }
+    return @as(i64, @intCast(count));
+}
+
+/// Write src as an HTOK file (only the synthetic names: the real corpus is never written here)
+fn tr_write_tok(which: u8, src: []const u16) -> i32 {
+    const fd : i32 = tr_open_tok(which, 1);
+    if (fd < 0) {
+        return 0 - 1;
+    }
+    write_u32_le(&io_hdr, 0, HTOK_MAGIC);
+    write_u32_le(&io_hdr, 4, HTOK_VERSION);
+    write_u32_le(&io_hdr, 8, @intCast(src.len));
+    var rc : i32 = tr_write_all(fd, io_hdr[0..12]);
+    var idx : usize = 0;
+    while (rc == 0 and idx < src.len) {
+        var n : usize = 0;
+        while (n + 2 <= IO_CHUNK and idx < src.len) {
+            io_chunk[n] = @intCast(src[idx] & 255);
+            io_chunk[n + 1] = @intCast(src[idx] >> 8);
+            n = n + 2;
+            idx = idx + 1;
+        }
+        rc = tr_write_all(fd, io_chunk[0..n]);
+    }
+    const c : i32 = host_close(fd);
+    if (rc != 0 or c != 0) {
+        return 0 - 2;
+    }
+    return 0;
+}
+
+/// A learnable synthetic stream: next = (7 cur + 3) mod 729, one token in ten drawn at random
+fn tr_synth(dst: []u16, seed: u64) -> void {
+    var x : u64 = seed;
+    if (x == 0) {
+        x = 1;
+    }
+    var cur : u64 = 1;
+    var i : usize = 0;
+    while (i < dst.len) {
+        x = tr_xs(x);
+        var nxt : u64 = (7 * cur + 3) % 729;
+        if (x % 10 == 0) {
+            nxt = (x >> 20) % 729;
+        }
+        dst[i] = @intCast(nxt);
+        cur = nxt;
+        i = i + 1;
+    }
+}
+
+/// train.tok and valid.tok; without them and with synth=1, the synthetic pair (written once,
+/// then read back through the same reader)
+fn tr_load_data() -> i32 {
+    var nt : i64 = tr_read_tok(0, &train_tok);
+    var nv : i64 = 0;
+    if (nt == 0 - 1 and cfg_synth == 1) {
+        data_synthetic = true;
+        nt = tr_read_tok(2, &train_tok);
+        if (nt < 0) {
+            tr_synth(train_tok[0..SYN_TRAIN], 11);
+            tr_synth(valid_tok[0..SYN_VALID], 13);
+            if (tr_write_tok(2, train_tok[0..SYN_TRAIN]) != 0 or tr_write_tok(3, valid_tok[0..SYN_VALID]) != 0) {
+                return RC_SYNTH_WRITE;
+            }
+            nt = tr_read_tok(2, &train_tok);
+        }
+        nv = tr_read_tok(3, &valid_tok);
+    } else {
+        nv = tr_read_tok(1, &valid_tok);
+    }
+    if (nt < @as(i64, @intCast(CONTEXT_LEN + 2))) {
+        return RC_TRAIN_TOK;
+    }
+    if (nv < @as(i64, @intCast(CONTEXT_LEN + 2))) {
+        return RC_VALID_TOK;
+    }
+    ntrain = @intCast(nt);
+    nvalid = @intCast(nv);
+    return RC_OK;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 6. Checkpoints: MSLH (nn/hslm_data) and the resumable state, each read back and compared
+; ---------------------------------------------------------------------------------------------
+
+/// /tmp/hslm/ckpt_<step>.bin (kind 0) or .state (kind 1), NUL-terminated, in path_buf
+fn tr_path(step: u64, kind: u8) -> void {
+    ln_reset();
+    ln_str("/tmp/hslm/ckpt_");
+    ln_u64(step);
+    if (kind == 0) {
+        ln_str(".bin");
+    } else {
+        ln_str(".state");
+    }
+    var i : usize = 0;
+    while (i < ln_n) {
+        path_buf[i] = ln_buf[i];
+        i = i + 1;
+    }
+    path_buf[ln_n] = 0;
+    ln_n = 0;
+}
+
+fn tr_open_path(mode: i32) -> i32 {
+    return host_open(@ptrCast(&path_buf), mode);
+}
+
+fn tr_put_f32(buf: []u8, off: usize, x: f64) -> void {
+    const f : f32 = @floatCast(x);
+    const bits : u32 = @bitCast(f);
+    write_u32_le(buf, off, bits);
+}
+
+fn tr_get_f32(buf: []const u8, off: usize) -> f64 {
+    const bits : u32 = read_u32_le(buf, off);
+    const f : f32 = @bitCast(bits);
+    return @floatCast(f);
+}
+
+fn tr_put_u64(buf: []u8, off: usize, value: u64) -> void {
+    const lo : u32 = @intCast(value & 4294967295);
+    const hi : u32 = @intCast(value >> 32);
+    write_u32_le(buf, off, lo);
+    write_u32_le(buf, off + 4, hi);
+}
+
+fn tr_get_u64(buf: []const u8, off: usize) -> u64 {
+    const lo : u64 = read_u32_le(buf, off);
+    const hi : u64 = read_u32_le(buf, off + 4);
+    return (hi << 32) | lo;
+}
+
+fn tr_put_f64(buf: []u8, off: usize, x: f64) -> void {
+    const bits : u64 = @bitCast(x);
+    tr_put_u64(buf, off, bits);
+}
+
+fn tr_get_f64(buf: []const u8, off: usize) -> f64 {
+    const bits : u64 = tr_get_u64(buf, off);
+    const x : f64 = @bitCast(bits);
+    return x;
+}
+
+fn tr_put_seg_f32(buf: []u8, off: usize, s: usize) -> void {
+    const base : usize = seg_off[s];
+    var i : usize = 0;
+    while (i < seg_len[s]) {
+        tr_put_f32(buf, off + 4 * i, p_val[base + i]);
+        i = i + 1;
+    }
+}
+
+fn tr_get_seg_f32(buf: []const u8, off: usize, s: usize) -> void {
+    const base : usize = seg_off[s];
+    var i : usize = 0;
+    while (i < seg_len[s]) {
+        p_val[base + i] = tr_get_f32(buf, off + 4 * i);
+        i = i + 1;
+    }
+}
+
+/// The MSLH image: header, then the sections in nn/hslm_data's order and offsets
+fn tr_pack_mslh(buf: []u8, step: u32, loss: f64) -> void {
+    write_header(buf, step, loss);
+    tr_put_seg_f32(buf, output_offset(), tr_seg(K_OUT, 0));
+    var b : usize = 0;
+    while (b < NUM_BLOCKS) {
+        tr_put_seg_f32(buf, shadow_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_UP, b));
+        tr_put_seg_f32(buf, shadow_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_DOWN, b));
+        tr_put_seg_f32(buf, bias_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_BUP, b));
+        tr_put_seg_f32(buf, bias_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_BDOWN, b));
+        b = b + 1;
+    }
+}
+
+/// The sections of an MSLH image back into the flat vector (as f32 values)
+fn tr_unpack_mslh(buf: []const u8) -> void {
+    tr_get_seg_f32(buf, output_offset(), tr_seg(K_OUT, 0));
+    var b : usize = 0;
+    while (b < NUM_BLOCKS) {
+        tr_get_seg_f32(buf, shadow_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_UP, b));
+        tr_get_seg_f32(buf, shadow_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_DOWN, b));
+        tr_get_seg_f32(buf, bias_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_BUP, b));
+        tr_get_seg_f32(buf, bias_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, b), tr_seg(K_BDOWN, b));
+        b = b + 1;
+    }
+}
+
+fn tr_count_diff(a: []const u8, b: []const u8, n: usize) -> usize {
+    var diff : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != b[i]) {
+            diff = diff + 1;
+        }
+        i = i + 1;
+    }
+    return diff;
+}
+
+/// Write ckpt_<step>.bin, read it back whole, compare every byte and the header
+fn tr_write_mslh(step: u64) -> i32 {
+    tr_pack_mslh(&ck_buf, @intCast(step), last_loss);
+    tr_path(step, 0);
+    const fd : i32 = tr_open_path(1);
+    if (fd < 0) {
+        return RC_CKPT_WRITE;
+    }
+    const w : i32 = tr_write_all(fd, &ck_buf);
+    const c : i32 = host_close(fd);
+    if (w != 0 or c != 0) {
+        return RC_CKPT_WRITE;
+    }
+    const rd : i32 = tr_open_path(0);
+    if (rd < 0) {
+        return RC_CKPT_VERIFY;
+    }
+    const got : i64 = tr_read_full(rd, &ck_back);
+    const extra : i64 = tr_read_full(rd, io_hdr[0..1]);
+    tr_note(host_close(rd));
+    if (got != @as(i64, @intCast(MSLH_BYTES)) or extra != 0) {
+        return RC_CKPT_VERIFY;
+    }
+    if (tr_count_diff(&ck_buf, &ck_back, MSLH_BYTES) != 0) {
+        return RC_CKPT_VERIFY;
+    }
+    if (parse_header(&ck_back) != HEADER_OK or @as(u64, header_step(&ck_back)) != step) {
+        return RC_CKPT_VERIFY;
+    }
+    return RC_OK;
+}
+
+fn tr_state_get(e: usize) -> f64 {
+    if (e < NPARAM) {
+        return p_val[e];
+    }
+    if (e < 2 * NPARAM) {
+        return m_val[e - NPARAM];
+    }
+    return v_val[e - 2 * NPARAM];
+}
+
+fn tr_state_set(e: usize, x: f64) -> void {
+    if (e < NPARAM) {
+        p_val[e] = x;
+    } else if (e < 2 * NPARAM) {
+        m_val[e - NPARAM] = x;
+    } else {
+        v_val[e - 2 * NPARAM] = x;
+    }
+}
+
+/// count f64 of the state stream (p, then m, then v) from element `first`, into buf
+fn tr_state_encode(first: usize, count: usize, buf: []u8) -> void {
+    var k : usize = 0;
+    while (k < count) {
+        tr_put_f64(buf, 8 * k, tr_state_get(first + k));
+        k = k + 1;
+    }
+}
+
+fn tr_state_decode(first: usize, count: usize, buf: []const u8) -> void {
+    var k : usize = 0;
+    while (k < count) {
+        tr_state_set(first + k, tr_get_f64(buf, 8 * k));
+        k = k + 1;
+    }
+}
+
+fn tr_state_header(buf: []u8, step: u64) -> void {
+    var z : usize = 0;
+    while (z < STATE_HEADER) {
+        buf[z] = 0;
+        z = z + 1;
+    }
+    write_u32_le(buf, 0, STATE_MAGIC);
+    write_u32_le(buf, 4, STATE_VERSION);
+    write_u32_le(buf, 8, @intCast(step));
+    write_u32_le(buf, 12, @intCast(NPARAM));
+    tr_put_u64(buf, 16, rng_state);
+    tr_put_f64(buf, 24, beta1_pow);
+    tr_put_f64(buf, 32, beta2_pow);
+    tr_put_f64(buf, 40, last_loss);
+    write_u32_le(buf, 48, @intCast(NSEG));
+}
+
+/// Write ckpt_<step>.state, then read it back and compare it chunk by chunk with the encoding
+fn tr_write_state(step: u64) -> i32 {
+    tr_path(step, 1);
+    const fd : i32 = tr_open_path(1);
+    if (fd < 0) {
+        return RC_STATE_WRITE;
+    }
+    tr_state_header(&io_hdr, step);
+    var rc : i32 = tr_write_all(fd, &io_hdr);
+    const total : usize = 3 * NPARAM;
+    const per : usize = IO_CHUNK / 8;
+    var e : usize = 0;
+    while (rc == 0 and e < total) {
+        var n : usize = total - e;
+        if (n > per) {
+            n = per;
+        }
+        tr_state_encode(e, n, &io_chunk);
+        rc = tr_write_all(fd, io_chunk[0..8 * n]);
+        e = e + n;
+    }
+    const c : i32 = host_close(fd);
+    if (rc != 0 or c != 0) {
+        return RC_STATE_WRITE;
+    }
+    const rd : i32 = tr_open_path(0);
+    if (rd < 0) {
+        return RC_STATE_VERIFY;
+    }
+    var same : bool = tr_read_full(rd, &io_hdr_back) == @as(i64, @intCast(STATE_HEADER));
+    if (same and tr_count_diff(&io_hdr, &io_hdr_back, STATE_HEADER) != 0) {
+        same = false;
+    }
+    e = 0;
+    while (same and e < total) {
+        var n : usize = total - e;
+        if (n > per) {
+            n = per;
+        }
+        tr_state_encode(e, n, &io_chunk);
+        const got : i64 = tr_read_full(rd, io_back[0..8 * n]);
+        if (got != @as(i64, @intCast(8 * n)) or tr_count_diff(&io_chunk, &io_back, 8 * n) != 0) {
+            same = false;
+        }
+        e = e + n;
+    }
+    if (same and tr_read_full(rd, io_hdr_back[0..1]) != 0) {
+        same = false;
+    }
+    tr_note(host_close(rd));
+    if (!same) {
+        return RC_STATE_VERIFY;
+    }
+    return RC_OK;
+}
+
+/// Restart from ckpt_<step>.state: parameters, moments, beta powers, PRNG, last loss
+fn tr_load_state(step: u64) -> i32 {
+    tr_path(step, 1);
+    const rd : i32 = tr_open_path(0);
+    if (rd < 0) {
+        return RC_RESUME;
+    }
+    const hg : i64 = tr_read_full(rd, &io_hdr_back);
+    var ok : bool = hg == @as(i64, @intCast(STATE_HEADER));
+    if (ok) {
+        ok = read_u32_le(&io_hdr_back, 0) == STATE_MAGIC and read_u32_le(&io_hdr_back, 4) == STATE_VERSION and @as(u64, read_u32_le(&io_hdr_back, 8)) == step and @as(usize, read_u32_le(&io_hdr_back, 12)) == NPARAM and @as(usize, read_u32_le(&io_hdr_back, 48)) == NSEG;
+    }
+    const total : usize = 3 * NPARAM;
+    const per : usize = IO_CHUNK / 8;
+    var e : usize = 0;
+    while (ok and e < total) {
+        var n : usize = total - e;
+        if (n > per) {
+            n = per;
+        }
+        const got : i64 = tr_read_full(rd, io_back[0..8 * n]);
+        if (got != @as(i64, @intCast(8 * n))) {
+            ok = false;
+        } else {
+            tr_state_decode(e, n, &io_back);
+        }
+        e = e + n;
+    }
+    tr_note(host_close(rd));
+    if (!ok) {
+        return RC_RESUME;
+    }
+    rng_state = tr_get_u64(&io_hdr_back, 16);
+    beta1_pow = tr_get_f64(&io_hdr_back, 24);
+    beta2_pow = tr_get_f64(&io_hdr_back, 32);
+    last_loss = tr_get_f64(&io_hdr_back, 40);
+    tr_scatter_all();
+    return RC_OK;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 7. main
+; ---------------------------------------------------------------------------------------------
+
+fn tr_eval_line(step: u64, have_train: bool, avg_loss: f64, valid: f64, valid_full: f64, train_secs: f64, train_steps: u64) -> void {
+    ln_reset();
+    ln_str("step ");
+    ln_u64(step);
+    ln_str(" objective last");
+    ln_u64(cfg_loss_positions);
+    if (have_train) {
+        ln_str(" train_loss_last");
+        ln_u64(cfg_loss_positions);
+        ln_byte(32);
+        ln_f64(last_loss, 4);
+        ln_str(" train_ppl_last");
+        ln_u64(cfg_loss_positions);
+        ln_byte(32);
+        ln_f64(exp(last_loss), 2);
+        ln_str(" avg_loss_last");
+        ln_u64(cfg_loss_positions);
+        ln_byte(32);
+        ln_f64(avg_loss, 4);
+    } else {
+        ln_str(" train_loss - train_ppl - avg_loss -");
+    }
+    ln_str(" valid_loss ");
+    ln_f64(valid, 4);
+    ln_str(" valid_ppl ");
+    ln_f64(exp(valid), 2);
+    ln_str(" valid_full_loss ");
+    ln_f64(valid_full, 4);
+    ln_str(" valid_full_ppl ");
+    ln_f64(exp(valid_full), 2);
+    if (train_steps > 0 and train_secs > 0.0) {
+        const sps : f64 = train_secs / @as(f64, @floatFromInt(train_steps));
+        ln_str(" tok_per_s ");
+        ln_f64(@as(f64, @floatFromInt(BATCH * CONTEXT_LEN)) / sps, 1);
+        ln_str(" s_per_step ");
+        ln_f64(sps, 4);
+    } else {
+        ln_str(" tok_per_s - s_per_step -");
+    }
+    ln_str(" lr ");
+    ln_f64(last_lr, 8);
+    ln_str(" gnorm ");
+    ln_f64(last_gnorm, 4);
+    ln_flush();
+}
+
+fn tr_main() -> i32 {
+    const t_begin : f64 = tr_now();
+    tr_read_cfg();
+    speed_level = @intCast(cfg_speed % 3);
+    if (cfg_gradcheck > 0) {
+        return tr_gradcheck();
+    }
+    const k_obj : usize = @intCast(cfg_loss_positions);
+    const rc_data : i32 = tr_load_data();
+    if (rc_data != RC_OK) {
+        ln_reset();
+        ln_str("train_hslm: token files missing or bad, code ");
+        ln_u64(@intCast(rc_data));
+        ln_flush();
+        return rc_data;
+    }
+    tr_init(cfg_seed);
+    var step : u64 = 0;
+    if (cfg_resume > 0) {
+        const rc_res : i32 = tr_load_state(cfg_resume);
+        if (rc_res != RC_OK) {
+            return rc_res;
+        }
+        step = cfg_resume;
+    }
+    ln_reset();
+    ln_str("train_hslm: train_tokens ");
+    ln_u64(@intCast(ntrain));
+    ln_str(" valid_tokens ");
+    ln_u64(@intCast(nvalid));
+    if (data_synthetic) {
+        ln_str(" (synthetic)");
+    }
+    ln_str(" nparam ");
+    ln_u64(@intCast(NPARAM));
+    ln_str(" batch ");
+    ln_u64(@intCast(BATCH));
+    ln_str(" steps ");
+    ln_u64(cfg_steps);
+    ln_str(" total ");
+    ln_u64(cfg_total);
+    ln_str(" warmup ");
+    ln_u64(cfg_warmup);
+    ln_str(" seed ");
+    ln_u64(cfg_seed);
+    ln_str(" speed ");
+    ln_u64(@as(u64, speed_level));
+    ln_str(" loss_positions ");
+    ln_u64(cfg_loss_positions);
+    ln_str(" from_step ");
+    ln_u64(step);
+    ln_flush();
+    var eval_count : u64 = cfg_eval_windows;
+    if (eval_count == 0) {
+        eval_count = 1;
+    }
+    tr_eval_line(step, false, 0.0, tr_valid_loss(@intCast(eval_count)), tr_valid_full_loss(@intCast(eval_count)), 0.0, 0);
+    var train_secs : f64 = 0.0;
+    var all_secs : f64 = 0.0;
+    var interval_steps : u64 = 0;
+    var interval_loss : f64 = 0.0;
+    var run_steps : u64 = 0;
+    var first_loss : f64 = 0.0;
+    var rc : i32 = RC_OK;
+    while (rc == RC_OK and step < cfg_steps) {
+        const t0 : f64 = tr_now();
+        const loss : f64 = tr_train_step_k(step, BATCH, 0.0, false, k_obj);
+        const t1 : f64 = tr_now();
+        step = step + 1;
+        train_secs = train_secs + (t1 - t0);
+        all_secs = all_secs + (t1 - t0);
+        interval_steps = interval_steps + 1;
+        interval_loss = interval_loss + loss;
+        if (run_steps == 0) {
+            first_loss = loss;
+        }
+        run_steps = run_steps + 1;
+        if (loss != loss) {
+            rc = RC_NAN;
+        }
+        if (rc == RC_OK and (step % cfg_eval_every == 0 or step == cfg_steps)) {
+            const avg : f64 = interval_loss / @as(f64, @floatFromInt(interval_steps));
+            tr_eval_line(step, true, avg, tr_valid_loss(@intCast(eval_count)), tr_valid_full_loss(@intCast(eval_count)), train_secs, interval_steps);
+            train_secs = 0.0;
+            interval_steps = 0;
+            interval_loss = 0.0;
+        }
+        if (rc == RC_OK and (step % cfg_ckpt_every == 0 or step == cfg_steps)) {
+            rc = tr_write_mslh(step);
+            if (rc == RC_OK) {
+                rc = tr_write_state(step);
+            }
+            ln_reset();
+            ln_str("checkpoint ");
+            ln_u64(step);
+            if (rc == RC_OK) {
+                ln_str(" written and read back byte-equal: /tmp/hslm/ckpt_");
+            } else {
+                ln_str(" FAILED, code ");
+                ln_u64(@intCast(rc));
+                ln_str(" /tmp/hslm/ckpt_");
+            }
+            ln_u64(step);
+            ln_str(".bin (4971796 bytes) + .state");
+            ln_flush();
+        }
+    }
+    ln_reset();
+    ln_str("done steps ");
+    ln_u64(run_steps);
+    ln_str(" objective last");
+    ln_u64(cfg_loss_positions);
+    ln_str(" train_s ");
+    ln_f64(all_secs, 2);
+    if (run_steps > 0 and all_secs > 0.0) {
+        const sps : f64 = all_secs / @as(f64, @floatFromInt(run_steps));
+        ln_str(" s_per_step ");
+        ln_f64(sps, 4);
+        ln_str(" tok_per_s ");
+        ln_f64(@as(f64, @floatFromInt(BATCH * CONTEXT_LEN)) / sps, 1);
+        ln_str(" first_loss ");
+        ln_f64(first_loss, 4);
+        ln_str(" last_loss ");
+        ln_f64(last_loss, 4);
+    }
+    ln_str(" wall_s ");
+    ln_f64(tr_now() - t_begin, 2);
+    ln_str(" io_fail ");
+    ln_u64(@as(u64, io_fail));
+    ln_str(" rc ");
+    ln_u64(@intCast(rc));
+    ln_flush();
+    return rc;
+}
+
+/// The program `t27c compile --backend ml` builds: train, evaluate, checkpoint; any checkpoint
+/// that does not read back byte-equal, a NaN loss or missing tokens fail the run
+pub fn main() -> void {
+    assert tr_main() == RC_OK;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 8. Test helpers (each returns the number its test checks) and the tests
+; ---------------------------------------------------------------------------------------------
+
+/// A digest of `count` window starts drawn from `seed` over n tokens
+fn tr_sample_digest(seed: u64, count: usize, n: usize) -> u64 {
+    rng_state = seed;
+    var h : u64 = 17;
+    var k : usize = 0;
+    while (k < count) {
+        const s : u64 = @intCast(tr_next_start(n));
+        h = (h * 31 + s) % 4294967291;
+        k = k + 1;
+    }
+    return h;
+}
+
+/// The largest of `count` starts drawn from `seed` over n tokens
+fn tr_sample_max(seed: u64, count: usize, n: usize) -> usize {
+    rng_state = seed;
+    var mx : usize = 0;
+    var k : usize = 0;
+    while (k < count) {
+        const s : usize = tr_next_start(n);
+        if (s > mx) {
+            mx = s;
+        }
+        k = k + 1;
+    }
+    return mx;
+}
+
+/// The global norm of a fixed 1000-entry vector times `scale`, after clipping to 1.0
+fn tr_clip_norm_after(scale: f64) -> f64 {
+    var i : usize = 0;
+    while (i < 1000) {
+        clip_buf[i] = scale * (@as(f64, @floatFromInt((i * 37) % 101)) - 50.0);
+        i = i + 1;
+    }
+    const before : f64 = tr_clip_global(&clip_buf, CLIP_NORM);
+    if (before <= CLIP_NORM) {
+        return 0.0 - 1.0;
+    }
+    return tr_norm(&clip_buf);
+}
+
+/// How many entries clipping changes in a vector whose norm is already below 1.0
+fn tr_clip_changed(scale: f64) -> usize {
+    var i : usize = 0;
+    while (i < 1000) {
+        clip_buf[i] = scale * (@as(f64, @floatFromInt((i * 37) % 101)) - 50.0);
+        clip_ref[i] = clip_buf[i];
+        i = i + 1;
+    }
+    const before : f64 = tr_clip_global(&clip_buf, CLIP_NORM);
+    var changed : usize = 0;
+    i = 0;
+    while (i < 1000) {
+        if (clip_buf[i] != clip_ref[i]) {
+            changed = changed + 1;
+        }
+        i = i + 1;
+    }
+    if (before > CLIP_NORM) {
+        changed = changed + 1000;
+    }
+    return changed;
+}
+
+/// A small synthetic corpus in train_tok and valid_tok, and a fresh model
+fn tr_tiny_setup(seed: u64) -> void {
+    tr_synth(train_tok[0..4096], 99);
+    tr_synth(valid_tok[0..1024], 98);
+    ntrain = 4096;
+    nvalid = 1024;
+    tr_init(seed);
+}
+
+fn tr_fixed_loss(count: usize) -> f64 {
+    var sum : f64 = 0.0;
+    var k : usize = 0;
+    while (k < count) {
+        sum = sum + tr_window_loss(train_tok[0..ntrain], fixed_starts[k]);
+        k = k + 1;
+    }
+    return sum / @as(f64, @floatFromInt(count));
+}
+
+/// Two LAMB steps at lr 0.01 on two fixed windows; the loss on them after (before: tiny_before)
+fn tr_tiny_after() -> f64 {
+    speed_level = 2;
+    tr_tiny_setup(7);
+    fixed_starts[0] = 100;
+    fixed_starts[1] = 2000;
+    tiny_before = tr_fixed_loss(2);
+    var t : u64 = 0;
+    while (t < 2) {
+        const seen : f64 = tr_train_step(t, 2, 0.01, true);
+        if (seen != seen) {
+            return seen;
+        }
+        t = t + 1;
+    }
+    return tr_fixed_loss(2);
+}
+
+fn tr_tiny_before() -> f64 {
+    return tiny_before;
+}
+
+/// The largest |difference| between the logits of one window at speed `fast` and at speed 0
+fn tr_speed_logit_diff(fast: u8) -> f64 {
+    tr_tiny_setup(5);
+    speed_level = 0;
+    tr_window_forward(train_tok[0..ntrain], 500, &ref_logits);
+    speed_level = fast;
+    tr_window_forward(train_tok[0..ntrain], 500, &win_logits);
+    var mx : f64 = 0.0;
+    var i : usize = 0;
+    while (i < VOCAB_SIZE) {
+        const d : f64 = abs(win_logits[i] - ref_logits[i]);
+        if (d > mx or d != d) {
+            mx = d;
+        }
+        i = i + 1;
+    }
+    return mx;
+}
+
+/// The relative difference of the input gradient (it flows back through every
+/// ternary_matmul_t_add) between speed 2 and speed 0
+fn tr_speed_grad_reldiff() -> f64 {
+    tr_tiny_setup(5);
+    speed_level = 0;
+    zero_weight_gradients();
+    const l0 : f64 = tr_window_grad(train_tok[0..ntrain], 700);
+    var c : usize = 0;
+    while (c < EMBED_DIM) {
+        ref_gin[c] = win_gin[c];
+        c = c + 1;
+    }
+    speed_level = 2;
+    zero_weight_gradients();
+    const l2 : f64 = tr_window_grad(train_tok[0..ntrain], 700);
+    var num : f64 = 0.0;
+    var den : f64 = 0.0;
+    var i : usize = 0;
+    while (i < EMBED_DIM) {
+        const d : f64 = win_gin[i] - ref_gin[i];
+        num = num + d * d;
+        den = den + ref_gin[i] * ref_gin[i];
+        i = i + 1;
+    }
+    if (l0 != l2 or den == 0.0) {
+        return 1.0;
+    }
+    return sqrt(num / den);
+}
+
+/// Bytes that differ between an MSLH image and the image packed again from its own decoded floats
+fn tr_mslh_roundtrip_diff() -> usize {
+    tr_init(3);
+    last_loss = 5.5;
+    tr_pack_mslh(&ck_buf, 7, last_loss);
+    tr_init(4);
+    tr_unpack_mslh(&ck_buf);
+    tr_pack_mslh(&ck_back, 7, 5.5);
+    return tr_count_diff(&ck_buf, &ck_back, MSLH_BYTES);
+}
+
+fn tr_mslh_header_status() -> u32 {
+    return parse_header(&ck_back);
+}
+
+fn tr_mslh_header_step() -> u32 {
+    return header_step(&ck_back);
+}
+
+fn tr_mslh_header_loss() -> f64 {
+    return header_loss(&ck_back);
+}
+
+/// One flipped byte in the copy is found: the diff count is 1
+fn tr_mslh_flip_diff() -> usize {
+    ck_back[123457] = ck_back[123457] ^ 1;
+    return tr_count_diff(&ck_buf, &ck_back, MSLH_BYTES);
+}
+
+/// State stream round trip across the p / m boundary: encode a chunk, clear it, decode it;
+/// the number of f64 whose bits differ from before
+fn tr_state_roundtrip_diff() -> usize {
+    tr_init(9);
+    var k : usize = 0;
+    while (k < NPARAM) {
+        m_val[k] = 0.001 * p_val[k];
+        v_val[k] = p_val[k] * p_val[k];
+        k = k + 1;
+    }
+    const first : usize = NPARAM - 1000;
+    const per : usize = IO_CHUNK / 8;
+    k = 0;
+    while (k < per) {
+        st_save[k] = tr_state_get(first + k);
+        k = k + 1;
+    }
+    tr_state_encode(first, per, &io_chunk);
+    k = 0;
+    while (k < per) {
+        tr_state_set(first + k, 0.0);
+        k = k + 1;
+    }
+    tr_state_decode(first, per, &io_chunk);
+    var diff : usize = 0;
+    k = 0;
+    while (k < per) {
+        const a : u64 = @bitCast(st_save[k]);
+        const b : u64 = @bitCast(tr_state_get(first + k));
+        if (a != b) {
+            diff = diff + 1;
+        }
+        k = k + 1;
+    }
+    return diff;
+}
+
+fn tr_mslh_size() -> usize {
+    return real_file_bytes();
+}
+
+fn tr_param_count() -> usize {
+    return tr_build_segments();
+}
+
+; THE K-POSITION OBJECTIVE, CHECKED. The kinds a gradient check can move: nn/hslm's MAT_* (a ternary
+; matrix entry, moved through the nudge as a real weight before the alpha scale, which is the
+; quantity gw_* is the gradient of), one embedding table entry, one output bias entry. Central
+; differences with step FD_H = 1e-4; a check passes below a relative error of 1e-4 (measured: at
+; most 5e-6, on a W_down entry of magnitude 2e-7). Negative controls, one line each: scoring the
+; wrong target fails 5 of these 6 tests (not the head check: its vocab entry is not a target in
+; that window), dropping the 1/k scale fails 4, and an off-by-one loop bound fails 5.
+const FD_EMBED : u8 = 20;
+const FD_BOUT : u8 = 21;
+const FD_H : f64 = 0.0001;
+var fd_analytic : f64 = 0.0;
+var fd_stop : f64 = 0.0;
+var fd_true : f64 = 0.0;
+var fd_loss : f64 = 0.0;
+var uni_loss : f64 = 0.0;
+var uni_ref : f64 = 0.0;
+var cmp_val : [NPARAM]f64 = undefined;
+
+/// One step on three fixed windows by tr_train_step (the last-position objective as it was) and
+/// by tr_train_step_k at k = 1, from the same init: the number of parameters whose bits differ,
+/// plus 1 if the two losses differ. The parameters of the first run stay in cmp_val.
+fn tr_k1_bitdiff() -> usize {
+    speed_level = 2;
+    tr_tiny_setup(7);
+    fixed_starts[0] = 100;
+    fixed_starts[1] = 2000;
+    fixed_starts[2] = 3500;
+    const a : f64 = tr_train_step(0, 3, 0.01, true);
+    var i : usize = 0;
+    while (i < NPARAM) {
+        cmp_val[i] = p_val[i];
+        i = i + 1;
+    }
+    tr_tiny_setup(7);
+    const b : f64 = tr_train_step_k(0, 3, 0.01, true, 1);
+    var diff : usize = 0;
+    i = 0;
+    while (i < NPARAM) {
+        const x : u64 = @bitCast(p_val[i]);
+        const y : u64 = @bitCast(cmp_val[i]);
+        if (x != y) {
+            diff = diff + 1;
+        }
+        i = i + 1;
+    }
+    const la : u64 = @bitCast(a);
+    const lb : u64 = @bitCast(b);
+    if (la != lb) {
+        diff = diff + 1;
+    }
+    return diff;
+}
+
+/// The same step at k = 27: how many parameters end elsewhere than after the k = 1 step in cmp_val
+/// (the objective is not the old one under another name)
+fn tr_k27_moved() -> usize {
+    speed_level = 2;
+    tr_tiny_setup(7);
+    const seen : f64 = tr_train_step_k(0, 3, 0.01, true, 27);
+    var moved : usize = 0;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        if (p_val[i] != cmp_val[i]) {
+            moved = moved + 1;
+        }
+        i = i + 1;
+    }
+    if (seen != seen) {
+        return 0;
+    }
+    return moved;
+}
+
+/// |window loss of tr_window_grad_k - mean of the k per-position cross-entropies of forward-only
+/// calls| on one window; fd_loss keeps the first
+fn tr_k_loss_gap(k: usize) -> f64 {
+    speed_level = 2;
+    tr_tiny_setup(5);
+    zero_weight_gradients();
+    fd_loss = tr_window_grad_k(train_tok[0..ntrain], 700, k);
+    var sum : f64 = 0.0;
+    var p : usize = CONTEXT_LEN - k;
+    while (p < CONTEXT_LEN) {
+        speed_level = 0;
+        tr_window_forward_to(train_tok[0..ntrain], 700, p);
+        sum = sum + cross_entropy(&ref_logits, @as(usize, @intCast(train_tok[700 + p + 1])));
+        p = p + 1;
+    }
+    speed_level = 2;
+    return abs(fd_loss - sum / @as(f64, @floatFromInt(k)));
+}
+
+/// Positions 0..last of a window by plain hslm_forward; the logits of `last` land in ref_logits
+fn tr_window_forward_to(tokens: []const u16, start: usize, last: usize) -> void {
+    var p : usize = 0;
+    while (p <= last) {
+        const tok : usize = @intCast(tokens[start + p]);
+        hslm_forward(tok, p, &ref_logits);
+        p = p + 1;
+    }
+}
+
+fn tr_k_loss_value() -> f64 {
+    return fd_loss;
+}
+
+/// Uniform logits (alpha_out = 0, b_out = 0) on one window at k = 27: every position's loss is
+/// ln 729 and d loss / d b_out[j] = 1/729 - (positions whose target is j) / 27. Returns the largest
+/// error of that bias gradient; uni_loss and uni_ref keep the window loss of tr_window_grad_k and
+/// of tr_window_loss_k.
+fn tr_uniform_bias_err() -> f64 {
+    speed_level = 2;
+    tr_tiny_setup(5);
+    model.alpha_out = 0.0;
+    fill(&model.b_out, 0.0);
+    zero_weight_gradients();
+    uni_loss = tr_window_grad_k(train_tok[0..ntrain], 900, CONTEXT_LEN);
+    uni_ref = tr_window_loss_k(train_tok[0..ntrain], 900, CONTEXT_LEN);
+    var j : usize = 0;
+    while (j < VOCAB_SIZE) {
+        clip_ref[j] = 0.0;
+        j = j + 1;
+    }
+    var p : usize = 1;
+    while (p <= CONTEXT_LEN) {
+        const t : usize = @intCast(train_tok[900 + p]);
+        clip_ref[t] = clip_ref[t] + 1.0;
+        p = p + 1;
+    }
+    var mx : f64 = 0.0;
+    j = 0;
+    while (j < VOCAB_SIZE) {
+        const want : f64 = 1.0 / 729.0 - clip_ref[j] / 27.0;
+        const d : f64 = abs(g_b_out[j] - want);
+        if (d > mx or d != d) {
+            mx = d;
+        }
+        j = j + 1;
+    }
+    return mx;
+}
+
+fn tr_uniform_loss_err() -> f64 {
+    return abs(uni_loss - log(729.0));
+}
+
+fn tr_uniform_ref_err() -> f64 {
+    return abs(uni_ref - log(729.0));
+}
+
+fn tr_fd_base(kind: u8, index: usize) -> f64 {
+    if (kind == FD_EMBED) {
+        return model.embed[index];
+    }
+    if (kind == FD_BOUT) {
+        return model.b_out[index];
+    }
+    return 0.0;
+}
+
+/// The parameter at base + delta (MAT_*: the nudge, whose base is the weight itself)
+fn tr_fd_put(kind: u8, block_idx: usize, index: usize, base: f64, delta: f64) -> void {
+    if (kind == FD_EMBED) {
+        model.embed[index] = base + delta;
+    } else if (kind == FD_BOUT) {
+        model.b_out[index] = base + delta;
+    } else {
+        nudge_which = kind;
+        nudge_block = block_idx;
+        nudge_index = index;
+        nudge_delta = delta;
+    }
+}
+
+fn tr_fd_restore(kind: u8, index: usize, base: f64) -> void {
+    if (kind == FD_EMBED) {
+        model.embed[index] = base;
+    } else if (kind == FD_BOUT) {
+        model.b_out[index] = base;
+    }
+    nudge_which = MAT_NONE;
+    nudge_delta = 0.0;
+}
+
+/// The accumulated analytic gradient of one parameter
+fn tr_fd_grad(kind: u8, block_idx: usize, index: usize) -> f64 {
+    if (kind == FD_EMBED) {
+        return g_embed[index];
+    }
+    if (kind == FD_BOUT) {
+        return g_b_out[index];
+    }
+    if (kind == MAT_Q) {
+        return gw_q[block_idx * EMBED_DIM * EMBED_DIM + index];
+    }
+    if (kind == MAT_K) {
+        return gw_k[block_idx * EMBED_DIM * EMBED_DIM + index];
+    }
+    if (kind == MAT_V) {
+        return gw_v[block_idx * EMBED_DIM * EMBED_DIM + index];
+    }
+    if (kind == MAT_O) {
+        return gw_o[block_idx * EMBED_DIM * EMBED_DIM + index];
+    }
+    if (kind == MAT_UP) {
+        return gw_up[block_idx * EMBED_DIM * FF_DIM + index];
+    }
+    if (kind == MAT_DOWN) {
+        return gw_down[block_idx * FF_DIM * EMBED_DIM + index];
+    }
+    return gw_out[index];
+}
+
+fn tr_rel(a: f64, b: f64) -> f64 {
+    var m : f64 = abs(a);
+    if (abs(b) > m) {
+        m = abs(b);
+    }
+    if (m == 0.0 or m != m) {
+        return 1.0;
+    }
+    return abs(a - b) / m;
+}
+
+/// One gradient check of the k-position objective on window 700 of the tiny corpus, model seed 5.
+/// fd_analytic: tr_window_grad_k. fd_stop: central differences with step FD_H, the parameter moved
+/// only during the forward of the position whose loss is measured, earlier positions as they were
+/// -- the derivative the analytic gradient defines, since earlier keys and values are its
+/// constants. fd_true: the parameter moved for the whole window (forward only, tr_window_loss_k);
+/// it equals fd_stop for parameters no cached key or value depends on (the head, and the last
+/// block's Q, O, up, down). Returns |fd_analytic - fd_stop| / max(|fd_analytic|, |fd_stop|).
+fn tr_fd_check(kind: u8, block_idx: usize, index: usize, k: usize) -> f64 {
+    const start : usize = 700;
+    speed_level = 2;
+    tr_tiny_setup(5);
+    zero_weight_gradients();
+    fd_loss = tr_window_grad_k(train_tok[0..ntrain], start, k);
+    fd_analytic = tr_fd_grad(kind, block_idx, index);
+    const base : f64 = tr_fd_base(kind, index);
+    const up : f64 = (base + FD_H) - base;
+    const dn : f64 = (base - FD_H) - base;
+    var sum : f64 = 0.0;
+    var p : usize = 0;
+    while (p < CONTEXT_LEN) {
+        const tok : usize = @intCast(train_tok[start + p]);
+        if (p >= CONTEXT_LEN - k) {
+            const target : usize = @intCast(train_tok[start + p + 1]);
+            tr_fd_put(kind, block_idx, index, base, up);
+            hslm_forward(tok, p, &ref_logits);
+            const lp : f64 = cross_entropy(&ref_logits, target);
+            tr_fd_put(kind, block_idx, index, base, dn);
+            hslm_forward(tok, p, &ref_logits);
+            const lm : f64 = cross_entropy(&ref_logits, target);
+            tr_fd_restore(kind, index, base);
+            sum = sum + (lp - lm) / (up - dn);
+        }
+        hslm_forward(tok, p, &ref_logits);
+        p = p + 1;
+    }
+    fd_stop = sum / @as(f64, @floatFromInt(k));
+    tr_fd_put(kind, block_idx, index, base, up);
+    const wp : f64 = tr_window_loss_k(train_tok[0..ntrain], start, k);
+    tr_fd_put(kind, block_idx, index, base, dn);
+    const wm : f64 = tr_window_loss_k(train_tok[0..ntrain], start, k);
+    tr_fd_restore(kind, index, base);
+    fd_true = (wp - wm) / (up - dn);
+    return tr_rel(fd_analytic, fd_stop);
+}
+
+fn tr_fd_true_rel() -> f64 {
+    return tr_rel(fd_analytic, fd_true);
+}
+
+fn tr_fd_mag() -> f64 {
+    return abs(fd_analytic);
+}
+
+/// The embedding entry the checks move: row of the token at position 3 of window 700, column 10
+fn tr_fd_embed_index() -> usize {
+    tr_tiny_setup(5);
+    const tok : usize = @intCast(train_tok[700 + 3]);
+    return tok * EMBED_DIM + 10;
+}
+
+fn tr_gc_line(name: []const u8, kind: u8, block_idx: usize, index: usize, k: usize) -> void {
+    const rel : f64 = tr_fd_check(kind, block_idx, index, k);
+    ln_reset();
+    ln_str("gradcheck ");
+    ln_str(name);
+    ln_str(" block ");
+    ln_u64(@intCast(block_idx));
+    ln_str(" index ");
+    ln_u64(@intCast(index));
+    ln_str(" k ");
+    ln_u64(@intCast(k));
+    ln_str(" loss ");
+    ln_f64(fd_loss, 6);
+    ln_str(" analytic ");
+    ln_sci(fd_analytic, 9);
+    ln_str(" fd_stop ");
+    ln_sci(fd_stop, 9);
+    ln_str(" fd_true ");
+    ln_sci(fd_true, 9);
+    ln_str(" rel_stop ");
+    ln_sci(rel, 3);
+    ln_str(" rel_true ");
+    ln_sci(tr_fd_true_rel(), 3);
+    ln_flush();
+}
+
+/// gradcheck=1 in train.cfg: main prints the gradient checks the tests assert, with their numbers,
+/// and the k-position loss checks, then returns without reading tokens or training
+fn tr_gradcheck() -> i32 {
+    tr_gc_line("w_out", MAT_OUT, 0, 5 * VOCAB_SIZE + 17, 27);
+    tr_gc_line("b_out", FD_BOUT, 0, 17, 27);
+    tr_gc_line("w_out", MAT_OUT, 0, 5 * VOCAB_SIZE + 17, 7);
+    tr_gc_line("w_down", MAT_DOWN, 2, 3 * EMBED_DIM + 10, 27);
+    tr_gc_line("w_q", MAT_Q, 2, 40 * EMBED_DIM + 7, 27);
+    tr_gc_line("w_v", MAT_V, 0, 12 * EMBED_DIM + 30, 27);
+    tr_gc_line("w_k", MAT_K, 1, 50 * EMBED_DIM + 61, 27);
+    tr_gc_line("w_up", MAT_UP, 0, 20 * FF_DIM + 100, 27);
+    tr_gc_line("embed", FD_EMBED, 0, tr_fd_embed_index(), 27);
+    const gap27 : f64 = tr_k_loss_gap(27);
+    const loss27 : f64 = tr_k_loss_value();
+    const gap1 : f64 = tr_k_loss_gap(1);
+    const bias_err : f64 = tr_uniform_bias_err();
+    ln_reset();
+    ln_str("losscheck k27_loss ");
+    ln_f64(loss27, 9);
+    ln_str(" gap27 ");
+    ln_sci(gap27, 3);
+    ln_str(" gap1 ");
+    ln_sci(gap1, 3);
+    ln_str(" uniform_loss ");
+    ln_f64(uni_loss, 12);
+    ln_str(" ln729 ");
+    ln_f64(log(729.0), 12);
+    ln_str(" uniform_bias_err ");
+    ln_sci(bias_err, 3);
+    ln_flush();
+    return RC_OK;
+}
+
+test window_sampling_is_deterministic_for_a_seed
+    given first  = tr_sample_digest(27, 1000, 100000)
+    and   again  = tr_sample_digest(27, 1000, 100000)
+    and   other  = tr_sample_digest(28, 1000, 100000)
+    then  first == again
+    and   first != other
+
+test window_starts_leave_room_for_the_target
+    given top = tr_sample_max(27, 5000, 100)
+    then  top <= 72
+    and   top >= 60
+
+test lr_at_step_zero_is_the_first_warmup_slice
+    given lr0 = tr_lr_at(0, 2000, 32000)
+    when  diff = abs(lr0 - 0.001 / 2000.0)
+    then  diff < 1e-18
+
+test lr_at_the_end_of_warmup_is_the_peak
+    given last_warm = tr_lr_at(1999, 2000, 32000)
+    and   first_cos = tr_lr_at(2000, 2000, 32000)
+    then  abs(last_warm - 0.001) < 1e-15
+    and   abs(first_cos - 0.001) < 1e-15
+
+test lr_at_the_end_is_the_floor
+    given lr_end = tr_lr_at(32000, 2000, 32000)
+    and   lr_mid = tr_lr_at(17000, 2000, 32000)
+    and   lr_after = tr_lr_at(40000, 2000, 32000)
+    then  abs(lr_end - 0.000001) < 1e-15
+    and   abs(lr_mid - 0.0005005) < 1e-12
+    and   abs(lr_after - 0.000001) < 1e-15
+
+test clip_bounds_the_global_norm
+    given after = tr_clip_norm_after(3.0)
+    then  after <= 1.0 + 1e-12
+    and   after >= 1.0 - 1e-12
+
+test clip_leaves_a_small_gradient_alone
+    given changed = tr_clip_changed(0.0001)
+    then  changed == 0
+
+test the_parameter_vector_is_the_whole_model
+    given n = tr_param_count()
+    then  n == 2130138
+
+test a_checkpoint_round_trip_on_a_buffer_is_byte_equal
+    given diff = tr_mslh_roundtrip_diff()
+    and   status = tr_mslh_header_status()
+    and   step = tr_mslh_header_step()
+    and   loss = tr_mslh_header_loss()
+    and   size = tr_mslh_size()
+    and   flipped = tr_mslh_flip_diff()
+    then  diff == 0
+    and   status == 0
+    and   step == 7
+    and   abs(loss - 5.5) < 1e-6
+    and   size == 4971796
+    and   flipped == 1
+
+test the_state_stream_round_trips_bit_exactly
+    given diff = tr_state_roundtrip_diff()
+    then  diff == 0
+
+test speed_one_gives_the_reference_logits_to_the_bit
+    given diff = tr_speed_logit_diff(1)
+    then  diff == 0.0
+
+test speed_two_gives_the_reference_logits_to_the_bit
+    given diff = tr_speed_logit_diff(2)
+    then  diff == 0.0
+
+test speed_two_input_gradient_matches_the_reference
+    given rel = tr_speed_grad_reldiff()
+    then  rel < 1e-12
+
+test a_few_steps_on_a_tiny_fixed_slice_lower_the_loss
+    given after = tr_tiny_after()
+    and   before = tr_tiny_before()
+    then  before > 6.0
+    and   after < before
+
+test loss_positions_one_is_the_last_position_step_to_the_bit
+    given diff = tr_k1_bitdiff()
+    and   moved = tr_k27_moved()
+    then  diff == 0
+    and   moved > 1000000
+
+test the_27_position_loss_is_the_mean_of_27_forward_only_cross_entropies
+    given gap27 = tr_k_loss_gap(27)
+    and   loss27 = tr_k_loss_value()
+    and   gap7 = tr_k_loss_gap(7)
+    and   gap1 = tr_k_loss_gap(1)
+    then  gap27 < 1e-12
+    and   gap7 < 1e-12
+    and   gap1 < 1e-12
+    and   loss27 > 6.0
+
+test uniform_logits_give_ln_729_at_every_position
+    given bias_err = tr_uniform_bias_err()
+    and   loss_err = tr_uniform_loss_err()
+    and   ref_err = tr_uniform_ref_err()
+    then  loss_err < 1e-12
+    and   ref_err < 1e-12
+    and   bias_err < 1e-15
+
+test the_27_position_gradient_of_the_head_matches_finite_differences
+    given rel_w = tr_fd_check(MAT_OUT, 0, 5 * 729 + 17, 27)
+    and   true_w = tr_fd_true_rel()
+    and   mag_w = tr_fd_mag()
+    and   rel_b = tr_fd_check(FD_BOUT, 0, 17, 27)
+    and   true_b = tr_fd_true_rel()
+    and   mag_b = tr_fd_mag()
+    and   rel_7 = tr_fd_check(MAT_OUT, 0, 5 * 729 + 17, 7)
+    and   mag_7 = tr_fd_mag()
+    then  rel_w < 1e-4
+    and   true_w < 1e-4
+    and   mag_w > 1e-7
+    and   rel_b < 1e-4
+    and   true_b < 1e-4
+    and   mag_b > 1e-7
+    and   rel_7 < 1e-4
+    and   mag_7 > 1e-7
+
+test the_27_position_gradient_of_the_last_block_matches_finite_differences
+    given rel_d = tr_fd_check(MAT_DOWN, 2, 3 * 243 + 10, 27)
+    and   true_d = tr_fd_true_rel()
+    and   mag_d = tr_fd_mag()
+    and   rel_q = tr_fd_check(MAT_Q, 2, 40 * 243 + 7, 27)
+    and   true_q = tr_fd_true_rel()
+    and   mag_q = tr_fd_mag()
+    then  rel_d < 1e-4
+    and   true_d < 1e-4
+    and   mag_d > 1e-7
+    and   rel_q < 1e-4
+    and   true_q < 1e-4
+    and   mag_q > 1e-7
+
+test the_27_position_gradient_of_deep_parameters_matches_stop_gradient_differences
+    given rel_v = tr_fd_check(MAT_V, 0, 12 * 243 + 30, 27)
+    and   mag_v = tr_fd_mag()
+    and   rel_k = tr_fd_check(MAT_K, 1, 50 * 243 + 61, 27)
+    and   mag_k = tr_fd_mag()
+    and   rel_u = tr_fd_check(MAT_UP, 0, 20 * 729 + 100, 27)
+    and   mag_u = tr_fd_mag()
+    and   rel_e = tr_fd_check(FD_EMBED, 0, tr_fd_embed_index(), 27)
+    and   mag_e = tr_fd_mag()
+    then  rel_v < 1e-4
+    and   mag_v > 1e-7
+    and   rel_k < 1e-4
+    and   mag_k > 1e-7
+    and   rel_u < 1e-4
+    and   mag_u > 1e-7
+    and   rel_e < 1e-4
+    and   mag_e > 1e-7
