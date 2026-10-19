@@ -25,6 +25,8 @@ argument-hint: "[refusal class | measure | check <file.rs>]"
 | What a run's evidence is worth; which runner's exit code is a verdict | `specs/tools/t27o/ledger.t27` |
 | Golden criteria, the service, the installer | `golden.t27`, `service.t27`, `install.t27` in the same directory |
 | The SPICE front end (analog M2a) | `specs/tools/t27o/spice_convert.t27`, #10509 -- owned by the analog loop |
+| The Zig front end (`tri t27o <file>.zig`; the file's own `test` blocks, translated, are the oracle) | `specs/tools/t27o/zig_convert.t27`, #10597, step 1 #10765 |
+| Coverage over a tree, reused by seal keys (`tri t27o-sweep`) | the rules in `specs/tools/t27o/ledger.t27` (#10543, `--repo` #10638) |
 | Baseline numbers, the field, ten weaknesses | `docs/nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md` |
 | The overnight loop's state | epic #10522, its "Loop ledger" comment |
 | The CLI glue (reads the file, runs rustc, t27b and t27c, writes) | `cmd_t27o` in `cli/tri/src/main.rs`; every rule it applies is gen-rust of the specs above |
@@ -34,7 +36,7 @@ argument-hint: "[refusal class | measure | check <file.rs>]"
 1. Find it in the numbers, not by intuition: the first-refusal table in the doc above, or a fresh measurement (below). Pick the class with the most first refusals that needs no new type in the subset.
 2. Reproduce on a real file: `./target/release/tri t27o <file.rs> | grep -n "refused fn <name>"`.
 3. Write the test first, in `rust_convert.t27`: the tests near the end call `body(...)` / `convert(...)` on a Rust text and compare the output text. Add the rule; add a negative control (a near-miss form that must stay refused, or a mutated copy that must fail).
-4. Inner loop: `./target/release/t27b test specs/tools/t27o/rust_convert.t27` (66 tests in about 14 s). The final gate once: `t27c test-report` on it, `vacuous passes` must be 0.
+4. Inner loop: `./target/release/t27b test specs/tools/t27o/rust_convert.t27` (about 130 tests in a few seconds since #10631). The final gate once: `t27c test-report` on it, `vacuous passes` must be 0.
 5. Regenerate, never hand-edit: `./target/release/t27c gen-rust specs/tools/t27o/rust_convert.t27 > gen/rust/tools/t27o/rust_convert.rs`, check it compiles with `rustc --edition 2021 --crate-type lib`, then `t27c seal ... --save` and `--verify`.
 6. Measure the gain on the same files and commits, before and after, and put both numbers in the PR.
 
@@ -43,7 +45,8 @@ DRY: a std call goes through `rust_std.t27`, which names an existing t27 fn with
 ## Measure coverage
 
 - One file: the last line of `tri t27o <file.rs>` is its count: `t27o: N fn seen, M converted (a of b tests), R refused (S kept as stubs); coverage P%`.
-- Many files: the same command per file, with a time cap, each output kept, then the counts summed and the `// t27o: refused ... : <kind> \`<name>\`` lines tallied. Cap every file (`perl -e 'alarm 30; exec @ARGV' ./target/release/tri t27o <f>`): run time grows faster than file size, and `bootstrap/src/compiler.rs` (1.9 MB) does not finish in 5 min.
+- Many files: `tri t27o-sweep [PATHS...] [--repo <dir>] [--max-bytes N] [--cache FILE] [--top K]` converts every tracked `.rs` file in-process, prints one row per file, the totals with the coverage share, the root refusal kinds and the cascade apart. A row is reused while the file's SHA-256 and the `spec_hash` of the converter's seals hold, so a re-run after a converter change re-converts everything and a re-run without one takes well under a second. `--repo` sweeps another checkout (one cache per repository); run it from a t27 checkout, which supplies the seals.
+- Since #10631 the converter is close to linear in the file: all 1,388 Rust files of the five roadmap repositories in 26 s, `bootstrap/src/compiler.rs` in 1.4 s. A file that takes seconds again is a regression: profile it with `cmd & pid=$!; sample $pid 3 -file out.txt` (macOS; `ps` and `pgrep` are blocked in the sandbox).
 - Count first refusals as what they are: the cascade (`uses refused ...`) is 13% of them and moves when a root refusal is fixed, so rank work by root reasons.
 - Quote a number only with its repository, commit and binary.
 
@@ -51,21 +54,30 @@ DRY: a std call goes through `rust_std.t27`, which names an existing t27 fn with
 
 `--check` builds the oracle harness with rustc, writes `specs/t27o_check/<stem>.t27` with the oracle's vectors as tests, and judges it. Since #10525 it runs `t27b test` first and `t27c test-report` only when t27b's exit code is not a verdict (`t27b_outcome` in `ledger.t27`); the fallback says which code caused it. Golden means equivalent on the recorded vectors, never a proof for all inputs.
 
+For a `.zig` file there is no rustc oracle: the converted spec carries the file's own tests, so judge it with `t27b test` on the spec (`--check` for Zig is #10823).
+
 ## The loop tick (epic #10522)
 
 1. Read the ledger comment on #10522; `CronList` (delete duplicates after a restart); list running subagents. A lane a row calls running is not started again. The analog loop keeps its own ledger on #10486 and owns #10509 and `specs/analog/`: never start work there.
 2. Anomalies before new work: open PRs of the epic that are red, conflicting or stale; a lane that reported done with no PR (`git ls-remote origin | grep t27o`); a seal that no longer verifies.
 3. Opus plans and reviews, Sonnet implements (`specs/claw/model_route.t27`). Two lanes at most from this loop while the analog loop runs on the same 8 GB Mac; one lane at a time edits `rust_convert.t27`.
-4. Merge only green; enable auto-merge after reading the diff. To change a PR under auto-merge, disable it, push, enable it again.
-5. Edit the ledger row last; add a trap here when it cost more than one try.
+4. Review before auto-merge, on the PR head: `t27b test` and once `t27c test-report` (vacuous 0) on every touched spec; `t27c seal --verify`; regenerate each gen file and compare byte for byte; `python3 -I tools/dupe_scan.py` and `--like <spec>` (bodies -- `t27c dupes --name` only finds names; #10801 passed the name check with 13 copied bodies); the own-language budget compiled from the merge base (below); `python3 -I tools/check_devhome_paths.py` (#10646 brought nine `/Users/...` test literals); `cargo check -p tri`. A spec that `use`s `rust_convert.t27` (spice, zig) carries it in its seal closure: re-seal it when rust_convert changes.
+5. Merge only green, then auto-merge (GraphQL `enablePullRequestAutoMerge`). Turning auto-merge off does not hold a PR -- any actor with the token can re-arm it (#10801 merged five minutes after it was switched off). To hold a PR, convert it to a draft (`convertPullRequestToDraft`); `markPullRequestReadyForReview` when it may go.
+6. Stacked PRs and squash merges: after the base merges, `git rebase --onto origin/master <old base tip>`, check `git diff <reviewed head> HEAD -- <converter files>` is empty, push with `--force-with-lease=<branch>:<old sha>`; auto-merge survives a force push.
+7. Edit the ledger row last; add a trap here when it cost more than one try.
 
 ## Hand-written glue must net to zero
 
 The required check `own-language` (`check_budget` in `specs/policy/own_language.t27`) fails a pull request when the counted hand-written foreign files gain more lines than they lose over the whole diff -- on top of the 40-per-file / 80-per-PR cap. Specs and `gen/` do not count. A `#[path]` mount plus a few lines in `cmd_t27o` therefore needs an equal deletion in the same diff: dead code in `cli/tri/src` (`cargo check -p tri` lists it), or hand logic moved into a spec and replaced by a call. Check before the first push:
 
 ```bash
-git diff --numstat origin/master...HEAD -- cli bootstrap/src tools scripts | awk '{a+=$1; d+=$2} END {print "added", a, "deleted", d}'
+BASE=$(git merge-base origin/master HEAD)
+git show "${BASE}:gen/c/policy/own_language.c" > $TMPDIR/gate/gate.c   # zsh: write ${BASE}:, never $BASE: (the :g modifier)
+printf '#include "gate.c"\n#include <stdio.h>\nint main(void){static char b[1<<22],o[1<<22];unsigned n=check_budget((uint8_t*)b,fread(b,1,sizeof b,stdin),(uint8_t*)o,sizeof o-1);fputs(o,stdout);return n!=0;}\n' | cc -w -I $TMPDIR/gate -x c -o $TMPDIR/gate/budget -
+git diff --numstat --no-renames "${BASE}...HEAD" | $TMPDIR/gate/budget; echo rc=$?   # must print rc=0
 ```
+
+This is the gate CI runs, compiled from the base revision. Most "never used" items in `cargo check -p tri` have test callers; truly dead code is rare, so fold glue (one dispatch branch for several front ends) before hunting deletions, and agree with peer sessions on which dead lines each PR deletes.
 
 PR #10538 failed it with +9 / -0 at 1e20cfb34.
 
@@ -75,4 +87,8 @@ PR #10538 failed it with +9 / -0 at 1e20cfb34.
 - The session scratchpad is wiped when the session resumes (2026-10-18 23:53: lane worktrees, the cargo target and raw measurements gone; pushed branches survived). `$TMPDIR` survived: keep worktrees and data under `$TMPDIR/t27o-loop/`, and commit + push after every working step.
 - `--no-track` matters: the shared `.git/config` cannot be locked from the sandbox, so `-B` with tracking fails after creating the branch.
 - `gh` fails on TLS in the sandbox: use the REST and GraphQL APIs with `curl -H "Authorization: Bearer $(gh auth token)"`; write bodies to a file and build JSON with `python3`, never with backticks inside double quotes.
-- Auto-merge by API: the GraphQL mutation `enablePullRequestAutoMerge` with the PR's `node_id` and `mergeMethod: SQUASH`.
+- Auto-merge by API: the GraphQL mutation `enablePullRequestAutoMerge` with the PR's `node_id` and `mergeMethod: SQUASH`. The timeline API shows no AutoMergeEnabledEvent for an API-enabled auto-merge, so a timeline cannot prove who re-armed a PR.
+- Building `tri` on master: when `Cargo.lock` pins a crate the sandbox cannot write into `~/.cargo`, clone the registry (`cp -c -R ~/.cargo/registry $TMPDIR/cargo-home/registry`, an APFS clone that costs no space), `CARGO_HOME=$TMPDIR/cargo-home cargo fetch`, and build with that `CARGO_HOME`. Give each lane its own `ZIG_LOCAL_CACHE_DIR`: two lanes sharing one get `BLOCKED ... FileNotFound`.
+- zsh: `echo "$json"` expands `\n` inside JSON strings, so write API responses to a file and parse the file; `echo =====` runs `=` expansion; text with backticks goes through a quoted heredoc, never into a double-quoted argument (it runs the command).
+- gen-rust's `use` splice matches words inside string literals and can pull a whole module into the generated file (#10824): after regenerating, look at the gen file's size.
+- Each lane worktree costs about 320 MB; remove finished ones (`git worktree remove --force`) and keep 8 GB free.
