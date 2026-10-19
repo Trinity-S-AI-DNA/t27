@@ -1,0 +1,1761 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/bit_diff_logic.t27 -- the bit-diff widget's bitstream reader and frame comparison: a Xilinx
+; 7-series .bit or .bin read into packets and frame writes, mapped onto a device's frame addresses,
+; compared frame by frame. Ported from trinity apps/website/public/widgets/bit-diff/bitparse.js (371
+; lines). Epic gHashTag/t27#10937, issue #10938. UG470 names for registers and commands are kept.
+; --
+; JS export         -> t27 function(s)                          note
+;   SYNC_WORD, FRAME_WORDS, ECC_WORD, ECC_MASK -> consts of this module
+;   REG_NAMES, CMD_NAMES, BLOCK_NAMES -> name_of(kind, code) fills the name buffer, name_byte(i) reads it
+;   hex8             -> lb_hex8 (inside the line builder), hex8_into(v) + name_byte
+;   decodeFar        -> decode_far(far, f)         encodeFar -> encode_far(block, bottom, row, column, minor)
+;   findSync         -> find_sync(u8, from, limit)
+;   parseBitstream   -> bs_parse(inst, u8) + bs_* getters   (inst 0 is stream A, 1 is stream B)
+;   packetLine       -> packet_line(inst, k) + name_byte(i)     packetSequence -> bs_seq(inst) + seq_byte(inst, i)
+;   lineDiff         -> line_diff(a_list, b_list) + ld_* getters
+;   frameSlots       -> slots_build(g) + slot_get(i)
+;   mapFrames        -> bs_map(inst) + bs_off / bs_far getters (geometries from geom_begin / geom_add)
+;   frameDelta       -> frame_delta(a, ao, b, bo) + fd_* getters
+;   compareFrames    -> compare_frames(ua, ub) + cmp_* getters   (the async onProgress callback is the glue's)
+;   bytesIdentical   -> bytes_identical(a, b)
+;   stripOf          -> strip_of(buckets) + strip_* getters
+;   summarize        -> the bs_* getters (the file name and sha256 come from the glue, as in JS)
+;   compareBitstreams-> compare_all(ua, ub, buckets): parse, map, compare, strip, packetsSame, identical
+; --
+; Calls, in order, for a page: geom_begin(); geom_add(idcode, name, rows) per geometry; compare_all(ua, ub,
+; buckets) (or bs_parse + bs_map per stream and the parts by hand). rows of geom_add is i32: per row
+; block, bottom, row, ncols, then ncols frame counts.
+; Result layout (all offsets are BYTE offsets into the stream passed to bs_parse, or into the name buffer):
+;   bs_info(inst, f): 0 size 1 kind (1 = .bit) 2 headerEnd 3 sync (-1 none) 4 idcode state (0 null, 1 a number,
+;     2 undefined: an IDCODE write that was not one word) 5 idcode 6 packet count 7 FDRI write count 8 words
+;     9 end (-1 undefined) 10 desync 11 frameWords 12 frames (-1 undefined: no sync word) 13 warning count
+;     14..19 warning codes in order (1 nosync 2 encrypted 3 compressed 4 truncated 5 badheader 6 partialframe)
+;     20..31 header fields a,b,c,d as (start, bytes, nul padding) ; 32 header length field e
+;     33 mapped 34 geometry index (-1 none)
+;   bs_pk(inst, k, f): 0 off 1 type 2 op (-1 for a bad word) 3 reg (-1 null) 4 count 5 data 6 has value 7 value 8 pad or raw
+;   bs_fdri(inst, k, f): 0 off 1 words 2 far null 3 far.     bs_off(inst, k), bs_far(inst, k, f): 0 null flag 1 far.
+;   compare_frames -> cmp_info(f): 0 frames 1 framesA 2 framesB 3 differing 4 onlyOne 5 first 6 byAddress
+;     7 detail kind (0 none, 1 differing frame, 2 present in one only) 8 detail index 9 far null 10 far
+;     11 words 12 bits 13 ecc 14 listed words;  cmp_list(i, f): 0 word 1 a 2 b;  cmp_diff(i) the per-frame byte.
+;   strip_of -> strip_info(f): 0 row count 1 buckets;  strip_row(r, f): 0 has meta 1 block 2 bottom 3 row;
+;     strip_cell(r, c).
+; Quirks of the JavaScript kept: out-of-range bytes read as 0 (be32 of a short tail); a header text
+; field runs past the end of the file as NULs; an IDCODE write of other than one word leaves idcode
+; "undefined" (it prints as 0x00000000); a type 2 packet takes the register of the last type 1 packet,
+; even null ("REGnull"); the Map from FAR to slot or frame keeps the LAST entry; a stream with no sync
+; word has frames undefined, which JS turns into NaN totals in a comparison.
+; Not carried: compare_all on a stream with no sync word (status 9); numbers beyond 2^31 bytes of
+; stream; geometry with fractional numbers. Table limits (the JS has none): 65536 packets, 16384 FDRI
+; writes, 262144 frames and slots per stream, 8 geometries, 1024 geometry rows, 65536 geometry columns,
+; 1 MB of packet text per stream, 1024 strip buckets, line diff inputs of 65536 lines and 4.2 M cells.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widget_bit_diff_logic;
+
+pub const SYNC_WORD : u32 = 2862175590;
+pub const FRAME_WORDS : u32 = 101;
+pub const ECC_WORD : u32 = 50;
+pub const ECC_MASK : u32 = 8191;
+
+pub const REG_FAR : u32 = 1;
+pub const REG_FDRI : u32 = 2;
+pub const REG_CMD : u32 = 4;
+pub const REG_MFWR : u32 = 10;
+pub const REG_CBC : u32 = 11;
+pub const REG_IDCODE : u32 = 12;
+
+pub const MP : usize = 65536;
+pub const MW : usize = 16384;
+pub const MF : usize = 262144;
+
+pub const I_SIZE : usize = 0;
+pub const I_KIND : usize = 1;
+pub const I_HEND : usize = 2;
+pub const I_SYNC : usize = 3;
+pub const I_IDS : usize = 4;
+pub const I_ID : usize = 5;
+pub const I_NPK : usize = 6;
+pub const I_NFD : usize = 7;
+pub const I_WORDS : usize = 8;
+pub const I_END : usize = 9;
+pub const I_DESYNC : usize = 10;
+pub const I_FW : usize = 11;
+pub const I_FRAMES : usize = 12;
+pub const I_NW : usize = 13;
+pub const I_W0 : usize = 14;
+pub const I_HDR : usize = 20;
+pub const I_E : usize = 32;
+pub const I_MAPPED : usize = 33;
+pub const I_GEOM : usize = 34;
+
+pub var INS : [128]i64 = [0; 128];
+pub var PKO : [131072]u32 = [0; 131072];
+pub var PKT : [131072]u8 = [0; 131072];
+pub var PKP : [131072]i32 = [0; 131072];
+pub var PKR : [131072]i32 = [0; 131072];
+pub var PKC : [131072]u32 = [0; 131072];
+pub var PKD : [131072]u32 = [0; 131072];
+pub var PKH : [131072]u8 = [0; 131072];
+pub var PKV : [131072]u32 = [0; 131072];
+pub var PKX : [131072]u32 = [0; 131072];
+pub var FDO : [32768]u32 = [0; 32768];
+pub var FDW : [32768]u32 = [0; 32768];
+pub var FDN : [32768]u8 = [0; 32768];
+pub var FDF : [32768]u32 = [0; 32768];
+pub var OFFS : [524288]u32 = [0; 524288];
+pub var FARS : [524288]u32 = [0; 524288];
+pub var FARN : [524288]u8 = [0; 524288];
+pub var DIFF : [262144]u8 = [0; 262144];
+pub var CMP : [32]i64 = [0; 32];
+pub var CLW : [8]u32 = [0; 8];
+pub var CLA : [8]u32 = [0; 8];
+pub var CLB : [8]u32 = [0; 8];
+pub var FDL : [8]i64 = [0; 8];
+
+pub var GID : [8]u32 = [0; 8];
+pub var GNO : [8]u32 = [0; 8];
+pub var GNL : [8]u32 = [0; 8];
+pub var GRO : [8]u32 = [0; 8];
+pub var GRN : [8]u32 = [0; 8];
+pub var RWB : [1024]u32 = [0; 1024];
+pub var RWK : [1024]u32 = [0; 1024];
+pub var RWR : [1024]u32 = [0; 1024];
+pub var RWC : [1024]u32 = [0; 1024];
+pub var RWO : [1024]u32 = [0; 1024];
+pub var CNT : [65536]u32 = [0; 65536];
+pub var GPL : [4096]u8 = [0; 4096];
+pub var GV : [8]u64 = [0; 8];
+pub var SLOT : [262144]u32 = [0; 262144];
+pub var SLN : [262144]u8 = [0; 262144];
+pub var HTS : [524288]u32 = [0; 524288];
+pub var HTB : [524288]u32 = [0; 524288];
+pub var HTM : [524288]u32 = [0; 524288];
+pub var MIK : [262144]u32 = [0; 262144];
+pub var MIV : [262144]u32 = [0; 262144];
+pub var STC : [1048576]u8 = [0; 1048576];
+pub var STRI : [8]i64 = [0; 8];
+pub var SQB : [2097152]u8 = [0; 2097152];
+pub var SQN : [2]u64 = [0; 2];
+pub var LB : [512]u8 = [0; 512];
+pub var PREV : [512]u8 = [0; 512];
+pub var LBN : [2]u64 = [0; 2];
+pub var MAGIC : [13]u8 = [0, 9, 15, 240, 15, 240, 15, 240, 15, 240, 0, 0, 1];
+pub var DP : [4300000]u16 = [0; 4300000];
+pub var DAO : [65536]u32 = [0; 65536];
+pub var DAL : [65536]u32 = [0; 65536];
+pub var DBO : [65536]u32 = [0; 65536];
+pub var DBL : [65536]u32 = [0; 65536];
+pub var DRO : [140000]u8 = [0; 140000];
+pub var DRA : [140000]u32 = [0; 140000];
+pub var DRB : [140000]u32 = [0; 140000];
+pub var LDN : [4]u64 = [0; 4];
+
+// ---------------------------------------------------------------- bytes
+/// A byte, or 0 past the end (what JavaScript's `undefined << n` gives).
+pub fn bat(u: []const u8, i: usize) -> u64 {
+    if (i < u.len) { return u[i] as u64; }
+    return 0;
+}
+
+pub fn be32(u: []const u8, o: usize) -> u32 {
+    return (bat(u, o) * 16777216 + bat(u, o + 1) * 65536 + bat(u, o + 2) * 256 + bat(u, o + 3)) as u32;
+}
+
+/// The position of the sync word's first byte at or after `from` within `limit`, or -1.
+pub fn find_sync(u: []const u8, from: usize, limit: usize) -> i64 {
+    var end : i64 = (u.len as i64) - 3;
+    const lim : i64 = (from as i64) + (limit as i64);
+    if (lim < end) { end = lim; }
+    var i : i64 = from as i64;
+    while (i < end) {
+        const p : usize = i as usize;
+        if (u[p] == 170 and u[p + 1] == 153 and u[p + 2] == 85 and u[p + 3] == 102) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn bytes_identical(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// FAR fields, UG470 table 5-24: f 0 block 1 bottom 2 row 3 column 4 minor.
+pub fn decode_far(far: u32, f: u32) -> u32 {
+    if (f == 0) { return (far / 8388608) % 8; }
+    if (f == 1) { return (far / 4194304) % 2; }
+    if (f == 2) { return (far / 131072) % 32; }
+    if (f == 3) { return (far / 128) % 1024; }
+    return far % 128;
+}
+
+pub fn encode_far(block: u32, bottom: u32, row: u32, column: u32, minor: u32) -> u32 {
+    return ((block % 8) * 8388608 + (bottom % 2) * 4194304 + (row % 32) * 131072 + (column % 1024) * 128 + (minor % 128)) as u32;
+}
+
+// ---------------------------------------------------------------- names and the line builder
+pub fn lb_reset() -> bool {
+    LBN[0] = 0;
+    return true;
+}
+
+pub fn lb_byte(b: u8) -> bool {
+    if (LBN[0] < 512) { LB[LBN[0] as usize] = b; }
+    LBN[0] = LBN[0] + 1;
+    return true;
+}
+
+pub fn lb_put(w: []const u8) -> bool {
+    var k : usize = 0;
+    while (k < w.len) {
+        lb_byte(w[k]);
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn lb_dec(v: u64) -> bool {
+    var digits : u64 = 1;
+    var t : u64 = v;
+    while (t >= 10) {
+        t = t / 10;
+        digits = digits * 10;
+    }
+    var d : u64 = digits;
+    var r : u64 = v;
+    while (d > 0) {
+        lb_byte((48 + r / d) as u8);
+        r = r % d;
+        d = d / 10;
+    }
+    return true;
+}
+
+pub fn hex_digit(v: u64) -> u8 {
+    if (v < 10) { return (48 + v) as u8; }
+    return (87 + v) as u8;
+}
+
+pub fn lb_hex8(v: u32) -> bool {
+    lb_put("0x");
+    var sh : u64 = 268435456;
+    var r : u64 = v as u64;
+    var k : u32 = 0;
+    while (k < 8) {
+        lb_byte(hex_digit(r / sh));
+        r = r % sh;
+        sh = sh / 16;
+        k = k + 1;
+    }
+    return true;
+}
+
+/// REG_NAMES[reg] or "REG<n>" ("REGnull" for no register).
+pub fn lb_reg(reg: i32) -> bool {
+    if (reg < 0) { return lb_put("REGnull"); }
+    if (reg == 0) { return lb_put("CRC"); }
+    if (reg == 1) { return lb_put("FAR"); }
+    if (reg == 2) { return lb_put("FDRI"); }
+    if (reg == 3) { return lb_put("FDRO"); }
+    if (reg == 4) { return lb_put("CMD"); }
+    if (reg == 5) { return lb_put("CTL0"); }
+    if (reg == 6) { return lb_put("MASK"); }
+    if (reg == 7) { return lb_put("STAT"); }
+    if (reg == 8) { return lb_put("LOUT"); }
+    if (reg == 9) { return lb_put("COR0"); }
+    if (reg == 10) { return lb_put("MFWR"); }
+    if (reg == 11) { return lb_put("CBC"); }
+    if (reg == 12) { return lb_put("IDCODE"); }
+    if (reg == 13) { return lb_put("AXSS"); }
+    if (reg == 14) { return lb_put("COR1"); }
+    if (reg == 16) { return lb_put("WBSTAR"); }
+    if (reg == 17) { return lb_put("TIMER"); }
+    if (reg == 19) { return lb_put("RBCRC_SW"); }
+    if (reg == 22) { return lb_put("BOOTSTS"); }
+    if (reg == 24) { return lb_put("CTL1"); }
+    if (reg == 31) { return lb_put("BSPI"); }
+    lb_put("REG");
+    return lb_dec(reg as u64);
+}
+
+/// CMD_NAMES[v] ?? v
+pub fn lb_cmd(v: u32) -> bool {
+    if (v == 0) { return lb_put("NULL"); }
+    if (v == 1) { return lb_put("WCFG"); }
+    if (v == 2) { return lb_put("MFW"); }
+    if (v == 3) { return lb_put("LFRM"); }
+    if (v == 4) { return lb_put("RCFG"); }
+    if (v == 5) { return lb_put("START"); }
+    if (v == 6) { return lb_put("RCAP"); }
+    if (v == 7) { return lb_put("RCRC"); }
+    if (v == 8) { return lb_put("AGHIGH"); }
+    if (v == 9) { return lb_put("SWITCH"); }
+    if (v == 10) { return lb_put("GRESTORE"); }
+    if (v == 11) { return lb_put("SHUTDOWN"); }
+    if (v == 12) { return lb_put("GCAPTURE"); }
+    if (v == 13) { return lb_put("DESYNC"); }
+    if (v == 15) { return lb_put("IPROG"); }
+    if (v == 16) { return lb_put("CRCC"); }
+    if (v == 17) { return lb_put("LTIMER"); }
+    if (v == 18) { return lb_put("BSPI_READ"); }
+    if (v == 19) { return lb_put("FALL_EDGE"); }
+    return lb_dec(v as u64);
+}
+
+/// Fill the name buffer: kind 0 REG_NAMES[code], 1 CMD_NAMES[code], 2 BLOCK_NAMES[code]; the length, -1 when there is no such name.
+pub fn name_of(kind: u32, code: u32) -> i64 {
+    lb_reset();
+    if (kind == 0) {
+        if (code > 31) { return -1; }
+        lb_reg(code as i32);
+        if (LB[0] == 82 and LB[1] == 69 and LB[2] == 71 and LBN[0] > 3 and LB[3] >= 48 and LB[3] <= 57) { return -1; }
+    }
+    if (kind == 1) {
+        lb_cmd(code);
+        if (LB[0] >= 48 and LB[0] <= 57) { return -1; }
+    }
+    if (kind == 2) {
+        if (code == 0) { lb_put("CLB_IO_CLK"); }
+        if (code == 1) { lb_put("BLOCK_RAM"); }
+        if (code == 2) { lb_put("CFG_CLB"); }
+        if (code > 2) { return -1; }
+    }
+    return LBN[0] as i64;
+}
+
+pub fn hex8_into(v: u32) -> i64 {
+    lb_reset();
+    lb_hex8(v);
+    return LBN[0] as i64;
+}
+
+pub fn name_byte(i: u32) -> u8 {
+    return LB[i as usize];
+}
+
+// ---------------------------------------------------------------- parseBitstream
+pub fn warn(inst: usize, code: i64) -> bool {
+    const b : usize = inst * 64;
+    var k : usize = 0;
+    while (k < (INS[b + I_NW] as usize)) {
+        if (INS[b + I_W0 + k] == code) { return true; }
+        k = k + 1;
+    }
+    if (INS[b + I_NW] >= 6) { return false; }
+    INS[b + I_W0 + (INS[b + I_NW] as usize)] = code;
+    INS[b + I_NW] = INS[b + I_NW] + 1;
+    return true;
+}
+
+/// The text(start, len) of the header: bytes up to a NUL, a position past the end counts as a NUL character appended.
+pub fn header_text(u: []const u8, b: usize, slot: usize, start: usize, len: usize) -> bool {
+    var i : usize = start;
+    var inr : i64 = 0;
+    var pad : i64 = 0;
+    var stop : bool = false;
+    while (i < start + len and !stop) {
+        if (i < u.len) {
+            if (u[i] == 0) {
+                stop = true;
+            } else {
+                inr = inr + 1;
+            }
+        } else {
+            pad = pad + 1;
+        }
+        if (!stop) { i = i + 1; }
+    }
+    INS[b + I_HDR + slot * 3] = start as i64;
+    INS[b + I_HDR + slot * 3 + 1] = inr;
+    INS[b + I_HDR + slot * 3 + 2] = pad;
+    return true;
+}
+
+pub fn parse_header(u: []const u8, b: usize) -> bool {
+    var i : usize = 0;
+    while (i < 13) {
+        if (i >= u.len or u[i] != MAGIC[i]) { return false; }
+        i = i + 1;
+    }
+    var k : usize = 0;
+    while (k < 12) {
+        INS[b + I_HDR + k] = 0;
+        k = k + 1;
+    }
+    var o : usize = 13;
+    while (o < u.len and o < 4096) {
+        const key : u8 = u[o];
+        if (key == 101) {
+            INS[b + I_E] = be32(u, o + 1) as i64;
+            INS[b + I_HEND] = (o + 5) as i64;
+            return true;
+        }
+        if (key < 97 or key > 100) { return false; }
+        const len : usize = ((bat(u, o + 1) * 256) + bat(u, o + 2)) as usize;
+        header_text(u, b, (key - 97) as usize, o + 3, len);
+        o = o + 3 + len;
+    }
+    return false;
+}
+
+pub fn pk_push(inst: usize, off: usize, ty: u8, op: i32, reg: i32, count: u32, data: usize, hasv: u8, value: u32, x: u32) -> bool {
+    const b : usize = inst * 64;
+    const k : usize = INS[b + I_NPK] as usize;
+    if (k >= MP) { return false; }
+    const s : usize = inst * MP + k;
+    PKO[s] = off as u32;
+    PKT[s] = ty;
+    PKP[s] = op;
+    PKR[s] = reg;
+    PKC[s] = count;
+    PKD[s] = data as u32;
+    PKH[s] = hasv;
+    PKV[s] = value;
+    PKX[s] = x;
+    INS[b + I_NPK] = INS[b + I_NPK] + 1;
+    return true;
+}
+
+pub fn fd_push(inst: usize, off: usize, words: u32, fnull: u8, far: u32) -> bool {
+    const b : usize = inst * 64;
+    const k : usize = INS[b + I_NFD] as usize;
+    if (k >= MW) { return false; }
+    const s : usize = inst * MW + k;
+    FDO[s] = off as u32;
+    FDW[s] = words;
+    FDN[s] = fnull;
+    FDF[s] = far;
+    INS[b + I_NFD] = INS[b + I_NFD] + 1;
+    INS[b + I_FW] = INS[b + I_FW] + (words as i64);
+    return true;
+}
+
+/// parseBitstream(u8). 0 ok, -1 over a table limit.
+pub fn bs_parse(inst: u32, u: []const u8) -> i32 {
+    const ii : usize = inst as usize;
+    const b : usize = ii * 64;
+    var f : usize = 0;
+    while (f < 64) {
+        INS[b + f] = 0;
+        f = f + 1;
+    }
+    INS[b + I_SIZE] = u.len as i64;
+    INS[b + I_SYNC] = -1;
+    INS[b + I_END] = -1;
+    INS[b + I_FRAMES] = -1;
+    INS[b + I_GEOM] = -1;
+    if (parse_header(u, b)) {
+        INS[b + I_KIND] = 1;
+    } else {
+        INS[b + I_HEND] = 0;
+    }
+    const sync : i64 = find_sync(u, INS[b + I_HEND] as usize, 1048576);
+    INS[b + I_SYNC] = sync;
+    if (sync < 0) {
+        warn(ii, 1);
+        return 0;
+    }
+    var o : usize = (sync as usize) + 4;
+    var far_null : bool = true;
+    var far : u32 = 0;
+    var last_reg : i32 = -1;
+    const n : usize = u.len;
+    var brk : bool = false;
+    while (o + 4 <= n and !brk) {
+        const w : u32 = be32(u, o);
+        const ty : u32 = w / 536870912;
+        if (ty == 1) {
+            const op : u32 = (w / 134217728) % 4;
+            const reg : u32 = (w / 8192) % 16384;
+            const count : u32 = w % 2048;
+            var hasv : u8 = 0;
+            var value : u32 = 0;
+            var finish : bool = false;
+            if (op == 2 and count > 0 and o + 4 + (count as usize) * 4 <= n) {
+                if (reg == REG_CMD) {
+                    value = be32(u, o + 4);
+                    hasv = 1;
+                } else {
+                    if (reg == REG_FAR) {
+                        far = be32(u, o + 4);
+                        far_null = false;
+                        value = far;
+                        hasv = 1;
+                    } else {
+                        if (count == 1) {
+                            value = be32(u, o + 4);
+                            hasv = 1;
+                        }
+                    }
+                }
+                if (reg == REG_IDCODE) {
+                    if (hasv == 1) {
+                        INS[b + I_IDS] = 1;
+                        INS[b + I_ID] = value as i64;
+                    } else {
+                        INS[b + I_IDS] = 2;
+                        INS[b + I_ID] = 0;
+                    }
+                }
+                if (reg == REG_CBC) { warn(ii, 2); }
+                if (reg == REG_MFWR) { warn(ii, 3); }
+                if (reg == REG_FDRI) {
+                    var fnl : u8 = 0;
+                    if (far_null) { fnl = 1; }
+                    if (!fd_push(ii, o + 4, count, fnl, far)) { return -1; }
+                }
+                if (reg == REG_CMD and value == 13) {
+                    if (!pk_push(ii, o, 1, op as i32, reg as i32, count, o + 4, hasv, value, 0)) { return -1; }
+                    o = o + 4 + (count as usize) * 4;
+                    INS[b + I_DESYNC] = 1;
+                    finish = true;
+                    brk = true;
+                }
+            }
+            if (!finish) {
+                last_reg = reg as i32;
+                if (!pk_push(ii, o, 1, op as i32, reg as i32, count, o + 4, hasv, value, 0)) { return -1; }
+                if (op == 0) { o = o + 4; } else { o = o + 4 + (count as usize) * 4; }
+            }
+        } else {
+            if (ty == 2) {
+                const op : u32 = (w / 134217728) % 4;
+                const count : u32 = w % 134217728;
+                const reg : i32 = last_reg;
+                if (o + 4 + (count as usize) * 4 > n) {
+                    warn(ii, 4);
+                    if (!pk_push(ii, o, 2, op as i32, reg, count, o + 4, 0, 0, 0)) { return -1; }
+                    brk = true;
+                } else {
+                    if (op == 2 and reg == 2) {
+                        var fnl : u8 = 0;
+                        if (far_null) { fnl = 1; }
+                        if (!fd_push(ii, o + 4, count, fnl, far)) { return -1; }
+                    }
+                    if (!pk_push(ii, o, 2, op as i32, reg, count, o + 4, 0, 0, 0)) { return -1; }
+                    o = o + 4 + (count as usize) * 4;
+                }
+            } else {
+                if (w == 4294967295 or w == 0) {
+                    if (!pk_push(ii, o, 0, 0, -1, 0, 0, 0, 0, w)) { return -1; }
+                    o = o + 4;
+                } else {
+                    warn(ii, 5);
+                    if (!pk_push(ii, o, ty as u8, -1, -1, 0, 0, 0, 0, w)) { return -1; }
+                    o = o + 4;
+                }
+            }
+        }
+    }
+    INS[b + I_END] = o as i64;
+    INS[b + I_WORDS] = (((o as i64) - sync) / 4);
+    const fw : i64 = INS[b + I_FW];
+    INS[b + I_FRAMES] = fw / 101;
+    if (fw % 101 != 0) { warn(ii, 6); }
+    return 0;
+}
+
+pub fn bs_info(inst: u32, f: u32) -> i64 {
+    return INS[(inst as usize) * 64 + (f as usize)];
+}
+
+pub fn bs_pk(inst: u32, k: u32, f: u32) -> i64 {
+    const s : usize = (inst as usize) * MP + (k as usize);
+    if (f == 0) { return PKO[s] as i64; }
+    if (f == 1) { return PKT[s] as i64; }
+    if (f == 2) { return PKP[s] as i64; }
+    if (f == 3) { return PKR[s] as i64; }
+    if (f == 4) { return PKC[s] as i64; }
+    if (f == 5) { return PKD[s] as i64; }
+    if (f == 6) { return PKH[s] as i64; }
+    if (f == 7) { return PKV[s] as i64; }
+    return PKX[s] as i64;
+}
+
+pub fn bs_fdri(inst: u32, k: u32, f: u32) -> i64 {
+    const s : usize = (inst as usize) * MW + (k as usize);
+    if (f == 0) { return FDO[s] as i64; }
+    if (f == 1) { return FDW[s] as i64; }
+    if (f == 2) { return FDN[s] as i64; }
+    return FDF[s] as i64;
+}
+
+// ---------------------------------------------------------------- packetLine and packetSequence
+/// packetLine(pk) into the line buffer; the length.
+pub fn packet_line(inst: u32, k: u32) -> i64 {
+    const s : usize = (inst as usize) * MP + (k as usize);
+    lb_reset();
+    const ty : u8 = PKT[s];
+    if (ty == 0) {
+        if (PKX[s] == 0) { lb_put("ZERO"); } else { lb_put("DUMMY"); }
+        return LBN[0] as i64;
+    }
+    const op : i32 = PKP[s];
+    if (op == -1) {
+        lb_put("WORD ");
+        lb_hex8(PKX[s]);
+        return LBN[0] as i64;
+    }
+    if (op == 0) {
+        lb_put("NOP");
+        return LBN[0] as i64;
+    }
+    const reg : i32 = PKR[s];
+    if (reg == 4 and PKH[s] == 1) {
+        lb_put("CMD ");
+        lb_cmd(PKV[s]);
+        return LBN[0] as i64;
+    }
+    if (op == 1) { lb_put("READ"); }
+    if (op == 2) { lb_put("WRITE"); }
+    if (op == 3) { lb_put("RSVD"); }
+    if (reg == 2) {
+        lb_put(" FDRI ");
+        lb_dec(PKC[s] as u64);
+        if (ty == 2) { lb_put(" (type 2)"); }
+        return LBN[0] as i64;
+    }
+    lb_put(" ");
+    lb_reg(reg);
+    if (PKH[s] == 1 and PKC[s] == 1) {
+        lb_put(" ");
+        lb_hex8(PKV[s]);
+        return LBN[0] as i64;
+    }
+    lb_put(" x");
+    lb_dec(PKC[s] as u64);
+    return LBN[0] as i64;
+}
+
+pub fn sq_put(inst: usize, b: u8) -> bool {
+    if (SQN[inst] >= 1048576) { return false; }
+    SQB[inst * 1048576 + (SQN[inst] as usize)] = b;
+    SQN[inst] = SQN[inst] + 1;
+    return true;
+}
+
+pub fn sq_flush(inst: usize, plen: usize, cnt: u64) -> bool {
+    var k : usize = 0;
+    while (k < plen) {
+        if (!sq_put(inst, PREV[k])) { return false; }
+        k = k + 1;
+    }
+    if (cnt > 1) {
+        sq_put(inst, 32);
+        sq_put(inst, 42);
+        sq_put(inst, 32);
+        var digits : u64 = 1;
+        var t : u64 = cnt;
+        while (t >= 10) {
+            t = t / 10;
+            digits = digits * 10;
+        }
+        var d : u64 = digits;
+        var r : u64 = cnt;
+        while (d > 0) {
+            sq_put(inst, (48 + r / d) as u8);
+            r = r % d;
+            d = d / 10;
+        }
+    }
+    return sq_put(inst, 10);
+}
+
+/// packetSequence(parsed): the packet lines with runs folded, each ended by byte 10, in SQB. The byte count, -1 over the limit.
+pub fn bs_seq(inst: u32) -> i64 {
+    const ii : usize = inst as usize;
+    SQN[ii] = 0;
+    const npk : usize = INS[ii * 64 + I_NPK] as usize;
+    var have : bool = false;
+    var plen : usize = 0;
+    var cnt : u64 = 0;
+    var k : usize = 0;
+    while (k < npk) {
+        const l : i64 = packet_line(inst, k as u32);
+        if (l > 512) { return -1; }
+        const ln : usize = l as usize;
+        var same : bool = false;
+        if (have and ln == plen) {
+            same = true;
+            var c : usize = 0;
+            while (c < ln) {
+                if (LB[c] != PREV[c]) { same = false; }
+                c = c + 1;
+            }
+        }
+        if (same) {
+            cnt = cnt + 1;
+        } else {
+            if (have) {
+                if (!sq_flush(ii, plen, cnt)) { return -1; }
+            }
+            var c2 : usize = 0;
+            while (c2 < ln) {
+                PREV[c2] = LB[c2];
+                c2 = c2 + 1;
+            }
+            plen = ln;
+            cnt = 1;
+            have = true;
+        }
+        k = k + 1;
+    }
+    if (have) {
+        if (!sq_flush(ii, plen, cnt)) { return -1; }
+    }
+    return SQN[ii] as i64;
+}
+
+pub fn seq_byte(inst: u32, i: u32) -> u8 {
+    return SQB[(inst as usize) * 1048576 + (i as usize)];
+}
+
+// ---------------------------------------------------------------- lineDiff
+pub fn ld_items(list: []const u8, o: bool) -> i64 {
+    var a : usize = 0;
+    var n : usize = 0;
+    while (a < list.len) {
+        var e : usize = a;
+        while (e < list.len and list[e] != 10) { e = e + 1; }
+        if (n >= 65536) { return -1; }
+        if (o) {
+            DAO[n] = a as u32;
+            DAL[n] = (e - a) as u32;
+        } else {
+            DBO[n] = a as u32;
+            DBL[n] = (e - a) as u32;
+        }
+        n = n + 1;
+        a = e + 1;
+    }
+    return n as i64;
+}
+
+pub fn ld_eq(a: []const u8, i: usize, b: []const u8, j: usize) -> bool {
+    if (DAL[i] != DBL[j]) { return false; }
+    var k : usize = 0;
+    while (k < (DAL[i] as usize)) {
+        if (a[(DAO[i] as usize) + k] != b[(DBO[j] as usize) + k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// lineDiff(a, b): rows in ld_row. 0 ok, 1 null (too big: n*m > 4e6), -1 over a table limit.
+pub fn line_diff(a: []const u8, b: []const u8) -> i32 {
+    const na : i64 = ld_items(a, true);
+    const nb : i64 = ld_items(b, false);
+    if (na < 0 or nb < 0) { return -1; }
+    const n : usize = na as usize;
+    const m : usize = nb as usize;
+    if ((n as u64) * (m as u64) > 4000000) { return 1; }
+    const w : usize = m + 1;
+    if ((n + 1) * w > 4300000) { return -1; }
+    var c : usize = 0;
+    while (c < w) {
+        DP[n * w + c] = 0;
+        c = c + 1;
+    }
+    var r : usize = 0;
+    while (r <= n) {
+        DP[r * w + m] = 0;
+        r = r + 1;
+    }
+    var i : usize = n;
+    while (i > 0) {
+        i = i - 1;
+        var j : usize = m;
+        while (j > 0) {
+            j = j - 1;
+            if (ld_eq(a, i, b, j)) {
+                DP[i * w + j] = DP[(i + 1) * w + j + 1] + 1;
+            } else {
+                const x : u16 = DP[(i + 1) * w + j];
+                const y : u16 = DP[i * w + j + 1];
+                if (x > y) { DP[i * w + j] = x; } else { DP[i * w + j] = y; }
+            }
+        }
+    }
+    var p : usize = 0;
+    var q : usize = 0;
+    var rows : usize = 0;
+    while (p < n or q < m) {
+        if (rows >= 140000) { return -1; }
+        if (p < n and q < m and ld_eq(a, p, b, q)) {
+            DRO[rows] = 61;
+            DRA[rows] = p as u32;
+            DRB[rows] = q as u32;
+            p = p + 1;
+            q = q + 1;
+        } else {
+            if (q < m and (p >= n or DP[p * w + q + 1] >= DP[(p + 1) * w + q])) {
+                DRO[rows] = 43;
+                DRA[rows] = 0;
+                DRB[rows] = q as u32;
+                q = q + 1;
+            } else {
+                DRO[rows] = 45;
+                DRA[rows] = p as u32;
+                DRB[rows] = 0;
+                p = p + 1;
+            }
+        }
+        rows = rows + 1;
+    }
+    LDN[0] = rows as u64;
+    return 0;
+}
+
+pub fn ld_count() -> u64 {
+    return LDN[0];
+}
+
+/// A row of the diff: f 0 the op byte ('=', '+', '-'), 1 the index in a, 2 the index in b.
+pub fn ld_row(i: u32, f: u32) -> u32 {
+    if (f == 0) { return DRO[i as usize] as u32; }
+    if (f == 1) { return DRA[i as usize]; }
+    return DRB[i as usize];
+}
+
+// ---------------------------------------------------------------- geometry and mapFrames
+pub fn geom_begin() -> i32 {
+    var f : usize = 0;
+    while (f < 8) {
+        GV[f] = 0;
+        f = f + 1;
+    }
+    return 0;
+}
+
+/// One geometry: idcode, name, rows (i32: block, bottom, row, ncols, then the ncols frame counts, per row).
+pub fn geom_add(idcode: u32, name: []const u8, rows: []const i32) -> i32 {
+    const g : usize = GV[0] as usize;
+    if (g >= 8) { return -1; }
+    if (GV[3] + (name.len as u64) > 4096) { return -1; }
+    GID[g] = idcode;
+    GNO[g] = GV[3] as u32;
+    GNL[g] = name.len as u32;
+    var k : usize = 0;
+    while (k < name.len) {
+        GPL[(GV[3] as usize) + k] = name[k];
+        k = k + 1;
+    }
+    GV[3] = GV[3] + (name.len as u64);
+    GRO[g] = GV[1] as u32;
+    var p : usize = 0;
+    var nr : u32 = 0;
+    while (p + 4 <= rows.len) {
+        const r : usize = GV[1] as usize;
+        if (r >= 1024) { return -1; }
+        const nc : usize = rows[p + 3] as usize;
+        if (p + 4 + nc > rows.len or GV[2] + (nc as u64) > 65536) { return -1; }
+        RWB[r] = rows[p] as u32;
+        RWK[r] = rows[p + 1] as u32;
+        RWR[r] = rows[p + 2] as u32;
+        RWC[r] = nc as u32;
+        RWO[r] = GV[2] as u32;
+        var c : usize = 0;
+        while (c < nc) {
+            CNT[(GV[2] as usize) + c] = rows[p + 4 + c] as u32;
+            c = c + 1;
+        }
+        GV[2] = GV[2] + (nc as u64);
+        GV[1] = GV[1] + 1;
+        nr = nr + 1;
+        p = p + 4 + nc;
+    }
+    GRN[g] = nr;
+    GV[0] = GV[0] + 1;
+    return 0;
+}
+
+/// frameSlots(geom): the address of every frame slot, pad frames null (SLN = 1). The count, -1 over the limit.
+pub fn slots_build(g: u32) -> i64 {
+    var n : usize = 0;
+    const gi : usize = g as usize;
+    var r : usize = 0;
+    while (r < (GRN[gi] as usize)) {
+        const ri : usize = (GRO[gi] as usize) + r;
+        var c : usize = 0;
+        while (c < (RWC[ri] as usize)) {
+            const cnt : u32 = CNT[(RWO[ri] as usize) + c];
+            var mi : u32 = 0;
+            while (mi < cnt) {
+                if (n >= 262144) { return -1; }
+                SLOT[n] = encode_far(RWB[ri], RWK[ri], RWR[ri], c as u32, mi);
+                SLN[n] = 0;
+                n = n + 1;
+                mi = mi + 1;
+            }
+            c = c + 1;
+        }
+        if (n + 2 > 262144) { return -1; }
+        SLN[n] = 1;
+        SLN[n + 1] = 1;
+        SLOT[n] = 0;
+        SLOT[n + 1] = 0;
+        n = n + 2;
+        r = r + 1;
+    }
+    GV[4] = n as u64;
+    return n as i64;
+}
+
+pub fn slot_get(i: u32) -> i64 {
+    if (SLN[i as usize] == 1) { return -1; }
+    return SLOT[i as usize] as i64;
+}
+
+pub fn hslot(key: u32) -> usize {
+    return (((key as u64) * 2654435761) % 4294967296 % 524288) as usize;
+}
+
+/// mapFrames(parsed, geometries) for stream inst: offsets, addresses, mapped, geometry index.
+pub fn bs_map(inst: u32) -> i32 {
+    const ii : usize = inst as usize;
+    const b : usize = ii * 64;
+    var gi : i64 = -1;
+    if (INS[b + I_IDS] == 1) {
+        var g : usize = 0;
+        while (g < (GV[0] as usize) and gi < 0) {
+            if ((GID[g] as i64) == INS[b + I_ID]) { gi = g as i64; }
+            g = g + 1;
+        }
+    }
+    var nsl : i64 = 0;
+    if (gi >= 0) {
+        nsl = slots_build(gi as u32);
+        if (nsl < 0) { return -1; }
+        var h : usize = 0;
+        while (h < 524288) {
+            HTS[h] = 0;
+            h = h + 1;
+        }
+        var s : usize = 0;
+        while (s < (nsl as usize)) {
+            if (SLN[s] == 0) {
+                var p : usize = hslot(SLOT[s]);
+                var done : bool = false;
+                while (!done) {
+                    if (HTS[p] == 0) {
+                        HTS[p] = (s + 1) as u32;
+                        done = true;
+                    } else {
+                        if (SLOT[(HTS[p] - 1) as usize] == SLOT[s]) {
+                            HTS[p] = (s + 1) as u32;
+                            done = true;
+                        } else {
+                            p = (p + 1) % 524288;
+                        }
+                    }
+                }
+            }
+            s = s + 1;
+        }
+    }
+    var frames : i64 = INS[b + I_FRAMES];
+    if (frames < 0) { frames = 0; }
+    if (frames > (MF as i64)) { return -1; }
+    var z : usize = 0;
+    while (z < (frames as usize)) {
+        FARN[ii * MF + z] = 1;
+        FARS[ii * MF + z] = 0;
+        OFFS[ii * MF + z] = 0;
+        z = z + 1;
+    }
+    var mapped : bool = gi >= 0;
+    var k : usize = 0;
+    var wi : usize = 0;
+    while (wi < (INS[b + I_NFD] as usize)) {
+        const s2 : usize = ii * MW + wi;
+        const nf : usize = ((FDW[s2] / 101) as usize);
+        var at : i64 = -1;
+        if (gi >= 0 and FDN[s2] == 0) {
+            var p2 : usize = hslot(FDF[s2]);
+            var found : bool = false;
+            while (HTS[p2] != 0 and !found) {
+                if (SLOT[(HTS[p2] - 1) as usize] == FDF[s2]) {
+                    found = true;
+                } else {
+                    p2 = (p2 + 1) % 524288;
+                }
+            }
+            if (found) { at = (HTS[p2] - 1) as i64; }
+        }
+        if (at < 0 and gi >= 0 and FDN[s2] == 0 and FDF[s2] == 0) { at = 0; }
+        if (at < 0) { mapped = false; }
+        var f : usize = 0;
+        while (f < nf and k < (frames as usize)) {
+            const q : usize = ii * MF + k;
+            OFFS[q] = FDO[s2] + (f as u32) * 404;
+            if (at >= 0 and (at as usize) + f < (nsl as usize)) {
+                const sx : usize = (at as usize) + f;
+                if (SLN[sx] == 0) {
+                    FARN[q] = 0;
+                    FARS[q] = SLOT[sx];
+                }
+            } else {
+                if (f == 0 and FDN[s2] == 0) {
+                    FARN[q] = 0;
+                    FARS[q] = FDF[s2];
+                }
+            }
+            f = f + 1;
+            k = k + 1;
+        }
+        wi = wi + 1;
+    }
+    if (mapped) { INS[b + I_MAPPED] = 1; } else { INS[b + I_MAPPED] = 0; }
+    INS[b + I_GEOM] = gi;
+    return 0;
+}
+
+pub fn bs_off(inst: u32, k: u32) -> u32 {
+    return OFFS[(inst as usize) * MF + (k as usize)];
+}
+
+pub fn bs_far(inst: u32, k: u32, f: u32) -> u32 {
+    if (f == 0) { return FARN[(inst as usize) * MF + (k as usize)] as u32; }
+    return FARS[(inst as usize) * MF + (k as usize)];
+}
+
+// ---------------------------------------------------------------- frames compared
+/// frameDelta(a, ao, b, bo): words, bits, ecc, and the first 8 differing words.
+pub fn frame_delta(a: []const u8, ao: usize, b: []const u8, bo: usize) -> bool {
+    var words : i64 = 0;
+    var bits : i64 = 0;
+    var ecc : i64 = 0;
+    var listed : usize = 0;
+    var w : usize = 0;
+    while (w < 101) {
+        const x : u32 = be32(a, ao + w * 4);
+        const y : u32 = be32(b, bo + w * 4);
+        if (x != y) {
+            words = words + 1;
+            const v : u64 = xor32(x, y) as u64;
+            if (w == 50) {
+                var e : u64 = v % 8192;
+                while (e > 0) {
+                    ecc = ecc + ((e % 2) as i64);
+                    e = e / 2;
+                }
+            }
+            var t : u64 = v;
+            while (t > 0) {
+                bits = bits + ((t % 2) as i64);
+                t = t / 2;
+            }
+            if (listed < 8) {
+                CLW[listed] = w as u32;
+                CLA[listed] = x;
+                CLB[listed] = y;
+                listed = listed + 1;
+            }
+        }
+        w = w + 1;
+    }
+    FDL[0] = words;
+    FDL[1] = bits;
+    FDL[2] = ecc;
+    FDL[3] = listed as i64;
+    return true;
+}
+
+pub fn xor32(x: u32, y: u32) -> u32 {
+    var r : u64 = 0;
+    var m : u64 = 1;
+    var a : u64 = x as u64;
+    var b : u64 = y as u64;
+    var k : u32 = 0;
+    while (k < 32) {
+        if ((a % 2) != (b % 2)) { r = r + m; }
+        a = a / 2;
+        b = b / 2;
+        m = m * 2;
+        k = k + 1;
+    }
+    return r as u32;
+}
+
+pub fn same_frame(a: []const u8, ao: usize, b: []const u8, bo: usize) -> bool {
+    var i : usize = 0;
+    while (i < 404) {
+        if (a[ao + i] != b[bo + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// compareFrames(ua, pa, ma, ub, pb, mb): needs bs_parse and bs_map for both streams. 0 ok, -1 over a limit.
+pub fn compare_frames(ua: []const u8, ub: []const u8) -> i32 {
+    const fa : usize = INS[I_FRAMES] as usize;
+    const fb : usize = INS[64 + I_FRAMES] as usize;
+    const by_address : bool = INS[I_MAPPED] == 1 and INS[64 + I_MAPPED] == 1 and INS[I_GEOM] >= 0 and INS[64 + I_GEOM] >= 0 and same_geom_name(INS[I_GEOM] as usize, INS[64 + I_GEOM] as usize);
+    var n : usize = fa;
+    if (fb > n) { n = fb; }
+    if (n > MF) { return -1; }
+    if (by_address) {
+        var h : usize = 0;
+        while (h < 524288) {
+            HTB[h] = 0;
+            h = h + 1;
+        }
+        var i : usize = 0;
+        while (i < fb) {
+            if (FARN[MF + i] == 0) {
+                var p : usize = hslot(FARS[MF + i]);
+                var done : bool = false;
+                while (!done) {
+                    if (HTB[p] == 0) {
+                        HTB[p] = (i + 1) as u32;
+                        done = true;
+                    } else {
+                        if (FARS[MF + ((HTB[p] - 1) as usize)] == FARS[MF + i]) {
+                            HTB[p] = (i + 1) as u32;
+                            done = true;
+                        } else {
+                            p = (p + 1) % 524288;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    var differing : i64 = 0;
+    var only_one : i64 = 0;
+    var first : i64 = -1;
+    var i2 : usize = 0;
+    while (i2 < n) {
+        var j : i64 = i2 as i64;
+        if (by_address and i2 < fa and FARN[i2] == 0) {
+            j = pair_of(FARS[i2]);
+        }
+        if (i2 >= fa or j < 0 or j >= (fb as i64)) {
+            DIFF[i2] = 2;
+            only_one = only_one + 1;
+            if (first < 0) { first = i2 as i64; }
+        } else {
+            if (!same_frame(ua, OFFS[i2] as usize, ub, OFFS[MF + (j as usize)] as usize)) {
+                DIFF[i2] = 1;
+                differing = differing + 1;
+                if (first < 0) { first = i2 as i64; }
+            } else {
+                DIFF[i2] = 0;
+            }
+        }
+        i2 = i2 + 1;
+    }
+    CMP[0] = n as i64;
+    CMP[1] = fa as i64;
+    CMP[2] = fb as i64;
+    CMP[3] = differing;
+    CMP[4] = only_one;
+    CMP[5] = first;
+    CMP[6] = 0;
+    if (by_address) { CMP[6] = 1; }
+    CMP[7] = 0;
+    if (first >= 0) {
+        const fi : usize = first as usize;
+        CMP[8] = first;
+        CMP[9] = 1;
+        CMP[10] = 0;
+        if (fi < fa and FARN[fi] == 0) {
+            CMP[9] = 0;
+            CMP[10] = FARS[fi] as i64;
+        }
+        CMP[11] = -1;
+        CMP[12] = -1;
+        CMP[13] = -1;
+        CMP[14] = 0;
+        if (DIFF[fi] == 1) {
+            CMP[7] = 1;
+            var j2 : usize = fi;
+            if (by_address and FARN[fi] == 0) {
+                j2 = pair_of(FARS[fi]) as usize;
+            }
+            frame_delta(ua, OFFS[fi] as usize, ub, OFFS[MF + j2] as usize);
+            CMP[11] = FDL[0];
+            CMP[12] = FDL[1];
+            CMP[13] = FDL[2];
+            CMP[14] = FDL[3];
+        } else {
+            CMP[7] = 2;
+        }
+    }
+    return 0;
+}
+
+pub fn same_geom_name(a: usize, b: usize) -> bool {
+    if (GNL[a] != GNL[b]) { return false; }
+    var k : usize = 0;
+    while (k < (GNL[a] as usize)) {
+        if (GPL[(GNO[a] as usize) + k] != GPL[(GNO[b] as usize) + k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// pairB.get(far): the last frame of stream B with that address, -1 when none.
+pub fn pair_of(far: u32) -> i64 {
+    var p : usize = hslot(far);
+    while (HTB[p] != 0) {
+        if (FARS[MF + ((HTB[p] - 1) as usize)] == far) { return (HTB[p] - 1) as i64; }
+        p = (p + 1) % 524288;
+    }
+    return -1;
+}
+
+pub fn cmp_info(f: u32) -> i64 {
+    return CMP[f as usize];
+}
+
+pub fn cmp_list(i: u32, f: u32) -> u32 {
+    if (f == 0) { return CLW[i as usize]; }
+    if (f == 1) { return CLA[i as usize]; }
+    return CLB[i as usize];
+}
+
+pub fn cmp_diff(i: u32) -> u8 {
+    return DIFF[i as usize];
+}
+
+// ---------------------------------------------------------------- stripOf
+/// stripOf(cmp, map, geom, buckets) for stream A's map. geom is the geometry index (-1 none).
+/// 0 ok, -1 over a limit.
+pub fn strip_of(buckets: u32, geom: i64) -> i32 {
+    if (buckets == 0 or buckets > 1024) { return -1; }
+    const nb : usize = buckets as usize;
+    const frames : usize = CMP[0] as usize;
+    if (geom < 0 or CMP[6] == 0) {
+        var c : usize = 0;
+        while (c < nb) {
+            STC[c] = 0;
+            c = c + 1;
+        }
+        const per : f64 = (frames as f64) / (buckets as f64);
+        var i : usize = 0;
+        while (i < frames) {
+            var cc : usize = ((i as f64) / per) as usize;
+            if (cc > nb - 1) { cc = nb - 1; }
+            if (DIFF[i] > STC[cc]) { STC[cc] = DIFF[i]; }
+            i = i + 1;
+        }
+        STRI[0] = 1;
+        STRI[1] = buckets as i64;
+        STRI[2] = 0;
+        return 0;
+    }
+    const gi : usize = geom as usize;
+    const nr : usize = GRN[gi] as usize;
+    if (nr * nb > 1048576) { return -1; }
+    var z : usize = 0;
+    while (z < nr * nb) {
+        STC[z] = 0;
+        z = z + 1;
+    }
+    // minorIndex: encodeFar(block, bottom, row, c, 0) -> running frame count, last entry wins
+    var h : usize = 0;
+    while (h < 524288) {
+        HTM[h] = 0;
+        h = h + 1;
+    }
+    var nm : usize = 0;
+    var r : usize = 0;
+    while (r < nr) {
+        const ri : usize = (GRO[gi] as usize) + r;
+        var s : u32 = 0;
+        var c2 : usize = 0;
+        while (c2 < (RWC[ri] as usize)) {
+            const key : u32 = encode_far(RWB[ri], RWK[ri], RWR[ri], c2 as u32, 0);
+            var p : usize = hslot(key);
+            var done : bool = false;
+            while (!done) {
+                if (HTM[p] == 0) {
+                    if (nm >= 262144) { return -1; }
+                    MIK[nm] = key;
+                    MIV[nm] = s;
+                    nm = nm + 1;
+                    HTM[p] = nm as u32;
+                    done = true;
+                } else {
+                    if (MIK[(HTM[p] - 1) as usize] == key) {
+                        MIV[(HTM[p] - 1) as usize] = s;
+                        done = true;
+                    } else {
+                        p = (p + 1) % 524288;
+                    }
+                }
+            }
+            s = s + CNT[(RWO[ri] as usize) + c2];
+            c2 = c2 + 1;
+        }
+        r = r + 1;
+    }
+    var i2 : usize = 0;
+    while (i2 < frames) {
+        if (i2 < (INS[I_FRAMES] as usize) and FARN[i2] == 0) {
+            const far : u32 = FARS[i2];
+            const rk : u32 = far / 131072;
+            // the last row whose key matches
+            var ri2 : i64 = -1;
+            var q : usize = 0;
+            while (q < nr) {
+                const rr : usize = (GRO[gi] as usize) + q;
+                const rkey : u64 = ((RWB[rr] as u64) * 64 + (RWK[rr] as u64) * 32 + (RWR[rr] as u64)) % 4294967296;
+                if (rkey == (rk as u64)) { ri2 = q as i64; }
+                q = q + 1;
+            }
+            if (ri2 >= 0) {
+                const rr2 : usize = (GRO[gi] as usize) + (ri2 as usize);
+                var total : u64 = 0;
+                var cc2 : usize = 0;
+                while (cc2 < (RWC[rr2] as usize)) {
+                    total = total + (CNT[(RWO[rr2] as usize) + cc2] as u64);
+                    cc2 = cc2 + 1;
+                }
+                var base : u64 = 0;
+                var p2 : usize = hslot(far - (far % 128));
+                var found : bool = false;
+                while (HTM[p2] != 0 and !found) {
+                    if (MIK[(HTM[p2] - 1) as usize] == far - (far % 128)) {
+                        found = true;
+                        base = MIV[(HTM[p2] - 1) as usize] as u64;
+                    } else {
+                        p2 = (p2 + 1) % 524288;
+                    }
+                }
+                const pos : u64 = base + ((far % 128) as u64);
+                var skip : bool = false;
+                var cidx : usize = nb - 1;
+                if (total == 0) {
+                    if (pos == 0) { skip = true; }
+                } else {
+                    const cf : f64 = ((pos as f64) / (total as f64)) * (buckets as f64);
+                    const ci : u64 = cf as u64;
+                    if (ci < (nb as u64) - 1) { cidx = ci as usize; }
+                }
+                if (!skip) {
+                    const cell : usize = (ri2 as usize) * nb + cidx;
+                    if (DIFF[i2] > STC[cell]) { STC[cell] = DIFF[i2]; }
+                }
+            }
+        }
+        i2 = i2 + 1;
+    }
+    STRI[0] = nr as i64;
+    STRI[1] = buckets as i64;
+    STRI[2] = 1;
+    STRI[3] = geom;
+    return 0;
+}
+
+pub fn strip_info(f: u32) -> i64 {
+    return STRI[f as usize];
+}
+
+/// Row metadata of the strip: f 0 has meta (1 on the geometry path), 1 block, 2 bottom, 3 row.
+pub fn strip_row(r: u32, f: u32) -> i64 {
+    if (STRI[2] == 0) { return 0; }
+    const ri : usize = (GRO[STRI[3] as usize] as usize) + (r as usize);
+    if (f == 0) { return 1; }
+    if (f == 1) { return RWB[ri] as i64; }
+    if (f == 2) { return RWK[ri] as i64; }
+    return RWR[ri] as i64;
+}
+
+pub fn strip_cell(r: u32, c: u32) -> u8 {
+    return STC[(r as usize) * (STRI[1] as usize) + (c as usize)];
+}
+
+/// compareBitstreams: parse, map and compare two streams (the geometries set), strip, and the identity and packet checks.
+/// 0 ok, 9 a stream has no sync word (not carried), -1 over a limit. cmp_info(15) = identical, (16) = packetsSame.
+pub fn compare_all(ua: []const u8, ub: []const u8, buckets: u32) -> i32 {
+    if (bs_parse(0, ua) < 0) { return -1; }
+    if (bs_parse(1, ub) < 0) { return -1; }
+    if (INS[I_FRAMES] < 0 or INS[64 + I_FRAMES] < 0) { return 9; }
+    if (bs_map(0) < 0) { return -1; }
+    if (bs_map(1) < 0) { return -1; }
+    if (compare_frames(ua, ub) < 0) { return -1; }
+    var gsel : i64 = -1;
+    if (INS[I_GEOM] >= 0) {
+        var g : usize = 0;
+        while (g < (GV[0] as usize) and gsel < 0) {
+            if (same_geom_name(g, INS[I_GEOM] as usize)) { gsel = g as i64; }
+            g = g + 1;
+        }
+    }
+    if (strip_of(buckets, gsel) < 0) { return -1; }
+    const la : i64 = bs_seq(0);
+    const lb : i64 = bs_seq(1);
+    if (la < 0 or lb < 0) { return -1; }
+    var same : bool = la == lb;
+    var k : usize = 0;
+    while (same and k < (la as usize)) {
+        if (SQB[k] != SQB[1048576 + k]) { same = false; }
+        k = k + 1;
+    }
+    CMP[16] = 0;
+    if (same) { CMP[16] = 1; }
+    CMP[15] = 0;
+    if (bytes_identical(ua, ub)) { CMP[15] = 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- tests
+pub var BUF : [16384]u8 = [0; 16384];
+pub var BN : usize = 0;
+pub var BUF2 : [16384]u8 = [0; 16384];
+pub var BN2 : usize = 0;
+pub var GR : [8]i32 = [0; 8];
+pub var LA : [256]u8 = [0; 256];
+pub var LBB : [256]u8 = [0; 256];
+
+pub fn b_reset() -> usize {
+    BN = 0;
+    return 0;
+}
+
+pub fn b_byte(v: u32) -> usize {
+    BUF[BN] = v as u8;
+    BN = BN + 1;
+    return BN;
+}
+
+pub fn w32(v: u32) -> usize {
+    b_byte(v / 16777216);
+    b_byte((v / 65536) % 256);
+    b_byte((v / 256) % 256);
+    b_byte(v % 256);
+    return BN;
+}
+
+pub fn b_text(s: []const u8) -> usize {
+    var k : usize = 0;
+    while (k < s.len) {
+        b_byte(s[k] as u32);
+        k = k + 1;
+    }
+    return BN;
+}
+
+/// A .bit header with the four text fields, as xc7frames2bit writes it, then field e.
+pub fn b_header(total: u32) -> usize {
+    b_reset();
+    b_byte(0); b_byte(9); b_byte(15); b_byte(240); b_byte(15); b_byte(240); b_byte(15); b_byte(240); b_byte(15); b_byte(240); b_byte(0); b_byte(0); b_byte(1);
+    b_byte(97); b_byte(0); b_byte(3); b_byte(100); b_byte(49); b_byte(0);
+    b_byte(98); b_byte(0); b_byte(8); b_text("xc7a35t"); b_byte(0);
+    b_byte(99); b_byte(0); b_byte(11); b_text("2026/10/02"); b_byte(0);
+    b_byte(100); b_byte(0); b_byte(9); b_text("19:50:34"); b_byte(0);
+    b_byte(101);
+    w32(total);
+    return BN;
+}
+
+/// The packets of a small configuration: NOP, TIMER, RCRC, IDCODE, FAR, WCFG, an FDRI write of two frames
+/// (a type 1 header of count 0 then a type 2 packet), three NOPs, DESYNC. The second frame's word 7 is `tweak`.
+pub fn b_body(tweak: u32) -> usize {
+    w32(4294967295);
+    w32(4294967295);
+    w32(2862175590);
+    w32(536870912);
+    w32(805445633);
+    w32(0);
+    w32(805339137);
+    w32(7);
+    w32(805404673);
+    w32(56823955);
+    w32(805314561);
+    w32(0);
+    w32(805339137);
+    w32(1);
+    w32(805322752);
+    w32(1342177482);
+    var k : u32 = 0;
+    while (k < 202) {
+        if (k == 101 + 7) { w32(tweak); } else { w32(k * 3 + 1); }
+        k = k + 1;
+    }
+    w32(536870912);
+    w32(536870912);
+    w32(536870912);
+    w32(805339137);
+    w32(13);
+    w32(536870912);
+    w32(536870912);
+    return BN;
+}
+
+/// A geometry with idcode 56823955 (0x03631093): one row, block 0, bottom 0, row 0, one column of 2 frames.
+pub fn tiny_geom() -> i32 {
+    geom_begin();
+    GR[0] = 0;
+    GR[1] = 0;
+    GR[2] = 0;
+    GR[3] = 1;
+    GR[4] = 2;
+    return geom_add(56823955, "tiny", GR[0 .. 5]);
+}
+
+pub fn same_name(w: []const u8, n: i64) -> bool {
+    if ((w.len as i64) != n) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (LB[k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+test a_bit_file_is_read_into_header_packets_and_frame_writes {
+    b_header(850);
+    b_body(0);
+    const u : []const u8 = BUF[0 .. BN];
+    assert bs_parse(0, u) == 0;
+    assert bs_info(0, 1) == 1;
+    assert bs_info(0, 0) == (BN as i64);
+    assert bs_info(0, 2) == 61;
+    assert bs_info(0, 3) == 69;
+    assert bs_info(0, 4) == 1;
+    assert bs_info(0, 5) == 56823955;
+    assert bs_info(0, 12) == 2;
+    assert bs_info(0, 11) == 202;
+    assert bs_info(0, 7) == 1;
+    assert bs_info(0, 10) == 1;
+    assert bs_info(0, 13) == 0;
+    assert bs_info(0, 32) == 850;
+    assert bs_info(0, 21) == 2;
+    assert u[bs_info(0, 20) as usize] == 100;
+    assert bs_fdri(0, 0, 1) == 202;
+    assert bs_fdri(0, 0, 2) == 0;
+    assert bs_fdri(0, 0, 3) == 0;
+    assert bs_info(0, 9) == bs_info(0, 0) - 8;
+    assert bs_pk(0, 0, 1) == 1;
+    assert bs_pk(0, 2, 7) == 7;
+    assert bs_pk(0, 2, 6) == 1;
+    assert bs_pk(0, 0, 6) == 0;
+}
+
+test packets_read_as_mnemonic_lines {
+    b_header(850);
+    b_body(0);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert same_name("NOP", packet_line(0, 0));
+    assert same_name("WRITE TIMER 0x00000000", packet_line(0, 1));
+    assert same_name("CMD RCRC", packet_line(0, 2));
+    assert same_name("WRITE IDCODE 0x03631093", packet_line(0, 3));
+    assert same_name("WRITE FAR 0x00000000", packet_line(0, 4));
+    assert same_name("CMD WCFG", packet_line(0, 5));
+    assert same_name("WRITE FDRI 0", packet_line(0, 6));
+    assert same_name("WRITE FDRI 202 (type 2)", packet_line(0, 7));
+    assert same_name("CMD DESYNC", packet_line(0, 11));
+}
+
+test runs_of_equal_lines_are_folded {
+    b_header(850);
+    b_body(0);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    const n : i64 = bs_seq(0);
+    assert n > 60;
+    var lines : u32 = 0;
+    var k : u32 = 0;
+    var star : bool = false;
+    while (k < (n as u32)) {
+        if (seq_byte(0, k) == 10) { lines = lines + 1; }
+        if (seq_byte(0, k) == 42 and seq_byte(0, k + 1) == 32 and seq_byte(0, k + 2) == 51) { star = true; }
+        k = k + 1;
+    }
+    assert star;
+    assert lines == 10;
+    assert seq_byte(0, 0) == 78;
+    assert seq_byte(0, 3) == 10;
+}
+
+test two_streams_are_compared_frame_by_frame_with_the_geometry {
+    assert tiny_geom() == 0;
+    b_header(850);
+    b_body(0);
+    for_copy_a();
+    b_header(850);
+    b_body(4);
+    const ub : []const u8 = BUF[0 .. BN];
+    const ua : []const u8 = BUF2[0 .. BN2];
+    assert compare_all(ua, ub, 8) == 0;
+    assert bs_info(0, 33) == 1;
+    assert bs_info(0, 34) == 0;
+    assert bs_far(0, 0, 0) == 0;
+    assert bs_far(0, 0, 1) == 0;
+    assert bs_far(0, 1, 1) == 1;
+    assert cmp_info(0) == 2;
+    assert cmp_info(3) == 1;
+    assert cmp_info(4) == 0;
+    assert cmp_info(5) == 1;
+    assert cmp_info(6) == 1;
+    assert cmp_info(7) == 1;
+    assert cmp_info(11) == 1;
+    assert cmp_info(12) == 1;
+    assert cmp_info(13) == 0;
+    assert cmp_info(14) == 1;
+    assert cmp_list(0, 0) == 7;
+    assert cmp_list(0, 1) == 0;
+    assert cmp_list(0, 2) == 4;
+    assert cmp_diff(0) == 0;
+    assert cmp_diff(1) == 1;
+    assert cmp_info(15) == 0;
+    assert cmp_info(16) == 1;
+    assert strip_info(0) == 1;
+    assert strip_info(2) == 1;
+    assert strip_row(0, 0) == 1;
+    assert strip_cell(0, 0) == 0;
+    assert strip_cell(0, 4) == 1;
+    assert compare_all(ua, ua, 8) == 0;
+    assert cmp_info(15) == 1;
+    assert cmp_info(3) == 0;
+}
+
+pub fn for_copy_a() -> usize {
+    var k : usize = 0;
+    while (k < BN) {
+        BUF2[k] = BUF[k];
+        k = k + 1;
+    }
+    BN2 = BN;
+    return BN2;
+}
+
+test without_a_geometry_frames_are_paired_by_position {
+    geom_begin();
+    b_header(850);
+    b_body(0);
+    for_copy_a();
+    b_header(850);
+    b_body(4);
+    assert compare_all(BUF2[0 .. BN2], BUF[0 .. BN], 4) == 0;
+    assert bs_info(0, 33) == 0;
+    assert bs_info(0, 34) == -1;
+    assert bs_far(0, 0, 0) == 0;
+    assert bs_far(0, 0, 1) == 0;
+    assert bs_far(0, 1, 0) == 1;
+    assert cmp_info(6) == 0;
+    assert cmp_info(3) == 1;
+    assert strip_info(2) == 0;
+    assert strip_cell(0, 0) == 0;
+    assert strip_cell(0, 2) == 1;
+    assert strip_row(0, 0) == 0;
+}
+
+test odd_streams_raise_the_warnings_the_javascript_raises {
+    b_reset();
+    w32(1);
+    w32(2);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert bs_info(0, 3) == -1;
+    assert bs_info(0, 13) == 1;
+    assert bs_info(0, 14) == 1;
+    assert bs_info(0, 12) == -1;
+    b_reset();
+    w32(2862175590);
+    w32(805322752);
+    w32(1342177482 + 1000);
+    w32(5);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert bs_info(0, 13) == 1;
+    assert bs_info(0, 14) == 4;
+    assert bs_info(0, 9) == 8;
+    assert bs_info(0, 12) == 0;
+    b_reset();
+    w32(2862175590);
+    w32(805396481);
+    w32(1);
+    w32(805388289);
+    w32(2);
+    w32(805322757);
+    w32(1);
+    w32(2);
+    w32(3);
+    w32(4);
+    w32(5);
+    w32(100);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert bs_info(0, 13) == 4;
+    assert bs_info(0, 14) == 2;
+    assert bs_info(0, 15) == 3;
+    assert bs_info(0, 16) == 5;
+    assert bs_info(0, 17) == 6;
+    assert bs_info(0, 4) == 0;
+    assert bs_info(0, 11) == 5;
+    assert bs_info(0, 12) == 0;
+    b_reset();
+    w32(2862175590);
+    w32(805371905);
+    w32(1);
+    w32(805371905);
+    w32(2);
+    w32(805371905);
+    w32(3);
+    w32(805371905);
+    w32(0);
+    w32(805371905);
+    w32(0);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert bs_info(0, 13) == 0;
+    assert bs_pk(0, 0, 7) == 1;
+    b_reset();
+    w32(2862175590);
+    w32(805404674);
+    w32(5);
+    w32(6);
+    assert bs_parse(0, BUF[0 .. BN]) == 0;
+    assert bs_info(0, 4) == 2;
+    assert same_name("WRITE IDCODE x2", packet_line(0, 0));
+}
+
+test names_far_fields_and_hex_follow_ug470 {
+    assert name_of(0, 2) == 4;
+    assert LB[0] == 70;
+    assert name_of(0, 31) == 4;
+    assert name_of(0, 15) == -1;
+    assert name_of(1, 13) == 6;
+    assert name_of(1, 14) == -1;
+    assert name_of(2, 1) == 9;
+    assert name_of(2, 3) == -1;
+    assert encode_far(1, 1, 3, 17, 5) == 12978309;
+    assert decode_far(12978309, 0) == 1;
+    assert decode_far(12978309, 1) == 1;
+    assert decode_far(12978309, 2) == 3;
+    assert decode_far(12978309, 3) == 17;
+    assert decode_far(12978309, 4) == 5;
+    assert hex8_into(255) == 10;
+    assert LB[0] == 48;
+    assert LB[1] == 120;
+    assert LB[9] == 102;
+    assert find_sync(BUF[0 .. 0], 0, 100) == -1;
+}
+
+pub fn ls_two() -> usize {
+    LA[0] = 97; LA[1] = 10; LA[2] = 98; LA[3] = 10; LA[4] = 99; LA[5] = 10; LA[6] = 100; LA[7] = 10;
+    LBB[0] = 97; LBB[1] = 10; LBB[2] = 120; LBB[3] = 10; LBB[4] = 99; LBB[5] = 10; LBB[6] = 100; LBB[7] = 10; LBB[8] = 101; LBB[9] = 10;
+    return 8;
+}
+
+test lines_are_diffed_by_longest_common_subsequence {
+    ls_two();
+    assert line_diff(LA[0 .. 8], LBB[0 .. 10]) == 0;
+    assert ld_count() == 6;
+    assert ld_row(0, 0) == 61;
+    assert ld_row(1, 0) == 43;
+    assert ld_row(1, 2) == 1;
+    assert ld_row(2, 0) == 45;
+    assert ld_row(2, 1) == 1;
+    assert ld_row(3, 0) == 61;
+    assert ld_row(4, 0) == 61;
+    assert ld_row(5, 0) == 43;
+    assert ld_row(5, 2) == 4;
+    assert line_diff(LA[0 .. 0], LBB[0 .. 0]) == 0;
+    assert ld_count() == 0;
+}

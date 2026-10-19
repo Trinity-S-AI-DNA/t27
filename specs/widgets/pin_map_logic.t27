@@ -1,0 +1,1421 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/pin_map_logic.t27 -- the XDC reader and pin lint of the pin-map widget, as pure rules
+; over bytes: the JavaScript file apps/website/public/widgets/pin-map/xdc.js (207 lines, gHashTag/trinity)
+; ported to .t27. Epic gHashTag/t27#10937, issue #10938. Owner rule (Only t27): the logic is written in
+; .t27, never by hand in JavaScript. The page reads pasted or dropped text in the reader's browser and sends
+; nothing anywhere; these rules keep that: they see only bytes the glue hands over and fill buffers the
+; glue hands over, they read no file and hold no hidden state.
+; --
+; Table: every export of xdc.js and the function(s) that replace it.
+;   CONFIG_TOKEN (regex)    is_config_token. The regex lists FCS_B FOE_B FWE_B ADV_B CSI_B DOUT_CSO_B
+;                           RDWR_B PUDC_B, but the callers split a pin name at "_" first, so a token never
+;                           holds an underscore and those eight alternatives can never match. Ported as the
+;                           JavaScript behaves: only D\d\d A\d\d RS0 RS1 EMCCLK MOSI DIN CCLK match.
+;   pinType(fn)             pin_type: returns a type code, T_IO 0, T_CLOCK 1, T_CONFIG 2, T_ANALOG 3,
+;                           T_VREF 4, T_MGT 5, T_XADC 6 (the order of SAY_TYPE_IDS, "unlisted" is 7).
+;   isDualConfig(fn)        is_dual_config.
+;   parseXdc(text)          xdc_parse: fills norm, upn, pins, stds, meta. See "parse layout".
+;   covers(pattern, port)   covers (exact, bus base, then the glob with * and ?).
+;   lintXdc(parsed,pkg,v)   xdc_lint: fills ports, findings, order, pool, lm. See "lint layout".
+;   summarize(lint)         xdc_summarize: six counts.
+; Not ported: nothing of xdc.js is left out. Two helpers of xdc.js that are not exports (words, unwrap,
+; commands, portsOf, globRe) are next_word, unwrap_span, process_line, ports_head and glob_match.
+; --
+; A string literal in this language takes \" \\ \n \t but not \r or \0: the CRLF test marks carriage
+; returns with a backtick (with_cr).
+; Domain. Input is ASCII or UTF-8 bytes. Bytes above 127 are ordinary non-space characters; JavaScript's
+; \s and trim() also treat NBSP, U+FEFF, U+2028 and friends as space, and toUpperCase() maps non-ASCII
+; letters, and localeCompare orders them: none of that is ported and none is claimed. The differential in
+; the commit message is over ASCII text. Lines end at LF, CR or CRLF. A backslash that ends a line, with a
+; line after it, joins the two with one space, as in parseXdc.
+; --
+; parse layout (xdc_parse(text, norm, upn, pins, stds, meta) -> status 0 | 1 | 2):
+;   norm  copy of text with line ends and joins applied: logical lines are NOT separated, each is a span.
+;         capacity >= text.len. upn is norm with ASCII letters upper-cased, same offsets.
+;   pins  5 u32 per placed port: port offset, port length (both in norm), ball offset, ball length (both
+;         in upn), line (1-based, the physical line the command's logical line starts on).
+;   stds  5 u32 per IOSTANDARD port: pattern offset, length (norm), std offset, length (upn), line.
+;   meta  8 u32: [0] pins count, [1] stds count, [2] commands, [3] placed, [4] skipped, [5] bytes in norm,
+;         [6] unused, [7] unused. The counts keep counting when a buffer is full.
+;   status 0 ok, 1 pins or stds full (counts are exact, rows past capacity are missing), 2 norm or upn
+;         shorter than text.
+; lint layout (xdc_lint(norm, upn, pins, n_pins, stds, n_stds, rows, cols, pkg, vcco, work, ports,
+;   finds, order, pool, lm) -> status 0 | 1 | 2 | 3):
+;   rows  comma-separated row letters "A,B,C,...,AF".
+;   pkg   one line per listed ball, fields separated by single spaces: "BALL BANK TYPE FN\n". The last
+;         line that names a ball wins (a Map overwrites).
+;   vcco  one line per standard: "STD MILLIVOLTS\n". The last line that names a standard wins.
+;   work  scratch u32, length >= 3 * n_pins + finds capacity (finds.len / 11).
+;   ports 12 u32 per placed port, distinct ports in first-placed order: port off, len, ball off, len, std
+;         off, len (off = 4294967295 when no IOSTANDARD covers the port; len 0 is an empty std), line, bank
+;         (4294967295 when the ball is not listed), fn off, len, type off, len (off 4294967295 when the
+;         ball is neither listed nor on the grid). All offsets are in pool.
+;   finds 11 u32 per finding in the order lintXdc creates them: id (index in SAY_LINT_IDS), sev (0 error,
+;         1 warn, 2 info), ball off, len, port off, len, number of args, arg0 off, len, arg1 off, len. An
+;         arg that is a number (a line, a bank) is written as decimal text. All offsets are in pool.
+;   order u32 permutation: finds[order[k]] is the k-th of lintXdc's sorted findings (severity, then the
+;         ball by localeCompare('en', numeric) -- ICU root collation, ASCII; stable).
+;   pool  bytes; every string of ports and finds is copied here.
+;   lm    4 u32: [0] ports count, [1] findings count, [2] pool bytes used, [3] status.
+;   status 0 ok; 1 ports or finds full; 2 pool full; 3 work shorter than needed. After a non-zero status
+;         the outputs are not valid; counts keep counting so the glue can size the retry.
+; Complexity. Lookups are linear scans (the JavaScript uses hashed Maps): O(P^2) in distinct ports, O(S*P)
+; for covers over IOSTANDARD patterns. A real XDC has some hundreds of ports; this is not for 100000.
+; Collation. localeCompare('en', {numeric:true}) is ICU root collation. Measured in node: control bytes
+; 0-8, 14-31 and 127 are ignorable and end a digit run; then tab LF VT FF CR space _ - , ; : ! ? . ' " ( ) [
+; ] { } @ * / \ & # % ` ^ + < = > | ~ $ then digits then letters; a digit run compares by value, leading
+; zeros dropped (A01 equals A1); a longer token list is greater. COLL_RANK is that table.
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widget_pin_map_logic;
+
+pub const NONE : u32 = 4294967295;
+pub const NO_TEXT : i64 = -1;
+pub const PACK : i64 = 4294967296;
+
+pub const B_TAB : u8 = 9;
+pub const B_CR : u8 = 13;
+pub const B_LF : u8 = 10;
+pub const B_SPACE : u8 = 32;
+pub const B_QUOTE : u8 = 34;
+pub const B_HASH : u8 = 35;
+pub const B_COMMA : u8 = 44;
+pub const B_DASH : u8 = 45;
+pub const B_ZERO : u8 = 48;
+pub const B_SEMI : u8 = 59;
+pub const B_STAR : u8 = 42;
+pub const B_QUERY : u8 = 63;
+pub const B_OPEN_B : u8 = 91;
+pub const B_BSLASH : u8 = 92;
+pub const B_CLOSE_B : u8 = 93;
+pub const B_UNDER : u8 = 95;
+pub const B_OPEN_C : u8 = 123;
+pub const B_CLOSE_C : u8 = 125;
+
+pub const T_IO : u8 = 0;
+pub const T_CLOCK : u8 = 1;
+pub const T_CONFIG : u8 = 2;
+pub const T_ANALOG : u8 = 3;
+pub const T_VREF : u8 = 4;
+pub const T_MGT : u8 = 5;
+pub const T_XADC : u8 = 6;
+
+pub const ID_NOBALL : u32 = 0;
+pub const ID_NOTIO : u32 = 1;
+pub const ID_MGT : u32 = 2;
+pub const ID_XADC : u32 = 3;
+pub const ID_TWOPORTS : u32 = 4;
+pub const ID_MOVED : u32 = 5;
+pub const ID_NOSTD : u32 = 6;
+pub const ID_VCCO : u32 = 7;
+pub const ID_DUAL : u32 = 8;
+
+pub const SEV_ERROR : u32 = 0;
+pub const SEV_WARN : u32 = 1;
+pub const SEV_INFO : u32 = 2;
+
+pub const KIND_NONE : u8 = 0;
+pub const KIND_PIN : u8 = 1;
+pub const KIND_STD : u8 = 2;
+
+pub const M_PINS : usize = 0;
+pub const M_STDS : usize = 1;
+pub const M_CMDS : usize = 2;
+pub const M_PLACED : usize = 3;
+pub const M_SKIPPED : usize = 4;
+pub const M_NORM : usize = 5;
+
+pub const LM_PORTS : usize = 0;
+pub const LM_FINDS : usize = 1;
+pub const LM_POOL : usize = 2;
+pub const LM_STATUS : usize = 3;
+
+/// ICU root collation weights of the 128 ASCII bytes under numeric ordering: 0 ignorable, 1.. the
+/// whitespace and punctuation in collation order, 100 a digit, 200.. a letter (either case).
+pub const COLL_RANK : [128]u16 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 12, 16, 28, 38, 29, 27, 15, 17, 18, 24, 32, 9, 8, 14, 25, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 11, 10, 33, 34, 35, 13, 23, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 19, 26, 20, 31, 7, 30, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 21, 36, 22, 37, 0];
+
+// ------------------------------------------------------------------------------------------------
+// bytes and spans
+// ------------------------------------------------------------------------------------------------
+
+pub fn pack(lo: usize, hi: usize) -> i64 {
+    return (lo as i64) * PACK + (hi as i64);
+}
+
+pub fn lo_of(p: i64) -> usize {
+    return (p / PACK) as usize;
+}
+
+pub fn hi_of(p: i64) -> usize {
+    return (p % PACK) as usize;
+}
+
+/// JavaScript's \s for the ASCII range.
+pub fn is_ws(b: u8) -> bool {
+    return b == B_SPACE or (b >= B_TAB and b <= B_CR);
+}
+
+pub fn is_digit(b: u8) -> bool {
+    return b >= 48 and b <= 57;
+}
+
+pub fn up_b(b: u8) -> u8 {
+    if (b >= 97 and b <= 122) { return b - 32; }
+    return b;
+}
+
+/// Do s[lo .. hi] hold exactly the bytes of w?
+pub fn span_is(s: []const u8, lo: usize, hi: usize, w: []const u8) -> bool {
+    if (hi - lo != w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (s[lo + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Do a[alo .. ahi] and b[blo .. bhi] hold the same bytes?
+pub fn span_eq(a: []const u8, alo: usize, ahi: usize, b: []const u8, blo: usize, bhi: usize) -> bool {
+    if (ahi - alo != bhi - blo) { return false; }
+    var k : usize = 0;
+    const n : usize = ahi - alo;
+    while (k < n) {
+        if (a[alo + k] != b[blo + k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// trim(): the span of s[lo .. hi] without leading and trailing white space.
+pub fn trim_span(s: []const u8, lo: usize, hi: usize) -> i64 {
+    var a : usize = lo;
+    var b : usize = hi;
+    while (a < b and is_ws(s[a])) { a = a + 1; }
+    while (b > a and is_ws(s[b - 1])) { b = b - 1; }
+    return pack(a, b);
+}
+
+/// unwrap(): trim; if the text is {...} or "..." take the inside and trim again.
+pub fn unwrap_span(s: []const u8, lo: usize, hi: usize) -> i64 {
+    const t : i64 = trim_span(s, lo, hi);
+    var a : usize = lo_of(t);
+    var b : usize = hi_of(t);
+    if (b > a) {
+        const f : u8 = s[a];
+        const l : u8 = s[b - 1];
+        var wrapped : bool = false;
+        if (b - a >= 2 and f == B_OPEN_C and l == B_CLOSE_C) { wrapped = true; }
+        if (f == B_QUOTE and l == B_QUOTE) { wrapped = true; }
+        if (wrapped) {
+            if (b - a >= 2) {
+                a = a + 1;
+                b = b - 1;
+            } else {
+                b = a;
+            }
+            return trim_span(s, a, b);
+        }
+    }
+    return pack(a, b);
+}
+
+/// words(): the next word of s[pos .. hi] as a packed span, NO_TEXT when none. {...}, [...] and "..."
+/// groups stay whole; a backslash takes the next byte with it. The next search starts at the span's end.
+pub fn next_word(s: []const u8, pos: usize, hi: usize) -> i64 {
+    var i : usize = pos;
+    while (i < hi and is_ws(s[i])) { i = i + 1; }
+    if (i >= hi) { return NO_TEXT; }
+    const start : usize = i;
+    var depth_b : i64 = 0;
+    var depth_k : i64 = 0;
+    var quote : bool = false;
+    while (i < hi) {
+        const c : u8 = s[i];
+        if (c == B_BSLASH) {
+            i = i + 2;
+            continue;
+        }
+        if (quote) {
+            if (c == B_QUOTE) { quote = false; }
+            i = i + 1;
+            continue;
+        }
+        if (c == B_QUOTE and depth_b == 0) {
+            quote = true;
+        } else {
+            if (c == B_OPEN_C) {
+                depth_b = depth_b + 1;
+            } else {
+                if (c == B_CLOSE_C) {
+                    depth_b = depth_b - 1;
+                } else {
+                    if (c == B_OPEN_B and depth_b == 0) {
+                        depth_k = depth_k + 1;
+                    } else {
+                        if (c == B_CLOSE_B and depth_b == 0) {
+                            depth_k = depth_k - 1;
+                        } else {
+                            if (is_ws(c) and depth_b <= 0 and depth_k <= 0) { break; }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    var e : usize = i;
+    if (e > hi) { e = hi; }
+    return pack(start, e);
+}
+
+// ------------------------------------------------------------------------------------------------
+// pin types
+// ------------------------------------------------------------------------------------------------
+
+/// CONFIG_TOKEN on one token that holds no underscore (see the table above).
+pub fn is_config_token(f: []const u8, lo: usize, hi: usize) -> bool {
+    const n : usize = hi - lo;
+    if (n == 3) {
+        const a : u8 = f[lo];
+        if ((a == 68 or a == 65) and is_digit(f[lo + 1]) and is_digit(f[lo + 2])) { return true; }
+        if (span_is(f, lo, hi, "RS0") or span_is(f, lo, hi, "RS1") or span_is(f, lo, hi, "DIN")) { return true; }
+        return false;
+    }
+    if (n == 4) { return span_is(f, lo, hi, "MOSI") or span_is(f, lo, hi, "CCLK"); }
+    if (n == 6) { return span_is(f, lo, hi, "EMCCLK"); }
+    return false;
+}
+
+/// /^AD\d+[PN]$/ on one token.
+pub fn is_analog_token(f: []const u8, lo: usize, hi: usize) -> bool {
+    if (hi - lo < 4) { return false; }
+    if (f[lo] != 65 or f[lo + 1] != 68) { return false; }
+    var i : usize = lo + 2;
+    while (i < hi - 1 and is_digit(f[i])) { i = i + 1; }
+    if (i == lo + 2 or i != hi - 1) { return false; }
+    return f[i] == 80 or f[i] == 78;
+}
+
+/// Does any token of fn (split at "_") satisfy test? test: 0 config, 1 analog, 2 MRCC or SRCC, 3 VREF.
+pub fn any_token(f: []const u8, test_kind: u8) -> bool {
+    var pos : usize = 0;
+    var go : bool = true;
+    while (go) {
+        var e : usize = pos;
+        while (e < f.len and f[e] != B_UNDER) { e = e + 1; }
+        if (test_kind == 0 and is_config_token(f, pos, e)) { return true; }
+        if (test_kind == 1 and is_analog_token(f, pos, e)) { return true; }
+        if (test_kind == 2 and (span_is(f, pos, e, "MRCC") or span_is(f, pos, e, "SRCC"))) { return true; }
+        if (test_kind == 3 and span_is(f, pos, e, "VREF")) { return true; }
+        if (e >= f.len) { go = false; } else { pos = e + 1; }
+    }
+    return false;
+}
+
+/// True when a user IO also serves configuration (a dual-purpose pin).
+pub fn is_dual_config(f: []const u8) -> bool {
+    return any_token(f, 0);
+}
+
+/// Pin type of a prjxray-db pin_function, first match wins.
+pub fn pin_type(f: []const u8) -> u8 {
+    if (f.len >= 3 and span_is(f, 0, 3, "MGT")) { return T_MGT; }
+    if (span_is(f, 0, f.len, "VP_0") or span_is(f, 0, f.len, "VN_0")) { return T_XADC; }
+    if (any_token(f, 2)) { return T_CLOCK; }
+    if (any_token(f, 0)) { return T_CONFIG; }
+    if (any_token(f, 1)) { return T_ANALOG; }
+    if (any_token(f, 3)) { return T_VREF; }
+    return T_IO;
+}
+
+// ------------------------------------------------------------------------------------------------
+// covers: exact, bus base, glob
+// ------------------------------------------------------------------------------------------------
+
+/// The glob of globRe: * is any run, ? is one character, neither crosses a line end; anchored.
+pub fn glob_match(pat: []const u8, s: []const u8) -> bool {
+    var p : usize = 0;
+    var i : usize = 0;
+    var star : i64 = -1;
+    var mark : usize = 0;
+    while (i < s.len) {
+        var step : bool = false;
+        if (p < pat.len and pat[p] == B_STAR) {
+            star = p as i64;
+            mark = i;
+            p = p + 1;
+            continue;
+        }
+        if (p < pat.len and s[i] != B_LF and s[i] != B_CR and pat[p] == B_QUERY) { step = true; }
+        if (p < pat.len and pat[p] != B_STAR and pat[p] != B_QUERY and pat[p] == s[i]) { step = true; }
+        if (step) {
+            p = p + 1;
+            i = i + 1;
+            continue;
+        }
+        if (star >= 0 and s[mark] != B_LF and s[mark] != B_CR) {
+            mark = mark + 1;
+            i = mark;
+            p = (star as usize) + 1;
+            continue;
+        }
+        return false;
+    }
+    while (p < pat.len and pat[p] == B_STAR) { p = p + 1; }
+    return p == pat.len;
+}
+
+/// Does an IOSTANDARD object pattern cover a port? Exact, bus base (led covers led[3]) or glob.
+pub fn covers(pattern: []const u8, port: []const u8) -> bool {
+    if (span_eq(pattern, 0, pattern.len, port, 0, port.len)) { return true; }
+    if (port.len > pattern.len and port[pattern.len] == B_OPEN_B and span_eq(pattern, 0, pattern.len, port, 0, pattern.len)) { return true; }
+    var wild : bool = false;
+    var k : usize = 0;
+    while (k < pattern.len) {
+        if (pattern[k] == B_STAR or pattern[k] == B_QUERY) { wild = true; }
+        k = k + 1;
+    }
+    if (wild) { return glob_match(pattern, port); }
+    return false;
+}
+
+// ------------------------------------------------------------------------------------------------
+// the reader
+// ------------------------------------------------------------------------------------------------
+
+/// portsOf: when the word is [get_ports ...], the packed span of what follows get_ports inside the
+/// brackets; NO_TEXT otherwise.
+pub fn ports_head(s: []const u8, os: usize, oe: usize) -> i64 {
+    const t : i64 = trim_span(s, os, oe);
+    const a : usize = lo_of(t);
+    const b : usize = hi_of(t);
+    if (b - a < 2) { return NO_TEXT; }
+    if (s[a] != B_OPEN_B or s[b - 1] != B_CLOSE_B) { return NO_TEXT; }
+    const iw : i64 = next_word(s, a + 1, b - 1);
+    if (iw < 0) { return NO_TEXT; }
+    if (!span_is(s, lo_of(iw), hi_of(iw), "get_ports")) { return NO_TEXT; }
+    return pack(hi_of(iw), b - 1);
+}
+
+pub fn put_pin(pins: []u32, meta: []u32, kp: usize, pa: usize, pb: usize, va: usize, vb: usize, line: u32) {
+    const n : usize = meta[kp] as usize;
+    if ((n + 1) * 5 <= pins.len) {
+        pins[n * 5] = pa as u32;
+        pins[n * 5 + 1] = (pb - pa) as u32;
+        pins[n * 5 + 2] = va as u32;
+        pins[n * 5 + 3] = (vb - va) as u32;
+        pins[n * 5 + 4] = line;
+    } else {
+        meta[6] = 1;
+    }
+    meta[kp] = (n + 1) as u32;
+}
+
+/// For every port name of the get_ports arguments in s[alo .. ahi], record (name, value) as a pin or
+/// as an IOSTANDARD row. Arguments that start with a dash are options and are skipped.
+pub fn emit_ports(s: []const u8, alo: usize, ahi: usize, kind: u8, va: usize, vb: usize, line: u32, pins: []u32, stds: []u32, meta: []u32) {
+    var pos : usize = alo;
+    var go : bool = true;
+    while (go) {
+        const w : i64 = next_word(s, pos, ahi);
+        if (w < 0) {
+            go = false;
+        } else {
+            pos = hi_of(w);
+            if (s[lo_of(w)] != B_DASH) {
+                const u : i64 = unwrap_span(s, lo_of(w), hi_of(w));
+                var q : usize = lo_of(u);
+                const qe : usize = hi_of(u);
+                while (q < qe) {
+                    while (q < qe and is_ws(s[q])) { q = q + 1; }
+                    if (q < qe) {
+                        var te : usize = q;
+                        while (te < qe and !is_ws(s[te])) { te = te + 1; }
+                        var na : usize = q;
+                        var nb : usize = te;
+                        if (s[na] == B_OPEN_C) { na = na + 1; }
+                        if (nb > na and s[nb - 1] == B_CLOSE_C) { nb = nb - 1; }
+                        if (kind == KIND_STD) {
+                            put_pin(stds, meta, M_STDS, na, nb, va, vb, line);
+                        } else {
+                            put_pin(pins, meta, M_PINS, na, nb, va, vb, line);
+                        }
+                        q = te;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn key_kind(upn: []const u8, lo: usize, hi: usize) -> u8 {
+    if (span_is(upn, lo, hi, "PACKAGE_PIN") or span_is(upn, lo, hi, "LOC")) { return KIND_PIN; }
+    if (span_is(upn, lo, hi, "IOSTANDARD")) { return KIND_STD; }
+    return KIND_NONE;
+}
+
+/// One command, already trimmed: count it, and when it is a set_property on get_ports with a
+/// PACKAGE_PIN, LOC or IOSTANDARD, record the rows.
+pub fn process_command(norm: []const u8, upn: []const u8, lo: usize, hi: usize, line: u32, pins: []u32, stds: []u32, meta: []u32) {
+    meta[M_CMDS] = meta[M_CMDS] + 1;
+    const w0 : i64 = next_word(norm, lo, hi);
+    if (w0 < 0 or !span_is(norm, lo_of(w0), hi_of(w0), "set_property")) {
+        meta[M_SKIPPED] = meta[M_SKIPPED] + 1;
+        return;
+    }
+    const w1 : i64 = next_word(norm, hi_of(w0), hi);
+    if (w1 < 0) {
+        meta[M_SKIPPED] = meta[M_SKIPPED] + 1;
+        return;
+    }
+    const w2 : i64 = next_word(norm, hi_of(w1), hi);
+    if (w2 < 0) {
+        meta[M_SKIPPED] = meta[M_SKIPPED] + 1;
+        return;
+    }
+    // the first object that is a get_ports list
+    var ports : i64 = NO_TEXT;
+    var pos : usize = hi_of(w2);
+    var go : bool = true;
+    while (go) {
+        const o : i64 = next_word(norm, pos, hi);
+        if (o < 0) {
+            go = false;
+        } else {
+            pos = hi_of(o);
+            const h : i64 = ports_head(norm, lo_of(o), hi_of(o));
+            if (h >= 0) {
+                ports = h;
+                go = false;
+            }
+        }
+    }
+    if (ports < 0) {
+        meta[M_SKIPPED] = meta[M_SKIPPED] + 1;
+        return;
+    }
+    const alo : usize = lo_of(ports);
+    const ahi : usize = hi_of(ports);
+    var any : bool = false;
+    if (span_is(norm, lo_of(w1), hi_of(w1), "-dict")) {
+        const kv : i64 = unwrap_span(norm, lo_of(w2), hi_of(w2));
+        const kb : usize = hi_of(kv);
+        var kpos : usize = lo_of(kv);
+        var more : bool = true;
+        while (more) {
+            const k : i64 = next_word(norm, kpos, kb);
+            if (k < 0) {
+                more = false;
+            } else {
+                const v : i64 = next_word(norm, hi_of(k), kb);
+                if (v < 0) {
+                    more = false;
+                } else {
+                    kpos = hi_of(v);
+                    const key : i64 = unwrap_span(norm, lo_of(k), hi_of(k));
+                    const kind : u8 = key_kind(upn, lo_of(key), hi_of(key));
+                    if (kind != KIND_NONE) {
+                        const val : i64 = unwrap_span(norm, lo_of(v), hi_of(v));
+                        any = true;
+                        emit_ports(norm, alo, ahi, kind, lo_of(val), hi_of(val), line, pins, stds, meta);
+                    }
+                }
+            }
+        }
+    } else {
+        const key : i64 = unwrap_span(norm, lo_of(w1), hi_of(w1));
+        const kind : u8 = key_kind(upn, lo_of(key), hi_of(key));
+        if (kind != KIND_NONE) {
+            const val : i64 = unwrap_span(norm, lo_of(w2), hi_of(w2));
+            any = true;
+            emit_ports(norm, alo, ahi, kind, lo_of(val), hi_of(val), line, pins, stds, meta);
+        }
+    }
+    if (any) {
+        meta[M_PLACED] = meta[M_PLACED] + 1;
+    } else {
+        meta[M_SKIPPED] = meta[M_SKIPPED] + 1;
+    }
+}
+
+/// commands(): split one logical line at ; outside groups, stop at a # that starts a command, and hand
+/// every non-empty trimmed command to process_command.
+pub fn process_line(norm: []const u8, upn: []const u8, a: usize, b: usize, line: u32, pins: []u32, stds: []u32, meta: []u32) {
+    var seg : usize = a;
+    var i : usize = a;
+    var depth_b : i64 = 0;
+    var depth_k : i64 = 0;
+    var quote : bool = false;
+    var stopped : bool = false;
+    while (i < b and !stopped) {
+        const c : u8 = norm[i];
+        if (c == B_BSLASH) {
+            i = i + 2;
+            continue;
+        }
+        if (quote) {
+            if (c == B_QUOTE) { quote = false; }
+            i = i + 1;
+            continue;
+        }
+        if (c == B_QUOTE) {
+            quote = true;
+        } else {
+            if (c == B_OPEN_C) {
+                depth_b = depth_b + 1;
+            } else {
+                if (c == B_CLOSE_C) {
+                    depth_b = depth_b - 1;
+                } else {
+                    if (c == B_OPEN_B) {
+                        depth_k = depth_k + 1;
+                    } else {
+                        if (c == B_CLOSE_B) { depth_k = depth_k - 1; }
+                    }
+                }
+            }
+        }
+        if (c == B_HASH and depth_b <= 0 and depth_k <= 0) {
+            const t : i64 = trim_span(norm, seg, i);
+            if (hi_of(t) == lo_of(t)) { stopped = true; }
+        }
+        if (!stopped and c == B_SEMI and depth_b <= 0 and depth_k <= 0) {
+            const t : i64 = trim_span(norm, seg, i);
+            if (hi_of(t) > lo_of(t)) { process_command(norm, upn, lo_of(t), hi_of(t), line, pins, stds, meta); }
+            seg = i + 1;
+        }
+        i = i + 1;
+    }
+    if (!stopped) {
+        var e : usize = b;
+        if (seg < e) {
+            const t : i64 = trim_span(norm, seg, e);
+            if (hi_of(t) > lo_of(t)) { process_command(norm, upn, lo_of(t), hi_of(t), line, pins, stds, meta); }
+        }
+    }
+}
+
+/// parseXdc: see "parse layout" in the header.
+pub fn xdc_parse(text: []const u8, norm: []u8, upn: []u8, pins: []u32, stds: []u32, meta: []u32) -> u32 {
+    var k : usize = 0;
+    while (k < 8) {
+        meta[k] = 0;
+        k = k + 1;
+    }
+    if (norm.len < text.len or upn.len < text.len) { return 2; }
+    var pos : usize = 0;
+    var nlen : usize = 0;
+    var lstart : usize = 0;
+    var phys : u32 = 1;
+    var lno : u32 = 1;
+    while (pos <= text.len) {
+        if (pos == text.len) {
+            process_line(norm, upn, lstart, nlen, lno, pins, stds, meta);
+            break;
+        }
+        const c : u8 = text[pos];
+        if (c == B_CR or c == B_LF) {
+            var tl : usize = 1;
+            if (c == B_CR and pos + 1 < text.len and text[pos + 1] == B_LF) { tl = 2; }
+            if (nlen > lstart and norm[nlen - 1] == B_BSLASH) {
+                norm[nlen - 1] = B_SPACE;
+                upn[nlen - 1] = B_SPACE;
+            } else {
+                process_line(norm, upn, lstart, nlen, lno, pins, stds, meta);
+                lstart = nlen;
+                lno = phys + 1;
+            }
+            phys = phys + 1;
+            pos = pos + tl;
+            continue;
+        }
+        norm[nlen] = c;
+        upn[nlen] = up_b(c);
+        nlen = nlen + 1;
+        pos = pos + 1;
+    }
+    meta[M_NORM] = nlen as u32;
+    return meta[6];
+}
+
+// ------------------------------------------------------------------------------------------------
+// the lint
+// ------------------------------------------------------------------------------------------------
+
+/// Copy src[lo .. hi] to the end of the pool; returns its offset. A full pool sets the status.
+pub fn pool_put(pool: []u8, lm: []u32, src: []const u8, lo: usize, hi: usize) -> u32 {
+    const at : usize = lm[LM_POOL] as usize;
+    const n : usize = hi - lo;
+    if (at + n > pool.len) {
+        lm[LM_STATUS] = 2;
+        return NONE;
+    }
+    var k : usize = 0;
+    while (k < n) {
+        pool[at + k] = src[lo + k];
+        k = k + 1;
+    }
+    lm[LM_POOL] = (at + n) as u32;
+    return at as u32;
+}
+
+pub fn dec_len(v: u32) -> usize {
+    var n : usize = 1;
+    var x : u32 = v;
+    while (x >= 10) {
+        x = x / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Write v as decimal text to the pool; returns the offset (the length is dec_len(v)).
+pub fn pool_put_dec(pool: []u8, lm: []u32, v: u32) -> u32 {
+    const at : usize = lm[LM_POOL] as usize;
+    const n : usize = dec_len(v);
+    if (at + n > pool.len) {
+        lm[LM_STATUS] = 2;
+        return NONE;
+    }
+    var x : u32 = v;
+    var k : usize = n;
+    while (k > 0) {
+        k = k - 1;
+        pool[at + k] = (48 + (x % 10)) as u8;
+        x = x / 10;
+    }
+    lm[LM_POOL] = (at + n) as u32;
+    return at as u32;
+}
+
+pub fn put_find(finds: []u32, lm: []u32, id: u32, sev: u32, bo: u32, bl: u32, po: u32, pl: u32, nargs: u32, a0o: u32, a0l: u32, a1o: u32, a1l: u32) {
+    const n : usize = lm[LM_FINDS] as usize;
+    if ((n + 1) * 11 <= finds.len) {
+        finds[n * 11] = id;
+        finds[n * 11 + 1] = sev;
+        finds[n * 11 + 2] = bo;
+        finds[n * 11 + 3] = bl;
+        finds[n * 11 + 4] = po;
+        finds[n * 11 + 5] = pl;
+        finds[n * 11 + 6] = nargs;
+        finds[n * 11 + 7] = a0o;
+        finds[n * 11 + 8] = a0l;
+        finds[n * 11 + 9] = a1o;
+        finds[n * 11 + 10] = a1l;
+    } else {
+        lm[LM_STATUS] = 1;
+    }
+    lm[LM_FINDS] = (n + 1) as u32;
+}
+
+/// /^([A-Z]+)(\d+)$/ with the letters in the row list and 1 <= number <= cols.
+pub fn on_grid(b: []const u8, lo: usize, hi: usize, rows: []const u8, cols: u32) -> bool {
+    var i : usize = lo;
+    while (i < hi and b[i] >= 65 and b[i] <= 90) { i = i + 1; }
+    if (i == lo or i == hi) { return false; }
+    var j : usize = i;
+    while (j < hi and is_digit(b[j])) { j = j + 1; }
+    if (j != hi) { return false; }
+    // is the letter run one of the comma-separated rows?
+    var listed : bool = false;
+    var pos : usize = 0;
+    var more : bool = true;
+    while (more) {
+        var e : usize = pos;
+        while (e < rows.len and rows[e] != B_COMMA) { e = e + 1; }
+        if (span_eq(rows, pos, e, b, lo, i)) { listed = true; }
+        if (e >= rows.len) { more = false; } else { pos = e + 1; }
+    }
+    if (!listed) { return false; }
+    var k : usize = i;
+    while (k < hi and b[k] == B_ZERO) { k = k + 1; }
+    const sig : usize = hi - k;
+    if (sig == 0 or sig > 18) { return false; }
+    var v : u64 = 0;
+    while (k < hi) {
+        v = v * 10 + ((b[k] - 48) as u64);
+        k = k + 1;
+    }
+    return v >= 1 and v <= (cols as u64);
+}
+
+/// The k-th space-separated field (0 to 3) of the line s[ls .. le]; the last field runs to the end.
+pub fn field_of(s: []const u8, ls: usize, le: usize, k: usize) -> i64 {
+    var a : usize = ls;
+    var f : usize = 0;
+    while (f < k) {
+        while (a < le and s[a] != B_SPACE) { a = a + 1; }
+        if (a < le) { a = a + 1; }
+        f = f + 1;
+    }
+    var e : usize = a;
+    if (k < 3) {
+        while (e < le and s[e] != B_SPACE) { e = e + 1; }
+    } else {
+        e = le;
+    }
+    return pack(a, e);
+}
+
+/// The packed line span of the LAST line of a "KEY ..." table whose first field is key[klo .. khi].
+pub fn table_find(tab: []const u8, key: []const u8, klo: usize, khi: usize) -> i64 {
+    var found : i64 = NO_TEXT;
+    var ls : usize = 0;
+    while (ls < tab.len) {
+        var le : usize = ls;
+        while (le < tab.len and tab[le] != B_LF) { le = le + 1; }
+        const f : i64 = field_of(tab, ls, le, 0);
+        if (span_eq(tab, lo_of(f), hi_of(f), key, klo, khi)) { found = pack(ls, le); }
+        ls = le + 1;
+    }
+    return found;
+}
+
+pub fn parse_dec(s: []const u8, lo: usize, hi: usize) -> u32 {
+    var v : u32 = 0;
+    var i : usize = lo;
+    while (i < hi) {
+        v = v * 10 + ((s[i] - 48) as u32);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// localeCompare('en', {numeric: true}) of two ASCII strings, -1 0 or 1.
+pub fn coll_cmp(a: []const u8, alo: usize, ahi: usize, b: []const u8, blo: usize, bhi: usize) -> i32 {
+    var i : usize = alo;
+    var j : usize = blo;
+    var go : bool = true;
+    while (go) {
+        while (i < ahi and a[i] < 128 and COLL_RANK[a[i] as usize] == 0) { i = i + 1; }
+        while (j < bhi and b[j] < 128 and COLL_RANK[b[j] as usize] == 0) { j = j + 1; }
+        if (i >= ahi and j >= bhi) { return 0; }
+        if (i >= ahi) { return -1; }
+        if (j >= bhi) { return 1; }
+        var ra : u32 = 300;
+        if (a[i] < 128) { ra = COLL_RANK[a[i] as usize] as u32; }
+        var rb : u32 = 300;
+        if (b[j] < 128) { rb = COLL_RANK[b[j] as usize] as u32; }
+        if (ra != rb) {
+            if (ra < rb) { return -1; }
+            return 1;
+        }
+        if (ra == 100) {
+            var ie : usize = i;
+            while (ie < ahi and is_digit(a[ie])) { ie = ie + 1; }
+            var je : usize = j;
+            while (je < bhi and is_digit(b[je])) { je = je + 1; }
+            var is : usize = i;
+            while (is < ie and a[is] == B_ZERO) { is = is + 1; }
+            var js : usize = j;
+            while (js < je and b[js] == B_ZERO) { js = js + 1; }
+            if (ie - is != je - js) {
+                if (ie - is < je - js) { return -1; }
+                return 1;
+            }
+            var k : usize = 0;
+            while (k < ie - is) {
+                if (a[is + k] != b[js + k]) {
+                    if (a[is + k] < b[js + k]) { return -1; }
+                    return 1;
+                }
+                k = k + 1;
+            }
+            i = ie;
+            j = je;
+        } else {
+            if (ra >= 200 and a[i] != b[j] and up_b(a[i]) != up_b(b[j])) {
+                if (ra < rb) { return -1; }
+                return 1;
+            }
+            i = i + 1;
+            j = j + 1;
+        }
+    }
+    return 0;
+}
+
+/// Order of two findings: severity, then the ball by collation.
+pub fn find_cmp(finds: []const u32, pool: []const u8, x: usize, y: usize) -> i32 {
+    const sx : u32 = finds[x * 11 + 1];
+    const sy : u32 = finds[y * 11 + 1];
+    if (sx != sy) {
+        if (sx < sy) { return -1; }
+        return 1;
+    }
+    const bx : usize = finds[x * 11 + 2] as usize;
+    const by : usize = finds[y * 11 + 2] as usize;
+    return coll_cmp(pool, bx, bx + (finds[x * 11 + 3] as usize), pool, by, by + (finds[y * 11 + 3] as usize));
+}
+
+/// Stable bottom-up merge sort of order[0 .. n] by find_cmp, using tmp[0 .. n].
+pub fn sort_findings(finds: []const u32, pool: []const u8, order: []u32, tmp: []u32, n: usize) {
+    var width : usize = 1;
+    while (width < n) {
+        var lo : usize = 0;
+        while (lo < n) {
+            var mid : usize = lo + width;
+            if (mid > n) { mid = n; }
+            var hi : usize = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var l : usize = lo;
+            var r : usize = mid;
+            var o : usize = lo;
+            while (l < mid or r < hi) {
+                var take_left : bool = false;
+                if (l < mid and r >= hi) { take_left = true; }
+                if (l < mid and r < hi) {
+                    if (find_cmp(finds, pool, order[l] as usize, order[r] as usize) <= 0) { take_left = true; }
+                }
+                if (take_left) {
+                    tmp[o] = order[l];
+                    l = l + 1;
+                } else {
+                    tmp[o] = order[r];
+                    r = r + 1;
+                }
+                o = o + 1;
+            }
+            lo = lo + 2 * width;
+        }
+        var c : usize = 0;
+        while (c < n) {
+            order[c] = tmp[c];
+            c = c + 1;
+        }
+        width = width * 2;
+    }
+}
+
+/// lintXdc: see "lint layout" in the header.
+pub fn xdc_lint(norm: []const u8, upn: []const u8, pins: []const u32, n_pins: usize, stds: []const u32, n_stds: usize, rows: []const u8, cols: u32, pkg: []const u8, vcco: []const u8, work: []u32, ports: []u32, finds: []u32, order: []u32, pool: []u8, lm: []u32) -> u32 {
+    lm[0] = 0;
+    lm[1] = 0;
+    lm[2] = 0;
+    lm[3] = 0;
+    const fcap : usize = finds.len / 11;
+    if (work.len < 3 * n_pins + fcap) {
+        lm[LM_STATUS] = 3;
+        return 3;
+    }
+    // 1. the last placement of each port, in first-placed order; a port placed again on another ball
+    // is a "moved" warning.
+    var nlast : usize = 0;
+    var j : usize = 0;
+    while (j < n_pins) {
+        const po : usize = pins[j * 5] as usize;
+        const pe : usize = po + (pins[j * 5 + 1] as usize);
+        const bo : usize = pins[j * 5 + 2] as usize;
+        const be : usize = bo + (pins[j * 5 + 3] as usize);
+        var s : usize = 0;
+        var hit : bool = false;
+        while (s < nlast and !hit) {
+            const q : usize = work[s] as usize;
+            const qo : usize = pins[q * 5] as usize;
+            if (span_eq(norm, qo, qo + (pins[q * 5 + 1] as usize), norm, po, pe)) { hit = true; } else { s = s + 1; }
+        }
+        if (hit) {
+            const q : usize = work[s] as usize;
+            const qb : usize = pins[q * 5 + 2] as usize;
+            const qbe : usize = qb + (pins[q * 5 + 3] as usize);
+            if (!span_eq(upn, qb, qbe, upn, bo, be)) {
+                const c_b : u32 = pool_put(pool, lm, upn, bo, be);
+                const c_p : u32 = pool_put(pool, lm, norm, po, pe);
+                const a0 : u32 = pool_put(pool, lm, upn, qb, qbe);
+                const a1 : u32 = pool_put_dec(pool, lm, pins[q * 5 + 4]);
+                put_find(finds, lm, ID_MOVED, SEV_WARN, c_b, (be - bo) as u32, c_p, (pe - po) as u32, 2, a0, (qbe - qb) as u32, a1, dec_len(pins[q * 5 + 4]) as u32);
+            }
+            work[s] = j as u32;
+        } else {
+            work[nlast] = j as u32;
+            nlast = nlast + 1;
+        }
+        j = j + 1;
+    }
+    // 2. each distinct port: its IOSTANDARD, its ball in the package, its findings.
+    var s : usize = 0;
+    while (s < nlast) {
+        const j2 : usize = work[s] as usize;
+        const po : usize = pins[j2 * 5] as usize;
+        const pe : usize = po + (pins[j2 * 5 + 1] as usize);
+        const bo : usize = pins[j2 * 5 + 2] as usize;
+        const be : usize = bo + (pins[j2 * 5 + 3] as usize);
+        const line : u32 = pins[j2 * 5 + 4];
+        var has_std : bool = false;
+        var so : usize = 0;
+        var se : usize = 0;
+        var t : usize = 0;
+        while (t < n_stds) {
+            const xo : usize = stds[t * 5] as usize;
+            const xe : usize = xo + (stds[t * 5 + 1] as usize);
+            if (covers(norm[xo .. xe], norm[po .. pe])) {
+                has_std = true;
+                so = stds[t * 5 + 2] as usize;
+                se = so + (stds[t * 5 + 3] as usize);
+            }
+            t = t + 1;
+        }
+        const grid : bool = on_grid(upn, bo, be, rows, cols);
+        const info : i64 = table_find(pkg, upn[bo .. be], 0, be - bo);
+        var bank : u32 = NONE;
+        var fo : usize = 0;
+        var fe : usize = 0;
+        var yo : usize = 0;
+        var ye : usize = 0;
+        if (info >= 0) {
+            const f1 : i64 = field_of(pkg, lo_of(info), hi_of(info), 1);
+            bank = parse_dec(pkg, lo_of(f1), hi_of(f1));
+            const f2 : i64 = field_of(pkg, lo_of(info), hi_of(info), 2);
+            yo = lo_of(f2);
+            ye = hi_of(f2);
+            const f3 : i64 = field_of(pkg, lo_of(info), hi_of(info), 3);
+            fo = lo_of(f3);
+            fe = hi_of(f3);
+        }
+        const nports : usize = lm[LM_PORTS] as usize;
+        const c_p : u32 = pool_put(pool, lm, norm, po, pe);
+        const c_b : u32 = pool_put(pool, lm, upn, bo, be);
+        var c_s : u32 = NONE;
+        if (has_std) { c_s = pool_put(pool, lm, upn, so, se); }
+        var c_f : u32 = NONE;
+        var c_y : u32 = NONE;
+        var c_fl : u32 = 0;
+        var c_yl : u32 = 0;
+        if (info >= 0) {
+            c_f = pool_put(pool, lm, pkg, fo, fe);
+            c_fl = (fe - fo) as u32;
+            c_y = pool_put(pool, lm, pkg, yo, ye);
+            c_yl = (ye - yo) as u32;
+        } else {
+            if (grid) {
+                c_y = pool_put(pool, lm, "unlisted", 0, 8);
+                c_yl = 8;
+            }
+        }
+        if ((nports + 1) * 12 <= ports.len) {
+            ports[nports * 12] = c_p;
+            ports[nports * 12 + 1] = (pe - po) as u32;
+            ports[nports * 12 + 2] = c_b;
+            ports[nports * 12 + 3] = (be - bo) as u32;
+            ports[nports * 12 + 4] = c_s;
+            ports[nports * 12 + 5] = (se - so) as u32;
+            ports[nports * 12 + 6] = line;
+            ports[nports * 12 + 7] = bank;
+            ports[nports * 12 + 8] = c_f;
+            ports[nports * 12 + 9] = c_fl;
+            ports[nports * 12 + 10] = c_y;
+            ports[nports * 12 + 11] = c_yl;
+        } else {
+            lm[LM_STATUS] = 1;
+        }
+        lm[LM_PORTS] = (nports + 1) as u32;
+        // findings for this port
+        const pl : u32 = (pe - po) as u32;
+        const bl : u32 = (be - bo) as u32;
+        if (!grid) {
+            put_find(finds, lm, ID_NOBALL, SEV_ERROR, c_b, bl, c_p, pl, 0, 0, 0, 0, 0);
+        } else {
+            if (info < 0) {
+                put_find(finds, lm, ID_NOTIO, SEV_ERROR, c_b, bl, c_p, pl, 0, 0, 0, 0, 0);
+            } else {
+                if (span_is(pkg, yo, ye, "mgt")) {
+                    put_find(finds, lm, ID_MGT, SEV_ERROR, c_b, bl, c_p, pl, 1, c_f, c_fl, 0, 0);
+                } else {
+                    if (span_is(pkg, yo, ye, "xadc")) {
+                        put_find(finds, lm, ID_XADC, SEV_ERROR, c_b, bl, c_p, pl, 1, c_f, c_fl, 0, 0);
+                    } else {
+                        if (is_dual_config(pkg[fo .. fe])) { put_find(finds, lm, ID_DUAL, SEV_INFO, c_b, bl, c_p, pl, 1, c_f, c_fl, 0, 0); }
+                    }
+                }
+            }
+        }
+        if (!has_std or se == so) {
+            put_find(finds, lm, ID_NOSTD, SEV_WARN, c_b, bl, c_p, pl, 0, 0, 0, 0, 0);
+        }
+        s = s + 1;
+    }
+    const np : usize = lm[LM_PORTS] as usize;
+    if (lm[LM_STATUS] != 0) { return lm[LM_STATUS]; }
+    // 3. two ports on one ball: one finding per ball, in first-seen order.
+    var i : usize = 0;
+    while (i < np) {
+        const ib : usize = ports[i * 12 + 2] as usize;
+        const il : usize = ports[i * 12 + 3] as usize;
+        var first : bool = true;
+        var e : usize = 0;
+        while (e < i and first) {
+            const eb : usize = ports[e * 12 + 2] as usize;
+            if (span_eq(pool, eb, eb + (ports[e * 12 + 3] as usize), pool, ib, ib + il)) { first = false; }
+            e = e + 1;
+        }
+        if (first) {
+            var count : usize = 0;
+            var m : usize = i;
+            while (m < np) {
+                const mb : usize = ports[m * 12 + 2] as usize;
+                if (span_eq(pool, mb, mb + (ports[m * 12 + 3] as usize), pool, ib, ib + il)) { count = count + 1; }
+                m = m + 1;
+            }
+            if (count > 1) {
+                var joined : u32 = NONE;
+                var jlen : usize = 0;
+                var seen : usize = 0;
+                m = i;
+                while (m < np) {
+                    const mb : usize = ports[m * 12 + 2] as usize;
+                    if (span_eq(pool, mb, mb + (ports[m * 12 + 3] as usize), pool, ib, ib + il)) {
+                        if (seen > 0) {
+                            const sep : u32 = pool_put(pool, lm, ", ", 0, 2);
+                            if (seen == 1 and joined == NONE) { joined = sep; }
+                            jlen = jlen + 2;
+                        }
+                        const mo : usize = ports[m * 12] as usize;
+                        const ml : usize = ports[m * 12 + 1] as usize;
+                        const piece : u32 = pool_put(pool, lm, pool, mo, mo + ml);
+                        if (seen == 0) { joined = piece; }
+                        jlen = jlen + ml;
+                        seen = seen + 1;
+                    }
+                    m = m + 1;
+                }
+                put_find(finds, lm, ID_TWOPORTS, SEV_ERROR, ports[i * 12 + 2], il as u32, ports[i * 12], ports[i * 12 + 1], 1, joined, jlen as u32, 0, 0);
+            }
+        }
+        i = i + 1;
+    }
+    // 4. banks whose standards need different VCCO.
+    // mv of each port (NONE when the port does not take part), kept in work[n_pins ..].
+    var p : usize = 0;
+    while (p < np) {
+        var mv : u32 = NONE;
+        const sl : usize = ports[p * 12 + 5] as usize;
+        if (ports[p * 12 + 7] != NONE and ports[p * 12 + 4] != NONE and sl > 0) {
+            const sb : usize = ports[p * 12 + 4] as usize;
+            const hit : i64 = table_find(vcco, pool[sb .. sb + sl], 0, sl);
+            if (hit >= 0) {
+                const f1 : i64 = field_of(vcco, lo_of(hit), hi_of(hit), 1);
+                mv = parse_dec(vcco, lo_of(f1), hi_of(f1));
+            }
+        }
+        work[n_pins + p] = mv;
+        p = p + 1;
+    }
+    p = 0;
+    while (p < np) {
+        const bank : u32 = ports[p * 12 + 7];
+        if (work[n_pins + p] != NONE) {
+            var fresh : bool = true;
+            var q : usize = 0;
+            while (q < p and fresh) {
+                if (work[n_pins + q] != NONE and ports[q * 12 + 7] == bank) { fresh = false; }
+                q = q + 1;
+            }
+            if (fresh) {
+                // the first port of this bank, and the first port whose level differs from it
+                var m1 : u32 = work[n_pins + p];
+                var second : i64 = -1;
+                q = p;
+                while (q < np and second < 0) {
+                    if (work[n_pins + q] != NONE and ports[q * 12 + 7] == bank and work[n_pins + q] != m1) { second = q as i64; }
+                    q = q + 1;
+                }
+                if (second >= 0) {
+                    // standards by level, highest millivolts first, each standard once
+                    var joined : u32 = NONE;
+                    var jlen : usize = 0;
+                    var nfl : usize = 0;
+                    var bound : u64 = 4294967296;
+                    var more : bool = true;
+                    while (more) {
+                        var cur : i64 = -1;
+                        q = p;
+                        while (q < np) {
+                            if (work[n_pins + q] != NONE and ports[q * 12 + 7] == bank and (work[n_pins + q] as u64) < bound and (work[n_pins + q] as i64) > cur) { cur = work[n_pins + q] as i64; }
+                            q = q + 1;
+                        }
+                        if (cur < 0) {
+                            more = false;
+                        } else {
+                            bound = cur as u64;
+                            q = p;
+                            while (q < np) {
+                                if (work[n_pins + q] != NONE and ports[q * 12 + 7] == bank and (work[n_pins + q] as i64) == cur) {
+                                    const qs : usize = ports[q * 12 + 4] as usize;
+                                    const ql : usize = ports[q * 12 + 5] as usize;
+                                    var dup : bool = false;
+                                    var d : usize = 0;
+                                    while (d < nfl and !dup) {
+                                        const r : usize = work[2 * n_pins + d] as usize;
+                                        const rs : usize = ports[r * 12 + 4] as usize;
+                                        if (span_eq(pool, rs, rs + (ports[r * 12 + 5] as usize), pool, qs, qs + ql)) { dup = true; }
+                                        d = d + 1;
+                                    }
+                                    if (!dup) {
+                                        if (nfl > 0) {
+                                            const sep : u32 = pool_put(pool, lm, " / ", 0, 3);
+                                            if (nfl == 1 and joined == NONE) { joined = sep; }
+                                            jlen = jlen + 3;
+                                        }
+                                        const piece : u32 = pool_put(pool, lm, pool, qs, qs + ql);
+                                        if (nfl == 0) { joined = piece; }
+                                        jlen = jlen + ql;
+                                        work[2 * n_pins + nfl] = q as u32;
+                                        nfl = nfl + 1;
+                                    }
+                                }
+                                q = q + 1;
+                            }
+                        }
+                    }
+                    const sq : usize = second as usize;
+                    const bnum : u32 = pool_put_dec(pool, lm, bank);
+                    put_find(finds, lm, ID_VCCO, SEV_WARN, ports[sq * 12 + 2], ports[sq * 12 + 3], ports[sq * 12], ports[sq * 12 + 1], 2, bnum, dec_len(bank) as u32, joined, jlen as u32);
+                }
+            }
+        }
+        p = p + 1;
+    }
+    if (lm[LM_STATUS] != 0) { return lm[LM_STATUS]; }
+    // 5. the sorted order.
+    const nf : usize = lm[LM_FINDS] as usize;
+    var o : usize = 0;
+    while (o < nf) {
+        order[o] = o as u32;
+        o = o + 1;
+    }
+    sort_findings(finds, pool, order, work[3 * n_pins .. 3 * n_pins + fcap], nf);
+    return 0;
+}
+
+/// summarize: out = [ports, ports not on an error ball, balls with an error, errors, warnings, notes].
+pub fn xdc_summarize(ports: []const u32, n_ports: usize, finds: []const u32, n_finds: usize, pool: []const u8, out: []u32) {
+    var errors : u32 = 0;
+    var warns : u32 = 0;
+    var infos : u32 = 0;
+    var flagged : u32 = 0;
+    var f : usize = 0;
+    while (f < n_finds) {
+        const sev : u32 = finds[f * 11 + 1];
+        if (sev == SEV_ERROR) {
+            errors = errors + 1;
+            const fb : usize = finds[f * 11 + 2] as usize;
+            const fl : usize = finds[f * 11 + 3] as usize;
+            var first : bool = true;
+            var g : usize = 0;
+            while (g < f and first) {
+                if (finds[g * 11 + 1] == SEV_ERROR) {
+                    const gb : usize = finds[g * 11 + 2] as usize;
+                    if (span_eq(pool, gb, gb + (finds[g * 11 + 3] as usize), pool, fb, fb + fl)) { first = false; }
+                }
+                g = g + 1;
+            }
+            if (first) { flagged = flagged + 1; }
+        }
+        if (sev == SEV_WARN) { warns = warns + 1; }
+        if (sev == SEV_INFO) { infos = infos + 1; }
+        f = f + 1;
+    }
+    var ok : u32 = 0;
+    var p : usize = 0;
+    while (p < n_ports) {
+        const pb : usize = ports[p * 12 + 2] as usize;
+        const pl : usize = ports[p * 12 + 3] as usize;
+        var bad : bool = false;
+        f = 0;
+        while (f < n_finds and !bad) {
+            if (finds[f * 11 + 1] == SEV_ERROR) {
+                const fb : usize = finds[f * 11 + 2] as usize;
+                if (span_eq(pool, fb, fb + (finds[f * 11 + 3] as usize), pool, pb, pb + pl)) { bad = true; }
+            }
+            f = f + 1;
+        }
+        if (!bad) { ok = ok + 1; }
+        p = p + 1;
+    }
+    out[0] = n_ports as u32;
+    out[1] = ok;
+    out[2] = flagged;
+    out[3] = errors;
+    out[4] = warns;
+    out[5] = infos;
+}
+
+// ------------------------------------------------------------------------------------------------
+// tests: the project's own demo XDCs (public/widgets/pin-map/demos.json) against the package rows of
+// pins.json for the balls they name; the counts are the K_DEMO_ facts of specs/widgets/pin-map.t27.
+// ------------------------------------------------------------------------------------------------
+
+pub var T_NORM : [1024]u8 = [0; 1024];
+pub var T_UPN : [1024]u8 = [0; 1024];
+pub var T_PINS : [200]u32 = [0; 200];
+pub var T_STDS : [200]u32 = [0; 200];
+pub var T_META : [8]u32 = [0; 8];
+pub var T_WORK : [512]u32 = [0; 512];
+pub var T_PORTS : [240]u32 = [0; 240];
+pub var T_FINDS : [220]u32 = [0; 220];
+pub var T_ORDER : [20]u32 = [0; 20];
+pub var T_POOL : [4096]u8 = [0; 4096];
+pub var T_LM : [4]u32 = [0; 4];
+pub var T_SUM : [6]u32 = [0; 6];
+
+pub fn t_pkg() -> []const u8 {
+    return "R23 14 config IO_L24N_T3_A00_D16_14\nT23 14 config IO_L24P_T3_A01_D17_14\nU22 13 clock IO_L12P_T1_MRCC_13\nN23 14 io IO_L15P_T2_DQS_RDWR_B_14\nC8 216 mgt MGTPTXN1_216\nB19 16 io IO_L10P_T1_16\nA18 16 io IO_L9N_T1_DQS_16\nE3 35 io IO_L18N_T2_35\nA2 35 io IO_L20N_T3_35\nA3 35 io IO_L20P_T3_35\nA4 35 io IO_L16N_T2_35\nA5 35 io IO_L15N_T2_DQS_35\n";
+}
+
+pub fn t_vcco() -> []const u8 {
+    return "LVCMOS33 3300\nLVTTL 3300\nLVCMOS25 2500\nLVCMOS18 1800\n";
+}
+
+/// Parse and lint a text against the test package; the lint status, or 100 + the parse status.
+pub fn t_lint(text: []const u8) -> u32 {
+    const st : u32 = xdc_parse(text, T_NORM[0 .. 1024], T_UPN[0 .. 1024], T_PINS[0 .. 200], T_STDS[0 .. 200], T_META[0 .. 8]);
+    if (st != 0) { return 100 + st; }
+    const lst : u32 = xdc_lint(T_NORM[0 .. 1024], T_UPN[0 .. 1024], T_PINS[0 .. 200], T_META[0] as usize, T_STDS[0 .. 200], T_META[1] as usize, "A,B,C,D,E,F,G,H,J,K,L,M,N,P,R,T,U,V,W,Y,AA,AB,AC,AD,AE,AF", 26, t_pkg(), t_vcco(), T_WORK[0 .. 512], T_PORTS[0 .. 240], T_FINDS[0 .. 220], T_ORDER[0 .. 20], T_POOL[0 .. 4096], T_LM[0 .. 4]);
+    xdc_summarize(T_PORTS[0 .. 240], T_LM[0] as usize, T_FINDS[0 .. 220], T_LM[1] as usize, T_POOL[0 .. 4096], T_SUM[0 .. 6]);
+    return lst;
+}
+
+pub var T_TEXT : [1024]u8 = [0; 1024];
+
+/// x with every backtick turned into a carriage return (a string literal has no \r).
+pub fn with_cr(x: []const u8) -> []const u8 {
+    var i : usize = 0;
+    while (i < x.len) {
+        T_TEXT[i] = x[i];
+        if (x[i] == 96) { T_TEXT[i] = 13; }
+        i = i + 1;
+    }
+    return T_TEXT[0 .. x.len];
+}
+
+/// The id of the k-th sorted finding.
+pub fn t_id(k: usize) -> u32 {
+    return T_FINDS[(T_ORDER[k] as usize) * 11];
+}
+
+/// Is the pool text at (off, len) exactly w?
+pub fn t_pool_is(off: u32, len: u32, w: []const u8) -> bool {
+    return span_is(T_POOL[0 .. 4096], off as usize, (off + len) as usize, w);
+}
+
+test the_flashed_led_demo_places_two_ports_both_user_io {
+    const x : []const u8 = "# Constraints\n\nset_property -dict { PACKAGE_PIN R23 IOSTANDARD LVCMOS33 } [get_ports led_r23]\nset_property -dict { PACKAGE_PIN T23 IOSTANDARD LVCMOS33 } [get_ports led_t23]\n\nset_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]\nset_property CLOCK_DEDICATED_ROUTE FALSE [get_nets osc]\n";
+    assert t_lint(x) == 0;
+    assert T_META[2] == 4;
+    assert T_META[3] == 2;
+    assert T_META[4] == 2;
+    assert T_META[0] == 2;
+    assert T_PINS[4] == 3;
+    assert T_PINS[9] == 4;
+    assert T_SUM[0] == 2;
+    assert T_SUM[1] == 2;
+    assert T_SUM[2] == 0;
+    assert T_SUM[5] == 2;
+    assert t_id(0) == ID_DUAL;
+}
+
+test the_spi_proxy_demo_has_one_transceiver_pin_among_three {
+    const x : []const u8 = "set_property LOC C8  [get_ports cs_n]    ; # FCS_B\nset_property LOC B19 [get_ports mosi]    ; # MOSI / DQ0\nset_property LOC A18 [get_ports miso]\nset_property IOSTANDARD LVCMOS33 [get_ports {cs_n mosi miso}]\nset_property CFGBVS VCCO [current_design]\n";
+    assert t_lint(x) == 0;
+    assert T_META[2] == 5;
+    assert T_META[3] == 4;
+    assert T_META[0] == 3;
+    assert T_META[1] == 3;
+    assert T_SUM[0] == 3;
+    assert T_SUM[1] == 2;
+    assert T_SUM[2] == 1;
+    assert T_SUM[3] == 1;
+    assert T_LM[1] == 1;
+    assert t_id(0) == ID_MGT;
+    assert T_FINDS[(T_ORDER[0] as usize) * 11 + 6] == 1;
+    assert t_pool_is(T_FINDS[(T_ORDER[0] as usize) * 11 + 7], T_FINDS[(T_ORDER[0] as usize) * 11 + 8], "MGTPTXN1_216");
+}
+
+test the_core_board_demo_passes_with_one_dual_purpose_note {
+    const x : []const u8 = "set_property PACKAGE_PIN U22 [get_ports clk]\nset_property IOSTANDARD LVCMOS33 [get_ports clk]\nset_property PACKAGE_PIN T23 [get_ports led]\nset_property IOSTANDARD LVCMOS33 [get_ports led]\nset_property PACKAGE_PIN N23 [get_ports {debug_leds[0]}]\nset_property IOSTANDARD LVCMOS33 [get_ports {debug_leds[0]}]\nset_property PULLDOWN true [get_ports {sw[0]}]\ncreate_clock -period 20.000 -name clk [get_ports clk]\n";
+    assert t_lint(x) == 0;
+    assert T_META[2] == 8;
+    assert T_META[3] == 6;
+    assert T_META[4] == 2;
+    assert T_SUM[0] == 3;
+    assert T_SUM[1] == 3;
+    assert T_SUM[2] == 0;
+    assert T_SUM[5] == 1;
+    assert T_LM[1] == 1;
+}
+
+test pins_moved_shared_and_missing_are_found_in_severity_order {
+    const x : []const u8 = "set_property PACKAGE_PIN E3 [get_ports a]\nset_property PACKAGE_PIN E3 [get_ports b]\nset_property PACKAGE_PIN T10 [get_ports c]\nset_property PACKAGE_PIN T11 [get_ports d]\nset_property PACKAGE_PIN T10 [get_ports c]\nset_property PACKAGE_PIN R23 [get_ports c]\nset_property IOSTANDARD LVCMOS33 [get_ports {a b}]\nset_property IOSTANDARD LVCMOS18 [get_ports c]\nset_property IOSTANDARD LVCMOS25 [get_ports d]\n";
+    assert t_lint(x) == 0;
+    assert T_META[3] == 9;
+    assert T_LM[1] == 4;
+    assert t_id(0) == ID_TWOPORTS;
+    assert t_id(1) == ID_NOTIO;
+    assert t_id(2) == ID_MOVED;
+    assert t_id(3) == ID_DUAL;
+    assert T_SUM[0] == 4;
+    assert T_SUM[1] == 1;
+    assert T_SUM[2] == 2;
+    assert T_SUM[3] == 2;
+    assert T_SUM[4] == 1;
+    assert T_SUM[5] == 1;
+    assert t_pool_is(T_FINDS[(T_ORDER[0] as usize) * 11 + 7], T_FINDS[(T_ORDER[0] as usize) * 11 + 8], "a, b");
+    assert t_pool_is(T_FINDS[(T_ORDER[2] as usize) * 11 + 9], T_FINDS[(T_ORDER[2] as usize) * 11 + 10], "5");
+}
+
+test a_bank_that_mixes_standards_names_them_by_voltage {
+    const x : []const u8 = "set_property -dict {PACKAGE_PIN A2 IOSTANDARD LVCMOS33} [get_ports a]\nset_property -dict {PACKAGE_PIN A3 IOSTANDARD LVCMOS18} [get_ports b]\nset_property -dict {PACKAGE_PIN A4 IOSTANDARD LVCMOS25} [get_ports c]\nset_property -dict {PACKAGE_PIN A5 IOSTANDARD LVCMOS33} [get_ports d]\n";
+    assert t_lint(x) == 0;
+    assert T_LM[1] == 1;
+    assert t_id(0) == ID_VCCO;
+    assert T_FINDS[(T_ORDER[0] as usize) * 11 + 1] == SEV_WARN;
+    assert t_pool_is(T_FINDS[(T_ORDER[0] as usize) * 11 + 7], T_FINDS[(T_ORDER[0] as usize) * 11 + 8], "35");
+    assert t_pool_is(T_FINDS[(T_ORDER[0] as usize) * 11 + 9], T_FINDS[(T_ORDER[0] as usize) * 11 + 10], "LVCMOS33 / LVCMOS25 / LVCMOS18");
+    assert t_pool_is(T_FINDS[(T_ORDER[0] as usize) * 11 + 2], T_FINDS[(T_ORDER[0] as usize) * 11 + 3], "A3");
+}
+
+test continued_lines_crlf_and_comments_follow_parse_xdc {
+    const x : []const u8 = "set_property -dict { PACKAGE_PIN E3 \\`\n IOSTANDARD LVCMOS33 } \\\n [get_ports clk]; set_property LOC E4 [get_ports led[*]]`\n# trailing \\\nset_property IOSTANDARD LVTTL [get_ports led[*]]";
+    assert t_lint(with_cr(x)) == 0;
+    assert T_META[2] == 2;
+    assert T_META[3] == 2;
+    assert T_META[0] == 2;
+    assert T_META[1] == 1;
+    assert T_PINS[4] == 1;
+    assert T_PINS[9] == 1;
+    assert T_SUM[0] == 2;
+    assert T_SUM[1] == 1;
+    assert T_LM[1] == 2;
+    assert t_id(0) == ID_NOTIO;
+    assert t_id(1) == ID_NOSTD;
+}
+
+test pin_types_follow_the_prjxray_names {
+    assert pin_type("IO_L18N_T2_35") == T_IO;
+    assert pin_type("IO_L12P_T1_MRCC_13") == T_CLOCK;
+    assert pin_type("IO_L24N_T3_A00_D16_14") == T_CONFIG;
+    assert pin_type("IO_L9P_T1_DQS_AD3P_15") == T_ANALOG;
+    assert pin_type("IO_L1P_T0_VREF_35") == T_VREF;
+    assert pin_type("MGTPTXN1_216") == T_MGT;
+    assert pin_type("VP_0") == T_XADC;
+    assert pin_type("IO_L15P_T2_DQS_RDWR_B_14") == T_IO;
+    assert is_dual_config("IO_L24N_T3_A00_D16_14");
+    assert is_dual_config("IO_L15P_T2_DQS_RDWR_B_14") == false;
+    assert is_dual_config("IO_L18N_T2_35") == false;
+}
+
+test covers_is_exact_bus_base_or_glob {
+    assert covers("led", "led");
+    assert covers("led", "led[3]");
+    assert covers("led", "ledx") == false;
+    assert covers("led[*]", "led[7]");
+    assert covers("sw?", "sw1");
+    assert covers("sw?", "sw12") == false;
+    assert covers("*", "anything");
+    assert covers("a.b", "aXb") == false;
+    assert coll_cmp("A2", 0, 2, "A10", 0, 3) == -1;
+    assert coll_cmp("A01", 0, 3, "A1", 0, 2) == 0;
+    assert coll_cmp("B", 0, 1, "A", 0, 1) == 1;
+}
