@@ -517,6 +517,13 @@ impl Lexer {
                             b't' => s.push('\t'),
                             b'\\' => s.push('\\'),
                             b'"' => s.push('"'),
+                            // #10793: `\xNN` (two hex digits) is one byte, held as the char of that value.
+                            b'x' if (1..3).all(|i| self.peek_offset(i).is_ascii_hexdigit()) => {
+                                let hex = |i| (self.peek_offset(i) as char).to_digit(16).unwrap_or(0);
+                                s.push(char::from((hex(1) * 16 + hex(2)) as u8));
+                                self.advance();
+                                self.advance();
+                            }
                             _ => {
                                 s.push('\\');
                                 s.push(escaped as char);
@@ -3642,44 +3649,6 @@ the parser used to read it as `{}` followed by a negation",
         Ok(())
     }
 
-    /// Skip tokens to recover to next statement boundary (semicolon or closing brace)
-    #[allow(dead_code)]
-    fn recover_to_stmt_boundary(&mut self) {
-        let mut brace_depth: i32 = 0;
-        loop {
-            // W646: statement-level recovery is the second discard channel.
-            // Everything it walks past is a statement the AST never sees.
-            // W899: record the span too -- see the note in skip_brace_body.
-            if self.current.kind != TokenKind::Eof {
-                self.dropped_top_level_tokens += 1;
-                if self.dropped_spans.len() < 20000 {
-                    self.dropped_spans
-                        .push((self.current.line as u32, self.current.lexeme.clone()));
-                    self.dropped_channels.push("stmt-recovery");
-                }
-            }
-            match self.current.kind {
-                TokenKind::Eof => break,
-                TokenKind::Semicolon if brace_depth == 0 => {
-                    self.advance();
-                    break;
-                }
-                TokenKind::RBrace if brace_depth == 0 => break,
-                TokenKind::LBrace => {
-                    brace_depth += 1;
-                    self.advance();
-                }
-                TokenKind::RBrace => {
-                    brace_depth -= 1;
-                    self.advance();
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
-    }
-
     /// Parse a single statement inside a function body
     fn parse_body_stmt(&mut self) -> Result<Node, String> {
         // `defer <stmt>;` / `errdefer <stmt>;` -- Zig's scope-exit hook. Not
@@ -4656,31 +4625,6 @@ the parser used to read it as `{}` followed by a negation",
         node.children.push(body_block);
 
         Ok(node)
-    }
-
-    fn parse_range_bound(&mut self) -> Result<Node, String> {
-        match self.current.kind {
-            TokenKind::Number => {
-                let (val, num_suffix) = split_number_suffix(&self.current.lexeme);
-                self.advance();
-                Ok(Node {
-                    kind: NodeKind::ExprLiteral,
-                    value: val,
-                    extra_type: num_suffix,
-                    ..Default::default()
-                })
-            }
-            TokenKind::Ident => {
-                let name = self.current.lexeme.clone();
-                self.advance();
-                Ok(Node {
-                    kind: NodeKind::ExprIdentifier,
-                    name,
-                    ..Default::default()
-                })
-            }
-            _ => self.parse_expr_additive(),
-        }
     }
 
     // ========================================================================
@@ -7129,16 +7073,6 @@ the parser used to read it as `{}` followed by a negation",
         )
     }
 
-    /// W655 (T95): is this a floating type? Verilog's synthesizable subset has
-    /// no float, and lowering `f32` to an integer vector produced a value that
-    /// COMPILES, SYNTHESIZES, RUNS and is wrong for every non-integral input
-    /// (T84/T85). Verilog `real` is IEEE double and is correct in simulation;
-    /// synthesis rejects it, which is truthful because `f32` arithmetic was
-    /// never synthesizable.
-    fn type_is_float(ty: &str) -> bool {
-        matches!(ty.trim(), "f32" | "f64")
-    }
-
     fn opens_declaration(kind: TokenKind) -> bool {
         matches!(
             kind,
@@ -8590,7 +8524,7 @@ impl Codegen {
 
     /// Re-escape a string the lexer already unescaped, so it can be written
     /// back between quotes.
-    fn zig_escape(raw: &str) -> String {
+    fn zig_escape(raw: &str, octal: bool) -> String {
         let mut out = String::with_capacity(raw.len());
         for c in raw.chars() {
             match c {
@@ -8599,10 +8533,28 @@ impl Codegen {
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
+                // #10793: a lexeme char is a byte (U+0000..U+00FF). Zig, Rust
+                // take `\xNN`; C and Verilog take octal (a C `\x` eats digits).
+                c if (c as u32) < 0x20 || (0x7f..=0xff).contains(&(c as u32)) => {
+                    out.push_str(&match octal {
+                        true => format!("\\{:03o}", c as u32),
+                        false => format!("\\x{:02x}", c as u32),
+                    })
+                }
                 _ => out.push(c),
             }
         }
         out
+    }
+
+    /// A Rust `&str` literal for a lexeme of bytes: a `str` cannot hold a lone
+    /// byte above 0x7F, so non-ASCII must be valid UTF-8 (#10793).
+    fn rust_str_literal(raw: &str) -> String {
+        match String::from_utf8(raw.chars().map(|c| c as u32 as u8).collect()) {
+            Ok(text) if !raw.is_ascii() => format!("\"{}\"", text.escape_default()),
+            Err(_) => "compile_error!(\"string literal is not valid UTF-8\")".to_string(),
+            _ => format!("\"{}\"", Self::zig_escape(raw, false)),
+        }
     }
 
     fn zig_is_primitive(name: &str) -> bool {
@@ -10366,7 +10318,7 @@ impl Codegen {
                     // 154 escape sequences across 19 specs. The W576 lexer
                     // conformance table records the unescaping as a boundary,
                     // which is how this was found.
-                    self.write(&format!("\"{}\"", Self::zig_escape(&node.value)));
+                    self.write(&format!("\"{}\"", Self::zig_escape(&node.value, false)));
                 } else {
                     self.write(&node.value);
                 }
@@ -12764,11 +12716,6 @@ impl VerilogCodegen {
             return Self::packed_struct_width_in(t, depth + 1, structs);
         }
         Self::type_to_width(t)
-    }
-
-    /// W671: total packed width of a struct, summing `field_type_width`.
-    fn packed_struct_width(&self, name: &str, depth: u32) -> u32 {
-        Self::packed_struct_width_in(name, depth, &self.struct_decls)
     }
 
     /// #5904: `packed_struct_width` with the struct map passed in.
@@ -18173,11 +18120,7 @@ impl VerilogCodegen {
                 // otherwise Yosys emits "unterminated string" / "unknown escape
                 // sequence" warnings.
                 if node.extra_kind == "string" {
-                    let escaped = val
-                        .replace('\\', "\\\\")
-                        .replace('\n', "\\n")
-                        .replace('\t', "\\t")
-                        .replace('"', "\\\"");
+                    let escaped = Codegen::zig_escape(val, true);
                     self.write(&format!("\"{}\"", escaped));
                     return;
                 }
@@ -20275,7 +20218,7 @@ long double: fabsl, default: llabs)(x)",
                 // a bare word is valid C. It lands in the output and fails
                 // wherever it is used, or expands to something else entirely.
                 let text = if child.extra_kind == "string" {
-                    format!("\"{}\"", Codegen::zig_escape(&child.value))
+                    format!("\"{}\"", Codegen::zig_escape(&child.value, true))
                 } else {
                     Self::c_literal(&child.value)
                 };
@@ -22253,7 +22196,7 @@ long double: fabsl, default: llabs)(x)",
                 // The lexer UNESCAPES as it reads, so the value here holds real
                 // newlines and quotes; they have to be written back escaped.
                 if node.extra_kind == "string" {
-                    self.write(&format!("\"{}\"", Codegen::zig_escape(&node.value)));
+                    self.write(&format!("\"{}\"", Codegen::zig_escape(&node.value, true)));
                     return;
                 }
                 // Zig and Rust write `100_000_000`; C does not. The separator
@@ -24249,6 +24192,18 @@ fn collect_field_names(node: &Node, out: &mut std::collections::HashSet<String>)
     }
 }
 
+/// #8891: `Struct.field` -> its Rust type, `.variant` -> its enum, or "" when two enums declare the variant.
+fn collect_decl_types(node: &Node, out: &mut std::collections::HashMap<String, String>) {
+    for c in &node.children {
+        if node.kind == NodeKind::StructDecl && c.kind == NodeKind::ExprIdentifier && !c.name.is_empty() {
+            out.insert(format!("{}.{}", node.name, c.name), RustCodegen::t27_type_to_rust(&c.extra_type));
+        } else if node.kind == NodeKind::EnumDecl && c.kind == NodeKind::EnumVariant {
+            let e = out.entry(format!(".{}", c.name)).or_insert_with(|| node.name.clone()); if *e != node.name { e.clear() }
+        }
+        collect_decl_types(c, out);
+    }
+}
+
 /// Each function's parameter names, in order. A call site knows argument
 /// POSITIONS; `written_slice_params` is keyed by parameter NAME, and this is
 /// the map between them.
@@ -24552,7 +24507,7 @@ fn collect_fn_ret_types(node: &Node, out: &mut std::collections::HashMap<String,
 /// the emitter wrote them bare, so the struct did not parse. Rust's raw-identifier
 /// syntax `r#type` is the exact spelling for this and needs no judgement.
 ///
-/// `crate`, `self`, `Self` and `super` are deliberately NOT escaped: `r#` is invalid
+/// `crate`, `Self` and `super` are deliberately NOT escaped: `r#` is invalid
 /// for them, so escaping would replace one parse error with another. They do not
 /// occur as field names in this corpus; if one appears, it stays bare and fails
 /// visibly rather than failing in a way that looks like this fix worked.
@@ -24566,6 +24521,7 @@ fn rust_ident(name: &str) -> String {
         "abstract", "become", "do", "final", "macro", "override", "priv", "try",
         "typeof", "unsized", "virtual",
     ];
+    if name == "self" { return "self_".to_string(); } // #8891: a free fn's `self` parameter; `r#self` is invalid
     if KEYWORDS.contains(&name) {
         format!("r#{}", name)
     } else {
@@ -26872,6 +26828,7 @@ pub struct RustCodegen {
     /// needs `unsafe`. Collected in a pre-pass because a function may be
     /// emitted before the declaration it reads.
     static_mut_names: std::collections::HashSet<String>,
+    decl_types: std::collections::HashMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -26899,6 +26856,7 @@ impl RustCodegen {
             enum_names: std::collections::HashSet::new(),
             type_params: std::collections::HashSet::new(),
             static_mut_names: std::collections::HashSet::new(),
+            decl_types: std::collections::HashMap::new(),
         }
     }
 
@@ -27015,6 +26973,7 @@ impl RustCodegen {
         collect_param_names(ast, &mut self.param_names);
         self.field_names.clear();
         collect_field_names(ast, &mut self.field_names);
+        self.decl_types.clear(); collect_decl_types(ast, &mut self.decl_types); // #8891
 
         // Whole-tree, because the `Copy` fixpoint follows struct fields across
         // declarations that may appear in any order.
@@ -27493,9 +27452,14 @@ impl RustCodegen {
             )
         };
         self.current_mut_slice_params = mut_slices.into_iter().collect();
+        let anon = node.extra_return_type.trim().strip_prefix("struct").map(|b| b.trim().trim_start_matches('{').trim_end_matches('}').trim().trim_end_matches(','));
+        if let Some(fields) = anon.filter(|b| !b.contains('{')).and_then(Self::split_type_list).map(|v| v.iter().filter_map(|f| f.split_once(':')).map(|(n, t)| format!("pub {}: {}", rust_ident(n.trim()), Self::t27_type_to_rust(&t.replace("[ ", "[").replace(" ]", "]").replace("] ", "]").replace("? ", "?")))).collect::<Vec<_>>()).filter(|v| !v.is_empty()) {
+            self.fn_ret_type = format!("{}_ret", node.name); // #8891: an anonymous struct return gets a name
+            self.write(&format!("#[allow(non_camel_case_types)]\n#[derive(Debug, Clone)]\npub struct {} {{ {} }}\n\n", self.fn_ret_type, fields.join(", ")));
+        }
         self.write(&format!(
             "pub fn {}{}({}) -> {} {{",
-            fn_name, generics, params_str, ret_type
+            fn_name, generics, params_str, self.fn_ret_type
         ));
 
         // Check if there's a body
@@ -28065,7 +28029,7 @@ impl RustCodegen {
             "@min" if two => format!("({}).min({})", a(0), a(1)),
             "@max" if two => format!("({}).max({})", a(0), a(1)),
             "@sqrt" | "@abs" | "@round" | "@floor" | "@ceil" | "@trunc" | "@exp" | "@log"
-            | "@sin" | "@cos" | "@tan"
+            | "@sin" | "@cos" | "@tan" | "@log2" | "@log10" | "@exp2"
                 if one =>
             {
                 format!("({}).{}()", a(0), &name[1..])
@@ -28411,6 +28375,9 @@ impl RustCodegen {
                     None => t.to_string(),
                 }
             }
+            // #8891: `[N]T` whose T has brackets of its own (`[3][]const u8`) splits at the FIRST `]`.
+            t if t.starts_with('[') && t.matches(']').count() > 1 && t.find(']').is_some_and(|e| e > 1 && t[1..e].bytes().all(|b| b.is_ascii_digit())) => {
+                let e = t.find(']').unwrap(); format!("[{}; {}]", Self::t27_type_to_rust(&t[e + 1..]), &t[1..e]) }
             t if t.starts_with('[') && t.contains(']') => {
                 let end = t.rfind(']').unwrap();
                 let inside = &t[1..end];
@@ -28755,6 +28722,10 @@ impl RustCodegen {
             }
             return self.expr_to_rust(node);
         }
+        if node.kind == NodeKind::ExprStructLit && node.name.is_empty() && !ty.contains([' ', '<', '[']) { // #8891: `.{ .. }` takes the type
+            return self.expr_to_rust(&Node { name: ty.to_string(), ..node.clone() }); }
+        if ty.starts_with("Vec<") && !self.type_params.iter().any(|p| ty == format!("Vec<{p}>")) && node.kind == NodeKind::ExprIndex && node.children.get(1).is_some_and(|i| i.extra_op == "..") {
+            return format!("({}).to_vec()", self.expr_to_rust(node)); } // #8891: a returned slice is an owned Vec
         let s = self.expr_to_rust(node);
         if !Self::is_int_type(ty) {
             return s;
@@ -28785,7 +28756,8 @@ impl RustCodegen {
                 plain(self.var_types.get(&node.name).or_else(|| self.const_types.get(&node.name)))
             }
             NodeKind::ExprCall => plain(self.fn_ret_types.get(&node.name)),
-            NodeKind::ExprFieldAccess => node.name == "?", // `x.?` unwraps
+            NodeKind::ExprFieldAccess => node.name == "?" // `x.?` unwraps; #8891: `E.x` is a member of enum E
+                || node.children.first().is_some_and(|b| b.kind == NodeKind::ExprIdentifier && self.enum_names.contains(&b.name)),
             _ => false,
         }
     }
@@ -28798,7 +28770,7 @@ impl RustCodegen {
             // `let s = hello world;` and `const NAME : str = "trinity"` became
             // `pub const NAME: String = trinity;`.
             NodeKind::ExprLiteral if node.extra_kind == "string" => {
-                format!("\"{}\"", Codegen::zig_escape(&node.value))
+                Codegen::rust_str_literal(&node.value)
             }
             NodeKind::ExprLiteral if node.value.starts_with('\'') => format!("b{}", node.value), // #8971: a u8
             NodeKind::ExprLiteral => node.value.clone(),
@@ -28820,6 +28792,7 @@ impl RustCodegen {
             {
                 "unreachable!()".to_string()
             }
+            NodeKind::ExprIdentifier if node.name == "self" => rust_ident(&node.name),
             NodeKind::ExprIdentifier => node.name.clone(),
             // Zig's repeat `[v] ** n` is Rust's `[v; n]`; verbatim, rustc read `[v] * (*n)`.
             // A sole literal or name element arrives as bracket TEXT, a typed one as a child.
@@ -29016,7 +28989,8 @@ impl RustCodegen {
                     }
                 }
                 // The callee's name went through `rust_ident` at `gen_fn`; the call must too.
-                format!("{}({})", rust_ident(&node.name), args.join(", "))
+                let name = node.name.strip_prefix("self.").map_or_else(|| rust_ident(&node.name), |m| format!("self_.{m}")); // #8891
+                format!("{}({})", name, args.join(", "))
             }
             NodeKind::ExprArrayLiteral => {
                 if node.children.is_empty() && !node.extra_size.trim().is_empty() {
@@ -29070,6 +29044,8 @@ impl RustCodegen {
                     .map(|c| {
                         let val = if c.children.is_empty() {
                             "{}".to_string()
+                        } else if let Some(t) = self.decl_types.get(&format!("{}.{}", node.name, c.name)) {
+                            self.expr_to_rust_as(&c.children[0], t) // #8891: a usize into a u64 field is cast
                         } else {
                             self.expr_to_rust(&c.children[0])
                         };
@@ -29086,7 +29062,7 @@ impl RustCodegen {
                     // return type of the function being emitted - exactly the
                     // case the shorthand is written for. Without it the variant
                     // was printed on the LEFT of the separator: `escalate::`.
-                    if self.enum_names.contains(&self.fn_ret_type) {
+                    if let Some(e) = self.decl_types.get(&format!(".{}", node.name)).filter(|e| !e.is_empty()) { format!("{}::{}", e, rust_ident(&node.name)) } else if self.enum_names.contains(&self.fn_ret_type) { // #8891: the one enum declaring it first
                         format!("{}::{}", self.fn_ret_type, node.name)
                     } else {
                         node.name.clone()
@@ -29605,23 +29581,6 @@ impl HirMemory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum HwClkSrcKind {
-    External,
-    Pll,
-    Dcm,
-    Mmcm,
-}
-
-#[derive(Debug, Clone)]
-pub struct HirClkSource {
-    pub name: String,
-    pub kind: HwClkSrcKind,
-    pub freq_hz: u32,
-    pub phase_deg: u32,
-    pub jitter_ps: u32,
-}
-
 #[derive(Debug, Clone)]
 pub struct HirClockDomain {
     pub name: String,
@@ -30058,18 +30017,6 @@ impl HirApbBridge {
         }
         errors
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Gf16OpKind {
-    Mul,
-    Add,
-    Mac,
-    Dot,
-    Fft,
-    Ifft,
-    Matmul,
-    Inverse,
 }
 
 #[derive(Debug, Clone)]

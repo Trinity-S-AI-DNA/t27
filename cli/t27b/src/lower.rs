@@ -3600,7 +3600,7 @@ impl<'a> Lower<'a> {
     /// nothing is reported or emitted otherwise.
     fn peek_string(&mut self, n: &Node) -> R<Option<u64>> {
         if n.kind == NodeKind::ExprLiteral {
-            return Ok((n.extra_kind == "string").then(|| n.value.len() as u64));
+            return Ok((n.extra_kind == "string").then(|| n.value.chars().count() as u64));
         }
         match self.lookup(&n.name) {
             Some(Binding::Const(Val::S(_, len))) => Ok(Some(len)),
@@ -3885,7 +3885,7 @@ impl<'a> Lower<'a> {
         // The t27c lexer strips the quotes and unescapes, so the node holds
         // the string's own bytes (not trimmed: spaces are part of it).
         if n.extra_kind == "string" {
-            return Ok(self.string(n.value.as_bytes()));
+            return Ok(self.string(&n.value.chars().map(|c| c as u32 as u8).collect::<Vec<u8>>())); // #10793: one char per byte
         }
         let s = n.value.trim();
         if s == "true" || s == "false" {
