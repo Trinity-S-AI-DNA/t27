@@ -188,3 +188,37 @@ cell by cell, by `the_screen_is_the_t27os_vt_grid_as_the_layout_says`.
 
 The spec uses `specs/t27os/{agents,pane_state,vt}.t27` by `use`; those files are on `feat/t27os-petal-menu`
 (PR #10783) and not yet on `master`. Until that PR lands, `t27b` cannot resolve the imports on `master` alone.
+
+## 6. What the trinity-fpga experience says about a video bitstream (read 2026-10-19)
+
+Source: `gHashTag/trinity-fpga` (checkout `~/trinity-fpga`, `fpga/*.md`, `fpga/openxc7-synth/`,
+`docs/HW_CAMPAIGN_AX7203_2026_07_30.md`). Only the parts that bite a VGA/HDMI bitstream are kept here.
+
+- **No HDMI/TMDS design or pin exists there**; the HDMI map comes from the ALINX documents (section 5b).
+- **Clock.** The 200 MHz oscillator is R4(+)/T4(-); declare it `DIFF_SSTL15`, **not** `LVDS`: with `LVDS` the
+  board's DONE stayed dark and nothing ran (`HARDWARE_REFERENCE.md`, Pin Mapping, Clock Input). It goes
+  IBUFDS then BUFG. The 25.175/25 MHz pixel clock must be derived from it, never from a fabric divider
+  (`COMMON_PITFALLS.md`, Clock Domain Issues: use clock enables, not divided clocks; a 25 MHz pixel clock needs an
+  MMCM/PLL or a one-in-eight enable on 200 MHz).
+- **IO standards.** The HDMI-output pins are bank 13/15/16 and the manual lists them LVCMOS33; LEDs are LVCMOS18
+  (B13, C13, D14, D15), reset T6 is LVCMOS15, UART N15/P20 is LVCMOS33. Banks must not mix VCCO: the VGA/HDMI bus
+  must stay on 3.3 V banks, the LED bank is 1.8 V. The openxc7 chipdb lists `TMDS_33`, but the AX7203 has no TMDS
+  pins to the connector (SiI9134 does the serialising), so it is not needed.
+- **SRAM-only loading.** Bitstreams are loaded to SRAM with `openFPGALoader -c digilent_hs2` and the flash is left
+  alone (`fpga/HARDWARE_SSOT.md`); the Platform Cable `fxload` ritual in trinity-fpga applies to a 0x03FD cable
+  that is not on this bench. A bitstream that gets no DONE after load is a pin/IO-standard problem first
+  (the LVDS case above), not a cable problem.
+- **Toolchain.** openXC7 (yosys + nextpnr-xilinx + prjxray) is the only toolchain that produced working
+  bitstreams (1 of 1; FORGE 0 of 23). nextpnr-xilinx mapped `LOC R23` to the T23 site on the 100T chipdb
+  (`COMMON_PITFALLS.md`): after P&R, **read the placed pin back from the FASM before trusting any pin** of the
+  video bus. The fbg484 chipdb is not on the lab yet (section 5, step 4).
+- **Verification discipline.** A blinking or scanning output needs video, not a photo (`COMMON_PITFALLS.md`,
+  Single Photo for Blinking LED): `hdmi_grab` compares frames for this reason. Their Tier-E rule: nothing counts
+  as silicon without CI + bitstream sha256 + readback log + IDCODE, so every VGA/HDMI result in this note stays
+  **[simulated]** until a captured frame from the real output exists.
+- **IDCODE is not in conflict.** trinity-fpga's campaign file says `0x13636093`, `fpga/HARDWARE_SSOT.md` measured
+  `0x03636093` on this bench. Both are the XC7A200T part number `0x3636`; the leading nibble is the silicon
+  revision (their own `fpga/IDCODE.md` lists "ver 1 / ver 0", and `ax7203_al321.cfg` accepts both). The SSOT
+  value is what this bench reads; use `./scripts/tri boards` rather than a literal.
+- **Do not copy** from there: the QMTech XC7A100T pins (U22, T23, R23), the `0x13631093` IDCODE and the
+  Platform-Cable flow. They belong to another board and cable.
