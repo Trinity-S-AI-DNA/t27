@@ -775,7 +775,7 @@ fn lower_mode<'a>(
         if l.unreferenced_tuple_const(&items, &name) || hw.contains(name.as_str()) || l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
             continue;
         }
-        let _ = l.global(&name);
+        l.eager_const(&name);
     }
     for node in std::mem::take(&mut l.var_nodes) {
         if l.module_var(node).is_err() {
