@@ -95,6 +95,10 @@ mod ed25519;
 #[path = "../gen/rust/tri/fmt_source.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod fmt_source;
+// specs/igla/coder/ternary_gemm_ptx.t27 (#10404), lowered by `t27c gen-rust`: the PTX of the ternary GEMM kernel. Never hand-edit; regenerate.
+#[path = "../gen/rust/igla/coder/ternary_gemm_ptx.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod ternary_gemm_ptx;
 mod memory;
 mod trit_stdlib;
 mod behavior_sva;
@@ -1343,7 +1347,7 @@ enum Commands {
     Compile {
         /// Input file path
         input: String,
-        /// Backend: zig, verilog, c, or ml
+        /// Backend: zig, verilog, c, ml, or ptx (one kernel only: specs/igla/coder/ternary_gemm_gpu.t27)
         #[arg(long, default_value = "zig")]
         backend: String,
         /// Output file path (default: input with backend extension)
@@ -1552,6 +1556,18 @@ enum Commands {
     /// Normalise .t27 whitespace, keeping every comment and token (specs/tri/fmt_source.t27)
     Fmt {
         input: String,
+    },
+
+    /// Run the PTX kernel t27 emitted on a CUDA GPU and check it against the t27 reference (#10404)
+    #[cfg(feature = "cuda")]
+    #[command(name = "ptx-run")]
+    PtxRun {
+        #[arg(long, default_value_t = 4096)] m: usize,
+        #[arg(long, default_value_t = 1280)] n: usize,
+        #[arg(long, default_value_t = 1280)] k: usize,
+        #[arg(long, default_value_t = 20)] iters: u32,
+        /// Check every stride-th row, and always the last one, against the reference
+        #[arg(long, default_value_t = 1)] stride: usize,
     },
 
     /// Dependency graph of .t27 modules
@@ -6181,6 +6197,7 @@ fn backend_extension(backend: &str) -> &str {
         "verilog" => ".v",
         "c" => ".c",
         "rust" => ".rs",
+        "ptx" => ".ptx",
         _ => ".zig",
     }
 }
@@ -6221,6 +6238,12 @@ fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow:
     }
 
     let code = match backend {
+        "ptx" if path.ends_with("specs/igla/coder/ternary_gemm_gpu.t27") => {
+            let mut buf = vec![0u8; ternary_gemm_ptx::PTX_CAP];
+            let n = ternary_gemm_ptx::emit_ptx(&mut buf, ternary_gemm_ptx::PTX_CAP);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        }
+        "ptx" => anyhow::bail!("--backend ptx lowers one kernel only: specs/igla/coder/ternary_gemm_gpu.t27 (#10404)"),
         "verilog" => {
             let mut cg = compiler::VerilogCodegen::new();
             cg.gen_verilog(&ast);
@@ -11754,6 +11777,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Bench { input } => run_bench(&input)?,
         Commands::Explain { input } => run_explain(&input)?,
         Commands::Fmt { input } => run_fmt(&input)?,
+        #[cfg(feature = "cuda")]
+        Commands::PtxRun { m, n, k, iters, stride } => host::driver::ptx_run(m, n, k, iters, stride)?,
         Commands::Graph { repo_root, format } => run_graph(&repo_root, &format)?,
         Commands::Doc { input, output_dir } => run_doc(&input, &output_dir)?,
         Commands::DocAll { repo_root, output_dir } => run_doc_all(&repo_root, &output_dir)?,
@@ -12196,6 +12221,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Bench { input } => run_bench(&input)?,
         Commands::Explain { input } => run_explain(&input)?,
         Commands::Fmt { input } => run_fmt(&input)?,
+        #[cfg(feature = "cuda")]
+        Commands::PtxRun { m, n, k, iters, stride } => host::driver::ptx_run(m, n, k, iters, stride)?,
         Commands::Graph { repo_root, format } => run_graph(&repo_root, &format)?,
         Commands::Doc { input, output_dir } => run_doc(&input, &output_dir)?,
         Commands::DocAll { repo_root, output_dir } => run_doc_all(&repo_root, &output_dir)?,
