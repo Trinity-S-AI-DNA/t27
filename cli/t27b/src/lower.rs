@@ -3712,8 +3712,8 @@ impl<'a> Lower<'a> {
     }
 
     /// `@intCast(x)` with integer result type `ty` from the context (`@as`, a typed binding, a parameter, a
-    /// return). What is refused and what the rest lowers to: specs/tri/t27b/int_cast_plan.t27.
-    fn int_cast(&mut self, n: &Node, ty: Ty) -> R<Val> {
+    /// return), or with `trunc` `@truncate` (#10837). What is refused and what the rest lowers to: int_cast_plan.t27.
+    fn int_cast(&mut self, n: &Node, ty: Ty, trunc: bool) -> R<Val> {
         self.see(n);
         let shape = ic::shape(n.children.len(), ty.is_int());
         let v = if shape == ic::GO { self.expr(&n.children[0])? } else { Val::Poison };
@@ -3723,20 +3723,20 @@ impl<'a> Lower<'a> {
             Val::Ct(c) => (ic::K_CT, ty, Some(*c)),
             _ => (ic::K_OTHER, ty, None),
         };
-        let (fits, wrap) = (c.is_some_and(|c| ty.fits(c)), self.mode == OverflowMode::Wrap);
-        let plan = |k| ic::plan(k, from.bits(), from.signed(), ty.bits(), ty.signed(), c.is_some(), fits, wrap);
+        let (fits, wrap, site) = (c.is_some_and(|c| ty.fits(c)), self.mode == OverflowMode::Wrap, if trunc { ic::TRUNC_SITE } else { ic::SITE });
+        let plan = |k| if trunc { ic::truncate_plan(k, from.bits(), from.signed(), ty.bits(), ty.signed(), c.is_some()) } else { ic::plan(k, from.bits(), from.signed(), ty.bits(), ty.signed(), c.is_some(), fits, wrap) };
         let kind = match (if shape == ic::GO { plan(k) } else { shape }, v) {
             (ic::KEEP, v) => return Ok(v),
             (ic::FOLD | ic::FOLD_WRAP, _) => ExprKind::Const(ty.wrap(c.unwrap())), // a FOLD fits `ty`: wrap keeps it
             (ic::WIDEN, Val::E(e)) => ExprKind::Widen(Box::new(e)),
             (a, Val::E(e)) if ic::is_cast(a) => {
-                let what = format!("{} {} to {}", ic::SITE, from.name(), ty.name());
+                let what = format!("{} {} to {}", site, from.name(), ty.name());
                 ExprKind::Cast { arg: Box::new(e), site: if ic::traps(a) { self.site(TrapKind::Cast, what, ty) } else { 0 } }
             }
             (a, v) => {
                 let d = match &v { Val::E(e) => e.ty.name().into(), Val::Ct(c) => c.to_string(), _ => self.val_desc(&v) };
                 let d = if v.is_poison() { format!("{} operands", n.children.len()) } else { d };
-                return self.reject(ic::WHAT, format!("`@intCast` of {} to {}: {}", d, ty.name(), ic::why(a)));
+                return self.reject(if trunc { ic::TRUNC_WHAT } else { ic::WHAT }, format!("`{}` of {} to {}: {}", site, d, ty.name(), ic::why(a)));
             }
         };
         Ok(Val::E(Expr { ty, kind }))
@@ -3744,7 +3744,7 @@ impl<'a> Lower<'a> {
 
     /// An index or a slice bound, whose result type in Zig is `ic::INDEX_TYPE`: an `@intCast` there converts to it.
     fn usize_operand(&mut self, n: &Node) -> R<Val> {
-        if n.kind == NodeKind::ExprCall && n.name == ic::SITE { self.int_cast(n, Ty::from_name(ic::INDEX_TYPE).unwrap_or(Ty::U64)) } else { self.expr(n) }
+        if n.kind == NodeKind::ExprCall && n.name == ic::SITE { self.int_cast(n, Ty::from_name(ic::INDEX_TYPE).unwrap_or(Ty::U64), false) } else { self.expr(n) }
     }
 
     /// `n` folded as Zig folds an expression that names a module constant of an integer type wider than 64 bits:
@@ -5223,8 +5223,8 @@ impl<'a> Lower<'a> {
         if let (NodeKind::ExprCall, "@floatCast", LTy::S(ty)) = (&n.kind, n.name.as_str(), want) {
             return self.float_cast_call(n, *ty);
         }
-        if let (NodeKind::ExprCall, "@intCast", LTy::S(ty)) = (&n.kind, n.name.as_str(), want) {
-            return self.int_cast(n, *ty);
+        if let (NodeKind::ExprCall, "@intCast" | "@truncate", LTy::S(ty)) = (&n.kind, n.name.as_str(), want) {
+            return self.int_cast(n, *ty, n.name == ic::TRUNC_SITE);
         }
         if let (NodeKind::ExprCall, "@bitCast", LTy::S(ty)) = (&n.kind, n.name.as_str(), want) { return self.bit_cast(n, *ty); }
         if let (NodeKind::ExprCall, "@intFromEnum", LTy::S(ty)) = (&n.kind, n.name.as_str(), want) {
