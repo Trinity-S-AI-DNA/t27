@@ -798,9 +798,10 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     for (qual, name, _) in rewrites {
         out = out.replace(qual.as_str(), &flat(qual, name).unwrap_or_else(|| name.clone()));
     }
+    let names: String = pulled_names.iter().map(|n| format!("{n}\n")).chain(scoped.keys().map(|(_, n)| format!("{n}\n"))).collect();
     for d in pulled.iter_mut() {
         let ren: String = scoped.iter().filter(|((c, x), o)| *c == d.origin || (*x == d.name && **o == d.origin)).map(|((_, x), o)| format!("{x}\t{o}\n")).collect();
-        d.text = sized(|b, n| use_splice::rewrite(d.text.as_bytes(), imports.get(&d.origin).map_or("", String::as_str).as_bytes(), ren.as_bytes(), b, n));
+        d.text = sized(|b, n| use_splice::rewrite(d.text.as_bytes(), imports.get(&d.origin).map_or("", String::as_str).as_bytes(), names.as_bytes(), ren.as_bytes(), b, n));
     }
     if !out.ends_with('\n') {
         out.push('\n');
