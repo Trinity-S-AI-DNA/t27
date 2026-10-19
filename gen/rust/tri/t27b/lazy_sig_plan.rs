@@ -160,13 +160,6 @@ pub fn zig_builtin(name: &[u8]) -> bool {
     return listed(name, b"@abs @addrSpaceCast @addWithOverflow @alignCast @alignOf @as @atomicLoad @atomicRmw @atomicStore @bitCast @bitOffsetOf @bitReverse @bitSizeOf @branchHint @breakpoint @byteSwap @call @cDefine @cImport @cInclude @ceil @clz @cmpxchgStrong @cmpxchgWeak @compileError @compileLog @constCast @cos @ctz @cUndef @cVaArg @cVaCopy @cVaEnd @cVaStart @disableInstrumentation @disableIntrinsics @divExact @divFloor @divTrunc @embedFile @Enum @EnumLiteral @enumFromInt @errorFromInt @errorName @errorReturnTrace @errSetCast @exp @exp2 @export @extern @field @fieldParentPtr @FieldType @floatCast @floatFromInt @floor @Fn @frameAddress @hasDecl @hasField @import @inComptime @Int @intCast @intFromBool @intFromEnum @intFromError @intFromFloat @intFromPtr @log @log10 @log2 @max @memcpy @memmove @memset @min @mod @mulAdd @mulWithOverflow @offsetOf @panic @Pointer @popCount @prefetch @ptrCast @ptrFromInt @reduce @rem @returnAddress @round @select @setEvalBranchQuota @setFloatMode @setRuntimeSafety @shlExact @shlWithOverflow @shrExact @shuffle @sin @sizeOf @splat @sqrt @src @Struct @subWithOverflow @tagName @tan @This @trap @trunc @truncate @Tuple @Type @typeInfo @typeName @TypeOf @Union @unionInit @Vector @volatileCast @wasmMemoryGrow @wasmMemorySize @workGroupId @workGroupSize @workItemId");
 }
 
-pub fn ends(t: &[u8], word: &[u8]) -> bool {
-    if (word.len() > t.len()) {
-        return false;
-    }
-    return begins(&t[((t.len() - word.len())) as usize..(t.len()) as usize], word);
-}
-
 pub fn body_plan(construct: &[u8], detail: &[u8]) -> u8 {
     if begins(construct, b"ExprCall(@") {
         let mut e: usize = 9;
@@ -198,7 +191,7 @@ pub fn body_plan(construct: &[u8], detail: &[u8]) -> u8 {
     if (begins(construct, b"type (tuple") || begins(construct, b"type [K:V")) {
         return KEEP;
     }
-    if (begins(construct, b"ExprStructLit") && ends(detail, b"initialised twice")) {
+    if (begins(construct, b"ExprStructLit") && ends_with(detail, "initialised twice")) {
         return KEEP;
     }
     return UNRESOLVED;
@@ -206,5 +199,19 @@ pub fn body_plan(construct: &[u8], detail: &[u8]) -> u8 {
 
 pub fn withdrawn_come_back(names_missing: bool, bare: bool, eql_used: bool) -> bool {
     return (names_missing || (bare && eql_used));
+}
+
+pub fn ends_with(t: &[u8], w: &'static str) -> bool {
+    if (t.len() < w.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        if (t[(((t.len() - w.len()) + k)) as usize] != w.as_bytes()[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
 }
 
