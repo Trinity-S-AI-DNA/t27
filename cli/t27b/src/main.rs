@@ -784,20 +784,17 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             cmd: String::new(),
             input: None,
             out: None,
-            mode: o.mode,
             time: false,
             quiet: true,
             check: true,
             list: false,
-            timeout_ms: o.timeout_ms,
             jobs: 1,
             json: None,
-            runner: o.runner.clone(),
-            blockers: o.blockers,
             elf: false,
             reference: None,
             reference_cache: None,
             reference_timeout_ms: 0,
+            ..o.clone() // mode, timeout_ms, runner, blockers
         };
         handles.push(std::thread::spawn(move || loop {
             let i = {
