@@ -160,7 +160,7 @@ fn wide_integer_constants_fold_or_are_refused() {
     let head = "module a;\n\nconst A: u128 = 340282366920938463463374607431768211455;\nconst B: u256 = 18446744073709551616;\nconst C: i128 = 5;\nconst D: u128 = 0 - 1;\nconst E: u128 = E + 1;\n\nfn g(x: u128) -> u256 {\n    return x;\n}\n\n";
     let t = |body: &str| format!("{}test t {{\n    assert({});\n}}\n", head, body);
     assert_eq!(names_ok(&run(&t("B < A and (A >> 64) as u64 == 18446744073709551615 and (0 - C) as i8 == -5"))), vec![("t", false, true)]);
-    let h = format!("{}fn h(x: u64) -> bool {{\n    return A > x;\n}}\n", head);
+    let h = format!("{}fn h(x: u64) -> bool {{\n    return A > x;\n}}\ntest t {{\n    assert(h(1));\n}}\n", head);
     for (src, ty, why) in [(t("A + 1 > 0"), "u128", "overflows"), (t("B as u64 == 0"), "u256", "does not fit"), (t("A << 128 == 0"), "u128", "shift amount"),
         (t("C / 0 == 1"), "i128", "by zero"), (t("A + B > 0"), "u128", "two different"), (t("(0 - C) / 2 < 0"), "i128", "negative"),
         (t("D > 0"), "u128", "does not fit"), (h, "u128", "beside a value"), (t("E > 0"), "u128", "beside a value"), (t("g(1) == 0"), "u128", "")] {
@@ -375,7 +375,8 @@ fn a_discarded_value_runs_unless_the_reference_deletes_it() {
 /// `anytype` and `[*]T` in the signature of a fn no test reaches (gh.t27, trios-scarab-types SR-00 and SR-02, #7857):
 /// Zig never resolves them, so the reference passes the file (specs/tri/t27b/lazy_sig_plan.t27; `t27c test-report`
 /// passes the conformance spec 3/3, none vacuous). A call from a test, an undeclared element type and an undeclared
-/// name in the withdrawn body keep their refusals, as the reference refuses each.
+/// name in the withdrawn body keep their refusals, as the reference refuses each. The unit struct returned as a value
+/// by `lazy_unit_new` (#10897) is refused as soon as a test calls it (BLOCKED, "expected type 'spec.LazyUnit', found 'type'").
 #[test]
 fn a_signature_zig_never_resolves() {
     let src = include_str!("../../../specs/tri/t27b/conformance/lazy_signature.t27");
@@ -385,6 +386,8 @@ fn a_signature_zig_never_resolves() {
     assert!(rejected(&src.replace("assert(issue_score(i) == 34);", "format_into(i, 5);")).contains("type anytype"));
     assert!(rejected(&src.replace("?[*]Issue", "?[*]Missing")).contains("type [*]T"));
     assert!(rejected(&src.replace("all: [*]const Issue", "all: [*]const Issue, m: Missing")).contains("type [*]T"));
+    assert!(rejected(&src.replace("== 34);", "== 34);\n    lazy_unit_new();")).contains("unknown name `LazyUnit`"));
+    assert!(common::lower_src(&src.replace("return lazy_unit_new();", "return lazy_unit_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
     let m = common::lower_src(&src.replace("f.write_num", "undeclared_thing")).unwrap_err().join("\n");
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
 }
