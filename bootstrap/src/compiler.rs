@@ -13773,7 +13773,7 @@ impl VerilogCodegen {
             // Verilog.  Wrap the slice with $signed(...) when the element type is
             // signed so that comparisons, arithmetic, and probes preserve t27's
             // two's-complement semantics.
-            let elem_signed = Self::type_is_signed(&elem_type);
+            let elem_signed = Self::type_is_signed(&elem_type) && !self.in_lvalue;
             if elem_signed {
                 self.write("$signed(");
             }
