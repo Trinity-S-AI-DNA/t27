@@ -9145,7 +9145,10 @@ pub fn put_call_buf(src: &[u8], st: &mut [usize], out: &mut [u8], na: usize, nb:
         put_arg(src, st, out, k4, t4, (j + 4), j, 4, rust);
     }
     if (buf.len() > 0) {
-        puts(st, out, b", t27o_o");
+        if (n > 0) {
+            puts(st, out, b", ");
+        }
+        puts(st, out, b"t27o_o");
         put_num(st, out, j);
         puts(st, out, buf);
     }
@@ -9582,9 +9585,16 @@ pub fn vectors(src: &[u8], st: &mut [usize], out: &mut [u8], na: usize, nb: usiz
         nv = slen(src, st, k4, t4);
     }
     puts(st, out, b"    {\n        let mut v: Vec<String> = Vec::new();\n");
+    if (rk == V_OUTVEC) {
+        puts(st, out, b"        t27o_guard::clear();\n");
+    }
     let mut j: usize = 0;
     while (j < nv) {
-        puts(st, out, b"        if let Ok(r) = std::panic::catch_unwind(|| ");
+        if (rk == V_OUTVEC) {
+            puts(st, out, b"        if let Some(r) = t27o_guard::guard(|| ");
+        } else {
+            puts(st, out, b"        if let Ok(r) = std::panic::catch_unwind(|| ");
+        }
         put_call(src, st, out, na, nb, n, k0, t0, k1, t1, k2, t2, k3, t3, k4, t4, j, selfp, true, false);
         puts(st, out, b") { let c = \"");
         put_call(src, st, out, na, nb, n, k0, t0, k1, t1, k2, t2, k3, t3, k4, t4, j, selfp, false, ((wrapk == 0) && ((rk == V_STRING) || (rk == V_OUTVEC))));
@@ -10752,6 +10762,20 @@ pub fn out_str_return(src: &[u8], st: &mut [usize], out: &mut [u8]) -> bool {
     return true;
 }
 
+pub const VEC_GUARD: &'static str = "// t27o: the original of a fn that returns a Vec runs on a thread with 3 s and 16 MiB: a call that does not stop, or keeps growing its Vec, is skipped, not run to the end of the machine\nmod t27o_guard {\n    use std::alloc::{GlobalAlloc, Layout, System};\n    use std::cell::Cell;\n    use std::sync::atomic::{AtomicUsize, Ordering};\n    thread_local! { static BYTES: Cell<usize> = const { Cell::new(usize::MAX) }; }\n    static HUNG: AtomicUsize = AtomicUsize::new(0);\n    fn charge(n: usize) { let _ = BYTES.try_with(|g| { let c = g.get(); if c != usize::MAX { g.set(c + n); if c + n > (16 << 20) { loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } } } }); }\n    fn refund(n: usize) { let _ = BYTES.try_with(|g| { let c = g.get(); if c != usize::MAX { g.set(c.saturating_sub(n)); } }); }\n    struct Guarded;\n    unsafe impl GlobalAlloc for Guarded {\n        unsafe fn alloc(&self, l: Layout) -> *mut u8 { charge(l.size()); System.alloc(l) }\n        unsafe fn dealloc(&self, p: *mut u8, l: Layout) { refund(l.size()); System.dealloc(p, l) }\n        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 { charge(n); refund(l.size()); System.realloc(p, l, n) }\n    }\n    #[global_allocator]\n    static ALLOC: Guarded = Guarded;\n    pub fn clear() { HUNG.store(0, Ordering::SeqCst); }\n    pub fn guard<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {\n        if HUNG.load(Ordering::SeqCst) >= 2 { return None; }\n        let (tx, rx) = std::sync::mpsc::channel();\n        std::thread::spawn(move || { BYTES.with(|g| g.set(0)); let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)); let _ = tx.send(r.ok()); });\n        match rx.recv_timeout(std::time::Duration::from_secs(3)) { Ok(r) => r, Err(_) => { HUNG.fetch_add(1, Ordering::SeqCst); None } }\n    }\n}\n\n";
+
+pub fn has_vecfn(st: impl AsRef<[usize]>) -> bool {
+    let st: &[usize] = st.as_ref();
+    let mut k: usize = 0;
+    while (k < st[(NNAMES) as usize]) {
+        if (st[(((NAMES + (k * NAME_SLOTS)) + 4)) as usize] == K_VECFN) {
+            return true;
+        }
+        k = (k + 1);
+    }
+    return false;
+}
+
 pub fn vec_ret_elem(src: &[u8], pn: usize) -> usize {
     if !(tok_is(src, pn, b"(")) {
         return src.len();
@@ -10882,11 +10906,15 @@ pub fn vec_out_form(src: &[u8], st: &mut [usize], lo: usize, hi: usize) -> bool 
         return false;
     }
     let mut p0: usize = src.len();
+    let mut clash: bool = false;
     q = lo;
     while ((q < hi) && (st[(ERR) as usize] == 0)) {
         let e: usize = tok_end(src, q);
         if ((q != na) && same_text(src, q, e, na, nb)) {
             vecout_mention(src, st, q, e, p0);
+        }
+        if (((word_is(src, q, e, b"out") && !(same_text(src, q, e, na, nb))) && !(tok_is(src, p0, b"."))) && !(tok_is(src, skip_ws(src, e), b":"))) {
+            clash = true;
         }
         if word_is(src, q, e, b"return") {
             let r: usize = skip_ws(src, e);
@@ -10898,7 +10926,7 @@ pub fn vec_out_form(src: &[u8], st: &mut [usize], lo: usize, hi: usize) -> bool 
         p0 = q;
         q = skip_ws(src, e);
     }
-    if (st[(ERR) as usize] != 0) {
+    if ((st[(ERR) as usize] != 0) || clash) {
         return false;
     }
     add_name(src, st, K_VECLOC, na, nb, lo, hi);
@@ -12304,6 +12332,9 @@ pub fn oracle(src: &[u8], out: &mut [u8], st: &mut [usize]) -> usize {
     st[(NNAMES) as usize] = n;
     st[(MODE) as usize] = M_SOURCE;
     puts(st, out, b"// t27o oracle harness (specs/tools/t27o/rust_convert.t27): the converted items, run to record\n// their behaviour as t27 tests.\n#![allow(warnings)]\n\n");
+    if has_vecfn(st) {
+        puts(st, out, VEC_GUARD.as_bytes());
+    }
     st[(P) as usize] = skip_ws(src, 0);
     items(src, st, out, false);
     let w: usize = st[(W) as usize];
