@@ -90,7 +90,7 @@ the diagram core in detail, then the other surfaces and the topic-map applicatio
 | Surface: particle reels and stills | `specs/t27f/token_floor*.t27`, `lesson_reel.t27`, `reel_particles*.t27` | rendered on the Railway lab (lesson 1 EN and RU); no renderer in the repo, no MCP tool yet |
 | Surface: honeycomb map video and deck | `specs/t27f/reel.t27`, `deck.t27` | spec; stills only, through `t27f_view` |
 | Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; drawn through the map surface; procedure below |
-| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. R3 (t27#10571) draws it: `scene_raster`, `scene_lex`, `scene_bg` plus one `scene_<archetype>.t27` per archetype (code, graph, tests, trit, loop, branch, data, links, guard, title, task, map), each `<name>_px(t, acc, n, x, y)` over the lesson's own content on a 360 x 640 canvas, dispatched by `scene_still.pixel`; `still_gate.t27` renders the 27 course-0 stills (108 x 192 luma), scores all 351 pairs with a block SSIM and refuses above 850 permille, measured worst pair lessons 8 and 20 at 607. `lesson_reel` still draws token_floor (R4). SSIM on luma sees layout and contrast, not meaning. The floor modulo is `fmod` (t27b rejects `@mod`). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
 When asked "how is T27F going", report against the core rows first, then the other surfaces.
@@ -220,6 +220,22 @@ Traps from this tick (ffmpeg on the lab):
    `lit_len` that was red on `duplicate-bodies` until #10688. Reuse the existing body through
    `use`, and do not `--bless` a copy you made by accident.
 
+## Visual in every output (Claude Code and TRI CLAW)
+
+**The rule is `specs/t27mcp/visual_output.t27`** (its `RULE_CLAUDE_CODE` and `RULE_TRI_CLAW` lines
+are what each host reads). **Its particle-still layer is `specs/claw/visual_output.t27`.** This
+section is the order of steps; which answer carries which visual and how it reaches each host are
+the specs', not repeated here.
+
+1. Decide the answer's kind (`K_*` in the t27mcp spec). A one-sentence reply or a question back
+   goes without a visual.
+2. Spec, flow or numbers: draw from t27f tool rows (`t27f_outline`, `t27f_graph`, `t27f_view`),
+   labelled, with the legend and the source file, as `answer_verdict` checks.
+3. A report of a piece of work: a particle still (`takes_still`). Render the reel on the Railway lab
+   (never the Mac), take the frame at `STILL_MS` with `ffmpeg -ss 9 -frames:v 1`, and bring it into
+   the session folder (`out-reels/`, gitignored, never `git add`).
+4. Anything not made: say which and why in the answer. Never show an older file as this turn's.
+
 ## Application: topic map (gHashTag/trinity#1677)
 
 Use this part when the user gives a topic or a client brief, not a spec.
@@ -343,6 +359,43 @@ Before you change a uniqueness rule, measure what it can draw from:
   shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
   pass `--body-file`.
 
+### Preview the factory's stills as a video (t27#10571)
+
+The owner asks to see intermediate videos, not only numbers. Show one every time a renderer changes.
+
+1. **Write a lab-only printer.** It needs a `main` that loops `t` over `TOPICS`. For each lesson it
+   takes `arche`, `accent`, `motion`, `layout` and `content(t, a)` from `reel_factory`. It then
+   prints a plain PPM (`P3`, 360 x 640) of `scene_still.pixel(...)` through `scene_raster`'s
+   `red`, `green` and `blue`. Give it one trivial `test`.
+2. **Generate and build.** Run `t27c gen` on it, then `zig build-exe -lc -O ReleaseFast`.
+3. **Run it.** `./d 2> all.ppm`: `std.debug.print` writes to stderr. All 27 stills take 4 s and
+   56 MB.
+4. **Split and convert.** Split the dump on each `P3` line with awk. Convert each part to PNG with
+   ffmpeg, which reads P3.
+5. **Make the video and the sheet.**
+   - Video: `ffmpeg -framerate 1.25 -i s%02d.png` with
+     `-vf scale=720:1280:flags=neighbor,fps=30,format=yuv420p` and libx264. This gives 21.6 s.
+   - Contact sheet: `-vf scale=120:213,tile=9x3 -frames:v 1`.
+6. **Fetch them.** Bring both back wrapped as `B64:...:END`, and compare sha256 on both ends.
+   Put them in the session's notes folder, never in the repo or `out-reels/`.
+
+Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 to 32 KB.
+
+**Traps:**
+
+- **A Mac session may not read images.** A hook can block image reads because the upstream
+  provider refuses them. Check the stills by numbers (colour count, file size, ffprobe) and open
+  the file for the owner in the file pane.
+- **WIP commits can sink a PR.** A WIP commit whose message names `#N` without a linking keyword
+  fails L1. `l1-traceability.yml` checks every non-merge commit, and the history cannot be
+  rewritten. Carry the work instead:
+  1. Make a new branch from master.
+  2. `git read-tree -m -u HEAD <merged-branch>`.
+  3. Make one commit with `Closes #N`, open a new PR, and close the old one with a pointer.
+- **Merge in the right direction.** Merging master into an old branch can trip the pre-commit
+  `foreign-budget` hook on master's own Rust lines (t27#10414). Merge the old branch into a
+  master-based branch instead. The result still fast-forwards the old branch.
+
 ## Check the whole corpus for import cycles (t27#10693)
 
 dependency-cruiser's `no-circular` and madge's `--circular` list every module on a cycle.
@@ -460,7 +513,7 @@ Rows start at y = 280 + 76k above the focus and 820 + 76k below it. Then check:
 On 255910235 (2483 edge lines, 813 specs named):
 
 - 783 cards drew. `base/types` is the hub: 378 direct importers, reached by 400.
-- 30 were refused:
+- 30 were refused (all drawn since t27#10728, below):
   - 29 because the spec's own name is over 58 bytes (`port/trios/...`);
   - 1 because a shown neighbour's name is.
 - No spec in the corpus is on an import cycle.
@@ -476,8 +529,102 @@ Traps:
 - **A one-byte-short fit test cannot tell `w > cap` from `w > cap + k`.** Both return `cap + 1`
   there. The original and the mutant only differ when the room is 2..k+1 bytes short, so the
   test that kills the mutant is three bytes short, not ten.
-- **Bands are in edge-list order, so a hub shows `account/*` first.** That is the stated rule,
-  not a ranking; do not caption the first three as the most important.
+- **Bands were in edge-list order, so a hub showed `account/*` first.** Since t27#10762 (below)
+  they are ranked by how many specs import each row. Even so, do not caption the first three as
+  the most important: "most imported" is the only measure the card has.
+
+#### Long names are abbreviated, not refused (t27#10728)
+
+A shown name of at most 58 bytes is drawn byte for byte. A longer one is drawn as its first
+segment, `/...`, and the longest run of whole trailing segments that fits
+(`port/.../rings/CR-CHAT-03/src/confirmation_tag_chain`). When no whole run fits, it is drawn as
+`...` and its last 55 bytes. Only drawn bytes are checked, and the text size follows the drawn
+length. `why_card` is unchanged and still refuses a name over 58 bytes.
+
+On 5440d35e1 the sweep compares the new binary with master's, card by card:
+
+- 30 cards are newly drawn, 783 are byte-identical to master, and 0 are lost or refused;
+- 0 changed cards and 0 newly drawn cards have no `...`, and 0 identical cards have one;
+- 29 abbreviated forms are drawn: 27 `/.../` and 2 `...`, the longest 58 bytes;
+- the helpers card (29 importers), a `/.../` focus and a `...` focus passed every pixel check,
+  with 0 white pixels outside x 100..980.
+
+Lab traps from this run:
+
+- **`pkill -f dn_lab.sh` kills the fs-lab command that runs it**, because the pattern is in that
+  command's own line. Write `pkill -f '[d]n_lab.sh'`, in an fs-lab call that names the script
+  nowhere else (see #10762's traps).
+- **An untracked seal in the lab checkout makes `git checkout` fail, and the script then tests the
+  old commit.** Have the script take the commit it must test and stop with `WRONG COMMIT` when
+  `HEAD` differs. Once the PR adding a seal merges, that seal is tracked, so `rm -f` of it deletes
+  a tracked file: restore it with `git checkout --` before sealing.
+- **Count a kill only on `^ ?FAIL [a-z]`.** The `FAIL 0` summary line otherwise counts as a failing
+  test, and a surviving mutant reads `KILLED by 1: 0`.
+- **A `<` mutant of a 58-byte bound needs an unquotable byte that only the whole-name check
+  sees.** A 58-byte name with `:` in the middle is `true` under the mutant, because the dots form
+  hides that byte, and `false` under the rule.
+
+#### Bands rank the most imported first (t27#10762)
+
+Each band draws its specs by how many distinct specs import each of them in the whole edge list,
+highest first. A repeated edge line counts once, and equal scores keep the edge-list order, so a
+band of equal scores draws exactly what it drew before. The subtitle says
+`most imported first in each band`. The direct counts, the transitive counts and `+N more` do not
+change: only which names are drawn, and in what order. "Most imported" is the only measure; the
+ranking is quadratic in the edge list, and the hub is the largest band measured (539 ms, 378 importers).
+
+On 7853e2ef4 the sweep compares the new binary with the #10728 binary, card by card:
+
+- 124 cards are reordered, 689 are the same, and 0 are lost or refused;
+- 0 cards have a count that differs, and 0 drawn rows score higher than the row above them
+  (1647 rows checked; 3 rows have abbreviated names, so their scores are unknown);
+- the hub `base/types` now shows `compiler/lexer`, `compiler/parser` and `igla/race/bram_weights`
+  in place of three `account/*` specs, and both it and `analog/linear` passed every pixel check;
+- 21 of 21 mutants fail a named test, including the tie order, the repeated line, out-degree in
+  place of in-degree, and the hidden-name check run in edge-list order.
+
+Traps from this run:
+
+- **ffmpeg splits drawtext on `:` and `,` even inside the quoted text.** A subtitle with `:` made
+  ffmpeg refuse the whole graph ("Both text and text file provided"), and every test still passed,
+  because the tests compare the graph text and do not run ffmpeg. Every fixed text now passes
+  `dcard_text_ok`, which has a test and a negative control. Only a render catches this class.
+- **`pkill -f '[r]k.sh'` still kills the fs-lab command if that same command line also says
+  `/root/rk.sh`.** The bracket trick only hides the pattern from itself. Run the pkill in its own
+  fs-lab call, then send and start the script in the next one.
+- **`seal --verify` does not check the closure.** After a master merge changes an imported spec,
+  `--verify` still says MATCH, and frontier refuses the seal (#10749). Re-save the seal after any merge
+  that touches the closure.
+
+#### Long names are abbreviated, not refused (t27#10728)
+
+A shown name of at most 58 bytes is drawn byte for byte. A longer one is drawn as its first
+segment, `/...`, and the longest run of whole trailing segments that fits
+(`port/.../rings/CR-CHAT-03/src/confirmation_tag_chain`). When no whole run fits, it is drawn as
+`...` and its last 55 bytes. Only drawn bytes are checked, and the text size follows the drawn
+length. `why_card` is unchanged and still refuses a name over 58 bytes.
+
+On 5440d35e1 the sweep compares the new binary with master's, card by card:
+
+- 30 cards are newly drawn, 783 are byte-identical to master, and 0 are lost or refused;
+- 0 changed cards and 0 newly drawn cards have no `...`, and 0 identical cards have one;
+- 29 abbreviated forms are drawn: 27 `/.../` and 2 `...`, the longest 58 bytes;
+- the helpers card (29 importers), a `/.../` focus and a `...` focus passed every pixel check,
+  with 0 white pixels outside x 100..980.
+
+Lab traps from this run:
+
+- **`pkill -f dn_lab.sh` kills the fs-lab command that runs it**, because the pattern is in that
+  command's own line. Write `pkill -f '[d]n_lab.sh'`.
+- **An untracked seal in the lab checkout makes `git checkout` fail, and the script then tests the
+  old commit.** Have the script take the commit it must test and stop with `WRONG COMMIT` when
+  `HEAD` differs. Once the PR adding a seal merges, that seal is tracked, so `rm -f` of it deletes
+  a tracked file: restore it with `git checkout --` before sealing.
+- **Count a kill only on `^ ?FAIL [a-z]`.** The `FAIL 0` summary line otherwise counts as a failing
+  test, and a surviving mutant reads `KILLED by 1: 0`.
+- **A `<` mutant of a 58-byte bound needs an unquotable byte that only the whole-name check
+  sees.** A 58-byte name with `:` in the middle is `true` under the mutant, because the dots form
+  hides that byte, and `false` under the rule.
 
 ## What this skill does not claim
 
