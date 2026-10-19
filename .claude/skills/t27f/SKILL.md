@@ -476,8 +476,9 @@ Traps:
 - **A one-byte-short fit test cannot tell `w > cap` from `w > cap + k`.** Both return `cap + 1`
   there. The original and the mutant only differ when the room is 2..k+1 bytes short, so the
   test that kills the mutant is three bytes short, not ten.
-- **Bands are in edge-list order, so a hub shows `account/*` first.** That is the stated rule,
-  not a ranking; do not caption the first three as the most important.
+- **Bands were in edge-list order, so a hub showed `account/*` first.** Since t27#10762 (below)
+  they are ranked by how many specs import each row. Even so, do not caption the first three as
+  the most important: "most imported" is the only measure the card has.
 
 #### Long names are abbreviated, not refused (t27#10728)
 
@@ -498,7 +499,8 @@ On 5440d35e1 the sweep compares the new binary with master's, card by card:
 Lab traps from this run:
 
 - **`pkill -f dn_lab.sh` kills the fs-lab command that runs it**, because the pattern is in that
-  command's own line. Write `pkill -f '[d]n_lab.sh'`.
+  command's own line. Write `pkill -f '[d]n_lab.sh'`, in an fs-lab call that names the script
+  nowhere else (see #10762's traps).
 - **An untracked seal in the lab checkout makes `git checkout` fail, and the script then tests the
   old commit.** Have the script take the commit it must test and stop with `WRONG COMMIT` when
   `HEAD` differs. Once the PR adding a seal merges, that seal is tracked, so `rm -f` of it deletes
@@ -508,6 +510,38 @@ Lab traps from this run:
 - **A `<` mutant of a 58-byte bound needs an unquotable byte that only the whole-name check
   sees.** A 58-byte name with `:` in the middle is `true` under the mutant, because the dots form
   hides that byte, and `false` under the rule.
+
+#### Bands rank the most imported first (t27#10762)
+
+Each band draws its specs by how many distinct specs import each of them in the whole edge list,
+highest first. A repeated edge line counts once, and equal scores keep the edge-list order, so a
+band of equal scores draws exactly what it drew before. The subtitle says
+`most imported first in each band`. The direct counts, the transitive counts and `+N more` do not
+change: only which names are drawn, and in what order. "Most imported" is the only measure; the
+ranking is quadratic in the edge list, and the hub is the largest band measured (539 ms, 378 importers).
+
+On 7853e2ef4 the sweep compares the new binary with the #10728 binary, card by card:
+
+- 124 cards are reordered, 689 are the same, and 0 are lost or refused;
+- 0 cards have a count that differs, and 0 drawn rows score higher than the row above them
+  (1647 rows checked; 3 rows have abbreviated names, so their scores are unknown);
+- the hub `base/types` now shows `compiler/lexer`, `compiler/parser` and `igla/race/bram_weights`
+  in place of three `account/*` specs, and both it and `analog/linear` passed every pixel check;
+- 21 of 21 mutants fail a named test, including the tie order, the repeated line, out-degree in
+  place of in-degree, and the hidden-name check run in edge-list order.
+
+Traps from this run:
+
+- **ffmpeg splits drawtext on `:` and `,` even inside the quoted text.** A subtitle with `:` made
+  ffmpeg refuse the whole graph ("Both text and text file provided"), and every test still passed,
+  because the tests compare the graph text and do not run ffmpeg. Every fixed text now passes
+  `dcard_text_ok`, which has a test and a negative control. Only a render catches this class.
+- **`pkill -f '[r]k.sh'` still kills the fs-lab command if that same command line also says
+  `/root/rk.sh`.** The bracket trick only hides the pattern from itself. Run the pkill in its own
+  fs-lab call, then send and start the script in the next one.
+- **`seal --verify` does not check the closure.** After a master merge changes an imported spec,
+  `--verify` still says MATCH, and frontier refuses the seal (#10749). Re-save the seal after any merge
+  that touches the closure.
 
 ## What this skill does not claim
 
