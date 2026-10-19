@@ -10764,15 +10764,17 @@ pub fn out_str_return(src: &[u8], st: &mut [usize], out: &mut [u8]) -> bool {
 
 pub const VEC_GUARD: &'static str = "// t27o: the original of a fn that returns a Vec runs on a thread with 3 s and 16 MiB: a call that does not stop, or keeps growing its Vec, is skipped, not run to the end of the machine\nmod t27o_guard {\n    use std::alloc::{GlobalAlloc, Layout, System};\n    use std::cell::Cell;\n    use std::sync::atomic::{AtomicUsize, Ordering};\n    thread_local! { static BYTES: Cell<usize> = const { Cell::new(usize::MAX) }; }\n    static HUNG: AtomicUsize = AtomicUsize::new(0);\n    fn charge(n: usize) { let _ = BYTES.try_with(|g| { let c = g.get(); if c != usize::MAX { g.set(c + n); if c + n > (16 << 20) { loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } } } }); }\n    fn refund(n: usize) { let _ = BYTES.try_with(|g| { let c = g.get(); if c != usize::MAX { g.set(c.saturating_sub(n)); } }); }\n    struct Guarded;\n    unsafe impl GlobalAlloc for Guarded {\n        unsafe fn alloc(&self, l: Layout) -> *mut u8 { charge(l.size()); System.alloc(l) }\n        unsafe fn dealloc(&self, p: *mut u8, l: Layout) { refund(l.size()); System.dealloc(p, l) }\n        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 { charge(n); refund(l.size()); System.realloc(p, l, n) }\n    }\n    #[global_allocator]\n    static ALLOC: Guarded = Guarded;\n    pub fn clear() { HUNG.store(0, Ordering::SeqCst); }\n    pub fn guard<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {\n        if HUNG.load(Ordering::SeqCst) >= 2 { return None; }\n        let (tx, rx) = std::sync::mpsc::channel();\n        std::thread::spawn(move || { BYTES.with(|g| g.set(0)); let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)); let _ = tx.send(r.ok()); });\n        match rx.recv_timeout(std::time::Duration::from_secs(3)) { Ok(r) => r, Err(_) => { HUNG.fetch_add(1, Ordering::SeqCst); None } }\n    }\n}\n\n";
 
-pub fn has_vecfn(st: impl AsRef<[usize]>) -> bool {
-    let st: &[usize] = st.as_ref();
+pub fn has_vecfn(st: &mut [usize]) -> bool {
     let mut k: usize = 0;
     while (k < st[(NNAMES) as usize]) {
-        if (st[(((NAMES + (k * NAME_SLOTS)) + 4)) as usize] == K_VECFN) {
+        let s: usize = (NAMES + (k * NAME_SLOTS));
+        if (st[((s + 4)) as usize] == K_VECFN) {
+            st[(HIT) as usize] = s;
             return true;
         }
         k = (k + 1);
     }
+    st[(HIT) as usize] = 0;
     return false;
 }
 
