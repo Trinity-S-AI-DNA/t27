@@ -400,7 +400,9 @@ Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 t
 ## Application: idea factory, the OS particle design system (t27#10771)
 
 The owner wants one factory that unpacks any idea in any style preset, with every element made
-of particles, and runnable in the OS itself and on FPGA. Two specs do this:
+of particles, and runnable in the OS itself and on FPGA. Two specs do this. TRI CLAW's card for
+them is `specs/skills/t27-idea-factory.t27` (t27#10796). If you add a preset, also add it to the
+card's `PRESETS`; its lab check compares that list to `PRESET_NAMES` byte for byte.
 
 - **`specs/t27f/particle_ds.t27` is the design system.** A preset is a column in integer tables:
   `BG`, `COL_A/B/C`, `RADIUS`, `GAIN`, `SPRING`, `DAMP`, `LAW`, `FORCE`, `KICK`, `CARD`. The five
