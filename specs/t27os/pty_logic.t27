@@ -47,6 +47,7 @@ use t27os::session_store::put_dec;
 use t27os::session_store::put_record;
 use t27os::session_store::parse_record;
 use t27os::session_store::sid_ok;
+use t27os::session_store::model_ok;
 use t27os::session_store::restore_plan;
 use t27os::session_store::build_command;
 use t27os::session_store::fresh_command;
@@ -130,6 +131,9 @@ pub const O_HOME : usize = 91304;
 pub const O_POLL : usize = 91560;
 pub const O_MISC : usize = 92072;
 pub const O_BIN : usize = 92400;
+/// Each pane's model (session_store model_ok): a length byte, then up to MODEL_CAP - 1 bytes.
+pub const MODEL_CAP : usize = 64;
+pub const O_MODEL : usize = 97280;
 pub const O_RING : usize = 98304;
 pub const MEM_SIZE : usize = 1146880;
 pub const TICK_MS : i32 = 500;
@@ -194,14 +198,35 @@ pub fn list_flags(live: bool, w: u32) -> u32 {
     return f;
 }
 
+/// The model a hook payload names ({"model":"..."}: Claude Code's SessionStart carries it), as (at, len)
+/// in f[0], f[1]; false when there is none or it fails model_ok().
+pub fn hook_model(payload: []const u8, f: []u64) -> bool {
+    if (!json_field(payload, "model", f)) { return false; }
+    const at : usize = @as(usize, @intCast(f[0]));
+    return model_ok(payload[at .. at + @as(usize, @intCast(f[1]))]);
+}
+
+/// A SPAWN payload is agent, plan, 1 spare byte, then the cwd, optionally followed by a TAB and a model.
+/// The length of the cwd part.
+pub fn spawn_cwd_len(payload: []const u8) -> usize {
+    if (payload.len <= 3) { return 0; }
+    var i : usize = 3;
+    var end : usize = payload.len;
+    while (i < payload.len) {
+        if (payload[i] == 9 and end == payload.len) { end = i; }
+        i = i + 1;
+    }
+    return end - 3;
+}
+
 /// The command a pane runs: fresh (with a new Claude session id) or resumed, plus the Claude hook
 /// settings file for the claude cell, written into out. Returns the length.
-pub fn pane_command(agent: u32, plan: u32, sid: []const u8, home: []const u8, out: []u8) -> usize {
+pub fn pane_command(agent: u32, plan: u32, sid: []const u8, model: []const u8, home: []const u8, out: []u8) -> usize {
     var n : usize = 0;
     if (plan == R_RELAUNCH) {
-        n = fresh_command(agent, sid, out);
+        n = fresh_command(agent, sid, model, out);
     } else {
-        n = build_command(agent, plan, sid, out);
+        n = build_command(agent, plan, sid, model, out);
     }
     if (agent == 0) {
         n = put_bytes(out, n, " --settings ");
@@ -226,8 +251,30 @@ pub fn argv_text(cmd: []const u8, out: []u8, f: []u64) -> usize {
     return n + 1;
 }
 
-/// The launchd agent plist that keeps this binary running and restarts it when it dies.
-pub fn plist_text(out: []u8, bin: []const u8) -> usize {
+/// Text that can stand inside a plist <string> as it is: no markup character, no control byte.
+pub fn xml_ok(s: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] == 60 or s[i] == 62 or s[i] == 38 or s[i] < 32) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn plist_env(out: []u8, at: usize, key: []const u8, val: []const u8) -> usize {
+    if (val.len == 0 or !xml_ok(val)) { return at; }
+    var n : usize = put_bytes(out, at, "<key>");
+    n = put_bytes(out, n, key);
+    n = put_bytes(out, n, "</key><string>");
+    n = put_bytes(out, n, val);
+    return put_bytes(out, n, "</string>");
+}
+
+/// The launchd agent plist that starts this binary at login and restarts it when it dies. launchd gives
+/// an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and no TERM, so the plist carries the PATH and LANG of the
+/// shell that installed it (claude lives in ~/.local/bin) and TERM=xterm-256color for the panes; the
+/// server's output goes to ~/.t27os/server.log. A value that is not xml_ok() is left out.
+pub fn plist_text(out: []u8, bin: []const u8, home: []const u8, path: []const u8, lang: []const u8) -> usize {
     var n : usize = put_bytes(out, 0, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     n = put_bytes(out, n, "<plist version=\"1.0\"><dict>\n");
     n = put_bytes(out, n, "<key>Label</key><string>ai.t27.os-server</string>\n");
@@ -236,6 +283,19 @@ pub fn plist_text(out: []u8, bin: []const u8) -> usize {
     n = put_bytes(out, n, "</string></array>\n");
     n = put_bytes(out, n, "<key>RunAtLoad</key><true/>\n");
     n = put_bytes(out, n, "<key>KeepAlive</key><true/>\n");
+    n = put_bytes(out, n, "<key>EnvironmentVariables</key><dict>");
+    n = plist_env(out, n, "PATH", path);
+    n = plist_env(out, n, "LANG", lang);
+    n = plist_env(out, n, "TERM", "xterm-256color");
+    n = put_bytes(out, n, "</dict>\n");
+    if (xml_ok(home)) {
+        n = put_bytes(out, n, "<key>StandardOutPath</key><string>");
+        n = put_bytes(out, n, home);
+        n = put_bytes(out, n, "/.t27os/server.log</string>\n");
+        n = put_bytes(out, n, "<key>StandardErrorPath</key><string>");
+        n = put_bytes(out, n, home);
+        n = put_bytes(out, n, "/.t27os/server.log</string>\n");
+    }
     n = put_bytes(out, n, "</dict></plist>\n");
     return n;
 }
@@ -335,7 +395,7 @@ test exit_and_hook_events_pick_the_right_status {
 
 test the_command_carries_the_resume_flag_and_the_hook_settings {
     var out : [200]u8 = undefined;
-    const n : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", "/Users/x", out[0..200]);
+    const n : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", "", "/Users/x", out[0..200]);
     var want : [200]u8 = undefined;
     const m : usize = put_bytes(want[0..200], 0, "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --settings /Users/x/.t27os/hooks.json");
     assert n == m;
@@ -346,7 +406,7 @@ test the_command_carries_the_resume_flag_and_the_hook_settings {
         i = i + 1;
     }
     assert same;
-    const b : usize = pane_command(SHELL_CELL, R_RELAUNCH, "-", "/Users/x", out[0..200]);
+    const b : usize = pane_command(SHELL_CELL, R_RELAUNCH, "-", "opus", "/Users/x", out[0..200]);
     assert b == 9;
     assert out[5] == 98;
 }
@@ -368,20 +428,79 @@ test the_argv_buffer_holds_three_strings {
     assert n == 22;
 }
 
+/// How many times needle occurs in hay (the plist test reads its output with it).
+fn pl_count(hay: []const u8, needle: []const u8) -> usize {
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        while (j < needle.len and hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.len) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
 test the_plist_names_the_binary_and_keeps_it_alive {
-    var out : [600]u8 = undefined;
-    const n : usize = plist_text(out[0..600], "/Users/x/t27os-server");
-    assert n > 200;
+    var out : [1200]u8 = undefined;
+    const n : usize = plist_text(out[0..1200], "/Users/x/.t27os/t27os-pty", "/Users/x", "/Users/x/.local/bin:/usr/bin:/bin", "en_US.UTF-8");
+    assert n > 400;
     assert out[0] == 60;
     assert out[n - 1] == 10;
-    var at : usize = 0;
-    var found : usize = 0;
-    while (at + 21 <= n) {
-        if (out[at] == 47 and out[at + 1] == 85 and out[at + 20] == 114) { found = found + 1; }
-        at = at + 1;
-    }
-    assert found == 1;
+    assert pl_count(out[0..n], "<string>/Users/x/.t27os/t27os-pty</string>") == 1;
+    assert pl_count(out[0..n], "<key>RunAtLoad</key><true/>") == 1;
+    assert pl_count(out[0..n], "<key>KeepAlive</key><true/>") == 1;
+    // launchd's own PATH has no ~/.local/bin: the installer's PATH goes with the agent
+    assert pl_count(out[0..n], "<key>PATH</key><string>/Users/x/.local/bin:/usr/bin:/bin</string>") == 1;
+    assert pl_count(out[0..n], "<key>LANG</key><string>en_US.UTF-8</string>") == 1;
+    assert pl_count(out[0..n], "<key>TERM</key><string>xterm-256color</string>") == 1;
+    assert pl_count(out[0..n], "<string>/Users/x/.t27os/server.log</string>") == 2;
+    assert pl_count(out[0..n], "<dict>") == 2;
+    assert pl_count(out[0..n], "</dict>") == 2;
+    // a value that would break the XML is left out, the rest stays
+    const m : usize = plist_text(out[0..1200], "/b", "/h", "/a<b", "");
+    assert pl_count(out[0..m], "<key>PATH</key>") == 0;
+    assert pl_count(out[0..m], "<key>LANG</key>") == 0;
+    assert pl_count(out[0..m], "<key>TERM</key>") == 1;
+    assert xml_ok("/usr/bin:/bin");
+    assert xml_ok("a&b") == false;
+    assert xml_ok("a>b") == false;
 }
+
+test the_session_start_hook_gives_the_model {
+    var f : [2]u64 = undefined;
+    const p : str = "{\"session_id\":\"abc-1\",\"hook_event_name\":\"SessionStart\",\"model\":\"claude-opus-5-5\"}";
+    assert hook_model(p, f[0..2]);
+    assert f[1] == 15;
+    assert p[@as(usize, @intCast(f[0]))] == 99;
+    assert hook_model("{\"session_id\":\"abc-1\"}", f[0..2]) == false;
+    assert hook_model("{\"model\":\"a b\"}", f[0..2]) == false;
+    // an object, not a string: nothing to save
+    assert hook_model("{\"model\":{\"id\":\"opus\"}}", f[0..2]) == false;
+}
+
+test a_pane_command_keeps_its_model {
+    var out : [200]u8 = undefined;
+    const n : usize = pane_command(0, R_RESUME, "abc-1", "opus", "/h", out[0..200]);
+    // claude --resume abc-1 --model 'opus' --settings /h/.t27os/hooks.json
+    assert n == 36 + 12 + 2 + 18;
+    assert pl_count(out[0..n], " --model 'opus' --settings ") == 1;
+    const r : usize = pane_command(0, R_RELAUNCH, "5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11", "opus", "/h", out[0..200]);
+    assert pl_count(out[0..r], "claude --session-id 5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11 --model 'opus' --settings ") == 1;
+    // no model: the line is the one before v2
+    const b : usize = pane_command(0, R_RESUME, "abc-1", "", "/h", out[0..200]);
+    assert b == 21 + 12 + 2 + 18;
+    assert O_MODEL + 16 * MODEL_CAP <= O_RING;
+    assert O_BIN + 256 <= O_MODEL;
+}
+
+test a_spawn_payload_splits_cwd_and_model {
+    assert spawn_cwd_len("abc/Users/me") == 9;
+    assert spawn_cwd_len("abc/Users/me\topus") == 9;
+    assert spawn_cwd_len("abc") == 0;
+    assert spawn_cwd_len("abc\topus") == 0;
+}
+
 
 test c_path_adds_the_nul {
     var out : [20]u8 = undefined;
