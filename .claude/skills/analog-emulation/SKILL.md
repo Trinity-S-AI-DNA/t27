@@ -67,7 +67,7 @@ Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next m
 
 **The board flow is local; the Railway lab is not needed.** `O="$(git rev-parse --git-common-dir)/../build/fpga/openxc7"` (the main checkout's `build/`, from any worktree) holds `np-main/build/nextpnr-xilinx`, the AX7203 chipdb `xc7a200tfbg484-2.bin`, `prjxray/utils/fasm2frames.py` (run with `$O/venv/bin/python3`) and `px-main/build/tools/xc7frames2bit`; yosys and openFPGALoader come from Homebrew. nextpnr on this Mac takes about 22 s and 2.4 GB: check `memory_pressure` (>= 25 % free) and `df -h /` (>= 8 GB) first and never run two at once. Read the memory notes before declaring a blocker: the recipe was there.
 
-Sandboxed sessions: `export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local`; commit with `git -c core.hooksPath=.githooks commit`; `gh` fails TLS, use curl with `$(gh auth token)`. There is no `t27t` in this repository (searched 2026-10-18); do not invent one.
+Sandboxed sessions: `export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local`; commit with `git -c core.hooksPath=.githooks commit`; `gh` fails TLS, use curl with `$(gh auth token)`. The t27 trainer is t27t: `specs/t27t/t27t.t27` (`tri t27t`); its runner is gHashTag/igla-coder-gpu.
 
 ## The overnight loop tick
 
