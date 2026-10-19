@@ -178,6 +178,33 @@ derived, suggested or unknown. The surfaces and their status are
   node and edge instead of the whole file. Use it before reading a big spec in
   full.
 
+### t27t: the t27 trainer
+
+t27t is the t27 training product. Its law is
+[`specs/t27t/t27t.t27`](specs/t27t/t27t.t27), run with `tri t27t`. Its runner
+today is the PyTorch trainer gHashTag/igla-coder-gpu (`train.py`, tern-tc
+models). The spec says what the runner must do; it does not rewrite the runner.
+
+- **What makes training cheaper** (measured on an RTX 4090 with CUTLASS 3.5.1,
+  2026-10-18, #10360): the forward GEMMs run on int8 tensor cores, at 2.9x to
+  3.5x bf16, and the gradients stay in bf16. PyTorch reaches those cores through
+  `torch._int_mm`, so no t27c CUDA backend is needed for the saving.
+- **What makes it more expensive:** int8 dp4a on CUDA cores runs at 0.91x to
+  0.94x of bf16. `pick_path` never chooses it.
+- **The saving law:** f x (1 - 1/s), which is 16% to 24%, or $16 to $24 on a
+  $100 run. f is the share of a step spent in forward GEMMs, and it is **an
+  estimate, not a measurement** (`F_MEASURED = false`). Do not quote the saving
+  without saying so.
+- **When a generated kernel takes over:** only on a shape where it beats tuned
+  CUTLASS s8 by 10% (`GEN_CUDA_BAR_E2`).
+- **Open:** the runner is not wired to `torch._int_mm` yet
+  (`RUNNER_USES_INT_MM = false`). The spec's `NOT_MEASURED` lists what else was
+  not measured.
+- **Numbers about our formats** go through the papers check,
+  [`specs/numeric/paper_claims.t27`](specs/numeric/paper_claims.t27) (`tri papers`).
+  Of 45 numbers printed in three papers, 34 recompute, 8 do not, 3 cannot be
+  checked.
+
 ### Hot reload and incremental work: only what changed is redone
 
 The rule: key every result on the content hash of its inputs and reuse it while

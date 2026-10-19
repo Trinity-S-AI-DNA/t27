@@ -1,11 +1,11 @@
 ---
 id: model-routing
 name: model-routing
-description: Which Claude model does which job -- the orchestrator runs on Opus 5.5, every sub-task it delegates runs on Sonnet 5.5, and a sub-task escalates to Opus only after two failed attempts or on the owner's word. Load before spawning any subagent, writing a workflow, or picking a model in TRI CLAW or the Queen.
+description: Which Claude model does which job -- every agent runs on Sonnet 5.5 by default, the orchestrator included, and any job escalates to Opus 5.5 only after two failed attempts or on the owner's word. Load before spawning any subagent, writing a workflow, or picking a model in TRI CLAW or the Queen.
 argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|docs|fix]"
 ---
 
-# /model-routing -- Opus orchestrates, Sonnet does the sub-tasks
+# /model-routing -- Sonnet by default for every agent, Opus only on evidence
 
 <!-- only-t27-rule -->
 > **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
@@ -16,7 +16,7 @@ argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|
 > - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
 > - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
 
-Owner directive 2026-10-18: orchestration through Opus 5.5, sub-tasks through Sonnet 5.5, because it is cheaper; the rule is part of TRI CLAW so development stays economical.
+Owner directive 2026-10-19 (translated): "set Sonnet as the default model for all agents -- it is cheaper with the same result" (#10921). It replaces the 2026-10-18 rule (orchestration on Opus 5.5, sub-tasks on Sonnet 5.5, #10493). The rule is part of TRI CLAW so development stays economical.
 
 **The law is `specs/claw/model_route.t27`.** This skill is how to follow it in a Claude Code session. If the two disagree, the spec wins; fix the skill.
 
@@ -24,24 +24,24 @@ Owner directive 2026-10-18: orchestration through Opus 5.5, sub-tasks through So
 
 | Role | Kind | Model |
 |---|---|---|
-| orchestrate, plan, review-final | orchestration | **Opus 5.5** (`opus`, `claude-opus-5-5`) |
+| orchestrate, plan, review-final | orchestration | **Sonnet 5.5** (`sonnet`, `claude-sonnet-5-5`) |
 | implement, port, search, test, docs, fix | sub-task | **Sonnet 5.5** (`sonnet`, `claude-sonnet-5-5`) |
 
-- A sub-task goes to Opus only on evidence: **2 failed Sonnet attempts on the same task** (`ESCALATE_AFTER`), or the owner says so. Nothing else raises a tier.
-- Orchestration is never routed down. Splitting the work, deciding what is true, and saying merge or stop stay on Opus.
+- Any job goes to Opus 5.5 (`opus`, `claude-opus-5-5`) only on evidence: **2 failed Sonnet attempts on the same task** (`ESCALATE_AFTER`), or the owner says so. Nothing else raises a tier.
+- Opus without that evidence is waste for every role (`is_waste`), the orchestrator included.
 - Why: epic #10066 measured Sonnet 5.5 at least as good as Opus 5.5 on ten bounded spec-to-RTL tasks (9 vs 8 direct Verilog, 7 vs 7 in .t27) at about 40% of the cost.
 
 ## How it is wired in Claude Code
 
 - `.claude/settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-5-5`, so any subagent with no model of its own runs on Sonnet.
-- Every sub-task agent in `.claude/agents/` carries `model: sonnet`; the orchestrator `trinity.md` (Queen) carries `model: opus`.
-- The main session is the orchestrator: pick **Opus 5.5** for it in the app's model menu.
+- Every agent in `.claude/agents/` carries `model: sonnet`, the orchestrator `trinity.md` (Queen) included.
+- The main session is the orchestrator: pick **Sonnet 5.5** for it in the app's model menu; switch it to Opus only for a job that failed twice on Sonnet or on the owner's word.
 
 ## When you are the orchestrator
 
-1. Plan on Opus: split the task into sub-tasks with a clear input, output and done-check each.
+1. Plan (on Sonnet): split the task into sub-tasks with a clear input, output and done-check each.
 2. Spawn each sub-task with the Agent tool. Leave `model` unset (the default is Sonnet) or pass `model: "sonnet"`. Give the subagent everything it needs in the prompt: file paths, the issue, the acceptance check. A sub-task prompt that needs Opus to understand is a planning failure, not a reason to escalate.
-3. Verify the result yourself (that is review-final, on Opus): read the diff or the output, run the check.
+3. Verify the result yourself (that is review-final): read the diff or the output, run the check.
 4. If the same sub-task fails twice on Sonnet, re-spawn it once with `model: "opus"`, and say in the result why it escalated.
 5. In a Workflow script, set `model: 'sonnet'` on sub-task `agent()` calls and keep the orchestration logic in the script itself.
 
@@ -49,7 +49,7 @@ Parallelism: at most 3 subagents at once on this 8 GB Mac (swap eats the disk); 
 
 ## Audit
 
-`is_waste(role, tier, failed_attempts, owner_flag)` in the spec answers whether a run spent Opus on a sub-task without evidence. Use it when TRI CLAW or the Queen records which model ran a job.
+`is_waste(role, tier, failed_attempts, owner_flag)` in the spec answers whether a run spent Opus on any role without evidence. Use it when TRI CLAW or the Queen records which model ran a job.
 
 ## Not covered yet
 
