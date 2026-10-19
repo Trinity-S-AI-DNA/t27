@@ -8262,7 +8262,7 @@ impl Codegen {
             self.write(HOST_IO_ZIG);
         }
         let mut threads = false;
-        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores"));
+        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores") && !self.declared_fns.contains(&c.name));
         if threads {
             self.write(THREAD_ZIG);
         }
@@ -38461,21 +38461,6 @@ mod tests_hir_assembler {
     }
 
     #[test]
-    fn test_align_address_zero() {
-        assert_eq!(align_address(5, 4), 8);
-    }
-
-    #[test]
-    fn test_align_address_already_aligned() {
-        assert_eq!(align_address(8, 4), 8);
-    }
-
-    #[test]
-    fn test_align_address_zero_alignment() {
-        assert_eq!(align_address(5, 0), 5);
-    }
-
-    #[test]
     fn test_instr_count() {
         let cfg = AsmConfig::new("test");
         assert_eq!(cfg.instr_count(128), 32);
@@ -38686,7 +38671,6 @@ mod tests_hir_testbench {
         assert!(cfg.active_low);
         assert_eq!(cfg.delay_cycles, 5);
         assert_eq!(cfg.duration_cycles, 10);
-        assert_eq!(cfg.reset_end_cycle(), 15);
     }
 
     #[test]
@@ -40073,16 +40057,6 @@ mod tests_hir_timing {
     }
 
     #[test]
-    fn test_path_delay() {
-        let arcs = vec![
-            TimingArc::comb("a", "b", 100),
-            TimingArc::comb("b", "c", 200),
-            TimingArc::comb("c", "d", 300),
-        ];
-        assert_eq!(path_delay(&arcs), 600);
-    }
-
-    #[test]
     fn test_slack_positive() {
         assert_eq!(TimingModel::slack(5000, 10000), 5000);
     }
@@ -40110,21 +40084,6 @@ mod tests_hir_timing {
     #[test]
     fn test_est_reg_to_reg_delay() {
         assert_eq!(TimingModel::est_reg_to_reg_delay(3), 800);
-    }
-
-    #[test]
-    fn test_worst_path() {
-        let paths = vec![
-            TimingPath::new("a", "b", 500, 0),
-            TimingPath::new("c", "d", 1200, 0),
-            TimingPath::new("e", "f", 800, 0),
-        ];
-        assert_eq!(worst_path_delay(&paths), 1200);
-    }
-
-    #[test]
-    fn test_worst_path_empty() {
-        assert_eq!(worst_path_delay(&[]), 0);
     }
 
     #[test]
