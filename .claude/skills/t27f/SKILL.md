@@ -434,6 +434,51 @@ Traps:
   until a fixture had fewer edges than `hops=` *and* still ended at B. Give every refusal a
   fixture that only that refusal catches.
 
+### Draw who uses a spec as a card (t27#10720)
+
+`specs/t27f/deps_card.t27` draws one spec's neighbourhood. Its first three direct importers sit
+above it and its first three direct imports below it, with `+N more` past three and the
+transitive counts in the footer. A gold `ON AN IMPORT CYCLE` line appears when `deps_on_cycle`
+holds. It imports why_card's `card_*` helpers rather than copying them, and its main reads
+`DEPS_SPEC` and `DEPS_FONT`. Skill card: `t27/deps-card`. To build and render it, follow the
+why-card recipe above with `deps_card` in place of `why_card`.
+
+Pixel checks per row:
+
+- fill at (106, y+6);
+- stroke at (101, y+32);
+- fill at both inner edges (110 and 970);
+- backdrop in the gap at (300, y+70).
+
+Rows start at y = 280 + 76k above the focus and 820 + 76k below it. Then check:
+
+- the focus fill at (112, 650) and its 8 px stroke at (103, 688);
+- the connector at (540, 630) above and (540, 745) below, or the backdrop at those points when a
+  band is empty;
+- the white-pixel count in every row's text band.
+
+On 255910235 (2483 edge lines, 813 specs named):
+
+- 783 cards drew. `base/types` is the hub: 378 direct importers, reached by 400.
+- 30 were refused:
+  - 29 because the spec's own name is over 58 bytes (`port/trios/...`);
+  - 1 because a shown neighbour's name is.
+- No spec in the corpus is on an import cycle.
+- 70 of 70 pixel checks held on the hub, leaf and mid cards.
+
+Traps:
+
+- **A shell helper that sets `tag` clobbers the caller's `tag`.** POSIX `sh` has no `local`:
+  `rows()` setting `tag=$4` sent every later check to `up.png`, which does not exist. Name each
+  helper's variables apart.
+- **`sort -t "$TAB" -k3,3n -r` sorts ascending.** A key with its own ordering flag does not
+  inherit `-r`, so write `-k3,3nr`. In `sh`, `$'\t'` is two characters; use `TAB=$(printf '\t')`.
+- **A one-byte-short fit test cannot tell `w > cap` from `w > cap + k`.** Both return `cap + 1`
+  there. The original and the mutant only differ when the room is 2..k+1 bytes short, so the
+  test that kills the mutant is three bytes short, not ten.
+- **Bands are in edge-list order, so a hub shows `account/*` first.** That is the stated rule,
+  not a ranking; do not caption the first three as the most important.
+
 ## What this skill does not claim
 
 The graph IR is a schema (`specs/t27f/spec_graph.t27`) and `specs/t27f/spec_graph_export.t27` turns source into it, but only exact declarations, spans and edges within the IR's capacity, with `specs/t27f/spec_graph_derive.t27` adding the derived and unknown part by stated rules, and no host calls either yet; no renderer draws a T27F view in the Trinity UI, no
