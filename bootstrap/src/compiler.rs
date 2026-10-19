@@ -32092,18 +32092,6 @@ pub enum ArcKind {
     InputToOutput,
 }
 
-impl ArcKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => ArcKind::Comb,
-            1 => ArcKind::RegToReg,
-            2 => ArcKind::RegToOutput,
-            3 => ArcKind::InputToReg,
-            4 => ArcKind::InputToOutput,
-            _ => ArcKind::Comb,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TimingArc {
@@ -33020,11 +33008,6 @@ pub struct RouteEstimate {
     pub needs_global_buf: bool,
 }
 
-impl RouteEstimate {
-    pub fn passed(&self) -> bool {
-        self.congestion_score < 80
-    }
-}
 
 pub struct RouteModel;
 
@@ -33436,11 +33419,6 @@ pub struct CtsReport {
     pub has_violations: bool,
 }
 
-impl CtsReport {
-    pub fn passed(&self) -> bool {
-        !self.has_violations
-    }
-}
 
 pub struct CtsModel;
 
@@ -41711,32 +41689,6 @@ mod tests_hir_router {
     }
 
     #[test]
-    fn test_route_passed() {
-        let r = RouteEstimate {
-            total_nets: 100,
-            total_wire_length_um: 50000,
-            avg_wire_length_um: 500,
-            max_fanout: 10,
-            congestion_score: 20,
-            needs_global_buf: false,
-        };
-        assert!(r.passed());
-    }
-
-    #[test]
-    fn test_route_failed() {
-        let r = RouteEstimate {
-            total_nets: 1000,
-            total_wire_length_um: 500000,
-            avg_wire_length_um: 500,
-            max_fanout: 50,
-            congestion_score: 90,
-            needs_global_buf: true,
-        };
-        assert!(!r.passed());
-    }
-
-    #[test]
     fn test_router_analyze_fanout() {
         let mut router = HirRouter::new();
         router.add_edge(ConnEdge::data("src", "d1", 8));
@@ -41937,19 +41889,6 @@ mod tests_hir_cts {
         assert_eq!(t.tree_delay_ps(100), 200);
         assert!(t.skew_ok(200));
         assert!(!t.skew_ok(50));
-    }
-
-    #[test]
-    fn test_cts_report_passed() {
-        let r = CtsReport {
-            num_clocks: 2,
-            num_plls: 1,
-            total_buffers: 10,
-            worst_skew_ps: 80,
-            worst_latency_ps: 300,
-            has_violations: false,
-        };
-        assert!(r.passed());
     }
 
     #[test]
