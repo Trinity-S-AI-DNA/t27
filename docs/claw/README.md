@@ -1,3 +1,4 @@
+| Move gate: whether a Railway service can move to another project, checked before anything is created there (private hosts, doubled outbound loops, state volumes, a target with no plan) | `specs/claw/move_gate.t27` (move kind and five readings in, one `V` line out: go or hold; not wired to a job yet) | #10794 |
 # TRI CLAW
 
 TRI CLAW — TRI-27 — Trinity S3AI: every CI gate of this repository, packaged
