@@ -388,6 +388,7 @@ fn a_signature_zig_never_resolves() {
     assert!(rejected(&src.replace("all: [*]const Issue", "all: [*]const Issue, m: Missing")).contains("type [*]T"));
     assert!(rejected(&src.replace("== 34);", "== 34);\n    lazy_unit_new();")).contains("unknown name `LazyUnit`"));
     assert!(common::lower_src(&src.replace("return lazy_unit_new();", "return lazy_unit_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
+    assert!(rejected(&src.replace("fn issue_score(", "fn lazy_local() -> u32 {\n    var x : LazyMissing = 0;\n    return 1;\n}\n\nfn issue_score(")).contains("type (undeclared)")); // #11053: t27c BLOCKED
     let m = common::lower_src(&src.replace("f.write_num", "undeclared_thing")).unwrap_err().join("\n");
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
 }

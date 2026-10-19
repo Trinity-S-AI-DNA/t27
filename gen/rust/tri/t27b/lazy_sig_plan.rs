@@ -170,6 +170,9 @@ pub fn body_plan(construct: &[u8], detail: &[u8]) -> u8 {
             return KEEP;
         }
     }
+    if begins(construct, b"type (undeclared") {
+        return KEEP;
+    }
     if (begins(construct, b"StmtBreak") || begins(construct, b"StmtContinue")) {
         return KEEP;
     }

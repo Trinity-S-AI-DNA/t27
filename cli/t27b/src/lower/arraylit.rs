@@ -15,8 +15,6 @@
 //! use is `&x` as such an argument (one E for all) or `x.len`, it takes the
 //! same slice-local path, and `&x` passes the slice of it (`arg_as`).
 //!
-//! An untyped module constant bound to a list is `.{ ... }`, a tuple: Zig reads it only where something names it (`eager_const`).
-//!
 //! `return [ ... ];` (or `&[_]E{ ... }` for a const slice) in a fn returning a slice, or a slice field's literal, is
 //! `@constCast(&[_]E{ ... })` (`slice_lit`, plan `specs/tri/t27b/slice_lit_plan.t27`); one whose
 //! elements hold a str is a global written at entry (`entry_static`, #8091).
