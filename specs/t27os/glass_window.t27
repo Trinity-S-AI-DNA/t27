@@ -38,6 +38,9 @@
 ;                  looking at, the last eight controls pressed, one suggestion behind Confirm / Dismiss,
 ;                  and GOD MODE (box filled = on): with the panel open and the user still 3 s she runs the
 ;                  suggestion herself and logs it; Cmd+J, Escape, the box or closing the panel stops it.
+;   T  term     -- a Claude Code chat shows a live terminal pane (term_pane.t27, vt.t27): the agent runs
+;                  in the PTY server (pty_server.t27) reached over ~/.t27os/pty.sock, so it outlives the
+;                  window; reopening the window re-finds the same pane. No server: offline, keys echo.
 ;   D  dock     -- app icon: the logo white on a black squircle, drawn at launch.
 ; Not drawn (no server behind them yet): the Online dot, search, swarm and
 ; history lists, Cmd+K / Cmd+/ overlays, the formula in the tooltip. The Queen has no model
@@ -340,6 +343,23 @@ use t27os::term_pane::tp_reset_due;
 use t27os::term_pane::tp_utf8;
 use t27os::term_pane::tp_key_bytes;
 use t27os::term_pane::tp_echo;
+use t27os::term_pane::TP_DATA_AT;
+use t27os::term_pane::tp_pick_pane;
+use t27os::term_pane::tp_ordinal;
+use t27os::term_pane::tp_spawned;
+use t27os::term_pane::tp_data_len;
+use t27os::term_pane::tp_read_more;
+use t27os::term_pane::tp_retry_due;
+use t27os::pty_client::client_connect;
+use t27os::pty_client::client_list;
+use t27os::pty_client::client_spawn;
+use t27os::pty_client::client_attach;
+use t27os::pty_client::client_keys;
+use t27os::pty_client::client_read;
+use t27os::pty_client::reply_cursor;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_close;
 
 // ---- W window ----
 
@@ -1959,15 +1979,38 @@ fn draw_edge_glow(c: u64, sw: f64, sh: f64, g: f64, frame: u32) -> void {
 }
 
 // ---- the terminal pane (Claude Code, AGENT 0) ----
-// Stand-ins for specs/t27os/pty_client.t27 (connect, spawn, keys, read frames, resize), which
-// the pty-server session ships; until it lands every call answers "not connected" and the pane
-// runs offline, echoing its own keys into the grid.
+// The pane talks to the T27 OS PTY server through specs/t27os/pty_client.t27: blocking round trips on
+// ~/.t27os/pty.sock, one frame out and one back. Which server pane a chat is, and how a reply reads, are
+// term_pane.t27 decisions; when no server answers the pane runs offline, echoing its own keys.
 
-fn term_connect() -> bool { return false; }
-fn term_spawn(cwd: u64, bin: []const u8, cols: u32, rows: u32) -> u32 { return PANE_NONE; }
-fn term_keys(pane: u32, b: []const u8, n: u32) -> bool { return false; }
-fn term_read(pane: u32, out: []u8) -> u32 { return 0; }
-fn term_resize(pane: u32, cols: u32, rows: u32) -> bool { return false; }
+/// The UTF-8 bytes of an NSString into out; the count, cut at out.len.
+fn ns_bytes(s: u64, out: []u8) -> usize {
+    const p : u64 = msg0(s, sel("UTF8String"));
+    if (p == 0) { return 0; }
+    var n : u64 = sys_strlen(p);
+    if (n > @as(u64, out.len)) { n = @as(u64, out.len); }
+    sys_peek(out, p, n);
+    return @as(usize, n);
+}
+
+/// Connect to the server under the home directory; the fd, -1 when nothing listens.
+fn term_connect(hb: []u8) -> i32 {
+    const hn : usize = ns_bytes(home_dir(), hb);
+    return client_connect(hb[0 .. hn]);
+}
+
+/// The server pane for chat `cur`: the k-th pane of its agent when the server has one (a reopened
+/// window lands here), else a new pane spawned in `cwd`. PANE_NONE when the server refuses or is gone.
+fn term_open(fd: i32, ss: u64, cur: u32, cwd: u64, out: []u8, db: []u8) -> u32 {
+    const a : u32 = session_agent(ss, cur);
+    const ln : usize = client_list(fd, out);
+    if (ln == 0) { return PANE_NONE; }
+    const have : u32 = tp_pick_pane(out, ln, a, tp_ordinal(ss, cur));
+    if (have != PANE_NONE) { return have; }
+    const dn : usize = ns_bytes(cwd, db);
+    const sn : usize = client_spawn(fd, a, session_space(ss, cur), cur, db[0 .. dn], out);
+    return tp_spawned(out, sn);
+}
 
 /// The offline banner: title, the cwd the pane opened in, the offline note and a prompt.
 fn term_banner(st: []u32, cells: []u32, cwd: u64) -> bool {
@@ -3095,13 +3138,19 @@ pub fn main() -> void {
     var dnow : bool = true;
     var auto_open : bool = true;
     // the terminal pane: the vt grid, the session it shows, offline or live, the server's pane id,
-    // frames since the last key (the cursor stays solid while typing), the bytes in and out
+    // frames since the last key (the cursor stays solid while typing), the bytes in and out, the socket,
+    // the read cursor into the pane's output and frames since the last connect attempt
     var tst : [10]u32 = undefined;
     var tcells : [9600]u32 = undefined;
     vt_init(tst[0..10], tcells[0..9600], TP_COLS_MIN, TP_ROWS_MIN);
     var tkey : [8]u8 = undefined;
     var techo : [8]u8 = undefined;
-    var tread : [4096]u8 = undefined;
+    var tout : [4100]u8 = undefined;
+    var thome : [256]u8 = undefined;
+    var tdir : [512]u8 = undefined;
+    var tfd : i32 = -1;
+    var tcursor : u64 = 0;
+    var ttry : u32 = 0;
     var topen : u32 = PANE_NONE;
     var tlink : u32 = PANE_OFFLINE;
     var tpid : u32 = PANE_NONE;
@@ -3381,7 +3430,7 @@ pub fn main() -> void {
                     const kn : u32 = tp_key_bytes(@as(u32, @intCast(key)), cp, ctrl, tkey[0..8]);
                     if (kn > 0) {
                         if (tlink == PANE_LIVE) {
-                            term_keys(tpid, tkey[0..8], kn);
+                            if (client_keys(tfd, tpid, tkey[0 .. @as(usize, kn)], tout[0..4100]) == 0) { tlink = PANE_OFFLINE; }
                         } else {
                             const en : u32 = tp_echo(tkey[0..8], kn, techo[0..8]);
                             var ei : u32 = 0;
@@ -3507,33 +3556,63 @@ pub fn main() -> void {
         var dlabel : u64 = dk_word(dk, DL_TITLE);
         if (dgo > 0) { dlabel = dk_cat(dk, dk_word(dk, DL_FOOT), dk_int(dk, @as(u64, dgo))); }
         // T. the terminal pane: a Claude Code chat on screen opens it in its space's folder (home when
-        // the space is unbound); a new chat or a new size starts the grid over and spawns again
+        // the space is unbound); a new chat or a new size starts the grid over and replays the pane's
+        // output from the server's ring; an offline pane tries the server again every TP_RETRY frames
         if (screen and cur != SESSION_NONE and opens_pane(session_agent(ss, cur))) {
             const tox : f64 = content_x(ws, collapsed);
             const toy : f64 = WS_TOP + HEADER_H;
             const tw : f64 = sw - tox;
             const th : f64 = sh - toy;
-            if (tp_reset_due(topen, cur) or tp_resize_due(tst[ST_COLS], tst[ST_ROWS], tw, th)) {
-                const tcols : u32 = tp_cols(tw);
-                const trows : u32 = tp_rows(th);
-                vt_init(tst[0..10], tcells[0..9600], tcols, trows);
+            var tgo : bool = tp_reset_due(topen, cur) or tp_resize_due(tst[ST_COLS], tst[ST_ROWS], tw, th);
+            if (tlink == PANE_OFFLINE and topen == cur) {
+                ttry = ttry + 1;
+                if (tp_retry_due(ttry)) {
+                    ttry = 0;
+                    if (tfd < 0) { tfd = term_connect(thome[0..256]); }
+                    if (tfd >= 0) { tgo = true; }
+                }
+            }
+            if (tgo) {
+                vt_init(tst[0..10], tcells[0..9600], tp_cols(tw), tp_rows(th));
+                tcursor = 0;
                 var tcwd : u64 = dk_at(dk, dk[DK_SLOTS], @as(u64, session_space(ss, cur)));
                 if (dk_len(dk, tcwd) == 0) { tcwd = home_dir(); }
-                if (topen == cur and tlink == PANE_LIVE) {
-                    term_resize(tpid, tcols, trows);
-                } else {
+                if (topen != cur or tlink != PANE_LIVE) {
                     tpid = PANE_NONE;
-                    if (term_connect()) { tpid = term_spawn(tcwd, TERM_BIN, tcols, trows); }
+                    if (tfd < 0) { tfd = term_connect(thome[0..256]); }
+                    if (tfd >= 0) { tpid = term_open(tfd, ss, cur, tcwd, tout[0..4100], tdir[0..512]); }
+                    if (tpid != PANE_NONE and client_attach(tfd, tpid, tout[0..4100]) == 0) { tpid = PANE_NONE; }
                     if (tpid == PANE_NONE) { tlink = PANE_OFFLINE; } else { tlink = PANE_LIVE; }
+                    if (tpid == PANE_NONE and tfd >= 0) {
+                        sys_close(tfd);
+                        tfd = -1;
+                    }
                 }
                 if (tlink == PANE_OFFLINE) { term_banner(tst[0..10], tcells[0..9600], tcwd); }
                 topen = cur;
                 tsince = 0;
+                ttry = 0;
             }
             if (tlink == PANE_LIVE) {
-                const got : u32 = term_read(tpid, tread[0..4096]);
-                var gi : u32 = 0;
-                while (gi < got) { vt_feed(tst[0..10], tcells[0..9600], tread[gi]); gi = gi + 1; }
+                var treads : u32 = 0;
+                var tmore : bool = true;
+                while (tmore) {
+                    const rn : usize = client_read(tfd, tpid, tcursor, tout[0..4100]);
+                    if (rn == 0) {
+                        // the server went away: drop the socket; the retry finds it again after a restart
+                        tmore = false;
+                        tlink = PANE_OFFLINE;
+                        sys_close(tfd);
+                        tfd = -1;
+                    } else {
+                        const dn : usize = tp_data_len(tout[0..4100], rn);
+                        if (dn > 0) { tcursor = reply_cursor(tout[0..4100]); }
+                        var gi : usize = 0;
+                        while (gi < dn) { vt_feed(tst[0..10], tcells[0..9600], tout[TP_DATA_AT + gi]); gi = gi + 1; }
+                        treads = treads + 1;
+                        tmore = tp_read_more(dn, treads);
+                    }
+                }
             }
         } else {
             topen = PANE_NONE;

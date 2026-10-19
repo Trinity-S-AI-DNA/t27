@@ -5,13 +5,22 @@
 ; opens a terminal pane in the current space's directory; the pane draws a grid of codepoints, monospace,
 ; black and white, with a cursor, and every key typed in it goes to the agent as bytes.
 ; The grid itself is specs/t27os/vt.t27 (bytes in, cells out). The PTY lives in the T27 OS terminal server
-; and is reached through specs/t27os/pty_client.t27 (connect, spawn, keys, read, resize). Until that client
-; is wired the pane is OFFLINE: it says so on its first lines and echoes what it would send, so the grid,
-; the cursor and the key path can be seen working without a process behind them.
+; and is reached through specs/t27os/pty_client.t27 (connect, list, spawn, keys, read). When no server
+; answers on ~/.t27os/pty.sock the pane is OFFLINE: it says so on its first lines and echoes what it would
+; send, and the window tries to connect again every TP_RETRY frames.
+; The window stores no pane ids. Its k-th chat of an agent is the server's k-th pane of that agent
+; (tp_pick_pane over a LIST reply), so a window that quits and reopens finds the same panes; a chat with no
+; pane yet spawns one. RESIZE is still a stub on the server (t27#10902): panes run at 80x24.
 ; The window keeps one grid. The server keeps every pane's output, so selecting another chat re-initialises
 ; the grid and re-attaches; nothing here is the store of a session's history.
 
 module T27osTermPane;
+
+use t27os::pty_proto::HEADER;
+use t27os::pty_proto::RE_OK;
+use t27os::pty_proto::RE_DATA;
+use t27os::pty_proto::RE_LISTING;
+use t27os::windows::session_agent;
 
 /// The agent whose rows open a terminal pane: AGENT 0, Claude Code (agents.t27 AGENT_NAMES order).
 pub const TERM_AGENT : u32 = 0;
@@ -45,12 +54,19 @@ pub const PANE_LIVE : u32 = 1;
 pub const PANE_EXITED : u32 = 2;
 /// No pane open.
 pub const PANE_NONE : u32 = 999;
+/// Frames between connect attempts while the pane is OFFLINE (30 fps: three seconds).
+pub const TP_RETRY : u32 = 90;
+/// READ round trips a frame makes at most. Each brings up to 4096 bytes, so a fresh grid replays the
+/// server's whole 64 KiB ring in one frame and a busy pane never stalls the window for longer.
+pub const TP_READS_MAX : u32 = 16;
+/// Where the output bytes start in a RE_DATA reply: after the header and the 8-byte cursor.
+pub const TP_DATA_AT : usize = 12;
 
 /// The lines an OFFLINE pane prints first; the host writes the directory after TP_LINE_CWD, and the echo
 /// starts after TP_PROMPT.
 pub const TP_LINE_TITLE : str = "T27 OS terminal -- Claude Code";
 pub const TP_LINE_CWD : str = "cwd ";
-pub const TP_LINE_OFFLINE : str = "offline: the t27os pty server is not wired yet (pty_client.t27); keys echo here";
+pub const TP_LINE_OFFLINE : str = "offline: no t27os pty server on ~/.t27os/pty.sock; keys echo here";
 pub const TP_PROMPT : str = "> ";
 /// The directory buffer the host fills for TP_LINE_CWD.
 pub const TP_PATH_MAX : u32 = 512;
@@ -216,6 +232,57 @@ pub fn tp_echo(sent: []const u8, n: u32, out: []u8) -> u32 {
     return n;
 }
 
+/// The k-th pane running `agent` in a LIST reply (`len` bytes of frame: the header, then pane, agent,
+/// state and flags per entry); PANE_NONE when the server has fewer, or the frame is not a listing.
+pub fn tp_pick_pane(frame: []const u8, len: usize, agent: u32, k: u32) -> u32 {
+    if (len < HEADER or frame[0] != RE_LISTING) { return PANE_NONE; }
+    var seen : u32 = 0;
+    var found : u32 = PANE_NONE;
+    var at : usize = HEADER;
+    while (at + 4 <= len and found == PANE_NONE) {
+        if (@as(u32, frame[at + 1]) == agent) {
+            if (seen == k) { found = @as(u32, frame[at]); }
+            seen = seen + 1;
+        }
+        at = at + 4;
+    }
+    return found;
+}
+
+/// Which of the window's chats of its own agent chat `cur` is: 0 for the first, 1 for the second, ...
+pub fn tp_ordinal(ss: u64, cur: u32) -> u32 {
+    const a : u32 = session_agent(ss, cur);
+    var k : u32 = 0;
+    var i : u32 = 0;
+    while (i < cur) {
+        if (session_agent(ss, i) == a) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// The pane a SPAWN reply names, PANE_NONE when the server refused.
+pub fn tp_spawned(frame: []const u8, len: usize) -> u32 {
+    if (len < HEADER or frame[0] != RE_OK) { return PANE_NONE; }
+    return @as(u32, frame[1]);
+}
+
+/// How many output bytes a READ reply carries (from TP_DATA_AT); 0 for anything but RE_DATA.
+pub fn tp_data_len(frame: []const u8, len: usize) -> usize {
+    if (len < TP_DATA_AT or frame[0] != RE_DATA) { return 0; }
+    return len - TP_DATA_AT;
+}
+
+/// Another READ this frame? Only while the last one came back full and the budget lasts.
+pub fn tp_read_more(got: usize, reads: u32) -> bool {
+    return got == 4096 and reads < TP_READS_MAX;
+}
+
+/// Try to connect this frame? At once on a fresh pane, then every TP_RETRY frames while offline.
+pub fn tp_retry_due(since_try: u32) -> bool {
+    return since_try >= TP_RETRY;
+}
+
 test claude_code_rows_open_a_pane {
     assert opens_pane(0);
     assert opens_pane(1) == false;
@@ -288,6 +355,49 @@ test offline_echo_reads_like_a_line {
     assert tp_echo(s[0..8], 1, o[0..8]) == 3 and o[0] == 8 and o[1] == 32 and o[2] == 8;
     s[0] = 104;
     assert tp_echo(s[0..8], 1, o[0..8]) == 1 and o[0] == 104;
+}
+
+test a_reopened_window_finds_its_panes {
+    // LIST reply: header, then panes 3 (claude), 5 (codex), 7 (claude)
+    var f : [16]u8 = undefined;
+    f[0] = RE_LISTING; f[1] = 0; f[2] = 12; f[3] = 0;
+    f[4] = 3; f[5] = 0; f[6] = 1; f[7] = 1;
+    f[8] = 5; f[9] = 1; f[10] = 1; f[11] = 1;
+    f[12] = 7; f[13] = 0; f[14] = 1; f[15] = 1;
+    assert tp_pick_pane(f[0..16], 16, 0, 0) == 3;
+    assert tp_pick_pane(f[0..16], 16, 0, 1) == 7;
+    assert tp_pick_pane(f[0..16], 16, 0, 2) == PANE_NONE;
+    assert tp_pick_pane(f[0..16], 16, 1, 0) == 5;
+    assert tp_pick_pane(f[0..16], 4, 0, 0) == PANE_NONE;
+    f[0] = RE_OK;
+    assert tp_pick_pane(f[0..16], 16, 0, 0) == PANE_NONE;
+    // chats: claude in space 0, codex in space 0, claude in space 1 (slot byte = agent * 8 + space + 1)
+    const ss : u64 = 1 + 9 * 256 + 2 * 65536;
+    assert tp_ordinal(ss, 0) == 0;
+    assert tp_ordinal(ss, 1) == 0;
+    assert tp_ordinal(ss, 2) == 1;
+}
+
+test replies_read_as_pane_and_bytes {
+    var f : [20]u8 = undefined;
+    f[0] = RE_OK; f[1] = 6; f[2] = 0; f[3] = 0;
+    assert tp_spawned(f[0..20], 4) == 6;
+    assert tp_spawned(f[0..20], 3) == PANE_NONE;
+    f[0] = RE_DATA;
+    assert tp_spawned(f[0..20], 4) == PANE_NONE;
+    assert TP_DATA_AT == HEADER + 8;
+    assert tp_data_len(f[0..20], 20) == 8;
+    assert tp_data_len(f[0..20], 12) == 0;
+    assert tp_data_len(f[0..20], 11) == 0;
+    f[0] = RE_OK;
+    assert tp_data_len(f[0..20], 20) == 0;
+    assert tp_read_more(4096, 1);
+    assert tp_read_more(4096, TP_READS_MAX) == false;
+    assert tp_read_more(100, 1) == false;
+    assert tp_retry_due(0) == false;
+    assert tp_retry_due(TP_RETRY);
+    // the whole ring replays in one frame's budget
+    assert @as(u64, TP_READS_MAX) * 4096 >= 65536;
 }
 
 invariant grid_buffer_holds_the_largest_pane {
