@@ -36,7 +36,8 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 
 ## The T27F check in every `.t27` repository (#10268)
 
-Every 10 minutes the `claw-t27f` job of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
+On each run (the cron is `*/10`, but GitHub runs it best effort, see "How often it runs" below) the `claw-t27f` job
+of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
 is installed on, and for each open pull request that touches `.t27` posts one `claw/t27f`
 check-run on its head commit: the changed specs and their direct importers, each judged by
 `t27c seal --verify` from the signed t27o-v0.1.0 release. The law is `specs/claw/t27f_gate.t27`:
@@ -77,8 +78,8 @@ permission `pull_requests: write`; without them the job posts nothing and says s
 
 ## The merge lane (#10973)
 
-The `claw-merge` job of `gate-topology.yml` runs on every push to master, on the 10-minute schedule and on
-dispatch. It lists the open pull requests once, feeds `gen/c/claw/merge_judge.c` (`specs/claw/merge_judge.t27`),
+The `claw-merge` job of `gate-topology.yml` runs on every push to master, on the best-effort `*/10` schedule and on
+dispatch (cadence: see "How often it runs" below). It lists the open pull requests once, feeds `gen/c/claw/merge_judge.c` (`specs/claw/merge_judge.t27`),
 and applies what the spec prints: `G` lines merge (squash, pinned to the judged head sha, so GitHub refuses it if
 the head moved), every other line is a reason in the step summary. After a push it also runs `refresh.t27` as the
 former `claw-refresh` job did, skipping a pull request it merged in the same run. Strictness is required + inherited:
@@ -94,6 +95,14 @@ check inherited from master by `red_origin.t27` (claw-sarif is, by definition, u
   reviewer bee. Drafts and pull requests labelled `no-auto-merge` are held; a conflict is listed, never resolved.
 - Honest limits are in the header of the spec: the lane reads whether a failing log names a file the PR changes, not
   the failure set; reviews are not read; two pull requests merged in one run were each green alone.
+
+### How often it runs
+
+The cron in `gate-topology.yml` is `*/10 * * * *`, and GitHub runs scheduled workflows best effort. Measured on
+master (Actions API, `event=schedule`, #11132): the last 8 scheduled runs, 2026-10-18 12:11Z to 2026-10-19 13:50Z,
+were 2.1 to 7.5 hours apart. The dependable triggers are a push to master (any merge starts the lane) and
+`workflow_dispatch`. A repository that merges nothing for hours can leave this lane idle for hours; a faster
+heartbeat would be an external dispatch and is a separate decision.
 
 ## The inventory spec and how to regenerate it
 

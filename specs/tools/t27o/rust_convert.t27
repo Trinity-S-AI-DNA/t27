@@ -51,7 +51,8 @@
 ;    a `s.split(SEP).map(F).collect::<Vec<_>>().join(J)` chain handed back (a byte loop over the text
 ;    calling the named F on each piece), and the local handed back (`return t27o_w`). Anything else
 ;    that reads the String refuses, naming the read -- a call outside the form, an argument to it, any
-;    other use of the local.
+;    other use of the local. A call of a fn in this form refuses too (R_STRCALL, #11111): the source calls
+;    it without the buffer, and the caller would own one of no stated length.
 ;    The Vec out-buffer form (#11073): a fn whose result is `Vec<T>`, T an integer, float or bool type, and whose body
 ;    makes the Vec as one local (`Vec::new()`, `Vec::with_capacity(n)` or `vec![]`), changes it only by `push(e)` and
 ;    `extend_from_slice(s)`, and hands it back (`return v`, the tail `v`, or an empty Vec in an early return), takes a
@@ -70,7 +71,11 @@
 ;    file and self of one, arrays and slices of scalars as typed locals of the test); a direct text or
 ;    integer parameter is also sampled with the literals its fn body compares against -- every string
 ;    literal alone and wrapped in one space, every integer one below, at it, one above (#9102) -- so a
-;    match arm is reached and not only the default one; a result is a
+;    match arm is reached and not only the default one; a fn with two or more direct texts (a haystack and a
+;    needle) also takes a text, a text inside it and the first text again right after the fixed samples
+;    (parameter i takes sample j + i, so one call has the needle inside the haystack and the next the haystack
+;    second), and each of its literals comes alone, wrapped, alone, so the wrapped one is next to it in both
+;    orders (#11113: every count regex_lite_global recorded was 0); a result is a
 ;    scalar, a text, an owned String (the out-buffer form: its bytes into a 256-byte buffer the test
 ;    owns, the written length its result, checked with type_text::same on the written slice), a Vec of
 ;    integers, floats or bools (the Vec out-buffer form: the count it returns is the Vec's length and every
@@ -108,6 +113,9 @@
 ; Vec / Box and other heap types, a `?` inside an expression (only `let x = e?;` and `e?;`), tuples, enum
 ; variants with data, labels, &mut of a scalar, `mut self`, unsafe, and if / match / blocks used as a
 ; value without a type annotation.
+; A method of a refused type is refused with it, and the refusal names the impl type, at the line of the receiver, not
+; `self` or `Self`: the name a refusal of the file's own struct or enum line has, so a reader or the sweep can follow
+; the cascade to its reason (#11128).
 ; --
 ; The caller passes the source, an output buffer and a state vector: STATE slots, the index slots (IXHIT ..
 ; IXTOP), then the name table (NAME_SLOTS a name, as many as fit; the declaration index takes the top of
@@ -204,6 +212,9 @@ pub const CFB : usize = 49;
 pub const CCNT : usize = 50;
 /// The most samples one parameter holds: its fixed ones plus the body-derived ones (FR-003 of #9102).
 pub const DCAP : usize = 64;
+/// The pair samples of a text parameter of a fn with two or more texts: a text, a text inside it, the first text again
+/// (see derived_at). A derived sample in the DCSP slot reads 2 for them, and DVAL is which.
+pub const PAIR_N : usize = 3;
 /// The line cache of line_at: the position of the last line asked for, and the newlines before it.
 pub const LNPOS : usize = 51;
 pub const LNNL : usize = 52;
@@ -219,7 +230,10 @@ pub const IXON : usize = 55;
 pub const IXB : usize = 56;
 pub const IXBN : usize = 57;
 pub const IXTOP : usize = 58;
-pub const NAMES : usize = 59;
+/// How many parameters of the fn vectors is sampling are direct texts (#11113): two or more and the texts that make a
+/// needle sit inside a haystack come after the fixed samples of each of them. vectors sets it and clears it.
+pub const PAIRS : usize = 59;
+pub const NAMES : usize = 60;
 pub const NAME_SLOTS : usize = 5;
 
 pub const F_NONE : usize = 0;
@@ -370,6 +384,9 @@ pub const R_TYPENAME : usize = 42;
 /// and handed back as it is. And a call of a fn that is in that form: the caller would own an unbounded buffer.
 pub const R_VECOUT : usize = 44;
 pub const R_VECCALL : usize = 45;
+/// A call of a fn that is in the String out-buffer form (#11111): it takes the caller's buffer as a last `out: []u8`, and the
+/// call the Rust source writes has no such argument, so the caller would own a buffer of no stated length.
+pub const R_STRCALL : usize = 46;
 /// A float literal bound to a `var` with no type: t27c writes a `var` of comptime_float, which Zig rejects, and
 /// the source leaves f32 or f64 to inference.
 pub const R_FLOATLIT : usize = 43;
@@ -1334,12 +1351,14 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
     if (st[ILO] != st[IHI] and st[ERR] == 0 and !declared_type(src, st, st[ILO], st[IHI])) { refuse(st, R_UNDECL, st[ILO], st[ILO], st[IHI]); }
     // a member that takes `self` still belongs to the type that is not in the output: its t27
     // form would carry a parameter of the missing type. The acceptance here is the self-less
-    // associated fn, which names neither the type nor a field of it.
+    // associated fn, which names neither the type nor a field of it. The refusal names the impl type, the
+    // thing the fn depends on, at the line of the receiver: `self` is no name any refusal of the file has, so
+    // the sweep could not follow it to the type's own reason (#11128).
     if (self_bad) {
         var sq : usize = lo;
         while (sq < hi and st[ERR] == 0) {
             const se : usize = tok_end(src, sq);
-            if (word_is(src, sq, se, "self")) { refuse(st, R_DEPENDS, sq, sq, se); }
+            if (word_is(src, sq, se, "self")) { refuse(st, R_DEPENDS, sq, st[ILO], st[IHI]); }
             sq = skip_ws(src, se);
         }
     }
@@ -1370,15 +1389,18 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
                         hit = same_text(src, st[s + 2], st[s + 3], p1, tok_end(src, p1)) or tok_is(src, p1, "Self");
                     }
                     if (kind == K_ITEM or kind == K_EXT) { hit = !after_dot and !after_path and !after_fn and !tok_is(src, nx, ":"); }
-                    // a fn in the Vec out-buffer form (#11073): a free fn is hit by a call, a method as K_MEMBER is
-                    if (kind == K_VECFN and st[s + 2] == st[s + 3]) { hit = call and !after_dot and !after_path and !after_fn; }
-                    if (kind == K_VECFN and st[s + 2] != st[s + 3] and after_dot and call) { hit = true; }
-                    if (kind == K_VECFN and st[s + 2] != st[s + 3] and after_path and p1 < src.len) {
+                    // a fn in an out-buffer form, the Vec one (#11073) or the String one (#11111): a free fn is hit by a call, a
+                    // method as K_MEMBER is. Its caller would call it without the buffer, so it is refused, naming the form.
+                    const outfn : bool = kind == K_VECFN or kind == K_STRFN;
+                    if (outfn and st[s + 2] == st[s + 3]) { hit = call and !after_dot and !after_path and !after_fn; }
+                    if (outfn and st[s + 2] != st[s + 3] and after_dot and call) { hit = true; }
+                    if (outfn and st[s + 2] != st[s + 3] and after_path and p1 < src.len) {
                         hit = same_text(src, st[s + 2], st[s + 3], p1, tok_end(src, p1)) or tok_is(src, p1, "Self");
                     }
                     if (hit and kind == K_EXT) { refuse(st, R_EXTERNAL, q, q, e); }
                     if (hit and kind == K_VECFN) { refuse(st, R_VECCALL, q, q, e); }
-                    if (hit and kind != K_EXT and kind != K_VECFN) { refuse(st, R_DEPENDS, q, q, e); }
+                    if (hit and kind == K_STRFN) { refuse(st, R_STRCALL, q, q, e); }
+                    if (hit and kind != K_EXT and !outfn) { refuse(st, R_DEPENDS, q, q, e); }
                 }
                 k = k + 1;
             }
@@ -1389,7 +1411,7 @@ pub fn deps(src: []const u8, st: []usize, lo: usize, hi: usize) -> void {
                 const c1 : usize = skip_ws(src, e);
                 const c2 : usize = skip_ws(src, tok_end(src, c1));
                 const self_call : bool = tok_is(src, c1, "::") and c2 < src.len and is_alpha(src[c2]) and !is_upper(src[c2]) and tok_is(src, skip_ws(src, tok_end(src, c2)), "(") and declared_fn(src, st, c2, tok_end(src, c2));
-                if (!self_call) { refuse(st, R_DEPENDS, q, q, e); }
+                if (!self_call) { refuse(st, R_DEPENDS, q, st[ILO], st[IHI]); }
             }
             if (st[ERR] == 0 and call and !after_dot and !after_path and !after_fn and !is_upper(src[q]) and !call_keyword(src, q, e) and !declared_fn(src, st, q, e)) {
                 refuse(st, R_UNDECL, q, q, e);
@@ -6954,6 +6976,8 @@ pub fn put_reason(src: []const u8, st: []usize, out: []u8) -> void {
         puts(st, out, "a Vec result that is not one local built only by push / extend_from_slice and returned as it is (the out-buffer form holds no read of it, no other change, no second Vec: a list that grows without a bound the caller states has no t27 form)");
     } else if (c == R_VECCALL) {
         puts(st, out, "a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own)");
+    } else if (c == R_STRCALL) {
+        puts(st, out, "a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length)");
     } else if (c == R_SPLICE) {
         puts(st, out, "a used module t27c cannot splice beside type_text (its own use stays unresolved, or its same clashes with type_text's, the gap specs/compiler/int_type_names.t27 records)");
     } else {
@@ -7581,6 +7605,28 @@ pub fn num_value(src: []const u8, q: usize, te: usize) -> usize {
     return v;
 }
 
+/// Is `kind` a text the oracle samples with strings: &str, a byte slice, an owned or borrowed String?
+pub fn is_text_kind(kind: usize) -> bool {
+    return kind == V_STR or kind == V_BYTES or kind == V_STRING or kind == V_RSTRING;
+}
+
+/// How many of the five parameter kinds are texts (the unused ones are V_NONE).
+pub fn text_count(k0: usize, k1: usize, k2: usize, k3: usize, k4: usize) -> usize {
+    var n : usize = 0;
+    if (is_text_kind(k0)) { n = n + 1; }
+    if (is_text_kind(k1)) { n = n + 1; }
+    if (is_text_kind(k2)) { n = n + 1; }
+    if (is_text_kind(k3)) { n = n + 1; }
+    if (is_text_kind(k4)) { n = n + 1; }
+    return n;
+}
+
+/// Write pair sample `k` (the DVAL of a derived sample whose DCSP is 2): the haystack `abcabc` for 0 and 2, the needle
+/// `abc` for 1. The needle is at the start of the haystack and again at its end.
+pub fn put_pair_sample(st: []usize, out: []u8, k: usize) -> void {
+    if (k == 1) { puts(st, out, "abc"); } else { puts(st, out, "abcabc"); }
+}
+
 /// Derived sample `d` of a text or integer parameter whose type is src[tq], read from the fn body
 /// st[FBLO .. FBHI] (#9102): every string literal of the body twice -- alone, and wrapped in one
 /// space -- plus every byte and char literal once as a one-byte text; every integer literal (a `-`
@@ -7590,13 +7636,25 @@ pub fn num_value(src: []const u8, q: usize, te: usize) -> usize {
 /// next to it. The sample found: a text src[DCLA .. DCLB), wrapped when st[DCSP] is 1; an integer of
 /// magnitude st[DVAL], negative when st[DNEG] is 1. False when `d` is past the last sample. A plain
 /// left-to-right token walk: deterministic, no clock, no randomness.
+/// A fn with two or more direct texts (st[PAIRS], a haystack and a needle) meets a match only when one text is inside the
+/// other, and parameter i takes sample j + i, so its first PAIR_N derived samples are fixed texts, a text, a text inside it
+/// and the first text again (st[DCSP] is 2 and st[DVAL] which one, see put_pair_sample): the next call has the needle inside the
+/// haystack, the one after it the haystack second, and a count or an offset the fn records is not 0 for every sample
+/// (#11113). Each literal of the body then comes alone, wrapped, alone, so its wrapped sample is next to it in both orders.
 pub fn derived_at(src: []const u8, st: []usize, kind: usize, tq: usize, d: usize) -> bool {
     st[DCSP] = 0;
     st[DNEG] = 0;
     if (st[FBLO] >= st[FBHI]) { return false; }
-    const text : bool = kind == V_STR or kind == V_BYTES or kind == V_STRING or kind == V_RSTRING;
+    const text : bool = is_text_kind(kind);
     const ints : bool = kind == V_UNSIGNED or kind == V_SIGNED;
     if (!text and !ints) { return false; }
+    var c : usize = 0;
+    var per : usize = 2;
+    if (text and st[PAIRS] >= 2) {
+        if (d < PAIR_N) { st[DCSP] = 2; st[DVAL] = d; return true; }
+        c = PAIR_N;
+        per = 3;
+    }
     var w : usize = 0;
     var sg : bool = false;
     if (ints) {
@@ -7604,7 +7662,6 @@ pub fn derived_at(src: []const u8, st: []usize, kind: usize, tq: usize, d: usize
         sg = int_type_signed(src, tq);
         if (w == 0) { return false; }
     }
-    var c : usize = 0;
     var q : usize = st[FBLO];
     var neg : bool = false;
     while (q < st[FBHI]) {
@@ -7619,10 +7676,8 @@ pub fn derived_at(src: []const u8, st: []usize, kind: usize, tq: usize, d: usize
             }
         }
         if (text and src[q] == B_QUOTE and clean_text(src, q + 1, te - 1)) {
-            if (c == d) { st[DCLA] = q + 1; st[DCLB] = te - 1; st[DCSP] = 0; return true; }
-            c = c + 1;
-            if (c == d) { st[DCLA] = q + 1; st[DCLB] = te - 1; st[DCSP] = 1; return true; }
-            c = c + 1;
+            if (d >= c and d < c + per) { st[DCLA] = q + 1; st[DCLB] = te - 1; st[DCSP] = (d - c) % 2; return true; }
+            c = c + per;
         }
         // a byte string b"..." and a raw string r"..." / r#"..."#: one token, its content between
         // the quotes (the hashes of the raw one are not content)
@@ -7630,10 +7685,8 @@ pub fn derived_at(src: []const u8, st: []usize, kind: usize, tq: usize, d: usize
             var h : usize = 0;
             while (src[q] == B_LOWER_R and q + 1 + h < te and src[q + 1 + h] == B_HASH) { h = h + 1; }
             if (clean_text(src, q + 2 + h, te - 1 - h)) {
-                if (c == d) { st[DCLA] = q + 2 + h; st[DCLB] = te - 1 - h; st[DCSP] = 0; return true; }
-                c = c + 1;
-                if (c == d) { st[DCLA] = q + 2 + h; st[DCLB] = te - 1 - h; st[DCSP] = 1; return true; }
-                c = c + 1;
+                if (d >= c and d < c + per) { st[DCLA] = q + 2 + h; st[DCLB] = te - 1 - h; st[DCSP] = (d - c) % 2; return true; }
+                c = c + per;
             }
         }
         // a one-byte byte literal b'x' or char literal 'x' (a lifetime is a word, not three bytes)
@@ -7834,6 +7887,11 @@ pub fn put_value(src: []const u8, st: []usize, out: []u8, kind: usize, tq: usize
     if (kind == V_BYTES and rust) { puts(st, out, "b"); }
     put_quote(st, out, rust);
     if (k >= base and derived_at(src, st, kind, tq, k - base)) {
+        if (st[DCSP] == 2) {
+            put_pair_sample(st, out, st[DVAL]);
+            put_quote(st, out, rust);
+            return;
+        }
         if (st[DCSP] == 1) { puts(st, out, " "); }
         put_src(src, st, out, st[DCLA], st[DCLB]);
         if (st[DCSP] == 1) { puts(st, out, " "); }
@@ -8325,6 +8383,7 @@ pub fn vectors(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, pn
             st[FBHI] = be - 1;
         }
     }
+    st[PAIRS] = text_count(k0, k1, k2, k3, k4);
     var nv : usize = 1;
     if (n > 0) { nv = slen(src, st, k0, t0); }
     if (n > 1 and slen(src, st, k1, t1) > nv) { nv = slen(src, st, k1, t1); }
@@ -8408,6 +8467,7 @@ pub fn vectors(src: []const u8, st: []usize, out: []u8, na: usize, nb: usize, pn
     }
     put_src(src, st, out, na, nb);
     puts(st, out, " {{\"); for l in &v { println!(\"{}\", l); } println!(\"}}\\n\"); }\n    }\n");
+    st[PAIRS] = 0;
 }
 
 /// Does the fn whose parameters open at src[pn] return exactly an owned String (`-> String {`)?
@@ -10878,7 +10938,7 @@ test a_selfless_member_of_a_refused_impl_type_converts {
     var out : [2048]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
     const n : usize = body("struct Gen { code: Vec<u8> }\nimpl Gen {\n    fn is_bin(op: &str) -> bool { matches!(op, \"+\" | \"-\") }\n    fn wide(w: u32, op: &str) -> u32 { if w > 8 { w } else if Self::is_bin(op) { 1 } else { 0 } }\n    fn same(a: &Self, b: u8) -> bool { b > 0 }\n}", &out, &st);
-    assert(out_is(n, &out, 0, "use tri::t27b::type_text;\n\n// t27o: refused struct Gen (line 1): type `Vec` at line 1\n\nfn Gen_is_bin(op: []const u8) -> bool {\n    return (type_text::same(op, \"+\") or type_text::same(op, \"-\"));\n}\n\nfn Gen_wide(w: u32, op: []const u8) -> u32 {\n    if (w > 8) {\n        return w;\n    } else if (Gen_is_bin(op)) {\n        return 1;\n    } else {\n        return 0;\n    }\n}\n\n// t27o: refused fn same (line 5): uses refused `Self` at line 5\n\n"));
+    assert(out_is(n, &out, 0, "use tri::t27b::type_text;\n\n// t27o: refused struct Gen (line 1): type `Vec` at line 1\n\nfn Gen_is_bin(op: []const u8) -> bool {\n    return (type_text::same(op, \"+\") or type_text::same(op, \"-\"));\n}\n\nfn Gen_wide(w: u32, op: []const u8) -> u32 {\n    if (w > 8) {\n        return w;\n    } else if (Gen_is_bin(op)) {\n        return 1;\n    } else {\n        return 0;\n    }\n}\n\n// t27o: refused fn same (line 5): uses refused `Gen` at line 5\n\n"));
     assert(st[NOK] == 2);
 }
 
@@ -11072,7 +11132,7 @@ test a_call_of_an_out_buffer_fn_is_refused_because_the_caller_would_own_the_buff
     var out : [4096]u8 = undefined;
     var st : [1024]usize = [0] ** 1024;
     // A caller would need a buffer of a length nobody stated, so it is refused with a reason that names the call, in whichever
-    // order the file declares them. (The String form leaves its callers to call it without the buffer: #11073 notes it.)
+    // order the file declares them. (The String form refuses its callers the same way: R_STRCALL, #11111.)
     const n : usize = body("fn evens(n: u32) -> Vec<u32> { let mut v = Vec::new(); v.push(n); v }\nfn total(n: u32) -> usize { evens(n).len() }\nfn first(n: u32) -> u32 { let e = evens(n); e[0] }\nfn fine(n: u32) -> u32 { n + 1 }\n", &out, &st);
     assert(out_text_has(&out, n, "fn evens(n: u32, out: []u32) -> usize {"));
     assert(out_text_has(&out, n, "// t27o: refused fn total (line 2): a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own) `evens` at line 2\n"));
@@ -11089,6 +11149,49 @@ test a_call_of_an_out_buffer_method_is_refused_by_method_and_by_path {
     assert(out_text_has(&out, n, "// t27o: refused fn n (line 4): a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own) `bytes` at line 4\n"));
     assert(out_text_has(&out, n, "// t27o: refused fn user (line 7): a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own) `bytes` at line 7\n"));
     assert(out_text_has(&out, n, "fn S_twice(self: S) -> u8 {"));
+}
+
+test a_call_of_an_out_buffer_string_fn_is_refused_because_the_caller_would_own_the_buffer {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // The out-buffer String form takes the caller's buffer as a last `out: []u8` and returns the byte count. A caller that
+    // reads the String would call it without that argument -- `tag(n).len`, `const t = tag(n);` -- which t27c rejects, or reads
+    // another meaning (#11111). So it is refused with a reason that names the form, in whichever order the file declares the
+    // two, and the buffer is not guessed. A fn that is not in the form is called as before.
+    const n : usize = body("fn width(n: u32) -> usize { tag(n).len() }\nfn tag(n: u32) -> String { format!(\"<{}>\", n) }\nfn show(n: u32) -> String { let t = tag(n); t }\nfn plain(n: u32) -> u32 { n + 1 }\nfn user(n: u32) -> u32 { plain(n) + 1 }\n", &out, &st);
+    assert(out_text_has(&out, n, "fn tag(n: u32, out: []u8) -> usize {"));
+    assert(out_text_has(&out, n, "// t27o: refused fn width (line 1): a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length) `tag` at line 1\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn show (line 3): a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length) `tag` at line 3\n"));
+    assert(out_text_has(&out, n, "fn user(n: u32) -> u32 {\n    return plain(n) + 1;\n}"));
+    assert(!out_text_has(&out, n, "tag(n).len"));
+    assert(!out_text_has(&out, n, "const t = tag(n)"));
+    assert(!out_text_has(&out, n, "tag(n);"));
+}
+
+test a_call_of_an_out_buffer_string_method_is_refused_by_method_and_by_path {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // The same for a method, called as `x.label(k)` or `S::label(x, k)`; a method of the same impl that is not in the form is
+    // converted.
+    const n : usize = body("struct S { a: u32 }\nimpl S {\n    fn label(&self, k: u32) -> String { format!(\"s{}\", k) }\n    fn n(&self) -> usize { self.label(1).len() }\n    fn twice(&self) -> u32 { self.a + self.a }\n}\nfn user(s: &S) -> usize { S::label(s, 2).len() }\n", &out, &st);
+    assert(out_text_has(&out, n, "fn S_label(self_: S, k: u32, out: []u8) -> usize {"));
+    assert(out_text_has(&out, n, "// t27o: refused fn n (line 4): a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length) `label` at line 4\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn user (line 7): a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length) `label` at line 7\n"));
+    assert(out_text_has(&out, n, "fn S_twice(self: S) -> u32 {"));
+    assert(!out_text_has(&out, n, "S_label(self, 1)"));
+    assert(!out_text_has(&out, n, "S_label(s, 2)"));
+}
+
+test negative_control_a_caller_of_a_string_fn_outside_the_out_buffer_form_keeps_its_old_reason {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // mk reads its String, so it is not in the form (an owned String outside it): its caller is refused as a user of a refused fn,
+    // not as the caller of an out buffer. The split chain, which names the fn it calls on each piece without calling it,
+    // converts.
+    const n : usize = body("fn mk(x: u32) -> String { let mut s = String::new(); s.push_str(\"x=\"); s.push_str(&x.to_string()); s }\nfn use_mk(x: u32) -> usize { mk(x).len() }\nfn zig_ident(name: &str) -> String { if name.contains(\"::\") { return name.split(\"::\").map(zig_ident).collect::<Vec<_>>().join(\".\"); } name.to_string() }\n", &out, &st);
+    assert(out_text_has(&out, n, "// t27o: refused fn use_mk (line 2): uses refused `mk` at line 2\n"));
+    assert(!out_text_has(&out, n, "out buffer"));
+    assert(out_text_has(&out, n, "fn zig_ident(name: []const u8, out: []u8) -> usize {"));
 }
 
 test the_oracle_records_the_written_prefix_of_a_vec_result_in_a_full_buffer_and_in_none {
@@ -11443,6 +11546,125 @@ test byte_and_char_literals_are_one_byte_texts {
     assert(slen(src, &st, V_BYTES, 0) == 8);
 }
 
+test the_oracle_of_a_fn_with_two_texts_samples_a_needle_inside_a_haystack_in_both_orders {
+    var out : [40000]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // A fn that takes a haystack and a needle as text (regex_lite_global of trios-phd) was called only with pairs in which the
+    // needle is not inside the haystack, so every count it recorded was 0 (#11113). Parameter i takes sample j + i, so the
+    // texts that follow the fixed ones are a text, a text inside it, and the first text again: the next call has the needle
+    // inside the haystack, the one after it the haystack second, the two orders a fn can take its texts in. "abc" occurs twice in
+    // "abcabc" (at 0 and at 3), the second time right at its end.
+    const n : usize = oracle("fn find_all(s: &str, needle: &str) -> Vec<usize> {\n    let mut out = Vec::new();\n    let mut i = 0usize;\n    while let Some(p) = s[i..].find(needle) {\n        out.push(i + p);\n        i = i + p + needle.len();\n    }\n    out\n}", &out, &st);
+    assert(out_text_has(&out, n, "t27o_guard::guard(|| find_all(\"-7\", \"abcabc\"))"));
+    assert(out_text_has(&out, n, "t27o_guard::guard(|| find_all(\"abcabc\", \"abc\"))"));
+    assert(out_text_has(&out, n, "t27o_guard::guard(|| find_all(\"abc\", \"abcabc\"))"));
+    // the fixed samples are still there, and the empty needle (which the guard skips) is the last call
+    assert(out_text_has(&out, n, "t27o_guard::guard(|| find_all(\"\", \"a\"))"));
+    assert(out_text_has(&out, n, "t27o_guard::guard(|| find_all(\"abcabc\", \"\"))"));
+    assert(out_text_has(&out, n, "let c = \"find_all(\\\"abcabc\\\", \\\"abc\\\", t27o_o8[0 .. 256])\";"));
+    // vectors clears the count of texts it set
+    assert(st[PAIRS] == 0);
+    // String and &String are texts too, bytes the same with b"..."
+    const m : usize = oracle("fn two(a: &String, b: String) -> usize { a.len() + b.len() }\nfn bytes(a: &[u8], b: &[u8]) -> usize { a.len() + b.len() }", &out, &st);
+    assert(out_text_has(&out, m, "catch_unwind(|| two(&String::from(\"abcabc\"), String::from(\"abc\")))"));
+    assert(out_text_has(&out, m, "catch_unwind(|| bytes(b\"abcabc\", b\"abc\"))"));
+}
+
+test negative_control_a_fn_with_one_text_gets_no_pair_samples_and_the_fixed_ones_stay {
+    var out : [40000]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // One text, or a text and a number, has no needle and no haystack to pair: the samples are the fixed eight, the body's
+    // literals, and nothing else.
+    const n : usize = oracle("fn one_text(s: &str) -> usize { s.len() }\nfn text_and_int(s: &str, k: usize) -> usize { s.len() + k }\nfn text_and_bool(s: &str, b: bool) -> bool { s.is_empty() && b }", &out, &st);
+    assert(!out_text_has(&out, n, "abcabc"));
+    assert(out_text_has(&out, n, "catch_unwind(|| one_text(\"-7\"))"));
+    assert(!out_text_has(&out, n, "one_text(\"abc\") "));
+    assert(out_text_has(&out, n, "catch_unwind(|| text_and_int(\"a b\", 0))"));
+    assert(out_text_has(&out, n, "catch_unwind(|| text_and_bool(\"-7\", false))"));
+}
+
+test a_literal_of_a_fn_with_two_texts_is_sampled_alone_and_inside_a_sample_in_both_orders {
+    var out : [40000]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // Each string literal of the body is a sample alone and a sample that contains it (wrapped in one space); with two texts
+    // the literal comes again after the wrapped one, so the next call has the wrapped text first and the literal second, as
+    // the one before it has the literal first (#11113).
+    const n : usize = oracle("fn has_either(s: &str, t: &str) -> bool { s.contains(\"foo\") || t == \"bar\" }", &out, &st);
+    assert(out_text_has(&out, n, "catch_unwind(|| has_either(\"foo\", \" foo \"))"));
+    assert(out_text_has(&out, n, "catch_unwind(|| has_either(\" foo \", \"foo\"))"));
+    assert(out_text_has(&out, n, "catch_unwind(|| has_either(\"foo\", \"bar\"))"));
+    assert(out_text_has(&out, n, "catch_unwind(|| has_either(\"bar\", \" bar \"))"));
+    assert(out_text_has(&out, n, "catch_unwind(|| has_either(\" bar \", \"bar\"))"));
+}
+
+test is_text_kind_text_count_and_put_pair_sample_name_the_texts_a_fn_takes {
+    var st : [64]usize = [0] ** 64;
+    var out : [32]u8 = undefined;
+    assert(is_text_kind(V_STR) and is_text_kind(V_BYTES) and is_text_kind(V_STRING) and is_text_kind(V_RSTRING));
+    assert(!is_text_kind(V_UNSIGNED) and !is_text_kind(V_VEC) and !is_text_kind(V_NONE) and !is_text_kind(V_ENUM) and !is_text_kind(V_OUTVEC));
+    assert(text_count(V_NONE, V_NONE, V_NONE, V_NONE, V_NONE) == 0);
+    assert(text_count(V_STR, V_UNSIGNED, V_NONE, V_NONE, V_NONE) == 1);
+    assert(text_count(V_STR, V_STRING, V_NONE, V_NONE, V_NONE) == 2);
+    assert(text_count(V_STR, V_UNSIGNED, V_BYTES, V_BOOL, V_RSTRING) == 3);
+    assert(text_count(V_STR, V_STR, V_STR, V_STR, V_STR) == 5);
+    // the haystack for 0 and 2, the needle for 1: the needle is at the start of the haystack and again at its end
+    put_pair_sample(&st, &out, 0);
+    assert(out_is(st[W], &out, 0, "abcabc"));
+    put_pair_sample(&st, &out, 1);
+    assert(out_is(st[W], &out, 6, "abc"));
+    put_pair_sample(&st, &out, 2);
+    assert(out_is(st[W], &out, 9, "abcabc"));
+    assert(st[W] == 15);
+    assert(PAIR_N == 3);
+}
+
+test derived_at_puts_the_pair_samples_first_for_a_fn_with_two_texts_and_gives_each_literal_three {
+    var st : [1024]usize = [0] ** 1024;
+    const src : []const u8 = "fn arm(s: &str, t: &str) -> bool { s == \"+=\" }";
+    const fb : usize = find_at(src, 0, B_LBRACE);
+    st[FBLO] = fb + 1;
+    st[FBHI] = block_end(src, fb) - 1;
+    // one text: the literal alone and wrapped, no pair sample
+    assert(slen(src, &st, V_STR, 0) == 10);
+    assert(derived_at(src, &st, V_STR, 0, 0) and st[DCSP] == 0);
+    assert(derived_at(src, &st, V_STR, 0, 1) and st[DCSP] == 1);
+    assert(!derived_at(src, &st, V_STR, 0, 2));
+    // two texts: a text, a text inside it, the first again; then the literal alone, wrapped, alone
+    st[PAIRS] = 2;
+    assert(derived_at(src, &st, V_STR, 0, 0) and st[DCSP] == 2 and st[DVAL] == 0);
+    assert(derived_at(src, &st, V_STR, 0, 1) and st[DCSP] == 2 and st[DVAL] == 1);
+    assert(derived_at(src, &st, V_STR, 0, 2) and st[DCSP] == 2 and st[DVAL] == 2);
+    assert(derived_at(src, &st, V_STR, 0, 3) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 2 and src[st[DCLA]] == B_PLUS);
+    assert(derived_at(src, &st, V_STR, 0, 4) and st[DCSP] == 1 and st[DCLB] - st[DCLA] == 2);
+    assert(derived_at(src, &st, V_STR, 0, 5) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 2);
+    assert(!derived_at(src, &st, V_STR, 0, 6));
+    assert(slen(src, &st, V_STR, 0) == 14);
+    // a single text is not a pair, whatever else the fn takes
+    st[PAIRS] = 1;
+    assert(slen(src, &st, V_STR, 0) == 10);
+    // bytes: the same, with the byte string b"ab"
+    const bs : []const u8 = "fn f(a: &[u8], b: &[u8]) -> bool { a == b\"ab\" }";
+    const bf : usize = find_at(bs, 0, B_LBRACE);
+    st[FBLO] = bf + 1;
+    st[FBHI] = block_end(bs, bf) - 1;
+    st[PAIRS] = 2;
+    assert(slen(bs, &st, V_BYTES, 0) == 11);
+    assert(derived_at(bs, &st, V_BYTES, 0, 2) and st[DCSP] == 2);
+    assert(derived_at(bs, &st, V_BYTES, 0, 5) and st[DCSP] == 0 and st[DCLB] - st[DCLA] == 2);
+    // a number ignores the count of texts: its samples are the body's integers, one below, at it and above
+    const num : []const u8 = "fn lim(a: u8, s: &str, t: &str) -> bool { a == 9 }";
+    const nf : usize = find_at(num, 0, B_LBRACE);
+    st[FBLO] = nf + 1;
+    st[FBHI] = block_end(num, nf) - 1;
+    const uq : usize = skip_ws(num, tok_end(num, skip_ws(num, tok_end(num, skip_ws(num, find_at(num, 0, B_LPAREN) + 1)))));
+    assert(dcount(num, &st, V_UNSIGNED, uq, 7) == 3);
+    assert(derived_at(num, &st, V_UNSIGNED, uq, 0) and st[DVAL] == 8 and st[DCSP] == 0);
+    // a fn with no body to read has no derived sample at all, pairs included
+    st[FBLO] = num.len;
+    st[FBHI] = num.len;
+    assert(!derived_at(num, &st, V_STR, 0, 0));
+}
+
 test the_sample_count_caps_at_64 {
     var st : [1024]usize = [0] ** 1024;
     const src : []const u8 = "fn many(s: &str) -> bool { s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || s == \"0\" || false }";
@@ -11453,6 +11675,11 @@ test the_sample_count_caps_at_64 {
     assert(slen(src, &st, V_STR, 0) == 64);
     assert(derived_at(src, &st, V_STR, 0, 59));
     assert(!derived_at(src, &st, V_STR, 0, 60));
+    // with two texts the three pair samples come first and each literal gives three samples: 3 + 90 derived, still 64 in all
+    st[PAIRS] = 2;
+    assert(slen(src, &st, V_STR, 0) == 64);
+    assert(derived_at(src, &st, V_STR, 0, 92));
+    assert(!derived_at(src, &st, V_STR, 0, 93));
 }
 
 test the_oracle_samples_the_arms_discriminants {
@@ -13124,6 +13351,59 @@ test deps_reads_a_name_after_a_dot_or_a_path_as_a_member_not_a_free_fn {
     assert(j[ERR] == 0);
 }
 
+test deps_refuses_a_call_of_a_fn_in_an_out_buffer_form_naming_the_form {
+    var a : [128]usize = [0] ** 128;
+    const s1 : str = "tag(1)";
+    add_name(s1, &a, K_STRFN, 0, 3, 0, 0);
+    deps(s1, &a, 0, s1.len);
+    assert(a[ERR] == R_STRCALL);
+    assert(a[AT] == 0);
+    assert(a[NLO] == 0);
+    assert(a[NHI] == 3);
+    // the same name of the Vec form is the Vec form's refusal
+    var b : [128]usize = [0] ** 128;
+    add_name(s1, &b, K_VECFN, 0, 3, 0, 0);
+    deps(s1, &b, 0, s1.len);
+    assert(b[ERR] == R_VECCALL);
+    // a free fn is hit by a call only: not by its name alone, by its declaration, or by a method of that name after a dot
+    var c : [128]usize = [0] ** 128;
+    const s2 : str = "tag + 1";
+    add_name(s2, &c, K_STRFN, 0, 3, 0, 0);
+    deps(s2, &c, 0, s2.len);
+    assert(c[ERR] == 0);
+    var d : [128]usize = [0] ** 128;
+    const s3 : str = "fn tag(n: u32) { }";
+    add_name(s3, &d, K_STRFN, 3, 6, 0, 0);
+    deps(s3, &d, 0, s3.len);
+    assert(d[ERR] == 0);
+    var e : [128]usize = [0] ** 128;
+    const s4 : str = "x.tag(1)";
+    add_name(s4, &e, K_STRFN, 2, 5, 0, 0);
+    deps(s4, &e, 0, s4.len);
+    assert(e[ERR] == 0);
+    // a method (it has an owner type) is hit by a call after a dot and by a path through its owner or Self, not through another type
+    var f : [128]usize = [0] ** 128;
+    add_name(s4, &f, K_STRFN, 2, 5, 0, 1);
+    deps(s4, &f, 0, s4.len);
+    assert(f[ERR] == R_STRCALL);
+    assert(f[AT] == 2);
+    var g : [128]usize = [0] ** 128;
+    const s5 : str = "struct T {} fn f() { T::go(1); }";
+    add_name(s5, &g, K_STRFN, 24, 26, 7, 8);
+    deps(s5, &g, 12, s5.len);
+    assert(g[ERR] == R_STRCALL);
+    assert(g[AT] == 24);
+    var h : [128]usize = [0] ** 128;
+    add_name(s5, &h, K_STRFN, 24, 26, 3, 4);
+    deps(s5, &h, 12, s5.len);
+    assert(h[ERR] == 0);
+    var i : [128]usize = [0] ** 128;
+    const s6 : str = "Self::go(1)";
+    add_name(s6, &i, K_STRFN, 6, 8, 0, 4);
+    deps(s6, &i, 0, s6.len);
+    assert(i[ERR] == R_STRCALL);
+}
+
 test deps_refuses_a_use_of_a_refused_type_a_foreign_name_and_an_undeclared_one {
     var a : [128]usize = [0] ** 128;
     const s1 : str = "fn f(a: Ghost) {}";
@@ -13175,6 +13455,32 @@ test deps_refuses_a_use_of_a_refused_type_a_foreign_name_and_an_undeclared_one {
     assert(i[ERR] == 0);
 }
 
+test a_refusal_caused_by_a_refused_receiver_type_names_that_type {
+    var out : [4096]u8 = undefined;
+    var st : [1024]usize = [0] ** 1024;
+    // A method of a type the converter refused is refused with it, and the line named `self` or `Self`, a name no refusal in
+    // the file has, so the sweep could not follow it to the type's own reason (#11128). It names the impl type, at the line
+    // of the receiver: for a `&self` method, for a `Self` constructor, for a method that calls another one, and for a
+    // refused enum. A static fn that names neither `self` nor the type, and every method of a type that converts, are
+    // converted as before.
+    const n : usize = body("struct Foo { name: String, n: u32 }\nimpl Foo {\n    fn len(&self) -> usize { self.n as usize }\n    fn unit() -> Self { Self { n: 0 } }\n    fn kind() -> u32 { 7 }\n    fn twice(&self) -> usize { self.len() * 2 }\n}\nstruct Fine { a: u32 }\nimpl Fine {\n    fn a(&self) -> u32 { self.a }\n    fn unit() -> Self { Self { a: 0 } }\n}\nenum E { A(u32), B }\nimpl E {\n    fn is_b(&self) -> bool { true }\n}\nfn free(f: &Foo) -> usize { f.len() }\nstruct Ok2 { a: u32 }\nimpl Ok2 {\n    fn bad(&self) -> Vec<u8> { Vec::new() }\n    fn uses(&self) -> usize { self.bad().len() }\n}\n", &out, &st);
+    assert(out_text_has(&out, n, "// t27o: refused struct Foo (line 1): type `String` at line 1\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn len (line 3): uses refused `Foo` at line 3\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn unit (line 4): uses refused `Foo` at line 4\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn twice (line 6): uses refused `Foo` at line 6\n"));
+    assert(out_text_has(&out, n, "// t27o: refused enum E (line 13): enum variant with data `A` at line 13\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn is_b (line 15): uses refused `E` at line 15\n"));
+    assert(out_text_has(&out, n, "// t27o: refused fn free (line 17): uses refused `Foo` at line 17\n"));
+    assert(!out_text_has(&out, n, "uses refused `self`"));
+    assert(!out_text_has(&out, n, "uses refused `Self`"));
+    // the negative controls: a static member that names neither, the methods of the type that converts, and a method that
+    // uses a refused method of a type that converts (the callee is the name, as before)
+    assert(out_text_has(&out, n, "// t27o: refused fn uses (line 21): uses refused `bad` at line 21\n"));
+    assert(out_text_has(&out, n, "fn Foo_kind() -> u32 {\n    return 7;\n}"));
+    assert(out_text_has(&out, n, "fn Fine_a(self: Fine) -> u32 {\n    return self.a;\n}"));
+    assert(out_text_has(&out, n, "fn Fine_unit() -> Fine {\n    return Fine{ .a = 0 };\n}"));
+}
+
 test deps_keeps_a_member_of_a_refused_impl_type_when_it_names_neither_self_nor_the_type {
     var a : [128]usize = [0] ** 128;
     const s1 : str = "struct Ghost {} impl Ghost { fn m(&self) { } }";
@@ -13184,6 +13490,9 @@ test deps_keeps_a_member_of_a_refused_impl_type_when_it_names_neither_self_nor_t
     deps(s1, &a, 29, s1.len);
     assert(a[ERR] == R_DEPENDS);
     assert(a[AT] == 35);
+    // the line is at the receiver, the token it names is the impl type (#11128)
+    assert(a[NLO] == 21);
+    assert(a[NHI] == 26);
     var b : [128]usize = [0] ** 128;
     const s2 : str = "struct Ghost {} impl Ghost { fn s(a: u8) -> u8 { a } }";
     add_name(s2, &b, K_ITEM, 7, 12, 0, 0);
@@ -13199,6 +13508,8 @@ test deps_keeps_a_member_of_a_refused_impl_type_when_it_names_neither_self_nor_t
     deps(s3, &c, 29, s3.len);
     assert(c[ERR] == R_DEPENDS);
     assert(c[AT] == 39);
+    assert(c[NLO] == 21);
+    assert(c[NHI] == 26);
     var d : [128]usize = [0] ** 128;
     const s4 : str = "struct Ghost {} impl Ghost { fn u() { Self::s(); } fn s() {} }";
     add_name(s4, &d, K_ITEM, 7, 12, 0, 0);
@@ -14466,7 +14777,7 @@ test std_bool_find_and_let_int_read_the_std_table_and_a_typed_let {
     assert(find("count_ones", C_INT, "u16") == 55);
     assert(find("nosuch", C_ANY, "") == STD_N);
     assert(find("", C_ANY, "") == STD_N);
-    var st : [64]usize = [0] ** 64;
+    var st : [65]usize = [0] ** 65;
     assert(let_int(" u32", &st, 1) == 1);
     assert(let_int(" usize", &st, 1) == 1);
     assert(let_int(" i8", &st, 1) == 1);
@@ -18228,13 +18539,13 @@ test put_docs_writes_the_doc_lines_above_an_item_and_nothing_else {
 }
 
 test put_reason_names_the_refusal_and_the_text_it_points_at {
-    const codes : [45]usize = [R_SYNTAX, R_GENERIC, R_TRAIT, R_CLOSURE, R_TRY, R_MACRO, R_TYPE, R_METHOD, R_TUPLE, R_IFLET, R_ITER, R_PATTERN, R_MUTREF, R_DEREF, R_VALUE, R_LITERAL, R_LABEL, R_ITEM, R_UNSAFE, R_PATH, R_WHERE, R_SELFMUT, R_UPDATE, R_DATA, R_DEPENDS, R_EXTERNAL, R_UNDECL, R_CLASH, R_STRUCTEQ, R_STRUSE, R_SPLICE, R_EMPTY, R_NOTYPE, R_VECMUT, R_VECMOVE, R_VECTYPE, R_LIBM, R_SLICEGEN, R_SHIFTCALL, R_OPERAND, R_TYPENAME, R_FLOATLIT, R_NOPRELUDE, R_VECOUT, R_VECCALL];
-    const why : [45]str = ["syntax", "generics", "trait impl", "closure", "? operator", "macro", "type", "method", "tuple", "if let / while let", "for over an iterator", "match pattern", "&mut of a value", "deref", "block as a value", "literal", "label or break value", "item", "unsafe", "path", "where clause", "mut self", "struct update", "enum variant with data", "uses refused", "uses external", "undeclared", "a used module's name, declared here too (use splices flat, see #7176)", "== of structs", "an owned String outside the out-buffer form", "a used module t27c cannot splice beside type_text (its own use stays unresolved, or its same clashes with type_text's, the gap specs/compiler/int_type_names.t27 records)", "empty slice with no known element type", "`!` of an operand whose type t27o cannot tell", "a vec! the fn changes (push, resize, assign into, &mut)", "a vec! the fn hands on or returns", "a vec! or array literal whose element type or length t27o cannot tell", "libm function not bit-exact", "slice contains on", "a compound shift of a place that calls something", "an operator, cast, borrow or deref t27 has no form for on an enum, struct, array or text", "a type named like one t27c renames (GF16, str, int ..)", "a float literal in a var of no type, f32 or f64 left to inference", "an assert or a comparison of texts in a spec with no test block (t27c writes the std import and assert helper with the first one)", "a Vec result that is not one local built only by push / extend_from_slice and returned as it is (the out-buffer form holds no read of it, no other change, no second Vec: a list that grows without a bound the caller states has no t27 form)", "a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own)"];
+    const codes : [46]usize = [R_SYNTAX, R_GENERIC, R_TRAIT, R_CLOSURE, R_TRY, R_MACRO, R_TYPE, R_METHOD, R_TUPLE, R_IFLET, R_ITER, R_PATTERN, R_MUTREF, R_DEREF, R_VALUE, R_LITERAL, R_LABEL, R_ITEM, R_UNSAFE, R_PATH, R_WHERE, R_SELFMUT, R_UPDATE, R_DATA, R_DEPENDS, R_EXTERNAL, R_UNDECL, R_CLASH, R_STRUCTEQ, R_STRUSE, R_SPLICE, R_EMPTY, R_NOTYPE, R_VECMUT, R_VECMOVE, R_VECTYPE, R_LIBM, R_SLICEGEN, R_SHIFTCALL, R_OPERAND, R_TYPENAME, R_FLOATLIT, R_NOPRELUDE, R_VECOUT, R_VECCALL, R_STRCALL];
+    const why : [46]str = ["syntax", "generics", "trait impl", "closure", "? operator", "macro", "type", "method", "tuple", "if let / while let", "for over an iterator", "match pattern", "&mut of a value", "deref", "block as a value", "literal", "label or break value", "item", "unsafe", "path", "where clause", "mut self", "struct update", "enum variant with data", "uses refused", "uses external", "undeclared", "a used module's name, declared here too (use splices flat, see #7176)", "== of structs", "an owned String outside the out-buffer form", "a used module t27c cannot splice beside type_text (its own use stays unresolved, or its same clashes with type_text's, the gap specs/compiler/int_type_names.t27 records)", "empty slice with no known element type", "`!` of an operand whose type t27o cannot tell", "a vec! the fn changes (push, resize, assign into, &mut)", "a vec! the fn hands on or returns", "a vec! or array literal whose element type or length t27o cannot tell", "libm function not bit-exact", "slice contains on", "a compound shift of a place that calls something", "an operator, cast, borrow or deref t27 has no form for on an enum, struct, array or text", "a type named like one t27c renames (GF16, str, int ..)", "a float literal in a var of no type, f32 or f64 left to inference", "an assert or a comparison of texts in a spec with no test block (t27c writes the std import and assert helper with the first one)", "a Vec result that is not one local built only by push / extend_from_slice and returned as it is (the out-buffer form holds no read of it, no other change, no second Vec: a list that grows without a bound the caller states has no t27 form)", "a call of a fn whose Vec result is the caller's out buffer (an unbounded list the caller would own)", "a call of a fn whose String result is the caller's out buffer (the caller would own a buffer of no stated length)"];
     var out : [512]u8 = undefined;
     var st : [64]usize = [0] ** 64;
     var w : [512]u8 = [0] ** 512;
     var i : usize = 0;
-    while (i < 45) {
+    while (i < 46) {
         clear(&st);
         st[ERR] = codes[i];
         st[AT] = 3;
@@ -19468,7 +19779,7 @@ test out_fmt_arg_and_out_format_append_each_hole_of_a_format_string {
 
 test out_str_push_out_str_plus_and_out_piece_call_append_to_the_buffer {
     var out : [256]u8 = undefined;
-    var st : [64]usize = [0] ** 64;
+    var st : [65]usize = [0] ** 65;
     out_str_push("'x');", &st, &out, 0);
     assert(out_is(st[W], &out, 0, "t27o_w = rust_std::append_char(out, t27o_w, 'x');"));
     assert(st[P] == 5);
@@ -19995,7 +20306,7 @@ test prescan_and_reused_enter_the_names_a_file_declares_before_its_items {
     var none : [1024]usize = [0] ** 1024;
     prescan("fn f() {}\n//@t27o reuse nopath\n//@t27o reuse   \n//@t27o reuse g p\n", &none);
     assert(none[NNAMES] == 1);
-    var tiny : [64]usize = [0] ** 64;
+    var tiny : [65]usize = [0] ** 65;
     prescan(s, &tiny);
     assert(tiny[IXON] == 0);
     assert(tiny[NNAMES] == 1);
