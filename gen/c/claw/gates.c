@@ -26,7 +26,8 @@
 static const const char* NAMES[67] = { "agent-runner-docker", "auto-merge-ready-prs", "bootstrap-tests", "build-paper", "build-vivado-image", "catalog-count-gate", "cli-tri", "conflict-markers", "conformance-integrity-gate", "coq-kernel", "coq-proofs", "corpus-ratchet", "damage-negatives", "deploy-api", "documented-commands", "dupe-ratchet", "emit-bitexact-gate", "exhaustive-nightly", "fix-carries-source", "fpga-build", "gate-topology", "gf-wide-conformance", "gf16-conformance", "harness-scratch", "issue-gate", "l1-traceability", "lean-proofs", "loop-tools-gate", "needs-boundary", "oracle-nightly", "orphan-modules", "own-language", "pack-index-consistency-gate", "phi-loop-ci", "pr-budget", "pr-dashboard", "pusher", "queen-doctor", "queen-export-push", "queen-feed-empty-bodies", "queen-feed-roadmap", "queen-feed-untested", "queen-publish", "queen-refile", "queen-watchdog", "release", "rings-rust", "sandbox-docker", "sbom", "schema-validation", "scorecard", "seal-coverage", "seal-staleness-warn", "secret-scan", "sign-release", "spec-guards", "spec-parse-ratchet", "t27b-native", "t27o-golden", "t27o-release", "untrusted-input-gate", "verilog-widths", "vivado-synth", "wasm-explorer", "withdrawn-live-gate", "xilinx7-l3-bench", "zenodo-publish" };
 static const size_t NAME_LENS[67] = { 19, 20, 15, 11, 18, 18, 7, 16, 26, 10, 10, 14, 16, 10, 19, 12, 18, 18, 18, 10, 13, 19, 16, 15, 10, 15, 11, 15, 14, 14, 14, 12, 27, 11, 9, 12, 6, 12, 17, 23, 18, 19, 13, 12, 14, 7, 10, 14, 4, 17, 9, 13, 19, 11, 12, 11, 18, 11, 11, 12, 20, 14, 12, 13, 19, 16, 14 };
 static const uint8_t CLASSES[67] = { 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-static const const char* EVENTS[67] = { "push,workflow_dispatch", "schedule,pull_request_target,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request_target,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request", "push,pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request_target", "workflow_dispatch,pull_request", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "push,schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "release", "push,pull_request,workflow_dispatch", "push,workflow_dispatch", "push,release,workflow_dispatch", "pull_request,push,workflow_dispatch", "branch_protection_rule,schedule,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "release,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_call", "push", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_dispatch", "push,pull_request", "pull_request,push,workflow_dispatch", "workflow_dispatch,pull_request", "release,workflow_dispatch" };
+static const size_t EVENT_LENS[67] = { 22, 46, 35, 35, 17, 30, 17, 35, 35, 35, 35, 35, 35, 22, 35, 35, 30, 26, 30, 35, 44, 35, 35, 35, 37, 30, 30, 35, 26, 26, 35, 12, 35, 30, 19, 30, 26, 26, 26, 26, 26, 26, 31, 26, 26, 7, 35, 22, 30, 35, 54, 35, 30, 35, 25, 35, 35, 35, 13, 4, 35, 35, 17, 17, 35, 30, 25 };
+static const const char* EVENTS[67] = { "push,workflow_dispatch", "schedule,pull_request_target,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch,schedule", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request_target,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request", "push,pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request_target", "workflow_dispatch,pull_request", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "push,schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "release", "push,pull_request,workflow_dispatch", "push,workflow_dispatch", "push,release,workflow_dispatch", "pull_request,push,workflow_dispatch", "branch_protection_rule,schedule,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "release,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_call", "push", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_dispatch", "push,pull_request", "pull_request,push,workflow_dispatch", "workflow_dispatch,pull_request", "release,workflow_dispatch" };
 #define P_OK 0
 #define P_SPEC_ONLY 1
 #define P_DIR_ONLY 2
@@ -52,21 +53,25 @@ static const size_t CLASS_LABEL_LENS[3] = { 10, 6, 11 };
 uint8_t class_of(const char* name, size_t name_len);
 bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
+size_t events_len_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
+bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]);
 bool every_row_filled(void);
-bool str_eq(const char* a, size_t alen, const char* b, size_t blen);
+bool names_unique_in(const char* names[static 67], size_t lens[static 67]);
 bool all_names_unique(void);
+bool classes_known(uint8_t cl[static 67]);
 bool all_classes_known(void);
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start);
 bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name, size_t name_len);
 bool dir_has(uint8_t* dir_text, size_t dir_len, const char* name, size_t name_len);
 bool line_in_names(uint8_t* dir_text, size_t start, size_t len);
-size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
-uint8_t digit_byte(uint32_t d);
-size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
-bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
 int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_cap);
 size_t claw_coverage_report(uint8_t* out, size_t out_cap);
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len);
+uint8_t digit_byte(uint32_t d);
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v);
+size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
+bool str_eq(const char* a, size_t alen, const char* b, size_t blen);
 
 /* -------------------------------------------------------
    Function implementations
@@ -94,6 +99,15 @@ const char* events_of(const char* name, size_t name_len) {
     return "";
 }
 
+size_t events_len_of(const char* name, size_t name_len) {
+    for (size_t i = 0; i < 67; i++) {
+        if (str_eq(NAMES[i], NAME_LENS[i], name, name_len)) {
+            return EVENT_LENS[i];
+        }
+    }
+    return 0;
+}
+
 uint32_t count_class(uint8_t c) {
     uint32_t n = 0;
     for (size_t i = 0; i < 67; i++) {
@@ -104,37 +118,26 @@ uint32_t count_class(uint8_t c) {
     return n;
 }
 
-bool every_row_filled(void) {
+bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]) {
     for (size_t i = 0; i < 67; i++) {
-        if ((NAMES[i] == "")) {
+        if ((name_lens[i] == 0)) {
             return false;
         }
-        if ((EVENTS[i] == "")) {
+        if ((event_lens[i] == 0)) {
             return false;
         }
     }
     return true;
 }
 
-bool str_eq(const char* a, size_t alen, const char* b, size_t blen) {
-    if ((alen != blen)) {
-        return false;
-    }
-    size_t diff = 0;
-    size_t i = 0;
-    while ((i < alen)) {
-        if ((a[i] != b[i])) {
-            diff += 1;
-        }
-        i += 1;
-    }
-    return (diff == 0);
+bool every_row_filled(void) {
+    return rows_filled(NAME_LENS, EVENT_LENS);
 }
 
-bool all_names_unique(void) {
+bool names_unique_in(const char* names[static 67], size_t lens[static 67]) {
     for (size_t i = 0; i < 67; i++) {
         for (size_t j = (i + 1); j < 67; j++) {
-            if (str_eq(NAMES[i], NAME_LENS[i], NAMES[j], NAME_LENS[j])) {
+            if (str_eq(names[i], lens[i], names[j], lens[j])) {
                 return false;
             }
         }
@@ -142,17 +145,25 @@ bool all_names_unique(void) {
     return true;
 }
 
-bool all_classes_known(void) {
+bool all_names_unique(void) {
+    return names_unique_in(NAMES, NAME_LENS);
+}
+
+bool classes_known(uint8_t cl[static 67]) {
     for (size_t i = 0; i < 67; i++) {
-        if ((CLASSES[i] != G_BLOCKING)) {
-            if ((CLASSES[i] != G_SOFT)) {
-                if ((CLASSES[i] != G_REPORTING)) {
+        if ((cl[i] != G_BLOCKING)) {
+            if ((cl[i] != G_SOFT)) {
+                if ((cl[i] != G_REPORTING)) {
                     return false;
                 }
             }
         }
     }
     return true;
+}
+
+bool all_classes_known(void) {
+    return classes_known(CLASSES);
 }
 
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start) {
@@ -198,94 +209,6 @@ bool line_in_names(uint8_t* dir_text, size_t start, size_t len) {
         if (line_eq_name(dir_text, start, len, NAMES[i], NAME_LENS[i])) {
             return true;
         }
-    }
-    return false;
-}
-
-size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) {
-    size_t i = 0;
-    while ((i < s_len)) {
-        if (((w + i) < cap)) {
-            dst[(w + i)] = s[i];
-        }
-        i += 1;
-    }
-    return (w + s_len);
-}
-
-uint8_t digit_byte(uint32_t d) {
-    uint8_t b = '0';
-    if ((d == 1)) {
-        b = '1';
-    }
-    if ((d == 2)) {
-        b = '2';
-    }
-    if ((d == 3)) {
-        b = '3';
-    }
-    if ((d == 4)) {
-        b = '4';
-    }
-    if ((d == 5)) {
-        b = '5';
-    }
-    if ((d == 6)) {
-        b = '6';
-    }
-    if ((d == 7)) {
-        b = '7';
-    }
-    if ((d == 8)) {
-        b = '8';
-    }
-    if ((d == 9)) {
-        b = '9';
-    }
-    return b;
-}
-
-size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
-    uint8_t tmp[16] = {0};
-    size_t n = 0;
-    uint32_t x = v;
-    if ((x == 0)) {
-        tmp[0] = digit_byte(0);
-        n = 1;
-    }
-    while ((x > 0)) {
-        tmp[n] = digit_byte((x % 10));
-        n += 1;
-        x = (x / 10);
-    }
-    size_t k = 0;
-    while ((k < n)) {
-        if (((w + k) < cap)) {
-            dst[(w + k)] = tmp[((n - 1) - k)];
-        }
-        k += 1;
-    }
-    return (w + n);
-}
-
-bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
-    if ((needle_len > buf_len)) {
-        return false;
-    }
-    size_t start = 0;
-    while (((start + needle_len) <= buf_len)) {
-        size_t k = 0;
-        size_t diff = 0;
-        while ((k < needle_len)) {
-            if ((buf[(start + k)] != needle[k])) {
-                diff += 1;
-            }
-            k += 1;
-        }
-        if ((diff == 0)) {
-            return true;
-        }
-        start += 1;
     }
     return false;
 }
@@ -376,6 +299,109 @@ size_t claw_coverage_report(uint8_t* out, size_t out_cap) {
     return w;
 }
 
+bool buf_has(uint8_t* buf, size_t buf_len, const char* needle, size_t needle_len) {
+    if ((needle_len > buf_len)) {
+        return false;
+    }
+    size_t start = 0;
+    while (((start + needle_len) <= buf_len)) {
+        size_t k = 0;
+        size_t diff = 0;
+        while ((k < needle_len)) {
+            if ((buf[(start + k)] != needle[k])) {
+                diff += 1;
+            }
+            k += 1;
+        }
+        if ((diff == 0)) {
+            return true;
+        }
+        start += 1;
+    }
+    return false;
+}
+
+uint8_t digit_byte(uint32_t d) {
+    uint8_t b = '0';
+    if ((d == 1)) {
+        b = '1';
+    }
+    if ((d == 2)) {
+        b = '2';
+    }
+    if ((d == 3)) {
+        b = '3';
+    }
+    if ((d == 4)) {
+        b = '4';
+    }
+    if ((d == 5)) {
+        b = '5';
+    }
+    if ((d == 6)) {
+        b = '6';
+    }
+    if ((d == 7)) {
+        b = '7';
+    }
+    if ((d == 8)) {
+        b = '8';
+    }
+    if ((d == 9)) {
+        b = '9';
+    }
+    return b;
+}
+
+size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
+    uint8_t tmp[16] = {0};
+    size_t n = 0;
+    uint32_t x = v;
+    if ((x == 0)) {
+        tmp[0] = digit_byte(0);
+        n = 1;
+    }
+    while ((x > 0)) {
+        tmp[n] = digit_byte((x % 10));
+        n += 1;
+        x = (x / 10);
+    }
+    size_t k = 0;
+    while ((k < n)) {
+        if (((w + k) < cap)) {
+            dst[(w + k)] = tmp[((n - 1) - k)];
+        }
+        k += 1;
+    }
+    return (w + n);
+}
+
+size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len) {
+    size_t i = 0;
+    while ((i < s_len)) {
+        if (((w + i) < cap)) {
+            dst[(w + i)] = s[i];
+        }
+        i += 1;
+    }
+    return (w + s_len);
+}
+
+bool str_eq(const char* a, size_t alen, const char* b, size_t blen) {
+    if ((alen != blen)) {
+        return false;
+    }
+    size_t diff = 0;
+    size_t i = 0;
+    while ((i < alen)) {
+        if ((a[i] != b[i])) {
+            diff += 1;
+        }
+        i += 1;
+    }
+    return (diff == 0);
+}
+
 /* -------------------------------------------------------
    Tests
    ------------------------------------------------------- */
@@ -426,20 +452,26 @@ void test_rows_stay_aligned_name_class_events(void) {
     const char* ol = "own-language";
     const char* ev_qp = "push,schedule,workflow_dispatch";
     const char* ev_ol = "pull_request";
-    assert((NAMES[1] == want1));
+    assert((str_eq(NAMES[1], NAME_LENS[1], want1, 20) == true));
     assert((CLASSES[1] == G_REPORTING));
-    assert((NAMES[42] == want42));
+    assert((str_eq(NAMES[42], NAME_LENS[42], want42, 13) == true));
     assert((CLASSES[42] == G_REPORTING));
-    assert((NAMES[29] == want29));
+    assert((str_eq(NAMES[29], NAME_LENS[29], want29, 14) == true));
     assert((CLASSES[29] == G_SOFT));
-    assert((events_of(qp, 13) == ev_qp));
-    assert((events_of(ol, 12) == ev_ol));
+    assert((str_eq(events_of(qp, 13), events_len_of(qp, 13), ev_qp, 31) == true));
+    assert((str_eq(events_of(ol, 12), events_len_of(ol, 12), ev_ol, 12) == true));
 }
 
 void test_unknown_name_is_unknown_and_not_blocking(void) {
     assert((class_of("no-such-gate", 12) == G_UNKNOWN));
     assert((is_blocking("no-such-gate", 12) == false));
-    assert((events_of("no-such-gate", 12) == ""));
+    assert((events_len_of("no-such-gate", 12) == 0));
+}
+
+void test_events_len_of_answers_every_row(void) {
+    for (size_t i = 0; i < 67; i++) {
+        assert((events_len_of(NAMES[i], NAME_LENS[i]) == EVENT_LENS[i]));
+    }
 }
 
 void test_nightly_pair_contrast(void) {
@@ -507,14 +539,10 @@ void test_audit_ignores_blank_lines_in_the_directory(void) {
 }
 
 void test_audit_prefixes_name_the_problem_kind(void) {
-    const char* spec_only = LINE_PREFIX[P_SPEC_ONLY];
-    assert((spec_only == "SPEC-ONLY  "));
-    const char* dir_only = LINE_PREFIX[P_DIR_ONLY];
-    assert((dir_only == "DIR-ONLY   "));
-    const char* ok = LINE_PREFIX[P_OK];
-    assert((ok == ""));
-    const char* tail = DRIFT_TAIL;
-    assert((tail == "claw: DRIFT -- regenerate specs/claw/gates.t27 (docs/claw/README.md)"));
+    assert((str_eq(LINE_PREFIX[P_SPEC_ONLY], PREFIX_LENS[P_SPEC_ONLY], "SPEC-ONLY  ", 11) == true));
+    assert((str_eq(LINE_PREFIX[P_DIR_ONLY], PREFIX_LENS[P_DIR_ONLY], "DIR-ONLY   ", 11) == true));
+    assert((PREFIX_LENS[P_OK] == 0));
+    assert((str_eq(DRIFT_TAIL, DRIFT_TAIL_LEN, "claw: DRIFT -- regenerate specs/claw/gates.t27 (docs/claw/README.md)", 68) == true));
 }
 
 void test_every_row_round_trips_through_the_name_lookup(void) {
@@ -531,9 +559,9 @@ void test_every_row_round_trips_through_the_name_lookup(void) {
 }
 
 void test_soft_gates_report_their_events(void) {
-    assert((events_of("oracle-nightly", 14) == "schedule,workflow_dispatch"));
-    assert((events_of("queen-doctor", 12) == "schedule,workflow_dispatch"));
-    assert((events_of("rings-rust", 10) == "push,pull_request,workflow_dispatch"));
+    assert((str_eq(events_of("oracle-nightly", 14), events_len_of("oracle-nightly", 14), "schedule,workflow_dispatch", 26) == true));
+    assert((str_eq(events_of("queen-doctor", 12), events_len_of("queen-doctor", 12), "schedule,workflow_dispatch", 26) == true));
+    assert((str_eq(events_of("rings-rust", 10), events_len_of("rings-rust", 10), "push,pull_request,workflow_dispatch", 35) == true));
 }
 
 void test_coverage_report_carries_every_class(void) {
@@ -549,6 +577,102 @@ void test_coverage_report_carries_every_class(void) {
     assert((buf_has(&out, w, "n=0", 3) == true));
     assert((buf_has(&out, w, "n=63", 4) == false));
     assert((buf_has(&out, w, "G_UNKNOWN", 9) == true));
+}
+
+void test_audit_tail_line_matches_the_count(void) {
+    uint8_t dir[8192] = {0};
+    size_t w = 0;
+    for (size_t i = 0; i < 67; i++) {
+        w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
+        w = put_str(&dir, 8192, w, "\n", 1);
+    }
+    uint8_t out[8192] = {0};
+    for (size_t i = 0; i < 8192; i++) {
+        out[i] = 0;
+    }
+    assert((claw_status(&dir, w, &out, 8192) == 0));
+    assert((buf_has(&out, 8192, "claw: matrix is current\n", 24) == true));
+    assert((buf_has(&out, 8192, DRIFT_TAIL, DRIFT_TAIL_LEN) == false));
+    uint8_t gone[8192] = {0};
+    size_t g = 0;
+    for (size_t i = 1; i < 67; i++) {
+        g = put_str(&gone, 8192, g, NAMES[i], NAME_LENS[i]);
+        g = put_str(&gone, 8192, g, "\n", 1);
+    }
+    uint8_t red[8192] = {0};
+    for (size_t i = 0; i < 8192; i++) {
+        red[i] = 0;
+    }
+    assert((claw_status(&gone, g, &red, 8192) == 1));
+    assert((buf_has(&red, 8192, DRIFT_TAIL, DRIFT_TAIL_LEN) == true));
+    assert((buf_has(&red, 8192, OK_TAIL, OK_TAIL_LEN) == false));
+}
+
+void test_coverage_report_lines_are_exact(void) {
+    uint8_t out[4096] = {0};
+    size_t w = claw_coverage_report(&out, 4096);
+    assert((buf_has(&out, w, "G_BLOCKING n=62 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
+    assert((buf_has(&out, w, "G_SOFT n=3 blocking=false e.g. oracle-nightly, queen-doctor, rings-rust\n", 72) == true));
+    assert((buf_has(&out, w, "G_REPORTING n=2 blocking=false e.g. auto-merge-ready-prs, queen-publish\n", 72) == true));
+}
+
+void test_a_hole_in_either_column_fails_the_filled_check(void) {
+    assert((rows_filled(NAME_LENS, EVENT_LENS) == true));
+    size_t n[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        n[i] = NAME_LENS[i];
+    }
+    n[66] = 0;
+    assert((rows_filled(n, EVENT_LENS) == false));
+    size_t e[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        e[i] = EVENT_LENS[i];
+    }
+    e[0] = 0;
+    assert((rows_filled(NAME_LENS, e) == false));
+    e[0] = 1;
+    assert((rows_filled(NAME_LENS, e) == true));
+}
+
+void test_a_repeated_name_is_caught_wherever_it_sits(void) {
+    const char* n[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        n[i] = NAMES[i];
+    }
+    size_t l[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        l[i] = NAME_LENS[i];
+    }
+    n[5] = n[4];
+    l[5] = l[4];
+    assert((names_unique_in(n, l) == false));
+    const char* m[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        m[i] = NAMES[i];
+    }
+    size_t k[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        k[i] = NAME_LENS[i];
+    }
+    m[66] = m[0];
+    k[66] = k[0];
+    assert((names_unique_in(m, k) == false));
+}
+
+void test_a_class_outside_the_three_is_unknown(void) {
+    assert((classes_known(CLASSES) == true));
+    uint8_t c[67] = {0};
+    for (size_t i = 0; i < 67; i++) {
+        c[i] = CLASSES[i];
+    }
+    c[66] = G_UNKNOWN;
+    assert((classes_known(c) == false));
+    c[66] = G_BLOCKING;
+    assert((classes_known(c) == true));
+    c[66] = G_SOFT;
+    assert((classes_known(c) == true));
+    c[66] = G_REPORTING;
+    assert((classes_known(c) == true));
 }
 
 
@@ -567,6 +691,7 @@ int main(void) {
     test_class_census_62_3_2();
     test_rows_stay_aligned_name_class_events();
     test_unknown_name_is_unknown_and_not_blocking();
+    test_events_len_of_answers_every_row();
     test_nightly_pair_contrast();
     test_reporting_gates_never_block_a_merge();
     test_audit_clean_when_directory_matches_inventory();
@@ -577,7 +702,12 @@ int main(void) {
     test_every_row_round_trips_through_the_name_lookup();
     test_soft_gates_report_their_events();
     test_coverage_report_carries_every_class();
-    printf("All %d tests passed.\n", 18);
+    test_audit_tail_line_matches_the_count();
+    test_coverage_report_lines_are_exact();
+    test_a_hole_in_either_column_fails_the_filled_check();
+    test_a_repeated_name_is_caught_wherever_it_sits();
+    test_a_class_outside_the_three_is_unknown();
+    printf("All %d tests passed.\n", 24);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

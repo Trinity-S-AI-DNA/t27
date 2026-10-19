@@ -7405,6 +7405,19 @@ the parser used to read it as `{}` followed by a negation",
 // Code Generator
 // ============================================================================
 
+/// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
+const HOST_IO_ZIG: &str = r#"
+const __t27_posix = @import("std").posix;
+fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
+    const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
+    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+}
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -8289,6 +8302,12 @@ impl Codegen {
             if decl.kind != NodeKind::UseDecl {
                 self.gen_decl(decl);
             }
+        }
+        // `--backend ml`: the host's file syscalls, only for a spec that calls them.
+        let mut host = false;
+        Self::visit_calls(&ast.children, &mut |c| host |= matches!(c.name.as_str(), "host_open" | "host_read" | "host_write" | "host_close"));
+        if host {
+            self.write(HOST_IO_ZIG);
         }
     }
 
@@ -10448,6 +10467,10 @@ impl Codegen {
                         "sin" => Some("@sin"),
                         "cos" => Some("@cos"),
                         "tanh" => Some("std.math.tanh"),
+                        "host_open" => Some("__t27_host_open"),
+                        "host_read" => Some("__t27_host_read"),
+                        "host_write" => Some("__t27_host_write"),
+                        "host_close" => Some("__t27_host_close"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -10791,13 +10814,13 @@ impl Codegen {
             NodeKind::ExprIndex => {
                 // children[0] = base, children[1] = index
                 // W605: a slice carries a third child (the end) and lowers to
-                // Zig's `[a..b]` -- the same half-open range the source means.
-                if node.extra_op == "slice" && node.children.len() >= 3 {
+                // Zig's `[a..b]`; `slice_open` has no end and is `[a..]` (#8200).
+                if node.extra_op.starts_with("slice") && node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
                     self.write("[");
                     self.gen_expr(&node.children[1]);
                     self.write("..");
-                    self.gen_expr(&node.children[2]);
+                    if let Some(end) = node.children.get(2) { self.gen_expr(end); }
                     self.write("]");
                 } else if node.children.len() >= 2 {
                     self.gen_expr(&node.children[0]);
@@ -41050,16 +41073,16 @@ mod tests_compiler_rejects {
         assert!(r.is_err(), "malformed input must fail to compile, got Ok");
     }
 
-    // Case 3: invalid width. `u3` is not a real integer width and is not in
-    // VALID_CAST_TYPES -> rejected; `u3` never reaches codegen.
+    // Case 3: invalid width. `u65` is past the 64 bits a uN cast may name (int_type_names.t27)
+    // and is not in VALID_CAST_TYPES -> rejected; `u65` never reaches codegen.
     #[test]
-    fn rejects_invalid_width_u3() {
+    fn rejects_invalid_width_u65() {
         // Hardened contract (t27#1940): a malformed statement/declaration
         // is a COMPILE ERROR, not a silent drop.
         let r = try_emit(
             r#"module RejBadWidth {
     pub fn h(x: u8) -> u8 {
-        return x as u3
+        return x as u65
     }
 }"#,
         );
