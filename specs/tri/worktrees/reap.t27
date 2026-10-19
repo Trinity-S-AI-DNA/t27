@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/worktrees/reap.t27 -- which checkouts `tri worktrees --reap-plan` calls REMOVABLE, and the line that removes each
+; A finished lane leaves its worktree behind: 300-650 MB each, and on the night of 2026-10-18 the bench
+; Mac's disk filled twice. The self-cleanup skill (.claude/skills/self-cleanup/SKILL.md) removes the
+; trees of merged lanes by hand, one rule at a time. This spec is that judgement as rules with tests
+; (gHashTag/t27#10805), so `tri worktrees` states it and the session only runs what it prints.
+; The command (cli/tri/src/trees.rs, through `t27c gen-rust` in gen/rust/tri/worktrees/reap.rs) is
+; glue: it reads git (worktree list, status), asks `ps` whether a lock's pid lives, asks GitHub's REST
+; API for the pull requests of a branch (one request per branch, and only for a tree that a merged
+; pull request would make removable), calls the functions below and prints what they return. It never
+; removes anything: it prints `git -C <main checkout> worktree remove <flags> <path>`, REMOVE_HEAD,
+; the main checkout, REMOVE_MID, remove_flags(lock), the path.
+; A checkout is judged by five facts, in this order, and the first that applies decides:
+;   main       the first checkout of `git worktree list` is the clone itself: never removed.
+;   dirty      `git status --porcelain` prints anything but the untracked `target` link (`only_target`),
+;              or git could not read the tree: it holds work, or it is unknown, and unknown is not clean.
+;   lock       `locked <reason>` of the porcelain. Claude's agent worktrees write `(pid N start ...)` in
+;              the reason; the glue asks `ps -p N`. A live pid, or a lock with no pid to check, keeps the
+;              tree. A dead pid is a lock a finished agent left: removable with `-f -f`.
+;   pr         the pull requests whose head is the branch (`pr_state`): open keeps it, merged or closed
+;              lets it go. No pull request, a detached tree, an unreadable answer, a failed request: NONE,
+;              and NONE keeps it. A tree is never removable on missing data.
+;   path       the printed line is typed into a terminal: a path with a character the shell reads
+;              (space, quote, `;`, `$`) is kept, not quoted by guesswork.
+; The answer of GitHub is read as serde_json::to_string_pretty prints it: an array, a pull request
+; `  {` ... `  }` at indent 2, its keys sorted at 4, the nested objects (head, user, milestone) deeper.
+; Only the keys at indent 4 count: a milestone's own "state" is not the pull request's. The line
+; readers are specs/tri/lab/receipt.t27's, imported, and the pull request walk is lanes.t27's.
+; Fixtures are GitHub's answer for gHashTag/t27 PR 10808 (merged 2026-10-19), shortened; the nested
+; milestone, the open and closed variants and the second pull request are made up to test the trap.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriWorktreeReap;
+
+use tri::lab::receipt::line_end;
+use tri::lab::receipt::span_is;
+use tri::lab::receipt::key_at;
+use tri::lab::receipt::value_from;
+use tri::lab::receipt::value_to;
+use tri::lab::receipt::object_end;
+use tri::lanes::lanes::next_pr;
+use tri::lanes::lanes::starts;
+use tri::lanes::lanes::digits;
+
+// The pull requests whose head is a branch of this repository; the glue appends the branch name.
+pub const PULLS_URL : str = "https://api.github.com/repos/gHashTag/t27/pulls?state=all&per_page=10&head=gHashTag:";
+// The line to run, in pieces: REMOVE_HEAD, the main checkout, REMOVE_MID, the flags, a space, the path.
+pub const REMOVE_HEAD : str = "git -C ";
+pub const REMOVE_MID : str = " worktree remove ";
+
+// What GitHub says about a branch. NONE is also what a missing, failed or unreadable answer says.
+pub const PR_NONE : u8 = 0;
+pub const PR_OPEN : u8 = 1;
+pub const PR_MERGED : u8 = 2;
+pub const PR_CLOSED : u8 = 3;
+
+// What holds a tree's lock.
+pub const LOCK_NONE : u8 = 0;
+pub const LOCK_LIVE : u8 = 1;
+pub const LOCK_DEAD : u8 = 2;
+pub const LOCK_UNKNOWN : u8 = 3;
+
+// The verdict on one checkout. Only REMOVABLE gets a line; every other is a reason to keep it.
+pub const V_REMOVABLE : u8 = 0;
+pub const V_KEEP_MAIN : u8 = 1;
+pub const V_KEEP_DIRTY : u8 = 2;
+pub const V_KEEP_LOCKED : u8 = 3;
+pub const V_KEEP_OPEN_PR : u8 = 4;
+pub const V_KEEP_NO_PR : u8 = 5;
+pub const V_KEEP_ODD_PATH : u8 = 6;
+pub const VERDICTS : u8 = 7;
+
+invariant the_verdicts_are_numbered { assert V_REMOVABLE == 0 and V_KEEP_ODD_PATH == 6 and VERDICTS == 7 and PR_CLOSED == 3 and LOCK_UNKNOWN == 3; }
+
+/// Does `git status --porcelain` print nothing but the untracked `target` link (or directory)?
+/// Empty is clean too. Every other entry, staged, modified, deleted or untracked, is work.
+pub fn only_target(status: string) -> bool {
+    var k : usize = 0;
+    while (k < status.len) {
+        const end : usize = line_end(status, k);
+        if (end > k and span_is(status, k, end, "?? target") == false and span_is(status, k, end, "?? target/") == false) { return false; }
+        k = end + 1;
+    }
+    return true;
+}
+
+/// The pid a lock's reason names: the digits after `(pid `, as Claude's agent worktrees write it.
+/// 0 when the reason names none.
+pub fn lock_pid(reason: string) -> u64 {
+    var k : usize = 0;
+    while (k < reason.len) {
+        if (starts(reason, k, "(pid ")) {
+            var e : usize = k + 5;
+            while (e < reason.len and reason[e] >= 48 and reason[e] <= 57) {
+                e = e + 1;
+            }
+            return digits(reason, k + 5, e);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// Who holds the lock: nobody, a live pid, a dead one, or something that cannot be checked (a lock
+/// with no pid in its reason).
+pub fn lock_state(locked: bool, pid: u64, alive: bool) -> u8 {
+    if (locked == false) { return LOCK_NONE; }
+    if (pid == 0) { return LOCK_UNKNOWN; }
+    if (alive) { return LOCK_LIVE; }
+    return LOCK_DEAD;
+}
+
+/// Is s safe to put in a URL and in a shell word as it stands: not empty, and only letters, digits
+/// and / . _ -? A branch name or a path that is not plain is not asked about and not printed.
+pub fn plain(s: string) -> bool {
+    if (s.len == 0) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        const ok : bool = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 47 or c == 46 or c == 95 or c == 45;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// What the answer of GitHub (the pull requests of one branch) says: OPEN when any is open, else
+/// MERGED when any was merged (merged_at is a time, not null), else CLOSED when any is closed, else
+/// NONE (no pull request, a state that is neither word, an error body, no text).
+pub fn pr_state(body: string) -> u8 {
+    var seen : u8 = PR_NONE;
+    var o : usize = next_pr(body, 0);
+    while (o < body.len) {
+        const e : usize = object_end(body, o);
+        const s : usize = key_at(body, o, e, 4, "state");
+        const m : usize = key_at(body, o, e, 4, "merged_at");
+        if (span_is(body, value_from(body, s), value_to(body, s), "open")) { return PR_OPEN; }
+        if (span_is(body, value_from(body, s), value_to(body, s), "closed")) {
+            if (m < body.len and body[m] == 34) {
+                seen = PR_MERGED;
+            } else {
+                if (seen == PR_NONE) { seen = PR_CLOSED; }
+            }
+        }
+        o = next_pr(body, e);
+    }
+    return seen;
+}
+
+/// The verdict on one checkout from its facts: is it the main checkout, does it hold work (or could
+/// not be read), who holds its lock, what GitHub says of its branch, is its path plain. The first
+/// fact that keeps it decides. A lock or a pull request state this code does not know keeps it too.
+pub fn verdict(main: bool, dirty: bool, lock: u8, pr: u8, path_ok: bool) -> u8 {
+    if (main) { return V_KEEP_MAIN; }
+    if (dirty) { return V_KEEP_DIRTY; }
+    if (lock != LOCK_NONE and lock != LOCK_DEAD) { return V_KEEP_LOCKED; }
+    if (pr == PR_OPEN) { return V_KEEP_OPEN_PR; }
+    if (pr != PR_MERGED and pr != PR_CLOSED) { return V_KEEP_NO_PR; }
+    if (path_ok == false) { return V_KEEP_ODD_PATH; }
+    return V_REMOVABLE;
+}
+
+/// The flags of `git worktree remove`: -f for the untracked target link, and -f -f for a tree whose
+/// lock a dead process left.
+pub fn remove_flags(lock: u8) -> string {
+    if (lock == LOCK_DEAD) { return "-f -f"; }
+    return "-f";
+}
+
+pub fn verdict_name(v: u8) -> string {
+    if (v == V_REMOVABLE) { return "REMOVABLE"; }
+    if (v == V_KEEP_MAIN) { return "KEEP_MAIN"; }
+    if (v == V_KEEP_DIRTY) { return "KEEP_DIRTY"; }
+    if (v == V_KEEP_LOCKED) { return "KEEP_LOCKED"; }
+    if (v == V_KEEP_OPEN_PR) { return "KEEP_OPEN_PR"; }
+    if (v == V_KEEP_NO_PR) { return "KEEP_NO_PR"; }
+    return "KEEP_ODD_PATH";
+}
+
+pub fn why(v: u8) -> string {
+    if (v == V_REMOVABLE) { return "its PR is merged or closed, it holds nothing but the target link, no live process holds its lock"; }
+    if (v == V_KEEP_MAIN) { return "the main checkout is never removed"; }
+    if (v == V_KEEP_DIRTY) { return "it holds work, or git could not read it"; }
+    if (v == V_KEEP_LOCKED) { return "a live process, or a lock with no pid to check, holds it"; }
+    if (v == V_KEEP_OPEN_PR) { return "its pull request is still open"; }
+    if (v == V_KEEP_NO_PR) { return "no merged or closed pull request was found for its branch"; }
+    return "its path has a character the printed line would need quoted for";
+}
+
+const AGENT_LOCK : string = "claude agent agent-a1a8e2b61031e3d98 (pid 5082 start Sun Oct 18 15:42:53 2026)";
+
+const MERGED : string = "[\n  {\n    \"head\": {\n      \"label\": \"gHashTag:claude/self-cleanup-skill-10804\",\n      \"ref\": \"claude/self-cleanup-skill-10804\"\n    },\n    \"merged_at\": \"2026-10-19T03:33:38Z\",\n    \"milestone\": {\n      \"state\": \"open\"\n    },\n    \"number\": 10808,\n    \"state\": \"closed\",\n    \"title\": \"skills: self-cleanup\"\n  }\n]";
+
+const CLOSED : string = "[\n  {\n    \"head\": {\n      \"ref\": \"claude/dropped\"\n    },\n    \"merged_at\": null,\n    \"number\": 10790,\n    \"state\": \"closed\"\n  }\n]";
+
+const OPEN : string = "[\n  {\n    \"body\": \"mentions \\\"state\\\": \\\"open\\\" in prose\",\n    \"head\": {\n      \"ref\": \"claude/open-one\"\n    },\n    \"merged_at\": null,\n    \"number\": 10811,\n    \"state\": \"open\"\n  }\n]";
+
+const CLOSED_THEN_OPEN : string = "[\n  {\n    \"merged_at\": null,\n    \"number\": 1,\n    \"state\": \"closed\"\n  },\n  {\n    \"merged_at\": null,\n    \"number\": 2,\n    \"state\": \"open\"\n  }\n]";
+
+const OPEN_THEN_MERGED : string = "[\n  {\n    \"merged_at\": null,\n    \"number\": 3,\n    \"state\": \"open\"\n  },\n  {\n    \"merged_at\": \"2026-10-01T00:00:00Z\",\n    \"number\": 4,\n    \"state\": \"closed\"\n  }\n]";
+
+const CLOSED_THEN_MERGED : string = "[\n  {\n    \"merged_at\": null,\n    \"number\": 5,\n    \"state\": \"closed\"\n  },\n  {\n    \"merged_at\": \"2026-10-01T00:00:00Z\",\n    \"number\": 6,\n    \"state\": \"closed\"\n  }\n]";
+
+// Scenario: a tree holding nothing but the untracked target link is clean; anything else is work.
+test only_the_target_link_is_clean {
+    assert only_target("") == true;
+    assert only_target("?? target") == true;
+    assert only_target("?? target/") == true;
+    assert only_target("?? target\n") == true;
+    assert only_target("?? target\n\n") == true;
+    assert only_target(" M cli/tri/src/trees.rs") == false;
+    assert only_target("?? target\n M a.rs") == false;
+    assert only_target(" M a.rs\n?? target") == false;
+    assert only_target("A  new.t27") == false;
+    assert only_target(" D gone.rs") == false;
+    assert only_target("?? notes.md") == false;
+    assert only_target("?? targets") == false;
+    assert only_target("?? target2/") == false;
+    assert only_target("?? src/target") == false;
+    assert only_target("?? target/x") == false;
+    assert only_target("?? target ") == false;
+}
+
+// Scenario: Claude's agent worktrees name the pid of their session in the lock's reason.
+test a_lock_names_its_pid {
+    assert lock_pid(AGENT_LOCK) == 5082;
+    assert lock_pid("(pid 7)") == 7;
+    assert lock_pid("(pid 123456") == 123456;
+    assert lock_pid("") == 0;
+    assert lock_pid("locked by hand") == 0;
+    assert lock_pid("pid 5082") == 0;
+    assert lock_pid("(pid )") == 0;
+    assert lock_pid("(pid x5)") == 0;
+    assert lock_pid("(pid 99999999999999999999999)") == 0;
+    assert lock_pid("agent (pid") == 0;
+}
+
+// Scenario: nobody, a live pid, a dead pid, and a lock that cannot be checked.
+test a_lock_is_held_by_nobody_a_live_pid_a_dead_one_or_an_unknown {
+    assert lock_state(false, 0, false) == LOCK_NONE;
+    assert lock_state(false, 5082, true) == LOCK_NONE;
+    assert lock_state(true, 5082, true) == LOCK_LIVE;
+    assert lock_state(true, 5082, false) == LOCK_DEAD;
+    assert lock_state(true, 0, true) == LOCK_UNKNOWN;
+    assert lock_state(true, 0, false) == LOCK_UNKNOWN;
+}
+
+// Scenario: only a plain name is asked about and printed.
+test a_branch_and_a_path_are_plain_or_not {
+    assert plain("claude/tri-worktrees-reap-10805") == true;
+    assert plain("worktree-agent-a5476fea5f7b1db56") == true;
+    assert plain("/Users/dev/t27/.claude/worktrees/agent-a1a8e2b61031e3d98") == true;
+    assert plain("/private/tmp/claude-501/-Users-playom/04183dc5-60f9/scratchpad/epic/wt_4a") == true;
+    assert plain("") == false;
+    assert plain("/Users/play om/t27") == false;
+    assert plain("/tmp/a;rm") == false;
+    assert plain("/tmp/a$b") == false;
+    assert plain("/tmp/a'b") == false;
+    assert plain("feature#1") == false;
+    assert plain("a+b") == false;
+    assert plain("a&b") == false;
+}
+
+// Scenario: the pull requests of a branch, as GitHub answers.
+test the_pull_requests_of_a_branch_are_read {
+    assert pr_state(MERGED) == PR_MERGED;
+    assert pr_state(CLOSED) == PR_CLOSED;
+    assert pr_state(OPEN) == PR_OPEN;
+    assert pr_state(CLOSED_THEN_OPEN) == PR_OPEN;
+    assert pr_state(OPEN_THEN_MERGED) == PR_OPEN;
+    assert pr_state(CLOSED_THEN_MERGED) == PR_MERGED;
+}
+
+// Scenario: no answer is NONE, never a pull request: an empty list, nothing, an error body (rate limit,
+// bad credentials), a pull request with no state, a state that is neither word, one written at the
+// wrong indent.
+test missing_or_unreadable_data_is_none {
+    assert pr_state("[]") == PR_NONE;
+    assert pr_state("") == PR_NONE;
+    assert pr_state("{\n  \"message\": \"Bad credentials\",\n  \"status\": \"401\"\n}") == PR_NONE;
+    assert pr_state("[\n  {\n    \"number\": 9\n  }\n]") == PR_NONE;
+    assert pr_state("[\n  {\n    \"merged_at\": null,\n    \"state\": \"draft\"\n  }\n]") == PR_NONE;
+    assert pr_state("[\n  {\n    \"number\": 9,\n      \"state\": \"closed\"\n  }\n]") == PR_NONE;
+    assert pr_state("[\n  {\n    \"number\": 9,\n    \"state\": \"OPEN\"\n  }\n]") == PR_NONE;
+}
+
+// Scenario: the nested objects do not speak for the pull request: the milestone of the merged one says
+// "open" and the body of the open one quotes "state": "closed" in prose.
+test a_nested_state_is_not_the_pull_requests {
+    assert pr_state(MERGED) != PR_OPEN;
+    const prose : string = "[\n  {\n    \"body\": \"fixed; \\\"state\\\": \\\"closed\\\"\",\n    \"merged_at\": null,\n    \"state\": \"open\"\n  }\n]";
+    assert pr_state(prose) == PR_OPEN;
+    const nested_only : string = "[\n  {\n    \"milestone\": {\n      \"state\": \"closed\"\n    },\n    \"number\": 5\n  }\n]";
+    assert pr_state(nested_only) == PR_NONE;
+}
+
+// Scenario: each verdict, with the facts that give it.
+test each_verdict_has_its_case {
+    assert verdict(false, false, LOCK_NONE, PR_MERGED, true) == V_REMOVABLE;
+    assert verdict(false, false, LOCK_NONE, PR_CLOSED, true) == V_REMOVABLE;
+    assert verdict(false, false, LOCK_DEAD, PR_MERGED, true) == V_REMOVABLE;
+    assert verdict(true, false, LOCK_NONE, PR_MERGED, true) == V_KEEP_MAIN;
+    assert verdict(false, true, LOCK_NONE, PR_MERGED, true) == V_KEEP_DIRTY;
+    assert verdict(false, false, LOCK_LIVE, PR_MERGED, true) == V_KEEP_LOCKED;
+    assert verdict(false, false, LOCK_UNKNOWN, PR_MERGED, true) == V_KEEP_LOCKED;
+    assert verdict(false, false, LOCK_NONE, PR_OPEN, true) == V_KEEP_OPEN_PR;
+    assert verdict(false, false, LOCK_NONE, PR_NONE, true) == V_KEEP_NO_PR;
+    assert verdict(false, false, LOCK_NONE, PR_MERGED, false) == V_KEEP_ODD_PATH;
+}
+
+// Scenario: the first fact that keeps a tree decides, so the reason shown is the gravest one.
+test the_first_keeping_fact_decides {
+    assert verdict(true, true, LOCK_LIVE, PR_OPEN, false) == V_KEEP_MAIN;
+    assert verdict(false, true, LOCK_LIVE, PR_OPEN, false) == V_KEEP_DIRTY;
+    assert verdict(false, false, LOCK_LIVE, PR_OPEN, false) == V_KEEP_LOCKED;
+    assert verdict(false, false, LOCK_NONE, PR_OPEN, false) == V_KEEP_OPEN_PR;
+    assert verdict(false, false, LOCK_NONE, PR_NONE, false) == V_KEEP_NO_PR;
+    assert verdict(false, false, LOCK_DEAD, PR_OPEN, true) == V_KEEP_OPEN_PR;
+}
+
+// Scenario (negative control): a merged branch whose tree holds one stray file is kept, and a clean tree
+// with no PR data is kept. The same facts with the stray file gone and the answer read are removable.
+test a_tree_is_never_removable_on_missing_data {
+    assert verdict(false, only_target(" M a.rs") == false, LOCK_NONE, PR_MERGED, true) == V_KEEP_DIRTY;
+    assert verdict(false, only_target("?? target") == false, LOCK_NONE, pr_state(""), true) == V_KEEP_NO_PR;
+    assert verdict(false, only_target("?? target") == false, LOCK_NONE, pr_state("{\n  \"message\": \"API rate limit exceeded\"\n}"), true) == V_KEEP_NO_PR;
+    assert verdict(false, only_target("?? target") == false, LOCK_NONE, pr_state(MERGED), true) == V_REMOVABLE;
+    assert verdict(false, only_target("?? target") == false, lock_state(true, lock_pid(AGENT_LOCK), true), pr_state(MERGED), true) == V_KEEP_LOCKED;
+    assert verdict(false, only_target("?? target") == false, lock_state(true, lock_pid(AGENT_LOCK), false), pr_state(MERGED), true) == V_REMOVABLE;
+    assert verdict(false, only_target("?? target") == false, lock_state(true, lock_pid("locked by hand"), false), pr_state(MERGED), true) == V_KEEP_LOCKED;
+}
+
+// Scenario: over every combination of facts, including a lock state and a PR state nobody defined, a
+// tree is REMOVABLE exactly when it is not main, not dirty, locked by nobody or a dead pid, its PR
+// merged or closed, and its path plain.
+test removable_exactly_when_every_fact_allows {
+    var m : u8 = 0;
+    while (m < 2) {
+        var d : u8 = 0;
+        while (d < 2) {
+            var l : u8 = 0;
+            while (l < 6) {
+                var p : u8 = 0;
+                while (p < 6) {
+                    var o : u8 = 0;
+                    while (o < 2) {
+                        const v : u8 = verdict(m == 1, d == 1, l, p, o == 1);
+                        const allowed : bool = m == 0 and d == 0 and (l == LOCK_NONE or l == LOCK_DEAD) and (p == PR_MERGED or p == PR_CLOSED) and o == 1;
+                        if (allowed) {
+                            assert v == V_REMOVABLE;
+                        } else {
+                            assert v != V_REMOVABLE;
+                            assert v < VERDICTS;
+                        }
+                        o = o + 1;
+                    }
+                    p = p + 1;
+                }
+                l = l + 1;
+            }
+            d = d + 1;
+        }
+        m = m + 1;
+    }
+}
+
+// Scenario: the line to run. A dead pid's lock needs -f twice; every other tree, once.
+test the_line_that_removes_a_tree {
+    assert span_is(REMOVE_HEAD, 0, REMOVE_HEAD.len, "git -C ");
+    assert span_is(REMOVE_MID, 0, REMOVE_MID.len, " worktree remove ");
+    assert span_is(remove_flags(LOCK_NONE), 0, 2, "-f");
+    assert remove_flags(LOCK_NONE).len == 2;
+    assert remove_flags(LOCK_DEAD).len == 5;
+    assert span_is(remove_flags(LOCK_DEAD), 0, 5, "-f -f");
+    assert remove_flags(LOCK_LIVE).len == 2;
+    assert starts(PULLS_URL, 0, "https://api.github.com/repos/gHashTag/t27/pulls?");
+    assert PULLS_URL[PULLS_URL.len - 1] == 58;
+}
+
+// Scenario: every verdict has its name and its reason.
+test the_words {
+    assert span_is(verdict_name(V_REMOVABLE), 0, 9, "REMOVABLE");
+    assert span_is(verdict_name(V_KEEP_MAIN), 0, 9, "KEEP_MAIN");
+    assert span_is(verdict_name(V_KEEP_DIRTY), 0, 10, "KEEP_DIRTY");
+    assert span_is(verdict_name(V_KEEP_LOCKED), 0, 11, "KEEP_LOCKED");
+    assert span_is(verdict_name(V_KEEP_OPEN_PR), 0, 12, "KEEP_OPEN_PR");
+    assert span_is(verdict_name(V_KEEP_NO_PR), 0, 10, "KEEP_NO_PR");
+    assert span_is(verdict_name(V_KEEP_ODD_PATH), 0, 13, "KEEP_ODD_PATH");
+    assert why(V_REMOVABLE)[0] == 105 and why(V_KEEP_MAIN)[4] == 109 and why(V_KEEP_DIRTY)[0] == 105;
+    assert why(V_KEEP_LOCKED)[0] == 97 and why(V_KEEP_OPEN_PR)[0] == 105 and why(V_KEEP_NO_PR)[0] == 110;
+    assert why(V_KEEP_ODD_PATH)[0] == 105;
+}

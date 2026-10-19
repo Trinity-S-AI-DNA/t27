@@ -1,0 +1,1114 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/igla/coder/hslm_bwd_ptx.t27 -- the PTX of the two HSLM backward GEMMs, written by t27.
+; Issue #10847. Forward kernel and PTX backend: specs/igla/coder/ternary_gemm_ptx.t27 (#10404, #10425).
+; --
+; What this is. specs/ml/train_hslm.t27 trains a 2.13M-parameter ternary transformer on the CPU in f64.
+; Its backward spends its time in two loops:
+;   ternary_matmul_t_add: dx[j] += sum_i w[j * out_dim + i] * dy[i]   (dX = dY x W^T, W ternary)
+;   outer_add:            gw[j * out_dim + i] += x[j] * dy[i]          (dW = X^T x dY, summed over rows)
+; This spec writes the PTX of one int8 tensor-core kernel for each, `hslm_dx_s8` and `hslm_dw_s8`, and
+; holds their CPU references, so a GPU result is checked bit-exactly by t27 code. It does not touch the
+; trainer; the quantize kernels and the wiring into train_hslm.t27 are a follow-up.
+; --
+; Both kernels compute C[m][n] = sum_k A(m, k) * B(k, n) into i32 C, row-major m x n, on the skeleton
+; of the forward v1 kernel: 128 x 128 block tile, k-steps of 32, 256 threads, 8 warps of 64 x 32, 16
+; mma.sync.m16n8k32.row.col.s32.s8.s8.s32 per k-step, sA and sB rows of 48 bytes (32 data + 16 pad).
+; Only how a tile reaches shared memory differs.
+;   hslm_dx_s8 (kernel 1). A = dYq, rows x out_dim i8 row-major (k = out_dim). B(i, j) = code j*k + i
+;     of the trainer's W (in_dim x out_dim, row-major, 2-bit codes four per byte, lane 0 low; n =
+;     in_dim). The reduction runs along a row of W, so each thread loads one u32 = 16 codes of one
+;     column of B (column t/2, codes (t%2)*16..+15 of the k-step) and writes them to sB with ONE
+;     16-byte store: no transpose. The decode is branch-free: spread the 2-bit codes of 8 lanes into 8
+;     nibbles (three shift-or-mask steps) and use them as prmt selectors into the table 0x00FF0100,
+;     whose bytes 0..3 are the decode of codes 0..3: 0, +1, -1, 0.
+;   hslm_dw_s8 (kernel 2). m = in_dim, n = out_dim, k = rows. A(i, r) = X[r][i] (X is rows x in_dim
+;     i8), B(r, j) = dY[r][j] (rows x out_dim s8). Both reductions run down a column, so each thread
+;     loads 16 bytes of one row (row t/8 of the k-step, elements (t%8)*16..+15) and stores them
+;     transposed, one byte per sA/sB row.
+; Scales (the host's side, stated here so the integer kernel has one meaning):
+;   dX: dYq[r][i] = round(dy[r][i] / s_r), s_r = max_i |dy[r][i]| / 127 (per row); dx[r][j] = s_r * C.
+;     The trainer's sum has no alpha in it; a per-matrix alpha is one scalar and commutes with the sum.
+;     |dx - ref| <= k * s_r / 2: each term is off by at most s_r / 2 times |w| <= 1.
+;   dW: Xq[r][i] = round(x / sx_i), sx_i = max_r |x[r][i]| / 127 (per COLUMN i); dYq likewise per
+;     column j. A per-row scale would sit inside the r-sum and could not be factored out of C.
+;     dw[i][j] = sx_i * sy_j * C; |dw - ref| <= k * sx_i * sy_j * (127/2 + 127/2 + 1/4).
+; Accumulation is i32 and exact: dX products are in [-128, 128], so k <= K_MAX_DX = 16777215; dW
+; products are in [-16256, 16384], so k <= K_MAX_DW = 131071. HSLM uses k <= 1782.
+; Preconditions, checked by shape_ok(): n % 16 == 0 (16-byte rows, 8-byte pair stores) for both;
+; dX also k % 16 == 0 (a 16-code word is aligned and wholly inside or outside k); dW also m % 16 == 0.
+; HSLM's 243 and 729 are padded with zeros to 256 and 736; zero rows and columns add nothing.
+; The honest limit, as for the forward: a kernel-specific emitter, not a general t27 -> PTX lowering.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module igla-coder-hslm-bwd-ptx;
+
+/// Kernel ids as `t27c ptx-run --kernel` takes them; 0 is the forward kernel of ternary_gemm_ptx.t27.
+pub const KERNEL_FWD : u32 = 0;
+pub const KERNEL_DX : u32 = 1;
+pub const KERNEL_DW : u32 = 2;
+/// Block tile, k-step and thread count, as in the forward kernel.
+pub const BM : u32 = 128;
+pub const BN : u32 = 128;
+pub const BK : u32 = 32;
+pub const THREADS : u32 = 256;
+pub const SMEM_STRIDE : u32 = 48;
+/// Largest k with no i32 overflow: 128 * 16777215 and 16384 * 131071 are below 2^31.
+pub const K_MAX_DX : usize = 16777215;
+pub const K_MAX_DW : usize = 131071;
+pub const GRID_Y_MAX : usize = 65535;
+pub const PTX_CAP : usize = 32768;
+/// prmt table: byte c is the decode of code c (0, +1, -1 = 0xFF, 0), i.e. 0x00FF0100.
+pub const DECODE_TABLE : u32 = 16711936;
+/// HSLM (specs/ml/train_hslm.t27): context, embedding, feed-forward, vocabulary, windows per step.
+pub const HSLM_CTX : usize = 27;
+pub const HSLM_EMBED : usize = 243;
+pub const HSLM_FF : usize = 729;
+pub const HSLM_VOCAB : usize = 729;
+pub const HSLM_BATCH : usize = 66;
+pub const HSLM_ROWS : usize = 1782;
+/// 243 and 729 rounded up to a multiple of 16.
+pub const HSLM_EMBED_PAD : usize = 256;
+pub const HSLM_FF_PAD : usize = 736;
+
+// ============================================================================
+// 1. A bounded text writer (as in ternary_gemm_ptx.t27)
+// ============================================================================
+
+fn put_s(out : []u8, cap : usize, w : usize, s : str) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (w + i < cap) { out[w + i] = s[i]; }
+        i += 1;
+    }
+    return w + s.len;
+}
+
+fn put_u(out : []u8, cap : usize, w : usize, v : u32) -> usize {
+    var d : u32 = 1;
+    while (v / d >= 10) { d = d * 10; }
+    var x : usize = w;
+    while (d > 0) {
+        const c : u8 = '0' + (((v / d) % 10) as u8);
+        if (x < cap) { out[x] = c; }
+        x += 1;
+        d = d / 10;
+    }
+    return x;
+}
+
+fn ins(out : []u8, cap : usize, w : usize, s : str) -> usize {
+    // One writer call per statement: a nested call would borrow `out` twice in the Rust that gen-rust writes.
+    var x : usize = put_s(out, cap, w, "    ");
+    x = put_s(out, cap, x, s);
+    return put_s(out, cap, x, "\n");
+}
+
+fn put_quad(out : []u8, cap : usize, w : usize, name : str, first : u32) -> usize {
+    var x : usize = put_s(out, cap, w, "{");
+    var j : u32 = 0;
+    while (j < 4) {
+        if (j > 0) { x = put_s(out, cap, x, ", "); }
+        x = put_s(out, cap, x, name);
+        x = put_u(out, cap, x, first + j);
+        j += 1;
+    }
+    return put_s(out, cap, x, "}");
+}
+
+fn put_name_at(out : []u8, cap : usize, w : usize, kernel : u32) -> usize {
+    if (kernel == KERNEL_FWD) { return put_s(out, cap, w, "ternary_gemm_s8"); }
+    if (kernel == KERNEL_DX) { return put_s(out, cap, w, "hslm_dx_s8"); }
+    if (kernel == KERNEL_DW) { return put_s(out, cap, w, "hslm_dw_s8"); }
+    return w;
+}
+
+/// The entry name of a kernel into out[0..cap), the one cuModuleGetFunction looks up; 0 bytes for an unknown id.
+pub fn put_name(kernel : u32, out : []u8, cap : usize) -> usize {
+    return put_name_at(out, cap, 0, kernel);
+}
+
+// ============================================================================
+// 2. The kernels, section by section
+// ============================================================================
+
+fn emit_header(out : []u8, cap : usize, w : usize, kernel : u32) -> usize {
+    var x : usize = put_s(out, cap, w, "// ");
+    x = put_name_at(out, cap, x, kernel);
+    x = put_s(out, cap, x, " -- emitted by t27c from specs/igla/coder/hslm_bwd_ptx.t27 (#10847). Do not edit.\n");
+    x = put_s(out, cap, x, ".version 7.0\n.target sm_80\n.address_size 64\n\n");
+    x = put_s(out, cap, x, ".visible .entry ");
+    x = put_name_at(out, cap, x, kernel);
+    x = put_s(out, cap, x, "(\n");
+    x = put_s(out, cap, x, "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n");
+    x = put_s(out, cap, x, "    .param .u32 p_m,\n    .param .u32 p_n,\n    .param .u32 p_k\n)\n");
+    x = put_s(out, cap, x, ".maxntid 256, 1, 1\n{\n");
+    x = ins(out, cap, x, ".reg .pred %p<10>;");
+    x = ins(out, cap, x, ".reg .b32 %r<64>;");
+    x = ins(out, cap, x, ".reg .b32 %acc<64>;");
+    x = ins(out, cap, x, ".reg .b32 %fa<16>;");
+    x = ins(out, cap, x, ".reg .b32 %fb<8>;");
+    x = ins(out, cap, x, ".reg .b64 %rd<12>;");
+    x = ins(out, cap, x, ".shared .align 16 .b8 sA[6144];");
+    x = ins(out, cap, x, ".shared .align 16 .b8 sB[6144];");
+    return x;
+}
+
+/// Parameters and thread coordinates: r1 m, r2 n, r3 k, r4 tid, r5 block x, r6 block y.
+fn emit_params(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "ld.param.u64 %rd1, [p_a];");
+    x = ins(out, cap, x, "ld.param.u64 %rd2, [p_b];");
+    x = ins(out, cap, x, "ld.param.u64 %rd3, [p_c];");
+    x = ins(out, cap, x, "ld.param.u32 %r1, [p_m];");
+    x = ins(out, cap, x, "ld.param.u32 %r2, [p_n];");
+    x = ins(out, cap, x, "ld.param.u32 %r3, [p_k];");
+    x = ins(out, cap, x, "cvta.to.global.u64 %rd1, %rd1;");
+    x = ins(out, cap, x, "cvta.to.global.u64 %rd2, %rd2;");
+    x = ins(out, cap, x, "cvta.to.global.u64 %rd3, %rd3;");
+    x = ins(out, cap, x, "mov.u32 %r4, %tid.x;");
+    x = ins(out, cap, x, "mov.u32 %r5, %ctaid.x;");
+    x = ins(out, cap, x, "mov.u32 %r6, %ctaid.y;");
+    x = ins(out, cap, x, "mov.u32 %r10, sA;");
+    return ins(out, cap, x, "mov.u32 %r15, sB;");
+}
+
+/// dX: A row r7 = tid/2 and B column r7, both at k offset r8 = (tid%2)*16. r11 / r16 are the sA / sB
+/// store addresses, rd4 the A row pointer, rd7 the pointer to byte (j*k + r8)/4 of the codes of column
+/// j = r14, r44 / r45 the prmt table and its zero partner.
+fn emit_setup_dx(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "shr.u32 %r7, %r4, 1;");
+    x = ins(out, cap, x, "and.b32 %r8, %r4, 1;");
+    x = ins(out, cap, x, "shl.b32 %r8, %r8, 4;");
+    x = ins(out, cap, x, "shl.b32 %r9, %r6, 7;");
+    x = ins(out, cap, x, "add.u32 %r9, %r9, %r7;");
+    x = ins(out, cap, x, "setp.lt.u32 %p1, %r9, %r1;");
+    x = ins(out, cap, x, "mad.lo.u32 %r11, %r7, 48, %r8;");
+    x = ins(out, cap, x, "add.u32 %r16, %r11, %r15;");
+    x = ins(out, cap, x, "add.u32 %r11, %r11, %r10;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd4, %r9, %r3;");
+    x = ins(out, cap, x, "add.u64 %rd4, %rd4, %rd1;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd5, %r8;");
+    x = ins(out, cap, x, "add.u64 %rd4, %rd4, %rd5;");
+    x = ins(out, cap, x, "shl.b32 %r14, %r5, 7;");
+    x = ins(out, cap, x, "add.u32 %r14, %r14, %r7;");
+    x = ins(out, cap, x, "setp.lt.u32 %p2, %r14, %r2;");
+    x = ins(out, cap, x, "shr.u32 %r17, %r3, 2;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd7, %r14, %r17;");
+    x = ins(out, cap, x, "add.u64 %rd7, %rd7, %rd2;");
+    x = ins(out, cap, x, "shr.u32 %r18, %r8, 2;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd8, %r18;");
+    x = ins(out, cap, x, "add.u64 %rd7, %rd7, %rd8;");
+    x = ins(out, cap, x, "mov.b32 %r44, 16711936;");
+    return ins(out, cap, x, "mov.b32 %r45, 0;");
+}
+
+/// dW: k-row r12 = tid/8 of both tiles, element chunk r13 = (tid%8)*16; i = r9 along m, j = r14 along n.
+fn emit_setup_dw(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "shr.u32 %r12, %r4, 3;");
+    x = ins(out, cap, x, "and.b32 %r13, %r4, 7;");
+    x = ins(out, cap, x, "shl.b32 %r13, %r13, 4;");
+    x = ins(out, cap, x, "shl.b32 %r9, %r6, 7;");
+    x = ins(out, cap, x, "add.u32 %r9, %r9, %r13;");
+    x = ins(out, cap, x, "setp.lt.u32 %p1, %r9, %r1;");
+    x = ins(out, cap, x, "shl.b32 %r14, %r5, 7;");
+    x = ins(out, cap, x, "add.u32 %r14, %r14, %r13;");
+    x = ins(out, cap, x, "setp.lt.u32 %p2, %r14, %r2;");
+    x = ins(out, cap, x, "mad.lo.u32 %r11, %r13, 48, %r12;");
+    x = ins(out, cap, x, "add.u32 %r16, %r11, %r15;");
+    return ins(out, cap, x, "add.u32 %r11, %r11, %r10;");
+}
+
+/// Warp and lane coordinates, the two fragment bases, k0 = 0 and the 64 accumulators (as the forward).
+fn emit_warp_setup(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "shr.u32 %r19, %r4, 5;");
+    x = ins(out, cap, x, "and.b32 %r20, %r4, 31;");
+    x = ins(out, cap, x, "shr.u32 %r21, %r20, 2;");
+    x = ins(out, cap, x, "and.b32 %r22, %r20, 3;");
+    x = ins(out, cap, x, "shr.u32 %r23, %r19, 2;");
+    x = ins(out, cap, x, "and.b32 %r24, %r19, 3;");
+    x = ins(out, cap, x, "shl.b32 %r26, %r22, 2;");
+    x = ins(out, cap, x, "shl.b32 %r25, %r23, 6;");
+    x = ins(out, cap, x, "add.u32 %r25, %r25, %r21;");
+    x = ins(out, cap, x, "mul.lo.u32 %r25, %r25, 48;");
+    x = ins(out, cap, x, "add.u32 %r25, %r25, %r26;");
+    x = ins(out, cap, x, "add.u32 %r25, %r25, %r10;");
+    x = ins(out, cap, x, "shl.b32 %r27, %r24, 5;");
+    x = ins(out, cap, x, "add.u32 %r27, %r27, %r21;");
+    x = ins(out, cap, x, "mul.lo.u32 %r27, %r27, 48;");
+    x = ins(out, cap, x, "add.u32 %r27, %r27, %r26;");
+    x = ins(out, cap, x, "add.u32 %r27, %r27, %r15;");
+    x = ins(out, cap, x, "mov.u32 %r28, 0;");
+    var i : u32 = 0;
+    while (i < 64) {
+        x = put_s(out, cap, x, "    mov.b32 %acc");
+        x = put_u(out, cap, x, i);
+        x = put_s(out, cap, x, ", 0;\n");
+        i += 1;
+    }
+    return x;
+}
+
+/// Eight codes of r35 (half hh) into two words of s8 weights, r50 + 2 hh and r51 + 2 hh: spread the
+/// 2-bit codes into nibbles, then prmt picks byte c of DECODE_TABLE for code c.
+fn emit_decode_half(out : []u8, cap : usize, w : usize, hh : u32) -> usize {
+    var x : usize = w;
+    if (hh == 0) {
+        x = ins(out, cap, x, "and.b32 %r36, %r35, 65535;");
+    } else {
+        x = ins(out, cap, x, "shr.u32 %r36, %r35, 16;");
+    }
+    x = ins(out, cap, x, "shl.b32 %r37, %r36, 8;");
+    x = ins(out, cap, x, "or.b32 %r36, %r36, %r37;");
+    x = ins(out, cap, x, "and.b32 %r36, %r36, 16711935;");
+    x = ins(out, cap, x, "shl.b32 %r37, %r36, 4;");
+    x = ins(out, cap, x, "or.b32 %r36, %r36, %r37;");
+    x = ins(out, cap, x, "and.b32 %r36, %r36, 252645135;");
+    x = ins(out, cap, x, "shl.b32 %r37, %r36, 2;");
+    x = ins(out, cap, x, "or.b32 %r36, %r36, %r37;");
+    x = ins(out, cap, x, "and.b32 %r36, %r36, 858993459;");
+    x = put_s(out, cap, x, "    prmt.b32 %r");
+    x = put_u(out, cap, x, 50 + 2 * hh);
+    x = put_s(out, cap, x, ", %r44, %r45, %r36;\n");
+    x = ins(out, cap, x, "shr.u32 %r37, %r36, 16;");
+    x = put_s(out, cap, x, "    prmt.b32 %r");
+    x = put_u(out, cap, x, 51 + 2 * hh);
+    return put_s(out, cap, x, ", %r44, %r45, %r37;\n");
+}
+
+/// The tile loads of one dX k-step (k0 in r28): A as the forward, then 16 codes -> one 16-byte store.
+fn emit_loads_dx(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "add.u32 %r29, %r28, %r8;");
+    x = ins(out, cap, x, "setp.lt.u32 %p4, %r29, %r3;");
+    x = ins(out, cap, x, "and.pred %p5, %p4, %p2;");
+    x = ins(out, cap, x, "and.pred %p4, %p4, %p1;");
+    x = ins(out, cap, x, "mov.b32 %r30, 0;");
+    x = ins(out, cap, x, "mov.b32 %r31, 0;");
+    x = ins(out, cap, x, "mov.b32 %r32, 0;");
+    x = ins(out, cap, x, "mov.b32 %r33, 0;");
+    x = ins(out, cap, x, "mov.b32 %r35, 0;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd5, %r28;");
+    x = ins(out, cap, x, "add.u64 %rd6, %rd4, %rd5;");
+    x = ins(out, cap, x, "@%p4 ld.global.v4.u32 {%r30, %r31, %r32, %r33}, [%rd6];");
+    x = ins(out, cap, x, "st.shared.v4.u32 [%r11], {%r30, %r31, %r32, %r33};");
+    x = ins(out, cap, x, "shr.u32 %r34, %r28, 2;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd8, %r34;");
+    x = ins(out, cap, x, "add.u64 %rd9, %rd7, %rd8;");
+    x = ins(out, cap, x, "@%p5 ld.global.u32 %r35, [%rd9];");
+    x = emit_decode_half(out, cap, x, 0);
+    x = emit_decode_half(out, cap, x, 1);
+    return ins(out, cap, x, "st.shared.v4.u32 [%r16], {%r50, %r51, %r52, %r53};");
+}
+
+/// 16 bytes in r<src>..r<src+3> to 16 consecutive tile rows: byte e at [base + 48 e].
+fn emit_transposed(out : []u8, cap : usize, w : usize, src : u32, base : str, tmp : str) -> usize {
+    var x : usize = w;
+    var e : u32 = 0;
+    while (e < 16) {
+        const word : u32 = src + e / 4;
+        const byte : u32 = e % 4;
+        if (byte != 0) {
+            x = put_s(out, cap, x, "    shr.u32 ");
+            x = put_s(out, cap, x, tmp);
+            x = put_s(out, cap, x, ", %r");
+            x = put_u(out, cap, x, word);
+            x = put_s(out, cap, x, ", ");
+            x = put_u(out, cap, x, 8 * byte);
+            x = put_s(out, cap, x, ";\n");
+        }
+        x = put_s(out, cap, x, "    st.shared.u8 [");
+        x = put_s(out, cap, x, base);
+        x = put_s(out, cap, x, "+");
+        x = put_u(out, cap, x, e * SMEM_STRIDE);
+        x = put_s(out, cap, x, "], ");
+        if (byte == 0) {
+            x = put_s(out, cap, x, "%r");
+            x = put_u(out, cap, x, word);
+        } else {
+            x = put_s(out, cap, x, tmp);
+        }
+        x = put_s(out, cap, x, ";\n");
+        e += 1;
+    }
+    return x;
+}
+
+/// The tile loads of one dW k-step: row r = k0 + r12 of X (16 bytes at column i) and of dY (at j).
+fn emit_loads_dw(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "add.u32 %r34, %r28, %r12;");
+    x = ins(out, cap, x, "setp.lt.u32 %p8, %r34, %r3;");
+    x = ins(out, cap, x, "and.pred %p4, %p8, %p1;");
+    x = ins(out, cap, x, "and.pred %p5, %p8, %p2;");
+    x = ins(out, cap, x, "mov.b32 %r30, 0;");
+    x = ins(out, cap, x, "mov.b32 %r31, 0;");
+    x = ins(out, cap, x, "mov.b32 %r32, 0;");
+    x = ins(out, cap, x, "mov.b32 %r33, 0;");
+    x = ins(out, cap, x, "mov.b32 %r50, 0;");
+    x = ins(out, cap, x, "mov.b32 %r51, 0;");
+    x = ins(out, cap, x, "mov.b32 %r52, 0;");
+    x = ins(out, cap, x, "mov.b32 %r53, 0;");
+    x = ins(out, cap, x, "mul.wide.u32 %rd6, %r34, %r1;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd5, %r9;");
+    x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd5;");
+    x = ins(out, cap, x, "add.u64 %rd6, %rd6, %rd1;");
+    x = ins(out, cap, x, "@%p4 ld.global.v4.u32 {%r30, %r31, %r32, %r33}, [%rd6];");
+    x = ins(out, cap, x, "mul.wide.u32 %rd9, %r34, %r2;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd8, %r14;");
+    x = ins(out, cap, x, "add.u64 %rd9, %rd9, %rd8;");
+    x = ins(out, cap, x, "add.u64 %rd9, %rd9, %rd2;");
+    x = ins(out, cap, x, "@%p5 ld.global.v4.u32 {%r50, %r51, %r52, %r53}, [%rd9];");
+    x = emit_transposed(out, cap, x, 30, "%r11", "%r36");
+    return emit_transposed(out, cap, x, 50, "%r16", "%r37");
+}
+
+fn emit_lds(out : []u8, cap : usize, w : usize, reg : str, i : u32, base : str, off : u32) -> usize {
+    var x : usize = put_s(out, cap, w, "    ld.shared.u32 ");
+    x = put_s(out, cap, x, reg);
+    x = put_u(out, cap, x, i);
+    x = put_s(out, cap, x, ", [");
+    x = put_s(out, cap, x, base);
+    x = put_s(out, cap, x, "+");
+    x = put_u(out, cap, x, off);
+    return put_s(out, cap, x, "];\n");
+}
+
+/// The fragment loads and the 16 mma.sync of one k-step, the forward kernel's.
+fn emit_mma_step(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = w;
+    var mi : u32 = 0;
+    while (mi < 4) {
+        const off : u32 = mi * 16 * SMEM_STRIDE;
+        x = emit_lds(out, cap, x, "%fa", mi * 4, "%r25", off);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 1, "%r25", off + 8 * SMEM_STRIDE);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 2, "%r25", off + 16);
+        x = emit_lds(out, cap, x, "%fa", mi * 4 + 3, "%r25", off + 8 * SMEM_STRIDE + 16);
+        mi += 1;
+    }
+    var ni : u32 = 0;
+    while (ni < 4) {
+        x = emit_lds(out, cap, x, "%fb", ni * 2, "%r27", ni * 8 * SMEM_STRIDE);
+        x = emit_lds(out, cap, x, "%fb", ni * 2 + 1, "%r27", ni * 8 * SMEM_STRIDE + 16);
+        ni += 1;
+    }
+    mi = 0;
+    while (mi < 4) {
+        ni = 0;
+        while (ni < 4) {
+            const b : u32 = (mi * 4 + ni) * 4;
+            x = put_s(out, cap, x, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ");
+            x = put_quad(out, cap, x, "%acc", b);
+            x = put_s(out, cap, x, ", ");
+            x = put_quad(out, cap, x, "%fa", mi * 4);
+            x = put_s(out, cap, x, ", {%fb");
+            x = put_u(out, cap, x, ni * 2);
+            x = put_s(out, cap, x, ", %fb");
+            x = put_u(out, cap, x, ni * 2 + 1);
+            x = put_s(out, cap, x, "}, ");
+            x = put_quad(out, cap, x, "%acc", b);
+            x = put_s(out, cap, x, ";\n");
+            ni += 1;
+        }
+        mi += 1;
+    }
+    return x;
+}
+
+fn emit_store(out : []u8, cap : usize, w : usize, dr : u32, dc : u32, b : u32) -> usize {
+    var x : usize = put_s(out, cap, w, "    add.u32 %r41, %r39, ");
+    x = put_u(out, cap, x, dr);
+    x = put_s(out, cap, x, ";\n");
+    x = put_s(out, cap, x, "    add.u32 %r42, %r40, ");
+    x = put_u(out, cap, x, dc);
+    x = put_s(out, cap, x, ";\n");
+    x = ins(out, cap, x, "setp.lt.u32 %p6, %r41, %r1;");
+    x = ins(out, cap, x, "setp.lt.u32 %p7, %r42, %r2;");
+    x = ins(out, cap, x, "and.pred %p6, %p6, %p7;");
+    x = ins(out, cap, x, "cvt.u64.u32 %rd10, %r42;");
+    x = ins(out, cap, x, "mad.wide.u32 %rd10, %r41, %r2, %rd10;");
+    x = ins(out, cap, x, "shl.b64 %rd10, %rd10, 2;");
+    x = ins(out, cap, x, "add.u64 %rd10, %rd10, %rd3;");
+    x = put_s(out, cap, x, "    @%p6 st.global.v2.u32 [%rd10], {%acc");
+    x = put_u(out, cap, x, b);
+    x = put_s(out, cap, x, ", %acc");
+    x = put_u(out, cap, x, b + 1);
+    return put_s(out, cap, x, "};\n");
+}
+
+/// The 32 guarded pair stores of the forward kernel's epilogue.
+fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "shl.b32 %r39, %r6, 7;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r23, 6;");
+    x = ins(out, cap, x, "add.u32 %r39, %r39, %r41;");
+    x = ins(out, cap, x, "add.u32 %r39, %r39, %r21;");
+    x = ins(out, cap, x, "shl.b32 %r40, %r5, 7;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r24, 5;");
+    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r22, 1;");
+    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
+    var mi : u32 = 0;
+    while (mi < 4) {
+        var ni : u32 = 0;
+        while (ni < 4) {
+            const b : u32 = (mi * 4 + ni) * 4;
+            x = emit_store(out, cap, x, mi * 16, ni * 8, b);
+            x = emit_store(out, cap, x, mi * 16 + 8, ni * 8, b + 2);
+            ni += 1;
+        }
+        mi += 1;
+    }
+    return x;
+}
+
+/// The whole text of kernel 1 or 2 into out[0..cap). Returns the bytes it needs (more than cap means
+/// a clipped text); an unknown id writes nothing and returns 0.
+pub fn emit_ptx(kernel : u32, out : []u8, cap : usize) -> usize {
+    if (kernel != KERNEL_DX and kernel != KERNEL_DW) { return 0; }
+    var x : usize = emit_header(out, cap, 0, kernel);
+    x = emit_params(out, cap, x);
+    if (kernel == KERNEL_DX) {
+        x = emit_setup_dx(out, cap, x);
+    } else {
+        x = emit_setup_dw(out, cap, x);
+    }
+    x = emit_warp_setup(out, cap, x);
+    x = put_s(out, cap, x, "LOOP_K:\n");
+    x = ins(out, cap, x, "setp.ge.u32 %p3, %r28, %r3;");
+    x = ins(out, cap, x, "@%p3 bra DONE_K;");
+    if (kernel == KERNEL_DX) {
+        x = emit_loads_dx(out, cap, x);
+    } else {
+        x = emit_loads_dw(out, cap, x);
+    }
+    x = ins(out, cap, x, "bar.sync 0;");
+    x = emit_mma_step(out, cap, x);
+    x = ins(out, cap, x, "bar.sync 0;");
+    x = ins(out, cap, x, "add.u32 %r28, %r28, 32;");
+    x = ins(out, cap, x, "bra LOOP_K;");
+    x = put_s(out, cap, x, "DONE_K:\n");
+    x = emit_epilogue(out, cap, x);
+    x = ins(out, cap, x, "ret;");
+    return put_s(out, cap, x, "}\n");
+}
+
+// ============================================================================
+// 3. Launch geometry, accepted shapes, buffer sizes
+// ============================================================================
+
+/// Blocks along a dimension of x elements: ceil(x / 128). The grid is (grid_dim(n), grid_dim(m)).
+pub fn grid_dim(x : usize) -> u32 {
+    return ((x + 127) / 128) as u32;
+}
+
+/// Whether kernel 1 or 2 can run an m x n output over k.
+pub fn shape_ok(kernel : u32, m : usize, n : usize, k : usize) -> bool {
+    if (m < 1 or n < 16 or n % 16 != 0) { return false; }
+    if ((m + 127) / 128 > GRID_Y_MAX) { return false; }
+    if (kernel == KERNEL_DX) { return k >= 16 and k % 16 == 0 and k <= K_MAX_DX; }
+    if (kernel == KERNEL_DW) { return m % 16 == 0 and k >= 1 and k <= K_MAX_DW; }
+    return false;
+}
+
+/// Bytes of the B operand: k x n 2-bit codes for kernels 0 and 1, k x n s8 for kernel 2. A is m * k bytes
+/// for every kernel (dX: dYq rows x k; dW: X as k rows x m).
+pub fn b_len(kernel : u32, n : usize, k : usize) -> usize {
+    if (kernel == KERNEL_DW) { return k * n; }
+    return k * n / 4;
+}
+
+// ============================================================================
+// 4. The integer references and the mismatch count
+// ============================================================================
+
+/// Code i of a packed code matrix, lane 0 in the low bits.
+pub fn code_at(wp : []const u8, i : usize) -> u32 {
+    const b : u32 = wp[i / 4] as u32;
+    const sh : u32 = ((i % 4) * 2) as u32;
+    return (b >> sh) & 3;
+}
+
+/// The decode of ternary_gemm_gpu.t27: 0 -> 0, 1 -> +1, 2 -> -1, 3 -> 0.
+pub fn weight(code : u32) -> i32 {
+    return ((code & 1) as i32) - (((code >> 1) & 1) as i32);
+}
+
+/// A byte of B read as s8.
+pub fn sbyte(v : u8) -> i32 {
+    const u : i32 = v as i32;
+    if (u >= 128) { return u - 256; }
+    return u;
+}
+
+/// acc[0..n) = row `row` of C.
+///   kernel 1: acc[j] = sum_i a[row * k + i] * w(j * k + i), ternary_matmul_t_add's index layout;
+///   kernel 2: acc[j] = sum_r a[r * m + row] * b[r * n + j], outer_add's layout summed over rows.
+pub fn ref_row(kernel : u32, a : []const i8, b : []const u8, m : usize, n : usize, k : usize, row : usize, acc : []i32) -> void {
+    var j : usize = 0;
+    while (j < n) {
+        var s : i32 = 0;
+        var r : usize = 0;
+        while (r < k) {
+            if (kernel == KERNEL_DX) {
+                s += (a[row * k + r] as i32) * weight(code_at(b, j * k + r));
+            } else {
+                s += (a[r * m + row] as i32) * sbyte(b[r * n + j]);
+            }
+            r += 1;
+        }
+        acc[j] = s;
+        j += 1;
+    }
+}
+
+/// Entries of c (m x n) that differ from the reference over rows 0, stride, 2 stride, ... and always
+/// the last row; stride 0 or 1 checks every row. acc is n entries of scratch.
+pub fn mismatches(kernel : u32, a : []const i8, b : []const u8, c : []const i32, m : usize, n : usize, k : usize, stride : usize, acc : []i32) -> usize {
+    var st : usize = stride;
+    if (st == 0) { st = 1; }
+    var bad : usize = 0;
+    var row : usize = 0;
+    while (row < m) {
+        ref_row(kernel, a, b, m, n, k, row, acc);
+        var col : usize = 0;
+        while (col < n) {
+            if (c[row * n + col] != acc[col]) { bad += 1; }
+            col += 1;
+        }
+        if (row + 1 < m and row + st >= m) {
+            row = m - 1;
+        } else {
+            row += st;
+        }
+    }
+    return bad;
+}
+
+// ============================================================================
+// 5. The host's scales, and the decode the kernel runs, modelled on the CPU
+// ============================================================================
+
+/// |x|.
+pub fn fabs64(x : f64) -> f64 {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+/// max |v[base + q * step]| / 127 over q < count: the symmetric int8 scale of one row or column.
+pub fn scale_of(v : []const f64, base : usize, count : usize, step : usize) -> f64 {
+    var mx : f64 = 0.0;
+    var q : usize = 0;
+    while (q < count) {
+        const t : f64 = fabs64(v[base + q * step]);
+        if (t > mx) { mx = t; }
+        q += 1;
+    }
+    return mx / 127.0;
+}
+
+/// round(x / s) to nearest, halves away from zero, clamped to [-127, 127]; 0 when s is 0.
+pub fn quantize(x : f64, s : f64) -> i8 {
+    if (s == 0.0) { return 0; }
+    const y : f64 = x / s;
+    var q : i64 = 0;
+    if (y >= 0.0) {
+        q = (y + 0.5) as i64;
+    } else {
+        q = 0 - (((0.0 - y) + 0.5) as i64);
+    }
+    if (q > 127) { q = 127; }
+    if (q < -127) { q = -127; }
+    return q as i8;
+}
+
+/// The kernel's three shift-or-mask steps: the 2-bit code q of x (x < 65536) moves to bits 4q..4q+1.
+pub fn spread8(x : u32) -> u32 {
+    var y : u32 = (x | (x << 8)) & 16711935;
+    y = (y | (y << 4)) & 252645135;
+    return (y | (y << 2)) & 858993459;
+}
+
+/// prmt.b32 d, DECODE_TABLE, 0, sel in its default mode: result byte q is byte (sel >> 4q) & 7 of
+/// the eight bytes (0, DECODE_TABLE); bit 3 of a selector nibble (sign replicate) is never set here.
+pub fn prmt_table(sel : u32) -> u32 {
+    var d : u32 = 0;
+    var q : u32 = 0;
+    while (q < 4) {
+        const idx : u32 = (sel >> (4 * q)) & 7;
+        var byte : u32 = 0;
+        if (idx < 4) { byte = (DECODE_TABLE >> (8 * idx)) & 255; }
+        d = d | (byte << (8 * q));
+        q += 1;
+    }
+    return d;
+}
+
+/// Word wq (0..3) of the 16 s8 weights the kernel stores for one code word.
+pub fn decoded_word(word : u32, wq : u32) -> u32 {
+    var half : u32 = word & 65535;
+    if (wq >= 2) { half = word >> 16; }
+    const sp : u32 = spread8(half);
+    if (wq % 2 == 0) { return prmt_table(sp); }
+    return prmt_table(sp >> 16);
+}
+
+// ============================================================================
+// 6. Test helpers
+// ============================================================================
+
+fn at_text(t : []const u8, n : usize, at : usize, s : str) -> bool {
+    if (at + s.len > n) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (t[at + i] != s[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn count_text(t : []const u8, n : usize, s : str) -> usize {
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (at_text(t, n, i, s)) { c += 1; }
+        i += 1;
+    }
+    return c;
+}
+
+/// 31-bit LCG (glibc constants), the generator of ternary_gemm_ptx.t27.
+fn lcg(s : u64) -> u64 {
+    return (s * 1103515245 + 12345) % 2147483648;
+}
+
+/// A value in [-1, 1] in steps of 1/1000 from the LCG state s.
+fn unit(s : u64) -> f64 {
+    return (((s >> 16) % 2001) as f64) / 1000.0 - 1.0;
+}
+
+// ============================================================================
+// 7. Tests
+// ============================================================================
+
+test both_kernels_open_with_their_header_and_entry {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DX, &out, PTX_CAP);
+    assert at_text(&out, m, 0, "// hslm_dx_s8 -- emitted by t27c from specs/igla/coder/hslm_bwd_ptx.t27 (#10847). Do not edit.\n.version 7.0\n.target sm_80\n.address_size 64\n\n");
+    assert count_text(&out, m, ".visible .entry hslm_dx_s8(\n    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_m,\n    .param .u32 p_n,\n    .param .u32 p_k\n)\n.maxntid 256, 1, 1\n{\n") == 1;
+    const d : usize = emit_ptx(KERNEL_DW, &out, PTX_CAP);
+    assert at_text(&out, d, 0, "// hslm_dw_s8 -- emitted by t27c");
+    assert count_text(&out, d, ".visible .entry hslm_dw_s8(\n") == 1;
+    assert count_text(&out, d, "    .shared .align 16 .b8 sA[6144];\n    .shared .align 16 .b8 sB[6144];\n") == 1;
+}
+
+test an_unknown_kernel_writes_nothing {
+    var out : [64]u8 = [7; 64];
+    assert emit_ptx(KERNEL_FWD, &out, 64) == 0;
+    assert emit_ptx(3, &out, 64) == 0;
+    assert out[0] == 7;
+    assert put_name(3, &out, 64) == 0;
+}
+
+test the_names_are_the_entry_names {
+    var out : [32]u8 = undefined;
+    const a : usize = put_name(KERNEL_DX, &out, 32);
+    assert a == 10;
+    assert at_text(&out, a, 0, "hslm_dx_s8");
+    const b : usize = put_name(KERNEL_DW, &out, 32);
+    assert at_text(&out, b, 0, "hslm_dw_s8");
+    const c : usize = put_name(KERNEL_FWD, &out, 32);
+    assert c == 15;
+    assert at_text(&out, c, 0, "ternary_gemm_s8");
+}
+
+test both_kernels_run_sixteen_int8_mma_per_k_step {
+    var out : [32768]u8 = undefined;
+    var kk : u32 = 1;
+    while (kk <= 2) {
+        const m : usize = emit_ptx(kk, &out, PTX_CAP);
+        assert count_text(&out, m, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ") == 16;
+        assert count_text(&out, m, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%acc60, %acc61, %acc62, %acc63}, {%fa12, %fa13, %fa14, %fa15}, {%fb6, %fb7}, {%acc60, %acc61, %acc62, %acc63};\n") == 1;
+        assert count_text(&out, m, "    ld.shared.u32 ") == 24;
+        assert count_text(&out, m, "    ld.shared.u32 %fa3, [%r25+400];\n") == 1;
+        assert count_text(&out, m, "    ld.shared.u32 %fb7, [%r27+1168];\n") == 1;
+        assert count_text(&out, m, "    mov.b32 %acc") == 64;
+        assert count_text(&out, m, "st.global.v2.u32 ") == 32;
+        assert count_text(&out, m, "    @%p6 st.global.v2.u32 [%rd10], {%acc62, %acc63};\n") == 1;
+        assert count_text(&out, m, "\nLOOP_K:\n") == 1;
+        assert count_text(&out, m, "    bar.sync 0;\n") == 2;
+        assert at_text(&out, m, m - 11, "    ret;\n}\n");
+        assert count_text(&out, m, "dp4a") == 0;
+        kk += 1;
+    }
+}
+
+test dx_loads_one_code_word_and_stores_sixteen_weights_at_once {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DX, &out, PTX_CAP);
+    assert count_text(&out, m, "    @%p5 ld.global.u32 %r35, [%rd9];\n") == 1;
+    assert count_text(&out, m, "ld.global.v4.u32 ") == 1;
+    assert count_text(&out, m, "st.shared.v4.u32 ") == 2;
+    assert count_text(&out, m, "    st.shared.v4.u32 [%r16], {%r50, %r51, %r52, %r53};\n") == 1;
+    assert count_text(&out, m, "st.shared.u8 ") == 0;
+    assert count_text(&out, m, "    mov.b32 %r44, 16711936;\n") == 1;
+    assert count_text(&out, m, "prmt.b32 ") == 4;
+    assert count_text(&out, m, "    prmt.b32 %r50, %r44, %r45, %r36;\n") == 1;
+    assert count_text(&out, m, "    prmt.b32 %r53, %r44, %r45, %r37;\n") == 1;
+    assert count_text(&out, m, "    and.b32 %r36, %r36, 858993459;\n") == 2;
+    // The code row of column j starts at byte j * k / 4: r17 = k >> 2.
+    assert count_text(&out, m, "    shr.u32 %r17, %r3, 2;\n    mul.wide.u32 %rd7, %r14, %r17;\n") == 1;
+}
+
+test dw_loads_two_rows_and_stores_them_transposed {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DW, &out, PTX_CAP);
+    assert count_text(&out, m, "ld.global.v4.u32 ") == 2;
+    assert count_text(&out, m, "ld.global.u32 ") == 0;
+    assert count_text(&out, m, "st.shared.u8 ") == 32;
+    assert count_text(&out, m, "    st.shared.u8 [%r11+0], %r30;\n") == 1;
+    assert count_text(&out, m, "    shr.u32 %r36, %r33, 24;\n    st.shared.u8 [%r11+720], %r36;\n") == 1;
+    assert count_text(&out, m, "    shr.u32 %r37, %r52, 8;\n    st.shared.u8 [%r16+432], %r37;\n") == 1;
+    assert count_text(&out, m, "prmt") == 0;
+    // X rows are m long, dY rows n long.
+    assert count_text(&out, m, "    mul.wide.u32 %rd6, %r34, %r1;\n") == 1;
+    assert count_text(&out, m, "    mul.wide.u32 %rd9, %r34, %r2;\n") == 1;
+}
+
+test the_texts_are_ascii_fit_and_are_stable {
+    var a : [32768]u8 = undefined;
+    var b : [32768]u8 = undefined;
+    var kk : u32 = 1;
+    while (kk <= 2) {
+        const m : usize = emit_ptx(kk, &a, PTX_CAP);
+        // The lengths ptx-run wrote on the RTX 4090 pod (wc -c ptx-run-1.ptx, ptx-run-2.ptx).
+        if (kk == KERNEL_DX) { assert m == 19431; } else { assert m == 20141; }
+        assert emit_ptx(kk, &b, PTX_CAP) == m;
+        var i : usize = 0;
+        while (i < m) {
+            assert a[i] == b[i];
+            assert a[i] == '\n' or (a[i] >= 32 and a[i] < 127);
+            i += 1;
+        }
+        kk += 1;
+    }
+}
+
+test a_short_buffer_reports_the_full_length_and_writes_nothing_past_cap {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DW, &out, PTX_CAP);
+    var small : [64]u8 = [7; 64];
+    assert emit_ptx(KERNEL_DW, &small, 32) == m;
+    assert small[31] == out[31];
+    assert small[32] == 7;
+    assert small[63] == 7;
+}
+
+test the_modelled_decode_is_the_weight_decode {
+    // Every word the LCG gives, and the all-codes words: each of the 16 bytes the kernel stores is
+    // weight(code) as an s8.
+    assert prmt_table(0) == 0;
+    assert prmt_table(1) == 1;
+    assert prmt_table(2) == 255;
+    assert prmt_table(3) == 0;
+    assert prmt_table(4660) == 33488896;
+    var s : u64 = 11;
+    var t : u32 = 0;
+    while (t < 200) {
+        s = lcg(s);
+        var word : u32 = ((s >> 8) & 65535) as u32;
+        s = lcg(s);
+        word = word | ((((s >> 8) & 65535) as u32) << 16);
+        if (t == 0) { word = 2863311530; }
+        if (t == 1) { word = 1431655765; }
+        if (t == 2) { word = 4294967295; }
+        var q : u32 = 0;
+        while (q < 16) {
+            const dw : u32 = decoded_word(word, q / 4);
+            const got : i32 = sbyte(((dw >> (8 * (q % 4))) & 255) as u8);
+            assert got == weight((word >> (2 * q)) & 3);
+            q += 1;
+        }
+        t += 1;
+    }
+}
+
+test spreading_puts_code_q_in_nibble_q {
+    assert spread8(0) == 0;
+    assert spread8(3) == 3;
+    assert spread8(12) == 48;
+    assert spread8(49152) == 805306368;
+    assert spread8(65535) == 858993459;
+}
+
+test dx_reference_is_the_trainers_layout_and_not_its_transpose {
+    // k = out_dim = 16, n = in_dim = 16, one row. w(j, i) = code at j*16 + i: +1 at i == j, -1 at
+    // i == (j + 1) % 16. dy[i] = i + 1. Then dx[j] = (j + 1) - ((j + 1) % 16 + 1).
+    var a : [16]i8 = [0; 16];
+    var wp : [64]u8 = [0; 64];
+    var i : usize = 0;
+    while (i < 16) {
+        a[i] = (i + 1) as i8;
+        const p : usize = i * 16 + i;
+        wp[p / 4] = ((wp[p / 4] as u32) | (1 << (((p % 4) * 2) as u32))) as u8;
+        const q : usize = i * 16 + (i + 1) % 16;
+        wp[q / 4] = ((wp[q / 4] as u32) | (2 << (((q % 4) * 2) as u32))) as u8;
+        i += 1;
+    }
+    var acc : [16]i32 = [9; 16];
+    ref_row(KERNEL_DX, &a, &wp, 1, 16, 16, 0, &acc);
+    assert acc[0] == -1;
+    assert acc[7] == -1;
+    assert acc[15] == 15;
+    // Negative control: read as the forward's k x n layout (code at i*16 + j) the same codes give
+    // dx[j] = (j + 1) - (((j + 15) % 16) + 1), so entry 0 is -15, not -1.
+    var j : usize = 0;
+    var t : i32 = 0;
+    while (j < 16) {
+        t += (a[j] as i32) * weight(code_at(&wp, j * 16 + 0));
+        j += 1;
+    }
+    assert t == -15;
+}
+
+test dw_reference_is_outer_add_summed_over_rows {
+    // m = in_dim 16, n = out_dim 16, k = 2 rows. X[r][i] = i + 1 - r, dY[r][j] = (j - 8) for r = 0
+    // and -1 for r = 1 (s8 0xFF). C[i][j] = (i + 1) (j - 8) - i.
+    var a : [32]i8 = [0; 32];
+    var b : [32]u8 = [0; 32];
+    var x : usize = 0;
+    while (x < 16) {
+        a[x] = (x + 1) as i8;
+        a[16 + x] = x as i8;
+        b[x] = ((x + 248) % 256) as u8;
+        b[16 + x] = 255;
+        x += 1;
+    }
+    var acc : [16]i32 = [9; 16];
+    ref_row(KERNEL_DW, &a, &b, 16, 16, 2, 3, &acc);
+    assert acc[0] == -32 - 3;
+    assert acc[8] == -3;
+    assert acc[15] == 28 - 3;
+    assert sbyte(255) == -1;
+    assert sbyte(128) == -128;
+    assert sbyte(127) == 127;
+}
+
+test the_extremes_stay_inside_i32 {
+    var a : [64]i8 = [-128; 64];
+    var b : [1024]u8 = [128; 1024];
+    var acc : [16]i32 = [0; 16];
+    ref_row(KERNEL_DW, &a, &b, 1, 16, 64, 0, &acc);
+    assert acc[0] == 64 * 16384;
+    var wp : [256]u8 = [170; 256];
+    ref_row(KERNEL_DX, &a, &wp, 1, 16, 64, 0, &acc);
+    assert acc[15] == 8192;
+}
+
+test mismatches_count_exactly_the_wrong_entries {
+    var a : [96]i8 = [0; 96];
+    var b : [512]u8 = [0; 512];
+    var s : u64 = 3;
+    var i : usize = 0;
+    while (i < 96) {
+        s = lcg(s);
+        a[i] = ((((s >> 16) % 256) as i32) - 128) as i8;
+        i += 1;
+    }
+    i = 0;
+    while (i < 512) {
+        s = lcg(s);
+        b[i] = ((s >> 16) % 256) as u8;
+        i += 1;
+    }
+    var c : [48]i32 = [0; 48];
+    var acc : [16]i32 = [0; 16];
+    var kk : u32 = 1;
+    while (kk <= 2) {
+        // m 3, n 16, k 32 for both: dX reads A as 3 x 32 and 128 code bytes; dW reads A as 32 x 3 and
+        // B as 32 x 16 bytes. ref_row does not need dW's m % 16, only the kernel does.
+        var row : usize = 0;
+        while (row < 3) {
+            ref_row(kk, &a, &b, 3, 16, 32, row, &acc);
+            var j : usize = 0;
+            while (j < 16) {
+                c[row * 16 + j] = acc[j];
+                j += 1;
+            }
+            row += 1;
+        }
+        assert mismatches(kk, &a, &b, &c, 3, 16, 32, 1, &acc) == 0;
+        c[16 + 5] += 1;
+        assert mismatches(kk, &a, &b, &c, 3, 16, 32, 1, &acc) == 1;
+        assert mismatches(kk, &a, &b, &c, 3, 16, 32, 2, &acc) == 0;
+        c[47] -= 1;
+        assert mismatches(kk, &a, &b, &c, 3, 16, 32, 100, &acc) == 1;
+        assert mismatches(kk, &a, &b, &c, 3, 16, 32, 0, &acc) == 2;
+        kk += 1;
+    }
+}
+
+test quantize_rounds_to_nearest_and_clamps {
+    assert quantize(0.5, 1.0) == 1;
+    assert quantize(0.49, 1.0) == 0;
+    assert quantize(-0.5, 1.0) == -1;
+    assert quantize(-2.6, 1.0) == -3;
+    assert quantize(500.0, 1.0) == 127;
+    assert quantize(-500.0, 1.0) == -127;
+    assert quantize(3.0, 0.0) == 0;
+    var v : [4]f64 = [0.5, -2.54, 1.0, 0.0];
+    const s : f64 = scale_of(&v, 0, 4, 1);
+    assert fabs64(s * 127.0 - 2.54) < 0.000000001;
+    assert quantize(-2.54, s) == -127;
+    assert scale_of(&v, 2, 1, 1) * 127.0 == 1.0;
+}
+
+test dx_quantized_path_is_within_its_bound_of_the_f64_reference {
+    // rows 3, k = out_dim 32, n = in_dim 16: dx_ref[r][j] = sum_i w(j*32 + i) * dy[r][i] in f64 (the
+    // trainer's loop); the int8 path is s_r * C; |error| <= k * s_r / 2.
+    var dy : [96]f64 = [0.0; 96];
+    var q : [96]i8 = [0; 96];
+    var wp : [128]u8 = [0; 128];
+    var sc : [3]f64 = [0.0; 3];
+    var s : u64 = 5;
+    var i : usize = 0;
+    while (i < 96) {
+        s = lcg(s);
+        dy[i] = unit(s) * 0.003;
+        i += 1;
+    }
+    i = 0;
+    while (i < 128) {
+        s = lcg(s);
+        wp[i] = ((s >> 16) % 256) as u8;
+        i += 1;
+    }
+    var r : usize = 0;
+    while (r < 3) {
+        sc[r] = scale_of(&dy, r * 32, 32, 1);
+        i = 0;
+        while (i < 32) {
+            q[r * 32 + i] = quantize(dy[r * 32 + i], sc[r]);
+            i += 1;
+        }
+        r += 1;
+    }
+    var acc : [16]i32 = [0; 16];
+    var worst : f64 = 0.0;
+    r = 0;
+    while (r < 3) {
+        ref_row(KERNEL_DX, &q, &wp, 3, 16, 32, r, &acc);
+        var j : usize = 0;
+        while (j < 16) {
+            var ref : f64 = 0.0;
+            i = 0;
+            while (i < 32) {
+                ref = ref + (weight(code_at(&wp, j * 32 + i)) as f64) * dy[r * 32 + i];
+                i += 1;
+            }
+            const err : f64 = fabs64(sc[r] * (acc[j] as f64) - ref);
+            assert err <= 32.0 * sc[r] / 2.0 + 0.000000000001;
+            if (err / sc[r] > worst) { worst = err / sc[r]; }
+            j += 1;
+        }
+        r += 1;
+    }
+    // The bound is not vacuous: some entry is off by more than a tenth of a quantum.
+    assert worst > 0.1;
+}
+
+test dw_quantized_path_is_within_its_bound_of_the_f64_reference {
+    // k = 5 rows, m = in_dim 16, n = out_dim 16. ref[i][j] = sum_r x[r][i] * dy[r][j] in f64; scales
+    // per column; |error| <= k * sx_i * sy_j * (127 + 1/4).
+    var x : [80]f64 = [0.0; 80];
+    var dy : [80]f64 = [0.0; 80];
+    var xq : [80]i8 = [0; 80];
+    var dq : [80]u8 = [0; 80];
+    var sx : [16]f64 = [0.0; 16];
+    var sy : [16]f64 = [0.0; 16];
+    var s : u64 = 9;
+    var i : usize = 0;
+    while (i < 80) {
+        s = lcg(s);
+        x[i] = unit(s) * 2.0;
+        s = lcg(s);
+        dy[i] = unit(s) * 0.01;
+        i += 1;
+    }
+    var c : usize = 0;
+    while (c < 16) {
+        sx[c] = scale_of(&x, c, 5, 16);
+        sy[c] = scale_of(&dy, c, 5, 16);
+        var r : usize = 0;
+        while (r < 5) {
+            xq[r * 16 + c] = quantize(x[r * 16 + c], sx[c]);
+            dq[r * 16 + c] = ((((quantize(dy[r * 16 + c], sy[c])) as i32) + 256) % 256) as u8;
+            r += 1;
+        }
+        c += 1;
+    }
+    var acc : [16]i32 = [0; 16];
+    var worst : f64 = 0.0;
+    var row : usize = 0;
+    while (row < 16) {
+        ref_row(KERNEL_DW, &xq, &dq, 16, 16, 5, row, &acc);
+        var j : usize = 0;
+        while (j < 16) {
+            var ref : f64 = 0.0;
+            var r : usize = 0;
+            while (r < 5) {
+                ref = ref + x[r * 16 + row] * dy[r * 16 + j];
+                r += 1;
+            }
+            const unitq : f64 = sx[row] * sy[j];
+            const err : f64 = fabs64(unitq * (acc[j] as f64) - ref);
+            assert err <= 5.0 * unitq * 127.25 + 0.000000000001;
+            if (err / unitq > worst) { worst = err / unitq; }
+            j += 1;
+        }
+        row += 1;
+    }
+    assert worst > 1.0;
+}
+
+test the_hslm_shapes_are_accepted {
+    // dX: rows x (out_dim -> k) -> in_dim; the four matrices of a block and the head, at 27 and 1782 rows.
+    assert shape_ok(KERNEL_DX, HSLM_CTX, HSLM_EMBED_PAD, HSLM_EMBED_PAD) == true;
+    assert shape_ok(KERNEL_DX, HSLM_ROWS, HSLM_EMBED_PAD, HSLM_FF_PAD) == true;
+    assert shape_ok(KERNEL_DX, HSLM_ROWS, HSLM_FF_PAD, HSLM_EMBED_PAD) == true;
+    // dW: in_dim x out_dim over k rows.
+    assert shape_ok(KERNEL_DW, HSLM_EMBED_PAD, HSLM_FF_PAD, HSLM_CTX) == true;
+    assert shape_ok(KERNEL_DW, HSLM_FF_PAD, HSLM_EMBED_PAD, HSLM_ROWS) == true;
+    // The unpadded dims are refused: 243 and 729 are not multiples of 16.
+    assert shape_ok(KERNEL_DX, HSLM_CTX, HSLM_EMBED, HSLM_EMBED_PAD) == false;
+    assert shape_ok(KERNEL_DX, HSLM_CTX, HSLM_EMBED_PAD, HSLM_FF) == false;
+    assert shape_ok(KERNEL_DW, HSLM_EMBED, HSLM_FF_PAD, HSLM_CTX) == false;
+}
+
+test the_limits_of_each_kernel {
+    assert shape_ok(KERNEL_DX, 1, 16, 16777200) == true;
+    assert shape_ok(KERNEL_DX, 1, 16, 16777216) == false;
+    assert shape_ok(KERNEL_DX, 1, 16, 8) == false;
+    assert shape_ok(KERNEL_DW, 16, 16, 131071) == true;
+    assert shape_ok(KERNEL_DW, 16, 16, 131072) == false;
+    assert shape_ok(KERNEL_DW, 16, 16, 0) == false;
+    assert shape_ok(KERNEL_DW, 16, 16, 1) == true;
+    assert shape_ok(KERNEL_DW, 8, 16, 4) == false;
+    assert shape_ok(KERNEL_FWD, 16, 16, 16) == false;
+    assert shape_ok(KERNEL_DX, 0, 16, 16) == false;
+    assert shape_ok(KERNEL_DX, 65535 * 128 + 1, 16, 16) == false;
+    assert b_len(KERNEL_FWD, 256, 736) == 47104;
+    assert b_len(KERNEL_DX, 256, 736) == 47104;
+    assert b_len(KERNEL_DW, 736, 1782) == 1311552;
+    assert grid_dim(HSLM_ROWS) == 14;
+    assert grid_dim(HSLM_FF_PAD) == 6;
+}
+
+invariant dx_accumulator_cannot_overflow { 128 * K_MAX_DX <= 2147483647 }
+
+invariant dw_accumulator_cannot_overflow { 16384 * K_MAX_DW <= 2147483647 and 16384 * (K_MAX_DW + 1) > 2147483647 }
+
+invariant shared_tiles_fit_static_shared_memory { 2 * BM * SMEM_STRIDE <= 49152 }
+
+invariant eight_warps_cover_the_block { (THREADS / 32) * 64 * 32 == BM * BN }
+
+invariant hslm_rows_are_windows_times_context { HSLM_ROWS == HSLM_BATCH * HSLM_CTX }
+
+invariant hslm_padding_is_the_next_multiple_of_16 { HSLM_EMBED_PAD % 16 == 0 and HSLM_EMBED_PAD - HSLM_EMBED < 16 and HSLM_FF_PAD % 16 == 0 and HSLM_FF_PAD - HSLM_FF < 16 and HSLM_FF == HSLM_VOCAB }
+
+invariant the_decode_table_is_0_1_minus1_0 { DECODE_TABLE == 255 * 65536 + 256 }

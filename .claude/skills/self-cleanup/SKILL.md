@@ -52,7 +52,7 @@ Remove it only when all of these hold; otherwise keep it and say why in the ledg
 The Bash sandbox cannot delete `.git/worktrees/<name>` (`Operation not permitted`), so `git worktree remove` fails there for lane trees. Run the removal in the session's Terminal tab (`run_in_terminal`, one line), then verify from Bash:
 
 ```
-git -C /Users/playom/t27 worktree remove -f <tree>        # -f -f when a finished agent left its lock
+git -C "$(git rev-parse --git-common-dir)/.." worktree remove -f <tree>        # -f -f when a finished agent left its lock
 [ -d <tree> ] && echo "still there" || echo removed
 df -h /System/Volumes/Data | tail -1
 ```
