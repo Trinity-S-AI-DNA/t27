@@ -52,14 +52,20 @@ Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next m
 | Step | Command | Note |
 |---|---|---|
 | syntax | `./target/release/t27c check <spec>` or MCP `t27_check` | parse + typecheck only |
-| tests | `./target/release/t27c test-report <spec>` | per-test assert counts; read `vacuous passes` (must be 0); `tri test` does not check vacuity yet (#10497) |
-| negative control | copy to `$TMPDIR`, break one constant, `test-report` | must FAIL before the PR |
-| seal | `t27c seal <spec> --save`, then `--verify` | commit `.trinity/seals/<dir>_<Module>.json` |
-| board top | `t27b verilog <top spec>` | pin attributes in the spec, no XDC; no signed types |
-| board run | M0's flow, AX7203 = `xc7a200tfbg484-2`, `openFPGALoader -c digilent_hs2` | `t27c fpga-build/fpga-flash` default to Wukong (#10498) |
-| converter | `tri t27o <file> [--check]` | Rust only today; SPICE front end is M2 |
+| inner loop | `./target/release/t27b test <spec>` | native arm64 JIT, compiles in milliseconds; exit 4 = JIT and interpreter disagree, 2 = unsupported construct |
+| unchanged specs | `./target/release/t27c frontier --only <specs> --list` | ~2 s; REUSE = seal, closure and toolchain still match and the sealed test verdict stands -- do not re-run its tests |
+| tests (final gate) | `./target/release/t27c test-report <spec>` and `tri test <spec>` | per-test assert counts; `vacuous passes` must be 0; `tri test` fails on vacuous passes since #10507 |
+| negative control | copy to `specs/analog/` (a `use` does not resolve from `$TMPDIR`), break one constant, `test-report`, delete the copy | must FAIL before the PR |
+| seal | `t27c seal <spec> --save`, then `--verify` | commit `.trinity/seals/<dir>_<Module>.json`; the seal is also the cache key for reuse |
+| board top | `t27b verilog <top spec>` | pin attributes in the spec, no XDC; no signed types; slice parameters and array indexing in the clocked path exit 2 (tables become a ROM) |
+| board run | local openXC7 flow, see below | `t27c fpga-build/fpga-flash` and `t27c silicon` assume the Wukong fbg676 (#10498) |
+| bitstream reuse | `tri hot caches`, `tri hot prebuild <spec> --top <v>` | seal-keyed bitstream cache; check it targets fbg484 before trusting it for the AX7203 |
+| ngspice reference | `ngspice -b deck.cir` (ngspice-47, Homebrew) | fixed-step backward Euler on our grid: `.options method=gear maxord=1 trtol=1e7`, drive with a B source (PWL corners restart the step ramp), circuit at rest before the source switches on; matches the f64 recurrence to 1e-15 V (#10505) |
+| converter | `tri t27o <file> [--check]` | Rust only today; SPICE front end is M2a (#10509) |
 | who else | `tri topic analog spice <keyword>` | before opening an issue or a lane |
 | PR verdict | `tri pr ready <N> --required-only` | one VERDICT line |
+
+**The board flow is local; the Railway lab is not needed.** `O="$(git rev-parse --git-common-dir)/../build/fpga/openxc7"` (the main checkout's `build/`, from any worktree) holds `np-main/build/nextpnr-xilinx`, the AX7203 chipdb `xc7a200tfbg484-2.bin`, `prjxray/utils/fasm2frames.py` (run with `$O/venv/bin/python3`) and `px-main/build/tools/xc7frames2bit`; yosys and openFPGALoader come from Homebrew. nextpnr on this Mac takes about 22 s and 2.4 GB: check `memory_pressure` (>= 25 % free) and `df -h /` (>= 8 GB) first and never run two at once. Read the memory notes before declaring a blocker: the recipe was there.
 
 Sandboxed sessions: `export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local`; commit with `git -c core.hooksPath=.githooks commit`; `gh` fails TLS, use curl with `$(gh auth token)`. There is no `t27t` in this repository (searched 2026-10-18); do not invent one.
 
@@ -69,22 +75,24 @@ A `/loop` tick on this epic follows this order, so a new tick never undoes or du
 
 1. **Read state.** The ledger is a comment on #10486 (the one headed "Loop ledger"). Read it, `CronList` (delete duplicate crons after a restart), and list running subagents. A lane the ledger says is running is not started again.
 2. **Look for anomalies before new work.** Open PRs of this epic that are red, conflicting or stale (`tri pr ready`); a subagent that reported done but whose PR does not exist (`git ls-remote`); a merged PR whose spec is missing on master (`tri pr landed`); a seal that no longer verifies (`tri seals drift`); a ledger row older than 45 minutes still "running". Fix or file each one first (self-repair beats new work).
-3. **Review on Opus, implement on Sonnet** (`specs/claw/model_route.t27`): at most 3 subagents on the 8 GB Mac; each lane in its own worktree and branch; the orchestrator reads every diff before auto-merge is enabled.
+3. **Review on Opus, implement on Sonnet** (`specs/claw/model_route.t27`): 3 to 5 subagents on the 8 GB Mac while `memory_pressure` stays above 25 % free; each lane in its own worktree and branch; the orchestrator reads every diff before auto-merge is enabled. Fast review: check out the PR head, `t27c frontier --only <its specs> --list` and `t27c seal --verify`; re-run `test-report` only when frontier says rebuild or the diff looks wrong; regenerate any `gen/` file the PR touches and compare it byte for byte; run `python3 -I tools/dupe_scan.py`. To change a PR that has auto-merge on, disable auto-merge first, push, then enable it again (a second push races the merge).
 4. **Merge only green.** Auto-merge after the required checks pass. A red is inherited only if it is a subset of master's failures; `claw-sarif` failing on "permissions requested are not granted to this installation" is the known App-permission red (owner steps in `docs/claw/README.md`).
-5. **Write state.** Edit the ledger row, tick the epic's Progress table, republish the dashboard, and add a learning to this skill when a trap cost more than one try.
-6. **Reports** to the partner are drafted into the dashboard; they are sent only after the owner's explicit yes in chat.
+5. **Write state.** Edit the ledger row, tick the epic's Progress table, republish the dashboard, and add a learning to this skill when a trap cost more than one try. Renew the keep-awake hold at the start of each tick (it lapses after about 5 idle minutes).
+6. **Reports** to the partner: the owner gave standing permission on 2026-10-18 to message the Symbiotic EDA contact directly about anything the work needs and at every milestone. Read the chat for answers first in every tick.
 
 ## Claim guard
 
 Every number that leaves the repo -- in a report, the dashboard, a post or a partner summary -- comes from a test or a receipt in gHashTag/t27. Before sending, check each sentence against the receipt:
 
 - Never claim power (nothing measures it), accuracy outside measured circuits, real-time or "faster than SPICE" unless measured on the same circuit, or PCIe throughput before it runs.
+- A speed claim needs `may_claim_speedup` in `specs/analog/bench.t27` to say yes: a measured board time including readout, a measured bitstream build time (so the break-even run count exists), and a wall ratio >= 1. Today it says no for every circuit; ngspice wall time is mostly process start-up and the board's is mostly the UART line.
+- Report three errors separately: arithmetic (fixed point vs f64 of the same scheme), discretization (scheme vs analytic or dt/2), model (vs ngspice with the PDK).
 - Say "table model of PSP103", not "the IHP transistor model", for M3-M4.
 - If a previous message overstated something, the next report corrects it explicitly.
 
 ## Progress reports to the Symbiotic EDA contact
 
-The owner wants a report on every breakthrough and every milestone. The owner sends, or confirms each send; Claude drafts.
+The owner wants a report on every breakthrough and every milestone. Since 2026-10-18 the owner's standing word is to message the contact directly about anything the work needs; keep every message within the claim guard.
 
 - **When:** a milestone closes; a board receipt or oracle result lands for the first time; a blocker appears that needs something from them; a claim made earlier turns out wrong.
 - **Language and form:** English, plain, written. Lead with what was measured, then what it does not show, then the next step and what is needed from them. Link the PR or issue. No more than about 12 lines.
@@ -100,7 +108,7 @@ The owner wants a report on every breakthrough and every milestone. The owner se
   <link to PR or issue>
   ```
 - **Privacy:** the chat is private. Nothing from it (names, budgets, proposals, payments, accounts) goes into the public repo, issues or PRs. The epic says "Symbiotic EDA" and nothing more personal.
-- **Sending on X:** in BrowserOS neo, open the chat. `act type` drops characters in X's composer; use `act fill` with `clear=false` per paragraph and Shift+Enter between paragraphs, verify with a screenshot, then press the Send button by its ref. Read the chat first: X keeps message text in a shadow root and a virtualised list, so read `[role=log]` through the shadow roots and scroll it with mouse-wheel events.
+- **Sending on X:** in BrowserOS neo, open the chat in your own tab. `act type` and `insertText` drop characters in X's composer; use ONE `act fill` with the whole text (newlines included), compare the textarea's value with the intended text, then press the Send button by its ref. Read the chat first: X keeps message text in a shadow root and a virtualised list, so read `[role=log]` through the shadow roots and scroll it with mouse-wheel events.
 - After sending, add a line to the dashboard's report log and republish it.
 
 ## Updating the dashboard
@@ -112,3 +120,8 @@ The page is a single HTML file whose data sits in four arrays at the top of its 
 - `gh` fails TLS inside the Claude sandbox (x509 OSStatus -26276); `curl` with `$(gh auth token)` against api.github.com works.
 - The asicone sub-blocks (`ro_reliability`, `saradc_auto`) are submodules on gitlab.symbioticeda.com; a shallow clone of asicone_sg13g2 leaves them empty. Ask for the netlist instead of guessing it.
 - `t27b` bitstream specs are skipped by the fpga-build job and have no gen-verilog rows (#10300); follow M0's ledger handling.
+- A PR that removes a dead `tri` mention must lower `MAX_DEAD_TRI` in `tools/check_documented_commands_exist.py` in the same commit (an equality ratchet; #10500 forgot, #10514 fixed master).
+- `t27b-native-ratchet` red with only UNLISTED rows for new specs is expected: spec PRs do not edit the ledger; the steward lists them from master runs (#8656).
+- uberWAVE reads ngspice RAW (binary or ASCII). Its `wp2-parser/golden/top.spice` (SAR ADC, xschem, IHP SG13G2) is GPL-2.0: test against it at run time, never vendor it.
+- A module-level one-element array literal `[798915]` lowers to a Zig array type (#10512); write `[798915] ** 1` until it is fixed.
+- Seal only with `ZIG_GLOBAL_CACHE_DIR` set in a sandboxed session: otherwise the seal's test run cannot create the zig cache and the seal records a false "blocked" verdict plus a home path, which turns `scan` red (#10521). Never write a home path into a committed file; derive it from `git rev-parse`.
