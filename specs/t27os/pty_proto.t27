@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/pty_proto.t27 -- the wire format between the T27 OS PTY server and its clients, and the
+; scrollback ring each pane keeps. pty_server.t27 and pty_client.t27 both `use` this module, so the two ends
+; cannot disagree about a byte.
+; Owner, 2026-10-19: agents run as real terminals owned by T27 OS; the window attaches and detaches, the
+; panes keep running.
+; The socket is ~/.t27os/pty.sock (unix stream). Every message is one frame:
+;   [op u8][pane u8][len u16 little-endian][payload, len bytes]      len <= MAX_PAYLOAD
+; Requests (client to server): LIST, SPAWN, ATTACH, DETACH, KEYS, RESIZE, READ, KILL, HOOK.
+; Replies (server to client) carry bit 7: OK, ERR, DATA, LISTING.
+;   SPAWN  payload: [agent u8][space u8][slot u8] then the cwd bytes. Reply OK with the new pane in `pane`.
+;   KEYS   payload: the bytes to write to the pane's PTY.
+;   RESIZE payload: [cols u16 LE][rows u16 LE].
+;   READ   payload: [cursor u64 LE]. Reply DATA: [new cursor u64 LE] then the bytes since `cursor`; a cursor
+;          older than the ring holds is clamped to the oldest byte still kept (ring_window).
+;   LIST   reply LISTING: one 4-byte entry per pane [pane][agent][shown state][flags] (list_entry).
+;   HOOK   payload: [event name length u8][event name][hook JSON payload]; pane is the pane the hook ran in.
+; The scrollback of a pane is a ring of RING_CAP bytes addressed by a running byte count `total`; the byte
+; with count n lives at n % RING_CAP. A client's cursor is also a running count, so it survives a detach.
+
+module T27osPtyProto;
+
+pub const OP_LIST : u8 = 1;
+pub const OP_SPAWN : u8 = 2;
+pub const OP_ATTACH : u8 = 3;
+pub const OP_DETACH : u8 = 4;
+pub const OP_KEYS : u8 = 5;
+pub const OP_RESIZE : u8 = 6;
+pub const OP_READ : u8 = 7;
+pub const OP_KILL : u8 = 8;
+pub const OP_HOOK : u8 = 9;
+pub const RE_OK : u8 = 128;
+pub const RE_ERR : u8 = 129;
+pub const RE_DATA : u8 = 130;
+pub const RE_LISTING : u8 = 131;
+
+pub const HEADER : usize = 4;
+pub const MAX_PAYLOAD : usize = 4096;
+pub const MAX_FRAME : usize = 4100;
+pub const RING_CAP : u64 = 65536;
+pub const MAX_PANES : u32 = 16;
+/// sun_path holds 104 bytes on macOS; the socket path must leave room for the terminating zero.
+pub const SUN_PATH_MAX : usize = 103;
+
+pub fn put_u16(out: []u8, at: usize, v: u32) -> usize {
+    out[at] = @as(u8, @intCast(v & 255));
+    out[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    return at + 2;
+}
+
+pub fn get_u16(b: []const u8, at: usize) -> u32 {
+    return @as(u32, b[at]) + @as(u32, b[at + 1]) * 256;
+}
+
+pub fn put_u64(out: []u8, at: usize, v: u64) -> usize {
+    var i : usize = 0;
+    var x : u64 = v;
+    while (i < 8) {
+        out[at + i] = @as(u8, @intCast(x & 255));
+        x = x >> 8;
+        i = i + 1;
+    }
+    return at + 8;
+}
+
+pub fn get_u64(b: []const u8, at: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = 8;
+    while (i > 0) {
+        i = i - 1;
+        v = v * 256 + @as(u64, b[at + i]);
+    }
+    return v;
+}
+
+/// Write the header of a frame whose payload has `len` bytes; returns HEADER.
+pub fn put_header(out: []u8, op: u8, pane: u8, len: usize) -> usize {
+    out[0] = op;
+    out[1] = pane;
+    return put_u16(out, 2, @as(u32, @intCast(len)));
+}
+
+/// Write a whole frame (header and payload); returns its length, 0 when the payload is too long.
+pub fn put_frame(out: []u8, op: u8, pane: u8, payload: []const u8) -> usize {
+    if (payload.len > MAX_PAYLOAD) { return 0; }
+    var n : usize = put_header(out, op, pane, payload.len);
+    var i : usize = 0;
+    while (i < payload.len) {
+        out[n + i] = payload[i];
+        i = i + 1;
+    }
+    return n + payload.len;
+}
+
+/// How many bytes the frame at the start of buf needs in all: 0 when the header is not here yet, 1 when
+/// the declared payload is longer than MAX_PAYLOAD (the connection is bad and is dropped), else the length.
+pub fn frame_need(buf: []const u8) -> usize {
+    if (buf.len < HEADER) { return 0; }
+    const len : usize = @as(usize, get_u16(buf, 2));
+    if (len > MAX_PAYLOAD) { return 1; }
+    return HEADER + len;
+}
+
+/// True when buf holds a whole frame.
+pub fn frame_complete(buf: []const u8) -> bool {
+    const need : usize = frame_need(buf);
+    return need > 1 and buf.len >= need;
+}
+
+pub fn is_request(op: u8) -> bool { return op >= OP_LIST and op <= OP_HOOK; }
+pub fn is_reply(op: u8) -> bool { return op >= RE_OK and op <= RE_LISTING; }
+
+/// The running count of the oldest byte still in the ring and how many bytes a reader at `cursor` gets,
+/// as (start, count): a stale cursor is clamped, a cursor past the end gets nothing.
+pub fn ring_window(total: u64, cursor: u64, f: []u64) -> bool {
+    var start : u64 = cursor;
+    if (total > RING_CAP and start < total - RING_CAP) { start = total - RING_CAP; }
+    if (start > total) { start = total; }
+    f[0] = start;
+    f[1] = total - start;
+    return start != cursor;
+}
+
+/// Where in the ring the byte with running count n lives.
+pub fn ring_slot(n: u64) -> usize {
+    return @as(usize, @intCast(n % RING_CAP));
+}
+
+/// The number of bytes of a window that fit in one DATA reply: the payload also holds the 8-byte cursor.
+pub fn data_chunk(avail: u64) -> usize {
+    const room : usize = MAX_PAYLOAD - 8;
+    if (avail > @as(u64, room)) { return room; }
+    return @as(usize, @intCast(avail));
+}
+
+/// Append n bytes to a ring (a RING_CAP-byte buffer) that has seen `total` bytes; returns the new total.
+pub fn ring_append(ring: []u8, total: u64, src: []const u8, n: usize) -> u64 {
+    var i : usize = 0;
+    var t : u64 = total;
+    while (i < n) {
+        ring[ring_slot(t)] = src[i];
+        t = t + 1;
+        i = i + 1;
+    }
+    return t;
+}
+
+/// Copy the window of a ring that starts at count `start` into out; returns the number of bytes copied.
+pub fn ring_copy(ring: []const u8, start: u64, n: usize, out: []u8) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = ring[ring_slot(start + @as(u64, i))];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// One LISTING entry.
+pub fn put_list_entry(out: []u8, at: usize, pane: u32, agent: u32, shown: u32, flags: u32) -> usize {
+    out[at] = @as(u8, @intCast(pane & 255));
+    out[at + 1] = @as(u8, @intCast(agent & 255));
+    out[at + 2] = @as(u8, @intCast(shown & 255));
+    out[at + 3] = @as(u8, @intCast(flags & 255));
+    return at + 4;
+}
+
+/// The cwd of a SPAWN payload [agent][space][slot][cwd...] lives at 3; false when it is too short or the
+/// cwd holds a NUL, a newline or a space-free-ness the manifest could not keep (NUL and newline).
+pub fn spawn_ok(payload: []const u8) -> bool {
+    if (payload.len < 4) { return false; }
+    var i : usize = 3;
+    while (i < payload.len) {
+        if (payload[i] == 0 or payload[i] == 10) { return false; }
+        i = i + 1;
+    }
+    return payload[3] == 47;
+}
+
+/// Length of the socket path <home>/.t27os/pty.sock, or 0 when it would not fit in sun_path.
+pub fn socket_path(out: []u8, home: []const u8) -> usize {
+    const tail : []const u8 = "/.t27os/pty.sock";
+    if (home.len + tail.len > SUN_PATH_MAX) { return 0; }
+    var i : usize = 0;
+    while (i < home.len) {
+        out[i] = home[i];
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < tail.len) {
+        out[i + j] = tail[j];
+        j = j + 1;
+    }
+    return i + tail.len;
+}
+
+test a_frame_round_trips_through_a_partial_read {
+    var buf : [MAX_FRAME]u8 = undefined;
+    var pay : [10]u8 = undefined;
+    var i : usize = 0;
+    while (i < 10) { pay[i] = @as(u8, @intCast(65 + i)); i = i + 1; }
+    const n : usize = put_frame(buf[0..MAX_FRAME], OP_KEYS, 3, pay[0..10]);
+    assert n == 14;
+    assert buf[0] == OP_KEYS and buf[1] == 3;
+    assert get_u16(buf[0..MAX_FRAME], 2) == 10;
+    var cut : usize = 0;
+    while (cut < n) {
+        assert frame_complete(buf[0..cut]) == false;
+        cut = cut + 1;
+    }
+    assert frame_complete(buf[0..n]);
+    assert frame_need(buf[0..n]) == 14;
+    assert buf[HEADER + 9] == 74;
+}
+
+test an_oversized_frame_is_refused_at_both_ends {
+    var buf : [MAX_FRAME + 8]u8 = undefined;
+    var big : [4200]u8 = undefined;
+    assert put_frame(buf[0..MAX_FRAME], OP_KEYS, 0, big[0..4097]) == 0;
+    assert put_frame(buf[0..MAX_FRAME], OP_KEYS, 0, big[0..4096]) == 4100;
+    var h : usize = put_header(buf[0..MAX_FRAME], OP_KEYS, 0, 5000);
+    assert h == HEADER;
+    assert frame_need(buf[0..HEADER]) == 1;
+    assert frame_complete(buf[0..HEADER]) == false;
+}
+
+test ops_are_split_into_requests_and_replies {
+    var op : u8 = 0;
+    var requests : u32 = 0;
+    var replies : u32 = 0;
+    while (op < 200) {
+        if (is_request(op)) { requests = requests + 1; }
+        if (is_reply(op)) { replies = replies + 1; }
+        assert !(is_request(op) and is_reply(op));
+        op = op + 1;
+    }
+    assert requests == 9;
+    assert replies == 4;
+}
+
+test numbers_are_little_endian {
+    var b : [10]u8 = undefined;
+    assert put_u16(b[0..10], 0, 513) == 2;
+    assert b[0] == 1 and b[1] == 2;
+    assert get_u16(b[0..10], 0) == 513;
+    var v : u64 = 1234567890123;
+    assert put_u64(b[0..10], 1, v) == 9;
+    assert b[1] == 203;
+    assert get_u64(b[0..10], 1) == v;
+    v = 18446744073709551615;
+    assert put_u64(b[0..10], 0, v) == 8;
+    assert get_u64(b[0..10], 0) == v;
+}
+
+test a_reader_gets_what_it_missed_and_never_stale_bytes {
+    var f : [2]u64 = undefined;
+    // nothing new
+    assert ring_window(100, 100, f[0..2]) == false;
+    assert f[0] == 100 and f[1] == 0;
+    // 40 new bytes
+    assert ring_window(100, 60, f[0..2]) == false;
+    assert f[1] == 40;
+    // a cursor older than the ring holds is moved forward
+    assert ring_window(RING_CAP + 1000, 10, f[0..2]);
+    assert f[0] == 1000 and f[1] == RING_CAP;
+    // a cursor from the future (the server restarted with an empty ring) is pulled back
+    assert ring_window(50, 900, f[0..2]);
+    assert f[0] == 50 and f[1] == 0;
+}
+
+test the_ring_keeps_the_last_cap_bytes {
+    var ring : [65536]u8 = undefined;
+    var chunk : [100]u8 = undefined;
+    var i : usize = 0;
+    while (i < 100) { chunk[i] = @as(u8, @intCast(i)); i = i + 1; }
+    var total : u64 = 0;
+    var k : u32 = 0;
+    while (k < 700) {
+        total = ring_append(ring[0..65536], total, chunk[0..100], 100);
+        k = k + 1;
+    }
+    assert total == 70000;
+    var f : [2]u64 = undefined;
+    assert ring_window(total, 0, f[0..2]);
+    assert f[0] == 70000 - RING_CAP;
+    var out : [100]u8 = undefined;
+    // the byte with count 70000 - 100 was the last byte of a chunk: value 99
+    assert ring_copy(ring[0..65536], total - 100, 100, out[0..100]) == 100;
+    assert out[0] == 0 and out[99] == 99;
+    // the oldest byte still kept is chunk byte (70000 - 65536) % 100 = 64
+    assert ring_copy(ring[0..65536], f[0], 1, out[0..100]) == 1;
+    assert out[0] == 64;
+    assert ring_slot(65536) == 0;
+    assert ring_slot(65537) == 1;
+}
+
+test a_data_reply_never_overflows_a_frame {
+    assert data_chunk(0) == 0;
+    assert data_chunk(100) == 100;
+    assert data_chunk(4088) == 4088;
+    assert data_chunk(4089) == 4088;
+    assert data_chunk(65536) == 4088;
+    assert 8 + data_chunk(65536) <= MAX_PAYLOAD;
+}
+
+test listing_entries_are_four_bytes {
+    var b : [20]u8 = undefined;
+    var at : usize = 0;
+    at = put_list_entry(b[0..20], at, 2, 0, 4, 1);
+    at = put_list_entry(b[0..20], at, 3, 7, 1, 0);
+    assert at == 8;
+    assert b[0] == 2 and b[1] == 0 and b[2] == 4 and b[3] == 1;
+    assert b[4] == 3 and b[5] == 7;
+}
+
+test spawn_payloads_are_checked_before_use {
+    var p : [40]u8 = undefined;
+    var i : usize = 0;
+    while (i < 40) { p[i] = 120; i = i + 1; }
+    p[3] = 47;
+    assert spawn_ok(p[0..10]);
+    assert spawn_ok(p[0..3]) == false;
+    p[6] = 10;
+    assert spawn_ok(p[0..10]) == false;
+    p[6] = 0;
+    assert spawn_ok(p[0..10]) == false;
+    p[6] = 120;
+    p[3] = 114;
+    assert spawn_ok(p[0..10]) == false;
+}
+
+test the_socket_path_fits_sun_path {
+    var out : [120]u8 = undefined;
+    const n : usize = socket_path(out[0..120], "/Users/playra");
+    assert n == 29;
+    assert out[n - 1] == 107;
+    var long : [100]u8 = undefined;
+    var i : usize = 0;
+    while (i < 100) { long[i] = 97; i = i + 1; }
+    assert socket_path(out[0..120], long[0..87]) == 103;
+    assert socket_path(out[0..120], long[0..88]) == 0;
+}
