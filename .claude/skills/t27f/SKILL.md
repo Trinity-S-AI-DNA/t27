@@ -429,6 +429,16 @@ card's `PRESETS`; its lab check compares that list to `PRESET_NAMES` byte for by
   Five parallel libx264 encoders on the lab failed with "Error while opening encoder", the
   pipe closed, and md5 hashed a truncated stream: 3 of 5 read DIFF. Run md5 separately, then
   encode one at a time. A DIFF that coincides with an encoder error is the harness, not the code.
+- **Run `preflight(IDEA)` before you render an idea** (gHashTag/t27#10820). It returns `PF_EMPTY`
+  (no scene), `PF_GLYPH` (a character glyph57 would draw as `?`, such as phi, a euro sign, `{`, `~`
+  or a malformed byte; `first_missing` gives its byte offset), `PF_LONG` (the reel would run past
+  `MAX_S` = 60 s) or `PF_OK`. `main` writes **0 bytes** for a refused idea, so an empty output file
+  means the idea was refused, not that the render broke. Rewrite the idea instead: `PHI^2`, not the
+  Greek letter. **Check the guard on the binary, with a control:** the same refused idea built with
+  the guard line `sed`-ed out must write frames (144 for `A{B}`), or the 0 bytes prove nothing.
+  **A mutant can survive and still be equivalent:** reels grow in 72-frame steps, so `MAX_S` from
+  60 to 62 refuses exactly the same ideas. Say that in the report, and do not add a test that only
+  restates the constant.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
