@@ -146,12 +146,6 @@ impl Node {
             children: Vec::new(),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn with_child(mut self, child: Node) -> Self {
-        self.children.push(child);
-        self
-    }
 }
 
 // ============================================================================
@@ -1339,11 +1333,6 @@ impl Parser {
         self.current.kind == kind
     }
 
-    #[allow(dead_code)]
-    fn check_peek(&self, kind: TokenKind) -> bool {
-        self.peek.kind == kind
-    }
-
     fn expect(&mut self, kind: TokenKind) -> Result<(), String> {
         if !self.check(kind) {
             return Err(format!(
@@ -2042,6 +2031,15 @@ the parser used to read it as `{}` followed by a negation",
 
             if self.current.kind == TokenKind::KwPragma {
                 self.parse_pragma()?;
+                continue;
+            }
+
+            // #10876: `threadlocal var` -- one copy of the variable per thread (Zig `threadlocal var`).
+            if self.current.kind == TokenKind::Ident && self.current.lexeme == "threadlocal" && self.peek.kind == TokenKind::KwVar {
+                self.advance();
+                let mut decl = self.parse_var_decl(false)?;
+                decl.extra_kind = "threadlocal".to_string();
+                module.children.push(decl);
                 continue;
             }
 
@@ -7359,6 +7357,26 @@ fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_po
 fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
 "#;
 
+/// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
+/// and returns false when the slot is busy or the OS refuses; thread_join(slot) waits for it.
+const THREAD_ZIG: &str = r#"
+const __t27_Thread = @import("std").Thread;
+var __t27_threads: [256]?__t27_Thread = [_]?__t27_Thread{null} ** 256;
+fn __t27_thread_spawn(slot: usize, comptime f: anytype, arg: usize) bool {
+    if (slot >= __t27_threads.len or __t27_threads[slot] != null) return false;
+    __t27_threads[slot] = __t27_Thread.spawn(.{}, f, .{arg}) catch return false;
+    return true;
+}
+fn __t27_thread_join(slot: usize) bool {
+    if (slot >= __t27_threads.len) return false;
+    const t = __t27_threads[slot] orelse return false;
+    t.join();
+    __t27_threads[slot] = null;
+    return true;
+}
+fn __t27_thread_cores() usize { return __t27_Thread.getCpuCount() catch 1; }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -8250,6 +8268,11 @@ impl Codegen {
         if host {
             self.write(HOST_IO_ZIG);
         }
+        let mut threads = false;
+        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores"));
+        if threads {
+            self.write(THREAD_ZIG);
+        }
     }
 
     /// Generate Zig code with project-aware import resolution.
@@ -8425,6 +8448,9 @@ impl Codegen {
         // module-level name emitted `const` and Zig refused the assignment.
         // gen-verilog got this right all along -- it emits a `reg`.
         let kw = if node.extra_mutable { "var" } else { "const" };
+        if node.extra_kind == "threadlocal" {
+            self.write("threadlocal ");
+        }
         self.write(&format!("{} {}", kw, node.name));
 
         if !node.extra_type.is_empty() {
@@ -10430,6 +10456,9 @@ impl Codegen {
                         "host_read" => Some("__t27_host_read"),
                         "host_write" => Some("__t27_host_write"),
                         "host_close" => Some("__t27_host_close"),
+                        "thread_spawn" => Some("__t27_thread_spawn"),
+                        "thread_join" => Some("__t27_thread_join"),
+                        "thread_cores" => Some("__t27_thread_cores"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -23609,15 +23638,6 @@ impl Compiler {
         Self::ast_is_icarus_lowerable(&ast, &structs, &functions, false)
     }
 
-    /// W534: reason string version of the structural classifier.
-    pub fn icarus_lowerability_reason(source: &str) -> Result<String, String> {
-        match Self::is_icarus_lowerable(source) {
-            Ok(true) => Ok(String::new()),
-            Ok(false) => Err("not lowerable".to_string()),
-            Err(e) => Err(e),
-        }
-    }
-
     fn collect_function_names(
         node: &Node,
         functions: &mut std::collections::HashSet<String>,
@@ -31197,10 +31217,6 @@ impl TbResetCfg {
             duration_cycles: duration,
         }
     }
-
-    pub fn reset_end_cycle(&self) -> u32 {
-        self.delay_cycles.saturating_add(self.duration_cycles)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -32325,17 +32341,6 @@ impl TimingModel {
             has_violations: violated > 0,
         }
     }
-}
-
-pub fn path_delay(arcs: &[TimingArc]) -> u32 {
-    arcs.iter().map(|a| a.delay_ps).sum()
-}
-
-pub fn worst_path_delay(paths: &[TimingPath]) -> u32 {
-    if paths.is_empty() {
-        return 0;
-    }
-    paths.iter().map(|p| p.total_delay_ps).max().unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
