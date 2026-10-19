@@ -589,3 +589,7 @@ tri self-heal --max-iterations 5  # Automated recovery loop
 ```
 
 See **`references/recovery-policy.md`** for complete recovery procedures.
+
+## Traps
+
+- 2026-10-19 'tri coverage' run in a scratch worktree without target/ shows tests, vacuous and seal as unmeasured and the total looks low; pass --t27c <main checkout>/target/release/t27c and the same specs read 145 of 145. (#11061)
