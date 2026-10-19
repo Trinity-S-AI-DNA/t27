@@ -437,6 +437,21 @@ of particles, and runnable in the OS itself and on FPGA. Two specs do this:
   **A mutant can survive and still be equivalent:** reels grow in 72-frame steps, so `MAX_S` from
   60 to 62 refuses exactly the same ideas. Say that in the report, and do not add a test that only
   restates the constant.
+- **Cut the cover still with `COVER = 1`, not with ffmpeg** (gHashTag/t27#10828). `main` still runs
+  the physics of every frame up to `cover_frame(IDEA)`, which is the first scene's last frame, 71.
+  It rasters only that frame and writes one 6220800-byte frame. The still is therefore byte for
+  byte frame 71 of the reel, with the same idea and preset, and it cannot drift. **Prove it with
+  `cmp`, plus a control.** Cut frame 71 out of the `COVER = 0` output (`dd bs=6220800 skip=71
+  count=1`) and `cmp` it with the cover. A control with the guard moved to `frames - 2` must
+  `cmp` equal to frame 70 instead. Without that control, an identical result could mean
+  both sides are broken the same way.
+  Skipping a frame's rows is `py = FRAME_H` before the row loop. That changes no indentation and
+  needs no `!` (codegen trap #6549).
+- **Insert ledger rows in sort order.** `loop-tools-gate` fails "ledger: sorted, one entry per
+  spec" when a row is out of order, and a nearby row looks right by eye
+  (`sar_switch` was put before `sar_comparator`). Check the order before you commit, on the Mac,
+  without running anything heavier than `sort`:
+  `grep -o '"path": "[^"]*"' docs/reports/t27b_expectations.json | LC_ALL=C sort -c`.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
