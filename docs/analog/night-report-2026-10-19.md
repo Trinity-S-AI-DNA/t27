@@ -86,7 +86,7 @@ Skills and rules: `CLAUDE.md` section "Proactivity: request, do not ask", the us
 
 ## 9. Three collaboration options for the next loop
 
-Option A: finish the v0.1 deliverable with the external EDA team. Needs from them: access to their self-checking evaluator and its ADC limits, the ngspice version behind their published RAW, a VACASK that reads current syntax. Cost: small to medium; risk: their answers (several of our questions are still open). First measurable step: VACASK, ngspice-47 and our model on the golden comparator's flip point and the DAC top-plate voltages, differences tabulated (#10911). Default taken if nobody answers: this option.
+Option A: finish the v0.1 deliverable with the external EDA team. Needs from them: access to their self-checking evaluator and its ADC limits, the ngspice version behind their published RAW, a VACASK newer than the wheel so their demo runs in full. Cost: small to medium; risk: their answers (several of our questions are still open). First measurable step: VACASK, ngspice-47 and our model on the golden comparator's flip point and the DAC top-plate voltages, differences tabulated (#10911). Default taken if nobody answers: this option.
 
 Option B: the lab as a network job kind. Needs: operators of machines (our own laptop, a CI runner, the remote host if its owner agrees). Cost: medium; risk: determinism across hardware, untrusted code, the legal line (test-network XP only, no value claim). First measurable step: run the closed gate list on one pinned commit on each host class and count the verdict hashes that differ.
 
@@ -99,3 +99,22 @@ Option C: open-source upstreams. Needs: the maintainers of VACASK, OpenVAF-Reloa
 - Whether a page the external team sent (a researcher's account of time and space) matters for the work. Default taken: nothing.
 - Whether and when to hold a call with the external team is the owner's to decide; no call, price or deadline was promised in the chat.
 
+## 11. Addendum (02:20): VACASK as a second reference, and a defect a peer found
+
+VACASK (PR #11133, issue #10911, merged). Source: the PyPI wheel `vacask-bin` 0.3.4.dev3, pip-installed inside a container job on the remote host (the banner prints "This is vacask unknown."). The main-branch demo of the external team no longer stops at its line-42 syntax error: it runs op1, op2, tran1 and hb1 and stops in hbac1 ("Parameter 'truncharm' not found", "Function 'sort' not found"); the wheel is older than the demo. The 0.3.4 release tarball does not start in that image (libopenblas.so.0 is missing). Both simulators load the same `psp103.osdi`; the IHP PDK was converted for VACASK by the converter of a main-branch clone in 12 s with no hand edits.
+
+Measured, comparator at VDP-VDN = +2 mV, times after the clock's 50 % point at 200.8 ps, ngspice-47 run on the same host the same day:
+
+| quantity | ngspice | VACASK | model | VACASK - ngspice |
+|---|---|---|---|---|
+| decision time | 523.032 ps | 522.910 ps | 5.350 ps | -0.122 ps (-0.023 %) |
+| resolution time | 1111.910 ps | 1111.845 ps | 7.186 ps | -0.065 ps (-0.006 %) |
+| Valid of xtop | 897.700 ps | 897.567 ps | not modelled | -0.133 ps |
+| DAC code 1, Vout | 1.466275659813511e-3 V | 1.46627565982399e-3 V | within 1.74 units of the closed form | about 1e-14 V |
+| DAC code 1023, Vout | 1.499999999998824 V | 1.5 V | closed form 1.5 V | 1.18e-12 V |
+
+At all 14 inputs the decision time agrees within 0.125 ps, the resolution time within 0.065 ps and the Valid time within 0.138 ps, and all 28 winners are the same. The two simulators agree to 0.03 % that the model is 97.7 times too fast on the decision and 154.7 times on the resolution; the cause is the device charge the model does not read yet, not ngspice. The flip point of the loaded top stage is 12 to 46 units (0.7 to 2.7 uV) lower in VACASK, about ngspice's own 10-unit shift between reltol 1e-6 and 1e-8. `specs/analog/vacask_compare.t27`: 7 tests, vacuous 0, six negative controls, four mutants of the pinned numbers each caught. Not done: the full demo on any available VACASK; VACASK's flip point is bracketed only to 4 units; the 1e-12 V DAC drift of ngspice's long run is not attributed (the VACASK runs are 30 ns per code, not the same experiment); no speed claim.
+
+Effect on option A: its first step, a second independent reference on the golden comparator, is done; what the external team's input still adds is a VACASK newer than the wheel (so their demo runs in full) and their evaluator's limits.
+
+A defect a peer found (PR #11136, issue #11131). Another session reported that my lab L2 spec `lab_t27b_ratchet.t27` made the `t27b-native-ratchet` of every PR read "jit/interp mismatch 1". `t27b test --check` reproduces it: the JIT passes, the interpreter faults on an 8-byte read of bytes never written. Nine `[3]usize` scratch arrays were declared without a value; they now start at zero; `--check` exits 0 and the interpreter runs 1824 runtime asserts instead of stopping at 794. I had not run `--check` on that spec; the landing script now does for every spec.
