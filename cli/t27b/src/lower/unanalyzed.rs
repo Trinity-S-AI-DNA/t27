@@ -66,7 +66,7 @@ impl<'a> Lower<'a> {
     /// After every body, the refusals `lazy_body` withdrew come back if AstGen refuses the file anyway (`ls::withdrawn_come_back`).
     pub(super) fn restore_held(&mut self, items: &[&Node]) {
         let prelude = items.iter().any(|c| matches!(c.kind, NodeKind::TestBlock | NodeKind::InvariantBlock));
-        if !self.held.is_empty() && super::ls::withdrawn_come_back(items.iter().any(|f| f.kind == NodeKind::FnDecl && self.undeclared_in(f, prelude).is_some()), !prelude, self.eql_used) {
+        if !self.held.is_empty() && super::ls::withdrawn_come_back(items.iter().any(|f| f.kind == NodeKind::FnDecl && self.undeclared_in(f, prelude).is_some()), !prelude, self.eql_used || super::marked(items.iter().copied(), super::sh::string_eq).next().is_some()) {
             self.errors.append(&mut self.held);
         }
     }
