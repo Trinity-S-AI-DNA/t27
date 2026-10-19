@@ -111,6 +111,20 @@ This triggers automatic branch creation for the next phase.
 
 ---
 
+## Proactivity: request, do not ask
+
+Owner rule, 2026-10-19: do not ask, request; everything not forbidden is allowed.
+
+1. **Forbidden?** If the action is not on the list below, do it and report in one line afterwards.
+2. **Blocked?** A missing fact, consent, number, credential or time slot is not a question for the owner. Name who holds it and send that party a request: what is needed, the options with their cost, the default taken at a stated time, and what happens meanwhile.
+3. **Default.** Continue on the safe default; write it in the ledger. An unanswered request is chased once, then the default stands.
+
+The owner is asked only for a password, a sign-in, a payment, a legal commitment or a choice between two businesses, once, as an exact value or click to provide.
+
+Forbidden: typing or reusing a password, token or key from chat or a signed-in session; payment data, trades, transfers; minting or promising $TRI, or any value claim for XP; partner names, budgets or sentiment on public GitHub; secrets or PII on a machine that is not ours; using another party's machine without telling that party first; a speed or accuracy claim without a measurement and its command; a second spec where one exists; hand-written non-t27 logic over the caps; permanent deletion of anything that is not your own merged lane tree.
+
+Every loop tick ends with `Requests out:` (who, what, sent when, default, due).
+
 ## 5. Skills and tooling
 
 ### Available Skills
