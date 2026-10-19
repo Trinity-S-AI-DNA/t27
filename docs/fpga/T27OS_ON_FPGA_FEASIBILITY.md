@@ -64,7 +64,7 @@ From `fpga/HARDWARE_SSOT.md` (the bench board is an ALINX AX7203, `xc7a200tfbg48
   That is the stage 2 transport.
 - **LEDs**: B13 C13 D14 D15, active low. The shell uses them as blocked / working / done / heartbeat.
 - **Button**: T6 (active low), LVCMOS15; resets the shell.
-- **HDMI / display**: **not established.**
+- **HDMI output**: an SiI9134 transmitter fed by a parallel RGB bus, pins second-hand (section 5b); not yet checked against the official manual.
 - **DDR3**: 1 GB present; two DDR3 cells exist (`ddr3_head_bandwidth`, `ddr3_ternary_matvec`). Not needed before a
   scrollback ring per pane (stage 3).
 
@@ -76,32 +76,75 @@ From `fpga/HARDWARE_SSOT.md` (the bench board is an ALINX AX7203, `xc7a200tfbg48
 | 1 | the host feeds real events: a small host-side client sends one byte per Claude Code hook to the board's RX, so the board's screen shows the user's real panes | a host client in `.t27` (the window's `pty_client.t27` already speaks to a server; a UART transport is a new `@extern` set in `pty_sys.t27`) | next |
 | 2 | the same over Ethernet with `pty_proto.t27`'s frame codec | lower `pty_proto` encode/decode (slice-free subset), reuse the UDP node | later |
 | 3 | `windows.t27` (spaces, sidebar) and a grid (`vt`) on the board | rewrite loops as FSMs or run them on the wasm cell; `f64` to fixed point; DDR3 for scrollback | later |
-| 4 | display | an HDMI pin table and a TMDS transmitter, none of which the repository has | **not established** |
+| 4 | display | parallel-RGB scanout (`vga_text_core.t27`, done) plus an SiI9134 I2C initialiser and a pin table checked against the manual | core **measured**; board top blocked (section 5b) |
 
-## 5b. Stage 4 in progress: a VGA text screen (owner has a VGA monitor, 2026-10-19)
+## 5b. Stage 4: a text screen on the owner's VGA monitor (2026-10-19)
 
-`specs/fpga/vga_text_core.t27` is the part that does not depend on the connector: 640x480@60 timing (800x525
-total, syncs low), an 8x8 glyph ROM and a text scanout, one `on_clock` per pixel. **Measured** on the lab: 7 tests
-pass (96 low hsync ticks a line, 800 ticks a line, 2 low vsync lines, 525 lines, 307200 visible pixels, the first
-glyph row of "T" on the stream, the stream equal to `pixel_at` for 8 lines, blanking black); `t27b verilog`
-lowers it (636 lines); yosys `synth_xilinx` passes (392 cells).
+The owner's monitor is VGA, attached to the board's HDMI output through an active HDMI-to-VGA adapter.
 
-**How VGA reaches the board is not established.** No VGA, HDMI or DVI pin appears in `fpga/HARDWARE_SSOT.md` or in
-any `.xdc` in the repository, and there is no AX7203 schematic. So there is deliberately no board top and no pin
-attribute, and no pin is guessed: a wrong pin map can damage the board or the monitor. The owner must confirm
-one of these routes (and supply its pin table, from the schematic or the adapter's documentation):
+`specs/fpga/vga_text_core.t27` is the part that does not depend on how the pixels leave the chip: 640x480@60
+timing (800x525 total, syncs low), an 8x8 glyph ROM and a text scanout, one `on_clock` per pixel. **Measured** on
+the lab: 7 tests pass (96 low hsync ticks a line, 800 ticks a line, 2 low vsync lines, 525 lines, 307200 visible
+pixels, the first glyph row of "T" on the stream, the stream equal to `pixel_at` for 8 lines, blanking black);
+`t27b verilog` lowers it (636 lines); yosys `synth_xilinx` passes (392 cells).
 
-1. **An on-board HDMI/DVI connector** (if the AX7203 revision on the bench has one): a TMDS encoder in `.t27`
-   (8b/10b-style encoding plus a 10:1 serializer on `OSERDESE2`) drives it; the monitor needs an HDMI-to-VGA
-   converter or an HDMI/DVI input. Cheaper in parts (no adapter board), dearer in logic and in timing closure
-   (a 250 MHz bit clock).
-2. **A VGA board on a PMOD, FMC or expansion header** (resistor-ladder DAC, 4 to 5 bits a color): the logic is
-   the core above plus a pin table; cheapest in logic and in risk, since the colour outputs are plain LVCMOS
-   and a black-and-white screen needs only one pin for all three colors. Needs the adapter's pinout and the
-   header's pin map.
+### The AX7203 HDMI output is not a TMDS output from the FPGA
 
-Plug the monitor in only after the board top for the confirmed route is in a merged spec and its bitstream is
-programmed; before that there is nothing to show.
+Two community projects that read the ALINX manual (pages 31-32 for the video part) agree, pin for pin, that the
+board's HDMI output is an **SiI9134 HDMI transmitter fed by a parallel bus**: 24 data bits, a pixel clock, DE,
+HSYNC and VSYNC, plus a reset and an I2C configuration bus. The FPGA does not drive TMDS pairs, so a TMDS
+encoder and 10:1 serialiser in `.t27` would have no pin to drive on this board. The route is a **parallel RGB
+scanout** (what the core already is) plus an **I2C initialiser** for the SiI9134. The adapter then sees an
+ordinary HDMI/DVI signal from the transmitter chip.
+
+Sources (second-hand, **not yet checked against the official PDF**, which this session could not read: the
+browser pane shows no PDF, and downloading it needs the owner's yes):
+
+- `LilithSemi/harbor`, `packages/harbor/lib/src/soc/board.dart` (AX7203 pin table, "p.31-32").
+- `adilsondias-engineer/20-fpga-order-book`, `constraints/ax7203_rgmii.xdc` (lines 324-345 and after).
+- The ALINX manual itself: `https://www.alinx.com/public/upload/file/AX7203_User_Manual.pdf`.
+
+Both lists agree on every one of these (all LVCMOS33):
+
+| signal | ball | signal | ball |
+|---|---|---|---|
+| hdmi_clk (to IDCK) | M13 | hdmi_d[12] | L14 |
+| hdmi_de | V13 | hdmi_d[13] | L15 |
+| hdmi_hsync | T15 | hdmi_d[14] | M15 |
+| hdmi_vsync | T14 | hdmi_d[15] | M16 |
+| hdmi_reset_n | J19 | hdmi_d[16] | L18 |
+| hdmi_d[0] | V14 | hdmi_d[17] | M18 |
+| hdmi_d[1] | H14 | hdmi_d[18] | N18 |
+| hdmi_d[2] | J14 | hdmi_d[19] | N19 |
+| hdmi_d[3] | K13 | hdmi_d[20] | M20 |
+| hdmi_d[4] | K14 | hdmi_d[21] | N20 |
+| hdmi_d[5] | L13 | hdmi_d[22] | L21 |
+| hdmi_d[6] | L19 | hdmi_d[23] | M21 |
+| hdmi_d[7] | L20 | i2c scl | E16 |
+| hdmi_d[8] | K17 | i2c sda | F16 |
+| hdmi_d[9] | J17 | | |
+| hdmi_d[10] | L16 | | |
+| hdmi_d[11] | K16 | | |
+
+The data bits are not named by colour in the manual: the chip's input setup (over I2C) decides which group is
+red, green or blue. The I2C balls come from LiteX, not from the manual ("the manual draws the nets but gives no
+balls"), and the manual gives no I2C address. The initialiser in `harbor` (`sii9134_initializer.dart`) writes
+two registers, `0x72 <- reg 0x08 = 0x35` and `0x7A <- reg 0x2F = 0x00`, after a reset low of at least 50 us; that
+sequence is **third-party and not run on this bench**.
+
+### What is still missing before a board top
+
+1. The pin table checked against the official manual (or the owner's yes to download that one PDF).
+2. The SiI9134 input setup for 24-bit RGB with separate syncs, and the I2C address and registers, from the
+   manual or the chip's reference. The two-register sequence above is not a verified picture-on sequence.
+3. A way to drive an open-drain I2C pad from `.t27`: no tristate primitive was found in the repository, and
+   `t27b verilog` was not shown to emit one. This needs a look in `specs/fpga/` for an `IOBUF`-style cell.
+4. A 25 MHz pixel clock: from the 200 MHz input, the PLL used by the other cells gives 25 MHz with a VCO at
+   800 MHz and an output divide of 32 (to be checked in the PLL spec, not assumed).
+
+The monitor needs plugging in only when the board top for this route is merged and its bitstream is
+programmed. The cable to connect is **the board's HDMI output (the connector marked HDMI output, not HDMI input)
+to the HDMI-to-VGA adapter, and the adapter to the monitor's VGA cable**.
 
 ## 6. Why there is no bench transcript in this PR
 
