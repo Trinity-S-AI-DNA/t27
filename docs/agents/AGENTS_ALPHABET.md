@@ -633,7 +633,7 @@ two domains, and a tool the Queen runs daily may still be N's or K's to answer f
 | **TI** | 1 | 0 | `gHashTag/trinity:tri/identity` |
 
 Tools are written in `code`, skills in *italics*. The Queen is not listed: she
-holds all 92 tools and all 27 skills by rule 1, which is why her own cards say so
+holds all 93 tools and all 27 skills by rule 1, which is why her own cards say so
 rather than repeating this table.
 
 Each binding is recorded twice and checked both ways: a tool card's `AGENTS` must

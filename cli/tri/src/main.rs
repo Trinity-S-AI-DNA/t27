@@ -50,6 +50,10 @@ mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab r
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
 #[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
+#[path = "../../../gen/rust/tri/remote/remote_job.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
+#[path = "../../../gen/rust/tri/land/land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -412,6 +416,8 @@ enum Commands {
     },
     /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
     Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
+    /// An analog reference job on a remote Docker host over SSH (host: TRI_REMOTE_HOST): ping | run <deck> [--golden] [--threads N] | status <id> | logs <id> | stop <id> | fetch <id> <file> [--to dir]; --print shows the command lines and sends nothing (rules: specs/tri/remote/remote_job.t27, #11020).
+    Remote { action: String, name: Option<String>, file: Option<String>, #[arg(long)] to: Option<String>, #[arg(long)] golden: bool, #[arg(long, default_value_t = rj::DEFAULT_THREADS)] threads: u64, #[arg(long)] print: bool },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -445,6 +451,12 @@ enum Commands {
     },
     /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
+    /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
+    Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
+    /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
+    Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
+    /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
+    Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
 }
 
 #[derive(Subcommand)]
@@ -1078,6 +1090,22 @@ fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
     Ok(0)
 }
 
+/// `tri remote` (#11020): every command line is specs/tri/remote/remote_job.t27; this reads TRI_REMOTE_HOST / _IMAGE / _DECK_URL, prints each line the spec builds and, without --print, runs it (no shell), stopping at the first that fails.
+fn cmd_remote(action: &str, name: Option<&str>, file: Option<&str>, to: Option<&str>, threads: u64, golden: bool, print: bool) -> Result<u8> {
+    let (env, arg) = (|k: &str, d: &str| -> &'static str { std::env::var(k).unwrap_or_else(|_| d.to_string()).leak() }, |o: Option<&str>| -> &'static str { o.unwrap_or("").to_string().leak() });
+    let r = rj::TriRemoteReq { op: rj::action_op(arg(Some(action))), host: env(rj::HOST_VAR, ""), image: env(rj::IMAGE_VAR, rj::DEFAULT_IMAGE), name: arg(name), file: arg(file), dest: arg(to), url: env(rj::URL_VAR, ""), threads, counter: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), golden };
+    let (mut buf, mut line, why) = (vec![0u8; rj::CMD_MAX], vec![0u8; rj::CMD_MAX], rj::refusal(r));
+    anyhow::ensure!(why == rj::R_OK, "tri remote: refused, nothing sent: {}", rj::refusal_text(why));
+    let id = rj::job_id(r, &mut buf); if id > 0 { println!("job {}", String::from_utf8_lossy(&buf[..id])); }
+    for step in 0u8.. {
+        let n = rj::command(r, step, &mut buf); if n == 0 { break; }
+        let m = rj::shell_form(&buf, n, &mut line); println!("{}", String::from_utf8_lossy(&line[..m]));
+        let argv: Vec<&str> = std::str::from_utf8(&buf[..n])?.lines().collect();
+        if !print { let s = Command::new(argv[0]).args(&argv[1..]).status()?; if !s.success() { return Ok(s.code().unwrap_or(1) as u8); } }
+    }
+    Ok(0)
+}
+
 /// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
 fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
     let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
@@ -1343,10 +1371,14 @@ fn main() -> Result<()> {
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
         Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
+        Commands::Remote { action, name, file, to, golden, threads, print } => std::process::exit(cmd_remote(action, name.as_deref(), file.as_deref(), to.as_deref(), *threads, *golden, *print)? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
+        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
+        Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
+        Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
 
     Ok(())
@@ -1468,4 +1500,36 @@ fn cmd_serve(addr: &str) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
+fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result<u8> {
+    let leak = |s: String| -> &'static str { s.leak() };
+    let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan };
+    let (mut ev, mut buf, mut code, mut at) = ("", vec![0u8; land::CMD_MAX], land::request_refusal(r), (0u8, 0u64));
+    let argv = |b: &[u8]| -> Vec<String> { String::from_utf8_lossy(b).lines().map(str::to_string).collect() };
+    if plan && code == land::L_OK { for k in 0..land::LAND_STEPS { let n = land::step_argv(r, "", k, 0, &mut buf); println!("{k:2} {:<17} {}", land::step_name(k), argv(&buf[..n]).join(" ")); } return Ok(0); }
+    while code == land::L_OK {
+        let s = land::next_slot(r, ev);
+        if s >= land::DONE { code = if check { land::L_CHECKED } else { land::L_LANDED }; break; }
+        at = ((s / land::SLOT) as u8, s % land::SLOT);
+        let n = land::step_argv(r, ev, at.0, at.1, &mut buf);
+        anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
+        let a = argv(&buf[..n]);
+        let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
+        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::in_scratch(at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
+        let text = leak(text);
+        let mut sec = vec![0u8; text.len() + 128];
+        let m = land::emit_section(&mut sec, 0, at.0, at.1, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..m])));
+        if at.0 == land::L_CHANGES { r.changes = text; }
+        code = land::judge(r, ev, at.0, at.1);
+        println!("{:<17} exit {x}", land::step_name(at.0));
+    }
+    let m = land::step_argv(r, ev, land::L_CLEAN, 0, &mut buf);
+    if m > 0 { let a = argv(&buf[..m]); let _ = Command::new(&a[0]).args(&a[1..]).output(); }
+    let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
+    println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
+    Ok(land::exit_code(code))
 }
