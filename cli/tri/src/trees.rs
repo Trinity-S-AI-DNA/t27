@@ -150,21 +150,6 @@ pub fn parse_porcelain(text: &str) -> Vec<Tree> {
     out
 }
 
-/// The session a scratchpad path belongs to, if it is under one.
-///
-/// Scratch worktrees live under `.../claude-501/<project>/<session-uuid>/...`. Grouping by
-/// that segment is what turns "120 trees" into "96 of them are somebody else's".
-pub fn session_of(path: &str) -> Option<&str> {
-    let mut parts = path.split('/');
-    while let Some(p) = parts.next() {
-        if p.starts_with("claude-") {
-            parts.next()?; // the project segment
-            return parts.next().filter(|s| s.len() >= 32);
-        }
-    }
-    None
-}
-
 /// Kilobytes to gibibytes, for printing only.
 pub fn gib(kb: u64) -> f64 {
     kb as f64 / 1_048_576.0
@@ -241,6 +226,19 @@ fn du_kb(path: &str) -> Option<u64> {
         .ok()
 }
 
+/// The newest commit of a tree as `git log -1 --format=%ct%x09%s` prints it, and its age in minutes (reap.t27): what a reader has to go on to tell whose work a tree is. A path says nothing of it, and the `mine` label that guessed from the path is gone.
+fn newest(path: &str) -> (&'static str, u64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let log: &'static str = git_in(path, &["log", "-1", "--format=%ct%x09%s"]).unwrap_or_default().leak();
+    (log, reap::age_of(now, log))
+}
+
+/// That evidence as one phrase: the age, and the first 60 characters of the subject, quoted.
+fn said((log, age): (&'static str, u64)) -> String {
+    let when = if age == reap::AGE_UNKNOWN { "time unreadable".to_string() } else { format!("{}{} ago", reap::age_count(age), reap::age_unit(age)) };
+    format!("newest commit {when}: {:?}", log[reap::subject_from(log)..].chars().take(60).collect::<String>())
+}
+
 #[derive(Args)]
 pub struct Worktrees {
     /// Also measure disk usage. Off by default: `du` over 120 checkouts is slow, and the
@@ -250,7 +248,7 @@ pub struct Worktrees {
     /// Print every tree, not only those holding work or unreadable.
     #[arg(long)]
     all: bool,
-    /// Print the `git worktree remove` line of every checkout that is REMOVABLE (rules: specs/tri/worktrees/reap.t27): its PR is merged or closed (asked of GitHub once per branch), it holds nothing but the untracked target link, and no live pid holds its lock. Still deletes nothing.
+    /// Print the `git worktree remove` line of every checkout that is REMOVABLE (rules: specs/tri/worktrees/reap.t27): its PR is merged or closed (asked of GitHub once per branch), it holds nothing but the untracked target link, no live pid holds its lock, and neither its newest commit nor a file in it is younger than 60 minutes (such a tree is KEEP_ACTIVE and is printed too). Each row shows the unpushed commits and the newest commit's age and subject. Still deletes nothing.
     #[arg(long)]
     reap_plan: bool,
 }
@@ -267,16 +265,19 @@ fn reap_plan(trees: &[Tree], all: bool) {
         let pid = reap::lock_pid(t.locked.clone().unwrap_or_default().leak());
         let gone = pid != 0 && Command::new("kill").args(["-0", &pid.to_string()]).output().map_or(false, |o| String::from_utf8_lossy(&o.stderr).contains("No such process"));
         let lock = reap::lock_state(t.locked.is_some(), pid, !gone);
-        let judge = |pr| reap::verdict(i == 0, dirty, lock, pr, reap::plain(path));
-        let mut v = judge(reap::PR_MERGED);
+        let last = newest(path);
+        let judge = |pr, busy| reap::verdict(i == 0, dirty, lock, pr, reap::plain(path), busy);
+        let mut v = judge(reap::PR_MERGED, false);
         if v == reap::V_REMOVABLE {
             let url = format!("{}{branch}", reap::PULLS_URL);
             let pulls = if reap::plain(branch) { crate::payout::sh("curl", &["-fsSL", "--max-time", "30", "-H", "@-", &url], &auth) } else { "" };
-            v = judge(reap::pr_state(serde_json::from_str::<serde_json::Value>(pulls).ok().and_then(|j| serde_json::to_string_pretty(&j).ok()).unwrap_or_default().leak()));
+            let touched = Command::new("find").args([path, "-path", &format!("{path}/target"), "-prune", "-o", "-type", "f", "-mmin", &format!("-{}", reap::ACTIVE_MINUTES), "-print", "-quit"]).output().map_or(true, |o| !o.stdout.is_empty());
+            v = judge(reap::pr_state(serde_json::from_str::<serde_json::Value>(pulls).ok().and_then(|j| serde_json::to_string_pretty(&j).ok()).unwrap_or_default().leak()), reap::active(last.1, touched));
         }
         counts[v as usize] += 1;
-        if v == reap::V_REMOVABLE || all {
-            println!("  {:14} {:28.28}  {branch:34.34}  {}", reap::verdict_name(v), path.rsplit('/').next().unwrap_or(path), reap::why(v));
+        if v == reap::V_REMOVABLE || v == reap::V_KEEP_ACTIVE || all {
+            let ahead = match holding_of(t) { Holding::Work { commits, .. } => commits.to_string(), Holding::Clean { .. } => "0".into(), Holding::Unknown(_) => "?".into() };
+            println!("  {:14} {:28.28}  {branch:34.34}  {ahead} unpushed, {}  {}", reap::verdict_name(v), path.rsplit('/').next().unwrap_or(path), said(last), reap::why(v));
         }
         if v == reap::V_REMOVABLE {
             println!("    {}{main}{}{} {path}", reap::REMOVE_HEAD, reap::REMOVE_MID, reap::remove_flags(lock));
@@ -295,9 +296,6 @@ pub fn run(a: &Worktrees) -> Result<()> {
         String::from_utf8_lossy(&out.stdout).to_string()
     };
     let trees = parse_porcelain(&porcelain);
-    let here = std::env::current_dir()
-        .ok()
-        .and_then(|p| session_of(&p.to_string_lossy()).map(str::to_string));
 
     let mut work = 0usize;
     let mut unknown = 0usize;
@@ -318,7 +316,6 @@ pub fn run(a: &Worktrees) -> Result<()> {
             Holding::Unknown(_) => unknown += 1,
             Holding::Work { .. } => work += 1,
         }
-        let mine = session_of(&t.path) == here.as_deref();
         let show = a.all || h.holds_work();
         let (tk, ok) = if a.size {
             let target = du_kb(&format!("{}/target", t.path)).unwrap_or(0);
@@ -366,15 +363,15 @@ pub fn run(a: &Worktrees) -> Result<()> {
             }
             Holding::Unknown(r) => format!("UNREADABLE -- {r}"),
         };
-        let tag = if mine { "mine " } else { "other" };
+        let seen = said(newest(&t.path));
         if a.size {
             println!(
-                "  {tag}  {name:28.28}  {branch:34.34}  {state}   [{:.1} GiB regenerable, {:.1} GiB not]",
+                "  {name:28.28}  {branch:34.34}  {state}   [{:.1} GiB regenerable, {:.1} GiB not]  {seen}",
                 gib(tk),
                 gib(ok)
             );
         } else {
-            println!("  {tag}  {name:28.28}  {branch:34.34}  {state}");
+            println!("  {name:28.28}  {branch:34.34}  {state}  {seen}");
         }
     }
 
@@ -532,37 +529,6 @@ mod holding_tests {
         let st = parse_status("");
         assert_eq!(st, Status::default());
         assert_eq!(parse_status("\n\n"), Status::default());
-    }
-}
-
-#[cfg(test)]
-mod session_tests {
-    use super::*;
-
-    #[test]
-    fn a_scratch_path_names_its_session() {
-        let p = "/private/tmp/claude-501/-Users-x-PROJECTS/9ba6bf38-825b-45d0-a349-e87b252815cd/wt-shell";
-        assert_eq!(session_of(p), Some("9ba6bf38-825b-45d0-a349-e87b252815cd"));
-    }
-
-    #[test]
-    fn a_path_outside_a_scratchpad_names_none() {
-        assert_eq!(session_of("/Users/x/Desktop/PROJECTS/CLAUDE/t27"), None);
-        assert_eq!(session_of("/private/tmp/t27-brkstack"), None);
-    }
-
-    #[test]
-    fn a_short_segment_is_not_a_session_id() {
-        // Guards against reading the next path component as an id whatever it is.
-        assert_eq!(session_of("/private/tmp/claude-501/proj/short/wt"), None);
-    }
-
-    #[test]
-    fn two_paths_in_one_session_group_together() {
-        let a = "/private/tmp/claude-501/p/6d5ee66e-7a77-440d-bb58-d33bbe1e1558/scratchpad/CP";
-        let b = "/private/tmp/claude-501/p/6d5ee66e-7a77-440d-bb58-d33bbe1e1558/scratchpad/hunt";
-        assert_eq!(session_of(a), session_of(b));
-        assert!(session_of(a).is_some());
     }
 }
 
