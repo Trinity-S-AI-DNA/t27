@@ -12,6 +12,13 @@ use serde::Serialize;
 #[path = "../gen/rust/compiler/verilog_aos_memory.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod verilog_aos_memory;
+// specs/compiler/verilog_entry_port_collision.t27 (#5649), verilog_void_tail.t27 (#5651): the same; never hand-edit.
+#[path = "../gen/rust/compiler/verilog_entry_port_collision.rs"]
+#[allow(dead_code, unused_parens, clippy::all)]
+mod verilog_entry_port_collision;
+#[path = "../gen/rust/compiler/verilog_void_tail.rs"]
+#[allow(dead_code, unused_parens, clippy::all)]
+mod verilog_void_tail;
 // specs/compiler/cse_hoist.t27 (#8197), lowered by `t27c gen-rust`; never hand-edit it.
 #[path = "../gen/rust/compiler/cse_hoist.rs"]
 #[allow(dead_code, unused_parens)]
@@ -138,12 +145,6 @@ impl Node {
             line: 0,
             children: Vec::new(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_child(mut self, child: Node) -> Self {
-        self.children.push(child);
-        self
     }
 }
 
@@ -1332,11 +1333,6 @@ impl Parser {
         self.current.kind == kind
     }
 
-    #[allow(dead_code)]
-    fn check_peek(&self, kind: TokenKind) -> bool {
-        self.peek.kind == kind
-    }
-
     fn expect(&mut self, kind: TokenKind) -> Result<(), String> {
         if !self.check(kind) {
             return Err(format!(
@@ -2035,6 +2031,15 @@ the parser used to read it as `{}` followed by a negation",
 
             if self.current.kind == TokenKind::KwPragma {
                 self.parse_pragma()?;
+                continue;
+            }
+
+            // #10876: `threadlocal var` -- one copy of the variable per thread (Zig `threadlocal var`).
+            if self.current.kind == TokenKind::Ident && self.current.lexeme == "threadlocal" && self.peek.kind == TokenKind::KwVar {
+                self.advance();
+                let mut decl = self.parse_var_decl(false)?;
+                decl.extra_kind = "threadlocal".to_string();
+                module.children.push(decl);
                 continue;
             }
 
@@ -7352,6 +7357,26 @@ fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_po
 fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
 "#;
 
+/// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
+/// and returns false when the slot is busy or the OS refuses; thread_join(slot) waits for it.
+const THREAD_ZIG: &str = r#"
+const __t27_Thread = @import("std").Thread;
+var __t27_threads: [256]?__t27_Thread = [_]?__t27_Thread{null} ** 256;
+fn __t27_thread_spawn(slot: usize, comptime f: anytype, arg: usize) bool {
+    if (slot >= __t27_threads.len or __t27_threads[slot] != null) return false;
+    __t27_threads[slot] = __t27_Thread.spawn(.{}, f, .{arg}) catch return false;
+    return true;
+}
+fn __t27_thread_join(slot: usize) bool {
+    if (slot >= __t27_threads.len) return false;
+    const t = __t27_threads[slot] orelse return false;
+    t.join();
+    __t27_threads[slot] = null;
+    return true;
+}
+fn __t27_thread_cores() usize { return __t27_Thread.getCpuCount() catch 1; }
+"#;
+
 pub struct Codegen {
     output: String,
     indent: u32,
@@ -8243,6 +8268,11 @@ impl Codegen {
         if host {
             self.write(HOST_IO_ZIG);
         }
+        let mut threads = false;
+        Self::visit_calls(&ast.children, &mut |c| threads |= matches!(c.name.as_str(), "thread_spawn" | "thread_join" | "thread_cores") && !self.declared_fns.contains(&c.name));
+        if threads {
+            self.write(THREAD_ZIG);
+        }
     }
 
     /// Generate Zig code with project-aware import resolution.
@@ -8418,6 +8448,9 @@ impl Codegen {
         // module-level name emitted `const` and Zig refused the assignment.
         // gen-verilog got this right all along -- it emits a `reg`.
         let kw = if node.extra_mutable { "var" } else { "const" };
+        if node.extra_kind == "threadlocal" {
+            self.write("threadlocal ");
+        }
         self.write(&format!("{} {}", kw, node.name));
 
         if !node.extra_type.is_empty() {
@@ -10423,6 +10456,9 @@ impl Codegen {
                         "host_read" => Some("__t27_host_read"),
                         "host_write" => Some("__t27_host_write"),
                         "host_close" => Some("__t27_host_close"),
+                        "thread_spawn" => Some("__t27_thread_spawn"),
+                        "thread_join" => Some("__t27_thread_join"),
+                        "thread_cores" => Some("__t27_thread_cores"),
                         _ => None,
                     };
                     if let Some(b) = builtin {
@@ -11674,7 +11710,8 @@ impl VerilogCodegen {
     /// The in-file half of an entry-point refusal (the stderr half is in
     /// `main.rs`). One writer, so `on_comb` and `on_clock` say the same thing.
     fn write_entry_refusal_comment(&mut self, what: &str) {
-        self.write_line("// ENTRY POINT REFUSED -- a parameter or return has no derivable width:");
+        let why = if what.contains(" -- named like ") { "is named like a 1-bit header port" } else { "or return has no derivable width" };
+        self.write_line(&format!("// ENTRY POINT REFUSED -- a parameter {why}:"));
         self.write_line(&format!("//     {what}"));
         self.write_line(
             "// `[N]T` is accepted (N*width(T) is arithmetic). A slice has no length in",
@@ -14170,10 +14207,19 @@ impl VerilogCodegen {
         // so anything accepted can be sized.
         let mut input_ports: Vec<(String, u32, bool)> = Vec::new();
         let mut entry_refusal: Option<String> = None;
+        let declares = |n: &str| {
+            consts.iter().any(|c| c.name == n) || module_regs.iter().any(|r| r == n)
+        };
+        // #5649: a parameter named like a header port that is emitted (below, W649) is decided by the spec.
+        let port_of = |n: &str, w: u32, s: bool| verilog_entry_port_collision::entry_param_port(["clk", "rst_n", "en"].contains(&n) && !declares(n), w, s);
         if let Some(oc) = functions.iter().find(|f| f.name == "on_clock" || f.name == "on_comb") {
             let mut widths: Vec<(String, u32, bool)> = Vec::new();
             for (pname, ptype) in &oc.params {
                 match Self::entry_port_width(ptype, &self.struct_decls) {
+                    Some(w) if port_of(pname, w, Self::type_is_signed(ptype)) == verilog_entry_port_collision::PORT_REFUSED => {
+                        entry_refusal = Some(format!("{pname}: {ptype} -- named like the 1-bit `{pname}` port"));
+                        break;
+                    }
                     Some(w) => widths.push((pname.clone(), w, Self::type_is_signed(ptype))),
                     None => {
                         entry_refusal = Some(format!("{pname}: {ptype}"));
@@ -14217,10 +14263,7 @@ impl VerilogCodegen {
         // The spec's intent is unambiguous: it declares the signal and assigns
         // it, so the `reg` is right and the PORT is wrong. Dropping the reg --
         // the obvious reading of the error -- would have made a driven signal an
-        // undrivable input. See T62.
-        let declares = |n: &str| {
-            consts.iter().any(|c| c.name == n) || module_regs.iter().any(|r| r == n)
-        };
+        // undrivable input. See T62. (`declares` is defined above, where #5649 reads it.)
         self.write_line(&format!("module {} (", mod_name));
         self.indent();
         for p in ["clk", "rst_n", "en"] {
@@ -14231,6 +14274,7 @@ impl VerilogCodegen {
             self.write_line(&format!("input  wire        {},", p));
         }
         for (name, w, signed) in &input_ports {
+            if port_of(name, *w, *signed) == verilog_entry_port_collision::PORT_SHARED { continue; } // #5649: declared above
             let range = Self::range_decl(*w);
             let signed_str = if *signed { "signed " } else { "" };
             // W650: the FOURTH unescaped emit site, and the one T53 predicted.
@@ -15835,6 +15879,7 @@ impl VerilogCodegen {
     /// byte-identical to before.
     fn gen_verilog_clocked_fn(&mut self, node: &Node, consts: &[&Node]) {
         self.current_fn_name = node.name.clone();
+        self.current_fn_return_type = node.extra_return_type.clone(); // #5651: its own, never the last fn's
         self.local_types.clear();
         self.param_types.clear();
         self.param_widths.clear();
@@ -15891,6 +15936,7 @@ impl VerilogCodegen {
         self.write_indent();
         self.write_line("end");
         self.current_fn_name.clear();
+        self.current_fn_return_type.clear();
         self.local_types.clear();
         self.param_types.clear();
         self.param_widths.clear();
@@ -16022,9 +16068,7 @@ impl VerilogCodegen {
             if idx + 1 == stmts.len()
                 && stmt.kind == NodeKind::StmtIf
                 && stmt.children.len() == 3
-                && !self.current_fn_name.is_empty()
-                && !self.current_fn_return_type.is_empty()
-                && self.current_fn_return_type != "void"
+                && verilog_void_tail::tail_is_return(!self.current_fn_name.is_empty(), !self.current_fn_return_type.is_empty(), self.current_fn_return_type == "void")
                 && (Self::verilog_body_has_tail_expr(&stmt.children[1].children)
                     || Self::verilog_body_has_tail_expr(&stmt.children[2].children))
             {
@@ -16048,12 +16092,11 @@ impl VerilogCodegen {
             // the function's implicit return value. Verilog has no tail
             // expressions, so it emitted `expr;` (a bare statement iverilog
             // reads as a task-enable). Lower the LAST StmtExpr to an implicit
-            // return assignment `<fn> = <expr>;` (t27#1948).
+            // return assignment `<fn> = <expr>;` (t27#1948) -- in a fn that returns a value (#5651).
             let is_tail_expr = idx + 1 == stmts.len()
                 && stmt.kind == NodeKind::StmtExpr
                 && !stmt.children.is_empty()
-                && !self.current_fn_name.is_empty()
-                && self.current_fn_return_type != "void";
+                && verilog_void_tail::tail_is_return(!self.current_fn_name.is_empty(), !self.current_fn_return_type.is_empty(), self.current_fn_return_type == "void");
             if is_tail_expr {
                 self.write_indent();
                 let asn = if self.clocked_nonblocking { " <= " } else { " = " };
@@ -23595,15 +23638,6 @@ impl Compiler {
         Self::ast_is_icarus_lowerable(&ast, &structs, &functions, false)
     }
 
-    /// W534: reason string version of the structural classifier.
-    pub fn icarus_lowerability_reason(source: &str) -> Result<String, String> {
-        match Self::is_icarus_lowerable(source) {
-            Ok(true) => Ok(String::new()),
-            Ok(false) => Err("not lowerable".to_string()),
-            Err(e) => Err(e),
-        }
-    }
-
     fn collect_function_names(
         node: &Node,
         functions: &mut std::collections::HashSet<String>,
@@ -30993,18 +31027,6 @@ impl AsmConfig {
     }
 }
 
-pub fn align_address(addr: u32, alignment: u32) -> u32 {
-    if alignment == 0 {
-        return addr;
-    }
-    let remainder = addr % alignment;
-    if remainder == 0 {
-        addr
-    } else {
-        addr + alignment - remainder
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct HirAssembler {
     pub config: AsmConfig,
@@ -31194,10 +31216,6 @@ impl TbResetCfg {
             delay_cycles: delay,
             duration_cycles: duration,
         }
-    }
-
-    pub fn reset_end_cycle(&self) -> u32 {
-        self.delay_cycles.saturating_add(self.duration_cycles)
     }
 }
 
@@ -32074,18 +32092,6 @@ pub enum ArcKind {
     InputToOutput,
 }
 
-impl ArcKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => ArcKind::Comb,
-            1 => ArcKind::RegToReg,
-            2 => ArcKind::RegToOutput,
-            3 => ArcKind::InputToReg,
-            4 => ArcKind::InputToOutput,
-            _ => ArcKind::Comb,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TimingArc {
@@ -32323,17 +32329,6 @@ impl TimingModel {
             has_violations: violated > 0,
         }
     }
-}
-
-pub fn path_delay(arcs: &[TimingArc]) -> u32 {
-    arcs.iter().map(|a| a.delay_ps).sum()
-}
-
-pub fn worst_path_delay(paths: &[TimingPath]) -> u32 {
-    if paths.is_empty() {
-        return 0;
-    }
-    paths.iter().map(|p| p.total_delay_ps).max().unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -33013,11 +33008,6 @@ pub struct RouteEstimate {
     pub needs_global_buf: bool,
 }
 
-impl RouteEstimate {
-    pub fn passed(&self) -> bool {
-        self.congestion_score < 80
-    }
-}
 
 pub struct RouteModel;
 
@@ -33428,6 +33418,7 @@ pub struct CtsReport {
     pub worst_latency_ps: u32,
     pub has_violations: bool,
 }
+
 
 impl CtsReport {
     pub fn passed(&self) -> bool {
@@ -38468,21 +38459,6 @@ mod tests_hir_assembler {
     }
 
     #[test]
-    fn test_align_address_zero() {
-        assert_eq!(align_address(5, 4), 8);
-    }
-
-    #[test]
-    fn test_align_address_already_aligned() {
-        assert_eq!(align_address(8, 4), 8);
-    }
-
-    #[test]
-    fn test_align_address_zero_alignment() {
-        assert_eq!(align_address(5, 0), 5);
-    }
-
-    #[test]
     fn test_instr_count() {
         let cfg = AsmConfig::new("test");
         assert_eq!(cfg.instr_count(128), 32);
@@ -38693,7 +38669,6 @@ mod tests_hir_testbench {
         assert!(cfg.active_low);
         assert_eq!(cfg.delay_cycles, 5);
         assert_eq!(cfg.duration_cycles, 10);
-        assert_eq!(cfg.reset_end_cycle(), 15);
     }
 
     #[test]
@@ -40080,16 +40055,6 @@ mod tests_hir_timing {
     }
 
     #[test]
-    fn test_path_delay() {
-        let arcs = vec![
-            TimingArc::comb("a", "b", 100),
-            TimingArc::comb("b", "c", 200),
-            TimingArc::comb("c", "d", 300),
-        ];
-        assert_eq!(path_delay(&arcs), 600);
-    }
-
-    #[test]
     fn test_slack_positive() {
         assert_eq!(TimingModel::slack(5000, 10000), 5000);
     }
@@ -40117,21 +40082,6 @@ mod tests_hir_timing {
     #[test]
     fn test_est_reg_to_reg_delay() {
         assert_eq!(TimingModel::est_reg_to_reg_delay(3), 800);
-    }
-
-    #[test]
-    fn test_worst_path() {
-        let paths = vec![
-            TimingPath::new("a", "b", 500, 0),
-            TimingPath::new("c", "d", 1200, 0),
-            TimingPath::new("e", "f", 800, 0),
-        ];
-        assert_eq!(worst_path_delay(&paths), 1200);
-    }
-
-    #[test]
-    fn test_worst_path_empty() {
-        assert_eq!(worst_path_delay(&[]), 0);
     }
 
     #[test]
@@ -41742,32 +41692,6 @@ mod tests_hir_router {
     #[test]
     fn test_congestion_zero_area() {
         assert_eq!(RouteModel::est_congestion(1000, 0), 0);
-    }
-
-    #[test]
-    fn test_route_passed() {
-        let r = RouteEstimate {
-            total_nets: 100,
-            total_wire_length_um: 50000,
-            avg_wire_length_um: 500,
-            max_fanout: 10,
-            congestion_score: 20,
-            needs_global_buf: false,
-        };
-        assert!(r.passed());
-    }
-
-    #[test]
-    fn test_route_failed() {
-        let r = RouteEstimate {
-            total_nets: 1000,
-            total_wire_length_um: 500000,
-            avg_wire_length_um: 500,
-            max_fanout: 50,
-            congestion_score: 90,
-            needs_global_buf: true,
-        };
-        assert!(!r.passed());
     }
 
     #[test]
