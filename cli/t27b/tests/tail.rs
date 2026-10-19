@@ -376,7 +376,7 @@ fn a_discarded_value_runs_unless_the_reference_deletes_it() {
 /// Zig never resolves them, so the reference passes the file (specs/tri/t27b/lazy_sig_plan.t27; `t27c test-report`
 /// passes the conformance spec 3/3, none vacuous). A call from a test, an undeclared element type and an undeclared
 /// name in the withdrawn body keep their refusals, as the reference refuses each. The unit struct returned as a value
-/// by `gate_new` (#10897) is refused as soon as a test calls it (BLOCKED, "expected type 'spec.Gate', found 'type'").
+/// by `lazy_unit_new` (#10897) is refused as soon as a test calls it (BLOCKED, "expected type 'spec.LazyUnit', found 'type'").
 #[test]
 fn a_signature_zig_never_resolves() {
     let src = include_str!("../../../specs/tri/t27b/conformance/lazy_signature.t27");
@@ -386,8 +386,8 @@ fn a_signature_zig_never_resolves() {
     assert!(rejected(&src.replace("assert(issue_score(i) == 34);", "format_into(i, 5);")).contains("type anytype"));
     assert!(rejected(&src.replace("?[*]Issue", "?[*]Missing")).contains("type [*]T"));
     assert!(rejected(&src.replace("all: [*]const Issue", "all: [*]const Issue, m: Missing")).contains("type [*]T"));
-    assert!(rejected(&src.replace("== 34);", "== 34);\n    gate_new();")).contains("unknown name `Gate`"));
-    assert!(common::lower_src(&src.replace("return gate_new();", "return gate_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
+    assert!(rejected(&src.replace("== 34);", "== 34);\n    lazy_unit_new();")).contains("unknown name `LazyUnit`"));
+    assert!(common::lower_src(&src.replace("return lazy_unit_new();", "return lazy_unit_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
     let m = common::lower_src(&src.replace("f.write_num", "undeclared_thing")).unwrap_err().join("\n");
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
 }
