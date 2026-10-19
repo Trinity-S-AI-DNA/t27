@@ -1,0 +1,564 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/idea_factory.t27 -- the content factory: (idea, preset) -> frames. Any idea, in any
+// style of the particle design system, and every element on screen is a particle. Issue
+// gHashTag/t27#10771, epic #10560.
+//
+// WHY: the owner, 2026-10-19: one factory, on the factory pattern, that unpacks any idea in any
+// style preset, with the factory and all its elements formed by particle physics -- the visual
+// design system of the OS, so it has to be able to run on the FPGA too. Before this, every reel
+// was a hand-built module with its own f64 constants (token_floor, reel_particles, lesson_reel).
+//
+// THE FACTORY, in four stages, each a pure function the tests pin:
+//   wrap      the idea is cut into lines of at most MAXC characters (greedy, by words; a longer
+//             word is split) and lines into scenes of at most MAXL; an explicit `|` cuts a scene.
+//   layout    a scene's lines are set in the 3x5 font of scene_raster, centred, at the largest cell
+//             size S that fits the text box; every lit font pixel is a cell, a target for particles.
+//   assign    at each scene cut every particle gets a new target: a sub-slot of a cell, or -- when
+//             the preset has a card -- a point on the card's border around the text. The closing
+//             scene is the address, CTA.
+//   render    particle_ds moves every particle (spring, dashpot, the preset's law, the cut's kick)
+//             and paints it as a soft disc; main writes 1080x1920 RGB24 frames to stderr for ffmpeg.
+// The preset is a number. Nothing in this file names a colour, a law or a speed.
+//
+// THE NUMBERS: layout and assignment run once per scene cut and may divide by a variable (the cell
+// size); the per-step and per-pixel paths are particle_ds's -- integer, Q8, table lookups.
+//
+// NOT CLAIMED: the font is ASCII (no Cyrillic); no voice or music (lesson_reel mode 5 has those);
+// gen-verilog has not been run on this module and no board has drawn it.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module idea_factory;
+
+use t27f::scene_raster::glyph_on;
+use t27f::scene_raster::rnd;
+use t27f::scene_raster::lcg;
+use t27f::scene_raster::clamp;
+use t27f::scene_raster::imin;
+use t27f::scene_raster::imax;
+use t27f::scene_raster::iabs;
+use t27f::scene_raster::fmod;
+use t27f::scene_raster::red;
+use t27f::scene_raster::green;
+use t27f::scene_raster::blue;
+use t27f::particle_ds::ONE;
+use t27f::particle_ds::BG;
+use t27f::particle_ds::KEY_COL;
+use t27f::particle_ds::GRAIN;
+use t27f::particle_ds::CARD;
+use t27f::particle_ds::TONE_N;
+use t27f::particle_ds::live;
+use t27f::particle_ds::law_ax;
+use t27f::particle_ds::law_ay;
+use t27f::particle_ds::step_v;
+use t27f::particle_ds::kick_x;
+use t27f::particle_ds::kick_y;
+use t27f::particle_ds::start_x;
+use t27f::particle_ds::start_y;
+use t27f::particle_ds::start_vx;
+use t27f::particle_ds::start_vy;
+use t27f::particle_ds::particle_col;
+use t27f::particle_ds::channel_of;
+use t27f::particle_ds::reach;
+use t27f::particle_ds::kern;
+use t27f::particle_ds::tone;
+use t27f::particle_ds::vignette;
+use t27f::particle_ds::key_lift;
+use t27f::particle_ds::finish;
+
+pub const ID : str = "idea-factory";
+pub const VERSION : u8 = 1;
+
+// ---- the factory's input: the lab recipe rewrites these two lines per render ----
+pub const IDEA : str = "PARTICLES BUILD EVERY FRAME|ONE SPEC MANY STYLES";
+pub const PRESET : usize = 0;
+pub const CTA : str = "T27.AI";
+
+// ---- the frame ----
+pub const FRAME_W : i32 = 1080;
+pub const FRAME_H : i32 = 1920;
+pub const FPS : i32 = 30;
+pub const SCENE_F : i32 = 72;              // 2.4 s a scene: the law's clock runs out at frame 43
+pub const STEPS : i32 = 2;                 // integrator steps a frame
+pub const NP : i32 = 3072;                 // particles; main's arrays are this long
+pub const CX : i32 = 540;                  // the text block's centre
+pub const CY : i32 = 864;                  // 0.45 of the height, under the key light
+
+// ---- the wrap and the layout ----
+pub const MAXC : i32 = 9;                  // characters a line
+pub const MAXL : i32 = 4;                  // lines a scene
+pub const LINE_PITCH : i32 = 7;            // font pixels from one line's top to the next's
+pub const TEXT_W : i32 = 907;              // 0.84 of the width
+pub const TEXT_H : i32 = 768;              // 0.40 of the height
+pub const CELL_MAX : i32 = 40;             // the largest font pixel, px
+pub const MAXCELLS : i32 = 1024;           // MAXL * MAXC * 15 = 540 is the most a scene can light
+
+// ---- wrap ----
+
+// The k-th line of text t: what 0 = its first byte, 1 = its length in bytes, 2 = its scene; -1 when
+// there is no such line. what 3 = the number of lines, what 4 = the number of scenes (k unused).
+pub fn wrap_walk(t: []const u8, k: i32, what: i32) -> i32 {
+    const n = @as(i32, @intCast(t.len));
+    var line : i32 = 0;
+    var scene : i32 = 0;
+    var in_scene : i32 = 0;
+    var ls : i32 = 0 - 1;
+    var le : i32 = 0;
+    var i : i32 = 0;
+    var done : bool = false;
+    while (!done) {
+        var flush : bool = false;
+        var cut : bool = false;
+        if (i >= n) {
+            flush = true;
+            done = true;
+        } else {
+            const c = @as(i32, t[@as(usize, @intCast(i))]);
+            if (c == 32) {
+                i = i + 1;
+            } else if (c == 124) {
+                flush = true;
+                cut = true;
+                i = i + 1;
+            } else {
+                var j : i32 = i;
+                while (j < n && j - i < MAXC && t[@as(usize, @intCast(j))] != 32 && t[@as(usize, @intCast(j))] != 124) {
+                    j = j + 1;
+                }
+                if (ls >= 0 && j - ls > MAXC) {
+                    flush = true;
+                } else {
+                    if (ls < 0) { ls = i; }
+                    le = j;
+                    i = j;
+                }
+            }
+        }
+        if (flush && ls >= 0) {
+            if (line == k) {
+                if (what == 0) { return ls; }
+                if (what == 1) { return le - ls; }
+                if (what == 2) { return scene; }
+            }
+            line = line + 1;
+            in_scene = in_scene + 1;
+            ls = 0 - 1;
+            if (in_scene == MAXL) {
+                scene = scene + 1;
+                in_scene = 0;
+            }
+        }
+        if (cut && in_scene > 0) {
+            scene = scene + 1;
+            in_scene = 0;
+        }
+    }
+    if (what == 3) { return line; }
+    if (what == 4) {
+        if (in_scene > 0) { return scene + 1; }
+        return scene;
+    }
+    return 0 - 1;
+}
+pub fn line_count(t: []const u8) -> i32 {
+    return wrap_walk(t, 0, 3);
+}
+pub fn scene_count(t: []const u8) -> i32 {
+    return wrap_walk(t, 0, 4);
+}
+
+// ---- layout ----
+
+// Scene s of text t, set in the font: what 2 = the number of lit cells; 0, 1 = the c-th cell's
+// centre x, y in px; 3, 4, 5, 6 = the text block's left, top, right, bottom; 7 = the cell size S.
+// An empty scene has no cells and a zero block.
+pub fn scene_cell(t: []const u8, s: i32, c: i32, what: i32) -> i32 {
+    const lines = line_count(t);
+    var nl : i32 = 0;
+    var maxlen : i32 = 0;
+    var first : i32 = 0 - 1;
+    var k : i32 = 0;
+    while (k < lines) {
+        if (wrap_walk(t, k, 2) == s) {
+            if (first < 0) { first = k; }
+            nl = nl + 1;
+            maxlen = imax(maxlen, wrap_walk(t, k, 1));
+        }
+        k = k + 1;
+    }
+    if (nl == 0) { return 0; }
+    const cols = maxlen * 4 - 1;
+    const rows = nl * LINE_PITCH - 2;
+    const cs = imin(imin(@divTrunc(TEXT_W, cols), @divTrunc(TEXT_H, rows)), CELL_MAX);
+    const ox = CX - @divTrunc(cols * cs, 2);
+    const oy = CY - @divTrunc(rows * cs, 2);
+    if (what == 3) { return ox; }
+    if (what == 4) { return oy; }
+    if (what == 5) { return ox + cols * cs; }
+    if (what == 6) { return oy + rows * cs; }
+    if (what == 7) { return cs; }
+    var n : i32 = 0;
+    var li : i32 = 0;
+    while (li < nl) {
+        const st = wrap_walk(t, first + li, 0);
+        const ln = wrap_walk(t, first + li, 1);
+        const lox = CX - @divTrunc((ln * 4 - 1) * cs, 2);
+        var ci : i32 = 0;
+        while (ci < ln) {
+            const ch = @as(i32, t[@as(usize, @intCast(st + ci))]);
+            var gy : i32 = 0;
+            while (gy < 5) {
+                var gx : i32 = 0;
+                while (gx < 3) {
+                    if (glyph_on(ch, gx, gy)) {
+                        if (n == c) {
+                            if (what == 0) { return lox + (ci * 4 + gx) * cs + @divTrunc(cs, 2); }
+                            if (what == 1) { return oy + (li * LINE_PITCH + gy) * cs + @divTrunc(cs, 2); }
+                        }
+                        n = n + 1;
+                    }
+                    gx = gx + 1;
+                }
+                gy = gy + 1;
+            }
+            ci = ci + 1;
+        }
+        li = li + 1;
+    }
+    if (what == 2) { return n; }
+    return 0 - 1;
+}
+
+// The reel's scene s: the idea's scenes, then the address.
+pub fn reel_scenes(t: []const u8) -> i32 {
+    return scene_count(t) + 1;
+}
+pub fn reel_cell(t: []const u8, s: i32, c: i32, what: i32) -> i32 {
+    if (s < scene_count(t)) { return scene_cell(t, s, c, what); }
+    return scene_cell(CTA, 0, c, what);
+}
+pub fn reel_frames(t: []const u8) -> i32 {
+    return reel_scenes(t) * SCENE_F;
+}
+pub fn frame_bytes() -> i32 {
+    return FRAME_W * FRAME_H * 3;
+}
+
+// ---- assign ----
+
+// Where card particle m of mm sits on the border of the rectangle (x0, y0)-(x1, y1): what 0 = x,
+// 1 = y. The particles are spread evenly along the perimeter, clockwise from the top left.
+pub fn card_point(m: i32, mm: i32, x0: i32, y0: i32, x1: i32, y1: i32, what: i32) -> i32 {
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const d = @divTrunc(m * 2 * (w + h), mm);
+    var x : i32 = x0;
+    var y : i32 = y0;
+    if (d < w) {
+        x = x0 + d;
+    } else if (d < w + h) {
+        x = x1;
+        y = y0 + d - w;
+    } else if (d < 2 * w + h) {
+        x = x1 - (d - w - h);
+        y = y1;
+    } else {
+        y = y1 - (d - 2 * w - h);
+    }
+    if (what == 0) { return x; }
+    return y;
+}
+// The offset of text particle i inside its cell of size cs, for the m-th particle on that cell:
+// one of nine sub-slots, plus a seeded jitter of up to cs / 8 so a dense cell does not stack.
+pub fn slot_off(i: i32, m: i32, c: i32, cs: i32, axis: i32) -> i32 {
+    const slot = fmod(m * 4 + c, 9);
+    var k : i32 = fmod(slot, 3);
+    if (axis == 1) { k = @divTrunc(slot, 3); }
+    const j = @divTrunc(cs, 4) + 1;
+    return (k - 1) * @divTrunc(cs, 3) + rnd(i * 17 + axis * 5 + m, j) - @divTrunc(j, 2);
+}
+
+// ---- render ----
+
+pub fn main() -> void {
+    var x : [3072]i32 = undefined;
+    var y : [3072]i32 = undefined;
+    var vx : [3072]i32 = undefined;
+    var vy : [3072]i32 = undefined;
+    var tx : [3072]i32 = undefined;
+    var ty : [3072]i32 = undefined;
+    var sx : [3072]i32 = undefined;
+    var sy : [3072]i32 = undefined;
+    var cr : [3072]i32 = undefined;
+    var cg : [3072]i32 = undefined;
+    var cb : [3072]i32 = undefined;
+    var cellx : [1024]i32 = undefined;
+    var celly : [1024]i32 = undefined;
+    var kt : [1024]i32 = undefined;
+    var tt : [1024]i32 = undefined;
+    var accr : [1080]i32 = undefined;
+    var accg : [1080]i32 = undefined;
+    var accb : [1080]i32 = undefined;
+    var row : [3240]u8 = undefined;
+
+    const p = PRESET;
+    const rr = reach(p);
+    var d2 : i32 = 0;
+    while (d2 <= rr * rr) {
+        kt[@as(usize, @intCast(d2))] = kern(p, d2);
+        d2 = d2 + 1;
+    }
+    var tv : i32 = 0;
+    while (tv < TONE_N) {
+        tt[@as(usize, @intCast(tv))] = tone(tv);
+        tv = tv + 1;
+    }
+    const bgr = red(BG[p]);
+    const bgg = green(BG[p]);
+    const bgb = blue(BG[p]);
+    const kr = red(KEY_COL[p]);
+    const kg = green(KEY_COL[p]);
+    const kb = blue(KEY_COL[p]);
+    const gmax = GRAIN[p];
+    const ncards = @divTrunc(NP, 4);
+
+    const frames = reel_frames(IDEA);
+    var frame : i32 = 0;
+    while (frame < frames) {
+        const s = @divTrunc(frame, SCENE_F);
+        const fis = frame - s * SCENE_F;
+
+        // ---- a cut: every particle gets a target in the new scene ----
+        if (fis == 0) {
+            const nc = imin(reel_cell(IDEA, s, 0, 2), MAXCELLS);
+            var c : i32 = 0;
+            while (c < nc) {
+                cellx[@as(usize, @intCast(c))] = reel_cell(IDEA, s, c, 0);
+                celly[@as(usize, @intCast(c))] = reel_cell(IDEA, s, c, 1);
+                c = c + 1;
+            }
+            const cs = reel_cell(IDEA, s, 0, 7);
+            const bx0 = reel_cell(IDEA, s, 0, 3) - cs;
+            const by0 = reel_cell(IDEA, s, 0, 4) - cs;
+            const bx1 = reel_cell(IDEA, s, 0, 5) + cs;
+            const by1 = reel_cell(IDEA, s, 0, 6) + cs;
+            var ia : i32 = 0;
+            while (ia < NP) {
+                const u = @as(usize, @intCast(ia));
+                var gx : i32 = 0;
+                var gy : i32 = 0;
+                if (CARD[p] == 1 && fmod(ia, 4) == 3 && nc > 0) {
+                    gx = card_point(@divTrunc(ia, 4), ncards, bx0, by0, bx1, by1, 0);
+                    gy = card_point(@divTrunc(ia, 4), ncards, bx0, by0, bx1, by1, 1);
+                } else if (nc > 0) {
+                    const ce = fmod(ia, nc);
+                    const m = @divTrunc(ia, nc);
+                    gx = cellx[@as(usize, @intCast(ce))] + slot_off(ia, m, ce, cs, 0);
+                    gy = celly[@as(usize, @intCast(ce))] + slot_off(ia, m, ce, cs, 1);
+                } else {
+                    gx = rnd(ia * 5 + s, FRAME_W);
+                    gy = rnd(ia * 7 + s, FRAME_H);
+                }
+                tx[u] = gx * ONE;
+                ty[u] = gy * ONE;
+                if (s == 0) {
+                    x[u] = start_x(p, ia, gx, CX, FRAME_W) * ONE;
+                    y[u] = start_y(p, ia, gy, CY, FRAME_H) * ONE;
+                    vx[u] = start_vx(p, ia);
+                    vy[u] = start_vy(p, ia);
+                } else {
+                    const dx = clamp(x[u] - CX * ONE, 0 - 1200 * ONE, 1200 * ONE);
+                    const dy = clamp(y[u] - CY * ONE, 0 - 1200 * ONE, 1200 * ONE);
+                    const h = rnd(ia * 29 + s, 256);
+                    vx[u] = vx[u] + kick_x(p, dx, dy, h);
+                    vy[u] = vy[u] + kick_y(p, dx, dy, h);
+                }
+                ia = ia + 1;
+            }
+        }
+
+        // ---- physics ----
+        const l = live(fis);
+        var st : i32 = 0;
+        while (st < STEPS) {
+            var ib : i32 = 0;
+            while (ib < NP) {
+                const u = @as(usize, @intCast(ib));
+                const dx = clamp(x[u] - CX * ONE, 0 - 1200 * ONE, 1200 * ONE);
+                const dy = clamp(y[u] - CY * ONE, 0 - 1200 * ONE, 1200 * ONE);
+                const h = rnd(ib * 31 + frame * 2 + st, 256);
+                vx[u] = step_v(p, x[u], vx[u], tx[u], law_ax(p, dx, dy, l, h));
+                vy[u] = step_v(p, y[u], vy[u], ty[u], law_ay(p, dx, dy, l, h, ty[u] - y[u]));
+                x[u] = x[u] + vx[u];
+                y[u] = y[u] + vy[u];
+                ib = ib + 1;
+            }
+            st = st + 1;
+        }
+
+        // ---- paint: each particle's pixel and colour ----
+        var ic : i32 = 0;
+        while (ic < NP) {
+            const u = @as(usize, @intCast(ic));
+            sx[u] = @divTrunc(x[u], ONE);
+            sy[u] = @divTrunc(y[u], ONE);
+            const col = particle_col(p, ic, iabs(vx[u]) + iabs(vy[u]));
+            cr[u] = channel_of(p, red(col), bgr);
+            cg[u] = channel_of(p, green(col), bgg);
+            cb[u] = channel_of(p, blue(col), bgb);
+            ic = ic + 1;
+        }
+
+        // ---- raster: one row at a time ----
+        var gseed : i32 = 1000003 + frame * 7919;
+        var py : i32 = 0;
+        while (py < FRAME_H) {
+            var q : i32 = 0;
+            while (q < FRAME_W) {
+                const k = @as(usize, @intCast(q));
+                accr[k] = 0;
+                accg[k] = 0;
+                accb[k] = 0;
+                q = q + 1;
+            }
+            var j : i32 = 0;
+            while (j < NP) {
+                const u = @as(usize, @intCast(j));
+                const dy = py - sy[u];
+                if (dy <= rr && dy >= 0 - rr) {
+                    q = imax(sx[u] - rr, 0);
+                    const qe = imin(sx[u] + rr, FRAME_W - 1);
+                    while (q <= qe) {
+                        const dx = q - sx[u];
+                        const dd = dx * dx + dy * dy;
+                        if (dd <= rr * rr) {
+                            const w = kt[@as(usize, @intCast(dd))];
+                            const k = @as(usize, @intCast(q));
+                            accr[k] = accr[k] + w * cr[u];
+                            accg[k] = accg[k] + w * cg[u];
+                            accb[k] = accb[k] + w * cb[u];
+                        }
+                        q = q + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            q = 0;
+            while (q < FRAME_W) {
+                const k = @as(usize, @intCast(q));
+                const vig = vignette(p, q, py, FRAME_W, FRAME_H);
+                const lift = key_lift(p, q, py, FRAME_W, FRAME_H);
+                gseed = lcg(gseed);
+                const g = fmod(@divTrunc(gseed, 4096), 2 * gmax + 1) - gmax;
+                const lr = tt[@as(usize, @intCast(clamp(@divTrunc(accr[k], ONE), 0, TONE_N - 1)))];
+                const lg = tt[@as(usize, @intCast(clamp(@divTrunc(accg[k], ONE), 0, TONE_N - 1)))];
+                const lb = tt[@as(usize, @intCast(clamp(@divTrunc(accb[k], ONE), 0, TONE_N - 1)))];
+                row[k * 3] = @as(u8, @intCast(finish(p, bgr, kr, lift, lr, vig, g)));
+                row[k * 3 + 1] = @as(u8, @intCast(finish(p, bgg, kg, lift, lg, vig, g)));
+                row[k * 3 + 2] = @as(u8, @intCast(finish(p, bgb, kb, lift, lb, vig, g)));
+                q = q + 1;
+            }
+            std.debug.print("{s}", .{row});
+            py = py + 1;
+        }
+        frame = frame + 1;
+    }
+}
+
+// ---- tests ----
+
+test "the sample idea wraps into seven lines and two scenes, and the reel adds the address" {
+    assert(line_count(IDEA) == 7);
+    assert(scene_count(IDEA) == 2);
+    assert(reel_scenes(IDEA) == 3);
+    assert(wrap_walk(IDEA, 0, 1) == 9);    // PARTICLES
+    assert(wrap_walk(IDEA, 3, 2) == 0);    // FRAME closes scene 0
+    assert(wrap_walk(IDEA, 4, 1) == 8);    // ONE SPEC
+    assert(wrap_walk(IDEA, 4, 2) == 1);
+    assert(wrap_walk(IDEA, 7, 0) == 0 - 1);
+    assert(reel_frames(IDEA) == 216);
+}
+
+test "a 40-character idea with no cut wraps into lines of at most 9 and scenes of at most 4" {
+    const t = "SPRINGS PULL EVERY DOT TO ITS LETTER NOW";
+    assert(t.len == 40);
+    const n = line_count(t);
+    assert(n >= 5);
+    var k : i32 = 0;
+    var per : i32 = 0;
+    var last : i32 = 0;
+    while (k < n) {
+        assert(wrap_walk(t, k, 1) <= MAXC);
+        assert(wrap_walk(t, k, 1) > 0);
+        const s = wrap_walk(t, k, 2);
+        if (s == last) { per = per + 1; } else { per = 1; last = s; }
+        assert(per <= MAXL);
+        k = k + 1;
+    }
+    assert(scene_count(t) == 2);
+}
+
+test "a word longer than a line is split, and empty cuts make no scene" {
+    assert(line_count("ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 3);
+    assert(wrap_walk("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 2, 1) == 8);
+    assert(scene_count("A||B") == 2);
+    assert(scene_count("") == 0);
+    assert(reel_scenes("") == 1);
+}
+
+test "cells are the font's lit pixels: AA lights twice A, a space lights none" {
+    const a = scene_cell("A", 0, 0, 2);
+    assert(a > 0);
+    assert(scene_cell("AA", 0, 0, 2) == 2 * a);
+    assert(scene_cell("A A", 0, 0, 2) == 2 * a);
+    assert(scene_cell(" ", 0, 0, 2) == 0);
+    assert(scene_cell("a", 0, 0, 2) == a);
+}
+
+test "every target of every scene lies inside the frame, and the card frames the text" {
+    var s : i32 = 0;
+    while (s < reel_scenes(IDEA)) {
+        const n = reel_cell(IDEA, s, 0, 2);
+        assert(n > 0);
+        assert(n <= MAXCELLS);
+        const cs = reel_cell(IDEA, s, 0, 7);
+        assert(cs >= 8 && cs <= CELL_MAX);
+        var c : i32 = 0;
+        while (c < n) {
+            const cx = reel_cell(IDEA, s, c, 0);
+            const cy = reel_cell(IDEA, s, c, 1);
+            assert(cx > reel_cell(IDEA, s, 0, 3) && cx < reel_cell(IDEA, s, 0, 5));
+            assert(cy > reel_cell(IDEA, s, 0, 4) && cy < reel_cell(IDEA, s, 0, 6));
+            c = c + 1;
+        }
+        assert(reel_cell(IDEA, s, 0, 3) - cs >= 0);
+        assert(reel_cell(IDEA, s, 0, 5) + cs < FRAME_W);
+        assert(reel_cell(IDEA, s, 0, 4) - cs >= 0);
+        assert(reel_cell(IDEA, s, 0, 6) + cs < FRAME_H);
+        s = s + 1;
+    }
+}
+
+test "the card's particles walk the whole border once" {
+    assert(card_point(0, 100, 10, 20, 110, 70, 0) == 10);
+    assert(card_point(0, 100, 10, 20, 110, 70, 1) == 20);
+    assert(card_point(25, 100, 10, 20, 110, 70, 0) == 85);
+    assert(card_point(50, 100, 10, 20, 110, 70, 0) == 110);
+    assert(card_point(50, 100, 10, 20, 110, 70, 1) == 70);
+    assert(card_point(99, 100, 10, 20, 110, 70, 0) == 10);
+}
+
+test "sub-slots stay inside their cell" {
+    var i : i32 = 0;
+    while (i < 200) {
+        const ox = slot_off(i, fmod(i, 13), fmod(i, 7), 25, 0);
+        const oy = slot_off(i, fmod(i, 13), fmod(i, 7), 25, 1);
+        assert(iabs(ox) <= 12);
+        assert(iabs(oy) <= 12);
+        i = i + 1;
+    }
+}
+
+test "a frame is 1080x1920 RGB24, 6220800 bytes" {
+    assert(frame_bytes() == 6220800);
+    assert(FPS == 30);
+}
