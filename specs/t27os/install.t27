@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/install.t27 -- how T27 OS is put on a machine: the one installer, `make install` (#11044,
+; part of the T27 OS epic #11037 and the lab epic #11040). Owner, 2026-10-19: T27 OS has one installer,
+; built with make, README.md says so, and TRI CLAW is part of T27 OS too.
+; --
+; What is DECIDED here, and what carries it out:
+; - Decided here: which platforms install, which binaries each one gets, what a prefix may be, which
+;   files an install lists, what a re-run changes, what a dry run changes, how a version pin is read,
+;   and the two opt-in flags. Both flags are off unless the user types exactly `on`.
+; - Carried out by the Makefile at the repository root, which names the same files and the same flags.
+;   It only builds with cargo and copies with install(1); it decides nothing the list below does not.
+;   No generator turns a .t27 spec into a Makefile (t27c has no such backend), and a test cannot read the
+;   Makefile, so the agreement between the two is checked by reading `make -n install` and
+;   `make -n install CLAW=on` against the file lists here, not by a gate. That is the honest limit.
+; --
+; Layout under PREFIX. The `tri` front door (scripts/tri) finds the compiler at
+; <its parent directory>/target/release/t27c, so the install gives it that shape:
+;   bin/tri                  the front door, a copy of scripts/tri
+;   bin/t27c                 the compiler
+;   bin/t27b                 the native compiler, only where it runs (arm64: it emits AArch64 and runs it
+;                            in-process; specs/hosting/toolchain.t27 records the same rule for releases)
+;   target/release/tri       the Rust `tri` binary (cli/tri) the front door hands its own subcommands to
+;   target/release/t27c      the compiler again, where the front door looks for it
+;   share/t27/install.list   every file any install under this PREFIX has listed, one per line
+; With the TRI CLAW flag on, four more files go under share/t27/claw/: the service spec
+; specs/claw/service.t27, the one spec it imports, specs/claw/text.t27, and their two seals. TRI CLAW has
+; no server of its own: specs/claw/service.t27 says its execution is the consumer's own runner. So
+; "start" for the installed copy means the check that runner makes: `t27c seal --verify` on the installed
+; service spec, from the directory the four files form.
+; --
+; The earn flag (the lab node that earns test-network XP by running lab gates) is decided here and
+; refused here: LAB_NODE_SHIPS is false, because no lab node program is in this checkout. The job kind
+; is specs/lab/job_kind.t27 (not on master at the time of writing) and nodes join through the trios app.
+; plan_status answers PLAN_EARN_REFUSED, the Makefile stops before it changes anything, and the day a lab
+; node lands, one constant and one more file list change here, with their tests.
+; --
+; Counted strings, as in specs/claw/text.t27: a length rides along with every str a function reads,
+; because `.len` and `==` on str do not lower under gen-c. Tests may use `.len`.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osInstall;
+
+use claw::text;
+
+/// The platforms a source install supports, in this order. The names are the ones
+/// specs/hosting/toolchain.t27 uses for the release assets, plus darwin-x64, which builds from source.
+pub const PLATFORMS : [4]str = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
+pub const PLATFORM_COUNT : u32 = 4;
+pub const PLATFORM_NONE : u8 = 255;
+
+/// The prefix an install uses when the user names none.
+pub const DEFAULT_PREFIX : str = "/usr/local";
+
+/// A flag is on only when it is exactly this word. Anything else, "1", "yes", "ON", "true", is off.
+pub const FLAG_ON : str = "on";
+pub const FLAG_OFF : str = "off";
+
+/// No lab node program ships in this checkout; see the header. Flip this with the node, not before.
+pub const LAB_NODE_SHIPS : bool = false;
+
+/// What an install lists. Core files go to every platform; t27b only where it runs; the TRI CLAW files
+/// only when that flag is on; the manifest is last and lists itself.
+pub const CORE_FILES : [4]str = ["bin/tri", "bin/t27c", "target/release/tri", "target/release/t27c"];
+pub const CORE_COUNT : u32 = 4;
+pub const T27B_FILE : str = "bin/t27b";
+pub const CLAW_FILES : [4]str = [
+    "share/t27/claw/specs/claw/service.t27",
+    "share/t27/claw/specs/claw/text.t27",
+    "share/t27/claw/.trinity/seals/claw_ClawService.json",
+    "share/t27/claw/.trinity/seals/claw_ClawText.json"
+];
+pub const CLAW_COUNT : u32 = 4;
+pub const MANIFEST : str = "share/t27/install.list";
+
+/// A version pin is the compiler's own first line of `t27c --version`: this word, a space, then the
+/// pinned version. An empty pin means the user pinned nothing.
+pub const PIN_WORD : str = "t27c ";
+
+/// plan_status results. The Makefile checks in this order and stops at the first that is not OK.
+pub const PLAN_OK : u8 = 0;
+pub const PLAN_BAD_PLATFORM : u8 = 1;
+pub const PLAN_BAD_PREFIX : u8 = 2;
+pub const PLAN_EARN_REFUSED : u8 = 3;
+
+/// What one file does on an install. A file that is missing is copied; one that is already the same
+/// is left alone, mtime included; one that differs is replaced.
+pub const ACT_COPY : u8 = 0;
+pub const ACT_KEEP : u8 = 1;
+pub const ACT_REPLACE : u8 = 2;
+
+/// uname -s and uname -m to a platform index, or PLATFORM_NONE. Darwin reports arm64, Linux reports
+/// aarch64; the other spelling of each is not a pair uname gives, so it is not accepted.
+pub fn platform_index(os : str, os_len : usize, arch : str, arch_len : usize) -> u8 {
+    if (str_eq(os, os_len, "Darwin", 6)) {
+        if (str_eq(arch, arch_len, "arm64", 5)) { return 0; }
+        if (str_eq(arch, arch_len, "x86_64", 6)) { return 1; }
+    }
+    if (str_eq(os, os_len, "Linux", 5)) {
+        if (str_eq(arch, arch_len, "aarch64", 7)) { return 2; }
+        if (str_eq(arch, arch_len, "x86_64", 6)) { return 3; }
+    }
+    return PLATFORM_NONE;
+}
+
+/// t27b emits AArch64 and runs it in-process, so it is installed on the two arm64 platforms only.
+pub fn has_t27b(platform : u8) -> bool {
+    return platform == 0 or platform == 2;
+}
+
+/// A prefix is an absolute path longer than "/" with no space and no ".." in it: the Makefile cannot
+/// quote a space through every recipe line, and an install into the filesystem root is not a prefix.
+pub fn prefix_ok(p : str, p_len : usize) -> bool {
+    if (p_len < 2) { return false; }
+    if (p[0] != '/') { return false; }
+    var i : usize = 0;
+    while (i < p_len) {
+        if (p[i] == ' ') { return false; }
+        if (i + 1 < p_len) {
+            if (p[i] == '.' and p[i + 1] == '.') { return false; }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// A flag is on only when it is exactly "on".
+pub fn flag_on(v : str, v_len : usize) -> bool {
+    return str_eq(v, v_len, FLAG_ON, 2);
+}
+
+/// Is this install allowed to start? First match wins: an unsupported platform, a bad prefix, then the
+/// earn flag while no lab node ships. The TRI CLAW flag never refuses: its files are in this checkout.
+pub fn plan_status(platform : u8, prefix_good : bool, earn : bool) -> u8 {
+    if (platform == PLATFORM_NONE) { return PLAN_BAD_PLATFORM; }
+    if (!prefix_good) { return PLAN_BAD_PREFIX; }
+    if (earn and !LAB_NODE_SHIPS) { return PLAN_EARN_REFUSED; }
+    return PLAN_OK;
+}
+
+/// How many files an install lists, the manifest included.
+pub fn file_count(t27b : bool, claw : bool) -> u32 {
+    var n : u32 = CORE_COUNT;
+    if (t27b) { n += 1; }
+    if (claw) { n += CLAW_COUNT; }
+    return n + 1;
+}
+
+/// The i-th file an install lists, relative to the prefix; "" past the end. The uninstall list is this
+/// same list: there is no second one.
+pub fn file_at(i : u32, t27b : bool, claw : bool) -> str {
+    var k : u32 = i;
+    if (k < CORE_COUNT) { return CORE_FILES[k]; }
+    k -= CORE_COUNT;
+    if (t27b) {
+        if (k == 0) { return T27B_FILE; }
+        k -= 1;
+    }
+    if (claw) {
+        if (k < CLAW_COUNT) { return CLAW_FILES[k]; }
+        k -= CLAW_COUNT;
+    }
+    if (k == 0) { return MANIFEST; }
+    return "";
+}
+
+/// A listed file stays inside the prefix: relative, not empty, no "..". The uninstall removes the
+/// manifest's lines relative to the prefix, so a line that escapes it is never written.
+pub fn rel_ok(p : str, p_len : usize) -> bool {
+    if (p_len == 0) { return false; }
+    if (p[0] == '/') { return false; }
+    var i : usize = 0;
+    while (i + 1 < p_len) {
+        if (p[i] == '.' and p[i + 1] == '.') { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// What a file does, from two facts the copy can read: does it exist, and is it byte-identical.
+pub fn step_action(exists : bool, same : bool) -> u8 {
+    if (!exists) { return ACT_COPY; }
+    if (same) { return ACT_KEEP; }
+    return ACT_REPLACE;
+}
+
+/// Files a run changes: those that are not already the same. A second run over a finished install
+/// has every file the same, so it changes nothing.
+pub fn changes(total : u32, already_same : u32) -> u32 {
+    if (already_same >= total) { return 0; }
+    return total - already_same;
+}
+
+/// A dry run lists the whole plan and changes nothing; a real run changes what `changes` says.
+pub fn dry_changes(dry : bool, planned_changes : u32) -> u32 {
+    if (dry) { return 0; }
+    return planned_changes;
+}
+
+/// The manifest only grows: a later install under the same prefix adds its files to the lines that
+/// are already there, so an uninstall removes every file any install under it listed. old and added
+/// are line counts, shared the lines both have.
+pub fn manifest_lines(old : u32, added : u32, shared : u32) -> u32 {
+    return old + added - shared;
+}
+
+/// Does the built compiler's first line say the pinned version? An empty pin accepts anything; a pin
+/// is PIN_WORD then the version, nothing before it and nothing after it.
+pub fn pin_ok(want : str, want_len : usize, have : str, have_len : usize) -> bool {
+    if (want_len == 0) { return true; }
+    if (have_len != 5 + want_len) { return false; }
+    if (!has_prefix(have, have_len, PIN_WORD, 5)) { return false; }
+    var i : usize = 0;
+    while (i < want_len) {
+        if (have[5 + i] != want[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+test platform_index_names_the_four_supported_pairs {
+    assert(platform_index("Darwin", 6, "arm64", 5) == 0);
+    assert(platform_index("Darwin", 6, "x86_64", 6) == 1);
+    assert(platform_index("Linux", 5, "aarch64", 7) == 2);
+    assert(platform_index("Linux", 5, "x86_64", 6) == 3);
+    assert(PLATFORM_COUNT == 4);
+    assert(PLATFORMS[0] == "darwin-arm64");
+    assert(PLATFORMS[1] == "darwin-x64");
+    assert(PLATFORMS[2] == "linux-arm64");
+    assert(PLATFORMS[3] == "linux-x64");
+}
+
+test platform_index_refuses_every_other_pair {
+    assert(platform_index("Darwin", 6, "aarch64", 7) == PLATFORM_NONE);
+    assert(platform_index("Linux", 5, "arm64", 5) == PLATFORM_NONE);
+    assert(platform_index("Linux", 5, "i686", 4) == PLATFORM_NONE);
+    assert(platform_index("FreeBSD", 7, "x86_64", 6) == PLATFORM_NONE);
+    assert(platform_index("MINGW64_NT", 10, "x86_64", 6) == PLATFORM_NONE);
+    assert(platform_index("darwin", 6, "arm64", 5) == PLATFORM_NONE);
+    assert(platform_index("", 0, "", 0) == PLATFORM_NONE);
+}
+
+test t27b_is_installed_only_on_the_arm64_platforms {
+    assert(has_t27b(0) == true);
+    assert(has_t27b(2) == true);
+    assert(has_t27b(1) == false);
+    assert(has_t27b(3) == false);
+    assert(has_t27b(PLATFORM_NONE) == false);
+}
+
+test prefix_ok_takes_an_absolute_path_and_nothing_else {
+    assert(prefix_ok("/usr/local", 10) == true);
+    assert(prefix_ok("/tmp/t27-prefix", 15) == true);
+    assert(prefix_ok("/a", 2) == true);
+    assert(prefix_ok("", 0) == false);
+    assert(prefix_ok("/", 1) == false);
+    assert(prefix_ok("local", 5) == false);
+    assert(prefix_ok("./local", 7) == false);
+    assert(prefix_ok("/a b", 4) == false);
+    assert(prefix_ok("/a/../etc", 9) == false);
+    assert(prefix_ok("/a/.hidden", 10) == true);
+}
+
+test the_default_prefix_is_itself_a_prefix {
+    const d : str = DEFAULT_PREFIX;
+    assert(prefix_ok(d, d.len) == true);
+}
+
+test flags_are_off_unless_they_are_exactly_on {
+    assert(flag_on("on", 2) == true);
+    assert(flag_on(FLAG_OFF, 3) == false);
+    assert(flag_on("", 0) == false);
+    assert(flag_on("ON", 2) == false);
+    assert(flag_on("1", 1) == false);
+    assert(flag_on("yes", 3) == false);
+    assert(flag_on("true", 4) == false);
+    assert(flag_on("on ", 3) == false);
+    assert(flag_on("o", 1) == false);
+}
+
+test the_earn_flag_is_refused_while_no_lab_node_ships {
+    assert(LAB_NODE_SHIPS == false);
+    assert(plan_status(3, true, true) == PLAN_EARN_REFUSED);
+    assert(plan_status(0, true, true) == PLAN_EARN_REFUSED);
+    assert(plan_status(3, true, false) == PLAN_OK);
+}
+
+test plan_status_checks_platform_then_prefix_then_earn {
+    assert(plan_status(PLATFORM_NONE, false, true) == PLAN_BAD_PLATFORM);
+    assert(plan_status(PLATFORM_NONE, true, false) == PLAN_BAD_PLATFORM);
+    assert(plan_status(1, false, true) == PLAN_BAD_PREFIX);
+    assert(plan_status(1, false, false) == PLAN_BAD_PREFIX);
+    assert(plan_status(1, true, true) == PLAN_EARN_REFUSED);
+    assert(plan_status(1, true, false) == PLAN_OK);
+}
+
+test the_default_plan_has_no_claw_file {
+    const arm : u32 = file_count(true, false);
+    const x64 : u32 = file_count(false, false);
+    assert(arm == 6);
+    assert(x64 == 5);
+    var i : u32 = 0;
+    while (i < arm) {
+        const f : str = file_at(i, true, false);
+        assert(f.len > 0);
+        var k : u32 = 0;
+        while (k < CLAW_COUNT) {
+            const c : str = CLAW_FILES[k];
+            assert(str_eq(f, f.len, c, c.len) == false);
+            k += 1;
+        }
+        i += 1;
+    }
+    const past_arm : str = file_at(arm, true, false);
+    const past_x64 : str = file_at(x64, false, false);
+    assert(past_arm.len == 0);
+    assert(past_x64.len == 0);
+}
+
+test the_claw_flag_adds_exactly_the_four_claw_files {
+    assert(file_count(true, true) == file_count(true, false) + CLAW_COUNT);
+    assert(file_count(false, true) == file_count(false, false) + CLAW_COUNT);
+    assert(file_at(5, true, true) == CLAW_FILES[0]);
+    assert(file_at(6, true, true) == CLAW_FILES[1]);
+    assert(file_at(7, true, true) == CLAW_FILES[2]);
+    assert(file_at(8, true, true) == CLAW_FILES[3]);
+    assert(file_at(4, false, true) == CLAW_FILES[0]);
+    assert(file_at(7, false, true) == CLAW_FILES[3]);
+    assert(CLAW_FILES[0] == "share/t27/claw/specs/claw/service.t27");
+}
+
+test the_listed_files_are_the_front_door_layout {
+    assert(file_at(0, true, false) == "bin/tri");
+    assert(file_at(1, true, false) == "bin/t27c");
+    assert(file_at(2, true, false) == "target/release/tri");
+    assert(file_at(3, true, false) == "target/release/t27c");
+    assert(file_at(4, true, false) == "bin/t27b");
+    assert(file_at(4, false, false) == MANIFEST);
+    assert(file_at(5, true, false) == MANIFEST);
+    assert(file_at(9, true, true) == MANIFEST);
+    assert(MANIFEST == "share/t27/install.list");
+}
+
+test every_listed_file_stays_inside_the_prefix {
+    var t : u32 = 0;
+    while (t < 2) {
+        var c : u32 = 0;
+        while (c < 2) {
+            const n : u32 = file_count(t == 0, c == 0);
+            var i : u32 = 0;
+            while (i < n) {
+                const f : str = file_at(i, t == 0, c == 0);
+                assert(rel_ok(f, f.len) == true);
+                i += 1;
+            }
+            c += 1;
+        }
+        t += 1;
+    }
+    assert(rel_ok("", 0) == false);
+    assert(rel_ok("/etc/passwd", 11) == false);
+    assert(rel_ok("bin/../../etc", 13) == false);
+}
+
+test a_second_run_changes_nothing {
+    assert(step_action(false, false) == ACT_COPY);
+    assert(step_action(true, true) == ACT_KEEP);
+    assert(step_action(true, false) == ACT_REPLACE);
+    assert(step_action(false, true) == ACT_COPY);
+    const total : u32 = file_count(true, true);
+    assert(changes(total, 0) == total);
+    assert(changes(total, total) == 0);
+    assert(changes(total, total - 1) == 1);
+}
+
+test a_dry_run_lists_the_plan_and_changes_nothing {
+    const total : u32 = file_count(true, false);
+    assert(dry_changes(true, total) == 0);
+    assert(dry_changes(true, 0) == 0);
+    assert(dry_changes(false, total) == total);
+    assert(dry_changes(false, 0) == 0);
+}
+
+test the_manifest_never_forgets_a_file {
+    const first : u32 = file_count(true, false);
+    const second : u32 = file_count(true, true);
+    assert(manifest_lines(0, first, 0) == first);
+    assert(manifest_lines(first, first, first) == first);
+    assert(manifest_lines(first, second, first) == second);
+    assert(manifest_lines(second, first, first) == second);
+}
+
+test a_version_pin_is_the_compiler_first_line {
+    assert(pin_ok("", 0, "t27c 0.5.2", 10) == true);
+    assert(pin_ok("", 0, "anything", 8) == true);
+    assert(pin_ok("0.5.2", 5, "t27c 0.5.2", 10) == true);
+    assert(pin_ok("0.5.3", 5, "t27c 0.5.2", 10) == false);
+    assert(pin_ok("0.5.2", 5, "t27c 0.5.22", 11) == false);
+    assert(pin_ok("0.5.2", 5, "t27c 0.5", 8) == false);
+    assert(pin_ok("0.5.2", 5, "tri 0.5.2", 9) == false);
+    assert(pin_ok("0.5.2", 5, "", 0) == false);
+}
