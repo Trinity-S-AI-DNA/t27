@@ -6733,32 +6733,6 @@ fn build_theorem_matrix_report(
     })
 }
 
-/// Strip `fixture_dir` from the fixture paths inside matrix entries so that
-/// snapshots are stable across machines.
-#[cfg(test)]
-fn normalize_fixture_paths(
-    entries: &[serde_json::Value],
-    fixture_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
-    entries
-        .iter()
-        .map(|entry| {
-            let mut entry = entry.clone();
-            if let Some(serde_json::Value::Object(fixtures)) = entry.get_mut("fixtures") {
-                for (_key, value) in fixtures.iter_mut() {
-                    if let Some(path_str) = value.as_str() {
-                        let path = std::path::Path::new(path_str);
-                        if let Ok(rel) = path.strip_prefix(fixture_dir) {
-                            *value = serde_json::Value::String(rel.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-            entry
-        })
-        .collect()
-}
-
 fn boot_protocol(checklist: bool) -> Result<()> {
     println!("== Cold-POR boot-from-flash protocol ==");
     println!();
