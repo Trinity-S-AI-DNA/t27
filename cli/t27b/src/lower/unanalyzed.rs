@@ -6,7 +6,7 @@
 //! `fn f() undefined { undefined; }`; Zig would refuse that type ("expected
 //! type 'type', found '@TypeOf(undefined)'") only once something calls `f`.
 
-use super::{Lower, Reject, R};
+use super::{Lower, Reject, Val, R};
 use crate::compiler::{Node, NodeKind};
 use crate::ir::{Expr, ExprKind, Stmt, Ty, TrapKind};
 use std::collections::HashSet;
@@ -66,8 +66,19 @@ impl<'a> Lower<'a> {
     /// After every body, the refusals `lazy_body` withdrew come back if AstGen refuses the file anyway (`ls::withdrawn_come_back`).
     pub(super) fn restore_held(&mut self, items: &[&Node]) {
         let prelude = items.iter().any(|c| matches!(c.kind, NodeKind::TestBlock | NodeKind::InvariantBlock));
-        if !self.held.is_empty() && super::ls::withdrawn_come_back(items.iter().any(|f| f.kind == NodeKind::FnDecl && self.undeclared_in(f, prelude).is_some()), !prelude, self.eql_used || super::marked(items.iter().copied(), super::sh::string_eq).next().is_some()) {
+        if !self.held.is_empty() && super::ls::withdrawn_come_back(items.iter().any(|f| matches!(f.kind, NodeKind::FnDecl | NodeKind::ConstDecl) && self.undeclared_in(f, prelude).is_some()), !prelude, self.eql_used || super::marked(items.iter().copied(), super::sh::string_eq).next().is_some()) {
             self.errors.append(&mut self.held);
+        }
+    }
+
+    /// `global(name)` for the eager pass: a constant nothing analyzed reaches is lazy like a body (`analyzed`, `ls::const_plan`).
+    pub(super) fn eager_const(&mut self, name: &str) {
+        let (nerr, n): (usize, &Node) = (self.errors.len(), self.const_nodes[name]);
+        let _ = self.global(name);
+        let spelled = n.extra_type.trim().is_empty() || self.zig_spelled(n.extra_type.trim());
+        if !self.analyzed.contains(name) && self.errors[nerr..].iter().all(|e| super::ls::const_plan(e.construct.as_bytes(), e.detail.as_bytes(), spelled) == super::ls::UNRESOLVED) {
+            let dropped = self.withdraw(nerr); self.held.extend(dropped);
+            self.globals.retain(|_, v| !matches!(v, Val::Poison)); // recovery mode: a reached use must report a withdrawn failure again
         }
     }
 
@@ -101,12 +112,6 @@ impl<'a> Lower<'a> {
     /// reaches can make one, but the callee's parameter types are unknown
     /// here, so the call is refused rather than lowered.
     pub(super) fn unresolved_call<T>(&mut self, c: &Node) -> R<T> {
-        self.reject(
-            "ExprCall(unresolved fn)",
-            format!(
-                "call to `{}`, a fn no test reaches whose signature names a struct t27b cannot lay out",
-                c.name
-            ),
-        )
+        self.reject("ExprCall(unresolved fn)", format!("call to `{}`, a fn no test reaches whose signature names a struct t27b cannot lay out", c.name))
     }
 }

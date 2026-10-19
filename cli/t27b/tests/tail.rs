@@ -388,8 +388,19 @@ fn a_signature_zig_never_resolves() {
     assert!(rejected(&src.replace("all: [*]const Issue", "all: [*]const Issue, m: Missing")).contains("type [*]T"));
     assert!(rejected(&src.replace("== 34);", "== 34);\n    lazy_unit_new();")).contains("unknown name `LazyUnit`"));
     assert!(common::lower_src(&src.replace("return lazy_unit_new();", "return lazy_unit_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
+    assert!(rejected(&src.replace("fn issue_score(", "fn lazy_local() -> u32 {\n    var x : LazyMissing = 0;\n    return 1;\n}\n\nfn issue_score(")).contains("type (undeclared)")); // #11053: t27c BLOCKED
     let m = common::lower_src(&src.replace("f.write_num", "undeclared_thing")).unwrap_err().join("\n");
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
+}
+
+/// #10899, #10903: a constant no analyzed code names is never resolved (conformance/lazy_const.t27; `t27c test-report` 2/2); a test naming the slice (directly or through a fn) or the call-initialised struct, and a constant naming a type, fn or value declared nowhere, keep the refusal.
+#[test]
+fn a_constant_zig_never_resolves() {
+    let src = include_str!("../../../specs/tri/t27b/conformance/lazy_const.t27");
+    assert_eq!(names_ok(&run(src)).len(), 2);
+    for (from, to, want) in [("== 0x1100", "== 0x1100); assert(LAZY_ALLOWED.len == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_allowed_count() == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_bram_end() == 0x100000", "ConstDecl at"), ("[][]const u8", "[]LazyMissing", "type (undeclared)"), ("lazy_region_new(0, 0x100000)", "lazy_region_nowhere(0, 0x100000)", "ExprCall(undeclared fn)"), ("= LAZY_CSR;", "= LAZY_NOWHERE;", "ExprIdentifier(undeclared)")] {
+        assert!(common::lower_src(&src.replace(from, to)).unwrap_err().join("\n").contains(want), "{}", to);
+    }
 }
 
 // ------------------------------------------------ f32 @log, @log2 and @log10
