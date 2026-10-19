@@ -1280,6 +1280,125 @@ void test_no_annotation_text_can_break_its_line(void) {
     }
 }
 
+void test_holds_never_reads_past_its_range(void) {
+    const char* s = "abc$";
+    assert((holds(s, 0, 2, "abc$") == false));
+    assert((holds(s, 0, 3, "abc$") == true));
+}
+
+void test_a_spec_hash_saved_as_missing_is_not_recorded(void) {
+    const char* out = "spec_hash: MISMATCH (saved=missing, current=sha256:bb)\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    uint8_t fl = seal_flags(out, 0, lit_len(out));
+    assert((flag_on(fl, F_READ) == true));
+    assert((flag_on(fl, F_RECORDED) == false));
+    assert((flags_verdict(fl) == V_UNSEALED));
+}
+
+void test_negative_control_a_record_with_an_empty_path_or_no_url_is_unreadable(void) {
+    const char* no_url = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    assert((t27f_conclusion(no_url, lit_len(no_url)) == CONCL_FAILURE));
+    const char* no_path = "repo\tgHashTag/trios\n@\t\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    assert((t27f_conclusion(no_path, lit_len(no_path)) == CONCL_FAILURE));
+    const char* no_path_two = "repo\tgHashTag/trios\n@\t\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    assert((t27f_conclusion(no_path_two, lit_len(no_path_two)) == CONCL_FAILURE));
+    const char* one_char = "repo\tgHashTag/trios\n@\ta\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    assert((t27f_conclusion(one_char, lit_len(one_char)) == CONCL_SUCCESS));
+}
+
+void test_a_record_with_no_output_lines_is_its_own_unreadable_row(void) {
+    uint8_t out[4096] = {0};
+    const char* inp = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\n@\tspecs/b.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    size_t n = lit_len(inp);
+    assert((record_count(inp, n) == 2));
+    assert((t27f_conclusion(inp, n) == CONCL_FAILURE));
+    size_t w = t27f_report(inp, n, &out, 4096);
+    assert((holds(&out, 0, w, "T27F seals: 2 spec(s), 1 sealed, 0 neutral, 1 failing\n$") == true));
+    assert((holds(&out, 0, w, "| `specs/a.t27` | `0123456789ab` | - | - | unreadable | - | [view](https://t27.ai/t27f/graph/?src=url) |\n| `specs/b.t27` | `0123456789ab` | - | - | sealed | reuse |$") == true));
+    size_t a = t27f_annotations(inp, n, &out, 4096);
+    assert((holds(&out, 0, a, "specs/a.t27\t1\tfailure\tT27F seal: unreadable\t$") == true));
+}
+
+void test_the_repo_line_need_not_be_the_first_line(void) {
+    const char* late = "# header\nrepo\tgHashTag/ghashtag.github.io\n@\tt27/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MISMATCH (saved=sha256:aa, current=sha256:bb)\n$";
+    assert((input_readable(late, lit_len(late)) == true));
+    assert((t27f_conclusion(late, lit_len(late)) == CONCL_NEUTRAL));
+}
+
+void test_ten_and_its_powers_are_written_in_full(void) {
+    uint8_t out[64] = {0};
+    size_t w = put_decimal(&out, 0, 64, 10);
+    assert((w == 2));
+    assert((out[0] == '1'));
+    assert((out[1] == '0'));
+    w = put_decimal(&out, 0, 64, 100);
+    assert((holds(&out, 0, w, "100$") == true));
+    assert((w == 3));
+}
+
+void test_the_query_keeps_every_letter_and_digit_at_its_bounds(void) {
+    uint8_t out[64] = {0};
+    const char* q = "azAZ09-._~/:$";
+    size_t w = put_query(&out, 0, 64, q, 0, lit_len(q));
+    assert((w == lit_len(q)));
+    assert((holds(&out, 0, w, "azAZ09-._~/:$") == true));
+    const char* edge = "`{@[$";
+    w = put_query(&out, 0, 64, edge, 0, lit_len(edge));
+    assert((holds(&out, 0, w, "%60%7B%40%5B$") == true));
+}
+
+void test_the_digest_and_graph_columns_show_exactly_their_fields(void) {
+    uint8_t out[4096] = {0};
+    const char* inp = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nError: parse error\n@\tspecs/b.t27\t0123456789abc\turl\nError: parse error\n@\tspecs/c.t27\t\turl\nError: parse error\n@\t\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: parse error\n$";
+    size_t w = t27f_report(inp, lit_len(inp), &out, 4096);
+    assert((w < 4096));
+    assert((holds(&out, 0, w, "| `specs/a.t27` | `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` | - | - | unreadable | - | - |$") == true));
+    assert((holds(&out, 0, w, "| `specs/b.t27` | `0123456789ab` | - | - | unreadable | - | [view](https://t27.ai/t27f/graph/?src=url) |$") == true));
+    assert((holds(&out, 0, w, "| `specs/c.t27` | `` | - | - | unreadable | - | [view](https://t27.ai/t27f/graph/?src=url) |$") == true));
+    assert((holds(&out, 0, w, "| `` | `0123456789ab` | - | - | unreadable | - | [view](https://t27.ai/t27f/graph/?src=url) |$") == true));
+}
+
+void test_a_neutral_row_is_counted_as_neutral(void) {
+    uint8_t out[4096] = {0};
+    const char* inp = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: No saved seal found at .trinity/seals/A.json. Run with --save first.\n$";
+    size_t w = t27f_report(inp, lit_len(inp), &out, 4096);
+    assert((holds(&out, 0, w, "claw/t27f\nneutral\nT27F seals: 1 spec(s), 0 sealed, 1 neutral, 0 failing\n$") == true));
+}
+
+void test_a_report_or_annotations_that_fit_exactly_are_kept(void) {
+    uint8_t out[4096] = {0};
+    const char* inp = "repo\tgHashTag/trios\n@\tspecs/a.t27\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nspec_hash: MATCH\ngen_hash_zig: MATCH\ngen_hash_verilog: MATCH\ngen_hash_c: MATCH\ngen_hash_rust: MATCH\n$";
+    size_t full = t27f_report(inp, lit_len(inp), &out, 4096);
+    assert((full < 4096));
+    assert((t27f_report(inp, lit_len(inp), &out, full) == full));
+    assert((holds(&out, 0, full, "claw/t27f\nsuccess\nT27F seals: 1 spec(s)$") == true));
+    const char* empty = "repo\tgHashTag/trios\n$";
+    size_t e = t27f_report(empty, lit_len(empty), &out, 4096);
+    assert((t27f_report(empty, lit_len(empty), &out, e) == e));
+    assert((holds(&out, 0, e, "claw/t27f\nneutral\nT27F seals: no spec in scope\n$") == true));
+    const char* bad = "@\tx\n$";
+    size_t u = t27f_report(bad, lit_len(bad), &out, 4096);
+    assert((t27f_report(bad, lit_len(bad), &out, u) == u));
+    assert((holds(&out, 0, u, "claw/t27f\nfailure\nT27F seals: the input could not be read\n$") == true));
+    const char* one = "repo\tgHashTag/trios\n@\ta\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\turl\nError: parse error\n$";
+    size_t a = t27f_annotations(one, lit_len(one), &out, 4096);
+    assert((holds(&out, 0, a, "a\t1\tfailure\tT27F seal: unreadable\t$") == true));
+    assert((t27f_annotations(one, lit_len(one), &out, a) == a));
+}
+
+void test_negative_control_the_scope_reads_names_and_room_exactly(void) {
+    uint8_t set[512] = {0};
+    const char* short = "x\n.t27\na\nspecs/.t27\n--graph\nspecs/z.t27\n$";
+    assert((t27f_scope(short, lit_len(short), &set, 512) == 0));
+    const char* two = "specs/c.t27\nspecs/d.t27\n--graph\n$";
+    assert((t27f_scope(two, lit_len(two), &set, 12) == 13));
+    const char* edge = "specs/c.t27\n--graph\nspecs/b.t27\tspecs/c.t27\n$";
+    assert((t27f_scope(edge, lit_len(edge), &set, 12) == 13));
+    const char* order = "specs/c.t27\n--graph\nspecs/z.t27\nspecs/x.t27\tspecs/y.t27\nspecs/b.t27\tspecs/c.t27\n$";
+    size_t sn = t27f_scope(order, lit_len(order), &set, 512);
+    assert((in_set(&set, sn, "specs/b.t27", 0, 11) == true));
+    assert((sn == 24));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1316,7 +1435,18 @@ int main(void) {
     test_the_annotations_are_cut_into_batches_of_fifty();
     test_negative_control_unreadable_input_or_no_room_writes_no_annotation();
     test_no_annotation_text_can_break_its_line();
-    printf("All %d tests passed.\n", 28);
+    test_holds_never_reads_past_its_range();
+    test_a_spec_hash_saved_as_missing_is_not_recorded();
+    test_negative_control_a_record_with_an_empty_path_or_no_url_is_unreadable();
+    test_a_record_with_no_output_lines_is_its_own_unreadable_row();
+    test_the_repo_line_need_not_be_the_first_line();
+    test_ten_and_its_powers_are_written_in_full();
+    test_the_query_keeps_every_letter_and_digit_at_its_bounds();
+    test_the_digest_and_graph_columns_show_exactly_their_fields();
+    test_a_neutral_row_is_counted_as_neutral();
+    test_a_report_or_annotations_that_fit_exactly_are_kept();
+    test_negative_control_the_scope_reads_names_and_room_exactly();
+    printf("All %d tests passed.\n", 39);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

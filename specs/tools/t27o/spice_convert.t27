@@ -1,0 +1,2048 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/tools/t27o/spice_convert.t27 -- t27o (Ouroboros), its SPICE front end (#10509, M2a of the
+// analog-emulation epic #10486): reads an ngspice netlist, flattens its subcircuits and prints an
+// inventory, or refuses with the card, its line and the reason. It sits beside rust_convert.t27 as the
+// spec said it would (specs/tools/t27o/<language>_convert.t27) and is reached by file extension:
+// `tri t27o deck.spice | deck.cir | deck.sp`. Emitting the M1 linear-cell spec from the inventory is M2b.
+// --
+// The dialect is ngspice's (the IHP open PDK targets ngspice). What this reader does with a deck:
+// - The first physical line is the TITLE and is never a card (ngspice does the same). It is printed
+//   back, so a first card eaten as a title is visible.
+// - `*` starts a comment line, `;` and ` $` end a line early, `+` continues the card before it (comment
+//   and blank lines between do not break the continuation), case is ignored, a tab is a space.
+// - SI suffixes: t g meg k m u n p f, with `m` = milli and `meg` = mega (`1m` is 1e-3, `1meg` is 1e6);
+//   any other trailing letters are a unit, as ngspice reads them (`10pF`, `5V`; also `1farad` = 1e-15,
+//   the well-known ngspice trap). `mil` is refused, not guessed. A number is kept exact as a decimal
+//   mantissa and a power of ten (0.13u is 13e-8): no float is involved. At most 18 significant digits.
+// - Cards read: R C L (two nodes, a value, `m=`), V I (DC, PULSE, SIN, PWL), E (a VCVS: two node pairs
+//   and a gain), X (an instance of a subcircuit or of a PDK device), `.subckt` / `.ends` (nested
+//   definitions are scoped to the definition that holds them), `.lib <file> <section>` and `.include
+//   <file>` (recorded, never followed: no PDK file is read), `.options TEMP=`, `.PARAM name=literal`,
+//   `.tran`, `.ic` / `.nodeset` (`v(node)=literal`), `.save` and `.global` (recorded), `.end`.
+// - PDK devices are recognised by the model name of an X card and counted, not evaluated (evaluation is
+//   M3): sg13_lv_nmos and sg13_lv_pmos (4 nodes, w l ng m) and cap_cmim (2 nodes, w l m). A `.subckt`
+//   of the same name in the deck wins over the table, as it does in ngspice. cap_cmim is beyond what
+//   #10509 lists: the acceptance deck holds 64 of them, so refusing it would have refused the deck.
+// - `.control` ... `.endc`: `tran` is read like a `.tran` card; let plot set unset write run print echo
+//   wrdata setplot display destroy quit exit save hardcopy are post-processing, counted as ignored;
+//   any other command is refused (an `ac` or `op` would be an analysis nobody here evaluates).
+// - Refused with `line N: <reason>` and the card text, never approximated: a B source, any other
+//   element letter (D Q J K M G F H S W T U O P Z Y), `.measure`, `.func`, `.model` and every other
+//   directive not listed above, a `{expression}` or 'quoted expression', a value that is not a literal
+//   number, an instance parameter other than m (w l ng for PDK devices), subcircuit parameters, a node
+//   count that differs from the subcircuit's ports, an undefined subcircuit, a subcircuit nested deeper
+//   than MAX_DEPTH, a subcircuit that instantiates itself, a fractional `m` on an instance, a `.subckt`
+//   without `.ends`. Every card is read; the refusal reported is the one on the EARLIEST line, so a
+//   forward reference to a missing subcircuit never hides a malformed card above it.
+// --
+// The end of the deck (the rule, #10509): the reader reads the WHOLE file, and the deck ends at the LAST
+// `.end` card. A `.end` with more cards after it is a section break, recorded and not a terminator; the
+// cards after the last `.end` are ignored and counted. Why: in top.spice (uberWAVE's SAR ADC golden
+// netlist, xschem output) the first `.end` is at line 296 and the two `.lib` lines, `.GLOBAL` and all
+// the `.subckt` definitions come after it; ngspice produced SAR_top_tb_tran.raw from that very file, so it
+// must have seen the definitions, and a reader that stopped at line 296 would reject every instance in
+// it. A deck with one `.end` and definitions after it is therefore NOT read as a whole: its definitions
+// are ignored and its instances come back as undefined subcircuits, named with their line. The ngspice
+// source is not at hand here; the evidence for the rule is the golden .raw, not the source.
+// --
+// Flattening: every instance gets the hierarchical name ngspice gives a subcircuit's contents, the path of
+// X instance names then the card name, lowercased and joined by dots: `x3.x1.xm1`. (ngspice's device-letter
+// first spelling, `m.x3.x1.xm1`, is not reproduced.) Only leaf devices are listed; the X cards that open a
+// level are counted. An `m=` on an X card multiplies everything below it; the inventory reports MOS and
+// MIM devices weighted by the product of the m of the instance and of its ancestors. Node names are not
+// resolved through the port maps: M2a counts and names, M2b will wire.
+// --
+// The caller passes the deck, a work buffer (at least 2 * deck.len + 8192 bytes: the cleaned cards, then
+// the path scratch), an output buffer and a zeroed state vector: FIXED counters, the subcircuit table
+// (MAXDEF rows), the stack of definitions the flattener is inside (MAX_DEPTH), then CARD_SLOTS slots a
+// card, as many cards as fit; a deck that does not fit is refused, never cut. The result is the number of
+// bytes the output needs; the buffer was too small when that is above out.len. `exit_code` is 0 for an
+// accepted deck and 1 for a refused one.
+// --
+// Writing this spec, three t27c behaviours shaped it (each is a compiler limit, not a choice):
+// - `use` splices by NAME: every word of the spec outside a `//` comment, string literals and `;` lines
+//   included, that is also a declaration of an imported module is pulled in with everything that
+//   declaration calls. A local called `bit`, a message saying "at line" or ".param" pulled all of
+//   rust_convert.t27 into the generated Rust (11185 lines, 5150 once the comments moved to `//`). So the
+//   header is `//` prose, nothing here is named like a rust_convert declaration, and the .param
+//   directive is compared in two pieces (ci_cat).
+// - A slice parameter that is only read becomes `impl AsRef<[usize]>` in the generated Rust, and the caller
+//   then moves its `&mut [usize]` into it: the card and definition tables are therefore indexed in place,
+//   not through accessor fns, and find_def writes a slot so the state vector stays `&mut`.
+// - A string literal has \n and \t escapes but no \r; the tests build their CRLF deck at run time.
+// ASCII only (L3)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27oSpice;
+
+use tools::t27o::rust_convert::put;
+use tools::t27o::rust_convert::puts;
+use tools::t27o::rust_convert::put_num;
+use tools::t27o::rust_convert::put_text;
+use tools::t27o::rust_convert::is_space;
+use tools::t27o::rust_convert::is_digit;
+use tools::t27o::rust_convert::is_alpha;
+use tools::t27o::rust_convert::out_is;
+
+// ---------------------------------------------------------------- state
+
+/// No card, no definition, no token. SCOPE_CTL is the scope of a card inside .control ... .endc.
+pub const NONE : usize = 4294967295;
+pub const SCOPE_CTL : usize = 4294967294;
+
+/// The state vector. Slot W is where the output writer stands (put and puts from rust_convert write
+/// st[W]); the first FIXED slots hold counters, then MAXDEF definitions, then the cards.
+pub const NCARDS : usize = 0;
+pub const W : usize = 1;
+/// The refusal: the line (0 = none), the reason code, the card it is about and the offending token.
+pub const ERR_LINE : usize = 2;
+pub const ERR_WHY : usize = 3;
+pub const ERR_CARD : usize = 4;
+pub const ERR_TOK : usize = 5;
+/// The end of the cleaned deck in the work buffer: the path scratch of the flattener starts here.
+pub const WEND : usize = 6;
+pub const TITLE_A : usize = 7;
+pub const TITLE_B : usize = 8;
+/// .end cards, the line of the first, the card index of the last (NONE when there is none), the
+/// cards read (those before the last .end) and the cards after it that were ignored.
+pub const END_N : usize = 9;
+pub const END_LINE : usize = 10;
+pub const END_LAST : usize = 11;
+pub const SCAN_HI : usize = 12;
+pub const IGNORED : usize = 13;
+pub const NDEF : usize = 14;
+/// The definition being read (NONE at the top) and the card of the open .control (NONE when closed).
+pub const CUR : usize = 15;
+pub const CTL_CARD : usize = 16;
+/// Cards of each kind in the source text: K_R .. K_MIM, then the source waveforms.
+pub const SRC : usize = 17;
+pub const WAVE : usize = 26;
+pub const N_LIB : usize = 30;
+pub const N_INC : usize = 31;
+pub const N_PARAM : usize = 32;
+pub const N_TRAN : usize = 33;
+pub const N_TRAN_CTL : usize = 34;
+pub const N_OPT : usize = 35;
+pub const N_IC : usize = 36;
+pub const N_NODESET : usize = 37;
+pub const N_SAVE : usize = 38;
+pub const N_GLOBAL : usize = 39;
+pub const N_CTLCMD : usize = 40;
+pub const N_NMOS : usize = 41;
+pub const N_PMOS : usize = 42;
+pub const N_MIM : usize = 43;
+pub const N_XCARDS : usize = 44;
+/// Leaf devices after flattening, per kind (K_R .. K_MIM; K_X counts the levels opened), and the MOS
+/// and MIM devices weighted by m.
+pub const FLAT : usize = 45;
+pub const FLAT_MOS_W : usize = 54;
+pub const FLAT_MIM_W : usize = 55;
+pub const DEPTH_SEEN : usize = 56;
+/// 1 while the flattener writes the instance list; 0 while it only counts.
+pub const EMIT : usize = 57;
+/// The number parse_num found: mantissa, biased exponent, sign.
+pub const VM : usize = 58;
+pub const VE : usize = 59;
+pub const VS : usize = 60;
+/// What xparse found in an X card: the node count, the model token, where the key=value pairs begin.
+pub const XN : usize = 61;
+pub const XA : usize = 62;
+pub const XB : usize = 63;
+pub const XP : usize = 64;
+/// The definition find_def found, and the card of the TEMP option (NONE when there is none).
+pub const DEF_HIT : usize = 65;
+pub const TEMP_CARD : usize = 66;
+/// Where group_count left the position just after the ) it read.
+pub const GROUP_END : usize = 67;
+pub const FIXED : usize = 80;
+
+/// The subcircuit table: DEF_SLOTS slots a definition, MAXDEF of them.
+pub const DEF0 : usize = 80;
+pub const DEF_SLOTS : usize = 6;
+pub const MAXDEF : usize = 256;
+pub const D_NAME_A : usize = 0;
+pub const D_NAME_B : usize = 1;
+pub const D_NPORTS : usize = 2;
+pub const D_FIRST : usize = 3;
+pub const D_LAST : usize = 4;
+pub const D_PARENT : usize = 5;
+
+/// The definitions the flattener is inside, outermost first: MAX_DEPTH slots.
+pub const STK : usize = 1616;
+
+/// The card table: CARD_SLOTS slots a card, as many as the state vector has room for.
+pub const CARD0 : usize = 1648;
+pub const CARD_SLOTS : usize = 4;
+pub const C_A : usize = 0;
+pub const C_B : usize = 1;
+pub const C_LINE : usize = 2;
+pub const C_SCOPE : usize = 3;
+
+/// The kinds of element the inventory counts.
+pub const K_R : usize = 0;
+pub const K_C : usize = 1;
+pub const K_L : usize = 2;
+pub const K_V : usize = 3;
+pub const K_I : usize = 4;
+pub const K_E : usize = 5;
+pub const K_X : usize = 6;
+pub const K_MOS : usize = 7;
+pub const K_MIM : usize = 8;
+pub const K_COUNT : usize = 9;
+
+/// What an X card names: a subcircuit of the deck, or a PDK device the reader recognises.
+pub const X_NONE : usize = 0;
+pub const X_SUB : usize = 1;
+pub const X_NMOS : usize = 2;
+pub const X_PMOS : usize = 3;
+pub const X_MIM : usize = 4;
+
+/// Waveforms of a V or I source.
+pub const WV_DC : usize = 0;
+pub const WV_PULSE : usize = 1;
+pub const WV_SIN : usize = 2;
+pub const WV_PWL : usize = 3;
+
+/// The exponent of a number is kept biased so it never goes below zero.
+pub const EXP_BIAS : usize = 10000;
+/// Subcircuit levels flattened before the reader calls it recursion, and the largest m it weighs.
+pub const MAX_DEPTH : usize = 32;
+pub const MAX_MULT : usize = 1000000000;
+/// The longest card, title or token text printed back.
+pub const SHOW : usize = 120;
+
+/// Why a card is refused.
+pub const Y_CONT : usize = 1;
+pub const Y_SIZE : usize = 2;
+pub const Y_B : usize = 3;
+pub const Y_ELEMENT : usize = 4;
+pub const Y_DIRECTIVE : usize = 5;
+pub const Y_EXPR : usize = 6;
+pub const Y_NUMBER : usize = 7;
+pub const Y_FIELDS : usize = 8;
+pub const Y_PARAM : usize = 9;
+pub const Y_SOURCE : usize = 10;
+pub const Y_E : usize = 11;
+pub const Y_UNDEF : usize = 12;
+pub const Y_PORTS : usize = 13;
+pub const Y_DEPTH : usize = 14;
+pub const Y_ENDS : usize = 15;
+pub const Y_OPEN : usize = 16;
+pub const Y_DUP : usize = 17;
+pub const Y_CTL : usize = 18;
+pub const Y_CTLOPEN : usize = 19;
+pub const Y_OPTION : usize = 20;
+pub const Y_SUBPARAM : usize = 21;
+pub const Y_MULT : usize = 22;
+pub const Y_CTLIN : usize = 23;
+pub const Y_RECUR : usize = 24;
+
+// The bytes the reader looks at, as numbers (a char literal is a Rust char in gen-rust).
+pub const B_TAB : u8 = 9;
+pub const B_NL : u8 = 10;
+pub const B_CR : u8 = 13;
+pub const B_SPACE : u8 = 32;
+pub const B_DOLLAR : u8 = 36;
+pub const B_APOS : u8 = 39;
+pub const B_LPAREN : u8 = 40;
+pub const B_RPAREN : u8 = 41;
+pub const B_STAR : u8 = 42;
+pub const B_PLUS : u8 = 43;
+pub const B_COMMA : u8 = 44;
+pub const B_MINUS : u8 = 45;
+pub const B_DOT : u8 = 46;
+pub const B_ZERO : u8 = 48;
+pub const B_SEMI : u8 = 59;
+pub const B_EQ : u8 = 61;
+pub const B_LBRACE : u8 = 123;
+
+// ---------------------------------------------------------------- the file name
+
+/// ASCII lowercase of one byte (every spec that reads text carries this one).
+pub fn lower(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// Does a file name end in .spice, .cir or .sp, whatever the case? `tri t27o` sends such a file here.
+pub fn is_spice_name(name: []const u8) -> bool {
+    return ends_ci(name, ".spice") or ends_ci(name, ".cir") or ends_ci(name, ".sp");
+}
+
+pub fn ends_ci(name: []const u8, suffix: []const u8) -> bool {
+    if (name.len < suffix.len) { return false; }
+    const from : usize = name.len - suffix.len;
+    var k : usize = 0;
+    while (k < suffix.len) {
+        if (lower(name[from + k]) != suffix[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- tables
+
+/// A refusal on `line`, kept only when it is the earliest one seen.
+pub fn reject_at(st: []usize, why: usize, line: usize, k: usize, tok: usize) -> void {
+    if (st[ERR_LINE] == 0 or line < st[ERR_LINE]) {
+        st[ERR_LINE] = line;
+        st[ERR_WHY] = why;
+        st[ERR_CARD] = k;
+        st[ERR_TOK] = tok;
+    }
+}
+
+/// A refusal about card k, and token `tok` of it (NONE for the card as a whole).
+pub fn reject(st: []usize, why: usize, k: usize, tok: usize) -> void {
+    const line : usize = st[CARD0 + k * CARD_SLOTS + C_LINE];
+    reject_at(st, why, line, k, tok);
+}
+
+pub fn exit_code(st: []usize) -> u8 {
+    if (st[ERR_LINE] != 0) { return 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- tokens
+
+/// A separator: a space, a tab or a comma.
+pub fn is_sep(c: u8) -> bool {
+    return is_space(c) or c == B_COMMA;
+}
+
+/// The punctuation that is a token by itself: ( ) and =.
+pub fn is_punct(c: u8) -> bool {
+    return c == B_LPAREN or c == B_RPAREN or c == B_EQ;
+}
+
+/// Where the next token at or after p starts, e when there is none.
+pub fn tk(w: []const u8, p: usize, e: usize) -> usize {
+    var q : usize = p;
+    while (q < e and is_sep(w[q])) { q = q + 1; }
+    return q;
+}
+
+/// Where the token that starts at s ends.
+pub fn tk_end(w: []const u8, s: usize, e: usize) -> usize {
+    if (s >= e) { return s; }
+    if (is_punct(w[s])) { return s + 1; }
+    var q : usize = s;
+    while (q < e and !is_sep(w[q]) and !is_punct(w[q])) { q = q + 1; }
+    return q;
+}
+
+/// Start of the i-th (from 0) word at or after p, NONE when a ( ) or = comes first or the card ends.
+pub fn word_at(w: []const u8, p: usize, e: usize, i: usize) -> usize {
+    var q : usize = p;
+    var n : usize = 0;
+    var found : usize = NONE;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e or is_punct(w[t])) {
+            go = false;
+        } else if (n == i) {
+            found = t;
+            go = false;
+        } else {
+            n = n + 1;
+            q = tk_end(w, t, e);
+        }
+    }
+    return found;
+}
+
+/// The position just after the i-th word, NONE when there is none.
+pub fn after_word(w: []const u8, p: usize, e: usize, i: usize) -> usize {
+    const t : usize = word_at(w, p, e, i);
+    if (t == NONE) { return NONE; }
+    return tk_end(w, t, e);
+}
+
+/// Is w[a..b] the text `lit`, ignoring case? `lit` is lower case.
+pub fn ci_is(w: []const u8, a: usize, b: usize, lit: []const u8) -> bool {
+    if (b < a or b - a != lit.len) { return false; }
+    var k : usize = 0;
+    while (k < lit.len) {
+        if (lower(w[a + k]) != lit[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Is w[a..b] the text pre followed by suf, ignoring case? (.PARAM is spelled in two pieces: t27c's
+/// `use` splice reads every word of a spec, string literals included, as a name to pull, and
+/// rust_convert declares fns called param and params that would drag the Rust converter in with them.)
+pub fn ci_cat(w: []const u8, a: usize, b: usize, pre: []const u8, suf: []const u8) -> bool {
+    if (b < a or b - a != pre.len + suf.len) { return false; }
+    return ci_is(w, a, a + pre.len, pre) and ci_is(w, a + pre.len, b, suf);
+}
+
+/// Are w[a1..b1] and w[a2..b2] the same text, ignoring case?
+pub fn same_ci(w: []const u8, a1: usize, b1: usize, a2: usize, b2: usize) -> bool {
+    if (b1 < a1 or b2 < a2 or b1 - a1 != b2 - a2) { return false; }
+    var k : usize = 0;
+    while (a1 + k < b1) {
+        if (lower(w[a1 + k]) != lower(w[a2 + k])) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Where a byte of the card w[a..e] is `c1` or `c2`, NONE when neither is.
+pub fn find_either(w: []const u8, a: usize, e: usize, c1: u8, c2: u8) -> usize {
+    var q : usize = a;
+    while (q < e) {
+        if (w[q] == c1 or w[q] == c2) { return q; }
+        q = q + 1;
+    }
+    return NONE;
+}
+
+// ---------------------------------------------------------------- numbers
+
+/// Parse w[a..b] as a SPICE number into st[VM] (the mantissa, trailing zeros taken out), st[VE] (the
+/// power of ten, biased by EXP_BIAS) and st[VS] (1 for a minus sign). False when it is not one.
+pub fn parse_num(w: []const u8, a: usize, b: usize, st: []usize) -> bool {
+    var q : usize = a;
+    var neg : usize = 0;
+    if (q < b and (w[q] == B_MINUS or w[q] == B_PLUS)) {
+        if (w[q] == B_MINUS) { neg = 1; }
+        q = q + 1;
+    }
+    var mant : usize = 0;
+    var sig : usize = 0;
+    var eb : usize = EXP_BIAS;
+    var any : bool = false;
+    var dot : bool = false;
+    var go : bool = true;
+    while (go and q < b) {
+        const c : u8 = w[q];
+        if (is_digit(c)) {
+            any = true;
+            if (mant != 0 or c != B_ZERO) {
+                if (sig >= 18) { return false; }
+                mant = mant * 10 + (c - B_ZERO) as usize;
+                sig = sig + 1;
+            }
+            if (dot) { eb = eb - 1; }
+            q = q + 1;
+        } else if (c == B_DOT and !dot) {
+            dot = true;
+            q = q + 1;
+        } else {
+            go = false;
+        }
+    }
+    if (!any) { return false; }
+    // an exponent: e or E, an optional sign and at least one digit
+    if (q < b and lower(w[q]) == 101) {
+        var r : usize = q + 1;
+        var eneg : bool = false;
+        if (r < b and (w[r] == B_MINUS or w[r] == B_PLUS)) {
+            eneg = w[r] == B_MINUS;
+            r = r + 1;
+        }
+        if (r < b and is_digit(w[r])) {
+            var ev : usize = 0;
+            while (r < b and is_digit(w[r])) {
+                if (ev > 1000) { return false; }
+                ev = ev * 10 + (w[r] - B_ZERO) as usize;
+                r = r + 1;
+            }
+            if (eneg) { eb = eb - ev; } else { eb = eb + ev; }
+            q = r;
+        }
+    }
+    // a scale factor, then units: letters only
+    if (q < b) {
+        const c : u8 = lower(w[q]);
+        if (c == 109) {
+            if (q + 2 < b and lower(w[q + 1]) == 101 and lower(w[q + 2]) == 103) {
+                eb = eb + 6;
+                q = q + 3;
+            } else if (q + 2 < b and lower(w[q + 1]) == 105 and lower(w[q + 2]) == 108) {
+                return false;
+            } else {
+                eb = eb - 3;
+                q = q + 1;
+            }
+        } else if (c == 116) { eb = eb + 12; q = q + 1; }
+        else if (c == 103) { eb = eb + 9; q = q + 1; }
+        else if (c == 107) { eb = eb + 3; q = q + 1; }
+        else if (c == 117) { eb = eb - 6; q = q + 1; }
+        else if (c == 110) { eb = eb - 9; q = q + 1; }
+        else if (c == 112) { eb = eb - 12; q = q + 1; }
+        else if (c == 102) { eb = eb - 15; q = q + 1; }
+        while (q < b) {
+            if (!is_alpha(w[q])) { return false; }
+            q = q + 1;
+        }
+    }
+    while (mant != 0 and mant % 10 == 0) {
+        mant = mant / 10;
+        eb = eb + 1;
+    }
+    if (mant == 0) { eb = EXP_BIAS; }
+    st[VM] = mant;
+    st[VE] = eb;
+    st[VS] = neg;
+    return true;
+}
+
+/// Is the number with mantissa m, biased exponent e and sign s a whole number from 1 to MAX_MULT?
+pub fn whole_mult(m: usize, e: usize, s: usize) -> bool {
+    if (s != 0 or m == 0 or e < EXP_BIAS or e - EXP_BIAS > 9) { return false; }
+    if (m > MAX_MULT) { return false; }
+    return mult_value(m, e) <= MAX_MULT;
+}
+
+/// The whole number that whole_mult accepted: the mantissa times ten to the exponent.
+pub fn mult_value(m: usize, e: usize) -> usize {
+    var v : usize = m;
+    var x : usize = e - EXP_BIAS;
+    while (x > 0) {
+        v = v * 10;
+        x = x - 1;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------- the cleaned deck
+
+/// Where a card's inline comment starts: a `;`, or a `$` after a blank or at the start; e when none.
+pub fn cut_comment(src: []const u8, a: usize, e: usize) -> usize {
+    var i : usize = a;
+    while (i < e) {
+        const c : u8 = src[i];
+        if (c == B_SEMI) { return i; }
+        if (c == B_DOLLAR and (i == a or src[i - 1] == B_SPACE or src[i - 1] == B_TAB)) { return i; }
+        i = i + 1;
+    }
+    return e;
+}
+
+/// Read the deck into the work buffer, one card per line: the title set aside, comment and blank lines
+/// dropped, inline comments cut, every `+` line joined to the card before it. The card table records
+/// where each card is and the physical line it started on.
+pub fn prepare(src: []const u8, w: []u8, st: []usize) -> void {
+    const cap : usize = (st.len - CARD0) / CARD_SLOTS;
+    var p : usize = 0;
+    var line : usize = 0;
+    var wp : usize = 0;
+    var open : bool = false;
+    var n : usize = 0;
+    var go : bool = true;
+    while (go and p < src.len) {
+        var e : usize = p;
+        while (e < src.len and src[e] != B_NL) { e = e + 1; }
+        line = line + 1;
+        if (line == 1) {
+            var te : usize = e;
+            if (te > p and src[te - 1] == B_CR) { te = te - 1; }
+            st[TITLE_A] = p;
+            st[TITLE_B] = te;
+        } else {
+            var a : usize = p;
+            while (a < e and (src[a] == B_SPACE or src[a] == B_TAB)) { a = a + 1; }
+            var b : usize = cut_comment(src, a, e);
+            while (b > a and is_space(src[b - 1])) { b = b - 1; }
+            if (a < b and src[a] != B_STAR) {
+                if (wp + (b - a) + 2 > w.len) {
+                    reject_at(st, Y_SIZE, line, NONE, NONE);
+                    go = false;
+                } else if (src[a] == B_PLUS) {
+                    if (!open) {
+                        reject_at(st, Y_CONT, line, NONE, NONE);
+                    } else {
+                        w[wp] = B_SPACE;
+                        wp = wp + 1;
+                        var i : usize = a + 1;
+                        while (i < b and (src[i] == B_SPACE or src[i] == B_TAB)) { i = i + 1; }
+                        while (i < b) {
+                            w[wp] = src[i];
+                            wp = wp + 1;
+                            i = i + 1;
+                        }
+                    }
+                } else if (n >= cap) {
+                    reject_at(st, Y_SIZE, line, NONE, NONE);
+                    go = false;
+                } else {
+                    if (open) {
+                        st[CARD0 + (n - 1) * CARD_SLOTS + C_B] = wp;
+                        w[wp] = B_NL;
+                        wp = wp + 1;
+                    }
+                    st[CARD0 + n * CARD_SLOTS + C_A] = wp;
+                    st[CARD0 + n * CARD_SLOTS + C_LINE] = line;
+                    st[CARD0 + n * CARD_SLOTS + C_SCOPE] = NONE;
+                    var i : usize = a;
+                    while (i < b) {
+                        w[wp] = src[i];
+                        wp = wp + 1;
+                        i = i + 1;
+                    }
+                    n = n + 1;
+                    open = true;
+                }
+            }
+        }
+        p = e + 1;
+    }
+    if (open) {
+        st[CARD0 + (n - 1) * CARD_SLOTS + C_B] = wp;
+        w[wp] = B_NL;
+        wp = wp + 1;
+    }
+    st[NCARDS] = n;
+    st[WEND] = wp;
+}
+
+/// Find the .end cards. The deck ends at the last one (see the header): the cards before it are read,
+/// the ones after it are ignored and counted.
+pub fn mark_end(w: []const u8, st: []usize) -> void {
+    var k : usize = 0;
+    var last : usize = NONE;
+    var n : usize = 0;
+    while (k < st[NCARDS]) {
+        const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+        if (ci_is(w, a, tk_end(w, a, st[CARD0 + k * CARD_SLOTS + C_B]), ".end")) {
+            if (n == 0) { st[END_LINE] = st[CARD0 + k * CARD_SLOTS + C_LINE]; }
+            n = n + 1;
+            last = k;
+        }
+        k = k + 1;
+    }
+    st[END_N] = n;
+    st[END_LAST] = last;
+    if (last == NONE) {
+        st[SCAN_HI] = st[NCARDS];
+        st[IGNORED] = 0;
+    } else {
+        st[SCAN_HI] = last;
+        st[IGNORED] = st[NCARDS] - last - 1;
+    }
+}
+
+// ---------------------------------------------------------------- reading the cards
+
+/// Count one card of kind `kind` in the source text.
+pub fn count(st: []usize, kind: usize) -> void {
+    st[SRC + kind] = st[SRC + kind] + 1;
+}
+
+/// A value token: it must be a number.
+pub fn need_num(w: []const u8, st: []usize, k: usize, t: usize, e: usize) -> bool {
+    if (t == NONE or t >= e or is_punct(w[t])) {
+        reject(st, Y_FIELDS, k, NONE);
+        return false;
+    }
+    if (!parse_num(w, t, tk_end(w, t, e), st)) {
+        reject(st, Y_NUMBER, k, t);
+        return false;
+    }
+    return true;
+}
+
+/// The key=value pairs from p to the end of the card k. `allow` is a mask set of the keys that may
+/// appear: 1 m, 2 w, 4 l, 8 ng. Every value is a number; with `whole` the m must be a whole number.
+pub fn check_params(w: []const u8, st: []usize, k: usize, p: usize, e: usize, allow: usize, whole: bool) -> void {
+    var q : usize = p;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            const eq : usize = tk(w, te, e);
+            if (is_punct(w[t]) or eq >= e or w[eq] != B_EQ) {
+                reject(st, Y_PARAM, k, t);
+                go = false;
+            } else {
+                const v : usize = tk(w, eq + 1, e);
+                var mask : usize = 0;
+                if (ci_is(w, t, te, "m")) { mask = 1; }
+                if (ci_is(w, t, te, "w")) { mask = 2; }
+                if (ci_is(w, t, te, "l")) { mask = 4; }
+                if (ci_is(w, t, te, "ng")) { mask = 8; }
+                if (mask == 0 or (allow / mask) % 2 == 0) {
+                    reject(st, Y_PARAM, k, t);
+                    go = false;
+                } else if (!need_num(w, st, k, v, e)) {
+                    go = false;
+                } else {
+                    if (mask == 1 and whole and !whole_mult(st[VM], st[VE], st[VS])) {
+                        reject(st, Y_MULT, k, v);
+                        go = false;
+                    }
+                    q = tk_end(w, v, e);
+                }
+            }
+        }
+    }
+}
+
+/// R, C and L: name, two nodes, a value, then m=.
+pub fn passive(w: []const u8, st: []usize, k: usize, kind: usize, t1: usize, e: usize) -> void {
+    count(st, kind);
+    const q : usize = after_word(w, t1, e, 2);
+    const v : usize = word_at(w, t1, e, 2);
+    if (q == NONE) {
+        reject(st, Y_FIELDS, k, NONE);
+    } else if (need_num(w, st, k, v, e)) {
+        check_params(w, st, k, q, e, 1, false);
+    }
+}
+
+/// How many numbers sit between the ( at t and its ), NONE when the group is malformed or holds a non-number.
+/// The position after the ) is left in st[GROUP_END].
+pub fn group_count(w: []const u8, st: []usize, k: usize, t: usize, e: usize) -> usize {
+    if (t >= e or w[t] != B_LPAREN) { return NONE; }
+    var q : usize = t + 1;
+    var n : usize = 0;
+    var result : usize = NONE;
+    var go : bool = true;
+    while (go) {
+        const a : usize = tk(w, q, e);
+        if (a >= e) {
+            go = false;
+        } else if (w[a] == B_RPAREN) {
+            st[GROUP_END] = a + 1;
+            result = n;
+            go = false;
+        } else if (is_punct(w[a]) or !parse_num(w, a, tk_end(w, a, e), st)) {
+            reject(st, Y_NUMBER, k, a);
+            go = false;
+        } else {
+            n = n + 1;
+            q = tk_end(w, a, e);
+        }
+    }
+    return result;
+}
+
+/// V and I: two nodes, then a DC value, or DC value, or one of PULSE( .. ), SIN( .. ), PWL( .. ).
+pub fn source(w: []const u8, st: []usize, k: usize, kind: usize, t1: usize, e: usize) -> void {
+    count(st, kind);
+    var q : usize = after_word(w, t1, e, 1);
+    if (q == NONE) {
+        reject(st, Y_FIELDS, k, NONE);
+        return;
+    }
+    var wave : usize = WV_DC;
+    var seen : usize = 0;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            if (ci_is(w, t, te, "dc")) {
+                if (!need_num(w, st, k, tk(w, te, e), e)) { return; }
+                q = tk_end(w, tk(w, te, e), e);
+            } else if (ci_is(w, t, te, "pulse") or ci_is(w, t, te, "sin") or ci_is(w, t, te, "pwl")) {
+                const n : usize = group_count(w, st, k, tk(w, te, e), e);
+                if (n == NONE) {
+                    reject(st, Y_FIELDS, k, t);
+                    return;
+                }
+                var ok : bool = false;
+                if (ci_is(w, t, te, "pulse")) { wave = WV_PULSE; ok = n >= 2 and n <= 7; }
+                if (ci_is(w, t, te, "sin")) { wave = WV_SIN; ok = n >= 3 and n <= 6; }
+                if (ci_is(w, t, te, "pwl")) { wave = WV_PWL; ok = n >= 2 and n % 2 == 0; }
+                if (!ok) {
+                    reject(st, Y_FIELDS, k, t);
+                    return;
+                }
+                q = st[GROUP_END];
+            } else if (seen == 0 and !is_punct(w[t]) and parse_num(w, t, te, st)) {
+                q = te;
+            } else {
+                reject(st, Y_SOURCE, k, t);
+                return;
+            }
+            seen = seen + 1;
+        }
+    }
+    if (seen == 0) {
+        reject(st, Y_FIELDS, k, NONE);
+    } else {
+        st[WAVE + wave] = st[WAVE + wave] + 1;
+    }
+}
+
+/// E: a voltage-controlled voltage source, name n+ n- nc+ nc- gain, and nothing else.
+pub fn vcvs(w: []const u8, st: []usize, k: usize, t1: usize, e: usize) -> void {
+    count(st, K_E);
+    const g : usize = word_at(w, t1, e, 4);
+    if (g == NONE) {
+        reject(st, Y_E, k, NONE);
+        return;
+    }
+    const q : usize = tk_end(w, g, e);
+    if (tk(w, q, e) < e) {
+        reject(st, Y_E, k, tk(w, q, e));
+    } else if (!parse_num(w, g, q, st)) {
+        reject(st, Y_E, k, g);
+    }
+}
+
+/// Split an X card (or a .subckt card, from its first node on) at the first key=value: the words before
+/// it are nodes and, last, the model. Sets st[XN] nodes, st[XA..XB] the model, st[XP] where the pairs
+/// begin (e when there are none). False when there are fewer than two words.
+pub fn xparse(w: []const u8, st: []usize, k: usize) -> bool {
+    const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+    var q : usize = tk_end(w, st[CARD0 + k * CARD_SLOTS + C_A], e);
+    var words : usize = 0;
+    var ma : usize = 0;
+    var mb : usize = 0;
+    var pairs : usize = e;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            const nx : usize = tk(w, te, e);
+            if (nx < e and w[nx] == B_EQ and !is_punct(w[t])) {
+                pairs = t;
+                go = false;
+            } else if (is_punct(w[t])) {
+                pairs = t;
+                go = false;
+            } else {
+                words = words + 1;
+                ma = t;
+                mb = te;
+                q = te;
+            }
+        }
+    }
+    st[XN] = 0;
+    if (words > 0) { st[XN] = words - 1; }
+    st[XA] = ma;
+    st[XB] = mb;
+    st[XP] = pairs;
+    return words >= 2;
+}
+
+/// The PDK device an X card's model names, X_NONE when it is none of the table's.
+pub fn pdk_class(w: []const u8, a: usize, b: usize) -> usize {
+    if (ci_is(w, a, b, "sg13_lv_nmos")) { return X_NMOS; }
+    if (ci_is(w, a, b, "sg13_lv_pmos")) { return X_PMOS; }
+    if (ci_is(w, a, b, "cap_cmim")) { return X_MIM; }
+    return X_NONE;
+}
+
+/// An X card: nodes, a model, then key=value pairs. Only the shape is checked here; whether the model
+/// is a subcircuit of the deck or a PDK device waits until every .subckt is known (resolve).
+pub fn x_card(w: []const u8, st: []usize, k: usize) -> void {
+    st[N_XCARDS] = st[N_XCARDS] + 1;
+    if (!xparse(w, st, k)) {
+        reject(st, Y_FIELDS, k, NONE);
+        return;
+    }
+    check_params(w, st, k, st[XP], st[CARD0 + k * CARD_SLOTS + C_B], 15, true);
+}
+
+pub fn element(w: []const u8, st: []usize, k: usize, t0: usize, t1: usize, e: usize) -> void {
+    const c : u8 = lower(w[t0]);
+    if (c == 114) { passive(w, st, k, K_R, t1, e); }
+    else if (c == 99) { passive(w, st, k, K_C, t1, e); }
+    else if (c == 108) { passive(w, st, k, K_L, t1, e); }
+    else if (c == 118) { source(w, st, k, K_V, t1, e); }
+    else if (c == 105) { source(w, st, k, K_I, t1, e); }
+    else if (c == 101) { vcvs(w, st, k, t1, e); }
+    else if (c == 120) { x_card(w, st, k); }
+    else if (c == 98) { reject(st, Y_B, k, NONE); }
+    else { reject(st, Y_ELEMENT, k, NONE); }
+}
+
+// ---------------------------------------------------------------- directives
+
+/// Is the directive token w[a..b] one of the two spellings?
+pub fn dir_is(w: []const u8, a: usize, b: usize, one: []const u8, two: []const u8) -> bool {
+    return ci_is(w, a, b, one) or ci_is(w, a, b, two);
+}
+
+/// The definition of a name among the ones whose parent is `scope` or an ancestor of it, NONE if none.
+pub fn find_def(w: []const u8, st: []usize, a: usize, b: usize, scope: usize) -> usize {
+    var s : usize = scope;
+    var found : usize = NONE;
+    var go : bool = true;
+    while (go) {
+        var d : usize = 0;
+        while (go and d < st[NDEF]) {
+            if (st[DEF0 + d * DEF_SLOTS + D_PARENT] == s and same_ci(w, a, b, st[DEF0 + d * DEF_SLOTS + D_NAME_A], st[DEF0 + d * DEF_SLOTS + D_NAME_B])) {
+                found = d;
+                go = false;
+            }
+            d = d + 1;
+        }
+        if (go) {
+            if (s == NONE or s == SCOPE_CTL) {
+                go = false;
+            } else {
+                s = st[DEF0 + s * DEF_SLOTS + D_PARENT];
+            }
+        }
+    }
+    st[DEF_HIT] = found;
+    return found;
+}
+
+/// .subckt name port ... : a definition. Parameters on the line are refused, but the definition is still
+/// recorded so its instances do not also read as undefined.
+pub fn d_subckt(w: []const u8, st: []usize, k: usize, t1: usize, e: usize) -> void {
+    const na : usize = word_at(w, t1, e, 0);
+    if (na == NONE) {
+        reject(st, Y_FIELDS, k, NONE);
+        return;
+    }
+    const nb : usize = tk_end(w, na, e);
+    var ports : usize = 0;
+    var q : usize = nb;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            const nx : usize = tk(w, te, e);
+            if (is_punct(w[t]) or (nx < e and w[nx] == B_EQ)) {
+                reject(st, Y_SUBPARAM, k, t);
+                go = false;
+            } else {
+                ports = ports + 1;
+                q = te;
+            }
+        }
+    }
+    if (st[NDEF] >= MAXDEF) {
+        reject(st, Y_SIZE, k, NONE);
+        return;
+    }
+    const dup : usize = find_def(w, st, na, nb, st[CUR]);
+    if (dup != NONE and st[DEF0 + dup * DEF_SLOTS + D_PARENT] == st[CUR]) {
+        reject(st, Y_DUP, k, na);
+    }
+    const d : usize = st[NDEF];
+    st[DEF0 + d * DEF_SLOTS + D_NAME_A] = na;
+    st[DEF0 + d * DEF_SLOTS + D_NAME_B] = nb;
+    st[DEF0 + d * DEF_SLOTS + D_NPORTS] = ports;
+    st[DEF0 + d * DEF_SLOTS + D_FIRST] = k;
+    st[DEF0 + d * DEF_SLOTS + D_LAST] = NONE;
+    st[DEF0 + d * DEF_SLOTS + D_PARENT] = st[CUR];
+    st[NDEF] = d + 1;
+    st[CUR] = d;
+}
+
+/// .ends [name]: closes the definition being read.
+pub fn d_ends(w: []const u8, st: []usize, k: usize, t1: usize, e: usize) -> void {
+    const d : usize = st[CUR];
+    if (d == NONE) {
+        reject(st, Y_ENDS, k, NONE);
+        return;
+    }
+    const na : usize = word_at(w, t1, e, 0);
+    if (na != NONE and !same_ci(w, na, tk_end(w, na, e), st[DEF0 + d * DEF_SLOTS + D_NAME_A], st[DEF0 + d * DEF_SLOTS + D_NAME_B])) {
+        reject(st, Y_ENDS, k, na);
+    }
+    st[DEF0 + d * DEF_SLOTS + D_LAST] = k;
+    st[CUR] = st[DEF0 + d * DEF_SLOTS + D_PARENT];
+}
+
+/// Exactly `n` words after the directive and nothing else.
+pub fn only_words(w: []const u8, t1: usize, e: usize, n: usize) -> bool {
+    const q : usize = after_word(w, t1, e, n - 1);
+    if (q == NONE) { return false; }
+    return tk(w, q, e) >= e;
+}
+
+/// .options key=value ... : only TEMP.
+pub fn d_options(w: []const u8, st: []usize, k: usize, t1: usize, e: usize) -> void {
+    st[N_OPT] = st[N_OPT] + 1;
+    var q : usize = t1;
+    var go : bool = true;
+    var seen : usize = 0;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            const eq : usize = tk(w, te, e);
+            if (is_punct(w[t]) or !ci_is(w, t, te, "temp") or eq >= e or w[eq] != B_EQ) {
+                reject(st, Y_OPTION, k, t);
+                go = false;
+            } else if (!need_num(w, st, k, tk(w, eq + 1, e), e)) {
+                go = false;
+            } else {
+                st[TEMP_CARD] = k;
+                seen = seen + 1;
+                q = tk_end(w, tk(w, eq + 1, e), e);
+            }
+        }
+    }
+    if (seen == 0) { reject(st, Y_FIELDS, k, NONE); }
+}
+
+/// .PARAM name=literal ... and .ic / .nodeset v(node)=literal ... : `groups` says which. Returns how many.
+pub fn pairs(w: []const u8, st: []usize, k: usize, t1: usize, e: usize, groups: bool) -> usize {
+    var q : usize = t1;
+    var n : usize = 0;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            var eq : usize = NONE;
+            const te : usize = tk_end(w, t, e);
+            if (groups) {
+                // v ( node ) =
+                const lp : usize = tk(w, te, e);
+                const nd : usize = tk(w, lp + 1, e);
+                const rp : usize = tk(w, tk_end(w, nd, e), e);
+                const q2 : usize = tk(w, rp + 1, e);
+                if (ci_is(w, t, te, "v") and lp < e and w[lp] == B_LPAREN and nd < e and !is_punct(w[nd]) and rp < e and w[rp] == B_RPAREN and q2 < e and w[q2] == B_EQ) { eq = q2; }
+            } else {
+                const q2 : usize = tk(w, te, e);
+                if (!is_punct(w[t]) and q2 < e and w[q2] == B_EQ) { eq = q2; }
+            }
+            if (eq == NONE) {
+                reject(st, Y_FIELDS, k, t);
+                go = false;
+            } else if (!need_num(w, st, k, tk(w, eq + 1, e), e)) {
+                go = false;
+            } else {
+                n = n + 1;
+                q = tk_end(w, tk(w, eq + 1, e), e);
+            }
+        }
+    }
+    if (n == 0 and st[ERR_LINE] == 0) { reject(st, Y_FIELDS, k, NONE); }
+    return n;
+}
+
+/// The arguments of a transient analysis, from p: step and stop, up to two more numbers, and uic.
+pub fn tran_args(w: []const u8, st: []usize, k: usize, p: usize, e: usize) -> void {
+    var q : usize = p;
+    var n : usize = 0;
+    var go : bool = true;
+    while (go) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) {
+            go = false;
+        } else {
+            const te : usize = tk_end(w, t, e);
+            if (n >= 2 and ci_is(w, t, te, "uic")) {
+                q = te;
+            } else if (n < 4 and !is_punct(w[t]) and parse_num(w, t, te, st)) {
+                n = n + 1;
+                q = te;
+            } else {
+                reject(st, Y_NUMBER, k, t);
+                go = false;
+            }
+        }
+    }
+    if (n < 2) { reject(st, Y_FIELDS, k, NONE); }
+}
+
+pub fn directive(w: []const u8, st: []usize, k: usize, t0: usize, t1: usize, e: usize) -> void {
+    if (ci_is(w, t0, t1, ".subckt")) {
+        d_subckt(w, st, k, t1, e);
+    } else if (ci_is(w, t0, t1, ".ends")) {
+        d_ends(w, st, k, t1, e);
+    } else if (ci_is(w, t0, t1, ".end")) {
+        // a .end with more cards after it: a section break (mark_end counted it)
+    } else if (ci_is(w, t0, t1, ".control")) {
+        if (st[CUR] != NONE) { reject(st, Y_CTLIN, k, NONE); }
+        st[CTL_CARD] = k;
+    } else if (ci_is(w, t0, t1, ".lib")) {
+        st[N_LIB] = st[N_LIB] + 1;
+        if (!only_words(w, t1, e, 2)) { reject(st, Y_FIELDS, k, NONE); }
+    } else if (dir_is(w, t0, t1, ".include", ".inc")) {
+        st[N_INC] = st[N_INC] + 1;
+        if (!only_words(w, t1, e, 1)) { reject(st, Y_FIELDS, k, NONE); }
+    } else if (dir_is(w, t0, t1, ".options", ".option")) {
+        d_options(w, st, k, t1, e);
+    } else if (ci_cat(w, t0, t1, ".par", "am") or ci_cat(w, t0, t1, ".par", "ams")) {
+        st[N_PARAM] = st[N_PARAM] + pairs(w, st, k, t1, e, false);
+    } else if (ci_is(w, t0, t1, ".tran")) {
+        st[N_TRAN] = st[N_TRAN] + 1;
+        tran_args(w, st, k, t1, e);
+    } else if (ci_is(w, t0, t1, ".ic")) {
+        st[N_IC] = st[N_IC] + pairs(w, st, k, t1, e, true);
+    } else if (ci_is(w, t0, t1, ".nodeset")) {
+        st[N_NODESET] = st[N_NODESET] + pairs(w, st, k, t1, e, true);
+    } else if (ci_is(w, t0, t1, ".save")) {
+        st[N_SAVE] = st[N_SAVE] + 1;
+    } else if (ci_is(w, t0, t1, ".global")) {
+        st[N_GLOBAL] = st[N_GLOBAL] + 1;
+        if (word_at(w, t1, e, 0) == NONE) { reject(st, Y_FIELDS, k, NONE); }
+    } else {
+        reject(st, Y_DIRECTIVE, k, NONE);
+    }
+}
+
+/// Is the control command w[a..b] one that only plots, prints, saves or sets a variable?
+pub fn inert_command(w: []const u8, a: usize, b: usize) -> bool {
+    return ci_is(w, a, b, "let") or ci_is(w, a, b, "plot") or ci_is(w, a, b, "set") or ci_is(w, a, b, "unset") or ci_is(w, a, b, "write") or ci_is(w, a, b, "run") or ci_is(w, a, b, "print") or ci_is(w, a, b, "echo") or ci_is(w, a, b, "wrdata") or ci_is(w, a, b, "setplot") or ci_is(w, a, b, "display") or ci_is(w, a, b, "destroy") or ci_is(w, a, b, "quit") or ci_is(w, a, b, "exit") or ci_is(w, a, b, "save") or ci_is(w, a, b, "hardcopy");
+}
+
+/// A card inside .control ... .endc.
+pub fn control_card(w: []const u8, st: []usize, k: usize, t0: usize, t1: usize, e: usize) -> void {
+    if (ci_is(w, t0, t1, ".endc")) {
+        st[CTL_CARD] = NONE;
+    } else if (ci_is(w, t0, t1, "tran")) {
+        st[N_TRAN_CTL] = st[N_TRAN_CTL] + 1;
+        tran_args(w, st, k, t1, e);
+    } else if (inert_command(w, t0, t1)) {
+        st[N_CTLCMD] = st[N_CTLCMD] + 1;
+    } else {
+        reject(st, Y_CTL, k, t0);
+    }
+}
+
+pub fn scan_card(w: []const u8, st: []usize, k: usize) -> void {
+    const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+    const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+    const t0 : usize = tk(w, a, e);
+    const t1 : usize = tk_end(w, t0, e);
+    if (st[CTL_CARD] != NONE) {
+        st[CARD0 + k * CARD_SLOTS + C_SCOPE] = SCOPE_CTL;
+        control_card(w, st, k, t0, t1, e);
+        return;
+    }
+    st[CARD0 + k * CARD_SLOTS + C_SCOPE] = st[CUR];
+    const brace : usize = find_either(w, a, e, B_LBRACE, B_APOS);
+    if (brace != NONE) {
+        reject(st, Y_EXPR, k, brace);
+    } else if (w[t0] == B_DOT) {
+        directive(w, st, k, t0, t1, e);
+    } else {
+        element(w, st, k, t0, t1, e);
+    }
+}
+
+pub fn scan(w: []const u8, st: []usize) -> void {
+    var k : usize = 0;
+    while (k < st[SCAN_HI]) {
+        scan_card(w, st, k);
+        k = k + 1;
+    }
+    if (st[CUR] != NONE) {
+        reject(st, Y_OPEN, st[DEF0 + st[CUR] * DEF_SLOTS + D_FIRST], st[DEF0 + st[CUR] * DEF_SLOTS + D_NAME_A]);
+    }
+    if (st[CTL_CARD] != NONE) { reject(st, Y_CTLOPEN, st[CTL_CARD], NONE); }
+}
+
+// ---------------------------------------------------------------- resolving the X cards
+
+/// What the X card k names: a subcircuit of the deck (its index in st[DEF_HIT]), a PDK device, or nothing.
+pub fn x_class(w: []const u8, st: []usize, k: usize) -> usize {
+    if (!xparse(w, st, k)) { return X_NONE; }
+    const d : usize = find_def(w, st, st[XA], st[XB], st[CARD0 + k * CARD_SLOTS + C_SCOPE]);
+    if (d != NONE) { return X_SUB; }
+    return pdk_class(w, st[XA], st[XB]);
+}
+
+/// The m of the X card k, 1 when it has none (check_params has seen that it is a whole number).
+pub fn x_mult(w: []const u8, st: []usize, k: usize) -> usize {
+    const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+    var q : usize = st[XP];
+    while (q < e) {
+        const t : usize = tk(w, q, e);
+        if (t >= e) { return 1; }
+        const te : usize = tk_end(w, t, e);
+        const v : usize = tk(w, tk(w, te, e) + 1, e);
+        if (ci_is(w, t, te, "m") and parse_num(w, v, tk_end(w, v, e), st) and whole_mult(st[VM], st[VE], st[VS])) { return mult_value(st[VM], st[VE]); }
+        q = tk_end(w, v, e);
+    }
+    return 1;
+}
+
+/// Every X card against the definitions: a subcircuit takes as many nodes as it has ports and only m; a
+/// PDK device takes its node count; anything else is undefined. The cards of the source text are counted.
+pub fn resolve(w: []const u8, st: []usize) -> void {
+    var k : usize = 0;
+    while (k < st[SCAN_HI]) {
+        const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+        const t0 : usize = tk(w, a, st[CARD0 + k * CARD_SLOTS + C_B]);
+        if (st[CARD0 + k * CARD_SLOTS + C_SCOPE] != SCOPE_CTL and w[t0] != B_DOT and lower(w[t0]) == 120 and xparse(w, st, k)) {
+            const cls : usize = x_class(w, st, k);
+            if (cls == X_SUB) {
+                count(st, K_X);
+                if (st[XN] != st[DEF0 + st[DEF_HIT] * DEF_SLOTS + D_NPORTS]) { reject(st, Y_PORTS, k, st[XA]); }
+                if (st[XP] < st[CARD0 + k * CARD_SLOTS + C_B]) { check_params(w, st, k, st[XP], st[CARD0 + k * CARD_SLOTS + C_B], 1, true); }
+            } else if (cls == X_NONE) {
+                reject(st, Y_UNDEF, k, st[XA]);
+            } else if (cls == X_MIM) {
+                count(st, K_MIM);
+                st[N_MIM] = st[N_MIM] + 1;
+                if (st[XN] != 2) { reject(st, Y_PORTS, k, st[XA]); }
+            } else {
+                count(st, K_MOS);
+                if (cls == X_NMOS) { st[N_NMOS] = st[N_NMOS] + 1; } else { st[N_PMOS] = st[N_PMOS] + 1; }
+                if (st[XN] != 4) { reject(st, Y_PORTS, k, st[XA]); }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// ---------------------------------------------------------------- flattening
+
+/// Write the name w[a..b] lowercased.
+pub fn put_lower(w: []const u8, st: []usize, out: []u8, a: usize, b: usize) -> void {
+    var i : usize = a;
+    while (i < b) {
+        put(st, out, lower(w[i]));
+        i = i + 1;
+    }
+}
+
+/// Write the path scratch: the instance names above the level being read, each followed by a dot.
+pub fn put_trail(w: []const u8, st: []usize, out: []u8, plen: usize) -> void {
+    var i : usize = 0;
+    while (i < plen) {
+        put(st, out, w[st[WEND] + i]);
+        i = i + 1;
+    }
+}
+
+/// One leaf device of the flattened circuit: its hierarchical name, its kind and, for a PDK device, its
+/// model and the product of the m of the instance and of the instances above it.
+pub fn emit_leaf(w: []const u8, st: []usize, out: []u8, k: usize, plen: usize, kind: []const u8, weight: usize) -> void {
+    const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+    put_trail(w, st, out, plen);
+    put_lower(w, st, out, a, tk_end(w, a, st[CARD0 + k * CARD_SLOTS + C_B]));
+    puts(st, out, " ");
+    puts(st, out, kind);
+    if (weight > 0) {
+        puts(st, out, " ");
+        put_lower(w, st, out, st[XA], st[XB]);
+        puts(st, out, " m=");
+        put_num(st, out, weight);
+    }
+    put(st, out, B_NL);
+}
+
+/// Walk the cards lo..hi that belong to `scope` (a definition, or NONE for the top of the deck). A leaf
+/// is counted (when st[EMIT] is 0) or listed (when it is 1); an X card of a subcircuit opens a level: the
+/// instance name goes on the path scratch and the definition's cards are walked.
+pub fn flatten(w: []u8, st: []usize, out: []u8, scope: usize, lo: usize, hi: usize, plen: usize, depth: usize, mult: usize) -> void {
+    if (depth > st[DEPTH_SEEN]) { st[DEPTH_SEEN] = depth; }
+    if (depth > 0 and depth <= MAX_DEPTH) { st[STK + depth - 1] = scope; }
+    var k : usize = lo;
+    while (k < hi) {
+        const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+        const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+        const t0 : usize = tk(w, a, e);
+        if (st[CARD0 + k * CARD_SLOTS + C_SCOPE] == scope and w[t0] != B_DOT) {
+            const c : u8 = lower(w[t0]);
+            var kind : usize = K_COUNT;
+            var label : []const u8 = "";
+            if (c == 114) { kind = K_R; label = "r"; }
+            if (c == 99) { kind = K_C; label = "c"; }
+            if (c == 108) { kind = K_L; label = "l"; }
+            if (c == 118) { kind = K_V; label = "v"; }
+            if (c == 105) { kind = K_I; label = "i"; }
+            if (c == 101) { kind = K_E; label = "e"; }
+            if (kind < K_COUNT) {
+                if (st[EMIT] == 0) { st[FLAT + kind] = st[FLAT + kind] + 1; } else { emit_leaf(w, st, out, k, plen, label, 0); }
+            } else if (c == 120) {
+                const cls : usize = x_class(w, st, k);
+                if (cls == X_SUB) {
+                    const d : usize = st[DEF_HIT];
+                    const nm : usize = mult * x_mult(w, st, k);
+                    const nl : usize = tk_end(w, t0, e) - t0;
+                    var open : bool = false;
+                    var j : usize = 0;
+                    while (j < depth and j < MAX_DEPTH) {
+                        if (st[STK + j] == d) { open = true; }
+                        j = j + 1;
+                    }
+                    if (open) {
+                        reject(st, Y_RECUR, k, st[XA]);
+                    } else if (depth >= MAX_DEPTH) {
+                        reject(st, Y_DEPTH, k, st[XA]);
+                    } else if (nm > MAX_MULT) {
+                        reject(st, Y_MULT, k, NONE);
+                    } else if (st[WEND] + plen + nl + 1 > w.len) {
+                        reject(st, Y_SIZE, k, NONE);
+                    } else {
+                        if (st[EMIT] == 0) { st[FLAT + K_X] = st[FLAT + K_X] + 1; }
+                        var i : usize = 0;
+                        while (i < nl) {
+                            w[st[WEND] + plen + i] = lower(w[t0 + i]);
+                            i = i + 1;
+                        }
+                        w[st[WEND] + plen + nl] = B_DOT;
+                        flatten(w, st, out, d, st[DEF0 + d * DEF_SLOTS + D_FIRST] + 1, st[DEF0 + d * DEF_SLOTS + D_LAST], plen + nl + 1, depth + 1, nm);
+                    }
+                } else if (cls != X_NONE) {
+                    const weight : usize = mult * x_mult(w, st, k);
+                    if (weight > MAX_MULT) {
+                        reject(st, Y_MULT, k, NONE);
+                    } else if (st[EMIT] == 0) {
+                        if (cls == X_MIM) {
+                            st[FLAT + K_MIM] = st[FLAT + K_MIM] + 1;
+                            st[FLAT_MIM_W] = st[FLAT_MIM_W] + weight;
+                        } else {
+                            st[FLAT + K_MOS] = st[FLAT + K_MOS] + 1;
+                            st[FLAT_MOS_W] = st[FLAT_MOS_W] + weight;
+                        }
+                    } else if (cls == X_MIM) {
+                        emit_leaf(w, st, out, k, plen, "mim", weight);
+                    } else {
+                        emit_leaf(w, st, out, k, plen, "mos", weight);
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// ---------------------------------------------------------------- the inventory
+
+/// Write the number parse_num found: whole numbers up to 9 powers of ten in digits (50), anything else as
+/// <mantissa>e<exponent> (5e-8 is 50n); zero is 0.
+pub fn put_val(st: []usize, out: []u8) -> void {
+    if (st[VS] != 0) { put(st, out, B_MINUS); }
+    put_num(st, out, st[VM]);
+    if (st[VM] != 0 and st[VE] > EXP_BIAS and st[VE] - EXP_BIAS <= 9) {
+        var z : usize = st[VE] - EXP_BIAS;
+        while (z > 0) {
+            put(st, out, B_ZERO);
+            z = z - 1;
+        }
+    } else if (st[VM] != 0 and st[VE] != EXP_BIAS) {
+        puts(st, out, "e");
+        if (st[VE] < EXP_BIAS) {
+            put(st, out, B_MINUS);
+            put_num(st, out, EXP_BIAS - st[VE]);
+        } else {
+            put_num(st, out, st[VE] - EXP_BIAS);
+        }
+    }
+}
+
+/// Write the token w[t..] of card e, the way it was written.
+pub fn put_tok(w: []const u8, st: []usize, out: []u8, t: usize, e: usize) -> void {
+    put_text(w, st, out, t, tk_end(w, t, e), SHOW);
+}
+
+/// One `key=value` count line of the inventory.
+pub fn put_kv(st: []usize, out: []u8, key: []const u8, v: usize) -> void {
+    puts(st, out, key);
+    put_num(st, out, v);
+}
+
+/// The reason of the refusal in st, with the token it is about.
+pub fn put_why(w: []const u8, st: []usize, out: []u8) -> void {
+    const why : usize = st[ERR_WHY];
+    const k : usize = st[ERR_CARD];
+    const tok : usize = st[ERR_TOK];
+    if (why == Y_CONT) { puts(st, out, "continuation line with no card before it"); }
+    else if (why == Y_SIZE) { puts(st, out, "deck is larger than the reader's tables"); }
+    else if (why == Y_B) { puts(st, out, "B source not supported"); }
+    else if (why == Y_ELEMENT) {
+        const c : u8 = lower(w[st[CARD0 + k * CARD_SLOTS + C_A]]);
+        if (c >= 97 and c <= 122) { put(st, out, c - 32); } else { put(st, out, c); }
+        puts(st, out, " element not supported");
+    }
+    else if (why == Y_DIRECTIVE) {
+        put_tok(w, st, out, st[CARD0 + k * CARD_SLOTS + C_A], st[CARD0 + k * CARD_SLOTS + C_B]);
+        puts(st, out, " directive not supported");
+    }
+    else if (why == Y_EXPR) { puts(st, out, "expression in braces or quotes not supported"); }
+    else if (why == Y_FIELDS) { puts(st, out, "wrong number of fields"); }
+    else if (why == Y_E) { puts(st, out, "E source must be a VCVS: name n+ n- nc+ nc- gain"); }
+    else if (why == Y_SUBPARAM) { puts(st, out, "subcircuit parameters not supported"); }
+    else if (why == Y_ENDS) { puts(st, out, ".ends does not close a .subckt"); }
+    else if (why == Y_CTLOPEN) { puts(st, out, ".control without .endc"); }
+    else if (why == Y_CTLIN) { puts(st, out, ".control inside a .subckt not supported"); }
+    else if (why == Y_MULT) { puts(st, out, "m must be a whole number from 1 to 1000000000"); }
+    else {
+        if (why == Y_NUMBER) { puts(st, out, "not a literal number"); }
+        if (why == Y_PARAM) { puts(st, out, "parameter not supported"); }
+        if (why == Y_SOURCE) { puts(st, out, "source form not supported"); }
+        if (why == Y_UNDEF) { puts(st, out, "subcircuit or device model not defined"); }
+        if (why == Y_PORTS) { puts(st, out, "node count differs from the ports of"); }
+        if (why == Y_DEPTH) { puts(st, out, "subcircuit nesting deeper than 32 levels"); }
+        if (why == Y_RECUR) { puts(st, out, "subcircuit instantiates itself"); }
+        if (why == Y_OPEN) { puts(st, out, ".subckt without .ends"); }
+        if (why == Y_DUP) { puts(st, out, "subcircuit defined twice"); }
+        if (why == Y_CTL) { puts(st, out, "control command not supported"); }
+        if (why == Y_OPTION) { puts(st, out, "option not supported (only TEMP)"); }
+        if (tok != NONE and k != NONE) {
+            puts(st, out, ": ");
+            put_tok(w, st, out, tok, st[CARD0 + k * CARD_SLOTS + C_B]);
+        }
+    }
+}
+
+/// `line N: reason`, then the card.
+pub fn put_reject(w: []const u8, st: []usize, out: []u8) -> void {
+    puts(st, out, "line ");
+    put_num(st, out, st[ERR_LINE]);
+    puts(st, out, ": ");
+    put_why(w, st, out);
+    put(st, out, B_NL);
+    if (st[ERR_CARD] != NONE) {
+        puts(st, out, "  card: ");
+        put_text(w, st, out, st[CARD0 + st[ERR_CARD] * CARD_SLOTS + C_A], st[CARD0 + st[ERR_CARD] * CARD_SLOTS + C_B], SHOW);
+        put(st, out, B_NL);
+    }
+}
+
+/// The line of the inventory that says what a .tran card or a control `tran` asks: the step and stop as
+/// written, then as numbers.
+pub fn put_tran(w: []const u8, st: []usize, out: []u8, k: usize, t1: usize, label: []const u8) -> void {
+    const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+    const a : usize = tk(w, t1, e);
+    const b : usize = tk(w, tk_end(w, a, e), e);
+    puts(st, out, label);
+    puts(st, out, " ");
+    put_tok(w, st, out, a, e);
+    puts(st, out, " ");
+    put_tok(w, st, out, b, e);
+    puts(st, out, ": tstep ");
+    if (parse_num(w, a, tk_end(w, a, e), st)) { put_val(st, out); }
+    puts(st, out, " tstop ");
+    if (parse_num(w, b, tk_end(w, b, e), st)) { put_val(st, out); }
+    puts(st, out, " (line ");
+    put_num(st, out, st[CARD0 + k * CARD_SLOTS + C_LINE]);
+    puts(st, out, ")\n");
+}
+
+/// The cards that are lines of the inventory by themselves: transients, corners, includes.
+pub fn put_recorded(w: []const u8, st: []usize, out: []u8) -> void {
+    var corners : usize = 0;
+    var k : usize = 0;
+    while (k < st[SCAN_HI]) {
+        const a : usize = st[CARD0 + k * CARD_SLOTS + C_A];
+        const e : usize = st[CARD0 + k * CARD_SLOTS + C_B];
+        const t0 : usize = tk(w, a, e);
+        const t1 : usize = tk_end(w, t0, e);
+        if (st[CARD0 + k * CARD_SLOTS + C_SCOPE] == SCOPE_CTL) {
+            if (ci_is(w, t0, t1, "tran")) { put_tran(w, st, out, k, t1, "tran (control)"); }
+        } else if (ci_is(w, t0, t1, ".tran")) {
+            put_tran(w, st, out, k, t1, "tran (.tran card)");
+        } else if (ci_is(w, t0, t1, ".lib")) {
+            puts(st, out, "corner: ");
+            put_tok(w, st, out, word_at(w, t1, e, 1), e);
+            puts(st, out, " from ");
+            put_tok(w, st, out, word_at(w, t1, e, 0), e);
+            puts(st, out, " (not read)\n");
+            corners = corners + 1;
+        } else if (dir_is(w, t0, t1, ".include", ".inc")) {
+            puts(st, out, "include: ");
+            put_tok(w, st, out, word_at(w, t1, e, 0), e);
+            puts(st, out, " (not read)\n");
+        }
+        k = k + 1;
+    }
+    if (corners == 0) { puts(st, out, "corners: none\n"); }
+    if (st[TEMP_CARD] == NONE) {
+        puts(st, out, "temp: none\n");
+    } else {
+        const tc : usize = st[TEMP_CARD];
+        const e : usize = st[CARD0 + tc * CARD_SLOTS + C_B];
+        var q : usize = tk_end(w, st[CARD0 + tc * CARD_SLOTS + C_A], e);
+        var go : bool = true;
+        while (go) {
+            const t : usize = tk(w, q, e);
+            if (t >= e) { go = false; }
+            else if (ci_is(w, t, tk_end(w, t, e), "temp")) {
+                const v : usize = tk(w, tk(w, tk_end(w, t, e), e) + 1, e);
+                if (parse_num(w, v, tk_end(w, v, e), st)) {
+                    puts(st, out, "temp: ");
+                    put_val(st, out);
+                    puts(st, out, "\n");
+                }
+                go = false;
+            } else {
+                q = tk_end(w, t, e);
+            }
+        }
+    }
+}
+
+/// The inventory of a deck that was accepted.
+pub fn put_inventory(src: []const u8, w: []u8, st: []usize, out: []u8) -> void {
+    puts(st, out, "deck: ");
+    put_text(src, st, out, st[TITLE_A], st[TITLE_B], SHOW);
+    puts(st, out, "\nend: ");
+    if (st[END_N] == 0) {
+        puts(st, out, "no .end card");
+    } else {
+        puts(st, out, "first .end on line ");
+        put_num(st, out, st[END_LINE]);
+        puts(st, out, ", the deck ends with the last of ");
+        put_num(st, out, st[END_N]);
+        puts(st, out, ", cards after it ignored: ");
+        put_num(st, out, st[IGNORED]);
+    }
+    puts(st, out, "\ncards: ");
+    put_kv(st, out, "r=", st[SRC + K_R]);
+    put_kv(st, out, " c=", st[SRC + K_C]);
+    put_kv(st, out, " l=", st[SRC + K_L]);
+    put_kv(st, out, " v=", st[SRC + K_V]);
+    put_kv(st, out, " i=", st[SRC + K_I]);
+    put_kv(st, out, " e=", st[SRC + K_E]);
+    put_kv(st, out, " x=", st[N_XCARDS]);
+    put_kv(st, out, " (subcircuit instances ", st[SRC + K_X]);
+    put_kv(st, out, ", mos ", st[SRC + K_MOS]);
+    put_kv(st, out, ", mim ", st[SRC + K_MIM]);
+    puts(st, out, ")\nsources: ");
+    put_kv(st, out, "dc=", st[WAVE + WV_DC]);
+    put_kv(st, out, " pulse=", st[WAVE + WV_PULSE]);
+    put_kv(st, out, " sin=", st[WAVE + WV_SIN]);
+    put_kv(st, out, " pwl=", st[WAVE + WV_PWL]);
+    puts(st, out, "\nsubckt definitions: ");
+    put_num(st, out, st[NDEF]);
+    put(st, out, B_NL);
+    var d : usize = 0;
+    while (d < st[NDEF]) {
+        puts(st, out, "  subckt ");
+        put_lower(w, st, out, st[DEF0 + d * DEF_SLOTS + D_NAME_A], st[DEF0 + d * DEF_SLOTS + D_NAME_B]);
+        put_kv(st, out, " ports=", st[DEF0 + d * DEF_SLOTS + D_NPORTS]);
+        if (st[DEF0 + d * DEF_SLOTS + D_PARENT] != NONE) {
+            puts(st, out, " inside ");
+            put_lower(w, st, out, st[DEF0 + st[DEF0 + d * DEF_SLOTS + D_PARENT] * DEF_SLOTS + D_NAME_A], st[DEF0 + st[DEF0 + d * DEF_SLOTS + D_PARENT] * DEF_SLOTS + D_NAME_B]);
+        }
+        put(st, out, B_NL);
+        d = d + 1;
+    }
+    put_kv(st, out, "mos: sg13_lv_nmos=", st[N_NMOS]);
+    put_kv(st, out, " sg13_lv_pmos=", st[N_PMOS]);
+    put_kv(st, out, " total=", st[SRC + K_MOS]);
+    put_kv(st, out, "\nmim: cap_cmim=", st[N_MIM]);
+    put(st, out, B_NL);
+    put_recorded(w, st, out);
+    puts(st, out, "recorded, not evaluated: ");
+    put_kv(st, out, "lib=", st[N_LIB]);
+    put_kv(st, out, " include=", st[N_INC]);
+    put_kv(st, out, " parameters=", st[N_PARAM]);
+    put_kv(st, out, " options=", st[N_OPT]);
+    put_kv(st, out, " ic=", st[N_IC]);
+    put_kv(st, out, " nodeset=", st[N_NODESET]);
+    put_kv(st, out, " save=", st[N_SAVE]);
+    put_kv(st, out, " global=", st[N_GLOBAL]);
+    put_kv(st, out, " control-commands=", st[N_CTLCMD]);
+    puts(st, out, "\nflattened: ");
+    put_kv(st, out, "instances=", st[FLAT + K_R] + st[FLAT + K_C] + st[FLAT + K_L] + st[FLAT + K_V] + st[FLAT + K_I] + st[FLAT + K_E] + st[FLAT + K_MOS] + st[FLAT + K_MIM]);
+    put_kv(st, out, " r=", st[FLAT + K_R]);
+    put_kv(st, out, " c=", st[FLAT + K_C]);
+    put_kv(st, out, " l=", st[FLAT + K_L]);
+    put_kv(st, out, " v=", st[FLAT + K_V]);
+    put_kv(st, out, " i=", st[FLAT + K_I]);
+    put_kv(st, out, " e=", st[FLAT + K_E]);
+    put_kv(st, out, " mos=", st[FLAT + K_MOS]);
+    put_kv(st, out, " mim=", st[FLAT + K_MIM]);
+    put_kv(st, out, " levels=", st[FLAT + K_X]);
+    put_kv(st, out, " depth=", st[DEPTH_SEEN]);
+    puts(st, out, "\nflattened, weighted by m: ");
+    put_kv(st, out, "mos=", st[FLAT_MOS_W]);
+    put_kv(st, out, " mim=", st[FLAT_MIM_W]);
+    puts(st, out, "\ninstances:\n");
+    st[EMIT] = 1;
+    flatten(w, st, out, NONE, 0, st[SCAN_HI], 0, 0, 1);
+}
+
+/// Read a deck and write its inventory, or the refusal. `w` is the work buffer (see the header), `st` the
+/// state vector, zeroed by the caller. The result is the size of the output.
+pub fn inventory(src: []const u8, w: []u8, out: []u8, st: []usize) -> usize {
+    st[END_LAST] = NONE;
+    st[CUR] = NONE;
+    st[CTL_CARD] = NONE;
+    st[TEMP_CARD] = NONE;
+    st[DEF_HIT] = NONE;
+    prepare(src, w, st);
+    mark_end(w, st);
+    scan(w, st);
+    resolve(w, st);
+    st[EMIT] = 0;
+    flatten(w, st, out, NONE, 0, st[SCAN_HI], 0, 0, 1);
+    if (st[ERR_LINE] != 0) {
+        put_reject(w, st, out);
+    } else {
+        put_inventory(src, w, st, out);
+    }
+    return st[W];
+}
+
+/// Does what was written, out[0 .. w], hold the text `needle`? (The tests of the larger decks look for a
+/// line of the inventory, not for all of it.)
+pub fn has_text(w: usize, out: []const u8, needle: []const u8) -> bool {
+    var i : usize = 0;
+    while (i + needle.len <= w) {
+        var k : usize = 0;
+        while (k < needle.len and out[i + k] == needle[k]) { k = k + 1; }
+        if (k == needle.len) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- tests
+// Each test reads a small deck. The buffers are the caller's: a work buffer, an output buffer and a
+// state vector with room for 300 cards.
+
+test the_m0_rc_deck_is_one_r_one_c_one_pulse_source {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("RC lowpass\nV1 in 0 PULSE(0 1 0 1n 1n 5u 10u)\nR1 in out 1k\nC1 out 0 1n\n.tran 50n 10u\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(exit_code(&st) == 0);
+    assert(st[SRC + K_R] == 1);
+    assert(st[SRC + K_C] == 1);
+    assert(st[SRC + K_V] == 1);
+    assert(st[WAVE + WV_PULSE] == 1);
+    assert(st[N_TRAN] == 1);
+    assert(out_is(n, &out, 0, "deck: RC lowpass\nend: first .end on line 6, the deck ends with the last of 1, cards after it ignored: 0\ncards: r=1 c=1 l=0 v=1 i=0 e=0 x=0 (subcircuit instances 0, mos 0, mim 0)\nsources: dc=0 pulse=1 sin=0 pwl=0\nsubckt definitions: 0\nmos: sg13_lv_nmos=0 sg13_lv_pmos=0 total=0\nmim: cap_cmim=0\ntran (.tran card) 50n 10u: tstep 5e-8 tstop 1e-5 (line 5)\ncorners: none\ntemp: none\nrecorded, not evaluated: lib=0 include=0 parameters=0 options=0 ic=0 nodeset=0 save=0 global=0 control-commands=0\nflattened: instances=3 r=1 c=1 l=0 v=1 i=0 e=0 mos=0 mim=0 levels=0 depth=0\nflattened, weighted by m: mos=0 mim=0\ninstances:\nv1 v\nr1 r\nc1 c\n"));
+}
+
+test a_two_level_subcircuit_is_flattened_with_hierarchical_names {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("two level\n.subckt cell a b\nR1 a b 1k\nC1 b 0 1p\n.ends\n.subckt pair p q\nX1 p mid cell\nX2 mid q cell\n.ends\nX3 in out pair\nV1 in 0 1\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[NDEF] == 2);
+    assert(st[FLAT + K_R] == 2);
+    assert(st[FLAT + K_C] == 2);
+    assert(st[FLAT + K_V] == 1);
+    assert(st[FLAT + K_X] == 3);
+    assert(st[DEPTH_SEEN] == 2);
+    assert(out_is(n, &out, 0, "deck: two level\nend: first .end on line 12, the deck ends with the last of 1, cards after it ignored: 0\ncards: r=1 c=1 l=0 v=1 i=0 e=0 x=3 (subcircuit instances 3, mos 0, mim 0)\nsources: dc=1 pulse=0 sin=0 pwl=0\nsubckt definitions: 2\n  subckt cell ports=2\n  subckt pair ports=2\nmos: sg13_lv_nmos=0 sg13_lv_pmos=0 total=0\nmim: cap_cmim=0\ncorners: none\ntemp: none\nrecorded, not evaluated: lib=0 include=0 parameters=0 options=0 ic=0 nodeset=0 save=0 global=0 control-commands=0\nflattened: instances=5 r=2 c=2 l=0 v=1 i=0 e=0 mos=0 mim=0 levels=3 depth=2\nflattened, weighted by m: mos=0 mim=0\ninstances:\nx3.x1.r1 r\nx3.x1.c1 c\nx3.x2.r1 r\nx3.x2.c1 c\nv1 v\n"));
+}
+
+test continuation_comment_and_blank_lines_join_a_card {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("t\n* a comment\nR1 a b\n+ 2k ; trailing comment\n* a comment between continuation lines\n\n+ m=2\nC1 b 0 $ nothing\n+ 1p\n.end\n", &w, &out, &st);
+    assert(n > 0);
+    assert(st[ERR_LINE] == 0);
+    assert(st[NCARDS] == 3);
+    assert(out_is(st[CARD0 + C_B], &w, st[CARD0 + C_A], "R1 a b 2k m=2"));
+    assert(st[CARD0 + C_LINE] == 3);
+    assert(out_is(st[CARD0 + CARD_SLOTS + C_B], &w, st[CARD0 + CARD_SLOTS + C_A], "C1 b 0 1p"));
+    assert(st[CARD0 + CARD_SLOTS + C_LINE] == 8);
+    assert(st[SRC + K_R] == 1);
+    assert(st[SRC + K_C] == 1);
+}
+
+test si_suffixes_milli_is_not_mega {
+    var st : [64]usize = [0] ** 64;
+    assert(parse_num("1meg", 0, 4, &st));
+    assert(st[VM] == 1 and st[VE] == EXP_BIAS + 6 and st[VS] == 0);
+    assert(parse_num("1m", 0, 2, &st));
+    assert(st[VM] == 1 and st[VE] == EXP_BIAS - 3);
+    assert(parse_num("2.5MEG", 0, 6, &st));
+    assert(st[VM] == 25 and st[VE] == EXP_BIAS + 5);
+    assert(parse_num("4f", 0, 2, &st));
+    assert(st[VM] == 4 and st[VE] == EXP_BIAS - 15);
+    assert(parse_num("0.13u", 0, 5, &st));
+    assert(st[VM] == 13 and st[VE] == EXP_BIAS - 8);
+    assert(parse_num("16u", 0, 3, &st));
+    assert(st[VM] == 16 and st[VE] == EXP_BIAS - 6);
+    assert(parse_num("100", 0, 3, &st));
+    assert(st[VM] == 1 and st[VE] == EXP_BIAS + 2);
+    assert(parse_num("9.0e-6", 0, 6, &st));
+    assert(st[VM] == 9 and st[VE] == EXP_BIAS - 6);
+    assert(parse_num("1E-12", 0, 5, &st));
+    assert(st[VM] == 1 and st[VE] == EXP_BIAS - 12);
+    assert(parse_num("0.00048828125", 0, 13, &st));
+    assert(st[VM] == 48828125 and st[VE] == EXP_BIAS - 11);
+    assert(parse_num("10pF", 0, 4, &st));
+    assert(st[VM] == 1 and st[VE] == EXP_BIAS - 11);
+    assert(parse_num("-3k", 0, 3, &st));
+    assert(st[VM] == 3 and st[VE] == EXP_BIAS + 3 and st[VS] == 1);
+    assert(parse_num("1t", 0, 2, &st) and st[VE] == EXP_BIAS + 12);
+    assert(parse_num("1g", 0, 2, &st) and st[VE] == EXP_BIAS + 9);
+    assert(parse_num("1n", 0, 2, &st) and st[VE] == EXP_BIAS - 9);
+    assert(parse_num("1p", 0, 2, &st) and st[VE] == EXP_BIAS - 12);
+    assert(parse_num("5V", 0, 2, &st) and st[VM] == 5 and st[VE] == EXP_BIAS);
+    assert(parse_num("0", 0, 1, &st) and st[VM] == 0 and st[VE] == EXP_BIAS);
+}
+
+test numbers_that_are_not_literals_are_not_numbers {
+    var st : [64]usize = [0] ** 64;
+    assert(!parse_num("", 0, 0, &st));
+    assert(!parse_num("abc", 0, 3, &st));
+    assert(!parse_num("1mil", 0, 4, &st));
+    assert(!parse_num("1.2.3", 0, 5, &st));
+    assert(!parse_num("1k2", 0, 3, &st));
+    assert(!parse_num("1234567890123456789", 0, 19, &st));
+    assert(!parse_num("-", 0, 1, &st));
+    assert(!parse_num(".", 0, 1, &st));
+    assert(parse_num("123456789012345678", 0, 18, &st));
+}
+
+test a_control_block_reads_tran_and_ignores_post_processing {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("ctl\nV1 a 0 1\nR1 a 0 1k\n.control\ntran 0.1n 16u\nplot v(a)\nlet x = 1\nset filetype = ascii\n.endc\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[N_TRAN_CTL] == 1);
+    assert(st[N_TRAN] == 0);
+    assert(st[N_CTLCMD] == 3);
+    assert(st[SRC + K_L] == 0);
+    assert(st[SRC + K_V] == 1);
+    assert(st[SRC + K_R] == 1);
+    assert(has_text(n, &out, "tran (control) 0.1n 16u: tstep 1e-10 tstop 16e-6 (line 5)\n"));
+    assert(has_text(n, &out, "control-commands=3\n"));
+}
+
+test the_deck_ends_at_the_last_end_and_definitions_after_the_first_are_read {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("end rule\nX1 a b cell\n.end\n.subckt cell p q\nR1 p q 1\n.ends\n.end\njunk after the last end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[END_N] == 2);
+    assert(st[END_LINE] == 3);
+    assert(st[IGNORED] == 1);
+    assert(st[NDEF] == 1);
+    assert(st[FLAT + K_R] == 1);
+    assert(has_text(n, &out, "x1.r1 r\n"));
+    assert(has_text(n, &out, "first .end on line 3, the deck ends with the last of 2, cards after it ignored: 1\n"));
+}
+
+test one_end_with_definitions_after_it_leaves_the_instance_undefined {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("single end\nX1 a b cell\n.end\n.subckt cell p q\nR1 p q 1\n.ends\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 2);
+    assert(st[ERR_WHY] == Y_UNDEF);
+    assert(st[IGNORED] == 3);
+    assert(exit_code(&st) == 1);
+    assert(out_is(n, &out, 0, "line 2: subcircuit or device model not defined: cell\n  card: X1 a b cell\n"));
+}
+
+test a_b_source_is_refused_with_its_line {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("bsrc\nR1 a b 1k\nB1 out 0 v=v(a)*2\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 3);
+    assert(st[ERR_WHY] == Y_B);
+    assert(exit_code(&st) == 1);
+    assert(out_is(n, &out, 0, "line 3: B source not supported\n  card: B1 out 0 v=v(a)*2\n"));
+}
+
+test unsupported_cards_are_refused_and_the_same_deck_without_them_is_accepted {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n1 : usize = inventory("neg\nR1 a b 1k\n.measure tran x max v(a)\n.end\n", &w, &out, &st);
+    assert(out_is(n1, &out, 0, "line 3: .measure directive not supported\n  card: .measure tran x max v(a)\n"));
+    assert(exit_code(&st) == 1);
+    var st2 : [3000]usize = [0] ** 3000;
+    const n2 : usize = inventory("neg\nR1 a b {rval}\n.end\n", &w, &out, &st2);
+    assert(out_is(n2, &out, 0, "line 2: expression in braces or quotes not supported\n  card: R1 a b {rval}\n"));
+    var st3 : [3000]usize = [0] ** 3000;
+    const n3 : usize = inventory("neg\nR1 a b abc\n.end\n", &w, &out, &st3);
+    assert(out_is(n3, &out, 0, "line 2: not a literal number: abc\n  card: R1 a b abc\n"));
+    var st4 : [3000]usize = [0] ** 3000;
+    const n4 : usize = inventory("neg\nD1 a b dmod\n.end\n", &w, &out, &st4);
+    assert(out_is(n4, &out, 0, "line 2: D element not supported\n  card: D1 a b dmod\n"));
+    var st5 : [3000]usize = [0] ** 3000;
+    const n5 : usize = inventory("neg\n.model nmos1 nmos\n.end\n", &w, &out, &st5);
+    assert(n5 > 0);
+    assert(st5[ERR_LINE] == 2);
+    assert(st5[ERR_WHY] == Y_DIRECTIVE);
+    var st6 : [3000]usize = [0] ** 3000;
+    const n6 : usize = inventory("neg\n.func f(x) {x*2}\n.end\n", &w, &out, &st6);
+    assert(n6 > 0);
+    assert(st6[ERR_LINE] == 2);
+    assert(st6[ERR_WHY] == Y_EXPR);
+    var ok : [3000]usize = [0] ** 3000;
+    const n7 : usize = inventory("neg\nR1 a b 1k\n.end\n", &w, &out, &ok);
+    assert(n7 > 0);
+    assert(ok[ERR_LINE] == 0);
+    assert(exit_code(&ok) == 0);
+    assert(ok[SRC + K_R] == 1);
+}
+
+test the_earliest_refusal_is_the_one_reported {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("order\nX1 a b nosuch\nR1 a b 1k\nB1 x y v=1\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 2);
+    assert(st[ERR_WHY] == Y_UNDEF);
+    assert(out_is(n, &out, 0, "line 2: subcircuit or device model not defined: nosuch\n  card: X1 a b nosuch\n"));
+}
+
+test nested_definitions_are_scoped_to_the_definition_that_holds_them {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("nested\n.subckt outer a b\n.subckt inner p q\nR1 p q 1k\n.ends inner\nX1 a b inner\nX2 b a inner\n.ends outer\nX1 n1 n2 outer\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[NDEF] == 2);
+    assert(st[FLAT + K_R] == 2);
+    assert(has_text(n, &out, "  subckt inner ports=2 inside outer\n"));
+    assert(has_text(n, &out, "x1.x1.r1 r\nx1.x2.r1 r\n"));
+    var st2 : [3000]usize = [0] ** 3000;
+    const n2 : usize = inventory("scope\n.subckt outer a b\n.subckt inner p q\nR1 p q 1\n.ends\n.ends\nX1 n1 n2 inner\n.end\n", &w, &out, &st2);
+    assert(n2 > 0);
+    assert(st2[ERR_LINE] == 7);
+    assert(st2[ERR_WHY] == Y_UNDEF);
+}
+
+test pdk_devices_are_counted_by_model_and_weighted_by_m {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("mos\nXM1 d g s b sg13_lv_nmos w=1.0u l=0.13u ng=1 m=4\nXM2 d g s b sg13_lv_pmos w=3.0u l=0.45u ng=1 m=2\nXC1 a b cap_cmim w=9.0e-6 l=9.0e-6 m=1\n.subckt blk a b c d\nXM1 a b c d sg13_lv_nmos w=1u l=1u m=3\n.ends\nX1 n1 n2 n3 n4 blk m=5\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[N_NMOS] == 2);
+    assert(st[N_PMOS] == 1);
+    assert(st[N_MIM] == 1);
+    assert(st[SRC + K_MOS] == 3);
+    assert(st[SRC + K_X] == 1);
+    assert(st[FLAT + K_MOS] == 3);
+    assert(st[FLAT_MOS_W] == 21);
+    assert(st[FLAT + K_MIM] == 1);
+    assert(st[FLAT_MIM_W] == 1);
+    assert(has_text(n, &out, "xm1 mos sg13_lv_nmos m=4\n"));
+    assert(has_text(n, &out, "xm2 mos sg13_lv_pmos m=2\n"));
+    assert(has_text(n, &out, "xc1 mim cap_cmim m=1\n"));
+    assert(has_text(n, &out, "x1.xm1 mos sg13_lv_nmos m=15\n"));
+    assert(has_text(n, &out, "mos: sg13_lv_nmos=2 sg13_lv_pmos=1 total=3\n"));
+    assert(has_text(n, &out, "flattened, weighted by m: mos=21 mim=1\n"));
+}
+
+test instance_shapes_that_do_not_match_their_definition_are_refused {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var a : [3000]usize = [0] ** 3000;
+    const na : usize = inventory("ports\n.subckt blk a b\nR1 a b 1\n.ends\nX1 n1 blk\n.end\n", &w, &out, &a);
+    assert(na > 0);
+    assert(a[ERR_LINE] == 5);
+    assert(a[ERR_WHY] == Y_PORTS);
+    var b : [3000]usize = [0] ** 3000;
+    const nb : usize = inventory("extra\n.subckt blk a b\nR1 a b 1\n.ends\nX1 n1 n2 blk w=1u\n.end\n", &w, &out, &b);
+    assert(nb > 0);
+    assert(b[ERR_LINE] == 5);
+    assert(b[ERR_WHY] == Y_PARAM);
+    var c : [3000]usize = [0] ** 3000;
+    const nc : usize = inventory("frac\nXM1 d g s b sg13_lv_nmos m=1.5\n.end\n", &w, &out, &c);
+    assert(nc > 0);
+    assert(c[ERR_LINE] == 2);
+    assert(c[ERR_WHY] == Y_MULT);
+    var d : [3000]usize = [0] ** 3000;
+    const nd : usize = inventory("nodes\nXM1 d g s sg13_lv_nmos\n.end\n", &w, &out, &d);
+    assert(nd > 0);
+    assert(d[ERR_LINE] == 2);
+    assert(d[ERR_WHY] == Y_PORTS);
+    var e : [3000]usize = [0] ** 3000;
+    const ne : usize = inventory("shadow\n.subckt sg13_lv_nmos d g s b\nR1 d s 1\n.ends\nXM1 a b c d sg13_lv_nmos\n.end\n", &w, &out, &e);
+    assert(ne > 0);
+    assert(e[ERR_LINE] == 0);
+    assert(e[FLAT + K_MOS] == 0);
+    assert(e[FLAT + K_R] == 1);
+    assert(e[N_NMOS] == 0);
+}
+
+test lib_include_options_param_ic_and_global_are_recorded_not_followed {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("corners and options\n.lib /pdk/models.lib mos_tt\n.lib /pdk/cap.lib cap_typ\n.include /tmp/extra.inc\n.options TEMP = 50\n.PARAM vdd=1.5 tp=2n\n.ic v(x1.n1)=0 v(n2)=0.5\n.nodeset v(a)=1\n.global GND\n.save v(a) i(v1)\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(out_is(n, &out, 0, "deck: corners and options\nend: first .end on line 11, the deck ends with the last of 1, cards after it ignored: 0\ncards: r=0 c=0 l=0 v=0 i=0 e=0 x=0 (subcircuit instances 0, mos 0, mim 0)\nsources: dc=0 pulse=0 sin=0 pwl=0\nsubckt definitions: 0\nmos: sg13_lv_nmos=0 sg13_lv_pmos=0 total=0\nmim: cap_cmim=0\ncorner: mos_tt from /pdk/models.lib (not read)\ncorner: cap_typ from /pdk/cap.lib (not read)\ninclude: /tmp/extra.inc (not read)\ntemp: 50\nrecorded, not evaluated: lib=2 include=1 parameters=2 options=1 ic=2 nodeset=1 save=1 global=1 control-commands=0\nflattened: instances=0 r=0 c=0 l=0 v=0 i=0 e=0 mos=0 mim=0 levels=0 depth=0\nflattened, weighted by m: mos=0 mim=0\ninstances:\n"));
+    var a : [3000]usize = [0] ** 3000;
+    const na : usize = inventory("opt\n.options reltol=1m\n.end\n", &w, &out, &a);
+    assert(na > 0);
+    assert(a[ERR_LINE] == 2);
+    assert(a[ERR_WHY] == Y_OPTION);
+    var b : [3000]usize = [0] ** 3000;
+    const nb : usize = inventory("par\n.PARAM x={1+2}\n.end\n", &w, &out, &b);
+    assert(nb > 0);
+    assert(b[ERR_LINE] == 2);
+    assert(b[ERR_WHY] == Y_EXPR);
+    var c : [3000]usize = [0] ** 3000;
+    const nc : usize = inventory("lib\n.lib mos_tt\n.end\n", &w, &out, &c);
+    assert(nc > 0);
+    assert(c[ERR_LINE] == 2);
+    assert(c[ERR_WHY] == Y_FIELDS);
+}
+
+test the_first_line_is_the_title_and_never_a_card {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("R1 a b 1k\nR2 a b 2k\n.end\n", &w, &out, &st);
+    assert(st[SRC + K_R] == 1);
+    assert(out_is(16, &out, 0, "deck: R1 a b 1k\n"));
+    assert(n > 16);
+}
+
+test sources_take_dc_pulse_sin_and_pwl_and_a_vcvs_takes_a_gain {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("src\nV1 a 0 DC 1.5\nV2 a 0 1.5\nV3 a 0 SIN(0 0.6 62.5k)\nV4 a 0 PWL(0 0 1n 1 2n 0)\nI1 a 0 DC 1m\nV5 a 0 DC 0 PULSE(0 1 1n)\nE1 x y a 0 2\n.end\n", &w, &out, &st);
+    assert(n > 0);
+    assert(st[ERR_LINE] == 0);
+    assert(st[SRC + K_V] == 5);
+    assert(st[SRC + K_I] == 1);
+    assert(st[SRC + K_E] == 1);
+    assert(st[WAVE + WV_DC] == 3);
+    assert(st[WAVE + WV_SIN] == 1);
+    assert(st[WAVE + WV_PWL] == 1);
+    assert(st[WAVE + WV_PULSE] == 1);
+    var a : [3000]usize = [0] ** 3000;
+    const na : usize = inventory("src\nV1 a 0 AC 1\n.end\n", &w, &out, &a);
+    assert(na > 0);
+    assert(a[ERR_LINE] == 2 and a[ERR_WHY] == Y_SOURCE);
+    var b : [3000]usize = [0] ** 3000;
+    const nb : usize = inventory("src\nV1 a 0 PULSE(0)\n.end\n", &w, &out, &b);
+    assert(nb > 0);
+    assert(b[ERR_LINE] == 2 and b[ERR_WHY] == Y_FIELDS);
+    var c : [3000]usize = [0] ** 3000;
+    const nc : usize = inventory("src\nV1 a 0 PWL(0 0 1n)\n.end\n", &w, &out, &c);
+    assert(nc > 0);
+    assert(c[ERR_LINE] == 2 and c[ERR_WHY] == Y_FIELDS);
+    var d : [3000]usize = [0] ** 3000;
+    const nd : usize = inventory("src\nE1 a b c d\n.end\n", &w, &out, &d);
+    assert(nd > 0);
+    assert(d[ERR_LINE] == 2 and d[ERR_WHY] == Y_E);
+    var e : [3000]usize = [0] ** 3000;
+    const ne : usize = inventory("src\nE1 a b POLY(1) c d 0 1\n.end\n", &w, &out, &e);
+    assert(ne > 0);
+    assert(e[ERR_LINE] == 2 and e[ERR_WHY] == Y_E);
+    var f : [3000]usize = [0] ** 3000;
+    const nf : usize = inventory("src\nV1 a 0 PULSE(0 1 x)\n.end\n", &w, &out, &f);
+    assert(nf > 0);
+    assert(f[ERR_LINE] == 2 and f[ERR_WHY] == Y_NUMBER);
+}
+
+test broken_structure_is_refused_where_it_starts {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var a : [3000]usize = [0] ** 3000;
+    const na : usize = inventory("open\n.subckt a x\nR1 x 0 1\n", &w, &out, &a);
+    assert(na > 0);
+    assert(a[ERR_LINE] == 2 and a[ERR_WHY] == Y_OPEN);
+    var b : [3000]usize = [0] ** 3000;
+    const nb : usize = inventory("stray\n.ends\n.end\n", &w, &out, &b);
+    assert(nb > 0);
+    assert(b[ERR_LINE] == 2 and b[ERR_WHY] == Y_ENDS);
+    var c : [3000]usize = [0] ** 3000;
+    const nc : usize = inventory("dup\n.subckt a x\nR1 x 0 1\n.ends\n.subckt a y\nR1 y 0 1\n.ends\n.end\n", &w, &out, &c);
+    assert(nc > 0);
+    assert(c[ERR_LINE] == 5 and c[ERR_WHY] == Y_DUP);
+    var d : [3000]usize = [0] ** 3000;
+    const nd : usize = inventory("rec\n.subckt r a\nX1 a r\nX2 a r\n.ends\nX1 n r\n.end\n", &w, &out, &d);
+    assert(nd > 0);
+    assert(d[ERR_LINE] == 3 and d[ERR_WHY] == Y_RECUR);
+    var e : [3000]usize = [0] ** 3000;
+    const ne : usize = inventory("argument\n.subckt a x w=1u\nR1 x 0 1\n.ends\n.end\n", &w, &out, &e);
+    assert(ne > 0);
+    assert(e[ERR_LINE] == 2 and e[ERR_WHY] == Y_SUBPARAM);
+    var f : [3000]usize = [0] ** 3000;
+    const nf : usize = inventory("ctl\n.control\nac dec 10 1 1k\n.endc\n.end\n", &w, &out, &f);
+    assert(nf > 0);
+    assert(f[ERR_LINE] == 3 and f[ERR_WHY] == Y_CTL);
+    var g : [3000]usize = [0] ** 3000;
+    const ng : usize = inventory("ctl\n.control\ntran 1n 1u\n.end\n", &w, &out, &g);
+    assert(ng > 0);
+    assert(g[ERR_LINE] == 2 and g[ERR_WHY] == Y_CTLOPEN);
+    var h : [3000]usize = [0] ** 3000;
+    const nh : usize = inventory("cont\n+ foo\n.end\n", &w, &out, &h);
+    assert(nh > 0);
+    assert(h[ERR_LINE] == 2 and h[ERR_WHY] == Y_CONT);
+}
+
+test netlist_file_names_are_told_by_extension {
+    assert(is_spice_name("top.spice"));
+    assert(is_spice_name("rc.cir"));
+    assert(is_spice_name("amp.sp"));
+    assert(is_spice_name("RC.CIR"));
+    assert(is_spice_name("dir/Deck.SP"));
+    assert(!is_spice_name("lib.rs"));
+    assert(!is_spice_name("top.spice.bak"));
+    assert(!is_spice_name("spice"));
+    assert(!is_spice_name(""));
+}
+
+test crlf_tabs_a_missing_final_newline_and_an_empty_deck_are_read {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    // a t27 string literal has no \r escape: ~ stands for the carriage return in the literal
+    var src : [64]u8 = undefined;
+    const lit : []const u8 = "crlf~\n\tR1\ta\tb\t1k~\nC1 b 0 1p~\n.end";
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (lit[i] == 126) { src[i] = 13; } else { src[i] = lit[i]; }
+        i = i + 1;
+    }
+    const n : usize = inventory(src[0 .. lit.len], &w, &out, &st);
+    assert(n > 0);
+    assert(st[ERR_LINE] == 0);
+    assert(st[SRC + K_R] == 1);
+    assert(st[SRC + K_C] == 1);
+    assert(st[END_N] == 1);
+    assert(out_is(st[CARD0 + C_B], &w, st[CARD0 + C_A], "R1\ta\tb\t1k"));
+    var st2 : [3000]usize = [0] ** 3000;
+    const n2 : usize = inventory("", &w, &out, &st2);
+    assert(st2[ERR_LINE] == 0);
+    assert(st2[NCARDS] == 0);
+    assert(has_text(n2, &out, "end: no .end card\n"));
+}
+
+test a_deck_larger_than_the_tables_is_refused_not_cut {
+    var w : [1024]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var small : [1700]usize = [0] ** 1700;
+    const n : usize = inventory("big\nR1 a b 1\nR2 a b 1\nR3 a b 1\nR4 a b 1\nR5 a b 1\nR6 a b 1\nR7 a b 1\nR8 a b 1\nR9 a b 1\nR10 a b 1\nR11 a b 1\nR12 a b 1\nR13 a b 1\nR14 a b 1\nR15 a b 1\n.end\n", &w, &out, &small);
+    assert(n > 0);
+    assert(small[ERR_WHY] == Y_SIZE);
+    assert(exit_code(&small) == 1);
+    var tiny : [16]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n2 : usize = inventory("big\nR1 a b 1k\nR2 a b 1k\n.end\n", &tiny, &out, &st);
+    assert(n2 > 0);
+    assert(st[ERR_WHY] == Y_SIZE);
+    assert(st[ERR_LINE] == 3);
+}
+
+test the_sar_adc_dac_capacitors_bracketed_names_m_up_to_36_and_both_corners {
+    var w : [2048]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    const n : usize = inventory("sar\n.lib cornerMOSlv.lib mos_tt\n.lib cornerCAP.lib cap_typ\n.subckt dacarr vout b1 b2\nXC2[3] net1 b1 cap_cmim w=9.0e-6 l=9.0e-6 m=1\nXC2[4] net1 b2 cap_cmim w=9.0e-6 l=9.0e-6 m=1\nXM1 vout b1 net1 net1 sg13_lv_nmos w=1.0u l=0.45u ng=1 m=36\n.ends\nX17 vdn n1 n2 dacarr\nX18 vdp n1 n2 dacarr\n.end\n", &w, &out, &st);
+    assert(st[ERR_LINE] == 0);
+    assert(st[N_MIM] == 2);
+    assert(st[SRC + K_MIM] == 2);
+    assert(st[FLAT + K_MIM] == 4);
+    assert(st[FLAT_MIM_W] == 4);
+    assert(st[FLAT + K_MOS] == 2);
+    assert(st[FLAT_MOS_W] == 72);
+    assert(has_text(n, &out, "mim: cap_cmim=2\n"));
+    assert(has_text(n, &out, "corner: mos_tt from cornerMOSlv.lib (not read)\ncorner: cap_typ from cornerCAP.lib (not read)\n"));
+    assert(has_text(n, &out, "x17.xc2[3] mim cap_cmim m=1\n"));
+    assert(has_text(n, &out, "x18.xc2[4] mim cap_cmim m=1\n"));
+    assert(has_text(n, &out, "x18.xm1 mos sg13_lv_nmos m=36\n"));
+    assert(has_text(n, &out, "flattened, weighted by m: mos=72 mim=4\n"));
+}
