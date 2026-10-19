@@ -90,7 +90,7 @@ the diagram core in detail, then the other surfaces and the topic-map applicatio
 | Surface: particle reels and stills | `specs/t27f/token_floor*.t27`, `lesson_reel.t27`, `reel_particles*.t27` | rendered on the Railway lab (lesson 1 EN and RU); no renderer in the repo, no MCP tool yet |
 | Surface: honeycomb map video and deck | `specs/t27f/reel.t27`, `deck.t27` | spec; stills only, through `t27f_view` |
 | Application: topic map (#1677) | `specs/t27f/topic_engine.t27`, `topic_reel.t27` | spec; drawn through the map surface; procedure below |
-| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. No renderer draws a plan yet (R3), and `lesson_reel` still draws token_floor (R4). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
+| Application: content factory (epic t27#10560) | `specs/t27f/reel_factory.t27` (t27#10561) | spec with tests: an item's code and title, read keyword by keyword, give 11 features. Those pick 1 of 12 scene archetypes (best pair first, cap 4, no repeat within 2 items, then the least-used generic scene) plus an accent, a motion, a layout and 8 output formats. R3 (t27#10571) draws it: `scene_raster`, `scene_lex`, `scene_bg` plus one `scene_<archetype>.t27` per archetype (code, graph, tests, trit, loop, branch, data, links, guard, title, task, map), each `<name>_px(t, acc, n, x, y)` over the lesson's own content on a 360 x 640 canvas, dispatched by `scene_still.pixel`; `still_gate.t27` renders the 27 course-0 stills (108 x 192 luma), scores all 351 pairs with a block SSIM and refuses above 850 permille, measured worst pair lessons 8 and 20 at 607. `lesson_reel` still draws token_floor (R4). SSIM on luma sees layout and contrast, not meaning. The floor modulo is `fmod` (t27b rejects `@mod`). Lessons: read the plan's spread over the whole course before trusting it. A greedy walk in course order gave 7 lessons one scene. Code counts alone handed lesson 8 the tests scene over "A test block". Gate: `tri factory`. The plan prints from a separate module, `specs/t27f/reel_factory_plan.t27` (t27#10573): `t27c gen` it, then run the zig (t27c has no `run`). Names come from the factory's comma lists, so the law module keeps no `main`. Traps: the lab's `/root/t27` t27b can predate #10455 and refuse `std.debug.print` that master accepts, so build a fresh t27b in its own worktree with its own `CARGO_TARGET_DIR` before you call a print unsupported. `t27c seal --save` needs zig on PATH (`/opt/zig`). A base64 line fetched back from fs-lab merges with the Railway warning, so wrap it as `B64:...:END`. A new `tri` arm must start its own line (`  name)`) or the documented-commands checker misses it |
 | Related | trinity#1647 dashboards, #1652 MVP research, #1653 three skills, #1655 evolution runtime | open |
 
 When asked "how is T27F going", report against the core rows first, then the other surfaces.
@@ -220,6 +220,22 @@ Traps from this tick (ffmpeg on the lab):
    `lit_len` that was red on `duplicate-bodies` until #10688. Reuse the existing body through
    `use`, and do not `--bless` a copy you made by accident.
 
+## Visual in every output (Claude Code and TRI CLAW)
+
+**The rule is `specs/t27mcp/visual_output.t27`** (its `RULE_CLAUDE_CODE` and `RULE_TRI_CLAW` lines
+are what each host reads). **Its particle-still layer is `specs/claw/visual_output.t27`.** This
+section is the order of steps; which answer carries which visual and how it reaches each host are
+the specs', not repeated here.
+
+1. Decide the answer's kind (`K_*` in the t27mcp spec). A one-sentence reply or a question back
+   goes without a visual.
+2. Spec, flow or numbers: draw from t27f tool rows (`t27f_outline`, `t27f_graph`, `t27f_view`),
+   labelled, with the legend and the source file, as `answer_verdict` checks.
+3. A report of a piece of work: a particle still (`takes_still`). Render the reel on the Railway lab
+   (never the Mac), take the frame at `STILL_MS` with `ffmpeg -ss 9 -frames:v 1`, and bring it into
+   the session folder (`out-reels/`, gitignored, never `git add`).
+4. Anything not made: say which and why in the answer. Never show an older file as this turn's.
+
 ## Application: topic map (gHashTag/trinity#1677)
 
 Use this part when the user gives a topic or a client brief, not a spec.
@@ -342,6 +358,43 @@ Before you change a uniqueness rule, measure what it can draw from:
 - **Write PR bodies with the Write tool.** The Mac hook matches words in a
   shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
   pass `--body-file`.
+
+### Preview the factory's stills as a video (t27#10571)
+
+The owner asks to see intermediate videos, not only numbers. Show one every time a renderer changes.
+
+1. **Write a lab-only printer.** It needs a `main` that loops `t` over `TOPICS`. For each lesson it
+   takes `arche`, `accent`, `motion`, `layout` and `content(t, a)` from `reel_factory`. It then
+   prints a plain PPM (`P3`, 360 x 640) of `scene_still.pixel(...)` through `scene_raster`'s
+   `red`, `green` and `blue`. Give it one trivial `test`.
+2. **Generate and build.** Run `t27c gen` on it, then `zig build-exe -lc -O ReleaseFast`.
+3. **Run it.** `./d 2> all.ppm`: `std.debug.print` writes to stderr. All 27 stills take 4 s and
+   56 MB.
+4. **Split and convert.** Split the dump on each `P3` line with awk. Convert each part to PNG with
+   ffmpeg, which reads P3.
+5. **Make the video and the sheet.**
+   - Video: `ffmpeg -framerate 1.25 -i s%02d.png` with
+     `-vf scale=720:1280:flags=neighbor,fps=30,format=yuv420p` and libx264. This gives 21.6 s.
+   - Contact sheet: `-vf scale=120:213,tile=9x3 -frames:v 1`.
+6. **Fetch them.** Bring both back wrapped as `B64:...:END`, and compare sha256 on both ends.
+   Put them in the session's notes folder, never in the repo or `out-reels/`.
+
+Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 to 32 KB.
+
+**Traps:**
+
+- **A Mac session may not read images.** A hook can block image reads because the upstream
+  provider refuses them. Check the stills by numbers (colour count, file size, ffprobe) and open
+  the file for the owner in the file pane.
+- **WIP commits can sink a PR.** A WIP commit whose message names `#N` without a linking keyword
+  fails L1. `l1-traceability.yml` checks every non-merge commit, and the history cannot be
+  rewritten. Carry the work instead:
+  1. Make a new branch from master.
+  2. `git read-tree -m -u HEAD <merged-branch>`.
+  3. Make one commit with `Closes #N`, open a new PR, and close the old one with a pointer.
+- **Merge in the right direction.** Merging master into an old branch can trip the pre-commit
+  `foreign-budget` hook on master's own Rust lines (t27#10414). Merge the old branch into a
+  master-based branch instead. The result still fast-forwards the old branch.
 
 ## Check the whole corpus for import cycles (t27#10693)
 
