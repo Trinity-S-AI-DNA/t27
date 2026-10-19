@@ -770,12 +770,11 @@ fn lower_mode<'a>(
     l.nfuncs = next_id;
     let mut const_names: Vec<String> = l.const_nodes.keys().cloned().collect();
     const_names.sort();
-    let hw: HashSet<&str> = marked(items.iter().copied(), vp::hw_consts).map(|n| n.name.as_str()).collect();
     for name in const_names {
-        if l.unreferenced_tuple_const(&items, &name) || hw.contains(name.as_str()) || l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
+        if l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
             continue;
         }
-        let _ = l.global(&name);
+        l.eager_const(&name);
     }
     for node in std::mem::take(&mut l.var_nodes) {
         if l.module_var(node).is_err() {
@@ -7339,7 +7338,6 @@ fn flat<'n>(ns: impl IntoIterator<Item = &'n Node>) -> (Vec<u8>, Vec<u8>) {
 }
 const _: () = assert!(NodeKind::StmtExpr as u8 == aw::K_STMT_EXPR && NodeKind::ExprRange as u8 == aw::K_EXPR_RANGE);
 #[path = "../../../gen/rust/tri/t27b/verilog_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod ve; // t27c gen-rust of specs/tri/t27b/verilog_emit.t27: `t27b verilog` (#8796)
-#[path = "../../../gen/rust/tri/t27b/verilog_plan.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod vp; // t27c gen-rust of specs/tri/t27b/verilog_plan.t27: hw_consts, the consts only the hardware reads
 #[path = "../../../gen/rust/tri/t27b/ts_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod tse; // specs/tri/t27b/ts_emit.t27: `t27b ts` (#9994)
 /// `t27b verilog` (`t27b ts` when `ts`): `flat`'s bytes and per node four u32 (flags 1 var, 2 pub; line; its params' span in `p`).
 pub fn verilog(ast: &Node, ts: bool) -> Result<String, String> {
