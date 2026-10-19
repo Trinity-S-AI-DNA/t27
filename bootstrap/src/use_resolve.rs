@@ -606,10 +606,10 @@ fn consumed_use(line: &str, specs_root: &Path, pulled: &HashSet<String>) -> Opti
     Some(format!("{}use {}{{{}}}; // {}", indent, prefix, kept.join(", "), note))
 }
 
-fn renamed(text: &str, name: &str, origin: &str) -> String {
-    let n = use_splice::rename_ident(text.as_bytes(), name.as_bytes(), origin.as_bytes(), &mut [], 0);
-    let mut out = vec![0u8; n];
-    use_splice::rename_ident(text.as_bytes(), name.as_bytes(), origin.as_bytes(), &mut out, n);
+fn sized(f: impl Fn(&mut [u8], usize) -> usize) -> String {
+    let mut out = vec![0u8; f(&mut [], 0)];
+    let n = out.len();
+    f(&mut out, n);
     String::from_utf8(out).unwrap_or_default()
 }
 pub fn resolve(input_path: &Path, source: &str) -> String {
@@ -680,8 +680,7 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     let mut pulled_names: HashSet<String> = HashSet::new();
     let mut ambiguous: Vec<(String, Vec<String>)> = Vec::new();
     let mut scoped: HashMap<(String, String), String> = HashMap::new();
-    let bare = qualified.iter().fold(source.to_string(), |s, (q, n, _)| s.replace(q.as_str(), &q[..q.len() - n.len()]));
-    let mut frontier: HashSet<(String, String)> = identifiers(&bare).into_iter().map(|n| (n, String::new())).collect();
+    let mut frontier: HashSet<(String, String)> = identifiers(&qualified.iter().fold(source.to_string(), |s, (q, n, _)| s.replace(q.as_str(), &q[..q.len() - n.len()]))).into_iter().map(|n| (n, String::new())).collect();
     for (q, name, _) in &qualified {
         frontier.insert((name.clone(), format!("={}", q)));
     }
@@ -728,11 +727,8 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
                     origins.sort();
                     let at = use_splice::scope_index(origins.join("\n").as_bytes(), ctx.as_bytes(), imports.get(&ctx).map_or("", String::as_str).as_bytes());
                     if let Some(d) = usize::try_from(at).ok().and_then(|i| distinct.get(i)) {
-                        for c in [&ctx, &d.origin] { scoped.insert((c.clone(), name.clone()), d.origin.clone()); }
-                        if pulled_names.insert(format!("{}::{}", d.origin, name)) {
-                            next.extend(identifiers(&d.text).into_iter().map(|n| (n, d.origin.clone())));
-                            pulled.push((*d).clone());
-                        }
+                        scoped.insert((ctx.clone(), name.clone()), d.origin.clone());
+                        if pulled_names.insert(format!("{}::{}", d.origin, name)) { next.extend(identifiers(&d.text).into_iter().map(|n| (n, d.origin.clone()))); pulled.push((*d).clone()); }
                         continue;
                     }
                     ambiguous.push((name.clone(), origins));
@@ -791,7 +787,7 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     // local one; otherwise the qualifier stays, the call binds to no local
     // function, and the arity check is skipped by non-match rather than run
     // against a namesake. Non-call spellings keep the old flattening.
-    let flat = |q: &String, n: &String| scoped.get(&(format!("={}", q), n.clone())).map(|o| renamed(n, n, o));
+    let flat = |q: &String, n: &String| scoped.get(&(format!("={}", q), n.clone())).map(|o| sized(|b, c| use_splice::flat_name(o.as_bytes(), n.as_bytes(), b, c)));
     let mut rewrites: Vec<&(String, String, bool)> = qualified
         .iter()
         .filter(|(q, name, is_call)| {
@@ -802,7 +798,10 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     for (qual, name, _) in rewrites {
         out = out.replace(qual.as_str(), &flat(qual, name).unwrap_or_else(|| name.clone()));
     }
-    scoped.iter().for_each(|((c, x), o)| pulled.iter_mut().filter(|d| d.origin == *c).for_each(|d| d.text = renamed(&d.text, x, o)));
+    for d in pulled.iter_mut() {
+        let ren: String = scoped.iter().filter(|((c, x), o)| *c == d.origin || (*x == d.name && **o == d.origin)).map(|((_, x), o)| format!("{x}\t{o}\n")).collect();
+        d.text = sized(|b, n| use_splice::rewrite(d.text.as_bytes(), imports.get(&d.origin).map_or("", String::as_str).as_bytes(), ren.as_bytes(), b, n));
+    }
     if !out.ends_with('\n') {
         out.push('\n');
     }

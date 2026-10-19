@@ -10,6 +10,10 @@
   module's own declaration, else the one its direct imports make). A qualified reference the importer writes
   (`beta::name_ok`) is read in beta. Both copies are spliced under `<module path>__<name>` and the uses inside
   the module's texts are renamed. A bare name the importer writes stays UNRESOLVED.
+- Also: a path a pulled declaration writes (`type_text::same` in `compound_binop`, pulled from operator_text) loses
+  its module when the declaration's module imports it. The importer's own paths always did; pulled ones kept the
+  qualifier and the file declared no `type_text`. This, not only the clash, is what stopped `tri t27o --check`
+  on `bootstrap/src/compiler.rs`.
 - The rule is `specs/compiler/use_splice.t27`; `t27c gen-rust` writes `bootstrap/gen/rust/compiler/use_splice.rs`,
   which use_resolve.rs mounts by `#[path]`. `all_agree` and `alias_target` moved there too, so the hand Rust only
   shrinks.
