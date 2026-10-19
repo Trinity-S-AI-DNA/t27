@@ -11,7 +11,6 @@ mod abandoned;
 mod census;
 mod cibase;
 mod competitors;
-mod coverage;
 mod depin;
 mod discard;
 mod elab;
@@ -1376,7 +1375,7 @@ fn main() -> Result<()> {
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
-        Commands::Coverage { patterns, strict, t27c } => std::process::exit(coverage::run(patterns, *strict, t27c.as_deref())?),
+        Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
     }
 
     Ok(())
