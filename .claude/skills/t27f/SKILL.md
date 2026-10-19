@@ -405,7 +405,7 @@ of particles, and runnable in the OS itself and on FPGA. Two specs do this:
   `BG`, `COL_A/B/C`, `RADIUS`, `GAIN`, `SPRING`, `DAMP`, `LAW`, `FORCE`, `KICK`, `CARD`. The five
   are noir, neon, trit, paper and rain. **Add a preset by adding a column, never a branch in code.**
 - **`specs/t27f/idea_factory.t27` is the factory**, `(IDEA, PRESET) -> RGB24 frames`. It wraps
-  (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in the 3x5 font,
+  (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in glyph57's 5x7 font,
   assigns particles to glyph sub-slots and the card border, and closes on `CTA`.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
@@ -441,6 +441,28 @@ particles never settled into letters.
   `ic`).
 - **Base the branch on master's tip before the PR.** If the base PR (R3) merged first, reset the branch onto
   `origin/master`. Untracked new specs survive the reset.
+
+### Russian text: UTF-8 and the 5x7 font (t27#10788)
+
+`specs/t27f/glyph57.t27` gives the factory Cyrillic. It decodes UTF-8 (`cp_len`, `cp_at`,
+`cp_count`), folds lower case to capitals, and stores a 5x7 font. The font holds ASCII 32..95
+and only the 21 Cyrillic capitals that have no Latin twin. The 11 look-alikes (A, Ve, Ie, Ka, Em,
+En, O, Er, Es, Te, Ha) and Yo reuse the Latin glyph through the 32-entry `CYR_MAP`.
+
+- **Write non-ASCII text as a `u8` array, never as `"\xNN"`.** L3 keeps sources ASCII. The t27c
+  lexer lowers only `\n`, `\t`, `\\` and `\"`, and keeps `\xD0` as four characters, so a
+  `\xNN` test fails with no error. Use `pub const RU_IDEA : [80]u8 = [208, 167, ...];` and pass
+  `RU_IDEA[0..80]` to a `[]const u8` parameter. `specs/tri/utils/terminal.t27` records the same
+  trap for `\x1b`.
+- **Count widths in characters, keep positions in bytes.** Wrapping compares `cp_count` with
+  `MAXC`. The line start and end stay byte offsets, and the layout loop steps by
+  `bi = bi + cp_len(t, bi)`. An ASCII idea's numbers do not change, so the old tests still pin
+  the old layout.
+- **Guard the font with a duplicate-bitmap test.** Every pair of stored glyphs must differ, and
+  every look-alike must light exactly its Latin twin's pixels.
+- **Render a Russian idea without touching the committed constant.** In the lab copy, `sed`
+  `reel_frames(IDEA)` and `reel_cell(IDEA,` to use `RU_IDEA[0..80]`, next to the `PRESET` and
+  module renames.
 
 ## Check the whole corpus for import cycles (t27#10693)
 
