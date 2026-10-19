@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/text_meas.t27 -- text widths for a native widget card: the host measures, the wasm asks. Epic
+; gHashTag/t27#10937, issue #10938. A tool.js that draws a PNG card fits text to a width with
+; ctx.measureText(s).width and decides the layout from the answers (cut a name from the left until it fits, wrap a
+; sentence, shrink a headline). A wasm cannot call measureText, and the answers change the draw list, so the page asks
+; the way specs/widgets/canvas_out.t27 asks for nothing: it keeps a MEMO of (font, text) -> width. A width that is not
+; in the memo is added as a request and read as 0.0; the page then writes a draw list that is WRONG, sets the miss flag
+; (tm_missed) and the host throws that list away, measures every open request on a scratch canvas context and gives the
+; widths back (tm_give), and calls the page again, until nothing is missing. The memo survives, so a second card of
+; the same words costs one pass. tm_fit_left and tm_wrap ask for the next 31 candidates at once, so a loop that
+; JavaScript runs 60 times costs 2 passes, not 60.
+; --
+; Host protocol (the page exports it, the host loops; host.js):
+;   w_meas_need(dst) -> bytes   the open requests as  font NUL text NUL  records, 0 when none
+;   w_meas_give(text)           one width per open request, in the same order, as decimal text separated by LF
+;   w_card(dst) -> len          is called again while w_meas_need answers more than 0
+; The memo is a set of arrays the PAGE owns (this module keeps no state; t27c's `use` does not carry a `pub var`):
+;   tm   u32 x (8 + 4 * N)   [0] entries, [1] bytes of pool used, [2] miss flag, [3] overflow flag; then per entry
+;                            font offset, font length, text offset, text length (offsets into pool)
+;   pool u8 x P              the bytes of every font and text asked
+;   wid  f64 x N             the width of an entry (0.0 until given)
+;   ok   u8 x N              1 once the width was given
+; An entry is found by its exact bytes. When the arrays are full, tm_width sets the overflow flag and answers 0.0:
+; the card is drawn with wrong widths (the page cannot tell the host more).
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widgets_text_meas;
+
+use widgets::js_num::JN_OVER;
+use widgets::js_num::JN_CAP;
+use widgets::js_num::JN_TWO52;
+use widgets::js_num::JN_TWO53;
+use widgets::js_num::jn_put;
+use widgets::js_num::jn_raw;
+use widgets::js_num::jn_digits;
+use widgets::js_num::jn_mul;
+use widgets::js_num::jn_mul2;
+use widgets::js_num::jn_mul5;
+use widgets::js_num::jn_shift;
+use widgets::js_num::jn_cmp;
+use widgets::js_num::jn_expo;
+use widgets::js_num::jn_mant;
+use widgets::js_num::jn_make;
+use widgets::js_num::jn_exact;
+use widgets::js_num::jn_fscale;
+use widgets::js_num::js_is_nan;
+use widgets::js_num::js_nan;
+use widgets::js_num::js_inf;
+use widgets::js_num::js_floor;
+use widgets::js_num::js_ceil;
+use widgets::js_num::js_max;
+use widgets::js_num::js_min;
+use widgets::js_num::js_round;
+use widgets::js_num::jn_shortest;
+use widgets::js_num::jn_copy;
+use widgets::js_num::jn_put_run;
+use widgets::js_num::jn_layout;
+use widgets::js_num::js_str_num;
+use widgets::js_num::js_to_fixed;
+use widgets::js_num::js_locale_num;
+use widgets::js_num::jn_num_ok;
+use widgets::js_num::jn_cmp_text;
+use widgets::js_num::js_parse_num;
+use widgets::js_num::jn_dec_value;
+use widgets::js_num::jn_abs;
+use widgets::js_num::js_str_u64;
+
+pub const TM_HEAD : u32 = 8;
+pub const TM_AHEAD : u32 = 32;
+
+pub fn tm_reset(tm: []u32) {
+    tm[0] = 0;
+    tm[1] = 0;
+    tm[2] = 0;
+    tm[3] = 0;
+}
+
+pub fn tm_missed(tm: []const u32) -> bool {
+    return tm[2] != 0;
+}
+
+pub fn tm_clear_miss(tm: []u32) {
+    tm[2] = 0;
+}
+
+fn same_at(pool: []const u8, off: usize, len: usize, s: []const u8) -> bool {
+    if (len != s.len) { return false; }
+    var i : usize = 0;
+    while (i < len) {
+        if (pool[off + i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The index of the entry (font, text), or -1.
+pub fn tm_find(tm: []const u32, pool: []const u8, font: []const u8, text: []const u8) -> i64 {
+    var i : u32 = 0;
+    const n : u32 = tm[0];
+    while (i < n) {
+        const b : usize = ((TM_HEAD + 4 * i) as usize);
+        if (same_at(pool, tm[b + 2] as usize, tm[b + 3] as usize, text) and same_at(pool, tm[b] as usize, tm[b + 1] as usize, font)) { return i as i64; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn pool_add(pool: []u8, at: u32, s: []const u8) {
+    var i : usize = 0;
+    while (i < s.len) {
+        pool[(at as usize) + i] = s[i];
+        i = i + 1;
+    }
+}
+
+/// Add the entry (font, text) when there is room. Returns its index, or -1 when the arrays are full.
+pub fn tm_add(tm: []u32, pool: []u8, wid: []f64, ok: []u8, font: []const u8, text: []const u8) -> i64 {
+    const n : u32 = tm[0];
+    const used : u32 = tm[1];
+    const need : u32 = (font.len as u32) + (text.len as u32);
+    if ((n as usize) >= wid.len or ((used + need) as usize) > pool.len or tm.len < ((TM_HEAD + 4 * (n + 1)) as usize)) {
+        tm[3] = 1;
+        return 0 - 1;
+    }
+    const b : usize = ((TM_HEAD + 4 * n) as usize);
+    tm[b] = used;
+    tm[b + 1] = font.len as u32;
+    tm[b + 2] = used + (font.len as u32);
+    tm[b + 3] = text.len as u32;
+    pool_add(pool, used, font);
+    pool_add(pool, used + (font.len as u32), text);
+    wid[n as usize] = 0.0;
+    ok[n as usize] = 0;
+    tm[0] = n + 1;
+    tm[1] = used + need;
+    return n as i64;
+}
+
+/// ctx.font = font; ctx.measureText(text).width -- from the memo; 0.0 and the miss flag when it is not known yet.
+pub fn tm_width(tm: []u32, pool: []u8, wid: []f64, ok: []u8, font: []const u8, text: []const u8) -> f64 {
+    var i : i64 = tm_find(tm, pool, font, text);
+    if (i < 0) { i = tm_add(tm, pool, wid, ok, font, text); }
+    if (i < 0) {
+        tm[2] = 1;
+        return 0.0;
+    }
+    if (ok[i as usize] == 0) {
+        tm[2] = 1;
+        return 0.0;
+    }
+    return wid[i as usize];
+}
+
+/// Ask for a width without using it (look-ahead).
+pub fn tm_ask(tm: []u32, pool: []u8, wid: []f64, ok: []u8, font: []const u8, text: []const u8) {
+    var i : i64 = tm_find(tm, pool, font, text);
+    if (i < 0) { i = tm_add(tm, pool, wid, ok, font, text); }
+}
+
+/// The open requests, font NUL text NUL each; the length written (0 when none). A request that does not fit stays open.
+pub fn tm_need(tm: []const u32, pool: []const u8, ok: []const u8, dst: []u8) -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    const cnt : u32 = tm[0];
+    while (i < cnt) {
+        if (ok[i as usize] == 0) {
+            const b : usize = ((TM_HEAD + 4 * i) as usize);
+            const fl : u32 = tm[b + 1];
+            const tl : u32 = tm[b + 3];
+            if ((n + fl + tl + 2) as usize > dst.len) { return n; }
+            var k : u32 = 0;
+            while (k < fl) {
+                dst[(n + k) as usize] = pool[(tm[b] + k) as usize];
+                k = k + 1;
+            }
+            dst[(n + fl) as usize] = 0;
+            k = 0;
+            while (k < tl) {
+                dst[(n + fl + 1 + k) as usize] = pool[(tm[b + 2] + k) as usize];
+                k = k + 1;
+            }
+            dst[(n + fl + 1 + tl) as usize] = 0;
+            n = n + fl + tl + 2;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The widths of the open requests, in order, as decimal text separated by LF. Returns how many were given.
+pub fn tm_give(tm: []const u32, ok: []u8, wid: []f64, s: []const u8) -> u32 {
+    var given : u32 = 0;
+    var i : u32 = 0;
+    var p : usize = 0;
+    const cnt : u32 = tm[0];
+    while (i < cnt and p <= s.len) {
+        if (ok[i as usize] == 0) {
+            var e : usize = p;
+            while (e < s.len and s[e] != 10) { e = e + 1; }
+            var w : f64 = js_parse_num(s, p, e);
+            if (js_is_nan(w)) { w = 0.0; }
+            wid[i as usize] = w;
+            ok[i as usize] = 1;
+            given = given + 1;
+            p = e + 1;
+        }
+        i = i + 1;
+    }
+    return given;
+}
+
+// --- JavaScript string units of UTF-8 text ----------------------------------------------------------
+
+/// The UTF-16 length of the UTF-8 bytes t[lo .. hi): a 4-byte character is 2 units, the others 1.
+pub fn tm_units(t: []const u8, lo: usize, hi: usize) -> usize {
+    var n : usize = 0;
+    var i : usize = lo;
+    while (i < hi) {
+        const b : u8 = t[i];
+        if (b >= 240) { n = n + 2; } else { if (b < 128 or b >= 192) { n = n + 1; } }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The byte length of the UTF-8 character that starts at t[i].
+pub fn tm_charlen(t: []const u8, i: usize, hi: usize) -> usize {
+    var l : usize = 1;
+    const b : u8 = t[i];
+    if (b >= 240) { l = 4; } else { if (b >= 224) { l = 3; } else { if (b >= 192) { l = 2; } } }
+    if (i + l > hi) { l = hi - i; }
+    return l;
+}
+
+fn put_dots(scratch: []u8, t: []const u8, lo: usize) -> usize {
+    scratch[0] = 46;
+    scratch[1] = 46;
+    scratch[2] = 46;
+    var k : usize = lo;
+    var n : usize = 3;
+    while (k < t.len) {
+        scratch[n] = t[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    return n;
+}
+
+/// tool.js:  fit = (t, room) => { let v = String(t); if (measure(v) <= room) return v;
+///             while (v.length > 1 && measure(`...${v}`) > room) v = v.slice(1); return `...${v}` }
+/// Returns the byte offset in t from which the result is `...` + t[off..], or -1 when t fits whole.
+/// scratch needs t.len + 3 bytes. While widths are missing the answer is meaningless (the miss flag is set).
+pub fn tm_fit_left(tm: []u32, pool: []u8, wid: []f64, ok: []u8, font: []const u8, t: []const u8, room: f64, scratch: []u8) -> i64 {
+    const whole : f64 = tm_width(tm, pool, wid, ok, font, t);
+    if (tm[2] != 0) { return 0 - 1; }
+    if (whole <= room) { return 0 - 1; }
+    var lo : usize = 0;
+    while (tm_units(t, lo, t.len) > 1) {
+        var n : usize = put_dots(scratch, t, lo);
+        const w : f64 = tm_width(tm, pool, wid, ok, font, scratch[0..n]);
+        if (tm[2] != 0) {
+            // ask for the next candidates in one go
+            var a : u32 = 0;
+            var q : usize = lo;
+            while (a < TM_AHEAD and q < t.len) {
+                q = q + tm_charlen(t, q, t.len);
+                n = put_dots(scratch, t, q);
+                tm_ask(tm, pool, wid, ok, font, scratch[0..n]);
+                a = a + 1;
+            }
+            return 0 - 1;
+        }
+        if (w <= room) { return lo as i64; }
+        lo = lo + tm_charlen(t, lo, t.len);
+    }
+    return lo as i64;
+}
+
+/// tool.js:  wrap = (t, room) => { lines = []; cur = ''; for (w of t.split(' ')) { next = cur ? `${cur} ${w}` : w;
+///             if (measure(next) > room && cur) { lines.push(cur); cur = w } else cur = next } if (cur) lines.push(cur) }
+/// The lines are substrings of t: line k is t[spans[2k] .. spans[2k + 1]). Returns the number of lines (at most
+/// spans.len / 2; the rest is dropped).
+pub fn tm_wrap(tm: []u32, pool: []u8, wid: []f64, ok: []u8, font: []const u8, t: []const u8, room: f64, spans: []u32) -> u32 {
+    var nl : u32 = 0;
+    var cl : usize = 0;
+    var ch : usize = 0;
+    var p : usize = 0;
+    var more : bool = true;
+    while (more) {
+        var e : usize = p;
+        while (e < t.len and t[e] != 32) { e = e + 1; }
+        var nlo : usize = p;
+        if (ch > cl) { nlo = cl; }
+        const w : f64 = tm_width(tm, pool, wid, ok, font, t[nlo..e]);
+        if (w > room and ch > cl) {
+            if (((nl + 1) as usize) * 2 <= spans.len) {
+                spans[(nl as usize) * 2] = cl as u32;
+                spans[(nl as usize) * 2 + 1] = ch as u32;
+            }
+            nl = nl + 1;
+            cl = p;
+            ch = e;
+        } else {
+            cl = nlo;
+            ch = e;
+        }
+        if (e >= t.len) { more = false; } else { p = e + 1; }
+    }
+    if (ch > cl) {
+        if (((nl + 1) as usize) * 2 <= spans.len) {
+            spans[(nl as usize) * 2] = cl as u32;
+            spans[(nl as usize) * 2 + 1] = ch as u32;
+        }
+        nl = nl + 1;
+    }
+    return nl;
+}
+
+fn m_same(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub var T_TM : [64]u32 = [0; 64];
+pub var T_POOL : [4096]u8 = [0; 4096];
+pub var T_WID : [12]f64 = [0.0; 12];
+pub var T_OK : [12]u8 = [0; 12];
+pub var T_NEED : [512]u8 = [0; 512];
+pub var T_SC : [64]u8 = [0; 64];
+pub var T_SP : [16]u32 = [0; 16];
+
+/// Give every open request width = 10 * bytes of its text (a stand-in for the host).
+fn t_give_all() -> u32 {
+    var s : [200]u8 = [0; 200];
+    var n : usize = 0;
+    var i : u32 = 0;
+    while (i < T_TM[0]) {
+        if (T_OK[i as usize] == 0) {
+            const tl : u32 = T_TM[(TM_HEAD + 4 * i + 3) as usize];
+            const w : u32 = tl * 10;
+            var d : [12]u8 = [0; 12];
+            var k : usize = 0;
+            var v : u32 = w;
+            if (v == 0) { d[0] = 48; k = 1; }
+            while (v > 0) {
+                d[k] = ((v % 10) as u8) + 48;
+                v = v / 10;
+                k = k + 1;
+            }
+            while (k > 0) {
+                k = k - 1;
+                s[n] = d[k];
+                n = n + 1;
+            }
+            s[n] = 10;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return tm_give(T_TM[0..64], T_OK[0..12], T_WID[0..12], s[0..n]);
+}
+
+test a_width_not_in_the_memo_is_a_request_and_the_miss_flag {
+    tm_reset(T_TM[0..64]);
+    var w : f64 = tm_width(T_TM[0..64], T_POOL[0..4096], T_WID[0..12], T_OK[0..12], "bold 20px m", "abc");
+    assert w == 0.0;
+    assert tm_missed(T_TM[0..64]);
+    assert T_TM[0] == 1;
+    const n : u32 = tm_need(T_TM[0..64], T_POOL[0..4096], T_OK[0..12], T_NEED[0..512]);
+    assert n == 11 + 3 + 2;
+    assert T_NEED[0] == 98 and T_NEED[11] == 0 and T_NEED[12] == 97 and T_NEED[15] == 0;
+    assert t_give_all() == 1;
+    tm_clear_miss(T_TM[0..64]);
+    w = tm_width(T_TM[0..64], T_POOL[0..4096], T_WID[0..12], T_OK[0..12], "bold 20px m", "abc");
+    assert w == 30.0;
+    assert !tm_missed(T_TM[0..64]);
+    assert tm_need(T_TM[0..64], T_POOL[0..4096], T_OK[0..12], T_NEED[0..512]) == 0;
+}
+
+test fit_left_cuts_from_the_left_and_asks_ahead {
+    tm_reset(T_TM[0..64]);
+    const t : []const u8 = "top.dut.counter";
+    var r : i64 = 0 - 2;
+    var k : u32 = 0;
+    var passes : u32 = 0;
+    while (k < 20) {
+        tm_clear_miss(T_TM[0..64]);
+        r = tm_fit_left(T_TM[0..64], T_POOL[0..4096], T_WID[0..12], T_OK[0..12], "f", t, 80.0, T_SC[0..64]);
+        passes = passes + 1;
+        if (!tm_missed(T_TM[0..64])) { k = 99; } else { t_give_all(); k = k + 1; }
+    }
+    assert k == 99;
+    assert r == 10;
+    assert passes <= 3;
+    tm_reset(T_TM[0..64]);
+    k = 0;
+    while (k < 20) {
+        tm_clear_miss(T_TM[0..64]);
+        r = tm_fit_left(T_TM[0..64], T_POOL[0..4096], T_WID[0..12], T_OK[0..12], "f", "ab", 80.0, T_SC[0..64]);
+        if (!tm_missed(T_TM[0..64])) { k = 99; } else { t_give_all(); k = k + 1; }
+    }
+    assert r == 0 - 1;
+}
+
+test wrap_breaks_where_the_next_word_no_longer_fits {
+    tm_reset(T_TM[0..64]);
+    const t : []const u8 = "aa bb cc";
+    var k : u32 = 0;
+    var nl : u32 = 0;
+    while (k < 8) {
+        tm_clear_miss(T_TM[0..64]);
+        nl = tm_wrap(T_TM[0..64], T_POOL[0..4096], T_WID[0..12], T_OK[0..12], "f", t, 50.0, T_SP[0..16]);
+        if (!tm_missed(T_TM[0..64])) { k = 99; } else { t_give_all(); k = k + 1; }
+    }
+    assert k == 99;
+    assert nl == 2;
+    assert T_SP[0] == 0 and T_SP[1] == 5 and T_SP[2] == 6 and T_SP[3] == 8;
+}
+
+test units_count_utf16_and_charlen_steps_over_utf8 {
+    var u : [3]u8 = [195, 169, 120];
+    assert tm_units("abc", 0, 3) == 3;
+    assert tm_units(u[0..], 0, 3) == 2;
+    assert tm_charlen(u[0..], 0, 3) == 2;
+    assert tm_charlen(u[0..], 2, 3) == 1;
+}
+
+/// The splicer follows only the names a module itself mentions; this mentions every helper of js_num that
+/// js_parse_num calls. Never called.
+pub fn tm_anchor(o: []u8, s: []const u8) -> u32 {
+    var n : u32 = 0;
+    n = n + JN_OVER;
+    n = n + JN_CAP;
+    n = n + ((JN_TWO52 > 0.0) as u32);
+    n = n + ((JN_TWO53 > 0.0) as u32);
+    n = n + jn_put(o, 0, 0);
+    n = n + jn_raw(o, 0, s);
+    n = n + jn_digits(o, 0);
+    n = n + jn_mul(o, 0, 0);
+    n = n + jn_mul2(o, 0, 0);
+    n = n + jn_mul5(o, 0, 0);
+    n = n + jn_shift(o, 0, 0);
+    n = n + (jn_cmp(s, s, 0) as u32);
+    n = n + (jn_expo(0.0) as u32);
+    n = n + (jn_mant(0.0) as u32);
+    n = n + ((jn_make(0, 0) > 0.0) as u32);
+    n = n + jn_exact(o, 0, 0);
+    n = n + jn_fscale(0);
+    n = n + (js_is_nan(0.0) as u32);
+    n = n + ((js_nan(0.0) > 0.0) as u32);
+    n = n + ((js_inf(1.0) > 0.0) as u32);
+    n = n + ((js_floor(0.0) > 0.0) as u32);
+    n = n + ((js_ceil(0.0) > 0.0) as u32);
+    n = n + ((js_max(0.0, 0.0) > 0.0) as u32);
+    n = n + ((js_min(0.0, 0.0) > 0.0) as u32);
+    n = n + ((js_round(0.0) > 0.0) as u32);
+    n = n + (jn_shortest(o, 1.0) as u32);
+    n = n + jn_copy(o, s, 0);
+    n = n + jn_put_run(o, 0, s, 0, 0);
+    n = n + jn_layout(o, 0, s, 0, 0);
+    n = n + js_str_num(o, 0, 0.0);
+    n = n + js_to_fixed(o, 0, 0.0, 0);
+    n = n + js_locale_num(o, 0, 0.0);
+    n = n + (jn_num_ok(s, 0, 0) as u32);
+    n = n + (jn_cmp_text(s, 0, 0, 0, 0) as u32);
+    n = n + ((js_parse_num(s, 0, 0) > 0.0) as u32);
+    n = n + ((jn_dec_value(s, 0, 0) > 0.0) as u32);
+    n = n + (jn_abs(0) as u32);
+    n = n + js_str_u64(o, 0, 0);
+    return n;
+}
