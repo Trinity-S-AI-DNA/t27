@@ -414,6 +414,19 @@ of particles, and runnable in the OS itself and on FPGA. Two specs do this:
   This is Remotion's `random(seed)` applied to style. Any other `PRESET` value is used as given
   (gHashTag/t27#10803). Test hashes against the published FNV vectors (`""`, `a`, `b`, `foobar`),
   never against a value the spec computes itself.
+- **Prove AUTO on the compiled binary, not only in the interpreter.** For each idea, build it
+  twice on the lab: once with `PRESET = PRESET_AUTO` and once with the expected preset written in.
+  md5 the two frame streams (`./f 2>&1 1>fo.txt | md5sum`). They must be SAME, and the idea with a
+  wrong preset must be DIFF (the control). Then gen and the interpreter agree, and you need no image
+  analysis: noir, trit and rain backgrounds differ by a few levels, so a colour check is fragile.
+  The batch in the spec's test (#10815) is five ideas that cover all five presets; render it as the
+  batch preview. **To find an idea's preset without a print:** a scratch spec with
+  `assert((preset_of(X) & b) == b)` for b = 1, 2, 4 reads the value off which tests pass.
+  Build the variants in parallel with `&` and `wait`: 11 builds and renders take about as long as one.
+  **Trap: never `tee` the frame stream into md5 and ffmpeg at once while several encoders run.**
+  Five parallel libx264 encoders on the lab failed with "Error while opening encoder", the
+  pipe closed, and md5 hashed a truncated stream: 3 of 5 read DIFF. Run md5 separately, then
+  encode one at a time. A DIFF that coincides with an encoder error is the harness, not the code.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.
