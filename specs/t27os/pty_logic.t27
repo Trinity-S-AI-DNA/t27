@@ -1,0 +1,408 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS pty_logic: the decisions of the PTY server (pty_server.t27) that need no syscall -- pane slot
+; allocation, pollfd packing, the status a hook or an exit gives, the command and argv a pane runs, the
+; launchd plist. They live apart from the server because a module with @extern imports cannot run its
+; tests (t27c needs two arguments for @extern; the JIT refuses imports), and a decision should run its tests.
+; Refs gHashTag/t27#10782.
+module T27osPtyLogic;
+
+use t27os::agents::AGENT_COUNT;
+use t27os::agents::S_STOPPED;
+use t27os::agents::R_SKIP;
+use t27os::agents::R_RESUME;
+use t27os::agents::R_RELAUNCH;
+use t27os::pane_state::P_HOOK_START;
+use t27os::pane_state::P_OUTPUT;
+use t27os::pane_state::P_QUIET;
+use t27os::pane_state::P_KEY;
+use t27os::pane_state::P_SEEN;
+use t27os::pane_state::P_EXIT_OK;
+use t27os::pane_state::P_EXIT_FAIL;
+use t27os::pane_state::P_SPAWNED;
+use t27os::pane_state::P_COUNT;
+use t27os::pane_state::BIT_UNSEEN;
+use t27os::pane_state::ps_state;
+use t27os::pane_state::ps_hooked;
+use t27os::pane_state::P_HOOK_SUBMIT;
+use t27os::pane_state::P_HOOK_STOP;
+use t27os::agents::S_WORKING;
+use t27os::pane_state::pane_step;
+use t27os::pane_state::shown_state;
+use t27os::pane_state::pane_needs_you;
+use t27os::pane_state::quiet_applies;
+use t27os::pane_state::is_quiet;
+use t27os::pane_state::hook_event;
+use t27os::session_store::SHELL_CELL;
+use t27os::session_store::F_SPACE;
+use t27os::session_store::F_AGENT;
+use t27os::session_store::F_SLOT;
+use t27os::session_store::F_STATE;
+use t27os::session_store::F_SID_AT;
+use t27os::session_store::F_SID_LEN;
+use t27os::session_store::F_CWD_AT;
+use t27os::session_store::F_CWD_LEN;
+use t27os::session_store::F_COUNT;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_record;
+use t27os::session_store::parse_record;
+use t27os::session_store::sid_ok;
+use t27os::session_store::restore_plan;
+use t27os::session_store::build_command;
+use t27os::session_store::fresh_command;
+use t27os::session_store::json_field;
+use t27os::session_store::record_path;
+use t27os::session_store::uuid_text;
+use t27os::session_store::hooks_json;
+use t27os::pty_proto::OP_LIST;
+use t27os::pty_proto::OP_SPAWN;
+use t27os::pty_proto::OP_ATTACH;
+use t27os::pty_proto::OP_DETACH;
+use t27os::pty_proto::OP_KEYS;
+use t27os::pty_proto::OP_READ;
+use t27os::pty_proto::OP_KILL;
+use t27os::pty_proto::OP_HOOK;
+use t27os::pty_proto::RE_OK;
+use t27os::pty_proto::RE_ERR;
+use t27os::pty_proto::RE_DATA;
+use t27os::pty_proto::RE_LISTING;
+use t27os::pty_proto::HEADER;
+use t27os::pty_proto::RING_CAP;
+use t27os::pty_proto::MAX_PANES;
+use t27os::pty_proto::get_u16;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::put_header;
+use t27os::pty_proto::put_frame;
+use t27os::pty_proto::frame_need;
+use t27os::pty_proto::frame_complete;
+use t27os::pty_proto::is_request;
+use t27os::pty_proto::ring_window;
+use t27os::pty_proto::ring_slot;
+use t27os::pty_proto::data_chunk;
+use t27os::pty_proto::ring_append;
+use t27os::pty_proto::ring_copy;
+use t27os::pty_proto::put_list_entry;
+use t27os::pty_proto::spawn_ok;
+use t27os::pty_proto::socket_path;
+
+// ---- the server's memory: one byte arena and one u64 table ----
+
+/// u64 fields per pane in the table st; pane i starts at i * PF.
+pub const PF : usize = 14;
+pub const PF_USED : usize = 0;
+pub const PF_LIVE : usize = 1;
+pub const PF_PID : usize = 2;
+pub const PF_FD : usize = 3;
+pub const PF_AGENT : usize = 4;
+pub const PF_SPACE : usize = 5;
+pub const PF_SLOT : usize = 6;
+pub const PF_STATUS : usize = 7;
+pub const PF_TOTAL : usize = 8;
+pub const PF_LAST : usize = 9;
+pub const PF_SIDLEN : usize = 10;
+pub const PF_CWDLEN : usize = 11;
+pub const PF_BORN : usize = 12;
+pub const PF_PLAN : usize = 13;
+pub const RESUME_GRACE_MS : u64 = 8000;
+pub const HOOK_STALE_MS : u64 = 30000;
+
+pub const G_LISTEN : usize = 224;
+pub const G_HLEN : usize = 225;
+pub const G_BINLEN : usize = 226;
+pub const G_CFD : usize = 232;
+pub const G_CLEN : usize = 240;
+pub const ST_SIZE : usize = 256;
+pub const MAX_CONNS : usize = 8;
+
+pub const SID_CAP : usize = 64;
+pub const CWD_CAP : usize = 256;
+pub const IN_CAP : usize = 8200;
+pub const O_SID : usize = 0;
+pub const O_CWD : usize = 1024;
+pub const O_IN : usize = 5120;
+pub const O_TMP1 : usize = 70720;
+pub const O_TMP2 : usize = 78912;
+pub const O_OUT : usize = 87104;
+pub const O_HOME : usize = 91304;
+pub const O_POLL : usize = 91560;
+pub const O_MISC : usize = 92072;
+pub const O_BIN : usize = 92400;
+pub const O_RING : usize = 98304;
+pub const MEM_SIZE : usize = 1146880;
+pub const TICK_MS : i32 = 500;
+pub const SIGHUP_RING : u64 = 65536;
+
+// ---- pure decisions ----
+
+/// The index of the first pane slot with no record; MAX_PANES when the table is full.
+pub fn pane_alloc(st: []const u64) -> u32 {
+    var i : u32 = 0;
+    while (i < MAX_PANES) {
+        if (st[@as(usize, i) * PF + PF_USED] == 0) { return i; }
+        i = i + 1;
+    }
+    return MAX_PANES;
+}
+
+/// The milliseconds a gettimeofday result holds: tv_sec (8 bytes) then tv_usec (4 bytes).
+pub fn tv_ms(b: []const u8) -> u64 {
+    const sec : u64 = get_u64(b, 0);
+    const us : u64 = @as(u64, b[8]) + @as(u64, b[9]) * 256 + @as(u64, b[10]) * 65536 + @as(u64, b[11]) * 16777216;
+    return sec * 1000 + us / 1000;
+}
+
+/// One pollfd entry k: the fd (4 bytes LE), events POLLIN, revents cleared.
+pub fn put_pollfd(b: []u8, k: usize, fd: u32) -> void {
+    const at : usize = k * 8;
+    b[at] = @as(u8, @intCast(fd & 255));
+    b[at + 1] = @as(u8, @intCast((fd / 256) & 255));
+    b[at + 2] = @as(u8, @intCast((fd / 65536) & 255));
+    b[at + 3] = @as(u8, @intCast((fd / 16777216) & 255));
+    b[at + 4] = 1;
+    b[at + 5] = 0;
+    b[at + 6] = 0;
+    b[at + 7] = 0;
+}
+
+/// The revents of entry k: anything but 0 means read it (data, hangup and error all show up as a read).
+pub fn poll_revents(b: []const u8, k: usize) -> u32 {
+    return @as(u32, b[k * 8 + 6]) + @as(u32, b[k * 8 + 7]) * 256;
+}
+
+/// The exit status word of waitpid: a clean exit(0) is P_EXIT_OK, anything else P_EXIT_FAIL.
+pub fn exit_event(status: u32) -> u32 {
+    if (status == 0) { return P_EXIT_OK; }
+    return P_EXIT_FAIL;
+}
+
+/// The status a hook event gives a pane; the status itself when the name is not one we read.
+pub fn hooked_status(w: u32, name: []const u8) -> u32 {
+    const e : u32 = hook_event(name);
+    if (e == P_COUNT) { return w; }
+    return pane_step(w, e);
+}
+
+/// The flags byte of a LISTING entry: bit 0 live, bit 1 needs you, bit 2 unseen.
+pub fn list_flags(live: bool, w: u32) -> u32 {
+    var f : u32 = 0;
+    if (live) { f = f + 1; }
+    if (pane_needs_you(w)) { f = f + 2; }
+    if ((w & BIT_UNSEEN) != 0) { f = f + 4; }
+    return f;
+}
+
+/// The command a pane runs: fresh (with a new Claude session id) or resumed, plus the Claude hook
+/// settings file for the claude cell, written into out. Returns the length.
+pub fn pane_command(agent: u32, plan: u32, sid: []const u8, home: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    if (plan == R_RELAUNCH) {
+        n = fresh_command(agent, sid, out);
+    } else {
+        n = build_command(agent, plan, sid, out);
+    }
+    if (agent == 0) {
+        n = put_bytes(out, n, " --settings ");
+        n = put_bytes(out, n, home);
+        n = put_bytes(out, n, "/.t27os/hooks.json");
+    }
+    return n;
+}
+
+/// The argv strings of `/bin/sh -c "exec <cmd>"` in one buffer, NUL separated; offsets go to f:
+/// f[0] the -c at, f[1] the command at. Returns the buffer length.
+pub fn argv_text(cmd: []const u8, out: []u8, f: []u64) -> usize {
+    var n : usize = put_bytes(out, 0, "/bin/sh");
+    out[n] = 0;
+    f[0] = n + 1;
+    n = put_bytes(out, n + 1, "-c");
+    out[n] = 0;
+    f[1] = n + 1;
+    n = put_bytes(out, n + 1, "exec ");
+    n = put_bytes(out, n, cmd);
+    out[n] = 0;
+    return n + 1;
+}
+
+/// The launchd agent plist that keeps this binary running and restarts it when it dies.
+pub fn plist_text(out: []u8, bin: []const u8) -> usize {
+    var n : usize = put_bytes(out, 0, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    n = put_bytes(out, n, "<plist version=\"1.0\"><dict>\n");
+    n = put_bytes(out, n, "<key>Label</key><string>ai.t27.os-server</string>\n");
+    n = put_bytes(out, n, "<key>ProgramArguments</key><array><string>");
+    n = put_bytes(out, n, bin);
+    n = put_bytes(out, n, "</string></array>\n");
+    n = put_bytes(out, n, "<key>RunAtLoad</key><true/>\n");
+    n = put_bytes(out, n, "<key>KeepAlive</key><true/>\n");
+    n = put_bytes(out, n, "</dict></plist>\n");
+    return n;
+}
+
+/// A resumed pane that dies at once (no conversation to resume: claude was never prompted, or its
+/// transcript is gone) is relaunched fresh in its cwd: the exit came before the grace period ended.
+pub fn resume_failed(plan: u32, born: u64, now: u64, status: u32) -> bool {
+    if (plan != R_RESUME or status == 0) { return false; }
+    return now >= born and now - born < RESUME_GRACE_MS;
+}
+
+/// A hooked pane that says "working" and has printed nothing for HOOK_STALE_MS lost its Stop hook (an
+/// empty Enter at the prompt starts no turn): treat the turn as finished.
+pub fn hook_stale(w: u32, now: u64, last: u64) -> bool {
+    if (!ps_hooked(w) or ps_state(w) != S_WORKING) { return false; }
+    return now >= last and now - last >= HOOK_STALE_MS;
+}
+
+/// Copy a NUL-free path and add the NUL a C call needs; returns the length without it.
+pub fn c_path(out: []u8, src: []const u8) -> usize {
+    const n : usize = put_bytes(out, 0, src);
+    out[n] = 0;
+    return n;
+}
+
+
+// ---- tests: each runs and asserts on values the decisions compute ----
+
+test pane_alloc_takes_the_first_free_slot {
+    var st : [224]u64 = undefined;
+    var i : usize = 0;
+    while (i < 224) {
+        st[i] = 0;
+        i = i + 1;
+    }
+    assert pane_alloc(st[0..224]) == 0;
+    st[0 * PF + PF_USED] = 1;
+    st[1 * PF + PF_USED] = 1;
+    assert pane_alloc(st[0..224]) == 2;
+    st[0 * PF + PF_USED] = 0;
+    assert pane_alloc(st[0..224]) == 0;
+    var k : usize = 0;
+    while (k < 16) {
+        st[k * PF + PF_USED] = 1;
+        k = k + 1;
+    }
+    assert pane_alloc(st[0..224]) == 16;
+}
+
+test tv_ms_adds_seconds_and_micros {
+    var b : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 16) {
+        b[i] = 0;
+        i = i + 1;
+    }
+    b[0] = 10;
+    b[8] = 208;
+    b[9] = 7;
+    assert tv_ms(b[0..16]) == 10002;
+    b[8] = 63;
+    b[9] = 66;
+    b[10] = 15;
+    assert tv_ms(b[0..16]) == 10000 + 999;
+}
+
+test pollfd_round_trips_a_big_fd {
+    var b : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) {
+        b[i] = 255;
+        i = i + 1;
+    }
+    put_pollfd(b[0..32], 1, 66051);
+    assert b[8] == 3;
+    assert b[9] == 2;
+    assert b[10] == 1;
+    assert b[11] == 0;
+    assert b[12] == 1;
+    assert b[13] == 0;
+    assert poll_revents(b[0..32], 1) == 0;
+    b[14] = 16;
+    assert poll_revents(b[0..32], 1) == 16;
+    assert b[7] == 255;
+}
+
+test exit_and_hook_events_pick_the_right_status {
+    assert exit_event(0) == P_EXIT_OK;
+    assert exit_event(256) == P_EXIT_FAIL;
+    const w : u32 = pane_step(0, P_SPAWNED);
+    assert ps_state(hooked_status(w, "UserPromptSubmit")) == 1;
+    assert ps_state(hooked_status(w, "Notification")) == 2;
+    assert hooked_status(w, "SomethingElse") == w;
+    assert list_flags(true, hooked_status(w, "Notification")) == 3;
+    assert list_flags(false, w) == 0;
+}
+
+test the_command_carries_the_resume_flag_and_the_hook_settings {
+    var out : [200]u8 = undefined;
+    const n : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", "/Users/x", out[0..200]);
+    var want : [200]u8 = undefined;
+    const m : usize = put_bytes(want[0..200], 0, "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --settings /Users/x/.t27os/hooks.json");
+    assert n == m;
+    var i : usize = 0;
+    var same : bool = true;
+    while (i < n) {
+        if (out[i] != want[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same;
+    const b : usize = pane_command(SHELL_CELL, R_RELAUNCH, "-", "/Users/x", out[0..200]);
+    assert b == 9;
+    assert out[5] == 98;
+}
+
+test the_argv_buffer_holds_three_strings {
+    var out : [200]u8 = undefined;
+    var f : [2]u64 = undefined;
+    const n : usize = argv_text("codex", out[0..200], f[0..2]);
+    assert out[7] == 0;
+    assert f[0] == 8;
+    assert out[9] == 99;
+    assert out[10] == 0;
+    assert f[1] == 11;
+    assert out[11] == 101;
+    assert out[15] == 32;
+    assert out[16] == 99;
+    assert out[20] == 120;
+    assert out[21] == 0;
+    assert n == 22;
+}
+
+test the_plist_names_the_binary_and_keeps_it_alive {
+    var out : [600]u8 = undefined;
+    const n : usize = plist_text(out[0..600], "/Users/x/t27os-server");
+    assert n > 200;
+    assert out[0] == 60;
+    assert out[n - 1] == 10;
+    var at : usize = 0;
+    var found : usize = 0;
+    while (at + 21 <= n) {
+        if (out[at] == 47 and out[at + 1] == 85 and out[at + 20] == 114) { found = found + 1; }
+        at = at + 1;
+    }
+    assert found == 1;
+}
+
+test c_path_adds_the_nul {
+    var out : [20]u8 = undefined;
+    out[3] = 255;
+    const n : usize = c_path(out[0..20], "abc");
+    assert n == 3;
+    assert out[3] == 0;
+    assert out[2] == 99;
+}
+
+test a_resume_that_dies_at_once_relaunches_fresh {
+    assert resume_failed(R_RESUME, 1000, 2500, 256);
+    assert !resume_failed(R_RESUME, 1000, 2500, 0);
+    assert !resume_failed(R_RESUME, 1000, 20000, 256);
+    assert !resume_failed(R_RELAUNCH, 1000, 2500, 256);
+    assert !resume_failed(R_RESUME, 5000, 1000, 256);
+}
+
+test a_hooked_working_pane_that_went_silent_is_finished {
+    var w : u32 = pane_step(pane_step(0, P_SPAWNED), P_HOOK_START);
+    w = pane_step(w, P_HOOK_SUBMIT);
+    assert !hook_stale(w, 20000, 1000);
+    assert hook_stale(w, 31000, 1000);
+    assert !hook_stale(pane_step(0, P_SPAWNED), 99999, 0);
+    assert !hook_stale(pane_step(w, P_HOOK_STOP), 99999, 0);
+}
