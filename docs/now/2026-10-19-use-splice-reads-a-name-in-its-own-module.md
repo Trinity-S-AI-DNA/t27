@@ -17,5 +17,9 @@
 - The rule is `specs/compiler/use_splice.t27`; `t27c gen-rust` writes `bootstrap/gen/rust/compiler/use_splice.rs`,
   which use_resolve.rs mounts by `#[path]`. `all_agree` and `alias_target` moved there too, so the hand Rust only
   shrinks.
+- Measured: `gen`, `gen-rust`, `gen-c` and `gen-verilog` over the 757 specs that carry a `use` line, base against this
+  branch: 20 differ (11 had an UNRESOLVED line, 9 named an undeclared path), the other 737 are byte-identical; none of
+  the 20 compiled before and none stopped compiling. `seal --verify` is identical for all 756 sealed importers, since a
+  seal hashes the unspliced source, so only the new spec gets a seal.
 - Trap, not fixed here: `identifiers` reads `;` prose lines, so a comment that names the ambiguous name in the
   importer (the header of the issue's `importer.t27` does) still prints UNRESOLVED, though the output is right.
