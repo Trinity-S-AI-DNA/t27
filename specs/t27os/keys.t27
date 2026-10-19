@@ -1,0 +1,820 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/keys.t27 -- the one key manager of T27 OS: which providers hold a key, which environment
+; variable each agent reads, how a key is shown, what a probe answer does to a provider's status, which of
+; several keys goes next, and what a freshly spawned pane gets in its environment.
+; Owner, 2026-10-19: a KEYS tab modelled on trios, every key managed by one manager written in .t27.
+; Mirrors the trios SR-00 decisions (not the Swift): ModelProvider, ModelKeyRotation (least recently used
+; plus cooldown), ProviderCircuitBreaker, ProviderStatusService, KeychainSecrets.
+; Storage is the macOS Keychain, service "ai.t27.os", one item per provider (account = provider name).
+; Never a plain file and never the repo. This spec holds no key and no syscall: the Keychain, the probe and
+; the child environment are host calls (keys_host.t27, pty_server.t27); only the decisions live here, so
+; they run their tests (a module with @extern imports cannot). Every test uses fake values.
+; Refs gHashTag/t27#10782.
+; ---- MAP: the app.t27.ai account and its keys (read 2026-10-19, read-only; M12 follow-up) -----------------
+; R = 999-multibots-telegraf apps/vibee-editor/render; Q = BrowserOS trios/agent-server/apps/server/src/api
+; (queen-contributor-keys.ts lives at git commit 2b25f0bcf, not in the BrowserOS working tree).
+; IDENTITY (EXISTS). A person signs in with a Telegram Mini App initData (R/auth.ts:509-591) or the Telegram
+;   Login Widget (R/session-routes.ts:909). The server mints an HS256 session JWT, 600 s, claims sub=telegram
+;   id, sid, jti (R/session.ts:137-170), sent as `Authorization: Bearer`. The long-lived refresh token is the
+;   cookie __Host-t27_refresh (HttpOnly, Secure, SameSite=Strict; R/src/auth/refresh-cookie.ts:72) renewed by
+;   POST /api/auth/refresh (R/session-routes.ts:1306). The key owner is `telegram:<id>`
+;   (R/src/hive/contributor-keys-route.ts:31-45).
+; KEYS (EXISTS, metadata only). Table queen_contributor_keys in the Queen's PostgreSQL, AES-256-GCM sealed
+;   (Q/services/queen-contributor-keys.ts:185-259). Browser door GET/POST /api/hive/keys[...] ->
+;   R/render-server.ts:9154 -> Queen with a shared server-to-server token. A key object is {id, provider
+;   (nvidia|zai), label, fingerprint, model, enabled, createdAt, lastProbe{status, checkedAt, latencyMs},
+;   contribution}. The secret is accepted on POST add and never returned.
+; PROXY (MISSING). No route lets a client spend a stored key: no Anthropic-compatible /v1/messages, no
+;   chat-completions proxy on a per-user key, no per-user delegated token. The keys are used only by the
+;   Queen's own bees (Q queen-tick.ts:46, queen-dispatch.ts:36). So a pane cannot use server-side keys without
+;   a copy on this Mac until that route exists (filed as an issue against 999-multibots-telegraf).
+; NOT BUILT HERE: the KEYS tab listing the signed-in user's server keys needs a session token on this Mac;
+;   the Mac app has no sign-in yet (refresh cookie lives on the auth.t27.ai host).
+module T27osKeys;
+
+use t27os::agents::AGENT_COUNT;
+use t27os::session_store::csv_field;
+use t27os::session_store::put_bytes;
+
+/// Keychain service every item is stored under.
+pub const KEYCHAIN_SERVICE : str = "ai.t27.os";
+
+pub const PROVIDER_COUNT : u32 = 9;
+pub const P_ANTHROPIC : u32 = 0;
+pub const P_OPENAI : u32 = 1;
+pub const P_GEMINI : u32 = 2;
+pub const P_OPENROUTER : u32 = 3;
+pub const P_ZAI : u32 = 4;
+pub const P_OLLAMA : u32 = 5;
+pub const P_GITHUB : u32 = 6;
+pub const P_CURSOR : u32 = 7;
+pub const P_GONKA : u32 = 8;
+
+/// Provider names in cell order; also the Keychain account of each.
+pub const PROVIDER_NAMES : str = "anthropic,openai,gemini,openrouter,zai,ollama,github,cursor,gonka";
+/// The environment variable the agent CLIs read the provider's key from.
+pub const PROVIDER_ENVS : str = "ANTHROPIC_API_KEY,OPENAI_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY,ZAI_API_KEY,OLLAMA_API_KEY,GITHUB_TOKEN,CURSOR_API_KEY,GONKA_API_KEY";
+
+pub const MAX_KEY_CHARS : u32 = 254;
+
+/// Provider status, trios ProviderStatusService.
+pub const ST_MISSING : u32 = 0;
+pub const ST_STORED : u32 = 1;
+pub const ST_VALID : u32 = 2;
+pub const ST_INVALID : u32 = 3;
+pub const ST_RATE_LIMITED : u32 = 4;
+pub const ST_CIRCUIT_OPEN : u32 = 5;
+pub const STATUS_NAMES : str = "missing,stored,valid,invalid,rate-limited,circuit-open";
+
+/// Circuit breaker: this many failed probes in a row open the circuit, for CIRCUIT_COOLDOWN_S seconds.
+pub const CIRCUIT_FAILS : u32 = 3;
+pub const CIRCUIT_COOLDOWN_S : u64 = 60;
+/// A key that answered 429 rests this long before rotation picks it again.
+pub const RATE_COOLDOWN_S : u64 = 30;
+
+/// Per agent cell (agents.t27 order: Claude, Codex, Gemini, OpenCode, Queen, Crush, Cursor, Aider, Copilot):
+/// a bitmask over providers, bit p set when the agent reads provider p's key.
+pub const AGENT_PROVIDERS : [9]u32 = [1, 2, 4, 11, 1, 63, 128, 15, 64];
+
+/// Does agent a read provider p's key?
+pub fn agent_uses(a: u32, p: u32) -> bool {
+    if (a >= AGENT_COUNT) { return false; }
+    if (p >= PROVIDER_COUNT) { return false; }
+    return (AGENT_PROVIDERS[a] >> p) % 2 == 1;
+}
+
+/// Copy the environment variable name of provider p into out; returns its length (0 when p is unknown).
+pub fn provider_env(p: u32, out: []u8) -> usize {
+    return csv_field(PROVIDER_ENVS, p, out);
+}
+
+/// Copy the name of provider p into out; returns its length.
+pub fn provider_name(p: u32, out: []u8) -> usize {
+    return csv_field(PROVIDER_NAMES, p, out);
+}
+
+/// A key is fit to store when it is non-empty, within MAX_KEY_CHARS and holds only printable ASCII
+/// without a space (a pasted newline or a space is a paste mistake, not a key).
+pub fn key_fits(key: []const u8) -> bool {
+    if (key.len == 0) { return false; }
+    if (key.len > MAX_KEY_CHARS) { return false; }
+    var i : usize = 0;
+    while (i < key.len) {
+        if (key[i] <= 32) { return false; }
+        if (key[i] >= 127) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// How a key is shown: stars, then the last four characters when the key is at least 12 long (a shorter
+/// key shows stars only, so at most a third of a key ever reaches the screen). Returns the length.
+pub fn mask_key(key: []const u8, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "********");
+    if (key.len >= 12) {
+        n = put_bytes(out, n, key[key.len - 4 .. key.len]);
+    }
+    return n;
+}
+
+/// The status after a probe answered with HTTP status code http (0 = no answer: network down or timeout).
+/// `prev` is the status before. A 5xx or no answer does not condemn the key: it keeps `prev` (the failure
+/// feeds the circuit breaker, circuit_fails).
+pub fn status_after_probe(prev: u32, http: u32) -> u32 {
+    if (http >= 200 and http < 300) { return ST_VALID; }
+    if (http == 401 or http == 403) { return ST_INVALID; }
+    if (http == 429) { return ST_RATE_LIMITED; }
+    if (prev == ST_MISSING) { return ST_MISSING; }
+    return prev;
+}
+
+/// A probe that proves nothing about the key (no answer, 5xx) counts as a transport failure.
+pub fn is_transport_failure(http: u32) -> bool {
+    return http == 0 or http >= 500;
+}
+
+/// Consecutive transport failures after one more probe: reset by any answer that came from the provider.
+pub fn circuit_fails(fails: u32, http: u32) -> u32 {
+    if (is_transport_failure(http)) { return fails + 1; }
+    return 0;
+}
+
+/// Is the circuit open at `now`? `opened` is when it opened (seconds), fails the failures in a row.
+pub fn circuit_open(fails: u32, opened: u64, now: u64) -> bool {
+    if (fails < CIRCUIT_FAILS) { return false; }
+    return now < opened + CIRCUIT_COOLDOWN_S;
+}
+
+/// The status to show: a stored key whose circuit is open reads circuit-open; a missing key is missing.
+pub fn status_shown(has_key: bool, status: u32, fails: u32, opened: u64, now: u64) -> u32 {
+    if (has_key == false) { return ST_MISSING; }
+    if (circuit_open(fails, opened, now)) { return ST_CIRCUIT_OPEN; }
+    if (status == ST_MISSING) { return ST_STORED; }
+    return status;
+}
+
+/// Rotation among n keys of one provider (trios ModelKeyRotation): the usable key used longest ago wins.
+/// A key is usable when it is not cooling down (`rest_until[k] <= now`). Returns n when none is usable.
+pub fn rotate_pick(n: u32, last_used: []const u64, rest_until: []const u64, now: u64) -> u32 {
+    var best : u32 = n;
+    var k : u32 = 0;
+    while (k < n) {
+        if (rest_until[k] <= now) {
+            if (best == n) {
+                best = k;
+            } else if (last_used[k] < last_used[best]) {
+                best = k;
+            }
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+/// Names a child process must not inherit: the Claude Code session markers of whatever started the server.
+/// They make the pane believe it is a child session ("Transcript saving is off") and cut its login.
+pub fn env_stripped(name: []const u8) -> bool {
+    if (name.len == 10) {
+        if (name[0] == 67 and name[1] == 76 and name[2] == 65 and name[3] == 85 and name[4] == 68 and name[5] == 69) {
+            if (name[6] == 67 and name[7] == 79 and name[8] == 68 and name[9] == 69) { return true; }
+        }
+    }
+    if (name.len < 12) { return false; }
+    var i : usize = 0;
+    const pre : str = "CLAUDE_CODE_";
+    while (i < 12) {
+        if (name[i] != pre[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The providers whose keys a pane of agent a is given: the bitmask, narrowed to those stored.
+pub fn spawn_mask(a: u32, stored: u32) -> u32 {
+    if (a >= AGENT_COUNT) { return 0; }
+    var m : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (agent_uses(a, p) and (stored >> p) % 2 == 1) { m = m + (1 << p); }
+        p = p + 1;
+    }
+    return m;
+}
+
+/// The Keychain account of provider p (its name) plus the service: "ai.t27.os/anthropic". Returns length.
+pub fn keychain_label(p: u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, KEYCHAIN_SERVICE);
+    n = put_bytes(out, n, "/");
+    var tmp : [24]u8 = undefined;
+    const l : usize = csv_field(PROVIDER_NAMES, p, tmp[0..24]);
+    n = put_bytes(out, n, tmp[0..l]);
+    return n;
+}
+
+test every_agent_reads_its_own_key {
+    assert agent_uses(0, P_ANTHROPIC);
+    assert agent_uses(0, P_OPENAI) == false;
+    assert agent_uses(1, P_OPENAI);
+    assert agent_uses(2, P_GEMINI);
+    assert agent_uses(4, P_ANTHROPIC);
+    assert agent_uses(6, P_CURSOR);
+    assert agent_uses(8, P_GITHUB);
+    assert agent_uses(9, P_ANTHROPIC) == false;
+    assert agent_uses(0, 9) == false;
+}
+
+test multi_provider_agents_get_every_provider_they_read {
+    assert agent_uses(3, P_ANTHROPIC) and agent_uses(3, P_OPENAI) and agent_uses(3, P_OPENROUTER);
+    assert agent_uses(3, P_ZAI) == false;
+    assert agent_uses(5, P_ZAI) and agent_uses(5, P_OLLAMA) and agent_uses(5, P_GEMINI);
+    assert agent_uses(7, P_ANTHROPIC) and agent_uses(7, P_GEMINI) and agent_uses(7, P_OPENROUTER);
+}
+
+test provider_tables_line_up {
+    var out : [40]u8 = undefined;
+    assert provider_name(P_ANTHROPIC, out[0..40]) == 9;
+    assert provider_name(P_GONKA, out[0..40]) == 5;
+    assert provider_name(9, out[0..40]) == 0;
+    assert provider_env(P_ANTHROPIC, out[0..40]) == 17;
+    assert out[0] == 65 and out[16] == 89;
+    assert provider_env(P_GITHUB, out[0..40]) == 12;
+    assert provider_env(P_GONKA, out[0..40]) == 13;
+    assert provider_env(9, out[0..40]) == 0;
+}
+
+test a_key_is_masked_to_four_characters_at_most {
+    var out : [32]u8 = undefined;
+    const n : usize = mask_key("sk-test-0000-abcd", out[0..32]);
+    assert n == 12;
+    assert out[0] == 42 and out[7] == 42;
+    assert out[8] == 97 and out[11] == 100;
+    const s : usize = mask_key("sk-test-00", out[0..32]);
+    assert s == 8;
+    assert out[7] == 42;
+    const e : usize = mask_key("", out[0..32]);
+    assert e == 8;
+}
+
+test a_pasted_key_must_be_one_clean_token {
+    assert key_fits("sk-test-0000");
+    assert key_fits("") == false;
+    assert key_fits("sk test") == false;
+    assert key_fits("sk-test\n") == false;
+    assert key_fits("sk\ttest") == false;
+}
+
+test a_probe_answer_sets_the_status {
+    assert status_after_probe(ST_STORED, 200) == ST_VALID;
+    assert status_after_probe(ST_STORED, 401) == ST_INVALID;
+    assert status_after_probe(ST_VALID, 403) == ST_INVALID;
+    assert status_after_probe(ST_VALID, 429) == ST_RATE_LIMITED;
+    assert status_after_probe(ST_RATE_LIMITED, 200) == ST_VALID;
+    assert status_after_probe(ST_VALID, 503) == ST_VALID;
+    assert status_after_probe(ST_STORED, 0) == ST_STORED;
+    assert status_after_probe(ST_MISSING, 0) == ST_MISSING;
+}
+
+test three_failures_open_the_circuit_for_a_minute {
+    var f : u32 = 0;
+    f = circuit_fails(f, 0);
+    f = circuit_fails(f, 503);
+    assert circuit_open(f, 100, 101) == false;
+    f = circuit_fails(f, 0);
+    assert f == 3;
+    assert circuit_open(f, 100, 101);
+    assert circuit_open(f, 100, 159);
+    assert circuit_open(f, 100, 160) == false;
+    assert circuit_fails(f, 200) == 0;
+    assert circuit_fails(f, 401) == 0;
+}
+
+test the_shown_status_follows_the_key_and_the_circuit {
+    assert status_shown(false, ST_VALID, 0, 0, 0) == ST_MISSING;
+    assert status_shown(true, ST_MISSING, 0, 0, 0) == ST_STORED;
+    assert status_shown(true, ST_VALID, 0, 0, 0) == ST_VALID;
+    assert status_shown(true, ST_VALID, 3, 100, 120) == ST_CIRCUIT_OPEN;
+    assert status_shown(true, ST_VALID, 3, 100, 200) == ST_VALID;
+}
+
+test rotation_takes_the_key_used_longest_ago {
+    var used : [3]u64 = [50, 10, 30];
+    var rest : [3]u64 = [0, 0, 0];
+    assert rotate_pick(3, used[0..3], rest[0..3], 100) == 1;
+    rest[1] = 200;
+    assert rotate_pick(3, used[0..3], rest[0..3], 100) == 2;
+    rest[2] = 200;
+    rest[0] = 200;
+    assert rotate_pick(3, used[0..3], rest[0..3], 100) == 3;
+    assert rotate_pick(3, used[0..3], rest[0..3], 200) == 1;
+    assert rotate_pick(0, used[0..3], rest[0..3], 200) == 0;
+}
+
+test the_claude_code_markers_are_stripped_from_a_pane {
+    assert env_stripped("CLAUDECODE");
+    assert env_stripped("CLAUDE_CODE_CHILD_SESSION");
+    assert env_stripped("CLAUDE_CODE_ENTRYPOINT");
+    assert env_stripped("CLAUDE_CODE_");
+    assert env_stripped("ANTHROPIC_API_KEY") == false;
+    assert env_stripped("CLAUDE_CONFIG_DIR") == false;
+    assert env_stripped("CLAUDE") == false;
+    assert env_stripped("CLAUDECODEX") == false;
+    assert env_stripped("HOME") == false;
+}
+
+test a_pane_gets_only_the_stored_keys_its_agent_reads {
+    const all : u32 = 511;
+    assert spawn_mask(0, all) == 1;
+    assert spawn_mask(0, 2) == 0;
+    assert spawn_mask(3, all) == 11;
+    assert spawn_mask(3, 8) == 8;
+    assert spawn_mask(8, 64) == 64;
+    assert spawn_mask(8, 1) == 0;
+    assert spawn_mask(9, all) == 0;
+}
+
+test the_keychain_item_is_named_by_service_and_provider {
+    var out : [48]u8 = undefined;
+    const n : usize = keychain_label(P_OPENAI, out[0..48]);
+    assert n == 16;
+    assert out[0] == 97 and out[9] == 47 and out[10] == 111;
+}
+
+test a_key_longer_than_the_server_slot_is_refused {
+    var long : [300]u8 = undefined;
+    var i : usize = 0;
+    while (i < 300) { long[i] = 97; i = i + 1; }
+    assert key_fits(long[0..254]);
+    assert key_fits(long[0..255]) == false;
+}
+
+// ---- the check button: the cheapest authenticated request each provider answers ----
+// A GET of the provider's model list (or whoami) with the key in a header -- never in the URL. The answer's
+// HTTP status is all that is read (status_after_probe). cursor and gonka have no such public endpoint: their
+// check stays "stored".
+pub const PROBE_URLS : str = "https://api.anthropic.com/v1/models,https://api.openai.com/v1/models,https://generativelanguage.googleapis.com/v1beta/models,https://openrouter.ai/api/v1/auth/key,https://api.z.ai/api/anthropic/v1/messages,https://ollama.com/api/tags,https://api.github.com/user,,";
+pub const AUTH_NONE : u32 = 0;
+pub const AUTH_BEARER : u32 = 1;
+pub const AUTH_X_API_KEY : u32 = 2;
+pub const AUTH_X_GOOG : u32 = 3;
+pub const PROBE_AUTH : [9]u32 = [2, 1, 3, 1, 2, 1, 1, 0, 0];
+pub const PROBE_TIMEOUT_S : u32 = 6;
+
+pub fn probe_url(p: u32, out: []u8) -> usize {
+    return csv_field(PROBE_URLS, p, out);
+}
+
+pub fn probe_has(p: u32) -> bool {
+    if (p >= PROVIDER_COUNT) { return false; }
+    return PROBE_AUTH[p] != AUTH_NONE;
+}
+
+/// The header that carries the key, and its value (the key itself, or "Bearer " + key).
+pub fn probe_header_name(p: u32, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT) { return 0; }
+    const a : u32 = PROBE_AUTH[p];
+    if (a == AUTH_BEARER) { return put_bytes(out, 0, "Authorization"); }
+    if (a == AUTH_X_API_KEY) { return put_bytes(out, 0, "x-api-key"); }
+    if (a == AUTH_X_GOOG) { return put_bytes(out, 0, "x-goog-api-key"); }
+    return 0;
+}
+
+pub fn probe_header_value(p: u32, key: []const u8, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT) { return 0; }
+    var n : usize = 0;
+    if (PROBE_AUTH[p] == AUTH_BEARER) { n = put_bytes(out, 0, "Bearer "); }
+    return put_bytes(out, n, key);
+}
+
+test every_probe_has_a_url_and_a_header {
+    var u : [160]u8 = undefined;
+    var h : [40]u8 = undefined;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (probe_has(p)) {
+            assert probe_url(p, u[0..160]) > 20;
+            assert u[0] == 104 and u[4] == 115;
+            assert probe_header_name(p, h[0..40]) > 0;
+        } else {
+            assert probe_url(p, u[0..160]) == 0;
+        }
+        p = p + 1;
+    }
+    assert probe_has(P_CURSOR) == false;
+    assert probe_has(P_GONKA) == false;
+    assert probe_has(9) == false;
+}
+
+test the_key_travels_in_a_header_never_in_the_url {
+    var u : [160]u8 = undefined;
+    var v : [64]u8 = undefined;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (probe_has(p)) {
+            const n : usize = probe_url(p, u[0..160]);
+            var i : usize = 0;
+            while (i < n) {
+                assert u[i] != 63 and u[i] != 61;
+                i = i + 1;
+            }
+        }
+        p = p + 1;
+    }
+    assert probe_header_value(P_OPENAI, "sk-test-0000", v[0..64]) == 19;
+    assert v[0] == 66 and v[7] == 115;
+    assert probe_header_value(P_ANTHROPIC, "sk-test-0000", v[0..64]) == 12;
+    assert v[0] == 115;
+}
+
+// ---- the KEYS panel: layout, hit tests and what a click or a key means ----------------------------------
+// The window (glass_window.t27) only draws and forwards; every decision is a tested fn here.
+
+pub const KY_ROWS_Y : f64 = 56.0;
+pub const KY_ROW_H : f64 = 44.0;
+pub const KY_BTN_W : f64 = 56.0;
+pub const KY_BTN_H : f64 = 18.0;
+pub const KY_BTN_DY : f64 = 20.0;
+pub const KY_BTN_GAP : f64 = 6.0;
+pub const KY_LINK_W : f64 = 44.0;
+pub const KY_NONE : u32 = 255;
+
+pub const B_SET : u32 = 0;
+pub const B_DELETE : u32 = 1;
+pub const B_CHECK : u32 = 2;
+
+pub const KA_NONE : u32 = 0;
+pub const KA_EDIT : u32 = 1;
+pub const KA_ARM : u32 = 2;
+pub const KA_DELETE : u32 = 3;
+pub const KA_CHECK : u32 = 4;
+
+pub const KE_NONE : u32 = 0;
+pub const KE_SAVE : u32 = 1;
+pub const KE_CANCEL : u32 = 2;
+pub const KE_BACK : u32 = 3;
+pub const KE_PASTE : u32 = 4;
+pub const KE_CHAR : u32 = 5;
+
+pub const KEY_RETURN : u32 = 36;
+pub const KEY_BACKSPACE : u32 = 51;
+pub const KEY_ESC : u32 = 53;
+pub const KEY_V : u32 = 9;
+
+pub const KEYS_WORDS : str = "KEYS,add,replace,delete,confirm,check,checking,no key,paste or type a key,enter saves  esc cancels,open in";
+
+/// Top edge of provider row r in a panel whose top is t.
+pub fn ky_row_top(t: f64, r: u32) -> f64 {
+    return t + KY_ROWS_Y + @as(f64, @floatFromInt(r)) * KY_ROW_H;
+}
+
+/// Left edge of button b (SET, DELETE, CHECK): the three sit together at the right end of the row.
+pub fn ky_btn_x(l: f64, w: f64, pad: f64, b: u32) -> f64 {
+    return l + w - pad - 3.0 * KY_BTN_W - 2.0 * KY_BTN_GAP + @as(f64, @floatFromInt(b)) * (KY_BTN_W + KY_BTN_GAP);
+}
+
+/// Which button of which row a click lands on, as row * 4 + button; KY_NONE when it lands on none.
+pub fn ky_hit(x: f64, y: f64, l: f64, w: f64, pad: f64, t: f64) -> u32 {
+    var r : u32 = 0;
+    while (r < PROVIDER_COUNT) {
+        const by : f64 = ky_row_top(t, r) + KY_BTN_DY;
+        if (y >= by and y <= by + KY_BTN_H) {
+            var b : u32 = 0;
+            while (b < 3) {
+                const bx : f64 = ky_btn_x(l, w, pad, b);
+                if (x >= bx and x <= bx + KY_BTN_W) { return r * 4 + b; }
+                b = b + 1;
+            }
+        }
+        r = r + 1;
+    }
+    return KY_NONE;
+}
+
+/// The KEYS link in the sidebar foot, left of the DOCTOR link (which ends 14 from the right edge).
+pub fn on_keys_link(x: f64, y: f64, side_w: f64, sh: f64, foot_h: f64, doc_w: f64) -> bool {
+    const right : f64 = side_w - 14.0 - doc_w - 6.0;
+    return x >= right - KY_LINK_W and x <= right and y >= sh - foot_h and y <= sh - 6.0;
+}
+
+/// What a click on button b of a row means. `stored`: the row has a key; `probed`: its provider has a check;
+/// `armed`: the row whose DELETE was clicked once (KY_NONE when none); `row`: the clicked row.
+pub fn ky_click(b: u32, stored: bool, probed: bool, armed: u32, row: u32) -> u32 {
+    if (b == B_SET) { return KA_EDIT; }
+    if (stored == false) { return KA_NONE; }
+    if (b == B_DELETE) {
+        if (armed == row) { return KA_DELETE; }
+        return KA_ARM;
+    }
+    if (b == B_CHECK and probed) { return KA_CHECK; }
+    return KA_NONE;
+}
+
+/// What a key press means while a key is being typed. `code` is the macOS key code, `cmd` the Command bit.
+pub fn ky_key(code: u32, cmd: bool) -> u32 {
+    if (cmd) {
+        if (code == KEY_V) { return KE_PASTE; }
+        return KE_NONE;
+    }
+    if (code == KEY_RETURN) { return KE_SAVE; }
+    if (code == KEY_ESC) { return KE_CANCEL; }
+    if (code == KEY_BACKSPACE) { return KE_BACK; }
+    return KE_CHAR;
+}
+
+/// A typed character is taken when it is printable ASCII without a space and the buffer has room.
+pub fn ky_accepts(len: u32, ch: u32) -> bool {
+    if (len >= MAX_KEY_CHARS) { return false; }
+    return ch > 32 and ch < 127;
+}
+
+/// A pasted text with its surrounding white space and control characters cut off; the length written.
+pub fn trim_key(src: []const u8, out: []u8) -> usize {
+    var a : usize = 0;
+    var b : usize = src.len;
+    while (a < b and src[a] <= 32) { a = a + 1; }
+    while (b > a and src[b - 1] <= 32) { b = b - 1; }
+    var n : usize = 0;
+    while (a + n < b and n < out.len) {
+        out[n] = src[a + n];
+        n = n + 1;
+    }
+    return n;
+}
+
+test a_click_finds_its_row_and_button {
+    const y : f64 = ky_row_top(35.0, 2) + KY_BTN_DY + 4.0;
+    assert ky_hit(ky_btn_x(660.0, 300.0, 16.0, 0) + 3.0, y, 660.0, 300.0, 16.0, 35.0) == 2 * 4 + B_SET;
+    assert ky_hit(ky_btn_x(660.0, 300.0, 16.0, 1) + 5.0, y, 660.0, 300.0, 16.0, 35.0) == 2 * 4 + B_DELETE;
+    assert ky_hit(ky_btn_x(660.0, 300.0, 16.0, 2) + 5.0, y, 660.0, 300.0, 16.0, 35.0) == 2 * 4 + B_CHECK;
+    assert ky_hit(665.0, y, 660.0, 300.0, 16.0, 35.0) == KY_NONE;
+    assert ky_hit(900.0, 35.0, 660.0, 300.0, 16.0, 35.0) == KY_NONE;
+}
+
+test delete_asks_twice {
+    assert ky_click(B_DELETE, true, true, KY_NONE, 3) == KA_ARM;
+    assert ky_click(B_DELETE, true, true, 3, 3) == KA_DELETE;
+    assert ky_click(B_DELETE, true, true, 2, 3) == KA_ARM;
+    assert ky_click(B_DELETE, false, true, KY_NONE, 3) == KA_NONE;
+}
+
+test add_always_edits_and_check_needs_a_key_and_a_probe {
+    assert ky_click(B_SET, false, false, KY_NONE, 0) == KA_EDIT;
+    assert ky_click(B_SET, true, true, KY_NONE, 0) == KA_EDIT;
+    assert ky_click(B_CHECK, true, true, KY_NONE, 0) == KA_CHECK;
+    assert ky_click(B_CHECK, false, true, KY_NONE, 0) == KA_NONE;
+    assert ky_click(B_CHECK, true, false, KY_NONE, 7) == KA_NONE;
+}
+
+test keys_while_typing {
+    assert ky_key(KEY_RETURN, false) == KE_SAVE;
+    assert ky_key(KEY_ESC, false) == KE_CANCEL;
+    assert ky_key(KEY_BACKSPACE, false) == KE_BACK;
+    assert ky_key(KEY_V, true) == KE_PASTE;
+    assert ky_key(0, true) == KE_NONE;
+    assert ky_key(0, false) == KE_CHAR;
+    assert ky_accepts(0, 65);
+    assert ky_accepts(0, 32) == false;
+    assert ky_accepts(0, 10) == false;
+    assert ky_accepts(MAX_KEY_CHARS, 65) == false;
+}
+
+test a_pasted_text_loses_its_white_space {
+    var out : [32]u8 = undefined;
+    const n : usize = trim_key("  sk-abc\n", out[0..32]);
+    assert n == 6;
+    assert out[0] == 115 and out[5] == 99;
+    assert trim_key("\n \t", out[0..32]) == 0;
+    assert trim_key("sk-abc", out[0..4]) == 4;
+}
+
+test the_keys_link_sits_left_of_the_doctor_link {
+    assert on_keys_link(272.0 - 14.0 - 84.0 - 6.0 - 20.0, 530.0, 272.0, 540.0, 30.0, 84.0);
+    assert on_keys_link(272.0 - 20.0, 530.0, 272.0, 540.0, 30.0, 84.0) == false;
+    assert on_keys_link(10.0, 530.0, 272.0, 540.0, 30.0, 84.0) == false;
+}
+
+// ---- the claude pane's PROFILE: which provider the Claude Code CLI talks to (M12) ----------------------
+// The owner's screenshot (2026-10-19): a claude pane answered "Your organization has disabled Claude
+// subscription access". A pane never uses the subscription login; it gets one of two API profiles from
+// the Keychain. Order: the free z.ai first, as the chain in specs/automation/agent-provider-chain.t27
+// (ORDER_DEFAULT "zai,kie,...", WHY: the free route first, a paid one behind it). That spec is written in
+// the brace module syntax and cannot be `use`d from here, so the order is restated once, below, and
+// nowhere else. Kie, nemotron and ollama are not Anthropic-protocol endpoints; they join in stage 2 (the
+// local router, which translates through specs/provider/transform.t27).
+pub const PR_ZAI : u32 = 0;
+pub const PR_ANTHROPIC : u32 = 1;
+pub const PR_NONE : u32 = 255;
+pub const PROFILE_COUNT : u32 = 2;
+pub const PROFILE_NAMES : str = "zai,anthropic-api";
+/// The provider whose Keychain key backs each profile.
+pub const PROFILE_PROVIDER : [2]u32 = [4, 0];
+/// The variables a profile sets. The key variable is filled from the Keychain; the rest are constants.
+pub const PROFILE_VARS_ZAI : str = "ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_MODEL,ANTHROPIC_SMALL_FAST_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL";
+pub const PROFILE_VARS_ANTHROPIC : str = "ANTHROPIC_API_KEY";
+/// Only the flash model answered on the second z.ai key (owner, 2026-10-19), so every model variable names it.
+pub const ZAI_BASE_URL : str = "https://api.z.ai/api/anthropic";
+pub const ZAI_MODEL : str = "glm-4.7-flash";
+/// What a claude pane must not inherit from the shell that started the server: every variable that picks
+/// an endpoint, a login or a model. CLAUDE_CODE_* (including the OAuth token) goes by env_stripped.
+pub const CLAUDE_STRIPS : str = "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_SMALL_FAST_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_CUSTOM_HEADERS";
+pub const CLAUDE_STRIP_COUNT : u32 = 9;
+
+/// Does agent a (cell order of agents.t27) get a profile? Only Claude Code (cell 0).
+pub fn profile_agent(a: u32) -> bool {
+    return a == 0;
+}
+
+pub fn profile_name(pr: u32, out: []u8) -> usize {
+    return csv_field(PROFILE_NAMES, pr, out);
+}
+
+pub fn profile_var_count(pr: u32) -> u32 {
+    if (pr == PR_ZAI) { return 5; }
+    if (pr == PR_ANTHROPIC) { return 1; }
+    return 0;
+}
+
+pub fn profile_var_name(pr: u32, k: u32, out: []u8) -> usize {
+    if (pr == PR_ZAI) { return csv_field(PROFILE_VARS_ZAI, k, out); }
+    if (pr == PR_ANTHROPIC) { return csv_field(PROFILE_VARS_ANTHROPIC, k, out); }
+    return 0;
+}
+
+/// True when variable k of the profile carries the Keychain key.
+pub fn profile_var_is_key(pr: u32, k: u32) -> bool {
+    if (pr == PR_ZAI) { return k == 1; }
+    if (pr == PR_ANTHROPIC) { return k == 0; }
+    return false;
+}
+
+/// The constant value of variable k (0 for the key variable).
+pub fn profile_var_text(pr: u32, k: u32, out: []u8) -> usize {
+    if (pr != PR_ZAI) { return 0; }
+    if (k == 0) { return put_bytes(out, 0, ZAI_BASE_URL); }
+    if (k >= 2 and k < 5) { return put_bytes(out, 0, ZAI_MODEL); }
+    return 0;
+}
+
+/// Is `name` one of the variables a claude pane starts without?
+pub fn claude_strips(name: []const u8) -> bool {
+    var tmp : [40]u8 = undefined;
+    var k : u32 = 0;
+    while (k < CLAUDE_STRIP_COUNT) {
+        const n : usize = csv_field(CLAUDE_STRIPS, k, tmp[0..40]);
+        if (n == name.len) {
+            var i : usize = 0;
+            var same : bool = true;
+            while (i < n) {
+                if (tmp[i] != name[i]) { same = false; }
+                i = i + 1;
+            }
+            if (same) { return true; }
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// The profile a new claude pane gets: the first in order whose provider key is stored and has not
+/// failed its check (bad bit set). PR_NONE when there is none: the pane starts without a key and says so.
+pub fn pick_profile(stored: u32, bad: u32) -> u32 {
+    var pr : u32 = 0;
+    while (pr < PROFILE_COUNT) {
+        const bit : u32 = PROFILE_PROVIDER[pr];
+        if ((stored >> bit) % 2 == 1 and (bad >> bit) % 2 == 0) { return pr; }
+        pr = pr + 1;
+    }
+    return PR_NONE;
+}
+
+/// The bad mask from the providers' statuses (st[p]): invalid and circuit-open keys are not offered.
+pub fn bad_mask(st: []const u32) -> u32 {
+    var m : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT and p < st.len) {
+        if (st[p] == ST_INVALID or st[p] == ST_CIRCUIT_OPEN) { m = m + (1 << p); }
+        p = p + 1;
+    }
+    return m;
+}
+
+/// The "why" line of the KEYS tab: which profile a claude pane gets and why. No key value, ever.
+pub fn profile_why(stored: u32, bad: u32, out: []u8) -> usize {
+    const pr : u32 = pick_profile(stored, bad);
+    var tmp : [24]u8 = undefined;
+    if (pr == PR_NONE) {
+        if (stored == 0) { return put_bytes(out, 0, "claude: no key stored, the pane asks for a login"); }
+        return put_bytes(out, 0, "claude: every stored key failed its check");
+    }
+    var n : usize = put_bytes(out, 0, "claude: ");
+    const l : usize = profile_name(pr, tmp[0..24]);
+    n = put_bytes(out, n, tmp[0..l]);
+    if (pr == PR_ZAI) { return put_bytes(out, n, ", the first key in the chain order"); }
+    const first : u32 = PROFILE_PROVIDER[PR_ZAI];
+    if ((stored >> first) % 2 == 0) { return put_bytes(out, n, ", no z.ai key stored"); }
+    return put_bytes(out, n, ", z.ai failed its check");
+}
+
+/// z.ai has no cheap GET that proves a key opens the Anthropic-protocol route, so its check is one
+/// one-token message to the flash model (free); the answer is read by status only.
+pub fn probe_post(p: u32) -> bool {
+    return p == P_ZAI;
+}
+
+/// Providers whose route wants the anthropic-version header.
+pub fn probe_needs_version(p: u32) -> bool {
+    return p == P_ANTHROPIC or p == P_ZAI;
+}
+
+pub fn probe_body(p: u32, out: []u8) -> usize {
+    if (p != P_ZAI) { return 0; }
+    var n : usize = put_bytes(out, 0, "{\"model\":\"");
+    n = put_bytes(out, n, ZAI_MODEL);
+    return put_bytes(out, n, "\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+}
+
+test the_free_zai_profile_comes_first {
+    assert pick_profile(17, 0) == PR_ZAI;
+    assert pick_profile(1, 0) == PR_ANTHROPIC;
+    assert pick_profile(16, 0) == PR_ZAI;
+    assert pick_profile(0, 0) == PR_NONE;
+    assert pick_profile(2, 0) == PR_NONE;
+}
+
+test a_failed_key_hands_the_pane_to_the_next_profile {
+    assert pick_profile(17, 16) == PR_ANTHROPIC;
+    assert pick_profile(17, 1) == PR_ZAI;
+    assert pick_profile(17, 17) == PR_NONE;
+    var st : [9]u32 = [1, 0, 0, 0, 3, 0, 0, 0, 0];
+    assert bad_mask(st[0..9]) == 16;
+    st[0] = ST_CIRCUIT_OPEN;
+    assert bad_mask(st[0..9]) == 17;
+    st[4] = ST_RATE_LIMITED;
+    assert bad_mask(st[0..9]) == 1;
+}
+
+test the_zai_profile_sets_the_base_url_the_token_and_flash_everywhere {
+    var o : [80]u8 = undefined;
+    assert profile_var_count(PR_ZAI) == 5;
+    assert profile_var_name(PR_ZAI, 0, o[0..80]) == 18;
+    assert profile_var_name(PR_ZAI, 1, o[0..80]) == 20;
+    assert profile_var_is_key(PR_ZAI, 1);
+    assert profile_var_is_key(PR_ZAI, 0) == false;
+    assert profile_var_text(PR_ZAI, 0, o[0..80]) == 30;
+    assert o[0] == 104 and o[8] == 97;
+    assert profile_var_text(PR_ZAI, 1, o[0..80]) == 0;
+    assert profile_var_text(PR_ZAI, 2, o[0..80]) == 13;
+    assert profile_var_text(PR_ZAI, 3, o[0..80]) == 13;
+    assert profile_var_text(PR_ZAI, 4, o[0..80]) == 13;
+    assert profile_var_name(PR_ZAI, 4, o[0..80]) == 29;
+}
+
+test the_anthropic_profile_sets_one_key_variable {
+    var o : [80]u8 = undefined;
+    assert profile_var_count(PR_ANTHROPIC) == 1;
+    assert profile_var_name(PR_ANTHROPIC, 0, o[0..80]) == 17;
+    assert profile_var_is_key(PR_ANTHROPIC, 0);
+    assert profile_var_text(PR_ANTHROPIC, 0, o[0..80]) == 0;
+    assert profile_var_count(PR_NONE) == 0;
+}
+
+test a_claude_pane_starts_without_the_endpoint_variables_of_its_parent {
+    assert claude_strips("ANTHROPIC_API_KEY");
+    assert claude_strips("ANTHROPIC_AUTH_TOKEN");
+    assert claude_strips("ANTHROPIC_BASE_URL");
+    assert claude_strips("ANTHROPIC_MODEL");
+    assert claude_strips("ANTHROPIC_DEFAULT_OPUS_MODEL");
+    assert claude_strips("ANTHROPIC_CUSTOM_HEADERS");
+    assert claude_strips("ANTHROPIC_API_KEYS") == false;
+    assert claude_strips("ANTHROPIC") == false;
+    assert claude_strips("OPENAI_API_KEY") == false;
+    assert claude_strips("PATH") == false;
+    assert profile_agent(0);
+    assert profile_agent(1) == false;
+    assert profile_agent(4) == false;
+}
+
+test the_why_line_names_the_profile_and_never_a_key {
+    var o : [96]u8 = undefined;
+    assert profile_why(0, 0, o[0..96]) > 30;
+    assert o[8] == 110;
+    assert profile_why(17, 0, o[0..96]) > 30;
+    assert o[8] == 122;
+    assert profile_why(17, 16, o[0..96]) > 30;
+    assert o[8] == 97;
+    assert profile_why(1, 0, o[0..96]) > 30;
+    assert o[8] == 97;
+    assert profile_why(16, 16, o[0..96]) > 30;
+    assert o[8] == 101;
+}
+
+test the_zai_check_is_one_message_to_the_flash_model {
+    var b : [160]u8 = undefined;
+    assert probe_post(P_ZAI);
+    assert probe_post(P_ANTHROPIC) == false;
+    assert probe_needs_version(P_ZAI) and probe_needs_version(P_ANTHROPIC);
+    assert probe_needs_version(P_OPENAI) == false;
+    const n : usize = probe_body(P_ZAI, b[0..160]);
+    assert n > 40;
+    assert b[0] == 123 and b[n - 1] == 125;
+    assert probe_body(P_OPENAI, b[0..160]) == 0;
+}
