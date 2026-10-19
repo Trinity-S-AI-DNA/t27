@@ -942,6 +942,14 @@ fn is_char_literal(n: &Node) -> bool {
     let (a, t) = flat(std::slice::from_ref(n)); sh::char_literal(&a, &t, 0)
 }
 
+/// `fn f(..) T { return @extern("sym"); }` (or `{ @extern("sym"); }` for void) imports the C symbol `sym`
+/// (#8946): the fn is named `@sym`, a name t27 source cannot declare, and the object writer reads it.
+fn extern_sym(n: &Node) -> Option<String> {
+    let [s] = n.children.as_slice() else { return None };
+    let c = if s.name == "@extern" { s } else { s.children.first().filter(|_| matches!(s.kind, NodeKind::ExprReturn | NodeKind::StmtExpr))? };
+    c.children.first().filter(|a| c.name == "@extern" && c.children.len() == 1 && a.extra_kind == "string").map(|a| format!("@{}", a.value))
+}
+
 fn parse_int(s: &str) -> Option<i128> {
     Some(st::parse_int(s.as_bytes())).filter(|v| *v != st::NO_INT)
 }
@@ -1622,6 +1630,13 @@ impl<'a> Lower<'a> {
         self.ret_poison = false;
         if poisoned {
             return self.poisoned_function(n);
+        }
+        if let Some(name) = extern_sym(n) { // an import: no body, a str or slice goes as its bytes' address, an aggregate as its own
+            let ty = |t: &LTy| reg_ty(t).unwrap_or(Ty::U64);
+            let vars = params.iter().zip(&n.params).map(|(t, p)| Var { name: p.0.clone(), ty: ty(t) }).collect();
+            if ret.as_ref().is_some_and(is_agg) { return self.reject("FnDecl(extern)", format!("`{}` returns an aggregate; an import returns a scalar (#8972)", n.name)); }
+            let noreturn_site = if ret.is_some() { self.site(TrapKind::NoReturn, format!("import {} run outside an object", n.name), Ty::Bool) } else { 0 };
+            return Ok(Func { name, nparams: params.len(), ret: ret.map(|t| ty(&t)), vars, body: Vec::new(), slots: Vec::new(), line: n.line, is_test: false, is_invariant: false, noreturn_site });
         }
         // Parameters first (vars 0..), then the hidden result pointer, so
         // that they are exactly the first `nparams` variables.
@@ -3106,13 +3121,14 @@ impl<'a> Lower<'a> {
         if c.children.len() != params.len() {
             return self.reject("ExprCall", format!("`{}` takes {} arguments, {} given", c.name, params.len(), c.children.len()));
         }
-        let mut args = Vec::new();
+        let (mut args, ext) = (Vec::new(), self.fns.get(&c.name).is_some_and(|f| extern_sym(f).is_some()));
         for (i, a) in c.children.iter().enumerate() {
             let v = if self.fns.get(&c.name).and_then(|f| f.params.get(i).map(|p| unread_any(f, &p.0, &p.1))) == Some(true) {
                 self.any_arg(c, a, &params[i])?
             } else if is_undefined(a) && !self.is_void(&params[i]) { self.undefined_arg(c, i, a, &params[i])? } else { self.arg_as(a, &params[i])? };
             args.push(match v {
                 // By reference; the callee never writes it.
+                Val::M(p) if ext && matches!(params[i], LTy::Str | LTy::Slice(..)) => Expr { ty: Ty::U64, kind: ExprKind::Load { addr: Box::new(addr_of(&p)), off: 0 } }, // C gets the bytes' address (#8946)
                 Val::M(p) => addr_of(&p),
                 v => self.reg(v)?,
             });
