@@ -410,6 +410,50 @@ card's `PRESETS`; its lab check compares that list to `PRESET_NAMES` byte for by
 - **`specs/t27f/idea_factory.t27` is the factory**, `(IDEA, PRESET) -> RGB24 frames`. It wraps
   (at most 9 characters per line, 4 lines per scene, `|` cuts a scene), lays out in glyph57's 5x7 font,
   assigns particles to glyph sub-slots and the card border, and closes on `CTA`.
+- **A batch of ideas: set `PRESET = PRESET_AUTO`** (255). `main` runs `pick_preset(IDEA, PRESET)`,
+  and AUTO means `preset_of(IDEA)` = FNV-1a 32 of the idea's bytes mod `PRESETS`. The same idea
+  always gets the same style, and different ideas spread across all five; A..Z hit every preset.
+  This is Remotion's `random(seed)` applied to style. Any other `PRESET` value is used as given
+  (gHashTag/t27#10803). Test hashes against the published FNV vectors (`""`, `a`, `b`, `foobar`),
+  never against a value the spec computes itself.
+- **Prove AUTO on the compiled binary, not only in the interpreter.** For each idea, build it
+  twice on the lab: once with `PRESET = PRESET_AUTO` and once with the expected preset written in.
+  md5 the two frame streams (`./f 2>&1 1>fo.txt | md5sum`). They must be SAME, and the idea with a
+  wrong preset must be DIFF (the control). Then gen and the interpreter agree, and you need no image
+  analysis: noir, trit and rain backgrounds differ by a few levels, so a colour check is fragile.
+  The batch in the spec's test (#10815) is five ideas that cover all five presets; render it as the
+  batch preview. **To find an idea's preset without a print:** a scratch spec with
+  `assert((preset_of(X) & b) == b)` for b = 1, 2, 4 reads the value off which tests pass.
+  Build the variants in parallel with `&` and `wait`: 11 builds and renders take about as long as one.
+  **Trap: never `tee` the frame stream into md5 and ffmpeg at once while several encoders run.**
+  Five parallel libx264 encoders on the lab failed with "Error while opening encoder", the
+  pipe closed, and md5 hashed a truncated stream: 3 of 5 read DIFF. Run md5 separately, then
+  encode one at a time. A DIFF that coincides with an encoder error is the harness, not the code.
+- **Run `preflight(IDEA)` before you render an idea** (gHashTag/t27#10820). It returns `PF_EMPTY`
+  (no scene), `PF_GLYPH` (a character glyph57 would draw as `?`, such as phi, a euro sign, `{`, `~`
+  or a malformed byte; `first_missing` gives its byte offset), `PF_LONG` (the reel would run past
+  `MAX_S` = 60 s) or `PF_OK`. `main` writes **0 bytes** for a refused idea, so an empty output file
+  means the idea was refused, not that the render broke. Rewrite the idea instead: `PHI^2`, not the
+  Greek letter. **Check the guard on the binary, with a control:** the same refused idea built with
+  the guard line `sed`-ed out must write frames (144 for `A{B}`), or the 0 bytes prove nothing.
+  **A mutant can survive and still be equivalent:** reels grow in 72-frame steps, so `MAX_S` from
+  60 to 62 refuses exactly the same ideas. Say that in the report, and do not add a test that only
+  restates the constant.
+- **Cut the cover still with `COVER = 1`, not with ffmpeg** (gHashTag/t27#10828). `main` still runs
+  the physics of every frame up to `cover_frame(IDEA)`, which is the first scene's last frame, 71.
+  It rasters only that frame and writes one 6220800-byte frame. The still is therefore byte for
+  byte frame 71 of the reel, with the same idea and preset, and it cannot drift. **Prove it with
+  `cmp`, plus a control.** Cut frame 71 out of the `COVER = 0` output (`dd bs=6220800 skip=71
+  count=1`) and `cmp` it with the cover. A control with the guard moved to `frames - 2` must
+  `cmp` equal to frame 70 instead. Without that control, an identical result could mean
+  both sides are broken the same way.
+  Skipping a frame's rows is `py = FRAME_H` before the row loop. That changes no indentation and
+  needs no `!` (codegen trap #6549).
+- **Insert ledger rows in sort order.** `loop-tools-gate` fails "ledger: sorted, one entry per
+  spec" when a row is out of order, and a nearby row looks right by eye
+  (`sar_switch` was put before `sar_comparator`). Check the order before you commit, on the Mac,
+  without running anything heavier than `sort`:
+  `grep -o '"path": "[^"]*"' docs/reports/t27b_expectations.json | LC_ALL=C sort -c`.
 
 **Keep it FPGA-shaped.** Use Q8 fixed point. The per-step and per-pixel paths use only add,
 multiply, compare, table lookup (`kt` kernel ROM, `tt` tone ROM) and power-of-two division.

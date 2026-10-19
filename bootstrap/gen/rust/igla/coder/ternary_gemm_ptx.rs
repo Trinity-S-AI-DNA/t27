@@ -28,54 +28,6 @@ pub const D_MODEL_500M: usize = 1280;
 
 pub const D_FF_500M: usize = 4096;
 
-pub fn put_s(out: &mut [u8], cap: usize, w: usize, s: &'static str) -> usize {
-    let mut i: usize = 0;
-    while (i < s.len()) {
-        if ((w + i) < cap) {
-            out[((w + i)) as usize] = s.as_bytes()[(i) as usize];
-        }
-        i += 1;
-    }
-    return (w + s.len());
-}
-
-pub fn put_u(out: &mut [u8], cap: usize, w: usize, v: u32) -> usize {
-    let mut d: u32 = 1;
-    while ((v / d) >= 10) {
-        d = (d * 10);
-    }
-    let mut x: usize = w;
-    while (d > 0) {
-        let c: u8 = (b'0' + (((v / d) % 10) as u8));
-        if (x < cap) {
-            out[(x) as usize] = c;
-        }
-        x += 1;
-        d = (d / 10);
-    }
-    return x;
-}
-
-pub fn ins(out: &mut [u8], cap: usize, w: usize, s: &'static str) -> usize {
-    let mut x: usize = put_s(out, cap, w, "    ");
-    x = put_s(out, cap, x, s);
-    return put_s(out, cap, x, "\n");
-}
-
-pub fn put_quad(out: &mut [u8], cap: usize, w: usize, name: &'static str, first: u32) -> usize {
-    let mut x: usize = put_s(out, cap, w, "{");
-    let mut j: u32 = 0;
-    while (j < 4) {
-        if (j > 0) {
-            x = put_s(out, cap, x, ", ");
-        }
-        x = put_s(out, cap, x, name);
-        x = put_u(out, cap, x, (first + j));
-        j += 1;
-    }
-    return put_s(out, cap, x, "}");
-}
-
 pub fn emit_header(out: &mut [u8], cap: usize, w: usize) -> usize {
     let mut x: usize = put_s(out, cap, w, "// ternary_gemm_s8 -- emitted by t27c from specs/igla/coder/ternary_gemm_ptx.t27 (#10404). Do not edit.\n");
     x = put_s(out, cap, x, ".version 7.0\n.target sm_80\n.address_size 64\n\n");
@@ -197,6 +149,179 @@ pub fn emit_tile_loads(out: &mut [u8], cap: usize, w: usize) -> usize {
     return x;
 }
 
+pub fn emit_ptx(out: &mut [u8], cap: usize) -> usize {
+    let mut x: usize = emit_header(out, cap, 0);
+    x = emit_prologue(out, cap, x);
+    x = put_s(out, cap, x, "LOOP_K:\n");
+    x = ins(out, cap, x, "setp.ge.u32 %p3, %r28, %r3;");
+    x = ins(out, cap, x, "@%p3 bra DONE_K;");
+    x = emit_tile_loads(out, cap, x);
+    x = ins(out, cap, x, "bar.sync 0;");
+    x = emit_mma_step(out, cap, x);
+    x = ins(out, cap, x, "bar.sync 0;");
+    x = ins(out, cap, x, "add.u32 %r28, %r28, 32;");
+    x = ins(out, cap, x, "bra LOOP_K;");
+    x = put_s(out, cap, x, "DONE_K:\n");
+    x = emit_epilogue(out, cap, x);
+    x = ins(out, cap, x, "ret;");
+    return put_s(out, cap, x, "}\n");
+}
+
+pub fn grid_dim(x: usize) -> u32 {
+    return (((x + 127) / 128) as u32);
+}
+
+pub fn shape_ok(m: usize, n: usize, k: usize) -> bool {
+    if (((m < 1) || (n < 16)) || (k < 16)) {
+        return false;
+    }
+    if (((n % 16) != 0) || ((k % 16) != 0)) {
+        return false;
+    }
+    if (k > K_MAX_I32) {
+        return false;
+    }
+    return (((m + 127) / 128) <= GRID_Y_MAX);
+}
+
+pub fn lcg(s: u64) -> u64 {
+    return (((s * 1103515245) + 12345) % 2147483648);
+}
+
+pub fn gen_a(a: &mut [i8], count: usize, seed: u64) -> u64 {
+    let mut s: u64 = seed;
+    let mut i: usize = 0;
+    while (i < count) {
+        s = lcg(s);
+        a[(i) as usize] = (((((s >> 16) % 256) as i32) - 128) as i8);
+        i += 1;
+    }
+    return s;
+}
+
+pub fn gen_wp(wp: &mut [u8], count: usize, seed: u64) -> u64 {
+    let mut s: u64 = seed;
+    let mut i: usize = 0;
+    while (i < count) {
+        let mut byte: u32 = 0;
+        let mut lane: u32 = 0;
+        while (lane < 4) {
+            s = lcg(s);
+            let code: u32 = (((s >> 16) % 4) as u32);
+            byte = (byte | (code << (lane * 2)));
+            lane += 1;
+        }
+        wp[((i / 4)) as usize] = (byte as u8);
+        i += 4;
+    }
+    return s;
+}
+
+pub fn ref_row(a: impl AsRef<[i8]>, wp: &[u8], n: usize, k: usize, row: usize, acc: &mut [i32]) -> () {
+    let a: &[i8] = a.as_ref();
+    let mut j: usize = 0;
+    while (j < n) {
+        acc[(j) as usize] = 0;
+        j += 1;
+    }
+    let mut kk: usize = 0;
+    while (kk < k) {
+        let v: i32 = (a[(((row * k) + kk)) as usize] as i32);
+        if (v != 0) {
+            let base: usize = (kk * n);
+            let mut col: usize = 0;
+            while (col < n) {
+                acc[(col) as usize] += (v * weight(code_at(wp, (base + col))));
+                col += 1;
+            }
+        }
+        kk += 1;
+    }
+}
+
+pub fn mismatches(a: impl AsRef<[i8]>, wp: &[u8], c: impl AsRef<[i32]>, m: usize, n: usize, k: usize, stride: usize, acc: &mut [i32]) -> usize {
+    let a: &[i8] = a.as_ref();
+    let c: &[i32] = c.as_ref();
+    let mut st: usize = stride;
+    if (st == 0) {
+        st = 1;
+    }
+    let mut bad: usize = 0;
+    let mut row: usize = 0;
+    while (row < m) {
+        ref_row(a, wp, n, k, row, acc);
+        let mut col: usize = 0;
+        while (col < n) {
+            if (c[(((row * n) + col)) as usize] != acc[(col) as usize]) {
+                bad += 1;
+            }
+            col += 1;
+        }
+        if (((row + 1) < m) && ((row + st) >= m)) {
+            row = (m - 1);
+        } else {
+            row += st;
+        }
+    }
+    return bad;
+}
+
+pub fn at_text(t: &[u8], n: usize, at: usize, s: &'static str) -> bool {
+    if ((at + s.len()) > n) {
+        return false;
+    }
+    let mut i: usize = 0;
+    while (i < s.len()) {
+        if (t[((at + i)) as usize] != s.as_bytes()[(i) as usize]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+pub fn code_at(wp: &[u8], i: usize) -> u32 {
+    let b: u32 = (wp[((i / 4)) as usize] as u32);
+    let sh: u32 = (((i % 4) * 2) as u32);
+    return ((b >> sh) & 3);
+}
+
+pub fn count_text(t: &[u8], n: usize, s: &'static str) -> usize {
+    let mut c: usize = 0;
+    let mut i: usize = 0;
+    while (i < n) {
+        if at_text(t, n, i, s) {
+            c += 1;
+        }
+        i += 1;
+    }
+    return c;
+}
+
+pub fn emit_epilogue(out: &mut [u8], cap: usize, w: usize) -> usize {
+    let mut x: usize = ins(out, cap, w, "shl.b32 %r39, %r6, 7;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r23, 6;");
+    x = ins(out, cap, x, "add.u32 %r39, %r39, %r41;");
+    x = ins(out, cap, x, "add.u32 %r39, %r39, %r21;");
+    x = ins(out, cap, x, "shl.b32 %r40, %r5, 7;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r24, 5;");
+    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
+    x = ins(out, cap, x, "shl.b32 %r41, %r22, 1;");
+    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
+    let mut mi: u32 = 0;
+    while (mi < 4) {
+        let mut ni: u32 = 0;
+        while (ni < 4) {
+            let b: u32 = (((mi * 4) + ni) * 4);
+            x = emit_store(out, cap, x, (mi * 16), (ni * 8), b);
+            x = emit_store(out, cap, x, ((mi * 16) + 8), (ni * 8), (b + 2));
+            ni += 1;
+        }
+        mi += 1;
+    }
+    return x;
+}
+
 pub fn emit_lds(out: &mut [u8], cap: usize, w: usize, reg: &'static str, i: u32, base: &'static str, off: u32) -> usize {
     let mut x: usize = put_s(out, cap, w, "    ld.shared.u32 ");
     x = put_s(out, cap, x, reg);
@@ -269,180 +394,55 @@ pub fn emit_store(out: &mut [u8], cap: usize, w: usize, dr: u32, dc: u32, b: u32
     return put_s(out, cap, x, "};\n");
 }
 
-pub fn emit_epilogue(out: &mut [u8], cap: usize, w: usize) -> usize {
-    let mut x: usize = ins(out, cap, w, "shl.b32 %r39, %r6, 7;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r23, 6;");
-    x = ins(out, cap, x, "add.u32 %r39, %r39, %r41;");
-    x = ins(out, cap, x, "add.u32 %r39, %r39, %r21;");
-    x = ins(out, cap, x, "shl.b32 %r40, %r5, 7;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r24, 5;");
-    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
-    x = ins(out, cap, x, "shl.b32 %r41, %r22, 1;");
-    x = ins(out, cap, x, "add.u32 %r40, %r40, %r41;");
-    let mut mi: u32 = 0;
-    while (mi < 4) {
-        let mut ni: u32 = 0;
-        while (ni < 4) {
-            let b: u32 = (((mi * 4) + ni) * 4);
-            x = emit_store(out, cap, x, (mi * 16), (ni * 8), b);
-            x = emit_store(out, cap, x, ((mi * 16) + 8), (ni * 8), (b + 2));
-            ni += 1;
+pub fn ins(out: &mut [u8], cap: usize, w: usize, s: &'static str) -> usize {
+    let mut x: usize = put_s(out, cap, w, "    ");
+    x = put_s(out, cap, x, s);
+    return put_s(out, cap, x, "\n");
+}
+
+pub fn put_quad(out: &mut [u8], cap: usize, w: usize, name: &'static str, first: u32) -> usize {
+    let mut x: usize = put_s(out, cap, w, "{");
+    let mut j: u32 = 0;
+    while (j < 4) {
+        if (j > 0) {
+            x = put_s(out, cap, x, ", ");
         }
-        mi += 1;
+        x = put_s(out, cap, x, name);
+        x = put_u(out, cap, x, (first + j));
+        j += 1;
+    }
+    return put_s(out, cap, x, "}");
+}
+
+pub fn put_s(out: &mut [u8], cap: usize, w: usize, s: &'static str) -> usize {
+    let mut i: usize = 0;
+    while (i < s.len()) {
+        if ((w + i) < cap) {
+            out[((w + i)) as usize] = s.as_bytes()[(i) as usize];
+        }
+        i += 1;
+    }
+    return (w + s.len());
+}
+
+pub fn put_u(out: &mut [u8], cap: usize, w: usize, v: u32) -> usize {
+    let mut d: u32 = 1;
+    while ((v / d) >= 10) {
+        d = (d * 10);
+    }
+    let mut x: usize = w;
+    while (d > 0) {
+        let c: u8 = (b'0' + (((v / d) % 10) as u8));
+        if (x < cap) {
+            out[(x) as usize] = c;
+        }
+        x += 1;
+        d = (d / 10);
     }
     return x;
 }
 
-pub fn emit_ptx(out: &mut [u8], cap: usize) -> usize {
-    let mut x: usize = emit_header(out, cap, 0);
-    x = emit_prologue(out, cap, x);
-    x = put_s(out, cap, x, "LOOP_K:\n");
-    x = ins(out, cap, x, "setp.ge.u32 %p3, %r28, %r3;");
-    x = ins(out, cap, x, "@%p3 bra DONE_K;");
-    x = emit_tile_loads(out, cap, x);
-    x = ins(out, cap, x, "bar.sync 0;");
-    x = emit_mma_step(out, cap, x);
-    x = ins(out, cap, x, "bar.sync 0;");
-    x = ins(out, cap, x, "add.u32 %r28, %r28, 32;");
-    x = ins(out, cap, x, "bra LOOP_K;");
-    x = put_s(out, cap, x, "DONE_K:\n");
-    x = emit_epilogue(out, cap, x);
-    x = ins(out, cap, x, "ret;");
-    return put_s(out, cap, x, "}\n");
-}
-
-pub fn grid_dim(x: usize) -> u32 {
-    return (((x + 127) / 128) as u32);
-}
-
-pub fn shape_ok(m: usize, n: usize, k: usize) -> bool {
-    if (((m < 1) || (n < 16)) || (k < 16)) {
-        return false;
-    }
-    if (((n % 16) != 0) || ((k % 16) != 0)) {
-        return false;
-    }
-    if (k > K_MAX_I32) {
-        return false;
-    }
-    return (((m + 127) / 128) <= GRID_Y_MAX);
-}
-
-pub fn lcg(s: u64) -> u64 {
-    return (((s * 1103515245) + 12345) % 2147483648);
-}
-
-pub fn gen_a(a: &mut [i8], count: usize, seed: u64) -> u64 {
-    let mut s: u64 = seed;
-    let mut i: usize = 0;
-    while (i < count) {
-        s = lcg(s);
-        a[(i) as usize] = (((((s >> 16) % 256) as i32) - 128) as i8);
-        i += 1;
-    }
-    return s;
-}
-
-pub fn gen_wp(wp: &mut [u8], count: usize, seed: u64) -> u64 {
-    let mut s: u64 = seed;
-    let mut i: usize = 0;
-    while (i < count) {
-        let mut byte: u32 = 0;
-        let mut lane: u32 = 0;
-        while (lane < 4) {
-            s = lcg(s);
-            let code: u32 = (((s >> 16) % 4) as u32);
-            byte = (byte | (code << (lane * 2)));
-            lane += 1;
-        }
-        wp[((i / 4)) as usize] = (byte as u8);
-        i += 4;
-    }
-    return s;
-}
-
-pub fn code_at(wp: &[u8], i: usize) -> u32 {
-    let b: u32 = (wp[((i / 4)) as usize] as u32);
-    let sh: u32 = (((i % 4) * 2) as u32);
-    return ((b >> sh) & 3);
-}
-
 pub fn weight(code: u32) -> i32 {
     return (((code & 1) as i32) - (((code >> 1) & 1) as i32));
-}
-
-pub fn ref_row(a: impl AsRef<[i8]>, wp: &[u8], n: usize, k: usize, row: usize, acc: &mut [i32]) -> () {
-    let a: &[i8] = a.as_ref();
-    let mut j: usize = 0;
-    while (j < n) {
-        acc[(j) as usize] = 0;
-        j += 1;
-    }
-    let mut kk: usize = 0;
-    while (kk < k) {
-        let v: i32 = (a[(((row * k) + kk)) as usize] as i32);
-        if (v != 0) {
-            let base: usize = (kk * n);
-            let mut col: usize = 0;
-            while (col < n) {
-                acc[(col) as usize] += (v * weight(code_at(wp, (base + col))));
-                col += 1;
-            }
-        }
-        kk += 1;
-    }
-}
-
-pub fn mismatches(a: impl AsRef<[i8]>, wp: &[u8], c: impl AsRef<[i32]>, m: usize, n: usize, k: usize, stride: usize, acc: &mut [i32]) -> usize {
-    let a: &[i8] = a.as_ref();
-    let c: &[i32] = c.as_ref();
-    let mut st: usize = stride;
-    if (st == 0) {
-        st = 1;
-    }
-    let mut bad: usize = 0;
-    let mut row: usize = 0;
-    while (row < m) {
-        ref_row(a, wp, n, k, row, acc);
-        let mut col: usize = 0;
-        while (col < n) {
-            if (c[(((row * n) + col)) as usize] != acc[(col) as usize]) {
-                bad += 1;
-            }
-            col += 1;
-        }
-        if (((row + 1) < m) && ((row + st) >= m)) {
-            row = (m - 1);
-        } else {
-            row += st;
-        }
-    }
-    return bad;
-}
-
-pub fn at_text(t: &[u8], n: usize, at: usize, s: &'static str) -> bool {
-    if ((at + s.len()) > n) {
-        return false;
-    }
-    let mut i: usize = 0;
-    while (i < s.len()) {
-        if (t[((at + i)) as usize] != s.as_bytes()[(i) as usize]) {
-            return false;
-        }
-        i += 1;
-    }
-    return true;
-}
-
-pub fn count_text(t: &[u8], n: usize, s: &'static str) -> usize {
-    let mut c: usize = 0;
-    let mut i: usize = 0;
-    while (i < n) {
-        if at_text(t, n, i, s) {
-            c += 1;
-        }
-        i += 1;
-    }
-    return c;
 }
 
