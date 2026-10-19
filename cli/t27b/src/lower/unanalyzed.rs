@@ -71,19 +71,15 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `global(name)` for the eager pass. Zig resolves a constant only when something analyzed reaches it (`analyzed`): on one
-    /// nothing reaches, the refusals `ls::const_plan` calls Sema's are withdrawn like a body's and come back with `restore_held`.
+    /// `global(name)` for the eager pass: a constant nothing analyzed reaches is lazy like a body (`analyzed`, `ls::const_plan`).
     pub(super) fn eager_const(&mut self, name: &str) {
-        let nerr = self.errors.len();
+        let (nerr, n): (usize, &Node) = (self.errors.len(), self.const_nodes[name]);
         let _ = self.global(name);
-        let a = self.const_nodes[name].extra_type.trim();
-        let spelled = a.is_empty() || self.zig_spelled(a);
-        if self.analyzed.contains(name) || self.errors.len() == nerr || self.errors[nerr..].iter().any(|e| super::ls::const_plan(e.construct.as_bytes(), e.detail.as_bytes(), spelled) == super::ls::KEEP) {
-            return;
+        let spelled = n.extra_type.trim().is_empty() || self.zig_spelled(n.extra_type.trim());
+        if !self.analyzed.contains(name) && self.errors[nerr..].iter().all(|e| super::ls::const_plan(e.construct.as_bytes(), e.detail.as_bytes(), spelled) == super::ls::UNRESOLVED) {
+            let dropped = self.withdraw(nerr); self.held.extend(dropped);
+            self.globals.retain(|_, v| !matches!(v, Val::Poison)); // recovery mode: a reached use must report a withdrawn failure again
         }
-        let dropped = self.withdraw(nerr);
-        self.held.extend(dropped);
-        self.globals.retain(|_, v| !matches!(v, Val::Poison)); // recovery mode caches a failure as Poison; a reached use must report it again
     }
 
     /// A refused signature type Zig resolves only when the fn is analyzed, as `layout` failures are
@@ -116,12 +112,6 @@ impl<'a> Lower<'a> {
     /// reaches can make one, but the callee's parameter types are unknown
     /// here, so the call is refused rather than lowered.
     pub(super) fn unresolved_call<T>(&mut self, c: &Node) -> R<T> {
-        self.reject(
-            "ExprCall(unresolved fn)",
-            format!(
-                "call to `{}`, a fn no test reaches whose signature names a struct t27b cannot lay out",
-                c.name
-            ),
-        )
+        self.reject("ExprCall(unresolved fn)", format!("call to `{}`, a fn no test reaches whose signature names a struct t27b cannot lay out", c.name))
     }
 }

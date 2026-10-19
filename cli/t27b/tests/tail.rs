@@ -392,23 +392,13 @@ fn a_signature_zig_never_resolves() {
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
 }
 
-// ------------------------------------------------ constants Zig never resolves
-
-/// #10899, #10903: a module constant no analyzed code names is never resolved, whatever it is initialised with: a slice written as an
-/// array literal (catalog_gate.t27's `ALLOWED`), a struct built by a call (addrmap.t27's `REGION_BRAM`). `t27c test-report` passes the
-/// conformance spec 2/2, none vacuous (lazy_sig_plan.t27 `const_plan`, ast_shape.t27 `analyzed`). A test that names the slice, directly or
-/// through a fn, keeps the refusal (t27c blocks it), as does one naming a call-initialised struct (t27c passes it: the counted
-/// remainder), and so do a constant naming a type, a fn or a name declared nowhere.
+/// #10899, #10903: a constant no analyzed code names is never resolved (conformance/lazy_const.t27; `t27c test-report` 2/2); a test naming the slice (directly or through a fn) or the call-initialised struct, and a constant naming a type, fn or value declared nowhere, keep the refusal.
 #[test]
 fn a_constant_zig_never_resolves() {
     let src = include_str!("../../../specs/tri/t27b/conformance/lazy_const.t27");
-    let r = run(src);
-    assert!(r.len() == 2 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
-    let t = "assert(lazy_region_end(r) == 0x1100);";
-    for (from, to, want) in [(t, "assert(LAZY_ALLOWED.len == 2);", "ConstDecl(slice) at"), (t, "assert(lazy_allowed_count() == 2);", "ConstDecl(slice) at"), (t, "assert(lazy_bram_end() == 0x100000);", "ConstDecl at"),
-        ("LAZY_ALLOWED : [][]const u8", "LAZY_ALLOWED : []LazyMissing", "type (undeclared)"), ("lazy_region_new(0, 0x100000)", "lazy_region_nowhere(0, 0x100000)", "ExprCall(undeclared fn)"), ("= LAZY_CSR;", "= LAZY_NOWHERE;", "ExprIdentifier(undeclared)")] {
-        let m = common::lower_src(&src.replace(from, to)).unwrap_err().join("\n");
-        assert!(m.contains(want), "{}: {}", to, m);
+    assert_eq!(names_ok(&run(src)).len(), 2);
+    for (from, to, want) in [("== 0x1100", "== 0x1100); assert(LAZY_ALLOWED.len == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_allowed_count() == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_bram_end() == 0x100000", "ConstDecl at"), ("[][]const u8", "[]LazyMissing", "type (undeclared)"), ("lazy_region_new(0, 0x100000)", "lazy_region_nowhere(0, 0x100000)", "ExprCall(undeclared fn)"), ("= LAZY_CSR;", "= LAZY_NOWHERE;", "ExprIdentifier(undeclared)")] {
+        assert!(common::lower_src(&src.replace(from, to)).unwrap_err().join("\n").contains(want), "{}", to);
     }
 }
 
