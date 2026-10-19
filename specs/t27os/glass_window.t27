@@ -1,0 +1,565 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS glass window -- the 27-petal home as a native macOS window, written in t27 and built by t27b.
+; No HTML, no Swift: t27b compiles this module to an arm64 Mach-O object (`t27b build --macho`), and
+; `ld` links it against AppKit, CoreGraphics and libobjc. Every call into the system goes through an
+; import, `fn f(..) T { return @extern("sym"); }` (t27b extern boundary, #8946).
+//
+; What it shows:
+;   W  window   -- NSWindow 960 x 540 pt, transparent title bar, content = NSVisualEffectView, dark
+;                  appearance, behind-window blending: the frosted (matte) glass of the trios app.
+;   G  glass    -- over the blur: black tint 0.30 (trios blackGlass) and the 0.5 px white 0.14 edge.
+;   P  petals   -- geometry, fills (idle black 0.22, hover white, open = realm colour), the 1 px white
+;                  outline, hit test and tap / back all come from petal_menu.t27; the fly-in from
+;                  petal_glass.t27 (800 units out, phase 1 at 4.5/s, spring k 28 damping 0.86).
+;   M  menu     -- a tap opens the petal's menu: black 0.30 scrim, blackGlass panel (surfaceBlack 0.46,
+;                  white 0.14 edge) holding the 3 x 3 empty card slots, a realm-coloured header line and
+;                  a back control; it fades in over 10 frames and out the same way. Escape, the back
+;                  control or a tap outside the panel goes back.
+; CoreGraphics rasterises (anti-aliased paths) into a 2x bitmap that becomes the layer's contents.
+; Epic gHashTag/t27#10782.
+
+module T27osGlassWindow;
+
+use t27f::petal_menu::QX;
+use t27f::petal_menu::QY;
+use t27f::petal_menu::BOX_CX;
+use t27f::petal_menu::BOX_CY;
+use t27f::petal_menu::PETAL_COUNT;
+use t27f::petal_menu::PETAL_NONE;
+use t27f::petal_menu::STATE_HOME;
+use t27f::petal_menu::CARD_SLOTS;
+use t27f::petal_menu::CARD_GAP_PX;
+use t27f::petal_menu::fit_permille;
+use t27f::petal_menu::to_box;
+use t27f::petal_menu::hit_px;
+use t27f::petal_menu::fill;
+use t27f::petal_menu::outline;
+use t27f::petal_menu::on_tap;
+use t27f::petal_menu::on_back;
+use t27f::petal_menu::menu_open;
+use t27f::petal_menu::card_x;
+use t27f::petal_menu::card_y;
+
+// ---- W window ----
+
+pub const W_PT : f64 = 960.0;
+pub const H_PT : f64 = 540.0;
+pub const RETINA : f64 = 2.0;
+/// titled | closable | miniaturizable | resizable | fullSizeContentView (the green button goes full screen)
+pub const STYLE : u64 = 32783;
+/// NSWindowCollectionBehaviorFullScreenPrimary
+pub const FULL_SCREEN_PRIMARY : u64 = 128;
+/// NSViewWidthSizable | NSViewHeightSizable
+pub const SIZABLE : u64 = 18;
+pub const KEY_F : u64 = 3;
+pub const BACKING_BUFFERED : u64 = 2;
+/// NSVisualEffectMaterialHUDWindow, NSVisualEffectBlendingModeBehindWindow, state active
+pub const MATERIAL : u64 = 13;
+pub const BLEND_BEHIND : u64 = 0;
+pub const STATE_ACTIVE : u64 = 1;
+pub const UTF8 : u32 = 134217984;
+/// kCGImageAlphaPremultipliedLast
+pub const ALPHA_PREMUL_LAST : u32 = 1;
+pub const EV_LEFT_DOWN : u64 = 1;
+pub const EV_KEY_DOWN : u64 = 10;
+pub const KEY_ESCAPE : u64 = 53;
+pub const FRAME_S : f64 = 0.0333333333333333;
+
+// ---- G glass, M menu (trios values, as in petal_glass.t27) ----
+
+pub const TINT_BLACK : f64 = 0.30;
+pub const BORDER_WHITE : f64 = 0.14;
+pub const SURFACE_BLACK : f64 = 0.46;
+pub const PANEL_W : f64 = 600.0;
+pub const PANEL_H : f64 = 360.0;
+pub const PANEL_R : f64 = 18.0;
+pub const PANEL_LIFT : f64 = 24.0;
+pub const CARD_R : f64 = 12.0;
+pub const CARD_FILL : f64 = 0.06;
+pub const CARD_EDGE : f64 = 0.10;
+pub const WAVE_STEP : f64 = 0.1;
+pub const BACK_PT : f64 = 28.0;
+pub const CASCADE : f64 = 0.06;
+pub const CARD_HOVER_FILL : f64 = 0.12;
+pub const CARD_HOVER_EDGE : f64 = 0.30;
+pub const CARD_HOVER_LIFT : f64 = 3.0;
+
+// ---- A assembly (LogoAnimation, as in petal_glass.t27) ----
+
+pub const ANIM_FRAMES : u32 = 75;
+pub const START_OFF : f64 = 800.0;
+pub const PHASE1_FRAMES : u32 = 52;
+pub const PHASE1_RATE : f64 = 4.5;
+pub const V_HANDOFF : f64 = 0.4;
+pub const SPRING_K : f64 = 28.0;
+pub const SPRING_DAMP : f64 = 0.86;
+pub const DT : f64 = 0.0333333333333333;
+pub const TAU : f64 = 6.28318530717958647;
+
+// ---- imports: Foundation, the ObjC runtime, AppKit through objc_msgSend, CoreGraphics ----
+
+fn cf_bytes(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn class_named(name: u64) -> u64 { return @extern("NSClassFromString"); }
+fn sel_named(name: u64) -> u64 { return @extern("NSSelectorFromString"); }
+fn pool_push() -> u64 { return @extern("objc_autoreleasePoolPush"); }
+fn pool_pop(p: u64) -> void { @extern("objc_autoreleasePoolPop"); }
+fn msg0(o: u64, s: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg1(o: u64, s: u64, a: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg_flag(o: u64, s: u64, a: bool) -> u64 { return @extern("objc_msgSend"); }
+fn msg_test(o: u64, s: u64) -> bool { return @extern("objc_msgSend"); }
+fn msg_f(o: u64, s: u64, t: f64) -> u64 { return @extern("objc_msgSend"); }
+fn msg_rect(o: u64, s: u64, x: f64, y: f64, w: f64, h: f64) -> u64 { return @extern("objc_msgSend"); }
+fn msg_window(o: u64, s: u64, x: f64, y: f64, w: f64, h: f64, style: u64, backing: u64, later: bool) -> u64 { return @extern("objc_msgSend"); }
+fn msg_event(o: u64, s: u64, mask: u64, until: u64, mode: u64, dequeue: bool) -> u64 { return @extern("objc_msgSend"); }
+fn msg_point(o: u64, s: u64, out: [2]f64) -> void { @extern("objc_msgSend"); }
+fn msg_frame(o: u64, s: u64, out: [4]f64) -> void { @extern("objc_msgSend"); }
+
+fn cg_rgb() -> u64 { return @extern("CGColorSpaceCreateDeviceRGB"); }
+fn cg_bitmap(data: u64, w: usize, h: usize, bits: usize, row: usize, space: u64, info: u32) -> u64 { return @extern("CGBitmapContextCreate"); }
+fn cg_image(c: u64) -> u64 { return @extern("CGBitmapContextCreateImage"); }
+fn cg_image_release(i: u64) -> void { @extern("CGImageRelease"); }
+fn cg_translate(c: u64, x: f64, y: f64) -> void { @extern("CGContextTranslateCTM"); }
+fn cg_scale(c: u64, x: f64, y: f64) -> void { @extern("CGContextScaleCTM"); }
+fn cg_clear(c: u64, x: f64, y: f64, w: f64, h: f64) -> void { @extern("CGContextClearRect"); }
+fn cg_fill_rect(c: u64, x: f64, y: f64, w: f64, h: f64) -> void { @extern("CGContextFillRect"); }
+fn cg_fill_rgba(c: u64, r: f64, g: f64, b: f64, a: f64) -> void { @extern("CGContextSetRGBFillColor"); }
+fn cg_stroke_rgba(c: u64, r: f64, g: f64, b: f64, a: f64) -> void { @extern("CGContextSetRGBStrokeColor"); }
+fn cg_line_width(c: u64, w: f64) -> void { @extern("CGContextSetLineWidth"); }
+fn cg_move(c: u64, x: f64, y: f64) -> void { @extern("CGContextMoveToPoint"); }
+fn cg_line(c: u64, x: f64, y: f64) -> void { @extern("CGContextAddLineToPoint"); }
+fn cg_close(c: u64) -> void { @extern("CGContextClosePath"); }
+fn cg_fill_path(c: u64) -> void { @extern("CGContextFillPath"); }
+fn cg_stroke_path(c: u64) -> void { @extern("CGContextStrokePath"); }
+fn cg_round_rect(x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64, t: u64) -> u64 { return @extern("CGPathCreateWithRoundedRect"); }
+fn cg_add_path(c: u64, p: u64) -> void { @extern("CGContextAddPath"); }
+fn cg_path_release(p: u64) -> void { @extern("CGPathRelease"); }
+fn cg_color(r: f64, g: f64, b: f64, a: f64) -> u64 { return @extern("CGColorCreateGenericRGB"); }
+
+// ---- small helpers ----
+
+fn cf(s: []const u8) -> u64 {
+    return cf_bytes(0, s, s.len, UTF8, false);
+}
+
+fn cls(s: []const u8) -> u64 {
+    return class_named(cf(s));
+}
+
+fn sel(s: []const u8) -> u64 {
+    return sel_named(cf(s));
+}
+
+/// Channel k of a 0xAARRGGBB value in 0..1: 0 red, 1 green, 2 blue, 3 alpha.
+pub fn chan(c: u32, k: u32) -> f64 {
+    var v : u32 = c % 256;
+    if (k == 3) { v = c / 16777216; }
+    if (k == 0) { v = (c / 65536) % 256; }
+    if (k == 1) { v = (c / 256) % 256; }
+    return @as(f64, @floatFromInt(v)) / 255.0;
+}
+
+pub fn clamp01(x: f64) -> f64 {
+    if (x < 0.0) { return 0.0; }
+    if (x > 1.0) { return 1.0; }
+    return x;
+}
+
+/// M. g_wave_transition: one step of the menu alpha towards open (1) or closed (0).
+pub fn wave(a: f64, open: bool) -> f64 {
+    if (open) { return clamp01(a + WAVE_STEP); }
+    return clamp01(a - WAVE_STEP);
+}
+
+/// Viewport pixels per box milli-unit x 1000, from petal_menu's fit.
+pub fn scale() -> f64 {
+    return @as(f64, @floatFromInt(fit_permille(960, 540))) / 1000.0;
+}
+
+pub fn cen_x(p: u32) -> f64 {
+    const i : u32 = p * 4;
+    return @as(f64, @floatFromInt(QX[i] + QX[i + 1] + QX[i + 2] + QX[i + 3])) / 4.0;
+}
+
+pub fn cen_y(p: u32) -> f64 {
+    const i : u32 = p * 4;
+    return @as(f64, @floatFromInt(QY[i] + QY[i + 1] + QY[i + 2] + QY[i + 3])) / 4.0;
+}
+
+/// A. Unit direction a block flies in from: box centre -> its centroid ((1, 0) for a block on the centre).
+pub fn dir(p: u32, axis: u32) -> f64 {
+    const dx : f64 = cen_x(p) - @as(f64, @floatFromInt(BOX_CX));
+    const dy : f64 = cen_y(p) - @as(f64, @floatFromInt(BOX_CY));
+    const len : f64 = @sqrt(dx * dx + dy * dy);
+    if (len <= 100.0) {
+        if (axis == 0) { return 1.0; }
+        return 0.0;
+    }
+    if (axis == 0) { return dx / len; }
+    return dy / len;
+}
+
+/// A. How far (SVG units) every block still is from home after `frame` updates at 30 fps.
+pub fn anim_off(frame: u32) -> f64 {
+    var off : f64 = START_OFF;
+    var v : f64 = 0.0;
+    var f : u32 = 0;
+    while (f < frame and f < ANIM_FRAMES) {
+        if (f < PHASE1_FRAMES) {
+            off = off - off * PHASE1_RATE * DT;
+            v = 0.0 - off * V_HANDOFF;
+        } else {
+            v = v + (0.0 - off) * SPRING_K * DT;
+            v = v * SPRING_DAMP;
+            off = off + v * DT * 60.0;
+        }
+        f = f + 1;
+    }
+    if (frame >= ANIM_FRAMES) { return 0.0; }
+    return off;
+}
+
+/// A box coordinate in milli-units to a window point on one axis (0 x, 1 y; y grows down).
+pub fn to_pt(m: f64, axis: u32) -> f64 {
+    const s : f64 = scale();
+    if (axis == 0) { return 0.5 * W_PT + (m - @as(f64, @floatFromInt(BOX_CX))) / 1000.0 * s; }
+    return 0.5 * H_PT + (m - @as(f64, @floatFromInt(BOX_CY))) / 1000.0 * s;
+}
+
+pub fn panel_top(alpha: f64) -> f64 {
+    return 0.5 * H_PT + (1.0 - alpha) * PANEL_LIFT - 0.5 * PANEL_H;
+}
+
+pub fn panel_left() -> f64 {
+    return 0.5 * W_PT - 0.5 * PANEL_W;
+}
+
+/// M. A tap at (x, y) while the menu is up goes back unless it lands on the panel; the back control
+/// sits above the panel's left corner.
+pub fn tap_goes_back(x: f64, y: f64) -> bool {
+    const l : f64 = panel_left();
+    const t : f64 = panel_top(1.0);
+    if (on_back_control(x, y)) { return true; }
+    return x < l or x > l + PANEL_W or y < t or y > t + PANEL_H;
+}
+
+pub fn on_back_control(x: f64, y: f64) -> bool {
+    const l : f64 = panel_left();
+    const t : f64 = panel_top(1.0);
+    return x >= l and x <= l + BACK_PT and y >= t - BACK_PT - 12.0 and y <= t - 12.0;
+}
+
+pub fn card_w() -> f64 {
+    return (PANEL_W - 4.0 * @as(f64, @floatFromInt(CARD_GAP_PX))) / 3.0;
+}
+
+pub fn card_h() -> f64 {
+    return (PANEL_H - 4.0 * @as(f64, @floatFromInt(CARD_GAP_PX))) / 3.0;
+}
+
+/// M. The card slot under (x, y) on the open panel, CARD_SLOTS when none.
+pub fn card_at(x: f64, y: f64) -> u32 {
+    const l : f64 = panel_left();
+    const t : f64 = panel_top(1.0);
+    var k : u32 = 0;
+    while (k < CARD_SLOTS) {
+        const kx : f64 = l + @as(f64, @floatFromInt(card_x(k, 600)));
+        const ky : f64 = t + @as(f64, @floatFromInt(card_y(k, 360)));
+        if (x >= kx and x <= kx + card_w() and y >= ky and y <= ky + card_h()) { return k; }
+        k = k + 1;
+    }
+    return CARD_SLOTS;
+}
+
+/// M. Cards arrive one after another: slot k shows CASCADE of the fade later than slot k - 1.
+pub fn card_alpha(ma: f64, k: u32) -> f64 {
+    return clamp01((ma - CASCADE * @as(f64, @floatFromInt(k))) / (1.0 - CASCADE * 8.0));
+}
+
+/// Fit of the 960 x 540 scene into a view of w x h points (aspect kept, centred): the scale.
+pub fn fit(w: f64, h: f64) -> f64 {
+    const sx : f64 = w / W_PT;
+    const sy : f64 = h / H_PT;
+    if (sx < sy) { return sx; }
+    return sy;
+}
+
+/// A view point (y up, as AppKit reports it) to a scene point (y down) on one axis.
+pub fn view_to_scene(v: f64, w: f64, h: f64, axis: u32) -> f64 {
+    const s : f64 = fit(w, h);
+    if (axis == 0) { return (v - 0.5 * (w - W_PT * s)) / s; }
+    return H_PT - (v - 0.5 * (h - H_PT * s)) / s;
+}
+
+// ---- drawing ----
+
+fn round_rect(c: u64, x: f64, y: f64, w: f64, h: f64, r: f64) -> void {
+    const p : u64 = cg_round_rect(x, y, w, h, r, r, 0);
+    cg_add_path(c, p);
+    cg_path_release(p);
+}
+
+fn set_fill(c: u64, argb: u32, k: f64) -> void {
+    cg_fill_rgba(c, chan(argb, 0), chan(argb, 1), chan(argb, 2), chan(argb, 3) * k);
+}
+
+/// One frame over the tinted glass: the 27 petals at 1 - ma, then the menu at alpha ma for the petal
+/// `shown`, with the card and back control under the mouse (mx, my) lit.
+fn draw(c: u64, frame: u32, state: u32, hov: u32, ma: f64, shown: u32, mx: f64, my: f64) -> void {
+    cg_clear(c, 0.0, 0.0, W_PT, H_PT);
+    const off : f64 = anim_off(frame) * 1000.0;
+    const oc : u32 = outline();
+    cg_line_width(c, 1.0);
+    // M. the widget mode owns the screen: the logo fades out as the menu fades in, and is gone at ma = 1.
+    const pk : f64 = 1.0 - ma;
+    var p : u32 = 0;
+    while (p < PETAL_COUNT and pk > 0.0) {
+        const ox : f64 = dir(p, 0) * off;
+        const oy : f64 = dir(p, 1) * off;
+        var v : u32 = 0;
+        while (v < 4) {
+            const x : f64 = to_pt(@as(f64, @floatFromInt(QX[p * 4 + v])) + ox, 0);
+            const y : f64 = to_pt(@as(f64, @floatFromInt(QY[p * 4 + v])) + oy, 1);
+            if (v == 0) { cg_move(c, x, y); } else { cg_line(c, x, y); }
+            v = v + 1;
+        }
+        cg_close(c);
+        set_fill(c, fill(p, state, hov), pk);
+        cg_fill_path(c);
+        v = 0;
+        while (v < 4) {
+            const x : f64 = to_pt(@as(f64, @floatFromInt(QX[p * 4 + v])) + ox, 0);
+            const y : f64 = to_pt(@as(f64, @floatFromInt(QY[p * 4 + v])) + oy, 1);
+            if (v == 0) { cg_move(c, x, y); } else { cg_line(c, x, y); }
+            v = v + 1;
+        }
+        cg_close(c);
+        cg_stroke_rgba(c, chan(oc, 0), chan(oc, 1), chan(oc, 2), chan(oc, 3) * pk);
+        cg_stroke_path(c);
+        p = p + 1;
+    }
+    if (ma > 0.0) {
+        const l : f64 = panel_left();
+        const t : f64 = panel_top(ma);
+        cg_fill_rgba(c, 0.0, 0.0, 0.0, TINT_BLACK * ma);
+        cg_fill_rect(c, 0.0, 0.0, W_PT, H_PT);
+        round_rect(c, l, t, PANEL_W, PANEL_H, PANEL_R);
+        cg_fill_rgba(c, 0.0, 0.0, 0.0, SURFACE_BLACK * ma);
+        cg_fill_path(c);
+        round_rect(c, l, t, PANEL_W, PANEL_H, PANEL_R);
+        cg_stroke_rgba(c, 1.0, 1.0, 1.0, BORDER_WHITE * ma);
+        cg_stroke_path(c);
+        set_fill(c, fill(shown, shown, PETAL_NONE), ma);
+        cg_fill_rect(c, l + PANEL_R, t, PANEL_W - 2.0 * PANEL_R, 3.0);
+        const cw : f64 = card_w();
+        const ch : f64 = card_h();
+        var hk : u32 = CARD_SLOTS;
+        if (ma >= 1.0) { hk = card_at(mx, my); }
+        cg_line_width(c, 1.0);
+        var k : u32 = 0;
+        while (k < CARD_SLOTS) {
+            const ka : f64 = card_alpha(ma, k);
+            var kf : f64 = CARD_FILL;
+            var ke : f64 = CARD_EDGE;
+            var lift : f64 = (1.0 - ka) * 10.0;
+            if (k == hk) {
+                kf = CARD_HOVER_FILL;
+                ke = CARD_HOVER_EDGE;
+                lift = 0.0 - CARD_HOVER_LIFT;
+            }
+            const kx : f64 = l + @as(f64, @floatFromInt(card_x(k, 600)));
+            const ky : f64 = t + @as(f64, @floatFromInt(card_y(k, 360))) + lift;
+            round_rect(c, kx, ky, cw, ch, CARD_R);
+            cg_fill_rgba(c, 1.0, 1.0, 1.0, kf * ka);
+            cg_fill_path(c);
+            round_rect(c, kx, ky, cw, ch, CARD_R);
+            cg_stroke_rgba(c, 1.0, 1.0, 1.0, ke * ka);
+            cg_stroke_path(c);
+            k = k + 1;
+        }
+        const by : f64 = t - BACK_PT - 12.0;
+        var bf : f64 = CARD_EDGE;
+        if (ma >= 1.0 and on_back_control(mx, my)) { bf = 0.24; }
+        round_rect(c, l, by, BACK_PT, BACK_PT, 0.5 * BACK_PT);
+        cg_fill_rgba(c, 1.0, 1.0, 1.0, bf * ma);
+        cg_fill_path(c);
+        cg_line_width(c, 2.0);
+        cg_move(c, l + 16.0, by + 8.0);
+        cg_line(c, l + 10.0, by + 14.0);
+        cg_line(c, l + 16.0, by + 20.0);
+        cg_stroke_rgba(c, 1.0, 1.0, 1.0, 0.85 * ma);
+        cg_stroke_path(c);
+    }
+}
+
+// ---- the app ----
+
+pub fn main() -> void {
+    const s_alloc : u64 = sel("alloc");
+    const app : u64 = msg0(cls("NSApplication"), sel("sharedApplication"));
+    msg1(app, sel("setActivationPolicy:"), 0);
+    const win : u64 = msg_window(msg0(cls("NSWindow"), s_alloc), sel("initWithContentRect:styleMask:backing:defer:"), 0.0, 0.0, W_PT, H_PT, STYLE, BACKING_BUFFERED, false);
+    msg1(win, sel("setTitle:"), cf("T27 OS"));
+    msg_flag(win, sel("setTitlebarAppearsTransparent:"), true);
+    msg1(win, sel("setTitleVisibility:"), 1);
+    msg_flag(win, sel("setMovableByWindowBackground:"), false);
+    msg_flag(win, sel("setOpaque:"), false);
+    msg1(win, sel("setBackgroundColor:"), msg0(cls("NSColor"), sel("clearColor")));
+    msg1(win, sel("setAppearance:"), msg1(cls("NSAppearance"), sel("appearanceNamed:"), cf("NSAppearanceNameDarkAqua")));
+    const glass : u64 = msg_rect(msg0(cls("NSVisualEffectView"), s_alloc), sel("initWithFrame:"), 0.0, 0.0, W_PT, H_PT);
+    msg1(glass, sel("setMaterial:"), MATERIAL);
+    msg1(glass, sel("setBlendingMode:"), BLEND_BEHIND);
+    msg1(glass, sel("setState:"), STATE_ACTIVE);
+    msg1(win, sel("setContentView:"), glass);
+    msg1(win, sel("setCollectionBehavior:"), FULL_SCREEN_PRIMARY);
+    msg1(glass, sel("setAutoresizingMask:"), SIZABLE);
+    const view : u64 = msg_rect(msg0(cls("NSView"), s_alloc), sel("initWithFrame:"), 0.0, 0.0, W_PT, H_PT);
+    msg_flag(view, sel("setWantsLayer:"), true);
+    msg1(glass, sel("addSubview:"), view);
+    msg1(view, sel("setAutoresizingMask:"), SIZABLE);
+    const layer : u64 = msg0(view, sel("layer"));
+    msg1(layer, sel("setContentsGravity:"), cf("resizeAspect"));
+    // G. the blackGlass tint lives on the layer, so it covers the whole window in full screen too.
+    msg1(layer, sel("setBackgroundColor:"), cg_color(0.0, 0.0, 0.0, TINT_BLACK));
+    msg0(win, sel("center"));
+    msg1(win, sel("makeKeyAndOrderFront:"), 0);
+    msg0(app, sel("finishLaunching"));
+    msg_flag(app, sel("activateIgnoringOtherApps:"), true);
+
+    const c : u64 = cg_bitmap(0, 1920, 1080, 8, 7680, cg_rgb(), ALPHA_PREMUL_LAST);
+    cg_translate(c, 0.0, H_PT * RETINA);
+    cg_scale(c, RETINA, 0.0 - RETINA);
+
+    const s_next : u64 = sel("nextEventMatchingMask:untilDate:inMode:dequeue:");
+    const s_send : u64 = sel("sendEvent:");
+    const s_type : u64 = sel("type");
+    const s_key : u64 = sel("keyCode");
+    const s_value : u64 = sel("valueForKey:");
+    const s_get : u64 = sel("getValue:");
+    const s_visible : u64 = sel("isVisible");
+    const s_contents : u64 = sel("setContents:");
+    const s_wait : u64 = sel("dateWithTimeIntervalSinceNow:");
+    const s_quiet : u64 = sel("setDisableActions:");
+    const k_mouse : u64 = cf("mouseLocationOutsideOfEventStream");
+    const mode : u64 = cf("kCFRunLoopDefaultMode");
+    const date_cls : u64 = cls("NSDate");
+    const tx_cls : u64 = cls("CATransaction");
+    const k_frame : u64 = cf("frame");
+    const s_full : u64 = sel("toggleFullScreen:");
+    const s_cursor_set : u64 = sel("set");
+    const hand : u64 = msg0(cls("NSCursor"), sel("pointingHandCursor"));
+    const arrow : u64 = msg0(cls("NSCursor"), sel("arrowCursor"));
+    const sc : i64 = fit_permille(960, 540);
+
+    var pt : [2]f64 = undefined;
+    var fr : [4]f64 = undefined;
+    var state : u32 = STATE_HOME;
+    var shown : u32 = 0;
+    var ma : f64 = 0.0;
+    var frame : u32 = 0;
+    while (msg_test(win, s_visible)) {
+        const pool : u64 = pool_push();
+        msg_point(msg1(win, s_value, k_mouse), s_get, pt);
+        msg_frame(msg1(view, s_value, k_frame), s_get, fr);
+        const mx : f64 = view_to_scene(pt[0], fr[2], fr[3], 0);
+        const my : f64 = view_to_scene(pt[1], fr[2], fr[3], 1);
+        var ev : u64 = msg_event(app, s_next, 0xffffffffffffffff, msg_f(date_cls, s_wait, FRAME_S), mode, true);
+        while (ev != 0) {
+            const ty : u64 = msg0(ev, s_type);
+            if (ty == EV_LEFT_DOWN) {
+                if (menu_open(state)) {
+                    if (tap_goes_back(mx, my)) { state = on_back(state); }
+                } else if (ma == 0.0) {
+                    const bx : i64 = to_box(@as(i64, @intFromFloat(mx)), 480, BOX_CX, sc);
+                    const by : i64 = to_box(@as(i64, @intFromFloat(my)), 270, BOX_CY, sc);
+                    state = on_tap(state, bx, by);
+                    if (menu_open(state)) { shown = state; }
+                }
+            }
+            if (ty == EV_KEY_DOWN and msg0(ev, s_key) == KEY_ESCAPE) { state = on_back(state); }
+            if (ty == EV_KEY_DOWN and msg0(ev, s_key) == KEY_F) { msg1(win, s_full, 0); }
+            msg1(app, s_send, ev);
+            ev = msg_event(app, s_next, 0xffffffffffffffff, 0, mode, true);
+        }
+        ma = wave(ma, menu_open(state));
+        var hov : u32 = PETAL_NONE;
+        if (menu_open(state) == false and ma == 0.0) {
+            hov = hit_px(@as(i64, @intFromFloat(mx)), @as(i64, @intFromFloat(my)), 960, 540);
+        }
+        if (hov != PETAL_NONE or (ma >= 1.0 and (on_back_control(mx, my) or card_at(mx, my) != CARD_SLOTS))) { msg0(hand, s_cursor_set); } else { msg0(arrow, s_cursor_set); }
+        draw(c, frame, state, hov, ma, shown, mx, my);
+        const img : u64 = cg_image(c);
+        msg_flag(tx_cls, s_quiet, true);
+        msg1(layer, s_contents, img);
+        cg_image_release(img);
+        frame = frame + 1;
+        pool_pop(pool);
+    }
+}
+
+// ---- tests ----
+
+test the_menu_fades_in_and_out_over_ten_frames {
+    var a : f64 = 0.0;
+    var i : u32 = 0;
+    while (i < 9) { a = wave(a, true); i = i + 1; }
+    assert a < 1.0;
+    a = wave(a, true);
+    assert a > 0.999;
+    i = 0;
+    while (i < 10) { a = wave(a, false); i = i + 1; }
+    assert a < 0.001;
+}
+
+test the_blocks_fly_in_from_800_units_and_settle_home {
+    assert anim_off(0) == 800.0;
+    assert anim_off(1) < 800.0;
+    assert anim_off(40) < 10.0;
+    assert anim_off(ANIM_FRAMES) == 0.0;
+}
+
+test a_tap_outside_the_panel_or_on_back_goes_home {
+    assert tap_goes_back(10.0, 10.0);
+    assert tap_goes_back(panel_left() + 5.0, panel_top(1.0) - 20.0);
+    assert tap_goes_back(480.0, 270.0) == false;
+}
+
+test the_glass_carries_trios_numbers {
+    assert TINT_BLACK == 0.30;
+    assert SURFACE_BLACK == 0.46;
+    assert BORDER_WHITE == 0.14;
+    assert chan(outline(), 3) == 1.0;
+}
+
+test every_petal_flies_out_along_a_unit_direction {
+    var p : u32 = 0;
+    while (p < PETAL_COUNT) {
+        const x : f64 = dir(p, 0);
+        const y : f64 = dir(p, 1);
+        assert @abs(x * x + y * y - 1.0) < 0.000001;
+        p = p + 1;
+    }
+}
+
+test the_menu_finds_the_card_and_the_back_control_under_the_mouse {
+    const l : f64 = panel_left();
+    const t : f64 = panel_top(1.0);
+    assert card_at(l + 30.0, t + 30.0) == 0;
+    assert card_at(480.0, 270.0) == 4;
+    assert card_at(10.0, 10.0) == CARD_SLOTS;
+    assert on_back_control(l + 14.0, t - 26.0);
+    assert on_back_control(480.0, 270.0) == false;
+}
+
+test the_cards_cascade_in_and_all_arrive_at_full_alpha {
+    assert card_alpha(0.3, 0) > card_alpha(0.3, 8);
+    var k : u32 = 0;
+    while (k < CARD_SLOTS) { assert card_alpha(1.0, k) == 1.0; k = k + 1; }
+}
+
+test full_screen_keeps_the_scene_aspect_and_maps_the_mouse_back {
+    assert fit(960.0, 540.0) == 1.0;
+    assert fit(1920.0, 1200.0) == 2.0;
+    assert view_to_scene(960.0, 1920.0, 1200.0, 0) == 480.0;
+    assert view_to_scene(600.0, 1920.0, 1200.0, 1) == 270.0;
+    assert view_to_scene(0.0, 960.0, 540.0, 1) == 540.0;
+}
