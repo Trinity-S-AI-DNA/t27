@@ -359,6 +359,43 @@ Before you change a uniqueness rule, measure what it can draw from:
   shell heredoc, such as a PR body that mentions tests. Write the body with the Write tool, then
   pass `--body-file`.
 
+### Preview the factory's stills as a video (t27#10571)
+
+The owner asks to see intermediate videos, not only numbers. Show one every time a renderer changes.
+
+1. **Write a lab-only printer.** It needs a `main` that loops `t` over `TOPICS`. For each lesson it
+   takes `arche`, `accent`, `motion`, `layout` and `content(t, a)` from `reel_factory`. It then
+   prints a plain PPM (`P3`, 360 x 640) of `scene_still.pixel(...)` through `scene_raster`'s
+   `red`, `green` and `blue`. Give it one trivial `test`.
+2. **Generate and build.** Run `t27c gen` on it, then `zig build-exe -lc -O ReleaseFast`.
+3. **Run it.** `./d 2> all.ppm`: `std.debug.print` writes to stderr. All 27 stills take 4 s and
+   56 MB.
+4. **Split and convert.** Split the dump on each `P3` line with awk. Convert each part to PNG with
+   ffmpeg, which reads P3.
+5. **Make the video and the sheet.**
+   - Video: `ffmpeg -framerate 1.25 -i s%02d.png` with
+     `-vf scale=720:1280:flags=neighbor,fps=30,format=yuv420p` and libx264. This gives 21.6 s.
+   - Contact sheet: `-vf scale=120:213,tile=9x3 -frames:v 1`.
+6. **Fetch them.** Bring both back wrapped as `B64:...:END`, and compare sha256 on both ends.
+   Put them in the session's notes folder, never in the repo or `out-reels/`.
+
+Measured at 355d44a39: each still has 9 to 14 flat colours, and the PNGs are 4 to 32 KB.
+
+**Traps:**
+
+- **A Mac session may not read images.** A hook can block image reads because the upstream
+  provider refuses them. Check the stills by numbers (colour count, file size, ffprobe) and open
+  the file for the owner in the file pane.
+- **WIP commits can sink a PR.** A WIP commit whose message names `#N` without a linking keyword
+  fails L1. `l1-traceability.yml` checks every non-merge commit, and the history cannot be
+  rewritten. Carry the work instead:
+  1. Make a new branch from master.
+  2. `git read-tree -m -u HEAD <merged-branch>`.
+  3. Make one commit with `Closes #N`, open a new PR, and close the old one with a pointer.
+- **Merge in the right direction.** Merging master into an old branch can trip the pre-commit
+  `foreign-budget` hook on master's own Rust lines (t27#10414). Merge the old branch into a
+  master-based branch instead. The result still fast-forwards the old branch.
+
 ## Check the whole corpus for import cycles (t27#10693)
 
 dependency-cruiser's `no-circular` and madge's `--circular` list every module on a cycle.
