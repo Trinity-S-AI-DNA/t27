@@ -157,11 +157,14 @@ App permission checks: write, accepting that permission, secret
 Adding a workflow file means adding its row to `gates.t27` in the same commit.
 The drift gate refuses anything else.
 
-### T27F: the visual spec of every `.t27`
+### T27F: t27's frontend
 
-One spec gives one graph model and many views: source, architecture, data flow,
-dependencies and tests. Every node is labelled exact, derived, suggested or
-unknown, and links back to its source lines. The definition lives in one place:
+T27F is how t27 shows anything visual, through several tools: spec diagrams,
+map stills, particle reels and stills, the hot-reload stream and the
+`claw/t27f` check-run. TRI CLAW serves its MCP tools. Its core is the visual
+spec of every `.t27`: one graph model, many views, every node labelled exact,
+derived, suggested or unknown. The surfaces and their status are
+[`specs/t27f/frontend.t27`](specs/t27f/frontend.t27); the definition lives in
 [`.claude/skills/t27f/SKILL.md`](.claude/skills/t27f/SKILL.md), "What T27F is".
 
 - **Specs:** [`specs/t27f/`](specs/t27f/). The IR is `spec_graph.t27`. The
@@ -174,6 +177,33 @@ unknown, and links back to its source lines. The definition lives in one place:
 - **Read a spec cheaply:** the MCP tool `t27f_outline` returns one line per
   node and edge instead of the whole file. Use it before reading a big spec in
   full.
+
+### t27t: the t27 trainer
+
+t27t is the t27 training product. Its law is
+[`specs/t27t/t27t.t27`](specs/t27t/t27t.t27), run with `tri t27t`. Its runner
+today is the PyTorch trainer gHashTag/igla-coder-gpu (`train.py`, tern-tc
+models). The spec says what the runner must do; it does not rewrite the runner.
+
+- **What makes training cheaper** (measured on an RTX 4090 with CUTLASS 3.5.1,
+  2026-10-18, #10360): the forward GEMMs run on int8 tensor cores, at 2.9x to
+  3.5x bf16, and the gradients stay in bf16. PyTorch reaches those cores through
+  `torch._int_mm`, so no t27c CUDA backend is needed for the saving.
+- **What makes it more expensive:** int8 dp4a on CUDA cores runs at 0.91x to
+  0.94x of bf16. `pick_path` never chooses it.
+- **The saving law:** f x (1 - 1/s), which is 16% to 24%, or $16 to $24 on a
+  $100 run. f is the share of a step spent in forward GEMMs, and it is **an
+  estimate, not a measurement** (`F_MEASURED = false`). Do not quote the saving
+  without saying so.
+- **When a generated kernel takes over:** only on a shape where it beats tuned
+  CUTLASS s8 by 10% (`GEN_CUDA_BAR_E2`).
+- **Open:** the runner is not wired to `torch._int_mm` yet
+  (`RUNNER_USES_INT_MM = false`). The spec's `NOT_MEASURED` lists what else was
+  not measured.
+- **Numbers about our formats** go through the papers check,
+  [`specs/numeric/paper_claims.t27`](specs/numeric/paper_claims.t27) (`tri papers`).
+  Of 45 numbers printed in three papers, 34 recompute, 8 do not, 3 cannot be
+  checked.
 
 ### Hot reload and incremental work: only what changed is redone
 
@@ -448,3 +478,25 @@ documents addressed to other people's agents, the six negative controls, and the
 `;`-alone-on-a-line trap that silently discards a `module` declaration. This
 section is a pointer, not a copy -- the recorded defect in this codebase family
 is the hand-copied rule that only two of its three homes knew about.
+
+## New functionality is written in .t27 only
+
+**Owner, 2026-10-11:** new functionality is added on `t27c` / `t27b`, and the
+outdated logic that lives outside `.t27` is abandoned, not extended.
+
+1. **Spec first, `.t27` only.** A new rule, number, threshold, limit, price,
+   access decision or order of steps is written as a `.t27` spec and executed
+   by `t27c` / `t27b`. It is not written in TypeScript, Rust, Python or
+   hand-written Zig.
+2. **Existing logic outside `.t27` is legacy.** It is not extended. When it is
+   touched for a fix, the rule moves into a spec first and the host keeps only
+   plumbing.
+3. **Plumbing may stay in the host language**: transport, HTTP, database
+   drivers, rendering, wiring. Plumbing never decides a rule. A host function
+   that only looks like a rule is a defect, not plumbing.
+4. **Concurrency uses the actor model of `specs/queen/actors.t27`** (pids,
+   mailboxes, links, monitors, supervisors), not hand-written threads or
+   queues.
+5. **A claim that `t27b` can host a runtime is verified by running it.** Where
+   it cannot yet, the existing host stays as a thin transitional host and the
+   gap is recorded as an issue, not hidden.
