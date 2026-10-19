@@ -20,6 +20,12 @@
 //   `const B: f64 = std.math.pi * 2.0;`), and of an array literal (`const T = [_]u8{ 1, 2, 3 };` is
 //   `const T : [3]u8 = [1, 2, 3];`); `test "name" { .. }`. `const std = @import("std");` and `const math = std.math;` leave
 //   no trace: the table knows them as namespaces (std, math, mem, testing, ascii) and `math.pi`, `std.math.pi` mean the same.
+// - Containers: the fns and consts of a `struct`, `enum` or `union` are read one by one and named `Container_name`
+//   (`Optimizer.bitLength(n)` and a bare `bitLength(n)` inside it are `Optimizer_bitLength(n)`), as the Rust front end names
+//   a method `Type_method`. A container that holds only fns and consts is a namespace and leaves no comment; one with a
+//   field, a variant, a var or a nested type is a type, refused as such (`refused const Point .. type declaration`), and
+//   its static fns still convert while each method is refused for the type it takes. A container inside a container is
+//   a type, not read further.
 // - Types: u8 .. u64, i8 .. i64, usize, isize, bool, f32, f64, void; `[]T` and `[]const T` of those; `[N]T`.
 // - Statements: const and var, assignment and compound assignment, if / else if / else (braces are always written; an
 //   unbraced `if (c) x = 1 else x = 2;` is read), while with its `: (step)`, for over a slice, a range or several objects,
@@ -56,7 +62,7 @@
 //   and the rest of std: "std call `std.math.pow`".
 // --
 // Refused, with the kind a sweep ranks them by: pointers and `.*`, optionals and `.?` / orelse, error unions / try / catch /
-// error values, types other than the scalars above (structs, enums, unions, u128, arbitrary-width ints), comptime and
+// error values, types other than the scalars above (structs, enums, unions as values, u128, arbitrary-width ints), comptime and
 // anytype, payload captures, labels, defer, unreachable, anonymous literals, export / extern / inline fns, mutable
 // file-level vars, a const that is another file's, names nobody declares, bare braces as a statement. Step 2 of #10597
 // reads same-file structs / enums and `*T` self methods; step 3 error unions.
@@ -129,12 +135,15 @@ pub const Z_HASHON : usize = 28;
 pub const Z_INCONST : usize = 29;
 pub const Z_CRAMPED : usize = 31;
 pub const Z_ONE : usize = 32;
+pub const Z_OWNER : usize = 33;
+pub const Z_CUR : usize = 34;
+pub const Z_QUAL : usize = 35;
 /// Slots below Z_FIXED are not the name table's: mine from 8, and rust_convert's own (its line cache sits at 51 and 52).
 pub const Z_FIXED : usize = 128;
 pub const Z_NAMES : usize = 128;
 /// The tail of the state vector, when it is long enough, is a table of the hashes of the test names written so far.
 pub const Z_HSLOTS : usize = 8192;
-pub const Z_NAME_SLOTS : usize = 4;
+pub const Z_NAME_SLOTS : usize = 5;
 
 /// The byte values rust_convert has no name for.
 pub const Z_B_AT : u8 = 64;
@@ -348,6 +357,7 @@ pub const Z_K_LOCAL : usize = 8;
 pub const Z_K_PARAM : usize = 9;
 pub const Z_K_VARX : usize = 10;
 pub const Z_K_HOIST : usize = 11;
+pub const Z_K_NSPACE : usize = 12;
 
 /// The std namespaces a call can name (the class of a K_NS entry): std itself, and its math, mem, testing and ascii.
 pub const Z_NS_STD : usize = 1;
@@ -363,7 +373,7 @@ pub fn z_slot(e: usize) -> usize {
     return Z_NAMES + (e - 1) * Z_NAME_SLOTS;
 }
 
-/// Add a name; false when the table is full.
+/// Add a name (owned by the struct st[Z_OWNER] is reading, none for a local or a top-level name); false when the table is full.
 pub fn z_add_name(st: []usize, kind: usize, lo: usize, hi: usize, cls: usize) -> bool {
     const k : usize = st[Z_NNAMES];
     const s : usize = Z_NAMES + k * Z_NAME_SLOTS;
@@ -372,16 +382,17 @@ pub fn z_add_name(st: []usize, kind: usize, lo: usize, hi: usize, cls: usize) ->
     st[s + 1] = hi;
     st[s + 2] = kind;
     st[s + 3] = cls;
+    st[s + 4] = st[Z_OWNER];
     st[Z_NNAMES] = k + 1;
     return true;
 }
 
-/// The newest entry named src[a .. b] (a local shadows a file-level name), as its index counted from 1; 0 when
-/// there is none. The index also lands in st[Z_HIT].
+/// The entry named src[a .. b] a fn body sees, as its index counted from 1; 0 when there is none (the index also lands in
+/// st[Z_HIT]). A local comes first, newest first, then a member of the struct the fn is in (st[Z_CUR]), then a name of the file.
 pub fn z_find(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
-    var k : usize = st[Z_NNAMES];
     st[Z_HIT] = 0;
-    while (k > 0) {
+    var k : usize = st[Z_NNAMES];
+    while (k > st[Z_NFILE]) {
         k = k - 1;
         const s : usize = Z_NAMES + k * Z_NAME_SLOTS;
         if (st[s + 2] != Z_K_HOIST and same_text(src, st[s], st[s + 1], a, b)) {
@@ -389,22 +400,63 @@ pub fn z_find(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
             return k + 1;
         }
     }
+    var phase : usize = 0;
+    while (phase < 2) {
+        const want_owner : usize = st[Z_CUR] * (1 - phase);
+        if (phase == 1 or st[Z_CUR] != 0) {
+            k = st[Z_NFILE];
+            while (k > 0) {
+                k = k - 1;
+                const s : usize = Z_NAMES + k * Z_NAME_SLOTS;
+                if (st[s + 4] == want_owner and same_text(src, st[s], st[s + 1], a, b)) {
+                    st[Z_HIT] = k + 1;
+                    return k + 1;
+                }
+            }
+        }
+        phase = phase + 1;
+    }
     return 0;
 }
 
-/// The file-level entry named src[a .. b] (the locals are not looked at), as its index counted from 1; 0 when none.
-pub fn z_find_file(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+/// The member of the struct whose entry is `owner`, named src[a .. b]; 0 when it has none.
+pub fn z_find_member(src: []const u8, st: []usize, owner: usize, a: usize, b: usize) -> usize {
     var k : usize = 0;
     st[Z_HIT] = 0;
     while (k < st[Z_NFILE]) {
         const s : usize = Z_NAMES + k * Z_NAME_SLOTS;
-        if (same_text(src, st[s], st[s + 1], a, b)) {
+        if (st[s + 4] == owner and same_text(src, st[s], st[s + 1], a, b)) {
             st[Z_HIT] = k + 1;
             return k + 1;
         }
         k = k + 1;
     }
     return 0;
+}
+
+/// The file-level entry named src[a .. b] of the struct being read (st[Z_CUR], none at the top); 0 when there is none.
+pub fn z_find_file(src: []const u8, st: []usize, a: usize, b: usize) -> usize {
+    return z_find_member(src, st, st[Z_CUR], a, b);
+}
+
+/// A name written for the entry e that src[a .. b] resolved to: a member of a namespace struct is `Struct_member`.
+pub fn z_put_entry(src: []const u8, st: []usize, out: []u8, e: usize, a: usize, b: usize) -> void {
+    const owner : usize = st[z_slot(e) + 4];
+    if (owner != 0) {
+        put_ident(src, st, out, st[z_slot(owner)], st[z_slot(owner) + 1]);
+        puts(st, out, "_");
+    }
+    put_ident(src, st, out, a, b);
+}
+
+/// The name src[a .. b] of a declaration of the struct being read (st[Z_CUR], none at the top), written `Struct_name`.
+pub fn z_put_qualified(src: []const u8, st: []usize, out: []u8, a: usize, b: usize) -> void {
+    const owner : usize = st[Z_CUR];
+    if (owner != 0) {
+        put_ident(src, st, out, st[z_slot(owner)], st[z_slot(owner) + 1]);
+        puts(st, out, "_");
+    }
+    put_ident(src, st, out, a, b);
 }
 
 /// The refusal for a name a fn body cannot use: 0 when it can. Refused names are the cascade (uses refused), another
@@ -772,7 +824,7 @@ pub fn z_unary(src: []const u8, st: []usize, out: []u8) -> usize {
             const e : usize = z_find(src, st, n0, n1);
             if (e != 0 and st[z_slot(e) + 3] >= ZC_ARRAY and st[z_slot(e) + 2] != Z_K_FNX and st[z_slot(e) + 2] != Z_K_CONSTX) {
                 puts(st, out, "&");
-                put_ident(src, st, out, n0, n1);
+                z_put_entry(src, st, out, e, n0, n1);
                 st[Z_CLS] = ZC_SLICE + z_elem(st[z_slot(e) + 3]);
                 z_step(src, st);
                 return L_UNARY;
@@ -1230,6 +1282,49 @@ pub fn z_builtin(src: []const u8, st: []usize, out: []u8) -> usize {
     return L_ATOM;
 }
 
+/// `Struct.member` where the struct is a namespace of this file: a call of its fn or a read of its const, written
+/// `Struct_member`. A member nobody declares, a refused one, or anything else about the struct is refused.
+pub fn z_member_ref(src: []const u8, st: []usize, out: []u8, a: usize, b: usize, e: usize) -> usize {
+    z_step(src, st);
+    if (!z_take(src, st, ".")) {
+        refuse(st, Z_R_TYPE, a, a, b);
+        return L_ATOM;
+    }
+    const ma : usize = st[P];
+    const mb : usize = z_tok_end(src, ma);
+    if (!is_alpha(head(src, ma))) {
+        z_refuse_here(src, st, Z_R_SYNTAX);
+        return L_ATOM;
+    }
+    z_step(src, st);
+    const m : usize = z_find_member(src, st, e, ma, mb);
+    if (m == 0) {
+        // a field, a variant or a decl nobody wrote: of a type when the container holds more than fns and consts
+        if (st[z_slot(e) + 3] == 1) { refuse(st, Z_R_TYPE, a, a, b); } else { refuse(st, Z_R_UNDECL, a, a, mb); }
+        return L_ATOM;
+    }
+    const kind : usize = st[z_slot(m) + 2];
+    const cls : usize = st[z_slot(m) + 3];
+    if (kind == Z_K_FNX or kind == Z_K_CONSTX) {
+        refuse(st, Z_R_DEPENDS, a, a, mb);
+        return L_ATOM;
+    }
+    if (kind != Z_K_FN and kind != Z_K_CONST) {
+        refuse(st, Z_R_FIELD, a, a, mb);
+        return L_ATOM;
+    }
+    z_put_entry(src, st, out, m, ma, mb);
+    if (kind == Z_K_FN) {
+        if (!z_is(src, st[P], "(")) {
+            refuse(st, Z_R_FIELD, a, a, mb);
+            return L_ATOM;
+        }
+        z_args(src, st, out);
+    }
+    st[Z_CLS] = cls;
+    return L_ATOM;
+}
+
 /// A name in an expression: a value (a parameter, a local, a const of this file), a call of a fn of this file, or
 /// std. Names that are refused, external, types or undeclared refuse the reader with their kind.
 pub fn z_name(src: []const u8, st: []usize, out: []u8, a: usize, b: usize) -> usize {
@@ -1250,11 +1345,12 @@ pub fn z_name(src: []const u8, st: []usize, out: []u8, a: usize, b: usize) -> us
     const e : usize = z_find(src, st, a, b);
     if (e == 0 and word_is(src, a, b, "std")) { return z_std_chain(src, st, out, a, Z_NS_STD); }
     if (e != 0 and st[z_slot(e) + 2] == Z_K_NS) { return z_std_chain(src, st, out, a, st[z_slot(e) + 3]); }
+    if (e != 0 and st[z_slot(e) + 2] == Z_K_NSPACE) { return z_member_ref(src, st, out, a, b, e); }
     const k : usize = z_lookup(src, st, a, b);
     if (k == 0) { return L_ATOM; }
     const kind : usize = st[z_slot(k) + 2];
     const cls : usize = st[z_slot(k) + 3];
-    put_ident(src, st, out, a, b);
+    z_put_entry(src, st, out, k, a, b);
     z_step(src, st);
     if (kind == Z_K_FN) {
         if (!z_is(src, st[P], "(")) {
@@ -1514,7 +1610,7 @@ pub fn z_decl(src: []const u8, st: []usize, out: []u8) -> void {
     }
     z_step(src, st);
     if (is_var) { puts(st, out, "var "); } else { puts(st, out, "const "); }
-    put_ident(src, st, out, na, nb);
+    if (st[Z_QUAL] == 1) { z_put_qualified(src, st, out, na, nb); } else { put_ident(src, st, out, na, nb); }
     var cls : usize = ZC_NONE;
     if (z_take(src, st, ":")) {
         puts(st, out, " : ");
@@ -2284,6 +2380,23 @@ pub fn z_scan_const(src: []const u8, st: []usize, q: usize) -> void {
         z_enter(st, Z_K_EXT, na, nb, ZC_NONE);
         return;
     }
+    const lb : usize = z_container_open(src, ip);
+    // a container inside a container is a type like any other (its fns are counted refused with it), not a namespace
+    if (lb < src.len and st[Z_OWNER] == 0) {
+        var pure : usize = 1;
+        if (!z_container_pure(src, lb)) { pure = 0; }
+        z_enter(st, Z_K_NSPACE, na, nb, 1 - pure);
+        const owner : usize = st[Z_NNAMES];
+        const close : usize = block_end(src, lb);
+        st[Z_OWNER] = owner;
+        var p : usize = z_next_member(src, skip_ws(src, lb + 1), close);
+        while (p + 1 < close) {
+            z_scan_item(src, st, p);
+            p = z_next_member(src, skip_ws(src, z_item_end(src, p)), close);
+        }
+        st[Z_OWNER] = 0;
+        return;
+    }
     if (z_type_init(src, ip) or (z_scalar(src, ip, ib) and z_peek_is(src, ip, ";"))) {
         z_enter(st, Z_K_TYPEX, na, nb, ZC_NONE);
         return;
@@ -2296,6 +2409,83 @@ pub fn z_scan_const(src: []const u8, st: []usize, q: usize) -> void {
     z_enter(st, Z_K_CONST, na, nb, cls);
 }
 
+/// Where the `{` is of the container (struct, enum or union) the initializer starting at src[ip] declares; src.len when it
+/// declares none (a packed or extern struct, an opaque, an error set, anything else).
+pub fn z_container_open(src: []const u8, ip: usize) -> usize {
+    if (!(z_is(src, ip, "struct") or z_is(src, ip, "enum") or z_is(src, ip, "union"))) { return src.len; }
+    var q : usize = skip_ws(src, z_tok_end(src, ip));
+    if (head(src, q) == B_LPAREN) { q = skip_ws(src, block_end(src, q)); }
+    if (head(src, q) != B_LBRACE) { return src.len; }
+    return q;
+}
+
+/// Does a member of a container start at src[p]: a fn, const, var, test, usingnamespace or comptime block (a field does not)?
+pub fn z_decl_start(src: []const u8, p: usize) -> bool {
+    var q : usize = p;
+    var guard : usize = 0;
+    while (guard < 6 and (z_mod_word(src, q) or z_is(src, q, "threadlocal"))) {
+        q = skip_ws(src, z_tok_end(src, q));
+        guard = guard + 1;
+    }
+    if (z_is(src, q, "fn") or z_is(src, q, "const") or z_is(src, q, "var") or z_is(src, q, "test") or z_is(src, q, "usingnamespace")) { return true; }
+    return z_is(src, q, "comptime") and z_peek_is(src, q, "{");
+}
+
+/// Where the next member of the container whose body ends at src[close - 1] starts, from src[p]; a field is skipped
+/// through its comma. close - 1 when there is none.
+pub fn z_next_member(src: []const u8, p: usize, close: usize) -> usize {
+    var q : usize = p;
+    while (q + 1 < close and !z_decl_start(src, q)) {
+        const cm : usize = find_at(src, q, B_COMMA);
+        if (cm + 1 >= close) { return close - 1; }
+        q = skip_ws(src, cm + 1);
+    }
+    return q;
+}
+
+/// Does the container whose `{` is src[lb] hold only fns and consts: a namespace, whose fns are free fns named
+/// `Container_fn`? A field, a variant, a var, a test, a nested type makes it a type, which is refused (its static fns
+/// are still read one by one).
+pub fn z_container_pure(src: []const u8, lb: usize) -> bool {
+    const close : usize = block_end(src, lb);
+    var p : usize = skip_ws(src, lb + 1);
+    while (p + 1 < close) {
+        var q : usize = p;
+        var guard : usize = 0;
+        while (guard < 6 and z_mod_word(src, q)) {
+            q = skip_ws(src, z_tok_end(src, q));
+            guard = guard + 1;
+        }
+        if (z_is(src, q, "const")) {
+            const eq : usize = find_at(src, q, B_EQ);
+            if (eq >= src.len or z_type_init(src, skip_ws(src, eq + 1))) { return false; }
+        } else if (!z_is(src, q, "fn")) {
+            return false;
+        }
+        const end : usize = z_item_end(src, p);
+        if (end <= p) { return false; }
+        p = skip_ws(src, end);
+    }
+    return true;
+}
+
+/// Enter the names of the item that starts at src[p]: a fn, a const or var, and the members of a namespace struct.
+pub fn z_scan_item(src: []const u8, st: []usize, p: usize) -> void {
+    var q : usize = p;
+    var guard : usize = 0;
+    while (guard < 6 and z_mod_word(src, q)) {
+        q = skip_ws(src, z_tok_end(src, q));
+        guard = guard + 1;
+    }
+    if (z_is(src, q, "fn")) {
+        const na : usize = skip_ws(src, z_tok_end(src, q));
+        const nb : usize = z_tok_end(src, na);
+        if (is_alpha(head(src, na)) and !z_add_name(st, Z_K_FN, na, nb, z_ret_class(src, nb))) { st[Z_CRAMPED] = 1; }
+    } else if (z_is(src, q, "const") or z_is(src, q, "var")) {
+        z_scan_const(src, st, q);
+    }
+}
+
 /// Every name the file declares at its top level, entered before any item is read, so that a fn may use one declared
 /// below it. The table stops growing here (Z_NFILE).
 pub fn z_prescan(src: []const u8, st: []usize) -> void {
@@ -2303,19 +2493,7 @@ pub fn z_prescan(src: []const u8, st: []usize) -> void {
     while (p < src.len) {
         var end : usize = z_item_end(src, p);
         if (end <= p) { end = p + 1; }
-        var q : usize = p;
-        var guard : usize = 0;
-        while (guard < 6 and z_mod_word(src, q)) {
-            q = skip_ws(src, z_tok_end(src, q));
-            guard = guard + 1;
-        }
-        if (z_is(src, q, "fn")) {
-            const na : usize = skip_ws(src, z_tok_end(src, q));
-            const nb : usize = z_tok_end(src, na);
-            if (is_alpha(head(src, na)) and !z_add_name(st, Z_K_FN, na, nb, z_ret_class(src, nb))) { st[Z_CRAMPED] = 1; }
-        } else if (z_is(src, q, "const") or z_is(src, q, "var")) {
-            z_scan_const(src, st, q);
-        }
+        z_scan_item(src, st, p);
         p = skip_ws(src, end);
     }
     st[Z_NFILE] = st[Z_NNAMES];
@@ -2343,6 +2521,10 @@ pub fn z_put_refusal(src: []const u8, st: []usize, out: []u8, what: []const u8, 
     puts(st, out, "// t27o: refused ");
     puts(st, out, what);
     puts(st, out, " ");
+    if (st[Z_CUR] != 0) {
+        put_text(src, st, out, st[z_slot(st[Z_CUR])], st[z_slot(st[Z_CUR]) + 1], 60);
+        puts(st, out, ".");
+    }
     put_text(src, st, out, na, nb, 60);
     puts(st, out, " (line ");
     const ln : usize = line_at(src, st, pos);
@@ -2408,7 +2590,7 @@ pub fn z_fn_item(src: []const u8, st: []usize, out: []u8, p0: usize, q: usize, e
         z_step(src, st);
         if (is_pub) { puts(st, out, "pub "); }
         puts(st, out, "fn ");
-        put_ident(src, st, out, na, nb);
+        z_put_qualified(src, st, out, na, nb);
         z_params(src, st, out);
         const la : usize = st[P];
         const lb : usize = z_tok_end(src, la);
@@ -2468,6 +2650,9 @@ pub fn z_const_item(src: []const u8, st: []usize, out: []u8, p0: usize, q: usize
         refuse(st, Z_R_SYNTAX, na, na, nb);
     } else if (word_is(src, ip, ib, "@import") or word_is(src, ip, ib, "std")) {
         return;
+    } else if (kind != 0 and st[z_slot(kind) + 2] == Z_K_NSPACE) {
+        z_nspace_item(src, st, out, p0, na, nb, ip, kind);
+        return;
     } else if (z_type_init(src, ip)) {
         const nf : usize = count_fns(src, p0, end);
         st[Z_NFN] = st[Z_NFN] + nf;
@@ -2481,7 +2666,9 @@ pub fn z_const_item(src: []const u8, st: []usize, out: []u8, p0: usize, q: usize
         st[P] = q;
         if (is_pub) { puts(st, out, "pub "); }
         st[Z_INCONST] = 1;
+        st[Z_QUAL] = 1;
         z_decl(src, st, out);
+        st[Z_QUAL] = 0;
         st[Z_INCONST] = 0;
         const last : usize = st[Z_NNAMES];
         if (kind != 0 and last > st[Z_NFILE] and !bad(st[ERR])) { st[z_slot(kind) + 3] = st[z_slot(last) + 3]; }
@@ -2495,6 +2682,27 @@ pub fn z_const_item(src: []const u8, st: []usize, out: []u8, p0: usize, q: usize
         puts(st, out, "\n\n");
     }
     st[ERR] = 0;
+}
+
+/// A container (struct, enum, union) of the file: its members are read as items of their own, named `Container_member`,
+/// and the calls `Container.member(..)` and the bare calls between its members are written the same way. A container that
+/// holds anything but fns and consts is a type, refused as such; its static fns still convert, and its methods are refused
+/// one by one for the type they take.
+pub fn z_nspace_item(src: []const u8, st: []usize, out: []u8, p0: usize, na: usize, nb: usize, ip: usize, e: usize) -> void {
+    const lb : usize = z_container_open(src, ip);
+    const close : usize = block_end(src, lb);
+    if (st[z_slot(e) + 3] == 1) {
+        refuse(st, Z_R_TYPEDECL, ip, ip, z_tok_end(src, ip));
+        z_put_refusal(src, st, out, "const", na, nb, p0, 0);
+        st[ERR] = 0;
+    }
+    st[Z_CUR] = e;
+    st[P] = z_next_member(src, skip_ws(src, lb + 1), close);
+    while (st[P] + 1 < close) {
+        z_item(src, st, out);
+        st[P] = z_next_member(src, st[P], close);
+    }
+    st[Z_CUR] = 0;
 }
 
 /// Does out hold the text s at out[j]?
@@ -2847,8 +3055,8 @@ test bitwise_and_shift_operands_keep_their_parentheses {
 test imports_leave_nothing_and_scalar_consts_convert {
     var out : [512]u8 = undefined;
     var st : [2048]usize = [0] ** 2048;
-    const n : usize = z_body_text("const std = @import(\"std\");\nconst math = std.math;\npub const A: u32 = 4;\npub const B = A * 2 + 1;\nconst PI2: f64 = math.pi * 2.0;\npub const NAMES = [_]u8{ 1, 2, 3 };\npub fn at(i: usize) u8 {\n    return NAMES[i];\n}\npub fn tau() f64 {\n    return PI2;\n}\n", &out, &st);
-    assert(out_is(n, &out, 0, "pub const A : u32 = 4;\n\npub const B = A * 2 + 1;\n\nconst PI2 : f64 = std.math.pi * 2.0;\n\npub const NAMES : [3]u8 = [1, 2, 3];\n\npub fn at(i: usize) -> u8 {\n    return NAMES[i];\n}\n\npub fn tau() -> f64 {\n    return PI2;\n}\n\n"));
+    const n : usize = z_body_text("const std = @import(\"std\");\nconst math = std.math;\npub const A: u32 = 4;\npub const B = A * 2 + 1;\nconst PI2: f64 = math.pi * 2.0;\npub const TABLE = [_]u8{ 1, 2, 3 };\npub fn elem(i: usize) u8 {\n    return TABLE[i];\n}\npub fn tau() f64 {\n    return PI2;\n}\n", &out, &st);
+    assert(out_is(n, &out, 0, "pub const A : u32 = 4;\n\npub const B = A * 2 + 1;\n\nconst PI2 : f64 = std.math.pi * 2.0;\n\npub const TABLE : [3]u8 = [1, 2, 3];\n\npub fn elem(i: usize) -> u8 {\n    return TABLE[i];\n}\n\npub fn tau() -> f64 {\n    return PI2;\n}\n\n"));
     assert(st[Z_NFN] == 2);
     assert(st[Z_NOK] == 2);
 }
@@ -2958,10 +3166,10 @@ test a_callee_refused_anywhere_refuses_its_callers_in_any_order {
 }
 
 test every_refusal_names_its_kind_its_token_and_its_line {
-    var out : [2304]u8 = undefined;
+    var out : [2560]u8 = undefined;
     var st : [2048]usize = [0] ** 2048;
-    const n : usize = z_body_text("const Point = struct {\n    x: u32,\n    pub fn len(self: Point) u32 { return self.x; }\n    pub fn neg(self: Point) u32 { return 0 - self.x; }\n};\nconst Mode = enum { a, b };\nvar counter: u32 = 0;\nconst other = @import(\"other.zig\");\nfn ptr(p: *u32) void { _ = p; }\nfn opt(x: ?u32) u32 { return x orelse 0; }\nfn err(x: u32) !u32 { return x; }\nfn named(p: Point) u32 { return p.x; }\nfn gen(comptime T: type, x: T) T { return x; }\nfn any(x: anytype) u32 { _ = x; return 0; }\nfn tryit(x: u32) u32 { return try err(x); }\nfn catches(x: u32) u32 { return err(x) catch 0; }\nfn defers(x: u32) u32 { defer counter += 1; return x; }\nfn unreach(x: u32) u32 { if (x > 1) unreachable; return x; }\nfn glob(x: u32) u32 { return x + counter; }\nfn ext(x: u32) u32 { return other.f(x); }\nfn field(x: u32) u32 { return x.y; }\nfn anon() u32 { const p = .{ .a = 1 }; _ = p; return 1; }\nfn lab(x: u32) u32 { blk: { _ = x; } return 0; }\nfn blockstmt(x: u32) u32 { { _ = x; } return 0; }\nfn payload(s: []const u8) u32 { if (s.len > 0) |x| { _ = x; } return 0; }\nfn wide(x: u128) u128 { return x; }\nfn catfn(a: u32) u32 { return a ++ a; }\nexport fn exported(x: u32) u32 { return x; }\nextern fn external(x: u32) u32;\ninline fn inl(x: u32) u32 { return x; }\nfn plain(x: u32) u32 { return x; }\ncomptime { }\n", &out, &st);
-    assert(out_is(n, &out, 0, "// t27o: refused const Point (line 1): type declaration `struct` at line 1; 2 fn inside\n\n// t27o: refused const Mode (line 6): type declaration `enum` at line 6\n\n// t27o: refused const counter (line 7): mutable file-level var `counter` at line 7\n\n// t27o: refused fn ptr (line 9): pointer `*` at line 9\n\n// t27o: refused fn opt (line 10): optional `?` at line 10\n\n// t27o: refused fn err (line 11): error handling `!` at line 11\n\n// t27o: refused fn named (line 12): type `Point` at line 12\n\n// t27o: refused fn gen (line 13): comptime or generic `comptime` at line 13\n\n// t27o: refused fn any (line 14): comptime or generic `anytype` at line 14\n\n// t27o: refused fn tryit (line 15): error handling `try` at line 15\n\n// t27o: refused fn catches (line 16): uses refused `err` at line 16\n\n// t27o: refused fn defers (line 17): defer `defer` at line 17\n\n// t27o: refused fn unreach (line 18): unreachable or panic `unreachable` at line 18\n\n// t27o: refused fn glob (line 19): mutable file-level var `counter` at line 19\n\n// t27o: refused fn ext (line 20): uses external `other` at line 20\n\n// t27o: refused fn field (line 21): field or call through a value `y` at line 21\n\n// t27o: refused fn anon (line 22): anonymous literal `.` at line 22\n\n// t27o: refused fn lab (line 23): label `blk` at line 23\n\n// t27o: refused fn blockstmt (line 24): bare braces statement `{` at line 24\n\n// t27o: refused fn payload (line 25): payload capture `|` at line 25\n\n// t27o: refused fn wide (line 26): type `u128` at line 26\n\n// t27o: refused fn catfn (line 27): operator `++` at line 27\n\n// t27o: refused fn exported (line 28): export, extern or inline fn `export` at line 28\n\n// t27o: refused fn external (line 29): export, extern or inline fn `extern` at line 29\n\n// t27o: refused fn inl (line 30): export, extern or inline fn `inline` at line 30\n\nfn plain(x: u32) -> u32 {\n    return x;\n}\n\n// t27o: refused top-level comptime (line 32): declaration `comptime` at line 32\n\n"));
+    const n : usize = z_body_text("const Point = struct {\n    x: u32,\n    pub fn len(self: Point) u32 { return self.x; }\n    pub fn neg(self: Point) u32 { return 0 - self.x; }\n};\nconst Mode = enum { a, b };\nvar counter: u32 = 0;\nconst other = @import(\"other.zig\");\nfn ptr(p: *u32) void { _ = p; }\nfn opt(x: ?u32) u32 { return x orelse 0; }\nfn err(x: u32) !u32 { return x; }\nfn typed(p: Point) u32 { return p.x; }\nfn gen(comptime T: type, x: T) T { return x; }\nfn any(x: anytype) u32 { _ = x; return 0; }\nfn tryit(x: u32) u32 { return try err(x); }\nfn catches(x: u32) u32 { return err(x) catch 0; }\nfn defers(x: u32) u32 { defer counter += 1; return x; }\nfn unreach(x: u32) u32 { if (x > 1) unreachable; return x; }\nfn glob(x: u32) u32 { return x + counter; }\nfn ext(x: u32) u32 { return other.f(x); }\nfn field(x: u32) u32 { return x.y; }\nfn anon() u32 { const p = .{ .a = 1 }; _ = p; return 1; }\nfn lab(x: u32) u32 { blk: { _ = x; } return 0; }\nfn blockstmt(x: u32) u32 { { _ = x; } return 0; }\nfn payload(s: []const u8) u32 { if (s.len > 0) |x| { _ = x; } return 0; }\nfn wide(x: u128) u128 { return x; }\nfn catfn(a: u32) u32 { return a ++ a; }\nexport fn exported(x: u32) u32 { return x; }\nextern fn external(x: u32) u32;\ninline fn inl(x: u32) u32 { return x; }\nfn plain(x: u32) u32 { return x; }\ncomptime { }\n", &out, &st);
+    assert(out_is(n, &out, 0, "// t27o: refused const Point (line 1): type declaration `struct` at line 1\n\n// t27o: refused fn Point.len (line 3): type `Point` at line 3\n\n// t27o: refused fn Point.neg (line 4): type `Point` at line 4\n\n// t27o: refused const Mode (line 6): type declaration `enum` at line 6\n\n// t27o: refused const counter (line 7): mutable file-level var `counter` at line 7\n\n// t27o: refused fn ptr (line 9): pointer `*` at line 9\n\n// t27o: refused fn opt (line 10): optional `?` at line 10\n\n// t27o: refused fn err (line 11): error handling `!` at line 11\n\n// t27o: refused fn typed (line 12): type `Point` at line 12\n\n// t27o: refused fn gen (line 13): comptime or generic `comptime` at line 13\n\n// t27o: refused fn any (line 14): comptime or generic `anytype` at line 14\n\n// t27o: refused fn tryit (line 15): error handling `try` at line 15\n\n// t27o: refused fn catches (line 16): uses refused `err` at line 16\n\n// t27o: refused fn defers (line 17): defer `defer` at line 17\n\n// t27o: refused fn unreach (line 18): unreachable or panic `unreachable` at line 18\n\n// t27o: refused fn glob (line 19): mutable file-level var `counter` at line 19\n\n// t27o: refused fn ext (line 20): uses external `other` at line 20\n\n// t27o: refused fn field (line 21): field or call through a value `y` at line 21\n\n// t27o: refused fn anon (line 22): anonymous literal `.` at line 22\n\n// t27o: refused fn lab (line 23): label `blk` at line 23\n\n// t27o: refused fn blockstmt (line 24): bare braces statement `{` at line 24\n\n// t27o: refused fn payload (line 25): payload capture `|` at line 25\n\n// t27o: refused fn wide (line 26): type `u128` at line 26\n\n// t27o: refused fn catfn (line 27): operator `++` at line 27\n\n// t27o: refused fn exported (line 28): export, extern or inline fn `export` at line 28\n\n// t27o: refused fn external (line 29): export, extern or inline fn `extern` at line 29\n\n// t27o: refused fn inl (line 30): export, extern or inline fn `inline` at line 30\n\nfn plain(x: u32) -> u32 {\n    return x;\n}\n\n// t27o: refused top-level comptime (line 32): declaration `comptime` at line 32\n\n"));
 }
 
 test literals_t27_reads_the_same_pass_and_the_rest_are_refused {
@@ -3003,8 +3211,8 @@ test reserved_words_get_an_underscore_everywhere {
 test a_mutable_slice_parameter_can_be_written_through {
     var out : [512]u8 = undefined;
     var st : [2048]usize = [0] ** 2048;
-    const n : usize = z_body_text("fn fill(a: []u8, v: u8) void {\n    for (0..a.len) |i| {\n        a[i] = v;\n    }\n}\nfn take(a: []const u8) u8 {\n    return a[0];\n}\n", &out, &st);
-    assert(out_is(n, &out, 0, "fn fill(a: []u8, v: u8) -> void {\n    for (0..a.len) |i| {\n        a[i] = v;\n    }\n}\n\nfn take(a: []const u8) -> u8 {\n    return a[0];\n}\n\n"));
+    const n : usize = z_body_text("fn fill(a: []u8, v: u8) void {\n    for (0..a.len) |i| {\n        a[i] = v;\n    }\n}\nfn first_of(a: []const u8) u8 {\n    return a[0];\n}\n", &out, &st);
+    assert(out_is(n, &out, 0, "fn fill(a: []u8, v: u8) -> void {\n    for (0..a.len) |i| {\n        a[i] = v;\n    }\n}\n\nfn first_of(a: []const u8) -> u8 {\n    return a[0];\n}\n\n"));
 }
 
 test a_namespace_alias_inside_a_body_is_a_name_and_not_a_line {
@@ -3034,6 +3242,29 @@ test std_debug_assert_is_an_assert_in_a_body {
     var st : [2048]usize = [0] ** 2048;
     const n : usize = z_body_text("const std = @import(\"std\");\nconst debug = std.debug;\nfn checked(x: u32) u32 {\n    std.debug.assert(x > 0);\n    debug.assert(x < 100);\n    return x - 1;\n}\nfn printing(x: u32) u32 {\n    std.debug.print(\"{}\", .{x});\n    return x;\n}\n", &out, &st);
     assert(out_is(n, &out, 0, "fn checked(x: u32) -> u32 {\n    assert(x > 0);\n    assert(x < 100);\n    return x - 1;\n}\n\n// t27o: refused fn printing (line 8): std call `std.debug.print` at line 9\n\n"));
+}
+
+test a_struct_of_fns_and_consts_is_read_as_free_fns_named_after_it {
+    var out : [1024]u8 = undefined;
+    var st : [2048]usize = [0] ** 2048;
+    const n : usize = z_body_text("const std = @import(\"std\");\npub const Optimizer = struct {\n    pub const LIMIT: u32 = 16;\n    const TABLE = [_]u8{ 3, 1, 4 };\n\n    pub fn bitLength(n: u64) usize {\n        var len: usize = 0;\n        var v = n;\n        while (v > 0) : (v >>= 1) len += 1;\n        return len;\n    }\n\n    pub fn weight(i: usize) u32 {\n        return TABLE[i] + LIMIT + @as(u32, @intCast(bitLength(i)));\n    }\n};\nfn outside(n: u64) usize {\n    return Optimizer.bitLength(n) + Optimizer.LIMIT;\n}\nfn missing() u32 {\n    return Optimizer.nothing(1);\n}\ntest \"bits\" {\n    try std.testing.expectEqual(@as(usize, 8), Optimizer.bitLength(255));\n    try std.testing.expectEqual(@as(usize, 24), outside(255));\n}\n", &out, &st);
+    assert(out_is(n, &out, 0, "pub const Optimizer_LIMIT : u32 = 16;\n\nconst Optimizer_TABLE : [3]u8 = [3, 1, 4];\n\npub fn Optimizer_bitLength(n: u64) -> usize {\n    var len : usize = 0;\n    var v = n;\n    while (v > 0) : (v = v >> 1) {\n        len += 1;\n    }\n    return len;\n}\n\npub fn Optimizer_weight(i: usize) -> u32 {\n    return Optimizer_TABLE[i] + Optimizer_LIMIT + @as(u32, @intCast(Optimizer_bitLength(i)));\n}\n\nfn outside(n: u64) -> usize {\n    return Optimizer_bitLength(n) + Optimizer_LIMIT;\n}\n\n// t27o: refused fn missing (line 20): undeclared `Optimizer.nothing` at line 21\n\ntest bits {\n    assert(Optimizer_bitLength(255) == @as(usize, 8));\n    assert(outside(255) == @as(usize, 24));\n}\n\n"));
+    assert(st[Z_NFN] == 4);
+    assert(st[Z_NOK] == 3);
+}
+
+test a_struct_with_fields_is_a_type_but_its_static_fns_still_convert {
+    var out : [1024]u8 = undefined;
+    var st : [2048]usize = [0] ** 2048;
+    const n : usize = z_body_text("const Point = struct {\n    x: u32,\n    y: u32 = 0,\n\n    pub const ORIGIN_X: u32 = 0;\n\n    pub fn dist(a: u32, b: u32) u32 {\n        return if (a > b) a - b else b - a;\n    }\n\n    pub fn len(self: Point) u32 {\n        return self.x + self.y;\n    }\n\n    pub fn flip(self: *Point) void {\n        self.x = self.y;\n    }\n};\nconst Mode = enum(u8) {\n    on,\n    off = 5,\n\n    pub fn count() usize {\n        return 2;\n    }\n};\nfn use_it() u32 {\n    return Point.dist(3, 5) + Point.ORIGIN_X;\n}\nfn variant() u8 {\n    return @intFromEnum(Mode.off);\n}\nfn make() u32 {\n    return Point.origin();\n}\n", &out, &st);
+    assert(out_is(n, &out, 0, "// t27o: refused const Point (line 1): type declaration `struct` at line 1\n\npub const Point_ORIGIN_X : u32 = 0;\n\npub fn Point_dist(a: u32, b: u32) -> u32 {\n    return if (a > b) a - b else b - a;\n}\n\n// t27o: refused fn Point.len (line 11): type `Point` at line 11\n\n// t27o: refused fn Point.flip (line 15): pointer `*` at line 15\n\n// t27o: refused const Mode (line 19): type declaration `enum` at line 19\n\npub fn Mode_count() -> usize {\n    return 2;\n}\n\nfn use_it() -> u32 {\n    return Point_dist(3, 5) + Point_ORIGIN_X;\n}\n\n// t27o: refused fn variant (line 30): builtin `@intFromEnum` at line 31\n\n// t27o: refused fn make (line 33): type `Point` at line 34\n\n"));
+}
+
+test a_nested_type_a_test_and_a_var_in_a_struct_are_read_for_what_they_are {
+    var out : [768]u8 = undefined;
+    var st : [2048]usize = [0] ** 2048;
+    const n : usize = z_body_text("const Outer = struct {\n    var counter: u32 = 0;\n    const Inner = struct {\n        pub fn deep() u32 { return 1; }\n    };\n    pub fn plain(x: u32) u32 { return x + 1; }\n    test \"plain\" {\n        try @import(\"std\").testing.expectEqual(@as(u32, 2), plain(1));\n    }\n};\n", &out, &st);
+    assert(out_is(n, &out, 0, "// t27o: refused const Outer (line 1): type declaration `struct` at line 1\n\n// t27o: refused const Outer.counter (line 2): mutable file-level var `counter` at line 2\n\n// t27o: refused const Outer.Inner (line 3): type declaration `struct` at line 3; 1 fn inside\n\npub fn Outer_plain(x: u32) -> u32 {\n    return x + 1;\n}\n\n// t27o: refused test Outer.\"plain\" (line 7): error handling `try @import` at line 8\n\n"));
 }
 
 test the_tokenizer_reads_zig_operators_whole {
