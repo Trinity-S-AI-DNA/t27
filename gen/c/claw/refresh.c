@@ -1474,6 +1474,18 @@ void test_the_second_digits_decide_the_order(void) {
     assert((out[47] == '3'));
 }
 
+void test_a_record_cut_after_its_number_does_not_borrow_the_previous_fields(void) {
+    uint8_t r[512] = {0};
+    size_t n = t_rec(&r, 512, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    n = put_str(&r, 512, n, "8\n", 2);
+    uint8_t out[4096] = {0};
+    size_t d = refresh_plan(&r, n, &out, 4096, 0);
+    assert((t_lines(&out, d, 'R') == 1));
+    assert((buf_has(&out, d, "R\t8\t", 4) == false));
+    assert((buf_has(&out, d, "M\tclaw-refresh: 1 to update, ", 29) == true));
+    assert((buf_has(&out, d, " 1 unreadable\n", 14) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -1536,7 +1548,8 @@ int main(void) {
     test_the_513th_record_is_counted_as_unreadable_and_not_stored();
     test_the_hour_digits_decide_the_order();
     test_the_second_digits_decide_the_order();
-    printf("All %d tests passed.\n", 54);
+    test_a_record_cut_after_its_number_does_not_borrow_the_previous_fields();
+    printf("All %d tests passed.\n", 55);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
