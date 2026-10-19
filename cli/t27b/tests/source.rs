@@ -3024,9 +3024,8 @@ fn type_alias_rejections() {
 
 // ------------------------------------------------------------ bare abs
 
-/// `abs(x)` with no `fn abs` declared is Zig's `@abs` (#7227): t27c prints
-/// the builtin. A float loses its sign bit (`-0.0` gives `+0.0`), the
-/// operand runs once, and a comptime operand folds.
+/// `abs(x)` with no `fn abs` declared is Zig's `@abs` (#7227): t27c prints the builtin. A float loses its
+/// sign bit (`-0.0` gives `+0.0`), the operand runs once, a comptime operand folds; bare `sqrt` is `@sqrt`.
 #[test]
 fn bare_abs_is_the_zig_builtin() {
     let src = "module a;
@@ -3059,6 +3058,7 @@ test ok {
     assert(CALLS == 1);
     assert(abs(-2.5) == 2.5);
     assert(abs(-3) == 3);
+    assert(sqrt(mag(-16.0)) == 4.0);
 }
 
 test fails {
@@ -3079,7 +3079,7 @@ fn bare_abs_rejections() {
     let cases: &[(&str, &str)] = &[
         ("fn f(x: i32) -> u32 { return abs(x); }", "ExprCall(abs of an integer)"),
         ("fn f(x: f64, y: f64) -> f64 { return abs(x, y); }", "ExprCall(undeclared fn)"),
-        ("fn f(x: f64) -> f64 { return sqrt(x); }", "ExprCall(undeclared fn)"),
+        ("fn f(x: f64) -> f64 { return tanh(x); }", "ExprCall(undeclared fn)"),
     ];
     for (body, construct) in cases {
         let m = rejected(&format!("module a;\n\n{}\n", body));
