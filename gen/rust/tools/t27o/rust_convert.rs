@@ -3305,7 +3305,7 @@ pub fn str_chain(src: &[u8], st: &mut [usize], a: usize, b: usize) -> bool {
     if (!(base) && tok_is(src, nx, b".")) {
         let f: usize = skip_ws(src, (nx + 1));
         let fe: usize = tok_end(src, f);
-        if ((((f < src.len()) && is_alpha(src[(f) as usize])) && (fe <= b)) && tok_is(src, skip_ws(src, fe), b"(")) {
+        if ((((f < src.len()) && is_alpha(src[(f) as usize])) && (fe <= b)) && !(tok_is(src, skip_ws(src, fe), b"("))) {
             base = (field_of_class(src, st, a, e, f, fe) == C_STR);
             c = skip_ws(src, fe);
         }
