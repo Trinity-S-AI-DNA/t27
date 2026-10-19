@@ -543,6 +543,36 @@ Traps from this run:
   `--verify` still says MATCH, and frontier refuses the seal (#10749). Re-save the seal after any merge
   that touches the closure.
 
+#### Long names are abbreviated, not refused (t27#10728)
+
+A shown name of at most 58 bytes is drawn byte for byte. A longer one is drawn as its first
+segment, `/...`, and the longest run of whole trailing segments that fits
+(`port/.../rings/CR-CHAT-03/src/confirmation_tag_chain`). When no whole run fits, it is drawn as
+`...` and its last 55 bytes. Only drawn bytes are checked, and the text size follows the drawn
+length. `why_card` is unchanged and still refuses a name over 58 bytes.
+
+On 5440d35e1 the sweep compares the new binary with master's, card by card:
+
+- 30 cards are newly drawn, 783 are byte-identical to master, and 0 are lost or refused;
+- 0 changed cards and 0 newly drawn cards have no `...`, and 0 identical cards have one;
+- 29 abbreviated forms are drawn: 27 `/.../` and 2 `...`, the longest 58 bytes;
+- the helpers card (29 importers), a `/.../` focus and a `...` focus passed every pixel check,
+  with 0 white pixels outside x 100..980.
+
+Lab traps from this run:
+
+- **`pkill -f dn_lab.sh` kills the fs-lab command that runs it**, because the pattern is in that
+  command's own line. Write `pkill -f '[d]n_lab.sh'`.
+- **An untracked seal in the lab checkout makes `git checkout` fail, and the script then tests the
+  old commit.** Have the script take the commit it must test and stop with `WRONG COMMIT` when
+  `HEAD` differs. Once the PR adding a seal merges, that seal is tracked, so `rm -f` of it deletes
+  a tracked file: restore it with `git checkout --` before sealing.
+- **Count a kill only on `^ ?FAIL [a-z]`.** The `FAIL 0` summary line otherwise counts as a failing
+  test, and a surviving mutant reads `KILLED by 1: 0`.
+- **A `<` mutant of a 58-byte bound needs an unquotable byte that only the whole-name check
+  sees.** A 58-byte name with `:` in the middle is `true` under the mutant, because the dots form
+  hides that byte, and `false` under the rule.
+
 ## What this skill does not claim
 
 The graph IR is a schema (`specs/t27f/spec_graph.t27`) and `specs/t27f/spec_graph_export.t27` turns source into it, but only exact declarations, spans and edges within the IR's capacity, with `specs/t27f/spec_graph_derive.t27` adding the derived and unknown part by stated rules, and no host calls either yet; no renderer draws a T27F view in the Trinity UI, no
