@@ -152,8 +152,19 @@ sequence is **third-party and not run on this bench**.
    SiI9134 pins CSCL/CSDA on those nets, 33R series on DSCL/DSDA, R62/R63 4.7K pull-ups to 3V3 on the HDMI_SCL/SDA
    nets, and CI2CA tied through R57 10K (the other end is a ground symbol the text extraction cannot read, so the
    address bit is not established here).
-2. The SiI9134 input setup for 24-bit RGB with separate syncs, and the I2C address and registers, from the
-   manual or the chip's reference. The two-register sequence above is not a verified picture-on sequence.
+2. The SiI9134 input setup for 24-bit RGB with separate syncs. **Read 2026-10-19 as a fact source only** (text
+   read, nothing copied or run) from ALINX's own HDMI-output demo `11_1_hdmi_out.zip`
+   (`01_demo_document/Demo/11_1_hdmi_out`, same public Dropbox folder; 9,814,322 bytes, sha256
+   `65a7d521b6b8a502f14a975e0caae2a621b9c0a36a206b95e6b10eef43ae02fa`; not committed). Its `lut_hdmi.v` writes six
+   8-bit-register entries as (8-bit I2C write address, register, value): `72:08=35`, `7A:2F=00`, `60:05=10`,
+   `60:08=05`, `60:09=01`, `60:05=04`; the list ends at the first entry whose address byte is `FF`. That fixes the
+   SiI9134 write address as **0x72** (7-bit 0x39, so the CI2CA strap reads low) and shows two more devices
+   written at 0x7A and 0x60. Facts about the demo's board use: `hdmi_nreset` is the PLL `locked` flag (reset is
+   released when the pixel PLL locks), I2C starts only after that, and the picture generator is held in reset
+   until the last I2C entry is done. Pin lines in its `hdmi_out.xdc` match the table above (J19, M13, E16, F16;
+   clock R4 `DIFF_SSTL15`). The demo's timing is 1920x1080 by default (`video_define.v`), so its pixel clock is
+   not ours; whether the same six writes are right for 640x480 at 25 MHz is **not established** (the register
+   meanings are in the chip's reference, which this session does not have). Still unproven on silicon.
 3. A way to drive an open-drain I2C pad from `.t27`: no tristate primitive was found in the repository, and
    `t27b verilog` was not shown to emit one. This needs a look in `specs/fpga/` for an `IOBUF`-style cell.
 4. A 25 MHz pixel clock: from the 200 MHz input, the PLL used by the other cells gives 25 MHz with a VCO at
