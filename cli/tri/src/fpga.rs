@@ -2890,13 +2890,6 @@ fn extract_source_from_lean(text: &str) -> Option<String> {
     None
 }
 
-/// Combined dashboard gate: the OSCFSEL selection is within the documented 0..7
-/// range and the PVT context is inside the operating envelope. Mirrors
-/// `cclk_variant_and_xadc_envelope_check` in Lean 4.
-fn cclk_variant_and_xadc_envelope_check(oscfsel: u8, ctx: &PvtContext) -> bool {
-    oscfsel <= 7 && pvt_context_inside_envelope(ctx)
-}
-
 /// Structs used to persist and report a single cold-POR sweep attempt.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SweepLog {
