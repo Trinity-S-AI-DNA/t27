@@ -22,7 +22,7 @@ We will acknowledge receipt as capacity allows and coordinate a fix and disclosu
 
 No password, API key, token or credentials file is committed, not even in docs or examples. Read secrets from the environment or from a gitignored file.
 
-The gate has three layers, all driven by [`.gitleaks.toml`](.gitleaks.toml):
+The gate has three layers, all driven by one gitleaks config that [`specs/policy/secret_gate.t27`](specs/policy/secret_gate.t27) writes (its gen-c output is `gen/c/policy/secret_gate.c`):
 
 1. **pre-commit** (lefthook) scans staged changes with gitleaks.
 2. **pre-push** (lefthook) scans every commit that is not yet on a remote.
