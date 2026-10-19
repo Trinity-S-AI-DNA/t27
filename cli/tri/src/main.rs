@@ -60,8 +60,8 @@ mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
-#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
-mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
+#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
+#[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
 mod renum;
 mod reseal;
 mod rtl;
@@ -428,7 +428,7 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27). A .zig file prints the spec and its count line (rules: specs/tools/t27o/zig_convert.t27); its own tests are the oracle, so run `t27b test` on the spec (--oracle and --check are for Rust).
     T27o {
         file: String,
         /// The module name; default the file's stem.
@@ -1349,8 +1349,8 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
         return Ok(spice::exit_code(&st));
     }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
-    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], vec![0u8; 1 << 24]);
-    let n = if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], vec![0u8; 1 << 24]);
+    let n = if zig::is_zig_name(file.as_bytes()) { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
     if !check {
         std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
         return Ok(0);
