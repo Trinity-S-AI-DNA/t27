@@ -11,8 +11,9 @@
 //   T27OS_HOOK=1       a Claude Code hook: read the payload on stdin, forward it as OP_HOOK to pane
 //                      T27OS_PANE, exit. The server writes ~/.t27os/hooks.json so claude panes run it.
 //   T27OS_CTL=<verb>   a tiny client for scripts and the live test: list, spawn, kill, read, keys
-//                      (T27OS_AGENT, T27OS_CWD, T27OS_PANE, T27OS_KEYS carry the arguments).
-//   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary.
+//                      (T27OS_AGENT, T27OS_CWD, T27OS_MODEL, T27OS_PANE, T27OS_KEYS carry the arguments).
+//   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
+//                      the server at login, so panes come back (by session id, model kept) after a reboot.
 //
 // Every decision is a fn with a test that runs; the host loop only moves bytes through pty_sys.t27.
 //
@@ -51,6 +52,11 @@ use t27os::session_store::F_SID_LEN;
 use t27os::session_store::F_CWD_AT;
 use t27os::session_store::F_CWD_LEN;
 use t27os::session_store::F_COUNT;
+use t27os::session_store::F_MODEL_AT;
+use t27os::session_store::F_MODEL_LEN;
+use t27os::session_store::model_ok;
+use t27os::session_store::transcript_path;
+use t27os::session_store::last_model;
 use t27os::session_store::put_bytes;
 use t27os::session_store::put_dec;
 use t27os::session_store::put_record;
@@ -181,6 +187,10 @@ use t27os::pty_logic::O_HOME;
 use t27os::pty_logic::O_POLL;
 use t27os::pty_logic::O_MISC;
 use t27os::pty_logic::O_BIN;
+use t27os::pty_logic::O_MODEL;
+use t27os::pty_logic::MODEL_CAP;
+use t27os::pty_logic::hook_model;
+use t27os::pty_logic::spawn_cwd_len;
 use t27os::pty_logic::O_RING;
 use t27os::pty_logic::MEM_SIZE;
 use t27os::pty_logic::TICK_MS;
@@ -227,6 +237,65 @@ fn cwd_of(st: []const u64, mem: []const u8, i: usize) -> []const u8 {
     return mem[at .. at + @as(usize, @intCast(st[i * PF + PF_CWDLEN]))];
 }
 
+fn model_of(mem: []const u8, i: usize) -> []const u8 {
+    const at : usize = O_MODEL + i * MODEL_CAP;
+    return mem[at + 1 .. at + 1 + @as(usize, mem[at])];
+}
+
+/// Set pane i's model from mem[at .. at + len] when model_ok() passes it; true when it changed.
+fn set_model(mem: []u8, i: usize, at: usize, len: usize) -> bool {
+    if (len >= MODEL_CAP or !model_ok(mem[at .. at + len])) { return false; }
+    const mo : usize = O_MODEL + i * MODEL_CAP;
+    var same : bool = @as(usize, mem[mo]) == len;
+    var k : usize = 0;
+    while (k < len) {
+        if (mem[mo + 1 + k] != mem[at + k]) { same = false; }
+        mem[mo + 1 + k] = mem[at + k];
+        k = k + 1;
+    }
+    mem[mo] = @as(u8, @intCast(len));
+    return !same;
+}
+
+/// The last model a claude pane's transcript names (session_store last_model), read in 32 KiB chunks
+/// with a 128-byte overlap so a value across a chunk edge is still seen. Runs only from restore_all,
+/// before any connection is accepted, so the connection buffers at O_IN are free.
+fn model_from_transcript(st: []const u64, mem: []u8, i: usize) -> void {
+    if (st[i * PF + PF_AGENT] != 0 or st[i * PF + PF_SIDLEN] == 0) { return; }
+    const pn : usize = transcript_path(mem[O_TMP2 + 1536 .. O_TMP2 + 2048], home_slice(st, mem), cwd_of(st, mem, i), sid_of(st, mem, i));
+    const fd : i32 = sys_open_ro(mem[O_TMP2 + 1536 .. O_TMP2 + 1536 + pn + 1], 0);
+    if (fd < 0) { return; }
+    var keep : usize = 0;
+    var ml : usize = 0;
+    var done : bool = false;
+    while (!done) {
+        const n : i64 = sys_read(fd, mem[O_IN + keep .. O_IN + keep + 32768], 32768);
+        if (n <= 0) {
+            done = true;
+        } else {
+            const total : usize = keep + @as(usize, @intCast(n));
+            var f : [2]u64 = undefined;
+            if (last_model(mem[O_IN .. O_IN + total], f[0..2])) {
+                ml = @as(usize, @intCast(f[1]));
+                var k : usize = 0;
+                while (k < ml) {
+                    mem[O_TMP2 + 2048 + k] = mem[O_IN + @as(usize, @intCast(f[0])) + k];
+                    k = k + 1;
+                }
+            }
+            keep = 128;
+            if (total < keep) { keep = total; }
+            var m : usize = 0;
+            while (m < keep) {
+                mem[O_IN + m] = mem[O_IN + total - keep + m];
+                m = m + 1;
+            }
+        }
+    }
+    sys_close(fd);
+    if (ml > 0) { set_model(mem, i, O_TMP2 + 2048, ml); }
+}
+
 fn ring_of(mem: []u8, i: usize) -> []u8 {
     const at : usize = O_RING + i * 65536;
     return mem[at .. at + 65536];
@@ -238,7 +307,7 @@ fn save_pane(st: []const u64, mem: []u8, i: usize) -> void {
     if (st[base + PF_USED] == 0) { return; }
     var sid : []const u8 = sid_of(st, mem, i);
     if (sid.len == 0) { sid = "-"; }
-    const rn : usize = put_record(mem[O_TMP2 + 512 .. O_TMP2 + 1536], @as(u32, @intCast(st[base + PF_SPACE])), @as(u32, @intCast(st[base + PF_AGENT])), @as(u32, @intCast(st[base + PF_SLOT])), ps_state(@as(u32, @intCast(st[base + PF_STATUS]))), sid, cwd_of(st, mem, i));
+    const rn : usize = put_record(mem[O_TMP2 + 512 .. O_TMP2 + 1536], @as(u32, @intCast(st[base + PF_SPACE])), @as(u32, @intCast(st[base + PF_AGENT])), @as(u32, @intCast(st[base + PF_SLOT])), ps_state(@as(u32, @intCast(st[base + PF_STATUS]))), sid, model_of(mem, i), cwd_of(st, mem, i));
     const home : []const u8 = home_slice(st, mem);
     const tn : usize = record_path(mem[O_TMP2 .. O_TMP2 + 255], home, @as(u32, @intCast(i)), true);
     mem[O_TMP2 + tn] = 0;
@@ -267,7 +336,7 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
         st[base + PF_SIDLEN] = @as(u64, un);
     }
     const home : []const u8 = home_slice(st, mem);
-    const cn : usize = pane_command(agent, plan, sid_of(st, mem, i), home, mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
+    const cn : usize = pane_command(agent, plan, sid_of(st, mem, i), model_of(mem, i), home, mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
     var f : [4]u64 = undefined;
     const tn : usize = argv_text(mem[O_TMP1 + 4096 .. O_TMP1 + 4096 + cn], mem[O_TMP1 .. O_TMP1 + 3000], f[0..4]);
     const cw : usize = c_path(mem[O_TMP1 + 3000 .. O_TMP1 + 3300], cwd_of(st, mem, i));
@@ -377,7 +446,8 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
     if (op == OP_SPAWN) {
         if (!spawn_ok(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
         const slot : u32 = pane_alloc(st);
-        if (slot >= MAX_PANES or plen - 3 > CWD_CAP - 1 or mem[p0] >= AGENT_COUNT and mem[p0] != SHELL_CELL) {
+        const cl : usize = spawn_cwd_len(mem[p0 .. p0 + plen]);
+        if (slot >= MAX_PANES or cl > CWD_CAP - 1 or cl == 0 or mem[p0] >= AGENT_COUNT and mem[p0] != SHELL_CELL) {
             reply(fd, mem, RE_ERR, 0, 0);
             return;
         }
@@ -387,13 +457,17 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         st[sb + PF_SPACE] = @as(u64, mem[p0 + 1]);
         st[sb + PF_SLOT] = @as(u64, mem[p0 + 2]);
         st[sb + PF_SIDLEN] = 0;
-        st[sb + PF_CWDLEN] = @as(u64, plen - 3);
+        st[sb + PF_CWDLEN] = @as(u64, cl);
         st[G_WINSZ + @as(usize, slot) / 2] = ws_pack(st[G_WINSZ + @as(usize, slot) / 2], slot % 2, 0, 0);
         var k : usize = 0;
-        while (k < plen - 3) {
+        while (k < cl) {
             mem[O_CWD + @as(usize, slot) * CWD_CAP + k] = mem[p0 + 3 + k];
             k = k + 1;
         }
+        // a model after a TAB in the payload (T27OS_CTL=spawn with T27OS_MODEL) goes on the command line and into
+        // the record; without one the pane learns it from its SessionStart hook or, on restore, its transcript
+        mem[O_MODEL + @as(usize, slot) * MODEL_CAP] = 0;
+        if (3 + cl < plen) { set_model(mem, @as(usize, slot), p0 + 4 + cl, plen - 4 - cl); }
         launch(st, mem, @as(usize, slot), R_RELAUNCH);
         save_pane(st, mem, @as(usize, slot));
         reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
@@ -466,6 +540,9 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
                 st[base + PF_SIDLEN] = @as(u64, sl);
                 changed = true;
             }
+        }
+        if (st[base + PF_AGENT] == 0 and hook_model(mem[p0 .. p0 + plen], f[0..2])) {
+            if (set_model(mem, @as(usize, pane), p0 + @as(usize, @intCast(f[0])), @as(usize, @intCast(f[1])))) { changed = true; }
         }
         if (changed) { save_pane(st, mem, @as(usize, pane)); }
         reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
@@ -543,8 +620,8 @@ fn restore_all(st: []u64, mem: []u8) -> u32 {
         if (fd >= 0) {
             const n : i64 = sys_read(fd, mem[O_TMP2 + 512 .. O_TMP2 + 1536], 1024);
             sys_close(fd);
-            var f : [8]u64 = undefined;
-            if (n > 0 and parse_record(mem[O_TMP2 + 512 .. O_TMP2 + 512 + @as(usize, @intCast(n))], f[0..8])) {
+            var f : [10]u64 = undefined;
+            if (n > 0 and parse_record(mem[O_TMP2 + 512 .. O_TMP2 + 512 + @as(usize, @intCast(n))], f[0..10])) {
                 const b : usize = @as(usize, i) * PF;
                 const sl : usize = @as(usize, @intCast(f[F_SID_LEN]));
                 const cl : usize = @as(usize, @intCast(f[F_CWD_LEN]));
@@ -565,6 +642,10 @@ fn restore_all(st: []u64, mem: []u8) -> u32 {
                     st[b + PF_SLOT] = f[F_SLOT];
                     st[b + PF_SIDLEN] = @as(u64, sl);
                     st[b + PF_CWDLEN] = @as(u64, cl);
+                    // the record's model (a v1 record has none), then the newer one the transcript names
+                    mem[O_MODEL + @as(usize, i) * MODEL_CAP] = 0;
+                    set_model(mem, @as(usize, i), O_TMP2 + 512 + @as(usize, @intCast(f[F_MODEL_AT])), @as(usize, @intCast(f[F_MODEL_LEN])));
+                    model_from_transcript(st, mem, @as(usize, i));
                     const sid : []const u8 = sid_of(st, mem, @as(usize, i));
                     const sidv : []const u8 = sid;
                     var plan : u32 = restore_plan(@as(u32, @intCast(f[F_AGENT])), @as(u32, @intCast(f[F_STATE])), sidv);
@@ -767,7 +848,12 @@ fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
             agent = agent * 10 + @as(u32, mem[O_MISC + 300 + a]) - 48;
             a = a + 1;
         }
-        const cl : usize = env_text("T27OS_CWD", mem, O_TMP1);
+        var cl : usize = env_text("T27OS_CWD", mem, O_TMP1);
+        const ml : usize = env_text("T27OS_MODEL", mem, O_TMP1 + cl + 1);
+        if (ml > 0) {
+            mem[O_TMP1 + cl] = 9;
+            cl = cl + 1 + ml;
+        }
         client_spawn(fd, agent, 0, 0, mem[O_TMP1 .. O_TMP1 + cl], out);
         say("spawned pane ");
         print_dec(@as(u64, out[1]), mem);
@@ -793,7 +879,9 @@ fn run_install(st: []u64, mem: []u8) -> void {
     var n : usize = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], 0, home);
     n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/Library/LaunchAgents/ai.t27.os-server.plist");
     mem[O_TMP2 + n] = 0;
-    const pn : usize = plist_text(mem[O_TMP2 + 512 .. O_TMP2 + 1536], mem[O_BIN .. O_BIN + @as(usize, @intCast(st[G_BINLEN]))]);
+    const pl : usize = env_text("PATH", mem, O_TMP1);
+    const ll : usize = env_text("LANG", mem, O_TMP1 + 4096);
+    const pn : usize = plist_text(mem[O_TMP2 + 512 .. O_TMP2 + 8192], mem[O_BIN .. O_BIN + @as(usize, @intCast(st[G_BINLEN]))], home, mem[O_TMP1 .. O_TMP1 + pl], mem[O_TMP1 + 4096 .. O_TMP1 + 4096 + ll]);
     const fd : i32 = sys_creat(mem[O_TMP2 .. O_TMP2 + n + 1], 420);
     if (fd < 0) { say("cannot write the plist\n"); return; }
     sys_write(fd, mem[O_TMP2 + 512 .. O_TMP2 + 512 + pn], @as(u64, pn));
