@@ -47,17 +47,17 @@ Rules are applied to every function in source order; the first violation by posi
 
 ## Totals per repository
 
-| repo | commit | tracked .py | gate-counted lines | generated / vendored | parse failures | test-only | scanned files | lines / code | fns f+m+n | classes in subset / all | T fns / lines | S fns / lines | whole T / S | near-whole S |
+| repo | commit | tracked .py | gate-counted lines | generated / vendored | parse failures | test-only | scanned files | lines / code | fns f+m+n | classes in subset / all | T fns / lines | S fns / lines | whole T / S files (lines) | near-whole S files (lines) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| t27 | 0e00974da7 | 655 | 153,503 | 0 / 0 | 7 | 52 | 596 | 141,796 / 116,879 | 3245+509+289 | 5 / 143 | 29 / 289 | 163 / 1,210 | 0 / 1 | 1 |
-| trios | 78671ba794 | 12 | 2,382 | 0 / 0 | 0 | 0 | 12 | 2,382 / 1,975 | 43+0+3 | 0 / 0 | 0 / 0 | 1 / 32 | 0 / 0 | 0 |
-| trinity | 8e535bc9bb | 378 | 79,821 | 9 / 11 | 15 | 37 | 306 | 71,005 / 56,402 | 1082+1059+52 | 27 / 346 | 86 / 672 | 133 / 946 | 0 / 0 | 0 |
-| trinity-fpga | c9b180bf78 | 1059 | 194,623 | 14 / 11 | 16 | 46 | 972 | 184,498 / 150,269 | 4254+1585+292 | 53 / 503 | 114 / 830 | 352 / 3,220 | 0 / 0 | 4 |
-| 999-multibots | fcdbb2f7dc | 22 | 4,657 | 0 / 0 | 0 | 2 | 20 | 4,301 / 3,518 | 107+23+4 | 0 / 9 | 1 / 2 | 5 / 36 | 0 / 0 | 0 |
-| **five, raw** | | 2,126 | 434,986 | 23 / 22 | 38 | 137 | 1906 | 403,982 / 329,043 | 8731+3176+640 | 85 / 1001 | 230 / 1,793 | 654 / 5,444 | 0 / 1 | 5 |
-| **five, distinct** | | | 348,524 | | | 114 | 1594 | 325,897 / 267,886 | 8501 bodies | | 105 / 812 | 454 / 4,090 | 0 / 1 | 5 |
+| t27 | 0e00974da7 | 655 | 153,503 | 0 / 0 | 7 | 52 | 596 | 141,796 / 116,879 | 3245+509+289 | 5 / 143 | 29 / 289 | 163 / 1,210 | 0 (0) / 1 (93) | 1 (201) |
+| trios | 78671ba794 | 12 | 2,382 | 0 / 0 | 0 | 0 | 12 | 2,382 / 1,975 | 43+0+3 | 0 / 0 | 0 / 0 | 1 / 32 | 0 (0) / 0 (0) | 0 (0) |
+| trinity | 8e535bc9bb | 378 | 79,821 | 9 / 11 | 15 | 37 | 306 | 71,005 / 56,402 | 1082+1059+52 | 27 / 346 | 86 / 672 | 133 / 946 | 0 (0) / 0 (0) | 0 (0) |
+| trinity-fpga | c9b180bf78 | 1059 | 194,623 | 14 / 11 | 16 | 46 | 972 | 184,498 / 150,269 | 4254+1585+292 | 53 / 503 | 114 / 830 | 352 / 3,220 | 0 (0) / 0 (0) | 4 (351) |
+| 999-multibots | fcdbb2f7dc | 22 | 4,657 | 0 / 0 | 0 | 2 | 20 | 4,301 / 3,518 | 107+23+4 | 0 / 9 | 1 / 2 | 5 / 36 | 0 (0) / 0 (0) | 0 (0) |
+| **five, raw** | | 2,126 | 434,986 | 23 / 22 | 38 | 137 | 1906 | 403,982 / 329,043 | 8731+3176+640 | 85 / 1001 | 230 / 1,793 | 654 / 5,444 | 0 (0) / 1 (93) | 5 (552) |
+| **five, distinct** | | | 348,524 | | | 114 | 1594 | 325,897 / 267,886 | 8501 bodies | | 105 / 812 | 454 / 4,090 | 0 (0) / 1 (93) | 5 (552) |
 
-Columns: `gate-counted lines` is every tracked `.py` including generated, vendored and test files, counted as `git diff --numstat` would; `generated / vendored` and `parse failures` and `test-only` are file counts; `lines / code` are the scanned (parsed, non-test) files; `fns` are module-level functions + methods + nested defs; `classes in subset / all` are module-level classes; `999-multibots` is 999-multibots-telegraf; `whole T / S` are whole-file candidates (R10); `near-whole S` leaves `main` out. The raw row repeats copies (trinity and trinity-fpga share byte-identical files); the distinct row counts identical files once and identical function bodies once, so its `T`/`S` counts are bodies, and its line count adds up only the parsed files (325,897; with 5,286 lines in unparsed files the census is 331,183 lines).
+Columns: `gate-counted lines` is every tracked `.py` including generated, vendored and test files, counted as `git diff --numstat` would; `generated / vendored` and `parse failures` and `test-only` are file counts; `lines / code` are the scanned (parsed, non-test) files; `fns` are module-level functions + methods + nested defs; `classes in subset / all` are module-level classes; `999-multibots` is 999-multibots-telegraf; `whole T / S` and `near-whole S` count whole-file candidates (R10) with their physical lines in parentheses; near-whole leaves `main` out. The raw row repeats copies (trinity and trinity-fpga share byte-identical files); the distinct row counts identical files once and identical function bodies once, so its `T`/`S` counts are bodies, and its line count adds up only the parsed files (325,897; with 5,286 lines in unparsed files the census is 331,183 lines).
 
 ## Ranked rows
 
@@ -317,7 +317,7 @@ Method. Sample drawn with a seeded generator (seed 20261021) from the functions 
 
 ## Reproduce
 
-The scripts are throw-away and live outside the tree (a new `.py` file is denied by the own-language gate; the rules R1 to R10 above are the specification). They ran with `python3 -I` on Python 3.14.6. sha256 prefixes: scan 50228b3989d7, post 61c9c9ed582a, report 89f4fcc59bd2, render ad32c485cbda.
+The scripts are throw-away and live outside the tree (a new `.py` file is denied by the own-language gate; the rules R1 to R10 above are the specification). They ran with `python3 -I` on Python 3.14.6. sha256 prefixes: scan 50228b3989d7, post 61c9c9ed582a, report 89f4fcc59bd2, render f4187c178144.
 
 1. Fetch each sibling repository at its pinned commit: `git init; git remote add origin <url>; git fetch --depth 1 --filter=blob:none origin <sha>; git sparse-checkout set --no-cone '*.py' '*.sh' '*.yml' '*.yaml' Makefile 'Dockerfile*' package.json pyproject.toml; git checkout FETCH_HEAD`.
 2. For each repository list `git ls-tree -r --name-only HEAD`, keep `*.py`, apply the exclusions above, `ast.parse` each file, walk every `def` with the rules R1 to R9, count lines as stated, hash each function with `ast.dump`.
