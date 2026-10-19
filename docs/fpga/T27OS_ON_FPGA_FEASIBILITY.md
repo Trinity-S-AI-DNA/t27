@@ -1,0 +1,105 @@
+# T27 OS on the FPGA: feasibility and plan
+
+Refs gHashTag/t27#10782 (T27 OS epic), PR #10783 (the T27 OS specs). Owner, 2026-10-19: "ideally T27 OS should
+run on the FPGA".
+
+Status words used below: **measured** = run in this work on the Railway lab; **read** = judged from the spec's
+text, not lowered or run; **not established** = nothing in the repository says.
+
+## 1. The answer in one paragraph
+
+The decisions of T27 OS can run on the bench AX7203 today; its window cannot, and should not. Four panes whose
+herdr status is advanced by the real `pane_step` from `specs/t27os/pane_state.t27` lower to about 470 LCs and 270
+flip-flops (**measured**, yosys `synth_xilinx`), and their screen leaves the board as VT100 on the UART, where the
+T27 OS terminal pane (or any terminal) shows it. That is `specs/fpga/t27os_uart_shell_ax7203.t27`. The window stays
+on the Mac, as a client of the board, exactly as it is a client of the PTY server today.
+
+## 2. What T27 OS is made of, and where each part can go
+
+T27 OS specs on `feat/t27os-petal-menu` (PR #10783). Counts are from the spec text: `@extern` imports, slice
+types, `while` loops, `f64`.
+
+| spec | what it decides | host-bound? | on the board |
+|---|---|---|---|
+| `agents.t27` | agent table, session states S_*, restore actions | no (scalars, two `str` consts) | **measured**: its S_* constants are used by the shell spec; the fns are scalar |
+| `pane_state.t27` | pane status word and `pane_step`, `shown_state`, `pane_needs_you` | no | **measured**: `pane_step`, `shown_state`, `pane_needs_you`, `ps_state` lower inside the shell spec (`hook_event` takes a slice, so it is left out) |
+| `vt.t27` | VT/ANSI grid: bytes in, cells out | no | **measured as a test-side reader only**: it uses slices and loops, which `t27b verilog` does not take in the clocked path. The board only writes bytes; it never parses them. A grid on silicon is stage 3 |
+| `windows.t27` | the window model: spaces, sessions, the sidebar | no (no `@extern`, no slices; 17 loops, 19 `f64`) | **read**: pure logic, but loop-heavy; it needs a ROM/FSM rewrite of its loops and a fixed-point rewrite of its `f64` before it can lower |
+| `queen.t27` | Queen panel, suggestions, GOD MODE | no (6 loops, 60 `f64`) | **read**: same as `windows.t27`; `f64` is the cost |
+| `layout.t27`, `term_pane.t27` | placement of cells and panels in pixels; key bytes to the PTY | no, but pixel geometry only matters to a display | **read**: `layout` is `f64` geometry, useless without a display; `term_pane`'s key-to-bytes table is a ROM and could lower |
+| `doctor.t27` | repositories on the machine, disk cost | yes in spirit (it reads the file system through the host) | stays on the host |
+| `pty_proto.t27`, `pty_logic.t27`, `session_store.t27` | wire format, slot allocation, the manifest | `pty_proto` is pure but slice-heavy; `pty_logic` has 2 `@extern`; `session_store` is a file format | `pty_proto`'s frame codec is the natural wire format for stage 2 (Ethernet or UART framing); the rest stays on the host |
+| `pty_server.t27`, `pty_client.t27`, `pty_sys.t27` | the PTY server and its client over libSystem | **yes**: `forkpty`, `poll`, Unix sockets (32 `@extern` in `pty_sys`) | replaced on the board by the UART/Ethernet link (see section 3) |
+| `glass_window.t27`, `hot_reload.t27` | the AppKit window, hot reload | **yes**: AppKit, CoreGraphics, CoreText, `ld` | stays on the Mac; it becomes the display client of the board |
+
+Two routes lower pure logic, and both exist in the repository:
+
+1. **t27 to Verilog to bitstream.** `t27b verilog` (the pure-t27 board flow, as `specs/fpga/rc_filter_ax7203.t27`).
+   Limits that decide what lowers: no signed types, no slices and no array indexing in the clocked path, tables
+   become ROMs, no loops in the tick body. `pane_state` and `agents` meet these; `vt`, `windows`, `queen` do not
+   yet.
+2. **t27 to WASM on the existing wasm board cell** (`specs/fpga/wasm_board_ax7203.t27`). Its wire format and
+   `on_clock(rxd)` step loop would run a compiled `windows`/`queen` unchanged in source; its top is outside this
+   repository, so this route was **not** exercised here. It is the way to run the loop-heavy specs without
+   rewriting them, at the price of a WASM core on the die.
+
+## 3. What replaces the host-bound parts
+
+| host-bound part | on the board |
+|---|---|
+| AppKit window, CoreText drawing | the T27 OS window as a client: it already hosts a terminal pane, so it shows the board's VT100 stream. HDMI is **not established**: no AX7203 HDMI pin table or schematic is in the repository (`fpga/HARDWARE_SSOT.md` lists UART, LEDs, the 200 MHz clock, the two RGMII PHYs and DDR3 only) |
+| `forkpty` and the agent processes | nothing: an agent CLI cannot run on an FPGA. The board holds the agents' **status**, not the agents. A hook from the host (Claude Code's `UserPromptSubmit`, `Notification`, `Stop`) becomes one event byte on the link |
+| Unix socket to the PTY server | UART (stage 1), then Ethernet (stage 2) |
+| Keychain | not replaced; secrets stay on the host. The board never holds a credential |
+| the manifest on disk | the board has no disk; the 16 MiB N25Q128 flash is on the AX7203 (`fpga/HARDWARE_SSOT.md`), but a manifest in flash is **not established** as a plan |
+
+## 4. I/O on the AX7203
+
+From `fpga/HARDWARE_SSOT.md` (the bench board is an ALINX AX7203, `xc7a200tfbg484-2`):
+
+- **UART**: TX N15, RX P20, LVCMOS33. 115200 8N1 from a 100 MHz PLL clock (divider 868) is what
+  `rc_filter_ax7203.t27` already measured on this board.
+- **Ethernet**: two KSZ9031 RGMII PHYs (the cabled PHY 1 runs at 100 Mb/s). The repository has `eth_beacon`,
+  `eth_rx`, `eth_reply`, `eth_crc`, and a UDP node on this board was measured on 2026-10-10 (HARDWARE_SSOT.md).
+  That is the stage 2 transport.
+- **LEDs**: B13 C13 D14 D15, active low. The shell uses them as blocked / working / done / heartbeat.
+- **Button**: T6 (active low), LVCMOS15; resets the shell.
+- **HDMI / display**: **not established.**
+- **DDR3**: 1 GB present; two DDR3 cells exist (`ddr3_head_bandwidth`, `ddr3_ternary_matvec`). Not needed before a
+  scrollback ring per pane (stage 3).
+
+## 5. Staged plan
+
+| stage | what runs on the board | what it needs | state |
+|---|---|---|---|
+| 0 | `pane_step`/`shown_state` on silicon, screen as VT100 over UART; keys and a script drive the events | this PR | spec, tests and RTL lowering **measured**; bitstream and bench run **blocked** (section 6) |
+| 1 | the host feeds real events: a small host-side client sends one byte per Claude Code hook to the board's RX, so the board's screen shows the user's real panes | a host client in `.t27` (the window's `pty_client.t27` already speaks to a server; a UART transport is a new `@extern` set in `pty_sys.t27`) | next |
+| 2 | the same over Ethernet with `pty_proto.t27`'s frame codec | lower `pty_proto` encode/decode (slice-free subset), reuse the UDP node | later |
+| 3 | `windows.t27` (spaces, sidebar) and a grid (`vt`) on the board | rewrite loops as FSMs or run them on the wasm cell; `f64` to fixed point; DDR3 for scrollback | later |
+| 4 | display | an HDMI pin table and a TMDS transmitter, none of which the repository has | **not established** |
+
+## 6. Why there is no bench transcript in this PR
+
+What was done: the spec's 8 tests pass at run time (`t27b test` under qemu-aarch64 on the lab, since the t27b JIT
+runs on arm64 only), the RTL lowers (`t27b verilog`, 1074 lines), yosys synthesises it for xc7 (1274 cells, about
+468 LCs, 0 problems from its check pass), and the pin stream is checked byte for byte against the screen function.
+
+What is missing, exactly:
+
+1. **Place and route.** The lab has yosys and iverilog but no `nextpnr-xilinx`, no `xc7a200tfbg484-2.bin` chipdb and
+   no prjxray database (`t27c preflight` there: "T27_OPENXC7 is not set"). The openXC7 toolchain and that chipdb
+   exist on the owner's Mac (`~/openxc7-src`), where the standing rule forbids heavy runs. The fix is to install
+   the toolchain on the lab, or to approve one place-and-route on the Mac. Until then no bitstream exists.
+2. **The board.** `openFPGALoader --scan-usb` on the Mac found no USB device when it was run, so the cable was not
+   visible.
+3. **RTL-level simulation of the pins.** The spec's own test already decodes the pin the machine drives and
+   compares it to the screen function; a simulation of the lowered Verilog through the PLL primitive was not done
+   (the lab has no unisim model of `PLLE2_ADV`, and a hand-written Verilog shim is barred by the only-t27 rule).
+
+No UART transcript is shown because none was captured. The expected screen is in the spec header and is asserted,
+cell by cell, by `the_screen_is_the_t27os_vt_grid_as_the_layout_says`.
+
+## 7. Dependency
+
+The spec uses `specs/t27os/{agents,pane_state,vt}.t27` by `use`; those files are on `feat/t27os-petal-menu`
+(PR #10783) and not yet on `master`. Until that PR lands, `t27b` cannot resolve the imports on `master` alone.
