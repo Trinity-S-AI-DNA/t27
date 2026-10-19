@@ -144,8 +144,14 @@ sequence is **third-party and not run on this bench**.
 
 ### What is still missing before a board top
 
-1. ~~The pin table checked against the official manual~~ **Done 2026-10-19** for the 29 HDMI-output pins. Still
-   open: the two I2C balls (E16, F16), which the manual draws only in Figure 3.4.1 and does not list.
+1. ~~The pin table checked against the official manual~~ **Done 2026-10-19** for the 29 HDMI-output pins, and the
+   two I2C balls are now confirmed too: the official ALINX schematic package `04_...zip` (6,327,128 bytes, sha256
+   `fdb16c3c0da5eb9db2be3a07d18f6dbab55b771d8e10f34419722564ac869b61`, same public Dropbox folder, not committed)
+   holds `AX7203_PIN_Define.xls`, which lists HDMI_SCL = E16 (bank 16 L2_P), HDMI_SDA = F16 (bank 16 L5_N) and
+   9134_NRESET = J19. The schematic PDF `AX7203-2018-2-2.pdf` in it is titled "AX7203 extension board" and shows
+   SiI9134 pins CSCL/CSDA on those nets, 33R series on DSCL/DSDA, R62/R63 4.7K pull-ups to 3V3 on the HDMI_SCL/SDA
+   nets, and CI2CA tied through R57 10K (the other end is a ground symbol the text extraction cannot read, so the
+   address bit is not established here).
 2. The SiI9134 input setup for 24-bit RGB with separate syncs, and the I2C address and registers, from the
    manual or the chip's reference. The two-register sequence above is not a verified picture-on sequence.
 3. A way to drive an open-drain I2C pad from `.t27`: no tristate primitive was found in the repository, and
