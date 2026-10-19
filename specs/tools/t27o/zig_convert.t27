@@ -20,6 +20,10 @@
 //   `const B: f64 = std.math.pi * 2.0;`), and of an array literal (`const T = [_]u8{ 1, 2, 3 };` is
 //   `const T : [3]u8 = [1, 2, 3];`); `test "name" { .. }`. `const std = @import("std");` and `const math = std.math;` leave
 //   no trace: the table knows them as namespaces (std, math, mem, testing, ascii) and `math.pi`, `std.math.pi` mean the same.
+// - Consts of another file (#10823): `pub const C = @import("x.zig").C;` where x.zig is a file of this one's own directory tree
+//   and its `pub const C` is a scalar literal is written as that const, before the file is read (`imports` names the files the
+//   glue reads, `inline_imports` writes the values; see the section "consts imported from another file"). Any other import
+//   stays external: a use of its name is refused ("uses external").
 // - Containers: the fns and consts of a `struct`, `enum` or `union` are read one by one and named `Container_name`
 //   (`Optimizer.bitLength(n)` and a bare `bitLength(n)` inside it are `Optimizer_bitLength(n)`), as the Rust front end names
 //   a method `Type_method`. A container that holds only fns and consts is a namespace and leaves no comment; one with a
@@ -64,7 +68,7 @@
 // Refused, with the kind a sweep ranks them by: pointers and `.*`, optionals and `.?` / orelse, error unions / try / catch /
 // error values, types other than the scalars above (structs, enums, unions as values, u128, arbitrary-width ints), comptime and
 // anytype, payload captures, labels, defer, unreachable, anonymous literals, export / extern / inline fns, mutable
-// file-level vars, a const that is another file's, names nobody declares, bare braces as a statement. Step 2 of #10597
+// file-level vars, a const that is another file's and no scalar literal of its own tree, names nobody declares, bare braces as a statement. Step 2 of #10597
 // reads same-file structs / enums and `*T` self methods; step 3 error unions.
 // --
 // Three t27c behaviours shaped this spec: `use` splices by NAME (every word outside a `//` comment, string literals
@@ -2873,6 +2877,273 @@ pub fn z_item(src: []const u8, st: []usize, out: []u8) -> void {
     st[P] = skip_ws(src, end);
 }
 
+// ---------------------------------------------------------------- consts imported from another file (#10823)
+// `pub const C = @import("x.zig").C;` makes C another file's: the converter alone knows nothing of x.zig, so every use
+// of C is refused ("uses external"). When x.zig is a file of this file's own directory tree and its `pub const C` is a
+// scalar literal, the value is written in place of the import, before the file is read: `pub const C: u32 = 5;`.
+// Two fns, both pure, and the glue between them (it alone reads files): `imports` lists the paths to read, once each;
+// the glue reads them and passes the bundle on, one record per file it could read, `Z_B_REC path \n text`;
+// `inline_imports` finds each record by its path. A line is never added or taken: a declaration spread over several
+// lines is left as it is, and so is anything that is not a literal. What is left stays refused with its reason:
+// "uses external `C`".
+// Allowed: a path of the form `a.zig` or `dir/a.zig` (also `./a.zig`), no `..`, no leading `/`, no `\`, no `:`: the
+// directory tree of the file that imports, never above it. Values: an integer, a float, `true`, `false`, or a string
+// with no escape, of at most Z_LIT_MAX bytes, under a scalar type or none. A const of any other type, an expression, a
+// const that is not `pub` (Zig itself refuses it through @import), a fn or a type is not resolved.
+
+/// Starts each record of the bundle `inline_imports` reads: this byte, the path, a newline, the file's text. A file that
+/// holds this byte is not resolved from.
+pub const Z_B_REC : u8 = 1;
+/// The longest literal written in: with it, the output is never more than 4 times the source and 64 bytes.
+pub const Z_LIT_MAX : usize = 64;
+
+/// The slots of one import declaration, in the state vector the glue passes (from 8: slot 1 is W, where the output is
+/// counted): the name, the type written in the importing file (0 when none), the path without its quotes, the member, the
+/// `;` that ends it; then, once the imported file is read, its type and its literal.
+pub const ZI_NA : usize = 8;
+pub const ZI_NB : usize = 9;
+pub const ZI_TA : usize = 10;
+pub const ZI_TB : usize = 11;
+pub const ZI_PA : usize = 12;
+pub const ZI_PB : usize = 13;
+pub const ZI_MA : usize = 14;
+pub const ZI_MB : usize = 15;
+pub const ZI_SEMI : usize = 16;
+pub const ZI_XA : usize = 17;
+pub const ZI_XB : usize = 18;
+pub const ZI_LA : usize = 19;
+pub const ZI_LB : usize = 20;
+/// The state vector `imports` and `inline_imports` need holds at least this many slots.
+pub const ZI_SLOTS : usize = 21;
+
+/// Is src[a .. b] a path inside the directory tree of the file that imports it: ends in .zig, relative, no `..`
+/// component, no backslash, no colon, no control byte?
+pub fn z_import_path_ok(src: []const u8, a: usize, b: usize) -> bool {
+    if (b < a + 5 or b > src.len) { return false; }
+    if (!word_is(src, b - 4, b, ".zig")) { return false; }
+    if (src[a] == B_SLASH) { return false; }
+    var comp : usize = a;
+    var k : usize = a;
+    while (k < b) {
+        const c : u8 = src[k];
+        if (c == B_BACKSLASH or c == B_COLON or c < B_SPACE or c == B_DEL) { return false; }
+        if (c == B_SLASH) {
+            if (k - comp == 2 and src[comp] == B_DOT and src[comp + 1] == B_DOT) { return false; }
+            comp = k + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The end of the scalar literal at buf[p]: a number (a minus sign before it allowed), `true`, `false`, or a string with no
+/// escape and no newline, of at most Z_LIT_MAX bytes. p itself when there is none.
+pub fn z_lit_end(buf: []const u8, p: usize) -> usize {
+    var q : usize = p;
+    if (head(buf, q) == B_MINUS) { q = q + 1; }
+    const e : usize = z_tok_end(buf, q);
+    if (e <= q or e > buf.len or e - p > Z_LIT_MAX) { return p; }
+    if (is_digit(head(buf, q))) { return e; }
+    if (q != p) { return p; }
+    if (word_is(buf, q, e, "true") or word_is(buf, q, e, "false")) { return e; }
+    if (head(buf, q) != B_QUOTE or e < q + 2 or buf[e - 1] != B_QUOTE) { return p; }
+    var k : usize = q + 1;
+    while (k < e - 1) {
+        if (buf[k] == B_BACKSLASH or buf[k] == B_NL) { return p; }
+        k = k + 1;
+    }
+    return e;
+}
+
+/// Does the item starting at src[p] have the form `[pub] const NAME [: scalar] = @import("path.zig").MEMBER;` with a path
+/// z_import_path_ok allows? Its slots are written in ps (ZI_NA .. ZI_SEMI).
+pub fn z_import_const(src: []const u8, p: usize, ps: []usize) -> bool {
+    var q : usize = p;
+    if (z_is(src, q, "pub")) { q = skip_ws(src, z_tok_end(src, q)); }
+    if (!z_is(src, q, "const")) { return false; }
+    const na : usize = skip_ws(src, z_tok_end(src, q));
+    const nb : usize = z_tok_end(src, na);
+    if (!is_alpha(head(src, na))) { return false; }
+    ps[ZI_NA] = na;
+    ps[ZI_NB] = nb;
+    ps[ZI_TA] = 0;
+    ps[ZI_TB] = 0;
+    var t : usize = skip_ws(src, nb);
+    if (z_is(src, t, ":")) {
+        const ta : usize = skip_ws(src, z_tok_end(src, t));
+        const tb : usize = z_tok_end(src, ta);
+        if (!z_scalar(src, ta, tb)) { return false; }
+        ps[ZI_TA] = ta;
+        ps[ZI_TB] = tb;
+        t = skip_ws(src, tb);
+    }
+    if (!z_is(src, t, "=")) { return false; }
+    const i : usize = skip_ws(src, z_tok_end(src, t));
+    if (!z_is(src, i, "@import")) { return false; }
+    const o : usize = skip_ws(src, z_tok_end(src, i));
+    if (!z_is(src, o, "(")) { return false; }
+    const s : usize = skip_ws(src, z_tok_end(src, o));
+    const sb : usize = z_tok_end(src, s);
+    if (head(src, s) != B_QUOTE or sb < s + 3 or head(src, sb - 1) != B_QUOTE) { return false; }
+    if (!z_import_path_ok(src, s + 1, sb - 1)) { return false; }
+    const c : usize = skip_ws(src, sb);
+    if (!z_is(src, c, ")")) { return false; }
+    const d : usize = skip_ws(src, z_tok_end(src, c));
+    if (!z_is(src, d, ".")) { return false; }
+    const m : usize = skip_ws(src, z_tok_end(src, d));
+    const mb : usize = z_tok_end(src, m);
+    if (!is_alpha(head(src, m))) { return false; }
+    const semi : usize = skip_ws(src, mb);
+    if (head(src, semi) != B_SEMI) { return false; }
+    ps[ZI_PA] = s + 1;
+    ps[ZI_PB] = sb - 1;
+    ps[ZI_MA] = m;
+    ps[ZI_MB] = mb;
+    ps[ZI_SEMI] = semi;
+    return true;
+}
+
+/// The value of the const the declaration named by ps imports, read from ext[nb ..] (the text after the const's name in the
+/// imported file): `[: scalar] = literal;`. Its type and its literal are written in ps (ZI_XA .. ZI_LB).
+pub fn z_ext_value(ext: []const u8, nb: usize, ps: []usize) -> bool {
+    ps[ZI_XA] = 0;
+    ps[ZI_XB] = 0;
+    var t : usize = skip_ws(ext, nb);
+    if (z_is(ext, t, ":")) {
+        const ta : usize = skip_ws(ext, z_tok_end(ext, t));
+        const tb : usize = z_tok_end(ext, ta);
+        if (!z_scalar(ext, ta, tb)) { return false; }
+        ps[ZI_XA] = ta;
+        ps[ZI_XB] = tb;
+        t = skip_ws(ext, tb);
+    }
+    if (!z_is(ext, t, "=")) { return false; }
+    const la : usize = skip_ws(ext, z_tok_end(ext, t));
+    const le : usize = z_lit_end(ext, la);
+    if (le == la or head(ext, skip_ws(ext, le)) != B_SEMI) { return false; }
+    ps[ZI_LA] = la;
+    ps[ZI_LB] = le;
+    return true;
+}
+
+/// Is there, in the file ext[lo .. hi), a file-level `pub const MEMBER` whose value is a scalar literal? MEMBER is
+/// src[ps[ZI_MA] .. ps[ZI_MB]]. An item that runs past hi belongs to a broken file: no answer.
+pub fn z_ext_const(ext: []const u8, lo: usize, hi: usize, src: []const u8, ps: []usize) -> bool {
+    var p : usize = skip_ws(ext, lo);
+    while (p < hi) {
+        var end : usize = z_item_end(ext, p);
+        if (end <= p) { end = p + 1; }
+        if (end > hi) { return false; }
+        var q : usize = p;
+        if (z_is(ext, q, "pub")) {
+            q = skip_ws(ext, z_tok_end(ext, q));
+            if (z_is(ext, q, "const")) {
+                const na : usize = skip_ws(ext, z_tok_end(ext, q));
+                const nb : usize = z_tok_end(ext, na);
+                if (word_is(ext, na, nb, src[ps[ZI_MA] .. ps[ZI_MB]])) { return z_ext_value(ext, nb, ps); }
+            }
+        }
+        p = skip_ws(ext, end);
+    }
+    return false;
+}
+
+/// Where the text of the file that starts at ext[from] ends: at the next Z_B_REC, or at the end of the bundle.
+pub fn z_seg_end(ext: []const u8, from: usize) -> usize {
+    var k : usize = from;
+    while (k < ext.len and ext[k] != Z_B_REC) { k = k + 1; }
+    return k;
+}
+
+/// Where the text of the file imported as src[a .. b] starts in the bundle: after its record's header. ext.len when the
+/// bundle has no record of that path.
+pub fn z_rec_text(ext: []const u8, src: []const u8, a: usize, b: usize) -> usize {
+    const n : usize = b - a;
+    var k : usize = 0;
+    while (k + n + 1 < ext.len) {
+        if (ext[k] == Z_B_REC and ext[k + 1 + n] == B_NL and word_is(ext, k + 1, k + 1 + n, src[a .. b])) { return k + n + 2; }
+        k = k + 1;
+    }
+    return ext.len;
+}
+
+/// Is the path src[a .. b] a line of the list out[0 .. w) already?
+pub fn z_listed(out: []const u8, w: usize, src: []const u8, a: usize, b: usize) -> bool {
+    const n : usize = b - a;
+    var k : usize = 0;
+    while (k + n < w and k + n < out.len) {
+        if ((k == 0 or out[k - 1] == B_NL) and out[k + n] == B_NL and word_is(out, k, k + n, src[a .. b])) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// Is there no line break in src[a .. b)?
+pub fn z_one_line(src: []const u8, a: usize, b: usize) -> bool {
+    var k : usize = a;
+    while (k < b and k < src.len) {
+        if (src[k] == B_NL or src[k] == B_CR) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The paths `inline_imports` will want, one per line, each once, in the order they are first declared: the glue reads each
+/// and passes the texts on as records (Z_B_REC, the path, a newline, the text). The result is the size of the list; it is
+/// above out.len when the buffer was too small (a list is never longer than src).
+pub fn imports(src: []const u8, out: []u8, st: []usize) -> usize {
+    if (st.len < ZI_SLOTS) { return 0; }
+    st[W] = 0;
+    var p : usize = skip_ws(src, 0);
+    while (p < src.len) {
+        var end : usize = z_item_end(src, p);
+        if (end <= p) { end = p + 1; }
+        if (z_import_const(src, p, st) and !z_listed(out, st[W], src, st[ZI_PA], st[ZI_PB])) {
+            put_src(src, st, out, st[ZI_PA], st[ZI_PB]);
+            put(st, out, B_NL);
+        }
+        p = skip_ws(src, end);
+    }
+    return st[W];
+}
+
+/// src with each import of a scalar literal written as the const it is: `pub const C = @import("x.zig").C;` and `pub
+/// const C: u32 = 5;` in x.zig make `pub const C: u32 = 5;`; the type written in the importing file wins over the
+/// imported one. ext holds the files `imports` listed, as records (see Z_B_REC). The result is the size of
+/// the output, above out.len when the buffer was too small (4 times src.len and 64 always suffice, see Z_LIT_MAX).
+pub fn inline_imports(src: []const u8, ext: []const u8, out: []u8, st: []usize) -> usize {
+    if (st.len < ZI_SLOTS) { return 0; }
+    st[W] = 0;
+    var done : usize = 0;
+    var p : usize = skip_ws(src, 0);
+    while (p < src.len) {
+        var end : usize = z_item_end(src, p);
+        if (end <= p) { end = p + 1; }
+        if (z_import_const(src, p, st)) {
+            const lo : usize = z_rec_text(ext, src, st[ZI_PA], st[ZI_PB]);
+            if (lo < ext.len and z_ext_const(ext, lo, z_seg_end(ext, lo), src, st) and z_one_line(src, st[ZI_NB], st[ZI_SEMI])) {
+                put_src(src, st, out, done, st[ZI_NB]);
+                if (st[ZI_TA] != 0) {
+                    puts(st, out, ": ");
+                    put_src(src, st, out, st[ZI_TA], st[ZI_TB]);
+                    puts(st, out, " = ");
+                } else if (st[ZI_XA] != 0) {
+                    puts(st, out, ": ");
+                    put_src(ext, st, out, st[ZI_XA], st[ZI_XB]);
+                    puts(st, out, " = ");
+                } else {
+                    puts(st, out, " = ");
+                }
+                put_src(ext, st, out, st[ZI_LA], st[ZI_LB]);
+                done = st[ZI_SEMI];
+            }
+        }
+        p = skip_ws(src, end);
+    }
+    put_src(src, st, out, done, src.len);
+    return st[W];
+}
+
 // ---------------------------------------------------------------- the file
 
 /// Is the text s at src[i], whatever the case?
@@ -3386,4 +3657,157 @@ test negative_control_the_five_counters_are_five_different_slots_and_none_is_the
     assert(Z_CLS != NTEST);
     assert(Z_STMT != NTEST);
     assert(Z_GREW != NSTUB);
+}
+
+// ---------------------------------------------------------------- tests: consts imported from another file (#10823)
+
+/// Test helper: the record of one imported file, Z_B_REC, the file's name, a newline, the text, appended to ext at w; the new w.
+pub fn z_ext_add(ext: []u8, w: usize, rel: []const u8, text: []const u8) -> usize {
+    var n : usize = w;
+    ext[n] = Z_B_REC;
+    n = n + 1;
+    var k : usize = 0;
+    while (k < rel.len) {
+        ext[n] = rel[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    ext[n] = B_NL;
+    n = n + 1;
+    k = 0;
+    while (k < text.len) {
+        ext[n] = text[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    return n;
+}
+
+test imports_lists_each_path_once_in_the_order_it_is_first_imported_as_a_member {
+    var st : [64]usize = [0] ** 64;
+    var out : [128]u8 = undefined;
+    const n : usize = imports("const std = @import(\"std\");\nconst x = @import(\"x.zig\");\npub const A = @import(\"gen_common.zig\").A;\nconst B: u32 = @import(\"./d/c.zig\").B;\nconst T = @import(\"x.zig\").T;\npub const C = @import(\"gen_common.zig\").C;\nfn f() u32 {\n    return 1;\n}\n", &out, &st);
+    assert(out_is(n, &out, 0, "gen_common.zig\n./d/c.zig\nx.zig\n"));
+}
+
+test negative_control_a_path_above_the_tree_or_not_a_zig_file_or_not_a_member_is_not_listed {
+    var st : [64]usize = [0] ** 64;
+    var out : [128]u8 = undefined;
+    const n : usize = imports("const a = @import(\"../up.zig\").A;\nconst b = @import(\"/abs/p.zig\").B;\nconst c = @import(\"d/../e.zig\").C;\nconst d = @import(\"readme.txt\").D;\nconst e = @import(\"std\").E;\nconst f = @import(\"x.zig\").F.G;\nvar g = @import(\"y.zig\").G;\nexport const h = @import(\"z.zig\").H;\nconst i = @import(\"a\\b.zig\").I;\nconst j = @import(\"c:d.zig\").J;\nconst k: Foo = @import(\"k.zig\").K;\nconst l = @import(\".zig\").L;\n", &out, &st);
+    assert(n == 0);
+}
+
+test an_imported_scalar_literal_is_written_in_place_of_the_import {
+    var st : [64]usize = [0] ** 64;
+    var ext : [512]u8 = undefined;
+    var w : usize = z_ext_add(&ext, 0, "a.zig", "pub const SIZE: usize = 32;\npub const NEG: i32 = -1;\npub const RATIO = 1.585;\n");
+    w = z_ext_add(&ext, w, "d/b.zig", "pub const ON: bool = true;\npub const NAME = \"tri\";\n");
+    var out : [512]u8 = undefined;
+    const n : usize = inline_imports("pub const SIZE = @import(\"a.zig\").SIZE;\nconst N: i64 = @import(\"a.zig\").NEG;\npub const RATIO = @import(\"a.zig\").RATIO;\npub const ON = @import(\"d/b.zig\").ON;\nconst NAME = @import(\"d/b.zig\").NAME;\n", ext[0 .. w], &out, &st);
+    assert(out_is(n, &out, 0, "pub const SIZE: usize = 32;\nconst N: i64 = -1;\npub const RATIO = 1.585;\npub const ON: bool = true;\nconst NAME = \"tri\";\n"));
+}
+
+test negative_control_what_is_not_a_scalar_literal_of_a_pub_const_is_left_as_it_was {
+    var st : [64]usize = [0] ** 64;
+    var ext : [1024]u8 = undefined;
+    const theirs : []const u8 = "pub const T = struct { x: u32 };\npub fn f() u32 { return 1; }\nconst PRIV: u32 = 7;\npub const EXPR = 2 * 3;\npub const TY: Trit = -1;\npub const TEXT = \"a\\nb\";\npub const LONG = 1234567890123456789012345678901234567890123456789012345678901234567890;\npub const REF = other.X;\npub const ARR = [_]u8{ 1, 2 };\npub const NEG = -x;\npub const HEXEXPR = 0xFF - 1;\n";
+    var w : usize = z_ext_add(&ext, 0, "a.zig", theirs);
+    var out : [1024]u8 = undefined;
+    const src : []const u8 = "const A = @import(\"a.zig\").T;\nconst B = @import(\"a.zig\").f;\nconst C = @import(\"a.zig\").PRIV;\nconst D = @import(\"a.zig\").EXPR;\nconst E = @import(\"a.zig\").TY;\nconst F = @import(\"a.zig\").TEXT;\nconst G = @import(\"a.zig\").LONG;\nconst H = @import(\"a.zig\").REF;\nconst I = @import(\"a.zig\").ARR;\nconst J = @import(\"a.zig\").NEG;\nconst K = @import(\"a.zig\").HEXEXPR;\nconst L = @import(\"a.zig\").MISSING;\nconst M = @import(\"gone.zig\").M;\n";
+    const n : usize = inline_imports(src, ext[0 .. w], &out, &st);
+    assert(out_is(n, &out, 0, src));
+}
+
+test a_declaration_over_several_lines_or_a_bundle_with_no_record_is_left_as_it_was {
+    var st : [64]usize = [0] ** 64;
+    var ext : [128]u8 = undefined;
+    var w : usize = z_ext_add(&ext, 0, "a.zig", "pub const SIZE: usize = 32;\n");
+    var out : [256]u8 = undefined;
+    const spread : []const u8 = "pub const SIZE =\n    @import(\"a.zig\").SIZE;\n";
+    const n : usize = inline_imports(spread, ext[0 .. w], &out, &st);
+    assert(out_is(n, &out, 0, spread));
+    const one : []const u8 = "pub const SIZE = @import(\"a.zig\").SIZE;\n";
+    const m : usize = inline_imports(one, ext[0 .. 0], &out, &st);
+    assert(out_is(m, &out, 0, one));
+    const k : usize = inline_imports(one, ext[0 .. w], &out, &st);
+    assert(out_is(k, &out, 0, "pub const SIZE: usize = 32;\n"));
+}
+
+test an_imported_const_is_found_by_its_name_among_the_items_of_its_file_and_not_inside_one {
+    var st : [64]usize = [0] ** 64;
+    var ext : [512]u8 = undefined;
+    var w : usize = z_ext_add(&ext, 0, "a.zig", "const std = @import(\"std\");\nfn local() u32 {\n    const SIZE: u32 = 1;\n    return SIZE;\n}\ntest \"t\" {\n    const SIZE: u32 = 2;\n    _ = SIZE;\n}\npub const SIZE: u32 = 3;\n");
+    var out : [128]u8 = undefined;
+    const n : usize = inline_imports("const SIZE = @import(\"a.zig\").SIZE;\n", ext[0 .. w], &out, &st);
+    assert(out_is(n, &out, 0, "const SIZE: u32 = 3;\n"));
+}
+
+test a_missing_record_in_the_middle_does_not_shift_the_next_import_and_the_line_count_never_changes {
+    var st : [64]usize = [0] ** 64;
+    var ext : [256]u8 = undefined;
+    var w : usize = z_ext_add(&ext, 0, "b.zig", "pub const B: u8 = 2;\n");
+    w = z_ext_add(&ext, w, "c.zig", "pub const C: u8 = 3;\n");
+    var out : [256]u8 = undefined;
+    const n : usize = inline_imports("const A = @import(\"a.zig\").A;\nconst B = @import(\"b.zig\").B;\n\n// kept\nconst C = @import(\"c.zig\").C;\n", ext[0 .. w], &out, &st);
+    assert(out_is(n, &out, 0, "const A = @import(\"a.zig\").A;\nconst B: u8 = 2;\n\n// kept\nconst C: u8 = 3;\n"));
+}
+
+test the_imported_value_makes_a_fn_that_used_it_convert_and_without_it_the_fn_stays_refused {
+    var ext : [256]u8 = undefined;
+    var w : usize = z_ext_add(&ext, 0, "gen_common.zig", "pub const SIMD_WIDTH: usize = 32;\n");
+    const src : []const u8 = "pub const SIMD_WIDTH = @import(\"gen_common.zig\").SIMD_WIDTH;\npub fn lanes(n: usize) usize {\n    return n / SIMD_WIDTH;\n}\n";
+    var flat : [512]u8 = undefined;
+    var ist : [64]usize = [0] ** 64;
+    const m : usize = inline_imports(src, ext[0 .. w], &flat, &ist);
+    var out : [512]u8 = undefined;
+    var st : [2048]usize = [0] ** 2048;
+    const n : usize = z_body_text(flat[0 .. m], &out, &st);
+    assert(out_is(n, &out, 0, "pub const SIMD_WIDTH : usize = 32;\n\npub fn lanes(n: usize) -> usize {\n    return n / SIMD_WIDTH;\n}\n\n"));
+    assert(st[NOK] == 1);
+    var out2 : [512]u8 = undefined;
+    var st2 : [2048]usize = [0] ** 2048;
+    const n2 : usize = z_body_text(src, &out2, &st2);
+    assert(out_is(n2, &out2, 0, "// t27o: refused fn lanes (line 2): uses external `SIMD_WIDTH` at line 3\n\n"));
+    assert(st2[NOK] == 0);
+}
+
+test the_output_is_never_more_than_four_times_the_source_and_64_bytes {
+    var st : [64]usize = [0] ** 64;
+    var text : [128]u8 = undefined;
+    var k : usize = 0;
+    while (k < 64) {
+        text[k] = 49;
+        k = k + 1;
+    }
+    var theirs : [128]u8 = undefined;
+    var t : usize = 0;
+    const head_text : []const u8 = "pub const B: usize = ";
+    while (t < head_text.len) {
+        theirs[t] = head_text[t];
+        t = t + 1;
+    }
+    var j : usize = 0;
+    while (j < 64) {
+        theirs[t + j] = 49;
+        j = j + 1;
+    }
+    theirs[t + 64] = 59;
+    var ext : [256]u8 = undefined;
+    const w : usize = z_ext_add(&ext, 0, "a.zig", theirs[0 .. t + 65]);
+    const src : []const u8 = "const A=@import(\"a.zig\").B;";
+    var out : [512]u8 = undefined;
+    const n : usize = inline_imports(src, ext[0 .. w], &out, &st);
+    assert(n <= 4 * src.len + 64);
+    assert(n == 82);
+}
+
+test negative_control_a_short_state_vector_gives_nothing_and_a_short_buffer_is_told_by_the_size {
+    var short : [8]usize = [0] ** 8;
+    var out : [64]u8 = undefined;
+    assert(imports("const A = @import(\"a.zig\").A;\n", &out, &short) == 0);
+    assert(inline_imports("const A = @import(\"a.zig\").A;\n", "", &out, &short) == 0);
+    var st : [64]usize = [0] ** 64;
+    var tiny : [4]u8 = undefined;
+    assert(imports("const A = @import(\"a.zig\").A;\n", &tiny, &st) == 6);
+    assert(inline_imports("const A = @import(\"a.zig\").A;\n", "", &tiny, &st) == 30);
 }

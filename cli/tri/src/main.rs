@@ -1353,6 +1353,12 @@ fn main() -> Result<()> {
 }
 
 /// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
+fn zig_source(file: &Path, src: &[u8]) -> Vec<u8> { // a .zig source with the consts it imports from files of its own directory tree written in: zig_convert.t27 `imports` names the files, `inline_imports` writes the values, this only reads (a symlink out of the tree is not followed; #10823)
+    let (dir, mut want, mut ext, mut flat, mut st) = (file.parent().and_then(|d| fs::canonicalize(d).ok()).unwrap_or_default(), vec![0u8; src.len() + 64], Vec::new(), vec![0u8; 4 * src.len() + 64], vec![0usize; zig::ZI_SLOTS]);
+    let w = zig::imports(src, &mut want, &mut st).min(want.len()); for rel in String::from_utf8_lossy(&want[..w]).lines() { if let Some(t) = fs::canonicalize(dir.join(rel)).ok().filter(|f| f.starts_with(&dir)).and_then(|f| fs::read(f).ok()) { ext.extend([&[zig::Z_B_REC][..], rel.as_bytes(), b"\n", &t].concat()); } }
+    let n = zig::inline_imports(src, &ext, &mut flat, &mut st).min(flat.len()); flat.truncate(n); flat
+}
+
 fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>, emit_cell: bool) -> Result<u8> {
     let src = fs::read(file).with_context(|| format!("reading {file}"))?;
     if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
@@ -1363,23 +1369,18 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
     let zig = t27o_ledger::front_end(file.as_bytes()) == t27o_ledger::FE_ZIG; if zig && oracle { println!("{}", t27o_ledger::NOTE_ZIG_ORACLE); return Ok(0); } // a .zig file: its own tests are the oracle (ledger.t27, #10823)
+    let src = if zig { zig_source(Path::new(file), &src) } else { src };
     let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], vec![0u8; 1 << 24]);
     let mut n = if zig { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
-    if !check {
-        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
-        return Ok(0);
-    }
-    // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
-    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27")));
+    if !check { std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?; return Ok(0); }
+    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27"))); // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
     if !zig { // a Rust file: the harness rustc builds is run and its samples follow the spec
-        fs::write(&h, &out[..n.min(out.len())])?; let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status(); fs::remove_file(&h)?;
-        anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
+        fs::write(&h, &out[..n.min(out.len())])?; let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status(); fs::remove_file(&h)?; anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
         let m = t27o::convert(&src, stem.as_bytes(), &mut spec, &mut st); out = [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat(); n = out.len();
     }
     fs::create_dir_all("specs/t27o_check")?; fs::write(&path, &out[..n.min(out.len())])?; println!("{}", path.display());
     if !t27o_ledger::has_evidence(zig, st[zig::Z_NTEST]) { eprintln!("{}", t27o_ledger::NOTE_ZIG_UNJUDGED); return Ok(t27o_ledger::EXIT_UNJUDGED as u8); }
-    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
-    let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
     if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
@@ -1395,12 +1396,11 @@ fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>,
     for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
         let Ok(src) = fs::read(Path::new(root).join(p)) else { continue };
         if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
-        let z = t27o_ledger::front_end(p.as_bytes()) == t27o_ledger::FE_ZIG; let ck = if z { &zk } else { &conv }; // a .zig row is keyed by both converters' seals (#10823)
-        let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
+        let z = t27o_ledger::front_end(p.as_bytes()) == t27o_ledger::FE_ZIG; let ck = if z { &zk } else { &conv }; // a .zig row is keyed by both converters' seals, and by the source with its imported consts written in (#10823)
+        let src = if z { zig_source(&Path::new(root).join(p), &src) } else { src }; let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
         let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == *ck), r.is_some_and(|r| r[3] == std)));
         let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
-            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new());
-            let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
+            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new()); let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
             let m = if z { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
             let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); for l in o.lines().filter(|l| t27o_ledger::is_refusal(l)) { *k.entry(&l[t27o_ledger::kind_from(l)..t27o_ledger::kind_to(l)]).or_default() += 1; }
             format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
