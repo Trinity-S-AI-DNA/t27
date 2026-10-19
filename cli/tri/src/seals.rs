@@ -25,6 +25,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[path = "../../../gen/rust/tri/seals/drift.rs"] #[allow(dead_code, unused_parens)] mod drift; // t27c gen-rust of specs/tri/seals/drift.t27 (#11045)
+#[path = "../../../bootstrap/gen/rust/verified/suite_jobs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod suite_jobs; // specs/verified/suite_jobs.t27
 
 #[derive(Subcommand)]
 pub enum SealsCmd {
@@ -261,31 +263,30 @@ pub fn is_sealable(claims: &[String]) -> bool {
     !claims.iter().any(|c| c.trim() == "none")
 }
 
+fn t27c_bin(root: &std::path::Path) -> Option<PathBuf> {
+    ["target/release/t27c", "target/debug/t27c"].iter().map(|p| root.join(p)).find(|p| p.is_file())
+}
+
 fn recompute(root: &PathBuf, spec: &str) -> Option<Vec<String>> {
-    let t27c = ["target/release/t27c", "target/debug/t27c"]
-        .iter()
-        .map(|p| root.join(p))
-        .find(|p| p.is_file())?;
-    let out = std::process::Command::new(t27c)
-        .arg("seal")
-        .arg(spec)
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let out = std::process::Command::new(t27c_bin(root)?).arg("seal").arg(spec).current_dir(root).output().ok().filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut found: Vec<String> = Vec::new();
-    for k in CLAIMS.iter() {
-        let key = format!("{k}=");
-        let v = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix(&key))
-            .map(|v| v.trim().to_string())?;
-        found.push(v);
-    }
-    Some(found)
+    CLAIMS.iter().map(|k| text.lines().find_map(|l| l.trim().strip_prefix(&format!("{k}="))).map(|v| v.trim().to_string())).collect()
+}
+
+/// `recompute` of every spec, suite_jobs() at a time (#11045: one by one the ledger took 56-108 s); in the order of `specs`.
+fn recompute_all(root: &PathBuf, specs: &[&String]) -> Vec<Option<Vec<String>>> {
+    let (next, jobs) = (std::sync::atomic::AtomicUsize::new(0), suite_jobs::suite_jobs(std::thread::available_parallelism().map_or(1, |n| n.get() as u32), std::env::var("T27_SUITE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)));
+    let mut got: Vec<(usize, Option<Vec<String>>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| std::iter::from_fn(|| Some(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).filter(|i| *i < specs.len())).map(|i| (i, recompute(root, specs[i]))).collect::<Vec<_>>())).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("seal worker panicked")).collect()
+    });
+    got.sort_by_key(|g| g.0);
+    got.into_iter().map(|g| g.1).collect()
+}
+
+/// The claims, by name, in which any of a spec's seals differs from what the compiler produces.
+fn moved_names(seals: &[Claims], truth: &[String]) -> Vec<&'static str> {
+    CLAIMS.iter().zip(truth).enumerate().filter(|(i, (_, t))| seals.iter().any(|(_, c)| &c[*i] != *t)).map(|(_, (k, _))| *k).collect()
 }
 
 fn sync_twins(root: &PathBuf, dir: &PathBuf, dry_run: bool) -> Result<()> {
@@ -541,11 +542,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
                 return Ok(());
             }
 
-            let bin = ["target/release/t27c", "target/debug/t27c"]
-                .iter()
-                .map(|p| root.join(p))
-                .find(|p| p.is_file());
-            let Some(bin) = bin else {
+            let Some(bin) = t27c_bin(&root) else {
                 anyhow::bail!(
                     "--why needs a compiler, and its absence is not a clean bill.\n  \
                      cargo build --release -p t27c"
@@ -619,11 +616,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
             return Ok(());
         }
         SealsCmd::Drift { fix } => {
-            let bin = ["target/release/t27c", "target/debug/t27c"]
-                .iter()
-                .map(|p| root.join(p))
-                .find(|p| p.is_file());
-            let Some(bin) = bin else {
+            let Some(bin) = t27c_bin(&root) else {
                 anyhow::bail!(
                     "no compiler binary -- a drift reading needs one, and its \
                      absence is not a clean bill.\n  cargo build --release -p t27c"
@@ -643,18 +636,18 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
             }
 
             let by = collect(&dir)?;
-            let mut drifted: Vec<(&String, Vec<String>)> = Vec::new();
+            let mut drifted: Vec<(&String, String, u8)> = Vec::new();
             let mut unreadable = 0usize;
-            for (spec, seals) in by.iter() {
-                if !root.join(spec).is_file() {
-                    continue; // dangling: a different kind, and the gate's to judge
-                }
-                let Some(truth) = recompute(&root, spec) else {
+            let live: Vec<&String> = by.keys().filter(|s| root.join(s).is_file()).collect(); // dangling: a different kind, and the gate's to judge
+            for (spec, truth) in live.iter().zip(recompute_all(&root, &live)) {
+                let Some(truth) = truth else {
                     unreadable += 1;
                     continue;
                 };
-                if seals.iter().any(|(_, c)| *c != truth) {
-                    drifted.push((spec, truth));
+                let moved = moved_names(&by[*spec], &truth);
+                let nones = truth.iter().filter(|c| !is_sealable(std::slice::from_ref(c))).count();
+                if !moved.is_empty() {
+                    drifted.push((spec, moved.join(", "), drift::verdict(moved.len() as u8, nones as u8)));
                 }
             }
 
@@ -673,8 +666,8 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
                 return Ok(());
             }
             println!();
-            for (spec, _) in drifted.iter().take(12) {
-                println!("      {spec}");
+            for (spec, fields, v) in drifted.iter().take(12) {
+                println!("{}", drift::row(*v).replace(drift::SPEC, spec).replace(drift::FIELDS, fields));
             }
             if drifted.len() > 12 {
                 println!("      ... and {} more", drifted.len() - 12);
@@ -692,10 +685,10 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
             }
 
             let (mut sealed, mut refused) = (0usize, 0usize);
-            for (spec, truth) in &drifted {
+            for (spec, fields, v) in &drifted {
                 // `--force` would write `gen_hash=none` as though absence were a
                 // hash. A spec no backend accepts is not a spec to seal.
-                if !is_sealable(truth) {
+                if *v == drift::V_REFUSE {
                     refused += 1;
                     continue;
                 }
@@ -707,6 +700,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
                     .unwrap_or(false);
                 if ok {
                     sealed += 1;
+                    println!("{}", drift::DONE.replace(drift::SPEC, spec).replace(drift::FIELDS, fields));
                 } else {
                     refused += 1;
                 }
@@ -845,7 +839,7 @@ mod tests {
             let a: Vec<String> = CLAIMS.iter().map(|_| "same".to_string()).collect();
             let mut b = a.clone();
             b[i] = "different".to_string();
-            assert_ne!(a, b, "field {} was not compared", CLAIMS[i]);
+            assert_eq!(moved_names(&[("x.json".into(), b)], &a), [CLAIMS[i]], "field {} was not compared", CLAIMS[i]);
         }
     }
 
