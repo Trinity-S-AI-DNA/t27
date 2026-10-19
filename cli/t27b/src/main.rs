@@ -1,19 +1,5 @@
 //! `t27b`: t27's own native backend (MVP), command line.
-//!
-//! ```text
-//! t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-//! t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
-//! t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then "<cmd>"]
-//! t27b asm    <file.t27> [--overflow trap|wrap]
-//! t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
-//!                   [--json <path>] [--runner "<cmd> [args]"]
-//!                   [--blockers [--reference <t27c> [--reference-cache <file>]
-//!                                [--reference-timeout-ms N]]]
-//! ```
-//!
-//! Exit codes: 0 success; 1 a test failed; 2 unsupported construct;
-//! 3 front-end (parse or typecheck) error; 4 JIT and interpreter disagree
-//! (`--check`); 5 code generation limit; 64 usage; 74 I/O error.
+//! Usage and exit codes: specs/tri/t27b/usage.t27 (`t27b help`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -65,35 +51,7 @@ macro_rules! errln {
     }};
 }
 
-const USAGE: &str = "usage:
-  t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-  t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
-  t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then \"<cmd>\"]
-  t27b asm    <file.t27> [--overflow trap|wrap]
-  t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
-  t27b ts      <file.t27>   (consts, scalar fns and tests as TypeScript; specs/tri/t27b/ts_emit.t27)
-  t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
-                    [--json <path>] [--runner \"<cmd> [args]\"]
-                    [--blockers [--reference <t27c> [--reference-cache <file>]
-                                 [--reference-timeout-ms N]]]
-
-  --elf        build: an ELF64 object for aarch64 Linux (specs/tri/t27b/elf.t27), the default on
-               Linux; --macho: a Mach-O object for arm64 macOS, the default elsewhere
-  --json       corpus: also write per-file results and totals to <path> as JSON
-               (with --reference, the reference verdicts too)
-  --runner     corpus: start each per-file `t27b test` as `<cmd> [args] <t27b> test ...`,
-               e.g. --runner \"qemu-aarch64 -L /usr/aarch64-linux-gnu\" when the corpus
-               itself runs under qemu-user without binfmt_misc
-  --blockers   test: report every unsupported construct, not just the first.
-               corpus: per file, every construct t27b lacks; then the greedy
-               order in which supporting them unlocks the most whole files.
-  --reference  corpus: also run the reference path (`<t27c> test-report`,
-               t27c's Zig backend) on every file, and leave the files it fails
-               out of the denominator. Where both sides ran a file's tests,
-               compare them test by test: `reference_disagree` counts files
-               where a test's verdict differs or only one side has it (#6441).
-               `mismatch` (= `jit_interp_mismatch`) is t27b's JIT against
-               t27b's own interpreter, not against the reference.";
+#[path = "../../../gen/rust/tri/t27b/usage.rs"] #[allow(dead_code)] mod usage; use usage::T27B_USAGE as USAGE; // the usage text, t27c gen-rust of specs/tri/t27b/usage.t27
 
 #[derive(Clone)]
 struct Opts {
