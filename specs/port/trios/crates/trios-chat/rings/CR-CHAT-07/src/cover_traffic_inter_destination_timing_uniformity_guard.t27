@@ -1,0 +1,403 @@
+module port::trios::crates::trios-chat::rings::CR-CHAT-07::src::cover_traffic_inter_destination_timing_uniformity_guard;
+
+use port::trios::crates::trios-chat::common::helpers;
+
+// Port of gHashTag/trios crates/trios-chat/rings/CR-CHAT-07/src/cover_traffic_inter_destination_timing_uniformity_guard.rs
+// (CR-CHAT-07 - Cover traffic inter-destination timing
+// uniformity guard, Wave-118 Lane B, R-CHAT-10).
+//
+// Cover timing must spread evenly across destinations: a
+// destination that receives cover faster or more often reads as
+// the real recipient, a cover burst to one destination
+// correlates with a real burst to the same, and cross-destination
+// timing analysis lays the true pattern bare. The rules, in the
+// original's order: the batch ceiling, then per emission the
+// zero-destination probe, the zero-timestamp probe and the
+// strictly-increasing timestamps, then per destination the
+// two-emission floor, and over the destinations' mean times the
+// standard-deviation ceiling - only when at least two
+// destinations carry traffic.
+//
+// The original returns Result<(), DestTimingError>. This port
+// carries the verdict as a named struct (owner decision D5): Ok
+// first, then the six variants in the original's declaration
+// order - HighStddev, ZeroDest, ZeroTimestamp, NonMonotonic,
+// TooFew, TooMany - with every payload field: the measured and
+// ceiling stddev, idx for the per-emission rules, idx with prev
+// and current for the monotonic break, the destination's
+// byte-order position with got and min for the floor, and got
+// with max for the batch bounds.
+//
+// The original's stddev folds float means of u64 timestamp sums
+// - the int-to-float casts do not lower under the backends - so
+// the standard deviation arrives as a number the caller computed,
+// the lane convention for statistics over buffers (fill-byte
+// randomness #9698, payload entropy #9747, pattern randomness
+// #9811, rate stability #9814). The structural rules stay
+// fully in the spec. The original's BTreeMap walk visits
+// destinations in byte order of their hashes; the port's floor
+// walk enumerates the distinct destinations in the same byte
+// order, so the failing destination's index is its byte-order
+// rank exactly as the original reports. Every fixture's stddev
+// is Python-verified exact: the split batch 74250 over the
+// ceiling of 5000, the uniform batch 250, the twenty-emission
+// walk 1.414.
+
+// Maximum allowed standard deviation of inter-destination
+// timing.
+pub const CIDT_MAX_STDDEV: f64 = 5000.0;
+
+// Minimum emissions per destination for statistical validity.
+pub const CIDT_MIN_PER_DEST: usize = 2;
+
+// Maximum emissions per batch.
+pub const CIDT_MAX_EMISSIONS: usize = 1024;
+
+// Destination hash length.
+pub const CIDT_DEST_LEN: usize = 16;
+
+// A cover traffic emission to a destination.
+pub struct DestTimingEmission {
+    dest: [16]u8,
+    timestamp_ms: u64,
+}
+
+// Verdict codes: Ok(()) and DestTimingError's variants, in declaration order.
+pub enum DestTimingCode {
+    Ok,
+    HighStddev,
+    ZeroDest,
+    ZeroTimestamp,
+    NonMonotonic,
+    TooFew,
+    TooMany,
+}
+
+// The verdict of the inter-destination timing validation, with
+// every error payload field.
+pub struct DestTimingVerdict {
+    code: DestTimingCode,
+    idx: usize,
+    got: usize,
+    bound: usize,
+    prev: u64,
+    current: u64,
+    got_f: f64,
+    bound_f: f64,
+}
+
+// Whether a is byte-lexicographically before b: the first
+// differing byte decides.
+pub fn dest_byte_less(a: [16]u8, b: [16]u8) -> bool {
+    for i in 0..16 {
+        if (a[i] != b[i]) {
+            if (a[i] < b[i]) {
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// Whether emission i carries a destination an earlier emission
+// already carried - the first-occurrence probe of the
+// distribution lane.
+pub fn dest_seen_before(emissions: []const DestTimingEmission, i: usize) -> bool {
+    for j in 0..i {
+        if (ids16_equal(emissions[j].dest, emissions[i].dest)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The number of distinct destinations in the batch.
+pub fn distinct_dests(emissions: []const DestTimingEmission) -> usize {
+    var distinct: usize = 0;
+    for i in 0..emissions.len {
+        if (!dest_seen_before(emissions, i)) {
+            distinct = distinct + 1;
+        }
+    }
+    return distinct;
+}
+
+// How many emissions of the batch carry this destination - the
+// original's BTreeMap entry count, answered by a scan.
+pub fn dest_count(emissions: []const DestTimingEmission, d: [16]u8) -> usize {
+    var count: usize = 0;
+    for i in 0..emissions.len {
+        if (ids16_equal(emissions[i].dest, d)) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+// [VERIFIED] Validate cover traffic inter-destination timing
+// uniformity. Returns Ok only when every rule holds, checked in
+// the original's order: the batch ceiling, then per emission the
+// zero destination, the zero timestamp and the strictly-
+// increasing timestamps, then per destination (in byte order of
+// the hashes, the original's BTreeMap walk) the two-emission
+// floor, and over at least two destinations the caller's stddev
+// against the ceiling.
+pub fn validate_dest_timing(
+    emissions: []const DestTimingEmission,
+    stddev: f64,
+) -> DestTimingVerdict {
+    if (emissions.len > CIDT_MAX_EMISSIONS) {
+        return DestTimingVerdict { code: DestTimingCode.TooMany, idx: 0, got: emissions.len, bound: CIDT_MAX_EMISSIONS, prev: 0, current: 0, got_f: 0.0, bound_f: 0.0, };
+    }
+    var prev_ts: u64 = 0;
+    for i in 0..emissions.len {
+        if (zero_id16(emissions[i].dest)) {
+            return DestTimingVerdict { code: DestTimingCode.ZeroDest, idx: i, got: 0, bound: 0, prev: 0, current: 0, got_f: 0.0, bound_f: 0.0, };
+        }
+        if (emissions[i].timestamp_ms == 0) {
+            return DestTimingVerdict { code: DestTimingCode.ZeroTimestamp, idx: i, got: 0, bound: 0, prev: 0, current: 0, got_f: 0.0, bound_f: 0.0, };
+        }
+        if (i > 0) {
+            if (emissions[i].timestamp_ms <= prev_ts) {
+                return DestTimingVerdict { code: DestTimingCode.NonMonotonic, idx: i, got: 0, bound: 0, prev: prev_ts, current: emissions[i].timestamp_ms, got_f: 0.0, bound_f: 0.0, };
+            }
+        }
+        prev_ts = emissions[i].timestamp_ms;
+    }
+    const distinct: usize = distinct_dests(emissions);
+    var last: [16]u8 = ZERO_DEST16;
+    var have_last: bool = false;
+    for rank in 0..distinct {
+        var best: [16]u8 = ZERO_DEST16;
+        var have_best: bool = false;
+        for i in 0..emissions.len {
+            var beyond_last: bool = true;
+            if (have_last) {
+                beyond_last = dest_byte_less(last, emissions[i].dest);
+            }
+            if (beyond_last) {
+                if (!have_best) {
+                    best = emissions[i].dest;
+                    have_best = true;
+                } else {
+                    if (dest_byte_less(emissions[i].dest, best)) {
+                        best = emissions[i].dest;
+                    }
+                }
+            }
+        }
+        const count: usize = dest_count(emissions, best);
+        if (count < CIDT_MIN_PER_DEST) {
+            return DestTimingVerdict { code: DestTimingCode.TooFew, idx: rank, got: count, bound: CIDT_MIN_PER_DEST, prev: 0, current: 0, got_f: 0.0, bound_f: 0.0, };
+        }
+        last = best;
+        have_last = true;
+    }
+    if (distinct >= 2) {
+        if (stddev > CIDT_MAX_STDDEV) {
+            return DestTimingVerdict { code: DestTimingCode.HighStddev, idx: 0, got: 0, bound: 0, prev: 0, current: 0, got_f: stddev, bound_f: CIDT_MAX_STDDEV, };
+        }
+    }
+    return DestTimingVerdict { code: DestTimingCode.Ok, idx: 0, got: 0, bound: 0, prev: 0, current: 0, got_f: 0.0, bound_f: 0.0, };
+}
+
+// The destinations of the fixtures, one byte repeated sixteen
+// times - the original's dest(byte) helper, entry by entry.
+pub const DEST_1: [16]u8 = [16]u8{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,};
+pub const DEST_2: [16]u8 = [16]u8{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,};
+pub const ZERO_DEST16: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,};
+
+// The destination bytes of the loop fixtures.
+pub const CIDT_DEST_BYTES_5: [5]u8 = [5]u8{1, 2, 3, 4, 5,};
+
+// **CIDT-01** - high stddev rejected: destination one's mean
+// time 1500 and destination two's 150000 - a stddev of 74250
+// over the ceiling of 5000.
+test cidt_01_high_stddev_rejected {
+    const es: [4]DestTimingEmission = [4]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 100000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 200000, },
+    };
+    const v = validate_dest_timing(&es, 74250.0);
+    assert(v.code == DestTimingCode.HighStddev);
+    assert(v.got_f == 74250.0);
+    assert(v.bound_f == 5000.0);
+}
+
+// **CIDT-02** - the zero destination rejected.
+test cidt_02_zero_dest_rejected {
+    const es: [1]DestTimingEmission = [1]DestTimingEmission{
+        DestTimingEmission { dest: ZERO_DEST16, timestamp_ms: 1000, },
+    };
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.ZeroDest);
+    assert(v.idx == 0);
+}
+
+// **CIDT-03** - the zero timestamp rejected.
+test cidt_03_zero_timestamp_rejected {
+    const es: [1]DestTimingEmission = [1]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 0, },
+    };
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.ZeroTimestamp);
+    assert(v.idx == 0);
+}
+
+// **CIDT-04** - a non-monotonic timestamp rejected: 1000 after
+// 2000.
+test cidt_04_non_monotonic_rejected {
+    const es: [2]DestTimingEmission = [2]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 1000, },
+    };
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.NonMonotonic);
+    assert(v.idx == 1);
+    assert(v.prev == 2000);
+    assert(v.current == 1000);
+}
+
+// **CIDT-05** - too few emissions for a destination rejected:
+// destination two carries one emission of a required two, its
+// byte-order rank one.
+test cidt_05_too_few_rejected {
+    const es: [3]DestTimingEmission = [3]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 3000, },
+    };
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.TooFew);
+    assert(v.idx == 1);
+    assert(v.got == 1);
+    assert(v.bound == 2);
+}
+
+// **CIDT-06** - too many rejected: 1025 emissions of a maximum
+// 1024, built in a loop like the original's, the destinations
+// rotating over three values and the timestamps stepping by
+// one. The batch rule fires before any emission is examined.
+test cidt_06_too_many_rejected {
+    var es: [1025]DestTimingEmission;
+    for i in 0..1025 {
+        var d: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,};
+        const slot: usize = i % 3;
+        d[0] = CIDT_DEST_BYTES_5[slot];
+        es[i] = DestTimingEmission { dest: d, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.TooMany);
+    assert(v.got == 1025);
+    assert(v.bound == 1024);
+}
+
+// **CIDT-07** - the uniform batch accepted: two destinations,
+// means 1500 and 2000 - a stddev of 250.
+test cidt_07_uniform_accepted {
+    const es: [4]DestTimingEmission = [4]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 1500, },
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 2500, },
+    };
+    const v = validate_dest_timing(&es, 250.0);
+    assert(v.code == DestTimingCode.Ok);
+}
+
+// **CIDT-08** - an empty batch accepted.
+test cidt_08_empty_accepted {
+    const es: [0]DestTimingEmission = [0]DestTimingEmission{};
+    const v = validate_dest_timing(&es, 0.0);
+    assert(v.code == DestTimingCode.Ok);
+}
+
+// **CIDT-09** - a single destination accepted: the stddev check
+// needs two.
+test cidt_09_single_dest_accepted {
+    const es: [2]DestTimingEmission = [2]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+    };
+    const v = validate_dest_timing(&es, 999999.0);
+    assert(v.code == DestTimingCode.Ok);
+}
+
+// **CIDT-10** - many uniform destinations accepted: five
+// destinations, four emissions each, the timestamps walking one
+// to twenty - a stddev of 1.414.
+test cidt_10_many_uniform_accepted {
+    var es: [20]DestTimingEmission;
+    for i in 0..20 {
+        var dest: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,};
+        dest[0] = CIDT_DEST_BYTES_5[i / 4];
+        es[i] = DestTimingEmission { dest: dest, timestamp_ms: @as(u64, i) + 1, };
+    }
+    const v = validate_dest_timing(&es, 1.4142135623730951);
+    assert(v.code == DestTimingCode.Ok);
+}
+
+// The six helpers have direct tests (coverage: Untested 0).
+test cidt_helpers_answer {
+    assert(ids16_equal(DEST_1, DEST_1));
+    assert(!ids16_equal(DEST_1, DEST_2));
+    assert(zero_id16(ZERO_DEST16));
+    assert(!zero_id16(DEST_1));
+    assert(dest_byte_less(DEST_1, DEST_2));
+    assert(!dest_byte_less(DEST_2, DEST_1));
+    assert(!dest_byte_less(DEST_1, DEST_1));
+    const three: [3]DestTimingEmission = [3]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 2, },
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 3, },
+    };
+    assert(!dest_seen_before(&three, 0));
+    assert(!dest_seen_before(&three, 1));
+    assert(dest_seen_before(&three, 2));
+    assert(distinct_dests(&three) == 2);
+    assert(dest_count(&three, DEST_1) == 2);
+    assert(dest_count(&three, DEST_2) == 1);
+    assert(dest_count(&three, ZERO_DEST16) == 0);
+}
+
+// Rule order is the original's: the zero destination before the
+// zero timestamp, the zero timestamp before the monotonicity,
+// the per-emission rules before the per-destination floor, and
+// the floor before the stddev ceiling.
+test rule_order_matches_original {
+    const zero_zero_ts: [1]DestTimingEmission = [1]DestTimingEmission{
+        DestTimingEmission { dest: ZERO_DEST16, timestamp_ms: 0, },
+    };
+    const v1 = validate_dest_timing(&zero_zero_ts, 0.0);
+    assert(v1.code == DestTimingCode.ZeroDest);
+
+    const zero_ts_backstep: [2]DestTimingEmission = [2]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 0, },
+    };
+    const v2 = validate_dest_timing(&zero_ts_backstep, 0.0);
+    assert(v2.code == DestTimingCode.ZeroTimestamp);
+    assert(v2.idx == 1);
+
+    const backstep_few: [3]DestTimingEmission = [3]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 3000, },
+    };
+    const v3 = validate_dest_timing(&backstep_few, 0.0);
+    assert(v3.code == DestTimingCode.NonMonotonic);
+    assert(v3.idx == 1);
+
+    const few_split: [3]DestTimingEmission = [3]DestTimingEmission{
+        DestTimingEmission { dest: DEST_1, timestamp_ms: 1000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 2000, },
+        DestTimingEmission { dest: DEST_2, timestamp_ms: 3000, },
+    };
+    const v4 = validate_dest_timing(&few_split, 74250.0);
+    assert(v4.code == DestTimingCode.TooFew);
+    assert(v4.idx == 0);
+    assert(v4.got == 1);
+}

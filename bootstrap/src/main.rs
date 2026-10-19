@@ -90,6 +90,11 @@ mod sha256;
 #[path = "../gen/rust/tri/crypto/ed25519.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod ed25519;
+// specs/tri/fmt_source.t27 (#10365), lowered by `t27c gen-rust`: the lossless formatter behind `t27c fmt`.
+// Never hand-edit it; regenerate.
+#[path = "../gen/rust/tri/fmt_source.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod fmt_source;
 mod memory;
 mod trit_stdlib;
 mod behavior_sva;
@@ -113,6 +118,9 @@ mod test_report_exit;
 #[path = "../gen/rust/verified/seal_identity.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod seal_identity;
+// specs/verified/seal_write.t27 (#10457, #10454): what one seal write must check before and after it lands.
+#[path = "../gen/rust/verified/seal_write.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod seal_write;
 // specs/verified/verdict_audit.t27 (#8542): which reused verdicts `frontier --audit` reruns.
 #[path = "../gen/rust/verified/verdict_audit.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
@@ -133,6 +141,8 @@ mod suite_jobs;
 #[path = "../gen/rust/verified/watch.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod watch;
+#[path = "../gen/rust/verified/frontier_scope.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod frontier_scope; // specs/verified/frontier_scope.t27 (#10236): whether, and how far, a scoped frontier narrows its walk.
+#[path = "../gen/rust/ci/affected.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod affected; // specs/ci/affected.t27 (#7565): the specs a change can move; CI's rule, here the selection behind `frontier --only/--since`.
 // specs/verified/silicon_queue.t27 (#8095 step 5): the bench queue and the reseal guard.
 #[path = "../gen/rust/verified/silicon_queue.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
@@ -387,16 +397,12 @@ enum Commands {
         #[arg(long, value_delimiter = ',', default_value = "1,7,42")]
         seeds: Vec<u32>,
     },
-    /// THE SERVICE (R2-4): read the receipts a spec's hardware runs wrote
-    /// (.trinity/receipts) and judge, by specs/verified/run_record.t27, whether
-    /// they are ONE verified run a verdict record may cite as its run
-    /// reference. Collects the facts, never repairs the record.
     /// #8095: every spec, REUSE or the reason to rebuild (specs/verified/seal_identity.t27).
     Frontier { /// Also print each spec that must be rebuilt, with its reason code.
         #[arg(long)] list: bool, /// Seal again each spec with a stale part; keep only a seal remint_keeps allows.
         #[arg(long)] reseal: bool, /// Rerun the reused specs verdict_audit.t27 picks for this round; exit 1 on a disagreement.
         #[arg(long)] audit: Option<u32>, /// Keep running: rerun each spec whose closure changed since the last look (watch.t27).
-        #[arg(long)] watch: bool },
+        #[arg(long)] watch: bool, #[arg(long, num_args = 1.., conflicts_with = "since", help = "Walk only these specs and the specs that import them (frontier_scope.t27)")] only: Vec<String>, #[arg(long, help = "Walk only the specs `git diff --name-status REV` names and the specs that import them")] since: Option<String> },
     /// #8095 step 5: what the bench does about each spec with a silicon run (specs/verified/silicon_queue.t27).
     SiliconQueue,
     /// #8153: the agent next to a board (specs/verified/bench_agent.t27). Runs owner-approved jobs (open
@@ -1293,6 +1299,9 @@ enum Commands {
         /// Input file path
         input: String,
     },
+    /// Print the IGLA board event a .t27 spec states, as one JSON object
+    #[command(name = "gen-json")]
+    GenJson { input: String },
 
     /// Compute deterministic test_vector_hash from conformance JSON
     Conformance {
@@ -1336,7 +1345,7 @@ enum Commands {
     Compile {
         /// Input file path
         input: String,
-        /// Backend: zig, verilog, or c
+        /// Backend: zig, verilog, c, or ml
         #[arg(long, default_value = "zig")]
         backend: String,
         /// Output file path (default: input with backend extension)
@@ -1542,7 +1551,7 @@ enum Commands {
         input: String,
     },
 
-    /// Pretty-print .t27 from AST
+    /// Normalise .t27 whitespace, keeping every comment and token (specs/tri/fmt_source.t27)
     Fmt {
         input: String,
     },
@@ -1621,14 +1630,6 @@ enum Commands {
     Diff {
         left: String,
         right: String,
-    },
-
-    /// Watch .t27 files for changes and recompile
-    Watch {
-        #[arg(long, default_value = ".")]
-        repo_root: String,
-        #[arg(long, default_value = "2")]
-        interval_secs: u64,
     },
 
     /// Run full CI checks (parse + typecheck + gen + seal)
@@ -5637,6 +5638,31 @@ fn run_gen_python(input_path: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `gen-json` (#10050): the IGLA board event a spec states, as one JSON object. Every value comes
+/// through the gen-js layer, which spells it as JSON does; this only arranges them, cells zipped.
+fn run_gen_json(input_path: &str) -> anyhow::Result<()> {
+    let (ast, _) = ast_for_codegen(input_path)?;
+    let scope = codegen_js::Bound::in_spec(&ast);
+    let v = |name: &str| -> anyhow::Result<String> {
+        let found = ast.children.iter().find(|n| n.kind == compiler::NodeKind::ConstDecl && n.name == name);
+        let node = found.ok_or_else(|| anyhow::anyhow!("gen-json: the spec declares no const {name}"))?;
+        codegen_js::const_value(&codegen_js::JS, node, &scope).map_err(anyhow::Error::msg)
+    };
+    let items = |name: &str| -> anyhow::Result<Vec<String>> {
+        let s = v(name)?;
+        Ok(s.trim_matches(|c| c == '[' || c == ']').split(", ").map(String::from).collect())
+    };
+    let (status, pct) = (items("CELL_STATUS")?, items("CELL_PCT")?);
+    anyhow::ensure!(status.len() == pct.len(), "gen-json: {} statuses, {} percents", status.len(), pct.len());
+    let (ks, kp) = (v("KEY_STATUS")?, v("KEY_PCT")?);
+    let cells: Vec<_> = status.iter().zip(&pct).map(|(s, p)| format!("{{{ks}:{s},{kp}:{p}}}")).collect();
+    let lens = items("LENS_PCT")?.join(",");
+    let metrics = format!("{{{}:[{lens}],{}:[{}]}}", v("KEY_LENS")?, v("KEY_CELLS")?, cells.join(","));
+    let (job, stage, msg, progress) = (v("JOB")?, v("STAGE")?, v("MSG")?, v("PROGRESS")?);
+    println!("{{\"job\":{job},\"stage\":{stage},\"msg\":{msg},\"progress\":{progress},\"metrics\":{metrics}}}");
+    Ok(())
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     sha256::hash_hex(data).iter().map(|&c| c as char).collect()
 }
@@ -5836,6 +5862,16 @@ fn seal_file_path(module: &str, input_path: &str) -> std::path::PathBuf {
     Path::new(".trinity").join("seals").join(name)
 }
 
+/// seal_write.t27 STAGE_THEN_RENAME (#10454): stage `.<name>.part-<pid>` beside the seal, sync, let `check` judge the staged file, then one rename; any other answer removes the stage and leaves the old seal.
+fn write_seal_atomic(path: &Path, bytes: &[u8], check: impl FnOnce(&Path) -> u8) -> anyhow::Result<u8> {
+    let (dir, part) = (path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")), path.with_file_name(format!(".{}{}-{}", path.file_name().unwrap_or_default().to_string_lossy(), seal_write::SEAL_STAGE_SUFFIX, std::process::id())));
+    let w = fs::File::create(&part).and_then(|mut f| { std::io::Write::write_all(&mut f, bytes)?; f.sync_all() }).map(|_| check(&part)).and_then(|c| if c == seal_write::WRITE_OK { fs::rename(&part, path).map(|_| c) } else { Ok(c) });
+    if w.as_ref().map_or(true, |c| *c != seal_write::WRITE_OK) { let _ = fs::remove_file(&part); } let c = w.with_context(|| format!("writing {}", path.display()))?; if let Ok(d) = fs::File::open(dir) { let _ = d.sync_all(); } Ok(c)
+}
+/// The staged file read back equals what was written (seal_write.t27 post_write_check's readback_equal).
+fn staged_is(bytes: &[u8]) -> impl FnOnce(&Path) -> u8 + '_ { move |p| seal_write::post_write_check(0, 0, 0, fs::read(p).map_or(false, |b| b == bytes)) }
+/// The five hashes a seal records, in the order seal prints them.
+fn hash_pairs(h: &SealHashes) -> [(&'static str, &String); 5] { [("spec_hash", &h.spec_hash), ("gen_hash_zig", &h.gen_hash_zig), ("gen_hash_verilog", &h.gen_hash_verilog), ("gen_hash_c", &h.gen_hash_c), ("gen_hash_rust", &h.gen_hash_rust)] }
 /// The producer identity a seal and a receipt both carry: `name@version+git`,
 /// defined ONCE. specs/verified/receipt.t27's `producer_matches` compares two
 /// producer identities verbatim -- no normalization anywhere, matching is not
@@ -5916,13 +5952,7 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
             serde_json::from_str(&fs::read_to_string(&seal_path)?)?;
 
         let mut all_match = true;
-        let checks = [
-            ("spec_hash", &hashes.spec_hash),
-            ("gen_hash_zig", &hashes.gen_hash_zig),
-            ("gen_hash_verilog", &hashes.gen_hash_verilog),
-            ("gen_hash_c", &hashes.gen_hash_c),
-            ("gen_hash_rust", &hashes.gen_hash_rust),
-        ];
+        let checks = hash_pairs(&hashes);
 
         for (field, current) in &checks {
             let saved = saved_json
@@ -6092,28 +6122,19 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
             "tests": tests_record
         });
 
-        // The derived name and the file on disk can differ ONLY IN CASE: the
-        // tool would write `ar_restraint.json` where `ar_Restraint.json` is
-        // tracked. macOS resolves those to one file and hides it; on the
-        // case-sensitive filesystem CI runs on, `--save` would create a SECOND
-        // seal for the same spec and neither would be wrong-looking. Measured
-        // over the store: 751 filenames match the derived name exactly, 4
-        // differ only by case, 558 use the older bare-`<module>` scheme.
-        //
-        // An existing file wins, so the store cannot grow a case-variant twin.
+        // An existing file wins, even one that differs only in case: seal_write.t27 names_collide() says why.
         let derived = seal_file_path(&hashes.module, &hashes.spec_path);
-        let seal_path = fs::read_dir(&seals_dir)
-            .ok()
-            .and_then(|entries| {
-                let want = derived.file_name()?.to_string_lossy().to_lowercase();
-                entries.flatten().find_map(|e| {
-                    let p = e.path();
-                    (p.file_name()?.to_string_lossy().to_lowercase() == want).then_some(p)
-                })
-            })
-            .unwrap_or(derived);
+        let want = derived.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let seal_path = fs::read_dir(&seals_dir).ok().and_then(|es| es.flatten().map(|e| e.path()).find(|p| p.file_name().map_or(false, |n| seal_write::names_collide(n.to_string_lossy() == want, n.to_string_lossy().to_lowercase() == want.to_lowercase())))).unwrap_or(derived);
         let pretty = serde_json::to_string_pretty(&seal_obj)?;
-        fs::write(&seal_path, &pretty)?;
+        // seal_write.t27 dest_check + dest_allowed (#10454): another spec's seal is refused, --force included; an unreadable owner (torn or legacy) only with --force.
+        let owner = fs::read(&seal_path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["spec_path"].as_str().map(|s| s.trim_start_matches("./").to_string()));
+        let dest = seal_write::dest_check(seal_path.exists(), owner.is_some(), owner.as_deref() == Some(hashes.spec_path.as_str()));
+        if !seal_write::dest_allowed(dest, force) { eprintln!("refusing to seal {}: {}", hashes.spec_path, if dest == seal_write::WRITE_COLLISION { format!("{} is the seal of {}, and both specs derive that name (parent directory + module). Rename one spec's module or directory; --force does not override this.", seal_path.display(), owner.unwrap_or_default()) } else { format!("{} names no readable spec_path (a torn write or a legacy seal); --force replaces it.", seal_path.display()) }); std::process::exit(1); } else if dest == seal_write::WRITE_OWNER_UNKNOWN { println!("{} names no readable spec_path: replacing it (--force)", seal_path.display()); }
+        // seal_write.t27 post_write_check + gens_check judge the staged file before the rename: the spec hashed and generated again, the bytes the tests read, the stage read back.
+        let tested = report.read.as_ref().map_or(0, |r| (format!("sha256:{r}") != hashes.spec_hash) as u64); // 0 = the recorded bytes, or no test read any
+        let code = write_seal_atomic(&seal_path, pretty.as_bytes(), |p| { let again = compute_seal_hashes(input_path).ok(); seal_write::gens_check(seal_write::post_write_check(0, again.as_ref().map_or(1, |a| (a.spec_hash != hashes.spec_hash) as u64), tested, staged_is(pretty.as_bytes())(p) == seal_write::WRITE_OK), again.map_or(false, |a| hash_pairs(&a)[1..] == hash_pairs(&hashes)[1..])) })?;
+        if code != seal_write::WRITE_OK { eprintln!("seal of {} not kept: {}; the old seal is untouched", hashes.spec_path, match code { seal_write::WRITE_TESTED_OTHER => "the tests read other bytes than the ones hashed", seal_write::WRITE_SPEC_MOVED => "the spec changed while it was being sealed", seal_write::WRITE_READBACK_DIFF => "the staged file read back is not the seal written", _ => "a second generation of the same spec gave other code (a gen hash nobody can reproduce)" }); std::process::exit(1); }
 
         // A spec can own MORE THAN ONE seal file, and writing only the
         // canonical name leaves the others describing output that no longer
@@ -6131,62 +6152,23 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
         // each file has it, because the file is NAMED after that field and
         // overwriting it would leave a seal whose name and contents disagree --
         // which is the defect this is repairing, not a second copy of it.
-        let mut also_updated = 0usize;
-        if let Ok(entries) = fs::read_dir(&seals_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path == seal_path || path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(text) = fs::read_to_string(&path) else { continue };
-                let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&text) else {
-                    continue;
-                };
-                if existing.get("spec_path").and_then(|v| v.as_str()) != Some(hashes.spec_path.as_str())
-                {
-                    continue;
-                }
-                for (k, v) in [
-                    ("spec_hash", &hashes.spec_hash),
-                    ("gen_hash_zig", &hashes.gen_hash_zig),
-                    ("gen_hash_verilog", &hashes.gen_hash_verilog),
-                    ("gen_hash_c", &hashes.gen_hash_c),
-                    ("gen_hash_rust", &hashes.gen_hash_rust),
-                ] {
-                    existing[k] = serde_json::Value::String(v.clone());
-                }
-                existing["sealed_at"] = serde_json::Value::String(now.clone());
-                existing["tests"] = tests_record.clone();
-                if let Ok(out) = serde_json::to_string_pretty(&existing) {
-                    if fs::write(&path, &out).is_ok() {
-                        also_updated += 1;
-                    }
-                }
-            }
+        let (mut also_updated, mut twins_failed) = (0usize, Vec::new());
+        for path in fs::read_dir(&seals_dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p != &seal_path && p.extension().and_then(|e| e.to_str()) == Some("json")) {
+            let Some(mut existing) = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { continue };
+            if existing.get("spec_path").and_then(|v| v.as_str()) != Some(hashes.spec_path.as_str()) { continue; }
+            for (k, v) in hash_pairs(&hashes) { existing[k] = serde_json::Value::String(v.clone()); }
+            existing["sealed_at"] = serde_json::Value::String(now.clone()); existing["tests"] = tests_record.clone();
+            let out = serde_json::to_string_pretty(&existing)?; // #10454: staged, read back, renamed; a twin that failed is named and fails the command, not skipped
+            if write_seal_atomic(&path, out.as_bytes(), staged_is(out.as_bytes())).map_or(false, |c| c == seal_write::WRITE_OK) { also_updated += 1 } else { twins_failed.push(path.display().to_string()) }
         }
-
-        // Also print hashes to stdout
-        println!("spec_hash={}", hashes.spec_hash);
-        println!("gen_hash_zig={}", hashes.gen_hash_zig);
-        println!("gen_hash_verilog={}", hashes.gen_hash_verilog);
-        println!("gen_hash_c={}", hashes.gen_hash_c);
-        println!("gen_hash_rust={}", hashes.gen_hash_rust);
+        for (k, v) in hash_pairs(&hashes) { println!("{k}={v}"); }
         println!("\nSeal saved to {}", seal_path.display());
-        if also_updated > 0 {
-            // Said out loud: a command that silently touched other files would
-            // be worse than one that touches too few.
-            println!(
-                "  and {} other seal file(s) naming the same spec",
-                also_updated
-            );
-        }
+        // Said out loud: a command that silently touched other files would be worse than one that touches too few.
+        if also_updated > 0 { println!("  and {} other seal file(s) naming the same spec", also_updated); }
+        anyhow::ensure!(twins_failed.is_empty(), "{} other seal file(s) naming {} were not rewritten: {}", twins_failed.len(), hashes.spec_path, twins_failed.join(", "));
     } else {
         // Default: just print hashes (existing behavior, enhanced with all backends)
-        println!("spec_hash={}", hashes.spec_hash);
-        println!("gen_hash_zig={}", hashes.gen_hash_zig);
-        println!("gen_hash_verilog={}", hashes.gen_hash_verilog);
-        println!("gen_hash_c={}", hashes.gen_hash_c);
-        println!("gen_hash_rust={}", hashes.gen_hash_rust);
+        for (k, v) in hash_pairs(&hashes) { println!("{k}={v}"); }
     }
 
     Ok(())
@@ -6220,7 +6202,10 @@ fn compile_source(source: &str, backend: &str) -> Result<String, String> {
 
 fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow::Result<()> {
     let path = Path::new(input_path);
-    let source = fs::read_to_string(path)?;
+    let mut source = fs::read_to_string(path)?;
+    if backend == "ml" {
+        source = use_resolve::resolve(path, &source);
+    }
 
     let ast = compiler::Compiler::parse_ast(&source)
         .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
@@ -6269,6 +6254,13 @@ fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow:
     }
     fs::write(&out_path, &code)?;
     println!("wrote {}", out_path.display());
+    if backend == "ml" {
+        let exe = out_path.with_extension("");
+        let mut zig = std::process::Command::new("zig");
+        zig.arg("build-exe").arg(&out_path).arg(format!("-femit-bin={}", exe.display()));
+        anyhow::ensure!(zig.status()?.success(), "zig build-exe failed");
+        println!("built {}", exe.display());
+    }
     Ok(())
 }
 
@@ -7986,6 +7978,14 @@ fn run_fpga_build(
     for module in &modules {
         let spec_file = specs_dir.join(format!("{}.t27", module));
         let out_file = gen_dir.join(format!("{}.v", module));
+        // #10300: a pin attribute (`const x_LOC : str`) marks t27b's bitstream idiom. Its
+        // pins and primitive instances are lowered by `t27b verilog`, which builds the
+        // board RTL; gen-verilog has no such lowering and would lint a file nobody ships.
+        let src = fs::read_to_string(&spec_file).with_context(|| format!("read {}", spec_file.display()))?;
+        if src.lines().any(|l| l.starts_with("const ") && l.contains("_LOC : str")) {
+            println!("  SKIP {}.v (t27b bitstream spec; `t27b verilog` lowers it)", module);
+            continue;
+        }
         let gen_cmd = if use_hir { "gen-verilog-hir" } else { "gen-verilog" };
         let status = std::process::Command::new(&t27c)
             .arg(gen_cmd)
@@ -8152,6 +8152,26 @@ endmodule
 
     let synth_json = synth_dir.join("synth.json");
 
+    let synth_script = build_dir.join("synth.ys");
+    let verilog_files = if minimal {
+        format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
+    } else {
+        format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
+    };
+    fs::write(
+        &synth_script,
+        format!(
+            // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
+            // SIMULATION` bench blocks whose $display carries non-constant
+            // args that synthesis cannot evaluate (mac.v:535; the repo
+            // convention, see suite.rs and verify_emit_bitexact.py).
+            "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
+            files = verilog_files,
+            top = top,
+            json = synth_json.display(),
+        ),
+    )?;
+
     if use_docker {
         if std::process::Command::new("docker")
             .arg("--version")
@@ -8163,25 +8183,6 @@ endmodule
             anyhow::bail!("Docker is required for synthesis but not installed. Use --smoke for gen-only, or install Yosys locally and pass --docker false.");
         }
         println!("=== Synthesizing with Yosys (Docker) ===");
-        let synth_script = build_dir.join("synth.ys");
-        let verilog_files = if minimal {
-            format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
-        } else {
-            format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
-        };
-        fs::write(
-            &synth_script,
-            format!(
-                // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
-                // SIMULATION` bench blocks whose $display carries non-constant
-                // args that synthesis cannot evaluate (mac.v:535; the repo
-                // convention, see suite.rs and verify_emit_bitexact.py).
-                "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
-                files = verilog_files,
-                top = top,
-                json = synth_json.display(),
-            ),
-        )?;
         let status = std::process::Command::new("docker")
             .args(["run", "--rm", "-v", &format!("{}:/project", repo_root.display()), "-w", "/project", "hdlc/oss-cad-suite:latest", "yosys", "-s", &format!("{}", synth_script.display())])
             .status()
@@ -8192,25 +8193,6 @@ endmodule
         println!("Synthesis complete (Docker).");
     } else {
         println!("=== Synthesizing with local Yosys ===");
-        let synth_script = build_dir.join("synth.ys");
-        let verilog_files = if minimal {
-            format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
-        } else {
-            format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
-        };
-        fs::write(
-            &synth_script,
-            format!(
-                // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
-                // SIMULATION` bench blocks whose $display carries non-constant
-                // args that synthesis cannot evaluate (mac.v:535; the repo
-                // convention, see suite.rs and verify_emit_bitexact.py).
-                "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
-                files = verilog_files,
-                top = top,
-                json = synth_json.display(),
-            ),
-        )?;
         let status = std::process::Command::new("yosys")
             .arg("-s")
             .arg(&synth_script)
@@ -8685,250 +8667,15 @@ fn run_explain(input_path: &str) -> anyhow::Result<()> {
 }
 
 fn run_fmt(input_path: &str) -> anyhow::Result<()> {
-    let source = fs::read_to_string(input_path)?;
-    let ast = compiler::Compiler::parse_ast(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    fn fmt_expr(node: &compiler::Node) -> String {
-        match node.kind {
-            compiler::NodeKind::ExprLiteral => node.value.clone(),
-            compiler::NodeKind::ExprIdentifier => node.name.clone(),
-            compiler::NodeKind::ExprBinary => {
-                if node.children.len() >= 2 {
-                    let l = fmt_expr(&node.children[0]);
-                    let r = fmt_expr(&node.children[1]);
-                    format!("{} {} {}", l, node.extra_op, r)
-                } else {
-                    "()".to_string()
-                }
-            }
-            compiler::NodeKind::ExprUnary => {
-                if !node.children.is_empty() {
-                    format!("{}{}", node.extra_op, fmt_expr(&node.children[0]))
-                } else {
-                    node.extra_op.clone()
-                }
-            }
-            compiler::NodeKind::ExprCall => {
-                let args: Vec<String> = node.children.iter().map(fmt_expr).collect();
-                format!("{}({})", node.name, args.join(", "))
-            }
-            compiler::NodeKind::ExprFieldAccess => {
-                if !node.children.is_empty() {
-                    format!("{}.{}", fmt_expr(&node.children[0]), node.name)
-                } else {
-                    node.name.clone()
-                }
-            }
-            compiler::NodeKind::ExprIndex => {
-                if node.children.len() >= 2 {
-                    format!("{}[{}]", fmt_expr(&node.children[0]), fmt_expr(&node.children[1]))
-                } else {
-                    "()".to_string()
-                }
-            }
-            compiler::NodeKind::ExprEnumValue => format!("{}::{}", node.name, node.extra_field),
-            compiler::NodeKind::ExprStructLit => {
-                let fields: Vec<String> = node.children.iter().map(|c| {
-                    let val = if c.children.is_empty() { "".to_string() } else { format!(" = {}", fmt_expr(&c.children[0])) };
-                    format!("{}:{}", c.name, val)
-                }).collect();
-                format!("{} {{ {} }}", node.name, fields.join(", "))
-            }
-            compiler::NodeKind::ExprArrayLiteral => {
-                let elems: Vec<String> = node.children.iter().map(fmt_expr).collect();
-                format!("[{}]", elems.join(", "))
-            }
-            _ => format!("/* {:?} */", node.kind),
-        }
+    // The formatter is specs/tri/fmt_source.t27 (lossless: whitespace only); this is its I/O glue.
+    let src = fs::read(input_path)?;
+    let cap = src.len() * 4 + 1;
+    let mut out = vec![0u8; cap];
+    let m = fmt_source::fmt_source(&src, src.len(), &mut out, cap);
+    if !fmt_source::fmt_accept(&src, src.len(), &out, m, cap) {
+        anyhow::bail!("fmt: refused, the output would not keep every non-whitespace byte of {}", input_path);
     }
-
-    fn fmt_stmt(node: &compiler::Node, indent: usize) -> String {
-        let pad = "    ".repeat(indent);
-        let mut out = String::new();
-        match node.kind {
-            compiler::NodeKind::StmtLocal => {
-                let kw = if node.extra_mutable { "var" } else { "const" };
-                if node.children.is_empty() {
-                    if node.extra_type.is_empty() {
-                        out.push_str(&format!("{}{} {};\n", pad, kw, node.name));
-                    } else {
-                        out.push_str(&format!("{}{} {}: {};\n", pad, kw, node.name, node.extra_type));
-                    }
-                } else {
-                    let val = fmt_expr(&node.children[0]);
-                    if node.extra_type.is_empty() {
-                        out.push_str(&format!("{}{} {} = {};\n", pad, kw, node.name, val));
-                    } else {
-                        out.push_str(&format!("{}{} {}: {} = {};\n", pad, kw, node.name, node.extra_type, val));
-                    }
-                }
-            }
-            compiler::NodeKind::StmtAssign => {
-                if node.children.len() >= 2 {
-                    let target = fmt_expr(&node.children[0]);
-                    let val = fmt_expr(&node.children[1]);
-                    out.push_str(&format!("{}{} = {};\n", pad, target, val));
-                }
-            }
-            compiler::NodeKind::ExprReturn => {
-                if node.children.is_empty() {
-                    out.push_str(&format!("{}return;\n", pad));
-                } else {
-                    out.push_str(&format!("{}return {};\n", pad, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::StmtExpr => {
-                if node.children.len() == 1 {
-                    out.push_str(&format!("{}{};\n", pad, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::StmtIf => {
-                out.push_str(&pad);
-                out.push_str("if (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                out.push_str(") {\n");
-                if node.children.len() > 1 {
-                    for s in &node.children[1].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-                if node.children.len() > 2 {
-                    out.push_str(&format!("{} else {{\n", pad));
-                    for s in &node.children[2].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                    out.push_str(&format!("{}}}\n", pad));
-                }
-            }
-            compiler::NodeKind::StmtWhile => {
-                out.push_str(&pad);
-                out.push_str("while (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                out.push_str(") {\n");
-                if node.children.len() > 1 {
-                    for s in &node.children[1].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StmtFor => {
-                out.push_str(&pad);
-                out.push_str("for (");
-                if !node.children.is_empty() {
-                    out.push_str(&fmt_expr(&node.children[0]));
-                }
-                if node.children.len() > 1 {
-                    out.push_str(&format!(") |{}| {{\n", node.children[1].name));
-                } else {
-                    out.push_str(") {\n");
-                }
-                if node.children.len() > 2 {
-                    for s in &node.children[2].children {
-                        out.push_str(&fmt_stmt(s, indent + 1));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StmtBreak => {
-                out.push_str(&format!("{}break;\n", pad));
-            }
-            compiler::NodeKind::StmtContinue => {
-                out.push_str(&format!("{}continue;\n", pad));
-            }
-            _ => {
-                out.push_str(&format!("{}// {:?}\n", pad, node.kind));
-            }
-        }
-        out
-    }
-
-    fn fmt_node(node: &compiler::Node, indent: usize) -> String {
-        let pad = "    ".repeat(indent);
-        let mut out = String::new();
-        match node.kind {
-            compiler::NodeKind::Module => {
-                out.push_str(&format!("{}module {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_node(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::UseDecl => {
-                out.push_str(&format!("{}using {};\n", pad, node.value));
-            }
-            compiler::NodeKind::ConstDecl => {
-                if node.children.is_empty() {
-                    out.push_str(&format!("{}const {}: {};\n", pad, node.name, node.extra_type));
-                } else {
-                    out.push_str(&format!("{}const {} = {};\n", pad, node.name, fmt_expr(&node.children[0])));
-                }
-            }
-            compiler::NodeKind::EnumDecl => {
-                out.push_str(&format!("{}enum {} {{\n", pad, node.name));
-                for child in &node.children {
-                    if child.kind == compiler::NodeKind::EnumVariant {
-                        if child.value.is_empty() {
-                            out.push_str(&format!("    {}{},\n", pad, child.name));
-                        } else {
-                            out.push_str(&format!("    {}{} = {},\n", pad, child.name, child.value));
-                        }
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::StructDecl => {
-                out.push_str(&format!("{}struct {} {{\n", pad, node.name));
-                for child in &node.children {
-                    if child.kind == compiler::NodeKind::ExprIdentifier && !child.name.is_empty() {
-                        out.push_str(&format!("    {}{}: {},\n", pad, child.name, child.extra_type));
-                    }
-                }
-                out.push_str(&format!("{}}}\n", pad));
-            }
-            compiler::NodeKind::FnDecl => {
-                let params: Vec<String> = node.params.iter().map(|(n, t)| {
-                    if t.is_empty() { n.clone() } else { format!("{}: {}", n, t) }
-                }).collect();
-                let ret = if node.extra_return_type.is_empty() { String::new() } else { format!(" -> {}", node.extra_return_type) };
-                out.push_str(&format!("{}fn {}({}){} {{\n", pad, node.name, params.join(", "), ret));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            compiler::NodeKind::TestBlock => {
-                out.push_str(&format!("{}test {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            compiler::NodeKind::InvariantBlock => {
-                out.push_str(&format!("{}invariant {} {}\n\n", pad, node.name, node.value));
-            }
-            compiler::NodeKind::BenchBlock => {
-                out.push_str(&format!("{}bench {} {{\n", pad, node.name));
-                for child in &node.children {
-                    out.push_str(&fmt_stmt(child, indent + 1));
-                }
-                out.push_str(&format!("{}}}\n\n", pad));
-            }
-            _ => {
-                for child in &node.children {
-                    out.push_str(&fmt_node(child, indent));
-                }
-            }
-        }
-        out
-    }
-
-    print!("{}", fmt_node(&ast, 0));
+    std::io::Write::write_all(&mut std::io::stdout(), &out[..m])?;
     Ok(())
 }
 
@@ -11141,102 +10888,6 @@ fn run_ci(repo_root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_watch(repo_root: &str, interval_secs: u64) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-    println!("t27c watch: monitoring .t27 files in {} (interval: {}s)", repo_root, interval_secs);
-    println!("Press Ctrl+C to stop.");
-
-    let mut file_hashes: HashMap<String, u64> = HashMap::new();
-
-    fn scan_t27_files(repo_root: &str) -> Vec<String> {
-        let mut files = Vec::new();
-        for dir in &["specs", "compiler"] {
-            let base = format!("{}/{}", repo_root, dir);
-            if std::path::Path::new(&base).exists() {
-                collect_t27_recursive(&base, &mut files);
-            }
-        }
-        files
-    }
-
-    fn collect_t27_recursive(dir: &str, files: &mut Vec<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    collect_t27_recursive(&path.to_string_lossy(), files);
-                } else if path.extension().map(|e| e == "t27").unwrap_or(false) {
-                    files.push(path.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    let mut iteration: u32 = 0;
-    loop {
-        let files = scan_t27_files(repo_root);
-        let mut changed = Vec::new();
-        let mut new_files = Vec::new();
-
-        for file in &files {
-            if let Ok(content) = std::fs::read_to_string(file) {
-                let hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    hasher.finish()
-                };
-                if let Some(prev) = file_hashes.get(file) {
-                    if *prev != hash {
-                        changed.push(file.clone());
-                    }
-                } else {
-                    new_files.push(file.clone());
-                }
-                file_hashes.insert(file.clone(), hash);
-            }
-        }
-
-        if iteration == 0 {
-            println!("[watch] Initial scan: {} files tracked", files.len());
-            for f in &new_files {
-                let short = f.strip_prefix(repo_root).unwrap_or(f);
-                println!("  + {}", short);
-            }
-        } else if !changed.is_empty() {
-            println!("[watch] {} file(s) changed:", changed.len());
-            for f in &changed {
-                let short = f.strip_prefix(repo_root).unwrap_or(f);
-                println!("  ~ {}", short);
-            }
-            let _now = std::time::SystemTime::now();
-            let duration = std::time::Duration::from_secs(interval_secs);
-            std::thread::sleep(duration);
-            continue;
-        }
-
-        if !changed.is_empty() || iteration == 0 {
-            let suite_result = std::process::Command::new("./bootstrap/target/release/t27c")
-                .args(["suite", "--repo-root", repo_root])
-                .output();
-            match suite_result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if line.contains("FAIL") || line.contains("TOTAL FAILURES") || line.contains("ALL TESTS PASSED") {
-                            println!("[suite] {}", line);
-                        }
-                    }
-                }
-                Err(e) => println!("[watch] suite error: {}", e),
-            }
-        }
-
-        iteration += 1;
-        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
-    }
-}
-
 fn run_diff(left_path: &str, right_path: &str) -> anyhow::Result<()> {
     let left_src = fs::read_to_string(left_path)?;
     let right_src = fs::read_to_string(right_path)?;
@@ -11968,6 +11619,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::GenJs { input } => run_gen_js(&input)?,
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
+        Commands::GenJson { input } => run_gen_json(&input)?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
@@ -12045,7 +11697,7 @@ async fn main() -> anyhow::Result<()> {
             service::run_prove(&std::env::current_dir()?, &input, mutate)?
         }
         Commands::Seal { input, save, verify, force } => run_seal(&input, save, verify, force)?,
-        Commands::Frontier { list, reseal, audit, watch } => service::run_frontier(list, reseal, audit, watch)?,
+        Commands::Frontier { list, reseal, audit, watch, only, since } => service::run_frontier(list, reseal, audit, watch, only, since)?,
         Commands::SiliconQueue => service::run_silicon_queue()?,
         Commands::BenchAgent { busdev_num, wrong_part, once } => service::run_bench_agent(&std::env::current_dir()?, busdev_num, wrong_part, once)?,
         Commands::Compile { input, backend, output } => {
@@ -12110,7 +11762,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Size { input } => run_size(&input)?,
         Commands::Analyze { repo_root, json, top } => run_analyze(&repo_root, json, top)?,
         Commands::Diff { left, right } => run_diff(&left, &right)?,
-        Commands::Watch { repo_root, interval_secs } => run_watch(&repo_root, interval_secs)?,
         Commands::Ci { repo_root } => run_ci(&repo_root)?,
         Commands::Inspect { input } => run_inspect(&input)?,
         Commands::Outline { input } => run_outline(&input)?,
@@ -12405,6 +12056,7 @@ fn main() -> anyhow::Result<()> {
         Commands::GenJs { input } => run_gen_js(&input)?,
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
+        Commands::GenJson { input } => run_gen_json(&input)?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
@@ -12482,7 +12134,7 @@ fn main() -> anyhow::Result<()> {
             service::run_prove(&std::env::current_dir()?, &input, mutate)?
         }
         Commands::Seal { input, save, verify, force } => run_seal(&input, save, verify, force)?,
-        Commands::Frontier { list, reseal, audit, watch } => service::run_frontier(list, reseal, audit, watch)?,
+        Commands::Frontier { list, reseal, audit, watch, only, since } => service::run_frontier(list, reseal, audit, watch, only, since)?,
         Commands::SiliconQueue => service::run_silicon_queue()?,
         Commands::BenchAgent { busdev_num, wrong_part, once } => service::run_bench_agent(&std::env::current_dir()?, busdev_num, wrong_part, once)?,
         Commands::Compile { input, backend, output } => {
@@ -12552,7 +12204,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Size { input } => run_size(&input)?,
         Commands::Analyze { repo_root, json, top } => run_analyze(&repo_root, json, top)?,
         Commands::Diff { left, right } => run_diff(&left, &right)?,
-        Commands::Watch { repo_root, interval_secs } => run_watch(&repo_root, interval_secs)?,
         Commands::Ci { repo_root } => run_ci(&repo_root)?,
         Commands::Inspect { input } => run_inspect(&input)?,
         Commands::Outline { input } => run_outline(&input)?,
