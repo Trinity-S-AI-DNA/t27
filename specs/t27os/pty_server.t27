@@ -10,8 +10,9 @@
 //   (none)             serve
 //   T27OS_HOOK=1       a Claude Code hook: read the payload on stdin, forward it as OP_HOOK to pane
 //                      T27OS_PANE, exit. The server writes ~/.t27os/hooks.json so claude panes run it.
-//   T27OS_CTL=<verb>   a tiny client for scripts and the live test: list, spawn, kill, read, keys
-//                      (T27OS_AGENT, T27OS_CWD, T27OS_MODEL, T27OS_PANE, T27OS_KEYS carry the arguments).
+//   T27OS_CTL=<verb>   a tiny client for scripts and the live test: list, spawn, kill, read, keys, expect
+//                      (T27OS_AGENT, T27OS_CWD, T27OS_MODEL, T27OS_PANE, T27OS_KEYS, T27OS_RAW, T27OS_EXPECT,
+//                      T27OS_WAIT carry the arguments; the verb is the whole word, `write` is the old name of keys).
 //   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
 //                      the server at login, so panes come back (by session id, model kept) after a reboot.
 //
@@ -206,6 +207,16 @@ use t27os::pty_logic::pane_command;
 use t27os::pty_logic::argv_text;
 use t27os::pty_logic::plist_text;
 use t27os::pty_logic::c_path;
+use t27os::pty_logic::ctl_verb;
+use t27os::pty_logic::keys_decode;
+use t27os::pty_logic::strip_ansi;
+use t27os::pty_logic::has_text;
+use t27os::pty_logic::CTL_LIST;
+use t27os::pty_logic::CTL_SPAWN;
+use t27os::pty_logic::CTL_KILL;
+use t27os::pty_logic::CTL_READ;
+use t27os::pty_logic::CTL_KEYS;
+use t27os::pty_logic::CTL_EXPECT;
 
 // ---- the host loop: syscalls and bytes ----
 
@@ -813,8 +824,13 @@ fn print_dec(v: u64, mem: []u8) -> void {
     sys_write(1, mem[O_MISC + 200 .. O_MISC + 200 + n], @as(u64, n));
 }
 
-/// T27OS_CTL=<verb>: list | spawn | kill | read | keys against a running server.
-fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
+/// T27OS_CTL=<verb>: list | spawn | kill | read | keys | expect against a running server. The verb is the
+/// whole word (`write` is the old name of `keys`). T27OS_KEYS takes \e \r \n \t \\ \xHH; a CR is added unless
+/// T27OS_RAW is set. `expect` waits up to T27OS_WAIT seconds (default 30) for T27OS_EXPECT in the pane's
+/// output and exits 0, or prints `timeout` and exits 1.
+fn run_ctl(st: []u64, mem: []u8, wl: usize) -> void {
+    const verb : u32 = ctl_verb(mem[O_MISC + 400 .. O_MISC + 400 + wl]);
+    if (verb == 0) { say("unknown verb: list | spawn | kill | read | keys | expect\n"); return; }
     const fd : i32 = client_connect(home_slice(st, mem));
     if (fd < 0) { say("no server\n"); return; }
     const out : []u8 = mem[O_OUT .. O_OUT + 4200];
@@ -825,7 +841,7 @@ fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
         pane = pane * 10 + @as(u32, mem[O_MISC + 256 + i]) - 48;
         i = i + 1;
     }
-    if (verb == 108) {
+    if (verb == CTL_LIST) {
         const n : usize = client_list(fd, out);
         var at : usize = HEADER;
         while (at + 4 <= n) {
@@ -840,7 +856,7 @@ fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
             say("\n");
             at = at + 4;
         }
-    } else if (verb == 115) {
+    } else if (verb == CTL_SPAWN) {
         const al : usize = env_text("T27OS_AGENT", mem, O_MISC + 300);
         var agent : u32 = 0;
         var a : usize = 0;
@@ -858,17 +874,49 @@ fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
         say("spawned pane ");
         print_dec(@as(u64, out[1]), mem);
         say("\n");
-    } else if (verb == 107) {
+    } else if (verb == CTL_KILL) {
         client_kill(fd, pane, out);
         say("killed\n");
-    } else if (verb == 114) {
+    } else if (verb == CTL_READ) {
         const n : usize = client_read(fd, pane, 0, out);
         if (n > HEADER + 8) { sys_write(1, out[HEADER + 8 .. n], @as(u64, n - HEADER - 8)); }
-    } else if (verb == 119) {
+    } else if (verb == CTL_KEYS) {
         const kl : usize = env_text("T27OS_KEYS", mem, O_TMP1);
-        mem[O_TMP1 + kl] = 13;
-        client_keys(fd, pane, mem[O_TMP1 .. O_TMP1 + kl + 1], out);
+        var dl : usize = keys_decode(mem[O_TMP1 .. O_TMP1 + kl], mem[O_TMP2 .. O_TMP2 + 256]);
+        if (sys_getenv("T27OS_RAW") == 0) {
+            mem[O_TMP2 + dl] = 13;
+            dl = dl + 1;
+        }
+        client_keys(fd, pane, mem[O_TMP2 .. O_TMP2 + dl], out);
         say("sent\n");
+    } else if (verb == CTL_EXPECT) {
+        const xl : usize = env_text("T27OS_EXPECT", mem, O_TMP1);
+        const wt : usize = env_text("T27OS_WAIT", mem, O_MISC + 320);
+        var secs : usize = 0;
+        var w : usize = 0;
+        while (w < wt) {
+            secs = secs * 10 + @as(usize, mem[O_MISC + 320 + w]) - 48;
+            w = w + 1;
+        }
+        if (wt == 0) { secs = 30; }
+        var left : usize = secs * 2;
+        var found : bool = false;
+        while (left > 0 and found == false) {
+            const n : usize = client_read(fd, pane, 0, out);
+            if (n > HEADER + 8) {
+                const sn : usize = strip_ansi(out[HEADER + 8 .. n], mem[O_TMP2 .. O_TMP2 + 8192]);
+                found = has_text(mem[O_TMP2 .. O_TMP2 + sn], mem[O_TMP1 .. O_TMP1 + xl]);
+            }
+            if (found == false) {
+                sys_poll(mem[O_MISC + 340 .. O_MISC + 348], 0, 500);
+                left = left - 1;
+            }
+        }
+        sys_close(fd);
+        if (found) { say("found\n"); sys_exit(0); }
+        say("timeout\n");
+        sys_exit(1);
+        return;
     }
     sys_close(fd);
 }
@@ -909,7 +957,7 @@ pub fn main() -> void {
     if (sys_getenv("T27OS_HOOK") != 0) { run_hook(st[0..ST_SIZE], mem[0..MEM_SIZE]); return; }
     if (sys_getenv("T27OS_INSTALL") != 0) { run_install(st[0..ST_SIZE], mem[0..MEM_SIZE]); return; }
     const cl : usize = env_text("T27OS_CTL", mem[0..MEM_SIZE], O_MISC + 400);
-    if (cl > 0) { run_ctl(st[0..ST_SIZE], mem[0..MEM_SIZE], mem[O_MISC + 400]); return; }
+    if (cl > 0) { run_ctl(st[0..ST_SIZE], mem[0..MEM_SIZE], cl); return; }
     run_server(st[0..ST_SIZE], mem[0..MEM_SIZE]);
 }
 
