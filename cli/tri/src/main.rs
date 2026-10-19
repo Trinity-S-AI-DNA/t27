@@ -443,7 +443,7 @@ enum Commands {
         /// A netlist: print the M1 cell constants (CELL_N, CELL_D, CELL_NV) folded from it, or the refusal, instead of the inventory.
         #[arg(long)] emit_cell: bool,
     },
-    /// t27o over a tree (#10543): every tracked .rs file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
+    /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
 }
 
@@ -1387,7 +1387,7 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
 /// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, root vs cascade, the ranking); this lists, hashes, converts in-process and keeps the cache.
 fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>, top: usize) -> Result<u8> {
     let t0 = std::time::Instant::now(); let seal = |f: &str| -> Result<String> { let p = std::env::current_dir()?.join(f); Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(&p).with_context(|| format!("{}: cannot read the seal; {}", p.display(), t27o_ledger::SEAL_HINT))?)?["spec_hash"].as_str().with_context(|| format!("{}: no spec_hash", p.display()))?.to_string()) };
-    let (conv, std) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
+    let (conv, std, zs) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?, seal(t27o_ledger::SEAL_ZIG)?); let zk = format!("{conv}+{zs}"); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
     let root: &'static str = if t27o_ledger::repo_is_here(repo) { t27o_ledger::SWEEP_HERE } else { fs::canonicalize(repo).with_context(|| format!("{repo}: cannot open the repository"))?.to_string_lossy().into_owned().leak() }; let cache = cache.map_or_else(|| { let mut b = vec![0u8; 4096]; let n = t27o_ledger::cache_path(root, &mut b); String::from_utf8_lossy(&b[..n]).into_owned() }, str::to_string);
     let old: &'static str = fs::read_to_string(&cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 10).map(|f| (f[0], f)).collect();
     let ls = Command::new("git").args(["-C", root, "ls-files", "--"]).args(paths).output()?; anyhow::ensure!(ls.status.success(), "{root}: git ls-files failed: {}", String::from_utf8_lossy(&ls.stderr).trim()); let listing: &'static str = String::from_utf8(ls.stdout)?.leak();
@@ -1395,13 +1395,15 @@ fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>,
     for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
         let Ok(src) = fs::read(Path::new(root).join(p)) else { continue };
         if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
+        let z = t27o_ledger::front_end(p.as_bytes()) == t27o_ledger::FE_ZIG; let ck = if z { &zk } else { &conv }; // a .zig row is keyed by both converters' seals (#10823)
         let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
-        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == conv), r.is_some_and(|r| r[3] == std)));
+        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == *ck), r.is_some_and(|r| r[3] == std)));
         let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
-            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], std::collections::BTreeMap::<&'static str, usize>::new());
-            let m = t27o::convert(&src, Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()).as_bytes(), &mut out, &mut st);
+            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new());
+            let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
+            let m = if z { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
             let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); for l in o.lines().filter(|l| t27o_ledger::is_refusal(l)) { *k.entry(&l[t27o_ledger::kind_from(l)..t27o_ledger::kind_to(l)]).or_default() += 1; }
-            format!("{p}\t{sha}\t{conv}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
+            format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
         };
         n[reuse as usize] += 1; tab += &format!("{}\n", f.join("\t"));
         (0..5).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0));
