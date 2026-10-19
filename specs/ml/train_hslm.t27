@@ -30,7 +30,8 @@
 ;   /tmp/hslm/train.cfg             optional, key=value lines of integers: steps, total, warmup,
 ;                                   eval_every, ckpt_every, seed, speed, resume, synth, eval_windows,
 ;                                   loss_positions (1..27, default 27), gradcheck (1: print the
-;                                   gradient checks and exit)
+;                                   gradient checks and exit), profile (1: time the parts of every
+;                                   step and print them at the end; section 1 says how)
 ;   /tmp/hslm/ckpt_<step>.bin       MSLH: nn/hslm_data's header (magic 0x484C534D, version 1, step,
 ;                                   f32 loss = the last minibatch loss under the k-position
 ;                                   objective) and its layout, f32: output shadow (243 x 729,
@@ -275,16 +276,133 @@ var cfg_synth : u64 = 0;
 var cfg_eval_windows : u64 = DEFAULT_EVAL_WINDOWS;
 var cfg_loss_positions : u64 = DEFAULT_LOSS_POSITIONS;
 var cfg_gradcheck : u64 = 0;
+var cfg_profile : u64 = 0;
+
+; THE PROFILE (profile=1 or 2 in train.cfg; gHashTag/t27#10850). Where a training step's time goes,
+; read off the monotonic clock (1) or the thread's CPU clock (2) with interval attribution: every
+; mark charges the time since the previous mark to one part. The four local kernels mark their own
+; entry and exit, so a kernel's part holds
+; exactly its calls; the gap before a kernel goes to the region the call order puts there. Forward,
+; per position: Q K V O up down per block (calls 0..17), then the head (18); the gap before each O
+; matmul (calls 3, 9, 15) is the attention core with RoPE. Backward, per position: the head's
+; outer_add and t_add (calls 0, 1), then per block from the last: outer down, t_add down, outer up,
+; t_add up, outer O, t_add O, outer Q K V, t_add Q K V (12 calls); the gap before outer Q (local
+; call 6) is the attention core's backward with the inverse RoPE. Profile off costs one branch per
+; kernel call and changes no bit (a test runs one step both ways and compares the parameters).
+const PR_FWD_MM : usize = 0;
+const PR_ATT_FWD : usize = 1;
+const PR_FWD_OTHER : usize = 2;
+const PR_BWD_TADD : usize = 3;
+const PR_BWD_OUTER : usize = 4;
+const PR_ATT_BWD : usize = 5;
+const PR_BWD_OTHER : usize = 6;
+const PR_LOSS : usize = 7;
+const PR_ZERO : usize = 8;
+const PR_GATHER_CLIP : usize = 9;
+const PR_LAMB : usize = 10;
+const PR_REQUANT : usize = 11;
+const PR_STEP_OTHER : usize = 12;
+const PR_PARTS : usize = 13;
+const PR_FWD_CALLS : usize = 19;
+const PR_CALIBRATE : usize = 1000000;
+var prof_on : bool = false;
+var prof_ns : [PR_PARTS]u64 = undefined;
+var prof_calls : [PR_PARTS]u64 = undefined;
+var prof_last : u64 = 0;
+var prof_fcall : usize = 0;
+var prof_bcall : usize = 0;
+var prof_sink : u64 = 0;
+var prof_cpu : bool = false;
 
 ; ---------------------------------------------------------------------------------------------
 ; 1. Kernels. The four names below are nn/hslm.t27's; a local declaration wins over the spliced
 ; one, also inside the spliced forward and backward. speed 0 runs nn/hslm.t27's code unchanged.
 ; ---------------------------------------------------------------------------------------------
 
+/// The monotonic clock in ns (profile=1), or this thread's CPU time (profile=2)
+fn prof_now() -> u64 {
+    var ts: std.os.linux.timespec = undefined;
+    var rc : usize = 0;
+    if (prof_cpu) {
+        rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.THREAD_CPUTIME_ID, &ts);
+    } else {
+        rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    }
+    if (rc != 0) {
+        return prof_last;
+    }
+    return @as(u64, @intCast(ts.sec)) * 1000000000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn prof_reset() -> void {
+    var i : usize = 0;
+    while (i < PR_PARTS) {
+        prof_ns[i] = 0;
+        prof_calls[i] = 0;
+        i = i + 1;
+    }
+    prof_fcall = 0;
+    prof_bcall = 0;
+}
+
+/// Charge the time since the last mark to `part`
+fn prof_mark(part: usize) -> void {
+    const now : u64 = prof_now();
+    if (now >= prof_last) {
+        prof_ns[part] = prof_ns[part] + (now - prof_last);
+    }
+    prof_calls[part] = prof_calls[part] + 1;
+    prof_last = now;
+}
+
+/// The part that owns the gap before forward kernel call `c` of a position
+fn prof_fwd_gap_part(c: usize) -> usize {
+    if (c < 18 and c % 6 == 3) {
+        return PR_ATT_FWD;
+    }
+    return PR_FWD_OTHER;
+}
+
+/// The part that owns the gap before backward kernel call `c` of a position
+fn prof_bwd_gap_part(c: usize) -> usize {
+    if (c >= 2 and (c - 2) % 12 == 6) {
+        return PR_ATT_BWD;
+    }
+    return PR_BWD_OTHER;
+}
+
+fn prof_fwd_enter() -> void {
+    prof_mark(prof_fwd_gap_part(prof_fcall));
+}
+
+fn prof_fwd_leave() -> void {
+    prof_mark(PR_FWD_MM);
+    prof_fcall = prof_fcall + 1;
+}
+
+fn prof_bwd_enter() -> void {
+    prof_mark(prof_bwd_gap_part(prof_bcall));
+}
+
+fn prof_bwd_leave(part: usize) -> void {
+    prof_mark(part);
+    prof_bcall = prof_bcall + 1;
+}
+
 /// output[i] = sum_j input[j] * w[j * out_dim + i]. Speed 0: nn/hslm.t27's branchy dot per output.
 /// Otherwise: zero the output, then add x_j * trit row by row (an axpy the compiler vectorizes);
 /// per output the terms are added in the same order j = 0, 1, ..., so the result is the same bits.
 fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_fwd_enter();
+    }
+    tr_matmul_fast(input, weights, output, in_dim, out_dim);
+    if (prof_on) {
+        prof_fwd_leave();
+    }
+}
+
+fn tr_matmul_fast(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
     if (speed_level == 0) {
         tr_matmul_ref(input, weights, output, in_dim, out_dim);
         return;
@@ -333,6 +451,16 @@ fn tr_matmul_ref(input: []const f64, weights: []const Trit, output: []f64, in_di
 /// dx[j] += sum_i w[j * out_dim + i] * dy[i]. Speed 0: nn/hslm.t27's branchy sum. Otherwise four
 /// partial sums of trit * dy (the only kernel whose rounding differs from the reference).
 fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_bwd_enter();
+    }
+    tr_t_add_fast(dy, weights, dx, in_dim, out_dim);
+    if (prof_on) {
+        prof_bwd_leave(PR_BWD_TADD);
+    }
+}
+
+fn tr_t_add_fast(dy: []const f64, weights: []const Trit, dx: []f64, in_dim: usize, out_dim: usize) -> void {
     var j : usize = 0;
     while (j < in_dim) {
         const row : usize = j * out_dim;
@@ -380,6 +508,16 @@ fn ternary_matmul_t_add(dy: []const f64, weights: []const Trit, dx: []f64, in_di
 /// gw[j * out_dim + i] += x[j] * dy[i], with x[j] read once per row; above speed 0 a row whose
 /// x[j] is 0 (half the ReLU outputs) is skipped, which adds nothing either way
 fn outer_add(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize) -> void {
+    if (prof_on) {
+        prof_bwd_enter();
+    }
+    tr_outer_add_fast(x, dy, gw, in_dim, out_dim);
+    if (prof_on) {
+        prof_bwd_leave(PR_BWD_OUTER);
+    }
+}
+
+fn tr_outer_add_fast(x: []const f64, dy: []const f64, gw: []f64, in_dim: usize, out_dim: usize) -> void {
     var j : usize = 0;
     while (j < in_dim) {
         const xj : f64 = x[j];
@@ -504,7 +642,11 @@ fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
     while (p < CONTEXT_LEN) {
         const tok : usize = @intCast(tokens[start + p]);
         if (p + k >= CONTEXT_LEN) {
+            prof_fcall = 0;
             hslm_forward(tok, p, &win_logits);
+            if (prof_on) {
+                prof_mark(PR_FWD_OTHER);
+            }
             const target : usize = @intCast(tokens[start + p + 1]);
             sum = sum + cross_entropy(&win_logits, target);
             cross_entropy_backward(&win_logits, target, &win_dl);
@@ -513,11 +655,24 @@ fn tr_window_grad_k(tokens: []const u16, start: usize, k: usize) -> f64 {
                 win_dl[j] = win_dl[j] * inv_k;
                 j = j + 1;
             }
+            if (prof_on) {
+                prof_mark(PR_LOSS);
+            }
+            prof_bcall = 0;
             hslm_backward(&win_dl, &win_gin);
-        } else if (speed_level < 2) {
-            hslm_forward(tok, p, &win_logits);
+            if (prof_on) {
+                prof_mark(PR_BWD_OTHER);
+            }
         } else {
-            tr_prefix_forward(tok, p);
+            prof_fcall = 0;
+            if (speed_level < 2) {
+                hslm_forward(tok, p, &win_logits);
+            } else {
+                tr_prefix_forward(tok, p);
+            }
+            if (prof_on) {
+                prof_mark(PR_FWD_OTHER);
+            }
         }
         p = p + 1;
     }
@@ -1553,7 +1708,13 @@ fn tr_train_step(t: u64, batch: usize, lr_fixed: f64, fixed: bool) -> f64 {
 /// tr_train_step under the k-position objective: the same windows, averaging, clip, LAMB and
 /// requantize; each window's loss and gradient come from tr_window_grad_k
 fn tr_train_step_k(t: u64, batch: usize, lr_fixed: f64, fixed: bool, k: usize) -> f64 {
+    if (prof_on) {
+        prof_mark(PR_STEP_OTHER);
+    }
     zero_weight_gradients();
+    if (prof_on) {
+        prof_mark(PR_ZERO);
+    }
     var loss_sum : f64 = 0.0;
     var wi : usize = 0;
     while (wi < batch) {
@@ -1566,16 +1727,28 @@ fn tr_train_step_k(t: u64, batch: usize, lr_fixed: f64, fixed: bool, k: usize) -
         loss_sum = loss_sum + tr_window_grad_k(train_tok[0..ntrain], start, k);
         wi = wi + 1;
     }
+    if (prof_on) {
+        prof_mark(PR_STEP_OTHER);
+    }
     const inv : f64 = 1.0 / @as(f64, @floatFromInt(batch));
     tr_gather(inv);
     last_gnorm = tr_clip_global(g_val[0..NPARAM], CLIP_NORM);
+    if (prof_on) {
+        prof_mark(PR_GATHER_CLIP);
+    }
     var lr : f64 = lr_fixed;
     if (lr <= 0.0) {
         lr = tr_lr_at(t, cfg_warmup, cfg_total);
     }
     last_lr = lr;
     tr_lamb(lr);
+    if (prof_on) {
+        prof_mark(PR_LAMB);
+    }
     tr_scatter_all();
+    if (prof_on) {
+        prof_mark(PR_REQUANT);
+    }
     last_loss = loss_sum * inv;
     return last_loss;
 }
@@ -1861,6 +2034,8 @@ fn tr_cfg_set(off: usize, len: usize, value: u64) -> void {
         }
     } else if (tr_key_is(off, len, "gradcheck")) {
         cfg_gradcheck = value;
+    } else if (tr_key_is(off, len, "profile")) {
+        cfg_profile = value;
     }
 }
 
@@ -2464,9 +2639,16 @@ fn tr_main() -> i32 {
     var run_steps : u64 = 0;
     var first_loss : f64 = 0.0;
     var rc : i32 = RC_OK;
+    prof_reset();
+    prof_cpu = cfg_profile == 2;
     while (rc == RC_OK and step < cfg_steps) {
         const t0 : f64 = tr_now();
+        if (cfg_profile != 0) {
+            prof_on = true;
+            prof_last = prof_now();
+        }
         const loss : f64 = tr_train_step_k(step, BATCH, 0.0, false, k_obj);
+        prof_on = false;
         const t1 : f64 = tr_now();
         step = step + 1;
         train_secs = train_secs + (t1 - t0);
@@ -2532,7 +2714,115 @@ fn tr_main() -> i32 {
     ln_str(" rc ");
     ln_u64(@intCast(rc));
     ln_flush();
+    if (cfg_profile != 0) {
+        tr_profile_lines(run_steps);
+    }
     return rc;
+}
+
+fn prof_name(part: usize) -> []const u8 {
+    if (part == PR_FWD_MM) {
+        return "fwd_matmul";
+    } else if (part == PR_ATT_FWD) {
+        return "attn_fwd_core";
+    } else if (part == PR_FWD_OTHER) {
+        return "fwd_other";
+    } else if (part == PR_BWD_TADD) {
+        return "bwd_matmul_t";
+    } else if (part == PR_BWD_OUTER) {
+        return "bwd_outer";
+    } else if (part == PR_ATT_BWD) {
+        return "attn_bwd_core";
+    } else if (part == PR_BWD_OTHER) {
+        return "bwd_other";
+    } else if (part == PR_LOSS) {
+        return "loss";
+    } else if (part == PR_ZERO) {
+        return "zero_grad";
+    } else if (part == PR_GATHER_CLIP) {
+        return "gather_clip";
+    } else if (part == PR_LAMB) {
+        return "lamb";
+    } else if (part == PR_REQUANT) {
+        return "requantize";
+    }
+    return "step_other";
+}
+
+/// The profile: per part the raw ns and the number of marks charged to it, then the cost of
+/// one clock read, measured over PR_CALIBRATE back-to-back reads (in ps)
+fn tr_profile_lines(steps: u64) -> void {
+    var total : u64 = 0;
+    var reads : u64 = 0;
+    var part : usize = 0;
+    while (part < PR_PARTS) {
+        ln_reset();
+        ln_str("profile part ");
+        ln_str(prof_name(part));
+        ln_str(" ns ");
+        ln_u64(prof_ns[part]);
+        ln_str(" marks ");
+        ln_u64(prof_calls[part]);
+        ln_flush();
+        total = total + prof_ns[part];
+        reads = reads + prof_calls[part];
+        part = part + 1;
+    }
+    const c0 : u64 = prof_now();
+    var i : usize = 0;
+    while (i < PR_CALIBRATE) {
+        prof_sink = prof_now();
+        i = i + 1;
+    }
+    const c1 : u64 = prof_now();
+    ln_reset();
+    ln_str("profile steps ");
+    ln_u64(steps);
+    ln_str(" total_ns ");
+    ln_u64(total);
+    ln_str(" marks ");
+    ln_u64(reads);
+    ln_str(" ps_per_read ");
+    ln_u64((c1 - c0) * 1000 / @as(u64, PR_CALIBRATE));
+    ln_flush();
+}
+
+/// One fixed k = 27 step on the tiny slice with the profile on or off; a digest of every parameter
+/// bit afterwards (the profile must not move a bit)
+fn tr_prof_step_digest(on: bool) -> u64 {
+    speed_level = 2;
+    tr_tiny_setup(11);
+    fixed_starts[0] = 300;
+    fixed_starts[1] = 1700;
+    prof_reset();
+    prof_on = on;
+    prof_last = prof_now();
+    const seen : f64 = tr_train_step_k(0, 2, 0.01, true, CONTEXT_LEN);
+    prof_on = false;
+    var h : u64 = 1469598103;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        h = (h * 31 + (@as(u64, @bitCast(p_val[i])) % 4294967291)) % 4294967291;
+        i = i + 1;
+    }
+    if (seen != seen) {
+        return 0;
+    }
+    return h;
+}
+
+/// The digest of a step with the profile off, then with it on
+fn tr_prof_digest_off() -> u64 {
+    return tr_prof_step_digest(false);
+}
+
+fn tr_prof_digest_on() -> u64 {
+    return tr_prof_step_digest(true);
+}
+
+/// After tr_prof_digest_on: the marks charged to `part` (2 windows x 27 positions)
+fn tr_prof_marks(part: usize) -> u64 {
+    return prof_calls[part];
 }
 
 /// The program `t27c compile --backend ml` builds: train, evaluate, checkpoint; any checkpoint
@@ -3473,3 +3763,43 @@ test the_27_position_gradient_of_deep_parameters_matches_stop_gradient_differenc
     and   mag_u > 1e-7
     and   rel_e < 1e-4
     and   mag_e > 1e-7
+
+test the_profile_charges_attention_to_the_gap_before_the_o_matmul
+    given f3 = prof_fwd_gap_part(3)
+    and   f9 = prof_fwd_gap_part(9)
+    and   f15 = prof_fwd_gap_part(15)
+    and   f2 = prof_fwd_gap_part(2)
+    and   f18 = prof_fwd_gap_part(18)
+    and   b8 = prof_bwd_gap_part(8)
+    and   b20 = prof_bwd_gap_part(20)
+    and   b32 = prof_bwd_gap_part(32)
+    and   b7 = prof_bwd_gap_part(7)
+    and   b0 = prof_bwd_gap_part(0)
+    then  f3 == PR_ATT_FWD
+    and   f9 == PR_ATT_FWD
+    and   f15 == PR_ATT_FWD
+    and   f2 == PR_FWD_OTHER
+    and   f18 == PR_FWD_OTHER
+    and   b8 == PR_ATT_BWD
+    and   b20 == PR_ATT_BWD
+    and   b32 == PR_ATT_BWD
+    and   b7 == PR_BWD_OTHER
+    and   b0 == PR_BWD_OTHER
+
+test the_profile_moves_no_bit_and_sees_the_call_order
+    given off = tr_prof_digest_off()
+    and   on = tr_prof_digest_on()
+    and   mm = tr_prof_marks(PR_FWD_MM)
+    and   ta = tr_prof_marks(PR_BWD_TADD)
+    and   ou = tr_prof_marks(PR_BWD_OUTER)
+    and   af = tr_prof_marks(PR_ATT_FWD)
+    and   ab = tr_prof_marks(PR_ATT_BWD)
+    and   la = tr_prof_marks(PR_LAMB)
+    then  off == on
+    and   off != 0
+    and   mm == 1026
+    and   ta == 1026
+    and   ou == 1026
+    and   af == 162
+    and   ab == 162
+    and   la == 1

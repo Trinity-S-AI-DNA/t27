@@ -99,6 +99,8 @@ mod fmt_source;
 #[path = "../gen/rust/igla/coder/ternary_gemm_ptx.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod ternary_gemm_ptx;
+// specs/igla/coder/hslm_bwd_ptx.t27 (#10847), lowered by `t27c gen-rust`: the PTX of the HSLM backward kernels dX and dW. Never hand-edit; regenerate.
+#[path = "../gen/rust/igla/coder/hslm_bwd_ptx.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)] mod hslm_bwd_ptx;
 mod memory;
 mod trit_stdlib;
 mod behavior_sva;
@@ -1562,6 +1564,8 @@ enum Commands {
     #[cfg(feature = "cuda")]
     #[command(name = "ptx-run")]
     PtxRun {
+        /// 0 = ternary_gemm_s8 (forward); 1 = hslm_dx_s8, 2 = hslm_dw_s8 (specs/igla/coder/hslm_bwd_ptx.t27, #10847)
+        #[arg(long, default_value_t = 0)] kernel: u32,
         #[arg(long, default_value_t = 4096)] m: usize,
         #[arg(long, default_value_t = 1280)] n: usize,
         #[arg(long, default_value_t = 1280)] k: usize,
@@ -11778,7 +11782,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Explain { input } => run_explain(&input)?,
         Commands::Fmt { input } => run_fmt(&input)?,
         #[cfg(feature = "cuda")]
-        Commands::PtxRun { m, n, k, iters, stride } => host::driver::ptx_run(m, n, k, iters, stride)?,
+        Commands::PtxRun { kernel, m, n, k, iters, stride } => host::driver::ptx_run(kernel, m, n, k, iters, stride)?,
         Commands::Graph { repo_root, format } => run_graph(&repo_root, &format)?,
         Commands::Doc { input, output_dir } => run_doc(&input, &output_dir)?,
         Commands::DocAll { repo_root, output_dir } => run_doc_all(&repo_root, &output_dir)?,
@@ -12222,7 +12226,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Explain { input } => run_explain(&input)?,
         Commands::Fmt { input } => run_fmt(&input)?,
         #[cfg(feature = "cuda")]
-        Commands::PtxRun { m, n, k, iters, stride } => host::driver::ptx_run(m, n, k, iters, stride)?,
+        Commands::PtxRun { kernel, m, n, k, iters, stride } => host::driver::ptx_run(kernel, m, n, k, iters, stride)?,
         Commands::Graph { repo_root, format } => run_graph(&repo_root, &format)?,
         Commands::Doc { input, output_dir } => run_doc(&input, &output_dir)?,
         Commands::DocAll { repo_root, output_dir } => run_doc_all(&repo_root, &output_dir)?,

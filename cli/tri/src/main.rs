@@ -48,6 +48,8 @@ mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of
 mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
 #[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
 mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -60,8 +62,8 @@ mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
-#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
-mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
+#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
+#[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
 mod renum;
 mod reseal;
 mod rtl;
@@ -410,6 +412,8 @@ enum Commands {
         /// Passed on to t27c after the action's own arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)] rest: Vec<String>,
     },
+    /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
+    Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
     /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
     Actors {
         /// The Queen's base URL.
@@ -428,7 +432,7 @@ enum Commands {
         /// Print one JSON object instead of the table.
         #[arg(long)] json: bool,
     },
-    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27).
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27). A .zig file prints the spec and its count line (rules: specs/tools/t27o/zig_convert.t27); its own tests are the oracle, so run `t27b test` on the spec (--oracle and --check are for Rust).
     T27o {
         file: String,
         /// The module name; default the file's stem.
@@ -1066,6 +1070,16 @@ fn cmd_lab(specs: Option<&str>, sha: &[String]) -> Result<u8> {
     let x = lab::exit_code(n.iter().sum(), n[lab::V_RED as usize], n[lab::V_UNREAD as usize]); println!("{}", lab::exit_why(x)); Ok(x)
 }
 
+/// `tri raw` (#10909): every rule is specs/analog/raw_writer.t27; this allocates its buffers and writes the file.
+fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
+    let d = date.map_or_else(|| chrono::Local::now().format("%a %b %e %H:%M:%S  %Y").to_string(), str::to_string);
+    let (mut buf, mut vals, mut limbs, mut dig) = (vec![0u8; 1 << 16], vec![0f64; raw::RLC_VALS], vec![0u64; raw::RAW_LIMBS], vec![0u8; raw::RAW_DIGITS]);
+    let n = raw::raw_rlc_file(&mut buf, d.as_bytes(), binary, &mut vals, &mut limbs, &mut dig);
+    anyhow::ensure!(n > 0 && n <= buf.len(), "raw: the trace is not the RLC cell's pinned simulation, or the file does not fit");
+    fs::write(out, &buf[..n])?;
+    Ok(0)
+}
+
 /// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
 fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
     let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
@@ -1330,6 +1344,7 @@ fn main() -> Result<()> {
         Commands::Hooks { action } => hooks::run(action)?,
         Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
         Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
+        Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
         Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
@@ -1349,8 +1364,8 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
         return Ok(spice::exit_code(&st));
     }
     let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
-    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 16], vec![0u8; 1 << 24]);
-    let n = if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], vec![0u8; 1 << 24]);
+    let n = if zig::is_zig_name(file.as_bytes()) { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
     if !check {
         std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
         return Ok(0);

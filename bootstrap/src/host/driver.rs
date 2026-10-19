@@ -299,7 +299,7 @@ mod tests {
     }
 }
 
-// `t27c ptx-run` (#10404): load the PTX that specs/igla/coder/ternary_gemm_ptx.t27 wrote, run it, count mismatches with its reference.
+// `t27c ptx-run` (#10404, #10847): load the PTX that ternary_gemm_ptx.t27 (kernel 0) or hslm_bwd_ptx.t27 (1, 2) wrote, run it, count mismatches with its reference.
 #[cfg(feature = "cuda")] #[link(name = "cuda")]
 extern "C" {
     fn cuInit(flags: u32) -> i32; fn cuDeviceGet(dev: *mut i32, ordinal: i32) -> i32;
@@ -310,18 +310,20 @@ extern "C" {
     fn cuLaunchKernel(f: usize, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32, smem: u32, stream: usize, params: *mut *mut u8, extra: usize) -> i32;
 }
 #[cfg(feature = "cuda")]
-pub fn ptx_run(m: usize, n: usize, k: usize, iters: u32, stride: usize) -> anyhow::Result<()> {
-    use crate::ternary_gemm_ptx as t;
-    anyhow::ensure!(t::shape_ok(m, n, k), "m={} n={} k={}: refused by shape_ok in ternary_gemm_ptx.t27", m, n, k);
+pub fn ptx_run(kernel: u32, m: usize, n: usize, k: usize, iters: u32, stride: usize) -> anyhow::Result<()> {
+    use crate::{hslm_bwd_ptx as u, ternary_gemm_ptx as t};
+    anyhow::ensure!(if kernel == 0 { t::shape_ok(m, n, k) } else { u::shape_ok(kernel, m, n, k) }, "kernel={} m={} n={} k={}: refused by shape_ok", kernel, m, n, k);
     let ck = |r: i32| if r == 0 { Ok(()) } else { Err(anyhow::anyhow!("CUDA driver error {}", r)) };
     let mut ptx = vec![0u8; t::PTX_CAP + 1];
-    let len = t::emit_ptx(&mut ptx, t::PTX_CAP); ptx.truncate(len); ptx.push(0);
-    let (mut a, mut wp, mut c, mut acc) = (vec![0i8; m * k], vec![0u8; k * n / 4], vec![0i32; m * n], vec![0i32; n]);
-    t::gen_wp(&mut wp, k * n, t::gen_a(&mut a, m * k, 1));
+    let len = if kernel == 0 { t::emit_ptx(&mut ptx, t::PTX_CAP) } else { u::emit_ptx(kernel, &mut ptx, t::PTX_CAP) };
+    std::fs::write(format!("ptx-run-{}.ptx", kernel), &ptx[..len])?; ptx.truncate(len); ptx.push(0);
+    let mut name = vec![0u8; 33]; let nl = u::put_name(kernel, &mut name, 32); name.truncate(nl); name.push(0);
+    let (mut a, mut wp, mut c, mut acc) = (vec![0i8; m * k], vec![0u8; u::b_len(kernel, n, k)], vec![0i32; m * n], vec![0i32; n]);
+    t::gen_wp(&mut wp, 4 * u::b_len(kernel, n, k), t::gen_a(&mut a, m * k, 1));
     let (mut dev, mut ctx, mut module, mut f, mut da, mut dw, mut dc, mut pm, mut pn, mut pk) = (0i32, 0usize, 0usize, 0usize, 0u64, 0u64, 0u64, m as u32, n as u32, k as u32);
     let ms = unsafe {
         ck(cuInit(0))?; ck(cuDeviceGet(&mut dev, 0))?; ck(cuCtxCreate_v2(&mut ctx, 0, dev))?;
-        ck(cuModuleLoadData(&mut module, ptx.as_ptr()))?; ck(cuModuleGetFunction(&mut f, module, b"ternary_gemm_s8\0".as_ptr()))?;
+        ck(cuModuleLoadData(&mut module, ptx.as_ptr()))?; ck(cuModuleGetFunction(&mut f, module, name.as_ptr()))?;
         ck(cuMemAlloc_v2(&mut da, a.len()))?; ck(cuMemAlloc_v2(&mut dw, wp.len()))?; ck(cuMemAlloc_v2(&mut dc, c.len() * 4))?;
         ck(cuMemcpyHtoD_v2(da, a.as_ptr() as *const u8, a.len()))?; ck(cuMemcpyHtoD_v2(dw, wp.as_ptr(), wp.len()))?;
         let mut args: [*mut u8; 6] = [&mut da as *mut u64 as *mut u8, &mut dw as *mut u64 as *mut u8, &mut dc as *mut u64 as *mut u8,
@@ -332,8 +334,8 @@ pub fn ptx_run(m: usize, n: usize, k: usize, iters: u32, stride: usize) -> anyho
         for _ in 0..iters { launch()?; } ck(cuCtxSynchronize())?;
         t0.elapsed().as_secs_f64() * 1e3 / iters.max(1) as f64
     };
-    let bad = t::mismatches(&a, &wp, &c, m, n, k, stride, &mut acc);
-    println!("ptx-run m={} n={} k={} rows_checked_every={} mismatches={} iters={} ms_per_call={:.4} tops={:.2}", m, n, k, stride.max(1), bad, iters, ms, 2.0 * (m * n * k) as f64 / ms / 1e9);
+    let bad = if kernel == 0 { t::mismatches(&a, &wp, &c, m, n, k, stride, &mut acc) } else { u::mismatches(kernel, &a, &wp, &c, m, n, k, stride, &mut acc) };
+    println!("ptx-run kernel={} m={} n={} k={} rows_checked_every={} mismatches={} iters={} ms_per_call={:.4} tops={:.2}", kernel, m, n, k, stride.max(1), bad, iters, ms, 2.0 * (m * n * k) as f64 / ms / 1e9);
     anyhow::ensure!(bad == 0, "{} entries differ from the t27 reference", bad);
     Ok(())
 }
