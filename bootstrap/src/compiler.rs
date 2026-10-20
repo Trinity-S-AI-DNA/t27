@@ -23458,24 +23458,10 @@ impl Compiler {
         Ok(codegen.into_string())
     }
 
-    /// #11182: `S{ .f = p }` or `s.f = p` with `f` a `[]T` field (`Vec<T>` here) and `p` a `[]T` parameter or `&x` moves the caller's storage; a borrow needs a lifetime on the struct and every constructor, so refuse.
-    fn rust_slice_field_capture(structs: &std::collections::HashMap<String, Vec<(String, String)>>, n: &Node, params: &[String]) -> Option<String> {
-        let params: Vec<String> = if n.kind == NodeKind::FnDecl { n.params.iter().filter(|(_, t)| t.trim_start().starts_with("[]") && t.trim() != "[]const u8").map(|p| p.0.clone()).collect() } else { params.to_vec() };
-        let taken = |v: &Node| (v.kind == NodeKind::ExprUnary && v.extra_op == "&") || (v.kind == NodeKind::ExprIdentifier && params.contains(&v.name));
-        let slice = |s: &str, f: &str| structs.iter().any(|(k, fs)| (s.is_empty() || k == s) && fs.iter().any(|(n, t)| n == f && t.trim_start_matches('?').starts_with("[]") && t.trim() != "[]const u8"));
-        let hit = match n.kind {
-            NodeKind::ExprStructLit => n.children.iter().find(|f| f.children.first().is_some_and(taken) && slice(&n.name, &f.name)).map(|f| (n.name.as_str(), f.name.as_str())),
-            NodeKind::StmtAssign if n.children.len() == 2 && n.children[0].kind == NodeKind::ExprFieldAccess && taken(&n.children[1]) && slice("", &n.children[0].name) => Some(("", n.children[0].name.as_str())),
-            _ => None,
-        };
-        hit.map(|(s, f)| format!("`{s}.{f}` is a `[]T` field filled from borrowed storage: gen-rust writes it `Vec<T>` and takes the storage by value, so the caller's storage is moved; a borrow needs a lifetime on the struct and on every constructor (#11182)")).or_else(|| n.children.iter().find_map(|c| Self::rust_slice_field_capture(structs, c, &params)))
-    }
-
     pub fn compile_rust(source: &str) -> Result<String, String> {
         let lexer = Lexer::new(source);
         let mut parser = Parser::new(lexer);
         let ast = parser.parse()?;
-        Self::rust_slice_field_capture(&Self::collect_struct_decls(&ast), &ast, &[]).map_or(Ok(()), Err)?;
         // Emit FAITHFUL Rust from the AST. Do NOT run t27c's own optimizer on the
         // Rust backend: several of its passes (const-propagation and the
         // unconditional copy-propagation / dead-store passes) corrupt a
@@ -24573,6 +24559,11 @@ fn rust_ident(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// The lowering for a bracketed type whose brackets do not hold a size.
+fn return_unsized(elem: String) -> String {
+    format!("Vec<{}>", elem)
 }
 
 /// Does `hay` use `name` as a whole identifier?
@@ -28481,7 +28472,7 @@ impl RustCodegen {
                                     .chars()
                                     .all(|c| c.is_ascii_alphanumeric() || c == '_'));
                         if !sized {
-                            format!("Vec<{}>", Self::t27_type_to_rust(after))
+                            return_unsized(Self::t27_type_to_rust(after))
                         } else {
                         let elem = Self::t27_type_to_rust(after);
                         if size.chars().all(|c| c.is_ascii_digit()) {
@@ -29173,7 +29164,7 @@ impl RustCodegen {
                     // times in specs/isa/t27a.t27, #6507). The bytes are what the
                     // spec means, and `.as_bytes()` is the zero-cost view.
                     let base_node = &node.children[0];
-                    if self.rust_type_of(base_node).is_some_and(|t| t == "&'static str") {
+                    if self.rust_type_of(base_node).is_some_and(|t| t == "&'static str") && (base_node.kind == NodeKind::ExprIdentifier || node.children[1].extra_op != "..") {
                         base = format!("{}.as_bytes()", base);
                     }
                     let idx = &node.children[1];
