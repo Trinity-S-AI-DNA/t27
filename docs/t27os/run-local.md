@@ -22,8 +22,11 @@ The window does not start the server and does not bundle it. They meet on one Un
 pane in the window says "offline" and echoes keys.
 
 Provider keys (the KEYS tab, up to 8 per provider) live in the macOS Keychain, service `ai.t27.os`, account
-`<provider>`, then `<provider>#2` .. `#8`. The window reaches them only by running `/usr/bin/security`
-(`specs/t27os/keys_host.t27`: posix_spawn, pipes, poll, waitpid), never through the SecItem calls, so
+`<provider>`, then `<provider>#2` .. `#8`. The window and the PTY server reach them only by running
+`/usr/bin/security` (`specs/t27os/keys_host.t27`: posix_spawn, pipes, poll, waitpid; the server reads the
+Keychain itself at its start and at a spawn that finds no key for the pane's agent, at most once a minute,
+so a pane spawned from a script while the window is closed still has its key; the log line is
+`keys read from the Keychain: N`, a count, never a key), never through the SecItem calls, so
 **Security.framework is not linked** and the link line in section 3 is complete (measured 2026-10-20: the
 SecItem build did not link without `-framework Security`; this one does). The reason: the window is signed
 ad hoc, every rebuild is a new code identity to macOS, and each SecItem read asked for the login password
@@ -92,7 +95,7 @@ refuses to connect to the socket).
 ```
 # 1. the server first, detached from the tab. PATH must contain the directory of the `claude` CLI.
 cd ~ && PATH=$HOME/.local/bin:$PATH <repo>/target/t27os/t27os-pty < /dev/null > <scratch>/pty-server.log 2>&1 &
-# the log then reads: t27os-server: listening, restored 0
+# the log then reads: t27os-server: keys read from the Keychain: N  /  t27os-server: listening, restored 0
 # 2. the app
 open <repo>/target/t27os/T27OS.app
 ```
