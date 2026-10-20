@@ -24,6 +24,14 @@ i (issues) -> k (kanban) -> c (task an agent) -> p (PR, CI) -> v (verdict) -> n 
 (experience), and q (the Queen in GOD MODE) turns it on her own. A petal opens straight into that
 tool's page, the agent's dashboard open; nothing on a page is drawn outside a widget.
 
+## Glass everywhere (owner rule, repeated 2026-10-20 -- do not get it wrong again)
+
+In a WINDOW every surface is matte transparent glass: sidebar, content, tiles, panels, hero, and
+the embedded live widget page (WKWebView drawsBackground off + an injected
+`html,body{background:transparent}` user script). In FULL SCREEN the background is opaque black
+#000000. Use glass_window's surface_alpha (#11266) for every new surface; never hardcode an opaque
+fill. Before claiming a surface done, screenshot it in both modes.
+
 ## The image (owner, 2026-10-20)
 
 We sit in a spaceship; T27 OS is its **instrument panel** for working on the project.
