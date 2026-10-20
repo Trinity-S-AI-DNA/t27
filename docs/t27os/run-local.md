@@ -21,6 +21,19 @@ The window does not start the server and does not bundle it. They meet on one Un
 `glass_window.t27`), the server from `$HOME` (`socket_path` in `pty_proto.t27`). With no server the Claude Code
 pane in the window says "offline" and echoes keys.
 
+Provider keys (the KEYS tab, up to 8 per provider) live in the macOS Keychain, service `ai.t27.os`, account
+`<provider>`, then `<provider>#2` .. `#8`. The window reaches them only by running `/usr/bin/security`
+(`specs/t27os/keys_host.t27`: posix_spawn, pipes, poll, waitpid), never through the SecItem calls, so
+**Security.framework is not linked** and the link line in section 3 is complete (measured 2026-10-20: the
+SecItem build did not link without `-framework Security`; this one does). The reason: the window is signed
+ad hoc, every rebuild is a new code identity to macOS, and each SecItem read asked for the login password
+again. `/usr/bin/security` is signed by Apple and never changes, so a read of an item it created shows no
+dialog across rebuilds. A key is never put on argv (`ps` shows it): an add writes one line to the stdin of
+`security -i`, and refuses a key with white space, a quote or a backslash. An add never replaces a key
+(the account must be free); a delete removes the newest key only. Items that an older SecItem build made
+trust that build, not `security`, so a read of one may still ask once: remove it in Keychain Access and add
+the key again in the KEYS tab.
+
 ## 2. Prerequisites
 
 - Apple silicon, Xcode installed and selected (`xcode-select -p`): `ld`, the SDK and `codesign`. Command Line
