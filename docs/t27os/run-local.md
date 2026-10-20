@@ -13,7 +13,7 @@ product). Every call into the system is an `@extern` import (`specs/t27os/pty_sy
 
 | Product | Spec (with its `use` closure) | Links |
 |---|---|---|
-| `T27OS.app` (window, 960 x 540 pt, title "TRINITY S3AI") | `specs/t27os/glass_window.t27` | libSystem, libobjc, Foundation, AppKit, CoreGraphics, CoreText, CoreFoundation, QuartzCore |
+| `T27OS.app` (window, 960 x 540 pt, title "TRINITY S3AI") | `specs/t27os/glass_window.t27` | libSystem, libobjc, Foundation, AppKit, CoreGraphics, CoreText, CoreFoundation, QuartzCore, Security, WebKit, ImageIO |
 | `t27os-pty` (PTY server, one process, owns every agent terminal) | `specs/t27os/pty_server.t27` | libSystem |
 
 The window does not start the server and does not bundle it. They meet on one Unix socket,
@@ -27,8 +27,8 @@ Provider keys (the KEYS tab, up to 8 per provider) live in the macOS Keychain, s
 Keychain itself at its start and at a spawn that finds no key for the pane's agent, at most once a minute,
 so a pane spawned from a script while the window is closed still has its key; the log line is
 `keys read from the Keychain: N`, a count, never a key), never through the SecItem calls, so
-**Security.framework is not linked** and the link line in section 3 is complete (measured 2026-10-20: the
-SecItem build did not link without `-framework Security`; this one does). The reason: the window is signed
+`make t27os` links Security.framework with the rest (the list is `APP_FRAMEWORKS` in `install.t27`); the key manager itself
+still reaches the Keychain only through `/usr/bin/security`, not SecItem. The reason: the window is signed
 ad hoc, every rebuild is a new code identity to macOS, and each SecItem read asked for the login password
 again. `/usr/bin/security` is signed by Apple and never changes, so a read of an item it created shows no
 dialog across rebuilds. A key is never put on argv (`ps` shows it): an add writes one line to the stdin of
@@ -47,41 +47,29 @@ the key again in the KEYS tab.
 
 ## 3. Build
 
-`t27b` on master and on the petal branch does NOT implement `@extern` in `--macho` objects. Without it the
-build still "succeeds" and writes an object with no undefined symbols whose every import is a trapping stub
-(`otool -tv` shows `brk` in `_sys_close`; `nm -u` is empty). The feature is two commits on
-`origin/feat/t27b-host-boundary` (#8946), not on master:
-`865b4ee3f` (extern boundary, Mach-O undefined symbols and BRANCH26) and `6113f868b` (regenerated Rust).
+One command, from the repository root, on Apple silicon with Xcode selected:
 
 ```
-cd <repo>
-git fetch origin feat/t27os-petal-menu feat/t27b-host-boundary
-git checkout --detach origin/feat/t27os-petal-menu
-git cherry-pick --no-commit 865b4ee3f 6113f868b        # applied, never committed on this branch
-cargo build --release -p t27b                          # about 2 min on this Mac, target/release/t27b
-
-T27B=<repo>/target/release/t27b ; OUT=<repo>/target/t27os ; mkdir -p $OUT
-$T27B build specs/t27os/pty_server.t27   -o $OUT/pty_server.o   --macho    # 0.9 s, 64 KB object
-$T27B build specs/t27os/glass_window.t27 -o $OUT/glass_window.o --macho    # 16 s, 183 KB object
-nm -u $OUT/pty_server.o      # must list _forkpty, _write, ... ; an empty list means the extern commits are missing
-
-SDK=$(xcrun --show-sdk-path) ; SDKV=$(xcrun --show-sdk-version)
-ld -arch arm64 -platform_version macos 11.0 $SDKV -syslibroot $SDK -e _main -lSystem \
-   -o $OUT/t27os-pty $OUT/pty_server.o
-ld -arch arm64 -platform_version macos 11.0 $SDKV -syslibroot $SDK -e _main -lSystem -lobjc \
-   -framework Foundation -framework AppKit -framework CoreGraphics -framework CoreText \
-   -framework CoreFoundation -framework ImageIO -framework QuartzCore -o $OUT/T27OS $OUT/glass_window.o
-
-mkdir -p $OUT/T27OS.app/Contents/MacOS && cp $OUT/T27OS $OUT/T27OS.app/Contents/MacOS/T27OS
-# $OUT/T27OS.app/Contents/Info.plist needs: CFBundleExecutable T27OS, CFBundleIdentifier ai.t27.os,
-# CFBundleName T27OS, CFBundlePackageType APPL, CFBundleVersion 1, LSMinimumSystemVersion 11.0,
-# NSHighResolutionCapable true
-codesign --force --sign - $OUT/T27OS.app ; codesign --force --sign - $OUT/t27os-pty
-otool -L $OUT/T27OS.app/Contents/MacOS/T27OS            # the 7 libraries above
+make t27os            # builds t27b, both objects, the Info.plist, links, signs; 3 s when t27b is built
+make -n t27os         # prints the plan
 ```
 
-Run inside Claude Code's Bash sandbox, `ld` prints `couldn't create cache file ... xcrun_db (Operation not
-permitted)` twice and still links; the products exist and `otool -L` shows the right libraries.
+It writes `target/t27os/T27OS.app` and `target/t27os/t27os-pty` (the PTY server, a plain file beside the bundle).
+What it decides lives in `specs/t27os/install.t27` ("the app target": products, the nine frameworks Foundation
+AppKit CoreGraphics CoreText CoreFoundation QuartzCore Security WebKit ImageIO, minimum macOS 11.0, the refusals,
+and `plist_text`, the function that writes `Info.plist`); the Makefile only names the same files and flags.
+
+- **Info.plist** is generated: `specs/t27os/plist_main.t27` is built, linked and run by the rule, and prints
+  `plist_text` with the version from `specs/t27os/release.t27` and the build number `T27OS_BUILD` (default
+  `git rev-list --count HEAD`). `plutil -lint` checks it.
+- **Signing** is ad hoc (`-`) unless `T27OS_SIGN_ID="Developer ID Application: ..."` names an identity. Ad hoc is a
+  new code identity on every rebuild.
+- **Refusals**: not Apple silicon; a build number that is not a plain commit count; an object with zero undefined
+  symbols (`nm -u`), which means `t27b` has no `@extern` and the build would be trapping stubs. The `@extern`
+  support is two commits of #8946 (`865b4ee3f`, `6113f868b`) that are on this branch's base; with them the
+  window object emits in about 13 ms (an earlier quadratic walk made it 148 s; fixed in `specs/tri/t27b/macho.t27`).
+- Run inside Claude Code's Bash sandbox, `ld` prints `couldn't create cache file ... xcrun_db (Operation not
+  permitted)` and still links. Point `CARGO_TARGET_DIR` at a directory you may write if `target/` is not.
 
 Iterating: the window watches its own executable (`hot_reload.t27`). Re-run `t27b build` and the second `ld`
 straight onto `T27OS.app/Contents/MacOS/T27OS`, then `codesign`; the window waits for the file to settle, saves
@@ -177,10 +165,9 @@ OK 128, ERR 129, DATA 130, LISTING 131.
    With a clean environment (`env -i HOME=$HOME PATH=$PATH claude -p ...`) it prints `Not logged in`. Needs an
    owner action on the provider balance or login; the KEYS tab and per-pane profiles (M12/M12b, PR #10977) and the
    child-environment strip (#11029) are not on this branch.
-2. **`t27b` needs the extern commits** (section 3). Master's `t27b` builds a binary of trapping stubs with no
-   error.
-3. **No recipe in the repository.** The build is a scratch script around `t27b` and `ld`; `Info.plist` is a
-   hand-made bundle manifest. A `tri` target or a spec that generates the bundle does not exist.
+2. **`t27b` needs the extern commits** (section 3). A `t27b` without them builds a binary of trapping stubs with
+   no error; `make t27os` now refuses such an object.
+3. **The recipe is `make t27os`** (section 3); the Info.plist is generated, not hand-made.
 4. **Nothing starts the server.** `T27OS_INSTALL=1 t27os-pty` writes
    `~/Library/LaunchAgents/ai.t27.os-server.plist` (login start, #11035); it is persistent configuration and was
    not used here.
@@ -200,3 +187,38 @@ OK 128, ERR 129, DATA 130, LISTING 131.
     Other agent cells were not tried.
 11. **Load.** The app redraws at 30 fps while idle (about 15 percent of a core) and its DOCTOR scan walks the
     home directory; both are on the M11 list (#11025).
+
+## 7. Releases and the update channel
+
+Rules: `specs/t27os/release.t27` (every one tested). Version: `VERSION_MAJOR/MINOR/PATCH` in that file, the
+build number is the commit count. The release is a GitHub release `v<version>` with two assets: `T27OS-<version>.zip`
+and `t27os-release.t27`, the **manifest**, a t27 module (not JSON) with six constants: VERSION, BUILD, SHA256 of the
+zip, MIN_MACOS, URL, NOTES. Its address is `https://github.com/gHashTag/t27/releases/latest/download/t27os-release.t27`;
+every address in it must start with `https://github.com/gHashTag/t27/releases/`.
+
+The update rule the app follows:
+
+1. At start and every 6 hours it fetches the manifest, never while a pane is busy (a due check waits).
+2. It offers an update only for a newer version that passes `manifest_check`, is not a version a rollback removed,
+   and whose MIN_MACOS the Mac meets.
+3. The zip is downloaded to `~/.t27os/updates` by a background curl (spawned, as `keys_host.t27` spawns `security`).
+4. `shasum -a 256` of the zip must equal the manifest's SHA256, then the unzipped bundle must pass `codesign --verify`.
+   A bad digest deletes the zip and waits for the next check.
+5. When no pane is busy the running bundle moves to `~/.t27os/previous` (the one bundle kept) and the new one takes
+   its place; `hot_reload.t27` sees the new executable and `exec`s it. The PTY server is a separate process and keeps
+   its panes.
+6. The swap leaves a `pending` marker; a start that lives 60 s removes it. A start that finds the marker (a crash within
+   60 s) puts the previous bundle back, consumes it, and refuses that version from then on.
+
+Status of this lane: steps 1-6 are decided and tested as rules in `release.t27` (21 tests); the window's host calls that
+fetch, spawn and move are not wired into `glass_window.t27` yet.
+
+To release (the plan prints, nothing publishes):
+
+```
+tri t27os release --plan        # build, zip, sha256, manifest, notes since the last tag, gh release create
+tri t27os manifest --build N --sha H     # the manifest text, as step 4 of the plan uses it
+```
+
+Publishing needs the owner's yes (`publish_allowed`), and a Developer ID Application certificate for a release other
+Macs will open without a Gatekeeper warning; neither exists in this repository.

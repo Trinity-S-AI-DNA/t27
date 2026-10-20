@@ -189,6 +189,35 @@ t27t gaps (live console for H/N): no live run feed (runner private), no model re
 is a map), HTOK data and checkpoints host-local in /tmp/hslm; real today: GEMM bench, saving with its
 estimate label (bind to F_MEASURED), paper_claims, dataset/igla-coder MANIFEST.
 
+## Every page has its own agent chat (owner, 2026-10-20)
+
+At the bottom of every letter page sits a docked chat with THAT letter's agent: Claude Code through
+the key master (free tier, rotation, traffic light), started with a brief built from the agent's own
+spec (tool t27<letter>, DOMAIN, ARCHETYPE, KEY_FILES, SKILLS, TOOLS), allowed only the tri commands and
+MCP tools of its TOOLS field, in that letter's worktree. Tapping an instrument adds it to the chat as
+context; 'do it' turns the conversation into a kanban card and a fan-out child whose result returns
+to the parent. Decisions: specs/t27os/agent_chat.t27; spawn through the pane verbs of #11316.
+
+## Harness visibility (what people love on X, studied 2026-10-20)
+
+Hook-event timeline per agent (every tool call; our pty server already receives Claude Code hooks),
+a 'waiting for you' column with batch approve/reject, a parent -> child tree with live pane preview,
+session replay with a time scrubber, token/cost per agent/key/model/tier, a playful glanceable hive
+(H page), a read-only watch mode for shared links.
+
+## One UI, three platforms; the game moves in before the site is replaced (owner, 2026-10-20)
+
+One UI logic and one design for the desktop, the website and the FPGA: a frame function in .t27
+(extend specs/t27f/ui_plan.t27) turns state + normalized input into a draw list (canvas_out.t27
+primitives) and hit regions; three thin hosts only replay it -- CoreGraphics (glass_window becomes a
+player), wasm + canvas on the site (the widgets host.js pattern), a PL rasterizer to HDMI (glyph57
+fonts). One input script, byte-equal draw lists on all three.
+Before app.t27.ai/game is replaced by T27 OS on the web, EVERY piece of the game's logic is ported
+into the 27 petals -- including the SPACE MAP: QueenUniverse (the universe atlas of worlds = repos,
+queenUniverseAtlas, the hex hive with foundation/castle/code layers, territory held/neutral/fog,
+castle rings) goes to M (MAP) and H (HIVE). A parity table (game feature -> petal -> native / live
+page / missing) gates the switch: nothing missing.
+
 ## Plan (open items, 2026-10-20)
 
 1. Cockpit dashboard in the home tabs: nested widget tree, agent consoles, card.png instruments,

@@ -149,8 +149,8 @@ pub fn gc_pair(a_path: u64, a_kind: u8, a_lo: u32, a_hi: u32, b_path: u64, b_kin
 /// FORWARD: its parent was the head. CARRIED: carried past what landed, nothing re-run. REGEN: a
 /// derived file both wrote is recomputed on the new head and sealed again; the other verdicts carry.
 /// REJUDGE: back to GEN, the frontier picks the nodes. CONFLICT: a source edit met one that landed;
-/// back to a bee. NOT_GOLDEN: never landed. UNKNOWN_PARENT: its parent is neither the pass's head nor
-/// a link that landed in the pass; it fails closed.
+/// back to a bee. NOT_GOLDEN: never landed. UNKNOWN_PARENT: it has no parent id at all (no merge-base)
+/// and fails closed. A parent that is neither the pass's head nor a link of the pass is carried (#11361).
 pub const GC_OUT_FORWARD : u8 = 0;
 pub const GC_OUT_CARRIED : u8 = 1;
 pub const GC_OUT_REGEN : u8 = 2;
@@ -243,7 +243,27 @@ pub fn gc_land(n: usize, id: []const u64, parent: []const u64, v: []const u8, m:
             if (adv != GC_ADV_STALE) {
                 out[i] = GC_OUT_NOT_GOLDEN;
             } else {
-                var since : usize = gc_since(i, n, id, parent[i], head, pos);
+                // gc_since inlined: a read-only slice passed on from a written one is a move in generated Rust
+                var since : usize = n;
+                if (parent[i] == head) {
+                    since = 0;
+                } else {
+                    var jj : usize = 0;
+                    while (jj < i) {
+                        if (id[jj] == parent[i] and pos[jj] < n) {
+                            since = pos[jj] + 1;
+                            jj = i;
+                        } else {
+                            jj = jj + 1;
+                        }
+                    }
+                }
+                // A parent the chain never saw (a branch cut from an older master) is carried past every link that landed in
+                // this pass; the host's merge-tree then judges it against the real head (#11361). Only a link with no parent
+                // id at all (no merge-base) stays UNKNOWN_PARENT.
+                if (since == n and parent[i] != 0) {
+                    since = 0;
+                }
                 if (since == n) {
                     out[i] = GC_OUT_UNKNOWN_PARENT;
                 } else {
@@ -366,6 +386,10 @@ pub fn gc_region_counts(answer: u8) -> bool {
 ;   at most GC_BATCH_MAX ready links, the window is GC_WINDOW_MIN minutes, doubled while the Actions
 ;   queue holds GC_CI_JAM runs or more (a push into a jam only goes to the back of it, push_gate.t27).
 ; - Required checks run once per batch. A derived-only rebase (CARRIED or REGEN) re-runs nothing.
+; - The chain follows master (#11361). GitHub squash-merges a batch, so the head is then no ancestor of
+;   origin/master: gc_rebase resets head and pushed to master when nothing is unpushed, and carries the
+;   unpushed links onto master as one commit otherwise. A link cut from an older master is carried, not
+;   refused (gc_land); a seal saved by an older t27c is saved again after the tests (gc_regen_ok, REGEN).
 ; - A red batch is bisected here, by verdicts: gc_bisect finds the first link whose prefix is red from
 ;   locally replayed prefix verdicts; it is not found by re-running GitHub.
 
@@ -437,6 +461,40 @@ pub fn lane_may(act: u8) -> bool {
 /// re-run nothing, here or on GitHub; REJUDGE re-runs from GEN locally; CONFLICT goes back to a bee.
 pub fn gc_rerun_local(out: u8) -> bool {
     return out >= GC_OUT_REJUDGE;
+}
+
+/// After GitHub squash-merges a batch, refs/golden/head is no longer an ancestor of origin/master, so every link
+/// cut from origin/master would read as a stranger (#11361). The chain follows master:
+///   NONE:  no head, no pushed mark, or origin/master already holds the head: nothing to do.
+///   RESET: nothing is unpushed (pushed is the head) and master does not hold it: head and pushed both move to master.
+///   CARRY: links are unpushed and master does not hold the head: they are carried onto master as one commit
+///          (merge-tree with the pushed mark as the base), then head moves to it and pushed to master.
+pub const GC_RB_NONE : u8 = 0;
+pub const GC_RB_RESET : u8 = 1;
+pub const GC_RB_CARRY : u8 = 2;
+
+pub fn gc_rebase(head_ok: bool, pushed_ok: bool, same: bool, master_has_head: bool) -> u8 {
+    if (head_ok == false or pushed_ok == false or master_has_head) {
+        return GC_RB_NONE;
+    }
+    if (same) {
+        return GC_RB_RESET;
+    }
+    return GC_RB_CARRY;
+}
+
+/// A link whose seals were saved by an older t27c has them saved again on its own tree (t27c seal --save, then
+/// --verify), after its tests passed. Only .trinity/seals/ may change: every changed path must be a seal.
+pub fn gc_regen_ok(changed: usize, seals: usize) -> bool {
+    return changed == seals;
+}
+
+/// The outcome to show: FORWARD or CARRIED become REGEN when the link's seals were re-saved; any other stands.
+pub fn gc_regen_view(out: u8, resealed: bool) -> u8 {
+    if (resealed and (out == GC_OUT_FORWARD or out == GC_OUT_CARRIED)) {
+        return GC_OUT_REGEN;
+    }
+    return out;
 }
 
 /// The first red prefix of a batch, by binary search. red[j-1] is true when the golden head after the
@@ -589,9 +647,9 @@ test negative_control_a_link_that_is_not_golden_never_lands_and_moves_nothing {
     assert out[2] == GC_OUT_CARRIED;
 }
 
-test negative_control_a_parent_nobody_landed_fails_closed {
+test negative_control_a_link_with_no_parent_id_fails_closed {
     var id : [2]u64 = [2]u64{ 11, 12 };
-    var parent : [2]u64 = [2]u64{ 1, 99 };
+    var parent : [2]u64 = [2]u64{ 1, 0 };
     var v : [10]u8 = [10]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
     var eo : [2]usize = [2]usize{ 0, 1 };
     var ep : [2]u64 = [2]u64{ 100, 200 };
@@ -734,6 +792,47 @@ invariant five_stages_and_done_after_them {
 }
 
 ; --- Section 6 tests -----------------------------------------------------------------------------------
+
+test the_chain_follows_master_after_a_squash_merge {
+    // nothing unpushed and master lost the head: reset both refs to master
+    assert gc_rebase(true, true, true, false) == GC_RB_RESET;
+    // links unpushed and master lost the head: carry them onto master
+    assert gc_rebase(true, true, false, false) == GC_RB_CARRY;
+    // master holds the head, or a ref is missing: leave everything alone
+    assert gc_rebase(true, true, true, true) == GC_RB_NONE;
+    assert gc_rebase(true, true, false, true) == GC_RB_NONE;
+    assert gc_rebase(false, true, true, false) == GC_RB_NONE;
+    assert gc_rebase(true, false, false, false) == GC_RB_NONE;
+}
+
+test re_saved_seals_may_change_only_seals_and_land_as_regen {
+    assert gc_regen_ok(3, 3) == true and gc_regen_ok(0, 0) == true;
+    // a changed path that is not a seal refuses the re-save
+    assert gc_regen_ok(3, 2) == false;
+    assert gc_regen_view(GC_OUT_FORWARD, true) == GC_OUT_REGEN and gc_regen_view(GC_OUT_CARRIED, true) == GC_OUT_REGEN;
+    assert gc_regen_view(GC_OUT_FORWARD, false) == GC_OUT_FORWARD;
+    // a refusal is never dressed as a landing
+    assert gc_regen_view(GC_OUT_CONFLICT, true) == GC_OUT_CONFLICT and gc_regen_view(GC_OUT_NOT_GOLDEN, true) == GC_OUT_NOT_GOLDEN;
+}
+
+test a_parent_the_chain_never_saw_is_carried_and_a_meeting_edit_still_conflicts {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 99, 98 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 200, 100 };
+    var ek : [3]u8 = [3]u8{ EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE };
+    var el : [3]u32 = [3]u32{ 0, 0, 0 };
+    var eh : [3]u32 = [3]u32{ 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 2;
+    assert out[0] == GC_OUT_FORWARD and out[1] == GC_OUT_CARRIED;
+    // link 2 wrote the path link 0 wrote: carrying it past link 0 meets
+    assert out[2] == GC_OUT_CONFLICT;
+}
 
 test a_lane_is_ready_only_when_every_stage_is_golden_in_order {
     var v : [15]u8 = [15]u8{ 1, 2, 1, 1, 1, 1, 1, 1, 3, 0, 1, 0, 1, 1, 1 };

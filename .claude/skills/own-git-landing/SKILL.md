@@ -59,8 +59,10 @@ Why: a push starts every required check again at the back of an Actions queue of
 
 - `tri land [branch] [--plan|--check]` exists (specs/tri/land/land.t27, #11068): the GitHub leg for ONE
   branch (merge master, tests, seals, push, PR, auto-merge). Use it for the batch branch, once.
-- No verb yet runs the local leg. Missing: `tri golden land [--plan]` (reads the queue of links, applies
-  batch_from, gc_land, advances `refs/golden/head`) and `tri golden push` (when_to_push, then `tri land`
-  on the head). Until they exist, a lane commits on its branch, verifies locally, and its steward
-  batches by hand following section 6. Spec to write: `specs/tri/land/golden_land.t27`, a thin host
-  over golden_chain.t27, no rules of its own.
+- `tri golden land [--plan]`, `tri golden push [--plan] [--queued N] --issue N`, `tri golden status` run the local leg
+  (specs/tri/land/golden_land.t27, a thin host over golden_chain.t27; hosted by `cmd_golden` in cli/tri/src/main.rs, #11275).
+  `land` reads the queue (local claude/evolve-* branches and `.trinity/golden/queue`), judges each link by `t27c seal --verify`
+  and `t27b test` in a scratch worktree of its tip, and lands the ready ones on `refs/golden/head` by `git update-ref` with the
+  old value (compare-and-swap); `--plan` writes no ref and prints the update-ref lines. `push` applies when_to_push to the links
+  after `refs/golden/pushed` and, when due, cuts `claude/golden-<sha>` at the batch's last link and runs `tri land` on it once.
+  A lane built on a head that has since moved is UNKNOWN_PARENT: `git merge refs/golden/head` into it first.

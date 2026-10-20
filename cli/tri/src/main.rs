@@ -54,6 +54,10 @@ mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw
 mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
 #[path = "../../../gen/rust/tri/land/land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
+#[path = "../../../gen/rust/tri/land/golden_land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
+#[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod t27rel; // t27c gen-rust of specs/t27os/release.t27: the release plan and manifest text of `tri t27os` (#11315)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -453,6 +457,10 @@ enum Commands {
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
     /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
+    /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
+    Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
+    /// T27 OS release front door: `release --plan` prints the numbered steps (build, zip, sha256, manifest, notes, `gh release create`) and runs none; `manifest --build N --sha H` prints the release manifest, a t27 module the app reads; anything that would publish is refused (rules: specs/t27os/release.t27, #11315).
+    T27os { action: String, #[arg(long)] plan: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sha: String },
     /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
     Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
     /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
@@ -1376,6 +1384,8 @@ fn main() -> Result<()> {
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
+        Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
+        Commands::T27os { action, plan, build, sha } => std::process::exit(cmd_t27os(action, *plan, *build, sha)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
@@ -1532,4 +1542,47 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result
     let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
     println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
     Ok(land::exit_code(code))
+}
+
+/// `tri golden land|push|status` (#11275): every rule is specs/tri/land/golden_land.t27 over golden_chain.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence and stops where the spec says.
+fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Result<u8> {
+    use golden_land as g;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let env = |k: &str, d: &str| leak(std::env::var(k).unwrap_or(d.into()));
+    let r = g::GolReq { verb: g::verb_of(leak(action.into())), plan, queued: queued.unwrap_or(g::ABSENT), issue, scratch: leak(std::env::temp_dir().join(format!("tri-golden-{}", std::process::id())).display().to_string()), t27b: env("T27B", "t27b"), t27c: env("T27C", "t27c"), tri: leak(std::env::current_exe()?.display().to_string()) };
+    let (mut ev, mut buf, mut code, mut wo, mut wp) = ("", vec![0u8; g::CMD_MAX], g::request_refusal(r), vec![0u8; 16], vec![0usize; 16]);
+    let run = |b: &[u8], dir: &str| { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); match Command::new(&a[0]).args(&a[1..]).current_dir(dir).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) } };
+    if code == g::C_OK { std::fs::create_dir_all(r.scratch)?; }
+    while code == g::C_OK {
+        let s = g::next_slot(r, ev, &mut wo, &mut wp);
+        if s >= g::DONE { break; }
+        let (k, n) = ((s / g::SLOT) as u8, s % g::SLOT);
+        let m = g::step_argv(r, ev, k, n, &mut buf, &mut wo, &mut wp);
+        anyhow::ensure!(m > 0, "tri golden: step {k} does not fit");
+        let argv = buf[..m].to_vec();
+        let c = g::step_cwd(r, k, n, &mut buf);
+        let (x, text) = run(&argv, if c > 0 { leak(String::from_utf8_lossy(&buf[..c]).into()) } else { "." });
+        let (text, mut sec) = (leak(text.clone()), vec![0u8; text.len() + 128]);
+        let w = g::emit_section(&mut sec, 0, k, n, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..w])));
+        code = g::judge(r, ev, k, n);
+        eprintln!("golden {k}.{n} exit {x}");
+    }
+    let m = g::step_argv(r, ev, g::G_PRUNE, 0, &mut buf, &mut wo, &mut wp);
+    if m > 0 { let _ = std::fs::remove_dir_all(r.scratch); run(&buf[..m].to_vec(), "."); }
+    let mut out = vec![0u8; 16384];
+    let w = g::report(r, ev, code, &mut out, &mut wo, &mut wp, &mut buf);
+    print!("{}", String::from_utf8_lossy(&out[..w]));
+    Ok(g::exit_code(code))
+}
+
+/// `tri t27os release --plan` | `manifest` (#11315): the text is specs/t27os/release.t27; this prints it and publishes nothing.
+fn cmd_t27os(action: &str, plan: bool, build: u32, sha: &str) -> i32 {
+    let (mut buf, v) = (vec![0u8; 4096], t27rel::current_version());
+    let n = match action {
+        "release" if plan && !t27rel::publish_allowed(plan, false) => t27rel::plan_text(&mut buf, 4096, v),
+        "manifest" if build > 0 && t27rel::sha_ok(sha.as_bytes(), sha.len()) => t27rel::manifest_text(&mut buf, 4096, v, build, sha.as_bytes(), sha.len()),
+        _ => { eprintln!("{}", if action == "manifest" { "tri t27os manifest: --build N and --sha <64 lowercase hex digits> are required" } else { t27rel::REFUSAL }); return 2 }
+    };
+    print!("{}", String::from_utf8_lossy(&buf[..n.min(4096)])); (n > 4096) as i32
 }
