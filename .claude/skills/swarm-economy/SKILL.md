@@ -24,7 +24,7 @@ stock online on the dashboard so there is no idle time". Deadline set by the own
 
 ## Pulse (no LLM)
 
-`pulse.sh` (this folder) collects, without any model call:
+The collector (session scratchpad, plumbing only; every decision is specs/t27os/swarm_pulse.t27) collects, without any model call:
 
 - bees running / queued (GitHub Actions runs on gHashTag/t27), PRs opened and merged in 24 h;
 - swarm issues waiting;
