@@ -26,6 +26,14 @@ We sit in a spaceship; T27 OS is its **instrument panel** for working on the pro
 - **End-to-end analytics per domain**: what is happening in each agent's domain (commits 24 h / 7 d, last activity, 7-day pulse, lamp ACTIVE / WARM / QUIET / BLOCKED, default action), every fact labelled CONFIRMED or GUESS, an OPEN count of unowned files (idea from the REA + Opus 5.5 reverse-engineering posts).
 - **For hardware engineers**: the BENCH (three AX7203 dice live), provenance of every number, "not measured" instead of 0, keyboard first, idle at no CPU.
 
+## Every widget carries its agents (owner, 2026-10-20, mandatory)
+
+No widget, tab or instrument without its pinned agents: the owner letter plus the letters that feed
+it, each with a one-line reason, in `specs/t27os/agent_parts.t27`. A test refuses a widget with no
+agent, and the widget factory (`specs/t27f/widget_factory.t27`) refuses a new widget without them.
+On screen every instrument shows its agent badges (owner first, bold); the live widget view shows
+an `AGENTS:` line. Purpose: make the system's hard-to-follow work transparent to a human.
+
 ## Where the law lives (one home each, never restated)
 
 | What | Spec |
