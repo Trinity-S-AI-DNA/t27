@@ -32,6 +32,28 @@ the embedded live widget page (WKWebView drawsBackground off + an injected
 #000000. Use glass_window's surface_alpha (#11266) for every new surface; never hardcode an opaque
 fill. Before claiming a surface done, screenshot it in both modes.
 
+## Tool pages built so far (2026-10-20)
+
+Letters B, K and Q draw a page in place of their dashboard (`agent_parts::page_kind`; a header switch goes to the
+dashboard and back). The window only calls the decisions of `bench.t27`, `kanban.t27` and `queen_board.t27`.
+
+- **B BENCH**: one glass card per board (AX7203, Zynq): chain diagram with IDCODEs, cable, serial, busdev, UART ports,
+  lamp, DETECT / FLASH / UART. A background `sh -c` every 10 s while the page is open runs `openFPGALoader --scan-usb`,
+  `ls /dev/cu.usbserial-*` and one `--detect` per cable seen once, into `~/.t27os/bench/*.txt`. FLASH asks for a `.bit`
+  path and an explicit CONFIRM click (SRAM load, never `-f`). The PTY server only spawns agents and editors, so UART
+  and FLASH run as host jobs with a log widget (`run.txt`) until a PTY command kind exists in `pty_logic`.
+- **K KANBAN**: `gh issue list` and `gh pr list` once a minute into `~/.t27os/kanban/*.tsv` through the `--jq`
+  templates of `kanban.t27`; drag and drop follows `drag_action`, an accepted drop is a PROPOSAL kept on the board until
+  the next refresh (no GitHub write, no agent: `EVOLVE_SPAWNS` stays false). Letters: no census yet, so every card is S
+  with a GUESS mark.
+- **Q QUEEN**: lamps (27, "not measured": `domain_pulse` cannot be linked into the window, #5980), feed, top gaps with
+  why-not, the six-counter meter (links and tests from `git log` / `grep` in the space's folder once a minute),
+  safety strip with STOP = GOD MODE off.
+- **Trap, measured**: `t27b` splices every imported module into one flat namespace, so a same-named private helper in
+  two modules is silently the first one. The page specs prefix their internals (`kb_`, `qb_`, `bn_`); check with the
+  duplicate-name script before importing a new spec into `glass_window`. The fast `t27b test` does not type-check the
+  non-test functions unless an error forces the full checker (add an unknown name to a scratch copy).
+
 ## The image (owner, 2026-10-20)
 
 We sit in a spaceship; T27 OS is its **instrument panel** for working on the project.
@@ -213,3 +235,16 @@ page / missing) gates the switch: nothing missing.
 
 GOD MODE lanes land through `own-git-landing` (law: `specs/queen/golden_chain.t27` section 6): verify
 locally, land on the local golden head, one batched GitHub push per window; never a push per commit.
+
+## Terminal scrollback and the LANES block (2026-10-20, #11398, #11397)
+
+- **Scrollback** is `vt.t27`: a ring of 5000 rows that left the top, a view offset in 1/16 rows (sub-row pixels), follow-live until
+  scrolled up, a "JUMP TO LIVE" chip (`term_pane.t27` geometry), typing returns to live. The alternate screen keeps the main
+  screen aside, has no history and gets the wheel as arrows (SS3 under DECCKM) or as mouse reports (DECSET 1000, SGR 1006).
+  Dirty rows and a generation counter feed the frame gate. The cells buffer is the grid + a saved grid + the ring (`TP_BUF_CELLS`).
+- **LANES AND ACTORS** (chat sidebar, under AGENTS) is `lanes_view.t27`: one row model for pane, script lane
+  (`/tmp/claude-501/lane-*`, `.lane.log`), own-git status lines, Queen numbers and the kernel tree. One shell job per 5 s writes
+  `~/.t27os/lanes/lanes.txt`; a click on a script lane runs the tail job and shows the last 40 lines.
+- Trap, measured: importing `kernel.t27` into the window's closure collided on `lane_gate` and `GAUGE_NAMES`; kernel's are now
+  `kn_lane_gate` and `KN_GAUGE_NAMES`. Importing `petal_glass` pulls `topic_engine`, whose `layer_of` shadowed
+  `identity_table::layer_of` (now `id_layer_of`). Check the flat namespace before every new import.
