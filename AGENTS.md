@@ -223,6 +223,10 @@ section only states the rules.
   (A-I, J-R, S-Ti). Petal 3 (C) holds the chat and the commander. A letter's tool t27<letter>
   leads where one exists (t27a, t27b, t27c, t27f frontend, t27o, t27t, t27u); never name a tool
   before its artifact exists (`specs/compiler/theory/toolchain.t27`).
+- **T27 OS is an ergonomic project-management system, 100% widgets** (owner, 2026-10-20: "our
+  signature"). Each letter is a tool t27<letter> with its own page -- t27k the kanban board, t27c
+  the chat and commander, t27i issues, t27p pull requests and CI, t27q the Queen; the table is
+  `TOOL_NAMES` in `specs/t27os/agent_parts.t27`. Every pixel of every page belongs to a widget.
 - **Everything is a widget; widgets contain widgets.** A letter's console holds its instruments:
   its widgets and app surfaces, its specs, its tri commands, MCP tools and skills, its live
   domain pulse. No text-only screens.

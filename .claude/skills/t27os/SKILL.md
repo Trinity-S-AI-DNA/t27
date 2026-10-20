@@ -15,6 +15,15 @@ description: T27 OS is the spaceship instrument panel for working on t27 -- a na
 > - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
 > - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
 
+## The product (owner, 2026-10-20)
+
+An ergonomic project-management system made 100% of widgets -- our signature. Each letter is a
+tool t27<letter> with its own page (t27k kanban, t27c chat + commander, t27i issues, t27p PRs and
+CI, t27q Queen, t27s specs, t27w widgets, ...; table in agent_parts.t27 TOOL_NAMES). The work loop:
+i (issues) -> k (kanban) -> c (task an agent) -> p (PR, CI) -> v (verdict) -> n (now) -> e
+(experience), and q (the Queen in GOD MODE) turns it on her own. A petal opens straight into that
+tool's page, the agent's dashboard open; nothing on a page is drawn outside a widget.
+
 ## The image (owner, 2026-10-20)
 
 We sit in a spaceship; T27 OS is its **instrument panel** for working on the project.
