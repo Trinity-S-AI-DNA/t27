@@ -235,3 +235,16 @@ page / missing) gates the switch: nothing missing.
 
 GOD MODE lanes land through `own-git-landing` (law: `specs/queen/golden_chain.t27` section 6): verify
 locally, land on the local golden head, one batched GitHub push per window; never a push per commit.
+
+## Terminal scrollback and the LANES block (2026-10-20, #11398, #11397)
+
+- **Scrollback** is `vt.t27`: a ring of 5000 rows that left the top, a view offset in 1/16 rows (sub-row pixels), follow-live until
+  scrolled up, a "JUMP TO LIVE" chip (`term_pane.t27` geometry), typing returns to live. The alternate screen keeps the main
+  screen aside, has no history and gets the wheel as arrows (SS3 under DECCKM) or as mouse reports (DECSET 1000, SGR 1006).
+  Dirty rows and a generation counter feed the frame gate. The cells buffer is the grid + a saved grid + the ring (`TP_BUF_CELLS`).
+- **LANES AND ACTORS** (chat sidebar, under AGENTS) is `lanes_view.t27`: one row model for pane, script lane
+  (`/tmp/claude-501/lane-*`, `.lane.log`), own-git status lines, Queen numbers and the kernel tree. One shell job per 5 s writes
+  `~/.t27os/lanes/lanes.txt`; a click on a script lane runs the tail job and shows the last 40 lines.
+- Trap, measured: importing `kernel.t27` into the window's closure collided on `lane_gate` and `GAUGE_NAMES`; kernel's are now
+  `kn_lane_gate` and `KN_GAUGE_NAMES`. Importing `petal_glass` pulls `topic_engine`, whose `layer_of` shadowed
+  `identity_table::layer_of` (now `id_layer_of`). Check the flat namespace before every new import.
