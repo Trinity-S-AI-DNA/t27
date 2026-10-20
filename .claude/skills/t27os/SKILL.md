@@ -32,6 +32,28 @@ the embedded live widget page (WKWebView drawsBackground off + an injected
 #000000. Use glass_window's surface_alpha (#11266) for every new surface; never hardcode an opaque
 fill. Before claiming a surface done, screenshot it in both modes.
 
+## Tool pages built so far (2026-10-20)
+
+Letters B, K and Q draw a page in place of their dashboard (`agent_parts::page_kind`; a header switch goes to the
+dashboard and back). The window only calls the decisions of `bench.t27`, `kanban.t27` and `queen_board.t27`.
+
+- **B BENCH**: one glass card per board (AX7203, Zynq): chain diagram with IDCODEs, cable, serial, busdev, UART ports,
+  lamp, DETECT / FLASH / UART. A background `sh -c` every 10 s while the page is open runs `openFPGALoader --scan-usb`,
+  `ls /dev/cu.usbserial-*` and one `--detect` per cable seen once, into `~/.t27os/bench/*.txt`. FLASH asks for a `.bit`
+  path and an explicit CONFIRM click (SRAM load, never `-f`). The PTY server only spawns agents and editors, so UART
+  and FLASH run as host jobs with a log widget (`run.txt`) until a PTY command kind exists in `pty_logic`.
+- **K KANBAN**: `gh issue list` and `gh pr list` once a minute into `~/.t27os/kanban/*.tsv` through the `--jq`
+  templates of `kanban.t27`; drag and drop follows `drag_action`, an accepted drop is a PROPOSAL kept on the board until
+  the next refresh (no GitHub write, no agent: `EVOLVE_SPAWNS` stays false). Letters: no census yet, so every card is S
+  with a GUESS mark.
+- **Q QUEEN**: lamps (27, "not measured": `domain_pulse` cannot be linked into the window, #5980), feed, top gaps with
+  why-not, the six-counter meter (links and tests from `git log` / `grep` in the space's folder once a minute),
+  safety strip with STOP = GOD MODE off.
+- **Trap, measured**: `t27b` splices every imported module into one flat namespace, so a same-named private helper in
+  two modules is silently the first one. The page specs prefix their internals (`kb_`, `qb_`, `bn_`); check with the
+  duplicate-name script before importing a new spec into `glass_window`. The fast `t27b test` does not type-check the
+  non-test functions unless an error forces the full checker (add an unknown name to a scratch copy).
+
 ## The image (owner, 2026-10-20)
 
 We sit in a spaceship; T27 OS is its **instrument panel** for working on the project.
