@@ -52,8 +52,10 @@ pub const LV_SCRIPT : u32 = 1;
 pub const LV_TRIGIT : u32 = 2;
 pub const LV_QUEEN : u32 = 3;
 pub const LV_KERNEL : u32 = 4;
-pub const LV_SRC_COUNT : u32 = 5;
-pub const LV_SRC_NAMES : [5]str = ["PANE", "SCRIPT", "TRIGIT", "QUEEN", "KERNEL"];
+/// A row that says nothing runs (the empty state); it is not a lane and has no log.
+pub const LV_NOTE : u32 = 5;
+pub const LV_SRC_COUNT : u32 = 6;
+pub const LV_SRC_NAMES : [6]str = ["PANE", "SCRIPT", "TRIGIT", "QUEEN", "KERNEL", "NOTHING RUNNING"];
 
 pub const LVS_RUNNING : u32 = 0;
 pub const LVS_DONE : u32 = 1;
@@ -93,6 +95,8 @@ pub const LVF_ELAPSED : usize = 5;
 pub const LVF_TLEN : usize = 6;
 pub const LVF_DEPTH : usize = 7;
 pub const LV_F : usize = 8;
+/// LVF_DEPTH of the one row that stands for the whole kernel tree (a group header, not a node).
+pub const LV_GROUP_DEPTH : u32 = 100;
 /// Rows kept; bytes of last line kept per row.
 pub const LV_MAX : u32 = 64;
 pub const LV_LINE : usize = 80;
@@ -509,6 +513,291 @@ pub fn lv_refresh_due(up: bool, now: u64, last: u64) -> bool {
     return now - last >= LV_PERIOD_S;
 }
 
+
+// ---- order, grouping, the empty state (owner, 2026-10-20, #11412) ----
+// The block is read top to bottom by importance: lanes waiting for the human, running lanes (script lanes first,
+// then panes), the other panes, the Queen, trigit, and the kernel group last. The nine kernel actors fold into ONE
+// row ("9 actors running", a chevron, collapsed by default); the own-git lines fold into ONE row (queue / landed /
+// unpushed). When no lane or pane runs, one NOTHING RUNNING row says so.
+
+pub const LVR_WAITING : u32 = 0;
+pub const LVR_NOTE : u32 = 1;
+pub const LVR_SCRIPT : u32 = 2;
+pub const LVR_PANE : u32 = 3;
+pub const LVR_OTHER : u32 = 4;
+pub const LVR_QUEEN : u32 = 5;
+pub const LVR_TRIGIT : u32 = 6;
+pub const LVR_KERNEL : u32 = 7;
+
+/// The rank of a row: lower is higher in the block.
+pub fn lv_rank(src: u32, state: u32) -> u32 {
+    if (src == LV_NOTE) { return LVR_NOTE; }
+    if (src == LV_QUEEN) { return LVR_QUEEN; }
+    if (src == LV_TRIGIT) { return LVR_TRIGIT; }
+    if (src == LV_KERNEL) { return LVR_KERNEL; }
+    if (state == LVS_BLOCKED) { return LVR_WAITING; }
+    if (src == LV_SCRIPT) {
+        if (state == LVS_RUNNING or state == LVS_STALLED) { return LVR_SCRIPT; }
+        return LVR_OTHER;
+    }
+    if (state == LVS_RUNNING) { return LVR_PANE; }
+    return LVR_OTHER;
+}
+
+/// Copy row `a` over row `b` (fields and bytes).
+fn lv_copy_row(tab: []u32, txt: []u8, a: u32, b: u32) -> void {
+    var f : usize = 0;
+    while (f < LV_F) {
+        tab[@as(usize, b) * LV_F + f] = tab[@as(usize, a) * LV_F + f];
+        f = f + 1;
+    }
+    var i : usize = 0;
+    while (i < LV_LINE) {
+        txt[@as(usize, b) * LV_LINE + i] = txt[@as(usize, a) * LV_LINE + i];
+        i = i + 1;
+    }
+}
+
+fn lv_rank_of_row(tab: []const u32, i: u32) -> u32 {
+    return lv_rank(tab[@as(usize, i) * LV_F + LVF_SRC], tab[@as(usize, i) * LV_F + LVF_STATE]);
+}
+
+/// Stable insertion sort by lv_rank; the row at slot n is scratch space (n < LV_MAX).
+pub fn lv_sort(tab: []u32, txt: []u8, n: u32) -> void {
+    if (n < 2 or n >= LV_MAX) { return; }
+    var i : u32 = 1;
+    while (i < n) {
+        lv_copy_row(tab, txt, i, n);
+        const rk : u32 = lv_rank_of_row(tab, n);
+        var j : u32 = i;
+        while (j > 0 and lv_rank_of_row(tab, j - 1) > rk) {
+            lv_copy_row(tab, txt, j - 1, j);
+            j = j - 1;
+        }
+        lv_copy_row(tab, txt, n, j);
+        i = i + 1;
+    }
+}
+
+/// Count the lane and pane rows (not the Queen, trigit or kernel) in `state`.
+pub fn lv_work_count(tab: []const u32, n: u32, state: u32) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        const src : u32 = tab[@as(usize, i) * LV_F + LVF_SRC];
+        if ((src == LV_PANE or src == LV_SCRIPT) and tab[@as(usize, i) * LV_F + LVF_STATE] == state) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The Queen's row: what her lanes are doing, in numbers (running / idle / blocked / review). She is RUNNING while
+/// GOD MODE is on, IDLE while it is off. `review` = own-git lines ready to go forward.
+pub fn lv_queen_counts_row(tab: []u32, txt: []u8, n: u32, running: u32, idle: u32, blocked: u32, review: u32, god: bool) -> u32 {
+    var ln : [80]u8 = undefined;
+    var w : usize = 0;
+    w = lv_put_str(ln[0..80], w, "running ");
+    w = lv_put_num(ln[0..80], w, running);
+    w = lv_put_str(ln[0..80], w, "  idle ");
+    w = lv_put_num(ln[0..80], w, idle);
+    w = lv_put_str(ln[0..80], w, "  blocked ");
+    w = lv_put_num(ln[0..80], w, blocked);
+    w = lv_put_str(ln[0..80], w, "  review ");
+    w = lv_put_num(ln[0..80], w, review);
+    var st : u32 = LVS_IDLE;
+    if (god) { st = LVS_RUNNING; }
+    return lv_add(tab, txt, n, LV_QUEEN, 0, LVM_UNKNOWN, L_NONE, st, LV_NOT_MEASURED, 0, ln[0..w]);
+}
+
+/// The empty state: one row when no lane or pane runs or waits.
+pub fn lv_note_row(tab: []u32, txt: []u8, n: u32) -> u32 {
+    return lv_add(tab, txt, n, LV_NOTE, 0, LVM_UNKNOWN, L_NONE, LVS_IDLE, LV_NOT_MEASURED, 0, "no lane or pane is working");
+}
+
+/// Does the own-git flag word show something not pushed? The five flags are p (pushed) or . / - (not).
+fn lv_unpushed(txt: []const u8, base: usize, len: usize) -> bool {
+    var i : usize = 0;
+    while (i < len and txt[base + i] != 32) { i = i + 1; }
+    i = i + 1;
+    while (i < len and txt[base + i] != 32) {
+        if (txt[base + i] != 112) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Fold every own-git row into one: "queue Q  landed L  unpushed U". Its state is BLOCKED when a line is broken,
+/// else READY when one waits to go forward, else DONE. Returns the new row count.
+pub fn lv_fold_trigit(tab: []u32, txt: []u8, n: u32) -> u32 {
+    var queue : u32 = 0;
+    var landed : u32 = 0;
+    var unpushed : u32 = 0;
+    var broken : bool = false;
+    var w : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        const r : usize = @as(usize, i) * LV_F;
+        if (tab[r + LVF_SRC] == LV_TRIGIT) {
+            const st : u32 = tab[r + LVF_STATE];
+            if (st == LVS_READY) { queue = queue + 1; }
+            if (st == LVS_DONE) { landed = landed + 1; }
+            if (st == LVS_BLOCKED) { broken = true; }
+            if (lv_unpushed(txt, @as(usize, i) * LV_LINE + 0, @as(usize, tab[r + LVF_TLEN]))) {
+                unpushed = unpushed + 1;
+            }
+        } else {
+            if (w != i) { lv_copy_row(tab, txt, i, w); }
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    if (w == n) { return n; }
+    var ln : [80]u8 = undefined;
+    var k : usize = 0;
+    k = lv_put_str(ln[0..80], k, "queue ");
+    k = lv_put_num(ln[0..80], k, queue);
+    k = lv_put_str(ln[0..80], k, "  landed ");
+    k = lv_put_num(ln[0..80], k, landed);
+    k = lv_put_str(ln[0..80], k, "  unpushed ");
+    k = lv_put_num(ln[0..80], k, unpushed);
+    var st2 : u32 = LVS_DONE;
+    if (broken) { st2 = LVS_BLOCKED; } else if (queue > 0) { st2 = LVS_READY; }
+    return lv_add(tab, txt, w, LV_TRIGIT, 0, LVM_UNKNOWN, L_NONE, st2, LV_NOT_MEASURED, 0, ln[0..k]);
+}
+
+/// Is row i the kernel group header?
+pub fn lv_is_group(tab: []const u32, i: u32) -> bool {
+    const r : usize = @as(usize, i) * LV_F;
+    return tab[r + LVF_SRC] == LV_KERNEL and tab[r + LVF_DEPTH] == LV_GROUP_DEPTH;
+}
+
+/// Fold the kernel tree (the trailing KERNEL rows) under one group row "N actors running". Collapsed: the group
+/// row replaces them. Expanded: the group row sits above them. Returns the new row count.
+pub fn lv_fold_kernel(tab: []u32, txt: []u8, n: u32, expanded: bool) -> u32 {
+    var k0 : u32 = n;
+    while (k0 > 0 and tab[@as(usize, k0 - 1) * LV_F + LVF_SRC] == LV_KERNEL) { k0 = k0 - 1; }
+    const kc : u32 = n - k0;
+    if (kc == 0) { return n; }
+    var running : u32 = 0;
+    var j : u32 = k0;
+    while (j < n) {
+        if (tab[@as(usize, j) * LV_F + LVF_STATE] == LVS_RUNNING) { running = running + 1; }
+        j = j + 1;
+    }
+    var ln : [80]u8 = undefined;
+    var k : usize = 0;
+    k = lv_put_num(ln[0..80], k, running);
+    k = lv_put_str(ln[0..80], k, " actors running");
+    if (running < kc) {
+        k = lv_put_str(ln[0..80], k, ", ");
+        k = lv_put_num(ln[0..80], k, kc - running);
+        k = lv_put_str(ln[0..80], k, " not");
+    }
+    var st : u32 = LVS_RUNNING;
+    if (running < kc) { st = LVS_BLOCKED; }
+    if (expanded and n < LV_MAX) {
+        var m : u32 = n;
+        while (m > k0) {
+            lv_copy_row(tab, txt, m - 1, m);
+            m = m - 1;
+        }
+        return lv_add(tab, txt, k0, LV_KERNEL, 0, LVM_UNKNOWN, L_NONE, st, LV_NOT_MEASURED, LV_GROUP_DEPTH, ln[0..k]) + kc;
+    }
+    return lv_add(tab, txt, k0, LV_KERNEL, 0, LVM_UNKNOWN, L_NONE, st, LV_NOT_MEASURED, LV_GROUP_DEPTH, ln[0..k]);
+}
+
+// ---- the log view: a lane's log opens as its own view that replaces the terminal area ----
+// State: the selected row (LV_NONE = closed) and a scroll offset in lines up from the bottom. Events: a row click
+// opens it, the close x, the "back to chat" crumb and Escape close it, the wheel scrolls it. The view has its own
+// header (LV_LOG_HEAD_H) and never shares the area with the terminal.
+
+pub const LV_LOG_HEAD_H : f64 = 40.0;
+pub const LV_LOG_PAD : f64 = 16.0;
+pub const LV_LOG_X_W : f64 = 28.0;
+pub const LV_LOG_CRUMB_W : f64 = 112.0;
+pub const LV_LOG_LINE_H : f64 = 15.0;
+
+pub const LVH_NONE : u32 = 0;
+pub const LVH_CLOSE : u32 = 1;
+pub const LVH_CRUMB : u32 = 2;
+pub const LVH_BODY : u32 = 3;
+
+pub const LVE_OPEN : u32 = 0;
+pub const LVE_CLOSE : u32 = 1;
+pub const LVE_CRUMB : u32 = 2;
+pub const LVE_ESC : u32 = 3;
+pub const LVE_PANE_CHANGED : u32 = 4;
+
+/// The next selection: LVE_OPEN selects `row`; every closing event clears it; a closed view stays closed.
+pub fn lv_log_event(sel: u32, ev: u32, row: u32) -> u32 {
+    if (ev == LVE_OPEN) { return row; }
+    return LV_NONE;
+}
+
+pub fn lv_log_open(sel: u32) -> bool { return sel != LV_NONE; }
+
+/// What a point is on in the log view whose area starts at (ox, oy) and is pw wide.
+pub fn lv_log_hit(mx: f64, my: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> u32 {
+    if (mx < ox or mx >= ox + pw or my < oy or my >= oy + ph) { return LVH_NONE; }
+    if (my < oy + LV_LOG_HEAD_H) {
+        if (mx >= ox + pw - LV_LOG_PAD - LV_LOG_X_W) { return LVH_CLOSE; }
+        if (mx < ox + LV_LOG_PAD + LV_LOG_CRUMB_W) { return LVH_CRUMB; }
+        return LVH_NONE;
+    }
+    return LVH_BODY;
+}
+
+/// Lines that fit under the header of an area ph high.
+pub fn lv_log_vis(ph: f64) -> u32 {
+    if (ph <= LV_LOG_HEAD_H + 2.0 * LV_LOG_PAD) { return 0; }
+    return @as(u32, @intFromFloat((ph - LV_LOG_HEAD_H - 2.0 * LV_LOG_PAD) / LV_LOG_LINE_H));
+}
+
+/// Scroll offset (lines up from the bottom) after moving `k` lines, up or down, clamped to the log.
+pub fn lv_log_scroll(off: u32, up: bool, k: u32, n: u32, vis: u32) -> u32 {
+    const mx : u32 = lv_scroll_max(n, vis);
+    if (up) {
+        if (off + k > mx) { return mx; }
+        return off + k;
+    }
+    if (k > off) { return 0; }
+    return off - k;
+}
+
+/// Index of the first line shown: the bottom of the log when off is 0.
+pub fn lv_log_first(n: u32, vis: u32, off: u32) -> u32 {
+    if (n <= vis) { return 0; }
+    const o : u32 = lv_scroll_clamp(off, n, vis);
+    return n - vis - o;
+}
+
+/// The title: "<KIND> <name> -- log" where the name is #issue, or the row's own text for a row with no issue.
+pub fn lv_log_title(tab: []const u32, txt: []const u8, i: u32, out: []u8) -> usize {
+    const r : usize = @as(usize, i) * LV_F;
+    var p : usize = lv_put_str(out, 0, LV_SRC_NAMES[tab[r + LVF_SRC]]);
+    p = lv_put(out, p, 32);
+    if (tab[r + LVF_ISSUE] > 0) {
+        p = lv_put(out, p, 35);
+        p = lv_put_num(out, p, tab[r + LVF_ISSUE]);
+    } else {
+        p = lv_copy(out, p, lv_row_text(txt, tab, i));
+    }
+    return lv_put_str(out, p, " -- log");
+}
+
+/// The model an agent's pane runs on by default (owner, 2026-10-20: panes default to the free z.ai GLM flash); LVM_UNKNOWN
+/// for an agent whose model this window does not know. Index = agents.t27 AGENT_NAMES order (0 = Claude Code).
+pub fn lv_agent_model(agent: u32) -> u32 {
+    if (agent == 0) { return LVM_GLM_FLASH; }
+    return LVM_UNKNOWN;
+}
+
+/// The word shown for a model on an agent row ("" when unknown).
+pub fn lv_model_word(model: u32) -> string {
+    if (model == LVM_UNKNOWN or model >= LVM_COUNT) { return ""; }
+    return LVM_NAMES[model];
+}
+
 // ---- tests ----
 
 test an_issue_is_the_last_run_of_digits {
@@ -757,7 +1046,7 @@ pub fn lv_line2(tab: []const u32, txt: []const u8, i: u32, out: []u8) -> usize {
     const r : usize = @as(usize, i) * LV_F;
     var p : usize = 0;
     var d : u32 = 0;
-    while (tab[r + LVF_SRC] == LV_KERNEL and d < tab[r + LVF_DEPTH] and d < 4) {
+    while (tab[r + LVF_SRC] == LV_KERNEL and d < tab[r + LVF_DEPTH] and d < 4 and tab[r + LVF_DEPTH] < LV_GROUP_DEPTH) {
         p = lv_put(out, p, 32);
         p = lv_put(out, p, 32);
         d = d + 1;
@@ -808,4 +1097,173 @@ test kernel_nodes_are_indented_by_depth_and_show_no_time {
     const k : usize = lv_line2(tab[0..512], txt[0..5120], 4, o[0..120]);
     assert n == 10 and o[0] == 32 and o[5] == 32 and o[6] == 80;
     assert lv_has(o[0..k], "pty link");
+}
+
+test rows_are_ordered_by_importance {
+    assert lv_rank(LV_SCRIPT, LVS_BLOCKED) == LVR_WAITING and lv_rank(LV_PANE, LVS_BLOCKED) == LVR_WAITING;
+    assert lv_rank(LV_SCRIPT, LVS_RUNNING) < lv_rank(LV_PANE, LVS_RUNNING);
+    assert lv_rank(LV_PANE, LVS_RUNNING) < lv_rank(LV_QUEEN, LVS_RUNNING);
+    assert lv_rank(LV_QUEEN, LVS_IDLE) < lv_rank(LV_TRIGIT, LVS_DONE);
+    assert lv_rank(LV_TRIGIT, LVS_BLOCKED) < lv_rank(LV_KERNEL, LVS_RUNNING);
+    assert lv_rank(LV_PANE, LVS_IDLE) < lv_rank(LV_QUEEN, LVS_IDLE);
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    var n : u32 = 0;
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_KERNEL, 0, 0, L_NONE, LVS_RUNNING, 0, 1, "ROOT");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_QUEEN, 0, 0, L_NONE, LVS_IDLE, 0, 0, "q");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_PANE, 0, 0, L_NONE, LVS_RUNNING, 0, 0, "pane run");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_SCRIPT, 11, 0, L_NONE, LVS_RUNNING, 0, 0, "script run");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_SCRIPT, 12, 0, L_NONE, LVS_BLOCKED, 0, 0, "script wait");
+    lv_sort(tab[0..576], txt[0..5200], n);
+    assert lv_row_text(txt[0..5200], tab[0..576], 0) == "script wait";
+    assert lv_row_text(txt[0..5200], tab[0..576], 1) == "script run";
+    assert lv_row_text(txt[0..5200], tab[0..576], 2) == "pane run";
+    assert lv_row_text(txt[0..5200], tab[0..576], 3) == "q";
+    assert lv_row_text(txt[0..5200], tab[0..576], 4) == "ROOT";
+    assert tab[LVF_ISSUE] == 12 and tab[LV_F + LVF_ISSUE] == 11;
+}
+
+test the_sort_is_stable_for_equal_ranks {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    var n : u32 = 0;
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_SCRIPT, 1, 0, L_NONE, LVS_RUNNING, 0, 0, "a");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_SCRIPT, 2, 0, L_NONE, LVS_RUNNING, 0, 0, "b");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_SCRIPT, 3, 0, L_NONE, LVS_RUNNING, 0, 0, "c");
+    lv_sort(tab[0..576], txt[0..5200], n);
+    assert tab[LVF_ISSUE] == 1 and tab[LV_F + LVF_ISSUE] == 2 and tab[2 * LV_F + LVF_ISSUE] == 3;
+}
+
+test nine_kernel_actors_fold_into_one_row_collapsed_by_default {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    var ls : [1]u32 = undefined;
+    ls[0] = LVS_RUNNING;
+    var n : u32 = lv_pane_row(tab[0..576], txt[0..5200], 0, "Claude Code", 0, 0, S_WORKING, false, 1, 5);
+    n = lv_kernel_rows(tab[0..576], txt[0..5200], n, 1, ls[0..1]);
+    assert n == 11;
+    const m : u32 = lv_fold_kernel(tab[0..576], txt[0..5200], n, false);
+    assert m == 2;
+    assert lv_is_group(tab[0..576], 1) and lv_is_group(tab[0..576], 0) == false;
+    assert lv_row_text(txt[0..5200], tab[0..576], 1) == "10 actors running";
+    // expanded: the group row, then all ten nodes
+    const e : u32 = lv_fold_kernel(tab[0..576], txt[0..5200], lv_kernel_rows(tab[0..576], txt[0..5200], 1, 1, ls[0..1]) - 0 - 0, true);
+    assert e == 12;
+    assert lv_is_group(tab[0..576], 1);
+    assert lv_row_text(txt[0..5200], tab[0..576], 2) == "ROOT";
+    // no kernel rows: nothing to fold
+    assert lv_fold_kernel(tab[0..576], txt[0..5200], 1, false) == 1;
+}
+
+test a_group_row_that_has_a_stopped_actor_says_so {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    var ls : [1]u32 = undefined;
+    ls[0] = LVS_BLOCKED;
+    var n : u32 = lv_kernel_rows(tab[0..576], txt[0..5200], 0, 1, ls[0..1]);
+    n = lv_fold_kernel(tab[0..576], txt[0..5200], n, false);
+    assert n == 1 and tab[LVF_STATE] == LVS_BLOCKED;
+    assert lv_row_text(txt[0..5200], tab[0..576], 0) == "9 actors running, 1 not";
+    var o : [120]u8 = undefined;
+    const k : usize = lv_line2(tab[0..576], txt[0..5200], 0, o[0..120]);
+    assert o[0] == 57 and k == 23;
+}
+
+test own_git_lines_fold_into_queue_landed_unpushed {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    const feed : string = "T|claude/a-1|ppppp|CARRIED\nT|claude/b-2|pp-.p|FORWARD\nT|claude/c-3|.....|FORWARD\nL|lane-5|90|50|R|-|x\n";
+    var n : u32 = lv_parse(feed, 100, tab[0..576], txt[0..5200], 0);
+    assert n == 4;
+    n = lv_fold_trigit(tab[0..576], txt[0..5200], n);
+    assert n == 2;
+    assert tab[LVF_SRC] == LV_SCRIPT and tab[LV_F + LVF_SRC] == LV_TRIGIT;
+    assert lv_row_text(txt[0..5200], tab[0..576], 1) == "queue 2  landed 1  unpushed 2";
+    assert tab[LV_F + LVF_STATE] == LVS_READY;
+    // no own-git line: unchanged, no empty row
+    assert lv_fold_trigit(tab[0..576], txt[0..5200], 1) == 1;
+}
+
+test the_queen_row_counts_what_runs_idles_blocks_and_waits_for_review {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    const n : u32 = lv_queen_counts_row(tab[0..576], txt[0..5200], 0, 3, 1, 2, 4, true);
+    assert n == 1 and tab[LVF_SRC] == LV_QUEEN and tab[LVF_STATE] == LVS_RUNNING;
+    assert lv_row_text(txt[0..5200], tab[0..576], 0) == "running 3  idle 1  blocked 2  review 4";
+    var t2 : [576]u32 = undefined;
+    var x2 : [5200]u8 = undefined;
+    var m : u32 = lv_add(t2[0..576], x2[0..5200], 0, LV_SCRIPT, 1, 0, L_NONE, LVS_RUNNING, 0, 0, "a");
+    m = lv_add(t2[0..576], x2[0..5200], m, LV_SCRIPT, 2, 0, L_NONE, LVS_BLOCKED, 0, 0, "b");
+    m = lv_add(t2[0..576], x2[0..5200], m, LV_KERNEL, 0, 0, L_NONE, LVS_RUNNING, 0, 0, "ROOT");
+    assert lv_work_count(t2[0..576], m, LVS_RUNNING) == 1 and lv_work_count(t2[0..576], m, LVS_BLOCKED) == 1;
+}
+
+test nothing_running_gets_one_note_row {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    const n : u32 = lv_note_row(tab[0..576], txt[0..5200], 0);
+    assert n == 1 and tab[LVF_SRC] == LV_NOTE;
+    var o : [120]u8 = undefined;
+    const k : usize = lv_line1(tab[0..576], 0, o[0..120]);
+    assert lv_has(o[0..k], "nothing running");
+    assert lv_can_tail(LV_NOTE) == false;
+    assert lv_rank(LV_NOTE, LVS_IDLE) < lv_rank(LV_QUEEN, LVS_IDLE);
+}
+
+test the_log_view_state_machine_opens_and_closes {
+    var sel : u32 = LV_NONE;
+    assert lv_log_open(sel) == false;
+    sel = lv_log_event(sel, LVE_OPEN, 3);
+    assert sel == 3 and lv_log_open(sel);
+    assert lv_log_event(sel, LVE_ESC, 0) == LV_NONE;
+    assert lv_log_event(sel, LVE_CLOSE, 0) == LV_NONE;
+    assert lv_log_event(sel, LVE_CRUMB, 0) == LV_NONE;
+    assert lv_log_event(sel, LVE_PANE_CHANGED, 0) == LV_NONE;
+    // a closed view stays closed; opening another row replaces the first
+    assert lv_log_event(LV_NONE, LVE_ESC, 0) == LV_NONE;
+    assert lv_log_event(3, LVE_OPEN, 5) == 5;
+}
+
+test the_log_view_hit_test_has_a_close_a_crumb_and_a_body {
+    // the area starts at (240, 80) and is 700 x 400
+    assert lv_log_hit(930.0, 100.0, 240.0, 80.0, 700.0, 400.0) == LVH_CLOSE;
+    assert lv_log_hit(260.0, 100.0, 240.0, 80.0, 700.0, 400.0) == LVH_CRUMB;
+    assert lv_log_hit(500.0, 100.0, 240.0, 80.0, 700.0, 400.0) == LVH_NONE;
+    assert lv_log_hit(500.0, 200.0, 240.0, 80.0, 700.0, 400.0) == LVH_BODY;
+    assert lv_log_hit(100.0, 200.0, 240.0, 80.0, 700.0, 400.0) == LVH_NONE;
+    assert lv_log_hit(500.0, 500.0, 240.0, 80.0, 700.0, 400.0) == LVH_NONE;
+}
+
+test the_log_view_scrolls_by_lines_and_clamps {
+    // 400 high: 40 head, 32 pad, 328 / 15 = 21 lines
+    assert lv_log_vis(400.0) == 21 and lv_log_vis(60.0) == 0;
+    assert lv_log_first(40, 21, 0) == 19;
+    assert lv_log_first(40, 21, 5) == 14;
+    assert lv_log_first(10, 21, 3) == 0;
+    assert lv_log_scroll(0, true, 3, 40, 21) == 3;
+    assert lv_log_scroll(18, true, 5, 40, 21) == 19;
+    assert lv_log_scroll(2, false, 5, 40, 21) == 0;
+    assert lv_log_scroll(0, true, 5, 10, 21) == 0;
+}
+
+test the_log_title_names_the_kind_and_the_lane {
+    var tab : [576]u32 = undefined;
+    var txt : [5200]u8 = undefined;
+    var n : u32 = lv_add(tab[0..576], txt[0..5200], 0, LV_SCRIPT, 11367, 0, L_NONE, LVS_RUNNING, 0, 0, "x");
+    n = lv_add(tab[0..576], txt[0..5200], n, LV_KERNEL, 0, 0, L_NONE, LVS_RUNNING, 0, 1, "ROOT");
+    var o : [64]u8 = undefined;
+    var k : usize = lv_log_title(tab[0..576], txt[0..5200], 0, o[0..64]);
+    assert k == 20 and lv_has(o[0..k], "script #11367 -- log");
+    k = lv_log_title(tab[0..576], txt[0..5200], 1, o[0..64]);
+    assert lv_has(o[0..k], "kernel root -- log");
+}
+
+test an_agent_row_names_its_model_and_has_a_key_light {
+    assert lv_agent_model(0) == LVM_GLM_FLASH;
+    assert lv_agent_model(1) == LVM_UNKNOWN;
+    assert lv_model_word(lv_agent_model(0)) == "GLM FLASH";
+    assert lv_model_word(LVM_UNKNOWN) == "";
+    // the free tier is yellow, an unknown model has no light
+    assert lv_light(lv_agent_model(0), false, 1) == L_YELLOW;
+    assert lv_light(lv_agent_model(1), false, 1) == L_NONE;
 }
