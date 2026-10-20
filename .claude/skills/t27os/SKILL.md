@@ -113,6 +113,23 @@ What each console needs. "Source" = where its live data comes from today; "gap" 
 | 26 | Z Zero-Touch UX / Docs | t27u university: 7 course maps, lessons, blog | open lesson | courses.t27 (trinity) |
 | 27 | Ti Security / Reserve | secrets scan, key rotation, identity | rotate key | gitleaks, keys.t27 |
 
+## One registry per letter (owner, 2026-10-20)
+
+Each of the 27 letters gathers, with no copy of any list: its TOOL t27<letter> (t27a assembler,
+t27b native compiler, t27c compiler, t27f FRONTEND, t27o converter, t27t trainer, t27u university;
+other letters: inventory pending), its agent (specs/agents), its specs (domain_pulse letter_of_path),
+its widgets and app surfaces with owner + feeders (agent_parts), its tri commands and MCP tools
+(the agent's TOOLS field; cards in specs/tools/tri (53), specs/tools/mcp (11), specs/t27mcp
+tool_schema (20 t27_/t27f_ tools)), and its skills (the agent's SKILLS field; specs/skills,
+.claude/skills). The registry is an extension of agent_parts.t27, not a new spec.
+On screen: a console's command strip runs its tri commands and MCP tools in a PTY pane inside the
+window (output kept in the console log, numbers flow into instruments labelled measured + command);
+skills are playbook buttons that start an agent in the C chat with that skill; the commander on C
+(Cmd+K) is a palette of every command and tool with its agent badge; empty letters show their gap.
+Open question for the owner: where a tool letter and an alphabet agent disagree (A assembler vs
+Architecture, B native compiler vs Build, F frontend vs Formal Conformance, T trainer vs Queen,
+U university vs Universe), the default is that the tool decides the letter.
+
 ## Plan (open items, 2026-10-20)
 
 1. Cockpit dashboard in the home tabs: nested widget tree, agent consoles, card.png instruments,
