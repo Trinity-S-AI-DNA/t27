@@ -340,8 +340,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
     let root = repo_root()?;
     let dir = root.join(".trinity/seals");
     if !dir.is_dir() {
-        // Not "zero twins". There is no seal directory here, which is a
-        // different world from a directory with nothing wrong in it.
+        // Not "zero twins": no seal directory is not a directory with nothing wrong in it.
         anyhow::bail!(
             "no seal directory at {} -- nothing was read, so nothing is claimed",
             dir.display()
