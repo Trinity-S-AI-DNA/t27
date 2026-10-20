@@ -1,0 +1,899 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/share.t27 -- share any session, document or "finish this task" through the TRI CLAW GitHub App, and
+; the sign-in that starts the game.
+; Owner, 2026-10-20: "we can SHARE any session or document, or share 'finish this task' in Claude Code; login goes
+; through the GitHub App -- signing in starts the game, connecting TRI CLAW." Closes #11275. ASCII only (L3), English.
+; Decisions only; the host (glass_window, pty server) moves bytes, calls GitHub and the Keychain. Nothing here reads a
+; secret, and no test holds a real one (fake secrets are built at run time from a prefix and filler bytes).
+; --
+; REUSE (no parallel spec):
+;   claw::github_surface   every GitHub write a share makes names a ROW of that table and mints only that row's narrow
+;                          token (APP_ID 5166765, 'tri-claw'): TASK new issue = findings-issues (issues write); TASK
+;                          comment and SESSION comment = control-comments (issues write); TASK branch ref = autofix-commit
+;                          (contents write); DOCUMENT permalink = spec-read (contents read). A gist is NOT an App surface
+;                          (an installation token cannot create one), so SESSION goes out as an issue comment.
+;   t27os::session_store   sid_ok (the one id charset), put_bytes. A pane's sid, cwd and model come from its .rec file.
+;   t27os::kanban          COL_TODO: a received TASK lands there.
+;   t27os::evolve          PTY_CAP, F_ALL. The share class F_SHARE (32) is added HERE by a use-level predicate,
+;                          evolve_forbids(): evolve.t27 is untouched. Its touches_forbidden(F_SHARE) stays false while
+;                          F_ALL is 31, so the host must call evolve_forbids() on the risk class before next_action; the
+;                          one-line durable fix (F_ALL = 63) is evolve's owner's, and a test pins this gap.
+;   t27os::keys_host       token storage is the Keychain via /usr/bin/security only; this spec only decides WHERE.
+;   Not found in the tree: a passport/game account spec for app.t27.ai (only hosting/topology.t27 names the host). The
+;   PASSPORT and PLAYING states are decisions about the server's answer; the server side is a gap (see the report).
+; LINK  https://app.t27.ai/s/<kind>/<id>   kind = session | doc | task, id = sid_ok characters (letters, digits, "-").
+; LOGIN  GitHub App device flow: POST github.com/login/device/code, user opens github.com/login/device and types the
+;   user code, POST github.com/login/oauth/access_token polled; then GET /user/installations decides whether the
+;   tri-claw App is installed; if not, a button opens github.com/apps/tri-claw/installations/new -- that IS 'connecting
+;   TRI CLAW'. Then the passport is found or created, then the first quest starts.
+
+module T27osShare;
+
+use claw::github_surface::row_of;
+use claw::github_surface::perm_of;
+use claw::github_surface::level_of;
+use claw::github_surface::L_READ;
+use claw::github_surface::L_WRITE;
+use claw::recipes::str_eq;
+use t27os::session_store::sid_ok;
+use t27os::kanban::COL_TODO;
+use t27os::evolve::F_ALL;
+use t27os::evolve::PTY_CAP;
+use t27os::evolve::touches_forbidden;
+
+// ---------------------------------------------------------------- 1. kinds, surfaces, link
+
+pub const K_SESSION : u32 = 0;
+pub const K_DOCUMENT : u32 = 1;
+pub const K_TASK : u32 = 2;
+pub const K_COUNT : u32 = 3;
+pub const K_BAD : u32 = 4294967295;
+
+pub const LINK_PREFIX : str = "https://app.t27.ai/s/";
+pub const ID_MAX : usize = 64;
+pub const EXCERPT_MAX : usize = 4000;
+
+/// The GitHub App surface (a row of claw::github_surface) a share of this kind writes through.
+/// existing: the TASK already has an issue (comment on it instead of opening one).
+pub fn surface_of(kind: u32, existing: bool) -> str {
+    if (kind == K_TASK) {
+        if (existing) { return "control-comments"; }
+        return "findings-issues";
+    }
+    if (kind == K_SESSION) { return "control-comments"; }
+    if (kind == K_DOCUMENT) { return "spec-read"; }
+    return "";
+}
+
+/// A TASK share also pushes its branch; that is the App's contents-write row.
+pub const BRANCH_SURFACE : str = "autofix-commit";
+
+/// An installation token cannot create a gist; SESSION goes out as an issue comment.
+pub fn gist_possible_with_app() -> bool {
+    return false;
+}
+
+/// The issue a new TASK share opens has exactly these four headings (the Queen's issue shape).
+pub const ISSUE_HEADINGS : str = "Goal,Boundary,Acceptance,State";
+
+pub fn kind_word(kind: u32) -> str {
+    if (kind == K_SESSION) { return "session"; }
+    if (kind == K_DOCUMENT) { return "doc"; }
+    if (kind == K_TASK) { return "task"; }
+    return "";
+}
+
+fn starts(s: []const u8, at: usize, lit: []const u8) -> bool {
+    if (lit.len == 0 or at + lit.len > s.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (s[at + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn put1(out: []u8, o: usize, c: u8) -> usize {
+    if (o < out.len) { out[o] = c; return o + 1; }
+    return o;
+}
+
+fn putn(out: []u8, o: usize, lit: []const u8) -> usize {
+    var p : usize = o;
+    var i : usize = 0;
+    while (i < lit.len) {
+        p = put1(out, p, lit[i]);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// Link ids are session_store's id charset, at most ID_MAX long: nothing a URL parser or a shell reads as more.
+pub fn id_ok(id: []const u8) -> bool {
+    return id.len <= ID_MAX and sid_ok(id);
+}
+
+/// Write the share link; returns its length, 0 when the kind or id is bad or out is too small.
+pub fn emit_link(kind: u32, id: []const u8, out: []u8) -> usize {
+    if (kind >= K_COUNT or !id_ok(id)) { return 0; }
+    const w : str = kind_word(kind);
+    const need : usize = LINK_PREFIX.len + w.len + 1 + id.len;
+    if (need > out.len) { return 0; }
+    var o : usize = putn(out, 0, LINK_PREFIX);
+    o = putn(out, o, w);
+    o = put1(out, o, 47);
+    o = putn(out, o, id);
+    return o;
+}
+
+/// Parse a share link into f = [kind, id_at, id_len]. Exact host, https only, no query, no fragment, no extra segment.
+pub fn parse_link(s: []const u8, f: []u64) -> bool {
+    if (!starts(s, 0, LINK_PREFIX)) { return false; }
+    var at : usize = LINK_PREFIX.len;
+    var k : u32 = 0;
+    while (k < K_COUNT) {
+        const w : str = kind_word(k);
+        if (starts(s, at, w) and at + w.len < s.len and s[at + w.len] == 47) {
+            const id_at : usize = at + w.len + 1;
+            const id_len : usize = s.len - id_at;
+            if (!id_ok(s[id_at..s.len])) { return false; }
+            f[0] = k;
+            f[1] = id_at;
+            f[2] = id_len;
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- 2. redaction
+
+pub const R_KEY : usize = 0;
+pub const R_ENV : usize = 1;
+pub const R_HOME : usize = 2;
+pub const R_EMAIL : usize = 3;
+pub const R_OVER : usize = 4;
+pub const R_KINDS : usize = 5;
+pub const RUN_MIN : usize = 32;
+pub const MARK : str = "[REDACTED]";
+pub const MARK_EMAIL : str = "[email]";
+
+/// Share sections. The keys.t27 profile (provider names, key counts, any key) is never a section of any share.
+pub const SEC_AGENT : u32 = 0;
+pub const SEC_MODEL : u32 = 1;
+pub const SEC_REPO : u32 = 2;
+pub const SEC_SID : u32 = 3;
+pub const SEC_EXCERPT : u32 = 4;
+pub const SEC_KEYS_PROFILE : u32 = 5;
+
+pub fn section_allowed(sec: u32) -> bool {
+    return sec < SEC_KEYS_PROFILE;
+}
+
+fn is_alnum(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 and c <= 57;
+}
+
+fn is_hex(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102);
+}
+
+fn is_space(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+fn upper(c: u8) -> u8 {
+    if (c >= 97 and c <= 122) { return c - 32; }
+    return c;
+}
+
+/// Length of a key-like token starting at i: a known vendor prefix plus at least 8 token characters, else 0.
+fn token_len(src: []const u8, i: usize) -> usize {
+    var pre : usize = 0;
+    if (starts(src, i, "sk-")) { pre = 3; }
+    if (starts(src, i, "ghp_") or starts(src, i, "gho_") or starts(src, i, "ghs_") or starts(src, i, "ghu_") or starts(src, i, "ghr_")) { pre = 4; }
+    if (starts(src, i, "github_pat_")) { pre = 11; }
+    if (starts(src, i, "xoxb-") or starts(src, i, "xoxp-")) { pre = 5; }
+    if (pre == 0) { return 0; }
+    var j : usize = i + pre;
+    while (j < src.len and (is_alnum(src[j]) or src[j] == 95 or src[j] == 45)) { j = j + 1; }
+    if (j - (i + pre) < 8) { return 0; }
+    return j - i;
+}
+
+/// A long base64-ish run (letters, digits, "+", then up to two "=") that has a digit. A bare 40- or 64-digit hex run is a
+/// git sha and is kept. Returns the length to drop, 0 to keep.
+fn run_len(src: []const u8, i: usize) -> usize {
+    var j : usize = i;
+    var digit : bool = false;
+    var hex : bool = true;
+    while (j < src.len and (is_alnum(src[j]) or src[j] == 43)) {
+        if (is_digit(src[j])) { digit = true; }
+        if (!is_hex(src[j])) { hex = false; }
+        j = j + 1;
+    }
+    const n : usize = j - i;
+    if (n < RUN_MIN or !digit) { return 0; }
+    if (hex and (n == 40 or n == 64)) { return 0; }
+    var pad : usize = 0;
+    while (pad < 2 and j < src.len and src[j] == 61) { j = j + 1; pad = pad + 1; }
+    return j - i;
+}
+
+/// "/Users/<name>" or "/home/<name>" at i: the length of that prefix (the name has at least one character), else 0.
+fn home_len(src: []const u8, i: usize) -> usize {
+    var pre : usize = 0;
+    if (starts(src, i, "/Users/")) { pre = 7; }
+    if (starts(src, i, "/home/")) { pre = 6; }
+    if (pre == 0) { return 0; }
+    var j : usize = i + pre;
+    while (j < src.len and src[j] != 47 and !is_space(src[j])) { j = j + 1; }
+    if (j == i + pre) { return 0; }
+    return j - i;
+}
+
+fn name_char(c: u8) -> bool {
+    return is_alnum(c) or c == 95;
+}
+
+fn contains_ci(name: []const u8, lit: []const u8) -> bool {
+    if (name.len < lit.len) { return false; }
+    var s : usize = 0;
+    while (s + lit.len <= name.len) {
+        var k : usize = 0;
+        while (k < lit.len and upper(name[s + k]) == lit[k]) { k = k + 1; }
+        if (k == lit.len) { return true; }
+        s = s + 1;
+    }
+    return false;
+}
+
+/// The name before the "=" at i (letters, digits, "_") names a secret: it contains KEY, TOKEN or SECRET in any case.
+fn secret_name_at(src: []const u8, i: usize) -> bool {
+    var j : usize = i;
+    while (j > 0 and name_char(src[j - 1])) { j = j - 1; }
+    const nm : []const u8 = src[j..i];
+    return contains_ci(nm, "KEY") or contains_ci(nm, "TOKEN") or contains_ci(nm, "SECRET");
+}
+
+fn local_char(c: u8) -> bool {
+    return is_alnum(c) or c == 46 or c == 95 or c == 37 or c == 43 or c == 45;
+}
+
+/// Write src to out with secrets removed; returns the bytes written. counts[R_*] says how many of each kind were
+/// removed (counts must hold R_KINDS). Rules: vendor-prefixed keys (sk-, ghp_ ... github_pat_ ..., xoxb-), long base64 runs,
+/// the value of NAME=value when NAME holds KEY/TOKEN/SECRET, "/Users/<n>" and "/home/<n>" -> "~", e-mail addresses
+/// (a bare "git@host" ssh remote is kept). R_OVER is 1 when out was too small and the tail was cut.
+pub fn redact(src: []const u8, out: []u8, counts: []u32) -> usize {
+    var k : usize = 0;
+    while (k < R_KINDS) { counts[k] = 0; k = k + 1; }
+    var i : usize = 0;
+    var o : usize = 0;
+    while (i < src.len) {
+        const c : u8 = src[i];
+        const edge : bool = i == 0 or !is_alnum(src[i - 1]);
+        if (edge) {
+            const tl : usize = token_len(src, i);
+            if (tl > 0) { o = putn(out, o, MARK); counts[R_KEY] = counts[R_KEY] + 1; i = i + tl; continue; }
+            const rl : usize = run_len(src, i);
+            if (rl > 0) { o = putn(out, o, MARK); counts[R_KEY] = counts[R_KEY] + 1; i = i + rl; continue; }
+            const hl : usize = home_len(src, i);
+            if (hl > 0) { o = put1(out, o, 126); counts[R_HOME] = counts[R_HOME] + 1; i = i + hl; continue; }
+        }
+        if (c == 61 and i + 1 < src.len and !is_space(src[i + 1]) and secret_name_at(src, i)) {
+            var j : usize = i + 1;
+            const q : u8 = src[j];
+            if (q == 34 or q == 39) {
+                j = j + 1;
+                while (j < src.len and src[j] != q) { j = j + 1; }
+                if (j < src.len) { j = j + 1; }
+            } else {
+                while (j < src.len and !is_space(src[j])) { j = j + 1; }
+            }
+            o = put1(out, o, 61);
+            o = putn(out, o, MARK);
+            counts[R_ENV] = counts[R_ENV] + 1;
+            i = j;
+            continue;
+        }
+        if (c == 64 and o > 0 and i + 1 < src.len and is_alnum(src[i + 1])) {
+            var p : usize = o;
+            while (p > 0 and local_char(out[p - 1])) { p = p - 1; }
+            var q2 : usize = i + 1;
+            var dot : bool = false;
+            while (q2 < src.len and (is_alnum(src[q2]) or src[q2] == 45 or src[q2] == 46)) {
+                if (src[q2] == 46) { dot = true; }
+                q2 = q2 + 1;
+            }
+            while (q2 > i + 1 and src[q2 - 1] == 46) { q2 = q2 - 1; }
+            const git : bool = o - p == 3 and out[p] == 103 and out[p + 1] == 105 and out[p + 2] == 116;
+            if (o > p and dot and q2 - (i + 1) >= 4 and !git) {
+                o = putn(out, p, MARK_EMAIL);
+                counts[R_EMAIL] = counts[R_EMAIL] + 1;
+                i = q2;
+                continue;
+            }
+        }
+        o = put1(out, o, c);
+        i = i + 1;
+    }
+    if (o >= out.len and i >= src.len and out.len > 0 and src.len > out.len) { counts[R_OVER] = 1; }
+    return o;
+}
+
+pub fn redacted_total(counts: []const u32) -> u32 {
+    return counts[R_KEY] + counts[R_ENV] + counts[R_HOME] + counts[R_EMAIL];
+}
+
+/// The counted note a share shows when redaction removed anything; 0 bytes when nothing was removed.
+pub fn note_text(counts: []const u32, out: []u8) -> usize {
+    const n : u32 = redacted_total(counts);
+    if (n == 0) { return 0; }
+    var o : usize = putn(out, 0, "redacted ");
+    o = put_dec_local(out, o, n);
+    return putn(out, o, " item(s) before sharing");
+}
+
+fn put_dec_local(out: []u8, at: usize, v: u32) -> usize {
+    var digits : u32 = 1;
+    var t : u32 = v;
+    while (t >= 10) { t = t / 10; digits = digits + 1; }
+    var x : u32 = v;
+    var i : u32 = digits;
+    while (i > 0) {
+        out[at + i - 1] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        i = i - 1;
+    }
+    return at + digits;
+}
+
+// ---------------------------------------------------------------- 3. consent
+
+pub const F_SHARE : u32 = 32;
+
+pub const V_PRIVATE : u32 = 0;
+pub const V_PUBLIC : u32 = 1;
+pub const V_UNKNOWN : u32 = 2;
+
+pub const G_OK : u32 = 0;
+pub const G_NEED_CLICK : u32 = 1;
+pub const G_NEED_PREVIEW : u32 = 2;
+pub const G_NEED_PUBLIC_OK : u32 = 3;
+pub const G_NEED_NOTE_SEEN : u32 = 4;
+pub const G_NEED_LOGIN : u32 = 5;
+
+/// GOD MODE may prepare a TASK share (a draft in the panel) and nothing else.
+pub fn god_may_prepare(kind: u32) -> bool {
+    return kind == K_TASK;
+}
+
+/// GOD MODE never sends a share: sending is the user's click.
+pub fn god_may_send() -> bool {
+    return false;
+}
+
+/// The evolve rule's forbidden check plus the share class. evolve::F_ALL is 31, so evolve's own touches_forbidden() does
+/// not know F_SHARE; the host calls this one on the risk class and turns a hit into an OWNER REQUEST.
+pub fn evolve_forbids(classes: u32) -> bool {
+    return touches_forbidden(classes) or (classes & F_SHARE) != 0;
+}
+
+/// May the share go out? Gates in order. user_click: the user pressed the Share button widget (GOD MODE and loops pass
+/// false). preview: the target repo and its visibility were shown. vis: V_*; unknown counts as public. public_ok: the
+/// user confirmed a public target. redacted/note_seen: a redacted share needs its counted note seen. signed_in: login
+/// state may_share().
+pub fn send_gate(signed_in: bool, user_click: bool, preview: bool, vis: u32, public_ok: bool, redacted: u32, note_seen: bool) -> u32 {
+    if (!user_click) { return G_NEED_CLICK; }
+    if (!signed_in) { return G_NEED_LOGIN; }
+    if (!preview) { return G_NEED_PREVIEW; }
+    if (vis != V_PRIVATE and !public_ok) { return G_NEED_PUBLIC_OK; }
+    if (redacted > 0 and !note_seen) { return G_NEED_NOTE_SEEN; }
+    return G_OK;
+}
+
+// ---------------------------------------------------------------- 4. login = start the game
+
+pub const L_OUT : u32 = 0;
+pub const L_REQUESTING : u32 = 1;
+pub const L_CODE_SHOWN : u32 = 2;
+pub const L_AUTHORIZED : u32 = 3;
+pub const L_NEED_INSTALL : u32 = 4;
+pub const L_CONNECTED : u32 = 5;
+pub const L_PASSPORT : u32 = 6;
+pub const L_PLAYING : u32 = 7;
+pub const L_EXPIRED : u32 = 8;
+pub const L_DENIED : u32 = 9;
+pub const L_FAILED : u32 = 10;
+
+pub const E_START : u32 = 0;
+pub const E_CODE_OK : u32 = 1;
+pub const E_CODE_FAIL : u32 = 2;
+pub const E_PENDING : u32 = 3;
+pub const E_SLOW : u32 = 4;
+pub const E_TOKEN_STORED : u32 = 5;
+pub const E_TOKEN_REFUSED : u32 = 6;
+pub const E_EXPIRED : u32 = 7;
+pub const E_DENIED : u32 = 8;
+pub const E_APP_FOUND : u32 = 9;
+pub const E_APP_MISSING : u32 = 10;
+pub const E_PASSPORT_OK : u32 = 11;
+pub const E_PASSPORT_FAIL : u32 = 12;
+pub const E_QUEST_STARTED : u32 = 13;
+pub const E_SIGN_OUT : u32 = 14;
+
+/// GitHub's device-flow code lives 900 s; poll every 5 s, +5 s for each slow_down answer.
+pub const DEVICE_EXPIRES_S : u32 = 900;
+pub const POLL_BASE_S : u32 = 5;
+pub const POLL_SLOW_ADD : u32 = 5;
+pub const APP_SLUG : str = "tri-claw";
+pub const INSTALL_URL : str = "https://github.com/apps/tri-claw/installations/new";
+pub const DEVICE_URL : str = "https://github.com/login/device";
+
+/// The one transition table. An event that makes no sense in a state leaves it unchanged.
+pub fn step(state: u32, ev: u32) -> u32 {
+    if (ev == E_SIGN_OUT) { return L_OUT; }
+    if (ev == E_START and (state == L_OUT or state == L_EXPIRED or state == L_DENIED or state == L_FAILED)) { return L_REQUESTING; }
+    if (state == L_REQUESTING) {
+        if (ev == E_CODE_OK) { return L_CODE_SHOWN; }
+        if (ev == E_CODE_FAIL) { return L_FAILED; }
+    }
+    if (state == L_CODE_SHOWN) {
+        if (ev == E_TOKEN_STORED) { return L_AUTHORIZED; }
+        if (ev == E_TOKEN_REFUSED) { return L_FAILED; }
+        if (ev == E_EXPIRED) { return L_EXPIRED; }
+        if (ev == E_DENIED) { return L_DENIED; }
+    }
+    if (state == L_AUTHORIZED or state == L_NEED_INSTALL) {
+        if (ev == E_APP_FOUND) { return L_CONNECTED; }
+        if (ev == E_APP_MISSING) { return L_NEED_INSTALL; }
+    }
+    if (state == L_CONNECTED) {
+        if (ev == E_PASSPORT_OK) { return L_PASSPORT; }
+        if (ev == E_PASSPORT_FAIL) { return L_FAILED; }
+    }
+    if (state == L_PASSPORT and ev == E_QUEST_STARTED) { return L_PLAYING; }
+    return state;
+}
+
+pub fn shows_user_code(state: u32) -> bool {
+    return state == L_CODE_SHOWN;
+}
+
+pub fn shows_install_button(state: u32) -> bool {
+    return state == L_NEED_INSTALL;
+}
+
+/// TRI CLAW is connected once the App is installed on the user's account.
+pub fn connected(state: u32) -> bool {
+    return state == L_CONNECTED or state == L_PASSPORT or state == L_PLAYING;
+}
+
+pub fn game_started(state: u32) -> bool {
+    return state == L_PLAYING;
+}
+
+/// Sending a share needs the App token, so it needs a connected TRI CLAW.
+pub fn may_share(state: u32) -> bool {
+    return connected(state);
+}
+
+pub fn code_expired(now: u32, issued: u32, expires_in: u32) -> bool {
+    return now >= issued + expires_in;
+}
+
+pub fn next_poll_s(slow_downs: u32) -> u32 {
+    return POLL_BASE_S + POLL_SLOW_ADD * slow_downs;
+}
+
+pub const A_PENDING : u32 = 0;
+pub const A_SLOW : u32 = 1;
+pub const A_GRANTED : u32 = 2;
+pub const A_EXPIRED : u32 = 3;
+pub const A_DENIED : u32 = 4;
+pub const A_OTHER : u32 = 5;
+
+/// The event for one poll answer. The clock wins: past the code's life every answer is an expiry.
+pub fn poll_event(now: u32, issued: u32, expires_in: u32, answer: u32, stored: bool) -> u32 {
+    if (code_expired(now, issued, expires_in)) { return E_EXPIRED; }
+    if (answer == A_GRANTED) {
+        if (stored) { return E_TOKEN_STORED; }
+        return E_TOKEN_REFUSED;
+    }
+    if (answer == A_SLOW) { return E_SLOW; }
+    if (answer == A_PENDING) { return E_PENDING; }
+    if (answer == A_EXPIRED) { return E_EXPIRED; }
+    if (answer == A_DENIED) { return E_DENIED; }
+    return E_CODE_FAIL;
+}
+
+pub const W_KEYCHAIN : u32 = 0;
+pub const W_FILE : u32 = 1;
+pub const W_ENV : u32 = 2;
+pub const W_LINK : u32 = 3;
+pub const W_LOG : u32 = 4;
+
+/// Where a user token may live: the Keychain, nowhere else (written through keys_host's /usr/bin/security path).
+pub fn token_home_ok(w: u32) -> bool {
+    return w == W_KEYCHAIN;
+}
+
+// ---------------------------------------------------------------- 5. receive
+
+pub const RT_BAD_LINK : u32 = 0;
+pub const RT_LOGIN : u32 = 1;
+pub const RT_INSTALL : u32 = 2;
+pub const RT_KANBAN_TODO : u32 = 3;
+pub const RT_TRANSCRIPT_RO : u32 = 4;
+pub const RT_SPEC_PAGE : u32 = 5;
+
+/// Where an opened share link goes. A DOCUMENT is a public permalink and needs no login; TASK and SESSION read through
+/// the App, so they need a connected TRI CLAW (not signed in -> login, signed in without the App -> install).
+pub fn route(kind: u32, state: u32) -> u32 {
+    if (kind >= K_COUNT) { return RT_BAD_LINK; }
+    if (kind == K_DOCUMENT) { return RT_SPEC_PAGE; }
+    if (state == L_AUTHORIZED or state == L_NEED_INSTALL) { return RT_INSTALL; }
+    if (!connected(state)) { return RT_LOGIN; }
+    if (kind == K_TASK) { return RT_KANBAN_TODO; }
+    return RT_TRANSCRIPT_RO;
+}
+
+/// The kanban column a received TASK lands in.
+pub fn task_column() -> u32 {
+    return COL_TODO;
+}
+
+/// The received transcript is read-only; "resume a copy" starts a NEW session seeded with the redacted transcript and
+/// never resumes the sender's session id (it is not on this machine, and a foreign sid must not reach --resume).
+pub fn transcript_writable() -> bool {
+    return false;
+}
+
+pub fn resume_uses_sender_sid() -> bool {
+    return false;
+}
+
+/// "Continue in Claude Code": needs the branch to exist and a key from the key master (keys_host); the context
+/// reaches the agent as a file, never on the command line.
+pub fn continue_ok(has_branch: bool, key_present: bool) -> bool {
+    return has_branch and key_present;
+}
+
+/// The pane's command line: claude "$(cat ~/.t27os/shares/<id>.md)". Returns its length; 0 when the id is bad or the
+/// line would pass the pty server's cap.
+pub fn continue_line(id: []const u8, out: []u8) -> usize {
+    if (!id_ok(id)) { return 0; }
+    var o : usize = putn(out, 0, "claude \"$(cat ~/.t27os/shares/");
+    o = putn(out, o, id);
+    o = putn(out, o, ".md)\"");
+    if (o > PTY_CAP) { return 0; }
+    return o;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn rep(out: []u8, at: usize, c: u8, n: usize) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < n) { p = put1(out, p, c); i = i + 1; }
+    return p;
+}
+
+fn eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn run_redact(src: []const u8, out: []u8, counts: []u32) -> usize {
+    return redact(src, out, counts);
+}
+
+test every_share_kind_writes_through_a_row_of_the_app_table {
+    assert str_eq(surface_of(K_TASK, false), "findings-issues");
+    assert str_eq(surface_of(K_TASK, true), "control-comments");
+    assert str_eq(surface_of(K_SESSION, false), "control-comments");
+    assert str_eq(surface_of(K_DOCUMENT, false), "spec-read");
+    assert str_eq(surface_of(K_BAD, false), "");
+    // each named row exists and mints a narrow token: issues write, contents read, contents write for the branch
+    assert row_of("findings-issues") >= 0 and row_of("control-comments") >= 0 and row_of("spec-read") >= 0;
+    assert row_of(BRANCH_SURFACE) >= 0;
+    assert str_eq(perm_of("findings-issues", false), "issues") and level_of("findings-issues", false) == L_WRITE;
+    assert str_eq(perm_of("control-comments", false), "issues") and level_of("control-comments", false) == L_WRITE;
+    assert str_eq(perm_of("spec-read", false), "contents") and level_of("spec-read", false) == L_READ;
+    assert str_eq(perm_of(BRANCH_SURFACE, false), "contents") and level_of(BRANCH_SURFACE, false) == L_WRITE;
+    // a document share is read-only: it never asks for a write level
+    assert level_of(surface_of(K_DOCUMENT, false), false) == L_READ;
+    assert gist_possible_with_app() == false;
+    // negative control: a row that is not in the table is not a surface
+    assert row_of("gist-create") < 0;
+}
+
+test a_link_round_trips_for_every_kind {
+    var buf : [128]u8 = undefined;
+    var f : [3]u64 = undefined;
+    var k : u32 = 0;
+    while (k < K_COUNT) {
+        const n : usize = emit_link(k, "5f1c-9A-11275", buf[0..128]);
+        assert n > 0;
+        assert parse_link(buf[0..n], f[0..3]);
+        assert f[0] == k and f[2] == 13;
+        assert buf[f[1]] == 53 and buf[f[1] + f[2] - 1] == 53;
+        k = k + 1;
+    }
+    const n2 : usize = emit_link(K_TASK, "11275", buf[0..128]);
+    assert eq(buf[0..n2], "https://app.t27.ai/s/task/11275");
+    assert eq(buf[0..emit_link(K_SESSION, "ab-1", buf[0..128])], "https://app.t27.ai/s/session/ab-1");
+    assert eq(buf[0..emit_link(K_DOCUMENT, "9f8e7d6c", buf[0..128])], "https://app.t27.ai/s/doc/9f8e7d6c");
+}
+
+test a_bad_link_is_refused_and_a_bad_id_is_never_emitted {
+    var buf : [128]u8 = undefined;
+    var f : [3]u64 = undefined;
+    assert parse_link("https://app.t27.ai/s/task/11275", f[0..3]);
+    assert parse_link("http://app.t27.ai/s/task/11275", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai.evil.com/s/task/11275", f[0..3]) == false;
+    assert parse_link("https://evil.com/https://app.t27.ai/s/task/1", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task/", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/other/1", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task/11275/extra", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task/11275?x=1", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task/..", f[0..3]) == false;
+    assert parse_link("https://app.t27.ai/s/task/a b", f[0..3]) == false;
+    assert parse_link("", f[0..3]) == false;
+    assert emit_link(K_TASK, "", buf[0..128]) == 0;
+    assert emit_link(K_TASK, "a/b", buf[0..128]) == 0;
+    assert emit_link(K_TASK, "a;b", buf[0..128]) == 0;
+    assert emit_link(K_COUNT, "ok", buf[0..128]) == 0;
+    assert emit_link(K_TASK, "ok", buf[0..10]) == 0;
+}
+
+test key_like_strings_are_dropped_and_counted {
+    var src : [200]u8 = undefined;
+    var out : [200]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    // fake keys built at run time: a prefix and filler, never a real secret
+    var s : usize = putn(src[0..200], 0, "use ");
+    s = putn(src[0..200], s, "sk-");
+    s = rep(src[0..200], s, 97, 24);
+    s = putn(src[0..200], s, " and ");
+    s = putn(src[0..200], s, "ghp_");
+    s = rep(src[0..200], s, 98, 36);
+    s = putn(src[0..200], s, " ok");
+    const n : usize = run_redact(src[0..s], out[0..200], cn[0..5]);
+    assert eq(out[0..n], "use [REDACTED] and [REDACTED] ok");
+    assert cn[R_KEY] == 2 and redacted_total(cn[0..5]) == 2;
+    // github_pat_ and a long base64 run with a digit
+    var s2 : usize = putn(src[0..200], 0, "github_pat_");
+    s2 = rep(src[0..200], s2, 67, 20);
+    s2 = putn(src[0..200], s2, " ");
+    s2 = rep(src[0..200], s2, 81, 40);
+    s2 = putn(src[0..200], s2, "7==");
+    const n2 : usize = run_redact(src[0..s2], out[0..200], cn[0..5]);
+    assert eq(out[0..n2], "[REDACTED] [REDACTED]");
+    assert cn[R_KEY] == 2;
+}
+
+test key_shaped_but_harmless_text_is_kept {
+    var src : [200]u8 = undefined;
+    var out : [200]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    // negative controls: a word that merely ends in "sk-", a too-short sk- tail, a git sha, a uuid, a long word with no digit
+    const a : []const u8 = "ask-me-anything and task-list and sk-short";
+    assert eq(out[0..run_redact(a, out[0..200], cn[0..5])], a);
+    assert redacted_total(cn[0..5]) == 0;
+    var s : usize = putn(src[0..200], 0, "commit ");
+    s = rep(src[0..200], s, 97, 40);
+    s = putn(src[0..200], s, " session 5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11 ");
+    s = rep(src[0..200], s, 122, 40);
+    const n : usize = run_redact(src[0..s], out[0..200], cn[0..5]);
+    assert eq(out[0..n], src[0..s]);
+    assert redacted_total(cn[0..5]) == 0;
+    // a sha of 41 hex characters is not a sha: the run is dropped
+    var s2 : usize = rep(src[0..200], 0, 49, 41);
+    assert eq(out[0..run_redact(src[0..s2], out[0..200], cn[0..5])], "[REDACTED]");
+    // a 64 digit hex run (sha256) is kept
+    s2 = rep(src[0..200], 0, 50, 64);
+    assert redact(src[0..s2], out[0..200], cn[0..5]) == 64 and redacted_total(cn[0..5]) == 0;
+}
+
+test secret_env_values_are_dropped_but_other_env_is_kept {
+    var out : [200]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const a : []const u8 = "export ANTHROPIC_API_KEY=hunter2 PATH=/usr/bin GH_TOKEN='a b' my_secret=\"x y\" z";
+    const n : usize = run_redact(a, out[0..200], cn[0..5]);
+    assert eq(out[0..n], "export ANTHROPIC_API_KEY=[REDACTED] PATH=/usr/bin GH_TOKEN=[REDACTED] my_secret=[REDACTED] z");
+    assert cn[R_ENV] == 3;
+    const b : []const u8 = "HOME=/x EDITOR=vim a=b KEY= none";
+    assert eq(out[0..run_redact(b, out[0..200], cn[0..5])], b);
+    assert redacted_total(cn[0..5]) == 0;
+}
+
+test home_paths_and_emails_are_rewritten {
+    var out : [200]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const a : []const u8 = "cd /Users/alice/t27 && ls /home/bob/x; mail dev@example.com now";
+    const n : usize = run_redact(a, out[0..200], cn[0..5]);
+    assert eq(out[0..n], "cd ~/t27 && ls ~/x; mail [email] now");
+    assert cn[R_HOME] == 2 and cn[R_EMAIL] == 1 and redacted_total(cn[0..5]) == 3;
+    // negative controls: a ssh remote, a handle, an absolute path that is not a home, a trailing @
+    const b : []const u8 = "git@github.com:gHashTag/t27.git @alice /usr/local/bin /mnt/Users/x end@";
+    assert eq(out[0..run_redact(b, out[0..200], cn[0..5])], b);
+    assert redacted_total(cn[0..5]) == 0;
+    // a name-less home is not a home path
+    const c : []const u8 = "/Users/ and /home/";
+    assert eq(out[0..run_redact(c, out[0..200], cn[0..5])], c);
+}
+
+test a_share_that_lost_something_shows_a_counted_note {
+    var out : [200]u8 = undefined;
+    var note : [64]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = run_redact("see /Users/alice/x and bob@example.org, GH_TOKEN=abc", out[0..200], cn[0..5]);
+    assert eq(out[0..n], "see ~/x and [email], GH_TOKEN=[REDACTED]");
+    assert redacted_total(cn[0..5]) == 3;
+    const m : usize = note_text(cn[0..5], note[0..64]);
+    assert eq(note[0..m], "redacted 3 item(s) before sharing");
+    // nothing removed: no note
+    const n2 : usize = run_redact("plain text", out[0..200], cn[0..5]);
+    assert n2 == 10 and note_text(cn[0..5], note[0..64]) == 0;
+    // a too small output is flagged, never silently cut
+    var tiny : [8]u8 = undefined;
+    run_redact("0123456789abcdef", tiny[0..8], cn[0..5]);
+    assert cn[R_OVER] == 1;
+}
+
+test the_keys_profile_is_never_a_share_section {
+    assert section_allowed(SEC_AGENT) and section_allowed(SEC_MODEL) and section_allowed(SEC_REPO);
+    assert section_allowed(SEC_SID) and section_allowed(SEC_EXCERPT);
+    assert section_allowed(SEC_KEYS_PROFILE) == false;
+    assert section_allowed(SEC_KEYS_PROFILE + 1) == false;
+    assert EXCERPT_MAX == 4000;
+}
+
+test consent_gates_run_in_order_and_god_mode_never_sends {
+    // all satisfied: private repo, nothing redacted
+    assert send_gate(true, true, true, V_PRIVATE, false, 0, false) == G_OK;
+    // no button click (GOD MODE, a loop, a script): never
+    assert send_gate(true, false, true, V_PRIVATE, true, 0, true) == G_NEED_CLICK;
+    assert god_may_send() == false;
+    assert god_may_prepare(K_TASK) and god_may_prepare(K_SESSION) == false and god_may_prepare(K_DOCUMENT) == false;
+    // not signed in
+    assert send_gate(false, true, true, V_PRIVATE, false, 0, false) == G_NEED_LOGIN;
+    // the target must be shown first
+    assert send_gate(true, true, false, V_PRIVATE, false, 0, false) == G_NEED_PREVIEW;
+    // public and unknown visibility need an explicit yes
+    assert send_gate(true, true, true, V_PUBLIC, false, 0, false) == G_NEED_PUBLIC_OK;
+    assert send_gate(true, true, true, V_UNKNOWN, false, 0, false) == G_NEED_PUBLIC_OK;
+    assert send_gate(true, true, true, V_PUBLIC, true, 0, false) == G_OK;
+    // a redacted share needs its note seen
+    assert send_gate(true, true, true, V_PRIVATE, false, 2, false) == G_NEED_NOTE_SEEN;
+    assert send_gate(true, true, true, V_PRIVATE, false, 2, true) == G_OK;
+}
+
+test the_share_class_is_forbidden_to_god_mode_at_use_level {
+    // evolve's own F_ALL (31) does not cover bit 32: the gap this predicate closes without editing evolve.t27
+    assert touches_forbidden(F_SHARE) == false;
+    assert evolve_forbids(F_SHARE);
+    assert evolve_forbids(F_SHARE | 1);
+    assert evolve_forbids(F_ALL);
+    assert evolve_forbids(0) == false;
+    assert F_SHARE == F_ALL + 1;
+}
+
+test signing_in_walks_to_the_game {
+    var s : u32 = L_OUT;
+    s = step(s, E_START);
+    assert s == L_REQUESTING;
+    s = step(s, E_CODE_OK);
+    assert s == L_CODE_SHOWN and shows_user_code(s);
+    s = step(s, E_PENDING);
+    s = step(s, E_SLOW);
+    assert s == L_CODE_SHOWN;
+    s = step(s, E_TOKEN_STORED);
+    assert s == L_AUTHORIZED and may_share(s) == false;
+    s = step(s, E_APP_FOUND);
+    assert s == L_CONNECTED and connected(s) and may_share(s) and game_started(s) == false;
+    s = step(s, E_PASSPORT_OK);
+    assert s == L_PASSPORT;
+    s = step(s, E_QUEST_STARTED);
+    assert s == L_PLAYING and game_started(s) and connected(s);
+    assert step(s, E_SIGN_OUT) == L_OUT;
+}
+
+test a_missing_app_shows_the_install_button_until_it_is_found {
+    var s : u32 = step(L_AUTHORIZED, E_APP_MISSING);
+    assert s == L_NEED_INSTALL and shows_install_button(s) and connected(s) == false and may_share(s) == false;
+    // the user installs and presses check again: still missing, then found
+    s = step(s, E_APP_MISSING);
+    assert s == L_NEED_INSTALL;
+    s = step(s, E_APP_FOUND);
+    assert s == L_CONNECTED and shows_install_button(s) == false;
+    assert INSTALL_URL.len > 0 and APP_SLUG.len == 8;
+}
+
+test an_expired_or_denied_code_restarts_and_nothing_skips_a_step {
+    assert step(L_CODE_SHOWN, E_EXPIRED) == L_EXPIRED;
+    assert step(L_CODE_SHOWN, E_DENIED) == L_DENIED;
+    assert step(L_EXPIRED, E_START) == L_REQUESTING;
+    assert step(L_DENIED, E_START) == L_REQUESTING;
+    assert step(L_FAILED, E_START) == L_REQUESTING;
+    // a refused Keychain write fails the login: no fallback to a file
+    assert step(L_CODE_SHOWN, E_TOKEN_REFUSED) == L_FAILED;
+    assert step(L_REQUESTING, E_CODE_FAIL) == L_FAILED;
+    assert step(L_CONNECTED, E_PASSPORT_FAIL) == L_FAILED;
+    // out-of-order events are ignored
+    assert step(L_OUT, E_TOKEN_STORED) == L_OUT;
+    assert step(L_OUT, E_QUEST_STARTED) == L_OUT;
+    assert step(L_CODE_SHOWN, E_APP_FOUND) == L_CODE_SHOWN;
+    assert step(L_AUTHORIZED, E_QUEST_STARTED) == L_AUTHORIZED;
+    assert step(L_CONNECTED, E_QUEST_STARTED) == L_CONNECTED;
+    assert step(L_PLAYING, E_START) == L_PLAYING;
+    assert step(L_CODE_SHOWN, E_START) == L_CODE_SHOWN;
+}
+
+test the_device_code_clock_wins_over_the_answer {
+    assert code_expired(899, 0, DEVICE_EXPIRES_S) == false;
+    assert code_expired(900, 0, DEVICE_EXPIRES_S);
+    assert poll_event(10, 0, 900, A_PENDING, false) == E_PENDING;
+    assert poll_event(10, 0, 900, A_SLOW, false) == E_SLOW;
+    assert poll_event(10, 0, 900, A_GRANTED, true) == E_TOKEN_STORED;
+    assert poll_event(10, 0, 900, A_GRANTED, false) == E_TOKEN_REFUSED;
+    assert poll_event(10, 0, 900, A_DENIED, false) == E_DENIED;
+    assert poll_event(10, 0, 900, A_EXPIRED, false) == E_EXPIRED;
+    assert poll_event(10, 0, 900, A_OTHER, false) == E_CODE_FAIL;
+    // past the life of the code even a granted answer is an expiry
+    assert poll_event(900, 0, 900, A_GRANTED, true) == E_EXPIRED;
+    assert next_poll_s(0) == 5 and next_poll_s(2) == 15;
+}
+
+test a_token_lives_only_in_the_keychain {
+    assert token_home_ok(W_KEYCHAIN);
+    assert token_home_ok(W_FILE) == false;
+    assert token_home_ok(W_ENV) == false;
+    assert token_home_ok(W_LINK) == false;
+    assert token_home_ok(W_LOG) == false;
+}
+
+test a_received_share_is_routed_by_kind_and_login {
+    // a document needs no login
+    assert route(K_DOCUMENT, L_OUT) == RT_SPEC_PAGE;
+    // task and session: login first, install second, then the instrument
+    assert route(K_TASK, L_OUT) == RT_LOGIN;
+    assert route(K_SESSION, L_CODE_SHOWN) == RT_LOGIN;
+    assert route(K_TASK, L_AUTHORIZED) == RT_INSTALL;
+    assert route(K_SESSION, L_NEED_INSTALL) == RT_INSTALL;
+    assert route(K_TASK, L_CONNECTED) == RT_KANBAN_TODO;
+    assert route(K_TASK, L_PLAYING) == RT_KANBAN_TODO;
+    assert route(K_SESSION, L_PASSPORT) == RT_TRANSCRIPT_RO;
+    assert route(K_COUNT, L_PLAYING) == RT_BAD_LINK;
+    assert task_column() == COL_TODO;
+    assert transcript_writable() == false and resume_uses_sender_sid() == false;
+}
+
+test continue_in_claude_code_needs_a_branch_a_key_and_a_short_line {
+    var out : [256]u8 = undefined;
+    assert continue_ok(true, true);
+    assert continue_ok(false, true) == false;
+    assert continue_ok(true, false) == false;
+    const n : usize = continue_line("11275-ab", out[0..256]);
+    assert eq(out[0..n], "claude \"$(cat ~/.t27os/shares/11275-ab.md)\"");
+    assert n <= PTY_CAP;
+    assert continue_line("a;rm", out[0..256]) == 0;
+    assert continue_line("", out[0..256]) == 0;
+    // an id at the cap still fits the pty line; one over is refused
+    var long : [80]u8 = undefined;
+    rep(long[0..80], 0, 97, 80);
+    assert continue_line(long[0..64], out[0..256]) > 0;
+    assert continue_line(long[0..65], out[0..256]) == 0;
+}
