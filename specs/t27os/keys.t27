@@ -865,6 +865,145 @@ pub fn profile_why(stored: u32, bad: u32, out: []u8) -> usize {
     return put_bytes(out, n, ", z.ai failed its check");
 }
 
+// ---- the pane failover: what to do when a claude pane shows a provider error (gHashTag/t27#11224, FR-004) --
+// Owner, 2026-10-20: panes that start Claude Code inherited a provider that answered 429 "Insufficient
+// balance" or "organization has disabled Claude subscription access". Free Claude Code solves this inside a
+// local proxy that retries and then walks a fallback list per request. T27 OS cannot run that proxy yet (no
+// AF_INET server and no streamed HTTPS client in t27b, t27c issue 10902; router.t27 stops at decisions), but
+// z.ai, OpenRouter and Ollama's cloud serve the Anthropic protocol themselves, so the walk is done per PANE:
+// read the error off the screen, mark the profile bad for this pane, respawn the pane (Claude Code resumes its
+// session) on the next profile. Everything here is a pure decision; the host reads the screen and respawns.
+// It cannot loop: a respawn onto the next profile moves strictly forward in the chain, a respawn onto the next
+// key of the same provider is counted, and MAX_FAILOVERS caps the count whatever the host reports.
+
+/// What the screen showed.
+pub const FC_NONE : u32 = 0;
+pub const FC_RATE_LIMITED : u32 = 1;
+pub const FC_NO_BALANCE : u32 = 2;
+pub const FC_SUBSCRIPTION : u32 = 3;
+pub const FC_LOGIN_REJECTED : u32 = 4;
+pub const FC_OTHER : u32 = 5;
+pub const FC_WORDS : str = "no error,rate limited (429),out of balance,subscription disabled,login rejected (401/403),other error";
+
+/// What to do about it.
+pub const FA_KEEP : u32 = 0;
+pub const FA_RESPAWN_NEXT : u32 = 1;
+pub const FA_RESPAWN_KEY : u32 = 2;
+pub const FA_GIVE_UP : u32 = 3;
+
+/// At most this many failovers per pane: every profile once, and a few key swaps inside a provider.
+pub const MAX_FAILOVERS : u32 = 12;
+
+/// The index of the first occurrence of needle in hay at or after `from`; hay.len + 1 when absent.
+fn find_bytes(hay: []const u8, needle: []const u8, from: usize) -> usize {
+    if (needle.len == 0) { return hay.len + 1; }
+    var i : usize = from;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        while (j < needle.len and hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.len) { return i; }
+        i = i + 1;
+    }
+    return hay.len + 1;
+}
+
+/// Does needle occur in hay?
+pub fn has_bytes(hay: []const u8, needle: []const u8) -> bool {
+    return find_bytes(hay, needle, 0) <= hay.len;
+}
+
+/// Does the status code occur in hay as a number of its own: not glued to a digit on either side, so "429"
+/// does not match "14290 tokens"?
+pub fn has_code(hay: []const u8, code: []const u8) -> bool {
+    var at : usize = find_bytes(hay, code, 0);
+    while (at <= hay.len) {
+        var glued : bool = false;
+        if (at > 0) {
+            if (hay[at - 1] >= 48 and hay[at - 1] <= 57) { glued = true; }
+        }
+        const e : usize = at + code.len;
+        if (e < hay.len) {
+            if (hay[e] >= 48 and hay[e] <= 57) { glued = true; }
+        }
+        if (glued == false) { return true; }
+        at = find_bytes(hay, code, at + 1);
+    }
+    return false;
+}
+
+/// The failure class of one screen line, by plain byte matching. The two phrases are specific enough alone;
+/// a bare status number counts only on a line that also says "error" (so "Edited 429 lines" is not a 429).
+/// "Insufficient balance" wins over 429: the provider sends both for an empty account. An "API Error" line
+/// that matches nothing is FC_OTHER; any other line is FC_NONE.
+pub fn classify_line(line: []const u8) -> u32 {
+    if (has_bytes(line, "disabled Claude subscription")) { return FC_SUBSCRIPTION; }
+    if (has_bytes(line, "Insufficient balance")) { return FC_NO_BALANCE; }
+    if (has_bytes(line, "rror") == false) { return FC_NONE; }
+    if (has_code(line, "429")) { return FC_RATE_LIMITED; }
+    if (has_code(line, "401") or has_code(line, "403")) { return FC_LOGIN_REJECTED; }
+    if (has_bytes(line, "API Error")) { return FC_OTHER; }
+    return FC_NONE;
+}
+
+/// The bad mask after a failure of class `class` on profile pr: the profile's provider joins it. A line that
+/// is no failure (FC_NONE, FC_OTHER) or a pane with no profile changes nothing.
+pub fn fo_bad(class: u32, pr: u32, bad: u32) -> u32 {
+    if (class == FC_NONE or class == FC_OTHER) { return bad; }
+    if (pr >= PROFILE_COUNT) { return bad; }
+    const bit : u32 = PROFILE_PROVIDER[pr];
+    if ((bad >> bit) % 2 == 1) { return bad; }
+    return bad + (1 << bit);
+}
+
+/// The failover decision for a pane whose screen showed `class` while it ran profile pr (PR_NONE = it
+/// started without a key, which is where the "disabled Claude subscription access" line comes from).
+/// `stored` and `bad` are the provider masks (bad: providers that failed for this pane or their check),
+/// `done` the failovers this pane has had, `alt` whether another key of pr's provider is usable now
+/// (rotate_pick_except over the keys, the failed one skipped). A throttled key (429) with another key at hand
+/// swaps the key and keeps the profile; every other failure leaves the profile for the next one in the chain;
+/// when none is left, or the cap is reached, the pane stays as it is.
+pub fn fo_action(class: u32, pr: u32, stored: u32, bad: u32, done: u32, alt: bool) -> u32 {
+    if (class == FC_NONE or class == FC_OTHER) { return FA_KEEP; }
+    if (done >= MAX_FAILOVERS) { return FA_GIVE_UP; }
+    if (class == FC_RATE_LIMITED and alt and pr < PROFILE_COUNT) { return FA_RESPAWN_KEY; }
+    if (next_profile(pr, stored, fo_bad(class, pr, bad)) == PR_NONE) { return FA_GIVE_UP; }
+    return FA_RESPAWN_NEXT;
+}
+
+/// The profile to respawn on for the action fo_action gave: the same one for a key swap, the next one in
+/// the chain for FA_RESPAWN_NEXT, PR_NONE when the pane stays.
+pub fn fo_target(class: u32, pr: u32, stored: u32, bad: u32, done: u32, alt: bool) -> u32 {
+    const act : u32 = fo_action(class, pr, stored, bad, done, alt);
+    if (act == FA_RESPAWN_KEY) { return pr; }
+    if (act == FA_RESPAWN_NEXT) { return next_profile(pr, stored, fo_bad(class, pr, bad)); }
+    return PR_NONE;
+}
+
+/// The "why" line for a failover, for the KEYS tab and the pane's title (128 bytes are enough): names the
+/// profile, the failure and the move. No key value, ever.
+pub fn fo_why(class: u32, pr: u32, act: u32, nxt: u32, done: u32, out: []u8) -> usize {
+    if (act == FA_KEEP) { return put_bytes(out, 0, "claude: no provider error, the pane stays"); }
+    var tmp : [32]u8 = undefined;
+    var n : usize = put_bytes(out, 0, "claude: ");
+    if (pr < PROFILE_COUNT) {
+        const l : usize = profile_name(pr, tmp[0..32]);
+        n = put_bytes(out, n, tmp[0..l]);
+    } else {
+        n = put_bytes(out, n, "no profile");
+    }
+    n = put_bytes(out, n, " ");
+    const w : usize = csv_field(FC_WORDS, class, tmp[0..32]);
+    n = put_bytes(out, n, tmp[0..w]);
+    if (act == FA_RESPAWN_KEY) { return put_bytes(out, n, ", same profile with the next key"); }
+    if (act == FA_RESPAWN_NEXT) {
+        n = put_bytes(out, n, ", respawn on ");
+        const m : usize = profile_name(nxt, tmp[0..32]);
+        return put_bytes(out, n, tmp[0..m]);
+    }
+    if (done >= MAX_FAILOVERS) { return put_bytes(out, n, ", failover limit reached, the pane stays"); }
+    return put_bytes(out, n, ", no profile left in the chain, the pane stays");
+}
+
 /// z.ai has no cheap GET that proves a key opens the Anthropic-protocol route, so its check is one
 /// one-token message to the flash model (free); the answer is read by status only.
 pub fn probe_post(p: u32) -> bool {
@@ -1080,6 +1219,139 @@ test a_second_key_has_its_own_keychain_item_and_the_first_keeps_the_old_one {
     assert a[16] == 35 and a[17] == 51;
     assert keychain_label_n(P_OPENAI, MAX_KEYS, a[0..48]) == 0;
     assert keychain_label_n(PROVIDER_COUNT, 0, a[0..48]) == 0;
+}
+
+test a_status_code_must_stand_alone_to_count {
+    assert has_code("API Error: 429 slow down", "429");
+    assert has_code("error 429", "429");
+    assert has_code("429 error", "429");
+    assert has_code("error 429x", "429");
+    assert has_code("error 1429", "429") == false;
+    assert has_code("error 4290", "429") == false;
+    assert has_code("error 14290 and 429", "429");
+    assert has_code("error", "429") == false;
+    assert has_code("", "429") == false;
+    assert has_bytes("abc", "bc");
+    assert has_bytes("abc", "abcd") == false;
+    assert has_bytes("abc", "") == false;
+}
+
+test a_screen_line_is_sorted_into_a_failure_class {
+    assert classify_line("API Error: 429 {\"error\":{\"message\":\"Insufficient balance\"}}") == FC_NO_BALANCE;
+    assert classify_line("Insufficient balance") == FC_NO_BALANCE;
+    assert classify_line("API Error: 429 rate limit reached, retry later") == FC_RATE_LIMITED;
+    assert classify_line("Your organization has disabled Claude subscription access") == FC_SUBSCRIPTION;
+    assert classify_line("API Error: 401 invalid credentials") == FC_LOGIN_REJECTED;
+    assert classify_line("Request failed with error 403 forbidden") == FC_LOGIN_REJECTED;
+    assert classify_line("API Error: 500 upstream overloaded") == FC_OTHER;
+    assert classify_line("Edited 429 lines in 3 files") == FC_NONE;
+    assert classify_line("error: read 14290 tokens") == FC_NONE;
+    assert classify_line("Reading specs/t27os/keys.t27") == FC_NONE;
+    assert classify_line("") == FC_NONE;
+}
+
+test a_failure_marks_the_provider_bad_for_this_pane {
+    assert fo_bad(FC_NO_BALANCE, PR_ZAI, 0) == 16;
+    assert fo_bad(FC_LOGIN_REJECTED, PR_ANTHROPIC, 16) == 17;
+    assert fo_bad(FC_LOGIN_REJECTED, PR_ANTHROPIC, 17) == 17;
+    assert fo_bad(FC_RATE_LIMITED, PR_OPENROUTER, 0) == 8;
+    assert fo_bad(FC_RATE_LIMITED, PR_OLLAMA_CLOUD, 0) == 32;
+    assert fo_bad(FC_NONE, PR_ZAI, 0) == 0;
+    assert fo_bad(FC_OTHER, PR_ZAI, 0) == 0;
+    assert fo_bad(FC_NO_BALANCE, PR_NONE, 5) == 5;
+}
+
+test no_error_or_an_unknown_one_leaves_the_pane_alone {
+    assert fo_action(FC_NONE, PR_ZAI, 57, 0, 0, false) == FA_KEEP;
+    assert fo_action(FC_OTHER, PR_ZAI, 57, 0, 0, true) == FA_KEEP;
+    assert fo_target(FC_NONE, PR_ZAI, 57, 0, 0, false) == PR_NONE;
+}
+
+test a_dead_profile_hands_the_pane_to_the_next_one {
+    assert fo_action(FC_NO_BALANCE, PR_ZAI, 57, 0, 0, false) == FA_RESPAWN_NEXT;
+    assert fo_target(FC_NO_BALANCE, PR_ZAI, 57, 0, 0, false) == PR_ANTHROPIC;
+    assert fo_target(FC_LOGIN_REJECTED, PR_ANTHROPIC, 57, 16, 1, false) == PR_OPENROUTER;
+    assert fo_target(FC_RATE_LIMITED, PR_OPENROUTER, 57, 17, 2, false) == PR_OLLAMA_CLOUD;
+    assert fo_target(FC_NO_BALANCE, PR_ZAI, 41, 0, 0, false) == PR_ANTHROPIC;
+    assert fo_target(FC_NO_BALANCE, PR_ZAI, 40, 0, 0, false) == PR_OPENROUTER;
+}
+
+test a_throttled_key_with_a_spare_swaps_the_key_and_keeps_the_profile {
+    assert fo_action(FC_RATE_LIMITED, PR_ZAI, 57, 0, 0, true) == FA_RESPAWN_KEY;
+    assert fo_target(FC_RATE_LIMITED, PR_ZAI, 57, 0, 0, true) == PR_ZAI;
+    assert fo_bad(FC_RATE_LIMITED, PR_ZAI, 0) == 16;
+    assert fo_action(FC_NO_BALANCE, PR_ZAI, 57, 0, 0, true) == FA_RESPAWN_NEXT;
+    assert fo_action(FC_LOGIN_REJECTED, PR_ZAI, 57, 0, 0, true) == FA_RESPAWN_NEXT;
+    assert fo_action(FC_RATE_LIMITED, PR_NONE, 57, 0, 0, true) == FA_RESPAWN_NEXT;
+}
+
+test a_pane_without_a_key_takes_the_first_stored_profile {
+    assert fo_action(FC_SUBSCRIPTION, PR_NONE, 16, 0, 0, false) == FA_RESPAWN_NEXT;
+    assert fo_target(FC_SUBSCRIPTION, PR_NONE, 16, 0, 0, false) == PR_ZAI;
+    assert fo_target(FC_SUBSCRIPTION, PR_NONE, 8, 0, 0, false) == PR_OPENROUTER;
+    assert fo_action(FC_SUBSCRIPTION, PR_NONE, 0, 0, 0, false) == FA_GIVE_UP;
+    assert fo_action(FC_SUBSCRIPTION, PR_NONE, 16, 16, 0, false) == FA_GIVE_UP;
+    assert fo_action(FC_SUBSCRIPTION, PR_NONE, 6, 0, 0, false) == FA_GIVE_UP;
+}
+
+test the_last_profile_failing_gives_up {
+    assert fo_action(FC_NO_BALANCE, PR_OLLAMA_CLOUD, 57, 57, 3, false) == FA_GIVE_UP;
+    assert fo_target(FC_NO_BALANCE, PR_OLLAMA_CLOUD, 57, 57, 3, false) == PR_NONE;
+    assert fo_action(FC_LOGIN_REJECTED, PR_ANTHROPIC, 17, 16, 1, false) == FA_GIVE_UP;
+    assert fo_action(FC_RATE_LIMITED, PR_OLLAMA_CLOUD, 57, 0, 3, false) == FA_GIVE_UP;
+    assert fo_action(FC_NO_BALANCE, 7, 57, 0, 0, false) == FA_GIVE_UP;
+}
+
+test a_pane_that_fails_on_every_profile_ends_in_give_up_after_each_was_tried_once {
+    var pr : u32 = PR_NONE;
+    var bad : u32 = 0;
+    var done : u32 = 0;
+    var tried : u32 = 0;
+    var act : u32 = FA_KEEP;
+    var guard : u32 = 0;
+    while (guard < 30) {
+        act = fo_action(FC_NO_BALANCE, pr, 57, bad, done, false);
+        if (act != FA_RESPAWN_NEXT) { guard = 30; }
+        else {
+            bad = fo_bad(FC_NO_BALANCE, pr, bad);
+            pr = fo_target(FC_NO_BALANCE, pr, 57, bad, done, false);
+            assert (tried >> pr) % 2 == 0;
+            tried = tried + (1 << pr);
+            done = done + 1;
+            guard = guard + 1;
+        }
+    }
+    assert act == FA_GIVE_UP;
+    assert done == PROFILE_COUNT;
+    assert tried == 15;
+}
+
+test a_host_that_always_reports_a_spare_key_still_cannot_loop {
+    var done : u32 = 0;
+    while (done < 40 and fo_action(FC_RATE_LIMITED, PR_ZAI, 57, 0, done, true) == FA_RESPAWN_KEY) {
+        done = done + 1;
+    }
+    assert done == MAX_FAILOVERS;
+    assert fo_action(FC_RATE_LIMITED, PR_ZAI, 57, 0, done, true) == FA_GIVE_UP;
+    assert fo_action(FC_NO_BALANCE, PR_ZAI, 57, 0, MAX_FAILOVERS, false) == FA_GIVE_UP;
+    assert MAX_FAILOVERS >= PROFILE_COUNT;
+}
+
+test the_failover_why_line_names_the_profile_and_the_move_and_never_a_key {
+    var o : [128]u8 = undefined;
+    var n : usize = fo_why(FC_NONE, PR_ZAI, FA_KEEP, PR_NONE, 0, o[0..128]);
+    assert has_bytes(o[0..n], "no provider error");
+    n = fo_why(FC_NO_BALANCE, PR_ZAI, FA_RESPAWN_NEXT, PR_ANTHROPIC, 0, o[0..128]);
+    assert has_bytes(o[0..n], "claude: zai out of balance, respawn on anthropic-api");
+    n = fo_why(FC_RATE_LIMITED, PR_OPENROUTER, FA_RESPAWN_KEY, PR_OPENROUTER, 2, o[0..128]);
+    assert has_bytes(o[0..n], "openrouter rate limited (429), same profile with the next key");
+    n = fo_why(FC_SUBSCRIPTION, PR_NONE, FA_RESPAWN_NEXT, PR_ZAI, 0, o[0..128]);
+    assert has_bytes(o[0..n], "no profile subscription disabled, respawn on zai");
+    n = fo_why(FC_LOGIN_REJECTED, PR_OLLAMA_CLOUD, FA_GIVE_UP, PR_NONE, 3, o[0..128]);
+    assert has_bytes(o[0..n], "ollama-cloud login rejected (401/403), no profile left in the chain");
+    assert n < 128;
+    n = fo_why(FC_RATE_LIMITED, PR_ZAI, FA_GIVE_UP, PR_NONE, MAX_FAILOVERS, o[0..128]);
+    assert has_bytes(o[0..n], "failover limit reached");
 }
 
 test the_profile_tables_have_one_field_per_profile {
