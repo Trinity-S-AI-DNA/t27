@@ -1,0 +1,712 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/kanban.t27 -- t27k, the KANBAN board of T27 OS: issues and pull requests as cards, 100% widgets
+; Owner, 2026-10-20 (decided): T27 OS is an ergonomic project-management system; each letter is a tool t27<letter>
+; with its own page; K is t27k, the kanban board, and everything on the page is a widget. Closes #11275.
+; ASCII only (L3), English only (LANG-EN). Artifact it draws (toolchain.t27 rule): the HUD view kanban of the app
+; (agent_parts SURFACE_IDS "kanban", letter 10 there, hence the page moves to petal K) and `tri issues`.
+; --
+; The tree. BOARD holds 5 COLUMNs (BACKLOG, TODO, DOING, REVIEW, DONE); a COLUMN holds CARDs; a CARD holds
+; CHIPs (the pinned agents, owner first) and BADGEs (the labels). Layout is the packer of dash.t27 (used, not
+; copied): the columns are one row of 5, the cards of a column are one column of 1.
+; --
+; The host feeds LINES, LF separated, fields TAB separated, no JSON in the spec (the host formats):
+;   issue TAB num TAB state TAB title TAB labels TAB paths TAB letters
+;     gh issue list --state all --limit 200 --json number,state,title,labels,body,closedAt
+;     the host prints state as open, or closed/<days since closed>; labels and paths are comma lists;
+;     paths are the Boundary paths of the issue body (specs/policy/issue_shape.t27), the first is the main one.
+;   pr TAB num TAB state TAB closes TAB checks TAB title TAB paths TAB letters
+;     gh pr list --state all --limit 200 --json number,state,title,closingIssuesReferences,statusCheckRollup,
+;       reviewRequests,files,mergedAt
+;     state is open, merged/<days> or closed/<days>; closes is the issue number or 0; checks is one of
+;     running, review (a review is requested), pass, fail, none; paths are the files the PR changes.
+; --
+; COLUMN RULE (column()): an open issue with no open PR is TODO, BACKLOG when labelled backlog; an open issue with
+; an open PR is DOING; an open PR with checks running or a review requested is REVIEW (its issue folds into the PR
+; card and is not drawn twice); a PR whose checks failed or are absent stays with its issue in DOING (folded); a
+; merged PR, or a closed issue with no merged PR, is DONE for 7 days after closing; a PR closed unmerged is not drawn.
+; --
+; AGENTS of a card: the LAST field of its line, a comma list of letters 1..27, owner first, distinct, at most
+; MAX_CHIPS used. The host fills it with domain_pulse::letter_of_path over each path (the Boundary paths of an
+; issue, the files of a PR). The spec does not call domain_pulse itself: that module reads the 27 agent specs by
+; module-qualified path, which neither gen nor t27b can splice into an importer (checked 2026-10-20), so the pin
+; between paths and letters is the test `kanban_sample_paths_are_owned_by_the_letters_of_its_lines` in
+; domain_pulse.t27, where those paths are resolved. A card whose list is empty is pinned to
+; FALLBACK_LETTER (S, who owns ownership, as evolve.t27 decides for unowned paths): every card has >= 1 agent.
+; The card's TOOL letter is its first agent (card_tool); the tool name and page come from agent_parts.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osKanban;
+
+use t27os::dash::cell_w;
+use t27os::dash::cell_x;
+use t27os::dash::cell_y;
+use t27os::dash::pack_h;
+use t27os::dash::pack_at;
+use t27os::evolve::why_not;
+use t27os::evolve::R_AGENT_CAP;
+use t27os::evolve::LETTER_UNOWNED;
+
+// ---- node kinds of the tree ----
+pub const KK_BOARD : u32 = 0;
+pub const KK_COLUMN : u32 = 1;
+pub const KK_CARD : u32 = 2;
+pub const KK_CHIP : u32 = 3;
+pub const KK_BADGE : u32 = 4;
+pub const KK_KINDS : u32 = 5;
+
+/// Kind of the i-th child kind of a node of kind k; KK_KINDS for none.
+pub fn child_kind(k: u32, i: u32) -> u32 {
+    if (k == KK_BOARD and i == 0) { return KK_COLUMN; }
+    if (k == KK_COLUMN and i == 0) { return KK_CARD; }
+    if (k == KK_CARD and i == 0) { return KK_CHIP; }
+    if (k == KK_CARD and i == 1) { return KK_BADGE; }
+    return KK_KINDS;
+}
+
+// ---- columns ----
+pub const COL_BACKLOG : u32 = 0;
+pub const COL_TODO : u32 = 1;
+pub const COL_DOING : u32 = 2;
+pub const COL_REVIEW : u32 = 3;
+pub const COL_DONE : u32 = 4;
+pub const COL_COUNT : u32 = 5;
+pub const COL_HIDDEN : u32 = 5;
+
+pub const DONE_DAYS : u32 = 7;
+pub const WIP_DOING : u32 = 3;
+pub const MAX_CHIPS : u32 = 3;
+pub const FALLBACK_LETTER : u32 = 19;
+pub const NONE : u32 = 4294967295;
+
+pub fn column_name(c: u32) -> string {
+    if (c == COL_BACKLOG) { return "BACKLOG"; }
+    if (c == COL_TODO) { return "TODO"; }
+    if (c == COL_DOING) { return "DOING"; }
+    if (c == COL_REVIEW) { return "REVIEW"; }
+    if (c == COL_DONE) { return "DONE"; }
+    return "";
+}
+
+/// WIP limit of a column, 0 = none. DOING is capped by the agent cap of GOD MODE (evolve.t27 MAX_AGENTS = 3, held equal by a test).
+pub fn wip_limit(c: u32) -> u32 {
+    if (c == COL_DOING) { return WIP_DOING; }
+    return 0;
+}
+
+pub fn wip_full(c: u32, count: u32) -> bool {
+    const lim : u32 = wip_limit(c);
+    if (lim == 0) { return false; }
+    return count >= lim;
+}
+
+// ---- reading the lines ----
+pub const NL : u32 = 10;
+pub const TAB : u32 = 9;
+
+/// End of the line that starts at ls: the index of its LF, or the text length.
+pub fn line_end(log: string, ls: u32) -> u32 {
+    var ii : u32 = ls;
+    while (ii < (log.len as u32)) {
+        if ((log[ii] as u32) == NL) { return ii; }
+        ii = ii + 1;
+    }
+    return log.len as u32;
+}
+
+/// Start of field f of the line at ls, NONE when the line has fewer fields.
+pub fn fstart(log: string, ls: u32, f: u32) -> u32 {
+    const le : u32 = line_end(log, ls);
+    var ii : u32 = ls;
+    var ff : u32 = 0;
+    while (ff < f) {
+        while (ii < le and (log[ii] as u32) != TAB) { ii = ii + 1; }
+        if (ii >= le) { return NONE; }
+        ii = ii + 1;
+        ff = ff + 1;
+    }
+    return ii;
+}
+
+/// End of the field that starts at fs (its TAB, or the line end).
+pub fn fend(log: string, fs: u32) -> u32 {
+    var ii : u32 = fs;
+    while (ii < (log.len as u32)) {
+        const c : u32 = log[ii] as u32;
+        if (c == TAB or c == NL) { return ii; }
+        ii = ii + 1;
+    }
+    return log.len as u32;
+}
+
+/// Length of field f (0 when absent): the counted string of a title, a label list, a path list.
+pub fn flen(log: string, ls: u32, f: u32) -> u32 {
+    const fs : u32 = fstart(log, ls, f);
+    if (fs == NONE) { return 0; }
+    return fend(log, fs) - fs;
+}
+
+/// Decimal value of log[a..b), stops at the first non-digit.
+pub fn dec(log: string, a: u32, b: u32) -> u32 {
+    var ii : u32 = a;
+    var vv : u32 = 0;
+    while (ii < b) {
+        const c : u32 = log[ii] as u32;
+        if (c < 48 or c > 57) { return vv; }
+        vv = vv * 10 + (c - 48);
+        ii = ii + 1;
+    }
+    return vv;
+}
+
+pub fn is_pr(log: string, ls: u32) -> bool {
+    return (log[ls] as u32) == 112;
+}
+
+pub fn card_num(log: string, ls: u32) -> u32 {
+    const fs : u32 = fstart(log, ls, 1);
+    if (fs == NONE) { return 0; }
+    return dec(log, fs, fend(log, fs));
+}
+
+/// First byte of the state: o(pen), c(losed), m(erged).
+pub fn state_byte(log: string, ls: u32) -> u32 {
+    const fs : u32 = fstart(log, ls, 2);
+    if (fs == NONE) { return 0; }
+    return log[fs] as u32;
+}
+
+/// Days since closing: the digits after the slash of the state, 0 when none.
+pub fn state_days(log: string, ls: u32) -> u32 {
+    const fs : u32 = fstart(log, ls, 2);
+    if (fs == NONE) { return 0; }
+    const fe : u32 = fend(log, fs);
+    var ii : u32 = fs;
+    while (ii < fe) {
+        if ((log[ii] as u32) == 47) { return dec(log, ii + 1, fe); }
+        ii = ii + 1;
+    }
+    return 0;
+}
+
+/// Field index of the title, of the paths, and of the labels (a PR has none).
+pub fn title_field(log: string, ls: u32) -> u32 {
+    if (is_pr(log, ls)) { return 5; }
+    return 3;
+}
+
+pub fn paths_field(log: string, ls: u32) -> u32 {
+    if (is_pr(log, ls)) { return 6; }
+    return 5;
+}
+
+pub fn letters_field(log: string, ls: u32) -> u32 {
+    return paths_field(log, ls) + 1;
+}
+
+pub fn title_len(log: string, ls: u32) -> u32 {
+    return flen(log, ls, title_field(log, ls));
+}
+
+/// Is the comma list of field f of the line made of exactly the word w among its items?
+pub fn list_has(log: string, ls: u32, f: u32, w: string) -> bool {
+    const fs : u32 = fstart(log, ls, f);
+    if (fs == NONE) { return false; }
+    const fe : u32 = fend(log, fs);
+    var ii : u32 = fs;
+    var st : u32 = fs;
+    while (ii <= fe) {
+        if (ii == fe or (log[ii] as u32) == 44) {
+            if (ii - st == (w.len as u32)) {
+                var kk : u32 = 0;
+                while (kk < (w.len as u32) and log[st + kk] == w[kk]) { kk = kk + 1; }
+                if (kk == (w.len as u32)) { return true; }
+            }
+            st = ii + 1;
+        }
+        ii = ii + 1;
+    }
+    return false;
+}
+
+pub fn has_label(log: string, ls: u32, w: string) -> bool {
+    if (is_pr(log, ls)) { return false; }
+    return list_has(log, ls, 4, w);
+}
+
+/// checks of a PR line: running or review means it is being looked at.
+pub fn pr_in_review(log: string, ls: u32) -> bool {
+    const fs : u32 = fstart(log, ls, 4);
+    if (fs == NONE) { return false; }
+    const c : u32 = log[fs] as u32;
+    return c == 114;
+}
+
+/// Start of the next line after the one at ls, NONE at the end.
+pub fn next_line(log: string, ls: u32) -> u32 {
+    const le : u32 = line_end(log, ls);
+    if (le + 1 >= (log.len as u32)) { return NONE; }
+    return le + 1;
+}
+
+/// Start of the open PR that closes issue num, NONE if there is none.
+pub fn open_pr_of(log: string, num: u32) -> u32 {
+    var ls : u32 = 0;
+    if (log.len == 0) { return NONE; }
+    while (ls != NONE) {
+        if (is_pr(log, ls) and state_byte(log, ls) == 111) {
+            const fs : u32 = fstart(log, ls, 3);
+            if (fs != NONE and dec(log, fs, fend(log, fs)) == num) { return ls; }
+        }
+        ls = next_line(log, ls);
+    }
+    return NONE;
+}
+
+/// Is there a merged PR that closes issue num?
+pub fn merged_pr_of(log: string, num: u32) -> bool {
+    var ls : u32 = 0;
+    if (log.len == 0) { return false; }
+    while (ls != NONE) {
+        if (is_pr(log, ls) and state_byte(log, ls) == 109) {
+            const fs : u32 = fstart(log, ls, 3);
+            if (fs != NONE and dec(log, fs, fend(log, fs)) == num) { return true; }
+        }
+        ls = next_line(log, ls);
+    }
+    return false;
+}
+
+/// Is there an open issue num in the log (a PR folds into it)?
+pub fn open_issue_of(log: string, num: u32) -> bool {
+    var ls : u32 = 0;
+    if (log.len == 0 or num == 0) { return false; }
+    while (ls != NONE) {
+        if (is_pr(log, ls) == false and state_byte(log, ls) == 111 and card_num(log, ls) == num) { return true; }
+        ls = next_line(log, ls);
+    }
+    return false;
+}
+
+/// THE COLUMN RULE (see the header).
+pub fn column(log: string, ls: u32) -> u32 {
+    const sb : u32 = state_byte(log, ls);
+    const num : u32 = card_num(log, ls);
+    if (is_pr(log, ls) == false) {
+        if (sb == 111) {
+            const p : u32 = open_pr_of(log, num);
+            if (p != NONE) {
+                if (pr_in_review(log, p)) { return COL_HIDDEN; }
+                return COL_DOING;
+            }
+            if (has_label(log, ls, "backlog")) { return COL_BACKLOG; }
+            return COL_TODO;
+        }
+        if (merged_pr_of(log, num)) { return COL_HIDDEN; }
+        if (state_days(log, ls) <= DONE_DAYS) { return COL_DONE; }
+        return COL_HIDDEN;
+    }
+    if (sb == 111) {
+        if (pr_in_review(log, ls)) { return COL_REVIEW; }
+        const fs : u32 = fstart(log, ls, 3);
+        if (fs != NONE and open_issue_of(log, dec(log, fs, fend(log, fs)))) { return COL_HIDDEN; }
+        return COL_DOING;
+    }
+    if (sb == 109 and state_days(log, ls) <= DONE_DAYS) { return COL_DONE; }
+    return COL_HIDDEN;
+}
+
+/// How many cards the board draws in column c.
+pub fn count_in(log: string, c: u32) -> u32 {
+    var ls : u32 = 0;
+    var n : u32 = 0;
+    if (log.len == 0) { return 0; }
+    while (ls != NONE) {
+        if (column(log, ls) == c) { n = n + 1; }
+        ls = next_line(log, ls);
+    }
+    return n;
+}
+
+/// Start of the k-th card of column c, in log order; NONE past the end.
+pub fn nth_card(log: string, c: u32, k: u32) -> u32 {
+    var ls : u32 = 0;
+    var n : u32 = 0;
+    if (log.len == 0) { return NONE; }
+    while (ls != NONE) {
+        if (column(log, ls) == c) {
+            if (n == k) { return ls; }
+            n = n + 1;
+        }
+        ls = next_line(log, ls);
+    }
+    return NONE;
+}
+
+// ---- the pinned agents ----
+
+/// The k-th letter of the card's letters field (comma list); 0 past the end, for a letter out of 1..27 and for a
+/// repeat of an earlier letter (the list is distinct by contract; a repeat is skipped, not trusted).
+pub fn raw_agent_at(log: string, ls: u32, k: u32) -> u32 {
+    const fs : u32 = fstart(log, ls, letters_field(log, ls));
+    if (fs == NONE) { return 0; }
+    const fe : u32 = fend(log, fs);
+    var ii : u32 = fs;
+    var st : u32 = fs;
+    var seen : u32 = 0;
+    var n : u32 = 0;
+    while (ii <= fe) {
+        if (ii == fe or (log[ii] as u32) == 44) {
+            if (ii > st) {
+                const l : u32 = dec(log, st, ii);
+                if (l >= 1 and l <= 27 and (seen & (1 << (l - 1))) == 0) {
+                    if (n == k) { return l; }
+                    seen = seen | (1 << (l - 1));
+                    n = n + 1;
+                }
+            }
+            st = ii + 1;
+        }
+        ii = ii + 1;
+    }
+    return 0;
+}
+
+/// How many agents the card pins: 1..MAX_CHIPS, never 0.
+pub fn agent_count(log: string, ls: u32) -> u32 {
+    var n : u32 = 0;
+    while (n < MAX_CHIPS and raw_agent_at(log, ls, n) != 0) { n = n + 1; }
+    if (n == 0) { return 1; }
+    return n;
+}
+
+/// Agent k of the card, owner first; the fallback letter when no path has an owner.
+pub fn agent_at(log: string, ls: u32, k: u32) -> u32 {
+    if (k >= agent_count(log, ls)) { return 0; }
+    const l : u32 = raw_agent_at(log, ls, k);
+    if (l == 0) { return FALLBACK_LETTER; }
+    return l;
+}
+
+/// The tool letter of the card: its owner.
+pub fn card_tool(log: string, ls: u32) -> u32 {
+    return agent_at(log, ls, 0);
+}
+
+// ---- drag and drop ----
+pub const ACT_NONE : u32 = 0;
+pub const ACT_REFUSED : u32 = 1;
+pub const ACT_PARK : u32 = 2;
+pub const ACT_START_AGENT : u32 = 3;
+pub const ACT_PAUSE : u32 = 4;
+pub const ACT_REQUEST_REVIEW : u32 = 5;
+pub const ACT_REWORK : u32 = 6;
+pub const ACT_WIP_FULL : u32 = 7;
+pub const ACT_MERGE_ONLY : u32 = 8;
+
+/// What dropping a card from column `from` onto column `to` does; doing = cards now in DOING.
+///  BACKLOG <-> TODO   ACT_PARK: add or remove the label backlog (no agent moves).
+///  TODO -> DOING      ACT_START_AGENT: one agent on a fresh lane worktree, the lane plan of evolve.t27 (Sonnet,
+///                     Closes #N); ACT_WIP_FULL when DOING already holds the cap (WIP_DOING = 3 = MAX_CHIPS).
+///  DOING -> TODO      ACT_PAUSE: stop the agent, the lane worktree stays.
+///  DOING -> REVIEW    ACT_REQUEST_REVIEW: open the PR of the lane and ask for review.
+///  REVIEW -> DOING    ACT_REWORK: hand the findings back to the agent (counts against the cap).
+///  REVIEW -> DONE     ACT_MERGE_ONLY: refused. A card reaches DONE only when the PR merges through the gates
+///                     (merge_judge); a drop never merges, never forces a close.
+/// Every other move, any move out of DONE or onto BACKLOG from DOING, is ACT_REFUSED. Same column: ACT_NONE.
+pub fn drag_action(from: u32, to: u32, doing: u32) -> u32 {
+    if (from >= COL_COUNT or to >= COL_COUNT) { return ACT_REFUSED; }
+    if (from == to) { return ACT_NONE; }
+    if (from == COL_BACKLOG and to == COL_TODO) { return ACT_PARK; }
+    if (from == COL_TODO and to == COL_BACKLOG) { return ACT_PARK; }
+    if (from == COL_TODO and to == COL_DOING) {
+        if (wip_full(COL_DOING, doing)) { return ACT_WIP_FULL; }
+        return ACT_START_AGENT;
+    }
+    if (from == COL_DOING and to == COL_TODO) { return ACT_PAUSE; }
+    if (from == COL_DOING and to == COL_REVIEW) { return ACT_REQUEST_REVIEW; }
+    if (from == COL_REVIEW and to == COL_DOING) {
+        if (wip_full(COL_DOING, doing)) { return ACT_WIP_FULL; }
+        return ACT_REWORK;
+    }
+    if (from == COL_REVIEW and to == COL_DONE) { return ACT_MERGE_ONLY; }
+    return ACT_REFUSED;
+}
+
+pub fn drag_allowed(from: u32, to: u32, doing: u32) -> bool {
+    const a : u32 = drag_action(from, to, doing);
+    return a != ACT_NONE and a != ACT_REFUSED and a != ACT_WIP_FULL and a != ACT_MERGE_ONLY;
+}
+
+// ---- layout: nested rects, the packer of dash.t27 ----
+pub const PAD : f64 = 8.0;
+pub const COL_GAP : f64 = 6.0;
+pub const COL_HEAD : f64 = 28.0;
+pub const CARD_PAD : f64 = 4.0;
+pub const CARD_H : f64 = 64.0;
+pub const CARD_GAP : f64 = 6.0;
+pub const CHIP_W : f64 = 22.0;
+pub const CHIP_H : f64 = 16.0;
+pub const CHIP_GAP : f64 = 2.0;
+
+fn fl(x: u32) -> f64 { return @as(f64, @floatFromInt(x)); }
+
+pub fn col_w(w: f64) -> f64 { return cell_w(w - 2.0 * PAD, COL_COUNT, COL_GAP); }
+pub fn col_x(c: u32, w: f64) -> f64 { return PAD + cell_x(c, w - 2.0 * PAD, COL_COUNT, COL_GAP); }
+pub fn card_x(c: u32, w: f64) -> f64 { return col_x(c, w) + CARD_PAD; }
+pub fn card_w(w: f64) -> f64 { return col_w(w) - 2.0 * CARD_PAD; }
+pub fn card_y(i: u32) -> f64 { return PAD + COL_HEAD + cell_y(i, 1, CARD_H, CARD_GAP); }
+pub fn chip_x(c: u32, w: f64, i: u32) -> f64 { return card_x(c, w) + CARD_PAD + fl(i) * (CHIP_W + CHIP_GAP); }
+
+/// Height of a column holding n cards.
+pub fn col_h(n: u32) -> f64 { return COL_HEAD + pack_h(n, 1, CARD_H, CARD_GAP) + PAD; }
+
+/// Height of the board when the tallest column holds n cards.
+pub fn board_h(n: u32) -> f64 { return PAD + col_h(n) + PAD; }
+
+/// The column under x of a board of width w, COL_HIDDEN (5) when none (a gap or the padding).
+pub fn column_at(w: f64, x: f64) -> u32 {
+    const rel : f64 = x - PAD;
+    if (rel < 0.0) { return COL_HIDDEN; }
+    return pack_at(COL_COUNT, w - 2.0 * PAD, COL_COUNT, 1.0e9, COL_GAP, rel, 0.0);
+}
+
+/// The card under (x, y) of column c of a board of width w holding n cards, n when none.
+pub fn card_at(n: u32, w: f64, c: u32, x: f64, y: f64) -> u32 {
+    return pack_at(n, card_w(w), 1, CARD_H, CARD_GAP, x - card_x(c, w), y - card_y(0));
+}
+
+// ---- tests: ten lines shaped on this repository's recent log ----
+// Numbers and titles come from the log (#11275 the epic, #11264/#11278 the PTY server, #11265/#11277 the homes
+// reseal, #11260 the KEY_FILES issue, #10938/#11104 the widgets, #11063 the night loop); the states, the labels, the
+// paths and the PR number 11280 are SAMPLE data, made to hit every rule once.
+pub const SAMPLE : string = "issue\t11275\topen\tT27 OS: ergonomic project management, one tool per letter\tt27os,epic\tspecs/t27os/agent_parts.t27,specs/t27os/homes.t27\t26\nissue\t11260\topen\tagents: KEY_FILES point at the directories each domain changes\tbacklog\tspecs/automation/x.t27\t10\nissue\t11264\topen\tT27 OS: the PTY server reads the Keychain itself\tt27os\tspecs/t27os/pty_server.t27\t26\npr\t11278\topen\t11264\trunning\tT27 OS: the PTY server reads the Keychain itself\tspecs/t27os/pty_server.t27,specs/t27os/keys.t27\t26\nissue\t10938\topen\twidgets: gatle drawn natively\twidgets\tspecs/t27f/widget_factory.t27,bootstrap/src/compiler.rs\t26,3\npr\t11280\topen\t10938\tfail\twidgets: gatle drawn natively\tspecs/t27f/widget_factory.t27,bootstrap/src/compiler.rs\t26,3\nissue\t11265\tclosed/2\tseals: homes.t27 resealed\tseals\t.trinity/seals/t27os_T27osHomes.json\t2\npr\t11277\tmerged/2\t11265\tpass\tseals: homes.t27 resealed (gen-drift)\t.trinity/seals/t27os_T27osHomes.json\t2\nissue\t11063\tclosed/20\tnight loop epic\tepic\tdocs/now/x.md\t5\nissue\t11104\topen\twidgets: catalog records every tool at PORT_DRAW\twidgets\t\t";
+
+test the_sample_has_ten_lines_and_the_rule_puts_each_card_in_its_column {
+    const s : string = SAMPLE;
+    var ls : u32 = 0;
+    var lines : u32 = 0;
+    while (ls != NONE) {
+        lines = lines + 1;
+        ls = next_line(s, ls);
+    }
+    assert lines == 10;
+    ls = 0;
+    assert column(s, ls) == COL_TODO;
+    ls = next_line(s, ls);
+    assert column(s, ls) == COL_BACKLOG;
+    ls = next_line(s, ls);
+    assert card_num(s, ls) == 11264;
+    assert column(s, ls) == COL_HIDDEN;
+    ls = next_line(s, ls);
+    assert is_pr(s, ls);
+    assert column(s, ls) == COL_REVIEW;
+    ls = next_line(s, ls);
+    assert card_num(s, ls) == 10938;
+    assert column(s, ls) == COL_DOING;
+    ls = next_line(s, ls);
+    assert column(s, ls) == COL_HIDDEN;
+    ls = next_line(s, ls);
+    assert column(s, ls) == COL_HIDDEN;
+    ls = next_line(s, ls);
+    assert card_num(s, ls) == 11277;
+    assert column(s, ls) == COL_DONE;
+    ls = next_line(s, ls);
+    assert state_days(s, ls) == 20;
+    assert column(s, ls) == COL_HIDDEN;
+    ls = next_line(s, ls);
+    assert card_num(s, ls) == 11104;
+    assert column(s, ls) == COL_TODO;
+}
+
+test the_column_counts_of_the_sample {
+    const s : string = SAMPLE;
+    assert count_in(s, COL_BACKLOG) == 1;
+    assert count_in(s, COL_TODO) == 2;
+    assert count_in(s, COL_DOING) == 1;
+    assert count_in(s, COL_REVIEW) == 1;
+    assert count_in(s, COL_DONE) == 1;
+    assert count_in(s, COL_HIDDEN) == 4;
+    assert count_in(s, COL_BACKLOG) + count_in(s, COL_TODO) + count_in(s, COL_DOING) + count_in(s, COL_REVIEW) + count_in(s, COL_DONE) + count_in(s, COL_HIDDEN) == 10;
+    assert count_in("", COL_TODO) == 0;
+}
+
+test every_drawn_card_has_at_least_one_agent_owner_first {
+    const s : string = SAMPLE;
+    var c : u32 = 0;
+    var cards : u32 = 0;
+    while (c < COL_COUNT) {
+        var k : u32 = 0;
+        while (k < count_in(s, c)) {
+            const ls : u32 = nth_card(s, c, k);
+            assert ls != NONE;
+            assert agent_count(s, ls) >= 1;
+            assert agent_count(s, ls) <= MAX_CHIPS;
+            assert agent_at(s, ls, 0) >= 1;
+            assert agent_at(s, ls, 0) <= 27;
+            assert agent_at(s, ls, agent_count(s, ls)) == 0;
+            assert card_tool(s, ls) == agent_at(s, ls, 0);
+            cards = cards + 1;
+            k = k + 1;
+        }
+        c = c + 1;
+    }
+    assert cards == 6;
+}
+
+test agents_come_from_the_letters_field_owner_first_distinct {
+    const s : string = SAMPLE;
+    const epic : u32 = nth_card(s, COL_TODO, 0);
+    assert card_num(s, epic) == 11275;
+    assert agent_count(s, epic) == 1;
+    assert agent_at(s, epic, 0) == 26;
+    const pr : u32 = nth_card(s, COL_REVIEW, 0);
+    assert card_num(s, pr) == 11278;
+    assert agent_count(s, pr) == 1;
+    const wid : u32 = nth_card(s, COL_DOING, 0);
+    assert card_num(s, wid) == 10938;
+    assert agent_count(s, wid) == 2;
+    assert agent_at(s, wid, 0) == 26;
+    assert agent_at(s, wid, 1) == 3;
+    assert agent_at(s, wid, 2) == 0;
+    const job : u32 = nth_card(s, COL_BACKLOG, 0);
+    assert agent_at(s, job, 0) == 10;
+    // no paths at all: pinned to the fallback letter, a card is never agentless
+    const bare : u32 = nth_card(s, COL_TODO, 1);
+    assert card_num(s, bare) == 11104;
+    assert raw_agent_at(s, bare, 0) == 0;
+    assert agent_count(s, bare) == 1;
+    assert agent_at(s, bare, 0) == FALLBACK_LETTER;
+    assert agent_at(s, bare, 1) == 0;
+    // a repeat, a zero and a letter past 27 are skipped; at most MAX_CHIPS are used
+    const odd : string = "issue\t1\topen\tt\t\tdocs/a.md\t3,3,0,28,10,27,5,7\n";
+    assert agent_count(odd, 0) == 3;
+    assert agent_at(odd, 0, 0) == 3;
+    assert agent_at(odd, 0, 1) == 10;
+    assert agent_at(odd, 0, 2) == 27;
+    assert agent_at(odd, 0, 3) == 0;
+}
+
+test the_counted_title_and_labels_are_read_without_copying {
+    const s : string = SAMPLE;
+    const epic : u32 = nth_card(s, COL_TODO, 0);
+    assert title_len(s, epic) == 57;
+    assert has_label(s, epic, "epic");
+    assert has_label(s, epic, "t27os");
+    assert has_label(s, epic, "epi") == false;
+    assert has_label(s, epic, "backlog") == false;
+    assert has_label(s, nth_card(s, COL_REVIEW, 0), "epic") == false;
+    assert card_num(s, nth_card(s, COL_DONE, 0)) == 11277;
+    assert state_byte(s, nth_card(s, COL_DONE, 0)) == 109;
+}
+
+test the_done_window_is_seven_days_and_a_closed_issue_without_pr_is_done {
+    const a : string = "issue\t5\tclosed/7\tx\t\tdocs/a.md\t5\n";
+    const b : string = "issue\t6\tclosed/8\tx\t\tdocs/a.md\t5\n";
+    const c : string = "pr\t7\tclosed/1\t0\tpass\tx\tdocs/a.md\t5\n";
+    const d : string = "pr\t8\topen\t0\tnone\tx\tdocs/a.md\t5\n";
+    const e : string = "pr\t9\topen\t0\treview\tx\tdocs/a.md\t5\n";
+    assert column(a, 0) == COL_DONE;
+    assert column(b, 0) == COL_HIDDEN;
+    assert column(c, 0) == COL_HIDDEN;
+    assert column(d, 0) == COL_DOING;
+    assert column(e, 0) == COL_REVIEW;
+}
+
+test drag_rules_each_allowed_move_implies_one_action {
+    assert drag_action(COL_BACKLOG, COL_TODO, 0) == ACT_PARK;
+    assert drag_action(COL_TODO, COL_BACKLOG, 0) == ACT_PARK;
+    assert drag_action(COL_TODO, COL_DOING, 0) == ACT_START_AGENT;
+    assert drag_action(COL_TODO, COL_DOING, 2) == ACT_START_AGENT;
+    assert drag_action(COL_DOING, COL_TODO, 3) == ACT_PAUSE;
+    assert drag_action(COL_DOING, COL_REVIEW, 3) == ACT_REQUEST_REVIEW;
+    assert drag_action(COL_REVIEW, COL_DOING, 1) == ACT_REWORK;
+    assert drag_action(COL_TODO, COL_TODO, 0) == ACT_NONE;
+    assert drag_allowed(COL_TODO, COL_DOING, 0);
+    assert drag_allowed(COL_DOING, COL_REVIEW, 1);
+}
+
+test merge_is_never_forced_and_done_is_never_left {
+    assert drag_action(COL_REVIEW, COL_DONE, 0) == ACT_MERGE_ONLY;
+    assert drag_allowed(COL_REVIEW, COL_DONE, 0) == false;
+    var f : u32 = 0;
+    while (f < COL_COUNT) {
+        // nothing is dropped into DONE except through the merge (refused or merge-only), and DONE is a dead end
+        if (f != COL_DONE) { assert drag_allowed(f, COL_DONE, 0) == false; }
+        if (f != COL_DONE) { assert drag_action(COL_DONE, f, 0) == ACT_REFUSED; }
+        f = f + 1;
+    }
+    assert drag_action(COL_BACKLOG, COL_DOING, 0) == ACT_REFUSED;
+    assert drag_action(COL_DOING, COL_BACKLOG, 0) == ACT_REFUSED;
+    assert drag_action(COL_TODO, COL_REVIEW, 0) == ACT_REFUSED;
+    assert drag_action(COL_REVIEW, COL_TODO, 0) == ACT_REFUSED;
+    assert drag_action(9, COL_TODO, 0) == ACT_REFUSED;
+    assert drag_action(COL_TODO, COL_HIDDEN, 0) == ACT_REFUSED;
+}
+
+test the_wip_limit_of_doing_is_the_agent_cap {
+    assert WIP_DOING == 3;
+    assert WIP_DOING == MAX_CHIPS;
+    // the cap is the one of evolve.t27: GOD MODE refuses a 4th agent at exactly WIP_DOING running
+    assert why_not(true, true, WIP_DOING - 1, 0) != R_AGENT_CAP;
+    assert why_not(true, true, WIP_DOING, 0) == R_AGENT_CAP;
+    assert FALLBACK_LETTER == LETTER_UNOWNED;
+    assert wip_limit(COL_DOING) == WIP_DOING;
+    assert wip_limit(COL_TODO) == 0;
+    assert wip_full(COL_DOING, 2) == false;
+    assert wip_full(COL_DOING, 3);
+    assert wip_full(COL_DOING, 4);
+    assert wip_full(COL_TODO, 400) == false;
+    assert drag_action(COL_TODO, COL_DOING, 3) == ACT_WIP_FULL;
+    assert drag_action(COL_REVIEW, COL_DOING, 3) == ACT_WIP_FULL;
+    assert drag_allowed(COL_TODO, COL_DOING, 3) == false;
+    // pausing or reviewing frees a slot and is never blocked by the cap
+    assert drag_action(COL_DOING, COL_REVIEW, 3) == ACT_REQUEST_REVIEW;
+    // the sample holds 1 card in DOING: room for two more starts
+    assert wip_full(COL_DOING, count_in(SAMPLE, COL_DOING)) == false;
+}
+
+test the_tree_is_board_column_card_chip_and_badge {
+    assert child_kind(KK_BOARD, 0) == KK_COLUMN;
+    assert child_kind(KK_COLUMN, 0) == KK_CARD;
+    assert child_kind(KK_CARD, 0) == KK_CHIP;
+    assert child_kind(KK_CARD, 1) == KK_BADGE;
+    assert child_kind(KK_CHIP, 0) == KK_KINDS;
+    assert child_kind(KK_BADGE, 0) == KK_KINDS;
+    assert child_kind(KK_BOARD, 1) == KK_KINDS;
+    assert column_name(COL_REVIEW) == "REVIEW";
+    assert column_name(COL_HIDDEN) == "";
+}
+
+test the_layout_nests_five_columns_of_cards_with_the_dash_packer {
+    const w : f64 = 1000.0;
+    // 5 columns, 4 gaps of 6, padding 8 each side: (1000 - 16 - 24) / 5 = 192
+    assert col_w(w) == 192.0;
+    assert col_x(0, w) == 8.0;
+    assert col_x(1, w) == 206.0;
+    assert col_x(4, w) == 8.0 + 4.0 * 198.0;
+    assert card_w(w) == 184.0;
+    assert card_x(0, w) == 12.0;
+    assert card_y(0) == 36.0;
+    assert card_y(1) == 106.0;
+    assert col_h(0) == 36.0;
+    assert col_h(2) == 28.0 + 134.0 + 8.0;
+    assert board_h(2) == 8.0 + col_h(2) + 8.0;
+    assert chip_x(0, w, 1) == 12.0 + 4.0 + 24.0;
+    // the rects stay inside the board
+    assert col_x(4, w) + col_w(w) + PAD == w;
+}
+
+test hit_testing_finds_the_column_then_the_card_and_misses_in_the_gaps {
+    const w : f64 = 1000.0;
+    assert column_at(w, 10.0) == COL_BACKLOG;
+    assert column_at(w, 210.0) == COL_TODO;
+    assert column_at(w, 500.0) == COL_DOING;
+    assert column_at(w, 990.0) == COL_DONE;
+    assert column_at(w, 203.0) == COL_HIDDEN;
+    assert column_at(w, 2.0) == COL_HIDDEN;
+    assert card_at(3, w, 1, card_x(1, w) + 5.0, card_y(0) + 5.0) == 0;
+    assert card_at(3, w, 1, card_x(1, w) + 5.0, card_y(1) + 5.0) == 1;
+    assert card_at(3, w, 1, card_x(1, w) + 5.0, card_y(0) + CARD_H + 2.0) == 3;
+    assert card_at(3, w, 1, card_x(1, w) + 5.0, card_y(3) + 5.0) == 3;
+    assert card_at(3, w, 1, card_x(1, w) + 5.0, 5.0) == 3;
+}
