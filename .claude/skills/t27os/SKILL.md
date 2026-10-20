@@ -179,3 +179,8 @@ estimate label (bind to F_MEASURED), paper_claims, dataset/igla-coder MANIFEST.
 6. Promotion, only after the owner's Telegram yes: an X Article "T27 OS + Opus 5.5, full setup
    included", a 30-45 s video petals -> console -> live widget -> board blinking; no claim
    without its command.
+
+## Landing (GOD MODE lanes)
+
+GOD MODE lanes land through `own-git-landing` (law: `specs/queen/golden_chain.t27` section 6): verify
+locally, land on the local golden head, one batched GitHub push per window; never a push per commit.

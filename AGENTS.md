@@ -314,6 +314,14 @@ Each gate is a spec. Read the spec, not a summary of it.
 
 ---
 
+## Landing work: our git first, GitHub once per batch (owner rule, 2026-10-20, #11275)
+
+GitHub's Actions queue is the bottleneck (800-900 queued runs, #10644). A lane verifies locally first
+(`t27b test`, `t27c test-report`, seal, gen), lands on the local golden head by compare-and-swap, and
+GitHub receives one batched push per window, never one per commit; a red batch is bisected locally by
+verdicts. The law is `specs/queen/golden_chain.t27` section 6; the practices, commands and traps are
+the skill `own-git-landing`.
+
 ## Only t27 (owner hard rule, 2026-10-05)
 
 Owner's rule, 2026-10-05: no new commit or pull request may contain code in
