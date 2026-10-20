@@ -5,7 +5,8 @@
 ; Owner, 2026-10-19: a KEYS tab modelled on trios, every key managed by one manager written in .t27.
 ; Mirrors the trios SR-00 decisions (not the Swift): ModelProvider, ModelKeyRotation (least recently used
 ; plus cooldown), ProviderCircuitBreaker, ProviderStatusService, KeychainSecrets.
-; Storage is the macOS Keychain, service "ai.t27.os", one item per provider (account = provider name).
+; Storage is the macOS Keychain, service "ai.t27.os", one item per key (account = provider name for key 1,
+; "<name>#2" .. "<name>#8" for the others, keychain_account_n).
 ; Never a plain file and never the repo. This spec holds no key and no syscall: the Keychain, the probe and
 ; the child environment are host calls (keys_host.t27, pty_server.t27); only the decisions live here, so
 ; they run their tests (a module with @extern imports cannot). Every test uses fake values.
@@ -822,18 +823,56 @@ pub fn pick_profile(stored: u32, bad: u32) -> u32 {
     return next_profile(PR_NONE, stored, bad);
 }
 
-/// How many keys one provider may hold, numbered from 1 (Free Claude Code: "key 1 first").
-pub const MAX_KEYS : u32 = 3;
+/// How many keys one provider may hold, numbered from 1 (Free Claude Code: "key 1 first"). Eight, since the
+/// owner stores seven z.ai keys and rotates over all of them (gHashTag/t27#11241).
+pub const MAX_KEYS : u32 = 8;
 
 /// The Keychain item of key number k (0-based; the panel says "key k+1") of provider p. Key 1 keeps the
-/// plain label of keychain_label, so a key stored before numbering stays where it is; keys 2 and 3 add
-/// "#2" and "#3". 0 for an unknown provider or a number past MAX_KEYS.
+/// plain label of keychain_label, so a key stored before numbering stays where it is; keys 2 to 8 add
+/// "#2" to "#8". 0 for an unknown provider or a number past MAX_KEYS.
 pub fn keychain_label_n(p: u32, k: u32, out: []u8) -> usize {
     if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return 0; }
     var n : usize = keychain_label(p, out);
     if (k == 0) { return n; }
     n = put_bytes(out, n, "#");
     return put_dec(out, n, @as(u64, k) + 1);
+}
+
+/// The Keychain account of key number k of provider p: the provider's name for key 1 and "<name>#<k+1>" for
+/// the others ("zai", "zai#2", ...); the service is KEYCHAIN_SERVICE for all. 0 when p or k is out of range.
+pub fn keychain_account_n(p: u32, k: u32, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return 0; }
+    var n : usize = provider_name(p, out);
+    if (k == 0) { return n; }
+    n = put_bytes(out, n, "#");
+    return put_dec(out, n, @as(u64, k) + 1);
+}
+
+/// What a KEYS row says next to the provider's name: nothing for no key, "1 key", "7 keys".
+pub fn key_count_text(n: u32, out: []u8) -> usize {
+    if (n == 0) { return 0; }
+    const c : usize = put_dec(out, 0, @as(u64, n));
+    if (n == 1) { return put_bytes(out, c, " key"); }
+    return put_bytes(out, c, " keys");
+}
+
+/// A key travels to the PTY server in an OP_SETKEY frame whose pane byte names the provider; the key number
+/// rides in the high nibble of that byte (k * 16 + p), so key 1 is the old frame byte for byte and an
+/// older server refuses the others instead of misreading them.
+pub const SETKEY_STEP : u32 = 16;
+
+pub fn setkey_byte(p: u32, k: u32) -> u32 {
+    return k * SETKEY_STEP + p;
+}
+
+/// The provider and the key number an OP_SETKEY pane byte names; the provider is PROVIDER_COUNT or more when
+/// the byte is not one the server knows (the caller refuses it), the number is MAX_KEYS or more when too big.
+pub fn setkey_provider(b: u32) -> u32 {
+    return b % SETKEY_STEP;
+}
+
+pub fn setkey_number(b: u32) -> u32 {
+    return b / SETKEY_STEP;
 }
 
 /// The bad mask from the providers' statuses (st[p]): invalid and circuit-open keys are not offered.
@@ -883,7 +922,10 @@ pub const FC_NO_BALANCE : u32 = 2;
 pub const FC_SUBSCRIPTION : u32 = 3;
 pub const FC_LOGIN_REJECTED : u32 = 4;
 pub const FC_OTHER : u32 = 5;
-pub const FC_WORDS : str = "no error,rate limited (429),out of balance,subscription disabled,login rejected (401/403),other error";
+/// The provider shed the request: HTTP 529, z.ai code 1305 "service may be temporarily overloaded".
+/// Measured 2026-10-20: on the free flash model five of seven z.ai keys answered it at once and one answered 200.
+pub const FC_OVERLOADED : u32 = 6;
+pub const FC_WORDS : str = "no error,rate limited (429),out of balance,subscription disabled,login rejected (401/403),other error,overloaded (529)";
 
 /// What to do about it.
 pub const FA_KEEP : u32 = 0;
@@ -933,16 +975,48 @@ pub fn has_code(hay: []const u8, code: []const u8) -> bool {
 
 /// The failure class of one screen line, by plain byte matching. The two phrases are specific enough alone;
 /// a bare status number counts only on a line that also says "error" (so "Edited 429 lines" is not a 429).
-/// "Insufficient balance" wins over 429: the provider sends both for an empty account. An "API Error" line
-/// that matches nothing is FC_OTHER; any other line is FC_NONE.
+/// "Insufficient balance" (or its code, 1113) wins over 429: the provider sends both for an empty account.
+/// An overload (529, code 1305, or the word "overloaded") wins over 429 too: z.ai sends 1305 under either
+/// status, and a throttled key rests longer than a busy one. An "API Error" line that matches nothing is
+/// FC_OTHER; any other line is FC_NONE.
 pub fn classify_line(line: []const u8) -> u32 {
     if (has_bytes(line, "disabled Claude subscription")) { return FC_SUBSCRIPTION; }
     if (has_bytes(line, "Insufficient balance")) { return FC_NO_BALANCE; }
     if (has_bytes(line, "rror") == false) { return FC_NONE; }
+    if (has_code(line, "1113")) { return FC_NO_BALANCE; }
+    if (has_code(line, "529") or has_code(line, "1305") or has_bytes(line, "verloaded")) { return FC_OVERLOADED; }
     if (has_code(line, "429")) { return FC_RATE_LIMITED; }
     if (has_code(line, "401") or has_code(line, "403")) { return FC_LOGIN_REJECTED; }
     if (has_bytes(line, "API Error")) { return FC_OTHER; }
     return FC_NONE;
+}
+
+/// Does `hay` start with `needle`?
+pub fn begins_with(hay: []const u8, needle: []const u8) -> bool {
+    if (needle.len > hay.len) { return false; }
+    var i : usize = 0;
+    while (i < needle.len) {
+        if (hay[i] != needle[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Is this screen line the error row Claude Code prints, and the final one? classify_line may be run on it
+/// only then, never on the body of the transcript: a diff or a quoted line that shows "Insufficient balance"
+/// or "API Error: 429" starts with something else (a +, a quote, a word) and would otherwise make the pane
+/// leave a healthy provider. Leading blanks are skipped. A row that says "Retrying" is Claude Code's own retry
+/// in flight and the turn is still alive; the failover waits for the final row, when nothing is left to lose.
+pub fn error_row(line: []const u8) -> bool {
+    var a : usize = 0;
+    while (a < line.len and line[a] == 32) { a = a + 1; }
+    const t : []const u8 = line[a .. line.len];
+    if (has_bytes(t, "Retrying")) { return false; }
+    if (begins_with(t, "API Error")) { return true; }
+    if (begins_with(t, "Error")) { return true; }
+    if (begins_with(t, "Request failed")) { return true; }
+    if (begins_with(t, "Your organization has disabled")) { return true; }
+    return begins_with(t, "Insufficient balance");
 }
 
 /// The bad mask after a failure of class `class` on profile pr: the profile's provider joins it. A line that
@@ -959,13 +1033,13 @@ pub fn fo_bad(class: u32, pr: u32, bad: u32) -> u32 {
 /// started without a key, which is where the "disabled Claude subscription access" line comes from).
 /// `stored` and `bad` are the provider masks (bad: providers that failed for this pane or their check),
 /// `done` the failovers this pane has had, `alt` whether another key of pr's provider is usable now
-/// (rotate_pick_except over the keys, the failed one skipped). A throttled key (429) with another key at hand
-/// swaps the key and keeps the profile; every other failure leaves the profile for the next one in the chain;
-/// when none is left, or the cap is reached, the pane stays as it is.
+/// (rotate_pick_except over the keys, the failed one skipped). A throttled (429) or overloaded (529) key with
+/// another key at hand swaps the key and keeps the profile; every other failure leaves the profile for the
+/// next one in the chain; when none is left, or the cap is reached, the pane stays as it is.
 pub fn fo_action(class: u32, pr: u32, stored: u32, bad: u32, done: u32, alt: bool) -> u32 {
     if (class == FC_NONE or class == FC_OTHER) { return FA_KEEP; }
     if (done >= MAX_FAILOVERS) { return FA_GIVE_UP; }
-    if (class == FC_RATE_LIMITED and alt and pr < PROFILE_COUNT) { return FA_RESPAWN_KEY; }
+    if ((class == FC_RATE_LIMITED or class == FC_OVERLOADED) and alt and pr < PROFILE_COUNT) { return FA_RESPAWN_KEY; }
     if (next_profile(pr, stored, fo_bad(class, pr, bad)) == PR_NONE) { return FA_GIVE_UP; }
     return FA_RESPAWN_NEXT;
 }
@@ -1002,6 +1076,45 @@ pub fn fo_why(class: u32, pr: u32, act: u32, nxt: u32, done: u32, out: []u8) -> 
     }
     if (done >= MAX_FAILOVERS) { return put_bytes(out, n, ", failover limit reached, the pane stays"); }
     return put_bytes(out, n, ", no profile left in the chain, the pane stays");
+}
+
+/// How long a key rests after it caused a failure of class `class` (seconds): a throttled key 30 s, an
+/// overloaded one 60 s (the service is busy, not the key, but the same key would meet the same queue), a key
+/// with no balance 10 min, a rejected key an hour; a failure that names no key rests none.
+pub const OVERLOAD_COOLDOWN_S : u64 = 60;
+pub const BALANCE_REST_S : u64 = 600;
+pub const REJECT_REST_S : u64 = 3600;
+
+pub fn key_rest_after(class: u32) -> u64 {
+    if (class == FC_RATE_LIMITED) { return RATE_COOLDOWN_S; }
+    if (class == FC_OVERLOADED) { return OVERLOAD_COOLDOWN_S; }
+    if (class == FC_NO_BALANCE) { return BALANCE_REST_S; }
+    if (class == FC_LOGIN_REJECTED) { return REJECT_REST_S; }
+    return 0;
+}
+
+/// The rest_until of a key slot that holds no key: no clock reaches it, so rotation never picks it.
+pub const KEY_NEVER : u64 = 99999999999;
+
+/// The key a new pane starts with: rotate_pick_except, and when every key is resting, the one whose rest ends
+/// first (a pane with a resting key is better than a pane with none). Slots that hold no key carry KEY_NEVER
+/// and are never taken. Returns n when the provider holds no usable key but the skipped one.
+pub fn rotate_pick_soft(n: u32, skip: u32, last_used: []const u64, rest_until: []const u64, now: u64) -> u32 {
+    const k : u32 = rotate_pick_except(n, skip, last_used, rest_until, now);
+    if (k != n) { return k; }
+    var best : u32 = n;
+    var i : u32 = 0;
+    while (i < n) {
+        if (rest_until[i] < KEY_NEVER and i != skip) {
+            if (best == n) {
+                best = i;
+            } else if (rest_until[i] < rest_until[best]) {
+                best = i;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
 }
 
 /// z.ai has no cheap GET that proves a key opens the Anthropic-protocol route, so its check is one
@@ -1243,11 +1356,218 @@ test a_screen_line_is_sorted_into_a_failure_class {
     assert classify_line("Your organization has disabled Claude subscription access") == FC_SUBSCRIPTION;
     assert classify_line("API Error: 401 invalid credentials") == FC_LOGIN_REJECTED;
     assert classify_line("Request failed with error 403 forbidden") == FC_LOGIN_REJECTED;
-    assert classify_line("API Error: 500 upstream overloaded") == FC_OTHER;
+    assert classify_line("API Error: 500 upstream failure") == FC_OTHER;
     assert classify_line("Edited 429 lines in 3 files") == FC_NONE;
     assert classify_line("error: read 14290 tokens") == FC_NONE;
     assert classify_line("Reading specs/t27os/keys.t27") == FC_NONE;
     assert classify_line("") == FC_NONE;
+}
+
+test an_overload_is_its_own_class_and_the_balance_code_still_marks_the_key_bad {
+    // what z.ai answered on the free flash model, 2026-10-20 (code 1305, HTTP 529 or 429)
+    assert classify_line("API Error: 529 {\"error\":{\"code\":\"1305\",\"message\":\"The service may be temporarily overloaded\"}}") == FC_OVERLOADED;
+    assert classify_line("API Error: 429 {\"error\":{\"code\":\"1305\",\"message\":\"overloaded, retry\"}}") == FC_OVERLOADED;
+    assert classify_line("API Error (529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}})") == FC_OVERLOADED;
+    assert classify_line("Request failed with error 1305") == FC_OVERLOADED;
+    assert classify_line("error 529") == FC_OVERLOADED;
+    // the paid models answered 1113: still out of balance, even next to a 429 or the word overloaded
+    assert classify_line("API Error: 429 {\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance\"}}") == FC_NO_BALANCE;
+    assert classify_line("API Error: 429 {\"error\":{\"code\":\"1113\"") == FC_NO_BALANCE;
+    assert classify_line("API Error: 429 code 1113 overloaded") == FC_NO_BALANCE;
+    // a number glued to digits, or a line that is no error, is no overload
+    assert classify_line("error 5290") == FC_NONE;
+    assert classify_line("error 13050") == FC_NONE;
+    assert classify_line("Edited 529 lines in 3 files") == FC_NONE;
+    assert classify_line("the service was overloaded earlier") == FC_NONE;
+    assert classify_line("API Error: 429 rate limit reached") == FC_RATE_LIMITED;
+}
+
+test only_an_error_row_is_ever_classified_never_the_body_of_the_transcript {
+    assert error_row("API Error: 529 {\"error\":{\"code\":\"1305\"}}");
+    assert error_row("   API Error: 429 Insufficient balance");
+    assert error_row("Error: 401 invalid credentials");
+    assert error_row("Request failed with error 403");
+    assert error_row("Your organization has disabled Claude subscription access");
+    assert error_row("Insufficient balance or no resource package");
+    // a diff or a quoted line that merely shows the phrases
+    assert error_row("+    assert classify_line(\"API Error: 429 Insufficient balance\") == FC_NO_BALANCE;") == false;
+    assert error_row("The log said API Error: 529 yesterday") == false;
+    assert error_row("  - Error handling for 429 added") == false;
+    assert error_row("Reading specs/t27os/keys.t27") == false;
+    assert error_row("") == false;
+    assert error_row("   ") == false;
+    // Claude Code's own retry in flight: the turn is alive, the failover waits
+    assert error_row("API Error (529 overloaded_error) Retrying in 4 seconds (attempt 2/10)") == false;
+    assert begins_with("abc", "ab");
+    assert begins_with("abc", "abcd") == false;
+    assert begins_with("abc", "");
+    assert begins_with("", "a") == false;
+}
+
+test an_overloaded_key_with_a_spare_swaps_the_key_and_keeps_the_profile {
+    assert fo_action(FC_OVERLOADED, PR_ZAI, 57, 0, 0, true) == FA_RESPAWN_KEY;
+    assert fo_target(FC_OVERLOADED, PR_ZAI, 57, 0, 0, true) == PR_ZAI;
+    // no other key usable now: the pane leaves the profile, as for a throttled key with no spare
+    assert fo_action(FC_OVERLOADED, PR_ZAI, 57, 0, 0, false) == FA_RESPAWN_NEXT;
+    assert fo_target(FC_OVERLOADED, PR_ZAI, 57, 0, 0, false) == PR_ANTHROPIC;
+    assert fo_action(FC_OVERLOADED, PR_ZAI, 16, 0, 0, false) == FA_GIVE_UP;
+    assert fo_action(FC_OVERLOADED, PR_NONE, 57, 0, 0, true) == FA_RESPAWN_NEXT;
+    assert fo_action(FC_OVERLOADED, PR_ZAI, 57, 0, MAX_FAILOVERS, true) == FA_GIVE_UP;
+    var done : u32 = 0;
+    while (done < 40 and fo_action(FC_OVERLOADED, PR_ZAI, 57, 0, done, true) == FA_RESPAWN_KEY) {
+        done = done + 1;
+    }
+    assert done == MAX_FAILOVERS;
+}
+
+test the_overload_why_line_names_the_class_and_never_a_key {
+    var o : [128]u8 = undefined;
+    const n : usize = fo_why(FC_OVERLOADED, PR_ZAI, FA_RESPAWN_KEY, PR_ZAI, 1, o[0..128]);
+    assert has_bytes(o[0..n], "claude: zai overloaded (529), same profile with the next key");
+    const m : usize = fo_why(FC_OVERLOADED, PR_ZAI, FA_RESPAWN_NEXT, PR_ANTHROPIC, 1, o[0..128]);
+    assert has_bytes(o[0..m], "zai overloaded (529), respawn on anthropic-api");
+    assert csv_fields(FC_WORDS) == FC_OVERLOADED + 1;
+}
+
+test a_failed_key_rests_by_the_kind_of_failure {
+    assert key_rest_after(FC_RATE_LIMITED) == RATE_COOLDOWN_S;
+    assert key_rest_after(FC_OVERLOADED) == OVERLOAD_COOLDOWN_S;
+    assert key_rest_after(FC_NO_BALANCE) == BALANCE_REST_S;
+    assert key_rest_after(FC_LOGIN_REJECTED) == REJECT_REST_S;
+    assert key_rest_after(FC_NONE) == 0;
+    assert key_rest_after(FC_OTHER) == 0;
+    assert key_rest_after(FC_SUBSCRIPTION) == 0;
+    assert key_rest_after(FC_OVERLOADED) > key_rest_after(FC_RATE_LIMITED);
+    assert key_rest_after(FC_NO_BALANCE) > key_rest_after(FC_OVERLOADED);
+    assert key_rest_after(FC_LOGIN_REJECTED) > key_rest_after(FC_NO_BALANCE);
+}
+
+test a_pane_takes_a_resting_key_only_when_no_key_is_free {
+    var used : [4]u64 = [50, 10, 30, 0];
+    var rest : [4]u64 = [0, 0, 0, KEY_NEVER];
+    // slot 3 holds no key: never taken; the key used longest ago wins
+    assert rotate_pick_soft(4, 4, used[0..4], rest[0..4], 100) == 1;
+    assert rotate_pick_soft(4, 1, used[0..4], rest[0..4], 100) == 2;
+    // every present key rests: the one that is free first
+    rest[0] = 300;
+    rest[1] = 200;
+    rest[2] = 250;
+    assert rotate_pick_except(4, 4, used[0..4], rest[0..4], 100) == 4;
+    assert rotate_pick_soft(4, 4, used[0..4], rest[0..4], 100) == 1;
+    assert rotate_pick_soft(4, 1, used[0..4], rest[0..4], 100) == 2;
+    // only the skipped key is left: none
+    rest[0] = KEY_NEVER;
+    rest[2] = KEY_NEVER;
+    assert rotate_pick_soft(4, 1, used[0..4], rest[0..4], 100) == 4;
+    assert rotate_pick_soft(4, 4, used[0..4], rest[0..4], 100) == 1;
+    rest[1] = KEY_NEVER;
+    assert rotate_pick_soft(4, 4, used[0..4], rest[0..4], 100) == 4;
+}
+
+test eight_keys_rotate_so_each_is_used_once_before_any_is_used_twice {
+    var used : [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    var rest : [8]u64 = [0, 0, 0, 0, 0, 0, 0, KEY_NEVER];
+    var seen : u32 = 0;
+    var t : u64 = 1;
+    var round : u32 = 0;
+    while (round < 7) {
+        const k : u32 = rotate_pick(8, used[0..8], rest[0..8], t);
+        assert k < 7;
+        assert (seen >> k) % 2 == 0;
+        seen = seen + (1 << k);
+        used[k] = t;
+        t = t + 1;
+        round = round + 1;
+    }
+    assert seen == 127;
+    assert rotate_pick(8, used[0..8], rest[0..8], t) == 0;
+}
+
+test the_account_of_key_k_is_the_provider_name_with_a_number {
+    var a : [32]u8 = undefined;
+    assert keychain_account_n(P_ZAI, 0, a[0..32]) == 3;
+    assert a[0] == 122 and a[2] == 105;
+    assert keychain_account_n(P_ZAI, 1, a[0..32]) == 5;
+    assert a[3] == 35 and a[4] == 50;
+    assert keychain_account_n(P_ZAI, 6, a[0..32]) == 5;
+    assert a[3] == 35 and a[4] == 55;
+    assert keychain_account_n(P_ANTHROPIC, 7, a[0..32]) == 11;
+    assert a[9] == 35 and a[10] == 56;
+    assert keychain_account_n(P_ZAI, MAX_KEYS, a[0..32]) == 0;
+    assert keychain_account_n(PROVIDER_COUNT, 0, a[0..32]) == 0;
+    assert MAX_KEYS == 8;
+    var l : [48]u8 = undefined;
+    assert keychain_label_n(P_ZAI, 7, l[0..48]) == 15;
+    assert l[13] == 35 and l[14] == 56;
+}
+
+test each_agent_cli_gets_the_variable_of_every_provider_it_reads_and_no_other {
+    // The pane's environment is built from AGENT_PROVIDERS and PROVIDER_ENVS only (pty_server inject_keys), one
+    // variable per provider the cell reads, carrying the key the rotation picked. These are the pairs.
+    var o : [40]u8 = undefined;
+    var n : usize = provider_env(P_OPENAI, o[0..40]);
+    assert agent_uses(1, P_OPENAI) and has_bytes(o[0..n], "OPENAI_API_KEY") and n == 14;
+    n = provider_env(P_GEMINI, o[0..40]);
+    assert agent_uses(2, P_GEMINI) and has_bytes(o[0..n], "GEMINI_API_KEY") and n == 14;
+    n = provider_env(P_ZAI, o[0..40]);
+    assert agent_uses(5, P_ZAI) and has_bytes(o[0..n], "ZAI_API_KEY") and n == 11;
+    n = provider_env(P_CURSOR, o[0..40]);
+    assert agent_uses(6, P_CURSOR) and has_bytes(o[0..n], "CURSOR_API_KEY") and n == 14;
+    n = provider_env(P_GITHUB, o[0..40]);
+    assert agent_uses(8, P_GITHUB) and has_bytes(o[0..n], "GITHUB_TOKEN") and n == 12;
+    n = provider_env(P_OPENROUTER, o[0..40]);
+    assert agent_uses(3, P_OPENROUTER) and agent_uses(7, P_OPENROUTER) and has_bytes(o[0..n], "OPENROUTER_API_KEY");
+    // a cell never gets a variable of a provider it does not read
+    assert agent_uses(1, P_ZAI) == false;
+    assert agent_uses(2, P_OPENAI) == false;
+    assert agent_uses(8, P_ANTHROPIC) == false;
+    assert agent_uses(6, P_GITHUB) == false;
+    // Claude Code is the one cell with profile variables, and its z.ai profile reads the z.ai provider's keys
+    assert profile_agent(0) and profile_agent(5) == false;
+    assert PROFILE_PROVIDER[PR_ZAI] == P_ZAI;
+    // every provider a cell reads has a variable name
+    var a : u32 = 0;
+    while (a < AGENT_COUNT) {
+        var p : u32 = 0;
+        while (p < PROVIDER_COUNT) {
+            if (agent_uses(a, p)) { assert provider_env(p, o[0..40]) > 0; }
+            p = p + 1;
+        }
+        a = a + 1;
+    }
+}
+
+test a_keys_row_says_how_many_keys_the_provider_holds {
+    var o : [24]u8 = undefined;
+    assert key_count_text(0, o[0..24]) == 0;
+    assert key_count_text(1, o[0..24]) == 5;
+    assert o[0] == 49 and o[2] == 107 and o[4] == 121;
+    assert key_count_text(7, o[0..24]) == 6;
+    assert o[0] == 55 and o[5] == 115;
+    assert key_count_text(MAX_KEYS, o[0..24]) == 6;
+    assert o[0] == 56;
+}
+
+test the_key_number_rides_in_the_high_nibble_of_the_setkey_byte {
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        var k : u32 = 0;
+        while (k < MAX_KEYS) {
+            const b : u32 = setkey_byte(p, k);
+            assert b < 256;
+            assert setkey_provider(b) == p;
+            assert setkey_number(b) == k;
+            k = k + 1;
+        }
+        p = p + 1;
+    }
+    // key 1 is the old frame byte
+    assert setkey_byte(P_ZAI, 0) == P_ZAI;
+    assert setkey_number(P_GONKA) == 0;
+    // a byte from a newer client that this table cannot hold reads as unknown
+    assert setkey_provider(setkey_byte(11, 0)) >= PROVIDER_COUNT;
+    assert PROVIDER_COUNT <= SETKEY_STEP;
+    assert MAX_KEYS * SETKEY_STEP <= 256;
 }
 
 test a_failure_marks_the_provider_bad_for_this_pane {
