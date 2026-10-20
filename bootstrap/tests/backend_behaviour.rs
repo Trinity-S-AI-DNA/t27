@@ -736,3 +736,13 @@ fn rust_lowers_log2_to_a_method() {
     };
     assert_eq!(out, "3");
 }
+
+#[test] // #11182: slices beside a `len` field and `[N]str` elements build with rustc; a `[]T` field filled from borrowed storage is refused
+fn gen_rust_slice_lengths_text_elements_and_borrowed_slice_fields() {
+    rust_says(include_str!("../../specs/compiler/rust_slice_lowering.t27"), "fn main(){}\n", "rust-slice-lowering");
+    for f in std::fs::read_dir(gate_fixture("../rust_slice_fields")).unwrap().flatten() {
+        let (out, refuse) = (t27c_on(&["gen-rust"], &f.path()), f.file_name().to_string_lossy().starts_with("refuse"));
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(out.status.success() != refuse && out.stdout.is_empty() == refuse && err.contains("#11182") == refuse, "{:?}: {err}", f.path());
+    }
+}
