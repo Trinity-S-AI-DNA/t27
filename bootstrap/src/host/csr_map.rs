@@ -154,15 +154,19 @@ mod tests {
 
     #[test]
     fn csr_offsets_strictly_increasing() {
-        for w in CSR_OFFSETS.windows(2) {
-            assert!(w[0] < w[1], "CSR offsets not strictly increasing");
+        let mut i = 1;
+        while i < CSR_COUNT {
+            assert!(CSR_OFFSETS[i - 1] < CSR_OFFSETS[i], "CSR offsets not strictly increasing");
+            i += 1;
         }
     }
 
     #[test]
     fn csr_offsets_step_is_four() {
-        for w in CSR_OFFSETS.windows(2) {
-            assert_eq!(w[1] - w[0], 4, "CSR offsets not contiguous by 4");
+        let mut i = 1;
+        while i < CSR_COUNT {
+            assert_eq!(CSR_OFFSETS[i] - CSR_OFFSETS[i - 1], 4, "CSR offsets not contiguous by 4");
+            i += 1;
         }
     }
 
@@ -192,9 +196,9 @@ mod tests {
 
     #[test]
     fn status_masks_are_powers_of_two() {
-        assert!(STATUS_BUSY_MASK.is_power_of_two());
-        assert!(STATUS_DONE_MASK.is_power_of_two());
-        assert!(STATUS_ERROR_MASK.is_power_of_two());
+        assert!(STATUS_BUSY_MASK != 0 && (STATUS_BUSY_MASK & (STATUS_BUSY_MASK - 1)) == 0);
+        assert!(STATUS_DONE_MASK != 0 && (STATUS_DONE_MASK & (STATUS_DONE_MASK - 1)) == 0);
+        assert!(STATUS_ERROR_MASK != 0 && (STATUS_ERROR_MASK & (STATUS_ERROR_MASK - 1)) == 0);
     }
 
     #[test]
