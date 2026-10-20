@@ -918,6 +918,125 @@ pub fn cache_free(keys: []const u64, n: u32) -> u32 {
 /// The slot to evict when none is free: round robin.
 pub fn cache_victim(next: u64, n: u32) -> u32 { return @as(u32, @intCast(next % @as(u64, n))); }
 
+; --- N9b. Virtual grid, thumbnails, fetch caps (owner, 2026-10-20: the instrument grid is heavy) ---------------
+; The window draws only the tiles that meet the visible scroll window, asks for the thumbnails of the tiles
+; within one row of it, and decodes them outside the draw path into small images (tile size x backing scale)
+; kept in an LRU. Everything below is a pure decision; the window only calls it.
+
+/// Rows of margin around the view within which a tile's thumbnail is requested (prefetch).
+pub const VIS_MARGIN_ROWS : u32 = 1;
+pub const THUMB_MIN : u32 = 24;
+pub const THUMB_PER_VISIBLE : u32 = 3;
+/// Curl children running at once.
+pub const FETCH_CAP : u32 = 4;
+/// Seconds between two scans for cards that are on disk.
+pub const POLL_S : u64 = 1;
+/// The backing scale the thumbnails are cut for.
+pub const THUMB_SCALE : f64 = 2.0;
+/// Bits of a cache key that hold the widget (+1); the rest is the last-use stamp.
+pub const TK_BITS : u64 = 65535;
+
+/// Does a rect (y, h) meet the view [vt, vb] widened by `margin` points on both sides?
+pub fn rect_visible(y: f64, h: f64, vt: f64, vb: f64, margin: f64) -> bool {
+    return y + h + margin >= vt and y - margin <= vb;
+}
+
+/// Does tile j of letter o, on a console whose top is `top`, meet the view [vt, vb] widened by `margin`?
+pub fn tile_visible(o: u32, j: u32, pw: f64, top: f64, vt: f64, vb: f64, margin: f64) -> bool {
+    return rect_visible(top + tile_ry(o, j, pw), cell_h(pw), vt, vb, margin);
+}
+
+/// How many of the cnt+1 tiles (the last is the '+' tile) meet the view widened by `margin`.
+pub fn tiles_visible(o: u32, cnt: u32, pw: f64, top: f64, vt: f64, vb: f64, margin: f64) -> u32 {
+    var n : u32 = 0;
+    var j : u32 = 0;
+    while (j <= cnt) {
+        if (tile_visible(o, j, pw, top, vt, vb, margin)) { n = n + 1; }
+        j = j + 1;
+    }
+    return n;
+}
+
+/// How many of those tiles enter the widened window when the view moves from [vt0, vb0] to [vt1, vb1]:
+/// the thumbnails a scroll step has to decode.
+pub fn tiles_entering(o: u32, cnt: u32, pw: f64, top: f64, vt0: f64, vb0: f64, vt1: f64, vb1: f64, margin: f64) -> u32 {
+    var n : u32 = 0;
+    var j : u32 = 0;
+    while (j < cnt) {
+        if (tile_visible(o, j, pw, top, vt1, vb1, margin) and tile_visible(o, j, pw, top, vt0, vb0, margin) == false) { n = n + 1; }
+        j = j + 1;
+    }
+    return n;
+}
+
+/// The thumbnails to keep: three times the tiles in view, between THUMB_MIN and the slots there are.
+pub fn thumb_cap(visible: u32) -> u32 {
+    const v : u32 = visible * THUMB_PER_VISIBLE;
+    if (v < THUMB_MIN) { return THUMB_MIN; }
+    if (v > CACHE_SLOTS) { return CACHE_SLOTS; }
+    return v;
+}
+
+/// The longest side of a thumbnail in pixels: the tile's width times the backing scale, rounded up.
+pub fn thumb_px(tile_w: f64, scale: f64) -> u32 {
+    const p : f64 = tile_w * scale + 0.999;
+    if (p < 16.0) { return 16; }
+    if (p > 1200.0) { return 1200; }
+    return @as(u32, @intFromFloat(p));
+}
+
+/// Bytes of a decoded RGBA image of a card scaled to a longest side of px (the card is CARD_W x CARD_H).
+pub fn card_bytes(px: u32) -> u64 {
+    const h : f64 = fl(px) * CARD_H / CARD_W;
+    return @as(u64, px) * @as(u64, @intFromFloat(h + 0.999)) * 4;
+}
+
+/// A cache key: widget wi + 1 in the low 16 bits, the use stamp above.
+pub fn tk_make(wi: u32, stamp: u64) -> u64 { return (stamp << 16) | (@as(u64, wi) + 1); }
+pub fn tk_wi1(k: u64) -> u64 { return k & TK_BITS; }
+pub fn tk_stamp(k: u64) -> u64 { return k >> 16; }
+
+/// The slot holding widget wi, n when none.
+pub fn tk_find(keys: []const u64, n: u32, wi: u32) -> u32 {
+    var s : u32 = 0;
+    while (s < n) {
+        if (tk_wi1(keys[s]) == @as(u64, wi) + 1) { return s; }
+        s = s + 1;
+    }
+    return n;
+}
+
+/// The slot a new thumbnail goes to: a free one while fewer than `cap` are held, else the least recently used.
+pub fn tk_slot(keys: []const u64, n: u32, cap: u32) -> u32 {
+    var used : u32 = 0;
+    var oldest : u32 = 0;
+    var best : u64 = 18446744073709551615;
+    var free : u32 = n;
+    var s : u32 = 0;
+    while (s < n) {
+        if (keys[s] == 0) {
+            if (free == n) { free = s; }
+        } else {
+            used = used + 1;
+            if (tk_stamp(keys[s]) < best) {
+                best = tk_stamp(keys[s]);
+                oldest = s;
+            }
+        }
+        s = s + 1;
+    }
+    if (used < cap and free < n) { return free; }
+    return oldest;
+}
+
+/// May a card scan run now? At most once per POLL_S, and only while some card is not cached.
+pub fn poll_due(now: u64, last: u64, cached: u32, total: u32) -> bool {
+    return cached < total and now >= last + POLL_S;
+}
+
+/// May another curl start with `running` already going?
+pub fn fetch_ok(running: u32) -> bool { return running < FETCH_CAP; }
+
 ; --- N10. Text of the page -------------------------------------------------------------------------------
 
 /// The readout of a console: "12 INSTRUMENTS" (or "1 INSTRUMENT", "IDLE").
@@ -1428,4 +1547,95 @@ test tile_code_names_what_the_hit_test_returns {
         assert h == tile_code(3, t);
         t = t + 1;
     }
+}
+
+test the_grid_draws_only_what_meets_the_view {
+    const pw : f64 = 950.0;
+    var ncon : [32]u32 = undefined;
+    const na : u32 = plan(11, ncon[0..32]);
+    ncon[1] = 0;
+    const cnt : u32 = ncon[0];
+    const top : f64 = con_top(11, ncon[0..32], na, pw, 0);
+    const ph : f64 = con_h(con_cells(11, cnt, pw), pw);
+    // a view the height of the window, at the top of the page, and the same view with the one-row margin
+    const inside : u32 = tiles_visible(11, cnt, pw, top, 0.0, 700.0, 0.0);
+    const ahead : u32 = tiles_visible(11, cnt, pw, top, 0.0, 700.0, cell_h(pw) + GAP);
+    assert inside > 0;
+    assert inside <= cnt + 1;
+    assert ahead >= inside;
+    assert ahead <= cnt + 1;
+    // a view far below the console meets nothing
+    assert tiles_visible(11, cnt, pw, top, top + ph + 2000.0, top + ph + 2700.0, 0.0) == 0;
+    // a view that holds the whole console meets every tile
+    assert tiles_visible(11, cnt, pw, top, top - 10.0, top + ph + 10.0, 0.0) == cnt + 1;
+}
+
+test a_scroll_step_decodes_only_the_row_that_enters {
+    const pw : f64 = 950.0;
+    var ncon : [32]u32 = undefined;
+    const na : u32 = plan(11, ncon[0..32]);
+    ncon[1] = 0;
+    const cnt : u32 = ncon[0];
+    const top : f64 = con_top(11, ncon[0..32], na, pw, 0);
+    const m : f64 = cell_h(pw) + GAP;
+    const step : f64 = 40.0;
+    const e1 : u32 = tiles_entering(11, cnt, pw, top, 300.0, 1000.0, 300.0 + step, 1000.0 + step, m);
+    assert e1 <= tile_cols(pw);
+    // a view that does not move pulls in nothing
+    assert tiles_entering(11, cnt, pw, top, 300.0, 1000.0, 300.0, 1000.0, m) == 0;
+}
+
+test thumbnails_are_cut_to_the_tile_and_kept_in_an_lru {
+    assert thumb_cap(0) == THUMB_MIN;
+    assert thumb_cap(14) == 42;
+    assert thumb_cap(500) == CACHE_SLOTS;
+    assert thumb_px(129.7, 2.0) == 260;
+    assert thumb_px(5.0, 2.0) == 16;
+    assert thumb_px(5000.0, 2.0) == 1200;
+    assert card_bytes(260) < card_bytes(1200) / 20;
+    assert tk_wi1(tk_make(7, 99)) == 8;
+    assert tk_stamp(tk_make(7, 99)) == 99;
+    var keys : [4]u64 = undefined;
+    keys[0] = tk_make(1, 5);
+    keys[1] = tk_make(2, 3);
+    keys[2] = tk_make(3, 9);
+    keys[3] = 0;
+    assert tk_find(keys[0..4], 4, 2) == 1;
+    assert tk_find(keys[0..4], 4, 9) == 4;
+    // room left and under the cap: the free slot; at the cap: the oldest stamp
+    assert tk_slot(keys[0..4], 4, 4) == 3;
+    assert tk_slot(keys[0..4], 4, 3) == 1;
+    keys[3] = tk_make(4, 1);
+    assert tk_slot(keys[0..4], 4, 4) == 3;
+}
+
+test scans_and_fetches_are_capped {
+    assert poll_due(10, 10, 5, 195) == false;
+    assert poll_due(11, 10, 5, 195);
+    assert poll_due(99, 10, 195, 195) == false;
+    assert fetch_ok(3);
+    assert fetch_ok(FETCH_CAP) == false;
+    assert FETCH_CAP <= FETCH_SLOTS;
+}
+
+test the_k_page_measure_67_tiles_and_a_plus {
+    // offline measure (owner, 2026-10-20): the 950 pt wide K page, 7 columns, 68 tiles with the '+'
+    const pw : f64 = 950.0;
+    var ncon : [32]u32 = undefined;
+    const na : u32 = plan(11, ncon[0..32]);
+    ncon[1] = 0;
+    const cnt : u32 = ncon[0];
+    const top : f64 = con_top(11, ncon[0..32], na, pw, 0);
+    const m : f64 = cell_h(pw) + GAP;
+    assert cnt == 67;
+    assert tile_cols(pw) == 7;
+    // tiles drawn in a 700 pt view: 35 of 68; 42 thumbnails requested (one row of margin)
+    assert tiles_visible(11, cnt, pw, top, 0.0, 700.0, 0.0) == 35;
+    assert tiles_visible(11, cnt, pw, top, 0.0, 700.0, m) == 42;
+    assert tiles_visible(11, cnt, pw, top, 0.0, 400.0, 0.0) == 14;
+    assert tiles_visible(11, cnt, pw, top, 0.0, 400.0, m) == 21;
+    assert tiles_entering(11, cnt, pw, top, 0.0, 400.0, 88.0, 488.0, m) == 7;
+    assert thumb_px(tile_w(pw), THUMB_SCALE) == 257;
+    assert card_bytes(257) / 1024 == 135;
+    assert card_bytes(1200) / 1024 == 2953;
 }

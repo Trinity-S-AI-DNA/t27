@@ -70,7 +70,7 @@ ld -arch arm64 -platform_version macos 11.0 $SDKV -syslibroot $SDK -e _main -lSy
    -o $OUT/t27os-pty $OUT/pty_server.o
 ld -arch arm64 -platform_version macos 11.0 $SDKV -syslibroot $SDK -e _main -lSystem -lobjc \
    -framework Foundation -framework AppKit -framework CoreGraphics -framework CoreText \
-   -framework CoreFoundation -framework QuartzCore -o $OUT/T27OS $OUT/glass_window.o
+   -framework CoreFoundation -framework ImageIO -framework QuartzCore -o $OUT/T27OS $OUT/glass_window.o
 
 mkdir -p $OUT/T27OS.app/Contents/MacOS && cp $OUT/T27OS $OUT/T27OS.app/Contents/MacOS/T27OS
 # $OUT/T27OS.app/Contents/Info.plist needs: CFBundleExecutable T27OS, CFBundleIdentifier ai.t27.os,
