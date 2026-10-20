@@ -6,13 +6,15 @@
 ; specs/tri/t27b/verilog_plan.t27; this file only spells them. It reaches cli/t27b only through
 ; `t27c gen-rust` (gen/rust/tri/t27b/verilog_emit.rs).
 ; --
-; The entry point is emit(nodes, text, meta, ptext, work, out): the AST records and their text; per node a
+; The entry point is emit(nodes, text, meta, ptext, work, out, top): the AST records and their text; per node a
 ; meta record of four u32 (flags, line, params span; verilog_plan.t27); the params text; a work area of at
-; least 2 * count(nodes) + 70 bytes, all 0; the output buffer. Bytes are written with text_escape.t27's put_text. It returns the length of the Verilog it wrote
-; at out[0 ..], or minus the length of the refusal it wrote there instead. A refusal names the construct,
+; least 3 * count(nodes) + 80 bytes, all 0; the output buffer; the name of the one fn to write as a module
+; (`--top`), empty for none. Bytes are written with text_escape.t27's put_text. It returns the length of the
+; Verilog it wrote at out[0 ..], or minus the length of the refusal it wrote there instead. A refusal names the construct,
 ; the name and the line: "t27b: verilog: unsupported construct <what> `<name>` at line <n>".
 ; The work area: [0, n) marks the fns the hardware reaches, [n, 2n) those the tests reach, [2n, 2n + 65)
-; the widths whose truncation function t27_uW a cast used.
+; the widths whose truncation function t27_uW a cast used, then (HELP_AT, ROM_AT) the constant-division
+; helpers and the tables a fn read.
 ; --
 ; Modes. An expression or statement is written for one of five places: the module scope (M_TOP: a net, an
 ; instance's connections, a reset value), a Verilog function of the module (M_FUNC), the clocked process of
@@ -33,6 +35,13 @@ pub const M_CLOCK : u8 = 2;
 pub const M_TEST : u8 = 3;
 pub const M_TBFUNC : u8 = 4;
 
+// The bytes of `work` after the closure marks (0 .. n) and the test marks (n .. 2n): at 2n + w the t27_uW
+// helper of width w (1 .. 64); at 2n + HELP_AT + h the constant-division helper h (ex_divk); at 2n + ROM_AT + d
+// the table declared at node d. lower.rs sizes it 3n + 80.
+pub const HELP_AT : usize = 65;
+pub const HELP_N : usize = 6;
+pub const ROM_AT : usize = 80;
+
 // ----------------------------------------------------------------------------------------------------------
 // Writing bytes.
 // ----------------------------------------------------------------------------------------------------------
@@ -49,17 +58,20 @@ pub fn put_name(out: []u8, at: usize, text: []const u8, a: usize, b: usize) -> u
     return put_bytes(out, at, text, a, e);
 }
 
-/// Writes the range of a scalar type, `[W-1:0] `, or nothing for one bit.
+/// Writes the range of a scalar type, `[W-1:0] `, or nothing for one bit; a signed type starts with `signed `.
 pub fn put_range(out: []u8, at: usize, t: i64) -> usize {
     const w : i64 = ty_width(t);
-    if (w <= 1) { return at; }
-    var q : usize = put_text(out, at, "[");
+    var q0 : usize = at;
+    if (ty_sint(t)) { q0 = put_text(out, at, "signed "); }
+    if (w <= 1) { return q0; }
+    var q : usize = put_text(out, q0, "[");
     const top : u64 = (w - 1) as u64;
     q = put_dec(out, q, top);
     return put_text(out, q, ":0] ");
 }
 
-/// Writes v as a literal of the scalar type t: `1'b1` for a bool, `W'dV` for an integer.
+/// Writes v as a literal of the scalar type t: `1'b1` for a bool, `W'dV` for an unsigned integer, `W'sdV` for
+/// a signed one (v is never negative: a constant that folds is a u64).
 pub fn put_lit(out: []u8, at: usize, v: u64, t: i64) -> usize {
     if (t == TY_BOOL) {
         if (v == 0) { return put_text(out, at, "1'b0"); }
@@ -67,7 +79,11 @@ pub fn put_lit(out: []u8, at: usize, v: u64, t: i64) -> usize {
     }
     const w : u64 = ty_width(t) as u64;
     var q : usize = put_dec(out, at, w);
-    q = put_text(out, q, "'d");
+    if (ty_sint(t)) {
+        q = put_text(out, q, "'sd");
+    } else {
+        q = put_text(out, q, "'d");
+    }
     return put_dec(out, q, v);
 }
 
@@ -209,16 +225,30 @@ pub fn ty_of(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []con
             const ot : i64 = ty_of(nodes, text, meta, ptext, item, i + 1, depth + 1);
             if (ty_int(ot)) { return ot; }
         }
+        if (field_eq(nodes, text, i, F_OP, "-")) {
+            const nt : i64 = ty_of(nodes, text, meta, ptext, item, i + 1, depth + 1);
+            if (ty_sint(nt) or nt == TY_COMPTIME) { return nt; }
+        }
         return TY_BAD;
     }
     if (k == K_EXPR_CAST) {
         return named_type(nodes, text, lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
     }
     if (k == K_EXPR_CALL) {
+        if (field_eq(nodes, text, i, F_NAME, "@as") and children(nodes, i) == 2 and kind(nodes, i + 1) == K_EXPR_IDENTIFIER) {
+            return type_code(text, lo(nodes, i + 1, F_NAME), hi(nodes, i + 1, F_NAME));
+        }
         const f : i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
         if (f == NO_NODE) { return TY_BAD; }
         const fi : usize = @intCast(f);
         return fn_type(nodes, text, fi);
+    }
+    if (k == K_EXPR_INDEX) {
+        if (children(nodes, i) != 2 or kind(nodes, i + 1) != K_EXPR_IDENTIFIER) { return TY_BAD; }
+        const rd : i64 = rom_decl(nodes, text, meta, ptext, item, i + 1);
+        if (rd == NO_NODE) { return TY_BAD; }
+        const rdi : usize = @intCast(rd);
+        return rom_elem(nodes, text, rdi);
     }
     if (k == K_EXPR_FIELD_ACCESS) {
         if (children(nodes, i) != 1 or kind(nodes, i + 1) != K_EXPR_IDENTIFIER) { return TY_BAD; }
@@ -236,6 +266,31 @@ pub fn ty_of(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []con
         return peer(ty_of(nodes, text, meta, ptext, item, a1, depth + 1), ty_of(nodes, text, meta, ptext, item, a2, depth + 1));
     }
     return TY_BAD;
+}
+
+/// The top-level const array a name at node u reads as a table: `const T : [N]ty = [..]` with an array literal
+/// value; NO_NODE when the name is anything else. The table is a ROM (gHashTag/t27#11326).
+pub fn rom_decl(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, u: usize) -> i64 {
+    const s : i64 = resolve(nodes, text, meta, ptext, item, u, lo(nodes, u, F_NAME), hi(nodes, u, F_NAME));
+    if (s == NO_SYM or sym_tag(s) != SYM_TOP) { return NO_NODE; }
+    const d : usize = sym_at(s);
+    if (kind(nodes, d) != K_CONST_DECL or is_mut(meta, d) or d + 1 >= end(nodes, d)) { return NO_NODE; }
+    if (kind(nodes, d + 1) != K_EXPR_ARRAY_LITERAL) { return NO_NODE; }
+    const ta : usize = lo(nodes, d, F_TYPE);
+    if (hi(nodes, d, F_TYPE) <= ta or text[ta] != 91) { return NO_NODE; }
+    const di : i64 = @intCast(d);
+    return di;
+}
+
+/// The element type of the table declared at node d (`[N]ty`): TY_BAD unless it is an integer or a bool.
+pub fn rom_elem(nodes: []const u8, text: []const u8, d: usize) -> i64 {
+    var j : usize = lo(nodes, d, F_TYPE);
+    const e : usize = hi(nodes, d, F_TYPE);
+    while (j < e and text[j] != 93) { j = j + 1; }
+    if (j >= e) { return TY_BAD; }
+    const t : i64 = type_code(text, j + 1, e);
+    if (!ty_scalar(t)) { return TY_BAD; }
+    return t;
 }
 
 /// Is text[a .. b] a float literal's text: digits with an `e` or a `.` (`10.0`, `1e3`)?
@@ -701,10 +756,36 @@ pub fn decl_count_in(nodes: []const u8, text: []const u8, item: usize, a: usize,
 }
 
 /// Writes expression node i at type `want` (the type an untyped literal takes; a typed expression keeps its
-/// own). Returns the end, or a refusal.
+/// own), except that an unsigned integer written where a signed one is wanted is widened by `$signed({1'b0,
+/// x})`: Verilog reads every operand of an expression as unsigned as soon as one is. Returns the end, or a
+/// refusal.
 pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, item: usize, mode: u8, i: usize, want: i64) -> i64 {
+    if (ty_sint(want) and ty_uint(ty_of(nodes, text, meta, ptext, item, i, 0))) {
+        var q : usize = put_text(out, at, "$signed({1'b0, ");
+        const r : i64 = ex_raw(out, q, nodes, text, meta, ptext, work, item, mode, i, want);
+        if (r < 0) { return r; }
+        q = @intCast(r);
+        q = put_text(out, q, "})");
+        const rq : i64 = @intCast(q);
+        return rq;
+    }
+    return ex_raw(out, at, nodes, text, meta, ptext, work, item, mode, i, want);
+}
+
+/// ex without the widening of an unsigned operand.
+pub fn ex_raw(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, item: usize, mode: u8, i: usize, want: i64) -> i64 {
     const k : u8 = kind(nodes, i);
     const own : i64 = ty_of(nodes, text, meta, ptext, item, i, 0);
+    // `-5` where a signed type is wanted: the negated literal of that type
+    if (own == TY_COMPTIME and k == K_EXPR_UNARY and field_eq(nodes, text, i, F_OP, "-") and ty_sint(want) and fold_ok(nodes, text, meta, ptext, item, i + 1, 0)) {
+        const nv : u64 = fold_val(nodes, text, meta, ptext, item, i + 1, 0);
+        if (nv > 0 and !fits(nv - 1, want)) { return fail(out, nodes, meta, text, i, "literal that does not fit its type", 0, 0); }
+        var qn : usize = put_text(out, at, "(-");
+        qn = put_lit(out, qn, nv, want);
+        qn = put_text(out, qn, ")");
+        const rn0 : i64 = @intCast(qn);
+        return rn0;
+    }
     // An untyped value is folded and written at the type it takes.
     if (own == TY_COMPTIME) {
         if (!fold_ok(nodes, text, meta, ptext, item, i, 0)) { return fail(out, nodes, meta, text, i, "untyped value that does not fold", 0, 0); }
@@ -717,6 +798,7 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
     }
     if (own == TY_BAD) {
         if (k == K_EXPR_CALL) {
+            if (field_eq(nodes, text, i, F_NAME, "@as") and children(nodes, i) == 2) { return fail(out, nodes, meta, text, i, "cast to type", lo(nodes, i + 1, F_NAME), hi(nodes, i + 1, F_NAME)); }
             const f : i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
             if (f == NO_NODE) { return fail(out, nodes, meta, text, i, "call of an undeclared fn", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
             return fail(out, nodes, meta, text, i, "call of a fn whose result is no scalar", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
@@ -809,7 +891,13 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
             rw = TY_BOOL;
         }
         if (oc == OP_BAD or lw == TY_BAD) { return fail(out, nodes, meta, text, i, "operator", op_a, op_b); }
-        if (oc == OP_ARITH or oc == OP_SHIFT) {
+        if (oc == OP_ARITH and (same(text[op_a .. op_b], "/") or same(text[op_a .. op_b], "%")) and fold_ok(nodes, text, meta, ptext, item, r, 0) and !fold_ok(nodes, text, meta, ptext, item, l, 0)) {
+            return ex_divk(out, q, nodes, text, meta, ptext, work, item, mode, i, own);
+        }
+        const sg : bool = ty_sint(own) and (oc == OP_ARITH or oc == OP_SHIFT);
+        if (sg) {
+            q = put_text(out, q, "$signed({");
+        } else if (oc == OP_ARITH or oc == OP_SHIFT) {
             q = put_text(out, q, "{");
         } else {
             q = put_text(out, q, "(");
@@ -818,12 +906,18 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
         if (r1 < 0) { return r1; }
         q = @intCast(r1);
         q = put_text(out, q, " ");
-        q = put_text(out, q, verilog_op(text[op_a .. op_b]));
+        if (oc == OP_SHIFT and ty_sint(own) and same(text[op_a .. op_b], ">>")) {
+            q = put_text(out, q, ">>>");
+        } else {
+            q = put_text(out, q, verilog_op(text[op_a .. op_b]));
+        }
         q = put_text(out, q, " ");
         const r2 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, r, rw);
         if (r2 < 0) { return r2; }
         q = @intCast(r2);
-        if (oc == OP_ARITH or oc == OP_SHIFT) {
+        if (sg) {
+            q = put_text(out, q, "})");
+        } else if (oc == OP_ARITH or oc == OP_SHIFT) {
             q = put_text(out, q, "}");
         } else {
             q = put_text(out, q, ")");
@@ -834,6 +928,10 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
     if (k == K_EXPR_UNARY) {
         if (field_eq(nodes, text, i, F_OP, "!")) {
             q = put_text(out, q, "(!");
+        } else if (field_eq(nodes, text, i, F_OP, "-")) {
+            q = put_text(out, q, "$signed({-");
+        } else if (ty_sint(own)) {
+            q = put_text(out, q, "$signed({~");
         } else {
             q = put_text(out, q, "{~");
         }
@@ -842,6 +940,8 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
         q = @intCast(r3);
         if (field_eq(nodes, text, i, F_OP, "!")) {
             q = put_text(out, q, ")");
+        } else if (ty_sint(own) or field_eq(nodes, text, i, F_OP, "-")) {
+            q = put_text(out, q, "})");
         } else {
             q = put_text(out, q, "}");
         }
@@ -849,40 +949,13 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
         return ru;
     }
     if (k == K_EXPR_CAST) {
-        const src : i64 = ty_of(nodes, text, meta, ptext, item, i + 1, 0);
-        if (src == TY_COMPTIME) { return ex(out, q, nodes, text, meta, ptext, work, item, mode, i + 1, own); }
-        if (!ty_scalar(src)) { return fail(out, nodes, meta, text, i, "cast of a value that is no integer or bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
-        if (own == TY_BOOL and src != TY_BOOL) { return fail(out, nodes, meta, text, i, "cast to bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
-        const sw : i64 = ty_width(src);
-        const dw : i64 = ty_width(own);
-        if (sw == dw) {
-            return ex(out, q, nodes, text, meta, ptext, work, item, mode, i + 1, src);
-        }
-        if (sw < dw) {
-            // zero fill: {N'd0, x}
-            q = put_text(out, q, "{");
-            const fillw : i64 = dw - sw;
-            q = put_lit(out, q, 0, fillw);
-            q = put_text(out, q, ", ");
-            const r4 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, i + 1, src);
-            if (r4 < 0) { return r4; }
-            q = @intCast(r4);
-            q = put_text(out, q, "}");
-            const rw2 : i64 = @intCast(q);
-            return rw2;
-        }
-        // narrowing: the low bits, through t27_uW
-        const dwu : usize = @intCast(dw);
-        work[2 * count(nodes) + dwu] = 1;
-        q = put_text(out, q, "t27_u");
-        q = put_dec(out, q, dw as u64);
-        q = put_text(out, q, "(");
-        const r5 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, i + 1, src);
-        if (r5 < 0) { return r5; }
-        q = @intCast(r5);
-        q = put_text(out, q, ")");
-        const rn : i64 = @intCast(q);
-        return rn;
+        return ex_cast(out, q, nodes, text, meta, ptext, work, item, mode, i, i + 1, own);
+    }
+    if (k == K_EXPR_CALL and field_eq(nodes, text, i, F_NAME, "@as") and children(nodes, i) == 2) {
+        return ex_cast(out, q, nodes, text, meta, ptext, work, item, mode, i, end(nodes, i + 1), own);
+    }
+    if (k == K_EXPR_INDEX) {
+        return ex_index(out, q, nodes, text, meta, ptext, work, item, mode, i);
     }
     if (k == K_EXPR_CALL) {
         return ex_call(out, q, nodes, text, meta, ptext, work, item, mode, i);
@@ -916,6 +989,201 @@ pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []con
         return rif;
     }
     return fail(out, nodes, meta, text, i, kind_label(k), lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+}
+
+/// Writes the cast of expression node srcn to type `own`, the value of node i (`x as T`, or `@as(T, x)`, where
+/// `@as(T, @intCast(y))` converts y). Equal widths keep the bits (`$signed`, `$unsigned`); a wider type fills
+/// with zeros, or with the sign of a signed source; a narrower one keeps the low bits through t27_uW.
+pub fn ex_cast(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, item: usize, mode: u8, i: usize, srcn: usize, own: i64) -> i64 {
+    var q : usize = at;
+    var sn : usize = srcn;
+    if (kind(nodes, sn) == K_EXPR_CALL and field_eq(nodes, text, sn, F_NAME, "@intCast") and children(nodes, sn) == 1) { sn = sn + 1; }
+    const src : i64 = ty_of(nodes, text, meta, ptext, item, sn, 0);
+    if (src == TY_COMPTIME) { return ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, own); }
+    if (!ty_scalar(src)) { return fail(out, nodes, meta, text, i, "cast of a value that is no integer or bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
+    if (own == TY_BOOL and src != TY_BOOL) { return fail(out, nodes, meta, text, i, "cast to bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
+    const sw : i64 = ty_width(src);
+    const dw : i64 = ty_width(own);
+    const sgd : bool = ty_sint(own);
+    if (sw == dw) {
+        if (ty_sint(src) == sgd) { return ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src); }
+        if (sgd) {
+            q = put_text(out, q, "$signed(");
+        } else {
+            q = put_text(out, q, "$unsigned(");
+        }
+        const rs : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+        if (rs < 0) { return rs; }
+        q = @intCast(rs);
+        q = put_text(out, q, ")");
+        const rsq : i64 = @intCast(q);
+        return rsq;
+    }
+    if (sw < dw) {
+        if (ty_sint(src)) {
+            // sign fill: a signed source plus a signed zero of the wider width is sign-extended
+            if (!sgd) { q = put_text(out, q, "$unsigned"); }
+            q = put_text(out, q, "(");
+            const rg : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+            if (rg < 0) { return rg; }
+            q = @intCast(rg);
+            q = put_text(out, q, " + ");
+            q = put_lit(out, q, 0, SI + dw);
+            q = put_text(out, q, ")");
+            const rgq : i64 = @intCast(q);
+            return rgq;
+        }
+        // zero fill: {N'd0, x}
+        if (sgd) { q = put_text(out, q, "$signed("); }
+        q = put_text(out, q, "{");
+        const fillw : i64 = dw - sw;
+        q = put_lit(out, q, 0, fillw);
+        q = put_text(out, q, ", ");
+        const r4 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+        if (r4 < 0) { return r4; }
+        q = @intCast(r4);
+        q = put_text(out, q, "}");
+        if (sgd) { q = put_text(out, q, ")"); }
+        const rw2 : i64 = @intCast(q);
+        return rw2;
+    }
+    // narrowing: the low bits, through t27_uW
+    const dwu : usize = @intCast(dw);
+    work[2 * count(nodes) + dwu] = 1;
+    if (sgd) { q = put_text(out, q, "$signed("); }
+    q = put_text(out, q, "t27_u");
+    q = put_dec(out, q, dw as u64);
+    q = put_text(out, q, "(");
+    const r5 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+    if (r5 < 0) { return r5; }
+    q = @intCast(r5);
+    q = put_text(out, q, ")");
+    if (sgd) { q = put_text(out, q, ")"); }
+    const rn : i64 = @intCast(q);
+    return rn;
+}
+
+/// Writes a read of a table (a ROM, gHashTag/t27#11326): `t27_rom_T(index)`, the index at its own unsigned
+/// type, or 64 bits when it is a constant. functions() writes the table once, after the fns, because the work
+/// byte of its declaration is set.
+pub fn ex_index(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, item: usize, mode: u8, i: usize) -> i64 {
+    const rd : i64 = rom_decl(nodes, text, meta, ptext, item, i + 1);
+    if (rd == NO_NODE) { return fail(out, nodes, meta, text, i, "ExprIndex", lo(nodes, i + 1, F_NAME), hi(nodes, i + 1, F_NAME)); }
+    const rdi : usize = @intCast(rd);
+    const idx : usize = end(nodes, i + 1);
+    const it : i64 = ty_of(nodes, text, meta, ptext, item, idx, 0);
+    if (it != TY_COMPTIME and !ty_uint(it)) { return fail(out, nodes, meta, text, i, "table index that is no unsigned integer", lo(nodes, i + 1, F_NAME), hi(nodes, i + 1, F_NAME)); }
+    work[2 * count(nodes) + ROM_AT + rdi] = 1;
+    var q : usize = put_text(out, at, "t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, rdi, F_NAME), hi(nodes, rdi, F_NAME));
+    q = put_text(out, q, "(");
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, idx, 64);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, ")");
+    const ri : i64 = @intCast(q);
+    return ri;
+}
+
+/// Writes the multiplier 2^n + m of a constant division as a 65-bit literal.
+pub fn put_mult(out: []u8, at: usize, n: u64, m: u64) -> usize {
+    if (n < 64) {
+        const q0 : usize = put_text(out, at, "65'd");
+        return put_dec(out, q0, m + pow2(n));
+    }
+    var q : usize = put_text(out, at, "{1'b1, 64'd");
+    q = put_dec(out, q, m);
+    return put_text(out, q, "}");
+}
+
+/// Writes `x / k` or `x % k` for a constant k (gHashTag/t27#11326), x the left operand of node i, at the
+/// binary node's type `own`. Never a general divider: k = 1 is x or 0; a power of two is a shift or a mask
+/// (a signed one, t27_sdivp and t27_smodp, rounds toward zero); any other k is the multiply-shift of
+/// verilog_plan.t27 (t27_udivc, t27_umodc, t27_sdivc, t27_smodc), exact for every operand of the type's
+/// width (constant_division_is_exact). The helpers work on 64 bits; the result is cut back to the type.
+pub fn ex_divk(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, item: usize, mode: u8, i: usize, own: i64) -> i64 {
+    const l : usize = i + 1;
+    const r : usize = end(nodes, l);
+    const isdiv : bool = field_eq(nodes, text, i, F_OP, "/");
+    const d : u64 = fold_val(nodes, text, meta, ptext, item, r, 0);
+    if (!ty_int(own)) { return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP)); }
+    if (d == 0) { return fail(out, nodes, meta, text, i, "division by the constant 0", 0, 0); }
+    const n : u64 = ty_width(own) as u64;
+    const sgn : bool = ty_sint(own);
+    var q : usize = at;
+    if (d == 1) {
+        if (isdiv) { return ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own); }
+        q = put_lit(out, q, 0, own);
+        const r1 : i64 = @intCast(q);
+        return r1;
+    }
+    if (is_pow2(d) and !sgn) {
+        q = put_text(out, q, "{");
+        const ra : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own);
+        if (ra < 0) { return ra; }
+        q = @intCast(ra);
+        if (isdiv) {
+            q = put_text(out, q, " >> ");
+            q = put_dec(out, q, ceil_log2(d));
+            q = put_text(out, q, "}");
+        } else {
+            q = put_text(out, q, " & ");
+            q = put_lit(out, q, d - 1, own);
+            q = put_text(out, q, "}");
+        }
+        const rp : i64 = @intCast(q);
+        return rp;
+    }
+    if (d > DIV_MAX) { return fail(out, nodes, meta, text, i, "division by a constant above 2^62", 0, 0); }
+    // a helper of 64 bits, then the low n bits
+    var h : usize = 0;
+    if (is_pow2(d)) {
+        h = 4;
+        if (!isdiv) { h = 5; }
+    } else if (sgn) {
+        h = 2;
+        if (!isdiv) { h = 3; }
+    } else if (!isdiv) {
+        h = 1;
+    }
+    work[2 * count(nodes) + HELP_AT + h] = 1;
+    if (n < 64) {
+        const nu : usize = @intCast(n);
+        work[2 * count(nodes) + nu] = 1;
+        if (sgn) { q = put_text(out, q, "$signed("); }
+        q = put_text(out, q, "t27_u");
+        q = put_dec(out, q, n);
+        q = put_text(out, q, "(");
+    }
+    if (h == 0) { q = put_text(out, q, "t27_udivc("); }
+    if (h == 1) { q = put_text(out, q, "t27_umodc("); }
+    if (h == 2) { q = put_text(out, q, "t27_sdivc("); }
+    if (h == 3) { q = put_text(out, q, "t27_smodc("); }
+    if (h == 4) { q = put_text(out, q, "t27_sdivp("); }
+    if (h == 5) { q = put_text(out, q, "t27_smodp("); }
+    const rx : i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own);
+    if (rx < 0) { return rx; }
+    q = @intCast(rx);
+    if (h >= 4) {
+        q = put_text(out, q, ", 7'd");
+        q = put_dec(out, q, ceil_log2(d));
+    } else {
+        q = put_text(out, q, ", ");
+        q = put_mult(out, q, n, div_mult_low(n, d));
+        q = put_text(out, q, ", 8'd");
+        q = put_dec(out, q, div_shift(n, d));
+        if (h == 1 or h == 3) {
+            q = put_text(out, q, ", 64'd");
+            q = put_dec(out, q, d);
+        }
+    }
+    q = put_text(out, q, ")");
+    if (n < 64) {
+        q = put_text(out, q, ")");
+        if (sgn) { q = put_text(out, q, ")"); }
+    }
+    const rd : i64 = @intCast(q);
+    return rd;
 }
 
 /// Writes a call of a fn with a body: `f(a, b)` with each argument at its parameter's type; a fn with no
@@ -1496,7 +1764,7 @@ pub fn decls(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []
                 q = put_text(out, q, ";\n");
             }
         }
-        if (k != K_STMT_LOCAL and k != K_STMT_WHILE and k != K_STMT_IF and k != K_MODULE and k != K_STMT_ASSIGN and k != K_EXPR_RETURN and k != K_STMT_EXPR and k != K_STMT_BREAK and k != K_STMT_CONTINUE and k != K_EXPR_LITERAL and k != K_EXPR_IDENTIFIER and k != K_EXPR_CALL and k != K_EXPR_BINARY and k != K_EXPR_UNARY and k != K_EXPR_CAST and k != K_EXPR_IF and k != K_EXPR_FIELD_ACCESS) {
+        if (k != K_STMT_LOCAL and k != K_STMT_WHILE and k != K_STMT_IF and k != K_MODULE and k != K_STMT_ASSIGN and k != K_EXPR_RETURN and k != K_STMT_EXPR and k != K_STMT_BREAK and k != K_STMT_CONTINUE and k != K_EXPR_LITERAL and k != K_EXPR_IDENTIFIER and k != K_EXPR_CALL and k != K_EXPR_BINARY and k != K_EXPR_UNARY and k != K_EXPR_CAST and k != K_EXPR_IF and k != K_EXPR_FIELD_ACCESS and k != K_EXPR_INDEX) {
             return fail(out, nodes, meta, text, j, kind_label(k), lo(nodes, j, F_NAME), hi(nodes, j, F_NAME));
         }
         j = j + 1;
@@ -1575,9 +1843,222 @@ pub fn functions(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta
         }
         w = w + 1;
     }
+    // the constant-division helpers: the multiply-shift is shared by the others
+    const hb : usize = 2 * count(nodes) + HELP_AT;
+    if (work[hb] != 0 or work[hb + 1] != 0 or work[hb + 2] != 0 or work[hb + 3] != 0) { q = put_div_helper(out, q, 0); }
+    if (work[hb + 1] != 0) { q = put_div_helper(out, q, 1); }
+    if (work[hb + 2] != 0 or work[hb + 3] != 0) { q = put_div_helper(out, q, 2); }
+    if (work[hb + 3] != 0) { q = put_div_helper(out, q, 3); }
+    if (work[hb + 4] != 0 or work[hb + 5] != 0) { q = put_div_helper(out, q, 4); }
+    if (work[hb + 5] != 0) { q = put_div_helper(out, q, 5); }
+    // the tables the fns read
+    var d : usize = 1;
+    while (d < end(nodes, 0)) {
+        if (kind(nodes, d) == K_CONST_DECL and work[2 * count(nodes) + ROM_AT + d] != 0) {
+            const rt : i64 = put_rom(out, q, nodes, text, meta, ptext, d);
+            if (rt < 0) { return rt; }
+            q = @intCast(rt);
+        }
+        d = end(nodes, d);
+    }
     const rr : i64 = @intCast(q);
     return rr;
 }
+
+/// Writes constant-division helper h (ex_divk's numbering) at the module's indent. They take 64 bits and
+/// give 64 bits; the multiplier m is 2^n + m' of the operand's width n and s is n + ceil(log2 k).
+pub fn put_div_helper(out: []u8, at: usize, h: usize) -> usize {
+    if (h == 0) {
+        return put_text(out, at, "\n    function [63:0] t27_udivc;\n        input [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        reg [191:0] p;\n        begin\n            p = x * m;\n            p = p >> s;\n            t27_udivc = p[63:0];\n        end\n    endfunction\n");
+    }
+    if (h == 1) {
+        return put_text(out, at, "\n    function [63:0] t27_umodc;\n        input [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        input [63:0] d;\n        begin\n            t27_umodc = x - t27_udivc(x, m, s) * d;\n        end\n    endfunction\n");
+    }
+    if (h == 2) {
+        return put_text(out, at, "\n    function signed [63:0] t27_sdivc;\n        input signed [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        reg [63:0] a;\n        begin\n            a = x[63] ? (64'd0 - x) : x;\n            a = t27_udivc(a, m, s);\n            t27_sdivc = x[63] ? (64'd0 - a) : a;\n        end\n    endfunction\n");
+    }
+    if (h == 3) {
+        return put_text(out, at, "\n    function signed [63:0] t27_smodc;\n        input signed [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        input [63:0] d;\n        begin\n            t27_smodc = x - t27_sdivc(x, m, s) * $signed(d);\n        end\n    endfunction\n");
+    }
+    if (h == 4) {
+        return put_text(out, at, "\n    function signed [63:0] t27_sdivp;\n        input signed [63:0] x;\n        input [6:0] k;\n        reg signed [63:0] b;\n        begin\n            b = (64'sd1 <<< k) - 64'sd1;\n            t27_sdivp = (x < 64'sd0) ? ((x + b) >>> k) : (x >>> k);\n        end\n    endfunction\n");
+    }
+    return put_text(out, at, "\n    function signed [63:0] t27_smodp;\n        input signed [63:0] x;\n        input [6:0] k;\n        begin\n            t27_smodp = x - (t27_sdivp(x, k) <<< k);\n        end\n    endfunction\n");
+}
+
+/// Writes the table declared at node d as a ROM: a function with one `case` arm per element; an index past
+/// the end reads 0.
+pub fn put_rom(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, d: usize) -> i64 {
+    const t : i64 = rom_elem(nodes, text, d);
+    if (!ty_scalar(t)) { return fail(out, nodes, meta, text, d, "table whose elements are no integers or bools", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME)); }
+    var q : usize = put_text(out, at, "\n    // table ");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, "\n    function ");
+    q = put_range(out, q, t);
+    q = put_text(out, q, "t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, ";\n        input [63:0] i;\n        begin\n            case (i)\n");
+    var c : usize = d + 2;
+    var kx : u64 = 0;
+    while (c < end(nodes, d + 1)) {
+        // an element is a constant, or `-` and a constant for a signed table
+        var ne : bool = false;
+        var ev : usize = c;
+        if (kind(nodes, c) == K_EXPR_UNARY and field_eq(nodes, text, c, F_OP, "-") and ty_sint(t)) {
+            ne = true;
+            ev = c + 1;
+        }
+        if (!fold_ok(nodes, text, meta, ptext, 0, ev, 0)) { return fail(out, nodes, meta, text, c, "table element that does not fold", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME)); }
+        const v : u64 = fold_val(nodes, text, meta, ptext, 0, ev, 0);
+        var okv : bool = fits(v, t);
+        if (ne and v > 0) { okv = fits(v - 1, t); }
+        if (!okv) { return fail(out, nodes, meta, text, c, "table element that does not fit its type", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME)); }
+        q = put_text(out, q, "                64'd");
+        q = put_dec(out, q, kx);
+        q = put_text(out, q, ": t27_rom_");
+        q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+        q = put_text(out, q, " = ");
+        if (ne) { q = put_text(out, q, "-"); }
+        q = put_lit(out, q, v, t);
+        q = put_text(out, q, ";\n");
+        kx = kx + 1;
+        c = end(nodes, c);
+    }
+    q = put_text(out, q, "                default: t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, " = ");
+    q = put_lit(out, q, 0, t);
+    q = put_text(out, q, ";\n            endcase\n        end\n    endfunction\n");
+    const rr : i64 = @intCast(q);
+    return rr;
+}
+
+/// Is fn f one that gets a module of its own (a library spec, gHashTag/t27#11326): a body, not on_clock, an
+/// integer or bool for every parameter and for the result, and `pub` unless `top` names it?
+pub fn wrappable(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, f: usize, top: []const u8) -> bool {
+    if (kind(nodes, f) != K_FN_DECL or is_extern(nodes, f) or field_eq(nodes, text, f, F_NAME, "on_clock")) { return false; }
+    if (top.len > 0) { return field_is(nodes, text, f, F_NAME, top); }
+    if (!is_pub(meta, f) or !ty_scalar(fn_type(nodes, text, f))) { return false; }
+    const np : usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
+    var kx : usize = 0;
+    while (kx < np) {
+        if (!ty_scalar(param_type(nodes, text, meta, ptext, f, kx))) { return false; }
+        kx = kx + 1;
+    }
+    return true;
+}
+
+/// Is the spec a library of decisions: no on_clock, and no var, net, instance or input?
+pub fn is_library(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8) -> bool {
+    if (clock_fn(nodes, text) != NO_NODE) { return false; }
+    var c : usize = 1;
+    while (c < end(nodes, 0)) {
+        const cl : u8 = item_class(nodes, text, meta, ptext, c);
+        if (cl == C_VAR or cl == C_NET or cl == C_INSTANCE or cl == C_INPUT or cl == C_INOUT) { return false; }
+        c = end(nodes, c);
+    }
+    return true;
+}
+
+/// Writes the module of the pure fn f: `module f (input p0, ..., output t27_y); assign t27_y = f(p0, ...);`
+/// and the fns f reaches. The marks and the helper flags are cleared before and after, so each module carries
+/// exactly its own.
+pub fn fn_module(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, f: usize) -> i64 {
+    const n : usize = count(nodes);
+    var j : usize = 0;
+    while (j < n) {
+        work[j] = 0;
+        j = j + 1;
+    }
+    j = 2 * n + 1;
+    while (j < 3 * n + ROM_AT) {
+        work[j] = 0;
+        j = j + 1;
+    }
+    work[f] = 1;
+    close_marks(nodes, text, work, 0);
+    const rt : i64 = fn_type(nodes, text, f);
+    const np : usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
+    var q : usize = put_text(out, at, "\n// pure fn ");
+    q = put_bytes(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, " (line ");
+    q = put_dec(out, q, line_of(meta, f) as u64);
+    q = put_text(out, q, "): combinational, one input per parameter\nmodule ");
+    q = put_name(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, " (");
+    var kx : usize = 0;
+    while (kx < np) {
+        const pt : i64 = param_type(nodes, text, meta, ptext, f, kx);
+        q = put_text(out, q, "\n    input  wire ");
+        q = put_range(out, q, pt);
+        q = put_name(out, q, ptext, param_name_lo(meta, ptext, f, kx), param_name_hi(meta, ptext, f, kx));
+        q = put_text(out, q, ",");
+        kx = kx + 1;
+    }
+    q = put_text(out, q, "\n    output wire ");
+    q = put_range(out, q, rt);
+    q = put_text(out, q, "t27_y\n);\n    assign t27_y = ");
+    q = put_name(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, "(");
+    if (np == 0) { q = put_text(out, q, "1'b0"); }
+    kx = 0;
+    while (kx < np) {
+        if (kx > 0) { q = put_text(out, q, ", "); }
+        q = put_name(out, q, ptext, param_name_lo(meta, ptext, f, kx), param_name_hi(meta, ptext, f, kx));
+        kx = kx + 1;
+    }
+    q = put_text(out, q, ");\n");
+    const r1 : i64 = functions(out, q, nodes, text, meta, ptext, work, 0, M_FUNC);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, "endmodule\n");
+    j = 2 * n + 1;
+    while (j < 3 * n + ROM_AT) {
+        work[j] = 0;
+        j = j + 1;
+    }
+    const rm : i64 = @intCast(q);
+    return rm;
+}
+
+/// Writes the modules of a library spec: one per wrappable fn (only `top` when one is named), a fn that does
+/// not lower noted as a comment and skipped unless it is the one named. When none lowers, the first refusal
+/// is the answer; when none is wrappable, the empty module of the spec as before.
+pub fn lib_modules(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, top: []const u8) -> i64 {
+    var q : usize = at;
+    var emitted : usize = 0;
+    var bad : i64 = NO_NODE;
+    var c : usize = 1;
+    while (c < end(nodes, 0)) {
+        if (wrappable(nodes, text, meta, ptext, c, top)) {
+            const r : i64 = fn_module(out, q, nodes, text, meta, ptext, work, c);
+            if (r < 0) {
+                if (top.len > 0) { return r; }
+                if (bad == NO_NODE) { bad = @intCast(c); }
+                q = put_text(out, q, "\n// skipped fn ");
+                q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+                q = put_text(out, q, ": ");
+                q = copy_msg(out, q, @intCast(0 - r));
+                q = put_text(out, q, "\n");
+            } else {
+                q = @intCast(r);
+                emitted = emitted + 1;
+            }
+        }
+        c = end(nodes, c);
+    }
+    if (emitted > 0) {
+        const rq : i64 = @intCast(q);
+        return rq;
+    }
+    if (top.len > 0) { return fail(out, nodes, meta, text, 0, "--top that names no fn of the spec", 0, 0); }
+    if (bad != NO_NODE) {
+        const bi : usize = @intCast(bad);
+        return fn_module(out, at, nodes, text, meta, ptext, work, bi);
+    }
+    return module_text(out, at, nodes, text, meta, ptext, work);
+}
+
 
 /// Writes the port list of the module: the implicit inputs, on_clock's unbound parameters, the outputs.
 pub fn ports(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, oc: i64) -> i64 {
@@ -2240,14 +2721,21 @@ pub fn test_bench(out: []u8, at: usize, nodes: []const u8, text: []const u8, met
 
 /// The entry point (see the header): the module, then its test bench; a test bench that does not lower is a
 /// comment naming why, and the module stands.
-pub fn emit(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, out: []u8) -> i64 {
+pub fn emit(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, out: []u8, top: []const u8) -> i64 {
     if (count(nodes) == 0 or kind(nodes, 0) != K_MODULE) { return fail_front(out, "file with no module node"); }
     closures(nodes, text, meta, ptext, work);
     var q : usize = put_text(out, 0, "// Generated by t27b verilog from module ");
     q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
     q = put_text(out, q, " -- DO NOT EDIT; the decisions are specs/tri/t27b/verilog_plan.t27\n");
     q = put_text(out, q, "// phi^2 + 1/phi^2 = 3 | TRINITY\n`timescale 1ns / 1ps\n`default_nettype none\n");
-    const r1 : i64 = module_text(out, q, nodes, text, meta, ptext, work);
+    var r1 : i64 = 0;
+    if (is_library(nodes, text, meta, ptext)) {
+        r1 = lib_modules(out, q, nodes, text, meta, ptext, work, top);
+    } else if (top.len > 0) {
+        return fail_front(out, "--top on a spec with an on_clock, a var, a net, an instance or an input");
+    } else {
+        r1 = module_text(out, q, nodes, text, meta, ptext, work);
+    }
     if (r1 < 0) {
         const ml1 : usize = @intCast(0 - r1);
         return to_front(out, ml1);
@@ -2327,14 +2815,14 @@ test an_input_spelled_in_underscore_is_the_port_in {
         i = i + 1;
     }
     tmeta(mb[0 .. 80], 3, FLAG_PUB, 4);
-    var wk : [80]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 80) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 80], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     assert holds(out[0 .. 4096], n, "input  wire [7:0] in,") or holds(out[0 .. 4096], n, "input  wire [7:0] in\n");
@@ -2344,11 +2832,11 @@ test an_input_spelled_in_underscore_is_the_port_in {
     vset(nb[0 .. 360], 1, F_NAME, 18, 23);
     vset(nb[0 .. 360], 4, F_NAME, 18, 23);
     i = 0;
-    while (i < 80) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 80], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 > 0;
     const n2 : usize = @intCast(r2);
     assert holds(out[0 .. 4096], n2, "input  wire [7:0] data_");
@@ -2357,11 +2845,11 @@ test an_input_spelled_in_underscore_is_the_port_in {
     vset(nb[0 .. 360], 1, F_NAME, 23, 27);
     vset(nb[0 .. 360], 4, F_NAME, 23, 27);
     i = 0;
-    while (i < 80) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r3 : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 80], out[0 .. 4096]);
+    const r3 : i64 = emit(nb[0 .. 360], tx, mb[0 .. 80], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r3 > 0;
     const n3 : usize = @intCast(r3);
     assert holds(out[0 .. 4096], n3, "input  wire [7:0] \\for ");
@@ -2396,14 +2884,14 @@ test a_clocked_counter_lowers_to_a_register_and_an_always_block {
     tmeta(mb[0 .. 144], 1, FLAG_MUT, 2);
     tmeta(mb[0 .. 144], 3, 0, 3);
     tmeta(mb[0 .. 144], 4, 0, 3);
-    var wk : [88]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 88) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 648], tx, mb[0 .. 144], "", wk[0 .. 88], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 648], tx, mb[0 .. 144], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     assert holds(out[0 .. 4096], n, "module M (");
@@ -2418,11 +2906,11 @@ test a_clocked_counter_lowers_to_a_register_and_an_always_block {
     // a pub var makes x an internal register: the module declares its ports
     tmeta(mb[0 .. 144], 1, FLAG_MUT | FLAG_PUB, 2);
     i = 0;
-    while (i < 88) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 648], tx, mb[0 .. 144], "", wk[0 .. 88], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 648], tx, mb[0 .. 144], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 > 0;
     const n2 : usize = @intCast(r2);
     assert holds(out[0 .. 4096], n2, "output reg  [7:0] x");
@@ -2479,14 +2967,14 @@ test a_constant_rst_n_and_en_are_folded_out_of_the_always_block {
     var nb : [936]u8 = undefined;
     var mb : [208]u8 = undefined;
     tied_counter(nb[0 .. 936], mb[0 .. 208], false, 24, 28, 24, 28);
-    var wk : [96]u8 = undefined;
+    var wk : [140]u8 = undefined;
     var i : usize = 0;
-    while (i < 96) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 96], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     assert holds(out[0 .. 4096], n, "input  wire clk");
@@ -2503,11 +2991,11 @@ test a_constant_rst_n_and_en_are_folded_out_of_the_always_block {
     // rst_n alone tied to true: no reset branch, but the enable is still read
     tied_counter(nb[0 .. 936], mb[0 .. 208], false, 24, 28, 39, 44);
     i = 0;
-    while (i < 96) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 96], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 > 0;
     const n2 : usize = @intCast(r2);
     assert holds(out[0 .. 4096], n2, "always @(posedge clk) begin");
@@ -2523,14 +3011,14 @@ test an_rst_n_port_keeps_its_async_reset_and_a_false_en_keeps_its_wire {
     var nb : [936]u8 = undefined;
     var mb : [208]u8 = undefined;
     tied_counter(nb[0 .. 936], mb[0 .. 208], true, 30, 39, 39, 44);
-    var wk : [96]u8 = undefined;
+    var wk : [140]u8 = undefined;
     var i : usize = 0;
-    while (i < 96) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 96], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     assert holds(out[0 .. 4096], n, "input  wire rst_n");
@@ -2566,14 +3054,14 @@ test a_call_of_an_undeclared_fn_is_refused_by_name {
     }
     tmeta(mb[0 .. 128], 1, FLAG_MUT, 3);
     tmeta(mb[0 .. 128], 6, 0, 7);
-    var wk : [86]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 86) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 576], tx, mb[0 .. 128], "", wk[0 .. 86], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 576], tx, mb[0 .. 128], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r < 0;
     const n : usize = @intCast(0 - r);
     assert holds(out[0 .. 4096], n, "unsupported construct call of an undeclared fn `STARTUPE2` at line 7");
@@ -2630,9 +3118,9 @@ test a_declared_clock_period_rides_on_the_wire_of_the_output_it_names {
         tmeta(mb[0 .. 160], i, 0, i + 1);
         i = i + 1;
     }
-    var wk : [90]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 90) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
@@ -2643,7 +3131,7 @@ test a_declared_clock_period_rides_on_the_wire_of_the_output_it_names {
     const r0 : i64 = put_period(out[0 .. 4096], 0, nb[0 .. 720], tx, mb[0 .. 160], "", 6);
     assert r0 == 33;
     assert holds(out[0 .. 4096], 33, "    (* t27_period_ps = 113040 *)\n");
-    const r : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 90], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     assert holds(out[0 .. 4096], n, "    (* t27_period_ps = 113040 *)\n    wire g__O;\n");
@@ -2651,11 +3139,11 @@ test a_declared_clock_period_rides_on_the_wire_of_the_output_it_names {
     vset(nb[0 .. 720], 8, F_NAME, 26, 39);
     assert !period_named(nb[0 .. 720], tx, mb[0 .. 160], "", 8);
     i = 0;
-    while (i < 90) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 90], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 < 0;
     const n2 : usize = @intCast(0 - r2);
     assert holds(out[0 .. 4096], n2, "unsupported construct clock period declared for no instance output `x_O_PERIOD_PS` at line 9");
@@ -2663,11 +3151,11 @@ test a_declared_clock_period_rides_on_the_wire_of_the_output_it_names {
     vset(nb[0 .. 720], 8, F_NAME, 26, 27);
     vset(nb[0 .. 720], 7, F_VALUE, 44, 45);
     i = 0;
-    while (i < 90) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r3 : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 90], out[0 .. 4096]);
+    const r3 : i64 = emit(nb[0 .. 720], tx, mb[0 .. 160], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r3 < 0;
     const n3 : usize = @intCast(0 - r3);
     assert holds(out[0 .. 4096], n3, "unsupported construct clock period of zero `g_O_PERIOD_PS` at line 7");
@@ -2707,14 +3195,14 @@ test a_lane_set_is_one_port_and_an_inout_is_handed_through {
     tmeta(mb[0 .. 192], 5, FLAG_PUB, 6);
     // E's parameter lines are the params text [0, 21)
     vput32(mb[0 .. 192], 4 * META + 12, 21);
-    var wk : [100]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u8\n", wk[0 .. 100], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u8\n", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     // p is a pin of the module, no output; each lane its own wire; each set one port, lane 0 in the low bits
@@ -2723,36 +3211,36 @@ test a_lane_set_is_one_port_and_an_inout_is_handed_through {
     assert holds(out[0 .. 4096], n, "    wire [7:0] k__r__0;\n    wire [7:0] k__r__1;\n");
     assert holds(out[0 .. 4096], n, "    E k (\n        .d({8'd2, 8'd1}),\n        .q(p),\n        .r({k__r__1, k__r__0}));\n");
     // anywhere but at an instance's port, an inout is refused by name
-    const re : i64 = ex(out[0 .. 4096], 0, nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u8\n", wk[0 .. 100], 0, M_TOP, 11, 8);
+    const re : i64 = ex(out[0 .. 4096], 0, nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u8\n", wk[0 .. 140], 0, M_TOP, 11, 8);
     assert re < 0;
     const ne : usize = @intCast(0 - re);
     assert holds(out[4096 - MSG_ROOM .. 4096], ne, "unsupported construct inout read anywhere but as an instance's port `p` at line 12");
     // a lane after a gap is refused, and so is a lane of another type, and an inout handed to a port of another
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__2:u8\nq:u8\n", wk[0 .. 100], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__2:u8\nq:u8\n", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 < 0;
     const n2 : usize = @intCast(0 - r2);
     assert holds(out[0 .. 4096], n2, "unsupported construct lane that does not follow its lane 0 in order `d__2` at line 9");
     vput32(mb[0 .. 192], 4 * META + 12, 22);
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r3 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u16\nq:u8\n", wk[0 .. 100], out[0 .. 4096]);
+    const r3 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u16\nq:u8\n", wk[0 .. 140], out[0 .. 4096], "");
     assert r3 < 0;
     const n3 : usize = @intCast(0 - r3);
     assert holds(out[0 .. 4096], n3, "unsupported construct lane of another type than its lane 0 `d__1` at line 9");
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r4 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u16\n", wk[0 .. 100], out[0 .. 4096]);
+    const r4 : i64 = emit(nb[0 .. 864], tx, mb[0 .. 192], "d__0:u8\nd__1:u8\nq:u16\n", wk[0 .. 140], out[0 .. 4096], "");
     assert r4 < 0;
     const n4 : usize = @intCast(0 - r4);
     assert holds(out[0 .. 4096], n4, "unsupported construct inout of another type than the port it is handed to `p` at line 12");
@@ -2794,9 +3282,9 @@ test a_pin_attribute_rides_on_the_port_it_names {
         i = i + 1;
     }
     tmeta(mb[0 .. 176], 7, FLAG_PUB, 8);
-    var wk : [100]u8 = undefined;
+    var wk : [140]u8 = undefined;
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
@@ -2812,7 +3300,7 @@ test a_pin_attribute_rides_on_the_port_it_names {
     vset(nb[0 .. 792], 4, F_KIND, 25, 31);
     assert pin_decl(nb[0 .. 792], tx, mb[0 .. 176], 1, "x") == 5 and pin_decl(nb[0 .. 792], tx, mb[0 .. 176], 1, "y") == NO_NODE;
     var out : [4096]u8 = undefined;
-    const r : i64 = emit(nb[0 .. 792], tx, mb[0 .. 176], "", wk[0 .. 100], out[0 .. 4096]);
+    const r : i64 = emit(nb[0 .. 792], tx, mb[0 .. 176], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r > 0;
     const n : usize = @intCast(r);
     // each attribute in PIN_KEYS order, before the port it names, and nowhere else
@@ -2821,11 +3309,11 @@ test a_pin_attribute_rides_on_the_port_it_names {
     // a pin attribute that names no port is refused by name
     vset(nb[0 .. 792], 9, F_NAME, 59, 64);
     i = 0;
-    while (i < 100) {
+    while (i < 140) {
         wk[i] = 0;
         i = i + 1;
     }
-    const r2 : i64 = emit(nb[0 .. 792], tx, mb[0 .. 176], "", wk[0 .. 100], out[0 .. 4096]);
+    const r2 : i64 = emit(nb[0 .. 792], tx, mb[0 .. 176], "", wk[0 .. 140], out[0 .. 4096], "");
     assert r2 < 0;
     const n2 : usize = @intCast(0 - r2);
     assert holds(out[0 .. 4096], n2, "unsupported construct pin attribute for no port of the module `z_LOC` at line 10");
