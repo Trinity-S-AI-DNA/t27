@@ -1,0 +1,669 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/kernel.t27 -- the Queen's kernel for T27 OS: the BEAM actor model of specs/queen/actors.t27 built
+; into the OS, to manage and SCALE it by the computer's resources.
+; Owner, 2026-10-20: "we built a BEAM-like actor model in .t27 -- build it natively into T27 OS, into the Queen's
+; kernel, to manage and scale the system depending on the computer's resources." Closes #11275. ASCII only (L3),
+; English only (LANG-EN). AGENTS.md "Actors, not threads": everything that runs at once is an actor under a supervisor.
+; --
+; DRY: nothing of the actor model is restated. Restart types and strategies, intensity (MaxR/MaxT), backoff, stop
+; order, mailbox delivery, the control lane and its priority all come from actors.t27 (used); the cap check of the
+; GOD MODE rule from evolve.t27 (used); the packer from dash.t27 (used, read only); number printing from
+; session_store.t27 (used). Only what is new lives here: the tree of T27 OS as data, the resource formula, the
+; shedding plan, the kernel's message tags and the view model.
+; --
+; THE TREE (indices are the node ids; lanes are dynamic children, node 9 + j for lane j, oldest first):
+;   0 ROOT            one_for_one          MaxR/MaxT = ROOT_MAX_RESTARTS/ROOT_PERIOD_SECONDS (actors.t27)
+;   1  QUEEN          permanent, one_for_one, supervises 2 and 3
+;   2   LANES         permanent supervisor, one_for_one, MaxR/MaxT = DOMAIN_* (actors.t27); children are the agent
+;                     lanes, TRANSIENT, one per pane/task. A lane that ends normally or by shutdown (a shed) stays down.
+;   3   SERVICES      permanent supervisor, one_for_one, MaxR/MaxT = SERVICES_MAX_R/SERVICES_PERIOD; children are
+;                     permanent: 4 pty server link, 5 card fetcher, 6 bench poller, 7 kanban poller, 8 pulse poller.
+;   A lane that crashes more than MaxR times in MaxT escalates (KD_OWNER_REQUEST): the Queen does not restart it again;
+;   she records an OWNER REQUEST (what, options, default, due) and the task stays held until the default time.
+; --
+; WHAT THE HOST MUST READ, natively, with no foreign code (macOS libSystem; a pty_sys-like glue file adds the
+; @extern imports; NOTHING here calls them, this spec only decides). The sandbox of the session that wrote this denied
+; `sysctl hw.ncpu`, so NO NUMBER BELOW IS MEASURED ON THIS MAC; the tests use stated machines, not a probe:
+;   mem_bytes    sysctlbyname("hw.memsize", &u64, &len, 0, 0)                 -> u64 bytes
+;   ncpu         sysctlbyname("hw.ncpu", &i32, &len, 0, 0)                    -> logical cpus
+;   load1x100    getloadavg(double[3], 3) -> loadavg[0] * 100 as u32          (vm.loadavg is the same data)
+;   free_bytes   host_statistics64(mach_host_self(), HOST_VM_INFO64, vm_statistics64*, &count) then
+;                (free_count + inactive_count) * page size; page size from sysctlbyname("hw.pagesize")
+;   on_battery   IOPSCopyPowerSourcesInfo + IOPSGetProvidingPowerSourceType (IOKit, OPTIONAL): "Battery Power" ->
+;                true. If IOKit is not linked the host passes false, and the cap is merely not halved.
+;   per lane     proc_pidinfo(pid, PROC_PIDTASKINFO) pti_resident_size, to REPLACE LANE_MB by a measurement.
+; Read cadence: once at start for mem_bytes and ncpu; every KERNEL_TICK_SECONDS for load, free and power.
+; --
+; WHAT THE WINDOW MUST DRAW (the Q page): the view of section 6 -- a row of GAUGES (used, free, load, cap), the
+; cap-reason strip, then one row per tree node indented by depth, each with kind, state, restarts in window, mailbox
+; depth and RSS estimate. kv_* give every x, y, w, h; kv_at hit-tests. Colors and glyphs stay in the window.
+
+module T27osKernel;
+
+use queen::actors::STRAT_ONE_FOR_ONE;
+use queen::actors::RESTART_PERMANENT;
+use queen::actors::RESTART_TRANSIENT;
+use queen::actors::X_NORMAL;
+use queen::actors::X_SHUTDOWN;
+use queen::actors::X_CRASH;
+use queen::actors::SUP_NOTHING;
+use queen::actors::SUP_RESTART;
+use queen::actors::SUP_GIVE_UP;
+use queen::actors::ROOT_MAX_RESTARTS;
+use queen::actors::ROOT_PERIOD_SECONDS;
+use queen::actors::DOMAIN_MAX_RESTARTS;
+use queen::actors::DOMAIN_PERIOD_SECONDS;
+use queen::actors::MAILBOX_CAP;
+use queen::actors::D_QUEUED;
+use queen::actors::D_DROPPED_FULL;
+use queen::actors::LANE_DATA;
+use queen::actors::LANE_CONTROL;
+use queen::actors::LANE_NONE;
+use queen::actors::M_TASK_OFFER;
+use queen::actors::on_child_exit;
+use queen::actors::should_restart;
+use queen::actors::stop_rank;
+use queen::actors::backoff_seconds;
+use queen::actors::deliver;
+use queen::actors::next_lane;
+use queen::actors::ctl_post;
+use queen::actors::ctl_next;
+use queen::actors::ctl_take;
+use queen::actors::ctl_pending;
+use t27os::evolve::why_not_cap;
+use t27os::evolve::why_not;
+use t27os::dash::pack_cols;
+use t27os::dash::cell_w;
+use t27os::dash::cell_x;
+use t27os::dash::cell_y;
+use t27os::dash::pack_h;
+use t27os::dash::pack_at;
+use t27os::dash::GAP;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+; --- 1. The supervision tree as data ---------------------------------------------------------------------
+
+pub const N_ROOT : u32 = 0;
+pub const N_QUEEN : u32 = 1;
+pub const N_LANES : u32 = 2;
+pub const N_SERVICES : u32 = 3;
+pub const N_SERVICE0 : u32 = 4;
+pub const SERVICE_COUNT : u32 = 5;
+pub const N_LANE0 : u32 = 9;
+pub const FIXED_NODES : u32 = 9;
+pub const N_NONE : u32 = 255;
+
+/// Service slots, in start order.
+pub const SV_PTY : u32 = 0;
+pub const SV_CARDS : u32 = 1;
+pub const SV_BENCH : u32 = 2;
+pub const SV_KANBAN : u32 = 3;
+pub const SV_PULSE : u32 = 4;
+pub const SERVICE_NAMES : [5]str = ["PTY LINK", "CARDS", "BENCH", "KANBAN", "PULSE"];
+
+/// What a node is.
+pub const KN_ROOT : u32 = 0;
+pub const KN_QUEEN : u32 = 1;
+pub const KN_SUP : u32 = 2;
+pub const KN_SERVICE : u32 = 3;
+pub const KN_LANE : u32 = 4;
+pub const KN_NONE : u32 = 99;
+pub const KIND_NAMES : [5]str = ["ROOT", "QUEEN", "SUP", "SERVICE", "LANE"];
+
+pub const LANES_MAX_R : u32 = DOMAIN_MAX_RESTARTS;
+pub const LANES_PERIOD_SECONDS : u32 = DOMAIN_PERIOD_SECONDS;
+/// Services are polls and links that fail for outside reasons (a network blip): a little more room than a lane.
+/// Chosen, not measured.
+pub const SERVICES_MAX_R : u32 = 5;
+pub const SERVICES_PERIOD_SECONDS : u32 = 300;
+pub const QUEEN_MAX_R : u32 = ROOT_MAX_RESTARTS;
+pub const QUEEN_PERIOD_SECONDS : u32 = ROOT_PERIOD_SECONDS;
+
+pub fn node_count(lanes: u32) -> u32 {
+    return FIXED_NODES + lanes;
+}
+
+pub fn node_kind(i: u32, lanes: u32) -> u32 {
+    if (i == N_ROOT) { return KN_ROOT; }
+    if (i == N_QUEEN) { return KN_QUEEN; }
+    if (i == N_LANES or i == N_SERVICES) { return KN_SUP; }
+    if (i >= N_SERVICE0 and i < N_SERVICE0 + SERVICE_COUNT) { return KN_SERVICE; }
+    if (i >= N_LANE0 and i < node_count(lanes)) { return KN_LANE; }
+    return KN_NONE;
+}
+
+pub fn node_parent(i: u32, lanes: u32) -> u32 {
+    const k : u32 = node_kind(i, lanes);
+    if (k == KN_QUEEN) { return N_ROOT; }
+    if (k == KN_SUP) { return N_QUEEN; }
+    if (k == KN_SERVICE) { return N_SERVICES; }
+    if (k == KN_LANE) { return N_LANES; }
+    return N_NONE;
+}
+
+pub fn node_depth(i: u32, lanes: u32) -> u32 {
+    var d : u32 = 0;
+    var n : u32 = i;
+    while (node_parent(n, lanes) != N_NONE) {
+        n = node_parent(n, lanes);
+        d = d + 1;
+    }
+    return d;
+}
+
+/// How a node's parent restarts it. Lanes are transient; everything else is permanent.
+pub fn node_restart(i: u32, lanes: u32) -> u8 {
+    if (node_kind(i, lanes) == KN_LANE) { return RESTART_TRANSIENT; }
+    return RESTART_PERMANENT;
+}
+
+/// A supervisor's own strategy over its children: one_for_one at every level, for the reason actors.t27 gives for
+/// the Queen's tree (no child holds state another needs). STRAT_NONE for a node that supervises nothing.
+pub const STRAT_NONE : u8 = 255;
+
+pub fn node_strategy(i: u32, lanes: u32) -> u8 {
+    const k : u32 = node_kind(i, lanes);
+    if (k == KN_ROOT or k == KN_QUEEN or k == KN_SUP) { return STRAT_ONE_FOR_ONE; }
+    return STRAT_NONE;
+}
+
+/// MaxR and MaxT of the supervisor i (the intensity of ITS children's restarts); 0 for a worker.
+pub fn node_max_r(i: u32, lanes: u32) -> u32 {
+    if (i == N_ROOT) { return ROOT_MAX_RESTARTS; }
+    if (i == N_QUEEN) { return QUEEN_MAX_R; }
+    if (i == N_LANES) { return LANES_MAX_R; }
+    if (i == N_SERVICES) { return SERVICES_MAX_R; }
+    return 0;
+}
+
+pub fn node_max_t(i: u32, lanes: u32) -> u32 {
+    if (i == N_ROOT) { return ROOT_PERIOD_SECONDS; }
+    if (i == N_QUEEN) { return QUEEN_PERIOD_SECONDS; }
+    if (i == N_LANES) { return LANES_PERIOD_SECONDS; }
+    if (i == N_SERVICES) { return SERVICES_PERIOD_SECONDS; }
+    return 0;
+}
+
+/// What a lane's exit does. A crash is restarted until MaxR is exceeded; then the lanes supervisor gives up and the
+/// Queen records an owner request instead of restarting forever. A normal end or a shed (X_SHUTDOWN) restarts nothing.
+pub const KD_NOTHING : u32 = 0;
+pub const KD_RESTART : u32 = 1;
+pub const KD_OWNER_REQUEST : u32 = 2;
+
+pub fn lane_decision(reason: u8, earlier_restarts: u32) -> u32 {
+    const d : u8 = on_child_exit(RESTART_TRANSIENT, reason, earlier_restarts, LANES_MAX_R);
+    if (d == SUP_GIVE_UP) { return KD_OWNER_REQUEST; }
+    if (d == SUP_RESTART) { return KD_RESTART; }
+    return KD_NOTHING;
+}
+
+/// A service is permanent: it restarts on any exit, and when the services supervisor gives up the Queen restarts that
+/// supervisor in turn (a permanent child of hers), the root deciding last by ROOT_*.
+pub fn service_decision(reason: u8, earlier_restarts: u32) -> u32 {
+    const d : u8 = on_child_exit(RESTART_PERMANENT, reason, earlier_restarts, SERVICES_MAX_R);
+    if (d == SUP_GIVE_UP) { return KD_OWNER_REQUEST; }
+    return KD_RESTART;
+}
+
+/// The wait before a lane's restart number n of an unstable streak (actors.t27 backoff).
+pub fn lane_restart_wait(streak: u32) -> u32 {
+    return backoff_seconds(streak);
+}
+
+/// An owner request the Queen recorded is chased once; the default stands at this age (CLAUDE.md "request, do not
+/// ask"): the task is dropped back to the backlog, not retried.
+pub const REQUEST_DEFAULT_SECONDS : u32 = 3600;
+
+pub fn request_default_due(age_seconds: u32) -> bool {
+    return age_seconds >= REQUEST_DEFAULT_SECONDS;
+}
+
+; --- 2. Resource-aware scaling ---------------------------------------------------------------------------
+
+/// Cost estimates in MB. NOT MEASURED: chosen constants (the owner named ~450 MB for a Claude Code pane). A lane is
+/// its pane PLUS the build or test process it spawns (cargo, t27c, zig), which is why a lane is counted at twice the
+/// pane. HOST_BASE_MB is macOS, the window, the browser and the editors already resident on a developer Mac. Replace
+/// by proc_pidinfo readings (header) before quoting any of them as a measurement.
+pub const PANE_MB : u32 = 450;
+pub const LANE_MB : u32 = 900;
+pub const SERVICE_MB : u32 = 60;
+pub const QUEEN_MB : u32 = 150;
+pub const HOST_BASE_MB : u32 = 3072;
+/// Never let free memory (free + inactive pages) fall under 1.5 GB.
+pub const FLOOR_MB : u32 = 1536;
+/// Held lanes resume only after free memory is back above the floor plus this margin (no flapping).
+pub const RESUME_MARGIN_MB : u32 = 512;
+pub const LANE_HARD_MAX : u32 = 16;
+/// Load above ncpu * 80 / 100 holds new spawns.
+pub const LOAD_HOLD_PERCENT : u32 = 80;
+pub const KERNEL_TICK_SECONDS : u32 = 5;
+
+pub fn min2(a: u32, b: u32) -> u32 {
+    if (a < b) { return a; }
+    return b;
+}
+
+pub fn mb_of(bytes: u64) -> u32 {
+    return @as(u32, @intCast(bytes >> 20));
+}
+
+/// What the kernel itself keeps resident: the Queen and the five services.
+pub fn kernel_mb() -> u32 {
+    return QUEEN_MB + SERVICE_COUNT * SERVICE_MB;
+}
+
+/// Lanes the memory of the machine carries: (mem - base - kernel - floor) / LANE_MB. Zero when it is negative.
+pub fn mem_lanes(mem_mb: u32) -> u32 {
+    const fixed : u32 = HOST_BASE_MB + kernel_mb() + FLOOR_MB;
+    if (mem_mb <= fixed) { return 0; }
+    return (mem_mb - fixed) / LANE_MB;
+}
+
+/// Lanes the cpus carry: all but one, one left for the window and the pty server.
+pub fn cpu_lanes(ncpu: u32) -> u32 {
+    if (ncpu < 2) { return 1; }
+    return ncpu - 1;
+}
+
+/// The cap on running lanes. min(memory, cpu, LANE_HARD_MAX), halved on battery, never below 1 (the Queen always
+/// keeps one lane), and 1 when free memory could not be read (free_bytes == 0, the host's failure value).
+/// load1x100 does not change the cap, it HOLDS new spawns (spawn_hold): a busy machine keeps its lanes.
+pub fn agent_cap(mem_bytes: u64, free_bytes: u64, ncpu: u32, load1x100: u32, on_battery: bool) -> u32 {
+    var c : u32 = min2(min2(mem_lanes(mb_of(mem_bytes)), cpu_lanes(ncpu)), LANE_HARD_MAX);
+    if (on_battery) { c = c / 2; }
+    if (free_bytes == 0) { c = min2(c, 1); }
+    if (c < 1) { return 1; }
+    return c;
+}
+
+/// Why a cap is what it is, for the strip of the view.
+pub const CR_MEM : u32 = 0;
+pub const CR_CPU : u32 = 1;
+pub const CR_HARD : u32 = 2;
+pub const CR_BATTERY : u32 = 3;
+pub const CR_UNREAD : u32 = 4;
+pub const CR_MIN : u32 = 5;
+
+pub fn cap_reason(mem_bytes: u64, free_bytes: u64, ncpu: u32, on_battery: bool) -> u32 {
+    if (free_bytes == 0) { return CR_UNREAD; }
+    if (on_battery) { return CR_BATTERY; }
+    const m : u32 = mem_lanes(mb_of(mem_bytes));
+    const c : u32 = cpu_lanes(ncpu);
+    if (m < 1) { return CR_MIN; }
+    if (m <= c and m <= LANE_HARD_MAX) { return CR_MEM; }
+    if (c <= LANE_HARD_MAX) { return CR_CPU; }
+    return CR_HARD;
+}
+
+/// Why new spawns are held now (H_NONE if they may start).
+pub const H_NONE : u32 = 0;
+pub const H_MEMORY : u32 = 1;
+pub const H_LOAD : u32 = 2;
+
+pub fn spawn_hold(free_mb: u32, ncpu: u32, load1x100: u32) -> u32 {
+    if (free_mb < FLOOR_MB + RESUME_MARGIN_MB) { return H_MEMORY; }
+    if (load1x100 > ncpu * LOAD_HOLD_PERCENT) { return H_LOAD; }
+    return H_NONE;
+}
+
+/// May a new lane start: under the cap and not held.
+pub fn may_spawn(cap: u32, running: u32, hold: u32) -> bool {
+    if (hold != H_NONE) { return false; }
+    return running < cap;
+}
+
+/// The GOD MODE rule's reason for doing nothing, with the cap this machine allows instead of evolve's fixed
+/// MAX_AGENTS (R_OK if a task may start). The hold is the kernel's own and is checked by may_spawn.
+pub fn lane_gate(god: bool, panel_open: bool, running: u32, started_hour: u32, mem_bytes: u64, free_bytes: u64, ncpu: u32, load1x100: u32, on_battery: bool) -> u32 {
+    return why_not_cap(god, panel_open, running, started_hour, agent_cap(mem_bytes, free_bytes, ncpu, load1x100, on_battery));
+}
+
+; --- 3. Backpressure and shedding ------------------------------------------------------------------------
+
+/// Lanes to stop now: each stopped lane frees about LANE_MB, so ceil((floor - free) / LANE_MB), at most `running`.
+/// Zero while free memory is at or above the floor. Never the Queen, never a service: only lanes are counted.
+pub fn lanes_to_shed(free_mb: u32, running: u32) -> u32 {
+    if (free_mb >= FLOOR_MB) { return 0; }
+    const need : u32 = (FLOOR_MB - free_mb + LANE_MB - 1) / LANE_MB;
+    return min2(need, running);
+}
+
+/// The lane (0 = oldest) with shed rank nth: the NEWEST first, which is actors.t27's stop order.
+pub fn shed_lane(count: u32, nth: u32) -> u32 {
+    var i : u32 = 0;
+    while (i < count) {
+        if (stop_rank(i, count) == nth) { return i; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// A shed lane ends with X_SHUTDOWN, a transient lane's quiet end: not restarted, not counted toward MaxR; its task
+/// is HELD, not failed. Held tasks come back, oldest first, when resume_ok.
+pub const SHED_REASON : u8 = X_SHUTDOWN;
+
+pub fn shed_restarts() -> bool {
+    return should_restart(RESTART_TRANSIENT, SHED_REASON);
+}
+
+pub fn resume_ok(free_mb: u32, held: u32, running: u32, cap: u32, load_hold: u32) -> bool {
+    if (held == 0) { return false; }
+    if (free_mb < FLOOR_MB + RESUME_MARGIN_MB) { return false; }
+    return may_spawn(cap, running, load_hold);
+}
+
+/// Mailbox limits per kind. A lane takes a few offers and cancels; the Queen takes the whole board's events
+/// (actors.t27 MAILBOX_CAP). A full mailbox drops the message and counts a dead letter (deliver).
+pub const LANE_MBOX : u32 = 16;
+pub const SERVICE_MBOX : u32 = 64;
+pub const QUEEN_MBOX : u32 = MAILBOX_CAP;
+
+pub fn mbox_cap(kind: u32) -> u32 {
+    if (kind == KN_LANE) { return LANE_MBOX; }
+    if (kind == KN_SERVICE) { return SERVICE_MBOX; }
+    return QUEEN_MBOX;
+}
+
+pub fn kernel_deliver(kind: u32, reached: bool, queued: u32) -> u8 {
+    return deliver(reached, queued, mbox_cap(kind));
+}
+
+/// Kernel message tags. STOP and ESCALATE ride the control lane (taken before any offer, whatever arrived first) and
+/// the lower tag first, so a STOP is received before an escalation, and both before a task offer (data lane).
+pub const K_STOP : u64 = 8;
+pub const K_ESCALATE : u64 = 9;
+pub const K_TASK : u64 = M_TASK_OFFER;
+
+pub fn kernel_lane(tag: u64) -> u8 {
+    if (tag == K_STOP or tag == K_ESCALATE) { return LANE_CONTROL; }
+    return LANE_DATA;
+}
+
+; --- 4. The view of the kernel for the Q page --------------------------------------------------------------
+
+/// Node states.
+pub const NS_RUNNING : u32 = 0;
+pub const NS_RESTARTING : u32 = 1;
+pub const NS_HELD : u32 = 2;
+pub const NS_STOPPED : u32 = 3;
+pub const NS_ESCALATED : u32 = 4;
+pub const STATE_NAMES : [5]str = ["RUNNING", "RESTARTING", "HELD", "STOPPED", "ESCALATED"];
+
+/// One node's row packed in a u64: state (3 bits) | restarts in window (4) << 3 | mailbox depth (10) << 7 |
+/// RSS estimate in MB (14) << 17.
+pub fn nv_pack(state: u32, restarts: u32, mbox: u32, rss_mb: u32) -> u64 {
+    return @as(u64, state & 7) | (@as(u64, restarts & 15) << 3) | (@as(u64, mbox & 1023) << 7) | (@as(u64, rss_mb & 16383) << 17);
+}
+
+pub fn nv_state(v: u64) -> u32 { return @as(u32, @intCast(v & 7)); }
+pub fn nv_restarts(v: u64) -> u32 { return @as(u32, @intCast((v >> 3) & 15)); }
+pub fn nv_mbox(v: u64) -> u32 { return @as(u32, @intCast((v >> 7) & 1023)); }
+pub fn nv_rss(v: u64) -> u32 { return @as(u32, @intCast((v >> 17) & 16383)); }
+
+/// The RSS estimate of a node (the constants above; NOT MEASURED).
+pub fn node_rss_mb(i: u32, lanes: u32) -> u32 {
+    const k : u32 = node_kind(i, lanes);
+    if (k == KN_QUEEN) { return QUEEN_MB; }
+    if (k == KN_SERVICE) { return SERVICE_MB; }
+    if (k == KN_LANE) { return LANE_MB; }
+    return 0;
+}
+
+/// Estimated RSS of the whole kernel and its lanes.
+pub fn tree_rss_mb(lanes: u32) -> u32 {
+    return kernel_mb() + lanes * LANE_MB;
+}
+
+/// Gauges: 0 used, 1 free, 2 load, 3 cap. Each is a fill 0..100.
+pub const GA_USED : u32 = 0;
+pub const GA_FREE : u32 = 1;
+pub const GA_LOAD : u32 = 2;
+pub const GA_CAP : u32 = 3;
+pub const GAUGE_COUNT : u32 = 4;
+pub const GAUGE_NAMES : [4]str = ["MEM USED", "MEM FREE", "LOAD", "LANES / CAP"];
+
+pub fn gauge_fill(g: u32, mem_mb: u32, free_mb: u32, ncpu: u32, load1x100: u32, running: u32, cap: u32) -> u32 {
+    if (mem_mb == 0 or ncpu == 0 or cap == 0) { return 0; }
+    if (g == GA_USED) { return (mem_mb - min2(free_mb, mem_mb)) * 100 / mem_mb; }
+    if (g == GA_FREE) { return min2(free_mb, mem_mb) * 100 / mem_mb; }
+    if (g == GA_LOAD) { return min2(load1x100 / ncpu, 100); }
+    if (g == GA_CAP) { return min2(running * 100 / cap, 100); }
+    return 0;
+}
+
+/// The cap-reason strip: "cap 3: 8 GB, 1.5 GB floor" and its siblings. Writes ASCII at `at`, returns the end.
+pub fn put_reason(out: []u8, at: usize, cap: u32, reason: u32, mem_mb: u32, ncpu: u32) -> usize {
+    var n : usize = put_bytes(out, at, "cap ");
+    n = put_dec(out, n, @as(u64, cap));
+    n = put_bytes(out, n, ": ");
+    if (reason == CR_MEM) {
+        n = put_dec(out, n, @as(u64, (mem_mb + 512) / 1024));
+        return put_bytes(out, n, " GB, 1.5 GB floor");
+    }
+    if (reason == CR_CPU) {
+        n = put_dec(out, n, @as(u64, ncpu));
+        return put_bytes(out, n, " cpu, one kept free");
+    }
+    if (reason == CR_HARD) { return put_bytes(out, n, "hard max"); }
+    if (reason == CR_BATTERY) { return put_bytes(out, n, "on battery, halved"); }
+    if (reason == CR_UNREAD) { return put_bytes(out, n, "free memory unread, one lane"); }
+    return put_bytes(out, n, "small machine, one lane");
+}
+
+pub fn put_hold(out: []u8, at: usize, hold: u32) -> usize {
+    if (hold == H_MEMORY) { return put_bytes(out, at, "hold: free memory near the floor"); }
+    if (hold == H_LOAD) { return put_bytes(out, at, "hold: load above 80% of cpus"); }
+    return at;
+}
+
+; --- 5. Layout (dash.t27's packer) -----------------------------------------------------------------------
+
+pub const KV_GAUGE_H : f64 = 26.0;
+pub const KV_GAUGE_MIN : f64 = 128.0;
+pub const KV_STRIP_H : f64 = 22.0;
+pub const KV_ROW_H : f64 = 22.0;
+pub const KV_INDENT : f64 = 14.0;
+
+fn kfl(x: u32) -> f64 { return @as(f64, @floatFromInt(x)); }
+
+pub fn kv_cols(w: f64) -> u32 {
+    return min2(pack_cols(w, KV_GAUGE_MIN, GAP), GAUGE_COUNT);
+}
+
+pub fn kv_gauge_x(g: u32, w: f64) -> f64 { return cell_x(g, w, kv_cols(w), GAP); }
+pub fn kv_gauge_y(g: u32, w: f64) -> f64 { return cell_y(g, kv_cols(w), KV_GAUGE_H, GAP); }
+pub fn kv_gauge_w(w: f64) -> f64 { return cell_w(w, kv_cols(w), GAP); }
+pub fn kv_gauges_h(w: f64) -> f64 { return pack_h(GAUGE_COUNT, kv_cols(w), KV_GAUGE_H, GAP); }
+pub fn kv_strip_y(w: f64) -> f64 { return kv_gauges_h(w) + GAP; }
+pub fn kv_tree_y(w: f64) -> f64 { return kv_strip_y(w) + KV_STRIP_H + GAP; }
+pub fn kv_row_x(i: u32, lanes: u32) -> f64 { return kfl(node_depth(i, lanes)) * KV_INDENT; }
+pub fn kv_row_y(i: u32, w: f64) -> f64 { return kv_tree_y(w) + kfl(i) * (KV_ROW_H + GAP); }
+pub fn kv_row_w(i: u32, lanes: u32, w: f64) -> f64 { return w - kv_row_x(i, lanes); }
+
+/// The page height: the tree is one row per node, in node order (parents before children).
+pub fn kv_height(lanes: u32, w: f64) -> f64 {
+    return kv_tree_y(w) + pack_h(node_count(lanes), 1, KV_ROW_H, GAP);
+}
+
+/// What is under (x, y): a gauge g (0..3), a node N_LANE... as 100 + i, 99 for the strip, 255 for nothing.
+pub fn kv_at(lanes: u32, w: f64, x: f64, y: f64) -> u32 {
+    if (x < 0.0 or x >= w or y < 0.0) { return 255; }
+    if (y < kv_gauges_h(w)) {
+        const g : u32 = pack_at(GAUGE_COUNT, w, kv_cols(w), KV_GAUGE_H, GAP, x, y);
+        if (g < GAUGE_COUNT) { return g; }
+        return 255;
+    }
+    if (y >= kv_strip_y(w) and y < kv_strip_y(w) + KV_STRIP_H) { return 99; }
+    if (y < kv_tree_y(w)) { return 255; }
+    const n : u32 = node_count(lanes);
+    const r : u32 = pack_at(n, w, 1, KV_ROW_H, GAP, x, y - kv_tree_y(w));
+    if (r < n and x >= kv_row_x(r, lanes)) { return 100 + r; }
+    return 255;
+}
+
+; --- 6. Tests ----------------------------------------------------------------------------------------------
+
+test the_tree_has_the_shape_root_queen_two_supervisors_five_services_and_one_node_per_lane {
+    assert node_count(0) == 9 and node_count(3) == 12;
+    assert node_kind(N_ROOT, 3) == KN_ROOT and node_kind(N_QUEEN, 3) == KN_QUEEN;
+    assert node_kind(N_LANES, 3) == KN_SUP and node_kind(N_SERVICES, 3) == KN_SUP;
+    assert node_kind(SERVICE_COUNT + 3, 3) == KN_SERVICE and node_kind(8, 3) == KN_SERVICE;
+    assert node_kind(9, 3) == KN_LANE and node_kind(11, 3) == KN_LANE and node_kind(12, 3) == KN_NONE;
+    assert node_parent(N_ROOT, 3) == N_NONE and node_parent(N_QUEEN, 3) == N_ROOT;
+    assert node_parent(N_LANES, 3) == N_QUEEN and node_parent(N_SERVICES, 3) == N_QUEEN;
+    assert node_parent(8, 3) == N_SERVICES and node_parent(10, 3) == N_LANES;
+    assert node_depth(N_ROOT, 3) == 0 and node_depth(N_QUEEN, 3) == 1;
+    assert node_depth(N_LANES, 3) == 2 and node_depth(9, 3) == 3 and node_depth(8, 3) == 3;
+    assert node_restart(9, 3) == RESTART_TRANSIENT and node_restart(N_QUEEN, 3) == RESTART_PERMANENT;
+    assert node_restart(4, 3) == RESTART_PERMANENT and node_restart(N_LANES, 3) == RESTART_PERMANENT;
+    assert node_strategy(N_ROOT, 3) == STRAT_ONE_FOR_ONE and node_strategy(N_LANES, 3) == STRAT_ONE_FOR_ONE;
+    assert node_strategy(9, 3) == STRAT_NONE and node_strategy(4, 3) == STRAT_NONE;
+    assert node_max_r(N_ROOT, 3) == ROOT_MAX_RESTARTS and node_max_t(N_ROOT, 3) == ROOT_PERIOD_SECONDS;
+    assert node_max_r(N_LANES, 3) == 3 and node_max_t(N_LANES, 3) == 300;
+    assert node_max_r(N_SERVICES, 3) == 5 and node_max_t(N_SERVICES, 3) == 300;
+    assert node_max_r(9, 3) == 0;
+}
+
+test a_lane_that_crashes_more_than_maxr_times_escalates_and_the_queen_records_a_request {
+    assert lane_decision(X_CRASH, 0) == KD_RESTART;
+    assert lane_decision(X_CRASH, 2) == KD_RESTART;
+    assert lane_decision(X_CRASH, 3) == KD_OWNER_REQUEST;
+    assert lane_decision(X_NORMAL, 9) == KD_NOTHING;
+    assert lane_decision(X_SHUTDOWN, 9) == KD_NOTHING;
+    assert service_decision(X_NORMAL, 0) == KD_RESTART;
+    assert service_decision(X_CRASH, 4) == KD_RESTART;
+    assert service_decision(X_CRASH, 5) == KD_OWNER_REQUEST;
+    assert lane_restart_wait(1) == 10 and lane_restart_wait(2) == 20 and lane_restart_wait(9) == 300;
+    assert request_default_due(3599) == false and request_default_due(3600);
+}
+
+test the_cap_on_the_eight_gb_mac_is_three_whatever_its_cpu_count_from_four_up {
+    // 8 GB: (8192 - 3072 - 450 - 1536) / 900 = 3 lanes by memory
+    assert mem_lanes(8192) == 3;
+    assert agent_cap(8589934592, 3221225472, 4, 100, false) == 3;
+    assert agent_cap(8589934592, 3221225472, 6, 100, false) == 3;
+    assert agent_cap(8589934592, 3221225472, 8, 300, false) == 3;
+    assert agent_cap(8589934592, 3221225472, 10, 100, false) == 3;
+    assert agent_cap(8589934592, 3221225472, 8, 100, false) == 3;
+    assert cap_reason(8589934592, 3221225472, 8, false) == CR_MEM;
+}
+
+test bigger_machines_get_larger_caps_and_the_cpu_and_hard_max_bind_in_turn {
+    assert mem_lanes(16384) == 12 and mem_lanes(32768) == 30;
+    assert agent_cap(17179869184, 6442450944, 10, 100, false) == 9;
+    assert cap_reason(17179869184, 6442450944, 10, false) == CR_CPU;
+    assert agent_cap(17179869184, 6442450944, 32, 100, false) == 12;
+    assert cap_reason(17179869184, 6442450944, 32, false) == CR_MEM;
+    assert agent_cap(34359738368, 12884901888, 12, 100, false) == 11;
+    assert agent_cap(34359738368, 12884901888, 64, 100, false) == 16;
+    assert cap_reason(34359738368, 12884901888, 64, false) == CR_HARD;
+    assert agent_cap(8589934592, 3221225472, 2, 100, false) == 1;
+    assert agent_cap(4294967296, 1073741824, 8, 100, false) == 1;
+    assert cap_reason(4294967296, 1073741824, 8, false) == CR_MIN;
+}
+
+test battery_halves_unread_memory_means_one_lane_and_load_holds_new_spawns_without_changing_the_cap {
+    assert agent_cap(17179869184, 6442450944, 10, 100, true) == 4;
+    assert agent_cap(8589934592, 3221225472, 8, 100, true) == 1;
+    assert cap_reason(17179869184, 6442450944, 10, true) == CR_BATTERY;
+    assert agent_cap(17179869184, 0, 10, 100, false) == 1;
+    assert cap_reason(17179869184, 0, 10, false) == CR_UNREAD;
+    // the cap ignores load; the hold reads it: 8 cpus hold above 640
+    assert agent_cap(8589934592, 3221225472, 8, 900, false) == 3;
+    assert spawn_hold(3072, 8, 640) == H_NONE;
+    assert spawn_hold(3072, 8, 641) == H_LOAD;
+    assert spawn_hold(2048, 8, 0) == H_NONE;
+    assert spawn_hold(2047, 8, 0) == H_MEMORY and spawn_hold(2000, 8, 0) == H_MEMORY;
+    assert may_spawn(3, 2, H_NONE) and may_spawn(3, 3, H_NONE) == false;
+    assert may_spawn(3, 0, H_LOAD) == false and may_spawn(3, 0, H_MEMORY) == false;
+}
+
+test the_god_mode_gate_takes_the_machines_cap_not_the_fixed_one {
+    // on the 8 GB Mac the cap is evolve's fixed MAX_AGENTS (why_not); on 16 GB a fourth lane may start
+    assert lane_gate(true, true, 3, 0, 8589934592, 3221225472, 8, 100, false) == why_not(true, true, 3, 0);
+    assert lane_gate(true, true, 3, 0, 8589934592, 3221225472, 8, 100, false) != why_not(true, true, 0, 0);
+    assert lane_gate(true, true, 3, 0, 17179869184, 6442450944, 10, 100, false) == why_not(true, true, 0, 0);
+    assert lane_gate(true, true, 9, 0, 17179869184, 6442450944, 10, 100, false) != why_not(true, true, 0, 0);
+}
+
+test shedding_stops_the_newest_lane_first_never_more_than_needed_and_resumes_with_a_margin {
+    assert lanes_to_shed(1536, 3) == 0 and lanes_to_shed(4000, 3) == 0;
+    assert lanes_to_shed(1535, 3) == 1;
+    assert lanes_to_shed(636, 3) == 1;
+    assert lanes_to_shed(635, 3) == 2;
+    assert lanes_to_shed(0, 3) == 2 and lanes_to_shed(0, 1) == 1 and lanes_to_shed(0, 0) == 0;
+    // lanes 0 (oldest), 1, 2 (newest): the newest goes first, then the next newest
+    assert shed_lane(3, 0) == 2 and shed_lane(3, 1) == 1 and shed_lane(3, 2) == 0;
+    assert shed_lane(3, 3) == 3;
+    assert shed_restarts() == false;
+    assert lane_decision(SHED_REASON, 0) == KD_NOTHING;
+    // the shed lane is a lane node; the Queen and the services are not in the lane count
+    assert node_kind(N_LANE0 + shed_lane(3, 0), 3) == KN_LANE;
+    assert resume_ok(2047, 1, 2, 3, H_NONE) == false;
+    assert resume_ok(2048, 1, 2, 3, H_NONE);
+    assert resume_ok(4096, 0, 2, 3, H_NONE) == false;
+    assert resume_ok(4096, 2, 3, 3, H_NONE) == false;
+    assert resume_ok(4096, 2, 2, 3, H_LOAD) == false;
+}
+
+test mailboxes_are_bounded_per_kind_and_stop_and_escalation_are_received_before_any_task {
+    assert mbox_cap(KN_LANE) == 16 and mbox_cap(KN_SERVICE) == 64 and mbox_cap(KN_QUEEN) == MAILBOX_CAP;
+    assert kernel_deliver(KN_LANE, true, 15) == D_QUEUED;
+    assert kernel_deliver(KN_LANE, true, 16) == D_DROPPED_FULL;
+    assert kernel_deliver(KN_SERVICE, true, 63) == D_QUEUED and kernel_deliver(KN_SERVICE, true, 64) == D_DROPPED_FULL;
+    assert kernel_deliver(KN_QUEEN, true, 255) == D_QUEUED and kernel_deliver(KN_QUEEN, true, 256) == D_DROPPED_FULL;
+    assert kernel_lane(K_STOP) == LANE_CONTROL and kernel_lane(K_ESCALATE) == LANE_CONTROL;
+    assert kernel_lane(K_TASK) == LANE_DATA;
+    // a control message beats a pending offer; between two control messages the lower tag wins
+    assert next_lane(true, true) == LANE_CONTROL and next_lane(false, true) == LANE_DATA;
+    const ctl : u64 = ctl_post(ctl_post(0, K_ESCALATE), K_STOP);
+    assert ctl_next(ctl) == K_STOP;
+    assert ctl_next(ctl_take(ctl)) == K_ESCALATE;
+    assert ctl_pending(ctl_take(ctl_take(ctl)), K_ESCALATE) == false;
+}
+
+test the_view_row_packs_state_restarts_mailbox_and_rss_and_the_gauges_read_the_machine {
+    const v : u64 = nv_pack(NS_RESTARTING, 2, 15, 900);
+    assert nv_state(v) == NS_RESTARTING and nv_restarts(v) == 2 and nv_mbox(v) == 15 and nv_rss(v) == 900;
+    assert node_rss_mb(9, 3) == 900 and node_rss_mb(N_QUEEN, 3) == 150 and node_rss_mb(4, 3) == 60;
+    assert node_rss_mb(N_ROOT, 3) == 0;
+    assert kernel_mb() == 450 and tree_rss_mb(3) == 450 + 2700;
+    assert gauge_fill(GA_USED, 8192, 3072, 8, 400, 3, 3) == 62;
+    assert gauge_fill(GA_FREE, 8192, 3072, 8, 400, 3, 3) == 37;
+    assert gauge_fill(GA_LOAD, 8192, 3072, 8, 400, 3, 3) == 50;
+    assert gauge_fill(GA_LOAD, 8192, 3072, 8, 4000, 3, 3) == 100;
+    assert gauge_fill(GA_CAP, 8192, 3072, 8, 400, 1, 3) == 33;
+    assert gauge_fill(GA_CAP, 0, 0, 0, 0, 0, 0) == 0;
+    var out : [64]u8 = undefined;
+    const e : usize = put_reason(out[0..], 0, 3, CR_MEM, 8192, 8);
+    assert e == 25;
+    assert out[0] == 99 and out[4] == 51 and out[7] == 56 and out[8] == 32 and out[9] == 71;
+    assert put_reason(out[0..], 0, 1, CR_BATTERY, 8192, 8) == 25;
+    assert put_hold(out[0..], 5, H_NONE) == 5 and put_hold(out[0..], 0, H_LOAD) > 0;
+}
+
+test the_view_layout_uses_the_dash_packer_one_gauge_row_a_strip_then_one_indented_row_per_node {
+    // wide: the four gauges share one row; narrow: two per row
+    assert kv_cols(800.0) == 4;
+    assert kv_cols(200.0) == 1;
+    assert kv_gauges_h(800.0) == KV_GAUGE_H;
+    assert kv_gauges_h(270.0) == 2.0 * KV_GAUGE_H + GAP;
+    assert kv_gauge_x(0, 800.0) == 0.0 and kv_gauge_y(3, 800.0) == 0.0;
+    assert kv_gauge_x(1, 800.0) > kv_gauge_w(800.0);
+    assert kv_strip_y(800.0) == KV_GAUGE_H + GAP;
+    assert kv_tree_y(800.0) == KV_GAUGE_H + GAP + KV_STRIP_H + GAP;
+    assert kv_row_x(N_ROOT, 3) == 0.0 and kv_row_x(N_QUEEN, 3) == 14.0 and kv_row_x(9, 3) == 42.0;
+    assert kv_row_y(1, 800.0) == kv_tree_y(800.0) + KV_ROW_H + GAP;
+    assert kv_row_w(9, 3, 800.0) == 758.0;
+    assert kv_height(3, 800.0) == kv_tree_y(800.0) + 12.0 * KV_ROW_H + 11.0 * GAP;
+    // hit tests: a gauge, the strip, a node row, the gap between rows, outside
+    assert kv_at(3, 800.0, 10.0, 5.0) == 0;
+    assert kv_at(3, 800.0, 790.0, 5.0) == 3;
+    assert kv_at(3, 800.0, 10.0, kv_strip_y(800.0) + 3.0) == 99;
+    assert kv_at(3, 800.0, 100.0, kv_tree_y(800.0) + 3.0) == 100 + N_ROOT;
+    assert kv_at(3, 800.0, 100.0, kv_row_y(10, 800.0) + 3.0) == 110;
+    assert kv_at(3, 800.0, 5.0, kv_row_y(10, 800.0) + 3.0) == 255;
+    assert kv_at(3, 800.0, 100.0, kv_row_y(2, 800.0) + KV_ROW_H + 2.0) == 255;
+    assert kv_at(3, 800.0, 900.0, 5.0) == 255;
+}
