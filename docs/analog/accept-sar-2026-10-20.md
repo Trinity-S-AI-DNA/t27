@@ -1,0 +1,324 @@
+# The external team's per-block checks applied to our SAR ADC blocks, 2026-10-20
+
+Issue #11212, milestone M5c of the analog epic #10486, night loop #11063; M5d (issue #11263) adds the transistor-level rows of the nand, nor, tgate and tracking_switch, cross-checked against ngspice; M3e (issue #11283) adds a source-to-bulk axis to the PSP103 tables, which turns the tgate's two resistances from NOT MODELLED to PASS (section 3c); M4b-q (issue #11312) gives the dynamic_comparator the devices' own charge and the body effect at 27 C, which turns its decision time from FAIL to PASS and its reset from NOT MODELLED to PASS, so the block is a PASS (section 3d); M5e (issue #11350) gives the inverter's delays into 20 fF the devices' own charge and an output node free to leave the tables' 0 to Vdd range, which turns the inverter's last row from NOT MODELLED to PASS, so that block is a PASS too (section 3e). English, ASCII only.
+
+The external team's report of 2026-10-16 lists, for each of the 13 blocks of the golden SAR ADC, a measured value and the limit that its check enforces (conditions: tt corner, 27 C, VDD 1.5 V, cells taken from the integrated converter's netlist). The team confirmed on 2026-10-20 that the checks and their limits may be used and published here. `specs/analog/accept_sar.t27` holds those limits as named constants, one pure check function per quantity, and one function per block that measures the quantity on OUR model by `use` of the spec that holds it. This document is the result. Every "our value" below is computed by a named function of that spec and pinned by a test; every "report" value is the report's, and is also in the spec as the positive control of its check (the report's own number must pass the report's own check).
+
+What this document does not say: nothing about a transistor-level result for the gate-level blocks (dff, clock_gen, SAR_logic), nothing about the voltage level of any digital node but the nand's and the nor's, nothing about the delay of a gate into a load, nothing about the tgate's resistance beyond the 27 outputs at 10 mV across it, nothing about power, noise, mismatch, another corner or temperature, or speed. No model was tuned to turn a FAIL into a PASS, and none was changed to make a number come out.
+
+## 1. The verdict rule
+
+A row is one quantity of the report's check.
+
+- PASS: our model produced the value and it is inside the report's limit.
+- FAIL: our model produced the value and it is outside the limit. It is reported as measured.
+- NOT MODELLED: our model does not produce the quantity the check enforces. Nothing is compared, and the row is never a pass, whatever a constant might have said (`as_verdict(false, x)` is NOT MODELLED for both values of `x`; a test pins it).
+
+A block is FAIL when any row fails, PASS only when it has rows and every row is PASS, and NOT MODELLED otherwise. A block with a passing row beside a row that is not modelled (the dff's behaviour and clock-to-Q beside its levels) is therefore not a pass: it is NOT MODELLED, and its passing rows are still shown. The inverter was such a block until M5e: its threshold passed and its delays were not modelled.
+
+The cross-check rule (M5d). A row from a transistor-level model is a verdict only when the same cell, run in ngspice-47 with the foundry's PSP103 (`specs/analog/decks/accept_*.cir`, on the reference host: a container with 2 threads), agrees with our number within a bar that is stated with the number: 10 uV for a level, 10 percent for a resistance or a current. A value without an ngspice run, or that does not agree with it, is shown in the table and is NOT MODELLED, whatever the limit says. The bars are far below the limits (50 mV, 30 kohm, 1 nA), so they decide only whether our number is the cell's number, never whether it passes the report's check.
+
+The comparator's rows (M4b-q, issue #11312) are worded as the issue words them: a row is PASS only inside the report's limit AND within the bar of ngspice's run of the same comparator at 27 C (10 percent for the decision time, 5 mV, a tenth of the report's 50 mV, for a level), and a model value that is produced but disagrees with ngspice's by more than the bar is the model's FAIL, not an unmeasured row. That is what makes the negative control of section 3d, the same model with its charge removed, a FAIL and not a NOT MODELLED.
+
+The inverter's delay row (M5e, issue #11350) is worded the same way: PASS only inside the report's limit (1 to 500 ps, both delays) AND within 10 percent of ngspice-47's converged run of the same cell into 20 fF (`psp103_inv20_fine.cir`, each delay); a produced value that disagrees is the model's FAIL. The report's own limit accepts the control of section 3e (the charge removed gives 39 and 52 ps), so the cross-check is what refuses it.
+
+## 2. The counts
+
+Over the 13 blocks of the report (inverter, nand, nor, tgate, dff, dynamic_comparator, tracking_switch, clock_gen, SAR_logic, DAC_control, DAC_control_top, neg_bottom_plate_logic, the 11-bit integration run):
+
+| verdict | blocks | which |
+|---|---|---|
+| PASS | 8 | clock_gen, SAR_logic, integration, nand, nor, tgate, dynamic_comparator, inverter |
+| FAIL | 0 | |
+| NOT MODELLED | 5 | dff, tracking_switch, DAC_control, DAC_control_top, neg_bottom_plate_logic |
+
+Over the 30 rows: 24 PASS, 0 FAIL, 6 NOT MODELLED (a test pins both counts: `as_all_blocks`, `as_all_rows`). Before M5d the counts were 3 / 1 / 9 blocks and 16 / 1 / 13 rows; after M5d and before M3e they were 5 / 1 / 7 blocks and 19 / 1 / 10 rows; after M3e and before M4b-q 6 / 1 / 6 blocks and 21 / 1 / 8 rows; after M4b-q and before M5e 7 / 0 / 6 blocks and 23 / 0 / 7 rows. The M5e row is the inverter's delays into 20 fF (PASS, NOT MODELLED before), so the inverter block, whose threshold row already passed, is a PASS (section 3e). The M4b-q rows are the comparator's four, all PASS: its decision time (FAIL before), its reset (NOT MODELLED before), its sign and its end levels (PASS before, on the model without charge; now on the model with it). The M5d PASS rows are the nand's and the nor's levels (2) and the tgate's off leakage (1); the M3e PASS rows are the tgate's two resistances (2), read on tables with a source-to-bulk axis (section 3c), so the tgate block is a PASS. Two of the five NOT MODELLED blocks have at least one measured, passing row (dff 2, tracking_switch 1); three have none (DAC_control, DAC_control_top, neg_bottom_plate_logic). The PASS of clock_gen and SAR_logic is the PASS of the gate-level model named in section 4, that of integration the PASS of a behavioural converter fitted to the golden deck, that of the nand, the nor and the tgate the PASS of a DC solve on the PSP103 tables, each nand and nor level within 3 uV of ngspice's and the tgate's Ron within 0.1 percent of ngspice's real cell, and that of the dynamic_comparator the PASS of a transient of the eight-node latch on the PSP103 tables with the devices' charge, its decision time 1.75 percent from ngspice's and its levels within 0.5 mV (section 3d), and that of the inverter the PASS of a transient of the cell into 20 fF on the PSP103 tables with the devices' charge, each delay 0.5 percent from ngspice's (section 3e).
+
+The report's corners smoke suite (SAR inverter delay 62 to 124 ps, comparator decision 467 to 829 ps over 5 corners at -40, 27 and 125 C) is a test run, not a block, and is not in the 13. It is NOT MODELLED (last row of the table).
+
+## 3. The table
+
+Times in ps or ns as written. "Report" is the report's measured value; "limit" is what its check enforces. Our value is from the function named in the last column.
+
+| block | check | our value | report | limit | verdict | function |
+|---|---|---|---|---|---|---|
+| inverter | switching threshold | 0.6892 V | 0.69 V | 0.5 to 1.0 V | PASS | `as_inv_vth_of` |
+| inverter | delays fall / rise into 20 fF (ideal gate step) | fall 75.755 ps, rise 93.246 ps; ngspice 75.368 and 92.778 ps (+0.51 % and +0.50 %) | 81 / 100 ps | 1 to 500 ps | PASS (within 10 % of ngspice) | `as_inv_delay` |
+| nand | truth table 00, 01, 10, 11 (logic level) | 1, 1, 1, 0 | rows right | exact | PASS | `sl_nand_code` |
+| nand | levels into 10 fF (DC solve, worst level of the 4 inputs) | 1 levels 1.5 V - 0.18 / 0.48 / 0.48 uV; 0 level 0.18 uV | 1.5 V for a 1, microvolts for a 0 | 1.45 to 1.55 V; +-50 mV | PASS (within 2.4 uV of ngspice) | `gt_levels` |
+| nor | truth table 00, 01, 10, 11 (logic level) | 1, 0, 0, 0 | rows right | exact | PASS | `sl_nor_code` |
+| nor | levels into 10 fF (DC solve, worst level of the 4 inputs) | 1 level 1.5 V - 1.85 uV; 0 levels 0.06 uV | 1.5 V for a 1, microvolts for a 0 | 1.45 to 1.55 V; +-50 mV | PASS (within 1.1 uV of ngspice) | `gt_levels` |
+| tgate | Ron at 0.75 V (10 mV across it) | 2461.2 ohm with the body effect (bulks on the rails); ngspice's real cell 2459.6 ohm, +0.065 % | 2.44 kohm | <= 30 kohm | PASS (within 10 % of ngspice) | `gt_tg_ron` |
+| tgate | worst Ron over 0.1 to 1.4 V (27 points) | 2777.5 ohm at 1.0 V with the body effect; ngspice's real cell 2776.1 ohm at 1.0 V, +0.049 % | 2.78 kohm | <= 50 kohm | PASS (within 10 % of ngspice) | `gt_tg_worst` |
+| tgate | off leakage (full swing) | 291.0 pA; ngspice 285.6 pA at the output source, 271.4 pA at the input source | 0.29 nA | <= 1 nA | PASS (within 7.2 % of ngspice) | `gt_tg_off` |
+| dff | edge capture, hold, set, reset (logic level, 11 stages) | all right | all right | exact | PASS | `as_sar_run`, `as_dff_set_reset` |
+| dff | levels of the 8 observation points | not produced | all right | +-50 mV | NOT MODELLED | |
+| dff | clock-to-Q | 546 ps | 524 ps | 1 to 3000 ps | PASS | `as_sar_run` |
+| dynamic_comparator | sign at +-2 mV, 0.75 V common mode | +2 mV: dp wins; -2 mV: dn wins | right | right | PASS | `as_cmp` |
+| dynamic_comparator | levels after the decision (2 ns) | winner 1.49933 V, loser 2.26 mV; ngspice 1.49884 V, 2.283 mV (0.49 and 0.02 mV) | right | +-50 mV | PASS (within 5 mV of ngspice) | `as_cmp` |
+| dynamic_comparator | reset (1.4 ns after the clock falls at 2 ns) | dp 3.08 mV, dn -0.17 mV; ngspice 3.265 and -0.247 mV (0.19 and 0.08 mV) | right | +-50 mV | PASS (within 5 mV of ngspice) | `as_cmp` |
+| dynamic_comparator | decision time at +-2 mV | 613.07 ps (+2 mV), 613.15 ps (-2 mV); ngspice 602.54 ps (+1.75 %) | 607 ps | 10 to 10000 ps | PASS (within 10 % of ngspice) | `as_cmp` |
+| tracking_switch | tracking error, DC (our levels 0.2 V and 1.3 V into 3.93 pF) | -1.97 uV at both; ngspice PSP103 +0.29 / -0.17 uV | < 0.001 mV at 0.3 V and 1.2 V into 2 pF | +-5 mV | PASS (within 2.3 uV of ngspice) | `as_sw` |
+| tracking_switch | hold step | not produced; ngspice PSP103 cell -1.60 / -1.73 mV at the report's conditions | -1.6 / -1.7 mV | +-30 mV | NOT MODELLED | |
+| tracking_switch | droop | not produced; ngspice PSP103 cell under 10 uV over 413 ns | none | +-5 mV | NOT MODELLED | |
+| clock_gen | slow delay (all trims 0), clks fall to clkc rise | 16.145 ns | 15.0 ns | 0.05 to 50 ns | PASS | `as_clk_golden` |
+| clock_gen | fast delay (all trims 1) | 9.822 ns | 9.2 ns | 0.02 to 40 ns | PASS | `as_clk_delay_ps` |
+| clock_gen | ratio slow / fast | 1.644 | 1.64 | >= 1.2 | PASS | |
+| clock_gen | stops after Valid | 5.704 ns | 10.7 ns | <= 30 ns | PASS | `as_clk_golden` |
+| SAR_logic | one more CK per Valid edge, CK11 first; 1, 4, 11 high after 1, 4, 11 edges | 1, 4, 11; thermometer in order at all 11 edges, held between edges | exact counts | exact | PASS | `as_sar_run` |
+| SAR_logic | CK11 to CK1 | 200.126 ns | 200 ns | 199 to 201 ns | PASS | `as_sar_run` |
+| DAC_control | idle 0.75 V; 0 V / 1.5 V after decisions 1 / 0 | not produced | right | 0.7 to 0.8 V; +-50 mV | NOT MODELLED | |
+| DAC_control_top | 11 bits latch in CK order; code, plate code | not produced | 1430, 617 | exact | NOT MODELLED | |
+| neg_bottom_plate_logic | Bit_n follows Bit while CK11 is low, complement after; VCM | not produced | 0.75 V | 0.7 to 0.8 V; +-50 mV | NOT MODELLED | |
+| integration | worst code error, -1 V to +1 V ramp of 8 conversions | 18.5 LSB | 13.8 LSB | +-64 LSB | PASS | `as_ramp_literal` |
+| integration | smallest step between conversions | 198 LSB | 154 LSB (ideal 152) | 60 to 250 LSB | PASS | `as_ramp_literal` |
+| corners (smoke suite, not a block) | inverter delay 62 to 124 ps, comparator decision 467 to 829 ps, 5 corners x 3 temperatures | not produced (the tt 27 C delays, 75.8 / 93.2 ps and 613 ps, are one point of the 15, and inside the range) | within | as stated | NOT MODELLED | |
+
+## 3b. The new rows of M5d, with ngspice's number beside ours
+
+Every number in this table is printed by a deck of `specs/analog/decks` run in ngspice-47 with the IHP SG13G2 PSP103 (IHP-Open-PDK 21133f21, mos_tt, 27 C) on the same cell, and pinned in `specs/analog/mos_psp103_gates.t27` (nand, nor, tgate) or `specs/analog/accept_sar.t27` (tracking switch). "Difference" is ours minus ngspice's. The bar is what the cross-check rule of section 1 allows; the limit is the report's.
+
+| row | our value | ngspice | difference | bar | report | limit | verdict |
+|---|---|---|---|---|---|---|---|
+| nand 00, 1 level (droop under 1.5 V) | 0.179 uV | 0.316 uV | -0.138 uV | 10 uV | 1.5 V | 1.45 to 1.55 V | PASS |
+| nand 01, 1 level | 0.477 uV | 0.721 uV | -0.244 uV | 10 uV | 1.5 V | 1.45 to 1.55 V | PASS |
+| nand 10, 1 level | 0.477 uV | 0.687 uV | -0.210 uV | 10 uV | 1.5 V | 1.45 to 1.55 V | PASS |
+| nand 11, 0 level | 0.179 uV | 2.537 uV | -2.358 uV | 10 uV | microvolts | +-50 mV | PASS |
+| nor 00, 1 level (droop under 1.5 V) | 1.848 uV | 2.883 uV | -1.036 uV | 10 uV | 1.5 V | 1.45 to 1.55 V | PASS |
+| nor 01, 0 level | 0.060 uV | 0.634 uV | -0.575 uV | 10 uV | microvolts | +-50 mV | PASS |
+| nor 10, 0 level | 0.060 uV | 0.617 uV | -0.557 uV | 10 uV | microvolts | +-50 mV | PASS |
+| nor 11, 0 level | 0.060 uV | 0.611 uV | -0.552 uV | 10 uV | microvolts | +-50 mV | PASS |
+| tgate Ron at 0.75 V | 2461.2 ohm (with the body effect; 1718.0 ohm with Vsb forced to 0) | 2459.6 ohm (real cell) | +1.6 ohm, +0.065 % (-741.6 ohm, -30.2 % with Vsb forced to 0) | 10 % | 2.44 kohm | <= 30 kohm | PASS (NOT MODELLED with Vsb forced to 0) |
+| tgate worst Ron, 27 points 0.10 to 1.40 V | 2777.5 ohm (1.0 V; 2109.3 ohm at 1.15 V with Vsb forced to 0) | 2776.1 ohm (real cell, 1.0 V) | +1.4 ohm, +0.049 % (-666.8 ohm, -24.0 % with Vsb forced to 0) | 10 % | 2.78 kohm | <= 50 kohm | PASS (NOT MODELLED with Vsb forced to 0) |
+| tgate off leakage, 1.5 V across | 291.0 pA | 285.6 pA (output source), 271.4 pA (input source) | +5.4 pA (+1.9 %), +19.7 pA (+7.2 %) | 10 % | 0.29 nA | <= 1 nA | PASS |
+| tracking error, 0.2 V into 3.93 pF | -1.967 uV | +0.287 uV | -2.253 uV | 10 uV | < 1 uV at 0.3 V and 1.2 V into 2 pF | +-5 mV | PASS |
+| tracking error, 1.3 V into 3.93 pF | -1.967 uV | -0.174 uV | -1.793 uV | 10 uV | as above | +-5 mV | PASS |
+| hold step, 0.3 V into 2 pF | not produced | -1.596 mV | | | -1.6 mV | +-30 mV | NOT MODELLED |
+| hold step, 1.2 V into 2 pF | not produced | -1.730 mV | | | -1.7 mV | +-30 mV | NOT MODELLED |
+| droop over the hold, all four runs | not produced | under 10 uV (zero at the 6 digits printed) | | | none | +-5 mV | NOT MODELLED |
+
+What the numbers say, one by one.
+
+- nand and nor levels. All eight levels, ours and ngspice's, are microvolts from the rail (1.5 V or 0 V): the report's "microvolts for a 0" is ngspice's too. The largest difference is 2.358 uV (the nand's 11, where the model's current floor leaves 0.18 uV and ngspice 2.54 uV); the bar of 10 uV was set at four times the worst difference and the verdict does not depend on it, since the limit is 50 mV. The levels are the DC solution with no load, which is the level a gate settles to into 10 fF; no transient is run, so nothing is said about how fast a gate gets there.
+- tgate off leakage. Ours is the sum of the two table words at Vgs = 0, Vds = 1.5 V (the NMOS 261 pA, the PMOS 30 pA). ngspice's two sources differ by 14 pA (285.6 pA at the output, 271.4 pA at the input), the size of a junction leakage that sits in different terminals of the two; the terms are not separated here, and our number is within the 10 percent bar of both, and the report's 0.29 nA is ngspice's output-source number rounded.
+- tgate Ron. Before M3e both resistances were NOT MODELLED because the model was 30 and 24 percent under the real cell, and the cause was measured, not guessed: the 2-D tables have no source-to-bulk voltage, and the real tgate has its bulks on the rails, so at 0.75 V the NMOS source sits 0.75 V above its bulk and the PMOS source 0.75 V below its bulk, which raises both thresholds. The deck `accept_tgate.cir` runs the same two devices again with each bulk tied to its own source, the condition the tables were made under: there ngspice gives 1717.2 ohm at 0.75 V and 2108.4 ohm at the worst point, and the model is within 0.06 percent of it at all 27 points (0.0588 percent at the largest). The gap to the real cell was largest at 0.85 V (31.1 percent) and the model was under the real cell at every one of the 27 points. Both resistances were far inside their limits (30 and 50 kohm); the rows were not PASS because the number was not the cell's number. With the source-to-bulk axis (section 3c) the model reads each device at the Vsb its source has, and the two resistances are 2461.2 and 2777.5 ohm, +0.065 and +0.049 percent from the real cell (the largest of the 27 gaps is 0.090 percent, at 0.65 V), so both rows are measured, inside the 10 percent bar and inside the report's limits: PASS. The read with Vsb forced to 0 is kept as the negative control and is still refused by the bar.
+- tracking error. The square-law model (`sar_switch.t27`) tracks to -1.967 uV, the arithmetic floor; the PSP103 cell tracks to +0.287 and -0.174 uV (a settling residue, either sign); the 2.3 uV between them is under the bar of 10 uV and 2000 times under the limit. At the report's own conditions (0.3 V and 1.2 V into 2 pF) the PSP103 cell tracks to +0.346 and +0.350 uV; our model is not run at those two conditions (its load and its levels are fixed in `sar_switch.t27`), and the DC error is the model's floor at every level it has been run at.
+- hold step and droop. The model has no gate capacitance and no leakage, so it produces neither, and the rows stay NOT MODELLED as before. What is new is ngspice's number for the same cell with the foundry's model: -1.596 and -1.730 mV at the report's conditions (the report's -1.6 and -1.7 mV), and -0.812 and -0.890 mV into our 3.93 pF (the charge injection spreads over a larger capacitor). The droop is zero at the six digits ngspice prints (under 10 uV) over the 413 ns of hold.
+
+### The reference run reproduces the report
+
+The same ngspice runs that serve as the reference give the numbers the external team measured on the same cells, so the cells we cross-check against are the report's cells (a test, `the_reference_run_of_the_real_tgate_and_the_psp103_switch_reproduces_the_reports_own_numbers`, pins each):
+
+| quantity | the report | our ngspice-47 run | difference |
+|---|---|---|---|
+| tgate Ron at 0.75 V | 2.44 kohm | 2459.6 ohm | +0.8 % |
+| tgate worst Ron over 0.1 to 1.4 V | 2.78 kohm | 2776.1 ohm | -0.14 % |
+| tgate off leakage | 0.29 nA | 0.2856 nA | -1.5 % |
+| switch hold step at 0.3 V into 2 pF | -1.6 mV | -1.596 mV | +0.004 mV |
+| switch hold step at 1.2 V into 2 pF | -1.7 mV | -1.730 mV | -0.030 mV (the report gives two digits) |
+| switch tracking error, both levels | < 0.001 mV | 0.35 uV | inside |
+
+## 3c. The body effect of the tgate (M3e, issue #11283)
+
+The 2-D log tables of both devices (`TT_LG_N`, `TT_LG_P`) are made with each bulk on its own source. The tgate's bulks are on the rails, so its Ron is 30 percent above the 2-D model's at 0.75 V (section 3b). M3e adds a third axis, the source-to-bulk voltage Vsb, and reads the tgate on it.
+
+- The data. `specs/analog/decks/psp103_idpa_vsb_tt.cir` is `psp103_idpa_tt.cir` with the bulk of each device moved off its source (the NMOS bulk at -Vsb, the PMOS bulk at 1.5 V + Vsb) and prints the same table, with the same grid and the same integer encoding, at Vsb = 0, 0.25, .. 1.5 V (7 slices), and 1000 held-out currents at centres of the cells of the (Vgs, Vds, Vsb) grid, Vsb halfway between two slices (0.125, 0.375, .. 1.375 V). Run twice on the reference host (ngspice-47, a container, 2 threads, 46 s and 48 s); the data rows of the two logs are identical. The six slices above 0 of each device, 12 tables of 4851 words, and the held-out currents are in `specs/analog/mos_psp103_vsb_data.t27` (566 kB); the slice 0 is the existing 2-D table (the deck's own slice 0 agrees with it in all but 4 and 3 of 4753 words, by at most 3 words, solver noise, and is not pasted).
+- The read. `lg_fine_vsb` of `mos_table.t27` reads the two slices around a Vsb and blends their log word linearly (weights 2^22 units = 0.25 V), then takes the same exp and Vds factor as the 2-D read (the tail is now one function, `lg_cur`, used by both). At Vsb = 0 it is the 2-D read to the word (a test over a lattice of 70 x 42 points per device, both devices); at a slice's own voltage it is that slice's 2-D read; above the supply it is the top slice.
+- The tgate. Conducting, the NMOS source is the output Vout, so its Vsb is Vout, and the PMOS source is the input Vout + 10 mV, so its Vsb is 1.5 V - (Vout + 10 mV). `gt_tg_i` with body true reads each device there; with body false it forces Vsb to 0 and is the 2-D read.
+
+| quantity | ours, 2-D (Vsb forced to 0) | ours, with Vsb | ngspice real cell | gap, with Vsb |
+|---|---|---|---|---|
+| Ron at 0.75 V | 1718.0 ohm | 2461.2 ohm | 2459.6 ohm | +0.065 % |
+| worst Ron of the 27 points (1.0 V) | 2109.3 ohm (1.15 V) | 2777.5 ohm | 2776.1 ohm | +0.049 % |
+| largest of the 27 gaps | 31.1 % | 0.090 % (at 0.65 V) | | |
+| held-out currents, relative error, floor 1 nA | NMOS 10481 %, PMOS 42404 % | NMOS 1.71 %, PMOS 2.51 % | 1000 points, 898 and 818 above the floor | bar 3 % |
+
+The bar of 10 percent holds by a factor of 110 on the Ron, so the tgate's rows pass the cross-check rule of section 1 and are PASS: inside the report's 30 and 50 kohm as well. The held-out error is larger, as it should be: a chord of the log word over 0.25 V of Vsb is exact where the threshold moves linearly with Vsb and is not where it bends (the square-root law is steepest near Vsb = 0), and the 2-D read's own 0.47 and 0.70 percent at its cell centres are in the number; the bar is 3 percent and the read is 1.2 times under it for the PMOS. The Ron check needs less than that: the same tables read with a floating-point twin of the reader (a scratch run) give the 27 Ron points within 0.09 percent with 7 slices, 0.29 percent with 4 slices (0.5 V apart), 0.58 percent with 3 and 1.2 percent with the two end slices alone, and the held-out error is 2.5, 5.8 and 14 percent for 7, 4 and 3 slices; the seven were kept because the data is modest and the held-out error is what a later user of the axis meets.
+
+What the data say, besides: the current of both devices falls with Vsb at every node above 0.25 V of gate drive (a test over 2 x 6 x 3969 nodes); at Vgs = 0.25 V, Vds = 1.5 V the NMOS current falls by a factor 92 from Vsb = 0 to 1.5 V and the PMOS current by 922. Below 0.25 V of gate drive the PMOS off current at Vsb above 0.5 V is held at the 1 IUNIT (1.164 pA) floor of the log word and the junction leakage that rises with Vsb is not resolved there; the off leakage row of the tgate uses Vsb = 0 for both devices, which is right (a gate off at full swing has each source on its own rail).
+
+What this does not say: the tgate at another corner, temperature or size (tt, 27 C, W 1.0 um and 3.0 um, L 0.45 um only); a bulk forward-biased against its source (Vsb below 0); the comparator, the switch or any cell other than the tgate, which are not read on the axis.
+
+## 3d. The comparator with its charge and the body effect (M4b-q, issue #11312)
+
+The comparator of the first versions of this table was the model of `sar_comparator_psp.t27`: the PSP103 current tables at 50 C and no charge, which decided 5.35 ps after the clock against the 523 ps of ngspice's run of the golden comparator, 98 times too fast, and FAILED the 10 ps lower limit. `specs/analog/sar_comparator_q.t27` is the same eight-node latch with the three things that were missing, at the report's 27 C: the devices' own drain, gate and source charge (the M3c tables), the log-domain current tables (M3c-2) and their source-to-bulk axis (M3e), which the input pair (source on net1) and the PMOS XM8, XM9 need. It is backward Euler of 1.6 ps, the clock a step of the grid, four Newton iterations, and reuses the solver of `sar_comparator.t27` (whose `sc_stamp_chan` is split in two so that the stamp is shared; its 20 tests and pinned folds are unchanged).
+
+THE REFERENCE. The comparator is written out in `sar_cmp_q_ref.cir` (the thirteen transistors and the inverter, the W, L and m of `sar_cmp_psp_r2b.cir`, the golden deck's bulks, 4 fF on dp and dn; none of the golden deck's text) and run in ngspice-47 with the PSP103 on the reference host. It IS the golden comparator: at 50 C and the golden deck's start it gives the first output through 0.75 V 523.032, 528.006, 529.386 and 529.741 ps after the clock (`sar_cmp_q_ref50.cir`), the four numbers the golden subcircuit gave in `sar_cmp_psp_real.cir`. A test pins the match to a femtosecond.
+
+THE START matters, and is the one finding of this lane beyond the model. `sar_cmp_psp_real.cir` starts from its initial conditions with `uic` and a clock at 200 ps; the nodes inside the PSP103 devices start at 0 V and their first charging disturbs the circuit for longer than the 200 ps (n_clkc falls to 0.56 V in 10 ps, ap, an, net2, net3 are kicked over the supply, dp and dn rise to 0.9 V, and at the clock n_clkc is 1.30 V and dp and dn 0.62 V). Its decision time, 508.1 ps at 27 C and 523.0 ps at 50 C, is a number of that start. Three starts, all in ngspice-47:
+
+| start | what it is | 27 C | 50 C |
+|---|---|---|---|
+| golden deck's | `.ic` and `uic`, clock at 200 ps | 508.1 ps | 523.0 ps |
+| settled | the spec's rest (ap = an = net2 = net3 = n_clkc = 1.5 V, dp = dn = 0, net1 = 0.401 V) as `.ic` without `uic`: the DC operating point with the eight nodes forced, then released; clock at 1 ps | 602.54 ps | 632.56 ps |
+| free | the operating point with the clock low and net1 where the leakage of the pair and the tail balance (0.7073 V) | 607.145 ps | |
+
+The external team's report has 607 ps: the free start gives it to 0.02 percent and the settled start to 0.7 percent, so the settled start is the right reference and the disturbed start is not. The model starts from the settled rest; the reference of the verdict is the settled start. The 98 times of the old no-charge model were against the disturbed start; against the settled start the 5.35 ps is 118 times too fast.
+
+THE NUMBERS (decision time = the first output through 0.75 V after the clock's 50 percent point; "BE" is ngspice's backward Euler on the model's own 1.6 ps grid, `sar_cmp_q_be.cir`):
+
+| input | model | ngspice | gap | ngspice BE | gap |
+|---|---|---|---|---|---|
+| +2 mV | 613.07 ps | 602.54 ps | +1.75 % | 603.32 ps | +1.62 % |
+| -2 mV | 613.15 ps | 602.54 ps | +1.76 % | | |
+| +0.5 mV | 624.14 ps | 608.02 ps | +2.65 % | 609.01 ps | +2.48 % |
+| 31 uV | 628.69 ps | 610.01 ps | +3.06 % | | |
+| 1 uV | 629.11 ps | 610.15 ps | +3.11 % | | |
+| free start, +2 mV | 614.86 ps | 607.145 ps | +1.27 % | | (the report's 607 ps: +1.29 %) |
+| levels at 2 ns (winner, loser) | 1.49933 V, 2.26 mV | 1.49884 V, 2.283 mV | 0.49 mV, 0.02 mV | | |
+| reset, 1.4 ns after the fall (dp, dn) | 3.08 mV, -0.17 mV | 3.265 mV, -0.247 mV | 0.19 mV, 0.08 mV | | |
+| resolution time (not a row) | 1040.7 ps | 1094.3 ps | -4.9 % | | |
+
+The decision time is between 1.75 and 3.11 percent over ngspice's at every input from 2 mV down to 1 unit of 2^-24 V, the same sign, a third of the bar of 10 percent and 61 times the report's lower limit. The scheme is not the error: ngspice's backward Euler on a grid of 0.2, 0.4, 0.8 and 1.6 ps is within 0.01, 0.02, 0.10 and 0.13 percent of its own trapezoidal run. The nodes follow ngspice's to 27 mV from 50 to 500 ps (the discharge of ap and an is 1 to 2 percent early) and to 83 mV through the regeneration (the resolution edge, 4.9 percent early); at the clock edge ap is 81 mV off (the kick is 0.39 V in ngspice and 0.45 V in the model), and in the 400 ps after the clock falls the model is up to 51 mV off on the outputs, 0.18 V on ap and 0.31 V on net2, while by 1.4 ns every node is within 2.6 mV. Only the decision time, the end levels and the reset levels are rows; the rest is stated so that the PASS is not read as more.
+
+THE NEGATIVE CONTROLS. The same model with the devices' charge removed (the lumped capacitors of the square-law model on every node) decides at 5.40 ps, 111 times too fast, under the report's 10 ps and 99 percent under ngspice: the row FAILS, and so does the block (a test). A decision time inside the limit but 25 percent from ngspice's is a FAIL too, and so is a level 5 mV from ngspice's. Without the body effect (the source-to-bulk voltage forced to 0) the decision is 570.6 ps, 5.30 percent under ngspice's, inside the 10 percent bar (so the bar of the verdict does not see it; a test in `sar_comparator_q.t27` with a 3 percent bar does: the body effect is worth 7.4 percent of the decision time). Without the closure of the source charge (below) the Newton step does not converge (last residual 1.88e6 units, 0.11 V); with the charge tables in the wrong slots it runs off the range; K = 2 leaves 2.76e5 units of residual although its time is within 0.1 ps (the residual bound is what refuses it). The Jacobian is the derivative of the residual to 1.5 percent and its transpose is not.
+
+THE ONE STEP BEYOND THE ISSUE. The issue asks for the drain and gate charge from the tables; the source terminal is the remainder (the four terminal charges add to zero) and the bulk's charge, 4 to 7 percent of the gate's, is not tabulated. Put on the source node, it jumped whenever the two ends of a channel exchanged their roles and the Newton step did not converge. The source charge is therefore closed by its two edges, Qb(x, y) = Qb(x, 0) + Qb(0, y), which the tables give exactly (Qs = Qd at Vds = 0 and Qs = 0 at a gate drive of 0, a test for both devices); the interior is the tables' charge without the cross term of the bulk. A deck that prints the source terminal's charge would test it; it was not made.
+
+What this does not say: the body effect on the charge (the charge tables have the bulk tied to the source), another corner or temperature, the flip point of the latch below 10 uV (the model's decision at 10 uV and below depends on the Newton count and the least bit of the tables), noise, mismatch, the converter's comparator (its delay-cell clock, the kickback of its input stages, the NAND "Valid" and the inverters on dp and dn), the reset timing of the report (read here 1.4 ns after the clock falls), hardware.
+
+## 3e. The inverter into 20 fF with the devices' own charge (M5e, issue #11350)
+
+The last row of the inverter block, "delays fall / rise into 20 fF" (the report's 81 and 100 ps, limit 1 to 500 ps), was NOT MODELLED: the transient of `mos_psp103.t27` is validated at 500 fF and 10 pF, and said of 20 fF that the gate edge kicks the output node 5 times further than at 100 fF, past the 0 to 1.5 V range of the tables. `specs/analog/mos_psp103_inv20.t27` is that run.
+
+THE CELL. The inverter of the golden SAR ADC netlist: a PMOS of W 3.0 um, L 0.45 um, ng 1, m 1 with its bulk on the supply and an NMOS of W 1.0 um, L 0.45 um, ng 1, m 1 with its bulk on ground, 1.5 V, 20 fF on the output and nothing else. The repository states those sizes in the header of `mos_psp103.t27` (W, L and Vdd, "facts of the circuit") and in the deck `psp103_inv_be_500f.cir` (W, L, ng and m of both devices); the tables of `mos_psp103_data.t27` are of exactly these two devices, so no table is new. Each source is on its own bulk, so the source-to-bulk axis of M3e is read at Vsb = 0, which is the 2-D log read bit for bit (a test); a channel end kicked past a rail is a forward junction and is read at 0, as `sar_comparator_q.t27` reads it.
+
+THE REFERENCE. `specs/analog/decks/psp103_inv20_fine.cir`, run in ngspice-47 with the PSP103 (IHP-Open-PDK 21133f21, mos_tt, 27 C, OSDI) on the reference host: the same two devices and 20 fF, the gate an IDEAL step (a B source of `u(time - t0)`, no slew, so that the model's gate edge, one jump of charge, is the same edge), at the supply until 1 ns, 0 V until 2 ns, the supply from 2 ns, each level held 20 delays; trapezoidal rule with the step held to 0.05 ps. The reference's own sensitivity to its step is a number of the deck: runs at 0.2 ps and 0.01 ps give the same 50 percent crossings to 1 fs. The deck also prints the kick (the output goes to -0.3848 V 0.56 ps after the first edge and to 1.9634 V 0.49 ps after the second) and 20 samples after each edge.
+
+THE MODEL. One node, the output, with the equation of the M3c charge step (`newton_iter_q` of `mos_table.t27`): the node holds C y + Qd_n - Qd_p, so a gate edge is a jump of charge, the Miller kick. The tables are M3c's and are not rescaled (a charge word is Q / 500 fF, a current word the current that moves a 500 fF node in 100 ps; C = 20 fF and the step enter as the factors 25 and 25 dt / 100 ps). Reused, not copied: the current is `sq_i` and the charge `sq_qt` and `sq_qsrc` of `sar_comparator_q.t27` (the tables extended linearly past their edges, the source terminal closed by its two edges). The new part is that the output is free to leave 0 to Vdd: an ideal gate edge kicks it 0.40 V below ground when the gate falls and 0.50 V over the supply when it rises (ngspice's 0.38 V and 0.46 V), and while it is out of range the two ends of the channel of the NMOS (below ground) or the PMOS (over the supply) exchange their roles: the output is then the source, and the terminal charge on it is the source terminal's. The charge and the current are continuous across the exchange (a test). Each step is solved by bisection (64 halvings, the residual rises with the output: a test), so the answer is the converged step and not K Newton iterations of the board's arithmetic. The M3c integer step could not be reused as it is: it holds the output to 0 to Vdd, and a charge table scaled by 25 for 20 fF overflows the u64 bound of its bilinear read when scaled plainly and goes below 0 when scaled around its 2^21 origin.
+
+THE NUMBERS (delay = the 0.75 V crossing after the edge, ps; the gap is the model's over ngspice's converged run):
+
+| | fall (output falls) | rise (output rises) |
+|---|---|---|
+| model, 1 ps step | 75.755 | 93.246 |
+| ngspice-47, converged | 75.368 | 92.778 |
+| gap | +0.513 % | +0.504 % |
+| the report (its own stimulus) | 81 | 100 |
+| ours against the report | 6.5 % under | 6.8 % under |
+
+The time step. The delay falls with the step (backward Euler is slow by its first-order error) and each halving takes half of the last:
+
+| step | fall | rise | gap to ngspice (fall, rise) |
+|---|---|---|---|
+| 4 ps | 75.971 | 93.485 | +0.80 %, +0.76 % |
+| 2 ps | 75.826 | 93.324 | +0.61 %, +0.59 % |
+| 1 ps (the verdict) | 75.755 | 93.246 | +0.51 %, +0.50 % |
+| 0.5 ps | 75.720 | 93.210 | +0.47 %, +0.47 % |
+| 0.25 ps | 75.703 | 93.191 | +0.44 %, +0.45 % |
+
+Halving the step moves each delay by 0.19 / 0.17 percent (4 to 2 ps), 0.094 / 0.084 (2 to 1), 0.046 / 0.039 (1 to 0.5, the issue's under-1-percent condition) and 0.022 / 0.020 percent (fall / rise); the limit in time is about 75.686 and 93.172 ps, so 1 ps is 0.09 and 0.08 percent over it, a sixth of the gap to ngspice, which is the tables' and the charge's. A test pins each of these.
+
+The waveform, the model at 0.5 ps against ngspice's 20 samples per edge (0.5 ps to 400 ps): the rise is within 11.3 mV (0.75 percent of the supply) at the worst sample, the first, where the model's kick is 0.3958 V against ngspice's 0.3848 V (2.9 percent larger), and within 5.4 mV from 30 ps on; the fall is within 35.0 mV (2.3 percent) at the first sample, where the model's kick is 0.4984 V over the supply against 0.4634 V (7.5 percent larger), and within 5.8 mV from 30 ps on. Through the 50 percent crossing the model is 4 to 5 mV under the rising output and 4.5 to 6 mV over the falling one, which at 12 to 16 V/ns is the half percent of the delays. The cause of the larger kick is not isolated.
+
+The same code at 500 fF and 100 ps (factors 1 and 1, no table scaled) follows ngspice's backward Euler on the same 100 ps grid (`psp103_inv_be_500f.cir`) to -0.0022 percent (rise) and -0.026 percent (fall), where the kick is 6 mV: where the old step held, the new one is the old one.
+
+THE NEGATIVE CONTROLS (each a test; the bar is 10 percent of ngspice's delay):
+
+| the break | fall | rise | gap to ngspice | verdict |
+|---|---|---|---|---|
+| the devices' charge removed (FR-004) | 39.043 ps | 51.868 ps | -48.2 %, -44.1 % | inside the report's 1 to 500 ps, refused by the bar: the delay row and the block FAIL |
+| the output held to 0 to 1.5 V, as the M3c step holds it (the kick is lost) | 46.793 ps | 63.122 ps | -37.9 %, -32.0 % | refused by the bar: FAIL |
+| a load of 25 fF instead of 20 | 85.544 ps | 106.242 ps | +13.5 %, +14.5 % | refused by the bar (22 fF gives +5.7 and +6.1 percent, inside it) |
+
+The report's own limit (1 to 500 ps) does not see any of the three; the cross-check does. The report's separate corners suite (62 to 124 ps) does see the charge removed (39 and 52 ps).
+
+What this does not say: another corner or temperature (tt, 27 C), another load, or another input slew (the gate edge is ideal; the report's own stimulus is not in the material this was made from), the waveform inside the first 30 ps (11 and 35 mV off at the first sample), a device's current past the tables' edge (held at the edge: the PMOS at Vsd up to 1.9 V and the NMOS at Vds up to 2.0 V are read at 1.5 V), the junction conduction of the kicked node (read at 0), PSP103's NQS and gate-resistance effects, mismatch, noise, power, hardware. The model is f64 with integer table reads and a bisection: the test-side model of the cell, not the board's arithmetic.
+
+## 4. What each model is, and what that means for the verdict
+
+- inverter. The PSP103 tables of the SG13G2 NMOS (W 1.0 um) and PMOS (W 3.0 um), tt, 27 C, current in the log domain (`mos_psp103.t27`, M3c-2). The threshold is the input at which the DC transfer falls through Vdd / 2: 0.689243 V on the log tables, 0.689252 V on the linear ones; ngspice's trip point is 0.689 V and the report's 0.69 V. The delays into 20 fF (M5e, `mos_psp103_inv20.t27`, section 3e) are the same two devices (W 1.0 um and 3.0 um, L 0.45 um, m 1) with the devices' own drain and source charge, an ideal gate step, the output node free to leave the tables' 0 to Vdd range, backward Euler of 1 ps: fall 75.755 ps and rise 93.246 ps, +0.51 and +0.50 percent from ngspice's converged run of the same cell (75.368 and 92.778 ps), inside the report's 1 to 500 ps: the row PASSES, so the block does. Before M5e they were NOT MODELLED: the transient was validated at 500 fF (tpLH 1.344 ns, tpHL 1.018 ns) and 10 pF only, and those 500 fF delays are not compared with the 1 to 500 ps limit, they are a different load.
+- nand, nor. Two rows each. The truth table is at gate level (`sar_logic.t27`: a gate is a delay and a truth table, a value is 0, 1 or X and never a voltage). The levels in volts are the DC solution of the two-input gate on the same PSP103 log tables as the inverter (`mos_psp103_gates.t27`, M5d): the nand is two NMOS in series against two PMOS in parallel, the nor the same seen from the supply, each device the W and L of the golden netlist's (NMOS 1.0 um, PMOS 3.0 um, L 0.45 um), so no new table was made. The solver is the inverter's bisection with the stack's middle node solved inside it (a second bisection); the currents are read by the integer log-domain reader in steps of 1.164 pA and the output has a resolution of 59.6 nV. Every level of both gates is within 3 uV of ngspice's run of the same cell, and microvolts from its rail.
+- tgate. The same tables and the same reader (`mos_psp103_gates.t27`): conducting, the NMOS reads (Vdd - Vout, 10 mV) and the PMOS (Vin, 10 mV), and R is 10 mV over the sum, at 27 outputs from 0.10 V to 1.40 V (the measurement of `sar_off_ron.cir`); off, both devices sit at Vgs = 0, Vds = 1.5 V and the leakage is the sum of their two table words. The leakage is a row, and so are the two resistances since M3e: the NMOS bulk is on ground and the PMOS bulk on the supply, so while the gate conducts the NMOS source (the output) is Vout above its bulk and the PMOS source (the input, Vout + 10 mV) is 1.5 V - (Vout + 10 mV) below its; each device is read on the tables at that source-to-bulk voltage (`gt_tg_i` with body true, section 3c). Without the axis (body false) the 2-D tables are made with source and bulk on one rail, and ngspice's real cell is 30 and 24 percent above the model (section 3b); with each bulk tied to its own source ngspice and the 2-D model agree to 0.06 percent, which is how the cause was found. The 2592 ohm of a golden tgate in `sar_kick.t27` is a different measurement (50 C, the golden deck's own bias) and is not compared.
+- dff. Gate level (`sar_logic.t27`): capture, hold, set, reset and the clock-to-Q delay are measured on it; the levels in volts are NOT MODELLED. The dff clock-to-Q is the first stage of the sequencer, Valid rise to CK11 rise with D = VDD, 546 ps (ngspice's own is 550 ps).
+- dynamic_comparator. The model of `sar_comparator_q.t27` (section 3d): the eight-node latch of M4b on the PSP103 log tables at 27 C, read on the source-to-bulk axis, with the devices' own charge (M3c tables, the source terminal closed by its two edges), backward Euler of 1.6 ps. All four rows are produced and PASS: the sign (dp wins at +2 mV, dn at -2 mV), the end levels at 2 ns (1.49933 V and 2.26 mV, 0.49 and 0.02 mV from ngspice's), the reset levels 1.4 ns after the clock falls (3.08 and -0.17 mV, 0.19 and 0.08 mV from ngspice's) and the decision time, 613.07 ps, 1.75 percent over ngspice's 602.54 ps on the golden comparator at 27 C and inside the report's 10 to 10000 ps. Before it, the model was the no-charge latch on the 50 C tables of `sar_comparator_psp.t27`, whose decision came 98 times too fast (5.35 ps against 523 ps at +2 mV, within 6.5 percent of ngspice with the charge swamped, the comparison its tables were built for) and FAILED the 10 ps lower limit; that FAIL was the model's, and the model with the charge removed still fails (the negative control of section 3d).
+- tracking_switch. A SQUARE-LAW bootstrapped switch (`sar_switch.t27`, MOSFET level 1). The tracking error at DC is measured: 1.97 uV, which is the fixed-point arithmetic floor (ngspice's own on the square-law deck is 0.03 to 0.05 uV), and it is a row because ngspice's PSP103 run of the same cell at the same conditions (`accept_switch.cir`) gives +0.29 and -0.17 uV, 2.3 uV from it. The hold step and the droop are NOT MODELLED because the square law has no gate capacitance, so no charge injection, and no leakage: the model returns a step of 0.18 uV and a droop of exactly 0, which sit far inside +-30 mV and +-5 mV by having no effect at all. That is not a measurement of the effect the report's -1.6 and -1.7 mV show, so the rows are not passes; the same cell in ngspice with the foundry's model has the effect (-1.60 and -1.73 mV) and the doc shows it beside the rows. A model with the PSP103 switch is what the two rows need.
+- clock_gen, SAR_logic. Gate level with delay tables measured on the golden gates in ngspice (`sar_logic.t27`, 113 gates, the delay cell with its history); the delays are the model's own run, within 8 percent of ngspice's for every clkc edge. The slow delay is 16.145 ns (ngspice 16.147 ns), the fast one 9.822 ns (ngspice 9.669 ns, 1.6 percent), the ratio 1.644 (the report's 1.64). The stop time is taken from the eleventh Valid rise to the last clkc fall at the golden pace (40 ns): 5.704 ns (ngspice 5.807 ns); the report's 10.7 ns is not reproduced by this definition and the report's definition is not in the material this was made from, so the two are not compared. SAR_logic is driven by eleven Valid pulses of 10 ns every 20 ns, so CK11 to CK1 spans ten periods plus the 126 ps by which CK1's load makes it later than CK11.
+- DAC_control, DAC_control_top, neg_bottom_plate_logic. NOT MODELLED. The DAC (`sar_cdac.t27`) has ideal capacitors driven by ideal plate sources: the level a plate reaches is its input, not an output. The eleven latches with their plate lines and the N half's follow-then-complement logic are not circuits in any spec. The polarity (the plate goes to the complement of the decision) is exercised end to end by `sar_adc.t27`, whose behavioural converter matches the golden deck's codes 30 of 31 times; that is not these blocks' check.
+- integration. The behavioural converter of `sar_adc.t27`: ideal DAC capacitors, one fitted top-plate parasitic (0.63 of a 9 um x 9 um unit) and the comparator offset measured on the netlist (6.776 mV, `sar_kick.t27`), on an ideal sampling input. The 8 conversions are -1 V, -0.714 V, ... +1 V. The worst error is |code + 0.5 - ideal| = 18.5 LSB (at +1 V: the model's gain is 1.9 percent above ideal, which is what the fit found in the golden deck) and the smallest step 198 LSB (ideal 195). This is a PASS of the model that was fitted to the golden deck's 30 of 31 codes; it is not a circuit-level result.
+
+### Context, not a verdict: the report's own ramp
+
+The report's ideal end codes are 517 and 1579 and its ideal step is 152 LSB, which is 7 equal steps of 151.7 LSB, so its 8 conversions are equally spaced and do not start at -1 V. Rebuilt from those two numbers (the inputs are inferred, not given), our converter on the same ramp gives:
+
+| quantity | our value | report |
+|---|---|---|
+| first code (ideal 517) | 512 | 510 |
+| last code (ideal 1579) | 1595 | 1593 |
+| worst error | 16.0 LSB | 13.8 LSB |
+| smallest step | 154 LSB | 154 LSB (ideal 152) |
+
+The four numbers agree within a few LSB. Without the measured offset the end codes are 507 and 1590. The literal -1 V to +1 V ramp is the one the verdict uses, because it is the check as stated.
+
+## 5. Conditions that differ from the report
+
+- Tracking switch: the report drives 2 pF at 0.3 V and 1.2 V; ours drives 3.93 pF (the DAC's top plate) at 0.2 V and 1.3 V. The tracking error scales with R C dVin/dt and is zero at DC in both; the number is ours at our conditions. ngspice's PSP103 cell is run at both sets (`accept_switch.cir`): the tracking error is under 0.4 uV at all four, and the hold step at the report's conditions is the report's. Our model was not run at 0.3 V, 1.2 V and 2 pF: the load and the levels are constants of `sar_switch.t27`, which M5d does not touch.
+- Comparator: the model is at 27 C, the report's temperature (it was at 50 C, the golden deck's, before M4b-q). The clock is an ideal 1.6 ps step, the inputs are held, the loads are the 4 fF on dp and dn: the converter's delay-cell clock, the kickback of its input stages and the NAND "Valid" are not in it. The reset level is read 1.4 ns after the clock falls at 2 ns; the report's own timing of it is not in the material this was made from.
+- Inverter threshold: taken as the input at which the output crosses Vdd / 2 (the quantity ngspice's trip points in `mos_psp103.t27` are). The other usual definition, the input at which the output equals the input, is not computed here.
+- Inverter delays: the gate is an ideal step, the load 20 fF and nothing else; the report's own stimulus (its input slew, the cell that drives it) is not in the material this was made from, and our delays are 6.5 and 6.8 percent under the report's 81 and 100 ps. The row is judged against ngspice's run of the same cell with the same ideal step, not against the report's number; the report's limit (1 to 500 ps) is the check.
+- Integration: see above. The report's sample points are not in the material this was made from.
+- The gate-level rows run on delays measured in ngspice at tt, 50 C (the golden deck's temperature), not the report's 27 C; the square-law switch has no temperature. The M5d rows are at tt, 27 C, the report's temperature.
+- nand and nor: the levels are the DC solution with no load, which is the level a gate settles to into 10 fF; the report's measurement is a settled level into 10 fF, and no transient is run here.
+- tgate: Ron is 10 mV over the current with 10 mV across the gate (the measurement of `sar_off_ron.cir`, at 27 C here), on 27 outputs 50 mV apart from 0.10 V to 1.40 V; the report's sweep grid and its definition of Ron are not in the material this was made from, and the reference run (ngspice, same definition, same grid) gives the report's 2.44 and 2.78 kohm to 0.8 and 0.14 percent. The leakage is at 1.5 V across the off gate, the bias at which ngspice gives the report's 0.29 nA.
+
+## 6. Negative controls
+
+Every check function accepts the report's own value and refuses a broken one, so none is always-FAIL or always-PASS. Where a model can be broken to leave the limit, that is done too, and the same check refuses it:
+
+| check | the break | its value |
+|---|---|---|
+| inverter threshold | PMOS table zeroed | the output never falls through Vdd / 2: the reader's no-crossing value, -0.031 V, refused by 0.5 V |
+| inverter delays (M5e) | the devices' charge removed | 39.043 ps fall, 51.868 ps rise, 48.2 and 44.1 percent under ngspice's: inside the report's 1 to 500 ps, refused by the 10 percent bar, row and block FAIL; refused by the corners suite's 62 to 124 ps too |
+| inverter delays (M5e) | the output held to 0 to 1.5 V (the M3c step's range) | 46.793 ps fall, 63.122 ps rise, 37.9 and 32.0 percent under: refused by the bar, row and block FAIL |
+| inverter delays (M5e) | a load of 25 fF instead of 20 | 85.544 ps fall, 106.242 ps rise, +13.5 and +14.5 percent over: refused by the bar (22 fF, +5.7 and +6.1 percent, is inside it) |
+| inverter delays (M5e) | a delay outside the limit that agrees with ngspice | FAIL: the report's limit is checked as well |
+| comparator sign | the inputs exchanged | the sign flips, refused |
+| comparator time | a missed decision, 20 ns | refused on both sides |
+| comparator time (M4b-q) | the devices' charge removed | 5.40 ps, 111 times too fast, 99 percent under ngspice's: refused by the 10 ps limit and by the 10 percent bar, row and block FAIL |
+| comparator time (M4b-q) | a time inside the limit but away from ngspice's (450 ps, 25 percent) | FAIL: a produced value that disagrees is the model's FAIL |
+| comparator levels (M4b-q) | a winner at 1.49 V (right by the report's 50 mV, 4 mV from ngspice's) | refused by the 5 mV bar |
+| comparator time (M4b-q) | the body effect removed (Vsb forced to 0) | 570.6 ps, 5.30 percent under ngspice's: inside the 10 percent bar, refused by the 3 percent test of `sar_comparator_q.t27` |
+| comparator solver (M4b-q) | the source charge without its closure / the charge tables in the wrong slots / K = 2 | residual 1.88e6 units / 4.2e9 units / 2.76e5 units, against a bound of 1600: refused |
+| tracking error | boost capacitor removed | -25.4 mV, refused by 5 mV and, against ngspice's PSP103 cell, by the 10 uV bar |
+| clock ratio | the trim code ignored | 1.0, refused by 1.2 |
+| SAR_logic counts and order | the fifth dff with Set and Reset exchanged | 2, 5, 11 high instead of 1, 4, 11, wrong order, refused |
+| dff set and reset | the same dff | the set row loses CK7, the clks reset sets it, refused |
+| integration error | the MSB capacitor halved | 237 LSB, refused by 64 |
+| nand, nor truth table | the other gate's table, one row flipped | refused |
+| nand levels | the PMOS table zeroed / the NMOS table zeroed | the 1 levels fall to under 0.4 mV, 1.5 V off / the 0 level rises to 1.5 V; refused by the report's check and by the cross-check |
+| nand, nor levels | the wrong gate (the nand's 1 read where the nor has a 0) | 1.5 V apart |
+| tgate leakage | the NMOS table in both slots | 521.5 pA: inside the report's 1 nA, 82.6 percent over ngspice's, refused by the 10 percent bar |
+| tgate Ron | the PMOS table zeroed / the NMOS table zeroed, against the no-body-effect cell | 2895 / 4225 ohm at 0.75 V, 69 and 146 percent over, refused by the 10 percent bar |
+| tgate Ron (M3e) | the real cell read with Vsb forced to 0 | 1718.0 ohm at 0.75 V and 2109.3 ohm at the worst point, inside the report's limits and 30.2 and 24.0 percent under ngspice's real cell (largest of 27 gaps 31.1 percent): refused by the 10 percent bar, rows NOT MODELLED |
+| tgate Ron (M3e) | the two devices' Vsb exchanged | 2461.07 ohm at 0.75 V (symmetric cell, not seen there), the largest of the 27 gaps 32.3 percent, 358 times the right read's: refused by the bar |
+| source-to-bulk read (M3e) | the 1000 held-out currents read with Vsb forced to 0 | 105 (NMOS) and 424 (PMOS) times off in relative terms against the bar of 3 percent |
+| DAC_control_top | a wrong code, a wrong plate code, two bits swapped, code and plate exchanged | refused (1430 + 617 = 2047, the complement pair) |
+
+Four mutants of the new code were also run and each fails tests (not committed): the nor's output not mirrored (2 tests fail), the 10 percent bar loosened to 50 percent (3), the tgate's NMOS gate drive wrong (2), and the tgate's Ron verdict made to ignore the cross-check (2, the tgate's and the counts').
+
+A limit of the control: some of the report's limits are wide, and a model error inside the limit is not seen by that check. A bridge capacitor of 2 units gives a worst error of 45.5 LSB, which the +-64 LSB limit accepts; the inverter threshold limit (0.5 to 1.0 V) accepts the two tables in each other's slots (0.811 V) and every corner's trip point (ngspice's 0.663 to 0.718 V). `sar_adc.t27` sees the bridge by the codes (0 of 31 match), `mos_psp103.t27` sees the corners by the delays. The inverter's delay limit (1 to 500 ps) is as wide: it accepts all three breaks of section 3e (39 to 106 ps), and it is the cross-check against ngspice's converged run that refuses them. Two more, from M5d. The level cross-check of a gate does not see a device's width: the two tables in each other's slots (a 3 um stack against a 1 um pair) leave every level within 0.69 uV (nand) and 2.7 uV (nor) of ngspice's, because a level is the leakage of the off side times the resistance of the on side and both are microvolts for either width; the leakage and the resistance do see it. And the choice of the reference cell matters: against the no-body-effect cell (each bulk on its source) the model's Ron is 0.06 percent off and would have PASSED, with a number that is 30 percent from the real cell; the reference is the real cell (bulks on the rails), on purpose.
+
+## 7. Not done, and why
+
+- The tracking switch's hold step and droop, and the three DAC blocks are NOT MODELLED (the tgate's two resistances were too, until M3e gave the tables a source-to-bulk axis, the comparator's reset until M4b-q ran a second clock phase, and the inverter's 20 fF delays until M5e freed the output node from the tables' range). Each needs a model that does not exist: a switch with gate capacitance and leakage (ngspice's PSP103 numbers for that cell, -1.60 and -1.73 mV and no droop, are in section 3b as the target), circuit-level plate drivers and latches. They are not approximated here.
+- The nand's, the nor's and the tgate's delays into a load, and their levels in a transient: M5d does the DC levels only.
+- The tracking error of our model at the report's own conditions (0.3 V and 1.2 V into 2 pF), see section 5.
+- The comparator's body effect on the CHARGE, and a deck that prints the source terminal's charge (to test the closure of section 3d), are not done; neither changes a verdict, the decision time being 1.75 percent from ngspice's.
+- The corners suite needs tables at -40 and 125 C.
+- A defect of the Zig emitter, found while making this, was worked around by renaming one identifier in `specs/analog/sar_kick.t27` (the field and local `half` of `KickThr` to `hw`, no value changed): the emitter types a local by the NAME of a variable or field in any spec of the closure, so a `half: f64` field in one spec made `(half as u64)` in `mos_table.t27`'s `blend1_w` (where `half` is a `u32`) a float conversion, and no spec could use both. It does not appear in any earlier closure because none had both. The repro is any spec that `use`s a function of `sar_kick.t27` and one of `mos_table.t27`; to be filed on #5980. M5e met the same defect twice more (a struct field `i: f64` made the `i` of `cross_idx` in `mos_psp103.t27` a float, a field `cur: f64` the `cur` of `sar_comparator.t27`'s `sc_apply_lim`, each a Zig compile error) and the fields of `IvDev` in `mos_psp103_inv20.t27` are named `chg_w` and `cur_iu` so that no local of an imported spec shares a name with them.
+
+## 8. How to run it
+
+```
+./target/release/t27c test-report specs/analog/accept_sar.t27
+./target/release/t27c test-report specs/analog/mos_psp103_inv20.t27
+./target/release/t27b test specs/analog/accept_sar.t27 --check
+./target/release/t27b test specs/analog/mos_psp103_inv20.t27 --check
+./target/release/t27b test specs/analog/sar_comparator_q.t27 --check
+./target/release/t27b test specs/analog/mos_psp103_gates.t27 --check
+./target/release/t27b test specs/analog/mos_psp103_vsb_data.t27 --check
+```
+
+`accept_sar.t27` has 15 tests (the verdict rule, one for each block or group of blocks, the reference run against the report, the corners line and the counts of blocks and of rows); `mos_psp103_inv20.t27` has 10 (the two delays against ngspice, the halving of the step, the waveform and the kick, the three negative controls, the source-to-bulk read, the premise of the bisection, the continuity across the exchange of the channel's ends, the 500 fF anchor, the rest levels); `mos_psp103_gates.t27` has 9 (the nand, the nor, the gates' negative controls, the tgate without the body effect, the real cell against the 2-D read, the leakage, and three of M3e: the Ron with the body effect, the held-out currents between slices, the controls); `mos_psp103_vsb_data.t27` has 3 (the pins and the layout of the 12 slices, the fall of the current with Vsb, the read at Vsb = 0 against the 2-D read); `mos_table.t27` has 21 (the one of M3e: the Vsb read on two synthetic slices). `sar_comparator_q.t27` has 8 (the units, the closure and the extensions of the charge, the Jacobian, the decision time at +-2 mV, the input sweep and the free start, the long run with the levels and the reset, the negative controls, the reference data). Every number in sections 3, 3b, 3c, 3d and 3e is pinned in them. `t27b test --check` exits 0 with no jit/interp mismatch.
+
+The ngspice numbers are the printed output of three decks, none changed after printing: `IHP_PDK=<checkout> IHP_OSDI=<osdi dir> ngspice -b specs/analog/decks/accept_gates.cir` (the eight gate levels and the off leakage), `accept_tgate.cir` (the conducting tgate, the real cell and the cell with its bulks on its sources, 27 points) and `accept_switch.cir` (the PSP103 tracking switch, four copies: tracking error, hold step, droop); ngspice-47 with the PSP103 of IHP-Open-PDK 21133f21, mos_tt, 27 C. M4b-q adds four: `sar_cmp_q_ref.cir` (the 27 C comparator: the settled start, the golden deck's start, the node rows and the reset), `sar_cmp_q_ref50.cir` (the proof that the written-out netlist is the golden comparator), `sar_cmp_q_free.cir` (the free start) and `sar_cmp_q_be.cir` (ngspice's backward Euler on a fixed grid of 0.2 to 1.6 ps), each run once on the reference host in 51 to 53 seconds and none reading the golden deck. M5e adds `psp103_inv20_fine.cir` (the inverter into 20 fF with an ideal gate step: the two 50 percent crossings at three time steps, the rest levels, the kick and 20 samples after each edge), run on the reference host in 47 seconds (an earlier revision of the deck, without the 10-digit print and the two further steps, gave the same numbers; the container and its files were removed after each run). M3e adds `psp103_idpa_vsb_tt.cir` (the log-domain current tables of both devices at seven source-to-bulk voltages and 1000 held-out currents between them, section 3c). The decks contain the W, L and m of the cells (facts of the circuit) and none of the golden netlist's text.

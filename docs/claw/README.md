@@ -29,14 +29,15 @@ behind one front door, with the gate logic in `.t27` specs. Epic
 | Red origin: whose red a failing check is. A file the log names that the PR changes, or a green master, makes it the PR's; a red master, or a named file master changed since the PR's base, makes it inherited, and the PR gets no push. Ask required_red first | `specs/claw/red_origin.t27` (the PR's paths, the log's named paths, master's moved paths and master's state in; one `O own/inherited/unknown` line with the reason out; not wired to a job yet) | #10821 |
 | Merge judge: which open pull requests TRI CLAW merges, and why it leaves the rest alone. First match wins: the no-auto-merge label, a draft, a base that is not master, a `queen-` bee branch (the reviewer-bee merger's), a conflict, no closing reference, an unread rollup, a pending check, a required check red or missing, any other red that is not inherited from master (claw-sarif is, by definition), a head commit under ten minutes old; then a squash merge pinned to the judged head sha, five per run at most, lowest number first | `specs/claw/merge_judge.t27` (`P`/`K`/`F`/`O`/`B` lines in; `G` merge, `W`/`H`/`N` skip with the reason, `L` failing log wanted and `M` summary out; lowered to `gen/c/claw/merge_judge.c`; run by the `claw-merge` job of `gate-topology.yml`, which also carries `refresh.t27`'s update-branch step; plan-only into the step summary until the repository variable `CLAW_MERGE_LIVE` is `1`) | #10973 |
 | Known survivors: whether a mutation sweep holds anything new. A survivor is keyed by its spec, operator and line text, not its line number, so an argued equivalent stays known when lines above it move; a new survivor, a NOAPPLY line or an unreadable line holds; a known entry no line matches asks to be pruned | `specs/claw/mut_known.t27` (the sweep text and the known list in; one `E pass/hold` line with the reason, and one `E new/harness/unreadable` line per holding sweep line, out; applied by hand, not wired to the sweep script yet) | #10835 |
-| Model routing: Opus 5.5 orchestrates, Sonnet 5.5 runs sub-tasks | `specs/claw/model_route.t27`, skill `model-routing`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-18 |
+| Model routing: sub-tasks start in a free T27 OS pane, then Sonnet 5.5, then Opus 5.5; Sonnet 5.5 orchestrates | `specs/claw/model_route.t27` (TIER_PANE), skills `model-routing` and `t27os-orchestra`, `.claude/settings.json` + `.claude/agents/*` | owner directive 2026-10-20 (#11317), replacing 2026-10-18 and 2026-10-19 |
 | A T27F visual in every answer that needs one | rule `specs/t27mcp/visual_output.t27`, particle-still layer `specs/claw/visual_output.t27`, procedure in skill `t27f`, "Visual in every output" | owner directive 2026-10-18 |
 | `reel_still`: one particle still (PNG at STILL_MS of a token_floor reel) from TRI CLAW's `/mcp` | `specs/claw/reel_still.t27`, rendered on the Railway lab only | follow-up of the row above |
 | Positioning / pricing | `docs/claw/competitors.md` | T6, started |
 
 ## The T27F check in every `.t27` repository (#10268)
 
-Every 10 minutes the `claw-t27f` job of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
+On each run (the cron is `*/10`, but GitHub runs it best effort, see "How often it runs" below) the `claw-t27f` job
+of `gate-topology.yml` in gHashTag/t27 lists the repositories the TRI CLAW App
 is installed on, and for each open pull request that touches `.t27` posts one `claw/t27f`
 check-run on its head commit: the changed specs and their direct importers, each judged by
 `t27c seal --verify` from the signed t27o-v0.1.0 release. The law is `specs/claw/t27f_gate.t27`:
@@ -77,8 +78,8 @@ permission `pull_requests: write`; without them the job posts nothing and says s
 
 ## The merge lane (#10973)
 
-The `claw-merge` job of `gate-topology.yml` runs on every push to master, on the 10-minute schedule and on
-dispatch. It lists the open pull requests once, feeds `gen/c/claw/merge_judge.c` (`specs/claw/merge_judge.t27`),
+The `claw-merge` job of `gate-topology.yml` runs on every push to master, on the best-effort `*/10` schedule and on
+dispatch (cadence: see "How often it runs" below). It lists the open pull requests once, feeds `gen/c/claw/merge_judge.c` (`specs/claw/merge_judge.t27`),
 and applies what the spec prints: `G` lines merge (squash, pinned to the judged head sha, so GitHub refuses it if
 the head moved), every other line is a reason in the step summary. After a push it also runs `refresh.t27` as the
 former `claw-refresh` job did, skipping a pull request it merged in the same run. Strictness is required + inherited:
@@ -94,6 +95,14 @@ check inherited from master by `red_origin.t27` (claw-sarif is, by definition, u
   reviewer bee. Drafts and pull requests labelled `no-auto-merge` are held; a conflict is listed, never resolved.
 - Honest limits are in the header of the spec: the lane reads whether a failing log names a file the PR changes, not
   the failure set; reviews are not read; two pull requests merged in one run were each green alone.
+
+### How often it runs
+
+The cron in `gate-topology.yml` is `*/10 * * * *`, and GitHub runs scheduled workflows best effort. Measured on
+master (Actions API, `event=schedule`, #11132): the last 8 scheduled runs, 2026-10-18 12:11Z to 2026-10-19 13:50Z,
+were 2.1 to 7.5 hours apart. The dependable triggers are a push to master (any merge starts the lane) and
+`workflow_dispatch`. A repository that merges nothing for hours can leave this lane idle for hours; a faster
+heartbeat would be an external dispatch and is a separate decision.
 
 ## The inventory spec and how to regenerate it
 

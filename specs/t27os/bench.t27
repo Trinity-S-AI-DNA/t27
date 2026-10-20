@@ -1,0 +1,664 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/bench.t27 -- the data model of the BENCH tab and of the project-summary strip of T27 OS.
+; Owner, 2026-10-20: hardware engineers must love T27 OS. This file is the data only; the window draws it.
+; --
+; What already exists and is REUSED, not restated (DRY):
+; - specs/verified/bench_boards.t27 is the board registry: board_part, board_idcode, board_serial,
+;   board_cable, idcode_is_row, detect_idcode, cables_matching. The three bench dice A, B and C are three
+;   cables of ONE row (BOARD_AX7203, xc7a200tfbg484-2, IDCODE 0x03636093, serial 210512180081); what tells
+;   them apart is the busdev, and fpga/HARDWARE_SSOT.md (W791) names it: 1:4 / 1:6 / 1:8, shown by
+;   `openFPGALoader --scan-usb` as 001:004 / 001:006 / 001:008. This file adds only that busdev column.
+; - specs/verified/die_binding.t27 owns text_find, text_hex_after, hex_digit, HEX_NONE, TEXT_NONE.
+; --
+; New here: (1) the per-die state, packed in integers; (2) the PROVENANCE of every number: kind
+; MEASURED / DERIVED / NOT_MEASURED + the command that produced it + when; (3) the summary row of T27B and
+; T27C and its integer formatting; (4) pure parsers of the lines the host reads.
+; --
+; THE RULE (law of this file): a value that was not measured prints as "not measured", never 0. A zero is
+; a measurement ("0 DSP"); an absent number is not. Every cell carries a `known` bit beside its value.
+; --
+; What the HOST must supply (this file runs no command, reads no device):
+;   cable_seen      openFPGALoader -c digilent_hs2 --scan-usb     -> scan_has_busdev(scan, die)
+;   idcode_ok       openFPGALoader -c digilent_hs2 --busdev-num <b> --detect -> die_idcode_ok(detect)
+;   loaded sha      t27c silicon receipt, "seal_hash": "sha256:<hex>"  -> receipt_seal_prefix(receipt)
+;   loaded_at       the same receipt, "utc_unix": <seconds>             -> receipt_utc(receipt)
+;   LED byte        the USB camera read of the user LEDs (skill board-eye); the read is an integer 0..255
+;                   supplied by the host, no text format in the repo, so there is no parser here
+;   UART counter    the bytes the board's UART printed since load      -> uart_lines(text)
+;   Fmax            nextpnr log line "Max frequency for clock ..."      -> fmax_khz(line)
+;   LUT FF BRAM DSP yosys `synth_xilinx` stat / nextpnr utilization (host passes counts + known bit)
+;   WNS TNS         Vivado report_timing_summary (ps); nextpnr prints no WNS, so without Vivado they stay
+;                   NOT_MEASURED
+;   build seconds   the wall clock of the build command, measured by the host
+; Honest limit: capacities are the datasheet numbers of the xc7a200t (Xilinx DS180, 7 Series FPGAs
+; Overview, Table 1: 33,650 slices x 4 LUT6 = 134,600 LUT; x 8 FF = 269,200 FF; 365 RAMB36; 740 DSP48E1),
+; kind DERIVED from SRC_DATASHEET, not read from the board. No new read of any board was made for this file.
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osBench;
+
+use verified::bench_boards;
+use verified::die_binding;
+
+// ---------------------------------------------------------------- the dice
+
+pub const DIE_A : u8 = 0;
+pub const DIE_B : u8 = 1;
+pub const DIE_C : u8 = 2;
+pub const DIE_COUNT : u8 = 3;
+
+/// All three dice sit on the same registry row.
+pub const DIE_BOARD : u8 = 1;
+
+pub fn die_name(d: u8) -> string {
+    if (d == DIE_A) { return "A"; }
+    if (d == DIE_B) { return "B"; }
+    if (d == DIE_C) { return "C"; }
+    return "";
+}
+
+/// openFPGALoader --busdev-num value (fpga/HARDWARE_SSOT.md, W791).
+pub fn die_busdev(d: u8) -> string {
+    if (d == DIE_A) { return "1:4"; }
+    if (d == DIE_B) { return "1:6"; }
+    if (d == DIE_C) { return "1:8"; }
+    return "";
+}
+
+/// The same bus:device as `openFPGALoader --scan-usb` prints it.
+pub fn die_scan_busdev(d: u8) -> string {
+    if (d == DIE_A) { return "001:004"; }
+    if (d == DIE_B) { return "001:006"; }
+    if (d == DIE_C) { return "001:008"; }
+    return "";
+}
+
+pub fn die_device(d: u8) -> string { return board_part(DIE_BOARD); }
+pub fn die_idcode(d: u8) -> u64 { return board_idcode(DIE_BOARD); }
+pub fn die_serial(d: u8) -> string { return board_serial(DIE_BOARD); }
+
+// ---------------------------------------------------------------- per-die state, packed
+// word a: bit0 cable seen, bit1 idcode read ok, bit2 a bitstream is loaded, bit3 LED byte known,
+//         bit4 UART counter known, bits 8..15 LED byte, bits 16..47 UART line counter.
+// word b: bits 0..31 sha256 prefix (first 8 hex digits) of the loaded seal, bits 32..63 loaded-at seconds.
+
+pub const ST_CABLE : u64 = 1;
+pub const ST_IDCODE : u64 = 2;
+pub const ST_LOADED : u64 = 4;
+pub const ST_LED_KNOWN : u64 = 8;
+pub const ST_UART_KNOWN : u64 = 16;
+pub const ST_LED_UNIT : u64 = 256;
+pub const ST_UART_UNIT : u64 = 65536;
+pub const ST_LOADED_AT_UNIT : u64 = 4294967296;
+
+pub fn st_has(a: u64, flag: u64) -> bool { return (a / flag) % 2 == 1; }
+pub fn st_led(a: u64) -> u64 { return (a / ST_LED_UNIT) % 256; }
+pub fn st_uart(a: u64) -> u64 { return (a / ST_UART_UNIT) % 4294967296; }
+pub fn st_sha_prefix(b: u64) -> u64 { return b % ST_LOADED_AT_UNIT; }
+pub fn st_loaded_at(b: u64) -> u64 { return b / ST_LOADED_AT_UNIT; }
+
+pub fn st_pack_a(cable: bool, idcode_ok: bool, loaded: bool, led_known: bool, led: u64, uart_known: bool, uart: u64) -> u64 {
+    var a : u64 = 0;
+    if (cable) { a = a + ST_CABLE; }
+    if (idcode_ok) { a = a + ST_IDCODE; }
+    if (loaded) { a = a + ST_LOADED; }
+    if (led_known) { a = a + ST_LED_KNOWN + (led % 256) * ST_LED_UNIT; }
+    if (uart_known) { a = a + ST_UART_KNOWN + (uart % 4294967296) * ST_UART_UNIT; }
+    return a;
+}
+
+pub fn st_pack_b(sha_prefix: u64, loaded_at: u64) -> u64 {
+    return (sha_prefix % ST_LOADED_AT_UNIT) + loaded_at * ST_LOADED_AT_UNIT;
+}
+
+/// What a die row says in one word. A die whose IDCODE was not read is never "ready".
+pub const DIE_NO_CABLE : u8 = 0;
+pub const DIE_CABLE_ONLY : u8 = 1;
+pub const DIE_READY : u8 = 2;
+pub const DIE_RUNNING : u8 = 3;
+
+pub fn die_status(a: u64) -> u8 {
+    if (st_has(a, ST_CABLE) == false) { return DIE_NO_CABLE; }
+    if (st_has(a, ST_IDCODE) == false) { return DIE_CABLE_ONLY; }
+    if (st_has(a, ST_LOADED) == false) { return DIE_READY; }
+    return DIE_RUNNING;
+}
+
+pub fn die_status_text(s: u8) -> string {
+    if (s == DIE_NO_CABLE) { return "no cable"; }
+    if (s == DIE_CABLE_ONLY) { return "cable, idcode not read"; }
+    if (s == DIE_READY) { return "ready"; }
+    return "running";
+}
+
+// ---------------------------------------------------------------- provenance
+// A provenance is one u64: bits 0..3 kind, bits 4..7 source command, bits 8.. timestamp (unix seconds).
+
+pub const PV_MEASURED : u8 = 0;
+pub const PV_DERIVED : u8 = 1;
+pub const PV_NOT_MEASURED : u8 = 2;
+pub const PV_KIND_COUNT : u8 = 3;
+
+pub const SRC_NONE : u8 = 0;
+pub const SRC_SCAN_USB : u8 = 1;
+pub const SRC_DETECT : u8 = 2;
+pub const SRC_LOAD : u8 = 3;
+pub const SRC_CAMERA : u8 = 4;
+pub const SRC_UART : u8 = 5;
+pub const SRC_NEXTPNR : u8 = 6;
+pub const SRC_VIVADO : u8 = 7;
+pub const SRC_YOSYS : u8 = 8;
+pub const SRC_RECEIPT : u8 = 9;
+pub const SRC_DATASHEET : u8 = 10;
+pub const SRC_STOPWATCH : u8 = 11;
+pub const SRC_COUNT : u8 = 12;
+
+pub fn src_command(s: u8) -> string {
+    if (s == SRC_SCAN_USB) { return "openFPGALoader -c digilent_hs2 --scan-usb"; }
+    if (s == SRC_DETECT) { return "openFPGALoader -c digilent_hs2 --busdev-num <b> --detect"; }
+    if (s == SRC_LOAD) { return "openFPGALoader -c digilent_hs2 --busdev-num <b> <bit>"; }
+    if (s == SRC_CAMERA) { return "board-eye camera LED read"; }
+    if (s == SRC_UART) { return "UART capture"; }
+    if (s == SRC_NEXTPNR) { return "nextpnr-xilinx"; }
+    if (s == SRC_VIVADO) { return "vivado report_timing_summary"; }
+    if (s == SRC_YOSYS) { return "yosys synth_xilinx stat"; }
+    if (s == SRC_RECEIPT) { return "t27c silicon receipt"; }
+    if (s == SRC_DATASHEET) { return "Xilinx DS180 Table 1"; }
+    if (s == SRC_STOPWATCH) { return "wall clock of the build"; }
+    return "";
+}
+
+pub fn prov_make(kind: u8, src: u8, at: u64) -> u64 {
+    return (kind as u64) + (src as u64) * 16 + at * 256;
+}
+
+pub fn prov_kind(p: u64) -> u8 { return (p % 16) as u8; }
+pub fn prov_src(p: u64) -> u8 { return ((p / 16) % 16) as u8; }
+pub fn prov_at(p: u64) -> u64 { return p / 256; }
+
+pub fn prov_kind_text(k: u8) -> string {
+    if (k == PV_MEASURED) { return "measured"; }
+    if (k == PV_DERIVED) { return "derived"; }
+    return "not measured";
+}
+
+/// The text beside a number: its kind; the host appends src_command and the time when the kind is not
+/// "not measured". A not-measured number has no command and no time to show.
+pub fn prov_has_source(p: u64) -> bool {
+    return prov_kind(p) != PV_NOT_MEASURED;
+}
+
+/// The provenance of a value from its two facts: was it read, and was it computed from other numbers.
+pub fn prov_of(known: bool, computed: bool, src: u8, at: u64) -> u64 {
+    if (known == false) { return prov_make(PV_NOT_MEASURED, SRC_NONE, 0); }
+    if (computed) { return prov_make(PV_DERIVED, src, at); }
+    return prov_make(PV_MEASURED, src, at);
+}
+
+// ---------------------------------------------------------------- the summary row of T27B and T27C
+
+pub const PROJ_T27B : u8 = 0;
+pub const PROJ_T27C : u8 = 1;
+pub const PROJ_COUNT : u8 = 2;
+
+pub fn proj_name(p: u8) -> string {
+    if (p == PROJ_T27B) { return "T27B"; }
+    if (p == PROJ_T27C) { return "T27C"; }
+    return "";
+}
+
+/// Both products target the bench part; the family name is the datasheet's.
+pub fn proj_device(p: u8) -> string { return board_part(DIE_BOARD); }
+pub const DEVICE_FAMILY : str = "xc7a200t";
+
+pub const COL_LUT : u8 = 0;
+pub const COL_FF : u8 = 1;
+pub const COL_BRAM : u8 = 2;
+pub const COL_DSP : u8 = 3;
+pub const COL_WNS : u8 = 4;
+pub const COL_TNS : u8 = 5;
+pub const COL_FMAX : u8 = 6;
+pub const COL_BUILD : u8 = 7;
+pub const COL_COUNT : u8 = 8;
+
+pub fn col_name(c: u8) -> string {
+    if (c == COL_LUT) { return "LUT"; }
+    if (c == COL_FF) { return "FF"; }
+    if (c == COL_BRAM) { return "BRAM"; }
+    if (c == COL_DSP) { return "DSP"; }
+    if (c == COL_WNS) { return "WNS ns"; }
+    if (c == COL_TNS) { return "TNS ns"; }
+    if (c == COL_FMAX) { return "Fmax MHz"; }
+    if (c == COL_BUILD) { return "build s"; }
+    return "";
+}
+
+/// xc7a200t capacity (DS180 Table 1), 0 for a column that is not a resource.
+pub fn col_capacity(c: u8) -> u64 {
+    if (c == COL_LUT) { return 134600; }
+    if (c == COL_FF) { return 269200; }
+    if (c == COL_BRAM) { return 365; }
+    if (c == COL_DSP) { return 740; }
+    return 0;
+}
+
+pub fn col_is_resource(c: u8) -> bool { return c < COL_WNS; }
+
+pub fn col_fmt(c: u8) -> u8 {
+    if (c == COL_WNS) { return F_NS; }
+    if (c == COL_TNS) { return F_NS; }
+    if (c == COL_FMAX) { return F_MHZ; }
+    return F_COUNT;
+}
+
+/// Share of the part in permille, rounded half up; a part of no capacity has no share.
+pub fn permille(used: u64, cap: u64) -> u64 {
+    if (cap == 0) { return 0; }
+    return (used * 1000 + cap / 2) / cap;
+}
+
+/// Timing closes when the worst slack is not negative. Without a measurement it does not say.
+pub const TIMING_MET : u8 = 0;
+pub const TIMING_VIOLATED : u8 = 1;
+pub const TIMING_UNKNOWN : u8 = 2;
+
+pub fn timing_verdict(wns_known: bool, wns_ps: i64) -> u8 {
+    if (wns_known == false) { return TIMING_UNKNOWN; }
+    if (wns_ps < 0) { return TIMING_VIOLATED; }
+    return TIMING_MET;
+}
+
+// ---------------------------------------------------------------- integer formatting
+// Text is produced a character at a time (fmt_len, fmt_char): no allocation, the same in every target.
+
+pub const F_COUNT : u8 = 0;
+pub const F_PERMILLE : u8 = 1;
+pub const F_NS : u8 = 2;
+pub const F_MHZ : u8 = 3;
+
+pub const NOT_MEASURED_TEXT : str = "not measured";
+
+pub fn fmt_frac_digits(f: u8) -> u32 {
+    if (f == F_PERMILLE) { return 1; }
+    if (f == F_NS) { return 3; }
+    if (f == F_MHZ) { return 3; }
+    return 0;
+}
+
+pub fn fmt_divisor(f: u8) -> u64 {
+    if (f == F_PERMILLE) { return 10; }
+    if (f == F_NS) { return 1000; }
+    if (f == F_MHZ) { return 1000; }
+    return 1;
+}
+
+/// The value as a non-negative magnitude (ps, kHz, permille, count).
+pub fn mag(v: i64) -> u64 {
+    if (v < 0) { return @as(u64, @intCast(0 - v)); }
+    return @as(u64, @intCast(v));
+}
+
+pub fn dec_digits(u: u64) -> u32 {
+    var n : u32 = 1;
+    var r : u64 = u;
+    while (r >= 10) { r = r / 10; n = n + 1; }
+    return n;
+}
+
+/// Digit j (0 = most significant) of u written with nd digits, zero padded.
+pub fn dec_char(u: u64, nd: u32, j: u32) -> u32 {
+    var p : u64 = 1;
+    var i : u32 = j + 1;
+    while (i < nd) { p = p * 10; i = i + 1; }
+    return 48 + ((u / p) % 10) as u32;
+}
+
+pub fn fmt_neg(v: i64) -> u32 {
+    if (v < 0) { return 1; }
+    return 0;
+}
+
+pub fn fmt_suffix(f: u8) -> u32 {
+    if (f == F_PERMILLE) { return 1; }
+    return 0;
+}
+
+/// Length of the value's text: [-]int[.frac][%]. The unit is the column header's, not the cell's.
+pub fn fmt_len(f: u8, v: i64) -> u32 {
+    const a : u64 = mag(v);
+    const fd : u32 = fmt_frac_digits(f);
+    var n : u32 = fmt_neg(v) + dec_digits(a / fmt_divisor(f));
+    if (fd > 0) { n = n + 1 + fd; }
+    return n + fmt_suffix(f);
+}
+
+pub fn fmt_char(f: u8, v: i64, k: u32) -> u32 {
+    const a : u64 = mag(v);
+    const fd : u32 = fmt_frac_digits(f);
+    const ip : u64 = a / fmt_divisor(f);
+    const fp : u64 = a % fmt_divisor(f);
+    const nd : u32 = dec_digits(ip);
+    var i : u32 = k;
+    if (fmt_neg(v) == 1) {
+        if (i == 0) { return 45; }
+        i = i - 1;
+    }
+    if (i < nd) { return dec_char(ip, nd, i); }
+    i = i - nd;
+    if (fd > 0) {
+        if (i == 0) { return 46; }
+        i = i - 1;
+        if (i < fd) { return dec_char(fp, fd, i); }
+        i = i - fd;
+    }
+    if (fmt_suffix(f) == 1) { if (i == 0) { return 37; } }
+    return 32;
+}
+
+/// One right-aligned cell of `width` columns: the value, or "not measured" when it is not known.
+pub fn cell_len(f: u8, known: bool, v: i64, width: u32) -> u32 {
+    var n : u32 = fmt_len(f, v);
+    if (known == false) { n = NOT_MEASURED_TEXT.len as u32; }
+    if (n < width) { return width; }
+    return n;
+}
+
+pub fn cell_char(f: u8, known: bool, v: i64, width: u32, k: u32) -> u32 {
+    var n : u32 = fmt_len(f, v);
+    if (known == false) { n = NOT_MEASURED_TEXT.len as u32; }
+    var pad : u32 = 0;
+    if (n < width) { pad = width - n; }
+    if (k < pad) { return 32; }
+    if (known == false) { return NOT_MEASURED_TEXT[k - pad] as u32; }
+    return fmt_char(f, v, k - pad);
+}
+
+/// Whether a cell renders exactly as `want` (a test and gate helper).
+pub fn cell_is(f: u8, known: bool, v: i64, width: u32, want: string) -> bool {
+    if (cell_len(f, known, v, width) != (want.len as u32)) { return false; }
+    var k : u32 = 0;
+    while (k < (want.len as u32)) {
+        if (cell_char(f, known, v, width, k) != (want[k] as u32)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- parsers of the lines the host reads
+
+/// Whether `openFPGALoader --scan-usb` lists the die's bus:device.
+pub fn scan_has_busdev(scan: string, d: u8) -> bool {
+    return text_find(scan, die_scan_busdev(d), 0) != TEXT_NONE;
+}
+
+/// Whether `--detect` (for that die's --busdev-num) lists the bench part's IDCODE first, version masked.
+pub fn die_idcode_ok(detect: string) -> bool {
+    return idcode_is_row(detect_idcode(detect, 0), DIE_BOARD);
+}
+
+/// The decimal number at text[at], or HEX_NONE when no digit is there.
+pub fn num_at(text: string, at: u32) -> u64 {
+    var i : u32 = at;
+    var v : u64 = 0;
+    var any : bool = false;
+    while (i < (text.len as u32)) {
+        const c : u32 = text[i] as u32;
+        if (c >= 48) {
+            if (c <= 57) { v = v * 10 + ((c - 48) as u64); any = true; i = i + 1; }
+            else { i = (text.len as u32); }
+        } else { i = (text.len as u32); }
+    }
+    if (any == false) { return HEX_NONE; }
+    return v;
+}
+
+/// Where the digits that start at `at` end.
+pub fn num_end(text: string, at: u32) -> u32 {
+    var i : u32 = at;
+    while (i < (text.len as u32)) {
+        const c : u32 = text[i] as u32;
+        if (c < 48) { return i; }
+        if (c > 57) { return i; }
+        i = i + 1;
+    }
+    return i;
+}
+
+pub const FMAX_KEY : str = "Max frequency for clock '";
+pub const FMAX_SEP : str = "': ";
+
+/// "Max frequency for clock 'slowclk': 32.87 MHz" -> 32870 (kHz), or HEX_NONE. The fraction is read to
+/// three digits, so a two-digit nextpnr fraction is scaled exactly.
+pub fn fmax_khz(line: string) -> u64 {
+    var at : u32 = text_find(line, FMAX_KEY, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    var s : u32 = text_find(line, FMAX_SEP, 0);
+    if (s == TEXT_NONE) { return HEX_NONE; }
+    s = s + (FMAX_SEP.len as u32);
+    var whole : u64 = num_at(line, s);
+    if (whole == HEX_NONE) { return HEX_NONE; }
+    var e : u32 = num_end(line, s);
+    var frac : u64 = 0;
+    var got : u32 = 0;
+    if (e < (line.len as u32)) {
+        if ((line[e] as u32) == 46) {
+            var j : u32 = e + 1;
+            while (got < 3) {
+                var c : u32 = 48;
+                if (j < (line.len as u32)) { c = line[j] as u32; }
+                if (c < 48) { c = 48; }
+                if (c > 57) { c = 48; }
+                frac = frac * 10 + ((c - 48) as u64);
+                got = got + 1;
+                j = j + 1;
+            }
+        }
+    }
+    return whole * 1000 + frac;
+}
+
+/// A receipt (docs/reports/silicon-runs/index.json layout, `"key": value`) -> its unix seconds.
+pub const RECEIPT_UTC : str = "\"utc_unix\": ";
+pub const RECEIPT_SEAL : str = "\"seal_hash\": \"sha256:";
+
+pub fn receipt_utc(receipt: string) -> u64 {
+    var at : u32 = text_find(receipt, RECEIPT_UTC, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    return num_at(receipt, at + (RECEIPT_UTC.len as u32));
+}
+
+/// The first 8 hex digits of the sealed hash, as one number, or HEX_NONE when fewer than 8 are there.
+pub fn receipt_seal_prefix(receipt: string) -> u64 {
+    var at : u32 = text_find(receipt, RECEIPT_SEAL, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    var s : u32 = at + (RECEIPT_SEAL.len as u32);
+    var v : u64 = 0;
+    var k : u32 = 0;
+    while (k < 8) {
+        if (s + k >= (receipt.len as u32)) { return HEX_NONE; }
+        const d : u64 = hex_digit(receipt[s + k] as u32);
+        if (d == 16) { return HEX_NONE; }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+/// The UART line counter: how many newlines the capture holds.
+pub fn uart_lines(text: string) -> u64 {
+    var n : u64 = 0;
+    var i : u32 = 0;
+    while (i < (text.len as u32)) {
+        if ((text[i] as u32) == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- tests
+
+test three_dice_share_one_row_and_differ_by_busdev {
+    assert DIE_COUNT == 3;
+    assert die_device(DIE_A) == "xc7a200tfbg484-2";
+    assert die_device(DIE_C) == "xc7a200tfbg484-2";
+    assert die_idcode(DIE_B) == 0x03636093;
+    assert die_serial(DIE_A) == "210512180081";
+    assert die_busdev(DIE_A) == "1:4";
+    assert die_busdev(DIE_B) == "1:6";
+    assert die_busdev(DIE_C) == "1:8";
+    assert die_scan_busdev(DIE_B) == "001:006";
+    assert die_name(DIE_A) == "A";
+    assert die_name(DIE_B) == "B";
+    assert die_name(DIE_C) == "C";
+}
+
+test scan_and_detect_parse_the_real_layout {
+    // fpga/HARDWARE_SSOT.md W791: --scan-usb lists 001:004 / 001:006 / 001:008 at 0x0403:0x6014,
+    // serial 210512180081; --detect prints "idcode 0x3636093" (layout of bench_boards.t27 tests).
+    const scan : string = "Bus device vid:pid       probe type      manufacturer serial               product\n001:004 0x0403:0x6014   FTDI2232H       Digilent  210512180081 Digilent USB Device\n001:006 0x0403:0x6014   FTDI2232H       Digilent  210512180081 Digilent USB Device\n";
+    assert scan_has_busdev(scan, DIE_A);
+    assert scan_has_busdev(scan, DIE_B);
+    assert scan_has_busdev(scan, DIE_C) == false;
+    const detect : string = "index 0:\n    idcode 0x3636093\n    manufacturer xilinx\n    family artix a7 200t\n    model  xc7a200\n    irlength 6\n";
+    assert die_idcode_ok(detect);
+    assert die_idcode_ok("index 0:\n    idcode 0x23727093\n") == false;
+    assert die_idcode_ok("") == false;
+}
+
+test state_packs_into_two_integers {
+    const a : u64 = st_pack_a(true, true, true, true, 165, true, 4000000);
+    const b : u64 = st_pack_b(0xa769f41e, 1791402176);
+    assert st_has(a, ST_CABLE);
+    assert st_has(a, ST_IDCODE);
+    assert st_has(a, ST_LOADED);
+    assert st_led(a) == 165;
+    assert st_uart(a) == 4000000;
+    assert st_sha_prefix(b) == 0xa769f41e;
+    assert st_loaded_at(b) == 1791402176;
+    assert die_status(a) == DIE_RUNNING;
+    assert die_status(st_pack_a(true, true, false, false, 0, false, 0)) == DIE_READY;
+    assert die_status(st_pack_a(true, false, false, false, 0, false, 0)) == DIE_CABLE_ONLY;
+    assert die_status(st_pack_a(false, true, true, false, 0, false, 0)) == DIE_NO_CABLE;
+    assert die_status_text(DIE_CABLE_ONLY) == "cable, idcode not read";
+    // an LED byte that was not read is not 0
+    const dark : u64 = st_pack_a(true, true, true, false, 0, false, 0);
+    assert st_has(dark, ST_LED_KNOWN) == false;
+    assert st_has(dark, ST_UART_KNOWN) == false;
+}
+
+test every_provenance_kind_carries_its_command_and_time {
+    const m : u64 = prov_of(true, false, SRC_DETECT, 1791402176);
+    const d : u64 = prov_of(true, true, SRC_DATASHEET, 0);
+    const n : u64 = prov_of(false, false, SRC_NEXTPNR, 1791402176);
+    assert prov_kind(m) == PV_MEASURED;
+    assert prov_src(m) == SRC_DETECT;
+    assert prov_at(m) == 1791402176;
+    assert prov_kind(d) == PV_DERIVED;
+    assert prov_src(d) == SRC_DATASHEET;
+    assert prov_kind(n) == PV_NOT_MEASURED;
+    assert prov_src(n) == SRC_NONE;
+    assert prov_at(n) == 0;
+    assert prov_has_source(m);
+    assert prov_has_source(d);
+    assert prov_has_source(n) == false;
+    assert prov_kind_text(PV_MEASURED) == "measured";
+    assert prov_kind_text(PV_DERIVED) == "derived";
+    assert prov_kind_text(PV_NOT_MEASURED) == "not measured";
+    assert PV_KIND_COUNT == 3;
+    assert src_command(SRC_SCAN_USB) == "openFPGALoader -c digilent_hs2 --scan-usb";
+    assert src_command(SRC_NONE) == "";
+    assert SRC_COUNT == 12;
+}
+
+test the_summary_row_knows_its_part {
+    assert proj_name(PROJ_T27B) == "T27B";
+    assert proj_name(PROJ_T27C) == "T27C";
+    assert proj_device(PROJ_T27C) == "xc7a200tfbg484-2";
+    assert col_capacity(COL_LUT) == 134600;
+    assert col_capacity(COL_FF) == 269200;
+    assert col_capacity(COL_BRAM) == 365;
+    assert col_capacity(COL_DSP) == 740;
+    assert col_capacity(COL_WNS) == 0;
+    assert col_is_resource(COL_DSP);
+    assert col_is_resource(COL_WNS) == false;
+    assert col_name(COL_FMAX) == "Fmax MHz";
+    assert col_fmt(COL_WNS) == F_NS;
+    assert col_fmt(COL_LUT) == F_COUNT;
+    assert COL_COUNT == 8;
+}
+
+test percent_is_permille_rounded_half_up {
+    // 1196 LUT is the yosys count in docs/analog/board-regression-2026-10-19.md
+    assert permille(1196, 134600) == 9;
+    assert permille(67300, 134600) == 500;
+    assert permille(134600, 134600) == 1000;
+    assert permille(0, 134600) == 0;
+    assert permille(5, 0) == 0;
+    assert cell_is(F_PERMILLE, true, 9, 0, "0.9%");
+    assert cell_is(F_PERMILLE, true, 500, 0, "50.0%");
+    assert cell_is(F_PERMILLE, true, 1000, 0, "100.0%");
+}
+
+test picoseconds_print_as_nanoseconds_with_three_decimals_and_a_sign {
+    assert cell_is(F_NS, true, 1234, 0, "1.234");
+    assert cell_is(F_NS, true, 0, 0, "0.000");
+    assert cell_is(F_NS, true, 5, 0, "0.005");
+    assert cell_is(F_NS, true, -1234, 0, "-1.234");
+    assert cell_is(F_NS, true, -5, 0, "-0.005");
+    assert cell_is(F_NS, true, -12500000, 0, "-12500.000");
+    assert cell_is(F_MHZ, true, 32870, 0, "32.870");
+    assert cell_is(F_MHZ, true, 846020, 0, "846.020");
+}
+
+test negative_slack_is_a_violation_and_unknown_slack_says_nothing {
+    assert timing_verdict(true, 250) == TIMING_MET;
+    assert timing_verdict(true, 0) == TIMING_MET;
+    assert timing_verdict(true, -1) == TIMING_VIOLATED;
+    assert timing_verdict(false, -1) == TIMING_UNKNOWN;
+    assert timing_verdict(false, 0) == TIMING_UNKNOWN;
+}
+
+test a_value_without_a_measurement_prints_not_measured_never_zero {
+    assert cell_is(F_COUNT, false, 0, 0, "not measured");
+    assert cell_is(F_NS, false, 0, 0, "not measured");
+    assert cell_is(F_MHZ, false, 0, 0, "not measured");
+    assert cell_is(F_PERMILLE, false, 0, 0, "not measured");
+    // a measured zero is a zero: "0 DSP" is a result
+    assert cell_is(F_COUNT, true, 0, 0, "0");
+    assert cell_is(F_COUNT, false, 0, 0, "0") == false;
+}
+
+test columns_align_to_the_right {
+    assert cell_is(F_COUNT, true, 1196, 8, "    1196");
+    assert cell_is(F_NS, true, -1234, 8, "  -1.234");
+    assert cell_is(F_COUNT, false, 0, 14, "  not measured");
+    assert cell_is(F_COUNT, true, 123456789, 4, "123456789");
+    assert cell_len(F_COUNT, true, 7, 6) == 6;
+    assert cell_len(F_COUNT, false, 0, 6) == 12;
+}
+
+test fmax_parses_the_nextpnr_line {
+    // docs/theory/IGLA-FORMAL-RESULTS.md line 23846 and 23848
+    assert fmax_khz("    Max frequency for clock 'slowclk': 32.87 MHz (PASS at 8.85 MHz)") == 32870;
+    assert fmax_khz("    Max frequency for clock 'cfgmclk': 846.02 MHz (PASS at 70.77 MHz)") == 846020;
+    assert fmax_khz("Max frequency for clock 'c': 100 MHz") == 100000;
+    assert fmax_khz("nothing here") == HEX_NONE;
+    assert fmax_khz("Max frequency for clock 'c': MHz") == HEX_NONE;
+}
+
+test the_receipt_gives_the_loaded_seal_and_its_time {
+    // docs/reports/silicon-runs/index.json, first receipt (pretty-printed layout)
+    const r : string = "{\n        \"auth\": \"FRESH\",\n        \"device_dna\": \"050d58218fd9854\",\n        \"seal_hash\": \"sha256:a769f41ecf2da17a27d68cabd5f0a132f010b89a3d08eade51a454ba8064e7fa\",\n        \"utc_unix\": 1791402176,\n        \"verdict_word\": 0\n}";
+    assert receipt_utc(r) == 1791402176;
+    assert receipt_seal_prefix(r) == 0xa769f41e;
+    assert receipt_utc("{}") == HEX_NONE;
+    assert receipt_seal_prefix("{}") == HEX_NONE;
+    assert receipt_seal_prefix("\"seal_hash\": \"sha256:a76") == HEX_NONE;
+}
+
+test the_uart_counter_counts_lines {
+    assert uart_lines("") == 0;
+    assert uart_lines("a\nb\nc\n") == 3;
+    assert uart_lines("no newline yet") == 0;
+}
