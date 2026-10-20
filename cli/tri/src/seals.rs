@@ -705,7 +705,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
             sync_twins(&root, &dir, false)?;
             return Ok(());
         }
-        SealsCmd::Twins { all } => all,
+        SealsCmd::Twins { all } => all, SealsCmd::Changed | SealsCmd::MergeDriver { .. } => return Ok(()),
     };
     let by = collect(&dir)?;
 

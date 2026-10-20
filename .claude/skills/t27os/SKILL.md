@@ -66,6 +66,19 @@ dashboard and back). The window only calls the decisions of `bench.t27`, `kanban
   duplicate-name script before importing a new spec into `glass_window`. The fast `t27b test` does not type-check the
   non-test functions unless an error forces the full checker (add an unknown name to a scratch copy).
 
+## Updates on the fly (owner, 2026-10-20; rules and tests: `specs/t27os/release.t27`, host: `glass_window.t27` update_tick)
+
+Every machine updates itself online. At launch and every 10 minutes the app fetches the manifest of the release named
+`t27os-latest` (assets replaced on every publish; releases are tagged `t27os-v<semver>-b<build>`, never `v*`). A newer
+build is downloaded to `~/.t27os/updates/<build>/`, checked against the manifest's sha256 rows, unzipped, signed ad hoc
+and verified, and swapped in only when no pane is busy (quiet 60 s, or the **UPDATE NOW** line above the sidebar foot).
+The previous bundle stays in `~/.t27os/updates/previous`; a start that dies within 60 s is rolled back by the next one,
+which refuses that build. Each release also ships arm64 `t27b`, `t27c`, `tri` built from the same commit; they go to
+`~/.t27os/bin` (first on every pane's PATH, `.prev` kept) only when their `--version` names the manifest's COMMIT.
+The pane server runs under launchd (`ai.t27.os.pty`, never a child of the app or a shell) and is restarted only when its
+own digest changed. Publish: `tri t27os publish --yes` (owner's word); `tri t27os release --plan` prints the steps.
+A copy that is not a built bundle (build 0), or runs from a checkout's `target/` folder, never updates itself.
+
 ## The image (owner, 2026-10-20)
 
 We sit in a spaceship; T27 OS is its **instrument panel** for working on the project.
