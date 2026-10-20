@@ -28630,15 +28630,12 @@ impl RustCodegen {
                         None
                     }
                 }),
-            // The FIELD form `x.len` is lowered to `x.len()` (see the
-            // ExprFieldAccess arm of `expr_to_rust`) and is just as `usize`, but
-            // only the CALL form above was known, so `k < text.len` with a u32
-            // `k` reached rustc uncast: E0308, six times in specs/isa/t27a.t27
-            // (#6507). Same field-census guard as the lowering itself.
+            // The FIELD form `x.len` is lowered to `x.len()` (see `expr_to_rust`) and is just as `usize`: `k < text.len`
+            // with a u32 `k` reached rustc uncast, E0308, six times in specs/isa/t27a.t27 (#6507). Same guard as the lowering.
             NodeKind::ExprFieldAccess
                 if node.name == "len"
                     && !node.children.is_empty()
-                    && !self.field_names.contains("len") =>
+                    && self.len_is_method(&node.children[0]) =>
             {
                 Some("usize".to_string())
             }
@@ -28712,15 +28709,25 @@ impl RustCodegen {
     /// to have the *same* integer type; t27 does not. Cast the narrower side up
     /// so the emitted operator compiles. Shifts are exempt — Rust already
     /// accepts any integer type as the shift amount.
-    fn rust_type_of(&self, n: &Node) -> Option<&str> { // #8971: the declared Rust type of a name
-        self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).filter(|_| n.kind == NodeKind::ExprIdentifier).map(|t| t.as_str())
+    fn rust_type_of(&self, n: &Node) -> Option<String> { // #8971, #11182: the declared Rust type of a name, a typed field or an element
+        let t = match (&n.kind, n.children.first()) {
+            (NodeKind::ExprIdentifier, _) => return self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).cloned(),
+            (NodeKind::ExprCall, _) => return self.fn_ret_types.get(&n.name).cloned(),
+            (NodeKind::ExprFieldAccess, Some(b)) => return self.decl_types.get(&format!("{}.{}", self.rust_type_of(b)?.trim_start_matches("*mut "), n.name)).cloned(),
+            (NodeKind::ExprIndex, Some(b)) if n.children.get(1).is_some_and(|i| i.extra_op != "..") => self.rust_type_of(b)?,
+            _ => return None,
+        };
+        t.strip_prefix("Vec<").and_then(|r| r.strip_suffix('>')).or_else(|| t.strip_prefix('[')?.rsplit_once(';').map(|x| x.0)).map(str::to_string)
     }
+
+    /// #11182: `x.len` is a length METHOD unless `x` is a struct with a field `len`; with one in the file the base's declared type decides.
+    fn len_is_method(&self, base: &Node) -> bool { !self.field_names.contains("len") || self.rust_type_of(base).is_some_and(|t| ["Vec<", "[", "&[", "&mut [", "&'static str"].iter().any(|p| t.starts_with(p))) }
 
     fn coerce_binary_operands(&self, node: &Node, left: &mut String, right: &mut String) {
         let text = |n: &Node, s: &mut String| if n.kind == NodeKind::ExprLiteral && n.extra_kind == "string" { s.insert(0, 'b') }
-            else if self.rust_type_of(n) == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
-        if self.rust_type_of(&node.children[0]) == Some("&[u8]") { text(&node.children[1], right) }
-        if self.rust_type_of(&node.children[1]) == Some("&[u8]") { text(&node.children[0], left) }
+            else if self.rust_type_of(n).as_deref() == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
+        if self.rust_type_of(&node.children[0]).as_deref() == Some("&[u8]") { text(&node.children[1], right) }
+        if self.rust_type_of(&node.children[1]).as_deref() == Some("&[u8]") { text(&node.children[0], left) }
         if matches!(node.extra_op.as_str(), "<<" | ">>") {
             return;
         }
@@ -28898,18 +28905,8 @@ impl RustCodegen {
                 // slice length as a field, so specs write both `x.len` and
                 // `len(x)`; the second reached rustc as a call to a function
                 // that does not exist -- 38 of the corpus's E0425 diagnostics.
-                // Two guards, and the code checks both: `declared_fns` because
-                // 3 specs declare their own `fn len`, and `field_names` because
-                // 6 declare a struct field named `len`. The second is stricter
-                // than this form strictly needs -- a free `len(x)` is a length
-                // call even in a file that also has a `len` field -- and it is
-                // kept deliberately so both spellings answer to one condition
-                // rather than drifting apart.
-                if node.name == "len"
-                    && args.len() == 1
-                    && !self.declared_fns.contains("len")
-                    && !self.field_names.contains("len")
-                {
+                // Guarded by `declared_fns` (3 specs declare their own `fn len`), not by a `len` field (#11182).
+                if node.name == "len" && args.len() == 1 && !self.declared_fns.contains("len") {
                     return format!("({}).len()", args[0]);
                 }
                 if let Some(callee_params) = self.param_names.get(&node.name) {
@@ -28932,7 +28929,7 @@ impl RustCodegen {
                     for (i, a) in args.iter_mut().enumerate() {
                         let (Some((_, t)), Some(c)) = (callee_params.get(i), node.children.get(i)) else { continue };
                         let t = t.trim();
-                        if t == "[]const u8" && self.rust_type_of(c) == Some("&'static str") {
+                        if t == "[]const u8" && self.rust_type_of(c).as_deref() == Some("&'static str") {
                             a.push_str(".as_bytes()");
                         } else if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
                             && !t[1..].trim_start().starts_with("const ")
@@ -29146,18 +29143,9 @@ impl RustCodegen {
                             format!("(*{})", base)
                         } else if node.name == "?" {
                             format!("{}.unwrap()", base)
-                        } else if node.name == "len" && !self.field_names.contains("len") {
-                            // Zig exposes a slice length as the FIELD `.len` and
-                            // specs are written in that shape, so `data.len`
-                            // reached rustc verbatim: "attempted to take value
-                            // of method `len`" (E0615, 26 diagnostics). Rust
-                            // spells it as a method. The Zig backend documents
-                            // the mirror image of this at its own `.len` site.
-                            //
-                            // Guarded by the whole-file field census: 6 corpus
-                            // specs declare a struct field genuinely named
-                            // `len`, and in those files the access is a field
-                            // and must stay one.
+                        } else if node.name == "len" && self.len_is_method(&node.children[0]) {
+                            // Zig's slice length is the FIELD `.len`; Rust's is a method (E0615, 26 diagnostics). A struct
+                            // field named `len` (6 corpus specs) stays a field; `len_is_method` tells them apart (#11182).
                             format!("{}.len()", base)
                         } else {
                             format!("{}.{}", base, rust_ident(&node.name))
@@ -29176,14 +29164,7 @@ impl RustCodegen {
                     // times in specs/isa/t27a.t27, #6507). The bytes are what the
                     // spec means, and `.as_bytes()` is the zero-cost view.
                     let base_node = &node.children[0];
-                    if base_node.kind == NodeKind::ExprIdentifier
-                        && self
-                            .var_types
-                            .get(&base_node.name)
-                            .or_else(|| self.const_types.get(&base_node.name))
-                            .map(|t| t == "&'static str")
-                            .unwrap_or(false)
-                    {
+                    if self.rust_type_of(base_node).is_some_and(|t| t == "&'static str") && (base_node.kind == NodeKind::ExprIdentifier || node.children[1].extra_op != "..") {
                         base = format!("{}.as_bytes()", base);
                     }
                     let idx = &node.children[1];
