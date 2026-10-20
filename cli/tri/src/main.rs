@@ -1386,7 +1386,7 @@ fn main() -> Result<()> {
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
         Commands::T27os { action, plan, build, sha } => std::process::exit(cmd_t27os(action, *plan, *build, sha)),
-        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
+        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
@@ -1513,10 +1513,10 @@ fn cmd_serve(addr: &str) -> Result<()> {
 }
 
 /// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
-fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result<u8> {
+fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bool) -> Result<u8> {
     let leak = |s: String| -> &'static str { s.leak() };
     let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan };
+    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan, seals };
     let (mut ev, mut buf, mut code, mut at) = ("", vec![0u8; land::CMD_MAX], land::request_refusal(r), (0u8, 0u64));
     let argv = |b: &[u8]| -> Vec<String> { String::from_utf8_lossy(b).lines().map(str::to_string).collect() };
     if plan && code == land::L_OK { for k in 0..land::LAND_STEPS { let n = land::step_argv(r, "", k, 0, &mut buf); println!("{k:2} {:<17} {}", land::step_name(k), argv(&buf[..n]).join(" ")); } return Ok(0); }
@@ -1528,7 +1528,7 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result
         anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
         let a = argv(&buf[..n]);
         let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
-        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::in_scratch(at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
+        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::cwd_scratch(r, at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
         let text = leak(text);
         let mut sec = vec![0u8; text.len() + 128];
         let m = land::emit_section(&mut sec, 0, at.0, at.1, x, text);
