@@ -10,6 +10,42 @@
 
 ---
 
+## 2026-10-20 - a Zynq-7000 XC7Z020 is on a second cable; the AX7203 cable shows an empty chain
+
+Measured by the orchestrator on this Mac (openFPGALoader from /opt/homebrew/bin), unix time
+1792488364 (recorded when the lines were entered). Every row below is a command and its output.
+
+| Command | Output |
+|---|---|
+| `openFPGALoader --scan-usb` | `000 004 0x0403:0x6014 ft232H Digilent 210512180081 Digilent USB Device` and `000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 Digilent Adept USB Device` |
+| `openFPGALoader -c digilent --busdev-num 0:2 --detect` (same with `-c digilent_hs2`) | index 0: idcode `0x4ba00477`, type ARM cortex A9, irlength 4; index 1: idcode `0x3727093` |
+| `openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect` | an empty chain (only `Jtag frequency : requested 6.00MHz -> real 6.00MHz`) |
+
+Serial ports: `/dev/cu.usbserial-130`, `/dev/cu.usbserial-2102038592890`,
+`/dev/cu.usbserial-2102038592891`, `/dev/cu.usbserial-210512180081`.
+
+- **New board, measured:** a Zynq-7000 XC7Z020. PL IDCODE `0x03727093` (version nibble masked), ARM DAP
+  `0x4ba00477`, chain from TDI: ARM first, PL second. Cable: Digilent Adept FTDI2232 `0x0403:0x6010`,
+  serial `210203859289`, at **busdev 0:2** (`-c digilent` and `-c digilent_hs2` both answer). Its UARTs are
+  `/dev/cu.usbserial-2102038592890` and `-2102038592891` (the cable's two FTDI channels; which channel
+  carries a design's UART is not established).
+- **The AX7203 cable shows an EMPTY chain.** HS2 cable `210512180081` (FT232H) is at **busdev 0:4** and
+  `--detect` lists no device. Board unpowered or board disconnected: **not measured which**; the cable
+  itself is seen by `--scan-usb`. One cable is listed now, not three: the earlier 1:6 and 1:8 are not in the scan.
+- **Bus numbering moved from 1 to 0** since this file's busdev tables were written: `1:4 / 1:6 / 1:8`
+  now answer "device not found". A busdev is a value the host reads from `--scan-usb` each time, never a
+  constant (`specs/t27os/bench.t27`, `bench_busdev_*`).
+- **Board model is a GUESS.** An XC7Z020 in clg400-1 sits on the Arty Z7-20, PYNQ-Z1, Zybo Z7-20 and the
+  PZSDR P201/P203 Mini (die D, `specs/verified/bench_boards.t27` row `pzsdr-d`, #8635); JTAG cannot tell them
+  apart, and the package `xc7z020clg400-1` is assumed, not read. The same cable serial `210203859289`
+  and the same PL part are die D's of 2026-10-10, so this is most likely die D again; that is not proven.
+  What would establish it: a photo of the PCB marking through the camera (skill board-eye), or the cable's
+  own USB product string / EEPROM read with `openFPGALoader --scan-usb` verbose or `ioreg`.
+- **Open discrepancy:** the 2026-10-10 die D read recorded the full IDCODE `0x23727093` (version 2); today's
+  `--detect` prints `0x3727093` (version 0). `idcode_is_row` masks the version, so the row still matches, but
+  the reader's `-expected-id` (`tap_idcode`) uses version 2. Either the silicon revision differs (a different
+  board behind the same cable serial) or one of the two transcriptions dropped the nibble. Not resolved.
+
 ## 2026-10-10 - the TRI-NET node answers jobs over UDP on the AX7203
 
 What ran: EthRx, TrinetNode and EthReply (`specs/fpga/eth_rx.t27`, `trinet_node.t27`,

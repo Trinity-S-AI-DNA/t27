@@ -37,6 +37,12 @@ Supporting: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), 
 
 Use **domain directories**, not “one folder per agent.” Primary contact for a path is the **Primary** listed in the nearest `OWNERS.md`.
 
+- **Every path, spec, widget and app surface has its agents** (owner rule, 2026-10-20). A path maps
+  to one letter through the agents' `KEY_FILES` (`specs/t27os/domain_pulse.t27`); a widget or app
+  surface carries its owner letter plus the letters that feed it (`specs/t27os/agent_parts.t27`),
+  and the widget factory refuses a widget without them. Keep `KEY_FILES` pointing at the
+  directories a domain really changes: stale entries make the domain look idle.
+
 ---
 
 ## 3. Non-negotiables for changes
@@ -216,6 +222,41 @@ models). The spec says what the runner must do; it does not rewrite the runner.
   Of 45 numbers printed in three papers, 34 recompute, 8 do not, 3 cannot be
   checked.
 
+### T27 OS: the instrument panel, and GOD MODE evolution
+
+T27 OS is the native window through which the project is worked on and watched: a spaceship
+instrument panel, written in `.t27` and built by `t27b` (`specs/t27os/`, run recipe
+`docs/t27os/run-local.md`). The image, the per-letter registry, the build traps and the plan live
+in one place, the skill [`.claude/skills/t27os/SKILL.md`](.claude/skills/t27os/SKILL.md); this
+section only states the rules.
+
+- **27 petals = 27 letters.** Petal index p is letter p + 1; the rings are the alphabet layers
+  (A-I, J-R, S-Ti). Petal 3 (C) holds the chat and the commander. A letter's tool t27<letter>
+  leads where one exists (t27a, t27b, t27c, t27f frontend, t27o, t27t, t27u); never name a tool
+  before its artifact exists (`specs/compiler/theory/toolchain.t27`).
+- **T27 OS is an ergonomic project-management system, 100% widgets** (owner, 2026-10-20: "our
+  signature"). Each letter is a tool t27<letter> with its own page -- t27k the kanban board, t27c
+  the chat and commander, t27i issues, t27p pull requests and CI, t27q the Queen; the table is
+  `TOOL_NAMES` in `specs/t27os/agent_parts.t27`. Every pixel of every page belongs to a widget.
+- **Everything is a widget; widgets contain widgets.** A letter's console holds its instruments:
+  its widgets and app surfaces, its specs, its tri commands, MCP tools and skills, its live
+  domain pulse. No text-only screens.
+- **Every number shows where it came from**: measured (with the command), derived, or not
+  measured; a missing value prints "not measured", never 0 (`specs/t27os/bench.t27`). Every
+  fact about a domain is labelled CONFIRMED or GUESS (`domain_pulse.t27`).
+- **GOD MODE evolves the system, inside the same laws.** With GOD MODE on, the Queen
+  (`specs/t27os/queen.t27`) picks the next gap from the panel itself -- a letter with no
+  instrument, a stale seal, a red check on a domain's path, an unowned path, a spec no widget
+  shows -- turns it into an issue with the 4-heading shape, starts one agent in a PTY pane on a
+  fresh lane worktree (Sonnet; at most three at once on an 8 GB Mac), and lands the result only
+  through the normal gates (`Closes #N`, tests, seals, Only t27, DRY). The decision rule is
+  `specs/t27os/evolve.t27`. GOD MODE never does what CLAUDE.md "Proactivity" forbids
+  (passwords, payments, secrets, public claims without a measurement, owner-only gate files);
+  those become requests to the owner. Cmd+J, Escape or the switch stops it; every action is in
+  the RECENT log on screen.
+- **Two lanes edit `glass_window.t27`.** Merge master before every push to it; reseal
+  `specs/t27os/homes.t27` after master moves.
+
 ### Hot reload and incremental work: only what changed is redone
 
 The rule: key every result on the content hash of its inputs and reuse it while
@@ -283,6 +324,14 @@ Each gate is a spec. Read the spec, not a summary of it.
 **φ² + 1/φ² = 3 | TRINITY**
 
 ---
+
+## Landing work: our git first, GitHub once per batch (owner rule, 2026-10-20, #11275)
+
+GitHub's Actions queue is the bottleneck (800-900 queued runs, #10644). A lane verifies locally first
+(`t27b test`, `t27c test-report`, seal, gen), lands on the local golden head by compare-and-swap, and
+GitHub receives one batched push per window, never one per commit; a red batch is bisected locally by
+verdicts. The law is `specs/queen/golden_chain.t27` section 6; the practices, commands and traps are
+the skill `own-git-landing`.
 
 ## Only t27 (owner hard rule, 2026-10-05)
 

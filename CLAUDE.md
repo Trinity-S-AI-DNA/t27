@@ -1,4 +1,6 @@
-# CLAUDE.md — Instructions for Claude Code and autonomous agents (t27)
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository: instructions for Claude Code and autonomous agents (t27).
 
 Use this file **together with** `[AGENTS.md](AGENTS.md)`. Repo-specific law always overrides generic tooling defaults.
 
@@ -73,6 +75,11 @@ Do **not** add parallel math/physics implementations in ad-hoc scripts when the 
 - **Local sweep (CI-like):** from repo root, `./scripts/tri test` or `./target/release/t27c suite --repo-root .` (Rust runner; no shell test harness under `tests/`).
 - **Generated code:** under `gen/` — do not hand-edit for routine fixes; change specs and regenerate.
 - **Pull requests:** follow project Issue Gate and linking policy; **do not approve** PRs unless explicitly authorized.
+- **Specs with `@extern` (T27 OS host files such as `specs/t27os/glass_window.t27`)** cannot be compiled by `t27c`; test them with `t27b test <spec>` and build the app with `make t27os` (an extern-capable `t27b`; a binary without `@extern` support emits trapping stubs). `tri land` refuses such a branch, so it lands as a plain PR.
+- **Seals** come from a master-built `t27c` (`t27c seal <spec> --save`, then `tri seals sync-twins`); a seal saved from a worktree under `/Users/...` can embed the path and fail the `scan` check.
+- **`gen/` is gitignored:** a generated file that a hand crate includes through `#[path = ".../gen/..."]` must be committed with `git add -f`, or master breaks after the squash (#11324 -> #11328).
+- **Landing:** `tri land [--issue N]` is the GitHub leg for one branch (merge master, tests with no vacuous pass, seals, types ratchet, dupe subset, PR, auto-merge). `tri golden land | push | status` is our own git (`specs/queen/golden_chain.t27` section 6, `specs/tri/land/golden_land.t27`): small `claude/evolve-*` links are verified locally, land on `refs/golden/head` by compare-and-swap (a stale seal is re-saved as REGEN), and reach GitHub as one batch PR per 15-minute window.
+- **Before the first push** check what CI will refuse: foreign-line budget (at most 40 added hand lines per non-t27 file, 80 per PR), home paths, stale seals, duplicate-body growth (`python3 tools/dupe_scan.py`), absurd Verilog widths. `--auto` merge can land commit 1 alone if you push twice.
 
 ---
 
@@ -158,17 +165,11 @@ before touching anything under `fpga/`. Non-negotiables:
   camera read "ALINX" off the PCB and the AX7203 gf8 bitstream answered 512/512 over its UART.
   JTAG-only results stand; any design that uses package pins must target fbg484. The Wukong
   text below is what the SSOT said before; HARDWARE_SSOT.md §2026-10-08 has the evidence.
-- Target board is **QMTech Wukong V1 / XC7A200T-FGG676** (`xc7a200tfgg676-1`),
-  IDCODE `0x03636093`. Not the Arty A7 (`csg324`), and **not the 100T** — this
-  file said `XC7A100T` / `0x13631093` until 2026-08-14, contradicting the SSOT
-  it points to. Measured on all three attached boards: `idcode 0x3636093`,
-  `family artix a7 200t`. For place-and-route use the `fbg676` chipdb
-  (`xc7a200tfbg676-1`) — same die and pinout, per HARDWARE_SSOT.md §2026-07-05.
+- **Bench on this Mac (2026-10-20):** the AX7203 answers at HS2 `--busdev-num 0:4` (IDCODE `0x3636093`, cable serial `210512180081`); a Zynq-7020 board (ARM `0x4ba00477` + PL `0x03727093`) answers at `0:2` on a Digilent Adept cable. The USB bus renumbers (it was `1:x`), so always run `openFPGALoader --detect` first. The Wukong text that used to stand here is history in HARDWARE_SSOT.md; pins and PnR follow the AX7203 (fbg484).
 - **Flash with `openFPGALoader -c digilent_hs2`.** The attached cables are
   **Digilent FTDI `0x0403:0x6014`**, not the Xilinx `0x03FD` Platform Cable, and
   `cli/dlc10` speaks only to `0x03FD` — it answers `DLC10 cable not found` on this
-  bench. Address the three boards with `--busdev-num 1:4 / 1:6 / 1:8`; they share
-  serial `210512180081`, so serial-based addressing cannot separate them.
+  bench. Cables that share a serial cannot be separated by serial, only by `--busdev-num`.
   See `fpga/HARDWARE_SSOT.md` §"Note" and §"Programming".
   *Corrected W791 (T460/T461): the previous text here forbade `openFPGALoader` on
   the grounds that it cannot drive a `0x03FD` cable — true, and irrelevant, since
@@ -185,6 +186,20 @@ before touching anything under `fpga/`. Non-negotiables:
 - Never commit secrets. See `[SECURITY.md](SECURITY.md)`. Root `.env` patterns are gitignored; use `.env.example` patterns only in docs.
 
 ---
+
+## Swarm, Queen and keys (state 2026-10-20)
+
+- **Who does the work:** the bees (the Queen's lanes) and T27 OS panes on free tiers (z.ai `glm-4.5-flash`, OpenRouter `:free`) through the key master (`specs/t27os/keys.t27`); Claude sessions land, verify and unblock (`swarm-economy` skill). Remaining work is filed as 4-heading issues (Boundary / User Scenarios / Requirements / Success Criteria) under the T27 OS epics listed in AGENTS.md "Swarm focus".
+- **The Queen picks by labels** (`specs/queen/priority.t27`): `P0` (at most 3 count as critical), `P1`, unlabelled last. Two open issues whose Boundary names the same file are run one after the other (whole-file holds), so give each issue its own files or a `path :: fn NAME` region.
+- **Where the live Queen runs today:** Railway project `999`, service `trios-agent-server` (gHashTag/trios `trios/agent-server`, api.t27.ai). The region-hold code there is behind `TRIOS_QUEEN_REGIONS`, `TRIOS_QUEEN_DISPATCH_BATCH`, `TRIOS_QUEEN_DERIVED_FREE`. The project is leaving Railway: the dispatcher moves onto our own actors in the T27 OS kernel (`specs/t27os/kernel.t27`, `specs/queen/actors.t27`, epic #11377).
+- **Contributed keys** (added by users on app.t27.ai) are stored sealed by the Queen; work on them is managed by the owner and the Queen with the contributor's consent, and the contributor earns PROVIDER_FEE in TRI credit for verified work (`specs/network/mvp.t27`, `specs/verified/payout.t27`; minting is the founder's alone, `specs/trinet/mint_authority.t27`). Never read, print or move a key value.
+- **Numbers and the brand:** number formats (TNF, GoldenFloat, Golden Ruler, Z[phi]) and the brand visual (verified formulas orbiting the 27-petal logo) are sections of AGENTS.md; follow them, do not restate them.
+
+## Sandbox and shell traps
+
+- In a sandboxed agent, `gh` can fail with `x509: OSStatus -26276`, and `git worktree add`, branch deletion and `.git/config` writes can be refused; run those through a Terminal tab, or ask the orchestrator to fetch CI logs (`gh run view <id> --log-failed`) into a file for you.
+- zsh: write `${b}` before a colon (`"+refs/heads/${b}:refs/heads/${b}"`), because `$b:r` is a modifier; never put backticks inside a double-quoted `--body` (they run), use `--body-file`; BSD `grep` has no `-P`.
+- `Closes #N` in a commit or PR body closes N on merge: never name an epic that way (use `see #N`).
 
 ## The 7 Invariant Laws
 
