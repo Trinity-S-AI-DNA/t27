@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // T27 OS keys_host: where the key manager (keys.t27) touches the machine. Three jobs, no decisions:
-//   - the macOS Keychain: kc_put / kc_get / kc_del, one generic-password item per provider under the
-//     service "ai.t27.os" (SecItemAdd, SecItemCopyMatching, SecItemUpdate, SecItemDelete). A key is never
-//     written to a file and never reaches the repo.
+//   - the macOS Keychain: kc_put_n / kc_get_n / kc_del_n, one generic-password item per key (up to MAX_KEYS a
+//     provider; account = provider name, then "<name>#2" .. "<name>#8") under the service "ai.t27.os"
+//     (SecItemAdd, SecItemCopyMatching, SecItemUpdate, SecItemDelete); kc_put / kc_get / kc_del are key 1.
+//     A key is never written to a file and never reaches the repo.
 //   - the check button: probe() sends the cheapest authenticated request of a provider (a GET; for z.ai one one-token POST) (table: keys.t27) and
 //     hands back the HTTP status; keys.t27 status_after_probe decides what it means. The key travels in a
 //     request header, never in the URL.
-//   - push_keys(): hand every stored key to the PTY server (OP_SETKEY) so a pane it spawns is logged in.
+//   - push_keys(): hand every stored key, with its number, to the PTY server (OP_SETKEY) so a pane it spawns
+//     is logged in and the server can rotate over the keys of a provider.
 //
 // The kSec* constants are global CFStringRef variables, not functions, so an @extern call cannot read them:
 // dlsym finds the variable's address and sys_peek copies the pointer out. Specs holding @extern cannot run
@@ -16,9 +18,11 @@
 module T27osKeysHost;
 
 use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
 use t27os::keys::KEYCHAIN_SERVICE;
 use t27os::keys::PROBE_TIMEOUT_S;
-use t27os::keys::provider_name;
+use t27os::keys::keychain_account_n;
+use t27os::keys::setkey_byte;
 use t27os::keys::probe_url;
 use t27os::keys::probe_has;
 use t27os::keys::probe_header_name;
@@ -107,13 +111,14 @@ fn set_text(d: u64, key_name: []const u8, text: []const u8) -> void {
     cf_release(s);
 }
 
-/// The query that names provider p's item: generic password, service "ai.t27.os", account = provider name.
-fn item_query(p: u32) -> u64 {
+/// The query that names key k of provider p (k = 0 is key 1): generic password, service "ai.t27.os", account
+/// = the provider name, then "#2" .. "#8" for the others (keys.t27 keychain_account_n).
+fn item_query(p: u32, k: u32) -> u64 {
     const d : u64 = new_dict();
     cf_dict_set(d, global_ref("kSecClass"), global_ref("kSecClassGenericPassword"));
     set_text(d, "kSecAttrService", KEYCHAIN_SERVICE);
-    var nm : [24]u8 = undefined;
-    const n : usize = provider_name(p, nm[0..24]);
+    var nm : [32]u8 = undefined;
+    const n : usize = keychain_account_n(p, k, nm[0..32]);
     set_text(d, "kSecAttrAccount", nm[0..n]);
     return d;
 }
@@ -124,16 +129,16 @@ fn set_data(d: u64, key: []const u8) -> void {
     cf_release(data);
 }
 
-/// Store provider p's key (replacing an earlier one). True when the Keychain accepted it.
-pub fn kc_put(p: u32, key: []const u8) -> bool {
-    if (p >= PROVIDER_COUNT) { return false; }
+/// Store key k (0-based) of provider p, replacing an earlier one. True when the Keychain accepted it.
+pub fn kc_put_n(p: u32, k: u32, key: []const u8) -> bool {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return false; }
     if (key.len == 0) { return false; }
-    const a : u64 = item_query(p);
+    const a : u64 = item_query(p, k);
     set_data(a, key);
     var st : i32 = sec_add(a, 0);
     cf_release(a);
     if (st == SEC_DUPLICATE) {
-        const q : u64 = item_query(p);
+        const q : u64 = item_query(p, k);
         const u : u64 = new_dict();
         set_data(u, key);
         st = sec_update(q, u);
@@ -143,10 +148,15 @@ pub fn kc_put(p: u32, key: []const u8) -> bool {
     return st == 0;
 }
 
-/// Read provider p's key into out; its length, 0 when none is stored.
-pub fn kc_get(p: u32, out: []u8) -> usize {
-    if (p >= PROVIDER_COUNT) { return 0; }
-    const q : u64 = item_query(p);
+/// Store provider p's first key.
+pub fn kc_put(p: u32, key: []const u8) -> bool {
+    return kc_put_n(p, 0, key);
+}
+
+/// Read key k (0-based) of provider p into out; its length, 0 when none is stored.
+pub fn kc_get_n(p: u32, k: u32, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return 0; }
+    const q : u64 = item_query(p, k);
     cf_dict_set(q, global_ref("kSecReturnData"), global_ref("kCFBooleanTrue"));
     cf_dict_set(q, global_ref("kSecMatchLimit"), global_ref("kSecMatchLimitOne"));
     var res : [8]u8 = undefined;
@@ -162,19 +172,63 @@ pub fn kc_get(p: u32, out: []u8) -> usize {
     return @as(usize, n);
 }
 
-/// Delete provider p's item. True when it is gone (also when none was there).
-pub fn kc_del(p: u32) -> bool {
-    if (p >= PROVIDER_COUNT) { return false; }
-    const q : u64 = item_query(p);
+/// Read provider p's first key into out.
+pub fn kc_get(p: u32, out: []u8) -> usize {
+    return kc_get_n(p, 0, out);
+}
+
+/// Delete key k (0-based) of provider p. True when it is gone (also when none was there).
+pub fn kc_del_n(p: u32, k: u32) -> bool {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return false; }
+    const q : u64 = item_query(p, k);
     const st : i32 = sec_delete(q);
     cf_release(q);
     return st == 0 or st == -25300;
 }
 
-/// True when the Keychain holds a key for provider p (reads it, then drops the copy).
+/// Delete provider p's first key.
+pub fn kc_del(p: u32) -> bool {
+    return kc_del_n(p, 0);
+}
+
+/// Delete every key of provider p (a KEYS row's DELETE removes the provider's whole set). True when all are gone.
+pub fn kc_del_all(p: u32) -> bool {
+    var ok : bool = true;
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if (kc_del_n(p, k) == false) { ok = false; }
+        k = k + 1;
+    }
+    return ok;
+}
+
+/// True when the Keychain holds a first key for provider p (reads it, then drops the copy).
 pub fn kc_has(p: u32) -> bool {
     var b : [256]u8 = undefined;
-    return kc_get(p, b[0..256]) > 0;
+    const n : usize = kc_get(p, b[0..256]);
+    var i : usize = 0;
+    while (i < 256) {
+        b[i] = 0;
+        i = i + 1;
+    }
+    return n > 0;
+}
+
+/// How many of the provider's MAX_KEYS accounts hold a key (a gap in the numbers does not stop the count).
+pub fn kc_count(p: u32) -> u32 {
+    var b : [256]u8 = undefined;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if (kc_get_n(p, k, b[0..256]) > 0) { c = c + 1; }
+        k = k + 1;
+    }
+    var i : usize = 0;
+    while (i < 256) {
+        b[i] = 0;
+        i = i + 1;
+    }
+    return c;
 }
 
 fn add_header(req: u64, name: []const u8, value: []const u8) -> void {
@@ -230,19 +284,31 @@ pub fn probe(p: u32, key: []const u8) -> u32 {
     return @as(u32, @intCast(msg0(r, sel("statusCode"))));
 }
 
-/// Hand every stored key to the PTY server on `fd`; the count pushed. Called on connect and before a spawn,
-/// because a server that restarted has forgotten them.
+/// Hand every stored key to the PTY server on `fd`, each with its number; the count pushed. Every numbered
+/// account of every provider is read, up to MAX_KEYS, and the number rides in the OP_SETKEY pane byte
+/// (keys.t27 setkey_byte), so the server holds all of them and rotates over them. Called on connect, when
+/// the KEYS tab opens and before a spawn, because a server that restarted has forgotten them. The copy of
+/// each key in this stack frame is wiped when the call ends.
 pub fn push_keys(fd: i32) -> u32 {
     var key : [256]u8 = undefined;
     var reply : [MAX_FRAME]u8 = undefined;
     var pushed : u32 = 0;
     var p : u32 = 0;
     while (p < PROVIDER_COUNT) {
-        const n : usize = kc_get(p, key[0..256]);
-        if (n > 0) {
-            if (client_set_key(fd, p, key[0..n], reply[0..MAX_FRAME]) > 0) { pushed = pushed + 1; }
+        var k : u32 = 0;
+        while (k < MAX_KEYS) {
+            const n : usize = kc_get_n(p, k, key[0..256]);
+            if (n > 0) {
+                if (client_set_key(fd, setkey_byte(p, k), key[0..n], reply[0..MAX_FRAME]) > 0) { pushed = pushed + 1; }
+            }
+            k = k + 1;
         }
         p = p + 1;
+    }
+    var i : usize = 0;
+    while (i < 256) {
+        key[i] = 0;
+        i = i + 1;
     }
     return pushed;
 }
