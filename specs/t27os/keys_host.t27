@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// T27 OS keys_host: where the key manager (keys.t27) touches the machine. Three jobs, no decisions:
+// T27 OS keys_host: where the key manager (keys.t27) touches the machine through libSystem. Two jobs, no
+// decisions (the check button, which needs Foundation, is keys_probe.t27):
 //   - the macOS Keychain, one generic-password item per key (up to MAX_KEYS a provider; account = provider
 //     name, then "<name>#2" .. "<name>#8") under the service "ai.t27.os": kc_get_n / kc_put_n / kc_del_n.
 //     The Keychain is reached ONLY by running /usr/bin/security (posix_spawn, pipes, poll, waitpid), never
@@ -7,11 +8,14 @@
 //     SecItem read of an item asked for the login password again; the items trust /usr/bin/security, which
 //     Apple signs and no rebuild changes. A key is never written to a file, never put on argv (ps shows it:
 //     an add feeds `security -i` one line on standard input) and never reaches the repo.
-//   - the check button: probe() sends the cheapest authenticated request of a provider (a GET; for z.ai one one-token POST) (table: keys.t27) and
-//     hands back the HTTP status; keys.t27 status_after_probe decides what it means. The key travels in a
-//     request header, never in the URL.
 //   - push_keys(): hand every stored key, with its number, to the PTY server (OP_SETKEY) so a pane it spawns
 //     is logged in and the server can rotate over the keys of a provider.
+//
+// Two programs import this module: the window (glass_window.t27) and the PTY server (pty_server.t27, which
+// reads the Keychain itself with kc_get_n so it never depends on the window being connected). A module's
+// @extern imports travel with it, so everything here is libSystem only (posix_spawn, pipe, poll, waitpid): the
+// server links against libSystem alone. Nothing may be added here that needs CoreFoundation or Foundation;
+// that is why the check button moved to keys_probe.t27.
 //
 // Specs holding @extern cannot run tests under t27c; every rule these fns follow is a tested fn in keys.t27
 // (argument lists, the add line, which keys are safe for it, the exit-status table, the output -> key rule).
@@ -27,7 +31,6 @@ module T27osKeysHost;
 use t27os::keys::PROVIDER_COUNT;
 use t27os::keys::MAX_KEYS;
 use t27os::keys::KEYCHAIN_SERVICE;
-use t27os::keys::PROBE_TIMEOUT_S;
 use t27os::keys::SEC_OP_READ;
 use t27os::keys::SEC_OP_WRITE;
 use t27os::keys::SEC_OP_DELETE;
@@ -45,13 +48,6 @@ use t27os::keys::sec_key_from_output;
 use t27os::keys::scan_goes_on;
 use t27os::keys::keychain_account_n;
 use t27os::keys::setkey_byte;
-use t27os::keys::probe_url;
-use t27os::keys::probe_has;
-use t27os::keys::probe_header_name;
-use t27os::keys::probe_header_value;
-use t27os::keys::probe_post;
-use t27os::keys::probe_body;
-use t27os::keys::probe_needs_version;
 use t27os::pty_proto::get_u64;
 use t27os::pty_proto::MAX_FRAME;
 use t27os::pty_logic::put_pollfd;
@@ -66,7 +62,6 @@ use t27os::pty_sys::sys_kill;
 use t27os::pty_sys::sys_waitpid;
 use t27os::pty_client::client_set_key;
 
-pub const UTF8_ENC : u32 = 134217984;
 pub const SIGNAL_PIPE : i32 = 13;
 pub const SIGNAL_CHLD : i32 = 20;
 pub const HANDLER_DFL : u64 = 0;
@@ -74,16 +69,6 @@ pub const HANDLER_IGN : u64 = 1;
 pub const SIGKILL_NUMBER : i32 = 9;
 
 fn addr_of(dst: []u8, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
-fn cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
-fn cf_data(alloc: u64, bytes: []const u8, n: u64) -> u64 { return @extern("CFDataCreate"); }
-fn cf_release(o: u64) -> void { @extern("CFRelease"); }
-fn class_named(name: u64) -> u64 { return @extern("NSClassFromString"); }
-fn sel_named(name: u64) -> u64 { return @extern("NSSelectorFromString"); }
-fn msg0(o: u64, s: u64) -> u64 { return @extern("objc_msgSend"); }
-fn msg1(o: u64, s: u64, a: u64) -> u64 { return @extern("objc_msgSend"); }
-fn msg2(o: u64, s: u64, a: u64, b: u64) -> u64 { return @extern("objc_msgSend"); }
-fn msg3(o: u64, s: u64, a: u64, b: u64, c: u64) -> u64 { return @extern("objc_msgSend"); }
-fn msg_f(o: u64, s: u64, t: f64) -> u64 { return @extern("objc_msgSend"); }
 
 /// pipe(2): fds[0] is the read end, fds[1] the write end.
 fn sys_pipe(fds: [2]u32) -> i32 { return @extern("pipe"); }
@@ -94,24 +79,6 @@ fn fa_destroy(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_destro
 fn fa_dup2(fa: []u8, fd: i32, to: i32) -> i32 { return @extern("posix_spawn_file_actions_adddup2"); }
 fn fa_close(fa: []u8, fd: i32) -> i32 { return @extern("posix_spawn_file_actions_addclose"); }
 fn fa_open(fa: []u8, fd: i32, path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("posix_spawn_file_actions_addopen"); }
-
-fn cf(s: []const u8) -> u64 {
-    return cf_str(0, s, s.len, UTF8_ENC, false);
-}
-
-fn cls(s: []const u8) -> u64 {
-    const n : u64 = cf(s);
-    const c : u64 = class_named(n);
-    cf_release(n);
-    return c;
-}
-
-fn sel(s: []const u8) -> u64 {
-    const n : u64 = cf(s);
-    const c : u64 = sel_named(n);
-    cf_release(n);
-    return c;
-}
 
 fn close_fd(fd: u32) -> void {
     sys_close(@as(i32, @intCast(fd)));
@@ -367,59 +334,6 @@ pub fn kc_has(p: u32) -> bool {
     const n : usize = kc_get_n(p, 0, b[0..256]);
     wipe(b[0..256]);
     return n > 0;
-}
-
-fn add_header(req: u64, name: []const u8, value: []const u8) -> void {
-    const n : u64 = cf(name);
-    const v : u64 = cf(value);
-    msg2(req, sel("setValue:forHTTPHeaderField:"), v, n);
-    cf_release(n);
-    cf_release(v);
-}
-
-/// The check button: one authenticated GET for provider p with `key`; the HTTP status, 0 when nothing
-/// answered (no network, timeout) and 1 when the provider has no probe. Blocks up to PROBE_TIMEOUT_S.
-pub fn probe(p: u32, key: []const u8) -> u32 {
-    if (probe_has(p) == false) { return 1; }
-    var ub : [160]u8 = undefined;
-    const un : usize = probe_url(p, ub[0..160]);
-    const us : u64 = cf(ub[0..un]);
-    const url : u64 = msg1(cls("NSURL"), sel("URLWithString:"), us);
-    cf_release(us);
-    if (url == 0) { return 0; }
-    const req : u64 = msg1(cls("NSMutableURLRequest"), sel("requestWithURL:"), url);
-    if (req == 0) { return 0; }
-    msg_f(req, sel("setTimeoutInterval:"), @as(f64, @floatFromInt(PROBE_TIMEOUT_S)));
-    var hn : [24]u8 = undefined;
-    var hv : [300]u8 = undefined;
-    const nl : usize = probe_header_name(p, hn[0..24]);
-    const vl : usize = probe_header_value(p, key, hv[0..300]);
-    add_header(req, hn[0..nl], hv[0..vl]);
-    if (probe_needs_version(p)) { add_header(req, "anthropic-version", "2023-06-01"); }
-    if (probe_post(p)) {
-        var bb : [200]u8 = undefined;
-        const bl : usize = probe_body(p, bb[0..200]);
-        const data : u64 = cf_data(0, bb[0..bl], @as(u64, bl));
-        const post : u64 = cf("POST");
-        msg1(req, sel("setHTTPMethod:"), post);
-        msg1(req, sel("setHTTPBody:"), data);
-        add_header(req, "content-type", "application/json");
-        cf_release(post);
-        cf_release(data);
-    }
-    add_header(req, "User-Agent", "t27os");
-    var resp : [8]u8 = undefined;
-    var err : [8]u8 = undefined;
-    var i : usize = 0;
-    while (i < 8) {
-        resp[i] = 0;
-        err[i] = 0;
-        i = i + 1;
-    }
-    msg3(cls("NSURLConnection"), sel("sendSynchronousRequest:returningResponse:error:"), req, addr_of(resp[0..8], resp[0..8], 0), addr_of(err[0..8], err[0..8], 0));
-    const r : u64 = get_u64(resp[0..8], 0);
-    if (r == 0) { return 0; }
-    return @as(u32, @intCast(msg0(r, sel("statusCode"))));
 }
 
 /// Hand every stored key to the PTY server on `fd`, each with its number; the count pushed. The numbered
