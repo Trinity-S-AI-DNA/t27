@@ -511,3 +511,24 @@ outdated logic that lives outside `.t27` is abandoned, not extended.
 5. **A claim that `t27b` can host a runtime is verified by running it.** Where
    it cannot yet, the existing host stays as a thin transitional host and the
    gap is recorded as an issue, not hidden.
+
+## Number formats: TNF and the numeric papers (owner, 2026-10-20)
+
+Papers: TNF (Vasilev, 2026-08-11), arXiv:2606.05017 GoldenFloat, arXiv:2606.09686 Golden Ruler. Digests: `specs/numeric/paper_claims.t27`.
+
+**Which format where**
+1. Numeric SSOT is `conformance/FORMAT-SPEC-001.json` + `specs/numeric/gf16.t27` (L6). Never restate a width, bias or range in prose or a second spec; read the spec.
+2. Width rules: GF `E = round((N-1)/phi^2)`, `F = N-1-E`; BNF/TNF `1 + E_t + M = N` (`goldenfloat_family.t27`, `tnf*.t27`). Add a new width by extending the ladder spec, never by copying one.
+3. TNF exponent = `E_t` balanced-ternary trits, offset `3^E_t - 1` is the reserved special row, `e = offset - (3^E_t - 1)/2`. Fixed fields, no regime, no taper. State the budget with every width: nominal `1+E_t+M` or physical `1+ceil(E_t*log2 3)+M` (TNF16 = 19 physical bits). "Wins at equal width" without the budget is forbidden.
+4. On FPGA logic that must be exact and synthesizable use Z[phi] integers, not f64 (t27b refuses f64). Value = pair `(a,b)` for `a + b*phi`; `phi*(a,b) = (b, a+b)`; products reduce with `phi^2 = phi + 1`. Size accumulators from the WORST case: fan-in grows 1 bit per doubling, depth grows 0.694 bit per layer (`specs/igla/race/phi_accumulator_growth.t27`); Z[phi] never saturates, so overflow is silent. Weight path: `specs/igla/race/phi_weights.t27`.
+5. Test exactness with integers only: `phi^(2n) + phi^(-2n) = L_2n`, `S0=2, S1=3, S(n+2)=3 S(n+1) - S(n)` (`specs/numeric/lucas_accumulator.t27`). No rounding model in the loop.
+6. Rounding and specials: the rounding mode is stated in the format spec, never assumed (`paper_claims.t27` rounds printed decimals half-to-even at an exact tie); one reserved special row per format; every new format ships a conformance pack (JSON + SHA-256, anchor vector `phi^2 + 1/phi^2 = 3`) under `conformance/vectors/`; a decoder and its oracle must agree bit for bit before any hardware number is quoted.
+
+**Claim discipline (the referee findings, TNF-FINDINGS-LEDGER.md)**
+7. Decode cost first: the only effect that cleared every noise band was decode-cost separation (6.08x published, 8.93x corrected). Lead with it; report accuracy second.
+8. Never state a ranking margin below the stated resolution of its own measurement (TNF headline 10.2% < 11.4%). Rankings need three seeds (25-37 of 210 pairwise winners flip across five seeds of one configuration).
+9. Every FPGA number names part and package, tool versions, placer, router and seed set. Placer/router choice moved Fmax up to 4.3x and flipped 32 pairwise rankings; a number without them is not a number. Pre-route yosys LUT counts are a lower bound, label them. A different part/package (fbg676 vs the AX7203 fbg484) is not the same measurement.
+10. No superiority claim against posit, takum, OCP-MX or P3109 without a stated workload, sampling prior and budget. Say "depends on the distribution" when it does.
+11. Every correction is dated and kept: errata, retractions and a falsification ledger (`docs/nona-03-manifest/RESEARCH_CLAIMS.md`, FL-xxx). Do not delete a withdrawn claim; mark it in place. Counts that a paper prints (109 formats, clusters) are recomputed in `paper_claims.t27` / `catalog_paper_count.t27`; a misfit is reported, not smoothed.
+12. Hardware claims cover only silicon that exists: the bench is the ALINX AX7203 (`fpga/HARDWARE_SSOT.md`); no die exists for the GoldenFloat paper's withdrawn TTSKY26b submission.
+13. Sampling a range uniformly in binades favors flat-precision formats; disclose the prior (`rng.integers(-38, 39)` was the TNF default).
