@@ -1,0 +1,760 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/session_store.t27 -- the on-disk session manifest of the T27 OS PTY server and what a restart
+; does with it.
+; Owner, 2026-10-19: agents run as real terminals owned by T27 OS and every session comes back after a
+; crash or a reboot (herdr model, see agents.t27).
+; One file per pane under ~/.t27os/sessions, named pane-<id>.rec, holding one line:
+;   v2 <space> <agent> <slot> <state> <sid> <model> <cwd>
+; (a v1 line, the same without <model>, is still read: its pane has no saved model)
+; space, agent, slot and state are decimal numbers (agents.t27 cells and S_* states, windows.t27 spaces);
+; slot is the pane's place in the layout; sid is the agent's own session id, "-" when not known yet; model is
+; the model the pane was started with or switched to (claude --model ...), "-" when none; cwd is
+; the rest of the line and may hold spaces. The server writes the file to pane-<id>.tmp and renames it over
+; pane-<id>.rec on every change, so a crash leaves the old record or the new one, never half of one.
+; On start the server reads every .rec file and, per record, restore_plan() decides: resume with the CLI's
+; own flag and the saved sid, relaunch fresh in the cwd, or skip. The decisions are here; the host loop only
+; reads and writes bytes.
+; Learning the sid: Claude Code's SessionStart hook payload is JSON with "session_id" (json_field reads it);
+; the fallback is the transcript file ~/.claude/projects/<cwd with / and . turned into ->/<uuid>.jsonl
+; (project_dir_name, uuid_from_jsonl). A sid reaches a command line only after sid_ok().
+
+module T27osSessionStore;
+
+use t27os::agents::AGENT_COUNT;
+use t27os::agents::AGENT_BINS;
+use t27os::agents::RESUME_KIND;
+use t27os::agents::RESUME_BY_ID;
+use t27os::agents::RESUME_HISTORY;
+use t27os::agents::RESUME_UNKNOWN;
+use t27os::agents::S_DONE;
+use t27os::agents::R_SKIP;
+use t27os::agents::R_RESUME;
+use t27os::agents::R_RELAUNCH;
+
+/// The resume flag (or subcommand) of each cell, in cell order; empty when none is established.
+pub const RESUME_FLAGS : str = "--resume,resume,--resume,--session,,,--resume,--restore-chat-history,--resume";
+/// A pane that runs a plain shell instead of an agent CLI takes the cell number after the last agent.
+pub const SHELL_CELL : u32 = 9;
+pub const SHELL_BIN : str = "/bin/bash";
+pub const SID_NONE : u8 = 45;
+pub const SID_MAX : usize = 64;
+/// Record fields in the array parse_record fills.
+pub const F_SPACE : usize = 0;
+pub const F_AGENT : usize = 1;
+pub const F_SLOT : usize = 2;
+pub const F_STATE : usize = 3;
+pub const F_SID_AT : usize = 4;
+pub const F_SID_LEN : usize = 5;
+pub const F_CWD_AT : usize = 6;
+pub const F_CWD_LEN : usize = 7;
+pub const F_MODEL_AT : usize = 8;
+pub const F_MODEL_LEN : usize = 9;
+pub const F_COUNT : usize = 10;
+/// The model flag of each cell, in cell order; empty when the CLI takes none we have established.
+pub const MODEL_FLAGS : str = "--model,--model,--model,,,,,--model,";
+pub const MODEL_MAX : usize = 60;
+
+/// Append the decimal digits of v at `at`; returns the position after them.
+pub fn put_dec(out: []u8, at: usize, v: u64) -> usize {
+    var digits : u32 = 1;
+    var t : u64 = v;
+    while (t >= 10) {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    var x : u64 = v;
+    var i : u32 = digits;
+    while (i > 0) {
+        out[at + i - 1] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        i = i - 1;
+    }
+    return at + digits;
+}
+
+/// Append the bytes of s at `at`; returns the position after them.
+pub fn put_bytes(out: []u8, at: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        out[at + i] = s[i];
+        i = i + 1;
+    }
+    return at + s.len;
+}
+
+/// Write the record line of one pane, newline included; returns its length.
+pub fn put_record(out: []u8, space: u32, agent: u32, slot: u32, state: u32, sid: []const u8, model: []const u8, cwd: []const u8) -> usize {
+    var n : usize = put_bytes(out, 0, "v2 ");
+    n = put_dec(out, n, space);
+    out[n] = 32;
+    n = put_dec(out, n + 1, agent);
+    out[n] = 32;
+    n = put_dec(out, n + 1, slot);
+    out[n] = 32;
+    n = put_dec(out, n + 1, state);
+    out[n] = 32;
+    if (sid.len == 0) {
+        out[n + 1] = SID_NONE;
+        n = n + 2;
+    } else {
+        n = put_bytes(out, n + 1, sid);
+    }
+    out[n] = 32;
+    if (model_ok(model)) {
+        n = put_bytes(out, n + 1, model);
+    } else {
+        out[n + 1] = SID_NONE;
+        n = n + 2;
+    }
+    out[n] = 32;
+    n = put_bytes(out, n + 1, cwd);
+    out[n] = 10;
+    return n + 1;
+}
+
+/// Read one decimal number at `at`; its value goes to f[slot] and the position after it comes back,
+/// at when there is no digit (so the caller can tell).
+fn read_dec(line: []const u8, at: usize, f: []u64, slot: usize) -> usize {
+    var i : usize = at;
+    var v : u64 = 0;
+    while (i < line.len and line[i] >= 48 and line[i] <= 57 and i - at < 10) {
+        v = v * 10 + @as(u64, line[i] - 48);
+        i = i + 1;
+    }
+    f[slot] = v;
+    return i;
+}
+
+/// Parse a record line into f (F_* fields); false when the line is not a v1 or v2 record. A v1 line and a
+/// v2 line with model "-" both leave F_MODEL_LEN at 0.
+pub fn parse_record(line: []const u8, f: []u64) -> bool {
+    if (line.len < 12) { return false; }
+    if (line[0] != 118 or line[2] != 32) { return false; }
+    if (line[1] != 49 and line[1] != 50) { return false; }
+    var at : usize = 3;
+    var k : usize = 0;
+    while (k < 4) {
+        const e : usize = read_dec(line, at, f, k);
+        if (e == at or e >= line.len or line[e] != 32) { return false; }
+        at = e + 1;
+        k = k + 1;
+    }
+    var e2 : usize = at;
+    while (e2 < line.len and line[e2] != 32) { e2 = e2 + 1; }
+    if (e2 == at or e2 >= line.len) { return false; }
+    f[F_SID_AT] = at;
+    f[F_SID_LEN] = e2 - at;
+    var cat : usize = e2 + 1;
+    f[F_MODEL_AT] = cat;
+    f[F_MODEL_LEN] = 0;
+    if (line[1] == 50) {
+        var e3 : usize = cat;
+        while (e3 < line.len and line[e3] != 32) { e3 = e3 + 1; }
+        if (e3 == cat or e3 >= line.len) { return false; }
+        if (model_ok(line[cat .. e3])) { f[F_MODEL_LEN] = e3 - cat; }
+        cat = e3 + 1;
+    }
+    var end : usize = line.len;
+    if (line[end - 1] == 10) { end = end - 1; }
+    if (end <= cat) { return false; }
+    f[F_CWD_AT] = cat;
+    f[F_CWD_LEN] = end - cat;
+    if (f[F_AGENT] > AGENT_COUNT) { return false; }
+    return true;
+}
+
+/// A session id is 1..SID_MAX characters of letters, digits and "-": nothing a shell or an argv splitter
+/// would read as more than one word. "-" alone means "not known yet" and is not a sid.
+pub fn sid_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > SID_MAX) { return false; }
+    if (s.len == 1 and s[0] == SID_NONE) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        const alnum : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+        if (!alnum and c != 45) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A model name is 1..MODEL_MAX characters of letters, digits and "-", ".", "_", "[", "]" (claude-opus-5-5,
+/// opus[1m], gpt-5.1). build_command quotes it, so "[" never reaches the shell as a glob. "-" alone means none.
+pub fn model_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > MODEL_MAX) { return false; }
+    if (s.len == 1 and s[0] == SID_NONE) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        const alnum : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+        const mark : bool = c == 45 or c == 46 or c == 95 or c == 91 or c == 93;
+        if (!alnum and !mark) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// " <flag> '<model>'" after a command line of n bytes, when the cell has a model flag and the model is
+/// one model_ok() passes; n unchanged otherwise.
+pub fn add_model(agent: u32, model: []const u8, out: []u8, n: usize) -> usize {
+    if (agent >= AGENT_COUNT or !model_ok(model)) { return n; }
+    var flag : [16]u8 = undefined;
+    const fl : usize = csv_field(MODEL_FLAGS, agent, flag[0..16]);
+    if (fl == 0) { return n; }
+    out[n] = 32;
+    var m : usize = put_bytes(out, n + 1, flag[0..fl]);
+    out[m] = 32;
+    out[m + 1] = 39;
+    m = put_bytes(out, m + 2, model);
+    out[m] = 39;
+    return m + 1;
+}
+
+/// What restart does with a saved pane: skip a finished one, resume by the CLI's flag when the session is
+/// known, relaunch fresh in the cwd otherwise.
+pub fn restore_plan(agent: u32, state: u32, sid: []const u8) -> u32 {
+    if (state == S_DONE) { return R_SKIP; }
+    if (agent == SHELL_CELL) { return R_RELAUNCH; }
+    if (agent > SHELL_CELL) { return R_SKIP; }
+    const kind : u32 = RESUME_KIND[agent];
+    if (kind == RESUME_UNKNOWN) { return R_RELAUNCH; }
+    if (kind == RESUME_HISTORY) { return R_RESUME; }
+    if (sid_ok(sid)) { return R_RESUME; }
+    return R_RELAUNCH;
+}
+
+/// Copy the k-th comma-separated field of list into out; returns its length (0 when k is out of range).
+pub fn csv_field(list: []const u8, k: u32, out: []u8) -> usize {
+    var idx : u32 = 0;
+    var i : usize = 0;
+    var n : usize = 0;
+    while (i < list.len) {
+        if (list[i] == 44) {
+            idx = idx + 1;
+        } else if (idx == k) {
+            out[n] = list[i];
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The command line of a pane: the binary, then (on R_RESUME) the resume flag and the sid, then the model flag
+/// and the quoted model when there is one (add_model), so a resumed or relaunched pane keeps its model. Words are
+/// separated by one space; the server runs the line through /bin/sh -c (argv_text). Returns the length.
+pub fn build_command(agent: u32, plan: u32, sid: []const u8, model: []const u8, out: []u8) -> usize {
+    if (agent == SHELL_CELL) { return put_bytes(out, 0, SHELL_BIN); }
+    var n : usize = csv_field(AGENT_BINS, agent, out);
+    if (plan != R_RESUME or agent >= AGENT_COUNT) { return add_model(agent, model, out, n); }
+    var flag : [32]u8 = undefined;
+    const fl : usize = csv_field(RESUME_FLAGS, agent, flag[0..32]);
+    if (fl == 0) { return add_model(agent, model, out, n); }
+    out[n] = 32;
+    n = n + 1;
+    var i : usize = 0;
+    while (i < fl) {
+        out[n + i] = flag[i];
+        i = i + 1;
+    }
+    n = n + fl;
+    if (RESUME_KIND[agent] == RESUME_BY_ID) {
+        out[n] = 32;
+        n = put_bytes(out, n + 1, sid);
+    }
+    return add_model(agent, model, out, n);
+}
+
+/// The index just past the first occurrence of needle in hay at or after `from`; hay.len + 1 when absent.
+fn find_after(hay: []const u8, needle: []const u8, from: usize) -> usize {
+    if (needle.len == 0) { return hay.len + 1; }
+    var i : usize = from;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        while (j < needle.len and hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.len) { return i + needle.len; }
+        i = i + 1;
+    }
+    return hay.len + 1;
+}
+
+/// The value of a string field in a flat JSON object, as (at, len) in f[0], f[1]: the hook payload
+/// {"session_id":"..."}. Escapes are not interpreted; a value holding a backslash is refused.
+pub fn json_field(src: []const u8, key: []const u8, f: []u64) -> bool {
+    var pat : [40]u8 = undefined;
+    if (key.len > 30) { return false; }
+    pat[0] = 34;
+    var n : usize = put_bytes(pat[0..40], 1, key);
+    pat[n] = 34;
+    pat[n + 1] = 58;
+    n = n + 2;
+    var at : usize = find_after(src, pat[0..n], 0);
+    if (at > src.len) { return false; }
+    while (at < src.len and src[at] == 32) { at = at + 1; }
+    if (at >= src.len or src[at] != 34) { return false; }
+    at = at + 1;
+    var e : usize = at;
+    while (e < src.len and src[e] != 34) {
+        if (src[e] == 92) { return false; }
+        e = e + 1;
+    }
+    if (e >= src.len) { return false; }
+    f[0] = at;
+    f[1] = e - at;
+    return true;
+}
+
+/// Claude Code's project directory name for a cwd: "/" and "." become "-".
+pub fn project_dir_name(cwd: []const u8, out: []u8) -> usize {
+    var i : usize = 0;
+    while (i < cwd.len) {
+        var c : u8 = cwd[i];
+        if (c == 47 or c == 46) { c = 45; }
+        out[i] = c;
+        i = i + 1;
+    }
+    return cwd.len;
+}
+
+/// The transcript of a Claude Code session: <home>/.claude/projects/<project_dir_name(cwd)>/<sid>.jsonl,
+/// NUL added for the open call. Returns the length without the NUL.
+pub fn transcript_path(out: []u8, home: []const u8, cwd: []const u8, sid: []const u8) -> usize {
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.claude/projects/");
+    n = n + project_dir_name(cwd, out[n .. out.len]);
+    out[n] = 47;
+    n = put_bytes(out, n + 1, sid);
+    n = put_bytes(out, n, ".jsonl");
+    out[n] = 0;
+    return n;
+}
+
+/// The last model a transcript chunk names: every assistant line of a Claude Code transcript carries
+/// "model":"<id>", so the last one is the model the session ran on most recently, after any /model switch
+/// (no hook reports a switch). As (at, len) in f[0], f[1]; values that fail model_ok() (<synthetic>) are
+/// passed over. false when the chunk names none.
+pub fn last_model(buf: []const u8, f: []u64) -> bool {
+    const key : str = "\"model\":\"";
+    var found : bool = false;
+    var i : usize = 0;
+    while (i + key.len <= buf.len) {
+        var j : usize = 0;
+        while (j < key.len and buf[i + j] == key[j]) { j = j + 1; }
+        if (j == key.len) {
+            const at : usize = i + key.len;
+            var e : usize = at;
+            while (e < buf.len and buf[e] != 34 and e - at <= MODEL_MAX) { e = e + 1; }
+            if (e < buf.len and buf[e] == 34 and model_ok(buf[at .. e])) {
+                f[0] = at;
+                f[1] = e - at;
+                found = true;
+            }
+            i = at;
+        } else {
+            i = i + 1;
+        }
+    }
+    return found;
+}
+
+fn is_hex(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102);
+}
+
+/// True when name is "<uuid>.jsonl": 36 characters with "-" at 8, 13, 18 and 23, then ".jsonl".
+pub fn uuid_from_jsonl(name: []const u8) -> bool {
+    if (name.len != 42) { return false; }
+    var i : usize = 0;
+    while (i < 36) {
+        const dash : bool = i == 8 or i == 13 or i == 18 or i == 23;
+        if (dash and name[i] != 45) { return false; }
+        if (!dash and !is_hex(name[i])) { return false; }
+        i = i + 1;
+    }
+    return name[36] == 46 and name[37] == 106 and name[38] == 115 and name[39] == 111 and name[40] == 110 and name[41] == 108;
+}
+
+/// The path of pane id's record: <home>/.t27os/sessions/pane-<id>.rec, or .tmp when tmp is true.
+pub fn record_path(out: []u8, home: []const u8, id: u32, tmp: bool) -> usize {
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.t27os/sessions/pane-");
+    n = put_dec(out, n, id);
+    if (tmp) { return put_bytes(out, n, ".tmp"); }
+    return put_bytes(out, n, ".rec");
+}
+
+/// The pane id of a file name "pane-<id>.rec"; 4294967295 when it is not one (a .tmp left by a crash).
+pub fn pane_id_from_name(name: []const u8) -> u32 {
+    if (name.len < 10) { return 4294967295; }
+    if (name[0] != 112 or name[1] != 97 or name[2] != 110 or name[3] != 101 or name[4] != 45) { return 4294967295; }
+    const t : usize = name.len - 4;
+    if (name[t] != 46 or name[t + 1] != 114 or name[t + 2] != 101 or name[t + 3] != 99) { return 4294967295; }
+    var v : u64 = 0;
+    var i : usize = 5;
+    while (i < t) {
+        if (name[i] < 48 or name[i] > 57) { return 4294967295; }
+        v = v * 10 + @as(u64, name[i] - 48);
+        i = i + 1;
+    }
+    if (t == 5 or v > 9999) { return 4294967295; }
+    return @as(u32, @intCast(v));
+}
+
+/// The Claude Code hook events the server listens to, comma separated.
+pub const HOOK_EVENTS : str = "SessionStart,UserPromptSubmit,Notification,Stop";
+
+fn hex_digit(v: u32) -> u8 {
+    if (v < 10) { return @as(u8, @intCast(48 + v)); }
+    return @as(u8, @intCast(87 + v));
+}
+
+/// Format 16 random bytes as a version 4 UUID (36 characters, lowercase) in out; returns 36.
+pub fn uuid_text(rnd: []const u8, out: []u8) -> usize {
+    var at : usize = 0;
+    var i : usize = 0;
+    while (i < 16) {
+        var b : u32 = @as(u32, rnd[i]);
+        if (i == 6) { b = (b & 15) + 64; }
+        if (i == 8) { b = (b & 63) + 128; }
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            out[at] = 45;
+            at = at + 1;
+        }
+        out[at] = hex_digit(b / 16);
+        out[at + 1] = hex_digit(b % 16);
+        at = at + 2;
+        i = i + 1;
+    }
+    return at;
+}
+
+/// The command line of a pane started fresh: Claude Code is given its session id up front
+/// (claude --session-id <uuid>), so the manifest knows it without waiting for a hook; every other agent
+/// starts bare and learns its id later, if ever.
+pub fn fresh_command(agent: u32, sid: []const u8, model: []const u8, out: []u8) -> usize {
+    if (agent == 0 and sid_ok(sid)) {
+        var n : usize = put_bytes(out, 0, "claude --session-id ");
+        n = put_bytes(out, n, sid);
+        return add_model(agent, model, out, n);
+    }
+    return build_command(agent, R_RELAUNCH, sid, model, out);
+}
+
+/// The Claude Code settings JSON that sends the four hook events to the server's own binary: each hook runs
+/// `T27OS_HOOK=1 <bin>`, which reads the payload on stdin and forwards it to the socket. false when bin
+/// holds a character that would end the JSON string.
+pub fn hooks_json(out: []u8, bin: []const u8, f: []u64) -> bool {
+    var i : usize = 0;
+    while (i < bin.len) {
+        if (bin[i] == 34 or bin[i] == 92 or bin[i] < 32) { return false; }
+        i = i + 1;
+    }
+    var n : usize = put_bytes(out, 0, "{\"hooks\":{");
+    var ev : [24]u8 = undefined;
+    var k : u32 = 0;
+    while (k < 4) {
+        const l : usize = csv_field(HOOK_EVENTS, k, ev[0..24]);
+        if (k > 0) { out[n] = 44; n = n + 1; }
+        out[n] = 34;
+        n = put_bytes(out, n + 1, ev[0..l]);
+        n = put_bytes(out, n, "\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"T27OS_HOOK=1 ");
+        n = put_bytes(out, n, bin);
+        n = put_bytes(out, n, "\"}]}]");
+        k = k + 1;
+    }
+    n = put_bytes(out, n, "}}");
+    f[0] = n;
+    return true;
+}
+
+test a_record_round_trips {
+    var buf : [200]u8 = undefined;
+    var f : [10]u64 = undefined;
+    var agent : u32 = 0;
+    while (agent < AGENT_COUNT) {
+        const n : usize = put_record(buf[0..200], 2, agent, 7, 3, "5f1c-9a", "opus[1m]", "/Users/x/my repo");
+        assert parse_record(buf[0..n], f[0..10]);
+        assert f[F_SPACE] == 2;
+        assert f[F_AGENT] == agent;
+        assert f[F_SLOT] == 7;
+        assert f[F_STATE] == 3;
+        assert f[F_SID_LEN] == 7;
+        assert f[F_CWD_LEN] == 16;
+        assert buf[f[F_CWD_AT] + 3] == 101;
+        assert f[F_MODEL_LEN] == 8;
+        assert buf[f[F_MODEL_AT]] == 111 and buf[f[F_MODEL_AT] + 7] == 93;
+        agent = agent + 1;
+    }
+}
+
+test the_record_line_is_exact {
+    var buf : [100]u8 = undefined;
+    var sp : u32 = 12;
+    const n : usize = put_record(buf[0..100], sp, 0, 1, 3, "abc", "", "/t");
+    assert n == 21;
+    assert buf[0] == 118 and buf[1] == 50 and buf[2] == 32;
+    assert buf[3] == 49 and buf[4] == 50 and buf[5] == 32;
+    assert buf[n - 1] == 10;
+    const m : usize = put_record(buf[0..100], 0, 1, 0, 0, "", "", "/t");
+    assert buf[m - 5] == SID_NONE;
+    assert buf[m - 7] == SID_NONE;
+}
+
+test a_damaged_record_is_refused {
+    var buf : [100]u8 = undefined;
+    var f : [10]u64 = undefined;
+    var n : usize = put_record(buf[0..100], 1, 0, 0, 1, "abc", "", "/t");
+    assert parse_record(buf[0..n], f[0..10]);
+    buf[1] = 51;
+    assert parse_record(buf[0..n], f[0..10]) == false;
+    buf[1] = 50;
+    assert parse_record(buf[0..8], f[0..10]) == false;
+    n = put_record(buf[0..100], 1, 99, 0, 1, "abc", "", "/t");
+    assert parse_record(buf[0..n], f[0..10]) == false;
+    n = put_record(buf[0..100], 1, 0, 0, 1, "abc", "", "/t");
+    buf[3] = 120;
+    assert parse_record(buf[0..n], f[0..10]) == false;
+}
+
+test a_v1_record_still_parses_without_a_model {
+    // the line a pre-v2 server wrote: no model field, the cwd still holds its space
+    const v1 : str = "v1 2 0 7 3 5f1c-9a /Users/x/my repo\n";
+    var f : [10]u64 = undefined;
+    assert parse_record(v1, f[0..10]);
+    assert f[F_SPACE] == 2;
+    assert f[F_SLOT] == 7;
+    assert f[F_SID_LEN] == 7;
+    assert f[F_MODEL_LEN] == 0;
+    assert f[F_CWD_LEN] == 16;
+    assert f[F_CWD_AT] == 19;
+    // the same pane written back is v2, with model "-", and reads the same
+    var buf : [100]u8 = undefined;
+    const n : usize = put_record(buf[0..100], 2, 0, 7, 3, "5f1c-9a", "", "/Users/x/my repo");
+    assert n == 38;
+    assert buf[1] == 50;
+    assert parse_record(buf[0..n], f[0..10]);
+    assert f[F_MODEL_LEN] == 0;
+    assert f[F_CWD_LEN] == 16;
+    // a v2 line whose model would not pass model_ok is read as having none
+    const bad : str = "v2 2 0 7 3 5f1c-9a a$b /t\n";
+    assert parse_record(bad, f[0..10]);
+    assert f[F_MODEL_LEN] == 0;
+    // a v2 line cut before its cwd is refused
+    assert parse_record("v2 2 0 7 3 5f1c-9a opus\n", f[0..10]) == false;
+}
+
+test only_plain_model_names_reach_a_command_line {
+    assert model_ok("claude-opus-5-5");
+    assert model_ok("opus[1m]");
+    assert model_ok("gpt-5.1_mini");
+    assert model_ok("-") == false;
+    assert model_ok("") == false;
+    assert model_ok("a b") == false;
+    assert model_ok("a'b") == false;
+    assert model_ok("$(x)") == false;
+    assert model_ok("a;b") == false;
+}
+
+test only_plain_ids_reach_a_command_line {
+    assert sid_ok("5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11");
+    assert sid_ok("-") == false;
+    assert sid_ok("") == false;
+    assert sid_ok("a b") == false;
+    assert sid_ok("a;b") == false;
+    assert sid_ok("$(x)") == false;
+    var long : [70]u8 = undefined;
+    var i : usize = 0;
+    while (i < 70) { long[i] = 97; i = i + 1; }
+    assert sid_ok(long[0..64]);
+    assert sid_ok(long[0..65]) == false;
+}
+
+test restore_resumes_by_the_cli_flag_or_relaunches {
+    var a : u32 = 0;
+    // Claude Code with a known session id is resumed
+    assert restore_plan(a, 3, "5f1c-9a") == R_RESUME;
+    // the same pane without an id starts fresh in its cwd
+    assert restore_plan(a, 3, "-") == R_RELAUNCH;
+    assert restore_plan(a, 1, "") == R_RELAUNCH;
+    // a finished pane is skipped
+    assert restore_plan(a, S_DONE, "5f1c-9a") == R_SKIP;
+    // aider restores its chat history and needs no id
+    a = 7;
+    assert restore_plan(a, 1, "") == R_RESUME;
+    // crush has no established flag: relaunched
+    a = 5;
+    assert restore_plan(a, 1, "5f1c-9a") == R_RELAUNCH;
+    // a plain shell pane has no session to resume: it starts again in its cwd
+    a = SHELL_CELL;
+    assert restore_plan(a, 1, "-") == R_RELAUNCH;
+    assert restore_plan(a, S_DONE, "-") == R_SKIP;
+    a = SHELL_CELL + 1;
+    assert restore_plan(a, 1, "5f1c-9a") == R_SKIP;
+}
+
+test the_command_line_carries_the_flag {
+    var out : [120]u8 = undefined;
+    var a : u32 = 0;
+    var n : usize = build_command(a, R_RESUME, "abc-1", "", out[0..120]);
+    // claude --resume abc-1
+    assert n == 21;
+    assert out[0] == 99 and out[6] == 32 and out[7] == 45 and out[8] == 45;
+    assert out[n - 1] == 49;
+    n = build_command(a, R_RELAUNCH, "abc-1", "", out[0..120]);
+    assert n == 6;
+    a = 1;
+    n = build_command(a, R_RESUME, "abc-1", "", out[0..120]);
+    // codex resume abc-1
+    assert n == 18;
+    assert out[6] == 114;
+    a = 7;
+    n = build_command(a, R_RESUME, "", "", out[0..120]);
+    // aider --restore-chat-history
+    assert n == 28;
+    a = 5;
+    n = build_command(a, R_RESUME, "abc-1", "", out[0..120]);
+    assert n == 5;
+}
+
+test resume_and_relaunch_keep_the_model {
+    var out : [160]u8 = undefined;
+    var a : u32 = 0;
+    // claude --resume abc-1 --model 'opus'
+    var n : usize = build_command(a, R_RESUME, "abc-1", "opus", out[0..160]);
+    assert n == 36;
+    assert out[22] == 45 and out[24] == 109 and out[30] == 39 and out[n - 1] == 39;
+    // claude --model 'opus[1m]'
+    n = build_command(a, R_RELAUNCH, "abc-1", "opus[1m]", out[0..160]);
+    assert n == 25;
+    assert out[15] == 39 and out[20] == 91;
+    // a model that fails model_ok is left off
+    assert build_command(a, R_RESUME, "abc-1", "a b", out[0..160]) == 21;
+    assert build_command(a, R_RESUME, "abc-1", "-", out[0..160]) == 21;
+    // claude --session-id <uuid> --model 'opus'
+    n = fresh_command(a, "5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11", "opus", out[0..160]);
+    assert n == 20 + 36 + 15;
+    assert out[57] == 45 and out[58] == 45 and out[59] == 109;
+    // aider --restore-chat-history --model 'opus'
+    a = 7;
+    assert build_command(a, R_RESUME, "", "opus", out[0..160]) == 43;
+    // codex resume abc-1 --model 'opus'
+    a = 1;
+    assert build_command(a, R_RESUME, "abc-1", "opus", out[0..160]) == 33;
+    // crush has no established model flag; a shell pane has no model
+    a = 5;
+    assert build_command(a, R_RESUME, "abc-1", "opus", out[0..160]) == 5;
+    assert build_command(SHELL_CELL, R_RELAUNCH, "-", "opus", out[0..160]) == 9;
+}
+
+test the_transcript_gives_the_last_model {
+    var f : [2]u64 = undefined;
+    const t : str = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-5-5\"}}\n{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5-5\"}}\n{\"message\":{\"model\":\"<synthetic>\"}}\n";
+    assert last_model(t, f[0..2]);
+    assert f[1] == 15;
+    assert t[@as(usize, @intCast(f[0])) + 7] == 111;
+    assert last_model("{\"type\":\"user\"}", f[0..2]) == false;
+    // a value cut at the end of the chunk is not taken
+    assert last_model("\"model\":\"claude-op", f[0..2]) == false;
+    var out : [120]u8 = undefined;
+    const n : usize = transcript_path(out[0..120], "/h", "/Users/x/my.repo", "abc-1");
+    // /h/.claude/projects/-Users-x-my-repo/abc-1.jsonl
+    assert n == 2 + 18 + 16 + 1 + 5 + 6;
+    assert out[20] == 45 and out[n] == 0;
+}
+
+test csv_fields_are_picked_by_position {
+    var out : [40]u8 = undefined;
+    var k : u32 = 0;
+    assert csv_field(RESUME_FLAGS, k, out[0..40]) == 8;
+    k = 4;
+    assert csv_field(RESUME_FLAGS, k, out[0..40]) == 0;
+    k = 7;
+    assert csv_field(RESUME_FLAGS, k, out[0..40]) == 22;
+    k = 20;
+    assert csv_field(RESUME_FLAGS, k, out[0..40]) == 0;
+}
+
+test the_hook_payload_gives_the_session_id {
+    var f : [2]u64 = undefined;
+    var src : [100]u8 = undefined;
+    const n : usize = put_bytes(src[0..100], 0, "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"5f1c-9a\",\"cwd\":\"/t\"}");
+    assert json_field(src[0..n], "session_id", f[0..2]);
+    assert f[1] == 7;
+    assert src[f[0]] == 53;
+    assert json_field(src[0..n], "cwd", f[0..2]);
+    assert f[1] == 2;
+    assert json_field(src[0..n], "missing", f[0..2]) == false;
+    const m : usize = put_bytes(src[0..100], 0, "{\"session_id\":\"a\\\"b\"}");
+    assert json_field(src[0..m], "session_id", f[0..2]) == false;
+}
+
+test the_transcript_name_is_the_fallback {
+    var out : [60]u8 = undefined;
+    var p : [60]u8 = undefined;
+    const n : usize = project_dir_name("/Users/alice1/t27/.claude", out[0..60]);
+    assert n == 25;
+    assert out[0] == 45 and out[6] == 45 and out[13] == 45 and out[17] == 45 and out[18] == 45;
+    const m : usize = put_bytes(p[0..60], 0, "5f1c2c6e-9a41-4f0b-8c5d-0d3e5a7b9c11.jsonl");
+    assert uuid_from_jsonl(p[0..m]);
+    p[8] = 120;
+    assert uuid_from_jsonl(p[0..m]) == false;
+    p[8] = 45;
+    p[0] = 71;
+    assert uuid_from_jsonl(p[0..m]) == false;
+    p[0] = 53;
+    assert uuid_from_jsonl(p[0..m - 1]) == false;
+}
+
+test record_paths_and_names_agree {
+    var out : [100]u8 = undefined;
+    var id : u32 = 0;
+    while (id < 12) {
+        const n : usize = record_path(out[0..100], "/h", id, false);
+        var from : usize = 0;
+        while (from < n and !(out[from] == 112 and out[from + 1] == 97 and out[from + 2] == 110 and out[from + 3] == 101)) { from = from + 1; }
+        assert pane_id_from_name(out[from..n]) == id;
+        id = id + 1;
+    }
+    const t : usize = record_path(out[0..100], "/h", 7, true);
+    assert pane_id_from_name(out[t - 10..t]) == 4294967295;
+}
+
+test a_fresh_claude_pane_carries_its_session_id {
+    var rnd : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 16) { rnd[i] = @as(u8, @intCast(i * 17)); i = i + 1; }
+    var id : [40]u8 = undefined;
+    assert uuid_text(rnd[0..16], id[0..40]) == 36;
+    var name : [60]u8 = undefined;
+    const m : usize = put_bytes(name[0..60], 0, id[0..36]);
+    const m2 : usize = put_bytes(name[0..60], m, ".jsonl");
+    assert uuid_from_jsonl(name[0..m2]);
+    // version 4 and the RFC 4122 variant
+    assert id[14] == 52;
+    assert id[19] == 56 or id[19] == 57 or id[19] == 97 or id[19] == 98;
+    assert sid_ok(id[0..36]);
+    var out : [120]u8 = undefined;
+    const n : usize = fresh_command(0, id[0..36], "", out[0..120]);
+    assert n == 20 + 36;
+    assert out[7] == 45 and out[8] == 45 and out[9] == 115;
+    // anything else starts bare
+    assert fresh_command(1, id[0..36], "", out[0..120]) == 5;
+    assert fresh_command(SHELL_CELL, "-", "", out[0..120]) == 9;
+    assert fresh_command(0, "bad id", "", out[0..120]) == 6;
+}
+
+test the_hook_settings_are_json_that_names_the_binary {
+    var out : [600]u8 = undefined;
+    var f : [1]u64 = undefined;
+    assert hooks_json(out[0..600], "/Users/x/t27os-pty", f[0..1]);
+    const n : usize = f[0];
+    assert out[0] == 123 and out[n - 1] == 125 and out[n - 2] == 125;
+    assert find_after(out[0..n], "\"SessionStart\":[", 0) <= n;
+    assert find_after(out[0..n], "\"UserPromptSubmit\":[", 0) <= n;
+    assert find_after(out[0..n], "\"Notification\":[", 0) <= n;
+    assert find_after(out[0..n], "\"Stop\":[", 0) <= n;
+    assert find_after(out[0..n], "T27OS_HOOK=1 /Users/x/t27os-pty\"", 0) <= n;
+    assert find_after(out[0..n], "\"Idle\":[", 0) > n;
+    assert hooks_json(out[0..600], "/a\"b", f[0..1]) == false;
+    assert hooks_json(out[0..600], "/a\\b", f[0..1]) == false;
+}
