@@ -97,11 +97,13 @@ use t27os::keys::PROFILE_PROVIDER;
 use t27os::keys::PR_NONE;
 use t27os::keys::PR_ZAI;
 use t27os::keys::PR_ANTHROPIC;
+use t27os::keys::PR_OPENROUTER;
 use t27os::keys::MAX_FAILOVERS;
 use t27os::keys::agent_uses;
 use t27os::keys::spawn_mask;
 use t27os::keys::P_ZAI;
 use t27os::keys::P_ANTHROPIC;
+use t27os::keys::P_OPENROUTER;
 use t27os::keys::P_OPENAI;
 use t27os::keys::FC_OTHER;
 use t27os::keys::FC_LOGIN_REJECTED;
@@ -126,6 +128,12 @@ use t27os::keys::FA_KEEP;
 use t27os::keys::FA_RESPAWN_NEXT;
 use t27os::keys::FA_RESPAWN_KEY;
 use t27os::keys::FA_GIVE_UP;
+use t27os::keys::FA_RESPAWN_MODEL;
+use t27os::keys::fo_next_model;
+use t27os::keys::model_for_profile;
+use t27os::keys::tier_model_step;
+use t27os::keys::TI_DEFAULT;
+use t27os::keys::profile_var_text_step;
 use t27os::keys::setkey_provider;
 use t27os::keys::setkey_number;
 use t27os::editors::TERM_COUNT;
@@ -175,6 +183,10 @@ pub const G_START : usize = 227;
 /// The millisecond the server last read the Keychain itself (pty_server load_keys); 0 = never. Word 228 was
 /// free: G_START is 227 and the connection tables begin at G_CFD.
 pub const G_KLOAD : usize = 228;
+/// The model step of every pane (keys.t27 MODEL_STEPS, tier_model_step), one nibble per pane, pane i at
+/// 16^i: 0 = the default model of the pane's profile, 1 = the second model of its tier (gHashTag/t27#11284).
+/// Word 229 was free; the connection tables begin at G_CFD.
+pub const G_MSTEP : usize = 229;
 pub const G_KLAST : usize = 256;
 pub const G_KREST : usize = 328;
 pub const G_PANEK : usize = 400;
@@ -469,8 +481,20 @@ pub fn key_slot(p: u32, k: u32) -> usize {
     return O_KEYS + key_index(p, k) * KEY_CAP;
 }
 
-/// A pane that has chosen nothing: no keys, no profile, no failures, nothing to skip, nothing waiting.
+/// The model step of pane i (0 = the default model of its profile).
+pub fn pane_mstep_get(st: []const u64, i: usize) -> u32 {
+    return @as(u32, @intCast(st[G_MSTEP] / pow16(@as(u32, @intCast(i))) % 16));
+}
+
+pub fn pane_mstep_set(st: []u64, i: usize, v: u32) -> void {
+    const m : u64 = pow16(@as(u32, @intCast(i)));
+    st[G_MSTEP] = st[G_MSTEP] - @as(u64, pane_mstep_get(st, i)) * m + @as(u64, v) * m;
+}
+
+/// A pane that has chosen nothing: no keys, no profile, no failures, nothing to skip, nothing waiting, and the
+/// default model of its tier (a new pane, and a pane restored from its record, start on it).
 pub fn pane_keys_reset(st: []u64, i: usize) -> void {
+    pane_mstep_set(st, i, 0);
     const pk : usize = G_PANEK + i * PK;
     st[pk + PK_KEYS] = 0;
     st[pk + PK_PROF] = PK_UNSET;
@@ -546,6 +570,17 @@ pub fn key_pick(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
 pub fn key_pick_free(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
     const at : usize = key_index(p, 0);
     return rotate_pick_except(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
+}
+
+/// Every key of provider p is free again: a rest was earned on the model a pane ran, and the next model of the
+/// tier answers on its own (z.ai: the same key that is overloaded on glm-4.7-flash answers glm-4.5-flash).
+/// A slot that holds no key stays empty.
+pub fn key_rests_lift(st: []u64, p: u32) -> void {
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if (key_present(st, p, k)) { st[G_KREST + key_index(p, k)] = 0; }
+        k = k + 1;
+    }
 }
 
 pub fn key_used(st: []u64, p: u32, k: u32, now_ms: u64) -> void {
@@ -638,11 +673,24 @@ pub fn plan_pane_keys(st: []u64, i: usize, a: u32, now_ms: u64) -> void {
     }
 }
 
+/// How long a give-up leaves the pane's screen unread: at least GIVEUP_QUIET_MS, and at least as long as the
+/// failed key rests (keys.t27 key_rest_after: ten minutes for an empty account, an hour for a rejected key).
+/// Until a rest ends there is no key to move to, so reading the same error row again would only write the
+/// same why line again: the give-up is said once.
+pub fn giveup_quiet_ms(class: u32) -> u64 {
+    const rest : u64 = key_rest_after(class) * 1000;
+    if (rest > GIVEUP_QUIET_MS) { return rest; }
+    return GIVEUP_QUIET_MS;
+}
+
 /// The failover for pane i whose screen showed failure `class` at `now_ms`. The key the pane used rests by the
 /// kind of failure (keys.t27 key_rest_after), for every pane, not just this one. fo_action decides; on a respawn
 /// the pane's profile, bad mask, failover count and key to skip are set for plan_pane_keys, and the why line
 /// (keys.t27 fo_why, 128 bytes are enough) goes to `why` with its length in wl[0]. After a give-up the screen
-/// is not read again for GIVEUP_QUIET_MS. Returns the action; FA_RESPAWN_* means "stop the process, launch again".
+/// is not read again for giveup_quiet_ms (never retrying a key that rests). Returns the action; FA_RESPAWN_*
+/// means "stop the process, launch again": FA_RESPAWN_KEY on the next key of the provider (the failed one
+/// skipped), FA_RESPAWN_MODEL on the next model of the tier with every key free again (no key was left on this
+/// model, fo_next_model), FA_RESPAWN_NEXT on the next profile of the chain (model step 0 again).
 pub fn plan_failover(st: []u64, i: usize, class: u32, now_ms: u64, why: []u8, wl: []u64) -> u32 {
     const pk : usize = G_PANEK + i * PK;
     var pr : u32 = PR_NONE;
@@ -660,23 +708,47 @@ pub fn plan_failover(st: []u64, i: usize, class: u32, now_ms: u64, why: []u8, wl
         if (cur < MAX_KEYS and rest > 0) { key_rest(st, prov, cur, now_ms / 1000 + rest); }
         alt = key_pick_free(st, prov, cur, now_ms) != MAX_KEYS;
     }
-    const act : u32 = fo_action(class, pr, stored, bad, done, alt);
+    const step : u32 = pane_mstep_get(st, i);
+    var act : u32 = fo_action(class, pr, stored, bad, done, alt);
+    if (fo_next_model(class, pr, step, done, alt)) { act = FA_RESPAWN_MODEL; }
     var nxt : u32 = PR_NONE;
     if (act == FA_RESPAWN_KEY) {
         nxt = pr;
         st[pk + PK_SKIP] = @as(u64, cur) + 1;
     }
+    if (act == FA_RESPAWN_MODEL) {
+        nxt = pr;
+        pane_mstep_set(st, i, step + 1);
+        key_rests_lift(st, PROFILE_PROVIDER[pr]);
+    }
     if (act == FA_RESPAWN_NEXT) {
         nxt = fo_target(class, pr, stored, bad, done, alt);
         st[pk + PK_BAD] = @as(u64, fo_bad(class, pr, bad));
+        pane_mstep_set(st, i, 0);
     }
-    if (act == FA_RESPAWN_KEY or act == FA_RESPAWN_NEXT) {
+    if (act == FA_RESPAWN_KEY or act == FA_RESPAWN_NEXT or act == FA_RESPAWN_MODEL) {
         st[pk + PK_PROF] = @as(u64, nxt);
         st[pk + PK_DONE] = @as(u64, done) + 1;
     }
-    if (act == FA_GIVE_UP) { st[pk + PK_STOP] = now_ms + GIVEUP_QUIET_MS; }
+    if (act == FA_GIVE_UP) { st[pk + PK_STOP] = now_ms + giveup_quiet_ms(class); }
     wl[0] = @as(u64, fo_why(class, pr, act, nxt, done, why));
     return act;
+}
+
+/// The model pane i (agent a) starts with, written into out (64 bytes are enough); 0 = pass no model. Call it
+/// after plan_pane_keys, which chose the pane's profile. A pane that is restored from its record, started
+/// again after a failover, or relaunched after a resume that died gets the model a fresh spawn of its
+/// profile computes (keys.t27 model_for_profile at the pane's model step), never the one its record holds: the
+/// record may name a model the provider does not serve to these keys (glm-5.2 answers 1113 on all of them),
+/// and a model of the profile it just left has no place on the next one. `first` is the first start of a
+/// SPAWN, whose payload may name a model on purpose; that one, and the model of every agent but the claude
+/// cell (no profile), stay as they are.
+pub fn launch_model(st: []const u64, i: usize, a: u32, first: bool, saved: []const u8, out: []u8) -> usize {
+    if (profile_agent(a) == false or first) { return put_bytes(out, 0, saved); }
+    var pr : u32 = PR_NONE;
+    const w : u64 = st[G_PANEK + i * PK + PK_PROF];
+    if (w < @as(u64, PROFILE_COUNT)) { pr = @as(u32, @intCast(w)); }
+    return model_for_profile(pr, pane_mstep_get(st, i), saved, out);
 }
 
 // ---- reading a pane's screen: plain text lines out of terminal bytes ----
@@ -1231,6 +1303,9 @@ test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
     assert G_START > G_BINLEN;
     assert G_KLOAD > G_START;
     assert G_KLOAD < G_CFD;
+    assert G_MSTEP > G_KLOAD;
+    assert G_MSTEP < G_CFD;
+    assert MAX_PANES <= 16;
     assert 16 * PF <= G_LISTEN;
     assert key_slot(0, 0) == O_KEYS;
     assert key_slot(4, 2) == O_KEYS + (4 * 8 + 2) * KEY_CAP;
@@ -1359,7 +1434,7 @@ test an_overloaded_key_swaps_to_the_next_key_rests_and_is_passed_over_by_other_p
     assert st[G_KREST + 34] == 1011 + 30;
 }
 
-test when_every_z_ai_key_is_overloaded_the_pane_moves_to_the_next_profile_then_gives_up {
+test when_every_z_ai_key_is_overloaded_the_pane_takes_the_next_model_then_the_next_profile_then_gives_up {
     var st : [512]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
@@ -1374,37 +1449,59 @@ test when_every_z_ai_key_is_overloaded_the_pane_moves_to_the_next_profile_then_g
     assert a == FA_RESPAWN_KEY;
     plan_pane_keys(st[0..512], 0, 0, 1002500);
     assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
-    // the third key is overloaded too and the other two still rest: next profile, z.ai marked bad
+    // the third key is overloaded too and the other two still rest: no key is left on the first model, so
+    // the pane takes the second model of the tier, and every key is free again for it
     a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1003000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_MODEL;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    assert st[G_PANEK + PK_BAD] == 0;
+    assert st[G_KREST + 32] == 0 and st[G_KREST + 33] == 0 and st[G_KREST + 34] == 0;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai overloaded (529), every key tried, same profile on the next model");
+    plan_pane_keys(st[0..512], 0, 0, 1003500);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    // the same walk over the keys on the second model
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1004000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..512], 0, 0, 1004500);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..512], 0, 0, 1005500);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    // every key failed on the last model of the tier: next profile, z.ai marked bad, the model step is 0 again
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_NEXT;
     assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..512], 0) == 0;
     assert st[G_PANEK + PK_BAD] == 16;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai overloaded (529), respawn on anthropic-api");
-    plan_pane_keys(st[0..512], 0, 0, 1003500);
+    plan_pane_keys(st[0..512], 0, 0, 1006500);
     assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
     assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
     // the Anthropic key is overloaded: no profile is left, the pane stays and its screen is not read for a minute
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1004000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1007000, why[0..128], wl[0..2]);
     assert a == FA_GIVE_UP;
-    assert st[G_PANEK + PK_DONE] == 3;
-    assert st[G_PANEK + PK_STOP] == 1004000 + GIVEUP_QUIET_MS;
+    assert st[G_PANEK + PK_DONE] == 6;
+    assert st[G_PANEK + PK_STOP] == 1007000 + GIVEUP_QUIET_MS;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "no profile left in the chain");
-    assert scan_ready(st[0..512], 0, 1003500, 1020000) == false;
-    assert scan_ready(st[0..512], 0, 1003500, 1064001);
+    assert scan_ready(st[0..512], 0, 1006500, 1020000) == false;
+    assert scan_ready(st[0..512], 0, 1006500, 1067001);
 }
 
-test an_empty_balance_leaves_the_provider_at_once_and_the_key_rests_ten_minutes {
+test an_empty_balance_swaps_to_the_next_key_and_the_key_rests_ten_minutes {
     var st : [512]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
     t_zai3(st[0..512]);
     plan_pane_keys(st[0..512], 0, 0, 1000000);
     const a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1005000, why[0..128], wl[0..2]);
-    assert a == FA_RESPAWN_NEXT;
+    assert a == FA_RESPAWN_KEY;
     assert st[G_KREST + 32] == 1005 + 600;
-    assert st[G_PANEK + PK_BAD] == 16;
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai out of balance, respawn on anthropic-api");
+    assert st[G_PANEK + PK_BAD] == 0;
+    assert st[G_PANEK + PK_SKIP] == 1;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai out of balance, same profile with the next key");
     // the failure cap ends any loop
     st[G_PANEK + PK_DONE] = @as(u64, MAX_FAILOVERS);
     const g : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
@@ -1447,6 +1544,386 @@ test a_new_spawn_starts_with_a_clean_pane_record {
     assert st[G_PANEK + 2 * PK + PK_WAIT] == W_NONE;
     plan_pane_keys(st[0..512], 2, 0, 1000100);
     assert t_prof(st[0..512], 2) == PR_ZAI;
+}
+
+test the_model_step_of_a_pane_is_its_own_nibble_and_a_reset_pane_starts_on_the_default_model {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    assert st[G_MSTEP] == 0;
+    pane_mstep_set(st[0..512], 0, 1);
+    pane_mstep_set(st[0..512], 15, 1);
+    pane_mstep_set(st[0..512], 3, 2);
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    assert pane_mstep_get(st[0..512], 15) == 1;
+    assert pane_mstep_get(st[0..512], 3) == 2;
+    assert pane_mstep_get(st[0..512], 7) == 0;
+    pane_mstep_set(st[0..512], 3, 0);
+    assert pane_mstep_get(st[0..512], 3) == 0;
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    // a new spawn and a restored pane both start from pane_keys_reset: the default model of the tier
+    pane_keys_reset(st[0..512], 0);
+    assert pane_mstep_get(st[0..512], 0) == 0;
+    assert pane_mstep_get(st[0..512], 15) == 1;
+    keys_init(st[0..512]);
+    assert pane_mstep_get(st[0..512], 15) == 0;
+    assert st[G_MSTEP] == 0;
+}
+
+// ---- a restored pane (gHashTag/t27#11284): its record held key 1 and the model glm-5.2, and every key answers
+// 1113 for glm-5.2. It must start as a fresh spawn would (the free flash model, the key rotation's pick) and
+// fail over exactly as a spawned pane does. restore_all leaves a pane in the state pane_keys_reset gives it,
+// with the sid and cwd of the record and the saved model in its slot; these tests start there.
+
+/// Pane i the way restore_all leaves it just before its launch: nothing chosen yet.
+fn t_restored(st: []u64, i: usize) -> void {
+    pane_keys_reset(st, i);
+}
+
+test a_restored_pane_takes_the_key_a_fresh_spawn_would_take_not_the_one_its_record_held {
+    var st : [512]u64 = undefined;
+    t_zai3(st[0..512]);
+    // key 1 earned a rest, key 3 was used lately: the key used longest ago and not resting is key 2
+    st[G_KREST + 32] = 1000 + 600;
+    st[G_KLAST + 32] = 900000;
+    st[G_KLAST + 33] = 100;
+    st[G_KLAST + 34] = 500000;
+    const fresh : u32 = key_pick(st[0..512], P_ZAI, MAX_KEYS, 1000000);
+    assert fresh == 1;
+    t_restored(st[0..512], 3);
+    plan_pane_keys(st[0..512], 3, 0, 1000000);
+    assert t_prof(st[0..512], 3) == PR_ZAI;
+    assert pane_key_get(st[0..512], 3, P_ZAI) == fresh + 1;
+    assert pane_key_get(st[0..512], 3, P_ZAI) == 2;
+    assert st[G_KLAST + 33] == 1000000;
+    // with no key in the table at all a restored pane has none, as a spawned one
+    var empty : [512]u64 = undefined;
+    t_table(empty[0..512]);
+    t_restored(empty[0..512], 0);
+    plan_pane_keys(empty[0..512], 0, 0, 1000000);
+    assert t_prof(empty[0..512], 0) == PR_NONE;
+}
+
+test a_restored_pane_resumes_its_session_on_the_free_flash_model_not_the_one_its_record_held {
+    var st : [512]u64 = undefined;
+    var o : [64]u8 = undefined;
+    var cmd : [200]u8 = undefined;
+    t_zai3(st[0..512]);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    // the record said glm-5.2; the model the pane starts with is the free flash tier's default
+    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-5.2", o[0..64]);
+    assert n == 13;
+    assert has_bytes(o[0..n], "glm-4.5-flash");
+    assert has_bytes(o[0..n], "glm-5.2") == false;
+    // the session id of the record still resumes; the command names the free model and never the stale one
+    const c : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", o[0..n], "/h", cmd[0..200]);
+    assert pl_count(cmd[0..c], "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --model 'glm-4.5-flash' --settings /h/.t27os/hooks.json") == 1;
+    assert has_bytes(cmd[0..c], "glm-5.2") == false;
+    // a fresh spawn of the same agent computes the same default: the environment's model variable
+    t_restored(st[0..512], 1);
+    plan_pane_keys(st[0..512], 1, 0, 1000100);
+    const f : usize = tier_model_step(PR_ZAI, TI_DEFAULT, pane_mstep_get(st[0..512], 1), o[0..64]);
+    assert f == 13;
+    assert has_bytes(o[0..f], "glm-4.5-flash");
+    const e : usize = profile_var_text_step(PR_ZAI, 2, pane_mstep_get(st[0..512], 1), o[0..64]);
+    assert e == 13 and has_bytes(o[0..e], "glm-4.5-flash");
+    // its first start passes no model of its own on the command line
+    assert launch_model(st[0..512], 1, 0, true, "", o[0..64]) == 0;
+    // one a SPAWN names on purpose stays on that first start
+    const x : usize = launch_model(st[0..512], 1, 0, true, "glm-4.7-flash", o[0..64]);
+    assert x == 13 and has_bytes(o[0..x], "glm-4.7-flash");
+    // but a restart of that pane is a restore: the profile's model again
+    const r : usize = launch_model(st[0..512], 1, 0, false, "glm-4.7-flash", o[0..64]);
+    assert r == 13 and has_bytes(o[0..r], "glm-4.5-flash");
+    // another agent has no profile: its saved model stays
+    const g : usize = launch_model(st[0..512], 2, 1, false, "gpt-5.1", o[0..64]);
+    assert g == 7 and has_bytes(o[0..g], "gpt-5.1");
+}
+
+test a_pane_that_fails_over_to_another_profile_does_not_carry_the_model_of_the_one_it_left {
+    var st : [512]u64 = undefined;
+    var o : [64]u8 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_table(st[0..512]);
+    t_key(st[0..512], P_ZAI, 0);
+    t_key(st[0..512], P_ANTHROPIC, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    // the only z.ai key is empty: the second model of the tier first, then the next profile
+    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
+    plan_pane_keys(st[0..512], 0, 0, 1001500);
+    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
+    plan_pane_keys(st[0..512], 0, 0, 1002500);
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..512], 0) == 0;
+    // the pane's slot still says glm-4.7-flash; the Anthropic API does not serve it, so no model is passed
+    assert launch_model(st[0..512], 0, 0, false, "glm-4.7-flash", o[0..64]) == 0;
+    // a model of Anthropic's own that a person chose is kept
+    const n : usize = launch_model(st[0..512], 0, 0, false, "claude-opus-5-5", o[0..64]);
+    assert n == 15 and has_bytes(o[0..n], "claude-opus-5-5");
+}
+
+test a_restored_pane_fails_over_on_an_empty_or_rejected_key_like_a_spawned_one {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..512]);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    // a restored claude pane's screen is read once its grace has passed, like any other pane's
+    assert scan_applies(0);
+    assert scan_ready(st[0..512], 0, 1000000, 1000000 + SCAN_GRACE_MS - 1) == false;
+    assert scan_ready(st[0..512], 0, 1000000, 1000000 + SCAN_GRACE_MS);
+    // an empty account: the key rests ten minutes and the pane respawns on the next key, the failed one skipped
+    var a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    assert st[G_KREST + 32] == 1020 + 600;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert st[G_PANEK + PK_DONE] == 1;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, same profile with the next key");
+    plan_pane_keys(st[0..512], 0, 0, 1021000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    // a rejected key rests an hour and the pane moves on to the third key
+    a = plan_failover(st[0..512], 0, FC_LOGIN_REJECTED, 1030000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    assert st[G_KREST + 33] == 1030 + 3600;
+    plan_pane_keys(st[0..512], 0, 0, 1031000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    // neither resting key is picked by the next pane that starts
+    t_restored(st[0..512], 1);
+    plan_pane_keys(st[0..512], 1, 0, 1032000);
+    assert pane_key_get(st[0..512], 1, P_ZAI) == 3;
+}
+
+test the_retry_row_of_an_empty_account_is_a_failure_at_once_so_a_stuck_pane_fails_over {
+    var t : [300]u8 = undefined;
+    // what the owner saw: HTTP 429 with code 1113, Claude Code's retry row, attempt 9 of 10
+    var n : usize = put_bytes(t[0..300], 0, "API Error: 429 {\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance or no resource package. Please recharge.\"}} - Retrying in 4 seconds (attempt 9/10)");
+    t[n] = 10;
+    assert text_class(t[0 .. n + 1]) == FC_NO_BALANCE;
+    // a plain throttle in flight still waits for its final row
+    n = put_bytes(t[0..300], 0, "API Error: 429 rate limit reached - Retrying in 4 seconds (attempt 3/10)");
+    t[n] = 10;
+    assert text_class(t[0 .. n + 1]) == FC_NONE;
+    // a diff that shows the row is no failure
+    n = put_bytes(t[0..300], 0, "+ API Error: 429 1113 Insufficient balance - Retrying in 4 seconds (attempt 9/10)");
+    t[n] = 10;
+    assert text_class(t[0 .. n + 1]) == FC_NONE;
+}
+
+test with_one_key_an_empty_pane_tries_the_next_model_once_then_gives_up_and_says_so_once {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    var o : [64]u8 = undefined;
+    t_table(st[0..512]);
+    t_key(st[0..512], P_ZAI, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    // the only key is empty on the default model: nothing to swap to, so the second model of the tier
+    var a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_MODEL;
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    plan_pane_keys(st[0..512], 0, 0, 1021000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-4.5-flash", o[0..64]);
+    assert n == 13 and has_bytes(o[0..n], "glm-4.7-flash");
+    // empty on the second model too: no key, no model and no profile left, the pane stays
+    a = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1040000, why[0..128], wl[0..2]);
+    assert a == FA_GIVE_UP;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, no profile left in the chain, the pane stays");
+    assert st[G_PANEK + PK_DONE] == 1;
+    // the give-up is said once: the screen is not read again until the key's rest is over
+    assert st[G_PANEK + PK_STOP] == 1040000 + 600000;
+    assert scan_ready(st[0..512], 0, 1021000, 1100000) == false;
+    assert scan_ready(st[0..512], 0, 1021000, 1639999) == false;
+    assert scan_ready(st[0..512], 0, 1021000, 1640000);
+    assert giveup_quiet_ms(FC_NO_BALANCE) == 600000;
+    assert giveup_quiet_ms(FC_LOGIN_REJECTED) == 3600000;
+    assert giveup_quiet_ms(FC_RATE_LIMITED) == GIVEUP_QUIET_MS;
+    assert giveup_quiet_ms(FC_SUBSCRIPTION) == GIVEUP_QUIET_MS;
+}
+
+test every_key_resting_for_an_empty_balance_moves_the_pane_on_and_no_dead_key_is_picked_twice_per_model {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..512]);
+    t_restored(st[0..512], 0);
+    var t : u64 = 1000000;
+    plan_pane_keys(st[0..512], 0, 0, t);
+    var seen : [2]u32 = [1, 0];
+    var respawns : u32 = 0;
+    var act : u32 = FA_KEEP;
+    var guard : u32 = 0;
+    var gave_up : bool = false;
+    while (guard < 30 and gave_up == false) {
+        t = t + 1000;
+        act = plan_failover(st[0..512], 0, FC_NO_BALANCE, t, why[0..128], wl[0..2]);
+        if (act == FA_GIVE_UP) {
+            gave_up = true;
+        } else {
+            respawns = respawns + 1;
+            t = t + 500;
+            plan_pane_keys(st[0..512], 0, 0, t);
+            if (t_prof(st[0..512], 0) == PR_ZAI) {
+                const kn : u32 = pane_key_get(st[0..512], 0, P_ZAI) - 1;
+                const sp : usize = @as(usize, pane_mstep_get(st[0..512], 0));
+                // each z.ai key is tried once on each model of the tier, never twice on the same one
+                assert (seen[sp] >> kn) % 2 == 0;
+                seen[sp] = seen[sp] + (1 << kn);
+            }
+        }
+        guard = guard + 1;
+    }
+    // three keys on glm-4.5-flash, then the same three on glm-4.7-flash, then the Anthropic key, then done
+    assert gave_up;
+    assert seen[0] == 7;
+    assert seen[1] == 7;
+    assert respawns == 6;
+    assert st[G_PANEK + PK_DONE] == 6;
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert st[G_PANEK + PK_BAD] == 16;
+    assert st[G_PANEK + PK_STOP] == t + 600000;
+}
+
+// ---- the tier order on a pane: z.ai free, then OpenRouter's free ids, then the paid profiles (gHashTag/t27#11285) ----
+
+/// The table with a key for every tier of the chain: three z.ai keys, one OpenRouter key, one Anthropic key.
+fn t_chain(st: []u64) -> void {
+    t_zai3(st);
+    t_key(st, P_OPENROUTER, 0);
+}
+
+/// One failure of class `class` on pane 0 at `t` ms: the failover, then the relaunch's key and profile choice
+/// half a second later unless the pane gave up. Returns the action.
+fn t_fail(st: []u64, class: u32, t: u64) -> u32 {
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    const a : u32 = plan_failover(st, 0, class, t, why[0..128], wl[0..2]);
+    if (a != FA_GIVE_UP) { plan_pane_keys(st, 0, 0, t + 500); }
+    return a;
+}
+
+test when_every_zai_key_rests_the_pane_moves_to_openrouters_free_ids_and_then_to_the_paid_profile {
+    var st : [512]u64 = undefined;
+    var o : [64]u8 = undefined;
+    t_chain(st[0..512]);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    // tier 1, z.ai: three keys on glm-4.5-flash, then the same three on glm-4.7-flash, every one overloaded
+    assert t_fail(st[0..512], FC_OVERLOADED, 1001000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..512], FC_OVERLOADED, 1002000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..512], FC_OVERLOADED, 1003000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..512], FC_OVERLOADED, 1004000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..512], FC_OVERLOADED, 1005000) == FA_RESPAWN_KEY;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    // the last z.ai key on the last model: tier 2, OpenRouter, on its first free id with its own key
+    assert t_fail(st[0..512], FC_OVERLOADED, 1006000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert pane_mstep_get(st[0..512], 0) == 0;
+    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    assert st[G_PANEK + PK_BAD] == 16;
+    var n : usize = launch_model(st[0..512], 0, 0, false, "glm-4.7-flash", o[0..64]);
+    assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
+    // the environment the pane gets: ANTHROPIC_MODEL (variable 2 of the profile) names the same id
+    n = profile_var_text_step(PR_OPENROUTER, 2, pane_mstep_get(st[0..512], 0), o[0..64]);
+    assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
+    // the only OpenRouter key is throttled: its second and third free id, the key free again for each
+    assert t_fail(st[0..512], FC_RATE_LIMITED, 1007000) == FA_RESPAWN_MODEL;
+    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert pane_mstep_get(st[0..512], 0) == 1;
+    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
+    n = launch_model(st[0..512], 0, 0, false, "minimax/minimax-m3.1-flash:free", o[0..64]);
+    assert n == 33 and begins_with(o[0..n], "nvidia/nemotron-3.5-super-vl:free");
+    assert t_fail(st[0..512], FC_RATE_LIMITED, 1008000) == FA_RESPAWN_MODEL;
+    assert pane_mstep_get(st[0..512], 0) == 2;
+    n = launch_model(st[0..512], 0, 0, false, "nvidia/nemotron-3.5-super-vl:free", o[0..64]);
+    assert n == 34 and begins_with(o[0..n], "nvidia/nemotron-3.5-lightning:free");
+    // both free tiers rest: only now the paid profile, whose model is not an OpenRouter id
+    assert t_fail(st[0..512], FC_RATE_LIMITED, 1009000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..512], 0) == 0;
+    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert st[G_PANEK + PK_BAD] == 24;
+    assert st[G_PANEK + PK_DONE] == 9;
+    assert launch_model(st[0..512], 0, 0, false, "nvidia/nemotron-3.5-lightning:free", o[0..64]) == 0;
+    // the paid key fails too: no tier is left and the pane says so once
+    assert t_fail(st[0..512], FC_RATE_LIMITED, 1010000) == FA_GIVE_UP;
+    assert st[G_PANEK + PK_DONE] == 9;
+    assert st[G_PANEK + PK_STOP] == 1010000 + GIVEUP_QUIET_MS;
+}
+
+test with_no_openrouter_key_stored_the_pane_skips_that_tier_to_the_paid_profile_or_the_give_up_line {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    // z.ai and Anthropic keys, none of OpenRouter: the tier in the middle costs nothing
+    t_table(st[0..512]);
+    t_key(st[0..512], P_ZAI, 0);
+    t_key(st[0..512], P_ANTHROPIC, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1002000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 0;
+    assert st[G_PANEK + PK_BAD] == 16;
+    assert st[G_PANEK + PK_DONE] == 2;
+    // z.ai alone: nothing after it, the give-up line, no loop
+    t_table(st[0..512]);
+    t_key(st[0..512], P_ZAI, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    const a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]);
+    assert a == FA_GIVE_UP;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, no profile left in the chain, the pane stays");
+    assert st[G_PANEK + PK_DONE] == 1;
+    // the same pane once an OpenRouter key arrives (an OP_SETKEY) and its quiet time has passed: the free tier is offered
+    t_key(st[0..512], P_OPENROUTER, 0);
+    st[G_PANEK + PK_STOP] = 0;
+    const b : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1003000, why[0..128], wl[0..2]);
+    assert b == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, respawn on openrouter");
+    // an OpenRouter key alone ends in the give-up line after its three ids
+    t_table(st[0..512]);
+    t_key(st[0..512], P_OPENROUTER, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1002000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..512], FC_NO_BALANCE, 1003000) == FA_GIVE_UP;
+    assert st[G_PANEK + PK_DONE] == 2;
+}
+
+test a_pane_on_openrouter_names_the_free_id_on_its_command_line_and_in_its_environment {
+    var st : [512]u64 = undefined;
+    var o : [64]u8 = undefined;
+    var cmd : [200]u8 = undefined;
+    t_table(st[0..512]);
+    t_key(st[0..512], P_OPENROUTER, 0);
+    t_restored(st[0..512], 0);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
+    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-5.2", o[0..64]);
+    assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
+    // the id keeps its slash and its colon on the command line (session_store model_ok), so the flag is not dropped
+    const c : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", o[0..n], "/h", cmd[0..200]);
+    assert pl_count(cmd[0..c], "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --model 'minimax/minimax-m3.1-flash:free' --settings /h/.t27os/hooks.json") == 1;
+    // a SPAWN's first start passes no model of its own
+    assert launch_model(st[0..512], 0, 0, true, "", o[0..64]) == 0;
 }
 
 test a_list_entry_carries_the_key_number_in_the_high_nibble {
