@@ -130,6 +130,26 @@ Open question for the owner: where a tool letter and an alphabet agent disagree 
 Architecture, B native compiler vs Build, F frontend vs Formal Conformance, T trainer vs Queen,
 U university vs Universe), the default is that the tool decides the letter.
 
+## The t27<letter> tools that exist (inventory 2026-10-20, origin/master + all local repos)
+
+| Tool | What | Law / path | Front door | Status |
+|---|---|---|---|---|
+| t27a | assembler / disassembler | specs/isa/t27a.t27 | t27c asm, t27c disasm | live |
+| t27b | native compiler (AArch64 JIT, Mach-O, Verilog) | cli/t27b | t27b test/build/verilog | live |
+| t27c | bootstrap compiler + sweep | bootstrap/src/compiler.rs | t27c, tri test | live |
+| t27f | FRONTEND (spec graph, outline, map stills, petal home) | specs/t27f/frontend.t27 | MCP t27f_*, claw/t27f, t27.ai/t27f/graph | live |
+| t27o | Ouroboros: foreign code into .t27 | specs/tools/t27o/rust_convert.t27 | tri t27o | live (Rust first) |
+| t27t | trainer (law; runners igla-coder-gpu train.py, specs/ml/train_hslm.t27) | specs/t27t/t27t.t27 | tri t27t | live spec; F_MEASURED=false, RUNNER_USES_INT_MM=false |
+| t27u | university, 7 courses x 27 lessons | trinity apps/website/specs/course/courses.t27 | t27.ai/learn | live (law in trinity) |
+| t27os / t27mcp | the OS window / MCP service | specs/t27os, specs/t27mcp | T27 OS app, t27_* tools | live |
+
+No tool exists for d, e, g, h, i, j, k, l, m, n, p, q, r, s, v, w, x, y, z (hits for t27x/t27w/t27s/t27z
+are false: a refused extension, logs, temp names). specs/compiler/theory/toolchain.t27:643 refuses
+inventing a t27d..t27z series without an artifact: do not name a tool before it exists.
+t27t gaps (live console for H/N): no live run feed (runner private), no model registry (own_model.t27
+is a map), HTOK data and checkpoints host-local in /tmp/hslm; real today: GEMM bench, saving with its
+estimate label (bind to F_MEASURED), paper_claims, dataset/igla-coder MANIFEST.
+
 ## Plan (open items, 2026-10-20)
 
 1. Cockpit dashboard in the home tabs: nested widget tree, agent consoles, card.png instruments,
