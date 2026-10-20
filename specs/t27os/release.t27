@@ -1,0 +1,757 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/release.t27 -- how T27 OS is versioned, released and updated (gHashTag/t27#11315, FR-003 and FR-004;
+; part of the T27 OS epic #11037). Owner, 2026-10-20: bring T27 OS to a release.
+; --
+; WHAT IS DECIDED HERE (every rule has a test below):
+; - The version: semver from the constants VERSION_MAJOR/MINOR/PATCH; the build number is the commit count
+;   (`git rev-list --count HEAD`), written into the bundle as CFBundleVersion by install.t27 plist_text.
+; - The release manifest, in OUR language (own-language-first): a .t27 module text, not JSON. The app reads
+;   the six constants of it that this file names and nothing else. manifest_text writes it, manifest_check
+;   judges a text the app downloaded. It rides with the zip as a release asset, t27os-release.t27.
+; - The update rule: the app looks at the manifest at start and every 6 hours, never while a pane is busy;
+;   downloads the zip to ~/.t27os/updates (background curl, a spawned process, the keys_host pattern); checks
+;   the sha256 against the manifest; unzips and checks the code signature; moves the running bundle to
+;   ~/.t27os/previous (the one bundle kept) and the new one into place; hot_reload.t27 then sees the new
+;   executable and execs it. A start that does not survive 60 seconds leaves a marker behind, and the next
+;   start puts the previous bundle back and refuses that version from then on.
+; - The release steps as a plan (`tri t27os release --plan` prints plan_text and runs nothing). Publishing is
+;   not done by this spec or by that verb: it needs the owner's yes.
+; --
+; WHAT IS NOT HERE: the posix_spawn of curl, ditto and codesign, the file moves and the exec. They are host
+; calls (keys_host.t27 and hot_reload.t27 show the pattern) and take these rules as their answers.
+; The sha256 is computed by /usr/bin/shasum -a 256 in that spawned job, and compared here as text.
+; Trust: the sha256 in the manifest proves the zip is the one the manifest names, not who wrote the manifest;
+; both come from the same https address on github.com/gHashTag/t27/releases, which url_ok enforces, and the
+; unzipped bundle must still pass `codesign --verify`. A Developer ID signature is the owner's step.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRelease;
+
+use claw::text;
+
+// ---------------------------------------------------------------- the version
+
+pub const VERSION_MAJOR : u32 = 0;
+pub const VERSION_MINOR : u32 = 1;
+pub const VERSION_PATCH : u32 = 0;
+
+/// The packed value of "no version": a text that is not a semver.
+pub const NO_VERSION : u64 = 18446744073709551615;
+
+/// Each part is at most 6 digits and is packed in 20 bits, so a packed version compares as a semver does.
+pub const PART_MAX : u32 = 999999;
+
+pub fn pack_version(major : u32, minor : u32, patch : u32) -> u64 {
+    return ((major as u64) << 40) | ((minor as u64) << 20) | (patch as u64);
+}
+
+/// The version this source tree builds.
+pub fn current_version() -> u64 {
+    return pack_version(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+}
+
+pub fn version_major(v : u64) -> u32 { return ((v >> 40) & 1048575) as u32; }
+pub fn version_minor(v : u64) -> u32 { return ((v >> 20) & 1048575) as u32; }
+pub fn version_patch(v : u64) -> u32 { return (v & 1048575) as u32; }
+
+/// Writes v in decimal at w, clipped at cap; the new cursor. (No scratch array: the digits are written
+/// from the most significant one by dividing, so the generated Rust needs no initializer.)
+pub fn put_number(out : []u8, cap : usize, w : usize, v : u32) -> usize {
+    var scale : u32 = 1;
+    while (v / scale >= 10) { scale = scale * 10; }
+    var k : usize = w;
+    var rest : u32 = v;
+    while (scale > 0) {
+        const d : u32 = rest / scale;
+        if (k < cap) { out[k] = (48 + d) as u8; }
+        k += 1;
+        rest = rest - d * scale;
+        scale = scale / 10;
+    }
+    return k;
+}
+
+/// Writes "major.minor.patch" at w, clipped at cap; the new cursor.
+pub fn put_semver(out : []u8, cap : usize, w : usize, v : u64) -> usize {
+    var k : usize = put_number(out, cap, w, version_major(v));
+    k = put_str(out, cap, k, ".", 1);
+    k = put_number(out, cap, k, version_minor(v));
+    k = put_str(out, cap, k, ".", 1);
+    return put_number(out, cap, k, version_patch(v));
+}
+
+/// Reads one part of a semver: digits, no leading zero unless the part is "0", at most 6 digits. The part
+/// goes to the high half of the result; the cursor after it goes to the low half. A bad part is NO_VERSION.
+pub fn read_part(t : []const u8, n : usize, at : usize) -> u64 {
+    if (at >= n) { return NO_VERSION; }
+    var i : usize = at;
+    var v : u32 = 0;
+    while (i < n and t[i] >= '0' and t[i] <= '9') {
+        if (i - at >= 6) { return NO_VERSION; }
+        v = v * 10 + ((t[i] - '0') as u32);
+        i += 1;
+    }
+    if (i == at) { return NO_VERSION; }
+    if (t[at] == '0' and i - at > 1) { return NO_VERSION; }
+    return ((v as u64) << 32) | (i as u64);
+}
+
+/// "a.b.c" to a packed version; NO_VERSION for anything else (a prefix, a suffix, a missing part).
+pub fn semver_parse(t : []const u8, n : usize) -> u64 {
+    var a : u64 = read_part(t, n, 0);
+    if (a == NO_VERSION) { return NO_VERSION; }
+    var p : usize = (a & 4294967295) as usize;
+    if (p >= n or t[p] != '.') { return NO_VERSION; }
+    var b : u64 = read_part(t, n, p + 1);
+    if (b == NO_VERSION) { return NO_VERSION; }
+    p = (b & 4294967295) as usize;
+    if (p >= n or t[p] != '.') { return NO_VERSION; }
+    var c : u64 = read_part(t, n, p + 1);
+    if (c == NO_VERSION) { return NO_VERSION; }
+    p = (c & 4294967295) as usize;
+    if (p != n) { return NO_VERSION; }
+    return pack_version((a >> 32) as u32, (b >> 32) as u32, (c >> 32) as u32);
+}
+
+/// The candidate is an update only if both are versions and the candidate is strictly newer.
+pub fn is_newer(candidate : u64, current : u64) -> bool {
+    if (candidate == NO_VERSION or current == NO_VERSION) { return false; }
+    return candidate > current;
+}
+
+// ---------------------------------------------------------------- the manifest
+
+/// Where the app looks: the manifest asset of the newest release.
+pub const MANIFEST_URL : str = "https://github.com/gHashTag/t27/releases/latest/download/t27os-release.t27";
+/// Every address the manifest names (the zip, the notes) starts with this.
+pub const URL_PREFIX : str = "https://github.com/gHashTag/t27/releases/";
+pub const URL_PREFIX_LEN : usize = 41;
+/// The manifest's module line, and the six lines the app reads, up to the value.
+pub const KEY_VERSION : str = "pub const VERSION : str = ";
+pub const KEY_BUILD : str = "pub const BUILD : u32 = ";
+pub const KEY_SHA : str = "pub const SHA256 : str = ";
+pub const KEY_MIN : str = "pub const MIN_MACOS : str = ";
+pub const KEY_URL : str = "pub const URL : str = ";
+pub const KEY_NOTES : str = "pub const NOTES : str = ";
+
+/// manifest_check results; the first failure in this order.
+pub const M_OK : u8 = 0;
+pub const M_NO_VERSION : u8 = 1;
+pub const M_NO_BUILD : u8 = 2;
+pub const M_BAD_SHA : u8 = 3;
+pub const M_BAD_MIN : u8 = 4;
+pub const M_BAD_URL : u8 = 5;
+pub const M_BAD_NOTES : u8 = 6;
+
+/// A field not found, as the packed (start, length) pair.
+pub const NO_FIELD : u64 = 18446744073709551615;
+
+fn at_line_start(t : []const u8, i : usize) -> bool {
+    if (i == 0) { return true; }
+    return t[i - 1] == 10;
+}
+
+fn starts_here(t : []const u8, n : usize, at : usize, key : str, key_len : usize) -> bool {
+    if (at + key_len > n) { return false; }
+    var j : usize = 0;
+    while (j < key_len) {
+        if (t[at + j] != key[j]) { return false; }
+        j += 1;
+    }
+    return true;
+}
+
+/// A string field: the line `<key>"value";`. The result is (start of value << 32) | length of value, or
+/// NO_FIELD when no line starts with the key, the value is not quoted, or it has no closing quote on its line.
+pub fn field_str(t : []const u8, n : usize, key : str, key_len : usize) -> u64 {
+    var i : usize = 0;
+    while (i < n) {
+        if (at_line_start(t, i) and starts_here(t, n, i, key, key_len)) {
+            const q : usize = i + key_len;
+            if (q >= n or t[q] != 34) { return NO_FIELD; }
+            var e : usize = q + 1;
+            while (e < n and t[e] != 34 and t[e] != 10) { e += 1; }
+            if (e >= n or t[e] != 34) { return NO_FIELD; }
+            return (((q + 1) as u64) << 32) | ((e - q - 1) as u64);
+        }
+        i += 1;
+    }
+    return NO_FIELD;
+}
+
+/// A number field: the line `<key>digits;`. The number, or NO_FIELD (no digits, more than 9, no line).
+pub fn field_num(t : []const u8, n : usize, key : str, key_len : usize) -> u64 {
+    var i : usize = 0;
+    while (i < n) {
+        if (at_line_start(t, i) and starts_here(t, n, i, key, key_len)) {
+            var e : usize = i + key_len;
+            var v : u64 = 0;
+            while (e < n and t[e] >= '0' and t[e] <= '9') {
+                if (e - (i + key_len) >= 9) { return NO_FIELD; }
+                v = v * 10 + ((t[e] - '0') as u64);
+                e += 1;
+            }
+            if (e == i + key_len) { return NO_FIELD; }
+            return v;
+        }
+        i += 1;
+    }
+    return NO_FIELD;
+}
+
+pub fn field_start(f : u64) -> usize { return (f >> 32) as usize; }
+pub fn field_len(f : u64) -> usize { return (f & 4294967295) as usize; }
+
+/// 64 lowercase hex digits.
+pub fn sha_ok(t : []const u8, n : usize) -> bool {
+    if (n != 64) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        const c : u8 = t[i];
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// An address the app may fetch: https on github.com/gHashTag/t27/releases/, with something after it and no space.
+pub fn url_ok(t : []const u8, n : usize) -> bool {
+    if (n <= URL_PREFIX_LEN) { return false; }
+    if (!starts_here(t, n, 0, URL_PREFIX, URL_PREFIX_LEN)) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (t[i] <= 32 or t[i] == 34 or t[i] == 39 or t[i] == 92 or t[i] > 126) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// "major.minor" or "major": a macOS version, packed as major * 1000 + minor; 4294967295 for anything else.
+pub fn macos_parse(t : []const u8, n : usize) -> u32 {
+    var a : u64 = read_part(t, n, 0);
+    if (a == NO_VERSION) { return 4294967295; }
+    const major : u32 = (a >> 32) as u32;
+    var p : usize = (a & 4294967295) as usize;
+    if (p == n) { return major * 1000; }
+    if (t[p] != '.') { return 4294967295; }
+    var b : u64 = read_part(t, n, p + 1);
+    if (b == NO_VERSION) { return 4294967295; }
+    p = (b & 4294967295) as usize;
+    if (p != n) { return 4294967295; }
+    return major * 1000 + ((b >> 32) as u32);
+}
+
+/// Does this Mac meet the manifest's minimum? host is major * 1000 + minor.
+pub fn macos_meets(min_text : []const u8, n : usize, host : u32) -> bool {
+    const m : u32 = macos_parse(min_text, n);
+    if (m == 4294967295) { return false; }
+    return host >= m;
+}
+
+/// The first thing wrong with a manifest text the app downloaded, or M_OK.
+pub fn manifest_check(t : []const u8, n : usize) -> u8 {
+    const v : u64 = field_str(t, n, KEY_VERSION, 26);
+    if (v == NO_FIELD) { return M_NO_VERSION; }
+    if (semver_parse(t[field_start(v)..field_start(v) + field_len(v)], field_len(v)) == NO_VERSION) { return M_NO_VERSION; }
+    if (field_num(t, n, KEY_BUILD, 24) == NO_FIELD) { return M_NO_BUILD; }
+    const s : u64 = field_str(t, n, KEY_SHA, 25);
+    if (s == NO_FIELD) { return M_BAD_SHA; }
+    if (!sha_ok(t[field_start(s)..field_start(s) + field_len(s)], field_len(s))) { return M_BAD_SHA; }
+    const m : u64 = field_str(t, n, KEY_MIN, 28);
+    if (m == NO_FIELD) { return M_BAD_MIN; }
+    if (macos_parse(t[field_start(m)..field_start(m) + field_len(m)], field_len(m)) == 4294967295) { return M_BAD_MIN; }
+    const u : u64 = field_str(t, n, KEY_URL, 22);
+    if (u == NO_FIELD) { return M_BAD_URL; }
+    if (!url_ok(t[field_start(u)..field_start(u) + field_len(u)], field_len(u))) { return M_BAD_URL; }
+    const w : u64 = field_str(t, n, KEY_NOTES, 24);
+    if (w == NO_FIELD) { return M_BAD_NOTES; }
+    if (!url_ok(t[field_start(w)..field_start(w) + field_len(w)], field_len(w))) { return M_BAD_NOTES; }
+    return M_OK;
+}
+
+fn put_line_text(out : []u8, cap : usize, w : usize, s : str, s_len : usize) -> usize {
+    var k : usize = put_str(out, cap, w, s, s_len);
+    if (k < cap) { out[k] = 10; }
+    return k + 1;
+}
+
+fn put_slice(out : []u8, cap : usize, w : usize, b : []const u8, b_len : usize) -> usize {
+    var i : usize = 0;
+    while (i < b_len) {
+        if (w + i < cap) { out[w + i] = b[i]; }
+        i += 1;
+    }
+    return w + b_len;
+}
+
+/// The release tag, "v" and the semver.
+pub fn put_tag(out : []u8, cap : usize, w : usize, v : u64) -> usize {
+    var k : usize = put_str(out, cap, w, "v", 1);
+    return put_semver(out, cap, k, v);
+}
+
+/// The zip's file name, T27OS-<semver>.zip.
+pub fn put_zip_name(out : []u8, cap : usize, w : usize, v : u64) -> usize {
+    var k : usize = put_str(out, cap, w, "T27OS-", 6);
+    k = put_semver(out, cap, k, v);
+    return put_str(out, cap, k, ".zip", 4);
+}
+
+/// The manifest of a release, a t27 module. sha is the 64 hex digits of the zip. Returns the length written;
+/// a result above cap means it was clipped.
+pub fn manifest_text(out : []u8, cap : usize, v : u64, build : u32, sha : []const u8, sha_len : usize) -> usize {
+    var w : usize = 0;
+    w = put_line_text(out, cap, w, "; T27 OS release manifest, written by specs/t27os/release.t27 manifest_text. The app reads the", 94);
+    w = put_line_text(out, cap, w, "; six constants below and nothing else.", 39);
+    w = put_line_text(out, cap, w, "module T27osReleaseManifest;", 28);
+    w = put_str(out, cap, w, KEY_VERSION, 26);
+    w = put_str(out, cap, w, "\"", 1);
+    w = put_semver(out, cap, w, v);
+    w = put_line_text(out, cap, w, "\";", 2);
+    w = put_str(out, cap, w, KEY_BUILD, 24);
+    w = put_number(out, cap, w, build);
+    w = put_line_text(out, cap, w, ";", 1);
+    w = put_str(out, cap, w, KEY_SHA, 25);
+    w = put_str(out, cap, w, "\"", 1);
+    w = put_slice(out, cap, w, sha, sha_len);
+    w = put_line_text(out, cap, w, "\";", 2);
+    w = put_str(out, cap, w, KEY_MIN, 28);
+    w = put_line_text(out, cap, w, "\"11.0\";", 7);
+    w = put_str(out, cap, w, KEY_URL, 22);
+    w = put_str(out, cap, w, "\"", 1);
+    w = put_str(out, cap, w, URL_PREFIX, 41);
+    w = put_str(out, cap, w, "download/", 9);
+    w = put_tag(out, cap, w, v);
+    w = put_str(out, cap, w, "/", 1);
+    w = put_zip_name(out, cap, w, v);
+    w = put_line_text(out, cap, w, "\";", 2);
+    w = put_str(out, cap, w, KEY_NOTES, 24);
+    w = put_str(out, cap, w, "\"", 1);
+    w = put_str(out, cap, w, URL_PREFIX, 41);
+    w = put_str(out, cap, w, "tag/", 4);
+    w = put_tag(out, cap, w, v);
+    w = put_line_text(out, cap, w, "\";", 2);
+    return w;
+}
+
+// ---------------------------------------------------------------- the update rule
+
+/// The app looks at the manifest at start (no check yet) and every 6 hours after the last one.
+pub const CHECK_EVERY_S : u64 = 21600;
+/// A start that lives this long is a good build.
+pub const CONFIRM_AFTER_S : u64 = 60;
+
+/// Is a check due? Seconds since the epoch. No check yet (0) is due; a clock that went back is due too, so a
+/// wrong clock cannot silence updates for a day.
+pub fn check_due(now : u64, last_check : u64) -> bool {
+    if (last_check == 0) { return true; }
+    if (now < last_check) { return true; }
+    return now - last_check >= CHECK_EVERY_S;
+}
+
+/// Never while a pane is busy (working or blocked on you). A check that is due waits for the panes to rest.
+pub fn idle_enough(busy_panes : u32) -> bool {
+    return busy_panes == 0;
+}
+
+pub fn should_check(now : u64, last_check : u64, busy_panes : u32) -> bool {
+    return check_due(now, last_check) and idle_enough(busy_panes);
+}
+
+/// What the app does with a manifest.
+pub const OFFER_NONE : u8 = 0;
+pub const OFFER_UPDATE : u8 = 1;
+pub const OFFER_BAD_MANIFEST : u8 = 2;
+pub const OFFER_OLD_MACOS : u8 = 3;
+pub const OFFER_REJECTED : u8 = 4;
+
+/// First match wins: a manifest that fails manifest_check, a version that is not newer, a version a rollback
+/// put out, a Mac below the minimum. Otherwise download.
+pub fn offer(check : u8, candidate : u64, current : u64, rejected : u64, os_ok : bool) -> u8 {
+    if (check != M_OK) { return OFFER_BAD_MANIFEST; }
+    if (!is_newer(candidate, current)) { return OFFER_NONE; }
+    if (candidate == rejected) { return OFFER_REJECTED; }
+    if (!os_ok) { return OFFER_OLD_MACOS; }
+    return OFFER_UPDATE;
+}
+
+/// Does the downloaded zip carry the digest the manifest names? Both are 64 hex digits; a bad length is no.
+pub fn sha_matches(computed : []const u8, computed_len : usize, wanted : []const u8, wanted_len : usize) -> bool {
+    if (!sha_ok(computed, computed_len) or !sha_ok(wanted, wanted_len)) { return false; }
+    var i : usize = 0;
+    while (i < 64) {
+        if (computed[i] != wanted[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// The update, one step at a time. A state is where the app is; an event is what just happened.
+pub const U_IDLE : u8 = 0;
+pub const U_CHECKING : u8 = 1;
+pub const U_DOWNLOADING : u8 = 2;
+pub const U_VERIFYING : u8 = 3;
+pub const U_STAGED : u8 = 4;
+pub const U_SWAPPED : u8 = 5;
+
+pub const EV_CHECK : u8 = 0;
+pub const EV_OFFER : u8 = 1;
+pub const EV_NO_OFFER : u8 = 2;
+pub const EV_DOWNLOADED : u8 = 3;
+pub const EV_FAILED : u8 = 4;
+pub const EV_SHA_OK : u8 = 5;
+pub const EV_SHA_BAD : u8 = 6;
+pub const EV_SIGNED : u8 = 7;
+pub const EV_SWAP : u8 = 8;
+
+/// The next state. Any failure falls back to idle (the next check is 6 hours away, or sooner if the app is
+/// restarted); a check starts only from idle and only when the panes rest; the swap only when they rest.
+pub fn update_step(state : u8, event : u8, busy_panes : u32) -> u8 {
+    if (event == EV_FAILED or event == EV_SHA_BAD or event == EV_NO_OFFER) { return U_IDLE; }
+    if (state == U_IDLE and event == EV_CHECK) {
+        if (idle_enough(busy_panes)) { return U_CHECKING; }
+        return U_IDLE;
+    }
+    if (state == U_CHECKING and event == EV_OFFER) { return U_DOWNLOADING; }
+    if (state == U_DOWNLOADING and event == EV_DOWNLOADED) { return U_VERIFYING; }
+    if (state == U_VERIFYING and event == EV_SHA_OK) { return U_VERIFYING; }
+    if (state == U_VERIFYING and event == EV_SIGNED) { return U_STAGED; }
+    if (state == U_STAGED and event == EV_SWAP) {
+        if (idle_enough(busy_panes)) { return U_SWAPPED; }
+        return U_STAGED;
+    }
+    return state;
+}
+
+// ---------------------------------------------------------------- rollback
+
+/// What a start does. A new build leaves PENDING (a marker file under ~/.t27os/updates) when the swap puts it
+/// in place and removes it once it has lived CONFIRM_AFTER_S; a start that finds the marker therefore follows a
+/// build that did not live that long.
+pub const BOOT_RUN : u8 = 0;
+pub const BOOT_ROLLBACK : u8 = 1;
+pub const BOOT_BROKEN : u8 = 2;
+
+/// Marker present and a previous bundle kept: put it back. Marker present and nothing to go back to: run on and
+/// report it (BOOT_BROKEN), do not loop.
+pub fn boot_action(pending_marker : bool, previous_kept : bool) -> u8 {
+    if (!pending_marker) { return BOOT_RUN; }
+    if (previous_kept) { return BOOT_ROLLBACK; }
+    return BOOT_BROKEN;
+}
+
+/// The running build is confirmed good once it has lived long enough; the marker is removed then.
+pub fn confirm_due(uptime_s : u64) -> bool {
+    return uptime_s >= CONFIRM_AFTER_S;
+}
+
+/// One previous bundle is kept: the swap replaces it, a rollback consumes it.
+pub fn previous_after(swapped : bool, rolled_back : bool, previous_kept : bool) -> bool {
+    if (rolled_back) { return false; }
+    if (swapped) { return true; }
+    return previous_kept;
+}
+
+/// The version a rollback refuses from then on: the one that was running when the marker was found.
+pub fn rejected_after(boot : u8, running : u64, rejected : u64) -> u64 {
+    if (boot == BOOT_ROLLBACK) { return running; }
+    return rejected;
+}
+
+// ---------------------------------------------------------------- the release plan
+
+/// `tri t27os release --plan`: the numbered steps with the exact commands. Nothing here runs them.
+pub const PLAN_STEPS : u32 = 6;
+
+pub fn plan_text(out : []u8, cap : usize, v : u64) -> usize {
+    var w : usize = 0;
+    w = put_str(out, cap, w, "# T27 OS release ", 17);
+    w = put_semver(out, cap, w, v);
+    w = put_line_text(out, cap, w, " -- the plan only; nothing below was run", 40);
+    w = put_line_text(out, cap, w, "# Publishing needs the owner's yes. T27OS_SIGN_ID names a Developer ID Application identity (else ad hoc).", 106);
+    w = put_line_text(out, cap, w, "1. build:", 9);
+    w = put_line_text(out, cap, w, "   make t27os T27OS_BUILD=$(git rev-list --count HEAD)", 54);
+    w = put_line_text(out, cap, w, "2. zip:", 7);
+    w = put_str(out, cap, w, "   ditto -c -k --keepParent target/t27os/T27OS.app target/t27os/", 64);
+    w = put_zip_name(out, cap, w, v);
+    w = put_line_text(out, cap, w, "", 0);
+    w = put_line_text(out, cap, w, "3. sha256:", 10);
+    w = put_str(out, cap, w, "   shasum -a 256 target/t27os/", 30);
+    w = put_zip_name(out, cap, w, v);
+    w = put_line_text(out, cap, w, "", 0);
+    w = put_line_text(out, cap, w, "4. manifest:", 12);
+    w = put_line_text(out, cap, w, "   tri t27os manifest --build $(git rev-list --count HEAD) --sha <the digest of step 3> > target/t27os/t27os-release.t27", 120);
+    w = put_line_text(out, cap, w, "5. notes (the commits since the last tag):", 42);
+    w = put_line_text(out, cap, w, "   git log --format='- %s' $(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD > target/t27os/notes.md", 152);
+    w = put_line_text(out, cap, w, "6. publish (the owner's yes first):", 35);
+    w = put_str(out, cap, w, "   gh release create ", 21);
+    w = put_tag(out, cap, w, v);
+    w = put_str(out, cap, w, " target/t27os/", 14);
+    w = put_zip_name(out, cap, w, v);
+    w = put_str(out, cap, w, " target/t27os/t27os-release.t27 --title 'T27 OS ", 48);
+    w = put_semver(out, cap, w, v);
+    w = put_line_text(out, cap, w, "' --notes-file target/t27os/notes.md", 36);
+    return w;
+}
+
+/// The plan runs nothing, so it is always allowed; anything that would publish is refused until the owner
+/// has said yes, and this verb never carries that yes.
+pub fn publish_allowed(plan_only : bool, owner_yes : bool) -> bool {
+    if (plan_only) { return false; }
+    return owner_yes;
+}
+
+pub const REFUSAL : str = "tri t27os release: publishing needs the owner's yes and is not done by this verb; run it with --plan and follow the steps by hand";
+pub const REFUSAL_LEN : usize = 129;
+
+// ---------------------------------------------------------------- tests
+
+test the_version_is_semver_from_three_constants {
+    assert(current_version() == pack_version(0, 1, 0));
+    var out : [32]u8 = undefined;
+    const n : usize = put_semver(out[0..32], 32, 0, pack_version(12, 3, 456));
+    assert(n == 8);
+    assert(buf_has(out[0..32], n, "12.3.456", 8));
+    assert(version_major(pack_version(12, 3, 456)) == 12);
+    assert(version_minor(pack_version(12, 3, 456)) == 3);
+    assert(version_patch(pack_version(12, 3, 456)) == 456);
+}
+
+test a_semver_text_parses_and_anything_else_does_not {
+    assert(semver_parse("0.1.0", 5) == pack_version(0, 1, 0));
+    assert(semver_parse("10.20.30", 8) == pack_version(10, 20, 30));
+    assert(semver_parse("999999.999999.999999", 20) == pack_version(999999, 999999, 999999));
+    assert(semver_parse("1.2", 3) == NO_VERSION);
+    assert(semver_parse("1.2.3.4", 7) == NO_VERSION);
+    assert(semver_parse("v1.2.3", 6) == NO_VERSION);
+    assert(semver_parse("1.2.3-rc1", 9) == NO_VERSION);
+    assert(semver_parse("01.2.3", 6) == NO_VERSION);
+    assert(semver_parse("1..3", 4) == NO_VERSION);
+    assert(semver_parse("", 0) == NO_VERSION);
+    assert(semver_parse("1.2.1000000", 11) == NO_VERSION);
+}
+
+test a_newer_version_is_an_update_and_an_equal_or_unreadable_one_is_not {
+    assert(is_newer(pack_version(0, 1, 1), pack_version(0, 1, 0)));
+    assert(is_newer(pack_version(0, 2, 0), pack_version(0, 1, 99)));
+    assert(is_newer(pack_version(1, 0, 0), pack_version(0, 99, 99)));
+    assert(is_newer(pack_version(0, 1, 0), pack_version(0, 1, 0)) == false);
+    assert(is_newer(pack_version(0, 0, 9), pack_version(0, 1, 0)) == false);
+    assert(is_newer(NO_VERSION, pack_version(0, 1, 0)) == false);
+    assert(is_newer(pack_version(9, 9, 9), NO_VERSION) == false);
+}
+
+test the_manifest_is_written_in_t27_and_read_back {
+    var sha : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) { sha[i] = 'a'; i += 1; }
+    var out : [1024]u8 = undefined;
+    const n : usize = manifest_text(out[0..1024], 1024, pack_version(0, 1, 0), 42, sha[0..64], 64);
+    assert(n < 1024);
+    assert(buf_has(out[0..1024], n, "module T27osReleaseManifest;", 28));
+    assert(buf_has(out[0..1024], n, "pub const VERSION : str = \"0.1.0\";", 34));
+    assert(buf_has(out[0..1024], n, "pub const BUILD : u32 = 42;", 27));
+    assert(buf_has(out[0..1024], n, "pub const MIN_MACOS : str = \"11.0\";", 35));
+    assert(buf_has(out[0..1024], n, "https://github.com/gHashTag/t27/releases/download/v0.1.0/T27OS-0.1.0.zip", 72));
+    assert(buf_has(out[0..1024], n, "https://github.com/gHashTag/t27/releases/tag/v0.1.0", 51));
+    assert(out[n - 1] == 10);
+    assert(manifest_check(out[0..1024], n) == M_OK);
+    const f : u64 = field_str(out[0..1024], n, KEY_VERSION, 26);
+    assert(field_len(f) == 5);
+    assert(semver_parse(out[0..1024][field_start(f)..field_start(f) + 5], 5) == pack_version(0, 1, 0));
+    assert(field_num(out[0..1024], n, KEY_BUILD, 24) == 42);
+}
+
+test a_short_buffer_for_the_manifest_is_detected {
+    var sha : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) { sha[i] = '0'; i += 1; }
+    var big : [1024]u8 = undefined;
+    const full : usize = manifest_text(big[0..1024], 1024, pack_version(0, 1, 0), 1, sha[0..64], 64);
+    var small : [100]u8 = undefined;
+    const n : usize = manifest_text(small[0..100], 100, pack_version(0, 1, 0), 1, sha[0..64], 64);
+    assert(n == full);
+    assert(n > 100);
+}
+
+test a_manifest_with_any_field_wrong_is_refused_by_name {
+    assert(manifest_check("module X;", 9) == M_NO_VERSION);
+    var sha : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) { sha[i] = 'b'; i += 1; }
+    var good : [1024]u8 = undefined;
+    const n : usize = manifest_text(good[0..1024], 1024, pack_version(0, 1, 0), 7, sha[0..64], 64);
+    assert(manifest_check(good[0..1024], n) == M_OK);
+    // an uppercase digit in the sha
+    var up : [1024]u8 = undefined;
+    var j : usize = 0;
+    while (j < n) { up[j] = good[j]; j += 1; }
+    const f : u64 = field_str(up[0..1024], n, KEY_SHA, 25);
+    up[field_start(f)] = 'B';
+    assert(manifest_check(up[0..1024], n) == M_BAD_SHA);
+    // a version that is not semver
+    var bv : [1024]u8 = undefined;
+    j = 0;
+    while (j < n) { bv[j] = good[j]; j += 1; }
+    const g : u64 = field_str(bv[0..1024], n, KEY_VERSION, 26);
+    bv[field_start(g) + 1] = 'x';
+    assert(manifest_check(bv[0..1024], n) == M_NO_VERSION);
+    // a url off github.com/gHashTag/t27/releases
+    var bu : [1024]u8 = undefined;
+    j = 0;
+    while (j < n) { bu[j] = good[j]; j += 1; }
+    const h : u64 = field_str(bu[0..1024], n, KEY_URL, 22);
+    bu[field_start(h) + 8] = 'x';
+    assert(manifest_check(bu[0..1024], n) == M_BAD_URL);
+}
+
+test an_address_must_be_https_on_the_release_path {
+    assert(url_ok("https://github.com/gHashTag/t27/releases/download/v1.0.0/a.zip", 62));
+    assert(url_ok("http://github.com/gHashTag/t27/releases/download/v1.0.0/a.zip", 61) == false);
+    assert(url_ok("https://evil.example/gHashTag/t27/releases/download/a.zip", 57) == false);
+    assert(url_ok("https://github.com/gHashTag/t27/releases/", 41) == false);
+    assert(url_ok("https://github.com/gHashTag/t27/releases/a b", 44) == false);
+    assert(url_ok("https://github.com/gHashTag/t27/releases/a'b", 44) == false);
+    assert(url_ok("", 0) == false);
+}
+
+test a_sha_is_sixty_four_lowercase_hex_digits {
+    assert(sha_ok("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64));
+    assert(sha_ok("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef", 64) == false);
+    assert(sha_ok("0123456789abcdef", 16) == false);
+    assert(sha_ok("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg", 64) == false);
+    assert(sha_matches("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64));
+    assert(sha_matches("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 64, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde0", 64) == false);
+    assert(sha_matches("", 0, "", 0) == false);
+}
+
+test the_minimum_macos_is_compared_as_major_and_minor {
+    assert(macos_parse("11.0", 4) == 11000);
+    assert(macos_parse("14", 2) == 14000);
+    assert(macos_parse("13.4", 4) == 13004);
+    assert(macos_parse("11.x", 4) == 4294967295);
+    assert(macos_parse("", 0) == 4294967295);
+    assert(macos_parse("11.0.1", 6) == 4294967295);
+    assert(macos_meets("11.0", 4, 26000));
+    assert(macos_meets("11.0", 4, 11000));
+    assert(macos_meets("14.2", 4, 14001) == false);
+    assert(macos_meets("14.2", 4, 14002));
+    assert(macos_meets("nope", 4, 26000) == false);
+}
+
+test a_check_is_due_at_start_and_every_six_hours {
+    assert(CHECK_EVERY_S == 21600);
+    assert(check_due(1000000, 0));
+    assert(check_due(1000000, 1000000) == false);
+    assert(check_due(1021599, 1000000) == false);
+    assert(check_due(1021600, 1000000));
+    assert(check_due(1900000, 1000000));
+    assert(check_due(500, 1000000));
+}
+
+test a_check_never_runs_while_a_pane_is_busy {
+    assert(should_check(1000000, 0, 0));
+    assert(should_check(1000000, 0, 1) == false);
+    assert(should_check(1000000, 0, 16) == false);
+    assert(should_check(1000100, 1000000, 0) == false);
+    assert(should_check(1021600, 1000000, 2) == false);
+    assert(should_check(1021600, 1000000, 0));
+}
+
+test the_offer_follows_the_manifest_the_version_the_rollback_and_the_mac {
+    const cur : u64 = pack_version(0, 1, 0);
+    const nxt : u64 = pack_version(0, 2, 0);
+    assert(offer(M_OK, nxt, cur, NO_VERSION, true) == OFFER_UPDATE);
+    assert(offer(M_BAD_SHA, nxt, cur, NO_VERSION, true) == OFFER_BAD_MANIFEST);
+    assert(offer(M_OK, cur, cur, NO_VERSION, true) == OFFER_NONE);
+    assert(offer(M_OK, pack_version(0, 0, 9), cur, NO_VERSION, true) == OFFER_NONE);
+    assert(offer(M_OK, nxt, cur, nxt, true) == OFFER_REJECTED);
+    assert(offer(M_OK, nxt, cur, pack_version(0, 3, 0), true) == OFFER_UPDATE);
+    assert(offer(M_OK, nxt, cur, NO_VERSION, false) == OFFER_OLD_MACOS);
+}
+
+test the_update_walks_check_download_verify_stage_swap {
+    var s : u8 = U_IDLE;
+    s = update_step(s, EV_CHECK, 0);
+    assert(s == U_CHECKING);
+    s = update_step(s, EV_OFFER, 0);
+    assert(s == U_DOWNLOADING);
+    s = update_step(s, EV_DOWNLOADED, 0);
+    assert(s == U_VERIFYING);
+    s = update_step(s, EV_SHA_OK, 0);
+    assert(s == U_VERIFYING);
+    s = update_step(s, EV_SIGNED, 0);
+    assert(s == U_STAGED);
+    s = update_step(s, EV_SWAP, 0);
+    assert(s == U_SWAPPED);
+}
+
+test the_update_waits_for_rest_before_it_checks_and_before_it_swaps {
+    assert(update_step(U_IDLE, EV_CHECK, 1) == U_IDLE);
+    assert(update_step(U_STAGED, EV_SWAP, 1) == U_STAGED);
+    assert(update_step(U_STAGED, EV_SWAP, 0) == U_SWAPPED);
+}
+
+test a_failure_a_bad_digest_or_no_offer_falls_back_to_idle {
+    assert(update_step(U_DOWNLOADING, EV_FAILED, 0) == U_IDLE);
+    assert(update_step(U_VERIFYING, EV_SHA_BAD, 0) == U_IDLE);
+    assert(update_step(U_CHECKING, EV_NO_OFFER, 0) == U_IDLE);
+    assert(update_step(U_STAGED, EV_FAILED, 0) == U_IDLE);
+}
+
+test an_event_out_of_order_changes_nothing {
+    assert(update_step(U_IDLE, EV_DOWNLOADED, 0) == U_IDLE);
+    assert(update_step(U_CHECKING, EV_SWAP, 0) == U_CHECKING);
+    assert(update_step(U_DOWNLOADING, EV_SIGNED, 0) == U_DOWNLOADING);
+    assert(update_step(U_SWAPPED, EV_CHECK, 0) == U_SWAPPED);
+}
+
+test a_start_that_did_not_live_sixty_seconds_rolls_back {
+    assert(CONFIRM_AFTER_S == 60);
+    assert(confirm_due(59) == false);
+    assert(confirm_due(60));
+    assert(boot_action(false, true) == BOOT_RUN);
+    assert(boot_action(false, false) == BOOT_RUN);
+    assert(boot_action(true, true) == BOOT_ROLLBACK);
+    assert(boot_action(true, false) == BOOT_BROKEN);
+}
+
+test one_previous_bundle_is_kept_and_a_rollback_consumes_it {
+    assert(previous_after(true, false, false));
+    assert(previous_after(true, false, true));
+    assert(previous_after(false, true, true) == false);
+    assert(previous_after(false, false, true));
+    assert(previous_after(false, false, false) == false);
+}
+
+test the_version_a_rollback_removed_is_not_offered_again {
+    const bad : u64 = pack_version(0, 2, 0);
+    assert(rejected_after(BOOT_ROLLBACK, bad, NO_VERSION) == bad);
+    assert(rejected_after(BOOT_RUN, bad, NO_VERSION) == NO_VERSION);
+    assert(rejected_after(BOOT_BROKEN, bad, pack_version(0, 1, 5)) == pack_version(0, 1, 5));
+    assert(offer(M_OK, bad, pack_version(0, 1, 0), rejected_after(BOOT_ROLLBACK, bad, NO_VERSION), true) == OFFER_REJECTED);
+}
+
+test the_release_plan_has_six_steps_and_names_the_zip_and_the_tag {
+    var out : [2048]u8 = undefined;
+    const n : usize = plan_text(out[0..2048], 2048, pack_version(0, 1, 0));
+    assert(n < 2048);
+    assert(PLAN_STEPS == 6);
+    assert(buf_has(out[0..2048], n, "make t27os T27OS_BUILD=$(git rev-list --count HEAD)", 51));
+    assert(buf_has(out[0..2048], n, "ditto -c -k --keepParent target/t27os/T27OS.app target/t27os/T27OS-0.1.0.zip", 76));
+    assert(buf_has(out[0..2048], n, "shasum -a 256 target/t27os/T27OS-0.1.0.zip", 42));
+    assert(buf_has(out[0..2048], n, "tri t27os manifest --build", 26));
+    assert(buf_has(out[0..2048], n, "git log --format='- %s' $(git describe --tags --abbrev=0 --match 'v*'", 69));
+    assert(buf_has(out[0..2048], n, "gh release create v0.1.0 target/t27os/T27OS-0.1.0.zip target/t27os/t27os-release.t27", 84));
+    assert(buf_has(out[0..2048], n, "the plan only; nothing below was run", 36));
+    assert(buf_has(out[0..2048], n, "1. build", 8));
+    assert(buf_has(out[0..2048], n, "6. publish", 10));
+}
+
+test publishing_is_refused_without_the_owners_yes_and_the_plan_never_publishes {
+    assert(publish_allowed(true, true) == false);
+    assert(publish_allowed(true, false) == false);
+    assert(publish_allowed(false, false) == false);
+    assert(publish_allowed(false, true));
+    assert(REFUSAL_LEN == REFUSAL.len);
+}

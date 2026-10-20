@@ -136,10 +136,13 @@ Every loop tick ends with `Requests out:` (who, what, sent when, default, due).
 
 Load these skills when their functionality matches the task.
 
-### Model routing (owner directive 2026-10-19, replacing 2026-10-18)
+### Model routing (owner directive 2026-10-20, replacing 2026-10-19)
 
-Every agent runs on **Sonnet 5.5** by default, the orchestrating session included; any job escalates to
-**Opus 5.5** only after 2 failed attempts on the same task or on the owner's word. The law is `specs/claw/model_route.t27`; how to follow it is the `model-routing` skill.
+Sub-tasks (implement, port, search, test, docs, fix) start in a **free T27 OS pane** (the key master's free
+tier, visible in the window), go to a **Sonnet 5.5** subagent after 2 failed attempts and to **Opus 5.5**
+after 4 or on the owner's word; the orchestrating session plans and reviews on Sonnet 5.5. The law is
+`specs/claw/model_route.t27` (TIER_PANE, #11317); how to follow it is the `model-routing` skill, and a lane
+as a pane is the `t27os-orchestra` skill.
 `.claude/settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL` and each agent in `.claude/agents/` names its
 model.
 
