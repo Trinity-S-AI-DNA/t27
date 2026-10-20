@@ -20027,29 +20027,29 @@ long double: fabsl, default: llabs)(x)",
             .all(|n| Self::is_c_word(n) || self.declares(n))
     }
 
-    /// A repeated element this emitter writes as a C value: a non-string
-    /// literal, a name, a field or enum member, or a unary or cast over one.
-    /// Anything else keeps the old `{0}` rather than risk C that does not
-    /// compile.
-    fn c_repeat_value_lowers(v: &Node) -> bool {
-        match v.kind {
-            NodeKind::ExprLiteral => v.extra_kind != "string",
-            NodeKind::ExprIdentifier | NodeKind::ExprFieldAccess => true,
-            NodeKind::ExprUnary | NodeKind::ExprCast => {
-                v.children.first().map(Self::c_repeat_value_lowers).unwrap_or(false)
-            }
-            _ => false,
-        }
+    /// The values `[a, b] ** n` repeats (#11181): the literal's children, or -- for a bare `[5]` or
+    /// `[K]`, which reads as an array dimension, and for a module-level literal -- the text the parser
+    /// kept, parsed again whole and then comma by comma.
+    fn c_repeat_list(l: &Node) -> Vec<Node> {
+        if l.kind != NodeKind::ExprArrayLiteral || (l.children.is_empty() && !l.extra_type.is_empty()) { return vec![]; }
+        if !l.children.is_empty() { return l.children.clone(); }
+        let one = |t: &str| {
+            let mut p = Parser::new(Lexer::new(t.trim()));
+            p.parse_expr().ok().filter(|_| p.current.kind == TokenKind::Eof)
+        };
+        one(&l.extra_size).map_or_else(|| l.extra_size.split(',').filter_map(one).collect(), |e| vec![e])
     }
 
-    /// Is a repeated element one that `{0}` initialises exactly: a numeric
-    /// zero in any radix, `false`, or `undefined` (any value will do)?
+    /// Is a repeated element one that `{0}` initialises exactly: a numeric zero in any radix, `false`,
+    /// `undefined` (any value will do), or a cast, struct or repeat of those?
     fn c_repeat_value_is_zero(v: &Node) -> bool {
-        if v.kind == NodeKind::ExprIdentifier {
-            return v.name == "undefined";
-        }
-        if v.kind != NodeKind::ExprLiteral || v.extra_kind == "string" {
-            return false;
+        match v.kind {
+            NodeKind::ExprIdentifier => return v.name == "undefined",
+            NodeKind::ExprCall => return v.name == "@as" && v.children.get(1).is_some_and(Self::c_repeat_value_is_zero),
+            NodeKind::ExprStructLit => return v.children.iter().all(|f| f.children.first().is_some_and(Self::c_repeat_value_is_zero)),
+            NodeKind::ExprBinary => return v.extra_op == "**" && Some(Self::c_repeat_list(&v.children[0])).filter(|l| !l.is_empty()).is_some_and(|l| l.iter().all(Self::c_repeat_value_is_zero)),
+            NodeKind::ExprLiteral if v.extra_kind != "string" => {}
+            _ => return false,
         }
         let t = v.value.replace('_', "");
         if t == "false" {
@@ -22508,32 +22508,20 @@ long double: fabsl, default: llabs)(x)",
                 if node.children.len() >= 2 {
                     let op = node.extra_op.as_str();
                     if op == "**" {
-                        // Zig repeat operator: `[_]T{v} ** n`. The source is
-                        // kept as a comment, then the initializer.
-                        //
-                        // #6050: the initializer used to be `{0}` whatever `v`
-                        // was, so `[_]u8{5} ** 4` was an array of zeros. `{0}`
-                        // is right only for a zero value, and stays for one;
-                        // any other single value takes the GNU range the
-                        // `[v; n]` form below already uses (gcc and clang).
+                        // Zig repeat operator: `[_]T{v} ** n`. The source is kept as a
+                        // comment, then the initializer: `{0}` for a zero, else the GNU
+                        // range holding the value (#6050, #11181); clang cannot build one from a call.
+                        let at = self.output.len();
                         self.write("/* repeat: ");
                         self.gen_c_expr(&node.children[0]);
                         self.write(" ** ");
                         self.gen_c_expr(&node.children[1]);
                         self.write(" */ ");
-                        let lhs = &node.children[0];
-                        let single = if lhs.kind == NodeKind::ExprArrayLiteral
-                            && lhs.children.len() == 1
-                        {
-                            Some(&lhs.children[0])
-                        } else {
-                            None
-                        };
-                        match single {
-                            Some(v)
-                                if Self::c_repeat_value_lowers(v)
-                                    && !Self::c_repeat_value_is_zero(v) =>
-                            {
+                        if self.output[at..].matches("/*").count() > 1 {
+                            self.output.truncate(at); // a nested repeat would close this comment early
+                        }
+                        match Self::c_repeat_list(&node.children[0]).as_slice() {
+                            [v] if !Self::c_repeat_value_is_zero(v) => {
                                 self.write("{ [0 ... (");
                                 self.gen_c_expr(&node.children[1]);
                                 self.write(") - 1] = ");
@@ -23413,6 +23401,16 @@ impl Compiler {
         Ok((codegen.into_string(), refusal))
     }
 
+    /// #11181: `[a, b] ** n` repeats a list, which a designated range cannot hold, and was written `{0}`;
+    /// refused, as a switch without `else` is, unless every element is zero.
+    fn c_repeat_of_a_list(node: &Node) -> Option<String> {
+        let list = node.children.first().filter(|_| node.extra_op == "**").map(CCodegen::c_repeat_list).unwrap_or_default();
+        if list.len() > 1 && !list.iter().all(CCodegen::c_repeat_value_is_zero) {
+            return Some("a repeat of several values (`[a, b] ** n`) has no C initializer (#11181)".to_string());
+        }
+        node.children.iter().find_map(Self::c_repeat_of_a_list)
+    }
+
     /// #7308: gen-c lowers a switch to a ternary chain and ended it with `0` when no arm
     /// matched. Like Zig, refuse an integer switch (a numeric, negative or char label) with no
     /// `else` or `_` arm; enum-literal labels are left alone, naming every variant is exhaustive.
@@ -23449,7 +23447,7 @@ impl Compiler {
         let lexer = Lexer::new(source);
         let mut parser = Parser::new(lexer);
         let ast = parser.parse()?;
-        if let Some(e) = Self::c_int_switch_without_else(&ast, "") {
+        if let Some(e) = Self::c_int_switch_without_else(&ast, "").or_else(|| Self::c_repeat_of_a_list(&ast)) {
             return Err(e);
         }
         // Emit FAITHFUL C from the AST; the C compiler optimizes downstream. See
