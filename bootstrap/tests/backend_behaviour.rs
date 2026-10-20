@@ -719,12 +719,12 @@ fn c_declares_a_local_nested_array_as_a_matrix() {
 /// compile. rustc builds it now, and the #8891 cases compute what the spec's Zig tests assert.
 #[test]
 fn the_codegen_conformance_spec_compiles_and_runs_as_rust() {
-    let main = "fn main(){ let mut t = tally(&[1u8, 2, 3][..]); let n = t.n; println!(\"{} {} {} {} {:?} {} {}\", size_of(11) == Some(Size::big), \
-                size_name(Size::big), name_len(2), verdict(11).code, head(&[9u8, 8, 7][..], 2), n, tally_bump(&mut t, 2)); }\n";
+    let main = "fn main(){ let mut t = tally(&[1u8, 2, 3][..]); let n = t.n; println!(\"{} {} {} {} {:?} {} {} {} {} {} {}\", size_of(11) == Some(Size::big), \
+                size_name(Size::big), name_len(2), verdict(11).code, head(&[9u8, 8, 7][..], 2), n, tally_bump(&mut t, 2), slice_len(b\"abc\"), array_len([1, 2, 3, 4]), name_bytes(1), name_first_byte(2)); }\n";
     let Some(out) = rust_says(include_str!("../../specs/compiler/codegen_conformance.t27"), main, "rust-codegen-conformance") else {
         return;
     };
-    assert_eq!(out, "true big 3 1 [9, 8] 3 5");
+    assert_eq!(out, "true big 3 1 [9, 8] 3 5 3 4 2 99");
 }
 
 /// #8891: `@log2` reached rustc verbatim. It is a method, as `@sqrt` is.
@@ -735,11 +735,4 @@ fn rust_lowers_log2_to_a_method() {
         return;
     };
     assert_eq!(out, "3");
-}
-
-#[test] // #11182: slice, array and string lengths beside a struct field `len`, and a `[N]str` element passed on as bytes, build and compute with rustc
-fn gen_rust_slice_lengths_and_text_elements() {
-    let main = "fn main(){ println!(\"{} {} {} {}\", slice_len(b\"abc\"), array_len([1, 2, 3, 4]), name_bytes(1), name_first_byte(2)); }\n";
-    let Some(out) = rust_says(include_str!("../../specs/compiler/rust_slice_lowering.t27"), main, "rust-slice-lowering") else { return };
-    assert_eq!(out, "3 4 2 99");
 }
