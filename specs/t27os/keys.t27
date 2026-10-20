@@ -35,6 +35,7 @@ module T27osKeys;
 use t27os::agents::AGENT_COUNT;
 use t27os::session_store::csv_field;
 use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
 
 /// Keychain service every item is stored under.
 pub const KEYCHAIN_SERVICE : str = "ai.t27.os";
@@ -154,12 +155,13 @@ pub fn status_shown(has_key: bool, status: u32, fails: u32, opened: u64, now: u6
 }
 
 /// Rotation among n keys of one provider (trios ModelKeyRotation): the usable key used longest ago wins.
-/// A key is usable when it is not cooling down (`rest_until[k] <= now`). Returns n when none is usable.
-pub fn rotate_pick(n: u32, last_used: []const u64, rest_until: []const u64, now: u64) -> u32 {
+/// A key is usable when it is not cooling down (`rest_until[k] <= now`) and is not key `skip` (the one that
+/// just failed; pass n to skip none). Returns n when none is usable.
+pub fn rotate_pick_except(n: u32, skip: u32, last_used: []const u64, rest_until: []const u64, now: u64) -> u32 {
     var best : u32 = n;
     var k : u32 = 0;
     while (k < n) {
-        if (rest_until[k] <= now) {
+        if (rest_until[k] <= now and k != skip) {
             if (best == n) {
                 best = k;
             } else if (last_used[k] < last_used[best]) {
@@ -169,6 +171,11 @@ pub fn rotate_pick(n: u32, last_used: []const u64, rest_until: []const u64, now:
         k = k + 1;
     }
     return best;
+}
+
+/// Rotation with no key skipped.
+pub fn rotate_pick(n: u32, last_used: []const u64, rest_until: []const u64, now: u64) -> u32 {
+    return rotate_pick_except(n, n, last_used, rest_until, now);
 }
 
 /// Names a child process must not inherit: the Claude Code session markers of whatever started the server.
@@ -787,16 +794,46 @@ pub fn claude_strips(name: []const u8) -> bool {
     return false;
 }
 
-/// The profile a new claude pane gets: the first in order whose provider key is stored and has not
-/// failed its check (bad bit set). PR_NONE when there is none: the pane starts without a key and says so.
-pub fn pick_profile(stored: u32, bad: u32) -> u32 {
+// ---- the profile chain with numbered keys (gHashTag/t27#11224, FR-003) ------------------------------------
+// Free Claude Code walks an ordered fallback list when a request fails after its retries, and each fallback
+// entry may name a key number of its provider (key 1 first). Here the list is PROFILE_NAMES, walked at pane
+// spawn and pane failover (the failover decision is below), forward only: a profile that failed once is not
+// tried again by the same pane, so the walk always ends.
+
+/// The first profile after `after` (PR_NONE = from the start) whose provider key is stored and has not
+/// failed (bad bit set); PR_NONE when the chain is over. Any other `after` out of range ends the chain.
+pub fn next_profile(after: u32, stored: u32, bad: u32) -> u32 {
     var pr : u32 = 0;
+    if (after != PR_NONE) {
+        if (after >= PROFILE_COUNT) { return PR_NONE; }
+        pr = after + 1;
+    }
     while (pr < PROFILE_COUNT) {
         const bit : u32 = PROFILE_PROVIDER[pr];
         if ((stored >> bit) % 2 == 1 and (bad >> bit) % 2 == 0) { return pr; }
         pr = pr + 1;
     }
     return PR_NONE;
+}
+
+/// The profile a new claude pane gets: the first in order whose provider key is stored and has not
+/// failed its check (bad bit set). PR_NONE when there is none: the pane starts without a key and says so.
+pub fn pick_profile(stored: u32, bad: u32) -> u32 {
+    return next_profile(PR_NONE, stored, bad);
+}
+
+/// How many keys one provider may hold, numbered from 1 (Free Claude Code: "key 1 first").
+pub const MAX_KEYS : u32 = 3;
+
+/// The Keychain item of key number k (0-based; the panel says "key k+1") of provider p. Key 1 keeps the
+/// plain label of keychain_label, so a key stored before numbering stays where it is; keys 2 and 3 add
+/// "#2" and "#3". 0 for an unknown provider or a number past MAX_KEYS.
+pub fn keychain_label_n(p: u32, k: u32, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return 0; }
+    var n : usize = keychain_label(p, out);
+    if (k == 0) { return n; }
+    n = put_bytes(out, n, "#");
+    return put_dec(out, n, @as(u64, k) + 1);
 }
 
 /// The bad mask from the providers' statuses (st[p]): invalid and circuit-open keys are not offered.
@@ -975,6 +1012,74 @@ test the_new_profiles_follow_the_old_two_and_wait_for_their_own_key {
     assert pick_profile(57, 25) == PR_OLLAMA_CLOUD;
     assert pick_profile(4, 0) == PR_NONE;
     assert pick_profile(448, 0) == PR_NONE;
+}
+
+test the_chain_goes_forward_only_and_skips_a_missing_or_bad_key {
+    assert next_profile(PR_NONE, 57, 0) == PR_ZAI;
+    assert next_profile(PR_ZAI, 57, 0) == PR_ANTHROPIC;
+    assert next_profile(PR_ANTHROPIC, 57, 0) == PR_OPENROUTER;
+    assert next_profile(PR_OPENROUTER, 57, 0) == PR_OLLAMA_CLOUD;
+    assert next_profile(PR_OLLAMA_CLOUD, 57, 0) == PR_NONE;
+    assert next_profile(PR_ZAI, 57, 1) == PR_OPENROUTER;
+    assert next_profile(PR_ZAI, 17, 0) == PR_ANTHROPIC;
+    assert next_profile(PR_ANTHROPIC, 17, 0) == PR_NONE;
+    assert next_profile(PR_OPENROUTER, 25, 0) == PR_NONE;
+    assert next_profile(PR_OPENROUTER, 57, 32) == PR_NONE;
+    assert next_profile(PR_NONE, 0, 0) == PR_NONE;
+    assert next_profile(PROFILE_COUNT, 57, 0) == PR_NONE;
+    assert next_profile(7, 57, 0) == PR_NONE;
+}
+
+test pick_profile_is_the_start_of_the_chain {
+    var stored : u32 = 0;
+    while (stored < 64) {
+        var bad : u32 = 0;
+        while (bad < 64) {
+            assert pick_profile(stored, bad) == next_profile(PR_NONE, stored, bad);
+            bad = bad + 7;
+        }
+        stored = stored + 1;
+    }
+}
+
+test a_profile_is_never_offered_twice_by_one_walk {
+    var pr : u32 = next_profile(PR_NONE, 57, 0);
+    var steps : u32 = 0;
+    var prev : u32 = 255;
+    while (pr != PR_NONE) {
+        if (prev != 255) { assert pr > prev; }
+        prev = pr;
+        pr = next_profile(pr, 57, 0);
+        steps = steps + 1;
+    }
+    assert steps == PROFILE_COUNT;
+}
+
+test rotation_can_skip_the_key_that_just_failed {
+    var used : [3]u64 = [50, 10, 30];
+    var rest : [3]u64 = [0, 0, 0];
+    assert rotate_pick_except(3, 1, used[0..3], rest[0..3], 100) == 2;
+    assert rotate_pick_except(3, 2, used[0..3], rest[0..3], 100) == 1;
+    assert rotate_pick_except(3, 3, used[0..3], rest[0..3], 100) == 1;
+    rest[0] = 200;
+    assert rotate_pick_except(3, 1, used[0..3], rest[0..3], 100) == 2;
+    rest[2] = 200;
+    assert rotate_pick_except(3, 1, used[0..3], rest[0..3], 100) == 3;
+    assert rotate_pick_except(1, 0, used[0..3], rest[0..3], 100) == 1;
+}
+
+test a_second_key_has_its_own_keychain_item_and_the_first_keeps_the_old_one {
+    var a : [48]u8 = undefined;
+    var b : [48]u8 = undefined;
+    assert keychain_label_n(P_OPENAI, 0, a[0..48]) == 16;
+    assert keychain_label(P_OPENAI, b[0..48]) == 16;
+    assert a[15] == b[15] and a[10] == b[10];
+    assert keychain_label_n(P_OPENAI, 1, a[0..48]) == 18;
+    assert a[16] == 35 and a[17] == 50;
+    assert keychain_label_n(P_OPENAI, 2, a[0..48]) == 18;
+    assert a[16] == 35 and a[17] == 51;
+    assert keychain_label_n(P_OPENAI, MAX_KEYS, a[0..48]) == 0;
+    assert keychain_label_n(PROVIDER_COUNT, 0, a[0..48]) == 0;
 }
 
 test the_profile_tables_have_one_field_per_profile {
