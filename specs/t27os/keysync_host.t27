@@ -1,0 +1,381 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS keysync_host: where the key sync (keysync.t27) touches the machine. Crypto comes from the OS and is never
+// written by hand: Security.framework SecKey (suite 1: P-256; sealing = ECIES cofactor ECDH, X9.63 SHA-256, AES-GCM;
+// signing = ECDSA over SHA-256) and CommonCrypto's CC_SHA256 (libSystem). No decision lives here: which devices are
+// trusted, who may write, which copy wins and what may be published are tested fns of keysync.t27. This file only
+// generates, hashes, seals, opens, signs, verifies, and keeps the device's two private keys in the Keychain.
+//
+// Device keys: two P-256 pairs, one to seal to and one to sign with, made in memory (SecKeyCreateRandomKey, not
+// permanent) and kept as hex in the Keychain under service "ai.t27.os", accounts "keysync-seal" and "keysync-sign",
+// by the same /usr/bin/security path keys_host uses for provider keys (never SecItem: the window is signed ad hoc,
+// every rebuild is a new code identity and SecItem would ask for the login password again). A private key is read
+// only into a stack frame of this module, used for one call and wiped; it is never put on argv, in a file, a log
+// or a URL, and never leaves this machine. The OS constants (kSecAttrKeyType, the algorithm names, the CF callback
+// tables) are looked up by name with dlsym, so no header and no hard-coded string stands in for them.
+//
+// Specs holding @extern cannot run tests under t27c; keysync.t27 carries the tests. This module was exercised by a
+// separate smoke program on fake data (see the pull request): seal/open, sign/verify and their negative controls.
+//
+// Suite 2 (X25519 + Ed25519, the owner's first choice) is reserved in keysync.t27: CryptoKit has no C ABI, so it
+// would need a Swift shim; this module is where such a shim would be called, behind the same fns.
+//
+// Refs gHashTag/t27#11444.
+module T27osKeysyncHost;
+
+use t27os::keys::KEYCHAIN_SERVICE;
+use t27os::keys::SEC_OP_READ;
+use t27os::keys::SEC_OP_WRITE;
+use t27os::keys::SEC_OP_DELETE;
+use t27os::keys::SEC_OK;
+use t27os::keys::SEC_TIMEOUT_MS;
+use t27os::keys::sec_argv;
+use t27os::keys::sec_add_line;
+use t27os::keys::sec_key_from_output;
+use t27os::keys_host::sec_run;
+use t27os::pty_proto::get_u64;
+use t27os::pty_sys::sys_peek;
+use t27os::keysync::unhex;
+use t27os::keysync::put_hex;
+use t27os::keysync::fp_input;
+use t27os::keysync::fp_from_digest;
+use t27os::keysync::sync_status;
+use t27os::keysync::sync_word;
+use t27os::keysync::kd_view_clear;
+use t27os::keysync::kd_view_set;
+use t27os::keysync::kd_local_row;
+use t27os::keysync::DS_PENDING;
+use t27os::keysync::KDF_MINE;
+
+pub const PRIV_LEN : usize = 97;
+pub const PUB_LEN : usize = 65;
+pub const ACCT_SEAL : str = "keysync-seal";
+pub const ACCT_SIGN : str = "keysync-sign";
+pub const ACCT_SEAL_PUB : str = "keysync-seal-pub";
+pub const ACCT_SIGN_PUB : str = "keysync-sign-pub";
+
+const RTLD_DEFAULT : u64 = 18446744073709551614;
+const CF_UTF8 : u32 = 134217984;
+const CF_NUMBER_SINT32 : i64 = 3;
+
+fn dlsym_(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn cf_data(alloc: u64, bytes: []const u8, n: i64) -> u64 { return @extern("CFDataCreate"); }
+fn cf_num(alloc: u64, kind: i64, v: []u32) -> u64 { return @extern("CFNumberCreate"); }
+fn cf_dict(alloc: u64, keys: [4]u64, vals: [4]u64, n: i64, kcb: u64, vcb: u64) -> u64 { return @extern("CFDictionaryCreate"); }
+fn cf_release(o: u64) -> void { @extern("CFRelease"); }
+fn cf_len(d: u64) -> i64 { return @extern("CFDataGetLength"); }
+fn cf_ptr(d: u64) -> u64 { return @extern("CFDataGetBytePtr"); }
+fn sk_random(attrs: u64, err: u64) -> u64 { return @extern("SecKeyCreateRandomKey"); }
+fn sk_public(key: u64) -> u64 { return @extern("SecKeyCopyPublicKey"); }
+fn sk_export(key: u64, err: u64) -> u64 { return @extern("SecKeyCopyExternalRepresentation"); }
+fn sk_with_data(data: u64, attrs: u64, err: u64) -> u64 { return @extern("SecKeyCreateWithData"); }
+fn sk_encrypt(key: u64, alg: u64, data: u64, err: u64) -> u64 { return @extern("SecKeyCreateEncryptedData"); }
+fn sk_decrypt(key: u64, alg: u64, data: u64, err: u64) -> u64 { return @extern("SecKeyCreateDecryptedData"); }
+fn sk_sign(key: u64, alg: u64, data: u64, err: u64) -> u64 { return @extern("SecKeyCreateSignature"); }
+fn sk_verify(key: u64, alg: u64, data: u64, sig: u64, err: u64) -> u32 { return @extern("SecKeyVerifySignature"); }
+fn cc_sha256(data: []const u8, n: u32, md: []u8) -> u64 { return @extern("CC_SHA256"); }
+
+fn wipe(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// The value of an exported CF constant (a pointer variable such as kSecAttrKeyType), found by name.
+fn konst(name: []const u8) -> u64 {
+    const a : u64 = dlsym_(RTLD_DEFAULT, name);
+    if (a == 0) { return 0; }
+    var b : [8]u8 = undefined;
+    wipe(b[0..8]);
+    sys_peek(b[0..8], a, 8);
+    return get_u64(b[0..8], 0);
+}
+
+fn dict(k: [4]u64, v: [4]u64, n: i64) -> u64 {
+    return cf_dict(0, k, v, n, dlsym_(RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), dlsym_(RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+}
+
+/// The bytes of a CFData into out; the count, 0 when it is nil or does not fit. The CFData is released.
+fn take(d: u64, out: []u8) -> usize {
+    if (d == 0) { return 0; }
+    const n : i64 = cf_len(d);
+    var got : usize = 0;
+    if (n > 0 and @as(usize, @intCast(n)) <= out.len) {
+        sys_peek(out, cf_ptr(d), @as(u64, @intCast(n)));
+        got = @as(usize, @intCast(n));
+    }
+    cf_release(d);
+    return got;
+}
+
+/// A SecKey from its X9.63 bytes: class = kSecAttrKeyClassPublic / kSecAttrKeyClassPrivate. 0 when the OS refuses.
+fn key_from(bytes: []const u8, private: bool) -> u64 {
+    var k : [4]u64 = undefined;
+    var v : [4]u64 = undefined;
+    k[0] = konst("kSecAttrKeyType");
+    v[0] = konst("kSecAttrKeyTypeECSECPrimeRandom");
+    k[1] = konst("kSecAttrKeyClass");
+    if (private) { v[1] = konst("kSecAttrKeyClassPrivate"); } else { v[1] = konst("kSecAttrKeyClassPublic"); }
+    k[2] = 0;
+    v[2] = 0;
+    k[3] = 0;
+    v[3] = 0;
+    if (k[0] == 0 or v[0] == 0 or k[1] == 0 or v[1] == 0) { return 0; }
+    const d : u64 = dict(k, v, 2);
+    const raw : u64 = cf_data(0, bytes, @as(i64, @intCast(bytes.len)));
+    var key : u64 = 0;
+    if (d != 0 and raw != 0) { key = sk_with_data(raw, d, 0); }
+    if (raw != 0) { cf_release(raw); }
+    if (d != 0) { cf_release(d); }
+    return key;
+}
+
+/// SHA-256 of data into out[0..32] (CommonCrypto, in libSystem).
+pub fn ks_sha256(data: []const u8, out: []u8) -> bool {
+    if (out.len < 32 or data.len > 4294967295) { return false; }
+    cc_sha256(data, @as(u32, @intCast(data.len)), out);
+    return true;
+}
+
+/// A fresh P-256 pair in memory: priv = 97 bytes (X9.63 private), pubk = 65 bytes. False when the OS refuses.
+pub fn ks_gen_pair(priv: []u8, pubk: []u8) -> bool {
+    if (priv.len < PRIV_LEN or pubk.len < PUB_LEN) { return false; }
+    var k : [4]u64 = undefined;
+    var v : [4]u64 = undefined;
+    k[0] = konst("kSecAttrKeyType");
+    v[0] = konst("kSecAttrKeyTypeECSECPrimeRandom");
+    k[1] = konst("kSecAttrKeySizeInBits");
+    var bits : [1]u32 = undefined;
+    bits[0] = 256;
+    v[1] = cf_num(0, CF_NUMBER_SINT32, bits[0..1]);
+    k[2] = 0;
+    v[2] = 0;
+    k[3] = 0;
+    v[3] = 0;
+    if (k[0] == 0 or v[0] == 0 or k[1] == 0 or v[1] == 0) { return false; }
+    const d : u64 = dict(k, v, 2);
+    cf_release(v[1]);
+    if (d == 0) { return false; }
+    const sk : u64 = sk_random(d, 0);
+    cf_release(d);
+    if (sk == 0) { return false; }
+    const pn : usize = take(sk_export(sk, 0), priv);
+    const pk : u64 = sk_public(sk);
+    var pl : usize = 0;
+    if (pk != 0) {
+        pl = take(sk_export(pk, 0), pubk);
+        cf_release(pk);
+    }
+    cf_release(sk);
+    return pn == PRIV_LEN and pl == PUB_LEN;
+}
+
+/// Seal `plain` to the sealing public key `pubk` (65 bytes) into out: ECIES, a fresh ephemeral key each time. The
+/// ciphertext length, 0 on any failure.
+pub fn ks_seal(pubk: []const u8, plain: []const u8, out: []u8) -> usize {
+    if (pubk.len != PUB_LEN or plain.len == 0) { return 0; }
+    const key : u64 = key_from(pubk, false);
+    const alg : u64 = konst("kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM");
+    if (key == 0 or alg == 0) { return 0; }
+    const pd : u64 = cf_data(0, plain, @as(i64, @intCast(plain.len)));
+    var n : usize = 0;
+    if (pd != 0) {
+        n = take(sk_encrypt(key, alg, pd, 0), out);
+        cf_release(pd);
+    }
+    cf_release(key);
+    return n;
+}
+
+/// Open a ciphertext with the sealing private key `priv` (97 bytes) into out; the plaintext length, 0 on any failure
+/// (a wrong key, a damaged or relabelled ciphertext all fail the AES-GCM tag).
+pub fn ks_open(priv: []const u8, ct: []const u8, out: []u8) -> usize {
+    if (priv.len != PRIV_LEN or ct.len == 0) { return 0; }
+    const key : u64 = key_from(priv, true);
+    const alg : u64 = konst("kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM");
+    if (key == 0 or alg == 0) { return 0; }
+    const cd : u64 = cf_data(0, ct, @as(i64, @intCast(ct.len)));
+    var n : usize = 0;
+    if (cd != 0) {
+        n = take(sk_decrypt(key, alg, cd, 0), out);
+        cf_release(cd);
+    }
+    cf_release(key);
+    return n;
+}
+
+/// Sign `msg` with the signing private key `priv` (97 bytes): ECDSA over SHA-256, X9.62 DER into out.
+pub fn ks_sign(priv: []const u8, msg: []const u8, out: []u8) -> usize {
+    if (priv.len != PRIV_LEN or msg.len == 0) { return 0; }
+    const key : u64 = key_from(priv, true);
+    const alg : u64 = konst("kSecKeyAlgorithmECDSASignatureMessageX962SHA256");
+    if (key == 0 or alg == 0) { return 0; }
+    const md : u64 = cf_data(0, msg, @as(i64, @intCast(msg.len)));
+    var n : usize = 0;
+    if (md != 0) {
+        n = take(sk_sign(key, alg, md, 0), out);
+        cf_release(md);
+    }
+    cf_release(key);
+    return n;
+}
+
+/// True when `sig` is a good signature of `msg` under the signing public key `pubk` (65 bytes).
+pub fn ks_verify(pubk: []const u8, msg: []const u8, sig: []const u8) -> bool {
+    if (pubk.len != PUB_LEN or msg.len == 0 or sig.len == 0) { return false; }
+    const key : u64 = key_from(pubk, false);
+    const alg : u64 = konst("kSecKeyAlgorithmECDSASignatureMessageX962SHA256");
+    if (key == 0 or alg == 0) { return false; }
+    const md : u64 = cf_data(0, msg, @as(i64, @intCast(msg.len)));
+    const sd : u64 = cf_data(0, sig, @as(i64, @intCast(sig.len)));
+    var ok : bool = false;
+    if (md != 0 and sd != 0) { ok = (sk_verify(key, alg, md, sd, 0) & 255) != 0; }
+    if (md != 0) { cf_release(md); }
+    if (sd != 0) { cf_release(sd); }
+    cf_release(key);
+    return ok;
+}
+
+// ---------------------------------------------------------------- the device's private keys in the Keychain
+
+fn kc_run(op: u32, account: []const u8, feed: []const u8, raw: []u8, res: []u32) -> u32 {
+    var words : [160]u8 = undefined;
+    var offs : [8]u32 = undefined;
+    wipe(words[0..160]);
+    var z : usize = 0;
+    while (z < 8) {
+        offs[z] = 0;
+        z = z + 1;
+    }
+    const argc : u32 = sec_argv(op, KEYCHAIN_SERVICE, account, words[0..160], offs[0..8]);
+    if (argc == 0) { return 3; }
+    return sec_run(words[0..160], offs[0..8], argc, feed, raw, res, @as(i32, @intCast(SEC_TIMEOUT_MS)));
+}
+
+/// Keep bytes (at most 127) under `account` as hex; never replaces one (the tool answers 45 on an existing item).
+fn kc_put_hex(account: []const u8, priv: []const u8) -> bool {
+    if (priv.len > 127) { return false; }
+    var hex : [200]u8 = undefined;
+    wipe(hex[0..200]);
+    const hn : usize = put_hex(hex[0..200], 0, priv);
+    var line : [400]u8 = undefined;
+    wipe(line[0..400]);
+    const ln : usize = sec_add_line(KEYCHAIN_SERVICE, account, hex[0..hn], line[0..400]);
+    wipe(hex[0..200]);
+    if (ln == 0) { return false; }
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = kc_run(SEC_OP_WRITE, account, line[0..ln], raw[0..256], res[0..2]);
+    wipe(line[0..400]);
+    wipe(raw[0..256]);
+    return st == SEC_OK;
+}
+
+/// Read bytes kept by kc_put_hex into priv (exactly priv.len of them); true when they are there and decode whole.
+fn kc_get_hex(account: []const u8, priv: []u8) -> bool {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = kc_run(SEC_OP_READ, account, "", raw[0..256], res[0..2]);
+    var hex : [256]u8 = undefined;
+    wipe(hex[0..256]);
+    var ok : bool = false;
+    if (st == SEC_OK) {
+        const n : usize = sec_key_from_output(raw[0 .. @as(usize, res[0])], hex[0..256]);
+        if (n == priv.len * 2 and unhex(hex[0..n], priv) == priv.len) { ok = true; }
+    }
+    wipe(raw[0..256]);
+    wipe(hex[0..256]);
+    return ok;
+}
+
+/// The device has both private keys in its Keychain.
+pub fn ks_have_device() -> bool {
+    var a : [97]u8 = undefined;
+    var b : [97]u8 = undefined;
+    const ok : bool = kc_get_hex(ACCT_SEAL, a[0..97]) and kc_get_hex(ACCT_SIGN, b[0..97]);
+    wipe(a[0..97]);
+    wipe(b[0..97]);
+    return ok;
+}
+
+/// Make this device's two pairs if it has none and keep their private halves in the Keychain; hand back the two
+/// public keys (65 bytes each). False when the OS or the Keychain refused (a half-made device is rolled back).
+pub fn ks_device_make(seal_pub: []u8, sign_pub: []u8) -> bool {
+    if (ks_have_device()) { return false; }
+    var sp : [97]u8 = undefined;
+    var gp : [97]u8 = undefined;
+    wipe(sp[0..97]);
+    wipe(gp[0..97]);
+    var ok : bool = ks_gen_pair(sp[0..97], seal_pub) and ks_gen_pair(gp[0..97], sign_pub);
+    if (ok) { ok = kc_put_hex(ACCT_SEAL, sp[0..97]) and kc_put_hex(ACCT_SIGN, gp[0..97]); }
+    // the public halves too (public, but the same home keeps a device whole: the fingerprint is computed from them)
+    if (ok) { ok = kc_put_hex(ACCT_SEAL_PUB, seal_pub[0..65]) and kc_put_hex(ACCT_SIGN_PUB, sign_pub[0..65]); }
+    wipe(sp[0..97]);
+    wipe(gp[0..97]);
+    return ok;
+}
+
+/// This device's fingerprint (keysync.t27 fp_from_digest of SHA-256(suite byte || seal public || sign public)) into
+/// fp[0..10]; false when the device has no keys. Only public keys are read.
+pub fn ks_device_fp(fp: []u8) -> bool {
+    if (fp.len < 10) { return false; }
+    var buf : [131]u8 = undefined;
+    var sp : [65]u8 = undefined;
+    var gp : [65]u8 = undefined;
+    if (!kc_get_hex(ACCT_SEAL_PUB, sp[0..65]) or !kc_get_hex(ACCT_SIGN_PUB, gp[0..65])) { return false; }
+    const n : usize = fp_input(1, sp[0..65], gp[0..65], buf[0..131]);
+    var dg : [32]u8 = undefined;
+    if (n == 0 or !ks_sha256(buf[0..n], dg[0..32])) { return false; }
+    return fp_from_digest(dg[0..32], fp[0..10]) == 10;
+}
+
+/// Open a ciphertext addressed to this device with the Keychain's sealing key into out; the plaintext length.
+/// The private key lives in this frame for the one call and is wiped.
+pub fn ks_device_open(ct: []const u8, out: []u8) -> usize {
+    var sp : [97]u8 = undefined;
+    wipe(sp[0..97]);
+    var n : usize = 0;
+    if (kc_get_hex(ACCT_SEAL, sp[0..97])) { n = ks_open(sp[0..97], ct, out); }
+    wipe(sp[0..97]);
+    return n;
+}
+
+/// Sign with this device's Keychain signing key.
+pub fn ks_device_sign(msg: []const u8, out: []u8) -> usize {
+    var gp : [97]u8 = undefined;
+    wipe(gp[0..97]);
+    var n : usize = 0;
+    if (kc_get_hex(ACCT_SIGN, gp[0..97])) { n = ks_sign(gp[0..97], msg, out); }
+    wipe(gp[0..97]);
+    return n;
+}
+
+/// Fill the Devices view of the KEYS panel (keysync.t27 kd_view_*): the sync status line, then this device's row.
+/// Until the sign-in of share.t27 is wired into the window TRI CLAW counts as not connected, so the status line says to sign in; no
+/// registry is read yet, so no other device is listed and no Approve / Reject button is offered. No key is read: only
+/// the public halves, for the fingerprint.
+pub fn ks_view_fill(view: []u8) -> void {
+    kd_view_clear(view);
+    var fp : [10]u8 = undefined;
+    const have : bool = ks_device_fp(fp[0..10]);
+    var w : [40]u8 = undefined;
+    const wn : usize = sync_word(sync_status(false, have, false, DS_PENDING, 0, 0), w[0..40]);
+    kd_view_set(view, 0, 0, w[0..wn]);
+    var r : [64]u8 = undefined;
+    const rn : usize = kd_local_row(have, fp[0..10], r[0..64]);
+    kd_view_set(view, 1, KDF_MINE, r[0..rn]);
+}
+
+test the_host_module_is_declared {
+    var b : [4]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1;
+}

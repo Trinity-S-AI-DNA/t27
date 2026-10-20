@@ -12,9 +12,7 @@ use t27b::eval::{Interp, Stop};
 use t27b::ir::{OverflowMode, Program, Ty};
 use t27b::jit::Jit;
 use t27b::timing::Phases;
-#[path = "../../../gen/rust/tri/t27b/check_budget.rs"]
-#[allow(dead_code, unused_parens)]
-mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
+#[path = "../../../gen/rust/tri/t27b/check_budget.rs"] #[allow(dead_code, unused_parens)] mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
 #[path = "../../../gen/rust/tri/t27b/watch_build.rs"] #[allow(dead_code, unused_parens)] mod watch_build; // `t27b watch`: when to build, the temp path, when --then runs (#10859)
 use t27b::blockers::{self, Reference, Verdicts};
 use t27b::{a64, front, lower, macho};
@@ -197,6 +195,7 @@ fn main() -> ExitCode {
             };
             cmd_corpus(Path::new(&dir), &o)
         }
+        "--version" | "-V" => { outln!("t27b {}\nbuild {} commit {}", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").unwrap_or("0"), option_env!("T27_COMMIT").unwrap_or("unknown")); ExitCode::SUCCESS }
         "help" | "--help" | "-h" => {
             outln!("{}", USAGE);
             ExitCode::SUCCESS

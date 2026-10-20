@@ -192,8 +192,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "t27c")]
-// `t27c version` existed; `--version` and `-V` did not, so the flag every
-// other CLI answers returned "unexpected argument". One attribute.
 #[command(version)]
 #[command(about = "T27 Bootstrap Compiler for Trinity S³AI Framework", long_about = None)]
 struct Cli {
@@ -11955,6 +11953,7 @@ fn run_gen_behavior_sva_v2(
 
 #[cfg(not(feature = "server"))]
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("t27c {}\nbuild {} commit {}", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").unwrap_or("0"), option_env!("T27_COMMIT").unwrap_or("unknown")); return Ok(()) }
     let cli = Cli::parse();
 
     match cli.command {

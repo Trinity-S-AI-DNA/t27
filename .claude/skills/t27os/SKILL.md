@@ -49,10 +49,35 @@ dashboard and back). The window only calls the decisions of `bench.t27`, `kanban
 - **Q QUEEN**: lamps (27, "not measured": `domain_pulse` cannot be linked into the window, #5980), feed, top gaps with
   why-not, the six-counter meter (links and tests from `git log` / `grep` in the space's folder once a minute),
   safety strip with STOP = GOD MODE off.
+- **H HIVE (TRI NET devices)**: `devices.t27`. One glass card per machine (host, T27 OS version + build and "behind N" against
+  the `t27os-latest` tag, `t27c` version, CPU/RAM/free disk, lanes running with model, key light and elapsed), a flow strip
+  CLAIMED -> LANE PUSHED -> TRIGIT LANDED -> BATCH PUSHED -> MERGED. Sources are git only: `git ls-remote` of
+  `refs/swarm/claims/*`, `claude/claim-*`, `claude/evolve-lane-*`, `t27os-*` tags, `refs/swarm/alive/*` fetched with their
+  committer dates, `tri golden status`. Each machine publishes `refs/swarm/alive/<host>` (subject = payload `hb1 host=.. build=..
+  lanes=issue:model:light:elapsed,..`) every 5 min from the app (`dv_publish_due`), a heartbeat older than 30 min reads OFFLINE,
+  a host with only a lane branch reads NO HEARTBEAT and n/m. Lanes of this machine come from the lanes table (the lanes feed
+  runs while the page is open and before each beat). The page widgets carry their agents in `DW_AGENTS`.
+- **Formula orbit around the home logo**: `orbit_view.t27` over `formula_orbit.t27` + `formula_table.t27`. How many of the 32
+  labels fit depends on the stage (PAD 52 is the law of formula_orbit): about 10 in a 960 x 540 window, all 32 from about
+  1440 x 800. Reduced motion (NSWorkspace) freezes the clock. formula_orbit's PAD, NONE and card_* were renamed ORB_PAD,
+  ORB_NONE, orb_card_*: t27b splices every import into one namespace and kanban/topic_reel/petal_menu own those names.
 - **Trap, measured**: `t27b` splices every imported module into one flat namespace, so a same-named private helper in
   two modules is silently the first one. The page specs prefix their internals (`kb_`, `qb_`, `bn_`); check with the
   duplicate-name script before importing a new spec into `glass_window`. The fast `t27b test` does not type-check the
   non-test functions unless an error forces the full checker (add an unknown name to a scratch copy).
+
+## Updates on the fly (owner, 2026-10-20; rules and tests: `specs/t27os/release.t27`, host: `glass_window.t27` update_tick)
+
+Every machine updates itself online. At launch and every 10 minutes the app fetches the manifest of the release named
+`t27os-latest` (assets replaced on every publish; releases are tagged `t27os-v<semver>-b<build>`, never `v*`). A newer
+build is downloaded to `~/.t27os/updates/<build>/`, checked against the manifest's sha256 rows, unzipped, signed ad hoc
+and verified, and swapped in only when no pane is busy (quiet 60 s, or the **UPDATE NOW** line above the sidebar foot).
+The previous bundle stays in `~/.t27os/updates/previous`; a start that dies within 60 s is rolled back by the next one,
+which refuses that build. Each release also ships arm64 `t27b`, `t27c`, `tri` built from the same commit; they go to
+`~/.t27os/bin` (first on every pane's PATH, `.prev` kept) only when their `--version` names the manifest's COMMIT.
+The pane server runs under launchd (`ai.t27.os.pty`, never a child of the app or a shell) and is restarted only when its
+own digest changed. Publish: `tri t27os publish --yes` (owner's word); `tri t27os release --plan` prints the steps.
+A copy that is not a built bundle (build 0), or runs from a checkout's `target/` folder, never updates itself.
 
 ## The image (owner, 2026-10-20)
 

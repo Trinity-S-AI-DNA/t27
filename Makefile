@@ -36,7 +36,7 @@ install:
 	@test "$(EARN)" != on || { echo "EARN=on: no lab node ships in this checkout yet; nothing was installed" >&2; exit 2; }
 	./scripts/tri disk
 	cargo build --release -p t27c -p tri $(if $(T27B),-p t27b)
-	@test -z "$(PIN)" || test "$$(target/release/t27c --version)" = "t27c $(PIN)" || { echo "version pin $(PIN) not met: $$(target/release/t27c --version)" >&2; exit 2; }
+	@test -z "$(PIN)" || test "$$(target/release/t27c --version | head -1)" = "t27c $(PIN)" || { echo "version pin $(PIN) not met: $$(target/release/t27c --version | head -1)" >&2; exit 2; }
 	@set -e; for p in $(PAIRS); do s=$${p%%:*}; d=$(PREFIX)/$${p#*:}; mkdir -p "$$(dirname "$$d")"; m=755; case "$$s" in specs/*|.trinity/*) m=644;; esac; install -C -m $$m "$$s" "$$d"; done
 	@set -e; mkdir -p $(PREFIX)/share/t27; m=$$({ cat $(LIST) 2>/dev/null || :; printf '%s\n' $(PAIRS) | sed 's/^[^:]*://'; echo share/t27/install.list; } | sort -u); [ "$$m" = "$$(cat $(LIST) 2>/dev/null)" ] || printf '%s\n' "$$m" > $(LIST)
 	$(if $(filter on,$(CLAW)),@cd $(PREFIX)/share/t27/claw && $(PREFIX)/bin/t27c seal --verify specs/claw/service.t27)
