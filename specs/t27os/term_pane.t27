@@ -22,6 +22,9 @@ use t27os::pty_proto::RE_OK;
 use t27os::pty_proto::RE_DATA;
 use t27os::pty_proto::RE_LISTING;
 use t27os::windows::session_agent;
+use t27os::agents::S_STOPPED;
+use t27os::agents::S_DONE;
+use t27os::vt::VIEW_SUB;
 
 /// The agent whose rows open a terminal pane: AGENT 0, Claude Code (agents.t27 AGENT_NAMES order).
 pub const TERM_AGENT : u32 = 0;
@@ -278,6 +281,27 @@ pub fn tp_pane_live(frame: []const u8, len: usize, pane: u32) -> bool {
     return false;
 }
 
+/// The state the server lists for the k-th pane of `agent` (entry byte 2, S_* of agents.t27), so a row shows
+/// what the pane really is: S_STOPPED when the server lists no such pane or its live flag (bit 0) is clear.
+pub fn tp_state_of(frame: []const u8, len: usize, agent: u32, k: u32) -> u32 {
+    if (len < HEADER or frame[0] != RE_LISTING) { return S_STOPPED; }
+    var seen : u32 = 0;
+    var at : usize = HEADER;
+    while (at + 4 <= len) {
+        if (@as(u32, frame[at + 1]) == agent) {
+            if (seen == k) {
+                if (frame[at + 3] % 2 == 0) { return S_STOPPED; }
+                const st : u32 = @as(u32, frame[at + 2]);
+                if (st > S_DONE) { return S_STOPPED; }
+                return st;
+            }
+            seen = seen + 1;
+        }
+        at = at + 4;
+    }
+    return S_STOPPED;
+}
+
 /// Which of the window's chats of its own agent chat `cur` is: 0 for the first, 1 for the second, ...
 pub fn tp_ordinal(ss: u64, cur: u32) -> u32 {
     const a : u32 = session_agent(ss, cur);
@@ -305,6 +329,65 @@ pub fn tp_data_len(frame: []const u8, len: usize) -> usize {
 /// Another READ this frame? Only while the last one came back full and the budget lasts.
 pub fn tp_read_more(got: usize, reads: u32) -> bool {
     return got == 4096 and reads < TP_READS_MAX;
+}
+
+// ---- scrollback glue (#11398): the wheel over the pane, the jump-to-live chip ----------------------------------
+
+/// The host's whole cells buffer: the grid (TP_CELLS at most), a saved main screen and the history ring (vt.t27).
+pub const TP_BUF_CELLS : u32 = 960000;
+/// One wheel notch of a mouse (not a trackpad) counts as this many rows.
+pub const TP_NOTCH_ROWS : f64 = 3.0;
+
+/// The chip "jump to live", centred above the pane's bottom edge.
+pub const TP_CHIP_W : f64 = 112.0;
+pub const TP_CHIP_H : f64 = 26.0;
+pub const TP_CHIP_GAP : f64 = 14.0;
+
+pub fn tp_chip_x(ox: f64, pw: f64) -> f64 { return ox + 0.5 * (pw - TP_CHIP_W); }
+pub fn tp_chip_y(oy: f64, ph: f64) -> f64 { return oy + ph - TP_CHIP_H - TP_CHIP_GAP; }
+
+pub fn tp_chip_hit(px: f64, py: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    const x : f64 = tp_chip_x(ox, pw);
+    const y : f64 = tp_chip_y(oy, ph);
+    return px >= x and px < x + TP_CHIP_W and py >= y and py < y + TP_CHIP_H;
+}
+
+/// Is the pointer over the pane (the grid's rectangle)?
+pub fn tp_over_pane(px: f64, py: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    return px >= ox and px < ox + pw and py >= oy and py < oy + ph;
+}
+
+/// The wheel's travel in points (NSEvent scrollingDeltaY; `notch` = a mouse wheel, which reports lines) as sub-row
+/// units of the view: a trackpad moves the text by the pixels it travelled, a mouse notch by TP_NOTCH_ROWS rows.
+pub fn tp_wheel_units(dy: f64, notch: bool) -> u32 {
+    var d : f64 = dy;
+    if (d < 0.0) { d = 0.0 - d; }
+    var rows : f64 = d / TP_LINE_H;
+    if (notch) { rows = d * TP_NOTCH_ROWS; }
+    return @as(u32, @intFromFloat(rows * @as(f64, VIEW_SUB) + 0.5));
+}
+
+/// The cell under the pointer, for a mouse report: (column, row) clamped to the grid.
+pub fn tp_cell_col(px: f64, ox: f64, cols: u32) -> u32 {
+    if (px <= ox + TP_PAD) { return 0; }
+    const c : u32 = @as(u32, @intFromFloat((px - ox - TP_PAD) / TP_CELL_W));
+    if (c >= cols) { return cols - 1; }
+    return c;
+}
+
+pub fn tp_cell_row(py: f64, oy: f64, rows: u32) -> u32 {
+    if (py <= oy + TP_PAD) { return 0; }
+    const r : u32 = @as(u32, @intFromFloat((py - oy - TP_PAD) / TP_LINE_H));
+    if (r >= rows) { return rows - 1; }
+    return r;
+}
+
+/// A key press that sends bytes (n > 0) returns the view to live; so does a click on the chip.
+pub fn tp_key_goes_live(n: u32) -> bool { return n > 0; }
+
+/// Dirty draw gate: the pane needs a draw when the grid changed (generation) or the view moved.
+pub fn tp_draw_due(gen: u32, last_gen: u32, view: u32, last_view: u32) -> bool {
+    return gen != last_gen or view != last_view;
 }
 
 /// Try to connect this frame? At once on a fresh pane, then every TP_RETRY frames while offline.
@@ -459,4 +542,61 @@ test an_editor_pane_is_reused_only_while_the_server_lists_it_live {
     assert tp_pane_live(f[0..16], 3, 3) == false;
     f[0] = RE_OK;
     assert tp_pane_live(f[0..16], 16, 3) == false;
+}
+
+test a_row_shows_the_state_the_server_lists_not_the_seed {
+    // the live finding: "pane 0 agent 0 state 3 flags 1" is idle and live, not stopped
+    var f : [16]u8 = undefined;
+    f[0] = RE_LISTING; f[1] = 0; f[2] = 12; f[3] = 0;
+    f[4] = 0; f[5] = 0; f[6] = 3; f[7] = 1;
+    f[8] = 5; f[9] = 1; f[10] = 1; f[11] = 1;
+    f[12] = 7; f[13] = 0; f[14] = 2; f[15] = 0;
+    assert tp_state_of(f[0..16], 16, 0, 0) == 3;
+    assert tp_state_of(f[0..16], 16, 1, 0) == 1;
+    // the second claude pane is listed but its live flag is clear: stopped
+    assert tp_state_of(f[0..16], 16, 0, 1) == S_STOPPED;
+    // no such pane, a truncated frame, a frame that is not a listing, a state past S_DONE
+    assert tp_state_of(f[0..16], 16, 4, 0) == S_STOPPED;
+    assert tp_state_of(f[0..16], 4, 0, 0) == S_STOPPED;
+    f[4 + 2] = 9;
+    assert tp_state_of(f[0..16], 16, 0, 0) == S_STOPPED;
+    f[0] = RE_OK;
+    assert tp_state_of(f[0..16], 16, 1, 0) == S_STOPPED;
+}
+
+test the_chip_sits_above_the_bottom_edge_and_takes_clicks {
+    // a pane at (272, 45), 600 x 400
+    assert tp_chip_x(272.0, 600.0) == 272.0 + 244.0;
+    assert tp_chip_y(45.0, 400.0) == 45.0 + 400.0 - 26.0 - 14.0;
+    assert tp_chip_hit(272.0 + 300.0, 45.0 + 370.0, 272.0, 45.0, 600.0, 400.0);
+    assert tp_chip_hit(272.0 + 10.0, 45.0 + 370.0, 272.0, 45.0, 600.0, 400.0) == false;
+    assert tp_chip_hit(272.0 + 300.0, 45.0 + 100.0, 272.0, 45.0, 600.0, 400.0) == false;
+}
+
+test the_wheel_over_the_pane_converts_to_sub_rows {
+    // a trackpad: 15 pt of travel = one row = 16 sub-rows; 1 pt is about one sixteenth
+    assert tp_wheel_units(15.0, false) == 16;
+    assert tp_wheel_units(0.0 - 15.0, false) == 16;
+    assert tp_wheel_units(1.0, false) == 1;
+    assert tp_wheel_units(7.5, false) == 8;
+    // a mouse notch of 1 line is 3 rows
+    assert tp_wheel_units(1.0, true) == 48;
+    assert tp_over_pane(300.0, 100.0, 272.0, 45.0, 600.0, 400.0);
+    assert tp_over_pane(100.0, 100.0, 272.0, 45.0, 600.0, 400.0) == false;
+}
+
+test the_pointer_cell_for_a_mouse_report_stays_on_the_grid {
+    assert tp_cell_col(0.0, 272.0, 80) == 0;
+    assert tp_cell_col(272.0 + 14.0 + 7.22 * 10.0 + 1.0, 272.0, 80) == 10;
+    assert tp_cell_col(5000.0, 272.0, 80) == 79;
+    assert tp_cell_row(45.0 + 14.0 + 15.0 * 3.0 + 1.0, 45.0, 30) == 3;
+    assert tp_cell_row(5000.0, 45.0, 30) == 29;
+}
+
+test typing_and_a_moved_view_ask_for_a_draw {
+    assert tp_key_goes_live(1) and tp_key_goes_live(0) == false;
+    assert tp_draw_due(5, 5, 0, 0) == false;
+    assert tp_draw_due(6, 5, 0, 0);
+    assert tp_draw_due(5, 5, 16, 0);
+    assert TP_BUF_CELLS >= 2 * TP_CELLS;
 }

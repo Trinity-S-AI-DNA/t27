@@ -1,0 +1,811 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/lanes_view.t27 -- LANES and ACTORS in the chat sidebar: one row model for everything that runs.
+; Owner, 2026-10-20 (#11397): "I want to SEE all lanes and actors in T27 OS CHAT mode." Five sources, one row type:
+;   PANE     a chat/terminal pane of the PTY server (the sessions the sidebar already lists),
+;   SCRIPT   a script lane: a directory /tmp/claude-501/lane-<issue> with a .lane.log (the lane runners),
+;   TRIGIT   a line of the own-git status, `<branch> <flags> <VERDICT>` (claude/evolve-lane-11367 ppppp CARRIED),
+;   QUEEN    the Queen's board numbers (links, tests, gaps) and whether GOD MODE is on,
+;   KERNEL   the kernel tree of kernel.t27: the supervisors, the services and one node per lane.
+; A row has: the issue it works on, the model, the key light (keys.t27 light_of, from the model's tier), the state,
+; the elapsed seconds, and the last line of what it printed. A click on a SCRIPT row opens the tail of its log.
+; --
+; DRY: the key light is keys.t27's light_of and its chain tiers; the tree is kernel.t27's node table; states for panes
+; are agents.t27's S_*. Nothing is restated. The host reads are thin glue: ONE shell job every LV_PERIOD_S seconds while
+; the sidebar is up writes ~/.t27os/lanes/lanes.txt in the line format below, and the window reads the file; the
+; tail job writes ~/.t27os/lanes/tail.txt. All parsing, mapping and geometry are here, with tests.
+; --
+; FEED FORMAT, one record per line, fields split by `|` (a field never holds one: the job maps `|` to a space):
+;   L|<dir name>|<log mtime epoch>|<dir birth epoch>|<R|D|B>|<model word or ->|<last line>      a script lane
+;   T|<branch>|<flags>|<VERDICT>                                                                 an own-git status line
+; R = no marker in the log's last 30 lines, D = LANE-DONE seen, B = LANE-BLOCKED seen.
+; Every number the host could not read is LV_NOT_MEASURED, shown as "-": never a 0 that looks like a reading.
+
+module T27osLanesView;
+
+use t27os::keys::light_of;
+use t27os::keys::L_NONE;
+use t27os::keys::L_GREEN;
+use t27os::keys::L_YELLOW;
+use t27os::keys::L_RED;
+use t27os::keys::CT_ZAI_FREE;
+use t27os::keys::CT_OR_FREE;
+use t27os::keys::CT_PAID;
+use t27os::keys::CT_NO_TIER;
+use t27os::agents::S_STOPPED;
+use t27os::agents::S_WORKING;
+use t27os::agents::S_BLOCKED;
+use t27os::agents::S_IDLE;
+use t27os::agents::S_DONE;
+use t27os::kernel::node_count;
+use t27os::kernel::node_kind;
+use t27os::kernel::node_depth;
+use t27os::kernel::N_SERVICE0;
+use t27os::kernel::SERVICE_COUNT;
+use t27os::kernel::SERVICE_NAMES;
+use t27os::kernel::KIND_NAMES;
+use t27os::kernel::KN_LANE;
+
+// ---- sources, states, models ----
+
+pub const LV_PANE : u32 = 0;
+pub const LV_SCRIPT : u32 = 1;
+pub const LV_TRIGIT : u32 = 2;
+pub const LV_QUEEN : u32 = 3;
+pub const LV_KERNEL : u32 = 4;
+pub const LV_SRC_COUNT : u32 = 5;
+pub const LV_SRC_NAMES : [5]str = ["PANE", "SCRIPT", "TRIGIT", "QUEEN", "KERNEL"];
+
+pub const LVS_RUNNING : u32 = 0;
+pub const LVS_DONE : u32 = 1;
+pub const LVS_BLOCKED : u32 = 2;
+pub const LVS_STALLED : u32 = 3;
+pub const LVS_IDLE : u32 = 4;
+pub const LVS_READY : u32 = 5;
+pub const LVS_UNKNOWN : u32 = 6;
+pub const LVS_COUNT : u32 = 7;
+pub const LVS_NAMES : [7]str = ["RUNNING", "DONE", "BLOCKED", "STALLED", "IDLE", "READY", "UNKNOWN"];
+
+pub const LVM_UNKNOWN : u32 = 0;
+pub const LVM_GLM_FLASH : u32 = 1;
+pub const LVM_GLM : u32 = 2;
+pub const LVM_OR_FREE : u32 = 3;
+pub const LVM_SONNET : u32 = 4;
+pub const LVM_OPUS : u32 = 5;
+pub const LVM_HAIKU : u32 = 6;
+pub const LVM_COUNT : u32 = 7;
+pub const LVM_NAMES : [7]str = ["-", "GLM FLASH", "GLM", "OR FREE", "SONNET", "OPUS", "HAIKU"];
+
+/// A number the host could not read.
+pub const LV_NOT_MEASURED : u32 = 4294967295;
+/// Seconds without a write to its log after which a lane with no end marker counts as STALLED.
+pub const LV_STALL_S : u32 = 300;
+/// Seconds between two runs of the feed job while the sidebar is up.
+pub const LV_PERIOD_S : u64 = 5;
+
+// ---- the table: LV_F u32 fields per row, the last line's bytes in a second buffer ----
+
+pub const LVF_SRC : usize = 0;
+pub const LVF_ISSUE : usize = 1;
+pub const LVF_MODEL : usize = 2;
+pub const LVF_LIGHT : usize = 3;
+pub const LVF_STATE : usize = 4;
+pub const LVF_ELAPSED : usize = 5;
+pub const LVF_TLEN : usize = 6;
+pub const LVF_DEPTH : usize = 7;
+pub const LV_F : usize = 8;
+/// Rows kept; bytes of last line kept per row.
+pub const LV_MAX : u32 = 64;
+pub const LV_LINE : usize = 80;
+
+/// Append a row; its last line is cut to LV_LINE bytes and to printable ASCII. The new row count (unchanged when full).
+pub fn lv_add(tab: []u32, txt: []u8, n: u32, src: u32, issue: u32, model: u32, light: u32, state: u32, elapsed: u32, depth: u32, line: []const u8) -> u32 {
+    if (n >= LV_MAX) { return n; }
+    const r : usize = @as(usize, n) * LV_F;
+    tab[r + LVF_SRC] = src;
+    tab[r + LVF_ISSUE] = issue;
+    tab[r + LVF_MODEL] = model;
+    tab[r + LVF_LIGHT] = light;
+    tab[r + LVF_STATE] = state;
+    tab[r + LVF_ELAPSED] = elapsed;
+    tab[r + LVF_DEPTH] = depth;
+    var i : usize = 0;
+    const base : usize = @as(usize, n) * LV_LINE;
+    while (i < line.len and i < LV_LINE) {
+        var b : u8 = line[i];
+        if (b < 32 or b > 126) { b = 32; }
+        txt[base + i] = b;
+        i = i + 1;
+    }
+    tab[r + LVF_TLEN] = @as(u32, @intCast(i));
+    return n + 1;
+}
+
+pub fn lv_row_text(txt: []const u8, tab: []const u32, i: u32) -> []const u8 {
+    const base : usize = @as(usize, i) * LV_LINE;
+    return txt[base .. base + @as(usize, tab[@as(usize, i) * LV_F + LVF_TLEN])];
+}
+
+// ---- small readers ----
+
+fn lv_is_digit(b: u8) -> bool { return b >= 48 and b <= 57; }
+
+/// The last run of digits in `name` as a number (an issue number: lane-11367, claude/evolve-lane-11371), 0 if none.
+pub fn lv_issue_of(name: []const u8) -> u32 {
+    var end : usize = name.len;
+    while (end > 0 and lv_is_digit(name[end - 1]) == false) { end = end - 1; }
+    if (end == 0) { return 0; }
+    var start : usize = end;
+    while (start > 0 and lv_is_digit(name[start - 1])) { start = start - 1; }
+    if (end - start > 9) { return 0; }
+    var v : u32 = 0;
+    var i : usize = start;
+    while (i < end) { v = v * 10 + @as(u32, name[i] - 48); i = i + 1; }
+    return v;
+}
+
+/// Does `text` hold the ASCII word `w` (case-insensitive)?
+pub fn lv_has(text: []const u8, w: string) -> bool {
+    if (w.len == 0 or text.len < w.len) { return false; }
+    var i : usize = 0;
+    while (i + w.len <= text.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < w.len and same) {
+            var a : u8 = text[i + j];
+            if (a >= 65 and a <= 90) { a = a + 32; }
+            var q : u8 = @as(u8, w[j]);
+            if (q >= 65 and q <= 90) { q = q + 32; }
+            if (a != q) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The model of a lane from a word or a line that names it (a command line, a brief, the feed's model field).
+pub fn lv_model_of(text: []const u8) -> u32 {
+    if (lv_has(text, "opus")) { return LVM_OPUS; }
+    if (lv_has(text, "sonnet")) { return LVM_SONNET; }
+    if (lv_has(text, "haiku")) { return LVM_HAIKU; }
+    if (lv_has(text, "glm")) {
+        if (lv_has(text, "flash")) { return LVM_GLM_FLASH; }
+        return LVM_GLM;
+    }
+    if (lv_has(text, ":free")) { return LVM_OR_FREE; }
+    return LVM_UNKNOWN;
+}
+
+/// The chain tier (keys.t27 CT_*) a model is served from; CT_NO_TIER for an unknown one.
+pub fn lv_tier_of(model: u32) -> u32 {
+    if (model == LVM_GLM_FLASH or model == LVM_GLM) { return CT_ZAI_FREE; }
+    if (model == LVM_OR_FREE) { return CT_OR_FREE; }
+    if (model == LVM_SONNET or model == LVM_OPUS or model == LVM_HAIKU) { return CT_PAID; }
+    return CT_NO_TIER;
+}
+
+/// The key light of a row: keys.t27 light_of over the model's tier. `usable` = keys of that provider free now.
+pub fn lv_light(model: u32, gave_up: bool, usable: u32) -> u32 {
+    return light_of(lv_tier_of(model), gave_up, usable);
+}
+
+// ---- states ----
+
+/// A script lane's state from the feed's marker and its log's age.
+pub fn lv_script_state(flag: u8, mtime: u32, now: u32) -> u32 {
+    if (flag == 68) { return LVS_DONE; }
+    if (flag == 66) { return LVS_BLOCKED; }
+    if (flag != 82) { return LVS_UNKNOWN; }
+    if (mtime == LV_NOT_MEASURED or now < mtime) { return LVS_RUNNING; }
+    if (now - mtime > LV_STALL_S) { return LVS_STALLED; }
+    return LVS_RUNNING;
+}
+
+/// Own-git verdict word to a state: CARRIED is on the golden head, FORWARD is ready to go forward, the two broken
+/// ones block the lane; anything else is UNKNOWN (never guessed).
+pub fn lv_trigit_state(verdict: []const u8) -> u32 {
+    if (lv_has(verdict, "carried")) { return LVS_DONE; }
+    if (lv_has(verdict, "forward")) { return LVS_READY; }
+    if (lv_has(verdict, "not_golden")) { return LVS_BLOCKED; }
+    if (lv_has(verdict, "unknown_parent")) { return LVS_BLOCKED; }
+    return LVS_UNKNOWN;
+}
+
+/// A pane's state from agents.t27's S_*: working runs, blocked waits on the human, idle and done as they say.
+pub fn lv_pane_state(s: u32) -> u32 {
+    if (s == S_WORKING) { return LVS_RUNNING; }
+    if (s == S_BLOCKED) { return LVS_BLOCKED; }
+    if (s == S_IDLE) { return LVS_IDLE; }
+    if (s == S_DONE) { return LVS_DONE; }
+    if (s == S_STOPPED) { return LVS_IDLE; }
+    return LVS_UNKNOWN;
+}
+
+/// Does the lane still run (a RUNNING row)? The sidebar's header counts these.
+pub fn lv_live(state: u32) -> bool { return state == LVS_RUNNING; }
+
+pub fn lv_elapsed(now: u32, birth: u32) -> u32 {
+    if (birth == LV_NOT_MEASURED or now < birth) { return LV_NOT_MEASURED; }
+    return now - birth;
+}
+
+fn lv_put(out: []u8, at: usize, b: u8) -> usize {
+    if (at >= out.len) { return at; }
+    out[at] = b;
+    return at + 1;
+}
+
+fn lv_put_num(out: []u8, at: usize, v: u32) -> usize {
+    var d : [10]u8 = undefined;
+    var n : usize = 0;
+    var w : u32 = v;
+    if (w == 0) { d[0] = 48; n = 1; }
+    while (w > 0) { d[n] = @as(u8, @intCast(48 + w % 10)); w = w / 10; n = n + 1; }
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < n) { p = lv_put(out, p, d[n - 1 - i]); i = i + 1; }
+    return p;
+}
+
+fn lv_put_str(out: []u8, at: usize, s: string) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < s.len) { p = lv_put(out, p, @as(u8, s[i])); i = i + 1; }
+    return p;
+}
+
+/// Elapsed seconds as text: "-" when not measured, 45s, 12m, 2h05m. Returns the length written.
+pub fn lv_elapsed_text(sec: u32, out: []u8) -> usize {
+    if (sec == LV_NOT_MEASURED) { return lv_put(out, 0, 45); }
+    if (sec < 60) {
+        const p : usize = lv_put_num(out, 0, sec);
+        return lv_put(out, p, 115);
+    }
+    if (sec < 3600) {
+        const p : usize = lv_put_num(out, 0, sec / 60);
+        return lv_put(out, p, 109);
+    }
+    var p : usize = lv_put_num(out, 0, sec / 3600);
+    p = lv_put(out, p, 104);
+    const m : u32 = (sec % 3600) / 60;
+    if (m < 10) { p = lv_put(out, p, 48); }
+    p = lv_put_num(out, p, m);
+    return p;
+}
+
+// ---- the feed ----
+
+/// Index of the next `|` or line end in `s` from `at`.
+fn lv_field_end(s: []const u8, at: usize, lim: usize) -> usize {
+    var i : usize = at;
+    while (i < lim and s[i] != 124) { i = i + 1; }
+    return i;
+}
+
+fn lv_num_in(s: []const u8, a: usize, b: usize) -> u32 {
+    if (b <= a or b - a > 10) { return LV_NOT_MEASURED; }
+    var v : u64 = 0;
+    var i : usize = a;
+    while (i < b) {
+        if (lv_is_digit(s[i]) == false) { return LV_NOT_MEASURED; }
+        v = v * 10 + @as(u64, s[i] - 48);
+        i = i + 1;
+    }
+    if (v >= 4294967295) { return LV_NOT_MEASURED; }
+    return @as(u32, @intCast(v));
+}
+
+/// Read the feed: every `L|` and `T|` line becomes a row (other lines are skipped). `now` is the epoch second.
+/// Returns the row count. Script lanes come first, then own-git lines, in file order.
+pub fn lv_parse(feed: []const u8, now: u32, tab: []u32, txt: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    var at : usize = 0;
+    while (at < feed.len) {
+        var le : usize = at;
+        while (le < feed.len and feed[le] != 10) { le = le + 1; }
+        if (le - at > 3 and feed[at + 1] == 124) {
+            const kind : u8 = feed[at];
+            const f1 : usize = at + 2;
+            const e1 : usize = lv_field_end(feed, f1, le);
+            if (kind == 76) {
+                const e2 : usize = lv_field_end(feed, e1 + 1, le);
+                const e3 : usize = lv_field_end(feed, e2 + 1, le);
+                const e4 : usize = lv_field_end(feed, e3 + 1, le);
+                const e5 : usize = lv_field_end(feed, e4 + 1, le);
+                if (e5 < le and e4 < le) {
+                    const mtime : u32 = lv_num_in(feed, e1 + 1, e2);
+                    const birth : u32 = lv_num_in(feed, e2 + 1, e3);
+                    var flag : u8 = 63;
+                    if (e4 > e3 + 1) { flag = feed[e3 + 1]; }
+                    const model : u32 = lv_model_of(feed[e4 + 1 .. e5]);
+                    n = lv_add(tab, txt, n, LV_SCRIPT, lv_issue_of(feed[f1 .. e1]), model, lv_light(model, flag == 66, 1), lv_script_state(flag, mtime, now), lv_elapsed(now, birth), 0, feed[e5 + 1 .. le]);
+                }
+            } else if (kind == 84) {
+                const e2 : usize = lv_field_end(feed, e1 + 1, le);
+                const e3 : usize = lv_field_end(feed, e2 + 1, le);
+                if (e3 > e2 and e2 < le and e1 < le) {
+                    var ln : [80]u8 = undefined;
+                    var w : usize = 0;
+                    w = lv_copy(ln[0..80], w, feed[f1 .. e1]);
+                    w = lv_put(ln[0..80], w, 32);
+                    w = lv_copy(ln[0..80], w, feed[e1 + 1 .. e2]);
+                    w = lv_put(ln[0..80], w, 32);
+                    w = lv_copy(ln[0..80], w, feed[e2 + 1 .. e3]);
+                    n = lv_add(tab, txt, n, LV_TRIGIT, lv_issue_of(feed[f1 .. e1]), LVM_UNKNOWN, L_NONE, lv_trigit_state(feed[e2 + 1 .. e3]), LV_NOT_MEASURED, 0, ln[0..w]);
+                }
+            }
+        }
+        at = le + 1;
+    }
+    return n;
+}
+
+fn lv_copy(out: []u8, at: usize, s: []const u8) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < s.len) { p = lv_put(out, p, s[i]); i = i + 1; }
+    return p;
+}
+
+// ---- the other three sources ----
+
+/// A pane row: the agent's name as the line, the state from agents.t27, the light from the pane's model and keys.
+pub fn lv_pane_row(tab: []u32, txt: []u8, n: u32, name: []const u8, issue: u32, model: u32, pane_state: u32, gave_up: bool, usable: u32, elapsed: u32) -> u32 {
+    return lv_add(tab, txt, n, LV_PANE, issue, model, lv_light(model, gave_up, usable), lv_pane_state(pane_state), elapsed, 0, name);
+}
+
+/// The Queen's row: her board numbers as the line; RUNNING while GOD MODE is on, IDLE while it is off.
+pub fn lv_queen_row(tab: []u32, txt: []u8, n: u32, links: u32, tests: u32, gaps: u32, god: bool) -> u32 {
+    var ln : [80]u8 = undefined;
+    var w : usize = 0;
+    w = lv_put_str(ln[0..80], w, "links ");
+    if (links == LV_NOT_MEASURED) { w = lv_put(ln[0..80], w, 45); } else { w = lv_put_num(ln[0..80], w, links); }
+    w = lv_put_str(ln[0..80], w, " tests ");
+    if (tests == LV_NOT_MEASURED) { w = lv_put(ln[0..80], w, 45); } else { w = lv_put_num(ln[0..80], w, tests); }
+    w = lv_put_str(ln[0..80], w, " gaps ");
+    if (gaps == LV_NOT_MEASURED) { w = lv_put(ln[0..80], w, 45); } else { w = lv_put_num(ln[0..80], w, gaps); }
+    var st : u32 = LVS_IDLE;
+    if (god) { st = LVS_RUNNING; }
+    return lv_add(tab, txt, n, LV_QUEEN, 0, LVM_UNKNOWN, L_NONE, st, LV_NOT_MEASURED, 0, ln[0..w]);
+}
+
+/// The kernel tree of kernel.t27 as rows, depth-first order by node id: ROOT, QUEEN, LANES, SERVICES, the five
+/// services, then one LANE node per running lane. `lane_states[j]` is lane j's state (LS_*) for the lane nodes.
+pub fn lv_kernel_rows(tab: []u32, txt: []u8, n0: u32, lanes: u32, lane_states: []const u32) -> u32 {
+    var n : u32 = n0;
+    const total : u32 = node_count(lanes);
+    var i : u32 = 0;
+    while (i < total) {
+        const k : u32 = node_kind(i, lanes);
+        var ln : [40]u8 = undefined;
+        var w : usize = 0;
+        if (i >= N_SERVICE0 and i < N_SERVICE0 + SERVICE_COUNT) {
+            w = lv_put_str(ln[0..40], w, SERVICE_NAMES[i - N_SERVICE0]);
+        } else {
+            w = lv_put_str(ln[0..40], w, KIND_NAMES[k]);
+            if (k == KN_LANE) {
+                w = lv_put(ln[0..40], w, 32);
+                w = lv_put_num(ln[0..40], w, i - 8);
+            }
+        }
+        var st : u32 = LVS_RUNNING;
+        if (k == KN_LANE) {
+            const j : usize = @as(usize, i - 9);
+            if (j < lane_states.len) { st = lane_states[j]; } else { st = LVS_UNKNOWN; }
+        }
+        n = lv_add(tab, txt, n, LV_KERNEL, 0, LVM_UNKNOWN, L_NONE, st, LV_NOT_MEASURED, node_depth(i, lanes), ln[0..w]);
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---- the sidebar block: geometry, scroll, click ----
+
+pub const LV_ROW_H : f64 = 34.0;
+pub const LV_LABEL_H : f64 = 22.0;
+pub const LV_NONE : u32 = 4294967295;
+
+/// Rows that fit in `avail` points under the label.
+pub fn lv_visible(avail: f64) -> u32 {
+    if (avail <= LV_LABEL_H) { return 0; }
+    return @as(u32, @intFromFloat((avail - LV_LABEL_H) / LV_ROW_H));
+}
+
+pub fn lv_scroll_max(n: u32, vis: u32) -> u32 {
+    if (n <= vis) { return 0; }
+    return n - vis;
+}
+
+pub fn lv_scroll_clamp(off: u32, n: u32, vis: u32) -> u32 {
+    const mx : u32 = lv_scroll_max(n, vis);
+    if (off > mx) { return mx; }
+    return off;
+}
+
+/// Top of row slot s (0 = the first visible) when the block starts at `top` (its label's top).
+pub fn lv_row_top(top: f64, s: u32) -> f64 { return top + LV_LABEL_H + @as(f64, s) * LV_ROW_H; }
+
+/// The row index under y for a block at `top` scrolled by `off`, or LV_NONE.
+pub fn lv_row_at(y: f64, top: f64, off: u32, n: u32, vis: u32) -> u32 {
+    if (y < top + LV_LABEL_H) { return LV_NONE; }
+    const s : u32 = @as(u32, @intFromFloat((y - top - LV_LABEL_H) / LV_ROW_H));
+    if (s >= vis or off + s >= n) { return LV_NONE; }
+    return off + s;
+}
+
+/// Only a script lane has a log to tail; the other sources show the row's own line.
+pub fn lv_can_tail(src: u32) -> bool { return src == LV_SCRIPT; }
+
+/// Count rows in a state.
+pub fn lv_count(tab: []const u32, n: u32, state: u32) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        if (tab[@as(usize, i) * LV_F + LVF_STATE] == state) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---- the host jobs ----
+
+pub const LV_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; D=$HOME/.t27os/lanes; mkdir -p $D; ";
+pub const LV_DIR : str = "/.t27os/lanes/";
+pub const LV_FILE : str = "lanes.txt";
+pub const LV_TAIL_FILE : str = "tail.txt";
+
+/// The feed job (after the `export HOME=".."` head): one L| record per lane dir, then the own-git T| lines.
+/// stat -f is the BSD form; a field that cannot be read is empty and the parser shows "-".
+pub const LV_FEED_CMD : str = "for d in /tmp/claude-501/lane-*; do [ -f \"$d/.lane.log\" ] || continue; f=\"$d/.lane.log\"; fl=R; tail -n 30 \"$f\" | grep -q LANE-DONE && fl=D; tail -n 30 \"$f\" | grep -q LANE-BLOCKED && fl=B; m=$(stat -f %m \"$f\"); b=$(stat -f %B \"$d\"); w=$(cat \"$d/.lane_brief.md\" \"$f\" 2>/dev/null | head -c 6000 | grep -o -i -m1 'glm-[a-z0-9.-]*\\|sonnet[a-z0-9.-]*\\|opus[a-z0-9.-]*\\|haiku[a-z0-9.-]*\\|[a-z0-9/-]*:free' | head -n1); l=$(tail -n 1 \"$f\" | tr -c '[:print:]' ' ' | tr '|' ' ' | cut -c1-80); echo \"L|${d##*/}|$m|$b|$fl|${w:--}|$l\"; done > $D/lanes.part; tri golden status 2>/dev/null | grep -E '^[A-Za-z0-9/_.-]+ [p.-]{5} [A-Z_]+$' | sed -E 's/^([^ ]+) ([^ ]+) ([^ ]+)$/T|\\1|\\2|\\3/' >> $D/lanes.part; mv $D/lanes.part $D/lanes.txt";
+
+/// The tail job for lane `issue` (digits only; the caller passes a number, so nothing from the feed reaches the shell).
+pub fn lv_tail_cmd(issue: u32, out: []u8) -> usize {
+    var p : usize = lv_put_str(out, 0, "tail -n 40 /tmp/claude-501/lane-");
+    p = lv_put_num(out, p, issue);
+    p = lv_put_str(out, p, "/.lane.log 2>/dev/null | tr -c '[:print:]\\n' ' ' > $D/tail.part; mv $D/tail.part $D/tail.txt");
+    return p;
+}
+
+/// Split a tail into lines: start offsets of up to `max` lines (the last `max` when there are more); returns the count.
+pub fn lv_tail_lines(buf: []const u8, starts: []u32, max: u32) -> u32 {
+    var total : u32 = 0;
+    var at : usize = 0;
+    while (at < buf.len) {
+        var le : usize = at;
+        while (le < buf.len and buf[le] != 10) { le = le + 1; }
+        total = total + 1;
+        at = le + 1;
+    }
+    var skip : u32 = 0;
+    if (total > max) { skip = total - max; }
+    var seen : u32 = 0;
+    var k : u32 = 0;
+    at = 0;
+    while (at < buf.len) {
+        var le2 : usize = at;
+        while (le2 < buf.len and buf[le2] != 10) { le2 = le2 + 1; }
+        if (seen >= skip and k < max) {
+            starts[@as(usize, k)] = @as(u32, @intCast(at));
+            k = k + 1;
+        }
+        seen = seen + 1;
+        at = le2 + 1;
+    }
+    return k;
+}
+
+/// The length of the line starting at `at`.
+pub fn lv_line_len(buf: []const u8, at: u32) -> u32 {
+    var i : usize = @as(usize, at);
+    while (i < buf.len and buf[i] != 10) { i = i + 1; }
+    return @as(u32, @intCast(i)) - at;
+}
+
+/// Is a feed refresh due? Only while the sidebar is up and LV_PERIOD_S has passed (0 = never ran).
+pub fn lv_refresh_due(up: bool, now: u64, last: u64) -> bool {
+    if (up == false) { return false; }
+    if (last == 0 or now < last) { return true; }
+    return now - last >= LV_PERIOD_S;
+}
+
+// ---- tests ----
+
+test an_issue_is_the_last_run_of_digits {
+    assert lv_issue_of("lane-11367") == 11367;
+    assert lv_issue_of("claude/evolve-lane-11371") == 11371;
+    assert lv_issue_of("claude/t27os-keys-v4") == 4;
+    assert lv_issue_of("no-digits-here") == 0;
+    assert lv_issue_of("") == 0;
+    assert lv_issue_of("lane-12345678901") == 0;
+}
+
+test a_model_word_names_the_model_and_the_tier {
+    assert lv_model_of("glm-4.5-flash") == LVM_GLM_FLASH;
+    assert lv_model_of("GLM-4.6") == LVM_GLM;
+    assert lv_model_of("claude-sonnet-5-5") == LVM_SONNET;
+    assert lv_model_of("claude-opus-5-5") == LVM_OPUS;
+    assert lv_model_of("claude-haiku-4") == LVM_HAIKU;
+    assert lv_model_of("meta-llama/llama-3.3-70b:free") == LVM_OR_FREE;
+    assert lv_model_of("-") == LVM_UNKNOWN;
+    assert lv_tier_of(LVM_GLM_FLASH) == CT_ZAI_FREE and lv_tier_of(LVM_OR_FREE) == CT_OR_FREE;
+    assert lv_tier_of(LVM_OPUS) == CT_PAID and lv_tier_of(LVM_UNKNOWN) == CT_NO_TIER;
+}
+
+test the_key_light_is_keys_t27s_and_unknown_models_have_none {
+    // free tiers are yellow, paid is green, no usable key or a given-up chain is red, no model no light
+    assert lv_light(LVM_GLM_FLASH, false, 2) == L_YELLOW;
+    assert lv_light(LVM_OPUS, false, 1) == L_GREEN;
+    assert lv_light(LVM_OPUS, false, 0) == L_RED;
+    assert lv_light(LVM_OR_FREE, true, 3) == L_RED;
+    assert lv_light(LVM_UNKNOWN, false, 5) == L_NONE;
+}
+
+test a_script_lane_state_follows_its_marker_and_the_age_of_its_log {
+    assert lv_script_state(68, 100, 5000) == LVS_DONE;
+    assert lv_script_state(66, 100, 5000) == LVS_BLOCKED;
+    assert lv_script_state(82, 4900, 5000) == LVS_RUNNING;
+    assert lv_script_state(82, 4000, 5000) == LVS_STALLED;
+    assert lv_script_state(82, 4700, 5000) == LVS_RUNNING;
+    assert lv_script_state(82, LV_NOT_MEASURED, 5000) == LVS_RUNNING;
+    assert lv_script_state(63, 100, 5000) == LVS_UNKNOWN;
+}
+
+test own_git_verdicts_map_to_states_and_never_guess {
+    assert lv_trigit_state("CARRIED") == LVS_DONE;
+    assert lv_trigit_state("FORWARD") == LVS_READY;
+    assert lv_trigit_state("NOT_GOLDEN") == LVS_BLOCKED;
+    assert lv_trigit_state("UNKNOWN_PARENT") == LVS_BLOCKED;
+    assert lv_trigit_state("SOMETHING_NEW") == LVS_UNKNOWN;
+}
+
+test pane_states_map_from_agents_t27 {
+    assert lv_pane_state(S_WORKING) == LVS_RUNNING;
+    assert lv_pane_state(S_BLOCKED) == LVS_BLOCKED;
+    assert lv_pane_state(S_IDLE) == LVS_IDLE and lv_pane_state(S_STOPPED) == LVS_IDLE;
+    assert lv_pane_state(S_DONE) == LVS_DONE;
+    assert lv_pane_state(77) == LVS_UNKNOWN;
+    assert lv_live(LVS_RUNNING) and lv_live(LVS_IDLE) == false;
+}
+
+test elapsed_reads_as_seconds_minutes_or_hours {
+    var o : [16]u8 = undefined;
+    assert lv_elapsed(1000, 955) == 45;
+    assert lv_elapsed(1000, 2000) == LV_NOT_MEASURED;
+    assert lv_elapsed(1000, LV_NOT_MEASURED) == LV_NOT_MEASURED;
+    var n : usize = lv_elapsed_text(45, o[0..16]);
+    assert n == 3 and o[0] == 52 and o[1] == 53 and o[2] == 115;
+    n = lv_elapsed_text(720, o[0..16]);
+    assert n == 3 and o[0] == 49 and o[1] == 50 and o[2] == 109;
+    n = lv_elapsed_text(7500, o[0..16]);
+    assert n == 4 and o[0] == 50 and o[1] == 104 and o[2] == 48 and o[3] == 53;
+    n = lv_elapsed_text(LV_NOT_MEASURED, o[0..16]);
+    assert n == 1 and o[0] == 45;
+}
+
+test the_feed_becomes_rows_for_script_lanes_and_own_git_lines {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    const feed : string = "L|lane-11367|4900|4000|R|glm-4.5-flash|editing specs/t27os/vt.t27\nL|lane-11368|100|50|D|opus|LANE-DONE all tests pass\nL|lane-11371|2000|1000|B||LANE-BLOCKED no key\nnoise line\nT|claude/evolve-lane-11371|ppppp|CARRIED\nT|claude/t27os-keys-v4|pp-f-|NOT_GOLDEN\n";
+    const n : u32 = lv_parse(feed, 5000, tab[0..512], txt[0..5120], 0);
+    assert n == 5;
+    // row 0: a running GLM FLASH lane on issue 11367, 1000 s old, yellow light
+    assert tab[LVF_SRC] == LV_SCRIPT and tab[LVF_ISSUE] == 11367 and tab[LVF_MODEL] == LVM_GLM_FLASH;
+    assert tab[LVF_STATE] == LVS_RUNNING and tab[LVF_ELAPSED] == 1000 and tab[LVF_LIGHT] == L_YELLOW;
+    assert lv_row_text(txt[0..5120], tab[0..512], 0) == "editing specs/t27os/vt.t27";
+    // row 1: done, paid opus, green
+    assert tab[LV_F + LVF_STATE] == LVS_DONE and tab[LV_F + LVF_MODEL] == LVM_OPUS and tab[LV_F + LVF_LIGHT] == L_GREEN;
+    // row 2: blocked, no model word: unknown model, no light
+    assert tab[2 * LV_F + LVF_STATE] == LVS_BLOCKED and tab[2 * LV_F + LVF_LIGHT] == L_NONE;
+    // rows 3 and 4: own-git
+    assert tab[3 * LV_F + LVF_SRC] == LV_TRIGIT and tab[3 * LV_F + LVF_ISSUE] == 11371 and tab[3 * LV_F + LVF_STATE] == LVS_DONE;
+    assert lv_row_text(txt[0..5120], tab[0..512], 3) == "claude/evolve-lane-11371 ppppp CARRIED";
+    assert tab[4 * LV_F + LVF_STATE] == LVS_BLOCKED and tab[4 * LV_F + LVF_ELAPSED] == LV_NOT_MEASURED;
+}
+
+test a_broken_feed_line_makes_no_row {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    assert lv_parse("L|lane-1|5\nL|\nT|only|two\nX|a|b|c|d|e|f\n", 100, tab[0..512], txt[0..5120], 0) == 0;
+    assert lv_parse("", 100, tab[0..512], txt[0..5120], 0) == 0;
+    // a number that is not digits is not measured, never 0
+    const n : u32 = lv_parse("L|lane-5|abc|xyz|R|-|hello\n", 100, tab[0..512], txt[0..5120], 0);
+    assert n == 1 and tab[LVF_ELAPSED] == LV_NOT_MEASURED and tab[LVF_STATE] == LVS_RUNNING;
+}
+
+test the_table_holds_at_most_LV_MAX_rows_and_cuts_a_long_line {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < 70) {
+        n = lv_add(tab[0..512], txt[0..5120], n, LV_PANE, i, LVM_UNKNOWN, L_NONE, LVS_IDLE, 0, 0, "a pane");
+        i = i + 1;
+    }
+    assert n == LV_MAX;
+    var long : [200]u8 = undefined;
+    i = 0;
+    while (i < 200) { long[i] = 120; i = i + 1; }
+    long[3] = 7;
+    const m : u32 = lv_add(tab[0..512], txt[0..5120], 0, LV_SCRIPT, 1, LVM_UNKNOWN, L_NONE, LVS_IDLE, 0, 0, long[0..200]);
+    assert m == 1 and tab[LVF_TLEN] == 80;
+    // a control byte is shown as a space
+    assert txt[3] == 32 and txt[4] == 120;
+}
+
+test the_queen_row_carries_her_board_numbers {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var n : u32 = lv_queen_row(tab[0..512], txt[0..5120], 0, 4210, 1307, 12, true);
+    assert n == 1 and tab[LVF_SRC] == LV_QUEEN and tab[LVF_STATE] == LVS_RUNNING;
+    assert lv_row_text(txt[0..5120], tab[0..512], 0) == "links 4210 tests 1307 gaps 12";
+    n = lv_queen_row(tab[0..512], txt[0..5120], 0, LV_NOT_MEASURED, 5, LV_NOT_MEASURED, false);
+    assert lv_row_text(txt[0..5120], tab[0..512], 0) == "links - tests 5 gaps -";
+    assert tab[LVF_STATE] == LVS_IDLE;
+}
+
+test the_kernel_tree_is_one_row_per_node {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var ls : [3]u32 = undefined;
+    ls[0] = LVS_RUNNING;
+    ls[1] = LVS_DONE;
+    ls[2] = LVS_BLOCKED;
+    // 9 fixed nodes + 3 lanes
+    const n : u32 = lv_kernel_rows(tab[0..512], txt[0..5120], 0, 3, ls[0..3]);
+    assert n == node_count(3) and n == 12;
+    assert tab[LVF_SRC] == LV_KERNEL;
+    assert lv_row_text(txt[0..5120], tab[0..512], 0) == "ROOT";
+    assert lv_row_text(txt[0..5120], tab[0..512], 1) == "QUEEN";
+    assert lv_row_text(txt[0..5120], tab[0..512], 4) == "PTY LINK";
+    assert lv_row_text(txt[0..5120], tab[0..512], 8) == "PULSE";
+    assert tab[9 * LV_F + LVF_STATE] == LVS_RUNNING and tab[10 * LV_F + LVF_STATE] == LVS_DONE and tab[11 * LV_F + LVF_STATE] == LVS_BLOCKED;
+    assert tab[1 * LV_F + LVF_DEPTH] == 1;
+    assert tab[9 * LV_F + LVF_DEPTH] == node_depth(9, 3);
+}
+
+test pane_rows_use_the_panes_state_and_model_light {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    const n : u32 = lv_pane_row(tab[0..512], txt[0..5120], 0, "Claude Code", 11398, LVM_GLM_FLASH, S_WORKING, false, 1, 90);
+    assert n == 1 and tab[LVF_SRC] == LV_PANE and tab[LVF_ISSUE] == 11398;
+    assert tab[LVF_STATE] == LVS_RUNNING and tab[LVF_LIGHT] == L_YELLOW and tab[LVF_ELAPSED] == 90;
+    assert lv_row_text(txt[0..5120], tab[0..512], 0) == "Claude Code";
+    assert lv_count(tab[0..512], n, LVS_RUNNING) == 1 and lv_count(tab[0..512], n, LVS_DONE) == 0;
+}
+
+test the_block_scrolls_and_a_click_finds_the_row {
+    // 10 rows, room for 3 under the label: 22 + 3 * 34 = 124 pt
+    assert lv_visible(124.0) == 3 and lv_visible(100.0) == 2 and lv_visible(20.0) == 0;
+    assert lv_scroll_max(10, 3) == 7 and lv_scroll_max(2, 3) == 0;
+    assert lv_scroll_clamp(99, 10, 3) == 7 and lv_scroll_clamp(2, 10, 3) == 2;
+    assert lv_row_top(200.0, 0) == 222.0 and lv_row_top(200.0, 2) == 290.0;
+    assert lv_row_at(230.0, 200.0, 4, 10, 3) == 4;
+    assert lv_row_at(262.0, 200.0, 4, 10, 3) == 5;
+    assert lv_row_at(210.0, 200.0, 4, 10, 3) == LV_NONE;
+    assert lv_row_at(400.0, 200.0, 4, 10, 3) == LV_NONE;
+    // fewer rows than slots: the empty slot is no row
+    assert lv_row_at(262.0, 200.0, 0, 1, 3) == LV_NONE;
+}
+
+test only_a_script_lane_opens_a_log {
+    assert lv_can_tail(LV_SCRIPT);
+    assert lv_can_tail(LV_PANE) == false and lv_can_tail(LV_TRIGIT) == false;
+    assert lv_can_tail(LV_QUEEN) == false and lv_can_tail(LV_KERNEL) == false;
+}
+
+test the_tail_job_takes_a_number_only {
+    var o : [200]u8 = undefined;
+    const n : usize = lv_tail_cmd(11367, o[0..200]);
+    assert n > 40;
+    assert lv_has(o[0..n], "tail -n 40 /tmp/claude-501/lane-11367/.lane.log");
+    assert lv_has(o[0..n], "mv $D/tail.part $D/tail.txt");
+}
+
+test the_tail_keeps_the_last_lines {
+    var starts : [8]u32 = undefined;
+    const buf : string = "one\ntwo\nthree\nfour\nfive\n";
+    assert lv_tail_lines(buf, starts[0..8], 8) == 5;
+    assert starts[0] == 0 and starts[1] == 4 and lv_line_len(buf, 4) == 3;
+    // only the last 3 of 5
+    assert lv_tail_lines(buf, starts[0..8], 3) == 3;
+    assert starts[0] == 8 and lv_line_len(buf, 8) == 5;
+    assert starts[2] == 19 and lv_line_len(buf, 19) == 4;
+    assert lv_tail_lines("", starts[0..8], 3) == 0;
+}
+
+test the_feed_job_runs_only_while_the_sidebar_is_up_and_not_more_often_than_its_period {
+    assert lv_refresh_due(false, 100, 0) == false;
+    assert lv_refresh_due(true, 100, 0);
+    assert lv_refresh_due(true, 103, 100) == false;
+    assert lv_refresh_due(true, 105, 100);
+    assert lv_refresh_due(true, 50, 100);
+}
+
+test the_feed_job_text_names_its_sources {
+    assert lv_has(LV_FEED_CMD, "/tmp/claude-501/lane-*");
+    assert lv_has(LV_FEED_CMD, ".lane.log");
+    assert lv_has(LV_FEED_CMD, "LANE-DONE");
+    assert lv_has(LV_FEED_CMD, "LANE-BLOCKED");
+    assert lv_has(LV_FEED_CMD, "tri golden status");
+    assert lv_has(LV_FEED_CMD, "mv $D/lanes.part $D/lanes.txt");
+    assert lv_has(LV_HEAD_B, "D=$HOME/.t27os/lanes");
+    assert LV_DIR == "/.t27os/lanes/" and LV_FILE == "lanes.txt";
+}
+
+// ---- the two lines of a drawn row (the window draws these bytes and nothing else) ----
+
+/// Line 1: the source, the issue as #N (nothing when there is none), the model name (nothing when unknown).
+pub fn lv_line1(tab: []const u32, i: u32, out: []u8) -> usize {
+    const r : usize = @as(usize, i) * LV_F;
+    var p : usize = lv_put_str(out, 0, LV_SRC_NAMES[tab[r + LVF_SRC]]);
+    if (tab[r + LVF_ISSUE] > 0) {
+        p = lv_put(out, p, 32);
+        p = lv_put(out, p, 35);
+        p = lv_put_num(out, p, tab[r + LVF_ISSUE]);
+    }
+    if (tab[r + LVF_MODEL] > 0 and tab[r + LVF_MODEL] < LVM_COUNT) {
+        p = lv_put(out, p, 32);
+        p = lv_put(out, p, 32);
+        p = lv_put_str(out, p, LVM_NAMES[tab[r + LVF_MODEL]]);
+    }
+    return p;
+}
+
+/// Line 2: the elapsed time, two spaces, the last line. A kernel node is indented by its depth.
+pub fn lv_line2(tab: []const u32, txt: []const u8, i: u32, out: []u8) -> usize {
+    const r : usize = @as(usize, i) * LV_F;
+    var p : usize = 0;
+    var d : u32 = 0;
+    while (tab[r + LVF_SRC] == LV_KERNEL and d < tab[r + LVF_DEPTH] and d < 4) {
+        p = lv_put(out, p, 32);
+        p = lv_put(out, p, 32);
+        d = d + 1;
+    }
+    if (tab[r + LVF_ELAPSED] != LV_NOT_MEASURED or tab[r + LVF_SRC] == LV_SCRIPT or tab[r + LVF_SRC] == LV_PANE) {
+        const q : usize = lv_elapsed_text(tab[r + LVF_ELAPSED], out[p .. out.len]);
+        p = p + q;
+        p = lv_put(out, p, 32);
+        p = lv_put(out, p, 32);
+    }
+    return lv_copy(out, p, lv_row_text(txt, tab, i));
+}
+
+pub fn lv_state_word(tab: []const u32, i: u32) -> string {
+    const s : u32 = tab[@as(usize, i) * LV_F + LVF_STATE];
+    if (s >= LVS_COUNT) { return "UNKNOWN"; }
+    return LVS_NAMES[s];
+}
+
+test a_drawn_row_has_two_lines_from_the_table {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    const feed : string = "L|lane-11367|4900|4000|R|glm-4.5-flash|editing vt.t27\nT|claude/evolve-lane-11371|ppppp|CARRIED\n";
+    const n : u32 = lv_parse(feed, 5000, tab[0..512], txt[0..5120], 0);
+    assert n == 2;
+    var o : [120]u8 = undefined;
+    var k : usize = lv_line1(tab[0..512], 0, o[0..120]);
+    assert lv_has(o[0..k], "script #11367  glm flash");
+    k = lv_line2(tab[0..512], txt[0..5120], 0, o[0..120]);
+    assert lv_has(o[0..k], "16m  editing vt.t27");
+    assert lv_state_word(tab[0..512], 0) == "RUNNING";
+    // an own-git row has no elapsed time: its second line is just the status text
+    k = lv_line2(tab[0..512], txt[0..5120], 1, o[0..120]);
+    assert o[0] == 99 and lv_has(o[0..k], "carried");
+    k = lv_line1(tab[0..512], 1, o[0..120]);
+    assert lv_has(o[0..k], "trigit #11371") and lv_has(o[0..k], "glm") == false;
+    assert lv_state_word(tab[0..512], 1) == "DONE";
+}
+
+test kernel_nodes_are_indented_by_depth_and_show_no_time {
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var ls : [1]u32 = undefined;
+    ls[0] = LVS_RUNNING;
+    const n : u32 = lv_kernel_rows(tab[0..512], txt[0..5120], 0, 1, ls[0..1]);
+    var o : [120]u8 = undefined;
+    // PTY LINK sits under SERVICES under QUEEN under ROOT: depth 3, six spaces
+    const k : usize = lv_line2(tab[0..512], txt[0..5120], 4, o[0..120]);
+    assert n == 10 and o[0] == 32 and o[5] == 32 and o[6] == 80;
+    assert lv_has(o[0..k], "pty link");
+}
