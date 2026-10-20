@@ -23,8 +23,15 @@
 // pane picks its key by rotation at each start; the pane record keeps the key NUMBER, never the key. The
 // claude cell's screen is read for an error row (pty_logic screen_text, keys.t27 error_row and classify_line):
 // the failed key rests, the pane is respawned (resumed) on the next key or profile, or stays with a line in its
-// scrollback. A restored pane waits for the window's keys (or 20 s) before it starts. T27OS_CTL=list prints
-// "key N" for each pane.
+// scrollback. A restored pane waits for a key (or 20 s) before it starts. T27OS_CTL=list prints "key N" for
+// each pane.
+// The server does not depend on the window for its keys: it reads the Keychain itself, through the same
+// /usr/bin/security reader the window uses (keys_host kc_get_n, no SecItem call, no dialog), once at its start
+// before it restores panes and again at a spawn that finds no key for its agent when the last read is older than
+// a minute (pty_logic keys_reload_due, load_mask_agent). A read puts each key in the table by the code path of
+// OP_SETKEY (put_key), so a pane spawned while the window is closed, minimized or never connected is logged in,
+// a restarted server is not keyless, and a key added from a terminal is picked up. A window's OP_SETKEY still
+// works and overrides or adds.
 //
 // Every decision is a fn with a test that runs; the host loop only moves bytes through pty_sys.t27.
 //
@@ -154,6 +161,11 @@ use t27os::pty_logic::O_KEYS;
 use t27os::pty_logic::KEY_CAP;
 use t27os::pty_proto::OP_SETKEY;
 use t27os::pty_logic::G_PANEK;
+use t27os::pty_logic::G_KLOAD;
+use t27os::pty_logic::load_all_mask;
+use t27os::pty_logic::load_mask_agent;
+use t27os::pty_logic::load_wants;
+use t27os::pty_logic::keys_reload_due;
 use t27os::pty_logic::G_START;
 use t27os::pty_logic::PK;
 use t27os::pty_logic::PK_PROF;
@@ -194,6 +206,8 @@ use t27os::keys::FA_KEEP;
 use t27os::keys::FA_GIVE_UP;
 use t27os::keys::setkey_provider;
 use t27os::keys::setkey_number;
+use t27os::keys::scan_goes_on;
+use t27os::keys_host::kc_get_n;
 use t27os::keys::agent_uses;
 use t27os::keys::provider_env;
 use t27os::keys::env_stripped;
@@ -653,6 +667,69 @@ fn scan_pane(st: []u64, mem: []u8, i: usize, n: usize) -> void {
     if (cls != FC_NONE) { failover(st, mem, i, cls, now); }
 }
 
+/// Put key number sk (0 = key 1) of provider sp into its slot from mem[src .. src + plen]: the one path both a
+/// window's OP_SETKEY frame and a read of the Keychain (load_keys) take. An empty key (plen 0) empties the slot.
+/// False when the provider or number is out of range or the bytes are no key (keys.t27 key_fits); nothing
+/// changes then. The table of times and rests follows the slot: the same key put again keeps its cooldown.
+fn put_key(st: []u64, mem: []u8, sp: u32, sk: u32, src: usize, plen: usize) -> bool {
+    if (sp >= PROVIDER_COUNT or sk >= MAX_KEYS or plen > KEY_CAP - 2) { return false; }
+    if (plen > 0 and !key_fits(mem[src .. src + plen])) { return false; }
+    const ka : usize = key_slot(sp, sk);
+    var same : bool = plen > 0 and @as(usize, mem[ka]) == plen;
+    var j : usize = 0;
+    while (j < plen) {
+        if (mem[ka + 1 + j] != mem[src + j]) { same = false; }
+        mem[ka + 1 + j] = mem[src + j];
+        j = j + 1;
+    }
+    mem[ka] = @as(u8, @intCast(plen));
+    // the rest of the slot is cleared, so a shorter or deleted key leaves none of the old one behind
+    var wp : usize = plen + 1;
+    while (wp < KEY_CAP) {
+        mem[ka + wp] = 0;
+        wp = wp + 1;
+    }
+    key_put(st, sp, sk, plen > 0, same);
+    return true;
+}
+
+/// Read the Keychain's keys of the providers in `mask` (pty_logic load_mask_agent, load_all_mask) into the table,
+/// each by put_key as an OP_SETKEY would put it. The reader is keys_host kc_get_n, which runs /usr/bin/security
+/// (never SecItem, so there is no dialog); a scan of one provider ends after two numbers in a row that hold
+/// nothing (keys.t27 scan_goes_on). A key is read into the scratch at O_TMP2 + 4096, which nothing else uses, and
+/// the scratch is wiped when the call ends. Sets G_KLOAD to now. Returns how many keys were put. It blocks the
+/// loop for the length of the reads (about 23 ms each, a few per provider): only the start and a spawn that
+/// found no key call it.
+fn load_keys(st: []u64, mem: []u8, mask: u32) -> u32 {
+    const at : usize = O_TMP2 + 4096;
+    var got : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (load_wants(mask, p)) {
+            var k : u32 = 0;
+            var misses : u32 = 0;
+            while (scan_goes_on(k, misses)) {
+                const n : usize = kc_get_n(p, k, mem[at .. at + KEY_CAP]);
+                if (n > 0) {
+                    misses = 0;
+                    if (put_key(st, mem, p, k, at, n)) { got = got + 1; }
+                } else {
+                    misses = misses + 1;
+                }
+                k = k + 1;
+            }
+        }
+        p = p + 1;
+    }
+    var w : usize = 0;
+    while (w < KEY_CAP) {
+        mem[at + w] = 0;
+        w = w + 1;
+    }
+    st[G_KLOAD] = now_ms(mem);
+    return got;
+}
+
 fn reply(fd: i32, mem: []u8, op: u8, pane: u8, plen: usize) -> void {
     put_header(mem[O_OUT .. O_OUT + 8], op, pane, plen);
     sys_write(fd, mem[O_OUT .. O_OUT + HEADER + plen], @as(u64, HEADER + plen));
@@ -711,6 +788,10 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         // the record; without one the pane learns it from its SessionStart hook or, on restore, its transcript
         mem[O_MODEL + @as(usize, slot) * MODEL_CAP] = 0;
         if (3 + cl < plen) { set_model(mem, @as(usize, slot), p0 + 4 + cl, plen - 4 - cl); }
+        // no key in the table for this agent (the window has not pushed one, or is not there at all): read the
+        // Keychain for the providers the agent reads, unless that was done in the last minute (keys_reload_due)
+        const spawn_agent : u32 = @as(u32, mem[p0]);
+        if (keys_reload_due(st, spawn_agent, now_ms(mem), st[G_KLOAD])) { load_keys(st, mem, load_mask_agent(spawn_agent)); }
         launch(st, mem, @as(usize, slot), R_RELAUNCH);
         save_pane(st, mem, @as(usize, slot));
         reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
@@ -719,27 +800,7 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
     if (op == OP_SETKEY) {
         // the pane byte is the provider in its low nibble and the key number (0 = key 1) in the high one
         // (keys.t27 setkey_byte): key 1 is the frame this op always had, an older client changes nothing
-        const sp : u32 = setkey_provider(pane);
-        const sk : u32 = setkey_number(pane);
-        if (sp >= PROVIDER_COUNT or sk >= MAX_KEYS or plen > KEY_CAP - 2) { reply(fd, mem, RE_ERR, 0, 0); return; }
-        if (plen > 0 and !key_fits(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
-        const ka : usize = key_slot(sp, sk);
-        var same : bool = plen > 0 and @as(usize, mem[ka]) == plen;
-        var j : usize = 0;
-        while (j < plen) {
-            if (mem[ka + 1 + j] != mem[p0 + j]) { same = false; }
-            mem[ka + 1 + j] = mem[p0 + j];
-            j = j + 1;
-        }
-        mem[ka] = @as(u8, @intCast(plen));
-        // the rest of the slot is cleared, so a shorter or deleted key leaves none of the old one behind
-        var wp : usize = plen + 1;
-        while (wp < KEY_CAP) {
-            mem[ka + wp] = 0;
-            wp = wp + 1;
-        }
-        // the table of times and rests follows the slot; the same key sent again keeps its cooldown
-        key_put(st, sp, sk, plen > 0, same);
+        if (!put_key(st, mem, setkey_provider(pane), setkey_number(pane), p0, plen)) { reply(fd, mem, RE_ERR, 0, 0); return; }
         reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
         return;
     }
@@ -1086,6 +1147,14 @@ fn run_server(st: []u64, mem: []u8) -> void {
         say("t27os-server: cannot open the socket\n");
         return;
     }
+    // the server reads the Keychain itself before it restores a pane, so a restored pane sees its key at once
+    // and does not wait for a window that may not be there (a number only is printed, never a key)
+    const loaded : u32 = load_keys(st, mem, load_all_mask());
+    say("t27os-server: keys read from the Keychain: ");
+    var lb : [8]u8 = undefined;
+    const ln : usize = put_dec(lb[0..8], 0, @as(u64, loaded));
+    lb[ln] = 10;
+    say(lb[0 .. ln + 1]);
     // the moment a restored pane starts its wait for the window's keys from (pty_logic RESTORE_WAIT_MS)
     st[G_START] = now_ms(mem);
     const back : u32 = restore_all(st, mem);

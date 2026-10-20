@@ -1,7 +1,8 @@
 # T27 OS key orchestration, compared with Free Claude Code
 
 Issue: gHashTag/t27#11224. Code: `specs/t27os/keys.t27` (decisions and data), the host side in
-`keys_host.t27`, `pty_server.t27` and `glass_window.t27`. Stage 2 (a local router) is
+`keys_host.t27` (the Keychain and the push to the server), `keys_probe.t27` (the check button),
+`pty_server.t27` and `glass_window.t27`. Stage 2 (a local router) is
 `specs/t27os/router.t27`, decisions only. No key value appears in this file or in any spec; every test uses
 fake values.
 
@@ -49,13 +50,13 @@ No proxy is involved.
 | Per-tier overrides (opus, sonnet, haiku) | Yes, as data, one column per tier; an empty field falls back to the default; the small-fast variable follows haiku | `MODELS_OPUS/SONNET/HAIKU`, `tier_model`, `profile_var_name/text` | A fourth tier (the one the OpenRouter and Kimi pages call fable) is not mapped; changing a tier is a data edit, not a screen |
 | `provider/model` syntax | A profile is a provider; its models sit in the tier table | `PROFILE_NAMES`, `PROFILE_PROVIDER` | The combined one-line syntax; it exists in Free Claude Code because its proxy picks the upstream per request |
 | Many providers | Four profiles today: z.ai, Anthropic direct, OpenRouter, Ollama cloud, over the nine key rows | `PROFILE_PROVIDER`, `PROFILE_BASE_URLS`, `PROFILE_KEY_VARS` | A provider that does not speak the Anthropic protocol needs the local router and `specs/provider/transform.t27` (#10902). DeepSeek, Moonshot and MiniMax speak it but need key rows of their own (see below) |
-| Numbered keys, key 1 first | Naming and choice are decided: key 1 keeps the existing Keychain item, keys 2 and 3 add `#2`, `#3`; least-recently-used rotation with a rest time | `keychain_label_n`, `MAX_KEYS`, `rotate_pick`, `rotate_pick_except` | The KEYS tab still shows one row per provider and the host reads only key 1; storing and listing keys 2 and 3 is host work |
+| Numbered keys, key 1 first | Naming and choice are decided: key 1 keeps the existing Keychain item, keys 2 to 8 add `#2` to `#8`; least-recently-used rotation with a rest time | `keychain_label_n`, `MAX_KEYS`, `rotate_pick`, `rotate_pick_except` | Built: the host reads every numbered key, up to 8 per provider (`MAX_KEYS`), only through `/usr/bin/security`, never through SecItem; the KEYS tab adds the next free number, deletes the newest key and checks every key (`next_free_key`, `newest_key`, `provider_status`). The PTY server reads the keys itself the same way, at its start and at a spawn that finds no key for the agent (`load_mask_agent`, `keys_reload_due`), so it does not depend on the window being connected; the window's push still adds and overrides |
 | A fallback entry names a key number | Decided: a throttled key (429) with a spare key swaps the key and keeps the profile | `fo_action` = `FA_RESPAWN_KEY`, `fo_target` | The host does not pass the key number to the respawn yet |
 | Ordered fallback list after retries | Yes, per pane: the profile list is walked forward only | `next_profile`, `fo_action` = `FA_RESPAWN_NEXT`, `MAX_FAILOVERS` | Per request, inside one conversation turn: needs the local router. A respawn does not replay the request that failed; the person continues in the resumed session |
 | Retries before the fallback | Not ours: Claude Code retries by itself, and the failover starts when the error text reaches the screen | `classify_line` | Nothing to build |
 | Reasoning effort per route | No | none | Out of scope; not set by any profile |
 | Bearer token for the local proxy | Not needed, there is no proxy | none | Needed with the router (it binds 127.0.0.1, `ROUTER_BIND`) |
-| Admin page for keys | Yes: the KEYS tab, Keychain storage, masked display, a check button, a circuit breaker | `ky_*`, `mask_key`, `status_after_probe`, `circuit_fails`, `bad_mask` | The signed-in account keys on app.t27.ai cannot be spent from a pane: no proxy route exists server-side (see the MAP block in `keys.t27`) |
+| Admin page for keys | Yes: the KEYS tab, Keychain storage through `/usr/bin/security`, masked display of the newest key, a check button, a circuit breaker | `ky_*`, `mask_key`, `status_after_probe`, `circuit_fails`, `bad_mask` | The signed-in account keys on app.t27.ai cannot be spent from a pane: no proxy route exists server-side (see the MAP block in `keys.t27`) |
 | Local models (LM Studio, llama.cpp, Ollama) | Ollama cloud only | profile `ollama-cloud` | Local Ollama needs no key, so the stored-keys mask cannot say it is available; a host fact (is the server up) must join the mask first |
 | OAuth sign-in for some providers | No | none | Out of scope |
 

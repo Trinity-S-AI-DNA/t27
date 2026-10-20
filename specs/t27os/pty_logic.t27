@@ -90,6 +90,7 @@ use t27os::pty_proto::spawn_ok;
 use t27os::pty_proto::socket_path;
 use t27os::keys::PROVIDER_COUNT;
 use t27os::keys::MAX_KEYS;
+use t27os::keys::key_index;
 use t27os::keys::KEY_NEVER;
 use t27os::keys::PROFILE_COUNT;
 use t27os::keys::PROFILE_PROVIDER;
@@ -171,6 +172,9 @@ pub const G_WINSZ : usize = 248;
 /// is not read (after a give-up) and its restore state (W_*). Key slot (p, k) is word p * MAX_KEYS + k.
 /// G_START is the millisecond the server started at (a restored pane waits for keys from then on).
 pub const G_START : usize = 227;
+/// The millisecond the server last read the Keychain itself (pty_server load_keys); 0 = never. Word 228 was
+/// free: G_START is 227 and the connection tables begin at G_CFD.
+pub const G_KLOAD : usize = 228;
 pub const G_KLAST : usize = 256;
 pub const G_KREST : usize = 328;
 pub const G_PANEK : usize = 400;
@@ -193,6 +197,10 @@ pub const W_KEYLESS : u64 = 8;
 pub const W_DONE : u64 = 9;
 /// How long a restored pane waits for the window's keys before it starts as it always did.
 pub const RESTORE_WAIT_MS : u64 = 20000;
+/// A spawn that finds no key for its agent reads the Keychain again only when the last read is older than this
+/// (a key added from a terminal is picked up at the next spawn after it; a table with no key at all does not
+/// run /usr/bin/security at every spawn).
+pub const KEYS_RELOAD_MS : u64 = 60000;
 /// A pane's screen is not read for this long after it starts: a resumed Claude Code session replays its
 /// transcript, which may hold an earlier error row.
 pub const SCAN_GRACE_MS : u64 = 10000;
@@ -446,10 +454,6 @@ pub fn c_path(out: []u8, src: []const u8) -> usize {
 // When the pane's screen shows a failure the key rests and the pane is respawned by keys.t27 fo_action, on the
 // next key of the same provider (rotate_pick_except, the failed key skipped) or on the next profile.
 
-fn kidx(p: u32, k: u32) -> usize {
-    return @as(usize, p) * @as(usize, MAX_KEYS) + @as(usize, k);
-}
-
 fn pow16(n: u32) -> u64 {
     var m : u64 = 1;
     var j : u32 = 0;
@@ -462,7 +466,7 @@ fn pow16(n: u32) -> u64 {
 
 /// The offset in the arena of key slot (p, k): a length byte, the key, a NUL (OP_SETKEY fills it).
 pub fn key_slot(p: u32, k: u32) -> usize {
-    return O_KEYS + kidx(p, k) * KEY_CAP;
+    return O_KEYS + key_index(p, k) * KEY_CAP;
 }
 
 /// A pane that has chosen nothing: no keys, no profile, no failures, nothing to skip, nothing waiting.
@@ -493,7 +497,7 @@ pub fn keys_init(st: []u64) -> void {
 }
 
 pub fn key_present(st: []const u64, p: u32, k: u32) -> bool {
-    return st[G_KREST + kidx(p, k)] < KEY_NEVER;
+    return st[G_KREST + key_index(p, k)] < KEY_NEVER;
 }
 
 /// How many slots of provider p hold a key.
@@ -521,7 +525,7 @@ pub fn keys_stored(st: []const u64) -> u32 {
 /// OP_SETKEY filled (present) or emptied slot (p, k). `same`: the bytes are those already held, so the key keeps
 /// its last-use and rest times (a window that sends every key again must not end a cooldown).
 pub fn key_put(st: []u64, p: u32, k: u32, present: bool, same: bool) -> void {
-    const ix : usize = kidx(p, k);
+    const ix : usize = key_index(p, k);
     if (present == false) {
         st[G_KLAST + ix] = 0;
         st[G_KREST + ix] = KEY_NEVER;
@@ -534,23 +538,23 @@ pub fn key_put(st: []u64, p: u32, k: u32, present: bool, same: bool) -> void {
 
 /// The key of provider p a new pane takes (MAX_KEYS when it holds none); `skip` is a key not to take.
 pub fn key_pick(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
-    const at : usize = kidx(p, 0);
+    const at : usize = key_index(p, 0);
     return rotate_pick_soft(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
 }
 
 /// A key of provider p that is usable right now and is not `skip` (MAX_KEYS when none): the test for a swap.
 pub fn key_pick_free(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
-    const at : usize = kidx(p, 0);
+    const at : usize = key_index(p, 0);
     return rotate_pick_except(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
 }
 
 pub fn key_used(st: []u64, p: u32, k: u32, now_ms: u64) -> void {
-    st[G_KLAST + kidx(p, k)] = now_ms;
+    st[G_KLAST + key_index(p, k)] = now_ms;
 }
 
 /// Key (p, k) rests until `until_s`; a longer rest it already has stays, and a slot that holds no key stays empty.
 pub fn key_rest(st: []u64, p: u32, k: u32, until_s: u64) -> void {
-    const ix : usize = G_KREST + kidx(p, k);
+    const ix : usize = G_KREST + key_index(p, k);
     if (st[ix] >= KEY_NEVER) { return; }
     if (until_s > st[ix]) { st[ix] = until_s; }
 }
@@ -850,6 +854,56 @@ pub fn keyless_plan(a: u32, sid: []const u8) -> u32 {
     const p : u32 = restore_plan(a, 0, sid);
     if (p == R_SKIP) { return R_RELAUNCH; }
     return p;
+}
+
+// ---- the server reads the Keychain itself ----
+// The window pushes the keys (OP_SETKEY) only while it is connected. A pane spawned with no window (it is
+// minimized, on the home screen, or a script or the Queen spawns it) would start with no key, and so would every
+// pane of a server that just restarted. So the server reads the keys itself, through the same /usr/bin/security
+// reader the window uses (keys_host kc_get_n): once at its start for every provider, and at a spawn that finds no
+// key its agent can start with, for the providers that agent reads, at most once per KEYS_RELOAD_MS. What a read
+// finds goes into the table the way an OP_SETKEY would put it. These are the decisions; the reads are in
+// pty_server.t27.
+
+/// Every provider, as a bit mask: the read at the server's start (a later spawn may be any agent).
+pub fn load_all_mask() -> u32 {
+    var m : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        m = m + (1 << p);
+        p = p + 1;
+    }
+    return m;
+}
+
+/// The providers a spawn of agent a can start with, as a bit mask: for the claude cell the provider of every
+/// profile (z.ai, Anthropic, OpenRouter, Ollama cloud), for every other agent the providers it reads (keys.t27
+/// AGENT_PROVIDERS); 0 for the shell and editor cells and an unknown agent, which read none.
+pub fn load_mask_agent(a: u32) -> u32 {
+    if (a >= AGENT_COUNT) { return 0; }
+    if (profile_agent(a) == false) { return spawn_mask(a, load_all_mask()); }
+    var m : u32 = 0;
+    var r : u32 = 0;
+    while (r < PROFILE_COUNT) {
+        const prov : u32 = PROFILE_PROVIDER[r];
+        if ((m >> prov) % 2 == 0) { m = m + (1 << prov); }
+        r = r + 1;
+    }
+    return m;
+}
+
+/// Does a read with provider mask `mask` cover provider p?
+pub fn load_wants(mask: u32, p: u32) -> bool {
+    return p < PROVIDER_COUNT and (mask >> p) % 2 == 1;
+}
+
+/// Is a read due for a spawn of agent a at `now` ms, `last` being G_KLOAD (0 = never read)? Only when the agent
+/// reads a key, the table holds none it can start with, and no read ran in the last KEYS_RELOAD_MS.
+pub fn keys_reload_due(st: []const u64, a: u32, now: u64, last: u64) -> bool {
+    if (needs_key(a) == false) { return false; }
+    if (has_key_for(st, a)) { return false; }
+    if (last == 0) { return true; }
+    return now >= last + KEYS_RELOAD_MS;
 }
 
 
@@ -1175,6 +1229,8 @@ test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
     assert G_PANEK + 16 * PK <= ST_SIZE;
     assert G_START < G_CFD;
     assert G_START > G_BINLEN;
+    assert G_KLOAD > G_START;
+    assert G_KLOAD < G_CFD;
     assert 16 * PF <= G_LISTEN;
     assert key_slot(0, 0) == O_KEYS;
     assert key_slot(4, 2) == O_KEYS + (4 * 8 + 2) * KEY_CAP;
@@ -1564,4 +1620,76 @@ test a_restored_pane_whose_wait_runs_out_starts_keyless_and_is_respawned_once_wh
     assert keyless_plan(0, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab") == R_RESUME;
     assert keyless_plan(0, "-") == R_RELAUNCH;
     assert keyless_plan(0, "") == R_RELAUNCH;
+}
+
+test the_server_reads_the_providers_a_spawn_can_start_with {
+    // at its start the server reads every provider: bits 0 to 8
+    assert load_all_mask() == 511;
+    // the claude cell starts on a profile: z.ai (4), Anthropic (0), OpenRouter (3), Ollama cloud (5)
+    assert load_mask_agent(0) == 57;
+    assert load_wants(load_mask_agent(0), P_ZAI);
+    assert load_wants(load_mask_agent(0), P_ANTHROPIC);
+    assert load_wants(load_mask_agent(0), P_OPENAI) == false;
+    // every other agent reads the providers keys.t27 AGENT_PROVIDERS names
+    assert load_mask_agent(1) == 2;
+    assert load_mask_agent(2) == 4;
+    assert load_mask_agent(3) == 11;
+    assert load_mask_agent(4) == 1;
+    assert load_mask_agent(5) == 63;
+    assert load_mask_agent(6) == 128;
+    assert load_mask_agent(7) == 15;
+    assert load_mask_agent(8) == 64;
+    // the shell and editor cells read no key; an unknown agent none either
+    assert load_mask_agent(SHELL_CELL) == 0;
+    assert load_mask_agent(AGENT_COUNT + 3) == 0;
+    // a provider past the last one is never wanted
+    assert load_wants(511, PROVIDER_COUNT - 1);
+    assert load_wants(511, PROVIDER_COUNT) == false;
+    assert load_wants(0, 0) == false;
+}
+
+test a_spawn_that_finds_no_key_reads_the_keychain_again_after_a_minute {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    // nothing was read yet: due at once
+    assert keys_reload_due(st[0..512], 0, 5000, 0);
+    // read 10 s ago and still no key: not yet; due exactly KEYS_RELOAD_MS after the read
+    assert KEYS_RELOAD_MS == 60000;
+    assert keys_reload_due(st[0..512], 0, 1010000, 1000000) == false;
+    assert keys_reload_due(st[0..512], 0, 1059999, 1000000) == false;
+    assert keys_reload_due(st[0..512], 0, 1060000, 1000000);
+    // a shell or an editor reads no key: never due
+    assert keys_reload_due(st[0..512], SHELL_CELL, 1060000, 1000000) == false;
+    assert keys_reload_due(st[0..512], SHELL_CELL, 5000, 0) == false;
+    // a z.ai key is a key the claude cell starts with: nothing to look for
+    t_key(st[0..512], P_ZAI, 0);
+    assert keys_reload_due(st[0..512], 0, 1060000, 1000000) == false;
+    assert keys_reload_due(st[0..512], 0, 5000, 0) == false;
+    // codex reads OpenAI only: the z.ai key is no use to it, so a read is due for it
+    assert keys_reload_due(st[0..512], 1, 1060000, 1000000);
+    assert keys_reload_due(st[0..512], 1, 1010000, 1000000) == false;
+    t_key(st[0..512], P_OPENAI, 0);
+    assert keys_reload_due(st[0..512], 1, 1060000, 1000000) == false;
+}
+
+test a_read_of_the_keychain_fills_the_table_like_a_window_push {
+    // the server's read goes through key_put exactly as OP_SETKEY does: the claude cell has a profile after it
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    assert has_key_for(st[0..512], 0) == false;
+    assert restore_waits(st[0..512], 0);
+    key_put(st[0..512], P_ZAI, 0, true, false);
+    key_put(st[0..512], P_ZAI, 1, true, false);
+    assert has_key_for(st[0..512], 0);
+    assert restore_waits(st[0..512], 0) == false;
+    plan_pane_keys(st[0..512], 5, 0, 1000000);
+    assert t_prof(st[0..512], 5) == PR_ZAI;
+    assert pane_key_shown(st[0..512], 5, 0) == 1;
+    // the window pushes the same keys a moment later: nothing changes, the key just used keeps its time
+    key_put(st[0..512], P_ZAI, 0, true, true);
+    assert st[G_KLAST + key_index(P_ZAI, 0)] == 1000000;
+    // a key that came from a terminal later is one more slot
+    assert key_count(st[0..512], P_ZAI) == 2;
+    key_put(st[0..512], P_ZAI, 2, true, false);
+    assert key_count(st[0..512], P_ZAI) == 3;
 }
