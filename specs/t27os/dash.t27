@@ -1,0 +1,1020 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/dash.t27 -- the instrument panel of a home tab: the widget tree, its packer, the gallery
+; parse, the cache paths and the hit tests. glass_window only calls these and draws what they place.
+; Owner, 2026-10-20: the home tab is a spaceship's INSTRUMENT PANEL built from widgets that contain widgets
+; (modelled on the website course and the widgets gallery of gHashTag/trinity): SCREEN > HOME > HERO (title,
+; gauge widgets, a segment bar) + one CONSOLE per agent letter > INSTRUMENT (a gallery widget's card.png).
+; For t27u, COURSE MAP widgets (7 courses x 9 modules x 3 lessons) follow the consoles.
+; THE TREE: a node is a kind and a rule that places the children inside the node's rectangle. There is ONE
+; rule, the packer: pack_cols / cell_w / cell_x / cell_y / pack_h place n equal children of a parent of
+; width w in rows. Every level calls it: the hero's gauges, a console's instruments, the idle consoles, a
+; module's three lessons, the segment bar. A console is a widget whose children are widgets.
+; Coordinates are page points: x from the left edge of the page column, y from the top of the page.
+; Which letter owns a widget is homes::letter_of_widget (a stub until agent_widgets.t27 lands). Which widget a
+; lesson opens is homes::course_widget. Ids, pages and kinds come from the parsed gallery.t27 text, never a
+; copy. Cards are cached in ~/.t27os/cards/<id>.png and fetched in the background by /usr/bin/curl.
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osDash;
+
+use t27os::homes::H_T27U;
+use t27os::homes::AGENT_LETTERS;
+use t27os::homes::agents_in;
+use t27os::homes::nth_agent;
+use t27os::agent_parts::INSTRUMENT_LABEL;
+use t27os::agent_parts::letter_of_surface;
+use t27os::homes::HOME_COUNT;
+use t27os::homes::WIDGET_COUNT;
+use t27os::homes::COURSE_COUNT;
+use t27os::homes::LESSONS_PER_COURSE;
+use t27os::agent_parts::home_of_letter;
+use t27os::agent_parts::widgets_of_letter;
+use t27os::agent_parts::parts_of_letter;
+use t27os::agent_parts::nth_surface_of_letter;
+use t27os::agent_parts::SURFACE_COUNT;
+use t27os::agent_parts::nth_widget_of_letter;
+use t27os::agent_parts::letter_of_widget;
+use t27os::agent_parts::LETTER_COUNT;
+use t27os::homes::course_widget;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+; --- N0. Node kinds --------------------------------------------------------------------------------------
+
+pub const NK_SCREEN : u32 = 0;
+pub const NK_HOME : u32 = 1;
+pub const NK_HERO : u32 = 2;
+pub const NK_GAUGE : u32 = 3;
+pub const NK_CONSOLE : u32 = 4;
+pub const NK_INSTRUMENT : u32 = 5;
+pub const NK_COURSE_MAP : u32 = 6;
+pub const NK_LESSON : u32 = 7;
+pub const NK_KINDS : u32 = 8;
+pub const NK_NAMES : [8]str = ["SCREEN", "HOME", "HERO", "GAUGE", "CONSOLE", "INSTRUMENT", "COURSE MAP", "LESSON"];
+
+/// The kinds a node of kind k holds as children (the tree: SCREEN > HOME > HERO, CONSOLE, COURSE_MAP; a HERO
+/// holds GAUGEs, a CONSOLE holds INSTRUMENTs, a COURSE_MAP holds LESSONs); NK_KINDS for a leaf.
+pub fn child_kind(k: u32, i: u32) -> u32 {
+    if (k == NK_SCREEN and i == 0) { return NK_HOME; }
+    if (k == NK_HOME and i == 0) { return NK_HERO; }
+    if (k == NK_HOME and i == 1) { return NK_CONSOLE; }
+    if (k == NK_HOME and i == 2) { return NK_COURSE_MAP; }
+    if (k == NK_HERO and i == 0) { return NK_GAUGE; }
+    if (k == NK_CONSOLE and i == 0) { return NK_INSTRUMENT; }
+    if (k == NK_COURSE_MAP and i == 0) { return NK_LESSON; }
+    return NK_KINDS;
+}
+
+; --- N1. The packer --------------------------------------------------------------------------------------
+
+fn fl(x: u32) -> f64 { return @as(f64, @floatFromInt(x)); }
+
+pub fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+/// How many children of at least minw (and gap apart) fit in a row of width w; one at least.
+pub fn pack_cols(w: f64, minw: f64, gap: f64) -> u32 {
+    const c : f64 = (w + gap) / (minw + gap);
+    if (c < 1.0) { return 1; }
+    return @as(u32, @intFromFloat(c));
+}
+
+/// The width of one child when cols fill the row exactly.
+pub fn cell_w(w: f64, cols: u32, gap: f64) -> f64 {
+    return (w - fl(cols - 1) * gap) / fl(cols);
+}
+
+pub fn cell_x(i: u32, w: f64, cols: u32, gap: f64) -> f64 {
+    return fl(i % cols) * (cell_w(w, cols, gap) + gap);
+}
+
+pub fn cell_y(i: u32, cols: u32, rowh: f64, gap: f64) -> f64 {
+    return fl(i / cols) * (rowh + gap);
+}
+
+pub fn pack_rows(n: u32, cols: u32) -> u32 {
+    return (n + cols - 1) / cols;
+}
+
+/// The height n children take in rows of rowh, 0 for none.
+pub fn pack_h(n: u32, cols: u32, rowh: f64, gap: f64) -> f64 {
+    if (n == 0) { return 0.0; }
+    const r : u32 = pack_rows(n, cols);
+    return fl(r) * rowh + fl(r - 1) * gap;
+}
+
+/// The child under (x, y) in a packed area (relative to its corner), n when none. Cells are cell_w wide and
+/// rowh high; the gaps between them hit nothing.
+pub fn pack_at(n: u32, w: f64, cols: u32, rowh: f64, gap: f64, x: f64, y: f64) -> u32 {
+    if (x < 0.0 or y < 0.0 or x >= w) { return n; }
+    const cw : f64 = cell_w(w, cols, gap);
+    const col : u32 = @as(u32, @intFromFloat(x / (cw + gap)));
+    const row : u32 = @as(u32, @intFromFloat(y / (rowh + gap)));
+    if (col >= cols) { return n; }
+    if (x - fl(col) * (cw + gap) > cw) { return n; }
+    if (y - fl(row) * (rowh + gap) > rowh) { return n; }
+    const i : u32 = row * cols + col;
+    if (i >= n) { return n; }
+    return i;
+}
+
+; --- N2. Constants ---------------------------------------------------------------------------------------
+
+pub const GAP : f64 = 6.0;
+pub const CGAP : f64 = 8.0;
+pub const CPAD : f64 = 8.0;
+pub const CON_HEAD : f64 = 24.0;
+pub const TILE_MIN : f64 = 128.0;
+pub const TTL_H : f64 = 14.0;
+pub const CARD_W : f64 = 1200.0;
+pub const CARD_H : f64 = 630.0;
+pub const SEG : f64 = 6.0;
+pub const SEG_GAP : f64 = 3.0;
+pub const CHIP_H : f64 = 36.0;
+pub const CHIP_MIN : f64 = 150.0;
+pub const GAUGES : u32 = 4;
+pub const GAUGE_H : f64 = 26.0;
+pub const GAUGE_AREA : f64 = 216.0;
+pub const GAUGE_GAP : f64 = 4.0;
+pub const WIDE_HERO : f64 = 560.0;
+pub const CM_HEAD : f64 = 26.0;
+pub const CM_ROW : f64 = 30.0;
+pub const CM_GAP : f64 = 4.0;
+pub const CM_NUM_W : f64 = 44.0;
+pub const MODULES : u32 = 9;
+pub const LESSONS_PER_MODULE : u32 = 3;
+pub const COURSES_HEAD : f64 = 34.0;
+pub const END_PAD : f64 = 28.0;
+pub const NO_WIDGET : u32 = 195;
+
+; --- N3. The hero: title, gauges, segment bar -------------------------------------------------------------
+
+/// The characters of the big title of letter o: "C  COMPILER CORE".
+pub fn title_len(o: u32) -> u32 {
+    if (o < 1 or o > LETTER_COUNT) { return 1; }
+    return @as(u32, @intCast(AGENT_LETTERS[o - 1].len)) + 2 + @as(u32, @intCast(INSTRUMENT_LABEL[o - 1].len));
+}
+
+/// The title fills the room left of the gauges (all the width when they sit below), 28 to 64 pt.
+pub fn title_size(o: u32, pw: f64) -> f64 {
+    var avail : f64 = pw;
+    if (gauge_below(pw) == false) { avail = pw - GAUGE_AREA - 14.0; }
+    return clampf(avail / (0.64 * fl(title_len(o))), 28.0, 64.0);
+}
+
+pub fn gauge_below(pw: f64) -> bool { return pw < WIDE_HERO; }
+
+/// The band of the title (and, when the page is wide, the gauges to its right).
+pub fn band_h(o: u32, pw: f64) -> f64 {
+    const t : f64 = title_size(o, pw) + 6.0;
+    if (gauge_below(pw)) { return t + GAUGE_H + 10.0; }
+    if (t < 2.0 * GAUGE_H + GAUGE_GAP) { return 2.0 * GAUGE_H + GAUGE_GAP; }
+    return t;
+}
+
+pub fn band_top() -> f64 { return 24.0; }
+
+/// Segments of the bar: one per part (widget or app surface) of the letter.
+pub fn seg_count(o: u32) -> u32 { return parts_of_letter(o); }
+
+/// The gallery index of segment s of letter o (WIDGET_COUNT for a surface or past the end).
+pub fn seg_widget(o: u32, s: u32) -> u32 { return con_widget(o, s); }
+
+pub fn seg_cols(n: u32, pw: f64) -> u32 {
+    const c : u32 = pack_cols(pw, SEG, SEG_GAP);
+    if (n > 0 and n < c) { return n; }
+    return c;
+}
+
+pub fn bar_h(n: u32, pw: f64) -> f64 { return pack_h(n, seg_cols(n, pw), SEG, SEG_GAP); }
+
+pub fn bar_top(o: u32, pw: f64) -> f64 { return band_top() + band_h(o, pw) + 26.0; }
+
+pub fn hero_h(o: u32, pw: f64) -> f64 {
+    return bar_top(o, pw) + bar_h(seg_count(o), pw) + 12.0;
+}
+
+/// Gauge g (0..3): AGENTS, WIDGETS, COURSES, CACHED. The 2x2 block at the right of a wide hero, or a row of
+/// four under the title in a narrow one.
+pub fn gauge_x(g: u32, pw: f64) -> f64 {
+    if (gauge_below(pw)) { return cell_x(g, pw, GAUGES, GAUGE_GAP); }
+    return pw - GAUGE_AREA + cell_x(g, GAUGE_AREA, 2, GAUGE_GAP);
+}
+
+pub fn gauge_y(g: u32, o: u32, pw: f64) -> f64 {
+    if (gauge_below(pw)) { return band_top() + title_size(o, pw) + 16.0; }
+    return band_top() + 0.5 * (band_h(o, pw) - 2.0 * GAUGE_H - GAUGE_GAP) + cell_y(g, 2, GAUGE_H, GAUGE_GAP);
+}
+
+pub fn gauge_w(pw: f64) -> f64 {
+    if (gauge_below(pw)) { return cell_w(pw, GAUGES, GAUGE_GAP); }
+    return cell_w(GAUGE_AREA, 2, GAUGE_GAP);
+}
+
+pub const GAUGE_NAMES : [4]str = ["HOME", "WIDGETS", "SURFACES", "CACHED"];
+
+; --- N4. Consoles ----------------------------------------------------------------------------------------
+; ncon[k] is the number of widgets the k-th letter agent of the home owns; the page is a function of it.
+
+/// Instrument j of the console of letter o: its widgets first (a gallery card), then its app surfaces
+/// (agent_parts.t27, no card). con_widget is the gallery index, WIDGET_COUNT for a surface or past the end.
+pub fn con_widget(o: u32, j: u32) -> u32 {
+    if (j >= widgets_of_letter(o)) { return WIDGET_COUNT; }
+    return nth_widget_of_letter(o, j);
+}
+
+/// The surface index of instrument j (SURFACE_COUNT when it is a widget or past the end).
+pub fn con_surface(o: u32, j: u32) -> u32 {
+    const nw : u32 = widgets_of_letter(o);
+    if (j < nw) { return SURFACE_COUNT; }
+    return nth_surface_of_letter(o, j - nw);
+}
+
+/// Fill ncon for the console of letter o: one console, ncon[0] instruments (widgets + surfaces); returns 1.
+pub fn plan(o: u32, ncon: []u32) -> u32 {
+    ncon[0] = parts_of_letter(o);
+    return 1;
+}
+
+pub fn heavy_count(ncon: []const u32, na: u32) -> u32 {
+    var n : u32 = 0;
+    var k : u32 = 0;
+    while (k < na) {
+        if (ncon[k] > 0) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The agent index k of the j-th console that holds instruments (na when none).
+pub fn heavy_k(ncon: []const u32, na: u32, j: u32) -> u32 {
+    var seen : u32 = 0;
+    var k : u32 = 0;
+    while (k < na) {
+        if (ncon[k] > 0) {
+            if (seen == j) { return k; }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    return na;
+}
+
+pub fn idle_k(ncon: []const u32, na: u32, j: u32) -> u32 {
+    var seen : u32 = 0;
+    var k : u32 = 0;
+    while (k < na) {
+        if (ncon[k] == 0) {
+            if (seen == j) { return k; }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    return na;
+}
+
+pub fn inner_w(pw: f64) -> f64 { return pw - 2.0 * CPAD; }
+pub fn tile_cols(pw: f64) -> u32 { return pack_cols(inner_w(pw), TILE_MIN, GAP); }
+pub fn tile_w(pw: f64) -> f64 { return cell_w(inner_w(pw), tile_cols(pw), GAP); }
+pub fn tile_h(pw: f64) -> f64 { return tile_w(pw) * CARD_H / CARD_W; }
+/// A cell: the card and the title line under it.
+pub fn cell_h(pw: f64) -> f64 { return tile_h(pw) + TTL_H; }
+
+pub fn con_h(n: u32, pw: f64) -> f64 {
+    return CON_HEAD + pack_h(n, tile_cols(pw), cell_h(pw), GAP) + CPAD;
+}
+
+/// Top of the j-th console that holds instruments.
+pub fn con_top(o: u32, ncon: []const u32, na: u32, pw: f64, j: u32) -> f64 {
+    var y : f64 = hero_h(o, pw) + CGAP;
+    var i : u32 = 0;
+    while (i < j) {
+        y = y + con_h(ncon[heavy_k(ncon, na, i)], pw) + CGAP;
+        i = i + 1;
+    }
+    return y;
+}
+
+pub fn idle_top(o: u32, ncon: []const u32, na: u32, pw: f64) -> f64 {
+    return con_top(o, ncon, na, pw, heavy_count(ncon, na));
+}
+
+pub fn idle_cols(pw: f64) -> u32 { return pack_cols(pw, CHIP_MIN, CGAP); }
+
+pub fn idle_h(o: u32, ncon: []const u32, na: u32, pw: f64) -> f64 {
+    return pack_h(na - heavy_count(ncon, na), idle_cols(pw), CHIP_H, CGAP);
+}
+
+; --- N5. Course maps (t27u) ------------------------------------------------------------------------------
+
+pub fn cm_h() -> f64 {
+    return CM_HEAD + fl(MODULES) * CM_ROW + fl(MODULES - 1) * CM_GAP + CPAD;
+}
+
+pub fn courses_top(o: u32, ncon: []const u32, na: u32, pw: f64) -> f64 {
+    var y : f64 = idle_top(o, ncon, na, pw) + idle_h(o, ncon, na, pw);
+    if (idle_h(o, ncon, na, pw) > 0.0) { y = y + CGAP; }
+    return y;
+}
+
+pub fn cm_top(o: u32, ncon: []const u32, na: u32, pw: f64, c: u32) -> f64 {
+    return courses_top(o, ncon, na, pw) + COURSES_HEAD + fl(c) * (cm_h() + CGAP);
+}
+
+pub fn cm_row_y(m: u32) -> f64 { return CM_HEAD + fl(m) * (CM_ROW + CM_GAP); }
+pub fn cm_lessons_x() -> f64 { return CPAD + CM_NUM_W + CGAP; }
+pub fn cm_lessons_w(pw: f64) -> f64 { return pw - cm_lessons_x() - CPAD; }
+
+/// The height of the whole page of home h at page width pw.
+pub fn page_h(o: u32, ncon: []const u32, na: u32, pw: f64) -> f64 {
+    if (o < 1 or o > LETTER_COUNT) { return 0.0; }
+    var y : f64 = courses_top(o, ncon, na, pw);
+    if (home_of_letter(o) == H_T27U) { y = cm_top(o, ncon, na, pw, COURSE_COUNT); }
+    return y + END_PAD;
+}
+
+pub fn dash_scroll_max(total: f64, view: f64) -> u32 {
+    const over : f64 = total - view;
+    if (over <= 0.0) { return 0; }
+    return @as(u32, @intFromFloat(over)) + 1;
+}
+
+pub fn dash_scroll_clamp(off: u32, dy: i64, total: f64, view: f64) -> u32 {
+    var v : i64 = @as(i64, off) + dy;
+    if (v < 0) { v = 0; }
+    const m : i64 = @as(i64, dash_scroll_max(total, view));
+    if (v > m) { v = m; }
+    return @as(u32, @intCast(v));
+}
+
+; --- N6. Hit test ----------------------------------------------------------------------------------------
+
+/// The gallery index of the instrument or lesson under the page point (px, py), NO_WIDGET when none.
+pub fn dash_hit(o: u32, ncon: []const u32, na: u32, pw: f64, px: f64, py: f64) -> u32 {
+    if (o < 1 or o > LETTER_COUNT) { return NO_WIDGET; }
+    const nh : u32 = heavy_count(ncon, na);
+    var j : u32 = 0;
+    while (j < nh) {
+        const k : u32 = heavy_k(ncon, na, j);
+        const top : f64 = con_top(o, ncon, na, pw, j);
+        if (py >= top and py < top + con_h(ncon[k], pw)) {
+            const t : u32 = pack_at(ncon[k], inner_w(pw), tile_cols(pw), cell_h(pw), GAP, px - CPAD, py - top - CON_HEAD);
+            if (t < ncon[k]) { return con_widget(o, t); }
+            return NO_WIDGET;
+        }
+        j = j + 1;
+    }
+    if (home_of_letter(o) == H_T27U) {
+        var c : u32 = 0;
+        while (c < COURSE_COUNT) {
+            const top : f64 = cm_top(o, ncon, na, pw, c);
+            if (py >= top and py < top + cm_h()) {
+                var m : u32 = 0;
+                while (m < MODULES) {
+                    const ry : f64 = top + cm_row_y(m);
+                    if (py >= ry and py < ry + CM_ROW) {
+                        const l : u32 = pack_at(LESSONS_PER_MODULE, cm_lessons_w(pw), LESSONS_PER_MODULE, CM_ROW, GAP, px - cm_lessons_x(), py - ry);
+                        if (l < LESSONS_PER_MODULE) { return course_widget(c, m * LESSONS_PER_MODULE + l); }
+                    }
+                    m = m + 1;
+                }
+                return NO_WIDGET;
+            }
+            c = c + 1;
+        }
+    }
+    return NO_WIDGET;
+}
+
+; --- N6a. The agents pinned to an instrument (a required field of every tile) --------------------------------
+; Owner, 2026-10-20: every instrument carries its AGENTS, shown on screen. agents_of_widget(i, k): k = 0 is the
+; owner letter (agent_parts LETTER_OF_WIDGET); k > 0 are the contributing letters. STUB: agent_parts.t27 has no
+; contributor list yet, so k > 0 is none. TO SWITCH: when it lands, return its k-th contributor here (0 past the
+; end) and nothing else changes: the tile and the live header draw until the first 0.
+
+pub const MAX_AGENTS : u32 = 4;
+
+pub fn agents_of_widget(i: u32, k: u32) -> u32 {
+    if (k == 0) { return letter_of_widget(i); }
+    return 0;
+}
+
+/// The k-th agent of instrument t of the console of letter o: a widget's, or (a surface) its owner letter.
+pub fn agents_of_instrument(o: u32, t: u32, k: u32) -> u32 {
+    const wi : u32 = con_widget(o, t);
+    if (wi < WIDGET_COUNT) { return agents_of_widget(wi, k); }
+    const s : u32 = con_surface(o, t);
+    if (s < SURFACE_COUNT and k == 0) { return letter_of_surface(s); }
+    return 0;
+}
+
+pub fn agents_count(o: u32, t: u32) -> u32 {
+    var k : u32 = 0;
+    while (k < MAX_AGENTS and agents_of_instrument(o, t, k) != 0) { k = k + 1; }
+    return k;
+}
+
+; --- N6b. The sidebar of letters grouped by home, and the CHAT / CONSOLE switch -------------------------------------
+; Eight groups (t27a .. t27u, Queen), each a heading and its letters as chips: SIDE_COLS to a row.
+
+pub const SIDE_W : f64 = 272.0;
+pub const SIDE_PAD : f64 = 12.0;
+pub const SIDE_TOP : f64 = 30.0;
+pub const SIDE_HEAD : f64 = 14.0;
+pub const CHIP_W : f64 = 26.0;
+pub const CHIP_H2 : f64 = 24.0;
+pub const CHIP_GAP : f64 = 2.0;
+pub const SIDE_COLS : u32 = 8;
+
+pub fn side_rows(h: u32) -> u32 {
+    const n : u32 = agents_in(h);
+    if (n == 0) { return 0; }
+    return (n + SIDE_COLS - 1) / SIDE_COLS;
+}
+
+/// Top (from the window top) of the heading of group h; ws_top is the top of the workspace.
+pub fn side_group_top(h: u32, ws_top: f64) -> f64 {
+    var y : f64 = ws_top + SIDE_TOP;
+    var g : u32 = 0;
+    while (g < h) {
+        y = y + SIDE_HEAD + fl(side_rows(g)) * (CHIP_H2 + CHIP_GAP) + 4.0;
+        g = g + 1;
+    }
+    return y;
+}
+
+pub fn side_chip_x(k: u32) -> f64 { return SIDE_PAD + fl(k % SIDE_COLS) * (CHIP_W + CHIP_GAP); }
+pub fn side_chip_y(h: u32, k: u32, ws_top: f64) -> f64 {
+    return side_group_top(h, ws_top) + SIDE_HEAD + fl(k / SIDE_COLS) * (CHIP_H2 + CHIP_GAP);
+}
+
+/// The letter (ORDINAL 1..27) whose chip is under (x, y), 0 when none.
+pub fn side_letter_at(x: f64, y: f64, ws_top: f64) -> u32 {
+    var h : u32 = 0;
+    while (h < HOME_COUNT) {
+        const n : u32 = agents_in(h);
+        var k : u32 = 0;
+        while (k < n) {
+            const cx : f64 = side_chip_x(k);
+            const cy : f64 = side_chip_y(h, k, ws_top);
+            if (x >= cx and x < cx + CHIP_W and y >= cy and y < cy + CHIP_H2) { return nth_agent(h, k); }
+            k = k + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+pub fn side_end(ws_top: f64) -> f64 { return side_group_top(HOME_COUNT, ws_top); }
+
+/// The CHAT / CONSOLE switch of the C petal: 84 x 22 at the right end of the workspace header.
+pub fn on_switch(x: f64, y: f64, sw: f64, ws_top: f64) -> bool {
+    return x >= sw - 108.0 and x <= sw - 24.0 and y >= ws_top + 11.0 and y <= ws_top + 33.0;
+}
+
+; --- N7. The live page of one widget ----------------------------------------------------------------------
+
+pub const LIVE_HEAD : f64 = 112.0;
+pub const LIVE_NONE : u64 = 0;
+
+/// The page area under the lesson-style header, in scene points: x, y (from the top), w, o.
+pub fn live_x(cx: f64) -> f64 { return cx + 32.0; }
+pub fn live_y(vt: f64) -> f64 { return vt + LIVE_HEAD; }
+pub fn live_w(sw: f64, cx: f64) -> f64 { return sw - live_x(cx) - 32.0; }
+pub fn live_h(sh: f64, vt: f64) -> f64 { return sh - live_y(vt) - 16.0; }
+
+/// The back crumb in the header: "< BACK", 76 x 20 at the header's top left.
+pub fn on_live_back(mx: f64, my: f64, cx: f64, vt: f64) -> bool {
+    return mx >= cx + 32.0 and mx <= cx + 32.0 + 76.0 and my >= vt + 10.0 and my <= vt + 30.0;
+}
+
+/// Scene (y down) to the AppKit view of a window that fits a scene of sw x sh at scale s into vw x vh.
+pub fn view_x(sx: f64, vw: f64, sw: f64, s: f64) -> f64 { return 0.5 * (vw - sw * s) + sx * s; }
+pub fn view_y(sy: f64, rh: f64, vh: f64, sh: f64, s: f64) -> f64 { return 0.5 * (vh - sh * s) + (sh - (sy + rh)) * s; }
+
+; --- N8. The gallery text, its parse and the strings built from it ---------------------------------------
+; The gallery file is read into a byte buffer. gal_parse writes, for each of the arrays WIDGET_IDS, WIDGET_KINDS
+; and WIDGET_PAGES, the start and length of every quoted string: tab[(a * cap + i) * 2] and +1.
+
+pub const GAL_IDS : u32 = 0;
+pub const GAL_KINDS : u32 = 1;
+pub const GAL_PAGES : u32 = 2;
+pub const GAL_MAX : usize = 49152;
+pub const GAL_CAP : u32 = 200;
+pub const GAL_TAB : usize = 1200;
+
+/// The index of the first occurrence of pat in buf[from..n], n when there is none.
+pub fn gal_find(buf: []const u8, n: usize, from: usize, pat: []const u8) -> usize {
+    var i : usize = from;
+    while (i + pat.len <= n) {
+        var k : usize = 0;
+        while (k < pat.len and buf[i + k] == pat[k]) { k = k + 1; }
+        if (k == pat.len) { return i; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Parse one array whose declaration starts at `at`: the strings after the first `= [` up to the closing `]`.
+/// Returns how many strings were recorded into tab at array slot a.
+fn gal_array(buf: []const u8, n: usize, at: usize, a: u32, tab: []u32) -> u32 {
+    var i : usize = at;
+    while (i < n and buf[i] != 61) { i = i + 1; }
+    while (i < n and buf[i] != 91) { i = i + 1; }
+    i = i + 1;
+    var cnt : u32 = 0;
+    while (i < n and buf[i] != 93 and cnt < GAL_CAP) {
+        if (buf[i] == 34) {
+            const st : usize = i + 1;
+            var e : usize = st;
+            while (e < n and buf[e] != 34) { e = e + 1; }
+            tab[(a * GAL_CAP + cnt) * 2] = @as(u32, @intCast(st));
+            tab[(a * GAL_CAP + cnt) * 2 + 1] = @as(u32, @intCast(e - st));
+            cnt = cnt + 1;
+            i = e;
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+/// Parse the gallery text; returns the number of widgets all three arrays agree on, 0 when one is missing.
+pub fn gal_parse(buf: []const u8, n: usize, tab: []u32) -> u32 {
+    const p0 : usize = gal_find(buf, n, 0, "pub const WIDGET_IDS");
+    const p1 : usize = gal_find(buf, n, 0, "pub const WIDGET_KINDS");
+    const p2 : usize = gal_find(buf, n, 0, "pub const WIDGET_PAGES");
+    if (p0 >= n or p1 >= n or p2 >= n) { return 0; }
+    const a : u32 = gal_array(buf, n, p0, GAL_IDS, tab);
+    const b : u32 = gal_array(buf, n, p1, GAL_KINDS, tab);
+    const c : u32 = gal_array(buf, n, p2, GAL_PAGES, tab);
+    if (a != b or a != c) { return 0; }
+    return a;
+}
+
+pub fn gal_start(tab: []const u32, a: u32, i: u32) -> usize { return @as(usize, tab[(a * GAL_CAP + i) * 2]); }
+pub fn gal_len(tab: []const u32, a: u32, i: u32) -> usize { return @as(usize, tab[(a * GAL_CAP + i) * 2 + 1]); }
+
+pub const SITE : str = "https://t27.ai/";
+
+/// The page of widget i as a URL: the page the site itself embeds.
+pub fn put_page_url(buf: []const u8, tab: []const u32, i: u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, SITE);
+    const s : usize = gal_start(tab, GAL_PAGES, i);
+    n = put_bytes(out, n, buf[s .. s + gal_len(tab, GAL_PAGES, i)]);
+    out[n] = 0;
+    return n;
+}
+
+/// The URL of widget i's card.png, 0 bytes when its page is not a directory (a Queen tab has no card).
+pub fn put_card_url(buf: []const u8, tab: []const u32, i: u32, out: []u8) -> usize {
+    const s : usize = gal_start(tab, GAL_PAGES, i);
+    const l : usize = gal_len(tab, GAL_PAGES, i);
+    if (l == 0 or buf[s + l - 1] != 47) { return 0; }
+    var n : usize = put_bytes(out, 0, SITE);
+    n = put_bytes(out, n, buf[s .. s + l]);
+    n = put_bytes(out, n, "card.png");
+    out[n] = 0;
+    return n;
+}
+
+/// ~/.t27os/cards/<id>.png, NUL-terminated (the NUL is not counted).
+pub fn put_card_path(home: []const u8, buf: []const u8, tab: []const u32, i: u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.t27os/cards/");
+    const s : usize = gal_start(tab, GAL_IDS, i);
+    n = put_bytes(out, n, buf[s .. s + gal_len(tab, GAL_IDS, i)]);
+    n = put_bytes(out, n, ".png");
+    out[n] = 0;
+    return n;
+}
+
+pub fn put_gallery_path(home: []const u8, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.t27os/gallery.t27");
+    out[n] = 0;
+    return n;
+}
+
+pub fn put_gallery_url(out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, SITE);
+    n = put_bytes(out, n, "widgets/gallery.t27");
+    out[n] = 0;
+    return n;
+}
+
+/// path + ".part", NUL-terminated: the file curl writes before the rename.
+pub fn put_part(path: []const u8, n: usize, out: []u8) -> usize {
+    var m : usize = put_bytes(out, 0, path[0 .. n]);
+    m = put_bytes(out, m, ".part");
+    out[m] = 0;
+    return m;
+}
+
+/// The argv of the fetch packed into buf (NUL-terminated words); offs[0..6] get the start of each word:
+/// curl -sfL --max-time 20 -o <tmp> <url>. Returns the bytes used.
+pub fn put_argv(tmp: []const u8, tn: usize, url: []const u8, un: usize, buf: []u8, offs: []u32) -> usize {
+    var n : usize = 0;
+    offs[0] = 0;
+    n = put_bytes(buf, n, "curl");
+    buf[n] = 0;
+    n = n + 1;
+    offs[1] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, "-sfL");
+    buf[n] = 0;
+    n = n + 1;
+    offs[2] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, "--max-time");
+    buf[n] = 0;
+    n = n + 1;
+    offs[3] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, "20");
+    buf[n] = 0;
+    n = n + 1;
+    offs[4] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, "-o");
+    buf[n] = 0;
+    n = n + 1;
+    offs[5] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, tmp[0 .. tn]);
+    buf[n] = 0;
+    n = n + 1;
+    offs[6] = @as(u32, @intCast(n));
+    n = put_bytes(buf, n, url[0 .. un]);
+    buf[n] = 0;
+    return n + 1;
+}
+
+; --- N9. Widget states and the card cache -----------------------------------------------------------------
+
+pub const WS_NEW : u64 = 0;
+pub const WS_FETCH : u64 = 1;
+pub const WS_LOADED : u64 = 2;
+pub const WS_FAILED : u64 = 3;
+pub const WS_WANT : u64 = 4;
+pub const CACHE_SLOTS : u32 = 128;
+pub const FETCH_SLOTS : u32 = 6;
+
+/// The slot holding widget wi (keys hold wi + 1; 0 is empty), n when none.
+pub fn cache_find(keys: []const u64, n: u32, wi: u32) -> u32 {
+    var s : u32 = 0;
+    while (s < n) {
+        if (keys[s] == @as(u64, wi) + 1) { return s; }
+        s = s + 1;
+    }
+    return n;
+}
+
+pub fn cache_free(keys: []const u64, n: u32) -> u32 {
+    var s : u32 = 0;
+    while (s < n) {
+        if (keys[s] == 0) { return s; }
+        s = s + 1;
+    }
+    return n;
+}
+
+/// The slot to evict when none is free: round robin.
+pub fn cache_victim(next: u64, n: u32) -> u32 { return @as(u32, @intCast(next % @as(u64, n))); }
+
+; --- N10. Text of the page -------------------------------------------------------------------------------
+
+/// The readout of a console: "12 INSTRUMENTS" (or "1 INSTRUMENT", "IDLE").
+pub fn put_readout(n: u32, out: []u8) -> usize {
+    if (n == 0) { return put_bytes(out, 0, "IDLE"); }
+    const c : usize = put_dec(out, 0, @as(u64, n));
+    if (n == 1) { return put_bytes(out, c, " INSTRUMENT"); }
+    return put_bytes(out, c, " INSTRUMENTS");
+}
+
+/// "04/12": a count of two numbers for a gauge.
+pub fn put_ratio(a: u32, b: u32, out: []u8) -> usize {
+    var n : usize = put_dec(out, 0, @as(u64, a));
+    n = put_bytes(out, n, "/");
+    return put_dec(out, n, @as(u64, b));
+}
+
+/// "01".."09": module numbers of a course map.
+pub fn put_two(v: u32, out: []u8) -> usize {
+    var n : usize = 0;
+    if (v < 10) { n = put_bytes(out, 0, "0"); }
+    return put_dec(out, n, @as(u64, v));
+}
+
+; --- Tests -----------------------------------------------------------------------------------------------
+
+test the_packer_places_children_edge_to_edge {
+    assert pack_cols(672.0, 128.0, 6.0) == 5;
+    assert pack_cols(10.0, 128.0, 6.0) == 1;
+    const w : f64 = cell_w(672.0, 5, 6.0);
+    assert w > 128.0;
+    assert cell_x(0, 672.0, 5, 6.0) == 0.0;
+    assert cell_x(4, 672.0, 5, 6.0) + w <= 672.0 + 0.001;
+    assert cell_x(4, 672.0, 5, 6.0) + w >= 672.0 - 0.001;
+    assert cell_y(5, 5, 82.0, 6.0) == 88.0;
+    assert pack_rows(11, 5) == 3;
+    assert pack_h(0, 5, 82.0, 6.0) == 0.0;
+    assert pack_h(11, 5, 82.0, 6.0) == 3.0 * 82.0 + 2.0 * 6.0;
+}
+
+test pack_at_hits_cells_and_not_gaps {
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 1.0, 1.0) == 0;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 140.0, 1.0) == 1;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 135.0, 1.0) == 11;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 1.0, 90.0) == 5;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 1.0, 85.0) == 11;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 140.0, 2.0 * 88.0 + 1.0) == 11;
+    assert pack_at(11, 672.0, 5, 82.0, 6.0, 0.0 - 1.0, 1.0) == 11;
+}
+
+test the_tree_nests_widgets_in_widgets {
+    assert child_kind(NK_SCREEN, 0) == NK_HOME;
+    assert child_kind(NK_HOME, 1) == NK_CONSOLE;
+    assert child_kind(NK_CONSOLE, 0) == NK_INSTRUMENT;
+    assert child_kind(NK_HERO, 0) == NK_GAUGE;
+    assert child_kind(NK_COURSE_MAP, 0) == NK_LESSON;
+    assert child_kind(NK_INSTRUMENT, 0) == NK_KINDS;
+}
+
+test the_hero_is_a_compact_strip {
+    assert title_size(3, 688.0) >= 28.0 and title_size(3, 688.0) <= 64.0;
+    assert title_len(3) == 1 + 2 + 13;
+    assert title_size(3, 688.0) * 0.64 * fl(title_len(3)) <= 688.0 - GAUGE_AREA - 14.0 + 0.01 or title_size(3, 688.0) == 28.0;
+    assert gauge_below(400.0);
+    assert gauge_below(688.0) == false;
+    assert gauge_x(1, 688.0) + gauge_w(688.0) <= 688.0 + 0.001;
+    assert gauge_x(1, 688.0) + gauge_w(688.0) >= 688.0 - 0.001;
+    assert gauge_y(2, 3, 688.0) > gauge_y(0, 3, 688.0);
+    assert hero_h(3, 688.0) < 200.0;
+    assert hero_h(3, 688.0) >= bar_top(3, 688.0);
+    assert seg_count(11) >= 64;
+    assert seg_count(11) == parts_of_letter(11);
+    assert seg_widget(11, 0) == 0;
+    assert seg_widget(11, 64) == WIDGET_COUNT or seg_widget(11, 64) < WIDGET_COUNT;
+    assert seg_widget(11, parts_of_letter(11)) == WIDGET_COUNT;
+    assert con_surface(11, 0) == SURFACE_COUNT;
+    assert letter_of_widget(seg_widget(26, 0)) == 26;
+}
+
+test a_console_holds_every_widget_of_its_letter {
+    var ncon : [32]u32 = undefined;
+    var o : u32 = 1;
+    var total : u32 = 0;
+    while (o <= LETTER_COUNT) {
+        const na : u32 = plan(o, ncon[0..32]);
+        assert na == 1;
+        assert ncon[0] == parts_of_letter(o);
+        total = total + ncon[0];
+        assert heavy_count(ncon[0..32], na) + (na - heavy_count(ncon[0..32], na)) == na;
+        o = o + 1;
+    }
+    assert total == WIDGET_COUNT + SURFACE_COUNT;
+}
+
+test the_page_height_is_a_sum_of_its_widgets {
+    var ncon : [32]u32 = undefined;
+    const na : u32 = plan(3, ncon[0..32]);
+    const pw : f64 = 688.0;
+    assert heavy_count(ncon[0..32], na) == 1;
+    assert con_top(3, ncon[0..32], na, pw, 0) == hero_h(3, pw) + CGAP;
+    assert idle_top(3, ncon[0..32], na, pw) == con_top(3, ncon[0..32], na, pw, 0) + con_h(ncon[0], pw) + CGAP;
+    assert page_h(3, ncon[0..32], na, pw) >= idle_top(3, ncon[0..32], na, pw) + END_PAD;
+    assert tile_cols(pw) == 5;
+    assert tile_h(pw) / tile_w(pw) < 0.526 and tile_h(pw) / tile_w(pw) > 0.524;
+    assert page_h(0, ncon[0..32], na, pw) == 0.0;
+    var e : u32 = 1;
+    while (e <= LETTER_COUNT and parts_of_letter(e) > 0) { e = e + 1; }
+    if (e <= LETTER_COUNT) {
+        const na2 : u32 = plan(e, ncon[0..32]);
+        assert heavy_count(ncon[0..32], na2) == 0;
+        assert idle_h(e, ncon[0..32], na2, pw) == CHIP_H;
+    }
+}
+
+test a_wider_page_packs_more_instruments_per_row {
+    assert tile_cols(1200.0) > tile_cols(688.0);
+    assert tile_cols(688.0) >= 4;
+    assert tile_cols(200.0) == 1;
+}
+
+test every_instrument_is_hit_at_its_centre {
+    var ncon : [32]u32 = undefined;
+    const pw : f64 = 688.0;
+    var o : u32 = 1;
+    while (o <= LETTER_COUNT) {
+        const na : u32 = plan(o, ncon[0..32]);
+        if (heavy_count(ncon[0..32], na) == 1) {
+            const top : f64 = con_top(o, ncon[0..32], na, pw, 0);
+            var t : u32 = 0;
+            while (t < ncon[0]) {
+                const x : f64 = CPAD + cell_x(t, inner_w(pw), tile_cols(pw), GAP) + 0.5 * tile_w(pw);
+                const y : f64 = top + CON_HEAD + cell_y(t, tile_cols(pw), cell_h(pw), GAP) + 0.5 * tile_h(pw);
+                assert dash_hit(o, ncon[0..32], na, pw, x, y) == con_widget(o, t);
+                t = t + 1;
+            }
+        }
+        o = o + 1;
+    }
+    assert dash_hit(11, ncon[0..32], plan(11, ncon[0..32]), pw, 5.0, 5.0) == NO_WIDGET;
+    assert dash_hit(0, ncon[0..32], 0, pw, 5.0, 5.0) == NO_WIDGET;
+}
+
+test a_lesson_cell_opens_its_widget {
+    var ncon : [32]u32 = undefined;
+    const na : u32 = plan(26, ncon[0..32]);
+    const pw : f64 = 688.0;
+    const x : f64 = cm_lessons_x() + 4.0;
+    const y : f64 = cm_top(26, ncon[0..32], na, pw, 1) + cm_row_y(2) + 4.0;
+    assert dash_hit(26, ncon[0..32], na, pw, x, y) == course_widget(1, 6);
+    const y0 : f64 = cm_top(26, ncon[0..32], na, pw, 0) + cm_row_y(0) + 4.0;
+    assert dash_hit(26, ncon[0..32], na, pw, x, y0) == course_widget(0, 0);
+    assert cm_top(26, ncon[0..32], na, pw, 7) > cm_top(26, ncon[0..32], na, pw, 6);
+    assert page_h(26, ncon[0..32], na, pw) == cm_top(26, ncon[0..32], na, pw, 7) + END_PAD;
+    assert cm_h() == 26.0 + 9.0 * 30.0 + 8.0 * 4.0 + 8.0;
+    const nb : u32 = plan(3, ncon[0..32]);
+    assert dash_hit(3, ncon[0..32], nb, pw, x, y) == NO_WIDGET or dash_hit(3, ncon[0..32], nb, pw, x, y) < WIDGET_COUNT;
+    assert page_h(3, ncon[0..32], nb, pw) < page_h(26, ncon[0..32], na, pw) + 4000.0;
+}
+
+test every_letter_has_one_chip_in_its_home_group {
+    var o : u32 = 1;
+    var seen : u32 = 0;
+    while (o <= LETTER_COUNT) {
+        var h : u32 = 0;
+        while (h < HOME_COUNT) {
+            var k : u32 = 0;
+            while (k < agents_in(h)) {
+                if (nth_agent(h, k) == o) {
+                    seen = seen + 1;
+                    const x : f64 = side_chip_x(k) + 4.0;
+                    const y : f64 = side_chip_y(h, k, 35.0) + 4.0;
+                    assert side_letter_at(x, y, 35.0) == o;
+                    assert home_of_letter(o) == h;
+                }
+                k = k + 1;
+            }
+            h = h + 1;
+        }
+        o = o + 1;
+    }
+    assert seen == LETTER_COUNT;
+    assert side_letter_at(2.0, 2.0, 35.0) == 0;
+    assert side_letter_at(side_chip_x(0) + CHIP_W + 1.0, side_chip_y(0, 0, 35.0) + 4.0, 35.0) == 0;
+    assert side_end(35.0) > side_group_top(7, 35.0);
+    assert side_end(35.0) < 450.0;
+    assert side_chip_x(SIDE_COLS - 1) + CHIP_W + SIDE_PAD <= SIDE_W;
+}
+
+test no_instrument_is_laid_out_without_an_agent {
+    var o : u32 = 1;
+    while (o <= LETTER_COUNT) {
+        var t : u32 = 0;
+        while (t < parts_of_letter(o)) {
+            assert agents_of_instrument(o, t, 0) != 0;
+            assert agents_count(o, t) >= 1;
+            t = t + 1;
+        }
+        o = o + 1;
+    }
+    var i : u32 = 0;
+    while (i < WIDGET_COUNT) {
+        assert agents_of_widget(i, 0) != 0;
+        i = i + 1;
+    }
+    assert agents_of_widget(0, 0) == letter_of_widget(0);
+    assert agents_of_widget(0, 1) == 0;
+    assert agents_of_widget(WIDGET_COUNT, 0) == 0;
+}
+
+test the_chat_console_switch_sits_in_the_header {
+    assert on_switch(900.0, 60.0, 960.0, 44.0);
+    assert on_switch(900.0, 100.0, 960.0, 44.0) == false;
+    assert on_switch(800.0, 60.0, 960.0, 44.0) == false;
+}
+
+test scrolling_stays_inside_the_page {
+    assert dash_scroll_max(400.0, 500.0) == 0;
+    assert dash_scroll_max(1000.0, 500.0) == 501;
+    assert dash_scroll_clamp(0, 0 - 5, 1000.0, 500.0) == 0;
+    assert dash_scroll_clamp(500, 90, 1000.0, 500.0) == 501;
+    assert dash_scroll_clamp(10, 20, 1000.0, 500.0) == 30;
+}
+
+test the_live_page_sits_under_its_header {
+    assert live_y(45.0) == 45.0 + LIVE_HEAD;
+    assert live_w(960.0, 272.0) == 960.0 - 304.0 - 32.0;
+    assert live_h(540.0, 45.0) == 540.0 - 45.0 - LIVE_HEAD - 16.0;
+    assert on_live_back(310.0, 60.0, 272.0, 45.0);
+    assert on_live_back(310.0, 100.0, 272.0, 45.0) == false;
+    assert view_x(0.0, 960.0, 960.0, 1.0) == 0.0;
+    assert view_y(0.0, 540.0, 540.0, 540.0, 1.0) == 0.0;
+    assert view_y(45.0, 100.0, 540.0, 540.0, 1.0) == 395.0;
+    assert view_x(100.0, 1000.0, 960.0, 1.0) == 120.0;
+}
+
+fn put_q(out: []u8, at: usize, s: []const u8) -> usize {
+    out[at] = 34;
+    const n : usize = put_bytes(out, at + 1, s);
+    out[n] = 34;
+    return n + 1;
+}
+
+fn put_decl(out: []u8, at: usize, name: []const u8, a: []const u8, b: []const u8, c: []const u8) -> usize {
+    var n : usize = put_bytes(out, at, "pub const ");
+    n = put_bytes(out, n, name);
+    n = put_bytes(out, n, " : [3]str = [");
+    n = put_q(out, n, a);
+    n = put_bytes(out, n, ", ");
+    n = put_q(out, n, b);
+    n = put_bytes(out, n, ", ");
+    n = put_q(out, n, c);
+    return put_bytes(out, n, "];\n");
+}
+
+test the_gallery_text_is_parsed_not_copied {
+    var buf : [1024]u8 = undefined;
+    var tab : [1200]u32 = undefined;
+    var n : usize = put_bytes(buf[0..1024], 0, "; a comment line about WIDGET_IDS\n");
+    n = put_decl(buf[0..1024], n, "WIDGET_IDS", "x7-board", "bit-diff", "wars");
+    n = put_decl(buf[0..1024], n, "WIDGET_KINDS", "cast", "tool", "tab");
+    n = put_decl(buf[0..1024], n, "WIDGET_PAGES", "term/x7-board/", "widgets/bit-diff/", "wars");
+    assert gal_parse(buf[0..1024], n, tab[0..1200]) == 3;
+    assert gal_len(tab[0..1200], GAL_IDS, 1) == 8;
+    const s : usize = gal_start(tab[0..1200], GAL_IDS, 1);
+    assert buf[s] == 98;
+    assert buf[s + 7] == 102;
+    assert gal_len(tab[0..1200], GAL_KINDS, 2) == 3;
+    assert gal_len(tab[0..1200], GAL_PAGES, 0) == 14;
+    var u : [256]u8 = undefined;
+    const un : usize = put_page_url(buf[0..1024], tab[0..1200], 1, u[0..256]);
+    assert un == 15 + 17;
+    assert u[un] == 0;
+    assert u[8] == 116;
+    const cn : usize = put_card_url(buf[0..1024], tab[0..1200], 0, u[0..256]);
+    assert cn == 15 + 14 + 8;
+    assert u[cn - 1] == 103;
+    assert put_card_url(buf[0..1024], tab[0..1200], 2, u[0..256]) == 0;
+    const pn : usize = put_card_path("/Users/me", buf[0..1024], tab[0..1200], 1, u[0..256]);
+    assert pn == 9 + 14 + 8 + 4;
+    assert u[pn] == 0;
+    assert gal_parse(buf[0..1024], 10, tab[0..1200]) == 0;
+}
+
+test a_gallery_with_one_array_missing_parses_to_zero {
+    var buf : [512]u8 = undefined;
+    var tab : [1200]u32 = undefined;
+    var n : usize = put_decl(buf[0..512], 0, "WIDGET_IDS", "a", "b", "c");
+    n = put_decl(buf[0..512], n, "WIDGET_KINDS", "cast", "tool", "tab");
+    assert gal_parse(buf[0..512], n, tab[0..1200]) == 0;
+}
+
+test the_fetch_command_is_packed_with_its_offsets {
+    var b : [256]u8 = undefined;
+    var o : [8]u32 = undefined;
+    const n : usize = put_argv("/t/a.png.part", 13, "https://t27.ai/x/", 17, b[0..256], o[0..8]);
+    assert o[0] == 0;
+    assert o[1] == 5;
+    assert b[o[1]] == 45;
+    assert b[o[4]] == 45;
+    assert b[o[5]] == 47;
+    assert b[o[6]] == 104;
+    assert n == o[6] + 17 + 1;
+    assert b[o[6] - 1] == 0;
+    var p : [64]u8 = undefined;
+    const pn : usize = put_part("/t/a.png", 8, p[0..64]);
+    assert pn == 13;
+    assert p[13] == 0;
+    assert put_gallery_path("/h", p[0..64]) == 2 + 19;
+    assert put_gallery_url(p[0..64]) == 15 + 19;
+}
+
+test the_card_cache_finds_frees_and_evicts {
+    var keys : [4]u64 = undefined;
+    keys[0] = 6;
+    keys[1] = 0;
+    keys[2] = 9;
+    keys[3] = 0;
+    assert cache_find(keys[0..4], 4, 5) == 0;
+    assert cache_find(keys[0..4], 4, 8) == 2;
+    assert cache_find(keys[0..4], 4, 7) == 4;
+    assert cache_free(keys[0..4], 4) == 1;
+    keys[1] = 1;
+    keys[3] = 2;
+    assert cache_free(keys[0..4], 4) == 4;
+    assert cache_victim(5, 4) == 1;
+    assert cache_victim(128, 128) == 0;
+}
+
+test the_readouts_are_plain_mono_text {
+    var b : [32]u8 = undefined;
+    assert put_readout(0, b[0..32]) == 4;
+    assert put_readout(1, b[0..32]) == 12;
+    assert put_readout(12, b[0..32]) == 14;
+    assert put_ratio(4, 12, b[0..32]) == 4;
+    assert put_two(3, b[0..32]) == 2;
+    assert b[0] == 48;
+    assert put_two(12, b[0..32]) == 2;
+}
