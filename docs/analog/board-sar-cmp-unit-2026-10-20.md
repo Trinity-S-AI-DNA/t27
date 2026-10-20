@@ -2,7 +2,7 @@
 
 Issue #11380 (M3f, phase 2a of the analog epic #10486). English, ASCII only.
 
-This is the first half of the comparator on the board: ONE evaluator unit (`specs/fpga/sar_cmp_qi_unit.t27`: one device's `qi_eval` of `specs/analog/sar_comparator_qi.t27` as a clocked machine) with its table ROM (`specs/fpga/sar_cmp_qi_tab_n.t27`, and `sar_cmp_qi_tab_p.t27` for a PMOS device), placed and routed on the `xc7a200tfbg484-2` by the probe design `specs/fpga/sar_cmp_qi_unit_probe_ax7203.t27`. The 8 x 8 solver, the board top that runs several units, the receipt and the board run are phase 2b and are not here. Nothing was loaded on the board for this document; every number below is a synthesis, place-and-route or test number.
+This is the first half of the comparator on the board: ONE evaluator unit (`specs/analog/board/sar_cmp_qi_unit.t27`: one device's `qi_eval` of `specs/analog/sar_comparator_qi.t27` as a clocked machine) with its table ROM (`specs/analog/board/sar_cmp_qi_tab_n.t27`, and `sar_cmp_qi_tab_p.t27` for a PMOS device), placed and routed on the `xc7a200tfbg484-2` by the probe design `specs/analog/board/sar_cmp_qi_unit_probe_ax7203.t27`. The 8 x 8 solver, the board top that runs several units, the receipt and the board run are phase 2b and are not here. Nothing was loaded on the board for this document; every number below is a synthesis, place-and-route or test number.
 
 What this document does not say: nothing about speed, power or the comparator's decision time (the unit's words are the spec's, `sar_comparator_qi.t27` gives 613.07 ps and 613.15 ps). Fmax is nextpnr's estimate for one placement of one netlist. The tests say the unit is the spec at the points they ran, not at every point.
 
@@ -10,7 +10,7 @@ What this document does not say: nothing about speed, power or the comparator's 
 
 The unit holds no table: a ROM instance beside it answers the address it asked for (one clock after the address register, registered, the word of every table at that address). Every product of the spec's reads goes through one multiply-add of two products (`r_ws = a wa + b wb`, two DSP48 multipliers), every sign-magnitude add through one add (`r_sr`), one of each a phase. The unit evaluates one device: the four current reads of `qi_eval`, the charge reads of both tables with their extensions past the edges of the tables, then the record, and serves the 20 stamps of the record (the words that go into the Newton matrix, listed in the header of the spec).
 
-`t27b-master test specs/fpga/sar_cmp_qi_unit.t27` and `t27c test-report` (6 tests, 6 pass, 0 fail, 0 vacuous, 73387 runtime asserts):
+`t27b-master test specs/analog/board/sar_cmp_qi_unit.t27` and `t27c test-report` (6 tests, 6 pass, 0 fail, 0 vacuous, 73387 runtime asserts):
 
 | test | what it compares with the spec |
 |---|---|
@@ -82,9 +82,9 @@ A further gain wants the phase register one-hot (or the decode registered), whic
 `$O` is the shared openXC7 build directory, `$B` a scratch output directory, `$T` a t27b built from master at or after 2195f7486 (rung 1 of the Verilog path, #11376: it reads the PSP103 table consts by `use` and writes them as ROM functions, signed integers, constant division; the t27b that predates it refuses an index in `on_clock`). Never build in the repository.
 
 ```
-$T verilog specs/fpga/sar_cmp_qi_unit.t27 > $B/unit.v                       # module FpgaSarCmpQiUnit, about 2300 lines
-$T verilog specs/fpga/sar_cmp_qi_tab_n.t27 > $B/tab_n.v                     # module FpgaSarCmpQiTabN, a ROM function for each of the nine tables
-$T verilog specs/fpga/sar_cmp_qi_unit_probe_ax7203.t27 > $B/probe.v         # module FpgaSarCmpQiUnitProbe: PLL, one unit, one ROM, the pins as attributes
+$T verilog specs/analog/board/sar_cmp_qi_unit.t27 > $B/unit.v                       # module FpgaSarCmpQiUnit, about 2300 lines
+$T verilog specs/analog/board/sar_cmp_qi_tab_n.t27 > $B/tab_n.v                     # module FpgaSarCmpQiTabN, a ROM function for each of the nine tables
+$T verilog specs/analog/board/sar_cmp_qi_unit_probe_ax7203.t27 > $B/probe.v         # module FpgaSarCmpQiUnitProbe: PLL, one unit, one ROM, the pins as attributes
 yosys -l $B/probe.log $B/probe.ys
   # probe.ys:
   read_verilog -sv $B/probe.v $B/unit.v $B/tab_n.v
@@ -102,7 +102,7 @@ $O/np-main/build/nextpnr-xilinx --chipdb $O/xc7a200tfbg484-2.bin --json $B/probe
 PYTHONPATH=$O/prjxray $O/venv/bin/python3 $O/prjxray/utils/fasm2frames.py --db-root $O/prjxray-db/artix7 --part xc7a200tfbg484-2 $B/probe.fasm $B/probe.frames
 ```
 
-The tests: `$T test specs/fpga/sar_cmp_qi_unit.t27` (and `--check`), `t27c test-report specs/fpga/sar_cmp_qi_unit.t27`; the same for `sar_cmp_qi_tab_n.t27`, `sar_cmp_qi_tab_p.t27` and `sar_cmp_qi_unit_probe_ax7203.t27` (1 test each, all pass, 0 vacuous).
+The tests: `$T test specs/analog/board/sar_cmp_qi_unit.t27` (and `--check`), `t27c test-report specs/analog/board/sar_cmp_qi_unit.t27`; the same for `sar_cmp_qi_tab_n.t27`, `sar_cmp_qi_tab_p.t27` and `sar_cmp_qi_unit_probe_ax7203.t27` (1 test each, all pass, 0 vacuous).
 
 Third build, for the record: `unit.v` sha256 `7ca369dda2152bff...`, `tab_n.v` `0b5b11e5a403725f...`, `probe.v` `043b436b021ad18e...`, `$T` `b36baec6e72b129c...`, yosys 0.63 (git 70a11c6bf0e8dd669f56c7da3587f78b405138e2), chipdb `xc7a200tfbg484-2.bin`. `fasm2frames` ran to the end on the routed design (20230 frames lines, as the inverter's); the frames were not made into a bitstream and nothing was loaded. The `.fasm`, `.frames` and `.json` were deleted after each run.
 
