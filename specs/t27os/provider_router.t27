@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/provider_router.t27 -- the decision core of the local provider router for T27 OS panes (#11032, M12b stage 2).
+; A pane's Claude Code can answer "organization has disabled Claude subscription access" (or hit a 429, 529, 402) and
+; stop. The router is meant to sit at the pane's base URL and hand the request to the next provider in a chain. This
+; spec is the part that decides, as pure functions over text: which providers form the chain for an owner pick, when a
+; reply means "try the next one", and how the chain is demoted. Sockets are not here (t27c#10902 holds variadic calls
+; and sockets); the host feeds in status, body and the chain text.
+; The chain text is NOT copied here: it is the comma-separated order that specs/automation/agent-provider-chain.t27
+; publishes, handed in by the caller. Request and response shapes are specs/provider/transform.t27's business and the
+; pane environment is provider_profile.t27's; this file holds neither. No key value is read or written.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osProviderRouter;
+
+use t27os::editors::same_bytes;
+use t27os::session_store::csv_field;
+use t27os::session_store::put_bytes;
+
+pub const ST_PAYMENT : u32 = 402;
+pub const ST_RATE : u32 = 429;
+pub const ST_OVERLOADED : u32 = 529;
+pub const MARK_SUBSCRIPTION : []const u8 = "disabled Claude subscription access";
+pub const ID_MAX : usize = 40;
+
+/// Does hay contain the fixed text nd.
+pub fn pr_has(hay: []const u8, nd: []const u8) -> bool {
+    const k : usize = nd.len;
+    if (k == 0 or hay.len < k) { return false; }
+    var i : usize = 0;
+    while (i + k <= hay.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < k) {
+            if (hay[i + j] != nd[j]) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A status that means "this provider cannot serve now": rate limit, overload, no funds.
+pub fn pr_retry_status(status: u32) -> bool {
+    return status == ST_RATE or status == ST_OVERLOADED or status == ST_PAYMENT;
+}
+
+/// The reply, whatever its status, carries the disabled-subscription message.
+pub fn pr_retry_body(body: []const u8) -> bool {
+    return pr_has(body, MARK_SUBSCRIPTION);
+}
+
+/// The next provider is tried when the status or the body says so.
+pub fn pr_should_next(status: u32, body: []const u8) -> bool {
+    return pr_retry_status(status) or pr_retry_body(body);
+}
+
+/// Providers in a comma-separated chain (0 for the empty chain).
+pub fn pr_count(chain: []const u8) -> u32 {
+    if (chain.len == 0) { return 0; }
+    var n : u32 = 1;
+    var i : usize = 0;
+    while (i < chain.len) {
+        if (chain[i] == 44) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The k-th provider id of the chain into out; its length (0 when k is out of range).
+pub fn pr_nth(chain: []const u8, k: u32, out: []u8) -> usize {
+    return csv_field(chain, k, out);
+}
+
+/// Is id in the chain.
+pub fn pr_in_chain(chain: []const u8, id: []const u8) -> bool {
+    var tmp : [40]u8 = undefined;
+    var k : u32 = 0;
+    const n : u32 = pr_count(chain);
+    while (k < n) {
+        const m : usize = csv_field(chain, k, tmp[0..40]);
+        if (same_bytes(tmp[0..m], id)) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// The chain for an owner pick: the pick first, the rest in order. A pick the chain does not hold changes nothing
+/// (the router never invents a provider). Returns the length written to out.
+pub fn pr_chain(out: []u8, order: []const u8, pick: []const u8) -> usize {
+    if (pick.len == 0 or pr_in_chain(order, pick) == false) { return put_bytes(out, 0, order); }
+    var tmp : [40]u8 = undefined;
+    var p : usize = put_bytes(out, 0, pick);
+    var k : u32 = 0;
+    const n : u32 = pr_count(order);
+    while (k < n) {
+        const m : usize = csv_field(order, k, tmp[0..40]);
+        if (same_bytes(tmp[0..m], pick) == false) {
+            out[p] = 44;
+            p = put_bytes(out, p + 1, tmp[0..m]);
+        }
+        k = k + 1;
+    }
+    return p;
+}
+
+/// Demote the head: it moves behind the others. A chain of one stays as it is.
+pub fn pr_demote(out: []u8, chain: []const u8) -> usize {
+    const n : u32 = pr_count(chain);
+    if (n <= 1) { return put_bytes(out, 0, chain); }
+    var tmp : [40]u8 = undefined;
+    var p : usize = 0;
+    var k : u32 = 1;
+    while (k < n) {
+        const m : usize = csv_field(chain, k, tmp[0..40]);
+        if (p > 0) { out[p] = 44; p = p + 1; }
+        p = put_bytes(out, p, tmp[0..m]);
+        k = k + 1;
+    }
+    const h : usize = csv_field(chain, 0, tmp[0..40]);
+    out[p] = 44;
+    p = put_bytes(out, p + 1, tmp[0..h]);
+    return p;
+}
+
+/// The chain after a reply: demoted when the reply says "next", unchanged otherwise. Returns the length in out.
+pub fn pr_after(out: []u8, chain: []const u8, status: u32, body: []const u8) -> usize {
+    if (pr_should_next(status, body)) { return pr_demote(out, chain); }
+    return put_bytes(out, 0, chain);
+}
+
+test "the_disabled_subscription_message_and_the_three_statuses_move_on" {
+    assert pr_retry_status(429);
+    assert pr_retry_status(529);
+    assert pr_retry_status(402);
+    assert pr_retry_status(200) == false;
+    assert pr_retry_status(401) == false;
+    assert pr_should_next(400, "organization has disabled Claude subscription access for this key");
+    assert pr_should_next(200, "ok") == false;
+}
+
+test "an_owner_pick_goes_first_and_the_rest_keep_order" {
+    var out : [96]u8 = undefined;
+    const n : usize = pr_chain(out[0..], "zai,kie,nemotron,reserve", "nemotron");
+    assert same_bytes(out[0..n], "nemotron,zai,kie,reserve");
+}
+
+test "a_pick_outside_the_chain_changes_nothing" {
+    var out : [96]u8 = undefined;
+    const n : usize = pr_chain(out[0..], "zai,kie", "ghost");
+    assert same_bytes(out[0..n], "zai,kie");
+    const e : usize = pr_chain(out[0..], "zai,kie", "");
+    assert same_bytes(out[0..e], "zai,kie");
+}
+
+test "a_429_from_the_head_demotes_it_and_the_next_answers" {
+    var out : [96]u8 = undefined;
+    var head : [40]u8 = undefined;
+    const n : usize = pr_after(out[0..], "zai,kie,nemotron", 429, "");
+    assert same_bytes(out[0..n], "kie,nemotron,zai");
+    const h : usize = pr_nth(out[0..n], 0, head[0..]);
+    assert same_bytes(head[0..h], "kie");
+}
+
+test "a_good_reply_leaves_the_chain_alone" {
+    var out : [96]u8 = undefined;
+    const n : usize = pr_after(out[0..], "zai,kie,nemotron", 200, "hello");
+    assert same_bytes(out[0..n], "zai,kie,nemotron");
+}
+
+test "the_subscription_error_in_a_200_body_still_moves_on" {
+    var out : [96]u8 = undefined;
+    const n : usize = pr_after(out[0..], "zai,kie", 400, "organization has disabled Claude subscription access");
+    assert same_bytes(out[0..n], "kie,zai");
+}
+
+test "one_full_round_of_failures_returns_to_the_start" {
+    var a : [96]u8 = undefined;
+    var b : [96]u8 = undefined;
+    const n1 : usize = pr_demote(a[0..], "x,y,z");
+    const n2 : usize = pr_demote(b[0..], a[0..n1]);
+    const n3 : usize = pr_demote(a[0..], b[0..n2]);
+    assert same_bytes(a[0..n3], "x,y,z");
+    assert pr_count("x,y,z") == 3;
+    assert pr_count("") == 0;
+    const one : usize = pr_demote(b[0..], "solo");
+    assert same_bytes(b[0..one], "solo");
+}
