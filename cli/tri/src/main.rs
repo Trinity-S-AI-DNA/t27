@@ -1629,6 +1629,8 @@ fn cmd_queen(action: &str, plan: bool, lanes: u32, host: Option<&str>, issues: O
         std::fs::write(format!("{dir}/.lane_regions"), f[4].replace(',', "\n") + "\n")?;
         let m = q::lane_model(&mut b[..64]);
         let model = String::from_utf8_lossy(&b[..m]).into_owned();
+        let m = q::lane_meta(k, model.as_bytes(), b"zai", hn.as_bytes(), now, &mut b);
+        std::fs::write(format!("{dir}/.lane.meta"), &b[..m])?;
         let m = q::lane_cmd(k, model.as_bytes(), &mut b);
         let line = String::from_utf8_lossy(&b[..m]).into_owned();
         let pane = !ptyb.is_empty() && Command::new(&ptyb).env("T27OS_CTL", "spawn").env("T27OS_AGENT", "9").env("T27OS_CWD", &dir).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().strip_prefix("spawned pane ")?.parse::<u32>().ok()).and_then(|pn| Command::new(&ptyb).env("T27OS_CTL", "write").env("T27OS_PANE", pn.to_string()).env("T27OS_KEYS", &line).output().ok()).is_some();
