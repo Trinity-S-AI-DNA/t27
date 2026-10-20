@@ -736,3 +736,11 @@ fn rust_lowers_log2_to_a_method() {
     };
     assert_eq!(out, "3");
 }
+
+#[test] // #11218: a `[]T` field filled from borrowed storage is refused (`refuse_*`); the `keep_*` fixtures still generate
+fn gen_rust_refuses_a_slice_field_filled_from_borrowed_storage() {
+    for f in std::fs::read_dir(gate_fixture("../rust_slice_fields")).unwrap().flatten() {
+        let (out, refuse) = (t27c_on(&["gen-rust"], &f.path()), f.file_name().to_string_lossy().starts_with("refuse"));
+        assert!(out.status.success() != refuse && out.stdout.is_empty() == refuse && String::from_utf8_lossy(&out.stderr).contains("#11182") == refuse, "{:?} refuse={refuse}", f.path());
+    }
+}
