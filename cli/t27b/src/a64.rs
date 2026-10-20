@@ -44,13 +44,7 @@ pub fn mov_imm(sf: bool, rd: Reg, value: u64, out: &mut Vec<u32>) {
 // -------------------------------------------------------------- disassembly
 
 fn xr(sf: bool, n: u32, sp_ctx: bool) -> String {
-    if n == 31 {
-        if sp_ctx {
-            return if sf { "sp".into() } else { "wsp".into() };
-        }
-        return if sf { "xzr".into() } else { "wzr".into() };
-    }
-    format!("{}{}", if sf { 'x' } else { 'w' }, n)
+    if n == 31 { [["wzr", "xzr"], ["wsp", "sp"]][sp_ctx as usize][sf as usize].into() } else { format!("{}{}", if sf { 'x' } else { 'w' }, n) }
 }
 
 /// Disassemble one word of the subset this module encodes (for `t27b asm`).
@@ -95,12 +89,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let s = (w >> 29) & 1 == 1;
         let imm = (w >> 10) & 0xfff;
         let sh = if (w >> 22) & 1 == 1 { ", lsl #12" } else { "" };
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if s && rd == 31 {
             return format!("{} {}, #{}{}", if sub { "cmp" } else { "cmn" }, xr(sf, rn, true), imm, sh);
         }
@@ -113,12 +102,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
     if w & 0x1F00_0000 == 0x0B00_0000 {
         let sub = (w >> 30) & 1 == 1;
         let s = (w >> 29) & 1 == 1;
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if (w >> 21) & 1 == 1 {
             let opt = (w >> 13) & 7;
             let ext = ["uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"][opt as usize];
@@ -173,26 +157,14 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let opc = (w >> 29) & 3;
         let hw = (w >> 21) & 3;
         let imm = (w >> 5) & 0xffff;
-        let name = match opc {
-            0 => "movn",
-            2 => "movz",
-            3 => "movk",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let Some(name) = [Some("movn"), None, Some("movz"), Some("movk")][opc as usize] else { return format!(".word {:#010x}", w) };
         let sh = if hw != 0 { format!(", lsl #{}", hw * 16) } else { String::new() };
         return format!("{} {}, #{:#x}{}", name, xr(sf, rd, false), imm, sh);
     }
     // data processing 2 source
     if w & 0x7FE0_0000 == 0x1AC0_0000 {
         let op = (w >> 10) & 63;
-        let name = match op {
-            2 => "udiv",
-            3 => "sdiv",
-            8 => "lsl",
-            9 => "lsr",
-            10 => "asr",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let name = match op { 2 => "udiv", 3 => "sdiv", 8 => "lsl", 9 => "lsr", 10 => "asr", _ => return format!(".word {:#010x}", w) };
         return format!("{} {}, {}, {}", name, xr(sf, rd, false), xr(sf, rn, false), xr(sf, rm, false));
     }
     // data processing 3 source
