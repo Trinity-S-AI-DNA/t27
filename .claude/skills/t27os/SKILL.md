@@ -65,6 +65,46 @@ We sit in a spaceship; T27 OS is its **instrument panel** for working on the pro
 - Use Sonnet subagents for the work, at most three at once on this 8 GB Mac; the orchestrator
   merges, builds, launches and screenshots.
 
+## The 27 petals are the 27 agents (owner, 2026-10-20)
+
+Petal index p = agent ordinal p + 1. The realms match the alphabet layers: RAZUM petals 0-8 =
+Archetypal A-I, MATERIYA 9-17 = Spiritual J-R, DUKH 18-26 = Physical S-Ti. A petal opens that
+letter's console. **Petal 3 = C: the chat and the commander live here** (driving the agents is
+compiling intent into work), together with the compiler core. Homes (t27a..t27u, Queen) are
+groups in the console sidebar, not petals.
+
+What each console needs. "Source" = where its live data comes from today; "gap" = what is missing.
+
+| # | Letter, domain | Instruments (widgets inside the console) | Actions | Source / gap |
+|---|---|---|---|---|
+| 1 | A Architecture / ADR / SOUL | law map L1-L7 with violations, ADR list + status, constitution diff | open ADR, check laws | SOUL.md, architecture/ADR-*; gap: no law-violation counter |
+| 2 | B Build / Pipeline | CI lamp per workflow, queue length, build time, red set vs master | rerun, open red log | specs/claw/gates.t27, gh checks; gap: host must poll gh |
+| 3 | C Compiler Core + CHAT + COMMANDER | chat panes of all agents (honeycomb), commander line (Cmd+K: tri/t27c verbs), compiler stages t27c-stages, gen backends, seal status | send to agent, run t27c verb | pty server, glass_window chat; widgets t27c-* |
+| 4 | D De-Zigfication | foreign lines left (Rust/Zig/TS), port progress, t27o sweep | open port task | specs/tools/t27o, tools/policy; gap: one counter spec |
+| 5 | E Experience / XAI | experience log stream, lessons learned, why-cards | save experience | .trinity/experience, why_card.t27 |
+| 6 | F Formal Conformance | conformance pass/fail, vacuous passes, test-report | run tri test | conformance/, t27b test; 22 widgets |
+| 7 | G Graph / ArchBench | SPEC MAP (T27F spec graph), dependency fan-in/out, archbench | open spec graph | spec_graph*.t27, t27f_graph |
+| 8 | H HSLM / NN | model architectures, training runs (t27t), loss curves | open run | specs/t27t, specs/hslm; see t27t study |
+| 9 | I ISA / Registers | register file, encodings, t27a assemble/disassemble | assemble a line | specs/isa/t27a.t27; gap: no widget yet |
+| 10 | J Jobs / Task Routing | issue queue, claims, lanes | claim, route | specs/queen, gh issues |
+| 11 | K Kernel / FPGA MAC | BENCH (3 dice), bitstreams, timing, pins, LUTs (64 widgets) | flash, detect | bench.t27, bench_boards.t27, camera |
+| 12 | L Language / Syntax | grammar coverage, unparsed constructs, fmt suggestions | format spec | tri unparsed, fmt_source.t27 |
+| 13 | M Metrics / Telemetry | domain_pulse for all letters, CPU/RAM of the Mac, swarm stats | open pulse | domain_pulse.t27 |
+| 14 | N Numeric / GoldenFloat | gf16 calc, format table, paper claims 34/8/3 (43 widgets) | recompute claim | gf16.t27, paper_claims.t27 |
+| 15 | O Orchestration / Phases | PHI LOOP phase per lane, ring state | advance phase | specs/queen phases; gap |
+| 16 | P Physics / SacredPhysics | identity checks phi^2 + phi^-2 = 3, formula catalog | verify identity | specs/physics, specs/sacred |
+| 17 | Q Queue / Scheduling | crons (specs/crons), scheduler queue, next runs | pause/resume | specs/crons |
+| 18 | R Runtime / Bootstrap | stage0 FROZEN_HASH, bootstrap build, toolchain versions | rebuild t27c | bootstrap/, toolchain.t27 |
+| 19 | S Specs / Standards | spec count, seals fresh/stale, duplicates ledger | reseal, dupe scan | .trinity/seals, dupe_scan |
+| 20 | T Queen / Lotus | Queen panel, GOD MODE, suggestions, swarm board | confirm/dismiss | queen.t27 |
+| 21 | U Universe / Domains | the 27-letter map itself, homes, ownership gaps (OPEN) | reassign path | agent_parts.t27, homes.t27 |
+| 22 | V Verdict / Bench | verdicts, bench results, mutation score | run verdict | t27c verdict, tri mutate |
+| 23 | W Workflow / tri cell | tri command palette, recent tri runs | run tri verb | specs/tools/tri |
+| 24 | X External / Interop | MCP servers, bindings, providers, keys (KEYS tab) | test provider | t27mcp, keys.t27, router.t27 |
+| 25 | Y Yield / DePIN | lab nodes, XP earned, hosting | join lab | specs/lab, depin; flags off |
+| 26 | Z Zero-Touch UX / Docs | t27u university: 7 course maps, lessons, blog | open lesson | courses.t27 (trinity) |
+| 27 | Ti Security / Reserve | secrets scan, key rotation, identity | rotate key | gitleaks, keys.t27 |
+
 ## Plan (open items, 2026-10-20)
 
 1. Cockpit dashboard in the home tabs: nested widget tree, agent consoles, card.png instruments,
