@@ -459,8 +459,8 @@ enum Commands {
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
     /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
     Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
-    /// T27 OS release front door: `release --plan` prints the numbered steps (build, zip, sha256, manifest, notes, `gh release create`) and runs none; `manifest --build N --sha H` prints the release manifest, a t27 module the app reads; anything that would publish is refused (rules: specs/t27os/release.t27, #11315).
-    T27os { action: String, #[arg(long)] plan: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sha: String },
+    /// T27 OS release front door: `release --plan` prints the numbered steps; `manifest --build N --sums FILE` prints the release manifest, a t27 module the app reads; `publish --yes` builds app and toolchain from one clean commit and creates the t27os-v<version>-b<build> release and the t27os-latest pointer; without --yes it is refused (rules: specs/t27os/release.t27, #11315, #11403).
+    T27os { action: String, #[arg(long)] plan: bool, #[arg(long)] yes: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sums: String },
     /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
     Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
     /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
@@ -1244,6 +1244,7 @@ fn cmd_health(root: &Path, target: Option<&str>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--version") { let mut b = [0u8; 256]; let n = t27rel::version_text(&mut b, 256, "tri", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").and_then(|s| s.parse().ok()).unwrap_or(0), option_env!("T27_COMMIT").unwrap_or("unknown")); print!("{}", String::from_utf8_lossy(&b[..n])); return Ok(()) }
     let cli = Cli::parse();
 
     match &cli.command {
@@ -1385,7 +1386,7 @@ fn main() -> Result<()> {
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
-        Commands::T27os { action, plan, build, sha } => std::process::exit(cmd_t27os(action, *plan, *build, sha)),
+        Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
@@ -1576,13 +1577,14 @@ fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Resu
     Ok(g::exit_code(code))
 }
 
-/// `tri t27os release --plan` | `manifest` (#11315): the text is specs/t27os/release.t27; this prints it and publishes nothing.
-fn cmd_t27os(action: &str, plan: bool, build: u32, sha: &str) -> i32 {
-    let (mut buf, v) = (vec![0u8; 4096], t27rel::current_version());
+/// `tri t27os release --plan` | `manifest` | `publish --yes` (#11315, #11403): the texts are specs/t27os/release.t27.
+fn cmd_t27os(action: &str, plan: bool, yes: bool, build: u32, sums: &str) -> i32 {
+    let (mut buf, v, s) = (vec![0u8; 8192], t27rel::current_version(), std::fs::read(sums).unwrap_or_default());
     let n = match action {
-        "release" if plan && !t27rel::publish_allowed(plan, false) => t27rel::plan_text(&mut buf, 4096, v),
-        "manifest" if build > 0 && t27rel::sha_ok(sha.as_bytes(), sha.len()) => t27rel::manifest_text(&mut buf, 4096, v, build, sha.as_bytes(), sha.len()),
-        _ => { eprintln!("{}", if action == "manifest" { "tri t27os manifest: --build N and --sha <64 lowercase hex digits> are required" } else { t27rel::REFUSAL }); return 2 }
+        "release" if plan => t27rel::plan_text(&mut buf, 8192, v),
+        "manifest" if build > 0 => t27rel::manifest_from_sums(&mut buf, 8192, v, build, &s, s.len()),
+        "publish" if t27rel::publish_allowed(plan, yes) => { let n = t27rel::publish_text(&mut buf, 8192, v); return Command::new("sh").arg("-c").arg(String::from_utf8_lossy(&buf[..n.min(8192)]).as_ref()).status().map_or(2, |x| x.code().unwrap_or(2)) }
+        _ => { eprintln!("{}", if action == "manifest" { "tri t27os manifest: --build N and --sums <complete sums file> are required" } else { t27rel::REFUSAL }); return 2 }
     };
-    print!("{}", String::from_utf8_lossy(&buf[..n.min(4096)])); (n > 4096) as i32
+    print!("{}", String::from_utf8_lossy(&buf[..n.min(8192)])); (n == 0 || n > 8192) as i32
 }

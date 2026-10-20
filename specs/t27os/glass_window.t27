@@ -159,6 +159,72 @@ use t27os::editors::foot_head_top;
 use t27os::editors::foot_chips_top;
 use t27os::editors::foot_status_fits;
 use t27os::editors::foot_chips;
+use t27os::release::current_version;
+use t27os::release::UPD_DIR;
+use t27os::release::F_MANIFEST;
+use t27os::release::F_PENDING;
+use t27os::release::F_KEPT;
+use t27os::release::F_REJECTED;
+use t27os::release::marker_of;
+use t27os::release::boot_action;
+use t27os::release::BOOT_FIRST;
+use t27os::release::BOOT_ROLLBACK;
+use t27os::release::BOOT_BROKEN;
+use t27os::release::mark_cmd;
+use t27os::release::rollback_cmd;
+use t27os::release::confirm_cmd;
+use t27os::release::confirm_due;
+use t27os::release::check_cmd;
+use t27os::release::check_due;
+use t27os::release::download_cmd;
+use t27os::release::stage_cmd;
+use t27os::release::swap_cmd;
+use t27os::release::swap_ready;
+use t27os::release::update_step;
+use t27os::release::EV_CHECK;
+use t27os::release::EV_OFFER;
+use t27os::release::EV_NO_OFFER;
+use t27os::release::EV_DOWNLOADED;
+use t27os::release::EV_FAILED;
+use t27os::release::EV_SIGNED;
+use t27os::release::EV_SWAP;
+use t27os::release::U_IDLE;
+use t27os::release::U_STAGED;
+use t27os::release::manifest_check;
+use t27os::release::manifest_build;
+use t27os::release::manifest_version;
+use t27os::release::offer;
+use t27os::release::OFFER_UPDATE;
+use t27os::release::OFFER_BAD_MANIFEST;
+use t27os::release::sums_verdict;
+use t27os::release::ROWS_DOWNLOADED;
+use t27os::release::ROWS_ALL;
+use t27os::release::put_build_file;
+use t27os::release::parse_build;
+use t27os::release::tool_verdict;
+use t27os::release::tv_worse;
+use t27os::release::TV_OK;
+use t27os::release::install_decision;
+use t27os::release::ID_INSTALL;
+use t27os::release::why_of_decision;
+use t27os::release::WHY_NONE;
+use t27os::release::WHY_OFFLINE;
+use t27os::release::WHY_MANIFEST;
+use t27os::release::WHY_DOWNLOAD;
+use t27os::release::WHY_SHA;
+use t27os::release::WHY_STAGE;
+use t27os::release::WHY_SWAP;
+use t27os::release::WHY_BROKEN;
+use t27os::release::field_str;
+use t27os::release::field_start;
+use t27os::release::field_len;
+use t27os::release::KEY_COMMIT;
+use t27os::release::NO_FIELD;
+use t27os::release::strip_kind;
+use t27os::release::strip_text;
+use t27os::release::STRIP_HIDDEN;
+use t27os::release::STRIP_READY;
+use t27os::release::bundle_len;
 use t27os::editors::open_word;
 use t27os::editors::OPEN_NONE;
 use t27os::editors::OPEN_OK;
@@ -5804,6 +5870,276 @@ fn queen_tick(tg: []u64, tb: []u8, hb: []const u8, now: u64, open: bool) -> void
     }
 }
 
+// ---- the updater (release.t27): the window hosts the rules --------------------------------------------------
+// Owner, 2026-10-20: updates install on every computer on the fly, online. release.t27 decides every step and
+// writes every command; this block spawns the commands as `/bin/sh -c` jobs (tg_spawn), reaps them from the
+// frame loop and reads their files. Words TPG_U_*; the job kinds below.
+pub const TPG_U_ST : u32 = 90;
+pub const TPG_U_PID : u32 = 91;
+pub const TPG_U_KIND : u32 = 92;
+pub const TPG_U_START : u32 = 93;
+pub const TPG_U_LAST : u32 = 94;
+pub const TPG_U_CUR : u32 = 95;
+pub const TPG_U_CAND : u32 = 96;
+pub const TPG_U_CANDV : u32 = 97;
+pub const TPG_U_WHY : u32 = 98;
+pub const TPG_U_GO : u32 = 99;
+pub const TPG_U_QUIET : u32 = 100;
+pub const TPG_U_BOOT : u32 = 101;
+pub const TPG_U_UP0 : u32 = 102;
+pub const TPG_U_MARK : u32 = 103;
+pub const TPG_U_FAILB : u32 = 104;
+pub const TPG_U_BLEN : u32 = 105;
+pub const TPG_U_BUSY : u32 = 106;
+pub const TPG_U_ON : u32 = 107;
+pub const TPG_U_STAGED : u32 = 108;
+pub const UP_CHECK : u64 = 1;
+pub const UP_DOWNLOAD : u64 = 2;
+pub const UP_STAGE : u64 = 3;
+pub const UP_SWAP : u64 = 4;
+pub const UP_MARK : u64 = 5;
+pub const UP_CONFIRM : u64 = 6;
+pub const UP_ROLLBACK : u64 = 7;
+/// The manifest is read into tb[TBO_SCR ..], then the sums (two files, one after the other) and the three
+/// --version outputs; the room is TBO_SCR .. TBO_SIZE.
+pub const UP_MAN : usize = 2048;
+pub const UP_SUMS : usize = 2560;
+pub const UP_VER : usize = 128;
+pub const UP_CAP : usize = 6000;
+/// A job that outlives this is killed; the download is the long one.
+pub const UP_KILL_CHECK_S : u64 = 60;
+pub const UP_KILL_LONG_S : u64 = 900;
+
+/// Panes the server lists as working or blocked on you: the swap never happens while one is.
+fn up_busy(sst: []const u32) -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < 32) {
+        const s : u32 = row_state(sst, i);
+        if (s == S_WORKING or s == S_BLOCKED) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Start the command that a release.t27 builder wrote at tb[TBO_CMD + 6 ..] (n bytes); false when it did not fit or did not start.
+fn up_start(tg: []u64, tb: []u8, n: usize, kind: u64, now: u64) -> bool {
+    if (n == 0 or n > UP_CAP) { return false; }
+    const pid : u64 = tg_spawn(tb, TBO_CMD, TBO_CMD + 6 + n);
+    if (pid == 0) { return false; }
+    tg[TPG_U_PID] = pid;
+    tg[TPG_U_KIND] = kind;
+    tg[TPG_U_START] = now;
+    return true;
+}
+
+fn up_fail(tg: []u64, why: u8, mark_bad: bool) -> void {
+    tg[TPG_U_ST] = @as(u64, update_step(@as(u8, @intCast(tg[TPG_U_ST])), EV_FAILED, 0));
+    tg[TPG_U_WHY] = @as(u64, why);
+    tg[TPG_U_GO] = 0;
+    if (mark_bad) { tg[TPG_U_FAILB] = tg[TPG_U_CAND]; }
+}
+
+/// The digits at the start of a small file (a build number followed by a newline).
+fn up_num(tb: []const u8, at: usize, n: usize) -> u32 {
+    var e : usize = 0;
+    while (e < n and tb[at + e] >= 48 and tb[at + e] <= 57) { e = e + 1; }
+    return parse_build(tb[at .. at + e], e);
+}
+
+/// The first start of this process: act on the marker an earlier swap left, and learn the build a rollback refused.
+fn up_boot(tg: []u64, tb: []u8, hb: []const u8, bp: []const u8, now: u64) -> void {
+    tg[TPG_U_BOOT] = 1;
+    tg[TPG_U_UP0] = now;
+    const rn : usize = tg_read(hb, UPD_DIR, F_REJECTED, tb[TBO_SCR .. TBO_SCR + 16]);
+    tg[TPG_U_FAILB] = @as(u64, up_num(tb, TBO_SCR, rn));
+    const mn : usize = tg_read(hb, UPD_DIR, F_PENDING, tb[TBO_SCR .. TBO_SCR + 8]);
+    const mk : u8 = marker_of(mn > 0, tb[TBO_SCR]);
+    const kn : usize = tg_read(hb, UPD_DIR, F_KEPT, tb[TBO_SCR .. TBO_SCR + 8]);
+    const act : u8 = boot_action(mk, kn > 0);
+    const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+    if (act == BOOT_FIRST) {
+        tg[TPG_U_MARK] = 1;
+        up_start(tg, tb, mark_cmd(out, UP_CAP, hb, hb.len), UP_MARK, now);
+    } else if (act == BOOT_ROLLBACK) {
+        up_start(tg, tb, rollback_cmd(out, UP_CAP, hb, hb.len, bp, @as(usize, tg[TPG_U_BLEN]), @as(u32, @intCast(tg[TPG_U_CUR]))), UP_ROLLBACK, now);
+        tg[TPG_U_WHY] = @as(u64, WHY_BROKEN);
+    } else if (act == BOOT_BROKEN) {
+        tg[TPG_U_MARK] = 1;
+        tg[TPG_U_WHY] = @as(u64, WHY_BROKEN);
+    }
+}
+
+/// A poll finished: judge the manifest it fetched and start the download of a newer build.
+fn up_checked(tg: []u64, tb: []u8, hb: []const u8, now: u64) -> void {
+    const mn : usize = tg_read(hb, UPD_DIR, F_MANIFEST, tb[TBO_SCR .. TBO_SCR + UP_MAN]);
+    const man : []const u8 = tb[TBO_SCR .. TBO_SCR + mn];
+    const chk : u8 = manifest_check(man, mn);
+    const cb : u64 = manifest_build(man, mn);
+    var bld : u32 = 0;
+    if (cb != NO_FIELD) { bld = @as(u32, @intCast(cb)); }
+    const ver : u64 = manifest_version(man, mn);
+    const off : u8 = offer(chk, ver, bld, current_version(), @as(u32, @intCast(tg[TPG_U_CUR])), @as(u32, @intCast(tg[TPG_U_FAILB])), true);
+    var st : u8 = @as(u8, @intCast(tg[TPG_U_ST]));
+    if (off == OFFER_UPDATE) {
+        tg[TPG_U_CAND] = @as(u64, bld);
+        tg[TPG_U_CANDV] = ver;
+        tg[TPG_U_WHY] = @as(u64, WHY_NONE);
+        if (tg[TPG_U_STAGED] == @as(u64, bld)) {
+            tg[TPG_U_ST] = @as(u64, U_STAGED);
+            return;
+        }
+        const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+        tg[TPG_U_ST] = @as(u64, update_step(st, EV_OFFER, 0));
+        if (up_start(tg, tb, download_cmd(out, UP_CAP, hb, hb.len, ver, bld), UP_DOWNLOAD, now) == false) { up_fail(tg, WHY_DOWNLOAD, false); }
+        return;
+    }
+    tg[TPG_U_ST] = @as(u64, update_step(st, EV_NO_OFFER, 0));
+    tg[TPG_U_WHY] = @as(u64, WHY_NONE);
+    if (off == OFFER_BAD_MANIFEST) { tg[TPG_U_WHY] = @as(u64, WHY_MANIFEST); }
+}
+
+/// The download finished: its digests against the manifest, then the stage job.
+fn up_downloaded(tg: []u64, tb: []u8, hb: []const u8, now: u64) -> void {
+    const b : u32 = @as(u32, @intCast(tg[TPG_U_CAND]));
+    const mn : usize = tg_read(hb, UPD_DIR, F_MANIFEST, tb[TBO_SCR .. TBO_SCR + UP_MAN]);
+    var fb : [48]u8 = undefined;
+    const fn1 : usize = put_build_file(fb[0..48], 48, 0, b, "sums.txt");
+    const sn : usize = tg_read(hb, UPD_DIR, fb[0..fn1], tb[TBO_SCR + UP_MAN .. TBO_SCR + UP_SUMS]);
+    const bad : u32 = sums_verdict(tb[TBO_SCR + UP_MAN .. TBO_SCR + UP_MAN + sn], sn, tb[TBO_SCR .. TBO_SCR + mn], mn, 0, ROWS_DOWNLOADED);
+    if (bad != 0) {
+        up_fail(tg, WHY_SHA, true);
+        return;
+    }
+    tg[TPG_U_ST] = @as(u64, update_step(@as(u8, @intCast(tg[TPG_U_ST])), EV_DOWNLOADED, 0));
+    const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+    if (up_start(tg, tb, stage_cmd(out, UP_CAP, hb, hb.len, tg[TPG_U_CANDV], b), UP_STAGE, now) == false) { up_fail(tg, WHY_STAGE, false); }
+}
+
+/// The stage finished (unzipped, signed, versions asked): every digest, every tool's commit, then staged or refused.
+fn up_staged(tg: []u64, tb: []u8, hb: []const u8) -> void {
+    const b : u32 = @as(u32, @intCast(tg[TPG_U_CAND]));
+    const mn : usize = tg_read(hb, UPD_DIR, F_MANIFEST, tb[TBO_SCR .. TBO_SCR + UP_MAN]);
+    const man : []const u8 = tb[TBO_SCR .. TBO_SCR + mn];
+    var fb : [48]u8 = undefined;
+    var fl : usize = put_build_file(fb[0..48], 48, 0, b, "sums.txt");
+    const s1 : usize = tg_read(hb, UPD_DIR, fb[0..fl], tb[TBO_SCR + UP_MAN .. TBO_SCR + UP_SUMS]);
+    fl = put_build_file(fb[0..48], 48, 0, b, "sums2.txt");
+    const s2 : usize = tg_read(hb, UPD_DIR, fb[0..fl], tb[TBO_SCR + UP_MAN + s1 .. TBO_SCR + UP_SUMS + 140]);
+    const bad : u32 = sums_verdict(tb[TBO_SCR + UP_MAN .. TBO_SCR + UP_MAN + s1 + s2], s1 + s2, man, mn, 0, ROWS_ALL);
+    const cm : u64 = field_str(man, mn, KEY_COMMIT, KEY_COMMIT.len);
+    var want : []const u8 = man[0..0];
+    if (cm != NO_FIELD) { want = man[field_start(cm) .. field_start(cm) + field_len(cm)]; }
+    var worst : u8 = TV_OK;
+    var k : u32 = 0;
+    while (k < 3) {
+        const at : usize = TBO_SCR + UP_SUMS + 140 + @as(usize, k) * UP_VER;
+        if (k == 0) { fl = put_build_file(fb[0..48], 48, 0, b, "v_t27b.txt"); }
+        if (k == 1) { fl = put_build_file(fb[0..48], 48, 0, b, "v_t27c.txt"); }
+        if (k == 2) { fl = put_build_file(fb[0..48], 48, 0, b, "v_tri.txt"); }
+        const vn : usize = tg_read(hb, UPD_DIR, fb[0..fl], tb[at .. at + UP_VER]);
+        worst = tv_worse(worst, tool_verdict(tb[at .. at + vn], vn, want, want.len));
+        k = k + 1;
+    }
+    const d : u8 = install_decision(bad, worst, tg[TPG_U_BLEN] > 0);
+    if (d != ID_INSTALL) {
+        up_fail(tg, why_of_decision(d), true);
+        return;
+    }
+    tg[TPG_U_ST] = @as(u64, update_step(@as(u8, @intCast(tg[TPG_U_ST])), EV_SIGNED, 0));
+    tg[TPG_U_STAGED] = @as(u64, b);
+}
+
+/// A job ended (ok: it exited 0). Decide the next step.
+fn up_finished(tg: []u64, tb: []u8, hb: []const u8, now: u64, kind: u64, ok: bool) -> void {
+    if (kind == UP_CHECK) {
+        if (ok) { up_checked(tg, tb, hb, now); } else { up_fail(tg, WHY_OFFLINE, false); }
+    } else if (kind == UP_DOWNLOAD) {
+        if (ok) { up_downloaded(tg, tb, hb, now); } else { up_fail(tg, WHY_DOWNLOAD, false); }
+    } else if (kind == UP_STAGE) {
+        if (ok) { up_staged(tg, tb, hb); } else { up_fail(tg, WHY_STAGE, true); }
+    } else if (kind == UP_SWAP) {
+        // a swap that worked ends in a relaunch (hot_reload); one that did not leaves the old app and says why
+        if (ok == false) { up_fail(tg, WHY_SWAP, true); }
+    }
+}
+
+/// One frame of the updater: reap the running job, else do the next thing that is due.
+fn update_tick(tg: []u64, tb: []u8, hb: []const u8, bp: []const u8, now: u64, busy: u32) -> void {
+    if (tg[TPG_U_ON] == 0) { return; }
+    if (tg[TPG_U_BUSY] != @as(u64, busy)) {
+        tg[TPG_U_BUSY] = @as(u64, busy);
+        tg_bump(tg);
+    }
+    if (busy > 0) { tg[TPG_U_QUIET] = 0; } else if (tg[TPG_U_QUIET] == 0) { tg[TPG_U_QUIET] = now; }
+    if (tg[TPG_U_PID] != 0) {
+        const d : u32 = tg_done(tg[TPG_U_PID]);
+        if (d == 0) {
+            var lim : u64 = UP_KILL_CHECK_S;
+            if (tg[TPG_U_KIND] == UP_DOWNLOAD or tg[TPG_U_KIND] == UP_STAGE) { lim = UP_KILL_LONG_S; }
+            if (now > tg[TPG_U_START] + lim) { sys_kill(@as(i32, @intCast(tg[TPG_U_PID])), 9); }
+            return;
+        }
+        const kind : u64 = tg[TPG_U_KIND];
+        tg[TPG_U_PID] = 0;
+        up_finished(tg, tb, hb, now, kind, d == 1);
+        tg_bump(tg);
+        if (tg[TPG_U_PID] != 0) { return; }
+    }
+    if (tg[TPG_U_BOOT] == 0) {
+        up_boot(tg, tb, hb, bp, now);
+        tg_bump(tg);
+        return;
+    }
+    if (tg[TPG_U_MARK] != 0 and confirm_due(now - tg[TPG_U_UP0])) {
+        const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+        tg[TPG_U_MARK] = 0;
+        up_start(tg, tb, confirm_cmd(out, UP_CAP, hb, hb.len), UP_CONFIRM, now);
+        return;
+    }
+    const st : u8 = @as(u8, @intCast(tg[TPG_U_ST]));
+    var quiet : u64 = 0;
+    if (tg[TPG_U_QUIET] != 0 and now > tg[TPG_U_QUIET]) { quiet = now - tg[TPG_U_QUIET]; }
+    if (swap_ready(st, busy, quiet, tg[TPG_U_GO] != 0)) {
+        const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+        const sn : usize = swap_cmd(out, UP_CAP, hb, hb.len, bp, @as(usize, tg[TPG_U_BLEN]), @as(u32, @intCast(tg[TPG_U_CAND])));
+        tg[TPG_U_GO] = 0;
+        tg[TPG_U_ST] = @as(u64, update_step(st, EV_SWAP, busy));
+        if (up_start(tg, tb, sn, UP_SWAP, now) == false) { up_fail(tg, WHY_SWAP, false); }
+        tg_bump(tg);
+        return;
+    }
+    if (st == U_IDLE and (check_due(now, tg[TPG_U_LAST]) or tg[TPG_U_GO] != 0)) {
+        const out : []u8 = tb[TBO_CMD + 6 .. TBO_CMD + 6 + UP_CAP];
+        tg[TPG_U_LAST] = now;
+        tg[TPG_U_GO] = 0;
+        if (up_start(tg, tb, check_cmd(out, UP_CAP, hb, hb.len), UP_CHECK, now)) {
+            tg[TPG_U_ST] = @as(u64, update_step(st, EV_CHECK, busy));
+        }
+        tg_bump(tg);
+    }
+}
+
+pub const UP_STRIP_H : f64 = 22.0;
+
+/// The update line sits on the sidebar just above the foot, while there is something to say.
+pub fn on_update_strip(x: f64, y: f64, sh: f64, ws: u32, collapsed: bool, shown: bool) -> bool {
+    return shown and in_side(x, ws, collapsed) and y >= sh - FOOT_H - UP_STRIP_H and y < sh - FOOT_H;
+}
+
+fn draw_update_strip(c: u64, kit: [48]u64, tg: []const u64, mx: f64, my: f64, sh: f64, ws: u32, collapsed: bool, a: f64) -> void {
+    const st : u8 = @as(u8, @intCast(tg[TPG_U_ST]));
+    const why : u8 = @as(u8, @intCast(tg[TPG_U_WHY]));
+    if (tg[TPG_U_ON] == 0 or strip_kind(st, why) == STRIP_HIDDEN) { return; }
+    var w : [96]u8 = undefined;
+    const n : usize = strip_text(w[0..96], 96, st, why, @as(u32, @intCast(tg[TPG_U_CAND])), @as(u32, @intCast(tg[TPG_U_BUSY])));
+    if (n == 0 or n > 96) { return; }
+    var la : f64 = LABEL_WHITE;
+    if (on_update_strip(mx, my, sh, ws, collapsed, true) or strip_kind(st, why) == STRIP_READY) { la = TEXT_WHITE; }
+    cg_fill_rgba(c, 1.0, 1.0, 1.0, la * a);
+    draw_bytes(c, kit, w[0..96], n, 14.0, sh - FOOT_H - 8.0, 9.5, WEIGHT_SEMIBOLD, false);
+}
+
 /// The evolve Panel from what the window knows (see evolve_next): letters with no instrument, pinned to nothing, and widgets no letter owns.
 fn make_panel(unassigned: u32) -> Panel {
     var p : Panel = Panel { master_red: false, blocked: 0, stale: 0, unowned_count: 0, no_instrument: 0, never_pinned: 0, no_widget_count: unassigned, no_widget: 0 };
@@ -6175,6 +6511,11 @@ fn draw(c: u64, kit: [48]u64, frame: u32, state: u32, hov: u32, ma: f64, shown: 
         const kn : usize = csv_field(KEYS_WORDS, 0, kw[0..16]);
         draw_bytes(c, kit, kw[0..16], kn, SIDE_W - 14.0 - DOC_LINK_W - 6.0 - KY_LINK_W + 8.0, sh - 13.0, 9.5, WEIGHT_SEMIBOLD, false);
         draw_light_dot(c, SIDE_W - 14.0 - DOC_LINK_W - 6.0 - KY_LINK_W + 1.0, sh - 16.0, foot_light_input(), ma);
+    }
+    if (ma > 0.0) {
+        var uws : u32 = ws;
+        if (shown != PETAL_CHAT or cons) { uws = home_ws(ws); }
+        draw_update_strip(c, kit, tg, mx, my, sh, uws, collapsed, ma);
     }
     draw_titlebar(c, kit, sw, full, ma);
     draw_edge_glow(c, sw, sh, glow, frame);
@@ -7561,6 +7902,15 @@ pub fn main() -> void {
     dcv[D_SEL_ALLOC] = s_alloc;
     var dhb : [256]u8 = undefined;
     const dhn : usize = ns_bytes(home_dir(), dhb[0..256]);
+    // U. the updater (release.t27): the running build is the bundle's CFBundleVersion, the bundle the executable's folder;
+    // a copy that is not a built bundle (build 0) does not update itself
+    var ubp : [320]u8 = undefined;
+    const ubn : usize = ns_bytes(exe, ubp[0..320]);
+    var ubd : [16]u8 = undefined;
+    const ubl : usize = ns_bytes(msg1(msg0(cls("NSBundle"), sel("mainBundle")), sel("objectForInfoDictionaryKey:"), cf("CFBundleVersion")), ubd[0..16]);
+    tgv[TPG_U_CUR] = @as(u64, parse_build(ubd[0..ubl], ubl));
+    tgv[TPG_U_BLEN] = @as(u64, bundle_len(ubp[0..ubn], ubn));
+    if (tgv[TPG_U_CUR] > 0) { tgv[TPG_U_ON] = 1; }
     var dpath : [300]u8 = undefined;
     put_bytes(dpath[0..300], put_bytes(dpath[0..300], 0, dhb[0..dhn]), "/.t27os");
     dpath[dhn + 7] = 0;
@@ -8068,6 +8418,10 @@ pub fn main() -> void {
                     dnow = true;
                     carg = space;
                     if (cur != SESSION_NONE) { cur = SESSION_NONE; task = CARD_SLOTS; }
+                } else if ((screen or hscreen) and on_update_strip(mx, my, sh, sws, collapsed, strip_kind(@as(u8, @intCast(tgv[TPG_U_ST])), @as(u8, @intCast(tgv[TPG_U_WHY]))) != STRIP_HIDDEN and tgv[TPG_U_ON] != 0)) {
+                    // U. the update line above the foot: Update now (install as soon as no pane is busy) or try again
+                    tgv[TPG_U_GO] = 1;
+                    tg_bump(tgv[0..128]);
                 } else if (screen and on_keys_foot(mx, my, sh, ws, collapsed)) {
                     // K. KEYS in the foot opens or closes the panel; it takes the Queen and DOCTOR panels' place
                     kyp = kyp == false;
@@ -8484,6 +8838,7 @@ pub fn main() -> void {
         bench_tick(tgv[0..128], tbv[0..49152], dhb[0..dhn], now, open2 and tpk2 == PAGE_BENCH);
         kanban_tick(tgv[0..128], tbv[0..49152], dhb[0..dhn], now, open2 and tpk2 == PAGE_KANBAN);
         queen_tick(tgv[0..128], tbv[0..49152], dhb[0..dhn], now, open2 and tpk2 == PAGE_QUEEN);
+        update_tick(tgv[0..128], tbv[0..49152], dhb[0..dhn], ubp[0..ubn], now, up_busy(sst[0..560]));
         // L. the LANES block of the chat sidebar: the feed job, the tail of a clicked lane, the table once a second
         const lvup : bool = menu_open(state) and ma >= 0.5 and shown == PETAL_CHAT and cons2 == false and ws == WS_EXPANDED and collapsed == false;
         if (lvcur != cur) { sst[SST_LVSEL] = LV_NONE; }
@@ -8852,6 +9207,7 @@ pub fn main() -> void {
         if (screen and on_new_chat(mx, my, sw, ws)) { on_control = true; }
         if (screen and (on_repo_link(mx, my, sh, ws, collapsed) or (in_side(mx, ws, collapsed) and on_space_plus(mx, my) and new_space(sp) != SPACE_NONE))) { on_control = true; }
         if (screen and on_doctor_link(mx, my, sh, ws, collapsed)) { on_control = true; }
+        if ((screen or hscreen) and on_update_strip(mx, my, sh, sws, collapsed, strip_kind(@as(u8, @intCast(tgv[TPG_U_ST])), @as(u8, @intCast(tgv[TPG_U_WHY]))) != STRIP_HIDDEN and tgv[TPG_U_ON] != 0)) { on_control = true; }
         if (dp and (on_panel_close(mx, my, sw, WS_TOP) or dk_btn_at(dk, mx, my, sw, sh, doff) != NS_NOT_FOUND)) { on_control = true; }
         if (qp and (on_panel_close(mx, my, sw, WS_TOP) or on_god(mx, my, sw, WS_TOP) or ((sug != A_NONE or evd != 0) and (on_confirm(mx, my, sw, WS_TOP) or on_dismiss(mx, my, sw, WS_TOP))))) { on_control = true; }
         if (hov != PETAL_NONE or on_control) { msg0(hand, s_cursor_set); } else { msg0(arrow, s_cursor_set); }
@@ -9910,4 +10266,15 @@ test the_lanes_block_sits_under_the_agents_rows_and_keeps_its_buffers_apart {
     assert SST_LV + LV_MAX as usize * LV_F <= SST_SIZE;
     assert SST_LVKEY + 1 < SST_LV and SST_LVSEL < SST_LV and SST_LVOFF < SST_LV;
     assert TPG_L_TISSUE < TPG_N and TPG_L_LAST > TPG_PHASE;
+}
+
+test the_update_line_sits_above_the_foot_and_the_updater_words_are_their_own {
+    assert on_update_strip(40.0, H_PT - FOOT_H - 10.0, H_PT, WS_EXPANDED, false, true);
+    assert on_update_strip(40.0, H_PT - FOOT_H - 10.0, H_PT, WS_EXPANDED, false, false) == false;
+    assert on_update_strip(40.0, H_PT - 5.0, H_PT, WS_EXPANDED, false, true) == false;
+    assert on_update_strip(40.0, H_PT - FOOT_H - 10.0, H_PT, WS_EXPANDED, true, true) == false;
+    assert TPG_U_ST > TPG_L_TISSUE and TPG_U_STAGED < TPG_N;
+    // the scratch the updater reads into ends inside the text store
+    assert TBO_SCR + UP_SUMS + 140 + 3 * UP_VER <= TBO_SIZE;
+    assert UP_CAP + 7 <= TBO_ROOT - TBO_CMD;
 }
