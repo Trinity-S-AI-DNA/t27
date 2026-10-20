@@ -88,6 +88,45 @@ use t27os::pty_proto::ring_copy;
 use t27os::pty_proto::put_list_entry;
 use t27os::pty_proto::spawn_ok;
 use t27os::pty_proto::socket_path;
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::KEY_NEVER;
+use t27os::keys::PROFILE_COUNT;
+use t27os::keys::PROFILE_PROVIDER;
+use t27os::keys::PR_NONE;
+use t27os::keys::PR_ZAI;
+use t27os::keys::PR_ANTHROPIC;
+use t27os::keys::MAX_FAILOVERS;
+use t27os::keys::agent_uses;
+use t27os::keys::spawn_mask;
+use t27os::keys::P_ZAI;
+use t27os::keys::P_ANTHROPIC;
+use t27os::keys::P_OPENAI;
+use t27os::keys::FC_OTHER;
+use t27os::keys::FC_LOGIN_REJECTED;
+use t27os::keys::profile_agent;
+use t27os::keys::pick_profile;
+use t27os::keys::rotate_pick_soft;
+use t27os::keys::rotate_pick_except;
+use t27os::keys::key_rest_after;
+use t27os::keys::fo_action;
+use t27os::keys::fo_target;
+use t27os::keys::fo_bad;
+use t27os::keys::fo_why;
+use t27os::keys::classify_line;
+use t27os::keys::error_row;
+use t27os::keys::has_bytes;
+use t27os::keys::FC_NONE;
+use t27os::keys::FC_RATE_LIMITED;
+use t27os::keys::FC_NO_BALANCE;
+use t27os::keys::FC_SUBSCRIPTION;
+use t27os::keys::FC_OVERLOADED;
+use t27os::keys::FA_KEEP;
+use t27os::keys::FA_RESPAWN_NEXT;
+use t27os::keys::FA_RESPAWN_KEY;
+use t27os::keys::FA_GIVE_UP;
+use t27os::keys::setkey_provider;
+use t27os::keys::setkey_number;
 use t27os::editors::TERM_COUNT;
 use t27os::editors::TERM_NONE;
 use t27os::editors::TERM_PATH_MAX;
@@ -125,7 +164,42 @@ pub const G_CFD : usize = 232;
 pub const G_CLEN : usize = 240;
 /// Each pane's last RESIZE, two panes per word (pty_proto ws_pack); 8 words cover MAX_PANES.
 pub const G_WINSZ : usize = 248;
-pub const ST_SIZE : usize = 256;
+/// The table grew from 256 to 512 words for the key rotation (gHashTag/t27#11241): per key slot of every
+/// provider (PROVIDER_COUNT * MAX_KEYS = 72) when it was last used (ms) and until when it rests (s, KEY_NEVER
+/// for a slot that holds no key), then PK words per pane: the key numbers the pane holds, its profile, its bad
+/// provider mask, its failover count, the key to skip at the next launch, the time until which its screen
+/// is not read (after a give-up) and its restore state (W_*). Key slot (p, k) is word p * MAX_KEYS + k.
+/// G_START is the millisecond the server started at (a restored pane waits for keys from then on).
+pub const G_START : usize = 227;
+pub const G_KLAST : usize = 256;
+pub const G_KREST : usize = 328;
+pub const G_PANEK : usize = 400;
+pub const KEY_SLOTS : usize = 72;
+pub const PK : usize = 7;
+pub const PK_KEYS : usize = 0;
+pub const PK_PROF : usize = 1;
+pub const PK_BAD : usize = 2;
+pub const PK_DONE : usize = 3;
+pub const PK_SKIP : usize = 4;
+pub const PK_STOP : usize = 5;
+pub const PK_WAIT : usize = 6;
+/// PK_PROF of a pane that has not chosen a profile yet.
+pub const PK_UNSET : u64 = 254;
+/// PK_WAIT: 0 nothing; 1 + plan a restored pane waiting for a key of its provider (its launch is deferred);
+/// W_KEYLESS a restored pane that started with no key (its one respawn is due when a key arrives); W_DONE
+/// that respawn was made.
+pub const W_NONE : u64 = 0;
+pub const W_KEYLESS : u64 = 8;
+pub const W_DONE : u64 = 9;
+/// How long a restored pane waits for the window's keys before it starts as it always did.
+pub const RESTORE_WAIT_MS : u64 = 20000;
+/// A pane's screen is not read for this long after it starts: a resumed Claude Code session replays its
+/// transcript, which may hold an earlier error row.
+pub const SCAN_GRACE_MS : u64 = 10000;
+/// After a give-up the pane's screen is read again only after this long, so one error row on screen is not
+/// answered with a line in the scrollback at every redraw.
+pub const GIVEUP_QUIET_MS : u64 = 60000;
+pub const ST_SIZE : usize = 512;
 pub const MAX_CONNS : usize = 8;
 
 pub const SID_CAP : usize = 64;
@@ -145,9 +219,17 @@ pub const O_BIN : usize = 92400;
 pub const MODEL_CAP : usize = 64;
 pub const O_MODEL : usize = 97280;
 pub const O_RING : usize = 98304;
+/// The key table: KEY_SLOTS slots of KEY_CAP bytes (a length byte, the key, a NUL), slot (p, k) at
+/// O_KEYS + (p * MAX_KEYS + k) * KEY_CAP (key_slot). Then each pane's unfinished screen line (a length byte
+/// and up to CARRY_CAP bytes, CARRY_SLOT apart) and the scratch where a chunk's plain text is built.
 pub const O_KEYS : usize = 1146880;
 pub const KEY_CAP : usize = 256;
-pub const MEM_SIZE : usize = 1149184;
+pub const O_CARRY : usize = 1165312;
+pub const CARRY_CAP : usize = 128;
+pub const CARRY_SLOT : usize = 132;
+pub const O_SCAN : usize = 1167424;
+pub const SCAN_CAP : usize = 4232;
+pub const MEM_SIZE : usize = 1171712;
 pub const TICK_MS : i32 = 500;
 pub const SIGHUP_RING : u64 = 65536;
 
@@ -355,6 +437,419 @@ pub fn c_path(out: []u8, src: []const u8) -> usize {
     const n : usize = put_bytes(out, 0, src);
     out[n] = 0;
     return n;
+}
+
+// ---- key rotation (gHashTag/t27#11241): the server's key table, the keys a pane holds, the failover ----
+// The server holds up to MAX_KEYS keys per provider in memory (never on disk) with when each was last used
+// and until when it rests. A pane spawn picks its key with rotate_pick_soft (the key used longest ago that is
+// not resting; when all rest, the one whose rest ends first). The pane keeps the key NUMBER, never the key.
+// When the pane's screen shows a failure the key rests and the pane is respawned by keys.t27 fo_action, on the
+// next key of the same provider (rotate_pick_except, the failed key skipped) or on the next profile.
+
+fn kidx(p: u32, k: u32) -> usize {
+    return @as(usize, p) * @as(usize, MAX_KEYS) + @as(usize, k);
+}
+
+fn pow16(n: u32) -> u64 {
+    var m : u64 = 1;
+    var j : u32 = 0;
+    while (j < n) {
+        m = m * 16;
+        j = j + 1;
+    }
+    return m;
+}
+
+/// The offset in the arena of key slot (p, k): a length byte, the key, a NUL (OP_SETKEY fills it).
+pub fn key_slot(p: u32, k: u32) -> usize {
+    return O_KEYS + kidx(p, k) * KEY_CAP;
+}
+
+/// A pane that has chosen nothing: no keys, no profile, no failures, nothing to skip, nothing waiting.
+pub fn pane_keys_reset(st: []u64, i: usize) -> void {
+    const pk : usize = G_PANEK + i * PK;
+    st[pk + PK_KEYS] = 0;
+    st[pk + PK_PROF] = PK_UNSET;
+    st[pk + PK_BAD] = 0;
+    st[pk + PK_DONE] = 0;
+    st[pk + PK_SKIP] = 0;
+    st[pk + PK_STOP] = 0;
+    st[pk + PK_WAIT] = W_NONE;
+}
+
+/// The empty table: every slot rests until KEY_NEVER (holds no key), every pane is reset.
+pub fn keys_init(st: []u64) -> void {
+    var s : usize = 0;
+    while (s < KEY_SLOTS) {
+        st[G_KLAST + s] = 0;
+        st[G_KREST + s] = KEY_NEVER;
+        s = s + 1;
+    }
+    var i : usize = 0;
+    while (i < 16) {
+        pane_keys_reset(st, i);
+        i = i + 1;
+    }
+}
+
+pub fn key_present(st: []const u64, p: u32, k: u32) -> bool {
+    return st[G_KREST + kidx(p, k)] < KEY_NEVER;
+}
+
+/// How many slots of provider p hold a key.
+pub fn key_count(st: []const u64, p: u32) -> u32 {
+    var c : u32 = 0;
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if (key_present(st, p, k)) { c = c + 1; }
+        k = k + 1;
+    }
+    return c;
+}
+
+/// The providers that hold at least one key, as a bit mask.
+pub fn keys_stored(st: []const u64) -> u32 {
+    var m : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (key_count(st, p) > 0) { m = m + (1 << p); }
+        p = p + 1;
+    }
+    return m;
+}
+
+/// OP_SETKEY filled (present) or emptied slot (p, k). `same`: the bytes are those already held, so the key keeps
+/// its last-use and rest times (a window that sends every key again must not end a cooldown).
+pub fn key_put(st: []u64, p: u32, k: u32, present: bool, same: bool) -> void {
+    const ix : usize = kidx(p, k);
+    if (present == false) {
+        st[G_KLAST + ix] = 0;
+        st[G_KREST + ix] = KEY_NEVER;
+        return;
+    }
+    if (same and st[G_KREST + ix] < KEY_NEVER) { return; }
+    st[G_KLAST + ix] = 0;
+    st[G_KREST + ix] = 0;
+}
+
+/// The key of provider p a new pane takes (MAX_KEYS when it holds none); `skip` is a key not to take.
+pub fn key_pick(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
+    const at : usize = kidx(p, 0);
+    return rotate_pick_soft(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
+}
+
+/// A key of provider p that is usable right now and is not `skip` (MAX_KEYS when none): the test for a swap.
+pub fn key_pick_free(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
+    const at : usize = kidx(p, 0);
+    return rotate_pick_except(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
+}
+
+pub fn key_used(st: []u64, p: u32, k: u32, now_ms: u64) -> void {
+    st[G_KLAST + kidx(p, k)] = now_ms;
+}
+
+/// Key (p, k) rests until `until_s`; a longer rest it already has stays, and a slot that holds no key stays empty.
+pub fn key_rest(st: []u64, p: u32, k: u32, until_s: u64) -> void {
+    const ix : usize = G_KREST + kidx(p, k);
+    if (st[ix] >= KEY_NEVER) { return; }
+    if (until_s > st[ix]) { st[ix] = until_s; }
+}
+
+/// The key number + 1 pane i holds for provider p (0 = none): one nibble per provider.
+pub fn pane_key_get(st: []const u64, i: usize, p: u32) -> u32 {
+    return @as(u32, @intCast(st[G_PANEK + i * PK + PK_KEYS] / pow16(p) % 16));
+}
+
+pub fn pane_key_set(st: []u64, i: usize, p: u32, v: u32) -> void {
+    const at : usize = G_PANEK + i * PK + PK_KEYS;
+    const m : u64 = pow16(p);
+    st[at] = st[at] - @as(u64, pane_key_get(st, i, p)) * m + @as(u64, v) * m;
+}
+
+/// The key number + 1 a LIST shows for pane i (0 = none): for the claude cell the key of its profile's provider,
+/// for every other agent the first provider it reads that it holds a key for.
+pub fn pane_key_shown(st: []const u64, i: usize, a: u32) -> u32 {
+    if (profile_agent(a)) {
+        const pr : u64 = st[G_PANEK + i * PK + PK_PROF];
+        if (pr >= @as(u64, PROFILE_COUNT)) { return 0; }
+        return pane_key_get(st, i, PROFILE_PROVIDER[@as(u32, @intCast(pr))]);
+    }
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        const v : u32 = pane_key_get(st, i, p);
+        if (v > 0) { return v; }
+        p = p + 1;
+    }
+    return 0;
+}
+
+/// The flags byte of a LIST entry with the pane's key number + 1 in its high nibble (0 to 8). Bits 0 to 2 are
+/// list_flags as before, so a client that reads only those is not disturbed.
+pub fn list_flags_key(live: bool, w: u32, key1: u32) -> u32 {
+    return list_flags(live, w) + 16 * key1;
+}
+
+/// Choose the keys of pane i about to launch (agent a, `now_ms`): fills the pane's key numbers and profile
+/// from the table, marks each picked key used, clears the skip. The claude cell takes the profile the pane
+/// asked for (a failover set it) or pick_profile over the providers that hold a key and have not failed for
+/// this pane, then the key of that provider by rotation, skipping the key that just failed. Every other agent
+/// takes a key of each provider it reads, by rotation. Nothing here holds a key value.
+pub fn plan_pane_keys(st: []u64, i: usize, a: u32, now_ms: u64) -> void {
+    const pk : usize = G_PANEK + i * PK;
+    st[pk + PK_KEYS] = 0;
+    st[pk + PK_STOP] = 0;
+    if (profile_agent(a)) {
+        var pr : u32 = PR_NONE;
+        if (st[pk + PK_PROF] < @as(u64, PROFILE_COUNT)) {
+            pr = @as(u32, @intCast(st[pk + PK_PROF]));
+        } else {
+            pr = pick_profile(keys_stored(st), @as(u32, @intCast(st[pk + PK_BAD])));
+        }
+        var skip : u32 = MAX_KEYS;
+        if (st[pk + PK_SKIP] > 0) { skip = @as(u32, @intCast(st[pk + PK_SKIP])) - 1; }
+        if (pr < PROFILE_COUNT) {
+            const prov : u32 = PROFILE_PROVIDER[pr];
+            const k : u32 = key_pick(st, prov, skip, now_ms);
+            if (k < MAX_KEYS) {
+                key_used(st, prov, k, now_ms);
+                pane_key_set(st, i, prov, k + 1);
+            } else {
+                pr = PR_NONE;
+            }
+        }
+        st[pk + PK_PROF] = @as(u64, pr);
+        st[pk + PK_SKIP] = 0;
+        return;
+    }
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (agent_uses(a, p) and key_count(st, p) > 0) {
+            const k : u32 = key_pick(st, p, MAX_KEYS, now_ms);
+            if (k < MAX_KEYS) {
+                key_used(st, p, k, now_ms);
+                pane_key_set(st, i, p, k + 1);
+            }
+        }
+        p = p + 1;
+    }
+}
+
+/// The failover for pane i whose screen showed failure `class` at `now_ms`. The key the pane used rests by the
+/// kind of failure (keys.t27 key_rest_after), for every pane, not just this one. fo_action decides; on a respawn
+/// the pane's profile, bad mask, failover count and key to skip are set for plan_pane_keys, and the why line
+/// (keys.t27 fo_why, 128 bytes are enough) goes to `why` with its length in wl[0]. After a give-up the screen
+/// is not read again for GIVEUP_QUIET_MS. Returns the action; FA_RESPAWN_* means "stop the process, launch again".
+pub fn plan_failover(st: []u64, i: usize, class: u32, now_ms: u64, why: []u8, wl: []u64) -> u32 {
+    const pk : usize = G_PANEK + i * PK;
+    var pr : u32 = PR_NONE;
+    if (st[pk + PK_PROF] < @as(u64, PROFILE_COUNT)) { pr = @as(u32, @intCast(st[pk + PK_PROF])); }
+    const stored : u32 = keys_stored(st);
+    const bad : u32 = @as(u32, @intCast(st[pk + PK_BAD]));
+    const done : u32 = @as(u32, @intCast(st[pk + PK_DONE]));
+    var cur : u32 = MAX_KEYS;
+    var alt : bool = false;
+    if (pr < PROFILE_COUNT) {
+        const prov : u32 = PROFILE_PROVIDER[pr];
+        const held : u32 = pane_key_get(st, i, prov);
+        if (held > 0) { cur = held - 1; }
+        const rest : u64 = key_rest_after(class);
+        if (cur < MAX_KEYS and rest > 0) { key_rest(st, prov, cur, now_ms / 1000 + rest); }
+        alt = key_pick_free(st, prov, cur, now_ms) != MAX_KEYS;
+    }
+    const act : u32 = fo_action(class, pr, stored, bad, done, alt);
+    var nxt : u32 = PR_NONE;
+    if (act == FA_RESPAWN_KEY) {
+        nxt = pr;
+        st[pk + PK_SKIP] = @as(u64, cur) + 1;
+    }
+    if (act == FA_RESPAWN_NEXT) {
+        nxt = fo_target(class, pr, stored, bad, done, alt);
+        st[pk + PK_BAD] = @as(u64, fo_bad(class, pr, bad));
+    }
+    if (act == FA_RESPAWN_KEY or act == FA_RESPAWN_NEXT) {
+        st[pk + PK_PROF] = @as(u64, nxt);
+        st[pk + PK_DONE] = @as(u64, done) + 1;
+    }
+    if (act == FA_GIVE_UP) { st[pk + PK_STOP] = now_ms + GIVEUP_QUIET_MS; }
+    wl[0] = @as(u64, fo_why(class, pr, act, nxt, done, why));
+    return act;
+}
+
+// ---- reading a pane's screen: plain text lines out of terminal bytes ----
+
+fn put_break(out: []u8, n: usize) -> usize {
+    if (n == 0) { return 0; }
+    if (out[n - 1] == 10) { return n; }
+    out[n] = 10;
+    return n + 1;
+}
+
+/// Plain text of terminal output: printable ASCII kept, tab a space, CR and LF one line break (no empty
+/// lines), cursor moves up, down or to a position a line break, a move right a space; every other escape
+/// sequence (colours, modes, titles), control byte and non-ASCII byte dropped. out needs src.len + 2 bytes.
+/// The result is a rough picture of the screen's rows, enough for keys.t27 to read an error row from.
+pub fn screen_text(src: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < src.len and n + 1 < out.len) {
+        const b : u8 = src[i];
+        if (b == 27) {
+            var j : usize = i + 1;
+            if (j >= src.len) {
+                i = src.len;
+            } else if (src[j] == 91) {
+                j = j + 1;
+                while (j < src.len and (src[j] < 64 or src[j] > 126)) { j = j + 1; }
+                if (j < src.len) {
+                    const f : u8 = src[j];
+                    if (f == 65 or f == 66 or f == 69 or f == 70 or f == 72 or f == 100 or f == 102 or f == 74) {
+                        n = put_break(out, n);
+                    } else if (f == 67 or f == 71) {
+                        out[n] = 32;
+                        n = n + 1;
+                    }
+                }
+                i = j + 1;
+            } else if (src[j] == 93) {
+                j = j + 1;
+                while (j < src.len and src[j] != 7 and src[j] != 27) { j = j + 1; }
+                if (j < src.len and src[j] == 27) { j = j + 2; } else { j = j + 1; }
+                i = j;
+            } else if (src[j] >= 40 and src[j] <= 43) {
+                i = j + 2;
+            } else {
+                i = j + 1;
+            }
+        } else if (b == 10 or b == 13) {
+            n = put_break(out, n);
+            i = i + 1;
+        } else if (b == 9) {
+            out[n] = 32;
+            n = n + 1;
+            i = i + 1;
+        } else if (b >= 32 and b < 127) {
+            out[n] = b;
+            n = n + 1;
+            i = i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+/// The failure class of one row: keys.t27 classify_line, but only on an error row (error_row).
+pub fn row_class(line: []const u8) -> u32 {
+    if (error_row(line) == false) { return FC_NONE; }
+    return classify_line(line);
+}
+
+/// The failure class of the rows of `text` (lines split at LF): the last row that is a failure; FC_NONE when
+/// there is none (a row classed FC_OTHER is no failure to act on).
+pub fn text_class(text: []const u8) -> u32 {
+    var cls : u32 = FC_NONE;
+    var a : usize = 0;
+    var i : usize = 0;
+    while (i <= text.len) {
+        if (i == text.len or text[i] == 10) {
+            if (i > a) {
+                const c : u32 = row_class(text[a .. i]);
+                if (c != FC_NONE and c != FC_OTHER) { cls = c; }
+            }
+            a = i + 1;
+        }
+        i = i + 1;
+    }
+    return cls;
+}
+
+/// Where the unfinished last row of `text` starts and how long it is, cut at CARRY_CAP: f[0], f[1]. The next
+/// chunk is read with this row in front, so an error row split across two reads is still one row.
+pub fn carry_cut(text: []const u8, f: []u64) -> void {
+    var a : usize = 0;
+    var i : usize = 0;
+    while (i < text.len) {
+        if (text[i] == 10) { a = i + 1; }
+        i = i + 1;
+    }
+    var l : usize = text.len - a;
+    if (l > CARRY_CAP) { l = CARRY_CAP; }
+    f[0] = @as(u64, a);
+    f[1] = @as(u64, l);
+}
+
+/// Only the claude cell is read: its error rows are the ones keys.t27 knows, and only it has profiles.
+pub fn scan_applies(a: u32) -> bool {
+    return profile_agent(a);
+}
+
+/// Is pane i's screen read now? Not in the first SCAN_GRACE_MS after it starts (a resumed session replays its
+/// transcript) and not while a give-up is quiet.
+pub fn scan_ready(st: []const u64, i: usize, born: u64, now: u64) -> bool {
+    if (now < born + SCAN_GRACE_MS) { return false; }
+    return now >= st[G_PANEK + i * PK + PK_STOP];
+}
+
+// ---- a restored pane waits for its keys ----
+// After a server restart the panes come back from their records at once, but the window sends the keys only
+// when it connects. A restored claude pane would start with the subscription variables stripped and no
+// profile ("Not logged in"). So a restored pane whose agent reads a provider key waits for a key of that
+// provider, or RESTORE_WAIT_MS since the server started, and then starts as it always did; a restored pane
+// that started with no key is respawned once when its first key arrives.
+
+/// Does a pane of agent a read some provider's key (the shell cell and an editor read none)?
+pub fn needs_key(a: u32) -> bool {
+    return spawn_mask(a, 511) != 0;
+}
+
+/// Does the table hold a key a pane of agent a can start with? The claude cell reads the key of a profile's
+/// provider (z.ai, Anthropic, OpenRouter, Ollama cloud), every other agent a provider of AGENT_PROVIDERS.
+pub fn has_key_for(st: []const u64, a: u32) -> bool {
+    const stored : u32 = keys_stored(st);
+    if (profile_agent(a)) { return pick_profile(stored, 0) != PR_NONE; }
+    return spawn_mask(a, stored) != 0;
+}
+
+/// A pane being restored waits instead of launching.
+pub fn restore_waits(st: []const u64, a: u32) -> bool {
+    return needs_key(a) and has_key_for(st, a) == false;
+}
+
+/// The wait ends: a key of the agent's provider arrived, or the time is up (`start` is G_START).
+pub fn restore_release(st: []const u64, a: u32, now: u64, start: u64) -> bool {
+    return has_key_for(st, a) or now >= start + RESTORE_WAIT_MS;
+}
+
+/// PK_WAIT of a pane that waits with launch plan `plan`, and the plan out of it (R_SKIP when not waiting).
+pub fn wait_word(plan: u32) -> u64 {
+    return @as(u64, plan) + 1;
+}
+
+pub fn waiting(w: u64) -> bool {
+    return w >= 1 and w <= 3;
+}
+
+pub fn wait_plan(w: u64) -> u32 {
+    if (waiting(w) == false) { return R_SKIP; }
+    return @as(u32, @intCast(w - 1));
+}
+
+/// PK_WAIT after a deferred launch: nothing when a key was there, W_KEYLESS when the wait ran out.
+pub fn after_wait(st: []const u64, a: u32) -> u64 {
+    if (has_key_for(st, a)) { return W_NONE; }
+    return W_KEYLESS;
+}
+
+/// A restored pane that started keyless gets its one respawn when its first key arrives.
+pub fn keyless_respawn(w: u64, st: []const u64, a: u32) -> bool {
+    return w == W_KEYLESS and has_key_for(st, a);
+}
+
+/// The plan of that respawn: resume when the session is known, else relaunch fresh.
+pub fn keyless_plan(a: u32, sid: []const u8) -> u32 {
+    const p : u32 = restore_plan(a, 0, sid);
+    if (p == R_SKIP) { return R_RELAUNCH; }
+    return p;
 }
 
 
@@ -642,4 +1137,431 @@ test an_editor_pane_survives_a_restart_in_its_record {
     assert restore_plan(SHELL_CELL, 0, "") == R_RELAUNCH;
     // the path limit is the pane cwd's
     assert TERM_PATH_MAX == CWD_CAP - 1;
+}
+
+// ---- tests of the key rotation. Every key here is a slot number; no test holds a key value, real or fake. ----
+
+fn t_table(st: []u64) -> void {
+    var z : usize = 0;
+    while (z < 512) {
+        st[z] = 0;
+        z = z + 1;
+    }
+    keys_init(st);
+}
+
+fn t_key(st: []u64, p: u32, k: u32) -> void {
+    key_put(st, p, k, true, false);
+}
+
+/// The profile pane i has chosen (PR_NONE when it holds no real profile).
+fn t_prof(st: []const u64, i: usize) -> u32 {
+    return @as(u32, @intCast(st[G_PANEK + i * PK + PK_PROF]));
+}
+
+/// The table of the owner's setup, in miniature: three z.ai keys and one Anthropic key.
+fn t_zai3(st: []u64) -> void {
+    t_table(st);
+    t_key(st, P_ZAI, 0);
+    t_key(st, P_ZAI, 1);
+    t_key(st, P_ZAI, 2);
+    t_key(st, P_ANTHROPIC, 0);
+}
+
+test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
+    assert KEY_SLOTS == @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS);
+    assert G_KLAST + KEY_SLOTS <= G_KREST;
+    assert G_KREST + KEY_SLOTS <= G_PANEK;
+    assert G_PANEK + 16 * PK <= ST_SIZE;
+    assert G_START < G_CFD;
+    assert G_START > G_BINLEN;
+    assert 16 * PF <= G_LISTEN;
+    assert key_slot(0, 0) == O_KEYS;
+    assert key_slot(4, 2) == O_KEYS + (4 * 8 + 2) * KEY_CAP;
+    assert key_slot(PROVIDER_COUNT - 1, MAX_KEYS - 1) + KEY_CAP <= O_CARRY;
+    assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
+    assert O_SCAN + SCAN_CAP <= MEM_SIZE;
+    assert CARRY_SLOT == CARRY_CAP + 4;
+    assert SCAN_CAP >= CARRY_CAP + 4096 + 2;
+    assert MAX_KEYS <= 8;
+}
+
+test an_empty_table_holds_no_key_and_a_put_fills_one_slot {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    assert keys_stored(st[0..512]) == 0;
+    assert key_count(st[0..512], P_ZAI) == 0;
+    assert key_present(st[0..512], P_ZAI, 3) == false;
+    t_key(st[0..512], P_ZAI, 3);
+    assert key_present(st[0..512], P_ZAI, 3);
+    assert key_count(st[0..512], P_ZAI) == 1;
+    assert keys_stored(st[0..512]) == 16;
+    t_key(st[0..512], P_OPENAI, 7);
+    assert keys_stored(st[0..512]) == 18;
+    key_put(st[0..512], P_ZAI, 3, false, false);
+    assert keys_stored(st[0..512]) == 2;
+    assert st[G_KREST + 4 * 8 + 3] == KEY_NEVER;
+}
+
+test sending_the_same_key_again_keeps_its_cooldown_and_a_new_key_starts_fresh {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    t_key(st[0..512], P_ZAI, 0);
+    key_used(st[0..512], P_ZAI, 0, 777);
+    key_rest(st[0..512], P_ZAI, 0, 5000);
+    key_put(st[0..512], P_ZAI, 0, true, true);
+    assert st[G_KREST + 32] == 5000;
+    assert st[G_KLAST + 32] == 777;
+    key_put(st[0..512], P_ZAI, 0, true, false);
+    assert st[G_KREST + 32] == 0;
+    assert st[G_KLAST + 32] == 0;
+    // a rest never shortens, and an empty slot never gets one
+    key_rest(st[0..512], P_ZAI, 0, 900);
+    key_rest(st[0..512], P_ZAI, 0, 400);
+    assert st[G_KREST + 32] == 900;
+    key_rest(st[0..512], P_ZAI, 1, 900);
+    assert st[G_KREST + 33] == KEY_NEVER;
+}
+
+test new_claude_panes_take_the_z_ai_keys_in_rotation {
+    var st : [512]u64 = undefined;
+    t_zai3(st[0..512]);
+    var n : usize = 0;
+    var want : [4]u32 = [1, 2, 3, 1];
+    while (n < 4) {
+        plan_pane_keys(st[0..512], n, 0, 1000000 + @as(u64, n) * 100);
+        assert t_prof(st[0..512], n) == PR_ZAI;
+        assert pane_key_get(st[0..512], n, P_ZAI) == want[n];
+        assert pane_key_get(st[0..512], n, P_ANTHROPIC) == 0;
+        assert pane_key_shown(st[0..512], n, 0) == want[n];
+        n = n + 1;
+    }
+    // a key that rests is passed over
+    key_rest(st[0..512], P_ZAI, 1, 2000);
+    plan_pane_keys(st[0..512], 5, 0, 1000500);
+    assert pane_key_get(st[0..512], 5, P_ZAI) == 3;
+    // every key resting: the one whose rest ends first
+    key_rest(st[0..512], P_ZAI, 0, 3000);
+    key_rest(st[0..512], P_ZAI, 2, 2500);
+    plan_pane_keys(st[0..512], 6, 0, 1000600);
+    assert pane_key_get(st[0..512], 6, P_ZAI) == 2;
+}
+
+test every_other_agent_gets_a_key_of_each_provider_it_reads {
+    var st : [512]u64 = undefined;
+    t_zai3(st[0..512]);
+    t_key(st[0..512], P_OPENAI, 0);
+    t_key(st[0..512], P_OPENAI, 1);
+    // OpenCode (cell 3) reads Anthropic, OpenAI, OpenRouter: OpenRouter holds none
+    plan_pane_keys(st[0..512], 0, 3, 1000000);
+    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert pane_key_get(st[0..512], 0, P_OPENAI) == 1;
+    assert pane_key_get(st[0..512], 0, 3) == 0;
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    // Codex (cell 1) reads OpenAI only, and takes the key used longest ago
+    plan_pane_keys(st[0..512], 1, 1, 1000100);
+    assert pane_key_get(st[0..512], 1, P_OPENAI) == 2;
+    assert pane_key_get(st[0..512], 1, P_ANTHROPIC) == 0;
+    assert pane_key_shown(st[0..512], 1, 1) == 2;
+    // Crush (cell 5) reads ZAI_API_KEY among others
+    plan_pane_keys(st[0..512], 2, 5, 1000200);
+    assert pane_key_get(st[0..512], 2, P_ZAI) > 0;
+    assert pane_key_get(st[0..512], 2, P_OPENAI) > 0;
+    // a shell and an editor read none; an agent with no key of its provider gets nothing
+    plan_pane_keys(st[0..512], 3, 9, 1000300);
+    assert pane_key_shown(st[0..512], 3, 9) == 0;
+    assert st[G_PANEK + 3 * PK + PK_KEYS] == 0;
+    plan_pane_keys(st[0..512], 4, 2, 1000400);
+    assert pane_key_shown(st[0..512], 4, 2) == 0;
+    // the key numbers of one pane do not touch another's
+    assert pane_key_get(st[0..512], 0, P_OPENAI) == 1;
+}
+
+test an_overloaded_key_swaps_to_the_next_key_rests_and_is_passed_over_by_other_panes {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..512]);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    const act : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
+    assert act == FA_RESPAWN_KEY;
+    assert st[G_KREST + 32] == 1005 + 60;
+    assert st[G_PANEK + PK_SKIP] == 1;
+    assert st[G_PANEK + PK_DONE] == 1;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai overloaded (529), same profile with the next key");
+    plan_pane_keys(st[0..512], 0, 0, 1006000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    assert st[G_PANEK + PK_SKIP] == 0;
+    // another pane started meanwhile does not take the resting key
+    plan_pane_keys(st[0..512], 1, 0, 1010000);
+    assert pane_key_get(st[0..512], 1, P_ZAI) == 3;
+    // and a rate limit rests the key for thirty seconds
+    const b : u32 = plan_failover(st[0..512], 1, FC_RATE_LIMITED, 1011000, why[0..128], wl[0..2]);
+    assert b == FA_RESPAWN_KEY;
+    assert st[G_KREST + 34] == 1011 + 30;
+}
+
+test when_every_z_ai_key_is_overloaded_the_pane_moves_to_the_next_profile_then_gives_up {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..512]);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    var a : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1001000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..512], 0, 0, 1001500);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1002000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..512], 0, 0, 1002500);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    // the third key is overloaded too and the other two still rest: next profile, z.ai marked bad
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1003000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert st[G_PANEK + PK_BAD] == 16;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai overloaded (529), respawn on anthropic-api");
+    plan_pane_keys(st[0..512], 0, 0, 1003500);
+    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    // the Anthropic key is overloaded: no profile is left, the pane stays and its screen is not read for a minute
+    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1004000, why[0..128], wl[0..2]);
+    assert a == FA_GIVE_UP;
+    assert st[G_PANEK + PK_DONE] == 3;
+    assert st[G_PANEK + PK_STOP] == 1004000 + GIVEUP_QUIET_MS;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "no profile left in the chain");
+    assert scan_ready(st[0..512], 0, 1003500, 1020000) == false;
+    assert scan_ready(st[0..512], 0, 1003500, 1064001);
+}
+
+test an_empty_balance_leaves_the_provider_at_once_and_the_key_rests_ten_minutes {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..512]);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    const a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1005000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_NEXT;
+    assert st[G_KREST + 32] == 1005 + 600;
+    assert st[G_PANEK + PK_BAD] == 16;
+    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai out of balance, respawn on anthropic-api");
+    // the failure cap ends any loop
+    st[G_PANEK + PK_DONE] = @as(u64, MAX_FAILOVERS);
+    const g : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
+    assert g == FA_GIVE_UP;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "failover limit reached");
+}
+
+test a_pane_that_started_without_a_key_takes_the_first_stored_profile_on_a_subscription_row {
+    var st : [512]u64 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_table(st[0..512]);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    assert t_prof(st[0..512], 0) == PR_NONE;
+    assert pane_key_shown(st[0..512], 0, 0) == 0;
+    // nothing stored: nothing to move to
+    assert plan_failover(st[0..512], 0, FC_SUBSCRIPTION, 1001000, why[0..128], wl[0..2]) == FA_GIVE_UP;
+    // the window's keys arrive; the pane asks again after its quiet time
+    t_key(st[0..512], P_ZAI, 4);
+    st[G_PANEK + PK_STOP] = 0;
+    const a : u32 = plan_failover(st[0..512], 0, FC_SUBSCRIPTION, 1002000, why[0..128], wl[0..2]);
+    assert a == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "no profile subscription disabled, respawn on zai");
+    plan_pane_keys(st[0..512], 0, 0, 1003000);
+    assert pane_key_get(st[0..512], 0, P_ZAI) == 5;
+}
+
+test a_new_spawn_starts_with_a_clean_pane_record {
+    var st : [512]u64 = undefined;
+    t_zai3(st[0..512]);
+    plan_pane_keys(st[0..512], 2, 0, 1000000);
+    st[G_PANEK + 2 * PK + PK_DONE] = 5;
+    st[G_PANEK + 2 * PK + PK_BAD] = 16;
+    pane_keys_reset(st[0..512], 2);
+    assert st[G_PANEK + 2 * PK + PK_DONE] == 0;
+    assert st[G_PANEK + 2 * PK + PK_BAD] == 0;
+    assert st[G_PANEK + 2 * PK + PK_PROF] == PK_UNSET;
+    assert st[G_PANEK + 2 * PK + PK_KEYS] == 0;
+    assert st[G_PANEK + 2 * PK + PK_WAIT] == W_NONE;
+    plan_pane_keys(st[0..512], 2, 0, 1000100);
+    assert t_prof(st[0..512], 2) == PR_ZAI;
+}
+
+test a_list_entry_carries_the_key_number_in_the_high_nibble {
+    const w : u32 = pane_step(0, P_SPAWNED);
+    assert list_flags_key(true, w, 0) == list_flags(true, w);
+    assert list_flags_key(true, w, 3) % 16 == list_flags(true, w);
+    assert list_flags_key(true, w, 3) / 16 == 3;
+    assert list_flags_key(false, w, MAX_KEYS) / 16 == MAX_KEYS;
+    assert list_flags_key(true, hooked_status(w, "Notification"), MAX_KEYS) < 256;
+    // a client that reads bit 0, 1 or 2 only sees the old byte
+    assert list_flags_key(true, hooked_status(w, "Notification"), 5) % 2 == 1;
+}
+
+test terminal_bytes_become_plain_rows {
+    var s : [200]u8 = undefined;
+    var o : [210]u8 = undefined;
+    var n : usize = put_bytes(s[0..200], 0, "ab");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "[31;1mAPI Error: 529");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "[0m");
+    s[n] = 13;
+    s[n + 1] = 10;
+    n = put_bytes(s[0..200], n + 2, "next");
+    var t : usize = screen_text(s[0..n], o[0..210]);
+    assert same_bytes(o[0..t], "abAPI Error: 529\nnext");
+    // a cursor move up or to a position is a line break, one to the right a space
+    n = put_bytes(s[0..200], 0, "one");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "[2K");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "[1Atwo");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "[3Cx");
+    t = screen_text(s[0..n], o[0..210]);
+    assert same_bytes(o[0..t], "one\ntwo x");
+    // a title (OSC) up to BEL, a charset switch, a tab, a bare ESC at the end, bytes above 127
+    n = put_bytes(s[0..200], 0, "a");
+    s[n] = 27;
+    n = put_bytes(s[0..200], n + 1, "]0;title");
+    s[n] = 7;
+    s[n + 1] = 27;
+    n = put_bytes(s[0..200], n + 2, "(Bb");
+    s[n] = 9;
+    s[n + 1] = 200;
+    s[n + 2] = 99;
+    s[n + 3] = 27;
+    t = screen_text(s[0..n + 4], o[0..210]);
+    assert same_bytes(o[0..t], "ab c");
+    assert screen_text("", o[0..210]) == 0;
+    // the output never runs past its room
+    assert screen_text("abcdefgh", o[0..5]) == 4;
+    // empty lines collapse and a leading break is dropped
+    t = screen_text("\n\nx\n\ny", o[0..210]);
+    assert same_bytes(o[0..t], "x\ny");
+}
+
+test only_an_error_row_on_the_screen_names_a_failure {
+    assert text_class("API Error: 529 {\"error\":{\"code\":\"1305\"}}") == FC_OVERLOADED;
+    assert text_class("reading\nAPI Error: 429 Insufficient balance\nprompt") == FC_NO_BALANCE;
+    assert text_class("API Error: 401 bad key\nAPI Error: 529 busy") == FC_OVERLOADED;
+    // a diff or a quotation that shows the phrases is not a failure
+    assert text_class("+    assert classify_line(\"API Error: 429 Insufficient balance\") == FC_NO_BALANCE;") == FC_NONE;
+    assert text_class("the log said API Error: 529\nok") == FC_NONE;
+    // Claude Code's own retry is not final
+    assert text_class("API Error (529 overloaded_error) Retrying in 4 seconds") == FC_NONE;
+    assert text_class("API Error: 500 upstream failure") == FC_NONE;
+    assert text_class("") == FC_NONE;
+    assert text_class("\n\n") == FC_NONE;
+    assert row_class("  Error: 403 forbidden") == FC_LOGIN_REJECTED;
+}
+
+test an_error_row_split_across_two_reads_is_still_one_row {
+    var o : [300]u8 = undefined;
+    var c : [300]u8 = undefined;
+    var f : [2]u64 = undefined;
+    // read 1 ends in the middle of the row; its unfinished row is carried
+    var t : usize = screen_text("Working...\nAPI Err", o[0..300]);
+    assert text_class(o[0..t]) == FC_NONE;
+    carry_cut(o[0..t], f[0..2]);
+    assert f[0] == 11;
+    assert f[1] == 7;
+    var cl : usize = put_bytes(c[0..300], 0, o[@as(usize, @intCast(f[0])) .. @as(usize, @intCast(f[0])) + @as(usize, @intCast(f[1]))]);
+    // read 2 finishes it
+    const t2 : usize = screen_text("or: 529 overloaded\n", o[0..300]);
+    cl = put_bytes(c[0..300], cl, o[0..t2]);
+    assert text_class(c[0..cl]) == FC_OVERLOADED;
+    // a long unfinished row is cut at the carry limit; a finished last row carries nothing
+    var big : [200]u8 = undefined;
+    var i : usize = 0;
+    while (i < 200) {
+        big[i] = 97;
+        i = i + 1;
+    }
+    carry_cut(big[0..200], f[0..2]);
+    assert f[0] == 0;
+    assert f[1] == CARRY_CAP;
+    carry_cut("abc\n", f[0..2]);
+    assert f[0] == 4;
+    assert f[1] == 0;
+}
+
+test a_pane_screen_is_not_read_in_its_first_seconds_nor_while_a_give_up_is_quiet {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    assert scan_ready(st[0..512], 1, 1000, 5000) == false;
+    assert scan_ready(st[0..512], 1, 1000, 11000);
+    st[G_PANEK + PK + PK_STOP] = 70000;
+    assert scan_ready(st[0..512], 1, 1000, 60000) == false;
+    assert scan_ready(st[0..512], 1, 1000, 70000);
+    assert scan_applies(0);
+    assert scan_applies(1) == false;
+    assert scan_applies(SHELL_CELL) == false;
+}
+
+test a_restored_pane_waits_for_a_key_of_its_provider_and_then_starts_with_it {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    // the window has not connected: claude, codex, queen wait; a shell and an editor do not
+    assert needs_key(0);
+    assert needs_key(1);
+    assert needs_key(4);
+    assert needs_key(SHELL_CELL) == false;
+    assert restore_waits(st[0..512], 0);
+    assert restore_waits(st[0..512], 1);
+    assert restore_waits(st[0..512], SHELL_CELL) == false;
+    assert wait_plan(wait_word(R_RESUME)) == R_RESUME;
+    assert wait_plan(wait_word(R_RELAUNCH)) == R_RELAUNCH;
+    assert waiting(wait_word(R_RESUME)) and waiting(wait_word(R_RELAUNCH));
+    assert waiting(W_NONE) == false;
+    assert waiting(W_KEYLESS) == false;
+    assert waiting(W_DONE) == false;
+    assert wait_plan(W_NONE) == R_SKIP;
+    // 2 s after the server started, still nothing
+    assert restore_release(st[0..512], 0, 1002000, 1000000) == false;
+    // an OpenAI key arrives: claude reads no OpenAI key, codex does
+    t_key(st[0..512], P_OPENAI, 0);
+    assert restore_release(st[0..512], 0, 1003000, 1000000) == false;
+    assert restore_release(st[0..512], 1, 1003000, 1000000);
+    // a z.ai key arrives: claude's profile has a provider now, and the pane starts on it
+    t_key(st[0..512], P_ZAI, 0);
+    assert restore_release(st[0..512], 0, 1003500, 1000000);
+    assert after_wait(st[0..512], 0) == W_NONE;
+    plan_pane_keys(st[0..512], 3, 0, 1003600);
+    assert t_prof(st[0..512], 3) == PR_ZAI;
+    assert pane_key_get(st[0..512], 3, P_ZAI) == 1;
+}
+
+test a_restored_pane_whose_wait_runs_out_starts_keyless_and_is_respawned_once_when_a_key_arrives {
+    var st : [512]u64 = undefined;
+    t_table(st[0..512]);
+    assert restore_release(st[0..512], 0, 1019999, 1000000) == false;
+    assert restore_release(st[0..512], 0, 1020000, 1000000);
+    assert after_wait(st[0..512], 0) == W_KEYLESS;
+    plan_pane_keys(st[0..512], 0, 0, 1020100);
+    assert t_prof(st[0..512], 0) == PR_NONE;
+    st[G_PANEK + PK_WAIT] = W_KEYLESS;
+    // still no key: no respawn
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0) == false;
+    // the first key arrives
+    t_key(st[0..512], P_ZAI, 0);
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0);
+    // the respawn: the pane takes the profile and the key, and the one respawn is spent
+    plan_pane_keys(st[0..512], 0, 0, 1030000);
+    st[G_PANEK + PK_WAIT] = W_DONE;
+    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert pane_key_shown(st[0..512], 0, 0) == 1;
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0) == false;
+    assert keyless_respawn(W_NONE, st[0..512], 0) == false;
+    // resume when the session is known, else a fresh start
+    assert keyless_plan(0, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab") == R_RESUME;
+    assert keyless_plan(0, "-") == R_RELAUNCH;
+    assert keyless_plan(0, "") == R_RELAUNCH;
 }

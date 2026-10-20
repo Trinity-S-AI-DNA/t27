@@ -18,6 +18,14 @@
 //   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
 //                      the server at login, so panes come back (by session id, model kept) after a reboot.
 //
+// Keys (gHashTag/t27#11241): the server holds up to MAX_KEYS numbered keys for each provider, in memory only,
+// sent by the window with OP_SETKEY (the key number rides in the high nibble of the pane byte). Every agent
+// pane picks its key by rotation at each start; the pane record keeps the key NUMBER, never the key. The
+// claude cell's screen is read for an error row (pty_logic screen_text, keys.t27 error_row and classify_line):
+// the failed key rests, the pane is respawned (resumed) on the next key or profile, or stays with a line in its
+// scrollback. A restored pane waits for the window's keys (or 20 s) before it starts. T27OS_CTL=list prints
+// "key N" for each pane.
+//
 // Every decision is a fn with a test that runs; the host loop only moves bytes through pty_sys.t27.
 //
 // Refs gHashTag/t27#10782.
@@ -145,16 +153,54 @@ use t27os::pty_sys::sys_unsetenv;
 use t27os::pty_logic::O_KEYS;
 use t27os::pty_logic::KEY_CAP;
 use t27os::pty_proto::OP_SETKEY;
+use t27os::pty_logic::G_PANEK;
+use t27os::pty_logic::G_START;
+use t27os::pty_logic::PK;
+use t27os::pty_logic::PK_PROF;
+use t27os::pty_logic::PK_WAIT;
+use t27os::pty_logic::W_DONE;
+use t27os::pty_logic::O_CARRY;
+use t27os::pty_logic::CARRY_SLOT;
+use t27os::pty_logic::O_SCAN;
+use t27os::pty_logic::SCAN_CAP;
+use t27os::pty_logic::CARRY_CAP;
+use t27os::pty_logic::key_slot;
+use t27os::pty_logic::keys_init;
+use t27os::pty_logic::pane_keys_reset;
+use t27os::pty_logic::pane_key_get;
+use t27os::pty_logic::pane_key_shown;
+use t27os::pty_logic::list_flags_key;
+use t27os::pty_logic::key_put;
+use t27os::pty_logic::plan_pane_keys;
+use t27os::pty_logic::plan_failover;
+use t27os::pty_logic::screen_text;
+use t27os::pty_logic::text_class;
+use t27os::pty_logic::carry_cut;
+use t27os::pty_logic::scan_applies;
+use t27os::pty_logic::scan_ready;
+use t27os::pty_logic::restore_waits;
+use t27os::pty_logic::restore_release;
+use t27os::pty_logic::wait_word;
+use t27os::pty_logic::waiting;
+use t27os::pty_logic::wait_plan;
+use t27os::pty_logic::after_wait;
+use t27os::pty_logic::keyless_respawn;
+use t27os::pty_logic::keyless_plan;
 use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::PROFILE_COUNT;
+use t27os::keys::FC_NONE;
+use t27os::keys::FA_KEEP;
+use t27os::keys::FA_GIVE_UP;
+use t27os::keys::setkey_provider;
+use t27os::keys::setkey_number;
 use t27os::keys::agent_uses;
 use t27os::keys::provider_env;
 use t27os::keys::env_stripped;
 use t27os::keys::key_fits;
 use t27os::keys::profile_agent;
 use t27os::keys::claude_strips;
-use t27os::keys::pick_profile;
 use t27os::keys::PROFILE_PROVIDER;
-use t27os::keys::PR_NONE;
 use t27os::keys::profile_var_count;
 use t27os::keys::profile_var_name;
 use t27os::keys::profile_var_is_key;
@@ -385,19 +431,18 @@ fn strip_claude_env(mem: []u8, agent: u32) -> void {
     }
 }
 
-/// In the child, for the claude agent: pick the profile (keys.t27 pick_profile over the stored keys; the
-/// window withholds a key that failed its check) and set exactly that profile's variables. No stored key
-/// leaves the pane without one, and none of the other profile's variables is set.
-fn inject_profile(mem: []u8) -> void {
-    var stored : u32 = 0;
-    var p : u32 = 0;
-    while (p < PROVIDER_COUNT) {
-        if (mem[O_KEYS + @as(usize, p) * KEY_CAP] != 0) { stored = stored + (1 << p); }
-        p = p + 1;
-    }
-    const pr : u32 = pick_profile(stored, 0);
-    if (pr == PR_NONE) { return; }
-    const at : usize = O_KEYS + @as(usize, PROFILE_PROVIDER[pr]) * KEY_CAP;
+/// In the child, for the claude agent: set exactly the variables of the profile the parent chose for pane i
+/// (pty_logic plan_pane_keys: pick_profile over the providers that hold a key, or the profile a failover moved
+/// to) with the key of the number it picked by rotation. No usable key leaves the pane without one, and none of
+/// the other profiles' variables is set. The key is read from its slot; its number is all the pane record holds.
+fn inject_profile(st: []const u64, mem: []u8, i: usize) -> void {
+    const pr64 : u64 = st[G_PANEK + i * PK + PK_PROF];
+    if (pr64 >= @as(u64, PROFILE_COUNT)) { return; }
+    const pr : u32 = @as(u32, @intCast(pr64));
+    const prov : u32 = PROFILE_PROVIDER[pr];
+    const kn : u32 = pane_key_get(st, i, prov);
+    if (kn == 0) { return; }
+    const at : usize = key_slot(prov, kn - 1);
     var k : u32 = 0;
     while (k < profile_var_count(pr)) {
         const nl : usize = profile_var_name(pr, k, mem[O_TMP2 .. O_TMP2 + 40]);
@@ -413,19 +458,24 @@ fn inject_profile(mem: []u8) -> void {
     }
 }
 
-/// In the child: set the environment variable of every stored key the agent reads (OP_SETKEY filled them).
-fn inject_keys(mem: []u8, agent: u32) -> void {
+/// In the child: set the environment variable (keys.t27 PROVIDER_ENVS) of each provider the agent reads
+/// (AGENT_PROVIDERS) to the key plan_pane_keys picked for pane i from that provider's numbered keys. A
+/// provider that holds no key leaves its variable unset.
+fn inject_keys(st: []const u64, mem: []u8, i: usize, agent: u32) -> void {
     if (profile_agent(agent)) {
-        inject_profile(mem);
+        inject_profile(st, mem, i);
         return;
     }
     var p : u32 = 0;
     while (p < PROVIDER_COUNT) {
-        const at : usize = O_KEYS + @as(usize, p) * KEY_CAP;
-        if (agent_uses(agent, p) and mem[at] != 0) {
-            const nl : usize = provider_env(p, mem[O_TMP2 .. O_TMP2 + 40]);
-            mem[O_TMP2 + nl] = 0;
-            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+        const kn : u32 = pane_key_get(st, i, p);
+        if (agent_uses(agent, p) and kn > 0) {
+            const at : usize = key_slot(p, kn - 1);
+            if (mem[at] != 0) {
+                const nl : usize = provider_env(p, mem[O_TMP2 .. O_TMP2 + 40]);
+                mem[O_TMP2 + nl] = 0;
+                sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+            }
         }
         p = p + 1;
     }
@@ -440,6 +490,10 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
         const un : usize = uuid_text(mem[O_MISC + 64 .. O_MISC + 80], mem[O_SID + i * SID_CAP .. O_SID + i * SID_CAP + 40]);
         st[base + PF_SIDLEN] = @as(u64, un);
     }
+    // the keys of this start: the profile and the key number of each provider the agent reads, by rotation
+    // over the numbered keys (a failover has set what to skip); the unfinished screen row of the old process goes
+    plan_pane_keys(st, i, agent, now_ms(mem));
+    mem[O_CARRY + i * CARRY_SLOT] = 0;
     const home : []const u8 = home_slice(st, mem);
     const cn : usize = launch_command(agent, plan, sid_of(st, mem, i), model_of(mem, i), home, cwd_of(st, mem, i), mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
     var f : [4]u64 = undefined;
@@ -470,7 +524,7 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
         sys_chdir(mem[O_TMP1 + 3000 .. O_TMP1 + 3000 + cw + 1]);
         sys_setenv("T27OS_PANE", mem[O_TMP1 + 3300 .. O_TMP1 + 3300 + idn + 1], 1);
         strip_claude_env(mem, agent);
-        inject_keys(mem, agent);
+        inject_keys(st, mem, i, agent);
         sys_execv(mem[O_TMP1 .. O_TMP1 + 8], argv);
         sys_exit(127);
         return false;
@@ -510,7 +564,8 @@ fn reap(st: []u64, mem: []u8, i: usize) -> void {
     save_pane(st, mem, i);
 }
 
-fn kill_pane(st: []u64, mem: []u8, i: usize) -> void {
+/// Stop pane i's process (SIGKILL, wait, close the master); the pane's record and slot stay.
+fn stop_pane_process(st: []u64, i: usize) -> void {
     const base : usize = i * PF;
     if (st[base + PF_LIVE] != 0) {
         sys_kill(@as(i32, @intCast(st[base + PF_PID])), 9);
@@ -520,9 +575,82 @@ fn kill_pane(st: []u64, mem: []u8, i: usize) -> void {
         sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, 0);
         sys_close(@as(i32, @intCast(st[base + PF_FD])));
     }
-    drop_record(st, mem, i);
     st[base + PF_LIVE] = 0;
+}
+
+fn kill_pane(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    stop_pane_process(st, i);
+    drop_record(st, mem, i);
     st[base + PF_USED] = 0;
+}
+
+/// Start pane i again under `plan` (a failover onto another key or profile, or the one respawn of a restored
+/// pane that started without a key). The scrollback and its running count stay, so a window that reads the pane
+/// goes on from where it was; launch sets the count to 0 and it is put back.
+fn respawn_pane(st: []u64, mem: []u8, i: usize, plan: u32) -> void {
+    const total : u64 = st[i * PF + PF_TOTAL];
+    stop_pane_process(st, i);
+    launch(st, mem, i, plan);
+    st[i * PF + PF_TOTAL] = total;
+    save_pane(st, mem, i);
+}
+
+/// Pane i's screen showed failure `class`: pty_logic plan_failover decides (the key rests, the pane moves to the
+/// next key or profile, or stays), the why line goes into the pane's scrollback, and on a respawn the pane is
+/// started again (resumed when its session is known). A give-up writes the same line and leaves the pane as it is.
+fn failover(st: []u64, mem: []u8, i: usize, class: u32, now: u64) -> void {
+    const base : usize = i * PF;
+    var wl : [2]u64 = undefined;
+    wl[0] = 0;
+    wl[1] = 0;
+    const act : u32 = plan_failover(st, i, class, now, mem[O_OUT + 2 .. O_OUT + 130], wl[0..2]);
+    if (act == FA_KEEP) { return; }
+    const n : usize = @as(usize, @intCast(wl[0]));
+    mem[O_OUT] = 13;
+    mem[O_OUT + 1] = 10;
+    mem[O_OUT + 2 + n] = 13;
+    mem[O_OUT + 3 + n] = 10;
+    st[base + PF_TOTAL] = ring_append(ring_of(mem, i), st[base + PF_TOTAL], mem[O_OUT .. O_OUT + n + 4], n + 4);
+    if (act == FA_GIVE_UP) { return; }
+    var plan : u32 = R_RELAUNCH;
+    if (st[base + PF_SIDLEN] > 0) { plan = R_RESUME; }
+    respawn_pane(st, mem, i, plan);
+}
+
+/// Read the n new bytes of pane i (at O_MISC + 128) for a provider error row: only the claude cell, never in
+/// the first seconds after it starts, never while a give-up is quiet. The bytes become plain rows (screen_text),
+/// the unfinished last row of the previous read is put in front and the new one is kept for the next, and the
+/// rows go through keys.t27 error_row and classify_line (pty_logic text_class).
+fn scan_pane(st: []u64, mem: []u8, i: usize, n: usize) -> void {
+    const base : usize = i * PF;
+    if (scan_applies(@as(u32, @intCast(st[base + PF_AGENT]))) == false) { return; }
+    const now : u64 = now_ms(mem);
+    const ca : usize = O_CARRY + i * CARRY_SLOT;
+    if (scan_ready(st, i, st[base + PF_BORN], now) == false) {
+        mem[ca] = 0;
+        return;
+    }
+    const cl : usize = @as(usize, mem[ca]);
+    var k : usize = 0;
+    while (k < cl) {
+        mem[O_SCAN + k] = mem[ca + 1 + k];
+        k = k + 1;
+    }
+    const tl : usize = screen_text(mem[O_MISC + 128 .. O_MISC + 128 + n], mem[O_SCAN + cl .. O_SCAN + cl + n + 2]);
+    const total : usize = cl + tl;
+    const cls : u32 = text_class(mem[O_SCAN .. O_SCAN + total]);
+    var f : [2]u64 = undefined;
+    carry_cut(mem[O_SCAN .. O_SCAN + total], f[0..2]);
+    const fs : usize = @as(usize, @intCast(f[0]));
+    const fl : usize = @as(usize, @intCast(f[1]));
+    mem[ca] = @as(u8, @intCast(fl));
+    k = 0;
+    while (k < fl) {
+        mem[ca + 1 + k] = mem[O_SCAN + fs + k];
+        k = k + 1;
+    }
+    if (cls != FC_NONE) { failover(st, mem, i, cls, now); }
 }
 
 fn reply(fd: i32, mem: []u8, op: u8, pane: u8, plen: usize) -> void {
@@ -543,7 +671,9 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
             const b : usize = @as(usize, i) * PF;
             if (st[b + PF_USED] != 0) {
                 const w : u32 = @as(u32, @intCast(st[b + PF_STATUS]));
-                at = put_list_entry(mem[O_OUT .. O_OUT + 128], at - O_OUT, i, @as(u32, @intCast(st[b + PF_AGENT])), shown_state(w), list_flags(st[b + PF_LIVE] != 0, w)) + O_OUT;
+                // the flags byte carries the pane's key number + 1 in its high nibble (0 = no key); bits 0 to 2 as before
+                const kshown : u32 = pane_key_shown(st, @as(usize, i), @as(u32, @intCast(st[b + PF_AGENT])));
+                at = put_list_entry(mem[O_OUT .. O_OUT + 128], at - O_OUT, i, @as(u32, @intCast(st[b + PF_AGENT])), shown_state(w), list_flags_key(st[b + PF_LIVE] != 0, w, kshown)) + O_OUT;
             }
             i = i + 1;
         }
@@ -570,6 +700,7 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         st[sb + PF_SLOT] = @as(u64, mem[p0 + 2]);
         st[sb + PF_SIDLEN] = 0;
         st[sb + PF_CWDLEN] = @as(u64, cl);
+        pane_keys_reset(st, @as(usize, slot));
         st[G_WINSZ + @as(usize, slot) / 2] = ws_pack(st[G_WINSZ + @as(usize, slot) / 2], slot % 2, 0, 0);
         var k : usize = 0;
         while (k < cl) {
@@ -586,16 +717,29 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         return;
     }
     if (op == OP_SETKEY) {
-        if (pane >= PROVIDER_COUNT or plen > KEY_CAP - 2) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        // the pane byte is the provider in its low nibble and the key number (0 = key 1) in the high one
+        // (keys.t27 setkey_byte): key 1 is the frame this op always had, an older client changes nothing
+        const sp : u32 = setkey_provider(pane);
+        const sk : u32 = setkey_number(pane);
+        if (sp >= PROVIDER_COUNT or sk >= MAX_KEYS or plen > KEY_CAP - 2) { reply(fd, mem, RE_ERR, 0, 0); return; }
         if (plen > 0 and !key_fits(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
-        const ka : usize = O_KEYS + @as(usize, pane) * KEY_CAP;
-        mem[ka] = @as(u8, @intCast(plen));
+        const ka : usize = key_slot(sp, sk);
+        var same : bool = plen > 0 and @as(usize, mem[ka]) == plen;
         var j : usize = 0;
         while (j < plen) {
+            if (mem[ka + 1 + j] != mem[p0 + j]) { same = false; }
             mem[ka + 1 + j] = mem[p0 + j];
             j = j + 1;
         }
-        mem[ka + 1 + plen] = 0;
+        mem[ka] = @as(u8, @intCast(plen));
+        // the rest of the slot is cleared, so a shorter or deleted key leaves none of the old one behind
+        var wp : usize = plen + 1;
+        while (wp < KEY_CAP) {
+            mem[ka + wp] = 0;
+            wp = wp + 1;
+        }
+        // the table of times and rests follows the slot; the same key sent again keeps its cooldown
+        key_put(st, sp, sk, plen > 0, same);
         reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
         return;
     }
@@ -716,6 +860,35 @@ fn serve_pane(st: []u64, mem: []u8, i: usize) -> void {
     st[base + PF_TOTAL] = ring_append(ring_of(mem, i), st[base + PF_TOTAL], mem[O_MISC + 128 .. O_MISC + 128 + 4096], @as(usize, @intCast(n)));
     st[base + PF_LAST] = now_ms(mem);
     st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), P_OUTPUT));
+    // last, because a failover starts the pane again
+    scan_pane(st, mem, i, @as(usize, @intCast(n)));
+}
+
+/// Once a tick: a restored pane that waits for a key of its provider starts when one arrived or the wait ran
+/// out (a pane that ran out starts as it always did, without a key); a restored pane that started keyless is
+/// started again, once, when its first key arrives. pty_logic holds both decisions.
+fn wait_tick(st: []u64, mem: []u8) -> void {
+    const now : u64 = now_ms(mem);
+    var i : usize = 0;
+    while (i < MAX_PANES) {
+        const base : usize = i * PF;
+        const wk : usize = G_PANEK + i * PK + PK_WAIT;
+        const ag : u32 = @as(u32, @intCast(st[base + PF_AGENT]));
+        if (st[base + PF_USED] != 0) {
+            const w : u64 = st[wk];
+            if (waiting(w)) {
+                if (restore_release(st, ag, now, st[G_START])) {
+                    st[wk] = after_wait(st, ag);
+                    launch(st, mem, i, wait_plan(w));
+                    save_pane(st, mem, i);
+                }
+            } else if (st[base + PF_LIVE] != 0 and keyless_respawn(w, st, ag)) {
+                st[wk] = W_DONE;
+                respawn_pane(st, mem, i, keyless_plan(ag, sid_of(st, mem, i)));
+            }
+        }
+        i = i + 1;
+    }
 }
 
 fn quiet_tick(st: []u64, mem: []u8) -> void {
@@ -768,6 +941,7 @@ fn restore_all(st: []u64, mem: []u8) -> u32 {
                     st[b + PF_SLOT] = f[F_SLOT];
                     st[b + PF_SIDLEN] = @as(u64, sl);
                     st[b + PF_CWDLEN] = @as(u64, cl);
+                    pane_keys_reset(st, @as(usize, i));
                     // the record's model (a v1 record has none), then the newer one the transcript names
                     mem[O_MODEL + @as(usize, i) * MODEL_CAP] = 0;
                     set_model(mem, @as(usize, i), O_TMP2 + 512 + @as(usize, @intCast(f[F_MODEL_AT])), @as(usize, @intCast(f[F_MODEL_LEN])));
@@ -777,6 +951,13 @@ fn restore_all(st: []u64, mem: []u8) -> u32 {
                     var plan : u32 = restore_plan(@as(u32, @intCast(f[F_AGENT])), @as(u32, @intCast(f[F_STATE])), sidv);
                     if (plan == R_SKIP) {
                         st[b + PF_STATUS] = @as(u64, @intCast(f[F_STATE]));
+                    } else if (restore_waits(st, @as(u32, @intCast(f[F_AGENT])))) {
+                        // the window has not sent its keys yet: a pane started now would run without the profile and
+                        // show "Not logged in". It waits for a key of its provider, or RESTORE_WAIT_MS since the
+                        // server started (wait_tick), and starts then.
+                        st[b + PF_STATUS] = @as(u64, @intCast(f[F_STATE]));
+                        st[G_PANEK + @as(usize, i) * PK + PK_WAIT] = wait_word(plan);
+                        back = back + 1;
                     } else {
                         if (launch(st, mem, @as(usize, i), plan)) { back = back + 1; }
                         save_pane(st, mem, @as(usize, i));
@@ -895,6 +1076,7 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
             }
         }
         quiet_tick(st, mem);
+        wait_tick(st, mem);
     }
 }
 
@@ -904,6 +1086,8 @@ fn run_server(st: []u64, mem: []u8) -> void {
         say("t27os-server: cannot open the socket\n");
         return;
     }
+    // the moment a restored pane starts its wait for the window's keys from (pty_logic RESTORE_WAIT_MS)
+    st[G_START] = now_ms(mem);
     const back : u32 = restore_all(st, mem);
     say("t27os-server: listening, restored ");
     var nb : [8]u8 = undefined;
@@ -961,8 +1145,11 @@ fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
             print_dec(@as(u64, out[at + 1]), mem);
             say(" state ");
             print_dec(@as(u64, out[at + 2]), mem);
+            // bits 0 to 2 of the flags byte as before; its high nibble is the key number (1 to 8) the pane holds
             say(" flags ");
-            print_dec(@as(u64, out[at + 3]), mem);
+            print_dec(@as(u64, out[at + 3] % 16), mem);
+            say(" key ");
+            if (out[at + 3] / 16 == 0) { say("-"); } else { print_dec(@as(u64, out[at + 3] / 16), mem); }
             say("\n");
             at = at + 4;
         }
@@ -1016,13 +1203,14 @@ fn run_install(st: []u64, mem: []u8) -> void {
 }
 
 pub fn main() -> void {
-    var st : [256]u64 = undefined;
-    var mem : [1149184]u8 = undefined;
+    var st : [512]u64 = undefined;
+    var mem : [1171712]u8 = undefined;
     var z : usize = 0;
     while (z < ST_SIZE) {
         st[z] = 0;
         z = z + 1;
     }
+    keys_init(st[0..ST_SIZE]);
     sys_signal(13, 1);
     st[G_HLEN] = @as(u64, env_text("HOME", mem[0 .. MEM_SIZE], O_HOME));
     var bsz : [2]u32 = undefined;
@@ -1054,5 +1242,12 @@ test the_arena_regions_do_not_overlap {
     assert O_MISC + 328 <= O_BIN;
     assert O_BIN + 256 <= O_RING;
     assert O_RING + 16 * 65536 <= O_KEYS;
-    assert O_KEYS + 9 * KEY_CAP <= MEM_SIZE;
+    // the key table holds MAX_KEYS keys for each of the PROVIDER_COUNT providers, then the screen carry rows
+    // and the scratch for a chunk's plain text; main() sizes its arrays with these two literals
+    assert O_KEYS + @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS) * KEY_CAP <= O_CARRY;
+    assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
+    assert O_SCAN + SCAN_CAP <= MEM_SIZE;
+    assert MEM_SIZE == 1171712;
+    assert ST_SIZE == 512;
+    assert CARRY_SLOT == CARRY_CAP + 4;
 }
