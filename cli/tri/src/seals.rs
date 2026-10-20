@@ -348,6 +348,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
         );
     }
     let all = match cmd {
+        SealsCmd::Changed | SealsCmd::MergeDriver { .. } => return Ok(()), // answered above
         SealsCmd::SyncTwins { dry_run } => return sync_twins(&root, &dir, *dry_run),
         SealsCmd::Fresh => {
             // The SAME order `check_seal_coverage.py::_find_t27c` uses. Only the

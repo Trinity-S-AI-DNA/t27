@@ -1,0 +1,953 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/local_dispatch.t27 -- `tri queen tick`: the Queen's dispatch as our own actors, on every machine that joins
+; Owner, 2026-10-20: "we move EVERYTHING to our actors" (epic gHashTag/t27#11377). The Railway Queen reads no priority label and
+; cannot be redeployed; this file is the rule of the dispatcher that replaces it, one tick at a time, on any Mac.
+; DRY: nothing here restates a rule that lives elsewhere. The order is priority.t27 (levels, cap, aging, outranks), the file
+; overlap is holds.t27 held_part, the lane cap is kernel.t27 agent_cap and may_spawn, the model is keys.t27 MODELS_DEFAULT, the
+; landing is golden_chain.t27 through `tri golden land` (it picks up claude/evolve-* branches). What is new: the candidates feed,
+; the Boundary reader, the claim by an atomic create on origin, the stale release, the lane command line and the brief.
+; --
+; THE HOST (cli/tri/src/main.rs, cmd_queen) is glue: it runs the commands named here as argument vectors, reads their output into
+; the text arguments below and prints what plan() returns. With --plan it stops after plan().
+; --
+; THE FEED, one record per line (the host maps the GitHub JSON with one --jq expression, fields split by a tab, a newline inside
+; the body written as byte 31): `number TAB created-epoch TAB labels,comma,separated TAB title TAB body`.
+; THE CLAIM is shared by every machine (owner, scope change 2026-10-20: a second Mac joins as a worker). Claiming issue n is
+; creating a ref on origin, which fails when it exists: `git push origin <sha>:refs/swarm/claims/<n>`. When the host refuses custom
+; refs the fallback is the branch claude/claim-<n>, created the same way. Whoever creates it owns the issue.
+; THE HEARTBEAT is `git push --force origin <sha>:refs/swarm/alive/<host>-<n>`, written by the tick while the lane's log moves.
+; A lane silent for LANE_SILENT_S seconds (log, heartbeat and start all older) loses its claim: the ref is deleted on origin.
+; THE LANE branch is claude/evolve-lane-<n>-<host>, pushed to origin when the lane is done, so the trigit host lands it.
+; HONEST LIMITS. (1) An open blocker is not read (priority.t27 eligible is asked with 0). (2) A region `path :: fn NAME` is compared
+; by name: two issues on one file with different names are apart; resolving names to lines is issue_shape.t27's job at merge.
+; (3) The pane title is not settable by the spawn verbs of pty_server.t27 (agent, cwd, model only): the lane is visible in the
+; LANES sidebar through its directory and .lane.log (lanes_view.t27). (4) At most CAND_MAX records per feed.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenLocalDispatch;
+
+use queen::priority::LEVEL_NORMAL;
+use queen::priority::CRITICAL_LABELS;
+use queen::priority::HIGH_LABELS;
+use queen::priority::NORMAL_LABELS;
+use queen::priority::LOW_LABELS;
+use queen::priority::capped_level;
+use queen::priority::effective_level;
+use queen::priority::outranks;
+use queen::priority::eligible;
+use queen::holds::held_part;
+use queen::holds::HP_APART;
+use t27os::kernel::agent_cap;
+use t27os::kernel::spawn_hold;
+use t27os::kernel::may_spawn;
+use t27os::kernel::H_NONE;
+use t27os::keys::tier_model;
+use t27os::keys::PR_ZAI;
+use t27os::keys::TI_DEFAULT;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+pub const CAND_MAX : usize = 64;
+pub const LANE_SILENT_S : u64 = 1800;
+pub const ZAI_KEYS : u32 = 7;
+pub const NO_LEVEL : u8 = 255;
+pub const BRIEF_BODY_MAX : usize = 12000;
+pub const ZERO_OID : str = "0000000000000000000000000000000000000000";
+pub const CLAIM_REF : str = "refs/swarm/claims/";
+pub const CLAIM_BRANCH : str = "claude/claim-";
+pub const ALIVE_REF : str = "refs/swarm/alive/";
+pub const LANE_ROOT : str = "/tmp/claude-501/lane-";
+
+// ---- text helpers ----
+
+pub fn is_nl(c: u8) -> bool {
+    return c == 10 or c == 31;
+}
+
+pub fn at_is(s: []const u8, i: usize, lit: []const u8) -> bool {
+    if (i + lit.len > s.len) { return false; }
+    var k : usize = 0;
+    while (k < lit.len) {
+        if (s[i + k] != lit[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn contains(s: []const u8, lit: []const u8) -> bool {
+    var i : usize = 0;
+    while (i + lit.len <= s.len) {
+        if (at_is(s, i, lit)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn is_digit(c: u8) -> bool {
+    return c >= 48 and c <= 57;
+}
+
+pub fn is_word(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or c == 45;
+}
+
+/// Decimal at s[a..b], 0 when there is a non-digit.
+pub fn uint_of(s: []const u8, a: usize, b: usize) -> u64 {
+    if (b <= a) { return 0; }
+    var v : u64 = 0;
+    var i : usize = a;
+    while (i < b) {
+        if (is_digit(s[i]) == false) { return 0; }
+        v = v * 10 + ((s[i] - 48) as u64);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Where field k of the tab-split record s[a..b] starts; b when there is no such field.
+pub fn field_start(s: []const u8, a: usize, b: usize, k: u32) -> usize {
+    var i : usize = a;
+    var f : u32 = 0;
+    while (f < k) {
+        while (i < b and s[i] != 9) { i = i + 1; }
+        if (i >= b) { return b; }
+        i = i + 1;
+        f = f + 1;
+    }
+    return i;
+}
+
+/// Where that field ends: at the next tab, or at b for the last one.
+pub fn field_end(s: []const u8, a: usize, b: usize, k: u32) -> usize {
+    var i : usize = field_start(s, a, b, k);
+    while (i < b and s[i] != 9) { i = i + 1; }
+    return i;
+}
+
+// ---- 1. the Boundary: paths and regions ----
+
+fn heading_is_boundary(s: []const u8, j: usize) -> bool {
+    return at_is(s, j, "## Boundary");
+}
+
+/// Append one Boundary item (`path`, or `path :: fn NAME`) found in s[a..e) as `path` or `path::NAME` plus a newline; returns the
+/// new length of out. An item with no '/' and no '.' in its path (`- none`) is not a path and adds nothing.
+pub fn put_item(s: []const u8, a: usize, e: usize, out: []u8, n0: usize, lim: usize) -> usize {
+    var i : usize = a;
+    while (i < e and (s[i] == 32 or s[i] == 96)) { i = i + 1; }
+    var p : usize = i;
+    var dotted : bool = false;
+    while (p < e and s[p] != 32 and s[p] != 96) {
+        if (s[p] == 47 or s[p] == 46) { dotted = true; }
+        p = p + 1;
+    }
+    if (p == i or dotted == false) { return n0; }
+    var name_a : usize = e;
+    var name_b : usize = e;
+    var q : usize = p;
+    while (q + 1 < e) {
+        if (s[q] == 58 and s[q + 1] == 58) {
+            q = q + 2;
+            while (q < e and s[q] == 32) { q = q + 1; }
+            if (at_is(s, q, "fn ")) { q = q + 3; }
+            while (q < e and s[q] == 32) { q = q + 1; }
+            name_a = q;
+            while (q < e and is_word(s[q])) { q = q + 1; }
+            name_b = q;
+            q = e;
+        } else {
+            q = q + 1;
+        }
+    }
+    const need : usize = (p - i) + (name_b - name_a) + 3;
+    if (n0 + need > lim) { return n0; }
+    var n : usize = put_bytes(out, n0, s[i..p]);
+    if (name_b > name_a) {
+        n = put_bytes(out, n, "::");
+        n = put_bytes(out, n, s[name_a..name_b]);
+    }
+    out[n] = 10;
+    return n + 1;
+}
+
+/// The Boundary of an issue body s[a..b): one path (or path::NAME) per line, in order. Only the lines `- ...` under the heading
+/// `## Boundary`, up to the next heading of any level.
+pub fn boundary_paths(s: []const u8, a: usize, b: usize, out: []u8, at: usize, lim: usize) -> usize {
+    var n : usize = at;
+    var inb : bool = false;
+    var i : usize = a;
+    while (i < b) {
+        var e : usize = i;
+        while (e < b and is_nl(s[e]) == false) { e = e + 1; }
+        var j : usize = i;
+        while (j < e and s[j] == 32) { j = j + 1; }
+        if (j < e and s[j] == 35) {
+            inb = heading_is_boundary(s, j);
+        } else {
+            if (inb and j + 1 < e and s[j] == 45 and s[j + 1] == 32) {
+                n = put_item(s, j + 2, e, out, n, lim);
+            }
+        }
+        i = e + 1;
+    }
+    return n - at;
+}
+
+// ---- 2. overlap: do two sets of paths meet? ----
+
+/// One line of a path set: s[from..) up to the newline; returns its end.
+fn line_end(s: []const u8, from: usize) -> usize {
+    var e : usize = from;
+    while (e < s.len and s[e] != 10) { e = e + 1; }
+    return e;
+}
+
+/// Where the path of the line s[a..e) ends: before "::" or at e.
+fn path_stop(s: []const u8, a: usize, e: usize) -> usize {
+    var q : usize = a;
+    while (q + 1 < e) {
+        if (s[q] == 58 and s[q + 1] == 58) { return q; }
+        q = q + 1;
+    }
+    return e;
+}
+
+/// Do two lines `path` / `path::NAME` meet. Paths that are apart never meet (holds.t27 held_part: a path and a path under it meet).
+/// The same file with two different region names is apart; with no name on either side the whole file is meant, and they meet.
+pub fn lines_meet(x: []const u8, xa: usize, xe: usize, y: []const u8, ya: usize, ye: usize) -> bool {
+    const xp : usize = path_stop(x, xa, xe);
+    const yp : usize = path_stop(y, ya, ye);
+    if (held_part(x[xa..xp], xp - xa, y[ya..yp], yp - ya) == HP_APART) { return false; }
+    if (xp - xa != yp - ya) { return true; }
+    if (xp == xe or yp == ye) { return true; }
+    if (xe - xp != ye - yp) { return false; }
+    var k : usize = xp;
+    while (k < xe) {
+        if (x[k] != y[k - xp + yp]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn sets_meet(x: []const u8, y: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < x.len) {
+        const ie : usize = line_end(x, i);
+        var j : usize = 0;
+        while (j < y.len) {
+            const je : usize = line_end(y, j);
+            if (ie > i and je > j and lines_meet(x, i, ie, y, j, je)) { return true; }
+            j = je + 1;
+        }
+        i = ie + 1;
+    }
+    return false;
+}
+
+// ---- 3. claims, lanes and refs ----
+
+/// Is `<tag><n>` in text, followed by a newline or the end: "claims/12" in a ref listing, "lane-12" in a directory listing.
+pub fn has_tagged(text: []const u8, tag: []const u8, n: u64) -> bool {
+    var digits : usize = 1;
+    var t : u64 = n;
+    while (t >= 10) {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    var i : usize = 0;
+    while (i < text.len) {
+        if (at_is(text, i, tag)) {
+            const a : usize = i + tag.len;
+            if (a + digits <= text.len and uint_of(text, a, a + digits) == n) {
+                const z : usize = a + digits;
+                if (z >= text.len or text[z] == 10 or text[z] == 32 or text[z] == 9) { return true; }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Is issue n claimed on origin: by the ref refs/swarm/claims/<n> or by the fallback branch claude/claim-<n> (ls-remote text).
+pub fn claimed(refs: []const u8, n: u64) -> bool {
+    return has_tagged(refs, "refs/swarm/claims/", n) or has_tagged(refs, "refs/heads/claude/claim-", n);
+}
+
+/// The outcome of one claim attempt, from the exit code and the text git printed.
+pub const CL_WON : u8 = 0;
+pub const CL_LOST : u8 = 1;
+pub const CL_REFUSED : u8 = 2;
+pub const CL_ERROR : u8 = 3;
+
+/// A push that creates a new ref: exit 0 won it; "already exists" or a rejected push says someone made it first; a host that
+/// declines custom refs ("deny", "hook declined", "refusing", "invalid refspec") is REFUSED and the branch fallback is tried;
+/// anything else (network, auth) is an ERROR, never read as a win.
+pub fn claim_outcome(exit: u32, said: []const u8) -> u8 {
+    if (exit == 0) { return CL_WON; }
+    if (contains(said, "already exists") or contains(said, "[rejected]") or contains(said, "stale info")) { return CL_LOST; }
+    if (contains(said, "deny") or contains(said, "hook declined") or contains(said, "refusing") or contains(said, "invalid refspec")) { return CL_REFUSED; }
+    return CL_ERROR;
+}
+
+/// What to do after the first attempt (ref) and, if it was refused, the second (branch).
+pub fn claim_final(first: u8, second: u8) -> u8 {
+    if (first == CL_REFUSED) { return second; }
+    return first;
+}
+
+pub fn claim_may_go_on(c: u8) -> bool {
+    return c == CL_WON;
+}
+
+/// A lane silent for LANE_SILENT_S: its newest sign of life (log write, heartbeat, start) is that old. A time the host could not
+/// read is 0 and never counts as a sign.
+pub fn lane_silent(now: u64, started: u64, log_mtime: u64, alive: u64) -> bool {
+    var last : u64 = started;
+    if (log_mtime > last) { last = log_mtime; }
+    if (alive > last) { last = alive; }
+    if (last == 0) { return false; }
+    if (now < last) { return false; }
+    return now - last >= LANE_SILENT_S;
+}
+
+/// The lanes whose claim is released: rows `n TAB started TAB log_mtime TAB alive TAB state` (state R running, D done, B blocked).
+/// A running lane that is silent loses its claim; a BLOCKED one too (its directory stays for a person to read); a done one keeps it
+/// (its branch is with trigit). Writes `RELEASE|n` lines.
+pub fn release_plan(rows: []const u8, now: u64, out: []u8) -> usize {
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < rows.len) {
+        const e : usize = line_end(rows, i);
+        if (e > i) {
+            const n : u64 = uint_of(rows, field_start(rows, i, e, 0), field_end(rows, i, e, 0));
+            const st : u64 = uint_of(rows, field_start(rows, i, e, 1), field_end(rows, i, e, 1));
+            const lg : u64 = uint_of(rows, field_start(rows, i, e, 2), field_end(rows, i, e, 2));
+            const al : u64 = uint_of(rows, field_start(rows, i, e, 3), field_end(rows, i, e, 3));
+            const sa : usize = field_start(rows, i, e, 4);
+            var state : u8 = 82;
+            if (sa < e) { state = rows[sa]; }
+            var rel : bool = false;
+            if (state == 82 and lane_silent(now, st, lg, al)) { rel = true; }
+            if (state == 66) { rel = true; }
+            if (rel and n > 0) {
+                w = put_bytes(out, w, "RELEASE|");
+                w = put_dec(out, w, n);
+                out[w] = 10;
+                w = w + 1;
+            }
+        }
+        i = e + 1;
+    }
+    return w;
+}
+
+// ---- 4. names and command lines (each an argument vector, one argument per line) ----
+
+/// A host name as a ref component: letters, digits and '-', anything else '-'; at most 24 bytes; "host" when empty.
+pub fn host_name(raw: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < raw.len and n < 24) {
+        const c : u8 = raw[i];
+        if (c == 10 or c == 13) {
+            i = raw.len;
+        } else {
+            if ((c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45) { out[n] = c; } else { out[n] = 45; }
+            n = n + 1;
+            i = i + 1;
+        }
+    }
+    if (n == 0) { return put_bytes(out, 0, "host"); }
+    return n;
+}
+
+/// claude/evolve-lane-<n>-<host>: the branch of a lane; trigit lands claude/evolve-* from origin.
+pub fn lane_branch(n: u64, host: []const u8, out: []u8, at: usize) -> usize {
+    var w : usize = put_bytes(out, at, "claude/evolve-lane-");
+    w = put_dec(out, w, n);
+    w = put_bytes(out, w, "-");
+    return put_bytes(out, w, host);
+}
+
+/// The lane directory /tmp/claude-501/lane-<n> (lanes_view.t27 reads exactly this name).
+pub fn lane_dir(n: u64, out: []u8) -> usize {
+    const w : usize = put_bytes(out, 0, "/tmp/claude-501/lane-");
+    return put_dec(out, w, n);
+}
+
+/// The claim push: git push origin <sha>:refs/swarm/claims/<n> (branch: the fallback ref claude/claim-<n>).
+pub fn claim_argv(n: u64, sha: []const u8, branch: bool, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "git\npush\norigin\n");
+    w = put_bytes(out, w, sha);
+    if (branch) { w = put_bytes(out, w, ":refs/heads/claude/claim-"); } else { w = put_bytes(out, w, ":refs/swarm/claims/"); }
+    return put_dec(out, w, n);
+}
+
+/// The release: git push origin --delete <ref> (both forms; the one that does not exist is an error the host ignores).
+pub fn release_argv(n: u64, branch: bool, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "git\npush\norigin\n--delete\n");
+    if (branch) { w = put_bytes(out, w, "refs/heads/claude/claim-"); } else { w = put_bytes(out, w, "refs/swarm/claims/"); }
+    return put_dec(out, w, n);
+}
+
+/// The heartbeat: git push --force origin <sha>:refs/swarm/alive/<host>-<n>.
+pub fn alive_argv(n: u64, host: []const u8, sha: []const u8, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "git\npush\n--force\norigin\n");
+    w = put_bytes(out, w, sha);
+    w = put_bytes(out, w, ":refs/swarm/alive/");
+    w = put_bytes(out, w, host);
+    w = put_bytes(out, w, "-");
+    return put_dec(out, w, n);
+}
+
+/// The lane worktree: git worktree add --no-track -b <branch> <dir> origin/master.
+pub fn worktree_argv(n: u64, host: []const u8, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "git\nworktree\nadd\n--no-track\n-b\n");
+    w = lane_branch(n, host, out, w);
+    w = put_bytes(out, w, "\n");
+    w = put_bytes(out, w, "/tmp/claude-501/lane-");
+    w = put_dec(out, w, n);
+    return put_bytes(out, w, "\norigin/master");
+}
+
+/// The push of a finished lane: git push origin <branch>.
+pub fn push_argv(n: u64, host: []const u8, out: []u8) -> usize {
+    const w : usize = put_bytes(out, 0, "git\npush\norigin\n");
+    return lane_branch(n, host, out, w);
+}
+
+/// The Keychain account of the key lane n takes: "zai" for key 1, "zai#k" after (keys.t27 KEYCHAIN_SERVICE ai.t27.os), by rotation.
+pub fn zai_account(n: u64, out: []u8, at: usize) -> usize {
+    const k : u64 = (n % (ZAI_KEYS as u64)) + 1;
+    var w : usize = put_bytes(out, at, "zai");
+    if (k > 1) {
+        w = put_bytes(out, w, "#");
+        w = put_dec(out, w, k);
+    }
+    return w;
+}
+
+/// The model of a lane: the first model of the free z.ai tier (keys.t27 MODELS_DEFAULT), glm-4.5-flash.
+pub fn lane_model(out: []u8) -> usize {
+    return tier_model(PR_ZAI, TI_DEFAULT, out);
+}
+
+/// The line a pane (or a detached shell) runs in the lane directory: claude on the free z.ai tier, the model keys.t27 names first
+/// (glm-4.5-flash), the key read from the Keychain inside the line (it is never printed), the log appended, then the marker
+/// lanes_view.t27 reads. Permission mode acceptEdits with an allowlist of t27b, t27c and git add / commit.
+pub fn lane_cmd(n: u64, model: []const u8, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=\"$(security find-generic-password -s ai.t27.os -a '");
+    w = zai_account(n, out, w);
+    w = put_bytes(out, w, "' -w 2>/dev/null || security find-generic-password -s ai.t27.os -a zai -w)\" ANTHROPIC_MODEL=");
+    w = put_bytes(out, w, model);
+    w = put_bytes(out, w, " ANTHROPIC_SMALL_FAST_MODEL=");
+    w = put_bytes(out, w, model);
+    w = put_bytes(out, w, " claude -p \"$(cat .lane_brief.md)\" --permission-mode acceptEdits --allowedTools 'Bash(t27b:*)' 'Bash(t27c:*)' 'Bash(git add:*)' 'Bash(git commit:*)' 'Bash(git status:*)' 'Bash(git diff:*)' 'Bash(ls:*)' 'Bash(grep:*)' >> .lane.log 2>&1; echo LANE-DONE exit=$? >> .lane.log");
+    return w;
+}
+
+// ---- 5. the brief ----
+
+/// .lane_brief.md: the issue and the rules of a lane. The body's byte 31 is a newline again.
+pub fn brief(n: u64, title: []const u8, body: []const u8, host: []const u8, out: []u8) -> usize {
+    var w : usize = put_bytes(out, 0, "# Lane for issue #");
+    w = put_dec(out, w, n);
+    w = put_bytes(out, w, ": ");
+    w = put_bytes(out, w, title);
+    w = put_bytes(out, w, "\n\nYou are one lane of the t27 swarm, started by `tri queen tick`. Work only in this directory (a git worktree on branch ");
+    w = lane_branch(n, host, out, w);
+    w = put_bytes(out, w, ").\n\nRULES\n- Read CLAUDE.md and AGENTS.md first. Logic is written in .t27 specs with tests (L4); no hand-written code in other languages.\n- Edit ONLY the paths of the Boundary below. Never edit gen/ by hand (L2). ASCII only (L3).\n- Test with `t27b test <spec>` (or `t27c test`); the tests must pass and not be vacuous.\n- Commit once: `git add` the files, then `git commit -m \"<what> (Closes #");
+    w = put_dec(out, w, n);
+    w = put_bytes(out, w, ")\"` with the trailer line `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.\n- Do not push and do not open a pull request: trigit lands the branch. Do not use gh.\n- If you cannot finish, commit nothing and say why in one line.\n\n# Issue\n\n");
+    var cap : usize = body.len;
+    if (cap > BRIEF_BODY_MAX) { cap = BRIEF_BODY_MAX; }
+    var i : usize = 0;
+    while (i < cap and w < out.len) {
+        if (body[i] == 31) { out[w] = 10; } else { out[w] = body[i]; }
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+// ---- 6. this machine: slots ----
+
+/// "Pages free", "Pages inactive" and "Pages speculative" (all reclaimable) of `vm_stat`, in bytes; 0 when the text is not vm_stat's (the cap then falls to 1).
+pub fn vm_free_bytes(text: []const u8) -> u64 {
+    var psz : u64 = 16384;
+    var i : usize = 0;
+    var pages : u64 = 0;
+    while (i < text.len) {
+        if (at_is(text, i, "page size of ")) {
+            var j : usize = i + 13;
+            var v : u64 = 0;
+            while (j < text.len and is_digit(text[j])) { v = v * 10 + ((text[j] - 48) as u64); j = j + 1; }
+            if (v > 0) { psz = v; }
+        }
+        if (at_is(text, i, "Pages free:") or at_is(text, i, "Pages inactive:") or at_is(text, i, "Pages speculative:")) {
+            var j : usize = i;
+            while (j < text.len and text[j] != 58) { j = j + 1; }
+            j = j + 1;
+            while (j < text.len and text[j] == 32) { j = j + 1; }
+            var v : u64 = 0;
+            while (j < text.len and is_digit(text[j])) { v = v * 10 + ((text[j] - 48) as u64); j = j + 1; }
+            pages = pages + v;
+        }
+        i = i + 1;
+    }
+    return pages * psz;
+}
+
+/// The first number of `sysctl -n vm.loadavg` ("{ 1.52 1.70 1.80 }") times 100; 0 when unreadable.
+pub fn load1x100(text: []const u8) -> u32 {
+    var i : usize = 0;
+    while (i < text.len and is_digit(text[i]) == false) { i = i + 1; }
+    var whole : u32 = 0;
+    while (i < text.len and is_digit(text[i])) { whole = whole * 10 + ((text[i] - 48) as u32); i = i + 1; }
+    var frac : u32 = 0;
+    if (i < text.len and text[i] == 46) {
+        i = i + 1;
+        if (i < text.len and is_digit(text[i])) { frac = ((text[i] - 48) as u32) * 10; i = i + 1; }
+        if (i < text.len and is_digit(text[i])) { frac = frac + ((text[i] - 48) as u32); }
+    }
+    return whole * 100 + frac;
+}
+
+/// How many new lanes this tick may start: the kernel cap of this machine minus the running lanes (hold: memory or load), then
+/// `want` (0 = no more limit than the cap).
+pub fn tick_slots(mem_bytes: u64, vm_text: []const u8, ncpu: u32, load_text: []const u8, batt_text: []const u8, running: u32, want: u32) -> u32 {
+    const free : u64 = vm_free_bytes(vm_text);
+    const cap : u32 = agent_cap(mem_bytes, free, ncpu, load1x100(load_text), contains(batt_text, "Battery Power"));
+    const hold : u32 = spawn_hold((free / 1048576) as u32, ncpu, load1x100(load_text));
+    if (may_spawn(cap, running, hold) == false) { return 0; }
+    var room : u32 = cap - running;
+    if (want > 0 and want < room) { room = want; }
+    return room;
+}
+
+pub fn cap_of(mem_bytes: u64, vm_text: []const u8, ncpu: u32, load_text: []const u8, batt_text: []const u8) -> u32 {
+    return agent_cap(mem_bytes, vm_free_bytes(vm_text), ncpu, load1x100(load_text), contains(batt_text, "Battery Power"));
+}
+
+// ---- 7. the order ----
+
+/// The level of a labels list (comma separated) by priority.t27's vocabulary; the more urgent label counts. NO_LEVEL when none.
+pub fn label_level(labels: []const u8) -> u8 {
+    var best : u8 = NO_LEVEL;
+    var i : usize = 0;
+    while (i <= labels.len) {
+        var e : usize = i;
+        while (e < labels.len and labels[e] != 44) { e = e + 1; }
+        if (e > i) {
+            var lv : u8 = NO_LEVEL;
+            if (csv_has(CRITICAL_LABELS, labels[i..e])) { lv = 0; }
+            else { if (csv_has(HIGH_LABELS, labels[i..e])) { lv = 1; }
+            else { if (csv_has(NORMAL_LABELS, labels[i..e])) { lv = 2; }
+            else { if (csv_has(LOW_LABELS, labels[i..e])) { lv = 3; } } } }
+            if (lv < best) { best = lv; }
+        }
+        i = e + 1;
+    }
+    return best;
+}
+
+pub fn csv_has(csv: []const u8, tok: []const u8) -> bool {
+    var i : usize = 0;
+    while (i <= csv.len) {
+        var e : usize = i;
+        while (e < csv.len and csv[e] != 44) { e = e + 1; }
+        if (e - i == tok.len and at_is(csv, i, tok)) { return true; }
+        i = e + 1;
+    }
+    return false;
+}
+
+fn put_clean(out: []u8, at: usize, s: []const u8) -> usize {
+    var w : usize = at;
+    var i : usize = 0;
+    while (i < s.len and w < out.len) {
+        if (s[i] == 124 or s[i] < 32) { out[w] = 32; } else { out[w] = s[i]; }
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+/// The plan of one tick. Reads the feed, orders it by priority.t27, and walks that order: a claimed issue, one whose lane directory
+/// exists, one without a Boundary path, one whose paths meet a running lane's (`held`) or an earlier pick, is skipped with its
+/// reason; the first `slots` of the rest are picked. Lines out:
+///   PICK|n|why|title|path,path      SKIP|n|claimed|lane dir|no boundary|held|full|blocked
+/// refs: ls-remote text of origin's claims; dirs: the lane directories present (one per line, `lane-<n>`); held: the Boundary paths
+/// of the lanes running here (one per line). Scratch from the host: ws holds 6 tables of CAND_MAX words (start, end, number, level,
+/// effective level, done); sc is 5120 bytes (a Boundary of at most 1024, the picked paths of at most 4096).
+pub fn plan(feed: []const u8, now: u64, refs: []const u8, dirs: []const u8, held: []const u8, slots: u32, out: []u8, ws: []u64, sc: []u8) -> usize {
+    var m : usize = 0;
+    var crit : u32 = 0;
+    var i : usize = 0;
+    while (i < feed.len and m < CAND_MAX) {
+        const e : usize = line_end2(feed, i);
+        if (e > i) {
+            const n : u64 = uint_of(feed, field_start(feed, i, e, 0), field_end(feed, i, e, 0));
+            const created : u64 = uint_of(feed, field_start(feed, i, e, 1), field_end(feed, i, e, 1));
+            var dup : bool = false;
+            var k : usize = 0;
+            while (k < m) { if (ws[2 * CAND_MAX + k] == n) { dup = true; } k = k + 1; }
+            if (n > 0 and dup == false) {
+                var base : u8 = label_level(feed[field_start(feed, i, e, 2)..field_end(feed, i, e, 2)]);
+                const labelled : bool = base != NO_LEVEL;
+                if (labelled == false) { base = LEVEL_NORMAL; }
+                const capped : u8 = capped_level(base, crit);
+                if (base == 0) { crit = crit + 1; }
+                var age : u32 = 0;
+                if (now > created and created > 0) { age = ((now - created) / 86400) as u32; }
+                ws[m] = i as u64;
+                ws[CAND_MAX + m] = e as u64;
+                ws[2 * CAND_MAX + m] = n;
+                ws[3 * CAND_MAX + m] = capped as u64;
+                ws[4 * CAND_MAX + m] = effective_level(capped, labelled, age) as u64;
+                ws[5 * CAND_MAX + m] = 0;
+                m = m + 1;
+            }
+        }
+        i = e + 1;
+    }
+    var w : usize = 0;
+    var pn : usize = 0;
+    var taken : u32 = 0;
+    var step : usize = 0;
+    while (step < m) {
+        var best : usize = m;
+        var c : usize = 0;
+        while (c < m) {
+            if (ws[5 * CAND_MAX + c] == 0) {
+                if (best == m) { best = c; }
+                else {
+                    if (outranks(ws[4 * CAND_MAX + c] as u8, ws[3 * CAND_MAX + c] as u8, c as u32, ws[4 * CAND_MAX + best] as u8, ws[3 * CAND_MAX + best] as u8, best as u32)) { best = c; }
+                }
+            }
+            c = c + 1;
+        }
+        ws[5 * CAND_MAX + best] = 1;
+        const a : usize = ws[best] as usize;
+        const b : usize = ws[CAND_MAX + best] as usize;
+        const num : u64 = ws[2 * CAND_MAX + best];
+        const pl : usize = boundary_paths(feed, field_start(feed, a, b, 4), b, sc, 0, 1024);
+        var reason : u32 = 0;
+        if (eligible(0) == false) { reason = 9; }
+        else { if (claimed(refs, num)) { reason = 1; }
+        else { if (has_tagged(dirs, "lane-", num)) { reason = 2; }
+        else { if (pl == 0) { reason = 3; }
+        else { if (sets_meet(sc[0..pl], held) or sets_meet(sc[0..pl], sc[1024..1024 + pn])) { reason = 4; }
+        else { if (taken >= slots) { reason = 5; } } } } } }
+        if (reason == 0) {
+            w = put_bytes(out, w, "PICK|");
+            w = put_dec(out, w, num);
+            w = put_bytes(out, w, "|");
+            if (ws[3 * CAND_MAX + best] != ws[4 * CAND_MAX + best]) { w = put_bytes(out, w, "aged"); }
+            else {
+                if (label_level(feed[field_start(feed, a, b, 2)..field_end(feed, a, b, 2)]) != NO_LEVEL) { w = put_bytes(out, w, "label"); }
+                else { w = put_bytes(out, w, "listing"); }
+            }
+            w = put_bytes(out, w, "|");
+            w = put_clean(out, w, feed[field_start(feed, a, b, 3)..field_end(feed, a, b, 3)]);
+            w = put_bytes(out, w, "|");
+            var q : usize = 0;
+            while (q < pl) {
+                if (sc[q] == 10) {
+                    if (q + 1 < pl) { out[w] = 44; w = w + 1; }
+                } else {
+                    out[w] = sc[q];
+                    w = w + 1;
+                }
+                q = q + 1;
+            }
+            out[w] = 10;
+            w = w + 1;
+            if (pn + pl <= 4096) {
+                var z : usize = 0;
+                while (z < pl) { sc[1024 + pn + z] = sc[z]; z = z + 1; }
+                pn = pn + pl;
+            }
+            taken = taken + 1;
+        } else {
+            w = put_bytes(out, w, "SKIP|");
+            w = put_dec(out, w, num);
+            w = put_bytes(out, w, "|");
+            if (reason == 1) { w = put_bytes(out, w, "claimed"); }
+            if (reason == 2) { w = put_bytes(out, w, "lane dir"); }
+            if (reason == 3) { w = put_bytes(out, w, "no boundary"); }
+            if (reason == 4) { w = put_bytes(out, w, "held"); }
+            if (reason == 5) { w = put_bytes(out, w, "full"); }
+            if (reason == 9) { w = put_bytes(out, w, "blocked"); }
+            out[w] = 10;
+            w = w + 1;
+        }
+        step = step + 1;
+    }
+    return w;
+}
+
+fn line_end2(s: []const u8, from: usize) -> usize {
+    var e : usize = from;
+    while (e < s.len and s[e] != 10) { e = e + 1; }
+    return e;
+}
+
+// ---- tests ----
+
+test the_lane_model_is_the_free_tier_default {
+    var o : [64]u8 = undefined;
+    const n : usize = lane_model(o[0..64]);
+    assert at_is(o[0..n], 0, "glm-4.5-flash");
+    assert n == 13;
+}
+
+// ---- tests ----
+
+const FEED_ONE : str = "11335\t1760918400\tP1\tT27 OS idle cpu\tPart of epic.\n\n## Boundary\n- specs/t27os/frame_gate.t27\n\n## User Scenarios\n- x\n";
+
+test boundary_reads_paths_and_regions_under_the_heading_only {
+    const b : str = "intro\n## Boundary\n- `specs/a/x.t27`\n- specs/b/y.t27 :: fn do_it\n- none\n\n## Requirements\n- `specs/not/this.t27`\n";
+    var o : [256]u8 = undefined;
+    const n : usize = boundary_paths(b, 0, b.len, o[0..256], 0, 256);
+    assert at_is(o[0..n], 0, "specs/a/x.t27\nspecs/b/y.t27::do_it\n");
+    assert n == 35;
+}
+
+test an_issue_without_a_boundary_has_no_paths {
+    const b : str = "## Requirements\n- `specs/x.t27`\n";
+    var o : [64]u8 = undefined;
+    assert boundary_paths(b, 0, b.len, o[0..64], 0, 64) == 0;
+}
+
+test the_body_newline_byte_31_also_ends_a_line {
+    var b : [40]u8 = undefined;
+    const t : usize = put_bytes(b[0..40], 0, "## Boundary");
+    b[t] = 31;
+    const u : usize = put_bytes(b[0..40], t + 1, "- a/b.t27");
+    var o : [64]u8 = undefined;
+    assert boundary_paths(b[0..u], 0, u, o[0..64], 0, 64) == 8;
+}
+
+test overlap_follows_holds_and_regions {
+    assert sets_meet("specs/a/x.t27\n", "specs/a/x.t27\n");
+    assert sets_meet("specs/a\n", "specs/a/x.t27\n");
+    assert sets_meet("specs/a/x.t27\n", "specs/b/x.t27\n") == false;
+    assert sets_meet("specs/a/x.t27::f\n", "specs/a/x.t27::g\n") == false;
+    assert sets_meet("specs/a/x.t27::f\n", "specs/a/x.t27::f\n");
+    assert sets_meet("specs/a/x.t27::f\n", "specs/a/x.t27\n");
+    assert sets_meet("specs/ab/x.t27\n", "specs/a\n") == false;
+    assert sets_meet("specs/a/x.t27\n", "") == false;
+}
+
+test claims_are_read_from_both_ref_forms {
+    const r : str = "abc\trefs/swarm/claims/12\ndef\trefs/heads/claude/claim-77\n";
+    assert claimed(r, 12);
+    assert claimed(r, 77);
+    assert claimed(r, 1) == false;
+    assert claimed(r, 7) == false;
+    assert claimed("", 12) == false;
+}
+
+test claim_outcome_codes_win_lose_refuse_error {
+    assert claim_outcome(0, "") == CL_WON;
+    assert claim_outcome(1, "! [remote rejected] x -> refs/swarm/claims/5 (already exists)") == CL_LOST;
+    assert claim_outcome(1, "error: failed to push some refs ... [rejected]") == CL_LOST;
+    assert claim_outcome(1, "remote: error: refusing to create ref") == CL_REFUSED;
+    assert claim_outcome(1, "remote: hook declined") == CL_REFUSED;
+    assert claim_outcome(128, "fatal: unable to access: Could not resolve host") == CL_ERROR;
+}
+
+test the_branch_fallback_decides_only_when_the_ref_was_refused {
+    assert claim_final(CL_WON, CL_LOST) == CL_WON;
+    assert claim_final(CL_LOST, CL_WON) == CL_LOST;
+    assert claim_final(CL_REFUSED, CL_WON) == CL_WON;
+    assert claim_final(CL_REFUSED, CL_LOST) == CL_LOST;
+    assert claim_final(CL_ERROR, CL_WON) == CL_ERROR;
+    assert claim_may_go_on(CL_WON);
+    assert claim_may_go_on(CL_ERROR) == false;
+}
+
+test distributed_claim_race_has_one_winner {
+    // two Macs push the same new ref: git on origin accepts the first and says "already exists" to the second
+    const mac_a : u8 = claim_outcome(0, "");
+    const mac_b : u8 = claim_outcome(1, "remote: error: reference already exists");
+    assert claim_may_go_on(mac_a);
+    assert claim_may_go_on(mac_b) == false;
+    assert mac_b == CL_LOST;
+}
+
+test claim_command_lines {
+    var o : [200]u8 = undefined;
+    var n : usize = claim_argv(11335, "abc123", false, o[0..200]);
+    assert at_is(o[0..n], 0, "git\npush\norigin\nabc123:refs/swarm/claims/11335");
+    assert n == 46;
+    n = claim_argv(9, "abc123", true, o[0..200]);
+    assert at_is(o[0..n], 0, "git\npush\norigin\nabc123:refs/heads/claude/claim-9");
+    n = release_argv(9, false, o[0..200]);
+    assert at_is(o[0..n], 0, "git\npush\norigin\n--delete\nrefs/swarm/claims/9");
+    n = alive_argv(9, "mac-b", "abc123", o[0..200]);
+    assert at_is(o[0..n], 0, "git\npush\n--force\norigin\nabc123:refs/swarm/alive/mac-b-9");
+    n = push_argv(9, "mac-b", o[0..200]);
+    assert at_is(o[0..n], 0, "git\npush\norigin\nclaude/evolve-lane-9-mac-b");
+    n = worktree_argv(9, "mac-b", o[0..200]);
+    assert at_is(o[0..n], 0, "git\nworktree\nadd\n--no-track\n-b\nclaude/evolve-lane-9-mac-b\n/tmp/claude-501/lane-9\norigin/master");
+}
+
+test the_host_name_is_a_safe_ref_component {
+    var o : [32]u8 = undefined;
+    var n : usize = host_name("Mac Book_2\n", o[0..32]);
+    assert at_is(o[0..n], 0, "Mac-Book-2");
+    assert n == 10;
+    n = host_name("", o[0..32]);
+    assert at_is(o[0..n], 0, "host");
+    n = host_name("a/b..c", o[0..32]);
+    assert at_is(o[0..n], 0, "a-b--c");
+}
+
+test a_silent_lane_loses_its_claim {
+    assert lane_silent(10000, 1000, 1000, 0) == true;
+    assert lane_silent(2500, 1000, 1000, 0) == false;
+    // the log moved 100 s ago: alive
+    assert lane_silent(10000, 1000, 9900, 0) == false;
+    // a heartbeat from another machine counts
+    assert lane_silent(10000, 1000, 1000, 9000) == false;
+    // exactly the limit
+    assert lane_silent(2800, 1000, 1000, 0) == true;
+    assert lane_silent(2799, 1000, 1000, 0) == false;
+    // nothing read: never a verdict
+    assert lane_silent(10000, 0, 0, 0) == false;
+}
+
+test release_plan_frees_silent_and_blocked_lanes_and_keeps_done_ones {
+    const rows : str = "1\t1000\t1000\t0\tR\n2\t1000\t9990\t0\tR\n3\t1000\t1000\t0\tD\n4\t9000\t9000\t0\tB\n";
+    var o : [128]u8 = undefined;
+    const n : usize = release_plan(rows, 10000, o[0..128]);
+    assert at_is(o[0..n], 0, "RELEASE|1\nRELEASE|4\n");
+    assert n == 20;
+}
+
+test the_lane_command_reads_the_key_inside_the_line_and_never_holds_it {
+    var o : [1200]u8 = undefined;
+    const n : usize = lane_cmd(11335, "glm-4.5-flash", o[0..1200]);
+    assert contains(o[0..n], "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic");
+    assert contains(o[0..n], "-a 'zai#");
+    assert contains(o[0..n], "ANTHROPIC_MODEL=glm-4.5-flash");
+    assert contains(o[0..n], "--permission-mode acceptEdits");
+    assert contains(o[0..n], "'Bash(t27b:*)'");
+    assert contains(o[0..n], "echo LANE-DONE exit=$? >> .lane.log");
+    assert contains(o[0..n], "sk-") == false;
+}
+
+test the_key_rotates_over_seven_accounts {
+    var o : [16]u8 = undefined;
+    var n : usize = zai_account(7, o[0..16], 0);
+    assert at_is(o[0..n], 0, "zai");
+    assert n == 3;
+    n = zai_account(8, o[0..16], 0);
+    assert at_is(o[0..n], 0, "zai#2");
+    n = zai_account(6, o[0..16], 0);
+    assert at_is(o[0..n], 0, "zai#7");
+}
+
+test the_brief_carries_the_issue_and_the_rules {
+    var body : [30]u8 = undefined;
+    const bl : usize = put_bytes(body[0..30], 0, "line1");
+    body[bl] = 31;
+    const bl2 : usize = put_bytes(body[0..30], bl + 1, "line2");
+    var o : [2000]u8 = undefined;
+    const n : usize = brief(11335, "idle cpu", body[0..bl2], "mac-b", o[0..2000]);
+    assert contains(o[0..n], "# Lane for issue #11335: idle cpu");
+    assert contains(o[0..n], "claude/evolve-lane-11335-mac-b");
+    assert contains(o[0..n], "(Closes #11335)");
+    assert contains(o[0..n], "Do not push");
+    assert contains(o[0..n], "line1\nline2");
+}
+
+test slots_follow_the_kernel_cap_of_the_machine {
+    const vm : str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               100000.\nPages inactive:                            90000.\nPages speculative:                         10000.\n";
+    assert vm_free_bytes(vm) == 200000 * 16384;
+    assert load1x100("{ 1.52 1.70 1.80 }") == 152;
+    // 8 GB, 4 cpus, quiet, mains power: the kernel cap is 3
+    assert cap_of(8589934592, vm, 4, "{ 0.50 0.40 0.30 }", "Now drawing from 'AC Power'") == 3;
+    assert tick_slots(8589934592, vm, 4, "{ 0.50 0.40 0.30 }", "AC Power", 0, 0) == 3;
+    assert tick_slots(8589934592, vm, 4, "{ 0.50 0.40 0.30 }", "AC Power", 1, 0) == 2;
+    assert tick_slots(8589934592, vm, 4, "{ 0.50 0.40 0.30 }", "AC Power", 3, 0) == 0;
+    assert tick_slots(8589934592, vm, 4, "{ 0.50 0.40 0.30 }", "AC Power", 0, 2) == 2;
+    // battery halves the cap
+    assert cap_of(8589934592, vm, 4, "{ 0.5 0.4 0.3 }", "Now drawing from 'Battery Power'") == 1;
+    // memory could not be read: one lane
+    assert cap_of(8589934592, "", 4, "{ 0.5 0.4 0.3 }", "AC Power") == 1;
+}
+
+test labels_map_to_the_priority_levels {
+    assert label_level("P0") == 0;
+    assert label_level("bug,P1") == 1;
+    assert label_level("P1,P0") == 0;
+    assert label_level("queen-shaped") == NO_LEVEL;
+    assert label_level("priority/low") == 3;
+    assert label_level("") == NO_LEVEL;
+}
+
+const F2 : str = "30\t1760918400\tP1\tsecond\t## Boundary\x1f- specs/a/x.t27\x1f\n20\t1760918400\tP0\tfirst\t## Boundary\x1f- specs/b/y.t27\x1f\n";
+
+test priority_order_runs_p0_before_p1_whatever_the_listing {
+    const f : str = "30\t1760918400\tP1\tsecond\t## Boundary\x1f- specs/a/x.t27\n20\t1760918400\tP0\tfirst\t## Boundary\x1f- specs/b/y.t27\n";
+    var o : [800]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    const n : usize = plan(f, 1760918500, "", "", "", 5, o[0..800], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "PICK|20|label|first|specs/b/y.t27\nPICK|30|label|second|specs/a/x.t27\n");
+}
+
+test the_cap_leaves_the_rest_as_full {
+    const f : str = "30\t1\tP1\tsecond\t## Boundary\x1f- specs/a/x.t27\n20\t1\tP0\tfirst\t## Boundary\x1f- specs/b/y.t27\n";
+    var o : [800]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    const n : usize = plan(f, 100, "", "", "", 1, o[0..800], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "PICK|20|label|first|specs/b/y.t27\nSKIP|30|full\n");
+}
+
+test claimed_dir_held_and_boundaryless_issues_are_skipped_with_a_reason {
+    const f : str = "1\t1\tP0\ta\t## Boundary\x1f- specs/a.t27\n2\t1\tP0\tb\t## Boundary\x1f- specs/b.t27\n3\t1\tP0\tc\t## Boundary\x1f- specs/c.t27\n4\t1\tP0\td\tno heading here\n5\t1\tP1\te\t## Boundary\x1f- specs/held/z.t27\n6\t1\tP1\tf\t## Boundary\x1f- specs/f.t27\n";
+    var o : [1200]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    const n : usize = plan(f, 100, "x\trefs/swarm/claims/1\n", "lane-2\n", "specs/held\n", 9, o[0..1200], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "SKIP|1|claimed\nSKIP|2|lane dir\nPICK|3|label|c|specs/c.t27\nSKIP|4|no boundary\nSKIP|5|held\nPICK|6|label|f|specs/f.t27\n");
+}
+
+test two_picks_on_one_file_are_not_taken_together_unless_their_regions_differ {
+    const f : str = "1\t1\tP0\ta\t## Boundary\x1f- specs/x.t27\n2\t1\tP0\tb\t## Boundary\x1f- specs/x.t27\n";
+    var o : [800]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    var n : usize = plan(f, 100, "", "", "", 9, o[0..800], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "PICK|1|label|a|specs/x.t27\nSKIP|2|held\n");
+    const g : str = "1\t1\tP0\ta\t## Boundary\x1f- specs/x.t27 :: fn f\n2\t1\tP0\tb\t## Boundary\x1f- specs/x.t27 :: fn g\n";
+    n = plan(g, 100, "", "", "", 9, o[0..800], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "PICK|1|label|a|specs/x.t27::f\nPICK|2|label|b|specs/x.t27::g\n");
+}
+
+test the_fourth_critical_runs_as_high_and_an_aged_low_runs_after_a_real_normal {
+    // four P0: the fourth is capped to HIGH, so a P1 listed before it... order inside HIGH is the listing
+    const f : str = "1\t1\tP0\ta\t## Boundary\x1f- s/1.t27\n2\t1\tP0\tb\t## Boundary\x1f- s/2.t27\n3\t1\tP0\tc\t## Boundary\x1f- s/3.t27\n4\t1\tP0\td\t## Boundary\x1f- s/4.t27\n";
+    var o : [800]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    const n : usize = plan(f, 100, "", "", "", 9, o[0..800], ws[0..400], sc[0..5120]);
+    assert contains(o[0..n], "PICK|4|");
+    assert at_is(o[0..n], 0, "PICK|1|") ;
+}
+
+test a_duplicate_number_is_listed_once_and_a_blocked_flag_is_not_invented {
+    const f : str = "1\t1\tP0\ta\t## Boundary\x1f- s/1.t27\n1\t1\tP1\ta\t## Boundary\x1f- s/1.t27\n";
+    var o : [800]u8 = undefined;
+    var ws : [400]u64 = undefined;
+    var sc : [5120]u8 = undefined;
+    const n : usize = plan(f, 100, "", "", "", 9, o[0..800], ws[0..400], sc[0..5120]);
+    assert at_is(o[0..n], 0, "PICK|1|label|a|s/1.t27\n");
+    assert n == 23;
+}
