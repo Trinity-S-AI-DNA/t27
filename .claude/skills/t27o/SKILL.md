@@ -92,6 +92,7 @@ PR #10538 failed it with +9 / -0 at 1e20cfb34.
 - Free disk follows swap and load, not files: measure with `df` and the load, keep lanes to one job at a time, and delete a profile you do not need (`target-tri/debug` was 2.5 GB).
 - A PR-body edit re-queues the required `check-linked-issue`: finish the body before the final CI wait. Merge a docs-only PR only after the checks that exist have completed.
 - The first golden port (#11157) is the recipe for deleting hand Rust: issue, `tri t27o`, review the spec, keep the hand tests, gen-rust into `bootstrap/gen/rust/` (`git add -f`), delete the file, mount it from the parent `mod.rs`, then the real crate's `cargo check --all-targets` and tests, and a side-by-side run of old and new (756 million comparisons, 0 disagreements).
+- Before a hand file is named as a port, find the spec it mirrors: read its header for `specs/...` and `ls` that path. When one exists, `tri t27o` on the file would write a second spec, which the one-spec rule refuses; the deletion is `gen-rust` of the existing spec, measured by the compile of the output and the diff of the public surface (fns, types, consts). The `rings/ring-*-rust` crates are such mirrors: 5 of 13 crate-spec pairs compile and none keeps the surface (#11232). `tri t27o-sweep` counts the whole files of a checkout: 0 of 385 in this tree on 2026-10-20.
 
 ## Traps met on this Mac
 
