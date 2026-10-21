@@ -1,4 +1,4 @@
-# AGENTS — Trinity S³AI / t27
+# AGENTS — Trinity S³AI / t27 v6.0.0
 
 This file is the **repository entry point** for humans and coding agents. It summarizes **where law lives** and **how to work safely** in this tree.
 
