@@ -1,0 +1,1554 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/profile.t27 -- the own profile of T27 OS: a round avatar picture and a nickname. What a picture and a
+; nickname must be to be accepted, how one typed UTF-16 unit becomes text, the small file that keeps the profile
+; across a restart, and where the header circle and the PROFILE panel are hit.
+; Owner, 2026-10-21, in Russian, rendered in English: "everything has to be inside the OS, so that anyone can call
+; another person by their avatar; make it possible to create your own avatar -- a circle where I type my nickname
+; and can upload my own avatar picture". Same day: "we write everything only in t27, remember!" -- every new source
+; file of this work is .t27, with no Swift, Rust, C, JS, YAML or shell implementation or shim. ASCII only (L3).
+; --
+; WHAT THIS SPEC DECIDES (and nothing else): it is PURE. It holds no @extern, no syscall and no file; every rule
+; has a test here. The host (profile_host.t27, @extern) opens the system file panel, asks ImageIO what a file
+; really is, decodes, crops, writes and renames; the window (glass_window.t27) draws and forwards clicks and keys.
+; Both only ask this spec and act on the answer.
+; NICKNAME  a display identity only, never an authentication: 1..PRF_NICK_MAX_CP code points and at most
+;   PRF_NICK_MAX_BYTES bytes of valid UTF-8 (no overlong form, no surrogate, nothing above U+10FFFF); no control
+;   character (prf_is_control), no invisible or direction character (prf_is_invisible); no space (U+0020) at the
+;   start or the end and no two spaces in a row. prf_nick_check answers in a fixed order: empty, utf8, control,
+;   invisible, spaces, long. Typing takes any printable Unicode (Cyrillic included) through NSEvent characters,
+;   one UTF-16 unit at a time (prf_unit_cp / prf_unit_hold join a surrogate pair); Backspace drops one code point;
+;   Return saves, Escape cancels (keys.t27 ky_key routes them, as in the KEYS panel); Cmd+V pastes text only.
+; PICTURE  allowed by the real content type ImageIO reports (CGImageSourceGetType), never by the file name: a GIF
+;   renamed avatar.png is still a GIF. Limits: file <= PRF_FILE_MAX bytes, each side <= PRF_SIDE_MAX px, at most
+;   PRF_PIXELS_MAX px, each side >= PRF_SIDE_MIN px. The host decodes a thumbnail with the EXIF orientation applied
+;   (prf_thumb_max keeps its short side >= PRF_AVATAR_PX), takes the centred square (prf_crop_*), scales it to
+;   PRF_AVATAR_PX x PRF_AVATAR_PX and writes a PNG through a .part file and a rename. A failed save keeps the
+;   previous picture (prf_has_after_pick). Errors are the fixed English lines of prf_error_text: no file name and
+;   no OS message ever reaches the screen; a cancelled file panel shows nothing.
+; FILES  <home>/.t27os/profile/ (mode PRF_DIR_MODE = 0700): avatar.png and profile.t27p, both written atomically
+;   (.part, then rename), read once at window start and decoded outside draw(). profile.t27p is the text of
+;   prf_emit: "t27os.profile.v1", "nick=<utf8>", "avatar=<0|1>", one per line. A missing, foreign or damaged file
+;   reads as "not set" (prf_parse_nick 0, prf_parse_avatar false), never as half a profile.
+; COLOUR  the avatar PICTURE is drawn in colour, as the person uploaded it. This is the owner's explicit request of
+;   2026-10-21 ("can upload my own avatar picture") and an exception to the black-and-white screen rule FR-006
+;   (windows.t27) for that picture only (prf_colour_ok): the initial letter, the outline circle, the buttons, the
+;   field and the status line stay black and white. The PR asks @gHashTag to confirm the exception.
+; LATER  calls will show other people's avatars: a 256 px PNG and a 64-byte nickname are small enough to send to a
+;   paired peer. Nothing in this slice talks to a network or calls anyone.
+; Reuse (no parallel helper): editors::same_bytes, term_pane::tp_utf8 (the UTF-8 of one code point),
+;   queen::QP_W and QP_PAD (the right-hand panel slot shared with the Queen, DOCTOR and KEYS panels).
+; Flat namespace: the window build splices every imported module into one namespace and a same-named helper
+;   silently resolves to the first one, so every fn and const here starts with prf_ / PRF_.
+; Refs gHashTag/t27#ISSUE.
+
+module T27osProfile;
+
+use t27os::editors::same_bytes;
+use t27os::term_pane::tp_utf8;
+use t27os::queen::QP_W;
+use t27os::queen::QP_PAD;
+
+// ---------------------------------------------------------------- 1. limits
+
+/// A nickname: at most 24 code points and at most 64 UTF-8 bytes.
+pub const PRF_NICK_MAX_CP : u32 = 24;
+pub const PRF_NICK_MAX_BYTES : usize = 64;
+/// A picture file: at most 20 MiB.
+pub const PRF_FILE_MAX : u64 = 20971520;
+/// A picture: each side at most 8192 px and at least 32 px, at most 40 000 000 px in all.
+pub const PRF_SIDE_MAX : u64 = 8192;
+pub const PRF_PIXELS_MAX : u64 = 40000000;
+pub const PRF_SIDE_MIN : u64 = 32;
+/// The stored avatar is a PRF_AVATAR_PX x PRF_AVATAR_PX PNG.
+pub const PRF_AVATAR_PX : u64 = 256;
+/// The largest thumbnail the host asks ImageIO for (memory bound of one decode).
+pub const PRF_THUMB_CAP : u64 = 4096;
+/// No code point (an invalid sequence, a held surrogate, a function key).
+pub const PRF_NONE : u32 = 4294967295;
+/// U+FFFD, the replacement character a broken surrogate pair becomes.
+pub const PRF_REPLACEMENT : u32 = 65533;
+/// The mode of <home>/.t27os/profile: 0700, owner only.
+pub const PRF_DIR_MODE : u32 = 448;
+
+// ---------------------------------------------------------------- 2. error codes and their lines
+
+pub const PRF_OK : u32 = 0;
+pub const PRF_E_TYPE : u32 = 1;
+pub const PRF_E_FILE_BIG : u32 = 2;
+pub const PRF_E_SIDE_BIG : u32 = 3;
+pub const PRF_E_PIXELS_BIG : u32 = 4;
+pub const PRF_E_SIDE_SMALL : u32 = 5;
+pub const PRF_E_UNREADABLE : u32 = 6;
+pub const PRF_E_SAVE : u32 = 7;
+pub const PRF_E_CANCELLED : u32 = 8;
+pub const PRF_E_PROFILE_SAVE : u32 = 9;
+pub const PRF_E_NICK_EMPTY : u32 = 10;
+pub const PRF_E_NICK_LONG : u32 = 11;
+pub const PRF_E_NICK_UTF8 : u32 = 12;
+pub const PRF_E_NICK_CONTROL : u32 = 13;
+pub const PRF_E_NICK_INVISIBLE : u32 = 14;
+pub const PRF_E_NICK_SPACES : u32 = 15;
+pub const PRF_OK_SAVED : u32 = 16;
+
+/// The status line of the PROFILE panel for a code: fixed English, no file name, no OS message. "" for PRF_OK, for
+/// a cancelled file panel and for an unknown code (nothing is shown).
+pub fn prf_error_text(code: u32) -> str {
+    if (code == PRF_E_TYPE) { return "Choose a PNG, JPEG or HEIC picture."; }
+    if (code == PRF_E_FILE_BIG) { return "The picture file is larger than 20 MB."; }
+    if (code == PRF_E_SIDE_BIG) { return "The picture is wider or taller than 8192 pixels."; }
+    if (code == PRF_E_PIXELS_BIG) { return "The picture has more than 40 megapixels."; }
+    if (code == PRF_E_SIDE_SMALL) { return "The picture is smaller than 32 x 32 pixels."; }
+    if (code == PRF_E_UNREADABLE) { return "The picture could not be read."; }
+    if (code == PRF_E_SAVE) { return "The picture could not be saved. Your previous picture is kept."; }
+    if (code == PRF_E_PROFILE_SAVE) { return "The nickname could not be saved."; }
+    if (code == PRF_E_NICK_EMPTY) { return "Type a nickname."; }
+    if (code == PRF_E_NICK_LONG) { return "A nickname is at most 24 characters."; }
+    if (code == PRF_E_NICK_UTF8) { return "The nickname is not valid text."; }
+    if (code == PRF_E_NICK_CONTROL) { return "A nickname cannot contain control characters."; }
+    if (code == PRF_E_NICK_INVISIBLE) { return "A nickname cannot contain invisible or direction characters."; }
+    if (code == PRF_E_NICK_SPACES) { return "No spaces at the start or end, and no double spaces."; }
+    if (code == PRF_OK_SAVED) { return "Saved."; }
+    return "";
+}
+
+// ---------------------------------------------------------------- 3. small byte helpers
+
+/// Copy s into out at `at` while out has room; the new end.
+fn prf_put(out: []u8, at: usize, s: []const u8) -> usize {
+    var o : usize = at;
+    var i : usize = 0;
+    while (i < s.len and o < out.len) {
+        out[o] = s[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Does t hold the non-empty `lit` at `at`.
+fn prf_starts(t: []const u8, at: usize, lit: []const u8) -> bool {
+    if (lit.len == 0 or at + lit.len > t.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (t[at + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- 4. the picture
+
+/// The content types a picture may have, exactly as ImageIO names them.
+pub const PRF_UTI_PNG : str = "public.png";
+pub const PRF_UTI_JPEG : str = "public.jpeg";
+pub const PRF_UTI_HEIC : str = "public.heic";
+pub const PRF_UTI_HEIF : str = "public.heif";
+
+/// What the host hands the system file panel: the file name extensions it may show (a hint only; the real check is
+/// prf_type_ok on the content type) and the message above the list.
+pub const PRF_PICK_HINT : str = "png jpg jpeg heic heif";
+pub const PRF_PICK_MESSAGE : str = "Choose a picture for your T27 OS avatar";
+
+/// A picture is accepted by its real content type alone, never by its file name.
+pub fn prf_type_ok(uti: []const u8) -> bool {
+    return same_bytes(uti, PRF_UTI_PNG) or same_bytes(uti, PRF_UTI_JPEG) or same_bytes(uti, PRF_UTI_HEIC) or same_bytes(uti, PRF_UTI_HEIF);
+}
+
+/// At most PRF_PIXELS_MAX pixels in a w x h picture (no product is formed, so no value overflows).
+pub fn prf_pixels_ok(w: u64, h: u64) -> bool {
+    if (w == 0 or h == 0) { return true; }
+    return h <= PRF_PIXELS_MAX / w;
+}
+
+/// The verdict on a chosen file, in this order: type, file size, a side too big, too many pixels, a side too small.
+pub fn prf_picture_check(uti: []const u8, bytes: u64, w: u64, h: u64) -> u32 {
+    if (prf_type_ok(uti) == false) { return PRF_E_TYPE; }
+    if (bytes > PRF_FILE_MAX) { return PRF_E_FILE_BIG; }
+    if (w > PRF_SIDE_MAX or h > PRF_SIDE_MAX) { return PRF_E_SIDE_BIG; }
+    if (prf_pixels_ok(w, h) == false) { return PRF_E_PIXELS_BIG; }
+    if (w < PRF_SIDE_MIN or h < PRF_SIDE_MIN) { return PRF_E_SIDE_SMALL; }
+    return PRF_OK;
+}
+
+/// kCGImageSourceThumbnailMaxPixelSize for a w x h picture: the smallest long side that keeps the SHORT side of the
+/// thumbnail >= PRF_AVATAR_PX, i.e. ceil(PRF_AVATAR_PX * long / short), never above the long side (ImageIO does not
+/// enlarge) and never above PRF_THUMB_CAP. 0 when a side is 0 or above PRF_SIDE_MAX: a picture that failed
+/// prf_picture_check is never decoded.
+pub fn prf_thumb_max(w: u64, h: u64) -> u64 {
+    if (w == 0 or h == 0 or w > PRF_SIDE_MAX or h > PRF_SIDE_MAX) { return 0; }
+    var big : u64 = w;
+    var small : u64 = h;
+    if (h > w) {
+        big = h;
+        small = w;
+    }
+    var m : u64 = (PRF_AVATAR_PX * big + small - 1) / small;
+    if (m > big) { m = big; }
+    if (m > PRF_THUMB_CAP) { m = PRF_THUMB_CAP; }
+    return m;
+}
+
+/// The centred square of a w x h image (the host applies it to the decoded THUMBNAIL size): its side, then its left
+/// and top edge.
+pub fn prf_crop_side(w: u64, h: u64) -> u64 {
+    if (w < h) { return w; }
+    return h;
+}
+
+pub fn prf_crop_x(w: u64, h: u64) -> u64 {
+    return (w - prf_crop_side(w, h)) / 2;
+}
+
+pub fn prf_crop_y(w: u64, h: u64) -> u64 {
+    return (h - prf_crop_side(w, h)) / 2;
+}
+
+/// Whether the profile has a picture after a CHOOSE PICTURE that ended with `code`: a new one only on PRF_OK; any
+/// failure or a cancel keeps what was there.
+pub fn prf_has_after_pick(had: bool, code: u32) -> bool {
+    if (code == PRF_OK) { return true; }
+    return had;
+}
+
+// ---------------------------------------------------------------- 5. UTF-8
+
+/// The length of the sequence a lead byte starts: 1..4, or 0 for a byte that cannot lead (a continuation byte
+/// 80..BF, C0 and C1, which only start overlong forms, and F5..FF, which only start values above U+10FFFF).
+pub fn prf_utf8_len(lead: u8) -> usize {
+    if (lead < 128) { return 1; }
+    if (lead < 194) { return 0; }
+    if (lead < 224) { return 2; }
+    if (lead < 240) { return 3; }
+    if (lead < 245) { return 4; }
+    return 0;
+}
+
+/// The code point of the sequence at `at`; PRF_NONE for a bad lead or continuation byte, a truncated sequence, an
+/// overlong form, a surrogate (U+D800..U+DFFF) or a value above U+10FFFF.
+pub fn prf_utf8_cp(s: []const u8, at: usize) -> u32 {
+    if (at >= s.len) { return PRF_NONE; }
+    const n : usize = prf_utf8_len(s[at]);
+    if (n == 0 or n > s.len - at) { return PRF_NONE; }
+    if (n == 1) { return @as(u32, s[at]); }
+    var cp : u32 = 0;
+    if (n == 2) { cp = @as(u32, s[at] & 31); }
+    if (n == 3) { cp = @as(u32, s[at] & 15); }
+    if (n == 4) { cp = @as(u32, s[at] & 7); }
+    var i : usize = 1;
+    while (i < n) {
+        const b : u8 = s[at + i];
+        if ((b & 192) != 128) { return PRF_NONE; }
+        cp = cp * 64 + @as(u32, b & 63);
+        i = i + 1;
+    }
+    // a two-byte form cannot be overlong here: prf_utf8_len refuses C0 and C1
+    if (n == 3 and cp < 2048) { return PRF_NONE; }
+    if (n == 4 and cp < 65536) { return PRF_NONE; }
+    if (cp >= 55296 and cp <= 57343) { return PRF_NONE; }
+    if (cp > 1114111) { return PRF_NONE; }
+    return cp;
+}
+
+/// The bytes the UTF-8 of a valid code point takes.
+pub fn prf_cp_bytes(cp: u32) -> usize {
+    if (cp < 128) { return 1; }
+    if (cp < 2048) { return 2; }
+    if (cp < 65536) { return 3; }
+    return 4;
+}
+
+/// Control characters: C0 (U+0000..U+001F), DEL (U+007F), C1 (U+0080..U+009F), the line and paragraph separators
+/// (U+2028, U+2029).
+pub fn prf_is_control(cp: u32) -> bool {
+    return cp <= 31 or cp == 127 or (cp >= 128 and cp <= 159) or cp == 8232 or cp == 8233;
+}
+
+/// Invisible and direction characters: soft hyphen U+00AD, Arabic letter mark U+061C, Mongolian vowel separator
+/// U+180E, U+200B..U+200F (zero widths, LRM, RLM), U+202A..U+202E (embeddings and overrides), U+2060..U+2064 (word
+/// joiner, invisible operators), U+2066..U+206F (isolates and deprecated format controls), the BOM U+FEFF and the
+/// interlinear annotation marks U+FFF9..U+FFFB. A name holding one of them can look like another name.
+pub fn prf_is_invisible(cp: u32) -> bool {
+    if (cp == 173 or cp == 1564 or cp == 6158 or cp == 65279) { return true; }
+    if (cp >= 8203 and cp <= 8207) { return true; }
+    if (cp >= 8234 and cp <= 8238) { return true; }
+    if (cp >= 8288 and cp <= 8292) { return true; }
+    if (cp >= 8294 and cp <= 8303) { return true; }
+    return cp >= 65529 and cp <= 65531;
+}
+
+// ---------------------------------------------------------------- 6. the nickname
+
+/// Code points in s; PRF_NONE when s is not valid UTF-8.
+pub fn prf_nick_cp_count(s: []const u8) -> u32 {
+    var n : u32 = 0;
+    var at : usize = 0;
+    while (at < s.len) {
+        if (prf_utf8_cp(s, at) == PRF_NONE) { return PRF_NONE; }
+        at = at + prf_utf8_len(s[at]);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// No space (U+0020) at the start or the end, no two in a row. A byte test is exact: 32 never occurs inside a
+/// multi-byte sequence.
+fn prf_spaces_ok(s: []const u8) -> bool {
+    if (s.len == 0) { return true; }
+    if (s[0] == 32 or s[s.len - 1] == 32) { return false; }
+    var i : usize = 1;
+    while (i < s.len) {
+        if (s[i] == 32 and s[i - 1] == 32) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The verdict on a nickname, first failing rule in this order: empty, utf8, control, invisible, spaces, long.
+pub fn prf_nick_check(s: []const u8) -> u32 {
+    if (s.len == 0) { return PRF_E_NICK_EMPTY; }
+    const count : u32 = prf_nick_cp_count(s);
+    if (count == PRF_NONE) { return PRF_E_NICK_UTF8; }
+    var ctl : bool = false;
+    var inv : bool = false;
+    var at : usize = 0;
+    while (at < s.len) {
+        const cp : u32 = prf_utf8_cp(s, at);
+        if (prf_is_control(cp)) { ctl = true; }
+        if (prf_is_invisible(cp)) { inv = true; }
+        at = at + prf_utf8_len(s[at]);
+    }
+    if (ctl) { return PRF_E_NICK_CONTROL; }
+    if (inv) { return PRF_E_NICK_INVISIBLE; }
+    if (prf_spaces_ok(s) == false) { return PRF_E_NICK_SPACES; }
+    if (count > PRF_NICK_MAX_CP or s.len > PRF_NICK_MAX_BYTES) { return PRF_E_NICK_LONG; }
+    return PRF_OK;
+}
+
+// ---------------------------------------------------------------- 7. typing: one UTF-16 unit from NSEvent at a time
+
+fn prf_is_high(u: u32) -> bool {
+    return u >= 55296 and u <= 56319;
+}
+
+fn prf_is_low(u: u32) -> bool {
+    return u >= 56320 and u <= 57343;
+}
+
+/// AppKit puts the function keys (arrows, F1..F35, Home, End, Page Up/Down, Delete forward) into NSEvent characters
+/// as U+F700..U+F8FF. They type nothing into the field.
+pub fn prf_is_fn_key(u: u32) -> bool {
+    return u >= 63232 and u <= 63743;
+}
+
+/// The code point one unit adds. `pending` is the high surrogate held from the unit before, or 0 for none. A high
+/// surrogate is held (PRF_NONE now); a low one after a held high gives the joined code point; a lone low surrogate,
+/// or a high after a high, gives U+FFFD (and the new high is held). A plain unit after a held high is typed as it
+/// is (the stray half is dropped). A function key or a value above 0xFFFF gives PRF_NONE.
+pub fn prf_unit_cp(pending: u32, unit: u32) -> u32 {
+    if (unit > 65535) { return PRF_NONE; }
+    if (prf_is_high(unit)) {
+        if (prf_is_high(pending)) { return PRF_REPLACEMENT; }
+        return PRF_NONE;
+    }
+    if (prf_is_low(unit)) {
+        if (prf_is_high(pending)) { return 65536 + (pending - 55296) * 1024 + (unit - 56320); }
+        return PRF_REPLACEMENT;
+    }
+    if (prf_is_fn_key(unit)) { return PRF_NONE; }
+    return unit;
+}
+
+/// The unit held after this one: the unit itself when it is a high surrogate, else 0.
+pub fn prf_unit_hold(pending: u32, unit: u32) -> u32 {
+    if (unit <= 65535 and prf_is_high(unit)) { return unit; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- 8. editing the field
+
+/// Append the UTF-8 of cp at len; the new length. Unchanged for PRF_NONE, a surrogate, a value above U+10FFFF, a
+/// control or an invisible character, or when the result would pass PRF_NICK_MAX_BYTES, PRF_NICK_MAX_CP or the end
+/// of buf. Spaces are typed freely: the spaces rule is told on SAVE (prf_nick_check).
+pub fn prf_append(buf: []u8, len: usize, cp: u32) -> usize {
+    if (cp == PRF_NONE or cp > 1114111 or (cp >= 55296 and cp <= 57343)) { return len; }
+    if (prf_is_control(cp) or prf_is_invisible(cp)) { return len; }
+    if (len > buf.len) { return len; }
+    const n : usize = prf_cp_bytes(cp);
+    if (len + n > PRF_NICK_MAX_BYTES or len + n > buf.len) { return len; }
+    const count : u32 = prf_nick_cp_count(buf[0..len]);
+    if (count == PRF_NONE or count >= PRF_NICK_MAX_CP) { return len; }
+    return @as(usize, tp_utf8(buf, @as(u32, @intCast(len)), cp));
+}
+
+/// Backspace: the length without the last code point (at most three continuation bytes are walked back).
+pub fn prf_backspace(buf: []const u8, len: usize) -> usize {
+    var n : usize = len;
+    if (n > buf.len) { n = buf.len; }
+    if (n == 0) { return 0; }
+    var i : usize = n - 1;
+    var k : u32 = 0;
+    while (i > 0 and k < 3 and (buf[i] & 192) == 128) {
+        i = i - 1;
+        k = k + 1;
+    }
+    return i;
+}
+
+/// Cmd+V: src (the pasteboard text) without its leading and trailing white space and control bytes, then each of
+/// its valid printable code points appended in turn; invalid bytes, newlines, tabs and invisible characters become
+/// nothing. The paste stops at the first code point that does not fit the limits. The new length.
+pub fn prf_paste(src: []const u8, buf: []u8, len: usize) -> usize {
+    var a : usize = 0;
+    var b : usize = src.len;
+    while (a < b and src[a] <= 32) { a = a + 1; }
+    while (b > a and src[b - 1] <= 32) { b = b - 1; }
+    var n : usize = len;
+    var at : usize = a;
+    while (at < b) {
+        const cp : u32 = prf_utf8_cp(src[0..b], at);
+        if (cp == PRF_NONE) {
+            at = at + 1;
+        } else {
+            if (prf_is_control(cp) == false and prf_is_invisible(cp) == false) {
+                const m : usize = prf_append(buf, n, cp);
+                if (m == n) { return n; }
+                n = m;
+            }
+            at = at + prf_utf8_len(src[at]);
+        }
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- 9. what the header circle shows
+
+pub const PRF_LOOK_PICTURE : u32 = 0;
+pub const PRF_LOOK_LETTER : u32 = 1;
+pub const PRF_LOOK_OUTLINE : u32 = 2;
+
+/// The first code point of the nickname, for the circle without a picture: its bytes in out, a..z upper-cased
+/// (other scripts as they are). 0 when the nickname is empty or not valid UTF-8, or out is too small.
+pub fn prf_initial(nick: []const u8, out: []u8) -> usize {
+    if (nick.len == 0) { return 0; }
+    if (prf_utf8_cp(nick, 0) == PRF_NONE) { return 0; }
+    const n : usize = prf_utf8_len(nick[0]);
+    if (n > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = nick[i];
+        i = i + 1;
+    }
+    if (n == 1 and out[0] >= 97 and out[0] <= 122) { out[0] = out[0] - 32; }
+    return n;
+}
+
+/// The picture clipped to a circle when there is one; else the initial on a dim disc; else a neutral outline.
+pub fn prf_look(has_picture: bool, nick: []const u8) -> u32 {
+    if (has_picture) { return PRF_LOOK_PICTURE; }
+    var b : [4]u8 = undefined;
+    if (prf_initial(nick, b[0..4]) > 0) { return PRF_LOOK_LETTER; }
+    return PRF_LOOK_OUTLINE;
+}
+
+/// FR-006 exception (owner, 2026-10-21): only the avatar picture itself is drawn in colour.
+pub fn prf_colour_ok(look: u32) -> bool {
+    return look == PRF_LOOK_PICTURE;
+}
+
+// ---------------------------------------------------------------- 10. the profile file
+
+/// The first line of profile.t27p. A later layout gets a new header, so an old app reads it as "not set".
+pub const PRF_MAGIC : str = "t27os.profile.v1";
+/// Bytes of the text around the nickname: the header, "\nnick=", "\navatar=", one digit and the last newline.
+pub const PRF_DOC_FIXED : usize = 32;
+/// The longest text prf_emit writes (a 64-byte nickname).
+pub const PRF_DOC_MAX : usize = 96;
+/// Where the nickname starts: after the header and "\nnick=".
+pub const PRF_NICK_AT : usize = 22;
+
+/// The text of profile.t27p: "t27os.profile.v1\nnick=<utf8>\navatar=<0|1>\n". An empty nickname is written as
+/// "nick=" (not set). 0 when a non-empty nickname fails prf_nick_check or out is too small.
+pub fn prf_emit(nick: []const u8, has_avatar: bool, out: []u8) -> usize {
+    if (nick.len > 0 and prf_nick_check(nick) != PRF_OK) { return 0; }
+    if (out.len < PRF_DOC_FIXED + nick.len) { return 0; }
+    var o : usize = prf_put(out, 0, PRF_MAGIC);
+    o = prf_put(out, o, "\nnick=");
+    o = prf_put(out, o, nick);
+    o = prf_put(out, o, "\navatar=");
+    if (has_avatar) {
+        o = prf_put(out, o, "1\n");
+    } else {
+        o = prf_put(out, o, "0\n");
+    }
+    return o;
+}
+
+/// Where the nickname of a well-formed text ends (the index of its newline), or 0 when the text is not exactly
+/// what prf_emit writes: the header, a nickname that is empty or passes prf_nick_check, "avatar=" with 0 or 1, the
+/// last newline, nothing after it.
+fn prf_doc_nick_end(text: []const u8) -> usize {
+    if (text.len < PRF_DOC_FIXED or text.len > PRF_DOC_MAX) { return 0; }
+    if (prf_starts(text, 0, PRF_MAGIC) == false) { return 0; }
+    if (prf_starts(text, PRF_MAGIC.len, "\nnick=") == false) { return 0; }
+    var e : usize = PRF_NICK_AT;
+    while (e < text.len and text[e] != 10) { e = e + 1; }
+    if (e + 10 != text.len) { return 0; }
+    if (prf_starts(text, e, "\navatar=") == false) { return 0; }
+    const d : u8 = text[e + 8];
+    if (d != 48 and d != 49) { return 0; }
+    if (text[e + 9] != 10) { return 0; }
+    if (e > PRF_NICK_AT and prf_nick_check(text[PRF_NICK_AT..e]) != PRF_OK) { return 0; }
+    return e;
+}
+
+/// The nickname kept in a profile text, copied into out; 0 for a missing file (an empty text), a foreign or damaged
+/// text, an empty nickname, or an out too small.
+pub fn prf_parse_nick(text: []const u8, out: []u8) -> usize {
+    const e : usize = prf_doc_nick_end(text);
+    if (e == 0) { return 0; }
+    const n : usize = e - PRF_NICK_AT;
+    if (n > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = text[PRF_NICK_AT + i];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Whether a profile text says a picture is set; false for a missing, foreign or damaged text.
+pub fn prf_parse_avatar(text: []const u8) -> bool {
+    const e : usize = prf_doc_nick_end(text);
+    if (e == 0) { return false; }
+    return text[e + 8] == 49;
+}
+
+/// The status line after SAVE: the nickname verdict when it fails, else whether the file was written.
+pub fn prf_save_status(check: u32, wrote: bool) -> u32 {
+    if (check != PRF_OK) { return check; }
+    if (wrote) { return PRF_OK_SAVED; }
+    return PRF_E_PROFILE_SAVE;
+}
+
+// ---------------------------------------------------------------- 11. paths
+
+pub const PRF_F_DIR : u32 = 0;
+pub const PRF_F_PROFILE : u32 = 1;
+pub const PRF_F_PROFILE_PART : u32 = 2;
+pub const PRF_F_AVATAR : u32 = 3;
+pub const PRF_F_AVATAR_PART : u32 = 4;
+
+/// The profile folder below the home folder.
+pub const PRF_DIR : str = "/.t27os/profile";
+
+/// The file name of a kind; "" for the folder itself and for an unknown kind.
+pub fn prf_file_name(kind: u32) -> str {
+    if (kind == PRF_F_PROFILE) { return "profile.t27p"; }
+    if (kind == PRF_F_PROFILE_PART) { return "profile.t27p.part"; }
+    if (kind == PRF_F_AVATAR) { return "avatar.png"; }
+    if (kind == PRF_F_AVATAR_PART) { return "avatar.png.part"; }
+    return "";
+}
+
+/// <home>/.t27os/profile[/<name>] with a terminating 0 byte that is NOT counted; the length. Trailing slashes of
+/// home are dropped. 0 when home is empty, is not absolute, holds a 0 byte, the kind is unknown, or out has no room
+/// for the path and its 0 byte.
+pub fn prf_path(home: []const u8, kind: u32, out: []u8) -> usize {
+    if (home.len == 0 or home[0] != 47 or kind > PRF_F_AVATAR_PART) { return 0; }
+    var h : usize = home.len;
+    while (h > 0 and home[h - 1] == 47) { h = h - 1; }
+    var i : usize = 0;
+    while (i < h) {
+        if (home[i] == 0) { return 0; }
+        i = i + 1;
+    }
+    const name : str = prf_file_name(kind);
+    var need : usize = h + PRF_DIR.len;
+    if (kind != PRF_F_DIR) { need = need + 1 + name.len; }
+    if (need + 1 > out.len) { return 0; }
+    var o : usize = prf_put(out, 0, home[0..h]);
+    o = prf_put(out, o, PRF_DIR);
+    if (kind != PRF_F_DIR) {
+        o = prf_put(out, o, "/");
+        o = prf_put(out, o, name);
+    }
+    out[o] = 0;
+    return o;
+}
+
+// ---------------------------------------------------------------- 12. geometry and hit tests (points)
+
+/// The header circle: diameter 22, PRF_HEAD_GAP left of the header control it stands beside.
+pub const PRF_HEAD_D : f64 = 22.0;
+pub const PRF_HEAD_R : f64 = 11.0;
+pub const PRF_HEAD_GAP : f64 = 10.0;
+
+/// The PROFILE panel, from its top t (the panel slot of queen.t27: left qp_left, width QP_W, padding QP_PAD; the
+/// title sits at t + 25 and the close x at t + 12..t + 28, as in the KEYS panel). Top to bottom: the big avatar
+/// circle, CHOOSE PICTURE and REMOVE PICTURE side by side, the NICKNAME label and field, SAVE, the status line.
+pub const PRF_AV_D : f64 = 120.0;
+pub const PRF_AV_R : f64 = 60.0;
+pub const PRF_AV_TOP : f64 = 52.0;
+pub const PRF_BTN_Y : f64 = 188.0;
+pub const PRF_BTN_H : f64 = 24.0;
+pub const PRF_BTN_GAP : f64 = 8.0;
+pub const PRF_LABEL_Y : f64 = 238.0;
+pub const PRF_FIELD_Y : f64 = 246.0;
+pub const PRF_FIELD_H : f64 = 26.0;
+pub const PRF_SAVE_Y : f64 = 284.0;
+pub const PRF_SAVE_W : f64 = 96.0;
+pub const PRF_STATUS_Y : f64 = 328.0;
+
+pub const PRF_H_NONE : u32 = 0;
+pub const PRF_H_CHOOSE : u32 = 1;
+pub const PRF_H_REMOVE : u32 = 2;
+pub const PRF_H_FIELD : u32 = 3;
+pub const PRF_H_SAVE : u32 = 4;
+
+/// (x, y) in the rectangle [l, l + w) x [t, t + h).
+fn prf_in(x: f64, y: f64, l: f64, t: f64, w: f64, h: f64) -> bool {
+    return x >= l and x < l + w and y >= t and y < t + h;
+}
+
+/// (x, y) in the closed disc of radius r around (cx, cy).
+fn prf_in_circle(x: f64, y: f64, cx: f64, cy: f64, r: f64) -> bool {
+    const dx : f64 = x - cx;
+    const dy : f64 = y - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+/// The centre of the header circle: PRF_HEAD_GAP left of `right` (the left edge of the header control beside it),
+/// in the middle of a title bar title_h high.
+pub fn prf_head_cx(right: f64) -> f64 {
+    return right - PRF_HEAD_GAP - PRF_HEAD_R;
+}
+
+pub fn prf_head_cy(title_h: f64) -> f64 {
+    return 0.5 * title_h;
+}
+
+/// A click or the hover on the header circle centred at (cx, cy).
+pub fn prf_head_hit(x: f64, y: f64, cx: f64, cy: f64) -> bool {
+    return prf_in_circle(x, y, cx, cy, PRF_HEAD_R);
+}
+
+pub fn prf_avatar_cx(l: f64, w: f64) -> f64 {
+    return l + 0.5 * w;
+}
+
+pub fn prf_avatar_cy(t: f64) -> f64 {
+    return t + PRF_AV_TOP + PRF_AV_R;
+}
+
+/// The width of CHOOSE PICTURE and of REMOVE PICTURE: half the content width less half the gap.
+pub fn prf_btn_w(w: f64) -> f64 {
+    return 0.5 * (w - 2.0 * QP_PAD - PRF_BTN_GAP);
+}
+
+/// The left edge of button b: 0 = CHOOSE PICTURE, 1 = REMOVE PICTURE.
+pub fn prf_btn_x(l: f64, w: f64, b: u32) -> f64 {
+    return l + QP_PAD + @as(f64, @floatFromInt(b)) * (prf_btn_w(w) + PRF_BTN_GAP);
+}
+
+pub fn prf_btn_y(t: f64) -> f64 {
+    return t + PRF_BTN_Y;
+}
+
+/// The baseline of the NICKNAME label.
+pub fn prf_label_y(t: f64) -> f64 {
+    return t + PRF_LABEL_Y;
+}
+
+pub fn prf_field_x(l: f64) -> f64 {
+    return l + QP_PAD;
+}
+
+pub fn prf_field_w(w: f64) -> f64 {
+    return w - 2.0 * QP_PAD;
+}
+
+pub fn prf_field_y(t: f64) -> f64 {
+    return t + PRF_FIELD_Y;
+}
+
+pub fn prf_save_x(l: f64) -> f64 {
+    return l + QP_PAD;
+}
+
+pub fn prf_save_y(t: f64) -> f64 {
+    return t + PRF_SAVE_Y;
+}
+
+/// The baseline of the status / error line.
+pub fn prf_status_y(t: f64) -> f64 {
+    return t + PRF_STATUS_Y;
+}
+
+/// What a click in the panel (left l, width w, top t) lands on. The big circle is a second way to CHOOSE PICTURE;
+/// REMOVE PICTURE is there only while a picture is set.
+pub fn prf_panel_hit(x: f64, y: f64, l: f64, w: f64, t: f64, has_avatar: bool) -> u32 {
+    if (prf_in_circle(x, y, prf_avatar_cx(l, w), prf_avatar_cy(t), PRF_AV_R)) { return PRF_H_CHOOSE; }
+    if (prf_in(x, y, prf_btn_x(l, w, 0), prf_btn_y(t), prf_btn_w(w), PRF_BTN_H)) { return PRF_H_CHOOSE; }
+    if (has_avatar and prf_in(x, y, prf_btn_x(l, w, 1), prf_btn_y(t), prf_btn_w(w), PRF_BTN_H)) { return PRF_H_REMOVE; }
+    if (prf_in(x, y, prf_field_x(l), prf_field_y(t), prf_field_w(w), PRF_FIELD_H)) { return PRF_H_FIELD; }
+    if (prf_in(x, y, prf_save_x(l), prf_save_y(t), PRF_SAVE_W, PRF_BTN_H)) { return PRF_H_SAVE; }
+    return PRF_H_NONE;
+}
+
+// ---------------------------------------------------------------- 13. the panel state
+
+pub const PRF_S_VIEW : u32 = 0;
+pub const PRF_S_EDIT : u32 = 1;
+pub const PRF_EV_FIELD : u32 = 0;
+pub const PRF_EV_SAVE : u32 = 1;
+pub const PRF_EV_CANCEL : u32 = 2;
+pub const PRF_EV_CLOSE : u32 = 3;
+
+/// One step: a click on the field edits; SAVE (button or Return) with a valid nickname ends the edit and with an
+/// invalid one stays in it (the window shows the error); CANCEL (Escape: the saved nickname comes back) and CLOSE
+/// (the close x, Escape outside an edit, another panel) end it. Anything else keeps the state; an unknown state is VIEW.
+pub fn prf_next(state: u32, ev: u32, nick_ok: bool) -> u32 {
+    if (ev == PRF_EV_FIELD) { return PRF_S_EDIT; }
+    if (ev == PRF_EV_SAVE) {
+        if (nick_ok) { return PRF_S_VIEW; }
+        return PRF_S_EDIT;
+    }
+    if (ev == PRF_EV_CANCEL or ev == PRF_EV_CLOSE) { return PRF_S_VIEW; }
+    if (state == PRF_S_EDIT) { return PRF_S_EDIT; }
+    return PRF_S_VIEW;
+}
+
+// ---------------------------------------------------------------- invariants
+
+invariant prf_limits_are_consistent {
+    assert PRF_PIXELS_MAX < PRF_SIDE_MAX * PRF_SIDE_MAX;
+    assert PRF_SIDE_MIN < PRF_AVATAR_PX;
+    assert PRF_AVATAR_PX <= PRF_THUMB_CAP;
+    assert PRF_THUMB_CAP <= PRF_SIDE_MAX;
+    assert PRF_DIR_MODE == 7 * 64;
+}
+
+invariant prf_a_full_length_cyrillic_nickname_fits_the_byte_cap {
+    // 24 two-byte code points (Cyrillic, Greek, Latin with accents) = 48 bytes <= 64
+    assert PRF_NICK_MAX_BYTES >= 2 * @as(usize, PRF_NICK_MAX_CP);
+    assert PRF_NICK_MAX_BYTES < 4 * @as(usize, PRF_NICK_MAX_CP);
+}
+
+invariant prf_the_longest_profile_text_is_doc_max {
+    assert PRF_DOC_FIXED + PRF_NICK_MAX_BYTES == PRF_DOC_MAX;
+    assert PRF_NICK_AT == 22;
+}
+
+invariant prf_the_panel_rows_do_not_overlap {
+    assert PRF_AV_D == 2.0 * PRF_AV_R;
+    assert PRF_HEAD_D == 2.0 * PRF_HEAD_R;
+    assert PRF_AV_TOP > 28.0;
+    assert PRF_AV_TOP + PRF_AV_D < PRF_BTN_Y;
+    assert PRF_BTN_Y + PRF_BTN_H + 12.0 < PRF_LABEL_Y;
+    assert PRF_LABEL_Y < PRF_FIELD_Y;
+    assert PRF_FIELD_Y + PRF_FIELD_H < PRF_SAVE_Y;
+    assert PRF_SAVE_Y + PRF_BTN_H + 12.0 < PRF_STATUS_Y;
+}
+
+// ---------------------------------------------------------------- tests (fake bytes only; byte strings are u8 arrays, L3)
+
+/// Write the first n (1..4) of four bytes at the start of b; n.
+fn prf_t_b(b: []u8, n: usize, x0: u8, x1: u8, x2: u8, x3: u8) -> usize {
+    b[0] = x0;
+    if (n > 1) { b[1] = x1; }
+    if (n > 2) { b[2] = x2; }
+    if (n > 3) { b[3] = x3; }
+    return n;
+}
+
+/// The 8 bytes of the Cyrillic name "Dima" (D0 94 D0 B8 D0 BC D0 B0) at `at`; the new end.
+fn prf_t_dima(b: []u8, at: usize) -> usize {
+    b[at] = 208;
+    b[at + 1] = 148;
+    b[at + 2] = 208;
+    b[at + 3] = 184;
+    b[at + 4] = 208;
+    b[at + 5] = 188;
+    b[at + 6] = 208;
+    b[at + 7] = 176;
+    return at + 8;
+}
+
+/// count copies of the UTF-8 of cp at the start of b (the caller gives room); the length.
+fn prf_t_rep(b: []u8, cp: u32, count: u32) -> usize {
+    var at : u32 = 0;
+    var i : u32 = 0;
+    while (i < count) {
+        at = tp_utf8(b, at, cp);
+        i = i + 1;
+    }
+    return @as(usize, at);
+}
+
+test prf_every_code_has_its_exact_line {
+    assert prf_error_text(PRF_OK) == "";
+    assert prf_error_text(PRF_E_TYPE) == "Choose a PNG, JPEG or HEIC picture.";
+    assert prf_error_text(PRF_E_FILE_BIG) == "The picture file is larger than 20 MB.";
+    assert prf_error_text(PRF_E_SIDE_BIG) == "The picture is wider or taller than 8192 pixels.";
+    assert prf_error_text(PRF_E_PIXELS_BIG) == "The picture has more than 40 megapixels.";
+    assert prf_error_text(PRF_E_SIDE_SMALL) == "The picture is smaller than 32 x 32 pixels.";
+    assert prf_error_text(PRF_E_UNREADABLE) == "The picture could not be read.";
+    assert prf_error_text(PRF_E_SAVE) == "The picture could not be saved. Your previous picture is kept.";
+    assert prf_error_text(PRF_E_CANCELLED) == "";
+    assert prf_error_text(PRF_E_PROFILE_SAVE) == "The nickname could not be saved.";
+    assert prf_error_text(PRF_E_NICK_EMPTY) == "Type a nickname.";
+    assert prf_error_text(PRF_E_NICK_LONG) == "A nickname is at most 24 characters.";
+    assert prf_error_text(PRF_E_NICK_UTF8) == "The nickname is not valid text.";
+    assert prf_error_text(PRF_E_NICK_CONTROL) == "A nickname cannot contain control characters.";
+    assert prf_error_text(PRF_E_NICK_INVISIBLE) == "A nickname cannot contain invisible or direction characters.";
+    assert prf_error_text(PRF_E_NICK_SPACES) == "No spaces at the start or end, and no double spaces.";
+    assert prf_error_text(PRF_OK_SAVED) == "Saved.";
+    // the codes are 0..16 and nothing past them has a line
+    assert PRF_E_TYPE == 1 and PRF_E_CANCELLED == 8 and PRF_E_NICK_SPACES == 15 and PRF_OK_SAVED == 16;
+    assert prf_error_text(17) == "";
+    assert prf_error_text(PRF_NONE) == "";
+}
+
+test prf_only_png_jpeg_heic_heif_pass_by_their_real_type {
+    assert prf_type_ok("public.png");
+    assert prf_type_ok("public.jpeg");
+    assert prf_type_ok("public.heic");
+    assert prf_type_ok("public.heif");
+    assert prf_type_ok(PRF_UTI_PNG) and prf_type_ok(PRF_UTI_JPEG) and prf_type_ok(PRF_UTI_HEIC) and prf_type_ok(PRF_UTI_HEIF);
+    // other picture types, a prefix match, another case, an empty answer
+    assert prf_type_ok("com.compuserve.gif") == false;
+    assert prf_type_ok("public.tiff") == false;
+    assert prf_type_ok("org.webmproject.webp") == false;
+    assert prf_type_ok("com.adobe.pdf") == false;
+    assert prf_type_ok("public.jpeg-2000") == false;
+    assert prf_type_ok("public.pn") == false;
+    assert prf_type_ok("PUBLIC.PNG") == false;
+    assert prf_type_ok("") == false;
+    // a renamed file: a GIF saved as avatar.png still reports com.compuserve.gif and is refused; a PNG saved as
+    // photo.jpg reports public.png and is taken. The file name never enters the check.
+    assert prf_picture_check("com.compuserve.gif", 1000, 100, 100) == PRF_E_TYPE;
+    assert prf_picture_check("public.png", 1000, 100, 100) == PRF_OK;
+    // the file panel hint lists the extensions of the four types, and its message is fixed
+    assert PRF_PICK_HINT == "png jpg jpeg heic heif";
+    assert PRF_PICK_MESSAGE == "Choose a picture for your T27 OS avatar";
+}
+
+test prf_each_picture_limit_holds_at_its_boundary {
+    // file size: 20971520 ok, 20971521 not
+    assert prf_picture_check("public.png", 20971520, 1000, 1000) == PRF_OK;
+    assert prf_picture_check("public.png", 20971521, 1000, 1000) == PRF_E_FILE_BIG;
+    // each side: 8192 ok, 8193 not
+    assert prf_picture_check("public.jpeg", 1000, 8192, 4000) == PRF_OK;
+    assert prf_picture_check("public.jpeg", 1000, 8193, 4000) == PRF_E_SIDE_BIG;
+    assert prf_picture_check("public.jpeg", 1000, 4000, 8192) == PRF_OK;
+    assert prf_picture_check("public.jpeg", 1000, 4000, 8193) == PRF_E_SIDE_BIG;
+    // pixels: 40000000 ok, 40000001 not
+    assert prf_pixels_ok(40000000, 1);
+    assert prf_pixels_ok(40000001, 1) == false;
+    assert prf_pixels_ok(53, 754717) == false;
+    assert prf_pixels_ok(0, 5);
+    assert prf_picture_check("public.heic", 1000, 8000, 5000) == PRF_OK;
+    assert prf_picture_check("public.heic", 1000, 8000, 5001) == PRF_E_PIXELS_BIG;
+    assert prf_picture_check("public.heic", 1000, 5001, 8000) == PRF_E_PIXELS_BIG;
+    // each side: 32 ok, 31 not
+    assert prf_picture_check("public.heif", 1000, 32, 32) == PRF_OK;
+    assert prf_picture_check("public.heif", 1000, 31, 32) == PRF_E_SIDE_SMALL;
+    assert prf_picture_check("public.heif", 1000, 32, 31) == PRF_E_SIDE_SMALL;
+}
+
+test prf_picture_checks_run_in_their_order {
+    assert prf_picture_check("com.compuserve.gif", 99999999, 9000, 9000) == PRF_E_TYPE;
+    assert prf_picture_check("public.png", 99999999, 9000, 9000) == PRF_E_FILE_BIG;
+    assert prf_picture_check("public.png", 10, 9000, 9000) == PRF_E_SIDE_BIG;
+    assert prf_picture_check("public.png", 10, 7000, 7000) == PRF_E_PIXELS_BIG;
+    assert prf_picture_check("public.png", 10, 8193, 20) == PRF_E_SIDE_BIG;
+    assert prf_picture_check("public.png", 10, 8000, 31) == PRF_E_SIDE_SMALL;
+    assert prf_picture_check("public.png", 10, 20, 20) == PRF_E_SIDE_SMALL;
+    assert prf_picture_check("public.png", 10, 0, 0) == PRF_E_SIDE_SMALL;
+}
+
+test prf_a_failed_or_cancelled_pick_keeps_the_previous_picture {
+    assert prf_has_after_pick(false, PRF_OK);
+    assert prf_has_after_pick(true, PRF_OK);
+    assert prf_has_after_pick(true, PRF_E_SAVE);
+    assert prf_has_after_pick(true, PRF_E_CANCELLED);
+    assert prf_has_after_pick(true, PRF_E_TYPE);
+    assert prf_has_after_pick(false, PRF_E_SAVE) == false;
+    assert prf_has_after_pick(false, PRF_E_CANCELLED) == false;
+    assert prf_has_after_pick(false, PRF_E_UNREADABLE) == false;
+}
+
+test prf_lead_bytes_and_their_lengths {
+    assert prf_utf8_len(65) == 1;
+    assert prf_utf8_len(127) == 1;
+    assert prf_utf8_len(128) == 0;
+    assert prf_utf8_len(191) == 0;
+    assert prf_utf8_len(192) == 0;
+    assert prf_utf8_len(193) == 0;
+    assert prf_utf8_len(194) == 2;
+    assert prf_utf8_len(223) == 2;
+    assert prf_utf8_len(224) == 3;
+    assert prf_utf8_len(239) == 3;
+    assert prf_utf8_len(240) == 4;
+    assert prf_utf8_len(244) == 4;
+    assert prf_utf8_len(245) == 0;
+    assert prf_utf8_len(255) == 0;
+    assert prf_cp_bytes(127) == 1 and prf_cp_bytes(128) == 2 and prf_cp_bytes(2047) == 2;
+    assert prf_cp_bytes(2048) == 3 and prf_cp_bytes(65535) == 3 and prf_cp_bytes(65536) == 4;
+}
+
+test prf_utf8_decodes_cyrillic_and_emoji {
+    var d : [8]u8 = undefined;
+    assert prf_t_dima(d[0..8], 0) == 8;
+    // "Dima" in Cyrillic: U+0414 U+0438 U+043C U+0430
+    assert prf_utf8_cp(d[0..8], 0) == 1044;
+    assert prf_utf8_cp(d[0..8], 2) == 1080;
+    assert prf_utf8_cp(d[0..8], 4) == 1084;
+    assert prf_utf8_cp(d[0..8], 6) == 1072;
+    // the middle of a sequence is not a code point
+    assert prf_utf8_cp(d[0..8], 1) == PRF_NONE;
+    assert prf_utf8_cp(d[0..8], 8) == PRF_NONE;
+    assert prf_utf8_cp("A", 0) == 65;
+    var s : [4]u8 = undefined;
+    // U+1F600, a 4-byte emoji
+    var n : usize = prf_t_b(s[0..4], 4, 240, 159, 152, 128);
+    assert prf_utf8_cp(s[0..n], 0) == 128512;
+    // U+10FFFF is the last valid code point; F4 90 80 80 is past it
+    n = prf_t_b(s[0..4], 4, 244, 143, 191, 191);
+    assert prf_utf8_cp(s[0..n], 0) == 1114111;
+    n = prf_t_b(s[0..4], 4, 244, 144, 128, 128);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    // the smallest three- and four-byte forms are fine
+    n = prf_t_b(s[0..4], 3, 224, 160, 128, 0);
+    assert prf_utf8_cp(s[0..n], 0) == 2048;
+    n = prf_t_b(s[0..4], 4, 240, 144, 128, 128);
+    assert prf_utf8_cp(s[0..n], 0) == 65536;
+    // U+D7FF, the last code point before the surrogates
+    n = prf_t_b(s[0..4], 3, 237, 159, 191, 0);
+    assert prf_utf8_cp(s[0..n], 0) == 55295;
+}
+
+test prf_utf8_refuses_overlong_surrogate_truncated_and_broken_forms {
+    var s : [4]u8 = undefined;
+    // overlong: C0 80 (U+0000), E0 9F BF (U+07FF), F0 8F BF BF (U+FFFF)
+    var n : usize = prf_t_b(s[0..4], 2, 192, 128, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 3, 224, 159, 191, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 4, 240, 143, 191, 191);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    // a surrogate: ED A0 80 (U+D800)
+    n = prf_t_b(s[0..4], 3, 237, 160, 128, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    // truncated: D0 alone, E2 82 of three, F0 9F 98 of four
+    n = prf_t_b(s[0..4], 1, 208, 0, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 2, 226, 130, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 3, 240, 159, 152, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    // a lead byte followed by a plain byte, a lone continuation byte, a byte that cannot lead
+    n = prf_t_b(s[0..4], 2, 208, 65, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 1, 148, 0, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    n = prf_t_b(s[0..4], 1, 255, 0, 0, 0);
+    assert prf_utf8_cp(s[0..n], 0) == PRF_NONE;
+    // each of them makes a nickname invalid text
+    n = prf_t_b(s[0..4], 2, 192, 128, 0, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_UTF8;
+    n = prf_t_b(s[0..4], 3, 237, 160, 128, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_UTF8;
+    n = prf_t_b(s[0..4], 4, 244, 144, 128, 128);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_UTF8;
+}
+
+test prf_code_points_are_counted_not_bytes {
+    var b : [16]u8 = undefined;
+    b[0] = 97;
+    const n : usize = prf_t_dima(b[0..16], 1);
+    assert n == 9;
+    assert prf_nick_cp_count(b[0..n]) == 5;
+    assert prf_nick_cp_count(b[1..n]) == 4;
+    assert prf_nick_cp_count("") == 0;
+    assert prf_nick_cp_count("dima") == 4;
+    var e : [4]u8 = undefined;
+    const en : usize = prf_t_b(e[0..4], 4, 240, 159, 152, 128);
+    assert prf_nick_cp_count(e[0..en]) == 1;
+    // a cut sequence anywhere makes the whole text invalid
+    assert prf_nick_cp_count(b[0..n - 1]) == PRF_NONE;
+    assert prf_nick_cp_count(e[0..3]) == PRF_NONE;
+}
+
+test prf_control_characters_are_refused {
+    assert prf_is_control(0) and prf_is_control(9) and prf_is_control(10) and prf_is_control(31);
+    assert prf_is_control(127);
+    assert prf_is_control(128) and prf_is_control(133) and prf_is_control(159);
+    assert prf_is_control(8232) and prf_is_control(8233);
+    assert prf_is_control(32) == false;
+    assert prf_is_control(126) == false;
+    assert prf_is_control(160) == false;
+    assert prf_is_control(1044) == false;
+    assert prf_is_control(8231) == false;
+    assert prf_is_control(8234) == false;
+    assert prf_nick_check("a\tb") == PRF_E_NICK_CONTROL;
+    assert prf_nick_check("a\nb") == PRF_E_NICK_CONTROL;
+    var s : [8]u8 = undefined;
+    // U+0085 (C2 85, a C1 control) and U+2028 (E2 80 A8, the line separator)
+    s[0] = 97;
+    var n : usize = 1 + prf_t_b(s[1..8], 2, 194, 133, 0, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_CONTROL;
+    n = 1 + prf_t_b(s[1..8], 3, 226, 128, 168, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_CONTROL;
+}
+
+test prf_invisible_and_direction_characters_are_refused {
+    // every listed point and range, at both ends
+    assert prf_is_invisible(173) and prf_is_invisible(1564) and prf_is_invisible(6158);
+    assert prf_is_invisible(8203) and prf_is_invisible(8207);
+    assert prf_is_invisible(8234) and prf_is_invisible(8238);
+    assert prf_is_invisible(8288) and prf_is_invisible(8292);
+    assert prf_is_invisible(8294) and prf_is_invisible(8303);
+    assert prf_is_invisible(65279);
+    assert prf_is_invisible(65529) and prf_is_invisible(65531);
+    // their neighbours are not (U+2065 is not in the list)
+    assert prf_is_invisible(172) == false;
+    assert prf_is_invisible(174) == false;
+    assert prf_is_invisible(8202) == false;
+    assert prf_is_invisible(8208) == false;
+    assert prf_is_invisible(8233) == false;
+    assert prf_is_invisible(8239) == false;
+    assert prf_is_invisible(8287) == false;
+    assert prf_is_invisible(8293) == false;
+    assert prf_is_invisible(8304) == false;
+    assert prf_is_invisible(65278) == false;
+    assert prf_is_invisible(65280) == false;
+    assert prf_is_invisible(65528) == false;
+    assert prf_is_invisible(65532) == false;
+    assert prf_is_invisible(65) == false;
+    var s : [8]u8 = undefined;
+    // "a" U+202E "b": the right-to-left override
+    s[0] = 97;
+    var n : usize = 1 + prf_t_b(s[1..8], 3, 226, 128, 174, 0);
+    s[n] = 98;
+    assert prf_nick_check(s[0..n + 1]) == PRF_E_NICK_INVISIBLE;
+    // "a" U+200B (zero width space), "a" U+FEFF (BOM), "a" U+00AD (soft hyphen), "a" U+061C (Arabic letter mark)
+    n = 1 + prf_t_b(s[1..8], 3, 226, 128, 139, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_INVISIBLE;
+    n = 1 + prf_t_b(s[1..8], 3, 239, 187, 191, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_INVISIBLE;
+    n = 1 + prf_t_b(s[1..8], 2, 194, 173, 0, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_INVISIBLE;
+    n = 1 + prf_t_b(s[1..8], 2, 216, 156, 0, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_INVISIBLE;
+}
+
+test prf_spaces_only_inside_and_one_at_a_time {
+    assert prf_nick_check("a b") == PRF_OK;
+    assert prf_nick_check("Dima T27") == PRF_OK;
+    assert prf_nick_check(" a") == PRF_E_NICK_SPACES;
+    assert prf_nick_check("a ") == PRF_E_NICK_SPACES;
+    assert prf_nick_check("a  b") == PRF_E_NICK_SPACES;
+    assert prf_nick_check(" ") == PRF_E_NICK_SPACES;
+    assert prf_nick_check("   ") == PRF_E_NICK_SPACES;
+}
+
+test prf_nickname_length_by_code_points_and_by_bytes {
+    var b : [80]u8 = undefined;
+    // 24 vs 25 code points of ASCII
+    var n : usize = prf_t_rep(b[0..80], 97, 24);
+    assert prf_nick_check(b[0..n]) == PRF_OK;
+    n = prf_t_rep(b[0..80], 97, 25);
+    assert prf_nick_check(b[0..n]) == PRF_E_NICK_LONG;
+    // 24 vs 25 Cyrillic letters (48 and 50 bytes): the code point count decides
+    n = prf_t_rep(b[0..80], 1044, 24);
+    assert n == 48 and prf_nick_check(b[0..n]) == PRF_OK;
+    n = prf_t_rep(b[0..80], 1044, 25);
+    assert prf_nick_check(b[0..n]) == PRF_E_NICK_LONG;
+    // 21 vs 22 euro signs (3 bytes each: 63 and 66 bytes): the byte cap decides below 24 code points
+    n = prf_t_rep(b[0..80], 8364, 21);
+    assert n == 63 and prf_nick_check(b[0..n]) == PRF_OK;
+    n = prf_t_rep(b[0..80], 8364, 22);
+    assert n == 66 and prf_nick_check(b[0..n]) == PRF_E_NICK_LONG;
+    // 16 emoji = 64 bytes is fine; 17 = 68 bytes is too long
+    n = prf_t_rep(b[0..80], 128512, 16);
+    assert n == 64 and prf_nick_check(b[0..n]) == PRF_OK;
+    n = prf_t_rep(b[0..80], 128512, 17);
+    assert n == 68 and prf_nick_check(b[0..n]) == PRF_E_NICK_LONG;
+    // the Cyrillic "Dima" is a good nickname
+    var d : [8]u8 = undefined;
+    const dn : usize = prf_t_dima(d[0..8], 0);
+    assert prf_nick_check(d[0..dn]) == PRF_OK;
+}
+
+test prf_nickname_rules_answer_in_their_order {
+    assert prf_nick_check("") == PRF_E_NICK_EMPTY;
+    var s : [40]u8 = undefined;
+    // utf8 before control: a tab then C0
+    s[0] = 9;
+    var n : usize = 1 + prf_t_b(s[1..40], 1, 192, 0, 0, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_UTF8;
+    // control before invisible, even when the invisible one comes first in the text
+    n = prf_t_b(s[0..40], 3, 226, 128, 174, 0);
+    s[n] = 9;
+    assert prf_nick_check(s[0..n + 1]) == PRF_E_NICK_CONTROL;
+    // invisible before spaces
+    s[0] = 32;
+    n = 1 + prf_t_b(s[1..40], 3, 226, 128, 139, 0);
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_INVISIBLE;
+    // spaces before long: 30 letters and a trailing space
+    n = prf_t_rep(s[0..40], 97, 30);
+    s[n] = 32;
+    assert prf_nick_check(s[0..n + 1]) == PRF_E_NICK_SPACES;
+    assert prf_nick_check(s[0..n]) == PRF_E_NICK_LONG;
+}
+
+test prf_a_surrogate_pair_from_two_key_units_is_one_code_point {
+    // U+1F600 arrives as D83D then DE00
+    assert prf_unit_cp(0, 55357) == PRF_NONE;
+    assert prf_unit_hold(0, 55357) == 55357;
+    assert prf_unit_cp(55357, 56832) == 128512;
+    assert prf_unit_hold(55357, 56832) == 0;
+    // the first and the last pair
+    assert prf_unit_cp(55296, 56320) == 65536;
+    assert prf_unit_cp(56319, 57343) == 1114111;
+    // a lone low surrogate, and a high after a high (the new high is held)
+    assert prf_unit_cp(0, 56832) == PRF_REPLACEMENT;
+    assert prf_unit_hold(0, 56832) == 0;
+    assert prf_unit_cp(55357, 55357) == PRF_REPLACEMENT;
+    assert prf_unit_hold(55357, 55357) == 55357;
+    // a plain unit types itself, also after a stray high (which is dropped)
+    assert prf_unit_cp(0, 1044) == 1044;
+    assert prf_unit_hold(0, 1044) == 0;
+    assert prf_unit_cp(55357, 65) == 65;
+    assert prf_unit_hold(55357, 65) == 0;
+    // a function key (U+F700 up arrow .. U+F8FF) and a value that is no UTF-16 unit type nothing
+    assert prf_is_fn_key(63232) and prf_is_fn_key(63743);
+    assert prf_is_fn_key(63231) == false;
+    assert prf_is_fn_key(63744) == false;
+    assert prf_unit_cp(0, 63232) == PRF_NONE;
+    assert prf_unit_cp(0, 63743) == PRF_NONE;
+    assert prf_unit_hold(0, 63232) == 0;
+    assert prf_unit_cp(0, 65536) == PRF_NONE;
+    assert prf_unit_hold(55357, 65536) == 0;
+    // the joined code point goes into the field as its 4 bytes
+    var b : [8]u8 = undefined;
+    assert prf_append(b[0..8], 0, prf_unit_cp(55357, 56832)) == 4;
+    assert b[0] == 240 and b[1] == 159 and b[2] == 152 and b[3] == 128;
+    // a held high adds nothing yet
+    assert prf_append(b[0..8], 4, prf_unit_cp(0, 55357)) == 4;
+}
+
+test prf_append_and_backspace_round_trip_on_multibyte_text {
+    var b : [64]u8 = undefined;
+    var d : [8]u8 = undefined;
+    assert prf_t_dima(d[0..8], 0) == 8;
+    var n : usize = prf_append(b[0..64], 0, 1044);
+    assert n == 2;
+    n = prf_append(b[0..64], n, 1080);
+    n = prf_append(b[0..64], n, 1084);
+    n = prf_append(b[0..64], n, 1072);
+    assert n == 8 and same_bytes(b[0..8], d[0..8]);
+    n = prf_append(b[0..64], n, 128512);
+    assert n == 12;
+    assert b[8] == 240 and b[9] == 159 and b[10] == 152 and b[11] == 128;
+    // back one code point at a time, whatever its width
+    n = prf_backspace(b[0..64], n);
+    assert n == 8 and same_bytes(b[0..8], d[0..8]);
+    n = prf_backspace(b[0..64], n);
+    assert n == 6;
+    n = prf_backspace(b[0..64], n);
+    assert n == 4;
+    n = prf_backspace(b[0..64], n);
+    assert n == 2;
+    n = prf_backspace(b[0..64], n);
+    assert n == 0;
+    assert prf_backspace(b[0..64], 0) == 0;
+    // ASCII and a three-byte sign
+    n = prf_append(b[0..64], 0, 65);
+    assert n == 1 and b[0] == 65;
+    n = prf_append(b[0..64], n, 8364);
+    assert n == 4 and b[1] == 226 and b[2] == 130 and b[3] == 172;
+    assert prf_backspace(b[0..64], n) == 1;
+    assert prf_backspace(b[0..64], 1) == 0;
+    // a length past the buffer is cut to it first
+    assert prf_backspace(b[0..2], 9) == 1;
+}
+
+test prf_append_refuses_what_a_nickname_cannot_hold {
+    var b : [64]u8 = undefined;
+    assert prf_append(b[0..64], 0, PRF_NONE) == 0;
+    assert prf_append(b[0..64], 0, 10) == 0;
+    assert prf_append(b[0..64], 0, 127) == 0;
+    assert prf_append(b[0..64], 0, 133) == 0;
+    assert prf_append(b[0..64], 0, 8203) == 0;
+    assert prf_append(b[0..64], 0, 8238) == 0;
+    assert prf_append(b[0..64], 0, 55296) == 0;
+    assert prf_append(b[0..64], 0, 1114112) == 0;
+    // U+FFFD (from a broken pair) is a visible character and is typed
+    assert prf_append(b[0..64], 0, PRF_REPLACEMENT) == 3;
+    // 24 code points: the 25th is refused
+    var n : usize = prf_t_rep(b[0..64], 97, 24);
+    assert prf_append(b[0..64], n, 98) == n;
+    // 20 euro signs and a letter: 61 bytes, 21 code points; a 4-byte emoji would pass 64, a 3-byte sign fits
+    n = prf_t_rep(b[0..64], 8364, 20);
+    n = prf_append(b[0..64], n, 97);
+    assert n == 61;
+    assert prf_append(b[0..64], n, 128512) == 61;
+    n = prf_append(b[0..64], n, 8364);
+    assert n == 64;
+    assert prf_append(b[0..64], n, 97) == 64;
+    // the end of a small buffer, and a length past it
+    var s : [2]u8 = undefined;
+    s[0] = 97;
+    assert prf_append(s[0..2], 1, 1044) == 1;
+    assert prf_append(s[0..2], 1, 98) == 2;
+    assert prf_append(s[0..2], 5, 98) == 5;
+}
+
+test prf_a_paste_is_trimmed_filtered_and_stops_at_the_limits {
+    var b : [64]u8 = undefined;
+    var d : [8]u8 = undefined;
+    assert prf_t_dima(d[0..8], 0) == 8;
+    // "  " Dima "\n": the white space around it goes
+    var src : [16]u8 = undefined;
+    src[0] = 32;
+    src[1] = 32;
+    var sn : usize = prf_t_dima(src[0..16], 2);
+    src[sn] = 10;
+    sn = sn + 1;
+    assert prf_paste(src[0..sn], b[0..64], 0) == 8;
+    assert same_bytes(b[0..8], d[0..8]);
+    // tabs and newlines inside become nothing
+    var n : usize = prf_paste("a\tb\nc", b[0..64], 0);
+    assert n == 3 and same_bytes(b[0..3], "abc");
+    // an invisible character and invalid bytes become nothing
+    src[0] = 97;
+    sn = 1 + prf_t_b(src[1..16], 3, 226, 128, 139, 0);
+    src[sn] = 98;
+    assert prf_paste(src[0..sn + 1], b[0..64], 0) == 2;
+    assert b[0] == 97 and b[1] == 98;
+    src[0] = 97;
+    src[1] = 192;
+    src[2] = 128;
+    src[3] = 98;
+    assert prf_paste(src[0..4], b[0..64], 0) == 2;
+    assert b[0] == 97 and b[1] == 98;
+    // the paste appends after what is typed and stops at 24 code points
+    n = prf_t_rep(b[0..64], 97, 20);
+    n = prf_paste("bcdefgh", b[0..64], n);
+    assert n == 24 and b[23] == 101;
+    assert prf_paste("xyz", b[0..64], n) == 24;
+    // and at 64 bytes: 20 emoji give 16
+    var e : [80]u8 = undefined;
+    const en : usize = prf_t_rep(e[0..80], 128512, 20);
+    assert prf_paste(e[0..en], b[0..64], 0) == 64;
+    assert prf_nick_cp_count(b[0..64]) == 16;
+    // nothing to paste
+    assert prf_paste("", b[0..64], 5) == 5;
+    assert prf_paste(" \n\t ", b[0..64], 5) == 5;
+}
+
+test prf_the_header_circle_shows_a_picture_a_letter_or_an_outline {
+    var o : [4]u8 = undefined;
+    var d : [8]u8 = undefined;
+    assert prf_t_dima(d[0..8], 0) == 8;
+    // the first code point, other scripts as they are
+    assert prf_initial(d[0..8], o[0..4]) == 2;
+    assert o[0] == 208 and o[1] == 148;
+    // a..z upper-cased, other ASCII as it is
+    assert prf_initial("dima", o[0..4]) == 1 and o[0] == 68;
+    assert prf_initial("zed", o[0..4]) == 1 and o[0] == 90;
+    assert prf_initial("a", o[0..4]) == 1 and o[0] == 65;
+    assert prf_initial("Zed", o[0..4]) == 1 and o[0] == 90;
+    assert prf_initial("1abc", o[0..4]) == 1 and o[0] == 49;
+    // the bytes just outside a..z (96 and 123) stay as they are
+    var g : [2]u8 = undefined;
+    var gn : usize = prf_t_b(g[0..2], 2, 96, 120, 0, 0);
+    assert prf_initial(g[0..gn], o[0..4]) == 1 and o[0] == 96;
+    gn = prf_t_b(g[0..2], 2, 123, 120, 0, 0);
+    assert prf_initial(g[0..gn], o[0..4]) == 1 and o[0] == 123;
+    // an emoji is its 4 bytes
+    var e : [4]u8 = undefined;
+    const en : usize = prf_t_b(e[0..4], 4, 240, 159, 152, 128);
+    assert prf_initial(e[0..en], o[0..4]) == 4 and o[3] == 128;
+    // nothing for an empty or broken nickname or a too small out
+    assert prf_initial("", o[0..4]) == 0;
+    assert prf_initial(e[0..2], o[0..4]) == 0;
+    assert prf_initial(d[0..8], o[0..1]) == 0;
+    // what the circle shows
+    assert prf_look(true, "") == PRF_LOOK_PICTURE;
+    assert prf_look(true, "dima") == PRF_LOOK_PICTURE;
+    assert prf_look(false, "dima") == PRF_LOOK_LETTER;
+    assert prf_look(false, d[0..8]) == PRF_LOOK_LETTER;
+    assert prf_look(false, "") == PRF_LOOK_OUTLINE;
+    assert prf_look(false, e[0..2]) == PRF_LOOK_OUTLINE;
+    // FR-006: only the picture is in colour
+    assert prf_colour_ok(PRF_LOOK_PICTURE);
+    assert prf_colour_ok(PRF_LOOK_LETTER) == false;
+    assert prf_colour_ok(PRF_LOOK_OUTLINE) == false;
+}
+
+test prf_the_profile_text_round_trips {
+    var doc : [128]u8 = undefined;
+    var nk : [64]u8 = undefined;
+    var n : usize = prf_emit("dima", true, doc[0..128]);
+    assert n == 36;
+    assert same_bytes(doc[0..n], "t27os.profile.v1\nnick=dima\navatar=1\n");
+    assert prf_parse_nick(doc[0..n], nk[0..64]) == 4;
+    assert same_bytes(nk[0..4], "dima");
+    assert prf_parse_avatar(doc[0..n]);
+    // a Cyrillic nickname without a picture
+    var d : [8]u8 = undefined;
+    assert prf_t_dima(d[0..8], 0) == 8;
+    n = prf_emit(d[0..8], false, doc[0..128]);
+    assert n == 40;
+    assert same_bytes(doc[PRF_NICK_AT..PRF_NICK_AT + 8], d[0..8]);
+    assert prf_parse_nick(doc[0..n], nk[0..64]) == 8;
+    assert same_bytes(nk[0..8], d[0..8]);
+    assert prf_parse_avatar(doc[0..n]) == false;
+    // no nickname yet: "nick=" means not set, a picture may still be set
+    n = prf_emit("", false, doc[0..128]);
+    assert n == PRF_DOC_FIXED;
+    assert same_bytes(doc[0..n], "t27os.profile.v1\nnick=\navatar=0\n");
+    assert prf_parse_nick(doc[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(doc[0..n]) == false;
+    n = prf_emit("", true, doc[0..128]);
+    assert prf_parse_nick(doc[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(doc[0..n]);
+    // the longest nickname (16 emoji, 64 bytes) makes the longest text
+    var e : [64]u8 = undefined;
+    const en : usize = prf_t_rep(e[0..64], 128512, 16);
+    n = prf_emit(e[0..en], true, doc[0..128]);
+    assert n == PRF_DOC_MAX;
+    assert prf_parse_nick(doc[0..n], nk[0..64]) == 64;
+    assert same_bytes(nk[0..64], e[0..64]);
+}
+
+test prf_a_bad_nickname_or_a_small_buffer_writes_nothing {
+    var doc : [128]u8 = undefined;
+    assert prf_emit(" a", true, doc[0..128]) == 0;
+    assert prf_emit("a  b", true, doc[0..128]) == 0;
+    assert prf_emit("a\nb", true, doc[0..128]) == 0;
+    var b : [32]u8 = undefined;
+    const n : usize = prf_t_rep(b[0..32], 97, 25);
+    assert prf_emit(b[0..n], false, doc[0..128]) == 0;
+    // exactly the room it needs, and one byte less
+    assert prf_emit("dima", true, doc[0..36]) == 36;
+    assert prf_emit("dima", true, doc[0..35]) == 0;
+}
+
+test prf_a_missing_foreign_or_damaged_profile_reads_as_not_set {
+    var doc : [128]u8 = undefined;
+    var bad : [128]u8 = undefined;
+    var nk : [64]u8 = undefined;
+    const n : usize = prf_emit("dima", true, doc[0..128]);
+    assert n == 36;
+    // no file
+    assert prf_parse_nick(doc[0..0], nk[0..64]) == 0;
+    assert prf_parse_avatar(doc[0..0]) == false;
+    // cut short, or with a byte after the end
+    assert prf_parse_nick(doc[0..n - 1], nk[0..64]) == 0;
+    assert prf_parse_avatar(doc[0..n - 1]) == false;
+    assert prf_put(bad[0..128], 0, doc[0..n]) == n;
+    bad[n] = 10;
+    assert prf_parse_nick(bad[0..n + 1], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..n + 1]) == false;
+    // another header version
+    assert prf_put(bad[0..128], 0, doc[0..n]) == n;
+    bad[15] = 50;
+    assert prf_parse_nick(bad[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..n]) == false;
+    // an avatar flag that is not 0 or 1
+    assert prf_put(bad[0..128], 0, doc[0..n]) == n;
+    bad[n - 2] = 50;
+    assert prf_parse_nick(bad[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..n]) == false;
+    // a nickname that is not valid text, or breaks the spaces rule
+    assert prf_put(bad[0..128], 0, doc[0..n]) == n;
+    bad[PRF_NICK_AT] = 192;
+    assert prf_parse_nick(bad[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..n]) == false;
+    assert prf_put(bad[0..128], 0, doc[0..n]) == n;
+    bad[PRF_NICK_AT + 3] = 32;
+    assert prf_parse_nick(bad[0..n], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..n]) == false;
+    // a nickname that holds a direction override (written by hand, not by prf_emit)
+    var m : usize = prf_put(bad[0..128], 0, "t27os.profile.v1\nnick=a");
+    m = m + prf_t_b(bad[m..128], 3, 226, 128, 174, 0);
+    m = prf_put(bad[0..128], m, "b\navatar=1\n");
+    assert prf_parse_nick(bad[0..m], nk[0..64]) == 0;
+    assert prf_parse_avatar(bad[0..m]) == false;
+    // the same text without the override is a good profile (the control case of the line above)
+    m = prf_put(bad[0..128], 0, "t27os.profile.v1\nnick=ab\navatar=1\n");
+    assert prf_parse_nick(bad[0..m], nk[0..64]) == 2;
+    assert prf_parse_avatar(bad[0..m]);
+    // a good text and an out too small for its nickname
+    assert prf_parse_nick(doc[0..n], nk[0..3]) == 0;
+}
+
+test prf_save_reports_the_rule_or_the_write {
+    assert prf_save_status(PRF_OK, true) == PRF_OK_SAVED;
+    assert prf_save_status(PRF_OK, false) == PRF_E_PROFILE_SAVE;
+    assert prf_save_status(PRF_E_NICK_LONG, true) == PRF_E_NICK_LONG;
+    assert prf_save_status(PRF_E_NICK_EMPTY, false) == PRF_E_NICK_EMPTY;
+    assert prf_save_status(prf_nick_check("dima"), true) == PRF_OK_SAVED;
+}
+
+test prf_the_profile_files_live_under_home {
+    var p : [64]u8 = undefined;
+    var n : usize = prf_path("/Users/d", PRF_F_DIR, p[0..64]);
+    assert n == 23 and same_bytes(p[0..n], "/Users/d/.t27os/profile") and p[n] == 0;
+    n = prf_path("/Users/d", PRF_F_PROFILE, p[0..64]);
+    assert n == 36 and same_bytes(p[0..n], "/Users/d/.t27os/profile/profile.t27p") and p[n] == 0;
+    n = prf_path("/Users/d", PRF_F_PROFILE_PART, p[0..64]);
+    assert n == 41 and same_bytes(p[0..n], "/Users/d/.t27os/profile/profile.t27p.part") and p[n] == 0;
+    n = prf_path("/Users/d", PRF_F_AVATAR, p[0..64]);
+    assert n == 34 and same_bytes(p[0..n], "/Users/d/.t27os/profile/avatar.png") and p[n] == 0;
+    n = prf_path("/Users/d", PRF_F_AVATAR_PART, p[0..64]);
+    assert n == 39 and same_bytes(p[0..n], "/Users/d/.t27os/profile/avatar.png.part") and p[n] == 0;
+    // a trailing slash of home changes nothing; the root as home
+    n = prf_path("/Users/d/", PRF_F_AVATAR, p[0..64]);
+    assert n == 34 and same_bytes(p[0..n], "/Users/d/.t27os/profile/avatar.png");
+    n = prf_path("/", PRF_F_DIR, p[0..64]);
+    assert n == 15 and same_bytes(p[0..n], "/.t27os/profile");
+    // no home, a relative home, a home with a 0 byte, an unknown kind
+    assert prf_path("", PRF_F_DIR, p[0..64]) == 0;
+    assert prf_path("Users/d", PRF_F_DIR, p[0..64]) == 0;
+    var hz : [4]u8 = undefined;
+    hz[0] = 47;
+    hz[1] = 97;
+    hz[2] = 0;
+    hz[3] = 98;
+    assert prf_path(hz[0..4], PRF_F_DIR, p[0..64]) == 0;
+    assert prf_path("/Users/d", 5, p[0..64]) == 0;
+    // room for the path and its 0 byte, and one byte less
+    assert prf_path("/Users/d", PRF_F_AVATAR, p[0..35]) == 34;
+    assert prf_path("/Users/d", PRF_F_AVATAR, p[0..34]) == 0;
+    // the names of the kinds
+    assert prf_file_name(PRF_F_DIR) == "";
+    assert prf_file_name(PRF_F_PROFILE) == "profile.t27p";
+    assert prf_file_name(PRF_F_AVATAR_PART) == "avatar.png.part";
+    assert prf_file_name(9) == "";
+    assert PRF_DIR == "/.t27os/profile";
+}
+
+test prf_the_crop_is_the_centred_square {
+    assert prf_crop_side(4000, 3000) == 3000;
+    assert prf_crop_x(4000, 3000) == 500;
+    assert prf_crop_y(4000, 3000) == 0;
+    assert prf_crop_side(3000, 4000) == 3000;
+    assert prf_crop_x(3000, 4000) == 0;
+    assert prf_crop_y(3000, 4000) == 500;
+    assert prf_crop_side(256, 256) == 256;
+    assert prf_crop_x(256, 256) == 0 and prf_crop_y(256, 256) == 0;
+    // an odd difference rounds the edge down
+    assert prf_crop_side(101, 100) == 100;
+    assert prf_crop_x(101, 100) == 0;
+    assert prf_crop_x(103, 100) == 1;
+}
+
+test prf_the_thumbnail_keeps_the_short_side_at_avatar_size {
+    assert prf_thumb_max(4000, 3000) == 342;
+    assert prf_thumb_max(3000, 4000) == 342;
+    // 342 is the smallest long side whose short side is still >= 256
+    assert prf_thumb_max(4000, 3000) * 3000 >= 256 * 4000;
+    assert (prf_thumb_max(4000, 3000) - 1) * 3000 < 256 * 4000;
+    assert prf_thumb_max(1024, 512) == 512;
+    assert prf_thumb_max(8192, 8192) == 256;
+    assert prf_thumb_max(300, 300) == 256;
+    // never above the long side: ImageIO does not enlarge
+    assert prf_thumb_max(200, 200) == 200;
+    assert prf_thumb_max(32, 32) == 32;
+    assert prf_thumb_max(300, 200) == 300;
+    // never above PRF_THUMB_CAP: a long thin picture is capped
+    assert prf_thumb_max(100, 5000) == PRF_THUMB_CAP;
+    assert prf_thumb_max(5000, 100) == PRF_THUMB_CAP;
+    assert prf_thumb_max(32, 8192) == PRF_THUMB_CAP;
+    // nothing to decode
+    assert prf_thumb_max(0, 100) == 0;
+    assert prf_thumb_max(100, 0) == 0;
+    assert prf_thumb_max(8193, 100) == 0;
+    assert prf_thumb_max(100, 8193) == 0;
+}
+
+test prf_the_header_circle_is_hit_inside_its_radius {
+    const cx : f64 = prf_head_cx(500.0);
+    const cy : f64 = prf_head_cy(34.0);
+    assert cx == 479.0;
+    assert cy == 17.0;
+    // it fits the 34-pt title bar
+    assert cy - PRF_HEAD_R > 0.0 and cy + PRF_HEAD_R < 34.0;
+    assert prf_head_hit(479.0, 17.0, cx, cy);
+    assert prf_head_hit(490.0, 17.0, cx, cy);
+    assert prf_head_hit(490.5, 17.0, cx, cy) == false;
+    assert prf_head_hit(486.0, 24.0, cx, cy);
+    assert prf_head_hit(487.0, 25.0, cx, cy) == false;
+    assert prf_head_hit(479.0, 5.0, cx, cy) == false;
+    // the circle stays left of the control it stands beside
+    assert cx + PRF_HEAD_R < 500.0;
+}
+
+test prf_a_click_in_the_panel_finds_its_control {
+    const l : f64 = 660.0;
+    const t : f64 = 35.0;
+    // the layout in the real panel slot
+    assert prf_avatar_cx(l, QP_W) == 810.0;
+    assert prf_avatar_cy(t) == 147.0;
+    assert prf_btn_w(QP_W) == 130.0;
+    assert prf_btn_x(l, QP_W, 0) == 676.0;
+    assert prf_btn_x(l, QP_W, 1) == 814.0;
+    assert prf_btn_y(t) == 223.0;
+    assert prf_label_y(t) == 273.0;
+    assert prf_field_x(l) == 676.0 and prf_field_w(QP_W) == 268.0 and prf_field_y(t) == 281.0;
+    assert prf_save_x(l) == 676.0 and prf_save_y(t) == 319.0;
+    assert prf_status_y(t) == 363.0;
+    // everything stays inside the padding of the panel
+    assert prf_btn_x(l, QP_W, 1) + prf_btn_w(QP_W) == l + QP_W - QP_PAD;
+    assert prf_field_x(l) + prf_field_w(QP_W) == l + QP_W - QP_PAD;
+    assert prf_avatar_cx(l, QP_W) - PRF_AV_R >= l + QP_PAD;
+    // the big circle chooses a picture, up to its edge
+    assert prf_panel_hit(810.0, 147.0, l, QP_W, t, false) == PRF_H_CHOOSE;
+    assert prf_panel_hit(852.0, 189.0, l, QP_W, t, false) == PRF_H_CHOOSE;
+    assert prf_panel_hit(853.0, 190.0, l, QP_W, t, false) == PRF_H_NONE;
+    // CHOOSE PICTURE, the gap, REMOVE PICTURE only with a picture
+    assert prf_panel_hit(680.0, 230.0, l, QP_W, t, false) == PRF_H_CHOOSE;
+    assert prf_panel_hit(805.0, 230.0, l, QP_W, t, false) == PRF_H_CHOOSE;
+    assert prf_panel_hit(806.0, 230.0, l, QP_W, t, true) == PRF_H_NONE;
+    assert prf_panel_hit(810.0, 230.0, l, QP_W, t, true) == PRF_H_NONE;
+    assert prf_panel_hit(820.0, 230.0, l, QP_W, t, true) == PRF_H_REMOVE;
+    assert prf_panel_hit(943.0, 230.0, l, QP_W, t, true) == PRF_H_REMOVE;
+    assert prf_panel_hit(944.0, 230.0, l, QP_W, t, true) == PRF_H_NONE;
+    assert prf_panel_hit(820.0, 230.0, l, QP_W, t, false) == PRF_H_NONE;
+    // the field and SAVE
+    assert prf_panel_hit(700.0, 290.0, l, QP_W, t, false) == PRF_H_FIELD;
+    assert prf_panel_hit(943.0, 306.0, l, QP_W, t, false) == PRF_H_FIELD;
+    assert prf_panel_hit(700.0, 307.0, l, QP_W, t, false) == PRF_H_NONE;
+    assert prf_panel_hit(700.0, 330.0, l, QP_W, t, false) == PRF_H_SAVE;
+    assert prf_panel_hit(771.0, 330.0, l, QP_W, t, false) == PRF_H_SAVE;
+    assert prf_panel_hit(772.0, 330.0, l, QP_W, t, false) == PRF_H_NONE;
+    // the title row, the label row and below the status line are nothing
+    assert prf_panel_hit(700.0, 50.0, l, QP_W, t, true) == PRF_H_NONE;
+    assert prf_panel_hit(700.0, 270.0, l, QP_W, t, true) == PRF_H_NONE;
+    assert prf_panel_hit(700.0, 400.0, l, QP_W, t, true) == PRF_H_NONE;
+}
+
+test prf_the_panel_edits_saves_and_cancels {
+    assert prf_next(PRF_S_VIEW, PRF_EV_FIELD, false) == PRF_S_EDIT;
+    assert prf_next(PRF_S_EDIT, PRF_EV_FIELD, true) == PRF_S_EDIT;
+    assert prf_next(PRF_S_EDIT, PRF_EV_SAVE, true) == PRF_S_VIEW;
+    assert prf_next(PRF_S_EDIT, PRF_EV_SAVE, false) == PRF_S_EDIT;
+    assert prf_next(PRF_S_VIEW, PRF_EV_SAVE, true) == PRF_S_VIEW;
+    assert prf_next(PRF_S_VIEW, PRF_EV_SAVE, false) == PRF_S_EDIT;
+    assert prf_next(PRF_S_EDIT, PRF_EV_CANCEL, false) == PRF_S_VIEW;
+    assert prf_next(PRF_S_EDIT, PRF_EV_CLOSE, false) == PRF_S_VIEW;
+    assert prf_next(PRF_S_VIEW, PRF_EV_CANCEL, true) == PRF_S_VIEW;
+    assert prf_next(PRF_S_VIEW, PRF_EV_CLOSE, true) == PRF_S_VIEW;
+    // an unknown event keeps the state; an unknown state is VIEW
+    assert prf_next(PRF_S_EDIT, 9, false) == PRF_S_EDIT;
+    assert prf_next(PRF_S_VIEW, 9, true) == PRF_S_VIEW;
+    assert prf_next(7, 9, true) == PRF_S_VIEW;
+    // the SAVE verdict comes from the nickname rules
+    assert prf_next(PRF_S_EDIT, PRF_EV_SAVE, prf_nick_check("dima") == PRF_OK) == PRF_S_VIEW;
+    assert prf_next(PRF_S_EDIT, PRF_EV_SAVE, prf_nick_check("") == PRF_OK) == PRF_S_EDIT;
+}
