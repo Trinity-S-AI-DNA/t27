@@ -69,6 +69,46 @@ The seven **Invariant Laws (L1–L8)** are defined in [`docs/T27-CONSTITUTION.md
 
 - Rule file: [`.cursor/rules/t27-ssot-math.mdc`](.cursor/rules/t27-ssot-math.mdc) — keep in sync with **SSOT-MATH** and this entry point.
 
+## 7. T27 Compiler tools (t27c)
+
+The **t27c** is the official Trinity T27 compiler. Use these commands for development:
+
+### Essential t27c Commands
+
+| Command | Description | Usage Example |
+|---------|-------------|---------------|
+| `t27c spec-status <file>` | Check spec status (IMPLEMENTED/PARTIAL/UNWRITTEN/NOPARSE/NOFN) | `t27c spec-status specs/base/trit.t27` |
+| `t27c gen <spec>` | Generate code from .t27 spec | `t27c gen specs/t27os/term_input.t27` |
+| `t27c test <spec>` | Run tests in a spec | `t27c test specs/t27os/term_input.t27` |
+| `t27c seal <spec>` | Generate immutable hash seals | `t27c seal specs/t27os/term_input.t27` |
+| `t27c ci` | Run full CI checks (parse + typecheck + gen + seal) | `t27c ci` |
+| `t27c health` | Quick compiler health check | `t27c health` |
+| `t27c lint <spec>` | Check spec quality and TDD compliance | `t27c lint specs/t27os/term_input.t27` |
+
+### Development Workflow
+
+1. **Check status**: `t27c spec-status specs/your-module.t27`
+2. **Generate code**: `t27c gen specs/your-module.t27` (output to gen/)
+3. **Run tests**: `t27c test specs/your-module.t27`
+4. **Seal changes**: `t27c seal specs/your-module.t27`
+5. **Full CI**: `t27c ci` (checks all specs)
+
+### Key Principles
+
+- **L2 GENERATION**: Never edit files in `gen/` manually - edit specs and regenerate
+- **L4 TESTABILITY**: Every spec needs `test`/`invariant`/`bench` blocks
+- **L7 UNITY**: Use `t27c` commands instead of shell scripts
+
+### T27OS Development
+
+For T27OS (Trinity Operating System) development:
+```bash
+# Check T27OS terminal input spec
+t27c spec-status specs/t27os/term_input.t27
+t27c test specs/t27os/term_input.t27
+t27c seal specs/t27os/term_input.t27
+```
+
 ---
 
 **φ² + 1/φ² = 3 | TRINITY**
