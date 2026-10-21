@@ -3060,22 +3060,59 @@ fn spec_module_decls(input_path: &Path) -> ModuleMaps {
         for ext in ["t27", "vibee"] {
             let f = root.join(format!("{}.{}", rel, ext));
             let Ok(text) = fs::read_to_string(&f) else { continue };
+            // A `.t27` module has no privacy: every declaration it makes is
+            // visible to any spec that `use`s it. Requiring `pub ` here left
+            // the pool EMPTY for every module that never says the word --
+            // file/schema, git/schema, storage/schema and shell/schema have
+            // zero `pub` between them, so the siblings that write `FileError`
+            // bare got no `const FileError = schema.FileError;` binding and
+            // Zig answered `use of undeclared identifier`: 41 + 32 + 31 + 26.
+            // Only 2426 of the corpus's 12849 declarations carry `pub`.
+            //
+            // Dropping the filter alone is worse than the disease: the scan is
+            // line-based, so a `const result = ...` inside a function body
+            // enters the pool as an export -- 1800 such phantoms. Module-level
+            // declarations sit at brace depth 0 in a spec written
+            // `module foo;` and at depth 1 in one written `module Foo {`, and
+            // both shapes exist, so the base depth is read off the file. That
+            // guard takes the phantoms to 223 and regresses no file.
+            let base_depth: i32 = if text.lines().take(60).any(|l| {
+                let t = l.trim();
+                t.starts_with("module ") && t.ends_with('{')
+            }) {
+                1
+            } else {
+                0
+            };
             let mut names = Vec::new();
+            let mut depth: i32 = 0;
             for line in text.lines() {
-                let t = line.trim_start();
-                let Some(rest) = t.strip_prefix("pub ") else { continue };
-                for kw in ["fn ", "const ", "type ", "struct ", "enum "] {
-                    if let Some(after) = rest.strip_prefix(kw) {
-                        let n: String = after
-                            .chars()
-                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                            .collect();
-                        if !n.is_empty() {
-                            names.push(n);
+                let code = line.split("//").next().unwrap_or("");
+                let t = code.trim_start();
+                if depth == base_depth {
+                    let rest = t.strip_prefix("pub ").unwrap_or(t);
+                    for kw in ["fn ", "const ", "type ", "struct ", "enum "] {
+                        if let Some(after) = rest.strip_prefix(kw) {
+                            let n: String = after
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .collect();
+                            // A one-letter export is nearly always a comptime
+                            // parameter in the importing file. Binding
+                            // `const E = constants.E;` cost
+                            // tri/collections/result.zig three
+                            // `function parameter shadows declaration of 'E'`
+                            // and `const n = formats.n;` cost
+                            // physics/p2_brain_physics.zig two more.
+                            if n.len() > 1 {
+                                names.push(n);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
+                depth += code.matches('{').count() as i32;
+                depth -= code.matches('}').count() as i32;
             }
             names.sort();
             names.dedup();

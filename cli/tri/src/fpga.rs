@@ -930,7 +930,7 @@ fn sha256_hex(path: &std::path::Path) -> Result<String> {
         .with_context(|| format!("read {}", path.display()))?;
     let mut h = Sha256::new();
     h.update(&data);
-    Ok(format!("{:x}", h.finalize()))
+    Ok(format!("{:064x}", h.finalize()))
 }
 
 fn gunzip(gz_path: &std::path::Path, out_path: &std::path::Path) -> Result<()> {

@@ -278,6 +278,20 @@ fn build_tools_list() -> Vec<Value> {
                 "required": []
             }
         }),
+        serde_json::json!({
+            "name": "tri_doctor",
+            "description": "Doctor agent: anomaly detection, health checks, and recovery. Actions: anomalies (detect anomalies), check (full health snapshot), recover (initiate recovery).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Doctor action: anomalies, check, recover"
+                    }
+                },
+                "required": ["action"]
+            }
+        }),
     ]
 }
 
@@ -309,6 +323,7 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         "tri_verdict" => cmd_verdict(root),
         "tri_experience_save" => cmd_experience_save(root, &arguments),
         "tri_health" => cmd_health(root),
+        "tri_doctor" => cmd_doctor(root, &arguments),
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     };
 
@@ -620,7 +635,7 @@ fn cmd_cell_seal(root: &Path) -> Result<Value> {
     hasher.update(skill.skill_id.as_bytes());
     hasher.update(cells[idx].cell_id.as_bytes());
     let hash_bytes = hasher.finalize();
-    let hash_hex = format!("{:x}", hash_bytes);
+    let hash_hex = format!("{:064x}", hash_bytes);
 
     cells[idx].seal = Some(CellSeal {
         hash: hash_hex.clone(),
@@ -771,6 +786,264 @@ fn cmd_test(root: &Path, args: &Value) -> Result<Value> {
         }
         Err(e) => {
             let msg = format!("Failed to execute t27c: {}. Is t27c on PATH?", e);
+            Ok(tool_error_text(&msg))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HealthAnomaly {
+    timestamp: String,
+    anomaly_type: String,
+    domain: String,
+    severity: String,
+    metric: Value,
+    description: String,
+}
+
+fn detect_anomalies(root: &Path) -> Vec<HealthAnomaly> {
+    let mut anomalies = Vec::new();
+    let now = Utc::now().to_rfc3339();
+
+    let swarm_path = trinity_path(root, &["state", "swarm-health.json"]);
+    let swarm: Value = fs::read_to_string(&swarm_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({}));
+
+    let queen_path = trinity_path(root, &["state", "queen-health.json"]);
+    let queen: Value = fs::read_to_string(&queen_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({}));
+
+    let toxic_rate = swarm
+        .get("metrics")
+        .and_then(|m| m.get("toxic_rate"))
+        .and_then(|r| r.as_f64())
+        .unwrap_or(0.0);
+
+    let repeat_failures = swarm
+        .get("metrics")
+        .and_then(|m| m.get("repeat_failures"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(0);
+
+    let stuck_tasks = swarm
+        .get("metrics")
+        .and_then(|m| m.get("stuck_tasks"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(0);
+
+    if toxic_rate > 0.05 {
+        anomalies.push(HealthAnomaly {
+            timestamp: now.clone(),
+            anomaly_type: "toxic_rate_increase".into(),
+            domain: "Swarm".into(),
+            severity: if toxic_rate > 0.2 { "critical".into() } else { "warning".into() },
+            metric: serde_json::json!({"current_value": toxic_rate, "threshold": 0.05}),
+            description: format!("Toxic rate {:.1}% exceeds 5% threshold", toxic_rate * 100.0),
+        });
+    }
+
+    if repeat_failures > 3 {
+        anomalies.push(HealthAnomaly {
+            timestamp: now.clone(),
+            anomaly_type: "repeat_failures".into(),
+            domain: "Swarm".into(),
+            severity: "critical".into(),
+            metric: serde_json::json!({"current_value": repeat_failures, "threshold": 3}),
+            description: format!("{} repeated failures (threshold: 3)", repeat_failures),
+        });
+    }
+
+    if stuck_tasks > 2 {
+        anomalies.push(HealthAnomaly {
+            timestamp: now.clone(),
+            anomaly_type: "stuck_tasks".into(),
+            domain: "Swarm".into(),
+            severity: "warning".into(),
+            metric: serde_json::json!({"current_value": stuck_tasks, "threshold": 2}),
+            description: format!("{} stuck tasks (threshold: 2)", stuck_tasks),
+        });
+    }
+
+    let queen_score = queen.get("score").and_then(|s| s.as_f64()).unwrap_or(1.0);
+
+    if queen_score < 0.5 {
+        anomalies.push(HealthAnomaly {
+            timestamp: now.clone(),
+            anomaly_type: "queen_below_critical".into(),
+            domain: "QueenLotus".into(),
+            severity: "critical".into(),
+            metric: serde_json::json!({"current_value": queen_score, "threshold": 0.5}),
+            description: format!(
+                "Queen health {:.3} below critical threshold 0.5 -- BLOCK all mutations",
+                queen_score
+            ),
+        });
+    } else if queen_score < 0.7 {
+        anomalies.push(HealthAnomaly {
+            timestamp: now.clone(),
+            anomaly_type: "queen_degraded".into(),
+            domain: "QueenLotus".into(),
+            severity: "warning".into(),
+            metric: serde_json::json!({"current_value": queen_score, "threshold": 0.7}),
+            description: format!("Queen health {:.3} degraded (YELLOW zone)", queen_score),
+        });
+    }
+
+    let akashic_path = trinity_path(root, &["events", "akashic-log.jsonl"]);
+    if akashic_path.exists() {
+        if let Ok(data) = fs::read_to_string(&akashic_path) {
+            let toxic_count = data
+                .lines()
+                .filter(|l| l.contains("\"verdict\":\"toxic\"") || l.contains("\"verdict\": \"toxic\""))
+                .count();
+            if toxic_count > 0 {
+                anomalies.push(HealthAnomaly {
+                    timestamp: now,
+                    anomaly_type: "toxic_verdicts_in_log".into(),
+                    domain: "Swarm".into(),
+                    severity: "warning".into(),
+                    metric: serde_json::json!({"current_value": toxic_count, "threshold": 0}),
+                    description: format!("{} toxic verdicts found in akashic log", toxic_count),
+                });
+            }
+        }
+    }
+
+    anomalies
+}
+
+fn cmd_doctor(root: &Path, args: &Value) -> Result<Value> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anomalies");
+
+    match action {
+        "anomalies" => {
+            let anomalies = detect_anomalies(root);
+            for a in &anomalies {
+                let event = AkashicEvent {
+                    ts: a.timestamp.clone(),
+                    event: "health.anomaly".into(),
+                    agent_id: "tri-doctor".into(),
+                    trace_id: Uuid::new_v4().to_string(),
+                    task_id: None,
+                    spec_path: None,
+                    result: "detected".into(),
+                    error: None,
+                    metadata: serde_json::json!({
+                        "anomaly_type": a.anomaly_type,
+                        "domain": a.domain,
+                        "severity": a.severity,
+                        "metric": a.metric,
+                        "description": a.description,
+                    }),
+                };
+                let _ = append_akashic(root, &event);
+            }
+            let result = serde_json::json!({
+                "count": anomalies.len(),
+                "status": if anomalies.iter().any(|a| a.severity == "critical") { "RED" } else if anomalies.is_empty() { "GREEN" } else { "YELLOW" },
+                "anomalies": anomalies,
+                "message": if anomalies.is_empty() {
+                    "No anomalies detected. All systems nominal.".to_string()
+                } else {
+                    format!("{} anomalies detected", anomalies.len())
+                }
+            });
+            Ok(tool_result_text(&serde_json::to_string_pretty(&result)?))
+        }
+        "check" => {
+            let swarm_path = trinity_path(root, &["state", "swarm-health.json"]);
+            let swarm: Value = fs::read_to_string(&swarm_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({}));
+            let queen_path = trinity_path(root, &["state", "queen-health.json"]);
+            let queen: Value = fs::read_to_string(&queen_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({}));
+            let anomalies = detect_anomalies(root);
+            let queen_score = queen.get("score").and_then(|s| s.as_f64()).unwrap_or(1.0);
+            let toxic_rate = swarm
+                .get("metrics")
+                .and_then(|m| m.get("toxic_rate"))
+                .and_then(|r| r.as_f64())
+                .unwrap_or(0.0);
+
+            let status = if queen_score < 0.5 || anomalies.iter().any(|a| a.severity == "critical") {
+                "RED"
+            } else if !anomalies.is_empty() || toxic_rate > 0.05 || queen_score < 0.7 {
+                "YELLOW"
+            } else {
+                "GREEN"
+            };
+
+            let result = serde_json::json!({
+                "queen_health": queen,
+                "swarm_health": swarm,
+                "anomaly_count": anomalies.len(),
+                "status": status,
+                "recommendations": if status == "RED" {
+                    vec!["BLOCK all mutations", "Run recovery: tri doctor recover", "Freeze new feature work"]
+                } else if status == "YELLOW" {
+                    vec!["Feature mutations blocked on affected domains", "Run: tri doctor anomalies for details"]
+                } else {
+                    vec!["All operations allowed"]
+                }
+            });
+            Ok(tool_result_text(&serde_json::to_string_pretty(&result)?))
+        }
+        "recover" => {
+            let anomalies = detect_anomalies(root);
+            let has_critical = anomalies.iter().any(|a| a.severity == "critical");
+            if !has_critical && anomalies.is_empty() {
+                let result = serde_json::json!({
+                    "action": "none",
+                    "message": "No critical anomalies. Recovery not needed."
+                });
+                return Ok(tool_result_text(&serde_json::to_string_pretty(&result)?));
+            }
+            let recovery_id = format!("recovery-{}", Utc::now().format("%Y%m%d%H%M%S"));
+            let event = AkashicEvent {
+                ts: Utc::now().to_rfc3339(),
+                event: "recovery.start".into(),
+                agent_id: "tri-doctor".into(),
+                trace_id: Uuid::new_v4().to_string(),
+                task_id: None,
+                spec_path: None,
+                result: "started".into(),
+                error: None,
+                metadata: serde_json::json!({
+                    "recovery_id": recovery_id,
+                    "type": "replay",
+                    "domain": "all",
+                    "anomaly_count": anomalies.len(),
+                    "actions": ["replay_from_last_clean", "emit_health_event", "save_experience"]
+                }),
+            };
+            append_akashic(root, &event)?;
+            let result = serde_json::json!({
+                "action": "recovery_started",
+                "recovery_id": recovery_id,
+                "steps": [
+                    "1. Freeze new mutations",
+                    "2. Identify unhealthy domains",
+                    "3. Roll back to last clean seal",
+                    "4. Re-run: tri gen, tri test, tri verdict",
+                    "5. Save recovery experience",
+                    "6. Re-open when queen health returns to GREEN"
+                ]
+            });
+            Ok(tool_result_text(&serde_json::to_string_pretty(&result)?))
+        }
+        _ => {
+            let msg = format!("Unknown doctor action: {} (anomalies|check|recover)", action);
             Ok(tool_error_text(&msg))
         }
     }

@@ -91,15 +91,22 @@ module tb_data;
     endfunction
 
     // ---- the known weights: all (+1) ---------------------------------------
+    // Wave 670, Prop. 143: keyed on the word INDEX. Until now this returned
+    // the same 54 trits for every weight address, so all C chunks of a neuron
+    // saw identical weights -- and a chunk-indexing error, the exact family as
+    // Prop. 125's four-faced units confusion, produced the same accumulator as
+    // correct indexing. The design could read chunk 0 C times and match.
     function [53:0] weight_word;
-        input dummy;
+        input integer widx;
         integer i;
         reg [31:0] r;
         begin
             weight_word = 54'd0;
-            r = `T27_SEED + 32'h85EBCA6B;
+            r = `T27_SEED + 32'h85EBCA6B + (widx * 32'h27D4EB2F);
             for (i = 0; i < 27; i = i + 1) begin
                 r = xs32(r);
+                // Seed 0 keeps every word all-(+1), preserving every result
+                // measured before this wave.
                 weight_word[i*2 +: 2] = (`T27_SEED == 0) ? 2'b10 : trit_of(r);
             end
         end
@@ -116,9 +123,13 @@ module tb_data;
         begin
             a = 0;
             iw = input_word(0);
-            ww = weight_word(0);
+            // Neuron 0's chunks occupy weight words 0..C-1 (neuron-major
+            // layout: addr = neuron*C + chunk). If the design reads any other
+            // word for chunk c, the accumulator now differs -- which is the
+            // whole point of making the words distinct.
             for (c = 0; c < C; c = c + 1)
                 for (i = 0; i < 27; i = i + 1) begin
+                    ww = weight_word(c);
                     it = (iw[i*2 +: 2] == 2'b00) ? -1 :
                          (iw[i*2 +: 2] == 2'b10) ?  1 : 0;
                     wt = (ww[i*2 +: 2] == 2'b00) ? -1 :
@@ -212,11 +223,19 @@ module tb_data;
     end
 
     // ---- weight memory: serves the WEIGHTS ---------------------------------
+    // The prefetcher streams words 0..num_words-1 in order, so the i-th read
+    // is word i. Serving a constant here was what made every weight address
+    // indistinguishable.
+    integer fetch_idx = 0;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin mem_rd_valid <= 0; mem_rd_data <= 64'd0; end
-        else begin
+        if (!rst_n) begin
+            mem_rd_valid <= 0; mem_rd_data <= 64'd0; fetch_idx = 0;
+        end else begin
             mem_rd_valid <= mem_rd_en;
-            mem_rd_data  <= {10'd0, weight_word(0)};
+            if (mem_rd_en) begin
+                mem_rd_data <= {10'd0, weight_word(fetch_idx)};
+                fetch_idx = fetch_idx + 1;
+            end
         end
     end
 

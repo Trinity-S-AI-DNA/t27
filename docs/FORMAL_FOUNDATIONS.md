@@ -11120,6 +11120,587 @@ in an empty tree, exit 1.
 
 ---
 
+### Prop. 211 — a missing baseline re-mints itself and passes, and disk, index and HEAD are three states — `MEASURED`
+
+**Gate:** `formal-yosys.yml` → *Corpus size scan — a finding ratchet improves when you delete the subject*
+
+Prop. 209 made deletion loud by ratcheting population size; Prop. 210 made
+hollowing loud by ratcheting content. Both leave the ratchet's own **reference**
+unexamined. Measured, by deleting each baseline in a clean clone and running its
+owner:
+
+| clean clone, baseline deleted | gates |
+|---|---|
+| writes a fresh baseline, **exit 0** | **8** |
+| writes, then exits 1 on an unrelated check | 1 — `runaway_string_scan` |
+| bails on a missing `target/release/t27c` or `build/rtl` | 3 |
+| refuses deliberately | 1 — `replacement_scan` |
+
+**8 of 13 accept a possibly-broken tree as the new truth and report success.**
+The three that bail do so *incidentally*: CI builds `t27c` and emits `build/rtl`
+before those steps run, so on a runner they reach the write path too. Their
+apparent safety is an artifact of a clone without build outputs and is not
+counted as protection.
+
+Only `replacement_scan.py` guards, by asking git whether the baseline is tracked,
+and both branches were measured. Baseline **tracked** and deleted from the
+worktree → exit 1, no write, `it is a reset with the evidence removed`. Baseline
+**untracked** and missing → exit 0, and it wrote a 540-file baseline. **The guard
+is inert precisely when the baseline is untracked, which was the state of all
+eight.**
+
+The guard's own file is the demonstration. `git log -- formal/replacement_scan.py`
+is **empty** — 38 `.py` on disk, 37 in the index. The scanner written to detect
+the re-baseline idiom had never been committed, so the detector for this bug
+class was itself the last file still missing from the index. `f66561f33` restored
+eight baselines and fifteen property files and did not restore the script,
+because nothing knew the script was gone.
+
+```bash
+git log --oneline -- formal/replacement_scan.py | wc -l   # 0 before 69e8f5884, 1 after
+git ls-files formal/ | grep -c baseline                   # 13 tracked, 14 on disk
+python3 formal/index_drift_scan.py                        # exit 0, ratchet holds
+```
+
+**Theorem (three states).** A git working tree presents three file sets —
+**disk**, **index**, **HEAD** — and they are independent. Every instrument under
+`formal/` reads *disk*. CI obtains its tree from `actions/checkout`, which
+materialises HEAD into index and disk together, so on a runner the three are
+**identical by construction**. Two consequences follow, opposite in sign:
+
+1. A defect that *is* a disagreement among the three — a file present on disk and
+   absent from the index, which is exactly `f66561f33` — is **invisible to every
+   gate in this repository**, because each gate reads the state where the file is
+   present.
+2. An instrument that *measures* the disagreement is **vacuous exactly where it
+   would gate**, because the runner supplies no disagreement to find.
+
+The second is not a defect in an implementation; it is a property of the subject.
+It is why this wave lands a guard and not a gate.
+
+**The guard.** All 13 baseline-owning scripts now refuse a missing baseline
+unless given `--init`. Exercised in a clean clone with each baseline moved aside:
+**13 of 13 exit 1**, each emitting exactly one `::error::`, none writes, and every
+baseline restores byte-identical. The guard is *reached* in 9 of 13; the other
+four bail earlier on a build artifact, so their guard path is untested without a
+`t27c` build. `--init` is supplied by nothing — it appears in no workflow and in
+no `run_all.py` invocation — and all 13 baselines are tracked at HEAD, so the
+branch is unreachable on a fresh clone and inert on ordinary work.
+
+**The gate, and why it does not close.** `formal/index_drift_scan.py` compares
+disk, index and HEAD across the 20 top-level trees the workflows name. On the
+working tree: **17 disk-only, 0 index-only, 44 case-only, 0 staged**, exit 0,
+`ratchet holds (61 drift entries, 61 baselined, none new)`. One of those classes
+is genuinely new — the 44 are `.trinity/seals/*.json` whose index spelling is
+`ar_Composition.json` and whose disk spelling is `ar_composition.json`, silent in
+`git status` because `core.ignorecase=true` here and not on an ubuntu runner. The
+other three classes `diff` to **zero lines** against `git status --porcelain`
+restricted to the same trees: they are a restatement.
+
+**Three adversarial lenses returned REFUTED on the gate and SURVIVED on the
+guard.** The refutations are the more useful half:
+
+- **Vacuous in CI.** Fresh clone at `f66561f33` with only the gate added:
+  `0 disk-only, 0 index-only, 0 case-only, 0 staged`, exit **0**. Clean clone at
+  `f66561f33^` — the broken commit itself — `--init` writes a **0-entry** baseline
+  and exits **0**. The gate cannot see its own motivating incident, and wiring it
+  into a workflow would make it unconditionally green.
+- **The repository root is in no population.** The population token requires a
+  `/`, so 64 tracked root files are enumerated nowhere. `git rm --cached
+  Cargo.toml` with the file still on disk — the `f66561f33` shape exactly, and
+  loud in `git status` — leaves the gate at exit **0** with its census unmoved at
+  `2402 tracked, 2402 on disk`; the identical divergence one directory down exits
+  **1**. Four untracked root files exist right now and it reports none.
+- **`gen/` is a printed population in which no `disk-only` finding is
+  reachable.** `.gitignore` names `gen/`, and `git check-ignore` calls the tree
+  un-ignored while calling every untracked file inside it ignored. A 35,892-byte
+  tracked file de-indexed *and committed* there: exit **0**.
+- **The self-exclusion claim and the findings contradict each other in one
+  output.** Exclusion is applied to the disk-only and index-only classes and not
+  to the staged class, so `git add -A formal/` — landing this change — prints the
+  Prop. 209b exclusion sentence and then lists `staged A formal/index_drift_scan.py`
+  among 15 findings, exit **1**.
+- **The remedy the error prints does not clear the error.** "Add the file"
+  converts `disk-only <path>` into `staged A <path>`: still new, still exit 1.
+  Only `git commit` returns 0.
+- **It passes on nothing.** Alone in a tree where it is the only tracked file,
+  self-exclusion empties the population on both sides and it exits **0** with a
+  zero-byte baseline: the Prop. 209b liveness check reads `tracked` *before*
+  exclusion, not after. That is the Prop. 208 shape, reproduced by Prop. 209 one
+  wave later and now a third time — in the gate whose own docstring cites it.
+
+**Corollary — a guard belongs where the state is, a gate belongs where CI is.**
+The three-state theorem partitions this campaign's instruments. A check whose
+subject exists only on a developer's disk cannot be made into a CI gate by wiring
+it up, and a green run of one is not evidence of anything. The `--init` guard is
+the right shape for this subject: it fires at the moment of the reset, on
+whatever machine performs the reset, and needs no runner to observe it.
+
+**A hard CI failure this wave did not introduce and does not fix.** `f66561f33`
+recorded `generated-rtl` 0→13 and `generated-rtl-lines` 0→1247 into
+`corpus_size_baseline.txt` from a dirty worktree, but `build/` is gitignored and
+the corpus size scan runs *before* the step that emits the RTL. A clean clone at
+HEAD exits **1** — `generated-rtl: 13 -> 0`, `generated-rtl-lines: 1247 -> 0`,
+`specs-lines: 76092 -> 75936` — reproduced independently by two measurements.
+That is this wave's own subject appearing in its own gate's baseline: a reference
+recorded from the working tree rather than from what a checkout contains.
+
+`69e8f5884` moved the corpus size scan after the RTL emit step, which retires the
+first two of those three. The third is not a baseline error and is not fixed by
+editing the baseline: `specs-lines 76092` is the size of the corpus **with** the
+55 edited `.t27` files that are still uncommitted, and those same 55 files are
+what `spec_parse_gate`, `runaway_string_scan`, `delimiter_balance_scan` and
+`capture_density_scan` each fail on in a clean clone. Overlaying them into the
+clone flips all five from fail to pass, which identifies the cause causally
+rather than by inference. Lowering the baseline to 75936 would canonicalise a
+corpus in which 22 declarations are silently swallowed by the parser and would
+still leave the other four red; the reason is now recorded as a comment inside
+`corpus_size_baseline.txt`, where the next person to be tempted will read it.
+
+**Corrected after adversarial review, and the corrections are the useful part.**
+Four of the refutations above were defects in the implementation rather than in
+the subject, and each is now closed with a harness that fails on the old code:
+
+- **The `staged` class is removed.** It is zero on every checkout by
+  construction and non-zero locally for the whole window between `git add` and
+  `git commit` — no detection power anywhere, one false red everywhere. Its
+  removal also repairs the remedy: `git add` on a `disk-only` finding now
+  returns exit 0, where before it converted the finding into a `staged` one and
+  only `git commit` cleared it.
+- **The self-exclusion is removed, so the tool reports its own two files.** The
+  measured asymmetry was exact: a cited gate script on disk and in no index
+  entry was reported when it was any other script and *not* reported when it was
+  `index_drift_scan.py` itself, and `git rm --cached` on its own baseline — the
+  precise case this proposition is about — left it at exit 0. Both now exit 1
+  and name the file. The printed sentence claiming the exclusion covered "every
+  population" was false as written: it was never applied to `staged`.
+- **Prop. 209b is answered as liveness rather than as exclusion.** The tool
+  declines when the index under its populations holds nothing but its own two
+  files, instead of exiting 0 on a population its own exclusion had emptied.
+- **The baseline is no longer shipped.** 60 of its 61 entries could not
+  reproduce on any runner — 44 `.trinity/seals` case foldings that exist only
+  because `core.ignorecase=true` here, and 16 untracked Coq build outputs whose
+  33 tracked siblings make "these particular outputs may be untracked" a policy
+  decision, not a measurement — and one entry was already stale on the day it
+  was written. It is gitignored and per-machine now, written by `--init` on the
+  machine that runs it. An untracked baseline is safe here for the reason this
+  whole proposition establishes: a missing one is an `::error::` and exit 1.
+
+**NUMBERING.** `formal/replacement_scan.py` titles itself "Gate 33" and
+`index_drift_scan.py` was written as "Gate 33" as well. The collision is resolved
+by `index_drift_scan.py` withdrawing the claim — it is an operator tool and not a
+gate, so it holds no gate number — rather than by renumbering a number already
+cited from commit messages that cannot be edited afterwards.
+
+Three bars: **TRUE** — `doc_gate`, `claims_check`, `faith_check` and
+`coverage_gate` each exit 0; `run_all.py` exit 0 (46 passed, 0 failed, 1 marked
+continue-on-error); `absence_sweep.py` exit 0 (55 diagnosed, 0 indeterminate, 7
+exempt, 0 passing on nothing); all 13 tracked baselines byte-identical to HEAD.
+**ALIVE** — all 13 guards executed with the baseline moved aside, each emitting
+one `::error::`, 9 of them reaching the guard rather than an earlier bail.
+**BITING** — `suspension_scan`, `spec_class_scan` and `coverage_gate` exit **1**
+with the baseline absent and **0** with `--init`, restoring byte-identical; the
+gate exits **1** on a clone where `formal/assume_liveness_check.sv` is de-indexed
+but present, and **0** on every clean checkout — which is the refutation above,
+not a pass.
+
+---
+
+### Prop. 212 — a wave can end with every gate green on a tree no checkout produces — `MEASURED`
+
+**Gate:** `formal-yosys.yml` → *Corpus size scan — a finding ratchet improves when you delete the subject*
+
+Prop. 211 proved that disk, index and HEAD are three independent states, and
+landed a guard for the case where they disagree. It closed with every meta-gate
+at exit 0, `run_all.py` at 46 passed / 0 failed, and 13 of 13 guards exercised —
+all measured on the **working tree**. Replaying the `prove` job on a clone
+instead, rather than reading it:
+
+**A clean clone of `69e8f5884` does not pass CI. It dies at step 9 of 65.**
+
+The job has 65 steps: 3 marketplace `uses:` actions and 62 named `run:` blocks.
+Executed in order, each block verbatim.
+
+| # | step | rc |
+|---|---|---|
+| 1–3 | `actions/checkout@v4`, `rust-toolchain@stable`, `cache@v4` | simulated |
+| 4 | Starve guard | **0** — `no interrupted-sweep stash` |
+| 5 | Install Yosys | **0** — host Yosys 0.63 substituted, see caveats |
+| 6 | Build t27c | **0** — `Finished release profile in 1m 35s` |
+| 7 | Assumptions are active in the proof flow | **0** — proves, so assumptions are live |
+| 8 | Emit the BitNet RTL bundle | **0** — 13 `.sv`, `trit_stdlib.sv` 13767 bytes |
+| **9** | **Corpus size scan** | **1 — HARD FAIL**, no `continue-on-error` |
+
+```bash
+git clone /Users/playom/t27 cc && git -C cc checkout 69e8f5884
+cargo build --release --manifest-path cc/bootstrap/Cargo.toml        # step 6
+cd cc && ./target/release/t27c gen-bitnet-bundle --output-dir build/rtl  # step 8
+python3 formal/corpus_size_scan.py                       # step 9 -> exit 1
+```
+
+```
+::error::corpus size scan: 1 population(s) shrank.
+  specs-lines: 76092 -> 75936  (156 missing)
+```
+
+**One cause, five gates.** `corpus_size_baseline.txt` records `specs-lines
+76092`. That figure was measured on a working tree carrying **55 uncommitted
+`.t27` files** — 51 with an added `test "..._smoke_test" { expect(true) }` block,
+the rest parser fixes such as `module ;` → `module string;` — totalling exactly
+the 156 missing lines. `8c8914ce4` committed the baseline; the spec edits it was
+measured from were never committed. Identified **causally**, by overlaying those
+55 files into the clone and re-running rather than by inferring from the diff:
+
+| gate | clean clone at HEAD | + the 55 uncommitted specs |
+|---|---|---|
+| `corpus_size_scan` | **1** — `specs-lines 76092 -> 75936` | **0** |
+| `spec_parse_gate` | **1** — `22 declarations swallowed` | **0** |
+| `runaway_string_scan` | **1** — 17 lines whose quotes cannot balance | **0** |
+| `delimiter_balance_scan` | **1** — 22 specs, 31 class-level imbalances | **0** |
+| `capture_density_scan` | **1** — 3 specs below 0.05 nodes/line | **0** |
+
+Five gates, one overlay, five flips. The baselines are right for the repaired
+corpus; it is the corpus that is behind. **The fix is to commit the 55 specs, not
+to lower the baseline** — 75936 would canonicalise a tree in which 22
+declarations are silently swallowed by the parser, and would unblock step 9 only
+for the job to die at the spec parse gate instead. That reasoning is now a
+comment inside `corpus_size_baseline.txt`, where the next person to be tempted
+will read it.
+
+**Step ordering is a fourth tree.** Run standalone at a terminal, before step 8,
+the same scan on the same clone reports **three** shrunk populations rather than
+one — `generated-rtl: 13 -> 0` and `generated-rtl-lines: 1247 -> 0` besides.
+`build/` is gitignored, so those two populations exist only after the generator
+has run. `69e8f5884` moved the scan after the emit step and retired both. A
+gate's verdict is therefore a function of *where in the pipeline it sits*, and
+running it by hand is neither the clean-clone answer nor the CI answer.
+
+**Theorem (a pipeline's source does not entail its outcome).** Let `S` be the
+text of a pipeline — the workflow YAML together with every script it invokes —
+and let `T` be the tree it runs against. `S` determines a *program*; an outcome
+is a property of the pair `(S, T)`. Reading `S`, or executing it against the
+developer's `T_dev`, therefore establishes a claim about CI only under the
+premise `T_dev = T_ci`, and `actions/checkout` fixes `T_ci = HEAD`. That premise
+is exactly *"`git status --porcelain` is empty"*. **Nothing in `S` checks it, and
+no gate in this repository reports it**, because every gate reads disk and disk
+is precisely where the premise fails. Here it was false by **110 files**, 55 of
+them load-bearing.
+
+The corollary is asymmetric, and it is the operational half: a **green** local
+run is evidence about `T_dev` alone, while a **red** one is evidence about the
+program and transfers. So local greenness is the single result that cannot be
+promoted to a claim about CI — and it is the result every wave promotes. Prop.
+211's three-state theorem says the disagreement is invisible; this says what it
+costs, which is that the entire verification record of a wave can be true and
+still describe a tree that no `git clone` will ever produce.
+
+**Prop. 211's theorem, turned on the wave that proved it.** Prop. 211 records
+that a defect which *is* a disk/index/HEAD disagreement is invisible to every
+gate here. Its own wave then shipped one — a baseline value that exists on disk
+and in no commit — in the same directory as the instrument written to detect the
+class. The instrument did not detect it; a clone did.
+
+**Every refutation the verifiers produced.** Two adversarial lenses: one on the
+change, one on the pipeline. The `--init` guard survived every question put to
+it; `index_drift_scan.py` survived one of five.
+
+| # | refutation | measured | disposition |
+|---|---|---|---|
+| 1 | the gate cannot report **itself** as the lost file | its own script de-indexed while a workflow cites it → **0**; an identically-situated non-self script → **1** | closed — `mine` filter removed |
+| 2 | it cannot see **its own baseline** leave the index — Prop. 211's exact case | `git rm --cached formal/index_drift_baseline.txt && git commit` → tracked 5→4, gate reports `0 disk-only, 0 index-only`, exit **0** | closed — now exit **1** |
+| 3 | its printed exclusion claim is **false** | it prints *"excludes itself and its baseline from every population"*; `staged_vs_head()` applies no filter, so `git add` on its own source → `staged M`, exit **1** | closed — class deleted, sentence replaced |
+| 4 | it goes red on **ordinary work** | on the real repo one untracked probe file → **1**; in a synthetic repo `git add` of a new spec → **1**; an edit to a tracked spec after `git add` → **1**; only `git commit` returns 0 | closed — `staged` class removed; the printed remedy now clears the error |
+| 5 | its baseline is a snapshot of **this laptop** | 60 of 61 entries cannot reproduce on a runner: 44 case foldings that exist only under `core.ignorecase=true`, 16 untracked Coq outputs whose **33 tracked siblings** make that a policy decision rather than a measurement | closed — gitignored, per-machine, minted by `--init` |
+| 6 | the baseline was **stale when written** | `formal/replacement_scan.py` listed as `disk-only` while tracked at `69e8f5884`; every run printed `1 baselined disagreement(s) are gone` | closed with 5 |
+| 7 | it is **run by nothing** — the condition its own docstring uses to condemn `replacement_scan.py` | `grep -rn index_drift .github/ .git/hooks/` → no match | closed by **withdrawal**: it claims no gate number and is named at run time by `run_all.py` |
+| 8 | it declines correctly when starved | non-git dir, empty repo, no workflow citation, empty index, absent baseline → **1** each, five distinct `::error::` messages | SURVIVED |
+| 9 | the `--init` guard alters no baseline | all 12 changed gates run, then 3 with `--init`: `git diff --exit-code -- 'formal/*baseline*.txt'` → **0**, byte-identical | SURVIVED |
+| 10 | the guard breaks a gate that legitimately has no baseline | all 13 baselines exist on disk and in HEAD; no workflow passes `--init`; no gate has a `--self-test` expecting a rewrite | SURVIVED |
+| 11 | the guard fires on ordinary work | unreachable while a baseline exists; it also closes a real data-loss path, since `absence_sweep.recover()` never overwrites a destination and then `rmtree`s the stash, so a gate-written baseline would have survived and the original been deleted | SURVIVED |
+| 12 | **a clean clone at HEAD does not pass CI** | step 9 of 65, exit **1**, reproduced on three independent runs | **OPEN — not fixed here** |
+| 13 | `gate-scripts` growth was **unratcheted** | 37→38 and 5768→6103 in the clone; growth only prints, so the rise could be given back with nothing going red | closed — ratcheted to 39 / 6643 |
+
+Refutation 12 is the one this proposition exists for and the one it does not
+close. The fix is a commit of `specs/`, which is outside this change's scope, so
+it is recorded rather than repaired.
+
+Three bars: **TRUE** — `doc_gate` exit **0** (209 propositions, 209 gate lines, 0
+problems), `claims_check` exit **0** (9 checkable claims, 0 stale), `faith_check`
+exit **0** (39 gates, 0 undeclared), `coverage_gate` exit **0** (ratchet holds).
+**ALIVE** — the replay executed steps 4–9 on a clone built from scratch and
+returned six distinct results, not a uniform one; step 9 printed 11 populations
+with none at zero; the five failing gates each named a different finding class.
+**BITING** — step 9 exits **1** on a clean clone at HEAD naming `specs-lines` and
+the 156 missing lines, and **0** once the 55 specs are overlaid; the four
+downstream gates go **1 → 0** on that same overlay, which is the causal
+identification and not an inference from the diff.
+
+**Caveats on the measurement.** The host is macOS 26 arm64, not `ubuntu-latest`,
+so step 5 (`sudo apt-get install -y yosys`) cannot run and host Yosys 0.63 was
+substituted; every yosys verdict in a replay on this host carries a version
+caveat. Step 9 does not — it is pure Python over the file tree and is
+host-independent, which is why it is the one this proposition rests on. Steps
+1–3 are marketplace actions and were simulated. Steps 10–65 were not re-executed
+for this proposition.
+
+---
+
+### Prop. 213 — the L1 gate was not leaky, it was off; and a ratchet was raised to a file no commit contains — `MEASURED`
+
+**Gate:** `formal-yosys.yml` → *Corpus size scan — a finding ratchet improves when you delete the subject*; `l1-traceability.yml` → *Check for Closes #N in commits*
+
+Prop. 212 replayed the `prove` job on a clone and found it dead at step 9 of 65.
+It closed with one shrunk population and named the fix as a commit of `specs/`.
+This wave replays the same job one commit later, at `c55e5075a`, and asks the
+same question of the other gate this branch relies on — the commit-message hook
+that every one of its 800 commits passed. **Both answers have the same shape,
+and it is not the shape either instrument advertises.**
+
+#### The clone got worse, and the commit that made it worse said so in its own message
+
+Replayed against a clean clone at HEAD, steps parsed from the YAML rather than
+transcribed, each `run:` block executed verbatim under `/bin/bash -e`:
+
+| # | step | rc |
+|---|---|---|
+| 1–3 | `actions/checkout@v4`, `rust-toolchain@stable`, `cache@v4` | simulated |
+| 4 | Starve guard | **0** |
+| 5 | Install Yosys | **0** — host Yosys 0.63 substituted, see caveats |
+| 6 | Build t27c | **0** — `Finished release profile in 1m 21s` |
+| 7 | Assumptions are active in the proof flow | **0** — `no model found: SUCCESS!` |
+| 8 | Emit the BitNet RTL bundle | **0** — 13 `.sv`, `trit_stdlib.sv` 13767 bytes |
+| **9** | **Corpus size scan** | **1 — HARD FAIL**, no `continue-on-error` |
+
+Prop. 212 recorded **one** shrunk population at `69e8f5884`. At `c55e5075a`
+there are **three**:
+
+```
+::error::corpus size scan: 3 population(s) shrank.
+  gate-scripts:       39 -> 38    (1 missing)
+  gate-scripts-lines: 6643 -> 6225  (418 missing)
+  specs-lines:        76092 -> 75936  (156 missing)
+```
+
+Refutation 13 of Prop. 212 read *"`gate-scripts` growth was unratcheted — 37→38
+and 5768→6103 in the clone; growth only prints, so the rise could be given back
+with nothing going red"*, and it was closed by ratcheting to **39 / 6643**. That
+39 counts `formal/index_drift_scan.py`. The same commit's message states
+**"index_drift_scan is NOT landed."** `git log --all -- formal/index_drift_scan.py`
+returns empty — the file has never been committed on any branch, and is not on
+disk here either. The reference was raised to include a file no checkout can
+produce, by the commit that said it was not producing it.
+
+The baseline predicted this in a committed comment, four lines above the numbers
+it predicted about: *"THESE TWO NUMBERS ASSUME THE SAME COMMIT CARRIES
+formal/index_drift_scan.py AND all 12 guarded gates. Landing a subset makes the
+scan report a shrink."* A subset was landed. **A prediction written into the
+artifact it is about does not prevent the thing it predicts**; nothing reads a
+comment.
+
+This needs no clone to establish, which is the useful part — the populations are
+functions of the object store, so HEAD can be measured directly and the answer
+is host-independent:
+
+```bash
+git ls-tree -r --name-only HEAD | grep -c '^specs/.*\.t27$'     # 497
+git ls-tree -r --name-only HEAD | grep -c '^formal/.*\.py$'     # 38
+python3 formal/corpus_size_scan.py                              # worktree: exit 0
+```
+
+| population | HEAD | baseline before | baseline now | worktree |
+|---|---|---|---|---|
+| `specs` | 497 | 497 | 497 | 497 |
+| `specs-lines` | **75936** | 76092 | 76092 | 76092 |
+| `gate-scripts` | **38** | 39 | **38** | 38 |
+| `gate-scripts-lines` | **6225** | 6643 | **6225** | 6225 |
+
+The two `gate-scripts` rows are repaired by lowering the baseline, and lowering
+it is correct **here and only here**: `git diff --name-status 69e8f5884
+c55e5075a -- 'formal/*.py'` is 13 `M` and zero `D`, and the series across the
+three commits is 37 → 38 → 38 and 5768 → 6103 → 6225, monotone. No growth is
+given back; a number that was never true of any commit is withdrawn. The
+`specs-lines` row is **not** repaired, for the reason Prop. 212 gives.
+
+#### The commit-message gate was not leaky. It was off.
+
+Every commit on this branch passed a local L1 check. The file that ran was
+`.git/hooks/commit-msg`, mtime **2026-04-30**, untracked, and superseded four
+months ago by `bootstrap/src/hooks.rs` — which prints `L1 TRACEABILITY: ok`
+where the stale copy prints `✅ L1 TRACEABILITY check passed`, so which one ran
+is decidable from the output alone. `core.hooksPath` was unset, so the tracked
+`.githooks/` shims that exec the modern implementation were dead files sitting
+beside it. `.git/hooks/pre-commit` had been hand-edited as recently as
+**2026-08-12**: the directory looked maintained.
+
+**Defect A — the regex contains no digit.** `.git/hooks/commit-msg:35`:
+
+```
+grep -qE "(Closes #|Fixes #|Resolves #|closes #|fixes #|resolves #)"
+```
+
+Seven literal characters. `Closes #` with nothing after it is not merely
+accepted — it is the strongest possible match.
+
+**Defect B — the "amend" exemption never checks for an amend.** Lines 23–29
+read **`HEAD`'s** message, find a reference in it, and `exit 0` before the
+candidate message is examined at all. HEAD is `c55e5075a`, whose own message
+ends in a bare `Closes #`. So the gate was not deciding messages; it was
+deciding its own parent, and answering yes.
+
+Seven messages, the stale hook invoked exactly as git invokes it, against the
+modern implementation on the same repository:
+
+| message | `.git/hooks/commit-msg` | `t27c hook-commit-msg` |
+|---|---|---|
+| `Closes #123` | **0**, no output | 0 — `#123 exists (MERGED)` |
+| `Closes #` | **0**, no output | **1** — closing verb, `#`, no number |
+| `Closes #abc` | **0**, no output | **1** — same |
+| `chore: no reference here` | **0**, no output | **1** — must reference an issue |
+| `see #123 in passing` | **0**, no output | **1** — number, no closing verb |
+| `Fixes #0` | **0**, no output | **1** — `#0 does not exist` |
+| `Resolves #999999` | **0**, no output | **1** — `#999999 does not exist` |
+
+The left column is not seven passes. It is **one bypass, seven times** — rc 0
+with an empty stdout in every row, including the row a broken regex would still
+have caught. Defect B subsumes Defect A entirely, and the silence is the tell: a
+gate that is passing prints, a gate that is off does not.
+
+```bash
+printf 'chore: no reference here\n' > /tmp/m
+.git/hooks/DISABLED-commit-msg.stale-2026-04-30 /tmp/m   # rc 0, stdout empty
+./target/release/t27c hook-commit-msg /tmp/m --repo-root .   # rc 1
+```
+
+**The census.** 986 commits on `main..HEAD`, 186 merges excluded as legitimately
+exempt, **800** non-merge:
+
+| verdict | count |
+|---|---|
+| a closing verb and a number | **410** |
+| a closing verb and a bare `#` | **10** |
+| no closing verb at all | **380** |
+| **would fail a correct form check** | **390 — 48.8%** |
+
+All ten empty references: `c55e5075a` (HEAD), `a8010547c`, `a346961b0`,
+`ff93ea459`, `aaec99f96`, `c6e4a65c2`, `8def2d11f`, `a4c38e43b`, `2955cfd1a`,
+`c8c3e7fcb`. Counted with the modern implementation's own semantics — verb in
+{`closes`,`fixes`,`resolves`}, then `#`, then digits — because the boundary is a
+measurement choice and a looser one returns 11: `61f633538`'s subject is
+*"fix #// syntax"*, which matches a naive `fix\s*#` and is not a reference.
+
+Neither hook ever asked whether an issue **exists**. There is no `gh`, no
+`curl`, no `api.github` anywhere in the stale file. `Closes #999999` passed both
+it and the modern implementation as it stood.
+
+#### Theorem (the free state variable)
+
+A gate is not a predicate. It is a **pair** — a predicate `P` and the state `σ`
+it is evaluated on — and the name of a gate records only `P`. Whenever the state
+the implementation reads differs from the state the claim is about, the verdict
+carries **no information about the subject**, and the failure is silent by
+construction because a gate that always returns 0 and a gate whose subject is
+clean produce identical observations.
+
+Three instances, one shape:
+
+| instrument | claim is about | implementation read | consequence |
+|---|---|---|---|
+| `.git/hooks/commit-msg` | the candidate message | `HEAD`'s message | 800 of 800 accepted |
+| `corpus_size_baseline.txt` | the corpus at HEAD | the working tree, and one file in no tree at all | 3 populations shrink on checkout |
+| every gate under `formal/` | what CI will do | disk | Prop. 212's premise, unchecked |
+
+The corollary is the operational half, and it is about **evidence**, not code:
+an accepting run of a gate is compatible with the gate being absent, so
+acceptance establishes nothing. Only a **refusal** distinguishes the two. This
+is why the seven-message table above is the whole of the L1 argument and the
+800 green commits are none of it, and why Prop. 194's `COVERAGE.` requirement,
+Prop. 208's self-matching floor and Prop. 211's `--init` guard are all the same
+requirement arriving three times: **name the state, then show a refusal on it.**
+
+Prop. 212 proved an outcome is a property of `(source, tree)`. This adds that
+the tree is a free variable in the *instrument* as well as in the run, and that
+a reference file is an instrument.
+
+#### What this wave landed
+
+- `bootstrap/src/hooks.rs` — a digit is required after `#`; the amend exemption
+  is deleted outright, so no message is exempted by its parent; an existence
+  check calls `gh` and blocks only on the one stderr phrase that means GitHub
+  answered *absent*. **18 unit tests pass, up from 10.**
+- `.githooks/commit-msg` and `.githooks/pre-commit` — a missing
+  `target/release/t27c` now **refuses** the commit. Both shims previously
+  printed "skipping" and `exit 0`, which is this proposition's own theorem one
+  layer down: a check that disables itself when it cannot run is a check whose
+  state is "not this repository".
+- `formal/corpus_size_baseline.txt` — `gate-scripts` 39→38 and
+  `gate-scripts-lines` 6643→6225, with the evidence recorded in the file.
+- `scripts/verify_all_152.py` — six committed conflict markers resolved; the
+  file now compiles and runs. See refutation 10.
+- `core.hooksPath` set to `.githooks`; the three shadow copies renamed
+  `DISABLED-*` rather than deleted, so the evidence above stays reproducible.
+
+The existence check **degrades and never blocks on silence**. Measured, valid
+reference in the left column, empty reference in the right:
+
+| condition | `Closes #123` | `Closes #` |
+|---|---|---|
+| `gh` not on `PATH` | 0 — `gh could not be run` | **1** |
+| no GitHub remote | 0 — `none of the git remotes…` | **1** |
+| host unreachable | 0 — `error connecting to…` | **1** |
+| `gh` hangs | 0 — `did not answer within 4s`, elapsed 4s | **1** |
+
+The **form** check never degrades; only the existence check does. Absence of an
+answer is not an answer of absence — the distinction is a pure function with its
+own unit tests, because that is the line a network-dependent gate gets wrong.
+
+#### Every refutation
+
+| # | refutation | measured | disposition |
+|---|---|---|---|
+| 1 | the journal's final state was wrong — it recorded **one** shrink | three at `c55e5075a`, reproduced from the object store without a clone | not a contradiction: two shrinks were **added** by the commit after it |
+| 2 | the "three shrinks" seen by a second agent were **the same three** | its three were `generated-rtl 13→0` and `-lines 1247→0` plus `specs-lines`, from running the scan **before** step 8 | different cause, same count — a coincidence that would have read as agreement |
+| 3 | a fresh clone "got through all 65 steps", so CI is fine | it did so only after the pending work was **committed inside the disposable clone** | that is Prop. 212's artificial tree, produced by the wave that named it |
+| 4 | the L1 hook is **leaky** — six of seven cases pass | all seven return 0 with **empty output**, including the case a broken regex rejects | not leaky: **off**. Defect B subsumes Defect A |
+| 5 | then Defect A is cosmetic | it is the gate's entire acceptance test, and is what runs the moment a parent lacks a reference — of the **551** branch commits with no valid reference, **70** had a parent that carried one, so B alone exempted those; the other 481 would have been refused even by the broken regex, meaning the hook was bypassed outright | both closed; the census is the same either way |
+| 6 | the modern implementation was already correct, so nothing was broken | correct **and not installed**: `core.hooksPath` unset, `.githooks/` dormant, the April copy authoritative | consolidating logic does not retire a copy; only `core.hooksPath` does |
+| 7 | `Closes #999999` and `Closes #0` pass | both passed the stale hook **and** the modern one — neither asked GitHub anything | closed — existence check added; both now exit 1 |
+| 8 | the shim fails open | `[ -x "$t27c" ] || { echo "…skipping"; exit 0; }` — the same shape one layer down | closed — refuses, names the build command, `--no-verify` remains the visible escape |
+| 9 | the fix will land red on 390 commits | `commit-msg` runs on new commits only; nothing already committed is touched | recorded — any CI gate over history must ratchet from 390, not from 0 |
+| 10 | resolving `verify_all_152.py`'s conflict markers is a judgement call | neither side ran alone — one imported `mp` where `PHI` needs `mpf`, the other never defined the name its loop appends to; and **outside** every marker, identical on both sides, `expected, tolerance = EXPECTED.get(...)` made `target, tol = expected` raise `TypeError` on the first formula | the resolution is forced, not chosen; the file had never reached its own comparison |
+| 11 | a committed file that does not parse would have gone red somewhere | nothing references it; **10 further committed `.py` files do not parse**; `corpus_size_scan` counts `formal/*.py` only | **OPEN** — no gate detects this class, and one that started red would be disabled |
+| 12 | the hook and CI agree on what L1 means | `l1-traceability.yml:61` also accepts `Refs #N` / `Updates #N` and the singular verbs; the hook accepts three verbs | the local gate is the stricter one, so no surprise red — but two definitions exist |
+| 13 | **a clean clone at HEAD still fails at step 9** | one shrink remains, `specs-lines 76092 -> 75936`, the 55 uncommitted `.t27` files | **OPEN — not fixed here**, carried from Prop. 212 |
+| 14 | the corpus baseline was lowered to make a gate pass | `git log --all` shows the counted file in no commit; `diff --name-status` is 13 `M`, 0 `D`; the series is monotone 37→38→38 | SURVIVED — a number true of no commit is withdrawn, not a loss accepted |
+| 15 | the existence check blocks work when GitHub is unreachable | four degradation paths, each passes with a printed note; only `could not resolve to an issue` blocks | SURVIVED |
+| 16 | this wave's own paperwork cites an issue that exists | it cites **none**: `#2149` does not resolve on `gHashTag/t27`, and neither does `#2148`, which the previous `NOW.md` entry claims to close | recorded in `NOW.md` rather than fabricated — refusing to write a reference that names nothing is the subject of this proposition |
+
+Three bars: **TRUE** — `doc_gate` exit **0** (210 propositions, 210 gate lines, 0
+problems), `claims_check` exit **0** (9 checkable claims, 0 stale), `faith_check`
+exit **0** (38 gates, 0 undeclared), `coverage_gate` exit **0** (ratchet holds);
+`cargo test -p t27c --bin t27c hooks::` 18 passed, 0 failed;
+`python3 -m py_compile scripts/verify_all_152.py` exit 0 and the script runs to
+`PASS: Exact identity (Delta = 0)`. **ALIVE** — the seven-message probe returns
+**four distinct verdicts** from the modern hook (ok, no number, no verb, does not
+exist) against **one uniform rc 0** from the stale one; the corpus scan prints 11
+populations with none at zero; the census separates 800 commits into three
+classes, none empty. **BITING** — the hook exits **1** on six of seven messages
+including the one HEAD itself carries, and on `Fixes #0` for a reason no regex
+can produce; the corpus scan exits **1** on a clean clone at HEAD naming
+`specs-lines` and 156 lines, and exited **1** on three populations before the
+baseline was corrected.
+
+**Caveats on the measurement.** The host is macOS 26 arm64, not `ubuntu-latest`:
+step 5 (`sudo apt-get install -y yosys`) cannot run and host Yosys 0.63 was
+substituted, so step 7's proof carries a version caveat. Step 9 does not — it is
+pure Python over the file tree, and the HEAD figures above were re-derived from
+`git ls-tree` and `git show`, which is host-independent and needs no clone.
+Steps 1–3 are marketplace actions and were simulated; steps 10–65 were not
+re-executed. The step 1–8 exit codes are the replay's, carried forward; the step
+9 verdict, the population figures, the seven-message table, the 800-commit
+census and the four meta-gate exits were re-measured here.
+
+---
+
 ## 2. Related work — verified citations
 
 Titles fetched from each source's own metadata on 2026-08-09; none is quoted

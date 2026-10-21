@@ -90,26 +90,35 @@ fn gf32_encode(value: f64) -> u32 {
     let ieee_exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
     let ieee_mant = bits & 0x000FFFFFFFFFFFFF;
 
-    let mut gf32_exp = ieee_exp + 2047; // GF32_BIAS = 2047
+    let mut gf32_exp = ieee_exp + 127;
     if gf32_exp < 0 { gf32_exp = 0; }
-    if gf32_exp > 4094 { gf32_exp = 4094; }
+    if gf32_exp > 254 { gf32_exp = 254; }
 
-    // Convert from 52-bit IEEE mantissa to 19-bit GF32 mantissa
-    let gf32_mant = (ieee_mant >> 33) & 0x7FFFF;
+    let mut gf32_mant = (ieee_mant >> 29) as u32;
 
-    (((sign as u64) | ((gf32_exp as u64) << 19) | (gf32_mant as u64)) & 0xFFFFFFFF) as u32
+    let discarded = ieee_mant & 0x1FFFFFFF;
+    let halfway = 1u64 << 28;
+    if discarded > halfway || (discarded == halfway && (gf32_mant & 1) != 0) {
+        gf32_mant += 1;
+        if gf32_mant > 0x7FFFFF {
+            gf32_mant = 0;
+            if gf32_exp < 254 { gf32_exp += 1; }
+        }
+    }
+
+    sign | ((gf32_exp as u32) << 23) | (gf32_mant & 0x7FFFFF)
 }
 
 fn gf32_decode(value: u32) -> f64 {
-    if value == 0 {
-        return 0.0f64;
+    if (value & 0x7FFFFFFF) == 0 {
+        return if (value & 0x80000000) != 0 { -0.0f64 } else { 0.0f64 };
     }
 
     let sign_f = if (value & 0x80000000) != 0 { -1.0f64 } else { 1.0f64 };
-    let exp = ((value >> 19) & 0xFFF) as i32;
-    let mant = (value & 0x7FFFF) as f64;
+    let exp = ((value >> 23) & 0xFF) as i32;
+    let mant = (value & 0x7FFFFF) as f64;
 
-    if exp == 4095 {
+    if exp == 255 {
         return if mant == 0.0 {
             if sign_f < 0.0 { f64::NEG_INFINITY } else { f64::INFINITY }
         } else {
@@ -117,24 +126,25 @@ fn gf32_decode(value: u32) -> f64 {
         };
     }
 
-    let mant_norm = 1.0f64 + mant / 524288.0f64;
-    let exp_adj = exp - 2047;
+    let mant_norm = 1.0f64 + mant / 8388608.0f64;
+    let exp_adj = exp - 127;
     sign_f * mant_norm * 2.0_f64.powi(exp_adj)
 }
 
 fn gf32_is_zero(value: u32) -> bool {
-    value == 0
+    (value & 0x7FFFFFFF) == 0
 }
 
 fn gf32_is_inf(value: u32) -> bool {
-    let exp = ((value >> 19) & 0xFFF) as i32;
-    exp == 4095
+    let exp = ((value >> 23) & 0xFF) as i32;
+    let mant = (value & 0x7FFFFF) as i32;
+    exp == 255 && mant == 0
 }
 
 fn gf32_is_nan(value: u32) -> bool {
-    let exp = ((value >> 19) & 0xFFF) as i32;
-    let mant = (value & 0x7FFFF) as i32;
-    exp == 4095 && mant != 0
+    let exp = ((value >> 23) & 0xFF) as i32;
+    let mant = (value & 0x7FFFFF) as i32;
+    exp == 255 && mant != 0
 }
 
 // ============================================================================

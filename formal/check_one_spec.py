@@ -4,7 +4,6 @@
     python3 formal/check_one_spec.py <spec-path> [tree-id]
 
 `zig test <file>` makes that file its own module root, so a cross-directory
-import shutil
 import is rejected outright (#2682). The spec is therefore compiled through a
 `comptime` shim at the top of the tree, which is where the emitted paths are
 written against.
@@ -20,6 +19,7 @@ import hashlib
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 

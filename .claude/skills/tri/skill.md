@@ -22,6 +22,36 @@ Execute the PHI LOOP workflow for Trinity S³AI Framework development. This skil
 - DO NOT offer "seal + verify + commit"
 - ONLY offer: `tri skill begin --issue N` or `tri status`
 
+## Herding the bee swarm remotely (owner rule, 2026-10-11, #9013)
+
+Bees run on the swarm's own models. Their work costs nothing from the session's weekly budget. Give them large, decomposed work; keep the session for design, review and merging. Everything below works through GitHub alone, including from a phone.
+
+1. **Turn an epic into bee issues.** One issue per small step that can be checked, in the format the Queen parses:
+   - `## Requirements` holds FR-NNN lines.
+   - `## Success Criteria` holds `- ` items only. Each is a command that prints a value, such as `t27c spec-status <spec>` printing `IMPLEMENTED`, or `grep -c '<marker>' <file>` printing `1`.
+   - Every criterion must FAIL when the issue is filed. Never count the output of a command that can fail silently.
+   - `## Boundary` comes LAST, one repo-relative path per line, nothing else.
+   - Every body states the DRY rule (search first, `use` instead of copying) and the only-t27 rule.
+   - Template: #9010.
+2. **Steer with labels.** `specs/queen/priority.t27` reads them:
+   - `P0` / `priority/critical`: critical. Critical is capped, so keep it for the single next step.
+   - `priority/high` / `high-priority`: high.
+   - `P2` / `priority/medium`, and `P3` / `priority/low`.
+
+   Relabel from the GitHub app to reorder the swarm.
+3. **Watch the swarm.**
+   - `tri priority` shows the order the Queen takes issues in.
+   - `tri swarm` shows lanes, finished per hour and the model ranking.
+   - The public board and `/queen/status` show `reviewable` against `reviewedLastHour`.
+   - Silence is not success. Read throughput over a window.
+4. **Gate bee PRs before auto-merge.**
+   - The own-language gate: foreign code only shrinks (#8236).
+   - The duplicate-bodies ratchet (DRY, #8963).
+   - A ledger row in `docs/reports/t27b_expectations.json` for every new spec.
+   - After the merge, a receipt compare of the squash commit against its parent.
+   - Send back a PR that copies an existing function or writes outside its Boundary.
+5. **Design before fan-out.** Hand bees only steps whose design is settled. An open design question goes to one agent or the owner first.
+
 ## Constitutional Foundation
 
 Always honor these foundational documents:
