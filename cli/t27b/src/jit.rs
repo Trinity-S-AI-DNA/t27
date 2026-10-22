@@ -186,6 +186,10 @@ pub struct Jit {
     /// so Rust only touches it through volatile raw-pointer accesses.
     state: *mut TrapState,
     pub code_words: usize,
+    /// Backing store of the module-level vars. Generated code writes it, so
+    /// Rust only touches it through raw pointers (in `call_fp`).
+    globals_mem: Vec<u64>,
+    globals_init: Vec<u8>,
 }
 
 type Enter = unsafe extern "C" fn(target: *const u8, args: *const u64) -> u64;
@@ -246,8 +250,12 @@ fn prefix(state: u64) -> (Vec<u32>, usize) {
 
 impl Jit {
     /// Link `funcs` behind the trampoline, append `data` (`Program::data`)
-    /// and map the result executable.
-    pub fn load(funcs: &[FuncCode], nfuncs: usize, data: &[Vec<u8>]) -> Result<Jit, String> {
+    /// and map the result executable. `globals` (`Program::globals`) are the
+    /// initial bytes of the module-level vars; they live in a writable heap
+    /// region outside the image, reached through a table of their addresses
+    /// appended after `data`, and are reset to these bytes on every call
+    /// (each test of the reference runs in a fresh process).
+    pub fn load(funcs: &[FuncCode], nfuncs: usize, data: &[Vec<u8>], globals: &[Vec<u8>]) -> Result<Jit, String> {
         if !JIT_SUPPORTED {
             return Err("the t27b JIT runs only on arm64 macOS and arm64 Linux; use `t27b build` for an object file".into());
         }
@@ -262,6 +270,17 @@ impl Jit {
         // `adrp` page on Linux), so page arithmetic relative to the image
         // start is the same as on absolute addresses.
         let data_at = (code.len() * 4 + 15) & !15;
+        let (g_offs, g_len) = codegen::data_layout(globals);
+        let mut globals_init = vec![0u8; g_len];
+        for (b, &o) in globals.iter().zip(&g_offs) {
+            globals_init[o..o + b.len()].copy_from_slice(b);
+        }
+        let mut globals_mem = vec![0u64; (g_len + 7) / 8 + 1];
+        let g_base = globals_mem.as_mut_ptr() as u64;
+        let table: Vec<u8> = g_offs.iter().flat_map(|&o| (g_base + o as u64).to_le_bytes()).collect();
+        let mut data: Vec<Vec<u8>> = data.to_vec();
+        data.push(table);
+        let data = &data[..];
         let (blob_offs, data_len) = codegen::data_layout(data);
         codegen::resolve_data(&mut code, &data_refs, &blob_offs, data_at)?;
         let mut image: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -287,6 +306,8 @@ impl Jit {
             offsets,
             state,
             code_words: code.len(),
+            globals_mem,
+            globals_init,
         })
     }
 
@@ -311,6 +332,13 @@ impl Jit {
         regs[8..8 + dargs.len()].copy_from_slice(dargs);
         // SAFETY: `state` is a live allocation owned by `self`.
         unsafe { std::ptr::write_volatile(self.state, TrapState::default()) };
+        // Fresh module-level vars for every entry. The buffer is never
+        // reallocated, so the addresses in the image's table stay valid.
+        let n = self.globals_init.len();
+        // SAFETY: `globals_mem` holds at least `n` bytes (see `load`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.globals_init.as_ptr(), self.globals_mem.as_mut_ptr() as *mut u8, n);
+        }
         // SAFETY: `base` is the start of our executable mapping, word 0 is
         // the `enter` trampoline with the C signature `Enter`, `off` is the
         // start of a function compiled for this image, and `regs` outlives

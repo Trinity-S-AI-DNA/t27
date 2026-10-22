@@ -35,12 +35,20 @@ uint8_t claim_code(uint8_t alive, uint32_t age_min, uint32_t limit_min);
 bool railway_old(uint32_t major);
 bool ledger_quiet(uint32_t age_min, uint32_t limit_min);
 uint8_t checkout_code(bool ok, bool recloned);
+uint8_t image_code(bool master_known, bool reported, bool same);
 bool cap_rise_is_new(uint32_t not_pass, uint32_t old_cap, uint32_t new_not_pass);
+bool header_stored(uint8_t field);
 bool is_alarm(uint8_t t, uint8_t reference);
+bool is_alarm_tests(uint8_t t, uint8_t reference, bool compared, uint32_t disagree);
+bool lanes_stop(uint32_t jit_interp_mismatch, uint32_t reference_disagree);
 uint8_t check_effect(uint8_t state, uint8_t master, bool required);
+uint8_t master_state(bool running, uint8_t last);
 uint8_t effect_fold(uint8_t acc, uint8_t e);
 uint8_t pr_ready(bool open, uint8_t mergeable, bool base_master, uint8_t required, uint8_t other);
 uint8_t watch_action(uint8_t verdict, uint8_t parent);
+uint8_t lane_kind(uint8_t reference, uint8_t t);
+uint32_t lane_score(uint32_t sole, uint32_t first);
+uint32_t with_tests(uint32_t reference, uint32_t vacuous);
 
 /* -------------------------------------------------------
    Function implementations
@@ -265,11 +273,34 @@ uint8_t checkout_code(bool ok, bool recloned) {
     return 0;
 }
 
+uint8_t image_code(bool master_known, bool reported, bool same) {
+    if ((master_known == false)) {
+        return 0;
+    }
+    if ((reported == false)) {
+        return 1;
+    }
+    if ((same == false)) {
+        return 1;
+    }
+    return 0;
+}
+
 bool cap_rise_is_new(uint32_t not_pass, uint32_t old_cap, uint32_t new_not_pass) {
     if ((not_pass < new_not_pass)) {
         return true;
     }
     return ((not_pass - new_not_pass) <= old_cap);
+}
+
+bool header_stored(uint8_t field) {
+    if ((field == 5)) {
+        return false;
+    }
+    if ((field > 5)) {
+        return false;
+    }
+    return true;
 }
 
 bool is_alarm(uint8_t t, uint8_t reference) {
@@ -286,6 +317,28 @@ bool is_alarm(uint8_t t, uint8_t reference) {
         return true;
     }
     if ((t == 8)) {
+        return true;
+    }
+    return false;
+}
+
+bool is_alarm_tests(uint8_t t, uint8_t reference, bool compared, uint32_t disagree) {
+    if (is_alarm(t, reference)) {
+        return true;
+    }
+    if (compared) {
+        if ((disagree > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lanes_stop(uint32_t jit_interp_mismatch, uint32_t reference_disagree) {
+    if ((jit_interp_mismatch > 0)) {
+        return true;
+    }
+    if ((reference_disagree > 0)) {
         return true;
     }
     return false;
@@ -312,6 +365,16 @@ uint8_t check_effect(uint8_t state, uint8_t master, bool required) {
     return 0;
 }
 
+uint8_t master_state(bool running, uint8_t last) {
+    if ((running == false)) {
+        return last;
+    }
+    if ((last == 2)) {
+        return 2;
+    }
+    return 1;
+}
+
 uint8_t effect_fold(uint8_t acc, uint8_t e) {
     if ((e > acc)) {
         return e;
@@ -336,6 +399,9 @@ uint8_t pr_ready(bool open, uint8_t mergeable, bool base_master, uint8_t require
         return 5;
     }
     if ((required == 1)) {
+        return 1;
+    }
+    if ((other == 1)) {
         return 1;
     }
     if ((mergeable != 0)) {
@@ -366,9 +432,42 @@ uint8_t watch_action(uint8_t verdict, uint8_t parent) {
     return 3;
 }
 
+uint8_t lane_kind(uint8_t reference, uint8_t t) {
+    if ((t != 2)) {
+        return 0;
+    }
+    if ((reference == 0)) {
+        return 1;
+    }
+    if ((reference == 1)) {
+        return 0;
+    }
+    if ((reference > 8)) {
+        return 0;
+    }
+    return 2;
+}
+
+uint32_t lane_score(uint32_t sole, uint32_t first) {
+    return ((sole * 1000) + first);
+}
+
+uint32_t with_tests(uint32_t reference, uint32_t vacuous) {
+    if ((vacuous > reference)) {
+        return 0;
+    }
+    return (reference - vacuous);
+}
+
 /* -------------------------------------------------------
    Invariants (compile-time assertions)
    ------------------------------------------------------- */
+
+/* invariant: reference_disagree_always_stops */
+/* invariant reference_disagree_always_stops is not a C constant expression: lanes_stop(0, 1) */
+
+/* invariant: no_total_in_the_ledger_header */
+/* invariant no_total_in_the_ledger_header is not a C constant expression: (header_stored(5) == false) */
 
 /* invariant: gained_never_red */
 /* invariant gained_never_red is not a C constant expression: (delta_is_red(delta_code(0, 0, 2, 0, 0, 1)) == false) */
@@ -593,6 +692,22 @@ void test_doctor_checkout_kept(void) {
     assert_eq(checkout_code(true, false), 0);
 }
 
+void test_doctor_image_master_unknown(void) {
+    assert_eq(image_code(false, false, false), 0);
+}
+
+void test_doctor_image_unreported_is_stale(void) {
+    assert_eq(image_code(true, false, false), 1);
+}
+
+void test_doctor_image_differs(void) {
+    assert_eq(image_code(true, true, false), 1);
+}
+
+void test_doctor_image_current(void) {
+    assert_eq(image_code(true, true, true), 0);
+}
+
 void test_bless_rise_all_new(void) {
     assert(cap_rise_is_new(594, 582, 41));
 }
@@ -641,6 +756,44 @@ void test_alarm_blocked_never(void) {
     assert((is_alarm(2, 0) == false));
 }
 
+void test_alarm_shared_fail_same_tests(void) {
+    assert((is_alarm_tests(5, 5, true, 0) == false));
+}
+
+void test_alarm_shared_fail_other_tests(void) {
+    assert(is_alarm_tests(5, 5, true, 1));
+}
+
+void test_alarm_shared_fail_not_compared(void) {
+    assert((is_alarm_tests(5, 5, false, 0) == false));
+}
+
+void test_alarm_pass_disagrees(void) {
+    assert(is_alarm_tests(0, 0, true, 2));
+}
+
+void test_alarm_pass_agrees(void) {
+    assert((is_alarm_tests(0, 0, true, 0) == false));
+}
+
+void test_alarm_tests_keeps_is_alarm(void) {
+    assert(is_alarm_tests(5, 0, true, 0));
+    assert(is_alarm_tests(6, 2, false, 0));
+    assert((is_alarm_tests(2, 0, false, 0) == false));
+}
+
+void test_stop_on_mismatch(void) {
+    assert(lanes_stop(1, 0));
+}
+
+void test_stop_on_reference_disagree(void) {
+    assert(lanes_stop(0, 3));
+}
+
+void test_stop_neither(void) {
+    assert((lanes_stop(0, 0) == false));
+}
+
 void test_gate_required_green(void) {
     assert_eq(check_effect(0, 3, true), 0);
 }
@@ -681,6 +834,32 @@ void test_gate_other_red_master_running_waits(void) {
     assert_eq(check_effect(2, 1, false), 1);
 }
 
+void test_gate_master_settled_is_its_verdict(void) {
+    assert_eq(master_state(false, 0), 0);
+    assert_eq(master_state(false, 2), 2);
+    assert_eq(master_state(false, 3), 3);
+}
+
+void test_gate_master_running_red_below_stays_red(void) {
+    assert_eq(master_state(true, 2), 2);
+}
+
+void test_gate_master_running_green_below_is_pending(void) {
+    assert_eq(master_state(true, 0), 1);
+}
+
+void test_gate_master_running_no_verdict_is_pending(void) {
+    assert_eq(master_state(true, 3), 1);
+}
+
+void test_gate_other_red_master_running_no_verdict_waits(void) {
+    assert_eq(check_effect(2, master_state(true, 3), false), 1);
+}
+
+void test_gate_other_red_master_red_below_running_passes(void) {
+    assert_eq(check_effect(2, master_state(true, 2), false), 0);
+}
+
 void test_gate_fold(void) {
     assert_eq(effect_fold(effect_fold(effect_fold(0, 1), 0), 2), 2);
     assert_eq(effect_fold(effect_fold(0, 0), 1), 1);
@@ -712,6 +891,10 @@ void test_gate_waits_on_required(void) {
 
 void test_gate_closed_first(void) {
     assert_eq(pr_ready(false, 1, false, 2, 2), 6);
+}
+
+void test_gate_waits_on_other_wait(void) {
+    assert_eq(pr_ready(true, 0, true, 0, 1), 1);
 }
 
 void test_gate_waits_on_mergeable_unknown(void) {
@@ -756,6 +939,74 @@ void test_watch_orphan_stack_stops(void) {
 
 void test_watch_unknown_base_stops(void) {
     assert_eq(watch_action(4, 0), 3);
+}
+
+void test_next_lane_when_reference_passes(void) {
+    assert_eq(lane_kind(0, 2), 1);
+}
+
+void test_next_reference_bug_when_reference_blocked(void) {
+    assert_eq(lane_kind(2, 2), 2);
+}
+
+void test_next_reference_bug_when_reference_fails(void) {
+    assert_eq(lane_kind(5, 2), 2);
+}
+
+void test_next_reference_bug_on_reference_timeout(void) {
+    assert_eq(lane_kind(8, 2), 2);
+}
+
+void test_next_no_verdict_counts_nowhere(void) {
+    assert_eq(lane_kind(11, 2), 0);
+}
+
+void test_next_not_run_counts_nowhere(void) {
+    assert_eq(lane_kind(9, 2), 0);
+}
+
+void test_next_only_blocked_files_count(void) {
+    assert_eq(lane_kind(0, 0), 0);
+}
+
+void test_next_frontend_is_not_a_lane(void) {
+    assert_eq(lane_kind(0, 3), 0);
+}
+
+void test_next_sole_outranks_first(void) {
+    assert((lane_score(1, 0) > lane_score(0, 999)));
+}
+
+void test_next_first_breaks_ties(void) {
+    assert((lane_score(3, 10) > lane_score(3, 9)));
+}
+
+void test_next_score_value(void) {
+    assert_eq(lane_score(12, 40), 12040);
+}
+
+void test_next_with_tests(void) {
+    assert_eq(with_tests(720, 271), 449);
+}
+
+void test_next_with_tests_never_wraps(void) {
+    assert_eq(with_tests(3, 5), 0);
+}
+
+void test_ledger_stores_its_cap(void) {
+    assert(header_stored(4));
+}
+
+void test_ledger_stores_where_it_came_from(void) {
+    assert(header_stored(2));
+}
+
+void test_ledger_derives_its_counts(void) {
+    assert((header_stored(5) == false));
+}
+
+void test_ledger_stores_no_unknown_field(void) {
+    assert((header_stored(6) == false));
 }
 
 
@@ -816,6 +1067,10 @@ int main(void) {
     test_doctor_checkout_reclone_failed();
     test_doctor_checkout_healed();
     test_doctor_checkout_kept();
+    test_doctor_image_master_unknown();
+    test_doctor_image_unreported_is_stale();
+    test_doctor_image_differs();
+    test_doctor_image_current();
     test_bless_rise_all_new();
     test_bless_rise_old_entries_over_cap();
     test_bless_rise_at_old_cap();
@@ -828,6 +1083,15 @@ int main(void) {
     test_alarm_crash_always();
     test_alarm_mismatch_always();
     test_alarm_blocked_never();
+    test_alarm_shared_fail_same_tests();
+    test_alarm_shared_fail_other_tests();
+    test_alarm_shared_fail_not_compared();
+    test_alarm_pass_disagrees();
+    test_alarm_pass_agrees();
+    test_alarm_tests_keeps_is_alarm();
+    test_stop_on_mismatch();
+    test_stop_on_reference_disagree();
+    test_stop_neither();
     test_gate_required_green();
     test_gate_required_pending_waits();
     test_gate_required_absent_waits();
@@ -838,6 +1102,12 @@ int main(void) {
     test_gate_other_red_absent_on_master_passes();
     test_gate_other_pending_never_waits();
     test_gate_other_red_master_running_waits();
+    test_gate_master_settled_is_its_verdict();
+    test_gate_master_running_red_below_stays_red();
+    test_gate_master_running_green_below_is_pending();
+    test_gate_master_running_no_verdict_is_pending();
+    test_gate_other_red_master_running_no_verdict_waits();
+    test_gate_other_red_master_red_below_running_passes();
     test_gate_fold();
     test_gate_ready();
     test_gate_conflict_first();
@@ -846,6 +1116,7 @@ int main(void) {
     test_gate_blocked_by_other();
     test_gate_waits_on_required();
     test_gate_closed_first();
+    test_gate_waits_on_other_wait();
     test_gate_waits_on_mergeable_unknown();
     test_watch_merges_ready();
     test_watch_waits();
@@ -857,7 +1128,24 @@ int main(void) {
     test_watch_stacked_waits_for_parent();
     test_watch_orphan_stack_stops();
     test_watch_unknown_base_stops();
-    printf("All %d tests passed.\n", 91);
+    test_next_lane_when_reference_passes();
+    test_next_reference_bug_when_reference_blocked();
+    test_next_reference_bug_when_reference_fails();
+    test_next_reference_bug_on_reference_timeout();
+    test_next_no_verdict_counts_nowhere();
+    test_next_not_run_counts_nowhere();
+    test_next_only_blocked_files_count();
+    test_next_frontend_is_not_a_lane();
+    test_next_sole_outranks_first();
+    test_next_first_breaks_ties();
+    test_next_score_value();
+    test_next_with_tests();
+    test_next_with_tests_never_wraps();
+    test_ledger_stores_its_cap();
+    test_ledger_stores_where_it_came_from();
+    test_ledger_derives_its_counts();
+    test_ledger_stores_no_unknown_field();
+    printf("All %d tests passed.\n", 128);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
