@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The docs/now/ entry a PR adds must SAY something.
 
+No CI job runs this since the NOW gate was removed by owner decision 2026-10-04
+(#5935); `tri now check` asks it on request. The history below is kept as is.
+
 WHY THIS EXISTS
 ---------------
 `t27-master-protection` requires four status checks, and one of them, `check`,
@@ -201,7 +204,7 @@ def main():
         print(f"NOT APPLICABLE: this check reads the docs/now/ entry a PULL REQUEST adds,")
         print(f"  and the event here is `{event}`. There is no pull request to read.")
         print("  Nothing was checked and nothing is claimed.")
-        return 0
+        return 3
 
     if not base:
         print("check_now_entry_shape: PR_BASE_SHA is unset on a pull_request event, so")

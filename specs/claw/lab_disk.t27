@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/lab_disk.t27 -- whether a Railway lab volume has room for a check, read from
+; `df -Pk` before the check runs.
+; --
+; On 2026-10-19 (tick 40) the t27c lab printed this for its volume:
+;     /dev/zd31792      47745772   47729388         0     100% /data
+; 0 KB free on 47.7 GB. The lab's poller and every cache kept there write to /data. A check
+; that writes to a full volume either fails on its first write or prints nothing, and
+; specs/claw/lab_receipt.t27 then reads the blank as silent. This gate asks first: is there
+; room? It holds a check before it runs instead of explaining a blank after.
+; --
+; disk_reason(blocks, avail), sizes in KiB, first match wins:
+;   blocks or avail is NONE (no such field)   -> hold R_UNREADABLE
+;   blocks == 0, or avail > blocks            -> hold R_UNREADABLE (df does not say that)
+;   avail < FULL_KB (1 GiB)                   -> hold R_FULL
+;   avail < LOW_KB (5 GiB), or avail*10 < blocks (under 10% free) -> warn R_LOW
+;   otherwise                                 -> go R_OK
+; The 10% line is the kubelet's default hard-eviction threshold for a node's root volume
+; (nodefs.available<10%). The 1 GiB and 5 GiB floors are ours: a zig build of one spec
+; writes a few hundred MB of cache.
+; line_for finds the df line whose last field is the mount, byte for byte: "/data" does not
+; match "/data2", "/dat" or "/". field reads field n of that line (0 is the filesystem, 1 the
+; size, 3 the free count) as digits that end at a space, a newline or the buffer's end.
+; `df -P` keeps each filesystem on one line; without -P a long device name wraps, and the
+; numbers move to the next line. Inode use (`df -Pi`) is not judged here.
+; disk_line writes   D TAB <go|warn|hold> TAB <why>\n   for one reason.
+; The honest limit: the text is what the caller read off the lab. This module decides from it;
+; it does not run df, and it deletes nothing.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawLabDisk;
+
+use claw::text;
+
+/// "No such field."
+pub const NONE : u64 = 999999999999999999;
+
+/// The most digits a size may have (KiB; 15 digits is about 1 EiB).
+pub const MAX_DIGITS : u32 = 15;
+
+/// 1 GiB and 5 GiB, in KiB.
+pub const FULL_KB : u64 = 1048576;
+pub const LOW_KB : u64 = 5242880;
+
+/// Verdicts.
+pub const V_GO : u8 = 0;
+pub const V_WARN : u8 = 1;
+pub const V_HOLD : u8 = 2;
+
+/// Reasons, one per disk line.
+pub const R_OK : u8 = 0;
+pub const R_LOW : u8 = 1;
+pub const R_FULL : u8 = 2;
+pub const R_NO_MOUNT : u8 = 3;
+pub const R_UNREADABLE : u8 = 4;
+pub const R_COUNT : usize = 5;
+
+/// df -Pk fields.
+pub const F_SIZE : usize = 1;
+pub const F_FREE : usize = 3;
+
+pub const VERDICT_TEXTS : [3]str = ["D\tgo\t", "D\twarn\t", "D\thold\t"];
+pub const VERDICT_LENS : [3]usize = [5, 7, 7];
+
+pub const WHY_TEXTS : [5]str = [
+    "the volume has room: at least 5 GiB and at least 10% free\n",
+    "the volume is low: under 5 GiB or under 10% free; a check may still run\n",
+    "the volume is full: under 1 GiB free; a build that writes there fails or prints nothing\n",
+    "no df line names this mount; the path is not a mount point or df failed\n",
+    "the df line for this mount has no readable size or free count\n"
+];
+pub const WHY_LENS : [5]usize = [58, 72, 88, 72, 62];
+
+/// The reason for one volume, sizes in KiB; its verdict is verdict_of(reason).
+pub fn disk_reason(blocks : u64, avail : u64) -> u8 {
+    if (blocks == NONE or avail == NONE) { return R_UNREADABLE; }
+    if (blocks == 0 or avail > blocks) { return R_UNREADABLE; }
+    if (avail < FULL_KB) { return R_FULL; }
+    if (avail < LOW_KB or avail * 10 < blocks) { return R_LOW; }
+    return R_OK;
+}
+
+/// R_OK goes, R_LOW warns; every other reason, and any value out of range, holds.
+pub fn verdict_of(r : u8) -> u8 {
+    if (r == R_OK) { return V_GO; }
+    if (r == R_LOW) { return V_WARN; }
+    return V_HOLD;
+}
+
+/// Where the first line of b[0..b_len) whose last field is mount starts; b_len when none is.
+pub fn line_for(b : str, b_len : usize, mount : str, mount_len : usize) -> usize {
+    var s : usize = 0;
+    while (s < b_len) {
+        var e : usize = s;
+        while (e < b_len and b[e] != '\n') { e += 1; }
+        var j : usize = e;
+        while (j > s and b[j - 1] != ' ') { j -= 1; }
+        if (e - j == mount_len) {
+            var k : usize = 0;
+            var same : bool = true;
+            while (k < mount_len) {
+                if (b[j + k] != mount[k]) { same = false; }
+                k += 1;
+            }
+            if (same) { return s; }
+        }
+        s = e + 1;
+    }
+    return b_len;
+}
+
+/// Field n of the line that starts at s, as a number; NONE when the line has fewer fields, the
+/// field is not all digits, or it has more than MAX_DIGITS digits.
+pub fn field(b : str, b_len : usize, s : usize, n : usize) -> u64 {
+    var i : usize = s;
+    var f : usize = 0;
+    while (f < n) {
+        while (i < b_len and b[i] != ' ' and b[i] != '\n') { i += 1; }
+        while (i < b_len and b[i] == ' ') { i += 1; }
+        if (i >= b_len or b[i] == '\n') { return NONE; }
+        f += 1;
+    }
+    var v : u64 = 0;
+    var digits : u32 = 0;
+    while (i < b_len and b[i] >= '0' and b[i] <= '9') {
+        if (digits == MAX_DIGITS) { return NONE; }
+        v = v * 10 + ((b[i] - '0') as u64);
+        digits += 1;
+        i += 1;
+    }
+    if (digits == 0) { return NONE; }
+    if (i < b_len and b[i] != ' ' and b[i] != '\n') { return NONE; }
+    return v;
+}
+
+/// The reason for mount in a whole `df -Pk` text.
+pub fn df_reason(b : str, b_len : usize, mount : str, mount_len : usize) -> u8 {
+    const s : usize = line_for(b, b_len, mount, mount_len);
+    if (s == b_len) { return R_NO_MOUNT; }
+    return disk_reason(field(b, b_len, s, F_SIZE), field(b, b_len, s, F_FREE));
+}
+
+/// The disk line for reason r into out at w, clipped at cap; returns the new cursor, which still
+/// advances when clipped. A reason out of range writes the R_UNREADABLE line.
+pub fn disk_line(r : u8, out : []u8, cap : usize, w : usize) -> usize {
+    var k : u8 = r;
+    if ((k as usize) >= R_COUNT) { k = R_UNREADABLE; }
+    const v : usize = verdict_of(k) as usize;
+    const x : usize = put_str(out, cap, w, VERDICT_TEXTS[v], VERDICT_LENS[v]);
+    return put_str(out, cap, x, WHY_TEXTS[k as usize], WHY_LENS[k as usize]);
+}
+
+// ---- tests: the volumes the lane met ----
+
+/// `df -Pk /data /root` on the t27c lab, 2026-10-19.
+pub const LAB : str = "Filesystem     1024-blocks       Used Available Capacity Mounted on\n/dev/zd31792      47745772   47729388         0     100% /data\noverlay         2030337424 1507827364 522493676      75% /\n";
+pub const LAB_LEN : usize = 190;
+
+test the_full_lab_volume_holds_a_check {
+    assert df_reason(LAB, LAB_LEN, "/data", 5) == R_FULL;
+    assert verdict_of(df_reason(LAB, LAB_LEN, "/data", 5)) == V_HOLD;
+    assert disk_reason(47745772, 0) == R_FULL;
+}
+
+test the_overlay_root_has_room {
+    assert df_reason(LAB, LAB_LEN, "/", 1) == R_OK;
+    assert verdict_of(df_reason(LAB, LAB_LEN, "/", 1)) == V_GO;
+}
+
+test the_numbers_are_read_from_the_right_fields {
+    const d : usize = line_for(LAB, LAB_LEN, "/data", 5);
+    assert d == 68;
+    assert field(LAB, LAB_LEN, d, F_SIZE) == 47745772;
+    assert field(LAB, LAB_LEN, d, 2) == 47729388;
+    assert field(LAB, LAB_LEN, d, F_FREE) == 0;
+    const r : usize = line_for(LAB, LAB_LEN, "/", 1);
+    assert field(LAB, LAB_LEN, r, F_SIZE) == 2030337424;
+    assert field(LAB, LAB_LEN, r, F_FREE) == 522493676;
+}
+
+test negative_control_a_mount_matches_only_byte_for_byte {
+    assert df_reason(LAB, LAB_LEN, "/dat", 4) == R_NO_MOUNT;
+    assert df_reason(LAB, LAB_LEN, "/data2", 6) == R_NO_MOUNT;
+    assert df_reason(LAB, LAB_LEN, "data", 4) == R_NO_MOUNT;
+    assert df_reason(LAB, LAB_LEN, "/root", 5) == R_NO_MOUNT;
+    assert df_reason("", 0, "/data", 5) == R_NO_MOUNT;
+    assert verdict_of(R_NO_MOUNT) == V_HOLD;
+}
+
+test negative_control_the_header_line_is_not_a_volume {
+    // The header's last field is "on"; its fields are words, not numbers.
+    assert line_for(LAB, LAB_LEN, "on", 2) == 0;
+    assert df_reason(LAB, LAB_LEN, "on", 2) == R_UNREADABLE;
+}
+
+test a_last_line_without_a_newline_is_read_to_the_buffer_end {
+    const b : str = "x 20000000 1 15000000 1% /m";
+    assert line_for(b, 27, "/m", 2) == 0;
+    assert field(b, 27, 0, F_FREE) == 15000000;
+    assert df_reason(b, 27, "/m", 2) == R_OK;
+    assert df_reason(b, 26, "/m", 2) == R_NO_MOUNT;
+}
+
+test a_line_that_ends_early_or_carries_a_word_is_unreadable {
+    assert field("x 10\n", 5, 0, F_FREE) == NONE;
+    assert field("x 10", 4, 0, F_SIZE) == 10;
+    assert field("x 10a 3", 7, 0, F_SIZE) == NONE;
+    assert field("x 10 3", 6, 0, 2) == 3;
+    assert field("x  ", 3, 0, F_SIZE) == NONE;
+    assert df_reason("x 10a 1 2 3% /m\n", 16, "/m", 2) == R_UNREADABLE;
+}
+
+test a_line_that_is_only_the_mount_is_found_and_unreadable {
+    // No space on the line: its one field is both the first and the last.
+    assert line_for("/m", 2, "/m", 2) == 0;
+    assert line_for("x 1\n/m", 6, "/m", 2) == 4;
+    assert df_reason("x 1\n/m", 6, "/m", 2) == R_UNREADABLE;
+}
+
+test a_one_field_line_at_the_end_of_a_full_buffer_is_not_read_past {
+    var one : [1]u8 = undefined;
+    one[0] = 'x';
+    assert field(&one, 1, 0, F_SIZE) == NONE;
+    var two : [3]u8 = undefined;
+    two[0] = '7';
+    two[1] = ' ';
+    two[2] = 'x';
+    assert field(&two, 3, 2, F_SIZE) == NONE;
+    assert field(&two, 3, 0, 0) == 7;
+}
+
+test fifteen_digits_read_and_sixteen_are_refused {
+    assert field("x 999999999999999", 17, 0, F_SIZE) == 999999999999999;
+    assert field("x 1000000000000000", 18, 0, F_SIZE) == NONE;
+}
+
+test the_full_line_is_exactly_one_gib {
+    assert disk_reason(100000000, FULL_KB - 1) == R_FULL;
+    assert disk_reason(2000000, FULL_KB) == R_LOW;
+}
+
+test the_low_line_is_five_gib_and_ten_percent {
+    assert disk_reason(LOW_KB * 10, LOW_KB - 1) == R_LOW;
+    assert disk_reason(LOW_KB * 10, LOW_KB) == R_OK;
+    assert disk_reason(LOW_KB * 10 + 1, LOW_KB) == R_LOW;
+    assert disk_reason(LOW_KB, LOW_KB) == R_OK;
+    assert verdict_of(R_LOW) == V_WARN;
+}
+
+test sizes_df_does_not_print_are_unreadable {
+    assert disk_reason(0, 0) == R_UNREADABLE;
+    assert disk_reason(LOW_KB, LOW_KB + 1) == R_UNREADABLE;
+    assert disk_reason(NONE, LOW_KB) == R_UNREADABLE;
+    assert disk_reason(LOW_KB, NONE) == R_UNREADABLE;
+}
+
+test only_ok_goes_only_low_warns_and_out_of_range_holds {
+    var gos : u32 = 0;
+    var warns : u32 = 0;
+    var r : u32 = 0;
+    while (r < 256) {
+        const v : u8 = verdict_of(r as u8);
+        if (v == V_GO) { gos += 1; assert r == 0; }
+        if (v == V_WARN) { warns += 1; assert r == 1; }
+        r += 1;
+    }
+    assert gos == 1;
+    assert warns == 1;
+    assert verdict_of(5) == V_HOLD;
+}
+
+test the_lens_are_the_text_lengths {
+    var i : usize = 0;
+    while (i < 3) {
+        assert VERDICT_TEXTS[i][0] == 'D';
+        assert VERDICT_TEXTS[i][1] == '\t';
+        assert VERDICT_TEXTS[i][VERDICT_LENS[i] - 1] == '\t';
+        i += 1;
+    }
+    var k : usize = 0;
+    while (k < R_COUNT) {
+        assert WHY_TEXTS[k][WHY_LENS[k] - 1] == '\n';
+        assert WHY_TEXTS[k][WHY_LENS[k] - 2] != '\n';
+        k += 1;
+    }
+}
+
+test the_full_line_is_spelled_out {
+    var out : [128]u8 = undefined;
+    const w : usize = disk_line(R_FULL, &out, 128, 0);
+    assert w == 95;
+    assert str_eq(&out, 7, "D\thold\t", 7);
+    assert out[7] == 't';
+    assert out[94] == '\n';
+    const g : usize = disk_line(R_OK, &out, 128, 0);
+    assert g == 63;
+    assert out[2] == 'g';
+    assert out[4] == '\t';
+}
+
+test out_of_range_reasons_write_the_unreadable_line {
+    var out : [128]u8 = undefined;
+    var r : u32 = 5;
+    while (r < 256) {
+        assert disk_line(r as u8, &out, 128, 0) == 69;
+        // The bytes, not only the length: this is the unreadable line.
+        assert out[2] == 'h';
+        assert out[7] == 't';
+        assert out[11] == 'd';
+        r += 1;
+    }
+    assert disk_line(R_UNREADABLE, &out, 128, 0) == 69;
+    assert disk_line(R_NO_MOUNT, &out, 128, 0) == 79;
+}
+
+test a_clipped_line_still_advances_the_cursor {
+    var out : [8]u8 = undefined;
+    assert disk_line(R_LOW, &out, 8, 0) == 79;
+    assert out[2] == 'w';
+    assert disk_line(R_LOW, &out, 8, 3) == 82;
+}
