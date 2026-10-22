@@ -19,16 +19,15 @@ What it does, and all it does:
         /runs/<sha>.json              one run: each gate's command, exit code,
                                       seconds and summary line
         /runs/<sha>/<gate>.log        one gate's whole output
+        /seals/<sha>.patch|.json      a master run's seal refresh (#9080)
 
 The `misread` gate is published and left out of the verdict (REPORT_ONLY):
 its "counts" are `tri misread`'s pairs / refused / silent totals, the numbers
 epic #6092 drives to zero.
 
-A re-seal run here by hand should put the image's zig on PATH, so the seal's
-`tests` field records a real compile instead of "zig not on PATH":
-
-    PATH=/opt/zig:$PATH t27c seal <spec> --save && tri seals sync-twins
-
+After a master run's gates, each seal the seal-coverage gate failed is re-saved
+with that t27c and the image's zig (so its `tests` record a real run) when
+specs/ci/derived_data.t27 seal_refresh() says V_REFRESH; the rest are listed.
 The gates themselves run without zig, as CI's do.
 
 It holds no secret, accepts no request that changes anything, and never writes
@@ -47,6 +46,7 @@ Self-check of the pure parts, no network: python3 lab.py --self-check
 
 from __future__ import annotations
 
+import ctypes
 import datetime as _dt
 import fnmatch
 import hashlib
@@ -54,6 +54,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -81,8 +82,8 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 # name, argv run from the checkout, timeout in seconds, the regex whose last
 # matching line is the summary (None: the last non-empty line). "{run}" is the
 # run's directory. The order is the CI order: nothing runs on a failed build.
+# bootstrap/build.rs fails the build when FROZEN_HASH is not sha256(compiler.rs).
 GATES = [
-    ("frozen-hash", None, 30, None),
     ("build", ["cargo", "build", "--release", "-p", "t27c", "-p", "tri"], 3600,
      r"Finished|^error"),
     ("suite", ["./target/release/t27c", "suite", "--repo-root", ".", "--corpus-only",
@@ -176,13 +177,7 @@ def summary(text: str, pattern: str | None) -> str:
 
 def misread_counts(text: str) -> dict | None:
     """`tri misread` output -> {"pairs", "refused", "silent"}, or None when the
-    command did not reach its table (a failed control, a missing binary).
-
-    Two formats are in the tree. Since #5947 the table has a header and three
-    columns, "  <pairs>  <refused>  <silent>  <shape>". Before it (master on
-    2026-10-04) one column, "  <pairs>  rust: <shape>", under the tool's own
-    statement that each pair "parses and typechecks": every pair is silent and
-    refusals were not measured, so "refused" is None there, not 0. Pure."""
+    command did not reach its table (a failed control, a missing binary). Pure."""
     if "CONTROL FAILED" in text:
         return None
     if "pairs  refused  silent" in text:
@@ -190,9 +185,6 @@ def misread_counts(text: str) -> dict | None:
         return {"pairs": sum(int(r[0]) for r in rows),
                 "refused": sum(int(r[1]) for r in rows),
                 "silent": sum(int(r[2]) for r in rows)}
-    if "parses and typechecks" in text or "Nothing found" in text:
-        n = sum(int(r) for r in re.findall(r"^\s+(\d+)\s+[a-z]+:\s", text, re.M))
-        return {"pairs": n, "refused": None, "silent": n}
     return None
 
 
@@ -203,19 +195,6 @@ def misread_line(counts: dict | None, fallback: str) -> str:
     refused = "refusals not measured" if counts["refused"] is None else \
         f"{counts['refused']} refused by typecheck"
     return f"{counts['silent']} of {counts['pairs']} pair(s) silent, {refused}"
-
-
-def frozen_hash_ok(root: Path) -> tuple[bool, str]:
-    """bootstrap/stage0/FROZEN_HASH names the sha256 of bootstrap/src/compiler.rs."""
-    src = root / "bootstrap" / "src" / "compiler.rs"
-    pin = root / "bootstrap" / "stage0" / "FROZEN_HASH"
-    if not src.exists() or not pin.exists():
-        return False, "missing compiler.rs or FROZEN_HASH"
-    actual = hashlib.sha256(src.read_bytes()).hexdigest()
-    pinned = pin.read_text().split()[0] if pin.read_text().split() else ""
-    if actual == pinned:
-        return True, f"FROZEN_HASH matches compiler.rs ({actual[:12]})"
-    return False, f"FROZEN_HASH {pinned[:12]} != sha256(compiler.rs) {actual[:12]}"
 
 
 def verdict(gates: list[dict]) -> str:
@@ -238,6 +217,9 @@ def safe_path(path: str) -> str | None:
     m = re.match(r"^/runs/([0-9a-f]{40})/([a-z-]{1,40})\.(log|json)$", path)
     if m:
         return f"runs/{m.group(1)}/{m.group(2)}.{m.group(3)}"
+    m = re.match(r"^/seals/([0-9a-f]{40})\.(json|patch)$", path)
+    if m:
+        return f"runs/{m.group(1)}/seals.{m.group(2)}"
     return None
 
 
@@ -264,6 +246,14 @@ def mem_gb() -> float | None:
 
 # ------------------------------------------------------------- side effects
 
+def kill_group(p: subprocess.Popen) -> None:
+    """SIGKILL the session `p` leads; a group that is already gone is fine."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def sh(argv: list[str], cwd: Path | None = None, timeout: int = 600,
        log: Path | None = None, env: dict | None = None) -> tuple[int, str]:
     """Run argv; tee into `log` when given. Returns (exit, output)."""
@@ -272,9 +262,13 @@ def sh(argv: list[str], cwd: Path | None = None, timeout: int = 600,
     start = time.time()
     out_f = open(log, "w", encoding="utf-8", errors="replace") if log else None
     try:
+        # A session of its own, so the limit kills the whole tree argv started
+        # (cargo's test binaries, t27c's spec_tests, zig), not only argv (#7090).
         p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, env=full_env, text=True,
-                             errors="replace")
+                             errors="replace", start_new_session=True)
+        killer = threading.Timer(timeout, kill_group, (p,))
+        killer.start()
         chunks = []
         assert p.stdout is not None
         for line in p.stdout:
@@ -282,14 +276,15 @@ def sh(argv: list[str], cwd: Path | None = None, timeout: int = 600,
             if out_f:
                 out_f.write(line)
                 out_f.flush()
-            if time.time() - start > timeout:
-                p.kill()
-                chunks.append(f"\n[lab] killed after {timeout} s\n")
-                if out_f:
-                    out_f.write(chunks[-1])
-                break
         code = p.wait()
-        return (124 if time.time() - start > timeout else code), "".join(chunks)
+        killer.cancel()
+        kill_group(p)
+        if time.time() - start > timeout:
+            chunks.append(f"\n[lab] killed after {timeout} s\n")
+            if out_f:
+                out_f.write(chunks[-1])
+            return 124, "".join(chunks)
+        return code, "".join(chunks)
     except FileNotFoundError as e:
         msg = f"[lab] {e}\n"
         if out_f:
@@ -386,6 +381,28 @@ def checkout(item: dict) -> None:
         link.symlink_to(TARGET)
 
 
+V_NAMES = ("OK", "PENDING", "REPORT", "REFRESH", "OWNER", "RED")  # derived_data.t27's V_* codes
+
+
+def refresh_seals(sha: str, run_dir: Path, env: dict) -> dict:
+    """#9080: judge each seal the seal-coverage gate failed by derived_data.t27 seal_refresh(), as this
+    t27c compiles it; re-save the V_REFRESH ones. Writes seals.patch (.trinity/seals/ only), seals.json."""
+    so, t27c, rows = run_dir / "dd.so", "./target/release/t27c", []
+    sh(["sh", "-c", f"{t27c} gen-c specs/ci/derived_data.t27 > {so}.c && cc -shared -fPIC -w -o {so} {so}.c"], SRC)
+    rule, log = ctypes.CDLL(str(so)).seal_refresh, (run_dir / "seal-coverage.log").read_text()
+    for name, kind in re.findall(r"^  (\S+\.json)  \[([a-z-]+)\]$", log, re.M):
+        spec = json.loads((SRC / ".trinity" / "seals" / name).read_text()).get("spec_path", "")
+        v = V_NAMES[rule(kind == "stale", kind == "gen-drift") & 255]
+        zig = dict(env, PATH="/opt/zig:" + os.environ["PATH"])  # so a seal's `tests` record a real run
+        code, out = sh([t27c, "seal", spec, "--save"], SRC, 900, env=zig) if v == "REFRESH" else (1, "")
+        rows.append({"seal": name, "spec": spec, "gate": kind, "verdict": v, "saved": code == 0, "why": out[-300:]})
+    (run_dir / "seals.patch").write_text(subprocess.run(["git", "diff", "--", ".trinity/seals"], cwd=SRC,
+                                                        capture_output=True, text=True).stdout)
+    doc = {"sha": sha, "verdict": "REFRESH" if any(r["saved"] for r in rows) else "OK", "seals": rows}
+    write_json(run_dir / "seals.json", dict(doc, report=[r for r in rows if not r["saved"]]))
+    return {"verdict": doc["verdict"], "seals": len(rows), "saved": sum(r["saved"] for r in rows)}
+
+
 def run_item(item: dict) -> dict:
     sha = item["sha"]
     run_dir = RUNS / sha
@@ -413,12 +430,6 @@ def run_item(item: dict) -> dict:
         if name in NEEDS_BUILD and not built:
             gate.update(exit=None, seconds=0, summary="skipped: the build failed")
             log.write_text("skipped: the build failed\n")
-        elif argv is None:
-            t0 = time.time()
-            ok, line = frozen_hash_ok(SRC)
-            log.write_text(line + "\n")
-            gate.update(cmd="sha256 bootstrap/src/compiler.rs vs bootstrap/stage0/FROZEN_HASH",
-                        exit=0 if ok else 1, seconds=round(time.time() - t0, 1), summary=line)
         else:
             cmd = [a.replace("{run}", str(run_dir)) for a in argv]
             t0 = time.time()
@@ -433,6 +444,11 @@ def run_item(item: dict) -> dict:
                 built = False
         record["gates"].append(gate)
         write_json(RUNS / f"{sha}.json", dict(record, finished=None, verdict="running"))
+    if "master" in item["branches"] and built:  # #9080, after the gates: none of them sees a re-saved seal
+        try:
+            record["seals"] = refresh_seals(sha, run_dir, env)
+        except Exception as e:  # noqa: BLE001 -- published as failed; the gates' verdict stands
+            record["seals"] = {"verdict": "ERROR", "error": repr(e)[:300]}
     red = [g["name"] for g in record["gates"]
            if g.get("exit") != 0 and g["name"] not in REPORT_ONLY]
     record.update(finished=now(), verdict=verdict(record["gates"]), red_gates=red)
@@ -449,6 +465,36 @@ def prune() -> None:
             continue
         p.unlink(missing_ok=True)
         shutil.rmtree(RUNS / p.stem, ignore_errors=True)
+    reap_scratch_targets()
+
+
+def newest_mtime(root: Path) -> float:
+    newest = root.stat().st_mtime
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def reap_scratch_targets(min_free: float = 0.15, idle_s: int = 86400,
+                         root: Path = DATA) -> None:
+    """When /data runs low, drop the cargo target dirs that sessions leave as
+    /data/<name>-target and have not written in a day. They rebuild; the lab's
+    own /data/target is not matched. 2026-10-07: /data filled to 99% with them
+    and the queue stopped on ENOSPC (#7090)."""
+    du = shutil.disk_usage(root)
+    if du.free >= du.total * min_free:
+        return
+    for d in sorted(root.glob("*-target")):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        if time.time() - newest_mtime(d) < idle_s:
+            continue
+        print(f"[lab] reap {d} (disk {du.free // 2**30} GiB free)", flush=True)
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def take_requests(heads: dict[str, str]) -> list[dict]:
@@ -503,27 +549,41 @@ def poller() -> None:
 
 def worker() -> None:
     while True:
-        item = None
-        with _lock:
-            if _state["queue"]:
-                item = _state["queue"].pop(0)
-                _state["running"] = {"sha": item["sha"], "branches": item["branches"],
-                                     "gate": None, "since": now()}
-        if item is None:
-            time.sleep(10)
-            continue
         try:
-            ensure_clone()
-            run_item(item)
-        except Exception as e:
-            write_json(RUNS / f"{item['sha']}.json", {
-                "sha": item["sha"], "branches": item["branches"], "finished": now(),
-                "verdict": "red", "red_gates": ["lab"],
-                "gates": [{"name": "lab", "exit": 1, "seconds": 0, "summary": repr(e)[:300]}]})
-        finally:
+            work_once()
+        except Exception as e:  # noqa: BLE001 -- the one thread that runs the queue must not end
+            # 2026-10-07: ENOSPC on /data, raised while recording a failed run, ended
+            # this thread; the queue then stood still with nothing running (#7090).
+            print(f"[lab] worker: {e!r}", file=sys.stderr, flush=True)
             with _lock:
                 _state["running"] = None
-            publish_latest()
+                _state["error"] = f"{now()} worker: {e!r}"[:500]
+            time.sleep(60)
+
+
+def work_once() -> None:
+    """Take the next queued commit, if any, and run its gates."""
+    item = None
+    with _lock:
+        if _state["queue"]:
+            item = _state["queue"].pop(0)
+            _state["running"] = {"sha": item["sha"], "branches": item["branches"],
+                                 "gate": None, "since": now()}
+    if item is None:
+        time.sleep(10)
+        return
+    try:
+        ensure_clone()
+        run_item(item)
+    except Exception as e:
+        write_json(RUNS / f"{item['sha']}.json", {
+            "sha": item["sha"], "branches": item["branches"], "finished": now(),
+            "verdict": "red", "red_gates": ["lab"],
+            "gates": [{"name": "lab", "exit": 1, "seconds": 0, "summary": repr(e)[:300]}]})
+    finally:
+        with _lock:
+            _state["running"] = None
+        publish_latest()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -615,14 +675,6 @@ def self_check() -> int:
     assert misread_counts(table) == {"pairs": 17, "refused": 15, "silent": 2}
     assert misread_counts("  CONTROL FAILED -- these shapes did not fire\n") is None
     assert misread_counts("error: target/release/t27c is not built\n") is None
-    old = ("  generated for 1178 of 1190 spec(s)\n\n"
-           "    28  rust: `pub f: ,`      field with no type\n"
-           "           specs/tools/registry.t27\n"
-           "     1  c:    `0 f;`          literal in type position\n\n"
-           "  Each of these parses and typechecks. The count above is a count of\n")
-    assert misread_counts(old) == {"pairs": 29, "refused": None, "silent": 29}
-    assert misread_line(misread_counts(old), "") == \
-        "29 of 29 pair(s) silent, refusals not measured"
     assert misread_line(misread_counts(table), "") == \
         "2 of 17 pair(s) silent, 15 refused by typecheck"
     assert misread_counts("  pairs  refused  silent\n\n  Nothing found\n") == \
@@ -631,11 +683,24 @@ def self_check() -> int:
     assert safe_path("/latest.json") == "latest.json"
     assert safe_path(f"/runs/{a}.json") == f"runs/{a}.json"
     assert safe_path(f"/runs/{a}/suite.log") == f"runs/{a}/suite.log"
+    assert safe_path(f"/seals/{a}.patch") == f"runs/{a}/seals.patch"
+    assert safe_path(f"/seals/{a}.log") is None and safe_path(f"/runs/{a}.patch") is None
     for bad in ("/../etc/passwd", f"/runs/{a}/../../x.log", "/runs/abc.json",
                 f"/runs/{a}/Suite.log", "/data/src/.git/config"):
         assert safe_path(bad) is None, bad
     assert BRANCH_RE.match("claude/t27c-match-tail-expr")
     assert not BRANCH_RE.match("-x") and not BRANCH_RE.match("a b")
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        for name in ("old-target", "new-target", "target"):
+            (root / name / "d").mkdir(parents=True)
+            (root / name / "d" / "f").write_text("x")
+        os.utime(root / "old-target" / "d" / "f", (0, 0))
+        os.utime(root / "old-target" / "d", (0, 0))
+        os.utime(root / "old-target", (0, 0))
+        reap_scratch_targets(min_free=2.0, root=root)
+        assert sorted(p.name for p in root.iterdir()) == ["new-target", "target"]
     print("lab self-check: ok")
     return 0
 
