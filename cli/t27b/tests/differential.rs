@@ -2254,7 +2254,7 @@ test nan_to_int {
 #[test]
 fn f64_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module f64rej;\nfn f(x: f64, n: i32) f64 {{\n{}\n}}\n", body);
+        let src = format!("module f64rej;\nfn f(x: f64, n: i32) f64 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),
@@ -2581,7 +2581,7 @@ test f32_out_of_range {
 #[test]
 fn f32_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module f32rej;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\n", body);
+        let src = format!("module f32rej;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),
@@ -2882,7 +2882,7 @@ fn shift_source_programs_run_in_both_engines() {
 #[test]
 fn shift_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module shiftrej;\nconst KB: u32 = 40;\nfn f(x: u32, n: u32) u32 {{\n{}\n}}\n", body);
+        let src = format!("module shiftrej;\nconst KB: u32 = 40;\nfn f(x: u32, n: u32) u32 {{\n{}\n}}\ntest t {{ assert(f(1, 1) == 0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),

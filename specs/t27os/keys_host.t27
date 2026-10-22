@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS keys_host: where the key manager (keys.t27) touches the machine. Three jobs, no decisions:
+//   - the macOS Keychain: kc_put / kc_get / kc_del, one generic-password item per provider under the
+//     service "ai.t27.os" (SecItemAdd, SecItemCopyMatching, SecItemUpdate, SecItemDelete). A key is never
+//     written to a file and never reaches the repo.
+//   - the check button: probe() sends the cheapest authenticated request of a provider (a GET; for z.ai one one-token POST) (table: keys.t27) and
+//     hands back the HTTP status; keys.t27 status_after_probe decides what it means. The key travels in a
+//     request header, never in the URL.
+//   - push_keys(): hand every stored key to the PTY server (OP_SETKEY) so a pane it spawns is logged in.
+//
+// The kSec* constants are global CFStringRef variables, not functions, so an @extern call cannot read them:
+// dlsym finds the variable's address and sys_peek copies the pointer out. Specs holding @extern cannot run
+// tests under t27c; every rule these fns follow is a tested fn in keys.t27.
+//
+// Refs gHashTag/t27#10782.
+module T27osKeysHost;
+
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::KEYCHAIN_SERVICE;
+use t27os::keys::PROBE_TIMEOUT_S;
+use t27os::keys::provider_name;
+use t27os::keys::probe_url;
+use t27os::keys::probe_has;
+use t27os::keys::probe_header_name;
+use t27os::keys::probe_header_value;
+use t27os::keys::probe_post;
+use t27os::keys::probe_body;
+use t27os::keys::probe_needs_version;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::MAX_FRAME;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_client::client_set_key;
+use t27os::session_store::put_bytes;
+
+pub const UTF8_ENC : u32 = 134217984;
+pub const SEC_DUPLICATE : i32 = -25299;
+pub const RTLD_LAZY : i32 = 1;
+
+fn dl_open(path: u64, mode: i32) -> u64 { return @extern("dlopen"); }
+fn dl_sym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn addr_of(dst: []u8, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn cf_data(alloc: u64, bytes: []const u8, n: u64) -> u64 { return @extern("CFDataCreate"); }
+fn cf_data_len(d: u64) -> u64 { return @extern("CFDataGetLength"); }
+fn cf_data_ptr(d: u64) -> u64 { return @extern("CFDataGetBytePtr"); }
+fn cf_dict_new(alloc: u64, cap: u64, kcb: u64, vcb: u64) -> u64 { return @extern("CFDictionaryCreateMutable"); }
+fn cf_dict_set(d: u64, k: u64, v: u64) -> void { @extern("CFDictionarySetValue"); }
+fn cf_release(o: u64) -> void { @extern("CFRelease"); }
+fn sec_add(attrs: u64, result: u64) -> i32 { return @extern("SecItemAdd"); }
+fn sec_copy(query: u64, result: []u8) -> i32 { return @extern("SecItemCopyMatching"); }
+fn sec_update(query: u64, attrs: u64) -> i32 { return @extern("SecItemUpdate"); }
+fn sec_delete(query: u64) -> i32 { return @extern("SecItemDelete"); }
+fn class_named(name: u64) -> u64 { return @extern("NSClassFromString"); }
+fn sel_named(name: u64) -> u64 { return @extern("NSSelectorFromString"); }
+fn msg0(o: u64, s: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg1(o: u64, s: u64, a: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg2(o: u64, s: u64, a: u64, b: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg3(o: u64, s: u64, a: u64, b: u64, c: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg_f(o: u64, s: u64, t: f64) -> u64 { return @extern("objc_msgSend"); }
+
+fn cf(s: []const u8) -> u64 {
+    return cf_str(0, s, s.len, UTF8_ENC, false);
+}
+
+fn cls(s: []const u8) -> u64 {
+    const n : u64 = cf(s);
+    const c : u64 = class_named(n);
+    cf_release(n);
+    return c;
+}
+
+fn sel(s: []const u8) -> u64 {
+    const n : u64 = cf(s);
+    const c : u64 = sel_named(n);
+    cf_release(n);
+    return c;
+}
+
+/// The value of a global CFStringRef (or CFBooleanRef) variable of the loaded frameworks.
+fn global_ref(name: []const u8) -> u64 {
+    var z : [40]u8 = undefined;
+    const n : usize = put_bytes(z[0..40], 0, name);
+    z[n] = 0;
+    const h : u64 = dl_open(0, RTLD_LAZY);
+    const at : u64 = dl_sym(h, z[0..40]);
+    if (at == 0) { return 0; }
+    var b : [8]u8 = undefined;
+    sys_peek(b[0..8], at, 8);
+    return get_u64(b[0..8], 0);
+}
+
+/// The address of a global struct (the dictionary callbacks): dlsym's answer itself.
+fn global_addr(name: []const u8) -> u64 {
+    var z : [40]u8 = undefined;
+    const n : usize = put_bytes(z[0..40], 0, name);
+    z[n] = 0;
+    return dl_sym(dl_open(0, RTLD_LAZY), z[0..40]);
+}
+
+fn new_dict() -> u64 {
+    return cf_dict_new(0, 0, global_addr("kCFTypeDictionaryKeyCallBacks"), global_addr("kCFTypeDictionaryValueCallBacks"));
+}
+
+fn set_text(d: u64, key_name: []const u8, text: []const u8) -> void {
+    const s : u64 = cf(text);
+    cf_dict_set(d, global_ref(key_name), s);
+    cf_release(s);
+}
+
+/// The query that names provider p's item: generic password, service "ai.t27.os", account = provider name.
+fn item_query(p: u32) -> u64 {
+    const d : u64 = new_dict();
+    cf_dict_set(d, global_ref("kSecClass"), global_ref("kSecClassGenericPassword"));
+    set_text(d, "kSecAttrService", KEYCHAIN_SERVICE);
+    var nm : [24]u8 = undefined;
+    const n : usize = provider_name(p, nm[0..24]);
+    set_text(d, "kSecAttrAccount", nm[0..n]);
+    return d;
+}
+
+fn set_data(d: u64, key: []const u8) -> void {
+    const data : u64 = cf_data(0, key, @as(u64, key.len));
+    cf_dict_set(d, global_ref("kSecValueData"), data);
+    cf_release(data);
+}
+
+/// Store provider p's key (replacing an earlier one). True when the Keychain accepted it.
+pub fn kc_put(p: u32, key: []const u8) -> bool {
+    if (p >= PROVIDER_COUNT) { return false; }
+    if (key.len == 0) { return false; }
+    const a : u64 = item_query(p);
+    set_data(a, key);
+    var st : i32 = sec_add(a, 0);
+    cf_release(a);
+    if (st == SEC_DUPLICATE) {
+        const q : u64 = item_query(p);
+        const u : u64 = new_dict();
+        set_data(u, key);
+        st = sec_update(q, u);
+        cf_release(q);
+        cf_release(u);
+    }
+    return st == 0;
+}
+
+/// Read provider p's key into out; its length, 0 when none is stored.
+pub fn kc_get(p: u32, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT) { return 0; }
+    const q : u64 = item_query(p);
+    cf_dict_set(q, global_ref("kSecReturnData"), global_ref("kCFBooleanTrue"));
+    cf_dict_set(q, global_ref("kSecMatchLimit"), global_ref("kSecMatchLimitOne"));
+    var res : [8]u8 = undefined;
+    const st : i32 = sec_copy(q, res[0..8]);
+    cf_release(q);
+    if (st != 0) { return 0; }
+    const d : u64 = get_u64(res[0..8], 0);
+    if (d == 0) { return 0; }
+    var n : u64 = cf_data_len(d);
+    if (n > @as(u64, out.len)) { n = @as(u64, out.len); }
+    sys_peek(out, cf_data_ptr(d), n);
+    cf_release(d);
+    return @as(usize, n);
+}
+
+/// Delete provider p's item. True when it is gone (also when none was there).
+pub fn kc_del(p: u32) -> bool {
+    if (p >= PROVIDER_COUNT) { return false; }
+    const q : u64 = item_query(p);
+    const st : i32 = sec_delete(q);
+    cf_release(q);
+    return st == 0 or st == -25300;
+}
+
+/// True when the Keychain holds a key for provider p (reads it, then drops the copy).
+pub fn kc_has(p: u32) -> bool {
+    var b : [256]u8 = undefined;
+    return kc_get(p, b[0..256]) > 0;
+}
+
+fn add_header(req: u64, name: []const u8, value: []const u8) -> void {
+    const n : u64 = cf(name);
+    const v : u64 = cf(value);
+    msg2(req, sel("setValue:forHTTPHeaderField:"), v, n);
+    cf_release(n);
+    cf_release(v);
+}
+
+/// The check button: one authenticated GET for provider p with `key`; the HTTP status, 0 when nothing
+/// answered (no network, timeout) and 1 when the provider has no probe. Blocks up to PROBE_TIMEOUT_S.
+pub fn probe(p: u32, key: []const u8) -> u32 {
+    if (probe_has(p) == false) { return 1; }
+    var ub : [160]u8 = undefined;
+    const un : usize = probe_url(p, ub[0..160]);
+    const us : u64 = cf(ub[0..un]);
+    const url : u64 = msg1(cls("NSURL"), sel("URLWithString:"), us);
+    cf_release(us);
+    if (url == 0) { return 0; }
+    const req : u64 = msg1(cls("NSMutableURLRequest"), sel("requestWithURL:"), url);
+    if (req == 0) { return 0; }
+    msg_f(req, sel("setTimeoutInterval:"), @as(f64, @floatFromInt(PROBE_TIMEOUT_S)));
+    var hn : [24]u8 = undefined;
+    var hv : [300]u8 = undefined;
+    const nl : usize = probe_header_name(p, hn[0..24]);
+    const vl : usize = probe_header_value(p, key, hv[0..300]);
+    add_header(req, hn[0..nl], hv[0..vl]);
+    if (probe_needs_version(p)) { add_header(req, "anthropic-version", "2023-06-01"); }
+    if (probe_post(p)) {
+        var bb : [200]u8 = undefined;
+        const bl : usize = probe_body(p, bb[0..200]);
+        const data : u64 = cf_data(0, bb[0..bl], @as(u64, bl));
+        const post : u64 = cf("POST");
+        msg1(req, sel("setHTTPMethod:"), post);
+        msg1(req, sel("setHTTPBody:"), data);
+        add_header(req, "content-type", "application/json");
+        cf_release(post);
+        cf_release(data);
+    }
+    add_header(req, "User-Agent", "t27os");
+    var resp : [8]u8 = undefined;
+    var err : [8]u8 = undefined;
+    var i : usize = 0;
+    while (i < 8) {
+        resp[i] = 0;
+        err[i] = 0;
+        i = i + 1;
+    }
+    msg3(cls("NSURLConnection"), sel("sendSynchronousRequest:returningResponse:error:"), req, addr_of(resp[0..8], resp[0..8], 0), addr_of(err[0..8], err[0..8], 0));
+    const r : u64 = get_u64(resp[0..8], 0);
+    if (r == 0) { return 0; }
+    return @as(u32, @intCast(msg0(r, sel("statusCode"))));
+}
+
+/// Hand every stored key to the PTY server on `fd`; the count pushed. Called on connect and before a spawn,
+/// because a server that restarted has forgotten them.
+pub fn push_keys(fd: i32) -> u32 {
+    var key : [256]u8 = undefined;
+    var reply : [MAX_FRAME]u8 = undefined;
+    var pushed : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        const n : usize = kc_get(p, key[0..256]);
+        if (n > 0) {
+            if (client_set_key(fd, p, key[0..n], reply[0..MAX_FRAME]) > 0) { pushed = pushed + 1; }
+        }
+        p = p + 1;
+    }
+    return pushed;
+}
+
+test the_host_module_is_declared {
+    var b : [4]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1;
+}

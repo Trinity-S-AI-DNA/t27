@@ -13,6 +13,9 @@
 //   T27OS_CTL=<verb>   a tiny client for scripts and the live test: list, spawn, kill, read, keys, expect
 //                      (T27OS_AGENT, T27OS_CWD, T27OS_MODEL, T27OS_PANE, T27OS_KEYS, T27OS_RAW, T27OS_EXPECT,
 //                      T27OS_WAIT carry the arguments; the verb is the whole word, `write` is the old name of keys).
+//                      An editor pane (T27 OS opens inside, 2026-10-20) is spawn with T27OS_AGENT=9 (the
+//                      shell cell) and T27OS_MODEL=vim|nvim|hx|micro|nano: the pane runs that editor on
+//                      T27OS_CWD, a folder or a file, instead of bash (pty_logic launch_command).
 //   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
 //                      the server at login, so panes come back (by session id, model kept) after a reboot.
 //
@@ -138,6 +141,25 @@ use t27os::pty_sys::sys_signal;
 use t27os::pty_sys::sys_gettimeofday;
 use t27os::pty_sys::sys_random;
 use t27os::pty_sys::sys_exe_path;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_unsetenv;
+use t27os::pty_logic::O_KEYS;
+use t27os::pty_logic::KEY_CAP;
+use t27os::pty_proto::OP_SETKEY;
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::agent_uses;
+use t27os::keys::provider_env;
+use t27os::keys::env_stripped;
+use t27os::keys::key_fits;
+use t27os::keys::profile_agent;
+use t27os::keys::claude_strips;
+use t27os::keys::pick_profile;
+use t27os::keys::PROFILE_PROVIDER;
+use t27os::keys::PR_NONE;
+use t27os::keys::profile_var_count;
+use t27os::keys::profile_var_name;
+use t27os::keys::profile_var_is_key;
+use t27os::keys::profile_var_text;
 use t27os::pty_client::sockaddr_un;
 use t27os::pty_client::client_connect;
 use t27os::pty_client::client_list;
@@ -203,7 +225,8 @@ use t27os::pty_logic::poll_revents;
 use t27os::pty_logic::exit_event;
 use t27os::pty_logic::hooked_status;
 use t27os::pty_logic::list_flags;
-use t27os::pty_logic::pane_command;
+use t27os::pty_logic::launch_command;
+use t27os::pty_logic::editor_spawn_ok;
 use t27os::pty_logic::argv_text;
 use t27os::pty_logic::plist_text;
 use t27os::pty_logic::c_path;
@@ -337,6 +360,88 @@ fn drop_record(st: []const u64, mem: []u8, i: usize) -> void {
     sys_unlink(mem[O_TMP2 + 256 .. O_TMP2 + 256 + fn_ + 1]);
 }
 
+/// In the child: unset every environment variable env_stripped names (CLAUDECODE, CLAUDE_CODE_*) and, for
+/// the claude agent, every endpoint/login/model variable claude_strips names; these are the
+/// markers of the session that started this server. Each unset changes the array, so the walk restarts.
+fn strip_claude_env(mem: []u8, agent: u32) -> void {
+    var round : u32 = 0;
+    var again : bool = true;
+    while (again and round < 64) {
+        again = false;
+        round = round + 1;
+        sys_peek(mem[O_TMP2 .. O_TMP2 + 8], sys_environ(), 8);
+        const arr : u64 = get_u64(mem[O_TMP2 .. O_TMP2 + 8], 0);
+        var i : u64 = 0;
+        var live : bool = arr != 0;
+        while (live and i < 1024) {
+            sys_peek(mem[O_TMP2 + 8 .. O_TMP2 + 16], arr + i * 8, 8);
+            const ent : u64 = get_u64(mem[O_TMP2 + 8 .. O_TMP2 + 16], 0);
+            if (ent == 0) {
+                live = false;
+            } else {
+                var n : u64 = sys_strlen(ent);
+                if (n > 100) { n = 100; }
+                sys_peek(mem[O_TMP2 + 16 .. O_TMP2 + 120], ent, n);
+                var e : usize = 0;
+                while (e < @as(usize, @intCast(n)) and mem[O_TMP2 + 16 + e] != 61) { e = e + 1; }
+                if (e < @as(usize, @intCast(n)) and (env_stripped(mem[O_TMP2 + 16 .. O_TMP2 + 16 + e]) or (profile_agent(agent) and claude_strips(mem[O_TMP2 + 16 .. O_TMP2 + 16 + e])))) {
+                    mem[O_TMP2 + 16 + e] = 0;
+                    sys_unsetenv(mem[O_TMP2 + 16 .. O_TMP2 + 16 + e + 1]);
+                    again = true;
+                    live = false;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// In the child, for the claude agent: pick the profile (keys.t27 pick_profile over the stored keys; the
+/// window withholds a key that failed its check) and set exactly that profile's variables. No stored key
+/// leaves the pane without one, and none of the other profile's variables is set.
+fn inject_profile(mem: []u8) -> void {
+    var stored : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (mem[O_KEYS + @as(usize, p) * KEY_CAP] != 0) { stored = stored + (1 << p); }
+        p = p + 1;
+    }
+    const pr : u32 = pick_profile(stored, 0);
+    if (pr == PR_NONE) { return; }
+    const at : usize = O_KEYS + @as(usize, PROFILE_PROVIDER[pr]) * KEY_CAP;
+    var k : u32 = 0;
+    while (k < profile_var_count(pr)) {
+        const nl : usize = profile_var_name(pr, k, mem[O_TMP2 .. O_TMP2 + 40]);
+        mem[O_TMP2 + nl] = 0;
+        if (profile_var_is_key(pr, k)) {
+            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+        } else {
+            const vl : usize = profile_var_text(pr, k, mem[O_TMP2 + 64 .. O_TMP2 + 200]);
+            mem[O_TMP2 + 64 + vl] = 0;
+            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[O_TMP2 + 64 .. O_TMP2 + 64 + vl + 1], 1);
+        }
+        k = k + 1;
+    }
+}
+
+/// In the child: set the environment variable of every stored key the agent reads (OP_SETKEY filled them).
+fn inject_keys(mem: []u8, agent: u32) -> void {
+    if (profile_agent(agent)) {
+        inject_profile(mem);
+        return;
+    }
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        const at : usize = O_KEYS + @as(usize, p) * KEY_CAP;
+        if (agent_uses(agent, p) and mem[at] != 0) {
+            const nl : usize = provider_env(p, mem[O_TMP2 .. O_TMP2 + 40]);
+            mem[O_TMP2 + nl] = 0;
+            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+        }
+        p = p + 1;
+    }
+}
+
 /// Start the process of pane i (fields already in st/mem) under plan R_RESUME or R_RELAUNCH.
 fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
     const base : usize = i * PF;
@@ -347,7 +452,7 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
         st[base + PF_SIDLEN] = @as(u64, un);
     }
     const home : []const u8 = home_slice(st, mem);
-    const cn : usize = pane_command(agent, plan, sid_of(st, mem, i), model_of(mem, i), home, mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
+    const cn : usize = launch_command(agent, plan, sid_of(st, mem, i), model_of(mem, i), home, cwd_of(st, mem, i), mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
     var f : [4]u64 = undefined;
     const tn : usize = argv_text(mem[O_TMP1 + 4096 .. O_TMP1 + 4096 + cn], mem[O_TMP1 .. O_TMP1 + 3000], f[0..4]);
     const cw : usize = c_path(mem[O_TMP1 + 3000 .. O_TMP1 + 3300], cwd_of(st, mem, i));
@@ -375,6 +480,8 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32) -> bool {
         }
         sys_chdir(mem[O_TMP1 + 3000 .. O_TMP1 + 3000 + cw + 1]);
         sys_setenv("T27OS_PANE", mem[O_TMP1 + 3300 .. O_TMP1 + 3300 + idn + 1], 1);
+        strip_claude_env(mem, agent);
+        inject_keys(mem, agent);
         sys_execv(mem[O_TMP1 .. O_TMP1 + 8], argv);
         sys_exit(127);
         return false;
@@ -458,7 +565,12 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         if (!spawn_ok(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
         const slot : u32 = pane_alloc(st);
         const cl : usize = spawn_cwd_len(mem[p0 .. p0 + plen]);
-        if (slot >= MAX_PANES or cl > CWD_CAP - 1 or cl == 0 or mem[p0] >= AGENT_COUNT and mem[p0] != SHELL_CELL) {
+        // an editor pane (the shell cell with a terminal editor as its model; pty_logic wants_editor) takes the
+        // path as `<editor> '<path>'`: a path that would break the quoting is refused here
+        var ml : usize = 0;
+        if (3 + cl < plen) { ml = plen - 4 - cl; }
+        const edit_ok : bool = editor_spawn_ok(@as(u32, mem[p0]), mem[p0 + 4 + cl .. p0 + 4 + cl + ml], mem[p0 + 3 .. p0 + 3 + cl]);
+        if (slot >= MAX_PANES or cl > CWD_CAP - 1 or cl == 0 or mem[p0] >= AGENT_COUNT and mem[p0] != SHELL_CELL or edit_ok == false) {
             reply(fd, mem, RE_ERR, 0, 0);
             return;
         }
@@ -482,6 +594,20 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         launch(st, mem, @as(usize, slot), R_RELAUNCH);
         save_pane(st, mem, @as(usize, slot));
         reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
+        return;
+    }
+    if (op == OP_SETKEY) {
+        if (pane >= PROVIDER_COUNT or plen > KEY_CAP - 2) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        if (plen > 0 and !key_fits(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        const ka : usize = O_KEYS + @as(usize, pane) * KEY_CAP;
+        mem[ka] = @as(u8, @intCast(plen));
+        var j : usize = 0;
+        while (j < plen) {
+            mem[ka + 1 + j] = mem[p0 + j];
+            j = j + 1;
+        }
+        mem[ka + 1 + plen] = 0;
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
         return;
     }
     if (pane >= MAX_PANES or st[base + PF_USED] == 0) { reply(fd, mem, RE_ERR, 0, 0); return; }
@@ -939,7 +1065,7 @@ fn run_install(st: []u64, mem: []u8) -> void {
 
 pub fn main() -> void {
     var st : [256]u64 = undefined;
-    var mem : [1146880]u8 = undefined;
+    var mem : [1149184]u8 = undefined;
     var z : usize = 0;
     while (z < ST_SIZE) {
         st[z] = 0;
@@ -975,5 +1101,6 @@ test the_arena_regions_do_not_overlap {
     assert O_POLL + 512 <= O_MISC;
     assert O_MISC + 328 <= O_BIN;
     assert O_BIN + 256 <= O_RING;
-    assert O_RING + 16 * 65536 <= MEM_SIZE;
+    assert O_RING + 16 * 65536 <= O_KEYS;
+    assert O_KEYS + 9 * KEY_CAP <= MEM_SIZE;
 }

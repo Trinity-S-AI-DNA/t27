@@ -434,6 +434,8 @@ struct Lower<'a> {
     /// bench or module-level declaration names, and every fn those name, to
     /// a fixed point (`analyzed_fns`).
     analyzed: HashSet<String>,
+    /// Refusals withdrawn from the bodies of fns nothing analyzed reaches (`lazy_body`).
+    held: Vec<Reject>,
     /// Lowering a fn outside `analyzed`: Zig compiles a fn body only when
     /// something analyzed references it, so a body stub there is never seen.
     unanalyzed_fn: bool,
@@ -573,6 +575,7 @@ fn lower_mode<'a>(
         ret_poison: false,
         decl_int: None,
         analyzed: HashSet::new(),
+        held: Vec::new(),
         unanalyzed_fn: false,
         unresolved: HashSet::new(),
         layout_err: false,
@@ -767,12 +770,11 @@ fn lower_mode<'a>(
     l.nfuncs = next_id;
     let mut const_names: Vec<String> = l.const_nodes.keys().cloned().collect();
     const_names.sort();
-    let hw: HashSet<&str> = marked(items.iter().copied(), vp::hw_consts).map(|n| n.name.as_str()).collect();
     for name in const_names {
-        if l.unreferenced_tuple_const(&items, &name) || hw.contains(name.as_str()) || l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
+        if l.alias_target(&name).is_some() || wp::is_wide(l.const_nodes[&name].extra_type.trim().as_bytes()) {
             continue;
         }
-        let _ = l.global(&name);
+        l.eager_const(&name);
     }
     for node in std::mem::take(&mut l.var_nodes) {
         if l.module_var(node).is_err() {
@@ -844,6 +846,7 @@ fn lower_mode<'a>(
             _ => {}
         }
     }
+    l.restore_held(&items);
     l.literal_writes();
     if !l.errors.is_empty() {
         return Err(l.errors);
@@ -1157,7 +1160,7 @@ impl<'a> Lower<'a> {
             }
         }
         let rt = n.extra_return_type.trim();
-        let ret = if rt.is_empty() || rt == "void" || self.unanalyzed_undefined_ret(n) {
+        let ret = if rt.is_empty() || rt == "void" {
             None
         } else if tt::anon_struct(rt.as_bytes()) {
             Some(self.anon_struct_ret(format!("{} (result of `{}`)", rt, n.name), rt)?)
@@ -1674,7 +1677,7 @@ impl<'a> Lower<'a> {
         if !self.unanalyzed_fn && tt::returns_value(n.extra_return_type.as_bytes()) {
             mark_tail_returns(&n.children, &mut self.tail_returns);
         }
-        let lowered = self.stmts(&n.children);
+        let lowered = self.lazy_body(n, &n.children);
         self.tail_returns.clear();
         body.extend(lowered?);
         let ret = ret.map(|t| reg_ty(&t).unwrap_or(Ty::Ptr));
@@ -2689,9 +2692,9 @@ impl<'a> Lower<'a> {
     ///   `expected == actual` or `|expected - actual| <= tolerance` (false
     ///   for a NaN). The operands are evaluated once, left to right.
     ///
-    /// Everywhere else the reference decides by where the statement sits: a
-    /// fn nothing analyzed reaches (or a bench, an uncalled fn) is never
-    /// analyzed, so the statement lowers to a trap no test reaches; an
+    /// Everywhere else the reference decides by where the statement sits: in a
+    /// fn nothing analyzed reaches (or a bench, an uncalled fn) the refusal
+    /// below is withdrawn with the body (`lazy_body`); an
     /// `invariant` is a container-level `comptime` block, where Zig's
     /// AstGen refuses `try` ("'try' outside function scope"); a reachable
     /// fn returns a non-error type in the reference's Zig ("expected type
@@ -2709,11 +2712,6 @@ impl<'a> Lower<'a> {
                 "ExprUnary(try) in an invariant",
                 "t27c emits an invariant as a container-level `comptime` block, where Zig refuses `try` (outside function scope)".into(),
             );
-        }
-        if self.unanalyzed_fn {
-            let site = self.site(TrapKind::Stub, "try in a fn the reference never analyzes".into(), Ty::Bool);
-            out.push(Stmt::Assert { cond: Expr { ty: Ty::Bool, kind: ExprKind::Const(0) }, site });
-            return Ok(());
         }
         if !self.in_test {
             return self.reject(
@@ -2840,18 +2838,11 @@ impl<'a> Lower<'a> {
     fn return_stmt(&mut self, v: Option<&Node>, out: &mut Vec<Stmt>) -> R<()> {
         // `return undefined;` (also a port's `fn stub() u32 { undefined; }`
         // since #6315) compiles in the reference and hands the caller an
-        // undefined value. In a fn nothing analyzed reaches, Zig never sees
-        // the body and the return is the stub trap no test can hit. Where
-        // analysis reaches the fn, an aggregate result is left unwritten in
-        // the caller's memory (`init`, as before #6315); a scalar one t27b
-        // refuses rather than guess a value.
+        // undefined value. Where analysis reaches the fn, an aggregate result
+        // is left unwritten in the caller's memory (`init`, as before #6315);
+        // a scalar one t27b refuses rather than guess a value (withdrawn with
+        // the body in a fn nothing analyzed reaches: `lazy_body`).
         if let Some(c) = v.filter(|c| c.kind == NodeKind::ExprIdentifier && c.name == "undefined") {
-            if self.ret.is_some() && !self.ret_poison && self.unanalyzed_fn {
-                self.see(c);
-                let site = self.site(TrapKind::Stub, "`return undefined;` in a fn the reference never analyzes".into(), Ty::Bool);
-                out.push(Stmt::Assert { cond: Expr { ty: Ty::Bool, kind: ExprKind::Const(0) }, site });
-                return Ok(());
-            }
             // In a void fn `undefined` is the one `void` value, so the
             // statement is a plain `return;`. Not in a test: its Zig result
             // is an error union, and an undefined one is no value t27b can
@@ -5275,25 +5266,6 @@ impl<'a> Lower<'a> {
                 return self.slice_of(addr_of(&arr), 0, want.clone());
             }
         }
-        // `&[_]T{ ... } ** n` where a slice is wanted: t27c prints
-        // `&.{ ... } ** n`, which Zig reads as `(&.{ ... }) ** n`, a pointer
-        // to a tuple, and refuses once it analyzes it ("expected indexable").
-        // In a fn nothing analyzed reaches it is only parsed, so it lowers to
-        // the stub trap no test reaches; anywhere else it stays refused.
-        if self.unanalyzed_fn
-            && n.kind == NodeKind::ExprUnary
-            && n.extra_op == "&"
-            && n.children.len() == 1
-            && is_repeat_op(&n.children[0])
-            && matches!(want, LTy::Str | LTy::Slice(..))
-        {
-            self.see(n);
-            let k = self.new_slot(want)?;
-            let site = self.site(TrapKind::Stub, "`&` of a repeated array literal in a fn the reference never analyzes".into(), Ty::Bool);
-            let trap = Stmt::Assert { cond: Expr { ty: Ty::Bool, kind: ExprKind::Const(0) }, site };
-            let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Seq { stmts: vec![trap], value: Box::new(slot_expr(k)) } };
-            return Ok(Val::M(Place { addr, off: 0, ty: want.clone(), mutable: false, temp: Some(k) }));
-        }
         let v = self.expr(n)?;
         self.coerce_to(v, want)
     }
@@ -6210,6 +6182,7 @@ impl<'a> Lower<'a> {
             let (x, y) = (&self.data[*ka as usize][..*la as usize], &self.data[*kb as usize][..*lb as usize]);
             Expr { ty: Ty::Bool, kind: ExprKind::Const((x == y) as i128) }
         } else {
+            self.eql_used = true; // before the coercions: t27c prints `std.mem.eql` whether or not they hold (`restore_held`)
             let mut args = Vec::new();
             for v in [a, b] {
                 match self.coerce_to(v, &LTy::Str)? {
@@ -6217,7 +6190,6 @@ impl<'a> Lower<'a> {
                     _ => return Err(()),
                 }
             }
-            self.eql_used = true;
             Expr { ty: Ty::Bool, kind: ExprKind::Call { func: self.nfuncs, args } }
         };
         if !negate {
@@ -7366,7 +7338,6 @@ fn flat<'n>(ns: impl IntoIterator<Item = &'n Node>) -> (Vec<u8>, Vec<u8>) {
 }
 const _: () = assert!(NodeKind::StmtExpr as u8 == aw::K_STMT_EXPR && NodeKind::ExprRange as u8 == aw::K_EXPR_RANGE);
 #[path = "../../../gen/rust/tri/t27b/verilog_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod ve; // t27c gen-rust of specs/tri/t27b/verilog_emit.t27: `t27b verilog` (#8796)
-#[path = "../../../gen/rust/tri/t27b/verilog_plan.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod vp; // t27c gen-rust of specs/tri/t27b/verilog_plan.t27: hw_consts, the consts only the hardware reads
 #[path = "../../../gen/rust/tri/t27b/ts_emit.rs"] #[allow(dead_code, unused_parens, unused_variables, while_true)] mod tse; // specs/tri/t27b/ts_emit.t27: `t27b ts` (#9994)
 /// `t27b verilog` (`t27b ts` when `ts`): `flat`'s bytes and per node four u32 (flags 1 var, 2 pub; line; its params' span in `p`).
 pub fn verilog(ast: &Node, ts: bool) -> Result<String, String> {
