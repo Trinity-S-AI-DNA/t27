@@ -1,0 +1,659 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/ngram_hslm.t27 -- main() fits unigram, bigram and trigram models on the HSLM training
+; tokens and measures them on the held-out tokens, the yardstick a perplexity of the trained HSLM
+; is read against. Issue: gHashTag/t27#10372 (epic #10024, own_model cell 25).
+; WHY: a perplexity means nothing alone. Its tokenizer fixes the scale (vocab 729, about 2.9
+; bytes per token on TinyStories), so published TinyStories numbers with other tokenizers do not
+; compare. What does compare is a count model on the SAME train.tok and valid.tok: if the network
+; does not beat a trigram, it learned nothing a table could not.
+; THE MODELS, counts over all of /tmp/hslm/train.tok, no parameter tuned on valid.tok:
+;   P1(w)      = (c(w) + 1) / (N + 729)                                  add-one unigram
+;   P2(w|v)    = (max(c(v w) - D, 0) + D n(v .) P1(w)) / c(v .)          interpolated absolute
+;   P3(w|u v)  = (max(c(u v w) - D, 0) + D n(u v .) P2(w|v)) / c(u v .)  discounting, D = 0.75
+; c(v .) and c(u v .) are context counts, n(v .) and n(u v .) the number of distinct words seen
+; after the context. An unseen context falls back to the order below. Each P sums to 1 over w
+; (the tests check it). Bigram counts are a dense 729 x 729 table; trigram counts live in an
+; open-addressing hash of 2^24 slots, keyed by (u * 729 + v) * 729 + w.
+; THE TWO MEASURES on /tmp/hslm/valid.tok:
+;   stream   every token from the second on, predicted from the (up to) two tokens before it
+;   windows  exactly eval_hslm's windows (NG_WINDOWS evenly spaced starts k * ((N - 28) / windows),
+;            28 tokens each): position p predicts token p + 1 from the tokens of the window only, so
+;            position 0 has one token of context (the bigram), later positions two (the trigram).
+;            full = mean over the 27 positions, last = position 26 only, as eval_hslm prints them.
+;   bpb        stream bits per byte = mean nats / ln 2 * tokens / bytes of /tmp/hslm/valid.txt.
+; THE OUTPUT, stdout: one `ngram data` line, then one `ngram order <k>` line per order.
+; main() fails (assert, a nonzero exit) when a token file cannot be read, valid.txt is missing, the
+; hash fills, or a loss is NaN.
+; WHAT IS REUSED: the HTOK reader (tr_read_tok), the file helpers and the line formatters of
+; train_hslm, through `use ml::train_hslm`; the state they bind to is declared here (use_resolve
+; splices no `var`). Nothing in train_hslm.t27 changes.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ngram_hslm;
+
+use base::types;
+use ml::train_hslm;
+
+const NG_V : usize = 729;
+const NG_D : f64 = 0.75;
+const NG_HASH_MAX : usize = 16777216;
+const NG_WINDOWS : usize = 19683;
+const NG_WINDOW : usize = 28;
+const NG_CTX : usize = 27;
+
+const NG_RC_OK : i32 = 0;
+const NG_RC_DATA : i32 = 10;
+const NG_RC_TEXT : i32 = 20;
+const NG_RC_FULL : i32 = 30;
+const NG_RC_NAN : i32 = 40;
+
+; THE STATE train_hslm's spliced helpers bind to
+var io_fail : u32 = 0;
+var io_hdr : [STATE_HEADER]u8 = undefined;
+var io_chunk : [IO_CHUNK]u8 = undefined;
+var cfg_buf : [4096]u8 = undefined;
+var ln_buf : [512]u8 = undefined;
+var ln_n : usize = 0;
+var train_tok : [TRAIN_CAP]u16 = undefined;
+var valid_tok : [VALID_CAP]u16 = undefined;
+var ntrain : usize = 0;
+var nvalid : usize = 0;
+
+; THE COUNTS
+var ng_uni : [NG_V]u64 = undefined;
+var ng_total : u64 = 0;
+var ng_bi : [NG_V * NG_V]u32 = undefined;
+var ng_bi_row : [NG_V]u64 = undefined;
+var ng_bi_types : [NG_V]u64 = undefined;
+var ng_tri_ctx : [NG_V * NG_V]u32 = undefined;
+var ng_tri_types : [NG_V * NG_V]u32 = undefined;
+var ng_key : [NG_HASH_MAX]u32 = undefined;
+var ng_cnt : [NG_HASH_MAX]u32 = undefined;
+var ng_hash_size : usize = NG_HASH_MAX;
+var ng_hash_used : usize = 0;
+var ng_full : bool = false;
+
+; THE MEASURES: index 0, 1, 2 = order 1, 2, 3
+var ng_s_stream : [3]f64 = undefined;
+var ng_s_full : [3]f64 = undefined;
+var ng_s_last : [3]f64 = undefined;
+var ng_n_stream : u64 = 0;
+var ng_n_pos : u64 = 0;
+var ng_n_win : u64 = 0;
+var ng_bytes : u64 = 0;
+
+; ---------------------------------------------------------------------------------------------
+; 1. Counting
+; ---------------------------------------------------------------------------------------------
+
+/// Zero every count; the hash uses its first `hash_size` slots (2^24 in main, small in the tests)
+fn ng_reset(hash_size: usize) -> void {
+    var i : usize = 0;
+    while (i < NG_V) {
+        ng_uni[i] = 0;
+        ng_bi_row[i] = 0;
+        ng_bi_types[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < NG_V * NG_V) {
+        ng_bi[i] = 0;
+        ng_tri_ctx[i] = 0;
+        ng_tri_types[i] = 0;
+        i = i + 1;
+    }
+    ng_hash_size = hash_size;
+    i = 0;
+    while (i < hash_size) {
+        ng_key[i] = 0;
+        ng_cnt[i] = 0;
+        i = i + 1;
+    }
+    ng_total = 0;
+    ng_hash_used = 0;
+    ng_full = false;
+}
+
+fn ng_tri_key(u: usize, v: usize, w: usize) -> u32 {
+    return @intCast((u * NG_V + v) * NG_V + w);
+}
+
+/// The slot of `key` (stored as key + 1, 0 = empty): its own, or the empty one where it would go
+fn ng_slot(key: u32) -> usize {
+    const k : u64 = @as(u64, key) + 1;
+    var h : usize = @intCast(((k * 2654435761) >> 16) % @as(u64, @intCast(ng_hash_size)));
+    var probes : usize = 0;
+    while (probes < ng_hash_size) {
+        const s : u32 = ng_key[h];
+        if (s == 0 or @as(u64, s) == k) {
+            return h;
+        }
+        h = h + 1;
+        if (h == ng_hash_size) {
+            h = 0;
+        }
+        probes = probes + 1;
+    }
+    return ng_hash_size;
+}
+
+/// c(u v w) += 1; true when the trigram is new
+fn ng_tri_add(key: u32) -> bool {
+    const h : usize = ng_slot(key);
+    if (h < ng_hash_size and ng_key[h] != 0) {
+        ng_cnt[h] = ng_cnt[h] + 1;
+        return false;
+    }
+    if (h == ng_hash_size or ng_hash_used * 4 >= ng_hash_size * 3) {
+        ng_full = true;
+        return false;
+    }
+    ng_key[h] = key + 1;
+    ng_cnt[h] = 1;
+    ng_hash_used = ng_hash_used + 1;
+    return true;
+}
+
+fn ng_tri_count(key: u32) -> u32 {
+    const h : usize = ng_slot(key);
+    if (h == ng_hash_size or ng_key[h] == 0) {
+        return 0;
+    }
+    return ng_cnt[h];
+}
+
+/// All counts of tokens[0..n]
+fn ng_fit(tokens: []const u16, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        const w : usize = @intCast(tokens[i]);
+        ng_uni[w] = ng_uni[w] + 1;
+        ng_total = ng_total + 1;
+        if (i >= 1) {
+            const v : usize = @intCast(tokens[i - 1]);
+            const b : usize = v * NG_V + w;
+            if (ng_bi[b] == 0) {
+                ng_bi_types[v] = ng_bi_types[v] + 1;
+            }
+            ng_bi[b] = ng_bi[b] + 1;
+            ng_bi_row[v] = ng_bi_row[v] + 1;
+        }
+        if (i >= 2) {
+            const u : usize = @intCast(tokens[i - 2]);
+            const v2 : usize = @intCast(tokens[i - 1]);
+            const c : usize = u * NG_V + v2;
+            if (ng_tri_add(ng_tri_key(u, v2, w))) {
+                ng_tri_types[c] = ng_tri_types[c] + 1;
+            }
+            ng_tri_ctx[c] = ng_tri_ctx[c] + 1;
+        }
+        i = i + 1;
+    }
+}
+
+; ---------------------------------------------------------------------------------------------
+; 2. The three models
+; ---------------------------------------------------------------------------------------------
+
+fn ng_p1(w: usize) -> f64 {
+    const num : f64 = @floatFromInt(ng_uni[w] + 1);
+    const den : f64 = @floatFromInt(ng_total + @as(u64, NG_V));
+    return num / den;
+}
+
+fn ng_p2(v: usize, w: usize) -> f64 {
+    const row : u64 = ng_bi_row[v];
+    if (row == 0) {
+        return ng_p1(w);
+    }
+    var kept : f64 = @as(f64, @floatFromInt(ng_bi[v * NG_V + w])) - NG_D;
+    if (kept < 0.0) {
+        kept = 0.0;
+    }
+    const types : f64 = @floatFromInt(ng_bi_types[v]);
+    return (kept + NG_D * types * ng_p1(w)) / @as(f64, @floatFromInt(row));
+}
+
+fn ng_p3(u: usize, v: usize, w: usize) -> f64 {
+    const c : usize = u * NG_V + v;
+    const ctx : u32 = ng_tri_ctx[c];
+    if (ctx == 0) {
+        return ng_p2(v, w);
+    }
+    var kept : f64 = @as(f64, @floatFromInt(ng_tri_count(ng_tri_key(u, v, w)))) - NG_D;
+    if (kept < 0.0) {
+        kept = 0.0;
+    }
+    const types : f64 = @floatFromInt(ng_tri_types[c]);
+    return (kept + NG_D * types * ng_p2(v, w)) / @as(f64, @floatFromInt(ctx));
+}
+
+/// -ln P of token tokens[i] under order k (1, 2, 3), with the context limited to tokens[lo..i]
+fn ng_nll(tokens: []const u16, lo: usize, i: usize, k: usize) -> f64 {
+    const w : usize = @intCast(tokens[i]);
+    if (k == 1 or i == lo) {
+        return 0.0 - log(ng_p1(w));
+    }
+    const v : usize = @intCast(tokens[i - 1]);
+    if (k == 2 or i == lo + 1) {
+        return 0.0 - log(ng_p2(v, w));
+    }
+    const u : usize = @intCast(tokens[i - 2]);
+    return 0.0 - log(ng_p3(u, v, w));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 3. The measures
+; ---------------------------------------------------------------------------------------------
+
+fn ng_acc_reset() -> void {
+    var k : usize = 0;
+    while (k < 3) {
+        ng_s_stream[k] = 0.0;
+        ng_s_full[k] = 0.0;
+        ng_s_last[k] = 0.0;
+        k = k + 1;
+    }
+    ng_n_stream = 0;
+    ng_n_pos = 0;
+    ng_n_win = 0;
+}
+
+/// Every token of tokens[1..n] from the tokens before it
+fn ng_stream(tokens: []const u16, n: usize) -> void {
+    var i : usize = 1;
+    while (i < n) {
+        var k : usize = 0;
+        while (k < 3) {
+            ng_s_stream[k] = ng_s_stream[k] + ng_nll(tokens, 0, i, k + 1);
+            k = k + 1;
+        }
+        ng_n_stream = ng_n_stream + 1;
+        i = i + 1;
+    }
+}
+
+/// One eval_hslm window at `start`: position p scores token start + p + 1 from start..start + p
+fn ng_window(tokens: []const u16, n: usize, start: usize) -> bool {
+    if (start + NG_WINDOW > n) {
+        return false;
+    }
+    var p : usize = 0;
+    while (p < NG_CTX) {
+        var k : usize = 0;
+        while (k < 3) {
+            const t : f64 = ng_nll(tokens, start, start + p + 1, k + 1);
+            ng_s_full[k] = ng_s_full[k] + t;
+            if (p + 1 == NG_CTX) {
+                ng_s_last[k] = ng_s_last[k] + t;
+            }
+            k = k + 1;
+        }
+        ng_n_pos = ng_n_pos + 1;
+        p = p + 1;
+    }
+    ng_n_win = ng_n_win + 1;
+    return true;
+}
+
+/// eval_hslm's spacing for `count` windows over n tokens (its ev_stride_for with stride 0)
+fn ng_stride_for(count: usize, n: usize) -> usize {
+    if (n <= NG_CTX + 1 or count == 0) {
+        return 1;
+    }
+    var stride : usize = (n - NG_CTX - 1) / count;
+    if (stride == 0) {
+        stride = 1;
+    }
+    return stride;
+}
+
+/// The windows that fit
+fn ng_windows(tokens: []const u16, n: usize, count: usize) -> usize {
+    const stride : usize = ng_stride_for(count, n);
+    var used : usize = 0;
+    var k : usize = 0;
+    while (k < count) {
+        if (ng_window(tokens, n, k * stride)) {
+            used = used + 1;
+        }
+        k = k + 1;
+    }
+    return used;
+}
+
+fn ng_mean(sum: f64, n: u64) -> f64 {
+    return sum / @as(f64, @floatFromInt(n));
+}
+
+; ---------------------------------------------------------------------------------------------
+; 4. Data, output, main
+; ---------------------------------------------------------------------------------------------
+
+/// The byte count of /tmp/hslm/valid.txt, or 0 when it cannot be read
+fn ng_count_bytes() -> u64 {
+    const fd : i32 = host_open("/tmp/hslm/valid.txt", 0);
+    if (fd < 0) {
+        return 0;
+    }
+    var total : u64 = 0;
+    var done : bool = false;
+    while (!done) {
+        const got : i64 = tr_read_full(fd, &io_chunk);
+        if (got <= 0) {
+            done = true;
+        } else {
+            total = total + @as(u64, @intCast(got));
+            if (got < @as(i64, @intCast(IO_CHUNK))) {
+                done = true;
+            }
+        }
+    }
+    tr_note(host_close(fd));
+    return total;
+}
+
+fn ng_say(text: []const u8) -> void {
+    ln_reset();
+    ln_str(text);
+    ln_flush();
+}
+
+fn ng_order_line(k: usize) -> void {
+    const sl : f64 = ng_mean(ng_s_stream[k], ng_n_stream);
+    const fl : f64 = ng_mean(ng_s_full[k], ng_n_pos);
+    const ll : f64 = ng_mean(ng_s_last[k], ng_n_win);
+    const bpb : f64 = sl / log(2.0) * @as(f64, @floatFromInt(nvalid)) / @as(f64, @floatFromInt(ng_bytes));
+    ln_reset();
+    ln_str("ngram order ");
+    ln_u64(@intCast(k + 1));
+    ln_str(" stream_tokens ");
+    ln_u64(ng_n_stream);
+    ln_str(" stream_loss ");
+    ln_f64(sl, 4);
+    ln_str(" stream_ppl ");
+    ln_f64(exp(sl), 2);
+    ln_str(" stream_bpb ");
+    ln_f64(bpb, 4);
+    ln_str(" windows ");
+    ln_u64(ng_n_win);
+    ln_str(" positions ");
+    ln_u64(ng_n_pos);
+    ln_str(" full_loss ");
+    ln_f64(fl, 4);
+    ln_str(" full_ppl ");
+    ln_f64(exp(fl), 2);
+    ln_str(" last_loss ");
+    ln_f64(ll, 4);
+    ln_str(" last_ppl ");
+    ln_f64(exp(ll), 2);
+    ln_flush();
+}
+
+fn ng_data_line() -> void {
+    ln_reset();
+    ln_str("ngram data train_tokens ");
+    ln_u64(@intCast(ntrain));
+    ln_str(" valid_tokens ");
+    ln_u64(@intCast(nvalid));
+    ln_str(" valid_bytes ");
+    ln_u64(ng_bytes);
+    ln_str(" trigram_types ");
+    ln_u64(@intCast(ng_hash_used));
+    ln_str(" discount ");
+    ln_f64(NG_D, 2);
+    ln_flush();
+}
+
+fn ng_main() -> i32 {
+    const nt : i64 = tr_read_tok(0, &train_tok);
+    const nv : i64 = tr_read_tok(1, &valid_tok);
+    if (nt < @as(i64, @intCast(NG_WINDOW)) or nv < @as(i64, @intCast(NG_WINDOW))) {
+        ng_say("ngram_hslm: /tmp/hslm/train.tok or valid.tok missing or bad");
+        return NG_RC_DATA;
+    }
+    ntrain = @intCast(nt);
+    nvalid = @intCast(nv);
+    ng_bytes = ng_count_bytes();
+    if (ng_bytes == 0) {
+        ng_say("ngram_hslm: /tmp/hslm/valid.txt missing");
+        return NG_RC_TEXT;
+    }
+    ng_reset(NG_HASH_MAX);
+    ng_fit(train_tok[0..ntrain], ntrain);
+    if (ng_full) {
+        ng_say("ngram_hslm: the trigram hash is full");
+        return NG_RC_FULL;
+    }
+    ng_acc_reset();
+    ng_stream(valid_tok[0..nvalid], nvalid);
+    if (ng_windows(valid_tok[0..nvalid], nvalid, NG_WINDOWS) == 0) {
+        ng_say("ngram_hslm: no window fits in valid.tok");
+        return NG_RC_DATA;
+    }
+    ng_data_line();
+    var k : usize = 0;
+    while (k < 3) {
+        const a : f64 = ng_s_stream[k];
+        const b : f64 = ng_s_full[k];
+        if (a != a or b != b) {
+            ng_say("ngram_hslm: a loss is NaN");
+            return NG_RC_NAN;
+        }
+        ng_order_line(k);
+        k = k + 1;
+    }
+    return NG_RC_OK;
+}
+
+/// The program `t27c compile --backend ml` builds
+pub fn main() -> void {
+    assert ng_main() == NG_RC_OK;
+}
+
+; ---------------------------------------------------------------------------------------------
+; 5. Test helpers (each returns the number its test checks) and the tests
+; ---------------------------------------------------------------------------------------------
+
+/// Counts of tr_synth's learnable stream (next = 7 cur + 3 mod 729, one token in ten random) in a
+/// small hash
+fn ng_tiny_fit() -> void {
+    tr_synth(train_tok[0..20000], 11);
+    tr_synth(valid_tok[0..3000], 13);
+    ntrain = 20000;
+    nvalid = 3000;
+    ng_reset(65536);
+    ng_fit(train_tok[0..ntrain], ntrain);
+}
+
+/// |1 - sum over w of P_k(w | context)| for order k, context (u, v)
+fn ng_sum_gap(k: usize, u: usize, v: usize) -> f64 {
+    var s : f64 = 0.0;
+    var w : usize = 0;
+    while (w < NG_V) {
+        if (k == 1) {
+            s = s + ng_p1(w);
+        } else if (k == 2) {
+            s = s + ng_p2(v, w);
+        } else {
+            s = s + ng_p3(u, v, w);
+        }
+        w = w + 1;
+    }
+    return abs(1.0 - s);
+}
+
+/// The largest sum gap over the three orders, a seen context (u v = 1, 10) and an unseen one
+fn ng_worst_sum_gap() -> f64 {
+    ng_tiny_fit();
+    var worst : f64 = 0.0;
+    var k : usize = 1;
+    while (k <= 3) {
+        const g1 : f64 = ng_sum_gap(k, 1, 10);
+        const g2 : f64 = ng_sum_gap(k, 700, 3);
+        if (g1 > worst) {
+            worst = g1;
+        }
+        if (g2 > worst) {
+            worst = g2;
+        }
+        k = k + 1;
+    }
+    return worst;
+}
+
+fn ng_seen_context() -> u64 {
+    ng_tiny_fit();
+    return @as(u64, ng_tri_ctx[1 * NG_V + 10]) * 1000 + @as(u64, ng_tri_ctx[700 * NG_V + 3]);
+}
+
+/// The stream losses on the synthetic held-out stream, order k (1..3)
+fn ng_tiny_stream(k: usize) -> f64 {
+    ng_tiny_fit();
+    ng_acc_reset();
+    ng_stream(valid_tok[0..nvalid], nvalid);
+    return ng_mean(ng_s_stream[k - 1], ng_n_stream);
+}
+
+/// A second-order stream over 27 ids: next = (cur + 5 prev + 3) mod 27, one token in ten random.
+/// Given cur alone the next id is uniform over the 27 values of prev, so only the trigram sees it.
+fn ng_synth2(dst: []u16, seed: u64) -> void {
+    var x : u64 = seed;
+    var prev : u64 = 1;
+    var cur : u64 = 2;
+    var i : usize = 0;
+    while (i < dst.len) {
+        x = tr_xs(x);
+        var nxt : u64 = (cur + 5 * prev + 3) % 27;
+        if (x % 10 == 0) {
+            nxt = (x >> 20) % 27;
+        }
+        dst[i] = @intCast(nxt);
+        prev = cur;
+        cur = nxt;
+        i = i + 1;
+    }
+}
+
+/// The stream loss of order k on ng_synth2 held-out tokens, after fitting on ng_synth2 tokens
+fn ng_tiny2_stream(k: usize) -> f64 {
+    ng_synth2(train_tok[0..20000], 11);
+    ng_synth2(valid_tok[0..3000], 13);
+    ntrain = 20000;
+    nvalid = 3000;
+    ng_reset(65536);
+    ng_fit(train_tok[0..ntrain], ntrain);
+    ng_acc_reset();
+    ng_stream(valid_tok[0..nvalid], nvalid);
+    return ng_mean(ng_s_stream[k - 1], ng_n_stream);
+}
+
+/// With no training tokens every order is the uniform 1/729
+fn ng_empty_gap() -> f64 {
+    ng_reset(4096);
+    tr_synth(valid_tok[0..500], 13);
+    nvalid = 500;
+    ng_acc_reset();
+    ng_stream(valid_tok[0..nvalid], nvalid);
+    var worst : f64 = 0.0;
+    var k : usize = 0;
+    while (k < 3) {
+        const g : f64 = abs(ng_mean(ng_s_stream[k], ng_n_stream) - log(729.0));
+        if (g > worst) {
+            worst = g;
+        }
+        k = k + 1;
+    }
+    return worst;
+}
+
+/// A trigram seen twice counts 2, one seen once counts 1, an unseen one 0
+fn ng_hash_counts() -> u64 {
+    ng_reset(4096);
+    const a : bool = ng_tri_add(ng_tri_key(5, 6, 7));
+    const b : bool = ng_tri_add(ng_tri_key(5, 6, 7));
+    const c : bool = ng_tri_add(ng_tri_key(728, 728, 728));
+    var r : u64 = @as(u64, ng_tri_count(ng_tri_key(5, 6, 7))) * 100;
+    r = r + @as(u64, ng_tri_count(ng_tri_key(728, 728, 728))) * 10;
+    r = r + @as(u64, ng_tri_count(ng_tri_key(6, 5, 7)));
+    if (!a or b or !c) {
+        r = r + 1000;
+    }
+    return r + @as(u64, @intCast(ng_hash_used)) * 10000;
+}
+
+/// One window: position 0 is the bigram term, position 26 the trigram term, full is the mean
+fn ng_window_gap() -> f64 {
+    ng_tiny_fit();
+    ng_acc_reset();
+    if (!ng_window(valid_tok[0..nvalid], nvalid, 100)) {
+        return 1.0;
+    }
+    var s : f64 = 0.0;
+    var p : usize = 0;
+    while (p < NG_CTX) {
+        const w : usize = @intCast(valid_tok[101 + p]);
+        const v : usize = @intCast(valid_tok[100 + p]);
+        if (p == 0) {
+            s = s - log(ng_p2(v, w));
+        } else {
+            const u : usize = @intCast(valid_tok[99 + p]);
+            s = s - log(ng_p3(u, v, w));
+        }
+        p = p + 1;
+    }
+    return abs(s - ng_s_full[2]) + abs(ng_mean(ng_s_full[2], ng_n_pos) - s / 27.0);
+}
+
+fn ng_short_window_refused() -> u64 {
+    ng_tiny_fit();
+    ng_acc_reset();
+    var r : u64 = 0;
+    if (ng_window(valid_tok[0..nvalid], 27, 0)) {
+        r = r + 1;
+    }
+    if (ng_window(valid_tok[0..nvalid], 28, 0)) {
+        r = r + 10;
+    }
+    return r + ng_n_pos * 100;
+}
+
+test every_order_sums_to_one_over_the_vocabulary
+    given gap = ng_worst_sum_gap()
+    and   seen = ng_seen_context()
+    then  gap < 1e-9
+    and   seen > 1000
+
+test no_training_tokens_gives_ln_729_for_every_order
+    given gap = ng_empty_gap()
+    then  gap < 1e-12
+
+test the_hash_counts_repeats_and_keeps_keys_apart
+    given r = ng_hash_counts()
+    then  r == 20210
+
+test a_first_order_stream_is_learned_by_the_bigram
+    given l1 = ng_tiny_stream(1)
+    and   l2 = ng_tiny_stream(2)
+    then  l2 < l1 - 3.0
+
+test a_second_order_stream_needs_the_trigram
+    given l2 = ng_tiny2_stream(2)
+    and   l3 = ng_tiny2_stream(3)
+    then  l3 < l2 - 2.0
+
+test the_window_measure_is_bigram_at_position_0_and_trigram_after
+    given gap = ng_window_gap()
+    then  gap < 1e-9
+
+test a_window_of_27_tokens_is_refused_and_28_is_taken
+    given r = ng_short_window_refused()
+    then  r == 2710
+
+test the_window_spacing_is_eval_hslms
+    given s1 = ng_stride_for(243, 7689354)
+    and   s2 = ng_stride_for(19683, 7689354)
+    and   s3 = ng_stride_for(5, 20)
+    then  s1 == 31643
+    and   s2 == 390
+    and   s3 == 1

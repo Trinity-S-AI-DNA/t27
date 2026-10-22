@@ -9,6 +9,7 @@ same way. The clone holds only git objects; a fresh clone is the repair.
   kept      a healthy clone is reused: steps.checkout says clone "kept".
   healed    a clone whose remote is gone is removed and cloned again; the run
             records clone "recloned" and the first error, so a heal is seen.
+  retry     a run whose checkout failed is tried again on the next poll;
   refcache  (#6443) the reference cache keys on the `use` closure and t27c,
             and a timeout is never cached;
   image     (#6443) the lab names its own lab.py by the sha `git hash-object`
@@ -82,6 +83,12 @@ with tempfile.TemporaryDirectory() as t:
           f"healed: a clone that cannot fetch is cloned again, and the run says so ({r})")
     check((lab.CLONE / "b.txt").exists() and git("rev-parse", "HEAD", cwd=str(lab.CLONE)) == sha,
           "healed: the new clone is at the requested commit")
+
+    if hasattr(lab, "run_done"):
+        check(lab.run_done({"steps": {"checkout": {"ok": True}, "ratchet": {"ok": False}}}),
+              "retry: a run that checked out settles its commit, even when a later step is red")
+        check(not lab.run_done({"steps": {"checkout": {"ok": False, "error": "git clone failed"}}}),
+              "retry: a run whose checkout failed does not, so the next poll tries it again")
 
     if hasattr(lab, "reference_key"):
         # #6443: the reference cache is keyed by the import closure and t27c,
