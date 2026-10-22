@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/sarif_feed.t27 -- the adapter between what t27c prints and specs/claw/sarif.t27, and the
+; one function the claw-sarif job calls: raw per-file records in, a SARIF 2.1.0 document out.
+; Owner order 2026-10-18: wire the merged TRI CLAW law specs to a real pull request.
+; --
+; Where things live:
+; - The document: sarif.t27 sarif_render. This file adds no JSON.
+; - The input: one record per changed .t27 file, three TAB fields, written by the job from two t27c
+;   subcommands it already runs: path, the one word `t27c spec-status` prints for it, and the first
+;   stderr line of `t27c parse` (empty when the file parses). Nothing else is read.
+; - The mapping, in one place:
+;     NOPARSE    -> error    parse-error     at the line:col `t27c parse` names ("... at line L:C"),
+;                                            1:1 when it names none; the message is t27c's own line
+;     UNWRITTEN  -> warning  unwritten-spec  at 1:1 (the status is per spec, not per function)
+;     IMPLEMENTED, PARTIAL, NOFN             no finding
+;     any other word, or a record that is not three fields: a line sarif_render refuses, so the
+;                document is emitted with executionSuccessful false instead of a clean-looking one
+; - Rules test-failed and vacuous-test need `t27c test-report`, which needs zig; the job does not
+;   install zig, so those two rules are not fed yet. The rule table keeps them (an alert is keyed by
+;   rule id) and the document does not claim them.
+; --
+; Fail closed: an unknown status, a short record or an overflowing finding list never becomes "no
+; findings"; each marks the run partial. A document too big for the output buffer is the caller's
+; to refuse: feed_sarif returns the bytes it needs and sarif_fits says whether they fit.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawSarifFeed;
+
+use claw::sarif;
+use claw::text;
+
+/// Findings buffered between the two passes, in bytes.
+pub const TSV_CAP : usize = 65536;
+
+/// A line sarif_render drops for its severity word, so it counts as invalid and marks the run partial.
+pub const REFUSED_LINE : str = "fatal\tparse-error\tx\t1\t1\tx\n";
+pub const REFUSED_LINE_LEN : usize = 26;
+
+/// Copy raw[s..e) to dst; a tab or newline inside a message is not copied as is (a space instead),
+/// since either would split the finding line the next pass reads.
+fn copy_span(dst : []u8, cap : usize, w : usize, raw : []const u8, s : usize, e : usize) -> usize {
+    var x : usize = w;
+    var i : usize = s;
+    while (i < e) {
+        var b : u8 = raw[i];
+        if (b == '\t' or b == '\n' or b == 13) { b = ' '; }
+        x = put_byte(dst, cap, x, b);
+        i += 1;
+    }
+    return x;
+}
+
+/// Index just past the first " at line " in raw[s..e); e when there is none.
+fn after_marker(raw : []const u8, s : usize, e : usize) -> usize {
+    var i : usize = s;
+    while (i + 9 <= e) {
+        if (field_eq(raw, i, i + 9, " at line ", 9)) { return i + 9; }
+        i += 1;
+    }
+    return e;
+}
+
+/// End of the run of digits starting at p, bounded by e.
+fn digits_end(raw : []const u8, p : usize, e : usize) -> usize {
+    var i : usize = p;
+    while (i < e) {
+        if (raw[i] < '0' or raw[i] > '9') { return i; }
+        i += 1;
+    }
+    return e;
+}
+
+/// One finding line for a parse failure of raw[ps..pe), whose t27c message is raw[ms..me).
+fn put_noparse(dst : []u8, cap : usize, w : usize, raw : []const u8, ps : usize, pe : usize, ms : usize, me : usize) -> usize {
+    var line : u32 = 1;
+    var col : u32 = 1;
+    const at : usize = after_marker(raw, ms, me);
+    const le : usize = digits_end(raw, at, me);
+    if (le > at) {
+        line = region_of(parse_num(raw, at, le));
+        if (le < me and raw[le] == ':') {
+            col = region_of(parse_num(raw, le + 1, digits_end(raw, le + 1, me)));
+        }
+    }
+    var x : usize = put_str(dst, cap, w, "error\tparse-error\t", 18);
+    x = copy_span(dst, cap, x, raw, ps, pe);
+    x = put_byte(dst, cap, x, '\t');
+    x = put_count(dst, cap, x, line);
+    x = put_byte(dst, cap, x, '\t');
+    x = put_count(dst, cap, x, col);
+    x = put_byte(dst, cap, x, '\t');
+    if (me > ms) {
+        x = copy_span(dst, cap, x, raw, ms, me);
+    } else {
+        x = put_str(dst, cap, x, RULE_TEXTS[0], RULE_TEXT_LENS[0]);
+    }
+    return put_byte(dst, cap, x, '\n');
+}
+
+/// One finding line for a spec with unwritten functions.
+fn put_unwritten(dst : []u8, cap : usize, w : usize, raw : []const u8, ps : usize, pe : usize) -> usize {
+    var x : usize = put_str(dst, cap, w, "warning\tunwritten-spec\t", 23);
+    x = copy_span(dst, cap, x, raw, ps, pe);
+    x = put_str(dst, cap, x, "\t1\t1\t", 5);
+    x = put_str(dst, cap, x, RULE_TEXTS[3], RULE_TEXT_LENS[3]);
+    return put_byte(dst, cap, x, '\n');
+}
+
+/// The finding lines of raw[0..n) in sarif.t27's six-field form, into out; returns the bytes needed.
+pub fn feed_tsv(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = line_end(raw, n, ls);
+        if (le > ls) {
+            const t1 : usize = field_end(raw, le, ls);
+            const t2 : usize = field_end(raw, le, t1 + 1);
+            if (t1 >= le or t2 >= le) {
+                w = put_str(out, cap, w, REFUSED_LINE, REFUSED_LINE_LEN);
+            } else if (field_eq(raw, t1 + 1, t2, "NOPARSE", 7)) {
+                w = put_noparse(out, cap, w, raw, ls, t1, t2 + 1, le);
+            } else if (field_eq(raw, t1 + 1, t2, "UNWRITTEN", 9)) {
+                w = put_unwritten(out, cap, w, raw, ls, t1);
+            } else if (field_eq(raw, t1 + 1, t2, "IMPLEMENTED", 11) == false and field_eq(raw, t1 + 1, t2, "PARTIAL", 7) == false and field_eq(raw, t1 + 1, t2, "NOFN", 4) == false) {
+                w = put_str(out, cap, w, REFUSED_LINE, REFUSED_LINE_LEN);
+            }
+        }
+        var nx : usize = le;
+        while (nx < n and raw[nx] != '\n') { nx += 1; }
+        ls = nx + 1;
+    }
+    return w;
+}
+
+/// The SARIF document for the records in raw[0..n), into out. Returns the bytes it needs; when that
+/// exceeds out_cap, sarif_fits says the buffer holds a clipped document that must not be uploaded.
+/// Findings that overflow TSV_CAP are not silently cut: the whole list is replaced by one refused
+/// line, so the document is empty and says the run is partial.
+pub fn feed_sarif(raw : []const u8, n : usize, out : []u8, out_cap : usize) -> usize {
+    var tsv : [65536]u8 = undefined;
+    var tn : usize = feed_tsv(raw, n, &tsv, TSV_CAP);
+    if (tn > TSV_CAP) { tn = put_str(&tsv, TSV_CAP, 0, REFUSED_LINE, REFUSED_LINE_LEN); }
+    return sarif_render(&tsv, tn, DEFAULT_MAX_RESULTS, out, out_cap);
+}
+
+test refused_line_length_is_pinned {
+    var b : [64]u8 = undefined;
+    const k : usize = put_str(&b, 64, 0, REFUSED_LINE, REFUSED_LINE_LEN);
+    assert k == 26;
+    assert b[k - 1] == '\n';
+}
+
+test a_parse_failure_is_an_error_at_the_line_t27c_names {
+    var r : [256]u8 = undefined;
+    const n : usize = put_str(&r, 256, 0, "specs/a.t27\tNOPARSE\tError: Parse error: Expected RParen, got Eof ('') at line 3:1\n", 82);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert sarif_fits(d, 8192) == true;
+    assert buf_has(&out, d, "\"ruleId\":\"T27C001\"", 18) == true;
+    assert buf_has(&out, d, "\"level\":\"error\"", 15) == true;
+    assert buf_has(&out, d, "\"uri\":\"specs/a.t27\"", 19) == true;
+    assert buf_has(&out, d, "\"startLine\":3,\"startColumn\":1", 29) == true;
+    assert buf_has(&out, d, "Expected RParen", 15) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test a_parse_failure_without_a_position_lands_on_line_one {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "specs/b.t27\tNOPARSE\tError: boom\n", 32);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"startLine\":1,\"startColumn\":1", 29) == true;
+    assert buf_has(&out, d, "\"text\":\"Error: boom\"", 20) == true;
+}
+
+test an_empty_parse_message_gets_the_fallback {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "specs/b.t27\tNOPARSE\t\n", 21);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"text\":\"t27c could not parse the spec\"", 38) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test unwritten_is_a_warning_at_line_one {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "specs/c.t27\tUNWRITTEN\t\n", 23);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"ruleId\":\"T27C004\"", 18) == true;
+    assert buf_has(&out, d, "\"level\":\"warning\"", 17) == true;
+    assert buf_has(&out, d, "\"startLine\":1,\"startColumn\":1", 29) == true;
+    assert buf_has(&out, d, "spec-status UNWRITTEN", 21) == true;
+}
+
+test written_specs_make_no_finding {
+    var r : [256]u8 = undefined;
+    const n : usize = put_str(&r, 256, 0, "a.t27\tIMPLEMENTED\t\nb.t27\tPARTIAL\t\nc.t27\tNOFN\t\n", 46);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test an_unknown_status_marks_the_run_partial {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "a.t27\tWEIRD\t\n", 13);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":false", 27) == true;
+}
+
+test a_short_record_marks_the_run_partial {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "a.t27 NOPARSE\n", 14);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":false", 27) == true;
+}
+
+test a_path_that_climbs_out_is_refused_not_reported {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "../x.t27\tUNWRITTEN\t\n", 20);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":false", 27) == true;
+}
+
+test several_files_make_several_results_in_order {
+    var r : [512]u8 = undefined;
+    const n : usize = put_str(&r, 512, 0, "a.t27\tNOPARSE\te at line 7:9\nb.t27\tIMPLEMENTED\t\nc.t27\tUNWRITTEN\t\n", 64);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"uri\":\"a.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"startLine\":7,\"startColumn\":9", 29) == true;
+    assert buf_has(&out, d, "\"uri\":\"c.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"uri\":\"b.t27\"", 13) == false;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test empty_input_is_a_valid_empty_run {
+    var r : [4]u8 = undefined;
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, 0, &out, 8192);
+    assert sarif_fits(d, 8192) == true;
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test a_message_with_a_quote_or_a_tab_stays_one_valid_finding {
+    var r : [256]u8 = undefined;
+    const n : usize = put_str(&r, 256, 0, "a.t27\tNOPARSE\tgot \"x\"\tthen y\n", 29);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "got \\\"x\\\" then y", 16) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+// The tests below were written against a mutation sweep of this file (#10721).
+
+test a_zero_inside_a_position_is_a_digit {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line 10:20\n", 30);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"startLine\":10,\"startColumn\":20", 31) == true;
+}
+
+test a_column_needs_a_line_number_and_a_colon_right_after_it {
+    var r : [128]u8 = undefined;
+    var out : [8192]u8 = undefined;
+    var n : usize = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line :5\n", 27);
+    var d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"startLine\":1,\"startColumn\":1", 29) == true;
+    n = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line 3-5\n", 28);
+    d = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"startLine\":3,\"startColumn\":1", 29) == true;
+}
+
+test a_blank_line_between_records_is_skipped_not_refused {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\t\n\nb.t27\tUNWRITTEN\t\n", 35);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"uri\":\"a.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"uri\":\"b.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test a_two_field_record_is_refused_even_with_a_known_status {
+    var r : [128]u8 = undefined;
+    const n : usize = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\n", 16);
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":false", 27) == true;
+}
+
+test crlf_records_are_all_read {
+    // the carriage return is written as 13: "\r" in a literal is two bytes, not one
+    var r : [128]u8 = undefined;
+    var n : usize = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\t", 16);
+    n = put_byte(&r, 128, n, 13);
+    n = put_byte(&r, 128, n, '\n');
+    n = put_str(&r, 128, n, "b.t27\tUNWRITTEN\t", 16);
+    n = put_byte(&r, 128, n, 13);
+    n = put_byte(&r, 128, n, '\n');
+    assert n == 36;
+    assert r[16] == 13;
+    var out : [8192]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 8192);
+    assert buf_has(&out, d, "\"uri\":\"a.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"uri\":\"b.t27\"", 13) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+/// count UNWRITTEN records whose path is plen bytes of 'p', then one whose path is last bytes of 'q'.
+fn t_unwritten_lines(dst : []u8, cap : usize, count : u32, plen : usize, last : usize) -> usize {
+    var x : usize = 0;
+    var c : u32 = 0;
+    while (c < count) {
+        var k : usize = 0;
+        while (k < plen) {
+            x = put_byte(dst, cap, x, 'p');
+            k += 1;
+        }
+        x = put_str(dst, cap, x, "\tUNWRITTEN\t\n", 12);
+        c += 1;
+    }
+    var j : usize = 0;
+    while (j < last) {
+        x = put_byte(dst, cap, x, 'q');
+        j += 1;
+    }
+    return put_str(dst, cap, x, "\tUNWRITTEN\t\n", 12);
+}
+
+test a_finding_list_of_exactly_tsv_cap_bytes_is_kept {
+    var r : [40000]u8 = undefined;
+    const n : usize = t_unwritten_lines(&r, 40000, 339, 100, 16);
+    var tsv : [65536]u8 = undefined;
+    assert feed_tsv(&r, n, &tsv, TSV_CAP) == TSV_CAP;
+    var out : [262144]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 262144);
+    assert sarif_fits(d, 262144) == true;
+    assert buf_has(&out, d, "\"uri\":\"qqqqqqqqqqqqqqqq\"", 24) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":true", 26) == true;
+}
+
+test a_finding_list_one_byte_over_tsv_cap_is_refused_whole {
+    var r : [40000]u8 = undefined;
+    const n : usize = t_unwritten_lines(&r, 40000, 339, 100, 17);
+    var tsv : [65536]u8 = undefined;
+    assert feed_tsv(&r, n, &tsv, TSV_CAP) == TSV_CAP + 1;
+    var out : [262144]u8 = undefined;
+    const d : usize = feed_sarif(&r, n, &out, 262144);
+    assert buf_has(&out, d, "\"results\":[]", 12) == true;
+    assert buf_has(&out, d, "\"executionSuccessful\":false", 27) == true;
+}
