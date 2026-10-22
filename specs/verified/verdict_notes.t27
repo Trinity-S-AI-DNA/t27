@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/verdict_notes.t27 -- the verdict cache: a spec whose normalized hash did not move keeps its last
+; verdict, stored as a git note. Epic gHashTag/t27#8095, trigit epic item 13, CI speed request of 2026-10-20.
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/reuse.t27 / seal_identity.t27: WHETHER an old verdict may be reused (five parts equal, old
+;   verdict PASS, MISSING never SAME). This file is WHERE the old verdict is kept and in what form.
+; - specs/verified/seal_kinds.t27: canon() and spec_norm_hash, the identity of the spec part.
+; - specs/verified/bitstream_reuse.t27: the same pattern for bitstreams (key -> entry, audit every Nth hit,
+;   a key that lied is POISONED and dropped). The audit rule here is the same one, not a second one.
+; - .trinity/seals/*.json keep the verdict of the sealed run in the repository tree. A note is the cheap side
+;   door for verdicts of runs that never produce a seal commit (a pull request's CI run, a lab run).
+; --
+; The store. A git notes ref, `refs/notes/verdicts`. Git notes attach text to an OBJECT, so the key is an object:
+;   the glue writes a small key document with `git hash-object -w`, one line per identity part, in this order:
+;     spec=<spec_norm_hash>            (seal_kinds.t27, sha256 of canon)
+;     closure=<hash>,<hash>,...        spec_norm_hash of every seal in the `use` closure, in the seal's own order
+;     config=<SEAL_CONFIG>             seal_identity.t27
+;     runner=<sha256 of bootstrap/src/test_report.rs>   and  zig=<version>
+;   Its blob id is the note's target. A different spec, import, config or runner is a different blob, so a
+;   changed input can only MISS; it can never read as a hit. The key document holds nothing that is not an
+;   identity part: no commit id, no time, no host.
+; The value. One line of `key=number` words, in this order, separated by one space:
+;     v=1 passed=P failed=F vacuous=V forced=X inv=I t27b=B lut=L ff=R
+;   passed/failed/vacuous/forced/inv are the tests part (seal_identity checks_pass reads them); t27b is 0 clean,
+;   1 dirty, 2 not run; lut and ff are the synthesis numbers (0 when not synthesized). Unknown words are kept
+;   and ignored, so a later field is not a break. A line that is not v=1 is STALE_FORMAT, and a stale format is
+;   a miss, never a hit.
+; --
+; The rules:
+; - GET: no note -> VR_MISS. Note present but unreadable (no v=1, or a required word missing) -> VR_STALE_FORMAT.
+;   A readable note whose tests part is not a clean pass (checks_pass) -> VR_RERUN: a cached failure is not
+;   reused, the spec is run again (reuse.t27: reuse only when the old verdict was PASS). Otherwise VR_HIT.
+; - PUT: only a run that finished, did not force its result, and whose spec bytes were the same before and after
+;   the run (seal_write.t27 pattern 2). A put for anything else is refused, so the cache never holds a half run.
+; - MERGE: two notes for one key are two runs of the same inputs and must agree. If both are clean they are
+;   equal in effect and the first is kept. If they disagree on pass versus fail the key lied (an input it never
+;   declared): PICK_DROP, both are removed and the spec is run again. Fail closed, as the bitstream audit does.
+; - AUDIT: every AUDIT_EVERY-th hit is run again without the cache and compared; a difference drops the key.
+; - SHARE: the ref travels with `git fetch/push origin refs/notes/verdicts:refs/notes/verdicts`. Branch
+;   protection does not cover notes, so a pull request cannot vouch for itself: a CI job reads the BASE
+;   branch's notes and writes its own into the head ref only after the job passed (the same trust line as the
+;   affected-specs step, which scores against the base seals).
+; --
+; Glue (thin, no cargo build in this change): `tri verdict get|put <spec>` computes canon + the key document
+; through t27c, then calls `git notes --ref=verdicts show|add -f`. `get` prints note_hit(); `put` refuses when
+; put_allowed() is false. The writer of the line is note_line() below, the reader is note_get(); neither is
+; reimplemented in the glue.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedVerdictNotes;
+
+use ci::affected;
+use verified::seal_identity;
+
+/// verdict_result() answers.
+pub const VR_HIT : u8 = 0;
+pub const VR_MISS : u8 = 1;
+pub const VR_STALE_FORMAT : u8 = 2;
+pub const VR_RERUN : u8 = 3;
+
+/// merge_pick() answers.
+pub const PICK_FIRST : u8 = 0;
+pub const PICK_DROP : u8 = 1;
+
+/// A word that is absent reads as this; no real count reaches it.
+pub const ABSENT : u32 = 0xFFFFFFFF;
+
+/// The format version this file writes and reads.
+pub const NOTE_VERSION : u32 = 1;
+
+/// t27b codes.
+pub const T27B_CLEAN : u32 = 0;
+pub const T27B_DIRTY : u32 = 1;
+pub const T27B_NOT_RUN : u32 = 2;
+
+/// One in AUDIT_EVERY hits is run again without the cache (bitstream_reuse.t27 uses the same idea).
+pub const AUDIT_EVERY : u32 = 20;
+
+/// Key literals end with '$' (no length needed in C or Zig), as in ci/affected.t27.
+pub const K_V : str = "v$";
+pub const K_PASSED : str = "passed$";
+pub const K_FAILED : str = "failed$";
+pub const K_VACUOUS : str = "vacuous$";
+pub const K_FORCED : str = "forced$";
+pub const K_INV : str = "inv$";
+pub const K_T27B : str = "t27b$";
+pub const K_LUT : str = "lut$";
+pub const K_FF : str = "ff$";
+
+/// Does the word buf[s..e] start with `key` followed by '='? Returns the index of the first digit, or e when it
+/// is not that key.
+pub fn word_value_at(buf: []const u8, s: usize, e: usize, key: []const u8) -> usize {
+    var k : usize = 0;
+    while (key[k] != LIST_END) {
+        if (s + k >= e) { return e; }
+        if (buf[s + k] != key[k]) { return e; }
+        k += 1;
+    }
+    if (s + k >= e) { return e; }
+    if (buf[s + k] != '=') { return e; }
+    return s + k + 1;
+}
+
+/// The decimal number in buf[s..e], or ABSENT when it is empty, has a non-digit, or does not fit in u32.
+pub fn parse_u32(buf: []const u8, s: usize, e: usize) -> u32 {
+    if (e <= s) { return ABSENT; }
+    var v : u32 = 0;
+    var i : usize = s;
+    while (i < e) {
+        if (buf[i] < '0' or buf[i] > '9') { return ABSENT; }
+        const d : u32 = (buf[i] - '0') as u32;
+        // 429496729 * 10 + 4 = 4294967294 is the largest value; ABSENT itself is not a number
+        if (v > 429496729) { return ABSENT; }
+        if (v == 429496729 and d > 4) { return ABSENT; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    return v;
+}
+
+/// The value of `key` in the note buf[0..n]: words are separated by single spaces. ABSENT when missing or not
+/// a number. The first occurrence wins.
+pub fn note_get(buf: []const u8, n: usize, key: []const u8) -> u32 {
+    var s : usize = 0;
+    while (s < n) {
+        var e : usize = s;
+        while (e < n and buf[e] != ' ' and buf[e] != '\n') { e += 1; }
+        const v : usize = word_value_at(buf, s, e, key);
+        if (v < e) { return parse_u32(buf, v, e); }
+        s = e + 1;
+    }
+    return ABSENT;
+}
+
+/// Is the note readable: v=1 and every required word present?
+pub fn note_valid(buf: []const u8, n: usize) -> bool {
+    if (note_get(buf, n, K_V) != NOTE_VERSION) { return false; }
+    if (note_get(buf, n, K_PASSED) == ABSENT) { return false; }
+    if (note_get(buf, n, K_FAILED) == ABSENT) { return false; }
+    if (note_get(buf, n, K_VACUOUS) == ABSENT) { return false; }
+    if (note_get(buf, n, K_FORCED) == ABSENT) { return false; }
+    if (note_get(buf, n, K_INV) == ABSENT) { return false; }
+    return true;
+}
+
+/// Do the tests of a readable note count as a pass? seal_identity.checks_pass is the one rule.
+pub fn note_clean(buf: []const u8, n: usize) -> bool {
+    const failed : u32 = note_get(buf, n, K_FAILED);
+    const passed : u32 = note_get(buf, n, K_PASSED);
+    return checks_pass(failed == 0, note_get(buf, n, K_FORCED) != 0, passed + failed, note_get(buf, n, K_INV), note_get(buf, n, K_VACUOUS));
+}
+
+/// What `tri verdict get` answers for a key: has_note says a note exists, buf[0..n] is its value.
+pub fn verdict_result(has_note: bool, buf: []const u8, n: usize) -> u8 {
+    if (has_note == false) { return VR_MISS; }
+    if (note_valid(buf, n) == false) { return VR_STALE_FORMAT; }
+    if (note_clean(buf, n) == false) { return VR_RERUN; }
+    return VR_HIT;
+}
+
+/// Is the verdict reused, saving the run?
+pub fn note_hit(has_note: bool, buf: []const u8, n: usize) -> bool {
+    return verdict_result(has_note, buf, n) == VR_HIT;
+}
+
+/// May `tri verdict put` store a verdict? The run finished, its result was not forced, and the spec bytes were
+/// the same before and after it.
+pub fn put_allowed(finished: bool, forced: bool, bytes_stable: bool) -> bool {
+    if (finished == false) { return false; }
+    if (forced) { return false; }
+    return bytes_stable;
+}
+
+/// Two notes for one key. Both clean: keep the first. Any disagreement, or any not clean: the key lied or the
+/// run was bad, drop both and run again.
+pub fn merge_pick(a_valid: bool, a_clean: bool, b_valid: bool, b_clean: bool) -> u8 {
+    if (a_valid == false or b_valid == false) { return PICK_DROP; }
+    if (a_clean != b_clean) { return PICK_DROP; }
+    return PICK_FIRST;
+}
+
+/// Is this hit the one in AUDIT_EVERY that is run again without the cache? hits counts hits for the key so far,
+/// this one included. AUDIT_EVERY of 0 would audit never; the constant is 20.
+pub fn audit_due(hits: u32) -> bool {
+    if (hits == 0) { return false; }
+    return hits % AUDIT_EVERY == 0;
+}
+
+/// Write the decimal of v at w; the returned position keeps counting past the end (affected.put).
+pub fn put_u32(out: []u8, w: usize, cap: usize, v: u32) -> usize {
+    var digits : u32 = 1;
+    var t : u32 = v;
+    while (t >= 10) {
+        t = t / 10;
+        digits += 1;
+    }
+    var p : u32 = digits;
+    var x : u32 = v;
+    var pos : usize = w + digits;
+    while (p > 0) {
+        pos -= 1;
+        if (pos < cap) { out[pos] = (48 + x % 10) as u8; }
+        x = x / 10;
+        p -= 1;
+    }
+    return w + digits;
+}
+
+/// Write `key=value ` (no trailing blank for the last word: the caller passes last = true).
+pub fn put_word(out: []u8, w: usize, cap: usize, key: []const u8, v: u32, last: bool) -> usize {
+    var p : usize = w;
+    var k : usize = 0;
+    while (key[k] != LIST_END) {
+        p = put(out, p, cap, key[k]);
+        k += 1;
+    }
+    p = put(out, p, cap, '=');
+    p = put_u32(out, p, cap, v);
+    if (last) { return p; }
+    return put(out, p, cap, ' ');
+}
+
+/// The note value for a verdict, written in the order the header fixes. Returns the length, or cap + 1 when it
+/// does not fit.
+pub fn note_line(out: []u8, cap: usize, passed: u32, failed: u32, vacuous: u32, forced: u32, inv: u32, t27b: u32, lut: u32, ff: u32) -> usize {
+    var w : usize = 0;
+    w = put_word(out, w, cap, K_V, NOTE_VERSION, false);
+    w = put_word(out, w, cap, K_PASSED, passed, false);
+    w = put_word(out, w, cap, K_FAILED, failed, false);
+    w = put_word(out, w, cap, K_VACUOUS, vacuous, false);
+    w = put_word(out, w, cap, K_FORCED, forced, false);
+    w = put_word(out, w, cap, K_INV, inv, false);
+    w = put_word(out, w, cap, K_T27B, t27b, false);
+    w = put_word(out, w, cap, K_LUT, lut, false);
+    w = put_word(out, w, cap, K_FF, ff, true);
+    if (w > cap) { return cap + 1; }
+    return w;
+}
+
+test a_written_note_reads_back_and_is_a_hit {
+    var b : [96]u8 = undefined;
+    const n : usize = note_line(&b, 96, 12, 0, 0, 0, 1, 0, 340, 120);
+    assert same(&b, 0, n, "v=1 passed=12 failed=0 vacuous=0 forced=0 inv=1 t27b=0 lut=340 ff=120", 0, 69);
+    assert note_get(&b, n, K_LUT) == 340;
+    assert note_get(&b, n, K_FF) == 120;
+    assert note_get(&b, n, K_PASSED) == 12;
+    assert note_valid(&b, n);
+    assert verdict_result(true, &b, n) == VR_HIT;
+}
+
+test no_note_is_a_miss_and_a_cached_failure_is_run_again {
+    var b : [96]u8 = undefined;
+    assert verdict_result(false, &b, 0) == VR_MISS;
+    const n : usize = note_line(&b, 96, 11, 1, 0, 0, 0, 0, 0, 0);
+    assert verdict_result(true, &b, n) == VR_RERUN;
+    assert note_hit(true, &b, n) == false;
+}
+
+test negative_control_forced_and_vacuous_runs_are_not_reused {
+    var b : [96]u8 = undefined;
+    // forced
+    var n : usize = note_line(&b, 96, 5, 0, 0, 1, 0, 0, 0, 0);
+    assert verdict_result(true, &b, n) == VR_RERUN;
+    // every test passed with no runtime assert: vacuous, checked nothing
+    n = note_line(&b, 96, 3, 0, 3, 0, 0, 0, 0, 0);
+    assert verdict_result(true, &b, n) == VR_RERUN;
+    // nothing ran at all
+    n = note_line(&b, 96, 0, 0, 0, 0, 0, 0, 0, 0);
+    assert verdict_result(true, &b, n) == VR_RERUN;
+}
+
+test an_unreadable_note_is_a_stale_format_never_a_hit {
+    assert verdict_result(true, "v=2 passed=1 failed=0 vacuous=0 forced=0 inv=0", 46) == VR_STALE_FORMAT;
+    assert verdict_result(true, "passed=1 failed=0 vacuous=0 forced=0 inv=0", 42) == VR_STALE_FORMAT;
+    assert verdict_result(true, "v=1 passed=1 failed=0 vacuous=0 forced=0", 40) == VR_STALE_FORMAT;
+    assert verdict_result(true, "v=1 passed=x failed=0 vacuous=0 forced=0 inv=0", 46) == VR_STALE_FORMAT;
+}
+
+test an_unknown_later_word_is_ignored {
+    const s : []const u8 = "v=1 passed=2 failed=0 vacuous=0 forced=0 inv=0 future=9";
+    assert note_valid(s, 55);
+    assert note_get(s, 55, K_LUT) == ABSENT;
+    assert verdict_result(true, s, 55) == VR_HIT;
+}
+
+test numbers_parse_exactly {
+    assert parse_u32("0", 0, 1) == 0;
+    assert parse_u32("4294967294", 0, 10) == 4294967294;
+    assert parse_u32("4294967295", 0, 10) == ABSENT;
+    assert parse_u32("12a", 0, 3) == ABSENT;
+    assert parse_u32("", 0, 0) == ABSENT;
+}
+
+test put_refuses_a_half_run {
+    assert put_allowed(true, false, true);
+    assert put_allowed(false, false, true) == false;
+    assert put_allowed(true, true, true) == false;
+    assert put_allowed(true, false, false) == false;
+}
+
+test two_notes_for_one_key_must_agree_or_the_key_is_dropped {
+    assert merge_pick(true, true, true, true) == PICK_FIRST;
+    assert merge_pick(true, true, true, false) == PICK_DROP;
+    assert merge_pick(true, false, true, true) == PICK_DROP;
+    assert merge_pick(true, true, false, false) == PICK_DROP;
+}
+
+test every_twentieth_hit_is_audited {
+    assert audit_due(0) == false;
+    assert audit_due(19) == false;
+    assert audit_due(20) == true;
+    assert audit_due(40) == true;
+    assert audit_due(41) == false;
+}
+
+test a_note_that_does_not_fit_is_refused {
+    var b : [8]u8 = undefined;
+    assert note_line(&b, 8, 1, 0, 0, 0, 0, 0, 0, 0) == 9;
+}

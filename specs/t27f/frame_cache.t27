@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/frame_cache.t27 -- the cache key of a reel's rendered frames, taken from the seal t27c
+; wrote for the spec that draws them (specs/t27f/token_floor.t27 first).
+; --
+; Why: token_floor renders 450 frames in 52 s, and most edits to the reel (captions, voice, music,
+; the filter graph in token_floor_mux.t27) never touch a pixel. The frames depend on the spec, on
+; the specs it uses, on the compiler that lowers them and on the zig that builds the result, and
+; on nothing else. `t27c seal --save` already records the first two as sha256 digests. So the key
+; is the seal, checked against the files as they are now, plus the toolchain.
+; --
+; The input, one text the caller assembles from tools it already runs:
+;   t27c <sha256 of the t27c binary>       (t27c --version prints only the release number)
+;   zig <`zig version`>
+;   mode <the zig build flags, e.g. ReleaseSafe -lc>
+;   <sha256>  <path>                        (`sha256sum` lines: the spec and every spec it uses;
+;                                            extra lines are ignored)
+;   seal
+;   <the .trinity/seals/*.json file, as `t27c seal --save` wrote it>
+; The output is the canonical key record:
+;   frame_cache 1
+;   dep <path> <sealed sha256>              (one per closure entry, in the seal's order)
+;   spec <path> <sealed sha256>
+;   t27c ... / zig ... / mode ...           (the header lines, verbatim)
+; and the caller names the cache file by the sha256 of that record.
+; --
+; Fail closed. `t27c seal --verify` checks the spec's own digest but not the closure, so this file
+; checks every digest itself. Any of these refuses, and a refusal is a cache miss that stores
+; nothing: no seal section, a header line missing or empty, a seal without a closure list, a seal
+; whose tests did not all pass, a sealed file with no `sha256sum` line, or one whose digest has
+; changed since the seal. The refusal is one line starting `refused:`, so a stale seal can never
+; hand back frames rendered from other code.
+; Every string is counted, as in specs/claw/text.t27, so this file lowers under gen-c and runs as
+; a plain C filter with no zig on the path.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module frame_cache;
+
+use claw::sarif;
+use claw::text;
+
+pub const KEY_HEAD : str = "frame_cache 1\n";
+pub const KEY_HEAD_LEN : usize = 14;
+
+/// A sha256 digest in hex; `sha256sum` puts two spaces after it.
+pub const DIGEST_LEN : usize = 64;
+
+/// Whether text[a0..a1) and text[b0..b1) hold the same bytes.
+fn spans_eq(text : []const u8, a0 : usize, a1 : usize, b0 : usize, b1 : usize) -> bool {
+    if (a1 < a0 or b1 < b0) { return false; }
+    if (a1 - a0 != b1 - b0) { return false; }
+    var i : usize = 0;
+    while (a0 + i < a1) {
+        if (text[a0 + i] != text[b0 + i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Copy text[s..e) to dst at w, clipped at cap; returns the new cursor.
+fn put_span(dst : []u8, cap : usize, w : usize, text : []const u8, s : usize, e : usize) -> usize {
+    var x : usize = w;
+    var i : usize = s;
+    while (i < e) {
+        x = put_byte(dst, cap, x, text[i]);
+        i += 1;
+    }
+    return x;
+}
+
+/// The start of the line after the one starting at s.
+fn next_line(text : []const u8, n : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < n and text[i] != '\n') { i += 1; }
+    return i + 1;
+}
+
+/// The first non-space index in text[s..e).
+fn skip_spaces(text : []const u8, s : usize, e : usize) -> usize {
+    var i : usize = s;
+    while (i < e and text[i] == ' ') { i += 1; }
+    return i;
+}
+
+/// The index of the first double quote in text[s..e); e when there is none.
+fn quote_at(text : []const u8, s : usize, e : usize) -> usize {
+    var i : usize = s;
+    while (i < e and text[i] != 34) { i += 1; }
+    return i;
+}
+
+/// The start of the line that is exactly `seal`; n when there is none.
+fn seal_line(text : []const u8, n : usize) -> usize {
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = line_end(text, n, ls);
+        if (le == ls + 4 and field_eq(text, ls, le, "seal", 4)) { return ls; }
+        ls = next_line(text, n, ls);
+    }
+    return n;
+}
+
+/// The start of the value of header line `name value` in text[0..he); he when absent.
+fn header_at(text : []const u8, he : usize, name : str, nlen : usize) -> usize {
+    var ls : usize = 0;
+    while (ls < he) {
+        const le : usize = line_end(text, he, ls);
+        if (le > ls + nlen + 1 and field_eq(text, ls, ls + nlen, name, nlen) and text[ls + nlen] == ' ') {
+            return ls + nlen + 1;
+        }
+        ls = next_line(text, he, ls);
+    }
+    return he;
+}
+
+/// The start of the digest `sha256sum` printed for the path text[ps..pe), among text[0..he); he
+/// when no line names that path.
+fn digest_of(text : []const u8, he : usize, ps : usize, pe : usize) -> usize {
+    var ls : usize = 0;
+    while (ls < he) {
+        const le : usize = line_end(text, he, ls);
+        if (le > ls + DIGEST_LEN + 2 and text[ls + DIGEST_LEN] == ' ' and text[ls + DIGEST_LEN + 1] == ' ') {
+            if (spans_eq(text, ls + DIGEST_LEN + 2, le, ps, pe)) { return ls; }
+        }
+        ls = next_line(text, he, ls);
+    }
+    return he;
+}
+
+/// The one refusal line, written from the start of dst; returns its length.
+fn refuse(dst : []u8, cap : usize, why : str, why_len : usize) -> usize {
+    const w : usize = put_str(dst, cap, 0, "refused: ", 9);
+    return put_byte(dst, cap, put_str(dst, cap, w, why, why_len), '\n');
+}
+
+/// Whether out[0..m) is a refusal rather than a key.
+pub fn is_refused(out : []const u8, m : usize) -> bool {
+    if (m < 8) { return true; }
+    return field_eq(out, 0, 8, "refused:", 8);
+}
+
+/// The header line whose value starts at v, verbatim and newline-terminated.
+fn put_header(dst : []u8, cap : usize, w : usize, text : []const u8, he : usize, v : usize, nlen : usize) -> usize {
+    return put_byte(dst, cap, put_span(dst, cap, w, text, v - nlen - 1, line_end(text, he, v)), '\n');
+}
+
+/// The key record for text[0..n) into out, or one `refused:` line. Returns the bytes written; a
+/// result over cap means out was too small and the key must not be used.
+pub fn frame_key(text : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    const he : usize = seal_line(text, n);
+    if (he >= n) { return refuse(out, cap, "no seal section", 15); }
+    const t27c_at : usize = header_at(text, he, "t27c", 4);
+    const zig_at : usize = header_at(text, he, "zig", 3);
+    const mode_at : usize = header_at(text, he, "mode", 4);
+    if (t27c_at >= he or zig_at >= he or mode_at >= he) {
+        return refuse(out, cap, "a t27c, zig or mode line is missing", 35);
+    }
+    var w : usize = put_str(out, cap, 0, KEY_HEAD, KEY_HEAD_LEN);
+    var closure_seen : bool = false;
+    var tests_pass : bool = false;
+    var have_spec : bool = false;
+    var spec_s : usize = n;
+    var spec_e : usize = n;
+    var top_h : usize = n;
+    var top_ps : usize = n;
+    var top_pe : usize = n;
+    var ls : usize = next_line(text, n, he);
+    while (ls < n) {
+        const le : usize = line_end(text, n, ls);
+        const s : usize = skip_spaces(text, ls, le);
+        var was_spec : bool = false;
+        if (le > s + 9 and field_eq(text, s, s + 9, "\"spec\": \"", 9)) {
+            spec_s = s + 9;
+            spec_e = quote_at(text, spec_s, le);
+            was_spec = true;
+        } else if (le > s + 21 + DIGEST_LEN and field_eq(text, s, s + 21, "\"spec_hash\": \"sha256:", 21) and text[s + 21 + DIGEST_LEN] == 34) {
+            if (have_spec) {
+                const d : usize = digest_of(text, he, spec_s, spec_e);
+                if (d >= he) { return refuse(out, cap, "a spec in the closure has no sha256sum line", 43); }
+                if (spans_eq(text, d, d + DIGEST_LEN, s + 21, s + 21 + DIGEST_LEN) == false) {
+                    return refuse(out, cap, "a spec in the closure changed since the seal", 44);
+                }
+                w = put_str(out, cap, w, "dep ", 4);
+                w = put_span(out, cap, w, text, spec_s, spec_e);
+                w = put_byte(out, cap, w, ' ');
+                w = put_span(out, cap, w, text, s + 21, s + 21 + DIGEST_LEN);
+                w = put_byte(out, cap, w, '\n');
+            } else {
+                top_h = s + 21;
+            }
+        } else if (le > s + 14 and field_eq(text, s, s + 14, "\"spec_path\": \"", 14)) {
+            top_ps = s + 14;
+            top_pe = quote_at(text, top_ps, le);
+        } else if (le > s + 10 and field_eq(text, s, s + 10, "\"failed\": ", 10)) {
+            tests_pass = text[s + 10] == '0' and (le == s + 11 or text[s + 11] == ',');
+        } else if (le >= s + 11 and field_eq(text, s, s + 11, "\"closure\": ", 11)) {
+            closure_seen = true;
+        }
+        have_spec = was_spec;
+        ls = next_line(text, n, ls);
+    }
+    if (closure_seen == false) { return refuse(out, cap, "the seal has no closure list", 28); }
+    if (tests_pass == false) { return refuse(out, cap, "the seal does not say every test passed", 39); }
+    if (top_h >= n or top_ps >= n) { return refuse(out, cap, "the seal has no spec_hash or spec_path", 38); }
+    const d : usize = digest_of(text, he, top_ps, top_pe);
+    if (d >= he) { return refuse(out, cap, "the sealed spec has no sha256sum line", 37); }
+    if (spans_eq(text, d, d + DIGEST_LEN, top_h, top_h + DIGEST_LEN) == false) {
+        return refuse(out, cap, "the spec changed since the seal", 31);
+    }
+    w = put_str(out, cap, w, "spec ", 5);
+    w = put_span(out, cap, w, text, top_ps, top_pe);
+    w = put_byte(out, cap, w, ' ');
+    w = put_span(out, cap, w, text, top_h, top_h + DIGEST_LEN);
+    w = put_byte(out, cap, w, '\n');
+    w = put_header(out, cap, w, text, he, t27c_at, 4);
+    w = put_header(out, cap, w, text, he, zig_at, 3);
+    return put_header(out, cap, w, text, he, mode_at, 4);
+}
+
+// ---- test inputs ----
+
+/// count copies of b at w.
+fn fill(dst : []u8, cap : usize, w : usize, b : u8, count : usize) -> usize {
+    var x : usize = w;
+    var i : usize = 0;
+    while (i < count) {
+        x = put_byte(dst, cap, x, b);
+        i += 1;
+    }
+    return x;
+}
+
+/// A token_floor-shaped input with one closure spec: the seal says the closure spec's digest is
+/// all `a` and the spec's is all `b`; dep_now, top_now and mux_now are what sha256sum says now,
+/// t27c the binary's digest byte, zig the last version digit, mode `S` or `F`, failed the digit
+/// the seal records for failed tests.
+pub fn sample_input(dst : []u8, cap : usize, t27c : u8, zig : u8, mode : u8, dep_now : u8, top_now : u8, mux_now : u8, failed : u8) -> usize {
+    var w : usize = put_str(dst, cap, 0, "t27c ", 5);
+    w = put_byte(dst, cap, fill(dst, cap, w, t27c, DIGEST_LEN), '\n');
+    w = put_str(dst, cap, w, "zig 0.16.", 9);
+    w = put_byte(dst, cap, put_byte(dst, cap, w, zig), '\n');
+    w = put_str(dst, cap, w, "mode Release", 12);
+    w = put_str(dst, cap, put_byte(dst, cap, w, mode), " -lc\n", 5);
+    w = put_str(dst, cap, fill(dst, cap, w, dep_now, DIGEST_LEN), "  specs/t27f/particle_engine.t27\n", 33);
+    w = put_str(dst, cap, fill(dst, cap, w, top_now, DIGEST_LEN), "  specs/t27f/token_floor.t27\n", 29);
+    w = put_str(dst, cap, fill(dst, cap, w, mux_now, DIGEST_LEN), "  specs/t27f/token_floor_mux.t27\n", 33);
+    w = put_str(dst, cap, w, "seal\n{\n  \"closure\": [\n    {\n      \"spec\": \"specs/t27f/particle_engine.t27\",\n", 76);
+    w = put_str(dst, cap, w, "      \"spec_hash\": \"sha256:", 27);
+    w = put_str(dst, cap, fill(dst, cap, w, 'a', DIGEST_LEN), "\"\n    }\n  ],\n  \"spec_hash\": \"sha256:", 36);
+    w = put_str(dst, cap, fill(dst, cap, w, 'b', DIGEST_LEN), "\",\n  \"spec_path\": \"specs/t27f/token_floor.t27\",\n", 48);
+    w = put_str(dst, cap, w, "  \"tests\": {\n    \"failed\": ", 27);
+    return put_str(dst, cap, put_byte(dst, cap, w, failed), ",\n    \"passed\": 20\n  }\n}\n", 25);
+}
+
+/// Whether a[0..an) and b[0..bn) are the same bytes.
+pub fn same_bytes(a : []const u8, an : usize, b : []const u8, bn : usize) -> bool {
+    if (an != bn) { return false; }
+    var i : usize = 0;
+    while (i < an) {
+        if (a[i] != b[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+test a_fresh_seal_gives_the_canonical_key {
+    var b : [2048]u8 = undefined;
+    const n : usize = sample_input(&b, 2048, 'e', '0', 'S', 'a', 'b', '9', '0');
+    assert n < 2048;
+    var o : [1024]u8 = undefined;
+    const m : usize = frame_key(&b, n, &o, 1024);
+    assert m < 1024;
+    assert is_refused(&o, m) == false;
+    assert buf_has(&o, m, "frame_cache 1\ndep specs/t27f/particle_engine.t27 aaaa", 53) == true;
+    assert buf_has(&o, m, "\nspec specs/t27f/token_floor.t27 bbbb", 37) == true;
+    assert buf_has(&o, m, "\nzig 0.16.0\nmode ReleaseS -lc\n", 30) == true;
+    assert buf_has(&o, m, "token_floor_mux", 15) == false;
+    assert o[m - 1] == '\n';
+}
+
+test the_key_is_deterministic {
+    var b : [2048]u8 = undefined;
+    const n : usize = sample_input(&b, 2048, 'e', '0', 'S', 'a', 'b', '9', '0');
+    var o1 : [1024]u8 = undefined;
+    var o2 : [1024]u8 = undefined;
+    const m1 : usize = frame_key(&b, n, &o1, 1024);
+    const m2 : usize = frame_key(&b, n, &o2, 1024);
+    assert same_bytes(&o1, m1, &o2, m2) == true;
+}
+
+test a_mux_only_edit_keeps_the_key {
+    var b1 : [2048]u8 = undefined;
+    var b2 : [2048]u8 = undefined;
+    const n1 : usize = sample_input(&b1, 2048, 'e', '0', 'S', 'a', 'b', '1', '0');
+    const n2 : usize = sample_input(&b2, 2048, 'e', '0', 'S', 'a', 'b', '2', '0');
+    var o1 : [1024]u8 = undefined;
+    var o2 : [1024]u8 = undefined;
+    const m1 : usize = frame_key(&b1, n1, &o1, 1024);
+    const m2 : usize = frame_key(&b2, n2, &o2, 1024);
+    assert is_refused(&o1, m1) == false;
+    assert same_bytes(&o1, m1, &o2, m2) == true;
+}
+
+test a_new_compiler_zig_or_build_mode_changes_the_key {
+    var b0 : [2048]u8 = undefined;
+    var b1 : [2048]u8 = undefined;
+    var o0 : [1024]u8 = undefined;
+    var o1 : [1024]u8 = undefined;
+    const m0 : usize = frame_key(&b0, sample_input(&b0, 2048, 'e', '0', 'S', 'a', 'b', '9', '0'), &o0, 1024);
+    var m1 : usize = frame_key(&b1, sample_input(&b1, 2048, 'f', '0', 'S', 'a', 'b', '9', '0'), &o1, 1024);
+    assert is_refused(&o1, m1) == false;
+    assert same_bytes(&o0, m0, &o1, m1) == false;
+    m1 = frame_key(&b1, sample_input(&b1, 2048, 'e', '1', 'S', 'a', 'b', '9', '0'), &o1, 1024);
+    assert is_refused(&o1, m1) == false;
+    assert same_bytes(&o0, m0, &o1, m1) == false;
+    m1 = frame_key(&b1, sample_input(&b1, 2048, 'e', '0', 'F', 'a', 'b', '9', '0'), &o1, 1024);
+    assert is_refused(&o1, m1) == false;
+    assert same_bytes(&o0, m0, &o1, m1) == false;
+}
+
+test an_edit_to_any_sealed_spec_refuses_the_key {
+    var b : [2048]u8 = undefined;
+    var o : [1024]u8 = undefined;
+    var m : usize = frame_key(&b, sample_input(&b, 2048, 'e', '0', 'S', 'c', 'b', '9', '0'), &o, 1024);
+    assert is_refused(&o, m) == true;
+    assert buf_has(&o, m, "closure changed since the seal", 30) == true;
+    m = frame_key(&b, sample_input(&b, 2048, 'e', '0', 'S', 'a', 'c', '9', '0'), &o, 1024);
+    assert is_refused(&o, m) == true;
+    assert buf_has(&o, m, "the spec changed since the seal", 31) == true;
+}
+
+test a_seal_with_a_failed_test_refuses_the_key {
+    var b : [2048]u8 = undefined;
+    var o : [1024]u8 = undefined;
+    const m : usize = frame_key(&b, sample_input(&b, 2048, 'e', '0', 'S', 'a', 'b', '9', '1'), &o, 1024);
+    assert is_refused(&o, m) == true;
+    assert buf_has(&o, m, "every test passed", 17) == true;
+}
+
+test a_missing_part_refuses_the_key {
+    var b : [2048]u8 = undefined;
+    var o : [1024]u8 = undefined;
+    const n : usize = sample_input(&b, 2048, 'e', '0', 'S', 'a', 'b', '9', '0');
+    // cut before the seal section: there is no seal
+    var m : usize = frame_key(&b, 100, &o, 1024);
+    assert is_refused(&o, m) == true;
+    assert buf_has(&o, m, "no seal section", 15) == true;
+    // drop the t27c line: the first line becomes `x27c ...`
+    b[0] = 'x';
+    m = frame_key(&b, n, &o, 1024);
+    assert buf_has(&o, m, "t27c, zig or mode line is missing", 33) == true;
+    b[0] = 't';
+    // rename the spec's sha256sum line to another path
+    // the three header lines, the closure spec's line, then the digest and `  specs/t27f/token_`
+    const p : usize = 70 + 11 + 18 + (DIGEST_LEN + 33) + DIGEST_LEN + 2 + 17;
+    assert b[p] == 'f';
+    b[p] = 'g';
+    m = frame_key(&b, n, &o, 1024);
+    assert buf_has(&o, m, "the sealed spec has no sha256sum line", 37) == true;
+}
+
+test an_empty_input_is_refused {
+    var o : [64]u8 = undefined;
+    const m : usize = frame_key(&o, 0, &o, 64);
+    assert is_refused(&o, m) == true;
+    assert is_refused(&o, 0) == true;
+}
