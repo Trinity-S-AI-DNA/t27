@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 ; specs/t27os/term_pane.t27 -- the window side of a terminal pane: where the cell grid sits, how big a cell
-; is, which agent rows open one, and which bytes a key press sends to the PTY.
+; is, which agent rows open one (the bytes a key press sends are term_input.t27).
 ; Owner, 2026-10-19: Claude Code runs inside the T27 OS window. Clicking the Claude Code entry under AGENTS
 ; opens a terminal pane in the current space's directory; the pane draws a grid of codepoints, monospace,
 ; black and white, with a cursor, and every key typed in it goes to the agent as bytes.
@@ -25,6 +25,11 @@ use t27os::windows::session_agent;
 use t27os::agents::S_STOPPED;
 use t27os::agents::S_DONE;
 use t27os::vt::VIEW_SUB;
+use t27os::vt::vt_init;
+use t27os::vt::vt_feed_all;
+use t27os::vt::vt_hist_rows;
+use t27os::pty_proto::RING_CAP;
+use t27os::pty_proto::MAX_PAYLOAD;
 
 /// The agent whose rows open a terminal pane: AGENT 0, Claude Code (agents.t27 AGENT_NAMES order).
 pub const TERM_AGENT : u32 = 0;
@@ -62,7 +67,9 @@ pub const PANE_NONE : u32 = 999;
 pub const TP_RETRY : u32 = 90;
 /// READ round trips a frame makes at most. Each brings up to 4096 bytes, so a fresh grid replays the
 /// server's whole 64 KiB ring in one frame and a busy pane never stalls the window for longer.
-pub const TP_READS_MAX : u32 = 16;
+pub const TP_READS_MAX : u32 = 24;
+/// Output bytes in one full READ reply: the payload holds the 8-byte cursor first (pty_proto data_chunk).
+pub const TP_CHUNK : usize = MAX_PAYLOAD - 8;
 /// Where the output bytes start in a RE_DATA reply: after the header and the 8-byte cursor.
 pub const TP_DATA_AT : usize = 12;
 
@@ -71,6 +78,10 @@ pub const TP_DATA_AT : usize = 12;
 pub const TP_LINE_TITLE : str = "T27 OS terminal -- Claude Code";
 pub const TP_LINE_CWD : str = "cwd ";
 pub const TP_LINE_OFFLINE : str = "offline: no t27os pty server on ~/.t27os/pty.sock; keys echo here";
+/// What the pane server banner says (owner, 2026-10-20): never the raw offline line.
+pub const TP_SRV_STARTING : str = "Starting pane server...";
+pub const TP_SRV_FAILED : str = "The pane server did not start";
+pub const TP_SRV_RETRY : str = "Retry";
 pub const TP_PROMPT : str = "> ";
 /// The directory buffer the host fills for TP_LINE_CWD.
 pub const TP_PATH_MAX : u32 = 512;
@@ -158,24 +169,6 @@ pub fn tp_reset_due(open_si: u32, cur: u32) -> bool {
     return open_si != cur;
 }
 
-fn tp_put(out: []u8, at: u32, b: u8) -> u32 {
-    if (at < TP_KEY_MAX) { out[at] = b; }
-    return at + 1;
-}
-
-fn tp_csi(out: []u8, fin: u8) -> u32 {
-    var n : u32 = tp_put(out, 0, 27);
-    n = tp_put(out, n, 91);
-    return tp_put(out, n, fin);
-}
-
-fn tp_csi_tilde(out: []u8, d: u8) -> u32 {
-    var n : u32 = tp_put(out, 0, 27);
-    n = tp_put(out, n, 91);
-    n = tp_put(out, n, d);
-    return tp_put(out, n, 126);
-}
-
 /// UTF-8 of one codepoint into out at `at`; returns the new end. A surrogate or out-of-range codepoint
 /// writes U+FFFD.
 pub fn tp_utf8(out: []u8, at: u32, cp0: u32) -> u32 {
@@ -203,32 +196,7 @@ pub fn tp_utf8(out: []u8, at: u32, cp0: u32) -> u32 {
     return at + 4;
 }
 
-/// The bytes one key press sends to the PTY: `key` is the virtual key code, `cp` the first character the
-/// key types without modifiers (0 when it types none), `ctrl` whether Control is held. Command is the
-/// window's (the host never forwards a Command key). Returns how many bytes went into out (TP_KEY_MAX long).
-pub fn tp_key_bytes(key: u32, cp: u32, ctrl: bool, out: []u8) -> u32 {
-    if (key == VK_RETURN or key == VK_ENTER_PAD) { return tp_put(out, 0, 13); }
-    if (key == VK_TAB) { return tp_put(out, 0, 9); }
-    if (key == VK_DELETE) { return tp_put(out, 0, 127); }
-    if (key == VK_ESCAPE) { return tp_put(out, 0, 27); }
-    if (key == VK_UP) { return tp_csi(out, 65); }
-    if (key == VK_DOWN) { return tp_csi(out, 66); }
-    if (key == VK_RIGHT) { return tp_csi(out, 67); }
-    if (key == VK_LEFT) { return tp_csi(out, 68); }
-    if (key == VK_HOME) { return tp_csi(out, 72); }
-    if (key == VK_END) { return tp_csi(out, 70); }
-    if (key == VK_FWD_DELETE) { return tp_csi_tilde(out, 51); }
-    if (key == VK_PAGE_UP) { return tp_csi_tilde(out, 53); }
-    if (key == VK_PAGE_DOWN) { return tp_csi_tilde(out, 54); }
-    if (cp == 0) { return 0; }
-    if (ctrl) {
-        // Control folds a letter or one of @[\]^_ to its C0 code; Control+space is NUL
-        if (cp >= 97 and cp <= 122) { return tp_put(out, 0, @as(u8, @intCast(cp - 96))); }
-        if (cp >= 64 and cp <= 95) { return tp_put(out, 0, @as(u8, @intCast(cp - 64))); }
-        if (cp == 32) { return tp_put(out, 0, 0); }
-    }
-    return tp_utf8(out, 0, cp);
-}
+/// The bytes a key press sends to the PTY are specs/t27os/term_input.t27 (tk_key_bytes): the table, with a test per key.
 
 /// OFFLINE echo: what the grid is fed for the bytes a key would send, so the echo reads like a shell line.
 /// Return echoes CR LF, Delete echoes BS space BS; everything else echoes as sent. Returns the length.
@@ -328,7 +296,7 @@ pub fn tp_data_len(frame: []const u8, len: usize) -> usize {
 
 /// Another READ this frame? Only while the last one came back full and the budget lasts.
 pub fn tp_read_more(got: usize, reads: u32) -> bool {
-    return got == 4096 and reads < TP_READS_MAX;
+    return got >= TP_CHUNK and reads < TP_READS_MAX;
 }
 
 // ---- scrollback glue (#11398): the wheel over the pane, the jump-to-live chip ----------------------------------
@@ -427,24 +395,6 @@ test cells_and_cursor_sit_on_the_grid {
     assert tp_reset_due(2, 2) == false;
 }
 
-test keys_become_terminal_bytes {
-    var o : [8]u8 = undefined;
-    assert tp_key_bytes(VK_RETURN, 13, false, o[0..8]) == 1 and o[0] == 13;
-    assert tp_key_bytes(VK_DELETE, 127, false, o[0..8]) == 1 and o[0] == 127;
-    assert tp_key_bytes(VK_TAB, 9, false, o[0..8]) == 1 and o[0] == 9;
-    assert tp_key_bytes(VK_ESCAPE, 27, false, o[0..8]) == 1 and o[0] == 27;
-    assert tp_key_bytes(VK_UP, 0, false, o[0..8]) == 3 and o[0] == 27 and o[1] == 91 and o[2] == 65;
-    assert tp_key_bytes(VK_LEFT, 0, false, o[0..8]) == 3 and o[2] == 68;
-    assert tp_key_bytes(VK_FWD_DELETE, 0, false, o[0..8]) == 4 and o[2] == 51 and o[3] == 126;
-    // a letter sends itself; Control+c sends ETX; Control+[ sends ESC
-    assert tp_key_bytes(0, 97, false, o[0..8]) == 1 and o[0] == 97;
-    assert tp_key_bytes(8, 99, true, o[0..8]) == 1 and o[0] == 3;
-    assert tp_key_bytes(33, 91, true, o[0..8]) == 1 and o[0] == 27;
-    assert tp_key_bytes(49, 32, true, o[0..8]) == 1 and o[0] == 0;
-    // a modifier alone types nothing and sends nothing
-    assert tp_key_bytes(56, 0, false, o[0..8]) == 0;
-}
-
 test codepoints_encode_as_utf8 {
     var o : [8]u8 = undefined;
     assert tp_utf8(o[0..8], 0, 65) == 1 and o[0] == 65;
@@ -503,13 +453,13 @@ test replies_read_as_pane_and_bytes {
     assert tp_data_len(f[0..20], 11) == 0;
     f[0] = RE_OK;
     assert tp_data_len(f[0..20], 20) == 0;
-    assert tp_read_more(4096, 1);
-    assert tp_read_more(4096, TP_READS_MAX) == false;
+    assert tp_read_more(TP_CHUNK, 1);
+    assert tp_read_more(TP_CHUNK, TP_READS_MAX) == false;
     assert tp_read_more(100, 1) == false;
     assert tp_retry_due(0) == false;
     assert tp_retry_due(TP_RETRY);
     // the whole ring replays in one frame's budget
-    assert @as(u64, TP_READS_MAX) * 4096 >= 65536;
+    assert @as(u64, TP_READS_MAX) * @as(u64, TP_CHUNK) >= RING_CAP;
 }
 
 invariant grid_buffer_holds_the_largest_pane {
@@ -599,4 +549,193 @@ test typing_and_a_moved_view_ask_for_a_draw {
     assert tp_draw_due(6, 5, 0, 0);
     assert tp_draw_due(5, 5, 16, 0);
     assert TP_BUF_CELLS >= 2 * TP_CELLS;
+}
+
+// ---- the pane server starts itself (owner, 2026-10-20, #11412) ----
+// If ~/.t27os/pty.sock does not answer, the app starts the t27os-pty that sits next to its bundle (or inside it) with
+// one `/bin/sh -c` job that backgrounds it, shows the banner "Starting pane server..." with a Retry button, and keeps
+// asking the socket. The server owns every pane's history, so the app NEVER stops it on quit.
+
+pub const PTY_STOP_ON_QUIT : bool = false;
+pub const SRV_UP : u32 = 0;
+pub const SRV_STARTING : u32 = 1;
+pub const SRV_FAILED : u32 = 2;
+/// Frames the app waits for the socket after starting the server (30 fps: six seconds).
+pub const TP_START_WAIT : u32 = 180;
+/// Frames between two connect attempts while it starts.
+pub const TP_START_POLL : u32 = 15;
+pub const SERVER_NAME : str = "t27os-pty";
+pub const TP_SRV_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; ";
+
+/// The next phase. A socket that answers is UP. A socket that does not answer while UP starts the server. A start
+/// that has waited TP_START_WAIT frames has FAILED; FAILED stays until the Retry button.
+pub fn tp_server_step(phase: u32, connected: bool, waited: u32) -> u32 {
+    if (connected) { return SRV_UP; }
+    if (phase == SRV_UP) { return SRV_STARTING; }
+    if (phase == SRV_STARTING and waited >= TP_START_WAIT) { return SRV_FAILED; }
+    return phase;
+}
+
+/// Start the server job on this step? Only when the phase turns into STARTING.
+pub fn tp_server_spawn_due(old: u32, new: u32) -> bool { return new == SRV_STARTING and old != SRV_STARTING; }
+
+/// The Retry button: a failed start starts again; anything else is unchanged.
+pub fn tp_server_retry(phase: u32) -> u32 {
+    if (phase == SRV_FAILED) { return SRV_STARTING; }
+    return phase;
+}
+
+/// Poll the socket this frame while starting (and every TP_START_POLL frames).
+pub fn tp_server_poll_due(phase: u32, waited: u32) -> bool {
+    return phase == SRV_STARTING and waited % TP_START_POLL == 0;
+}
+
+fn tp_cp(out: []u8, at: usize, s: []const u8) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < s.len and p < out.len) { out[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+
+/// Index just past the last "/" before `end` in `s`, or 0.
+fn tp_last_slash(s: []const u8, end: usize) -> usize {
+    var i : usize = end;
+    while (i > 0) {
+        if (s[i - 1] == 47) { return i - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// The directory that holds the `.app` of the executable path `exe` (".../T27OS.app/Contents/MacOS/T27OS"), or the
+/// executable's own directory when there is no .app in it. Returns the length written to `out` (0 = unfit).
+pub fn tp_server_dirs(exe: []const u8, bundle_dir: []u8, exe_dir: []u8) -> usize {
+    var i : usize = 0;
+    var app_end : usize = 0;
+    while (i + 5 <= exe.len) {
+        if (exe[i] == 46 and exe[i + 1] == 97 and exe[i + 2] == 112 and exe[i + 3] == 112 and exe[i + 4] == 47) { app_end = i; }
+        i = i + 1;
+    }
+    const ed : usize = tp_last_slash(exe, exe.len);
+    if (ed == 0) { return 0; }
+    tp_cp(exe_dir, 0, exe[0 .. ed]);
+    if (app_end == 0) { return tp_cp(bundle_dir, 0, exe[0 .. ed]); }
+    const bd : usize = tp_last_slash(exe, app_end);
+    if (bd == 0) { return 0; }
+    return tp_cp(bundle_dir, 0, exe[0 .. bd]);
+}
+
+fn tp_path_fits(s: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < s.len) {
+        const b : u8 = s[i];
+        if (b < 33 or b > 126 or b == 39 or b == 34 or b == 96 or b == 36 or b == 92) { return false; }
+        i = i + 1;
+    }
+    return s.len > 0;
+}
+
+/// The job text (after the head that exports HOME and PATH): try the server next to the bundle, then inside it, and
+/// background the first that is executable. 0 when the executable path is not fit for a quoted shell word.
+pub fn tp_server_cmd(exe: []const u8, out: []u8) -> usize {
+    var bd : [512]u8 = undefined;
+    var ed : [512]u8 = undefined;
+    const bn : usize = tp_server_dirs(exe, bd[0..512], ed[0..512]);
+    if (bn == 0) { return 0; }
+    var en : usize = tp_last_slash(exe, exe.len);
+    if (tp_path_fits(bd[0..bn]) == false or tp_path_fits(ed[0..en]) == false) { return 0; }
+    var p : usize = tp_cp(out, 0, "for P in '");
+    p = tp_cp(out, p, bd[0..bn]);
+    p = tp_cp(out, p, "/t27os-pty' '");
+    p = tp_cp(out, p, ed[0..en]);
+    p = tp_cp(out, p, "/t27os-pty'; do if [ -x \"$P\" ]; then nohup \"$P\" >/dev/null 2>&1 & exit 0; fi; done; exit 1");
+    return p;
+}
+
+// the banner card, centred in the pane area: a title and a Retry button (shown when the start failed)
+pub const TP_BAN_W : f64 = 320.0;
+pub const TP_BAN_H : f64 = 112.0;
+pub const TP_BTN_W : f64 = 96.0;
+pub const TP_BTN_H : f64 = 28.0;
+pub fn tp_ban_x(ox: f64, pw: f64) -> f64 { return ox + 0.5 * (pw - TP_BAN_W); }
+pub fn tp_ban_y(oy: f64, ph: f64) -> f64 { return oy + 0.5 * (ph - TP_BAN_H); }
+pub fn tp_btn_x(ox: f64, pw: f64) -> f64 { return tp_ban_x(ox, pw) + 0.5 * (TP_BAN_W - TP_BTN_W); }
+pub fn tp_btn_y(oy: f64, ph: f64) -> f64 { return tp_ban_y(oy, ph) + TP_BAN_H - TP_BTN_H - 16.0; }
+
+/// Is the point on the Retry button? (The button is there in every phase but UP; only FAILED acts on it.)
+pub fn tp_retry_hit(mx: f64, my: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    const bx : f64 = tp_btn_x(ox, pw);
+    const by : f64 = tp_btn_y(oy, ph);
+    return mx >= bx and mx < bx + TP_BTN_W and my >= by and my < by + TP_BTN_H;
+}
+
+test the_server_phase_walks_up_starting_failed_and_back {
+    assert tp_server_step(SRV_UP, true, 0) == SRV_UP;
+    assert tp_server_step(SRV_UP, false, 0) == SRV_STARTING;
+    assert tp_server_spawn_due(SRV_UP, SRV_STARTING);
+    assert tp_server_spawn_due(SRV_STARTING, SRV_STARTING) == false;
+    assert tp_server_step(SRV_STARTING, false, 10) == SRV_STARTING;
+    assert tp_server_step(SRV_STARTING, true, 10) == SRV_UP;
+    assert tp_server_step(SRV_STARTING, false, TP_START_WAIT) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, false, 999) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, true, 0) == SRV_UP;
+    // Retry starts again, and spawns again
+    assert tp_server_retry(SRV_FAILED) == SRV_STARTING;
+    assert tp_server_spawn_due(SRV_FAILED, tp_server_retry(SRV_FAILED));
+    assert tp_server_retry(SRV_UP) == SRV_UP and tp_server_retry(SRV_STARTING) == SRV_STARTING;
+    assert tp_server_poll_due(SRV_STARTING, 0) and tp_server_poll_due(SRV_STARTING, 7) == false;
+    assert tp_server_poll_due(SRV_UP, 0) == false;
+}
+
+test the_app_never_stops_the_server_on_quit {
+    assert PTY_STOP_ON_QUIT == false;
+}
+
+test the_server_is_found_next_to_the_bundle_and_inside_it {
+    var bd : [512]u8 = undefined;
+    var ed : [512]u8 = undefined;
+    const exe : string = "/tmp/claude-501/t27os-int11/T27OS.app/Contents/MacOS/T27OS";
+    const n : usize = tp_server_dirs(exe, bd[0..512], ed[0..512]);
+    assert n == 27 and bd[0] == 47 and bd[26] == 49;
+    var o : [600]u8 = undefined;
+    const k : usize = tp_server_cmd(exe, o[0..600]);
+    assert k > 60;
+    assert o[0] == 102;
+    // a bare executable (no .app): its own directory
+    const n2 : usize = tp_server_dirs("/opt/x/T27OS", bd[0..512], ed[0..512]);
+    assert n2 == 6;
+    assert tp_server_dirs("T27OS", bd[0..512], ed[0..512]) == 0;
+}
+
+test a_path_with_a_quote_or_a_dollar_starts_nothing {
+    var o : [600]u8 = undefined;
+    assert tp_server_cmd("/tmp/it's/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+    assert tp_server_cmd("/tmp/$HOME/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+    assert tp_server_cmd("/tmp/a b/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+}
+
+test the_retry_button_sits_inside_the_banner {
+    const bx : f64 = tp_btn_x(240.0, 700.0);
+    const by : f64 = tp_btn_y(80.0, 400.0);
+    assert tp_retry_hit(bx + 5.0, by + 5.0, 240.0, 80.0, 700.0, 400.0);
+    assert tp_retry_hit(bx - 5.0, by + 5.0, 240.0, 80.0, 700.0, 400.0) == false;
+    assert tp_retry_hit(bx + 5.0, by + TP_BTN_H + 5.0, 240.0, 80.0, 700.0, 400.0) == false;
+    assert bx > tp_ban_x(240.0, 700.0) and by + TP_BTN_H < tp_ban_y(80.0, 400.0) + TP_BAN_H;
+}
+
+test the_ring_fills_the_history_so_earlier_output_is_there_on_opening {
+    // a pane that printed 200 lines: replayed from the server ring into a 10-row grid, 190 rows of history are
+    // kept and scrollable at once (vt.t27 history ring of 5000 rows)
+    var st : [32]u32 = undefined;
+    var cells : [960000]u32 = undefined;
+    vt_init(st[0..32], cells[0..960000], 40, 10);
+    var i : u32 = 0;
+    while (i < 200) {
+        vt_feed_all(st[0..32], cells[0..960000], "line of earlier output\r\n");
+        i = i + 1;
+    }
+    assert vt_hist_rows(st[0..32]) >= 190;
+    // and the whole ring comes across inside one frame's read budget, full reads continuing
+    assert @as(u64, TP_READS_MAX) * @as(u64, TP_CHUNK) >= RING_CAP;
+    assert TP_CHUNK == 4088 and tp_read_more(4088, 1) and tp_read_more(4087, 1) == false;
 }
