@@ -1,0 +1,1211 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/devices.t27 -- petal H (HIVE), the DEVICES page of T27 OS: TRI NET, every machine and its work, in widgets
+; Owner, 2026-10-20: "make a tab where the synchronization of the devices and their work is visible". The page shows,
+; per machine, who it is (host, T27 OS version and build, toolchain), whether it is alive, what it spends (CPU, RAM,
+; disk), the lanes running on it (issue, model, key light, elapsed), and, across machines, the flow of work:
+; CLAIMED -> LANE PUSHED -> TRIGIT LANDED -> BATCH PUSHED -> MERGED. Everything is a widget; every widget carries its
+; pinned agents, owner first (DW_AGENTS). ASCII only (L3), English only (LANG-EN). Closes #ISSUE.
+; --
+; DRY: the lane rows, models and key lights are lanes_view.t27 (used, the window already builds them); the key light is
+; keys.t27 through lanes_view; the page chrome (plate, text, light dot) is glass_window's. Only the new facts live here:
+; the feed format, the heartbeat payload, the staleness rule, the release comparison, the flow counts, the geometry.
+; --
+; SOURCES, all on git (no server of ours): refs on origin, listed once a minute while the page is open.
+;   refs/swarm/alive/<host>          the machine's own heartbeat: a commit whose SUBJECT is the payload below, written by
+;                                    this app every DV_PUBLISH_S seconds (publish_due) and read back with the committer date.
+;   refs/swarm/alive/<host>-<lane>   a lane heartbeat of the queen: its subject does not start with "hb1 ", so it is no host.
+;   refs/swarm/claims/<n>, heads/claude/claim-<n>    a claim on issue n.
+;   heads/claude/evolve-lane-<n>[-<host>]            a lane pushed by <host> (a branch with no host suffix shows host "-").
+;   tags t27os-latest and t27os-v<semver>-b<build>   the release pointer: latest = the build whose tag has the same sha.
+;   `tri golden status` (trigit, the own git): unpushed links, minutes since the last push, queue.
+;   `git rev-list --count --since=24.hours origin/master`: merged work (as of the last fetch of this checkout).
+; PAYLOAD (one line, no |, only DV_PAYLOAD_CHARS):
+;   hb1 host=<h> build=<n> ver=<semver> tc=<t27c version> cpu=<pct> ram=<pct> disk=<free GB> lanes=<l>,<l>,...
+;   a lane l = issue:model:light:elapsed (model = lanes_view LVM_*, light = keys L_*, elapsed in seconds); "-" = not measured.
+; FEED FILE (~/.t27os/hive/feed.txt), one record per line, fields split by |:
+;   S|<epoch>                       when the job ran
+;   Z|<epoch>|<payload>             THIS machine, measured locally (lanes=- : the window adds its own lane rows)
+;   A|<name>|<epoch>|<payload>      a ref under refs/swarm/alive, with its committer date
+;   C|<n>                           a claim
+;   B|<n>|<host or ->               a pushed lane branch
+;   P|<tag>|<sha>                   a release tag
+;   G|<key>|<value>                 trigit: unpushed, since, actions, next, queue (count of branches)
+;   M|<n>                           commits on origin/master in the last 24 hours
+; Every number the host could not read is "-" and the page shows "not measured", never a 0 that looks like a reading.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osDevices;
+
+use t27os::lanes_view::lv_put;
+use t27os::lanes_view::lv_copy;
+use t27os::lanes_view::lv_put_num;
+use t27os::lanes_view::lv_put_str;
+use t27os::lanes_view::LV_F;
+use t27os::lanes_view::LVF_SRC;
+use t27os::lanes_view::LVF_ISSUE;
+use t27os::lanes_view::LVF_MODEL;
+use t27os::lanes_view::LVF_LIGHT;
+use t27os::lanes_view::LVF_STATE;
+use t27os::lanes_view::LVF_ELAPSED;
+use t27os::lanes_view::LV_SCRIPT;
+use t27os::lanes_view::LVS_RUNNING;
+use t27os::lanes_view::LV_NOT_MEASURED;
+use t27os::lanes_view::LVM_NAMES;
+use t27os::lanes_view::LVM_COUNT;
+
+// ---- constants ----
+pub const DV_NM : u32 = 4294967295;
+pub const DV_NONE : usize = 4294967295;
+/// A machine heartbeat is published every 5 minutes; a heartbeat older than 30 minutes means OFFLINE.
+pub const DV_PUBLISH_S : u64 = 300;
+pub const DV_STALE_S : u64 = 1800;
+pub const DV_MAX_HOSTS : u32 = 4;
+pub const DV_PERIOD_S : u32 = 60;
+pub const DV_DIR : str = "/.t27os/hive/";
+pub const DV_FILE : str = "feed.txt";
+pub const DV_PUBLISHED_FILE : str = "publish.txt";
+
+pub const DS_UNKNOWN : u32 = 0;
+pub const DS_ONLINE : u32 = 1;
+pub const DS_OFFLINE : u32 = 2;
+pub const DS_WORDS : [3]str = ["NO HEARTBEAT", "ONLINE", "OFFLINE"];
+
+// ---- decisions: staleness, publishing, safety ----
+
+/// ONLINE while the last heartbeat is younger than DV_STALE_S; a heartbeat dated in the future (clock skew) counts as fresh.
+pub fn dv_state(now: u64, seen: u64) -> u32 {
+    if (seen == 0) { return DS_UNKNOWN; }
+    if (now <= seen) { return DS_ONLINE; }
+    if (now - seen < DV_STALE_S) { return DS_ONLINE; }
+    return DS_OFFLINE;
+}
+
+/// Is it time to publish this machine's heartbeat? Never published (last 0) or a clock that went back: now; else every DV_PUBLISH_S.
+pub fn dv_publish_due(alive: bool, now: u64, last: u64) -> bool {
+    if (alive == false) { return false; }
+    if (last == 0 or now < last) { return true; }
+    return now - last >= DV_PUBLISH_S;
+}
+
+fn dv_digit(b: u8) -> bool { return b >= 48 and b <= 57; }
+
+fn dv_alnum(b: u8) -> bool {
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122);
+}
+
+/// A host name is a ref component and a shell word: letters, digits, dot, underscore, dash; 1 to 63 bytes.
+pub fn dv_host_ok(h: []const u8) -> bool {
+    if (h.len == 0 or h.len > 63) { return false; }
+    var i : usize = 0;
+    while (i < h.len) {
+        const b : u8 = h[i];
+        if (dv_alnum(b) == false and b != 46 and b != 95 and b != 45) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A payload: starts with "hb1 ", at most 400 bytes, and only letters, digits, space and = : , . _ / % + -
+/// (no quote, no |, no shell character), so it can be printed and put in a command safely.
+pub fn dv_payload_ok(p: []const u8) -> bool {
+    if (p.len < 8 or p.len > 400) { return false; }
+    if (p[0] != 104 or p[1] != 98 or p[2] != 49 or p[3] != 32) { return false; }
+    var i : usize = 0;
+    while (i < p.len) {
+        const b : u8 = p[i];
+        const ok : bool = dv_alnum(b) or b == 32 or b == 61 or b == 58 or b == 44 or b == 46 or b == 95 or b == 47 or b == 37 or b == 43 or b == 45;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The lanes field of a payload to be published: digits, colon, comma, dash only (a lane is issue:model:light:elapsed).
+pub fn dv_lanes_ok(l: []const u8) -> bool {
+    if (l.len == 0 or l.len > 240) { return false; }
+    var i : usize = 0;
+    while (i < l.len) {
+        const b : u8 = l[i];
+        if (dv_digit(b) == false and b != 58 and b != 44 and b != 45) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- small writers ----
+
+/// A reading or "not measured".
+fn dv_putm(out: []u8, at: usize, v: u32) -> usize {
+    if (v == DV_NM) { return lv_put_str(out, at, "n/m"); }
+    return lv_put_num(out, at, v);
+}
+
+// ---- parsing the feed ----
+
+/// Index of the LF that ends the line starting at `at`, or the text length.
+pub fn dv_line_end(f: []const u8, at: usize) -> usize {
+    var i : usize = at;
+    while (i < f.len and f[i] != 10) { i = i + 1; }
+    return i;
+}
+
+/// Start of field k (0 = the kind) of the line [ls, le); le when the line has fewer fields.
+pub fn dv_fstart(f: []const u8, ls: usize, le: usize, k: u32) -> usize {
+    var i : usize = ls;
+    var q : u32 = 0;
+    while (q < k) {
+        while (i < le and f[i] != 124) { i = i + 1; }
+        if (i >= le) { return le; }
+        i = i + 1;
+        q = q + 1;
+    }
+    return i;
+}
+
+pub fn dv_fend(f: []const u8, st: usize, le: usize) -> usize {
+    var i : usize = st;
+    while (i < le and f[i] != 124) { i = i + 1; }
+    return i;
+}
+
+/// A decimal number in s[a .. b]; DV_NM for empty, "-", a non-digit, more than 10 digits or a value that does not fit u32
+/// (a unix epoch has 10 digits).
+pub fn dv_num(s: []const u8, a: usize, b: usize) -> u32 {
+    if (b <= a or b - a > 10) { return DV_NM; }
+    var v : u64 = 0;
+    var i : usize = a;
+    while (i < b) {
+        if (dv_digit(s[i]) == false) { return DV_NM; }
+        v = v * 10 + @as(u64, s[i] - 48);
+        i = i + 1;
+    }
+    if (v >= 4294967295) { return DV_NM; }
+    return @intCast(v);
+}
+
+/// Start of the n-th line whose kind byte is `kind` and whose second byte is |; DV_NONE when there is none.
+pub fn dv_nth(f: []const u8, kind: u8, n: u32) -> usize {
+    var at : usize = 0;
+    var seen : u32 = 0;
+    while (at < f.len) {
+        const le : usize = dv_line_end(f, at);
+        if (le > at + 1 and f[at] == kind and f[at + 1] == 124) {
+            if (seen == n) { return at; }
+            seen = seen + 1;
+        }
+        at = le + 1;
+    }
+    return DV_NONE;
+}
+
+pub fn dv_count(f: []const u8, kind: u8) -> u32 {
+    var at : usize = 0;
+    var n : u32 = 0;
+    while (at < f.len) {
+        const le : usize = dv_line_end(f, at);
+        if (le > at + 1 and f[at] == kind and f[at + 1] == 124) { n = n + 1; }
+        at = le + 1;
+    }
+    return n;
+}
+
+fn dv_same(f: []const u8, a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
+    if (a1 - a0 != b1 - b0) { return false; }
+    var i : usize = 0;
+    while (i < a1 - a0) {
+        if (f[a0 + i] != f[b0 + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dv_is_word(f: []const u8, a: usize, b: usize, w: string) -> bool {
+    if (b - a != w.len) { return false; }
+    var i : usize = 0;
+    while (i < w.len) {
+        if (f[a + i] != @as(u8, w[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Start of the value of key `key` (the token key=value) in the payload f[a .. b]; DV_NONE when absent.
+pub fn dv_kv_at(f: []const u8, a: usize, b: usize, key: string) -> usize {
+    var i : usize = a;
+    while (i < b) {
+        // a token starts at i (the start or after a space)
+        var j : usize = 0;
+        while (j < key.len and i + j < b and f[i + j] == @as(u8, key[j])) { j = j + 1; }
+        if (j == key.len and i + j < b and f[i + j] == 61) { return i + j + 1; }
+        while (i < b and f[i] != 32) { i = i + 1; }
+        i = i + 1;
+    }
+    return DV_NONE;
+}
+
+/// End of the value that starts at `st` (the next space or the end b).
+pub fn dv_kv_end(f: []const u8, st: usize, b: usize) -> usize {
+    var i : usize = st;
+    while (i < b and f[i] != 32) { i = i + 1; }
+    return i;
+}
+
+pub fn dv_kv_num(f: []const u8, a: usize, b: usize, key: string) -> u32 {
+    const st : usize = dv_kv_at(f, a, b, key);
+    if (st == DV_NONE) { return DV_NM; }
+    return dv_num(f, st, dv_kv_end(f, st, b));
+}
+
+// ---- the machines ----
+// A host row of the table: its name range in the feed, its payload range (DV_NONE start when it has no heartbeat),
+// the heartbeat epoch (0 when none), and 1 when it is this machine.
+pub const DH_NS : usize = 0;
+pub const DH_NE : usize = 1;
+pub const DH_PS : usize = 2;
+pub const DH_PE : usize = 3;
+pub const DH_SEEN : usize = 4;
+pub const DH_LOCAL : usize = 5;
+pub const DH_F : usize = 6;
+
+fn dv_has_host(f: []const u8, tab: []u32, n: u32, a: usize, b: usize) -> bool {
+    var i : u32 = 0;
+    while (i < n) {
+        const r : usize = @as(usize, i) * DH_F;
+        if (dv_same(f, @as(usize, tab[r + DH_NS]), @as(usize, tab[r + DH_NE]), a, b)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn dv_add_host(tab: []u32, n: u32, ns: usize, ne: usize, ps: usize, pe: usize, seen: u32, local: u32) -> u32 {
+    const r : usize = @as(usize, n) * DH_F;
+    tab[r + DH_NS] = @as(u32, @intCast(ns));
+    tab[r + DH_NE] = @as(u32, @intCast(ne));
+    tab[r + DH_PS] = @as(u32, @intCast(ps));
+    tab[r + DH_PE] = @as(u32, @intCast(pe));
+    tab[r + DH_SEEN] = seen;
+    tab[r + DH_LOCAL] = local;
+    return n + 1;
+}
+
+/// The machines of the feed, at most DV_MAX_HOSTS: this machine first (the Z record), then every other machine that
+/// published a heartbeat (A records whose payload is ok), then every host that only pushed a lane branch (B records;
+/// these have no heartbeat, so they read NO HEARTBEAT and every reading n/m). Returns the count; tab holds DH_F u32 per host.
+pub fn dv_hosts(f: []const u8, tab: []u32) -> u32 {
+    var n : u32 = 0;
+    const z : usize = dv_nth(f, 90, 0);
+    if (z != DV_NONE) {
+        const le : usize = dv_line_end(f, z);
+        const ps : usize = dv_fstart(f, z, le, 2);
+        const seen : u32 = dv_num(f, dv_fstart(f, z, le, 1), dv_fend(f, dv_fstart(f, z, le, 1), le));
+        if (ps < le and dv_payload_ok(f[ps .. le]) and seen != DV_NM) {
+            const hs : usize = dv_kv_at(f, ps, le, "host");
+            if (hs != DV_NONE) {
+                const he : usize = dv_kv_end(f, hs, le);
+                if (dv_host_ok(f[hs .. he])) { n = dv_add_host(tab, n, hs, he, ps, le, seen, 1); }
+            }
+        }
+    }
+    var i : u32 = 0;
+    const na : u32 = dv_count(f, 65);
+    while (i < na and n < DV_MAX_HOSTS) {
+        const a : usize = dv_nth(f, 65, i);
+        const le : usize = dv_line_end(f, a);
+        const ps : usize = dv_fstart(f, a, le, 3);
+        const es : usize = dv_fstart(f, a, le, 2);
+        const seen : u32 = dv_num(f, es, dv_fend(f, es, le));
+        if (ps < le and dv_payload_ok(f[ps .. le]) and seen != DV_NM) {
+            const hs : usize = dv_kv_at(f, ps, le, "host");
+            if (hs != DV_NONE) {
+                const he : usize = dv_kv_end(f, hs, le);
+                if (dv_host_ok(f[hs .. he]) and dv_has_host(f, tab, n, hs, he) == false) { n = dv_add_host(tab, n, hs, he, ps, le, seen, 0); }
+            }
+        }
+        i = i + 1;
+    }
+    var j : u32 = 0;
+    const nb : u32 = dv_count(f, 66);
+    while (j < nb and n < DV_MAX_HOSTS) {
+        const b : usize = dv_nth(f, 66, j);
+        const le : usize = dv_line_end(f, b);
+        const hs : usize = dv_fstart(f, b, le, 2);
+        const he : usize = dv_fend(f, hs, le);
+        if (dv_host_ok(f[hs .. he]) and dv_is_word(f, hs, he, "-") == false and dv_has_host(f, tab, n, hs, he) == false) {
+            n = dv_add_host(tab, n, hs, he, DV_NONE, DV_NONE, 0, 0);
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+pub fn dv_host_state(now: u64, tab: []const u32, i: u32) -> u32 {
+    return dv_state(now, @as(u64, tab[@as(usize, i) * DH_F + DH_SEEN]));
+}
+
+/// A reading of a host's payload (cpu, ram, disk, build): DV_NM when it has no heartbeat or the key is absent.
+pub fn dv_host_num(f: []const u8, tab: []const u32, i: u32, key: string) -> u32 {
+    const r : usize = @as(usize, i) * DH_F;
+    if (@as(usize, tab[r + DH_PS]) == DV_NONE) { return DV_NM; }
+    return dv_kv_num(f, @as(usize, tab[r + DH_PS]), @as(usize, tab[r + DH_PE]), key);
+}
+
+/// Pushed lane branches of a host (B records naming it).
+pub fn dv_host_pushed(f: []const u8, tab: []const u32, i: u32) -> u32 {
+    const r : usize = @as(usize, i) * DH_F;
+    var n : u32 = 0;
+    var k : u32 = 0;
+    const nb : u32 = dv_count(f, 66);
+    while (k < nb) {
+        const b : usize = dv_nth(f, 66, k);
+        const le : usize = dv_line_end(f, b);
+        const hs : usize = dv_fstart(f, b, le, 2);
+        if (dv_same(f, hs, dv_fend(f, hs, le), @as(usize, tab[r + DH_NS]), @as(usize, tab[r + DH_NE]))) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+// ---- the release pointer ----
+
+/// The build number of the tag `t27os-latest`: the tag t27os-v<semver>-b<build> that has the same sha. DV_NM when
+/// either tag is absent, or the build tag has no -b<digits> end.
+pub fn dv_latest_build(f: []const u8) -> u32 {
+    var sha0 : usize = DV_NONE;
+    var sha1 : usize = DV_NONE;
+    var k : u32 = 0;
+    const np : u32 = dv_count(f, 80);
+    while (k < np and sha0 == DV_NONE) {
+        const p : usize = dv_nth(f, 80, k);
+        const le : usize = dv_line_end(f, p);
+        const ns : usize = dv_fstart(f, p, le, 1);
+        const ne : usize = dv_fend(f, ns, le);
+        if (dv_is_word(f, ns, ne, "t27os-latest")) {
+            sha0 = dv_fstart(f, p, le, 2);
+            sha1 = le;
+        }
+        k = k + 1;
+    }
+    if (sha0 == DV_NONE or sha1 <= sha0) { return DV_NM; }
+    k = 0;
+    while (k < np) {
+        const p : usize = dv_nth(f, 80, k);
+        const le : usize = dv_line_end(f, p);
+        const ns : usize = dv_fstart(f, p, le, 1);
+        const ne : usize = dv_fend(f, ns, le);
+        const ss : usize = dv_fstart(f, p, le, 2);
+        if (ne - ns > 8 and f[ns] == 116 and f[ns + 5] == 45 and f[ns + 6] == 118 and dv_same(f, ss, le, sha0, sha1)) {
+            // the digits after the last "-b"
+            var e : usize = ne;
+            while (e > ns and dv_digit(f[e - 1])) { e = e - 1; }
+            if (e > ns + 1 and e < ne and f[e - 1] == 98 and f[e - 2] == 45) { return dv_num(f, e, ne); }
+        }
+        k = k + 1;
+    }
+    return DV_NM;
+}
+
+/// How many builds a machine is behind the latest release; DV_NM when either build is unknown; 0 when level or ahead.
+pub fn dv_behind(latest: u32, build: u32) -> u32 {
+    if (latest == DV_NM or build == DV_NM) { return DV_NM; }
+    if (build >= latest) { return 0; }
+    return latest - build;
+}
+
+// ---- the flow strip ----
+pub const FS_CLAIMED : u32 = 0;
+pub const FS_PUSHED : u32 = 1;
+pub const FS_LANDED : u32 = 2;
+pub const FS_BATCH : u32 = 3;
+pub const FS_MERGED : u32 = 4;
+pub const FS_COUNT : u32 = 5;
+pub const FS_NAMES : [5]str = ["CLAIMED", "LANE PUSHED", "TRIGIT LANDED", "BATCH PUSHED", "MERGED"];
+pub const FS_SUBS : [5]str = ["open claims on origin", "lane branches on origin", "verified in the own git", "unpushed links in the batch", "master commits in 24 h"];
+
+/// The trigit value G|key|v; DV_NM when the line is absent or the value is not a number.
+pub fn dv_g(f: []const u8, key: string) -> u32 {
+    var k : u32 = 0;
+    const n : u32 = dv_count(f, 71);
+    while (k < n) {
+        const g : usize = dv_nth(f, 71, k);
+        const le : usize = dv_line_end(f, g);
+        const ks : usize = dv_fstart(f, g, le, 1);
+        const ke : usize = dv_fend(f, ks, le);
+        if (dv_is_word(f, ks, ke, key)) { return dv_num(f, ke + 1, le); }
+        k = k + 1;
+    }
+    return DV_NM;
+}
+
+/// The big number of stage s. CLAIMED and LANE PUSHED are counted from the records; the others are read from trigit and
+/// git, so a missing line is n/m, not 0. With no S record (the job never ran) every stage is n/m.
+pub fn dv_stage_value(f: []const u8, s: u32) -> u32 {
+    if (dv_nth(f, 83, 0) == DV_NONE) { return DV_NM; }
+    if (s == FS_CLAIMED) { return dv_count(f, 67); }
+    if (s == FS_PUSHED) { return dv_count(f, 66); }
+    if (s == FS_LANDED) { return dv_g(f, "queue"); }
+    if (s == FS_BATCH) { return dv_g(f, "unpushed"); }
+    if (s == FS_MERGED) {
+        const m : usize = dv_nth(f, 77, 0);
+        if (m == DV_NONE) { return DV_NM; }
+        const le : usize = dv_line_end(f, m);
+        return dv_num(f, dv_fstart(f, m, le, 1), le);
+    }
+    return DV_NM;
+}
+
+/// A stage lamp is lit when its count is a reading above zero.
+pub fn dv_stage_lit(v: u32) -> bool { return v != DV_NM and v > 0; }
+
+/// The small line under the number of stage s. The batch stage adds the minutes since the last push.
+pub fn dv_stage_sub(f: []const u8, s: u32, out: []u8) -> usize {
+    var w : usize = lv_put_str(out, 0, FS_SUBS[s]);
+    if (s == FS_BATCH) {
+        const since : u32 = dv_g(f, "since");
+        w = lv_put_str(out, w, ", last push ");
+        if (since == DV_NM) { w = lv_put_str(out, w, "n/m"); } else {
+            w = lv_put_num(out, w, since);
+            w = lv_put_str(out, w, " min ago");
+        }
+    }
+    return w;
+}
+
+// ---- text of a machine card ----
+
+/// Age as text: "now", "4 min", "3 h", "2 d".
+pub fn dv_age_text(now: u64, seen: u64, out: []u8) -> usize {
+    if (seen == 0) { return lv_put_str(out, 0, "never"); }
+    if (now <= seen + 59) { return lv_put_str(out, 0, "now"); }
+    const d : u64 = now - seen;
+    if (d < 3600) {
+        const w : usize = lv_put_num(out, 0, @as(u32, @intCast(d / 60)));
+        return lv_put_str(out, w, " min ago");
+    }
+    if (d < 86400) {
+        const w : usize = lv_put_num(out, 0, @as(u32, @intCast(d / 3600)));
+        return lv_put_str(out, w, " h ago");
+    }
+    const w : usize = lv_put_num(out, 0, @as(u32, @intCast(d / 86400)));
+    return lv_put_str(out, w, " d ago");
+}
+
+/// "T27 OS 0.1.0  build 4421  behind 36" (or "current", or n/m for what is not known).
+pub fn dv_ident_text(f: []const u8, tab: []const u32, i: u32, latest: u32, out: []u8) -> usize {
+    const r : usize = @as(usize, i) * DH_F;
+    var w : usize = lv_put_str(out, 0, "T27 OS ");
+    const ps : usize = @as(usize, tab[r + DH_PS]);
+    var vs : usize = DV_NONE;
+    if (ps != DV_NONE) { vs = dv_kv_at(f, ps, @as(usize, tab[r + DH_PE]), "ver"); }
+    if (vs == DV_NONE) { w = lv_put_str(out, w, "n/m"); } else {
+        const ve : usize = dv_kv_end(f, vs, @as(usize, tab[r + DH_PE]));
+        if (ve - vs == 1 and f[vs] == 45) { w = lv_put_str(out, w, "n/m"); } else { w = lv_copy(out, w, f[vs .. ve]); }
+    }
+    const b : u32 = dv_host_num(f, tab, i, "build");
+    w = lv_put_str(out, w, "  build ");
+    w = dv_putm(out, w, b);
+    const bh : u32 = dv_behind(latest, b);
+    if (bh == DV_NM) { return w; }
+    if (bh == 0) { return lv_put_str(out, w, "  current"); }
+    w = lv_put_str(out, w, "  behind ");
+    return lv_put_num(out, w, bh);
+}
+
+/// "t27c 0.5.2" (the toolchain the machine reports), n/m when it reports none.
+pub fn dv_tools_text(f: []const u8, tab: []const u32, i: u32, out: []u8) -> usize {
+    const r : usize = @as(usize, i) * DH_F;
+    var w : usize = lv_put_str(out, 0, "t27c ");
+    const ps : usize = @as(usize, tab[r + DH_PS]);
+    var ts : usize = DV_NONE;
+    if (ps != DV_NONE) { ts = dv_kv_at(f, ps, @as(usize, tab[r + DH_PE]), "tc"); }
+    if (ts == DV_NONE) { return lv_put_str(out, w, "n/m"); }
+    const te : usize = dv_kv_end(f, ts, @as(usize, tab[r + DH_PE]));
+    if (te - ts == 1 and f[ts] == 45) { return lv_put_str(out, w, "n/m"); }
+    return lv_copy(out, w, f[ts .. te]);
+}
+
+pub const RES_CPU : u32 = 0;
+pub const RES_RAM : u32 = 1;
+pub const RES_DISK : u32 = 2;
+pub const RES_COUNT : u32 = 3;
+pub const RES_LABELS : [3]str = ["CPU", "RAM", "DISK FREE"];
+pub const RES_KEYS : [3]str = ["cpu", "ram", "disk"];
+
+/// The text of meter r: "37%" (cpu, ram) or "30 GB" (disk), "n/m" when not measured.
+pub fn dv_res_text(v: u32, r: u32, out: []u8) -> usize {
+    if (v == DV_NM) { return lv_put_str(out, 0, "n/m"); }
+    const w : usize = lv_put_num(out, 0, v);
+    if (r == RES_DISK) { return lv_put_str(out, w, " GB"); }
+    return lv_put_str(out, w, "%");
+}
+
+/// The fill of meter r in 0..1000: cpu and ram are percents; the disk bar is the free space against 100 GB. 0 for n/m (the text says why).
+pub fn dv_res_fill(v: u32, r: u32) -> u32 {
+    if (v == DV_NM) { return 0; }
+    if (r == RES_DISK) {
+        if (v >= 100) { return 1000; }
+        return v * 10;
+    }
+    if (v >= 100) { return 1000; }
+    return v * 10;
+}
+
+// ---- lanes ----
+
+/// The lanes of THIS machine as a payload field: every script lane that is RUNNING in the lanes_view table, as
+/// issue:model:light:elapsed joined by commas; "-" when none. At most 8 lanes.
+pub fn dv_lanes_text(tab: []const u32, n: u32, out: []u8) -> usize {
+    var w : usize = 0;
+    var lanes : u32 = 0;
+    var i : u32 = 0;
+    while (i < n and lanes < 8) {
+        const r : usize = @as(usize, i) * LV_F;
+        if (tab[r + LVF_SRC] == LV_SCRIPT and tab[r + LVF_STATE] == LVS_RUNNING and tab[r + LVF_ISSUE] != 0) {
+            if (lanes > 0) { w = lv_put(out, w, 44); }
+            w = lv_put_num(out, w, tab[r + LVF_ISSUE]);
+            w = lv_put(out, w, 58);
+            w = lv_put_num(out, w, tab[r + LVF_MODEL]);
+            w = lv_put(out, w, 58);
+            w = lv_put_num(out, w, tab[r + LVF_LIGHT]);
+            w = lv_put(out, w, 58);
+            if (tab[r + LVF_ELAPSED] == LV_NOT_MEASURED) { w = lv_put(out, w, 45); } else { w = lv_put_num(out, w, tab[r + LVF_ELAPSED]); }
+            lanes = lanes + 1;
+        }
+        i = i + 1;
+    }
+    if (lanes == 0) { return lv_put(out, 0, 45); }
+    return w;
+}
+
+/// Number of lanes in a lanes field ("-" or empty is 0).
+pub fn dv_lane_n(l: []const u8) -> u32 {
+    if (l.len == 0 or (l.len == 1 and l[0] == 45)) { return 0; }
+    var n : u32 = 1;
+    var i : usize = 0;
+    while (i < l.len) {
+        if (l[i] == 44) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Field k (0 issue, 1 model, 2 light, 3 elapsed) of lane i; DV_NM when absent or "-".
+pub fn dv_lane_field(l: []const u8, i: u32, k: u32) -> u32 {
+    var at : usize = 0;
+    var q : u32 = 0;
+    while (q < i) {
+        while (at < l.len and l[at] != 44) { at = at + 1; }
+        if (at >= l.len) { return DV_NM; }
+        at = at + 1;
+        q = q + 1;
+    }
+    var e : usize = at;
+    while (e < l.len and l[e] != 44) { e = e + 1; }
+    var s : usize = at;
+    var p : u32 = 0;
+    while (p < k) {
+        while (s < e and l[s] != 58) { s = s + 1; }
+        if (s >= e) { return DV_NM; }
+        s = s + 1;
+        p = p + 1;
+    }
+    var fe : usize = s;
+    while (fe < e and l[fe] != 58) { fe = fe + 1; }
+    return dv_num(l, s, fe);
+}
+
+/// The lanes of host i: this machine's come from the window's own rows (`local`), the others from their heartbeat.
+/// Returns the range [start, end) of the lanes field inside `f`, or start == end (empty) when none are known.
+pub fn dv_remote_lanes_at(f: []const u8, tab: []const u32, i: u32) -> usize {
+    const r : usize = @as(usize, i) * DH_F;
+    const ps : usize = @as(usize, tab[r + DH_PS]);
+    if (ps == DV_NONE) { return DV_NONE; }
+    return dv_kv_at(f, ps, @as(usize, tab[r + DH_PE]), "lanes");
+}
+
+pub fn dv_remote_lanes_end(f: []const u8, tab: []const u32, i: u32, st: usize) -> usize {
+    return dv_kv_end(f, st, @as(usize, tab[@as(usize, i) * DH_F + DH_PE]));
+}
+
+/// "#11367  SONNET  4h05m" without the light (the window draws the dot): the issue, the model word, the elapsed text.
+pub fn dv_lane_text(l: []const u8, i: u32, out: []u8) -> usize {
+    var w : usize = lv_put_str(out, 0, "#");
+    w = dv_putm(out, w, dv_lane_field(l, i, 0));
+    w = lv_put_str(out, w, "  ");
+    const m : u32 = dv_lane_field(l, i, 1);
+    if (m == DV_NM or m >= LVM_COUNT) { w = lv_put_str(out, w, "model n/m"); } else { w = lv_put_str(out, w, LVM_NAMES[m]); }
+    w = lv_put_str(out, w, "  ");
+    const e : u32 = dv_lane_field(l, i, 3);
+    if (e == DV_NM) { return lv_put_str(out, w, "n/m"); }
+    if (e < 60) {
+        w = lv_put_num(out, w, e);
+        return lv_put_str(out, w, "s");
+    }
+    if (e < 3600) {
+        w = lv_put_num(out, w, e / 60);
+        return lv_put_str(out, w, "m");
+    }
+    w = lv_put_num(out, w, e / 3600);
+    w = lv_put_str(out, w, "h");
+    const mm : u32 = (e % 3600) / 60;
+    if (mm < 10) { w = lv_put(out, w, 48); }
+    return lv_put_num(out, w, mm);
+}
+
+// ---- what a machine publishes ----
+
+/// The payload template: the host glue fills the variables from the probes; the lanes come from dv_lanes_text.
+pub const DV_PAYLOAD_TMPL : str = "hb1 host=$H build=${B:--} ver=${V:--} tc=${TC:--} cpu=${CPU:--} ram=${RAM:--} disk=${DSK:--} lanes=";
+
+/// The shell head of both jobs (feed and publish): HOME and PATH, D = ~/.t27os/hive, then the working folder.
+pub const DV_HEAD_A : str = "export HOME=\"";
+pub const DV_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; D=$HOME/.t27os/hive; mkdir -p $D; cd \"";
+pub const DV_HEAD_C : str = "\" || exit 0; ";
+
+/// The local probes, one shell word each. A probe that fails leaves its variable empty and the payload says "-".
+/// H = host name (refused unless letters, digits, dot, underscore, dash), B/V = build and version of the RUNNING app's
+/// Info.plist, TC = t27c version, CPU = user+system percent, RAM = used percent (from memory_pressure), DSK = free GB of /.
+pub const DV_MEASURE : str = "H=$(scutil --get LocalHostName 2>/dev/null || hostname -s); case \"$H\" in \"\"|*[!A-Za-z0-9._-]*) exit 0;; esac; P=$(ps -axo command= | grep -m1 '[T]27OS.app/Contents/MacOS/T27OS$' | sed 's|/MacOS/T27OS$||'); B=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' \"$P/Info.plist\" 2>/dev/null); V=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \"$P/Info.plist\" 2>/dev/null); TC=$(t27c --version 2>/dev/null | head -n1 | grep -E '^t27c [0-9]+[.][0-9]+' | cut -d' ' -f2); CPU=$(top -l 1 -n 0 2>/dev/null | awk '/CPU usage/{gsub(\"%\",\"\");print int($3+$5)}'); RAM=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub(\"%\",\"\");print 100-$5}'); DSK=$(df -g / 2>/dev/null | awk 'NR==2{print $4}'); ";
+
+/// The refs and the trigit lines, written to the feed. Each line is a record of the FEED FILE above.
+pub const DV_FEED_A : str = "O=$D/feed.part; : > $O; echo \"S|$(date +%s)\" >> $O; echo \"Z|$(date +%s)|";
+pub const DV_FEED_B : str = "\" >> $O; git fetch -q origin '+refs/swarm/alive/*:refs/swarm/alive/*' 2>/dev/null; git for-each-ref --format='A|%(refname:lstrip=3)|%(committerdate:unix)|%(contents:subject)' refs/swarm/alive 2>/dev/null | tr -d '\\r' >> $O; ";
+pub const DV_FEED_C : str = "git ls-remote origin 'refs/swarm/claims/*' 'refs/heads/claude/claim-*' 'refs/heads/claude/evolve-lane-*' 'refs/tags/t27os-*' 2>/dev/null > $D/refs.txt; sed -n -e 's#.*refs/swarm/claims/\\([0-9][0-9]*\\)$#C|\\1#p' -e 's#.*refs/heads/claude/claim-\\([0-9][0-9]*\\)$#C|\\1#p' $D/refs.txt | sort -u >> $O; sed -n -e 's#.*refs/heads/claude/evolve-lane-\\([0-9][0-9]*\\)-\\(.*\\)$#B|\\1|\\2#p' -e 's#.*refs/heads/claude/evolve-lane-\\([0-9][0-9]*\\)$#B|\\1|-#p' $D/refs.txt | sort -u >> $O; ";
+pub const DV_FEED_D : str = "sed -n 's#^\\([0-9a-f]*\\)[[:space:]]refs/tags/\\(t27os-.*\\)$#P|\\2|\\1#p' $D/refs.txt >> $O; { tri golden status 2>/dev/null || ./scripts/tri golden status 2>/dev/null; } | awk '/^unpushed links:/{print \"G|unpushed|\" $3} /^minutes since the last push:/{print \"G|since|\" $6} /^actions queued:/{print \"G|actions|\" $3} /^queue:/{print \"G|queue|\" NF-1}' >> $O; echo \"M|$(git rev-list --count --since='24 hours ago' origin/master 2>/dev/null)\" >> $O; mv $O $D/feed.txt; true";
+
+/// The publish job after the probes: the payload text is DV_PAYLOAD_TMPL + the lanes field (checked by dv_lanes_ok),
+/// committed on the empty tree under a fixed identity and pushed to refs/swarm/alive/<host> (force: each beat replaces
+/// the last). The result (epoch and exit code) goes to publish.txt.
+pub const DV_PUB_A : str = "L='";
+pub const DV_PUB_B : str = "'; M=\"";
+pub const DV_PUB_C : str = "\"; T=$(git mktree </dev/null); C=$(GIT_AUTHOR_NAME=t27os GIT_AUTHOR_EMAIL=t27os@localhost GIT_COMMITTER_NAME=t27os GIT_COMMITTER_EMAIL=t27os@localhost git commit-tree \"$T\" -m \"$M\") && git push -q origin \"+$C:refs/swarm/alive/$H\" 2>/dev/null; echo \"$(date +%s) $?\" > $D/publish.txt; true";
+
+/// The feed job: head, folder, probes, the Z record (payload with lanes=-), the refs, the trigit lines.
+pub fn dv_feed_cmd(hb: []const u8, root: []const u8, out: []u8) -> usize {
+    var w : usize = lv_put_str(out, 0, DV_HEAD_A);
+    w = lv_copy(out, w, hb);
+    w = lv_put_str(out, w, DV_HEAD_B);
+    w = lv_copy(out, w, root);
+    w = lv_put_str(out, w, DV_HEAD_C);
+    w = lv_put_str(out, w, DV_MEASURE);
+    w = lv_put_str(out, w, DV_FEED_A);
+    w = lv_put_str(out, w, DV_PAYLOAD_TMPL);
+    w = lv_put_str(out, w, "-");
+    w = lv_put_str(out, w, DV_FEED_B);
+    w = lv_put_str(out, w, DV_FEED_C);
+    w = lv_put_str(out, w, DV_FEED_D);
+    return w;
+}
+
+/// The publish job; 0 bytes (nothing to run) when the lanes field is not safe or the folders are empty. The lanes text is
+/// only ever digits, colon, comma and dash, so no shell character can reach the command.
+pub fn dv_publish_cmd(hb: []const u8, root: []const u8, lanes: []const u8, out: []u8) -> usize {
+    if (dv_lanes_ok(lanes) == false or hb.len == 0 or root.len == 0) { return 0; }
+    var w : usize = lv_put_str(out, 0, DV_HEAD_A);
+    w = lv_copy(out, w, hb);
+    w = lv_put_str(out, w, DV_HEAD_B);
+    w = lv_copy(out, w, root);
+    w = lv_put_str(out, w, DV_HEAD_C);
+    w = lv_put_str(out, w, DV_MEASURE);
+    w = lv_put_str(out, w, DV_PUB_A);
+    w = lv_copy(out, w, lanes);
+    w = lv_put_str(out, w, DV_PUB_B);
+    w = lv_put_str(out, w, DV_PAYLOAD_TMPL);
+    w = lv_put_str(out, w, "$L");
+    w = lv_put_str(out, w, DV_PUB_C);
+    return w;
+}
+
+// ---- the widgets and their agents (owner, 2026-10-20: every widget carries its pinned agents) ----
+pub const DW_HEAD : u32 = 0;
+pub const DW_CLAIMED : u32 = 1;
+pub const DW_PUSHED : u32 = 2;
+pub const DW_LANDED : u32 = 3;
+pub const DW_BATCH : u32 = 4;
+pub const DW_MERGED : u32 = 5;
+pub const DW_MACHINE : u32 = 6;
+pub const DW_RESOURCES : u32 = 7;
+pub const DW_LANES : u32 = 8;
+pub const DW_COUNT : u32 = 9;
+pub const DW_NAMES : [9]str = ["TRI NET", "CLAIMED", "LANE PUSHED", "TRIGIT LANDED", "BATCH PUSHED", "MERGED", "MACHINE", "RESOURCES", "LANES RUNNING"];
+/// Three agent letters (1 = A .. 27 = Ti) per widget, owner first, 0 = none. H 8, J 10, Q 17, T 20, B 2, S 19, R 18, M 13, X 24.
+pub const DW_AGENTS : [27]u32 = [8, 10, 17, 10, 20, 8, 10, 17, 8, 2, 17, 8, 2, 17, 8, 2, 19, 8, 8, 18, 2, 13, 8, 0, 17, 10, 24];
+pub const DW_WHY : [9]str = [
+    "H owns the page; J routes the work it counts; Q is the Queen whose lanes it shows",
+    "J owns claims on issues; T is the Queen that claims; H shows them",
+    "J owns lane routing; H owns the machines that push; Q starts the lanes",
+    "B owns the pipeline; Q verifies lanes into the own git; H shows the queue",
+    "B owns the pipeline; Q owns the batch push; H shows the age of the last push",
+    "B owns merges; S owns the specs that land; H shows the 24 h count",
+    "H owns the machine; R owns the toolchain it reports; B owns the release it follows",
+    "M owns metrics; H owns the heartbeat that carries them",
+    "Q owns the lanes; J routes them; X owns the key light of each model"
+];
+
+pub fn dw_agent(w: u32, k: u32) -> u32 {
+    if (w >= DW_COUNT or k >= 3) { return 0; }
+    return DW_AGENTS[w * 3 + k];
+}
+
+pub fn dw_agents(w: u32) -> u32 {
+    var n : u32 = 0;
+    var k : u32 = 0;
+    while (k < 3) {
+        if (dw_agent(w, k) != 0) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+// ---- geometry (points; the page is pw x ph below the header strip of the window) ----
+pub const DV_PAD : f64 = 10.0;
+pub const DV_GAP : f64 = 10.0;
+pub const DV_HEAD_H : f64 = 24.0;
+pub const DV_FLOW_H : f64 = 66.0;
+pub const DV_ARROW : f64 = 16.0;
+pub const DV_CARD_MAX_H : f64 = 176.0;
+pub const DV_CARD_MIN_H : f64 = 124.0;
+pub const DV_TWO_COLS_PW : f64 = 620.0;
+/// y of the first lane row inside a card, the row height, the bottom strip (agent chips).
+pub const DV_LANE_Y : f64 = 92.0;
+pub const DV_LANE_H : f64 = 12.0;
+pub const DV_CHIP_STRIP : f64 = 16.0;
+
+pub fn dv_cols(pw: f64) -> u32 {
+    if (pw >= DV_TWO_COLS_PW) { return 2; }
+    return 1;
+}
+
+pub fn dv_rows(n: u32, pw: f64) -> u32 {
+    const c : u32 = dv_cols(pw);
+    return (n + c - 1) / c;
+}
+
+pub fn dv_flow_y() -> f64 { return DV_HEAD_H + DV_GAP; }
+pub fn dv_cards_y() -> f64 { return DV_HEAD_H + DV_GAP + DV_FLOW_H + DV_GAP; }
+
+pub fn dv_flow_w(pw: f64) -> f64 {
+    return (pw - 2.0 * DV_PAD - 4.0 * DV_ARROW) / 5.0;
+}
+
+pub fn dv_flow_x(s: u32, pw: f64) -> f64 {
+    return DV_PAD + @as(f64, @floatFromInt(s)) * (dv_flow_w(pw) + DV_ARROW);
+}
+
+pub fn dv_card_w(pw: f64) -> f64 {
+    const c : f64 = @as(f64, @floatFromInt(dv_cols(pw)));
+    return (pw - 2.0 * DV_PAD - (c - 1.0) * DV_GAP) / c;
+}
+
+/// Height of a card when `n` machines share the room under the flow strip: at most DV_CARD_MAX_H, at least DV_CARD_MIN_H
+/// (below it the rows that do not fit are cut, see dv_cards_fit).
+pub fn dv_card_h(n: u32, pw: f64, ph: f64) -> f64 {
+    var rows : u32 = dv_rows(n, pw);
+    if (rows == 0) { rows = 1; }
+    const room : f64 = ph - dv_cards_y() - DV_PAD;
+    var h : f64 = (room - @as(f64, @floatFromInt(rows - 1)) * DV_GAP) / @as(f64, @floatFromInt(rows));
+    if (h > DV_CARD_MAX_H) { h = DV_CARD_MAX_H; }
+    if (h < DV_CARD_MIN_H) { h = DV_CARD_MIN_H; }
+    return h;
+}
+
+pub fn dv_card_x(i: u32, pw: f64) -> f64 {
+    const c : u32 = dv_cols(pw);
+    return DV_PAD + @as(f64, @floatFromInt(i % c)) * (dv_card_w(pw) + DV_GAP);
+}
+
+pub fn dv_card_y(i: u32, n: u32, pw: f64, ph: f64) -> f64 {
+    const c : u32 = dv_cols(pw);
+    return dv_cards_y() + @as(f64, @floatFromInt(i / c)) * (dv_card_h(n, pw, ph) + DV_GAP);
+}
+
+/// How many of `n` machines fit in the room (rows that would run past the page are not drawn over the edge).
+pub fn dv_cards_fit(n: u32, pw: f64, ph: f64) -> u32 {
+    var k : u32 = 0;
+    while (k < n) {
+        if (dv_card_y(k, n, pw, ph) + dv_card_h(n, pw, ph) > ph) { return k; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// Lane rows a card of height h can show above the agent chip strip.
+pub fn dv_lane_rows(h: f64) -> u32 {
+    const room : f64 = h - DV_LANE_Y - DV_CHIP_STRIP;
+    if (room < DV_LANE_H) { return 0; }
+    return @as(u32, @intFromFloat(room / DV_LANE_H));
+}
+
+/// Width of one of the three meters inside a card.
+pub fn dv_meter_w(cw: f64) -> f64 { return (cw - 2.0 * DV_PAD - 2.0 * DV_GAP) / 3.0; }
+
+// ---- tests ----
+
+pub const DV_SAMPLE : string = "S|1000\nZ|1000|hb1 host=mac-a build=4421 ver=0.1.0 tc=0.5.2 cpu=37 ram=61 disk=30 lanes=-\nA|mac-a|995|hb1 host=mac-a build=4400 ver=0.1.0 tc=0.5.2 cpu=10 ram=50 disk=31 lanes=-\nA|mac-b|900|hb1 host=mac-b build=4457 ver=0.1.1 tc=0.5.2 cpu=5 ram=40 disk=12 lanes=11367:4:1:3600,11371:1:1:125\nA|mac-b-11367|950|queen lane heartbeat\nA|mac-c|100|hb1 host=mac-c build=4300 ver=0.1.0 tc=0.5.1 cpu=- ram=- disk=- lanes=-\nC|11421\nC|11422\nB|11367|mac-b\nB|9010|mac-d\nB|11368|-\nP|t27os-latest|0f6d83e9\nP|t27os-v0.1.0|5981f19a\nP|t27os-v0.1.1-b4457|0f6d83e9\nG|unpushed|3\nG|since|45\nG|queue|6\nM|52\n";
+
+test a_heartbeat_older_than_thirty_minutes_is_offline {
+    assert dv_state(10000, 0) == DS_UNKNOWN;
+    assert dv_state(10000, 10000) == DS_ONLINE;
+    assert dv_state(10000, 10000 - 1799) == DS_ONLINE;
+    assert dv_state(10000, 10000 - 1800) == DS_OFFLINE;
+    assert dv_state(10000, 1) == DS_OFFLINE;
+    // a heartbeat dated ahead of this clock (skew) is fresh, never a negative age
+    assert dv_state(10000, 10500) == DS_ONLINE;
+    assert DS_WORDS[DS_OFFLINE] == "OFFLINE";
+}
+
+test a_machine_publishes_every_five_minutes_and_only_when_alive {
+    assert dv_publish_due(true, 1000, 0);
+    assert dv_publish_due(true, 1299, 1000) == false;
+    assert dv_publish_due(true, 1300, 1000);
+    assert dv_publish_due(true, 900, 1000);
+    assert dv_publish_due(false, 5000, 0) == false;
+    assert DV_PUBLISH_S == 300 and DV_STALE_S == 1800;
+}
+
+test names_and_payloads_that_could_reach_a_shell_are_refused {
+    assert dv_host_ok("playras-MacBook-Pro");
+    assert dv_host_ok("mac_2.local");
+    assert dv_host_ok("") == false;
+    assert dv_host_ok("a b") == false;
+    assert dv_host_ok("a;rm") == false;
+    assert dv_host_ok("a$(x)") == false;
+    assert dv_payload_ok("hb1 host=a build=1 lanes=11:4:1:3600,12:1:1:5");
+    assert dv_payload_ok("not a payload at all") == false;
+    assert dv_payload_ok("hb1 host=a;rm -rf") == false;
+    assert dv_payload_ok("hb1 host=a|x=1") == false;
+    assert dv_payload_ok("hb1 host='a'") == false;
+    assert dv_lanes_ok("11367:4:1:3600,11371:1:1:-");
+    assert dv_lanes_ok("-");
+    assert dv_lanes_ok("") == false;
+    assert dv_lanes_ok("1;2") == false;
+    assert dv_lanes_ok("1 2") == false;
+}
+
+test the_sample_lists_this_machine_first_then_the_other_heartbeats_then_hosts_that_only_pushed {
+    var tab : [24]u32 = undefined;
+    const f : []const u8 = DV_SAMPLE;
+    const n : u32 = dv_hosts(f, tab[0..24]);
+    // mac-a (Z), mac-b, mac-c (A with ok payload), mac-d (a branch only); the lane heartbeat mac-b-11367 is no host,
+    // the second record of mac-a is the same machine, and the "-" host of a branch is nobody
+    assert n == 4;
+    assert tab[DH_LOCAL] == 1;
+    assert tab[DH_SEEN] == 1000;
+    assert tab[DH_F + DH_LOCAL] == 0;
+    assert tab[DH_F + DH_SEEN] == 900;
+    assert tab[DH_F * 3 + DH_PS] == DV_NONE;
+    assert tab[DH_F * 3 + DH_SEEN] == 0;
+    assert dv_is_word(f, @as(usize, tab[DH_NS]), @as(usize, tab[DH_NE]), "mac-a");
+    assert dv_is_word(f, @as(usize, tab[DH_F + DH_NS]), @as(usize, tab[DH_F + DH_NE]), "mac-b");
+    assert dv_is_word(f, @as(usize, tab[DH_F * 3 + DH_NS]), @as(usize, tab[DH_F * 3 + DH_NE]), "mac-d");
+    // states at now = 1000 + 100: a is live, b is 200 s old, c is 1000 s old... at now 2000 c is stale, d never reported
+    assert dv_host_state(1100, tab[0..24], 0) == DS_ONLINE;
+    assert dv_host_state(1100, tab[0..24], 1) == DS_ONLINE;
+    assert dv_host_state(2000, tab[0..24], 2) == DS_OFFLINE;
+    assert dv_host_state(2000, tab[0..24], 3) == DS_UNKNOWN;
+    assert dv_host_state(2800, tab[0..24], 1) == DS_OFFLINE;
+}
+
+test a_real_unix_epoch_has_ten_digits_and_is_read {
+    var tab : [24]u32 = undefined;
+    assert dv_num("1792515358", 0, 10) == 1792515358;
+    assert dv_num("4294967295", 0, 10) == DV_NM;
+    assert dv_num("12345678901", 0, 11) == DV_NM;
+    const n : u32 = dv_hosts("S|1792515358\nZ|1792515358|hb1 host=Gaia-MacBook-Air build=4505 ver=0.1.2 tc=0.2.0 cpu=99 ram=56 disk=30 lanes=-\n", tab[0..24]);
+    assert n == 1;
+    assert tab[DH_SEEN] == 1792515358;
+    assert dv_host_state(1792515400, tab[0..24], 0) == DS_ONLINE;
+    assert dv_host_state(1792515358 + 1800, tab[0..24], 0) == DS_OFFLINE;
+}
+
+test a_feed_with_no_machine_record_lists_no_machine_and_a_bad_payload_is_not_trusted {
+    var tab : [24]u32 = undefined;
+    assert dv_hosts("S|5\n", tab[0..24]) == 0;
+    assert dv_hosts("", tab[0..24]) == 0;
+    assert dv_hosts("Z|5|hb1 host=a;b build=1\n", tab[0..24]) == 0;
+    assert dv_hosts("Z|x|hb1 host=a build=1\n", tab[0..24]) == 0;
+    assert dv_hosts("A|q|7|garbage\n", tab[0..24]) == 0;
+    // at most DV_MAX_HOSTS rows
+    assert dv_hosts("B|1|h1\nB|2|h2\nB|3|h3\nB|4|h4\nB|5|h5\nB|6|h6\n", tab[0..24]) == 4;
+}
+
+test readings_come_from_the_payload_and_a_missing_one_is_not_a_zero {
+    var tab : [24]u32 = undefined;
+    const f : []const u8 = DV_SAMPLE;
+    const n : u32 = dv_hosts(f, tab[0..24]);
+    assert n == 4;
+    assert dv_host_num(f, tab[0..24], 0, "cpu") == 37;
+    assert dv_host_num(f, tab[0..24], 0, "ram") == 61;
+    assert dv_host_num(f, tab[0..24], 0, "disk") == 30;
+    assert dv_host_num(f, tab[0..24], 1, "build") == 4457;
+    assert dv_host_num(f, tab[0..24], 2, "cpu") == DV_NM;
+    assert dv_host_num(f, tab[0..24], 0, "nokey") == DV_NM;
+    assert dv_host_num(f, tab[0..24], 3, "cpu") == DV_NM;
+    var out : [64]u8 = undefined;
+    var w : usize = dv_res_text(37, RES_CPU, out[0..64]);
+    assert w == 3 and out[0] == 51 and out[2] == 37;
+    w = dv_res_text(30, RES_DISK, out[0..64]);
+    assert w == 5 and out[2] == 32 and out[3] == 71;
+    w = dv_res_text(DV_NM, RES_RAM, out[0..64]);
+    assert w == 3 and out[0] == 110;
+    assert dv_res_fill(37, RES_CPU) == 370;
+    assert dv_res_fill(250, RES_CPU) == 1000;
+    assert dv_res_fill(DV_NM, RES_CPU) == 0;
+    assert dv_res_fill(30, RES_DISK) == 300;
+}
+
+test the_release_pointer_is_the_build_whose_tag_has_the_same_sha {
+    const f : []const u8 = DV_SAMPLE;
+    assert dv_latest_build(f) == 4457;
+    assert dv_latest_build("P|t27os-latest|aaa\nP|t27os-v0.1.0|bbb\n") == DV_NM;
+    assert dv_latest_build("P|t27os-v0.1.1-b4457|aaa\n") == DV_NM;
+    assert dv_latest_build("") == DV_NM;
+    assert dv_latest_build("P|t27os-latest|aaa\nP|t27os-v0.1.1|aaa\n") == DV_NM;
+    assert dv_behind(4457, 4421) == 36;
+    assert dv_behind(4457, 4457) == 0;
+    assert dv_behind(4457, 4500) == 0;
+    assert dv_behind(DV_NM, 4421) == DV_NM;
+    assert dv_behind(4457, DV_NM) == DV_NM;
+}
+
+test the_identity_line_says_behind_current_or_not_measured {
+    var tab : [24]u32 = undefined;
+    const f : []const u8 = DV_SAMPLE;
+    const n : u32 = dv_hosts(f, tab[0..24]);
+    assert n == 4;
+    var out : [96]u8 = undefined;
+    var w : usize = dv_ident_text(f, tab[0..24], 0, 4457, out[0..96]);
+    // "T27 OS 0.1.0  build 4421  behind 36"
+    assert w == 35;
+    assert out[0] == 84 and out[7] == 48 and out[w - 1] == 54 and out[w - 2] == 51;
+    w = dv_ident_text(f, tab[0..24], 1, 4457, out[0..96]);
+    // "T27 OS 0.1.1  build 4457  current"
+    assert w == 33;
+    w = dv_ident_text(f, tab[0..24], 3, 4457, out[0..96]);
+    // a host with no heartbeat: "T27 OS n/m  build n/m"
+    assert w == 21;
+    w = dv_ident_text(f, tab[0..24], 0, DV_NM, out[0..96]);
+    // release unknown: no comparison is made up
+    assert w == 24;
+    w = dv_tools_text(f, tab[0..24], 0, out[0..96]);
+    assert w == 10;
+    w = dv_tools_text(f, tab[0..24], 3, out[0..96]);
+    assert w == 8;
+}
+
+test the_flow_strip_counts_claims_branches_trigit_and_merges_and_says_n_m_for_what_is_missing {
+    const f : []const u8 = DV_SAMPLE;
+    assert dv_stage_value(f, FS_CLAIMED) == 2;
+    assert dv_stage_value(f, FS_PUSHED) == 3;
+    assert dv_stage_value(f, FS_LANDED) == 6;
+    assert dv_stage_value(f, FS_BATCH) == 3;
+    assert dv_stage_value(f, FS_MERGED) == 52;
+    assert dv_g(f, "since") == 45;
+    assert dv_g(f, "nokey") == DV_NM;
+    // the job never ran: nothing is a zero
+    assert dv_stage_value("", FS_CLAIMED) == DV_NM;
+    assert dv_stage_value("", FS_MERGED) == DV_NM;
+    // the job ran but trigit printed nothing: claims are a real 0, trigit's are n/m
+    assert dv_stage_value("S|5\n", FS_CLAIMED) == 0;
+    assert dv_stage_value("S|5\n", FS_LANDED) == DV_NM;
+    assert dv_stage_value("S|5\n", FS_MERGED) == DV_NM;
+    assert dv_stage_lit(0) == false;
+    assert dv_stage_lit(DV_NM) == false;
+    assert dv_stage_lit(1);
+    var out : [96]u8 = undefined;
+    var w : usize = dv_stage_sub(f, FS_BATCH, out[0..96]);
+    assert w == 49;
+    w = dv_stage_sub(f, FS_PUSHED, out[0..96]);
+    assert w == 23;
+    w = dv_stage_sub("S|5\n", FS_BATCH, out[0..96]);
+    assert out[w - 1] == 109;
+}
+
+test pushed_branches_are_counted_per_host {
+    var tab : [24]u32 = undefined;
+    const f : []const u8 = DV_SAMPLE;
+    const n : u32 = dv_hosts(f, tab[0..24]);
+    assert n == 4;
+    assert dv_host_pushed(f, tab[0..24], 0) == 0;
+    assert dv_host_pushed(f, tab[0..24], 1) == 1;
+    assert dv_host_pushed(f, tab[0..24], 3) == 1;
+}
+
+test ages_are_words_not_clock_times {
+    var out : [32]u8 = undefined;
+    assert dv_age_text(1000, 0, out[0..32]) == 5;
+    assert dv_age_text(1000, 990, out[0..32]) == 3;
+    var w : usize = dv_age_text(1000 + 180, 1000, out[0..32]);
+    assert w == 9 and out[0] == 51;
+    w = dv_age_text(1000 + 7200, 1000, out[0..32]);
+    assert w == 7 and out[0] == 50 and out[2] == 104;
+    w = dv_age_text(1000 + 200000, 1000, out[0..32]);
+    assert w == 7 and out[0] == 50 and out[2] == 100;
+}
+
+test lanes_travel_as_issue_model_light_elapsed_and_only_running_script_lanes_are_published {
+    var tab : [48]u32 = undefined;
+    var i : usize = 0;
+    while (i < 48) { tab[i] = 0; i = i + 1; }
+    // row 0: a running script lane #11367 SONNET(4) light 1, 3600 s; row 1: a done lane; row 2: a trigit row; row 3: running, elapsed n/m
+    tab[LVF_SRC] = LV_SCRIPT; tab[LVF_ISSUE] = 11367; tab[LVF_MODEL] = 4; tab[LVF_LIGHT] = 1; tab[LVF_STATE] = LVS_RUNNING; tab[LVF_ELAPSED] = 3600;
+    tab[LV_F + LVF_SRC] = LV_SCRIPT; tab[LV_F + LVF_ISSUE] = 11368; tab[LV_F + LVF_STATE] = 1;
+    tab[2 * LV_F + LVF_SRC] = 2; tab[2 * LV_F + LVF_ISSUE] = 11369; tab[2 * LV_F + LVF_STATE] = LVS_RUNNING;
+    tab[3 * LV_F + LVF_SRC] = LV_SCRIPT; tab[3 * LV_F + LVF_ISSUE] = 11371; tab[3 * LV_F + LVF_MODEL] = 1; tab[3 * LV_F + LVF_LIGHT] = 1; tab[3 * LV_F + LVF_STATE] = LVS_RUNNING; tab[3 * LV_F + LVF_ELAPSED] = LV_NOT_MEASURED;
+    var out : [128]u8 = undefined;
+    var w : usize = dv_lanes_text(tab[0..48], 4, out[0..128]);
+    // "11367:4:1:3600,11371:1:1:-"
+    assert w == 26;
+    assert dv_lanes_ok(out[0..w]);
+    assert dv_lane_n(out[0..w]) == 2;
+    assert dv_lane_field(out[0..w], 0, 0) == 11367;
+    assert dv_lane_field(out[0..w], 0, 1) == 4;
+    assert dv_lane_field(out[0..w], 0, 3) == 3600;
+    assert dv_lane_field(out[0..w], 1, 0) == 11371;
+    assert dv_lane_field(out[0..w], 1, 3) == DV_NM;
+    assert dv_lane_field(out[0..w], 2, 0) == DV_NM;
+    w = dv_lanes_text(tab[0..48], 0, out[0..128]);
+    assert w == 1 and out[0] == 45;
+    assert dv_lane_n(out[0..1]) == 0;
+    assert dv_lane_n("") == 0;
+}
+
+test a_lane_row_reads_issue_model_and_elapsed {
+    var out : [64]u8 = undefined;
+    var w : usize = dv_lane_text("11367:4:1:14700,11371:1:1:125", 0, out[0..64]);
+    // "#11367  SONNET  4h05"
+    assert w == 20;
+    assert out[0] == 35 and out[1] == 49;
+    w = dv_lane_text("11367:4:1:14700,11371:1:1:125", 1, out[0..64]);
+    // "#11371  GLM FLASH  2m"
+    assert w == 21;
+    w = dv_lane_text("11367:9:1:-", 0, out[0..64]);
+    assert out[w - 1] == 109;
+}
+
+test the_remote_lanes_come_from_the_heartbeat_of_that_machine {
+    var tab : [24]u32 = undefined;
+    const f : []const u8 = DV_SAMPLE;
+    const n : u32 = dv_hosts(f, tab[0..24]);
+    assert n == 4;
+    const st : usize = dv_remote_lanes_at(f, tab[0..24], 1);
+    assert st != DV_NONE;
+    const en : usize = dv_remote_lanes_end(f, tab[0..24], 1, st);
+    assert dv_lane_n(f[st .. en]) == 2;
+    assert dv_lane_field(f[st .. en], 1, 0) == 11371;
+    // mac-a reports lanes=- and mac-d has no heartbeat
+    const s0 : usize = dv_remote_lanes_at(f, tab[0..24], 0);
+    assert dv_lane_n(f[s0 .. dv_remote_lanes_end(f, tab[0..24], 0, s0)]) == 0;
+    assert dv_remote_lanes_at(f, tab[0..24], 3) == DV_NONE;
+}
+
+test the_publish_command_carries_the_payload_the_lanes_and_the_staleness_inputs {
+    var out : [2400]u8 = undefined;
+    var w : usize = dv_publish_cmd("/Users/a", "/Users/a/t27", "11367:4:1:3600", out[0..2400]);
+    assert w > 600 and w < 2400;
+    const c : []const u8 = out[0..w];
+    assert dv_has(c, "export HOME=\"/Users/a\"");
+    assert dv_has(c, "cd \"/Users/a/t27\"");
+    assert dv_has(c, "L='11367:4:1:3600'");
+    assert dv_has(c, "hb1 host=$H build=");
+    assert dv_has(c, "lanes=$L");
+    assert dv_has(c, "git commit-tree");
+    assert dv_has(c, "refs/swarm/alive/$H");
+    // a host name that is not a ref component is refused before anything is published
+    assert dv_has(c, "*[!A-Za-z0-9._-]*) exit 0");
+    // the probes of the feed and of the publisher are the same text (one source)
+    assert dv_has(c, DV_MEASURE);
+    // an unsafe lanes field or an empty folder runs nothing
+    assert dv_publish_cmd("/Users/a", "/Users/a/t27", "1;rm -rf /", out[0..2400]) == 0;
+    assert dv_publish_cmd("", "/Users/a/t27", "-", out[0..2400]) == 0;
+    assert dv_publish_cmd("/Users/a", "", "-", out[0..2400]) == 0;
+}
+
+test the_feed_command_reads_refs_and_trigit_and_writes_nothing_to_the_remote {
+    var out : [3600]u8 = undefined;
+    const w : usize = dv_feed_cmd("/Users/a", "/Users/a/t27", out[0..3600]);
+    assert w > 800 and w < 3600;
+    const c : []const u8 = out[0..w];
+    assert dv_has(c, "refs/swarm/alive");
+    assert dv_has(c, "refs/swarm/claims/");
+    assert dv_has(c, "refs/heads/claude/evolve-lane-");
+    assert dv_has(c, "tri golden status");
+    assert dv_has(c, "mv $O $D/feed.txt");
+    assert dv_has(c, "git push") == false;
+    assert dv_has(c, "git commit") == false;
+    assert dv_has(c, "lanes=-");
+}
+
+fn dv_has(t: []const u8, w: string) -> bool {
+    if (w.len == 0 or t.len < w.len) { return false; }
+    var i : usize = 0;
+    while (i + w.len <= t.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < w.len and same) {
+            if (t[i + j] != @as(u8, w[j])) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+test every_widget_has_an_owner_and_its_feeders_are_distinct_letters_of_the_alphabet {
+    var w : u32 = 0;
+    while (w < DW_COUNT) {
+        assert dw_agents(w) >= 2;
+        assert dw_agent(w, 0) >= 1 and dw_agent(w, 0) <= 27;
+        var k : u32 = 0;
+        while (k < 3) {
+            const a : u32 = dw_agent(w, k);
+            assert a <= 27;
+            var q : u32 = k + 1;
+            while (q < 3) {
+                if (a != 0) { assert dw_agent(w, q) != a; }
+                q = q + 1;
+            }
+            k = k + 1;
+        }
+        assert DW_WHY[w].len > 20;
+        assert DW_NAMES[w].len > 0;
+        w = w + 1;
+    }
+    // H (8) owns the page, the machine and the heartbeat
+    assert dw_agent(DW_HEAD, 0) == 8;
+    assert dw_agent(DW_MACHINE, 0) == 8;
+    assert dw_agent(DW_RESOURCES, 0) == 13;
+    assert dw_agent(DW_COUNT, 0) == 0;
+    assert DW_COUNT == 9 and FS_COUNT == 5;
+}
+
+test the_layout_fits_four_machines_in_a_960_by_440_page_without_overlap {
+    const pw : f64 = 744.0;
+    const ph : f64 = 430.0;
+    assert dv_cols(pw) == 2;
+    assert dv_cols(500.0) == 1;
+    assert dv_rows(4, pw) == 2;
+    assert dv_rows(3, pw) == 2;
+    assert dv_rows(1, 500.0) == 1;
+    const h : f64 = dv_card_h(4, pw, ph);
+    assert h >= DV_CARD_MIN_H and h <= DV_CARD_MAX_H;
+    assert dv_cards_fit(4, pw, ph) == 4;
+    // cards of a row do not overlap and stay inside the page
+    assert dv_card_x(0, pw) + dv_card_w(pw) + DV_GAP <= dv_card_x(1, pw) + 0.001;
+    assert dv_card_x(1, pw) + dv_card_w(pw) <= pw - DV_PAD + 0.001;
+    assert dv_card_y(0, 4, pw, ph) + h + DV_GAP <= dv_card_y(2, 4, pw, ph) + 0.001;
+    assert dv_card_y(2, 4, pw, ph) + h <= ph - DV_PAD + 0.001;
+    // the flow strip sits above the cards and its five stages tile the width
+    assert dv_flow_y() + DV_FLOW_H + DV_GAP <= dv_cards_y() + 0.001;
+    assert dv_flow_x(4, pw) + dv_flow_w(pw) <= pw - DV_PAD + 0.001;
+    assert dv_flow_x(1, pw) >= dv_flow_x(0, pw) + dv_flow_w(pw) + DV_ARROW - 0.001;
+    // a short page cuts the rows that would run past the edge instead of drawing over it
+    assert dv_cards_fit(4, pw, 250.0) < 4;
+    // in one column four cards of the minimum height do not fit a 430 pt page: only what fits is drawn
+    assert dv_cards_fit(4, 500.0, ph) < 4;
+    assert dv_cards_fit(1, 500.0, ph) == 1;
+    // a card keeps at least one lane row above the chip strip, and more when taller
+    assert dv_lane_rows(DV_CARD_MIN_H) >= 1;
+    assert dv_lane_rows(DV_CARD_MAX_H) > dv_lane_rows(DV_CARD_MIN_H);
+    assert dv_meter_w(300.0) * 3.0 + 2.0 * DV_GAP + 2.0 * DV_PAD <= 300.001;
+}
