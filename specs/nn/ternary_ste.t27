@@ -1,0 +1,548 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/ternary_ste.t27
+// Ternary straight-through estimator (STE) for HSLM training: shadow float weights are
+// quantized to {-1, 0, +1} for the forward pass, and the gradient of the loss with respect
+// to a ternary weight is handed to the shadow weight as if the quantizer were the identity.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Source of truth: gHashTag/trinity-training @ 3e9648c1817a97c5f9b8c727b0f8e2291928eead
+//   src/hslm/ste.zig       quantizeAbsMean, quantizeVanilla, quantizeTwn, quantizeProgressive,
+//                          quantizeForMode, applyAlpha, computeMetrics (the quantizers)
+//   src/hslm/autograd.zig  clipGradNorm (the gradient clip the trainer applies to every
+//                          shadow-weight gradient before the AdamW step)
+//   src/hslm/trainer.zig   the shadow weights are the trained parameters; after each
+//                          optimizer step the model requantizes ternary weights from them
+//
+// What this spec adds to ste.zig, and what it leaves out, so nobody reads it as more:
+//   - ste.zig has no backward function: its gradient is the identity, taken by the autograd
+//     tape. ste_pass_through is that identity, written out. ste_pass is the clipped variant
+//     (the gradient is zero where |shadow| > clip), the usual hardtanh STE; the trainer does
+//     not use it, so it is a choice of this spec, not a copy.
+//   - Floats: ste.zig computes in f32, this spec in f64. They differ only for a weight that
+//     sits within one f32 ulp of a threshold.
+//   - quantize_progressive follows ste.zig exactly, including its odd blend: during the
+//     transition the threshold does not tighten gradually, it switches from the abs-mean rule
+//     to TWN once progress passes one half.
+//   - The optimizer is plain SGD here (sgd_shadow_step); the trainer uses AdamW (specs/ml/
+//     optimizer/adam.t27 holds Adam).
+//
+// Trits are base::types Trit values (neg, zero, pos); trit_value turns one into -1.0, 0.0, 1.0.
+
+module TernarySte {
+    use base::types;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 1. Constants (ste.zig defaults)
+    // ═════════════════════════════════════════════════════════════════
+
+    // Li et al. 2016: delta = 0.7 * mean(|w|)
+    const TWN_DELTA_FACTOR : f64 = 0.7;
+    // quantizeAbsMean: a scaled weight above 0.5 in magnitude rounds to a trit
+    const ABS_MEAN_ROUND : f64 = 0.5;
+    // quantizeAbsMean: below this mean the scale falls back to 1.0
+    const ABS_MEAN_FLOOR : f64 = 0.000001;
+    const DEFAULT_VANILLA_THRESHOLD : f64 = 0.5;
+    const DEFAULT_WARMUP_STEPS : u32 = 10000;
+    const DEFAULT_TRANSITION_STEPS : u32 = 10000;
+
+    // SteMode
+    const MODE_NONE : u8 = 0;
+    const MODE_VANILLA : u8 = 1;
+    const MODE_TWN : u8 = 2;
+    const MODE_PROGRESSIVE : u8 = 3;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 2. Quantizers: shadow floats -> trits, each returns alpha
+    // ═════════════════════════════════════════════════════════════════
+
+    fn trit_value(t: Trit) -> f64 {
+        if (t == Trit.pos) {
+            return 1.0;
+        } else if (t == Trit.neg) {
+            return -1.0;
+        }
+        return 0.0;
+    }
+
+    fn mean_abs(w: []const f64) -> f64 {
+        var sum : f64 = 0.0;
+        var i : usize = 0;
+        while (i < w.len) {
+            sum = sum + @abs(w[i]);
+            i = i + 1;
+        }
+        return sum / @as(f64, @floatFromInt(w.len));
+    }
+
+    // Standard rule: scale = mean(|w|) (1.0 when that is below the floor), trit = round of
+    // w / scale to {-1, 0, 1} with the cut at one half. Returns the scale.
+    fn quantize_abs_mean(w: []const f64, out: []Trit) -> f64 {
+        var scale : f64 = mean_abs(w);
+        if (scale <= ABS_MEAN_FLOOR) {
+            scale = 1.0;
+        }
+        var i : usize = 0;
+        while (i < w.len) {
+            const scaled = w[i] / scale;
+            if (scaled > ABS_MEAN_ROUND) {
+                out[i] = Trit.pos;
+            } else if (scaled < -ABS_MEAN_ROUND) {
+                out[i] = Trit.neg;
+            } else {
+                out[i] = Trit.zero;
+            }
+            i = i + 1;
+        }
+        return scale;
+    }
+
+    // Vanilla STE: a fixed threshold, no scale. Returns 1.0.
+    fn quantize_vanilla(w: []const f64, out: []Trit, threshold: f64) -> f64 {
+        var i : usize = 0;
+        while (i < w.len) {
+            if (w[i] > threshold) {
+                out[i] = Trit.pos;
+            } else if (w[i] < -threshold) {
+                out[i] = Trit.neg;
+            } else {
+                out[i] = Trit.zero;
+            }
+            i = i + 1;
+        }
+        return 1.0;
+    }
+
+    // The TWN threshold, delta = 0.7 * mean(|w|)
+    fn twn_delta(w: []const f64) -> f64 {
+        return TWN_DELTA_FACTOR * mean_abs(w);
+    }
+
+    // TWN: trit = sign(w) where |w| > delta, else 0; alpha = mean(|w|) over the nonzero
+    // trits, or 1.0 when there is none. Forward: y = alpha * (x @ W_trits).
+    fn quantize_twn(w: []const f64, out: []Trit) -> f64 {
+        const delta = twn_delta(w);
+        var alpha_sum : f64 = 0.0;
+        var alpha_count : usize = 0;
+        var i : usize = 0;
+        while (i < w.len) {
+            if (w[i] > delta) {
+                out[i] = Trit.pos;
+                alpha_sum = alpha_sum + @abs(w[i]);
+                alpha_count = alpha_count + 1;
+            } else if (w[i] < -delta) {
+                out[i] = Trit.neg;
+                alpha_sum = alpha_sum + @abs(w[i]);
+                alpha_count = alpha_count + 1;
+            } else {
+                out[i] = Trit.zero;
+            }
+            i = i + 1;
+        }
+        if (alpha_count > 0) {
+            return alpha_sum / @as(f64, @floatFromInt(alpha_count));
+        }
+        return 1.0;
+    }
+
+    // Warmup: abs-mean. Transition: abs-mean until progress passes 0.5, then TWN. After: TWN.
+    fn quantize_progressive(w: []const f64, out: []Trit, step: u32, warmup: u32, transition: u32) -> f64 {
+        if (step < warmup) {
+            return quantize_abs_mean(w, out);
+        } else if (step < warmup + transition) {
+            const progress = @as(f64, @floatFromInt(step - warmup)) / @as(f64, @floatFromInt(transition));
+            if (progress > 0.5) {
+                return quantize_twn(w, out);
+            }
+            return quantize_abs_mean(w, out);
+        }
+        return quantize_twn(w, out);
+    }
+
+    fn quantize_for_mode(w: []const f64, out: []Trit, mode: u8, threshold: f64, step: u32, warmup: u32, transition: u32) -> f64 {
+        if (mode == MODE_VANILLA) {
+            return quantize_vanilla(w, out, threshold);
+        } else if (mode == MODE_TWN) {
+            return quantize_twn(w, out);
+        } else if (mode == MODE_PROGRESSIVE) {
+            return quantize_progressive(w, out, step, warmup, transition);
+        }
+        return quantize_abs_mean(w, out);
+    }
+
+    // What the forward pass sees: alpha * trit
+    fn dequantize(trits: []const Trit, alpha: f64, out: []f64) -> void {
+        var i : usize = 0;
+        while (i < trits.len) {
+            out[i] = alpha * trit_value(trits[i]);
+            i = i + 1;
+        }
+    }
+
+    // After the ternary matvec: scale the output (a no-op at alpha exactly 1.0, as in ste.zig)
+    fn apply_alpha(output: []f64, alpha: f64) -> void {
+        if (alpha == 1.0) {
+            return;
+        }
+        var i : usize = 0;
+        while (i < output.len) {
+            output[i] = output[i] * alpha;
+            i = i + 1;
+        }
+    }
+
+    fn count_zero(trits: []const Trit) -> usize {
+        var zeros : usize = 0;
+        var i : usize = 0;
+        while (i < trits.len) {
+            if (trits[i] == Trit.zero) {
+                zeros = zeros + 1;
+            }
+            i = i + 1;
+        }
+        return zeros;
+    }
+
+    // computeMetrics: percent of trits that are zero
+    fn sparsity_pct(trits: []const Trit) -> f64 {
+        return @as(f64, @floatFromInt(count_zero(trits))) / @as(f64, @floatFromInt(trits.len)) * 100.0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 3. Straight-through backward and the shadow-weight update
+    // ═════════════════════════════════════════════════════════════════
+
+    // The identity STE: the gradient of the ternary weight is the gradient of the shadow weight
+    fn ste_pass_through(g: []const f64, out: []f64) -> void {
+        var i : usize = 0;
+        while (i < g.len) {
+            out[i] = g[i];
+            i = i + 1;
+        }
+    }
+
+    // The clipped STE: the gradient passes where |shadow| <= clip, and is zero beyond it
+    fn ste_pass(shadow: []const f64, g: []const f64, clip: f64, out: []f64) -> void {
+        var i : usize = 0;
+        while (i < g.len) {
+            if (@abs(shadow[i]) <= clip) {
+                out[i] = g[i];
+            } else {
+                out[i] = 0.0;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn grad_norm(g: []const f64) -> f64 {
+        var sq : f64 = 0.0;
+        var i : usize = 0;
+        while (i < g.len) {
+            sq = sq + g[i] * g[i];
+            i = i + 1;
+        }
+        return sqrt(sq);
+    }
+
+    // autograd.clipGradNorm: when the L2 norm exceeds max_norm, scale the gradient down to it
+    fn clip_grad_norm(g: []f64, max_norm: f64) -> void {
+        const norm = grad_norm(g);
+        if (norm > max_norm) {
+            const scale = max_norm / norm;
+            var i : usize = 0;
+            while (i < g.len) {
+                g[i] = g[i] * scale;
+                i = i + 1;
+            }
+        }
+    }
+
+    // shadow = shadow - lr * g. The shadow weights move in float; the trits follow on requantize.
+    fn sgd_shadow_step(shadow: []f64, g: []const f64, lr: f64) -> void {
+        var i : usize = 0;
+        while (i < shadow.len) {
+            shadow[i] = shadow[i] - lr * g[i];
+            i = i + 1;
+        }
+    }
+
+    // The trainer's requantize: TWN trits and alpha from the shadow weights
+    fn requantize(shadow: []const f64, out: []Trit) -> f64 {
+        return quantize_twn(shadow, out);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4. Probes (fixed inputs, so each test reads one number)
+    // ═════════════════════════════════════════════════════════════════
+
+    // ste.zig tests: [0.7, -0.8, 0.3, -0.2, 0.0, 1.5, -1.5] at threshold 0.5
+    fn vanilla_trit(i: usize) -> f64 {
+        const w : [7]f64 = [0.7, -0.8, 0.3, -0.2, 0.0, 1.5, -1.5];
+        var out : [7]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        const alpha = quantize_vanilla(&w, &out, DEFAULT_VANILLA_THRESHOLD);
+        return trit_value(out[i]) + alpha - 1.0;
+    }
+
+    fn vanilla_alpha() -> f64 {
+        const w : [3]f64 = [0.7, -0.8, 0.3];
+        var out : [3]Trit = [Trit.zero, Trit.zero, Trit.zero];
+        return quantize_vanilla(&w, &out, DEFAULT_VANILLA_THRESHOLD);
+    }
+
+    // mean(|w|) = 3.75 / 6 = 0.625, delta = 0.4375, nonzero |w| = 0.7 0.8 0.9 1.2
+    fn twn_fixture(i: usize) -> f64 {
+        const w : [6]f64 = [0.7, -0.8, 0.1, -0.05, 0.9, -1.2];
+        var out : [6]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        const alpha = quantize_twn(&w, &out);
+        if (i == 6) {
+            return alpha;
+        } else if (i == 7) {
+            return sparsity_pct(&out);
+        }
+        return trit_value(out[i]);
+    }
+
+    fn twn_delta_fixture() -> f64 {
+        const w : [6]f64 = [0.7, -0.8, 0.1, -0.05, 0.9, -1.2];
+        return twn_delta(&w);
+    }
+
+    // all zero: delta 0, no weight above it, alpha falls back to 1.0
+    fn twn_zero_fixture(i: usize) -> f64 {
+        const w : [3]f64 = [0.0, 0.0, 0.0];
+        var out : [3]Trit = [Trit.pos, Trit.pos, Trit.pos];
+        const alpha = quantize_twn(&w, &out);
+        if (i == 3) {
+            return alpha;
+        }
+        return trit_value(out[i]);
+    }
+
+    // mean(|w|) = 0.5 = scale; w / scale = 1.8, -0.2, 0.8, -1.2
+    fn abs_mean_fixture(i: usize) -> f64 {
+        const w : [4]f64 = [0.9, -0.1, 0.4, -0.6];
+        var out : [4]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        const alpha = quantize_abs_mean(&w, &out);
+        if (i == 4) {
+            return alpha;
+        }
+        return trit_value(out[i]);
+    }
+
+    // mean 0.475: abs-mean gives alpha 0.475 and trits 1 -1 1 0 (0.3 / 0.475 = 0.63);
+    // TWN has delta 0.3325, so 0.3 drops to 0, and alpha = (0.7 + 0.8) / 2 = 0.75
+    fn progressive_fixture(step: u32, i: usize) -> f64 {
+        const w : [4]f64 = [0.7, -0.8, 0.3, -0.1];
+        var out : [4]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        const alpha = quantize_progressive(&w, &out, step, 100, 100);
+        if (i == 4) {
+            return alpha;
+        }
+        return trit_value(out[i]);
+    }
+
+    fn mode_fixture(mode: u8) -> f64 {
+        const w : [4]f64 = [0.7, -0.8, 0.3, -0.1];
+        var out : [4]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        return quantize_for_mode(&w, &out, mode, 0.5, 0, 100, 100);
+    }
+
+    fn dequantize_fixture(i: usize) -> f64 {
+        const trits : [3]Trit = [Trit.pos, Trit.zero, Trit.neg];
+        var out : [3]f64 = [9.0, 9.0, 9.0];
+        dequantize(&trits, 0.75, &out);
+        return out[i];
+    }
+
+    fn apply_alpha_fixture(alpha: f64, i: usize) -> f64 {
+        var data : [4]f64 = [1.0, -2.0, 3.0, 0.0];
+        apply_alpha(&data, alpha);
+        return data[i];
+    }
+
+    // |shadow| = 0.5 1.5 1.0 1.0 against clip 1.0: the weight at 1.0 still passes
+    fn ste_pass_fixture(clip: f64, i: usize) -> f64 {
+        const shadow : [4]f64 = [0.5, -1.5, 1.0, -1.0];
+        const g : [4]f64 = [0.1, 0.2, -0.3, 0.4];
+        var out : [4]f64 = [9.0, 9.0, 9.0, 9.0];
+        ste_pass(&shadow, &g, clip, &out);
+        return out[i];
+    }
+
+    fn ste_identity_fixture(i: usize) -> f64 {
+        const g : [4]f64 = [0.1, 0.2, -0.3, 0.4];
+        var out : [4]f64 = [9.0, 9.0, 9.0, 9.0];
+        ste_pass_through(&g, &out);
+        return out[i];
+    }
+
+    fn clip_fixture(max_norm: f64, i: usize) -> f64 {
+        var g : [2]f64 = [3.0, 4.0];
+        clip_grad_norm(&g, max_norm);
+        return g[i];
+    }
+
+    fn norm_fixture() -> f64 {
+        const g : [2]f64 = [3.0, 4.0];
+        return grad_norm(&g);
+    }
+
+    // shadow 0.3 0.9 -0.9 0.0: delta 0.3675, trits 0 1 -1 0. A step of lr 1 against
+    // g0 = -0.4 moves shadow[0] to 0.7: mean 0.625, delta 0.4375, trit 1, alpha 2.5 / 3.
+    fn flip_fixture(steps: u32, i: usize) -> f64 {
+        var shadow : [4]f64 = [0.3, 0.9, -0.9, 0.0];
+        const g : [4]f64 = [-0.4, 0.0, 0.0, 0.0];
+        var out : [4]Trit = [Trit.zero, Trit.zero, Trit.zero, Trit.zero];
+        var n : u32 = 0;
+        while (n < steps) {
+            sgd_shadow_step(&shadow, &g, 1.0);
+            n = n + 1;
+        }
+        const alpha = requantize(&shadow, &out);
+        if (i == 4) {
+            return alpha;
+        } else if (i == 5) {
+            return shadow[0];
+        }
+        return trit_value(out[i]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants for the ternary STE
+    // ═════════════════════════════════════════════════════════════════
+
+    // The ste.zig vanilla test, value by value: 0.7 and 1.5 are above 0.5, -0.8 and -1.5 below -0.5
+    test ste_vanilla_trits_follow_the_threshold
+        given t0 = vanilla_trit(0)
+        when t1 = vanilla_trit(1)
+        then t0 == 1.0 and t1 == -1.0 and vanilla_trit(2) == 0.0 and vanilla_trit(3) == 0.0 and vanilla_trit(4) == 0.0 and vanilla_trit(5) == 1.0 and vanilla_trit(6) == -1.0
+
+    test ste_vanilla_alpha_is_one
+        given a = vanilla_alpha()
+        then a == 1.0
+
+    test ste_twn_threshold_is_seven_tenths_of_the_mean
+        given d = twn_delta_fixture()
+        then @abs(d - 0.4375) < 0.000000000001
+
+    test ste_twn_trits
+        given t0 = twn_fixture(0)
+        when t1 = twn_fixture(1)
+        then t0 == 1.0 and t1 == -1.0 and twn_fixture(2) == 0.0 and twn_fixture(3) == 0.0 and twn_fixture(4) == 1.0 and twn_fixture(5) == -1.0
+
+    // alpha = (0.7 + 0.8 + 0.9 + 1.2) / 4 = 0.9, over the four nonzero trits only
+    test ste_twn_alpha_is_the_mean_of_the_nonzero_magnitudes
+        given a = twn_fixture(6)
+        then @abs(a - 0.9) < 0.000000000001
+
+    // two of six trits are zero
+    test ste_twn_sparsity
+        given s = twn_fixture(7)
+        then @abs(s - 33.33333333333333) < 0.000001
+
+    test ste_twn_all_zero_weights_give_zero_trits_and_alpha_one
+        given a = twn_zero_fixture(3)
+        then a == 1.0 and twn_zero_fixture(0) == 0.0 and twn_zero_fixture(1) == 0.0 and twn_zero_fixture(2) == 0.0
+
+    test ste_abs_mean_trits_and_scale
+        given a = abs_mean_fixture(4)
+        when t0 = abs_mean_fixture(0)
+        then @abs(a - 0.5) < 0.000000000001 and t0 == 1.0 and abs_mean_fixture(1) == 0.0 and abs_mean_fixture(2) == 1.0 and abs_mean_fixture(3) == -1.0
+
+    test ste_progressive_warmup_is_abs_mean
+        given a = progressive_fixture(50, 4)
+        when t2 = progressive_fixture(50, 2)
+        then @abs(a - 0.475) < 0.000000000001 and t2 == 1.0
+
+    // progress 0.5 is not above 0.5: still abs-mean
+    test ste_progressive_transition_first_half_is_abs_mean
+        given a = progressive_fixture(150, 4)
+        then @abs(a - 0.475) < 0.000000000001 and progressive_fixture(150, 2) == 1.0
+
+    // progress 0.6: TWN, and the 0.3 weight falls into the dead zone
+    test ste_progressive_transition_second_half_is_twn
+        given a = progressive_fixture(160, 4)
+        then @abs(a - 0.75) < 0.000000000001 and progressive_fixture(160, 2) == 0.0
+
+    test ste_progressive_after_transition_is_twn
+        given a = progressive_fixture(250, 4)
+        then @abs(a - 0.75) < 0.000000000001 and progressive_fixture(250, 3) == 0.0
+
+    test ste_mode_dispatch
+        given none = mode_fixture(MODE_NONE)
+        when vanilla = mode_fixture(MODE_VANILLA)
+        then @abs(none - 0.475) < 0.000000000001 and vanilla == 1.0 and @abs(mode_fixture(MODE_TWN) - 0.75) < 0.000000000001 and @abs(mode_fixture(MODE_PROGRESSIVE) - 0.475) < 0.000000000001
+
+    test ste_dequantize_is_alpha_times_trit
+        given d0 = dequantize_fixture(0)
+        when d2 = dequantize_fixture(2)
+        then d0 == 0.75 and dequantize_fixture(1) == 0.0 and d2 == -0.75
+
+    test ste_apply_alpha_scales
+        given a0 = apply_alpha_fixture(0.75, 0)
+        when a1 = apply_alpha_fixture(0.75, 1)
+        then a0 == 0.75 and a1 == -1.5 and apply_alpha_fixture(0.75, 2) == 2.25 and apply_alpha_fixture(0.75, 3) == 0.0
+
+    test ste_apply_alpha_one_changes_nothing
+        given a1 = apply_alpha_fixture(1.0, 1)
+        then a1 == -2.0 and apply_alpha_fixture(1.0, 2) == 3.0
+
+    test ste_identity_passes_every_gradient
+        given g0 = ste_identity_fixture(0)
+        when g1 = ste_identity_fixture(1)
+        then g0 == 0.1 and g1 == 0.2 and ste_identity_fixture(2) == -0.3 and ste_identity_fixture(3) == 0.4
+
+    // inside the window the gradient is the input gradient; outside it is zero
+    test ste_clipped_passes_inside_and_blocks_outside
+        given g0 = ste_pass_fixture(1.0, 0)
+        when g1 = ste_pass_fixture(1.0, 1)
+        then g0 == 0.1 and g1 == 0.0 and ste_pass_fixture(1.0, 2) == -0.3 and ste_pass_fixture(1.0, 3) == 0.4
+
+    // a window wider than every shadow weight is the identity STE
+    test ste_clipped_with_a_wide_window_is_the_identity
+        given g1 = ste_pass_fixture(2.0, 1)
+        then g1 == 0.2 and ste_pass_fixture(2.0, 0) == ste_identity_fixture(0)
+
+    // a window narrower than |0.5| blocks all four
+    test ste_clipped_with_a_narrow_window_blocks_everything
+        given g0 = ste_pass_fixture(0.25, 0)
+        then g0 == 0.0 and ste_pass_fixture(0.25, 1) == 0.0 and ste_pass_fixture(0.25, 2) == 0.0 and ste_pass_fixture(0.25, 3) == 0.0
+
+    test ste_grad_norm_is_euclidean
+        given n = norm_fixture()
+        then n == 5.0
+
+    // norm 5 against max 1: scaled by 0.2, so [0.6, 0.8]
+    test ste_clip_grad_norm_scales_down_to_the_bound
+        given g0 = clip_fixture(1.0, 0)
+        when g1 = clip_fixture(1.0, 1)
+        then @abs(g0 - 0.6) < 0.000000000001 and @abs(g1 - 0.8) < 0.000000000001
+
+    test ste_clip_grad_norm_leaves_a_small_gradient_alone
+        given g0 = clip_fixture(10.0, 0)
+        then g0 == 3.0 and clip_fixture(10.0, 1) == 4.0
+
+    // no step: shadow 0.3 is inside delta 0.3675, so its trit is 0, alpha = (0.9 + 0.9) / 2
+    test ste_requantize_before_the_step
+        given t0 = flip_fixture(0, 0)
+        when a = flip_fixture(0, 4)
+        then t0 == 0.0 and flip_fixture(0, 1) == 1.0 and flip_fixture(0, 2) == -1.0 and @abs(a - 0.9) < 0.000000000001
+
+    // one SGD step moves the shadow weight to 0.7 and requantize flips its trit to +1
+    test ste_one_step_flips_a_trit
+        given s0 = flip_fixture(1, 5)
+        when t0 = flip_fixture(1, 0)
+        then @abs(s0 - 0.7) < 0.000000000001 and t0 == 1.0 and flip_fixture(1, 1) == 1.0 and flip_fixture(1, 2) == -1.0
+
+    test ste_alpha_follows_the_shadow_weights
+        given a = flip_fixture(1, 4)
+        then @abs(a - 0.8333333333333334) < 0.000000000001
+
+    invariant ste_modes_are_distinct
+        assert MODE_NONE != MODE_VANILLA and MODE_VANILLA != MODE_TWN and MODE_TWN != MODE_PROGRESSIVE and MODE_NONE != MODE_TWN
+
+    invariant ste_twn_factor_is_seven_tenths
+        assert TWN_DELTA_FACTOR > 0.69999 and TWN_DELTA_FACTOR < 0.70001
+
+    invariant ste_defaults_match_ste_zig
+        assert DEFAULT_WARMUP_STEPS == 10000 and DEFAULT_TRANSITION_STEPS == 10000
+}
