@@ -283,6 +283,9 @@ pub const REFUSED: u8 = 2;
 pub const REFUSED_NOTE: &'static str = "takes or returns a struct, a str, a slice, an array or an optional, or takes more than 8 parameters of a class, and is not exported (see #8972)";
 
 pub fn export_kind(name: &[u8], own_convention: bool) -> u8 {
+    if ((name.len() > 0) && (name[0] == 64)) {
+        return EXPORT;
+    }
     if (name.len() >= RESERVED.len()) {
         let mut i: usize = 0;
         while ((i < RESERVED.len()) && (name[(i) as usize] == RESERVED.as_bytes()[(i) as usize])) {
@@ -325,6 +328,8 @@ pub const ARM64_RELOC_PAGE21: u32 = 3;
 
 pub const ARM64_RELOC_PAGEOFF12: u32 = 4;
 
+pub const AT: u8 = 64;
+
 pub const ROW: usize = 16;
 
 pub fn align_up(x: usize, a: usize) -> usize {
@@ -349,7 +354,8 @@ pub fn blob_off(lens: &[u8], from: usize, k: usize) -> usize {
     return at;
 }
 
-pub fn bytes_are(out: Vec<u8>, at: usize, hex: &'static str) -> bool {
+pub fn bytes_are(out: impl AsRef<[u8]>, at: usize, hex: &'static str) -> bool {
+    let out: &[u8] = out.as_ref();
     let mut i: usize = 0;
     while ((2 * i) < hex.len()) {
         let b: u8 = ((hex_digit(hex.as_bytes()[((2 * i)) as usize]) * 16) + hex_digit(hex.as_bytes()[(((2 * i) + 1)) as usize]));
@@ -394,7 +400,7 @@ pub fn exported(names: &[u8], fns: &[u8], i: usize, at: usize) -> bool {
     if (fn_at(fns, i) == 0) {
         return false;
     }
-    return (names[(at) as usize] != 0);
+    return ((names[(at) as usize] != 0) && (names[(at) as usize] != AT));
 }
 
 pub fn fn_at(fns: &[u8], i: usize) -> usize {

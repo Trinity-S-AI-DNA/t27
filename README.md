@@ -235,15 +235,23 @@ t27 is the core of [Trinity S3AI](https://github.com/gHashTag/trinity) -- a neur
 
 ## Quick Start
 
+T27 OS has one installer, and it is built with `make`. From a clone of this repository, with `cargo` on your PATH (macOS or Linux, arm64 or x86_64):
+
 ```bash
-# Clone
-git clone https://github.com/gHashTag/t27.git
-cd t27
+make install                        # build tri, t27c and t27b, install them under /usr/local
+make -n install                     # print the plan, change nothing
+make install PREFIX=$HOME/.local    # install under a directory you own, no sudo
+make install CLAW=on                # also install TRI CLAW, the merge and gate agent of specs/claw/
+make uninstall                      # remove exactly the files the install listed
+make help
+tri --version                       # with PREFIX/bin on your PATH
+```
 
-# Build the bootstrap compiler (Rust); use ./scripts/tri as the CLI entry (wraps t27c)
-cd bootstrap && cargo build --release
-cd ..
+A second `make install` changes nothing, and t27b is installed on arm64 only. `CLAW=on` installs TRI CLAW's service spec (`specs/claw/service.t27`) with its seals and verifies them with `t27c seal --verify`; TRI CLAW has no server of its own, so that check is its start. The lab node that earns test-network XP by running lab gates is opt-in as `EARN=on`, off by default, and no lab node ships in this repository yet, so `make install EARN=on` stops before it changes anything. Phones do not run `make`; they join through the trios app. The decisions behind the installer are in [`specs/t27os/install.t27`](specs/t27os/install.t27).
 
+### Use the toolchain
+
+```bash
 # Parse a spec (canonical CLI: tri → wraps bootstrap t27c)
 ./scripts/tri parse specs/base/types.t27
 

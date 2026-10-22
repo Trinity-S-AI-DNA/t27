@@ -14,6 +14,12 @@ pub const M_TEST: u8 = 3;
 
 pub const M_TBFUNC: u8 = 4;
 
+pub const HELP_AT: usize = 65;
+
+pub const HELP_N: usize = 6;
+
+pub const ROM_AT: usize = 80;
+
 pub fn put_name(out: &mut [u8], at: usize, text: &[u8], a: usize, b: usize) -> usize {
     let e: usize = name_end(text, a, b);
     if verilog_keyword(&text[(a) as usize..(e) as usize]) {
@@ -26,10 +32,14 @@ pub fn put_name(out: &mut [u8], at: usize, text: &[u8], a: usize, b: usize) -> u
 
 pub fn put_range(out: &mut [u8], at: usize, t: i64) -> usize {
     let w: i64 = ty_width(t);
-    if (w <= 1) {
-        return at;
+    let mut q0: usize = at;
+    if ty_sint(t) {
+        q0 = put_text(out, at, "signed ");
     }
-    let mut q: usize = put_text(out, at, "[");
+    if (w <= 1) {
+        return q0;
+    }
+    let mut q: usize = put_text(out, q0, "[");
     let top: u64 = ((w - 1) as u64);
     q = put_dec(out, q, top);
     return put_text(out, q, ":0] ");
@@ -44,7 +54,11 @@ pub fn put_lit(out: &mut [u8], at: usize, v: u64, t: i64) -> usize {
     }
     let w: u64 = (ty_width(t) as u64);
     let mut q: usize = put_dec(out, at, w);
-    q = put_text(out, q, "'d");
+    if ty_sint(t) {
+        q = put_text(out, q, "'sd");
+    } else {
+        q = put_text(out, q, "'d");
+    }
     return put_dec(out, q, v);
 }
 
@@ -216,18 +230,38 @@ pub fn ty_of(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, 
                 return ot;
             }
         }
+        if field_eq(nodes, text, i, F_OP, "-") {
+            let nt: i64 = ty_of(nodes, text, meta, ptext, item, (i + 1), (depth + 1));
+            if (ty_sint(nt) || (nt == TY_COMPTIME)) {
+                return nt;
+            }
+        }
         return TY_BAD;
     }
     if (k == K_EXPR_CAST) {
         return named_type(nodes, text, lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
     }
     if (k == K_EXPR_CALL) {
+        if ((field_eq(nodes, text, i, F_NAME, "@as") && (children(nodes, i) == 2)) && (kind(nodes, (i + 1)) == K_EXPR_IDENTIFIER)) {
+            return type_code(text, lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
+        }
         let f: i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
         if (f == NO_NODE) {
             return TY_BAD;
         }
         let fi: usize = (f as _);
         return fn_type(nodes, text, fi);
+    }
+    if (k == K_EXPR_INDEX) {
+        if ((children(nodes, i) != 2) || (kind(nodes, (i + 1)) != K_EXPR_IDENTIFIER)) {
+            return TY_BAD;
+        }
+        let rd: i64 = rom_decl(nodes, text, meta, ptext, item, (i + 1));
+        if (rd == NO_NODE) {
+            return TY_BAD;
+        }
+        let rdi: usize = (rd as _);
+        return rom_elem(nodes, text, rdi);
     }
     if (k == K_EXPR_FIELD_ACCESS) {
         if ((children(nodes, i) != 1) || (kind(nodes, (i + 1)) != K_EXPR_IDENTIFIER)) {
@@ -253,6 +287,42 @@ pub fn ty_of(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, 
         return peer(ty_of(nodes, text, meta, ptext, item, a1, (depth + 1)), ty_of(nodes, text, meta, ptext, item, a2, (depth + 1)));
     }
     return TY_BAD;
+}
+
+pub fn rom_decl(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], item: usize, u: usize) -> i64 {
+    let s: i64 = resolve(nodes, text, meta, ptext, item, u, lo(nodes, u, F_NAME), hi(nodes, u, F_NAME));
+    if ((s == NO_SYM) || (sym_tag(s) != SYM_TOP)) {
+        return NO_NODE;
+    }
+    let d: usize = sym_at(s);
+    if (((kind(nodes, d) != K_CONST_DECL) || is_mut(meta, d)) || ((d + 1) >= end(nodes, d))) {
+        return NO_NODE;
+    }
+    if (kind(nodes, (d + 1)) != K_EXPR_ARRAY_LITERAL) {
+        return NO_NODE;
+    }
+    let ta: usize = lo(nodes, d, F_TYPE);
+    if ((hi(nodes, d, F_TYPE) <= ta) || (text[(ta) as usize] != 91)) {
+        return NO_NODE;
+    }
+    let di: i64 = (d as _);
+    return di;
+}
+
+pub fn rom_elem(nodes: &[u8], text: &[u8], d: usize) -> i64 {
+    let mut j: usize = lo(nodes, d, F_TYPE);
+    let e: usize = hi(nodes, d, F_TYPE);
+    while ((j < e) && (text[(j) as usize] != 93)) {
+        j = (j + 1);
+    }
+    if (j >= e) {
+        return TY_BAD;
+    }
+    let t: i64 = type_code(text, (j + 1), e);
+    if !(ty_scalar(t)) {
+        return TY_BAD;
+    }
+    return t;
 }
 
 pub fn float_text(text: &[u8], a: usize, b: usize) -> bool {
@@ -754,8 +824,34 @@ pub fn decl_count_in(nodes: &[u8], text: &[u8], item: usize, a: usize, b: usize)
 }
 
 pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize, want: i64) -> i64 {
+    if (ty_sint(want) && ty_uint(ty_of(nodes, text, meta, ptext, item, i, 0))) {
+        let mut q: usize = put_text(out, at, "$signed({1'b0, ");
+        let r: i64 = ex_raw(out, q, nodes, text, meta, ptext, work, item, mode, i, want);
+        if (r < 0) {
+            return r;
+        }
+        q = (r as _);
+        q = put_text(out, q, "})");
+        let rq: i64 = (q as _);
+        return rq;
+    }
+    return ex_raw(out, at, nodes, text, meta, ptext, work, item, mode, i, want);
+}
+
+pub fn ex_raw(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize, want: i64) -> i64 {
     let k: u8 = kind(nodes, i);
     let own: i64 = ty_of(nodes, text, meta, ptext, item, i, 0);
+    if (((((own == TY_COMPTIME) && (k == K_EXPR_UNARY)) && field_eq(nodes, text, i, F_OP, "-")) && ty_sint(want)) && fold_ok(nodes, text, meta, ptext, item, (i + 1), 0)) {
+        let nv: u64 = fold_val(nodes, text, meta, ptext, item, (i + 1), 0);
+        if ((nv > 0) && !(fits((nv - 1), want))) {
+            return fail(out, nodes, meta, text, i, "literal that does not fit its type", 0, 0);
+        }
+        let mut qn: usize = put_text(out, at, "(-");
+        qn = put_lit(out, qn, nv, want);
+        qn = put_text(out, qn, ")");
+        let rn0: i64 = (qn as _);
+        return rn0;
+    }
     if (own == TY_COMPTIME) {
         if !(fold_ok(nodes, text, meta, ptext, item, i, 0)) {
             return fail(out, nodes, meta, text, i, "untyped value that does not fold", 0, 0);
@@ -773,6 +869,9 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
     }
     if (own == TY_BAD) {
         if (k == K_EXPR_CALL) {
+            if (field_eq(nodes, text, i, F_NAME, "@as") && (children(nodes, i) == 2)) {
+                return fail(out, nodes, meta, text, i, "cast to type", lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
+            }
             let f: i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
             if (f == NO_NODE) {
                 return fail(out, nodes, meta, text, i, "call of an undeclared fn", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
@@ -879,10 +978,18 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         if ((oc == OP_BAD) || (lw == TY_BAD)) {
             return fail(out, nodes, meta, text, i, "operator", op_a, op_b);
         }
-        if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
-            q = put_text(out, q, "{");
+        if ((((oc == OP_ARITH) && (same(&text[(op_a) as usize..(op_b) as usize], "/") || same(&text[(op_a) as usize..(op_b) as usize], "%"))) && fold_ok(nodes, text, meta, ptext, item, r, 0)) && !(fold_ok(nodes, text, meta, ptext, item, l, 0))) {
+            return ex_divk(out, q, nodes, text, meta, ptext, work, item, mode, i, own);
+        }
+        let sg: bool = (ty_sint(own) && ((oc == OP_ARITH) || (oc == OP_SHIFT)));
+        if sg {
+            q = put_text(out, q, "$signed({");
         } else {
-            q = put_text(out, q, "(");
+            if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
+                q = put_text(out, q, "{");
+            } else {
+                q = put_text(out, q, "(");
+            }
         }
         let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, lw);
         if (r1 < 0) {
@@ -890,17 +997,25 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         }
         q = (r1 as _);
         q = put_text(out, q, " ");
-        q = put_text(out, q, verilog_op(&text[(op_a) as usize..(op_b) as usize]));
+        if (((oc == OP_SHIFT) && ty_sint(own)) && same(&text[(op_a) as usize..(op_b) as usize], ">>")) {
+            q = put_text(out, q, ">>>");
+        } else {
+            q = put_text(out, q, verilog_op(&text[(op_a) as usize..(op_b) as usize]));
+        }
         q = put_text(out, q, " ");
         let r2: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, r, rw);
         if (r2 < 0) {
             return r2;
         }
         q = (r2 as _);
-        if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
-            q = put_text(out, q, "}");
+        if sg {
+            q = put_text(out, q, "})");
         } else {
-            q = put_text(out, q, ")");
+            if ((oc == OP_ARITH) || (oc == OP_SHIFT)) {
+                q = put_text(out, q, "}");
+            } else {
+                q = put_text(out, q, ")");
+            }
         }
         let rbn: i64 = (q as _);
         return rbn;
@@ -909,7 +1024,15 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         if field_eq(nodes, text, i, F_OP, "!") {
             q = put_text(out, q, "(!");
         } else {
-            q = put_text(out, q, "{~");
+            if field_eq(nodes, text, i, F_OP, "-") {
+                q = put_text(out, q, "$signed({-");
+            } else {
+                if ty_sint(own) {
+                    q = put_text(out, q, "$signed({~");
+                } else {
+                    q = put_text(out, q, "{~");
+                }
+            }
         }
         let r3: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), own);
         if (r3 < 0) {
@@ -919,54 +1042,23 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         if field_eq(nodes, text, i, F_OP, "!") {
             q = put_text(out, q, ")");
         } else {
-            q = put_text(out, q, "}");
+            if (ty_sint(own) || field_eq(nodes, text, i, F_OP, "-")) {
+                q = put_text(out, q, "})");
+            } else {
+                q = put_text(out, q, "}");
+            }
         }
         let ru: i64 = (q as _);
         return ru;
     }
     if (k == K_EXPR_CAST) {
-        let src: i64 = ty_of(nodes, text, meta, ptext, item, (i + 1), 0);
-        if (src == TY_COMPTIME) {
-            return ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), own);
-        }
-        if !(ty_scalar(src)) {
-            return fail(out, nodes, meta, text, i, "cast of a value that is no integer or bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
-        }
-        if ((own == TY_BOOL) && (src != TY_BOOL)) {
-            return fail(out, nodes, meta, text, i, "cast to bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
-        }
-        let sw: i64 = ty_width(src);
-        let dw: i64 = ty_width(own);
-        if (sw == dw) {
-            return ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
-        }
-        if (sw < dw) {
-            q = put_text(out, q, "{");
-            let fillw: i64 = (dw - sw);
-            q = put_lit(out, q, 0, fillw);
-            q = put_text(out, q, ", ");
-            let r4: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
-            if (r4 < 0) {
-                return r4;
-            }
-            q = (r4 as _);
-            q = put_text(out, q, "}");
-            let rw2: i64 = (q as _);
-            return rw2;
-        }
-        let dwu: usize = (dw as _);
-        work[(((2 * count(nodes)) + dwu)) as usize] = 1;
-        q = put_text(out, q, "t27_u");
-        q = put_dec(out, q, (dw as u64));
-        q = put_text(out, q, "(");
-        let r5: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, (i + 1), src);
-        if (r5 < 0) {
-            return r5;
-        }
-        q = (r5 as _);
-        q = put_text(out, q, ")");
-        let rn: i64 = (q as _);
-        return rn;
+        return ex_cast(out, q, nodes, text, meta, ptext, work, item, mode, i, (i + 1), own);
+    }
+    if (((k == K_EXPR_CALL) && field_eq(nodes, text, i, F_NAME, "@as")) && (children(nodes, i) == 2)) {
+        return ex_cast(out, q, nodes, text, meta, ptext, work, item, mode, i, end(nodes, (i + 1)), own);
+    }
+    if (k == K_EXPR_INDEX) {
+        return ex_index(out, q, nodes, text, meta, ptext, work, item, mode, i);
     }
     if (k == K_EXPR_CALL) {
         return ex_call(out, q, nodes, text, meta, ptext, work, item, mode, i);
@@ -1008,6 +1100,255 @@ pub fn ex(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], pte
         return rif;
     }
     return fail(out, nodes, meta, text, i, kind_label(k), lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+}
+
+pub fn ex_cast(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize, srcn: usize, own: i64) -> i64 {
+    let mut q: usize = at;
+    let mut sn: usize = srcn;
+    if (((kind(nodes, sn) == K_EXPR_CALL) && field_eq(nodes, text, sn, F_NAME, "@intCast")) && (children(nodes, sn) == 1)) {
+        sn = (sn + 1);
+    }
+    let src: i64 = ty_of(nodes, text, meta, ptext, item, sn, 0);
+    if (src == TY_COMPTIME) {
+        return ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, own);
+    }
+    if !(ty_scalar(src)) {
+        return fail(out, nodes, meta, text, i, "cast of a value that is no integer or bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
+    }
+    if ((own == TY_BOOL) && (src != TY_BOOL)) {
+        return fail(out, nodes, meta, text, i, "cast to bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
+    }
+    let sw: i64 = ty_width(src);
+    let dw: i64 = ty_width(own);
+    let sgd: bool = ty_sint(own);
+    if (sw == dw) {
+        if (ty_sint(src) == sgd) {
+            return ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+        }
+        if sgd {
+            q = put_text(out, q, "$signed(");
+        } else {
+            q = put_text(out, q, "$unsigned(");
+        }
+        let rs: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+        if (rs < 0) {
+            return rs;
+        }
+        q = (rs as _);
+        q = put_text(out, q, ")");
+        let rsq: i64 = (q as _);
+        return rsq;
+    }
+    if (sw < dw) {
+        if ty_sint(src) {
+            if !(sgd) {
+                q = put_text(out, q, "$unsigned");
+            }
+            q = put_text(out, q, "(");
+            let rg: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+            if (rg < 0) {
+                return rg;
+            }
+            q = (rg as _);
+            q = put_text(out, q, " + ");
+            q = put_lit(out, q, 0, (SI + dw));
+            q = put_text(out, q, ")");
+            let rgq: i64 = (q as _);
+            return rgq;
+        }
+        if sgd {
+            q = put_text(out, q, "$signed(");
+        }
+        q = put_text(out, q, "{");
+        let fillw: i64 = (dw - sw);
+        q = put_lit(out, q, 0, fillw);
+        q = put_text(out, q, ", ");
+        let r4: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+        if (r4 < 0) {
+            return r4;
+        }
+        q = (r4 as _);
+        q = put_text(out, q, "}");
+        if sgd {
+            q = put_text(out, q, ")");
+        }
+        let rw2: i64 = (q as _);
+        return rw2;
+    }
+    let dwu: usize = (dw as _);
+    work[(((2 * count(nodes)) + dwu)) as usize] = 1;
+    if sgd {
+        q = put_text(out, q, "$signed(");
+    }
+    q = put_text(out, q, "t27_u");
+    q = put_dec(out, q, (dw as u64));
+    q = put_text(out, q, "(");
+    let r5: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, sn, src);
+    if (r5 < 0) {
+        return r5;
+    }
+    q = (r5 as _);
+    q = put_text(out, q, ")");
+    if sgd {
+        q = put_text(out, q, ")");
+    }
+    let rn: i64 = (q as _);
+    return rn;
+}
+
+pub fn ex_index(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize) -> i64 {
+    let rd: i64 = rom_decl(nodes, text, meta, ptext, item, (i + 1));
+    if (rd == NO_NODE) {
+        return fail(out, nodes, meta, text, i, "ExprIndex", lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
+    }
+    let rdi: usize = (rd as _);
+    let idx: usize = end(nodes, (i + 1));
+    let it: i64 = ty_of(nodes, text, meta, ptext, item, idx, 0);
+    if ((it != TY_COMPTIME) && !(ty_uint(it))) {
+        return fail(out, nodes, meta, text, i, "table index that is no unsigned integer", lo(nodes, (i + 1), F_NAME), hi(nodes, (i + 1), F_NAME));
+    }
+    work[((((2 * count(nodes)) + ROM_AT) + rdi)) as usize] = 1;
+    let mut q: usize = put_text(out, at, "t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, rdi, F_NAME), hi(nodes, rdi, F_NAME));
+    q = put_text(out, q, "(");
+    let r1: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, idx, 64);
+    if (r1 < 0) {
+        return r1;
+    }
+    q = (r1 as _);
+    q = put_text(out, q, ")");
+    let ri: i64 = (q as _);
+    return ri;
+}
+
+pub fn put_mult(out: &mut [u8], at: usize, n: u64, m: u64) -> usize {
+    if (n < 64) {
+        let q0: usize = put_text(out, at, "65'd");
+        return put_dec(out, q0, (m + pow2(n)));
+    }
+    let mut q: usize = put_text(out, at, "{1'b1, 64'd");
+    q = put_dec(out, q, m);
+    return put_text(out, q, "}");
+}
+
+pub fn ex_divk(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize, own: i64) -> i64 {
+    let l: usize = (i + 1);
+    let r: usize = end(nodes, l);
+    let isdiv: bool = field_eq(nodes, text, i, F_OP, "/");
+    let d: u64 = fold_val(nodes, text, meta, ptext, item, r, 0);
+    if !(ty_int(own)) {
+        return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP));
+    }
+    if (d == 0) {
+        return fail(out, nodes, meta, text, i, "division by the constant 0", 0, 0);
+    }
+    let n: u64 = (ty_width(own) as u64);
+    let sgn: bool = ty_sint(own);
+    let mut q: usize = at;
+    if (d == 1) {
+        if isdiv {
+            return ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own);
+        }
+        q = put_lit(out, q, 0, own);
+        let r1: i64 = (q as _);
+        return r1;
+    }
+    if (is_pow2(d) && !(sgn)) {
+        q = put_text(out, q, "{");
+        let ra: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own);
+        if (ra < 0) {
+            return ra;
+        }
+        q = (ra as _);
+        if isdiv {
+            q = put_text(out, q, " >> ");
+            q = put_dec(out, q, ceil_log2(d));
+            q = put_text(out, q, "}");
+        } else {
+            q = put_text(out, q, " & ");
+            q = put_lit(out, q, (d - 1), own);
+            q = put_text(out, q, "}");
+        }
+        let rp: i64 = (q as _);
+        return rp;
+    }
+    if (d > DIV_MAX) {
+        return fail(out, nodes, meta, text, i, "division by a constant above 2^62", 0, 0);
+    }
+    let mut h: usize = 0;
+    if is_pow2(d) {
+        h = 4;
+        if !(isdiv) {
+            h = 5;
+        }
+    } else {
+        if sgn {
+            h = 2;
+            if !(isdiv) {
+                h = 3;
+            }
+        } else {
+            if !(isdiv) {
+                h = 1;
+            }
+        }
+    }
+    work[((((2 * count(nodes)) + HELP_AT) + h)) as usize] = 1;
+    if (n < 64) {
+        let nu: usize = (n as _);
+        work[(((2 * count(nodes)) + nu)) as usize] = 1;
+        if sgn {
+            q = put_text(out, q, "$signed(");
+        }
+        q = put_text(out, q, "t27_u");
+        q = put_dec(out, q, n);
+        q = put_text(out, q, "(");
+    }
+    if (h == 0) {
+        q = put_text(out, q, "t27_udivc(");
+    }
+    if (h == 1) {
+        q = put_text(out, q, "t27_umodc(");
+    }
+    if (h == 2) {
+        q = put_text(out, q, "t27_sdivc(");
+    }
+    if (h == 3) {
+        q = put_text(out, q, "t27_smodc(");
+    }
+    if (h == 4) {
+        q = put_text(out, q, "t27_sdivp(");
+    }
+    if (h == 5) {
+        q = put_text(out, q, "t27_smodp(");
+    }
+    let rx: i64 = ex(out, q, nodes, text, meta, ptext, work, item, mode, l, own);
+    if (rx < 0) {
+        return rx;
+    }
+    q = (rx as _);
+    if (h >= 4) {
+        q = put_text(out, q, ", 7'd");
+        q = put_dec(out, q, ceil_log2(d));
+    } else {
+        q = put_text(out, q, ", ");
+        q = put_mult(out, q, n, div_mult_low(n, d));
+        q = put_text(out, q, ", 8'd");
+        q = put_dec(out, q, div_shift(n, d));
+        if ((h == 1) || (h == 3)) {
+            q = put_text(out, q, ", 64'd");
+            q = put_dec(out, q, d);
+        }
+    }
+    q = put_text(out, q, ")");
+    if (n < 64) {
+        q = put_text(out, q, ")");
+        if sgn {
+            q = put_text(out, q, ")");
+        }
+    }
+    let rd: i64 = (q as _);
+    return rd;
 }
 
 pub fn ex_call(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], item: usize, mode: u8, i: usize) -> i64 {
@@ -1683,7 +2024,7 @@ pub fn decls(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], 
                 q = put_text(out, q, ";\n");
             }
         }
-        if (((((((((((((((((k != K_STMT_LOCAL) && (k != K_STMT_WHILE)) && (k != K_STMT_IF)) && (k != K_MODULE)) && (k != K_STMT_ASSIGN)) && (k != K_EXPR_RETURN)) && (k != K_STMT_EXPR)) && (k != K_STMT_BREAK)) && (k != K_STMT_CONTINUE)) && (k != K_EXPR_LITERAL)) && (k != K_EXPR_IDENTIFIER)) && (k != K_EXPR_CALL)) && (k != K_EXPR_BINARY)) && (k != K_EXPR_UNARY)) && (k != K_EXPR_CAST)) && (k != K_EXPR_IF)) && (k != K_EXPR_FIELD_ACCESS)) {
+        if ((((((((((((((((((k != K_STMT_LOCAL) && (k != K_STMT_WHILE)) && (k != K_STMT_IF)) && (k != K_MODULE)) && (k != K_STMT_ASSIGN)) && (k != K_EXPR_RETURN)) && (k != K_STMT_EXPR)) && (k != K_STMT_BREAK)) && (k != K_STMT_CONTINUE)) && (k != K_EXPR_LITERAL)) && (k != K_EXPR_IDENTIFIER)) && (k != K_EXPR_CALL)) && (k != K_EXPR_BINARY)) && (k != K_EXPR_UNARY)) && (k != K_EXPR_CAST)) && (k != K_EXPR_IF)) && (k != K_EXPR_FIELD_ACCESS)) && (k != K_EXPR_INDEX)) {
             return fail(out, nodes, meta, text, j, kind_label(k), lo(nodes, j, F_NAME), hi(nodes, j, F_NAME));
         }
         j = (j + 1);
@@ -1772,8 +2113,252 @@ pub fn functions(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u
         }
         w = (w + 1);
     }
+    let hb: usize = ((2 * count(nodes)) + HELP_AT);
+    if ((((work[(hb) as usize] != 0) || (work[((hb + 1)) as usize] != 0)) || (work[((hb + 2)) as usize] != 0)) || (work[((hb + 3)) as usize] != 0)) {
+        q = put_div_helper(out, q, 0);
+    }
+    if (work[((hb + 1)) as usize] != 0) {
+        q = put_div_helper(out, q, 1);
+    }
+    if ((work[((hb + 2)) as usize] != 0) || (work[((hb + 3)) as usize] != 0)) {
+        q = put_div_helper(out, q, 2);
+    }
+    if (work[((hb + 3)) as usize] != 0) {
+        q = put_div_helper(out, q, 3);
+    }
+    if ((work[((hb + 4)) as usize] != 0) || (work[((hb + 5)) as usize] != 0)) {
+        q = put_div_helper(out, q, 4);
+    }
+    if (work[((hb + 5)) as usize] != 0) {
+        q = put_div_helper(out, q, 5);
+    }
+    let mut d: usize = 1;
+    while (d < end(nodes, 0)) {
+        if ((kind(nodes, d) == K_CONST_DECL) && (work[((((2 * count(nodes)) + ROM_AT) + d)) as usize] != 0)) {
+            let rt: i64 = put_rom(out, q, nodes, text, meta, ptext, d);
+            if (rt < 0) {
+                return rt;
+            }
+            q = (rt as _);
+        }
+        d = end(nodes, d);
+    }
     let rr: i64 = (q as _);
     return rr;
+}
+
+pub fn put_div_helper(out: &mut [u8], at: usize, h: usize) -> usize {
+    if (h == 0) {
+        return put_text(out, at, "\n    function [63:0] t27_udivc;\n        input [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        reg [191:0] p;\n        begin\n            p = x * m;\n            p = p >> s;\n            t27_udivc = p[63:0];\n        end\n    endfunction\n");
+    }
+    if (h == 1) {
+        return put_text(out, at, "\n    function [63:0] t27_umodc;\n        input [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        input [63:0] d;\n        begin\n            t27_umodc = x - t27_udivc(x, m, s) * d;\n        end\n    endfunction\n");
+    }
+    if (h == 2) {
+        return put_text(out, at, "\n    function signed [63:0] t27_sdivc;\n        input signed [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        reg [63:0] a;\n        begin\n            a = x[63] ? (64'd0 - x) : x;\n            a = t27_udivc(a, m, s);\n            t27_sdivc = x[63] ? (64'd0 - a) : a;\n        end\n    endfunction\n");
+    }
+    if (h == 3) {
+        return put_text(out, at, "\n    function signed [63:0] t27_smodc;\n        input signed [63:0] x;\n        input [64:0] m;\n        input [7:0] s;\n        input [63:0] d;\n        begin\n            t27_smodc = x - t27_sdivc(x, m, s) * $signed(d);\n        end\n    endfunction\n");
+    }
+    if (h == 4) {
+        return put_text(out, at, "\n    function signed [63:0] t27_sdivp;\n        input signed [63:0] x;\n        input [6:0] k;\n        reg signed [63:0] b;\n        begin\n            b = (64'sd1 <<< k) - 64'sd1;\n            t27_sdivp = (x < 64'sd0) ? ((x + b) >>> k) : (x >>> k);\n        end\n    endfunction\n");
+    }
+    return put_text(out, at, "\n    function signed [63:0] t27_smodp;\n        input signed [63:0] x;\n        input [6:0] k;\n        begin\n            t27_smodp = x - (t27_sdivp(x, k) <<< k);\n        end\n    endfunction\n");
+}
+
+pub fn put_rom(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], d: usize) -> i64 {
+    let t: i64 = rom_elem(nodes, text, d);
+    if !(ty_scalar(t)) {
+        return fail(out, nodes, meta, text, d, "table whose elements are no integers or bools", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    }
+    let mut q: usize = put_text(out, at, "\n    // table ");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, "\n    function ");
+    q = put_range(out, q, t);
+    q = put_text(out, q, "t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, ";\n        input [63:0] i;\n        begin\n            case (i)\n");
+    let mut c: usize = (d + 2);
+    let mut kx: u64 = 0;
+    while (c < end(nodes, (d + 1))) {
+        let mut ne: bool = false;
+        let mut ev: usize = c;
+        if (((kind(nodes, c) == K_EXPR_UNARY) && field_eq(nodes, text, c, F_OP, "-")) && ty_sint(t)) {
+            ne = true;
+            ev = (c + 1);
+        }
+        if !(fold_ok(nodes, text, meta, ptext, 0, ev, 0)) {
+            return fail(out, nodes, meta, text, c, "table element that does not fold", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+        }
+        let v: u64 = fold_val(nodes, text, meta, ptext, 0, ev, 0);
+        let mut okv: bool = fits(v, t);
+        if (ne && (v > 0)) {
+            okv = fits((v - 1), t);
+        }
+        if !(okv) {
+            return fail(out, nodes, meta, text, c, "table element that does not fit its type", lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+        }
+        q = put_text(out, q, "                64'd");
+        q = put_dec(out, q, kx);
+        q = put_text(out, q, ": t27_rom_");
+        q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+        q = put_text(out, q, " = ");
+        if ne {
+            q = put_text(out, q, "-");
+        }
+        q = put_lit(out, q, v, t);
+        q = put_text(out, q, ";\n");
+        kx = (kx + 1);
+        c = end(nodes, c);
+    }
+    q = put_text(out, q, "                default: t27_rom_");
+    q = put_bytes(out, q, text, lo(nodes, d, F_NAME), hi(nodes, d, F_NAME));
+    q = put_text(out, q, " = ");
+    q = put_lit(out, q, 0, t);
+    q = put_text(out, q, ";\n            endcase\n        end\n    endfunction\n");
+    let rr: i64 = (q as _);
+    return rr;
+}
+
+pub fn wrappable(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], f: usize, top: &[u8]) -> bool {
+    if (((kind(nodes, f) != K_FN_DECL) || is_extern(nodes, f)) || field_eq(nodes, text, f, F_NAME, "on_clock")) {
+        return false;
+    }
+    if (top.len() > 0) {
+        return field_is(nodes, text, f, F_NAME, top);
+    }
+    if (!(is_pub(meta, f)) || !(ty_scalar(fn_type(nodes, text, f)))) {
+        return false;
+    }
+    let np: usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
+    let mut kx: usize = 0;
+    while (kx < np) {
+        if !(ty_scalar(param_type(nodes, text, meta, ptext, f, kx))) {
+            return false;
+        }
+        kx = (kx + 1);
+    }
+    return true;
+}
+
+pub fn is_library(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8]) -> bool {
+    if (clock_fn(nodes, text) != NO_NODE) {
+        return false;
+    }
+    let mut c: usize = 1;
+    while (c < end(nodes, 0)) {
+        let cl: u8 = item_class(nodes, text, meta, ptext, c);
+        if (((((cl == C_VAR) || (cl == C_NET)) || (cl == C_INSTANCE)) || (cl == C_INPUT)) || (cl == C_INOUT)) {
+            return false;
+        }
+        c = end(nodes, c);
+    }
+    return true;
+}
+
+pub fn fn_module(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], f: usize) -> i64 {
+    let n: usize = count(nodes);
+    let mut j: usize = 0;
+    while (j < n) {
+        work[(j) as usize] = 0;
+        j = (j + 1);
+    }
+    j = ((2 * n) + 1);
+    while (j < ((3 * n) + ROM_AT)) {
+        work[(j) as usize] = 0;
+        j = (j + 1);
+    }
+    work[(f) as usize] = 1;
+    close_marks(nodes, text, work, 0);
+    let rt: i64 = fn_type(nodes, text, f);
+    let np: usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
+    let mut q: usize = put_text(out, at, "\n// pure fn ");
+    q = put_bytes(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, " (line ");
+    q = put_dec(out, q, (line_of(meta, f) as u64));
+    q = put_text(out, q, "): combinational, one input per parameter\nmodule ");
+    q = put_name(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, " (");
+    let mut kx: usize = 0;
+    while (kx < np) {
+        let pt: i64 = param_type(nodes, text, meta, ptext, f, kx);
+        q = put_text(out, q, "\n    input  wire ");
+        q = put_range(out, q, pt);
+        q = put_name(out, q, ptext, param_name_lo(meta, ptext, f, kx), param_name_hi(meta, ptext, f, kx));
+        q = put_text(out, q, ",");
+        kx = (kx + 1);
+    }
+    q = put_text(out, q, "\n    output wire ");
+    q = put_range(out, q, rt);
+    q = put_text(out, q, "t27_y\n);\n    assign t27_y = ");
+    q = put_name(out, q, text, lo(nodes, f, F_NAME), hi(nodes, f, F_NAME));
+    q = put_text(out, q, "(");
+    if (np == 0) {
+        q = put_text(out, q, "1'b0");
+    }
+    kx = 0;
+    while (kx < np) {
+        if (kx > 0) {
+            q = put_text(out, q, ", ");
+        }
+        q = put_name(out, q, ptext, param_name_lo(meta, ptext, f, kx), param_name_hi(meta, ptext, f, kx));
+        kx = (kx + 1);
+    }
+    q = put_text(out, q, ");\n");
+    let r1: i64 = functions(out, q, nodes, text, meta, ptext, work, 0, M_FUNC);
+    if (r1 < 0) {
+        return r1;
+    }
+    q = (r1 as _);
+    q = put_text(out, q, "endmodule\n");
+    j = ((2 * n) + 1);
+    while (j < ((3 * n) + ROM_AT)) {
+        work[(j) as usize] = 0;
+        j = (j + 1);
+    }
+    let rm: i64 = (q as _);
+    return rm;
+}
+
+pub fn lib_modules(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], top: &[u8]) -> i64 {
+    let mut q: usize = at;
+    let mut emitted: usize = 0;
+    let mut bad: i64 = NO_NODE;
+    let mut c: usize = 1;
+    while (c < end(nodes, 0)) {
+        if wrappable(nodes, text, meta, ptext, c, top) {
+            let r: i64 = fn_module(out, q, nodes, text, meta, ptext, work, c);
+            if (r < 0) {
+                if (top.len() > 0) {
+                    return r;
+                }
+                if (bad == NO_NODE) {
+                    bad = (c as _);
+                }
+                q = put_text(out, q, "\n// skipped fn ");
+                q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+                q = put_text(out, q, ": ");
+                q = copy_msg(out, q, ((0 - r) as _));
+                q = put_text(out, q, "\n");
+            } else {
+                q = (r as _);
+                emitted = (emitted + 1);
+            }
+        }
+        c = end(nodes, c);
+    }
+    if (emitted > 0) {
+        let rq: i64 = (q as _);
+        return rq;
+    }
+    if (top.len() > 0) {
+        return fail(out, nodes, meta, text, 0, "--top that names no fn of the spec", 0, 0);
+    }
+    if (bad != NO_NODE) {
+        let bi: usize = (bad as _);
+        return fn_module(out, at, nodes, text, meta, ptext, work, bi);
+    }
+    return module_text(out, at, nodes, text, meta, ptext, work);
 }
 
 pub fn ports(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], oc: i64) -> i64 {
@@ -2518,7 +3103,7 @@ pub fn test_bench(out: &mut [u8], at: usize, nodes: &[u8], text: &[u8], meta: &[
     return rb;
 }
 
-pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], out: &mut [u8]) -> i64 {
+pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8], out: &mut [u8], top: &[u8]) -> i64 {
     if ((count(nodes) == 0) || (kind(nodes, 0) != K_MODULE)) {
         return fail_front(out, "file with no module node");
     }
@@ -2527,7 +3112,16 @@ pub fn emit(nodes: &[u8], text: &[u8], meta: &[u8], ptext: &[u8], work: &mut [u8
     q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
     q = put_text(out, q, " -- DO NOT EDIT; the decisions are specs/tri/t27b/verilog_plan.t27\n");
     q = put_text(out, q, "// phi^2 + 1/phi^2 = 3 | TRINITY\n`timescale 1ns / 1ps\n`default_nettype none\n");
-    let r1: i64 = module_text(out, q, nodes, text, meta, ptext, work);
+    let mut r1: i64 = 0;
+    if is_library(nodes, text, meta, ptext) {
+        r1 = lib_modules(out, q, nodes, text, meta, ptext, work, top);
+    } else {
+        if (top.len() > 0) {
+            return fail_front(out, "--top on a spec with an on_clock, a var, a net, an instance or an input");
+        } else {
+            r1 = module_text(out, q, nodes, text, meta, ptext, work);
+        }
+    }
     if (r1 < 0) {
         let ml1: usize = ((0 - r1) as _);
         return to_front(out, ml1);
@@ -2614,6 +3208,8 @@ pub const F_VALUE: usize = 1;
 
 pub const K_CONST_DECL: u8 = 2;
 
+pub const K_EXPR_ARRAY_LITERAL: u8 = 22;
+
 pub const K_EXPR_BINARY: u8 = 16;
 
 pub const K_EXPR_CALL: u8 = 13;
@@ -2625,6 +3221,8 @@ pub const K_EXPR_FIELD_ACCESS: u8 = 14;
 pub const K_EXPR_IDENTIFIER: u8 = 11;
 
 pub const K_EXPR_IF: u8 = 20;
+
+pub const K_EXPR_INDEX: u8 = 19;
 
 pub const K_EXPR_LITERAL: u8 = 10;
 
@@ -3184,6 +3782,8 @@ pub const C_TYPE: u8 = 9;
 
 pub const C_VAR: u8 = 1;
 
+pub const DIV_MAX: u64 = 4611686018427387904;
+
 pub const FLAG_MUT: usize = 1;
 
 pub const FLAG_PUB: usize = 2;
@@ -3224,6 +3824,8 @@ pub const ROLE_PARAM: u8 = 2;
 
 pub const ROLE_PORT: u8 = 1;
 
+pub const SI: i64 = 100;
+
 pub const T27_KEYWORDS: [&'static str; 29] = ["and", "bench", "break", "const", "continue", "else", "enum", "false", "fn", "for", "if", "in", "invariant", "let", "module", "or", "pragma", "pub", "return", "struct", "switch", "test", "true", "try", "use", "using", "var", "void", "while"];
 
 pub const TY_BAD: i64 = -1;
@@ -3247,6 +3849,8 @@ pub const VERILOG_KEYWORDS: [&'static str; 103] = ["always", "and", "assign", "a
 pub const VERILOG_KEYWORDS_2: [&'static str; 17] = ["tranif0", "tranif1", "tri", "tri0", "tri1", "triand", "trior", "trireg", "unsigned", "use", "uwire", "vectored", "wait", "wand", "weak0", "weak1", "while"];
 
 pub const VERILOG_KEYWORDS_3: [&'static str; 5] = ["wire", "wor", "xnor", "xor", "logic"];
+
+pub const VERILOG_KEYWORDS_4: [&'static str; 40] = ["inside", "bit", "byte", "int", "longint", "shortint", "string", "type", "unique", "priority", "class", "final", "var", "ref", "do", "with", "assert", "assume", "cover", "property", "sequence", "local", "null", "new", "this", "super", "virtual", "pure", "rand", "import", "export", "extends", "foreach", "union", "packed", "interface", "package", "program", "checker", "iff"];
 
 pub fn assigns_of(nodes: &[u8], text: &[u8], a: usize, b: usize, va: usize, vb: usize) -> usize {
     let mut n: usize = 0;
@@ -3273,6 +3877,16 @@ pub fn binds(ps: &[u8], a: usize, b: usize, text: &[u8], ia: usize, ib: usize, f
         return false;
     }
     return has_at(ps, ((a + n) + 1), b, &text[(fa) as usize..(fb) as usize]);
+}
+
+pub fn ceil_log2(d: u64) -> u64 {
+    let mut l: u64 = 0;
+    let mut v: u64 = 1;
+    while ((v < d) && (l < 63)) {
+        v = (v * 2);
+        l = (l + 1);
+    }
+    return l;
 }
 
 pub fn colon_at(ptext: &[u8], s: usize, e: usize) -> usize {
@@ -3314,6 +3928,26 @@ pub fn digit_of(c: u8) -> u64 {
     return 99;
 }
 
+pub fn div_mult_low(n: u64, d: u64) -> u64 {
+    let mut r: u64 = (pow2(ceil_log2(d)) - d);
+    let mut q: u64 = 0;
+    let mut j: u64 = 0;
+    while (j < n) {
+        r = (r * 2);
+        q = (q * 2);
+        if (r >= d) {
+            r = (r - d);
+            q = (q + 1);
+        }
+        j = (j + 1);
+    }
+    return (q + 1);
+}
+
+pub fn div_shift(n: u64, d: u64) -> u64 {
+    return (n + ceil_log2(d));
+}
+
 pub fn find_decl(nodes: &[u8], text: &[u8], a: usize, b: usize) -> i64 {
     let mut c: usize = 1;
     while (c < end(nodes, 0)) {
@@ -3343,8 +3977,11 @@ pub fn fits(v: u64, t: i64) -> bool {
     if (t == TY_BOOL) {
         return (v <= 1);
     }
-    if ty_int(t) {
+    if ty_uint(t) {
         return (v <= max_of(t));
+    }
+    if ty_sint(t) {
+        return (v <= max_of(((t - SI) - 1)));
     }
     return false;
 }
@@ -3504,6 +4141,10 @@ pub fn is_pin_name(text: &[u8], ca: usize, cb: usize, k: usize) -> bool {
         return false;
     }
     return same(&text[((cb - s)) as usize..(cb) as usize], key);
+}
+
+pub fn is_pow2(d: u64) -> bool {
+    return ((d != 0) && ((d & (d - 1)) == 0));
 }
 
 pub fn is_pub(meta: &[u8], i: usize) -> bool {
@@ -3764,11 +4405,29 @@ pub fn peer(a: i64, b: i64) -> i64 {
     if ((a == TY_BOOL) && (b == TY_BOOL)) {
         return TY_BOOL;
     }
-    if (ty_int(a) && ty_int(b)) {
+    if (ty_uint(a) && ty_uint(b)) {
         if (a >= b) {
             return a;
         }
         return b;
+    }
+    if (ty_sint(a) && ty_sint(b)) {
+        if (a >= b) {
+            return a;
+        }
+        return b;
+    }
+    if (ty_sint(a) && ty_uint(b)) {
+        if ((a - SI) > b) {
+            return a;
+        }
+        return TY_BAD;
+    }
+    if (ty_uint(a) && ty_sint(b)) {
+        if ((b - SI) > a) {
+            return b;
+        }
+        return TY_BAD;
     }
     return TY_BAD;
 }
@@ -3802,6 +4461,16 @@ pub fn port_name_end(ps: &[u8], a: usize, b: usize) -> usize {
         return (b - 1);
     }
     return b;
+}
+
+pub fn pow2(k: u64) -> u64 {
+    let mut v: u64 = 1;
+    let mut j: u64 = 0;
+    while (j < k) {
+        v = (v * 2);
+        j = (j + 1);
+    }
+    return v;
 }
 
 pub fn step_of(nodes: &[u8], text: &[u8], w: usize, va: usize, vb: usize) -> i64 {
@@ -3900,16 +4569,27 @@ pub fn trip_bound(op: &[u8], kok: bool, k: u64, sok: bool, step: u64) -> i64 {
 }
 
 pub fn ty_int(t: i64) -> bool {
-    return ((t >= 1) && (t <= MAX_WIDTH));
+    return (ty_uint(t) || ty_sint(t));
 }
 
 pub fn ty_scalar(t: i64) -> bool {
     return (ty_int(t) || (t == TY_BOOL));
 }
 
+pub fn ty_sint(t: i64) -> bool {
+    return ((t > (SI + 1)) && (t <= (SI + MAX_WIDTH)));
+}
+
+pub fn ty_uint(t: i64) -> bool {
+    return ((t >= 1) && (t <= MAX_WIDTH));
+}
+
 pub fn ty_width(t: i64) -> i64 {
-    if ty_int(t) {
+    if ty_uint(t) {
         return t;
+    }
+    if ty_sint(t) {
+        return (t - SI);
     }
     if (t == TY_BOOL) {
         return 1;
@@ -3938,7 +4618,10 @@ pub fn type_code(s: &[u8], a: usize, b: usize) -> i64 {
     if ((same(&s[(p) as usize..(q) as usize], "f64") || same(&s[(p) as usize..(q) as usize], "f32")) || same(&s[(p) as usize..(q) as usize], "comptime_float")) {
         return TY_FLOAT;
     }
-    if (((s[(p) as usize] != 117) || ((q - p) < 2)) || ((q - p) > 3)) {
+    if same(&s[(p) as usize..(q) as usize], "isize") {
+        return (SI + 64);
+    }
+    if ((((s[(p) as usize] != 117) && (s[(p) as usize] != 105)) || ((q - p) < 2)) || ((q - p) > 3)) {
         return TY_BAD;
     }
     let p1: usize = (p + 1);
@@ -3954,6 +4637,12 @@ pub fn type_code(s: &[u8], a: usize, b: usize) -> i64 {
     }
     if (((s[(p1) as usize] == 48) || (w < 1)) || (w > MAX_WIDTH)) {
         return TY_BAD;
+    }
+    if (s[(p) as usize] == 105) {
+        if (w < 2) {
+            return TY_BAD;
+        }
+        return (SI + w);
     }
     return w;
 }
@@ -3976,6 +4665,13 @@ pub fn verilog_keyword(s: &[u8]) -> bool {
     j = 0;
     while (j < 5) {
         if same(s, VERILOG_KEYWORDS_3[(j) as usize]) {
+            return true;
+        }
+        j = (j + 1);
+    }
+    j = 0;
+    while (j < 40) {
+        if same(s, VERILOG_KEYWORDS_4[(j) as usize]) {
             return true;
         }
         j = (j + 1);
