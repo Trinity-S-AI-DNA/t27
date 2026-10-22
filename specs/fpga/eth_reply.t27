@@ -1,0 +1,378 @@
+// SPDX-License-Identifier: Apache-2.0
+module EthReply;
+// specs/fpga/eth_reply.t27 -- E2c of the Ethernet job link (#8388, #8530, part of #8327): the receipt
+// of TrinetNode (specs/fpga/trinet_node.t27) goes out as one unicast UDP datagram to the host
+// whose request started the job, on the byte stream EthBeacon drives (tx_en and txd, one byte
+// per 125 MHz clock; the wrapper turns them into RGMII with ODDR).
+//
+// The frame, byte for byte (73 on the wire):
+//   0..6    preamble 0x55, 7 SFD 0xD5                         (not covered by the FCS)
+//   8..13   destination MAC: the requester's                   (EthRx src_mac)
+//   14..19  source MAC 02:27:00:00:00:01                      (the node, as EthBeacon)
+//   20..21  ethertype 0x0800
+//   22..41  IPv4: 45 00 | len 47 | id 0 | DF | ttl 64 | UDP | checksum | 192.168.1.227 | requester
+//   42..49  UDP: port 27028 -> the requester's port, length 27, checksum 0 (allowed for IPv4)
+//   50..68  payload, the 19-byte v2 receipt of protocol.zig:
+//           A5 Y STATUS NONCE[4] NODE_ID[4] TAG[8], NODE_ID and TAG little-endian, NONCE as
+//           received (TrinetNode's r_n holds the first nonce byte in its low byte)
+//   69..72  FCS: CRC-32 over bytes 8..68, least significant byte first
+// 61 data bytes are more than the 60 Ethernet needs, so there is no padding.
+//
+// Which host: TrinetNode's receipt comes 59 clocks after the frame that started the job, and by
+// then EthRx may hold another frame's sender. So the sender is taken when the job starts
+// (take = TrinetNode's j_go) and kept apart; the receipt (go = resp_v) copies it into the frame
+// registers. The IPv4 checksum of that sender is a three-stage pipeline that runs on every
+// clock (sum, fold, fold and invert); it is ready three clocks after take, long before go.
+//
+// One frame at a time: a receipt that comes while a frame is on the line or inside the
+// 12-clock inter-frame gap is counted in n_drop and not sent. At line rate it cannot happen:
+// a request frame with its gap takes 90 clocks, a reply frame with its gap 86.
+//
+// Reference values were computed independently (Python struct, the RFC 791 sum and
+// zlib.crc32) before this spec was written. The V1 keyed receipt of protocol.zig (y 1,
+// status 1, nonce 7, tag 9706109019689513616) to 192.168.1.101:50000, MAC 02:00:00:00:00:99:
+// IPv4 checksum 0xB625, FCS 05 C5 5F 98, data byte sum 3987. The V6 receipt (y 224, nonce 12,
+// tag 13200515888575913244) to 192.168.1.50:40000, MAC 02:00:00:00:00:42: checksum 0xB658,
+// FCS 72 9F AC EE.
+//
+// Sequential (test) and nonblocking (hardware) semantics agree: every var is assigned at
+// most once on each path, and no var is read after it was written in the same call.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+const CRC_INIT : u32 = 4294967295
+const CRC_POLY : u32 = 3988292384
+const SRC_PORT : u32 = 27028
+const NODE_ID : u32 = 1414678862
+const IP_FIXED : u32 = 100299
+const DATA_FIRST : u8 = 8
+const DATA_END : u8 = 69
+const FRAME_LAST : u8 = 72
+const IFG : u8 = 12
+
+var st : u8 = 0
+var pos : u8 = 0
+var gap : u8 = 0
+var crc : u32 = 4294967295
+var txd : u8 = 0
+var tx_en : u8 = 0
+var p_mac : u64 = 0
+var p_ip : u32 = 0
+var p_port : u16 = 0
+var pc0 : u32 = 0
+var pc1 : u32 = 0
+var pcs : u32 = 0
+var s0 : u64 = 0
+var s1 : u64 = 0
+var s2 : u64 = 0
+var s3 : u64 = 0
+var s4 : u64 = 0
+var s5 : u64 = 0
+var s6 : u64 = 0
+var s7 : u64 = 0
+var n_sent : u32 = 0
+var n_drop : u32 = 0
+
+// Byte k (0 = least significant) of a word; k is a constant at every call.
+fn b32(w: u32, k: u8) -> u8 {
+    return ((w >> ((k as u32) << 3)) & 255) as u8;
+}
+
+fn b64(w: u64, k: u8) -> u8 {
+    return ((w >> ((k as u64) << 3)) & 255) as u8;
+}
+
+// RFC 791 over the header with checksum 0: IP_FIXED is the sum of every word but the
+// destination's (4500 002F 0000 4000 4011 C0A8 01E3), so three stages finish it.
+fn ip_sum(d: u32) -> u32 {
+    return IP_FIXED + (d >> 16) + (d & 65535);
+}
+
+fn ip_fold(s: u32) -> u32 {
+    return (s & 65535) + (s >> 16);
+}
+
+fn ip_final(s: u32) -> u32 {
+    return (((s & 65535) + (s >> 16)) ^ 65535) & 65535;
+}
+
+// The 61 data bytes (wire bytes 8..68) as eight little-endian words: data byte k is byte k % 8 of
+// word k / 8. They are loaded in one clock when the receipt comes and shifted out a byte a clock,
+// so no clock selects among 61 bytes (a table on the position was nine LUTs deep in the node).
+fn byte_at(v: u64, k: u8) -> u64 {
+    return (v >> ((k as u64) << 3)) & 255;
+}
+
+fn word(k: u8, mac: u64, ip: u32, port: u16, cs: u32, y: u8, st: u8, n: u32, tag: u64) -> u64 {
+    if (k == 0) {
+        return byte_at(mac, 5) | (byte_at(mac, 4) << 8) | (byte_at(mac, 3) << 16) | (byte_at(mac, 2) << 24) | (byte_at(mac, 1) << 32) | (byte_at(mac, 0) << 40) | (2 << 48) | (39 << 56);
+    }
+    if (k == 1) { return (1 << 24) | (8 << 32) | (69 << 48); }
+    if (k == 2) { return (47 << 8) | (64 << 32) | (64 << 48) | (17 << 56); }
+    if (k == 3) {
+        return byte_at(cs as u64, 1) | (byte_at(cs as u64, 0) << 8) | (192 << 16) | (168 << 24) | (1 << 32) | (227 << 40) | (byte_at(ip as u64, 3) << 48) | (byte_at(ip as u64, 2) << 56);
+    }
+    if (k == 4) {
+        return byte_at(ip as u64, 1) | (byte_at(ip as u64, 0) << 8) | (byte_at(SRC_PORT as u64, 1) << 16) | (byte_at(SRC_PORT as u64, 0) << 24) | (byte_at(port as u64, 1) << 32) | (byte_at(port as u64, 0) << 40) | (27 << 56);
+    }
+    if (k == 5) { return (165 << 16) | ((y as u64) << 24) | ((st as u64) << 32) | (((n as u64) & 16777215) << 40); }
+    if (k == 6) { return ((n as u64) >> 24) | ((NODE_ID as u64) << 8) | ((tag & 16777215) << 40); }
+    return tag >> 24;
+}
+
+// One byte out: each word passes its low byte down to the word below.
+fn shift(v: u64, above: u64) -> u64 {
+    return (v >> 8) | ((above & 255) << 56);
+}
+
+fn crc_step(c: u32) -> u32 {
+    if ((c & 1) == 1) { return (c >> 1) ^ CRC_POLY; }
+    return c >> 1;
+}
+
+fn crc_byte(c: u32, b: u8) -> u32 {
+    return crc_step(crc_step(crc_step(crc_step(crc_step(crc_step(crc_step(crc_step(c ^ (b as u32)))))))));
+}
+
+fn fcs_of(c: u32, k: u8) -> u8 {
+    return b32(c ^ CRC_INIT, k);
+}
+
+fn busy_go(go: u8, s: u8) -> u32 {
+    if (go == 1) {
+        if (s != 0) { return 1; }
+    }
+    return 0;
+}
+
+fn sel64(s: u8, nv: u64, v: u64) -> u64 {
+    if (s == 1) { return nv; }
+    return v;
+}
+
+fn sel32(s: u8, nv: u32, v: u32) -> u32 {
+    if (s == 1) { return nv; }
+    return v;
+}
+
+fn sel16(s: u8, nv: u16, v: u16) -> u16 {
+    if (s == 1) { return nv; }
+    return v;
+}
+
+// take, smac, sip, sport: TrinetNode's j_go and EthRx's src_mac, src_ip, src_port.
+// go, ry, rs, rn, rtag: TrinetNode's resp_v, r_y, r_st, r_n, r_tag.
+fn on_clock(take: u8, smac: u64, sip: u32, sport: u16, go: u8, ry: u8, rs: u8, rn: u32, rtag: u64) {
+    n_drop = n_drop + busy_go(go, st);
+    if (st == 0) {
+        tx_en = 0;
+        txd = 0;
+        if (go == 1) {
+            s0 = word(0, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s1 = word(1, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s2 = word(2, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s3 = word(3, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s4 = word(4, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s5 = word(5, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s6 = word(6, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            s7 = word(7, p_mac, p_ip, p_port, pcs, ry, rs, rn, rtag);
+            st = 1;
+            pos = 0;
+            crc = CRC_INIT;
+        }
+    } else {
+        if (st == 1) {
+            tx_en = 1;
+            if (pos < 7) {
+                txd = 85;
+            } else {
+                if (pos == 7) {
+                    txd = 213;
+                } else {
+                    if (pos < DATA_END) {
+                        txd = (s0 & 255) as u8;
+                        crc = crc_byte(crc, (s0 & 255) as u8);
+                        s0 = shift(s0, s1);
+                        s1 = shift(s1, s2);
+                        s2 = shift(s2, s3);
+                        s3 = shift(s3, s4);
+                        s4 = shift(s4, s5);
+                        s5 = shift(s5, s6);
+                        s6 = shift(s6, s7);
+                        s7 = s7 >> 8;
+                    } else {
+                        txd = fcs_of(crc, pos - DATA_END);
+                    }
+                }
+            }
+            if (pos == FRAME_LAST) {
+                st = 2;
+                gap = IFG;
+                n_sent = n_sent + 1;
+            } else {
+                pos = pos + 1;
+            }
+        } else {
+            tx_en = 0;
+            txd = 0;
+            if (gap <= 1) {
+                st = 0;
+                gap = 0;
+            } else {
+                gap = gap - 1;
+            }
+        }
+    }
+    pcs = ip_final(pc1);
+    pc1 = ip_fold(pc0);
+    pc0 = ip_sum(p_ip);
+    p_mac = sel64(take, smac, p_mac);
+    p_ip = sel32(take, sip, p_ip);
+    p_port = sel16(take, sport, p_port);
+}
+
+// ---------------------------------------------------------------------------
+// Test-only helpers. Sender A is the canonical EthRx test sender; sender B another host.
+
+const A_MAC : u64 = 2199023255705
+const A_IP : u32 = 3232235877
+const A_PORT : u16 = 50000
+const B_MAC : u64 = 2199023255618
+const B_IP : u32 = 3232235826
+const B_PORT : u16 = 40000
+
+invariant the_frame_is_the_data_plus_the_fcs {
+    assert_eq(FRAME_LAST, DATA_END + 3);
+    assert_eq(DATA_END - DATA_FIRST, 61);
+}
+
+test the_checksum_pipeline_gives_the_rfc_791_values {
+    assert_eq(ip_final(ip_fold(ip_sum(A_IP))), 46629);
+    assert_eq(ip_final(ip_fold(ip_sum(B_IP))), 46680);
+    assert_eq(IP_FIXED, 17664 + 47 + 16384 + 16401 + 49320 + 483);
+}
+
+test a_receipt_goes_to_the_sender_taken_at_job_start_with_the_reference_fcs {
+    st = 0; gap = 0; n_sent = 0; n_drop = 0; tx_en = 0;
+    var k : u32 = 0;
+    var n : u32 = 0;
+    var sum : u32 = 0;
+    var c : u32 = CRC_INIT;
+    on_clock(1, A_MAC, A_IP, A_PORT, 0, 0, 0, 0, 0);
+    // another frame from B passes through EthRx while the job runs; take stays 0
+    while (k < 59) {
+        on_clock(0, B_MAC, B_IP, B_PORT, 0, 0, 0, 0, 0);
+        k = k + 1;
+    }
+    assert_eq(pcs, 46629);
+    on_clock(0, B_MAC, B_IP, B_PORT, 1, 1, 1, 7, 9706109019689513616);
+    assert_eq(tx_en, 0);
+    k = 0;
+    while (k < 100) {
+        on_clock(0, B_MAC, B_IP, B_PORT, 0, 0, 0, 0, 0);
+        if (tx_en == 1) {
+            if (n < 7) { assert_eq(txd, 85); }
+            if (n == 7) { assert_eq(txd, 213); }
+            if (n == 8) { assert_eq(txd, 2); }
+            if (n == 13) { assert_eq(txd, 153); }
+            if (n == 32) { assert_eq(txd, 182); }
+            if (n == 33) { assert_eq(txd, 37); }
+            if (n == 41) { assert_eq(txd, 101); }
+            if (n == 44) { assert_eq(txd, 195); }
+            if (n == 45) { assert_eq(txd, 80); }
+            if (n == 50) { assert_eq(txd, 165); }
+            if (n == 53) { assert_eq(txd, 7); }
+            if (n == 57) { assert_eq(txd, 78); }
+            if (n == 68) { assert_eq(txd, 134); }
+            if (n == 69) { assert_eq(txd, 5); }
+            if (n == 70) { assert_eq(txd, 197); }
+            if (n == 71) { assert_eq(txd, 95); }
+            if (n == 72) { assert_eq(txd, 152); }
+            if (n >= 8) {
+                if (n < 69) {
+                    sum = sum + (txd as u32);
+                    c = crc_byte(c, txd);
+                }
+            }
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    assert_eq(n, 73);
+    assert_eq(sum, 3987);
+    assert_eq(fcs_of(c, 0), 5);
+    assert_eq(n_sent, 1);
+    assert_eq(n_drop, 0);
+}
+
+test a_receipt_while_a_frame_is_on_the_line_is_dropped_and_counted {
+    st = 0; gap = 0; n_sent = 0; n_drop = 0; tx_en = 0;
+    var k : u32 = 0;
+    var n : u32 = 0;
+    on_clock(1, A_MAC, A_IP, A_PORT, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 1, 1, 1, 7, 9706109019689513616);
+    while (k < 30) {
+        on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (tx_en == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    on_clock(0, 0, 0, 0, 1, 2, 2, 9, 1);
+    if (tx_en == 1) { n = n + 1; }
+    k = 0;
+    while (k < 150) {
+        on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (tx_en == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    assert_eq(n, 73);
+    assert_eq(n_sent, 1);
+    assert_eq(n_drop, 1);
+}
+
+test two_receipts_leave_at_least_twelve_idle_clocks_and_the_second_goes_to_its_own_sender {
+    st = 0; gap = 0; n_sent = 0; n_drop = 0; tx_en = 0;
+    var k : u32 = 0;
+    var n : u32 = 0;
+    var idle : u32 = 0;
+    var c : u32 = CRC_INIT;
+    on_clock(1, A_MAC, A_IP, A_PORT, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    on_clock(0, 0, 0, 0, 1, 1, 1, 7, 9706109019689513616);
+    on_clock(1, B_MAC, B_IP, B_PORT, 0, 0, 0, 0, 0);
+    while (st != 0) {
+        on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (tx_en == 0) { idle = idle + 1; }
+        k = k + 1;
+    }
+    assert_eq(idle, 12);
+    assert_eq(pcs, 46680);
+    on_clock(0, 0, 0, 0, 1, 224, 1, 12, 13200515888575913244);
+    k = 0;
+    while (k < 100) {
+        on_clock(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (tx_en == 1) {
+            if (n == 13) { assert_eq(txd, 66); }
+            if (n == 32) { assert_eq(txd, 182); }
+            if (n == 33) { assert_eq(txd, 88); }
+            if (n == 41) { assert_eq(txd, 50); }
+            if (n == 51) { assert_eq(txd, 224); }
+            if (n == 69) { assert_eq(txd, 114); }
+            if (n == 70) { assert_eq(txd, 159); }
+            if (n == 71) { assert_eq(txd, 172); }
+            if (n == 72) { assert_eq(txd, 238); }
+            if (n >= 8) {
+                if (n < 69) { c = crc_byte(c, txd); }
+            }
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    assert_eq(n, 73);
+    assert_eq(fcs_of(c, 3), 238);
+    assert_eq(n_sent, 2);
+    assert_eq(n_drop, 0);
+}

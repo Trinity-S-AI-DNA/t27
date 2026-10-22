@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use t27b::blockers::{binary_stamp, cache_row, read_cache, CacheWriter, Reference};
+use t27b::blockers::{binary_stamp, cache_row, cacheable, read_cache, use_closure, CacheWriter, Reference};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("t27b-refcache-{}-{}", name, std::process::id()));
@@ -106,5 +106,57 @@ fn stamp_follows_content_not_mtime() {
     std::fs::write(&c, b"\x7fELF pretend t27c binary 2").unwrap();
     assert_ne!(binary_stamp(&a).unwrap(), binary_stamp(&c).unwrap());
     assert!(binary_stamp(&d.join("absent")).is_err());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// #6441: a row carries the per-test verdicts; a row from before has none.
+#[test]
+fn rows_carry_per_test_verdicts() {
+    use t27b::blockers::{cache_row_tests, decode_row, read_cache_tests};
+    let tests = vec![("a;b%c".to_string(), true), ("x\ty".to_string(), false), ("plain".to_string(), true)];
+    let r = Reference::Fail("1 of 3 tests fail".into());
+    let row = cache_row_tests(0xab, Path::new("specs/a.t27"), &r, Some(&tests));
+    assert_eq!(row.lines().count(), 1);
+    let field = row.trim_end().splitn(3, '\t').nth(2).unwrap();
+    assert_eq!(decode_row(field), Some((r.clone(), Some(tests.clone()))));
+    // An old binary reads the verdict alone.
+    assert_eq!(Reference::decode(field), Some(r.clone()));
+    let empty = cache_row_tests(0xcd, Path::new("specs/b.t27"), &Reference::Pass, Some(&[]));
+    let field = empty.trim_end().splitn(3, '\t').nth(2).unwrap();
+    assert_eq!(decode_row(field), Some((Reference::Pass, Some(vec![]))));
+    assert_eq!(decode_row("pass"), Some((Reference::Pass, None)));
+    assert_eq!(decode_row("fail\tboom\ttests=?x"), None, "a damaged list is a damaged row");
+
+    let d = scratch("tests");
+    let cache = d.join("cache.tsv");
+    std::fs::write(&cache, format!("{}00000000000000aa\tspecs/old.t27\tfail\t1 of 2 tests fail\n", row)).unwrap();
+    let known = read_cache_tests(&cache);
+    assert_eq!(known.get(&0xab), Some(&(r, Some(tests))));
+    assert_eq!(known.get(&0xaa), Some(&(Reference::Fail("1 of 2 tests fail".into()), None)));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_timeout_is_never_cacheable() {
+    // #6443: a timeout measures the machine, not the spec.
+    assert!(!cacheable(&Reference::Timeout));
+    assert!(cacheable(&Reference::Pass));
+    assert!(cacheable(&Reference::Fail("x".into())));
+    assert!(cacheable(&Reference::Blocked("t27c test-report exited Some(1): e".into())));
+}
+
+#[test]
+fn the_key_closure_follows_use() {
+    // #6443: t27c splices imported declarations in, so an import's bytes are
+    // part of the verdict. `use a::c;` with a trailing comment, and the dotted
+    // form, both resolve; a missing import is skipped.
+    let d = scratch("closure");
+    let a = d.join("specs").join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::write(a.join("b.t27"), "module b;\nuse a::c;   // note\nuse a.e;\nuse a::gone;\n").unwrap();
+    std::fs::write(a.join("c.t27"), "module c;\nuse a::e;\n").unwrap();
+    std::fs::write(a.join("e.t27"), "module e;\nuse a::b;\n").unwrap();
+    let got = use_closure(&a.join("b.t27"));
+    assert_eq!(got, vec![a.join("b.t27"), a.join("c.t27"), a.join("e.t27")]);
     let _ = std::fs::remove_dir_all(&d);
 }
