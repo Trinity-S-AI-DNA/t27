@@ -13,6 +13,8 @@
 //! four "incompatible pointer to integer conversion" errors in one corpus file.
 //! That is what `a_list_of_strings_is_refused` holds.
 
+mod common;
+
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,13 +54,7 @@ fn gen_c_with(decls: &str, body: &str, tag: &str) -> (String, std::path::PathBuf
 fn errors(h: &str, d: &std::path::Path) -> String {
     let p = d.join("h.h");
     std::fs::write(&p, h).expect("write");
-    let out = Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter",
-               "-ferror-limit=0", "-fsyntax-only", "-x", "c"])
-        .arg(&p)
-        .output()
-        .expect("cc");
-    String::from_utf8_lossy(&out.stderr).to_string()
+    common::cc_check(&p, &["-Wall", "-Wextra", "-Wno-unused-parameter"])
 }
 
 #[test]
@@ -231,7 +227,6 @@ fn a_list_of_calls_to_declared_functions_is_typed() {
     for (body, why) in [
         ("var x = [cast_i8(1), other(2)];", "disagreeing return types"),
         ("var x = [nosuch(1)];", "a function this module does not declare"),
-        ("var x = [1, cast_i8(2)];", "a mixed literal-and-call list"),
     ] {
         let (h, _d) = gen_c_with(decls, body, "calls_no");
         assert!(
@@ -239,6 +234,9 @@ fn a_list_of_calls_to_declared_functions_is_typed() {
             "{why} must keep __auto_type:\n{h}"
         );
     }
+    // #11183: a number takes the type of the non-number beside it, so the call decides.
+    let (h, _d) = gen_c_with(decls, "var x = [1, cast_i8(2)];", "calls_mixed");
+    assert!(h.contains("__typeof__(cast_i8(2)) x[2] = { 1, cast_i8(2) }"), "{h}");
 }
 
 #[test]
