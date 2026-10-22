@@ -1,4 +1,5 @@
 ---
+model: sonnet
 description: Verifier Agent - Validates correctness, runs conformance tests, ensures law compliance
 color: "#10b981"
 ---

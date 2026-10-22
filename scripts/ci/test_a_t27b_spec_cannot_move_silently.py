@@ -11,14 +11,19 @@ docs/reports/t27b_expectations.json, per spec. Every input here is a fixture
   info      MOVED, UNJUDGED and VACUITY MEASURED only -> still exit 0.
   red       each red code at least once -> exit 1, and nothing else.
   bless     writes the ledger from a run; keeps a hand-written reason; refuses a
-            `fail` where the reference passes, and refuses to raise the cap.
+            `fail` where the reference passes, and refuses to raise the cap unless
+            --accept-new and the rise is exactly specs new to the ledger (#6237).
   unread    no run file, a run without reference verdicts, no ledger -> exit 2.
   ledger    the committed ledger: one entry per line, every non-pass entry
-            with a known reason, counts that add up, a cap equal to reality.
+            with a known reason, a cap equal to reality, and no stored counts.
+  merge     branches blessing 1 and 2 new pass specs merge cleanly (#7859,
+            steward.t27 header_stored); rules storing counts conflict.
   lab       lab.ratchet() of a fake clone: ok on green, ok=false with findings
             on red, skipped (ok None, never green) when the commit has no ledger.
-  mutation  a copy of the checker with the UNEXPECTED PASS branch removed
-            misses the case this test plants -- proof the red case can fail.
+  mutation  a copy of the checker whose generated rules (gen/c/tri/t27b/
+            steward.c, from specs/tri/t27b/steward.t27) lack the UNEXPECTED
+            PASS branch misses the case this test plants -- proof the red case
+            can fail, and that the decision is the spec's, not t27b.py's.
 """
 import importlib.util
 import json
@@ -31,6 +36,8 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TOOL = os.path.join(ROOT, "scripts", "tri_loop", "t27b.py")
+RULES = os.path.join(ROOT, "scripts", "tri_loop", "t27b_rules.py")
+GEN = os.path.join(ROOT, "gen", "c", "tri", "t27b", "steward.c")
 LEDGER = os.path.join(ROOT, "docs", "reports", "t27b_expectations.json")
 LAB = os.path.join(ROOT, "contrib", "railway", "t27b-lab", "lab.py")
 fails = []
@@ -85,12 +92,23 @@ def ratchet(run, ledger, *extra, tool=TOOL):
     return p.returncode, doc, p.stdout + p.stderr
 
 
+def plant(tree, gen_src):
+    """A checker tree: t27b.py, its rules loader and the generated rules beside it."""
+    os.makedirs(os.path.join(tree, "scripts", "tri_loop"), exist_ok=True)
+    os.makedirs(os.path.join(tree, "gen", "c", "tri", "t27b"), exist_ok=True)
+    shutil.copy(TOOL, os.path.join(tree, "scripts", "tri_loop", "t27b.py"))
+    shutil.copy(RULES, os.path.join(tree, "scripts", "tri_loop", "t27b_rules.py"))
+    with open(os.path.join(tree, "gen", "c", "tri", "t27b", "steward.c"), "w") as f:
+        f.write(gen_src)
+    return os.path.join(tree, "scripts", "tri_loop", "t27b.py")
+
+
 def kinds(doc):
     return sorted((f["kind"], f["path"]) for f in doc["findings"]) if doc else None
 
 
-def bless(run, ledger):
-    p = subprocess.run([sys.executable, TOOL, "ratchet", "--run", run, "--ledger", ledger, "--bless"],
+def bless(run, ledger, *extra, tool=TOOL):
+    p = subprocess.run([sys.executable, tool, "ratchet", "--run", run, "--ledger", ledger, "--bless", *extra],
                        capture_output=True, text=True)
     return p.returncode, p.stdout + p.stderr
 
@@ -103,8 +121,8 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = bless(j("base.json"), j("ledger.json"))
     check(code == 0, f"bless: base run blesses (exit {code}: {out.strip()[:200]})")
     led = json.load(open(j("ledger.json")))
-    check(led["counts"] == {"pass": 2, "pass_vacuous": 2, "not_pass": 5} and led["max_not_pass"] == 5,
-          f"bless: counts and cap from the run ({led['counts']}, cap {led['max_not_pass']})")
+    check("counts" not in led and "pass 2, pass_vacuous 2, not_pass 5 (max_not_pass 5)" in out and led["max_not_pass"] == 5,
+          f"bless: counts derived and printed, not stored; cap from the run ({sorted(led)}, {out.strip()[:120]})")
     check("specs/r.t27" not in {e["path"] for e in led["entries"]},
           "bless: a spec the reference does not pass is not in the ledger")
     check(all(e["reason"] == "unimplemented" for e in led["entries"] if e["t27b"] not in ("pass", "pass_vacuous")),
@@ -162,8 +180,8 @@ with tempfile.TemporaryDirectory() as tmp:
     write(j("old.json"), old_run)
     code, out = bless(j("old.json"), j("old-ledger.json"))
     old_led = json.load(open(j("old-ledger.json")))
-    check(code == 0 and old_led["source"]["asserts_counted"] is False and old_led["counts"]["pass_vacuous"] is None,
-          "bless: a run without asserts records asserts_counted false and pass_vacuous null, not 0")
+    check(code == 0 and old_led["source"]["asserts_counted"] is False and "pass_vacuous not counted" in out,
+          "bless: a run without asserts records asserts_counted false and pass_vacuous not counted, not 0")
     write(j("measured.json"), run_doc([rec("specs/p.t27", asserts=3), rec("specs/q.t27", t27b="pass_vacuous", asserts=0)]))
     code, doc, out = ratchet(j("measured.json"), j("old-ledger.json"))
     check(code == 0 and kinds(doc) == [("VACUITY MEASURED", "specs/q.t27")],
@@ -192,6 +210,22 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = bless(j("worse.json"), j("ledger-keep.json"))
     check(code == 1 and "max_not_pass 5" in out and open(j("ledger-keep.json")).read() == before,
           f"bless: the cap never rises on its own (exit {code})")
+    code, out = bless(j("worse.json"), j("ledger-keep.json"), "--accept-new")
+    check(code == 1 and "0 new to the ledger" in out and "regressed" in out
+          and open(j("ledger-keep.json")).read() == before,
+          f"bless --accept-new: a rise from a spec the ledger named is still refused (exit {code})")
+
+    # #6237: a rise covered by specs new to the ledger is accounted, and moves only with --accept-new
+    grown = [dict(r) for r in BASE] + [rec("specs/z.t27", t27b="blocked", blockers=["type str"])]
+    write(j("grown.json"), run_doc(grown))
+    code, out = bless(j("grown.json"), j("ledger-keep.json"))
+    check(code == 1 and "= 5 already named + 1 new to the ledger" in out and "--accept-new" in out
+          and open(j("ledger-keep.json")).read() == before,
+          f"bless: a covered rise prints its accounting and still needs --accept-new (exit {code})")
+    code, out = bless(j("grown.json"), j("ledger-keep.json"), "--accept-new")
+    grown_led = json.load(open(j("ledger-keep.json")))
+    check(code == 0 and grown_led["max_not_pass"] == 6 and "specs/z.t27" in {e["path"] for e in grown_led["entries"]},
+          f"bless --accept-new: the cap rises by exactly the new spec (exit {code}, cap {grown_led['max_not_pass']})")
 
     # unreadable inputs are exit 2, never a verdict
     code, doc, out = ratchet(j("absent.json"), j("ledger.json"))
@@ -211,9 +245,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check(paths == sorted(paths) and len(set(paths)) == len(paths), "ledger: sorted, one entry per spec")
     check(all(e.get("reason") in ("unimplemented", "reference-bug", "n/a") and e.get("blocker") for e in np),
           "ledger: every non-pass entry has a blocker and a known reason")
-    c = real["counts"]
-    check(c["not_pass"] == len(np) == real["max_not_pass"] and c["pass"] == sum(e["t27b"] == "pass" for e in ents),
-          f"ledger: counts add up and the cap equals reality ({c}, cap {real['max_not_pass']})")
+    check("counts" not in real and len(np) == real["max_not_pass"],
+          f"ledger: no stored counts (#7859) and the cap equals reality ({len(np)}, cap {real['max_not_pass']})")
     check(all(text.count('"path": "%s"' % p) == 1 for p in paths[:5]) and text.count("\n  {") == len(ents),
           "ledger: one entry per line")
     check(all(ord(ch) < 128 for ch in text), "ledger: ASCII only (L3)")
@@ -221,9 +254,8 @@ with tempfile.TemporaryDirectory() as tmp:
     # the lab half: lab.ratchet() runs the clone's own checker against its own ledger
     work = j("work")
     clone = os.path.join(work, "t27")
-    os.makedirs(os.path.join(clone, "scripts", "tri_loop"))
+    plant(clone, open(GEN).read())
     os.makedirs(os.path.join(clone, "docs", "reports"))
-    shutil.copy(TOOL, os.path.join(clone, "scripts", "tri_loop", "t27b.py"))
     os.environ.update(T27_WORK=work, T27_SRV=j("srv"))
     spec = importlib.util.spec_from_file_location("t27b_lab", LAB)
     lab = importlib.util.module_from_spec(spec)
@@ -240,13 +272,28 @@ with tempfile.TemporaryDirectory() as tmp:
           f"lab: red run -> steps.ratchet ok=false with its findings ({got.get('counts')})")
     log.close()
 
-    # mutation control: the checker without its UNEXPECTED PASS branch misses b.t27
-    src = open(TOOL).read()
-    needle = "elif want not in PASSES and got in PASSES:"
-    check(src.count(needle) == 1, "mutation: the branch to remove is present exactly once")
-    mutant = j("t27b_mutant.py")
-    with open(mutant, "w") as f:
-        f.write(src.replace(needle, "elif False:"))
+    # merge (#7859): 1 and 2 new pass specs; equal numbers would move "pass" identically and hide the control
+    def merges_clean(tool, name):
+        g = lambda *a: subprocess.run(["git", "-C", j(name), "-c", "user.name=t", "-c", "user.email=t@t", *a],  # noqa: E731
+                                      capture_output=True, text=True)
+        os.makedirs(j(name))
+        g("init", "-q", "-b", "master")
+        for branch, extra in (("master", []), ("a", ["specs/a0.t27"]), ("z", ["specs/z8.t27", "specs/z9.t27"])):
+            g("checkout", "-q", "-b", branch, "master") if extra else None
+            write(j(name + branch), run_doc(BASE + [rec(s) for s in extra]))
+            bless(j(name + branch), os.path.join(j(name), "ledger.json"), "--accept-new", tool=tool)
+            g("add", "ledger.json") and g("commit", "-q", "-m", branch)
+        return g("checkout", "-q", "a") and g("merge", "-q", "--no-edit", "z").returncode == 0
+    stored = "    if ((field == 5)) {\n        return false;\n    }\n"
+    counting = plant(j("counting"), open(GEN).read().replace(stored, "")) if open(GEN).read().count(stored) == 1 else TOOL
+    check(merges_clean(TOOL, "m-real") and not merges_clean(counting, "m-counting"),
+          "merge: 1 and 2 new pass entries merge cleanly; rules that store counts conflict (the control)")
+
+    # mutation control: rules generated without the UNEXPECTED PASS branch miss b.t27
+    src = open(GEN).read()
+    needle = "    if (is_pass(got)) {\n        return 3;\n    }\n"
+    check(src.count(needle) == 1, "mutation: the branch to remove is present exactly once in the generated rules")
+    mutant = plant(j("mutant"), src.replace(needle, "    if (false) {\n        return 3;\n    }\n"))
     code, doc, out = ratchet(j("red.json"), j("bad-ledger.json"), tool=mutant)
     check(doc is not None and ("UNEXPECTED PASS", "specs/b.t27") not in kinds(doc),
           "mutation: the mutant misses the planted UNEXPECTED PASS, so the red case above can fail")
