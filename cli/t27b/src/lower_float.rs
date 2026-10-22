@@ -72,21 +72,20 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `abs(x)` with no `fn abs` declared: t27c's Zig backend prints the
-    /// builtin `@abs(x)` (its `declared_fns` guard). A typed f64 / f32 loses
-    /// its sign bit, so `-0.0` gives `+0.0`; written `x <= 0 ? 0 - x : x`,
-    /// with `x` evaluated once (`NaN <= 0` is false: a NaN comes back as is).
-    /// A comptime operand folds. A typed integer is refused: Zig's `@abs`
-    /// of an `iN` is a `uN`. `None`: not this call.
+    /// `abs(x)` / `sqrt(x)` with no such fn declared: t27c's Zig backend prints the builtin `@abs(x)` / `@sqrt(x)`
+    /// (its `declared_fns` guard). A typed f64 / f32 `abs` loses its sign bit, so `-0.0` gives `+0.0`; written
+    /// `x <= 0 ? 0 - x : x`, with `x` evaluated once (`NaN <= 0` is false: a NaN comes back as is). A comptime
+    /// operand folds. A typed integer `abs` is refused: Zig's `@abs` of an `iN` is a `uN`. `None`: not this call.
     pub(super) fn bare_abs(&mut self, n: &Node) -> R<Option<Val>> {
-        if n.name != "abs" || self.sigs.contains_key("abs") || self.poison_names.contains("abs") {
+        let g = n.name.as_str();
+        if !matches!(g, "abs" | "sqrt") || self.sigs.contains_key(g) || self.poison_names.contains(g) {
             return Ok(None);
         }
+        if g == "sqrt" { return self.expr(&Node { name: "@sqrt".into(), ..n.clone() }).map(Some); }
         self.builtin_plan(n).map(Some)
     }
 
-    /// `@abs(x)`, `@max(a, b)`, `@min(a, b)`, `@divTrunc(a, b)` and a bare `abs(x)`: what they take, the
-    /// result type and the select chain or operator each lowers to are specs/tri/t27b/builtin_plan.t27.
+    /// `@abs`, `@max`, `@min`, `@divTrunc` and a bare `abs`: operands, result type and select chain/operator are specs/tri/t27b/builtin_plan.t27.
     pub(super) fn builtin_plan(&mut self, n: &Node) -> R<Val> {
         let b = match n.name.as_str() { "@abs" => bp::ABS, "@max" => bp::MAX, "@min" => bp::MIN, "@divTrunc" => bp::DIV_TRUNC, _ => bp::BARE_ABS };
         self.see(n);

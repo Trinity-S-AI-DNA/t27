@@ -81,3 +81,41 @@ fn a_use_resolves_however_the_spec_path_is_spelled() {
         assert!(stdout.contains("const K"), "{spelled}: the spliced constant is in the output:\n{stdout}");
     }
 }
+
+/// #10556: write specs/r/<name>.t27 for each file and gen the last one.
+fn gen_tree(tag: &str, files: &[(&str, &str)]) -> (bool, String, String) {
+    let root = scratch(tag).join("specs/r");
+    std::fs::create_dir_all(&root).expect("dir");
+    for (n, t) in files { std::fs::write(root.join(format!("{n}.t27")), t).expect("write"); }
+    gen(&root.join(format!("{}.t27", files.last().expect("files").0)))
+}
+const A: &str = "module a;\npub fn ok(n: u32) -> bool {\n    return n > 0;\n}\npub fn admit(n: u32) -> bool {\n    return ok(n);\n}\n";
+const B: &str = "module b;\npub fn ok(k: u32, f: bool) -> bool {\n    return k > 0 or f;\n}\npub fn fine(k: u32) -> bool {\n    return ok(k, false);\n}\n";
+fn imp(body: &str) -> String { format!("module imp;\nuse r::a;\nuse r::b;\n\npub fn s(n: u32) -> bool {{\n    return {body};\n}}\n") }
+
+#[test]
+fn a_helper_two_modules_declare_stays_with_the_module_that_means_it() {
+    let (ok, out, err) = gen_tree("scope", &[("a", A), ("b", B), ("imp", &imp("admit(n) and b::fine(n)"))]);
+    assert!(ok && !err.contains("UNRESOLVED") && !out.contains("UNRESOLVED"), "{err}");
+    for want in ["fn r_a__ok(", "fn r_b__ok(", "return r_a__ok(n);", "return r_b__ok(k, false);"] { assert!(out.contains(want), "{want}:\n{out}"); }
+}
+
+#[test]
+fn a_qualified_helper_takes_the_flat_name_of_the_module_it_names() {
+    let (_, out, err) = gen_tree("qualified", &[("a", A), ("b", B), ("imp", &imp("b::ok(n, true)"))]);
+    assert!(!err.contains("UNRESOLVED") && out.contains("return r_b__ok(n, true);") && !out.contains("r_a__ok"), "{err}\n{out}");
+}
+
+#[test]
+fn a_name_the_importer_writes_that_two_modules_declare_is_still_refused() {
+    let (ok, out, err) = gen_tree("refused", &[("a", A), ("b", B), ("imp", &imp("ok(n, true)"))]);
+    assert!(ok && err.contains("UNRESOLVED ok: declared in r/a.t27 and r/b.t27"), "{err}");
+    assert!(!out.contains("r_a__ok") && !out.contains("fn ok("), "{out}");
+}
+
+#[test]
+fn a_path_in_a_pulled_declaration_loses_its_module() {
+    let c = "module c;\nuse r::a;\npub fn f(n: u32) -> bool {\n    return a::admit(n);\n}\n";
+    let (ok, out, err) = gen_tree("path", &[("a", A), ("c", c), ("imp", "module imp;\nuse r::c;\n\npub fn s(n: u32) -> bool {\n    return c::f(n);\n}\n")]);
+    assert!(ok && out.contains("return admit(n);") && !out.contains("a.admit("), "{err}\n{out}");
+}

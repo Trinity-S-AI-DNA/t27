@@ -1,0 +1,813 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/term_input.t27 -- what a key press, a paste and a copy do in the chat terminal pane.
+; Owner, 2026-10-21: "keys do not work in the chat input! copy and paste too!" The chat pane is a terminal
+; (vt.t27 holds the grid, term_pane.t27 its geometry, glass_window.t27 forwards NSEvents to the PTY through
+; pty_client.t27); this module is the table between the two:
+;   the keys: virtual key code + modifiers + the mode the program set (application cursor keys, DECCKM) -> the
+;     bytes sent to the PTY, one test per key (tk_key_bytes);
+;   the Command keys: which the pane answers (copy, paste, select all, the line keys) and which belong to the
+;     window and are never sent (tk_cmd_route);
+;   the paste: the bytes of the clipboard, wrapped in ESC [ 200 ~ .. ESC [ 201 ~ when the program turned on
+;     bracketed paste (DECSET 2004, vt.t27 ST_BRPASTE), else raw with line ends as CR (ti_paste);
+;   the copy: the selected cells as plain UTF-8, trailing spaces trimmed per row, rows joined by LF (ti_sel_text);
+;   the pointer: which line and column a point of the pane is, and the small right-click menu.
+; The host calls (NSPasteboard, NSEvent) are in glass_window.t27 and carry no decision.
+; Refs gHashTag/t27#11450.
+
+module T27osTermInput;
+
+use t27os::vt::BLANK;
+use t27os::vt::ST_COLS;
+use t27os::vt::ST_ROWS;
+use t27os::vt::ST_SEL;
+use t27os::vt::ST_SEL_AL;
+use t27os::vt::ST_SEL_AC;
+use t27os::vt::ST_SEL_FL;
+use t27os::vt::ST_SEL_FC;
+use t27os::vt::ST_SEL_MODE;
+use t27os::vt::vt_init;
+use t27os::vt::VIEW_SUB;
+use t27os::vt::vt_line_cell;
+use t27os::vt::vt_line_of_view;
+use t27os::vt::vt_sel_bounds;
+use t27os::vt::vt_view_frac;
+use t27os::term_pane::VK_RETURN;
+use t27os::term_pane::VK_TAB;
+use t27os::term_pane::VK_DELETE;
+use t27os::term_pane::VK_ESCAPE;
+use t27os::term_pane::VK_ENTER_PAD;
+use t27os::term_pane::VK_HOME;
+use t27os::term_pane::VK_PAGE_UP;
+use t27os::term_pane::VK_FWD_DELETE;
+use t27os::term_pane::VK_END;
+use t27os::term_pane::VK_PAGE_DOWN;
+use t27os::term_pane::VK_LEFT;
+use t27os::term_pane::VK_RIGHT;
+use t27os::term_pane::VK_DOWN;
+use t27os::term_pane::VK_UP;
+use t27os::term_pane::TP_KEY_MAX;
+use t27os::term_pane::TP_PAD;
+use t27os::term_pane::TP_LINE_H;
+use t27os::term_pane::tp_utf8;
+
+// ---- the keys ---------------------------------------------------------------------------------------------------
+
+/// NSEvent modifierFlags bits (NSEventModifierFlagShift .. Command).
+pub const TK_FLAG_SHIFT : u32 = 131072;
+pub const TK_FLAG_CONTROL : u32 = 262144;
+pub const TK_FLAG_OPTION : u32 = 524288;
+pub const TK_FLAG_COMMAND : u32 = 1048576;
+
+/// The private-use codepoints AppKit types for arrows and function keys (NSUpArrowFunctionKey ..): not text.
+pub const TK_FN_LO : u32 = 63232;
+pub const TK_FN_HI : u32 = 63743;
+
+pub const VK_F1 : u32 = 122;
+pub const VK_F2 : u32 = 120;
+pub const VK_F3 : u32 = 99;
+pub const VK_F4 : u32 = 118;
+pub const VK_F5 : u32 = 96;
+pub const VK_F6 : u32 = 97;
+pub const VK_F7 : u32 = 98;
+pub const VK_F8 : u32 = 100;
+pub const VK_F9 : u32 = 101;
+pub const VK_F10 : u32 = 109;
+pub const VK_F11 : u32 = 103;
+pub const VK_F12 : u32 = 111;
+
+pub fn tk_has(flags: u32, bit: u32) -> bool { return flags / bit % 2 == 1; }
+
+/// xterm's modifier parameter: 1 + Shift 1 + Option 2 + Control 4 (Command is the window's, never sent).
+pub fn tk_mod_param(flags: u32) -> u32 {
+    var m : u32 = 1;
+    if (tk_has(flags, TK_FLAG_SHIFT)) { m = m + 1; }
+    if (tk_has(flags, TK_FLAG_OPTION)) { m = m + 2; }
+    if (tk_has(flags, TK_FLAG_CONTROL)) { m = m + 4; }
+    return m;
+}
+
+fn tk_put(out: []u8, at: u32, b: u8) -> u32 {
+    if (at < TP_KEY_MAX) { out[at] = b; }
+    return at + 1;
+}
+
+fn tk_esc(out: []u8, b: u8) -> u32 {
+    const n : u32 = tk_put(out, 0, 27);
+    return tk_put(out, n, b);
+}
+
+/// ESC [ <final>, or ESC O <final> with application cursor keys, or ESC [ 1 ; <m> <final> with a modifier.
+fn tk_cursor(out: []u8, fin: u8, m: u32, appcur: bool) -> u32 {
+    var n : u32 = tk_put(out, 0, 27);
+    if (m == 1) {
+        if (appcur) { n = tk_put(out, n, 79); } else { n = tk_put(out, n, 91); }
+        return tk_put(out, n, fin);
+    }
+    n = tk_put(out, n, 91);
+    n = tk_put(out, n, 49);
+    n = tk_put(out, n, 59);
+    n = tk_put(out, n, @as(u8, @intCast(48 + m)));
+    return tk_put(out, n, fin);
+}
+
+/// ESC [ <num> ~, or ESC [ <num> ; <m> ~ with a modifier (num is one or two digits).
+fn tk_tilde(out: []u8, num: u32, m: u32) -> u32 {
+    var n : u32 = tk_put(out, 0, 27);
+    n = tk_put(out, n, 91);
+    if (num >= 10) { n = tk_put(out, n, @as(u8, @intCast(48 + num / 10))); }
+    n = tk_put(out, n, @as(u8, @intCast(48 + num % 10)));
+    if (m > 1) {
+        n = tk_put(out, n, 59);
+        n = tk_put(out, n, @as(u8, @intCast(48 + m)));
+    }
+    return tk_put(out, n, 126);
+}
+
+/// F1 .. F12 for a virtual key code; 0 for any other key.
+pub fn tk_fkey(key: u32) -> u32 {
+    if (key == VK_F1) { return 1; }
+    if (key == VK_F2) { return 2; }
+    if (key == VK_F3) { return 3; }
+    if (key == VK_F4) { return 4; }
+    if (key == VK_F5) { return 5; }
+    if (key == VK_F6) { return 6; }
+    if (key == VK_F7) { return 7; }
+    if (key == VK_F8) { return 8; }
+    if (key == VK_F9) { return 9; }
+    if (key == VK_F10) { return 10; }
+    if (key == VK_F11) { return 11; }
+    if (key == VK_F12) { return 12; }
+    return 0;
+}
+
+/// The tilde number of F5 .. F12 (xterm: 15 17 18 19 20 21 23 24).
+fn tk_ftilde(f: u32) -> u32 {
+    if (f == 5) { return 15; }
+    if (f == 6) { return 17; }
+    if (f == 7) { return 18; }
+    if (f == 8) { return 19; }
+    if (f == 9) { return 20; }
+    if (f == 10) { return 21; }
+    if (f == 11) { return 23; }
+    return 24;
+}
+
+/// The lower-case ASCII letter (or the ASCII sign) an ANSI keyboard types on this key code, 0 for any other key.
+/// Control folds the key, not the layout: on a Russian layout Control+C is still ETX.
+pub fn tk_ascii_of_key(key: u32) -> u32 {
+    if (key == 0) { return 97; }
+    if (key == 11) { return 98; }
+    if (key == 8) { return 99; }
+    if (key == 2) { return 100; }
+    if (key == 14) { return 101; }
+    if (key == 3) { return 102; }
+    if (key == 5) { return 103; }
+    if (key == 4) { return 104; }
+    if (key == 34) { return 105; }
+    if (key == 38) { return 106; }
+    if (key == 40) { return 107; }
+    if (key == 37) { return 108; }
+    if (key == 46) { return 109; }
+    if (key == 45) { return 110; }
+    if (key == 31) { return 111; }
+    if (key == 35) { return 112; }
+    if (key == 12) { return 113; }
+    if (key == 15) { return 114; }
+    if (key == 1) { return 115; }
+    if (key == 17) { return 116; }
+    if (key == 32) { return 117; }
+    if (key == 9) { return 118; }
+    if (key == 13) { return 119; }
+    if (key == 7) { return 120; }
+    if (key == 16) { return 121; }
+    if (key == 6) { return 122; }
+    if (key == 33) { return 91; }
+    if (key == 30) { return 93; }
+    if (key == 42) { return 92; }
+    if (key == 44) { return 47; }
+    if (key == 27) { return 45; }
+    if (key == 49) { return 32; }
+    return 0;
+}
+
+/// The bytes one key press sends to the PTY; the length (0 = the key sends nothing), at most TP_KEY_MAX.
+///   key    the virtual key code (NSEvent keyCode)
+///   cp     the first character the key types (charactersIgnoringModifiers with Control, else characters), 0 for none
+///   flags  NSEvent modifierFlags
+///   appcur the program turned on application cursor keys (DECCKM, vt.t27 ST_APPCUR)
+/// Command keys send nothing here except the three line keys a shell reads (Cmd+Left, Cmd+Right, Cmd+Backspace);
+/// tk_cmd_route says which Command keys the pane answers itself.
+pub fn tk_key_bytes(key: u32, cp: u32, flags: u32, appcur: bool, out: []u8) -> u32 {
+    const shift : bool = tk_has(flags, TK_FLAG_SHIFT);
+    const ctrl : bool = tk_has(flags, TK_FLAG_CONTROL);
+    const opt : bool = tk_has(flags, TK_FLAG_OPTION);
+    const cmd : bool = tk_has(flags, TK_FLAG_COMMAND);
+    const m : u32 = tk_mod_param(flags);
+    if (cmd) {
+        // Cmd+Left / Right: start / end of the line (Ctrl+A, Ctrl+E); Cmd+Backspace: delete to the start (Ctrl+U)
+        if (key == VK_LEFT) { return tk_put(out, 0, 1); }
+        if (key == VK_RIGHT) { return tk_put(out, 0, 5); }
+        if (key == VK_DELETE) { return tk_put(out, 0, 21); }
+        return 0;
+    }
+    if (key == VK_RETURN or key == VK_ENTER_PAD) {
+        // Shift+Enter and Option+Enter: ESC CR, which Claude Code reads as a new line
+        if (shift or opt) { return tk_esc(out, 13); }
+        return tk_put(out, 0, 13);
+    }
+    if (key == VK_TAB) {
+        if (shift) {
+            // Shift+Tab: ESC [ Z
+            var z : u32 = tk_put(out, 0, 27);
+            z = tk_put(out, z, 91);
+            return tk_put(out, z, 90);
+        }
+        return tk_put(out, 0, 9);
+    }
+    if (key == VK_DELETE) {
+        // Backspace: DEL; Option+Backspace: ESC DEL (delete the word before)
+        if (opt) { return tk_esc(out, 127); }
+        return tk_put(out, 0, 127);
+    }
+    if (key == VK_ESCAPE) { return tk_put(out, 0, 27); }
+    if (key == VK_LEFT) {
+        // Option+Left / Right: a word back / forward (ESC b, ESC f)
+        if (opt and shift == false and ctrl == false) { return tk_esc(out, 98); }
+        return tk_cursor(out, 68, m, appcur);
+    }
+    if (key == VK_RIGHT) {
+        if (opt and shift == false and ctrl == false) { return tk_esc(out, 102); }
+        return tk_cursor(out, 67, m, appcur);
+    }
+    if (key == VK_UP) { return tk_cursor(out, 65, m, appcur); }
+    if (key == VK_DOWN) { return tk_cursor(out, 66, m, appcur); }
+    if (key == VK_HOME) { return tk_cursor(out, 72, m, appcur); }
+    if (key == VK_END) { return tk_cursor(out, 70, m, appcur); }
+    if (key == VK_FWD_DELETE) { return tk_tilde(out, 3, m); }
+    if (key == VK_PAGE_UP) { return tk_tilde(out, 5, m); }
+    if (key == VK_PAGE_DOWN) { return tk_tilde(out, 6, m); }
+    const f : u32 = tk_fkey(key);
+    if (f > 0) {
+        // F1 .. F4 are SS3 P Q R S (CSI 1 ; m P .. with a modifier); F5 .. F12 are CSI n ~
+        if (f <= 4) {
+            var fin : u8 = 80;
+            if (f == 2) { fin = 81; }
+            if (f == 3) { fin = 82; }
+            if (f == 4) { fin = 83; }
+            if (m == 1) {
+                var s : u32 = tk_put(out, 0, 27);
+                s = tk_put(out, s, 79);
+                return tk_put(out, s, fin);
+            }
+            return tk_cursor(out, fin, m, false);
+        }
+        return tk_tilde(out, tk_ftilde(f), m);
+    }
+    if (cp == 0 or (cp >= TK_FN_LO and cp <= TK_FN_HI)) { return 0; }
+    if (ctrl) {
+        // a non-Latin layout (Russian, Greek ..) folds the key's ANSI letter, not its own character
+        var fold : u32 = cp;
+        if (cp > 127) { fold = tk_ascii_of_key(key); }
+        return tk_ctrl(out, fold, cp);
+    }
+    return tp_utf8(out, 0, cp);
+}
+
+/// Control and a character: the C0 code, or the character itself when Control folds nothing.
+fn tk_ctrl(out: []u8, cp: u32, plain: u32) -> u32 {
+    // Control folds a letter or one of @[\]^_ to its C0 code; Control+space is NUL; Control+/ and Control+-
+    // are US (undo in readline)
+    if (cp >= 97 and cp <= 122) { return tk_put(out, 0, @as(u8, @intCast(cp - 96))); }
+    if (cp >= 64 and cp <= 95) { return tk_put(out, 0, @as(u8, @intCast(cp - 64))); }
+    if (cp == 32) { return tk_put(out, 0, 0); }
+    if (cp == 47 or cp == 45) { return tk_put(out, 0, 31); }
+    return tp_utf8(out, 0, plain);
+}
+
+// ---- the Command keys --------------------------------------------------------------------------------------------
+
+pub const CMD_DROP : u32 = 0;
+pub const CMD_COPY : u32 = 1;
+pub const CMD_PASTE : u32 = 2;
+pub const CMD_SELECT_ALL : u32 = 3;
+pub const CMD_BYTES : u32 = 4;
+pub const CMD_WINDOW : u32 = 5;
+
+pub const VK_A : u32 = 0;
+pub const VK_C : u32 = 8;
+pub const VK_V : u32 = 9;
+pub const VK_W : u32 = 13;
+pub const VK_T : u32 = 17;
+pub const VK_F : u32 = 3;
+pub const VK_K : u32 = 40;
+pub const VK_EQUALS : u32 = 24;
+pub const VK_MINUS : u32 = 27;
+pub const VK_COMMA : u32 = 43;
+
+/// Cmd+1 .. Cmd+9 are the number row's key codes 18 19 20 21 23 22 26 28 25.
+pub fn tk_digit_key(key: u32) -> bool {
+    return key == 18 or key == 19 or key == 20 or key == 21 or key == 23 or key == 22 or key == 26 or key == 28 or key == 25;
+}
+
+/// What a Command key means in the terminal pane: the pane's own (copy, paste, select all), the three line keys
+/// that go to the shell as bytes, a shortcut of the window (T W 1..9 F K + - ,: never sent), or nothing at all.
+pub fn tk_cmd_route(key: u32) -> u32 {
+    if (key == VK_C) { return CMD_COPY; }
+    if (key == VK_V) { return CMD_PASTE; }
+    if (key == VK_A) { return CMD_SELECT_ALL; }
+    if (key == VK_LEFT or key == VK_RIGHT or key == VK_DELETE) { return CMD_BYTES; }
+    if (key == VK_T or key == VK_W or key == VK_F or key == VK_K or key == VK_EQUALS or key == VK_MINUS or key == VK_COMMA) { return CMD_WINDOW; }
+    if (tk_digit_key(key)) { return CMD_WINDOW; }
+    return CMD_DROP;
+}
+
+/// Whether the pane takes this Command key itself (copy, paste, select all, the line keys); the rest fall to the
+/// window's own shortcuts and are never written to the PTY.
+pub fn tk_cmd_is_pane(key: u32) -> bool {
+    const r : u32 = tk_cmd_route(key);
+    return r == CMD_COPY or r == CMD_PASTE or r == CMD_SELECT_ALL or r == CMD_BYTES;
+}
+
+// ---- paste -------------------------------------------------------------------------------------------------------
+
+/// The bytes a paste writes to the PTY. With bracketed paste on (the program sent DECSET 2004) the text is
+/// wrapped in ESC [ 200 ~ and ESC [ 201 ~ and goes through as it is, except ESC itself (a pasted ESC [ 201 ~
+/// would end the paste early). Otherwise the text is typed raw: LF and CR LF become CR, ESC and NUL are dropped.
+/// out holds the result; text past its room is cut. Returns the length.
+pub fn ti_paste(bracketed: bool, text: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    const cap : usize = out.len;
+    if (cap < 16) { return 0; }
+    if (bracketed) {
+        out[0] = 27; out[1] = 91; out[2] = 50; out[3] = 48; out[4] = 48; out[5] = 126;
+        n = 6;
+    }
+    var i : usize = 0;
+    while (i < text.len and n + 7 < cap) {
+        const b : u8 = text[i];
+        if (b == 27 or b == 0) {
+            i = i + 1;
+        } else if (b == 13 and bracketed == false) {
+            out[n] = 13;
+            n = n + 1;
+            i = i + 1;
+            if (i < text.len and text[i] == 10) { i = i + 1; }
+        } else if (b == 10 and bracketed == false) {
+            out[n] = 13;
+            n = n + 1;
+            i = i + 1;
+        } else {
+            out[n] = b;
+            n = n + 1;
+            i = i + 1;
+        }
+    }
+    if (bracketed) {
+        out[n] = 27; out[n + 1] = 91; out[n + 2] = 50; out[n + 3] = 48; out[n + 4] = 49; out[n + 5] = 126;
+        n = n + 6;
+    }
+    return n;
+}
+
+// ---- copy --------------------------------------------------------------------------------------------------------
+
+/// The selected text: the cells of every selected row as UTF-8, trailing spaces trimmed per row, rows joined by
+/// LF (none after the last). Returns the length; 0 when nothing is selected. A selection longer than out is cut
+/// at a whole cell.
+pub fn ti_sel_text(st: []const u32, cells: []const u32, out: []u8) -> usize {
+    var b : [4]u32 = undefined;
+    if (vt_sel_bounds(st, b[0..4]) == false) { return 0; }
+    const cols : u32 = st[ST_COLS];
+    var n : u32 = 0;
+    var l : u32 = b[0];
+    while (l <= b[2]) {
+        var c0 : u32 = 0;
+        var c1 : u32 = cols - 1;
+        if (l == b[0]) { c0 = b[1]; }
+        if (l == b[2] and b[3] < c1) { c1 = b[3]; }
+        // the last non-blank column of the covered span
+        var last : u32 = c1 + 1;
+        while (last > c0 and vt_line_cell(st, cells, l, last - 1) == BLANK) { last = last - 1; }
+        var x : u32 = c0;
+        while (x < last) {
+            if (@as(usize, n) + 5 > out.len) { return @as(usize, n); }
+            n = tp_utf8(out, n, vt_line_cell(st, cells, l, x));
+            x = x + 1;
+        }
+        if (l < b[2]) {
+            if (@as(usize, n) + 5 > out.len) { return @as(usize, n); }
+            out[n] = 10;
+            n = n + 1;
+        }
+        l = l + 1;
+    }
+    return @as(usize, n);
+}
+
+// ---- the pointer --------------------------------------------------------------------------------------------------
+
+/// The line (history ++ grid) under a point: py is the scene y, oy the pane's top. Mirrors draw_term: view line vy
+/// is drawn at oy + TP_PAD + (vy - 1) * TP_LINE_H + the sub-row shift.
+pub fn ti_line_at(st: []const u32, py: f64, oy: f64) -> u32 {
+    const shift : f64 = @as(f64, vt_view_frac(st)) * TP_LINE_H / @as(f64, VIEW_SUB);
+    const u : f64 = (py - oy - TP_PAD - shift) / TP_LINE_H + 1.0;
+    var vy : u32 = 0;
+    if (u > 0.0) { vy = @as(u32, @intFromFloat(u)); }
+    if (vy == 0 and vt_view_frac(st) == 0) { vy = 1; }
+    if (vy > st[ST_ROWS]) { vy = st[ST_ROWS]; }
+    return vt_line_of_view(st, vy);
+}
+
+/// While the button is down above or below the pane the view scrolls this many sub-rows per event.
+pub const TI_AUTOSCROLL : u32 = 8;
+
+// ---- the right-click menu: COPY, PASTE, SELECT ALL ---------------------------------------------------------------
+
+pub const MENU_NONE : u32 = 0;
+pub const MENU_COPY : u32 = 1;
+pub const MENU_PASTE : u32 = 2;
+pub const MENU_ALL : u32 = 3;
+pub const MENU_W : f64 = 148.0;
+pub const MENU_ROW : f64 = 26.0;
+pub const MENU_PAD : f64 = 5.0;
+pub const MENU_H : f64 = 88.0;
+
+/// The menu's left edge for a right-click at x: kept inside the window.
+pub fn ti_menu_x(x: f64, sw: f64) -> f64 {
+    if (x + MENU_W > sw - 4.0) { return sw - 4.0 - MENU_W; }
+    return x;
+}
+
+pub fn ti_menu_y(y: f64, sh: f64) -> f64 {
+    if (y + MENU_H > sh - 4.0) { return sh - 4.0 - MENU_H; }
+    return y;
+}
+
+/// The row of the menu opened at (mx, my) that a point lands on; MENU_NONE outside it.
+pub fn ti_menu_hit(px: f64, py: f64, mx: f64, my: f64) -> u32 {
+    if (px < mx or px >= mx + MENU_W or py < my + MENU_PAD or py >= my + MENU_PAD + 3.0 * MENU_ROW) { return MENU_NONE; }
+    const r : u32 = @as(u32, @intFromFloat((py - my - MENU_PAD) / MENU_ROW));
+    return r + 1;
+}
+
+// ---- tests: one per key ---------------------------------------------------------------------------------------------
+
+fn tk_bytes_are(n: u32, o: []const u8, a: u8, b: u8, c: u8, d: u8, e: u8) -> bool {
+    // a .. e are the expected bytes, a zero ends the list early
+    var want : u32 = 0;
+    if (a != 0) { want = 1; }
+    if (b != 0) { want = 2; }
+    if (c != 0) { want = 3; }
+    if (d != 0) { want = 4; }
+    if (e != 0) { want = 5; }
+    if (n != want) { return false; }
+    if (want > 0 and o[0] != a) { return false; }
+    if (want > 1 and o[1] != b) { return false; }
+    if (want > 2 and o[2] != c) { return false; }
+    if (want > 3 and o[3] != d) { return false; }
+    if (want > 4 and o[4] != e) { return false; }
+    return true;
+}
+
+test the_plain_keys {
+    var o : [8]u8 = undefined;
+    // Enter sends CR, Tab HT, Backspace DEL, Esc ESC
+    assert tk_bytes_are(tk_key_bytes(VK_RETURN, 13, 0, false, o[0..8]), o[0..8], 13, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_ENTER_PAD, 13, 0, false, o[0..8]), o[0..8], 13, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_TAB, 9, 0, false, o[0..8]), o[0..8], 9, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_DELETE, 127, 0, false, o[0..8]), o[0..8], 127, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_ESCAPE, 27, 0, false, o[0..8]), o[0..8], 27, 0, 0, 0, 0);
+    // a letter, a digit, a space and a non-ASCII letter send themselves
+    assert tk_bytes_are(tk_key_bytes(0, 97, 0, false, o[0..8]), o[0..8], 97, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(18, 49, 0, false, o[0..8]), o[0..8], 49, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(49, 32, 0, false, o[0..8]), o[0..8], 32, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(0, 1092, 0, false, o[0..8]), o[0..8], 209, 132, 0, 0, 0);
+    // Shift types the character AppKit gives it
+    assert tk_bytes_are(tk_key_bytes(0, 65, TK_FLAG_SHIFT, false, o[0..8]), o[0..8], 65, 0, 0, 0, 0);
+    // a modifier alone, and a function-key codepoint with no key of ours, send nothing
+    assert tk_key_bytes(56, 0, TK_FLAG_SHIFT, false, o[0..8]) == 0;
+    assert tk_key_bytes(114, 63235, 0, false, o[0..8]) == 0;
+}
+
+test enter_variants {
+    var o : [8]u8 = undefined;
+    // Shift+Enter and Option+Enter: ESC CR, the sequence Claude Code reads as a new line
+    assert tk_bytes_are(tk_key_bytes(VK_RETURN, 13, TK_FLAG_SHIFT, false, o[0..8]), o[0..8], 27, 13, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RETURN, 13, TK_FLAG_OPTION, false, o[0..8]), o[0..8], 27, 13, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_ENTER_PAD, 13, TK_FLAG_SHIFT, false, o[0..8]), o[0..8], 27, 13, 0, 0, 0);
+    // Control+Enter is still CR
+    assert tk_bytes_are(tk_key_bytes(VK_RETURN, 13, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 13, 0, 0, 0, 0);
+}
+
+test tab_and_shift_tab {
+    var o : [8]u8 = undefined;
+    assert tk_bytes_are(tk_key_bytes(VK_TAB, 9, TK_FLAG_SHIFT, false, o[0..8]), o[0..8], 27, 91, 90, 0, 0);
+}
+
+test arrows_are_csi_or_ss3_by_the_cursor_key_mode {
+    var o : [8]u8 = undefined;
+    assert tk_bytes_are(tk_key_bytes(VK_UP, 63232, 0, false, o[0..8]), o[0..8], 27, 91, 65, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_DOWN, 63233, 0, false, o[0..8]), o[0..8], 27, 91, 66, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RIGHT, 63235, 0, false, o[0..8]), o[0..8], 27, 91, 67, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, 0, false, o[0..8]), o[0..8], 27, 91, 68, 0, 0);
+    // application cursor keys (DECCKM): ESC O A .. D
+    assert tk_bytes_are(tk_key_bytes(VK_UP, 63232, 0, true, o[0..8]), o[0..8], 27, 79, 65, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_DOWN, 63233, 0, true, o[0..8]), o[0..8], 27, 79, 66, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RIGHT, 63235, 0, true, o[0..8]), o[0..8], 27, 79, 67, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, 0, true, o[0..8]), o[0..8], 27, 79, 68, 0, 0);
+}
+
+test a_modified_arrow_carries_the_modifier_parameter {
+    var o : [8]u8 = undefined;
+    // Shift+Up ESC [ 1 ; 2 A, Control+Right ESC [ 1 ; 5 C, also in application mode
+    assert tk_key_bytes(VK_UP, 63232, TK_FLAG_SHIFT, false, o[0..8]) == 6;
+    assert o[0] == 27 and o[1] == 91 and o[2] == 49 and o[3] == 59 and o[4] == 50 and o[5] == 65;
+    assert tk_key_bytes(VK_RIGHT, 63235, TK_FLAG_CONTROL, true, o[0..8]) == 6;
+    assert o[3] == 59 and o[4] == 53 and o[5] == 67;
+    // Option+Up
+    assert tk_key_bytes(VK_UP, 63232, TK_FLAG_OPTION, false, o[0..8]) == 6;
+    assert o[4] == 51;
+}
+
+test option_left_and_right_move_a_word {
+    var o : [8]u8 = undefined;
+    // ESC b and ESC f, in either cursor mode
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, TK_FLAG_OPTION, false, o[0..8]), o[0..8], 27, 98, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RIGHT, 63235, TK_FLAG_OPTION, false, o[0..8]), o[0..8], 27, 102, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, TK_FLAG_OPTION, true, o[0..8]), o[0..8], 27, 98, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RIGHT, 63235, TK_FLAG_OPTION, true, o[0..8]), o[0..8], 27, 102, 0, 0, 0);
+}
+
+test command_left_right_and_backspace_edit_the_line {
+    var o : [8]u8 = undefined;
+    // Cmd+Left -> 0x01, Cmd+Right -> 0x05, Cmd+Backspace -> 0x15
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, TK_FLAG_COMMAND, false, o[0..8]), o[0..8], 1, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_RIGHT, 63235, TK_FLAG_COMMAND, false, o[0..8]), o[0..8], 5, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_DELETE, 127, TK_FLAG_COMMAND, false, o[0..8]), o[0..8], 21, 0, 0, 0, 0);
+    // the application cursor mode changes none of them
+    assert tk_bytes_are(tk_key_bytes(VK_LEFT, 63234, TK_FLAG_COMMAND, true, o[0..8]), o[0..8], 1, 0, 0, 0, 0);
+}
+
+test option_backspace_deletes_a_word {
+    var o : [8]u8 = undefined;
+    assert tk_bytes_are(tk_key_bytes(VK_DELETE, 127, TK_FLAG_OPTION, false, o[0..8]), o[0..8], 27, 127, 0, 0, 0);
+}
+
+test forward_delete_home_end_and_pages {
+    var o : [8]u8 = undefined;
+    // Delete ESC [ 3 ~, Home ESC [ H, End ESC [ F, PgUp ESC [ 5 ~, PgDn ESC [ 6 ~
+    assert tk_bytes_are(tk_key_bytes(VK_FWD_DELETE, 63272, 0, false, o[0..8]), o[0..8], 27, 91, 51, 126, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_HOME, 63273, 0, false, o[0..8]), o[0..8], 27, 91, 72, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_END, 63275, 0, false, o[0..8]), o[0..8], 27, 91, 70, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_PAGE_UP, 63276, 0, false, o[0..8]), o[0..8], 27, 91, 53, 126, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_PAGE_DOWN, 63277, 0, false, o[0..8]), o[0..8], 27, 91, 54, 126, 0);
+    // application cursor keys: Home and End are SS3 H and F
+    assert tk_bytes_are(tk_key_bytes(VK_HOME, 63273, 0, true, o[0..8]), o[0..8], 27, 79, 72, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_END, 63275, 0, true, o[0..8]), o[0..8], 27, 79, 70, 0, 0);
+    // a modifier on Delete: ESC [ 3 ; 2 ~
+    assert tk_key_bytes(VK_FWD_DELETE, 63272, TK_FLAG_SHIFT, false, o[0..8]) == 6;
+    assert o[2] == 51 and o[3] == 59 and o[4] == 50 and o[5] == 126;
+}
+
+test control_letters_fold_to_c0 {
+    var o : [8]u8 = undefined;
+    assert tk_bytes_are(tk_key_bytes(0, 97, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 1, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(8, 99, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 3, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(2, 100, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 4, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(37, 108, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 12, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(6, 122, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 26, 0, 0, 0, 0);
+    // Control+[ is ESC, Control+] GS, Control+space NUL, Control+/ US
+    assert tk_bytes_are(tk_key_bytes(33, 91, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 27, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(30, 93, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 29, 0, 0, 0, 0);
+    assert tk_key_bytes(49, 32, TK_FLAG_CONTROL, false, o[0..8]) == 1 and o[0] == 0;
+    assert tk_bytes_are(tk_key_bytes(44, 47, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 31, 0, 0, 0, 0);
+}
+
+test control_folds_the_key_on_a_russian_layout {
+    var o : [8]u8 = undefined;
+    // Control+C on a Russian layout types U+0441 with key code 8: still ETX; Control+D, Control+L likewise
+    assert tk_bytes_are(tk_key_bytes(8, 1089, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 3, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(2, 1074, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 4, 0, 0, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(37, 1076, TK_FLAG_CONTROL, false, o[0..8]), o[0..8], 12, 0, 0, 0, 0);
+    // without Control the layout's own letter goes out as UTF-8 (U+0441 is D1 81)
+    assert tk_bytes_are(tk_key_bytes(8, 1089, 0, false, o[0..8]), o[0..8], 209, 129, 0, 0, 0);
+    assert tk_ascii_of_key(8) == 99 and tk_ascii_of_key(0) == 97 and tk_ascii_of_key(122) == 0;
+}
+
+test function_keys_f1_to_f12 {
+    var o : [8]u8 = undefined;
+    // F1 .. F4: ESC O P Q R S
+    assert tk_bytes_are(tk_key_bytes(VK_F1, 63236, 0, false, o[0..8]), o[0..8], 27, 79, 80, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_F2, 63237, 0, false, o[0..8]), o[0..8], 27, 79, 81, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_F3, 63238, 0, false, o[0..8]), o[0..8], 27, 79, 82, 0, 0);
+    assert tk_bytes_are(tk_key_bytes(VK_F4, 63239, 0, false, o[0..8]), o[0..8], 27, 79, 83, 0, 0);
+    // F5 .. F12: ESC [ 15 ~ 17 ~ 18 ~ 19 ~ 20 ~ 21 ~ 23 ~ 24 ~
+    assert tk_key_bytes(VK_F5, 63240, 0, false, o[0..8]) == 5;
+    assert o[2] == 49 and o[3] == 53 and o[4] == 126;
+    assert tk_key_bytes(VK_F6, 63241, 0, false, o[0..8]) == 5;
+    assert o[2] == 49 and o[3] == 55 and o[4] == 126;
+    assert tk_key_bytes(VK_F7, 63242, 0, false, o[0..8]) == 5;
+    assert o[2] == 49 and o[3] == 56 and o[4] == 126;
+    assert tk_key_bytes(VK_F8, 63243, 0, false, o[0..8]) == 5;
+    assert o[2] == 49 and o[3] == 57 and o[4] == 126;
+    assert tk_key_bytes(VK_F9, 63244, 0, false, o[0..8]) == 5;
+    assert o[2] == 50 and o[3] == 48 and o[4] == 126;
+    assert tk_key_bytes(VK_F10, 63245, 0, false, o[0..8]) == 5;
+    assert o[2] == 50 and o[3] == 49 and o[4] == 126;
+    assert tk_key_bytes(VK_F11, 63246, 0, false, o[0..8]) == 5;
+    assert o[2] == 50 and o[3] == 51 and o[4] == 126;
+    assert tk_key_bytes(VK_F12, 63247, 0, false, o[0..8]) == 5;
+    assert o[2] == 50 and o[3] == 52 and o[4] == 126;
+    // Shift+F1 carries the parameter: ESC [ 1 ; 2 P
+    assert tk_key_bytes(VK_F1, 63236, TK_FLAG_SHIFT, false, o[0..8]) == 6;
+    assert o[3] == 59 and o[4] == 50 and o[5] == 80;
+    // every F key is told apart from the others
+    assert tk_fkey(VK_F1) == 1 and tk_fkey(VK_F12) == 12 and tk_fkey(0) == 0;
+}
+
+test a_held_key_repeats_the_same_bytes {
+    var a : [8]u8 = undefined;
+    var b : [8]u8 = undefined;
+    // key repeat delivers the same event again: the same bytes each time, in every mode
+    var i : u32 = 0;
+    while (i < 5) {
+        assert tk_key_bytes(VK_LEFT, 63234, 0, false, a[0..8]) == 3;
+        assert tk_key_bytes(VK_LEFT, 63234, 0, false, b[0..8]) == 3;
+        assert a[0] == b[0] and a[1] == b[1] and a[2] == b[2];
+        assert tk_key_bytes(0, 120, 0, false, a[0..8]) == 1 and a[0] == 120;
+        i = i + 1;
+    }
+}
+
+test command_keys_are_the_windows_not_the_ptys {
+    var o : [8]u8 = undefined;
+    // no Command shortcut of the window sends a byte: T W F K + - , and 1 .. 9
+    assert tk_key_bytes(VK_T, 116, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_W, 119, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_F, 102, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_K, 107, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_EQUALS, 61, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_MINUS, 45, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_COMMA, 44, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(18, 49, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(25, 57, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    // nor do copy, paste and select all (the pane answers them), nor Cmd+Return, Cmd+Up, Cmd+F5
+    assert tk_key_bytes(VK_C, 99, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_V, 118, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_A, 97, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_RETURN, 13, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_UP, 63232, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+    assert tk_key_bytes(VK_F5, 63240, TK_FLAG_COMMAND, false, o[0..8]) == 0;
+}
+
+test the_pane_answers_copy_paste_select_all_and_the_window_keeps_its_shortcuts {
+    assert tk_cmd_route(VK_C) == CMD_COPY;
+    assert tk_cmd_route(VK_V) == CMD_PASTE;
+    assert tk_cmd_route(VK_A) == CMD_SELECT_ALL;
+    assert tk_cmd_route(VK_LEFT) == CMD_BYTES and tk_cmd_route(VK_RIGHT) == CMD_BYTES and tk_cmd_route(VK_DELETE) == CMD_BYTES;
+    assert tk_cmd_route(VK_T) == CMD_WINDOW and tk_cmd_route(VK_W) == CMD_WINDOW and tk_cmd_route(VK_F) == CMD_WINDOW;
+    assert tk_cmd_route(VK_K) == CMD_WINDOW and tk_cmd_route(VK_EQUALS) == CMD_WINDOW and tk_cmd_route(VK_MINUS) == CMD_WINDOW;
+    assert tk_cmd_route(VK_COMMA) == CMD_WINDOW;
+    // Cmd+1 .. Cmd+9
+    assert tk_cmd_route(18) == CMD_WINDOW and tk_cmd_route(19) == CMD_WINDOW and tk_cmd_route(20) == CMD_WINDOW;
+    assert tk_cmd_route(21) == CMD_WINDOW and tk_cmd_route(23) == CMD_WINDOW and tk_cmd_route(22) == CMD_WINDOW;
+    assert tk_cmd_route(26) == CMD_WINDOW and tk_cmd_route(28) == CMD_WINDOW and tk_cmd_route(25) == CMD_WINDOW;
+    // any other Command key is dropped
+    assert tk_cmd_route(VK_RETURN) == CMD_DROP and tk_cmd_route(VK_UP) == CMD_DROP and tk_cmd_route(7) == CMD_DROP;
+    // the pane takes only its own four
+    assert tk_cmd_is_pane(VK_C) and tk_cmd_is_pane(VK_V) and tk_cmd_is_pane(VK_A) and tk_cmd_is_pane(VK_LEFT);
+    assert tk_cmd_is_pane(VK_T) == false and tk_cmd_is_pane(18) == false and tk_cmd_is_pane(VK_K) == false;
+}
+
+test the_modifier_flags_decode {
+    assert tk_has(TK_FLAG_SHIFT + TK_FLAG_COMMAND, TK_FLAG_SHIFT);
+    assert tk_has(TK_FLAG_SHIFT + TK_FLAG_COMMAND, TK_FLAG_COMMAND);
+    assert tk_has(TK_FLAG_SHIFT + TK_FLAG_COMMAND, TK_FLAG_OPTION) == false;
+    // Caps Lock (65536) and the arrow keys' function flags (8388608, 2097152) are no modifier we send
+    assert tk_mod_param(65536 + 8388608 + 2097152) == 1;
+    assert tk_mod_param(TK_FLAG_SHIFT + TK_FLAG_OPTION + TK_FLAG_CONTROL) == 8;
+}
+
+test a_paste_is_wrapped_when_the_program_asked_for_it {
+    var o : [64]u8 = undefined;
+    // bracketed: ESC [ 200 ~ text ESC [ 201 ~
+    const n : usize = ti_paste(true, "hi there", o[0..64]);
+    assert n == 6 + 8 + 6;
+    assert o[0] == 27 and o[1] == 91 and o[2] == 50 and o[3] == 48 and o[4] == 48 and o[5] == 126;
+    assert o[6] == 104 and o[13] == 101;
+    assert o[14] == 27 and o[15] == 91 and o[16] == 50 and o[17] == 48 and o[18] == 49 and o[19] == 126;
+    // newlines stay as they are inside the brackets, a pasted ESC is dropped
+    var nl : [3]u8 = undefined;
+    nl[0] = 97; nl[1] = 10; nl[2] = 98;
+    const k : usize = ti_paste(true, nl[0..3], o[0..64]);
+    assert k == 6 + 3 + 6 and o[7] == 10;
+    var raw : [4]u8 = undefined;
+    raw[0] = 97; raw[1] = 27; raw[2] = 98; raw[3] = 0;
+    assert ti_paste(true, raw[0..4], o[0..64]) == 6 + 2 + 6;
+    assert o[6] == 97 and o[7] == 98;
+}
+
+test a_paste_is_raw_otherwise {
+    var o : [64]u8 = undefined;
+    // no wrapping, and line ends are CR, as a terminal types them
+    assert ti_paste(false, "ls", o[0..64]) == 2;
+    assert o[0] == 108 and o[1] == 115;
+    var t : [5]u8 = undefined;
+    t[0] = 97; t[1] = 10; t[2] = 98; t[3] = 13; t[4] = 10;
+    assert ti_paste(false, t[0..5], o[0..64]) == 4;
+    assert o[0] == 97 and o[1] == 13 and o[2] == 98 and o[3] == 13;
+    // an empty paste is empty, wrapped or not
+    assert ti_paste(false, "", o[0..64]) == 0;
+    assert ti_paste(true, "", o[0..64]) == 12;
+}
+
+test a_long_paste_is_cut_to_the_room {
+    var o : [32]u8 = undefined;
+    const n : usize = ti_paste(true, "0123456789012345678901234567890123456789", o[0..32]);
+    assert n <= 32;
+    // the closing bracket is always there
+    assert o[n - 6] == 27 and o[n - 5] == 91 and o[n - 4] == 50 and o[n - 3] == 48 and o[n - 2] == 49 and o[n - 1] == 126;
+}
+
+fn tk_grid(st: []u32, cells: []u32) -> bool {
+    // a 8 x 3 grid with "hello  " / "wor ld" / "" typed into it by hand (no vt feed needed)
+    var i : usize = 0;
+    while (i < 24) { cells[i] = BLANK; i = i + 1; }
+    cells[0] = 104; cells[1] = 101; cells[2] = 108; cells[3] = 108; cells[4] = 111;
+    cells[8] = 119; cells[9] = 111; cells[10] = 114; cells[12] = 108; cells[13] = 100;
+    cells[16] = 233;
+    return true;
+}
+
+test the_selected_text_is_plain_rows_trimmed_and_joined_by_lf {
+    var st : [32]u32 = undefined;
+    var cells : [24]u32 = undefined;
+    var out : [64]u8 = undefined;
+    // vt_init clears the cells, tk_grid then types the text
+    assert vt_init(st[0..32], cells[0..24], 8, 3);
+    tk_grid(st[0..32], cells[0..24]);
+    assert ti_sel_text(st[0..32], cells[0..24], out[0..64]) == 0;
+    // two whole rows: "hello" LF "wor ld", the blanks at the end of each row dropped
+    st[ST_SEL] = 1; st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 0; st[ST_SEL_FL] = 1; st[ST_SEL_FC] = 7; st[ST_SEL_MODE] = 0;
+    const n : usize = ti_sel_text(st[0..32], cells[0..24], out[0..64]);
+    assert n == 12;
+    assert out[0] == 104 and out[4] == 111 and out[5] == 10 and out[6] == 119 and out[8] == 114 and out[9] == 32 and out[11] == 100;
+    // a span inside a row: "ell"
+    st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 1; st[ST_SEL_FL] = 0; st[ST_SEL_FC] = 3;
+    assert ti_sel_text(st[0..32], cells[0..24], out[0..64]) == 3;
+    assert out[0] == 101 and out[2] == 108;
+    // backwards drag: same text
+    st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 3; st[ST_SEL_FL] = 0; st[ST_SEL_FC] = 1;
+    assert ti_sel_text(st[0..32], cells[0..24], out[0..64]) == 3;
+    // a blank row in the middle is an empty line, a multibyte letter is its UTF-8
+    st[ST_SEL_AL] = 1; st[ST_SEL_AC] = 0; st[ST_SEL_FL] = 2; st[ST_SEL_FC] = 7;
+    const m : usize = ti_sel_text(st[0..32], cells[0..24], out[0..64]);
+    assert m == 6 + 1 + 2;
+    assert out[6] == 10 and out[7] == 195 and out[8] == 169;
+    // a trailing blank run at the end of the selection is trimmed too
+    st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 3; st[ST_SEL_FL] = 0; st[ST_SEL_FC] = 7;
+    assert ti_sel_text(st[0..32], cells[0..24], out[0..64]) == 2;
+    // nothing selected, or only an anchor: nothing to copy
+    st[ST_SEL] = 2;
+    assert ti_sel_text(st[0..32], cells[0..24], out[0..64]) == 0;
+}
+
+test the_text_is_cut_at_a_whole_cell {
+    var st : [32]u32 = undefined;
+    var cells : [24]u32 = undefined;
+    var out : [8]u8 = undefined;
+    assert vt_init(st[0..32], cells[0..24], 8, 3);
+    tk_grid(st[0..32], cells[0..24]);
+    st[ST_SEL] = 1; st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 0; st[ST_SEL_FL] = 1; st[ST_SEL_FC] = 7; st[ST_SEL_MODE] = 0;
+    const n : usize = ti_sel_text(st[0..32], cells[0..24], out[0..8]);
+    assert n <= 8 and n >= 3;
+}
+
+test a_point_finds_its_line {
+    var st : [32]u32 = undefined;
+    var cells : [24]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..24], 8, 3);
+    // live view: the first visible line is the grid's row 0, TP_PAD under the pane's top
+    assert ti_line_at(st[0..32], 100.0 + TP_PAD + 1.0, 100.0) == 0;
+    assert ti_line_at(st[0..32], 100.0 + TP_PAD + TP_LINE_H + 1.0, 100.0) == 1;
+    assert ti_line_at(st[0..32], 100.0 + TP_PAD + 2.0 * TP_LINE_H + 1.0, 100.0) == 2;
+    // above the pane's text and far below it stay on the grid
+    assert ti_line_at(st[0..32], 10.0, 100.0) == 0;
+    assert ti_line_at(st[0..32], 5000.0, 100.0) == 2;
+}
+
+test the_right_click_menu_has_three_rows_inside_the_window {
+    // opened at (100, 100): rows COPY, PASTE, SELECT ALL under a 5 pt pad
+    assert ti_menu_hit(110.0, 100.0 + MENU_PAD + 1.0, 100.0, 100.0) == MENU_COPY;
+    assert ti_menu_hit(110.0, 100.0 + MENU_PAD + MENU_ROW + 1.0, 100.0, 100.0) == MENU_PASTE;
+    assert ti_menu_hit(110.0, 100.0 + MENU_PAD + 2.0 * MENU_ROW + 1.0, 100.0, 100.0) == MENU_ALL;
+    assert ti_menu_hit(99.0, 120.0, 100.0, 100.0) == MENU_NONE;
+    assert ti_menu_hit(100.0 + MENU_W, 120.0, 100.0, 100.0) == MENU_NONE;
+    assert ti_menu_hit(110.0, 100.0 + MENU_PAD + 3.0 * MENU_ROW + 1.0, 100.0, 100.0) == MENU_NONE;
+    assert ti_menu_hit(110.0, 101.0, 100.0, 100.0) == MENU_NONE;
+    // near the right and bottom edges the menu moves back inside
+    assert ti_menu_x(900.0, 1000.0) == 1000.0 - 4.0 - MENU_W;
+    assert ti_menu_x(100.0, 1000.0) == 100.0;
+    assert ti_menu_y(790.0, 800.0) == 800.0 - 4.0 - MENU_H;
+    assert MENU_H >= 2.0 * MENU_PAD + 3.0 * MENU_ROW - 1.0;
+}

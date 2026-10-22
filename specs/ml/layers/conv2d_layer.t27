@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // t27/specs/
 // Optimized depthwise convolution | φ² + 1/φ² = 3 | TRINITY
+// Host: gHashTag/trinity apps/website/public/widgets/nn-conv/ (course 10, Neural
+//       networks in t27, lesson 10): its logic.js is the scalar fns of section 3b
+//       compiled to WASM by 999-multibots-telegraf scripts/t27-logic.mjs.
+
+// v2 (2026-10-19, #10612): forward did not slide a kernel. It multiplied one
+// kernel-sized patch elementwise by the weights and added the bias, so the 2 x 2
+// input with the 2 x 2 kernel gave four numbers where a convolution gives one,
+// 1*1 + 2*0.5 + 3*0.25 + 4*0.1 + 0.1 = 3.25, and its test checked the four.
+// forward is now the deep-learning convolution (a 2-D cross-correlation: the
+// kernel is not flipped) over one H x W channel, row-major, with a stride and
+// zero padding; the output side is (n + 2 * padding - kernel) / stride + 1, and
+// the bias is added once per output cell. backward is its sliding gradient.
+// Dilation and groups are carried in the config but not read: the layer assumes
+// dilation 1 and one group. out_size, conv_at, kernel_at, image_at and
+// default_at take and return scalars only, so a host reads the convolution from
+// the compiled spec.
 
 module Conv2d;
     use base::types;
@@ -12,6 +28,13 @@ module Conv2d;
 
     const MIN_KERNEL_SIZE : u32 = 1;
     const MAX_KERNEL_SIZE : u32 = 7;
+
+    // The header note above is v2.
+    pub const VERSION : u8 = 2;
+
+    // The fixed image and kernels of the scalar entry points (section 3b).
+    const IMAGE_SIDE : u32 = 5;
+    const KERNEL_SIDE : u32 = 3;
 
     // ═══════════════════════════════════════════════════════════
     // 2. Types
@@ -39,55 +62,189 @@ module Conv2d;
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // forward(input: []const f32, weights: []const f32, bias: []const f32, output: []f32, config: Conv2DConfig) → void
-    fn forward(input: []const f32, weights: []const f32, bias: []const f32, output: []f32, config: Conv2DConfig) -> void {
-        // Simple 2D convolution implementation
-        var i: u32 = 0;
-        while (i < config.kernel_size) {
-            var j: u32 = 0;
-            while (j < config.kernel_size) {
-                output[i * config.kernel_size + j] = input[i * config.kernel_size + j] * weights[i * config.kernel_size + j];
-                j = j + 1;
-            }
-            i = i + 1;
+    // Output side for an input side n: (n + 2 * padding - kernel) / stride + 1.
+    // 0 when the kernel does not fit the padded input, or the stride or the
+    // kernel is 0, so no caller divides by zero or wraps a u32.
+    fn out_size(n: u32, kernel: u32, stride: u32, padding: u32) -> u32 {
+        if (stride == 0 or kernel == 0 or kernel > n + 2 * padding) {
+            return 0;
         }
-        
-        // Add bias if present
-        if (config.has_bias) {
-            var k: u32 = 0;
-            while (k < config.kernel_size * config.kernel_size) {
-                output[k] = output[k] + bias[0];
-                k = k + 1;
+        return (n + 2 * padding - kernel) / stride + 1;
+    }
+
+    // One output cell (oy, ox) of the cross-correlation: the k x k window whose
+    // top-left corner sits at (oy * stride, ox * stride) of the zero-padded input,
+    // multiplied cell by cell with the kernel (not flipped) and summed. A window
+    // cell outside the input is padding and adds 0. Padded coordinates stay
+    // unsigned: py < padding is the zero band above the input, py - padding >=
+    // height the band below it.
+    fn conv_cell(input: []const f32, height: u32, width: u32, weights: []const f32, config: Conv2DConfig, oy: u32, ox: u32) -> f32 {
+        const k = config.kernel_size;
+        var sum : f32 = 0.0;
+        var ky : u32 = 0;
+        while (ky < k) {
+            const py : u32 = oy * config.stride + ky;
+            var kx : u32 = 0;
+            while (kx < k) {
+                const px : u32 = ox * config.stride + kx;
+                if (py >= config.padding and px >= config.padding and py - config.padding < height and px - config.padding < width) {
+                    sum = sum + input[(py - config.padding) * width + px - config.padding] * weights[ky * k + kx];
+                }
+                kx = kx + 1;
             }
+            ky = ky + 1;
+        }
+        return sum;
+    }
+
+    // forward: one channel, row-major. output[oy * ow + ox] = conv_cell(oy, ox)
+    // plus bias[0] once per output cell when the config has a bias.
+    fn forward(input: []const f32, height: u32, width: u32, weights: []const f32, bias: []const f32, output: []f32, config: Conv2DConfig) -> void {
+        const oh = out_size(height, config.kernel_size, config.stride, config.padding);
+        const ow = out_size(width, config.kernel_size, config.stride, config.padding);
+        var oy : u32 = 0;
+        while (oy < oh) {
+            var ox : u32 = 0;
+            while (ox < ow) {
+                var cell : f32 = conv_cell(input, height, width, weights, config, oy, ox);
+                if (config.has_bias) {
+                    cell = cell + bias[0];
+                }
+                output[oy * ow + ox] = cell;
+                ox = ox + 1;
+            }
+            oy = oy + 1;
         }
     }
 
-    // backward(grad_output: []const f32, input: []const f32, weights: []const f32, grad_input: []f32, grad_weights: []f32, grad_bias: []f32, config: Conv2DConfig) → void
-    fn backward(grad_output: []const f32, input: []const f32, weights: []const f32, grad_input: []f32, grad_weights: []f32, grad_bias: []f32, config: Conv2DConfig) -> void {
-        // Simple backward pass implementation
-        var i: u32 = 0;
-        while (i < config.kernel_size) {
-            var j: u32 = 0;
-            while (j < config.kernel_size) {
-                // Gradient w.r.t input
-                grad_input[i * config.kernel_size + j] = grad_output[i * config.kernel_size + j] * weights[i * config.kernel_size + j];
-                
-                // Gradient w.r.t weights
-                grad_weights[i * config.kernel_size + j] = grad_output[i * config.kernel_size + j] * input[i * config.kernel_size + j];
-                
-                j = j + 1;
-            }
+    // backward of the sliding form. For every output cell o and kernel cell
+    // (ky, kx) whose window cell lands inside the input at (iy, ix):
+    //   grad_input[iy][ix]    += grad_output[o] * weights[ky][kx]
+    //   grad_weights[ky][kx]  += grad_output[o] * input[iy][ix]
+    // Both start at 0. The bias gradient, the sum of grad_output (0 without a
+    // bias), is the return value.
+    fn backward(grad_output: []const f32, input: []const f32, height: u32, width: u32, weights: []const f32, grad_input: []f32, grad_weights: []f32, config: Conv2DConfig) -> f32 {
+        const k = config.kernel_size;
+        const oh = out_size(height, k, config.stride, config.padding);
+        const ow = out_size(width, k, config.stride, config.padding);
+        var i : u32 = 0;
+        while (i < height * width) {
+            grad_input[i] = 0.0;
             i = i + 1;
         }
-        
-        // Gradient w.r.t bias
-        if (config.has_bias) {
-            var k: u32 = 0;
-            while (k < config.kernel_size * config.kernel_size) {
-                grad_bias[0] = grad_bias[0] + grad_output[k];
-                k = k + 1;
-            }
+        var w : u32 = 0;
+        while (w < k * k) {
+            grad_weights[w] = 0.0;
+            w = w + 1;
         }
+        var grad_bias : f32 = 0.0;
+        var oy : u32 = 0;
+        while (oy < oh) {
+            var ox : u32 = 0;
+            while (ox < ow) {
+                const g : f32 = grad_output[oy * ow + ox];
+                var ky : u32 = 0;
+                while (ky < k) {
+                    const py : u32 = oy * config.stride + ky;
+                    var kx : u32 = 0;
+                    while (kx < k) {
+                        const px : u32 = ox * config.stride + kx;
+                        if (py >= config.padding and px >= config.padding and py - config.padding < height and px - config.padding < width) {
+                            const at : u32 = (py - config.padding) * width + px - config.padding;
+                            grad_input[at] = grad_input[at] + g * weights[ky * k + kx];
+                            grad_weights[ky * k + kx] = grad_weights[ky * k + kx] + g * input[at];
+                        }
+                        kx = kx + 1;
+                    }
+                    ky = ky + 1;
+                }
+                if (config.has_bias) {
+                    grad_bias = grad_bias + g;
+                }
+                ox = ox + 1;
+            }
+            oy = oy + 1;
+        }
+        return grad_bias;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 3b. Scalar entry points (the nn-conv widget calls these)
+    // ═══════════════════════════════════════════════════════════
+    // Every parameter and return is u8, u32 or f32, so 999 scripts/t27-logic.mjs
+    // lowers them to WASM; the slice- and struct-taking fns above stay inside.
+
+    // The fixed 5 x 5 image, row-major: a bright 3 x 3 square on a dark ground.
+    //   0 0 0 0 0
+    //   0 1 1 1 0
+    //   0 1 1 1 0
+    //   0 1 1 1 0
+    //   0 0 0 0 0
+    // 0.0 past the end.
+    fn image_at(index: u32) -> f32 {
+        const image : [25]f32 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        if (index >= IMAGE_SIDE * IMAGE_SIDE) {
+            return 0.0;
+        }
+        return image[index];
+    }
+
+    // The four fixed 3 x 3 kernels, row-major. 0 identity, 1 vertical edge
+    // (Sobel x), 2 horizontal edge (Sobel y), 3 box blur (every cell 1/9).
+    // 0.0 for another id or past the end.
+    fn kernel_at(kernel_id: u8, index: u32) -> f32 {
+        const identity : [9]f32 = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        const sobel_x : [9]f32 = [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0];
+        const sobel_y : [9]f32 = [-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0];
+        if (index >= KERNEL_SIDE * KERNEL_SIDE) {
+            return 0.0;
+        }
+        if (kernel_id == 0) {
+            return identity[index];
+        }
+        if (kernel_id == 1) {
+            return sobel_x[index];
+        }
+        if (kernel_id == 2) {
+            return sobel_y[index];
+        }
+        if (kernel_id == 3) {
+            return 1.0 / 9.0;
+        }
+        return 0.0;
+    }
+
+    // Output cell `index` (row-major) of the fixed image convolved with kernel
+    // `kernel_id` at this stride and zero padding, no bias. 0.0 past the end.
+    fn conv_at(kernel_id: u8, stride: u32, padding: u32, index: u32) -> f32 {
+        const side = out_size(IMAGE_SIDE, KERNEL_SIDE, stride, padding);
+        if (index >= side * side) {
+            return 0.0;
+        }
+        var image : [25]f32 = [0.0] ** 25;
+        var i : u32 = 0;
+        while (i < IMAGE_SIDE * IMAGE_SIDE) {
+            image[i] = image_at(i);
+            i = i + 1;
+        }
+        var kernel : [9]f32 = [0.0] ** 9;
+        var j : u32 = 0;
+        while (j < KERNEL_SIDE * KERNEL_SIDE) {
+            kernel[j] = kernel_at(kernel_id, j);
+            j = j + 1;
+        }
+        return conv_cell(&image, IMAGE_SIDE, IMAGE_SIDE, &kernel, config_of(KERNEL_SIDE, stride, padding, false), index / side, index % side);
+    }
+
+    // Output cell `index` of the 2x2 default input under the 2x2 default kernel,
+    // stride 1, padding 0, bias 0.1: one window, so one cell, 3.25. 0.0 past it.
+    fn default_at(index: u32) -> f32 {
+        if (index >= 1) {
+            return 0.0;
+        }
+        var output: [1]f32 = [0.0];
+        forward(default_input(), 2, 2, default_weights(), default_bias(), &output, default_config());
+        return output[index];
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -106,24 +263,8 @@ module Conv2d;
         return [0.1];
     }
 
-    fn default_output() -> []f32 {
-        return [0.0, 0.0, 0.0, 0.0]; // 2x2 output
-    }
-
     fn default_grad_output() -> []const f32 {
-        return [1.0, 1.0, 1.0, 1.0]; // 2x2 gradient
-    }
-
-    fn default_grad_input() -> []f32 {
-        return [0.0, 0.0, 0.0, 0.0]; // 2x2 gradient input
-    }
-
-    fn default_grad_weights() -> []f32 {
-        return [0.0, 0.0, 0.0, 0.0]; // 2x2 gradient weights
-    }
-
-    fn default_grad_bias() -> []f32 {
-        return [0.0]; // 1x1 gradient bias
+        return [1.0]; // gradient of the one output cell
     }
 
     // The input the invariants below are stated over.
@@ -131,50 +272,266 @@ module Conv2d;
         return default_config();
     }
 
-    fn default_config() -> Conv2DConfig {
+    // One channel, dilation 1, one group: the only shape forward reads
+    fn config_of(kernel: u32, stride: u32, padding: u32, has_bias: bool) -> Conv2DConfig {
         return Conv2DConfig {
             in_channels: 1,
             out_channels: 1,
-            kernel_size: 2,
-            stride: 1,
-            padding: 0,
+            kernel_size: kernel,
+            stride: stride,
+            padding: padding,
             dilation: 1,
             groups: 1,
-            has_bias: true,
+            has_bias: has_bias,
         };
+    }
+
+    fn default_config() -> Conv2DConfig {
+        return config_of(2, 1, 0, true);
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Tests (from .tri behaviors)
     // ═══════════════════════════════════════════════════════════
 
-    // The two tests below used `given output = default_output()`, which hands
-    // forward() a constant buffer to write into, and `then result != undefined`
-    // on a void call. Neither could pass once the spec compiled (#6446), so they
-    // write into local buffers and check the values the kernel produces.
+    // v1's two tests checked the elementwise product (output[0] = 1.1,
+    // output[3] = 0.5). A convolution of a 2x2 input with a 2x2 kernel has ONE
+    // window, so ONE output: 1*1 + 2*0.5 + 3*0.25 + 4*0.1 + bias 0.1 = 3.25.
+    // The elementwise fallback writes 1.1 into output[0] and fails here.
     test forward_basic_case {
-        var output: [4]f32 = [0.0, 0.0, 0.0, 0.0];
-        forward(default_input(), default_weights(), default_bias(), &output, default_config());
-        // 2x2 elementwise product plus bias[0]: 1.0 * 1.0 + 0.1 and 4.0 * 0.1 + 0.1
-        assert(output[0] > 1.09);
-        assert(output[0] < 1.11);
-        assert(output[3] > 0.49);
-        assert(output[3] < 0.51);
+        var output: [1]f32 = [9.0];
+        forward(default_input(), 2, 2, default_weights(), default_bias(), &output, default_config());
+        assert(output[0] > 3.249);
+        assert(output[0] < 3.251);
+        assert(default_at(0) > 3.249);
+        assert(default_at(0) < 3.251);
+        assert(default_at(1) == 0.0);
     }
 
+    // The window slides. 3x3 input [1 2 3; 4 5 6; 7 8 9], the default 2x2
+    // kernel [1 0.5; 0.25 0.1], stride 1, padding 0, bias 0.1: 2x2 outputs.
+    //   (0,0) 1*1 + 2*0.5 + 4*0.25 + 5*0.1 + 0.1 = 1 + 1 + 1 + 0.5 + 0.1    = 3.6
+    //   (0,1) 2*1 + 3*0.5 + 5*0.25 + 6*0.1 + 0.1 = 2 + 1.5 + 1.25 + 0.6 + 0.1 = 5.45
+    //   (1,0) 4*1 + 5*0.5 + 7*0.25 + 8*0.1 + 0.1 = 4 + 2.5 + 1.75 + 0.8 + 0.1 = 9.15
+    //   (1,1) 5*1 + 6*0.5 + 8*0.25 + 9*0.1 + 0.1 = 5 + 3 + 2 + 0.9 + 0.1     = 11.0
+    // A flipped kernel gives (0,0) = 1*0.1 + 2*0.25 + 4*0.5 + 5*1 + 0.1 = 7.7.
+    test forward_slides_over_3x3 {
+        const input: [9]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        var output: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+        forward(&input, 3, 3, default_weights(), default_bias(), &output, default_config());
+        assert(output[0] > 3.599);
+        assert(output[0] < 3.601);
+        assert(output[1] > 5.449);
+        assert(output[1] < 5.451);
+        assert(output[2] > 9.149);
+        assert(output[2] < 9.151);
+        assert(output[3] > 10.999);
+        assert(output[3] < 11.001);
+    }
+
+    // One window: grad_output [1] gives grad_input = weights, grad_weights =
+    // input, and backward returns the bias gradient 1.
     test backward_basic_case {
-        var grad_input: [4]f32 = [0.0, 0.0, 0.0, 0.0];
-        var grad_weights: [4]f32 = [0.0, 0.0, 0.0, 0.0];
-        var grad_bias: [1]f32 = [0.0];
-        backward(default_grad_output(), default_input(), default_weights(), &grad_input, &grad_weights, &grad_bias, default_config());
-        // grad_output is all ones: grad_input = weights, grad_weights = input,
-        // grad_bias = the sum of the four ones.
-        assert(grad_input[1] > 0.49);
-        assert(grad_input[1] < 0.51);
-        assert(grad_weights[2] > 2.99);
-        assert(grad_weights[2] < 3.01);
-        assert(grad_bias[0] > 3.99);
-        assert(grad_bias[0] < 4.01);
+        var grad_input: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        var grad_weights: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        const grad_bias = backward(default_grad_output(), default_input(), 2, 2, default_weights(), &grad_input, &grad_weights, default_config());
+        assert(grad_input[1] > 0.499);
+        assert(grad_input[1] < 0.501);
+        assert(grad_weights[2] > 2.999);
+        assert(grad_weights[2] < 3.001);
+        assert(grad_bias > 0.999);
+        assert(grad_bias < 1.001);
+        // without a bias there is no bias gradient
+        assert(backward(default_grad_output(), default_input(), 2, 2, default_weights(), &grad_input, &grad_weights, config_of(2, 1, 0, false)) == 0.0);
+    }
+
+    // The sliding gradient on the 3x3 input, grad_output all ones (4 windows):
+    //   grad_weights[k] = the sum of the input under kernel cell k over the windows
+    //     w00: 1+2+4+5 = 12   w01: 2+3+5+6 = 16   w10: 4+5+7+8 = 24   w11: 5+6+8+9 = 28
+    //   grad_input = the weights each input cell met: corner (0,0) only w00 = 1,
+    //     edge (0,1) w01 + w00 = 1.5, centre (1,1) all four = 1.85
+    //   grad_bias = 4 ones
+    test backward_slides_over_3x3 {
+        const input: [9]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        const grad_output: [4]f32 = [1.0, 1.0, 1.0, 1.0];
+        var grad_input: [9]f32 = [9.0] ** 9;
+        var grad_weights: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        const grad_bias = backward(&grad_output, &input, 3, 3, default_weights(), &grad_input, &grad_weights, default_config());
+        assert(grad_weights[0] > 11.999);
+        assert(grad_weights[0] < 12.001);
+        assert(grad_weights[1] > 15.999);
+        assert(grad_weights[1] < 16.001);
+        assert(grad_weights[2] > 23.999);
+        assert(grad_weights[2] < 24.001);
+        assert(grad_weights[3] > 27.999);
+        assert(grad_weights[3] < 28.001);
+        assert(grad_input[0] > 0.999);
+        assert(grad_input[0] < 1.001);
+        assert(grad_input[1] > 1.499);
+        assert(grad_input[1] < 1.501);
+        assert(grad_input[4] > 1.849);
+        assert(grad_input[4] < 1.851);
+        assert(grad_bias > 3.999);
+        assert(grad_bias < 4.001);
+    }
+
+    // Stride 2: a 4x4 input (cell i holds i), the default 2x2 kernel, grad_output
+    // [1, 2, 3, 4] for the four windows, whose top-left corners are 0, 2, 8, 10.
+    // The windows do not overlap, so each input cell meets one kernel cell once:
+    //   grad_input[5]  = 1 * w11 = 0.1   grad_input[2]  = 2 * w00 = 2
+    //   grad_input[15] = 4 * w11 = 0.4   grad_input[12] = 3 * w10 = 0.75
+    //   grad_weights[0] = 1*0 + 2*2 + 3*8 + 4*10 = 68
+    //   grad_weights[3] = 1*5 + 2*7 + 3*13 + 4*15 = 118
+    //   grad_bias = 1 + 2 + 3 + 4 = 10
+    test backward_strided {
+        var input: [16]f32 = [0.0] ** 16;
+        var i: u32 = 0;
+        while (i < 16) {
+            input[i] = @as(f32, @floatFromInt(i));
+            i = i + 1;
+        }
+        const grad_output: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        var grad_input: [16]f32 = [9.0] ** 16;
+        var grad_weights: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        const grad_bias = backward(&grad_output, &input, 4, 4, default_weights(), &grad_input, &grad_weights, config_of(2, 2, 0, true));
+        assert(grad_input[5] > 0.099);
+        assert(grad_input[5] < 0.101);
+        assert(grad_input[2] > 1.999);
+        assert(grad_input[2] < 2.001);
+        assert(grad_input[15] > 0.399);
+        assert(grad_input[15] < 0.401);
+        assert(grad_input[12] > 0.749);
+        assert(grad_input[12] < 0.751);
+        assert(grad_weights[0] > 67.999);
+        assert(grad_weights[0] < 68.001);
+        assert(grad_weights[3] > 117.999);
+        assert(grad_weights[3] < 118.001);
+        assert(grad_bias > 9.999);
+        assert(grad_bias < 10.001);
+    }
+
+    // Padding 1: the 2x2 default input, the 2x2 kernel, out side 3, grad_output
+    // all ones. With padding k - 1 every input cell meets every kernel cell once:
+    //   grad_input[i]   = w00 + w01 + w10 + w11 = 1.85
+    //   grad_weights[k] = 1 + 2 + 3 + 4 = 10
+    //   grad_bias       = 9 ones
+    // and the forward corner (0,0) sees only input[0] under w11: 1 * 0.1 + 0.1 = 0.2
+    test backward_padded {
+        const grad_output: [9]f32 = [1.0] ** 9;
+        var grad_input: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        var grad_weights: [4]f32 = [9.0, 9.0, 9.0, 9.0];
+        const grad_bias = backward(&grad_output, default_input(), 2, 2, default_weights(), &grad_input, &grad_weights, config_of(2, 1, 1, true));
+        assert(grad_input[0] > 1.849);
+        assert(grad_input[0] < 1.851);
+        assert(grad_input[3] > 1.849);
+        assert(grad_input[3] < 1.851);
+        assert(grad_weights[0] > 9.999);
+        assert(grad_weights[0] < 10.001);
+        assert(grad_weights[3] > 9.999);
+        assert(grad_weights[3] < 10.001);
+        assert(grad_bias > 8.999);
+        assert(grad_bias < 9.001);
+        var output: [9]f32 = [0.0] ** 9;
+        forward(default_input(), 2, 2, default_weights(), default_bias(), &output, config_of(2, 1, 1, true));
+        assert(output[0] > 0.199);
+        assert(output[0] < 0.201);
+        assert(output[4] > 3.249);
+        assert(output[4] < 3.251);
+    }
+
+    // (n + 2p - k) / s + 1: 5x5 with 3x3 is 3 at stride 1, 5 with padding 1, 3 at
+    // stride 2 and padding 1; the 2x2 default is 1; a kernel larger than the
+    // padded input, or stride 0, gives 0
+    test out_size_formula
+        given valid = out_size(5, 3, 1, 0)
+        when strided = out_size(5, 3, 2, 1)
+        then valid == 3 and strided == 3 and out_size(5, 3, 1, 1) == 5 and out_size(2, 2, 1, 0) == 1 and out_size(2, 3, 1, 0) == 0 and out_size(5, 3, 0, 0) == 0 and out_size(4, 2, 2, 0) == 2
+
+    // The widget's image and kernels, as the issue fixes them
+    test image_and_kernels_are_the_fixtures
+        given centre = image_at(12)
+        when corner = image_at(0)
+        then centre == 1.0 and corner == 0.0 and image_at(6) == 1.0 and image_at(18) == 1.0 and image_at(19) == 0.0 and image_at(25) == 0.0 and kernel_at(0, 4) == 1.0 and kernel_at(0, 0) == 0.0 and kernel_at(1, 0) == -1.0 and kernel_at(1, 5) == 2.0 and kernel_at(2, 1) == -2.0 and kernel_at(2, 7) == 2.0 and kernel_at(1, 9) == 0.0 and kernel_at(4, 4) == 0.0
+
+    // Row 1 of #10612: Sobel x, stride 1, padding 0 -> 3 x 3:
+    // 3, 0, -3, 4, 0, -4, 3, 0, -3
+    test conv_sobel_x_valid {
+        assert(conv_at(1, 1, 0, 0) == 3.0);
+        assert(conv_at(1, 1, 0, 1) == 0.0);
+        assert(conv_at(1, 1, 0, 2) == -3.0);
+        assert(conv_at(1, 1, 0, 3) == 4.0);
+        assert(conv_at(1, 1, 0, 4) == 0.0);
+        assert(conv_at(1, 1, 0, 5) == -4.0);
+        assert(conv_at(1, 1, 0, 6) == 3.0);
+        assert(conv_at(1, 1, 0, 7) == 0.0);
+        assert(conv_at(1, 1, 0, 8) == -3.0);
+        assert(conv_at(1, 1, 0, 9) == 0.0);
+    }
+
+    // Row 2: Sobel y, stride 1, padding 0 -> 3 x 3:
+    // 3, 4, 3, 0, 0, 0, -3, -4, -3
+    test conv_sobel_y_valid {
+        assert(conv_at(2, 1, 0, 0) == 3.0);
+        assert(conv_at(2, 1, 0, 1) == 4.0);
+        assert(conv_at(2, 1, 0, 2) == 3.0);
+        assert(conv_at(2, 1, 0, 3) == 0.0);
+        assert(conv_at(2, 1, 0, 4) == 0.0);
+        assert(conv_at(2, 1, 0, 5) == 0.0);
+        assert(conv_at(2, 1, 0, 6) == -3.0);
+        assert(conv_at(2, 1, 0, 7) == -4.0);
+        assert(conv_at(2, 1, 0, 8) == -3.0);
+    }
+
+    // Row 3: box blur, stride 1, padding 0 -> 3 x 3: the corners see 4 bright
+    // cells (4/9), the edges 6 (6/9), the centre all 9 (1). Within 0.001: nine
+    // f32 ninths do not sum to exactly 1.
+    test conv_box_blur_valid {
+        var i: u32 = 0;
+        while (i < 9) {
+            var want: f32 = 6.0 / 9.0;
+            if (i == 0 or i == 2 or i == 6 or i == 8) {
+                want = 4.0 / 9.0;
+            }
+            if (i == 4) {
+                want = 1.0;
+            }
+            assert(conv_at(3, 1, 0, i) - want < 0.001);
+            assert(conv_at(3, 1, 0, i) - want > -0.001);
+            i = i + 1;
+        }
+    }
+
+    // Row 4: identity, stride 1, padding 1 -> 5 x 5: the image itself, and
+    // cell 25 is past the end
+    test conv_identity_padded_is_the_image {
+        var i: u32 = 0;
+        while (i < 25) {
+            assert(conv_at(0, 1, 1, i) == image_at(i));
+            i = i + 1;
+        }
+        assert(conv_at(0, 1, 1, 6) == 1.0);
+        assert(conv_at(0, 1, 1, 0) == 0.0);
+        assert(conv_at(0, 1, 1, 25) == 0.0);
+    }
+
+    // Row 5: Sobel x, stride 2, padding 1 -> 3 x 3:
+    // 1, 0, -1, 4, 0, -4, 1, 0, -1
+    test conv_sobel_x_strided_padded {
+        assert(conv_at(1, 2, 1, 0) == 1.0);
+        assert(conv_at(1, 2, 1, 1) == 0.0);
+        assert(conv_at(1, 2, 1, 2) == -1.0);
+        assert(conv_at(1, 2, 1, 3) == 4.0);
+        assert(conv_at(1, 2, 1, 4) == 0.0);
+        assert(conv_at(1, 2, 1, 5) == -4.0);
+        assert(conv_at(1, 2, 1, 6) == 1.0);
+        assert(conv_at(1, 2, 1, 7) == 0.0);
+        assert(conv_at(1, 2, 1, 8) == -1.0);
+    }
+
+    // The header says v2 (2026-10-19, #10612); VERSION must say the same
+    test version_is_the_header_note {
+        var v: u8 = VERSION;
+        assert(v == 2);
     }
 
     // ═══════════════════════════════════════════════════════════

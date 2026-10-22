@@ -1,0 +1,790 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/t27os_uart_shell_ax7203.t27 -- T27 OS over UART: the pane logic of T27 OS runs on the ALINX AX7203
+; Owner, 2026-10-19: "ideally T27 OS should run on the FPGA". T27 OS (epic #10782) is a native window with a
+; sidebar and terminal panes, backed by a PTY server. Its window, its forkpty and its keychain are host-bound;
+; its decisions are not. This board cell is the decisions: four agent panes whose herdr status (WORKING,
+; BLOCKED, IDLE, DONE) is advanced by t27os::pane_step -- the very function the PTY server calls -- and a text
+; screen that the board draws as VT100 on its UART, so any terminal, the T27 OS window's terminal pane included,
+; shows the screen driven by silicon. docs/fpga/T27OS_ON_FPGA_FEASIBILITY.md is the analysis and the plan.
+; -
+; REUSE, NOT COPIES. pane_step, shown_state and pane_needs_you come from specs/t27os/pane_state.t27 by `use`;
+; the state numbers S_* from specs/t27os/agents.t27; hex_digit from specs/fpga/board_receipt.t27. The tests feed
+; the board's byte stream into specs/t27os/vt.t27, the T27 OS terminal grid, and read the grid back: the screen
+; the board draws is the screen the T27 OS terminal pane would show. vt.t27 uses slices and loops, so it is a
+; test-side reader only; it is not lowered onto the board (the board only writes bytes, it never parses them).
+; -
+; THE SCREEN. 30 columns, 8 lines, redrawn forever, home-cursor first (ESC [ H), no clear, so it does not flicker:
+;   T27 OS @ AX7203 t=0005
+;   SPACES 1:core 2:fpga 3:hdl
+;   AGENTS (herdr states)
+;   > 1 Claude   WORKING
+;     2 Codex    IDLE
+;     3 Gemini   BLOCKED  !
+;     4 OpenCode DONE     *
+;   keys 1-4 s k n r t o q x
+; "t=" is the number of events the panes have taken (4 hex digits). ">" marks the selected pane, "!" a pane that
+; needs you (blocked), "*" a pane whose finished turn nobody has seen (shown DONE). Every line is 32 bytes (30
+; characters, CR, LF); the first segment is the 3-byte home sequence. 259 bytes a frame, about 44 frames a second.
+; -
+; THE EVENTS. Two sources feed pane_step, one event a clock at most:
+;   1. a built-in script, one step every tick_div clocks (0.5 s at 100 MHz), 16 steps in a loop: it spawns the four
+;      panes, walks a Claude-like pane through submit / stop / seen, an un-hooked pane through output / quiet, a
+;      pane through a permission prompt and the answer, and a pane through exit and respawn;
+;   2. the UART receiver, 115200 8N1 on P20: keys 1-4 select a pane, and s k n r t o q x z send the selected pane
+;      the event SEEN, KEY, HOOK_NOTIFY, HOOK_SUBMIT, HOOK_STOP, OUTPUT, QUIET, EXIT_OK, SPAWNED. The key wins a
+;      clash with the script (one clock in 5e7; the script's event for that step is lost).
+; -
+; THE CLOCK. 100 MHz from a PLL on the 200 MHz oscillator, UART divider 868 (115207 baud), as rc_filter_ax7203. The
+; button T6 (active low) resets every pane to STOPPED and restarts the script. LEDs (active low): B13 a pane is
+; blocked, C13 a pane is working, D14 a pane shows DONE, D15 a heartbeat.
+; -
+; WHAT A PASS SAYS. The RTL `t27b verilog` lowers from this file, driven in simulation, puts on the UART exactly the
+; bytes the spec's screen function gives, which the T27 OS vt grid reads as the screen above; and pane_step is the
+; one in pane_state.t27. WHAT IT DOES NOT SAY. Nothing about the AppKit window, the PTY server, forkpty or the
+; keychain: those stay on the host. Nothing about a real agent: the events are a script and the keyboard. A
+; bitstream from this file has not been shown to run on the bench board unless the PR that carries it says so.
+; ASCII only, English only.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module FpgaT27osUartShell;
+
+use fpga::board_receipt;
+use t27os::agents::S_STOPPED;
+use t27os::agents::S_WORKING;
+use t27os::agents::S_BLOCKED;
+use t27os::agents::S_IDLE;
+use t27os::agents::S_DONE;
+use t27os::pane_state::P_HOOK_START;
+use t27os::pane_state::P_HOOK_SUBMIT;
+use t27os::pane_state::P_HOOK_NOTIFY;
+use t27os::pane_state::P_HOOK_STOP;
+use t27os::pane_state::P_OUTPUT;
+use t27os::pane_state::P_QUIET;
+use t27os::pane_state::P_KEY;
+use t27os::pane_state::P_SEEN;
+use t27os::pane_state::P_EXIT_OK;
+use t27os::pane_state::P_SPAWNED;
+use t27os::pane_state::pane_step;
+use t27os::pane_state::shown_state;
+use t27os::pane_state::pane_needs_you;
+use t27os::pane_state::ps_state;
+use t27os::pane_state::ps_unseen;
+use t27os::vt::vt_init;
+use t27os::vt::vt_feed;
+use t27os::vt::vt_cell;
+
+pub const KIND : str = "board-cell";
+pub const ID : str = "fpga/t27os_uart_shell_ax7203";
+pub const REFERENCE : str = "specs/t27os/pane_state.t27, specs/t27os/agents.t27, specs/t27os/vt.t27";
+pub const BOARD : str = "ALINX AX7203";
+pub const PART : str = "xc7a200tfbg484-2";
+
+pub const PANES : u8 = 4;
+pub const NOEV : u32 = 15;
+pub const SEGS : u8 = 9;
+pub const COLS : u32 = 32;
+pub const FRAME_BYTES : u32 = 259;
+pub const SCRIPT_LEN : u8 = 16;
+pub const BAUD_DIV : u16 = 868;
+pub const TICK_DIV : u32 = 50000000;
+
+; --- the text: ASCII packed 8 to a u64, first character in the high byte -------------------------
+pub const NAME_CLAUDE : u64 = 0x436c617564652020;
+pub const NAME_CODEX : u64 = 0x436f646578202020;
+pub const NAME_GEMINI : u64 = 0x47656d696e692020;
+pub const NAME_OPENCODE : u64 = 0x4f70656e436f6465;
+pub const STATE_STOPPED : u64 = 0x53544f5050454420;
+pub const STATE_WORKING : u64 = 0x574f524b494e4720;
+pub const STATE_BLOCKED : u64 = 0x424c4f434b454420;
+pub const STATE_IDLE : u64 = 0x49444c4520202020;
+pub const STATE_DONE : u64 = 0x444f4e4520202020;
+
+/// Byte i (0..7) of a packed word, first character first.
+pub fn pk(w: u64, i: u8) -> u8 {
+    return ((w >> ((7 - (i & 7)) * 8)) & 255) as u8;
+}
+
+/// The packed name of agent pane i.
+pub fn name_of(i: u8) -> u64 {
+    if (i == 0) { return NAME_CLAUDE; }
+    if (i == 1) { return NAME_CODEX; }
+    if (i == 2) { return NAME_GEMINI; }
+    return NAME_OPENCODE;
+}
+
+/// The packed name of a herdr state (agents.t27 S_*).
+pub fn state_name(s: u32) -> u64 {
+    if (s == S_WORKING) { return STATE_WORKING; }
+    if (s == S_BLOCKED) { return STATE_BLOCKED; }
+    if (s == S_IDLE) { return STATE_IDLE; }
+    if (s == S_DONE) { return STATE_DONE; }
+    return STATE_STOPPED;
+}
+
+/// The four 8-byte chunks of the static lines, 30 characters then CR LF. Segment 1 is the title (its hex digits
+/// are written over t= by screen_char), 2 the spaces, 3 the agents header, 8 the key legend.
+pub fn static_chunk(seg: u8, c: u8) -> u64 {
+    if (seg == 1) {
+        if (c == 0) { return 0x543237204f532040; }
+        if (c == 1) { return 0x2041583732303320; }
+        if (c == 2) { return 0x743d202020202020; }
+        return 0x2020202020200d0a;
+    }
+    if (seg == 2) {
+        if (c == 0) { return 0x5350414345532031; }
+        if (c == 1) { return 0x3a636f726520323a; }
+        if (c == 2) { return 0x6670676120333a68; }
+        return 0x646c202020200d0a;
+    }
+    if (seg == 3) {
+        if (c == 0) { return 0x4147454e54532028; }
+        if (c == 1) { return 0x6865726472207374; }
+        if (c == 2) { return 0x6174657329202020; }
+        return 0x2020202020200d0a;
+    }
+    if (c == 0) { return 0x6b65797320312d34; }
+    if (c == 1) { return 0x2073206b206e2072; }
+    if (c == 2) { return 0x2074206f20712078; }
+    return 0x2020202020200d0a;
+}
+
+/// Character pos of the line of agent pane i whose status word is w; sel is the selected pane.
+pub fn row_char(i: u8, pos: u8, sel: u8, w: u32) -> u8 {
+    if (pos == 0) {
+        if (sel == i) { return 62; }
+        return 32;
+    }
+    if (pos == 2) { return 49 + i; }
+    if (pos >= 4 and pos <= 11) { return pk(name_of(i), pos - 4); }
+    if (pos >= 13 and pos <= 19) { return pk(state_name(shown_state(w)), pos - 13); }
+    if (pos == 21) {
+        if (pane_needs_you(w)) { return 33; }
+        if (shown_state(w) == S_DONE) { return 42; }
+        return 32;
+    }
+    if (pos == 30) { return 13; }
+    if (pos == 31) { return 10; }
+    return 32;
+}
+
+/// The last position of segment s: the home sequence is 3 bytes, every line 32.
+pub fn seg_last(s: u8) -> u8 {
+    if (s == 0) { return 2; }
+    return 31;
+}
+
+/// The status word of pane i out of the four.
+pub fn word_of(i: u8, w0: u32, w1: u32, w2: u32, w3: u32) -> u32 {
+    if (i == 0) { return w0; }
+    if (i == 1) { return w1; }
+    if (i == 2) { return w2; }
+    return w3;
+}
+
+/// Byte pos of segment seg of the screen; evn is the event count shown as t=.
+pub fn screen_char(seg: u8, pos: u8, sel: u8, w0: u32, w1: u32, w2: u32, w3: u32, evn: u16) -> u8 {
+    if (seg == 0) {
+        if (pos == 0) { return 27; }
+        if (pos == 1) { return 91; }
+        return 72;
+    }
+    if (seg >= 4 and seg <= 7) { return row_char(seg - 4, pos, sel, word_of(seg - 4, w0, w1, w2, w3)); }
+    if (seg == 1 and pos >= 18 and pos <= 21) { return hex_digit((evn >> ((21 - pos) * 4)) as u8); }
+    if (seg == 8) { return pk(static_chunk(8, pos >> 3), pos & 7); }
+    return pk(static_chunk(seg, pos >> 3), pos & 7);
+}
+
+/// The pane the script's step n sends its event to.
+pub fn script_pane(n: u8) -> u8 {
+    if (n == 0) { return 0; }
+    if (n == 1) { return 1; }
+    if (n == 2) { return 2; }
+    if (n == 3) { return 3; }
+    if (n == 4) { return 0; }
+    if (n == 5) { return 1; }
+    if (n == 6) { return 2; }
+    if (n == 7) { return 2; }
+    if (n == 8) { return 0; }
+    if (n == 9) { return 1; }
+    if (n == 10) { return 3; }
+    if (n == 11) { return 3; }
+    if (n == 12) { return 2; }
+    if (n == 13) { return 0; }
+    if (n == 14) { return 2; }
+    return 3;
+}
+
+/// The event of the script's step n.
+pub fn script_ev(n: u8) -> u32 {
+    if (n < 4) { return P_SPAWNED; }
+    if (n == 4) { return P_HOOK_SUBMIT; }
+    if (n == 5) { return P_OUTPUT; }
+    if (n == 6) { return P_HOOK_SUBMIT; }
+    if (n == 7) { return P_HOOK_NOTIFY; }
+    if (n == 8) { return P_HOOK_STOP; }
+    if (n == 9) { return P_QUIET; }
+    if (n == 10) { return P_OUTPUT; }
+    if (n == 11) { return P_EXIT_OK; }
+    if (n == 12) { return P_KEY; }
+    if (n == 13) { return P_SEEN; }
+    if (n == 14) { return P_HOOK_STOP; }
+    return P_SPAWNED;
+}
+
+/// The event a keyboard byte stands for; NOEV when the byte is not an event key.
+pub fn key_event(b: u8) -> u32 {
+    if (b == 115) { return P_SEEN; }
+    if (b == 107) { return P_KEY; }
+    if (b == 110) { return P_HOOK_NOTIFY; }
+    if (b == 114) { return P_HOOK_SUBMIT; }
+    if (b == 116) { return P_HOOK_STOP; }
+    if (b == 111) { return P_OUTPUT; }
+    if (b == 113) { return P_QUIET; }
+    if (b == 120) { return P_EXIT_OK; }
+    if (b == 122) { return P_SPAWNED; }
+    return NOEV;
+}
+
+/// A UART frame, sent low bit first: a start bit 0, the 8 data bits, a stop bit 1.
+pub fn frame(ch: u8) -> u16 {
+    return ((ch as u16) << 1) | 512;
+}
+
+; --- the board ----------------------------------------------------------------------------------
+
+/// A differential input buffer (the 200 MHz oscillator on R4/T4).
+pub struct IbufdsOut { O: bool }
+pub fn IBUFDS(I: bool, IB: bool) -> IbufdsOut {}
+
+/// A global clock buffer.
+pub struct BufgOut { O: bool }
+pub fn BUFG(I: bool) -> BufgOut {}
+
+/// A PLL: 200 MHz in, VCO = 200 * 8 = 1600 MHz, CLKOUT0 = 1600 / 16 = 100 MHz; CLKFBOUT feeds CLKFBIN.
+pub struct PllOut { CLKOUT0: bool, CLKFBOUT: bool, LOCKED: bool }
+pub fn PLLE2_ADV(CLKIN1: bool, CLKFBIN: bool, RST: bool, PWRDWN: bool, CLKIN1_PERIOD: f64, REF_JITTER1: f64, CLKFBOUT_MULT: comptime_int, DIVCLK_DIVIDE: comptime_int, CLKOUT0_DIVIDE: comptime_int, CLKOUT0_PHASE: comptime_int, COMPENSATION: str) -> PllOut {}
+
+/// An input buffer, so the button and the UART line reach on_clock as instance outputs.
+pub struct IbufOut { O: bool }
+pub fn IBUF(I: bool) -> IbufOut {}
+
+; --- the pins in --------------------------------------------------------------------------------
+const clk200_p : bool = undefined;
+const clk200_p_LOC : str = "R4";
+const clk200_p_IOSTANDARD : str = "DIFF_SSTL15";
+const clk200_n : bool = undefined;
+const clk200_n_LOC : str = "T4";
+const clk200_n_IOSTANDARD : str = "DIFF_SSTL15";
+const cpu_reset_n : bool = undefined;
+const cpu_reset_n_LOC : str = "T6";
+const cpu_reset_n_IOSTANDARD : str = "LVCMOS15";
+const uart_rx : bool = undefined;
+const uart_rx_LOC : str = "P20";
+const uart_rx_IOSTANDARD : str = "LVCMOS33";
+
+; --- the clock and the reset --------------------------------------------------------------------
+const clkbuf : IbufdsOut = IBUFDS(clk200_p, clk200_n);
+const clkbuf_O_PERIOD_PS : u32 = 5000;
+const pll : PllOut = PLLE2_ADV(clkbuf.O, pll.CLKFBOUT, false, false, 5.0, 0.01, 8, 1, 16, 0, "FALSE");
+const gclk : BufgOut = BUFG(pll.CLKOUT0);
+const gclk_O_PERIOD_PS : u32 = 10000;
+
+const btn : IbufOut = IBUF(cpu_reset_n);
+const rxb : IbufOut = IBUF(uart_rx);
+
+// No asynchronous reset, as rc_filter_ax7203: the button and LOCKED pass two registers, and while they say no,
+// on_clock puts every register back to its start on the edge.
+const clk : bool = gclk.O;
+const rst_n : bool = true;
+const en : bool = true;
+
+; --- the registers ------------------------------------------------------------------------------
+var w0 : u32 = 0;
+var w1 : u32 = 0;
+var w2 : u32 = 0;
+var w3 : u32 = 0;
+var sel : u8 = 0;
+var evn : u16 = 0;
+var pend_p : u8 = 0;
+var pend_e : u32 = 15;
+var scr : u8 = 0;
+var tmr : u32 = 0;
+var tick_div : u32 = 50000000;
+var baud_div : u16 = 868;
+var tx_cnt : u16 = 0;
+var tx_sh : u16 = 1023;
+var tx_left : u8 = 0;
+var seg : u8 = 0;
+var pos : u8 = 0;
+var frames : u32 = 0;
+var rx_busy : bool = false;
+var rx_cnt : u16 = 0;
+var rx_nb : u8 = 0;
+var rx_sh : u8 = 0;
+var rx_key : u8 = 0;
+var rx_new : bool = false;
+var rx_s0 : bool = true;
+var rx_s1 : bool = true;
+var hb : u32 = 0;
+var go0 : bool = false;
+var go1 : bool = false;
+
+; --- the pins out: registers, set from the state one clock later (a pub var is an output reg) ----
+pub var uart_tx : bool = true;
+const uart_tx_LOC : str = "N15";
+const uart_tx_IOSTANDARD : str = "LVCMOS33";
+pub var led_0 : bool = true;
+const led_0_LOC : str = "B13";
+const led_0_IOSTANDARD : str = "LVCMOS33";
+pub var led_1 : bool = true;
+const led_1_LOC : str = "C13";
+const led_1_IOSTANDARD : str = "LVCMOS33";
+pub var led_2 : bool = true;
+const led_2_LOC : str = "D14";
+const led_2_IOSTANDARD : str = "LVCMOS33";
+pub var led_3 : bool = false;
+const led_3_LOC : str = "D15";
+const led_3_IOSTANDARD : str = "LVCMOS33";
+
+// Every var is read before it is written, so the test's order and the clock edge agree: the transmitter reads the
+// panes first, then the pending event is applied, then the script and the keyboard queue the next one.
+fn on_clock(pll_LOCKED: bool, btn_O: bool, rxb_O: bool) {
+    uart_tx = (tx_sh & 1) == 1;
+    led_0 = !(pane_needs_you(w0) or pane_needs_you(w1) or pane_needs_you(w2) or pane_needs_you(w3));
+    led_1 = !(ps_state(w0) == S_WORKING or ps_state(w1) == S_WORKING or ps_state(w2) == S_WORKING or ps_state(w3) == S_WORKING);
+    led_2 = !(shown_state(w0) == S_DONE or shown_state(w1) == S_DONE or shown_state(w2) == S_DONE or shown_state(w3) == S_DONE);
+    led_3 = ((hb >> 27) & 1) == 1;
+    hb = hb + 1;
+    if (!go1) {
+        w0 = 0;
+        w1 = 0;
+        w2 = 0;
+        w3 = 0;
+        sel = 0;
+        evn = 0;
+        pend_p = 0;
+        pend_e = NOEV;
+        scr = 0;
+        tmr = 0;
+        tx_cnt = 0;
+        tx_sh = 1023;
+        tx_left = 0;
+        seg = 0;
+        pos = 0;
+        frames = 0;
+        rx_busy = false;
+        rx_cnt = 0;
+        rx_nb = 0;
+        rx_sh = 0;
+        rx_key = 0;
+        rx_new = false;
+    } else {
+        // the transmitter: one byte every ten bit times, the screen over and over
+        if (tx_cnt != 0) {
+            tx_cnt = tx_cnt - 1;
+        } else {
+            tx_cnt = baud_div - 1;
+            if (tx_left != 0) {
+                tx_sh = (tx_sh >> 1) | 512;
+                tx_left = tx_left - 1;
+            } else {
+                tx_sh = frame(screen_char(seg, pos, sel, w0, w1, w2, w3, evn));
+                tx_left = 9;
+                if (pos == seg_last(seg)) {
+                    pos = 0;
+                    if (seg == SEGS - 1) {
+                        seg = 0;
+                        frames = frames + 1;
+                    } else {
+                        seg = seg + 1;
+                    }
+                } else {
+                    pos = pos + 1;
+                }
+            }
+        }
+        // the queued event reaches its pane
+        if (pend_e != NOEV) {
+            if (pend_p == 0) {
+                w0 = pane_step(w0, pend_e);
+            } else if (pend_p == 1) {
+                w1 = pane_step(w1, pend_e);
+            } else if (pend_p == 2) {
+                w2 = pane_step(w2, pend_e);
+            } else {
+                w3 = pane_step(w3, pend_e);
+            }
+            evn = evn + 1;
+            pend_e = NOEV;
+        }
+        // the script queues its next event
+        if (tmr + 1 >= tick_div) {
+            tmr = 0;
+            pend_p = script_pane(scr);
+            pend_e = script_ev(scr);
+            if (scr == SCRIPT_LEN - 1) {
+                scr = 0;
+            } else {
+                scr = scr + 1;
+            }
+        } else {
+            tmr = tmr + 1;
+        }
+        // a received key selects a pane or queues an event for the selected one
+        if (rx_new) {
+            rx_new = false;
+            if (rx_key >= 49 and rx_key <= 52) {
+                sel = rx_key - 49;
+            } else if (key_event(rx_key) != NOEV) {
+                pend_p = sel;
+                pend_e = key_event(rx_key);
+            }
+        }
+        // the receiver: 8N1, sampled in the middle of each bit
+        if (rx_busy) {
+            if (rx_cnt != 0) {
+                rx_cnt = rx_cnt - 1;
+            } else {
+                rx_cnt = baud_div - 1;
+                if (rx_nb == 8) {
+                    rx_busy = false;
+                    rx_key = rx_sh;
+                    rx_new = true;
+                } else {
+                    if (rx_s1) {
+                        rx_sh = (rx_sh >> 1) | 128;
+                    } else {
+                        rx_sh = rx_sh >> 1;
+                    }
+                    rx_nb = rx_nb + 1;
+                }
+            }
+        } else if (!rx_s1) {
+            rx_busy = true;
+            rx_cnt = baud_div + (baud_div >> 1) - 1;
+            rx_nb = 0;
+            rx_sh = 0;
+        }
+    }
+    rx_s1 = rx_s0;
+    rx_s0 = rxb_O;
+    go1 = go0;
+    go0 = pll_LOCKED and btn_O;
+}
+
+; --- the tests ----------------------------------------------------------------------------------
+
+test the_packed_words_spell_the_names_and_states {
+    assert_eq(pk(NAME_CLAUDE, 0), 67);
+    assert_eq(pk(NAME_CLAUDE, 5), 101);
+    assert_eq(pk(NAME_CODEX, 4), 120);
+    assert_eq(pk(NAME_OPENCODE, 7), 101);
+    assert_eq(pk(STATE_WORKING, 0), 87);
+    assert_eq(pk(STATE_BLOCKED, 6), 68);
+    assert_eq(pk(STATE_IDLE, 3), 69);
+    assert_eq(pk(STATE_IDLE, 4), 32);
+    assert_eq(pk(STATE_DONE, 0), 68);
+    assert_eq(pk(STATE_STOPPED, 0), 83);
+    assert_eq(state_name(S_STOPPED), STATE_STOPPED);
+    assert_eq(state_name(S_WORKING), STATE_WORKING);
+    assert_eq(state_name(S_BLOCKED), STATE_BLOCKED);
+    assert_eq(state_name(S_IDLE), STATE_IDLE);
+    assert_eq(state_name(S_DONE), STATE_DONE);
+}
+
+test the_script_walks_the_panes_through_the_herdr_states {
+    var a : u32 = 0;
+    var b : u32 = 0;
+    var c : u32 = 0;
+    var d : u32 = 0;
+    var n : u8 = 0;
+    var mid : bool = false;
+    while (n < SCRIPT_LEN) {
+        const p : u8 = script_pane(n);
+        const e : u32 = script_ev(n);
+        if (p == 0) { a = pane_step(a, e); }
+        if (p == 1) { b = pane_step(b, e); }
+        if (p == 2) { c = pane_step(c, e); }
+        if (p == 3) { d = pane_step(d, e); }
+        if (n == 7) {
+            // after the permission prompt: pane 2 needs you, pane 0 works, pane 1 works un-hooked
+            assert pane_needs_you(c);
+            assert_eq(shown_state(a), S_WORKING);
+            assert_eq(shown_state(b), S_WORKING);
+            mid = true;
+        }
+        if (n == 8) { assert_eq(shown_state(a), S_DONE); }
+        n = n + 1;
+    }
+    assert mid;
+    // the end of the loop: pane 0 saw its finished turn, pane 1 went quiet, pane 2 finished unseen, pane 3 respawned
+    assert_eq(shown_state(a), S_IDLE);
+    assert_eq(shown_state(b), S_IDLE);
+    assert_eq(shown_state(c), S_DONE);
+    assert ps_unseen(c);
+    assert_eq(shown_state(d), S_IDLE);
+}
+
+test the_keys_map_to_events {
+    assert_eq(key_event(115), P_SEEN);
+    assert_eq(key_event(107), P_KEY);
+    assert_eq(key_event(110), P_HOOK_NOTIFY);
+    assert_eq(key_event(114), P_HOOK_SUBMIT);
+    assert_eq(key_event(116), P_HOOK_STOP);
+    assert_eq(key_event(111), P_OUTPUT);
+    assert_eq(key_event(113), P_QUIET);
+    assert_eq(key_event(120), P_EXIT_OK);
+    assert_eq(key_event(122), P_SPAWNED);
+    assert_eq(key_event(65), NOEV);
+    assert_eq(key_event(49), NOEV);
+}
+
+test the_screen_is_the_t27os_vt_grid_as_the_layout_says {
+    var st : [10]u32 = undefined;
+    var cells : [288]u32 = undefined;
+    assert vt_init(st[0..10], cells[0..288], 32, 9);
+    const a : u32 = pane_step(pane_step(pane_step(0, P_SPAWNED), P_HOOK_SUBMIT), P_HOOK_NOTIFY);
+    const b : u32 = pane_step(0, P_SPAWNED);
+    const c : u32 = pane_step(pane_step(pane_step(0, P_SPAWNED), P_HOOK_SUBMIT), P_HOOK_STOP);
+    const d : u32 = pane_step(pane_step(0, P_SPAWNED), P_OUTPUT);
+    var s : u8 = 0;
+    var p : u8 = 0;
+    var n : u32 = 0;
+    while (s < SEGS) {
+        p = 0;
+        while (p <= seg_last(s)) {
+            assert vt_feed(st[0..10], cells[0..288], screen_char(s, p, 2, a, b, c, d, 0x00A5));
+            n = n + 1;
+            p = p + 1;
+        }
+        s = s + 1;
+    }
+    assert_eq(n, FRAME_BYTES);
+    // line 0, the title
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 0), 84);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 7, 0), 64);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 16, 0), 116);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 17, 0), 61);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 18, 0), 48);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 19, 0), 48);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 20, 0), 65);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 21, 0), 53);
+    // line 1 and 2, the spaces and the header
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 1), 83);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 7, 1), 49);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 2), 65);
+    // line 3, pane 0 BLOCKED, not selected: "  1 Claude   BLOCKED  !"
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 3), 32);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 2, 3), 49);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 4, 3), 67);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 13, 3), 66);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 19, 3), 68);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 21, 3), 33);
+    // line 4, pane 1 IDLE
+    assert_eq(vt_cell(st[0..10], cells[0..288], 2, 4), 50);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 13, 4), 73);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 21, 4), 32);
+    // line 5, pane 2 is the selected one and finished unseen: "> 3 Gemini   DONE     *"
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 5), 62);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 4, 5), 71);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 13, 5), 68);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 21, 5), 42);
+    // line 6, pane 3 WORKING
+    assert_eq(vt_cell(st[0..10], cells[0..288], 4, 6), 79);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 13, 6), 87);
+    // line 7, the key legend, and the grid below it stays blank
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 7), 107);
+    assert_eq(vt_cell(st[0..10], cells[0..288], 0, 8), 32);
+    // the cursor ends at the start of line 8: nothing scrolled
+    assert_eq(st[0], 0);
+    assert_eq(st[1], 8);
+}
+
+test the_pins_carry_exactly_the_screen_bytes {
+    // the board machine, in simulation: baud divider 4, decode the uart_tx pin like a terminal does, and compare
+    // every byte to the screen function while the panes take their events from the script
+    w0 = 0;
+    w1 = 0;
+    w2 = 0;
+    w3 = 0;
+    sel = 0;
+    evn = 0;
+    pend_e = NOEV;
+    scr = 0;
+    tmr = 0;
+    tick_div = 1000000;
+    baud_div = 4;
+    tx_cnt = 0;
+    tx_sh = 1023;
+    tx_left = 0;
+    seg = 0;
+    pos = 0;
+    frames = 0;
+    rx_busy = false;
+    rx_new = false;
+    rx_s0 = true;
+    rx_s1 = true;
+    go0 = true;
+    go1 = true;
+    var got : u32 = 0;
+    var s : u8 = 0;
+    var p : u8 = 0;
+    var clocks : u32 = 0;
+    var cnt : u32 = 0;
+    var bits : u8 = 0;
+    var acc : u8 = 0;
+    var prev : bool = true;
+    // advance the machine until the transmitter is idle-high once, then watch for start bits
+    while (got < FRAME_BYTES) {
+        on_clock(true, true, true);
+        clocks = clocks + 1;
+        if (cnt == 0 and prev and !uart_tx) {
+            // a start bit: sample 1.5 bit times later, then every bit time
+            cnt = 6;
+            bits = 0;
+            acc = 0;
+        } else if (cnt != 0) {
+            cnt = cnt - 1;
+            if (cnt == 0) {
+                if (bits < 8) {
+                    if (uart_tx) { acc = (acc >> 1) | 128; } else { acc = acc >> 1; }
+                    bits = bits + 1;
+                    cnt = 4;
+                } else {
+                    assert uart_tx;
+                    assert_eq(acc, screen_char(s, p, 0, 0, 0, 0, 0, 0));
+                    got = got + 1;
+                    if (p == seg_last(s)) {
+                        p = 0;
+                        s = s + 1;
+                    } else {
+                        p = p + 1;
+                    }
+                }
+            }
+        }
+        prev = uart_tx;
+        assert clocks < 100000;
+    }
+    assert_eq(s, SEGS);
+    // nothing moved in that time: no script step, no key
+    assert_eq(w0, 0);
+    assert_eq(evn, 0);
+}
+
+test the_script_clock_applies_one_event_per_tick {
+    w0 = 0;
+    w1 = 0;
+    w2 = 0;
+    w3 = 0;
+    evn = 0;
+    pend_e = NOEV;
+    scr = 0;
+    tmr = 0;
+    tick_div = 5;
+    baud_div = 868;
+    tx_cnt = 0;
+    tx_sh = 1023;
+    tx_left = 0;
+    seg = 0;
+    pos = 0;
+    rx_busy = false;
+    rx_new = false;
+    rx_s0 = true;
+    rx_s1 = true;
+    go0 = true;
+    go1 = true;
+    var i : u32 = 0;
+    while (i < 5 * 8 + 2) {
+        on_clock(true, true, true);
+        i = i + 1;
+    }
+    // 8 script steps (all four spawns, then submit, output, submit, notify) have been queued and applied
+    assert_eq(evn, 8);
+    assert_eq(shown_state(w0), S_WORKING);
+    assert_eq(shown_state(w1), S_WORKING);
+    assert_eq(shown_state(w2), S_BLOCKED);
+    assert_eq(shown_state(w3), S_IDLE);
+    assert led_0 == false;
+    assert led_1 == false;
+    assert led_2 == true;
+}
+
+test a_key_over_the_uart_selects_and_sends {
+    w0 = 0;
+    w1 = 0;
+    w2 = 0;
+    w3 = 0;
+    sel = 0;
+    evn = 0;
+    pend_e = NOEV;
+    scr = 0;
+    tmr = 0;
+    tick_div = 100000000;
+    baud_div = 16;
+    tx_cnt = 0;
+    tx_sh = 1023;
+    tx_left = 0;
+    rx_busy = false;
+    rx_new = false;
+    rx_s0 = true;
+    rx_s1 = true;
+    go0 = true;
+    go1 = true;
+    var k : u8 = 0;
+    var bit : u8 = 0;
+    var t : u8 = 0;
+    var line : bool = true;
+    // type "3" then "z" (select pane 2, spawn it) then "r" (hook submit): 8N1, 16 clocks a bit
+    while (k < 3) {
+        const ch : u8 = kbd_byte(k);
+        bit = 0;
+        while (bit < 10) {
+            if (bit == 0) { line = false; }
+            else if (bit == 9) { line = true; }
+            else { line = ((ch >> (bit - 1)) & 1) == 1; }
+            t = 0;
+            while (t < 16) {
+                on_clock(true, true, line);
+                t = t + 1;
+            }
+            bit = bit + 1;
+        }
+        t = 0;
+        while (t < 100) {
+            on_clock(true, true, true);
+            t = t + 1;
+        }
+        k = k + 1;
+    }
+    assert_eq(sel, 2);
+    assert_eq(shown_state(w2), S_WORKING);
+    assert_eq(shown_state(w0), S_STOPPED);
+    assert_eq(evn, 2);
+}
+
+/// The test keyboard: "3", "z", "r".
+pub fn kbd_byte(k: u8) -> u8 {
+    if (k == 0) { return 51; }
+    if (k == 1) { return 122; }
+    return 114;
+}
+
+test the_button_resets_every_pane_and_the_script {
+    w0 = 777;
+    w1 = 5;
+    sel = 3;
+    evn = 9;
+    scr = 6;
+    go0 = false;
+    go1 = false;
+    on_clock(true, true, true);
+    assert_eq(w0, 0);
+    assert_eq(w1, 0);
+    assert_eq(sel, 0);
+    assert_eq(evn, 0);
+    assert_eq(scr, 0);
+    assert_eq(pend_e, NOEV);
+    assert_eq(seg, 0);
+    assert_eq(tx_sh, 1023);
+}

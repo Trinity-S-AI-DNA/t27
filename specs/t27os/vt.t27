@@ -1,0 +1,1238 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/vt.t27 -- a minimal VT/ANSI terminal: bytes in, a grid of cells out. The T27 OS window feeds
+; the output of a pane's PTY (pty_client.t27 READ) through vt_feed and draws the grid.
+; Owner, 2026-10-19: agent CLIs run as real terminals; the window needs just enough of a terminal to show
+; Claude Code, Codex and a shell: printable text, CR LF BS TAB, cursor moves, erase and scroll. Colour and
+; style (SGR) are read and dropped: the screen is black and white.
+; State is a u32 register file (ST_*) and the cells are one u32 codepoint each, row-major, cols * rows long;
+; nothing else is kept, so a host loop owns two plain buffers and calls vt_feed per byte.
+; Handled: printable ASCII and UTF-8 (decoded to a codepoint), CR, LF (scrolls at the bottom), BS, TAB (to
+; the next multiple of 8), and CSI: A B C D (up, down, right, left), H f (position), G (column), d (row),
+; J (erase display 0, 1, 2, 3), K (erase line 0, 1, 2). Every other CSI (m, h, l, r, ...), OSC strings
+; (BEL or ESC \ ends them) and two-byte ESC sequences are consumed and dropped. A line that reaches the
+; right edge wraps on the next printable (deferred wrap, as xterm does).
+
+module T27osVt;
+
+pub const ST_X : usize = 0;
+pub const ST_Y : usize = 1;
+pub const ST_COLS : usize = 2;
+pub const ST_ROWS : usize = 3;
+pub const ST_MODE : usize = 4;
+pub const ST_P0 : usize = 5;
+pub const ST_P1 : usize = 6;
+pub const ST_NP : usize = 7;
+pub const ST_UTF : usize = 8;
+pub const ST_CP : usize = 9;
+pub const ST_HLEN : usize = 10;
+pub const ST_HHEAD : usize = 11;
+pub const ST_HCAP : usize = 12;
+pub const ST_VIEW : usize = 13;
+pub const ST_ALT : usize = 14;
+pub const ST_MOUSE : usize = 15;
+pub const ST_SGR : usize = 16;
+pub const ST_GEN : usize = 17;
+pub const ST_DMIN : usize = 18;
+pub const ST_DMAX : usize = 19;
+pub const ST_PRIV : usize = 20;
+pub const ST_SAVE_X : usize = 21;
+pub const ST_SAVE_Y : usize = 22;
+pub const ST_APPCUR : usize = 23;
+pub const ST_SAVED : usize = 24;
+/// DECSET 2004: the program asked for bracketed paste (the window wraps a paste in ESC [ 200 ~ ... ESC [ 201 ~).
+pub const ST_BRPASTE : usize = 25;
+/// The mouse selection (#11450): 0 none, 1 a range, 2 an anchor placed and no drag yet. Rows are counted in
+/// lines of history ++ grid (0 = the oldest history row), so a selection stays on its text while output scrolls.
+pub const ST_SEL : usize = 26;
+pub const ST_SEL_AL : usize = 27;
+pub const ST_SEL_AC : usize = 28;
+pub const ST_SEL_FL : usize = 29;
+pub const ST_SEL_FC : usize = 30;
+/// 0 by character, 1 by line, n >= 2 by word of n - 1 columns starting at the anchor.
+pub const ST_SEL_MODE : usize = 31;
+pub const ST_COUNT : usize = 32;
+
+/// The history keeps this many rows that left the top of the main screen (the owner's cap, #11398).
+pub const HIST_MAX : u32 = 5000;
+/// The view offset is counted in 1/VIEW_SUB of a row, so a trackpad scrolls by sub-row pixels.
+pub const VIEW_SUB : u32 = 16;
+
+pub const M_GROUND : u32 = 0;
+pub const M_ESC : u32 = 1;
+pub const M_CSI : u32 = 2;
+pub const M_OSC : u32 = 3;
+pub const M_OSC_ESC : u32 = 4;
+
+pub const BLANK : u32 = 32;
+pub const REPLACEMENT : u32 = 65533;
+pub const PARAM_MAX : u32 = 9999;
+
+pub fn vt_init(st: []u32, cells: []u32, cols: u32, rows: u32) -> bool {
+    if (cols == 0 or rows == 0 or cells.len < cols * rows or st.len < ST_COUNT) { return false; }
+    var i : usize = 0;
+    while (i < ST_COUNT) { st[i] = 0; i = i + 1; }
+    st[ST_COLS] = cols;
+    st[ST_ROWS] = rows;
+    var c : usize = 0;
+    while (c < cols * rows) { cells[c] = BLANK; c = c + 1; }
+    // Layout of the cells buffer: the grid, then (if it fits) a copy of the main screen kept while the alternate
+    // screen is up, then the history ring of rows. A buffer that holds only the grid has no history.
+    const g : u32 = cols * rows;
+    const total : u32 = @as(u32, @intCast(cells.len));
+    if (total >= 2 * g) {
+        st[ST_SAVED] = 1;
+        const room : u32 = (total - 2 * g) / cols;
+        st[ST_HCAP] = room;
+        if (room > HIST_MAX) { st[ST_HCAP] = HIST_MAX; }
+    }
+    st[ST_DMIN] = 0;
+    st[ST_DMAX] = rows;
+    st[ST_GEN] = 1;
+    return true;
+}
+
+pub fn vt_cell(st: []const u32, cells: []const u32, x: u32, y: u32) -> u32 {
+    return cells[y * st[ST_COLS] + x];
+}
+
+fn blank_range(cells: []u32, from: u32, to: u32) -> bool {
+    var i : u32 = from;
+    while (i < to) { cells[i] = BLANK; i = i + 1; }
+    return true;
+}
+
+/// Rows lo..hi (hi excluded) changed: widen the dirty range and bump the generation the frame gate reads.
+fn vt_mark_rows(st: []u32, lo: u32, hi: u32) -> bool {
+    if (hi <= lo) { return true; }
+    if (st[ST_DMAX] <= st[ST_DMIN]) { st[ST_DMIN] = lo; st[ST_DMAX] = hi; }
+    else {
+        if (lo < st[ST_DMIN]) { st[ST_DMIN] = lo; }
+        if (hi > st[ST_DMAX]) { st[ST_DMAX] = hi; }
+    }
+    st[ST_GEN] = st[ST_GEN] + 1;
+    return true;
+}
+
+/// The host has drawn the dirty rows: none are dirty now.
+pub fn vt_clean(st: []u32) -> bool {
+    st[ST_DMIN] = 0;
+    st[ST_DMAX] = 0;
+    return true;
+}
+
+pub fn vt_dirty_lo(st: []const u32) -> u32 { return st[ST_DMIN]; }
+
+/// How many rows the grid changed since the last vt_clean (0 = nothing to draw).
+pub fn vt_dirty_rows(st: []const u32) -> u32 {
+    if (st[ST_DMAX] <= st[ST_DMIN]) { return 0; }
+    return st[ST_DMAX] - st[ST_DMIN];
+}
+
+/// Where history row k (0 = oldest) starts in the cells buffer.
+fn vt_hist_at(st: []const u32, k: u32) -> u32 {
+    const cols : u32 = st[ST_COLS];
+    const g : u32 = cols * st[ST_ROWS];
+    return 2 * g + ((st[ST_HHEAD] + k) % st[ST_HCAP]) * cols;
+}
+
+/// The top row leaves the screen: the main screen keeps it in the ring (the oldest row goes when the ring is
+/// full), the alternate screen does not. A scrolled-up view stays on the same text: it moves one row along.
+fn vt_hist_push(st: []u32, cells: []u32) -> bool {
+    const cols : u32 = st[ST_COLS];
+    if (st[ST_ALT] != 0 or st[ST_HCAP] == 0) { return true; }
+    var at : u32 = 0;
+    if (st[ST_HLEN] < st[ST_HCAP]) {
+        at = vt_hist_at(st, st[ST_HLEN]);
+        st[ST_HLEN] = st[ST_HLEN] + 1;
+    } else {
+        at = vt_hist_at(st, 0);
+        st[ST_HHEAD] = (st[ST_HHEAD] + 1) % st[ST_HCAP];
+        vt_sel_shift(st);
+    }
+    var i : u32 = 0;
+    while (i < cols) { cells[at + i] = cells[i]; i = i + 1; }
+    if (st[ST_VIEW] > 0) {
+        st[ST_VIEW] = st[ST_VIEW] + VIEW_SUB;
+        if (st[ST_VIEW] > st[ST_HLEN] * VIEW_SUB) { st[ST_VIEW] = st[ST_HLEN] * VIEW_SUB; }
+    }
+    return true;
+}
+
+fn scroll_up(st: []u32, cells: []u32) -> bool {
+    const cols : u32 = st[ST_COLS];
+    const rows : u32 = st[ST_ROWS];
+    vt_hist_push(st, cells);
+    var i : u32 = 0;
+    while (i < cols * (rows - 1)) {
+        cells[i] = cells[i + cols];
+        i = i + 1;
+    }
+    vt_mark_rows(st, 0, rows);
+    return blank_range(cells, cols * (rows - 1), cols * rows);
+}
+
+fn line_feed(st: []u32, cells: []u32) -> bool {
+    if (st[ST_Y] + 1 >= st[ST_ROWS]) {
+        return scroll_up(st, cells);
+    }
+    st[ST_Y] = st[ST_Y] + 1;
+    return true;
+}
+
+fn put_cp(st: []u32, cells: []u32, cp: u32) -> bool {
+    if (st[ST_X] >= st[ST_COLS]) {
+        st[ST_X] = 0;
+        line_feed(st, cells);
+    }
+    cells[st[ST_Y] * st[ST_COLS] + st[ST_X]] = cp;
+    vt_mark_rows(st, st[ST_Y], st[ST_Y] + 1);
+    st[ST_X] = st[ST_X] + 1;
+    return true;
+}
+
+fn one_if_zero(v: u32) -> u32 {
+    if (v == 0) { return 1; }
+    return v;
+}
+
+fn clamp_to(v: u32, max_excl: u32) -> u32 {
+    if (v >= max_excl) { return max_excl - 1; }
+    return v;
+}
+
+fn erase_display(st: []u32, cells: []u32, how: u32) -> bool {
+    const cols : u32 = st[ST_COLS];
+    vt_mark_rows(st, 0, st[ST_ROWS]);
+    const at : u32 = st[ST_Y] * cols + clamp_to(st[ST_X], cols);
+    if (how == 0) { return blank_range(cells, at, cols * st[ST_ROWS]); }
+    if (how == 1) { return blank_range(cells, 0, at + 1); }
+    return blank_range(cells, 0, cols * st[ST_ROWS]);
+}
+
+fn erase_line(st: []u32, cells: []u32, how: u32) -> bool {
+    const cols : u32 = st[ST_COLS];
+    vt_mark_rows(st, st[ST_Y], st[ST_Y] + 1);
+    const row : u32 = st[ST_Y] * cols;
+    const x : u32 = clamp_to(st[ST_X], cols);
+    if (how == 0) { return blank_range(cells, row + x, row + cols); }
+    if (how == 1) { return blank_range(cells, row, row + x + 1); }
+    return blank_range(cells, row, row + cols);
+}
+
+/// Enter the alternate screen: the main screen and cursor are kept, the grid is cleared, the history stands still.
+fn vt_alt_enter(st: []u32, cells: []u32) -> bool {
+    if (st[ST_ALT] != 0) { return true; }
+    const g : u32 = st[ST_COLS] * st[ST_ROWS];
+    st[ST_SAVE_X] = st[ST_X];
+    st[ST_SAVE_Y] = st[ST_Y];
+    if (st[ST_SAVED] != 0) {
+        var i : u32 = 0;
+        while (i < g) { cells[g + i] = cells[i]; i = i + 1; }
+    }
+    blank_range(cells, 0, g);
+    st[ST_ALT] = 1;
+    st[ST_SEL] = 0;
+    st[ST_VIEW] = 0;
+    st[ST_X] = 0;
+    st[ST_Y] = 0;
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+fn vt_alt_leave(st: []u32, cells: []u32) -> bool {
+    if (st[ST_ALT] == 0) { return true; }
+    const g : u32 = st[ST_COLS] * st[ST_ROWS];
+    if (st[ST_SAVED] != 0) {
+        var i : u32 = 0;
+        while (i < g) { cells[i] = cells[g + i]; i = i + 1; }
+    } else {
+        blank_range(cells, 0, g);
+    }
+    st[ST_ALT] = 0;
+    st[ST_SEL] = 0;
+    st[ST_X] = st[ST_SAVE_X];
+    st[ST_Y] = st[ST_SAVE_Y];
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// CSI ? n h / l: the alternate screen (47, 1047, 1049), application cursor keys (1), mouse reporting (1000 click,
+/// 1002 drag, 1003 any motion) and the SGR mouse encoding (1006), bracketed paste (2004). Others are read and dropped.
+fn vt_private_mode(st: []u32, cells: []u32, n: u32, on: bool) -> bool {
+    if (n == 47 or n == 1047 or n == 1049) {
+        if (on) { return vt_alt_enter(st, cells); }
+        return vt_alt_leave(st, cells);
+    }
+    var v : u32 = 0;
+    if (on) { v = 1; }
+    if (n == 1) { st[ST_APPCUR] = v; }
+    if (n == 2004) { st[ST_BRPASTE] = v; }
+    if (n == 1000 or n == 1002 or n == 1003) { st[ST_MOUSE] = v; }
+    if (n == 1006) { st[ST_SGR] = v; }
+    return true;
+}
+
+fn csi_final(st: []u32, cells: []u32, b: u8) -> bool {
+    if (st[ST_PRIV] != 0) {
+        if (b == 104) { vt_private_mode(st, cells, st[ST_P0], true); }
+        if (b == 108) { vt_private_mode(st, cells, st[ST_P0], false); }
+        st[ST_PRIV] = 0;
+        st[ST_MODE] = M_GROUND;
+        return true;
+    }
+    const cols : u32 = st[ST_COLS];
+    const rows : u32 = st[ST_ROWS];
+    const p0 : u32 = st[ST_P0];
+    const p1 : u32 = st[ST_P1];
+    const x : u32 = clamp_to(st[ST_X], cols);
+    if (b == 65) {
+        // A: up
+        const d : u32 = one_if_zero(p0);
+        if (d > st[ST_Y]) { st[ST_Y] = 0; } else { st[ST_Y] = st[ST_Y] - d; }
+    } else if (b == 66) {
+        st[ST_Y] = clamp_to(st[ST_Y] + one_if_zero(p0), rows);
+    } else if (b == 67) {
+        st[ST_X] = clamp_to(x + one_if_zero(p0), cols);
+    } else if (b == 68) {
+        const d : u32 = one_if_zero(p0);
+        if (d > x) { st[ST_X] = 0; } else { st[ST_X] = x - d; }
+    } else if (b == 72 or b == 102) {
+        st[ST_Y] = clamp_to(one_if_zero(p0) - 1, rows);
+        st[ST_X] = clamp_to(one_if_zero(p1) - 1, cols);
+    } else if (b == 71) {
+        st[ST_X] = clamp_to(one_if_zero(p0) - 1, cols);
+    } else if (b == 100) {
+        st[ST_Y] = clamp_to(one_if_zero(p0) - 1, rows);
+    } else if (b == 74) {
+        erase_display(st, cells, p0);
+    } else if (b == 75) {
+        erase_line(st, cells, p0);
+    }
+    st[ST_MODE] = M_GROUND;
+    return true;
+}
+
+fn utf8_byte(st: []u32, cells: []u32, b: u8) -> bool {
+    const v : u32 = @as(u32, b);
+    if (v >= 128 and v < 192) {
+        if (st[ST_UTF] == 0) { return true; }
+        st[ST_CP] = st[ST_CP] * 64 + (v & 63);
+        st[ST_UTF] = st[ST_UTF] - 1;
+        if (st[ST_UTF] == 0) { put_cp(st, cells, st[ST_CP]); }
+        return true;
+    }
+    if (st[ST_UTF] != 0) {
+        st[ST_UTF] = 0;
+        put_cp(st, cells, REPLACEMENT);
+    }
+    if (v >= 192 and v < 224) { st[ST_UTF] = 1; st[ST_CP] = v & 31; return true; }
+    if (v >= 224 and v < 240) { st[ST_UTF] = 2; st[ST_CP] = v & 15; return true; }
+    if (v >= 240 and v < 248) { st[ST_UTF] = 3; st[ST_CP] = v & 7; return true; }
+    return put_cp(st, cells, REPLACEMENT);
+}
+
+fn ground_byte(st: []u32, cells: []u32, b: u8) -> bool {
+    if (b == 27) { st[ST_MODE] = M_ESC; return true; }
+    if (b == 13) { st[ST_X] = 0; return true; }
+    if (b == 10 or b == 11 or b == 12) { return line_feed(st, cells); }
+    if (b == 8) {
+        if (st[ST_X] > 0) { st[ST_X] = clamp_to(st[ST_X], st[ST_COLS]) - 1; }
+        return true;
+    }
+    if (b == 9) {
+        st[ST_X] = clamp_to((st[ST_X] / 8 + 1) * 8, st[ST_COLS]);
+        return true;
+    }
+    if (b < 32 or b == 127) { return true; }
+    if (b >= 128) { return utf8_byte(st, cells, b); }
+    if (st[ST_UTF] != 0) { st[ST_UTF] = 0; put_cp(st, cells, REPLACEMENT); }
+    return put_cp(st, cells, @as(u32, b));
+}
+
+fn csi_byte(st: []u32, cells: []u32, b: u8) -> bool {
+    if (b >= 48 and b <= 57) {
+        var v : u32 = @as(u32, b - 48);
+        if (st[ST_NP] == 0) {
+            st[ST_P0] = st[ST_P0] * 10 + v;
+            if (st[ST_P0] > PARAM_MAX) { st[ST_P0] = PARAM_MAX; }
+        } else if (st[ST_NP] == 1) {
+            st[ST_P1] = st[ST_P1] * 10 + v;
+            if (st[ST_P1] > PARAM_MAX) { st[ST_P1] = PARAM_MAX; }
+        }
+        return true;
+    }
+    if (b == 59) {
+        st[ST_NP] = st[ST_NP] + 1;
+        return true;
+    }
+    if (b == 63) { st[ST_PRIV] = 1; return true; }
+    if (b >= 64 and b <= 126) { return csi_final(st, cells, b); }
+    if (b == 27) { st[ST_MODE] = M_ESC; }
+    return true;
+}
+
+/// Feed one byte of PTY output to the terminal.
+pub fn vt_feed(st: []u32, cells: []u32, b: u8) -> bool {
+    const mode : u32 = st[ST_MODE];
+    if (mode == M_GROUND) { return ground_byte(st, cells, b); }
+    if (mode == M_ESC) {
+        if (b == 91) {
+            st[ST_MODE] = M_CSI;
+            st[ST_PRIV] = 0;
+            st[ST_P0] = 0;
+            st[ST_P1] = 0;
+            st[ST_NP] = 0;
+        } else if (b == 93) {
+            st[ST_MODE] = M_OSC;
+        } else if (b == 27) {
+            st[ST_MODE] = M_ESC;
+        } else {
+            st[ST_MODE] = M_GROUND;
+        }
+        return true;
+    }
+    if (mode == M_CSI) { return csi_byte(st, cells, b); }
+    if (mode == M_OSC) {
+        if (b == 7) { st[ST_MODE] = M_GROUND; }
+        if (b == 27) { st[ST_MODE] = M_OSC_ESC; }
+        return true;
+    }
+    st[ST_MODE] = M_GROUND;
+    return true;
+}
+
+/// Feed a run of bytes.
+pub fn vt_feed_all(st: []u32, cells: []u32, src: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < src.len) {
+        vt_feed(st, cells, src[i]);
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- scrollback: the view into history, follow-live, the wheel (owner, 2026-10-20, #11398) ----------------------
+//
+// The visible text is the history followed by the grid, read bottom-aligned. ST_VIEW is how far the view is
+// scrolled up from live, in 1/VIEW_SUB rows: 0 follows the live screen (new output keeps showing); above 0 the view
+// stays on the same text while output arrives (vt_hist_push moves it along). Typing, or the jump-to-live chip, sets it
+// back to 0. The alternate screen has no history: its view is always live.
+
+/// Rows of history the view can use (none on the alternate screen).
+pub fn vt_hist_rows(st: []const u32) -> u32 {
+    if (st[ST_ALT] != 0) { return 0; }
+    return st[ST_HLEN];
+}
+
+pub fn vt_view_max(st: []const u32) -> u32 { return vt_hist_rows(st) * VIEW_SUB; }
+
+pub fn vt_view(st: []const u32) -> u32 { return st[ST_VIEW]; }
+
+/// The jump-to-live chip shows while the view is above live.
+pub fn vt_chip_shown(st: []const u32) -> bool { return st[ST_VIEW] > 0 and st[ST_ALT] == 0; }
+
+/// Scroll the view back (towards older text) by `units` sub-rows, to the history's end at most.
+pub fn vt_view_up(st: []u32, units: u32) -> bool {
+    const mx : u32 = vt_view_max(st);
+    var v : u32 = st[ST_VIEW] + units;
+    if (v > mx) { v = mx; }
+    if (v == st[ST_VIEW]) { return false; }
+    st[ST_VIEW] = v;
+    st[ST_GEN] = st[ST_GEN] + 1;
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// Scroll the view forward (towards live) by `units` sub-rows; reaching 0 follows live again.
+pub fn vt_view_down(st: []u32, units: u32) -> bool {
+    if (st[ST_VIEW] == 0) { return false; }
+    if (units >= st[ST_VIEW]) { st[ST_VIEW] = 0; } else { st[ST_VIEW] = st[ST_VIEW] - units; }
+    st[ST_GEN] = st[ST_GEN] + 1;
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// Typing, or a click on the chip: back to the live screen.
+pub fn vt_to_live(st: []u32) -> bool {
+    if (st[ST_VIEW] == 0) { return false; }
+    st[ST_VIEW] = 0;
+    st[ST_GEN] = st[ST_GEN] + 1;
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// The sub-row part of the view (0 .. VIEW_SUB - 1): the lines are drawn this many sixteenths of a row lower.
+pub fn vt_view_frac(st: []const u32) -> u32 { return st[ST_VIEW] % VIEW_SUB; }
+
+/// The codepoint at column x of drawn line vy (0 .. rows, rows + 1 lines): line 0 is the row above the top one and
+/// shows only when the view has a sub-row part. Past the history's start, or past the grid, it is blank.
+pub fn vt_view_cell(st: []const u32, cells: []const u32, vy: u32, x: u32) -> u32 {
+    const cols : u32 = st[ST_COLS];
+    const rows : u32 = st[ST_ROWS];
+    const hl : u32 = vt_hist_rows(st);
+    const whole : u32 = st[ST_VIEW] / VIEW_SUB;
+    // the line's place in history ++ grid; vi + 1 avoids a negative index
+    const vi1 : u32 = hl - whole + vy;
+    if (vi1 == 0) { return BLANK; }
+    const vi : u32 = vi1 - 1;
+    if (vi < hl) {
+        const g : u32 = cols * rows;
+        return cells[2 * g + ((st[ST_HHEAD] + vi) % st[ST_HCAP]) * cols + x];
+    }
+    if (vi - hl >= rows) { return BLANK; }
+    return cells[(vi - hl) * cols + x];
+}
+
+// ---- the wheel: the view on the main screen, the program on the alternate one --------------------------------------
+
+pub const ROUTE_VIEW : u32 = 0;
+pub const ROUTE_ARROWS : u32 = 1;
+pub const ROUTE_MOUSE : u32 = 2;
+/// Arrow presses sent per wheel notch to a program that reads no mouse.
+pub const WHEEL_ARROWS : u32 = 3;
+
+/// Where a wheel turn goes: the scrollback view, arrows (alternate screen, no mouse mode), or mouse reports.
+pub fn vt_wheel_route(st: []const u32) -> u32 {
+    if (st[ST_ALT] == 0) { return ROUTE_VIEW; }
+    if (st[ST_MOUSE] != 0) { return ROUTE_MOUSE; }
+    return ROUTE_ARROWS;
+}
+
+fn vt_put_dec(out: []u8, at: u32, v: u32) -> u32 {
+    var d : [10]u8 = undefined;
+    var n : u32 = 0;
+    var w : u32 = v;
+    if (w == 0) { d[0] = 48; n = 1; }
+    while (w > 0) { d[n] = @as(u8, @intCast(48 + w % 10)); w = w / 10; n = n + 1; }
+    var i : u32 = 0;
+    while (i < n) { out[at + i] = d[n - 1 - i]; i = i + 1; }
+    return at + n;
+}
+
+/// The bytes one wheel notch sends to the program (col, row = the cell under the pointer, from 0). `up` = the wheel
+/// turned towards older text. Arrows are CSI A/B, or SS3 A/B while application cursor keys (DECCKM) are on. Mouse
+/// reports are button 64 (up) / 65 (down): SGR `ESC [ < b ; x ; y M` when DECSET 1006 is on, else the X10 form
+/// `ESC [ M b+32 x+32 y+32` (cells past 222 are clamped). `out` needs 40 bytes; the length is returned (0 = view route).
+pub fn vt_wheel_bytes(st: []const u32, up: bool, col: u32, row: u32, out: []u8) -> u32 {
+    const route : u32 = vt_wheel_route(st);
+    if (route == ROUTE_VIEW) { return 0; }
+    var b : u32 = 64;
+    if (up == false) { b = 65; }
+    if (route == ROUTE_ARROWS) {
+        var n : u32 = 0;
+        var k : u32 = 0;
+        while (k < WHEEL_ARROWS) {
+            out[n] = 27;
+            if (st[ST_APPCUR] != 0) { out[n + 1] = 79; } else { out[n + 1] = 91; }
+            if (up) { out[n + 2] = 65; } else { out[n + 2] = 66; }
+            n = n + 3;
+            k = k + 1;
+        }
+        return n;
+    }
+    out[0] = 27;
+    out[1] = 91;
+    if (st[ST_SGR] != 0) {
+        out[2] = 60;
+        var n2 : u32 = vt_put_dec(out, 3, b);
+        out[n2] = 59;
+        n2 = vt_put_dec(out, n2 + 1, col + 1);
+        out[n2] = 59;
+        n2 = vt_put_dec(out, n2 + 1, row + 1);
+        out[n2] = 77;
+        return n2 + 1;
+    }
+    var cx : u32 = col + 1;
+    var cy : u32 = row + 1;
+    if (cx > 222) { cx = 222; }
+    if (cy > 222) { cy = 222; }
+    out[2] = 77;
+    out[3] = @as(u8, @intCast(b + 32));
+    out[4] = @as(u8, @intCast(cx + 32));
+    out[5] = @as(u8, @intCast(cy + 32));
+    return 6;
+}
+
+// ---- the selection: lines of history ++ grid, copied as text by the window (#11450) --------------------------------
+// A line number counts from the oldest history row; the grid's rows follow the history. The history ring keeps
+// that numbering stable while rows scroll into it, and moves it down one when the ring drops its oldest row.
+
+/// Lines a selection can reach: the history rows and the grid's rows (the alternate screen has no history).
+pub fn vt_line_count(st: []const u32) -> u32 { return vt_hist_rows(st) + st[ST_ROWS]; }
+
+/// The codepoint at column x of line l (history ++ grid).
+pub fn vt_line_cell(st: []const u32, cells: []const u32, l: u32, x: u32) -> u32 {
+    const cols : u32 = st[ST_COLS];
+    const hl : u32 = vt_hist_rows(st);
+    if (l < hl) {
+        const g : u32 = cols * st[ST_ROWS];
+        return cells[2 * g + ((st[ST_HHEAD] + l) % st[ST_HCAP]) * cols + x];
+    }
+    if (l - hl >= st[ST_ROWS]) { return BLANK; }
+    return cells[(l - hl) * cols + x];
+}
+
+/// The line drawn at view line vy (0 .. rows, as vt_view_cell counts them); the first line when the view
+/// shows blank above the history.
+pub fn vt_line_of_view(st: []const u32, vy: u32) -> u32 {
+    const hl : u32 = vt_hist_rows(st);
+    const vi1 : u32 = hl - st[ST_VIEW] / VIEW_SUB + vy;
+    var l : u32 = 0;
+    if (vi1 > 0) { l = vi1 - 1; }
+    const top : u32 = vt_line_count(st) - 1;
+    if (l > top) { return top; }
+    return l;
+}
+
+/// Whether view line vy shows a line at all (false for the blank above the oldest history row).
+pub fn vt_view_has(st: []const u32, vy: u32) -> bool {
+    return vt_hist_rows(st) - st[ST_VIEW] / VIEW_SUB + vy > 0;
+}
+
+/// The ring dropped its oldest row: every stored line moves one up (a line already at 0 stays, at column 0).
+fn vt_sel_shift(st: []u32) -> bool {
+    if (st[ST_SEL] == 0) { return true; }
+    if (st[ST_SEL_AL] > 0) { st[ST_SEL_AL] = st[ST_SEL_AL] - 1; } else { st[ST_SEL_AC] = 0; }
+    if (st[ST_SEL_FL] > 0) { st[ST_SEL_FL] = st[ST_SEL_FL] - 1; } else { st[ST_SEL_FC] = 0; }
+    return true;
+}
+
+fn vt_before(l0: u32, c0: u32, l1: u32, c1: u32) -> bool {
+    return l0 < l1 or (l0 == l1 and c0 < c1);
+}
+
+/// 0 blank, 1 a delimiter (quotes, brackets, comma, semicolon, pipe), 2 any other character.
+fn vt_class(cp: u32) -> u32 {
+    if (cp == BLANK or cp == 0) { return 0; }
+    if (cp == 34 or cp == 39 or cp == 40 or cp == 41 or cp == 91 or cp == 93 or cp == 123 or cp == 125) { return 1; }
+    if (cp == 60 or cp == 62 or cp == 44 or cp == 59 or cp == 124 or cp == 96) { return 1; }
+    return 2;
+}
+
+/// The run of one class around column c of line l: first column * 1024 + last column.
+pub fn vt_word_span(st: []const u32, cells: []const u32, l: u32, c: u32) -> u32 {
+    const cols : u32 = st[ST_COLS];
+    const k : u32 = vt_class(vt_line_cell(st, cells, l, c));
+    var a : u32 = c;
+    while (a > 0 and vt_class(vt_line_cell(st, cells, l, a - 1)) == k) { a = a - 1; }
+    var b : u32 = c;
+    while (b + 1 < cols and vt_class(vt_line_cell(st, cells, l, b + 1)) == k) { b = b + 1; }
+    return a * 1024 + b;
+}
+
+pub fn vt_sel_clear(st: []u32) -> bool {
+    if (st[ST_SEL] == 0) { return false; }
+    st[ST_SEL] = 0;
+    vt_mark_rows(st, 0, st[ST_ROWS]);
+    return true;
+}
+
+/// The selection's ends in order: b = [first line, first column, last line, last column], both ends included.
+/// False when nothing is selected (a click without a drag selects nothing).
+pub fn vt_sel_bounds(st: []const u32, b: []u32) -> bool {
+    if (st[ST_SEL] != 1) { return false; }
+    const m : u32 = st[ST_SEL_MODE];
+    const al : u32 = st[ST_SEL_AL];
+    var ac : u32 = st[ST_SEL_AC];
+    const fl : u32 = st[ST_SEL_FL];
+    const fc : u32 = st[ST_SEL_FC];
+    // a word selection dragged backwards keeps the whole first word: it ends where that word ends
+    if (m >= 2 and vt_before(fl, fc, al, ac)) { ac = ac + m - 2; }
+    if (vt_before(fl, fc, al, ac)) {
+        b[0] = fl; b[1] = fc; b[2] = al; b[3] = ac;
+    } else {
+        b[0] = al; b[1] = ac; b[2] = fl; b[3] = fc;
+    }
+    return true;
+}
+
+/// A press at (l, c): clicks 1 places the anchor (nothing is selected until the drag), 2 selects the word, 3 the
+/// line. With shift the selection is extended to the press from its far end.
+pub fn vt_sel_begin(st: []u32, cells: []const u32, l: u32, c: u32, clicks: u32, shift: bool) -> bool {
+    const cols : u32 = st[ST_COLS];
+    var b : [4]u32 = undefined;
+    if (shift and st[ST_SEL] == 2) {
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = c; st[ST_SEL_MODE] = 0; st[ST_SEL] = 1;
+    } else if (shift and vt_sel_bounds(st, b[0..4])) {
+        if (vt_before(l, c, b[0], b[1])) {
+            st[ST_SEL_AL] = b[2]; st[ST_SEL_AC] = b[3];
+        } else {
+            st[ST_SEL_AL] = b[0]; st[ST_SEL_AC] = b[1];
+        }
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = c; st[ST_SEL_MODE] = 0; st[ST_SEL] = 1;
+    } else if (clicks == 2) {
+        const w : u32 = vt_word_span(st, cells, l, c);
+        st[ST_SEL_AL] = l; st[ST_SEL_AC] = w / 1024;
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = w % 1024;
+        st[ST_SEL_MODE] = 1 + (w % 1024 - w / 1024 + 1);
+        st[ST_SEL] = 1;
+    } else if (clicks >= 3) {
+        st[ST_SEL_AL] = l; st[ST_SEL_AC] = 0;
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = cols - 1;
+        st[ST_SEL_MODE] = 1;
+        st[ST_SEL] = 1;
+    } else {
+        st[ST_SEL_AL] = l; st[ST_SEL_AC] = c;
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = c;
+        st[ST_SEL_MODE] = 0;
+        st[ST_SEL] = 2;
+    }
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// The pointer moved to (l, c) with the button down: the far end follows it, by character, by word or by line.
+pub fn vt_sel_drag(st: []u32, cells: []const u32, l: u32, c: u32) -> bool {
+    if (st[ST_SEL] == 0) { return false; }
+    const cols : u32 = st[ST_COLS];
+    const m : u32 = st[ST_SEL_MODE];
+    if (st[ST_SEL] == 2) {
+        if (l == st[ST_SEL_AL] and c == st[ST_SEL_AC]) { return false; }
+        st[ST_SEL] = 1;
+    }
+    if (m == 1) {
+        if (l >= st[ST_SEL_AL]) {
+            st[ST_SEL_AC] = 0; st[ST_SEL_FL] = l; st[ST_SEL_FC] = cols - 1;
+        } else {
+            st[ST_SEL_AC] = cols - 1; st[ST_SEL_FL] = l; st[ST_SEL_FC] = 0;
+        }
+    } else if (m >= 2) {
+        const w : u32 = vt_word_span(st, cells, l, c);
+        st[ST_SEL_FL] = l;
+        if (vt_before(l, c, st[ST_SEL_AL], st[ST_SEL_AC])) { st[ST_SEL_FC] = w / 1024; } else { st[ST_SEL_FC] = w % 1024; }
+    } else {
+        if (l == st[ST_SEL_FL] and c == st[ST_SEL_FC]) { return false; }
+        st[ST_SEL_FL] = l; st[ST_SEL_FC] = c;
+    }
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// Select every line: the history and the grid.
+pub fn vt_sel_all(st: []u32) -> bool {
+    st[ST_SEL_AL] = 0; st[ST_SEL_AC] = 0;
+    st[ST_SEL_FL] = vt_line_count(st) - 1; st[ST_SEL_FC] = st[ST_COLS] - 1;
+    st[ST_SEL_MODE] = 0;
+    st[ST_SEL] = 1;
+    return vt_mark_rows(st, 0, st[ST_ROWS]);
+}
+
+/// The columns of line l the selection b covers: (first + 1) * 1024 + (last + 1), 0 when it covers none.
+pub fn vt_sel_span(b: []const u32, l: u32, cols: u32) -> u32 {
+    if (l < b[0] or l > b[2]) { return 0; }
+    var c0 : u32 = 0;
+    var c1 : u32 = cols - 1;
+    if (l == b[0]) { c0 = b[1]; }
+    if (l == b[2] and b[3] < c1) { c1 = b[3]; }
+    if (c0 > c1) { return 0; }
+    return (c0 + 1) * 1024 + (c1 + 1);
+}
+
+/// Test helper: feed text in which "^" stands for ESC, "%" for CR, "_" for BS and "@" for BEL, since a
+/// string literal here has no escapes for them.
+fn fed(st: []u32, cells: []u32, src: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < src.len) {
+        var b : u8 = src[i];
+        if (b == 94) { b = 27; }
+        if (b == 37) { b = 13; }
+        if (b == 95) { b = 8; }
+        if (b == 64) { b = 7; }
+        vt_feed(st, cells, b);
+        i = i + 1;
+    }
+    return true;
+}
+
+test text_lands_on_the_grid_and_wraps {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 8, 5);
+    fed(st[0..32], cells[0..40], "hello");
+    assert vt_cell(st[0..32], cells[0..40], 0, 0) == 104;
+    assert vt_cell(st[0..32], cells[0..40], 4, 0) == 111;
+    assert st[ST_X] == 5;
+    fed(st[0..32], cells[0..40], "world!");
+    // 11 characters on an 8-column grid: the last 3 wrap onto row 1
+    assert vt_cell(st[0..32], cells[0..40], 7, 0) == 114;
+    assert vt_cell(st[0..32], cells[0..40], 0, 1) == 108;
+    assert vt_cell(st[0..32], cells[0..40], 2, 1) == 33;
+    assert st[ST_Y] == 1 and st[ST_X] == 3;
+}
+
+test control_characters_move_the_cursor {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 20, 2);
+    fed(st[0..32], cells[0..40], "ab%\ncd");
+    assert vt_cell(st[0..32], cells[0..40], 0, 1) == 99;
+    fed(st[0..32], cells[0..40], "_X");
+    assert vt_cell(st[0..32], cells[0..40], 1, 1) == 88;
+    fed(st[0..32], cells[0..40], "%\ty");
+    assert vt_cell(st[0..32], cells[0..40], 8, 1) == 121;
+    assert st[ST_X] == 9;
+}
+
+test the_screen_scrolls_at_the_bottom {
+    var st : [32]u32 = undefined;
+    var cells : [30]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..30], 10, 3);
+    fed(st[0..32], cells[0..30], "one%\ntwo%\nthree%\nfour");
+    assert vt_cell(st[0..32], cells[0..30], 0, 0) == 116;
+    assert vt_cell(st[0..32], cells[0..30], 1, 0) == 119;
+    assert vt_cell(st[0..32], cells[0..30], 0, 1) == 116;
+    assert vt_cell(st[0..32], cells[0..30], 2, 1) == 114;
+    assert vt_cell(st[0..32], cells[0..30], 0, 2) == 102;
+    assert vt_cell(st[0..32], cells[0..30], 5, 2) == 32;
+    assert st[ST_Y] == 2;
+}
+
+test csi_moves_and_positions_the_cursor {
+    var st : [32]u32 = undefined;
+    var cells : [200]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..200], 20, 10);
+    fed(st[0..32], cells[0..200], "^[5;7Hx");
+    assert vt_cell(st[0..32], cells[0..200], 6, 4) == 120;
+    fed(st[0..32], cells[0..200], "^[2A^[3Dy");
+    assert vt_cell(st[0..32], cells[0..200], 4, 2) == 121;
+    fed(st[0..32], cells[0..200], "^[B^[Cz");
+    assert vt_cell(st[0..32], cells[0..200], 6, 3) == 122;
+    fed(st[0..32], cells[0..200], "^[H");
+    assert st[ST_X] == 0 and st[ST_Y] == 0;
+    fed(st[0..32], cells[0..200], "^[99;99H");
+    assert st[ST_X] == 19 and st[ST_Y] == 9;
+    fed(st[0..32], cells[0..200], "^[9999A^[9999D");
+    assert st[ST_X] == 0 and st[ST_Y] == 0;
+    fed(st[0..32], cells[0..200], "^[12G^[4d");
+    assert st[ST_X] == 11 and st[ST_Y] == 3;
+}
+
+test erase_clears_by_the_cursor {
+    var st : [32]u32 = undefined;
+    var cells : [60]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..60], 10, 6);
+    var r : u32 = 0;
+    while (r < 6) {
+        fed(st[0..32], cells[0..60], "aaaaaaaaaa");
+        r = r + 1;
+    }
+    fed(st[0..32], cells[0..60], "^[3;5H^[K");
+    assert vt_cell(st[0..32], cells[0..60], 3, 2) == 97;
+    assert vt_cell(st[0..32], cells[0..60], 4, 2) == 32;
+    assert vt_cell(st[0..32], cells[0..60], 9, 2) == 32;
+    fed(st[0..32], cells[0..60], "^[1K");
+    assert vt_cell(st[0..32], cells[0..60], 0, 2) == 32;
+    assert vt_cell(st[0..32], cells[0..60], 4, 2) == 32;
+    fed(st[0..32], cells[0..60], "^[4;1H^[J");
+    assert vt_cell(st[0..32], cells[0..60], 0, 3) == 32;
+    assert vt_cell(st[0..32], cells[0..60], 9, 5) == 32;
+    assert vt_cell(st[0..32], cells[0..60], 9, 1) == 97;
+    fed(st[0..32], cells[0..60], "^[2J");
+    assert vt_cell(st[0..32], cells[0..60], 9, 1) == 32;
+}
+
+test style_and_titles_are_dropped {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 20, 2);
+    fed(st[0..32], cells[0..40], "^[1;31mred^[0m ^]0;a title@ok^]2;x^\\!");
+    assert vt_cell(st[0..32], cells[0..40], 0, 0) == 114;
+    assert vt_cell(st[0..32], cells[0..40], 2, 0) == 100;
+    assert vt_cell(st[0..32], cells[0..40], 4, 0) == 111;
+    assert vt_cell(st[0..32], cells[0..40], 6, 0) == 33;
+    assert st[ST_X] == 7;
+    assert st[ST_MODE] == M_GROUND;
+    fed(st[0..32], cells[0..40], "^[?25l^[?2004h^c");
+    assert st[ST_X] == 7 and st[ST_MODE] == M_GROUND;
+}
+
+test utf8_is_decoded_to_codepoints {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 20, 2);
+    // e-acute (2 bytes), euro (3 bytes), a box-drawing corner (3 bytes), a rocket emoji (4 bytes)
+    var a : [12]u8 = undefined;
+    a[0] = 195; a[1] = 169;
+    a[2] = 226; a[3] = 130; a[4] = 172;
+    a[5] = 226; a[6] = 149; a[7] = 173;
+    a[8] = 240; a[9] = 159; a[10] = 154; a[11] = 128;
+    vt_feed_all(st[0..32], cells[0..40], a[0..12]);
+    assert vt_cell(st[0..32], cells[0..40], 0, 0) == 233;
+    assert vt_cell(st[0..32], cells[0..40], 1, 0) == 8364;
+    assert vt_cell(st[0..32], cells[0..40], 2, 0) == 9581;
+    assert vt_cell(st[0..32], cells[0..40], 3, 0) == 128640;
+    assert st[ST_X] == 4;
+    // a lead byte followed by ASCII is a broken sequence: one replacement, then the ASCII
+    a[0] = 226; a[1] = 122;
+    vt_feed_all(st[0..32], cells[0..40], a[0..2]);
+    assert vt_cell(st[0..32], cells[0..40], 4, 0) == REPLACEMENT;
+    assert vt_cell(st[0..32], cells[0..40], 5, 0) == 122;
+    // a lone continuation byte is dropped
+    a[0] = 169;
+    vt_feed_all(st[0..32], cells[0..40], a[0..1]);
+    assert st[ST_X] == 6;
+}
+
+test a_tiny_grid_cannot_be_overrun {
+    var st : [32]u32 = undefined;
+    var cells : [4]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..4], 2, 2);
+    var i : u32 = 0;
+    while (i < 50) {
+        fed(st[0..32], cells[0..4], "ab^[9B^[9C_\n^[J");
+        i = i + 1;
+    }
+    assert st[ST_X] < 3 and st[ST_Y] < 2;
+    assert vt_init(st[0..32], cells[0..4], 3, 2) == false;
+    assert vt_init(st[0..32], cells[0..4], 0, 2) == false;
+}
+
+// ---- tests: scrollback (#11398) ----
+
+/// Feed `n` numbered lines "L<d>" into a grid; the rows that leave the top enter the history.
+fn vt_lines(st: []u32, cells: []u32, n: u32) -> bool {
+    var i : u32 = 0;
+    while (i < n) {
+        vt_feed(st, cells, 76);
+        vt_feed(st, cells, @as(u8, @intCast(48 + i % 10)));
+        vt_feed(st, cells, 13);
+        vt_feed(st, cells, 10);
+        i = i + 1;
+    }
+    return true;
+}
+
+test rows_that_leave_the_top_enter_the_history {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    // a 4 x 3 grid, 400 cells: room for the saved grid (12) and (400 - 24) / 4 = 94 history rows
+    assert st[ST_HCAP] == 94;
+    vt_lines(st[0..32], cells[0..400], 5);
+    // 5 lines and the cursor on a 6th: the grid holds L3 L4 and a blank; L0 L1 L2 left the top
+    assert st[ST_HLEN] == 3;
+    assert vt_view_cell(st[0..32], cells[0..400], 1, 1) == 51;
+    assert vt_view_cell(st[0..32], cells[0..400], 2, 1) == 52;
+    assert vt_cell(st[0..32], cells[0..400], 1, 0) == 51;
+}
+
+test the_history_keeps_5000_rows_and_drops_the_oldest {
+    var st : [32]u32 = undefined;
+    var cells : [10040]u32 = undefined;
+    // 2 columns, 2 rows: grid 4, saved 4, then (10040 - 8) / 2 = 5016 rows of room, capped at 5000
+    assert vt_init(st[0..32], cells[0..10040], 2, 2);
+    assert st[ST_HCAP] == HIST_MAX;
+    assert HIST_MAX == 5000;
+    vt_lines(st[0..32], cells[0..10040], 5100);
+    assert st[ST_HLEN] == 5000;
+    // the oldest kept row is line 5099 - 5000 + 1 - 1 = 100 -> digit 0; the newest is the row above the grid
+    assert cells[8 + st[ST_HHEAD] * 2 + 1] == 57;
+    assert vt_view_up(st[0..32], 100000);
+    assert st[ST_VIEW] == 5000 * VIEW_SUB;
+}
+
+test the_view_follows_live_until_scrolled_up {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 6);
+    assert vt_view(st[0..32]) == 0;
+    assert vt_chip_shown(st[0..32]) == false;
+    // scrolling up by one row and a half
+    assert vt_view_up(st[0..32], 24);
+    assert vt_view(st[0..32]) == 24 and vt_view_frac(st[0..32]) == 8;
+    assert vt_chip_shown(st[0..32]);
+    // new output arrives: the view moves along one row, so it stays on the same text
+    const before : u32 = vt_view_cell(st[0..32], cells[0..400], 2, 1);
+    vt_lines(st[0..32], cells[0..400], 1);
+    assert vt_view(st[0..32]) == 24 + VIEW_SUB;
+    assert vt_view_cell(st[0..32], cells[0..400], 2, 1) != 0;
+    assert before != 0;
+    // forward to live
+    assert vt_view_down(st[0..32], 100);
+    assert vt_view(st[0..32]) == 0;
+    assert vt_chip_shown(st[0..32]) == false;
+}
+
+test the_view_cannot_pass_the_history {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    // nothing in history: scrolling up does nothing
+    assert vt_view_up(st[0..32], 40) == false;
+    assert vt_view(st[0..32]) == 0;
+    vt_lines(st[0..32], cells[0..400], 4);
+    assert st[ST_HLEN] == 2;
+    assert vt_view_up(st[0..32], 1000);
+    assert vt_view(st[0..32]) == 2 * VIEW_SUB;
+    assert vt_view_up(st[0..32], 1) == false;
+    // a view at the very top shows the oldest rows on the grid's lines
+    assert vt_view_cell(st[0..32], cells[0..400], 1, 1) == 48;
+    assert vt_view_cell(st[0..32], cells[0..400], 0, 1) == 32;
+    assert vt_view_cell(st[0..32], cells[0..400], 2, 1) == 49;
+}
+
+test typing_returns_to_live {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 6);
+    assert vt_view_up(st[0..32], 20);
+    assert vt_to_live(st[0..32]);
+    assert vt_view(st[0..32]) == 0;
+    assert vt_to_live(st[0..32]) == false;
+}
+
+test a_sub_row_view_draws_one_extra_line {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 6);
+    // at live and whole rows the extra line 0 is the row above the top and is clipped off screen
+    assert vt_view_frac(st[0..32]) == 0;
+    assert vt_view_up(st[0..32], 5);
+    assert vt_view_frac(st[0..32]) == 5;
+    // line 0 is now history, line 3 is the grid row 1 shifted up a bit
+    assert vt_view_cell(st[0..32], cells[0..400], 0, 0) == 76;
+}
+
+test the_alternate_screen_keeps_the_main_screen_and_has_no_history {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 5);
+    const h : u32 = st[ST_HLEN];
+    fed(st[0..32], cells[0..400], "^[?1049hAB");
+    assert st[ST_ALT] == 1;
+    assert vt_cell(st[0..32], cells[0..400], 0, 0) == 65;
+    assert vt_hist_rows(st[0..32]) == 0;
+    // scrolling in the alternate screen adds nothing to the history
+    vt_lines(st[0..32], cells[0..400], 5);
+    assert st[ST_HLEN] == h;
+    fed(st[0..32], cells[0..400], "^[?1049l");
+    assert st[ST_ALT] == 0;
+    assert vt_cell(st[0..32], cells[0..400], 1, 0) == 51;
+    assert vt_hist_rows(st[0..32]) == h;
+}
+
+test the_alternate_screen_pins_the_view_to_live {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 6);
+    assert vt_view_up(st[0..32], 40);
+    fed(st[0..32], cells[0..400], "^[?1049h");
+    assert vt_view(st[0..32]) == 0;
+    assert vt_view_up(st[0..32], 40) == false;
+    assert vt_chip_shown(st[0..32]) == false;
+}
+
+test the_wheel_goes_to_the_view_arrows_or_the_mouse {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    var o : [40]u8 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 80, 4);
+    // main screen: the view takes the wheel, no bytes go out
+    assert vt_wheel_route(st[0..32]) == ROUTE_VIEW;
+    assert vt_wheel_bytes(st[0..32], true, 3, 4, o[0..40]) == 0;
+    // alternate screen, no mouse mode: three arrows per notch
+    fed(st[0..32], cells[0..400], "^[?1049h");
+    assert vt_wheel_route(st[0..32]) == ROUTE_ARROWS;
+    assert vt_wheel_bytes(st[0..32], true, 0, 0, o[0..40]) == 9;
+    assert o[0] == 27 and o[1] == 91 and o[2] == 65 and o[5] == 65 and o[8] == 65;
+    assert vt_wheel_bytes(st[0..32], false, 0, 0, o[0..40]) == 9;
+    assert o[2] == 66;
+    // application cursor keys: SS3 arrows
+    fed(st[0..32], cells[0..400], "^[?1h");
+    assert vt_wheel_bytes(st[0..32], true, 0, 0, o[0..40]) == 9;
+    assert o[1] == 79 and o[2] == 65;
+    // mouse reporting on (1000), legacy encoding: ESC [ M, button 64 + 32, x + 33, y + 33
+    fed(st[0..32], cells[0..400], "^[?1000h");
+    assert vt_wheel_route(st[0..32]) == ROUTE_MOUSE;
+    assert vt_wheel_bytes(st[0..32], true, 9, 2, o[0..40]) == 6;
+    assert o[0] == 27 and o[1] == 91 and o[2] == 77 and o[3] == 96 and o[4] == 42 and o[5] == 35;
+    assert vt_wheel_bytes(st[0..32], false, 9, 2, o[0..40]) == 6;
+    assert o[3] == 97;
+    // SGR (1006): ESC [ < 64 ; 10 ; 3 M
+    fed(st[0..32], cells[0..400], "^[?1006h");
+    const n : u32 = vt_wheel_bytes(st[0..32], true, 9, 2, o[0..40]);
+    assert n == 11;
+    assert o[2] == 60 and o[3] == 54 and o[4] == 52 and o[5] == 59 and o[6] == 49 and o[7] == 48 and o[8] == 59;
+    assert o[9] == 51 and o[10] == 77;
+}
+
+test mouse_reporting_ends_with_its_reset {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 8, 4);
+    fed(st[0..32], cells[0..400], "^[?1049h^[?1002h");
+    assert st[ST_MOUSE] == 1;
+    fed(st[0..32], cells[0..400], "^[?1002l");
+    assert st[ST_MOUSE] == 0;
+    assert vt_wheel_route(st[0..32]) == ROUTE_ARROWS;
+    // plain (non-private) h and l do nothing to the modes
+    fed(st[0..32], cells[0..400], "^[1000h");
+    assert st[ST_MOUSE] == 0;
+}
+
+test dirty_rows_are_tracked_and_cleaned {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 8, 6);
+    // a fresh grid is all dirty (never drawn)
+    assert vt_dirty_rows(st[0..32]) == 6;
+    assert vt_clean(st[0..32]);
+    assert vt_dirty_rows(st[0..32]) == 0;
+    const g0 : u32 = st[ST_GEN];
+    fed(st[0..32], cells[0..400], "ab");
+    assert vt_dirty_rows(st[0..32]) == 1 and vt_dirty_lo(st[0..32]) == 0;
+    assert st[ST_GEN] > g0;
+    vt_clean(st[0..32]);
+    // a character on row 3 marks only row 3
+    fed(st[0..32], cells[0..400], "^[4;1Hz");
+    assert vt_dirty_lo(st[0..32]) == 3 and vt_dirty_rows(st[0..32]) == 1;
+    // a cursor move alone dirties nothing
+    vt_clean(st[0..32]);
+    fed(st[0..32], cells[0..400], "^[2;2H");
+    assert vt_dirty_rows(st[0..32]) == 0;
+    // a scroll dirties every row
+    fed(st[0..32], cells[0..400], "^[6;1H%\n");
+    assert vt_dirty_rows(st[0..32]) == 6;
+}
+
+test bracketed_paste_is_tracked {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 8, 4);
+    assert st[ST_BRPASTE] == 0;
+    fed(st[0..32], cells[0..40], "^[?2004h");
+    assert st[ST_BRPASTE] == 1;
+    fed(st[0..32], cells[0..40], "^[?2004l");
+    assert st[ST_BRPASTE] == 0;
+}
+
+test lines_count_from_the_oldest_history_row {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 5);
+    // L0 L1 L2 in the history, L3 L4 and a blank in the grid
+    assert vt_line_count(st[0..32]) == 6;
+    assert vt_line_cell(st[0..32], cells[0..400], 0, 1) == 48;
+    assert vt_line_cell(st[0..32], cells[0..400], 3, 1) == 51;
+    assert vt_line_cell(st[0..32], cells[0..400], 5, 0) == BLANK;
+    // view line 1 is the first visible one: the oldest grid row when the view is live
+    assert vt_line_of_view(st[0..32], 1) == 3;
+    assert vt_line_of_view(st[0..32], 3) == 5;
+    vt_view_up(st[0..32], VIEW_SUB);
+    assert vt_line_of_view(st[0..32], 1) == 2;
+    // scrolled to the very top, view line 0 is blank (nothing above the oldest row), line 1 is row 0
+    vt_view_up(st[0..32], 10 * VIEW_SUB);
+    assert vt_view_has(st[0..32], 0) == false and vt_view_has(st[0..32], 1);
+    assert vt_line_of_view(st[0..32], 1) == 0;
+}
+
+test a_click_selects_nothing_a_drag_selects_a_range {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    var b : [4]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 5);
+    assert vt_sel_begin(st[0..32], cells[0..400], 1, 0, 1, false);
+    assert st[ST_SEL] == 2;
+    assert vt_sel_bounds(st[0..32], b[0..4]) == false;
+    // the pointer still on the anchor: still nothing
+    assert vt_sel_drag(st[0..32], cells[0..400], 1, 0) == false;
+    // a drag across history and grid rows
+    assert vt_sel_drag(st[0..32], cells[0..400], 3, 1);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 1 and b[1] == 0 and b[2] == 3 and b[3] == 1;
+    assert vt_sel_span(b[0..4], 0, 4) == 0;
+    assert vt_sel_span(b[0..4], 1, 4) == 1 * 1024 + 4;
+    assert vt_sel_span(b[0..4], 2, 4) == 1 * 1024 + 4;
+    assert vt_sel_span(b[0..4], 3, 4) == 1 * 1024 + 2;
+    assert vt_sel_span(b[0..4], 4, 4) == 0;
+    // dragging back above the anchor orders the ends
+    assert vt_sel_drag(st[0..32], cells[0..400], 0, 2);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 2 and b[2] == 1 and b[3] == 0;
+    assert vt_sel_clear(st[0..32]);
+    assert vt_sel_bounds(st[0..32], b[0..4]) == false;
+    assert vt_sel_clear(st[0..32]) == false;
+}
+
+test a_double_click_takes_a_word_and_a_triple_click_the_line {
+    var st : [32]u32 = undefined;
+    var cells : [40]u32 = undefined;
+    var b : [4]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..40], 8, 2);
+    fed(st[0..32], cells[0..40], "ab cd");
+    assert vt_word_span(st[0..32], cells[0..40], 0, 4) == 3 * 1024 + 4;
+    assert vt_word_span(st[0..32], cells[0..40], 0, 2) == 2 * 1024 + 2;
+    assert vt_sel_begin(st[0..32], cells[0..40], 0, 4, 2, false);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 3 and b[2] == 0 and b[3] == 4;
+    // dragging the word selection left onto "ab" keeps "cd": the whole of "ab cd" is selected
+    assert vt_sel_drag(st[0..32], cells[0..40], 0, 1);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[1] == 0 and b[3] == 4;
+    // a delimiter ends a word
+    fed(st[0..32], cells[0..40], "^[2;1H(xy)");
+    assert vt_word_span(st[0..32], cells[0..40], 1, 1) == 1 * 1024 + 2;
+    // the triple click selects the whole line, wide as the grid
+    assert vt_sel_begin(st[0..32], cells[0..40], 0, 4, 3, false);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 0 and b[2] == 0 and b[3] == 7;
+    // dragged down a line it takes the next line too
+    assert vt_sel_drag(st[0..32], cells[0..40], 1, 2);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 0 and b[2] == 1 and b[3] == 7;
+}
+
+test shift_extends_from_the_far_end {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    var b : [4]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 5);
+    vt_sel_begin(st[0..32], cells[0..400], 1, 0, 1, false);
+    vt_sel_drag(st[0..32], cells[0..400], 3, 1);
+    // past the end: the start stays
+    assert vt_sel_begin(st[0..32], cells[0..400], 5, 2, 1, true);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 1 and b[1] == 0 and b[2] == 5 and b[3] == 2;
+    // before the start: the end stays
+    assert vt_sel_begin(st[0..32], cells[0..400], 0, 2, 1, true);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 2 and b[2] == 5 and b[3] == 2;
+    // a shift press after a bare click (anchor only) makes the range from the anchor
+    vt_sel_clear(st[0..32]);
+    vt_sel_begin(st[0..32], cells[0..400], 2, 1, 1, false);
+    assert vt_sel_begin(st[0..32], cells[0..400], 4, 0, 1, true);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 2 and b[1] == 1 and b[2] == 4 and b[3] == 0;
+}
+
+test select_all_spans_history_and_grid {
+    var st : [32]u32 = undefined;
+    var cells : [400]u32 = undefined;
+    var b : [4]u32 = undefined;
+    assert vt_init(st[0..32], cells[0..400], 4, 3);
+    vt_lines(st[0..32], cells[0..400], 5);
+    assert vt_sel_all(st[0..32]);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[1] == 0 and b[2] == 5 and b[3] == 3;
+}
+
+test a_selection_follows_its_text_up_the_ring_and_dies_with_the_screen {
+    var st : [32]u32 = undefined;
+    var cells : [24]u32 = undefined;
+    var b : [4]u32 = undefined;
+    // 4 x 2 grid and a two-row ring: the fourth line pushes the oldest row out
+    assert vt_init(st[0..32], cells[0..24], 4, 2);
+    assert st[ST_HCAP] == 2;
+    vt_lines(st[0..32], cells[0..24], 3);
+    assert st[ST_HLEN] == 2;
+    vt_sel_begin(st[0..32], cells[0..24], 1, 0, 1, false);
+    vt_sel_drag(st[0..32], cells[0..24], 2, 1);
+    vt_lines(st[0..32], cells[0..24], 1);
+    assert vt_sel_bounds(st[0..32], b[0..4]);
+    assert b[0] == 0 and b[2] == 1;
+    assert vt_line_cell(st[0..32], cells[0..24], 0, 1) == 49;
+    // the alternate screen has other lines: the selection goes
+    fed(st[0..32], cells[0..24], "^[?1049h");
+    assert vt_sel_bounds(st[0..32], b[0..4]) == false;
+}

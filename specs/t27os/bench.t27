@@ -1,0 +1,1649 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/bench.t27 -- the data model of the BENCH tab and of the project-summary strip of T27 OS.
+; Owner, 2026-10-20: hardware engineers must love T27 OS. This file is the data only; the window draws it.
+; --
+; What already exists and is REUSED, not restated (DRY):
+; - specs/verified/bench_boards.t27 is the board registry: board_part, board_idcode, board_serial,
+;   board_cable, idcode_is_row, detect_idcode, cables_matching. The three bench dice A, B and C are three
+;   cables of ONE row (BOARD_AX7203, xc7a200tfbg484-2, IDCODE 0x03636093, serial 210512180081); what tells
+;   them apart is the busdev, and fpga/HARDWARE_SSOT.md (W791) names it: 1:4 / 1:6 / 1:8, shown by
+;   `openFPGALoader --scan-usb` as 001:004 / 001:006 / 001:008. This file adds only that busdev column.
+; - specs/verified/die_binding.t27 owns text_find, text_hex_after, hex_digit, HEX_NONE, TEXT_NONE.
+; --
+; New here: (1) the per-die state, packed in integers; (2) the PROVENANCE of every number: kind
+; MEASURED / DERIVED / NOT_MEASURED + the command that produced it + when; (3) the summary row of T27B and
+; T27C and its integer formatting; (4) pure parsers of the lines the host reads.
+; --
+; THE RULE (law of this file): a value that was not measured prints as "not measured", never 0. A zero is
+; a measurement ("0 DSP"); an absent number is not. Every cell carries a `known` bit beside its value.
+; --
+; What the HOST must supply (this file runs no command, reads no device):
+;   cable_seen      openFPGALoader -c digilent_hs2 --scan-usb     -> scan_has_busdev(scan, die)
+;   idcode_ok       openFPGALoader -c digilent_hs2 --busdev-num <b> --detect -> die_idcode_ok(detect)
+;   loaded sha      t27c silicon receipt, "seal_hash": "sha256:<hex>"  -> receipt_seal_prefix(receipt)
+;   loaded_at       the same receipt, "utc_unix": <seconds>             -> receipt_utc(receipt)
+;   LED byte        the USB camera read of the user LEDs (skill board-eye); the read is an integer 0..255
+;                   supplied by the host, no text format in the repo, so there is no parser here
+;   UART counter    the bytes the board's UART printed since load      -> uart_lines(text)
+;   Fmax            nextpnr log line "Max frequency for clock ..."      -> fmax_khz(line)
+;   LUT FF BRAM DSP yosys `synth_xilinx` stat / nextpnr utilization (host passes counts + known bit)
+;   WNS TNS         Vivado report_timing_summary (ps); nextpnr prints no WNS, so without Vivado they stay
+;                   NOT_MEASURED
+;   build seconds   the wall clock of the build command, measured by the host
+; Honest limit: capacities are the datasheet numbers of the xc7a200t (Xilinx DS180, 7 Series FPGAs
+; Overview, Table 1: 33,650 slices x 4 LUT6 = 134,600 LUT; x 8 FF = 269,200 FF; 365 RAMB36; 740 DSP48E1),
+; kind DERIVED from SRC_DATASHEET, not read from the board. No new read of any board was made for this file.
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osBench;
+
+use verified::bench_boards;
+use verified::die_binding;
+
+// ---------------------------------------------------------------- the dice
+
+pub const DIE_A : u8 = 0;
+pub const DIE_B : u8 = 1;
+pub const DIE_C : u8 = 2;
+pub const DIE_COUNT : u8 = 3;
+
+/// All three dice sit on the same registry row.
+pub const DIE_BOARD : u8 = 1;
+
+pub fn die_name(d: u8) -> string {
+    if (d == DIE_A) { return "A"; }
+    if (d == DIE_B) { return "B"; }
+    if (d == DIE_C) { return "C"; }
+    return "";
+}
+
+/// openFPGALoader --busdev-num value (fpga/HARDWARE_SSOT.md, W791).
+pub fn die_busdev(d: u8) -> string {
+    if (d == DIE_A) { return "1:4"; }
+    if (d == DIE_B) { return "1:6"; }
+    if (d == DIE_C) { return "1:8"; }
+    return "";
+}
+
+/// The same bus:device as `openFPGALoader --scan-usb` prints it.
+pub fn die_scan_busdev(d: u8) -> string {
+    if (d == DIE_A) { return "001:004"; }
+    if (d == DIE_B) { return "001:006"; }
+    if (d == DIE_C) { return "001:008"; }
+    return "";
+}
+
+pub fn die_device(d: u8) -> string { return board_part(DIE_BOARD); }
+pub fn die_idcode(d: u8) -> u64 { return board_idcode(DIE_BOARD); }
+pub fn die_serial(d: u8) -> string { return board_serial(DIE_BOARD); }
+
+// ---------------------------------------------------------------- per-die state, packed
+// word a: bit0 cable seen, bit1 idcode read ok, bit2 a bitstream is loaded, bit3 LED byte known,
+//         bit4 UART counter known, bits 8..15 LED byte, bits 16..47 UART line counter.
+// word b: bits 0..31 sha256 prefix (first 8 hex digits) of the loaded seal, bits 32..63 loaded-at seconds.
+
+pub const ST_CABLE : u64 = 1;
+pub const ST_IDCODE : u64 = 2;
+pub const ST_LOADED : u64 = 4;
+pub const ST_LED_KNOWN : u64 = 8;
+pub const ST_UART_KNOWN : u64 = 16;
+pub const ST_CHAIN_READ : u64 = 32;   // --detect ran against a cable that is seen
+pub const ST_PORT : u64 = 64;         // a serial device node of this board exists
+pub const ST_LED_UNIT : u64 = 256;
+pub const ST_UART_UNIT : u64 = 65536;
+pub const ST_LOADED_AT_UNIT : u64 = 4294967296;
+
+pub fn st_has(a: u64, flag: u64) -> bool { return (a / flag) % 2 == 1; }
+pub fn st_led(a: u64) -> u64 { return (a / ST_LED_UNIT) % 256; }
+pub fn st_uart(a: u64) -> u64 { return (a / ST_UART_UNIT) % 4294967296; }
+pub fn st_sha_prefix(b: u64) -> u64 { return b % ST_LOADED_AT_UNIT; }
+pub fn st_loaded_at(b: u64) -> u64 { return b / ST_LOADED_AT_UNIT; }
+
+pub fn st_pack_a(cable: bool, idcode_ok: bool, loaded: bool, led_known: bool, led: u64, uart_known: bool, uart: u64) -> u64 {
+    var a : u64 = 0;
+    if (cable) { a = a + ST_CABLE; }
+    if (idcode_ok) { a = a + ST_IDCODE; }
+    if (loaded) { a = a + ST_LOADED; }
+    if (led_known) { a = a + ST_LED_KNOWN + (led % 256) * ST_LED_UNIT; }
+    if (uart_known) { a = a + ST_UART_KNOWN + (uart % 4294967296) * ST_UART_UNIT; }
+    return a;
+}
+
+pub fn st_pack_b(sha_prefix: u64, loaded_at: u64) -> u64 {
+    return (sha_prefix % ST_LOADED_AT_UNIT) + loaded_at * ST_LOADED_AT_UNIT;
+}
+
+/// What a die row says in one word. A die whose IDCODE was not read is never "ready".
+pub const DIE_NO_CABLE : u8 = 0;
+pub const DIE_CABLE_ONLY : u8 = 1;
+pub const DIE_READY : u8 = 2;
+pub const DIE_RUNNING : u8 = 3;
+/// The cable is seen and --detect ran, and it listed no device (board unpowered or disconnected).
+pub const DIE_CHAIN_EMPTY : u8 = 4;
+
+pub fn die_status(a: u64) -> u8 {
+    if (st_has(a, ST_CABLE) == false) { return DIE_NO_CABLE; }
+    if (st_has(a, ST_IDCODE) == false) {
+        if (st_has(a, ST_CHAIN_READ)) { return DIE_CHAIN_EMPTY; }
+        return DIE_CABLE_ONLY;
+    }
+    if (st_has(a, ST_LOADED) == false) { return DIE_READY; }
+    return DIE_RUNNING;
+}
+
+pub fn die_status_text(s: u8) -> string {
+    if (s == DIE_NO_CABLE) { return "no cable"; }
+    if (s == DIE_CABLE_ONLY) { return "cable, idcode not read"; }
+    if (s == DIE_CHAIN_EMPTY) { return "chain empty"; }
+    if (s == DIE_READY) { return "ready"; }
+    return "running";
+}
+
+// ---------------------------------------------------------------- provenance
+// A provenance is one u64: bits 0..3 kind, bits 4..7 source command, bits 8.. timestamp (unix seconds).
+
+pub const PV_MEASURED : u8 = 0;
+pub const PV_DERIVED : u8 = 1;
+pub const PV_NOT_MEASURED : u8 = 2;
+pub const PV_KIND_COUNT : u8 = 3;
+
+pub const BN_SRC_NONE : u8 = 0;
+pub const SRC_SCAN_USB : u8 = 1;
+pub const SRC_DETECT : u8 = 2;
+pub const SRC_LOAD : u8 = 3;
+pub const SRC_CAMERA : u8 = 4;
+pub const SRC_UART : u8 = 5;
+pub const SRC_NEXTPNR : u8 = 6;
+pub const SRC_VIVADO : u8 = 7;
+pub const SRC_YOSYS : u8 = 8;
+pub const SRC_RECEIPT : u8 = 9;
+pub const SRC_DATASHEET : u8 = 10;
+pub const SRC_STOPWATCH : u8 = 11;
+pub const SRC_LS_TTY : u8 = 12;
+pub const SRC_COUNT : u8 = 13;
+
+pub fn src_command(s: u8) -> string {
+    if (s == SRC_SCAN_USB) { return "openFPGALoader -c digilent_hs2 --scan-usb"; }
+    if (s == SRC_DETECT) { return "openFPGALoader -c digilent_hs2 --busdev-num <b> --detect"; }
+    if (s == SRC_LOAD) { return "openFPGALoader -c digilent_hs2 --busdev-num <b> <bit>"; }
+    if (s == SRC_CAMERA) { return "board-eye camera LED read"; }
+    if (s == SRC_UART) { return "UART capture"; }
+    if (s == SRC_NEXTPNR) { return "nextpnr-xilinx"; }
+    if (s == SRC_VIVADO) { return "vivado report_timing_summary"; }
+    if (s == SRC_YOSYS) { return "yosys synth_xilinx stat"; }
+    if (s == SRC_RECEIPT) { return "t27c silicon receipt"; }
+    if (s == SRC_DATASHEET) { return "Xilinx DS180 Table 1"; }
+    if (s == SRC_STOPWATCH) { return "wall clock of the build"; }
+    if (s == SRC_LS_TTY) { return "ls /dev/cu.usbserial-*"; }
+    return "";
+}
+
+pub fn prov_make(kind: u8, src: u8, at: u64) -> u64 {
+    return (kind as u64) + (src as u64) * 16 + at * 256;
+}
+
+pub fn prov_kind(p: u64) -> u8 { return (p % 16) as u8; }
+pub fn prov_src(p: u64) -> u8 { return ((p / 16) % 16) as u8; }
+pub fn prov_at(p: u64) -> u64 { return p / 256; }
+
+pub fn prov_kind_text(k: u8) -> string {
+    if (k == PV_MEASURED) { return "measured"; }
+    if (k == PV_DERIVED) { return "derived"; }
+    return "not measured";
+}
+
+/// The text beside a number: its kind; the host appends src_command and the time when the kind is not
+/// "not measured". A not-measured number has no command and no time to show.
+pub fn prov_has_source(p: u64) -> bool {
+    return prov_kind(p) != PV_NOT_MEASURED;
+}
+
+/// The provenance of a value from its two facts: was it read, and was it computed from other numbers.
+pub fn prov_of(known: bool, computed: bool, src: u8, at: u64) -> u64 {
+    if (known == false) { return prov_make(PV_NOT_MEASURED, BN_SRC_NONE, 0); }
+    if (computed) { return prov_make(PV_DERIVED, src, at); }
+    return prov_make(PV_MEASURED, src, at);
+}
+
+// ---------------------------------------------------------------- the summary row of T27B and T27C
+
+pub const PROJ_T27B : u8 = 0;
+pub const PROJ_T27C : u8 = 1;
+pub const PROJ_COUNT : u8 = 2;
+
+pub fn proj_name(p: u8) -> string {
+    if (p == PROJ_T27B) { return "T27B"; }
+    if (p == PROJ_T27C) { return "T27C"; }
+    return "";
+}
+
+/// Both products target the bench part; the family name is the datasheet's.
+pub fn proj_device(p: u8) -> string { return board_part(DIE_BOARD); }
+pub const DEVICE_FAMILY : str = "xc7a200t";
+
+pub const COL_LUT : u8 = 0;
+pub const COL_FF : u8 = 1;
+pub const COL_BRAM : u8 = 2;
+pub const COL_DSP : u8 = 3;
+pub const COL_WNS : u8 = 4;
+pub const COL_TNS : u8 = 5;
+pub const COL_FMAX : u8 = 6;
+pub const COL_BUILD : u8 = 7;
+pub const BN_COL_COUNT : u8 = 8;
+
+pub fn col_name(c: u8) -> string {
+    if (c == COL_LUT) { return "LUT"; }
+    if (c == COL_FF) { return "FF"; }
+    if (c == COL_BRAM) { return "BRAM"; }
+    if (c == COL_DSP) { return "DSP"; }
+    if (c == COL_WNS) { return "WNS ns"; }
+    if (c == COL_TNS) { return "TNS ns"; }
+    if (c == COL_FMAX) { return "Fmax MHz"; }
+    if (c == COL_BUILD) { return "build s"; }
+    return "";
+}
+
+/// xc7a200t capacity (DS180 Table 1), 0 for a column that is not a resource.
+pub fn col_capacity(c: u8) -> u64 {
+    if (c == COL_LUT) { return 134600; }
+    if (c == COL_FF) { return 269200; }
+    if (c == COL_BRAM) { return 365; }
+    if (c == COL_DSP) { return 740; }
+    return 0;
+}
+
+pub fn col_is_resource(c: u8) -> bool { return c < COL_WNS; }
+
+pub fn col_fmt(c: u8) -> u8 {
+    if (c == COL_WNS) { return F_NS; }
+    if (c == COL_TNS) { return F_NS; }
+    if (c == COL_FMAX) { return F_MHZ; }
+    return BN_F_COUNT;
+}
+
+/// Share of the part in permille, rounded half up; a part of no capacity has no share.
+pub fn permille(used: u64, cap: u64) -> u64 {
+    if (cap == 0) { return 0; }
+    return (used * 1000 + cap / 2) / cap;
+}
+
+/// Timing closes when the worst slack is not negative. Without a measurement it does not say.
+pub const TIMING_MET : u8 = 0;
+pub const TIMING_VIOLATED : u8 = 1;
+pub const TIMING_UNKNOWN : u8 = 2;
+
+pub fn timing_verdict(wns_known: bool, wns_ps: i64) -> u8 {
+    if (wns_known == false) { return TIMING_UNKNOWN; }
+    if (wns_ps < 0) { return TIMING_VIOLATED; }
+    return TIMING_MET;
+}
+
+// ---------------------------------------------------------------- integer formatting
+// Text is produced a character at a time (fmt_len, fmt_char): no allocation, the same in every target.
+
+pub const BN_F_COUNT : u8 = 0;
+pub const F_PERMILLE : u8 = 1;
+pub const F_NS : u8 = 2;
+pub const F_MHZ : u8 = 3;
+
+pub const NOT_MEASURED_TEXT : str = "not measured";
+
+pub fn fmt_frac_digits(f: u8) -> u32 {
+    if (f == F_PERMILLE) { return 1; }
+    if (f == F_NS) { return 3; }
+    if (f == F_MHZ) { return 3; }
+    return 0;
+}
+
+pub fn fmt_divisor(f: u8) -> u64 {
+    if (f == F_PERMILLE) { return 10; }
+    if (f == F_NS) { return 1000; }
+    if (f == F_MHZ) { return 1000; }
+    return 1;
+}
+
+/// The value as a non-negative magnitude (ps, kHz, permille, count).
+pub fn mag(v: i64) -> u64 {
+    if (v < 0) { return @as(u64, @intCast(0 - v)); }
+    return @as(u64, @intCast(v));
+}
+
+pub fn dec_digits(u: u64) -> u32 {
+    var n : u32 = 1;
+    var r : u64 = u;
+    while (r >= 10) { r = r / 10; n = n + 1; }
+    return n;
+}
+
+/// Digit j (0 = most significant) of u written with nd digits, zero padded.
+pub fn dec_char(u: u64, nd: u32, j: u32) -> u32 {
+    var p : u64 = 1;
+    var i : u32 = j + 1;
+    while (i < nd) { p = p * 10; i = i + 1; }
+    return 48 + ((u / p) % 10) as u32;
+}
+
+pub fn fmt_neg(v: i64) -> u32 {
+    if (v < 0) { return 1; }
+    return 0;
+}
+
+pub fn fmt_suffix(f: u8) -> u32 {
+    if (f == F_PERMILLE) { return 1; }
+    return 0;
+}
+
+/// Length of the value's text: [-]int[.frac][%]. The unit is the column header's, not the cell's.
+pub fn fmt_len(f: u8, v: i64) -> u32 {
+    const a : u64 = mag(v);
+    const fd : u32 = fmt_frac_digits(f);
+    var n : u32 = fmt_neg(v) + dec_digits(a / fmt_divisor(f));
+    if (fd > 0) { n = n + 1 + fd; }
+    return n + fmt_suffix(f);
+}
+
+pub fn fmt_char(f: u8, v: i64, k: u32) -> u32 {
+    const a : u64 = mag(v);
+    const fd : u32 = fmt_frac_digits(f);
+    const ip : u64 = a / fmt_divisor(f);
+    const fp : u64 = a % fmt_divisor(f);
+    const nd : u32 = dec_digits(ip);
+    var i : u32 = k;
+    if (fmt_neg(v) == 1) {
+        if (i == 0) { return 45; }
+        i = i - 1;
+    }
+    if (i < nd) { return dec_char(ip, nd, i); }
+    i = i - nd;
+    if (fd > 0) {
+        if (i == 0) { return 46; }
+        i = i - 1;
+        if (i < fd) { return dec_char(fp, fd, i); }
+        i = i - fd;
+    }
+    if (fmt_suffix(f) == 1) { if (i == 0) { return 37; } }
+    return 32;
+}
+
+/// One right-aligned cell of `width` columns: the value, or "not measured" when it is not known.
+pub fn cell_len(f: u8, known: bool, v: i64, width: u32) -> u32 {
+    var n : u32 = fmt_len(f, v);
+    if (known == false) { n = NOT_MEASURED_TEXT.len as u32; }
+    if (n < width) { return width; }
+    return n;
+}
+
+pub fn cell_char(f: u8, known: bool, v: i64, width: u32, k: u32) -> u32 {
+    var n : u32 = fmt_len(f, v);
+    if (known == false) { n = NOT_MEASURED_TEXT.len as u32; }
+    var pad : u32 = 0;
+    if (n < width) { pad = width - n; }
+    if (k < pad) { return 32; }
+    if (known == false) { return NOT_MEASURED_TEXT[k - pad] as u32; }
+    return fmt_char(f, v, k - pad);
+}
+
+/// Whether a cell renders exactly as `want` (a test and gate helper).
+pub fn cell_is(f: u8, known: bool, v: i64, width: u32, want: string) -> bool {
+    if (cell_len(f, known, v, width) != (want.len as u32)) { return false; }
+    var k : u32 = 0;
+    while (k < (want.len as u32)) {
+        if (cell_char(f, known, v, width, k) != (want[k] as u32)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- parsers of the lines the host reads
+
+/// Whether `openFPGALoader --scan-usb` lists the die's bus:device.
+pub fn scan_has_busdev(scan: string, d: u8) -> bool {
+    return text_find(scan, die_scan_busdev(d), 0) != TEXT_NONE;
+}
+
+/// Whether `--detect` (for that die's --busdev-num) lists the bench part's IDCODE first, version masked.
+pub fn die_idcode_ok(detect: string) -> bool {
+    return idcode_is_row(tp_idcode(detect, 0), DIE_BOARD);
+}
+
+/// The decimal number at text[at], or HEX_NONE when no digit is there.
+pub fn num_at(text: string, at: u32) -> u64 {
+    var i : u32 = at;
+    var v : u64 = 0;
+    var any : bool = false;
+    while (i < (text.len as u32)) {
+        const c : u32 = text[i] as u32;
+        if (c >= 48) {
+            if (c <= 57) { v = v * 10 + ((c - 48) as u64); any = true; i = i + 1; }
+            else { i = (text.len as u32); }
+        } else { i = (text.len as u32); }
+    }
+    if (any == false) { return HEX_NONE; }
+    return v;
+}
+
+/// Where the digits that start at `at` end.
+pub fn num_end(text: string, at: u32) -> u32 {
+    var i : u32 = at;
+    while (i < (text.len as u32)) {
+        const c : u32 = text[i] as u32;
+        if (c < 48) { return i; }
+        if (c > 57) { return i; }
+        i = i + 1;
+    }
+    return i;
+}
+
+pub const FMAX_KEY : str = "Max frequency for clock '";
+pub const FMAX_SEP : str = "': ";
+
+/// "Max frequency for clock 'slowclk': 32.87 MHz" -> 32870 (kHz), or HEX_NONE. The fraction is read to
+/// three digits, so a two-digit nextpnr fraction is scaled exactly.
+pub fn fmax_khz(line: string) -> u64 {
+    var at : u32 = text_find(line, FMAX_KEY, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    var s : u32 = text_find(line, FMAX_SEP, 0);
+    if (s == TEXT_NONE) { return HEX_NONE; }
+    s = s + (FMAX_SEP.len as u32);
+    var whole : u64 = num_at(line, s);
+    if (whole == HEX_NONE) { return HEX_NONE; }
+    var e : u32 = num_end(line, s);
+    var frac : u64 = 0;
+    var got : u32 = 0;
+    if (e < (line.len as u32)) {
+        if ((line[e] as u32) == 46) {
+            var j : u32 = e + 1;
+            while (got < 3) {
+                var c : u32 = 48;
+                if (j < (line.len as u32)) { c = line[j] as u32; }
+                if (c < 48) { c = 48; }
+                if (c > 57) { c = 48; }
+                frac = frac * 10 + ((c - 48) as u64);
+                got = got + 1;
+                j = j + 1;
+            }
+        }
+    }
+    return whole * 1000 + frac;
+}
+
+/// A receipt (docs/reports/silicon-runs/index.json layout, `"key": value`) -> its unix seconds.
+pub const RECEIPT_UTC : str = "\"utc_unix\": ";
+pub const RECEIPT_SEAL : str = "\"seal_hash\": \"sha256:";
+
+pub fn receipt_utc(receipt: string) -> u64 {
+    var at : u32 = text_find(receipt, RECEIPT_UTC, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    return num_at(receipt, at + (RECEIPT_UTC.len as u32));
+}
+
+/// The first 8 hex digits of the sealed hash, as one number, or HEX_NONE when fewer than 8 are there.
+pub fn receipt_seal_prefix(receipt: string) -> u64 {
+    var at : u32 = text_find(receipt, RECEIPT_SEAL, 0);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    var s : u32 = at + (RECEIPT_SEAL.len as u32);
+    var v : u64 = 0;
+    var k : u32 = 0;
+    while (k < 8) {
+        if (s + k >= (receipt.len as u32)) { return HEX_NONE; }
+        const d : u64 = hex_digit(receipt[s + k] as u32);
+        if (d == 16) { return HEX_NONE; }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+/// The UART line counter: how many newlines the capture holds.
+pub fn uart_lines(text: string) -> u64 {
+    var n : u64 = 0;
+    var i : u32 = 0;
+    while (i < (text.len as u32)) {
+        if ((text[i] as u32) == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- the BENCH cards (2026-10-20)
+// One card per board row. Card 0 is the AX7203 (registry row ax7203), card 1 the Zynq XC7Z020 (registry
+// row pzsdr-d: same cable serial and same PL part as die D of 2026-10-10; the board MODEL is a GUESS, see
+// fpga/HARDWARE_SSOT.md 2026-10-20). The window only draws what these functions say.
+pub const CARD_AX7203 : u8 = 0;
+pub const CARD_ZYNQ : u8 = 1;
+pub const CARD_COUNT : u8 = 2;
+
+pub fn card_board(c: u8) -> u8 {
+    if (c == CARD_ZYNQ) { return BOARD_PZSDR_D; }
+    return BOARD_AX7203;
+}
+
+pub fn card_title(c: u8) -> string {
+    if (c == CARD_ZYNQ) { return "Zynq XC7Z020"; }
+    return "AX7203";
+}
+
+/// Whether the board's MODEL is established. The AX7203 is (camera, 2026-10-08); the Zynq's is not.
+pub fn card_model_known(c: u8) -> bool { return c != CARD_ZYNQ; }
+
+pub fn card_model_text(c: u8) -> string {
+    if (c == CARD_ZYNQ) { return "model not established (guess)"; }
+    return "ALINX AX7203 (camera)";
+}
+
+pub fn card_cable_text(c: u8) -> string {
+    if (c == CARD_ZYNQ) { return "Digilent Adept FTDI2232"; }
+    return "Digilent HS2 FT232H";
+}
+
+pub fn card_serial(c: u8) -> string { return board_serial(card_board(c)); }
+
+/// The chain diagram: one box per TAP from TDI. The PL box is the registry's PL position.
+pub fn card_chain_len(c: u8) -> u32 { return chain_len(card_board(c)); }
+
+pub fn box_label(c: u8, k: u32) -> string {
+    if (k == pl_pos(card_board(c))) { return "PL"; }
+    return "ARM A9";
+}
+
+/// The IDCODE measured on 2026-10-20 at position k of the card, or HEX_NONE (not measured today: the
+/// AX7203's chain was empty).
+pub fn card_idcode_measured(c: u8, k: u32) -> u64 {
+    if (c == CARD_ZYNQ) {
+        if (k == 0) { return 0x4ba00477; }
+        if (k == 1) { return 0x3727093; }
+    }
+    return HEX_NONE;
+}
+
+// --- Provenance of the 2026-10-20 values: command text and time are the measurement itself.
+pub const CARD_MEASURED_AT : u64 = 1792488364;
+pub const FLD_CABLE : u8 = 0;
+pub const FLD_CHAIN : u8 = 1;
+pub const FLD_IDCODE : u8 = 2;
+pub const FLD_PORT : u8 = 3;
+pub const FLD_COUNT : u8 = 4;
+
+pub fn card_measured_command(c: u8, f: u8) -> string {
+    if (f == FLD_CABLE) { return "openFPGALoader --scan-usb"; }
+    if (f == FLD_PORT) { return "ls /dev/cu.usbserial-*"; }
+    if (c == CARD_ZYNQ) { return "openFPGALoader -c digilent --busdev-num 0:2 --detect"; }
+    return "openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect";
+}
+
+pub fn card_prov(c: u8, f: u8) -> u64 {
+    if (f == FLD_CABLE) { return prov_make(PV_MEASURED, SRC_SCAN_USB, CARD_MEASURED_AT); }
+    if (f == FLD_PORT) { return prov_make(PV_MEASURED, SRC_LS_TTY, CARD_MEASURED_AT); }
+    if (f == FLD_CHAIN) { return prov_make(PV_MEASURED, SRC_DETECT, CARD_MEASURED_AT); }
+    return prov_of(card_idcode_measured(c, pl_pos(card_board(c))) != HEX_NONE, false, SRC_DETECT, CARD_MEASURED_AT);
+}
+
+// --- Busdev is a value the host reads from the scan, never a constant (the bus moved from 1 to 0).
+pub const BUSDEV_NONE : u64 = 1099511627776;
+
+/// The start of the line that holds text[at].
+pub fn line_start(text: string, at: u32) -> u32 {
+    var i : u32 = at;
+    while (i > 0) {
+        if ((text[i - 1] as u32) == 10) { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// The row's cable bus*1000+device from `--scan-usb` ("000 004 0x..." or "001:004"), or BUSDEV_NONE
+/// unless exactly one cable matches the row.
+pub fn scan_busdev(scan: string, b: u8) -> u64 {
+    if (cables_matching(scan, b) != 1) { return BUSDEV_NONE; }
+    var at : u32 = text_next(scan, SCAN_VID, 0);
+    while (at != NOT_FOUND) {
+        if (text_hex_at(scan, at + (SCAN_VID.len as u32)) == board_pid(b)) {
+            if (line_has_serial(scan, at, b)) {
+                var s : u32 = line_start(scan, at);
+                var bus : u64 = num_at(scan, s);
+                if (bus == HEX_NONE) { return BUSDEV_NONE; }
+                var e : u32 = num_end(scan, s);
+                while (e < (scan.len as u32) && ((scan[e] as u32) == 32 || (scan[e] as u32) == 58)) { e = e + 1; }
+                var dev : u64 = num_at(scan, e);
+                if (dev == HEX_NONE) { return BUSDEV_NONE; }
+                return bus * 1000 + dev;
+            }
+        }
+        at = text_next(scan, SCAN_VID, at + 1);
+    }
+    return BUSDEV_NONE;
+}
+
+pub const CH_EMPTY : u8 = 0;
+pub const CH_OK : u8 = 1;
+pub const CH_OTHER : u8 = 2;
+
+// --- The TAPs of a real `openFPGALoader --detect` text (2026-10-20 fix). The tool aligns the key with spaces
+// ("idcode   0x4ba00477" next to "idcode 0x3727093"), so a TAP is: the word `idcode`, any spaces or tabs, `0x`.
+// The registry parser (detect_count) wants exactly one space and missed the first TAP of the Zynq chain, which
+// made the ARM A9 box show the PL id. A leading `empty` line and the `Jtag frequency` line carry no TAP.
+pub const TP_KEY : str = "idcode";
+
+/// Where the hex digits of the n-th TAP's idcode start in `detect`, or NOT_FOUND.
+pub fn tp_nth_start(detect: string, n: u32) -> u32 {
+    var seen : u32 = 0;
+    var from : u32 = 0;
+    var at : u32 = text_next(detect, TP_KEY, 0);
+    while (at != NOT_FOUND) {
+        var p : u32 = at + (TP_KEY.len as u32);
+        while (p < (detect.len as u32) && ((detect[p] as u32) == 32 || (detect[p] as u32) == 9)) { p = p + 1; }
+        if (p + 1 < (detect.len as u32) && (detect[p] as u32) == 48 && (detect[p + 1] as u32) == 120) {
+            if (seen == n) { return p + 2; }
+            seen = seen + 1;
+        }
+        at = text_next(detect, TP_KEY, at + 1);
+    }
+    return NOT_FOUND;
+}
+
+pub fn tp_count(detect: string) -> u32 {
+    var n : u32 = 0;
+    while (tp_nth_start(detect, n) != NOT_FOUND) { n = n + 1; }
+    return n;
+}
+
+/// The IDCODE of TAP n, or HEX_NONE.
+pub fn tp_idcode(detect: string, n: u32) -> u64 {
+    var at : u32 = tp_nth_start(detect, n);
+    if (at == NOT_FOUND) { return HEX_NONE; }
+    return text_hex_at(detect, at);
+}
+
+/// Where the value of `key` (manufacturer, family, model) in TAP n's block starts, or NOT_FOUND. The block ends
+/// where the next TAP begins.
+pub fn tp_field_at(detect: string, n: u32, key: string) -> u32 {
+    var s : u32 = tp_nth_start(detect, n);
+    if (s == NOT_FOUND) { return NOT_FOUND; }
+    var e : u32 = tp_nth_start(detect, n + 1);
+    if (e == NOT_FOUND) { e = detect.len as u32; }
+    var k : u32 = text_next(detect, key, s);
+    if (k == NOT_FOUND) { return NOT_FOUND; }
+    if (k >= e) { return NOT_FOUND; }
+    var p : u32 = k + (key.len as u32);
+    while (p < (detect.len as u32) && ((detect[p] as u32) == 32 || (detect[p] as u32) == 9)) { p = p + 1; }
+    if (p >= (detect.len as u32)) { return NOT_FOUND; }
+    if ((detect[p] as u32) == 10) { return NOT_FOUND; }
+    return p;
+}
+
+/// The length of that value: to the line end, trailing spaces trimmed.
+pub fn tp_field_len(detect: string, at: u32) -> u32 {
+    if (at == NOT_FOUND) { return 0; }
+    var e : u32 = line_end(detect, at);
+    while (e > at && ((detect[e - 1] as u32) == 32 || (detect[e - 1] as u32) == 9 || (detect[e - 1] as u32) == 13)) { e = e - 1; }
+    return e - at;
+}
+
+/// What a multi-device `--detect` says about the board: no device listed, the PL at the row's position
+/// answers the row's IDCODE (version masked), or something else is there.
+pub fn chain_state(detect: string, b: u8) -> u8 {
+    if (tp_count(detect) == 0) { return CH_EMPTY; }
+    if (idcode_is_row(tp_idcode(detect, pl_pos(b)), b)) {
+        if (tp_count(detect) == chain_len(b)) { return CH_OK; }
+    }
+    return CH_OTHER;
+}
+
+/// A card's state word from what the host read: the scan, the --detect text (ran or not), the ls text.
+pub fn card_state(c: u8, scan: string, detect: string, detect_ran: bool, ls: string) -> u64 {
+    var b : u8 = card_board(c);
+    var cable : bool = cables_matching(scan, b) >= 1;
+    var a : u64 = st_pack_a(cable, cable && chain_state(detect, b) == CH_OK && detect_ran, false, false, 0, false, 0);
+    if (cable && detect_ran) { a = a + ST_CHAIN_READ; }
+    if (port_count(ls, b) > 0) { a = a + ST_PORT; }
+    return a;
+}
+
+// --- Serial ports: a device node belongs to a board when its name ends with the board's cable serial
+// plus at most one channel digit. /dev/cu.usbserial-130 names no serial of ours and belongs to nobody.
+pub const PORT_PREFIX : str = "/dev/cu.usbserial-";
+
+pub fn port_belongs(ls: string, at: u32, b: u8) -> bool {
+    var e : u32 = line_end(ls, at);
+    var p : u32 = text_next(ls, PORT_PREFIX, at);
+    if (p == NOT_FOUND) { return false; }
+    if (p >= e) { return false; }
+    var serial : string = board_serial(b);
+    var n : u32 = serial.len as u32;
+    if (n == 0) { return false; }
+    var s : u32 = p + (PORT_PREFIX.len as u32);
+    var k : u32 = 0;
+    while (k < n) {
+        if (s + k >= e) { return false; }
+        if ((ls[s + k] as u32) != (serial[k] as u32)) { return false; }
+        k = k + 1;
+    }
+    var rest : u32 = e - (s + n);
+    if (rest == 0) { return true; }
+    if (rest > 1) { return false; }
+    var d : u32 = ls[s + n] as u32;
+    return d >= 48 && d <= 57;
+}
+
+/// How many device nodes in `ls /dev/cu.usbserial-*` are the board's, and where the n-th line starts.
+pub fn port_count(ls: string, b: u8) -> u32 {
+    var n : u32 = 0;
+    var at : u32 = 0;
+    while (at < (ls.len as u32)) {
+        if (port_belongs(ls, at, b)) { n = n + 1; }
+        at = line_end(ls, at) + 1;
+    }
+    return n;
+}
+
+pub fn port_nth_start(ls: string, b: u8, n: u32) -> u32 {
+    var seen : u32 = 0;
+    var at : u32 = 0;
+    while (at < (ls.len as u32)) {
+        if (port_belongs(ls, at, b)) {
+            if (seen == n) { return at; }
+            seen = seen + 1;
+        }
+        at = line_end(ls, at) + 1;
+    }
+    return NOT_FOUND;
+}
+
+// --- The lamp and the layout. Rows and columns are in text cells; the window multiplies by its cell.
+pub const LAMP_GREY : u8 = 0;    // no cable
+pub const LAMP_RED : u8 = 1;     // cable seen, chain empty
+pub const LAMP_AMBER : u8 = 2;   // cable seen, chain not read or not the board's
+pub const LAMP_GREEN : u8 = 3;   // ready
+pub const LAMP_BLUE : u8 = 4;    // running
+
+pub fn lamp_of(s: u8) -> u8 {
+    if (s == DIE_NO_CABLE) { return LAMP_GREY; }
+    if (s == DIE_CHAIN_EMPTY) { return LAMP_RED; }
+    if (s == DIE_CABLE_ONLY) { return LAMP_AMBER; }
+    if (s == DIE_READY) { return LAMP_GREEN; }
+    return LAMP_BLUE;
+}
+
+pub const ROW_TITLE : u8 = 0;
+pub const ROW_CHAIN : u8 = 1;
+pub const ROW_CABLE : u8 = 2;
+pub const ROW_SERIAL : u8 = 3;
+pub const ROW_BUSDEV : u8 = 4;
+pub const ROW_UART : u8 = 5;
+pub const ROW_STATUS : u8 = 6;
+pub const ROW_BUTTONS : u8 = 7;
+pub const ROW_COUNT : u8 = 8;
+pub const BN_BOX_W : u32 = 14;
+pub const BOX_GAP : u32 = 3;
+pub const BTN_W : u32 = 9;
+pub const BTN_GAP : u32 = 2;
+
+pub fn box_x(k: u32) -> u32 { return k * (BN_BOX_W + BOX_GAP); }
+pub fn chain_width(c: u8) -> u32 { return card_chain_len(c) * BN_BOX_W + (card_chain_len(c) - 1) * BOX_GAP; }
+pub fn btn_x(i: u32) -> u32 { return i * (BTN_W + BTN_GAP); }
+
+pub fn row_label(r: u8) -> string {
+    if (r == ROW_CHAIN) { return "chain"; }
+    if (r == ROW_CABLE) { return "cable"; }
+    if (r == ROW_SERIAL) { return "serial"; }
+    if (r == ROW_BUSDEV) { return "busdev"; }
+    if (r == ROW_UART) { return "uart"; }
+    if (r == ROW_STATUS) { return "status"; }
+    return "";
+}
+
+// --- The buttons. Their commands go to a PTY pane as text pieces; none runs unless the card allows it.
+pub const ACT_DETECT : u8 = 0;
+pub const ACT_FLASH : u8 = 1;
+pub const ACT_UART : u8 = 2;
+pub const ACT_COUNT : u8 = 3;
+pub const CMD_CAP : u32 = 200;
+pub const UART_BAUD_TEXT : str = " 115200\n";    // a default of this file, not a measured baud
+
+pub fn act_label(a: u8) -> string {
+    if (a == ACT_DETECT) { return "DETECT"; }
+    if (a == ACT_FLASH) { return "FLASH"; }
+    if (a == ACT_UART) { return "UART"; }
+    return "";
+}
+
+/// FLASH loads SRAM (no -f): reversible. It needs an explicit bitstream path and a confirm, every time.
+pub fn act_needs_confirm(a: u8) -> bool { return a == ACT_FLASH; }
+
+pub fn act_enabled(st: u64, a: u8) -> bool {
+    var s : u8 = die_status(st);
+    if (a == ACT_DETECT) { return s != DIE_NO_CABLE; }
+    if (a == ACT_FLASH) { return s == DIE_READY || s == DIE_RUNNING; }
+    if (a == ACT_UART) { return st_has(st, ST_PORT); }
+    return false;
+}
+
+/// Only path characters: no space, quote, semicolon, ampersand, pipe, dollar, backtick or newline reaches a shell.
+pub fn arg_safe(arg: string) -> bool {
+    var n : u32 = arg.len as u32;
+    if (n == 0) { return false; }
+    var i : u32 = 0;
+    while (i < n) {
+        var ch : u32 = arg[i] as u32;
+        var ok : bool = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122);
+        if (ch == 45 || ch == 46 || ch == 47 || ch == 95 || ch == 43 || ch == 126) { ok = true; }
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn ends_with(t: string, suffix: string) -> bool {
+    var n : u32 = t.len as u32;
+    var m : u32 = suffix.len as u32;
+    if (n < m) { return false; }
+    var k : u32 = 0;
+    while (k < m) {
+        if ((t[n - m + k] as u32) != (suffix[k] as u32)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn cmd_allowed(c: u8, a: u8, st: u64, bus: u64, arg: string, confirm: bool) -> bool {
+    if (c >= CARD_COUNT) { return false; }
+    if (act_enabled(st, a) == false) { return false; }
+    if (a != ACT_UART) { if (bus == BUSDEV_NONE) { return false; } }
+    if (a != ACT_DETECT) {
+        if (arg_safe(arg) == false) { return false; }
+    }
+    if (a == ACT_FLASH) {
+        if (confirm == false) { return false; }
+        if (ends_with(arg, ".bit") == false) { return false; }
+    }
+    if (a == ACT_UART) {
+        if (text_find(arg, PORT_PREFIX, 0) != 0) { return false; }
+    }
+    return cmd_raw_len(c, a, bus, arg) <= CMD_CAP;
+}
+
+/// Pieces 0..8: text, cable name, text, bus digits, ":", device digits, tail, the path, the end.
+pub const CMD_PIECES : u32 = 9;
+
+pub fn cmd_text(c: u8, a: u8, p: u32, arg: string) -> string {
+    var uart : bool = a == ACT_UART;
+    if (p == 0) { if (uart) { return "screen "; } return "openFPGALoader -c "; }
+    if (p == 1) { if (uart) { return ""; } return board_cable(card_board(c)); }
+    if (p == 2) { if (uart) { return ""; } return " --busdev-num "; }
+    if (p == 4) { if (uart) { return ""; } return ":"; }
+    if (p == 6) {
+        if (a == ACT_DETECT) { return " --detect\n"; }
+        if (a == ACT_FLASH) { return " "; }
+        return "";
+    }
+    if (p == 7) { if (a == ACT_DETECT) { return ""; } return arg; }
+    if (p == 8) {
+        if (a == ACT_FLASH) { return "\n"; }
+        if (uart) { return UART_BAUD_TEXT; }
+        return "";
+    }
+    return "";
+}
+
+pub fn cmd_piece_len(c: u8, a: u8, bus: u64, arg: string, p: u32) -> u32 {
+    if (p == 3) { if (a == ACT_UART) { return 0; } return dec_digits(bus / 1000); }
+    if (p == 5) { if (a == ACT_UART) { return 0; } return dec_digits(bus % 1000); }
+    var t : string = cmd_text(c, a, p, arg);
+    return t.len as u32;
+}
+
+pub fn cmd_raw_len(c: u8, a: u8, bus: u64, arg: string) -> u32 {
+    var n : u32 = 0;
+    var p : u32 = 0;
+    while (p < CMD_PIECES) { n = n + cmd_piece_len(c, a, bus, arg, p); p = p + 1; }
+    return n;
+}
+
+/// The command as its length and k-th character; length 0 when the card does not allow it.
+pub fn cmd_len(c: u8, a: u8, st: u64, bus: u64, arg: string, confirm: bool) -> u32 {
+    if (cmd_allowed(c, a, st, bus, arg, confirm) == false) { return 0; }
+    return cmd_raw_len(c, a, bus, arg);
+}
+
+pub fn cmd_char(c: u8, a: u8, bus: u64, arg: string, k: u32) -> u32 {
+    var at : u32 = k;
+    var p : u32 = 0;
+    while (p < CMD_PIECES) {
+        var n : u32 = cmd_piece_len(c, a, bus, arg, p);
+        if (at < n) {
+            if (p == 3) { return dec_char(bus / 1000, n, at); }
+            if (p == 5) { return dec_char(bus % 1000, n, at); }
+            var t : string = cmd_text(c, a, p, arg);
+            return t[at] as u32;
+        }
+        at = at - n;
+        p = p + 1;
+    }
+    return 0;
+}
+
+pub fn cmd_is(c: u8, a: u8, st: u64, bus: u64, arg: string, confirm: bool, want: string) -> bool {
+    if (cmd_len(c, a, st, bus, arg, confirm) != (want.len as u32)) { return false; }
+    var k : u32 = 0;
+    while (k < (want.len as u32)) {
+        if (cmd_char(c, a, bus, arg, k) != (want[k] as u32)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- the host feed of the B page (2026-10-20)
+// While the B page is open the host refreshes the cards every BENCH_PERIOD seconds (agent_parts PERIOD_BENCH) and
+// never blocks the draw: each stage is one background `/bin/sh -c` (posix_spawn, like the card curl) that writes a
+// file under ~/.t27os/bench/ and renames it into place, so a half-written file is never read. Stage 1 runs
+// `openFPGALoader --scan-usb` and `ls /dev/cu.usbserial-*`; when it ends the host reads the scan, takes each
+// card's busdev with scan_busdev, and stage 2 runs `openFPGALoader -c <cable> --busdev-num <b> --detect` for each
+// card whose cable is seen exactly once. The parsers above (card_state and the rest) read those files; this block
+// only builds the command text. A job that runs longer than FEED_KILL_S is killed and the cycle starts over.
+pub const FEED_KILL_S : u64 = 25;
+pub const BENCH_DIR : str = "/.t27os/bench/";
+pub const FILE_SCAN : str = "scan.txt";
+pub const FILE_LS : str = "ls.txt";
+pub const FILE_RUN : str = "run.txt";
+pub const FEED_HEAD_A : str = "export HOME=\"";
+pub const FEED_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; D=$HOME/.t27os/bench; mkdir -p $D; ";
+pub const FEED_SCAN : str = "openFPGALoader --scan-usb > $D/scan.txt.part 2>&1; mv $D/scan.txt.part $D/scan.txt; ls /dev/cu.usbserial-* > $D/ls.txt.part 2>/dev/null; mv $D/ls.txt.part $D/ls.txt; true";
+pub const FEED_RUN_TAIL : str = " > $D/run.txt.part 2>&1; mv $D/run.txt.part $D/run.txt; true";
+pub const UV_A : str = "stty -f ";
+pub const UV_B : str = " 115200 raw -echo; ( cat ";
+pub const UV_C : str = " > $D/run.txt.part & p=$!; sleep 3; kill $p ); mv $D/run.txt.part $D/run.txt; true";
+pub const FEED_DET_PIECES : u32 = 7;
+
+/// The file the --detect of card c is written to: det0.txt, det1.txt.
+pub fn file_detect(c: u8) -> string {
+    if (c == CARD_ZYNQ) { return "det1.txt"; }
+    return "det0.txt";
+}
+
+pub fn card_digit(c: u8) -> string {
+    if (c == CARD_ZYNQ) { return "1"; }
+    return "0";
+}
+
+/// The redirect and rename after card c's detect command: " > $D/det<c>.txt.part 2>&1; mv ... ; ".
+pub fn feed_det_piece(c: u8, p: u32) -> string {
+    if (p == 0) { return " > $D/det"; }
+    if (p == 2) { return ".txt.part 2>&1; mv $D/det"; }
+    if (p == 4) { return ".txt.part $D/det"; }
+    if (p == 6) { return ".txt; "; }
+    if (p == 1 or p == 3 or p == 5) { return card_digit(c); }
+    return "";
+}
+
+/// The detect command of card c as the host runs it: the PTY command without its trailing LF. 0 when the card is
+/// not allowed to run it (no cable seen, no single busdev).
+pub fn feed_detect_len(c: u8, st: u64, bus: u64) -> u32 {
+    const n : u32 = cmd_len(c, ACT_DETECT, st, bus, "", false);
+    if (n == 0) { return 0; }
+    return n - 1;
+}
+
+pub fn feed_detect_char(c: u8, bus: u64, k: u32) -> u32 { return cmd_char(c, ACT_DETECT, bus, "", k); }
+
+/// The FLASH command as the host runs it (SRAM load, no -f): the PTY command without its trailing LF; 0 unless the
+/// card allows it (a .bit path of safe characters, confirmed, the chain answering).
+pub fn host_flash_len(c: u8, st: u64, bus: u64, path: string, confirm: bool) -> u32 {
+    const n : u32 = cmd_len(c, ACT_FLASH, st, bus, path, confirm);
+    if (n == 0) { return 0; }
+    return n - 1;
+}
+
+pub fn host_flash_char(c: u8, bus: u64, path: string, k: u32) -> u32 { return cmd_char(c, ACT_FLASH, bus, path, k); }
+
+/// The UART button needs a PTY pane for `screen`; the server only spawns agents and editors, so the host runs the
+/// non-interactive view instead (stty + 3 s of cat into the run log). Allowed under the same rule as the PTY command.
+pub fn uart_view_allowed(c: u8, st: u64, port: string) -> bool {
+    return cmd_allowed(c, ACT_UART, st, 0, port, false);
+}
+
+/// Serial node n of card c: its offset in the `ls` text and its length (0 when there is none).
+pub fn port_at(ls: string, c: u8, n: u32) -> u32 { return port_nth_start(ls, card_board(c), n); }
+
+pub fn port_len(ls: string, at: u32) -> u32 {
+    if (at == NOT_FOUND) { return 0; }
+    return line_end(ls, at) - at;
+}
+
+/// The cable busdev of card c from the scan text, or BUSDEV_NONE (also when several cables match).
+pub fn card_busdev(c: u8, scan: string) -> u64 { return scan_busdev(scan, card_board(c)); }
+
+/// The live IDCODE at TAP position k of card c from its --detect text, or HEX_NONE when the chain has no such TAP.
+pub fn card_idcode_live(detect: string, k: u32) -> u64 {
+    if (k >= tp_count(detect)) { return HEX_NONE; }
+    return tp_idcode(detect, k);
+}
+
+/// Whether an IDCODE read is a value (not HEX_NONE), and whether a busdev is a cable (not BUSDEV_NONE).
+pub fn idcode_known(v: u64) -> bool { return v != HEX_NONE; }
+pub fn bus_known(b: u64) -> bool { return b != BUSDEV_NONE; }
+pub fn bus_none() -> u64 { return BUSDEV_NONE; }
+
+// ---------------------------------------------------------------- the FLASH dialogue (a path, then a confirm)
+pub const FS_NONE : u32 = 0;
+pub const FS_TYPING : u32 = 1;
+pub const FS_CONFIRM : u32 = 2;
+pub const FS_RUN : u32 = 3;
+pub const FE_FLASH_CLICK : u32 = 0;
+pub const FE_RETURN : u32 = 1;
+pub const FE_ESCAPE : u32 = 2;
+pub const FE_CONFIRM : u32 = 3;
+pub const FE_CANCEL : u32 = 4;
+pub const FLASH_PATH_MAX : u32 = 160;
+
+/// One step of the dialogue. A Return only moves from typing to the confirm line and only for a fit path; the
+/// load starts on the CONFIRM button alone, never on a key.
+pub fn fs_next(stage: u32, ev: u32, path_ok: bool) -> u32 {
+    if (stage == FS_NONE) {
+        if (ev == FE_FLASH_CLICK) { return FS_TYPING; }
+        return FS_NONE;
+    }
+    if (ev == FE_ESCAPE or ev == FE_CANCEL) { return FS_NONE; }
+    if (stage == FS_TYPING) {
+        if (ev == FE_RETURN and path_ok) { return FS_CONFIRM; }
+        return FS_TYPING;
+    }
+    if (stage == FS_CONFIRM) {
+        if (ev == FE_CONFIRM) { return FS_RUN; }
+        return FS_CONFIRM;
+    }
+    return FS_NONE;
+}
+
+/// A key typed into the path field: a path character of arg_safe, and the field is not full.
+pub fn flash_char_ok(ch: u32, len: u32) -> bool {
+    if (len >= FLASH_PATH_MAX) { return false; }
+    if (ch >= 48 and ch <= 57) { return true; }
+    if (ch >= 65 and ch <= 90) { return true; }
+    if (ch >= 97 and ch <= 122) { return true; }
+    return ch == 45 or ch == 46 or ch == 47 or ch == 95 or ch == 43 or ch == 126;
+}
+
+/// The typed path is fit to be confirmed: safe characters, ends in .bit, within the field.
+pub fn flash_path_ok(path: string) -> bool {
+    if ((path.len as u32) > FLASH_PATH_MAX) { return false; }
+    return arg_safe(path) and ends_with(path, ".bit");
+}
+
+// ---------------------------------------------------------------- the layout of the B page (px, relative to the page)
+pub const BP_PAD : f64 = 14.0;
+pub const BP_GAP : f64 = 10.0;
+pub const BP_CARD_H : f64 = 150.0;
+pub const BP_CARD_MAX_W : f64 = 880.0;
+pub const BP_BTN_W : f64 = 86.0;
+pub const BP_BTN_H : f64 = 24.0;
+pub const BP_BTN_GAP : f64 = 8.0;
+pub const BH_NONE : u32 = 4294967295;
+pub const BH_DETECT : u32 = 0;
+pub const BH_FLASH : u32 = 1;
+pub const BH_UART : u32 = 2;
+pub const BH_CONFIRM : u32 = 3;
+pub const BH_CANCEL : u32 = 4;
+pub const BH_FIELD : u32 = 5;
+
+pub fn bp_card_w(pw: f64) -> f64 {
+    const w : f64 = pw - 2.0 * BP_PAD;
+    if (w > BP_CARD_MAX_W) { return BP_CARD_MAX_W; }
+    if (w < 200.0) { return 200.0; }
+    return w;
+}
+
+pub fn bp_card_y(c: u8) -> f64 { return BP_PAD + (c as f64) * (BP_CARD_H + BP_GAP); }
+pub fn bp_btn_x(i: u32) -> f64 { return BP_PAD + (i as f64) * (BP_BTN_W + BP_BTN_GAP); }
+pub fn bp_btn_y() -> f64 { return BP_CARD_H - BP_PAD - BP_BTN_H; }
+pub fn bp_confirm_x(cw: f64) -> f64 { return cw - BP_PAD - 2.0 * BP_BTN_W - BP_BTN_GAP; }
+pub fn bp_cancel_x(cw: f64) -> f64 { return cw - BP_PAD - BP_BTN_W; }
+pub fn bp_field_w(cw: f64) -> f64 { return bp_confirm_x(cw) - BP_BTN_GAP - BP_PAD; }
+pub fn bp_log_y() -> f64 { return BP_PAD + (CARD_COUNT as f64) * (BP_CARD_H + BP_GAP); }
+
+pub fn bp_log_h(ph: f64) -> f64 {
+    const h : f64 = ph - bp_log_y() - BP_PAD;
+    if (h < 56.0) { return 56.0; }
+    return h;
+}
+
+fn bp_in(x: f64, y: f64, l: f64, t: f64, w: f64, h: f64) -> bool {
+    return x >= l and x < l + w and y >= t and y < t + h;
+}
+
+/// The control under (x, y) of a page pw wide: card * 8 + BH_*, BH_NONE when none. While a card asks for a FLASH
+/// path (ask_card < CARD_COUNT) its three buttons are replaced by the field, CONFIRM and CANCEL.
+pub fn bp_hit(x: f64, y: f64, pw: f64, ask_card: u32) -> u32 {
+    const cw : f64 = bp_card_w(pw);
+    var c : u32 = 0;
+    while (c < (CARD_COUNT as u32)) {
+        const top : f64 = bp_card_y(c as u8);
+        const by : f64 = top + bp_btn_y();
+        if (c == ask_card) {
+            if (bp_in(x, y, BP_PAD + bp_confirm_x(cw), by, BP_BTN_W, BP_BTN_H)) { return c * 8 + BH_CONFIRM; }
+            if (bp_in(x, y, BP_PAD + bp_cancel_x(cw), by, BP_BTN_W, BP_BTN_H)) { return c * 8 + BH_CANCEL; }
+            if (bp_in(x, y, BP_PAD + BP_PAD, by, bp_field_w(cw), BP_BTN_H)) { return c * 8 + BH_FIELD; }
+        } else {
+            var i : u32 = 0;
+            while (i < (ACT_COUNT as u32)) {
+                if (bp_in(x, y, BP_PAD + bp_btn_x(i), by, BP_BTN_W, BP_BTN_H)) { return c * 8 + i; }
+                i = i + 1;
+            }
+        }
+        c = c + 1;
+    }
+    return BH_NONE;
+}
+
+// ---------------------------------------------------------------- tests
+
+test three_dice_share_one_row_and_differ_by_busdev {
+    assert DIE_COUNT == 3;
+    assert die_device(DIE_A) == "xc7a200tfbg484-2";
+    assert die_device(DIE_C) == "xc7a200tfbg484-2";
+    assert die_idcode(DIE_B) == 0x03636093;
+    assert die_serial(DIE_A) == "210512180081";
+    assert die_busdev(DIE_A) == "1:4";
+    assert die_busdev(DIE_B) == "1:6";
+    assert die_busdev(DIE_C) == "1:8";
+    assert die_scan_busdev(DIE_B) == "001:006";
+    assert die_name(DIE_A) == "A";
+    assert die_name(DIE_B) == "B";
+    assert die_name(DIE_C) == "C";
+}
+
+test scan_and_detect_parse_the_real_layout {
+    // fpga/HARDWARE_SSOT.md W791: --scan-usb lists 001:004 / 001:006 / 001:008 at 0x0403:0x6014,
+    // serial 210512180081; --detect prints "idcode 0x3636093" (layout of bench_boards.t27 tests).
+    const scan : string = "Bus device vid:pid       probe type      manufacturer serial               product\n001:004 0x0403:0x6014   FTDI2232H       Digilent  210512180081 Digilent USB Device\n001:006 0x0403:0x6014   FTDI2232H       Digilent  210512180081 Digilent USB Device\n";
+    assert scan_has_busdev(scan, DIE_A);
+    assert scan_has_busdev(scan, DIE_B);
+    assert scan_has_busdev(scan, DIE_C) == false;
+    const detect : string = "index 0:\n    idcode 0x3636093\n    manufacturer xilinx\n    family artix a7 200t\n    model  xc7a200\n    irlength 6\n";
+    assert die_idcode_ok(detect);
+    assert die_idcode_ok("index 0:\n    idcode 0x23727093\n") == false;
+    assert die_idcode_ok("") == false;
+}
+
+test state_packs_into_two_integers {
+    const a : u64 = st_pack_a(true, true, true, true, 165, true, 4000000);
+    const b : u64 = st_pack_b(0xa769f41e, 1791402176);
+    assert st_has(a, ST_CABLE);
+    assert st_has(a, ST_IDCODE);
+    assert st_has(a, ST_LOADED);
+    assert st_led(a) == 165;
+    assert st_uart(a) == 4000000;
+    assert st_sha_prefix(b) == 0xa769f41e;
+    assert st_loaded_at(b) == 1791402176;
+    assert die_status(a) == DIE_RUNNING;
+    assert die_status(st_pack_a(true, true, false, false, 0, false, 0)) == DIE_READY;
+    assert die_status(st_pack_a(true, false, false, false, 0, false, 0)) == DIE_CABLE_ONLY;
+    assert die_status(st_pack_a(false, true, true, false, 0, false, 0)) == DIE_NO_CABLE;
+    assert die_status_text(DIE_CABLE_ONLY) == "cable, idcode not read";
+    // an LED byte that was not read is not 0
+    const dark : u64 = st_pack_a(true, true, true, false, 0, false, 0);
+    assert st_has(dark, ST_LED_KNOWN) == false;
+    assert st_has(dark, ST_UART_KNOWN) == false;
+}
+
+test every_provenance_kind_carries_its_command_and_time {
+    const m : u64 = prov_of(true, false, SRC_DETECT, 1791402176);
+    const d : u64 = prov_of(true, true, SRC_DATASHEET, 0);
+    const n : u64 = prov_of(false, false, SRC_NEXTPNR, 1791402176);
+    assert prov_kind(m) == PV_MEASURED;
+    assert prov_src(m) == SRC_DETECT;
+    assert prov_at(m) == 1791402176;
+    assert prov_kind(d) == PV_DERIVED;
+    assert prov_src(d) == SRC_DATASHEET;
+    assert prov_kind(n) == PV_NOT_MEASURED;
+    assert prov_src(n) == BN_SRC_NONE;
+    assert prov_at(n) == 0;
+    assert prov_has_source(m);
+    assert prov_has_source(d);
+    assert prov_has_source(n) == false;
+    assert prov_kind_text(PV_MEASURED) == "measured";
+    assert prov_kind_text(PV_DERIVED) == "derived";
+    assert prov_kind_text(PV_NOT_MEASURED) == "not measured";
+    assert PV_KIND_COUNT == 3;
+    assert src_command(SRC_SCAN_USB) == "openFPGALoader -c digilent_hs2 --scan-usb";
+    assert src_command(BN_SRC_NONE) == "";
+    assert SRC_COUNT == 13;
+    assert src_command(SRC_LS_TTY) == "ls /dev/cu.usbserial-*";
+}
+
+test the_summary_row_knows_its_part {
+    assert proj_name(PROJ_T27B) == "T27B";
+    assert proj_name(PROJ_T27C) == "T27C";
+    assert proj_device(PROJ_T27C) == "xc7a200tfbg484-2";
+    assert col_capacity(COL_LUT) == 134600;
+    assert col_capacity(COL_FF) == 269200;
+    assert col_capacity(COL_BRAM) == 365;
+    assert col_capacity(COL_DSP) == 740;
+    assert col_capacity(COL_WNS) == 0;
+    assert col_is_resource(COL_DSP);
+    assert col_is_resource(COL_WNS) == false;
+    assert col_name(COL_FMAX) == "Fmax MHz";
+    assert col_fmt(COL_WNS) == F_NS;
+    assert col_fmt(COL_LUT) == BN_F_COUNT;
+    assert BN_COL_COUNT == 8;
+}
+
+test percent_is_permille_rounded_half_up {
+    // 1196 LUT is the yosys count in docs/analog/board-regression-2026-10-19.md
+    assert permille(1196, 134600) == 9;
+    assert permille(67300, 134600) == 500;
+    assert permille(134600, 134600) == 1000;
+    assert permille(0, 134600) == 0;
+    assert permille(5, 0) == 0;
+    assert cell_is(F_PERMILLE, true, 9, 0, "0.9%");
+    assert cell_is(F_PERMILLE, true, 500, 0, "50.0%");
+    assert cell_is(F_PERMILLE, true, 1000, 0, "100.0%");
+}
+
+test picoseconds_print_as_nanoseconds_with_three_decimals_and_a_sign {
+    assert cell_is(F_NS, true, 1234, 0, "1.234");
+    assert cell_is(F_NS, true, 0, 0, "0.000");
+    assert cell_is(F_NS, true, 5, 0, "0.005");
+    assert cell_is(F_NS, true, -1234, 0, "-1.234");
+    assert cell_is(F_NS, true, -5, 0, "-0.005");
+    assert cell_is(F_NS, true, -12500000, 0, "-12500.000");
+    assert cell_is(F_MHZ, true, 32870, 0, "32.870");
+    assert cell_is(F_MHZ, true, 846020, 0, "846.020");
+}
+
+test negative_slack_is_a_violation_and_unknown_slack_says_nothing {
+    assert timing_verdict(true, 250) == TIMING_MET;
+    assert timing_verdict(true, 0) == TIMING_MET;
+    assert timing_verdict(true, -1) == TIMING_VIOLATED;
+    assert timing_verdict(false, -1) == TIMING_UNKNOWN;
+    assert timing_verdict(false, 0) == TIMING_UNKNOWN;
+}
+
+test a_value_without_a_measurement_prints_not_measured_never_zero {
+    assert cell_is(BN_F_COUNT, false, 0, 0, "not measured");
+    assert cell_is(F_NS, false, 0, 0, "not measured");
+    assert cell_is(F_MHZ, false, 0, 0, "not measured");
+    assert cell_is(F_PERMILLE, false, 0, 0, "not measured");
+    // a measured zero is a zero: "0 DSP" is a result
+    assert cell_is(BN_F_COUNT, true, 0, 0, "0");
+    assert cell_is(BN_F_COUNT, false, 0, 0, "0") == false;
+}
+
+test columns_align_to_the_right {
+    assert cell_is(BN_F_COUNT, true, 1196, 8, "    1196");
+    assert cell_is(F_NS, true, -1234, 8, "  -1.234");
+    assert cell_is(BN_F_COUNT, false, 0, 14, "  not measured");
+    assert cell_is(BN_F_COUNT, true, 123456789, 4, "123456789");
+    assert cell_len(BN_F_COUNT, true, 7, 6) == 6;
+    assert cell_len(BN_F_COUNT, false, 0, 6) == 12;
+}
+
+test fmax_parses_the_nextpnr_line {
+    // docs/theory/IGLA-FORMAL-RESULTS.md line 23846 and 23848
+    assert fmax_khz("    Max frequency for clock 'slowclk': 32.87 MHz (PASS at 8.85 MHz)") == 32870;
+    assert fmax_khz("    Max frequency for clock 'cfgmclk': 846.02 MHz (PASS at 70.77 MHz)") == 846020;
+    assert fmax_khz("Max frequency for clock 'c': 100 MHz") == 100000;
+    assert fmax_khz("nothing here") == HEX_NONE;
+    assert fmax_khz("Max frequency for clock 'c': MHz") == HEX_NONE;
+}
+
+test the_receipt_gives_the_loaded_seal_and_its_time {
+    // docs/reports/silicon-runs/index.json, first receipt (pretty-printed layout)
+    const r : string = "{\n        \"auth\": \"FRESH\",\n        \"device_dna\": \"050d58218fd9854\",\n        \"seal_hash\": \"sha256:a769f41ecf2da17a27d68cabd5f0a132f010b89a3d08eade51a454ba8064e7fa\",\n        \"utc_unix\": 1791402176,\n        \"verdict_word\": 0\n}";
+    assert receipt_utc(r) == 1791402176;
+    assert receipt_seal_prefix(r) == 0xa769f41e;
+    assert receipt_utc("{}") == HEX_NONE;
+    assert receipt_seal_prefix("{}") == HEX_NONE;
+    assert receipt_seal_prefix("\"seal_hash\": \"sha256:a76") == HEX_NONE;
+}
+
+test the_uart_counter_counts_lines {
+    assert uart_lines("") == 0;
+    assert uart_lines("a\nb\nc\n") == 3;
+    assert uart_lines("no newline yet") == 0;
+}
+
+test the_2026_10_20_bench_two_cables_on_bus_zero {
+    const scan : string = "found 2 USB device\nBus device vid:pid       probe type      manufacturer serial               product\n000 004    0x0403:0x6014 ft232H          Digilent     210512180081         Digilent USB Device\n000 002    0x0403:0x6010 FTDI2232        Digilent     210203859289         Digilent Adept USB Device\n";
+    assert scan_busdev(scan, BOARD_AX7203) == 4;
+    assert scan_busdev(scan, BOARD_PZSDR_D) == 2;
+    assert scan_busdev("001:006 0x0403:0x6014 ft232H Digilent 210512180081 x\n", BOARD_AX7203) == 1006;
+    // three QMTech cables share one serial: no single busdev
+    const three : string = "001 004 0x0403:0x6014 a 210512180081 b\n001 006 0x0403:0x6014 a 210512180081 b\n001 008 0x0403:0x6014 a 210512180081 b\n";
+    assert scan_busdev(three, BOARD_AX7203) == BUSDEV_NONE;
+    assert scan_busdev("", BOARD_PZSDR_D) == BUSDEV_NONE;
+    assert line_start("ab\ncd", 4) == 3;
+    assert line_start("ab\ncd", 1) == 0;
+}
+
+test a_two_device_chain_and_an_empty_chain_are_told_apart {
+    const zynq : string = "index 0:\n\tidcode 0x4ba00477\n\ttype ARM cortex A9\n\tirlength 4\nindex 1:\n\tidcode 0x3727093\n";
+    const empty : string = "Jtag frequency : requested 6.00MHz -> real 6.00MHz\n";
+    assert chain_state(zynq, BOARD_PZSDR_D) == CH_OK;
+    assert chain_state(empty, BOARD_AX7203) == CH_EMPTY;
+    assert chain_state(zynq, BOARD_AX7203) == CH_OTHER;
+    assert chain_state("index 0:\n\tidcode 0x3636093\n", BOARD_AX7203) == CH_OK;
+    const scan : string = "000 004 0x0403:0x6014 ft232H Digilent 210512180081 x\n000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 y\n";
+    const ls : string = "/dev/cu.usbserial-130\n/dev/cu.usbserial-2102038592890\n/dev/cu.usbserial-2102038592891\n/dev/cu.usbserial-210512180081\n";
+    const z : u64 = card_state(CARD_ZYNQ, scan, zynq, true, ls);
+    const x : u64 = card_state(CARD_AX7203, scan, empty, true, ls);
+    assert die_status(z) == DIE_READY;
+    assert die_status_text(die_status(z)) == "ready";
+    assert st_has(z, ST_PORT);
+    assert die_status(x) == DIE_CHAIN_EMPTY;
+    assert die_status_text(die_status(x)) == "chain empty";
+    assert die_status(x) != DIE_NO_CABLE;
+    // no cable at all is a different word
+    assert die_status(card_state(CARD_ZYNQ, "", "", false, "")) == DIE_NO_CABLE;
+    // a cable that --detect has not been run against is not an empty chain
+    assert die_status(card_state(CARD_AX7203, scan, "", false, ls)) == DIE_CABLE_ONLY;
+    assert lamp_of(DIE_NO_CABLE) == LAMP_GREY;
+    assert lamp_of(DIE_CHAIN_EMPTY) == LAMP_RED;
+    assert lamp_of(DIE_CABLE_ONLY) == LAMP_AMBER;
+    assert lamp_of(DIE_READY) == LAMP_GREEN;
+    assert lamp_of(DIE_RUNNING) == LAMP_BLUE;
+}
+
+test the_real_zynq_and_empty_detect_files_of_2026_10_20_are_read_whole {
+    const det1 : string = "empty\nJtag frequency : requested 6.00MHz    -> real 6.00MHz   \nindex 0:\n\tidcode   0x4ba00477\n\ttype     ARM cortex A9\n\tirlength 4\nindex 1:\n\tidcode 0x3727093\n\tmanufacturer xilinx\n\tfamily zynq\n\tmodel  xc7z020\n\tirlength 6\n";
+    const det0 : string = "empty\nJtag frequency : requested 6.00MHz    -> real 6.00MHz   \n";
+    const ls : string = "/dev/cu.usbserial-130\n/dev/cu.usbserial-2102038592890\n/dev/cu.usbserial-2102038592891\n/dev/cu.usbserial-210512180081\n";
+    const scan : string = "empty\nBus device vid:pid       probe_type manufacturer serial       product\n000 004    0x0403:0x6014 ft232H     Digilent     210512180081 Digilent USB Device\n000 002    0x0403:0x6010 FTDI2232   Digilent     210203859289 Digilent Adept USB Device\n";
+    assert tp_count(det1) == 2;
+    assert tp_count(det0) == 0;
+    assert tp_idcode(det1, 0) == 0x4ba00477;
+    assert tp_idcode(det1, 1) == 0x3727093;
+    assert tp_idcode(det1, 2) == HEX_NONE;
+    assert card_idcode_live(det1, 0) == 0x4ba00477;
+    assert card_idcode_live(det1, 1) == 0x3727093;
+    assert chain_state(det1, BOARD_PZSDR_D) == CH_OK;
+    assert chain_state(det0, BOARD_AX7203) == CH_EMPTY;
+    assert chain_state(det1, BOARD_AX7203) == CH_OTHER;
+    assert tp_field_len(det1, tp_field_at(det1, 1, "manufacturer")) == 6;
+    assert tp_field_len(det1, tp_field_at(det1, 1, "family")) == 4;
+    assert tp_field_len(det1, tp_field_at(det1, 1, "model")) == 7;
+    assert tp_field_at(det1, 0, "model") == NOT_FOUND;
+    assert tp_field_at(det0, 0, "model") == NOT_FOUND;
+    assert text_find(det1, "xc7z020", 0) == tp_field_at(det1, 1, "model");
+    const z : u64 = card_state(CARD_ZYNQ, scan, det1, true, ls);
+    const x : u64 = card_state(CARD_AX7203, scan, det0, true, ls);
+    assert die_status(z) == DIE_READY;
+    assert lamp_of(die_status(z)) == LAMP_GREEN;
+    assert die_status(x) == DIE_CHAIN_EMPTY;
+    assert lamp_of(die_status(x)) == LAMP_RED;
+    assert port_count(ls, BOARD_PZSDR_D) == 2;
+    assert port_count(ls, BOARD_AX7203) == 1;
+    assert port_len(ls, port_at(ls, CARD_AX7203, 0)) == 30;
+    const bz : u64 = card_busdev(CARD_ZYNQ, scan);
+    const bx : u64 = card_busdev(CARD_AX7203, scan);
+    assert bz == 2;
+    assert bx == 4;
+    assert cmd_is(CARD_ZYNQ, ACT_DETECT, z, bz, "", false, "openFPGALoader -c digilent --busdev-num 0:2 --detect\n");
+    assert cmd_is(CARD_AX7203, ACT_DETECT, x, bx, "", false, "openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect\n");
+}
+
+test serial_ports_belong_by_the_cable_serial {
+    const ls : string = "/dev/cu.usbserial-130\n/dev/cu.usbserial-2102038592890\n/dev/cu.usbserial-2102038592891\n/dev/cu.usbserial-210512180081\n";
+    assert port_count(ls, BOARD_PZSDR_D) == 2;
+    assert port_count(ls, BOARD_AX7203) == 1;
+    assert port_nth_start(ls, BOARD_PZSDR_D, 0) == 22;
+    assert port_nth_start(ls, BOARD_PZSDR_D, 1) == 54;
+    assert port_nth_start(ls, BOARD_PZSDR_D, 2) == NOT_FOUND;
+    // a longer digit tail is another serial
+    assert port_count("/dev/cu.usbserial-21020385928912\n", BOARD_PZSDR_D) == 0;
+    assert port_count("", BOARD_AX7203) == 0;
+}
+
+test the_card_states_its_chain_provenance_and_layout {
+    assert CARD_COUNT == 2;
+    assert card_title(CARD_ZYNQ) == "Zynq XC7Z020";
+    assert card_chain_len(CARD_ZYNQ) == 2;
+    assert box_label(CARD_ZYNQ, 0) == "ARM A9";
+    assert box_label(CARD_ZYNQ, 1) == "PL";
+    assert box_label(CARD_AX7203, 0) == "PL";
+    assert card_idcode_measured(CARD_ZYNQ, 0) == 0x4ba00477;
+    assert card_idcode_measured(CARD_ZYNQ, 1) == 0x3727093;
+    assert card_idcode_measured(CARD_AX7203, 0) == HEX_NONE;
+    assert card_serial(CARD_ZYNQ) == "210203859289";
+    assert card_model_known(CARD_ZYNQ) == false;
+    assert card_model_known(CARD_AX7203);
+    // a measured value carries its command and time; the AX7203's idcode today is not measured, not 0
+    assert prov_kind(card_prov(CARD_ZYNQ, FLD_IDCODE)) == PV_MEASURED;
+    assert prov_at(card_prov(CARD_ZYNQ, FLD_IDCODE)) == 1792488364;
+    assert prov_kind(card_prov(CARD_AX7203, FLD_IDCODE)) == PV_NOT_MEASURED;
+    assert prov_kind(card_prov(CARD_AX7203, FLD_CHAIN)) == PV_MEASURED;
+    assert card_measured_command(CARD_ZYNQ, FLD_CHAIN) == "openFPGALoader -c digilent --busdev-num 0:2 --detect";
+    assert card_measured_command(CARD_AX7203, FLD_CHAIN) == "openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect";
+    assert box_x(1) == 17;
+    assert chain_width(CARD_ZYNQ) == 31;
+    assert chain_width(CARD_AX7203) == 14;
+    assert btn_x(2) == 22;
+    assert ROW_COUNT == 8;
+    assert row_label(ROW_BUSDEV) == "busdev";
+}
+
+test button_commands_are_text_pieces_under_the_cap_and_flash_needs_a_path_and_a_confirm {
+    const scan : string = "000 004 0x0403:0x6014 ft232H Digilent 210512180081 x\n000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 y\n";
+    const zynq : string = "index 0:\n\tidcode 0x4ba00477\nindex 1:\n\tidcode 0x3727093\n";
+    const ls : string = "/dev/cu.usbserial-130\n/dev/cu.usbserial-2102038592890\n/dev/cu.usbserial-2102038592891\n/dev/cu.usbserial-210512180081\n";
+    const z : u64 = card_state(CARD_ZYNQ, scan, zynq, true, ls);
+    const bus : u64 = scan_busdev(scan, BOARD_PZSDR_D);
+    assert cmd_is(CARD_ZYNQ, ACT_DETECT, z, bus, "", false, "openFPGALoader -c digilent --busdev-num 0:2 --detect\n");
+    assert cmd_is(CARD_ZYNQ, ACT_UART, z, bus, "/dev/cu.usbserial-2102038592891", false, "screen /dev/cu.usbserial-2102038592891 115200\n");
+    // FLASH: no path, no confirm, a wrong suffix, or a shell character each give no command
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, "", true) == 0;
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, "/tmp/a.bit", false) == 0;
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, "/tmp/a.txt", true) == 0;
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, "/tmp/a.bit; rm -rf x", true) == 0;
+    assert cmd_is(CARD_ZYNQ, ACT_FLASH, z, bus, "/tmp/a.bit", true, "openFPGALoader -c digilent --busdev-num 0:2 /tmp/a.bit\n");
+    assert act_needs_confirm(ACT_FLASH);
+    assert act_needs_confirm(ACT_DETECT) == false;
+    // the UART button takes only a serial node
+    assert cmd_len(CARD_ZYNQ, ACT_UART, z, bus, "/etc/passwd", false) == 0;
+    // an empty chain still allows DETECT, never FLASH
+    const x : u64 = card_state(CARD_AX7203, scan, "Jtag frequency : requested 6.00MHz\n", true, ls);
+    assert act_enabled(x, ACT_DETECT);
+    assert act_enabled(x, ACT_FLASH) == false;
+    assert cmd_is(CARD_AX7203, ACT_DETECT, x, 4, "", false, "openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect\n");
+    assert cmd_len(CARD_AX7203, ACT_FLASH, x, 4, "/tmp/a.bit", true) == 0;
+    // no cable, nothing runs; no bus read, no openFPGALoader command
+    assert cmd_len(CARD_ZYNQ, ACT_DETECT, 0, bus, "", false) == 0;
+    assert cmd_len(CARD_ZYNQ, ACT_DETECT, z, BUSDEV_NONE, "", false) == 0;
+    // over the 200-byte cap is refused
+    const long : string = "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bit";
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, long, true) == 0;
+    assert cmd_len(CARD_ZYNQ, ACT_FLASH, z, bus, "/tmp/a.bit", true) <= CMD_CAP;
+    assert act_label(ACT_DETECT) == "DETECT";
+    assert act_label(ACT_FLASH) == "FLASH";
+    assert act_label(ACT_UART) == "UART";
+}
+
+fn feed_line(c: u8, st: u64, bus: u64, out: []u8) -> u32 {
+    // the stage-2 text of one card, built the way the host builds it
+    var n : u32 = 0;
+    const dl : u32 = feed_detect_len(c, st, bus);
+    var k : u32 = 0;
+    while (k < dl) { out[n] = feed_detect_char(c, bus, k) as u8; n = n + 1; k = k + 1; }
+    var p : u32 = 0;
+    while (p < FEED_DET_PIECES) {
+        const t : string = feed_det_piece(c, p);
+        var j : u32 = 0;
+        while (j < (t.len as u32)) { out[n] = t[j] as u8; n = n + 1; j = j + 1; }
+        p = p + 1;
+    }
+    return n;
+}
+
+test the_detect_stage_builds_one_redirected_command_per_card_with_a_single_cable {
+    const scan : string = "000 004 0x0403:0x6014 ft232H Digilent 210512180081 x\n000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 y\n";
+    const ls : string = "";
+    const z : u64 = card_state(CARD_ZYNQ, scan, "", false, ls);
+    const bus : u64 = card_busdev(CARD_ZYNQ, scan);
+    assert bus == 2;
+    var b : [400]u8 = undefined;
+    const n : u32 = feed_line(CARD_ZYNQ, z, bus, b[0..400]);
+    const want : string = "openFPGALoader -c digilent --busdev-num 0:2 --detect > $D/det1.txt.part 2>&1; mv $D/det1.txt.part $D/det1.txt; ";
+    assert n == (want.len as u32);
+    var i : u32 = 0;
+    while (i < n) { assert (b[i] as u32) == (want[i] as u32); i = i + 1; }
+    const x : u64 = card_state(CARD_AX7203, scan, "", false, ls);
+    const n2 : u32 = feed_line(CARD_AX7203, x, card_busdev(CARD_AX7203, scan), b[0..400]);
+    const want2 : string = "openFPGALoader -c digilent_hs2 --busdev-num 0:4 --detect > $D/det0.txt.part 2>&1; mv $D/det0.txt.part $D/det0.txt; ";
+    assert n2 == (want2.len as u32);
+    // no cable, no command; two cables of one row (no single busdev), no command
+    assert feed_detect_len(CARD_ZYNQ, 0, BUSDEV_NONE) == 0;
+    assert feed_detect_len(CARD_ZYNQ, z, BUSDEV_NONE) == 0;
+    const three : string = "001 004 0x0403:0x6014 a 210512180081 b\n001 006 0x0403:0x6014 a 210512180081 b\n";
+    assert card_busdev(CARD_AX7203, three) == BUSDEV_NONE;
+    assert file_detect(CARD_AX7203) == "det0.txt";
+    assert file_detect(CARD_ZYNQ) == "det1.txt";
+}
+
+test the_feed_pieces_keep_the_log_files_in_the_bench_dir_and_never_a_key_or_a_network_call {
+    assert text_find(FEED_HEAD_B, "mkdir -p $D", 0) != TEXT_NONE;
+    assert text_find(FEED_HEAD_B, "/opt/homebrew/bin", 0) != TEXT_NONE;
+    assert text_find(FEED_SCAN, "openFPGALoader --scan-usb", 0) == 0;
+    assert text_find(FEED_SCAN, "mv $D/scan.txt.part $D/scan.txt", 0) != TEXT_NONE;
+    assert text_find(FEED_SCAN, "mv $D/ls.txt.part $D/ls.txt", 0) != TEXT_NONE;
+    assert text_find(FEED_SCAN, "curl", 0) == TEXT_NONE;
+    assert text_find(FEED_RUN_TAIL, "mv $D/run.txt.part $D/run.txt", 0) != TEXT_NONE;
+    assert BENCH_DIR == "/.t27os/bench/";
+    assert FILE_SCAN == "scan.txt";
+    assert FILE_LS == "ls.txt";
+    assert FILE_RUN == "run.txt";
+    assert FEED_KILL_S > 10;
+    // the scan command is the one SRC_SCAN_USB names for provenance, without the cable flag
+    assert text_find(src_command(SRC_SCAN_USB), "--scan-usb", 0) != TEXT_NONE;
+    assert text_find(src_command(SRC_LS_TTY), "ls /dev/cu.usbserial-", 0) == 0;
+}
+
+test flash_runs_as_an_sram_load_without_its_line_feed_and_only_when_confirmed {
+    const scan : string = "000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 y\n";
+    const zynq : string = "index 0:\n\tidcode 0x4ba00477\nindex 1:\n\tidcode 0x3727093\n";
+    const z : u64 = card_state(CARD_ZYNQ, scan, zynq, true, "");
+    const want : string = "openFPGALoader -c digilent --busdev-num 0:2 /tmp/a.bit";
+    assert host_flash_len(CARD_ZYNQ, z, 2, "/tmp/a.bit", true) == (want.len as u32);
+    assert host_flash_len(CARD_ZYNQ, z, 2, "/tmp/a.bit", false) == 0;
+    assert host_flash_len(CARD_ZYNQ, z, 2, "/tmp/a.bit; id", true) == 0;
+    assert host_flash_len(CARD_ZYNQ, z, 2, "/tmp/a.rbf", true) == 0;
+    var k : u32 = 0;
+    while (k < (want.len as u32)) { assert host_flash_char(CARD_ZYNQ, 2, "/tmp/a.bit", k) == (want[k] as u32); k = k + 1; }
+    // -f (write to flash memory) is never part of it
+    assert text_find(want, " -f ", 0) == TEXT_NONE;
+    // a chain that did not answer cannot be flashed
+    const e : u64 = card_state(CARD_ZYNQ, scan, "Jtag frequency\n", true, "");
+    assert host_flash_len(CARD_ZYNQ, e, 2, "/tmp/a.bit", true) == 0;
+}
+
+test the_uart_view_takes_a_serial_node_of_the_card_and_nothing_else {
+    const scan : string = "000 002 0x0403:0x6010 FTDI2232 Digilent 210203859289 y\n";
+    const ls : string = "/dev/cu.usbserial-130\n/dev/cu.usbserial-2102038592890\n/dev/cu.usbserial-2102038592891\n";
+    const z : u64 = card_state(CARD_ZYNQ, scan, "", false, ls);
+    assert port_at(ls, CARD_ZYNQ, 0) == 22;
+    assert port_len(ls, 22) == 31;
+    assert port_len(ls, NOT_FOUND) == 0;
+    assert uart_view_allowed(CARD_ZYNQ, z, "/dev/cu.usbserial-2102038592890");
+    assert uart_view_allowed(CARD_ZYNQ, z, "/dev/cu.usbserial-2102038592890; rm x") == false;
+    assert uart_view_allowed(CARD_ZYNQ, z, "/etc/passwd") == false;
+    assert uart_view_allowed(CARD_ZYNQ, 0, "/dev/cu.usbserial-2102038592890") == false;
+    assert text_find(UV_B, "115200", 0) != TEXT_NONE;
+    assert text_find(UART_BAUD_TEXT, "115200", 0) != TEXT_NONE;
+    assert text_find(UV_C, "kill $p", 0) != TEXT_NONE;
+}
+
+test the_live_idcode_is_read_per_tap_and_a_missing_tap_is_not_measured {
+    const zynq : string = "index 0:\n\tidcode 0x4ba00477\nindex 1:\n\tidcode 0x3727093\n";
+    assert card_idcode_live(zynq, 0) == 0x4ba00477;
+    assert card_idcode_live(zynq, 1) == 0x3727093;
+    assert card_idcode_live(zynq, 2) == HEX_NONE;
+    assert card_idcode_live("", 0) == HEX_NONE;
+    assert card_idcode_live("Jtag frequency\n", 0) == HEX_NONE;
+}
+
+test the_flash_dialogue_asks_for_a_path_then_a_click_and_never_loads_on_a_key {
+    assert fs_next(FS_NONE, FE_FLASH_CLICK, false) == FS_TYPING;
+    assert fs_next(FS_NONE, FE_RETURN, true) == FS_NONE;
+    assert fs_next(FS_NONE, FE_CONFIRM, true) == FS_NONE;
+    assert fs_next(FS_TYPING, FE_RETURN, false) == FS_TYPING;
+    assert fs_next(FS_TYPING, FE_RETURN, true) == FS_CONFIRM;
+    assert fs_next(FS_TYPING, FE_ESCAPE, true) == FS_NONE;
+    assert fs_next(FS_TYPING, FE_CANCEL, true) == FS_NONE;
+    assert fs_next(FS_TYPING, FE_CONFIRM, true) == FS_TYPING;
+    assert fs_next(FS_CONFIRM, FE_RETURN, true) == FS_CONFIRM;
+    assert fs_next(FS_CONFIRM, FE_CONFIRM, true) == FS_RUN;
+    assert fs_next(FS_CONFIRM, FE_ESCAPE, true) == FS_NONE;
+    assert fs_next(FS_CONFIRM, FE_CANCEL, true) == FS_NONE;
+    // every path to FS_RUN passes the confirm stage
+    var st : u32 = FS_NONE;
+    st = fs_next(st, FE_FLASH_CLICK, true);
+    st = fs_next(st, FE_CONFIRM, true);
+    assert st != FS_RUN;
+    st = fs_next(st, FE_RETURN, true);
+    assert st == FS_CONFIRM;
+    st = fs_next(st, FE_CONFIRM, true);
+    assert st == FS_RUN;
+    assert fs_next(FS_RUN, FE_RETURN, true) == FS_NONE;
+}
+
+test the_path_field_accepts_path_characters_only_and_a_fit_path_ends_in_bit {
+    assert flash_char_ok(47, 0);
+    assert flash_char_ok(97, 3);
+    assert flash_char_ok(126, 0);
+    assert flash_char_ok(95, 0);
+    assert flash_char_ok(32, 0) == false;
+    assert flash_char_ok(59, 0) == false;
+    assert flash_char_ok(36, 0) == false;
+    assert flash_char_ok(96, 0) == false;
+    assert flash_char_ok(34, 0) == false;
+    assert flash_char_ok(97, FLASH_PATH_MAX) == false;
+    assert flash_path_ok("/tmp/a.bit");
+    assert flash_path_ok("~/t27/build/top.bit");
+    assert flash_path_ok("/tmp/a.bin") == false;
+    assert flash_path_ok("") == false;
+    assert flash_path_ok("/tmp/a b.bit") == false;
+    assert flash_path_ok("/tmp/$(id).bit") == false;
+    assert FLASH_PATH_MAX < CMD_CAP;
+}
+
+test the_b_page_packs_two_cards_a_button_row_and_a_log_and_hits_them {
+    assert CARD_COUNT == 2;
+    const pw : f64 = 700.0;
+    assert bp_card_w(pw) == 672.0;
+    assert bp_card_w(2000.0) == BP_CARD_MAX_W;
+    assert bp_card_y(CARD_AX7203) == BP_PAD;
+    assert bp_card_y(CARD_ZYNQ) == BP_PAD + BP_CARD_H + BP_GAP;
+    assert bp_log_y() == BP_PAD + 2.0 * (BP_CARD_H + BP_GAP);
+    assert bp_log_h(100.0) == 56.0;
+    assert bp_log_h(900.0) > 56.0;
+    // the three buttons of card 0 and card 1, middle of each
+    const by0 : f64 = bp_card_y(0) + bp_btn_y() + 5.0;
+    const by1 : f64 = bp_card_y(1) + bp_btn_y() + 5.0;
+    assert bp_hit(BP_PAD + bp_btn_x(0) + 5.0, by0, pw, BH_NONE) == BH_DETECT;
+    assert bp_hit(BP_PAD + bp_btn_x(1) + 5.0, by0, pw, BH_NONE) == BH_FLASH;
+    assert bp_hit(BP_PAD + bp_btn_x(2) + 5.0, by0, pw, BH_NONE) == BH_UART;
+    assert bp_hit(BP_PAD + bp_btn_x(0) + 5.0, by1, pw, BH_NONE) == 8 + BH_DETECT;
+    assert bp_hit(BP_PAD + bp_btn_x(2) + 5.0, by1, pw, BH_NONE) == 8 + BH_UART;
+    // the gap between two buttons and the title row are no control
+    assert bp_hit(BP_PAD + bp_btn_x(0) + BP_BTN_W + 2.0, by0, pw, BH_NONE) == BH_NONE;
+    assert bp_hit(BP_PAD + 20.0, bp_card_y(0) + 10.0, pw, BH_NONE) == BH_NONE;
+    // while card 1 asks for a path, its row holds the field, CONFIRM and CANCEL, and no DETECT
+    const cw : f64 = bp_card_w(pw);
+    assert bp_hit(BP_PAD + bp_confirm_x(cw) + 5.0, by1, pw, CARD_ZYNQ) == 8 + BH_CONFIRM;
+    assert bp_hit(BP_PAD + bp_cancel_x(cw) + 5.0, by1, pw, CARD_ZYNQ) == 8 + BH_CANCEL;
+    assert bp_hit(BP_PAD + BP_PAD + 5.0, by1, pw, CARD_ZYNQ) == 8 + BH_FIELD;
+    assert bp_hit(BP_PAD + bp_btn_x(0) + BP_BTN_W + 40.0, by1, pw, CARD_ZYNQ) == 8 + BH_FIELD;
+    assert bp_hit(BP_PAD + bp_btn_x(0) + 5.0, by0, pw, CARD_ZYNQ) == BH_DETECT;
+    // the field, CONFIRM and CANCEL do not overlap
+    assert bp_field_w(cw) > 100.0;
+    assert BP_PAD + BP_PAD + bp_field_w(cw) < BP_PAD + bp_confirm_x(cw);
+    assert bp_confirm_x(cw) + BP_BTN_W < bp_cancel_x(cw);
+    // two cards and the log fit a 540 pt window below the header (about 450 pt)
+    assert bp_log_y() < 340.0;
+}
+
+test idcode_and_bus_knownness_is_a_function_not_a_sentinel_the_window_repeats {
+    assert idcode_known(0x3727093);
+    assert idcode_known(HEX_NONE) == false;
+    assert bus_known(4);
+    assert bus_known(bus_none()) == false;
+}

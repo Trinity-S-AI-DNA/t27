@@ -50,7 +50,7 @@ centralization in the `tri` CLI, per issue #592.
 | `conformance/kepler_newton_tests.py` | C | Keep | Conformance helper not on gate. |
 | `test_notebooklm.py`, `test_notebooklm_venv.sh` | C | Keep | Manual smoke tests at repo root. |
 | `scripts/tri-*.py`, `scripts/audit_discovery.py`, `scripts/check_first_party_doc_language.py`, `scripts/verify_*.py`, `scripts/lee_*.py`, `scripts/compare_*.py`, `scripts/fix_*.py`, `scripts/overnight_research_agent.py`, `scripts/print_pellis_seal_decimal.py`, `scripts/unified_search_all.py`, `scripts/wrapup/*.py` | C | Keep | Standalone helpers; none referenced from `.githooks/` or commit-path workflows. |
-| `scripts/install-*.sh`, `scripts/setup-git-hooks.sh`, `scripts/auto-*.sh`, `scripts/check-conflicts.sh`, `scripts/bulk-create-notebooks.sh`, `scripts/generate_episodes.sh`, `scripts/git_commands_tasks_1_4.sh`, `scripts/mcp-wrapper.sh`, `scripts/phi-loop-stack.sh`, `scripts/run_v51_multiple.sh`, `scripts/test-agent-bridge.sh`, `scripts/verify-notebooklm.sh`, `scripts/verify-ssot-integration.sh` | C | Keep | One-shot setup / human-invoked utilities; not gated. |
+| `scripts/install-*.sh`, `scripts/setup-git-hooks.sh`, `scripts/auto-*.sh`, `scripts/check-conflicts.sh`, `scripts/bulk-create-notebooks.sh`, `scripts/generate_episodes.sh`, `scripts/mcp-wrapper.sh`, `scripts/phi-loop-stack.sh`, `scripts/run_v51_multiple.sh`, `scripts/test-agent-bridge.sh`, `scripts/verify-notebooklm.sh`, `scripts/verify-ssot-integration.sh` | C | Keep | One-shot setup / human-invoked utilities; not gated. |
 
 ## New `tri` subcommands added by this PR
 

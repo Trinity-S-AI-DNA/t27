@@ -1,0 +1,1329 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/analog/raw_writer.t27 -- analog waveforms as ngspice RAW files: the writer, and the reader that judges it
+; M5 of the analog emulation epic (#10486, issue #10909), first slice. A trace the cells produce is written as the file
+; ngspice's own `write` writes (ASCII or binary), so a designer opens it in uberWAVE or ngspice next to ngspice's traces.
+; Everything hand-written is this file; `tri raw` only allocates buffers and writes the bytes this file produces.
+; -
+; THE FORMAT is read off ngspice-47, not from a manual: specs/analog/decks/raw_ref.cir writes one transient as ASCII and
+; as binary, and both files are embedded below (SM_A0.., SM_H0..). Header, one line each: Title, Date, Command (optional),
+; Plotname, "Flags: real", "No. Variables: N", "No. Points: P", "Variables:", N lines "<TAB>index<TAB>name<TAB>type", then
+; "Values:" or "Binary:". An ASCII point is " index<TAB>v0" (a space, then the index in decimal, no padding), "<TAB>vj" for
+; each other variable, each value on its own line, and an empty line; every value is C's "%.15e". A binary point is N
+; little-endian f64. Three things the reference taught: the index has a single leading space at every width (" 9", " 10",
+; " 100"); the Command: line is a command that ngspice EXECUTES when it loads the file ("misplaced Command: line", or
+; "no such command available"), so the files written here carry none, and the Date line is a parameter only so that
+; tests are deterministic; and `ngspice -r` pads the point count with spaces once the simulation ends, which the reader accepts.
+; -
+; THE NUMBERS. A "%.15e" value is 16 significant digits of the EXACT binary value, rounded to nearest, a tie to the even
+; digit. f64 arithmetic cannot do that, so the digits come from the exact decimal expansion: |x| = m * 2^e becomes the
+; integer m * 2^e (e >= 0) or m * 5^-e read with the point -e digits from the right, held in base-1e9 limbs (at most 767
+; digits; 90 limbs are provided). The result equals Python's '%.15e' on 35 vectors, ties and carries and subnormals and
+; the largest double included, and ngspice's own text on all 60 values of the reference. The f64 <-> bits pair is built
+; from arithmetic as well (raw_to_bits, raw_from_bits; exact for every finite f64, checked against @bitCast in a test),
+; because gen-rust prints @bitCast as written and rustc refuses it (#10920).
+; -
+; THE FILE. raw_write takes the variable table ("name<TAB>type<LF>" lines, the Variables: block without its indexes), the
+; values time-major (point p, variable v is vals[p * nv + v]) and the Date line. Every writer returns the cursor in its
+; output buffer and counts a byte that does not fit without writing it, so the length a file needs is known from a short
+; buffer. raw_check is the reader that judges a file: header lines in order, the counts against the body, the body's shape.
+; -
+; THE TRACE. raw_cell_trace runs circuit 2 of specs/analog/linear.t27 (the series RLC, R = 100 Ohm, L = 10 uH, C = 1 nF,
+; dt = 5 ns, IN = 1 V for 100 steps then 0 V) with that file's own words (step_row, vin_at, fold) and writes 201 points: point
+; 0 at rest, then one point per update. The fold of every state word equals the RLC_EXP_S that linear.t27 pins, so the trace is
+; that simulation and not a re-implementation. The variables carry the names ngspice gives the nodes of decks/rlc_fixed.cir
+; (v(in), v(1), v(2), i(l1)); that deck's time axis is this one shifted by 42.5 ns, the instant its source turns on.
+; -
+; THE TESTS. (1) The ASCII file the writer makes for the 15-point, 4-variable reference equals ngspice's, byte for byte,
+; Date line included (the date is the same parameter); so does the binary file. (2) The reader accepts ngspice's own two
+; files and reads the binary values back bit for bit. (3) Negative controls: a header that says one point too many or too
+; few, one variable too many or too few, a body with the wrong values per point, a wrong index, a broken value, a missing
+; flags line or mode line, a binary file one byte short or long: each is refused with its own reason. (4) The RLC trace
+; passes the reader in both modes, its binary decodes exactly, and a trace with one stored constant's sign flipped is
+; not the pinned simulation.
+; -
+; WHAT A PASS SAYS. The writer reproduces ngspice-47's own bytes for the reference transient, in both modes, and its
+; %.15e is the C library's on the vectors above. The reader refuses the lies listed. The RLC trace is the cell's pinned simulation.
+; WHAT IT DOES NOT SAY. That ngspice or uberWAVE loads the file: no test here runs either; the PR that adds this file shows
+; `load` and `print` in ngspice and uberWAVE's wp2-parser (GPL-2.0, fetched and built for the check, never vendored) reading it.
+; Nothing about a complex-valued file (AC), a file of several plots, or any header line beyond the ones above. A negative zero
+; is written as zero, because arithmetic cannot see its sign; a NaN or an infinity is written as "nan", "inf", "-inf" in ASCII
+; and as its canonical pattern in binary (which raw_from_bits reads back as 0). The ASCII file holds 16 significant digits, so a
+; reader gets each value to better than 1e-15 relative (4.4e-16 measured on the RLC trace); the binary file is exact. Nothing about the waveform's physics: the values are the cell's words in volts, no
+; more accurate than the cell (linear.t27 states its error), and nothing is claimed against ngspice's trace of the same
+; circuit here. Nothing about a board.
+; ASCII only, English only.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module AnalogRawWriter;
+
+use analog::linear::{step_row, vin_at, sm_f64, fold, RLC_N, RLC_D, RLC_NV, RLC_DT, RLC_ZS, RLC_EXP_S, STEPS};
+
+pub const KIND : str = "analog-raw-writer";
+pub const ID : str = "analog/raw_writer";
+pub const REFERENCE : str = "ngspice-47 write, ASCII and binary";
+
+; --- sizes ----------------------------------------------------------------------------------------
+/// One limb of the exact decimal expansion holds 9 digits.
+pub const RAW_BASE : u64 = 1000000000;
+/// 90 limbs = 810 digits; the longest expansion of a finite f64 (m * 5^1074) has 767.
+pub const RAW_LIMBS : usize = 90;
+pub const RAW_DIGITS : usize = 810;
+/// %.15e: 16 significant digits.
+pub const RAW_SIG : usize = 16;
+
+pub struct RawParts { m: u64, e: i32 }
+
+/// |x| = m * 2^e exactly, with m odd or e >= 0 (x finite, nonzero).
+pub fn raw_parts(x: f64) -> RawParts {
+    var y : f64 = x;
+    if (y < 0.0) { y = 0.0 - y; }
+    var e : i32 = 0;
+    while (y >= 9007199254740992.0) {
+        y = y / 2.0;
+        e = e + 1;
+    }
+    while (y < 4503599627370496.0) {
+        y = y * 2.0;
+        e = e - 1;
+    }
+    var m : u64 = y as u64;
+    while (e < 0 and m % 2 == 0) {
+        m = m / 2;
+        e = e + 1;
+    }
+    return RawParts { m: m, e: e };
+}
+
+test parts_of_small_numbers {
+    const p : RawParts = raw_parts(1.0);
+    assert(p.m == 1);
+    assert(p.e == 0);
+    const q : RawParts = raw_parts(-0.5);
+    assert(q.m == 1);
+    assert(q.e == -1);
+    const r : RawParts = raw_parts(3.0);
+    assert(r.m == 3);
+    assert(r.e == 0);
+    const s : RawParts = raw_parts(8.0);
+    assert(s.m == 8);
+    assert(s.e == 0);
+}
+
+; --- the exact decimal expansion of a finite f64 --------------------------------------------------
+; |x| = m * 2^e. For e >= 0 the integer m * 2^e; for e < 0 the integer m * 5^-e read with the point -e digits from the
+; right (m / 2^k = m * 5^k / 10^k). The integer lives in base-1e9 limbs, least significant first, and is only ever
+; multiplied by a small number, so every product fits u64 (1e9 * 2^31 < 2^62).
+
+/// base^n for a small n.
+pub fn raw_pow(base: u64, n: u32) -> u64 {
+    var r : u64 = 1;
+    var i : u32 = 0;
+    while (i < n) {
+        r = r * base;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// a[0..n) times k (k < 2^31), in place; the new limb count (a carry past the end of a is dropped, never written).
+pub fn raw_mul(a: []u64, n: usize, k: u64) -> usize {
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const t : u64 = a[i] * k + carry;
+        a[i] = t % RAW_BASE;
+        carry = t / RAW_BASE;
+        i = i + 1;
+    }
+    var cnt : usize = n;
+    while (carry > 0) {
+        if (cnt < a.len) { a[cnt] = carry % RAW_BASE; }
+        carry = carry / RAW_BASE;
+        cnt = cnt + 1;
+    }
+    return cnt;
+}
+
+/// The limbs of m * 2^e (e >= 0) or m * 5^-e (e < 0) into a; the limb count.
+pub fn raw_expand(m: u64, e: i32, a: []u64) -> usize {
+    a[0] = m % RAW_BASE;
+    a[1] = (m / RAW_BASE) % RAW_BASE;
+    a[2] = m / RAW_BASE / RAW_BASE;
+    var n : usize = 3;
+    var left : i32 = e;
+    var big : u64 = 1073741824;
+    var chunk : i32 = 30;
+    var base : u64 = 2;
+    if (e < 0) {
+        left = 0 - e;
+        big = 1220703125;
+        chunk = 13;
+        base = 5;
+    }
+    while (left >= chunk) {
+        n = raw_mul(a, n, big);
+        left = left - chunk;
+    }
+    if (left > 0) { n = raw_mul(a, n, raw_pow(base, left as u32)); }
+    return n;
+}
+
+/// The decimal digits (0..9, most significant first, no leading zero) of a[0..n) into d; the digit count. a is nonzero.
+pub fn raw_digits(a: []const u64, n: usize, d: []u8) -> usize {
+    var cnt : usize = 0;
+    var i : usize = n;
+    while (i > 0) {
+        i = i - 1;
+        var div : u64 = 100000000;
+        var j : usize = 0;
+        while (j < 9) {
+            const dg : u8 = ((a[i] / div) % 10) as u8;
+            if (cnt > 0 or dg != 0) {
+                d[cnt] = dg;
+                cnt = cnt + 1;
+            }
+            div = div / 10;
+            j = j + 1;
+        }
+    }
+    return cnt;
+}
+
+test the_expansion_of_powers_is_exact {
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    // 2^64 = 18446744073709551616 (20 digits)
+    const n : usize = raw_expand(1, 64, &a);
+    const c : usize = raw_digits(&a, n, &d);
+    assert(c == 20);
+    assert(d[0] == 1);
+    assert(d[1] == 8);
+    assert(d[19] == 6);
+    assert(d[18] == 1);
+}
+
+test the_expansion_of_a_fraction_is_exact {
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    // 1/2^10 = 5^10 / 10^10 = 9765625 / 10^10: 7 digits
+    const n : usize = raw_expand(1, -10, &a);
+    const c : usize = raw_digits(&a, n, &d);
+    assert(c == 7);
+    assert(d[0] == 9);
+    assert(d[6] == 5);
+}
+
+; --- %.15e, exactly -------------------------------------------------------------------------------
+; ngspice writes every ASCII value with C's "%.15e": 16 significant digits of the exact binary value, rounded to nearest,
+; a tie to the even digit. The digits come from the exact expansion above, not from f64 arithmetic, so the rounding is
+; the C library's rounding on every input, including the ties and the carries (9.9999...95e-1).
+
+/// The 16 significant digits of |x| (x finite, nonzero), rounded, left in d[0..16) as values 0..9; the decimal exponent of
+/// the first one. a and d are scratch: RAW_LIMBS limbs and RAW_DIGITS digits.
+pub fn raw_sig(x: f64, a: []u64, d: []u8) -> i32 {
+    const p : RawParts = raw_parts(x);
+    const n : usize = raw_expand(p.m, p.e, a);
+    const nd : usize = raw_digits(a, n, d);
+    var ex : i32 = (nd as i32) - 1;
+    if (p.e < 0) { ex = ex + p.e; }
+    var up : bool = false;
+    if (nd > RAW_SIG) {
+        var rest : bool = false;
+        var j : usize = RAW_SIG + 1;
+        while (j < nd) {
+            if (d[j] != 0) { rest = true; }
+            j = j + 1;
+        }
+        up = d[RAW_SIG] > 5 or (d[RAW_SIG] == 5 and (rest or d[RAW_SIG - 1] % 2 == 1));
+    }
+    var i : usize = nd;
+    while (i < RAW_SIG) {
+        d[i] = 0;
+        i = i + 1;
+    }
+    if (up) {
+        var k : usize = RAW_SIG;
+        var carry : bool = true;
+        while (carry and k > 0) {
+            k = k - 1;
+            if (d[k] == 9) {
+                d[k] = 0;
+            } else {
+                d[k] = d[k] + 1;
+                carry = false;
+            }
+        }
+        if (carry) {
+            d[0] = 1;
+            ex = ex + 1;
+        }
+    }
+    return ex;
+}
+
+; --- bytes out ------------------------------------------------------------------------------------
+; Every writer takes the output buffer and a write cursor and returns the new cursor. A byte that does not fit is not
+; written but still counted, so the cursor after a call is the length the whole text needs (size it with a short buffer).
+
+/// One byte at w if it fits; the new cursor.
+pub fn raw_put(out: []u8, w: usize, c: u8) -> usize {
+    if (w < out.len) { out[w] = c; }
+    return w + 1;
+}
+
+/// The bytes of s; the new cursor.
+pub fn raw_puts(out: []u8, w: usize, s: []const u8) -> usize {
+    var p : usize = w;
+    var i : usize = 0;
+    while (i < s.len) {
+        p = raw_put(out, p, s[i]);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// v in decimal; the new cursor.
+pub fn raw_put_uint(out: []u8, w: usize, v: u64) -> usize {
+    var p : usize = w;
+    if (v >= 10) { p = raw_put_uint(out, p, v / 10); }
+    return raw_put(out, p, 48 + ((v % 10) as u8));
+}
+
+/// x as C's "%.15e" prints it: [-]d.ddddddddddddddde[+-]dd (three exponent digits when the exponent needs them). A NaN is
+/// "nan"; an infinity "inf" or "-inf". A negative zero cannot be told from zero without its bits and is written as 0.
+pub fn raw_put_f64(out: []u8, w: usize, x: f64, a: []u64, d: []u8) -> usize {
+    if (x != x) { return raw_puts(out, w, "nan"); }
+    if (x - x != 0.0) {
+        if (x < 0.0) { return raw_puts(out, w, "-inf"); }
+        return raw_puts(out, w, "inf");
+    }
+    var p : usize = w;
+    if (x < 0.0) { p = raw_put(out, p, 45); }
+    if (x == 0.0) { return raw_puts(out, p, "0.000000000000000e+00"); }
+    const ex : i32 = raw_sig(x, a, d);
+    p = raw_put(out, p, 48 + d[0]);
+    p = raw_put(out, p, 46);
+    var i : usize = 1;
+    while (i < RAW_SIG) {
+        p = raw_put(out, p, 48 + d[i]);
+        i = i + 1;
+    }
+    p = raw_put(out, p, 101);
+    var ea : u64 = 0;
+    if (ex < 0) {
+        p = raw_put(out, p, 45);
+        ea = (0 - ex) as u64;
+    } else {
+        p = raw_put(out, p, 43);
+        ea = ex as u64;
+    }
+    if (ea < 10) { p = raw_put(out, p, 48); }
+    return raw_put_uint(out, p, ea);
+}
+
+; --- the f64 <-> bits pair, in arithmetic ----------------------------------------------------------
+; Exact for every finite f64 and built from + * / and compares only, so every backend lowers it (gen-rust passes @bitCast
+; through unchanged, which rustc refuses; see the issue named in the header). Negative zero reads as zero.
+
+/// The IEEE 754 binary64 pattern of x. -0.0 gives the pattern of 0.0; a NaN gives 0x7FF8000000000000, an infinity 0x7FF0000000000000
+/// (0xFFF0000000000000 for -inf).
+pub fn raw_to_bits(x: f64) -> u64 {
+    if (x != x) { return 0x7FF8000000000000; }
+    if (x - x != 0.0) {
+        if (x < 0.0) { return 0xFFF0000000000000; }
+        return 0x7FF0000000000000;
+    }
+    if (x == 0.0) { return 0; }
+    var sign : u64 = 0;
+    if (x < 0.0) { sign = 9223372036854775808; }
+    const p : RawParts = raw_parts(x);
+    var m : u64 = p.m;
+    var e : i32 = p.e;
+    while (m < 4503599627370496) {
+        m = m * 2;
+        e = e - 1;
+    }
+    const be : i32 = e + 1075;
+    if (be >= 1) { return sign | ((be as u64) << 52) | (m - 4503599627370496); }
+    return sign | (m >> ((1 - be) as u32));
+}
+
+/// The finite f64 of a binary64 pattern. An infinity or a NaN pattern (exponent field 2047) reads as 0.0: this file
+/// only reads what it wrote, and it writes no such pattern.
+pub fn raw_from_bits(b: u64) -> f64 {
+    const ex : i32 = ((b >> 52) & 2047) as i32;
+    if (ex == 2047) { return 0.0; }
+    var m : f64 = (b & 4503599627370495) as f64;
+    var e : i32 = 0 - 1074;
+    if (ex > 0) {
+        m = m + 4503599627370496.0;
+        e = ex - 1075;
+    }
+    while (e > 0) {
+        m = m * 2.0;
+        e = e - 1;
+    }
+    while (e < 0) {
+        m = m / 2.0;
+        e = e + 1;
+    }
+    if ((b >> 63) != 0) { return 0.0 - m; }
+    return m;
+}
+
+/// Eight bytes, least significant first.
+pub fn raw_put_le64(out: []u8, w: usize, b: u64) -> usize {
+    var p : usize = w;
+    var i : u32 = 0;
+    while (i < 8) {
+        p = raw_put(out, p, ((b >> (i * 8)) & 255) as u8);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// Does out hold s starting at `at`?
+pub fn raw_at(out: []const u8, at: usize, s: []const u8) -> bool {
+    if (at + s.len > out.len) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (out[at + i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+; --- test vectors: every expected line was printed by Python 3's '%.15e' % x (correctly rounded, ties to even, as the C
+; library does) for the double with the pattern in FMT_BITS: round and short numbers, 1e-11 (just below the decimal),
+; 1e23, exact ties that round down and up and carry (3000000000000000.5, ...1.5, 3999999999999999.5), the subnormals,
+; the smallest normal and the largest double, and a dozen random ones across 1e-33 .. 1e37.
+pub const FMT_N : usize = 35;
+pub const FMT_BITS : [35]u64 = [
+    0x3FF0000000000000, 0xBFF0000000000000, 0x3FE0000000000000,
+    0x3FB999999999999A, 0x3DA5FD7FE1796495, 0x40FE240000000000,
+    0xBE90C6F7A0B5ED8D, 0x44B52D02C7E14AF6, 0x4480F0CF064DD592,
+    0x432550F7DCA70001, 0x432550F7DCA70003, 0x432C6BF52633FFFF,
+    0x0010000000000000, 0x0000000000000001, 0x7FEFFFFFFFFFFFFF,
+    0x0000000000000003, 0x3FD3333333333334, 0x0000000000000007,
+    0x7FE0000000000000, 0x3FEFFFFFFFFFFFFF, 0x3FF0000000000001,
+    0x4340000000000000, 0x4330000000000002, 0x4435D520A5380AA8,
+    0xBF0FD59DF2BE23E8, 0xB939810A6433D164, 0xC5DAF833936FC075,
+    0x41597E6720897B22, 0xC22D7DE32E66009E, 0xBD7F11CF951E0441,
+    0x396DD25E7837A7EB, 0x46AE6AE32324C5F6, 0x47C978CD87E8DCA8,
+    0x429179806751334A, 0x43418120C1445D0A,
+];
+pub const FMT_0 : str = "1.000000000000000e+00\n-1.000000000000000e+00\n5.000000000000000e-01\n1.000000000000000e-01\n9.999999999999999e-12\n";
+pub const FMT_1 : str = "1.234560000000000e+05\n-2.500000000000000e-07\n9.999999999999999e+22\n1.000000000000000e+22\n3.000000000000000e+15\n";
+pub const FMT_2 : str = "3.000000000000002e+15\n4.000000000000000e+15\n2.225073858507201e-308\n4.940656458412465e-324\n1.797693134862316e+308\n";
+pub const FMT_3 : str = "1.482196937523740e-323\n3.000000000000000e-01\n3.458459520888726e-323\n8.988465674311580e+307\n9.999999999999999e-01\n";
+pub const FMT_4 : str = "1.000000000000000e+00\n9.007199254740992e+15\n4.503599627370498e+15\n4.027390819373495e+20\n-6.071937818236795e-05\n";
+pub const FMT_5 : str = "-4.911904212198047e-33\n-3.338666967613588e+28\n6.683036508391174e+06\n-6.333304606700121e+10\n-1.766100792077441e-12\n";
+pub const FMT_6 : str = "4.594768720539267e-32\n3.084703844596761e+32\n6.771588835897009e+37\n4.803385742412822e+12\n9.854104571001364e+15\n";
+
+test the_bits_round_trip_and_match_ieee {
+    assert(raw_to_bits(1.0) == 0x3FF0000000000000);
+    assert(raw_to_bits(-2.0) == 0xC000000000000000);
+    assert(raw_to_bits(0.0) == 0);
+    assert(raw_to_bits(-0.0) == 0);
+    assert(raw_to_bits(0.5) == 0x3FE0000000000000);
+    var i : usize = 0;
+    while (i < FMT_N) {
+        const x : f64 = raw_from_bits(FMT_BITS[i]);
+        assert(raw_to_bits(x) == FMT_BITS[i]);
+        i = i + 1;
+    }
+    // the bits of a double ngspice wrote, cross-checked against @bitCast
+    const b : u64 = 0x3DA5FD7FE1796496;
+    const y : f64 = @bitCast(b);
+    assert(raw_from_bits(b) == y);
+    assert(raw_to_bits(y) == b);
+}
+
+test f64_prints_like_c_printf_15e {
+    var o : [2048]u8 = [0] ** 2048;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < FMT_N) {
+        w = raw_put_f64(&o, w, raw_from_bits(FMT_BITS[i]), &a, &d);
+        w = raw_put(&o, w, 10);
+        i = i + 1;
+    }
+    const want : [7]str = [FMT_0, FMT_1, FMT_2, FMT_3, FMT_4, FMT_5, FMT_6];
+    var at : usize = 0;
+    var k : usize = 0;
+    while (k < 7) {
+        assert(raw_at(&o, at, want[k]));
+        at = at + want[k].len;
+        k = k + 1;
+    }
+    assert(at == w);
+}
+
+; --- the file: header, variable table, values ------------------------------------------------------
+; The RAW layout is what ngspice's own `write` produced for a four-variable transient (raw_ref.cir). Header, one line
+; each: Title, Date, Command (optional), Plotname, "Flags: real", "No. Variables: N", "No. Points: P", "Variables:", then one
+; line per variable "<TAB>index<TAB>name<TAB>type", then "Values:" (ASCII) or "Binary:". An ASCII point is " index<TAB>v0",
+; then "<TAB>vj" for each other variable, each on its own line, and one empty line; a binary point is N little-endian f64.
+; The variables arrive as a table of "name<TAB>type<LF>" lines, which is the Variables: block without its indexes.
+
+/// The number of variables in a table of "name<TAB>type<LF>" lines.
+pub fn raw_count_vars(vars: []const u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < vars.len) {
+        if (vars[i] == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The Variables: block: every table line with "<TAB>index<TAB>" in front.
+pub fn raw_put_vars(out: []u8, w: usize, vars: []const u8) -> usize {
+    var p : usize = w;
+    var line : u64 = 0;
+    var start : bool = true;
+    var i : usize = 0;
+    while (i < vars.len) {
+        if (start) {
+            p = raw_put(out, p, 9);
+            p = raw_put_uint(out, p, line);
+            p = raw_put(out, p, 9);
+            start = false;
+        }
+        p = raw_put(out, p, vars[i]);
+        if (vars[i] == 10) {
+            start = true;
+            line = line + 1;
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+/// The header with the counts it is told (nv and np are stated, not derived, so a test can state a wrong one). An empty
+/// command writes no Command line: ngspice executes the text of that line as a command when it loads the file.
+pub fn raw_put_header(out: []u8, w: usize, title: []const u8, date: []const u8, command: []const u8, plotname: []const u8, vars: []const u8, nv: usize, np: usize, binary: bool) -> usize {
+    var p : usize = raw_puts(out, w, "Title: ");
+    p = raw_puts(out, p, title);
+    p = raw_puts(out, p, "\nDate: ");
+    p = raw_puts(out, p, date);
+    p = raw_put(out, p, 10);
+    if (command.len > 0) {
+        p = raw_puts(out, p, "Command: ");
+        p = raw_puts(out, p, command);
+        p = raw_put(out, p, 10);
+    }
+    p = raw_puts(out, p, "Plotname: ");
+    p = raw_puts(out, p, plotname);
+    p = raw_puts(out, p, "\nFlags: real\nNo. Variables: ");
+    p = raw_put_uint(out, p, nv as u64);
+    p = raw_puts(out, p, "\nNo. Points: ");
+    p = raw_put_uint(out, p, np as u64);
+    p = raw_puts(out, p, "\nVariables:\n");
+    p = raw_put_vars(out, p, vars);
+    if (binary) { return raw_puts(out, p, "Binary:\n"); }
+    return raw_puts(out, p, "Values:\n");
+}
+
+/// np points of nv values from vals (time-major: point p, variable v is vals[p * nv + v]; a missing value is 0) as ASCII.
+pub fn raw_put_ascii(out: []u8, w: usize, nv: usize, np: usize, vals: []const f64, a: []u64, d: []u8) -> usize {
+    var p : usize = w;
+    var pt : usize = 0;
+    while (pt < np) {
+        var v : usize = 0;
+        while (v < nv) {
+            if (v == 0) {
+                p = raw_put(out, p, 32);
+                p = raw_put_uint(out, p, pt as u64);
+            }
+            p = raw_put(out, p, 9);
+            var x : f64 = 0.0;
+            if (pt * nv + v < vals.len) { x = vals[pt * nv + v]; }
+            p = raw_put_f64(out, p, x, a, d);
+            p = raw_put(out, p, 10);
+            v = v + 1;
+        }
+        p = raw_put(out, p, 10);
+        pt = pt + 1;
+    }
+    return p;
+}
+
+/// np points of nv values from vals, each a little-endian f64.
+pub fn raw_put_binary(out: []u8, w: usize, nv: usize, np: usize, vals: []const f64) -> usize {
+    var p : usize = w;
+    var i : usize = 0;
+    while (i < nv * np) {
+        var x : f64 = 0.0;
+        if (i < vals.len) { x = vals[i]; }
+        p = raw_put_le64(out, p, raw_to_bits(x));
+        i = i + 1;
+    }
+    return p;
+}
+
+/// The whole file: nv comes from the table, np from the number of values. The length it needs (see "bytes out").
+pub fn raw_write(out: []u8, title: []const u8, date: []const u8, command: []const u8, plotname: []const u8, vars: []const u8, vals: []const f64, binary: bool, a: []u64, d: []u8) -> usize {
+    const nv : usize = raw_count_vars(vars);
+    var np : usize = 0;
+    if (nv > 0) { np = vals.len / nv; }
+    const p : usize = raw_put_header(out, 0, title, date, command, plotname, vars, nv, np, binary);
+    if (binary) { return raw_put_binary(out, p, nv, np, vals); }
+    return raw_put_ascii(out, p, nv, np, vals, a, d);
+}
+
+; --- the reader that judges a file ------------------------------------------------------------------
+; It checks what ngspice's `load` and uberWAVE's parser rely on: the header lines in order, the counts against the
+; body, and the body's shape. A file whose header lies about its points or variables is refused with the reason.
+
+pub const RAW_OK : u32 = 0;
+pub const RAW_E_TITLE : u32 = 1;
+pub const RAW_E_DATE : u32 = 2;
+pub const RAW_E_PLOT : u32 = 3;
+pub const RAW_E_FLAGS : u32 = 4;
+pub const RAW_E_NVARS : u32 = 5;
+pub const RAW_E_NPTS : u32 = 6;
+pub const RAW_E_VARS : u32 = 7;
+pub const RAW_E_MODE : u32 = 8;
+/// Fewer points than the header says.
+pub const RAW_E_SHORT : u32 = 9;
+/// Bytes after the last point the header declares.
+pub const RAW_E_TRAIL : u32 = 10;
+pub const RAW_E_INDEX : u32 = 11;
+pub const RAW_E_VALUE : u32 = 12;
+/// A point with more or fewer values than the header has variables.
+pub const RAW_E_SHAPE : u32 = 13;
+/// The largest count a header may state (nv * np * 8 stays below 2^63).
+pub const RAW_MAX : u64 = 1000000000;
+pub const RAW_BAD : u64 = 18446744073709551615;
+/// No position.
+pub const RAW_NONE : usize = 4294967295;
+
+pub struct RawInfo { err: u32, nv: usize, np: usize, binary: bool, data: usize }
+
+/// The index of the line feed at or after `from`, or n.
+pub fn raw_eol(buf: []const u8, n: usize, from: usize) -> usize {
+    var i : usize = from;
+    while (i < n and buf[i] != 10) { i = i + 1; }
+    return i;
+}
+
+/// Does buf[0..n) hold s at `at`?
+pub fn raw_has(buf: []const u8, n: usize, at: usize, s: []const u8) -> bool {
+    if (at + s.len > n) { return false; }
+    return raw_at(buf, at, s);
+}
+
+/// The unsigned number in buf[from..to): digits, then spaces (ngspice pads the point count of a file it rewrites); RAW_BAD else.
+pub fn raw_uint(buf: []const u8, from: usize, to: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = from;
+    while (i < to and buf[i] >= 48 and buf[i] <= 57) {
+        if (i - from >= 18) { return RAW_BAD; }
+        v = v * 10 + ((buf[i] - 48) as u64);
+        i = i + 1;
+    }
+    if (i == from) { return RAW_BAD; }
+    while (i < to and buf[i] == 32) { i = i + 1; }
+    if (i != to) { return RAW_BAD; }
+    return v;
+}
+
+/// The count on the line at `at` that starts with `prefix`; RAW_BAD if the line is not that or the count is not in range.
+pub fn raw_count_line(buf: []const u8, n: usize, at: usize, prefix: []const u8) -> u64 {
+    if (!raw_has(buf, n, at, prefix)) { return RAW_BAD; }
+    const v : u64 = raw_uint(buf, at + prefix.len, raw_eol(buf, n, at));
+    if (v > RAW_MAX) { return RAW_BAD; }
+    return v;
+}
+
+/// Is buf[from..to) the text of a number: [-]digits[.digits][e[+-]digits], or inf, -inf, nan?
+pub fn raw_value_ok(buf: []const u8, from: usize, to: usize) -> bool {
+    var i : usize = from;
+    if (i < to and buf[i] == 45) { i = i + 1; }
+    if (raw_has(buf, to, i, "inf") and to == i + 3) { return true; }
+    if (raw_has(buf, to, i, "nan") and to == i + 3) { return true; }
+    var digits : usize = 0;
+    while (i < to and buf[i] >= 48 and buf[i] <= 57) {
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (digits == 0) { return false; }
+    if (i < to and buf[i] == 46) {
+        i = i + 1;
+        var frac : usize = 0;
+        while (i < to and buf[i] >= 48 and buf[i] <= 57) {
+            i = i + 1;
+            frac = frac + 1;
+        }
+        if (frac == 0) { return false; }
+    }
+    if (i < to and (buf[i] == 101 or buf[i] == 69)) {
+        i = i + 1;
+        if (i < to and (buf[i] == 43 or buf[i] == 45)) { i = i + 1; }
+        var ed : usize = 0;
+        while (i < to and buf[i] >= 48 and buf[i] <= 57) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if (ed == 0) { return false; }
+    }
+    return i == to;
+}
+
+/// The ASCII body from `start`: np points of nv values, each point " index<TAB>v0", "<TAB>vj" lines and an empty line.
+pub fn raw_check_ascii(buf: []const u8, n: usize, start: usize, nv: usize, np: usize) -> u32 {
+    var at : usize = start;
+    var pt : usize = 0;
+    while (pt < np) {
+        var v : usize = 0;
+        while (v < nv) {
+            if (at >= n) { return RAW_E_SHORT; }
+            const e : usize = raw_eol(buf, n, at);
+            if (e >= n) { return RAW_E_SHORT; }
+            var from : usize = at + 1;
+            if (v == 0) {
+                if (buf[at] != 32) { return RAW_E_INDEX; }
+                var t : usize = from;
+                while (t < e and buf[t] != 9) { t = t + 1; }
+                if (t >= e) { return RAW_E_INDEX; }
+                if (raw_uint(buf, from, t) != (pt as u64)) { return RAW_E_INDEX; }
+                from = t + 1;
+            } else if (buf[at] != 9) {
+                return RAW_E_SHAPE;
+            }
+            if (!raw_value_ok(buf, from, e)) { return RAW_E_VALUE; }
+            at = e + 1;
+            v = v + 1;
+        }
+        if (at >= n) { return RAW_E_SHORT; }
+        if (buf[at] != 10) { return RAW_E_SHAPE; }
+        at = at + 1;
+        pt = pt + 1;
+    }
+    if (at != n) { return RAW_E_TRAIL; }
+    return RAW_OK;
+}
+
+/// The Variables: lines from `start`: nv lines "<TAB>k<TAB>name<TAB>type", both words non-empty; the position after them, or RAW_NONE.
+pub fn raw_check_vars(buf: []const u8, n: usize, start: usize, nv: usize) -> usize {
+    var at : usize = start;
+    var k : usize = 0;
+    while (k < nv) {
+        if (at >= n or buf[at] != 9) { return RAW_NONE; }
+        const e : usize = raw_eol(buf, n, at);
+        if (e >= n) { return RAW_NONE; }
+        var t1 : usize = at + 1;
+        while (t1 < e and buf[t1] != 9) { t1 = t1 + 1; }
+        if (t1 >= e or raw_uint(buf, at + 1, t1) != (k as u64)) { return RAW_NONE; }
+        var t2 : usize = t1 + 1;
+        while (t2 < e and buf[t2] != 9) { t2 = t2 + 1; }
+        if (t2 >= e or t2 == t1 + 1 or e == t2 + 1) { return RAW_NONE; }
+        var t3 : usize = t2 + 1;
+        while (t3 < e and buf[t3] != 9) { t3 = t3 + 1; }
+        if (t3 != e) { return RAW_NONE; }
+        at = e + 1;
+        k = k + 1;
+    }
+    return at;
+}
+
+/// Judge buf[0..n) as a real-valued RAW file; err is RAW_OK or the first thing that is wrong.
+pub fn raw_check(buf: []const u8, n: usize) -> RawInfo {
+    var inf : RawInfo = RawInfo { err: 0, nv: 0, np: 0, binary: false, data: 0 };
+    var at : usize = 0;
+    if (!raw_has(buf, n, at, "Title: ")) {
+        inf.err = RAW_E_TITLE;
+        return inf;
+    }
+    at = raw_eol(buf, n, at) + 1;
+    if (!raw_has(buf, n, at, "Date: ")) {
+        inf.err = RAW_E_DATE;
+        return inf;
+    }
+    at = raw_eol(buf, n, at) + 1;
+    if (raw_has(buf, n, at, "Command: ")) { at = raw_eol(buf, n, at) + 1; }
+    if (!raw_has(buf, n, at, "Plotname: ")) {
+        inf.err = RAW_E_PLOT;
+        return inf;
+    }
+    at = raw_eol(buf, n, at) + 1;
+    if (!raw_has(buf, n, at, "Flags: real\n")) {
+        inf.err = RAW_E_FLAGS;
+        return inf;
+    }
+    at = at + 12;
+    const nv : u64 = raw_count_line(buf, n, at, "No. Variables: ");
+    if (nv == RAW_BAD) {
+        inf.err = RAW_E_NVARS;
+        return inf;
+    }
+    at = raw_eol(buf, n, at) + 1;
+    const np : u64 = raw_count_line(buf, n, at, "No. Points: ");
+    if (np == RAW_BAD) {
+        inf.err = RAW_E_NPTS;
+        return inf;
+    }
+    at = raw_eol(buf, n, at) + 1;
+    inf.nv = nv as usize;
+    inf.np = np as usize;
+    if (!raw_has(buf, n, at, "Variables:\n")) {
+        inf.err = RAW_E_VARS;
+        return inf;
+    }
+    at = raw_check_vars(buf, n, at + 11, inf.nv);
+    if (at == RAW_NONE) {
+        inf.err = RAW_E_VARS;
+        return inf;
+    }
+    if (raw_has(buf, n, at, "Binary:\n")) {
+        inf.binary = true;
+        inf.data = at + 8;
+        const want : u64 = nv * np * 8;
+        const have : u64 = (n - inf.data) as u64;
+        if (have < want) { inf.err = RAW_E_SHORT; }
+        if (have > want) { inf.err = RAW_E_TRAIL; }
+        return inf;
+    }
+    if (raw_has(buf, n, at, "Values:\n")) {
+        inf.data = at + 8;
+        inf.err = raw_check_ascii(buf, n, inf.data, inf.nv, inf.np);
+        return inf;
+    }
+    inf.err = RAW_E_MODE;
+    return inf;
+}
+
+/// Eight bytes at `at`, least significant first.
+pub fn raw_get_le64(buf: []const u8, at: usize) -> u64 {
+    var b : u64 = 0;
+    var i : usize = 8;
+    while (i > 0) {
+        i = i - 1;
+        b = (b << 8) | (buf[at + i] as u64);
+    }
+    return b;
+}
+
+/// Value v of point p of a binary file that raw_check accepted.
+pub fn raw_binary_value(buf: []const u8, inf: RawInfo, p: usize, v: usize) -> f64 {
+    return raw_from_bits(raw_get_le64(buf, inf.data + (p * inf.nv + v) * 8));
+}
+
+; --- ngspice's own files: specs/analog/decks/raw_ref.cir, executed as `ngspice -b raw_ref.cir` (ngspice-47) -----------------------
+; The ASCII file in SM_A0.., the binary file as hex in SM_H0.., the 60 doubles both hold in SM_BITS (read off the binary file).
+pub const SM_TITLE : str = "m5 raw layout reference: an rc charge, first 100 ns, written by ngspice as ascii and as binary";
+pub const SM_DATE : str = "Mon Oct 19 13:53:03  2026";
+pub const SM_COMMAND : str = "ngspice-47, Build ";
+pub const SM_PLOT : str = "Transient Analysis";
+pub const SM_VARS : str = "time\ttime\nv(in)\tvoltage\nv(out)\tvoltage\ni(v1)\tcurrent\n";
+pub const SM_NV : usize = 4;
+pub const SM_NP : usize = 15;
+pub const SM_BITS : [60]u64 = [
+    0x3DA5FD7FE1796496, 0x3FF0000000000000, 0x3EE4F8A7CA7C7DD7, 0xBF50624316314250,
+    0x3DB5FD7FE1796496, 0x3FF0000000000000, 0x3EF4F8A0EB4D8930, 0xBF5062385977E40B,
+    0x3DC5FD7FE1796496, 0x3FF0000000000000, 0x3F04F8969C8B9B18, 0xBF506222E0133A47,
+    0x3DD5FD7FE1796496, 0x3FF0000000000000, 0x3F14F87CD7C64DF0, 0xBF5061F7ED9E56F1,
+    0x3DE5FD7FE1796496, 0x3FF0000000000000, 0x3F24F846BB2213A9, 0xBF5061A20A064CBC,
+    0x3DF5FD7FE1796496, 0x3FF0000000000000, 0x3F34F7D93A6924D3, 0xBF5060F6481D079B,
+    0x3E05FD7FE1796496, 0x3FF0000000000000, 0x3F44F6FD9DAFFD23, 0xBF505F9ED964A5E4,
+    0x3E15FD7FE1796496, 0x3FF0000000000000, 0x3F54F546385AB8F6, 0xBF505CF05053E095,
+    0x3E25FD7FE1796496, 0x3FF0000000000000, 0x3F64F1D7DEA8988B, 0xBF5057948F6D3B16,
+    0x3E35FD7FE1796496, 0x3FF0000000000000, 0x3F74EAFD7EA165DC, 0xBF504CE25063B4D7,
+    0x3E45FD7FE1796496, 0x3FF0000000000000, 0x3F84DD524D93C7AE, 0xBF503792CC2DEBF9,
+    0x3E55FD7FE1796496, 0x3FF0000000000000, 0x3F94C22216FD4C89, 0xBF500D472272BB31,
+    0x3E65FD7FE1796496, 0x3FF0000000000000, 0x3FA48C58C9BDC3BE, 0xBF4F73F2202501CF,
+    0x3E72EB5945BCB0CA, 0x3FF0000000000000, 0x3FB16C249FC63450, 0xBF4E89B5AE1BE0BB,
+    0x3E7AD7F29ABCAF49, 0x3FF0000000000000, 0x3FB85CE0B4989BEA, 0xBF4DA649A3406F1E,
+];
+pub const SM_A0 : str = "Title: m5 raw layout reference: an rc charge, first 100 ns, written by ngspice as ascii and as binary\nDate: Mon Oct 19 13:53:03  2026\nCommand: ngspice-47, Build \nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 4\nNo. Points: 15\nVariables:\n\t0\ttime\ttime\n\t1\tv(in)\tvoltage\n\t2\tv(out)\tvoltage\n\t3\ti(v1)\tcurrent\nValues:\n";
+pub const SM_A1 : str = " 0\t1.000000000000000e-11\n\t1.000000000000000e+00\n\t9.999900000999991e-06\n\t-9.999900000999991e-04\n\n 1\t2.000000000000000e-11\n\t1.000000000000000e+00\n\t1.999970000399995e-05\n\t-9.999800002999961e-04\n\n 2\t4.000000000000000e-11\n\t1.000000000000000e+00\n\t3.999910001599975e-05\n\t-9.999600008999841e-04\n\n 3\t8.000000000000001e-11\n\t1.000000000000000e+00\n\t7.999670009999744e-05\n\t-9.999200032999001e-04\n\n";
+pub const SM_A2 : str = " 4\t1.600000000000000e-10\n\t1.000000000000000e+00\n\t1.599871007479635e-04\n\t-9.998400128992521e-04\n\n 5\t3.200000000000000e-10\n\t1.000000000000000e+00\n\t3.199487058834331e-04\n\t-9.996800512941165e-04\n\n 6\t6.400000000000001e-10\n\t1.000000000000000e+00\n\t6.397951468669931e-04\n\t-9.993602048531331e-04\n\n 7\t1.280000000000000e-09\n\t1.000000000000000e+00\n\t1.279181074476163e-03\n\t-9.987208189255238e-04\n\n";
+pub const SM_A3 : str = " 8\t2.560000000000000e-09\n\t1.000000000000000e+00\n\t2.556726093888411e-03\n\t-9.974432739061115e-04\n\n 9\t5.120000000000001e-09\n\t1.000000000000000e+00\n\t5.106916631200300e-03\n\t-9.948930833687997e-04\n\n 10\t1.024000000000000e-08\n\t1.000000000000000e+00\n\t1.018776225325610e-02\n\t-9.898122377467440e-04\n\n 11\t2.048000000000000e-08\n\t1.000000000000000e+00\n\t2.027180924717390e-02\n\t-9.797281907528261e-04\n\n";
+pub const SM_A4 : str = " 12\t4.096000000000000e-08\n\t1.000000000000000e+00\n\t4.013326132451976e-02\n\t-9.598667386754802e-04\n\n 13\t7.048000000000001e-08\n\t1.000000000000000e+00\n\t6.805638218630006e-02\n\t-9.319436178137000e-04\n\n 14\t1.000000000000000e-07\n\t1.000000000000000e+00\n\t9.516720208249266e-02\n\t-9.048327979175074e-04\n\n";
+pub const SM_H0 : str = "5469746c653a206d3520726177206c61796f7574207265666572656e63653a20616e207263206368617267652c20666972737420313030206e732c207772697474656e206279206e67737069636520617320617363696920616e642061732062696e6172790a446174653a204d6f6e204f63742031392031333a35333a30332020323032360a436f6d6d616e643a206e6773706963652d34372c204275696c64200a506c6f746e616d653a205472616e7369656e7420416e61";
+pub const SM_H1 : str = "6c797369730a466c6167733a207265616c0a4e6f2e205661726961626c65733a20340a4e6f2e20506f696e74733a2031350a5661726961626c65733a0a09300974696d650974696d650a0931097628696e2909766f6c746167650a09320976286f75742909766f6c746167650a09330969287631290963757272656e740a42696e6172793a0a966479e17ffda53d000000000000f03fd77d7ccaa7f8e43e50423116436250bf966479e17ffdb53d000000000000f03f30894d";
+pub const SM_H2 : str = "eba0f8f43e0be47759386250bf966479e17ffdc53d000000000000f03f189b8b9c96f8043f473a13e0226250bf966479e17ffdd53d000000000000f03ff04dc6d77cf8143ff1569eedf76150bf966479e17ffde53d000000000000f03fa91322bb46f8243fbc4c060aa26150bf966479e17ffdf53d000000000000f03fd324693ad9f7343f9b071d48f66050bf966479e17ffd053e000000000000f03f23fdaf9dfdf6443fe4a564d99e5f50bf966479e17ffd153e00000000";
+pub const SM_H3 : str = "0000f03ff6b85a3846f5543f95e05350f05c50bf966479e17ffd253e000000000000f03f8b98a8ded7f1643f163b6d8f945750bf966479e17ffd353e000000000000f03fdc65a17efdea743fd7b46350e24c50bf966479e17ffd453e000000000000f03faec7934d52dd843ff9eb2dcc923750bf966479e17ffd553e000000000000f03f894cfd1622c2943f31bb7222470d50bf966479e17ffd653e000000000000f03fbec3bdc9588ca43fcf012520f2734fbfcab0bc4559";
+pub const SM_H4 : str = "eb723e000000000000f03f5034c69f246cb13fbbe01baeb5894ebf49afbc9af2d77a3e000000000000f03fea9b98b4e05cb83f1e6f40a349a64dbf";
+
+; --- small helpers for the tests ----------------------------------------------------------------------
+
+/// The first position at or after `from` where buf[0..n) holds s; RAW_NONE if there is none.
+pub fn raw_find(buf: []const u8, n: usize, s: []const u8, from: usize) -> usize {
+    var i : usize = from;
+    while (i + s.len <= n) {
+        if (raw_at(buf, i, s)) { return i; }
+        i = i + 1;
+    }
+    return RAW_NONE;
+}
+
+/// The value of a hex digit (0-9, a-f, A-F).
+pub fn raw_nibble(c: u8) -> u8 {
+    if (c >= 97) { return c - 87; }
+    if (c >= 65) { return c - 55; }
+    return c - 48;
+}
+
+/// Does out hold, at `at`, the bytes written as hex digits in `hex`?
+pub fn raw_at_hex(out: []const u8, at: usize, hex: []const u8) -> bool {
+    if (at + hex.len / 2 > out.len) { return false; }
+    var i : usize = 0;
+    while (i < hex.len / 2) {
+        if (out[at + i] != raw_nibble(hex[2 * i]) * 16 + raw_nibble(hex[2 * i + 1])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The bytes written as hex digits in `hex`, into out from w; the new cursor.
+pub fn raw_put_hex(out: []u8, w: usize, hex: []const u8) -> usize {
+    var p : usize = w;
+    var i : usize = 0;
+    while (i < hex.len / 2) {
+        p = raw_put(out, p, raw_nibble(hex[2 * i]) * 16 + raw_nibble(hex[2 * i + 1]));
+        i = i + 1;
+    }
+    return p;
+}
+
+; --- the M1 RLC trace as a RAW file ----------------------------------------------------------------------
+; Circuit 2 of specs/analog/linear.t27: R = 100 Ohm, L = 10 uH, C = 1 nF, dt = 5 ns, IN = 1 V for 100 steps then 0 V.
+; The trace has 201 points: point 0 is the circuit at rest before the source turns on (time 0, IN 0 V), point k the state
+; after the k-th update at time k * dt, with IN the source value of that update. The variables are named as ngspice names them for
+; specs/analog/decks/rlc_fixed.cir: v(in), the node v(1) between R and L, the capacitor voltage v(2) and the inductor
+; current i(l1) (the cell keeps it as volts, current * 100 Ohm; it is divided back here). That deck's time axis is this one
+; shifted by 42.5 ns, the instant its source turns on.
+
+/// The variable table of the RLC trace.
+pub const RLC_VARS : str = "time\ttime\nv(in)\tvoltage\nv(1)\tvoltage\nv(2)\tvoltage\ni(l1)\tcurrent\n";
+pub const RLC_NVARS : usize = 5;
+/// Point 0 and one point after each of the 200 steps.
+pub const RLC_PTS : usize = 201;
+/// RLC_PTS * RLC_NVARS: the f64 a trace holds.
+pub const RLC_VALS : usize = 1005;
+pub const RLC_TITLE : str = "m1 series rlc, backward euler on a fixed 5 ns grid";
+
+/// Simulate a 3-unknown cell with the tables d (D, 9 words) and nv (N, 3 words) for STEPS steps; vals (RLC_VALS of them) gets the
+/// trace, point-major. The fold of every state word of every update comes back: for the RLC's own tables linear.t27 pins it
+/// as RLC_EXP_S, so it says the trace is that simulation.
+pub fn raw_cell_trace(d: []const u32, nv: []const u32, vals: []f64) -> u64 {
+    var x : [3]u32 = [0] ** 3;
+    var s : u64 = 0;
+    var j : usize = 0;
+    while (j < RLC_NVARS) {
+        vals[j] = 0.0;
+        j = j + 1;
+    }
+    var k : u32 = 0;
+    while (k < STEPS) {
+        const u : u32 = vin_at(k);
+        const y0 : u32 = step_row(0, RLC_N, d, nv, &x, u);
+        const y1 : u32 = step_row(1, RLC_N, d, nv, &x, u);
+        const y2 : u32 = step_row(2, RLC_N, d, nv, &x, u);
+        x[0] = y0;
+        x[1] = y1;
+        x[2] = y2;
+        s = fold(s, y0);
+        s = fold(s, y1);
+        s = fold(s, y2);
+        const row : usize = ((k + 1) as usize) * RLC_NVARS;
+        vals[row] = ((k + 1) as f64) * RLC_DT;
+        vals[row + 1] = sm_f64(u);
+        vals[row + 2] = sm_f64(y0);
+        vals[row + 3] = sm_f64(y1);
+        vals[row + 4] = sm_f64(y2) / RLC_ZS;
+        k = k + 1;
+    }
+    return s;
+}
+
+/// The RLC trace: raw_cell_trace over the tables of linear.t27's circuit 2.
+pub fn raw_rlc_trace(vals: []f64) -> u64 {
+    return raw_cell_trace(&RLC_D, &RLC_NV, vals);
+}
+
+/// The RLC trace as a RAW file in out, ASCII or binary, with the given Date line and no Command line (ngspice executes a
+/// Command: line when it loads the file); the length it needs. vals: RLC_VALS f64
+/// of scratch for the trace; a and d: the scratch of raw_put_f64.
+pub fn raw_rlc_file(out: []u8, date: []const u8, binary: bool, vals: []f64, a: []u64, d: []u8) -> usize {
+    const s : u64 = raw_rlc_trace(vals);
+    if (s != RLC_EXP_S) { return 0; }
+    return raw_write(out, RLC_TITLE, date, "", "Transient Analysis", RLC_VARS, vals, binary, a, d);
+}
+
+; --- tests: the writer against ngspice -------------------------------------------------------------------
+
+test a_nan_or_an_infinity_is_written_in_both_modes_without_hanging {
+    const bi : u64 = 0x7FF0000000000000;
+    const bm : u64 = 0xFFF0000000000000;
+    const bn : u64 = 0x7FF8000000000000;
+    const inf : f64 = @bitCast(bi);
+    const ninf : f64 = @bitCast(bm);
+    const nan : f64 = @bitCast(bn);
+    assert(raw_to_bits(inf) == 0x7FF0000000000000);
+    assert(raw_to_bits(ninf) == 0xFFF0000000000000);
+    assert(raw_to_bits(nan) == 0x7FF8000000000000);
+    var out : [32]u8 = [0] ** 32;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var n : usize = raw_put_f64(&out, 0, inf, &a, &d);
+    assert(n == 3);
+    assert(raw_at(&out, 0, "inf"));
+    n = raw_put_f64(&out, 0, ninf, &a, &d);
+    assert(n == 4);
+    assert(raw_at(&out, 0, "-inf"));
+    n = raw_put_f64(&out, 0, nan, &a, &d);
+    assert(n == 3);
+    assert(raw_at(&out, 0, "nan"));
+    // the reader takes all three as numbers
+    assert(raw_value_ok(&out, 0, n));
+}
+
+test the_ascii_file_is_ngspices_byte_for_byte {
+    var vals : [60]f64 = [0.0] ** 60;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var out : [4096]u8 = [0] ** 4096;
+    var i : usize = 0;
+    while (i < 60) {
+        vals[i] = raw_from_bits(SM_BITS[i]);
+        i = i + 1;
+    }
+    const n : usize = raw_write(&out, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, &vals, false, &a, &d);
+    const want : [5]str = [SM_A0, SM_A1, SM_A2, SM_A3, SM_A4];
+    var at : usize = 0;
+    var k : usize = 0;
+    while (k < 5) {
+        assert(raw_at(&out, at, want[k]));
+        at = at + want[k].len;
+        k = k + 1;
+    }
+    assert(at == n);
+    // the comparison is not vacuous: one changed digit is not the reference
+    out[n - 4] = out[n - 4] + 1;
+    assert(!raw_at(&out, n - want[4].len, want[4]));
+}
+
+test the_binary_file_is_ngspices_byte_for_byte {
+    var vals : [60]f64 = [0.0] ** 60;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var out : [4096]u8 = [0] ** 4096;
+    var i : usize = 0;
+    while (i < 60) {
+        vals[i] = raw_from_bits(SM_BITS[i]);
+        i = i + 1;
+    }
+    const n : usize = raw_write(&out, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, &vals, true, &a, &d);
+    const want : [5]str = [SM_H0, SM_H1, SM_H2, SM_H3, SM_H4];
+    var at : usize = 0;
+    var k : usize = 0;
+    while (k < 5) {
+        assert(raw_at_hex(&out, at, want[k]));
+        at = at + want[k].len / 2;
+        k = k + 1;
+    }
+    assert(at == n);
+    assert(n == 799);
+}
+
+test the_reader_accepts_ngspices_own_files_and_reads_the_binary_values {
+    var buf : [4096]u8 = [0] ** 4096;
+    const hex : [5]str = [SM_H0, SM_H1, SM_H2, SM_H3, SM_H4];
+    var n : usize = 0;
+    var k : usize = 0;
+    while (k < 5) {
+        n = raw_put_hex(&buf, n, hex[k]);
+        k = k + 1;
+    }
+    const inf : RawInfo = raw_check(&buf, n);
+    assert(inf.err == RAW_OK);
+    assert(inf.binary);
+    assert(inf.nv == SM_NV);
+    assert(inf.np == SM_NP);
+    var p : usize = 0;
+    while (p < SM_NP) {
+        var v : usize = 0;
+        while (v < SM_NV) {
+            assert(raw_to_bits(raw_binary_value(&buf, inf, p, v)) == SM_BITS[p * SM_NV + v]);
+            v = v + 1;
+        }
+        p = p + 1;
+    }
+    var m : usize = 0;
+    const asc : [5]str = [SM_A0, SM_A1, SM_A2, SM_A3, SM_A4];
+    k = 0;
+    while (k < 5) {
+        m = raw_puts(&buf, m, asc[k]);
+        k = k + 1;
+    }
+    const ia : RawInfo = raw_check(&buf, m);
+    assert(ia.err == RAW_OK);
+    assert(!ia.binary);
+    assert(ia.nv == SM_NV);
+    assert(ia.np == SM_NP);
+}
+
+test the_point_index_is_written_with_one_space_before_it_at_every_width {
+    // ngspice writes " 9", " 10", " 100", " 1000": a space, then the index in decimal
+    var out : [32768]u8 = [0] ** 32768;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var vals : [1001]f64 = [0.0] ** 1001;
+    var i : usize = 0;
+    while (i < 1001) {
+        vals[i] = (i as f64) * 0.25;
+        i = i + 1;
+    }
+    var n : usize = raw_put_header(&out, 0, "t", "d", "", "p", "time\ttime\n", 1, 1001, false);
+    n = raw_put_ascii(&out, n, 1, 1001, &vals, &a, &d);
+    assert(n <= 32768);
+    assert(raw_check(&out, n).err == RAW_OK);
+    assert(raw_find(&out, n, "\n 9\t3.000000000000000e+00\n", 0) == RAW_NONE);
+    assert(raw_find(&out, n, "\n 9\t2.250000000000000e+00\n\n 10\t2.500000000000000e+00\n", 0) != RAW_NONE);
+    assert(raw_find(&out, n, "\n 100\t2.500000000000000e+01\n", 0) != RAW_NONE);
+    assert(raw_find(&out, n, "\n 1000\t2.500000000000000e+02\n\n", 0) != RAW_NONE);
+    // no Command line when the command is empty
+    assert(raw_find(&out, n, "Command", 0) == RAW_NONE);
+}
+
+; --- tests: the reader refuses a file that lies -------------------------------------------------------------
+
+test a_header_with_the_wrong_point_count_is_refused {
+    var vals : [60]f64 = [0.0] ** 60;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var buf : [4096]u8 = [0] ** 4096;
+    var i : usize = 0;
+    while (i < 60) {
+        vals[i] = raw_from_bits(SM_BITS[i]);
+        i = i + 1;
+    }
+    // the control: the honest header and body
+    var n : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 15, false);
+    n = raw_put_ascii(&buf, n, 4, 15, &vals, &a, &d);
+    assert(raw_check(&buf, n).err == RAW_OK);
+    // one point too many in the header: the file ends early
+    var n16 : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 16, false);
+    n16 = raw_put_ascii(&buf, n16, 4, 15, &vals, &a, &d);
+    assert(raw_check(&buf, n16).err == RAW_E_SHORT);
+    // one too few: a point is left over
+    var n14 : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 14, false);
+    n14 = raw_put_ascii(&buf, n14, 4, 15, &vals, &a, &d);
+    assert(raw_check(&buf, n14).err == RAW_E_TRAIL);
+    // the same two lies in a binary file
+    var b15 : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 15, true);
+    b15 = raw_put_binary(&buf, b15, 4, 15, &vals);
+    assert(raw_check(&buf, b15).err == RAW_OK);
+    assert(raw_check(&buf, b15 - 1).err == RAW_E_SHORT);
+    buf[b15] = 0;
+    assert(raw_check(&buf, b15 + 1).err == RAW_E_TRAIL);
+}
+
+test a_header_with_the_wrong_variable_count_is_refused {
+    var vals : [60]f64 = [0.0] ** 60;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var buf : [4096]u8 = [0] ** 4096;
+    var i : usize = 0;
+    while (i < 60) {
+        vals[i] = raw_from_bits(SM_BITS[i]);
+        i = i + 1;
+    }
+    // the table has 4 variables; the header says 5 or 3
+    var n5 : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 5, 12, false);
+    n5 = raw_put_ascii(&buf, n5, 4, 15, &vals, &a, &d);
+    assert(raw_check(&buf, n5).err == RAW_E_VARS);
+    var n3 : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 3, 15, false);
+    n3 = raw_put_ascii(&buf, n3, 4, 15, &vals, &a, &d);
+    assert(raw_check(&buf, n3).err == RAW_E_MODE);
+    // header and table agree on 4, the body has 3 values per point
+    var m : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 15, false);
+    m = raw_put_ascii(&buf, m, 3, 15, &vals, &a, &d);
+    assert(raw_check(&buf, m).err == RAW_E_SHAPE);
+    // and 5 values per point
+    var q : usize = raw_put_header(&buf, 0, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, 4, 12, false);
+    q = raw_put_ascii(&buf, q, 5, 12, &vals, &a, &d);
+    assert(raw_check(&buf, q).err == RAW_E_SHAPE);
+}
+
+test a_file_with_a_broken_header_index_or_value_is_refused {
+    var vals : [60]f64 = [0.0] ** 60;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var buf : [4096]u8 = [0] ** 4096;
+    var i : usize = 0;
+    while (i < 60) {
+        vals[i] = raw_from_bits(SM_BITS[i]);
+        i = i + 1;
+    }
+    const n : usize = raw_write(&buf, SM_TITLE, SM_DATE, SM_COMMAND, SM_PLOT, SM_VARS, &vals, false, &a, &d);
+    assert(raw_check(&buf, n).err == RAW_OK);
+    // point 1 numbered 7
+    const at1 : usize = raw_find(&buf, n, "\n 1\t", 0);
+    assert(at1 != RAW_NONE);
+    buf[at1 + 2] = 55;
+    assert(raw_check(&buf, n).err == RAW_E_INDEX);
+    buf[at1 + 2] = 49;
+    assert(raw_check(&buf, n).err == RAW_OK);
+    // an exponent letter turned into x
+    const av : usize = raw_find(&buf, n, "Values:\n", 0);
+    const ae : usize = raw_find(&buf, n, "e-", av);
+    assert(ae != RAW_NONE);
+    buf[ae] = 120;
+    assert(raw_check(&buf, n).err == RAW_E_VALUE);
+    buf[ae] = 101;
+    assert(raw_check(&buf, n).err == RAW_OK);
+    // the first header line, the flags line, the mode line
+    buf[0] = 116;
+    assert(raw_check(&buf, n).err == RAW_E_TITLE);
+    buf[0] = 84;
+    const af : usize = raw_find(&buf, n, "real", 0);
+    buf[af] = 99;
+    assert(raw_check(&buf, n).err == RAW_E_FLAGS);
+    buf[af] = 114;
+    const am : usize = raw_find(&buf, n, "Values:", 0);
+    buf[am] = 86;
+    buf[am + 1] = 65;
+    assert(raw_check(&buf, n).err == RAW_E_MODE);
+    buf[am] = 86;
+    buf[am + 1] = 97;
+    assert(raw_check(&buf, n).err == RAW_OK);
+}
+
+test the_value_syntax_the_reader_accepts {
+    var b : [32]u8 = [0] ** 32;
+    var n : usize = raw_puts(&b, 0, "-1.500000000000000e-03");
+    assert(raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "1");
+    assert(raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "nan");
+    assert(raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "-inf");
+    assert(raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "1.5E+10");
+    assert(raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, ".5");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "1.");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "1e");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "--1");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "1.0e+0x");
+    assert(!raw_value_ok(&b, 0, n));
+    n = raw_puts(&b, 0, "nanx");
+    assert(!raw_value_ok(&b, 0, n));
+}
+
+test the_reader_takes_the_padded_point_count_of_a_rewritten_file {
+    // ngspice -r writes the point count padded with spaces once the simulation has ended
+    var b : [256]u8 = [0] ** 256;
+    const n : usize = raw_puts(&b, 0, "Title: t\nDate: d\nPlotname: p\nFlags: real\nNo. Variables: 1\nNo. Points: 0    \nVariables:\n\t0\ttime\ttime\nValues:\n");
+    const inf : RawInfo = raw_check(&b, n);
+    assert(inf.err == RAW_OK);
+    assert(inf.nv == 1);
+    assert(inf.np == 0);
+}
+
+; --- tests: the M1 RLC trace ---------------------------------------------------------------------------------
+
+test the_rlc_trace_is_the_cells_own_run {
+    var vals : [1005]f64 = [0.0] ** 1005;
+    const s : u64 = raw_rlc_trace(&vals);
+    assert(s == RLC_EXP_S);
+    // point 0: at rest, the source not yet on
+    var j : usize = 0;
+    while (j < 5) {
+        assert(vals[j] == 0.0);
+        j = j + 1;
+    }
+    // the time axis is k * dt
+    assert(vals[5] == RLC_DT);
+    assert(vals[5 * 100] == 100.0 * RLC_DT);
+    assert(vals[5 * 200] == 200.0 * RLC_DT);
+    // IN is 1 V for the 100 charging steps and 0 V for the next 100
+    assert(vals[5 * 1 + 1] == 1.0);
+    assert(vals[5 * 100 + 1] == 1.0);
+    assert(vals[5 * 101 + 1] == 0.0);
+    assert(vals[5 * 200 + 1] == 0.0);
+    // the capacitor rings past the 1 V it is driven to (damping 0.5: overshoot near 15 %) and the inductor current moves both ways
+    var vmax : f64 = 0.0;
+    var imin : f64 = 0.0;
+    var imax : f64 = 0.0;
+    var p : usize = 0;
+    while (p < 201) {
+        if (vals[5 * p + 3] > vmax) { vmax = vals[5 * p + 3]; }
+        if (vals[5 * p + 4] < imin) { imin = vals[5 * p + 4]; }
+        if (vals[5 * p + 4] > imax) { imax = vals[5 * p + 4]; }
+        p = p + 1;
+    }
+    assert(vmax > 1.05);
+    assert(vmax < 1.2);
+    assert(imax > 0.0);
+    assert(imin < 0.0);
+}
+
+test the_rlc_file_passes_the_reader_in_ascii_and_binary_and_the_binary_decodes_exactly {
+    var vals : [1005]f64 = [0.0] ** 1005;
+    var a : [90]u64 = [0] ** 90;
+    var d : [810]u8 = [0] ** 810;
+    var asc : [32768]u8 = [0] ** 32768;
+    var bin : [16384]u8 = [0] ** 16384;
+    const na : usize = raw_rlc_file(&asc, "Mon Oct 19 00:00:00  2026", false, &vals, &a, &d);
+    const nb : usize = raw_rlc_file(&bin, "Mon Oct 19 00:00:00  2026", true, &vals, &a, &d);
+    assert(na > 0);
+    assert(na <= 32768);
+    assert(nb <= 16384);
+    const ia : RawInfo = raw_check(&asc, na);
+    assert(ia.err == RAW_OK);
+    assert(!ia.binary);
+    assert(ia.nv == 5);
+    assert(ia.np == 201);
+    const ib : RawInfo = raw_check(&bin, nb);
+    assert(ib.err == RAW_OK);
+    assert(ib.binary);
+    assert(ib.nv == 5);
+    assert(ib.np == 201);
+    assert(nb == ib.data + 1005 * 8);
+    var i : usize = 0;
+    while (i < 1005) {
+        assert(raw_binary_value(&bin, ib, i / 5, i % 5) == vals[i]);
+        i = i + 1;
+    }
+    // the header names the five traces
+    assert(raw_find(&asc, na, "\n\t0\ttime\ttime\n\t1\tv(in)\tvoltage\n\t2\tv(1)\tvoltage\n\t3\tv(2)\tvoltage\n\t4\ti(l1)\tcurrent\nValues:\n", 0) != RAW_NONE);
+    assert(raw_find(&asc, na, "No. Points: 201\n", 0) != RAW_NONE);
+    assert(raw_find(&asc, na, "Command", 0) == RAW_NONE);
+    assert(raw_find(&bin, nb, "Command", 0) == RAW_NONE);
+    assert(raw_find(&asc, na, "No. Variables: 5\n", 0) != RAW_NONE);
+}
+
+test a_mis_signed_constant_is_not_the_cells_run {
+    // the negative control: the sign of one stored constant flipped (as a mis-stamped element would) changes the fold and the trace
+    var good : [1005]f64 = [0.0] ** 1005;
+    var bad : [1005]f64 = [0.0] ** 1005;
+    var d : [9]u32 = [0] ** 9;
+    var i : usize = 0;
+    while (i < 9) {
+        d[i] = RLC_D[i];
+        i = i + 1;
+    }
+    assert(raw_cell_trace(&d, &RLC_NV, &good) == RLC_EXP_S);
+    d[4] = d[4] ^ 2147483648;
+    assert(raw_cell_trace(&d, &RLC_NV, &bad) != RLC_EXP_S);
+    var diff : bool = false;
+    i = 0;
+    while (i < 1005) {
+        if (good[i] != bad[i]) { diff = true; }
+        i = i + 1;
+    }
+    assert(diff);
+}

@@ -2890,13 +2890,6 @@ fn extract_source_from_lean(text: &str) -> Option<String> {
     None
 }
 
-/// Combined dashboard gate: the OSCFSEL selection is within the documented 0..7
-/// range and the PVT context is inside the operating envelope. Mirrors
-/// `cclk_variant_and_xadc_envelope_check` in Lean 4.
-fn cclk_variant_and_xadc_envelope_check(oscfsel: u8, ctx: &PvtContext) -> bool {
-    oscfsel <= 7 && pvt_context_inside_envelope(ctx)
-}
-
 /// Structs used to persist and report a single cold-POR sweep attempt.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SweepLog {
@@ -6738,32 +6731,6 @@ fn build_theorem_matrix_report(
         "elapsed_ms": elapsed_ms,
         "variants": entries,
     })
-}
-
-/// Strip `fixture_dir` from the fixture paths inside matrix entries so that
-/// snapshots are stable across machines.
-#[cfg(test)]
-fn normalize_fixture_paths(
-    entries: &[serde_json::Value],
-    fixture_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
-    entries
-        .iter()
-        .map(|entry| {
-            let mut entry = entry.clone();
-            if let Some(serde_json::Value::Object(fixtures)) = entry.get_mut("fixtures") {
-                for (_key, value) in fixtures.iter_mut() {
-                    if let Some(path_str) = value.as_str() {
-                        let path = std::path::Path::new(path_str);
-                        if let Ok(rel) = path.strip_prefix(fixture_dir) {
-                            *value = serde_json::Value::String(rel.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-            entry
-        })
-        .collect()
 }
 
 fn boot_protocol(checklist: bool) -> Result<()> {

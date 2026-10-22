@@ -55,7 +55,7 @@ pub fn run(src: &str) -> Vec<(String, bool, Outcome)> {
 /// The first rejection message, which must exist.
 pub fn rejected(src: &str) -> String {
     match lower_src(src) {
-        Ok(_) => panic!("expected a rejection"),
+        Ok(_) => panic!("expected a rejection of {}", src),
         Err(e) => e[0].clone(),
     }
 }

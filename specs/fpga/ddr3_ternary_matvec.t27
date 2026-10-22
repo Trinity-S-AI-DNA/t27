@@ -1,0 +1,1153 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/ddr3_ternary_matvec.t27 -- a ternary mat-vec on the AX7203 over real weights held in its DDR3
+; Cell 26 of specs/igla/own_model.t27 ("Full model on FPGA, DDR3"), epic gHashTag/t27#10024, issue
+; gHashTag/t27#10461. specs/fpga/ddr3_head_bandwidth.t27 measured the read path (#10248); this file is the
+; compute step on top of it: weights in DDR3, a product computed from them, a receipt that can be checked.
+; -
+; THE WEIGHTS. blocks.0.attn.k.weight of tern-tc-9m: 64 rows of 320 trits, one int8 in {-1, 0, +1} each,
+; 20,480 bytes at offset 10,589,476 of c_infer/model.bin (Hugging Face playra/tern-tc-9m, 16,953,800 bytes,
+; sha256 3102abdf35057924e077a86db4fdac726e4fe1f6574df47f39a638ba99a3ce9c). Its head (wte) is tied and f32,
+; not ternary, so the first ternary projection of the same checkpoint is the tensor used. The bytes, as
+; 2,560 little-endian u64 words, and the tests that compute S_EXPECT and Y_EXPECT from them, are
+; specs/fpga/tern9m_l0_k_weights.t27. The per-tensor scale (0.07064503) is not applied: y is the integer
+; product, as a ternary layer computes it before its one multiply.
+; -
+; THE RUN. Wait for the core's init_done. Receive the 20,480 bytes on the UART (115200 baud, 8N1, P20), pack
+; them low byte first into 640 beats of 32 bytes (row r is beats 10r .. 10r+9) and write beat i to address i
+; of the native port. The write checksum S folds each beat as it is packed. Then read the 640 beats back
+; from DDR3, one at a time: fold each into the read checksum C, and step through its 32 trits one per clock,
+; y_r = sum over c of w_rc * x_c in wrapping 32-bit arithmetic, where x_c is the int8 (37 c + 11) mod 256
+; read as two's complement (XV0, XSTEP). At the end of each row y_r is folded into Y. A byte that is not
+; 00, 01 or FF counts in E (and adds 0); a UART frame whose stop bit is low counts in F.
+; PASS is: 640 beats, S = S_EXPECT, C = S, Y = Y_EXPECT, E = 0 and F = 0. Anything else is FAIL.
+; -
+; THE RECEIPT. 115200 baud on N15, one line, sent again and again once the run is over:
+;   T27 TERN N=<16 hex> S=<16 hex> C=<16 hex> Y=<16 hex> E=<16 hex> F=<16 hex> L=<16 hex> PASS
+; N beats computed, S write checksum, C read checksum, Y output checksum, E bad trits, F bad frames, L the
+; line's number. Until the run is over the UART is the core's BIOS, which prints its calibration; the
+; core's own RX is tied idle, so the upload reaches only this design.
+; LEDs (active low): B13 init_done, C13 init_error, D14 PASS, D15 a heartbeat of the 100 MHz clock.
+; The button T6 (active low) resets the core and so starts the run again.
+; -
+; THE HOST. Plain commands only: `stty -f <port> 115200 cs8 -cstopb -parenb raw`, then `dd if=model.bin
+; bs=20480 skip=10589476 count=1 iflag=skip_bytes` (or `bs=1 skip=10589476 count=20480`) into the port, and
+; `cat` of the port for the receipt.
+; -
+; WHAT A PASS SAYS. These 20,480 bytes of a published checkpoint went into this board's DDR3, came back out
+; unchanged, and the board's own ternary datapath computed from them the same 64 outputs the spec's test
+; computes, checksum for checksum. WHAT IT DOES NOT SAY. Nothing about the full model: one projection of one
+; layer, an input vector that is a fixed pattern and not an activation, no scale, no attention, no rate.
+; ASCII only, English only.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module FpgaDdr3TernaryMatvec;
+
+use fpga::board_receipt;
+
+pub const KIND : str = "board-cell";
+pub const ID : str = "fpga/ddr3_ternary_matvec";
+pub const EPIC : str = "gHashTag/t27#10024";
+pub const BOARD : str = "ALINX AX7203";
+pub const PART : str = "xc7a200tfbg484-2";
+
+; --- the run ------------------------------------------------------------------------------------
+pub const W_FILE_SHA256 : str = "3102abdf35057924e077a86db4fdac726e4fe1f6574df47f39a638ba99a3ce9c";
+pub const W_TENSOR : str = "blocks.0.attn.k.weight";
+pub const W_OFFSET : u64 = 10589476;
+pub const W_BYTES : u64 = 20480;
+pub const W_ROWS : u32 = 64;
+pub const W_COLS : u32 = 320;
+pub const BEAT_BYTES : u64 = 32;
+pub const W_BEATS : u32 = 640;
+pub const BEATS_PER_ROW : u32 = 10;
+/// x_c = (XSTEP * c + XV0) mod 256, read as an int8.
+pub const XV0 : u8 = 11;
+pub const XSTEP : u8 = 37;
+/// What the board must report. Both were read off the failing assert_eq of specs/fpga/tern9m_l0_k_weights.t27
+/// run with 0 here (t27c test-report on the Railway lab, 2026-10-18), and that spec's tests now hold them: S is
+/// s_of over the pinned bytes, Y is y_of over them. The receipt prints them as S=4B58160720ABB863 and
+/// Y=9A50D884522C233D.
+pub const S_EXPECT : u64 = 0x4B58160720ABB863;
+pub const Y_EXPECT : u64 = 0x9A50D884522C233D;
+
+pub const V_PASS : u8 = 0;
+pub const V_FAIL : u8 = 3;
+
+pub const ST_WAIT : u8 = 0;
+pub const ST_LOAD : u8 = 1;
+pub const ST_READ : u8 = 2;
+pub const ST_JUDGE : u8 = 3;
+pub const ST_REPORT : u8 = 4;
+
+pub const BAUD_DIV : u16 = 868;
+pub const LINE_SEGS : u8 = 9;
+
+; --- the arithmetic -----------------------------------------------------------------------------
+; fold_beat (the beat checksum, the one specs/fpga/ddr3_head_bandwidth.t27 prints), hex_digit and pass_fail_char
+; come from specs/fpga/board_receipt.t27, which every AX7203 board spec uses.
+
+/// An int8, held as its u8 bits, sign-extended to 32 bits.
+pub fn sext8(v: u8) -> u32 {
+    if (v >= 128) { return (v as u32) | 0xFFFFFF00; }
+    return v as u32;
+}
+
+/// What a weight byte adds to a row sum, for the input x held as the u8 bits xv: +x for 01, -x for FF, 0 for
+/// 00 and for any byte that is not a trit.
+pub fn trit_term(b: u8, xv: u8) -> u32 {
+    if (b == 1) { return sext8(xv); }
+    if (b == 255) { return (0xFFFFFFFF - sext8(xv)) +% 1; }
+    return 0;
+}
+
+/// Is the byte one of the three trits 00, 01, FF.
+pub fn is_trit(b: u8) -> bool {
+    return b == 0 or b == 1 or b == 255;
+}
+
+/// The verdict of the run.
+pub fn verdict_of(n: u32, s: u64, c: u64, y: u64, e: u32, f: u32, s_want: u64, y_want: u64, n_want: u32) -> u8 {
+    if (n == n_want and s == s_want and c == s and y == y_want and e == 0 and f == 0) { return V_PASS; }
+    return V_FAIL;
+}
+
+/// How many clocks the receiver waits before its next sample: half a bit before the start bit's middle,
+/// a whole bit before every later one.
+pub fn rx_wait(bit: u8, div: u16) -> u16 {
+    if (bit == 0) { return div >> 1; }
+    return div;
+}
+
+/// The level of bit k (0 start, 1..8 data low bit first, 9 stop) of the UART frame of `b`.
+pub fn frame_bit(b: u8, k: u32) -> bool {
+    if (k == 0) { return false; }
+    if (k >= 9) { return true; }
+    var v : u8 = b;
+    var j : u32 = 1;
+    while (j < k) {
+        v = v >> 1;
+        j = j + 1;
+    }
+    return (v & 1) == 1;
+}
+
+; --- the receipt --------------------------------------------------------------------------------
+
+/// The key letter of field s (1..7): N S C Y E F L.
+pub fn key_of(s: u8) -> u8 {
+    if (s == 1) { return 78; }
+    if (s == 2) { return 83; }
+    if (s == 3) { return 67; }
+    if (s == 4) { return 89; }
+    if (s == 5) { return 69; }
+    if (s == 6) { return 70; }
+    return 76;
+}
+
+/// Character p of "T27 TERN".
+pub fn prefix_char(p: u8) -> u8 {
+    if (p == 0) { return 84; }
+    if (p == 1) { return 50; }
+    if (p == 2) { return 55; }
+    if (p == 3) { return 32; }
+    if (p == 4) { return 84; }
+    if (p == 5) { return 69; }
+    if (p == 6) { return 82; }
+    return 78;
+}
+
+/// The character at segment s, position p; `fsr` holds the field being written, its next nibble on top.
+pub fn line_char(s: u8, p: u8, fsr: u64, v: u8) -> u8 {
+    if (s == 0) { return prefix_char(p); }
+    if (s == LINE_SEGS - 1) { return pass_fail_char(v, p); }
+    if (p == 0) { return 32; }
+    if (p == 1) { return key_of(s); }
+    if (p == 2) { return 61; }
+    return hex_digit((fsr >> 60) as u8);
+}
+
+/// The last position of segment s.
+pub fn seg_last(s: u8) -> u8 {
+    if (s == 0) { return 7; }
+    if (s == LINE_SEGS - 1) { return 6; }
+    return 18;
+}
+
+/// A UART frame, sent low bit first: a start bit 0, the 8 data bits, a stop bit 1.
+pub fn frame(ch: u8) -> u16 {
+    return ((ch as u16) << 1) | 512;
+}
+
+/// A byte of the test stream: trits in an uneven order, and a 02 where `bad` says so.
+pub fn test_byte(k: u32, bad: u32) -> u8 {
+    if (k == bad) { return 2; }
+    const m : u32 = (k * 7 + k / 5) % 3;
+    if (m == 0) { return 0; }
+    if (m == 1) { return 1; }
+    return 255;
+}
+
+; --- the board ----------------------------------------------------------------------------------
+
+/// A differential input buffer (the 200 MHz oscillator on R4/T4).
+pub struct IbufdsOut { O: bool }
+pub fn IBUFDS(I: bool, IB: bool) -> IbufdsOut {}
+
+/// The outputs of the LiteDRAM core, as named in its generated Verilog.
+pub struct LitedramOut { ddram_a__0: bool, ddram_a__1: bool, ddram_a__2: bool, ddram_a__3: bool, ddram_a__4: bool, ddram_a__5: bool, ddram_a__6: bool, ddram_a__7: bool, ddram_a__8: bool, ddram_a__9: bool, ddram_a__10: bool, ddram_a__11: bool, ddram_a__12: bool, ddram_a__13: bool, ddram_a__14: bool, ddram_ba__0: bool, ddram_ba__1: bool, ddram_ba__2: bool, ddram_dm__0: bool, ddram_dm__1: bool, ddram_dm__2: bool, ddram_dm__3: bool, ddram_cas_n: bool, ddram_cke: bool, ddram_clk_n: bool, ddram_clk_p: bool, ddram_cs_n: bool, ddram_odt: bool, ddram_ras_n: bool, ddram_reset_n: bool, ddram_we_n: bool, init_done: bool, init_error: bool, pll_locked: bool, uart_tx: bool, user_clk: bool, user_port_native_0_cmd_ready: bool, user_port_native_0_rdata_data__0: u64, user_port_native_0_rdata_data__1: u64, user_port_native_0_rdata_data__2: u64, user_port_native_0_rdata_data__3: u64, user_port_native_0_rdata_valid: bool, user_port_native_0_wdata_ready: bool, user_rst: bool }
+
+/// The LiteDRAM core: a DDR3 controller with its PHY and PLL, a 256-bit native user port, and a BIOS on the UART
+/// that calibrates the PHY before it raises init_done.
+pub fn litedram_core(clk_: bool, rst: bool, uart_rx_: bool, user_port_native_0_cmd_addr: u25, user_port_native_0_cmd_valid: bool, user_port_native_0_cmd_we: bool, user_port_native_0_rdata_ready: bool, user_port_native_0_wdata_data__0: u64, user_port_native_0_wdata_data__1: u64, user_port_native_0_wdata_data__2: u64, user_port_native_0_wdata_data__3: u64, user_port_native_0_wdata_valid: bool, user_port_native_0_wdata_we: u32, ddram_dq__0: bool, ddram_dq__1: bool, ddram_dq__2: bool, ddram_dq__3: bool, ddram_dq__4: bool, ddram_dq__5: bool, ddram_dq__6: bool, ddram_dq__7: bool, ddram_dq__8: bool, ddram_dq__9: bool, ddram_dq__10: bool, ddram_dq__11: bool, ddram_dq__12: bool, ddram_dq__13: bool, ddram_dq__14: bool, ddram_dq__15: bool, ddram_dq__16: bool, ddram_dq__17: bool, ddram_dq__18: bool, ddram_dq__19: bool, ddram_dq__20: bool, ddram_dq__21: bool, ddram_dq__22: bool, ddram_dq__23: bool, ddram_dq__24: bool, ddram_dq__25: bool, ddram_dq__26: bool, ddram_dq__27: bool, ddram_dq__28: bool, ddram_dq__29: bool, ddram_dq__30: bool, ddram_dq__31: bool, ddram_dqs_n__0: bool, ddram_dqs_n__1: bool, ddram_dqs_n__2: bool, ddram_dqs_n__3: bool, ddram_dqs_p__0: bool, ddram_dqs_p__1: bool, ddram_dqs_p__2: bool, ddram_dqs_p__3: bool) -> LitedramOut {}
+
+; --- the pins in --------------------------------------------------------------------------------
+; uart_rx is the on_clock parameter of that name, so it is a port of this module read at the clock; the
+; core's own RX is tied idle (true) and never sees the upload.
+const clk200_p : bool = undefined;
+const clk200_p_LOC : str = "R4";
+const clk200_p_IOSTANDARD : str = "DIFF_SSTL15";
+const clk200_n : bool = undefined;
+const clk200_n_LOC : str = "T4";
+const clk200_n_IOSTANDARD : str = "DIFF_SSTL15";
+const cpu_reset_n : bool = undefined;
+const cpu_reset_n_LOC : str = "T6";
+const cpu_reset_n_IOSTANDARD : str = "LVCMOS15";
+const uart_rx_LOC : str = "P20";
+const uart_rx_IOSTANDARD : str = "LVCMOS33";
+
+; --- the clock, the core and its reset ----------------------------------------------------------
+const clkbuf : IbufdsOut = IBUFDS(clk200_p, clk200_n);
+const clkbuf_O_PERIOD_PS : u32 = 5000;
+
+const core : LitedramOut = litedram_core(clkbuf.O, !cpu_reset_n, true, ca as u25, cv, cwe, true, wb0, wb1, wb2, wb3, wv, 0xFFFFFFFF, ddram_dq_0, ddram_dq_1, ddram_dq_2, ddram_dq_3, ddram_dq_4, ddram_dq_5, ddram_dq_6, ddram_dq_7, ddram_dq_8, ddram_dq_9, ddram_dq_10, ddram_dq_11, ddram_dq_12, ddram_dq_13, ddram_dq_14, ddram_dq_15, ddram_dq_16, ddram_dq_17, ddram_dq_18, ddram_dq_19, ddram_dq_20, ddram_dq_21, ddram_dq_22, ddram_dq_23, ddram_dq_24, ddram_dq_25, ddram_dq_26, ddram_dq_27, ddram_dq_28, ddram_dq_29, ddram_dq_30, ddram_dq_31, ddram_dqs_n_0, ddram_dqs_n_1, ddram_dqs_n_2, ddram_dqs_n_3, ddram_dqs_p_0, ddram_dqs_p_1, ddram_dqs_p_2, ddram_dqs_p_3);
+const core_user_clk_PERIOD_PS : u32 = 10000;
+
+const clk : bool = core.user_clk;
+const rst_n : bool = !core.user_rst;
+const en : bool = true;
+
+; --- the pins out -------------------------------------------------------------------------------
+pub var uart_tx : bool = true;
+const uart_tx_LOC : str = "N15";
+const uart_tx_IOSTANDARD : str = "LVCMOS33";
+pub const led_0 : bool = !core.init_done;
+const led_0_LOC : str = "B13";
+const led_0_IOSTANDARD : str = "LVCMOS33";
+pub const led_1 : bool = !core.init_error;
+const led_1_LOC : str = "C13";
+const led_1_IOSTANDARD : str = "LVCMOS33";
+pub var led_2 : bool = true;
+const led_2_LOC : str = "D14";
+const led_2_IOSTANDARD : str = "LVCMOS33";
+pub var led_3 : bool = false;
+const led_3_LOC : str = "D15";
+const led_3_IOSTANDARD : str = "LVCMOS33";
+
+; --- the DDR3 pins: outputs of the core, then the bidirectional data and strobes ------------------
+pub const ddram_a_0 : bool = core.ddram_a__0;
+const ddram_a_0_LOC : str = "AA4";
+const ddram_a_0_IOSTANDARD : str = "SSTL15";
+const ddram_a_0_SLEW : str = "FAST";
+pub const ddram_a_1 : bool = core.ddram_a__1;
+const ddram_a_1_LOC : str = "AB2";
+const ddram_a_1_IOSTANDARD : str = "SSTL15";
+const ddram_a_1_SLEW : str = "FAST";
+pub const ddram_a_2 : bool = core.ddram_a__2;
+const ddram_a_2_LOC : str = "AA5";
+const ddram_a_2_IOSTANDARD : str = "SSTL15";
+const ddram_a_2_SLEW : str = "FAST";
+pub const ddram_a_3 : bool = core.ddram_a__3;
+const ddram_a_3_LOC : str = "AB5";
+const ddram_a_3_IOSTANDARD : str = "SSTL15";
+const ddram_a_3_SLEW : str = "FAST";
+pub const ddram_a_4 : bool = core.ddram_a__4;
+const ddram_a_4_LOC : str = "AB1";
+const ddram_a_4_IOSTANDARD : str = "SSTL15";
+const ddram_a_4_SLEW : str = "FAST";
+pub const ddram_a_5 : bool = core.ddram_a__5;
+const ddram_a_5_LOC : str = "U3";
+const ddram_a_5_IOSTANDARD : str = "SSTL15";
+const ddram_a_5_SLEW : str = "FAST";
+pub const ddram_a_6 : bool = core.ddram_a__6;
+const ddram_a_6_LOC : str = "W1";
+const ddram_a_6_IOSTANDARD : str = "SSTL15";
+const ddram_a_6_SLEW : str = "FAST";
+pub const ddram_a_7 : bool = core.ddram_a__7;
+const ddram_a_7_LOC : str = "T1";
+const ddram_a_7_IOSTANDARD : str = "SSTL15";
+const ddram_a_7_SLEW : str = "FAST";
+pub const ddram_a_8 : bool = core.ddram_a__8;
+const ddram_a_8_LOC : str = "V2";
+const ddram_a_8_IOSTANDARD : str = "SSTL15";
+const ddram_a_8_SLEW : str = "FAST";
+pub const ddram_a_9 : bool = core.ddram_a__9;
+const ddram_a_9_LOC : str = "U2";
+const ddram_a_9_IOSTANDARD : str = "SSTL15";
+const ddram_a_9_SLEW : str = "FAST";
+pub const ddram_a_10 : bool = core.ddram_a__10;
+const ddram_a_10_LOC : str = "Y1";
+const ddram_a_10_IOSTANDARD : str = "SSTL15";
+const ddram_a_10_SLEW : str = "FAST";
+pub const ddram_a_11 : bool = core.ddram_a__11;
+const ddram_a_11_LOC : str = "W2";
+const ddram_a_11_IOSTANDARD : str = "SSTL15";
+const ddram_a_11_SLEW : str = "FAST";
+pub const ddram_a_12 : bool = core.ddram_a__12;
+const ddram_a_12_LOC : str = "Y2";
+const ddram_a_12_IOSTANDARD : str = "SSTL15";
+const ddram_a_12_SLEW : str = "FAST";
+pub const ddram_a_13 : bool = core.ddram_a__13;
+const ddram_a_13_LOC : str = "U1";
+const ddram_a_13_IOSTANDARD : str = "SSTL15";
+const ddram_a_13_SLEW : str = "FAST";
+pub const ddram_a_14 : bool = core.ddram_a__14;
+const ddram_a_14_LOC : str = "V3";
+const ddram_a_14_IOSTANDARD : str = "SSTL15";
+const ddram_a_14_SLEW : str = "FAST";
+pub const ddram_ba_0 : bool = core.ddram_ba__0;
+const ddram_ba_0_LOC : str = "AA3";
+const ddram_ba_0_IOSTANDARD : str = "SSTL15";
+const ddram_ba_0_SLEW : str = "FAST";
+pub const ddram_ba_1 : bool = core.ddram_ba__1;
+const ddram_ba_1_LOC : str = "Y3";
+const ddram_ba_1_IOSTANDARD : str = "SSTL15";
+const ddram_ba_1_SLEW : str = "FAST";
+pub const ddram_ba_2 : bool = core.ddram_ba__2;
+const ddram_ba_2_LOC : str = "Y4";
+const ddram_ba_2_IOSTANDARD : str = "SSTL15";
+const ddram_ba_2_SLEW : str = "FAST";
+pub const ddram_ras_n : bool = core.ddram_ras_n;
+const ddram_ras_n_LOC : str = "V4";
+const ddram_ras_n_IOSTANDARD : str = "SSTL15";
+const ddram_ras_n_SLEW : str = "FAST";
+pub const ddram_cas_n : bool = core.ddram_cas_n;
+const ddram_cas_n_LOC : str = "W4";
+const ddram_cas_n_IOSTANDARD : str = "SSTL15";
+const ddram_cas_n_SLEW : str = "FAST";
+pub const ddram_we_n : bool = core.ddram_we_n;
+const ddram_we_n_LOC : str = "AA1";
+const ddram_we_n_IOSTANDARD : str = "SSTL15";
+const ddram_we_n_SLEW : str = "FAST";
+pub const ddram_cs_n : bool = core.ddram_cs_n;
+const ddram_cs_n_LOC : str = "AB3";
+const ddram_cs_n_IOSTANDARD : str = "SSTL15";
+const ddram_cs_n_SLEW : str = "FAST";
+pub const ddram_cke : bool = core.ddram_cke;
+const ddram_cke_LOC : str = "T5";
+const ddram_cke_IOSTANDARD : str = "SSTL15";
+const ddram_cke_SLEW : str = "FAST";
+pub const ddram_odt : bool = core.ddram_odt;
+const ddram_odt_LOC : str = "U5";
+const ddram_odt_IOSTANDARD : str = "SSTL15";
+const ddram_odt_SLEW : str = "FAST";
+pub const ddram_reset_n : bool = core.ddram_reset_n;
+const ddram_reset_n_LOC : str = "W6";
+const ddram_reset_n_IOSTANDARD : str = "LVCMOS15";
+const ddram_reset_n_SLEW : str = "FAST";
+pub const ddram_clk_p : bool = core.ddram_clk_p;
+const ddram_clk_p_LOC : str = "R3";
+const ddram_clk_p_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_clk_p_SLEW : str = "FAST";
+pub const ddram_clk_n : bool = core.ddram_clk_n;
+const ddram_clk_n_LOC : str = "R2";
+const ddram_clk_n_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_clk_n_SLEW : str = "FAST";
+pub const ddram_dm_0 : bool = core.ddram_dm__0;
+const ddram_dm_0_LOC : str = "D2";
+const ddram_dm_0_IOSTANDARD : str = "SSTL15";
+const ddram_dm_0_SLEW : str = "FAST";
+pub const ddram_dm_1 : bool = core.ddram_dm__1;
+const ddram_dm_1_LOC : str = "G2";
+const ddram_dm_1_IOSTANDARD : str = "SSTL15";
+const ddram_dm_1_SLEW : str = "FAST";
+pub const ddram_dm_2 : bool = core.ddram_dm__2;
+const ddram_dm_2_LOC : str = "M2";
+const ddram_dm_2_IOSTANDARD : str = "SSTL15";
+const ddram_dm_2_SLEW : str = "FAST";
+pub const ddram_dm_3 : bool = core.ddram_dm__3;
+const ddram_dm_3_LOC : str = "M5";
+const ddram_dm_3_IOSTANDARD : str = "SSTL15";
+const ddram_dm_3_SLEW : str = "FAST";
+
+pub const ddram_dq_0 : bool = undefined;
+const ddram_dq_0_LOC : str = "C2";
+const ddram_dq_0_IOSTANDARD : str = "SSTL15";
+const ddram_dq_0_SLEW : str = "FAST";
+const ddram_dq_0_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_1 : bool = undefined;
+const ddram_dq_1_LOC : str = "G1";
+const ddram_dq_1_IOSTANDARD : str = "SSTL15";
+const ddram_dq_1_SLEW : str = "FAST";
+const ddram_dq_1_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_2 : bool = undefined;
+const ddram_dq_2_LOC : str = "A1";
+const ddram_dq_2_IOSTANDARD : str = "SSTL15";
+const ddram_dq_2_SLEW : str = "FAST";
+const ddram_dq_2_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_3 : bool = undefined;
+const ddram_dq_3_LOC : str = "F3";
+const ddram_dq_3_IOSTANDARD : str = "SSTL15";
+const ddram_dq_3_SLEW : str = "FAST";
+const ddram_dq_3_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_4 : bool = undefined;
+const ddram_dq_4_LOC : str = "B2";
+const ddram_dq_4_IOSTANDARD : str = "SSTL15";
+const ddram_dq_4_SLEW : str = "FAST";
+const ddram_dq_4_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_5 : bool = undefined;
+const ddram_dq_5_LOC : str = "F1";
+const ddram_dq_5_IOSTANDARD : str = "SSTL15";
+const ddram_dq_5_SLEW : str = "FAST";
+const ddram_dq_5_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_6 : bool = undefined;
+const ddram_dq_6_LOC : str = "B1";
+const ddram_dq_6_IOSTANDARD : str = "SSTL15";
+const ddram_dq_6_SLEW : str = "FAST";
+const ddram_dq_6_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_7 : bool = undefined;
+const ddram_dq_7_LOC : str = "E2";
+const ddram_dq_7_IOSTANDARD : str = "SSTL15";
+const ddram_dq_7_SLEW : str = "FAST";
+const ddram_dq_7_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_8 : bool = undefined;
+const ddram_dq_8_LOC : str = "H3";
+const ddram_dq_8_IOSTANDARD : str = "SSTL15";
+const ddram_dq_8_SLEW : str = "FAST";
+const ddram_dq_8_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_9 : bool = undefined;
+const ddram_dq_9_LOC : str = "G3";
+const ddram_dq_9_IOSTANDARD : str = "SSTL15";
+const ddram_dq_9_SLEW : str = "FAST";
+const ddram_dq_9_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_10 : bool = undefined;
+const ddram_dq_10_LOC : str = "H2";
+const ddram_dq_10_IOSTANDARD : str = "SSTL15";
+const ddram_dq_10_SLEW : str = "FAST";
+const ddram_dq_10_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_11 : bool = undefined;
+const ddram_dq_11_LOC : str = "H5";
+const ddram_dq_11_IOSTANDARD : str = "SSTL15";
+const ddram_dq_11_SLEW : str = "FAST";
+const ddram_dq_11_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_12 : bool = undefined;
+const ddram_dq_12_LOC : str = "J1";
+const ddram_dq_12_IOSTANDARD : str = "SSTL15";
+const ddram_dq_12_SLEW : str = "FAST";
+const ddram_dq_12_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_13 : bool = undefined;
+const ddram_dq_13_LOC : str = "J5";
+const ddram_dq_13_IOSTANDARD : str = "SSTL15";
+const ddram_dq_13_SLEW : str = "FAST";
+const ddram_dq_13_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_14 : bool = undefined;
+const ddram_dq_14_LOC : str = "K1";
+const ddram_dq_14_IOSTANDARD : str = "SSTL15";
+const ddram_dq_14_SLEW : str = "FAST";
+const ddram_dq_14_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_15 : bool = undefined;
+const ddram_dq_15_LOC : str = "H4";
+const ddram_dq_15_IOSTANDARD : str = "SSTL15";
+const ddram_dq_15_SLEW : str = "FAST";
+const ddram_dq_15_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_16 : bool = undefined;
+const ddram_dq_16_LOC : str = "L4";
+const ddram_dq_16_IOSTANDARD : str = "SSTL15";
+const ddram_dq_16_SLEW : str = "FAST";
+const ddram_dq_16_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_17 : bool = undefined;
+const ddram_dq_17_LOC : str = "M3";
+const ddram_dq_17_IOSTANDARD : str = "SSTL15";
+const ddram_dq_17_SLEW : str = "FAST";
+const ddram_dq_17_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_18 : bool = undefined;
+const ddram_dq_18_LOC : str = "L3";
+const ddram_dq_18_IOSTANDARD : str = "SSTL15";
+const ddram_dq_18_SLEW : str = "FAST";
+const ddram_dq_18_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_19 : bool = undefined;
+const ddram_dq_19_LOC : str = "J6";
+const ddram_dq_19_IOSTANDARD : str = "SSTL15";
+const ddram_dq_19_SLEW : str = "FAST";
+const ddram_dq_19_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_20 : bool = undefined;
+const ddram_dq_20_LOC : str = "K3";
+const ddram_dq_20_IOSTANDARD : str = "SSTL15";
+const ddram_dq_20_SLEW : str = "FAST";
+const ddram_dq_20_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_21 : bool = undefined;
+const ddram_dq_21_LOC : str = "K6";
+const ddram_dq_21_IOSTANDARD : str = "SSTL15";
+const ddram_dq_21_SLEW : str = "FAST";
+const ddram_dq_21_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_22 : bool = undefined;
+const ddram_dq_22_LOC : str = "J4";
+const ddram_dq_22_IOSTANDARD : str = "SSTL15";
+const ddram_dq_22_SLEW : str = "FAST";
+const ddram_dq_22_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_23 : bool = undefined;
+const ddram_dq_23_LOC : str = "L5";
+const ddram_dq_23_IOSTANDARD : str = "SSTL15";
+const ddram_dq_23_SLEW : str = "FAST";
+const ddram_dq_23_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_24 : bool = undefined;
+const ddram_dq_24_LOC : str = "P1";
+const ddram_dq_24_IOSTANDARD : str = "SSTL15";
+const ddram_dq_24_SLEW : str = "FAST";
+const ddram_dq_24_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_25 : bool = undefined;
+const ddram_dq_25_LOC : str = "N4";
+const ddram_dq_25_IOSTANDARD : str = "SSTL15";
+const ddram_dq_25_SLEW : str = "FAST";
+const ddram_dq_25_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_26 : bool = undefined;
+const ddram_dq_26_LOC : str = "R1";
+const ddram_dq_26_IOSTANDARD : str = "SSTL15";
+const ddram_dq_26_SLEW : str = "FAST";
+const ddram_dq_26_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_27 : bool = undefined;
+const ddram_dq_27_LOC : str = "N2";
+const ddram_dq_27_IOSTANDARD : str = "SSTL15";
+const ddram_dq_27_SLEW : str = "FAST";
+const ddram_dq_27_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_28 : bool = undefined;
+const ddram_dq_28_LOC : str = "M6";
+const ddram_dq_28_IOSTANDARD : str = "SSTL15";
+const ddram_dq_28_SLEW : str = "FAST";
+const ddram_dq_28_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_29 : bool = undefined;
+const ddram_dq_29_LOC : str = "N5";
+const ddram_dq_29_IOSTANDARD : str = "SSTL15";
+const ddram_dq_29_SLEW : str = "FAST";
+const ddram_dq_29_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_30 : bool = undefined;
+const ddram_dq_30_LOC : str = "P6";
+const ddram_dq_30_IOSTANDARD : str = "SSTL15";
+const ddram_dq_30_SLEW : str = "FAST";
+const ddram_dq_30_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dq_31 : bool = undefined;
+const ddram_dq_31_LOC : str = "P2";
+const ddram_dq_31_IOSTANDARD : str = "SSTL15";
+const ddram_dq_31_SLEW : str = "FAST";
+const ddram_dq_31_IN_TERM : str = "UNTUNED_SPLIT_50";
+pub const ddram_dqs_p_0 : bool = undefined;
+const ddram_dqs_p_0_LOC : str = "E1";
+const ddram_dqs_p_0_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_p_0_SLEW : str = "FAST";
+pub const ddram_dqs_p_1 : bool = undefined;
+const ddram_dqs_p_1_LOC : str = "K2";
+const ddram_dqs_p_1_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_p_1_SLEW : str = "FAST";
+pub const ddram_dqs_p_2 : bool = undefined;
+const ddram_dqs_p_2_LOC : str = "M1";
+const ddram_dqs_p_2_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_p_2_SLEW : str = "FAST";
+pub const ddram_dqs_p_3 : bool = undefined;
+const ddram_dqs_p_3_LOC : str = "P5";
+const ddram_dqs_p_3_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_p_3_SLEW : str = "FAST";
+pub const ddram_dqs_n_0 : bool = undefined;
+const ddram_dqs_n_0_LOC : str = "D1";
+const ddram_dqs_n_0_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_n_0_SLEW : str = "FAST";
+pub const ddram_dqs_n_1 : bool = undefined;
+const ddram_dqs_n_1_LOC : str = "J2";
+const ddram_dqs_n_1_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_n_1_SLEW : str = "FAST";
+pub const ddram_dqs_n_2 : bool = undefined;
+const ddram_dqs_n_2_LOC : str = "L1";
+const ddram_dqs_n_2_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_n_2_SLEW : str = "FAST";
+pub const ddram_dqs_n_3 : bool = undefined;
+const ddram_dqs_n_3_LOC : str = "P4";
+const ddram_dqs_n_3_IOSTANDARD : str = "DIFF_SSTL15";
+const ddram_dqs_n_3_SLEW : str = "FAST";
+
+
+; --- the registers ------------------------------------------------------------------------------
+var st : u8 = 0;
+var n_beats : u32 = 640;
+; the values the board judges against. Reset values, so they hold on the board: the first build reset
+; them to 0, the tests set them before each run, and the board printed the right S and Y with FAIL.
+var s_want : u64 = S_EXPECT;
+var y_want : u64 = Y_EXPECT;
+; the native port: address, command, write data
+var ca : u32 = 0;
+var cv : bool = false;
+var cwe : bool = false;
+var wv : bool = false;
+var wb0 : u64 = 0;
+var wb1 : u64 = 0;
+var wb2 : u64 = 0;
+var wb3 : u64 = 0;
+; the load: write phase, beats written, bytes in the beat being packed, a packed beat waiting
+var wph : u8 = 0;
+var wi : u32 = 0;
+var nb : u8 = 0;
+var bfull : bool = false;
+var wsum : u64 = 0;
+; the read and the product: read phase, beats done, the beat being stepped through, its trit, the column
+var rph : u8 = 0;
+var ri : u32 = 0;
+var rb0 : u64 = 0;
+var rb1 : u64 = 0;
+var rb2 : u64 = 0;
+var rb3 : u64 = 0;
+var tk : u8 = 0;
+var col : u32 = 0;
+var xv : u8 = 11;
+var acc : u32 = 0;
+var ysum : u64 = 0;
+var csum : u64 = 0;
+var bad : u32 = 0;
+var ferr : u32 = 0;
+var verdict : u8 = 3;
+; the receiver: two flops of synchronizer, then a frame counter
+var rx_s1 : bool = true;
+var rx_s2 : bool = true;
+var rx_busy : bool = false;
+var rx_cnt : u16 = 0;
+var rx_bit : u8 = 0;
+var rx_sh : u8 = 0;
+var rx_got : bool = false;
+var rx_byte : u8 = 0;
+var rx_div : u16 = 868;
+; the transmitter
+var baud_div : u16 = 868;
+var tx_cnt : u16 = 0;
+var tx_sh : u16 = 1023;
+var tx_left : u8 = 0;
+var seg : u8 = 0;
+var pos : u8 = 0;
+var fsr : u64 = 0;
+var lines : u32 = 0;
+var hb : u32 = 0;
+
+/// The value of receipt field s (1..7), N S C Y E F L.
+pub fn field(s: u8, n: u32, ws: u64, cs: u64, y: u64, e: u32, f: u32, l: u32) -> u64 {
+    if (s == 1) { return n as u64; }
+    if (s == 2) { return ws; }
+    if (s == 3) { return cs; }
+    if (s == 4) { return y; }
+    if (s == 5) { return e as u64; }
+    if (s == 6) { return f as u64; }
+    return l as u64;
+}
+
+/// Lane k of beat i of the test stream, low byte first (the reference for the packer and the memory the
+/// tests stand in for).
+pub fn test_lane(i: u32, k: u32, bad: u32) -> u64 {
+    var w : u64 = 0;
+    var j : u32 = 8;
+    while (j > 0) {
+        j = j - 1;
+        w = (w << 8) | (test_byte(i * 32 + k * 8 + j, bad) as u64);
+    }
+    return w;
+}
+
+// Every var is read before it is written, so the test's order and the clock edge agree.
+fn on_clock(core_init_done: bool, core_init_error: bool, core_user_port_native_0_cmd_ready: bool, core_user_port_native_0_wdata_ready: bool, core_user_port_native_0_rdata_valid: bool, core_user_port_native_0_rdata_data__0: u64, core_user_port_native_0_rdata_data__1: u64, core_user_port_native_0_rdata_data__2: u64, core_user_port_native_0_rdata_data__3: u64, core_uart_tx: bool, uart_rx: bool) {
+    uart_tx = (st == ST_REPORT and (tx_sh & 1) == 1) or (st != ST_REPORT and core_uart_tx);
+    led_2 = !(st == ST_REPORT and verdict == V_PASS);
+    led_3 = ((hb >> 26) & 1) == 1;
+    hb = hb +% 1;
+    if (st == ST_WAIT) {
+        if (core_init_error) {
+            verdict = V_FAIL;
+            st = ST_REPORT;
+        } else if (core_init_done) {
+            st = ST_LOAD;
+        }
+    } else if (st == ST_LOAD) {
+        if (wph == 0) {
+            if (wi == n_beats) {
+                st = ST_READ;
+                ca = 0;
+                cv = true;
+                cwe = false;
+                rph = 0;
+            } else if (bfull) {
+                bfull = false;
+                ca = wi;
+                cv = true;
+                cwe = true;
+                wph = 1;
+            }
+        } else if (wph == 1) {
+            if (core_user_port_native_0_cmd_ready) {
+                cv = false;
+                wv = true;
+                wph = 2;
+            }
+        } else {
+            if (core_user_port_native_0_wdata_ready) {
+                wv = false;
+                wph = 0;
+                wi = wi + 1;
+            }
+        }
+        if (rx_got) {
+            if (nb == 31) {
+                wsum = fold_beat(wsum, (wb0 >> 8) | (wb1 << 56), (wb1 >> 8) | (wb2 << 56), (wb2 >> 8) | (wb3 << 56), (wb3 >> 8) | ((rx_byte as u64) << 56));
+                bfull = true;
+                nb = 0;
+            } else {
+                nb = nb + 1;
+            }
+            wb0 = (wb0 >> 8) | (wb1 << 56);
+            wb1 = (wb1 >> 8) | (wb2 << 56);
+            wb2 = (wb2 >> 8) | (wb3 << 56);
+            wb3 = (wb3 >> 8) | ((rx_byte as u64) << 56);
+        }
+    } else if (st == ST_READ) {
+        if (rph == 0) {
+            if (core_user_port_native_0_cmd_ready) {
+                cv = false;
+                rph = 1;
+            }
+        } else if (rph == 1) {
+            if (core_user_port_native_0_rdata_valid) {
+                csum = fold_beat(csum, core_user_port_native_0_rdata_data__0, core_user_port_native_0_rdata_data__1, core_user_port_native_0_rdata_data__2, core_user_port_native_0_rdata_data__3);
+                rb0 = core_user_port_native_0_rdata_data__0;
+                rb1 = core_user_port_native_0_rdata_data__1;
+                rb2 = core_user_port_native_0_rdata_data__2;
+                rb3 = core_user_port_native_0_rdata_data__3;
+                tk = 0;
+                rph = 2;
+            }
+        } else if (rph == 2) {
+            acc = acc +% trit_term((rb0 & 255) as u8, xv);
+            if (!is_trit((rb0 & 255) as u8)) { bad = bad + 1; }
+            xv = xv +% XSTEP;
+            col = col + 1;
+            rb0 = (rb0 >> 8) | (rb1 << 56);
+            rb1 = (rb1 >> 8) | (rb2 << 56);
+            rb2 = (rb2 >> 8) | (rb3 << 56);
+            rb3 = rb3 >> 8;
+            if (tk == 31) {
+                rph = 3;
+            } else {
+                tk = tk + 1;
+            }
+        } else {
+            if (col == W_COLS) {
+                ysum = fold_beat(ysum, acc as u64, 0, 0, 0);
+                acc = 0;
+                col = 0;
+                xv = XV0;
+            }
+            if (ri + 1 == n_beats) {
+                st = ST_JUDGE;
+            } else {
+                ca = ri + 1;
+                cv = true;
+                rph = 0;
+            }
+            ri = ri + 1;
+        }
+    } else if (st == ST_JUDGE) {
+        verdict = verdict_of(ri, wsum, csum, ysum, bad, ferr, s_want, y_want, n_beats);
+        st = ST_REPORT;
+    } else {
+        if (tx_cnt + 1 < baud_div) {
+            tx_cnt = tx_cnt + 1;
+        } else {
+            tx_cnt = 0;
+            if (tx_left != 0) {
+                tx_sh = (tx_sh >> 1) | 512;
+                tx_left = tx_left - 1;
+            } else {
+                tx_sh = frame(line_char(seg, pos, fsr, verdict));
+                tx_left = 9;
+                if (pos == seg_last(seg)) {
+                    fsr = field(seg + 1, ri, wsum, csum, ysum, bad, ferr, lines);
+                    pos = 0;
+                    if (seg == LINE_SEGS - 1) {
+                        seg = 0;
+                        lines = lines + 1;
+                    } else {
+                        seg = seg + 1;
+                    }
+                } else {
+                    if (seg != 0 and seg != LINE_SEGS - 1 and pos >= 3) { fsr = fsr << 4; }
+                    pos = pos + 1;
+                }
+            }
+        }
+    }
+    if (rx_busy) {
+        if (rx_cnt + 1 < rx_wait(rx_bit, rx_div)) {
+            rx_cnt = rx_cnt + 1;
+            rx_got = false;
+        } else {
+            rx_cnt = 0;
+            if (rx_bit == 0) {
+                if (rx_s2) {
+                    rx_busy = false;
+                } else {
+                    rx_bit = 1;
+                }
+                rx_got = false;
+            } else if (rx_bit < 9) {
+                if (rx_s2) {
+                    rx_sh = (rx_sh >> 1) | 128;
+                } else {
+                    rx_sh = rx_sh >> 1;
+                }
+                rx_bit = rx_bit + 1;
+                rx_got = false;
+            } else {
+                rx_busy = false;
+                rx_bit = 0;
+                if (rx_s2) {
+                    rx_byte = rx_sh;
+                    rx_got = true;
+                } else {
+                    ferr = ferr + 1;
+                    rx_got = false;
+                }
+            }
+        }
+    } else {
+        rx_got = false;
+        if (!rx_s2) {
+            rx_busy = true;
+            rx_cnt = 0;
+            rx_bit = 0;
+        }
+    }
+    rx_s2 = rx_s1;
+    rx_s1 = uart_rx;
+}
+
+; --- the tests ----------------------------------------------------------------------------------
+
+// First, before any test sets them; the tests that do restore them. A board out of reset judges with
+// these values and no others.
+test out_of_reset_the_board_judges_against_the_pinned_values {
+    assert_eq(n_beats, 640);
+    assert_eq(s_want, S_EXPECT);
+    assert_eq(y_want, Y_EXPECT);
+    assert_eq(verdict_of(640, S_EXPECT, S_EXPECT, Y_EXPECT, 0, 0, s_want, y_want, n_beats), V_PASS);
+    assert_eq(verdict_of(640, S_EXPECT, S_EXPECT, Y_EXPECT, 0, 0, 0, 0, n_beats), V_FAIL);
+}
+
+test the_tensor_is_640_beats_of_32_trits {
+    var beats : u32 = 0;
+    var bytes : u64 = 0;
+    var r : u32 = 0;
+    while (r < W_ROWS) {
+        beats = beats + BEATS_PER_ROW;
+        bytes = bytes + (W_COLS as u64);
+        r = r + 1;
+    }
+    assert_eq(beats, W_BEATS);
+    assert_eq(bytes, W_BYTES);
+    assert_eq((beats as u64) * BEAT_BYTES, bytes);
+    assert_eq((BEATS_PER_ROW as u64) * BEAT_BYTES, W_COLS as u64);
+    assert_eq(W_OFFSET, 10589476);
+}
+
+test a_trit_adds_plus_x_minus_x_or_nothing {
+    assert_eq(sext8(11), 11);
+    assert_eq(sext8(127), 127);
+    assert_eq(sext8(128), 0xFFFFFF80);
+    assert_eq(sext8(255), 0xFFFFFFFF);
+    assert_eq(trit_term(1, 11), 11);
+    assert_eq(trit_term(255, 11), 0xFFFFFFF5);
+    assert_eq(trit_term(0, 11), 0);
+    assert_eq(trit_term(2, 11), 0);
+    assert_eq(trit_term(1, 200), 0xFFFFFFC8);
+    assert_eq(trit_term(255, 200), 56);
+    assert_eq(trit_term(255, 0), 0);
+    assert_eq(trit_term(1, 11) +% trit_term(255, 11), 0);
+    assert is_trit(0) and is_trit(1) and is_trit(255);
+    assert !is_trit(2) and !is_trit(254) and !is_trit(128);
+}
+
+test the_input_is_37c_plus_11_as_an_int8 {
+    var x : u8 = XV0;
+    var c : u32 = 0;
+    var zero_at : u32 = 9999;
+    while (c < W_COLS) {
+        assert_eq(x as u32, (37 * c + 11) % 256);
+        if (x == 0) { zero_at = c; }
+        x = x +% XSTEP;
+        c = c + 1;
+    }
+    assert_eq(zero_at, 145);
+}
+
+test the_receiver_takes_a_frame_at_mid_bit_and_counts_a_bad_stop {
+    st = ST_WAIT;
+    rx_div = 4;
+    rx_s1 = true;
+    rx_s2 = true;
+    rx_busy = false;
+    rx_got = false;
+    rx_byte = 0;
+    ferr = 0;
+    var got : u32 = 0;
+    var t : u32 = 0;
+    while (t < 60) {
+        on_clock(false, false, false, false, false, 0, 0, 0, 0, true, frame_bit(0xA5, t / 4));
+        if (rx_got) { got = got + 1; }
+        t = t + 1;
+    }
+    assert_eq(got, 1);
+    assert_eq(rx_byte, 0xA5);
+    assert_eq(ferr, 0);
+    t = 0;
+    while (t < 60) {
+        on_clock(false, false, false, false, false, 0, 0, 0, 0, true, t / 4 < 9 and frame_bit(0x3C, t / 4));
+        if (rx_got) { got = got + 1; }
+        t = t + 1;
+    }
+    assert_eq(got, 1);
+    assert_eq(ferr, 1);
+    rx_div = 868;
+}
+
+test two_rows_go_in_come_back_and_are_multiplied {
+    var sref : u64 = 0;
+    var i : u32 = 0;
+    while (i < 20) {
+        sref = fold_beat(sref, test_lane(i, 0, 99999), test_lane(i, 1, 99999), test_lane(i, 2, 99999), test_lane(i, 3, 99999));
+        i = i + 1;
+    }
+    var yref : u64 = 0;
+    var r : u32 = 0;
+    while (r < 2) {
+        var a : u32 = 0;
+        var x : u8 = XV0;
+        var c : u32 = 0;
+        while (c < W_COLS) {
+            a = a +% trit_term(test_byte(r * W_COLS + c, 99999), x);
+            x = x +% XSTEP;
+            c = c + 1;
+        }
+        yref = fold_beat(yref, a as u64, 0, 0, 0);
+        r = r + 1;
+    }
+    st = ST_LOAD;
+    n_beats = 20;
+    s_want = sref;
+    y_want = yref;
+    ca = 0;
+    cv = false;
+    cwe = false;
+    wv = false;
+    wb0 = 0;
+    wb1 = 0;
+    wb2 = 0;
+    wb3 = 0;
+    wph = 0;
+    wi = 0;
+    nb = 0;
+    bfull = false;
+    wsum = 0;
+    rph = 0;
+    ri = 0;
+    tk = 0;
+    col = 0;
+    xv = XV0;
+    acc = 0;
+    ysum = 0;
+    csum = 0;
+    bad = 0;
+    ferr = 0;
+    verdict = V_FAIL;
+    rx_s1 = true;
+    rx_s2 = true;
+    rx_busy = false;
+    rx_got = false;
+    rx_div = 4;
+    var wrote : u32 = 0;
+    var t : u32 = 0;
+    while (t < 40000 and st != ST_REPORT) {
+        if (st == ST_LOAD and wph == 2) {
+            assert wb0 == test_lane(ca, 0, 99999) and wb1 == test_lane(ca, 1, 99999) and wb2 == test_lane(ca, 2, 99999) and wb3 == test_lane(ca, 3, 99999);
+            assert cwe;
+            wrote = wrote + 1;
+        }
+        on_clock(true, false, true, true, st == ST_READ and rph == 1, test_lane(ca, 0, 99999), test_lane(ca, 1, 99999), test_lane(ca, 2, 99999), test_lane(ca, 3, 99999), true, t / 48 >= 640 or frame_bit(test_byte(t / 48, 99999), (t % 48) / 4));
+        t = t + 1;
+    }
+    assert_eq(st, ST_REPORT);
+    assert_eq(wrote, 20);
+    assert_eq(ri, 20);
+    assert_eq(wsum, sref);
+    assert_eq(csum, wsum);
+    assert_eq(ysum, yref);
+    assert_eq(bad, 0);
+    assert_eq(ferr, 0);
+    assert_eq(verdict, V_PASS);
+    assert_eq(col, 0);
+    rx_div = 868;
+    n_beats = 640;
+    s_want = S_EXPECT;
+    y_want = Y_EXPECT;
+}
+
+test a_byte_that_is_no_trit_is_counted_and_fails {
+    var sref : u64 = 0;
+    var i : u32 = 0;
+    while (i < 10) {
+        sref = fold_beat(sref, test_lane(i, 0, 17), test_lane(i, 1, 17), test_lane(i, 2, 17), test_lane(i, 3, 17));
+        i = i + 1;
+    }
+    var a : u32 = 0;
+    var x : u8 = XV0;
+    var c : u32 = 0;
+    while (c < W_COLS) {
+        a = a +% trit_term(test_byte(c, 17), x);
+        x = x +% XSTEP;
+        c = c + 1;
+    }
+    st = ST_LOAD;
+    n_beats = 10;
+    s_want = sref;
+    y_want = fold_beat(0, a as u64, 0, 0, 0);
+    ca = 0;
+    cv = false;
+    wv = false;
+    wph = 0;
+    wi = 0;
+    nb = 0;
+    bfull = false;
+    wsum = 0;
+    rph = 0;
+    ri = 0;
+    col = 0;
+    xv = XV0;
+    acc = 0;
+    ysum = 0;
+    csum = 0;
+    bad = 0;
+    ferr = 0;
+    verdict = V_PASS;
+    rx_s1 = true;
+    rx_s2 = true;
+    rx_busy = false;
+    rx_got = false;
+    rx_div = 4;
+    var t : u32 = 0;
+    while (t < 20000 and st != ST_REPORT) {
+        on_clock(true, false, true, true, st == ST_READ and rph == 1, test_lane(ca, 0, 17), test_lane(ca, 1, 17), test_lane(ca, 2, 17), test_lane(ca, 3, 17), true, t / 48 >= 320 or frame_bit(test_byte(t / 48, 17), (t % 48) / 4));
+        t = t + 1;
+    }
+    assert_eq(st, ST_REPORT);
+    assert_eq(ri, 10);
+    assert_eq(wsum, sref);
+    assert_eq(csum, wsum);
+    assert_eq(ysum, y_want);
+    assert_eq(bad, 1);
+    assert_eq(verdict, V_FAIL);
+    assert_eq(verdict_of(ri, wsum, csum, ysum, 0, 0, s_want, y_want, 10), V_PASS);
+    assert_eq(verdict_of(ri, wsum, csum ^ 1, ysum, 0, 0, s_want, y_want, 10), V_FAIL);
+    assert_eq(verdict_of(ri, wsum, csum, ysum ^ 1, 0, 0, s_want, y_want, 10), V_FAIL);
+    assert_eq(verdict_of(ri, wsum, csum, ysum, 0, 1, s_want, y_want, 10), V_FAIL);
+    assert_eq(verdict_of(9, wsum, csum, ysum, 0, 0, s_want, y_want, 10), V_FAIL);
+    rx_div = 868;
+    n_beats = 640;
+    s_want = S_EXPECT;
+    y_want = Y_EXPECT;
+}
+
+test a_failed_calibration_reports_fail {
+    st = ST_WAIT;
+    verdict = V_PASS;
+    on_clock(false, true, false, false, false, 0, 0, 0, 0, true, true);
+    assert_eq(st, ST_REPORT);
+    assert_eq(verdict, V_FAIL);
+}
+
+test the_receipt_line_says_what_was_computed {
+    st = ST_REPORT;
+    ri = 640;
+    wsum = 0x0123456789ABCDEF;
+    csum = 0x0123456789ABCDEF;
+    ysum = 0xFEDCBA9876543210;
+    bad = 0;
+    ferr = 0;
+    lines = 0;
+    verdict = V_PASS;
+    baud_div = 1;
+    tx_cnt = 0;
+    tx_sh = 1023;
+    tx_left = 0;
+    seg = 0;
+    pos = 0;
+    var got : u32 = 0;
+    var bits : u32 = 0;
+    var ch : u8 = 0;
+    var line : u32 = 0;
+    while (line < 2) {
+        on_clock(true, false, false, false, false, 0, 0, 0, 0, true, true);
+        bits = bits + 1;
+        if (tx_left == 9) {
+            assert_eq(tx_sh & 1, 0);
+            assert_eq(tx_sh >> 9, 1);
+            ch = ((tx_sh >> 1) & 255) as u8;
+            if (got == 0) { assert_eq(ch, 84); }
+            if (got == 4) { assert_eq(ch, 84); }
+            if (got == 7) { assert_eq(ch, 78); }
+            if (got == 9) { assert_eq(ch, 78); }
+            if (got == 10) { assert_eq(ch, 61); }
+            if (got == 24) { assert_eq(ch, 50); }
+            if (got == 25) { assert_eq(ch, 56); }
+            if (got == 26) { assert_eq(ch, 48); }
+            if (got == 28) { assert_eq(ch, 83); }
+            if (got == 31) { assert_eq(ch, 49); }
+            if (got == 45) { assert_eq(ch, 70); }
+            if (got == 47) { assert_eq(ch, 67); }
+            if (got == 66) { assert_eq(ch, 89); }
+            if (got == 68) { assert_eq(ch, 70); }
+            if (got == 83) { assert_eq(ch, 48); }
+            if (got == 85) { assert_eq(ch, 69); }
+            if (got == 104) { assert_eq(ch, 70); }
+            if (got == 123) { assert_eq(ch, 76); }
+            if (line == 0 and got == 140) { assert_eq(ch, 48); }
+            if (line == 1 and got == 140) { assert_eq(ch, 49); }
+            if (got == 142) { assert_eq(ch, 80); }
+            if (got == 145) { assert_eq(ch, 83); }
+            if (got == 146) { assert_eq(ch, 13); }
+            if (ch == 10) {
+                assert_eq(got, 147);
+                got = 0;
+                line = line + 1;
+            } else {
+                got = got + 1;
+            }
+        }
+    }
+    assert_eq(lines, 2);
+    assert_eq(bits, (2 * 148 - 1) * 10 + 1);
+    baud_div = 868;
+}
+
+test the_pins_that_read_the_run_are_set_from_its_state {
+    baud_div = 868;
+    tx_cnt = 0;
+    tx_left = 0;
+    st = ST_WAIT;
+    verdict = V_PASS;
+    hb = 0;
+    tx_sh = 1023;
+    on_clock(false, false, false, false, false, 0, 0, 0, 0, false, true);
+    assert_eq(uart_tx, false);
+    assert_eq(led_2, true);
+    assert_eq(led_3, false);
+    on_clock(false, false, false, false, false, 0, 0, 0, 0, true, true);
+    assert_eq(uart_tx, true);
+    st = ST_REPORT;
+    tx_sh = 1022;
+    hb = 67108864;
+    on_clock(false, false, false, false, false, 0, 0, 0, 0, true, true);
+    assert_eq(uart_tx, false);
+    assert_eq(led_2, false);
+    assert_eq(led_3, true);
+    tx_sh = 1023;
+    on_clock(false, false, false, false, false, 0, 0, 0, 0, false, true);
+    assert_eq(uart_tx, true);
+}

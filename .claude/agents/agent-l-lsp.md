@@ -1,5 +1,6 @@
 ---
 id: agent-l-lsp
+model: sonnet
 name: Agent L - LSP Validator
 description: Validates language server protocol integration, type definitions, and IDE tooling for t27 specs and generated code
 triggers:

@@ -1,4 +1,5 @@
 ---
+model: sonnet
 description: Review Warden - keeps pull-request review moving; measures the reviewer bee and the epics' CI, hands every fix to the Queen as a task she can run, and reports on the plan's issue
 color: "#f59e0b"
 ---

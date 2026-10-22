@@ -10,7 +10,7 @@ its author could have seen.
 ## What
 
 - `specs/tri/pr/preflight.t27` owns every rule, every verdict (PASS, FAIL, UNREAD,
-  NOT RUN) and every message. 19 tests, 0 vacuous, 1 comptime invariant.
+  NOT RUN) and every message. 25 tests, 0 vacuous, 1 comptime invariant.
 - The evidence is data: each command the spec names runs once, per changed spec
   where the rule is per-spec. Its output is framed as
   `@@ preflight <step> <entry> <exit> <len>`, and the spec reads the frames. A
@@ -20,16 +20,18 @@ its author could have seen.
   2 evidence could not be read. `--quick` leaves out the corpus ratchet. The
   publisher gate runs it in the bee's worktree, with origin/master merged in,
   and skips a branch that did not exit 0.
-- **The glue is parked, not in this change.** It is 38 lines in
-  `cli/tri/src/prcheck.rs` and 30 in `tools/queen/publish.py`. It was built and
-  replayed on the lab, but neither file is in `tools/policy/foreign-exceptions.txt`
-  on master, and `check_budget` refuses any net growth of hand-written foreign
-  lines (owner rule 2026-10-09). So lefthook refuses the commit and no label
-  lifts it. Landing the glue needs the owner: either the exceptions plus an
-  offsetting deletion, or a t27-native way to run commands.
+- **The glue landed in #11126.** `preflight` in `cli/tri/src/prcheck.rs` is 40 lines
+  (a `#[path]` mount of `gen/rust/tri/pr/preflight.rs`, the `Preflight` subcommand and the
+  loop). It loops to the spec's STEPS and RULES, so a step added to the spec runs without a
+  glue change. It was parked until then because `check_budget` refuses any net growth of
+  hand-written foreign lines (owner rule 2026-10-09) and no label lifts it; it landed
+  net-zero, paid by deleting the 52 lines of `inflight.rs` that `cargo check -p tri` listed
+  as never used (`Merge`, `merge_outcome` and their three unit tests). The Queen's side,
+  about 30 lines in `tools/queen/publish.py`, is not part of that change.
 
 The rules are changes, base, check, tests, seal, types, dupes, ledgers, suite,
-census and kept. Only a branch's own defects fail it:
+census, budget (the own-language foreign-line budget, #11125), devhome (the
+developer-home-path scan, #11125) and kept. Only a branch's own defects fail it:
 
 - dupes compares `dupe_scan.py` on the branch with the same scan on a clean
   origin/master worktree. A finding master already prints is not the branch's.
@@ -49,7 +51,8 @@ census and kept. Only a branch's own defects fail it:
 
 ## Open
 
-- Land the glue (see above); until then nothing calls this spec.
+- `tools/queen/publish.py` does not call `tri pr preflight` yet; the publisher gate that
+  skips a branch that did not exit 0 is still to land, net-zero as well.
 - t27b's JIT runs on arm64 only and the lab is x86_64, so this PR's own
   `t27b_expectations.json` row is left to the tool after an arm64 run measures it.
 - cli-tri (Rust build) and "documented t27c subcommands" are outside the spec rules.

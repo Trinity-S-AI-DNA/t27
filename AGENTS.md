@@ -4,6 +4,17 @@ This file is the **repository entry point** for humans and coding agents. It sum
 
 ---
 
+## Swarm focus: T27 OS and its self-improvement (owner, 2026-10-20)
+
+Every bee, lane and the Queen puts its capacity into T27 OS and the loop that improves it, until the owner says otherwise.
+
+- **What T27 OS is:** the instrument panel through which the project is worked on and watched, written in `.t27` and built by `t27b`: 27 petals = 27 tools `t27<letter>`, each page 100% widgets, every widget carrying its pinned agents, an own agent chat on every page, GOD MODE evolution, one UI for desktop, site and FPGA. The rules and the plan live in gHashTag/t27: `AGENTS.md` (section "T27 OS") and `.claude/skills/t27os/SKILL.md`.
+- **Epics:** gHashTag/t27#11037 (T27 OS), gHashTag/t27#11275 (the panel), gHashTag/t27#11326 (T27 OS on the FPGA, built by t27b), gHashTag/t27#11315 (release and self-update).
+- **How to pick work:** take the next gap the Queen board shows (`specs/t27os/evolve.t27` order: red master, blocked domain, stale seal, unowned paths, a letter with no instrument, a spec no widget shows), or an open 4-heading issue under those epics. One lane per letter; never more lanes than the kernel's agent cap for the machine (`specs/t27os/kernel.t27`).
+- **Laws do not change:** logic only in `.t27` (generated targets plus thin glue), DRY, tests and seals, `Closes #N`, verify locally and land through our own git (golden chain, one batched GitHub push), no secrets, English only, matte glass everywhere in the UI, numbers only with the command that measured them.
+- **Self-improvement:** every change should leave the system better at improving itself: record what was learned (experience log), and turn a fix that recurs into a rule, a test or a spec.
+- **In this repository:** the law, the specs and the T27 OS app live here; this is where the Queen's gaps are fixed first.
+
 ## 1. Read first (constitutional stack)
 
 | Order | File | Role |
@@ -25,6 +36,12 @@ Supporting: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), 
 - **Operational agent specs (e.g. watchdogs, schemas):** [`docs/agents/AGENTS.md`](docs/agents/AGENTS.md) — complements the alphabet; not a second constitution.
 
 Use **domain directories**, not “one folder per agent.” Primary contact for a path is the **Primary** listed in the nearest `OWNERS.md`.
+
+- **Every path, spec, widget and app surface has its agents** (owner rule, 2026-10-20). A path maps
+  to one letter through the agents' `KEY_FILES` (`specs/t27os/domain_pulse.t27`); a widget or app
+  surface carries its owner letter plus the letters that feed it (`specs/t27os/agent_parts.t27`),
+  and the widget factory refuses a widget without them. Keep `KEY_FILES` pointing at the
+  directories a domain really changes: stale entries make the domain look idle.
 
 ---
 
@@ -157,11 +174,14 @@ App permission checks: write, accepting that permission, secret
 Adding a workflow file means adding its row to `gates.t27` in the same commit.
 The drift gate refuses anything else.
 
-### T27F: the visual spec of every `.t27`
+### T27F: t27's frontend
 
-One spec gives one graph model and many views: source, architecture, data flow,
-dependencies and tests. Every node is labelled exact, derived, suggested or
-unknown, and links back to its source lines. The definition lives in one place:
+T27F is how t27 shows anything visual, through several tools: spec diagrams,
+map stills, particle reels and stills, the hot-reload stream and the
+`claw/t27f` check-run. TRI CLAW serves its MCP tools. Its core is the visual
+spec of every `.t27`: one graph model, many views, every node labelled exact,
+derived, suggested or unknown. The surfaces and their status are
+[`specs/t27f/frontend.t27`](specs/t27f/frontend.t27); the definition lives in
 [`.claude/skills/t27f/SKILL.md`](.claude/skills/t27f/SKILL.md), "What T27F is".
 
 - **Specs:** [`specs/t27f/`](specs/t27f/). The IR is `spec_graph.t27`. The
@@ -174,6 +194,68 @@ unknown, and links back to its source lines. The definition lives in one place:
 - **Read a spec cheaply:** the MCP tool `t27f_outline` returns one line per
   node and edge instead of the whole file. Use it before reading a big spec in
   full.
+
+### t27t: the t27 trainer
+
+t27t is the t27 training product. Its law is
+[`specs/t27t/t27t.t27`](specs/t27t/t27t.t27), run with `tri t27t`. Its runner
+today is the PyTorch trainer gHashTag/igla-coder-gpu (`train.py`, tern-tc
+models). The spec says what the runner must do; it does not rewrite the runner.
+
+- **What makes training cheaper** (measured on an RTX 4090 with CUTLASS 3.5.1,
+  2026-10-18, #10360): the forward GEMMs run on int8 tensor cores, at 2.9x to
+  3.5x bf16, and the gradients stay in bf16. PyTorch reaches those cores through
+  `torch._int_mm`, so no t27c CUDA backend is needed for the saving.
+- **What makes it more expensive:** int8 dp4a on CUDA cores runs at 0.91x to
+  0.94x of bf16. `pick_path` never chooses it.
+- **The saving law:** f x (1 - 1/s), which is 16% to 24%, or $16 to $24 on a
+  $100 run. f is the share of a step spent in forward GEMMs, and it is **an
+  estimate, not a measurement** (`F_MEASURED = false`). Do not quote the saving
+  without saying so.
+- **When a generated kernel takes over:** only on a shape where it beats tuned
+  CUTLASS s8 by 10% (`GEN_CUDA_BAR_E2`).
+- **Open:** the runner is not wired to `torch._int_mm` yet
+  (`RUNNER_USES_INT_MM = false`). The spec's `NOT_MEASURED` lists what else was
+  not measured.
+- **Numbers about our formats** go through the papers check,
+  [`specs/numeric/paper_claims.t27`](specs/numeric/paper_claims.t27) (`tri papers`).
+  Of 45 numbers printed in three papers, 34 recompute, 8 do not, 3 cannot be
+  checked.
+
+### T27 OS: the instrument panel, and GOD MODE evolution
+
+T27 OS is the native window through which the project is worked on and watched: a spaceship
+instrument panel, written in `.t27` and built by `t27b` (`specs/t27os/`, run recipe
+`docs/t27os/run-local.md`). The image, the per-letter registry, the build traps and the plan live
+in one place, the skill [`.claude/skills/t27os/SKILL.md`](.claude/skills/t27os/SKILL.md); this
+section only states the rules.
+
+- **27 petals = 27 letters.** Petal index p is letter p + 1; the rings are the alphabet layers
+  (A-I, J-R, S-Ti). Petal 3 (C) holds the chat and the commander. A letter's tool t27<letter>
+  leads where one exists (t27a, t27b, t27c, t27f frontend, t27o, t27t, t27u); never name a tool
+  before its artifact exists (`specs/compiler/theory/toolchain.t27`).
+- **T27 OS is an ergonomic project-management system, 100% widgets** (owner, 2026-10-20: "our
+  signature"). Each letter is a tool t27<letter> with its own page -- t27k the kanban board, t27c
+  the chat and commander, t27i issues, t27p pull requests and CI, t27q the Queen; the table is
+  `TOOL_NAMES` in `specs/t27os/agent_parts.t27`. Every pixel of every page belongs to a widget.
+- **Everything is a widget; widgets contain widgets.** A letter's console holds its instruments:
+  its widgets and app surfaces, its specs, its tri commands, MCP tools and skills, its live
+  domain pulse. No text-only screens.
+- **Every number shows where it came from**: measured (with the command), derived, or not
+  measured; a missing value prints "not measured", never 0 (`specs/t27os/bench.t27`). Every
+  fact about a domain is labelled CONFIRMED or GUESS (`domain_pulse.t27`).
+- **GOD MODE evolves the system, inside the same laws.** With GOD MODE on, the Queen
+  (`specs/t27os/queen.t27`) picks the next gap from the panel itself -- a letter with no
+  instrument, a stale seal, a red check on a domain's path, an unowned path, a spec no widget
+  shows -- turns it into an issue with the 4-heading shape, starts one agent in a PTY pane on a
+  fresh lane worktree (Sonnet; at most three at once on an 8 GB Mac), and lands the result only
+  through the normal gates (`Closes #N`, tests, seals, Only t27, DRY). The decision rule is
+  `specs/t27os/evolve.t27`. GOD MODE never does what CLAUDE.md "Proactivity" forbids
+  (passwords, payments, secrets, public claims without a measurement, owner-only gate files);
+  those become requests to the owner. Cmd+J, Escape or the switch stops it; every action is in
+  the RECENT log on screen.
+- **Two lanes edit `glass_window.t27`.** Merge master before every push to it; reseal
+  `specs/t27os/homes.t27` after master moves.
 
 ### Hot reload and incremental work: only what changed is redone
 
@@ -242,6 +324,14 @@ Each gate is a spec. Read the spec, not a summary of it.
 **φ² + 1/φ² = 3 | TRINITY**
 
 ---
+
+## Landing work: our git first, GitHub once per batch (owner rule, 2026-10-20, #11275)
+
+GitHub's Actions queue is the bottleneck (800-900 queued runs, #10644). A lane verifies locally first
+(`t27b test`, `t27c test-report`, seal, gen), lands on the local golden head by compare-and-swap, and
+GitHub receives one batched push per window, never one per commit; a red batch is bisected locally by
+verdicts. The law is `specs/queen/golden_chain.t27` section 6; the practices, commands and traps are
+the skill `own-git-landing`.
 
 ## Only t27 (owner hard rule, 2026-10-05)
 
@@ -366,6 +456,44 @@ Every spec is a running cost: a seal, a ledger row, CI minutes on every pull req
 - **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
 - **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
 
+## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
+
+Owner, 2026-10-22: trigit is the standard, and the swarm uses it to go faster.
+trigit is our own git -- the golden chain, the swarm refs and notes, and the
+trigit verbs -- while GitHub is a mirror and a window, not the truth (name and
+principle, owner 2026-10-20, epic #11385). Every spec, skill, doc and UI calls
+it trigit.
+
+- **How work lands now (the accelerating path; use it):** verify locally, land
+  on the local golden head `refs/golden/head` by compare-and-swap, reach GitHub
+  as one batch PR per 15-minute window. The law is `specs/queen/golden_chain.t27`
+  section 6; the operating manual is `.claude/skills/own-git-landing/SKILL.md`;
+  the verbs are `tri golden land | push | status`, hosted by
+  `specs/tri/land/golden_land.t27`. Read those; this section does not restate them.
+- **Why it accelerates:** a plain push restarts every required check at the back
+  of an Actions queue of 800-900 runs (#10644, #10588, #6595). trigit judges a
+  change by its verdicts locally and talks to GitHub once per batch, not once
+  per push.
+- **Running today (measured 2026-10-22):** the golden chain and its batch push;
+  the verdict cache in `refs/notes/verdicts` (`specs/verified/verdict_notes.t27`);
+  heartbeats and claims as refs (`refs/swarm/alive/*`, `refs/swarm/claims/*`,
+  written by `specs/t27os/devices.t27`); the T27 OS readers (`statusbar.t27`,
+  `queen_dash.t27` `trigit.txt`, `glass_window.t27` flow strip); `tri worktrees`
+  for what a checkout holds.
+- **The gaps, named so nobody mistakes the standard for the whole:** the
+  one-command `trigit claim|hold|release|beat|send|recv|join|board|verdict|status`
+  verbs and their TRI CLAW MCP twins (#11385 items 24-26); holds as refs (item 7,
+  today disk-based); the mailbox and event refs (items 9-10); the own remote, so
+  swarm refs stop riding on GitHub (Layer 0); rerere, co-change prediction,
+  speculative lanes, auto-bisect, range-diff review (P2); the `.t27` git core and
+  the hardware spikes (P3). Epic #11385 is closed; a gap found under it is filed
+  as a Queen-shaped child issue, never papered over with a second coordination
+  channel (no new `setInterval`, no second registry).
+- **Acceleration is the reason every rule above exists:** trigit was built to
+  remove waiting -- 190 tasks blocked by whole-file holds, a personal token
+  throttled to about 5 minutes per call, 135 PRs queued for CI (#11385). Do not
+  reintroduce a per-push or per-comment coordination path it already replaced.
+
 ## Actors, not threads (owner rule, 2026-10-08)
 
 Owner's rule, 2026-10-08: the Queen and the swarm move to the actor model.
@@ -448,3 +576,55 @@ documents addressed to other people's agents, the six negative controls, and the
 `;`-alone-on-a-line trap that silently discards a `module` declaration. This
 section is a pointer, not a copy -- the recorded defect in this codebase family
 is the hand-copied rule that only two of its three homes knew about.
+
+## New functionality is written in .t27 only
+
+**Owner, 2026-10-11:** new functionality is added on `t27c` / `t27b`, and the
+outdated logic that lives outside `.t27` is abandoned, not extended.
+
+1. **Spec first, `.t27` only.** A new rule, number, threshold, limit, price,
+   access decision or order of steps is written as a `.t27` spec and executed
+   by `t27c` / `t27b`. It is not written in TypeScript, Rust, Python or
+   hand-written Zig.
+2. **Existing logic outside `.t27` is legacy.** It is not extended. When it is
+   touched for a fix, the rule moves into a spec first and the host keeps only
+   plumbing.
+3. **Plumbing may stay in the host language**: transport, HTTP, database
+   drivers, rendering, wiring. Plumbing never decides a rule. A host function
+   that only looks like a rule is a defect, not plumbing.
+4. **Concurrency uses the actor model of `specs/queen/actors.t27`** (pids,
+   mailboxes, links, monitors, supervisors), not hand-written threads or
+   queues.
+5. **A claim that `t27b` can host a runtime is verified by running it.** Where
+   it cannot yet, the existing host stays as a thin transitional host and the
+   gap is recorded as an issue, not hidden.
+
+## Number formats: TNF and the numeric papers (owner, 2026-10-20)
+
+Papers: TNF (Vasilev, 2026-08-11), arXiv:2606.05017 GoldenFloat, arXiv:2606.09686 Golden Ruler. Digests: `specs/numeric/paper_claims.t27`.
+
+**Which format where**
+1. Numeric SSOT is `conformance/FORMAT-SPEC-001.json` + `specs/numeric/gf16.t27` (L6). Never restate a width, bias or range in prose or a second spec; read the spec.
+2. Width rules: GF `E = round((N-1)/phi^2)`, `F = N-1-E`; BNF/TNF `1 + E_t + M = N` (`goldenfloat_family.t27`, `tnf*.t27`). Add a new width by extending the ladder spec, never by copying one.
+3. TNF exponent = `E_t` balanced-ternary trits, offset `3^E_t - 1` is the reserved special row, `e = offset - (3^E_t - 1)/2`. Fixed fields, no regime, no taper. State the budget with every width: nominal `1+E_t+M` or physical `1+ceil(E_t*log2 3)+M` (TNF16 = 19 physical bits). "Wins at equal width" without the budget is forbidden.
+4. On FPGA logic that must be exact and synthesizable use Z[phi] integers, not f64 (t27b refuses f64). Value = pair `(a,b)` for `a + b*phi`; `phi*(a,b) = (b, a+b)`; products reduce with `phi^2 = phi + 1`. Size accumulators from the WORST case: fan-in grows 1 bit per doubling, depth grows 0.694 bit per layer (`specs/igla/race/phi_accumulator_growth.t27`); Z[phi] never saturates, so overflow is silent. Weight path: `specs/igla/race/phi_weights.t27`.
+5. Test exactness with integers only: `phi^(2n) + phi^(-2n) = L_2n`, `S0=2, S1=3, S(n+2)=3 S(n+1) - S(n)` (`specs/numeric/lucas_accumulator.t27`). No rounding model in the loop.
+6. Rounding and specials: the rounding mode is stated in the format spec, never assumed (`paper_claims.t27` rounds printed decimals half-to-even at an exact tie); one reserved special row per format; every new format ships a conformance pack (JSON + SHA-256, anchor vector `phi^2 + 1/phi^2 = 3`) under `conformance/vectors/`; a decoder and its oracle must agree bit for bit before any hardware number is quoted.
+
+**Claim discipline (the referee findings, TNF-FINDINGS-LEDGER.md)**
+7. Decode cost first: the only effect that cleared every noise band was decode-cost separation (6.08x published, 8.93x corrected). Lead with it; report accuracy second.
+8. Never state a ranking margin below the stated resolution of its own measurement (TNF headline 10.2% < 11.4%). Rankings need three seeds (25-37 of 210 pairwise winners flip across five seeds of one configuration).
+9. Every FPGA number names part and package, tool versions, placer, router and seed set. Placer/router choice moved Fmax up to 4.3x and flipped 32 pairwise rankings; a number without them is not a number. Pre-route yosys LUT counts are a lower bound, label them. A different part/package (fbg676 vs the AX7203 fbg484) is not the same measurement.
+10. No superiority claim against posit, takum, OCP-MX or P3109 without a stated workload, sampling prior and budget. Say "depends on the distribution" when it does.
+11. Every correction is dated and kept: errata, retractions and a falsification ledger (`docs/nona-03-manifest/RESEARCH_CLAIMS.md`, FL-xxx). Do not delete a withdrawn claim; mark it in place. Counts that a paper prints (109 formats, clusters) are recomputed in `paper_claims.t27` / `catalog_paper_count.t27`; a misfit is reported, not smoothed.
+12. Hardware claims cover only silicon that exists: the bench is the ALINX AX7203 (`fpga/HARDWARE_SSOT.md`); no die exists for the GoldenFloat paper's withdrawn TTSKY26b submission.
+13. Sampling a range uniformly in binades favors flat-precision formats; disclose the prior (`rng.integers(-38, 39)` was the TNF default).
+## Brand visual: the owner's formulas orbit the 27-petal logo (owner, 2026-10-20)
+
+The signature image of the project, on every home surface (t27.ai main page, the T27 OS home, the FPGA HDMI home): the 27-petal logo in the centre, and the owner's formulas -- physical constants predicted from integers with phi, pi and e, `V = n * 3^k * pi^m * phi^p * e^q` (Vasilev, Pellis, Olsen, "The Sacred Formula", `research/trinity-pellis-paper/`) -- floating around it as in zero gravity, drifting outward on a golden spiral (golden angle 360/phi^2 degrees), and pushed aside softly by the pointer.
+
+1. **Formulas come from the SSOT, never typed into a page.** Text, value and error come from `specs/physics/formula_registry.t27` (69 formulas, sector, complexity, error) and `specs/physics/pellis-formulas.t27`; the precision check is `specs/math/pellis_precision_verify.t27`. A page that hand-copies a formula is a second home for the truth (DRY).
+2. **Only verified formulas fly, each with its error.** Show a formula only when its registry tag is VERIFIED, with its measured deviation (for example "-0.62%") beside it. A formula marked conjecture or failed does not appear in the brand visual; honesty is part of the image.
+3. **The motion is a .t27 law, one for every platform.** Spiral radius, angular speed, drift, the pointer push and the limits live in one spec (extend `specs/t27f/petal_menu.t27`, which owns the 27-petal geometry) with tests; the site, T27 OS and the FPGA draw from it. No hand-written animation logic in TS, Swift or Verilog.
+4. **Calm and legible.** Formulas never cover the logo or the petals' hit areas, never overlap each other, and slow down near the pointer instead of fleeing; respect reduced-motion settings (static orbit). Black ground, matte glass, formulas in white at reading size.
+5. **Science first.** Clicking a formula opens its card: the expression, the predicted and measured value, the deviation, the source (CODATA or PDG) and the paper. The visual invites a check; it never claims more than the registry proves.

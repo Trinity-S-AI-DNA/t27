@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS keys_host: where the key manager (keys.t27) touches the machine through libSystem. Two jobs, no
+// decisions (the check button, which needs Foundation, is keys_probe.t27):
+//   - the macOS Keychain, one generic-password item per key (up to MAX_KEYS a provider; account = provider
+//     name, then "<name>#2" .. "<name>#8") under the service "ai.t27.os": kc_get_n / kc_put_n / kc_del_n.
+//     The Keychain is reached ONLY by running /usr/bin/security (posix_spawn, pipes, poll, waitpid), never
+//     through SecItem calls. The window is signed ad hoc, so each rebuild is a new code identity and every
+//     SecItem read of an item asked for the login password again; the items trust /usr/bin/security, which
+//     Apple signs and no rebuild changes. A key is never written to a file, never put on argv (ps shows it:
+//     an add feeds `security -i` one line on standard input) and never reaches the repo.
+//   - push_keys(): hand every stored key, with its number, to the PTY server (OP_SETKEY) so a pane it spawns
+//     is logged in and the server can rotate over the keys of a provider.
+//
+// Two programs import this module: the window (glass_window.t27) and the PTY server (pty_server.t27, which
+// reads the Keychain itself with kc_get_n so it never depends on the window being connected). A module's
+// @extern imports travel with it, so everything here is libSystem only (posix_spawn, pipe, poll, waitpid): the
+// server links against libSystem alone. Nothing may be added here that needs CoreFoundation or Foundation;
+// that is why the check button moved to keys_probe.t27.
+//
+// Specs holding @extern cannot run tests under t27c; every rule these fns follow is a tested fn in keys.t27
+// (argument lists, the add line, which keys are safe for it, the exit-status table, the output -> key rule).
+// This file only spawns, pipes, reads and waits.
+//
+// Signals around a run: editors_host.t27 sets SIGCHLD to ignore (its children are never waited for), and with
+// that set waitpid cannot return a child's status, so a run sets the default for its own length and puts back
+// what it found; SIGPIPE is ignored while the line is written (a dead tool must not end the window).
+//
+// Refs gHashTag/t27#10782, gHashTag/t27#11241.
+module T27osKeysHost;
+
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::KEYCHAIN_SERVICE;
+use t27os::keys::SEC_OP_READ;
+use t27os::keys::SEC_OP_WRITE;
+use t27os::keys::SEC_OP_DELETE;
+use t27os::keys::SEC_MAX_WORDS;
+use t27os::keys::SEC_TIMEOUT_MS;
+use t27os::keys::SEC_SIGNALED;
+use t27os::keys::SEC_OK;
+use t27os::keys::SEC_FAILED;
+use t27os::keys::sec_argv;
+use t27os::keys::sec_add_line;
+use t27os::keys::sec_exit_code;
+use t27os::keys::sec_verdict;
+use t27os::keys::sec_gone;
+use t27os::keys::sec_key_from_output;
+use t27os::keys::scan_goes_on;
+use t27os::keys::keychain_account_n;
+use t27os::keys::setkey_byte;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::MAX_FRAME;
+use t27os::pty_logic::put_pollfd;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_signal;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_kill;
+use t27os::pty_sys::sys_waitpid;
+use t27os::pty_client::client_set_key;
+
+pub const SIGNAL_PIPE : i32 = 13;
+pub const SIGNAL_CHLD : i32 = 20;
+pub const HANDLER_DFL : u64 = 0;
+pub const HANDLER_IGN : u64 = 1;
+pub const SIGKILL_NUMBER : i32 = 9;
+
+fn addr_of(dst: []u8, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+/// pipe(2): fds[0] is the read end, fds[1] the write end.
+fn sys_pipe(fds: [2]u32) -> i32 { return @extern("pipe"); }
+/// posix_spawn(3): the file actions are the address of the 8-byte posix_spawn_file_actions_t.
+fn sec_spawn(pid: [2]u32, path: []const u8, actions: []u8, attr: u64, argv: [9]u64, envp: u64) -> i32 { return @extern("posix_spawn"); }
+fn fa_init(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_init"); }
+fn fa_destroy(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_destroy"); }
+fn fa_dup2(fa: []u8, fd: i32, to: i32) -> i32 { return @extern("posix_spawn_file_actions_adddup2"); }
+fn fa_close(fa: []u8, fd: i32) -> i32 { return @extern("posix_spawn_file_actions_addclose"); }
+fn fa_open(fa: []u8, fd: i32, path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("posix_spawn_file_actions_addopen"); }
+
+fn close_fd(fd: u32) -> void {
+    sys_close(@as(i32, @intCast(fd)));
+}
+
+fn wipe(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// The body of a run of /usr/bin/security (sec_run): the argument words (keys.t27 sec_argv), `feed` to its
+/// standard input (nothing when feed is empty, then /dev/null), its standard output into `out`, its standard
+/// error to /dev/null. res[0] = the bytes read, res[1] = the exit code (SEC_SIGNALED when a signal ended it).
+/// A tool that stays silent for `timeout` ms, or fills `out`, is killed. Returns SEC_OK / SEC_NOT_FOUND /
+/// SEC_DENIED / SEC_FAILED (keys.t27 sec_verdict); a failure to start is SEC_FAILED, never a key.
+fn sec_run_inner(words: []u8, offs: []const u32, argc: u32, feed: []const u8, out: []u8, res: []u32, timeout: i32) -> u32 {
+    res[0] = 0;
+    res[1] = SEC_SIGNALED;
+    if (argc == 0 or argc > SEC_MAX_WORDS) { return SEC_FAILED; }
+    var argv : [9]u64 = undefined;
+    var a : usize = 0;
+    while (a < 9) {
+        argv[a] = 0;
+        a = a + 1;
+    }
+    const base : u64 = addr_of(words, words, 0);
+    var w : u32 = 0;
+    while (w < argc) {
+        argv[w] = base + @as(u64, offs[w]);
+        w = w + 1;
+    }
+    var ev : [8]u8 = undefined;
+    wipe(ev[0..8]);
+    sys_peek(ev[0..8], sys_environ(), 8);
+    const envp : u64 = get_u64(ev[0..8], 0);
+    var po : [2]u32 = undefined;
+    po[0] = 0;
+    po[1] = 0;
+    var pi : [2]u32 = undefined;
+    pi[0] = 0;
+    pi[1] = 0;
+    const has_in : bool = feed.len > 0;
+    if (sys_pipe(po) != 0) { return SEC_FAILED; }
+    if (has_in) {
+        if (sys_pipe(pi) != 0) {
+            close_fd(po[0]);
+            close_fd(po[1]);
+            return SEC_FAILED;
+        }
+    }
+    // the child's descriptors: 0 = the line (or /dev/null), 1 = the output pipe, 2 = /dev/null; it closes every pipe end
+    var dn : [16]u8 = undefined;
+    wipe(dn[0..16]);
+    dn[0] = 47;
+    dn[1] = 100;
+    dn[2] = 101;
+    dn[3] = 118;
+    dn[4] = 47;
+    dn[5] = 110;
+    dn[6] = 117;
+    dn[7] = 108;
+    dn[8] = 108;
+    var fa : [8]u8 = undefined;
+    wipe(fa[0..8]);
+    var bad : bool = fa_init(fa[0..8]) != 0;
+    if (bad) {
+        close_fd(po[0]);
+        close_fd(po[1]);
+        if (has_in) {
+            close_fd(pi[0]);
+            close_fd(pi[1]);
+        }
+        return SEC_FAILED;
+    }
+    if (has_in) {
+        if (fa_dup2(fa[0..8], @as(i32, @intCast(pi[0])), 0) != 0) { bad = true; }
+        if (fa_close(fa[0..8], @as(i32, @intCast(pi[0]))) != 0) { bad = true; }
+        if (fa_close(fa[0..8], @as(i32, @intCast(pi[1]))) != 0) { bad = true; }
+    } else {
+        if (fa_open(fa[0..8], 0, dn[0..16], 0, 0) != 0) { bad = true; }
+    }
+    if (fa_dup2(fa[0..8], @as(i32, @intCast(po[1])), 1) != 0) { bad = true; }
+    if (fa_open(fa[0..8], 2, dn[0..16], 1, 0) != 0) { bad = true; }
+    if (fa_close(fa[0..8], @as(i32, @intCast(po[0]))) != 0) { bad = true; }
+    if (fa_close(fa[0..8], @as(i32, @intCast(po[1]))) != 0) { bad = true; }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    var rc : i32 = 1;
+    if (bad == false) {
+        rc = sec_spawn(pid, words[@as(usize, offs[0]) .. words.len], fa[0..8], 0, argv, envp);
+    }
+    fa_destroy(fa[0..8]);
+    close_fd(po[1]);
+    if (has_in) { close_fd(pi[0]); }
+    if (rc != 0) {
+        close_fd(po[0]);
+        if (has_in) { close_fd(pi[1]); }
+        return SEC_FAILED;
+    }
+    const pidv : i32 = @as(i32, @intCast(pid[0]));
+    // the line, in one write (it is shorter than PIPE_BUF, so it arrives whole or not at all)
+    var cut : bool = false;
+    if (has_in) {
+        const prev : u64 = sys_signal(SIGNAL_PIPE, HANDLER_IGN);
+        var off : usize = 0;
+        var live : bool = true;
+        while (live and off < feed.len) {
+            const wn : i64 = sys_write(@as(i32, @intCast(pi[1])), feed[off .. feed.len], @as(u64, feed.len - off));
+            if (wn <= 0) {
+                live = false;
+            } else {
+                off = off + @as(usize, @intCast(wn));
+            }
+        }
+        sys_signal(SIGNAL_PIPE, prev);
+        close_fd(pi[1]);
+        if (off < feed.len) { cut = true; }
+    }
+    // the output, until the tool closes it; a silent tool or a full buffer is cut short
+    var pf : [8]u8 = undefined;
+    wipe(pf[0..8]);
+    var got : usize = 0;
+    var spins : u32 = 0;
+    var more : bool = cut == false;
+    while (more) {
+        if (got >= out.len) {
+            cut = true;
+            more = false;
+        } else {
+            put_pollfd(pf[0..8], 0, po[0]);
+            const r : i32 = sys_poll(pf[0..8], 1, timeout);
+            if (r == 0) {
+                cut = true;
+                more = false;
+            } else if (r < 0) {
+                spins = spins + 1;
+                if (spins > 4) {
+                    cut = true;
+                    more = false;
+                }
+            } else {
+                const rn : i64 = sys_read(@as(i32, @intCast(po[0])), out[got .. out.len], @as(u64, out.len - got));
+                if (rn <= 0) {
+                    more = false;
+                } else {
+                    got = got + @as(usize, @intCast(rn));
+                }
+            }
+        }
+    }
+    close_fd(po[0]);
+    if (cut) { sys_kill(pidv, SIGKILL_NUMBER); }
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    var wp : i32 = sys_waitpid(pidv, ws, 0);
+    var tries : u32 = 0;
+    while (wp != pidv and tries < 4) {
+        wp = sys_waitpid(pidv, ws, 0);
+        tries = tries + 1;
+    }
+    res[0] = @as(u32, @intCast(got));
+    if (wp != pidv) { return SEC_FAILED; }
+    res[1] = sec_exit_code(ws[0]);
+    return sec_verdict(res[1], cut);
+}
+
+/// One run of /usr/bin/security (see sec_run_inner), with SIGCHLD at its default for the run's length.
+pub fn sec_run(words: []u8, offs: []const u32, argc: u32, feed: []const u8, out: []u8, res: []u32, timeout: i32) -> u32 {
+    const prev : u64 = sys_signal(SIGNAL_CHLD, HANDLER_DFL);
+    const st : u32 = sec_run_inner(words, offs, argc, feed, out, res, timeout);
+    sys_signal(SIGNAL_CHLD, prev);
+    return st;
+}
+
+/// One Keychain operation on key k of provider p: build the argument list (keys.t27 sec_argv), run the tool
+/// with `feed` on its standard input, its output in `raw`. The state of the run (SEC_*); res as in sec_run.
+fn sec_op(op: u32, p: u32, k: u32, feed: []const u8, raw: []u8, res: []u32) -> u32 {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return SEC_FAILED; }
+    var nm : [32]u8 = undefined;
+    wipe(nm[0..32]);
+    const nn : usize = keychain_account_n(p, k, nm[0..32]);
+    var words : [160]u8 = undefined;
+    var offs : [8]u32 = undefined;
+    wipe(words[0..160]);
+    var z : usize = 0;
+    while (z < 8) {
+        offs[z] = 0;
+        z = z + 1;
+    }
+    const argc : u32 = sec_argv(op, KEYCHAIN_SERVICE, nm[0..nn], words[0..160], offs[0..8]);
+    if (argc == 0) { return SEC_FAILED; }
+    return sec_run(words[0..160], offs[0..8], argc, feed, raw, res, @as(i32, @intCast(SEC_TIMEOUT_MS)));
+}
+
+/// Store `key` as key k (0-based) of provider p, never replacing one. True when the Keychain accepted it;
+/// false when the number is taken (the tool answers 45), the key is not fit for the `security -i` line
+/// (keys.t27 sec_key_safe) or the tool did not answer. The key goes in on standard input, never on argv.
+pub fn kc_put_n(p: u32, k: u32, key: []const u8) -> bool {
+    if (p >= PROVIDER_COUNT or k >= MAX_KEYS) { return false; }
+    var nm : [32]u8 = undefined;
+    wipe(nm[0..32]);
+    const nn : usize = keychain_account_n(p, k, nm[0..32]);
+    var line : [400]u8 = undefined;
+    wipe(line[0..400]);
+    const ln : usize = sec_add_line(KEYCHAIN_SERVICE, nm[0..nn], key, line[0..400]);
+    if (ln == 0) { return false; }
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = sec_op(SEC_OP_WRITE, p, k, line[0..ln], raw[0..256], res[0..2]);
+    wipe(line[0..400]);
+    wipe(raw[0..256]);
+    return st == SEC_OK;
+}
+
+/// Read key k (0-based) of provider p into out; its length, 0 when none is stored, the tool did not answer
+/// with exit status 0, or what it printed is not a key that fits out.
+pub fn kc_get_n(p: u32, k: u32, out: []u8) -> usize {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = sec_op(SEC_OP_READ, p, k, "", raw[0..256], res[0..2]);
+    var n : usize = 0;
+    if (st == SEC_OK) { n = sec_key_from_output(raw[0 .. @as(usize, res[0])], out); }
+    wipe(raw[0..256]);
+    return n;
+}
+
+/// Delete key k (0-based) of provider p. True when it is gone (also when none was there).
+pub fn kc_del_n(p: u32, k: u32) -> bool {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = sec_op(SEC_OP_DELETE, p, k, "", raw[0..256], res[0..2]);
+    wipe(raw[0..256]);
+    return sec_gone(st);
+}
+
+/// True when the Keychain holds a first key for provider p (reads it, then drops the copy).
+pub fn kc_has(p: u32) -> bool {
+    var b : [256]u8 = undefined;
+    const n : usize = kc_get_n(p, 0, b[0..256]);
+    wipe(b[0..256]);
+    return n > 0;
+}
+
+/// Hand every stored key to the PTY server on `fd`, each with its number; the count pushed. The numbered
+/// accounts of every provider are read (a scan stops after two misses in a row, keys.t27 scan_goes_on) and the
+/// number rides in the OP_SETKEY pane byte (keys.t27 setkey_byte), so the server holds all of them and
+/// rotates over them. Called on connect, when the KEYS tab opens and before a spawn, because a server that
+/// restarted has forgotten them. The copy of each key in this stack frame is wiped when the call ends.
+pub fn push_keys(fd: i32) -> u32 {
+    var key : [256]u8 = undefined;
+    var reply : [MAX_FRAME]u8 = undefined;
+    var pushed : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        var k : u32 = 0;
+        var misses : u32 = 0;
+        while (scan_goes_on(k, misses)) {
+            const n : usize = kc_get_n(p, k, key[0..256]);
+            if (n > 0) {
+                misses = 0;
+                if (client_set_key(fd, setkey_byte(p, k), key[0..n], reply[0..MAX_FRAME]) > 0) { pushed = pushed + 1; }
+            } else {
+                misses = misses + 1;
+            }
+            k = k + 1;
+        }
+        p = p + 1;
+    }
+    wipe(key[0..256]);
+    return pushed;
+}
+
+test the_host_module_is_declared {
+    var b : [4]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1;
+}

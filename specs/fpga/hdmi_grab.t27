@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/hdmi_grab.t27 -- grab the picture the AX7203 sends to the Mac through a USB HDMI dongle and
+; judge it against the frame the board is meant to show (Refs gHashTag/t27#10782, T27 OS on the FPGA).
+; Owner, 2026-10-19: the board's HDMI output is wired to this Mac through a USB HDMI dongle. macOS lists no
+; capture device yet (FaceTime HD Camera, OBS Virtual Camera, Capture screen 0), so the dongle may not be
+; a UVC capture device, or may not be enumerated. This program says which, instead of guessing.
+; --
+; WHAT RUNS WHERE. t27 has no AVCaptureSession and no callbacks, so the grab is the plain `ffmpeg -f
+; avfoundation` command line, started from main by libc `system`; everything that decides anything is
+; ordinary t27 with tests: which listed device is the capture one, and whether a grabbed frame is the
+; expected frame. No other language is involved.
+; --
+; THE EXPECTED FRAME is specs/fpga/vga_text_core.t27's: black, with the title "T27 OS" in white 8x8
+; glyphs at the top left of a 640x480 picture. The checker asks that core's own `pixel_at`, so the
+; expectation is not copied. A grabbed frame of any size is sampled at the centre of each of the 640x480
+; logical pixels, which assumes the dongle shows the whole picture: no border, no overscan.
+; --
+; THE RULES, each with a test below:
+;   - device pick: in the "AVFoundation video devices" section of ffmpeg's list, the first device whose
+;     name has none of FaceTime, OBS Virtual, Capture screen, iPhone; -1 when there is none. The audio
+;     section is never read;
+;   - a frame is a binary PPM (P6, 255). Not that: verdict 1. Fewer bytes than its header promises, or
+;     smaller than 64x48: verdict 2;
+;   - the 384 title pixels (48x8) are lit (luma >= 128) exactly where pixel_at says, give or take
+;     TITLE_TOL; more mismatches: verdict 3. A black, a white, an inverted and an eight-pixel-shifted
+;     frame all fail here;
+;   - on a grid over the rest of the picture (every 16th logical pixel, past the title rows) at most BG_TOL
+;     samples are lit; more: verdict 4. A frame with a lit square in the middle fails here;
+;   - otherwise verdict 0, PASS.
+; --
+; HOW (main): HG_FRAMES (default 3) frames, HG_TRIES (default 12) looks for the device, 5 s apart, then
+; stops with a message. It writes /tmp/hdmi_grab_N.ppm and .png. On the lab: `t27c gen` this file, then
+; `zig build-exe -lc`; the Mac runs only that binary: ./hdmi_grab
+; --
+; The honest limits:
+;   - it does not know the dongle. A device that ffmpeg lists is taken to be the capture one; if two pass
+;     the filter, the first wins, and the message lists all of them;
+;   - the checker is a threshold on luma, not a similarity score; blur, a scaler's ringing or a changed
+;     gamma inside TITLE_TOL pass, anything beyond fails;
+;   - the pattern is the VGA core's one-bit frame. Colour bars are not in the core (its output is one
+;     bit); a 24-bit pattern needs the core to drive the SiI9134's RGB bus first;
+;   - the avfoundation input's first frames are often dark, so the grab keeps the fifth;
+;   - nothing here proves the board is the source. A frame that passes is the expected frame seen on the
+;     dongle; the board in the loop is the reading of the owner's eyes at the other end of the cable.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module fpga_hdmi_grab;
+
+use fpga::vga_text_core::pixel_at;
+
+pub const TITLE_W : usize = 48;
+pub const TITLE_H : usize = 8;
+pub const TITLE_TOL : usize = 16;
+pub const BG_TOL : usize = 8;
+pub const LOGICAL_W : usize = 640;
+pub const LOGICAL_H : usize = 480;
+pub const LUMA_ON : usize = 128;
+pub const MIN_W : usize = 64;
+pub const MIN_H : usize = 48;
+
+pub const V_PASS : usize = 0;
+pub const V_NOT_PPM : usize = 1;
+pub const V_SHORT : usize = 2;
+pub const V_TITLE : usize = 3;
+pub const V_BACKGROUND : usize = 4;
+
+// ---- text helpers ----
+
+pub fn hg_is_digit(c: u8) -> bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Does s[a..b] contain the fixed text nd.
+pub fn hg_has(s: []const u8, a: usize, b: usize, nd: []const u8) -> bool {
+    const k : usize = nd.len;
+    if (k == 0 or b < a + k) { return false; }
+    var i : usize = a;
+    while (i + k <= b) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < k) {
+            if (s[i + j] != nd[j]) { same = false; }
+            j += 1;
+        }
+        if (same) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+// ---- which listed device is the capture one ----
+
+/// The ']' that closes the last "[digits]" in the line s[a..b]; b when the line has none.
+pub fn hg_br_end(s: []const u8, a: usize, b: usize) -> usize {
+    var last : usize = b;
+    var i : usize = a;
+    while (i < b) {
+        if (s[i] == '[') {
+            var j : usize = i + 1;
+            while (j < b and hg_is_digit(s[j])) { j += 1; }
+            if (j > i + 1 and j < b and s[j] == ']') { last = j; }
+        }
+        i += 1;
+    }
+    return last;
+}
+
+/// The number inside the "[digits]" that ends at e.
+pub fn hg_br_val(s: []const u8, a: usize, e: usize) -> i32 {
+    var v : i32 = 0;
+    var m : i32 = 1;
+    var j : usize = e;
+    while (j > a and hg_is_digit(s[j - 1])) {
+        v = v + m * @as(i32, @intCast(s[j - 1] - '0'));
+        m = m * 10;
+        j -= 1;
+    }
+    return v;
+}
+
+/// A name this program never takes for the board's capture device.
+pub fn hg_excluded(s: []const u8, a: usize, b: usize) -> bool {
+    if (hg_has(s, a, b, "FaceTime")) { return true; }
+    if (hg_has(s, a, b, "OBS Virtual")) { return true; }
+    if (hg_has(s, a, b, "Capture screen")) { return true; }
+    if (hg_has(s, a, b, "iPhone")) { return true; }
+    return false;
+}
+
+/// The index of the n-th (from 0) video device that is not excluded in ffmpeg's avfoundation list
+/// s[0..len]; -1 when there are not that many.
+pub fn hg_pick_nth(s: []const u8, len: usize, want: usize) -> i32 {
+    var in_video : bool = false;
+    var seen : usize = 0;
+    var ls : usize = 0;
+    var i : usize = 0;
+    while (i <= len) {
+        if (i == len or s[i] == '\n') {
+            if (hg_has(s, ls, i, "AVFoundation video devices")) {
+                in_video = true;
+            } else if (hg_has(s, ls, i, "AVFoundation audio devices")) {
+                in_video = false;
+            } else if (in_video) {
+                const e : usize = hg_br_end(s, ls, i);
+                if (e < i and hg_excluded(s, e + 1, i) == false) {
+                    if (seen == want) { return hg_br_val(s, ls, e); }
+                    seen += 1;
+                }
+            }
+            ls = i + 1;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+pub fn hg_pick(s: []const u8, len: usize) -> i32 {
+    return hg_pick_nth(s, len, 0);
+}
+
+/// How many video devices the list has, excluded or not.
+pub fn hg_video_count(s: []const u8, len: usize) -> usize {
+    var in_video : bool = false;
+    var n : usize = 0;
+    var ls : usize = 0;
+    var i : usize = 0;
+    while (i <= len) {
+        if (i == len or s[i] == '\n') {
+            if (hg_has(s, ls, i, "AVFoundation video devices")) {
+                in_video = true;
+            } else if (hg_has(s, ls, i, "AVFoundation audio devices")) {
+                in_video = false;
+            } else if (in_video and hg_br_end(s, ls, i) < i) {
+                n += 1;
+            }
+            ls = i + 1;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+// ---- the frame ----
+
+pub fn hg_skip_ws(f: []const u8, n: usize, p: usize) -> usize {
+    var i : usize = p;
+    while (i < n and (f[i] == ' ' or f[i] == '\n' or f[i] == '\t' or f[i] == '\r')) { i += 1; }
+    return i;
+}
+
+pub fn hg_num_end(f: []const u8, n: usize, p: usize) -> usize {
+    var i : usize = p;
+    while (i < n and hg_is_digit(f[i])) { i += 1; }
+    return i;
+}
+
+pub fn hg_num_at(f: []const u8, p: usize, e: usize) -> usize {
+    var v : usize = 0;
+    var i : usize = p;
+    while (i < e) {
+        v = v * 10 + @as(usize, @intCast(f[i] - '0'));
+        i += 1;
+    }
+    return v;
+}
+
+/// The byte just past the header of a P6 frame f[0..n] with maxval 255; 0 when it is not one.
+pub fn hg_data_start(f: []const u8, n: usize) -> usize {
+    if (n < 11 or f[0] != 'P' or f[1] != '6') { return 0; }
+    const a : usize = hg_skip_ws(f, n, 2);
+    const ae : usize = hg_num_end(f, n, a);
+    const b : usize = hg_skip_ws(f, n, ae);
+    const be : usize = hg_num_end(f, n, b);
+    const c : usize = hg_skip_ws(f, n, be);
+    const ce : usize = hg_num_end(f, n, c);
+    if (ae == a or be == b or ce == c or ce >= n) { return 0; }
+    if (hg_num_at(f, c, ce) != 255) { return 0; }
+    return ce + 1;
+}
+
+pub fn hg_width(f: []const u8, n: usize) -> usize {
+    const a : usize = hg_skip_ws(f, n, 2);
+    return hg_num_at(f, a, hg_num_end(f, n, a));
+}
+
+pub fn hg_height(f: []const u8, n: usize) -> usize {
+    const a : usize = hg_skip_ws(f, n, 2);
+    const b : usize = hg_skip_ws(f, n, hg_num_end(f, n, a));
+    return hg_num_at(f, b, hg_num_end(f, n, b));
+}
+
+/// Is the logical pixel (x, y) of the 640x480 picture lit in the w x h frame whose pixels start at d.
+pub fn hg_lit(f: []const u8, d: usize, w: usize, h: usize, x: usize, y: usize) -> bool {
+    const sx : usize = (x * 2 + 1) * w / (2 * LOGICAL_W);
+    const sy : usize = (y * 2 + 1) * h / (2 * LOGICAL_H);
+    const o : usize = d + (sy * w + sx) * 3;
+    const l : usize = (@as(usize, @intCast(f[o])) * 30 + @as(usize, @intCast(f[o + 1])) * 59 + @as(usize, @intCast(f[o + 2])) * 11) / 100;
+    return l >= LUMA_ON;
+}
+
+/// The verdict on the frame f[0..n]: V_PASS or the first rule it breaks.
+pub fn hg_check(f: []const u8, n: usize) -> usize {
+    const d : usize = hg_data_start(f, n);
+    if (d == 0) { return V_NOT_PPM; }
+    const w : usize = hg_width(f, n);
+    const h : usize = hg_height(f, n);
+    if (w < MIN_W or h < MIN_H or n < d + w * h * 3) { return V_SHORT; }
+    var bad : usize = 0;
+    var y : usize = 0;
+    while (y < TITLE_H) {
+        var x : usize = 0;
+        while (x < TITLE_W) {
+            const want : bool = pixel_at(@as(u32, @intCast(x)), @as(u32, @intCast(y)));
+            if (hg_lit(f, d, w, h, x, y) != want) { bad += 1; }
+            x += 1;
+        }
+        y += 1;
+    }
+    if (bad > TITLE_TOL) { return V_TITLE; }
+    var lit : usize = 0;
+    y = 16;
+    while (y < LOGICAL_H) {
+        var x : usize = 8;
+        while (x < LOGICAL_W) {
+            if (hg_lit(f, d, w, h, x, y)) { lit += 1; }
+            x += 16;
+        }
+        y += 16;
+    }
+    if (lit > BG_TOL) { return V_BACKGROUND; }
+    return V_PASS;
+}
+
+// ---- synthetic frames, for the tests ----
+
+pub fn hg_put_num(out: []u8, p: usize, v: usize) -> usize {
+    var digits : usize = 1;
+    var t : usize = v;
+    while (t >= 10) {
+        digits += 1;
+        t = t / 10;
+    }
+    var k : usize = digits;
+    t = v;
+    while (k > 0) {
+        out[p + k - 1] = @as(u8, @intCast(t % 10)) + '0';
+        t = t / 10;
+        k -= 1;
+    }
+    return p + digits;
+}
+
+pub fn hg_put_header(out: []u8, w: usize, h: usize) -> usize {
+    out[0] = 'P';
+    out[1] = '6';
+    out[2] = '\n';
+    var p : usize = hg_put_num(out, 3, w);
+    out[p] = ' ';
+    p = hg_put_num(out, p + 1, h);
+    out[p] = '\n';
+    p = hg_put_num(out, p + 1, 255);
+    out[p] = '\n';
+    return p + 1;
+}
+
+/// A w x h frame in out: mode 0 the expected frame, 1 black, 2 white, 3 inverted, 4 the title eight
+/// logical pixels to the right, 5 the expected frame plus a lit 80x80 square in the middle.
+pub fn hg_synth(out: []u8, w: usize, h: usize, mode: usize) -> usize {
+    var p : usize = hg_put_header(out, w, h);
+    var py : usize = 0;
+    while (py < h) {
+        var px : usize = 0;
+        while (px < w) {
+            const x : usize = px * LOGICAL_W / w;
+            const y : usize = py * LOGICAL_H / h;
+            var on : bool = false;
+            if (mode == 0 or mode == 5) { on = pixel_at(@as(u32, @intCast(x)), @as(u32, @intCast(y))); }
+            if (mode == 2) { on = true; }
+            if (mode == 3) { on = pixel_at(@as(u32, @intCast(x)), @as(u32, @intCast(y))) == false; }
+            if (mode == 4 and x >= 8) { on = pixel_at(@as(u32, @intCast(x - 8)), @as(u32, @intCast(y))); }
+            if (mode == 5 and x >= 280 and x < 360 and y >= 200 and y < 280) { on = true; }
+            var v : u8 = 0;
+            if (on) { v = 255; }
+            out[p] = v;
+            out[p + 1] = v;
+            out[p + 2] = v;
+            p += 3;
+            px += 1;
+        }
+        py += 1;
+    }
+    return p;
+}
+
+// ---- tests ----
+
+pub const LIST_NO_DONGLE : str = "[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n[AVFoundation indev @ 0x1] [1] OBS Virtual Camera\n[AVFoundation indev @ 0x1] [2] Capture screen 0\n[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] MacBook Pro Microphone\n";
+pub const LIST_DONGLE : str = "[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n[AVFoundation indev @ 0x1] [1] USB3.0 Capture\n[AVFoundation indev @ 0x1] [2] OBS Virtual Camera\n[AVFoundation indev @ 0x1] [3] Capture screen 0\n[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] USB3.0 Capture Audio\n";
+pub const LIST_AUDIO_ONLY : str = "[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] HDMI Audio Capture\n";
+pub const LIST_TWO_DIGIT : str = "[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n[AVFoundation indev @ 0x1] [12] Elgato HD60\n";
+
+test hg_the_three_devices_macos_lists_today_are_no_capture_device {
+    assert hg_pick(LIST_NO_DONGLE, LIST_NO_DONGLE.len) == -1;
+    assert hg_video_count(LIST_NO_DONGLE, LIST_NO_DONGLE.len) == 3;
+}
+
+test hg_a_dongle_in_the_video_section_is_picked_by_its_index {
+    assert hg_pick(LIST_DONGLE, LIST_DONGLE.len) == 1;
+    assert hg_video_count(LIST_DONGLE, LIST_DONGLE.len) == 4;
+    assert hg_pick_nth(LIST_DONGLE, LIST_DONGLE.len, 1) == -1;
+}
+
+test hg_a_capture_name_in_the_audio_section_is_not_a_video_device {
+    assert hg_pick(LIST_AUDIO_ONLY, LIST_AUDIO_ONLY.len) == -1;
+}
+
+test hg_a_two_digit_index_is_read_whole {
+    assert hg_pick(LIST_TWO_DIGIT, LIST_TWO_DIGIT.len) == 12;
+}
+
+test hg_an_empty_list_has_no_device {
+    assert hg_pick("", 0) == -1;
+    assert hg_video_count("", 0) == 0;
+}
+
+test hg_the_expected_frame_passes_at_640x480_and_at_1280x720 {
+    var buf : [3000000]u8 = undefined;
+    var n : usize = hg_synth(&buf, 640, 480, 0);
+    assert n == 15 + 640 * 480 * 3;
+    assert hg_check(&buf, n) == V_PASS;
+    n = hg_synth(&buf, 1280, 720, 0);
+    assert hg_check(&buf, n) == V_PASS;
+}
+
+test hg_a_black_frame_fails_on_the_title {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 1);
+    assert hg_check(&buf, n) == V_TITLE;
+}
+
+test hg_a_white_frame_fails_on_the_title {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 2);
+    assert hg_check(&buf, n) == V_TITLE;
+}
+
+test hg_an_inverted_frame_fails_on_the_title {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 3);
+    assert hg_check(&buf, n) == V_TITLE;
+}
+
+test hg_a_title_shifted_by_eight_pixels_fails_on_the_title {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 4);
+    assert hg_check(&buf, n) == V_TITLE;
+}
+
+test hg_a_lit_square_in_the_middle_fails_on_the_background {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 5);
+    assert hg_check(&buf, n) == V_BACKGROUND;
+}
+
+test hg_a_truncated_frame_is_short {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 640, 480, 0);
+    assert hg_check(&buf, n - 3) == V_SHORT;
+    assert hg_check(&buf, 40) == V_SHORT;
+}
+
+test hg_a_frame_below_the_minimum_size_is_short {
+    var buf : [1000000]u8 = undefined;
+    const n : usize = hg_synth(&buf, 32, 24, 0);
+    assert hg_check(&buf, n) == V_SHORT;
+}
+
+test hg_text_that_is_not_a_ppm_is_refused {
+    assert hg_check("hello, this is not an image at all", 34) == V_NOT_PPM;
+    assert hg_check("P5\n160 120\n255\n", 15) == V_NOT_PPM;
+    assert hg_check("P6\n160 120\n65535\n", 17) == V_NOT_PPM;
+    assert hg_check("", 0) == V_NOT_PPM;
+}
+
+// ---- main: the libc part. The tests above never link libc; only main reaches it. ----
+
+pub var HG_BUF : [8388608]u8 = undefined;
+pub var HG_LIST : [65536]u8 = undefined;
+pub var HG_CMD : [512]u8 = undefined;
+pub var HG_PATH : [64]u8 = undefined;
+
+/// Copy the fixed text s into out at w; the new write position.
+pub fn hg_cat(out: []u8, w: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        out[w + i] = s[i];
+        i += 1;
+    }
+    return w + s.len;
+}
+
+/// The number the environment variable name holds; dflt when it is unset or not a number.
+fn hg_env(name: [*:0]const u8, dflt: usize) -> usize {
+    const p = std.c.getenv(name);
+    if (p == null) { return dflt; }
+    const s = p.?;
+    var v : usize = 0;
+    var i : usize = 0;
+    while (s[i] != 0) {
+        if (hg_is_digit(s[i]) == false) { return dflt; }
+        v = v * 10 + @as(usize, @intCast(s[i] - '0'));
+        i += 1;
+    }
+    if (i == 0) { return dflt; }
+    return v;
+}
+
+/// Run the shell command in HG_CMD[0..w]; true when it exited with 0.
+fn hg_sh(w: usize) -> bool {
+    HG_CMD[w] = 0;
+    var av : [4]usize = undefined;
+    av[0] = @intFromPtr("sh");
+    av[1] = @intFromPtr("-c");
+    av[2] = @intFromPtr(&HG_CMD);
+    av[3] = 0;
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.execve("/bin/sh", @ptrCast(&av), std.c.environ);
+        std.c._exit(127);
+    }
+    if (pid < 0) { return false; }
+    var st : c_int = 0;
+    _ = std.c.waitpid(pid, &st, 0);
+    return st == 0;
+}
+
+/// Read the file named by the NUL-terminated HG_PATH into out; the byte count, 0 when it cannot be read.
+fn hg_slurp(out: []u8) -> usize {
+    const fp = std.c.fopen(@ptrCast(&HG_PATH), "rb");
+    if (fp == null) { return 0; }
+    var n : usize = 0;
+    var r : usize = 1;
+    while (r > 0 and n < out.len) {
+        r = std.c.fread(out[n..out.len].ptr, 1, out.len - n, fp.?);
+        n += r;
+    }
+    _ = std.c.fclose(fp.?);
+    return n;
+}
+
+fn hg_path(name: []const u8, k: usize, ext: []const u8) -> void {
+    var w : usize = hg_cat(&HG_PATH, 0, name);
+    w = hg_put_num(&HG_PATH, w, k);
+    w = hg_cat(&HG_PATH, w, ext);
+    HG_PATH[w] = 0;
+}
+
+pub fn main() void {
+    const frames : usize = hg_env("HG_FRAMES", 3);
+    const tries : usize = hg_env("HG_TRIES", 12);
+    var dev : i32 = -1;
+    var t : usize = 0;
+    while (t < tries and dev < 0) {
+        var w : usize = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -f avfoundation -list_devices true -i \"\" 2> /tmp/hdmi_grab_list.txt");
+        _ = hg_sh(w);
+        w = hg_cat(&HG_PATH, 0, "/tmp/hdmi_grab_list.txt");
+        HG_PATH[w] = 0;
+        const n : usize = hg_slurp(&HG_LIST);
+        dev = hg_pick(&HG_LIST, n);
+        if (dev < 0) {
+            const v : usize = hg_video_count(&HG_LIST, n);
+            std.debug.print("hdmi_grab: NO CAPTURE DEVICE. macOS lists {d} video device(s), none a capture device (FaceTime, OBS Virtual, Capture screen and iPhone are skipped). The dongle is not UVC or not enumerated: replug it, check the port, and look in System Information under USB. Try {d}/{d}, again in 5 s.\n", .{ v, t + 1, tries });
+            w = hg_cat(&HG_CMD, 0, "sleep 5");
+            _ = hg_sh(w);
+        }
+        t += 1;
+    }
+    if (dev < 0) {
+        std.debug.print("hdmi_grab: gave up after {d} looks. Nothing was grabbed and nothing is claimed about the board.\n", .{tries});
+        std.c.exit(2);
+    }
+    std.debug.print("hdmi_grab: capture device index {d}\n", .{dev});
+    var fails : usize = 0;
+    var k : usize = 0;
+    while (k < frames) {
+        var w : usize = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -loglevel error -y -f avfoundation -i \"");
+        w = hg_put_num(&HG_CMD, w, @as(usize, @intCast(dev)));
+        w = hg_cat(&HG_CMD, w, ":none\" -frames:v 5 -update 1 /tmp/hdmi_grab_");
+        w = hg_put_num(&HG_CMD, w, k);
+        w = hg_cat(&HG_CMD, w, ".ppm");
+        if (hg_sh(w) == false) {
+            std.debug.print("frame {d}: FAIL ffmpeg could not grab from device {d}\n", .{ k, dev });
+            fails += 1;
+        } else {
+            hg_path("/tmp/hdmi_grab_", k, ".ppm");
+            const n : usize = hg_slurp(&HG_BUF);
+            const v : usize = hg_check(&HG_BUF, n);
+            if (v == V_PASS) {
+                std.debug.print("frame {d}: PASS {d}x{d}, the T27 OS title on black\n", .{ k, hg_width(&HG_BUF, n), hg_height(&HG_BUF, n) });
+            } else {
+                std.debug.print("frame {d}: FAIL verdict {d} (1 not a PPM, 2 short, 3 title wrong, 4 background lit) in /tmp/hdmi_grab_{d}.ppm\n", .{ k, v, k });
+                fails += 1;
+            }
+            w = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -loglevel error -y -i /tmp/hdmi_grab_");
+            w = hg_put_num(&HG_CMD, w, k);
+            w = hg_cat(&HG_CMD, w, ".ppm /tmp/hdmi_grab_");
+            w = hg_put_num(&HG_CMD, w, k);
+            w = hg_cat(&HG_CMD, w, ".png");
+            _ = hg_sh(w);
+        }
+        k += 1;
+    }
+    std.debug.print("hdmi_grab: {d} of {d} frames pass\n", .{ frames - fails, frames });
+    if (fails > 0) { std.c.exit(1); }
+}

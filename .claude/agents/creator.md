@@ -1,4 +1,5 @@
 ---
+model: sonnet
 description: Creator Agent - Generates code from specs, implements features
 color: "#3b82f6"
 ---

@@ -5775,20 +5775,6 @@ fn preview(base: &str) -> Result<()> {
     Ok(())
 }
 
-// Its only caller was the `check-now-freshness` row of `preview`, removed in #5935.
-#[allow(dead_code)]
-fn rev(root: &std::path::Path, r: &str) -> Result<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", r])
-        .current_dir(root)
-        .output()
-        .context("failed to invoke git rev-parse")?;
-    if !out.status.success() {
-        anyhow::bail!("git rev-parse {r} failed -- the revision is wrong, not the tree");
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// The pull request's title and body, if this branch has one open.
 fn pr_text(root: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("gh")

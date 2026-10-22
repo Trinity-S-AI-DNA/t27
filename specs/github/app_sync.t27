@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/github/app_sync.t27 -- GitHub App authentication and agent issue sync
+// App JWT -> installation token -> issue queue for the swarm.
+// Priority labels steer the Queen: P0/priority/critical, priority/high, ...
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module github-app-sync;
+
+// ============================================================================
+// Token lifetimes (GitHub App contract)
+//
+// An App JWT may live at most 10 minutes; an installation token defaults to
+// one hour. The spec keeps both windows as named constants so the sync loop
+// never hard-codes them.
+// ============================================================================
+
+pub const JWT_MAX_LIFETIME_S : u64 = 600;
+pub const JWT_CLOCK_SKEW_S : u64 = 60;
+pub const INSTALLATION_TOKEN_TTL_S : u64 = 3600;
+pub const SYNC_INTERVAL_S : u64 = 300;
+pub const TOKEN_REFRESH_MARGIN_S : u64 = 120;
+
+// ============================================================================
+// Auth states
+// ============================================================================
+
+pub const AUTH_UNAUTHENTICATED : u8 = 0;
+pub const AUTH_JWT_MINTED : u8 = 1;
+pub const AUTH_INSTALLATION_TOKEN : u8 = 2;
+pub const AUTH_EXPIRED : u8 = 3;
+
+// ============================================================================
+// Priority labels -> Queen order (0 = take first)
+// ============================================================================
+
+pub const PRIO_P0 : u8 = 0;
+pub const PRIO_HIGH : u8 = 1;
+pub const PRIO_MEDIUM : u8 = 2;
+pub const PRIO_LOW : u8 = 3;
+
+// Mirror of the Queen's ladder in specs/queen/task_analysis.t27. Cross-module
+// `use` does not emit identifiers into generated code yet (blocker #4298), so
+// the four levels are restated here and pinned by the invariant
+// sync_priority_levels_match_the_queen below. When #4298 lands, replace these
+// four with the import and keep the invariant.
+pub const QUEEN_CRITICAL : u8 = 0;
+pub const QUEEN_HIGH : u8 = 1;
+pub const QUEEN_NORMAL : u8 = 2;
+pub const QUEEN_LOW : u8 = 3;
+
+pub const P0_CONCURRENCY_CAP : u8 = 1;
+
+// ============================================================================
+// JWT window
+//
+// valid while: issued not in the future (beyond skew), not expired, and the
+// whole window fits GitHub's 600 s ceiling for App JWTs.
+// ============================================================================
+
+pub fn jwt_window_valid(now_s: u64, iat_s: u64, exp_s: u64) bool {
+    if (exp_s <= iat_s) {
+        return false;
+    }
+    if (exp_s - iat_s > JWT_MAX_LIFETIME_S) {
+        return false;
+    }
+    if (iat_s > now_s + JWT_CLOCK_SKEW_S) {
+        return false;
+    }
+    return now_s < exp_s;
+}
+
+// Is the installation token past its refresh margin?
+pub fn token_needs_refresh(now_s: u64, expires_at_s: u64) bool {
+    if (now_s + TOKEN_REFRESH_MARGIN_S >= expires_at_s) {
+        return true;
+    }
+    return false;
+}
+
+// Derive the auth state from the clock alone.
+pub fn auth_state(has_jwt: bool, has_token: bool, now_s: u64, iat_s: u64, jwt_exp_s: u64, token_exp_s: u64) u8 {
+    if (has_token) {
+        if (token_needs_refresh(now_s, token_exp_s)) {
+            return AUTH_EXPIRED;
+        }
+        return AUTH_INSTALLATION_TOKEN;
+    }
+    if (has_jwt) {
+        if (jwt_window_valid(now_s, iat_s, jwt_exp_s)) {
+            return AUTH_JWT_MINTED;
+        }
+        return AUTH_EXPIRED;
+    }
+    return AUTH_UNAUTHENTICATED;
+}
+
+// ============================================================================
+// Priority from labels
+//
+// The narrowest label wins: P0 beats high beats medium beats low, and an
+// unlabeled issue lands at medium -- the default the queue already assumes.
+// ============================================================================
+
+pub fn priority_from_labels(has_p0: bool, has_high: bool, has_medium: bool, has_low: bool) u8 {
+    if (has_p0) {
+        return PRIO_P0;
+    }
+    if (has_high) {
+        return PRIO_HIGH;
+    }
+    if (has_medium) {
+        return PRIO_MEDIUM;
+    }
+    if (has_low) {
+        return PRIO_LOW;
+    }
+    return PRIO_MEDIUM;
+}
+
+// P0 is capped at one in-flight issue: the cap is what keeps P0 meaningful.
+pub fn p0_slot_available(p0_in_flight: u8) bool {
+    return p0_in_flight < P0_CONCURRENCY_CAP;
+}
+
+// Does an issue enter the queue for an agent right now?
+pub fn issue_enqueued(priority: u8, p0_in_flight: u8) bool {
+    if (priority == PRIO_P0) {
+        return p0_slot_available(p0_in_flight);
+    }
+    return true;
+}
+
+// ============================================================================
+// Sync loop
+//
+// Periodic, never overlapping: the next sync opens once the interval has
+// elapsed since the last one.
+// ============================================================================
+
+pub fn sync_due(last_synced_s: u64, now_s: u64) bool {
+    if (now_s < last_synced_s) {
+        return false;
+    }
+    return now_s - last_synced_s >= SYNC_INTERVAL_S;
+}
+
+// An open issue syncs; a closed one leaves the queue.
+pub fn should_sync_issue(is_open: bool) bool {
+    return is_open;
+}
+
+// ============================================================================
+// Agent assignment
+//
+// One queue per agent lane; the issue lands on the least loaded lane whose
+// priority slot accepts it.
+// ============================================================================
+
+pub const LANE_COUNT : u8 = 3;
+
+pub fn assign_lane(priority: u8, lane0_load: u32, lane1_load: u32, lane2_load: u32) u8 {
+    if (priority == PRIO_P0) {
+        return 0;
+    }
+    if (lane0_load <= lane1_load and lane0_load <= lane2_load) {
+        return 0;
+    }
+    if (lane1_load <= lane2_load) {
+        return 1;
+    }
+    return 2;
+}
+
+// ============================================================================
+// Queue contract -- the four files under .trinity/queue/
+//
+// A synced issue lands in exactly one of pending / active / blocked / done.
+// The state is a pure function of the issue lifecycle: closed or merged means
+// done, blocked outranks started, started means active, everything else waits
+// in pending.
+// ============================================================================
+
+pub const QSTATE_PENDING : u8 = 0;
+pub const QSTATE_ACTIVE : u8 = 1;
+pub const QSTATE_BLOCKED : u8 = 2;
+pub const QSTATE_DONE : u8 = 3;
+
+pub fn queue_state_for(is_open: bool, started: bool, blocked: bool, merged: bool) u8 {
+    if (!is_open or merged) {
+        return QSTATE_DONE;
+    }
+    if (blocked) {
+        return QSTATE_BLOCKED;
+    }
+    if (started) {
+        return QSTATE_ACTIVE;
+    }
+    return QSTATE_PENDING;
+}
+
+// Does a synced issue open a fresh queue record (vs. updating one)?
+pub fn queue_record_is_new(last_state: u8) bool {
+    return last_state == QSTATE_DONE;
+}
+
+// ============================================================================
+// TDD: TESTS
+// ============================================================================
+
+test "jwt window opens, expires and respects the 600 s ceiling" {
+    assert jwt_window_valid(1000, 970, 1530);
+    assert !jwt_window_valid(1600, 970, 1530);
+    assert !jwt_window_valid(1000, 970, 1571);
+}
+
+test "jwt window rejects an inverted or future issuance" {
+    assert !jwt_window_valid(1000, 1100, 1050);
+    assert !jwt_window_valid(1000, 1200, 1700);
+}
+
+test "token refresh fires inside the margin and stays quiet outside it" {
+    assert token_needs_refresh(3600, 3660);
+    assert !token_needs_refresh(0, 3600);
+}
+
+test "auth state walks unauthenticated -> jwt -> token -> expired" {
+    assert auth_state(false, false, 0, 0, 0, 0) == AUTH_UNAUTHENTICATED;
+    assert auth_state(true, false, 1000, 970, 1530, 0) == AUTH_JWT_MINTED;
+    assert auth_state(true, true, 1000, 970, 1530, 4600) == AUTH_INSTALLATION_TOKEN;
+    assert auth_state(true, true, 5000, 970, 1530, 4600) == AUTH_EXPIRED;
+}
+
+test "narrowest label wins" {
+    assert priority_from_labels(true, true, true, true) == PRIO_P0;
+    assert priority_from_labels(false, true, false, true) == PRIO_HIGH;
+    assert priority_from_labels(false, false, true, false) == PRIO_MEDIUM;
+    assert priority_from_labels(false, false, false, true) == PRIO_LOW;
+    assert priority_from_labels(false, false, false, false) == PRIO_MEDIUM;
+}
+
+test "P0 admits exactly one in-flight issue" {
+    assert p0_slot_available(0);
+    assert !p0_slot_available(1);
+    assert issue_enqueued(PRIO_P0, 0);
+    assert !issue_enqueued(PRIO_P0, 1);
+    assert issue_enqueued(PRIO_LOW, 1);
+}
+
+test "sync becomes due exactly on the interval, never before, never backwards" {
+    assert !sync_due(0, 299);
+    assert sync_due(0, 300);
+    assert sync_due(100, 400);
+    assert !sync_due(500, 400);
+}
+
+test "open issues sync and closed ones drop out" {
+    assert should_sync_issue(true);
+    assert !should_sync_issue(false);
+}
+
+test "P0 pins lane zero and lower priorities take the least loaded lane" {
+    assert assign_lane(PRIO_P0, 9, 0, 0) == 0;
+    assert assign_lane(PRIO_HIGH, 5, 2, 3) == 1;
+    assert assign_lane(PRIO_LOW, 5, 5, 1) == 2;
+}
+
+test "queue state walks pending -> active -> blocked -> done" {
+    assert queue_state_for(true, false, false, false) == QSTATE_PENDING;
+    assert queue_state_for(true, true, false, false) == QSTATE_ACTIVE;
+    assert queue_state_for(true, true, true, false) == QSTATE_BLOCKED;
+    assert queue_state_for(false, false, false, false) == QSTATE_DONE;
+}
+
+test "closed or merged issues leave the queue regardless of the rest" {
+    assert queue_state_for(false, true, true, false) == QSTATE_DONE;
+    assert queue_state_for(true, true, true, true) == QSTATE_DONE;
+}
+
+test "blocked outranks started" {
+    assert queue_state_for(true, true, true, false) == QSTATE_BLOCKED;
+    assert queue_state_for(true, false, false, false) == QSTATE_PENDING;
+}
+
+test "a done record is the only one a new sync reopens" {
+    assert queue_record_is_new(QSTATE_DONE);
+    assert !queue_record_is_new(QSTATE_PENDING);
+    assert !queue_record_is_new(QSTATE_ACTIVE);
+    assert !queue_record_is_new(QSTATE_BLOCKED);
+}
+
+// ============================================================================
+// TDD: INVARIANTS
+// ============================================================================
+
+invariant jwt_ceiling_is_ten_minutes
+    assert JWT_MAX_LIFETIME_S == 600
+
+invariant installation_token_default_is_one_hour
+    assert INSTALLATION_TOKEN_TTL_S == 3600
+
+invariant refresh_margin_fits_inside_token_ttl
+    assert TOKEN_REFRESH_MARGIN_S < INSTALLATION_TOKEN_TTL_S
+
+invariant sync_interval_fits_inside_token_ttl
+    assert SYNC_INTERVAL_S < INSTALLATION_TOKEN_TTL_S
+
+invariant p0_cap_is_one
+    assert P0_CONCURRENCY_CAP == 1
+
+invariant priority_levels_are_ordered
+    assert PRIO_P0 < PRIO_HIGH and PRIO_HIGH < PRIO_MEDIUM and PRIO_MEDIUM < PRIO_LOW
+
+invariant auth_states_are_pairwise_distinct
+    assert AUTH_UNAUTHENTICATED != AUTH_JWT_MINTED and AUTH_JWT_MINTED != AUTH_INSTALLATION_TOKEN and AUTH_INSTALLATION_TOKEN != AUTH_EXPIRED
+
+invariant unauthenticated_is_the_zero_state
+    assert AUTH_UNAUTHENTICATED == 0
+
+invariant lane_count_is_three
+    assert LANE_COUNT == 3
+
+invariant queue_states_are_pairwise_distinct
+    assert QSTATE_PENDING != QSTATE_ACTIVE and QSTATE_ACTIVE != QSTATE_BLOCKED and QSTATE_BLOCKED != QSTATE_DONE
+
+invariant sync_priority_levels_match_the_queen
+    assert PRIO_P0 == QUEEN_CRITICAL and PRIO_HIGH == QUEEN_HIGH and PRIO_MEDIUM == QUEEN_NORMAL and PRIO_LOW == QUEEN_LOW
+
+invariant queen_ladder_is_sequential
+    assert QUEEN_CRITICAL < QUEEN_HIGH and QUEEN_HIGH < QUEEN_NORMAL and QUEEN_NORMAL < QUEEN_LOW
+
+// ============================================================================
+// TDD: BENCHES -- the sync loop runs these on every tick.
+// ============================================================================
+
+bench "jwt_window_valid" {
+    _ = jwt_window_valid(1000, 970, 1530);
+}
+
+bench "priority_from_labels" {
+    _ = priority_from_labels(false, true, false, false);
+}
+
+bench "sync_due" {
+    _ = sync_due(0, 301);
+}
+
+bench "assign_lane" {
+    _ = assign_lane(PRIO_HIGH, 4, 2, 6);
+}
+
+bench "queue_state_for" {
+    _ = queue_state_for(true, true, false, false);
+}

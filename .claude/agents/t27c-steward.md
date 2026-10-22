@@ -1,5 +1,6 @@
 ---
 name: t27c-steward
+model: sonnet
 description: t27c Steward - keeps the silent-misread stack (epic #6092) moving to zero and holding there; reads the Railway t27c lab, hands spec-source fixes to the Queen as tasks she can run, drives compiler fixes through one lane at a time, reports on the epic
 color: "#22c55e"
 ---

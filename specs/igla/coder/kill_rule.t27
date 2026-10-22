@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/igla/coder/kill_rule.t27
+// IGLA-Coder kill rule: CONTINUE, WARN or KILL at an eval point of a training run
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Why this exists. See preflight.t27: the kernels stay Python, the decisions are
+// .t27. A run that has diverged or is stuck at the initial loss burns GPU hours
+// until the queue timeout; a rule that stops it at the next eval point saves an
+// expected $8-15 on a 500M run (2026-10-18 study).
+//
+// The rule is deliberately lax. EXP-025 (hslm-experiment-ledger): thresholds tuned
+// too tight killed 72/72 runs of a wave and nobody noticed until the kills were
+// counted instead of the results. So:
+//   * the first eval only warns for a threshold breach (it never kills);
+//   * below MIN_KILL_TOKENS no threshold applies at all (warm-up and the 60-step
+//     smoke run sit far above any curve);
+//   * the loss curve bound is SLACK x the reference curve;
+//   * a test counts the kills on a healthy trace and asserts zero.
+// A non-finite number is not a threshold: it kills at any eval, first included.
+//
+// Reference curve: the 100m ternary run reached 0.4722 bits per byte at 10B tokens
+// (research/DECOMPOSED_ROADMAP_2026.md); its 2.5B-token ladder run reached 0.5248.
+// Between them bpb ~ T^-a with a = 0.076; this spec uses 5/64 = 0.078125, which
+// needs only square roots (sqrt six times is the 64th root) and lands at 0.5262 on
+// the 2.5B point (0.3 % high). The curve describes fully decayed runs; a WSD run in
+// its stable phase sits higher, which is why SLACK is 2.5 and not 1.1.
+//
+// Calibration data, all real (igla-coder-gpu results/report_2026-09-24.md and the
+// Hugging Face summary.json of the 10B pair): ladder endpoints 0.8901 / 0.7460 /
+// 0.6093 / 0.5248 / 0.4722 for 13m..100m, the 25m ternary LR sweep (0.7460 healthy,
+// 0.8170 at x2, 1.6257 at x4 = a run that diverged), the fp100m final 0.4217, and
+// the train.py fine-tune log c_infer/t27_tuned/log.jsonl. The per-eval trace of the
+// 10B pair did not survive (runs/ is not committed): the "healthy trace" test below
+// uses an assumed plateau factor of 1.3 over the curve, which is stated, not measured.
+//
+// Verdict codes: 0 CONTINUE, 1 WARN (a threshold breach on the first eval), 2 KILL.
+// Reason codes:  0 none, 1 non-finite, 2 grad_norm spike, 3 val_bpb above the curve.
+
+module igla-coder-kill-rule;
+use base::types;
+
+// ============================================================================
+// 1. Codes and constants
+// ============================================================================
+
+pub const CONTINUE        : i32 = 0;
+pub const WARN            : i32 = 1;
+pub const KILL            : i32 = 2;
+
+pub const REASON_NONE     : i32 = 0;
+pub const REASON_NONFINITE: i32 = 1;
+pub const REASON_GRAD     : i32 = 2;
+pub const REASON_BPB      : i32 = 3;
+
+// Anchor: 100m ternary at 10B tokens.
+pub const BPB_AT_10B      : f64 = 0.4722;
+pub const TOKENS_AT_10B   : f64 = 10000000000.0;
+// Healthy grad norms: 1.04 .. 0.05 (smoke) and 0.5 .. 0.7 (fine-tune); the clip is 1.0.
+pub const GRAD_SPIKE      : f64 = 100.0;
+pub const SLACK           : f64 = 2.5;
+// 1000 steps of the 524288-token batch: well past the 381-step warm-up.
+pub const MIN_KILL_TOKENS : f64 = 500000000.0;
+
+// ============================================================================
+// 2. The reference curve
+// ============================================================================
+
+// NaN is the one value not equal to itself; inf - inf is NaN
+fn is_finite(x: f64) -> bool {
+    return x == x and (x - x) == (x - x);
+}
+
+// a / b at run time, where IEEE gives NaN for 0 / 0 and inf for 1 / 0
+fn ratio(a: f64, b: f64) -> f64 {
+    return a / b;
+}
+
+// x^(5/64): the 64th root by six square roots, then the fifth power.
+fn pow_5_64(x: f64) -> f64 {
+    const r = sqrt(sqrt(sqrt(sqrt(sqrt(sqrt(x))))));
+    return r * r * r * r * r;
+}
+
+// Fully decayed 100m ternary bits per byte after `tokens` tokens.
+pub fn curve_bpb(tokens: f64) -> f64 {
+    return BPB_AT_10B * pow_5_64(TOKENS_AT_10B / tokens);
+}
+
+// The most val_bpb a run may show at `tokens` before it counts as off the curve.
+pub fn bpb_bound(tokens: f64) -> f64 {
+    return SLACK * curve_bpb(tokens);
+}
+
+// ============================================================================
+// 3. The decision
+// ============================================================================
+
+pub fn kill_reason(step: i64, batch_tokens: i64, loss: f64, grad_norm: f64, val_bpb: f64) -> i32 {
+    if (!is_finite(loss) or !is_finite(grad_norm) or !is_finite(val_bpb)) {
+        return REASON_NONFINITE;
+    }
+    const tokens : f64 = (step as f64) * (batch_tokens as f64);
+    if (!(tokens >= MIN_KILL_TOKENS)) {
+        return REASON_NONE;
+    }
+    if (grad_norm > GRAD_SPIKE) {
+        return REASON_GRAD;
+    }
+    if (val_bpb > bpb_bound(tokens)) {
+        return REASON_BPB;
+    }
+    return REASON_NONE;
+}
+
+// eval_idx counts the evals of this run, first one is 1.
+pub fn verdict(step: i64, batch_tokens: i64, eval_idx: i32, loss: f64, grad_norm: f64, val_bpb: f64) -> i32 {
+    const why = kill_reason(step, batch_tokens, loss, grad_norm, val_bpb);
+    if (why == REASON_NONE) {
+        return CONTINUE;
+    }
+    if (why == REASON_NONFINITE) {
+        return KILL;
+    }
+    if (eval_idx <= 1) {
+        return WARN;
+    }
+    return KILL;
+}
+
+// ============================================================================
+// 4. Tests
+// ============================================================================
+
+// The curve hits its anchors: exactly 0.4722 at 10B, 0.5262 at 2.5B (real: 0.5248).
+test curve_anchors
+    given at_10b = curve_bpb(10000000000.0)
+    when at_2_5b = curve_bpb(2500000000.0)
+    then at_10b > 0.472199 and at_10b < 0.472201 and at_2_5b > 0.5248 and at_2_5b < 0.5300
+
+// The bound at the first kill-eligible points, 100m pair evals at 1B, 2B tokens.
+test bound_values
+    given b1 = bpb_bound(1000000000.0)
+    when b2 = bpb_bound(2000000000.0)
+    then b1 > 1.38 and b1 < 1.44 and b2 > 1.31 and b2 < 1.37
+
+// ---- negative controls: healthy runs are never killed ------------------------
+
+// The real finals of the 10B pair, as the last eval (step 19073, eval 10 of 10).
+test healthy_finals_continue
+    given tern = verdict(19073, 524288, 10, 1.2718, 0.5, 0.47219)
+    when fp = verdict(19073, 524288, 10, 1.1354, 0.5, 0.42166)
+    then tern == 0 and fp == 0
+
+// The real ladder endpoints (ternary arm), each at its own token count, eval 3:
+// 25m 0.5B 0.7460, 52m 1B 0.6093, 100m 2.5B 0.5248. 13m (0.25B) is below the gate.
+test healthy_ladder_continue
+    given m25 = verdict(1908, 262144, 3, 1.4, 0.6, 0.7460)
+    when m52 = verdict(1907, 524288, 3, 1.2, 0.6, 0.6093)
+    then m25 == 0 and m52 == 0 and verdict(4768, 524288, 3, 1.1, 0.6, 0.5248) == 0 and verdict(954, 262144, 3, 1.6, 0.6, 0.8901) == 0
+
+// The LR sweep runs that were healthy at 25m / 0.5B: x0.25 .. x2.
+test healthy_lr_sweep_continue
+    given a = verdict(1908, 262144, 2, 1.4, 0.6, 0.7623)
+    when b = verdict(1908, 262144, 2, 1.4, 0.6, 0.7549)
+    then a == 0 and b == 0 and verdict(1908, 262144, 2, 1.5, 0.6, 0.8170) == 0
+
+// The real train.py fine-tune log (c_infer/t27_tuned/log.jsonl): five eval records at
+// steps 84, 168, 252, 336, 337 of a 65536-token batch, grad_norm 0.5 .. 0.7. Far below
+// MIN_KILL_TOKENS, so every one continues.
+test healthy_finetune_log_continues
+    given a = verdict(84, 65536, 1, 1.3949, 0.72, 0.7558)
+    when b = verdict(168, 65536, 2, 1.4230, 0.58, 0.7710)
+    then a == 0 and b == 0 and verdict(252, 65536, 3, 1.2376, 0.49, 0.6706) == 0 and verdict(336, 65536, 4, 1.1276, 0.68, 0.6110) == 0 and verdict(337, 65536, 5, 1.1268, 0.68, 0.6105) == 0
+
+// The 60-step smoke run of the 100m ternary model (real: loss 10.38, grad_norm 0.05,
+// an untrained model at bpb ~3.85) evals every 10 steps and must never be killed:
+// it stops by its own max_steps (exit 3).
+test smoke_run_is_not_killed
+    given a = verdict(60, 524288, 6, 10.3811, 0.05, 3.85)
+    when b = verdict(20, 524288, 2, 10.5254, 1.04, 3.9)
+    then a == 0 and b == 0
+
+// A healthy-shaped trace at an ASSUMED plateau factor of 1.3 over the curve (a WSD run
+// in its stable phase sits above a decayed one): ten evals of 1B tokens, zero kills.
+// EXP-025: count the kills on a healthy run. The 1.3 is not measured.
+fn healthy_kills() -> i32 {
+    var k : i32 = 1;
+    var kills : i32 = 0;
+    while (k <= 10) {
+        const step : i64 = (k as i64) * 1907;
+        const bpb : f64 = 1.3 * curve_bpb((step as f64) * 524288.0);
+        if (verdict(step, 524288, k, 3.0, 0.5, bpb) == KILL) {
+            kills = kills + 1;
+        }
+        k = k + 1;
+    }
+    return kills;
+}
+
+test healthy_trace_has_no_kills
+    given kills = healthy_kills()
+    then kills == 0
+
+// ---- the runs it must stop ---------------------------------------------------
+
+// The 25m LR x4 run that diverged: 1.6257 at 0.5B tokens. First eval warns, second kills.
+test lr_x4_run_is_killed
+    given first = verdict(1908, 262144, 1, 3.0, 0.9, 1.6257)
+    when second = verdict(1908, 262144, 2, 3.0, 0.9, 1.6257)
+    then first == 1 and second == 2 and kill_reason(1908, 262144, 3.0, 0.9, 1.6257) == 3
+
+// Stuck at the initial loss: real init is loss 10.4, bpb 3.85. At 2B tokens.
+test stuck_loss_run_is_killed
+    given a = verdict(3815, 524288, 2, 10.4, 0.05, 3.85)
+    when b = verdict(3815, 524288, 1, 10.4, 0.05, 3.85)
+    then a == 2 and b == 1
+
+// A NaN loss kills even on the first eval, at any token count (not a threshold).
+test nan_loss_is_killed_at_once
+    given a = verdict(100, 524288, 1, ratio(0.0, 0.0), 0.5, 0.9)
+    when b = verdict(3815, 524288, 2, 2.0, ratio(0.0, 0.0), 0.9)
+    then a == 2 and b == 2 and verdict(3815, 524288, 2, 2.0, 0.5, ratio(1.0, 0.0)) == 2 and kill_reason(100, 524288, ratio(0.0, 0.0), 0.5, 0.9) == 1
+
+// A grad_norm spike: healthy is <= 1.04, the rule fires above 100.
+test grad_spike_is_killed
+    given a = verdict(3815, 524288, 3, 2.0, 400.0, 0.9)
+    when b = verdict(3815, 524288, 1, 2.0, 400.0, 0.9)
+    then a == 2 and b == 1 and kill_reason(3815, 524288, 2.0, 400.0, 0.9) == 2 and verdict(3815, 524288, 3, 2.0, 99.0, 0.9) == 0
+
+invariant kill_slack_is_lax
+    assert SLACK >= 2.0 and GRAD_SPIKE >= 10.0 and MIN_KILL_TOKENS >= 500000000.0
+
+invariant kill_codes_are_distinct
+    assert CONTINUE == 0 and WARN != KILL and KILL == 2 and REASON_GRAD != REASON_BPB

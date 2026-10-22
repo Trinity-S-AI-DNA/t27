@@ -1,4 +1,5 @@
 ---
+model: sonnet
 description: Learner Agent - Researches patterns, discovers insights, builds knowledge base
 color: "#8b5cf6"
 ---

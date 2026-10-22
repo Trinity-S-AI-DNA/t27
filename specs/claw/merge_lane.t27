@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/merge_lane.t27 -- is the merger starved? Read from its own runs (#10393).
+; --
+; TRI CLAW's merger is the workflow "Auto Merge Ready PRs". Its merge job runs on ubuntu-latest,
+; the same pool every pull_request job waits for. On 2026-10-18 at 20:22 UTC, 34 of its runs were
+; queued, and the oldest was 6598 s old. Run 39158684665 was created at 19:25 and its job got a runner
+; at 20:22. Of its last 200 completed runs, 22 succeeded, 88 were skipped, and 90 were cancelled by
+; its concurrency groups. A green, reviewed PR therefore waits about an hour for a runner, not for review.
+; The merge services built for this (GitHub merge queue, Mergify, Kodiak, bors, Aviator) decide outside
+; the CI runner pool, so merging never waits behind CI. This module only measures; it moves nothing.
+; --
+; Input: one row per merger run, status TAB conclusion TAB age.
+;   status      queued, waiting, requested, pending (all open and not started), in_progress, completed
+;   conclusion  `-` unless completed; when completed, success, skipped, cancelled or another
+;               GitHub conclusion (failure, neutral, timed_out, action_required, stale,
+;               startup_failure)
+;   age         whole seconds since the run was created, 0..432000 (queue_cost's MAX_SECS)
+; Output, merge_plan:
+;     G TAB merger: <q> queued, <r> running, <s> success, <k> skipped, <c> cancelled, <o> other,
+;                   <b> unreadable; oldest open <a> s
+;     F TAB merger TAB idle | flowing | starved | unknown
+; starved: an open run is older than ML_STARVE_SECS. A known starve wins over an unreadable row.
+; unknown: not starved, and some row is unreadable. idle: no open run. flowing: otherwise.
+; The honest limit: age is creation age. A queued run's age is how long it has waited. An
+; in_progress run's age also includes the time it has run, and a merge job takes under a minute.
+; --
+; Yield: does a merger run merge anything? (tick 14, 2026-10-18)
+; Only 1 of the last 40 merges came through the merger workflow; the other 39 had GitHub's
+; native auto-merge enabled (auto_squash_enabled in the PR timeline). The last 10 successful merger
+; runs merged 0 PRs. 9 of them were workflow_run runs that each took a runner to log "no
+; bee-reviewed label" for one PR. The schedule sweep skipped 6 old PRs whose label came from the wrong hand.
+; Input: one row per merger run, event TAB merged TAB no_label TAB other. merged counts the PRs it
+; merged. no_label counts PRs it skipped for a missing bee-reviewed label. other counts PRs it
+; skipped for any other reason. event is workflow_run, schedule, pull_request_target or
+; workflow_dispatch.
+; Output, yield_plan:
+;     Y TAB merger yield: <m> PRs merged in <r> runs; <e> merged nothing, <l> of them only for a
+;                         missing label; <b> unreadable
+;     F TAB merger-yield TAB zero | some | unknown | none
+; A known merge wins over an unreadable row; with no merge, an unreadable row makes it unknown.
+; --
+; Share: how much of the whole queue is the merger? (tick 15, 2026-10-19)
+; At 2026-10-19 the repository had 209 queued runs. 23 of them were the merger's, 22 of those
+; workflow_run runs. That is 11% of the queue, spent on a workflow whose last 10 runs merged nothing.
+; The merger's runs are the largest single group of queued runs, ahead of every PR check.
+; Input: one row per queued run in the repository, workflow TAB event. Both fields are non-empty,
+; and event is lower-case letters and `_` only.
+; Output, share_plan:
+;     S TAB merger share: <m> of <t> queued runs are the merger's, <f> of them workflow_run;
+;                         <b> unreadable
+;     F TAB merger-share TAB low | high | unknown | none
+; high: merger runs are at least MS_SHARE_PCT % of all rows, counting each unreadable row as
+; somebody else's. So a known high wins over an unreadable row. unknown: not high, and some row is
+; unreadable. none: no rows.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawMergeLane;
+
+use claw::text;
+use claw::queue_cost;
+use claw::check_state;
+
+pub const ML_QUEUED : usize = 0;
+pub const ML_RUNNING : usize = 1;
+pub const ML_SUCCESS : usize = 2;
+pub const ML_SKIPPED : usize = 3;
+pub const ML_CANCELLED : usize = 4;
+pub const ML_OTHER : usize = 5;
+pub const ML_BAD : usize = 6;
+/// The slot after the classes holds the oldest open age, in seconds.
+pub const ML_OLDEST : usize = 7;
+pub const ML_SLOTS : usize = 8;
+
+pub const ML_MAX_ROWS : u32 = 4096;
+/// Thirty minutes: the backstop sweep runs every twenty, so an older open run is not a sweep gap.
+pub const ML_STARVE_SECS : u32 = 1800;
+
+pub const ML_IDLE : u8 = 0;
+pub const ML_FLOWING : u8 = 1;
+pub const ML_STARVED : u8 = 2;
+pub const ML_UNKNOWN : u8 = 3;
+
+pub const ML_HEAD : str = "G\tmerger: ";
+pub const ML_HEAD_LEN : usize = 10;
+pub const ML_COUNT_TEXTS : [7]str = [" queued, ", " running, ", " success, ", " skipped, ", " cancelled, ", " other, ", " unreadable; oldest open "];
+pub const ML_COUNT_LENS : [7]usize = [9, 10, 10, 10, 12, 8, 25];
+pub const ML_FLAG_HEAD : str = "F\tmerger\t";
+pub const ML_FLAG_HEAD_LEN : usize = 9;
+pub const ML_FLAG_TEXTS : [4]str = ["idle\n", "flowing\n", "starved\n", "unknown\n"];
+pub const ML_FLAG_LENS : [4]usize = [5, 8, 8, 8];
+
+/// The class of one row from its status and conclusion ranges, or ML_BAD.
+pub fn ml_class(raw : []const u8, f : []const usize) -> usize {
+    const dash : bool = qc_range_is(raw, f[2], f[3], "-", 1);
+    const open : bool = qc_range_is(raw, f[0], f[1], "queued", 6) or qc_range_is(raw, f[0], f[1], "waiting", 7) or qc_range_is(raw, f[0], f[1], "requested", 9) or qc_range_is(raw, f[0], f[1], "pending", 7);
+    if (open) {
+        if (dash) { return ML_QUEUED; }
+        return ML_BAD;
+    }
+    if (qc_range_is(raw, f[0], f[1], "in_progress", 11)) {
+        if (dash) { return ML_RUNNING; }
+        return ML_BAD;
+    }
+    if (qc_range_is(raw, f[0], f[1], "completed", 9) == false) { return ML_BAD; }
+    if (qc_range_is(raw, f[2], f[3], "success", 7)) { return ML_SUCCESS; }
+    if (qc_range_is(raw, f[2], f[3], "skipped", 7)) { return ML_SKIPPED; }
+    if (qc_range_is(raw, f[2], f[3], "cancelled", 9)) { return ML_CANCELLED; }
+    const other : bool = qc_range_is(raw, f[2], f[3], "failure", 7) or qc_range_is(raw, f[2], f[3], "neutral", 7) or qc_range_is(raw, f[2], f[3], "timed_out", 9) or qc_range_is(raw, f[2], f[3], "action_required", 15) or qc_range_is(raw, f[2], f[3], "stale", 5) or qc_range_is(raw, f[2], f[3], "startup_failure", 15);
+    if (other) { return ML_OTHER; }
+    return ML_BAD;
+}
+
+/// Rows by class in st[ML_QUEUED..ML_BAD]; the oldest open age in st[ML_OLDEST]. Returns the
+/// number of rows.
+pub fn ml_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [6]usize = undefined;
+    var k : usize = 0;
+    while (k < ML_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var cls : usize = ML_BAD;
+            var age : i32 = -1;
+            if (rows < ML_MAX_ROWS and qc_split(raw, ls, le, &f, 3)) {
+                age = qc_secs(raw, f[4], f[5]);
+                if (age >= 0) { cls = ml_class(raw, &f); }
+            }
+            st[cls] += 1;
+            const is_open : bool = cls == ML_QUEUED or cls == ML_RUNNING;
+            if (is_open and (age as u32) > st[ML_OLDEST]) { st[ML_OLDEST] = age as u32; }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The verdict from the counts: a known starve wins over an unreadable row.
+pub fn ml_verdict_of(st : []const u32) -> u8 {
+    if (st[ML_OLDEST] > ML_STARVE_SECS) { return ML_STARVED; }
+    if (st[ML_BAD] > 0) { return ML_UNKNOWN; }
+    if (st[ML_QUEUED] + st[ML_RUNNING] == 0) { return ML_IDLE; }
+    return ML_FLOWING;
+}
+
+pub fn ml_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [8]u32 = undefined;
+    const rows : u32 = ml_counts(raw, n, &st);
+    if (rows == 0) { return ML_IDLE; }
+    return ml_verdict_of(&st);
+}
+
+/// The two output lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn merge_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [8]u32 = undefined;
+    const rows : u32 = ml_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, ML_HEAD, ML_HEAD_LEN);
+    var k : usize = 0;
+    while (k < 7) {
+        w = put_count(out, cap, w, st[k]);
+        w = put_str(out, cap, w, ML_COUNT_TEXTS[k], ML_COUNT_LENS[k]);
+        k += 1;
+    }
+    w = put_count(out, cap, w, st[ML_OLDEST]);
+    w = put_str(out, cap, w, " s\n", 3);
+    w = put_str(out, cap, w, ML_FLAG_HEAD, ML_FLAG_HEAD_LEN);
+    var v : usize = ML_IDLE as usize;
+    if (rows > 0) { v = ml_verdict_of(&st) as usize; }
+    return put_str(out, cap, w, ML_FLAG_TEXTS[v], ML_FLAG_LENS[v]);
+}
+
+// ---- yield ----
+
+pub const MY_RUNS : usize = 0;
+pub const MY_MERGED : usize = 1;
+pub const MY_EMPTY : usize = 2;
+pub const MY_LABEL_ONLY : usize = 3;
+pub const MY_BAD : usize = 4;
+pub const MY_SLOTS : usize = 5;
+
+pub const MY_ZERO : u8 = 0;
+pub const MY_SOME : u8 = 1;
+pub const MY_UNKNOWN : u8 = 2;
+pub const MY_NONE : u8 = 3;
+
+pub const MY_HEAD : str = "Y\tmerger yield: ";
+pub const MY_HEAD_LEN : usize = 16;
+pub const MY_TEXTS : [5]str = [" PRs merged in ", " runs; ", " merged nothing, ", " of them only for a missing label; ", " unreadable\n"];
+pub const MY_LENS : [5]usize = [15, 7, 17, 35, 12];
+pub const MY_FLAG_HEAD : str = "F\tmerger-yield\t";
+pub const MY_FLAG_HEAD_LEN : usize = 15;
+pub const MY_FLAG_TEXTS : [4]str = ["zero\n", "some\n", "unknown\n", "none\n"];
+pub const MY_FLAG_LENS : [4]usize = [5, 5, 8, 5];
+
+/// raw[s..e) is an event that starts the merger.
+pub fn my_event_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, "workflow_run", 12) or qc_range_is(raw, s, e, "schedule", 8) or qc_range_is(raw, s, e, "pull_request_target", 19) or qc_range_is(raw, s, e, "workflow_dispatch", 17);
+}
+
+/// Yield counts in st[MY_RUNS..MY_BAD]. Returns the number of rows.
+pub fn my_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [8]usize = undefined;
+    var k : usize = 0;
+    while (k < MY_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var ok : bool = false;
+            if (rows < ML_MAX_ROWS and qc_split(raw, ls, le, &f, 4)) {
+                const m : i32 = qc_secs(raw, f[2], f[3]);
+                const nl : i32 = qc_secs(raw, f[4], f[5]);
+                const ot : i32 = qc_secs(raw, f[6], f[7]);
+                if (my_event_ok(raw, f[0], f[1]) and m >= 0 and nl >= 0 and ot >= 0) {
+                    ok = true;
+                    st[MY_RUNS] += 1;
+                    st[MY_MERGED] += m as u32;
+                    if (m == 0) {
+                        st[MY_EMPTY] += 1;
+                        if (nl > 0 and ot == 0) { st[MY_LABEL_ONLY] += 1; }
+                    }
+                }
+            }
+            if (ok == false) { st[MY_BAD] += 1; }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The yield verdict from the counts: a known merge wins over an unreadable row.
+pub fn my_verdict_of(st : []const u32) -> u8 {
+    if (st[MY_MERGED] > 0) { return MY_SOME; }
+    if (st[MY_BAD] > 0) { return MY_UNKNOWN; }
+    if (st[MY_RUNS] == 0) { return MY_NONE; }
+    return MY_ZERO;
+}
+
+pub fn my_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [5]u32 = undefined;
+    const rows : u32 = my_counts(raw, n, &st);
+    if (rows == 0) { return MY_NONE; }
+    return my_verdict_of(&st);
+}
+
+/// The two yield lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn yield_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [5]u32 = undefined;
+    const rows : u32 = my_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, MY_HEAD, MY_HEAD_LEN);
+    w = put_count(out, cap, w, st[MY_MERGED]);
+    w = put_str(out, cap, w, MY_TEXTS[0], MY_LENS[0]);
+    w = put_count(out, cap, w, st[MY_RUNS]);
+    w = put_str(out, cap, w, MY_TEXTS[1], MY_LENS[1]);
+    w = put_count(out, cap, w, st[MY_EMPTY]);
+    w = put_str(out, cap, w, MY_TEXTS[2], MY_LENS[2]);
+    w = put_count(out, cap, w, st[MY_LABEL_ONLY]);
+    w = put_str(out, cap, w, MY_TEXTS[3], MY_LENS[3]);
+    w = put_count(out, cap, w, st[MY_BAD]);
+    w = put_str(out, cap, w, MY_TEXTS[4], MY_LENS[4]);
+    w = put_str(out, cap, w, MY_FLAG_HEAD, MY_FLAG_HEAD_LEN);
+    var v : usize = MY_NONE as usize;
+    if (rows > 0) { v = my_verdict_of(&st) as usize; }
+    return put_str(out, cap, w, MY_FLAG_TEXTS[v], MY_FLAG_LENS[v]);
+}
+
+// ---- share: the merger's part of the whole queue ----
+
+/// The merger's workflow name, as GitHub lists it.
+pub const MS_MERGER : str = "Auto Merge Ready PRs";
+pub const MS_MERGER_LEN : usize = 20;
+/// At this share or more of the queued runs, the merger is a high cost.
+pub const MS_SHARE_PCT : u32 = 10;
+
+pub const MS_ROWS : usize = 0;
+pub const MS_MERGER_ROWS : usize = 1;
+pub const MS_FOLLOW : usize = 2;
+pub const MS_BAD : usize = 3;
+pub const MS_SLOTS : usize = 4;
+
+pub const MS_LOW : u8 = 0;
+pub const MS_HIGH : u8 = 1;
+pub const MS_UNKNOWN : u8 = 2;
+pub const MS_NONE : u8 = 3;
+
+pub const MS_HEAD : str = "S\tmerger share: ";
+pub const MS_HEAD_LEN : usize = 16;
+pub const MS_TEXTS : [4]str = [" of ", " queued runs are the merger's, ", " of them workflow_run; ", " unreadable\n"];
+pub const MS_LENS : [4]usize = [4, 31, 23, 12];
+pub const MS_FLAG_HEAD : str = "F\tmerger-share\t";
+pub const MS_FLAG_HEAD_LEN : usize = 15;
+pub const MS_FLAG_TEXTS : [4]str = ["low\n", "high\n", "unknown\n", "none\n"];
+pub const MS_FLAG_LENS : [4]usize = [4, 5, 8, 5];
+
+/// raw[s..e) is a non-empty event name: lower-case letters and `_` only.
+pub fn ms_event_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e <= s) { return false; }
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = raw[i];
+        if ((b >= 'a' and b <= 'z') == false and b != '_') { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Share counts in st[MS_ROWS..MS_BAD]. Returns the number of rows.
+pub fn ms_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [4]usize = undefined;
+    var k : usize = 0;
+    while (k < MS_SLOTS) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var ok : bool = false;
+            if (rows < ML_MAX_ROWS and qc_split(raw, ls, le, &f, 2)) {
+                if (f[1] > f[0] and ms_event_ok(raw, f[2], f[3])) {
+                    ok = true;
+                    st[MS_ROWS] += 1;
+                    if (qc_range_is(raw, f[0], f[1], MS_MERGER, MS_MERGER_LEN)) {
+                        st[MS_MERGER_ROWS] += 1;
+                        if (qc_range_is(raw, f[2], f[3], "workflow_run", 12)) { st[MS_FOLLOW] += 1; }
+                    }
+                }
+            }
+            if (ok == false) { st[MS_BAD] += 1; }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The share verdict from the counts. An unreadable row counts as somebody else's run, so a high
+/// share that survives that is known.
+pub fn ms_verdict_of(st : []const u32) -> u8 {
+    const total : u32 = st[MS_ROWS] + st[MS_BAD];
+    if (total == 0) { return MS_NONE; }
+    if (st[MS_MERGER_ROWS] * 100 >= MS_SHARE_PCT * total) { return MS_HIGH; }
+    if (st[MS_BAD] > 0) { return MS_UNKNOWN; }
+    return MS_LOW;
+}
+
+pub fn ms_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [4]u32 = undefined;
+    if (ms_counts(raw, n, &st) == 0) { return MS_NONE; }
+    return ms_verdict_of(&st);
+}
+
+/// The two share lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn share_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [4]u32 = undefined;
+    const rows : u32 = ms_counts(raw, n, &st);
+    var w : usize = put_str(out, cap, 0, MS_HEAD, MS_HEAD_LEN);
+    w = put_count(out, cap, w, st[MS_MERGER_ROWS]);
+    w = put_str(out, cap, w, MS_TEXTS[0], MS_LENS[0]);
+    w = put_count(out, cap, w, rows);
+    w = put_str(out, cap, w, MS_TEXTS[1], MS_LENS[1]);
+    w = put_count(out, cap, w, st[MS_FOLLOW]);
+    w = put_str(out, cap, w, MS_TEXTS[2], MS_LENS[2]);
+    w = put_count(out, cap, w, st[MS_BAD]);
+    w = put_str(out, cap, w, MS_TEXTS[3], MS_LENS[3]);
+    w = put_str(out, cap, w, MS_FLAG_HEAD, MS_FLAG_HEAD_LEN);
+    const v : usize = ms_verdict_of(&st) as usize;
+    return put_str(out, cap, w, MS_FLAG_TEXTS[v], MS_FLAG_LENS[v]);
+}
+
+// ---- test helpers ----
+
+/// The merger on 2026-10-18 at 20:22 UTC, in miniature: the oldest queued run (6598 s), the
+/// in_progress run created at 19:25 (3425 s), and one each of success, skipped and cancelled.
+fn t_starved(dst : []u8, cap : usize) -> usize {
+    var x : usize = put_str(dst, cap, 0, "queued\t-\t6598\n", 14);
+    x = put_str(dst, cap, x, "in_progress\t-\t3425\n", 19);
+    x = put_str(dst, cap, x, "completed\tsuccess\t120\n", 22);
+    x = put_str(dst, cap, x, "completed\tskipped\t7\n", 20);
+    return put_str(dst, cap, x, "completed\tcancelled\t900\n", 24);
+}
+
+fn t_verdict2(a : str, al : usize, b : str, bl : usize) -> u8 {
+    var raw : [96]u8 = undefined;
+    var x : usize = put_str(&raw, 96, 0, a, al);
+    x = put_str(&raw, 96, x, b, bl);
+    return ml_verdict(&raw, x);
+}
+
+// ---- tests ----
+
+test the_merger_on_2026_10_18_is_starved {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    assert n == 99;
+    var st : [8]u32 = undefined;
+    assert ml_counts(&raw, n, &st) == 5;
+    assert st[ML_QUEUED] == 1;
+    assert st[ML_RUNNING] == 1;
+    assert st[ML_SUCCESS] == 1;
+    assert st[ML_SKIPPED] == 1;
+    assert st[ML_CANCELLED] == 1;
+    assert st[ML_OTHER] == 0;
+    assert st[ML_BAD] == 0;
+    assert st[ML_OLDEST] == 6598;
+    assert ml_verdict(&raw, n) == ML_STARVED;
+}
+
+test the_starved_plan_text {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    var out : [160]u8 = undefined;
+    const w : usize = merge_plan(&raw, n, &out, 160);
+    assert w == 125;
+    assert buf_has(&out, w, "G\tmerger: 1 queued, 1 running, 1 success, 1 skipped, 1 cancelled, 0 other, 0 unreadable; oldest open 6598 s\n", 108) == true;
+    assert buf_has(&out, w, "F\tmerger\tstarved\n", 17) == true;
+}
+
+test the_age_of_a_completed_run_does_not_starve {
+    assert t_verdict2("completed\tsuccess\t9000\n", 23, "queued\t-\t60\n", 12) == ML_FLOWING;
+    assert t_verdict2("completed\tcancelled\t9000\n", 25, "completed\tskipped\t9000\n", 23) == ML_IDLE;
+}
+
+test the_limit_is_strict {
+    assert t_verdict2("queued\t-\t1800\n", 14, "in_progress\t-\t5\n", 16) == ML_FLOWING;
+    assert t_verdict2("queued\t-\t1801\n", 14, "in_progress\t-\t5\n", 16) == ML_STARVED;
+    assert t_verdict2("pending\t-\t5\n", 12, "in_progress\t-\t1801\n", 19) == ML_STARVED;
+}
+
+test an_open_run_needs_a_dash_and_a_completed_run_needs_a_conclusion {
+    assert t_verdict2("queued\tsuccess\t5\n", 17, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("completed\t-\t5\n", 14, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("in_progress\tsuccess\t5\n", 22, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("completed\tfailure\t5\n", 20, "completed\ttimed_out\t5\n", 22) == ML_IDLE;
+}
+
+test an_unreadable_row_makes_it_unknown_and_a_known_starve_still_wins {
+    assert t_verdict2("queued\t-\t9x\n", 12, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("queued\t-\t432001\n", 16, "queued\t-\t5\n", 11) == ML_UNKNOWN;
+    assert t_verdict2("Queued\t-\t5\n", 11, "queued\t-\t2000\n", 14) == ML_STARVED;
+    assert t_verdict2("queued\t-\n", 9, "queued\t-\t2000\n", 14) == ML_STARVED;
+}
+
+test no_rows_is_idle {
+    assert ml_verdict("", 0) == ML_IDLE;
+    var out : [160]u8 = undefined;
+    const w : usize = merge_plan("", 0, &out, 160);
+    assert w == 119;
+    assert buf_has(&out, w, "F\tmerger\tidle\n", 14) == true;
+}
+
+test a_clipped_plan_still_advances_the_cursor {
+    var raw : [128]u8 = undefined;
+    const n : usize = t_starved(&raw, 128);
+    var out : [160]u8 = undefined;
+    assert merge_plan(&raw, n, &out, 40) == 125;
+}
+
+// ---- yield tests ----
+
+/// The last 10 successful merger runs on 2026-10-18: nine workflow_run runs that each skipped one
+/// PR for a missing label, and the schedule sweep that skipped six PRs for other reasons.
+fn t_yield_today(dst : []u8, cap : usize) -> usize {
+    var x : usize = 0;
+    var i : u32 = 0;
+    while (i < 9) {
+        x = put_str(dst, cap, x, "workflow_run\t0\t1\t0\n", 19);
+        i += 1;
+    }
+    return put_str(dst, cap, x, "schedule\t0\t0\t6\n", 15);
+}
+
+fn t_yield2(a : str, al : usize, b : str, bl : usize) -> u8 {
+    var raw : [96]u8 = undefined;
+    var x : usize = put_str(&raw, 96, 0, a, al);
+    x = put_str(&raw, 96, x, b, bl);
+    return my_verdict(&raw, x);
+}
+
+test the_merger_yield_on_2026_10_18_is_zero {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    assert n == 186;
+    var st : [5]u32 = undefined;
+    assert my_counts(&raw, n, &st) == 10;
+    assert st[MY_RUNS] == 10;
+    assert st[MY_MERGED] == 0;
+    assert st[MY_EMPTY] == 10;
+    assert st[MY_LABEL_ONLY] == 9;
+    assert st[MY_BAD] == 0;
+    assert my_verdict(&raw, n) == MY_ZERO;
+}
+
+test the_zero_yield_plan_text {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    var out : [160]u8 = undefined;
+    const w : usize = yield_plan(&raw, n, &out, 160);
+    assert w == 129;
+    assert buf_has(&out, w, "Y\tmerger yield: 0 PRs merged in 10 runs; 10 merged nothing, 9 of them only for a missing label; 0 unreadable\n", 109) == true;
+    assert buf_has(&out, w, "F\tmerger-yield\tzero\n", 20) == true;
+}
+
+test a_known_merge_wins_over_an_unreadable_row {
+    assert t_yield2("pull_request_target\t1\t0\t0\n", 26, "workflow_run\tx\t1\t0\n", 19) == MY_SOME;
+    assert t_yield2("workflow_run\tx\t1\t0\n", 19, "workflow_run\t0\t1\t0\n", 19) == MY_UNKNOWN;
+}
+
+test label_only_needs_no_other_skip {
+    var st : [5]u32 = undefined;
+    assert my_counts("schedule\t0\t1\t2\n", 15, &st) == 1;
+    assert st[MY_EMPTY] == 1;
+    assert st[MY_LABEL_ONLY] == 0;
+    assert my_counts("workflow_run\t2\t1\t0\n", 19, &st) == 1;
+    assert st[MY_EMPTY] == 0;
+    assert st[MY_LABEL_ONLY] == 0;
+    assert st[MY_MERGED] == 2;
+}
+
+test an_unknown_event_is_unreadable {
+    assert t_yield2("push\t0\t1\t0\n", 11, "schedule\t0\t0\t6\n", 15) == MY_UNKNOWN;
+    assert t_yield2("workflow_dispatch\t0\t0\t0\n", 24, "schedule\t0\t0\t6\n", 15) == MY_ZERO;
+    assert t_yield2("schedule\t0\t0\n", 13, "schedule\t0\t0\t6\n", 15) == MY_UNKNOWN;
+}
+
+test no_yield_rows_is_none {
+    assert my_verdict("", 0) == MY_NONE;
+    var out : [160]u8 = undefined;
+    const w : usize = yield_plan("", 0, &out, 160);
+    assert buf_has(&out, w, "F\tmerger-yield\tnone\n", 20) == true;
+}
+
+test a_clipped_yield_plan_still_advances_the_cursor {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_yield_today(&raw, 256);
+    var out : [160]u8 = undefined;
+    assert yield_plan(&raw, n, &out, 30) == 129;
+}
+
+// ---- share tests ----
+
+/// The 2026-10-19 queue: 22 merger workflow_run runs, the merger's schedule run, and 186 runs of
+/// other workflows.
+fn t_share_today(dst : []u8, cap : usize) -> usize {
+    var x : usize = 0;
+    var i : u32 = 0;
+    while (i < 22) {
+        x = put_str(dst, cap, x, "Auto Merge Ready PRs\tworkflow_run\n", 34);
+        i += 1;
+    }
+    x = put_str(dst, cap, x, "Auto Merge Ready PRs\tschedule\n", 30);
+    i = 0;
+    while (i < 186) {
+        x = put_str(dst, cap, x, "x\tpull_request\n", 15);
+        i += 1;
+    }
+    return x;
+}
+
+/// m merger rows, o rows of another workflow, then b one-field rows.
+fn t_share(m : u32, o : u32, b : u32) -> u8 {
+    var raw : [1024]u8 = undefined;
+    var x : usize = 0;
+    var i : u32 = 0;
+    while (i < m) {
+        x = put_str(&raw, 1024, x, "Auto Merge Ready PRs\tworkflow_run\n", 34);
+        i += 1;
+    }
+    i = 0;
+    while (i < o) {
+        x = put_str(&raw, 1024, x, "x\tpull_request\n", 15);
+        i += 1;
+    }
+    i = 0;
+    while (i < b) {
+        x = put_str(&raw, 1024, x, "x\n", 2);
+        i += 1;
+    }
+    return ms_verdict(&raw, x);
+}
+
+test the_merger_is_a_tenth_of_the_2026_10_19_queue {
+    var raw : [4096]u8 = undefined;
+    const n : usize = t_share_today(&raw, 4096);
+    assert n == 3568;
+    var st : [4]u32 = undefined;
+    assert ms_counts(&raw, n, &st) == 209;
+    assert st[MS_ROWS] == 209;
+    assert st[MS_MERGER_ROWS] == 23;
+    assert st[MS_FOLLOW] == 22;
+    assert st[MS_BAD] == 0;
+    assert ms_verdict(&raw, n) == MS_HIGH;
+}
+
+test the_high_share_plan_text {
+    var raw : [4096]u8 = undefined;
+    const n : usize = t_share_today(&raw, 4096);
+    var out : [160]u8 = undefined;
+    const w : usize = share_plan(&raw, n, &out, 160);
+    assert w == 114;
+    assert buf_has(&out, w, "S\tmerger share: 23 of 209 queued runs are the merger's, 22 of them workflow_run; 0 unreadable\n", 94) == true;
+    assert buf_has(&out, w, "F\tmerger-share\thigh\n", 20) == true;
+}
+
+test ten_percent_is_high_and_less_is_low {
+    assert t_share(1, 9, 0) == MS_HIGH;
+    assert t_share(1, 10, 0) == MS_LOW;
+    assert t_share(0, 3, 0) == MS_LOW;
+}
+
+test an_unreadable_row_counts_as_somebody_elses {
+    assert t_share(1, 9, 1) == MS_UNKNOWN;
+    assert t_share(2, 8, 1) == MS_HIGH;
+    assert t_share(0, 0, 1) == MS_UNKNOWN;
+}
+
+test a_carriage_return_or_a_near_name_is_not_the_merger {
+    var st : [4]u32 = undefined;
+    // `"\r"` in a t27 literal is a backslash and an `r`, so the carriage return is the byte 13 (#10722).
+    var cr : [40]u8 = undefined;
+    const w : usize = put_str(&cr, 40, 0, "Auto Merge Ready PRs\tworkflow_run", 33);
+    cr[w] = 13;
+    cr[w + 1] = '\n';
+    assert w == 33;
+    assert cr[33] == 13;
+    assert ms_counts(&cr, 35, &st) == 1;
+    assert st[MS_BAD] == 1;
+    assert st[MS_ROWS] == 0;
+    assert st[MS_MERGER_ROWS] == 0;
+    assert ms_counts("Auto Merge Ready PR\tworkflow_run\n", 33, &st) == 1;
+    assert st[MS_ROWS] == 1;
+    assert st[MS_MERGER_ROWS] == 0;
+    assert ms_counts("\tworkflow_run\n", 14, &st) == 1;
+    assert st[MS_BAD] == 1;
+    assert ms_counts("Auto Merge Ready PRs\tschedule\n", 30, &st) == 1;
+    assert st[MS_MERGER_ROWS] == 1;
+    assert st[MS_FOLLOW] == 0;
+}
+
+test no_share_rows_is_none {
+    assert ms_verdict("", 0) == MS_NONE;
+    var out : [160]u8 = undefined;
+    const w : usize = share_plan("", 0, &out, 160);
+    assert buf_has(&out, w, "F\tmerger-share\tnone\n", 20) == true;
+}
+
+test a_clipped_share_plan_still_advances_the_cursor {
+    var raw : [4096]u8 = undefined;
+    const n : usize = t_share_today(&raw, 4096);
+    var out : [160]u8 = undefined;
+    assert share_plan(&raw, n, &out, 30) == 114;
+}
+
+test the_share_total_counts_unreadable_rows {
+    var out : [160]u8 = undefined;
+    const w : usize = share_plan("Auto Merge Ready PRs\tworkflow_run\nx\n", 36, &out, 160);
+    assert w == 110;
+    assert buf_has(&out, w, "S\tmerger share: 1 of 2 queued runs are the merger's, 1 of them workflow_run; 1 unreadable\n", 90) == true;
+    assert buf_has(&out, w, "F\tmerger-share\thigh\n", 20) == true;
+}
+
+// The tests below were written against a mutation sweep of this file (#10724). They fill rows
+// with check_state's t_rows, the one copy of that helper (duplicate-bodies, #10742).
+
+test a_blank_line_is_not_a_row_in_any_reader {
+    var st : [8]u32 = undefined;
+    assert ml_counts("queued\t-\t5\n\nqueued\t-\t5\n", 23, &st) == 2;
+    assert st[ML_QUEUED] == 2;
+    assert st[ML_BAD] == 0;
+    assert my_counts("schedule\t1\t0\t0\n\n", 16, &st) == 1;
+    assert st[MY_RUNS] == 1;
+    assert st[MY_BAD] == 0;
+    assert ms_counts("x\tpush\n\n", 8, &st) == 1;
+    assert st[MS_ROWS] == 1;
+    assert st[MS_BAD] == 0;
+}
+
+test an_open_run_of_age_zero_is_read {
+    var st : [8]u32 = undefined;
+    assert ml_counts("queued\t-\t0\n", 11, &st) == 1;
+    assert st[ML_QUEUED] == 1;
+    assert st[ML_BAD] == 0;
+    assert st[ML_OLDEST] == 0;
+}
+
+test the_merger_rows_cap_at_4096_and_refuse_the_next {
+    var raw : [45067]u8 = undefined;
+    var st : [8]u32 = undefined;
+    const n : usize = t_rows(&raw, 45067, 0, "queued\t-\t5\n", 11, 4096);
+    assert n == 45056;
+    assert ml_counts(&raw, n, &st) == 4096;
+    assert st[ML_QUEUED] == 4096;
+    assert st[ML_BAD] == 0;
+    const m : usize = t_rows(&raw, 45067, n, "queued\t-\t5\n", 11, 1);
+    assert m == 45067;
+    assert ml_counts(&raw, m, &st) == 4097;
+    assert st[ML_QUEUED] == 4096;
+    assert st[ML_BAD] == 1;
+}
+
+test the_yield_rows_cap_at_4096_and_refuse_the_next {
+    var raw : [61455]u8 = undefined;
+    var st : [5]u32 = undefined;
+    const n : usize = t_rows(&raw, 61455, 0, "schedule\t1\t0\t0\n", 15, 4096);
+    assert n == 61440;
+    assert my_counts(&raw, n, &st) == 4096;
+    assert st[MY_RUNS] == 4096;
+    assert st[MY_BAD] == 0;
+    const m : usize = t_rows(&raw, 61455, n, "schedule\t1\t0\t0\n", 15, 1);
+    assert m == 61455;
+    assert my_counts(&raw, m, &st) == 4097;
+    assert st[MY_RUNS] == 4096;
+    assert st[MY_BAD] == 1;
+}
+
+test the_share_rows_cap_at_4096_and_refuse_the_next {
+    var raw : [28679]u8 = undefined;
+    var st : [4]u32 = undefined;
+    const n : usize = t_rows(&raw, 28679, 0, "x\tpush\n", 7, 4096);
+    assert n == 28672;
+    assert ms_counts(&raw, n, &st) == 4096;
+    assert st[MS_ROWS] == 4096;
+    assert st[MS_BAD] == 0;
+    const m : usize = t_rows(&raw, 28679, n, "x\tpush\n", 7, 1);
+    assert m == 28679;
+    assert ms_counts(&raw, m, &st) == 4097;
+    assert st[MS_ROWS] == 4096;
+    assert st[MS_BAD] == 1;
+}
+
+test an_empty_run_is_label_only_only_when_a_label_was_missing {
+    var st : [5]u32 = undefined;
+    assert my_counts("schedule\t0\t0\t0\n", 15, &st) == 1;
+    assert st[MY_EMPTY] == 1;
+    assert st[MY_LABEL_ONLY] == 0;
+}
+
+test an_event_name_is_lower_case_letters_from_a_to_z {
+    var st : [4]u32 = undefined;
+    assert ms_counts("x\t\n", 3, &st) == 1;
+    assert st[MS_BAD] == 1;
+    assert st[MS_ROWS] == 0;
+    assert ms_counts("x\tworkflow_dispatch\n", 20, &st) == 1;
+    assert st[MS_ROWS] == 1;
+    assert ms_counts("x\tzz\n", 5, &st) == 1;
+    assert st[MS_ROWS] == 1;
+    assert ms_counts("x\t`\n", 4, &st) == 1;
+    assert st[MS_BAD] == 1;
+    assert ms_counts("x\t{\n", 4, &st) == 1;
+    assert st[MS_BAD] == 1;
+}

@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/pane_state.t27 -- what each pane of the PTY server is doing: working, blocked, done or idle.
+; Owner, 2026-10-19: the herdr model. herdr marks every pane working, blocked (waiting on the human) or
+; idle, so the one that needs you is the one you look at. Its signals, which this spec follows:
+;   1. the agent's own hooks come first -- Claude Code reports UserPromptSubmit (a turn starts), Notification
+;      (it asks for permission or input) and Stop (the turn ended). A hook is exact, so a pane that has sent
+;      one is never guessed at again from its output;
+;   2. output quietness is the fallback for a CLI without hooks: output means working, a quiet stretch
+;      means idle.
+; The status of a pane is one u32: bits 0..7 the raw state (agents.t27 S_*), bit 8 "unseen" (a turn ended
+; and nobody has looked), bit 9 "hooked" (a hook was seen on this pane). The manifest stores the raw state;
+; the sidebar shows shown_state(), which is DONE only for an idle pane with an unseen finished turn.
+; Why unseen is a bit and not the state S_DONE: agents.t27 makes S_DONE the state of a process that
+; exited, and restore skips it. A Claude pane that finished a turn is still alive and must come back.
+; The server calls pane_step on every event and nothing else: no decision lives in a host loop.
+
+module T27osPaneState;
+
+use t27os::agents::S_STOPPED;
+use t27os::agents::S_WORKING;
+use t27os::agents::S_BLOCKED;
+use t27os::agents::S_IDLE;
+use t27os::agents::S_DONE;
+
+/// Milliseconds without output after which an un-hooked pane counts as idle.
+pub const QUIET_MS : u64 = 2500;
+
+/// Events a pane reports.
+pub const P_HOOK_START : u32 = 0;
+pub const P_HOOK_SUBMIT : u32 = 1;
+pub const P_HOOK_NOTIFY : u32 = 2;
+pub const P_HOOK_STOP : u32 = 3;
+pub const P_OUTPUT : u32 = 4;
+pub const P_QUIET : u32 = 5;
+pub const P_KEY : u32 = 6;
+pub const P_SEEN : u32 = 7;
+pub const P_EXIT_OK : u32 = 8;
+pub const P_EXIT_FAIL : u32 = 9;
+pub const P_SPAWNED : u32 = 10;
+pub const P_COUNT : u32 = 11;
+
+pub const BIT_UNSEEN : u32 = 256;
+pub const BIT_HOOKED : u32 = 512;
+
+pub fn ps_state(w: u32) -> u32 { return w & 255; }
+pub fn ps_unseen(w: u32) -> bool { return (w & BIT_UNSEEN) != 0; }
+pub fn ps_hooked(w: u32) -> bool { return (w & BIT_HOOKED) != 0; }
+
+pub fn ps_make(state: u32, unseen: bool, hooked: bool) -> u32 {
+    var w : u32 = state & 255;
+    if (unseen) { w = w + BIT_UNSEEN; }
+    if (hooked) { w = w + BIT_HOOKED; }
+    return w;
+}
+
+/// The next status of a pane with status w on event e.
+pub fn pane_step(w: u32, e: u32) -> u32 {
+    const s : u32 = ps_state(w);
+    const u : bool = ps_unseen(w);
+    const h : bool = ps_hooked(w);
+    if (e == P_SPAWNED) { return ps_make(S_IDLE, false, false); }
+    if (e == P_EXIT_OK) { return ps_make(S_DONE, false, h); }
+    if (e == P_EXIT_FAIL) { return ps_make(S_STOPPED, false, h); }
+    if (s == S_STOPPED or s == S_DONE) { return w; }
+    if (e == P_HOOK_START) { return ps_make(S_IDLE, false, true); }
+    if (e == P_HOOK_SUBMIT) { return ps_make(S_WORKING, false, true); }
+    if (e == P_HOOK_NOTIFY) { return ps_make(S_BLOCKED, u, true); }
+    if (e == P_HOOK_STOP) { return ps_make(S_IDLE, true, true); }
+    if (e == P_KEY) {
+        // answering a permission prompt starts work again, and no hook says so
+        if (s == S_BLOCKED) { return ps_make(S_WORKING, u, h); }
+        return w;
+    }
+    if (e == P_SEEN) { return ps_make(s, false, h); }
+    if (h) { return w; }
+    if (e == P_OUTPUT) { return ps_make(S_WORKING, u, h); }
+    if (e == P_QUIET and s == S_WORKING) { return ps_make(S_IDLE, u, h); }
+    return w;
+}
+
+/// What the sidebar shows: DONE for an idle pane whose finished turn nobody has seen.
+pub fn shown_state(w: u32) -> u32 {
+    const s : u32 = ps_state(w);
+    if (s == S_IDLE and ps_unseen(w)) { return S_DONE; }
+    return s;
+}
+
+/// True when the pane needs the human: blocked.
+pub fn pane_needs_you(w: u32) -> bool {
+    return ps_state(w) == S_BLOCKED;
+}
+
+/// True when the output-quiet fallback applies to a pane: a pane that sent a hook is never guessed at.
+pub fn quiet_applies(w: u32) -> bool {
+    return !ps_hooked(w) and ps_state(w) == S_WORKING;
+}
+
+/// True when a pane that last wrote at last_ms has been quiet at now_ms.
+pub fn is_quiet(now_ms: u64, last_ms: u64) -> bool {
+    if (now_ms < last_ms) { return false; }
+    return now_ms - last_ms >= QUIET_MS;
+}
+
+/// The event a Claude Code hook name stands for; P_COUNT when the name is not one we read.
+/// Names: SessionStart, UserPromptSubmit, Notification, Stop.
+pub fn hook_event(name: []const u8) -> u32 {
+    if (name.len == 4 and name[0] == 83 and name[1] == 116 and name[2] == 111 and name[3] == 112) {
+        return P_HOOK_STOP;
+    }
+    if (name.len == 12 and name[0] == 78 and name[1] == 111 and name[2] == 116 and name[3] == 105) {
+        return P_HOOK_NOTIFY;
+    }
+    if (name.len == 16 and name[0] == 85 and name[1] == 115 and name[2] == 101 and name[3] == 114) {
+        return P_HOOK_SUBMIT;
+    }
+    if (name.len == 12 and name[0] == 83 and name[1] == 101 and name[2] == 115 and name[3] == 115) {
+        return P_HOOK_START;
+    }
+    return P_COUNT;
+}
+
+test a_claude_turn_walks_the_four_states {
+    var w : u32 = pane_step(0, P_SPAWNED);
+    assert shown_state(w) == S_IDLE;
+    w = pane_step(w, P_HOOK_START);
+    assert ps_hooked(w);
+    w = pane_step(w, P_HOOK_SUBMIT);
+    assert shown_state(w) == S_WORKING;
+    w = pane_step(w, P_HOOK_NOTIFY);
+    assert shown_state(w) == S_BLOCKED;
+    assert pane_needs_you(w);
+    w = pane_step(w, P_KEY);
+    assert shown_state(w) == S_WORKING;
+    assert pane_needs_you(w) == false;
+    w = pane_step(w, P_HOOK_STOP);
+    assert ps_state(w) == S_IDLE;
+    assert shown_state(w) == S_DONE;
+    w = pane_step(w, P_SEEN);
+    assert shown_state(w) == S_IDLE;
+}
+
+test a_hooked_pane_ignores_output_and_quiet {
+    var w : u32 = pane_step(pane_step(0, P_SPAWNED), P_HOOK_SUBMIT);
+    var i : u32 = 0;
+    while (i < 5) {
+        w = pane_step(w, P_OUTPUT);
+        w = pane_step(w, P_QUIET);
+        i = i + 1;
+    }
+    assert shown_state(w) == S_WORKING;
+    assert quiet_applies(w) == false;
+    w = pane_step(w, P_HOOK_STOP);
+    w = pane_step(w, P_OUTPUT);
+    assert ps_state(w) == S_IDLE;
+}
+
+test a_pane_without_hooks_falls_back_to_quietness {
+    var w : u32 = pane_step(0, P_SPAWNED);
+    w = pane_step(w, P_OUTPUT);
+    assert shown_state(w) == S_WORKING;
+    assert quiet_applies(w);
+    w = pane_step(w, P_QUIET);
+    assert shown_state(w) == S_IDLE;
+    w = pane_step(w, P_QUIET);
+    assert shown_state(w) == S_IDLE;
+    w = pane_step(w, P_OUTPUT);
+    assert shown_state(w) == S_WORKING;
+}
+
+test exits_are_final {
+    var w : u32 = pane_step(pane_step(0, P_SPAWNED), P_OUTPUT);
+    const done : u32 = pane_step(w, P_EXIT_OK);
+    assert ps_state(done) == S_DONE;
+    assert pane_step(done, P_OUTPUT) == done;
+    assert pane_step(done, P_HOOK_SUBMIT) == done;
+    const dead : u32 = pane_step(w, P_EXIT_FAIL);
+    assert ps_state(dead) == S_STOPPED;
+    assert pane_step(dead, P_KEY) == dead;
+    // a respawn starts a fresh pane
+    assert ps_state(pane_step(dead, P_SPAWNED)) == S_IDLE;
+}
+
+test unseen_survives_a_prompt_and_clears_on_looking {
+    var w : u32 = pane_step(pane_step(0, P_SPAWNED), P_HOOK_SUBMIT);
+    w = pane_step(w, P_HOOK_STOP);
+    assert ps_unseen(w);
+    w = pane_step(w, P_HOOK_NOTIFY);
+    assert ps_unseen(w);
+    w = pane_step(w, P_SEEN);
+    assert ps_unseen(w) == false;
+    assert shown_state(w) == S_BLOCKED;
+    w = pane_step(w, P_HOOK_SUBMIT);
+    assert ps_unseen(w) == false;
+}
+
+test quiet_is_measured_in_milliseconds {
+    var now : u64 = 1000;
+    assert is_quiet(now, 1000) == false;
+    now = 1000 + QUIET_MS - 1;
+    assert is_quiet(now, 1000) == false;
+    now = now + 1;
+    assert is_quiet(now, 1000);
+    now = 500;
+    assert is_quiet(now, 1000) == false;
+}
+
+test hook_names_map_to_events {
+    var n : [16]u8 = undefined;
+    n[0] = 83; n[1] = 116; n[2] = 111; n[3] = 112;
+    assert hook_event(n[0..4]) == P_HOOK_STOP;
+    n[0] = 78; n[1] = 111; n[2] = 116; n[3] = 105;
+    n[4] = 102; n[5] = 105; n[6] = 99; n[7] = 97; n[8] = 116; n[9] = 105; n[10] = 111; n[11] = 110;
+    assert hook_event(n[0..12]) == P_HOOK_NOTIFY;
+    assert hook_event(n[0..11]) == P_COUNT;
+    n[0] = 85; n[1] = 115; n[2] = 101; n[3] = 114;
+    assert hook_event(n[0..16]) == P_HOOK_SUBMIT;
+    n[0] = 83; n[1] = 101; n[2] = 115; n[3] = 115;
+    assert hook_event(n[0..12]) == P_HOOK_START;
+    n[0] = 88;
+    assert hook_event(n[0..12]) == P_COUNT;
+}

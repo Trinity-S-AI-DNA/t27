@@ -1,0 +1,987 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/analog_cell_ax7203.t27 -- the linear analog cell on the ALINX AX7203: a series RLC and a 5-node RC ladder
+; M1b of the analog emulation epic (#10486, issue #10496). The cell is specs/analog/linear.t27 (#10487); the board
+; plumbing is M0 (specs/fpga/rc_filter_ax7203.t27, #10276): the PLL, the UART frame and the receipt fields are M0's
+; declarations and fns, brought in by `use`. What is written here is the machine that runs the cell's step on the fabric,
+; and the two circuits' tables as a ROM. Everything hand-written is this file.
+; -
+; ONE TOP, TWO CIRCUITS. The machine is the same for every circuit: only the ROM (the circuit's D and N words), the
+; state count, the state the receipt reports and the expected values change. The board runs the series RLC, prints its
+; receipt line, runs the 5-node ladder, prints its line, and goes round again, so every line is a fresh run of 200 steps
+; and the lines alternate RLC, LAD5, RLC, LAD5. Two copies of one machine would be two copies of one on_clock, which
+; the dupe ratchet refuses (and which would drift); CK_FIRST and CK_LAST pick the circuits the board cycles through, so
+; a build of one circuit alone is the same file with CK_FIRST = CK_LAST.
+; -
+; THE STEP (linear.t27). Every state, constant and input is an unsigned sign-magnitude word (bit 31 = negative, bits 0..30
+; the magnitude in units of 2^-24 V). One step is x_i' = x_i + rnd(sum_j D_ij x_j + N_i u): the positive terms add into
+; one u64, the negative terms into another, one subtraction gives the magnitude and the direction, round_back rounds it
+; half away from zero, add_sm adds it to the old state. The cell's scalar fns do that in one clock each; on the fabric
+; each is split across clocks, and the tests prove the split gives the same word as the cell's next_x.
+; -
+; THE MACHINE. One term (a constant c times a state or the source x) at a time, rows in order, 200 steps:
+;   P_LOAD  the ROM word c, the operand x, and the direction (opposite) of the product
+;   P_MUL   shift-and-add over the bits of |x| until none is left: |c| << b is added into the positive or the negative
+;           register for every set bit b. This is the cell's prod, one bit a clock: no DSP slice (DSP48E1 with live
+;           operands reads wrong on openXC7, BENCHMARKS.md 4.4, so the flow is -nodsp) and no wide combinational multiplier
+;   P_CMP   which register is larger        P_SUB   the difference        P_RND   round_back, and the old state
+;   P_PACK  the direction                   P_ADD   add_sm                P_STORE the new state, the fold, A and B
+;   P_COMMIT  all new states become the old ones, the next step.
+; The clocks of a run depend on the bit lengths of the states, and are deterministic: the tests pin them (C).
+; on_clock reads every register before it writes it, so the tests in this file and the clock edge agree.
+; THE RESTART. The button and LOCKED pass M0's two registers. While they say no, the request flags `fin` and `hard` are set
+; every clock, and the next clock puts the machine back to its start (circuit CK_FIRST, line 0). A finished line sets `fin`
+; alone, and the next clock starts the next circuit. The flags are registers beside the logic they restart: in the first
+; build the second synchroniser register drove the whole restart, sat by the pads, and failed 100 MHz on that wire.
+; -
+; THE CIRCUITS (the tables are linear.t27's, RLC_* and LAD5_*). Series RLC, R = 100 Ohm, L = 10 uH, C = 1 nF, dt = 5 ns,
+; unknowns [node between R and L, capacitor voltage, inductor current * 100 Ohm]; A and B are the capacitor voltage after
+; step 99 and step 199 (it rings: A is above 1 V). 5-node RC ladder, R = 1 kOhm and C = 1 nF per section, dt = 50 ns;
+; A and B are the last node. S is the cell's fold over every state of every step, state by state.
+; -
+; THE RECEIPT. 115200 baud on N15, one line after each run, then the next circuit runs:
+;   T27 RLC A=<16 hex> B=<16 hex> S=<16 hex> C=<16 hex> L=<16 hex> PASS
+;   T27 LAD5 A=... (the same fields)
+; L counts the lines since the button. PASS when A, B and S are the values linear.t27's run derives for that circuit, else
+; FAIL. LEDs (active low) as M0: B13 the run is over, C13 FAIL, D14 PASS, D15 a heartbeat. The button T6 resets.
+; -
+; NEGATIVE CONTROLS. One coefficient one LSB off in one ROM word (RLC address 5, the capacitor's own D; ladder address
+; 12): the cell's run on the changed table gives the A, B and S below, the tests assert they differ from the right ones
+; and that the verdict is FAIL, and a build with that one literal changed prints exactly those values with FAIL.
+; -
+; WHAT A PASS SAYS. This board, running RTL generated from this file, ran the linear cell for 200 steps on each of the two
+; circuits and produced the same states, bit for bit, as the cell's step in linear.t27 (the tests compare every state of
+; every step), so its A, B and S are the cell's. By the cell's own tests those are within 9 LSB (RLC) and 41 LSB (ladder)
+; of the double-precision backward Euler run of the same method.
+; WHAT IT DOES NOT SAY. Nothing about power. Nothing about the continuous circuit: only about backward Euler at this dt.
+; Nothing about another circuit: the tables are two of the cell's, and a netlist reader is M2. Nothing about real time:
+; a run takes more clocks than the circuit has time. ASCII only, English only.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module FpgaAnalogCell;
+
+use analog::linear;
+use fpga::rc_filter_ax7203;
+
+pub const KIND : str = "board-cell";
+pub const ID : str = "fpga/analog_cell_ax7203";
+pub const REFERENCE : str = "specs/analog/linear.t27, M0 specs/fpga/rc_filter_ax7203.t27";
+pub const BOARD : str = "ALINX AX7203";
+pub const PART : str = "xc7a200tfbg484-2";
+
+; --- the circuits -------------------------------------------------------------------------------
+pub const CK_RLC : u8 = 0;
+pub const CK_LAD5 : u8 = 1;
+/// The board cycles through the circuits CK_FIRST .. CK_LAST, one run and one line each.
+pub const CK_FIRST : u8 = 0;
+pub const CK_LAST : u8 = 1;
+pub const RLC_STATES : u8 = 3;
+pub const LAD5_STATES : u8 = 5;
+/// The state the receipt reports as A and B: the capacitor voltage, and the last node of the ladder.
+pub const RLC_OUT : u8 = 1;
+pub const LAD5_OUT : u8 = 4;
+
+; --- what the board must report, derived by the cell's run (the tests assert it) -------------------
+pub const RLC_EXP_A : u32 = 18050612;
+pub const RLC_EXP_B : u32 = NEG | 1265689;
+pub const LAD5_EXP_A : u32 = 2963590;
+pub const LAD5_EXP_B : u32 = 4464373;
+/// The clocks of a run, as the receipt's C field.
+pub const RLC_CLOCKS : u32 = 56666;
+pub const LAD5_CLOCKS : u32 = 139400;
+
+; --- the negative controls: one coefficient one LSB off -----------------------------------------------
+/// The index in linear.t27's D table, and the ROM address it has here (row * (n + 1) + column).
+pub const RLC_FAULT_IDX : usize = 4;
+pub const RLC_FAULT_ADDR : u8 = 5;
+pub const LAD5_FAULT_IDX : usize = 10;
+pub const LAD5_FAULT_ADDR : u8 = 12;
+/// What the cell's run gives with that coefficient one LSB further from zero.
+pub const RLC_BAD_A : u32 = 18050590;
+pub const RLC_BAD_B : u32 = NEG | 1265681;
+pub const RLC_BAD_S : u64 = 0x89932D8FBE407911;
+pub const LAD5_BAD_A : u32 = 2963600;
+pub const LAD5_BAD_B : u32 = 4464385;
+pub const LAD5_BAD_S : u64 = 0x321615C52B5B23EA;
+
+; --- the machine --------------------------------------------------------------------------------
+pub const P_LOAD : u8 = 0;
+pub const P_MUL : u8 = 1;
+pub const P_CMP : u8 = 2;
+pub const P_SUB : u8 = 3;
+pub const P_RND : u8 = 4;
+pub const P_PACK : u8 = 5;
+pub const P_ADD : u8 = 6;
+pub const P_STORE : u8 = 7;
+pub const P_COMMIT : u8 = 8;
+
+; --- per-circuit facts --------------------------------------------------------------------------
+
+/// The state count of circuit c.
+pub fn nstates(c: u8) -> u8 {
+    if (c == CK_RLC) { return RLC_STATES; }
+    return LAD5_STATES;
+}
+
+/// The state the receipt reports as A and B.
+pub fn out_of(c: u8) -> u8 {
+    if (c == CK_RLC) { return RLC_OUT; }
+    return LAD5_OUT;
+}
+
+/// The circuit after c: the last goes back to the first.
+pub fn next_ck(c: u8) -> u8 {
+    if (c == CK_LAST) { return CK_FIRST; }
+    return c + 1;
+}
+
+pub fn expect_a(c: u8) -> u32 {
+    if (c == CK_RLC) { return RLC_EXP_A; }
+    return LAD5_EXP_A;
+}
+
+pub fn expect_b(c: u8) -> u32 {
+    if (c == CK_RLC) { return RLC_EXP_B; }
+    return LAD5_EXP_B;
+}
+
+pub fn expect_s(c: u8) -> u64 {
+    if (c == CK_RLC) { return RLC_EXP_S; }
+    return LAD5_EXP_S;
+}
+
+/// PASS when the run of circuit c gave its derived A, B and S.
+pub fn verdict_for(c: u8, a: u32, b: u32, sm: u64) -> u8 {
+    if (a == expect_a(c) and b == expect_b(c) and sm == expect_s(c)) { return V_PASS; }
+    return V_FAIL;
+}
+
+; --- the ROM: the circuit's words at address row * (n + 1) + column ------------------------------------
+; Row i is D_i0 .. D_i(n-1), then N_i. The words are linear.t27's RLC_D, RLC_NV, LAD5_D and LAD5_NV, spelled as they are
+; there; `t27b verilog` lowers no array, so the table is an if-chain, and a test compares every word with the cell's.
+
+/// The series RLC (3 states, 4 words a row).
+pub fn rom_rlc(a: u8) -> u32 {
+    if (a == 0) { return NEG | 16777216; }
+    if (a == 1) { return 797017; }
+    if (a == 2) { return NEG | 15940348; }
+    if (a == 3) { return 15980199; }
+    if (a == 4) { return 0; }
+    if (a == 5) { return NEG | 39851; }
+    if (a == 6) { return 797017; }
+    if (a == 7) { return 39851; }
+    if (a == 8) { return 0; }
+    if (a == 9) { return NEG | 797017; }
+    if (a == 10) { return NEG | 836868; }
+    if (a == 11) { return 797017; }
+    return 0;
+}
+
+/// The 5-node ladder (5 states, 6 words a row).
+pub fn rom_lad5(a: u8) -> u32 {
+    if (a == 0) { return NEG | 1493558; }
+    if (a == 1) { return 696153; }
+    if (a == 2) { return 31709; }
+    if (a == 3) { return 1444; }
+    if (a == 4) { return 69; }
+    if (a == 5) { return 764183; }
+    if (a == 6) { return 696153; }
+    if (a == 7) { return NEG | 1461849; }
+    if (a == 8) { return 697597; }
+    if (a == 9) { return 31778; }
+    if (a == 10) { return 1513; }
+    if (a == 11) { return 34808; }
+    if (a == 12) { return 31709; }
+    if (a == 13) { return 697597; }
+    if (a == 14) { return NEG | 1461780; }
+    if (a == 15) { return 697666; }
+    if (a == 16) { return 33222; }
+    if (a == 17) { return 1585; }
+    if (a == 18) { return 1444; }
+    if (a == 19) { return 31778; }
+    if (a == 20) { return 697666; }
+    if (a == 21) { return NEG | 1460336; }
+    if (a == 22) { return 729375; }
+    if (a == 23) { return 72; }
+    if (a == 24) { return 69; }
+    if (a == 25) { return 1513; }
+    if (a == 26) { return 33222; }
+    if (a == 27) { return 729375; }
+    if (a == 28) { return NEG | 764183; }
+    if (a == 29) { return 3; }
+    return 0;
+}
+
+/// The ROM word of circuit c at address a.
+pub fn rom(c: u8, a: u8) -> u32 {
+    if (c == CK_RLC) { return rom_rlc(a); }
+    return rom_lad5(a);
+}
+
+; --- the operands and the finish -------------------------------------------------------------------
+
+/// Operand k of a row: state k, or the source u when k is the state count.
+pub fn pick(k: u8, n: u8, s0: u32, s1: u32, s2: u32, s3: u32, s4: u32, u: u32) -> u32 {
+    if (k == n) { return u; }
+    if (k == 0) { return s0; }
+    if (k == 1) { return s1; }
+    if (k == 2) { return s2; }
+    if (k == 3) { return s3; }
+    return s4;
+}
+
+/// The magnitude of the difference of the two registers, the larger one first.
+pub fn diff_mag(big_first: bool, p: u64, q: u64) -> u64 {
+    if (big_first) { return p - q; }
+    return q - p;
+}
+
+; --- the receipt: M0's line, with a prefix per circuit ------------------------------------------------
+
+/// The length of the circuit's name: RLC, LAD5.
+pub fn name_len(c: u8) -> u8 {
+    if (c == CK_RLC) { return 3; }
+    return 4;
+}
+
+/// Character p of "T27 RLC" or "T27 LAD5".
+pub fn name_char(c: u8, p: u8) -> u8 {
+    if (p < 4) { return prefix_char(p); }
+    if (c == CK_RLC) {
+        if (p == 4) { return 82; }
+        if (p == 5) { return 76; }
+        return 67;
+    }
+    if (p == 4) { return 76; }
+    if (p == 5) { return 65; }
+    if (p == 6) { return 68; }
+    return 53;
+}
+
+/// The last position of segment s: the prefix has the circuit's name, every other segment is M0's.
+pub fn seg_end(c: u8, s: u8) -> u8 {
+    if (s == 0) { return 3 + name_len(c); }
+    return seg_last(s);
+}
+
+/// The character at segment s, position p of the line of circuit c.
+pub fn next_char(c: u8, s: u8, p: u8, f: u64, v: u8) -> u8 {
+    if (s == 0) { return name_char(c, p); }
+    return line_char(s, p, f, v);
+}
+
+; --- the board ----------------------------------------------------------------------------------
+
+/// A differential input buffer (the 200 MHz oscillator on R4/T4).
+pub struct IbufdsOut { O: bool }
+pub fn IBUFDS(I: bool, IB: bool) -> IbufdsOut {}
+
+; --- the pins in --------------------------------------------------------------------------------
+const clk200_p : bool = undefined;
+const clk200_p_LOC : str = "R4";
+const clk200_p_IOSTANDARD : str = "DIFF_SSTL15";
+const clk200_n : bool = undefined;
+const clk200_n_LOC : str = "T4";
+const clk200_n_IOSTANDARD : str = "DIFF_SSTL15";
+const cpu_reset_n : bool = undefined;
+const cpu_reset_n_LOC : str = "T6";
+const cpu_reset_n_IOSTANDARD : str = "LVCMOS15";
+
+; --- the clock and the reset: M0's, unchanged ---------------------------------------------------
+const clkbuf : IbufdsOut = IBUFDS(clk200_p, clk200_n);
+const clkbuf_O_PERIOD_PS : u32 = 5000;
+const pll : PllOut = PLLE2_ADV(clkbuf.O, pll.CLKFBOUT, false, false, 5.0, 0.01, 8, 1, 16, 0, "FALSE");
+const gclk : BufgOut = BUFG(pll.CLKOUT0);
+const gclk_O_PERIOD_PS : u32 = 10000;
+
+const btn : IbufOut = IBUF(cpu_reset_n);
+
+// No asynchronous reset: the button and LOCKED pass two registers (M0's), they set the restart request, and on the next
+// edge on_clock puts every register back to its start (M0, where an async clear printed C=1199).
+const clk : bool = gclk.O;
+const rst_n : bool = true;
+const en : bool = true;
+
+; --- the registers ------------------------------------------------------------------------------
+var st : u8 = 0;
+var ph : u8 = 0;
+var ck : u8 = 0;
+var ri : u8 = 0;
+var ti : u8 = 0;
+var ra : u8 = 0;
+var step_n : u8 = 0;
+var x0 : u32 = 0;
+var x1 : u32 = 0;
+var x2 : u32 = 0;
+var x3 : u32 = 0;
+var x4 : u32 = 0;
+var y0 : u32 = 0;
+var y1 : u32 = 0;
+var y2 : u32 = 0;
+var y3 : u32 = 0;
+var y4 : u32 = 0;
+var mc : u64 = 0;
+var mr : u32 = 0;
+var opp : bool = false;
+var accp : u64 = 0;
+var accn : u64 = 0;
+var ge : bool = false;
+var dmag : u64 = 0;
+var rnd : u32 = 0;
+var xi : u32 = 0;
+var dword : u32 = 0;
+var ynew : u32 = 0;
+var cs : u64 = 0;
+var va : u32 = 0;
+var vb : u32 = 0;
+var cyc : u32 = 0;
+var verdict : u8 = 1;
+var baud_div : u16 = 868;
+var tx_cnt : u16 = 0;
+var tx_sh : u16 = 1023;
+var tx_left : u8 = 0;
+var seg : u8 = 0;
+var upos : u8 = 0;
+var fsr : u64 = 0;
+var lines : u32 = 0;
+var last : bool = false;
+var hard : bool = false;
+var fin : bool = false;
+var hb : u32 = 0;
+var go0 : bool = false;
+var go1 : bool = false;
+
+; --- the pins out: registers, set from the state one clock later (a pub var is an output reg) ----
+pub var uart_tx : bool = true;
+const uart_tx_LOC : str = "N15";
+const uart_tx_IOSTANDARD : str = "LVCMOS33";
+pub var led_0 : bool = true;
+const led_0_LOC : str = "B13";
+const led_0_IOSTANDARD : str = "LVCMOS33";
+pub var led_1 : bool = true;
+const led_1_LOC : str = "C13";
+const led_1_IOSTANDARD : str = "LVCMOS33";
+pub var led_2 : bool = true;
+const led_2_LOC : str = "D14";
+const led_2_IOSTANDARD : str = "LVCMOS33";
+pub var led_3 : bool = false;
+const led_3_LOC : str = "D15";
+const led_3_IOSTANDARD : str = "LVCMOS33";
+
+// Every var is read before it is written, so the test's order and the clock edge agree.
+fn on_clock(pll_LOCKED: bool, btn_O: bool) {
+    uart_tx = st != ST_REPORT or (tx_sh & 1) == 1;
+    led_0 = st != ST_REPORT;
+    led_1 = !(st == ST_REPORT and verdict == V_FAIL);
+    led_2 = !(st == ST_REPORT and verdict == V_PASS);
+    led_3 = ((hb >> 27) & 1) == 1;
+    hb = hb + 1;
+    if (fin) {
+        if (hard) {
+            ck = CK_FIRST;
+            lines = 0;
+            hard = false;
+        } else {
+            ck = next_ck(ck);
+        }
+        st = ST_RUN;
+        ph = P_LOAD;
+        ri = 0;
+        ti = 0;
+        ra = 0;
+        step_n = 0;
+        x0 = 0;
+        x1 = 0;
+        x2 = 0;
+        x3 = 0;
+        x4 = 0;
+        accp = 0;
+        accn = 0;
+        cs = 0;
+        cyc = 0;
+        va = 0;
+        vb = 0;
+        verdict = V_FAIL;
+        tx_cnt = 0;
+        tx_sh = 1023;
+        tx_left = 0;
+        seg = 0;
+        upos = 0;
+        fsr = 0;
+        last = false;
+        fin = false;
+    } else if (st == ST_RUN) {
+        cyc = cyc + 1;
+        if (ph == P_LOAD) {
+            mc = (rom(ck, ra) & MAG) as u64;
+            mr = pick(ti, nstates(ck), x0, x1, x2, x3, x4, vin_at(step_n as u32)) & MAG;
+            opp = opposite(rom(ck, ra), pick(ti, nstates(ck), x0, x1, x2, x3, x4, vin_at(step_n as u32)));
+            ph = P_MUL;
+        } else if (ph == P_MUL) {
+            if (mr == 0) {
+                if (ti == nstates(ck)) {
+                    ph = P_CMP;
+                } else {
+                    ti = ti + 1;
+                    ra = ra + 1;
+                    ph = P_LOAD;
+                }
+            } else {
+                if ((mr & 1) == 1) {
+                    if (opp) {
+                        accn = accn + mc;
+                    } else {
+                        accp = accp + mc;
+                    }
+                }
+                mc = mc << 1;
+                mr = mr >> 1;
+            }
+        } else if (ph == P_CMP) {
+            ge = accp >= accn;
+            ph = P_SUB;
+        } else if (ph == P_SUB) {
+            dmag = diff_mag(ge, accp, accn);
+            ph = P_RND;
+        } else if (ph == P_RND) {
+            rnd = round_back(dmag);
+            xi = pick(ri, nstates(ck), x0, x1, x2, x3, x4, 0);
+            ph = P_PACK;
+        } else if (ph == P_PACK) {
+            dword = pack(rnd, !ge);
+            ph = P_ADD;
+        } else if (ph == P_ADD) {
+            ynew = add_sm(xi, dword);
+            ph = P_STORE;
+        } else if (ph == P_STORE) {
+            cs = fold(cs, ynew);
+            if (ri == 0) {
+                y0 = ynew;
+            } else if (ri == 1) {
+                y1 = ynew;
+            } else if (ri == 2) {
+                y2 = ynew;
+            } else if (ri == 3) {
+                y3 = ynew;
+            } else {
+                y4 = ynew;
+            }
+            if (ri == out_of(ck)) {
+                if ((step_n as u32) == CHARGE_STEPS - 1) { va = ynew; }
+                if ((step_n as u32) == STEPS - 1) { vb = ynew; }
+            }
+            accp = 0;
+            accn = 0;
+            ti = 0;
+            ra = ra + 1;
+            if (ri == nstates(ck) - 1) {
+                ph = P_COMMIT;
+            } else {
+                ri = ri + 1;
+                ph = P_LOAD;
+            }
+        } else {
+            x0 = y0;
+            x1 = y1;
+            x2 = y2;
+            x3 = y3;
+            x4 = y4;
+            if ((step_n as u32) == STEPS - 1) { st = ST_JUDGE; }
+            step_n = step_n + 1;
+            ri = 0;
+            ra = 0;
+            ph = P_LOAD;
+        }
+    } else if (st == ST_JUDGE) {
+        verdict = verdict_for(ck, va, vb, cs);
+        st = ST_REPORT;
+    } else {
+        if (tx_cnt != 0) {
+            tx_cnt = tx_cnt - 1;
+        } else {
+            tx_cnt = baud_div - 1;
+            if (tx_left != 0) {
+                if (last and tx_left == 1) { fin = true; }
+                tx_sh = (tx_sh >> 1) | 512;
+                tx_left = tx_left - 1;
+            } else {
+                tx_sh = frame(next_char(ck, seg, upos, fsr, verdict));
+                tx_left = 9;
+                if (upos == seg_end(ck, seg)) {
+                    fsr = field(seg + 1, va, vb, cs, cyc, lines);
+                    upos = 0;
+                    if (seg == LINE_SEGS - 1) {
+                        seg = 0;
+                        lines = lines + 1;
+                        last = true;
+                    } else {
+                        seg = seg + 1;
+                    }
+                } else {
+                    if (seg != 0 and seg != LINE_SEGS - 1 and upos >= 3) { fsr = fsr << 4; }
+                    upos = upos + 1;
+                }
+            }
+        }
+    }
+    if (!go1) {
+        fin = true;
+        hard = true;
+    }
+    go1 = go0;
+    go0 = pll_LOCKED and btn_O;
+}
+
+; --- test-only helpers (the hardware does not reach them) ----------------------------------------------
+
+/// The machine as the button leaves it, then circuit first selected (the start of a run).
+fn boot(first: u8) {
+    go0 = true;
+    go1 = false;
+    on_clock(true, true);
+    on_clock(true, true);
+    ck = first;
+}
+
+/// How many ROM words of circuit c differ from the cell's D (n * n, row-major) and N tables.
+fn rom_bad(c: u8, n: usize, d: []const u32, nv: []const u32) -> u32 {
+    var bad : u32 = 0;
+    var i : usize = 0;
+    var j : usize = 0;
+    while (i < n) {
+        j = 0;
+        while (j < n) {
+            if (rom(c, (i * (n + 1) + j) as u8) != d[i * n + j]) { bad = bad + 1; }
+            j = j + 1;
+        }
+        if (rom(c, (i * (n + 1) + n) as u8) != nv[i]) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+/// Runs the machine from reset on circuit c, beside the cell's step on the tables d and nv, and counts the words where
+/// they differ: every state after every step, and the fold after every step. The machine is left at ST_JUDGE.
+fn board_vs_cell(c: u8, n: usize, d: []const u32, nv: []const u32) -> u32 {
+    boot(c);
+    var xr : [5]u32 = [0] ** 5;
+    var yr : [5]u32 = [0] ** 5;
+    var folded : u64 = 0;
+    var bad : u32 = 0;
+    var t : u32 = 0;
+    var i : usize = 0;
+    while (t < STEPS) {
+        step(n, d, nv, &xr, vin_at(t), &yr);
+        i = 0;
+        while (i < n) {
+            folded = fold(folded, yr[i]);
+            i = i + 1;
+        }
+        while ((step_n as u32) == t and st == ST_RUN) { on_clock(true, true); }
+        i = 0;
+        while (i < n) {
+            if (pick(i as u8, 255, x0, x1, x2, x3, x4, 0) != yr[i]) { bad = bad + 1; }
+            xr[i] = yr[i];
+            i = i + 1;
+        }
+        if (cs != folded) { bad = bad + 1; }
+        t = t + 1;
+    }
+    return bad;
+}
+
+/// The accumulators after the finish phases run on p, q and an old state of x0 (the machine's P_CMP .. P_ADD).
+fn finish_row(p: u64, q: u64, old: u32) -> u32 {
+    boot(CK_RLC);
+    accp = p;
+    accn = q;
+    x0 = old;
+    ri = 0;
+    ph = P_CMP;
+    while (ph != P_STORE) { on_clock(true, true); }
+    return ynew;
+}
+
+/// The value of one hex digit, 0-9 A-F.
+fn hex_val(ch: u8) -> u64 {
+    if (ch >= 65) { return (ch - 55) as u64; }
+    return (ch - 48) as u64;
+}
+
+/// The 16 hex digits of buf from position at.
+fn hex_run(buf: []const u8, at: usize) -> u64 {
+    var v : u64 = 0;
+    var k : usize = 0;
+    while (k < 16) {
+        v = (v << 4) | hex_val(buf[at + k]);
+        k = k + 1;
+    }
+    return v;
+}
+
+; --- the tests ----------------------------------------------------------------------------------
+
+test the_rom_is_the_cells_tables_word_for_word_and_sees_one_lsb {
+    assert_eq(rom_bad(CK_RLC, RLC_N, &RLC_D, &RLC_NV), 0);
+    assert_eq(rom_bad(CK_LAD5, LAD5_N, &LAD5_D, &LAD5_NV), 0);
+    var dr : [9]u32 = RLC_D;
+    dr[RLC_FAULT_IDX] = dr[RLC_FAULT_IDX] + 1;
+    assert_eq(rom_bad(CK_RLC, RLC_N, &dr, &RLC_NV), 1);
+    var dl5 : [25]u32 = LAD5_D;
+    dl5[LAD5_FAULT_IDX] = dl5[LAD5_FAULT_IDX] + 1;
+    assert_eq(rom_bad(CK_LAD5, LAD5_N, &dl5, &LAD5_NV), 1);
+    var nr : [3]u32 = RLC_NV;
+    nr[2] = nr[2] + 1;
+    assert_eq(rom_bad(CK_RLC, RLC_N, &RLC_D, &nr), 1);
+    // the fault addresses are the faulty words' places in the ROM: row * (n + 1) + column
+    assert_eq(RLC_FAULT_ADDR as usize, (RLC_FAULT_IDX / RLC_N) * (RLC_N + 1) + RLC_FAULT_IDX % RLC_N);
+    assert_eq(LAD5_FAULT_ADDR as usize, (LAD5_FAULT_IDX / LAD5_N) * (LAD5_N + 1) + LAD5_FAULT_IDX % LAD5_N);
+    assert_eq(rom_rlc(RLC_FAULT_ADDR), NEG | 39851);
+    assert_eq(rom_lad5(LAD5_FAULT_ADDR), 31709);
+}
+
+test the_circuit_facts_agree_with_the_cell {
+    assert_eq(RLC_STATES as usize, RLC_N);
+    assert_eq(LAD5_STATES as usize, LAD5_N);
+    assert_eq(nstates(CK_RLC), 3);
+    assert_eq(nstates(CK_LAD5), 5);
+    assert_eq(out_of(CK_RLC), 1);
+    assert_eq(out_of(CK_LAD5), 4);
+    assert_eq(next_ck(CK_RLC), CK_LAD5);
+    assert_eq(next_ck(CK_LAD5), CK_RLC);
+    assert_eq(expect_s(CK_RLC), RLC_EXP_S);
+    assert_eq(expect_s(CK_LAD5), LAD5_EXP_S);
+    assert_eq(RLC_EXP_B & MAG, 1265689);
+    assert(is_neg(RLC_EXP_B));
+    // the right values pass, and each of A, B, S alone being wrong fails, for both circuits and across them
+    assert_eq(verdict_for(CK_RLC, RLC_EXP_A, RLC_EXP_B, RLC_EXP_S), V_PASS);
+    assert_eq(verdict_for(CK_RLC, RLC_EXP_A + 1, RLC_EXP_B, RLC_EXP_S), V_FAIL);
+    assert_eq(verdict_for(CK_RLC, RLC_EXP_A, RLC_EXP_B + 1, RLC_EXP_S), V_FAIL);
+    assert_eq(verdict_for(CK_RLC, RLC_EXP_A, RLC_EXP_B, RLC_EXP_S ^ 1), V_FAIL);
+    assert_eq(verdict_for(CK_LAD5, LAD5_EXP_A, LAD5_EXP_B, LAD5_EXP_S), V_PASS);
+    assert_eq(verdict_for(CK_LAD5, LAD5_EXP_A + 1, LAD5_EXP_B, LAD5_EXP_S), V_FAIL);
+    assert_eq(verdict_for(CK_LAD5, LAD5_EXP_A, LAD5_EXP_B + 1, LAD5_EXP_S), V_FAIL);
+    assert_eq(verdict_for(CK_LAD5, LAD5_EXP_A, LAD5_EXP_B, LAD5_EXP_S ^ 1), V_FAIL);
+    assert_eq(verdict_for(CK_LAD5, RLC_EXP_A, RLC_EXP_B, RLC_EXP_S), V_FAIL);
+    assert_eq(verdict_for(CK_RLC, LAD5_EXP_A, LAD5_EXP_B, LAD5_EXP_S), V_FAIL);
+}
+
+test the_expected_values_are_what_the_cells_run_derives {
+    const mn_rlc : [30]f64 = derive(&RLC_KIND, &RLC_A, &RLC_B, &RLC_VAL, RLC_NE, RLC_DT, RLC_ZS);
+    var xa : [5]u32 = [0] ** 5;
+    var xb : [5]u32 = [0] ** 5;
+    const ca : RunOut = run(RLC_N, &RLC_D, &RLC_NV, &mn_rlc, CHARGE_STEPS, &xa);
+    const cb : RunOut = run(RLC_N, &RLC_D, &RLC_NV, &mn_rlc, STEPS, &xb);
+    assert_eq(xa[RLC_OUT as usize], RLC_EXP_A);
+    assert_eq(xb[RLC_OUT as usize], RLC_EXP_B);
+    assert_eq(cb.sig, RLC_EXP_S);
+    assert ca.worst < (RLC_MAX_ERR_LSB as f64);
+    assert cb.worst < (RLC_MAX_ERR_LSB as f64);
+    // the capacitor rings above 1 V at 5 us, and the inductor current changes sign
+    assert(xa[RLC_OUT as usize] > ONE);
+    assert(is_neg(xb[RLC_OUT as usize]));
+    const m5 : [30]f64 = derive(&LAD5_KIND, &LAD5_A, &LAD5_B, &LAD5_VAL, LAD5_NE, LAD5_DT, LAD5_ZS);
+    var ya : [5]u32 = [0] ** 5;
+    var yb : [5]u32 = [0] ** 5;
+    const da : RunOut = run(LAD5_N, &LAD5_D, &LAD5_NV, &m5, CHARGE_STEPS, &ya);
+    const db : RunOut = run(LAD5_N, &LAD5_D, &LAD5_NV, &m5, STEPS, &yb);
+    assert_eq(ya[LAD5_OUT as usize], LAD5_EXP_A);
+    assert_eq(yb[LAD5_OUT as usize], LAD5_EXP_B);
+    assert_eq(db.sig, LAD5_EXP_S);
+    assert da.worst < (LAD5_MAX_ERR_LSB as f64);
+    assert db.worst < (LAD5_MAX_ERR_LSB as f64);
+}
+
+test the_serial_multiplier_adds_what_the_cells_term_adds {
+    boot(CK_RLC);
+    const cs_tab : [10]u32 = [NEG | 797017, 797017, NEG | 1, 0, 7, MAG, ONE, NEG | ONE, 15940348, NEG | 39851];
+    const xs_tab : [10]u32 = [18050612, NEG | 123456, NEG | 1, 5, 0, MAG, ONE, MAG, 67108863, 1];
+    var k : usize = 0;
+    var clocks : u32 = 0;
+    while (k < 10) {
+        ph = P_MUL;
+        accp = 0;
+        accn = 0;
+        mc = (cs_tab[k] & MAG) as u64;
+        mr = xs_tab[k] & MAG;
+        opp = opposite(cs_tab[k], xs_tab[k]);
+        ti = 0;
+        clocks = 0;
+        while (ph == P_MUL) {
+            on_clock(true, true);
+            clocks = clocks + 1;
+        }
+        assert_eq(accp, pos_after(0, cs_tab[k], xs_tab[k]));
+        assert_eq(accn, neg_after(0, cs_tab[k], xs_tab[k]));
+        assert_eq(accp + accn, prod(cs_tab[k], xs_tab[k]));
+        k = k + 1;
+    }
+    // zero takes the one clock that finds no bit; ONE (25 bits) takes 25 + 1
+    ph = P_MUL;
+    mc = 5;
+    mr = 0;
+    opp = false;
+    ti = 0;
+    clocks = 0;
+    while (ph == P_MUL) {
+        on_clock(true, true);
+        clocks = clocks + 1;
+    }
+    assert_eq(clocks, 1);
+    ph = P_MUL;
+    mc = 5;
+    mr = ONE;
+    ti = 0;
+    clocks = 0;
+    while (ph == P_MUL) {
+        on_clock(true, true);
+        clocks = clocks + 1;
+    }
+    assert_eq(clocks, 26);
+}
+
+test the_finish_phases_equal_the_cells_next_x {
+    // half an LSB rounds away from zero, both ways; equal registers give zero; a negative old state; a carry across zero
+    assert_eq(finish_row(8388608, 0, 5), next_x(5, 8388608, 0));
+    assert_eq(finish_row(0, 8388608, 5), next_x(5, 0, 8388608));
+    assert_eq(finish_row(8388607, 0, 5), 5);
+    assert_eq(finish_row(5, 5, NEG | 9), NEG | 9);
+    assert_eq(finish_row(0, 8388608, 0), NEG | 1);
+    assert_eq(finish_row(25165824, 8388608, NEG | 3), next_x(NEG | 3, 25165824, 8388608));
+    assert_eq(finish_row(1099511627776, 3, 1000), next_x(1000, 1099511627776, 3));
+    assert_eq(finish_row(3, 1099511627776, NEG | 1000), next_x(NEG | 1000, 3, 1099511627776));
+    assert_eq(finish_row(33554432, 0, NEG | 1), next_x(NEG | 1, 33554432, 0));
+    assert_eq(finish_row(0, 33554432, 1), next_x(1, 0, 33554432));
+    assert_eq(diff_mag(true, 9, 4), 5);
+    assert_eq(diff_mag(false, 4, 9), 5);
+}
+
+test the_board_machine_runs_the_rlc_like_the_cell {
+    const mn : [30]f64 = derive(&RLC_KIND, &RLC_A, &RLC_B, &RLC_VAL, RLC_NE, RLC_DT, RLC_ZS);
+    assert_eq(board_vs_cell(CK_RLC, RLC_N, &RLC_D, &RLC_NV), 0);
+    assert_eq(st, ST_JUDGE);
+    assert_eq(step_n as u32, STEPS);
+    var xa : [5]u32 = [0] ** 5;
+    var xb : [5]u32 = [0] ** 5;
+    const ca : RunOut = run(RLC_N, &RLC_D, &RLC_NV, &mn, CHARGE_STEPS, &xa);
+    const cb : RunOut = run(RLC_N, &RLC_D, &RLC_NV, &mn, STEPS, &xb);
+    assert_eq(va, xa[RLC_OUT as usize]);
+    assert_eq(vb, xb[RLC_OUT as usize]);
+    assert_eq(cs, cb.sig);
+    assert_eq(va, RLC_EXP_A);
+    assert_eq(vb, RLC_EXP_B);
+    assert_eq(cs, RLC_EXP_S);
+    assert_eq(cyc, RLC_CLOCKS);
+    assert ca.peak < HEADROOM;
+    on_clock(true, true);
+    assert_eq(st, ST_REPORT);
+    assert_eq(verdict, V_PASS);
+}
+
+test the_board_machine_runs_the_ladder_like_the_cell {
+    const mn : [30]f64 = derive(&LAD5_KIND, &LAD5_A, &LAD5_B, &LAD5_VAL, LAD5_NE, LAD5_DT, LAD5_ZS);
+    assert_eq(board_vs_cell(CK_LAD5, LAD5_N, &LAD5_D, &LAD5_NV), 0);
+    assert_eq(st, ST_JUDGE);
+    assert_eq(step_n as u32, STEPS);
+    var xa : [5]u32 = [0] ** 5;
+    var xb : [5]u32 = [0] ** 5;
+    const ca : RunOut = run(LAD5_N, &LAD5_D, &LAD5_NV, &mn, CHARGE_STEPS, &xa);
+    const cb : RunOut = run(LAD5_N, &LAD5_D, &LAD5_NV, &mn, STEPS, &xb);
+    assert_eq(va, xa[LAD5_OUT as usize]);
+    assert_eq(vb, xb[LAD5_OUT as usize]);
+    assert_eq(cs, cb.sig);
+    assert_eq(va, LAD5_EXP_A);
+    assert_eq(vb, LAD5_EXP_B);
+    assert_eq(cs, LAD5_EXP_S);
+    assert_eq(cyc, LAD5_CLOCKS);
+    assert ca.peak < HEADROOM;
+    on_clock(true, true);
+    assert_eq(st, ST_REPORT);
+    assert_eq(verdict, V_PASS);
+}
+
+test one_lsb_in_one_coefficient_changes_a_b_and_s_and_fails {
+    const mn : [30]f64 = derive(&RLC_KIND, &RLC_A, &RLC_B, &RLC_VAL, RLC_NE, RLC_DT, RLC_ZS);
+    var dr : [9]u32 = RLC_D;
+    dr[RLC_FAULT_IDX] = dr[RLC_FAULT_IDX] + 1;
+    var xa : [5]u32 = [0] ** 5;
+    var xb : [5]u32 = [0] ** 5;
+    const ca : RunOut = run(RLC_N, &dr, &RLC_NV, &mn, CHARGE_STEPS, &xa);
+    const cb : RunOut = run(RLC_N, &dr, &RLC_NV, &mn, STEPS, &xb);
+    assert_eq(xa[RLC_OUT as usize], RLC_BAD_A);
+    assert_eq(xb[RLC_OUT as usize], RLC_BAD_B);
+    assert_eq(cb.sig, RLC_BAD_S);
+    assert(RLC_BAD_A != RLC_EXP_A);
+    assert(RLC_BAD_B != RLC_EXP_B);
+    assert(RLC_BAD_S != RLC_EXP_S);
+    assert_eq(verdict_for(CK_RLC, RLC_BAD_A, RLC_BAD_B, RLC_BAD_S), V_FAIL);
+    // the machine, whose ROM is the right table, disagrees with the cell run on the faulty one
+    assert(board_vs_cell(CK_RLC, RLC_N, &dr, &RLC_NV) > 0);
+    assert(cs != RLC_BAD_S);
+    const m5 : [30]f64 = derive(&LAD5_KIND, &LAD5_A, &LAD5_B, &LAD5_VAL, LAD5_NE, LAD5_DT, LAD5_ZS);
+    var dl5 : [25]u32 = LAD5_D;
+    dl5[LAD5_FAULT_IDX] = dl5[LAD5_FAULT_IDX] + 1;
+    var ya : [5]u32 = [0] ** 5;
+    var yb : [5]u32 = [0] ** 5;
+    const da : RunOut = run(LAD5_N, &dl5, &LAD5_NV, &m5, CHARGE_STEPS, &ya);
+    const db : RunOut = run(LAD5_N, &dl5, &LAD5_NV, &m5, STEPS, &yb);
+    assert_eq(ya[LAD5_OUT as usize], LAD5_BAD_A);
+    assert_eq(yb[LAD5_OUT as usize], LAD5_BAD_B);
+    assert_eq(db.sig, LAD5_BAD_S);
+    assert(LAD5_BAD_A != LAD5_EXP_A);
+    assert(LAD5_BAD_B != LAD5_EXP_B);
+    assert(LAD5_BAD_S != LAD5_EXP_S);
+    assert_eq(verdict_for(CK_LAD5, LAD5_BAD_A, LAD5_BAD_B, LAD5_BAD_S), V_FAIL);
+    assert(board_vs_cell(CK_LAD5, LAD5_N, &dl5, &LAD5_NV) > 0);
+    assert(cs != LAD5_BAD_S);
+}
+
+test the_run_starts_after_lock_and_button_and_restarts_on_the_button {
+    go0 = false;
+    go1 = false;
+    st = ST_REPORT;
+    cyc = 77;
+    lines = 5;
+    ck = CK_LAD5;
+    on_clock(false, true);
+    on_clock(true, false);
+    on_clock(false, false);
+    assert_eq(st, ST_RUN);
+    assert_eq(cyc, 0);
+    assert_eq(lines, 0);
+    assert_eq(ck, CK_FIRST);
+    on_clock(true, true);
+    assert_eq(cyc, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 0);
+    on_clock(true, true);
+    assert_eq(cyc, 1);
+    var k : u32 = 0;
+    while (st != ST_REPORT) {
+        on_clock(true, true);
+        k = k + 1;
+    }
+    assert_eq(k, RLC_CLOCKS);
+    assert_eq(cyc, RLC_CLOCKS);
+    assert_eq(verdict, V_PASS);
+    on_clock(true, false);
+    on_clock(true, true);
+    on_clock(true, true);
+    assert_eq(st, ST_REPORT);
+    on_clock(true, true);
+    assert_eq(st, ST_RUN);
+    assert_eq(cyc, 0);
+    assert_eq(lines, 0);
+    assert_eq(verdict, V_FAIL);
+}
+
+test the_pins_show_the_state_one_clock_later {
+    go0 = true;
+    go1 = true;
+    last = false;
+    fin = false;
+    st = ST_REPORT;
+    verdict = V_PASS;
+    tx_sh = 1022;
+    tx_cnt = 5;
+    hb = 0x08000000;
+    on_clock(true, true);
+    assert(!uart_tx);
+    assert(!led_0);
+    assert(led_1);
+    assert(!led_2);
+    assert(led_3);
+    verdict = V_FAIL;
+    tx_sh = 1023;
+    on_clock(true, true);
+    assert(uart_tx);
+    assert(!led_1);
+    assert(led_2);
+    st = ST_JUDGE;
+    on_clock(true, true);
+    assert(uart_tx);
+    assert(led_0);
+    assert(led_1);
+}
+
+test the_board_prints_passing_receipts_for_both_circuits_in_turn {
+    boot(CK_FIRST);
+    baud_div = 1;
+    var buf : [128]u8 = [0] ** 128;
+    var got : usize = 0;
+    var line : u32 = 0;
+    var ch : u8 = 0;
+    var ticks : u32 = 0;
+    var plen : usize = 0;
+    var ea : u32 = 0;
+    var eb : u32 = 0;
+    var es : u64 = 0;
+    var ec : u32 = 0;
+    var fld : usize = 0;
+    var at : usize = 0;
+    while (line < 4 and ticks < 2000000) {
+        on_clock(true, true);
+        ticks = ticks + 1;
+        if (st == ST_REPORT and tx_left == 9) {
+            ch = ((tx_sh >> 1) & 255) as u8;
+            buf[got] = ch;
+            got = got + 1;
+            if (ch == 10) {
+                if (line % 2 == 0) {
+                    plen = 7;
+                    ea = RLC_EXP_A;
+                    eb = RLC_EXP_B;
+                    es = RLC_EXP_S;
+                    ec = RLC_CLOCKS;
+                    assert_eq(buf[4], 82);
+                    assert_eq(buf[5], 76);
+                    assert_eq(buf[6], 67);
+                } else {
+                    plen = 8;
+                    ea = LAD5_EXP_A;
+                    eb = LAD5_EXP_B;
+                    es = LAD5_EXP_S;
+                    ec = LAD5_CLOCKS;
+                    assert_eq(buf[4], 76);
+                    assert_eq(buf[5], 65);
+                    assert_eq(buf[6], 68);
+                    assert_eq(buf[7], 53);
+                }
+                assert_eq(got, plen + 102);
+                assert_eq(buf[0], 84);
+                assert_eq(buf[1], 50);
+                assert_eq(buf[2], 55);
+                assert_eq(buf[3], 32);
+                fld = 0;
+                while (fld < 5) {
+                    at = plen + fld * 19;
+                    assert_eq(buf[at], 32);
+                    assert_eq(buf[at + 2], 61);
+                    fld = fld + 1;
+                }
+                assert_eq(buf[plen + 1], 65);
+                assert_eq(buf[plen + 20], 66);
+                assert_eq(buf[plen + 39], 83);
+                assert_eq(buf[plen + 58], 67);
+                assert_eq(buf[plen + 77], 76);
+                assert_eq(hex_run(&buf, plen + 3), ea as u64);
+                assert_eq(hex_run(&buf, plen + 22), eb as u64);
+                assert_eq(hex_run(&buf, plen + 41), es);
+                assert_eq(hex_run(&buf, plen + 60), ec as u64);
+                assert_eq(hex_run(&buf, plen + 79), line as u64);
+                assert_eq(buf[plen + 95], 32);
+                assert_eq(buf[plen + 96], 80);
+                assert_eq(buf[plen + 97], 65);
+                assert_eq(buf[plen + 98], 83);
+                assert_eq(buf[plen + 99], 83);
+                assert_eq(buf[plen + 100], 13);
+                got = 0;
+                line = line + 1;
+            }
+        }
+    }
+    assert_eq(line, 4);
+    assert_eq(lines, 4);
+    baud_div = BAUD_DIV;
+}

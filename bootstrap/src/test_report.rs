@@ -68,6 +68,7 @@ pub struct Report {
     /// **unwritten**, which is W586's category, and the remedy is to write the
     /// spec, not to add a test to a file with nothing in it.
     pub stub: bool,
+    pub read: Option<String>, // sha256 hex of the spec bytes the tests were built from (seal_write.t27 post_write_check `tested`, #10454); None when unread
     /// Set when the spec never got as far as a runnable binary.
     pub blocked: Option<String>,
     /// #6509: set when the tests ran from the plain build because the counting
@@ -87,6 +88,7 @@ impl Report {
             invariants: 0,
             stub: false,
             blocked: Some(why.into()),
+            read: None,
             uncounted: None,
         }
     }
@@ -610,6 +612,7 @@ fn run_limited(spec: &Path, specs_root: &Path, limit: Duration) -> Report {
         stub,
         blocked: None,
         uncounted,
+        read: Some(crate::sha256_hex(raw.as_bytes())),
     }
 }
 
@@ -923,6 +926,7 @@ mod tests {
             stub: false,
             blocked: None,
             uncounted: None,
+            read: None,
         }
     }
 

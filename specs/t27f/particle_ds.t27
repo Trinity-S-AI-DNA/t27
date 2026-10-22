@@ -1,0 +1,419 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/particle_ds.t27 -- the particle design system of the OS: every visible element is a
+// particle on a spring, and a style is a row of integers. Issue gHashTag/t27#10771, epic #10560.
+//
+// WHY: the owner, 2026-10-19: one content factory, on the factory pattern, that unpacks any idea in
+// any style preset; the factory and every element are formed by particle physics; and in the end
+// this behaviour runs inside the OS itself, on the FPGA too -- it is the visual design system of
+// the OS. Until now each reel (token_floor, reel_particles, lesson_reel) carried its own constants
+// in f64, so a style could not be swapped and nothing could move to hardware.
+//
+// THE DESIGN SYSTEM, in three parts:
+//   tokens    PRESETS rows of integers: three colours, a blend, a particle radius and gain, a
+//             spring, a dashpot, a force law with its strength, a transition kick, a card flag and
+//             a colour rule. A new style is a new column in these tables, never new code.
+//   physics   one integrator step for one particle, per axis: a clamped linear spring toward its
+//             target plus a dashpot (semi-implicit Euler: v += a, then x += v), plus the preset's
+//             law -- gravity (drop, rain), a swirl (vortex), a seeded jitter (drift) -- that fades
+//             with the scene's `live` clock, and a kick when the scene cuts.
+//   paint     a particle is a soft disc w = GAIN r^4 / (r^2 + d^2)^2, summed per pixel and rolled
+//             off by a tone curve; an ink preset subtracts from a light page instead of adding light.
+//
+// THE NUMBERS: positions and velocities are Q8 fixed point (256 = one pixel, one pixel per integrator
+// step), colours are 0xRRGGBB in an i32, angles are a 16-step table. The per-step and per-pixel paths
+// use only add, multiply, compare, table lookup and division by a power of two (q8, q16): no float,
+// no square root, no division by a variable, so the same law can follow the FPGA path. kern() and
+// tone() divide, but only to fill a ROM once (idea_factory builds the tables before the first frame).
+//
+// NOT CLAIMED: the spring rates, laws and colours are design choices, labelled as such; no constant
+// here is a physical measurement. This module has not been run through gen-verilog yet, and no
+// board has drawn it; it is written so that it can be.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module particle_ds;
+
+use t27f::scene_raster::rgb;
+use t27f::scene_raster::red;
+use t27f::scene_raster::green;
+use t27f::scene_raster::blue;
+use t27f::scene_raster::clamp;
+use t27f::scene_raster::iabs;
+use t27f::scene_raster::rnd;
+use t27f::scene_raster::fmod;
+
+pub const ID : str = "particle-ds";
+pub const VERSION : u8 = 1;
+
+// ---- fixed point ----
+pub const ONE : i32 = 256;                 // one pixel, Q8
+pub const AMAX : i32 = 768;                // the largest acceleration, 3 px per step^2
+pub const VMAX : i32 = 12288;              // the largest speed, 48 px per step
+pub const LIVE_STEP : i32 = 6;             // the law's clock falls 6/256 a frame, gone after 43 frames
+
+// ---- the presets (design tokens) ----
+pub const PRESETS : usize = 5;
+pub const P_NOIR : usize = 0;              // gold on near-black, letters fall into place
+pub const P_NEON : usize = 1;              // cyan and magenta on blue-black, a vortex winds them in
+pub const P_TRIT : usize = 2;              // -1, 0, +1 charges burst from the centre
+pub const P_PAPER : usize = 3;             // ink on a cream page, drifting like dust
+pub const P_RAIN : usize = 4;              // green rain falls and holds as letters
+pub const PRESET_NAMES : str = "noir-gold,neon-vortex,trit-charge,paper-ink,rain";
+
+pub const LAW_DROP : i32 = 0;
+pub const LAW_VORTEX : i32 = 1;
+pub const LAW_BURST : i32 = 2;
+pub const LAW_DRIFT : i32 = 3;
+pub const LAW_RAIN : i32 = 4;
+
+pub const BLEND_ADD : i32 = 0;             // light adds on a dark field
+pub const BLEND_INK : i32 = 1;             // ink subtracts from a light page
+
+pub const MIX_HEAT : i32 = 0;              // colour from A to B as the particle speeds up
+pub const MIX_TRIT : i32 = 1;              // colour from the particle's trit: A = -1, B = 0, C = +1
+
+//                                 noir       neon       trit       paper      rain
+pub const BG : [5]i32 =          [0x0A0A0A, 0x06060F, 0x080808, 0xECE6DA, 0x000602];
+pub const COL_A : [5]i32 =       [0xFFC45C, 0x00E5FF, 0xFF5A5A, 0x18161C, 0x00FF66];
+pub const COL_B : [5]i32 =       [0xFFF1DC, 0xFF2BD6, 0xEBEBEB, 0xC41E28, 0xBEFFD2];
+pub const COL_C : [5]i32 =       [0x8C5A1E, 0x7850FF, 0x50A0FF, 0x5A5650, 0x008C3C];
+pub const KEY_COL : [5]i32 =     [0xFFF1DC, 0x7850FF, 0xEBEBEB, 0xFFFFFF, 0x00FF66];
+pub const KEY_LIFT : [5]i32 =    [18, 14, 10, 8, 10];      // levels the key light adds at its centre
+pub const VIGN : [5]i32 =        [20, 22, 18, 8, 22];      // how much the corners darken
+pub const GRAIN : [5]i32 =       [3, 3, 3, 4, 4];          // levels, peak to peak
+pub const BLEND : [5]i32 =       [0, 0, 0, 1, 0];
+pub const MIX : [5]i32 =         [0, 0, 1, 0, 0];
+pub const RADIUS : [5]i32 =      [5, 5, 6, 4, 4];          // px
+pub const GAIN : [5]i32 =        [200, 210, 190, 230, 190];    // a lone particle's peak, of 256
+pub const SPRING : [5]i32 =      [5, 4, 6, 3, 7];          // Q8 per step^2 per Q8 of distance
+pub const DAMP : [5]i32 =        [46, 42, 51, 42, 55];     // Q8 per step: damping ratio 0.65-0.75
+pub const LAW : [5]i32 =         [0, 1, 2, 3, 4];
+pub const FORCE : [5]i32 =       [300, 50, 0, 200, 500];   // the law's strength, see law_ax/law_ay
+pub const KICK : [5]i32 =        [2600, 3000, 220, 1600, 1200];
+pub const CARD : [5]i32 =        [1, 1, 0, 1, 0];          // a card border of particles behind the text
+
+// cos of k * 2 pi / 16, Q8; sin(k) = COS16[(k + 12) % 16].
+pub const COS16 : [16]i32 = [256, 237, 181, 98, 0, -98, -181, -237, -256, -237, -181, -98, 0, 98, 181, 237];
+
+// ---- integer helpers ----
+
+// Division by 256 and by 65536, rounding toward zero (a shift and a sign fix in hardware).
+pub fn q8(a: i32) -> i32 {
+    return @divTrunc(a, 256);
+}
+pub fn q16(a: i32) -> i32 {
+    return @divTrunc(a, 65536);
+}
+pub fn dir_cos(k: i32) -> i32 {
+    return COS16[@as(usize, @intCast(fmod(k, 16)))];
+}
+pub fn dir_sin(k: i32) -> i32 {
+    return COS16[@as(usize, @intCast(fmod(k + 12, 16)))];
+}
+
+// ---- physics: one step of one particle ----
+
+// The scene's law clock, of 256: full when the scene cuts, gone LIVE_STEP frames later per level.
+pub fn live(frame_in_scene: i32) -> i32 {
+    return clamp(ONE - LIVE_STEP * frame_in_scene, 0, ONE);
+}
+
+// The spring toward t and the dashpot on v, Q8 px per step^2, clamped to AMAX.
+pub fn spring_a(p: usize, x: i32, v: i32, t: i32) -> i32 {
+    const a = q8(SPRING[p] * (t - x)) - q8(DAMP[p] * v);
+    return clamp(a, 0 - AMAX, AMAX);
+}
+
+// The preset's law along x and y. dx, dy: the particle from the scene's centre, Q8 px; h: a seeded
+// byte 0..255 for this particle and step; l: the law clock; gap: the target below the particle, Q8
+// (gravity pulls only a particle still above its place, so a settled letter does not sag).
+pub fn law_ax(p: usize, dx: i32, dy: i32, l: i32, h: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_VORTEX) { return q8(q16(0 - dy * FORCE[p]) * l); }
+    if (law == LAW_DRIFT) { return q16((h - 128) * FORCE[p] * l); }
+    return 0;
+}
+pub fn law_ay(p: usize, dx: i32, dy: i32, l: i32, h: i32, gap: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_DROP || law == LAW_RAIN) {
+        if (gap > 4 * ONE) { return q8(FORCE[p] * l); }
+        return 0;
+    }
+    if (law == LAW_VORTEX) { return q8(q16(dx * FORCE[p]) * l); }
+    if (law == LAW_DRIFT) { return q16((128 - h) * FORCE[p] * l); }
+    return 0;
+}
+
+// One step of one axis: the new velocity (semi-implicit Euler; the caller then adds it to x).
+pub fn step_v(p: usize, x: i32, v: i32, t: i32, law_a: i32) -> i32 {
+    return clamp(v + spring_a(p, x, v, t) + law_a, 0 - VMAX, VMAX);
+}
+
+// The kick when a scene cuts, per axis: a hop (drop), a turn (vortex), a blast out of the centre
+// (burst), a shove (drift), a push down (rain).
+pub fn kick_x(p: usize, dx: i32, dy: i32, h: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_VORTEX) { return q16(0 - dy * KICK[p]); }
+    if (law == LAW_BURST) { return @divTrunc(q8(dx * KICK[p]), 16); }
+    if (law == LAW_DRIFT) { return q8((h - 128) * KICK[p]); }
+    return 0;
+}
+pub fn kick_y(p: usize, dx: i32, dy: i32, h: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_DROP) { return 0 - KICK[p]; }
+    if (law == LAW_VORTEX) { return q16(dx * KICK[p]); }
+    if (law == LAW_BURST) { return @divTrunc(q8(dy * KICK[p]), 16); }
+    if (law == LAW_DRIFT) { return q8((128 - h) * KICK[p]); }
+    if (law == LAW_RAIN) { return KICK[p]; }
+    return 0;
+}
+
+// Where particle i starts, in px, given its first target (tx, ty) and the frame's centre (cx, cy).
+pub fn start_x(p: usize, i: i32, tx: i32, cx: i32, w: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_VORTEX) { return cx + q8(dir_cos(i) * (300 + rnd(i * 3 + 1, 420))); }
+    if (law == LAW_BURST) { return cx + q8(dir_cos(i) * rnd(i * 3 + 1, 40)); }
+    if (law == LAW_DRIFT) { return rnd(i * 5 + 2, w); }
+    return tx + rnd(i * 7 + 3, 9) - 4;
+}
+pub fn start_y(p: usize, i: i32, ty: i32, cy: i32, h: i32) -> i32 {
+    const law = LAW[p];
+    if (law == LAW_VORTEX) { return cy + q8(dir_sin(i) * (300 + rnd(i * 3 + 1, 420))); }
+    if (law == LAW_BURST) { return cy + q8(dir_sin(i) * rnd(i * 3 + 1, 40)); }
+    if (law == LAW_DRIFT) { return rnd(i * 5 + 4, h); }
+    if (law == LAW_RAIN) { return 0 - 40 - rnd(i * 11 + 5, 2400); }
+    return 0 - 200 - rnd(i * 11 + 5, 1100);
+}
+// A burst starts already flying outward.
+pub fn start_vx(p: usize, i: i32) -> i32 {
+    if (LAW[p] == LAW_BURST) { return q8(dir_cos(i) * (KICK[p] * 20 + rnd(i * 13 + 6, 2000))); }
+    return 0;
+}
+pub fn start_vy(p: usize, i: i32) -> i32 {
+    if (LAW[p] == LAW_BURST) { return q8(dir_sin(i) * (KICK[p] * 20 + rnd(i * 13 + 6, 2000))); }
+    return 0;
+}
+
+// ---- paint ----
+
+// The colour of particle i at speed s (|vx| + |vy|, Q8).
+pub fn particle_col(p: usize, i: i32, s: i32) -> i32 {
+    if (MIX[p] == MIX_TRIT) {
+        const t = fmod(i, 3);
+        if (t == 0) { return COL_A[p]; }
+        if (t == 1) { return COL_B[p]; }
+        return COL_C[p];
+    }
+    if (fmod(i, 7) == 0) { return COL_C[p]; }
+    const k = clamp(q8(s * 64), 0, 256);
+    const r = red(COL_A[p]) + q8((red(COL_B[p]) - red(COL_A[p])) * k);
+    const g = green(COL_A[p]) + q8((green(COL_B[p]) - green(COL_A[p])) * k);
+    const b = blue(COL_A[p]) + q8((blue(COL_B[p]) - blue(COL_A[p])) * k);
+    return rgb(r, g, b);
+}
+
+// What one channel of a particle adds to the pixel sum: light for ADD, the ink's depth for INK.
+pub fn channel_of(p: usize, col_ch: i32, bg_ch: i32) -> i32 {
+    if (BLEND[p] == BLEND_INK) { return bg_ch - col_ch; }
+    return col_ch;
+}
+
+// The kernel's reach: past 3 r a particle adds under GAIN / 100.
+pub fn reach(p: usize) -> i32 {
+    return 3 * RADIUS[p];
+}
+// The kernel at squared distance d2 (px^2), of 256: GAIN r^4 / (r^2 + d2)^2. Fills a ROM once.
+pub fn kern(p: usize, d2: i32) -> i32 {
+    const r2 = RADIUS[p] * RADIUS[p];
+    const q = r2 + d2;
+    return @divTrunc(GAIN[p] * r2 * r2, q * q);
+}
+// The tone curve: the identity up to 200, then a roll-off toward 255. Fills a ROM once.
+pub fn tone(x: i32) -> i32 {
+    if (x <= 200) { return x; }
+    const e = x - 200;
+    return 200 + @divTrunc(55 * e, e + 55);
+}
+pub const TONE_N : i32 = 1024;
+
+// The darkening toward the corners, of 256, at (x, y) in px on a w x h frame.
+pub fn vignette(p: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
+    const dx = x - @divTrunc(w, 2);
+    const dy = y - @divTrunc(h, 2);
+    const d = @divTrunc(q8(dx * dx + dy * dy), 16);
+    return ONE - q8(clamp(d, 0, 300) * VIGN[p]) * 3;
+}
+// The key light's lift at (x, y): KEY_LIFT at its centre (w / 2, 0.42 h), gone 700 px away.
+pub fn key_lift(p: usize, x: i32, y: i32, w: i32, h: i32) -> i32 {
+    const dx = x - @divTrunc(w, 2);
+    const dy = y - q8(h * 108);
+    const d = q16(dx * dx + dy * dy);
+    return clamp(KEY_LIFT[p] - q8(d * KEY_LIFT[p] * 34), 0, KEY_LIFT[p]);
+}
+// The final level of one channel: background, key light, the toned particle sum t, vignette, grain.
+pub fn finish(p: usize, bg_ch: i32, key_ch: i32, lift: i32, t: i32, vig: i32, grain: i32) -> i32 {
+    var v : i32 = 0;
+    if (BLEND[p] == BLEND_INK) {
+        v = bg_ch - t;
+    } else {
+        v = bg_ch + q8(key_ch * lift) + t;
+    }
+    return clamp(q8(v * vig) + grain, 0, 255);
+}
+
+// ---- tests ----
+
+test "five presets, five names, and every table has a row for each" {
+    var commas : i32 = 0;
+    var k : usize = 0;
+    while (k < PRESET_NAMES.len) {
+        if (PRESET_NAMES[k] == 44) { commas = commas + 1; }
+        k = k + 1;
+    }
+    assert(commas + 1 == 5);
+    assert(PRESETS == 5);
+    assert(LAW[P_NOIR] == LAW_DROP);
+    assert(LAW[P_NEON] == LAW_VORTEX);
+    assert(LAW[P_TRIT] == LAW_BURST);
+    assert(LAW[P_PAPER] == LAW_DRIFT);
+    assert(LAW[P_RAIN] == LAW_RAIN);
+    assert(BLEND[P_PAPER] == BLEND_INK);
+    assert(MIX[P_TRIT] == MIX_TRIT);
+}
+
+test "no two presets share a palette" {
+    var a : usize = 0;
+    while (a < PRESETS) {
+        var b : usize = a + 1;
+        while (b < PRESETS) {
+            assert(BG[a] != BG[b] || COL_A[a] != COL_A[b]);
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+}
+
+test "q8 rounds toward zero on both sides, so a dashpot never drifts one way" {
+    assert(q8(255) == 0);
+    assert(q8(0 - 255) == 0);
+    assert(q8(256) == 1);
+    assert(q8(0 - 256) == 0 - 1);
+    assert(q16(0 - 65535) == 0);
+}
+
+test "the direction table is a circle: cos^2 + sin^2 is 256^2 within 1%" {
+    var k : i32 = 0;
+    while (k < 16) {
+        const c = dir_cos(k);
+        const s = dir_sin(k);
+        const n = c * c + s * s;
+        assert(n > 64880 && n < 66190);
+        k = k + 1;
+    }
+    assert(dir_sin(4) == 256);
+    assert(dir_cos(8) == 0 - 256);
+}
+
+test "every preset's spring settles a particle 1000 px away inside one 72-frame scene, overshooting under 120 px" {
+    var p : usize = 0;
+    while (p < PRESETS) {
+        var x : i32 = 0;
+        var v : i32 = 0;
+        const t : i32 = 1000 * ONE;
+        var over : i32 = 0;
+        var st : i32 = 0;
+        while (st < 144) {
+            v = step_v(p, x, v, t, 0);
+            x = x + v;
+            if (x - t > over) { over = x - t; }
+            st = st + 1;
+        }
+        assert(iabs(x - t) < 2 * ONE);
+        assert(iabs(v) < ONE);
+        assert(over < 120 * ONE);
+        p = p + 1;
+    }
+}
+
+test "the law clock is full at the cut and gone before the next" {
+    assert(live(0) == 256);
+    assert(live(20) == 136);
+    assert(live(43) == 0);
+    assert(live(71) == 0);
+}
+
+test "laws push the way they say" {
+    assert(law_ay(P_NOIR, 0, 0, 256, 0, 1000 * ONE) == 300);
+    assert(law_ay(P_RAIN, 0, 0, 256, 0, 1000 * ONE) > law_ay(P_NOIR, 0, 0, 256, 0, 1000 * ONE));
+    assert(law_ax(P_NOIR, 1000, 1000, 256, 77) == 0);
+    assert(law_ay(P_NOIR, 0, 0, 0, 0, 1000 * ONE) == 0);
+    // the vortex turns: a particle right of centre is pushed down, one below it is pushed left
+    assert(law_ay(P_NEON, 400 * ONE, 0, 256, 0, 1000 * ONE) > 0);
+    assert(law_ax(P_NEON, 0, 400 * ONE, 256, 0) < 0);
+    // a burst kicks outward
+    assert(kick_x(P_TRIT, 100 * ONE, 0, 0) > 0);
+    assert(kick_y(P_TRIT, 0, 0 - 100 * ONE, 0) < 0);
+    assert(kick_y(P_NOIR, 0, 0, 0) < 0);
+    assert(kick_y(P_RAIN, 0, 0, 0) > 0);
+}
+
+test "starts: rain and drop above the frame, burst at the centre, drift inside it" {
+    var i : i32 = 0;
+    while (i < 64) {
+        assert(start_y(P_NOIR, i, 900, 960, 1920) < 0);
+        assert(start_y(P_RAIN, i, 900, 960, 1920) < 0);
+        assert(iabs(start_x(P_TRIT, i, 0, 540, 1080) - 540) <= 40);
+        const dx = start_x(P_PAPER, i, 0, 540, 1080);
+        assert(dx >= 0 && dx < 1080);
+        assert(iabs(start_vx(P_TRIT, i)) + iabs(start_vy(P_TRIT, i)) > 0);
+        assert(start_vx(P_NOIR, i) == 0);
+        i = i + 1;
+    }
+}
+
+test "colours: a still particle is colour A, a fast one is colour B, a trit picks its own" {
+    assert(particle_col(P_NOIR, 1, 0) == COL_A[P_NOIR]);
+    assert(particle_col(P_NOIR, 1, 4096) == COL_B[P_NOIR]);
+    assert(particle_col(P_NOIR, 7, 0) == COL_C[P_NOIR]);
+    assert(particle_col(P_TRIT, 0, 9999) == COL_A[P_TRIT]);
+    assert(particle_col(P_TRIT, 1, 0) == COL_B[P_TRIT]);
+    assert(particle_col(P_TRIT, 2, 0) == COL_C[P_TRIT]);
+    assert(channel_of(P_PAPER, 24, 236) == 212);
+    assert(channel_of(P_NOIR, 196, 10) == 196);
+}
+
+test "the kernel peaks at GAIN, falls with distance, and is under 1% of it at its reach" {
+    var p : usize = 0;
+    while (p < PRESETS) {
+        assert(kern(p, 0) == GAIN[p]);
+        var d2 : i32 = 1;
+        var last : i32 = kern(p, 0);
+        while (d2 <= reach(p) * reach(p)) {
+            const k = kern(p, d2);
+            assert(k <= last);
+            last = k;
+            d2 = d2 + 1;
+        }
+        assert(last * 100 <= GAIN[p] + 100);
+        p = p + 1;
+    }
+}
+
+test "tone keeps the dark levels and never clips past 255" {
+    assert(tone(0) == 0);
+    assert(tone(200) == 200);
+    assert(tone(255) == 227);
+    assert(tone(TONE_N - 1) <= 255);
+    assert(tone(TONE_N - 1) >= 250);
+}
+
+test "finish: the dark field stays near-black at the corners, the page stays cream" {
+    const vc = vignette(P_NOIR, 0, 0, 1080, 1920);
+    assert(vc < 256 && vc > 150);
+    assert(vignette(P_NOIR, 540, 960, 1080, 1920) == 256);
+    assert(key_lift(P_NOIR, 540, 806, 1080, 1920) == KEY_LIFT[P_NOIR]);
+    assert(key_lift(P_NOIR, 540, 1900, 1080, 1920) == 0);
+    assert(finish(P_NOIR, 10, 255, 0, 0, 256, 0) == 10);
+    assert(finish(P_PAPER, 236, 255, 0, 0, 256, 0) == 236);
+    assert(finish(P_PAPER, 236, 255, 0, 212, 256, 0) == 24);
+    assert(finish(P_NOIR, 10, 255, 0, 400, 256, 0) == 255);
+}

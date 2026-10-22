@@ -1,0 +1,930 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/loop/tick.t27 -- what `tri loop plan` prints for one tick of the overnight loop (gHashTag/t27#11059)
+; A tick of the loop (.claude/skills/analog-emulation/SKILL.md, "The overnight loop tick") used to be prose:
+; read the ledger, look for anomalies, do not start a lane the ledger lists as running, chase a request
+; once. Prose lets a new cron cycle repeat or undo the last one's work. This spec is that prose as
+; pure functions over a snapshot of the loop's state, with tests; the command (cli/tri/src/loopclaim.rs,
+; through `t27c gen-rust` in gen/rust/tri/loop/tick.rs) reads the snapshot from a file or stdin, calls
+; the functions below and prints one action per line. It contacts no network and no machine. The
+; clock is a line of the snapshot (`now`), so the same snapshot always prints the same lines.
+; The snapshot is text, one record per line, tokens split by one space; a blank line and a line that
+; starts with `;` are skipped:
+;   now <time>                                        the instant of the tick, YYYY-MM-DDTHH:MM:SSZ
+;   last <hash>                                       the HASH line the previous tick printed (optional)
+;   row <lane> <running|done> <since>                 a ledger row: the lane, its state, when it began
+;   want <lane>                                       a lane the loop would start
+;   pr <number> <branch> <green|pending|red> <merge>  an open pull request; merge is GitHub's mergeStateStatus
+;   merged <branch>                                   the head branch of a merged pull request
+;   agent <id> <running|done> <branch>                a subagent and the branch it was given
+;   cron <id> <prompt words...>                       a scheduled prompt
+;   req <id> <who> <sent> <due> <open|chased|answered|defaulted> <what words...> | <default words...>
+;                                                     a request out (CLAUDE.md "Proactivity: request, do not ask")
+; The action of a record, first rule that applies:
+;   want   START unless the ledger has a row for the lane (any state) or an earlier want names it
+;   row    RECHECK when it says running and is RUNNING_MINUTES old or older (the ledger's 45 minutes,
+;          the number `tri lanes` calls STALE_MINUTES, imported; a test holds the two equal)
+;   pr     FIX when a check failed; else UPDATE_BRANCH when it conflicts (DIRTY) or its base moved on
+;          (BEHIND, the staleness `tri pr ready` names): GitHub's update-branch merges the base into
+;          the head, nothing here rewrites history, and no action is a force-push
+;   agent  FIND_PR when it says done and no pr or merged record names its branch
+;   cron   DELETE_DUPLICATE when an earlier cron has the same prompt
+;   req    open and due: CHASE, once; chased and due: TAKE_DEFAULT; before due, answered, defaulted: none.
+;          The state moves only when the loop writes it, so a request is never chased twice
+; Fail closed (as specs/claw/refresh.t27 does): a record this spec cannot read, a time that does not
+; parse, a record that needs `now` when there is none, a second `now`, `last` or request id, is
+; UNREADABLE, never silence. The 45-minute and BEHIND/DIRTY facts are the ones `tri lanes` (specs/tri/lanes/lanes.t27)
+; and `tri pr ready` already rule on; the time readers are lanes.t27's, imported, not copied.
+; Idempotence. plan_hash folds every record and the action it gets (not `now`, not `last`) into one
+; number below 10^18. When the snapshot's `last` equals it, the tick is a NOOP: the same state with the
+; same plan was already handed out; the command prints NOOP in place of the actions. Every tick ends with
+; `HASH <number>`: the loop writes it into the next snapshot as `last`. A lane crossing 45 minutes
+; changes a plan, so time passing is a change and a static night is not a repeat. This is a change
+; detector over text, not a cryptographic hash.
+; UPDATE_BRANCH starts about 26 workflows each (specs/claw/refresh.t27): the loop meters them, this
+; spec does not read the Actions queue.
+; Searched before writing (FR-004, DRY): `tri night` (night.rs action_for maps mergeStateStatus to
+; words, hand Rust, not snapshot-driven), `tri lanes` (RED, CONFLICT, STALE per lane from gh JSON; its
+; constants and time readers are reused), `tri worktrees --reap-plan` (specs/tri/worktrees/reap.t27,
+; removal, not planning), specs/claw/refresh.t27 and specs/queen/review_valve.t27 (which PRs the App
+; refreshes, one Queen-published PR), specs/queen/waits.t27 (store rows with wake times), specs/tri/reseal.
+; None decides a tick's actions from a ledger, so this spec is new; it extends none by copying.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriLoopTick;
+
+use tri::lab::receipt::line_end;
+use tri::lab::receipt::span_is;
+use tri::lanes::lanes::digits;
+use tri::lanes::lanes::iso_seconds;
+use tri::lanes::lanes::age_minutes;
+use tri::lanes::lanes::age_known;
+use tri::lanes::lanes::STALE_MINUTES;
+
+// A running row this old, in whole minutes, is an anomaly. The test the_limit_is_the_ledgers holds it equal
+// to STALE_MINUTES of `tri lanes`, at run time, so a drift fails a test instead of blocking the build.
+pub const RUNNING_MINUTES : u64 = 45;
+pub const HASH_P1 : u64 = 999999937;
+pub const HASH_P2 : u64 = 999999929;
+
+// The kinds of record.
+pub const K_BAD : u8 = 0;
+pub const K_NOW : u8 = 1;
+pub const K_LAST : u8 = 2;
+pub const K_ROW : u8 = 3;
+pub const K_WANT : u8 = 4;
+pub const K_PR : u8 = 5;
+pub const K_MERGED : u8 = 6;
+pub const K_AGENT : u8 = 7;
+pub const K_CRON : u8 = 8;
+pub const K_REQ : u8 = 9;
+
+// The actions. NONE is not printed. NOOP stands for a whole tick, UNREADABLE for a record.
+pub const A_NONE : u8 = 0;
+pub const A_START : u8 = 1;
+pub const A_RECHECK : u8 = 2;
+pub const A_UPDATE_BRANCH : u8 = 3;
+pub const A_FIX : u8 = 4;
+pub const A_FIND_PR : u8 = 5;
+pub const A_DELETE_DUPLICATE : u8 = 6;
+pub const A_CHASE : u8 = 7;
+pub const A_TAKE_DEFAULT : u8 = 8;
+pub const A_BAD : u8 = 9;
+pub const A_NOOP : u8 = 10;
+pub const ACTIONS : u8 = 11;
+
+// A pull request's checks, and its mergeStateStatus as GitHub spells it.
+pub const C_GREEN : u8 = 0;
+pub const C_PENDING : u8 = 1;
+pub const C_RED : u8 = 2;
+pub const C_BAD : u8 = 3;
+pub const M_CLEAN : u8 = 0;
+pub const M_BEHIND : u8 = 1;
+pub const M_BLOCKED : u8 = 2;
+pub const M_DIRTY : u8 = 3;
+pub const M_DRAFT : u8 = 4;
+pub const M_HAS_HOOKS : u8 = 5;
+pub const M_UNKNOWN : u8 = 6;
+pub const M_UNSTABLE : u8 = 7;
+pub const M_BAD : u8 = 8;
+
+// A request's state in the ledger.
+pub const R_OPEN : u8 = 0;
+pub const R_CHASED : u8 = 1;
+pub const R_ANSWERED : u8 = 2;
+pub const R_DEFAULTED : u8 = 3;
+pub const R_BAD : u8 = 4;
+
+invariant the_words_are_numbered { assert A_NONE == 0 and A_NOOP == 10 and ACTIONS == 11 and K_REQ == 9 and C_RED == 2 and M_UNSTABLE == 7 and R_DEFAULTED == 3; }
+
+// ---- the text ---------------------------------------------------------------------------------------
+
+/// The offset where token n of the line s[at..stop] starts; stop when the line has fewer tokens.
+pub fn tok_from(s: string, at: usize, stop: usize, n: usize) -> usize {
+    var k : usize = at;
+    var i : usize = 0;
+    while (i < n) {
+        while (k < stop and s[k] != 32) {
+            k = k + 1;
+        }
+        if (k >= stop) { return stop; }
+        k = k + 1;
+        i = i + 1;
+    }
+    return k;
+}
+
+pub fn tok_to(s: string, at: usize, stop: usize, n: usize) -> usize {
+    var k : usize = tok_from(s, at, stop, n);
+    while (k < stop and s[k] != 32) {
+        k = k + 1;
+    }
+    return k;
+}
+
+/// How many tokens the line has: one more than its spaces. An empty token (two spaces) counts.
+pub fn ntok(s: string, at: usize, stop: usize) -> usize {
+    var n : usize = 1;
+    var k : usize = at;
+    while (k < stop) {
+        if (s[k] == 32) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// Does the line have at least n tokens, the first n of them not empty?
+pub fn head_ok(s: string, at: usize, stop: usize, n: usize) -> bool {
+    if (ntok(s, at, stop) < n) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (tok_to(s, at, stop, i) == tok_from(s, at, stop, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Does the line have exactly n tokens, none empty?
+pub fn fields_ok(s: string, at: usize, stop: usize, n: usize) -> bool {
+    return ntok(s, at, stop) == n and head_ok(s, at, stop, n);
+}
+
+pub fn tok_is(s: string, at: usize, stop: usize, n: usize, lit: string) -> bool {
+    return span_is(s, tok_from(s, at, stop, n), tok_to(s, at, stop, n), lit);
+}
+
+/// Are s[a1..a2] and s[b1..b2] the same bytes?
+pub fn same_span(s: string, a1: usize, a2: usize, b1: usize, b2: usize) -> bool {
+    if (a2 < a1 or b2 < b1 or a2 - a1 != b2 - b1) { return false; }
+    var i : usize = 0;
+    while (i < a2 - a1) {
+        if (s[a1 + i] != s[b1 + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The start of the first record at or after `at`: a line that is neither blank nor a `;` comment.
+/// s.len when there is none.
+pub fn next_record(s: string, at: usize) -> usize {
+    var k : usize = at;
+    while (k < s.len) {
+        if (s[k] != 10 and s[k] != 59) { return k; }
+        k = line_end(s, k) + 1;
+    }
+    return s.len;
+}
+
+/// The kind of the record s[at..stop], from its first token.
+pub fn kind_of(s: string, at: usize, stop: usize) -> u8 {
+    if (tok_is(s, at, stop, 0, "now")) { return K_NOW; }
+    if (tok_is(s, at, stop, 0, "last")) { return K_LAST; }
+    if (tok_is(s, at, stop, 0, "row")) { return K_ROW; }
+    if (tok_is(s, at, stop, 0, "want")) { return K_WANT; }
+    if (tok_is(s, at, stop, 0, "pr")) { return K_PR; }
+    if (tok_is(s, at, stop, 0, "merged")) { return K_MERGED; }
+    if (tok_is(s, at, stop, 0, "agent")) { return K_AGENT; }
+    if (tok_is(s, at, stop, 0, "cron")) { return K_CRON; }
+    if (tok_is(s, at, stop, 0, "req")) { return K_REQ; }
+    return K_BAD;
+}
+
+/// Does a record of kind k that starts before `before` have s[a..b] as its token n?
+pub fn listed(s: string, k: u8, n: usize, a: usize, b: usize, before: usize) -> bool {
+    var at : usize = next_record(s, 0);
+    while (at < before) {
+        const stop : usize = line_end(s, at);
+        if (kind_of(s, at, stop) == k and same_span(s, a, b, tok_from(s, at, stop, n), tok_to(s, at, stop, n))) { return true; }
+        at = next_record(s, stop + 1);
+    }
+    return false;
+}
+
+// ---- the clock --------------------------------------------------------------------------------------
+
+/// Unix seconds of token n of the line, 0 when it is not a time.
+pub fn time_of(s: string, at: usize, stop: usize, n: usize) -> u64 {
+    return iso_seconds(s, tok_from(s, at, stop, n), tok_to(s, at, stop, n));
+}
+
+/// The tick's instant: the first `now` record. 0 when there is none or it is not a time.
+pub fn now_seconds(s: string) -> u64 {
+    var at : usize = next_record(s, 0);
+    while (at < s.len) {
+        const stop : usize = line_end(s, at);
+        if (kind_of(s, at, stop) == K_NOW) {
+            if (fields_ok(s, at, stop, 2)) { return time_of(s, at, stop, 1); }
+            return 0;
+        }
+        at = next_record(s, stop + 1);
+    }
+    return 0;
+}
+
+/// The hash the previous tick printed: the first `last` record. 0 when there is none or it is not a number.
+pub fn last_hash(s: string) -> u64 {
+    var at : usize = next_record(s, 0);
+    while (at < s.len) {
+        const stop : usize = line_end(s, at);
+        if (kind_of(s, at, stop) == K_LAST) {
+            if (fields_ok(s, at, stop, 2)) { return digits(s, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1)); }
+            return 0;
+        }
+        at = next_record(s, stop + 1);
+    }
+    return 0;
+}
+
+// ---- the facts, as numbers --------------------------------------------------------------------------
+
+pub fn ci_code(s: string, from: usize, to: usize) -> u8 {
+    if (span_is(s, from, to, "green")) { return C_GREEN; }
+    if (span_is(s, from, to, "pending")) { return C_PENDING; }
+    if (span_is(s, from, to, "red")) { return C_RED; }
+    return C_BAD;
+}
+
+pub fn merge_code(s: string, from: usize, to: usize) -> u8 {
+    if (span_is(s, from, to, "CLEAN")) { return M_CLEAN; }
+    if (span_is(s, from, to, "BEHIND")) { return M_BEHIND; }
+    if (span_is(s, from, to, "BLOCKED")) { return M_BLOCKED; }
+    if (span_is(s, from, to, "DIRTY")) { return M_DIRTY; }
+    if (span_is(s, from, to, "DRAFT")) { return M_DRAFT; }
+    if (span_is(s, from, to, "HAS_HOOKS")) { return M_HAS_HOOKS; }
+    if (span_is(s, from, to, "UNKNOWN")) { return M_UNKNOWN; }
+    if (span_is(s, from, to, "UNSTABLE")) { return M_UNSTABLE; }
+    return M_BAD;
+}
+
+pub fn req_code(s: string, from: usize, to: usize) -> u8 {
+    if (span_is(s, from, to, "open")) { return R_OPEN; }
+    if (span_is(s, from, to, "chased")) { return R_CHASED; }
+    if (span_is(s, from, to, "answered")) { return R_ANSWERED; }
+    if (span_is(s, from, to, "defaulted")) { return R_DEFAULTED; }
+    return R_BAD;
+}
+
+// ---- the rules --------------------------------------------------------------------------------------
+
+/// A ledger row that says running: RECHECK from RUNNING_MINUTES whole minutes on, else nothing. A
+/// row with no time to age (0, or one in the future) is not old.
+pub fn row_decision(running: bool, now: u64, since: u64) -> u8 {
+    if (running == false) { return A_NONE; }
+    const age : u64 = age_minutes(now, since);
+    if (age_known(age) and age >= RUNNING_MINUTES) { return A_RECHECK; }
+    return A_NONE;
+}
+
+/// A pull request: a failed check is FIX (it comes first, as RED does in `tri lanes`); a conflict or a
+/// base that moved on is UPDATE_BRANCH; anything else, pending checks and a draft included, is left.
+pub fn pr_decision(ci: u8, merge: u8) -> u8 {
+    if (ci == C_RED) { return A_FIX; }
+    if (merge == M_DIRTY or merge == M_BEHIND) { return A_UPDATE_BRANCH; }
+    return A_NONE;
+}
+
+/// A request out: nothing before its due time, nothing once it is answered or defaulted, CHASE when it
+/// is open and due, TAKE_DEFAULT when it was chased and is due. Chased is never CHASE.
+pub fn req_decision(state: u8, now: u64, due: u64) -> u8 {
+    if (state != R_OPEN and state != R_CHASED) { return A_NONE; }
+    if (now < due) { return A_NONE; }
+    if (state == R_OPEN) { return A_CHASE; }
+    return A_TAKE_DEFAULT;
+}
+
+/// The offset of the ` | ` that ends a request's `what`, at or after `from`; stop when there is none.
+pub fn bar_at(s: string, from: usize, stop: usize) -> usize {
+    var k : usize = from;
+    while (k + 3 <= stop) {
+        if (span_is(s, k, k + 3, " | ")) { return k; }
+        k = k + 1;
+    }
+    return stop;
+}
+
+pub fn now_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 2) == false or time_of(s, at, stop, 1) == 0) { return A_BAD; }
+    if (listed(s, K_NOW, 0, tok_from(s, at, stop, 0), tok_to(s, at, stop, 0), at)) { return A_BAD; }
+    return A_NONE;
+}
+
+pub fn last_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 2) == false or digits(s, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1)) == 0) { return A_BAD; }
+    if (listed(s, K_LAST, 0, tok_from(s, at, stop, 0), tok_to(s, at, stop, 0), at)) { return A_BAD; }
+    return A_NONE;
+}
+
+pub fn row_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 4) == false or time_of(s, at, stop, 3) == 0) { return A_BAD; }
+    const running : bool = tok_is(s, at, stop, 2, "running");
+    if (running == false and tok_is(s, at, stop, 2, "done") == false) { return A_BAD; }
+    if (running and now_seconds(s) == 0) { return A_BAD; }
+    return row_decision(running, now_seconds(s), time_of(s, at, stop, 3));
+}
+
+pub fn want_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 2) == false) { return A_BAD; }
+    if (listed(s, K_ROW, 1, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1), s.len)) { return A_NONE; }
+    if (listed(s, K_WANT, 1, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1), at)) { return A_NONE; }
+    return A_START;
+}
+
+pub fn pr_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 5) == false or digits(s, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1)) == 0) { return A_BAD; }
+    const ci : u8 = ci_code(s, tok_from(s, at, stop, 3), tok_to(s, at, stop, 3));
+    const merge : u8 = merge_code(s, tok_from(s, at, stop, 4), tok_to(s, at, stop, 4));
+    if (ci == C_BAD or merge == M_BAD) { return A_BAD; }
+    return pr_decision(ci, merge);
+}
+
+pub fn agent_action(s: string, at: usize, stop: usize) -> u8 {
+    if (fields_ok(s, at, stop, 4) == false) { return A_BAD; }
+    const done : bool = tok_is(s, at, stop, 2, "done");
+    if (done == false and tok_is(s, at, stop, 2, "running") == false) { return A_BAD; }
+    if (done == false) { return A_NONE; }
+    const a : usize = tok_from(s, at, stop, 3);
+    const b : usize = tok_to(s, at, stop, 3);
+    if (listed(s, K_PR, 2, a, b, s.len) or listed(s, K_MERGED, 1, a, b, s.len)) { return A_NONE; }
+    return A_FIND_PR;
+}
+
+pub fn cron_action(s: string, at: usize, stop: usize) -> u8 {
+    if (head_ok(s, at, stop, 3) == false) { return A_BAD; }
+    var o : usize = next_record(s, 0);
+    while (o < at) {
+        const oe : usize = line_end(s, o);
+        if (kind_of(s, o, oe) == K_CRON and head_ok(s, o, oe, 3) and same_span(s, tok_from(s, o, oe, 2), oe, tok_from(s, at, stop, 2), stop)) { return A_DELETE_DUPLICATE; }
+        o = next_record(s, oe + 1);
+    }
+    return A_NONE;
+}
+
+pub fn req_action(s: string, at: usize, stop: usize) -> u8 {
+    if (head_ok(s, at, stop, 7) == false) { return A_BAD; }
+    if (listed(s, K_REQ, 1, tok_from(s, at, stop, 1), tok_to(s, at, stop, 1), at)) { return A_BAD; }
+    const bar : usize = bar_at(s, tok_from(s, at, stop, 6), stop);
+    if (bar + 3 >= stop) { return A_BAD; }
+    const due : u64 = time_of(s, at, stop, 4);
+    const state : u8 = req_code(s, tok_from(s, at, stop, 5), tok_to(s, at, stop, 5));
+    if (time_of(s, at, stop, 3) == 0 or due == 0 or state == R_BAD) { return A_BAD; }
+    if ((state == R_OPEN or state == R_CHASED) and now_seconds(s) == 0) { return A_BAD; }
+    return req_decision(state, now_seconds(s), due);
+}
+
+/// The action of the record that starts at `at`. A line of a kind this spec does not know is UNREADABLE.
+pub fn action(s: string, at: usize) -> u8 {
+    if (at >= s.len) { return A_NONE; }
+    const stop : usize = line_end(s, at);
+    const k : u8 = kind_of(s, at, stop);
+    if (k == K_NOW) { return now_action(s, at, stop); }
+    if (k == K_LAST) { return last_action(s, at, stop); }
+    if (k == K_ROW) { return row_action(s, at, stop); }
+    if (k == K_WANT) { return want_action(s, at, stop); }
+    if (k == K_PR) { return pr_action(s, at, stop); }
+    if (k == K_MERGED) {
+        if (fields_ok(s, at, stop, 2)) { return A_NONE; }
+        return A_BAD;
+    }
+    if (k == K_AGENT) { return agent_action(s, at, stop); }
+    if (k == K_CRON) { return cron_action(s, at, stop); }
+    if (k == K_REQ) { return req_action(s, at, stop); }
+    return A_BAD;
+}
+
+/// How many records get action a.
+pub fn count_action(s: string, a: u8) -> u64 {
+    var n : u64 = 0;
+    var at : usize = next_record(s, 0);
+    while (at < s.len) {
+        if (action(s, at) == a) { n = n + 1; }
+        at = next_record(s, line_end(s, at) + 1);
+    }
+    return n;
+}
+
+/// The start of record number k (from 0), s.len when there are fewer.
+pub fn record_at(s: string, k: usize) -> usize {
+    var at : usize = next_record(s, 0);
+    var i : usize = 0;
+    while (i < k and at < s.len) {
+        at = next_record(s, line_end(s, at) + 1);
+        i = i + 1;
+    }
+    return at;
+}
+
+pub fn action_of(s: string, k: usize) -> u8 {
+    return action(s, record_at(s, k));
+}
+
+/// What a printed line names: the second token of the record (the lane, number or id); for a record
+/// that cannot be read, the whole line.
+pub fn key_from(s: string, at: usize) -> usize {
+    if (action(s, at) == A_BAD) { return at; }
+    return tok_from(s, at, line_end(s, at), 1);
+}
+
+pub fn key_to(s: string, at: usize) -> usize {
+    if (action(s, at) == A_BAD) { return line_end(s, at); }
+    return tok_to(s, at, line_end(s, at), 1);
+}
+
+// ---- the tick ---------------------------------------------------------------------------------------
+
+/// One number for the snapshot and its plan: every record but `now` and `last`, byte by byte, and the
+/// action it gets, folded into two residues (HASH_P1 and HASH_P2) and joined below 10^18.
+pub fn plan_hash(s: string) -> u64 {
+    var h1 : u64 = 7;
+    var h2 : u64 = 11;
+    var at : usize = next_record(s, 0);
+    while (at < s.len) {
+        const stop : usize = line_end(s, at);
+        const k : u8 = kind_of(s, at, stop);
+        if (k != K_NOW and k != K_LAST) {
+            var i : usize = at;
+            while (i < stop) {
+                h1 = (h1 * 131 + (s[i] as u64)) % HASH_P1;
+                h2 = (h2 * 257 + (s[i] as u64) + 1) % HASH_P2;
+                i = i + 1;
+            }
+            h1 = (h1 * 131 + 10 + (action(s, at) as u64)) % HASH_P1;
+            h2 = (h2 * 257 + 11 + (action(s, at) as u64)) % HASH_P2;
+        }
+        at = next_record(s, stop + 1);
+    }
+    return h1 * HASH_P2 + h2;
+}
+
+/// Is this tick a repeat: a readable `now`, a `last`, and it equals the hash of this snapshot's plan?
+pub fn is_noop(s: string) -> bool {
+    return now_seconds(s) != 0 and last_hash(s) != 0 and last_hash(s) == plan_hash(s);
+}
+
+pub fn action_name(a: u8) -> string {
+    if (a == A_START) { return "START"; }
+    if (a == A_RECHECK) { return "RECHECK"; }
+    if (a == A_UPDATE_BRANCH) { return "UPDATE_BRANCH"; }
+    if (a == A_FIX) { return "FIX"; }
+    if (a == A_FIND_PR) { return "FIND_PR"; }
+    if (a == A_DELETE_DUPLICATE) { return "DELETE_DUPLICATE"; }
+    if (a == A_CHASE) { return "CHASE"; }
+    if (a == A_TAKE_DEFAULT) { return "TAKE_DEFAULT"; }
+    if (a == A_BAD) { return "UNREADABLE"; }
+    if (a == A_NOOP) { return "NOOP"; }
+    return "NONE";
+}
+
+pub fn why(a: u8) -> string {
+    if (a == A_START) { return "wanted, and the ledger has no row for the lane: start it"; }
+    if (a == A_RECHECK) { return "the ledger row has said running for the stale limit or longer: look at the lane, then update its row"; }
+    if (a == A_UPDATE_BRANCH) { return "the pull request conflicts with its base or is behind it: merge the base into the branch, history is not rewritten"; }
+    if (a == A_FIX) { return "a check of the pull request failed: read the failure and fix it on its branch"; }
+    if (a == A_FIND_PR) { return "a subagent reported done and no pull request or merge names its branch: look for the branch on the remote, open its pull request or run the lane again"; }
+    if (a == A_DELETE_DUPLICATE) { return "an earlier cron has the same prompt: delete this one"; }
+    if (a == A_CHASE) { return "the request is past due and was never chased: chase it once and mark it chased"; }
+    if (a == A_TAKE_DEFAULT) { return "the request is past due and was chased: take the default and write it in the ledger"; }
+    if (a == A_BAD) { return "the record cannot be read: an unread fact is reported, never skipped"; }
+    if (a == A_NOOP) { return "nothing changed since the last tick: the same state and the same plan were handed out"; }
+    return "nothing to do";
+}
+
+// ---- fixtures: the tick is 2026-10-19T22:30:00Z ----------------------------------------------------
+
+const T_NOW : string = "now 2026-10-19T22:30:00Z\n";
+
+// Scenario: lane L1 is listed running 10 minutes ago and wanted again.
+const S_RUNNING : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T22:20:00Z\nwant L1\n";
+const S_FRESH : string = "now 2026-10-19T22:30:00Z\nrow L1 done 2026-10-19T21:00:00Z\nrow L2 running 2026-10-19T22:20:00Z\nwant L1\nwant L2\nwant L3\nwant L3\nwant L4\n";
+
+const S_OLD_44 : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T21:46:00Z\n";
+const S_OLD_45 : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T21:45:00Z\n";
+const S_OLD_46 : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T21:44:00Z\n";
+const S_OLD_DONE : string = "now 2026-10-19T22:30:00Z\nrow L1 done 2026-10-19T09:00:00Z\n";
+const S_FUTURE : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T22:45:00Z\n";
+
+// Scenario: a pull request that conflicts with its base, and the others.
+const S_PRS : string = "now 2026-10-19T22:30:00Z\npr 11050 lane/a green CLEAN\npr 11051 lane/b red CLEAN\npr 11052 lane/c green DIRTY\npr 11053 lane/d pending BEHIND\npr 11054 lane/e red DIRTY\npr 11055 lane/f pending BLOCKED\npr 11056 lane/g green DRAFT\npr 11057 lane/h green UNSTABLE\n";
+
+const S_AGENTS : string = "now 2026-10-19T22:30:00Z\npr 11060 lane/open green CLEAN\nmerged lane/merged\nagent a1 done lane/open\nagent a2 done lane/merged\nagent a3 done lane/lost\nagent a4 running lane/lost\nagent a5 done lane/open2\n";
+
+const S_CRONS : string = "now 2026-10-19T22:30:00Z\ncron c1 run the loop tick on the epic\ncron c2 run the loop tick on the epic\ncron c3 run the loop tick on the epic\ncron c4 run the loop tick on the epic.\ncron c5 other prompt\n";
+
+// Scenario: a request due 1 hour ago that was already chased.
+const S_CHASED : string = "now 2026-10-19T22:30:00Z\nreq R1 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z chased which carrier | keep the cheaper carrier\n";
+const S_OPEN_DUE : string = "now 2026-10-19T22:30:00Z\nreq R1 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open which carrier | keep the cheaper carrier\n";
+const S_OPEN_EARLY : string = "now 2026-10-19T22:30:00Z\nreq R1 carrier 2026-10-19T19:00:00Z 2026-10-19T23:30:00Z open which carrier | keep the cheaper carrier\n";
+const S_REQS : string = "now 2026-10-19T22:30:00Z\nreq R1 a 2026-10-19T19:00:00Z 2026-10-19T22:30:00Z open x | y\nreq R2 b 2026-10-19T19:00:00Z 2026-10-19T22:29:59Z chased x | y\nreq R3 c 2026-10-19T19:00:00Z 2026-10-19T22:30:01Z open x | y\nreq R4 d 2026-10-19T19:00:00Z 2026-10-19T01:00:00Z answered x | y\nreq R5 e 2026-10-19T19:00:00Z 2026-10-19T01:00:00Z defaulted x | y\n";
+
+// The HASH a tick printed for the state and plan of NOOP_A (RECHECK L2, FIX 11051), written back as `last`.
+const NOOP_A : string = "now 2026-10-19T22:30:00Z\nlast 907227767944327903\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\npr 11051 lane/b red CLEAN\n";
+const NOOP_A_LATER : string = "now 2026-10-19T22:40:00Z\nlast 907227767944327903\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\npr 11051 lane/b red CLEAN\n";
+const NOOP_A_STALE : string = "now 2026-10-19T23:30:00Z\nlast 907227767944327903\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\npr 11051 lane/b red CLEAN\n";
+const NOOP_A_CHANGED : string = "now 2026-10-19T22:30:00Z\nlast 907227767944327903\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\npr 11051 lane/b green CLEAN\n";
+const NOOP_NO_NOW : string = "last 316340705975935075\nmerged lane/x\n";
+const NOOP_WITH_NOW : string = "now 2026-10-19T22:30:00Z\nlast 316340705975935075\nmerged lane/x\n";
+
+// A whole night.
+const S_NIGHT : string = "; one night\nnow 2026-10-19T22:30:00Z\n\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\nwant L1\nwant L5\npr 11051 lane/b red CLEAN\npr 11052 lane/c green DIRTY\nagent a3 done lane/lost\ncron c1 tick\ncron c2 tick\nreq R1 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open which | keep it\nreq R2 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z chased which | keep it\n";
+
+// ---- tests ------------------------------------------------------------------------------------------
+
+// Scenario: the text is cut at single spaces.
+test the_tokens_of_a_line {
+    const l : string = "row L1 running 2026";
+    assert tok_from(l, 0, l.len, 0) == 0 and tok_to(l, 0, l.len, 0) == 3;
+    assert tok_from(l, 0, l.len, 1) == 4 and tok_to(l, 0, l.len, 1) == 6;
+    assert tok_from(l, 0, l.len, 3) == 15 and tok_to(l, 0, l.len, 3) == 19;
+    assert tok_from(l, 0, l.len, 4) == l.len and tok_to(l, 0, l.len, 4) == l.len;
+    assert ntok(l, 0, l.len) == 4;
+    assert ntok("", 0, 0) == 1;
+    assert fields_ok(l, 0, l.len, 4) == true;
+    assert fields_ok(l, 0, l.len, 3) == false;
+    assert head_ok(l, 0, l.len, 3) == true;
+    assert head_ok(l, 0, l.len, 5) == false;
+    assert fields_ok("a  b", 0, 4, 3) == false;
+    assert head_ok("a  b", 0, 4, 2) == false;
+    assert head_ok("a ", 0, 2, 2) == false;
+    assert tok_is(l, 0, l.len, 2, "running") == true;
+    assert tok_is(l, 0, l.len, 2, "runnin") == false;
+    assert tok_is(l, 0, l.len, 9, "") == true;
+}
+
+// Scenario: blank lines and comments are not records; every other line is.
+test records_are_found_and_counted {
+    assert next_record("", 0) == 0;
+    assert next_record("\n\n; c\nrow\n", 0) == 6;
+    assert next_record("; c\n", 0) == 4;
+    assert next_record(S_NIGHT, 0) == 12;
+    assert record_at(S_NIGHT, 0) == 12;
+    assert record_at(S_NIGHT, 1) == 38;
+    assert record_at(S_NIGHT, 99) == S_NIGHT.len;
+    assert action_of(S_NIGHT, 99) == A_NONE;
+    assert kind_of("now x", 0, 5) == K_NOW and kind_of("last 1", 0, 6) == K_LAST and kind_of("row a b c", 0, 9) == K_ROW;
+    assert kind_of("want a", 0, 6) == K_WANT and kind_of("pr 1", 0, 4) == K_PR and kind_of("merged a", 0, 8) == K_MERGED;
+    assert kind_of("agent a", 0, 7) == K_AGENT and kind_of("cron a b", 0, 8) == K_CRON and kind_of("req a", 0, 5) == K_REQ;
+    assert kind_of("rows a", 0, 6) == K_BAD and kind_of("", 0, 0) == K_BAD and kind_of(" row", 0, 4) == K_BAD;
+}
+
+// Scenario: given a snapshot where lane L1 is listed running 10 minutes ago, it prints no START for L1.
+test a_lane_the_ledger_lists_as_running_is_never_started_again {
+    assert action_of(S_RUNNING, 2) == A_NONE;
+    assert count_action(S_RUNNING, A_START) == 0;
+    assert count_action(S_RUNNING, A_RECHECK) == 0;
+    assert is_noop(S_RUNNING) == false;
+}
+
+// Scenario: a lane the ledger has no row for is started once; a lane with a row, whatever its state, never.
+test a_lane_with_no_row_is_started_once {
+    assert action_of(S_FRESH, 3) == A_NONE;
+    assert action_of(S_FRESH, 4) == A_NONE;
+    assert action_of(S_FRESH, 5) == A_START;
+    assert action_of(S_FRESH, 6) == A_NONE;
+    assert action_of(S_FRESH, 7) == A_START;
+    assert count_action(S_FRESH, A_START) == 2;
+    assert count_action("want L1\nwant L1\nwant L1\n", A_START) == 1;
+    assert action(T_NOW, 0) == A_NONE;
+}
+
+// Scenario: a row that says running for 45 minutes or more is an anomaly: RECHECK. 44 is not.
+test a_running_row_older_than_the_limit_is_rechecked {
+    assert action_of(S_OLD_44, 1) == A_NONE;
+    assert action_of(S_OLD_45, 1) == A_RECHECK;
+    assert action_of(S_OLD_46, 1) == A_RECHECK;
+    assert action_of(S_OLD_DONE, 1) == A_NONE;
+    assert action_of(S_FUTURE, 1) == A_NONE;
+    assert count_action(S_OLD_45, A_RECHECK) == 1;
+    assert count_action(S_OLD_44, A_RECHECK) == 0;
+    assert row_decision(true, 100000, 100000 - 45 * 60) == A_RECHECK;
+    assert row_decision(true, 100000, 100000 - 45 * 60 + 1) == A_NONE;
+    assert row_decision(true, 100000, 0) == A_NONE;
+    assert row_decision(false, 100000, 1) == A_NONE;
+    assert row_decision(true, 100000, 100001) == A_NONE;
+}
+
+// Scenario: the age is read off the two times, not off the order of the lines.
+test the_age_of_a_row_is_now_minus_since {
+    assert row_decision(true, 5000, 5000 - 44 * 60 - 59) == A_NONE;
+    assert row_decision(true, 5000000, 5000000 - 90 * 60) == A_RECHECK;
+    assert row_decision(true, 5000000, 5000000 - 24 * 3600) == A_RECHECK;
+    assert now_seconds(S_OLD_45) == 1792449000;
+    assert time_of(S_OLD_45, record_at(S_OLD_45, 1), line_end(S_OLD_45, record_at(S_OLD_45, 1)), 3) == 1792449000 - 45 * 60;
+    assert now_seconds("row L1 running 2026-10-19T21:45:00Z\n") == 0;
+    assert now_seconds("now soon\n") == 0;
+    assert now_seconds("now 2026-10-19T22:30:00Z extra\n") == 0;
+}
+
+// Scenario: given a pull request that conflicts, it prints UPDATE_BRANCH for it; red is FIX.
+test a_red_or_conflicting_or_behind_pull_request_gets_an_action {
+    assert action_of(S_PRS, 1) == A_NONE;
+    assert action_of(S_PRS, 2) == A_FIX;
+    assert action_of(S_PRS, 3) == A_UPDATE_BRANCH;
+    assert action_of(S_PRS, 4) == A_UPDATE_BRANCH;
+    assert action_of(S_PRS, 5) == A_FIX;
+    assert action_of(S_PRS, 6) == A_NONE;
+    assert action_of(S_PRS, 7) == A_NONE;
+    assert action_of(S_PRS, 8) == A_NONE;
+    assert count_action(S_PRS, A_FIX) == 2;
+    assert count_action(S_PRS, A_UPDATE_BRANCH) == 2;
+    assert count_action(S_PRS, A_BAD) == 0;
+    assert key_to(S_PRS, record_at(S_PRS, 3)) - key_from(S_PRS, record_at(S_PRS, 3)) == 5;
+    assert span_is(S_PRS, key_from(S_PRS, record_at(S_PRS, 3)), key_to(S_PRS, record_at(S_PRS, 3)), "11052");
+    const bad : string = "sleep 5\nrow L1\nwant L1\n";
+    assert span_is(bad, key_from(bad, record_at(bad, 0)), key_to(bad, record_at(bad, 0)), "sleep 5");
+    assert span_is(bad, key_from(bad, record_at(bad, 1)), key_to(bad, record_at(bad, 1)), "row L1");
+    assert span_is(bad, key_from(bad, record_at(bad, 2)), key_to(bad, record_at(bad, 2)), "L1");
+}
+
+// Scenario: over every check state and merge state, a pull request gets FIX, UPDATE_BRANCH or nothing,
+// and the words printed for the actions never name a force-push.
+test a_pull_request_is_fixed_or_updated_and_never_force_pushed {
+    var c : u8 = 0;
+    while (c < 4) {
+        var m : u8 = 0;
+        while (m < 9) {
+            const a : u8 = pr_decision(c, m);
+            assert a == A_NONE or a == A_FIX or a == A_UPDATE_BRANCH;
+            if (c == C_RED) {
+                assert a == A_FIX;
+            } else {
+                assert (a == A_UPDATE_BRANCH) == (m == M_DIRTY or m == M_BEHIND);
+            }
+            m = m + 1;
+        }
+        c = c + 1;
+    }
+    var k : u8 = 0;
+    while (k < ACTIONS) {
+        assert span_is(action_name(k), 0, action_name(k).len, "FORCE_PUSH") == false;
+        assert action_name(k).len > 0;
+        k = k + 1;
+    }
+}
+
+// Scenario: the words a pull request line is read from.
+test the_checks_and_the_merge_states_are_read {
+    assert ci_code("green", 0, 5) == C_GREEN and ci_code("pending", 0, 7) == C_PENDING and ci_code("red", 0, 3) == C_RED;
+    assert ci_code("RED", 0, 3) == C_BAD and ci_code("", 0, 0) == C_BAD and ci_code("greens", 0, 6) == C_BAD;
+    assert merge_code("CLEAN", 0, 5) == M_CLEAN and merge_code("BEHIND", 0, 6) == M_BEHIND and merge_code("BLOCKED", 0, 7) == M_BLOCKED;
+    assert merge_code("DIRTY", 0, 5) == M_DIRTY and merge_code("DRAFT", 0, 5) == M_DRAFT and merge_code("HAS_HOOKS", 0, 9) == M_HAS_HOOKS;
+    assert merge_code("UNKNOWN", 0, 7) == M_UNKNOWN and merge_code("UNSTABLE", 0, 8) == M_UNSTABLE;
+    assert merge_code("dirty", 0, 5) == M_BAD and merge_code("DIRTEY", 0, 6) == M_BAD;
+    assert req_code("open", 0, 4) == R_OPEN and req_code("chased", 0, 6) == R_CHASED and req_code("answered", 0, 8) == R_ANSWERED;
+    assert req_code("defaulted", 0, 9) == R_DEFAULTED and req_code("done", 0, 4) == R_BAD;
+}
+
+// Scenario: a subagent that reported done whose pull request is missing is an anomaly.
+test a_subagent_done_without_its_pull_request_is_an_anomaly {
+    assert action_of(S_AGENTS, 3) == A_NONE;
+    assert action_of(S_AGENTS, 4) == A_NONE;
+    assert action_of(S_AGENTS, 5) == A_FIND_PR;
+    assert action_of(S_AGENTS, 6) == A_NONE;
+    assert action_of(S_AGENTS, 7) == A_FIND_PR;
+    assert count_action(S_AGENTS, A_FIND_PR) == 2;
+    assert count_action("agent a1 done lane/x\n", A_FIND_PR) == 1;
+    assert count_action("pr 1 lane/x green CLEAN\nagent a1 done lane/x\n", A_FIND_PR) == 0;
+    assert count_action("agent a1 done lane/x\nmerged lane/x\n", A_FIND_PR) == 0;
+    assert count_action("agent a1 done lane/xy\npr 1 lane/x green CLEAN\n", A_FIND_PR) == 1;
+}
+
+// Scenario: a second cron with the same prompt is an anomaly: DELETE_DUPLICATE; the first stays.
+test a_second_cron_with_the_same_prompt_is_deleted {
+    assert action_of(S_CRONS, 1) == A_NONE;
+    assert action_of(S_CRONS, 2) == A_DELETE_DUPLICATE;
+    assert action_of(S_CRONS, 3) == A_DELETE_DUPLICATE;
+    assert action_of(S_CRONS, 4) == A_NONE;
+    assert action_of(S_CRONS, 5) == A_NONE;
+    assert count_action(S_CRONS, A_DELETE_DUPLICATE) == 2;
+    assert count_action("cron c1 tick\ncron c2 tic\ncron c3 tick x\n", A_DELETE_DUPLICATE) == 0;
+    assert count_action("cron c1 tick\ncron c1 tick\n", A_DELETE_DUPLICATE) == 1;
+    assert count_action("cron c1\n", A_BAD) == 1;
+}
+
+// Scenario: nothing before the request is due; open and due is chased; chased and due takes the default.
+test a_request_is_chased_once_then_its_default_is_taken {
+    assert action_of(S_OPEN_EARLY, 1) == A_NONE;
+    assert action_of(S_OPEN_DUE, 1) == A_CHASE;
+    assert action_of(S_CHASED, 1) == A_TAKE_DEFAULT;
+    assert count_action(S_CHASED, A_CHASE) == 0;
+    assert count_action(S_CHASED, A_TAKE_DEFAULT) == 1;
+    assert count_action(S_OPEN_DUE, A_TAKE_DEFAULT) == 0;
+}
+
+// Scenario: due exactly now is due; one second early is not; answered and defaulted are done.
+test the_due_time_and_the_states_of_a_request {
+    assert action_of(S_REQS, 1) == A_CHASE;
+    assert action_of(S_REQS, 2) == A_TAKE_DEFAULT;
+    assert action_of(S_REQS, 3) == A_NONE;
+    assert action_of(S_REQS, 4) == A_NONE;
+    assert action_of(S_REQS, 5) == A_NONE;
+    assert count_action(S_REQS, A_BAD) == 0;
+}
+
+// Scenario: over every state and time, CHASE comes only for an open request that is due, and a chased
+// one never gets it; TAKE_DEFAULT only for a chased one that is due.
+test a_request_is_never_chased_twice {
+    var st : u8 = 0;
+    while (st < 5) {
+        var d : u64 = 90;
+        while (d < 111) {
+            const a : u8 = req_decision(st, 100, d);
+            assert (a == A_CHASE) == (st == R_OPEN and d <= 100);
+            assert (a == A_TAKE_DEFAULT) == (st == R_CHASED and d <= 100);
+            assert a == A_NONE or a == A_CHASE or a == A_TAKE_DEFAULT;
+            if (st == R_CHASED) {
+                assert a != A_CHASE;
+            }
+            d = d + 1;
+        }
+        st = st + 1;
+    }
+}
+
+// Scenario: a request needs all of its fields: a `what`, a ` | `, a default, two times, a known state.
+test a_request_with_a_missing_field_is_unreadable {
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | d\n", A_BAD) == 0;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | \n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open  | d\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z soon open w | d\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c later 2026-10-19T21:30:00Z open w | d\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z waiting w | d\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w|d\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w one | d one\n", A_CHASE) == 1;
+    assert count_action("req R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | d\n", A_BAD) == 1;
+    assert count_action("req R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z answered w | d\n", A_BAD) == 0;
+}
+
+// Scenario: a request id is one request: a second record with the same id is not read, so a request that
+// was chased is not chased again by a stale open copy of it.
+test a_request_id_is_one_request {
+    const twice : string = "now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z chased w | d\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | d\n";
+    assert action_of(twice, 1) == A_TAKE_DEFAULT;
+    assert action_of(twice, 2) == A_BAD;
+    assert count_action(twice, A_CHASE) == 0;
+    assert count_action("now 2026-10-19T22:30:00Z\nreq R1 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | d\nreq R2 c 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open w | d\n", A_CHASE) == 2;
+}
+
+// Scenario: a fact that is not read is reported, never skipped.
+test an_unreadable_record_is_not_silence {
+    assert count_action("sleep 5\n", A_BAD) == 1;
+    assert count_action(" now 2026-10-19T22:30:00Z\n", A_BAD) == 1;
+    assert count_action("row L1 paused 2026-10-19T22:30:00Z\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nrow L1 running soon\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nrow L1 running\n", A_BAD) == 1;
+    assert count_action("row L1 running 2026-10-19T22:00:00Z\n", A_BAD) == 1;
+    assert count_action("row L1 done 2026-10-19T22:00:00Z\n", A_BAD) == 0;
+    assert count_action("pr x lane/a green CLEAN\n", A_BAD) == 1;
+    assert count_action("pr 0 lane/a green CLEAN\n", A_BAD) == 1;
+    assert count_action("pr 5 lane/a amber CLEAN\n", A_BAD) == 1;
+    assert count_action("pr 5 lane/a green clean\n", A_BAD) == 1;
+    assert count_action("pr 5 lane/a green\n", A_BAD) == 1;
+    assert count_action("merged\n", A_BAD) == 1;
+    assert count_action("merged lane/a\n", A_BAD) == 0;
+    assert count_action("agent a1 gone lane/a\n", A_BAD) == 1;
+    assert count_action("want\n", A_BAD) == 1;
+    assert count_action("want L1 L2\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nnow 2026-10-19T22:31:00Z\n", A_BAD) == 1;
+    assert count_action("now 2026-10-19T22:30:00Z\nlast 5\nlast 6\n", A_BAD) == 1;
+    assert count_action("now yesterday\n", A_BAD) == 1;
+    assert count_action("last 0\n", A_BAD) == 1;
+    assert count_action("last x\n", A_BAD) == 1;
+}
+
+// Scenario: given the same snapshot twice, both runs print the same lines: every record gets one action and
+// the decisions read only the text, so a comment, a blank line or a later `now` moves nothing.
+test every_record_gets_exactly_one_action {
+    var a : u8 = 0;
+    var night : u64 = 0;
+    var prs : u64 = 0;
+    while (a < ACTIONS) {
+        night = night + count_action(S_NIGHT, a);
+        prs = prs + count_action(S_PRS, a);
+        a = a + 1;
+    }
+    assert night == 12;
+    assert prs == 9;
+    assert count_action(S_NIGHT, A_NOOP) == 0;
+    assert plan_hash(S_NIGHT) < 1000000000000000000;
+    assert plan_hash(S_NIGHT) != plan_hash(S_RUNNING);
+    assert plan_hash(S_PRS) != plan_hash(S_AGENTS);
+    assert plan_hash("") == plan_hash("; nothing\n\n");
+    assert plan_hash("merged lane/x\n") == plan_hash("; a comment\n\nmerged lane/x\n\n");
+    assert is_noop(S_NIGHT) == false;
+}
+
+// Scenario: a whole night, one count per action.
+test a_whole_night_in_one_snapshot {
+    assert count_action(S_NIGHT, A_START) == 1;
+    assert count_action(S_NIGHT, A_RECHECK) == 1;
+    assert count_action(S_NIGHT, A_FIX) == 1;
+    assert count_action(S_NIGHT, A_UPDATE_BRANCH) == 1;
+    assert count_action(S_NIGHT, A_FIND_PR) == 1;
+    assert count_action(S_NIGHT, A_DELETE_DUPLICATE) == 1;
+    assert count_action(S_NIGHT, A_CHASE) == 1;
+    assert count_action(S_NIGHT, A_TAKE_DEFAULT) == 1;
+    assert count_action(S_NIGHT, A_BAD) == 0;
+    assert count_action(S_NIGHT, A_NOOP) == 0;
+}
+
+// Scenario: the clock is not state: a later `now` with the same plan has the same hash; time crossing a
+// limit changes the plan, so it changes the hash.
+test time_passing_is_a_change_only_when_a_plan_moves {
+    const a : string = "now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T22:20:00Z\n";
+    const b : string = "now 2026-10-19T22:40:00Z\nrow L1 running 2026-10-19T22:20:00Z\n";
+    const c : string = "now 2026-10-19T23:30:00Z\nrow L1 running 2026-10-19T22:20:00Z\n";
+    const d : string = "now 2026-10-19T23:40:00Z\nrow L1 running 2026-10-19T22:20:00Z\n";
+    assert plan_hash(a) == plan_hash(b);
+    assert plan_hash(b) != plan_hash(c);
+    assert plan_hash(c) == plan_hash(d);
+    assert plan_hash(a) != plan_hash(c);
+}
+
+// Scenario: a state that moved is a change: a check that went red, a conflict, a lane that finished.
+test a_new_state_changes_the_hash {
+    const green : string = "now 2026-10-19T22:30:00Z\npr 5 lane/a green CLEAN\n";
+    const red : string = "now 2026-10-19T22:30:00Z\npr 5 lane/a red CLEAN\n";
+    const dirty : string = "now 2026-10-19T22:30:00Z\npr 5 lane/a green DIRTY\n";
+    const pending : string = "now 2026-10-19T22:30:00Z\npr 5 lane/a pending CLEAN\n";
+    assert plan_hash(green) != plan_hash(red);
+    assert plan_hash(green) != plan_hash(dirty);
+    assert plan_hash(red) != plan_hash(dirty);
+    assert plan_hash(green) != plan_hash(pending);
+    assert plan_hash("now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T22:20:00Z\n") != plan_hash("now 2026-10-19T22:30:00Z\nrow L1 done 2026-10-19T22:20:00Z\n");
+    assert plan_hash("pr 5 lane/a green CLEAN\npr 6 lane/b green CLEAN\n") != plan_hash("pr 6 lane/b green CLEAN\npr 5 lane/a green CLEAN\n");
+}
+
+// Scenario: a tick whose `last` is the hash of this snapshot's plan is a NOOP; any other `last`, none, or
+// a snapshot with no readable `now`, is not.
+test a_tick_with_nothing_new_is_a_noop {
+    const h : u64 = plan_hash(S_NIGHT);
+    assert h == plan_hash("last 1\n; the hash does not read last\n; or now\nnow 2026-10-19T22:45:00Z\n\nrow L1 running 2026-10-19T22:20:00Z\nrow L2 running 2026-10-19T21:00:00Z\nwant L1\nwant L5\npr 11051 lane/b red CLEAN\npr 11052 lane/c green DIRTY\nagent a3 done lane/lost\ncron c1 tick\ncron c2 tick\nreq R1 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z open which | keep it\nreq R2 carrier 2026-10-19T19:00:00Z 2026-10-19T21:30:00Z chased which | keep it\n");
+    assert is_noop("now 2026-10-19T22:30:00Z\nlast 907227767944327903\nrow L1 running 2026-10-19T22:20:00Z\n") == false;
+    assert is_noop("now 2026-10-19T22:30:00Z\nrow L1 running 2026-10-19T22:20:00Z\n") == false;
+    assert last_hash("now 2026-10-19T22:30:00Z\nlast 123456789012345678\n") == 123456789012345678;
+    assert last_hash("last 1234567890123456789\n") == 0;
+    assert last_hash("last 12x\n") == 0;
+    assert last_hash("") == 0;
+}
+
+// Scenario: the HASH a tick printed, written back as `last`, makes the same state and plan a NOOP; a
+// second tick of the same state with a later `now` is a NOOP too, and a plan that moved is not.
+test the_printed_hash_closes_the_loop {
+    assert is_noop(NOOP_A) == true;
+    assert is_noop(NOOP_A_LATER) == true;
+    assert is_noop(NOOP_A_STALE) == false;
+    assert is_noop(NOOP_A_CHANGED) == false;
+    assert is_noop(NOOP_NO_NOW) == false;
+    assert is_noop(NOOP_WITH_NOW) == true;
+    assert plan_hash(NOOP_NO_NOW) == plan_hash(NOOP_WITH_NOW);
+    assert plan_hash(NOOP_A) == 907227767944327903;
+    assert plan_hash(NOOP_A_LATER) == 907227767944327903;
+    assert plan_hash(NOOP_A_STALE) != 907227767944327903;
+    assert plan_hash(NOOP_A_CHANGED) != 907227767944327903;
+    assert action_of(NOOP_A, 1) == A_NONE;
+}
+
+// Scenario: the numbers and the words.
+test the_actions_have_their_words {
+    assert span_is(action_name(A_START), 0, 5, "START") and span_is(action_name(A_RECHECK), 0, 7, "RECHECK");
+    assert span_is(action_name(A_UPDATE_BRANCH), 0, 13, "UPDATE_BRANCH") and span_is(action_name(A_FIX), 0, 3, "FIX");
+    assert span_is(action_name(A_FIND_PR), 0, 7, "FIND_PR") and span_is(action_name(A_DELETE_DUPLICATE), 0, 16, "DELETE_DUPLICATE");
+    assert span_is(action_name(A_CHASE), 0, 5, "CHASE") and span_is(action_name(A_TAKE_DEFAULT), 0, 12, "TAKE_DEFAULT");
+    assert span_is(action_name(A_BAD), 0, 10, "UNREADABLE") and span_is(action_name(A_NOOP), 0, 4, "NOOP");
+    assert span_is(action_name(A_NONE), 0, 4, "NONE") and span_is(action_name(99), 0, 4, "NONE");
+    assert why(A_START).len > 0 and why(A_NONE).len > 0 and why(A_NOOP).len > 0 and why(A_BAD).len > 0;
+    assert why(A_UPDATE_BRANCH)[0] == 116 and why(A_CHASE)[0] == 116;
+}
+
+// Scenario: the ledger's 45 minutes is one number, and `tri lanes` holds it too.
+test the_limit_is_the_ledgers {
+    var age : u64 = 0;
+    while (row_decision(true, 100000, 100000 - age * 60) == A_NONE) {
+        age = age + 1;
+    }
+    assert age == STALE_MINUTES;
+    assert age == RUNNING_MINUTES;
+    assert age == 45;
+    assert HASH_P1 * HASH_P2 < 1000000000000000000;
+    assert HASH_P1 < 1000000000 and HASH_P2 < 1000000000;
+}

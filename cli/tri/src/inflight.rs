@@ -36,34 +36,6 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::process::Command;
 
-/// What `git merge` actually said. The exit code is the only channel that
-/// separates these; both leave unmerged paths behind.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Merge {
-    /// Merged cleanly.
-    Done,
-    /// Genuine conflict: the merge started and stopped in the middle.
-    Conflicted,
-    /// Refused to start. A merge was already in flight, or the tree was dirty.
-    /// Nothing about this run's merge is knowable from the working tree.
-    Refused,
-    /// Some other exit code. Reported as itself, never folded into a neighbour.
-    Other(i32),
-}
-
-/// `git merge` answers with more than success and failure.
-///
-/// 128 is refusal, not conflict, and the distinction is the whole point: after
-/// a refusal there is no merge of yours to resolve.
-pub fn merge_outcome(rc: i32) -> Merge {
-    match rc {
-        0 => Merge::Done,
-        1 => Merge::Conflicted,
-        128 => Merge::Refused,
-        n => Merge::Other(n),
-    }
-}
-
 /// How many parents `git log -1 --format=%p` reported.
 ///
 /// The root commit prints an empty line, which is zero parents and not a
@@ -182,30 +154,6 @@ pub fn run(a: &Merging) -> Result<()> {
     } else {
         println!("  {problems} problem(s). See above.");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod outcome_tests {
-    use super::*;
-
-    #[test]
-    fn refusal_is_not_conflict() {
-        assert_eq!(merge_outcome(1), Merge::Conflicted);
-        assert_eq!(merge_outcome(128), Merge::Refused);
-        assert_ne!(merge_outcome(1), merge_outcome(128));
-    }
-
-    #[test]
-    fn success_is_its_own_answer() {
-        assert_eq!(merge_outcome(0), Merge::Done);
-    }
-
-    #[test]
-    fn an_unknown_code_stays_unknown() {
-        // Never folded into the nearest known neighbour.
-        assert_eq!(merge_outcome(2), Merge::Other(2));
-        assert_eq!(merge_outcome(129), Merge::Other(129));
     }
 }
 

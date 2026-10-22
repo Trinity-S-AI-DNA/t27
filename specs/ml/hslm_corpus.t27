@@ -1,0 +1,981 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/hslm_corpus.t27 -- a text corpus becomes a pinned token file, in t27, no heap.
+; Part of gHashTag/t27#10024 (our own model), cell 25 "t27c --backend ml"; issue #10372.
+
+; WHAT IT DOES: main() reads two text files, tokenizes every story with the HSLM 729-token BPE
+; (nn/hslm_tokenizer.t27) and writes two token files:
+;     /tmp/hslm/valid.txt -> /tmp/hslm/valid.tok
+;     /tmp/hslm/train.txt -> /tmp/hslm/train.tok
+; (main cannot take argv in the ml backend: host_open takes a string literal, so the paths are
+; fixed and both files are converted in one run.)
+
+; THE TOKEN FILE (the contract a trainer reads):
+;     bytes 0..3     the magic "HTOK" (72 84 79 75)
+;     bytes 4..7     u32 little endian, the format version, 1
+;     bytes 8..11    u32 little endian, N, the number of tokens
+;     bytes 12..     N tokens, each a u16 little endian, every one below 729
+; so the file is exactly 12 + 2N bytes. The ids are the ones nn/hslm_tokenizer.t27 gives.
+
+; STORIES. TinyStories separates its stories with a line that is exactly <|endoftext|>. A story
+; is the text between two such lines; the line terminator right before the marker belongs to the
+; marker, so it is not part of the story. Every story becomes its tokens followed by one EOS
+; (id 2). The marker text itself is not tokenized: a line that merely CONTAINS it is ordinary
+; text, and the tokenizer turns it into id 390 like any other bytes (a test pins this). Empty
+; stories (two markers in a row) produce nothing. Text after the last marker, if any, is one more
+; story and gets its EOS too. Newlines inside a story are kept as byte 10 (id 14, merged into a
+; longer token where the table says so).
+; Source line: trinity-training @ 3e9648c1817a97c5f9b8c727b0f8e2291928eead, src/hslm/data.zig,
+; Dataset.addText and Dataset.loadTextFile. THIS IS NOT THE SAME CUT AS THE ZIG LOADER: the Zig
+; takes one LINE as one story (lines of 10 bytes or fewer are dropped, newlines are lost), cuts it
+; into 2000-byte pieces and wraps EACH piece in BOS and EOS, so a story is split and the marker
+; line is tokenized as text. Here a story is one marker-delimited run and carries one EOS, no BOS.
+; That is the choice this file makes, and the reason is that a model trained on it sees whole
+; stories, with their paragraph breaks, ended by a single EOS. The tokenizer itself is the Zig
+; tokenizer's, id for id.
+
+; CHUNKS. The merge scan of nn/hslm_tokenizer.t27 works on a window of at most 8192 bytes, so a
+; story longer than that is tokenized in pieces cut at a line start (the newline in front of that
+; line stays in the next piece), or, when a single line is longer than the window, at 8192 bytes.
+; No story in TinyStories is that long (both files were checked); the tests cover the path.
+
+; MEMORY. No heap. The story window is a module array of 8192 bytes, tokens collect in an array of
+; 32768 and are written out when it fills, the file is read 65536 bytes at a time. The token file
+; needs its count in front, and there is no seek, so the tokens go to a temporary file
+; <name>.tok.body first; the final file is the header followed by a copy of the body, and the
+; body is emptied (opened for writing and closed) at the end. After that the final file is read
+; back and checked: magic, version, count equal to the tokens counted while writing, every id
+; below 729, number of EOS equal to the number of stories, length 12 + 2N.
+
+; HOST CALLS: host_open(path literal, mode 0 read or 1 create), host_read, host_write, host_close,
+; as in specs/ml/host_io_model.t27. Writes are retried until the buffer is out.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module hslm_corpus;
+
+use nn::hslm_tokenizer;
+
+pub const HC_OK : i32 = 0;
+pub const HC_ERR_OPEN : i32 = 70;
+pub const HC_ERR_READ : i32 = 71;
+pub const HC_ERR_WRITE : i32 = 72;
+pub const HC_ERR_VERIFY : i32 = 73;
+pub const HC_ERR_CAP : i32 = 74;
+
+pub const HEADER_BYTES : usize = 12;
+pub const FORMAT_VERSION : u32 = 1;
+pub const CHUNK_CAP : usize = 8192;
+pub const TOK_CAP : usize = 32768;
+pub const IO_CAP : usize = 65536;
+
+/// The story separator: a line that is exactly this.
+pub const MARKER : [13]u8 = [60, 124, 101, 110, 100, 111, 102, 116, 101, 120, 116, 124, 62];
+
+// ---- state -----------------------------------------------------------------------------------
+
+var sbuf : [8192]u8 = undefined;
+var slen : usize = 0;
+var lstart : usize = 0;
+var cont : bool = false;
+var pending : bool = false;
+var tbuf : [32768]u16 = undefined;
+var tn : usize = 0;
+var obuf : [65536]u8 = undefined;
+var rbuf : [65536]u8 = undefined;
+var sink_fd : i32 = -1;
+var total : u32 = 0;
+var stories : u32 = 0;
+var ioerr : i32 = 0;
+var hdr : [12]u8 = undefined;
+
+var vhdr : [12]u8 = undefined;
+var vpos : u32 = 0;
+var vlo : u32 = 0;
+var vtoks : u32 = 0;
+var veos : u32 = 0;
+var vbad : i32 = 0;
+
+fn reset_state(sink: i32) -> void {
+    slen = 0;
+    lstart = 0;
+    cont = false;
+    pending = false;
+    tn = 0;
+    sink_fd = sink;
+    total = 0;
+    stories = 0;
+    ioerr = 0;
+}
+
+// ---- little endian helpers -------------------------------------------------------------------
+
+fn put32(buf: []u8, off: usize, v: u32) -> void {
+    var x : u32 = v;
+    var k : usize = 0;
+    while (k < 4) {
+        buf[off + k] = @intCast(@mod(x, 256));
+        x = @divTrunc(x, 256);
+        k = k + 1;
+    }
+}
+
+fn get32(buf: []const u8, off: usize) -> u32 {
+    var x : u32 = 0;
+    var k : usize = 4;
+    while (k > 0) {
+        k = k - 1;
+        const b : u32 = @intCast(buf[off + k]);
+        x = x * 256 + b;
+    }
+    return x;
+}
+
+/// The 12 header bytes for a file of count tokens, into hdr.
+fn make_header(count: u32) -> void {
+    hdr[0] = 72;
+    hdr[1] = 84;
+    hdr[2] = 79;
+    hdr[3] = 75;
+    put32(&hdr, 4, FORMAT_VERSION);
+    put32(&hdr, 8, count);
+}
+
+/// tbuf[0..tn] as u16 little endian into obuf. Returns the byte count, 2 * tn.
+fn pack_tokens() -> usize {
+    var i : usize = 0;
+    while (i < tn) {
+        const v : u16 = tbuf[i];
+        obuf[2 * i] = @intCast(@mod(v, 256));
+        obuf[2 * i + 1] = @intCast(@divTrunc(v, 256));
+        i = i + 1;
+    }
+    return 2 * tn;
+}
+
+fn write_all(fd: i32, buf: []const u8) -> i32 {
+    var done : usize = 0;
+    while (done < buf.len) {
+        const w : i32 = host_write(fd, buf[done .. buf.len]);
+        if (w <= 0) {
+            return HC_ERR_WRITE;
+        }
+        done = done + @as(usize, @intCast(w));
+    }
+    return HC_OK;
+}
+
+// ---- the story machine -----------------------------------------------------------------------
+
+/// Write the collected tokens to the sink and empty tbuf. With no sink (the tests) it keeps them.
+fn flush_tokens() -> void {
+    if (sink_fd < 0 or ioerr != 0) {
+        return;
+    }
+    const nb : usize = pack_tokens();
+    const rc : i32 = write_all(sink_fd, obuf[0 .. nb]);
+    if (rc != HC_OK) {
+        ioerr = rc;
+    }
+    tn = 0;
+}
+
+/// Tokenize sbuf[0..n] (n <= 8192) and append the ids to tbuf.
+fn emit_chunk(n: usize) -> void {
+    if (tn + n > TOK_CAP) {
+        flush_tokens();
+    }
+    if (tn + n > TOK_CAP) {
+        ioerr = HC_ERR_CAP;
+        return;
+    }
+    const m : usize = encode_window(sbuf[0 .. n], n, tbuf[tn .. tn + n]);
+    tn = tn + m;
+    total = total + @as(u32, @intCast(m));
+}
+
+fn emit_eos() -> void {
+    if (tn + 1 > TOK_CAP) {
+        flush_tokens();
+    }
+    if (tn + 1 > TOK_CAP) {
+        ioerr = HC_ERR_CAP;
+        return;
+    }
+    tbuf[tn] = EOS_TOKEN;
+    tn = tn + 1;
+    total = total + 1;
+    stories = stories + 1;
+}
+
+/// The window is full: tokenize all the lines before the current one and keep the current line.
+/// The newline that ends the last emitted line is kept as the first byte of what stays, so that a
+/// story's final newline is always still in the window when the story closes.
+fn flush_full() -> void {
+    if (lstart >= 2) {
+        const cut : usize = lstart - 1;
+        emit_chunk(cut);
+        var k : usize = 0;
+        while (cut + k < slen) {
+            sbuf[k] = sbuf[cut + k];
+            k = k + 1;
+        }
+        slen = slen - cut;
+        lstart = 1;
+    } else {
+        // one line fills the window: emit it all and carry on in the middle of that line
+        emit_chunk(slen);
+        slen = 0;
+        lstart = 0;
+        cont = true;
+    }
+    pending = true;
+}
+
+/// A story ends: drop the line terminator before the marker, tokenize what is left, add EOS.
+fn close_story() -> void {
+    if (slen > 0 and sbuf[slen - 1] == 10) {
+        slen = slen - 1;
+    }
+    if (slen > 0) {
+        emit_chunk(slen);
+        pending = true;
+    }
+    if (pending) {
+        emit_eos();
+    }
+    slen = 0;
+    lstart = 0;
+    cont = false;
+    pending = false;
+}
+
+/// Is the current line, sbuf[lstart..slen], exactly the marker? The caller checked its length.
+fn line_is_marker() -> bool {
+    var k : usize = 0;
+    while (k < 13) {
+        if (sbuf[lstart + k] != MARKER[k]) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn feed_byte(b: u8) -> void {
+    if (slen >= CHUNK_CAP) {
+        flush_full();
+    }
+    if (b == 10) {
+        if (!cont and slen - lstart == 13 and line_is_marker()) {
+            slen = lstart;
+            close_story();
+        } else {
+            sbuf[slen] = 10;
+            slen = slen + 1;
+            lstart = slen;
+            cont = false;
+        }
+    } else {
+        sbuf[slen] = b;
+        slen = slen + 1;
+    }
+}
+
+/// End of input: a last line without a newline may still be the marker; then close the story.
+fn finish() -> void {
+    if (!cont and slen - lstart == 13 and line_is_marker()) {
+        slen = lstart;
+    }
+    close_story();
+    flush_tokens();
+}
+
+/// Run the machine over a byte slice (the tests, and anything that has its text in memory).
+fn convert_bytes(data: []const u8, sink: i32) -> void {
+    reset_state(sink);
+    var i : usize = 0;
+    while (i < data.len) {
+        feed_byte(data[i]);
+        i = i + 1;
+    }
+    finish();
+}
+
+// ---- the file passes -------------------------------------------------------------------------
+
+/// Pass 1: text file in_fd -> tokens (no header) on body_fd. Leaves total and stories set.
+fn run_convert(in_fd: i32, body_fd: i32) -> i32 {
+    reset_state(body_fd);
+    var going : bool = true;
+    while (going and ioerr == 0) {
+        const got : i32 = host_read(in_fd, rbuf[0 .. IO_CAP]);
+        if (got < 0) {
+            ioerr = HC_ERR_READ;
+        } else if (got == 0) {
+            going = false;
+        } else {
+            const n : usize = @intCast(got);
+            var i : usize = 0;
+            while (i < n) {
+                feed_byte(rbuf[i]);
+                i = i + 1;
+            }
+        }
+    }
+    if (ioerr == 0) {
+        finish();
+    }
+    return ioerr;
+}
+
+/// Pass 2: header (with total) and then a copy of the body, onto out_fd.
+fn run_assemble(body_fd: i32, out_fd: i32) -> i32 {
+    make_header(total);
+    var rc : i32 = write_all(out_fd, hdr[0 .. 12]);
+    if (rc != HC_OK) {
+        return rc;
+    }
+    var copied : u32 = 0;
+    var going : bool = true;
+    while (going) {
+        const got : i32 = host_read(body_fd, rbuf[0 .. IO_CAP]);
+        if (got < 0) {
+            return HC_ERR_READ;
+        }
+        if (got == 0) {
+            going = false;
+        } else {
+            const n : usize = @intCast(got);
+            rc = write_all(out_fd, rbuf[0 .. n]);
+            if (rc != HC_OK) {
+                return rc;
+            }
+            copied = copied + @as(u32, @intCast(got));
+        }
+    }
+    if (copied != 2 * total) {
+        return HC_ERR_VERIFY;
+    }
+    return HC_OK;
+}
+
+// ---- the verifier: a byte-at-a-time check of a finished token file ----------------------------
+
+fn vreset() -> void {
+    vpos = 0;
+    vlo = 0;
+    vtoks = 0;
+    veos = 0;
+    vbad = 0;
+}
+
+fn vstep(b: u8) -> void {
+    const bb : u32 = @intCast(b);
+    if (vpos < 12) {
+        vhdr[@intCast(vpos)] = b;
+    } else if (@mod(vpos, 2) == 0) {
+        vlo = bb;
+    } else {
+        const tok : u32 = vlo + 256 * bb;
+        if (tok >= 729) {
+            vbad = vbad + 1;
+        }
+        if (tok == 2) {
+            veos = veos + 1;
+        }
+        vtoks = vtoks + 1;
+    }
+    vpos = vpos + 1;
+}
+
+fn vfinish(expect_count: u32, expect_eos: u32) -> i32 {
+    if (vpos < 12) {
+        return HC_ERR_VERIFY;
+    }
+    if (vhdr[0] != 72 or vhdr[1] != 84 or vhdr[2] != 79 or vhdr[3] != 75) {
+        return HC_ERR_VERIFY;
+    }
+    if (get32(&vhdr, 4) != FORMAT_VERSION) {
+        return HC_ERR_VERIFY;
+    }
+    if (get32(&vhdr, 8) != expect_count) {
+        return HC_ERR_VERIFY;
+    }
+    if (@mod(vpos, 2) != 0 or vtoks != expect_count or veos != expect_eos or vbad != 0) {
+        return HC_ERR_VERIFY;
+    }
+    return HC_OK;
+}
+
+/// Pass 3: read the finished file back and check it against what was written.
+fn run_verify(fd: i32, expect_count: u32, expect_eos: u32) -> i32 {
+    vreset();
+    var going : bool = true;
+    while (going) {
+        const got : i32 = host_read(fd, rbuf[0 .. IO_CAP]);
+        if (got < 0) {
+            return HC_ERR_READ;
+        }
+        if (got == 0) {
+            going = false;
+        } else {
+            const n : usize = @intCast(got);
+            var i : usize = 0;
+            while (i < n) {
+                vstep(rbuf[i]);
+                i = i + 1;
+            }
+        }
+    }
+    return vfinish(expect_count, expect_eos);
+}
+
+// ---- the two files ---------------------------------------------------------------------------
+
+/// /tmp/hslm/valid.txt -> /tmp/hslm/valid.tok
+pub fn convert_valid() -> i32 {
+    const in_fd : i32 = host_open("/tmp/hslm/valid.txt", 0);
+    if (in_fd < 0) {
+        return HC_ERR_OPEN;
+    }
+    const body_w : i32 = host_open("/tmp/hslm/valid.tok.body", 1);
+    if (body_w < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc1 : i32 = run_convert(in_fd, body_w);
+    const c1 : i32 = host_close(in_fd);
+    const c2 : i32 = host_close(body_w);
+    if (rc1 != HC_OK) {
+        return rc1;
+    }
+    if (c1 != 0 or c2 != 0) {
+        return HC_ERR_WRITE;
+    }
+    const body_r : i32 = host_open("/tmp/hslm/valid.tok.body", 0);
+    if (body_r < 0) {
+        return HC_ERR_OPEN;
+    }
+    const out_fd : i32 = host_open("/tmp/hslm/valid.tok", 1);
+    if (out_fd < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc2 : i32 = run_assemble(body_r, out_fd);
+    const c3 : i32 = host_close(body_r);
+    const c4 : i32 = host_close(out_fd);
+    if (rc2 != HC_OK) {
+        return rc2;
+    }
+    if (c3 != 0 or c4 != 0) {
+        return HC_ERR_WRITE;
+    }
+    const chk : i32 = host_open("/tmp/hslm/valid.tok", 0);
+    if (chk < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc3 : i32 = run_verify(chk, total, stories);
+    const c5 : i32 = host_close(chk);
+    if (rc3 != HC_OK) {
+        return rc3;
+    }
+    if (c5 != 0) {
+        return HC_ERR_READ;
+    }
+    const z : i32 = host_open("/tmp/hslm/valid.tok.body", 1);
+    if (z < 0) {
+        return HC_ERR_OPEN;
+    }
+    const c6 : i32 = host_close(z);
+    if (c6 != 0) {
+        return HC_ERR_WRITE;
+    }
+    return HC_OK;
+}
+
+/// /tmp/hslm/train.txt -> /tmp/hslm/train.tok
+pub fn convert_train() -> i32 {
+    const in_fd : i32 = host_open("/tmp/hslm/train.txt", 0);
+    if (in_fd < 0) {
+        return HC_ERR_OPEN;
+    }
+    const body_w : i32 = host_open("/tmp/hslm/train.tok.body", 1);
+    if (body_w < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc1 : i32 = run_convert(in_fd, body_w);
+    const c1 : i32 = host_close(in_fd);
+    const c2 : i32 = host_close(body_w);
+    if (rc1 != HC_OK) {
+        return rc1;
+    }
+    if (c1 != 0 or c2 != 0) {
+        return HC_ERR_WRITE;
+    }
+    const body_r : i32 = host_open("/tmp/hslm/train.tok.body", 0);
+    if (body_r < 0) {
+        return HC_ERR_OPEN;
+    }
+    const out_fd : i32 = host_open("/tmp/hslm/train.tok", 1);
+    if (out_fd < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc2 : i32 = run_assemble(body_r, out_fd);
+    const c3 : i32 = host_close(body_r);
+    const c4 : i32 = host_close(out_fd);
+    if (rc2 != HC_OK) {
+        return rc2;
+    }
+    if (c3 != 0 or c4 != 0) {
+        return HC_ERR_WRITE;
+    }
+    const chk : i32 = host_open("/tmp/hslm/train.tok", 0);
+    if (chk < 0) {
+        return HC_ERR_OPEN;
+    }
+    const rc3 : i32 = run_verify(chk, total, stories);
+    const c5 : i32 = host_close(chk);
+    if (rc3 != HC_OK) {
+        return rc3;
+    }
+    if (c5 != 0) {
+        return HC_ERR_READ;
+    }
+    const z : i32 = host_open("/tmp/hslm/train.tok.body", 1);
+    if (z < 0) {
+        return HC_ERR_OPEN;
+    }
+    const c6 : i32 = host_close(z);
+    if (c6 != 0) {
+        return HC_ERR_WRITE;
+    }
+    return HC_OK;
+}
+
+/// The program `t27c compile --backend ml` builds: valid first, then train; die loudly on any error.
+pub fn main() -> void {
+    const v : i32 = convert_valid();
+    assert v == HC_OK;
+    const t : i32 = convert_train();
+    assert t == HC_OK;
+}
+
+// ---- tests (byte slices in memory, no files) ---------------------------------------------------
+
+const ONCE_T : [16]u8 = [79, 110, 99, 101, 32, 117, 112, 111, 110, 32, 97, 32, 116, 105, 109, 101];
+const FOX_T : [19]u8 = [84, 104, 101, 32, 113, 117, 105, 99, 107, 32, 98, 114, 111, 119, 110, 32, 102, 111, 120];
+const ABC_T : [3]u8 = [97, 98, 99];
+const LINE2_T : [42]u8 = [79, 110, 99, 101, 32, 117, 112, 111, 110, 32, 97, 32, 116, 105, 109, 101, 44, 10, 116, 104, 101, 114, 101, 32, 119, 97, 115, 32, 97, 32, 108, 105, 116, 116, 108, 101, 32, 103, 105, 114, 108, 46];
+
+var tin : [20100]u8 = undefined;
+var tex : [20100]u8 = undefined;
+var dbuf : [24576]u8 = undefined;
+
+fn put_bytes(dst: []u8, at: usize, src: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < src.len) {
+        dst[at + i] = src[i];
+        i = i + 1;
+    }
+    return at + src.len;
+}
+
+fn put_nl(dst: []u8, at: usize) -> usize {
+    dst[at] = 10;
+    return at + 1;
+}
+
+/// The collected tokens are exactly want[0..k].
+fn tokens_are(want: []const u16, k: usize) -> bool {
+    if (tn != k) {
+        return false;
+    }
+    var i : usize = 0;
+    while (i < k) {
+        if (tbuf[i] != want[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The collected tokens are one story: its text is exp[0..n] and the last id is EOS.
+fn story_is(exp: []const u8, n: usize) -> bool {
+    if (tn < 2) {
+        return false;
+    }
+    if (tbuf[tn - 1] != EOS_TOKEN) {
+        return false;
+    }
+    const m : usize = decode(tbuf[0 .. tn - 1], &dbuf);
+    if (m != n) {
+        return false;
+    }
+    var i : usize = 0;
+    while (i < n) {
+        if (dbuf[i] != exp[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+test two_stories_each_end_in_one_eos {
+    // "Once upon a time" <marker> "The quick brown fox" <marker>; ids from the Zig tokenizer
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &ONCE_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &FOX_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    const want : [14]u16 = [463, 105, 2, 427, 683, 109, 490, 102, 397, 507, 36, 660, 124, 2];
+    assert ioerr == 0;
+    assert tokens_are(&want, 14);
+    assert total == 14;
+    assert stories == 2;
+}
+
+test a_newline_inside_a_story_is_kept {
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &LINE2_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    // the Zig tokenizer on "Once upon a time,\nthere was a little girl." is 1 463 105 48 14 464 410 504 112 50 2
+    const want : [10]u16 = [463, 105, 48, 14, 464, 410, 504, 112, 50, 2];
+    assert tokens_are(&want, 10);
+    assert stories == 1;
+}
+
+test empty_stories_make_nothing {
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &ABC_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    const want : [4]u16 = [101, 102, 103, 2];
+    assert tokens_are(&want, 4);
+    assert stories == 1;
+}
+
+test no_input_means_no_tokens {
+    convert_bytes(tin[0 .. 0], -1);
+    assert ioerr == 0;
+    assert tn == 0;
+    assert total == 0;
+    assert stories == 0;
+}
+
+test a_lone_newline_makes_nothing_but_a_blank_line_is_text {
+    // "\n" is just the terminator of an empty story; "\n\n" is a story of one newline (id 14)
+    tin[0] = 10;
+    tin[1] = 10;
+    convert_bytes(tin[0 .. 1], -1);
+    assert tn == 0;
+    assert stories == 0;
+    convert_bytes(tin[0 .. 2], -1);
+    const want : [2]u16 = [14, 2];
+    assert tokens_are(&want, 2);
+    assert stories == 1;
+}
+
+test the_marker_inside_a_line_is_text {
+    // "x<|endoftext|>\nabc": one story, the marker text tokenized (the Zig gives 1 124 391 101 102 103 2)
+    var p : usize = 0;
+    tin[p] = 120;
+    p = p + 1;
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &ABC_T);
+    convert_bytes(tin[0 .. p], -1);
+    const want : [6]u16 = [124, 391, 101, 102, 103, 2];
+    assert tokens_are(&want, 6);
+    assert stories == 1;
+}
+
+test a_marker_at_the_end_without_a_newline_still_closes {
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &ABC_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    convert_bytes(tin[0 .. p], -1);
+    const want : [4]u16 = [101, 102, 103, 2];
+    assert tokens_are(&want, 4);
+}
+
+test a_last_story_without_a_marker_gets_its_eos {
+    const want : [4]u16 = [101, 102, 103, 2];
+    convert_bytes(&ABC_T, -1);
+    assert tokens_are(&want, 4);
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &ABC_T);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert tokens_are(&want, 4);
+}
+
+test blank_lines_inside_a_story_are_kept {
+    // "abc\n\nabc" then the marker
+    var p : usize = 0;
+    p = put_bytes(&tex, p, &ABC_T);
+    p = put_nl(&tex, p);
+    p = put_nl(&tex, p);
+    p = put_bytes(&tex, p, &ABC_T);
+    const n : usize = p;
+    p = put_bytes(&tin, 0, tex[0 .. n]);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert story_is(tex[0 .. n], n);
+}
+
+test only_one_newline_before_the_marker_is_dropped {
+    // "abc\n\n" then the marker: the story is "abc\n"
+    var p : usize = 0;
+    p = put_bytes(&tex, p, &ABC_T);
+    p = put_nl(&tex, p);
+    const n : usize = p;
+    p = put_bytes(&tin, 0, tex[0 .. n]);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert story_is(tex[0 .. n], n);
+}
+
+test a_story_longer_than_the_window_is_cut_at_line_starts_and_decodes_back {
+    // 200 lines of 99 letters: 19999 bytes of story, then the marker
+    var line : usize = 0;
+    var p : usize = 0;
+    var q : usize = 0;
+    while (line < 200) {
+        var j : usize = 0;
+        while (j < 99) {
+            const c : u8 = @intCast(97 + @mod(j + line, 26));
+            tin[p] = c;
+            tex[q] = c;
+            p = p + 1;
+            q = q + 1;
+            j = j + 1;
+        }
+        tin[p] = 10;
+        p = p + 1;
+        if (line < 199) {
+            tex[q] = 10;
+            q = q + 1;
+        }
+        line = line + 1;
+    }
+    assert q == 19999;
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert ioerr == 0;
+    assert stories == 1;
+    assert story_is(tex[0 .. q], q);
+}
+
+test one_line_longer_than_the_window_is_cut_at_8192 {
+    var p : usize = 0;
+    while (p < 9000) {
+        const c : u8 = @intCast(98 + @mod(p, 5));
+        tin[p] = c;
+        tex[p] = c;
+        p = p + 1;
+    }
+    tin[p] = 10;
+    p = p + 1;
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert ioerr == 0;
+    assert stories == 1;
+    assert story_is(tex[0 .. 9000], 9000);
+}
+
+test a_marker_after_a_cut_line_is_not_a_boundary {
+    // 8192 letters, then the marker text on the same line: the rest of that line is exactly 13
+    // bytes, but it is not a line of its own, so no story ends there
+    var p : usize = 0;
+    while (p < 8192) {
+        tin[p] = 99;
+        tex[p] = 99;
+        p = p + 1;
+    }
+    var q : usize = 8192;
+    q = put_bytes(&tex, q, &MARKER);
+    q = put_nl(&tex, q);
+    tex[q] = 100;
+    q = q + 1;
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    tin[p] = 100;
+    p = p + 1;
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    assert ioerr == 0;
+    assert stories == 1;
+    assert story_is(tex[0 .. q], q);
+}
+
+test the_header_is_htok_version_count {
+    make_header(16909060);
+    assert hdr[0] == 72 and hdr[1] == 84 and hdr[2] == 79 and hdr[3] == 75;
+    assert hdr[4] == 1 and hdr[5] == 0 and hdr[6] == 0 and hdr[7] == 0;
+    assert hdr[8] == 4 and hdr[9] == 3 and hdr[10] == 2 and hdr[11] == 1;
+    assert get32(&hdr, 8) == 16909060;
+}
+
+test tokens_are_packed_as_u16_little_endian {
+    tbuf[0] = 463;
+    tbuf[1] = 2;
+    tbuf[2] = 728;
+    tn = 3;
+    const nb : usize = pack_tokens();
+    assert nb == 6;
+    assert obuf[0] == 207 and obuf[1] == 1;
+    assert obuf[2] == 2 and obuf[3] == 0;
+    assert obuf[4] == 216 and obuf[5] == 2;
+    tn = 0;
+}
+
+test a_converted_stream_passes_the_verifier {
+    var p : usize = 0;
+    p = put_bytes(&tin, p, &ONCE_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &FOX_T);
+    p = put_nl(&tin, p);
+    p = put_bytes(&tin, p, &MARKER);
+    p = put_nl(&tin, p);
+    convert_bytes(tin[0 .. p], -1);
+    make_header(total);
+    const nb : usize = pack_tokens();
+    vreset();
+    var i : usize = 0;
+    while (i < 12) {
+        vstep(hdr[i]);
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < nb) {
+        vstep(obuf[j]);
+        j = j + 1;
+    }
+    assert vtoks == 14;
+    assert vfinish(total, stories) == HC_OK;
+}
+
+/// A good 3-token file (463 105 2) in tin; returns its length, 18.
+fn good_stream() -> usize {
+    make_header(3);
+    var i : usize = 0;
+    while (i < 12) {
+        tin[i] = hdr[i];
+        i = i + 1;
+    }
+    tin[12] = 207;
+    tin[13] = 1;
+    tin[14] = 105;
+    tin[15] = 0;
+    tin[16] = 2;
+    tin[17] = 0;
+    return 18;
+}
+
+fn verify_tin(n: usize, count: u32, eos: u32) -> i32 {
+    vreset();
+    var i : usize = 0;
+    while (i < n) {
+        vstep(tin[i]);
+        i = i + 1;
+    }
+    return vfinish(count, eos);
+}
+
+test the_verifier_accepts_a_good_file {
+    const n : usize = good_stream();
+    assert verify_tin(n, 3, 1) == HC_OK;
+}
+
+test the_verifier_refuses_a_bad_magic {
+    const n : usize = good_stream();
+    tin[0] = 73;
+    assert verify_tin(n, 3, 1) == HC_ERR_VERIFY;
+}
+
+test the_verifier_refuses_a_bad_version {
+    const n : usize = good_stream();
+    tin[4] = 2;
+    assert verify_tin(n, 3, 1) == HC_ERR_VERIFY;
+}
+
+test the_verifier_refuses_a_count_that_is_not_the_file {
+    const n : usize = good_stream();
+    assert verify_tin(n, 4, 1) == HC_ERR_VERIFY;
+    tin[8] = 4;
+    assert verify_tin(n, 3, 1) == HC_ERR_VERIFY;
+    assert verify_tin(n, 4, 1) == HC_ERR_VERIFY;
+}
+
+test the_verifier_refuses_a_truncated_or_odd_file {
+    const n : usize = good_stream();
+    assert verify_tin(n - 1, 3, 1) == HC_ERR_VERIFY;
+    assert verify_tin(n - 2, 3, 1) == HC_ERR_VERIFY;
+    assert verify_tin(8, 3, 1) == HC_ERR_VERIFY;
+}
+
+test the_verifier_refuses_an_id_outside_the_vocabulary {
+    const n : usize = good_stream();
+    tin[12] = 217;
+    tin[13] = 2;
+    assert verify_tin(n, 3, 1) == HC_ERR_VERIFY;
+}
+
+test the_verifier_refuses_a_wrong_story_count {
+    const n : usize = good_stream();
+    assert verify_tin(n, 3, 2) == HC_ERR_VERIFY;
+    assert verify_tin(n, 3, 0) == HC_ERR_VERIFY;
+}
+
+test the_chunk_size_is_the_tokenizer_window {
+    var chunk : usize = CHUNK_CAP;
+    var window : usize = WORK_CAP;
+    var tok_cap : usize = TOK_CAP;
+    var io_cap : usize = IO_CAP;
+    var head : usize = HEADER_BYTES;
+    assert chunk == window;
+    assert tok_cap * 2 == io_cap;
+    assert head == 12;
+}
+
+test the_comparison_helpers_can_fail {
+    // tokens_are must say no to a wrong id and a wrong length, story_is to a wrong byte
+    convert_bytes(&ABC_T, -1);
+    const right : [4]u16 = [101, 102, 103, 2];
+    const wrong : [4]u16 = [101, 102, 104, 2];
+    assert tokens_are(&right, 4);
+    assert !tokens_are(&wrong, 4);
+    assert !tokens_are(&right, 3);
+    const same : [3]u8 = [97, 98, 99];
+    const other : [3]u8 = [97, 98, 100];
+    assert story_is(&same, 3);
+    assert !story_is(&other, 3);
+    assert !story_is(&same, 2);
+}

@@ -51,6 +51,7 @@ size_t put_noparse(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t ps, 
 size_t put_unwritten(uint8_t* dst, size_t cap, size_t w, uint8_t* raw, size_t ps, size_t pe);
 size_t feed_tsv(uint8_t* raw, size_t n, uint8_t* out, size_t cap);
 size_t feed_sarif(uint8_t* raw, size_t n, uint8_t* out, size_t out_cap);
+size_t t_unwritten_lines(uint8_t* dst, size_t cap, uint32_t count, size_t plen, size_t last);
 int32_t digit_val(uint8_t b);
 size_t field_end(uint8_t* text, size_t e, size_t s);
 bool field_eq(uint8_t* text, size_t s, size_t e, const char* name, size_t n);
@@ -185,6 +186,26 @@ size_t feed_sarif(uint8_t* raw, size_t n, uint8_t* out, size_t out_cap) {
         tn = put_str(&tsv, TSV_CAP, 0, REFUSED_LINE, REFUSED_LINE_LEN);
     }
     return sarif_render(&tsv, tn, DEFAULT_MAX_RESULTS, out, out_cap);
+}
+
+size_t t_unwritten_lines(uint8_t* dst, size_t cap, uint32_t count, size_t plen, size_t last) {
+    size_t x = 0;
+    uint32_t c = 0;
+    while ((c < count)) {
+        size_t k = 0;
+        while ((k < plen)) {
+            x = put_byte(dst, cap, x, 'p');
+            k += 1;
+        }
+        x = put_str(dst, cap, x, "\tUNWRITTEN\t\n", 12);
+        c += 1;
+    }
+    size_t j = 0;
+    while ((j < last)) {
+        x = put_byte(dst, cap, x, 'q');
+        j += 1;
+    }
+    return put_str(dst, cap, x, "\tUNWRITTEN\t\n", 12);
 }
 
 int32_t digit_val(uint8_t b) {
@@ -814,6 +835,84 @@ void test_a_message_with_a_quote_or_a_tab_stays_one_valid_finding(void) {
     assert((buf_has(&out, d, "\"executionSuccessful\":true", 26) == true));
 }
 
+void test_a_zero_inside_a_position_is_a_digit(void) {
+    uint8_t r[128] = {0};
+    size_t n = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line 10:20\n", 30);
+    uint8_t out[8192] = {0};
+    size_t d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"startLine\":10,\"startColumn\":20", 31) == true));
+}
+
+void test_a_column_needs_a_line_number_and_a_colon_right_after_it(void) {
+    uint8_t r[128] = {0};
+    uint8_t out[8192] = {0};
+    size_t n = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line :5\n", 27);
+    size_t d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"startLine\":1,\"startColumn\":1", 29) == true));
+    n = put_str(&r, 128, 0, "a.t27\tNOPARSE\te at line 3-5\n", 28);
+    d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"startLine\":3,\"startColumn\":1", 29) == true));
+}
+
+void test_a_blank_line_between_records_is_skipped_not_refused(void) {
+    uint8_t r[128] = {0};
+    size_t n = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\t\n\nb.t27\tUNWRITTEN\t\n", 35);
+    uint8_t out[8192] = {0};
+    size_t d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"uri\":\"a.t27\"", 13) == true));
+    assert((buf_has(&out, d, "\"uri\":\"b.t27\"", 13) == true));
+    assert((buf_has(&out, d, "\"executionSuccessful\":true", 26) == true));
+}
+
+void test_a_two_field_record_is_refused_even_with_a_known_status(void) {
+    uint8_t r[128] = {0};
+    size_t n = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\n", 16);
+    uint8_t out[8192] = {0};
+    size_t d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"results\":[]", 12) == true));
+    assert((buf_has(&out, d, "\"executionSuccessful\":false", 27) == true));
+}
+
+void test_crlf_records_are_all_read(void) {
+    uint8_t r[128] = {0};
+    size_t n = put_str(&r, 128, 0, "a.t27\tUNWRITTEN\t", 16);
+    n = put_byte(&r, 128, n, 13);
+    n = put_byte(&r, 128, n, '\n');
+    n = put_str(&r, 128, n, "b.t27\tUNWRITTEN\t", 16);
+    n = put_byte(&r, 128, n, 13);
+    n = put_byte(&r, 128, n, '\n');
+    assert((n == 36));
+    assert((r[16] == 13));
+    uint8_t out[8192] = {0};
+    size_t d = feed_sarif(&r, n, &out, 8192);
+    assert((buf_has(&out, d, "\"uri\":\"a.t27\"", 13) == true));
+    assert((buf_has(&out, d, "\"uri\":\"b.t27\"", 13) == true));
+    assert((buf_has(&out, d, "\"executionSuccessful\":true", 26) == true));
+}
+
+void test_a_finding_list_of_exactly_tsv_cap_bytes_is_kept(void) {
+    uint8_t r[40000] = {0};
+    size_t n = t_unwritten_lines(&r, 40000, 339, 100, 16);
+    uint8_t tsv[65536] = {0};
+    assert((feed_tsv(&r, n, &tsv, TSV_CAP) == TSV_CAP));
+    uint8_t out[262144] = {0};
+    size_t d = feed_sarif(&r, n, &out, 262144);
+    assert((sarif_fits(d, 262144) == true));
+    assert((buf_has(&out, d, "\"uri\":\"qqqqqqqqqqqqqqqq\"", 24) == true));
+    assert((buf_has(&out, d, "\"executionSuccessful\":true", 26) == true));
+}
+
+void test_a_finding_list_one_byte_over_tsv_cap_is_refused_whole(void) {
+    uint8_t r[40000] = {0};
+    size_t n = t_unwritten_lines(&r, 40000, 339, 100, 17);
+    uint8_t tsv[65536] = {0};
+    assert((feed_tsv(&r, n, &tsv, TSV_CAP) == (TSV_CAP + 1)));
+    uint8_t out[262144] = {0};
+    size_t d = feed_sarif(&r, n, &out, 262144);
+    assert((buf_has(&out, d, "\"results\":[]", 12) == true));
+    assert((buf_has(&out, d, "\"executionSuccessful\":false", 27) == true));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -834,7 +933,14 @@ int main(void) {
     test_several_files_make_several_results_in_order();
     test_empty_input_is_a_valid_empty_run();
     test_a_message_with_a_quote_or_a_tab_stays_one_valid_finding();
-    printf("All %d tests passed.\n", 12);
+    test_a_zero_inside_a_position_is_a_digit();
+    test_a_column_needs_a_line_number_and_a_colon_right_after_it();
+    test_a_blank_line_between_records_is_skipped_not_refused();
+    test_a_two_field_record_is_refused_even_with_a_known_status();
+    test_crlf_records_are_all_read();
+    test_a_finding_list_of_exactly_tsv_cap_bytes_is_kept();
+    test_a_finding_list_one_byte_over_tsv_cap_is_refused_whole();
+    printf("All %d tests passed.\n", 19);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

@@ -1,0 +1,965 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/js_num.t27 -- JavaScript's number-to-text and text-to-number rules, exact, for the
+; native widget views. Epic gHashTag/t27#10937, issue #10938, stage "page" of specs/t27f/widget_factory.t27.
+; A tool.js writes numbers with String(x), x.toFixed(d), x.toLocaleString('en-US') and reads them with
+; JSON.parse / Number(text). The native views (jtag_verdict.t27, race_the_bee.t27 and the rest) must give the
+; same bytes, so this file is those rules once, with no floating-point shortcut that rounds twice.
+; --
+; HOW: a double is m * 2^e with m below 2^53. Its exact decimal value is m * 5^k / 10^k (e < 0, k = -e) or
+; m * 2^e (e >= 0), computed in a base-10 digit array (least significant first). From the exact digits:
+;   - js_to_fixed: Number.prototype.toFixed, round half up on the EXACT value (the spec picks the larger
+;     n when two are as close);
+;   - js_str_num: Number::toString, the SHORTEST digits that read back to the same double, the one nearest
+;     the value when several have that length, laid out as the spec lays them out (plain, 0.000ddd, or e+NN);
+;   - js_locale_num: toLocaleString('en-US') for a number, at most 3 fraction digits, half up, groups of
+;     three, on the shortest digits (ICU rounds the shortest decimal, not the exact value: 1.0005 gives 1.001);
+;   - js_parse_num: the correctly rounded double of a decimal text (an f64 guess, then an exact comparison
+;     of the text with the two midpoints around it, so a 17-digit number is never off in the last place);
+;   - js_round: Math.round (floor(x + 0.5) is wrong at 0.49999999999999994), js_floor.
+; NOT SUPPORTED, said plainly: subnormal doubles (below 2.2250738585072014e-308) and a text of more than
+; 600 digits or an exponent past +-340 (js_parse_num then gives its f64 guess). Everything is stateless: no
+; module variable, the scratch arrays are locals, so a view that `use`s a name gets it with the names it
+; calls through its anchor (see race_the_bee.t27, imports_anchor).
+; MEASURED 2026-10-19: t27c 0.5.2 gen + a 10-function Zig export wrapper + zig build-exe wasm32-freestanding
+; ReleaseSmall give a 8394-byte wasm. 1925210 comparisons against node 23's String(x), toFixed(0,1,2,3,4,6),
+; toLocaleString('en-US'), Math.round, Math.floor, Math.ceil, Math.log2 (a port of fdlibm's e_log2.c, equal
+; to V8's bit for bit), two-argument Math.max/min and Number(text) over 121989 doubles (random bit
+; patterns, k-digit decimals, thousandths, binary fractions, powers of two, ties, NaN, infinities, -0) and
+; 120014 decimal texts (17-digit prints, toPrecision(17), exponent forms, random digit strings up to 25
+; digits): 0 differences. Two defects found and fixed by that run: an exact tie between two shortest digit
+; strings goes to the EVEN last digit (not the lower or the higher), and a 17-digit text far from 1 needed
+; more than 12 correction steps from the f64 guess (now 64, from a guess built with 1e22 steps).
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widgets_js_num;
+
+pub const JN_OVER : u32 = 4294967295;
+pub const JN_CAP : u32 = 1500;
+pub const JN_TWO52 : f64 = 4503599627370496.0;
+pub const JN_TWO53 : f64 = 9007199254740992.0;
+
+pub fn jn_put(o: []u8, n: u32, b: u8) -> u32 {
+    if (n >= (o.len as u32)) { return JN_OVER; }
+    o[n as usize] = b;
+    return n + 1;
+}
+
+pub fn jn_raw(o: []u8, n0: u32, s: []const u8) -> u32 {
+    var n : u32 = n0;
+    var i : usize = 0;
+    while (i < s.len) {
+        n = jn_put(o, n, s[i]);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The decimal digits of v, least significant first, into a; their count (1 for zero).
+pub fn jn_digits(a: []u8, v0: u64) -> u32 {
+    var v : u64 = v0;
+    var n : u32 = 0;
+    if (v == 0) {
+        a[0] = 0;
+        return 1;
+    }
+    while (v > 0) {
+        a[n as usize] = (v % 10) as u8;
+        v = v / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// a * k in place (a holds `len` digits, least significant first); the new length. k below 2^31.
+pub fn jn_mul(a: []u8, len: u32, k: u64) -> u32 {
+    var carry : u64 = 0;
+    var i : u32 = 0;
+    while (i < len) {
+        const t : u64 = (a[i as usize] as u64) * k + carry;
+        a[i as usize] = (t % 10) as u8;
+        carry = t / 10;
+        i = i + 1;
+    }
+    var n : u32 = len;
+    while (carry > 0 and (n as usize) < a.len) {
+        a[n as usize] = (carry % 10) as u8;
+        carry = carry / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// a * 2^p in place.
+pub fn jn_mul2(a: []u8, len0: u32, p0: u32) -> u32 {
+    var len : u32 = len0;
+    var p : u32 = p0;
+    while (p >= 20) {
+        len = jn_mul(a, len, 1048576);
+        p = p - 20;
+    }
+    var k : u64 = 1;
+    while (p > 0) {
+        k = k * 2;
+        p = p - 1;
+    }
+    if (k > 1) { len = jn_mul(a, len, k); }
+    return len;
+}
+
+/// a * 5^p in place.
+pub fn jn_mul5(a: []u8, len0: u32, p0: u32) -> u32 {
+    var len : u32 = len0;
+    var p : u32 = p0;
+    while (p >= 13) {
+        len = jn_mul(a, len, 1220703125);
+        p = p - 13;
+    }
+    var k : u64 = 1;
+    while (p > 0) {
+        k = k * 5;
+        p = p - 1;
+    }
+    if (k > 1) { len = jn_mul(a, len, k); }
+    return len;
+}
+
+/// a * 10^z in place (z zero digits at the bottom).
+pub fn jn_shift(a: []u8, len: u32, z: u32) -> u32 {
+    if (z == 0 or (len == 1 and a[0] == 0)) { return len; }
+    if ((len + z) as usize > a.len) { return len; }
+    var i : u32 = len;
+    while (i > 0) {
+        i = i - 1;
+        a[(i + z) as usize] = a[i as usize];
+    }
+    var j : u32 = 0;
+    while (j < z) {
+        a[j as usize] = 0;
+        j = j + 1;
+    }
+    return len + z;
+}
+
+/// Compare a and b as numbers, n digits each (both zero above their lengths): -1, 0, 1.
+pub fn jn_cmp(a: []const u8, b: []const u8, n: u32) -> i32 {
+    var i : u32 = n;
+    while (i > 0) {
+        i = i - 1;
+        if (a[i as usize] > b[i as usize]) { return 1; }
+        if (a[i as usize] < b[i as usize]) { return 0 - 1; }
+    }
+    return 0;
+}
+
+/// x (finite, > 0, not subnormal) = jn_mant(x) * 2^jn_expo(x) with the mantissa in [2^52, 2^53).
+pub fn jn_expo(x0: f64) -> i32 {
+    var x : f64 = x0;
+    var e : i32 = 0;
+    while (x >= JN_TWO53) {
+        x = x / 2.0;
+        e = e + 1;
+    }
+    while (x < JN_TWO52) {
+        x = x * 2.0;
+        e = e - 1;
+    }
+    return e;
+}
+
+pub fn jn_mant(x0: f64) -> u64 {
+    var x : f64 = x0;
+    while (x >= JN_TWO53) { x = x / 2.0; }
+    while (x < JN_TWO52) { x = x * 2.0; }
+    return x as u64;
+}
+
+/// m * 2^e as a double (exact when the result is a normal double).
+pub fn jn_make(m: u64, e0: i32) -> f64 {
+    var v : f64 = m as f64;
+    var e : i32 = e0;
+    while (e >= 30) {
+        v = v * 1073741824.0;
+        e = e - 30;
+    }
+    while (e <= 0 - 30) {
+        v = v / 1073741824.0;
+        e = e + 30;
+    }
+    while (e > 0) {
+        v = v * 2.0;
+        e = e - 1;
+    }
+    while (e < 0) {
+        v = v / 2.0;
+        e = e + 1;
+    }
+    return v;
+}
+
+/// The exact value m * 2^e as digits a / 10^F, F = -e for e < 0, else 0; the digit count.
+pub fn jn_exact(a: []u8, m: u64, e: i32) -> u32 {
+    var len : u32 = jn_digits(a, m);
+    if (e >= 0) {
+        len = jn_mul2(a, len, e as u32);
+    } else {
+        len = jn_mul5(a, len, (0 - e) as u32);
+    }
+    return len;
+}
+
+pub fn jn_fscale(e: i32) -> u32 {
+    if (e < 0) { return (0 - e) as u32; }
+    return 0;
+}
+
+pub fn js_is_nan(x: f64) -> bool {
+    return x != x;
+}
+
+/// NaN and Infinity from a runtime zero: a literal 0.0 / 0.0 is a compile-time division by zero.
+pub fn js_nan(z: f64) -> f64 {
+    return z / z;
+}
+
+pub fn js_inf(z: f64) -> f64 {
+    return 1.0 / z;
+}
+
+pub fn js_floor(x: f64) -> f64 {
+    if (x != x or x == 0.0) { return x; }
+    if (x >= JN_TWO52 or x <= 0.0 - JN_TWO52) { return x; }
+    const t : f64 = (x as i64) as f64;
+    if (t > x) { return t - 1.0; }
+    return t;
+}
+
+pub fn js_ceil(x: f64) -> f64 {
+    if (x != x or x == 0.0) { return x; }
+    if (x >= JN_TWO52 or x <= 0.0 - JN_TWO52) { return x; }
+    const t : f64 = (x as i64) as f64;
+    var r : f64 = t;
+    if (t < x) { r = t + 1.0; }
+    if (r == 0.0 and x < 0.0) { return 0.0 * (0.0 - 1.0); }
+    return r;
+}
+
+/// Math.max(a, b): NaN if either is NaN, +0 above -0.
+pub fn js_max(a: f64, b: f64) -> f64 {
+    if (a != a or b != b) { return js_nan(0.0); }
+    if (a == 0.0 and b == 0.0) {
+        if ((1.0 / a) > 0.0) { return a; }
+        return b;
+    }
+    if (a > b) { return a; }
+    return b;
+}
+
+/// Math.min(a, b): NaN if either is NaN, -0 below +0.
+pub fn js_min(a: f64, b: f64) -> f64 {
+    if (a != a or b != b) { return js_nan(0.0); }
+    if (a == 0.0 and b == 0.0) {
+        if ((1.0 / a) < 0.0) { return a; }
+        return b;
+    }
+    if (a < b) { return a; }
+    return b;
+}
+
+/// The low 32 bits of the mantissa cleared (fdlibm's SET_LOW_WORD(x, 0)), for x of either sign.
+pub fn jn_clear_low_word(x: f64) -> f64 {
+    if (x == 0.0 or x != x) { return x; }
+    var neg : bool = x < 0.0;
+    var ax : f64 = x;
+    if (neg) { ax = 0.0 - x; }
+    const m : u64 = (jn_mant(ax) / 4294967296) * 4294967296;
+    const v : f64 = jn_make(m, jn_expo(ax));
+    if (neg) { return 0.0 - v; }
+    return v;
+}
+
+/// fdlibm k_log1p(f): log(1+f) - f + f*f/2 for f in [-0.2929, 0.4142].
+pub fn jn_k_log1p(f: f64) -> f64 {
+    const s : f64 = f / (2.0 + f);
+    const z : f64 = s * s;
+    const w : f64 = z * z;
+    const t1 : f64 = w * (3.999999999940941908e-01 + w * (2.222219843214978396e-01 + w * 1.531383769920937332e-01));
+    const t2 : f64 = z * (6.666666666666735130e-01 + w * (2.857142874366239149e-01 + w * (1.818357216161805012e-01 + w * 1.479819860511658591e-01)));
+    const r : f64 = t2 + t1;
+    const hfsq : f64 = 0.5 * f * f;
+    return s * (hfsq + r);
+}
+
+/// Math.log2 as V8 computes it (fdlibm e_log2.c): the same digits, not just a close value.
+pub fn js_log2(x: f64) -> f64 {
+    if (x != x or x < 0.0) { return js_nan(0.0); }
+    if (x == 0.0) { return 0.0 - js_inf(0.0); }
+    if (x > 1.7976931348623157e308) { return x; }
+    if (x == 1.0) { return 0.0; }
+    var k : i32 = 0;
+    var xs : f64 = x;
+    if (x < 2.2250738585072014e-308) {
+        k = 0 - 54;
+        xs = x * 18014398509481984.0;
+    }
+    const m : u64 = jn_mant(xs);
+    const e : i32 = jn_expo(xs);
+    const hx : u64 = (m / 4294967296) % 1048576;
+    k = k + e + 52;
+    var i : u64 = 0;
+    if (((hx + 614244) % 2097152) >= 1048576) { i = 1; }
+    var xn : f64 = jn_make(m, 0 - 52);
+    if (i == 1) {
+        xn = jn_make(m, 0 - 53);
+        k = k + 1;
+    }
+    const y : f64 = k as f64;
+    const f : f64 = xn - 1.0;
+    const hfsq : f64 = 0.5 * f * f;
+    const r : f64 = jn_k_log1p(f);
+    const hi : f64 = jn_clear_low_word(f - hfsq);
+    const lo : f64 = (f - hi) - hfsq + r;
+    var val_hi : f64 = hi * 1.44269504072144627571e+00;
+    var val_lo : f64 = (lo + hi) * 1.67517131648865118353e-10 + lo * 1.44269504072144627571e+00;
+    const w : f64 = y + val_hi;
+    val_lo = val_lo + ((y - w) + val_hi);
+    val_hi = w;
+    return val_lo + val_hi;
+}
+
+/// Math.round: the nearest integer, halves toward +infinity; -0 for a negative that rounds to zero.
+pub fn js_round(x: f64) -> f64 {
+    if (x != x or x == 0.0) { return x; }
+    if (x >= JN_TWO52 or x <= 0.0 - JN_TWO52) { return x; }
+    const f : f64 = js_floor(x);
+    var r : f64 = f;
+    if (x - f >= 0.5) { r = f + 1.0; }
+    if (r == 0.0 and x < 0.0) { return 0.0 * (0.0 - 1.0); }
+    return r;
+}
+
+/// The shortest digits that read back to ax (finite, > 0): written MSB first to ds[0..k), k at ds[40];
+/// the return is n with ax = 0.ds * 10^n.
+pub fn jn_shortest(ds: []u8, ax: f64) -> i32 {
+    const m : u64 = jn_mant(ax);
+    const e : i32 = jn_expo(ax);
+    const ee : i32 = e - 2;
+    var a : [1500]u8 = [0; 1500];
+    var hi : [1500]u8 = [0; 1500];
+    var lo : [1500]u8 = [0; 1500];
+    var t : [1500]u8 = [0; 1500];
+    var c : [1500]u8 = [0; 1500];
+    const la : u32 = jn_exact(a[0..], 4 * m, ee);
+    const lh : u32 = jn_exact(hi[0..], 4 * m + 2, ee);
+    var ll : u32 = 0;
+    if (m == 4503599627370496) {
+        ll = jn_exact(lo[0..], 4 * m - 1, ee);
+    } else {
+        ll = jn_exact(lo[0..], 4 * m - 2, ee);
+    }
+    var big : u32 = la;
+    if (lh > big) { big = lh; }
+    if (ll > big) { big = ll; }
+    const w : u32 = big + 2;
+    const inclusive : bool = (m % 2) == 0;
+    const f : i32 = (jn_fscale(ee)) as i32;
+    var want : u32 = 1;
+    var chosen : u32 = 0;
+    while (want <= la) {
+        const drop : u32 = la - want;
+        var i : u32 = 0;
+        while (i < w) {
+            if (i >= drop) { t[i as usize] = a[i as usize]; } else { t[i as usize] = 0; }
+            c[i as usize] = t[i as usize];
+            i = i + 1;
+        }
+        var q : u32 = drop;
+        var carry : bool = true;
+        while (carry and q < w) {
+            if (c[q as usize] == 9) {
+                c[q as usize] = 0;
+                q = q + 1;
+            } else {
+                c[q as usize] = c[q as usize] + 1;
+                carry = false;
+            }
+        }
+        var t_ok : bool = false;
+        var c_ok : bool = false;
+        const t_lo : i32 = jn_cmp(t[0..], lo[0..], w);
+        const t_hi : i32 = jn_cmp(t[0..], hi[0..], w);
+        if ((t_lo > 0 or (inclusive and t_lo == 0)) and (t_hi < 0 or (inclusive and t_hi == 0))) { t_ok = true; }
+        const c_lo : i32 = jn_cmp(c[0..], lo[0..], w);
+        const c_hi : i32 = jn_cmp(c[0..], hi[0..], w);
+        if ((c_lo > 0 or (inclusive and c_lo == 0)) and (c_hi < 0 or (inclusive and c_hi == 0))) { c_ok = true; }
+        if (drop == 0) { c_ok = false; }
+        if (t_ok and c_ok) {
+            // The nearer of the two; an exact tie goes to the even last digit, as V8 and ICU do (measured:
+            // 1879617340194654.25 is written ...654.2 and 1176980439545544.75 is written ...544.8).
+            chosen = 1;
+            const dd : u8 = a[(drop - 1) as usize];
+            if (dd > 5) { chosen = 2; }
+            if (dd == 5) {
+                var rest : bool = false;
+                var r2 : u32 = 0;
+                while (r2 + 1 < drop) {
+                    if (a[r2 as usize] != 0) { rest = true; }
+                    r2 = r2 + 1;
+                }
+                if (rest) { chosen = 2; }
+                if (!rest and (a[drop as usize] % 2) == 1) { chosen = 2; }
+            }
+        } else {
+            if (t_ok) { chosen = 1; }
+            if (c_ok) { chosen = 2; }
+        }
+        if (chosen > 0) { break; }
+        want = want + 1;
+    }
+    if (chosen == 0) {
+        jn_copy(t[0..], a[0..], w);
+        chosen = 1;
+    }
+    var top : u32 = w;
+    var k : u32 = 0;
+    var topi : u32 = 0;
+    var seen : bool = false;
+    var j : u32 = w;
+    while (j > 0) {
+        j = j - 1;
+        var dgt : u8 = t[j as usize];
+        if (chosen == 2) { dgt = c[j as usize]; }
+        if (!seen and dgt != 0) {
+            seen = true;
+            topi = j;
+        }
+        if (seen and k < 38) {
+            ds[k as usize] = dgt;
+            k = k + 1;
+        }
+    }
+    top = topi;
+    while (k > 1 and ds[(k - 1) as usize] == 0) { k = k - 1; }
+    ds[40] = k as u8;
+    return (top as i32) + 1 - f;
+}
+
+pub fn jn_copy(d: []u8, s: []const u8, n: u32) -> u32 {
+    var i : u32 = 0;
+    while (i < n) {
+        d[i as usize] = s[i as usize];
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn jn_put_run(o: []u8, n0: u32, ds: []const u8, from: u32, to: u32) -> u32 {
+    var n : u32 = n0;
+    var i : u32 = from;
+    while (i < to) {
+        n = jn_put(o, n, ds[i as usize] + 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Number::toString laid out: digits ds[0..k), value 0.ds * 10^np.
+pub fn jn_layout(o: []u8, n0: u32, ds: []const u8, k: u32, np: i32) -> u32 {
+    var n : u32 = n0;
+    const ki : i32 = k as i32;
+    if (ki <= np and np <= 21) {
+        n = jn_put_run(o, n, ds, 0, k);
+        var z : i32 = np - ki;
+        while (z > 0) {
+            n = jn_put(o, n, 48);
+            z = z - 1;
+        }
+        return n;
+    }
+    if (0 < np and np <= 21) {
+        n = jn_put_run(o, n, ds, 0, np as u32);
+        n = jn_put(o, n, 46);
+        return jn_put_run(o, n, ds, np as u32, k);
+    }
+    if (np > 0 - 6 and np <= 0) {
+        n = jn_put(o, n, 48);
+        n = jn_put(o, n, 46);
+        var z2 : i32 = 0 - np;
+        while (z2 > 0) {
+            n = jn_put(o, n, 48);
+            z2 = z2 - 1;
+        }
+        return jn_put_run(o, n, ds, 0, k);
+    }
+    n = jn_put(o, n, ds[0] + 48);
+    if (k > 1) {
+        n = jn_put(o, n, 46);
+        n = jn_put_run(o, n, ds, 1, k);
+    }
+    n = jn_put(o, n, 101);
+    var ex : i32 = np - 1;
+    if (ex < 0) {
+        n = jn_put(o, n, 45);
+        ex = 0 - ex;
+    } else {
+        n = jn_put(o, n, 43);
+    }
+    var eb : [8]u8 = [0; 8];
+    var el : u32 = jn_digits(eb[0..], ex as u64);
+    while (el > 0) {
+        el = el - 1;
+        n = jn_put(o, n, eb[el as usize] + 48);
+    }
+    return n;
+}
+
+/// String(x) for a number.
+pub fn js_str_num(o: []u8, n0: u32, x: f64) -> u32 {
+    if (x != x) { return jn_raw(o, n0, "NaN"); }
+    var n : u32 = n0;
+    if (x == 0.0) { return jn_put(o, n, 48); }
+    var ax : f64 = x;
+    if (x < 0.0) {
+        n = jn_put(o, n, 45);
+        ax = 0.0 - x;
+    }
+    if (ax > 1.7976931348623157e308) { return jn_raw(o, n, "Infinity"); }
+    var ds : [48]u8 = [0; 48];
+    const np : i32 = jn_shortest(ds[0..], ax);
+    return jn_layout(o, n, ds[0..], ds[40] as u32, np);
+}
+
+/// x.toFixed(f), f up to 100.
+pub fn js_to_fixed(o: []u8, n0: u32, x: f64, f0: u32) -> u32 {
+    if (x != x) { return jn_raw(o, n0, "NaN"); }
+    var n : u32 = n0;
+    var ax : f64 = x;
+    if (x < 0.0) { ax = 0.0 - x; }
+    if (ax >= 1e21) { return js_str_num(o, n0, x); }
+    var f : u32 = f0;
+    if (f > 100) { f = 100; }
+    if (x < 0.0) { n = jn_put(o, n, 45); }
+    var a : [1500]u8 = [0; 1500];
+    var len : u32 = 1;
+    var fs : i32 = 0;
+    if (ax > 0.0) {
+        len = jn_exact(a[0..], jn_mant(ax), jn_expo(ax));
+        fs = jn_fscale(jn_expo(ax)) as i32;
+    }
+    const off : i32 = fs - (f as i32);
+    var r : [400]u8 = [0; 400];
+    var rl : u32 = 0;
+    var i : i32 = 0;
+    while (i < 399 and (i + off) < (len as i32)) {
+        if (i + off >= 0) { r[i as usize] = a[(i + off) as usize]; }
+        i = i + 1;
+        rl = rl + 1;
+    }
+    if (off > 0 and off <= (len as i32)) {
+        if (a[(off - 1) as usize] >= 5) {
+            var q : u32 = 0;
+            var carry : bool = true;
+            while (carry and q < 399) {
+                if (r[q as usize] == 9) {
+                    r[q as usize] = 0;
+                    q = q + 1;
+                } else {
+                    r[q as usize] = r[q as usize] + 1;
+                    carry = false;
+                }
+            }
+            if (q + 1 > rl) { rl = q + 1; }
+        }
+    }
+    var tail : u32 = rl;
+    if (tail < f + 1) { tail = f + 1; }
+    var d : u32 = tail;
+    while (d > 0) {
+        d = d - 1;
+        n = jn_put(o, n, r[d as usize] + 48);
+        if (d == f and f > 0) { n = jn_put(o, n, 46); }
+    }
+    return n;
+}
+
+/// x.toLocaleString('en-US') for a number: at most 3 fraction digits, groups of three.
+pub fn js_locale_num(o: []u8, n0: u32, x: f64) -> u32 {
+    if (x != x) { return jn_raw(o, n0, "NaN"); }
+    var n : u32 = n0;
+    var neg : bool = x < 0.0;
+    if (x == 0.0 and (1.0 / x) < 0.0) { neg = true; }
+    if (neg) { n = jn_put(o, n, 45); }
+    var ax : f64 = x;
+    if (neg) { ax = 0.0 - x; }
+    if (ax > 1.7976931348623157e308) {
+        n = jn_put(o, n, 226);
+        n = jn_put(o, n, 136);
+        return jn_put(o, n, 158);
+    }
+    if (ax == 0.0) { return jn_put(o, n, 48); }
+    var ds : [48]u8 = [0; 48];
+    var np : i32 = jn_shortest(ds[0..], ax);
+    var k : u32 = ds[40] as u32;
+    const keep : i32 = np + 3;
+    if (keep < 0) {
+        return jn_put(o, n, 48);
+    }
+    if (keep < (k as i32)) {
+        const kc : u32 = keep as u32;
+        const up : bool = ds[kc as usize] >= 5;
+        k = kc;
+        if (up) {
+            var q : u32 = k;
+            var carry : bool = true;
+            while (carry and q > 0) {
+                q = q - 1;
+                if (ds[q as usize] == 9) {
+                    ds[q as usize] = 0;
+                } else {
+                    ds[q as usize] = ds[q as usize] + 1;
+                    carry = false;
+                }
+            }
+            if (carry) {
+                var s : u32 = k;
+                while (s > 0) {
+                    ds[s as usize] = ds[(s - 1) as usize];
+                    s = s - 1;
+                }
+                ds[0] = 1;
+                k = k + 1;
+                np = np + 1;
+            }
+        }
+        while (k > 0 and ds[(k - 1) as usize] == 0) { k = k - 1; }
+        if (k == 0) { return jn_put(o, n, 48); }
+    }
+    if (np <= 0) {
+        n = jn_put(o, n, 48);
+    } else {
+        var g : i32 = np;
+        var di : u32 = 0;
+        while (g > 0) {
+            var dgt : u8 = 0;
+            if (di < k) { dgt = ds[di as usize]; }
+            n = jn_put(o, n, dgt + 48);
+            di = di + 1;
+            g = g - 1;
+            if (g > 0 and g % 3 == 0) { n = jn_put(o, n, 44); }
+        }
+    }
+    var fstart : i32 = np;
+    if (fstart < 0) { fstart = 0; }
+    if ((fstart as u32) < k or np < 0) {
+        n = jn_put(o, n, 46);
+        var z : i32 = 0 - np;
+        while (z > 0) {
+            n = jn_put(o, n, 48);
+            z = z - 1;
+        }
+        n = jn_put_run(o, n, ds[0..], fstart as u32, k);
+    }
+    return n;
+}
+
+pub fn jn_num_ok(s: []const u8, lo: usize, hi: usize) -> bool {
+    var p : usize = lo;
+    if (p < hi and (s[p] == 45 or s[p] == 43)) { p = p + 1; }
+    var nd : u32 = 0;
+    while (p < hi and s[p] >= 48 and s[p] <= 57) { p = p + 1; nd = nd + 1; }
+    if (p < hi and s[p] == 46) {
+        p = p + 1;
+        while (p < hi and s[p] >= 48 and s[p] <= 57) { p = p + 1; nd = nd + 1; }
+    }
+    if (nd == 0) { return false; }
+    if (p < hi and (s[p] == 101 or s[p] == 69)) {
+        p = p + 1;
+        if (p < hi and (s[p] == 45 or s[p] == 43)) { p = p + 1; }
+        var ne : u32 = 0;
+        while (p < hi and s[p] >= 48 and s[p] <= 57) { p = p + 1; ne = ne + 1; }
+        if (ne == 0) { return false; }
+    }
+    return p == hi;
+}
+
+/// Sign of D * 10^q - N * 2^f for the digit text D (LSB first, dl digits) and the integer N.
+pub fn jn_cmp_text(dig: []const u8, dl: u32, q: i32, nn: u64, f: i32) -> i32 {
+    var l : [1500]u8 = [0; 1500];
+    var r : [1500]u8 = [0; 1500];
+    var ll : u32 = 0;
+    while (ll < dl) {
+        l[ll as usize] = dig[ll as usize];
+        ll = ll + 1;
+    }
+    var a : i32 = 0;
+    if (q < 0) { a = 0 - q; }
+    if (q > 0) { ll = jn_shift(l[0..], ll, q as u32); }
+    if (f < 0) { ll = jn_mul2(l[0..], ll, (0 - f) as u32); }
+    var rl : u32 = jn_digits(r[0..], nn);
+    if (f > 0) { rl = jn_mul2(r[0..], rl, f as u32); }
+    if (a > 0) { rl = jn_shift(r[0..], rl, a as u32); }
+    var w : u32 = ll;
+    if (rl > w) { w = rl; }
+    return jn_cmp(l[0..], r[0..], w + 1);
+}
+
+/// The double nearest the decimal text s[lo..hi) (JSON number syntax, optional +); NaN when it is no number.
+pub fn js_parse_num(s: []const u8, lo: usize, hi: usize) -> f64 {
+    if (!jn_num_ok(s, lo, hi)) { return js_nan(0.0); }
+    var p : usize = lo;
+    var neg : bool = false;
+    if (s[p] == 45) { neg = true; p = p + 1; } else { if (s[p] == 43) { p = p + 1; } }
+    var dig : [700]u8 = [0; 700];
+    var nd : u32 = 0;
+    var q : i32 = 0;
+    var seen_dot : bool = false;
+    var started : bool = false;
+    while (p < hi and ((s[p] >= 48 and s[p] <= 57) or s[p] == 46)) {
+        if (s[p] == 46) {
+            seen_dot = true;
+        } else {
+            if (started or s[p] != 48) {
+                started = true;
+                if (nd < 640) {
+                    dig[nd as usize] = s[p] - 48;
+                    nd = nd + 1;
+                } else {
+                    q = q + 1;
+                }
+            }
+            if (seen_dot) { q = q - 1; }
+        }
+        p = p + 1;
+    }
+    if (p < hi and (s[p] == 101 or s[p] == 69)) {
+        p = p + 1;
+        var eneg : bool = false;
+        if (p < hi and s[p] == 45) { eneg = true; p = p + 1; } else { if (p < hi and s[p] == 43) { p = p + 1; } }
+        var ev : i32 = 0;
+        while (p < hi and s[p] >= 48 and s[p] <= 57 and ev < 100000) {
+            ev = ev * 10 + ((s[p] - 48) as i32);
+            p = p + 1;
+        }
+        if (eneg) { q = q - ev; } else { q = q + ev; }
+    }
+    if (nd == 0) {
+        if (neg) { return 0.0 * (0.0 - 1.0); }
+        return 0.0;
+    }
+    var v : f64 = jn_dec_value(dig[0..], nd, q);
+    if (neg) { v = 0.0 - v; }
+    return v;
+}
+
+/// The value of digits dig[0..nd) (MOST significant first) times 10^q, correctly rounded.
+pub fn jn_dec_value(dig: []const u8, nd: u32, q: i32) -> f64 {
+    var m19 : u64 = 0;
+    var take : u32 = nd;
+    if (take > 19) { take = 19; }
+    var i : u32 = 0;
+    while (i < take) {
+        m19 = m19 * 10 + (dig[i as usize] as u64);
+        i = i + 1;
+    }
+    var q2 : i32 = q;
+    if (nd > 19) { q2 = q2 + ((nd - 19) as i32); }
+    const mag : i32 = (nd as i32) + q;
+    if (mag > 310) { return js_inf(0.0); }
+    if (mag < 0 - 320) { return 0.0; }
+    var g : f64 = m19 as f64;
+    var z : i32 = q2;
+    while (z >= 22) {
+        g = g * 1e22;
+        z = z - 22;
+    }
+    while (z <= 0 - 22) {
+        g = g / 1e22;
+        z = z + 22;
+    }
+    var pw : f64 = 1.0;
+    var pz : i32 = jn_abs(z);
+    while (pz > 0) {
+        pw = pw * 10.0;
+        pz = pz - 1;
+    }
+    if (z >= 0) { g = g * pw; } else { g = g / pw; }
+    if (g == 0.0) { return 0.0; }
+    if (g > 1.7976931348623157e308) { return g; }
+    if (g < 2.3e-308) { return g; }
+    if (nd + (jn_abs(q) as u32) > 900) { return g; }
+    var m : u64 = jn_mant(g);
+    var e : i32 = jn_expo(g);
+    var dl : [700]u8 = [0; 700];
+    var k : u32 = 0;
+    while (k < nd) {
+        dl[k as usize] = dig[(nd - 1 - k) as usize];
+        k = k + 1;
+    }
+    var step : u32 = 0;
+    while (step < 64) {
+        var moved : bool = false;
+        const up : i32 = jn_cmp_text(dl[0..], nd, q, 2 * m + 1, e - 1);
+        const odd : bool = (m % 2) == 1;
+        if (up > 0 or (up == 0 and odd)) {
+            m = m + 1;
+            if (m == 9007199254740992) {
+                m = 4503599627370496;
+                e = e + 1;
+            }
+            moved = true;
+        }
+        if (!moved) {
+            var dn : i32 = 0;
+            if (m == 4503599627370496) {
+                dn = jn_cmp_text(dl[0..], nd, q, 4 * m - 1, e - 2);
+            } else {
+                dn = jn_cmp_text(dl[0..], nd, q, 2 * m - 1, e - 1);
+            }
+            if (dn < 0 or (dn == 0 and odd)) {
+                if (m == 4503599627370496) {
+                    m = 9007199254740991;
+                    e = e - 1;
+                } else {
+                    m = m - 1;
+                }
+                moved = true;
+            }
+        }
+        if (!moved) { break; }
+        step = step + 1;
+    }
+    return jn_make(m, e);
+}
+
+pub fn jn_abs(v: i32) -> i32 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+/// An unsigned integer as decimal text (String(n) for a whole number).
+pub fn js_str_u64(o: []u8, n0: u32, v: u64) -> u32 {
+    var d : [24]u8 = [0; 24];
+    var l : u32 = jn_digits(d[0..], v);
+    var n : u32 = n0;
+    while (l > 0) {
+        l = l - 1;
+        n = jn_put(o, n, d[l as usize] + 48);
+    }
+    return n;
+}
+
+fn jn_same(o: []const u8, n: u32, want: []const u8) -> bool {
+    if (n != (want.len as u32)) { return false; }
+    var i : usize = 0;
+    while (i < want.len) {
+        if (o[i] != want[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test shortest_digits_are_what_javascript_prints {
+    var o : [64]u8 = [0; 64];
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 0.1), "0.1");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 0.3), "0.3");
+    const p1 : f64 = 0.1;
+    const p2 : f64 = 0.2;
+    assert jn_same(o[0..], js_str_num(o[0..], 0, p1 + p2), "0.30000000000000004");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 100.0), "100");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 1e21), "1e+21");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 123456789012345680000.0), "123456789012345680000");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 0.000001), "0.000001");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 1e-7), "1e-7");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 1.5e-7), "1.5e-7");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 0.0 - 17.25), "-17.25");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 14.486877282030887), "14.486877282030887");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 2.2250738585072014e-308), "2.2250738585072014e-308");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 1.7976931348623157e308), "1.7976931348623157e+308");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 4503599627370496.0), "4503599627370496");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 9007199254740993.0), "9007199254740992");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 1.0 / 3.0), "0.3333333333333333");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 2.0 / 3.0), "0.6666666666666666");
+    assert jn_same(o[0..], js_str_num(o[0..], 0, 0.0), "0");
+}
+
+test to_fixed_rounds_the_exact_value {
+    var o : [64]u8 = [0; 64];
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 1.005, 2), "1.00");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 1.45, 1), "1.4");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 2.5, 0), "3");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.5, 0), "1");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 1.5, 0), "2");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.0, 4), "0.0000");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.0 - 0.0001, 2), "-0.00");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 14.486877282030887, 4), "14.4869");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 932.4294897362839, 1), "932.4");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 99.9999, 2), "100.00");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 1e21, 2), "1e+21");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 123.456, 10), "123.4560000000");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.000001, 3), "0.000");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.0005, 3), "0.001");
+    assert jn_same(o[0..], js_to_fixed(o[0..], 0, 0.00049999, 3), "0.000");
+}
+
+test locale_numbers_group_and_round_the_shortest_digits {
+    var o : [64]u8 = [0; 64];
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 0.0), "0");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 1000.0), "1,000");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 2015426.0), "2,015,426");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 1.0005), "1.001");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 1234.5678), "1,234.568");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 0.0 - 1234.5), "-1,234.5");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 0.0001), "0");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 0.0005), "0.001");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 999.9996), "1,000");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 0.1), "0.1");
+    assert jn_same(o[0..], js_locale_num(o[0..], 0, 123456789.0), "123,456,789");
+}
+
+test parse_is_correctly_rounded_even_at_seventeen_digits {
+    const a : []const u8 = "14.486877282030887";
+    assert js_parse_num(a, 0, a.len) == 14.486877282030887;
+    const b : []const u8 = "15.042";
+    assert js_parse_num(b, 0, b.len) == 15.042;
+    const c : []const u8 = "932.4294897362839";
+    assert js_parse_num(c, 0, c.len) == 932.4294897362839;
+    const d : []const u8 = "1.7976931348623157e308";
+    assert js_parse_num(d, 0, d.len) == 1.7976931348623157e308;
+    const e : []const u8 = "-0.3";
+    assert js_parse_num(e, 0, e.len) == 0.0 - 0.3;
+    const f : []const u8 = "9007199254740993";
+    assert js_parse_num(f, 0, f.len) == 9007199254740992.0;
+    const g : []const u8 = "1e23";
+    assert js_parse_num(g, 0, g.len) == 1e23;
+    const h : []const u8 = "0.1";
+    assert js_parse_num(h, 0, h.len) == 0.1;
+    const j : []const u8 = "12.";
+    assert js_is_nan(js_parse_num(j, 0, j.len)) == false;
+    const k : []const u8 = "abc";
+    assert js_is_nan(js_parse_num(k, 0, k.len));
+}
+
+test round_is_floor_of_x_plus_half_without_the_double_rounding {
+    assert js_round(2.5) == 3.0;
+    assert js_round(0.0 - 2.5) == 0.0 - 2.0;
+    assert js_round(0.49999999999999994) == 0.0;
+    assert js_round(1.4999999) == 1.0;
+    assert js_round(0.0 - 0.2) == 0.0;
+    assert js_floor(0.0 - 0.5) == 0.0 - 1.0;
+    assert js_floor(3.999) == 3.0;
+    assert js_ceil(3.001) == 4.0;
+    assert js_ceil(0.0 - 0.5) == 0.0;
+    assert js_ceil(0.0 - 1.5) == 0.0 - 1.0;
+    assert js_ceil(7.0) == 7.0;
+    assert js_max(1.0, 2.0) == 2.0;
+    assert js_min(1.0, 2.0) == 1.0;
+    assert js_is_nan(js_max(1.0, js_nan(0.0)));
+    assert js_is_nan(js_min(js_nan(0.0), 1.0));
+    assert js_max(0.0 - 3.0, 0.0) == 0.0;
+    assert js_log2(1024.0) == 10.0;
+    assert js_log2(0.5) == 0.0 - 1.0;
+    assert js_log2(27.0) == 4.754887502163468;
+    assert js_log2(16.0) == 4.0;
+    assert js_log2(1.0) == 0.0;
+    assert js_is_nan(js_log2(0.0 - 1.0));
+}

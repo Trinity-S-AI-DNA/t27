@@ -19,6 +19,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::process::Command;
+#[path = "../../../gen/rust/tri/loop/tick.rs"] #[allow(dead_code, unused_parens)]
+mod tick; // t27c gen-rust of specs/tri/loop/tick.t27: every rule of `tri loop plan`
 
 #[derive(Subcommand)]
 pub enum LoopCmd {
@@ -36,6 +38,11 @@ pub enum LoopCmd {
         /// Say who holds it without trying to take it.
         #[arg(long)]
         who: bool,
+    },
+    /// The next actions of the overnight loop, one `ACTION key  reason` line each, from a snapshot of its state (ledger rows, wanted lanes, pull requests, agents, crons, requests out) read from FILE or stdin. Rules: specs/tri/loop/tick.t27. Runs no command, contacts no network or machine. The same snapshot prints the same lines; the last line, `HASH n`, goes into the next snapshot as `last n`, and a tick whose state and plan it matches prints NOOP.
+    Plan {
+        /// The snapshot file; stdin when absent or `-`.
+        file: Option<std::path::PathBuf>,
     },
 }
 
@@ -83,7 +90,23 @@ fn holder(name: &str) -> Option<String> {
 pub fn run(cmd: &LoopCmd) -> Result<()> {
     match cmd {
         LoopCmd::Claim { name, release, who } => claim(name, *release, *who),
+        LoopCmd::Plan { file } => plan(file.as_deref()),
     }
+}
+
+/// `tri loop plan`: the generated rules judge the snapshot, this prints what they return.
+fn plan(file: Option<&std::path::Path>) -> Result<()> {
+    let text = match file.filter(|f| f.to_str() != Some("-")) { Some(f) => std::fs::read_to_string(f).with_context(|| f.display().to_string())?, None => std::io::read_to_string(std::io::stdin())? };
+    let s: &'static str = text.leak();
+    let (mut at, noop) = (tick::next_record(s, 0), tick::is_noop(s));
+    if noop { println!("{}  {}", tick::action_name(tick::A_NOOP), tick::why(tick::A_NOOP)); }
+    while !noop && at < s.len() {
+        let a = tick::action(s, at);
+        if a != tick::A_NONE { println!("{} {}  {}", tick::action_name(a), &s[tick::key_from(s, at)..tick::key_to(s, at)], tick::why(a)); }
+        at = tick::next_record(s, tick::line_end(s, at) + 1);
+    }
+    println!("HASH {}", tick::plan_hash(s));
+    Ok(())
 }
 
 fn claim(name: &str, release: bool, who: bool) -> Result<()> {
@@ -155,6 +178,44 @@ fn claim(name: &str, release: bool, who: bool) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+// `tri learn add` (#11060): every decision is specs/tri/loop/lesson.t27 (t27c gen-rust); this reads the skill's file, asks it, writes what it says.
+#[path = "../../../gen/rust/tri/loop/lesson.rs"] #[allow(dead_code, unused_parens)]
+mod lesson;
+#[derive(Subcommand)]
+pub enum LearnCmd {
+    /// Add one lesson, as the line `- <date> <lesson> (<ref>)`, to the Traps section of a skill's SKILL.md (a Traps section is made at the end of the file when it has none), unless the section already says it: then it prints `duplicate` and changes nothing. It prints the file and the line. It refuses an empty lesson, one over 400 bytes or with a line break, one that looks like a secret, a bad date or ref, and a skill that is no directory under .claude/skills/. Rules: specs/tri/loop/lesson.t27.
+    Add {
+        /// The skill: a directory name under .claude/skills/.
+        #[arg(long)] skill: String,
+        /// One line, at most 400 bytes.
+        lesson: String,
+        /// YYYY-MM-DD; today (UTC) when absent.
+        #[arg(long)] date: Option<String>,
+        /// Where it was learned, one word such as #11060; none when absent.
+        #[arg(long = "ref", default_value = "", value_name = "REF")] cite: String,
+    },
+}
+
+pub fn learn_run(cmd: &LearnCmd) -> Result<()> {
+    let LearnCmd::Add { skill, lesson: said, date, cite } = cmd;
+    let st = |s: &str| -> &'static str { s.to_string().leak() };
+    let dir = crate::find_trinity_root()?.join(".claude/skills").join(skill);
+    let is_dir = lesson::skill_ok(st(skill)) && std::fs::symlink_metadata(&dir).map_or(false, |m| m.is_dir());
+    let md = ["SKILL.md", "skill.md"].iter().map(|n| dir.join(n)).find(|p| is_dir && p.is_file());
+    let text = md.as_ref().map(std::fs::read_to_string).transpose()?.unwrap_or_default();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let (f, l, d, c) = (st(&text), st(said), st(date.as_ref().unwrap_or(&today)), st(cite));
+    let o = lesson::decide(st(skill), is_dir, f, l, d, c);
+    if lesson::refused(o) { anyhow::bail!("refused: {}", lesson::say(o)); }
+    if o == lesson::O_DUPLICATE { println!("{}", lesson::say(o)); return Ok(()); }
+    let path = md.context("the skill has no SKILL.md or skill.md")?;
+    let (mut buf, at) = (vec![0u8; 1024], lesson::patch_at(f));
+    let n = lesson::patch(f, l, d, c, &mut buf);
+    std::fs::write(&path, format!("{}{}{}", &f[..at], String::from_utf8_lossy(&buf[..n]), &f[at..]))?;
+    println!("{}:{}  {}", path.display(), lesson::row_line(f), lesson::say(o));
+    Ok(())
 }
 
 #[cfg(test)]
