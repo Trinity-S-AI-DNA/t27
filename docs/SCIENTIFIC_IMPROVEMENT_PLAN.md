@@ -104,7 +104,7 @@ generated file. When in doubt, omit the row.
 | ID | Track | t27 deliverable | Label |
 |----|-------|------------------|-------|
 | PUB-01 | GoldenFloat family paper | `docs/WHITEPAPER/gf_paper_v3_imrad_draft.md` already exists in the repo. 2026 work: harden citations, run the NMSE protocol from PUB-02 on a fixed seed set, attach the manifest. | `target` |
-| PUB-02 | NMSE manifest contributing to a publication | One sealed-toolchain `bench/results/nmse-*.json` produced under `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md`. **No `Delta_dB` figure introduced before this manifest lands.** | `target` |
+| PUB-02 | NMSE manifest contributing to a publication | One sealed-toolchain `bench/results/nmse-*.json` produced under `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md`. **No `Delta_dB` figure introduced before this manifest lands.** First manifest landed 2026-10-17: `bench/results/nmse-railway-x86_64-0x2545F4914F6CDD1D-2026-10-17.json`, a sealed-toolchain software run of `specs/benchmarks/gf16_bfloat16_nmse_run.t27`. It is not a silicon measurement, and attaching it to a draft is still open. | `target` |
 | PUB-03 | Tooling / spec-first methodology paper | A whitepaper-derivative doc that bundles `docs/TRI_NET_WHITEPAPER.md`, `STATUS.md`, `LINEUP.md`, `COMPETITORS.md` for an external review venue (workshop / preprint server). Draft only; submission is downstream. | `target` |
 
 ---
@@ -153,7 +153,7 @@ chip-repo CI jobs, not the Python SDK.
 | `gen/verilog/` modules that pass simulation | `STATUS.md` 2.1 | 5/5 | `target` 5/5 maintained; new modules tracked |
 | Sealed artefacts under `.trinity/seals/` | `STATUS.md` 2.1 | 729 (at audit time) | `target` strictly non-decreasing |
 | Coq files with zero `Admitted` cited in line plans | `trios-coq/Physics/`, `coq/` | per `docs/NOW.md` ledger | `target` zero `Admitted` in any file cited by Zenodo v3 manifest |
-| Conforming NMSE manifests under `bench/results/` | `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md` | 0 | `target` at least 1 sealed manifest for PUB-02 |
+| Conforming NMSE manifests under `bench/results/` | `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md` | 1 sealed software run (`nmse-railway-x86_64-0x2545F4914F6CDD1D-2026-10-17.json`) | `target` at least 1 sealed manifest for PUB-02 |
 | Schema files validating draft-07 | `schemas/` | 3 (numeric-format / tri-net-api / nmse-protocol) | `target` 3+ maintained; new schemas added only via constitutional / issue review |
 | Documents passing `scripts/check_first_party_doc_language.py` | the gate itself | PASS (today) | `target` PASS maintained |
 
