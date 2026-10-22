@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/check_latest.t27 -- a re-run supersedes the run it replaces (#10617).
+; --
+; check_state.t27 reads every rollup row. A PR's rollup keeps the old run of a check next to its
+; re-run: on 2026-10-19 #10563 held "Issue Gate/check-linked-issue" twice, run 39151562346
+; COMPLETED FAILURE (before its body was fixed) and run 39157315158 QUEUED (the re-run the body
+; edit started). check_state reads that as red. The failure is history: the check that decides the
+; merge is the queued re-run, so the PR is pending. A reader who trusts "red" pushes a fix, and the
+; push restarts every check at the back of the queue (#10606).
+; --
+; Input, one line per rollup item, four TAB fields:
+;     name TAB run TAB status TAB conclusion    a check run; name is workflow/job, run its run id
+;     name TAB - TAB CONTEXT TAB state          a commit status
+; A row is superseded when another readable row has the same name and a larger run id. Run ids are
+; compared as numbers (1000 is newer than 999), so row order does not matter. A commit status is
+; never superseded and supersedes nothing. Every live row is classed by check_state's rule.
+; A row is unreadable (and supersedes nothing) when it is not four fields, its name is empty, its
+; run is not 1 to 20 digits without a leading zero, a commit status carries a run id, a check run
+; carries none, or it lies past CHECK_MAX_ROWS. Unreadable is never green (check_state).
+; Output, latest_plan:
+;     L TAB latest: <live> of <rows> rows, <superseded> superseded
+;     C TAB checks: <p> pass, <f> failing, <w> pending, <b> unreadable of <live>
+;     V TAB red | pending | none | green
+; The honest limit: two rows with the same name and the same run id (a job re-run inside one run,
+; or a matrix that repeats a name) both stay live, and the worse one wins.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawCheckLatest;
+
+use claw::text;
+use claw::queue_cost;
+use claw::check_state;
+
+pub const MAX_RUN_DIGITS : usize = 20;
+
+/// The superseded count's slot after check_state's four classes.
+pub const K_SUPERSEDED : usize = 4;
+
+pub const L_HEAD : str = "L\tlatest: ";
+pub const L_HEAD_LEN : usize = 10;
+
+/// raw[s..e) is a run id: 1 to MAX_RUN_DIGITS digits, no leading zero.
+pub fn run_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e <= s or e - s > MAX_RUN_DIGITS) { return false; }
+    if (raw[s] == '0') { return false; }
+    var i : usize = s;
+    while (i < e) {
+        if (raw[i] < '0' or raw[i] > '9') { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// The run id in raw[a..ae) is larger than the one in raw[b..be); both are run_ok.
+pub fn run_gt(raw : []const u8, a : usize, ae : usize, b : usize, be : usize) -> bool {
+    if (ae - a != be - b) { return ae - a > be - b; }
+    var i : usize = 0;
+    while (a + i < ae) {
+        if (raw[a + i] != raw[b + i]) { return raw[a + i] > raw[b + i]; }
+        i += 1;
+    }
+    return false;
+}
+
+fn is_dash(raw : []const u8, s : usize, e : usize) -> bool {
+    return qc_range_is(raw, s, e, NO_CONCLUSION, 1);
+}
+
+/// f holds the bounds of a four-field row: name, run, status, conclusion.
+pub fn row_ok(raw : []const u8, f : []const usize) -> bool {
+    if (f[1] == f[0]) { return false; }
+    const ctx : bool = qc_range_is(raw, f[4], f[5], ST_CONTEXT, 7);
+    if (is_dash(raw, f[2], f[3])) { return ctx; }
+    if (ctx) { return false; }
+    return run_ok(raw, f[2], f[3]);
+}
+
+/// Another readable row in raw[0..n) has f's name and a larger run id. self_s is f's line start.
+pub fn is_superseded(raw : []const u8, n : usize, self_s : usize, f : []const usize) -> bool {
+    if (is_dash(raw, f[2], f[3])) { return false; }
+    var g : [8]usize = undefined;
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            if (ls != self_s and rows < CHECK_MAX_ROWS and qc_split(raw, ls, le, &g, 4)) {
+                if (row_ok(raw, &g) and is_dash(raw, g[2], g[3]) == false) {
+                    if (qc_range_eq(raw, g[0], g[1], f[0], f[1]) and run_gt(raw, g[2], g[3], f[2], f[3])) {
+                        return true;
+                    }
+                }
+            }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return false;
+}
+
+/// Counts of the live rows in st[K_PASS..K_BAD], superseded rows in st[K_SUPERSEDED]; returns the
+/// number of rows.
+pub fn latest_counts(raw : []const u8, n : usize, st : []u32) -> u32 {
+    var f : [8]usize = undefined;
+    var c : [4]usize = undefined;
+    var k : usize = 0;
+    while (k < 5) {
+        st[k] = 0;
+        k += 1;
+    }
+    var rows : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            var d : u8 = K_BAD;
+            var live : bool = true;
+            if (rows < CHECK_MAX_ROWS and qc_split(raw, ls, le, &f, 4)) {
+                if (row_ok(raw, &f)) {
+                    if (is_superseded(raw, n, ls, &f)) {
+                        live = false;
+                    } else {
+                        c[0] = f[4];
+                        c[1] = f[5];
+                        c[2] = f[6];
+                        c[3] = f[7];
+                        d = check_class(raw, &c);
+                    }
+                }
+            }
+            if (live) {
+                st[d] += 1;
+            } else {
+                st[K_SUPERSEDED] += 1;
+            }
+            rows += 1;
+        }
+        ls = le + 1;
+    }
+    return rows;
+}
+
+/// The verdict over the live rows.
+pub fn latest_verdict(raw : []const u8, n : usize) -> u8 {
+    var st : [5]u32 = undefined;
+    const rows : u32 = latest_counts(raw, n, &st);
+    if (rows == 0) { return V_NONE; }
+    return check_verdict(st[K_PASS], st[K_FAIL], st[K_WAIT], st[K_BAD]);
+}
+
+/// The three output lines into out, clipped at cap; returns the cursor, which still advances when
+/// clipped.
+pub fn latest_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var st : [5]u32 = undefined;
+    const rows : u32 = latest_counts(raw, n, &st);
+    const live : u32 = rows - st[K_SUPERSEDED];
+    var w : usize = put_str(out, cap, 0, L_HEAD, L_HEAD_LEN);
+    w = put_count(out, cap, w, live);
+    w = put_str(out, cap, w, " of ", 4);
+    w = put_count(out, cap, w, rows);
+    w = put_str(out, cap, w, " rows, ", 7);
+    w = put_count(out, cap, w, st[K_SUPERSEDED]);
+    w = put_str(out, cap, w, " superseded\n", 12);
+    w = put_str(out, cap, w, HEAD, HEAD_LEN);
+    var i : usize = 0;
+    while (i < 4) {
+        w = put_count(out, cap, w, st[i]);
+        w = put_str(out, cap, w, COUNT_TEXTS[i], COUNT_LENS[i]);
+        i += 1;
+    }
+    w = put_count(out, cap, w, live);
+    w = put_str(out, cap, w, "\n", 1);
+    const v : usize = check_verdict(st[K_PASS], st[K_FAIL], st[K_WAIT], st[K_BAD]) as usize;
+    return put_str(out, cap, w, VERDICT_TEXTS[v], VERDICT_LENS[v]);
+}
+
+// ---- test helpers ----
+
+/// The check-linked-issue pair and one passing check from #10563 on 2026-10-19.
+fn t_10563(dst : []u8, cap : usize) -> usize {
+    var x : usize = put_str(dst, cap, 0, "Issue Gate/check-linked-issue\t39151562346\tCOMPLETED\tFAILURE\n", 60);
+    x = put_str(dst, cap, x, "Issue Gate/check-linked-issue\t39157315158\tQUEUED\t-\n", 51);
+    return put_str(dst, cap, x, "Required/validate\t39157315001\tCOMPLETED\tSUCCESS\n", 48);
+}
+
+fn t_two(a : str, al : usize, b : str, bl : usize) -> u8 {
+    var raw : [128]u8 = undefined;
+    var x : usize = put_str(&raw, 128, 0, a, al);
+    x = put_str(&raw, 128, x, b, bl);
+    return latest_verdict(&raw, x);
+}
+
+fn t_bad(row : str, row_len : usize) -> bool {
+    var st : [5]u32 = undefined;
+    const rows : u32 = latest_counts(row, row_len, &st);
+    return rows == 1 and st[K_BAD] == 1 and st[K_PASS] == 0;
+}
+
+/// CHECK_MAX_ROWS rows: an old failure, a blank line when asked, 1022 passing commit statuses
+/// (never superseded, so cheap to scan), the re-run that supersedes the failure, and one more
+/// re-run past the cap when asked.
+fn t_cap(dst : []u8, cap : usize, blank : bool, extra : bool) -> usize {
+    var x : usize = put_str(dst, cap, 0, "g\t8\tCOMPLETED\tFAILURE\n", 22);
+    if (blank) { x = put_str(dst, cap, x, "\n", 1); }
+    var i : u32 = 0;
+    while (i < 1022) {
+        x = put_str(dst, cap, x, "p\t-\tCONTEXT\tSUCCESS\n", 20);
+        i += 1;
+    }
+    x = put_str(dst, cap, x, "g\t9\tCOMPLETED\tSUCCESS\n", 22);
+    if (extra) { x = put_str(dst, cap, x, "g\t10\tCOMPLETED\tSUCCESS\n", 23); }
+    return x;
+}
+
+// ---- tests ----
+
+test the_10563_rollup_is_pending_here_and_red_to_check_state {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_10563(&raw, 256);
+    assert n == 159;
+    var st : [5]u32 = undefined;
+    assert latest_counts(&raw, n, &st) == 3;
+    assert st[K_SUPERSEDED] == 1;
+    assert st[K_FAIL] == 0;
+    assert st[K_WAIT] == 1;
+    assert st[K_PASS] == 1;
+    assert latest_verdict(&raw, n) == V_PENDING;
+    var two : [4]u32 = undefined;
+    assert check_counts("COMPLETED\tFAILURE\nQUEUED\t-\nCOMPLETED\tSUCCESS\n", 45, &two) == 3;
+    assert check_verdict(two[K_PASS], two[K_FAIL], two[K_WAIT], two[K_BAD]) == V_RED;
+}
+
+test the_10563_plan_text {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_10563(&raw, 256);
+    var out : [160]u8 = undefined;
+    const w : usize = latest_plan(&raw, n, &out, 160);
+    assert w == 104;
+    assert buf_has(&out, w, "L\tlatest: 2 of 3 rows, 1 superseded\n", 36) == true;
+    assert buf_has(&out, w, "C\tchecks: 1 pass, 0 failing, 1 pending, 0 unreadable of 2\n", 58) == true;
+    assert buf_has(&out, w, "V\tpending\n", 10) == true;
+}
+
+test a_newer_failure_beats_an_older_queued_run {
+    assert t_two("g\t7\tQUEUED\t-\n", 13, "g\t8\tCOMPLETED\tFAILURE\n", 22) == V_RED;
+    assert t_two("g\t8\tCOMPLETED\tFAILURE\n", 22, "g\t7\tQUEUED\t-\n", 13) == V_RED;
+}
+
+test run_ids_compare_as_numbers_in_any_order {
+    assert t_two("g\t999\tCOMPLETED\tFAILURE\n", 24, "g\t1000\tCOMPLETED\tSUCCESS\n", 25) == V_GREEN;
+    assert t_two("g\t1000\tCOMPLETED\tSUCCESS\n", 25, "g\t999\tCOMPLETED\tFAILURE\n", 24) == V_GREEN;
+    assert run_gt("1000999", 0, 4, 4, 7) == true;
+    assert run_gt("1000999", 4, 7, 0, 4) == false;
+}
+
+test different_names_do_not_supersede_each_other {
+    assert t_two("a\t5\tCOMPLETED\tFAILURE\n", 22, "b\t5\tCOMPLETED\tSUCCESS\n", 22) == V_RED;
+    assert t_two("a\t4\tCOMPLETED\tFAILURE\n", 22, "b\t5\tCOMPLETED\tSUCCESS\n", 22) == V_RED;
+}
+
+test a_commit_status_is_never_superseded {
+    assert t_two("s\t-\tCONTEXT\tFAILURE\n", 20, "s\t9\tCOMPLETED\tSUCCESS\n", 22) == V_RED;
+}
+
+test malformed_rows_are_unreadable {
+    assert t_bad("x\t12a\tCOMPLETED\tSUCCESS\n", 24) == true;
+    assert t_bad("x\t0123\tCOMPLETED\tSUCCESS\n", 25) == true;
+    assert t_bad("\t5\tCOMPLETED\tSUCCESS\n", 21) == true;
+    assert t_bad("x\t5\tCONTEXT\tSUCCESS\n", 20) == true;
+    assert t_bad("x\t-\tCOMPLETED\tSUCCESS\n", 22) == true;
+    assert t_bad("x\t5\tCOMPLETED\n", 14) == true;
+    assert t_bad("x\t123456789012345678901\tCOMPLETED\tSUCCESS\n", 42) == true;
+    assert t_bad("x\t5\tCOMPLETED\tSUCCESS\n", 22) == false;
+}
+
+test an_unreadable_row_supersedes_nothing {
+    assert t_two("x\t9\tCOMPLETED\tFAILURE\n", 22, "x\t1a0\tCOMPLETED\tSUCCESS\n", 24) == V_RED;
+}
+
+test a_tie_keeps_both_rows_and_the_worse_wins {
+    assert t_two("m\t4\tCOMPLETED\tSUCCESS\n", 22, "m\t4\tCOMPLETED\tFAILURE\n", 22) == V_RED;
+}
+
+test no_rows_is_none {
+    assert latest_verdict("", 0) == V_NONE;
+    assert latest_verdict("\n\n", 2) == V_NONE;
+}
+
+test a_clipped_plan_still_advances_the_cursor {
+    var raw : [256]u8 = undefined;
+    const n : usize = t_10563(&raw, 256);
+    var out : [160]u8 = undefined;
+    assert latest_plan(&raw, n, &out, 50) == 104;
+}
+
+// ---- mutation sweep of this file (#10739): each test below kills a survivor ----
+
+test a_run_id_is_one_to_twenty_digits {
+    assert t_bad("x\t\tCOMPLETED\tSUCCESS\n", 21) == true;
+    assert t_bad("x\t12345678901234567890\tCOMPLETED\tSUCCESS\n", 41) == false;
+    assert t_bad("x\t1\tCOMPLETED\tSUCCESS\n", 22) == false;
+}
+
+test the_row_cap_reads_1024_rows_and_refuses_the_next {
+    var raw : [20608]u8 = undefined;
+    var st : [5]u32 = undefined;
+    var n : usize = t_cap(&raw, 20608, false, false);
+    assert n == 20484;
+    assert latest_counts(&raw, n, &st) == 1024;
+    assert st[K_SUPERSEDED] == 1;
+    assert st[K_PASS] == 1023;
+    assert st[K_FAIL] == 0;
+    assert st[K_BAD] == 0;
+    assert latest_verdict(&raw, n) == V_GREEN;
+    n = t_cap(&raw, 20608, false, true);
+    assert n == 20507;
+    assert latest_counts(&raw, n, &st) == 1025;
+    assert st[K_SUPERSEDED] == 1;
+    assert st[K_PASS] == 1023;
+    assert st[K_BAD] == 1;
+}
+
+test a_blank_line_does_not_push_a_rerun_past_the_cap {
+    var raw : [20608]u8 = undefined;
+    var st : [5]u32 = undefined;
+    const n : usize = t_cap(&raw, 20608, true, false);
+    assert n == 20485;
+    assert raw[22] == 10;
+    assert latest_counts(&raw, n, &st) == 1024;
+    assert st[K_SUPERSEDED] == 1;
+    assert st[K_FAIL] == 0;
+    assert latest_verdict(&raw, n) == V_GREEN;
+}
