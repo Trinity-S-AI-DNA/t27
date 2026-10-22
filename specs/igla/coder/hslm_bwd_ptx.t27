@@ -25,6 +25,14 @@
 ;     i8), B(r, j) = dY[r][j] (rows x out_dim s8). Both reductions run down a column, so each thread
 ;     loads 16 bytes of one row (row t/8 of the k-step, elements (t%8)*16..+15) and stores them
 ;     transposed, one byte per sA/sB row.
+;   hslm_dw_splitk_s8 (kernel 3, issue #10895). Kernel 2 split along k. At k = 1782 a 256 x 736 output is
+;     12 blocks of 128 x 128 on a 128-SM part and each walks 56 k-steps alone (0.075 ms on an RTX 4090,
+;     11x CUTLASS s8). Kernel 3 launches grid z = grid_z() slices; slice z sums k in [z * per * 32,
+;     (z + 1) * per * 32), per = ceil(ceil(k / 32) / nz) read from %nctaid.z, and ends with
+;     red.global.add.s32 of its i32 partials into C, which the host MUST zero before each launch
+;     (zero_first()). Integer addition is associative, so C equals kernel 2's bit for bit.
+;     It also maps a warp onto one 16-byte chunk and 32 k rows (kernel 2: 8 lanes per row), which makes the
+;     transposed byte stores of a warp land in 8 banks instead of 1.
 ; Scales (the host's side, stated here so the integer kernel has one meaning):
 ;   dX: dYq[r][i] = round(dy[r][i] / s_r), s_r = max_i |dy[r][i]| / 127 (per row); dx[r][j] = s_r * C.
 ;     The trainer's sum has no alpha in it; a per-matrix alpha is one scalar and commutes with the sum.
@@ -41,11 +49,17 @@
 ; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
 
 module igla-coder-hslm-bwd-ptx;
+use igla::coder::ptx_emit;
 
 /// Kernel ids as `t27c ptx-run --kernel` takes them; 0 is the forward kernel of ternary_gemm_ptx.t27.
 pub const KERNEL_FWD : u32 = 0;
 pub const KERNEL_DX : u32 = 1;
 pub const KERNEL_DW : u32 = 2;
+/// Kernel 3 is kernel 2 split along k (issue #10895): grid z = slices, i32 partials added into a zeroed C.
+pub const KERNEL_DW_SPLITK : u32 = 3;
+/// Blocks the split aims at. Every slice ends in one red.global.add.s32 per C element, so more slices buy
+/// parallelism and pay in red traffic; on an RTX 4090 the sweep of 8..256 was U-shaped with its floor at 48..64.
+pub const SPLIT_TARGET_BLOCKS : usize = 64;
 /// Block tile, k-step and thread count, as in the forward kernel.
 pub const BM : u32 = 128;
 pub const BN : u32 = 128;
@@ -70,55 +84,11 @@ pub const HSLM_ROWS : usize = 1782;
 pub const HSLM_EMBED_PAD : usize = 256;
 pub const HSLM_FF_PAD : usize = 736;
 
-// ============================================================================
-// 1. A bounded text writer (as in ternary_gemm_ptx.t27)
-// ============================================================================
-
-fn put_s(out : []u8, cap : usize, w : usize, s : str) -> usize {
-    var i : usize = 0;
-    while (i < s.len) {
-        if (w + i < cap) { out[w + i] = s[i]; }
-        i += 1;
-    }
-    return w + s.len;
-}
-
-fn put_u(out : []u8, cap : usize, w : usize, v : u32) -> usize {
-    var d : u32 = 1;
-    while (v / d >= 10) { d = d * 10; }
-    var x : usize = w;
-    while (d > 0) {
-        const c : u8 = '0' + (((v / d) % 10) as u8);
-        if (x < cap) { out[x] = c; }
-        x += 1;
-        d = d / 10;
-    }
-    return x;
-}
-
-fn ins(out : []u8, cap : usize, w : usize, s : str) -> usize {
-    // One writer call per statement: a nested call would borrow `out` twice in the Rust that gen-rust writes.
-    var x : usize = put_s(out, cap, w, "    ");
-    x = put_s(out, cap, x, s);
-    return put_s(out, cap, x, "\n");
-}
-
-fn put_quad(out : []u8, cap : usize, w : usize, name : str, first : u32) -> usize {
-    var x : usize = put_s(out, cap, w, "{");
-    var j : u32 = 0;
-    while (j < 4) {
-        if (j > 0) { x = put_s(out, cap, x, ", "); }
-        x = put_s(out, cap, x, name);
-        x = put_u(out, cap, x, first + j);
-        j += 1;
-    }
-    return put_s(out, cap, x, "}");
-}
-
 fn put_name_at(out : []u8, cap : usize, w : usize, kernel : u32) -> usize {
     if (kernel == KERNEL_FWD) { return put_s(out, cap, w, "ternary_gemm_s8"); }
     if (kernel == KERNEL_DX) { return put_s(out, cap, w, "hslm_dx_s8"); }
     if (kernel == KERNEL_DW) { return put_s(out, cap, w, "hslm_dw_s8"); }
+    if (kernel == KERNEL_DW_SPLITK) { return put_s(out, cap, w, "hslm_dw_splitk_s8"); }
     return w;
 }
 
@@ -202,9 +172,17 @@ fn emit_setup_dx(out : []u8, cap : usize, w : usize) -> usize {
 }
 
 /// dW: k-row r12 = tid/8 of both tiles, element chunk r13 = (tid%8)*16; i = r9 along m, j = r14 along n.
-fn emit_setup_dw(out : []u8, cap : usize, w : usize) -> usize {
-    var x : usize = ins(out, cap, w, "shr.u32 %r12, %r4, 3;");
-    x = ins(out, cap, x, "and.b32 %r13, %r4, 7;");
+/// Kernel 3 maps a warp onto one chunk and 32 k rows (r12 = tid%32, r13 = (tid/32)*16): the 32 lanes of a
+/// byte store then land in 8 banks, 4 lanes to a word, where the 8 lanes per row of kernel 2 hit one bank.
+fn emit_setup_dw(out : []u8, cap : usize, w : usize, split : bool) -> usize {
+    var x : usize = w;
+    if (split) {
+        x = ins(out, cap, x, "and.b32 %r12, %r4, 31;");
+        x = ins(out, cap, x, "shr.u32 %r13, %r4, 5;");
+    } else {
+        x = ins(out, cap, x, "shr.u32 %r12, %r4, 3;");
+        x = ins(out, cap, x, "and.b32 %r13, %r4, 7;");
+    }
     x = ins(out, cap, x, "shl.b32 %r13, %r13, 4;");
     x = ins(out, cap, x, "shl.b32 %r9, %r6, 7;");
     x = ins(out, cap, x, "add.u32 %r9, %r9, %r13;");
@@ -359,59 +337,30 @@ fn emit_loads_dw(out : []u8, cap : usize, w : usize) -> usize {
     return emit_transposed(out, cap, x, 50, "%r16", "%r37");
 }
 
-fn emit_lds(out : []u8, cap : usize, w : usize, reg : str, i : u32, base : str, off : u32) -> usize {
-    var x : usize = put_s(out, cap, w, "    ld.shared.u32 ");
-    x = put_s(out, cap, x, reg);
-    x = put_u(out, cap, x, i);
-    x = put_s(out, cap, x, ", [");
-    x = put_s(out, cap, x, base);
-    x = put_s(out, cap, x, "+");
-    x = put_u(out, cap, x, off);
-    return put_s(out, cap, x, "];\n");
+/// Slice bounds of a split-K block (kernel 3). z = %ctaid.z of nz = %nctaid.z slices: every slice runs
+/// per = ceil(ceil(k / 32) / nz) k-steps, from r49 = z * per * 32 up to r3 = min(k, (z + 1) * per * 32),
+/// which overwrites the k bound the loop and the loads compare against. A block with nothing to sum
+/// returns before the first barrier.
+fn emit_slice(out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = ins(out, cap, w, "mov.u32 %r46, %ctaid.z;");
+    x = ins(out, cap, x, "mov.u32 %r47, %nctaid.z;");
+    x = ins(out, cap, x, "add.u32 %r48, %r3, 31;");
+    x = ins(out, cap, x, "shr.u32 %r48, %r48, 5;");
+    x = ins(out, cap, x, "add.u32 %r48, %r48, %r47;");
+    x = ins(out, cap, x, "sub.u32 %r48, %r48, 1;");
+    x = ins(out, cap, x, "div.u32 %r48, %r48, %r47;");
+    x = ins(out, cap, x, "shl.b32 %r48, %r48, 5;");
+    x = ins(out, cap, x, "mul.lo.u32 %r49, %r46, %r48;");
+    x = ins(out, cap, x, "add.u32 %r46, %r46, 1;");
+    x = ins(out, cap, x, "mul.lo.u32 %r46, %r46, %r48;");
+    x = ins(out, cap, x, "min.u32 %r3, %r3, %r46;");
+    x = ins(out, cap, x, "setp.ge.u32 %p9, %r49, %r3;");
+    return ins(out, cap, x, "@%p9 ret;");
 }
 
-/// The fragment loads and the 16 mma.sync of one k-step, the forward kernel's.
-fn emit_mma_step(out : []u8, cap : usize, w : usize) -> usize {
-    var x : usize = w;
-    var mi : u32 = 0;
-    while (mi < 4) {
-        const off : u32 = mi * 16 * SMEM_STRIDE;
-        x = emit_lds(out, cap, x, "%fa", mi * 4, "%r25", off);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 1, "%r25", off + 8 * SMEM_STRIDE);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 2, "%r25", off + 16);
-        x = emit_lds(out, cap, x, "%fa", mi * 4 + 3, "%r25", off + 8 * SMEM_STRIDE + 16);
-        mi += 1;
-    }
-    var ni : u32 = 0;
-    while (ni < 4) {
-        x = emit_lds(out, cap, x, "%fb", ni * 2, "%r27", ni * 8 * SMEM_STRIDE);
-        x = emit_lds(out, cap, x, "%fb", ni * 2 + 1, "%r27", ni * 8 * SMEM_STRIDE + 16);
-        ni += 1;
-    }
-    mi = 0;
-    while (mi < 4) {
-        ni = 0;
-        while (ni < 4) {
-            const b : u32 = (mi * 4 + ni) * 4;
-            x = put_s(out, cap, x, "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ");
-            x = put_quad(out, cap, x, "%acc", b);
-            x = put_s(out, cap, x, ", ");
-            x = put_quad(out, cap, x, "%fa", mi * 4);
-            x = put_s(out, cap, x, ", {%fb");
-            x = put_u(out, cap, x, ni * 2);
-            x = put_s(out, cap, x, ", %fb");
-            x = put_u(out, cap, x, ni * 2 + 1);
-            x = put_s(out, cap, x, "}, ");
-            x = put_quad(out, cap, x, "%acc", b);
-            x = put_s(out, cap, x, ";\n");
-            ni += 1;
-        }
-        mi += 1;
-    }
-    return x;
-}
-
-fn emit_store(out : []u8, cap : usize, w : usize, dr : u32, dc : u32, b : u32) -> usize {
+/// One pair of accumulators b, b + 1 of row dr, column dc of the warp tile as two guarded i32 adds
+/// into C (the split-K epilogue; ptx_emit's emit_store writes the pair instead).
+fn emit_red_store(out : []u8, cap : usize, w : usize, dr : u32, dc : u32, b : u32) -> usize {
     var x : usize = put_s(out, cap, w, "    add.u32 %r41, %r39, ");
     x = put_u(out, cap, x, dr);
     x = put_s(out, cap, x, ";\n");
@@ -425,15 +374,15 @@ fn emit_store(out : []u8, cap : usize, w : usize, dr : u32, dc : u32, b : u32) -
     x = ins(out, cap, x, "mad.wide.u32 %rd10, %r41, %r2, %rd10;");
     x = ins(out, cap, x, "shl.b64 %rd10, %rd10, 2;");
     x = ins(out, cap, x, "add.u64 %rd10, %rd10, %rd3;");
-    x = put_s(out, cap, x, "    @%p6 st.global.v2.u32 [%rd10], {%acc");
+    x = put_s(out, cap, x, "    @%p6 red.global.add.s32 [%rd10], %acc");
     x = put_u(out, cap, x, b);
-    x = put_s(out, cap, x, ", %acc");
+    x = put_s(out, cap, x, ";\n    @%p6 red.global.add.s32 [%rd10+4], %acc");
     x = put_u(out, cap, x, b + 1);
-    return put_s(out, cap, x, "};\n");
+    return put_s(out, cap, x, ";\n");
 }
 
-/// The 32 guarded pair stores of the forward kernel's epilogue.
-fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
+/// The split-K epilogue: ptx_emit's row and column base setup, then 32 guarded pairs of adds.
+fn emit_red_epilogue(out : []u8, cap : usize, w : usize) -> usize {
     var x : usize = ins(out, cap, w, "shl.b32 %r39, %r6, 7;");
     x = ins(out, cap, x, "shl.b32 %r41, %r23, 6;");
     x = ins(out, cap, x, "add.u32 %r39, %r39, %r41;");
@@ -448,8 +397,8 @@ fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
         var ni : u32 = 0;
         while (ni < 4) {
             const b : u32 = (mi * 4 + ni) * 4;
-            x = emit_store(out, cap, x, mi * 16, ni * 8, b);
-            x = emit_store(out, cap, x, mi * 16 + 8, ni * 8, b + 2);
+            x = emit_red_store(out, cap, x, mi * 16, ni * 8, b);
+            x = emit_red_store(out, cap, x, mi * 16 + 8, ni * 8, b + 2);
             ni += 1;
         }
         mi += 1;
@@ -460,15 +409,18 @@ fn emit_epilogue(out : []u8, cap : usize, w : usize) -> usize {
 /// The whole text of kernel 1 or 2 into out[0..cap). Returns the bytes it needs (more than cap means
 /// a clipped text); an unknown id writes nothing and returns 0.
 pub fn emit_ptx(kernel : u32, out : []u8, cap : usize) -> usize {
-    if (kernel != KERNEL_DX and kernel != KERNEL_DW) { return 0; }
+    if (kernel != KERNEL_DX and kernel != KERNEL_DW and kernel != KERNEL_DW_SPLITK) { return 0; }
+    const split : bool = kernel == KERNEL_DW_SPLITK;
     var x : usize = emit_header(out, cap, 0, kernel);
     x = emit_params(out, cap, x);
     if (kernel == KERNEL_DX) {
         x = emit_setup_dx(out, cap, x);
     } else {
-        x = emit_setup_dw(out, cap, x);
+        x = emit_setup_dw(out, cap, x, split);
     }
+    if (split) { x = emit_slice(out, cap, x); }
     x = emit_warp_setup(out, cap, x);
+    if (split) { x = ins(out, cap, x, "mov.u32 %r28, %r49;"); }
     x = put_s(out, cap, x, "LOOP_K:\n");
     x = ins(out, cap, x, "setp.ge.u32 %p3, %r28, %r3;");
     x = ins(out, cap, x, "@%p3 bra DONE_K;");
@@ -483,7 +435,11 @@ pub fn emit_ptx(kernel : u32, out : []u8, cap : usize) -> usize {
     x = ins(out, cap, x, "add.u32 %r28, %r28, 32;");
     x = ins(out, cap, x, "bra LOOP_K;");
     x = put_s(out, cap, x, "DONE_K:\n");
-    x = emit_epilogue(out, cap, x);
+    if (split) {
+        x = emit_red_epilogue(out, cap, x);
+    } else {
+        x = emit_epilogue(out, cap, x);
+    }
     x = ins(out, cap, x, "ret;");
     return put_s(out, cap, x, "}\n");
 }
@@ -497,37 +453,58 @@ pub fn grid_dim(x : usize) -> u32 {
     return ((x + 127) / 128) as u32;
 }
 
-/// Whether kernel 1 or 2 can run an m x n output over k.
+/// Slices (grid z) of a kernel over an m x n output and k: 1 for every kernel but 3. Kernel 3 aims at
+/// SPLIT_TARGET_BLOCKS blocks, never more slices than k-steps, and then drops the slices the rounding of
+/// the per-slice step count would leave empty, so no block is idle.
+pub fn grid_z(kernel : u32, m : usize, n : usize, k : usize) -> u32 {
+    if (kernel != KERNEL_DW_SPLITK) { return 1; }
+    const steps : usize = (k + 31) / 32;
+    const blocks : usize = ((m + 127) / 128) * ((n + 127) / 128);
+    var s : usize = (SPLIT_TARGET_BLOCKS + blocks - 1) / blocks;
+    if (s > steps) { s = steps; }
+    if (s < 1) { s = 1; }
+    const per : usize = (steps + s - 1) / s;
+    return ((steps + per - 1) / per) as u32;
+}
+
+/// Whether C must be zero before a launch: kernel 3 adds its partials into it.
+pub fn zero_first(kernel : u32) -> bool {
+    return kernel == KERNEL_DW_SPLITK;
+}
+
+/// The k range [lo, hi) slice z of nz sums, as the kernel computes it: per = ceil(ceil(k / 32) / nz)
+/// steps of 32. Empty (lo >= hi) when z * per * 32 >= k.
+pub fn slice_lo(z : usize, nz : usize, k : usize) -> usize {
+    const per : usize = ((k + 31) / 32 + nz - 1) / nz;
+    return z * per * 32;
+}
+
+pub fn slice_hi(z : usize, nz : usize, k : usize) -> usize {
+    const per : usize = ((k + 31) / 32 + nz - 1) / nz;
+    const hi : usize = (z + 1) * per * 32;
+    if (hi < k) { return hi; }
+    return k;
+}
+
+/// Whether kernel 1, 2 or 3 can run an m x n output over k.
 pub fn shape_ok(kernel : u32, m : usize, n : usize, k : usize) -> bool {
     if (m < 1 or n < 16 or n % 16 != 0) { return false; }
     if ((m + 127) / 128 > GRID_Y_MAX) { return false; }
     if (kernel == KERNEL_DX) { return k >= 16 and k % 16 == 0 and k <= K_MAX_DX; }
-    if (kernel == KERNEL_DW) { return m % 16 == 0 and k >= 1 and k <= K_MAX_DW; }
+    if (kernel == KERNEL_DW or kernel == KERNEL_DW_SPLITK) { return m % 16 == 0 and k >= 1 and k <= K_MAX_DW; }
     return false;
 }
 
-/// Bytes of the B operand: k x n 2-bit codes for kernels 0 and 1, k x n s8 for kernel 2. A is m * k bytes
+/// Bytes of the B operand: k x n 2-bit codes for kernels 0 and 1, k x n s8 for kernels 2 and 3. A is m * k bytes
 /// for every kernel (dX: dYq rows x k; dW: X as k rows x m).
 pub fn b_len(kernel : u32, n : usize, k : usize) -> usize {
-    if (kernel == KERNEL_DW) { return k * n; }
+    if (kernel == KERNEL_DW or kernel == KERNEL_DW_SPLITK) { return k * n; }
     return k * n / 4;
 }
 
 // ============================================================================
 // 4. The integer references and the mismatch count
 // ============================================================================
-
-/// Code i of a packed code matrix, lane 0 in the low bits.
-pub fn code_at(wp : []const u8, i : usize) -> u32 {
-    const b : u32 = wp[i / 4] as u32;
-    const sh : u32 = ((i % 4) * 2) as u32;
-    return (b >> sh) & 3;
-}
-
-/// The decode of ternary_gemm_gpu.t27: 0 -> 0, 1 -> +1, 2 -> -1, 3 -> 0.
-pub fn weight(code : u32) -> i32 {
-    return ((code & 1) as i32) - (((code >> 1) & 1) as i32);
-}
 
 /// A byte of B read as s8.
 pub fn sbyte(v : u8) -> i32 {
@@ -648,30 +625,6 @@ pub fn decoded_word(word : u32, wq : u32) -> u32 {
     return prmt_table(sp >> 16);
 }
 
-// ============================================================================
-// 6. Test helpers
-// ============================================================================
-
-fn at_text(t : []const u8, n : usize, at : usize, s : str) -> bool {
-    if (at + s.len > n) { return false; }
-    var i : usize = 0;
-    while (i < s.len) {
-        if (t[at + i] != s[i]) { return false; }
-        i += 1;
-    }
-    return true;
-}
-
-fn count_text(t : []const u8, n : usize, s : str) -> usize {
-    var c : usize = 0;
-    var i : usize = 0;
-    while (i < n) {
-        if (at_text(t, n, i, s)) { c += 1; }
-        i += 1;
-    }
-    return c;
-}
-
 /// 31-bit LCG (glibc constants), the generator of ternary_gemm_ptx.t27.
 fn lcg(s : u64) -> u64 {
     return (s * 1103515245 + 12345) % 2147483648;
@@ -700,9 +653,9 @@ test both_kernels_open_with_their_header_and_entry {
 test an_unknown_kernel_writes_nothing {
     var out : [64]u8 = [7; 64];
     assert emit_ptx(KERNEL_FWD, &out, 64) == 0;
-    assert emit_ptx(3, &out, 64) == 0;
+    assert emit_ptx(4, &out, 64) == 0;
     assert out[0] == 7;
-    assert put_name(3, &out, 64) == 0;
+    assert put_name(4, &out, 64) == 0;
 }
 
 test the_names_are_the_entry_names {
@@ -1097,6 +1050,166 @@ test the_limits_of_each_kernel {
     assert b_len(KERNEL_DW, 736, 1782) == 1311552;
     assert grid_dim(HSLM_ROWS) == 14;
     assert grid_dim(HSLM_FF_PAD) == 6;
+}
+
+test the_split_k_kernel_has_its_own_header_and_name {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DW_SPLITK, &out, PTX_CAP);
+    assert m > 0;
+    assert at_text(&out, m, 0, "// hslm_dw_splitk_s8 -- emitted by t27c from specs/igla/coder/hslm_bwd_ptx.t27 (#10847). Do not edit.\n.version 7.0\n.target sm_80\n.address_size 64\n\n");
+    assert count_text(&out, m, ".visible .entry hslm_dw_splitk_s8(\n") == 1;
+    var nm : [32]u8 = undefined;
+    const c : usize = put_name(KERNEL_DW_SPLITK, &nm, 32);
+    assert c == 17;
+    assert at_text(&nm, c, 0, "hslm_dw_splitk_s8");
+    assert at_text(&out, m, m - 11, "    ret;\n}\n");
+}
+
+test the_split_k_kernel_adds_its_partials_into_c_and_slices_k_by_the_grid {
+    var out : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DW_SPLITK, &out, PTX_CAP);
+    // The same 16 int8 mma per k-step and the same transposing dW loads as kernel 2.
+    assert count_text(&out, m, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ") == 16;
+    assert count_text(&out, m, "ld.global.v4.u32 ") == 2;
+    assert count_text(&out, m, "st.shared.u8 ") == 32;
+    assert count_text(&out, m, "bar.sync 0;") == 2;
+    // The epilogue is 64 guarded i32 adds and no plain store: C must be zero before the launch.
+    assert count_text(&out, m, "red.global.add.s32 ") == 64;
+    assert count_text(&out, m, "    @%p6 red.global.add.s32 [%rd10], %acc0;\n    @%p6 red.global.add.s32 [%rd10+4], %acc1;\n") == 1;
+    assert count_text(&out, m, "    @%p6 red.global.add.s32 [%rd10], %acc62;\n    @%p6 red.global.add.s32 [%rd10+4], %acc63;\n") == 1;
+    assert count_text(&out, m, "st.global") == 0;
+    assert count_text(&out, m, "atom.") == 0;
+    // The slice code: z and nz from the grid, per = ceil(ceil(k / 32) / nz) steps of 32, an empty slice returns.
+    assert count_text(&out, m, "    mov.u32 %r46, %ctaid.z;\n    mov.u32 %r47, %nctaid.z;\n") == 1;
+    assert count_text(&out, m, "    div.u32 %r48, %r48, %r47;\n    shl.b32 %r48, %r48, 5;\n") == 1;
+    assert count_text(&out, m, "    min.u32 %r3, %r3, %r46;\n") == 1;
+    assert count_text(&out, m, "    setp.ge.u32 %p9, %r49, %r3;\n    @%p9 ret;\n") == 1;
+    // The k loop starts at the slice's own lower bound, once, after the warp setup.
+    assert count_text(&out, m, "    mov.u32 %r28, %r49;\nLOOP_K:\n") == 1;
+    assert count_text(&out, m, "ctaid.z") == 2;
+    // Kernel 2 has none of it.
+    const d : usize = emit_ptx(KERNEL_DW, &out, PTX_CAP);
+    assert count_text(&out, d, "ctaid.z") == 0;
+    assert count_text(&out, d, "red.global") == 0;
+    assert count_text(&out, d, "%p9") == 0;
+}
+
+test the_split_k_text_is_ascii_fits_and_is_stable {
+    var a : [32768]u8 = undefined;
+    var b : [32768]u8 = undefined;
+    const m : usize = emit_ptx(KERNEL_DW_SPLITK, &a, PTX_CAP);
+    // The length ptx-run wrote on the RTX 4090 pod (wc -c ptx-run-3.ptx).
+    assert m == 21820;
+    assert emit_ptx(KERNEL_DW_SPLITK, &b, PTX_CAP) == m;
+    var i : usize = 0;
+    while (i < m) {
+        assert a[i] == b[i];
+        assert a[i] == '\n' or (a[i] >= 32 and a[i] < 127);
+        i += 1;
+    }
+}
+
+test every_k_belongs_to_exactly_one_slice {
+    var k : usize = 1;
+    while (k <= 1800) {
+        var nz : usize = 1;
+        while (nz <= 70) {
+            // Slices tile [0, k): each starts where the one before ended, the last ends at k.
+            var z : usize = 0;
+            var at : usize = 0;
+            while (z < nz) {
+                const lo : usize = slice_lo(z, nz, k);
+                const hi : usize = slice_hi(z, nz, k);
+                if (lo < k) {
+                    assert lo == at;
+                    assert hi > lo;
+                    at = hi;
+                }
+                z += 1;
+            }
+            assert at == k;
+            nz += 3;
+        }
+        k += 37;
+    }
+    // k = 1782 over 19 slices: 56 steps, 3 per slice, the last slice has 2.
+    assert slice_lo(0, 19, 1782) == 0;
+    assert slice_hi(0, 19, 1782) == 96;
+    assert slice_lo(18, 19, 1782) == 1728;
+    assert slice_hi(18, 19, 1782) == 1782;
+}
+
+test the_slice_count_leaves_no_block_idle {
+    assert grid_z(KERNEL_FWD, 256, 736, 1782) == 1;
+    assert grid_z(KERNEL_DX, 256, 736, 1792) == 1;
+    assert grid_z(KERNEL_DW, 256, 736, 1782) == 1;
+    assert grid_z(KERNEL_DW_SPLITK, 256, 736, 1782) == 6;
+    assert grid_z(KERNEL_DW_SPLITK, 256, 256, 1782) == 14;
+    assert grid_z(KERNEL_DW_SPLITK, 736, 256, 1782) == 6;
+    // One step of k cannot be split; a big output needs no split.
+    assert grid_z(KERNEL_DW_SPLITK, 256, 256, 27) == 1;
+    assert grid_z(KERNEL_DW_SPLITK, 4096, 4096, 1782) == 1;
+    var k : usize = 1;
+    while (k <= 3000) {
+        var mm : usize = 16;
+        while (mm <= 1024) {
+            const nz : usize = grid_z(KERNEL_DW_SPLITK, mm, 256, k) as usize;
+            assert nz >= 1;
+            // The last slice is not empty, so none is.
+            assert slice_lo(nz - 1, nz, k) < k;
+            mm += 240;
+        }
+        k += 61;
+    }
+    assert zero_first(KERNEL_DW_SPLITK) == true;
+    assert zero_first(KERNEL_DW) == false;
+    assert zero_first(KERNEL_DX) == false;
+}
+
+test the_slices_summed_are_the_unsplit_reference {
+    // m = 16, n = 16, k = 100: C[i][j] = sum over rows r of X[r][i] * dY[r][j], by slices of 4 and by one.
+    var a : [1600]i8 = [0; 1600];
+    var b : [1600]u8 = [0; 1600];
+    var s : u64 = 5;
+    var t : usize = 0;
+    while (t < 1600) {
+        s = lcg(s);
+        a[t] = ((((s >> 8) % 256) as i32) - 128) as i8;
+        s = lcg(s);
+        b[t] = ((s >> 8) & 255) as u8;
+        t += 1;
+    }
+    var whole : [16]i32 = [0; 16];
+    ref_row(KERNEL_DW_SPLITK, &a, &b, 16, 16, 100, 3, &whole);
+    var sum : [16]i32 = [0; 16];
+    var z : usize = 0;
+    while (z < 4) {
+        const lo : usize = slice_lo(z, 4, 100);
+        const hi : usize = slice_hi(z, 4, 100);
+        var j : usize = 0;
+        while (j < 16) {
+            var r : usize = lo;
+            while (r < hi) {
+                sum[j] += (a[r * 16 + 3] as i32) * sbyte(b[r * 16 + j]);
+                r += 1;
+            }
+            j += 1;
+        }
+        z += 1;
+    }
+    var j2 : usize = 0;
+    while (j2 < 16) {
+        assert sum[j2] == whole[j2];
+        j2 += 1;
+    }
+}
+
+test the_split_k_kernel_takes_the_shapes_of_kernel_2 {
+    assert shape_ok(KERNEL_DW_SPLITK, HSLM_FF_PAD, HSLM_EMBED_PAD, HSLM_ROWS) == true;
+    assert shape_ok(KERNEL_DW_SPLITK, 16, 16, 131071) == true;
+    assert shape_ok(KERNEL_DW_SPLITK, 16, 16, 131072) == false;
+    assert shape_ok(KERNEL_DW_SPLITK, 8, 16, 4) == false;
+    assert b_len(KERNEL_DW_SPLITK, 736, 1782) == 1311552;
 }
 
 invariant dx_accumulator_cannot_overflow { 128 * K_MAX_DX <= 2147483647 }
