@@ -1,0 +1,653 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/hslm_data.t27
+// The HSLM data loader and checkpoint format, in t27: next-token batches with a curriculum on
+// the sequence length, and the byte layout of the MSLH checkpoint, checked against the one real
+// checkpoint file that survives.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Source of truth: gHashTag/trinity-training @ 3e9648c1817a97c5f9b8c727b0f8e2291928eead
+//   src/hslm/data.zig     Dataset.nextBatch, Dataset.numSequences, Curriculum.updateDifficulty,
+//                         Dataset.getCurrentSeqLen
+//   src/hslm/trainer.zig  CHECKPOINT_MAGIC, CHECKPOINT_VERSION, saveCheckpoint, loadCheckpoint
+// and the file gHashTag/trinity data/wave9/worker-2/hslm_step_10000.bin: 4971796 bytes, whose
+// first 16 bytes are REAL_HEADER below.
+//
+// What is in it and what is not, so nobody reads it as more:
+//   - There is no file I/O and no heap in t27c yet (cells 24 and 25 of specs/igla/own_model.t27).
+//     So nothing here opens a file or allocates: the loader reads a token slice the caller
+//     holds and writes into batch slices the caller holds, and the checkpoint is read and written
+//     as a byte slice. The reading and writing of that slice to a file is the missing piece.
+//   - Not ported: Dataset.addText and the tokenizer (tokenizer.zig), loadTextFile and
+//     loadTextFileShard, shuffle (Zig's PRNG), sortByComplexity, splitTrainVal.
+//   - The checkpoint holds the f32 shadow weights and biases only (no trits, no alphas: loading
+//     requantizes). f32 is handled as its 32 bits, converted to and from f64 by decode_f32 and
+//     encode_f32 (normal numbers and zero; no NaN, infinity or denormals).
+//   - The layout is checked by arithmetic: the byte count that header + sections give equals
+//     the size of the real file. Its weights are not read here.
+//   - The curriculum arithmetic runs in f64; data.zig runs it in f32. They differ only when
+//     difficulty * (max - min) lands within one f32 ulp of a whole number.
+//
+// Tokens are u16 (a vocabulary of 729 fits), batches are row-major batch_size x seq_len.
+
+module HslmData {
+    use base::types;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 1. Constants (trinity-training constants.zig and data.zig defaults)
+    // ═════════════════════════════════════════════════════════════════
+
+    const CONTEXT_LEN : usize = 27;       // 3^3
+    const VOCAB_SIZE : usize = 729;       // 3^6
+    const EMBED_DIM : usize = 243;
+    const FF_DIM : usize = 729;
+    const NUM_BLOCKS : usize = 3;
+
+    const CHECKPOINT_MAGIC : u32 = 0x484C534D;   // the bytes 4D 53 4C 48, "MSLH" on disk
+    const CHECKPOINT_VERSION : u32 = 1;
+    const HEADER_BYTES : usize = 16;             // magic, version, step, loss (f32): 4 bytes each
+    const REAL_FILE_BYTES : usize = 4971796;     // hslm_step_10000.bin
+
+    // CurriculumSchedule
+    const SCHED_LINEAR : u8 = 0;
+    const SCHED_EXPONENTIAL : u8 = 1;
+    const SCHED_STEP : u8 = 2;
+    const SCHED_COSINE : u8 = 3;
+    const SCHED_NONE : u8 = 4;
+
+    const DEFAULT_TOTAL_STEPS : u64 = 100000;
+    const DEFAULT_MIN_SEQ_LEN : usize = 8;
+    const DEFAULT_GROWTH_RATE : f64 = 5.0;
+    const DEFAULT_MILESTONES : usize = 10;
+    const PI : f64 = 3.141592653589793;
+
+    // status codes of parse_header
+    const HEADER_OK : u32 = 0;
+    const HEADER_BAD_MAGIC : u32 = 1;
+    const HEADER_BAD_VERSION : u32 = 2;
+    const HEADER_TOO_SHORT : u32 = 3;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 2. Curriculum
+    // ═════════════════════════════════════════════════════════════════
+
+    fn floor_pos(x: f64) -> f64 {
+        const n : usize = @intFromFloat(x);
+        return @as(f64, @floatFromInt(n));
+    }
+
+    // difficulty in [0, 1] at a step; progress = step / total_steps (1.0 when total is 0)
+    fn difficulty(schedule: u8, step: u64, total_steps: u64, growth_rate: f64, milestones: usize) -> f64 {
+        var progress : f64 = 1.0;
+        if (total_steps > 0) {
+            progress = @as(f64, @floatFromInt(step)) / @as(f64, @floatFromInt(total_steps));
+        }
+        var d : f64 = 1.0;
+        if (schedule == SCHED_LINEAR) {
+            d = @min(1.0, progress);
+        } else if (schedule == SCHED_EXPONENTIAL) {
+            d = 1.0 - exp(0.0 - growth_rate * progress);
+        } else if (schedule == SCHED_STEP) {
+            const m = @as(f64, @floatFromInt(milestones));
+            d = floor_pos(progress * m) / m;
+        } else if (schedule == SCHED_COSINE) {
+            d = (1.0 - cos(progress * PI)) / 2.0;
+        }
+        return @max(0.0, @min(1.0, d));
+    }
+
+    // min_seq_len + trunc(difficulty * (max_seq_len - min_seq_len))
+    fn curriculum_seq_len(schedule: u8, step: u64, total_steps: u64, min_len: usize, max_len: usize) -> usize {
+        const d = difficulty(schedule, step, total_steps, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES);
+        const range = @as(f64, @floatFromInt(max_len - min_len));
+        const grown : usize = @intFromFloat(d * range);
+        return min_len + grown;
+    }
+
+    // Dataset.getCurrentSeqLen: with no schedule the batch's own seq_len stands
+    fn current_seq_len(schedule: u8, step: u64, total_steps: u64, min_len: usize, max_len: usize, fixed_len: usize) -> usize {
+        if (schedule == SCHED_NONE) {
+            return fixed_len;
+        }
+        return curriculum_seq_len(schedule, step, total_steps, min_len, max_len);
+    }
+
+    // Curriculum.isComplete
+    fn curriculum_complete(schedule: u8, step: u64, total_steps: u64) -> bool {
+        const d = difficulty(schedule, step, total_steps, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES);
+        return d >= 0.99 or step >= total_steps;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 3. Batches
+    // ═════════════════════════════════════════════════════════════════
+
+    // Dataset.numSequences: complete sequences at a length (zero when the data is shorter)
+    fn num_sequences(total_tokens: usize, cur_len: usize) -> usize {
+        if (total_tokens < cur_len + 1) {
+            return 0;
+        }
+        return total_tokens - cur_len;
+    }
+
+    // Dataset.nextBatch. Fills inputs[b*seq_len + s] = data[cursor + s] and the target shifted
+    // by one, wraps the cursor to 0 when a sequence would run off the end, zero-pads each row
+    // from cur_len to seq_len, and advances by cur_len per row. Returns the new cursor. When the
+    // data is shorter than cur_len + 1 it writes nothing and returns the cursor unchanged.
+    fn next_batch(data: []const u16, cursor: usize, batch_size: usize, seq_len: usize, cur_len: usize, inputs: []u16, targets: []u16) -> usize {
+        if (data.len < cur_len + 1) {
+            return cursor;
+        }
+        var cur = cursor;
+        var b : usize = 0;
+        while (b < batch_size) {
+            if (cur + cur_len + 1 > data.len) {
+                cur = 0;
+            }
+            const row = b * seq_len;
+            var s : usize = 0;
+            while (s < cur_len) {
+                inputs[row + s] = data[cur + s];
+                targets[row + s] = data[cur + s + 1];
+                s = s + 1;
+            }
+            while (s < seq_len) {
+                inputs[row + s] = 0;
+                targets[row + s] = 0;
+                s = s + 1;
+            }
+            cur = cur + cur_len;
+            b = b + 1;
+        }
+        return cur;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4. Bytes: little-endian u32 and the f32 bit pattern
+    // ═════════════════════════════════════════════════════════════════
+
+    fn read_u32_le(buf: []const u8, off: usize) -> u32 {
+        const b0 : u32 = @intCast(buf[off]);
+        const b1 : u32 = @intCast(buf[off + 1]);
+        const b2 : u32 = @intCast(buf[off + 2]);
+        const b3 : u32 = @intCast(buf[off + 3]);
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    fn write_u32_le(buf: []u8, off: usize, v: u32) -> void {
+        buf[off] = @intCast(v & 255);
+        buf[off + 1] = @intCast((v >> 8) & 255);
+        buf[off + 2] = @intCast((v >> 16) & 255);
+        buf[off + 3] = @intCast((v >> 24) & 255);
+    }
+
+    // 2^k for 0 <= k <= 150
+    fn pow2(k: u32) -> f64 {
+        var r : f64 = 1.0;
+        var i : u32 = 0;
+        while (i < k) {
+            r = r * 2.0;
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // The f64 value of an f32 bit pattern: normal numbers and zero
+    fn decode_f32(bits: u32) -> f64 {
+        const exponent = (bits >> 23) & 255;
+        const mantissa = bits & 8388607;
+        var magnitude : f64 = 0.0;
+        if (exponent != 0) {
+            const frac = 1.0 + @as(f64, @floatFromInt(mantissa)) / 8388608.0;
+            if (exponent >= 127) {
+                magnitude = frac * pow2(exponent - 127);
+            } else {
+                magnitude = frac / pow2(127 - exponent);
+            }
+        }
+        if ((bits >> 31) == 1) {
+            return 0.0 - magnitude;
+        }
+        return magnitude;
+    }
+
+    // The f32 bit pattern nearest an f64 (round half up on the mantissa): normal numbers and zero
+    fn encode_f32(x: f64) -> u32 {
+        if (x == 0.0) {
+            return 0;
+        }
+        var sign : u32 = 0;
+        var m = x;
+        if (x < 0.0) {
+            sign = 1;
+            m = 0.0 - x;
+        }
+        var e : u32 = 127;
+        while (m >= 2.0) {
+            m = m / 2.0;
+            e = e + 1;
+        }
+        while (m < 1.0) {
+            m = m * 2.0;
+            e = e - 1;
+        }
+        const frac : u32 = @intFromFloat((m - 1.0) * 8388608.0 + 0.5);
+        // a mantissa that rounds up to 2.0 carries into the exponent
+        if (frac >= 8388608) {
+            return (sign << 31) | ((e + 1) << 23);
+        }
+        return (sign << 31) | (e << 23) | frac;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 5. Checkpoint: header and layout
+    // ═════════════════════════════════════════════════════════════════
+
+    // saveCheckpoint's header: magic, version, step, loss bits
+    fn write_header(buf: []u8, step: u32, loss: f64) -> void {
+        write_u32_le(buf, 0, CHECKPOINT_MAGIC);
+        write_u32_le(buf, 4, CHECKPOINT_VERSION);
+        write_u32_le(buf, 8, step);
+        write_u32_le(buf, 12, encode_f32(loss));
+    }
+
+    // loadCheckpoint's checks, in its order: magic, then version
+    fn parse_header(buf: []const u8) -> u32 {
+        if (buf.len < HEADER_BYTES) {
+            return HEADER_TOO_SHORT;
+        }
+        if (read_u32_le(buf, 0) != CHECKPOINT_MAGIC) {
+            return HEADER_BAD_MAGIC;
+        }
+        if (read_u32_le(buf, 4) != CHECKPOINT_VERSION) {
+            return HEADER_BAD_VERSION;
+        }
+        return HEADER_OK;
+    }
+
+    fn header_step(buf: []const u8) -> u32 {
+        return read_u32_le(buf, 8);
+    }
+
+    fn header_loss(buf: []const u8) -> f64 {
+        return decode_f32(read_u32_le(buf, 12));
+    }
+
+    // floats in the output projection's shadow weights
+    fn output_floats(vocab: usize, embed: usize) -> usize {
+        return embed * vocab;
+    }
+
+    // floats per block: shadow_up (embed x ff), shadow_down (ff x embed), bias_up, bias_down
+    fn block_floats(embed: usize, ff: usize) -> usize {
+        return embed * ff + ff * embed + ff + embed;
+    }
+
+    fn param_floats(vocab: usize, embed: usize, ff: usize, blocks: usize) -> usize {
+        return output_floats(vocab, embed) + blocks * block_floats(embed, ff);
+    }
+
+    fn file_bytes(vocab: usize, embed: usize, ff: usize, blocks: usize) -> usize {
+        return HEADER_BYTES + 4 * param_floats(vocab, embed, ff, blocks);
+    }
+
+    // Byte offsets, in the order saveCheckpoint writes them
+    fn output_offset() -> usize {
+        return HEADER_BYTES;
+    }
+
+    fn block_offset(vocab: usize, embed: usize, ff: usize, b: usize) -> usize {
+        return HEADER_BYTES + 4 * (output_floats(vocab, embed) + b * block_floats(embed, ff));
+    }
+
+    fn shadow_up_offset(vocab: usize, embed: usize, ff: usize, b: usize) -> usize {
+        return block_offset(vocab, embed, ff, b);
+    }
+
+    fn shadow_down_offset(vocab: usize, embed: usize, ff: usize, b: usize) -> usize {
+        return shadow_up_offset(vocab, embed, ff, b) + 4 * embed * ff;
+    }
+
+    fn bias_up_offset(vocab: usize, embed: usize, ff: usize, b: usize) -> usize {
+        return shadow_down_offset(vocab, embed, ff, b) + 4 * ff * embed;
+    }
+
+    fn bias_down_offset(vocab: usize, embed: usize, ff: usize, b: usize) -> usize {
+        return bias_up_offset(vocab, embed, ff, b) + 4 * ff;
+    }
+
+    // where the last section ends: must be the file size
+    fn last_section_end(vocab: usize, embed: usize, ff: usize, blocks: usize) -> usize {
+        return bias_down_offset(vocab, embed, ff, blocks - 1) + 4 * embed;
+    }
+
+    fn real_file_bytes() -> usize {
+        return file_bytes(VOCAB_SIZE, EMBED_DIM, FF_DIM, NUM_BLOCKS);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 6. Probes (fixed inputs, so each test reads one number)
+    // ═════════════════════════════════════════════════════════════════
+
+    // the first 16 bytes of data/wave9/worker-2/hslm_step_10000.bin
+    fn real_header_status() -> u32 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return parse_header(&h);
+    }
+
+    fn real_header_step() -> u32 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return header_step(&h);
+    }
+
+    fn real_header_loss() -> f64 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return header_loss(&h);
+    }
+
+    fn real_header_loss_bits() -> u32 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return read_u32_le(&h, 12);
+    }
+
+    // the same header written by write_header: byte k of the 16
+    fn written_header_byte(step: u32, loss: f64, k: usize) -> u32 {
+        var buf : [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        write_header(&buf, step, loss);
+        const v : u32 = @intCast(buf[k]);
+        return v;
+    }
+
+    fn written_header_status(step: u32, loss: f64) -> u32 {
+        var buf : [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        write_header(&buf, step, loss);
+        return parse_header(&buf);
+    }
+
+    fn written_header_step(step: u32, loss: f64) -> u32 {
+        var buf : [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        write_header(&buf, step, loss);
+        return header_step(&buf);
+    }
+
+    fn written_header_loss(step: u32, loss: f64) -> f64 {
+        var buf : [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        write_header(&buf, step, loss);
+        return header_loss(&buf);
+    }
+
+    fn bad_magic_status() -> u32 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x49, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return parse_header(&h);
+    }
+
+    fn bad_version_status() -> u32 {
+        const h : [16]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x02, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return parse_header(&h);
+    }
+
+    fn short_status() -> u32 {
+        const h : [12]u8 = [0x4D, 0x53, 0x4C, 0x48, 0x01, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
+        return parse_header(&h);
+    }
+
+    // the order matters: a wrong magic is reported before a wrong version
+    fn both_wrong_status() -> u32 {
+        const h : [16]u8 = [0x00, 0x53, 0x4C, 0x48, 0x09, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x17, 0xAA, 0xB1, 0x40];
+        return parse_header(&h);
+    }
+
+    // a float section written into a buffer and read back
+    fn float_round_trip(x: f64) -> f64 {
+        var buf : [4]u8 = [0, 0, 0, 0];
+        write_u32_le(&buf, 0, encode_f32(x));
+        return decode_f32(read_u32_le(&buf, 0));
+    }
+
+    // tokens 0..11, a 12-token stream; batch 2 x seq 4 at full length 4
+    fn batch_fixture(cursor: usize, cur_len: usize, which: usize) -> usize {
+        const data : [12]u16 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        var inputs : [8]u16 = [99, 99, 99, 99, 99, 99, 99, 99];
+        var targets : [8]u16 = [99, 99, 99, 99, 99, 99, 99, 99];
+        const next = next_batch(&data, cursor, 2, 4, cur_len, &inputs, &targets);
+        if (which == 100) {
+            return next;
+        }
+        if (which >= 50) {
+            const t : usize = @intCast(targets[which - 50]);
+            return t;
+        }
+        const i : usize = @intCast(inputs[which]);
+        return i;
+    }
+
+    // a 3-token stream is shorter than cur_len + 1 = 4
+    fn short_data_batch(which: usize) -> usize {
+        const data : [3]u16 = [5, 6, 7];
+        var inputs : [4]u16 = [99, 99, 99, 99];
+        var targets : [4]u16 = [99, 99, 99, 99];
+        const next = next_batch(&data, 2, 1, 4, 3, &inputs, &targets);
+        if (which == 100) {
+            return next;
+        }
+        const i : usize = @intCast(inputs[which]);
+        return i;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants
+    // ═════════════════════════════════════════════════════════════════
+
+    // --- the real checkpoint -------------------------------------------------
+
+    test real_header_parses_ok
+        given s = real_header_status()
+        then s == HEADER_OK
+
+    // 0x2710 = 10000 steps
+    test real_header_step_is_ten_thousand
+        given step = real_header_step()
+        then step == 10000
+
+    // 0x40B1AA17 = 5.5520129... as f32
+    test real_header_loss_bits_and_value
+        given bits = real_header_loss_bits()
+        when loss = real_header_loss()
+        then bits == 0x40B1AA17 and @abs(loss - 5.5520129) < 0.000001
+
+    // 3 blocks of 243 / 729 and a 729-class head: 1242945 floats after the header
+    test layout_floats_match_the_model
+        given n = param_floats(VOCAB_SIZE, EMBED_DIM, FF_DIM, NUM_BLOCKS)
+        when per_block = block_floats(EMBED_DIM, FF_DIM)
+        then n == 1242945 and per_block == 355266 and output_floats(VOCAB_SIZE, EMBED_DIM) == 177147
+
+    // the layout adds up to the size of hslm_step_10000.bin, byte for byte
+    test layout_bytes_equal_the_real_file
+        given n = real_file_bytes()
+        then n == 4971796 and n == REAL_FILE_BYTES
+
+    test layout_sections_tile_the_file
+        given first = output_offset()
+        when end0 = shadow_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0)
+        then first == 16 and end0 == 16 + 4 * 177147 and last_section_end(VOCAB_SIZE, EMBED_DIM, FF_DIM, NUM_BLOCKS) == REAL_FILE_BYTES
+
+    test layout_each_block_starts_where_the_last_ended
+        given b1 = block_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 1)
+        when b0end = bias_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0) + 4 * EMBED_DIM
+        then b1 == b0end and block_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 2) == bias_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 1) + 4 * EMBED_DIM
+
+    // section order inside a block: up, down, bias_up, bias_down
+    test layout_block_section_order
+        given up = shadow_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0)
+        when down = shadow_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0)
+        then down - up == 4 * 243 * 729 and bias_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0) - down == 4 * 729 * 243 and bias_down_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0) - bias_up_offset(VOCAB_SIZE, EMBED_DIM, FF_DIM, 0) == 4 * 729
+
+    // a small model keeps the same rules: 2 classes, width 3, ff 9, 1 block
+    test layout_holds_for_a_small_model
+        given n = file_bytes(2, 3, 9, 1)
+        then n == 16 + 4 * (6 + 27 + 27 + 9 + 3) and last_section_end(2, 3, 9, 1) == n
+
+    // --- header write and read -----------------------------------------------
+
+    test header_bytes_follow_the_format
+        given b0 = written_header_byte(10000, 5.5520129, 0)
+        when b3 = written_header_byte(10000, 5.5520129, 3)
+        then b0 == 0x4D and written_header_byte(10000, 5.5520129, 1) == 0x53 and written_header_byte(10000, 5.5520129, 2) == 0x4C and b3 == 0x48 and written_header_byte(10000, 5.5520129, 4) == 1 and written_header_byte(10000, 5.5520129, 8) == 0x10 and written_header_byte(10000, 5.5520129, 9) == 0x27
+
+    test header_written_then_parsed
+        given s = written_header_status(10000, 5.5520129)
+        when step = written_header_step(10000, 5.5520129)
+        then s == HEADER_OK and step == 10000 and @abs(written_header_loss(10000, 5.5520129) - 5.5520129) < 0.000001
+
+    // writing the real header's step and loss reproduces the real loss bits exactly
+    test header_loss_bits_reproduce_the_real_ones
+        given b12 = written_header_byte(10000, 5.552012920379639, 12)
+        when b15 = written_header_byte(10000, 5.552012920379639, 15)
+        then b12 == 0x17 and written_header_byte(10000, 5.552012920379639, 13) == 0xAA and written_header_byte(10000, 5.552012920379639, 14) == 0xB1 and b15 == 0x40
+
+    test header_rejects_a_wrong_magic
+        given s = bad_magic_status()
+        then s == HEADER_BAD_MAGIC
+
+    test header_rejects_a_wrong_version
+        given s = bad_version_status()
+        then s == HEADER_BAD_VERSION
+
+    test header_rejects_a_short_buffer
+        given s = short_status()
+        then s == HEADER_TOO_SHORT
+
+    test header_reports_the_magic_first
+        given s = both_wrong_status()
+        then s == HEADER_BAD_MAGIC
+
+    // --- f32 bit patterns ----------------------------------------------------
+
+    test f32_known_patterns
+        given one = encode_f32(1.0)
+        when small = encode_f32(0.15625)
+        then one == 0x3F800000 and small == 0x3E200000 and encode_f32(0.0 - 2.0) == 0xC0000000 and encode_f32(0.0) == 0
+
+    test f32_decode_known_patterns
+        given one = decode_f32(0x3F800000)
+        when small = decode_f32(0x3E200000)
+        then one == 1.0 and small == 0.15625 and decode_f32(0xC0000000) == 0.0 - 2.0 and decode_f32(0) == 0.0
+
+    // decode then encode returns the same 32 bits, for the real loss and for a negative and a tiny value
+    test f32_round_trip_on_bits
+        given real = encode_f32(decode_f32(0x40B1AA17))
+        when neg = encode_f32(decode_f32(0xBF99999A))
+        then real == 0x40B1AA17 and neg == 0xBF99999A and encode_f32(decode_f32(0x38D1B717)) == 0x38D1B717
+
+    test f32_round_trip_through_bytes
+        given a = float_round_trip(0.15625)
+        when b = float_round_trip(0.0 - 3.5)
+        then a == 0.15625 and b == 0.0 - 3.5 and @abs(float_round_trip(0.3) - 0.3) < 0.00000003
+
+    // a mantissa that rounds to 2.0 carries into the exponent: 1.99999999 -> 2.0
+    test f32_rounding_carries_into_the_exponent
+        given bits = encode_f32(1.999999999)
+        then bits == 0x40000000
+
+    // --- curriculum ----------------------------------------------------------
+
+    test curriculum_none_is_full_difficulty
+        given d = difficulty(SCHED_NONE, 0, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then d == 1.0
+
+    test curriculum_linear_follows_progress
+        given d = difficulty(SCHED_LINEAR, 25000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        when past = difficulty(SCHED_LINEAR, 250000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then @abs(d - 0.25) < 0.000000000001 and past == 1.0
+
+    test curriculum_exponential
+        given d = difficulty(SCHED_EXPONENTIAL, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then @abs(d - 0.917915001376101) < 0.000000000001
+
+    // milestones: floor(0.55 * 10) / 10 = 0.5
+    test curriculum_step_holds_between_milestones
+        given d = difficulty(SCHED_STEP, 55000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        when same = difficulty(SCHED_STEP, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then @abs(d - 0.5) < 0.000000000001 and @abs(same - 0.5) < 0.000000000001
+
+    test curriculum_cosine
+        given half = difficulty(SCHED_COSINE, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        when quarter = difficulty(SCHED_COSINE, 25000, DEFAULT_TOTAL_STEPS, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then @abs(half - 0.5) < 0.000000000001 and @abs(quarter - 0.14644660940672627) < 0.000000000001
+
+    test curriculum_zero_total_steps_is_full_progress
+        given d = difficulty(SCHED_LINEAR, 0, 0, DEFAULT_GROWTH_RATE, DEFAULT_MILESTONES)
+        then d == 1.0
+
+    // 8 + trunc(d * 19): linear 0.5 -> 17, cosine 0.25 -> 8 + trunc(2.78) = 10, exponential 0.918 -> 8 + 17 = 25
+    test curriculum_sequence_length
+        given lin = curriculum_seq_len(SCHED_LINEAR, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN)
+        when cosq = curriculum_seq_len(SCHED_COSINE, 25000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN)
+        then lin == 17 and cosq == 10 and curriculum_seq_len(SCHED_EXPONENTIAL, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN) == 25
+
+    test curriculum_starts_at_the_minimum_and_ends_at_the_maximum
+        given start = curriculum_seq_len(SCHED_LINEAR, 0, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN)
+        when finish = curriculum_seq_len(SCHED_LINEAR, 100000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN)
+        then start == 8 and finish == 27
+
+    test current_seq_len_without_a_schedule_is_the_fixed_one
+        given n = current_seq_len(SCHED_NONE, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN, 12)
+        when m = current_seq_len(SCHED_LINEAR, 50000, DEFAULT_TOTAL_STEPS, DEFAULT_MIN_SEQ_LEN, CONTEXT_LEN, 12)
+        then n == 12 and m == 17
+
+    test curriculum_completes_at_the_end
+        given early = curriculum_complete(SCHED_LINEAR, 1000, DEFAULT_TOTAL_STEPS)
+        when late = curriculum_complete(SCHED_LINEAR, 99000, DEFAULT_TOTAL_STEPS)
+        then early == false and late == true and curriculum_complete(SCHED_LINEAR, 100000, DEFAULT_TOTAL_STEPS) == true and curriculum_complete(SCHED_STEP, 98000, DEFAULT_TOTAL_STEPS) == false
+
+    // --- batches -------------------------------------------------------------
+
+    test num_sequences_counts_start_positions
+        given a = num_sequences(12, 4)
+        then a == 8 and num_sequences(4, 4) == 0 and num_sequences(5, 4) == 1 and num_sequences(0, 4) == 0
+
+    // row 0 = tokens 0..3, row 1 = tokens 4..7: inputs[0] = 0, inputs[4] = 4
+    test batch_inputs_are_consecutive_tokens
+        given i0 = batch_fixture(0, 4, 0)
+        when i3 = batch_fixture(0, 4, 3)
+        then i0 == 0 and i3 == 3 and batch_fixture(0, 4, 4) == 4 and batch_fixture(0, 4, 7) == 7
+
+    // the target is the input shifted by one
+    test batch_targets_are_shifted_by_one
+        given t0 = batch_fixture(0, 4, 50)
+        when t3 = batch_fixture(0, 4, 53)
+        then t0 == 1 and t3 == 4 and batch_fixture(0, 4, 54) == 5 and batch_fixture(0, 4, 57) == 8
+
+    test batch_advances_the_cursor_by_one_row_per_example
+        given next = batch_fixture(0, 4, 100)
+        then next == 8
+
+    // cursor 4: row 0 = 4..7, row 1 would need 8..12 but 8 + 5 > 12, so the cursor wraps to 0
+    test batch_wraps_when_a_sequence_would_run_off_the_end
+        given i4 = batch_fixture(4, 4, 4)
+        when next = batch_fixture(4, 4, 100)
+        then i4 == 0 and batch_fixture(4, 4, 0) == 4 and next == 4
+
+    // current length 2 in a row of 4: two tokens, then two PAD (0) entries
+    test batch_pads_a_short_curriculum_row
+        given i1 = batch_fixture(0, 2, 1)
+        when i2 = batch_fixture(0, 2, 2)
+        then i1 == 1 and i2 == 0 and batch_fixture(0, 2, 3) == 0 and batch_fixture(0, 2, 4) == 2 and batch_fixture(0, 2, 53) == 0
+
+    test batch_with_a_short_curriculum_advances_by_the_current_length
+        given next = batch_fixture(0, 2, 100)
+        then next == 4
+
+    // shorter than cur_len + 1: nothing is written, the cursor stays
+    test batch_leaves_everything_alone_when_data_is_too_short
+        given next = short_data_batch(100)
+        then next == 2 and short_data_batch(0) == 99 and short_data_batch(3) == 99
+
+    invariant checkpoint_magic_is_hslm_in_little_endian
+        assert CHECKPOINT_MAGIC == 0x484C534D and CHECKPOINT_VERSION == 1 and HEADER_BYTES == 16
+
+    invariant resonance_ctx_is_three_cubed
+        assert CONTEXT_LEN == 27 and CONTEXT_LEN == 3 * 3 * 3 and VOCAB_SIZE == 729 and EMBED_DIM == 243
+
+    invariant schedules_are_distinct
+        assert SCHED_LINEAR != SCHED_EXPONENTIAL and SCHED_STEP != SCHED_COSINE and SCHED_COSINE != SCHED_NONE
+}

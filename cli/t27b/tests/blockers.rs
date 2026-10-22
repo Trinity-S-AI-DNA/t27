@@ -185,3 +185,56 @@ fn a_timeout_kills_the_group_and_spares_the_caller() {
     // The pipes close only once the backgrounded sleep is dead too.
     assert!(t0.elapsed() < std::time::Duration::from_secs(10), "took {:?}", t0.elapsed());
 }
+
+/// #6441: the per-test verdicts of `t27c test-report --verbose`, and nothing
+/// when the list could be partial.
+#[test]
+fn reads_per_test_verdicts_of_test_report() {
+    use t27b::blockers::parse_test_verdicts;
+    let v = "--- test report: a.t27 ---\n  pass  Vec2_add\n  FAIL  Vec2_length\n  pass  Vec2_dot\n\n  tests       3\n  pass        2\n  FAIL        1\n";
+    assert_eq!(
+        parse_test_verdicts(v),
+        Some(vec![("Vec2_add".into(), true), ("Vec2_length".into(), false), ("Vec2_dot".into(), true)])
+    );
+    // Without --verbose only the failures are listed: the count gives it away.
+    let quiet = "--- test report: a.t27 ---\n  FAIL  t1\n\n  tests       3\n  pass        2\n  FAIL        1\n";
+    assert_eq!(parse_test_verdicts(quiet), None);
+    let none = "--- test report: a.t27 ---\n\n  tests       0\n  pass        0\n  FAIL        0\n";
+    assert_eq!(parse_test_verdicts(none), Some(vec![]));
+    let blocked = "--- test report: a.t27 ---\n  BLOCKED  does not compile: spec.zig:7:5\n";
+    assert_eq!(parse_test_verdicts(blocked), None);
+}
+
+#[test]
+fn t27b_verdicts_skip_invariants_and_name_repeats_like_t27c() {
+    use t27b::blockers::t27b_verdicts;
+    let out = "PASS a\nFAIL b: assert_eq failed at line 9 (left 1, right 2)\nINVARIANT PASS inv\nINVARIANT FAIL inv2: assert at line 3\nPASS a\nPASS a\nMISMATCH c: jit Ok, interpreter Err\nm: runtime asserts 4\nm: 3 passed, 1 failed, 4 total\n";
+    assert_eq!(
+        t27b_verdicts(out),
+        vec![
+            ("a".to_string(), true),
+            ("b".to_string(), false),
+            ("a__dup2".to_string(), true),
+            ("a__dup3".to_string(), true)
+        ]
+    );
+}
+
+/// The case #6441 was filed for: both sides fail the file, so the file-level
+/// comparison called it agreement, whatever test failed.
+#[test]
+fn a_file_both_sides_fail_agrees_only_if_the_same_tests_fail() {
+    use t27b::blockers::disagreements;
+    let t = |xs: &[(&str, bool)]| -> Vec<(String, bool)> { xs.iter().map(|(n, ok)| (n.to_string(), *ok)).collect() };
+    let reference = t(&[("Vec2_add", true), ("Vec2_length", false), ("Vec2_dot", true)]);
+    assert!(disagreements(&reference, &reference).is_empty());
+    let other = t(&[("Vec2_add", false), ("Vec2_length", true), ("Vec2_dot", true)]);
+    assert_eq!(
+        disagreements(&other, &reference),
+        vec!["Vec2_add: t27b FAIL, reference pass".to_string(), "Vec2_length: t27b pass, reference FAIL".to_string()]
+    );
+    // A test only one side ran is a disagreement too, never a silent skip.
+    let fewer = t(&[("Vec2_add", true), ("Vec2_length", false)]);
+    assert_eq!(disagreements(&fewer, &reference), vec!["Vec2_dot: t27b has no such test, reference pass".to_string()]);
+    assert_eq!(disagreements(&reference, &fewer), vec!["Vec2_dot: t27b pass, reference has no such test".to_string()]);
+}

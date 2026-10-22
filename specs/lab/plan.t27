@@ -1,0 +1,980 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/lab/plan.t27 -- which commits the t27c lab runs next, decided from `git ls-remote` (gHashTag/t27#11041, epic #11040)
+; The t27c lab (infra/t27c-lab/lab.py) polls the repository's heads, keeps the branches its T27_WATCH globs match, and queues
+; every commit it has not run and has not queued, one entry per commit with all the branches that point at it. This file is
+; that decision as pure functions of text, one per Python function, the Python being the oracle until the cutover:
+;   watched(branch, globs)           lab_watched      the index of the first glob a branch matches (fnmatch.fnmatchcase)
+;   parse_heads(ls_remote)           lab_parse_heads  `git ls-remote --heads` text -> the heads, as text
+;   plan(heads, globs, done, queued) lab_plan         the new work, in glob order then branch name
+;   stale_dropped(queue, heads)      lab_stale_dropped  the queue minus commits no watched branch points at, unless asked for
+;   "master" in item["branches"]     lab_item_has_branch  (run_item(): whether the seal refresh of a master commit is due)
+; It names no host: the plan of the next gates is the same wherever they run (one lab, or any node that takes a lab job, #11043).
+; THE TEXTS. A dict, a set and a list are text here, so a caller that holds none of Python's types (the runtime of #11040
+; is generated from specs) passes what it read:
+;   globs   the T27_WATCH text itself: globs separated by `,`, each stripped, an empty one dropped (the lab builds its list
+;           that way, so a list the lab can hold is a text this reads; a glob has no comma in it). Its index is the position
+;           among the non-empty ones.
+;   heads   one head per line, `<branch> TAB <sha>`, in the order a dict holds them, a branch on one line only (a dict has a key
+;           once). lab_parse_heads writes it; a branch name has no TAB or line break (git refuses them), so the text round-trips.
+;   done, queued   a set of shas, one per line. A sha is in the set when a line is byte for byte that sha.
+;   queue   one entry per line, `<sha>` or `<sha> TAB asked` (an entry someone asked for by hand).
+;   plan    one item per line, `<sha> TAB <branch> TAB <branch> ...`, the branches in order.
+; The writers return the new cursor of the caller's buffer and count a byte that does not fit without writing it. The
+; plan is LAB_NO when a glob of the watch text is one this port refuses (below).
+; FNMATCH. `fnmatch.fnmatchcase(name, glob)` is read off Python 3.14's translate(): `*` matches any run of characters
+; (`/` and a line break too), `?` one character, `[seq]` one of the characters of seq, `[!seq]` any other, `a-z` a range,
+; a `]` first in seq is itself, a `-` first or last is itself, an unclosed `[` is itself, and every other character is
+; itself. A character is a code point, not a byte. Not ported: a range that runs backwards (`[z-a]`). Python turns it into
+; a class that drops both ends, and a second range after it can change which ends; the lab's globs (`master`,
+; `claude/t27c-*`) have none, so a glob with one is REFUSED (lab_fnmatch returns LAB_FN_REFUSED, lab_watched LAB_WATCH_BAD,
+; lab_plan LAB_NO) rather than answered differently from Python. A refused glob is a configuration error to report.
+; DICT ORDER AND DUPLICATES. A dict keeps a key where it first appeared and the value that came last, so a branch listed
+; twice by ls-remote (git does not do it) is read once, in its first place, with its last sha. plan() does not depend on the
+; order of its heads, only on which branch points at which sha.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LabPlan;
+
+use tri::lab::receipt::span_is;
+use lab::text::LAB_NO;
+use lab::text::lab_line_end;
+use lab::text::lab_line_next;
+use lab::text::lab_find_byte;
+use lab::text::lab_strip_from;
+use lab::text::lab_strip_to;
+use lab::text::lab_char_len;
+use lab::text::lab_char_val;
+use lab::text::lab_same_span;
+use lab::text::lab_set_has;
+use lab::text::lab_span_cmp;
+use lab::text::lab_lit_at;
+use lab::text::lab_put_span;
+use lab::text::lab_put_lit;
+use lab::paths::lab_is_sha;
+
+/// What a glob says of a name.
+pub const LAB_FN_NO : u8 = 0;
+pub const LAB_FN_YES : u8 = 1;
+pub const LAB_FN_REFUSED : u8 = 2;
+
+/// watched(): no glob matched.
+pub const LAB_WATCH_NONE : usize = 4294967295;
+/// watched(): a glob of the text is one this port refuses.
+pub const LAB_WATCH_BAD : usize = 4294967294;
+
+/// The prefix of a branch's ref in `git ls-remote --heads`.
+pub const LAB_HEADS_PREFIX : string = "refs/heads/";
+
+/// Where the class that opens at pat[p] (a `[`) closes: the offset of its `]`, or LAB_NO when the `[` is a plain character.
+pub fn lab_class_close(pat: string, p: usize, pt: usize) -> usize {
+    var j : usize = p + 1;
+    if (j < pt and pat[j] == 33) { j = j + 1; }
+    if (j < pt and pat[j] == 93) { j = j + 1; }
+    while (j < pt and pat[j] != 93) {
+        j = j + 1;
+    }
+    if (j >= pt) { return LAB_NO; }
+    return j;
+}
+
+/// The offset where the characters of a class begin: past the `[` and a `!`.
+pub fn lab_class_first(pat: string, p: usize) -> usize {
+    if (pat[p + 1] == 33) { return p + 2; }
+    return p + 1;
+}
+
+/// Does the class pat[p..j] hold a range that runs backwards (the first end above the last)?
+pub fn lab_class_backwards(pat: string, p: usize, j: usize) -> bool {
+    var k : usize = lab_class_first(pat, p);
+    while (k < j) {
+        const k1 : usize = k + lab_char_len(pat, k, j);
+        if (k1 + 1 < j and pat[k1] == 45) {
+            if (lab_char_val(pat, k, j) > lab_char_val(pat, k1 + 1, j)) { return true; }
+            k = k1 + 1 + lab_char_len(pat, k1 + 1, j);
+        } else {
+            k = k1;
+        }
+    }
+    return false;
+}
+
+/// Does the class pat[p..j] take the character whose code point is c? (A class with no backwards range.)
+pub fn lab_class_takes(pat: string, p: usize, j: usize, c: u32) -> bool {
+    var hit : bool = false;
+    var k : usize = lab_class_first(pat, p);
+    while (k < j) {
+        const c0 : u32 = lab_char_val(pat, k, j);
+        const k1 : usize = k + lab_char_len(pat, k, j);
+        if (k1 + 1 < j and pat[k1] == 45) {
+            const c1 : u32 = lab_char_val(pat, k1 + 1, j);
+            if (c >= c0 and c <= c1) { hit = true; }
+            k = k1 + 1 + lab_char_len(pat, k1 + 1, j);
+        } else {
+            if (c == c0) { hit = true; }
+            k = k1;
+        }
+    }
+    if (pat[p + 1] == 33) { return hit == false; }
+    return hit;
+}
+
+/// Is every class of the glob pat[pf..pt] one this port reads?
+pub fn lab_glob_ok(pat: string, pf: usize, pt: usize) -> bool {
+    var p : usize = pf;
+    while (p < pt) {
+        var step : usize = lab_char_len(pat, p, pt);
+        if (pat[p] == 91) {
+            const j : usize = lab_class_close(pat, p, pt);
+            if (j != LAB_NO) {
+                if (lab_class_backwards(pat, p, j)) { return false; }
+                step = j + 1 - p;
+            }
+        }
+        p = p + step;
+    }
+    return true;
+}
+
+/// How many bytes of the glob the element at pat[p] takes when it matches the character at s[i]; 0 when it does not.
+pub fn lab_glob_step(pat: string, p: usize, pt: usize, s: string, i: usize, st: usize) -> usize {
+    const c : u8 = pat[p];
+    if (c == 63) { return 1; }
+    if (c == 91) {
+        const j : usize = lab_class_close(pat, p, pt);
+        if (j != LAB_NO) {
+            if (lab_class_takes(pat, p, j, lab_char_val(s, i, st))) { return j + 1 - p; }
+            return 0;
+        }
+    }
+    const n : usize = lab_char_len(pat, p, pt);
+    if (lab_char_len(s, i, st) == n and lab_same_span(pat, p, p + n, s, i, i + n)) { return n; }
+    return 0;
+}
+
+/// Does the glob pat[pf..pt] match all of s[sf..st]? (A glob lab_glob_ok accepts.) `*` is tried at the earliest place first and
+/// moved right only when what follows fails, which finds a match exactly when there is one.
+pub fn lab_glob_match(pat: string, pf: usize, pt: usize, s: string, sf: usize, st: usize) -> bool {
+    var p : usize = pf;
+    var i : usize = sf;
+    var star : usize = LAB_NO;
+    var mark : usize = sf;
+    var state : u8 = 0;
+    while (state == 0) {
+        if (p < pt and pat[p] == 42) {
+            while (p < pt and pat[p] == 42) {
+                p = p + 1;
+            }
+            star = p;
+            mark = i;
+        } else {
+            var stepped : bool = false;
+            if (p < pt and i < st) {
+                const step : usize = lab_glob_step(pat, p, pt, s, i, st);
+                if (step > 0) {
+                    p = p + step;
+                    i = i + lab_char_len(s, i, st);
+                    stepped = true;
+                }
+            }
+            if (stepped == false) {
+                if (p == pt and i == st) {
+                    state = 1;
+                } else {
+                    if (star != LAB_NO and mark < st) {
+                        mark = mark + lab_char_len(s, mark, st);
+                        i = mark;
+                        p = star;
+                    } else {
+                        state = 2;
+                    }
+                }
+            }
+        }
+    }
+    return state == 1;
+}
+
+/// fnmatch.fnmatchcase(s[sf..st], pat[pf..pt]): YES, NO, or REFUSED for a glob this port does not read.
+pub fn lab_fnmatch(pat: string, pf: usize, pt: usize, s: string, sf: usize, st: usize) -> u8 {
+    if (lab_glob_ok(pat, pf, pt) == false) { return LAB_FN_REFUSED; }
+    if (lab_glob_match(pat, pf, pt, s, sf, st)) { return LAB_FN_YES; }
+    return LAB_FN_NO;
+}
+
+/// Does every glob of the watch text read? (None is refused.)
+pub fn lab_watch_ok(watch: string) -> bool {
+    var s : usize = 0;
+    while (s <= watch.len) {
+        var e : usize = lab_find_byte(watch, s, watch.len, 44);
+        if (e == LAB_NO) { e = watch.len; }
+        const f : usize = lab_strip_from(watch, s, e);
+        const t : usize = lab_strip_to(watch, f, e);
+        if (f < t and lab_glob_ok(watch, f, t) == false) { return false; }
+        s = e + 1;
+    }
+    return true;
+}
+
+/// watched(branch, globs): the index of the first glob the branch matches, LAB_WATCH_NONE when none does, LAB_WATCH_BAD when a
+/// glob it had to try is refused. The globs are the watch text; the branch is name[nf..nt].
+pub fn lab_watched(name: string, nf: usize, nt: usize, watch: string) -> usize {
+    var idx : usize = 0;
+    var s : usize = 0;
+    while (s <= watch.len) {
+        var e : usize = lab_find_byte(watch, s, watch.len, 44);
+        if (e == LAB_NO) { e = watch.len; }
+        const f : usize = lab_strip_from(watch, s, e);
+        const t : usize = lab_strip_to(watch, f, e);
+        if (f < t) {
+            const r : u8 = lab_fnmatch(watch, f, t, name, nf, nt);
+            if (r == LAB_FN_YES) { return idx; }
+            if (r == LAB_FN_REFUSED) { return LAB_WATCH_BAD; }
+            idx = idx + 1;
+        }
+        s = e + 1;
+    }
+    return LAB_WATCH_NONE;
+}
+
+/// The offset in `ls` of the branch of the line ls[s..e] when it is a head, LAB_NO when the line is not one: exactly one TAB, a
+/// 40-hex sha before it, and `refs/heads/` after it. The sha is ls[s..branch - 12], the branch is ls[branch..e].
+pub fn lab_ls_branch(ls: string, s: usize, e: usize) -> usize {
+    const tab : usize = lab_find_byte(ls, s, e, 9);
+    if (tab == LAB_NO) { return LAB_NO; }
+    if (lab_find_byte(ls, tab + 1, e, 9) != LAB_NO) { return LAB_NO; }
+    if (lab_is_sha(ls, s, tab) == false) { return LAB_NO; }
+    if (lab_lit_at(ls, tab + 1, e, LAB_HEADS_PREFIX) == false) { return LAB_NO; }
+    return tab + 1 + LAB_HEADS_PREFIX.len;
+}
+
+/// parse_heads(ls_remote): the heads of `git ls-remote --heads` text, one `<branch> TAB <sha>` line each, as a dict holds them
+/// (a branch in its first place with its last sha). Writes into dst at w, clipped at cap; the new cursor.
+pub fn lab_parse_heads(ls: string, dst: []u8, cap: usize, w: usize) -> usize {
+    var x : usize = w;
+    var s : usize = 0;
+    while (s < ls.len) {
+        const e : usize = lab_line_end(ls, s);
+        const b : usize = lab_ls_branch(ls, s, e);
+        if (b != LAB_NO) {
+            var first : bool = true;
+            var last : usize = s;
+            var le : usize = e;
+            var k : usize = 0;
+            while (k < ls.len) {
+                const ke : usize = lab_line_end(ls, k);
+                const kb : usize = lab_ls_branch(ls, k, ke);
+                if (kb != LAB_NO and lab_same_span(ls, kb, ke, ls, b, e)) {
+                    if (k < s) { first = false; }
+                    if (k >= s) { last = k; le = ke; }
+                }
+                k = lab_line_next(ls, ke);
+            }
+            if (first) {
+                const lb : usize = lab_ls_branch(ls, last, le);
+                x = lab_put_span(dst, cap, x, ls, b, e);
+                x = lab_put_lit(dst, cap, x, "\t");
+                x = lab_put_span(dst, cap, x, ls, last, lb - 1 - LAB_HEADS_PREFIX.len);
+                x = lab_put_lit(dst, cap, x, "\n");
+            }
+        }
+        s = lab_line_next(ls, e);
+    }
+    return x;
+}
+
+/// The watch rank of the head on line heads[s..e] when it is new work: the branch is watched, its sha is neither done nor
+/// queued. LAB_NO otherwise, or when the line has no TAB.
+pub fn lab_head_rank(heads: string, s: usize, e: usize, watch: string, done: string, queued: string) -> usize {
+    const tab : usize = lab_find_byte(heads, s, e, 9);
+    if (tab == LAB_NO) { return LAB_NO; }
+    const rank : usize = lab_watched(heads, s, tab, watch);
+    if (rank == LAB_WATCH_NONE or rank == LAB_WATCH_BAD) { return LAB_NO; }
+    if (lab_set_has(done, heads, tab + 1, e) or lab_set_has(queued, heads, tab + 1, e)) { return LAB_NO; }
+    return rank;
+}
+
+/// The lowest watch rank among the new heads that point at the sha heads[sf..st]; LAB_NO when none is new work.
+pub fn lab_group_rank(heads: string, sf: usize, st: usize, watch: string, done: string, queued: string) -> usize {
+    var best : usize = LAB_NO;
+    var s : usize = 0;
+    while (s < heads.len) {
+        const e : usize = lab_line_end(heads, s);
+        const tab : usize = lab_find_byte(heads, s, e, 9);
+        if (tab != LAB_NO and lab_same_span(heads, tab + 1, e, heads, sf, st)) {
+            const r : usize = lab_head_rank(heads, s, e, watch, done, queued);
+            if (r != LAB_NO and (best == LAB_NO or r < best)) { best = r; }
+        }
+        s = lab_line_next(heads, e);
+    }
+    return best;
+}
+
+/// Is the head on line heads[s..e] (new work) the one whose branch sorts first among the new heads of its sha?
+pub fn lab_group_first(heads: string, s: usize, e: usize, watch: string, done: string, queued: string) -> bool {
+    const tab : usize = lab_find_byte(heads, s, e, 9);
+    var k : usize = 0;
+    while (k < heads.len) {
+        const ke : usize = lab_line_end(heads, k);
+        const kt : usize = lab_find_byte(heads, k, ke, 9);
+        if (kt != LAB_NO and k != s and lab_same_span(heads, kt + 1, ke, heads, tab + 1, e)) {
+            if (lab_head_rank(heads, k, ke, watch, done, queued) != LAB_NO and lab_span_cmp(heads, k, kt, heads, s, tab) < 0) { return false; }
+        }
+        k = lab_line_next(heads, ke);
+    }
+    return true;
+}
+
+/// Does item (rank a, first branch on line a) come before item (rank b, line b) in the plan: the lower rank, then the lower branch?
+pub fn lab_item_before(heads: string, a_rank: usize, a_s: usize, b_rank: usize, b_s: usize) -> bool {
+    if (a_rank != b_rank) { return a_rank < b_rank; }
+    const a_t : usize = lab_find_byte(heads, a_s, heads.len, 9);
+    const b_t : usize = lab_find_byte(heads, b_s, heads.len, 9);
+    return lab_span_cmp(heads, a_s, a_t, heads, b_s, b_t) < 0;
+}
+
+/// The line of the item that comes right after the one on line `last` (the first item when have_last is false): LAB_NO at the end.
+pub fn lab_plan_next(heads: string, watch: string, done: string, queued: string, have_last: bool, last: usize) -> usize {
+    var last_rank : usize = 0;
+    if (have_last) {
+        const lt : usize = lab_find_byte(heads, last, heads.len, 9);
+        const le : usize = lab_line_end(heads, last);
+        last_rank = lab_group_rank(heads, lt + 1, le, watch, done, queued);
+    }
+    var best : usize = LAB_NO;
+    var best_rank : usize = 0;
+    var s : usize = 0;
+    while (s < heads.len) {
+        const e : usize = lab_line_end(heads, s);
+        if (lab_head_rank(heads, s, e, watch, done, queued) != LAB_NO and lab_group_first(heads, s, e, watch, done, queued)) {
+            const tab : usize = lab_find_byte(heads, s, e, 9);
+            const rank : usize = lab_group_rank(heads, tab + 1, e, watch, done, queued);
+            var later : bool = true;
+            if (have_last) { later = lab_item_before(heads, last_rank, last, rank, s); }
+            if (later and (best == LAB_NO or lab_item_before(heads, rank, s, best_rank, best))) {
+                best = s;
+                best_rank = rank;
+            }
+        }
+        s = lab_line_next(heads, e);
+    }
+    return best;
+}
+
+/// The line of the branch of the item (the sha heads[sf..st]) that follows the one on line `prev`, in branch order: LAB_NO at the end.
+pub fn lab_item_branch_next(heads: string, sf: usize, st: usize, watch: string, done: string, queued: string, have_prev: bool, prev: usize) -> usize {
+    var prev_t : usize = 0;
+    if (have_prev) { prev_t = lab_find_byte(heads, prev, heads.len, 9); }
+    var best : usize = LAB_NO;
+    var best_t : usize = 0;
+    var s : usize = 0;
+    while (s < heads.len) {
+        const e : usize = lab_line_end(heads, s);
+        const tab : usize = lab_find_byte(heads, s, e, 9);
+        if (tab != LAB_NO and lab_same_span(heads, tab + 1, e, heads, sf, st) and lab_head_rank(heads, s, e, watch, done, queued) != LAB_NO) {
+            var after : bool = true;
+            if (have_prev) { after = lab_span_cmp(heads, prev, prev_t, heads, s, tab) < 0; }
+            if (after and (best == LAB_NO or lab_span_cmp(heads, s, tab, heads, best, best_t) < 0)) {
+                best = s;
+                best_t = tab;
+            }
+        }
+        s = lab_line_next(heads, e);
+    }
+    return best;
+}
+
+/// plan(heads, globs, done, queued): one line per new commit, `<sha> TAB <branch> TAB <branch>...`, in watch order and then branch
+/// order, into dst at w, clipped at cap; the new cursor. LAB_NO when the watch text has a glob this port refuses.
+pub fn lab_plan(heads: string, watch: string, done: string, queued: string, dst: []u8, cap: usize, w: usize) -> usize {
+    if (lab_watch_ok(watch) == false) { return LAB_NO; }
+    var x : usize = w;
+    var have : bool = false;
+    var cur : usize = 0;
+    while (true) {
+        const s : usize = lab_plan_next(heads, watch, done, queued, have, cur);
+        if (s == LAB_NO) { return x; }
+        const e : usize = lab_line_end(heads, s);
+        const tab : usize = lab_find_byte(heads, s, e, 9);
+        x = lab_put_span(dst, cap, x, heads, tab + 1, e);
+        var have_b : bool = false;
+        var b : usize = 0;
+        while (true) {
+            const nb : usize = lab_item_branch_next(heads, tab + 1, e, watch, done, queued, have_b, b);
+            if (nb == LAB_NO) { break; }
+            const nt : usize = lab_find_byte(heads, nb, heads.len, 9);
+            x = lab_put_lit(dst, cap, x, "\t");
+            x = lab_put_span(dst, cap, x, heads, nb, nt);
+            have_b = true;
+            b = nb;
+        }
+        x = lab_put_lit(dst, cap, x, "\n");
+        have = true;
+        cur = s;
+    }
+    return x;
+}
+
+/// run_item(): `"master" in item["branches"]` for a plan line item[s..e] (`<sha> TAB <branch> TAB <branch>...`): is `branch` one of
+/// the branches after the sha?
+pub fn lab_item_has_branch(item: string, s: usize, e: usize, branch: string) -> bool {
+    var f : usize = lab_find_byte(item, s, e, 9);
+    while (f != LAB_NO and f < e) {
+        var t : usize = lab_find_byte(item, f + 1, e, 9);
+        if (t == LAB_NO) { t = e; }
+        if (span_is(item, f + 1, t, branch)) { return true; }
+        f = lab_find_byte(item, t, e, 9);
+    }
+    return false;
+}
+
+/// stale_dropped(queue, heads): the queue's lines whose sha some head points at, or that were asked for by hand (`<sha> TAB asked`),
+/// in order, one per line, into dst at w, clipped at cap; the new cursor.
+pub fn lab_stale_dropped(queue: string, heads: string, dst: []u8, cap: usize, w: usize) -> usize {
+    var x : usize = w;
+    var s : usize = 0;
+    while (s < queue.len) {
+        const e : usize = lab_line_end(queue, s);
+        var sha_to : usize = lab_find_byte(queue, s, e, 9);
+        var asked : bool = false;
+        if (sha_to == LAB_NO) {
+            sha_to = e;
+        } else {
+            asked = span_is(queue, sha_to + 1, e, "asked");
+        }
+        var live : bool = false;
+        var h : usize = 0;
+        while (h < heads.len and live == false) {
+            const he : usize = lab_line_end(heads, h);
+            const ht : usize = lab_find_byte(heads, h, he, 9);
+            if (ht != LAB_NO and lab_same_span(heads, ht + 1, he, queue, s, sha_to)) { live = true; }
+            h = lab_line_next(heads, he);
+        }
+        if (asked or live) {
+            x = lab_put_span(dst, cap, x, queue, s, e);
+            x = lab_put_lit(dst, cap, x, "\n");
+        }
+        s = lab_line_next(queue, e);
+    }
+    return x;
+}
+
+// ---- tests ----
+// The oracle is infra/t27c-lab/lab.py. Every case below is its answer (Python 3.14.6), pinned: first the asserts of its
+// self_check(), one to one, then tables of inputs run through its own functions (fnmatch.fnmatchcase as `watched` calls it,
+// parse_heads, plan, stale_dropped).
+
+/// The names the fnmatch rows are read against, one per line (the empty one is the empty line).
+const LAB_TEST_NAMES : string = "master\nmain\nclaude/t27c-x\nclaude/t27c-\nclaude/lab\nclaude/a-b\nclaude/gen-zig-discard-call\na\nab\nabc\naxb\naxxb\nb\nx\nxx\n\n-\n]\n[\n[a\na]\n^\n\\\na\\b\nt27\nt270\nt27c\na/b/c\na/b\n/\n//\n a\na \n!\n!a\na-b\nc-e\ne\nd";
+
+/// One glob against every name of LAB_TEST_NAMES: the answers as a row of 1 (match) and 0 (no match).
+fn lab_test_fn_row(pat: string, want: string) -> bool {
+    var s : usize = 0;
+    var k : usize = 0;
+    while (s < LAB_TEST_NAMES.len) {
+        const e : usize = lab_line_end(LAB_TEST_NAMES, s);
+        const r : u8 = lab_fnmatch(pat, 0, pat.len, LAB_TEST_NAMES, s, e);
+        if (k >= want.len) { return false; }
+        if (r == LAB_FN_YES and want[k] != 49) { return false; }
+        if (r == LAB_FN_NO and want[k] != 48) { return false; }
+        if (r == LAB_FN_REFUSED) { return false; }
+        k = k + 1;
+        s = lab_line_next(LAB_TEST_NAMES, e);
+    }
+    return k == want.len;
+}
+
+/// One watch text against every name: the index of the glob each matches as a digit, n for none.
+fn lab_test_watch_row(watch: string, want: string) -> bool {
+    var s : usize = 0;
+    var k : usize = 0;
+    while (s < LAB_TEST_NAMES.len) {
+        const e : usize = lab_line_end(LAB_TEST_NAMES, s);
+        const r : usize = lab_watched(LAB_TEST_NAMES, s, e, watch);
+        if (k >= want.len) { return false; }
+        if (r == LAB_WATCH_NONE and want[k] != 110) { return false; }
+        if (r < 10 and want[k] != 48 + (r as u8)) { return false; }
+        if (r != LAB_WATCH_NONE and r >= 10) { return false; }
+        k = k + 1;
+        s = lab_line_next(LAB_TEST_NAMES, e);
+    }
+    return k == want.len;
+}
+
+fn lab_test_watched(name: string, watch: string) -> usize {
+    return lab_watched(name, 0, name.len, watch);
+}
+
+fn lab_test_heads(ls: string, want: string) -> bool {
+    var out : [2048]u8 = undefined;
+    const w : usize = lab_parse_heads(ls, &out, 2048, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+fn lab_test_plan(heads: string, watch: string, done: string, queued: string, want: string) -> bool {
+    var out : [2048]u8 = undefined;
+    const w : usize = lab_plan(heads, watch, done, queued, &out, 2048, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+fn lab_test_item_has(item: string, branch: string, want: bool) -> bool {
+    return lab_item_has_branch(item, 0, item.len, branch) == want;
+}
+
+fn lab_test_stale(queue: string, heads: string, want: string) -> bool {
+    var out : [2048]u8 = undefined;
+    const w : usize = lab_stale_dropped(queue, heads, &out, 2048, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+// <<< pinned table: plan_self_check
+test lab_py_self_check_watched_is_the_index_of_the_first_glob {
+    assert lab_test_watched("master", "master,claude/t27c-*") == 0;
+    assert lab_test_watched("claude/t27c-match-tail-expr", "master,claude/t27c-*") == 1;
+    assert lab_test_watched("claude/gen-zig-discard-call", "master,claude/t27c-*") == LAB_WATCH_NONE;
+    assert lab_test_watched("refs/pull/1/head", "master,claude/t27c-*") == LAB_WATCH_NONE;
+}
+
+test lab_py_self_check_parse_heads_keeps_heads_with_a_sha_only {
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/claude/t27c-x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/pull/9/head\nnot-a-sha\trefs/heads/y\n", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+}
+
+test lab_py_self_check_plan_groups_by_sha_in_glob_order {
+    assert lab_test_plan("claude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-y\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nmaster\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "master,claude/t27c-*", "", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmaster\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-x\tclaude/t27c-y\n");
+    assert lab_test_plan("master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "master,claude/t27c-*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "");
+}
+
+test lab_py_self_check_stale_dropped_keeps_live_and_asked_entries {
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\tasked\n", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\tasked\n");
+}
+
+// >>> pinned table: plan_self_check
+// <<< pinned table: plan_fnmatch
+// fnmatch.fnmatchcase(name, glob) for every name of LAB_TEST_NAMES, one row per glob (1 = match, 0 = none).
+test lab_py_table_fnmatch_rows {
+    assert lab_test_fn_row("master", "100000000000000000000000000000000000000");
+    assert lab_test_fn_row("claude/t27c-*", "001100000000000000000000000000000000000");
+    assert lab_test_fn_row("*", "111111111111111111111111111111111111111");
+    assert lab_test_fn_row("**", "111111111111111111111111111111111111111");
+    assert lab_test_fn_row("?", "000000010000110011100110000001000100011");
+    assert lab_test_fn_row("??", "000000001000001000011000000000111010000");
+    assert lab_test_fn_row("m?ster", "100000000000000000000000000000000000000");
+    assert lab_test_fn_row("?aster", "100000000000000000000000000000000000000");
+    assert lab_test_fn_row("[abc]*", "001111111111100000001001000110001001100");
+    assert lab_test_fn_row("[!abc]*", "110000000000011011110110111001110110011");
+    assert lab_test_fn_row("[a-c]", "000000010000100000000000000000000000000");
+    assert lab_test_fn_row("[a-]", "000000010000000010000000000000000000000");
+    assert lab_test_fn_row("[a-]x", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[]a]", "000000010000000001000000000000000000000");
+    assert lab_test_fn_row("[]", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[!]", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("a[", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[a", "000000000000000000010000000000000000000");
+    assert lab_test_fn_row("[[]", "000000000000000000100000000000000000000");
+    assert lab_test_fn_row("[[a]", "000000010000000000100000000000000000000");
+    assert lab_test_fn_row("[a^]", "000000010000000000000100000000000000000");
+    assert lab_test_fn_row("[!^]", "000000010000110011100010000001000100011");
+    assert lab_test_fn_row("[*]", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[?]", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[a-ce]", "000000010000100000000000000000000000010");
+    assert lab_test_fn_row("[--/]", "000000000000000010000000000001000000000");
+    assert lab_test_fn_row("[!-a]", "000000000000110001100110000001000100011");
+    assert lab_test_fn_row("[a-a]", "000000010000000000000000000000000000000");
+    assert lab_test_fn_row("t27[0-9]*", "000000000000000000000000010000000000000");
+    assert lab_test_fn_row("t27[0-9]", "000000000000000000000000010000000000000");
+    assert lab_test_fn_row("t27[a-z]", "000000000000000000000000001000000000000");
+    assert lab_test_fn_row("claude/[a-z]*-*", "001101100000000000000000000000000000000");
+    assert lab_test_fn_row("*/*", "001111100000000000000000000111100000000");
+    assert lab_test_fn_row("a*b*c", "000000000100000000000000000100000000000");
+    assert lab_test_fn_row("*a", "000000010000000000010000000000010010000");
+    assert lab_test_fn_row("a*", "000000011111000000001001000110001001000");
+    assert lab_test_fn_row("*b*", "000011001111100000000001000110000001000");
+    assert lab_test_fn_row("a?b", "000000000010000000000001000010000001000");
+    assert lab_test_fn_row("a*?b", "000000000011000000000001000010000001000");
+    assert lab_test_fn_row("*?", "111111111111111011111111111111111111111");
+    assert lab_test_fn_row("*?*", "111111111111111011111111111111111111111");
+    assert lab_test_fn_row("x*x*x*", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("*x*x*", "000000000001001000000000000000000000000");
+    assert lab_test_fn_row("\\", "000000000000000000000010000000000000000");
+    assert lab_test_fn_row("[\\]", "000000000000000000000010000000000000000");
+    assert lab_test_fn_row("[\\a]", "000000010000000000000010000000000000000");
+    assert lab_test_fn_row("[a-c\\]", "000000010000100000000010000000000000000");
+    assert lab_test_fn_row("!", "000000000000000000000000000000000100000");
+    assert lab_test_fn_row("[!]*", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("[!!]", "000000010000110011100110000001000000011");
+    assert lab_test_fn_row("[!a-c]*", "110000000000011011110110111001110110011");
+    assert lab_test_fn_row("[a-c!]", "000000010000100000000000000000000100000");
+    assert lab_test_fn_row("//", "000000000000000000000000000000100000000");
+    assert lab_test_fn_row("*/", "000000000000000000000000000001100000000");
+    assert lab_test_fn_row("?/?/?", "000000000000000000000000000100000000000");
+    assert lab_test_fn_row("a/b/*", "000000000000000000000000000100000000000");
+    assert lab_test_fn_row("[ab]*[bc]", "000000001111000000000001000110000001000");
+    assert lab_test_fn_row("ab*", "000000001100000000000000000000000000000");
+    assert lab_test_fn_row("a[b]", "000000001000000000000000000000000000000");
+    assert lab_test_fn_row("a[b-b]", "000000001000000000000000000000000000000");
+    assert lab_test_fn_row("-", "000000000000000010000000000000000000000");
+    assert lab_test_fn_row("[-]", "000000000000000010000000000000000000000");
+    assert lab_test_fn_row("[--]", "000000000000000010000000000000000000000");
+    assert lab_test_fn_row("[---]", "000000000000000010000000000000000000000");
+    assert lab_test_fn_row("[ae]", "000000010000000000000000000000000000010");
+    assert lab_test_fn_row("[c-e]", "000000000000000000000000000000000000011");
+    assert lab_test_fn_row("[ -a]", "000000010000000011100110000001000100000");
+    assert lab_test_fn_row("[ ]a", "000000000000000000000000000000010000000");
+    assert lab_test_fn_row("*!", "000000000000000000000000000000000100000");
+    assert lab_test_fn_row("[]]", "000000000000000001000000000000000000000");
+    assert lab_test_fn_row("[]-a]", "000000010000000001000100000000000000000");
+    assert lab_test_fn_row("[]-]", "000000000000000011000000000000000000000");
+    assert lab_test_fn_row("[a-b-c]", "000000010000100010000000000000000000000");
+    assert lab_test_fn_row("[ab-c]", "000000010000100000000000000000000000000");
+    assert lab_test_fn_row("[a-b]-[b-c]", "000000000000000000000000000000000001000");
+    assert lab_test_fn_row("a[]b]", "000000001000000000001000000000000000000");
+    assert lab_test_fn_row("[abc", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("abc[", "000000000000000000000000000000000000000");
+    assert lab_test_fn_row("a**", "000000011111000000001001000110001001000");
+    assert lab_test_fn_row("**a", "000000010000000000010000000000010010000");
+}
+
+// >>> pinned table: plan_fnmatch
+// <<< pinned table: plan_watched
+// watched(name, globs) for every name of LAB_TEST_NAMES, one row per watch text (the index as a digit, n for none).
+test lab_py_table_watched_rows {
+    assert lab_test_watch_row("master", "0nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("master,claude/t27c-*", "0n11nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(" master , claude/t27c-* ", "0n11nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("claude/*,master", "1n00000nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(",master", "0nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("master,", "0nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(",,", "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("", "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(" ", "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("a,b,c", "nnnnnnn0nnnn1nnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("*", "000000000000000000000000000000000000000");
+    assert lab_test_watch_row("*,master", "000000000000000000000000000000000000000");
+    assert lab_test_watch_row("x,[a-c]*,?", "nn111111111110nn222n1221nnn112nn12n1122");
+    assert lab_test_watch_row("claude/t27c-*,claude/*,*", "220011122222222222222222222222222222222");
+    assert lab_test_watch_row("master, ,main,claude/*", "0122222nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("master,main,claude/*,t27*,a*,b,x,xx,-,]", "012222244444567n89nn4nn433344nnn4nn4nnn");
+    assert lab_test_watch_row("main , master", "10nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("[abc]*,a*", "nn00000000000nnnnnnn0nn0nnn00nnn0nn00nn");
+    assert lab_test_watch_row("a,,,b", "nnnnnnn0nnnn1nnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(",a", "nnnnnnn0nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("t27?,t27", "nnnnnnnnnnnnnnnnnnnnnnnn100nnnnnnnnnnnn");
+    assert lab_test_watch_row("!*,*", "111111111111111111111111111111111001111");
+    assert lab_test_watch_row("claude/t27c-,claude/t27c-*", "nn10nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("e,d,c-e", "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn201");
+    assert lab_test_watch_row("a b", "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row(" a ,a", "nnnnnnn0nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn");
+    assert lab_test_watch_row("?,??,???", "nnnnnnn0122n001n000110022nnn20111012200");
+    assert lab_test_watch_row("*/*,a/b", "nn00000nnnnnnnnnnnnnnnnnnnn0000nnnnnnnn");
+}
+
+// >>> pinned table: plan_watched
+// <<< pinned table: plan_parse_heads
+// parse_heads(ls_remote) for ls-remote text of every shape the lab can be given and some it cannot.
+test lab_py_table_parse_heads {
+    assert lab_test_heads("", "");
+    assert lab_test_heads("\n", "");
+    assert lab_test_heads("\n\n\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/master\n", "master\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/x\ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/master\n", "master\tcccccccccccccccccccccccccccccccccccccccc\nx\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/y\ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/x\ndddddddddddddddddddddddddddddddddddddddd\trefs/heads/y\n", "x\tcccccccccccccccccccccccccccccccccccccccc\ny\tdddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/\n", "\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/\n", "\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/master\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t\trefs/heads/master\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\textra\n", "");
+    assert lab_test_heads("\trefs/heads/master\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_heads("refs/heads/master\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/x\n\n", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nx\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n  \nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/x\n", "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nx\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tREFS/HEADS/master\n", "");
+    assert lab_test_heads("cccccccccccccccccccccccccccccccccccccccc\tHEAD\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/pull/9/merge\n\trefs/pull/9/merge\nffffffffffffffffffffffffffffffffffffffff\trefs/remotes/origin/x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master \n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/claude/t27c-x\ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/master\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \trefs/pull/9/merge\ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/master \n", "master\tcccccccccccccccccccccccccccccccccccccccc\nmaster \tcccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/\ngggggggggggggggggggggggggggggggggggggggg\trefs/heads/claude/t27c-x\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/y\n0123456789abcdef0123456789abcdef01234567\trefs/heads/a b\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/refs/heads/x", "y\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\na b\t0123456789abcdef0123456789abcdef01234567\nrefs/heads/x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_heads("ffffffffffffffffffffffffffffffffffffffff\trefs/heads/a b\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tREFS/HEADS/x\ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/..\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \trefs/head/x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/pull/9/merge\n", "a b\tffffffffffffffffffffffffffffffffffffffff\n..\tcccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_heads("not-a-sha\theads/master\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/remotes/origin/x\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\n", "");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\ncccccccccccccccccccccccccccccccccccccccc\theads/master\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\nffffffffffffffffffffffffffffffffffffffff\t\n", "");
+    assert lab_test_heads("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/claude/t27c-x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tHEAD\nffffffffffffffffffffffffffffffffffffffff\trefs/heads/\ndddddddddddddddddddddddddddddddddddddddd\trefs/heads/feature/x-1\n0123456789abcdef0123456789abcdef01234567\trefs/heads/master\n", "claude/t27c-x\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n\tffffffffffffffffffffffffffffffffffffffff\nfeature/x-1\tdddddddddddddddddddddddddddddddddddddddd\nmaster\t0123456789abcdef0123456789abcdef01234567\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master \ndddddddddddddddddddddddddddddddddddddddd\trefs/tags/v1\n\trefs/remotes/origin/x\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/head/x\nnot-a-sha\trefs/heads/refs/heads/x\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\n", "master \taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_heads("dddddddddddddddddddddddddddddddddddddddd\trefs/heads/\ncccccccccccccccccccccccccccccccccccccccc\trefs/pull/9/merge\ndddddddddddddddddddddddddddddddddddddddd\trefs/heads/refs/heads/x\n", "\tdddddddddddddddddddddddddddddddddddddddd\nrefs/heads/x\tdddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_heads("dddddddddddddddddddddddddddddddddddddddd\tHEAD\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/a b\ncccccccccccccccccccccccccccccccccccccccc\tREFS/HEADS/x\n", "a b\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n");
+    assert lab_test_heads("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/master \n", "master \teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n");
+    assert lab_test_heads("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/head/x", "\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("0123456789abcdef0123456789abcdef01234567\trefs/heads/master\n", "master\t0123456789abcdef0123456789abcdef01234567\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \trefs/heads/master \ncccccccccccccccccccccccccccccccccccccccc\trefs/heads/a\tb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/master \n", "master \teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n");
+    assert lab_test_heads("cccccccccccccccccccccccccccccccccccccccc\theads/master\n0123456789abcdef0123456789abcdef01234567\trefs/tags/v1\ncccccccccccccccccccccccccccccccccccccccc\trefs/pull/9/head\n0123456789abcdef0123456789abcdef01234567\trefs/heads\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/master \n", "master \tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/a b\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t\ndddddddddddddddddddddddddddddddddddddddd\trefs/heads/\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tHEAD\nffffffffffffffffffffffffffffffffffffffff\t\n\theads/master", "a b\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\tdddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t\n0123456789abcdef0123456789abcdef01234567\t\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \trefs/tags/v1\n", "");
+    assert lab_test_heads("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/heads/master \nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/pull/9/head\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\n0123456789abcdef0123456789abcdef01234567\trefs/heads/refs/heads/x\ndddddddddddddddddddddddddddddddddddddddd\trefs/pull/9/merge\n", "master \teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nrefs/heads/x\t0123456789abcdef0123456789abcdef01234567\n");
+}
+
+// >>> pinned table: plan_parse_heads
+// <<< pinned table: plan_plan
+// plan(heads, globs, done, queued): new work, one entry per sha, its branches sorted, in glob order then branch name.
+test lab_py_table_plan {
+    assert lab_test_plan("master\tcccccccccccccccccccccccccccccccccccccccc\nclaude/lab\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrefs/pull/1/head\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/*", "", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a\n");
+    assert lab_test_plan("master\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmain\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "master", "dddddddddddddddddddddddddddddddddddddddd\n", "", "cccccccccccccccccccccccccccccccccccccccc\tmaster\n");
+    assert lab_test_plan("", "claude/t27c-*,master", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("main\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-y\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\n", "*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "", "cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y\n");
+    assert lab_test_plan("dev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfeature/a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/lab\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmain\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/t27c-*", "cccccccccccccccccccccccccccccccccccccccc\n", "", "");
+    assert lab_test_plan("feature/a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dev,feature/*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\n", "cccccccccccccccccccccccccccccccccccccccc\n", "");
+    assert lab_test_plan("master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/gen-zig\tdddddddddddddddddddddddddddddddddddddddd\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\n", "[a-c]*,master", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig\n");
+    assert lab_test_plan("refs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nmaster\tdddddddddddddddddddddddddddddddddddddddd\ndev\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nmain\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/t27c-*,master", "cccccccccccccccccccccccccccccccccccccccc\n", "dddddddddddddddddddddddddddddddddddddddd\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b\n");
+    assert lab_test_plan("claude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrefs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\n", "dev,feature/*", "", "cccccccccccccccccccccccccccccccccccccccc\n", "");
+    assert lab_test_plan("main\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nmaster\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-x\tdddddddddddddddddddddddddddddddddddddddd\n", "[a-c]*,master", "dddddddddddddddddddddddddddddddddddddddd\n", "", "cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-y\n");
+    assert lab_test_plan("claude/lab\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tdddddddddddddddddddddddddddddddddddddddd\nmaster\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dev,feature/*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\n", "", "");
+    assert lab_test_plan("claude/t27c-b\tdddddddddddddddddddddddddddddddddddddddd\nrefs/pull/1/head\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndev\tdddddddddddddddddddddddddddddddddddddddd\n", "claude/*", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-b\n");
+    assert lab_test_plan("", "[a-c]*,master", "", "", "");
+    assert lab_test_plan("", "master,main,claude/*", "cccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_plan("", "master", "cccccccccccccccccccccccccccccccccccccccc\n", "", "");
+    assert lab_test_plan("claude/t27c-b\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/lab\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "*", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("claude/t27c-a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\n", "dev,feature/*", "cccccccccccccccccccccccccccccccccccccccc\n", "", "");
+    assert lab_test_plan("", "claude/t27c-*,master", "", "cccccccccccccccccccccccccccccccccccccccc\n", "");
+    assert lab_test_plan("", "master,claude/t27c-*", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_plan("claude/lab\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "master", "cccccccccccccccccccccccccccccccccccccccc\n", "", "");
+    assert lab_test_plan("dev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/lab\tdddddddddddddddddddddddddddddddddddddddd\n", "master,main,claude/*", "", "dddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("", "dev,feature/*", "dddddddddddddddddddddddddddddddddddddddd\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("claude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\nfeature/a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tdddddddddddddddddddddddddddddddddddddddd\nmaster\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\n", "claude/*", "", "", "dddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-b\ncccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\n");
+    assert lab_test_plan("claude/t27c-z\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/*", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("claude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-y\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\tcccccccccccccccccccccccccccccccccccccccc\n", "master,claude/t27c-*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("main\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/lab\tdddddddddddddddddddddddddddddddddddddddd\n", "dev,feature/*", "", "dddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("dev\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-z\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-b\tdddddddddddddddddddddddddddddddddddddddd\nclaude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nmaster\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "", "cccccccccccccccccccccccccccccccccccccccc\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("claude/t27c-z\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/t27c-*,master", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "", "cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\n");
+    assert lab_test_plan("claude/t27c-z\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-a\tdddddddddddddddddddddddddddddddddddddddd\nclaude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nmain\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/gen-zig\tcccccccccccccccccccccccccccccccccccccccc\n", "", "dddddddddddddddddddddddddddddddddddddddd\n", "", "");
+    assert lab_test_plan("dev\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-z\tdddddddddddddddddddddddddddddddddddddddd\nclaude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfeature/a\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/*", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-z\n");
+    assert lab_test_plan("main\tdddddddddddddddddddddddddddddddddddddddd\nfeature/a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-x\tdddddddddddddddddddddddddddddddddddddddd\n", "*", "cccccccccccccccccccccccccccccccccccccccc\n", "", "dddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-x\tmain\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tdev\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfeature/a\n");
+    assert lab_test_plan("claude/gen-zig\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmain\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-z\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-a\tdddddddddddddddddddddddddddddddddddddddd\n", "claude/*", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/gen-zig\ndddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-a\n");
+    assert lab_test_plan("claude/gen-zig\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-a\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndev\tcccccccccccccccccccccccccccccccccccccccc\n", "dev,feature/*", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "cccccccccccccccccccccccccccccccccccccccc\tdev\n");
+    assert lab_test_plan("claude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nmaster\tdddddddddddddddddddddddddddddddddddddddd\nfeature/a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-z\tcccccccccccccccccccccccccccccccccccccccc\nclaude/lab\tcccccccccccccccccccccccccccccccccccccccc\n", "master", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dddddddddddddddddddddddddddddddddddddddd\tmaster\n");
+    assert lab_test_plan("claude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\n", "dev,feature/*", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "cccccccccccccccccccccccccccccccccccccccc\tfeature/a\n");
+    assert lab_test_plan("refs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-z\tcccccccccccccccccccccccccccccccccccccccc\nmaster\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "");
+    assert lab_test_plan("", "master,claude/t27c-*", "cccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("dev\tdddddddddddddddddddddddddddddddddddddddd\nmain\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\nmaster\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dev,feature/*", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dddddddddddddddddddddddddddddddddddddddd\tdev\ncccccccccccccccccccccccccccccccccccccccc\tfeature/a\n");
+    assert lab_test_plan("feature/a\tdddddddddddddddddddddddddddddddddddddddd\nclaude/gen-zig\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\tdddddddddddddddddddddddddddddddddddddddd\n", "master,claude/t27c-*", "cccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dddddddddddddddddddddddddddddddddddddddd\tclaude/t27c-a\n");
+    assert lab_test_plan("feature/a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "master,main,claude/*", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_plan("claude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndev\tdddddddddddddddddddddddddddddddddddddddd\nclaude/gen-zig\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-z\tcccccccccccccccccccccccccccccccccccccccc\n", "*", "", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/gen-zig\tclaude/t27c-b\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/t27c-a\ncccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-y\tclaude/t27c-z\ndddddddddddddddddddddddddddddddddddddddd\tdev\n");
+    assert lab_test_plan("claude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrefs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndev\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dev,feature/*", "", "", "dddddddddddddddddddddddddddddddddddddddd\tdev\n");
+    assert lab_test_plan("claude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\nmain\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-b\tcccccccccccccccccccccccccccccccccccccccc\n", "claude/t27c-*,master", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-b\tclaude/t27c-x\tclaude/t27c-y\n");
+    assert lab_test_plan("claude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-b\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmain\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-a\tcccccccccccccccccccccccccccccccccccccccc\n", "claude/t27c-*", "", "dddddddddddddddddddddddddddddddddddddddd\n", "cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-a\tclaude/t27c-y\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/t27c-b\tclaude/t27c-z\n");
+    assert lab_test_plan("refs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndev\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "master,main,claude/*", "cccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a\n");
+}
+
+// >>> pinned table: plan_plan
+// <<< pinned table: plan_stale
+// stale_dropped(queue, heads): a queued commit survives when some watched head points at it or it was asked for by hand.
+test lab_py_table_stale_dropped {
+    assert lab_test_stale("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\n", "claude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfeature/a\tdddddddddddddddddddddddddddddddddddddddd\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\n");
+    assert lab_test_stale("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\tasked\n", "main\tdddddddddddddddddddddddddddddddddddddddd\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\ndev\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\tasked\n");
+    assert lab_test_stale("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\n", "", "dddddddddddddddddddddddddddddddddddddddd\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "claude/t27c-y\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/lab\tdddddddddddddddddddddddddddddddddddddddd\nrefs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "cccccccccccccccccccccccccccccccccccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\ndddddddddddddddddddddddddddddddddddddddd\n", "claude/gen-zig\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-z\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\ndev\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\ndddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\ndddddddddddddddddddddddddddddddddddddddd\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\tasked\n", "claude/t27c-a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrefs/pull/1/head\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\tasked\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\n", "claude/t27c-a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/lab\tdddddddddddddddddddddddddddddddddddddddd\n", "");
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\tasked\n", "claude/gen-zig\tdddddddddddddddddddddddddddddddddddddddd\nfeature/a\tcccccccccccccccccccccccccccccccccccccccc\ndev\tcccccccccccccccccccccccccccccccccccccccc\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\ncccccccccccccccccccccccccccccccccccccccc\tasked\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\n", "refs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\tasked\n", "dev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ndddddddddddddddddddddddddddddddddddddddd\tasked\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\n", "claude/t27c-b\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "cccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\ncccccccccccccccccccccccccccccccccccccccc\tasked\ndddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", "", "dddddddddddddddddddddddddddddddddddddddd\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\ncccccccccccccccccccccccccccccccccccccccc\tasked\n");
+    assert lab_test_stale("", "claude/t27c-y\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-b\tcccccccccccccccccccccccccccccccccccccccc\nmain\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n", "claude/gen-zig\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n", "main\tdddddddddddddddddddddddddddddddddddddddd\n", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\n", "claude/gen-zig\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\n");
+    assert lab_test_stale("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\n", "claude/t27c-z\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/gen-zig\tdddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\tasked\ndddddddddddddddddddddddddddddddddddddddd\n", "claude/t27c-a\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\tasked\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "master\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-a\tdddddddddddddddddddddddddddddddddddddddd\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\ncccccccccccccccccccccccccccccccccccccccc\n", "claude/lab\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-z\tcccccccccccccccccccccccccccccccccccccccc\nmaster\tdddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\ncccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", "claude/t27c-y\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfeature/a\tdddddddddddddddddddddddddddddddddddddddd\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\ndddddddddddddddddddddddddddddddddddddddd\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dev\tdddddddddddddddddddddddddddddddddddddddd\n", "dddddddddddddddddddddddddddddddddddddddd\ndddddddddddddddddddddddddddddddddddddddd\tasked\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\n");
+    assert lab_test_stale("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccccccccccccccccccccccc\tasked\ncccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\ndddddddddddddddddddddddddddddddddddddddd\n", "dev\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\tasked\ncccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n", "refs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-b\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-x\tdddddddddddddddddddddddddddddddddddddddd\n", "cccccccccccccccccccccccccccccccccccccccc\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\ncccccccccccccccccccccccccccccccccccccccc\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", "", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\n");
+    assert lab_test_stale("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\ncccccccccccccccccccccccccccccccccccccccc\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/lab\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\n", "cccccccccccccccccccccccccccccccccccccccc\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\tasked\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\n", "claude/t27c-x\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-y\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaster\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "cccccccccccccccccccccccccccccccccccccccc\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    assert lab_test_stale("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\ndddddddddddddddddddddddddddddddddddddddd\tasked\ndddddddddddddddddddddddddddddddddddddddd\tasked\ndddddddddddddddddddddddddddddddddddddddd\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n", "refs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "dddddddddddddddddddddddddddddddddddddddd\tasked\ndddddddddddddddddddddddddddddddddddddddd\tasked\n");
+    assert lab_test_stale("", "claude/lab\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "");
+    assert lab_test_stale("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\ndddddddddddddddddddddddddddddddddddddddd\tasked\n", "", "dddddddddddddddddddddddddddddddddddddddd\tasked\n");
+    assert lab_test_stale("dddddddddddddddddddddddddddddddddddddddd\tasked\ncccccccccccccccccccccccccccccccccccccccc\tasked\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\ncccccccccccccccccccccccccccccccccccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "claude/lab\tdddddddddddddddddddddddddddddddddddddddd\nrefs/pull/1/head\tdddddddddddddddddddddddddddddddddddddddd\ndev\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nclaude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "dddddddddddddddddddddddddddddddddddddddd\tasked\ncccccccccccccccccccccccccccccccccccccccc\tasked\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    assert lab_test_stale("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n", "claude/t27c-a\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-b\tcccccccccccccccccccccccccccccccccccccccc\nclaude/t27c-x\tcccccccccccccccccccccccccccccccccccccccc\nrefs/pull/1/head\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccccccccccccccccccccccc\n");
+    assert lab_test_stale("cccccccccccccccccccccccccccccccccccccccc\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "claude/t27c-x\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-z\tdddddddddddddddddddddddddddddddddddddddd\nfeature/a\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nclaude/t27c-b\tdddddddddddddddddddddddddddddddddddddddd\n", "cccccccccccccccccccccccccccccccccccccccc\tasked\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndddddddddddddddddddddddddddddddddddddddd\tasked\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+}
+
+// >>> pinned table: plan_stale
+// <<< pinned table: plan_item_has
+// run_item(): `"master" in item["branches"]` (and any other name) over the items of the plans above.
+test lab_py_table_item_has_branch {
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab", "master", false);
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab", "claude/t27c-x", false);
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab", "mast", false);
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab", "", false);
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tclaude/lab", "master ", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a", "master", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a", "claude/t27c-x", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a", "mast", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a", "", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-a", "master ", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tmaster", "master", true);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tmaster", "claude/t27c-x", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tmaster", "mast", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tmaster", "", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tmaster", "master ", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head", "master", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head", "claude/t27c-x", true);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head", "mast", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head", "", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-x\tfeature/a\trefs/pull/1/head", "master ", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y", "master", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y", "claude/t27c-x", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y", "mast", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y", "", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-y", "master ", false);
+    assert lab_test_item_has("dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig", "master", false);
+    assert lab_test_item_has("dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig", "claude/t27c-x", false);
+    assert lab_test_item_has("dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig", "mast", false);
+    assert lab_test_item_has("dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig", "", false);
+    assert lab_test_item_has("dddddddddddddddddddddddddddddddddddddddd\tclaude/gen-zig", "master ", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b", "master", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b", "claude/t27c-x", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b", "mast", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b", "", false);
+    assert lab_test_item_has("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tclaude/t27c-b", "master ", false);
+    assert lab_test_item_has("cccccccccccccccccccccccccccccccccccccccc\tclaude/t27c-y", "master", false);
+    assert lab_test_item_has("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "master", false);
+}
+
+// >>> pinned table: plan_item_has
+
+// Scenario: `*` and `?` cross `/` and a line break (the regex is DOTALL); `[!x]` takes them too. Checked on Python.
+test the_star_and_the_question_mark_cross_slashes_and_line_breaks {
+    assert lab_fnmatch("a?b", 0, 3, "a\nb", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("a*", 0, 2, "a\nb", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("*", 0, 1, "a\nb", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("a[!x]b", 0, 6, "a\nb", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("a?b", 0, 3, "a/b", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("a[/]b", 0, 5, "a/b", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("", 0, 0, "", 0, 0) == LAB_FN_YES;
+    assert lab_fnmatch("", 0, 0, "a", 0, 1) == LAB_FN_NO;
+    assert lab_fnmatch("?", 0, 1, "", 0, 0) == LAB_FN_NO;
+}
+
+// Scenario: a character is a code point. `?` takes all of e-acute (2 bytes), a euro sign (3) and a face (4); `??` does not take
+// one; a class holds a character by its code point and a range reaches U+00FF but not U+0100. Checked on Python.
+test a_character_is_a_code_point_not_a_byte {
+    var eacute : [2]u8 = undefined;
+    eacute[0] = 195;
+    eacute[1] = 169;
+    assert lab_fnmatch("?", 0, 1, &eacute, 0, 2) == LAB_FN_YES;
+    assert lab_fnmatch("??", 0, 2, &eacute, 0, 2) == LAB_FN_NO;
+    assert lab_fnmatch("*", 0, 1, &eacute, 0, 2) == LAB_FN_YES;
+    var cls : [4]u8 = undefined;
+    cls[0] = 91;
+    cls[1] = 195;
+    cls[2] = 169;
+    cls[3] = 93;
+    assert lab_fnmatch(&cls, 0, 4, &eacute, 0, 2) == LAB_FN_YES;
+    assert lab_fnmatch(&cls, 0, 4, "e", 0, 1) == LAB_FN_NO;
+    var neg : [5]u8 = undefined;
+    neg[0] = 91;
+    neg[1] = 33;
+    neg[2] = 195;
+    neg[3] = 169;
+    neg[4] = 93;
+    assert lab_fnmatch(&neg, 0, 5, &eacute, 0, 2) == LAB_FN_NO;
+    assert lab_fnmatch(&neg, 0, 5, "e", 0, 1) == LAB_FN_YES;
+    var euro : [3]u8 = undefined;
+    euro[0] = 226;
+    euro[1] = 130;
+    euro[2] = 172;
+    assert lab_fnmatch("?", 0, 1, &euro, 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("??", 0, 2, &euro, 0, 3) == LAB_FN_NO;
+    var face : [4]u8 = undefined;
+    face[0] = 240;
+    face[1] = 159;
+    face[2] = 152;
+    face[3] = 128;
+    assert lab_fnmatch("?", 0, 1, &face, 0, 4) == LAB_FN_YES;
+    assert lab_fnmatch("*?", 0, 2, &face, 0, 4) == LAB_FN_YES;
+    var rng : [6]u8 = undefined;
+    rng[0] = 91;
+    rng[1] = 97;
+    rng[2] = 45;
+    rng[3] = 195;
+    rng[4] = 191;
+    rng[5] = 93;
+    assert lab_fnmatch(&rng, 0, 6, &eacute, 0, 2) == LAB_FN_YES;
+    var a_grave : [2]u8 = undefined;
+    a_grave[0] = 196;
+    a_grave[1] = 128;
+    assert lab_fnmatch(&rng, 0, 6, &a_grave, 0, 2) == LAB_FN_NO;
+}
+
+// Scenario (negative control, NOT Python): a range that runs backwards is refused, wherever it is and whatever the name is.
+// Python gives such a class no members at all (`[z-a]` takes neither z nor a), and a second range after it can move which
+// ends are dropped; the port refuses the glob rather than answer. A glob after the match is not tried, as in Python.
+test a_backwards_range_is_refused_not_answered_differently {
+    assert lab_fnmatch("[z-a]", 0, 5, "z", 0, 1) == LAB_FN_REFUSED;
+    assert lab_fnmatch("[z-a]", 0, 5, "a", 0, 1) == LAB_FN_REFUSED;
+    assert lab_fnmatch("[bz-a]", 0, 6, "b", 0, 1) == LAB_FN_REFUSED;
+    assert lab_fnmatch("x[9-0]y", 0, 7, "x5y", 0, 3) == LAB_FN_REFUSED;
+    assert lab_fnmatch("[!z-a]", 0, 6, "q", 0, 1) == LAB_FN_REFUSED;
+    assert lab_fnmatch("a-z", 0, 3, "a-z", 0, 3) == LAB_FN_YES;
+    assert lab_fnmatch("[a-a]", 0, 5, "a", 0, 1) == LAB_FN_YES;
+    assert lab_fnmatch("[a-b-c]", 0, 7, "c", 0, 1) == LAB_FN_YES;
+    assert lab_fnmatch("[a-]", 0, 4, "a", 0, 1) == LAB_FN_YES;
+    assert lab_glob_ok("[z-a]", 0, 5) == false;
+    assert lab_glob_ok("[a-z]", 0, 5) == true;
+    assert lab_glob_ok("[z-a", 0, 4) == true;
+    assert lab_watch_ok("master,[z-a]") == false;
+    assert lab_watch_ok("master, ,claude/*") == true;
+    assert lab_watched("master", 0, 6, "master,[z-a]") == 0;
+    assert lab_watched("main", 0, 4, "master,[z-a]") == LAB_WATCH_BAD;
+    assert lab_watched("main", 0, 4, "[z-a],main") == LAB_WATCH_BAD;
+}
+
+// Scenario: a writer reports the length it needs when the buffer is short, and writes what fits.
+test a_short_buffer_still_gets_the_length {
+    const h : string = "master\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    var out : [8]u8 = undefined;
+    assert lab_plan(h, "master", "", "", &out, 8, 0) == 48;
+    assert span_is(&out, 0, 8, "aaaaaaaa");
+    assert lab_plan(h, "master", "", "", &out, 8, 5) == 53;
+    assert lab_plan(h, "[z-a]", "", "", &out, 8, 0) == LAB_NO;
+    assert lab_parse_heads("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n", &out, 8, 0) == 48;
+    assert lab_stale_dropped("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n", "", &out, 8, 0) == 47;
+    assert lab_stale_dropped("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tasked\n", "", &out, 8, 3) == 50;
+}
+
+// Scenario: the watch text is cut at commas and stripped of Unicode spaces, as Python's strip() does (a no-break space is one).
+test a_glob_is_stripped_of_unicode_spaces {
+    var v : [10]u8 = undefined;
+    v[0] = 194;
+    v[1] = 160;
+    v[2] = 109;
+    v[3] = 97;
+    v[4] = 115;
+    v[5] = 116;
+    v[6] = 101;
+    v[7] = 114;
+    v[8] = 194;
+    v[9] = 160;
+    assert lab_watched("master", 0, 6, &v) == 0;
+    assert lab_watched("xx master yy", 3, 9, "master") == 0;
+    assert lab_watched("xx master yy", 3, 8, "master") == LAB_WATCH_NONE;
+}
+
+// Scenario: a head line is `<sha> TAB refs/heads/<branch>`: the offset of the branch comes back, and a line that is not one is no head.
+test the_branch_of_a_head_line_is_found_by_its_offset {
+    const l : string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/claude/x";
+    assert lab_ls_branch(l, 0, l.len) == 52;
+    assert lab_ls_branch(l, 0, 51) == LAB_NO;
+    assert lab_ls_branch(l, 0, 52) == 52;
+    assert lab_ls_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/", 0, 52) == 52;
+    assert lab_ls_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1", 0, 53) == LAB_NO;
+    assert lab_ls_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x", 0, 51) == LAB_NO;
+    assert lab_ls_branch("", 0, 0) == LAB_NO;
+}
