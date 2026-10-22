@@ -1,0 +1,2073 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/lab/lab_t27b_report.t27 -- how the t27b lab reads what `t27c test-report` and `cargo test` print, and how it sums
+; a run (issue #11042, epic #11040: the lab's decisions in .t27, pure functions that any host or job node can run).
+; --
+; The oracle is contrib/railway/t27b-lab/lab.py until the cutover. It is imported unedited, and every table at the end of
+; this file was computed by running its own functions (python3), on small texts written for the table: the real shapes
+; of `t27c test-report` (a pass; a fail with a vacuous pass; a spec that does not compile; a machine with no zig), then
+; cases that break each rule on its edge. No case has a host, a token or a path outside specs/.
+; --
+; PORTED, lab.py name -> here (a verdict is steward.t27's code: pass 0, blocked 2, fail 5, timeout 8, lab_error 11):
+;   parse_test_report        lr_report_verdict, lr_report_detail
+;   parse_test_verdicts      lr_verdicts (a table of three words a test), lr_table_text
+;   disagreements            lr_disagreements (names in Python's order, one line each)
+;   parse_cargo_test         lr_cargo_totals
+;   reference_one, once the process has ended   lr_ref_verdict, lr_ref_detail, lr_over_detail, lr_spawn_detail, lr_keeps_tests
+;   lab_run's summary block  lr_summary_field, lr_put_summary, lr_put_reference_summary, lr_summary_crash
+; LEFT OUT, and why: starting t27c with a timeout and a scratch directory, the worker pool and the cache file (they run
+; processes and touch the disk: the runtime, #11040 L3); the cache rules are in lab_t27b_cache.t27.
+; --
+; WHAT THE TEXT RULES ARE. Lines are str.splitlines (ten breaks), blank and stripped lines use str.isspace (thirty
+; spaces) and `[:300]` counts characters: all three come from specs/lab/text.t27 (LabText), read there off Python 3.14.
+; The regex `\s*(tests|FAIL)\s+(\d+)\s*$` of parse_test_report is lr_count_from, once per key. The last `tests N` and the
+; last `FAIL N` win, as in lab.py's dict; the first line whose stripped text starts with BLOCKED wins over every count.
+; --
+; WHERE THE SPEC DIFFERS FROM THE PYTHON, each pinned by a test below:
+;   - a count above 18446744073709551615 reads as that number (Python's int has no ceiling); only a detail that prints
+;     such a count differs, and a verdict never does
+;   - \d and \w are the ASCII classes, so a Unicode digit or letter is not one (cargo's words and t27c's counts are ASCII)
+;   - a table wider than the caller's buffer is no table (Python has no limit); lr_verdicts says so with LR_NONE
+; WHAT THE PORT FOUND IN lab.py, reproduced and not repaired (the spec states what the Python does):
+;   - lab_run reads r["reference"] of every merged result before it builds the summary, so a run in which the reference
+;     step produced nothing for some file raises KeyError and is never published: lr_summary_crash is that condition
+;   - run() keeps at most the last 2001 to 4000 lines of a command's output (it drops the oldest 2000 whenever the list
+;     passes 4000), so parse_cargo_test sums a long cargo run from its tail
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LabT27bReport;
+
+use lab::text::{LAB_NO, lab_line_end, lab_line_next, lab_strip_from, lab_strip_to, lab_lit_at, lab_has_lit, lab_same_span, lab_span_cmp, lab_cut_chars, lab_put_span, lab_put_lit, lab_put_count};
+use lab::lab_t27b_text::{LX_BIG, lx_is_word, lx_digits_end, lx_dec_value, lx_add_sat, lx_uline_end, lx_ubreak_len, lx_put_idec, lx_out_is};
+use tri::t27b::ledger_steward::T_PASS;
+use tri::t27b::ledger_steward::T_PASS_VACUOUS;
+use tri::t27b::ledger_steward::T_BLOCKED;
+use tri::t27b::ledger_steward::T_FRONTEND;
+use tri::t27b::ledger_steward::T_CODEGEN;
+use tri::t27b::ledger_steward::T_FAIL;
+use tri::t27b::ledger_steward::T_MISMATCH;
+use tri::t27b::ledger_steward::T_CRASH;
+use tri::t27b::ledger_steward::T_TIMEOUT;
+use tri::t27b::ledger_steward::T_NOT_RUN;
+use tri::t27b::ledger_steward::T_MISSING;
+
+/// "No such table", and the null of a summary field: the answers that are not a count.
+pub const LR_NONE : u32 = 4294967295;
+pub const LR_NULL : u64 = 18446744073709551615;
+
+/// steward.t27's verdict code 11: the lab could not run the reference (no verdict either way).
+pub const T_LAB_ERROR : u8 = 11;
+/// A word that is none of the twelve verdict words.
+pub const LR_UNKNOWN : u8 = 255;
+
+/// A detail is cut at this many characters: lab.py's [:300].
+pub const LR_DETAIL_MAX : usize = 300;
+
+pub const LR_WORDS : [12]string = ["pass", "pass_vacuous", "blocked", "frontend", "codegen", "fail", "mismatch", "crash", "timeout", "not run", "missing", "lab_error"];
+
+/// The verdict word of a code; "" for a code out of range.
+pub fn lr_word(code : u8) -> string {
+    if (code >= 12) { return ""; }
+    return LR_WORDS[code as usize];
+}
+
+/// The code of the verdict word t[a..b] (steward.t27's numbering); LR_UNKNOWN for any other text.
+pub fn lr_word_code(t : string, a : usize, b : usize) -> u8 {
+    var k : usize = 0;
+    while (k < 12) {
+        if (lab_same_span(t, a, b, LR_WORDS[k], 0, LR_WORDS[k].len)) { return k as u8; }
+        k = k + 1;
+    }
+    return LR_UNKNOWN;
+}
+
+/// A line that is `\s*key\s+DIGITS\s*$`: where the digits start; e + 1 when the line is not that.
+/// t[at..e] is the line.
+pub fn lr_count_from(t : string, at : usize, e : usize, key : string) -> usize {
+    const a : usize = lab_strip_from(t, at, e);
+    if (lab_lit_at(t, a, e, key) == false) { return e + 1; }
+    const j : usize = a + key.len;
+    const k : usize = lab_strip_from(t, j, e);
+    if (k == j) { return e + 1; }
+    const d : usize = lx_digits_end(t, k, e);
+    if (d == k) { return e + 1; }
+    if (lab_strip_from(t, d, e) != e) { return e + 1; }
+    return k;
+}
+
+/// Reads a report as parse_test_report does. st[0] and st[1] are the span of the BLOCKED detail of the
+/// first line whose stripped text starts with BLOCKED (st[0] is LX_BIG when no line does); st[2] says a
+/// `tests N` line was read and st[3] is the last N; st[4] and st[5] are the same for `FAIL N`.
+pub fn lr_scan(t : string, st : []u64) -> void {
+    st[0] = LX_BIG;
+    st[1] = 0;
+    st[2] = 0;
+    st[3] = 0;
+    st[4] = 0;
+    st[5] = 0;
+    var at : usize = 0;
+    while (at < t.len) {
+        const e : usize = lab_line_end(t, at);
+        const a : usize = lab_strip_from(t, at, e);
+        const b : usize = lab_strip_to(t, a, e);
+        if (lab_lit_at(t, a, b, "BLOCKED") and st[0] == LX_BIG) {
+            const f : usize = lab_strip_from(t, a + 7, b);
+            st[0] = f as u64;
+            st[1] = lab_cut_chars(t, f, b, LR_DETAIL_MAX) as u64;
+        }
+        const ft : usize = lr_count_from(t, at, e, "tests");
+        if (ft <= e) {
+            st[2] = 1;
+            st[3] = lx_dec_value(t, ft, lx_digits_end(t, ft, e));
+        }
+        const ff : usize = lr_count_from(t, at, e, "FAIL");
+        if (ff <= e) {
+            st[4] = 1;
+            st[5] = lx_dec_value(t, ff, lx_digits_end(t, ff, e));
+        }
+        at = lab_line_next(t, e);
+    }
+}
+
+/// parse_test_report's verdict, as a steward.t27 code: T_PASS when it compiled and every test it ran
+/// passed (`tests` and `FAIL 0` both read), T_FAIL when `FAIL` is not 0, T_BLOCKED when a line says
+/// BLOCKED or the numbers cannot be read.
+pub fn lr_report_verdict(t : string) -> u8 {
+    var st : [6]u64 = undefined;
+    lr_scan(t, &st);
+    if (st[0] != LX_BIG) { return T_BLOCKED; }
+    if (st[2] == 1 and st[4] == 1 and st[5] == 0) { return T_PASS; }
+    if (st[2] == 1 and st[4] == 1) { return T_FAIL; }
+    return T_BLOCKED;
+}
+
+/// parse_test_report's second value, written at w: the BLOCKED line's rest, `F of T tests fail`, the
+/// unreadable words, or nothing for a pass.
+pub fn lr_report_detail(t : string, out : []u8, cap : usize, w : usize) -> usize {
+    var st : [6]u64 = undefined;
+    lr_scan(t, &st);
+    if (st[0] != LX_BIG) { return lab_put_span(out, cap, w, t, st[0] as usize, st[1] as usize); }
+    if (st[2] == 1 and st[4] == 1 and st[5] == 0) { return w; }
+    if (st[2] == 1 and st[4] == 1) {
+        var x : usize = lab_put_count(out, cap, w, st[5]);
+        x = lab_put_lit(out, cap, x, " of ");
+        x = lab_put_count(out, cap, x, st[3]);
+        return lab_put_lit(out, cap, x, " tests fail");
+    }
+    return lab_put_lit(out, cap, w, "unreadable test-report output");
+}
+
+// ---- parse_test_verdicts: the per-test table ----
+; A table is a caller's []u32 of three words per test: where the name starts and ends in the report text,
+; and 1 when the test passed. Names are unique, in the order they first appear; a name that comes again
+; keeps its place and takes the new verdict (a dict's order and last write). cap is the number of tests
+; the buffer holds.
+
+/// parse_test_verdicts: the number of tests of the verbose report t, or LR_NONE when the list could be
+/// partial: no `--- test report:` line, a line after it that is neither `pass  name` nor `FAIL  name`
+/// before the blank one, no `tests N` line, a count that is not the number of names, or a table wider
+/// than cap.
+pub fn lr_verdicts(t : string, tab : []u32, cap : usize) -> u32 {
+    var at : usize = 0;
+    var found : bool = false;
+    while (at < t.len and found == false) {
+        const e : usize = lab_line_end(t, at);
+        if (lab_lit_at(t, at, e, "--- test report:")) { found = true; }
+        at = lab_line_next(t, e);
+    }
+    if (found == false) { return LR_NONE; }
+    var n : usize = 0;
+    var done : bool = false;
+    while (at < t.len and done == false) {
+        const e : usize = lab_line_end(t, at);
+        const a : usize = lab_strip_from(t, at, e);
+        if (a == e) {
+            done = true;
+        } else {
+            var ok : u32 = 0;
+            if (lab_lit_at(t, a, e, "pass  ")) {
+                ok = 1;
+            } else {
+                if (lab_lit_at(t, a, e, "FAIL  ") == false) { return LR_NONE; }
+            }
+            var j : usize = 0;
+            var at_j : usize = n;
+            while (j < n) {
+                if (lab_same_span(t, tab[3 * j] as usize, tab[3 * j + 1] as usize, t, a + 6, e)) { at_j = j; }
+                j = j + 1;
+            }
+            if (at_j == n) {
+                if (n >= cap) { return LR_NONE; }
+                tab[3 * n] = (a + 6) as u32;
+                tab[3 * n + 1] = e as u32;
+                n = n + 1;
+            }
+            tab[3 * at_j + 2] = ok;
+            at = lab_line_next(t, e);
+        }
+    }
+    var total : u64 = LX_BIG;
+    var has_total : bool = false;
+    var s : usize = 0;
+    while (s < t.len and has_total == false) {
+        const e : usize = lab_line_end(t, s);
+        const f : usize = lr_count_from(t, s, e, "tests");
+        if (f <= e) {
+            has_total = true;
+            total = lx_dec_value(t, f, lx_digits_end(t, f, e));
+        }
+        s = lab_line_next(t, e);
+    }
+    if (has_total == false) { return LR_NONE; }
+    if (total != (n as u64)) { return LR_NONE; }
+    return n as u32;
+}
+
+// ---- disagreements: where two tables differ ----
+
+/// Compares name i of table a (side 1) or b (side 2) with name j of table a or b: -1, 0 or 1.
+pub fn lr_name_cmp(a : string, at : []const u32, b : string, bt : []const u32, s1 : u8, i : usize, s2 : u8, j : usize) -> i32 {
+    var t1 : string = a;
+    var f1 : u32 = at[3 * i];
+    var e1 : u32 = at[3 * i + 1];
+    if (s1 == 2) {
+        t1 = b;
+        f1 = bt[3 * i];
+        e1 = bt[3 * i + 1];
+    }
+    var t2 : string = a;
+    var f2 : u32 = at[3 * j];
+    var e2 : u32 = at[3 * j + 1];
+    if (s2 == 2) {
+        t2 = b;
+        f2 = bt[3 * j];
+        e2 = bt[3 * j + 1];
+    }
+    return lab_span_cmp(t1, f1 as usize, e1 as usize, t2, f2 as usize, e2 as usize);
+}
+
+/// The index in table b (or a) of the test named like name i of the other table; LAB_NO when it has none.
+pub fn lr_name_in(a : string, at : []const u32, an : usize, b : string, bt : []const u32, bn : usize, from_a : bool, i : usize) -> usize {
+    var j : usize = 0;
+    if (from_a) {
+        while (j < bn) {
+            if (lab_same_span(a, at[3 * i] as usize, at[3 * i + 1] as usize, b, bt[3 * j] as usize, bt[3 * j + 1] as usize)) { return j; }
+            j = j + 1;
+        }
+        return LAB_NO;
+    }
+    while (j < an) {
+        if (lab_same_span(b, bt[3 * i] as usize, bt[3 * i + 1] as usize, a, at[3 * j] as usize, at[3 * j + 1] as usize)) { return j; }
+        j = j + 1;
+    }
+    return LAB_NO;
+}
+
+/// The word of a test's verdict in a message: pass, or FAIL.
+pub fn lr_ok_word(ok : u32) -> string {
+    if (ok == 1) { return "pass"; }
+    return "FAIL";
+}
+
+/// disagreements(t27b, reference): one line per test whose verdict differs, or that only one side ran,
+/// in name order, each ended by a newline. a is the t27b table (text a, an tests), b the reference's.
+pub fn lr_disagreements(a : string, at : []const u32, an : usize, b : string, bt : []const u32, bn : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var have : bool = false;
+    var ls : u8 = 0;
+    var li : usize = 0;
+    var step : usize = 0;
+    var finished : bool = false;
+    while (step < an + bn and finished == false) {
+        var bs : u8 = 0;
+        var bi : usize = 0;
+        var i : usize = 0;
+        while (i < an) {
+            var later : bool = true;
+            if (have) { later = lr_name_cmp(a, at, b, bt, 1, i, ls, li) > 0; }
+            if (later) {
+                if (bs == 0 or lr_name_cmp(a, at, b, bt, 1, i, bs, bi) < 0) {
+                    bs = 1;
+                    bi = i;
+                }
+            }
+            i = i + 1;
+        }
+        var j : usize = 0;
+        while (j < bn) {
+            var later : bool = true;
+            if (have) { later = lr_name_cmp(a, at, b, bt, 2, j, ls, li) > 0; }
+            if (later) {
+                if (bs == 0 or lr_name_cmp(a, at, b, bt, 2, j, bs, bi) < 0) {
+                    bs = 2;
+                    bi = j;
+                }
+            }
+            j = j + 1;
+        }
+        if (bs == 0) {
+            finished = true;
+        } else {
+            var ia : usize = LAB_NO;
+            var jb : usize = LAB_NO;
+            var nf : usize = 0;
+            var nt : usize = 0;
+            if (bs == 1) {
+                ia = bi;
+                jb = lr_name_in(a, at, an, b, bt, bn, true, bi);
+                nf = at[3 * bi] as usize;
+                nt = at[3 * bi + 1] as usize;
+            } else {
+                jb = bi;
+                ia = lr_name_in(a, at, an, b, bt, bn, false, bi);
+                nf = bt[3 * bi] as usize;
+                nt = bt[3 * bi + 1] as usize;
+            }
+            var src : string = a;
+            if (bs == 2) { src = b; }
+            if (ia != LAB_NO and jb != LAB_NO) {
+                if (at[3 * ia + 2] != bt[3 * jb + 2]) {
+                    w = lab_put_span(out, cap, w, src, nf, nt);
+                    w = lab_put_lit(out, cap, w, ": t27b ");
+                    w = lab_put_lit(out, cap, w, lr_ok_word(at[3 * ia + 2]));
+                    w = lab_put_lit(out, cap, w, ", reference ");
+                    w = lab_put_lit(out, cap, w, lr_ok_word(bt[3 * jb + 2]));
+                    w = lab_put_lit(out, cap, w, "\n");
+                }
+            } else {
+                if (ia != LAB_NO) {
+                    w = lab_put_span(out, cap, w, src, nf, nt);
+                    w = lab_put_lit(out, cap, w, ": t27b ");
+                    w = lab_put_lit(out, cap, w, lr_ok_word(at[3 * ia + 2]));
+                    w = lab_put_lit(out, cap, w, ", reference has no such test\n");
+                } else {
+                    w = lab_put_span(out, cap, w, src, nf, nt);
+                    w = lab_put_lit(out, cap, w, ": t27b has no such test, reference ");
+                    w = lab_put_lit(out, cap, w, lr_ok_word(bt[3 * jb + 2]));
+                    w = lab_put_lit(out, cap, w, "\n");
+                }
+            }
+            have = true;
+            ls = bs;
+            li = bi;
+        }
+        step = step + 1;
+    }
+    return w;
+}
+
+// ---- parse_cargo_test: the totals of a cargo test run ----
+
+/// Does a `test result: WORD. P passed; F failed; I ignored` begin at t[p]? Where the ignored count ends,
+/// or LAB_NO. The numbers start at the offsets written into num[0..6): P from and to, F, I.
+pub fn lr_cargo_at(t : string, p : usize, e : usize, num : []usize) -> usize {
+    if (lab_lit_at(t, p, e, "test result: ") == false) { return LAB_NO; }
+    var q : usize = p + 13;
+    while (q < e and lx_is_word(t[q])) {
+        q = q + 1;
+    }
+    if (q == p + 13) { return LAB_NO; }
+    if (lab_lit_at(t, q, e, ". ") == false) { return LAB_NO; }
+    q = q + 2;
+    var k : usize = 0;
+    while (k < 3) {
+        const d : usize = lx_digits_end(t, q, e);
+        if (d == q) { return LAB_NO; }
+        num[2 * k] = q;
+        num[2 * k + 1] = d;
+        q = d;
+        if (k == 0) {
+            if (lab_lit_at(t, q, e, " passed; ") == false) { return LAB_NO; }
+            q = q + 9;
+        }
+        if (k == 1) {
+            if (lab_lit_at(t, q, e, " failed; ") == false) { return LAB_NO; }
+            q = q + 9;
+        }
+        if (k == 2) {
+            if (lab_lit_at(t, q, e, " ignored") == false) { return LAB_NO; }
+            q = q + 8;
+        }
+        k = k + 1;
+    }
+    return q;
+}
+
+/// parse_cargo_test over the output t (lines as a text-mode read gives them): tot[0] passed, tot[1] failed,
+/// tot[2] ignored, tot[3] suites, summed over every line that holds a result line anywhere in it.
+pub fn lr_cargo_totals(t : string, tot : []u64) -> void {
+    tot[0] = 0;
+    tot[1] = 0;
+    tot[2] = 0;
+    tot[3] = 0;
+    var num : [6]usize = undefined;
+    var at : usize = 0;
+    while (at < t.len) {
+        const e : usize = lx_uline_end(t, at);
+        var p : usize = at;
+        var hit : bool = false;
+        while (p < e and hit == false) {
+            if (lr_cargo_at(t, p, e, &num) != LAB_NO) { hit = true; }
+            p = p + 1;
+        }
+        if (hit) {
+            tot[3] = lx_add_sat(tot[3], 1);
+            tot[0] = lx_add_sat(tot[0], lx_dec_value(t, num[0], num[1]));
+            tot[1] = lx_add_sat(tot[1], lx_dec_value(t, num[2], num[3]));
+            tot[2] = lx_add_sat(tot[2], lx_dec_value(t, num[4], num[5]));
+        }
+        at = e + lx_ubreak_len(t, e);
+    }
+}
+
+// ---- reference_one: the verdict of one run of `t27c test-report <file> --verbose` ----
+
+/// Did the run say it ran out of threads or processes: that is the lab's limit, not the spec's.
+pub fn lr_ref_resource(stderr : string) -> bool {
+    if (lab_has_lit(stderr, 0, stderr.len, "Resource temporarily unavailable")) { return true; }
+    return lab_has_lit(stderr, 0, stderr.len, "SystemResources");
+}
+
+/// reference_one after the process ended with exit code rc: T_LAB_ERROR when stderr names a resource
+/// limit, T_BLOCKED when rc is not 0 (a negative rc is a signal), else what the report says.
+pub fn lr_ref_verdict(rc : i32, stderr : string, stdout : string) -> u8 {
+    if (lr_ref_resource(stderr)) { return T_LAB_ERROR; }
+    if (rc != 0) { return T_BLOCKED; }
+    return lr_report_verdict(stdout);
+}
+
+/// reference_one's detail, written at w: the resource sentence, `t27c test-report exited RC: ` and the first
+/// line of the stripped stderr, all cut at 300 characters, or the report's own detail.
+pub fn lr_ref_detail(rc : i32, stderr : string, stdout : string, out : []u8, cap : usize, w : usize) -> usize {
+    if (lr_ref_resource(stderr)) { return lab_put_lit(out, cap, w, "zig ran out of threads/processes in the container"); }
+    if (rc == 0) { return lr_report_detail(stdout, out, cap, w); }
+    var x : usize = lab_put_lit(out, cap, w, "t27c test-report exited ");
+    x = lx_put_idec(out, cap, x, rc as i64);
+    x = lab_put_lit(out, cap, x, ": ");
+    const s0 : usize = lab_strip_from(stderr, 0, stderr.len);
+    const s1 : usize = lab_strip_to(stderr, s0, stderr.len);
+    var fe : usize = lab_line_end(stderr, s0);
+    if (fe > s1) { fe = s1; }
+    var room : usize = 0;
+    if (x - w < LR_DETAIL_MAX) { room = LR_DETAIL_MAX - (x - w); }
+    return lab_put_span(out, cap, x, stderr, s0, lab_cut_chars(stderr, s0, fe, room));
+}
+
+/// The detail of a reference run that outran its time: `over N s`.
+pub fn lr_over_detail(secs : u64, out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = lab_put_lit(out, cap, w, "over ");
+    x = lab_put_count(out, cap, x, secs);
+    return lab_put_lit(out, cap, x, " s");
+}
+
+/// The detail of a reference run that could not start: `could not start t27c: ` and the error, cut at 300.
+pub fn lr_spawn_detail(err : string, out : []u8, cap : usize, w : usize) -> usize {
+    const x : usize = lab_put_lit(out, cap, w, "could not start t27c: ");
+    return lab_put_span(out, cap, x, err, 0, lab_cut_chars(err, 0, err.len, LR_DETAIL_MAX - (x - w)));
+}
+
+/// Are the per-test verdicts kept for a reference result: only a pass or a fail, and only when the table was read.
+pub fn lr_keeps_tests(verdict : u8, table_read : bool) -> bool {
+    if (table_read == false) { return false; }
+    return verdict == T_PASS or verdict == T_FAIL;
+}
+
+// ---- the summary of a run ----
+; One row per result of the corpus, five words: the t27b verdict code, the reference verdict code (LR_NONE
+; when the lab has none for the file), 1 when the result carries `reference_disagree` (the per-test
+; comparison was made), how many tests it lists, and 1 when the result was retried after a timeout.
+; ref_nonempty says the lab's reference dict is not empty.
+
+pub const LR_SUMMARY_KEYS : [17]string = ["files", "reference_pass", "reference_lab_error", "t27b_pass", "t27b_pass_vacuous", "t27b_pass_where_reference_passes", "t27b_pass_vacuous_where_reference_passes", "t27b_pass_where_reference_does_not", "mismatch", "jit_interp_mismatch", "reference_compared", "reference_disagree", "reference_disagree_tests", "t27b_fail", "crash", "timeout", "timeout_retried"];
+
+/// lab.py reads r["reference"] of every merged result before it builds the summary: a result with no
+/// reference verdict raises KeyError there and the run is never published. True when that happens.
+pub fn lr_summary_crash(rows : []const u32, n : usize) -> bool {
+    var i : usize = 0;
+    while (i < n) {
+        if (rows[5 * i + 1] == LR_NONE) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Field k of the summary (LR_SUMMARY_KEYS), LR_NULL where lab.py writes null.
+pub fn lr_summary_field(rows : []const u32, n : usize, ref_nonempty : bool, k : usize) -> u64 {
+    var ref_pass : u64 = 0;
+    var lab_err : u64 = 0;
+    var t_pass : u64 = 0;
+    var t_vac : u64 = 0;
+    var t_pass_rp : u64 = 0;
+    var t_vac_rp : u64 = 0;
+    var t_pass_rn : u64 = 0;
+    var mism : u64 = 0;
+    var compared : u64 = 0;
+    var dis : u64 = 0;
+    var dis_t : u64 = 0;
+    var t_fail : u64 = 0;
+    var crash : u64 = 0;
+    var tmo : u64 = 0;
+    var retried : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const t : u32 = rows[5 * i];
+        const r : u32 = rows[5 * i + 1];
+        if (r == T_PASS as u32) {
+            ref_pass = ref_pass + 1;
+            if (t == T_PASS as u32) { t_pass_rp = t_pass_rp + 1; }
+            if (t == T_PASS_VACUOUS as u32) { t_vac_rp = t_vac_rp + 1; }
+        }
+        if (r == T_LAB_ERROR as u32) { lab_err = lab_err + 1; }
+        if (t == T_PASS as u32) {
+            t_pass = t_pass + 1;
+            if (r != T_PASS as u32) { t_pass_rn = t_pass_rn + 1; }
+        }
+        if (t == T_PASS_VACUOUS as u32) { t_vac = t_vac + 1; }
+        if (t == T_MISMATCH as u32) { mism = mism + 1; }
+        if (t == T_FAIL as u32) { t_fail = t_fail + 1; }
+        if (t == T_CRASH as u32) { crash = crash + 1; }
+        if (t == T_TIMEOUT as u32) { tmo = tmo + 1; }
+        if (rows[5 * i + 2] == 1) {
+            compared = compared + 1;
+            if (rows[5 * i + 3] > 0) { dis = dis + 1; }
+            dis_t = dis_t + (rows[5 * i + 3] as u64);
+        }
+        if (rows[5 * i + 4] == 1) { retried = retried + 1; }
+        i = i + 1;
+    }
+    if (k == 0) { return n as u64; }
+    if (k == 1) { if (ref_nonempty) { return ref_pass; } return LR_NULL; }
+    if (k == 2) { if (ref_nonempty) { return lab_err; } return LR_NULL; }
+    if (k == 3) { return t_pass; }
+    if (k == 4) { return t_vac; }
+    if (k == 5) { if (ref_nonempty) { return t_pass_rp; } return LR_NULL; }
+    if (k == 6) { if (ref_nonempty) { return t_vac_rp; } return LR_NULL; }
+    if (k == 7) { if (ref_nonempty) { return t_pass_rn; } return LR_NULL; }
+    if (k == 8 or k == 9) { return mism; }
+    if (k == 10) { return compared; }
+    if (k == 11) { if (compared > 0) { return dis; } return LR_NULL; }
+    if (k == 12) { if (compared > 0) { return dis_t; } return LR_NULL; }
+    if (k == 13) { return t_fail; }
+    if (k == 14) { return crash; }
+    if (k == 15) { return tmo; }
+    if (k == 16) { return retried; }
+    return LR_NULL;
+}
+
+/// The summary block as the run document holds it (json.dumps(doc, indent=1), a key that is followed by
+/// another): ` "summary": {`, one `  "key": value` line per field, ` },`.
+pub fn lr_put_summary(rows : []const u32, n : usize, ref_nonempty : bool, out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = lab_put_lit(out, cap, w, " \"summary\": {\n");
+    var k : usize = 0;
+    while (k < 17) {
+        x = lab_put_lit(out, cap, x, "  \"");
+        x = lab_put_lit(out, cap, x, LR_SUMMARY_KEYS[k]);
+        x = lab_put_lit(out, cap, x, "\": ");
+        const v : u64 = lr_summary_field(rows, n, ref_nonempty, k);
+        if (v == LR_NULL) {
+            x = lab_put_lit(out, cap, x, "null");
+        } else {
+            x = lab_put_count(out, cap, x, v);
+        }
+        if (k < 16) { x = lab_put_lit(out, cap, x, ","); }
+        x = lab_put_lit(out, cap, x, "\n");
+        k = k + 1;
+    }
+    return lab_put_lit(out, cap, x, " },\n");
+}
+
+/// The summary of a run where only the reference ran (t27b produced no result): files, reference_pass and a null t27b_pass.
+pub fn lr_put_reference_summary(files : u64, ref_pass : u64, out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = lab_put_lit(out, cap, w, " \"summary\": {\n  \"files\": ");
+    x = lab_put_count(out, cap, x, files);
+    x = lab_put_lit(out, cap, x, ",\n  \"reference_pass\": ");
+    x = lab_put_count(out, cap, x, ref_pass);
+    return lab_put_lit(out, cap, x, ",\n  \"t27b_pass\": null\n },\n");
+}
+
+/// A table as text, one `name TAB P|F` line per test, in table order: what a test compares a read table with.
+pub fn lr_table_text(t : string, tab : []const u32, n : usize, out : []u8, cap : usize, w : usize) -> usize {
+    var x : usize = w;
+    var i : usize = 0;
+    while (i < n) {
+        x = lab_put_span(out, cap, x, t, tab[3 * i] as usize, tab[3 * i + 1] as usize);
+        x = lab_put_lit(out, cap, x, "\t");
+        if (tab[3 * i + 2] == 1) {
+            x = lab_put_lit(out, cap, x, "P\n");
+        } else {
+            x = lab_put_lit(out, cap, x, "F\n");
+        }
+        i = i + 1;
+    }
+    return x;
+}
+
+/// A buffer for the details and tables a test writes.
+pub const LR_OUT : usize = 4096;
+/// The widest table a test reads.
+pub const LR_TABLE : usize = 64;
+
+// ---- tests ----
+
+test the_verdict_words_and_their_codes_are_stewards {
+    var k : usize = 0;
+    while (k < 12) {
+        assert lr_word_code(LR_WORDS[k], 0, LR_WORDS[k].len) == (k as u8);
+        assert lr_word(k as u8) == LR_WORDS[k];
+        k = k + 1;
+    }
+    assert lr_word_code("pass", 0, 4) == T_PASS;
+    assert lr_word_code("pass_vacuous", 0, 12) == T_PASS_VACUOUS;
+    assert lr_word_code("blocked", 0, 7) == T_BLOCKED;
+    assert lr_word_code("frontend", 0, 8) == T_FRONTEND;
+    assert lr_word_code("codegen", 0, 7) == T_CODEGEN;
+    assert lr_word_code("fail", 0, 4) == T_FAIL;
+    assert lr_word_code("mismatch", 0, 8) == T_MISMATCH;
+    assert lr_word_code("crash", 0, 5) == T_CRASH;
+    assert lr_word_code("timeout", 0, 7) == T_TIMEOUT;
+    assert lr_word_code("not run", 0, 7) == T_NOT_RUN;
+    assert lr_word_code("missing", 0, 7) == T_MISSING;
+    assert lr_word_code("lab_error", 0, 9) == T_LAB_ERROR;
+}
+
+test a_word_that_is_none_of_the_twelve_is_refused_as_unknown_and_never_a_guess {
+    assert lr_word_code("Pass", 0, 4) == LR_UNKNOWN;
+    assert lr_word_code("pass ", 0, 5) == LR_UNKNOWN;
+    assert lr_word_code("", 0, 0) == LR_UNKNOWN;
+    assert lr_word_code("not_run", 0, 7) == LR_UNKNOWN;
+    assert lr_word_code("lab-error", 0, 9) == LR_UNKNOWN;
+    assert lr_word_code("pas", 0, 3) == LR_UNKNOWN;
+    assert lr_word_code("xpassx", 1, 5) == T_PASS;
+    assert lr_word_code("xpassx", 0, 6) == LR_UNKNOWN;
+    assert lr_word(12) == "";
+    assert lr_word(255) == "";
+}
+
+test the_scan_of_a_real_report_reads_its_two_counts_and_no_blocked_line {
+    const t : string = "--- test report: specs/lab/example.t27 ---\n  pass  adds_small\n  FAIL  adds_wrong\n  pass  adds_vacuous\n\n  tests       3\n  pass        2\n  FAIL        1\n  rate    66.7%\n";
+    var st : [6]u64 = undefined;
+    lr_scan(t, &st);
+    assert st[0] == LX_BIG;
+    assert st[2] == 1;
+    assert st[3] == 3;
+    assert st[4] == 1;
+    assert st[5] == 1;
+}
+
+test a_count_line_is_the_whole_line_and_nothing_else {
+    assert lr_count_from("tests 12", 0, 8, "tests") == 6;
+    assert lr_count_from("  tests    12  ", 0, 15, "tests") == 11;
+    assert lr_count_from("tests 12x", 0, 9, "tests") == 10;
+    assert lr_count_from("tests12", 0, 7, "tests") == 8;
+    assert lr_count_from("tests", 0, 5, "tests") == 6;
+    assert lr_count_from("tests ", 0, 6, "tests") == 7;
+    assert lr_count_from("xtests 1", 0, 8, "tests") == 9;
+    assert lr_count_from("tests 1 2", 0, 9, "tests") == 10;
+    assert lr_count_from("FAIL 0", 0, 6, "FAIL") == 5;
+    assert lr_count_from("FAIL 0", 0, 6, "tests") == 7;
+    assert lr_count_from("ab tests 4", 3, 10, "tests") == 9;
+}
+
+test the_detail_of_a_blocked_report_is_the_rest_of_its_line_stripped {
+    var out : [4096]u8 = undefined;
+    const t : string = "  BLOCKED  does not compile: spec.zig:20:16: error: x  \n";
+    const w : usize = lr_report_detail(t, &out, 4096, 0);
+    assert lx_out_is(&out, w, "does not compile: spec.zig:20:16: error: x") == true;
+    assert lr_report_verdict(t) == T_BLOCKED;
+}
+
+test a_detail_that_does_not_fit_the_buffer_still_advances_the_cursor {
+    var out : [8]u8 = undefined;
+    var k : usize = 0;
+    while (k < 8) {
+        out[k] = 0;
+        k = k + 1;
+    }
+    const t : string = "  tests 9\n  FAIL 4\n";
+    assert lr_report_detail(t, &out, 4, 0) == 17;
+    assert out[3] == 102;
+    assert out[4] == 0;
+    assert lr_report_detail("BLOCKED abcdef", &out, 3, 0) == 6;
+    assert out[3] == 102;
+    assert lr_report_detail("", &out, 8, 5) == 34;
+}
+
+test the_table_of_a_real_verbose_report_is_in_the_reports_order {
+    const t : string = "--- test report: specs/lab/example.t27 ---\n  pass  adds_small\n  FAIL  adds_wrong\n  pass  adds_vacuous\n\n  tests       3\n  pass        2\n  FAIL        1\n";
+    var tab : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    const n : u32 = lr_verdicts(t, &tab, LR_TABLE);
+    assert n == 3;
+    const w : usize = lr_table_text(t, &tab, 3, &out, 4096, 0);
+    assert lx_out_is(&out, w, "adds_small\tP\nadds_wrong\tF\nadds_vacuous\tP\n") == true;
+}
+
+test a_table_wider_than_the_buffer_is_no_table_and_one_that_fits_exactly_is {
+    const t : string = "--- test report: x ---\n  pass  a\n  FAIL  b\n  pass  c\n\n  tests 3\n";
+    var tab : [9]u32 = undefined;
+    assert lr_verdicts(t, &tab, 3) == 3;
+    assert lr_verdicts(t, &tab, 2) == LR_NONE;
+    assert lr_verdicts(t, &tab, 0) == LR_NONE;
+    const d : string = "--- test report: x ---\n  pass  a\n  FAIL  a\n  pass  a\n\n  tests 1\n";
+    assert lr_verdicts(d, &tab, 1) == 1;
+}
+
+test a_repeated_name_keeps_its_place_and_takes_its_last_verdict {
+    const t : string = "--- test report: x ---\n  pass  a\n  pass  b\n  FAIL  a\n  pass  c\n  FAIL  b\n\n  tests 3\n";
+    var tab : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    assert lr_verdicts(t, &tab, LR_TABLE) == 3;
+    const w : usize = lr_table_text(t, &tab, 3, &out, 4096, 0);
+    assert lx_out_is(&out, w, "a\tF\nb\tF\nc\tP\n") == true;
+}
+
+test two_tables_that_agree_disagree_nowhere {
+    const t : string = "--- test report: x ---\n  pass  a\n  FAIL  b\n\n  tests 2\n";
+    var ta : [192]u32 = undefined;
+    var tb : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    assert lr_verdicts(t, &ta, LR_TABLE) == 2;
+    assert lr_verdicts(t, &tb, LR_TABLE) == 2;
+    assert lr_disagreements(t, &ta, 2, t, &tb, 2, &out, 4096) == 0;
+    assert lr_disagreements(t, &ta, 0, t, &tb, 0, &out, 4096) == 0;
+}
+
+test a_missing_test_on_either_side_is_named_with_its_name_order {
+    const a : string = "--- test report: x ---\n  pass  b\n  FAIL  c\n\n  tests 2\n";
+    const b : string = "--- test report: x ---\n  pass  a\n  pass  b\n\n  tests 2\n";
+    var ta : [192]u32 = undefined;
+    var tb : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    assert lr_verdicts(a, &ta, LR_TABLE) == 2;
+    assert lr_verdicts(b, &tb, LR_TABLE) == 2;
+    const w : usize = lr_disagreements(a, &ta, 2, b, &tb, 2, &out, 4096);
+    assert lx_out_is(&out, w, "a: t27b has no such test, reference pass\nc: t27b FAIL, reference has no such test\n") == true;
+}
+
+test a_differing_verdict_is_named_with_both_words {
+    const a : string = "--- test report: x ---\n  pass  t\n\n  tests 1\n";
+    const b : string = "--- test report: x ---\n  FAIL  t\n\n  tests 1\n";
+    var ta : [192]u32 = undefined;
+    var tb : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    assert lr_verdicts(a, &ta, LR_TABLE) == 1;
+    assert lr_verdicts(b, &tb, LR_TABLE) == 1;
+    var w : usize = lr_disagreements(a, &ta, 1, b, &tb, 1, &out, 4096);
+    assert lx_out_is(&out, w, "t: t27b pass, reference FAIL\n") == true;
+    w = lr_disagreements(b, &tb, 1, a, &ta, 1, &out, 4096);
+    assert lx_out_is(&out, w, "t: t27b FAIL, reference pass\n") == true;
+}
+
+test the_names_sort_as_python_sorts_them_by_code_point {
+    const a : string = "--- test report: x ---\n  pass  b\n  pass  a_b\n  pass  a-b\n  pass  B\n\n  tests 4\n";
+    const b : string = "--- test report: x ---\n  FAIL  b\n  FAIL  a_b\n  FAIL  a-b\n  FAIL  B\n\n  tests 4\n";
+    var ta : [192]u32 = undefined;
+    var tb : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    assert lr_verdicts(a, &ta, LR_TABLE) == 4;
+    assert lr_verdicts(b, &tb, LR_TABLE) == 4;
+    const w : usize = lr_disagreements(a, &ta, 4, b, &tb, 4, &out, 4096);
+    assert lx_out_is(&out, w, "B: t27b pass, reference FAIL\na-b: t27b pass, reference FAIL\na_b: t27b pass, reference FAIL\nb: t27b pass, reference FAIL\n") == true;
+}
+
+test the_cargo_totals_sum_every_suite_and_count_each_once {
+    var tot : [4]u64 = undefined;
+    lr_cargo_totals("running 2 tests\ntest result: ok. 3 passed; 1 failed; 2 ignored; 0 measured\n\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured\n", &tot);
+    assert tot[0] == 13;
+    assert tot[1] == 3;
+    assert tot[2] == 3;
+    assert tot[3] == 2;
+    lr_cargo_totals("", &tot);
+    assert tot[0] == 0;
+    assert tot[3] == 0;
+}
+
+test a_reference_run_that_exits_nonzero_is_blocked_with_its_first_stderr_line {
+    var out : [4096]u8 = undefined;
+    const w : usize = lr_ref_detail(101, "\n  thread panicked at x\nmore\n", "", &out, 4096, 0);
+    assert lx_out_is(&out, w, "t27c test-report exited 101: thread panicked at x") == true;
+    assert lr_ref_verdict(101, "x", "") == T_BLOCKED;
+    const s : usize = lr_ref_detail(-9, "", "", &out, 4096, 0);
+    assert lx_out_is(&out, s, "t27c test-report exited -9: ") == true;
+}
+
+test a_resource_limit_in_stderr_is_the_labs_error_never_the_specs {
+    var out : [4096]u8 = undefined;
+    assert lr_ref_verdict(0, "SystemResources", "  tests 1\n  FAIL 0\n") == T_LAB_ERROR;
+    assert lr_ref_verdict(1, "x Resource temporarily unavailable y", "") == T_LAB_ERROR;
+    assert lr_ref_verdict(0, "resource temporarily unavailable", "  tests 1\n  FAIL 0\n") == T_PASS;
+    const w : usize = lr_ref_detail(0, "SystemResources", "", &out, 4096, 0);
+    assert lx_out_is(&out, w, "zig ran out of threads/processes in the container") == true;
+}
+
+test a_timeout_and_a_spawn_error_have_their_words {
+    var out : [4096]u8 = undefined;
+    assert lx_out_is(&out, lr_over_detail(300, &out, 4096, 0), "over 300 s") == true;
+    assert lx_out_is(&out, lr_over_detail(0, &out, 4096, 0), "over 0 s") == true;
+    assert lx_out_is(&out, lr_spawn_detail("[Errno 11] x", &out, 4096, 0), "could not start t27c: [Errno 11] x") == true;
+    assert lr_keeps_tests(T_PASS, true) == true;
+    assert lr_keeps_tests(T_FAIL, true) == true;
+    assert lr_keeps_tests(T_BLOCKED, true) == false;
+    assert lr_keeps_tests(T_TIMEOUT, true) == false;
+    assert lr_keeps_tests(T_LAB_ERROR, true) == false;
+    assert lr_keeps_tests(T_PASS, false) == false;
+    assert lr_keeps_tests(T_FAIL, false) == false;
+}
+
+test a_count_above_u64_is_read_as_the_largest_u64_and_that_is_the_one_place_the_port_differs {
+    // Python's int has no ceiling and would print the whole number; the verdict is the same either way.
+    var out : [4096]u8 = undefined;
+    const t : string = "tests 5\nFAIL 99999999999999999999999\n";
+    assert lr_report_verdict(t) == T_FAIL;
+    const w : usize = lr_report_detail(t, &out, 4096, 0);
+    assert lx_out_is(&out, w, "18446744073709551615 of 5 tests fail") == true;
+    assert lr_report_verdict("tests 99999999999999999999999\nFAIL 0\n") == T_PASS;
+    assert lr_report_verdict("tests 3\nFAIL 000000000000000000000000000\n") == T_PASS;
+    var tot : [4]u64 = undefined;
+    lr_cargo_totals("test result: ok. 99999999999999999999 passed; 1 failed; 0 ignored\ntest result: ok. 1 passed; 0 failed; 0 ignored\n", &tot);
+    assert tot[0] == LX_BIG;
+    assert tot[1] == 1;
+    assert tot[3] == 2;
+}
+
+test the_unicode_digits_and_letters_the_regexes_would_match_are_not_matched_here {
+    // Python reads an Arabic-Indic digit as a \\d and an accented letter as a \\w: tests 3 passes there (pass) and the
+    // cargo line counts as a suite. t27c and cargo print neither, so the port reads ASCII only: a refusal, never a guess.
+    var tot : [4]u64 = undefined;
+    lr_cargo_totals("test result: ok\xc3\xa9. 1 passed; 0 failed; 0 ignored", &tot);
+    assert tot[3] == 0;
+    assert lr_report_verdict("tests \xd9\xa3\nFAIL 0\n") == T_BLOCKED;
+    assert lr_report_verdict("tests 3\nFAIL \xd9\xa0\n") == T_BLOCKED;
+}
+
+/// Test helper: writes unit `times` times at `at`; the cursor after.
+fn lr_test_repeat(out : []u8, at : usize, unit : string, times : usize) -> usize {
+    var x : usize = at;
+    var k : usize = 0;
+    while (k < times) {
+        x = lab_put_lit(out, 4096, x, unit);
+        k = k + 1;
+    }
+    return x;
+}
+
+test a_detail_is_cut_at_300_characters_never_in_the_middle_of_one {
+    var b : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    // two-byte characters: 301 of them are cut to 300, 600 bytes, the last byte a continuation byte
+    var n : usize = lab_put_lit(&b, 4096, 0, "BLOCKED ");
+    n = lr_test_repeat(&b, n, "\xc3\xa9", 301);
+    var w : usize = lr_report_detail(b[0..n], &out, 4096, 0);
+    assert w == 600;
+    assert out[598] == 195;
+    assert out[599] == 169;
+    // three-byte characters
+    n = lab_put_lit(&b, 4096, 0, "BLOCKED  ");
+    n = lr_test_repeat(&b, n, "\xe3\x81\x82", 301);
+    w = lr_report_detail(b[0..n], &out, 4096, 0);
+    assert w == 900;
+    assert out[897] == 227;
+    // 299 characters are kept whole, and ascii is counted by the byte
+    n = lab_put_lit(&b, 4096, 0, "BLOCKED ");
+    n = lr_test_repeat(&b, n, "\xc3\xa9", 299);
+    assert lr_report_detail(b[0..n], &out, 4096, 0) == 598;
+    n = lab_put_lit(&b, 4096, 0, "BLOCKED ");
+    n = lr_test_repeat(&b, n, "a", 301);
+    assert lr_report_detail(b[0..n], &out, 4096, 0) == 300;
+}
+
+test the_cut_of_the_reference_and_spawn_details_counts_the_words_before_it {
+    var b : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    // `t27c test-report exited 1: ` is 27 characters, so 273 of the 400 two-byte characters stay
+    var n : usize = lr_test_repeat(&b, 0, "\xc3\xa9", 400);
+    var w : usize = lr_ref_detail(1, b[0..n], "", &out, 4096, 0);
+    assert w == 27 + 546;
+    assert out[w - 1] == 169;
+    // a negative exit code is longer by its sign: `t27c test-report exited -9: ` is 28 characters
+    w = lr_ref_detail(-9, b[0..n], "", &out, 4096, 0);
+    assert w == 28 + 544;
+    // `could not start t27c: ` is 22 characters
+    n = lr_test_repeat(&b, 0, "\xc3\xa9", 300);
+    w = lr_spawn_detail(b[0..n], &out, 4096, 0);
+    assert w == 22 + 556;
+    assert out[w - 1] == 169;
+}
+
+// BEGIN GENERATED
+// The tables below were computed by running contrib/railway/t27b-lab/lab.py's own functions on the
+// inputs (python3, lab.py imported unedited; the summary is the block of lab_run run on the same results).
+// Every input is a small text written for the table: the real shapes of `t27c test-report` (a pass, a
+// fail with a vacuous pass, a spec that does not compile, a machine with no zig), then cases that
+// break each rule on its edge. The tests that read them are at the end of the file.
+
+// T1: parse_test_report -- 99 inputs, the verdict word as steward's code, and the detail
+pub const RT_N : usize = 99;
+pub const RT_IN : [99]string = [
+    "--- test report: specs/lab/pass3.t27 ---\n  pass  adds_small\n  pass  adds_zero\n  pass  adds_big\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n\n  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):\n       1  adds_small\n       2  adds_zero\n       1  adds_big\n  vacuous passes  0 of 3  (passed with 0 runtime asserts executed)\n",
+    "--- test report: specs/lab/fail1.t27 ---\n  pass  adds_small\n  FAIL  adds_wrong\n  pass  adds_vacuous\n\n  tests       3\n  pass        2\n  FAIL        1\n  rate    66.7%\n\n  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):\n       1  adds_small\n       -  adds_wrong   (failed, not counted)\n       0  adds_vacuous   VACUOUS\n  vacuous passes  1 of 2  (passed with 0 runtime asserts executed)\n",
+    "--- test report: specs/lab/blocked1.t27 ---\n  BLOCKED  does not compile: spec.zig:20:16: error: use of undeclared identifier 'undeclared_name'\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "--- test report: specs/lab/pass3.t27 ---\n  BLOCKED  zig not on PATH\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "t27c: BLOCKED: zig not on PATH\n",
+    "",
+    "\n",
+    "   \n  \n",
+    "--- test report: x ---\n",
+    "--- test report: specs/a/b.t27 ---\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  FAIL  t1\n  FAIL  t2\n  FAIL  t3\n\n  tests       3\n  pass        0\n  FAIL        3\n  rate    0.0%\n",
+    "--- test report: specs/a/b.t27 ---\n\n  tests       0\n  pass        0\n  FAIL        0\n  rate    0.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  only\n\n  tests       1\n  pass        1\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  adds_small\n  pass  adds_zero\n  pass  adds_big\n  pass  the_walk_finds_each_result_once\n  pass  a_row_reads_its_own_keys\n  pass  negative_control_a_test_named_tests_in_the_table\n  pass  nine_digits_read_and_ten_are_refused\n  pass  Upper_case_first\n  pass  a-b\n  pass  a_b\n  pass  a.b\n  pass  ab\n\n  tests       12\n  pass        12\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  FAIL  adds_small\n  pass  adds_zero\n  pass  adds_big\n  pass  the_walk_finds_each_result_once\n  FAIL  a_row_reads_its_own_keys\n  pass  negative_control_a_test_named_tests_in_the_table\n  pass  nine_digits_read_and_ten_are_refused\n  pass  Upper_case_first\n  FAIL  a-b\n  pass  a_b\n  pass  a.b\n  pass  ab\n  FAIL  abc\n  pass  name with spaces\n  pass  tests_5\n  pass  pass_x\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  z\n  pass  caf\xc3\xa9_name\n  pass  tail_space \n  FAIL  dup__dup1\n  pass  dup__dup2\n\n  tests       22\n  pass        16\n  FAIL        6\n  rate    72.7%\n",
+    "  tests       3\n",
+    "  FAIL        0\n",
+    "  tests       3\n  FAIL        0\n",
+    "  FAIL        0\n  tests       3\n",
+    "  tests       3\n  FAIL        2\n",
+    "  FAIL        2\n  tests       3\n",
+    "  tests       3\n  FAIL        0\n  tests       5\n",
+    "  tests       3\n  tests       5\n  FAIL        0\n",
+    "  tests       3\n  FAIL        0\n  FAIL        2\n",
+    "  tests       3\n  FAIL        2\n  FAIL        0\n",
+    "  tests       0\n  FAIL        0\n",
+    "  tests       0\n  FAIL        1\n",
+    "tests 7\nFAIL 0",
+    "tests\t7\nFAIL\t0\n",
+    "\t tests \t 7 \t\nFAIL 0 \n",
+    "tests7\nFAIL 0\n",
+    "tests 7\nFAIL0\n",
+    "tests 7 x\nFAIL 0\n",
+    "tests 7\nFAIL 0 x\n",
+    "tests -7\nFAIL 0\n",
+    "tests 7.0\nFAIL 0\n",
+    "tests 7\nFAIL -1\n",
+    "tests 007\nFAIL 00\n",
+    "tests 007\nFAIL 010\n",
+    "TESTS 7\nFAIL 0\n",
+    "tests 7\nfail 0\n",
+    "tests 99999999999999999999999\nFAIL 0\n",
+    "tests 18446744073709551615\nFAIL 18446744073709551615\n",
+    "tests 18446744073709551616\nFAIL 0\n",
+    "tests 3\nFAIL 000000000000000000000000000\n",
+    "xtests 3\nFAIL 0\n",
+    "tests 3\x0d\nFAIL 0\x0d\n",
+    "tests 3\x0dFAIL 0\x0d",
+    "--- test report: x ---\n  tests 3\n\x0b  FAIL 0\n",
+    "tests 3\x0cFAIL 0\n",
+    "tests 3\x1cFAIL 0",
+    "tests 3\x1fFAIL 0",
+    "tests\x1f3\nFAIL\x1f0\n",
+    "tests 3\n\xc2\xa0FAIL 0\n",
+    "tests\xc2\xa03\nFAIL 0\n",
+    "tests 3\xc2\xa0\nFAIL 0\n",
+    "tests 3\xc2\x85FAIL 0\n",
+    "BLOCKED",
+    "BLOCKED\n",
+    "BLOCKED  does not compile: spec.zig:3:1: error: x\n",
+    "  BLOCKED  x  \n",
+    "BLOCKEDx y\n",
+    "BLOCKED\tzig not on PATH\n",
+    "\tBLOCKED \t zig \t\n",
+    "blocked x\n",
+    "xBLOCKED y\n",
+    "unBLOCKED y\n",
+    "[BLOCKED] y\n",
+    "tests 3\nFAIL 0\nBLOCKED late\n",
+    "BLOCKED first\nBLOCKED second\n",
+    "BLOCKED   \nBLOCKED second\n",
+    "tests 3\nFAIL 2\nBLOCKED x\n",
+    "BLOCKED aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    "BLOCKED aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    "BLOCKED aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    "BLOCKED aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail\n",
+    "BLOCKED  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  \n",
+    "BLOCKED caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9\n",
+    "BLOCKED \xc2\xa0x\xc2\xa0\n",
+    "BLOCKED x\xc2\x85y\n",
+    "x\xc2\x85BLOCKED y\n",
+    "BLOCKED \x0bx\x0b\n",
+    "line one\nBLOCKED x\nline three\n",
+    "  BLOCKED does not compile\n    second\n",
+    "tests 3\xe2\x80\xa8FAIL 0\n",
+    "tests 3\n\xe3\x80\x80FAIL 0\xe3\x80\x80\n",
+    "tests\xe2\x80\x833\nFAIL 0\n",
+    "x\xe2\x80\xa9BLOCKED y\n",
+    "BLOCKED \xe3\x80\x80x\xe3\x80\x80y\xe2\x80\xa8z\n",
+    "BLOCKED \xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\n",
+    "--- test report: specs/gen/s2.t27 ---\n  FAIL  dup__dup1\n  FAIL  pass_x\n\n  tests       2\n  pass        0\n  FAIL        2\n  rate    0.0%\n",
+    "--- test report: specs/gen/s2.t27 ---\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/gen/s5.t27 ---\n  pass  a.b\n  pass  a-b\n  FAIL  ab\n  FAIL  abc\n  pass  negative_control_a_test_named_tests_in_the_table\n\n  tests       5\n  pass        3\n  FAIL        2\n  rate    60.0%\n",
+    "--- test report: specs/gen/s5.t27 ---\n\n  tests       5\n  pass        3\n  FAIL        2\n  rate    60.0%\n",
+    "--- test report: specs/gen/s9.t27 ---\n  FAIL  a-b\n  FAIL  a_row_reads_its_own_keys\n  FAIL  tail_space \n  pass  a.b\n  pass  Upper_case_first\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  dup__dup1\n  pass  adds_zero\n  pass  nine_digits_read_and_ten_are_refused\n\n  tests       9\n  pass        6\n  FAIL        3\n  rate    66.7%\n",
+    "--- test report: specs/gen/s9.t27 ---\n\n  tests       9\n  pass        6\n  FAIL        3\n  rate    66.7%\n",
+    "--- test report: specs/gen/s14.t27 ---\n  pass  Upper_case_first\n  pass  negative_control_a_test_named_tests_in_the_table\n  pass  nine_digits_read_and_ten_are_refused\n  pass  pass_x\n  pass  z\n  pass  adds_big\n  pass  a.b\n  FAIL  dup__dup1\n  pass  abc\n  FAIL  adds_small\n  pass  tail_space \n  FAIL  tests_5\n  pass  adds_zero\n  pass  a_row_reads_its_own_keys\n\n  tests       14\n  pass        11\n  FAIL        3\n  rate    78.6%\n",
+    "--- test report: specs/gen/s14.t27 ---\n\n  tests       14\n  pass        9\n  FAIL        5\n  rate    64.3%\n"
+];
+
+pub const RT_V : [99]u8 = [
+    0, 5, 2, 2, 2, 2, 2, 2, 2, 0, 5, 5, 0, 0, 0, 5, 2, 2, 0, 0, 5, 5, 0, 0, 5, 0, 0, 5, 0, 0, 0, 2,
+    2, 2, 2, 2, 2, 2, 0, 5, 2, 2, 0, 5, 0, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, 5, 5, 5, 5, 5,
+    5, 5, 5
+];
+
+pub const RT_D : [99]string = [
+    "",
+    "1 of 3 tests fail",
+    "does not compile: spec.zig:20:16: error: use of undeclared identifier 'undeclared_name'",
+    "zig not on PATH",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "",
+    "1 of 2 tests fail",
+    "3 of 3 tests fail",
+    "",
+    "",
+    "",
+    "6 of 22 tests fail",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "",
+    "",
+    "2 of 3 tests fail",
+    "2 of 3 tests fail",
+    "",
+    "",
+    "2 of 3 tests fail",
+    "",
+    "",
+    "1 of 0 tests fail",
+    "",
+    "",
+    "",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "",
+    "10 of 7 tests fail",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "",
+    "18446744073709551615 of 18446744073709551615 tests fail",
+    "",
+    "",
+    "unreadable test-report output",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "unreadable test-report output",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "does not compile: spec.zig:3:1: error: x",
+    "x",
+    "x y",
+    "zig not on PATH",
+    "zig",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "unreadable test-report output",
+    "late",
+    "first",
+    "",
+    "x",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9",
+    "x",
+    "x",
+    "y",
+    "",
+    "x",
+    "does not compile",
+    "",
+    "",
+    "",
+    "y",
+    "x\xe3\x80\x80y",
+    "\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82\xe3\x81\x82",
+    "2 of 2 tests fail",
+    "1 of 2 tests fail",
+    "2 of 5 tests fail",
+    "2 of 5 tests fail",
+    "3 of 9 tests fail",
+    "3 of 9 tests fail",
+    "3 of 14 tests fail",
+    "5 of 14 tests fail"
+];
+
+// T2: parse_test_verdicts -- 70 inputs; the number of tests (LR_NONE for None) and the table as text
+pub const TV_N : usize = 70;
+pub const TV_IN : [70]string = [
+    "--- test report: specs/lab/pass3.t27 ---\n  pass  adds_small\n  pass  adds_zero\n  pass  adds_big\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n\n  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):\n       1  adds_small\n       2  adds_zero\n       1  adds_big\n  vacuous passes  0 of 3  (passed with 0 runtime asserts executed)\n",
+    "--- test report: specs/lab/fail1.t27 ---\n  pass  adds_small\n  FAIL  adds_wrong\n  pass  adds_vacuous\n\n  tests       3\n  pass        2\n  FAIL        1\n  rate    66.7%\n\n  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):\n       1  adds_small\n       -  adds_wrong   (failed, not counted)\n       0  adds_vacuous   VACUOUS\n  vacuous passes  1 of 2  (passed with 0 runtime asserts executed)\n",
+    "--- test report: specs/lab/blocked1.t27 ---\n  BLOCKED  does not compile: spec.zig:20:16: error: use of undeclared identifier 'undeclared_name'\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "--- test report: specs/lab/pass3.t27 ---\n  BLOCKED  zig not on PATH\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "--- test report: specs/lab/pass3.t27 ---\n  pass  adds_small\n  pass  adds_zero\n  pass  adds_big\n  pass  adds_big\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n\n  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):\n       1  adds_small\n       2  adds_zero\n       1  adds_big\n  vacuous passes  0 of 3  (passed with 0 runtime asserts executed)\n",
+    "--- test report: s.t27 ---\n  pass  a\n  FAIL  b\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: s.t27 ---\n\n  tests       0\n  pass        0\n  FAIL        0\n  rate    0.0%\n",
+    "--- test report: s.t27 ---\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "",
+    "\n",
+    "--- test report: x ---\n",
+    "--- test report: x ---\n\n  tests 0\n",
+    "  tests 0\n--- test report: x ---\n",
+    "  tests 2\n--- test report: x ---\n  pass  a\n  FAIL  b\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  b\n\n  tests 3\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  b\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  b\n\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  b\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n  oops\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n  pass b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n  PASS  b\n\n  tests 2\n",
+    "--- test report: x ---\n  Pass  a\n\n  tests 1\n",
+    "--- test report: x ---\n  fail  a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  \n\n  tests 1\n",
+    "--- test report: x ---\n  pass   a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a \n  FAIL  b\t\n\n  tests 2\n",
+    "--- test report: x ---\n\t pass  a\n   FAIL  b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n  pass  a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n  pass  a\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: x ---\n  FAIL  a\n  pass  a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n  pass  b\n  FAIL  a\n  pass  c\n  FAIL  b\n\n  tests 3\n",
+    "--- test report: x ---\n  pass  a\n  pass  b\n  FAIL  a\n  pass  c\n  FAIL  b\n\n  tests 5\n",
+    "--- test report: x ---\n  pass  a\n   \n  pass  b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n\x0b\n  pass  b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a\n\x1f\n  pass  b\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\x0b  pass  b\n\n  tests 1\n",
+    "--- test report: x ---\x0d\n  pass  a\x0d\n  FAIL  b\x0d\n\x0d\n  tests 2\x0d\n",
+    "--- test report: x ---\x0d  pass  a\x0d\x0d  tests 1\x0d",
+    " --- test report: x ---\n  pass  a\n\n  tests 1\n",
+    "x --- test report: x ---\n  pass  a\n\n  tests 1\n",
+    "--- test report x ---\n  pass  a\n\n  tests 1\n",
+    "--- test report:\n  pass  a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n\n  tests 1\n--- test report: y ---\n  pass  b\n  pass  c\n\n  tests 2\n",
+    "  tests 1\n--- test report: x ---\n  pass  a\n\n  tests 9\n",
+    "  tests 9\n--- test report: x ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n\n  tests 1\n  tests 7\n",
+    "--- test report: x ---\n  pass  a\n\n  tests x\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\n\n  tests\t1\n",
+    "--- test report: x ---\n  pass  a\n\n  tests1\n",
+    "--- test report: x ---\n  pass  a\n\n  tests 1 x\n",
+    "--- test report: x ---\n  pass  a\n\n  tests 01\n",
+    "--- test report: x ---\n  pass  a\n\n  tests 99999999999999999999\n",
+    "--- test report: x ---\n  pass  caf\xc3\xa9\n  FAIL  \xc3\xa9\xc3\xa9\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  \xc2\xa0\n\n  tests 1\n",
+    "--- test report: x ---\n  pass  a\xc2\x85  pass  b\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  a b  c\n  FAIL  d\\e \"q\"\n\n  tests 2\n",
+    "--- test report: x ---\n  pass  \t\n\n  tests 1\n",
+    "--- test report: x ---\n\n  pass  a\n  tests 1\n",
+    "--- test report: x ---\n  FAIL  a\n  FAIL  b\n  FAIL  c\n\n  tests 3\n",
+    "--- test report: specs/gen/s1.t27 ---\n  pass  tests_5\n\n  tests       1\n  pass        1\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/gen/s2.t27 ---\n  pass  pass_x\n  pass  the_walk_finds_each_result_once\n\n  tests       2\n  pass        2\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/gen/s5.t27 ---\n  pass  a-b\n  pass  adds_small\n  FAIL  dup__dup2\n  pass  pass_x\n  pass  negative_control_a_test_named_tests_in_the_table\n\n  tests       5\n  pass        4\n  FAIL        1\n  rate    80.0%\n",
+    "--- test report: specs/gen/s9.t27 ---\n  pass  nine_digits_read_and_ten_are_refused\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  a_row_reads_its_own_keys\n  pass  a.b\n  pass  adds_zero\n  pass  Upper_case_first\n  FAIL  the_walk_finds_each_result_once\n  pass  dup__dup1\n  pass  a_b\n\n  tests       9\n  pass        8\n  FAIL        1\n  rate    88.9%\n",
+    "--- test report: specs/gen/s14.t27 ---\n  pass  z\n  pass  adds_small\n  FAIL  negative_control_a_test_named_tests_in_the_table\n  pass  tests_5\n  pass  adds_zero\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  caf\xc3\xa9_name\n  pass  a_b\n  pass  dup__dup1\n  pass  the_walk_finds_each_result_once\n  FAIL  a_row_reads_its_own_keys\n  FAIL  a-b\n  FAIL  abc\n  pass  dup__dup2\n\n  tests       14\n  pass        10\n  FAIL        4\n  rate    71.4%\n",
+    "--- test report: specs/gen/s20.t27 ---\n  pass  adds_big\n  pass  Upper_case_first\n  pass  tail_space \n  FAIL  dup__dup2\n  pass  adds_zero\n  FAIL  a_row_reads_its_own_keys\n  pass  z\n  pass  name with spaces\n  pass  a_b\n  pass  dup__dup1\n  pass  a-b\n  pass  pass_x\n  pass  abc\n  FAIL  a.b\n  FAIL  caf\xc3\xa9_name\n  pass  tests_5\n  pass  negative_control_a_test_named_tests_in_the_table\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  the_walk_finds_each_result_once\n  pass  nine_digits_read_and_ten_are_refused\n\n  tests       20\n  pass        15\n  FAIL        5\n  rate    75.0%\n",
+    "--- test report: specs/gen/dup.t27 ---\n  pass  a\n  FAIL  b\n  pass  c\n  FAIL  a\n\n  tests       3\n  pass        2\n  FAIL        1\n  rate    66.7%\n"
+];
+
+pub const TV_COUNT : [70]u32 = [
+    3, 3, 4294967295, 4294967295, 3, 2, 0, 4294967295, 4294967295, 4294967295, 4294967295, 0, 0, 2,
+    2, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295,
+    4294967295, 4294967295, 4294967295, 4294967295, 1, 1, 2, 2, 1, 4294967295, 1, 1, 3, 4294967295,
+    4294967295, 4294967295, 1, 4294967295, 2, 1, 4294967295, 4294967295, 4294967295, 1, 1, 1,
+    4294967295, 1, 1, 1, 4294967295, 4294967295, 1, 4294967295, 2, 1, 2, 2, 1, 4294967295, 3, 1, 2,
+    5, 9, 14, 20, 3
+];
+
+pub const TV_TXT : [70]string = [
+    "adds_small\tP\nadds_zero\tP\nadds_big\tP\n",
+    "adds_small\tP\nadds_wrong\tF\nadds_vacuous\tP\n",
+    "",
+    "",
+    "adds_small\tP\nadds_zero\tP\nadds_big\tP\n",
+    "a\tP\nb\tF\n",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "a\tP\nb\tF\n",
+    "a\tP\nb\tF\n",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "\tP\n",
+    " a\tP\n",
+    "a \tP\nb\t\tF\n",
+    "a\tP\nb\tF\n",
+    "a\tP\n",
+    "",
+    "a\tF\n",
+    "a\tP\n",
+    "a\tF\nb\tF\nc\tP\n",
+    "",
+    "",
+    "",
+    "a\tP\n",
+    "",
+    "a\tP\nb\tF\n",
+    "a\tP\n",
+    "",
+    "",
+    "",
+    "a\tP\n",
+    "a\tP\n",
+    "a\tP\n",
+    "",
+    "a\tP\n",
+    "a\tP\n",
+    "a\tP\n",
+    "",
+    "",
+    "a\tP\n",
+    "",
+    "caf\xc3\xa9\tP\n\xc3\xa9\xc3\xa9\tF\n",
+    "\xc2\xa0\tP\n",
+    "a\tP\nb\tP\n",
+    "a b  c\tP\nd\\e \"q\"\tF\n",
+    "\t\tP\n",
+    "",
+    "a\tF\nb\tF\nc\tF\n",
+    "tests_5\tP\n",
+    "pass_x\tP\nthe_walk_finds_each_result_once\tP\n",
+    "a-b\tP\nadds_small\tP\ndup__dup2\tF\npass_x\tP\nnegative_control_a_test_named_tests_in_the_table\tP\n",
+    "nine_digits_read_and_ten_are_refused\tP\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\tP\na_row_reads_its_own_keys\tP\na.b\tP\nadds_zero\tP\nUpper_case_first\tP\nthe_walk_finds_each_result_once\tF\ndup__dup1\tP\na_b\tP\n",
+    "z\tP\nadds_small\tP\nnegative_control_a_test_named_tests_in_the_table\tF\ntests_5\tP\nadds_zero\tP\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\tP\ncaf\xc3\xa9_name\tP\na_b\tP\ndup__dup1\tP\nthe_walk_finds_each_result_once\tP\na_row_reads_its_own_keys\tF\na-b\tF\nabc\tF\ndup__dup2\tP\n",
+    "adds_big\tP\nUpper_case_first\tP\ntail_space \tP\ndup__dup2\tF\nadds_zero\tP\na_row_reads_its_own_keys\tF\nz\tP\nname with spaces\tP\na_b\tP\ndup__dup1\tP\na-b\tP\npass_x\tP\nabc\tP\na.b\tF\ncaf\xc3\xa9_name\tF\ntests_5\tP\nnegative_control_a_test_named_tests_in_the_table\tP\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\tF\nthe_walk_finds_each_result_once\tP\nnine_digits_read_and_ten_are_refused\tP\n",
+    "a\tF\nb\tF\nc\tP\n"
+];
+
+// T3: disagreements -- 63 pairs of tables (as reports), and the lines the oracle returns, one per line
+pub const TD_N : usize = 63;
+pub const TD_A : [63]string = [
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  name with spaces\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  Upper\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  adds_zero\n\n  tests 1\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  dup__dup2\n  pass  ab\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  a\n  pass   a\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  a\n  pass  adds_small\n\n  tests 2\n",
+    "--- test report: s ---\n  pass   a\n  pass  adds_small\n  pass  caf\xc3\xa9\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  a/b\n  pass  t_1\n  pass  adds_zero\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  dup__dup1\n  pass  b\n  pass  ab\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  b\n  FAIL  name with spaces\n  pass  a_b\n  pass  adds_big\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  adds_big\n  pass  a/b\n  pass  a_b\n  FAIL  name with spaces\n\n  tests 4\n",
+    "--- test report: s ---\n  FAIL  abc\n  pass  t_10\n  pass  a/b\n  pass  Upper\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  adds_small\n  pass  t_10\n  pass  dup__dup2\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  a.b\n  FAIL  dup__dup2\n  FAIL  a-b\n  pass  t_1\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  a\n  pass  abc\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  FAIL  dup__dup2\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  Upper\n  pass  t_2\n  pass  caf\xc3\xa9\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  name with spaces\n\n  tests 5\n",
+    "--- test report: s ---\n  pass   a\n  FAIL  a/b\n  FAIL  adds_small\n  FAIL  t_10\n  pass  adds_big\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  FAIL  t_1\n  pass  a\n  FAIL  a/b\n  FAIL  adds_small\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  a\n  FAIL  name with spaces\n  FAIL  Upper\n  pass  caf\xc3\xa9\n  pass  a.b\n  pass  dup__dup1\n\n  tests 6\n",
+    "--- test report: s ---\n  FAIL  t_10\n  FAIL  t_1\n  pass   a\n  pass  adds_small\n  pass  ab \n  FAIL  z\n\n  tests 6\n",
+    "--- test report: s ---\n  FAIL  a.b\n  FAIL  a_b\n  pass  a-b\n  pass  adds_big\n  FAIL   a\n  pass  a\n\n  tests 6\n",
+    "--- test report: s ---\n  FAIL  b\n  pass  adds_big\n  pass  a_b\n  FAIL  Upper\n  pass  adds_small\n  pass   a\n  pass  t_1\n  pass  a\n\n  tests 8\n",
+    "--- test report: s ---\n  FAIL  dup__dup2\n  FAIL  a-b\n  FAIL  a_b\n  FAIL  dup__dup1\n  pass  Upper\n  FAIL  a/b\n  pass  t_1\n  pass  adds_big\n\n  tests 8\n",
+    "--- test report: s ---\n  FAIL  ab \n  FAIL  t_2\n  pass  t_10\n  pass  a-b\n  pass  a\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  a_b\n  pass  dup__dup2\n\n  tests 8\n",
+    "--- test report: s ---\n  FAIL  dup__dup2\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  t_10\n  FAIL  Upper\n  pass  t_1\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  a_b\n  FAIL  a/b\n  pass  z\n  pass   a\n  pass  t_2\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  dup__dup1\n  pass  a.b\n  pass  b\n  pass  a\n  pass  dup__dup2\n\n  tests 5\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  FAIL  a.b\n  pass  a/b\n  pass  adds_big\n  pass  z\n  FAIL  ab \n  FAIL  name with spaces\n  pass  b\n  pass  Upper\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n  tests 9\n",
+    "--- test report: s ---\n  FAIL  ab \n  pass  dup__dup1\n  pass  b\n  pass  name with spaces\n  pass  Upper\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  adds_zero\n  pass  a-b\n  pass  a\n\n  tests 9\n",
+    "--- test report: s ---\n  FAIL  dup__dup2\n  pass  adds_big\n  FAIL   a\n  pass  a\n  FAIL  ab \n  FAIL  adds_zero\n  FAIL  t_1\n  FAIL  adds_small\n  pass  Upper\n\n  tests 9\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n  pass  b\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  b\n  pass  a\n\n  tests 2\n",
+    "--- test report: s ---\n  pass  abc\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  ab\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  B\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a-b\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a.b\n  FAIL  a/b\n\n  tests 2\n",
+    "--- test report: s ---\n  pass  \n\n  tests 1\n",
+    "--- test report: s ---\n  pass  \n\n  tests 1\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  caf\xc3\xa9\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  x y\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  t_10\n  pass  t_2\n\n  tests 2\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  b\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n  FAIL  b\n  pass  c\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  x\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n  FAIL  b\n\n  tests 2\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  a\n  pass  A\n\n  tests 2\n"
+];
+
+pub const TD_B : [63]string = [
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  FAIL  ab\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a-b\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL   a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  dup__dup2\n  FAIL  ab\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  a\n  pass   a\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  a\n  pass  adds_small\n\n  tests 2\n",
+    "--- test report: s ---\n  pass   a\n  pass  adds_small\n  pass  caf\xc3\xa9\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  a/b\n  pass  t_1\n  pass  adds_zero\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  dup__dup1\n  pass  b\n  pass  ab\n\n  tests 3\n",
+    "--- test report: s ---\n  FAIL  b\n  pass  name with spaces\n  pass  a_b\n  pass  adds_big\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  adds_big\n  pass  a/b\n  pass  a_b\n  FAIL  name with spaces\n\n  tests 4\n",
+    "--- test report: s ---\n  FAIL  abc\n  pass  t_10\n  pass  a/b\n  pass  Upper\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  dup__dup2\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  t_2\n  pass  name with spaces\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  a-b\n  pass  t_1\n  pass  ab \n  FAIL  a/b\n\n  tests 4\n",
+    "--- test report: s ---\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  FAIL  dup__dup2\n  FAIL  ab \n  pass  name with spaces\n\n  tests 4\n",
+    "--- test report: s ---\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  name with spaces\n  pass   a\n  FAIL  a/b\n  pass  z\n\n  tests 5\n",
+    "--- test report: s ---\n  FAIL  t_10\n  pass  adds_big\n  pass  ab\n  FAIL  a_b\n  FAIL  ab \n\n  tests 5\n",
+    "--- test report: s ---\n  FAIL  a/b\n  FAIL  adds_small\n  FAIL  name with spaces\n  pass  a.b\n  FAIL  adds_zero\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  a.b\n  pass  dup__dup1\n  FAIL  z\n  pass  a_b\n  pass  adds_zero\n  pass  t_2\n\n  tests 6\n",
+    "--- test report: s ---\n  pass  ab \n  pass  z\n  FAIL  Upper\n  pass  abc\n  pass  b\n  FAIL  name with spaces\n\n  tests 6\n",
+    "--- test report: s ---\n  pass   a\n  pass  a\n  pass  adds_small\n  pass  t_1\n  pass  abc\n  pass  Upper\n\n  tests 6\n",
+    "--- test report: s ---\n  pass  adds_small\n  pass   a\n  pass  t_1\n  pass  a\n  FAIL  dup__dup1\n  FAIL  a-b\n  FAIL  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  adds_zero\n\n  tests 8\n",
+    "--- test report: s ---\n  pass  Upper\n  FAIL  a/b\n  pass  t_1\n  pass  adds_big\n  FAIL  ab \n  pass  z\n  FAIL  b\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n  tests 8\n",
+    "--- test report: s ---\n  pass  a\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  FAIL  a_b\n  FAIL  dup__dup2\n  pass  abc\n  pass  adds_zero\n  pass  a.b\n  FAIL   a\n\n  tests 8\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  t_2\n  pass  adds_zero\n  FAIL  b\n  pass  a/b\n  FAIL   a\n\n  tests 5\n",
+    "--- test report: s ---\n  pass  a-b\n  FAIL  adds_zero\n  pass  ab \n  pass  t_10\n  pass  name with spaces\n\n  tests 5\n",
+    "--- test report: s ---\n  pass   a\n  pass  dup__dup1\n  FAIL  a-b\n  pass  t_1\n  pass  a/b\n\n  tests 5\n",
+    "--- test report: s ---\n  FAIL  a.b\n  pass  a/b\n  pass  adds_big\n  pass  z\n  FAIL  ab \n  FAIL  name with spaces\n  pass  b\n  pass  Upper\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n  tests 9\n",
+    "--- test report: s ---\n  FAIL  ab \n  pass  dup__dup1\n  pass  b\n  pass  name with spaces\n  pass  Upper\n  pass  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  pass  adds_zero\n  pass  a-b\n  pass  a\n\n  tests 9\n",
+    "--- test report: s ---\n  FAIL  dup__dup2\n  pass  adds_big\n  FAIL   a\n  pass  a\n  FAIL  ab \n  FAIL  adds_zero\n  FAIL  t_1\n  FAIL  adds_small\n  pass  Upper\n\n  tests 9\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  b\n  pass  a\n\n  tests 2\n",
+    "--- test report: s ---\n  pass  a\n  FAIL  b\n\n  tests 2\n",
+    "--- test report: s ---\n  pass  ab\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  abc\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a_b\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a/b\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  \n\n  tests 1\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  FAIL  \n\n  tests 1\n",
+    "--- test report: s ---\n  pass  cafe\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  x  y\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  t_1\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  b\n\n  tests 1\n",
+    "--- test report: s ---\n  FAIL  a\n\n  tests 1\n",
+    "--- test report: s ---\n  pass  a\n  pass  b\n  FAIL  c\n\n  tests 3\n",
+    "--- test report: s ---\n  pass  y\n  FAIL  z\n\n  tests 2\n",
+    "--- test report: s ---\n\n  tests 0\n",
+    "--- test report: s ---\n  pass  a\n  FAIL  b\n\n  tests 2\n",
+    "--- test report: s ---\n  FAIL  A\n  pass  a\n\n  tests 2\n"
+];
+
+pub const TD_OUT : [63]string = [
+    "",
+    "",
+    "",
+    "name with spaces: t27b pass, reference has no such test\n",
+    "Upper: t27b pass, reference has no such test\n",
+    "adds_zero: t27b pass, reference has no such test\n",
+    "ab: t27b has no such test, reference FAIL\n",
+    "a-b: t27b has no such test, reference FAIL\n",
+    " a: t27b has no such test, reference FAIL\n",
+    "ab: t27b pass, reference FAIL\n",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "b: t27b pass, reference FAIL\nname with spaces: t27b FAIL, reference pass\n",
+    "",
+    "",
+    "adds_small: t27b pass, reference has no such test\nname with spaces: t27b has no such test, reference pass\nt_10: t27b pass, reference has no such test\nt_2: t27b has no such test, reference pass\n",
+    "a-b: t27b FAIL, reference pass\na.b: t27b pass, reference has no such test\na/b: t27b has no such test, reference FAIL\nab : t27b has no such test, reference pass\ndup__dup2: t27b FAIL, reference has no such test\n",
+    "a: t27b pass, reference has no such test\nab : t27b has no such test, reference FAIL\nabc: t27b pass, reference has no such test\nname with spaces: t27b has no such test, reference pass\n",
+    " a: t27b has no such test, reference pass\nUpper: t27b pass, reference has no such test\na/b: t27b has no such test, reference FAIL\ncaf\xc3\xa9: t27b pass, reference has no such test\nt_2: t27b pass, reference has no such test\nz: t27b has no such test, reference pass\n",
+    " a: t27b pass, reference has no such test\na/b: t27b FAIL, reference has no such test\na_b: t27b has no such test, reference FAIL\nab: t27b has no such test, reference pass\nab : t27b has no such test, reference FAIL\nadds_small: t27b FAIL, reference has no such test\n",
+    "a: t27b pass, reference has no such test\na.b: t27b has no such test, reference pass\nadds_zero: t27b has no such test, reference FAIL\nname with spaces: t27b has no such test, reference FAIL\nt_1: t27b FAIL, reference has no such test\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx: t27b pass, reference has no such test\n",
+    "Upper: t27b FAIL, reference has no such test\na: t27b pass, reference has no such test\na_b: t27b has no such test, reference pass\nadds_zero: t27b has no such test, reference pass\ncaf\xc3\xa9: t27b pass, reference has no such test\nname with spaces: t27b FAIL, reference has no such test\nt_2: t27b has no such test, reference pass\nz: t27b has no such test, reference FAIL\n",
+    " a: t27b pass, reference has no such test\nUpper: t27b has no such test, reference FAIL\nabc: t27b has no such test, reference pass\nadds_small: t27b pass, reference has no such test\nb: t27b has no such test, reference pass\nname with spaces: t27b has no such test, reference FAIL\nt_1: t27b FAIL, reference has no such test\nt_10: t27b FAIL, reference has no such test\nz: t27b FAIL, reference pass\n",
+    " a: t27b FAIL, reference pass\nUpper: t27b has no such test, reference pass\na-b: t27b pass, reference has no such test\na.b: t27b FAIL, reference has no such test\na_b: t27b FAIL, reference has no such test\nabc: t27b has no such test, reference pass\nadds_big: t27b pass, reference has no such test\nadds_small: t27b has no such test, reference pass\nt_1: t27b has no such test, reference pass\n",
+    "Upper: t27b FAIL, reference has no such test\na-b: t27b has no such test, reference FAIL\na_b: t27b pass, reference has no such test\nadds_big: t27b pass, reference has no such test\nadds_zero: t27b has no such test, reference pass\nb: t27b FAIL, reference has no such test\ndup__dup1: t27b has no such test, reference FAIL\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx: t27b has no such test, reference FAIL\n",
+    "a-b: t27b FAIL, reference has no such test\na_b: t27b FAIL, reference has no such test\nab : t27b has no such test, reference FAIL\nb: t27b has no such test, reference FAIL\ndup__dup1: t27b FAIL, reference has no such test\ndup__dup2: t27b FAIL, reference has no such test\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx: t27b has no such test, reference pass\nz: t27b has no such test, reference pass\n",
+    " a: t27b has no such test, reference FAIL\na-b: t27b pass, reference has no such test\na.b: t27b has no such test, reference pass\na_b: t27b pass, reference FAIL\nab : t27b FAIL, reference has no such test\nabc: t27b has no such test, reference pass\nadds_zero: t27b has no such test, reference pass\ndup__dup2: t27b pass, reference FAIL\nt_10: t27b pass, reference has no such test\nt_2: t27b FAIL, reference has no such test\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx: t27b FAIL, reference pass\n",
+    "Upper: t27b FAIL, reference has no such test\ndup__dup2: t27b FAIL, reference has no such test\nt_1: t27b pass, reference has no such test\nt_10: t27b pass, reference has no such test\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx: t27b pass, reference has no such test\n",
+    " a: t27b pass, reference has no such test\na/b: t27b FAIL, reference has no such test\na_b: t27b pass, reference has no such test\nt_2: t27b pass, reference has no such test\nz: t27b pass, reference has no such test\n",
+    "a: t27b pass, reference has no such test\na.b: t27b pass, reference has no such test\nb: t27b pass, reference has no such test\ndup__dup1: t27b pass, reference has no such test\ndup__dup2: t27b pass, reference has no such test\n",
+    " a: t27b has no such test, reference FAIL\na/b: t27b has no such test, reference pass\nadds_zero: t27b has no such test, reference pass\nb: t27b has no such test, reference FAIL\nt_2: t27b has no such test, reference pass\n",
+    "a-b: t27b has no such test, reference pass\nab : t27b has no such test, reference pass\nadds_zero: t27b has no such test, reference FAIL\nname with spaces: t27b has no such test, reference pass\nt_10: t27b has no such test, reference pass\n",
+    " a: t27b has no such test, reference pass\na-b: t27b has no such test, reference FAIL\na/b: t27b has no such test, reference pass\ndup__dup1: t27b has no such test, reference pass\nt_1: t27b has no such test, reference pass\n",
+    "",
+    "",
+    "",
+    "",
+    "a: t27b pass, reference FAIL\n",
+    "a: t27b FAIL, reference pass\n",
+    "",
+    "",
+    "",
+    "ab: t27b has no such test, reference pass\nabc: t27b pass, reference has no such test\n",
+    "ab: t27b pass, reference has no such test\nabc: t27b has no such test, reference pass\n",
+    "B: t27b pass, reference has no such test\na: t27b has no such test, reference pass\n",
+    "a-b: t27b pass, reference has no such test\na_b: t27b has no such test, reference pass\n",
+    "a.b: t27b pass, reference has no such test\n",
+    ": t27b pass, reference FAIL\n",
+    ": t27b pass, reference has no such test\n",
+    ": t27b has no such test, reference FAIL\n",
+    "cafe: t27b has no such test, reference pass\ncaf\xc3\xa9: t27b pass, reference has no such test\n",
+    "x  y: t27b has no such test, reference pass\nx y: t27b pass, reference has no such test\n",
+    "t_1: t27b has no such test, reference pass\nt_10: t27b pass, reference has no such test\nt_2: t27b pass, reference has no such test\n",
+    "a: t27b pass, reference has no such test\nb: t27b has no such test, reference FAIL\n",
+    "a: t27b has no such test, reference FAIL\nb: t27b pass, reference has no such test\n",
+    "b: t27b FAIL, reference pass\nc: t27b pass, reference FAIL\n",
+    "x: t27b pass, reference has no such test\ny: t27b has no such test, reference pass\nz: t27b has no such test, reference FAIL\n",
+    "a: t27b FAIL, reference has no such test\nb: t27b FAIL, reference has no such test\n",
+    "a: t27b has no such test, reference pass\nb: t27b has no such test, reference FAIL\n",
+    "A: t27b pass, reference FAIL\n"
+];
+
+// T4: parse_cargo_test -- 62 outputs (lines joined by a newline), passed, failed, ignored, suites
+pub const TC_N : usize = 62;
+pub const TC_IN : [62]string = [
+    "",
+    "",
+    "running 3 tests",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "test result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s",
+    "test result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\nx\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ny\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s",
+    "x test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s tail",
+    "  test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "a test result: ok. 1 passed; 0 failed; 0 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignore",
+    "test result: ok. 1 passed; 0 failed; ignored",
+    "test result: ok.  1 passed; 0 failed; 0 ignored",
+    "test result: ok.1 passed; 0 failed; 0 ignored",
+    "test result: ok. 1 passed;  0 failed; 0 ignored",
+    "test result: ok. 1 passed; 0 failed;0 ignored",
+    "test result: . 1 passed; 0 failed; 0 ignored",
+    "test result: ok 1 passed; 0 failed; 0 ignored",
+    "test result: ok. 1 passed 0 failed; 0 ignored",
+    "test result ok. 1 passed; 0 failed; 0 ignored",
+    "Test result: ok. 1 passed; 0 failed; 0 ignored",
+    "test  result: ok. 1 passed; 0 failed; 0 ignored",
+    "test result:ok. 1 passed; 0 failed; 0 ignored",
+    "test result: ok_2. 4 passed; 5 failed; 6 ignored",
+    "test result: o-k. 1 passed; 0 failed; 0 ignored",
+    "test result: ok. x passed; 0 failed; 0 ignored",
+    "test result: ok. -1 passed; 0 failed; 0 ignored",
+    "test result: ok. 1.5 passed; 0 failed; 0 ignored",
+    "test result: ok. 007 passed; 000 failed; 010 ignored",
+    "test result: test result: ok. 1 passed; 0 failed; 0 ignored",
+    "test result: ok. test result: ok. 2 passed; 0 failed; 0 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignored test result: ok. 8 passed; 8 failed; 8 ignored",
+    "x test result: ok. 1 passed; 0 failed; 0 ignored; test result: FAILED. 2 passed; 3 failed; 4 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignored\n\ntest result: ok. 2 passed; 0 failed; 0 ignored\n",
+    "   Doc-tests t27b\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+    "test result: ok. 1 passed; 0 failed; 0 ignored\x0b",
+    "test result: ok. 1 passed;\x0b0 failed; 0 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignored\xc2\x85",
+    "\xc2\xa0test result: ok. 1 passed; 0 failed; 0 ignored",
+    "test result: ok. 5 passed; 1 failed; 2 ignored\ntest result: FAILED. 0 passed; 3 failed; 0 ignored",
+    "test result: ok. 0 passed; 0 failed; 1 ignored",
+    "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored",
+    "test result: ok. 12 passed; 0 failed; 0 ignored\ntest result: ok. 3 passed; 0 failed; 3 ignored\ntest result: ok. 1 passed; 1 failed; 1 ignored",
+    "test result: ok. 1 passed; 0 failed; 0 ignored\xc3\xa9",
+    "test result: ok. 1 passed; 0 failed; 0 ignored\xe2\x80\xa8",
+    "running 5 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\ntest result: FAILED. 3 passed; 2 failed; 0 ignored",
+    "test result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured",
+    "noise 92\nnoise 0",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured\nnoise 46",
+    "noise 93\nnoise 7\nnoise 47\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nnoise 15\nnoise 13\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "noise 37\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nnoise 98\nnoise 14\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nnoise 10\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ntest result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nnoise 8",
+    "noise 8\ntest result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\nnoise 4\nnoise 67\nnoise 15\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nnoise 49",
+    "noise 48\nnoise 94\nnoise 47",
+    "test result: ok. 3 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "noise 64\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured\nnoise 53\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s",
+    "test result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s\nnoise 51\ntest result: ok. 123456 passed; 7 failed; 99 ignored; 0 measured\ntest result: FAILED. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.50s\nnoise 10\nnoise 87"
+];
+
+pub const TC_P : [62]u64 = [
+    0, 0, 0, 3, 0, 10, 123456, 13, 13, 3, 3, 3, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0,
+    0, 0, 0, 7, 1, 2, 1, 1, 3, 0, 1, 0, 1, 1, 5, 0, 0, 16, 1, 1, 3, 123456, 0, 123459, 0, 0, 246912,
+    13, 13, 0, 123469, 123466, 123476
+];
+
+pub const TC_F : [62]u64 = [
+    0, 0, 0, 1, 0, 2, 7, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 1, 0, 0, 2, 7, 0, 8, 0, 0, 14, 3, 3, 0, 10, 9, 11
+];
+
+pub const TC_I : [62]u64 = [
+    0, 0, 0, 2, 0, 1, 99, 3, 3, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0,
+    10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 4, 0, 0, 0, 99, 0, 101, 0, 0, 198, 3, 3, 0, 102, 100,
+    101
+];
+
+pub const TC_S : [62]u64 = [
+    0, 0, 0, 1, 1, 1, 1, 2, 3, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    1, 1, 1, 1, 1, 2, 1, 1, 0, 1, 1, 2, 1, 1, 3, 1, 1, 1, 1, 0, 2, 1, 3, 3, 5, 3, 0, 4, 3, 3
+];
+
+// T5: reference_one after the process ended -- 61 runs (exit code, stderr, stdout), the verdict and the detail
+pub const TR_N : usize = 61;
+pub const TR_RC : [61]i32 = [
+    0, 0, 0, 0, 1, 1, 2, -9, -9, 101, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 0, 0, 1, -9, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 1, 1, 101, 0, 0, 101, -9, 0, 1
+];
+
+pub const TR_ERR : [61]string = [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "boom\n",
+    "t27c: error: x\nmore\n",
+    "",
+    "killed\n",
+    "thread 'main' panicked at src/x.rs:1:1:\nmsg\n",
+    "  \n  \n\n",
+    "\n\n  first\nsecond\n",
+    "first   \nsecond\n",
+    "  first  \n",
+    "a\x0bb\nc",
+    "a\x0cb",
+    "a\x1cb",
+    "a\xc2\x85b",
+    "\xc2\x85a",
+    "a\xc2\xa0\n",
+    "\xc2\xa0\xc2\xa0a\xc2\xa0",
+    "a\xe2\x80\xa8b",
+    "\xe3\x80\x80a\xe3\x80\x80",
+    "\xe2\x80\xa9",
+    "a\xe2\x80\xa9b\xe2\x80\xa8c",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9",
+    "          qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    "Resource temporarily unavailable",
+    "fork: Resource temporarily unavailable\n",
+    "error: SystemResources\n",
+    "x SystemResources y",
+    "SystemResources",
+    "systemresources",
+    "resource temporarily unavailable",
+    "Resource temporarily  unavailable",
+    "SystemResource",
+    "Resource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\nResource temporarily unavailable\n",
+    "warning: unused\n",
+    "warning: unused\n",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "error: no such spec\n",
+    "",
+    "err 1\n",
+    "  e2  \nmore",
+    "err 3\n",
+    "  e4  \nmore",
+    "err 5\n",
+    "",
+    "",
+    "",
+    "err 9\n"
+];
+
+pub const TR_OUT : [61]string = [
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "  BLOCKED  does not compile: spec.zig:20:16: error: use of undeclared identifier 'x'\n\n  A blocked spec is not a failing one.\n",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/lab/pass3.t27 ---\n  BLOCKED  zig not on PATH\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "t27c: BLOCKED: zig not on PATH\n",
+    "  tests 3\n  FAIL 0\n",
+    "  tests 3\n  FAIL 1\n",
+    "BLOCKED zig\n",
+    "--- test report: specs/lab/pass3.t27 ---\n  BLOCKED  zig not on PATH\n\n  A blocked spec is not a failing one. It never produced a\n  binary, so it has no per-test result to report.\n",
+    "",
+    "  BLOCKED  does not compile: spec.zig:20:16: error: use of undeclared identifier 'x'\n\n  A blocked spec is not a failing one.\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  FAIL  t2\n\n  tests       2\n  pass        1\n  FAIL        1\n  rate    50.0%\n",
+    "",
+    "--- test report: specs/a/b.t27 ---\n  pass  t1\n  pass  t2\n  pass  t3\n\n  tests       3\n  pass        3\n  FAIL        0\n  rate    100.0%\n"
+];
+
+pub const TR_V : [61]u8 = [
+    0, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    11, 11, 11, 11, 11, 0, 0, 0, 0, 11, 0, 5, 2, 2, 0, 5, 2, 2, 2, 2, 2, 2, 2, 2, 5, 2, 2, 2, 2
+];
+
+pub const TR_D : [61]string = [
+    "",
+    "1 of 2 tests fail",
+    "does not compile: spec.zig:20:16: error: use of undeclared identifier 'x'",
+    "unreadable test-report output",
+    "t27c test-report exited 1: ",
+    "t27c test-report exited 1: boom",
+    "t27c test-report exited 2: t27c: error: x",
+    "t27c test-report exited -9: ",
+    "t27c test-report exited -9: killed",
+    "t27c test-report exited 101: thread 'main' panicked at src/x.rs:1:1:",
+    "t27c test-report exited 1: ",
+    "t27c test-report exited 1: first",
+    "t27c test-report exited 1: first   ",
+    "t27c test-report exited 1: first",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: ",
+    "t27c test-report exited 1: a",
+    "t27c test-report exited 1: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "t27c test-report exited 1: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "t27c test-report exited 1: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "t27c test-report exited 1: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "t27c test-report exited 1: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "t27c test-report exited 1: caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9",
+    "t27c test-report exited 1: qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    "zig ran out of threads/processes in the container",
+    "zig ran out of threads/processes in the container",
+    "zig ran out of threads/processes in the container",
+    "zig ran out of threads/processes in the container",
+    "zig ran out of threads/processes in the container",
+    "",
+    "",
+    "",
+    "",
+    "zig ran out of threads/processes in the container",
+    "",
+    "1 of 2 tests fail",
+    "zig not on PATH",
+    "unreadable test-report output",
+    "",
+    "1 of 3 tests fail",
+    "zig",
+    "t27c test-report exited 2: ",
+    "t27c test-report exited 2: error: no such spec",
+    "does not compile: spec.zig:20:16: error: use of undeclared identifier 'x'",
+    "t27c test-report exited 1: err 1",
+    "t27c test-report exited 1: e2  ",
+    "t27c test-report exited 101: err 3",
+    "unreadable test-report output",
+    "1 of 2 tests fail",
+    "t27c test-report exited 101: ",
+    "t27c test-report exited -9: ",
+    "unreadable test-report output",
+    "t27c test-report exited 1: err 9"
+];
+
+// T5b: a run that could not start (the error text) and a run that outran its time (the seconds)
+pub const SP_N : usize = 10;
+pub const SP_ERR : [10]string = [
+    "",
+    "[Errno 11] Resource temporarily unavailable",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9",
+    "[Errno 2] No such file or directory: '/work/target/release/t27c'",
+    "e\n",
+    "  padded  "
+];
+
+pub const SP_D : [10]string = [
+    "could not start t27c: ",
+    "could not start t27c: [Errno 11] Resource temporarily unavailable",
+    "could not start t27c: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "could not start t27c: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "could not start t27c: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "could not start t27c: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "could not start t27c: caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9caf\xc3\xa9",
+    "could not start t27c: [Errno 2] No such file or directory: '/work/target/release/t27c'",
+    "could not start t27c: e\n",
+    "could not start t27c:   padded  "
+];
+
+pub const OV_N : usize = 6;
+pub const OV_SECS : [6]u64 = [
+    0, 1, 30, 300, 301, 100000
+];
+
+pub const OV_D : [6]string = [
+    "over 0 s",
+    "over 1 s",
+    "over 30 s",
+    "over 300 s",
+    "over 301 s",
+    "over 100000 s"
+];
+
+// T6: the summary of a run -- 62 result sets (rows of five words: t27b code, reference code, compared, tests listed,
+// retried), whether the reference dict is not empty, whether lab.py raises KeyError on them, the 17 summary
+// fields (LR_NULL where the summary says null), and the summary block of the run document for the first LAYOUT of them
+pub const TS_N : usize = 62;
+pub const TS_LAYOUT : usize = 12;
+pub const TS_ROWS : [1320]u32 = [
+    2, 0, 1, 0, 0, 7, 5, 1, 1, 1, 4, 5, 0, 0, 1, 7, 11, 0, 0, 0, 7, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 8,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 3, 2, 0, 0, 0, 0, 2, 0, 0, 0, 8, 0, 0, 0, 0, 5, 5, 1, 0,
+    1, 9, 4294967295, 0, 0, 0, 9, 2, 0, 0, 0, 6, 0, 0, 0, 0, 6, 4294967295, 0, 0, 0, 1, 11, 0, 0, 1,
+    7, 4294967295, 0, 0, 0, 1, 4294967295, 0, 0, 0, 0, 4294967295, 0, 0, 1, 4, 4294967295, 0, 0, 0,
+    1, 4294967295, 0, 0, 0, 9, 4294967295, 0, 0, 0, 2, 4294967295, 0, 0, 0, 8, 4294967295, 0, 0, 0,
+    7, 4294967295, 0, 0, 0, 0, 4294967295, 0, 0, 1, 8, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 9,
+    11, 0, 0, 0, 2, 0, 1, 1, 0, 3, 0, 1, 2, 0, 0, 11, 0, 0, 0, 0, 0, 1, 1, 0, 7, 0, 0, 0, 0, 9, 8,
+    0, 0, 0, 1, 11, 0, 0, 0, 4, 0, 0, 0, 0, 7, 0, 0, 0, 0, 2, 8, 0, 0, 1, 8, 0, 0, 0, 0, 8, 0, 0, 0,
+    1, 6, 5, 1, 1, 1, 5, 5, 0, 0, 1, 8, 5, 1, 0, 1, 4, 0, 1, 2, 0, 0, 0, 1, 0, 0, 7, 8, 0, 0, 0, 6,
+    0, 0, 0, 0, 5, 8, 0, 0, 0, 1, 8, 0, 0, 0, 6, 8, 0, 0, 0, 0, 11, 0, 0, 0, 3, 5, 1, 1, 0, 0, 0, 1,
+    1, 1, 6, 8, 0, 0, 0, 1, 8, 0, 0, 0, 5, 5, 1, 0, 0, 3, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 11, 0, 0, 0,
+    3, 0, 1, 3, 0, 4, 8, 0, 0, 0, 8, 4294967295, 0, 0, 0, 2, 0, 0, 0, 0, 6, 4294967295, 0, 0, 0, 0,
+    11, 0, 0, 0, 6, 5, 1, 2, 0, 7, 11, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 0, 0, 1, 6, 4294967295, 0, 0,
+    0, 2, 4294967295, 0, 0, 0, 6, 4294967295, 0, 0, 0, 0, 4294967295, 0, 0, 0, 1, 8, 0, 0, 0, 3, 8,
+    0, 0, 0, 9, 0, 1, 3, 1, 9, 2, 0, 0, 0, 0, 0, 1, 2, 1, 0, 5, 1, 3, 0, 8, 8, 0, 0, 0, 9, 11, 0, 0,
+    0, 0, 2, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 0, 9, 0, 1, 2, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, 0, 2,
+    0, 0, 0, 0, 1, 4294967295, 0, 0, 1, 9, 11, 0, 0, 0, 8, 2, 0, 0, 0, 7, 11, 0, 0, 0, 2, 8, 0, 0,
+    0, 8, 8, 0, 0, 0, 6, 5, 1, 0, 0, 1, 2, 0, 0, 0, 2, 0, 1, 1, 0, 0, 8, 0, 0, 0, 0, 4294967295, 0,
+    0, 0, 4, 8, 0, 0, 0, 9, 2, 0, 0, 0, 6, 0, 0, 0, 0, 7, 5, 1, 2, 0, 5, 8, 0, 0, 0, 1, 2, 0, 0, 0,
+    5, 5, 0, 0, 0, 8, 4294967295, 0, 0, 0, 9, 4294967295, 0, 0, 0, 1, 4294967295, 0, 0, 1, 1,
+    4294967295, 0, 0, 1, 1, 4294967295, 0, 0, 0, 1, 4294967295, 0, 0, 0, 2, 2, 0, 0, 0, 4, 11, 0, 0,
+    0, 3, 8, 0, 0, 0, 0, 8, 0, 0, 0, 0, 2, 0, 0, 0, 4, 5, 0, 0, 0, 3, 0, 1, 2, 0, 9, 8, 0, 0, 0, 0,
+    11, 0, 0, 0, 4, 0, 1, 1, 0, 9, 8, 0, 0, 0, 8, 0, 0, 0, 0, 6, 2, 0, 0, 0, 2, 0, 0, 0, 0, 6, 0, 1,
+    0, 1, 4, 0, 1, 1, 1, 6, 0, 1, 2, 0, 9, 2, 0, 0, 0, 8, 0, 1, 1, 0, 7, 0, 1, 0, 0, 1, 8, 0, 0, 0,
+    6, 11, 0, 0, 0, 0, 4294967295, 0, 0, 0, 5, 8, 0, 0, 1, 8, 5, 1, 1, 0, 6, 0, 1, 1, 0, 3, 11, 0,
+    0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1, 9, 8, 0, 0, 0, 5, 8, 0, 0, 0, 8, 4294967295, 0, 0, 1, 6, 5,
+    0, 0, 0, 1, 2, 0, 0, 0, 5, 8, 0, 0, 1, 0, 2, 0, 0, 0, 4, 0, 1, 2, 1, 0, 0, 1, 1, 0, 9, 0, 1, 2,
+    0, 0, 0, 1, 3, 1, 6, 5, 1, 0, 0, 0, 8, 0, 0, 0, 1, 0, 1, 1, 0, 0, 5, 1, 2, 0, 4, 0, 0, 0, 0, 0,
+    8, 0, 0, 0, 4, 11, 0, 0, 1, 1, 0, 1, 1, 0, 7, 2, 0, 0, 0, 1, 4294967295, 0, 0, 1, 7, 4294967295,
+    0, 0, 0, 0, 4294967295, 0, 0, 0, 7, 4294967295, 0, 0, 0, 0, 0, 1, 3, 0, 9, 5, 1, 2, 0, 9, 0, 1,
+    0, 0, 5, 2, 0, 0, 0, 9, 8, 0, 0, 0, 0, 8, 0, 0, 0, 7, 11, 0, 0, 0, 2, 11, 0, 0, 1, 2, 0, 0, 0,
+    0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 4, 11, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+    0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 4294967295, 0, 0, 0, 8, 11, 0, 0, 0, 3, 11, 0, 0,
+    0, 5, 8, 0, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, 0, 8, 8, 0, 0, 0, 2, 0, 0, 0, 0, 6, 8, 0, 0, 0, 0,
+    0, 1, 0, 0, 4, 2, 0, 0, 0, 0, 0, 1, 2, 1, 4, 11, 0, 0, 0, 0, 0, 1, 2, 0, 2, 5, 0, 0, 0, 5, 0, 1,
+    0, 0, 1, 0, 1, 1, 0, 8, 0, 1, 0, 0, 6, 8, 0, 0, 0, 2, 0, 1, 1, 0, 8, 0, 1, 1, 0, 4, 8, 0, 0, 0,
+    9, 0, 1, 2, 0, 7, 5, 0, 0, 1, 8, 5, 1, 0, 0, 5, 0, 1, 1, 0, 0, 0, 1, 4, 0, 6, 0, 1, 0, 0, 1,
+    4294967295, 0, 0, 0, 7, 4294967295, 0, 0, 1, 6, 4294967295, 0, 0, 0, 9, 4294967295, 0, 0, 1, 4,
+    4294967295, 0, 0, 0, 9, 4294967295, 0, 0, 0, 2, 4294967295, 0, 0, 0, 6, 4294967295, 0, 0, 1, 9,
+    5, 1, 3, 0, 1, 0, 1, 1, 0, 5, 8, 0, 0, 0, 0, 0, 1, 1, 0, 7, 5, 1, 1, 0, 5, 8, 0, 0, 0, 1, 5, 0,
+    0, 0, 2, 5, 1, 0, 0, 0, 2, 0, 0, 1, 8, 8, 0, 0, 0, 2, 0, 1, 0, 0, 9, 8, 0, 0, 0, 0, 0, 1, 1, 0,
+    5, 0, 1, 0, 0, 8, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 3, 0, 1, 2, 0, 0, 0, 3, 5, 0, 0, 0, 7, 0,
+    0, 0, 0, 4, 0, 1, 0, 0, 6, 0, 1, 1, 0, 0, 5, 1, 1, 1, 0, 5, 1, 0, 0, 2, 0, 1, 2, 0, 1, 0, 1, 3,
+    0, 0, 0, 1, 1, 0, 5, 0, 0, 0, 0, 8, 5, 1, 1, 0, 4, 5, 1, 1, 0, 3, 8, 0, 0, 0, 0, 8, 0, 0, 0, 1,
+    11, 0, 0, 1, 0, 0, 1, 2, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 8, 8, 0, 0, 0, 7, 5, 0, 0, 0, 6, 0, 1,
+    1, 0, 0, 11, 0, 0, 0, 7, 2, 0, 0, 0
+];
+
+pub const TS_OFF : [63]usize = [
+    0, 2, 12, 13, 17, 18, 28, 31, 36, 44, 48, 49, 51, 56, 64, 68, 71, 73, 77, 79, 83, 86, 88, 89,
+    93, 101, 106, 109, 110, 116, 122, 126, 130, 138, 140, 141, 142, 150, 156, 157, 163, 165, 169,
+    175, 183, 188, 192, 195, 196, 200, 201, 204, 208, 209, 215, 223, 227, 237, 242, 247, 257, 262,
+    264
+];
+
+pub const TS_REF : [62]u8 = [
+    1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1
+];
+
+pub const TS_CRASH : [62]u8 = [
+    0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0,
+    0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0
+];
+
+pub const TS_FIELDS : [1054]u64 = [
+    2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 0, 1, 0, 1, 10, 3, 1, 5, 0, 1, 0, 4, 0, 0, 0, LR_NULL,
+    LR_NULL, 0, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, LR_NULL, LR_NULL, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 0, 1, 1, 1, 1, 0, 0, 0, 0, LR_NULL, LR_NULL,
+    0, 0, 1, 0, 5, 3, 2, 2, 0, 1, 0, 1, 0, 0, 3, 3, 4, 0, 0, 0, 0, 8, 5, 1, 0, 1, 0, 0, 0, 0, 0, 0,
+    LR_NULL, LR_NULL, 0, 2, 2, 2, 4, 1, 0, 0, 0, 0, 0, 0, 1, 1, 3, 2, 3, 1, 0, 1, 3, 1, 1, 0, 1, 0,
+    1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, LR_NULL, LR_NULL, 0, 1, 0,
+    0, 5, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 8, 3, 1, 2, 1, 1, 0, 1, 1, 1, 3, 2, 4, 1,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2, 1, 0, 0, 0, 1, 1, 1, 1, 1,
+    2, 0, 1, 0, 0, 2, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, LR_NULL, LR_NULL, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, LR_NULL, LR_NULL, 0, 0, 0, 0,
+    4, 2, 0, 2, 0, 1, 0, 1, 0, 0, 3, 3, 8, 0, 0, 0, 2, 3, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, LR_NULL,
+    LR_NULL, 0, 0, 1, 0, 2, 2, 0, 2, 0, 2, 0, 0, 0, 0, 2, 1, 2, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1, 2, 0, 1, 0,
+    0, 0, 1, 1, 2, 1, 1, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0,
+    1, 0, 0, 0, 0, 0, 1, 1, 2, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, LR_NULL, LR_NULL, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 1, 2, 0, 0, 0, 2, 0, 0, 0,
+    LR_NULL, LR_NULL, 0, 0, 0, 0, 4, 2, 1, 1, 0, 0, 0, 1, 0, 0, 2, 2, 3, 0, 0, 0, 0, 4, 2, 0, 0, 0,
+    0, 0, 0, 1, 1, 0, LR_NULL, LR_NULL, 0, 0, 1, 0, 8, 5, 1, 0, 1, 0, 0, 0, 3, 3, 5, 3, 4, 0, 1, 1,
+    2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+    0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 6, 4, 0, 3, 0, 2, 0, 1, 0, 0, 4, 4, 8, 1, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+    1, 0, 0, 0, 0, 0, 0, 6, 2, 1, 3, 1, 0, 1, 3, 0, 0, 2, 2, 3, 0, 0, 0, 1, 2, 1, 0, 0, 1, 0, 1, 0,
+    0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 2, 0, 2, 0, 1,
+    0, 1, 0, 0, 3, 2, 5, 1, 0, 0, 0, 8, 4, 3, 4, 0, 3, 0, 1, 0, 0, 0, LR_NULL, LR_NULL, 0, 1, 0, 2,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 2, 1, 0, 0, 0, 1, 0, 0, 0, LR_NULL,
+    LR_NULL, 1, 0, 1, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, LR_NULL, LR_NULL, 0, 0, 1, 0, 1, 0, 0, 0,
+    0, 0, 0, 0, 1, 1, 0, LR_NULL, LR_NULL, 0, 0, 0, 0, 4, 2, 1, 2, 0, 2, 0, 0, 0, 0, 2, 1, 2, 0, 0,
+    0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 2, 0, 0, 0, 0, 3, 2, 0, 0, 1, 0, 1, 0, 0, 0, 2, 1, 1,
+    1, 0, 0, 0, 4, 3, 0, 0, 0, 0, 0, 0, 1, 1, 3, 2, 2, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    LR_NULL, LR_NULL, 0, 0, 0, 0, 6, 4, 0, 1, 0, 1, 0, 0, 1, 1, 5, 3, 7, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 0, 1, 1, 1, 1, 0, 0, 0, 3, 3, 5, 1, 0, 0, 0, 10, 3, 0,
+    2, 1, 1, 0, 1, 0, 0, 5, 2, 2, 2, 1, 1, 1, 5, 3, 0, 2, 1, 2, 0, 0, 0, 0, 3, 3, 5, 0, 0, 1, 0, 5,
+    3, 0, 2, 0, 0, 0, 2, 1, 1, 4, 2, 2, 0, 1, 0, 1, 10, 5, 1, 3, 2, 2, 1, 1, 0, 0, 6, 6, 10, 1, 0,
+    1, 1, 5, 3, 0, 2, 0, 2, 0, 0, 1, 1, 2, 2, 2, 0, 1, 1, 1, 2, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0,
+    LR_NULL, LR_NULL, 0, 1, 0, 0
+];
+
+pub const TS_TXT : [12]string = [
+    " \"summary\": {\n  \"files\": 2,\n  \"reference_pass\": 1,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 2,\n  \"reference_disagree\": 1,\n  \"reference_disagree_tests\": 1,\n  \"t27b_fail\": 0,\n  \"crash\": 1,\n  \"timeout\": 0,\n  \"timeout_retried\": 1\n },\n",
+    " \"summary\": {\n  \"files\": 10,\n  \"reference_pass\": 3,\n  \"reference_lab_error\": 1,\n  \"t27b_pass\": 5,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 1,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 4,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 0,\n  \"reference_disagree\": null,\n  \"reference_disagree_tests\": null,\n  \"t27b_fail\": 0,\n  \"crash\": 2,\n  \"timeout\": 1,\n  \"timeout_retried\": 1\n },\n",
+    " \"summary\": {\n  \"files\": 1,\n  \"reference_pass\": 0,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 1,\n  \"reference_disagree\": 0,\n  \"reference_disagree_tests\": 0,\n  \"t27b_fail\": 1,\n  \"crash\": 0,\n  \"timeout\": 0,\n  \"timeout_retried\": 1\n },\n",
+    "",
+    " \"summary\": {\n  \"files\": 1,\n  \"reference_pass\": 0,\n  \"reference_lab_error\": 1,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 1,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 0,\n  \"reference_disagree\": null,\n  \"reference_disagree_tests\": null,\n  \"t27b_fail\": 0,\n  \"crash\": 0,\n  \"timeout\": 0,\n  \"timeout_retried\": 1\n },\n",
+    "",
+    " \"summary\": {\n  \"files\": 3,\n  \"reference_pass\": 2,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 1,\n  \"t27b_pass_vacuous\": 1,\n  \"t27b_pass_where_reference_passes\": 1,\n  \"t27b_pass_vacuous_where_reference_passes\": 1,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 0,\n  \"reference_disagree\": null,\n  \"reference_disagree_tests\": null,\n  \"t27b_fail\": 0,\n  \"crash\": 0,\n  \"timeout\": 1,\n  \"timeout_retried\": 0\n },\n",
+    " \"summary\": {\n  \"files\": 5,\n  \"reference_pass\": 3,\n  \"reference_lab_error\": 2,\n  \"t27b_pass\": 2,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 1,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 1,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 3,\n  \"reference_disagree\": 3,\n  \"reference_disagree_tests\": 4,\n  \"t27b_fail\": 0,\n  \"crash\": 0,\n  \"timeout\": 0,\n  \"timeout_retried\": 0\n },\n",
+    " \"summary\": {\n  \"files\": 8,\n  \"reference_pass\": 5,\n  \"reference_lab_error\": 1,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 1,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 0,\n  \"reference_disagree\": null,\n  \"reference_disagree_tests\": null,\n  \"t27b_fail\": 0,\n  \"crash\": 2,\n  \"timeout\": 2,\n  \"timeout_retried\": 2\n },\n",
+    " \"summary\": {\n  \"files\": 4,\n  \"reference_pass\": 1,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 1,\n  \"jit_interp_mismatch\": 1,\n  \"reference_compared\": 3,\n  \"reference_disagree\": 2,\n  \"reference_disagree_tests\": 3,\n  \"t27b_fail\": 1,\n  \"crash\": 0,\n  \"timeout\": 1,\n  \"timeout_retried\": 3\n },\n",
+    " \"summary\": {\n  \"files\": 1,\n  \"reference_pass\": 1,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 1,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 1,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 0,\n  \"jit_interp_mismatch\": 0,\n  \"reference_compared\": 1,\n  \"reference_disagree\": 0,\n  \"reference_disagree_tests\": 0,\n  \"t27b_fail\": 0,\n  \"crash\": 0,\n  \"timeout\": 0,\n  \"timeout_retried\": 0\n },\n",
+    " \"summary\": {\n  \"files\": 2,\n  \"reference_pass\": 1,\n  \"reference_lab_error\": 0,\n  \"t27b_pass\": 0,\n  \"t27b_pass_vacuous\": 0,\n  \"t27b_pass_where_reference_passes\": 0,\n  \"t27b_pass_vacuous_where_reference_passes\": 0,\n  \"t27b_pass_where_reference_does_not\": 0,\n  \"mismatch\": 1,\n  \"jit_interp_mismatch\": 1,\n  \"reference_compared\": 0,\n  \"reference_disagree\": null,\n  \"reference_disagree_tests\": null,\n  \"t27b_fail\": 0,\n  \"crash\": 1,\n  \"timeout\": 0,\n  \"timeout_retried\": 0\n },\n"
+];
+
+// T6b: a run where only the reference ran: files, passes, the summary block
+pub const RS_N : usize = 11;
+pub const RS_FILES : [11]u64 = [
+    1, 1, 5, 10, 100, 2000, 3, 7, 12, 40, 999
+];
+
+pub const RS_PASS : [11]u64 = [
+    1, 0, 3, 10, 7, 1752, 0, 7, 5, 39, 998
+];
+
+pub const RS_TXT : [11]string = [
+    " \"summary\": {\n  \"files\": 1,\n  \"reference_pass\": 1,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 1,\n  \"reference_pass\": 0,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 5,\n  \"reference_pass\": 3,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 10,\n  \"reference_pass\": 10,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 100,\n  \"reference_pass\": 7,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 2000,\n  \"reference_pass\": 1752,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 3,\n  \"reference_pass\": 0,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 7,\n  \"reference_pass\": 7,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 12,\n  \"reference_pass\": 5,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 40,\n  \"reference_pass\": 39,\n  \"t27b_pass\": null\n },\n",
+    " \"summary\": {\n  \"files\": 999,\n  \"reference_pass\": 998,\n  \"t27b_pass\": null\n },\n"
+];
+
+
+test the_report_verdict_and_detail_equal_the_pythons_on_every_input {
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < RT_N) {
+        assert lr_report_verdict(RT_IN[i]) == RT_V[i];
+        const w : usize = lr_report_detail(RT_IN[i], &out, 4096, 0);
+        assert lx_out_is(&out, w, RT_D[i]) == true;
+        i = i + 1;
+    }
+}
+
+test the_per_test_tables_equal_the_pythons_on_every_input {
+    var tab : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < TV_N) {
+        const n : u32 = lr_verdicts(TV_IN[i], &tab, LR_TABLE);
+        assert n == TV_COUNT[i];
+        if (n != LR_NONE) {
+            const w : usize = lr_table_text(TV_IN[i], &tab, n as usize, &out, 4096, 0);
+            assert lx_out_is(&out, w, TV_TXT[i]) == true;
+        }
+        i = i + 1;
+    }
+}
+
+test the_disagreement_lines_equal_the_pythons_on_every_pair {
+    var ta : [192]u32 = undefined;
+    var tb : [192]u32 = undefined;
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < TD_N) {
+        const na : u32 = lr_verdicts(TD_A[i], &ta, LR_TABLE);
+        const nb : u32 = lr_verdicts(TD_B[i], &tb, LR_TABLE);
+        assert na != LR_NONE;
+        assert nb != LR_NONE;
+        const w : usize = lr_disagreements(TD_A[i], &ta, na as usize, TD_B[i], &tb, nb as usize, &out, 4096);
+        assert lx_out_is(&out, w, TD_OUT[i]) == true;
+        i = i + 1;
+    }
+}
+
+test the_cargo_totals_equal_the_pythons_on_every_output {
+    var tot : [4]u64 = undefined;
+    var i : usize = 0;
+    while (i < TC_N) {
+        lr_cargo_totals(TC_IN[i], &tot);
+        assert tot[0] == TC_P[i];
+        assert tot[1] == TC_F[i];
+        assert tot[2] == TC_I[i];
+        assert tot[3] == TC_S[i];
+        i = i + 1;
+    }
+}
+
+test the_reference_verdict_and_detail_equal_the_pythons_on_every_run {
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < TR_N) {
+        assert lr_ref_verdict(TR_RC[i], TR_ERR[i], TR_OUT[i]) == TR_V[i];
+        const w : usize = lr_ref_detail(TR_RC[i], TR_ERR[i], TR_OUT[i], &out, 4096, 0);
+        assert lx_out_is(&out, w, TR_D[i]) == true;
+        i = i + 1;
+    }
+}
+
+test the_spawn_and_timeout_details_equal_the_pythons {
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < SP_N) {
+        const w : usize = lr_spawn_detail(SP_ERR[i], &out, 4096, 0);
+        assert lx_out_is(&out, w, SP_D[i]) == true;
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < OV_N) {
+        const w : usize = lr_over_detail(OV_SECS[j], &out, 4096, 0);
+        assert lx_out_is(&out, w, OV_D[j]) == true;
+        j = j + 1;
+    }
+}
+
+test the_summary_block_equals_the_pythons_and_a_result_without_a_reference_is_the_crash {
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < TS_N) {
+        const a : usize = TS_OFF[i] * 5;
+        const b : usize = TS_OFF[i + 1] * 5;
+        const n : usize = TS_OFF[i + 1] - TS_OFF[i];
+        const crash : bool = lr_summary_crash(TS_ROWS[a..b], n);
+        assert crash == (TS_CRASH[i] == 1);
+        if (crash == false) {
+            var k : usize = 0;
+            while (k < 17) {
+                assert lr_summary_field(TS_ROWS[a..b], n, TS_REF[i] == 1, k) == TS_FIELDS[17 * i + k];
+                k = k + 1;
+            }
+            if (i < TS_LAYOUT) {
+                const w : usize = lr_put_summary(TS_ROWS[a..b], n, TS_REF[i] == 1, &out, 4096, 0);
+                assert lx_out_is(&out, w, TS_TXT[i]) == true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+test the_reference_only_summary_equals_the_pythons {
+    var out : [4096]u8 = undefined;
+    var i : usize = 0;
+    while (i < RS_N) {
+        const w : usize = lr_put_reference_summary(RS_FILES[i], RS_PASS[i], &out, 4096, 0);
+        assert lx_out_is(&out, w, RS_TXT[i]) == true;
+        i = i + 1;
+    }
+}
+// END GENERATED

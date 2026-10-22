@@ -1,3 +1,4 @@
+
 # NOW -- Port gHashTag/trinity:fpga/openxc7-synth/trinity_os/trinity_os_core.v (Verilog, 1 module) to specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_os_core.t27 (published 2026-10-13)
 
 ## A bee's work on #9364, published from `queen-9364` (Closes #9364)
