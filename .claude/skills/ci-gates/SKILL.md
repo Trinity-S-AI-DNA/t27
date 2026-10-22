@@ -53,9 +53,9 @@ a claim that isn't true.
 
 Replacing one `echo` with *does every tracked JSON parse* — the weakest question worth
 asking, chosen because it carries no theory that could itself be wrong — immediately found
-`clara-bridge/audit-trail/experience-schema.json` with a literal `...` on line 40, which
-`clara-bridge/tests/run_tests.py:152` loads with `json.load()`. **3 of its 11 tests were
-failing** and no workflow ran that suite at all.
+a vendored audit-trail schema with a literal `...` on line 40, which its own test
+runner loaded with `json.load()` (both files have since been deleted). **3 of that
+suite's 11 tests were failing** and no workflow ran it at all.
 
 ## 2. A gate is green until proven otherwise — check its SCOPE separately from its result
 
@@ -17495,3 +17495,10 @@ fixing a defect and fixing a sighting.
 auto-merged on the required four while the Coq run was still in progress. The repair is
 correct and was measured locally; but note what the merge gate can and cannot say about a
 change to a non-required workflow — nothing. See §550 and the merge-critical census.
+
+## Traps
+
+- 2026-10-19 The L1 check reads every commit message of a PR for Closes/Fixes/Resolves/Refs/Updates #N and rejects 'Part of #N'; pushed history is not rewritten, so tell lane agents to end each commit message with 'Updates #N' before the first push. (#11106)
+- 2026-10-19 One seal the emitter PR did not re-save (ml_host_io_model after the gen-verilog fix) turns coverage and spec-guards red on master for every open PR; read 'tools/check_seal_currency.py' output for the one name, and run it with TRI_T27C set when the tree has no target/. (#11102)
+- 2026-10-19 On a Mac a spec that no longer compiles under Zig cannot be re-sealed: 't27c seal --save' refuses, rightly. If gen_hash_zig, c and rust still MATCH in 'seal --verify', the recorded test pass is still the evidence for that Zig and only the moved hash is set, to the value verify prints; say so in the PR. (#11103)
+- 2026-10-19 't27b test <spec> --check' cross-checks the JIT against the interpreter; a scratch array declared without a value passes the JIT and faults the interpreter on a read of bytes never written, which turns t27b-native-ratchet red for every PR: run --check on every new spec and start scratch arrays at zero. (#11131)

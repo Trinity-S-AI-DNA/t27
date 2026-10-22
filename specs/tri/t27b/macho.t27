@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 ; specs/tri/t27b/macho.t27 -- the layout and the bytes of t27b's Mach-O object file (port epic #6198)
-; `t27b build` writes a 64-bit relocatable object (MH_OBJECT) for arm64. Until this file, all of it was
-; hand-written Rust in cli/t27b/src/macho.rs. Now the layout (where every part of the file starts) and
-; the serialization of the header, the load commands, the relocations and the symbols are written here
-; and reach cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/macho.rs). The Rust left in macho.rs is
-; glue: it turns the linked code words into bytes, sorts the exported names, builds the string table
-; and copies text, data and strings into the buffer at the offsets this file computes.
+; `t27b build --macho` (the default on macOS) writes a 64-bit relocatable object (MH_OBJECT) for arm64.
+; Until #7526 all of it was hand-written Rust in cli/t27b/src/macho.rs; since #8947 every decision is here
+; and reaches cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/macho.rs): the layout (where every
+; part of the file starts), which blobs get a symbol, the order of the symbols, the string table, and the
+; bytes of the header, the load commands, the relocations and the symbols. The Rust left in macho.rs
+; flattens the linked image into the tables "the image both object writers read" below describes, which
+; elf.t27 (the ELF64 writer for aarch64 Linux) reads as well, and sizes the buffer.
 ; --
 ; The file, in order:
 ;   mach_header_64                      32 bytes
@@ -18,7 +19,7 @@
 ;   __const                             read-only data blobs, 8-byte aligned, at the next 16 bytes
 ;   relocations, at the next 8 bytes    two per data reference (ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12)
 ;   nlist_64 symbols                    one local symbol per referenced blob, then one external per fn
-;   string table                        padded to 8 bytes by the glue
+;   string table                        padded to 8 bytes
 ; --
 ; Intra-module `bl` offsets are resolved at emit time, so calls need no relocations. A data reference
 ; is an `adrp` + `add` pair; its target is named by the blob's local symbol (`l_t27b_data.N`) so the
@@ -28,7 +29,9 @@
 ; The oracle. Every byte string in the tests below was printed by the hand-written Rust this file
 ; replaces (cli/t27b/src/macho.rs `object` on master bd3bdcda1, run on the t27c Railway lab) for three
 ; images: S1 one function and no data; S2 three functions, three blobs, two data references; S3 four
-; functions (one without an offset), twelve blobs and four references to two-digit blob numbers.
+; functions (one without an offset), twelve blobs and four references to two-digit blob numbers. The
+; whole-object tests (S1 to S4, S4 for the symbol order) were printed by the same glue on master
+; 2ca8145da, before #8947 moved it here.
 ; ASCII only (L3)
 ; phi^2 + 1/phi^2 = 3 | TRINITY
 
@@ -57,6 +60,11 @@ pub const SECT_CONST : u8 = 2;
 // relocation_info r_type values (<mach-o/arm64/reloc.h>).
 pub const ARM64_RELOC_PAGE21 : u32 = 3;
 pub const ARM64_RELOC_PAGEOFF12 : u32 = 4;
+pub const ARM64_RELOC_BRANCH26 : u32 = 2;
+// A refs row whose blob is EXT_REF + i is the `bl` of a call to function i, an import (#8946): a fn whose
+// name starts with `@` (t27 `return @extern("sym");`), never emitted, named `_sym` as an undefined symbol.
+pub const EXT_REF : usize = 0x80000000;
+pub const AT : u8 = 64;
 // log2 alignments of the two sections: functions start on 16 bytes, blobs on 8.
 pub const TEXT_ALIGN_LOG2 : u32 = 4;
 pub const CONST_ALIGN_LOG2 : u32 = 3;
@@ -116,12 +124,17 @@ pub fn reloff(text_size: usize, const_size: usize) -> usize {
 
 /// File offset of the symbols: two relocations per data reference.
 pub fn symoff(text_size: usize, const_size: usize, nrefs: usize) -> usize {
-    return reloff(text_size, const_size) + RELOC_SIZE * 2 * nrefs;
+    return syms_at(text_size, const_size, 2 * nrefs);
+}
+
+/// File offset of the symbols after nreloc relocations (two per data reference, one per import call).
+pub fn syms_at(text_size: usize, const_size: usize, nreloc: usize) -> usize {
+    return reloff(text_size, const_size) + RELOC_SIZE * nreloc;
 }
 
 /// File offset of the string table.
 pub fn stroff(text_size: usize, const_size: usize, nrefs: usize, nsyms: usize) -> usize {
-    return symoff(text_size, const_size, nrefs) + NLIST_SIZE * nsyms;
+    return syms_at(text_size, const_size, 2 * nrefs) + NLIST_SIZE * nsyms;
 }
 
 /// Length of the whole object; strsize is the padded string table.
@@ -199,10 +212,15 @@ pub fn put_section(out: []u8, at: usize, sect: string, addr: usize, size: usize,
 /// HEADER_SIZE + sizeofcmds; the bytes up to text_off are padding the caller leaves zero.
 /// nrefs data references, nlocal blob symbols, nextdef function symbols, strsize padded string bytes.
 pub fn put_commands(out: []u8, text_size: usize, const_size: usize, nrefs: usize, nlocal: usize, nextdef: usize, strsize: usize) -> usize {
+    return put_commands_x(out, text_size, const_size, 2 * nrefs, nlocal, nextdef, 0, strsize);
+}
+
+/// put_commands with nreloc relocations and nundef undefined (imported) symbols after the external ones.
+pub fn put_commands_x(out: []u8, text_size: usize, const_size: usize, nreloc: usize, nlocal: usize, nextdef: usize, nundef: usize, strsize: usize) -> usize {
     const ns : u32 = nsects(const_size);
     const toff : usize = text_off(const_size);
     const vm : usize = vm_size(text_size, const_size);
-    const nsyms : usize = nlocal + nextdef;
+    const nsyms : usize = nlocal + nextdef + nundef;
     // mach_header_64
     var p : usize = put_u32(out, 0, MH_MAGIC_64);
     p = put_u32(out, p, CPU_TYPE_ARM64);
@@ -226,8 +244,8 @@ pub fn put_commands(out: []u8, text_size: usize, const_size: usize, nrefs: usize
     p = put_u32(out, p, 0);
     // __text carries the relocations; with none, reloff and nreloc are both 0.
     var rel : usize = 0;
-    if (nrefs > 0) { rel = reloff(text_size, const_size); }
-    p = put_section(out, p, "__text", 0, text_size, toff, TEXT_ALIGN_LOG2, rel, 2 * nrefs, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+    if (nreloc > 0) { rel = reloff(text_size, const_size); }
+    p = put_section(out, p, "__text", 0, text_size, toff, TEXT_ALIGN_LOG2, rel, nreloc, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
     if (const_size > 0) {
         const ca : usize = const_addr(text_size);
         p = put_section(out, p, "__const", ca, const_size, toff + ca, CONST_ALIGN_LOG2, 0, 0, S_REGULAR);
@@ -242,19 +260,19 @@ pub fn put_commands(out: []u8, text_size: usize, const_size: usize, nrefs: usize
     // LC_SYMTAB
     p = put_u32(out, p, LC_SYMTAB);
     p = put_u32(out, p, SYMTAB_SIZE as u32);
-    p = put_u32(out, p, symoff(text_size, const_size, nrefs) as u32);
+    p = put_u32(out, p, syms_at(text_size, const_size, nreloc) as u32);
     p = put_u32(out, p, nsyms as u32);
-    p = put_u32(out, p, stroff(text_size, const_size, nrefs, nsyms) as u32);
+    p = put_u32(out, p, (syms_at(text_size, const_size, nreloc) + NLIST_SIZE * nsyms) as u32);
     p = put_u32(out, p, strsize as u32);
-    // LC_DYSYMTAB: the blob symbols are local, the functions external, nothing undefined.
+    // LC_DYSYMTAB: the blob symbols are local, the functions external, the imports undefined.
     p = put_u32(out, p, LC_DYSYMTAB);
     p = put_u32(out, p, DYSYMTAB_SIZE as u32);
     p = put_u32(out, p, 0);
     p = put_u32(out, p, nlocal as u32);
     p = put_u32(out, p, nlocal as u32);
     p = put_u32(out, p, nextdef as u32);
-    p = put_u32(out, p, nsyms as u32);
-    p = put_u32(out, p, 0);
+    p = put_u32(out, p, (nlocal + nextdef) as u32);
+    p = put_u32(out, p, nundef as u32);
     var k : usize = 0;
     while (k < 12) {
         p = put_u32(out, p, 0);
@@ -280,6 +298,483 @@ pub fn put_nlist(out: []u8, at: usize, strx: u32, ntype: u8, sect: u8, value: u6
     return put_u64(out, p, value);
 }
 
+// ---------------------------------------------------------------- the image both object writers read
+// cli/t27b/src/macho.rs flattens a linked image into these byte tables; this file and elf.t27 read
+// them. Integers are u64, little-endian.
+//   text   the code words, little-endian
+//   names  each function's name and a NUL; an empty name is a function that is not exported
+//   fns    16 bytes per function: its word offset + 1 (0: not emitted), its size in words
+//   refs   16 bytes per data reference: the word of its `adrp` (its `add` follows), the blob
+//   lens   8 bytes per blob: its length; blobs holds the bytes back to back. The first nblobs are
+//          `Program::data` (read-only); the rest are `Program::globals` (elf.t27 only).
+
+pub const ROW : usize = 16;
+
+/// The u64 at byte `at` of a table.
+pub fn get_u64(t: []const u8, at: usize) -> usize {
+    var v : usize = 0;
+    var i : usize = 8;
+    while (i > 0) {
+        i = i - 1;
+        v = (v << 8) | (t[at + i] as usize);
+    }
+    return v;
+}
+
+pub fn fn_count(fns: []const u8) -> usize {
+    return fns.len / ROW;
+}
+
+/// Word offset + 1 of function i; 0 when it was not emitted.
+pub fn fn_at(fns: []const u8, i: usize) -> usize {
+    return get_u64(fns, ROW * i);
+}
+
+pub fn fn_words(fns: []const u8, i: usize) -> usize {
+    return get_u64(fns, ROW * i + 8);
+}
+
+pub fn ref_count(refs: []const u8) -> usize {
+    return refs.len / ROW;
+}
+
+pub fn ref_word(refs: []const u8, i: usize) -> usize {
+    return get_u64(refs, ROW * i);
+}
+
+pub fn ref_blob(refs: []const u8, i: usize) -> usize {
+    return get_u64(refs, ROW * i + 8);
+}
+
+pub fn blob_count(lens: []const u8) -> usize {
+    return lens.len / 8;
+}
+
+pub fn blob_len(lens: []const u8, k: usize) -> usize {
+    return get_u64(lens, 8 * k);
+}
+
+/// Offset of blob k in the group of blobs that starts at blob `from`: each 8-byte aligned, as the
+/// interpreter lays out data (codegen::data_layout).
+pub fn blob_off(lens: []const u8, from: usize, k: usize) -> usize {
+    var at : usize = 0;
+    var j : usize = from;
+    while (j < k) {
+        at = align_up(at + blob_len(lens, j), 8);
+        j = j + 1;
+    }
+    return at;
+}
+
+/// Bytes of the group of blobs from .. to: the last one ends it, unpadded.
+pub fn group_size(lens: []const u8, from: usize, to: usize) -> usize {
+    if (to == from) { return 0; }
+    return blob_off(lens, from, to - 1) + blob_len(lens, to - 1);
+}
+
+/// Copies src to out at `at`; the position after it.
+pub fn put_bytes(out: []u8, at: usize, src: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < src.len) {
+        out[at + i] = src[i];
+        i = i + 1;
+    }
+    return at + src.len;
+}
+
+/// Copies the blob bytes of blobs from .. to into out, blob k at base + its offset in the group.
+pub fn put_group(out: []u8, base: usize, blobs: []const u8, lens: []const u8, from: usize, to: usize) -> void {
+    var src : usize = 0;
+    var k : usize = 0;
+    while (k < from) {
+        src = src + blob_len(lens, k);
+        k = k + 1;
+    }
+    var at : usize = 0;
+    while (k < to) {
+        const n : usize = blob_len(lens, k);
+        put_bytes(out, base + at, blobs[src..src + n]);
+        src = src + n;
+        at = align_up(at + n, 8);
+        k = k + 1;
+    }
+}
+
+/// Length of the name that starts at byte `at` of names.
+pub fn name_len(names: []const u8, at: usize) -> usize {
+    var n : usize = 0;
+    while (names[at + n] != 0) { n = n + 1; }
+    return n;
+}
+
+/// Where the name of function i starts.
+pub fn name_at(names: []const u8, i: usize) -> usize {
+    var at : usize = 0;
+    var j : usize = 0;
+    while (j < i) {
+        at = at + name_len(names, at) + 1;
+        j = j + 1;
+    }
+    return at;
+}
+
+/// Copies the name at byte `from` of names, and its NUL, to out at `at`; the position after the NUL.
+pub fn put_name(out: []u8, at: usize, names: []const u8, from: usize) -> usize {
+    const n : usize = name_len(names, from);
+    var i : usize = 0;
+    while (i <= n) {
+        out[at + i] = names[from + i];
+        i = i + 1;
+    }
+    return at + n + 1;
+}
+
+/// A function is exported when it was emitted and has a name that is not an import's.
+pub fn exported(names: []const u8, fns: []const u8, i: usize, at: usize) -> bool {
+    if (fn_at(fns, i) == 0) { return false; }
+    return names[at] != 0 and names[at] != AT;
+}
+
+pub fn export_count(names: []const u8, fns: []const u8) -> usize {
+    var n : usize = 0;
+    var at : usize = 0;
+    var i : usize = 0;
+    while (i < fn_count(fns)) {
+        if (exported(names, fns, i, at)) { n = n + 1; }
+        at = at + name_len(names, at) + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The bytes the exported names take in a string table, a NUL after each.
+pub fn export_bytes(names: []const u8, fns: []const u8) -> usize {
+    var n : usize = 0;
+    var at : usize = 0;
+    var i : usize = 0;
+    while (i < fn_count(fns)) {
+        const len : usize = name_len(names, at);
+        if (exported(names, fns, i, at)) { n = n + len + 1; }
+        at = at + len + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- the Mach-O object of an image
+// (Until #8947 this was the hand-written glue in cli/t27b/src/macho.rs `object`.)
+// The symbols: one local `l_t27b_data.K` per blob some reference names, in blob order, then one
+// external `_` + name per exported function, in the order of Rust's sort of (symbol, value) pairs.
+// The string table: a NUL, the local names, then the external names, padded to 8.
+
+/// Does a reference name blob k?
+pub fn blob_used(refs: []const u8, k: usize) -> bool {
+    var i : usize = 0;
+    while (i < ref_count(refs)) {
+        if (ref_blob(refs, i) == k) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn used_count(refs: []const u8, nblobs: usize) -> usize {
+    var n : usize = 0;
+    var k : usize = 0;
+    while (k < nblobs) {
+        if (blob_used(refs, k)) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// Decimal digits of v.
+pub fn dec_len(v: usize) -> usize {
+    var n : usize = 1;
+    var x : usize = v;
+    while (x >= 10) {
+        x = x / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+pub fn put_dec(out: []u8, at: usize, v: usize) -> usize {
+    const n : usize = dec_len(v);
+    var x : usize = v;
+    var i : usize = n;
+    while (i > 0) {
+        i = i - 1;
+        out[at + i] = (48 + x % 10) as u8;
+        x = x / 10;
+    }
+    return at + n;
+}
+
+/// The padded string table: a NUL; `l_t27b_data.` + K + NUL per used blob; `_` + name + NUL per export.
+pub fn macho_strsize(names: []const u8, fns: []const u8, refs: []const u8, nblobs: usize) -> usize {
+    var n : usize = 1;
+    var k : usize = 0;
+    while (k < nblobs) {
+        if (blob_used(refs, k)) { n = n + 13 + dec_len(k); }
+        k = k + 1;
+    }
+    return align_up(n + export_bytes(names, fns) + export_count(names, fns) + import_bytes(names, fns), 8);
+}
+
+/// Does (name at a, value va) sort before (name at b, value vb)? Bytes first, a prefix before a longer
+/// name, then the values: Rust's order of (String, u64), where every symbol has the same `_` in front.
+pub fn key_before(names: []const u8, a: usize, va: usize, b: usize, vb: usize) -> bool {
+    var i : usize = 0;
+    while (names[a + i] == names[b + i]) {
+        if (names[a + i] == 0) { return va < vb; }
+        i = i + 1;
+    }
+    return names[a + i] < names[b + i];
+}
+
+/// The exported function whose symbol follows function prev's; prev = fn_count starts the walk. Returns
+/// fn_count when none is left.
+pub fn next_export(names: []const u8, fns: []const u8, prev: usize) -> usize {
+    const nf : usize = fn_count(fns);
+    var prev_at : usize = 0;
+    var prev_v : usize = 0;
+    if (prev < nf) {
+        prev_at = name_at(names, prev);
+        prev_v = fn_at(fns, prev);
+    }
+    var best : usize = nf;
+    var best_at : usize = 0;
+    var at : usize = 0;
+    var i : usize = 0;
+    while (i < nf) {
+        if (exported(names, fns, i, at)) {
+            var after : bool = true;
+            if (prev < nf) { after = key_before(names, prev_at, prev_v, at, fn_at(fns, i)); }
+            if (after) {
+                if (best == nf) {
+                    best = i;
+                    best_at = at;
+                } else if (key_before(names, at, fn_at(fns, i), best_at, fn_at(fns, best))) {
+                    best = i;
+                    best_at = at;
+                }
+            }
+        }
+        at = at + name_len(names, at) + 1;
+        i = i + 1;
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------- imports (#8946)
+// The undefined symbols follow the external ones: one `_sym` per distinct import name, in Rust's sort of
+// the names (key_before with equal values), so two fns that import one symbol share it. Their strings
+// follow the exported names. A call to an import is one ARM64_RELOC_BRANCH26 naming its symbol; the
+// relocations are in refs order, two per data reference and one per call.
+
+/// Is refs row i the `bl` of a call to an import?
+pub fn is_call(refs: []const u8, i: usize) -> bool {
+    return ref_blob(refs, i) >= EXT_REF;
+}
+
+/// Relocations before refs row i: two per data reference, one per call.
+pub fn reloc_slot(refs: []const u8, i: usize) -> usize {
+    var n : usize = 0;
+    var j : usize = 0;
+    while (j < i) {
+        if (is_call(refs, j)) { n = n + 1; } else { n = n + 2; }
+        j = j + 1;
+    }
+    return n;
+}
+
+/// Is the import name at byte `at`, the name of function i, the first function with that name? The walk over
+/// the earlier names is sequential (name_at per row would make every caller cubic: #8946, glass_window emit
+/// took 148 s with it and 6 ms without imports).
+pub fn first_import_at(names: []const u8, at: usize, i: usize) -> bool {
+    var b : usize = 0;
+    var j : usize = 0;
+    while (j < i) {
+        if (names[b] == AT) {
+            if (!key_before(names, at, 0, b, 0) and !key_before(names, b, 0, at, 0)) { return false; }
+        }
+        b = b + name_len(names, b) + 1;
+        j = j + 1;
+    }
+    return true;
+}
+
+/// Is function i an import, and the first function with its name?
+pub fn first_import(names: []const u8, i: usize) -> bool {
+    const at : usize = name_at(names, i);
+    if (names[at] != AT) { return false; }
+    return first_import_at(names, at, i);
+}
+
+/// Distinct import names that sort before the name at byte `at`: the rank of its undefined symbol.
+pub fn import_rank(names: []const u8, fns: []const u8, at: usize) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    var a : usize = 0;
+    while (i < fn_count(fns)) {
+        if (names[a] == AT) {
+            if (key_before(names, a, 0, at, 0) and first_import_at(names, a, i)) { n = n + 1; }
+        }
+        a = a + name_len(names, a) + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn import_count(names: []const u8, fns: []const u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    var a : usize = 0;
+    while (i < fn_count(fns)) {
+        if (names[a] == AT) {
+            if (first_import_at(names, a, i)) { n = n + 1; }
+        }
+        a = a + name_len(names, a) + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// String bytes of the undefined symbols: `_` + the name after `@` + NUL, the name's length + 1 each.
+pub fn import_bytes(names: []const u8, fns: []const u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    var a : usize = 0;
+    while (i < fn_count(fns)) {
+        if (names[a] == AT) {
+            if (first_import_at(names, a, i)) { n = n + name_len(names, a) + 1; }
+        }
+        a = a + name_len(names, a) + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// "No name": the byte offset next_import returns when none is left, and starts the walk with.
+pub const NO_NAME : usize = 0xFFFFFFFF;
+
+/// The byte offset of the smallest import name that sorts after the one at `prev` (NO_NAME starts the walk);
+/// NO_NAME when none is left. Two fns with one name give the earlier one's offset.
+pub fn next_import(names: []const u8, fns: []const u8, prev: usize) -> usize {
+    var best : usize = NO_NAME;
+    var i : usize = 0;
+    var a : usize = 0;
+    while (i < fn_count(fns)) {
+        if (names[a] == AT) {
+            if (prev == NO_NAME or key_before(names, prev, 0, a, 0)) {
+                if (best == NO_NAME or key_before(names, a, 0, best, 0)) { best = a; }
+            }
+        }
+        a = a + name_len(names, a) + 1;
+        i = i + 1;
+    }
+    return best;
+}
+
+/// Length of the Mach-O object of an image whose code is text_len bytes.
+pub fn object_len(names: []const u8, fns: []const u8, refs: []const u8, lens: []const u8, text_len: usize, nblobs: usize) -> usize {
+    const nsyms : usize = used_count(refs, nblobs) + export_count(names, fns) + import_count(names, fns);
+    const at : usize = syms_at(text_len, group_size(lens, 0, nblobs), reloc_slot(refs, ref_count(refs)));
+    return at + NLIST_SIZE * nsyms + macho_strsize(names, fns, refs, nblobs);
+}
+
+/// Writes the Mach-O object of an image into out, object_len bytes; returns that length.
+pub fn write_object(out: []u8, text: []const u8, names: []const u8, fns: []const u8, refs: []const u8, blobs: []const u8, lens: []const u8, nblobs: usize) -> usize {
+    const size : usize = object_len(names, fns, refs, lens, text.len, nblobs);
+    var z : usize = 0;
+    while (z < size) {
+        out[z] = 0;
+        z = z + 1;
+    }
+    const text_size : usize = text.len;
+    const const_size : usize = group_size(lens, 0, nblobs);
+    const nrefs : usize = ref_count(refs);
+    const nlocal : usize = used_count(refs, nblobs);
+    const nextdef : usize = export_count(names, fns);
+    const nreloc : usize = reloc_slot(refs, nrefs);
+    const nimp : usize = import_count(names, fns);
+    put_commands_x(out, text_size, const_size, nreloc, nlocal, nextdef, nimp, macho_strsize(names, fns, refs, nblobs));
+    const toff : usize = text_off(const_size);
+    const ca : usize = const_addr(text_size);
+    put_bytes(out, toff, text);
+    put_group(out, toff + ca, blobs, lens, 0, nblobs);
+    const rel : usize = reloff(text_size, const_size);
+    const syo : usize = syms_at(text_size, const_size, nreloc);
+    const sto : usize = syo + NLIST_SIZE * (nlocal + nextdef + nimp);
+    var strx : usize = 1;
+    var rank : usize = 0;
+    var k : usize = 0;
+    while (k < nblobs) {
+        if (blob_used(refs, k)) {
+            var i : usize = 0;
+            while (i < nrefs) {
+                if (ref_blob(refs, i) == k) { put_reloc_pair(out, rel + RELOC_SIZE * reloc_slot(refs, i), ref_word(refs, i), rank as u32); }
+                i = i + 1;
+            }
+            put_nlist(out, syo + NLIST_SIZE * rank, strx as u32, N_SECT, SECT_CONST, (ca + blob_off(lens, 0, k)) as u64);
+            const q : usize = put_text(out, sto + strx, "l_t27b_data.");
+            strx = put_dec(out, q, k) + 1 - sto;
+            rank = rank + 1;
+        }
+        k = k + 1;
+    }
+    var f : usize = next_export(names, fns, fn_count(fns));
+    var j : usize = 0;
+    while (f < fn_count(fns)) {
+        put_nlist(out, syo + NLIST_SIZE * (nlocal + j), strx as u32, N_SECT | N_EXT, SECT_TEXT, ((fn_at(fns, f) - 1) * 4) as u64);
+        out[sto + strx] = 95;
+        strx = put_name(out, sto + strx + 1, names, name_at(names, f)) - sto;
+        f = next_export(names, fns, f);
+        j = j + 1;
+    }
+    // The undefined symbols in sorted order; each one's strings, then the relocation of every call to a
+    // function that carries its name.
+    var hat : usize = next_import(names, fns, NO_NAME);
+    var u : usize = 0;
+    while (hat != NO_NAME) {
+        put_nlist(out, syo + NLIST_SIZE * (nlocal + nextdef + u), strx as u32, N_EXT, 0, 0);
+        out[sto + strx] = 95;
+        strx = put_name(out, sto + strx + 1, names, hat + 1) - sto;
+        var h : usize = 0;
+        var ha : usize = 0;
+        while (h < fn_count(fns)) {
+            if (names[ha] == AT) {
+                if (!key_before(names, ha, 0, hat, 0) and !key_before(names, hat, 0, ha, 0)) {
+                    var c : usize = 0;
+                    while (c < nrefs) {
+                        if (ref_blob(refs, c) == EXT_REF + h) {
+                            const r : usize = rel + RELOC_SIZE * reloc_slot(refs, c);
+                            put_u32(out, r, (ref_word(refs, c) * 4) as u32);
+                            put_u32(out, r + 4, reloc_info((nlocal + nextdef + u) as u32, 1, ARM64_RELOC_BRANCH26));
+                        }
+                        c = c + 1;
+                    }
+                }
+            }
+            ha = ha + name_len(names, ha) + 1;
+            h = h + 1;
+        }
+        hat = next_import(names, fns, hat);
+        u = u + 1;
+    }
+    return size;
+}
+
+/// Writes the bytes of w into out at `at`; the position after them.
+pub fn put_text(out: []u8, at: usize, w: string) -> usize {
+    var i : usize = 0;
+    while (i < w.len) {
+        out[at + i] = w[i];
+        i = i + 1;
+    }
+    return at + w.len;
+}
+
 /// Test helper: the value of one hex digit.
 pub fn hex_digit(c: u8) -> u8 {
     if (c >= 97) { return c - 87; }
@@ -295,6 +790,12 @@ pub fn bytes_are(out: []u8, at: usize, hex: string) -> bool {
         i = i + 1;
     }
     return true;
+}
+
+/// Test helper: row i of a 16-byte image table holds (a, b).
+pub fn put_row(t: []u8, i: usize, a: usize, b: usize) -> void {
+    put_u64(t, ROW * i, a as u64);
+    put_u64(t, ROW * i + 8, b as u64);
 }
 
 test layout_without_data_matches_the_rust_oracle_s1 {
@@ -462,6 +963,282 @@ test the_hex_helper_can_fail {
     assert hex_digit(57) == 9;
     assert hex_digit(97) == 10;
     assert hex_digit(102) == 15;
+}
+
+test the_object_of_one_function_is_the_rust_bytes_s1 {
+    // S1 whole. Every byte string below was printed by the hand-written glue this file replaces.
+    var text : [12]u8 = undefined;
+    put_u32(&text, 0, 0x52800540);
+    put_u32(&text, 4, 0xd65f03c0);
+    put_u32(&text, 8, 0xd503201f);
+    var names : [7]u8 = undefined;
+    names[put_text(&names, 0, "answer")] = 0;
+    var fns : [16]u8 = undefined;
+    put_row(&fns, 0, 1, 3);
+    var none : [8]u8 = undefined;
+    var out : [368]u8 = undefined;
+    assert object_len(&names, &fns, none[0..0], none[0..0], 12, 0) == 368;
+    assert write_object(&out, &text, &names, &fns, none[0..0], none[0..0], none[0..0], 0) == 368;
+    assert bytes_are(&out, 0, "cffaedfe0c0000010000000001000000040000001801000000000000000000001900000098000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "0c0000000000000040010000000000000c00000000000000070000000700000001000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "000000000000000000000000000000000c0000000000000040010000040000000000000000000000000400800000000000000000000000003200000018000000");
+    assert bytes_are(&out, 192, "0100000000000b0000000000000000000200000018000000500100000100000060010000100000000b0000005000000000000000000000000000000001000000");
+    assert bytes_are(&out, 256, "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 320, "40058052c0035fd61f2003d500000000010000000f0100000000000000000000005f616e737765720000000000000000");
+}
+
+test the_object_with_data_is_the_rust_bytes_s2 {
+    // S2 whole: `main` at word 0, `g` at word 4, an unexported fn at word 8; blobs "hello", 0..15, "xyz";
+    // `adrp` + `add` to blob 0 at word 2 and to blob 2 at word 5.
+    var text : [40]u8 = undefined;
+    put_u32(&text, 0, 0xa9bf7bfd);
+    put_u32(&text, 4, 0x910003fd);
+    put_u32(&text, 8, 0x90000000);
+    put_u32(&text, 12, 0x91000000);
+    put_u32(&text, 16, 0x52800020);
+    put_u32(&text, 20, 0x90000001);
+    put_u32(&text, 24, 0x91000021);
+    put_u32(&text, 28, 0xd65f03c0);
+    put_u32(&text, 32, 0x52800000);
+    put_u32(&text, 36, 0xd65f03c0);
+    var names : [8]u8 = undefined;
+    names[put_text(&names, 0, "main")] = 0;
+    names[put_text(&names, 5, "g")] = 0;
+    names[7] = 0;
+    var fns : [48]u8 = undefined;
+    put_row(&fns, 0, 1, 4);
+    put_row(&fns, 1, 5, 4);
+    put_row(&fns, 2, 9, 2);
+    var refs : [32]u8 = undefined;
+    put_row(&refs, 0, 2, 0);
+    put_row(&refs, 1, 5, 2);
+    var lens : [24]u8 = undefined;
+    put_u64(&lens, 0, 5);
+    put_u64(&lens, 8, 16);
+    put_u64(&lens, 16, 3);
+    var blobs : [24]u8 = undefined;
+    put_text(&blobs, 0, "hello");
+    var i : usize = 0;
+    while (i < 16) {
+        blobs[5 + i] = i as u8;
+        i = i + 1;
+    }
+    put_text(&blobs, 21, "xyz");
+    var out : [616]u8 = undefined;
+    assert object_len(&names, &fns, &refs, &lens, 40, 3) == 616;
+    assert write_object(&out, &text, &names, &fns, &refs, &blobs, &lens, 3) == 616;
+    assert bytes_are(&out, 0, "cffaedfe0c00000100000000010000000400000068010000000000000000000019000000e8000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "4b0000000000000090010000000000004b00000000000000070000000700000002000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "0000000000000000000000000000000028000000000000009001000004000000e001000004000000000400800000000000000000000000005f5f636f6e737400");
+    assert bytes_are(&out, 192, "00000000000000005f5f544558540000000000000000000030000000000000001b00000000000000c00100000300000000000000000000000000000000000000");
+    assert bytes_are(&out, 256, "000000000000000032000000180000000100000000000b0000000000000000000200000018000000000200000400000040020000280000000b00000050000000");
+    assert bytes_are(&out, 320, "00000000020000000200000002000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 384, "00000000000000000000000000000000fd7bbfa9fd0300910000009000000091200080520100009021000091c0035fd600008052c0035fd60000000000000000");
+    assert bytes_are(&out, 448, "68656c6c6f000000000102030405060708090a0b0c0d0e0f78797a0000000000080000000000003d0c0000000000004c140000000100003d180000000100004c");
+    assert bytes_are(&out, 512, "010000000e02000030000000000000000f0000000e02000048000000000000001d0000000f0100001000000000000000200000000f0100000000000000000000");
+    assert bytes_are(&out, 576, "006c5f743237625f646174612e30006c5f743237625f646174612e32005f67005f6d61696e000000");
+}
+
+test the_object_with_twelve_blobs_is_the_rust_bytes_s3 {
+    // S3 whole: `zeta` at 0, `alpha_beta` at word 8, `k` at word 12, one fn not emitted; twelve blobs
+    // of lengths 0 8 7 8 0 3 8 1 8 5 0 1 (byte i of blob k is 0x80 + 16k + i); references to blobs 11, 10,
+    // 11, 1 at words 1, 3, 6, 9.
+    var text : [52]u8 = undefined;
+    var w : usize = 0;
+    while (w < 13) {
+        put_u32(&text, 4 * w, 0xd503201f);
+        w = w + 1;
+    }
+    var names : [28]u8 = undefined;
+    names[put_text(&names, 0, "zeta")] = 0;
+    names[put_text(&names, 5, "alpha_beta")] = 0;
+    names[put_text(&names, 16, "k")] = 0;
+    names[put_text(&names, 18, "unemitted")] = 0;
+    var fns : [64]u8 = undefined;
+    put_row(&fns, 0, 1, 8);
+    put_row(&fns, 1, 9, 4);
+    put_row(&fns, 2, 13, 1);
+    put_row(&fns, 3, 0, 0);
+    var refs : [64]u8 = undefined;
+    put_row(&refs, 0, 1, 11);
+    put_row(&refs, 1, 3, 10);
+    put_row(&refs, 2, 6, 11);
+    put_row(&refs, 3, 9, 1);
+    var r : usize = 0;
+    while (r < 4) {
+        const at : usize = 4 * ref_word(&refs, r);
+        put_u32(&text, at, 0x90000000);
+        put_u32(&text, at + 4, 0x91000000);
+        r = r + 1;
+    }
+    put_u32(&text, 48, 0xd65f03c0);
+    var lens : [96]u8 = undefined;
+    var blobs : [49]u8 = undefined;
+    var src : usize = 0;
+    var k : usize = 0;
+    while (k < 12) {
+        var n : usize = 0;
+        if (k == 1 or k == 3 or k == 6 or k == 8) { n = 8; }
+        if (k == 2) { n = 7; }
+        if (k == 5) { n = 3; }
+        if (k == 7 or k == 11) { n = 1; }
+        if (k == 9) { n = 5; }
+        put_u64(&lens, 8 * k, n as u64);
+        var j : usize = 0;
+        while (j < n) {
+            blobs[src + j] = ((128 + 16 * k + j) % 256) as u8;
+            j = j + 1;
+        }
+        src = src + n;
+        k = k + 1;
+    }
+    assert src == 49;
+    var out : [768]u8 = undefined;
+    assert object_len(&names, &fns, &refs, &lens, 52, 12) == 768;
+    assert write_object(&out, &text, &names, &fns, &refs, &blobs, &lens, 12) == 768;
+    assert bytes_are(&out, 0, "cffaedfe0c00000100000000010000000400000068010000000000000000000019000000e8000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "810000000000000090010000000000008100000000000000070000000700000002000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "00000000000000000000000000000000340000000000000090010000040000001802000008000000000400800000000000000000000000005f5f636f6e737400");
+    assert bytes_are(&out, 192, "00000000000000005f5f544558540000000000000000000040000000000000004100000000000000d00100000300000000000000000000000000000000000000");
+    assert bytes_are(&out, 256, "000000000000000032000000180000000100000000000b00000000000000000002000000180000005802000006000000b8020000480000000b00000050000000");
+    assert bytes_are(&out, 320, "00000000030000000300000003000000060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 384, "000000000000000000000000000000001f2003d5000000900000009100000090000000911f2003d500000090000000911f2003d500000090000000911f2003d5");
+    assert bytes_are(&out, 448, "c0035fd60000000000000000000000009091929394959697a0a1a2a3a4a5a600b0b1b2b3b4b5b6b7d0d1d20000000000e0e1e2e3e4e5e6e7f000000000000000");
+    assert bytes_are(&out, 512, "000102030405060710111213140000003000000000000000040000000200003d080000000200004c0c0000000100003d100000000100004c180000000200003d");
+    assert bytes_are(&out, 576, "1c0000000200004c240000000000003d280000000000004c010000000e02000040000000000000000f0000000e02000080000000000000001e0000000e020000");
+    assert bytes_are(&out, 640, "80000000000000002d0000000f0100002000000000000000390000000f01000030000000000000003c0000000f0100000000000000000000006c5f743237625f");
+    assert bytes_are(&out, 704, "646174612e31006c5f743237625f646174612e3130006c5f743237625f646174612e3131005f616c7068615f62657461005f6b005f7a65746100000000000000");
+}
+
+test symbols_sort_as_rust_sorts_the_names_s4 {
+    // S4 whole: `ab`, `a`, `abc`, `b` at words 0, 4, 8, 12 sort as _a, _ab, _abc, _b (a prefix first); one
+    // blob that no reference names is copied and gets no symbol.
+    var text : [52]u8 = undefined;
+    var w : usize = 0;
+    while (w < 13) {
+        if (w % 4 == 0) { put_u32(&text, 4 * w, 0xd65f03c0); } else { put_u32(&text, 4 * w, 0xd503201f); }
+        w = w + 1;
+    }
+    var names : [11]u8 = undefined;
+    names[put_text(&names, 0, "ab")] = 0;
+    names[put_text(&names, 3, "a")] = 0;
+    names[put_text(&names, 5, "abc")] = 0;
+    names[put_text(&names, 9, "b")] = 0;
+    var fns : [64]u8 = undefined;
+    put_row(&fns, 0, 1, 1);
+    put_row(&fns, 1, 5, 1);
+    put_row(&fns, 2, 9, 1);
+    put_row(&fns, 3, 13, 1);
+    var lens : [8]u8 = undefined;
+    put_u64(&lens, 0, 3);
+    var blobs : [3]u8 = undefined;
+    blobs[0] = 7;
+    blobs[1] = 7;
+    blobs[2] = 7;
+    var none : [8]u8 = undefined;
+    var out : [552]u8 = undefined;
+    assert object_len(&names, &fns, none[0..0], &lens, 52, 1) == 552;
+    assert write_object(&out, &text, &names, &fns, none[0..0], &blobs, &lens, 1) == 552;
+    assert bytes_are(&out, 0, "cffaedfe0c00000100000000010000000400000068010000000000000000000019000000e8000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "430000000000000090010000000000004300000000000000070000000700000002000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "00000000000000000000000000000000340000000000000090010000040000000000000000000000000400800000000000000000000000005f5f636f6e737400");
+    assert bytes_are(&out, 192, "00000000000000005f5f544558540000000000000000000040000000000000000300000000000000d00100000300000000000000000000000000000000000000");
+    assert bytes_are(&out, 256, "000000000000000032000000180000000100000000000b0000000000000000000200000018000000d80100000400000018020000100000000b00000050000000");
+    assert bytes_are(&out, 320, "00000000000000000000000004000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 384, "00000000000000000000000000000000c0035fd61f2003d51f2003d51f2003d5c0035fd61f2003d51f2003d51f2003d5c0035fd61f2003d51f2003d51f2003d5");
+    assert bytes_are(&out, 448, "c0035fd60000000000000000000000000707070000000000010000000f0100001000000000000000040000000f0100000000000000000000080000000f010000");
+    assert bytes_are(&out, 512, "20000000000000000d0000000f0100003000000000000000005f61005f6162005f616263005f6200");
+    assert next_export(&names, &fns, 4) == 1;
+    assert next_export(&names, &fns, 1) == 0;
+    assert next_export(&names, &fns, 0) == 2;
+    assert next_export(&names, &fns, 2) == 3;
+    assert next_export(&names, &fns, 3) == 4;
+}
+
+test import_walk_is_sorted_and_distinct_s5b {
+    // The undefined symbols come out in sorted order, one per name, with no per-row name_at: _abort then _puts.
+    var names : [24]u8 = undefined;
+    names[put_text(&names, 0, "main")] = 0;
+    names[put_text(&names, 5, "@puts")] = 0;
+    names[put_text(&names, 11, "@abort")] = 0;
+    names[put_text(&names, 18, "@puts")] = 0;
+    var fns : [64]u8 = undefined;
+    put_row(&fns, 0, 1, 3);
+    put_row(&fns, 1, 0, 0);
+    put_row(&fns, 2, 0, 0);
+    put_row(&fns, 3, 0, 0);
+    const a : usize = next_import(&names, &fns, NO_NAME);
+    assert a == 11;
+    const b : usize = next_import(&names, &fns, a);
+    assert b == 5;
+    assert next_import(&names, &fns, b) == NO_NAME;
+    assert first_import(&names, 1) == true;
+    assert first_import(&names, 3) == false;
+    assert first_import(&names, 0) == false;
+}
+
+test imports_are_undefined_symbols_and_branch_relocations_s5 {
+    // S5: `main` calls `@puts` and `@abort`; a second fn imports `@puts` again and shares its symbol. The
+    // undefined symbols sort as _abort, _puts after the one external; each call is one BRANCH26 naming one.
+    var text : [12]u8 = undefined;
+    put_u32(&text, 0, 0x94000000);
+    put_u32(&text, 4, 0x94000000);
+    put_u32(&text, 8, 0xd65f03c0);
+    var names : [24]u8 = undefined;
+    names[put_text(&names, 0, "main")] = 0;
+    names[put_text(&names, 5, "@puts")] = 0;
+    names[put_text(&names, 11, "@abort")] = 0;
+    names[put_text(&names, 18, "@puts")] = 0;
+    var fns : [64]u8 = undefined;
+    put_row(&fns, 0, 1, 3);
+    put_row(&fns, 1, 0, 0);
+    put_row(&fns, 2, 0, 0);
+    put_row(&fns, 3, 0, 0);
+    var refs : [32]u8 = undefined;
+    put_row(&refs, 0, 0, EXT_REF + 3);
+    put_row(&refs, 1, 1, EXT_REF + 2);
+    var none : [8]u8 = undefined;
+    assert import_count(&names, &fns) == 2;
+    assert import_bytes(&names, &fns) == 13;
+    assert reloc_slot(&refs, 2) == 2;
+    assert import_rank(&names, &fns, 18) == 1;
+    var out : [424]u8 = undefined;
+    assert object_len(&names, &fns, &refs, none[0..0], 12, 0) == 424;
+    assert write_object(&out, &text, &names, &fns, &refs, none[0..0], none[0..0], 0) == 424;
+    assert bytes_are(&out, 152, "4001000004000000500100000200000000040080");
+    assert bytes_are(&out, 208, "020000001800000060010000030000009001000018000000");
+    assert bytes_are(&out, 232, "0b0000005000000000000000000000000000000001000000010000000200000000000000");
+    assert bytes_are(&out, 320, "0000009400000094c0035fd600000000");
+    assert bytes_are(&out, 336, "000000000200002d040000000100002d");
+    assert bytes_are(&out, 352, "010000000f0100000000000000000000070000000100000000000000000000000e000000010000000000000000000000");
+    assert bytes_are(&out, 400, "005f6d61696e005f61626f7274005f7075747300000000");
+}
+
+test the_image_tables_read_back {
+    var t : [32]u8 = undefined;
+    put_row(&t, 0, 7, 0x0102030405060708);
+    put_row(&t, 1, 0, 65536);
+    assert get_u64(&t, 0) == 7;
+    assert get_u64(&t, 8) == 0x0102030405060708;
+    assert ref_count(&t) == 2;
+    assert ref_word(&t, 1) == 0;
+    assert ref_blob(&t, 1) == 65536;
+    var lens : [32]u8 = undefined;
+    put_u64(&lens, 0, 5);
+    put_u64(&lens, 8, 0);
+    put_u64(&lens, 16, 16);
+    put_u64(&lens, 24, 3);
+    // codegen::data_layout: 0, 8, 8, 24; 27 bytes.
+    assert blob_off(&lens, 0, 1) == 8;
+    assert blob_off(&lens, 0, 2) == 8;
+    assert blob_off(&lens, 0, 3) == 24;
+    assert group_size(&lens, 0, 4) == 27;
+    assert group_size(&lens, 2, 4) == 19;
+    assert group_size(&lens, 3, 3) == 0;
+    assert dec_len(0) == 1;
+    assert dec_len(9) == 1;
+    assert dec_len(10) == 2;
+    assert dec_len(4096) == 4;
 }
 
 invariant one_section_without_data_two_with {

@@ -2244,7 +2244,7 @@ test nan_to_int {
     );
 }
 
-/// What stays refused, each named: `@sqrt` of a literal, `std.math.*`, a
+/// What stays refused, each named: `@sqrt` of a negative literal (a non-negative one folds), `std.math.*`, a
 /// conversion with no result type, f16, `as` from an f64 t27c gen does not
 /// spell as a float (here an array element; a spelled one, a call of a fn
 /// declared `-> f64` included, is lowered, see `float_as_plan.t27`) or from a bool to f64 (an integer `as f64` is
@@ -2254,14 +2254,14 @@ test nan_to_int {
 #[test]
 fn f64_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module f64rej;\nfn f(x: f64, n: i32) f64 {{\n{}\n}}\n", body);
+        let src = format!("module f64rej;\nfn f(x: f64, n: i32) f64 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),
         }
     };
     for (body, want) in [
-        ("return @sqrt(2.0) + x;", "ExprCall(@sqrt)"),
+        ("return @sqrt(-2.0) + x;", "ExprCall(@sqrt)"),
         ("return std.math.sqrt(x);", "ExprCall(std.*)"),
         ("return @floatFromInt(n) + x;", "ExprCall(@floatFromInt)"),
         ("const y: f16 = 1.0;\nreturn x;", "type f16"),
@@ -2581,7 +2581,7 @@ test f32_out_of_range {
 #[test]
 fn f32_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module f32rej;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\n", body);
+        let src = format!("module f32rej;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),
@@ -2882,7 +2882,7 @@ fn shift_source_programs_run_in_both_engines() {
 #[test]
 fn shift_refusals_name_the_construct() {
     let first = |body: &str| -> String {
-        let src = format!("module shiftrej;\nconst KB: u32 = 40;\nfn f(x: u32, n: u32) u32 {{\n{}\n}}\n", body);
+        let src = format!("module shiftrej;\nconst KB: u32 = 40;\nfn f(x: u32, n: u32) u32 {{\n{}\n}}\ntest t {{ assert(f(1, 1) == 0); }}\n", body);
         match f64_lower(&src) {
             Ok(_) => panic!("expected a rejection for {}", body),
             Err(e) => e[0].clone(),

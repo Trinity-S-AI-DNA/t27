@@ -8,7 +8,7 @@
 //! The words are checked against the system assembler in tests/encoder.rs.
 //! The encoders are generated: specs/tri/t27b/a64.t27 -> `t27c gen-rust` ->
 //! gen/rust/tri/t27b/a64.rs (#7531, #7549). This file keeps what gen-rust
-//! cannot express yet: Cond's methods, the tuple and Vec adapters
+//! cannot express yet: Cond::from_bits, the tuple and Vec adapters
 //! `bitmask_imm` and `mov_imm`, and the disassembler.
 
 #[path = "../../../gen/rust/tri/t27b/a64.rs"]
@@ -20,47 +20,9 @@ pub use enc::*;
 pub type Reg = u8;
 
 impl Cond {
-    pub fn invert(self) -> Cond {
-        use Cond::*;
-        match self {
-            Eq => Ne,
-            Ne => Eq,
-            Hs => Lo,
-            Lo => Hs,
-            Mi => Pl,
-            Pl => Mi,
-            Vs => Vc,
-            Vc => Vs,
-            Hi => Ls,
-            Ls => Hi,
-            Ge => Lt,
-            Lt => Ge,
-            Gt => Le,
-            Le => Gt,
-            Al => Al,
-        }
-    }
+    pub fn invert(self) -> Cond { Cond::from_bits(enc::invert_bits(self as u32)) }
 
-    pub fn name(self) -> &'static str {
-        use Cond::*;
-        match self {
-            Eq => "eq",
-            Ne => "ne",
-            Hs => "hs",
-            Lo => "lo",
-            Mi => "mi",
-            Pl => "pl",
-            Vs => "vs",
-            Vc => "vc",
-            Hi => "hi",
-            Ls => "ls",
-            Ge => "ge",
-            Lt => "lt",
-            Gt => "gt",
-            Le => "le",
-            Al => "al",
-        }
-    }
+    pub fn name(self) -> &'static str { enc::cond_name(self as u32) }
 
     pub fn from_bits(b: u32) -> Cond {
         use Cond::*;
@@ -82,13 +44,7 @@ pub fn mov_imm(sf: bool, rd: Reg, value: u64, out: &mut Vec<u32>) {
 // -------------------------------------------------------------- disassembly
 
 fn xr(sf: bool, n: u32, sp_ctx: bool) -> String {
-    if n == 31 {
-        if sp_ctx {
-            return if sf { "sp".into() } else { "wsp".into() };
-        }
-        return if sf { "xzr".into() } else { "wzr".into() };
-    }
-    format!("{}{}", if sf { 'x' } else { 'w' }, n)
+    if n == 31 { [["wzr", "xzr"], ["wsp", "sp"]][sp_ctx as usize][sf as usize].into() } else { format!("{}{}", if sf { 'x' } else { 'w' }, n) }
 }
 
 /// Disassemble one word of the subset this module encodes (for `t27b asm`).
@@ -133,12 +89,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let s = (w >> 29) & 1 == 1;
         let imm = (w >> 10) & 0xfff;
         let sh = if (w >> 22) & 1 == 1 { ", lsl #12" } else { "" };
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if s && rd == 31 {
             return format!("{} {}, #{}{}", if sub { "cmp" } else { "cmn" }, xr(sf, rn, true), imm, sh);
         }
@@ -151,12 +102,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
     if w & 0x1F00_0000 == 0x0B00_0000 {
         let sub = (w >> 30) & 1 == 1;
         let s = (w >> 29) & 1 == 1;
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if (w >> 21) & 1 == 1 {
             let opt = (w >> 13) & 7;
             let ext = ["uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"][opt as usize];
@@ -211,26 +157,14 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let opc = (w >> 29) & 3;
         let hw = (w >> 21) & 3;
         let imm = (w >> 5) & 0xffff;
-        let name = match opc {
-            0 => "movn",
-            2 => "movz",
-            3 => "movk",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let Some(name) = [Some("movn"), None, Some("movz"), Some("movk")][opc as usize] else { return format!(".word {:#010x}", w) };
         let sh = if hw != 0 { format!(", lsl #{}", hw * 16) } else { String::new() };
         return format!("{} {}, #{:#x}{}", name, xr(sf, rd, false), imm, sh);
     }
     // data processing 2 source
     if w & 0x7FE0_0000 == 0x1AC0_0000 {
         let op = (w >> 10) & 63;
-        let name = match op {
-            2 => "udiv",
-            3 => "sdiv",
-            8 => "lsl",
-            9 => "lsr",
-            10 => "asr",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let name = match op { 2 => "udiv", 3 => "sdiv", 8 => "lsl", 9 => "lsr", 10 => "asr", _ => return format!(".word {:#010x}", w) };
         return format!("{} {}, {}, {}", name, xr(sf, rd, false), xr(sf, rn, false), xr(sf, rm, false));
     }
     // data processing 3 source

@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[path = "../gen/rust/compiler/use_splice.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod use_splice; // specs/compiler/use_splice.t27, by `t27c gen-rust`
 
 /// One top-level declaration lifted out of a spec, with the module it came from.
 #[derive(Clone)]
@@ -39,6 +40,12 @@ struct Decl {
 
 /// Locate the repository's `specs/` directory by walking up from the input.
 fn find_specs_root(input: &Path) -> Option<PathBuf> {
+    // #8980: a bare `x.t27` (parent "") or `../x.t27` never reaches `specs/` as spelled, so nothing
+    // was spliced; the absolute path finds the tree the file sits in.
+    spelled_specs_root(input).or_else(|| spelled_specs_root(&std::path::absolute(input).ok()?))
+}
+
+fn spelled_specs_root(input: &Path) -> Option<PathBuf> {
     let mut dir = input.parent()?.to_path_buf();
     loop {
         let candidate = dir.join("specs");
@@ -465,72 +472,7 @@ fn identifiers(text: &str) -> HashSet<String> {
 /// `math/constants.t27` against `math/sacred_physics.t27` is a real conflict
 /// and a silent pick would be exactly the mistake this guard was built for.
 fn all_agree(candidates: &[&Decl]) -> bool {
-    let first = normalised(&candidates[0].text);
-    candidates.iter().all(|d| normalised(&d.text) == first)
-}
-
-/// Drop a line comment that is not inside a string literal.
-///
-/// `base/types.t27` writes `pub const ONE : i8 = 1;      // Trit = +1` and
-/// `base/ops.t27` writes `pub const ONE : i8 = 1;`. Those are the same
-/// declaration; only one of them is annotated. Comparing raw text calls that a
-/// conflict and refuses the import.
-fn without_comment(line: &str) -> &str {
-    let b = line.as_bytes();
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < b.len() {
-        match in_str {
-            Some(q) => {
-                if b[i] == b'\\' {
-                    i += 1;
-                } else if b[i] == q {
-                    in_str = None;
-                }
-            }
-            None => {
-                if b[i] == b'"' || b[i] == b'\'' {
-                    in_str = Some(b[i]);
-                } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-                    return &line[..i];
-                }
-            }
-        }
-        i += 1;
-    }
-    line
-}
-
-/// A declaration reduced to what it states: no comments, no blank lines, no
-/// indentation.
-fn normalised(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| without_comment(l).trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-/// If this declaration is nothing but `= <module>::<name>;`, the module it
-/// names.
-///
-/// `specs/math/sacred_physics.t27` declares
-/// `const PHI : f64 = constants::PHI;` -- a re-export. It is not a second
-/// opinion about PHI, it is a pointer to the first one.
-fn alias_target(d: &Decl, name: &str) -> Option<String> {
-    let joined = normalised(&d.text).join(" ");
-    let rhs = joined.split_once('=')?.1.trim().trim_end_matches(';').trim();
-    let (module, target) = rhs.split_once("::")?;
-    let module = module.trim();
-    if target.trim() != name || module.is_empty() {
-        return None;
-    }
-    if !module
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-    {
-        return None;
-    }
-    Some(module.to_string())
+    candidates.iter().all(|d| use_splice::same_decl(d.text.as_bytes(), candidates[0].text.as_bytes()))
 }
 
 /// Which candidate to splice when they are not all the same declaration.
@@ -544,29 +486,13 @@ fn alias_target(d: &Decl, name: &str) -> Option<String> {
 /// flat output has no `constants` namespace. The target is what carries the
 /// value.
 fn alias_resolved<'a>(candidates: &[&'a Decl], name: &str) -> Option<&'a Decl> {
-    let mut real: Vec<&Decl> = Vec::new();
-    let mut aliases: Vec<(&Decl, String)> = Vec::new();
-    for d in candidates {
-        match alias_target(d, name) {
-            Some(m) => aliases.push((d, m.to_string())),
-            None => real.push(d),
-        }
-    }
-    if real.len() != 1 || aliases.is_empty() {
+    let class = |d: &Decl, stem: &str| use_splice::alias_class(d.text.as_bytes(), name.as_bytes(), stem.as_bytes());
+    let real: Vec<&&Decl> = candidates.iter().filter(|d| class(d, "") == 0).collect();
+    if real.len() != 1 || real.len() == candidates.len() {
         return None;
     }
-    let target = real[0];
-    let target_module = target
-        .origin
-        .rsplit('/')
-        .next()
-        .unwrap_or(&target.origin)
-        .trim_end_matches(".t27");
-    if aliases.iter().all(|(_, m)| m == target_module) {
-        Some(target)
-    } else {
-        None
-    }
+    let stem = real[0].origin.rsplit('/').next().unwrap_or(&real[0].origin).trim_end_matches(".t27");
+    candidates.iter().all(|d| class(d, stem) != 2).then_some(*real[0])
 }
 /// The names `resolve` refused to splice, as it explained them.
 ///
@@ -622,7 +548,7 @@ fn flatten_qualified(
             available.get(name).map_or(false, |cands| {
                 cands
                     .iter()
-                    .any(|d| normalised(&d.text) == normalised(&ld.text))
+                    .any(|d| use_splice::same_decl(d.text.as_bytes(), ld.text.as_bytes()))
             })
         })
         .unwrap_or(false)
@@ -680,6 +606,12 @@ fn consumed_use(line: &str, specs_root: &Path, pulled: &HashSet<String>) -> Opti
     Some(format!("{}use {}{{{}}}; // {}", indent, prefix, kept.join(", "), note))
 }
 
+fn sized(f: impl Fn(&mut [u8], usize) -> usize) -> String {
+    let mut out = vec![0u8; f(&mut [], 0)];
+    let n = out.len();
+    f(&mut out, n);
+    String::from_utf8(out).unwrap_or_default()
+}
 pub fn resolve(input_path: &Path, source: &str) -> String {
     let specs_root = match find_specs_root(input_path) {
         Some(r) => r,
@@ -691,6 +623,7 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = use_targets(source, &specs_root);
     let mut available: HashMap<String, Vec<Decl>> = HashMap::new();
+    let mut imports: HashMap<String, String> = HashMap::new();
     while let Some(dep) = queue.pop() {
         let canonical = dep.canonicalize().unwrap_or_else(|_| dep.clone());
         if !seen.insert(canonical) {
@@ -715,6 +648,7 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
             .unwrap_or(&dep)
             .to_string_lossy()
             .to_string();
+        imports.insert(origin.clone(), use_targets(&text, &specs_root).iter().map(|p| p.strip_prefix(&specs_root).unwrap_or(p).to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"));
         for d in split_decls(&text, &origin) {
             available.entry(d.name.clone()).or_default().push(d);
         }
@@ -745,19 +679,20 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     let mut pulled: Vec<Decl> = Vec::new();
     let mut pulled_names: HashSet<String> = HashSet::new();
     let mut ambiguous: Vec<(String, Vec<String>)> = Vec::new();
-    let mut frontier = identifiers(source);
-    for (_, name, _) in &qualified {
-        frontier.insert(name.clone());
+    let mut scoped: HashMap<(String, String), String> = HashMap::new();
+    let mut frontier: HashSet<(String, String)> = identifiers(&qualified.iter().fold(source.to_string(), |s, (q, n, _)| s.replace(q.as_str(), &q[..q.len() - n.len()]))).into_iter().map(|n| (n, String::new())).collect();
+    for (q, name, _) in &qualified {
+        frontier.insert((name.clone(), format!("={}", q)));
     }
     while !frontier.is_empty() {
-        let mut next: HashSet<String> = HashSet::new();
+        let mut next: HashSet<(String, String)> = HashSet::new();
         // The frontier is walked in HashSet order, which Rust randomises per
         // process. Sorting it here was tried and REMOVED: with the `distinct`
         // sort below in place and this one gone, 0 of the 492 importing specs
         // are non-deterministic over four runs each. A guard whose removal
         // changes nothing measurable is decoration, and the comment justifying
         // it would outlive the reason for it.
-        for name in frontier {
+        for (name, ctx) in frontier {
             if local.contains(&name) || pulled_names.contains(&name) {
                 continue;
             }
@@ -790,11 +725,17 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
                     let mut origins: Vec<String> =
                         distinct.iter().map(|d| d.origin.clone()).collect();
                     origins.sort();
+                    let at = use_splice::scope_index(origins.join("\n").as_bytes(), ctx.as_bytes(), imports.get(&ctx).map_or("", String::as_str).as_bytes());
+                    if let Some(d) = usize::try_from(at).ok().and_then(|i| distinct.get(i)) {
+                        scoped.insert((ctx.clone(), name.clone()), d.origin.clone());
+                        if pulled_names.insert(format!("{}::{}", d.origin, name)) { next.extend(identifiers(&d.text).into_iter().map(|n| (n, d.origin.clone()))); pulled.push((*d).clone()); }
+                        continue;
+                    }
                     ambiguous.push((name.clone(), origins));
                     continue;
                 }
             };
-            next.extend(identifiers(&decl.text));
+            next.extend(identifiers(&decl.text).into_iter().map(|n| (n, decl.origin.clone())));
             pulled_names.insert(name);
             pulled.push(decl);
         }
@@ -846,15 +787,21 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     // local one; otherwise the qualifier stays, the call binds to no local
     // function, and the arity check is skipped by non-match rather than run
     // against a namesake. Non-call spellings keep the old flattening.
+    let flat = |q: &String, n: &String| scoped.get(&(format!("={}", q), n.clone())).map(|o| sized(|b, c| use_splice::flat_name(o.as_bytes(), n.as_bytes(), b, c)));
     let mut rewrites: Vec<&(String, String, bool)> = qualified
         .iter()
-        .filter(|(_, name, is_call)| {
-            flatten_qualified(name, *is_call, &pulled_names, &local, &local_decls, &available)
+        .filter(|(q, name, is_call)| {
+            flat(q, name).is_some() || flatten_qualified(name, *is_call, &pulled_names, &local, &local_decls, &available)
         })
         .collect();
     rewrites.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     for (qual, name, _) in rewrites {
-        out = out.replace(qual.as_str(), name.as_str());
+        out = out.replace(qual.as_str(), &flat(qual, name).unwrap_or_else(|| name.clone()));
+    }
+    let names: String = pulled_names.iter().map(|n| format!("{n}\n")).chain(scoped.keys().map(|(_, n)| format!("{n}\n"))).collect();
+    for d in pulled.iter_mut() {
+        let ren: String = scoped.iter().filter(|((c, x), o)| *c == d.origin || (*x == d.name && **o == d.origin)).map(|((_, x), o)| format!("{x}\t{o}\n")).collect();
+        d.text = sized(|b, n| use_splice::rewrite(d.text.as_bytes(), imports.get(&d.origin).map_or("", String::as_str).as_bytes(), names.as_bytes(), ren.as_bytes(), b, n));
     }
     if !out.ends_with('\n') {
         out.push('\n');
@@ -1128,63 +1075,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod agree_tests {
-    use super::*;
-
-    fn d(origin: &str, text: &str) -> Decl {
-        Decl { name: "X".into(), text: text.into(), origin: origin.into() }
-    }
-
-    #[test]
-    fn identical_declarations_agree() {
-        let a = d("types", "pub const Trit = enum(i8) {\n    neg = -1,\n};");
-        let b = d("ops", "pub const Trit = enum(i8) {\n    neg = -1,\n};");
-        assert!(all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn indentation_does_not_make_two_declarations_disagree() {
-        // The corpus writes two conventions -- column 0 in one file, indented
-        // under `module M;` in another. Raw text comparison calls these
-        // different and keeps refusing an import that has no ambiguity in it.
-        let a = d("types", "pub const T = enum(i8) {\n    neg = -1,\n};");
-        let b = d("ops", "    pub const T = enum(i8) {\n        neg = -1,\n    };");
-        assert!(all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn a_different_value_disagrees() {
-        // PHI is 1.618... in math/constants.t27 and something else in
-        // math/sacred_physics.t27. Twenty (spec, name) pairs are this shape and
-        // every one must stay unresolved: a silent pick here is the mistake the
-        // refusal was built to prevent.
-        let a = d("constants", "pub const PHI : f64 = 1.618033988749895;");
-        let b = d("sacred_physics", "pub const PHI : f64 = 1.6180339887;");
-        assert!(!all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn a_missing_line_disagrees() {
-        let a = d("x", "pub const E = enum(i8) {\n    a = 1,\n    b = 2,\n};");
-        let b = d("y", "pub const E = enum(i8) {\n    a = 1,\n};");
-        assert!(!all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn blank_lines_are_not_content() {
-        let a = d("x", "pub const A = 1;");
-        let b = d("y", "\npub const A = 1;\n\n");
-        assert!(all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn a_single_candidate_agrees_with_itself() {
-        let a = d("x", "pub const A = 1;");
-        assert!(all_agree(&[&a]));
-    }
-}
-
-#[cfg(test)]
 mod notes_tests {
     use super::*;
 
@@ -1222,40 +1112,6 @@ mod alias_tests {
 
     fn d(origin: &str, text: &str) -> Decl {
         Decl { name: "X".into(), text: text.into(), origin: origin.into() }
-    }
-
-    #[test]
-    fn a_trailing_comment_is_not_part_of_a_declaration() {
-        // base/types.t27 annotates `pub const ONE : i8 = 1;` and base/ops.t27
-        // does not. Same declaration, one of them documented.
-        let a = d("base/ops.t27", "pub const ONE : i8 = 1;");
-        let b = d("base/types.t27", "pub const ONE : i8 = 1;      // Trit = +1");
-        assert!(all_agree(&[&a, &b]));
-    }
-
-    #[test]
-    fn a_slash_inside_a_string_does_not_start_a_comment() {
-        assert_eq!(without_comment(r#"const U = "http://x"; // note"#), r#"const U = "http://x"; "#);
-    }
-
-    #[test]
-    fn an_alias_names_its_target_module() {
-        let a = d("math/sacred_physics.t27", "const PHI : f64 = constants::PHI;");
-        assert_eq!(alias_target(&a, "PHI").as_deref(), Some("constants"));
-    }
-
-    #[test]
-    fn a_value_is_not_an_alias() {
-        let a = d("math/constants.t27", "const PHI : f64 = 1.618033988749895;");
-        assert!(alias_target(&a, "PHI").is_none());
-    }
-
-    #[test]
-    fn an_alias_to_a_different_name_is_not_an_alias_for_this_one() {
-        // `const PHI = constants::PHI_INV;` is a re-export of something else,
-        // and splicing the PHI definition for it would be wrong.
-        let a = d("m/x.t27", "const PHI : f64 = constants::PHI_INV;");
-        assert!(alias_target(&a, "PHI").is_none());
     }
 
     #[test]

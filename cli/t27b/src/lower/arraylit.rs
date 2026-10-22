@@ -15,11 +15,7 @@
 //! use is `&x` as such an argument (one E for all) or `x.len`, it takes the
 //! same slice-local path, and `&x` passes the slice of it (`arg_as`).
 //!
-//! An untyped module constant bound to a list is `.{ ... }`, a tuple; one
-//! nothing names is never analyzed by the reference, so it is skipped
-//! (`unreferenced_tuple_const`), not evaluated.
-//!
-//! `return [ ... ];` in a fn returning a slice, or a slice field's literal, is
+//! `return [ ... ];` (or `&[_]E{ ... }` for a const slice) in a fn returning a slice, or a slice field's literal, is
 //! `@constCast(&[_]E{ ... })` (`slice_lit`, plan `specs/tri/t27b/slice_lit_plan.t27`); one whose
 //! elements hold a str is a global written at entry (`entry_static`, #8091).
 //! A write through it is undefined behaviour in Zig, so it is refused
@@ -28,17 +24,6 @@
 use super::*;
 
 impl<'a> Lower<'a> {
-    /// An untyped module constant whose value is an array literal and whose
-    /// name no other node carries: Zig never analyzes it.
-    pub(super) fn unreferenced_tuple_const(&self, items: &[&Node], name: &str) -> bool {
-        let Some(node) = self.const_nodes.get(name) else { return false };
-        let untyped_list = node.extra_type.trim().is_empty()
-            && node.children.len() == 1
-            && node.children[0].kind == NodeKind::ExprArrayLiteral;
-        let named: usize = items.iter().map(|n| name_count(std::slice::from_ref(*n), name)).sum();
-        untyped_list && named == 1
-    }
-
     /// Called from `begin_body`: every `const xs = &[_]T{ ... }`, and every
     /// `const x = [N]T{ ... }` used as `&x`, whose uses all fit becomes a
     /// slice local of the callees' element type.
@@ -171,6 +156,7 @@ impl<'a> Lower<'a> {
     /// slice of the one static of its type and value (Zig interns it), which
     /// only reads (`literal_writes`). False for NOT_MINE.
     pub(super) fn slice_lit(&mut self, at: u8, named: bool, c: &Node, dst: &Place, out: &mut Vec<Stmt>) -> R<bool> {
+        let c = if is_addr_lit(c) && sl::takes_addr(matches!(dst.ty, LTy::Slice(_, true))) { &c.children[0] } else { c };
         if c.kind != NodeKind::ExprArrayLiteral || !matches!(dst.ty, LTy::Slice(..) | LTy::Str) {
             return Ok(false);
         }

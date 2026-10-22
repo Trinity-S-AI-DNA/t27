@@ -1,0 +1,1231 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/refresh.t27 -- which open pull requests TRI CLAW brings up to date after a merge, and in
+; what order (#10397, lane 4 of epic #10393).
+; Owner, 2026-10-18 (translated): move the queue and dispatch into our GitHub App, TRI CLAW, and
+; control it with @tri-claw comments; the App runs in GitHub CI.
+; --
+; After a merge every open PR whose base moved is behind. A conflict-free one waits for a person or a
+; bee to update it, and its CI does not rerun until somebody does. The claw-refresh job in
+; .github/workflows/gate-topology.yml mints a token from the update-branch row of github_surface.t27,
+; feeds this module the open pull requests, and calls the update-branch endpoint for every line this
+; module answers `R`. The job holds no decision; every skip below is decided here.
+; --
+; The input, one record per pull request on stdin, twelve TAB fields, written by the job from one
+; GraphQL listing and one compare per PR (the fields are copied, never judged):
+;     number, head sha, createdAt, isDraft, label names joined by commas, isCrossRepository,
+;     head repository name with owner (empty when the fork is gone), maintainerCanModify,
+;     mergeable, mergeStateStatus, commits the head is behind its base (`-` when unread),
+;     autoMerge (`true` when auto-merge is armed on the PR)
+; The second input is the number of workflow runs queued on the repository (negative: unread).
+; The output, one line per fact, two TAB fields:
+;     R TAB number TAB head sha     refresh this one (at most 5, oldest first)
+;     M TAB text                    one line for the step summary
+; --
+; The decision, first match wins (decide below):
+;     held       the label no-auto-merge is on it: a person or a gate has claimed the PR
+;     draft      drafts are never touched
+;     fork       the head lives in a fork and the author did not allow maintainer edits
+;     conflict   CONFLICTING or DIRTY: left alone, listed once in the summary
+;     unknown    GitHub has not computed mergeability, or the behind count is unread: next push
+;     current    not behind
+;     later      behind and conflict-free, but the merger will not land it next: it has neither
+;                auto-merge armed nor the bee-reviewed label (the merger's two signals), so a
+;                refresh would start about 26 workflows that nobody is waiting for
+;     refresh    behind, conflict-free and next to land
+; Then at most REFRESH_CAP of the refresh ones are kept, oldest createdAt first (ties: lower number),
+; the rest are counted as over the cap and wait for the next merge.
+; --
+; The queue rule (#10545): every update-branch starts about 26 workflows, and on 2026-10-18 the
+; Actions queue held 396 queued runs against 13 running. When more than QUEUE_LIMIT runs are queued,
+; or the count is unread, the answer is one M line and no R line: a refresh would only lengthen the
+; queue that is already the bottleneck.
+; --
+; Fail closed: a record that is not twelve fields, a number that is not a positive integer, a sha that
+; is not 40 lowercase hex digits, a createdAt that is not YYYY-MM-DDTHH:MM:SSZ, a flag that is not
+; `true` or `false`, a number seen twice, or a record past MAX_PRS is never refreshed; it is counted
+; as unreadable in the summary line. An unread fact never becomes an API call.
+; The honest limit: update-branch merges the base into the PR head, so the head moves and its CI
+; reruns; it does not rebase, and it cannot resolve a conflict.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawRefresh;
+
+use claw::sarif;
+use claw::text;
+
+/// Records one run reads; more are counted as unreadable, never silently dropped.
+pub const MAX_PRS : usize = 512;
+/// FR-002: the most pull requests one run refreshes, so one merge cannot flood the Actions queue
+/// (each update-branch starts about 26 workflows).
+pub const REFRESH_CAP : u32 = 5;
+/// FR-004: above this many queued workflow runs a run refreshes nothing.
+pub const QUEUE_LIMIT : i32 = 150;
+/// Fields of one record.
+pub const NFIELDS : usize = 12;
+
+/// Decisions. D_BAD is an unreadable record.
+pub const D_NONE : u8 = 0;
+pub const D_REFRESH : u8 = 1;
+pub const D_CONFLICT : u8 = 2;
+pub const D_HELD : u8 = 3;
+pub const D_FORK : u8 = 4;
+pub const D_DRAFT : u8 = 5;
+pub const D_CURRENT : u8 = 6;
+pub const D_UNKNOWN : u8 = 7;
+pub const D_CAPPED : u8 = 8;
+pub const D_BAD : u8 = 9;
+pub const D_LATER : u8 = 10;
+pub const D_COUNT : usize = 11;
+
+/// What GitHub says about mergeability, folded: M_OK may be updated, M_CONFLICT may not, M_UNKNOWN is
+/// not computed yet (a draft, or a PR whose base moved a moment ago).
+pub const M_OK : u8 = 0;
+pub const M_CONFLICT : u8 = 1;
+pub const M_UNKNOWN : u8 = 2;
+
+/// A flag as the job copies it: `true`, `false`, or anything else (refused).
+pub const T_FALSE : u8 = 0;
+pub const T_TRUE : u8 = 1;
+pub const T_BAD : u8 = 2;
+
+/// The label that holds a pull request out of every automatic step (issue-gate.yml carries the same word).
+pub const HELD_LABEL : str = "no-auto-merge";
+pub const HELD_LABEL_LEN : usize = 13;
+/// The label the bee reviewer puts on a pull request it passed: the merger lands those next
+/// (auto-merge-ready-prs.yml), as it lands every PR that has auto-merge armed.
+pub const NEXT_LABEL : str = "bee-reviewed";
+pub const NEXT_LABEL_LEN : usize = 12;
+
+/// Summary pieces, each with its byte length (the tests pin the lengths).
+pub const SUM_HEAD : str = "M\tclaw-refresh: ";
+pub const SUM_HEAD_LEN : usize = 16;
+pub const SUM_TEXTS : [9]str = [
+    " to update, ", " in conflict, ", " held or draft, ", " fork without maintainer edits, ",
+    " already up to date, ", " not decidable yet, ", " over the cap, ", " not next to land, ",
+    " unreadable\n",
+];
+pub const SUM_LENS : [9]usize = [12, 14, 16, 32, 21, 20, 15, 19, 12];
+/// The whole answer when the Actions queue is too long (SKIP_HEAD, the count, SKIP_BUSY) or unread.
+pub const SKIP_HEAD : str = "M\tclaw-refresh: skipped, ";
+pub const SKIP_HEAD_LEN : usize = 25;
+pub const SKIP_BUSY : str = " Actions runs are queued, above the limit of 150\n";
+pub const SKIP_BUSY_LEN : usize = 49;
+pub const SKIP_UNREAD : str = "the Actions queue size could not be read\n";
+pub const SKIP_UNREAD_LEN : usize = 41;
+pub const CONFLICT_HEAD : str = "M\t- #";
+pub const CONFLICT_HEAD_LEN : usize = 5;
+pub const CONFLICT_TAIL : str = " conflicts with its base branch and was left alone\n";
+pub const CONFLICT_TAIL_LEN : usize = 51;
+pub const BLANK_LINE : str = "M\t\n";
+pub const BLANK_LINE_LEN : usize = 3;
+
+/// The pure decision. fork_blocked is "the head is in a fork and maintainer edits are off"; mc is
+/// M_*; bh is 1 behind, 0 current, -1 unread; next is "the merger lands this one next".
+pub fn decide(held : bool, draft : bool, fork_blocked : bool, mc : u8, bh : i32, next : bool) -> u8 {
+    if (held) { return D_HELD; }
+    if (draft) { return D_DRAFT; }
+    if (fork_blocked) { return D_FORK; }
+    if (mc == M_CONFLICT) { return D_CONFLICT; }
+    if (mc == M_UNKNOWN) { return D_UNKNOWN; }
+    if (bh < 0) { return D_UNKNOWN; }
+    if (bh == 0) { return D_CURRENT; }
+    if (next == false) { return D_LATER; }
+    return D_REFRESH;
+}
+
+/// Whether raw[s..e) is a comma list with the label (ll bytes) as one whole entry.
+pub fn rf_has_label(raw : []const u8, s : usize, e : usize, label : str, ll : usize) -> bool {
+    var p : usize = s;
+    while (p <= e) {
+        var q : usize = p;
+        while (q < e and raw[q] != ',') { q += 1; }
+        if (field_eq(raw, p, q, label, ll)) { return true; }
+        p = q + 1;
+    }
+    return false;
+}
+
+/// Whether the held label is one whole entry of the label list raw[s..e).
+pub fn rf_label_held(raw : []const u8, s : usize, e : usize) -> bool {
+    return rf_has_label(raw, s, e, HELD_LABEL, HELD_LABEL_LEN);
+}
+
+/// `true`, `false` or neither.
+pub fn rf_flag(raw : []const u8, s : usize, e : usize) -> u8 {
+    if (field_eq(raw, s, e, "true", 4)) { return T_TRUE; }
+    if (field_eq(raw, s, e, "false", 5)) { return T_FALSE; }
+    return T_BAD;
+}
+
+/// Mergeability folded to M_*: CONFLICTING or DIRTY is a conflict, MERGEABLE is fine, everything else
+/// (UNKNOWN, a word GitHub adds later) is not decidable.
+pub fn rf_merge_class(raw : []const u8, ms : usize, me : usize, ss : usize, se : usize) -> u8 {
+    if (field_eq(raw, ms, me, "CONFLICTING", 11)) { return M_CONFLICT; }
+    if (field_eq(raw, ss, se, "DIRTY", 5)) { return M_CONFLICT; }
+    if (field_eq(raw, ms, me, "MERGEABLE", 9)) { return M_OK; }
+    return M_UNKNOWN;
+}
+
+/// 1 when the head is behind its base, 0 when it is not, -1 when neither the state word nor the
+/// count says: BEHIND wins, then a positive count, then a zero count.
+pub fn rf_behind(raw : []const u8, bs : usize, be : usize, ss : usize, se : usize) -> i32 {
+    if (field_eq(raw, ss, se, "BEHIND", 6)) { return 1; }
+    const n : i32 = parse_num(raw, bs, be);
+    if (n > 0) { return 1; }
+    if (n == 0) { return 0; }
+    return -1;
+}
+
+fn rf_hex(b : u8) -> bool {
+    if (b >= '0' and b <= '9') { return true; }
+    return b >= 'a' and b <= 'f';
+}
+
+fn rf_digit(b : u8) -> bool {
+    return b >= '0' and b <= '9';
+}
+
+/// 40 lowercase hex digits.
+pub fn rf_sha_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e - s != 40) { return false; }
+    var bad : usize = 0;
+    var i : usize = s;
+    while (i < e) {
+        if (rf_hex(raw[i]) == false) { bad += 1; }
+        i += 1;
+    }
+    return bad == 0;
+}
+
+/// YYYY-MM-DDTHH:MM:SSZ, 20 bytes: the shape that sorts the same as time does.
+pub fn rf_created_ok(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e - s != 20) { return false; }
+    var i : usize = 0;
+    while (i < 20) {
+        const b : u8 = raw[s + i];
+        if (i == 4 or i == 7) {
+            if (b != '-') { return false; }
+        } else if (i == 10) {
+            if (b != 'T') { return false; }
+        } else if (i == 13 or i == 16) {
+            if (b != ':') { return false; }
+        } else if (i == 19) {
+            if (b != 'Z') { return false; }
+        } else if (rf_digit(b) == false) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Whether the PR created at raw[ca..ca+20) with number na is older than the one at cb with number
+/// nb: earlier time first, the lower number when the seconds are equal.
+pub fn rf_older(raw : []const u8, ca : usize, na : u32, cb : usize, nb : u32) -> bool {
+    var k : usize = 0;
+    while (k < 20) {
+        const x : u8 = raw[ca + k];
+        const y : u8 = raw[cb + k];
+        if (x < y) { return true; }
+        if (x > y) { return false; }
+        k += 1;
+    }
+    return na < nb;
+}
+
+/// Split raw[ls..le) into exactly NFIELDS tab fields: f[2k] is the start and f[2k+1] the end of
+/// field k. False for fewer or more.
+fn rf_split(raw : []const u8, ls : usize, le : usize, f : []usize) -> bool {
+    var k : usize = 0;
+    var s : usize = ls;
+    while (k < NFIELDS) {
+        const e : usize = field_end(raw, le, s);
+        f[2 * k] = s;
+        f[2 * k + 1] = e;
+        k += 1;
+        if (k < NFIELDS) {
+            if (e >= le) { return false; }
+            s = e + 1;
+        } else {
+            return e == le;
+        }
+    }
+    return false;
+}
+
+/// The decision for one split record; D_BAD when any fact it needs cannot be read.
+fn rf_classify(raw : []const u8, f : []const usize) -> u8 {
+    if (rf_sha_ok(raw, f[2], f[3]) == false) { return D_BAD; }
+    if (rf_created_ok(raw, f[4], f[5]) == false) { return D_BAD; }
+    const draft : u8 = rf_flag(raw, f[6], f[7]);
+    const cross : u8 = rf_flag(raw, f[10], f[11]);
+    const modify : u8 = rf_flag(raw, f[14], f[15]);
+    const armed : u8 = rf_flag(raw, f[22], f[23]);
+    if (draft == T_BAD or cross == T_BAD or modify == T_BAD or armed == T_BAD) { return D_BAD; }
+    const held : bool = rf_label_held(raw, f[8], f[9]);
+    const gone : bool = f[13] == f[12];
+    const fork_blocked : bool = (cross == T_TRUE or gone) and modify != T_TRUE;
+    const mc : u8 = rf_merge_class(raw, f[16], f[17], f[18], f[19]);
+    const bh : i32 = rf_behind(raw, f[20], f[21], f[18], f[19]);
+    const next : bool = armed == T_TRUE or rf_has_label(raw, f[8], f[9], NEXT_LABEL, NEXT_LABEL_LEN);
+    return decide(held, draft == T_TRUE, fork_blocked, mc, bh, next);
+}
+
+/// Index of the decision in the summary texts, for the counts that share one text.
+fn rf_put_sha(dst : []u8, cap : usize, w : usize, raw : []const u8, s : usize) -> usize {
+    var x : usize = w;
+    var i : usize = 0;
+    while (i < 40) {
+        x = put_byte(dst, cap, x, raw[s + i]);
+        i += 1;
+    }
+    return x;
+}
+
+/// The answer for the records in raw[0..n), into out: the R lines oldest first, then the summary.
+/// queued is the number of workflow runs queued on the repository (negative: unread); above
+/// QUEUE_LIMIT, or unread, the answer is one M line and no R line.
+/// Returns the bytes it needs; when that exceeds cap the buffer holds a clipped answer that must not
+/// be acted on.
+pub fn refresh_plan(raw : []const u8, n : usize, out : []u8, cap : usize, queued : i32) -> usize {
+    if (queued < 0) {
+        var u : usize = put_str(out, cap, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+        u = put_str(out, cap, u, SKIP_UNREAD, SKIP_UNREAD_LEN);
+        return u;
+    }
+    if (queued > QUEUE_LIMIT) {
+        var y : usize = put_str(out, cap, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+        y = put_count(out, cap, y, queued as u32);
+        y = put_str(out, cap, y, SKIP_BUSY, SKIP_BUSY_LEN);
+        return y;
+    }
+    var dec : [512]u8 = undefined;
+    var num : [512]u32 = undefined;
+    var cs : [512]usize = undefined;
+    var ss : [512]usize = undefined;
+    var rk : [512]u32 = undefined;
+    var f : [24]usize = undefined;
+    var st : [11]u32 = undefined;
+    var cnt : usize = 0;
+    var extra : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = line_end(raw, n, ls);
+        if (le > ls) {
+            if (cnt >= MAX_PRS) {
+                extra += 1;
+            } else {
+                var d : u8 = D_BAD;
+                var v : u32 = 0;
+                cs[cnt] = 0;
+                ss[cnt] = 0;
+                if (rf_split(raw, ls, le, &f)) {
+                    const pn : i32 = parse_num(raw, f[0], f[1]);
+                    if (pn > 0) {
+                        v = pn as u32;
+                        d = rf_classify(raw, &f);
+                        cs[cnt] = f[4];
+                        ss[cnt] = f[2];
+                    }
+                }
+                var j : usize = 0;
+                while (j < cnt) {
+                    if (v != 0 and num[j] == v) { d = D_BAD; }
+                    j += 1;
+                }
+                num[cnt] = v;
+                dec[cnt] = d;
+                cnt += 1;
+            }
+        }
+        var nx : usize = le;
+        while (nx < n and raw[nx] != '\n') { nx += 1; }
+        ls = nx + 1;
+    }
+    var i : usize = 0;
+    while (i < cnt) {
+        rk[i] = 0;
+        if (dec[i] == D_REFRESH) {
+            var j : usize = 0;
+            while (j < cnt) {
+                if (j != i and dec[j] == D_REFRESH) {
+                    if (rf_older(raw, cs[j], num[j], cs[i], num[i])) { rk[i] += 1; }
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < cnt) {
+        if (dec[i] == D_REFRESH and rk[i] >= REFRESH_CAP) { dec[i] = D_CAPPED; }
+        i += 1;
+    }
+    var c : usize = 0;
+    while (c < D_COUNT) {
+        st[c] = 0;
+        c += 1;
+    }
+    i = 0;
+    while (i < cnt) {
+        st[dec[i] as usize] += 1;
+        i += 1;
+    }
+    st[D_BAD as usize] += extra;
+    var w : usize = 0;
+    var r : u32 = 0;
+    while (r < REFRESH_CAP) {
+        i = 0;
+        while (i < cnt) {
+            if (dec[i] == D_REFRESH and rk[i] == r) {
+                w = put_str(out, cap, w, "R\t", 2);
+                w = put_count(out, cap, w, num[i]);
+                w = put_byte(out, cap, w, '\t');
+                w = rf_put_sha(out, cap, w, raw, ss[i]);
+                w = put_byte(out, cap, w, '\n');
+            }
+            i += 1;
+        }
+        r += 1;
+    }
+    w = put_str(out, cap, w, SUM_HEAD, SUM_HEAD_LEN);
+    w = put_count(out, cap, w, st[D_REFRESH as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[0], SUM_LENS[0]);
+    w = put_count(out, cap, w, st[D_CONFLICT as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[1], SUM_LENS[1]);
+    w = put_count(out, cap, w, st[D_HELD as usize] + st[D_DRAFT as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[2], SUM_LENS[2]);
+    w = put_count(out, cap, w, st[D_FORK as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[3], SUM_LENS[3]);
+    w = put_count(out, cap, w, st[D_CURRENT as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[4], SUM_LENS[4]);
+    w = put_count(out, cap, w, st[D_UNKNOWN as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[5], SUM_LENS[5]);
+    w = put_count(out, cap, w, st[D_CAPPED as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[6], SUM_LENS[6]);
+    w = put_count(out, cap, w, st[D_LATER as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[7], SUM_LENS[7]);
+    w = put_count(out, cap, w, st[D_BAD as usize]);
+    w = put_str(out, cap, w, SUM_TEXTS[8], SUM_LENS[8]);
+    if (st[D_CONFLICT as usize] > 0) {
+        w = put_str(out, cap, w, BLANK_LINE, BLANK_LINE_LEN);
+        i = 0;
+        while (i < cnt) {
+            if (dec[i] == D_CONFLICT) {
+                w = put_str(out, cap, w, CONFLICT_HEAD, CONFLICT_HEAD_LEN);
+                w = put_count(out, cap, w, num[i]);
+                w = put_str(out, cap, w, CONFLICT_TAIL, CONFLICT_TAIL_LEN);
+            }
+            i += 1;
+        }
+    }
+    return w;
+}
+
+/// Whether the answer of refresh_plan fits the buffer it was written to.
+pub fn refresh_fits(needed : usize, out_cap : usize) -> bool {
+    return needed <= out_cap;
+}
+
+// ---- test helpers: build one record from small codes, so a test states the case and not the bytes ----
+
+fn t_put2(dst : []u8, cap : usize, w : usize, v : u32) -> usize {
+    var x : usize = put_byte(dst, cap, w, digit_byte(v / 10));
+    x = put_byte(dst, cap, x, digit_byte(v % 10));
+    return x;
+}
+
+/// One record. ts is seconds into 2026-10-18 (under a day); labels: 0 none, 1 no-auto-merge,
+/// 2 bug,no-auto-merge,x, 3 no-auto-merge-2, 4 x-no-auto-merge, 5 bug,x; mg: 0 MERGEABLE,
+/// 1 CONFLICTING, 2 UNKNOWN; sc: 0 BLOCKED, 1 DIRTY, 2 BEHIND, 3 UNKNOWN; behind: commits behind,
+/// 9999 for unread; am: 0 false, 1 true, 2 maybe. The sha is 40 hex digits whose first is the last
+/// digit of num. Label code 6 is bug,bee-reviewed, 7 is bee-reviewed-2.
+fn t_rec(dst : []u8, cap : usize, w : usize, num : u32, ts : u32, draft : bool, labels : u32, cross : bool, modify : bool, mg : u32, sc : u32, behind : u32, am : u32) -> usize {
+    var x : usize = put_count(dst, cap, w, num);
+    x = put_byte(dst, cap, x, '\t');
+    x = put_byte(dst, cap, x, digit_byte(num % 10));
+    var k : usize = 1;
+    while (k < 40) {
+        x = put_byte(dst, cap, x, 'a');
+        k += 1;
+    }
+    x = put_str(dst, cap, x, "\t2026-10-18T", 12);
+    x = t_put2(dst, cap, x, ts / 3600);
+    x = put_byte(dst, cap, x, ':');
+    x = t_put2(dst, cap, x, (ts % 3600) / 60);
+    x = put_byte(dst, cap, x, ':');
+    x = t_put2(dst, cap, x, ts % 60);
+    x = put_str(dst, cap, x, "Z\t", 2);
+    if (draft) { x = put_str(dst, cap, x, "true", 4); } else { x = put_str(dst, cap, x, "false", 5); }
+    x = put_byte(dst, cap, x, '\t');
+    if (labels == 1) { x = put_str(dst, cap, x, "no-auto-merge", 13); }
+    if (labels == 2) { x = put_str(dst, cap, x, "bug,no-auto-merge,x", 19); }
+    if (labels == 3) { x = put_str(dst, cap, x, "no-auto-merge-2", 15); }
+    if (labels == 4) { x = put_str(dst, cap, x, "x-no-auto-merge", 15); }
+    if (labels == 5) { x = put_str(dst, cap, x, "bug,x", 5); }
+    if (labels == 6) { x = put_str(dst, cap, x, "bug,bee-reviewed", 16); }
+    if (labels == 7) { x = put_str(dst, cap, x, "bee-reviewed-2", 14); }
+    x = put_byte(dst, cap, x, '\t');
+    if (cross) { x = put_str(dst, cap, x, "true\tsomeone/t27\t", 17); } else { x = put_str(dst, cap, x, "false\tgHashTag/t27\t", 19); }
+    if (modify) { x = put_str(dst, cap, x, "true\t", 5); } else { x = put_str(dst, cap, x, "false\t", 6); }
+    if (mg == 0) { x = put_str(dst, cap, x, "MERGEABLE", 9); }
+    if (mg == 1) { x = put_str(dst, cap, x, "CONFLICTING", 11); }
+    if (mg == 2) { x = put_str(dst, cap, x, "UNKNOWN", 7); }
+    x = put_byte(dst, cap, x, '\t');
+    if (sc == 0) { x = put_str(dst, cap, x, "BLOCKED", 7); }
+    if (sc == 1) { x = put_str(dst, cap, x, "DIRTY", 5); }
+    if (sc == 2) { x = put_str(dst, cap, x, "BEHIND", 6); }
+    if (sc == 3) { x = put_str(dst, cap, x, "UNKNOWN", 7); }
+    x = put_byte(dst, cap, x, '\t');
+    if (behind == 9999) {
+        x = put_byte(dst, cap, x, '-');
+    } else {
+        x = put_count(dst, cap, x, behind);
+    }
+    x = put_byte(dst, cap, x, '\t');
+    if (am == 0) { x = put_str(dst, cap, x, "false", 5); }
+    if (am == 1) { x = put_str(dst, cap, x, "true", 4); }
+    if (am == 2) { x = put_str(dst, cap, x, "maybe", 5); }
+    return put_byte(dst, cap, x, '\n');
+}
+
+/// Lines of out[0..n) that start with byte b.
+fn t_lines(out : []const u8, n : usize, b : u8) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (out[i] == b and (i == 0 or out[i - 1] == '\n')) { c += 1; }
+        i += 1;
+    }
+    return c;
+}
+
+// ---- tests: the pure decision ----
+
+test a_behind_conflict_free_pull_request_is_refreshed {
+    assert decide(false, false, false, M_OK, 3, true) == D_REFRESH;
+    assert decide(false, false, false, M_OK, 1, true) == D_REFRESH;
+}
+
+test a_pull_request_that_is_not_behind_is_left_alone {
+    assert decide(false, false, false, M_OK, 0, true) == D_CURRENT;
+}
+
+test a_conflicting_pull_request_is_never_refreshed {
+    assert decide(false, false, false, M_CONFLICT, 5, true) == D_CONFLICT;
+    assert decide(false, false, false, M_CONFLICT, 0, true) == D_CONFLICT;
+}
+
+test a_held_pull_request_is_never_touched_whatever_else_is_true {
+    assert decide(true, false, false, M_OK, 5, true) == D_HELD;
+    assert decide(true, false, false, M_CONFLICT, 5, true) == D_HELD;
+    assert decide(true, true, true, M_UNKNOWN, 0, true) == D_HELD;
+}
+
+test a_draft_is_never_touched {
+    assert decide(false, true, false, M_OK, 5, true) == D_DRAFT;
+    assert decide(false, true, false, M_CONFLICT, 5, true) == D_DRAFT;
+}
+
+test a_fork_without_maintainer_edits_is_skipped_not_failed {
+    assert decide(false, false, true, M_OK, 5, true) == D_FORK;
+    assert decide(false, false, true, M_CONFLICT, 5, true) == D_FORK;
+}
+
+test a_fork_with_maintainer_edits_is_refreshed_like_any_other {
+    assert decide(false, false, false, M_OK, 5, true) == D_REFRESH;
+}
+
+test unread_facts_never_become_a_refresh {
+    assert decide(false, false, false, M_UNKNOWN, 5, true) == D_UNKNOWN;
+    assert decide(false, false, false, M_OK, -1, true) == D_UNKNOWN;
+}
+
+test a_pull_request_the_merger_will_not_land_next_waits {
+    assert decide(false, false, false, M_OK, 3, false) == D_LATER;
+    assert decide(false, false, false, M_OK, 1, false) == D_LATER;
+    assert decide(false, false, false, M_OK, 1, true) == D_REFRESH;
+}
+
+test every_other_reason_outranks_waiting_for_the_merger {
+    assert decide(true, false, false, M_OK, 5, false) == D_HELD;
+    assert decide(false, true, false, M_OK, 5, false) == D_DRAFT;
+    assert decide(false, false, true, M_OK, 5, false) == D_FORK;
+    assert decide(false, false, false, M_CONFLICT, 5, false) == D_CONFLICT;
+    assert decide(false, false, false, M_UNKNOWN, 5, false) == D_UNKNOWN;
+    assert decide(false, false, false, M_OK, -1, false) == D_UNKNOWN;
+    assert decide(false, false, false, M_OK, 0, false) == D_CURRENT;
+}
+
+// ---- tests: reading the fields ----
+
+test the_held_label_matches_only_as_a_whole_entry {
+    var b : [64]u8 = undefined;
+    var n : usize = put_str(&b, 64, 0, "no-auto-merge", 13);
+    assert rf_label_held(&b, 0, n) == true;
+    n = put_str(&b, 64, 0, "bug,no-auto-merge,x", 19);
+    assert rf_label_held(&b, 0, n) == true;
+    n = put_str(&b, 64, 0, "bug,no-auto-merge", 17);
+    assert rf_label_held(&b, 0, n) == true;
+    n = put_str(&b, 64, 0, "no-auto-merge-2", 15);
+    assert rf_label_held(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "x-no-auto-merge", 15);
+    assert rf_label_held(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "no-auto-merg", 12);
+    assert rf_label_held(&b, 0, n) == false;
+    n = put_str(&b, 64, 0, "bug,x", 5);
+    assert rf_label_held(&b, 0, n) == false;
+    assert rf_label_held(&b, 0, 0) == false;
+}
+
+test the_merger_label_matches_only_as_a_whole_entry {
+    var b : [64]u8 = undefined;
+    var n : usize = put_str(&b, 64, 0, "bee-reviewed", 12);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == true;
+    n = put_str(&b, 64, 0, "bug,bee-reviewed,x", 18);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == true;
+    n = put_str(&b, 64, 0, "bee-reviewed-2", 14);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false;
+    n = put_str(&b, 64, 0, "x-bee-reviewed", 14);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false;
+    n = put_str(&b, 64, 0, "bee-reviewe", 11);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false;
+    n = put_str(&b, 64, 0, "bug,x", 5);
+    assert rf_has_label(&b, 0, n, NEXT_LABEL, NEXT_LABEL_LEN) == false;
+    assert rf_has_label(&b, 0, 0, NEXT_LABEL, NEXT_LABEL_LEN) == false;
+    assert rf_label_held(&b, 0, 0) == false;
+}
+
+test a_flag_is_true_false_or_refused {
+    var b : [16]u8 = undefined;
+    var n : usize = put_str(&b, 16, 0, "true", 4);
+    assert rf_flag(&b, 0, n) == T_TRUE;
+    n = put_str(&b, 16, 0, "false", 5);
+    assert rf_flag(&b, 0, n) == T_FALSE;
+    n = put_str(&b, 16, 0, "True", 4);
+    assert rf_flag(&b, 0, n) == T_BAD;
+    n = put_str(&b, 16, 0, "", 0);
+    assert rf_flag(&b, 0, n) == T_BAD;
+    n = put_str(&b, 16, 0, "1", 1);
+    assert rf_flag(&b, 0, n) == T_BAD;
+}
+
+test mergeability_folds_conflict_and_unknown_apart {
+    var b : [64]u8 = undefined;
+    var m : usize = put_str(&b, 64, 0, "MERGEABLE", 9);
+    var s : usize = put_str(&b, 64, m, "BLOCKED", 7);
+    assert rf_merge_class(&b, 0, m, m, s) == M_OK;
+    s = put_str(&b, 64, m, "DIRTY", 5);
+    assert rf_merge_class(&b, 0, m, m, s) == M_CONFLICT;
+    m = put_str(&b, 64, 0, "CONFLICTING", 11);
+    s = put_str(&b, 64, m, "BLOCKED", 7);
+    assert rf_merge_class(&b, 0, m, m, s) == M_CONFLICT;
+    m = put_str(&b, 64, 0, "UNKNOWN", 7);
+    s = put_str(&b, 64, m, "UNKNOWN", 7);
+    assert rf_merge_class(&b, 0, m, m, s) == M_UNKNOWN;
+    m = put_str(&b, 64, 0, "WHATEVER", 8);
+    s = put_str(&b, 64, m, "CLEAN", 5);
+    assert rf_merge_class(&b, 0, m, m, s) == M_UNKNOWN;
+}
+
+test behind_reads_the_state_word_then_the_count {
+    var b : [64]u8 = undefined;
+    var c : usize = put_str(&b, 64, 0, "4", 1);
+    var s : usize = put_str(&b, 64, c, "BLOCKED", 7);
+    assert rf_behind(&b, 0, c, c, s) == 1;
+    c = put_str(&b, 64, 0, "0", 1);
+    s = put_str(&b, 64, c, "BLOCKED", 7);
+    assert rf_behind(&b, 0, c, c, s) == 0;
+    s = put_str(&b, 64, c, "BEHIND", 6);
+    assert rf_behind(&b, 0, c, c, s) == 1;
+    c = put_str(&b, 64, 0, "-", 1);
+    s = put_str(&b, 64, c, "BLOCKED", 7);
+    assert rf_behind(&b, 0, c, c, s) == -1;
+    s = put_str(&b, 64, c, "BEHIND", 6);
+    assert rf_behind(&b, 0, c, c, s) == 1;
+}
+
+test a_sha_is_forty_lowercase_hex_digits {
+    var b : [64]u8 = undefined;
+    var n : usize = 0;
+    while (n < 40) {
+        b[n] = 'a';
+        n += 1;
+    }
+    assert rf_sha_ok(&b, 0, 40) == true;
+    assert rf_sha_ok(&b, 0, 39) == false;
+    b[7] = 'G';
+    assert rf_sha_ok(&b, 0, 40) == false;
+    b[7] = 'A';
+    assert rf_sha_ok(&b, 0, 40) == false;
+    b[7] = '9';
+    assert rf_sha_ok(&b, 0, 40) == true;
+    b[7] = 'f';
+    assert rf_sha_ok(&b, 0, 40) == true;
+    b[7] = 'g';
+    assert rf_sha_ok(&b, 0, 40) == false;
+}
+
+test a_created_stamp_has_exactly_the_sortable_shape {
+    var b : [32]u8 = undefined;
+    var n : usize = put_str(&b, 32, 0, "2026-10-18T09:05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == true;
+    n = put_str(&b, 32, 0, "2026-10-18 09:05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-10-18T09:05:01+0", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-10-18T09:05:01", 19);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-1x-18T09:05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+}
+
+test older_goes_by_time_then_by_number {
+    var b : [64]u8 = undefined;
+    const a : usize = put_str(&b, 64, 0, "2026-10-18T09:05:01Z", 20);
+    const c : usize = put_str(&b, 64, a, "2026-10-18T09:05:02Z", 20);
+    assert rf_older(&b, 0, 900, a, 100) == true;
+    assert rf_older(&b, a, 100, 0, 900) == false;
+    assert rf_older(&b, 0, 5, 0, 6) == true;
+    assert rf_older(&b, 0, 6, 0, 5) == false;
+    assert rf_older(&b, 0, 5, 0, 5) == false;
+    assert c == 40;
+}
+
+// ---- tests: whole records through refresh_plan ----
+
+test a_behind_clean_pull_request_gets_an_R_line_with_its_sha {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert refresh_fits(d, 4096) == true;
+    assert out[0] == 'R';
+    assert out[1] == '\t';
+    assert buf_has(&out, d, "R\t4217\t7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 48) == true;
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, "M\tclaw-refresh: 1 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 not next to land, 0 unreadable\n", 186) == true;
+}
+
+test a_conflicting_pull_request_is_listed_once_and_not_refreshed {
+    var r : [512]u8 = undefined;
+    var n : usize = t_rec(&r, 512, 0, 300, 100, false, 0, false, false, 1, 1, 7, 1);
+    n = t_rec(&r, 512, n, 301, 200, false, 0, false, false, 0, 0, 2, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, "R\t301\t", 6) == true;
+    assert buf_has(&out, d, "R\t300\t", 6) == false;
+    assert buf_has(&out, d, "M\t- #300 conflicts with its base branch and was left alone\n", 59) == true;
+    assert buf_has(&out, d, "M\t- #301", 8) == false;
+    assert buf_has(&out, d, " 1 in conflict, ", 16) == true;
+}
+
+test a_dirty_state_word_alone_is_a_conflict {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 310, 100, false, 0, false, false, 0, 1, 4, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, "M\t- #310 ", 9) == true;
+}
+
+test a_draft_and_a_held_pull_request_are_not_touched {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 400, 100, true, 0, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 401, 110, false, 1, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 402, 120, false, 2, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 403, 130, false, 3, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 404, 140, false, 4, false, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 405, 150, false, 5, false, false, 0, 0, 9, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert buf_has(&out, d, "R\t400\t", 6) == false;
+    assert buf_has(&out, d, "R\t401\t", 6) == false;
+    assert buf_has(&out, d, "R\t402\t", 6) == false;
+    assert buf_has(&out, d, "R\t403\t", 6) == true;
+    assert buf_has(&out, d, "R\t404\t", 6) == true;
+    assert buf_has(&out, d, "R\t405\t", 6) == true;
+    assert t_lines(&out, d, 'R') == 3;
+    assert buf_has(&out, d, " 3 held or draft, ", 18) == true;
+}
+
+test a_fork_without_maintainer_edits_is_skipped_and_one_with_edits_is_refreshed {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 500, 100, false, 0, true, false, 0, 0, 9, 1);
+    n = t_rec(&r, 1024, n, 501, 110, false, 0, true, true, 0, 0, 9, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert buf_has(&out, d, "R\t500\t", 6) == false;
+    assert buf_has(&out, d, "R\t501\t", 6) == true;
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, " 1 fork without maintainer edits, ", 34) == true;
+}
+
+test a_deleted_head_repository_counts_as_a_fork_that_cannot_be_edited {
+    var r : [256]u8 = undefined;
+    var n : usize = put_str(&r, 256, 0, "510\t", 4);
+    var k : usize = 0;
+    while (k < 40) {
+        n = put_byte(&r, 256, n, 'b');
+        k += 1;
+    }
+    n = put_str(&r, 256, n, "\t2026-10-18T00:01:00Z\tfalse\t\tfalse\t\tfalse\tMERGEABLE\tBLOCKED\t5\ttrue\n", 67);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 fork without maintainer edits, ", 34) == true;
+}
+
+test a_pull_request_that_is_current_or_not_computed_is_counted_and_left_alone {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 600, 100, false, 0, false, false, 0, 0, 0, 1);
+    n = t_rec(&r, 1024, n, 601, 110, false, 0, false, false, 2, 3, 5, 1);
+    n = t_rec(&r, 1024, n, 602, 120, false, 0, false, false, 0, 0, 9999, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 already up to date, ", 23) == true;
+    assert buf_has(&out, d, " 2 not decidable yet, ", 22) == true;
+}
+
+test a_record_that_cannot_be_read_is_counted_and_never_refreshed {
+    var r : [2048]u8 = undefined;
+    var n : usize = put_str(&r, 2048, 0, "700\tnotasha\t2026-10-18T00:01:00Z\tfalse\t\tfalse\tx/y\tfalse\tMERGEABLE\tBLOCKED\t5\ttrue\n", 81);
+    n = put_str(&r, 2048, n, "701\tshort record\n", 17);
+    n = put_str(&r, 2048, n, "abc\tdef\n", 8);
+    n = put_str(&r, 2048, n, "0\t", 2);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 4 unreadable\n", 14) == true;
+}
+
+test a_flag_that_is_not_true_or_false_makes_the_record_unreadable {
+    var r : [512]u8 = undefined;
+    var n : usize = t_rec(&r, 512, 0, 710, 100, false, 0, false, false, 0, 0, 5, 1);
+    var k : usize = 0;
+    while (k < n) {
+        if (r[k] == 'f' and r[k + 1] == 'a' and r[k + 2] == 'l' and r[k + 3] == 's' and r[k + 4] == 'e') {
+            r[k] = 'F';
+            k = n;
+        }
+        k += 1;
+    }
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}
+
+test a_number_seen_twice_is_refused_the_second_time {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 800, 100, false, 0, false, false, 0, 0, 5, 1);
+    n = t_rec(&r, 1024, n, 800, 200, false, 0, false, false, 0, 0, 5, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}
+
+test the_oldest_pull_request_comes_first_whatever_the_input_order {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 903, 3000, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 901, 1000, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 902, 2000, false, 0, false, false, 0, 0, 1, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 3;
+    assert out[0] == 'R';
+    assert buf_has(&out, d, "R\t901\t", 6) == true;
+    assert out[2] == '9';
+    assert out[3] == '0';
+    assert out[4] == '1';
+    assert out[47] == 'R';
+    assert out[49] == '9';
+    assert out[50] == '0';
+    assert out[51] == '2';
+    assert out[94] == 'R';
+    assert out[98] == '3';
+}
+
+test equal_timestamps_are_ordered_by_number {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 952, 500, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 951, 500, false, 0, false, false, 0, 0, 1, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert out[4] == '1';
+    assert out[5] == '\t';
+}
+
+test at_most_five_are_refreshed_and_they_are_the_oldest {
+    var r : [8192]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 8;
+    while (i > 0) {
+        n = t_rec(&r, 8192, n, 100 + i, i * 60, false, 0, false, false, 0, 0, 2, 1);
+        i -= 1;
+    }
+    var out : [16384]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 16384, 0);
+    assert refresh_fits(d, 16384) == true;
+    assert t_lines(&out, d, 'R') == 5;
+    assert buf_has(&out, d, "R\t101\t", 6) == true;
+    assert buf_has(&out, d, "R\t105\t", 6) == true;
+    assert buf_has(&out, d, "R\t106\t", 6) == false;
+    assert buf_has(&out, d, "R\t108\t", 6) == false;
+    assert buf_has(&out, d, " 5 to update, ", 14) == true;
+    assert buf_has(&out, d, " 3 over the cap, ", 17) == true;
+}
+
+test five_exactly_is_not_capped {
+    var r : [8192]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 5) {
+        n = t_rec(&r, 8192, n, 200 + i, i * 60, false, 0, false, false, 0, 0, 2, 1);
+        i += 1;
+    }
+    var out : [16384]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 16384, 0);
+    assert t_lines(&out, d, 'R') == 5;
+    assert buf_has(&out, d, " 0 over the cap, ", 17) == true;
+}
+
+test held_and_conflicting_ones_do_not_use_up_the_cap {
+    var r : [16384]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 10) {
+        n = t_rec(&r, 16384, n, 300 + i, i * 60, false, 1, false, false, 0, 0, 2, 1);
+        i += 1;
+    }
+    i = 11;
+    while (i <= 20) {
+        n = t_rec(&r, 16384, n, 300 + i, i * 60, false, 0, false, false, 1, 1, 2, 1);
+        i += 1;
+    }
+    i = 21;
+    while (i <= 50) {
+        n = t_rec(&r, 16384, n, 300 + i, i * 60, false, 0, false, false, 0, 0, 2, 1);
+        i += 1;
+    }
+    var out : [16384]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 16384, 0);
+    assert t_lines(&out, d, 'R') == 5;
+    assert buf_has(&out, d, "R\t321\t", 6) == true;
+    assert buf_has(&out, d, "R\t325\t", 6) == true;
+    assert buf_has(&out, d, "R\t326\t", 6) == false;
+    assert t_lines(&out, d, 'M') == 12;
+}
+
+test the_merger_signal_is_auto_merge_armed_or_the_bee_label {
+    var r : [2048]u8 = undefined;
+    var n : usize = t_rec(&r, 2048, 0, 401, 100, false, 0, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 402, 200, false, 0, false, false, 0, 0, 2, 1);
+    n = t_rec(&r, 2048, n, 403, 300, false, 6, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 404, 400, false, 7, false, false, 0, 0, 2, 0);
+    n = t_rec(&r, 2048, n, 405, 500, false, 5, false, false, 0, 0, 2, 0);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 2;
+    assert buf_has(&out, d, "R\t402\t", 6) == true;
+    assert buf_has(&out, d, "R\t403\t", 6) == true;
+    assert buf_has(&out, d, "R\t401\t", 6) == false;
+    assert buf_has(&out, d, "R\t404\t", 6) == false;
+    assert buf_has(&out, d, "R\t405\t", 6) == false;
+    assert buf_has(&out, d, " 2 to update, ", 14) == true;
+    assert buf_has(&out, d, " 3 not next to land, ", 21) == true;
+}
+
+test pull_requests_that_wait_do_not_use_up_the_cap {
+    var r : [8192]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 10) {
+        n = t_rec(&r, 8192, n, 500 + i, i * 60, false, 0, false, false, 0, 0, 2, 0);
+        i += 1;
+    }
+    i = 11;
+    while (i <= 16) {
+        n = t_rec(&r, 8192, n, 500 + i, i * 60, false, 0, false, false, 0, 0, 2, 1);
+        i += 1;
+    }
+    var out : [16384]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 16384, 0);
+    assert t_lines(&out, d, 'R') == 5;
+    assert buf_has(&out, d, "R\t511\t", 6) == true;
+    assert buf_has(&out, d, "R\t515\t", 6) == true;
+    assert buf_has(&out, d, "R\t516\t", 6) == false;
+    assert buf_has(&out, d, " 10 not next to land, ", 22) == true;
+    assert buf_has(&out, d, " 1 over the cap, ", 17) == true;
+}
+
+test the_auto_merge_flag_must_be_true_or_false {
+    var r : [512]u8 = undefined;
+    const n : usize = t_rec(&r, 512, 0, 410, 100, false, 0, false, false, 0, 0, 2, 2);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+    assert buf_has(&out, d, " 0 not next to land, ", 21) == true;
+}
+
+test a_queue_above_the_limit_stops_every_refresh {
+    var r : [512]u8 = undefined;
+    const n : usize = t_rec(&r, 512, 0, 420, 100, false, 0, false, false, 0, 0, 2, 1);
+    var out : [4096]u8 = undefined;
+    var d : usize = refresh_plan(&r, n, &out, 4096, 151);
+    assert t_lines(&out, d, 'R') == 0;
+    assert t_lines(&out, d, 'M') == 1;
+    assert d == 25 + 3 + 49;
+    assert buf_has(&out, d, "M\tclaw-refresh: skipped, 151 Actions runs are queued, above the limit of 150\n", 77) == true;
+    d = refresh_plan(&r, n, &out, 4096, 396);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, "skipped, 396 Actions runs are queued", 36) == true;
+}
+
+test a_queue_at_the_limit_still_refreshes {
+    var r : [512]u8 = undefined;
+    const n : usize = t_rec(&r, 512, 0, 421, 100, false, 0, false, false, 0, 0, 2, 1);
+    var out : [4096]u8 = undefined;
+    var d : usize = refresh_plan(&r, n, &out, 4096, 150);
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, "skipped", 7) == false;
+    d = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+}
+
+test an_unread_queue_size_stops_every_refresh {
+    var r : [512]u8 = undefined;
+    const n : usize = t_rec(&r, 512, 0, 422, 100, false, 0, false, false, 0, 0, 2, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, -1);
+    assert t_lines(&out, d, 'R') == 0;
+    assert t_lines(&out, d, 'M') == 1;
+    assert d == 25 + 41;
+    assert buf_has(&out, d, "M\tclaw-refresh: skipped, the Actions queue size could not be read\n", 66) == true;
+}
+
+test the_skip_texts_are_pinned_by_their_lengths {
+    var b : [96]u8 = undefined;
+    var w : usize = put_str(&b, 96, 0, SKIP_HEAD, SKIP_HEAD_LEN);
+    assert b[w - 1] == ' ';
+    assert b[w - 2] == ',';
+    w = put_str(&b, 96, 0, SKIP_BUSY, SKIP_BUSY_LEN);
+    assert b[0] == ' ';
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == '0';
+    w = put_str(&b, 96, 0, SKIP_UNREAD, SKIP_UNREAD_LEN);
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == 'd';
+    assert QUEUE_LIMIT == 150;
+    assert REFRESH_CAP == 5;
+}
+
+test an_empty_list_is_a_valid_empty_answer {
+    var r : [4]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, 0, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, "M\tclaw-refresh: 0 to update, 0 in conflict, 0 held or draft, 0 fork without maintainer edits, 0 already up to date, 0 not decidable yet, 0 over the cap, 0 not next to land, 0 unreadable\n", 186) == true;
+    assert t_lines(&out, d, 'M') == 1;
+}
+
+test a_carriage_return_does_not_hide_a_record {
+    var r : [512]u8 = undefined;
+    var n : usize = t_rec(&r, 512, 0, 970, 100, false, 0, false, false, 0, 0, 2, 1);
+    r[n - 1] = 13;
+    n = put_byte(&r, 512, n, '\n');
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+}
+
+test a_buffer_too_small_is_reported_not_trusted {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 980, 100, false, 0, false, false, 0, 0, 2, 1);
+    var out : [32]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 32, 0);
+    assert refresh_fits(d, 32) == false;
+    assert refresh_fits(d, d) == true;
+}
+
+test the_summary_texts_are_pinned_by_their_lengths {
+    var b : [64]u8 = undefined;
+    var k : usize = 0;
+    while (k < 9) {
+        const w : usize = put_str(&b, 64, 0, SUM_TEXTS[k], SUM_LENS[k]);
+        assert w == SUM_LENS[k];
+        assert b[0] == ' ';
+        k += 1;
+    }
+    var w : usize = put_str(&b, 64, 0, SUM_TEXTS[8], SUM_LENS[8]);
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == 'e';
+    w = put_str(&b, 64, 0, CONFLICT_TAIL, CONFLICT_TAIL_LEN);
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == 'e';
+    w = put_str(&b, 64, 0, SUM_HEAD, SUM_HEAD_LEN);
+    assert b[w - 1] == ' ';
+    assert b[w - 2] == ':';
+    w = put_str(&b, 64, 0, CONFLICT_HEAD, CONFLICT_HEAD_LEN);
+    assert b[w - 1] == '#';
+    w = put_str(&b, 64, 0, BLANK_LINE, BLANK_LINE_LEN);
+    assert b[w - 1] == '\n';
+    assert b[w - 2] == '\t';
+}
+
+test one_record_splits_into_twelve_fields_and_classifies_as_refresh {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    var f : [24]usize = undefined;
+    const le : usize = line_end(&r, n, 0);
+    assert le == n - 1;
+    assert rf_split(&r, 0, le, &f) == true;
+    assert f[1] == 4;
+    assert parse_num(&r, f[0], f[1]) == 4217;
+    assert rf_sha_ok(&r, f[2], f[3]) == true;
+    assert rf_created_ok(&r, f[4], f[5]) == true;
+    assert rf_flag(&r, f[6], f[7]) == T_FALSE;
+    assert rf_flag(&r, f[10], f[11]) == T_FALSE;
+    assert rf_flag(&r, f[14], f[15]) == T_FALSE;
+    assert rf_merge_class(&r, f[16], f[17], f[18], f[19]) == M_OK;
+    assert rf_behind(&r, f[20], f[21], f[18], f[19]) == 1;
+    assert rf_flag(&r, f[22], f[23]) == T_TRUE;
+    assert f[23] == n - 1;
+    assert rf_classify(&r, &f) == D_REFRESH;
+}
+
+// ---- tests: the negative controls the mutation run asked for ----
+
+test a_created_stamp_is_checked_at_every_separator_and_at_its_length {
+    var b : [32]u8 = undefined;
+    var n : usize = put_str(&b, 32, 0, "2026-10-18T09:05:01Zx", 21);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026/10-18T09:05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-10/18T09:05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-10-18T09-05:01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+    n = put_str(&b, 32, 0, "2026-10-18T09:05-01Z", 20);
+    assert rf_created_ok(&b, 0, n) == false;
+}
+
+test older_ignores_the_byte_after_the_stamp {
+    var b : [64]u8 = undefined;
+    var w : usize = put_str(&b, 64, 0, "2026-10-18T09:05:01Zz", 21);
+    w = put_str(&b, 64, w, "2026-10-18T09:05:01Za", 21);
+    assert rf_older(&b, 0, 1, 21, 2) == true;
+    assert rf_older(&b, 21, 2, 0, 1) == false;
+}
+
+test one_unreadable_field_alone_makes_the_record_unreadable {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 720, 100, false, 0, false, false, 0, 0, 5, 1);
+    assert r[45] == '2';
+    assert r[73] == 'f';
+    assert r[92] == 'f';
+    var out : [4096]u8 = undefined;
+    var d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+    r[45] = 'x';
+    d = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+    r[45] = '2';
+    r[73] = 'F';
+    d = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+    r[73] = 'f';
+    r[92] = 'F';
+    d = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}
+
+test a_record_one_field_short_is_unreadable_not_merely_undecidable {
+    var r : [256]u8 = undefined;
+    var n : usize = t_rec(&r, 256, 0, 730, 100, false, 0, false, false, 0, 0, 5, 1);
+    r[n - 6] = '\n';
+    n -= 5;
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+    assert buf_has(&out, d, " 0 not decidable yet, ", 22) == true;
+}
+
+test a_blank_line_is_not_a_record {
+    var r : [512]u8 = undefined;
+    var n : usize = put_byte(&r, 512, 0, '\n');
+    n = t_rec(&r, 512, n, 740, 100, false, 0, false, false, 0, 0, 5, 1);
+    n = put_byte(&r, 512, n, '\n');
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, " 0 unreadable\n", 14) == true;
+}
+
+test pull_request_number_zero_is_unreadable {
+    var r : [256]u8 = undefined;
+    const n : usize = t_rec(&r, 256, 0, 0, 100, false, 0, false, false, 0, 0, 5, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 0;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}
+
+test the_513th_record_is_counted_as_unreadable_and_not_stored {
+    var r : [65536]u8 = undefined;
+    var n : usize = 0;
+    var i : u32 = 1;
+    while (i <= 513) {
+        n = t_rec(&r, 65536, n, i, 100, false, 0, false, false, 0, 0, 0, 1);
+        i += 1;
+    }
+    assert n < 65536;
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert buf_has(&out, d, "512 already up to date, ", 24) == true;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}
+
+test the_hour_digits_decide_the_order {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 9, 39600, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 3, 43200, false, 0, false, false, 0, 0, 1, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 2;
+    assert out[2] == '9';
+    assert out[47] == '3';
+}
+
+test the_second_digits_decide_the_order {
+    var r : [1024]u8 = undefined;
+    var n : usize = t_rec(&r, 1024, 0, 9, 3610, false, 0, false, false, 0, 0, 1, 1);
+    n = t_rec(&r, 1024, n, 3, 3659, false, 0, false, false, 0, 0, 1, 1);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 2;
+    assert out[2] == '9';
+    assert out[47] == '3';
+}
+
+// The test below was written against a mutation sweep of this file (#10721).
+
+test a_record_cut_after_its_number_does_not_borrow_the_previous_fields {
+    var r : [512]u8 = undefined;
+    var n : usize = t_rec(&r, 512, 0, 4217, 600, false, 0, false, false, 0, 0, 3, 1);
+    n = put_str(&r, 512, n, "8\n", 2);
+    var out : [4096]u8 = undefined;
+    const d : usize = refresh_plan(&r, n, &out, 4096, 0);
+    assert t_lines(&out, d, 'R') == 1;
+    assert buf_has(&out, d, "R\t8\t", 4) == false;
+    assert buf_has(&out, d, "M\tclaw-refresh: 1 to update, ", 29) == true;
+    assert buf_has(&out, d, " 1 unreadable\n", 14) == true;
+}

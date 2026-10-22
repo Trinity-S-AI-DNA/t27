@@ -3,8 +3,8 @@
 ; under #6063 and #5980). cli/t27b/src/lower.rs lowers the t27c AST to t27b's IR; a type reaches it as the
 ; source spelling (`?*const [4]u8`, `[T; N]`, `gf16::GF16`), and these are the rules that read that spelling
 ; without asking anything of the rest of the file. They were hand-written Rust in lower.rs (`close_of_open`,
-; `type_base`, `zig_type_name`, `undeclared_field_type`, `is_scoped_gf16`, `returns_value` and the shape
-; decision of `type_construct`); they now reach cli/t27b only through `t27c gen-rust`
+; `type_base`, `zig_type_name`, `undeclared_field_type`, `is_scoped_gf16`, `returns_value`, the shape
+; decision of `type_construct`, the prefix walk of `zig_spelled`); they now reach cli/t27b only through `t27c gen-rust`
 ; (gen/rust/tri/t27b/type_text.rs, mounted as `tt`).
 ; --
 ; The glue passes a text's bytes. A sub-text is returned as its two byte offsets packed in one i64
@@ -27,9 +27,15 @@ pub const B_TAB : u8 = 9;
 pub const B_CR : u8 = 13;
 pub const B_SPACE : u8 = 32;
 pub const B_BANG : u8 = 33;
+pub const B_PERCENT : u8 = 37;
 pub const B_AMP : u8 = 38;
 pub const B_LPAREN : u8 = 40;
+pub const B_RPAREN : u8 = 41;
 pub const B_STAR : u8 = 42;
+pub const B_PLUS : u8 = 43;
+pub const B_MINUS : u8 = 45;
+pub const B_DOT : u8 = 46;
+pub const B_SLASH : u8 = 47;
 pub const B_COLON : u8 = 58;
 pub const B_SEMI : u8 = 59;
 pub const B_LT : u8 = 60;
@@ -58,6 +64,8 @@ pub const ZIG_NAMES : [21]str = ["bool", "void", "type", "anyerror", "anyframe",
 pub const MAPPED_NAMES : [8]str = ["str", "string", "float", "double", "int", "uint", "GF16", "gf16"];
 /// The return types that are no value.
 pub const NO_VALUE_NAMES : [4]str = ["", "void", "noreturn", "()"];
+/// Zig's keywords: printed bare, they are no field name of an anonymous struct (`anon_struct_ret`).
+pub const ZIG_KEYWORDS : [48]str = ["align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await", "break", "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer", "error", "export", "extern", "fn", "for", "if", "inline", "linksection", "noalias", "noinline", "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return", "struct", "suspend", "switch", "test", "threadlocal", "try", "union", "unreachable", "usingnamespace", "var", "volatile", "while"];
 
 /// Is the byte an ASCII letter?
 pub fn alpha(c: u8) -> bool {
@@ -302,6 +310,282 @@ pub fn returns_value(s: []const u8) -> bool {
     return true;
 }
 
+/// Is the text one of Zig's keywords?
+pub fn zig_keyword(s: []const u8) -> bool {
+    var k : usize = 0;
+    while (k < 48) {
+        if (same(s, ZIG_KEYWORDS[k])) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// An anonymous struct as a fn's result type (`anon_struct_ret`, issue #8705). The reference prints the
+// spelling token by token (`struct { user : struct { login : [ ] const u8 } , state : [ ] const u8 , }`),
+// and Zig makes each `struct { .. }` in it a type of its own, a field's type included. The glue walks the
+// field list one field at a time (`field_end`), reads each `name : type`, and asks `anon_struct` whether the
+// type is again an anonymous struct; any other field type must be one Zig spells (`zig_spelled_base`).
+// ----------------------------------------------------------------------------------------------------------
+
+pub const B_COMMA : u8 = 44;
+pub const B_EQ : u8 = 61;
+pub const B_LBRACE : u8 = 123;
+pub const B_RBRACE : u8 = 125;
+
+/// Is the text, trimmed, `struct` and then `{` (White_Space between them allowed)?
+pub fn anon_struct(s: []const u8) -> bool {
+    const lo : usize = trim_lo(s, 0, s.len);
+    if (!starts(s, lo, s.len, "struct")) { return false; }
+    const at : usize = trim_lo(s, lo + 6, s.len);
+    return at < s.len and s[at] == B_LBRACE;
+}
+
+/// The field list of an anonymous struct's text, packed: what lies between its `{` and the `}` it ends with.
+/// NONE when the text is no anonymous struct or does not end with `}`, and when the list holds a `(`, `)` or
+/// `=` (a default value, a call) or a brace that does not pair up: only `name: type` fields, a field's type
+/// perhaps an anonymous struct again.
+pub fn anon_fields(s: []const u8) -> i64 {
+    if (!anon_struct(s)) { return NONE; }
+    const lo : usize = trim_lo(s, trim_lo(s, 0, s.len) + 6, s.len) + 1;
+    const end : usize = trim_hi(s, lo, s.len);
+    if (end == lo or s[end - 1] != B_RBRACE) { return NONE; }
+    var depth : i64 = 0;
+    var i : usize = lo;
+    while (i < end - 1) {
+        const c : u8 = s[i];
+        if (c == B_LPAREN or c == B_RPAREN or c == B_EQ) { return NONE; }
+        if (c == B_LBRACE) { depth = depth + 1; }
+        if (c == B_RBRACE) {
+            if (depth == 0) { return NONE; }
+            depth = depth - 1;
+        }
+        i = i + 1;
+    }
+    if (depth != 0) { return NONE; }
+    return pack(lo, end - 1);
+}
+
+/// The end of the field that starts at s[lo] in a field list that ends at hi: the first `,` outside the
+/// braces of a nested anonymous struct, or hi.
+pub fn field_end(s: []const u8, lo: usize, hi: usize) -> usize {
+    var depth : i64 = 0;
+    var i : usize = lo;
+    while (i < hi) {
+        const c : u8 = s[i];
+        if (c == B_LBRACE) { depth = depth + 1; }
+        if (c == B_RBRACE) { depth = depth - 1; }
+        if (c == B_COMMA and depth == 0) { return i; }
+        i = i + 1;
+    }
+    return hi;
+}
+
+/// The name a field type of an anonymous struct spells under Zig's prefixes (`zig_spelled`), packed: `?`,
+/// `*const `, `*`, `[]const `, `[]` and `[N]` stripped in any order and number, trimmed each time. NONE for a
+/// `[` that no `]` closes, or whose N is empty or holds a byte that is no letter, digit or `_`. The glue then
+/// asks whether the name is a Zig scalar or a struct or enum the file declares.
+pub fn zig_spelled_base(s: []const u8) -> i64 {
+    var lo : usize = trim_lo(s, 0, s.len);
+    const hi : usize = trim_hi(s, lo, s.len);
+    while (lo < hi) {
+        if (s[lo] == B_QUEST) {
+            lo = lo + 1;
+        } else if (starts(s, lo, hi, "*const ")) {
+            lo = lo + 7;
+        } else if (s[lo] == B_STAR) {
+            lo = lo + 1;
+        } else if (starts(s, lo, hi, "[]const ")) {
+            lo = lo + 8;
+        } else if (starts(s, lo, hi, "[]")) {
+            lo = lo + 2;
+        } else if (s[lo] == B_LBRACK) {
+            const close : i64 = close_in(s, lo, hi);
+            if (close == NONE) { return NONE; }
+            const at : usize = @intCast(close);
+            const a : usize = trim_lo(s, lo + 1, at);
+            const b : usize = trim_hi(s, a, at);
+            if (a == b) { return NONE; }
+            var k : usize = a;
+            while (k < b) {
+                if (!word(s[k])) { return NONE; }
+                k = k + 1;
+            }
+            lo = at + 1;
+        } else {
+            return pack(lo, hi);
+        }
+        lo = trim_lo(s, lo, hi);
+    }
+    return pack(lo, hi);
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// An array's length (issue #8657). Zig reads the text between `[` and `]` of `[N]T` as a comptime usize
+// expression, and gen-zig prints it as written: memory.t27's `[MAX_CONTENT_LENGTH+1]u8` and types.t27's
+// `[TRITS_PER_WORD+1]Trit` are 50001 and 28 elements long. t27b reads the integer expressions of this grammar:
+//     sum  := prod (('+' | '-') prod)*
+//     prod := atom (('*' | '/' | '%') atom)*
+//     atom := digits | '(' sum ')' | '-' atom
+// The glue holds the lookups: it finds each name (`name_lo`, `name_hi`), replaces it by the value of the
+// compile-time integer it names, in parentheses, and asks `len_value` for the answer. A value, an operand or a
+// result outside +-LEN_LIMIT is no length; nor is a `/` or `%` with a negative operand or a zero divisor, which
+// Zig refuses for comptime integers; nor is anything else (a call, `@sizeOf`, a hex or float literal).
+// ----------------------------------------------------------------------------------------------------------
+
+/// The answer for a text that is no integer expression this file reads.
+pub const LEN_NONE : i64 = -4611686018427387904;
+/// The largest magnitude `len_value` works with, 2^36; a length is below 2^32.
+pub const LEN_LIMIT : i64 = 68719476736;
+/// A reading returns its value and the position it stopped at as one i64: (value + LEN_LIMIT) * LEN_SHIFT +
+/// position. A text is shorter than LEN_SHIFT, 2^24 bytes. LEN_NONE is no reading.
+pub const LEN_SHIFT : i64 = 16777216;
+
+/// The end of the run of letters, digits and `_` that starts at s[i].
+fn word_end(s: []const u8, i: usize) -> usize {
+    var k : usize = i;
+    while (k < s.len and word(s[k])) { k = k + 1; }
+    return k;
+}
+
+/// The start of the first name in s at or after `from`; s.len when there is none. A token that starts with a
+/// digit is a number and is skipped whole (`0x10` holds no name).
+pub fn name_lo(s: []const u8, from: usize) -> usize {
+    var i : usize = from;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (digit(c)) {
+            i = word_end(s, i);
+        } else if (alpha(c) or c == B_UNDERSCORE) {
+            return i;
+        } else {
+            i = i + 1;
+        }
+    }
+    return s.len;
+}
+
+/// The end of the name that starts at s[lo]: words joined by `.` (`a.b`).
+pub fn name_hi(s: []const u8, lo: usize) -> usize {
+    var k : usize = word_end(s, lo);
+    while (k + 1 < s.len and s[k] == B_DOT and word(s[k + 1])) {
+        k = word_end(s, k + 1);
+    }
+    return k;
+}
+
+/// The first byte at or after i that is no space.
+fn len_skip(s: []const u8, i: usize) -> usize {
+    var k : usize = i;
+    while (k < s.len and s[k] == B_SPACE) { k = k + 1; }
+    return k;
+}
+
+/// The magnitude of v.
+fn len_abs(v: i64) -> i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+/// The reading of value v that stopped at position pos.
+fn len_pack(v: i64, pos: usize) -> i64 {
+    const p : i64 = @intCast(pos);
+    return (v + LEN_LIMIT) * LEN_SHIFT + p;
+}
+
+/// The value of a reading.
+fn len_val(r: i64) -> i64 {
+    return @divTrunc(r, LEN_SHIFT) - LEN_LIMIT;
+}
+
+/// The position a reading stopped at.
+fn len_pos(r: i64) -> usize {
+    const q : i64 = r - @divTrunc(r, LEN_SHIFT) * LEN_SHIFT;
+    return @intCast(q);
+}
+
+/// atom := digits | '(' sum ')' | '-' atom, read from position `at`.
+fn len_atom(s: []const u8, at: usize) -> i64 {
+    const i : usize = len_skip(s, at);
+    if (i >= s.len) { return LEN_NONE; }
+    const c : u8 = s[i];
+    if (c == B_LPAREN) {
+        const w : i64 = len_sum(s, i + 1);
+        if (w == LEN_NONE) { return LEN_NONE; }
+        const j : usize = len_skip(s, len_pos(w));
+        if (j >= s.len or s[j] != B_RPAREN) { return LEN_NONE; }
+        return len_pack(len_val(w), j + 1);
+    }
+    if (c == B_MINUS) {
+        const m : i64 = len_atom(s, i + 1);
+        if (m == LEN_NONE) { return LEN_NONE; }
+        return len_pack(0 - len_val(m), len_pos(m));
+    }
+    if (!digit(c)) { return LEN_NONE; }
+    var v : i64 = 0;
+    var k : usize = i;
+    while (k < s.len and word(s[k])) {
+        if (!digit(s[k])) { return LEN_NONE; }
+        v = v * 10 + @as(i64, s[k] - 48);
+        if (v > LEN_LIMIT) { return LEN_NONE; }
+        k = k + 1;
+    }
+    return len_pack(v, k);
+}
+
+/// prod := atom (('*' | '/' | '%') atom)*.
+fn len_prod(s: []const u8, at: usize) -> i64 {
+    var r : i64 = len_atom(s, at);
+    while (r != LEN_NONE) {
+        const i : usize = len_skip(s, len_pos(r));
+        if (i >= s.len) { return r; }
+        const op : u8 = s[i];
+        if (op != B_STAR and op != B_SLASH and op != B_PERCENT) { return r; }
+        const q : i64 = len_atom(s, i + 1);
+        if (q == LEN_NONE) { return LEN_NONE; }
+        const a : i64 = len_val(r);
+        const b : i64 = len_val(q);
+        if (op == B_STAR) {
+            if (b != 0 and len_abs(a) > @divTrunc(LEN_LIMIT, len_abs(b))) { return LEN_NONE; }
+            r = len_pack(a * b, len_pos(q));
+        } else if (a < 0 or b <= 0) {
+            return LEN_NONE;
+        } else if (op == B_SLASH) {
+            r = len_pack(@divTrunc(a, b), len_pos(q));
+        } else {
+            r = len_pack(a - b * @divTrunc(a, b), len_pos(q));
+        }
+    }
+    return LEN_NONE;
+}
+
+/// sum := prod (('+' | '-') prod)*.
+fn len_sum(s: []const u8, at: usize) -> i64 {
+    var r : i64 = len_prod(s, at);
+    while (r != LEN_NONE) {
+        const i : usize = len_skip(s, len_pos(r));
+        if (i >= s.len) { return r; }
+        const op : u8 = s[i];
+        if (op != B_PLUS and op != B_MINUS) { return r; }
+        const q : i64 = len_prod(s, i + 1);
+        if (q == LEN_NONE) { return LEN_NONE; }
+        var v : i64 = len_val(r) + len_val(q);
+        if (op == B_MINUS) { v = len_val(r) - len_val(q); }
+        if (v > LEN_LIMIT or v < 0 - LEN_LIMIT) { return LEN_NONE; }
+        r = len_pack(v, len_pos(q));
+    }
+    return LEN_NONE;
+}
+
+/// The value of the integer expression s, which holds no names; LEN_NONE when it is not one this file reads.
+pub fn len_value(s: []const u8) -> i64 {
+    if (s.len >= LEN_SHIFT) { return LEN_NONE; }
+    const r : i64 = len_sum(s, 0);
+    if (r == LEN_NONE) { return LEN_NONE; }
+    if (len_skip(s, len_pos(r)) != s.len) { return LEN_NONE; }
+    return len_val(r);
+}
+
 /// The shape a type outside the subset is refused as, by its first bytes (`type_construct`, after the
 /// file's own declarations): types of one shape share a construct, so a count says how many files need it.
 pub fn shape(s: []const u8) -> u8 {
@@ -475,6 +759,43 @@ test trimming_skips_whitespace_at_both_ends {
     assert trimmed_is("  void\t", "void");
     assert trimmed_is(" ", "");
     assert !trimmed_is(" voids ", "void");
+}
+
+/// The trims are no fns here: a t27 fn returning `[]const u8` is emitted `-> &'static str` in
+/// gen-rust, which a slice of a parameter cannot satisfy (E0308). The caller writes the slice
+/// itself, over trim_lo / trim_hi -- exactly the compositions the t27o std table emits (#9098).
+/// These are the vectors rust_std proved against Rust's std.
+test the_trims_are_the_slices_a_caller_writes_over_trim_lo_and_trim_hi {
+    assert same("  a b  "[trim_lo("  a b  ", 0, 7) .. trim_hi("  a b  ", trim_lo("  a b  ", 0, 7), 7)], "a b");
+    assert same("  a b  "[trim_lo("  a b  ", 0, 7) .. 7], "a b  ");
+    assert same("  a b  "[0 .. trim_hi("  a b  ", 0, 7)], "  a b");
+    assert same(""[trim_lo("", 0, 0) .. trim_hi("", trim_lo("", 0, 0), 0)], "");
+    assert same("a"[trim_lo("a", 0, 1) .. trim_hi("a", trim_lo("a", 0, 1), 1)], "a");
+    assert same(""[trim_lo("", 0, 0) .. 0], "");
+    assert same(""[0 .. trim_hi("", 0, 0)], "");
+    assert same("\t\n x"[trim_lo("\t\n x", 0, 4) .. trim_hi("\t\n x", trim_lo("\t\n x", 0, 4), 4)], "x");
+    var in3 : [7]u8 = undefined;
+    in3[0] = 9;
+    in3[1] = 10;
+    in3[2] = 32;
+    in3[3] = 120;
+    in3[4] = 32;
+    in3[5] = 13;
+    in3[6] = 10;
+    const t3 : []const u8 = in3[0 .. 7];
+    assert same(t3[trim_lo(t3, 0, t3.len) .. trim_hi(t3, trim_lo(t3, 0, t3.len), t3.len)], "x");
+    const out3_1 : [4]u8 = [120, 32, 13, 10];
+    assert same(t3[trim_lo(t3, 0, t3.len) .. t3.len], out3_1[0 .. 4]);
+    assert same(t3[0 .. trim_hi(t3, 0, t3.len)], "\t\n x");
+    var in4 : [5]u8 = undefined;
+    in4[0] = 194;
+    in4[1] = 160;
+    in4[2] = 97;
+    in4[3] = 194;
+    in4[4] = 160;
+    const t4 : []const u8 = in4[0 .. 5];
+    assert same(t4[trim_lo(t4, 0, t4.len) .. trim_hi(t4, trim_lo(t4, 0, t4.len), t4.len)], "a");
+    assert trimmed_is("abc", "abc");
 }
 
 test non_ascii_spaces_trim_too {
@@ -656,4 +977,165 @@ test shape_names_are_the_refusal_constructs {
     assert same(shape_name(SHAPE_ANON_STRUCT), "type (anonymous struct)");
     assert same(shape_name(SHAPE_GENERIC), "type (generic)");
     assert same(shape_name(SHAPE_UNDECLARED), "type (undeclared)");
+}
+
+test zig_keywords_are_no_field_names {
+    assert zig_keyword("fn") and zig_keyword("align") and zig_keyword("while") and zig_keyword("usingnamespace");
+    assert zig_keyword("test") and zig_keyword("error") and zig_keyword("or") and zig_keyword("anytype");
+    assert !zig_keyword("Fn") and !zig_keyword("") and !zig_keyword("f") and !zig_keyword("whiles");
+    assert !zig_keyword("type") and !zig_keyword("null") and !zig_keyword("undefined") and !zig_keyword("bool");
+    assert ZIG_KEYWORDS.len == 48;
+}
+
+test a_length_is_an_integer_expression {
+    assert len_value("28") == 28;
+    assert len_value("0") == 0;
+    assert len_value("27+1") == 28;
+    assert len_value(" 27 + 1 ") == 28;
+    assert len_value("(27)+(1)") == 28;
+    assert len_value("50000+1") == 50001;
+    assert len_value("2*3+4") == 10;
+    assert len_value("2+3*4") == 14;
+    assert len_value("(2+3)*4") == 20;
+    assert len_value("100/7") == 14;
+    assert len_value("100%7") == 2;
+    assert len_value("10-4-3") == 3;
+    assert len_value("100/5/2") == 10;
+    assert len_value("-3+5") == 2;
+    assert len_value("2*-3") == -6;
+    assert len_value("(-3)") == -3;
+    assert len_value("3-5") == -2;
+    assert len_value("((7))") == 7;
+}
+
+test a_text_that_is_no_length_expression_is_none {
+    assert len_value("") == LEN_NONE;
+    assert len_value("  ") == LEN_NONE;
+    assert len_value("1+") == LEN_NONE;
+    assert len_value("+1") == LEN_NONE;
+    assert len_value("(1") == LEN_NONE;
+    assert len_value("1)") == LEN_NONE;
+    assert len_value("()") == LEN_NONE;
+    assert len_value("1 2") == LEN_NONE;
+    assert len_value("1+*2") == LEN_NONE;
+    assert len_value("N+1") == LEN_NONE;
+    assert len_value("0x10") == LEN_NONE;
+    assert len_value("12abc") == LEN_NONE;
+    assert len_value("1.5") == LEN_NONE;
+    assert len_value("1e3") == LEN_NONE;
+    assert len_value("f(1)") == LEN_NONE;
+}
+
+test the_comptime_integer_rules_of_division_are_zigs {
+    assert len_value("1/0") == LEN_NONE;
+    assert len_value("1%0") == LEN_NONE;
+    assert len_value("(-7)/2") == LEN_NONE;
+    assert len_value("(-7)%2") == LEN_NONE;
+    assert len_value("7/(-2)") == LEN_NONE;
+    assert len_value("0/5") == 0;
+    assert len_value("7/7") == 1;
+}
+
+test a_length_stays_within_the_limit {
+    assert len_value("68719476736") == LEN_LIMIT;
+    assert len_value("68719476737") == LEN_NONE;
+    assert len_value("68719476736+1") == LEN_NONE;
+    assert len_value("68719476736*1") == LEN_LIMIT;
+    assert len_value("68719476736*2") == LEN_NONE;
+    assert len_value("262144*262144") == LEN_LIMIT;
+    assert len_value("262144*262145") == LEN_NONE;
+    assert len_value("0*68719476736") == 0;
+    assert len_value("99999999999999999999999999") == LEN_NONE;
+    assert len_value("68719476736-68719476736") == 0;
+    assert len_value("0-68719476736") == 0 - LEN_LIMIT;
+    assert len_value("0-68719476737") == LEN_NONE;
+}
+
+test the_names_of_a_length_are_found_in_order {
+    assert name_lo("A+1", 0) == 0;
+    assert name_hi("A+1", 0) == 1;
+    assert name_lo("A+1", 1) == 3;
+    assert name_lo("2*N", 0) == 2;
+    assert name_hi("2*N", 2) == 3;
+    assert name_lo("MAX_LEN*B_2", 0) == 0;
+    assert name_hi("MAX_LEN*B_2", 0) == 7;
+    assert name_lo("MAX_LEN*B_2", 7) == 8;
+    assert name_hi("MAX_LEN*B_2", 8) == 11;
+    assert name_lo("(_x+1)", 0) == 1;
+    assert name_lo("28", 0) == 2;
+    assert name_lo("", 0) == 0;
+    assert name_lo("0x10+N", 0) == 5;
+    assert name_lo("12abc", 0) == 5;
+    assert name_lo("1.5e3", 0) == 5;
+    assert name_hi("a.b_c+1", 0) == 5;
+    assert name_hi("a.+1", 0) == 1;
+    assert name_hi("a.", 0) == 1;
+    assert name_hi("a.b.c", 0) == 5;
+}
+
+test an_anonymous_struct_is_struct_then_a_brace {
+    assert anon_struct("struct { a : u8 }");
+    assert anon_struct("  struct{a:u8}");
+    assert anon_struct("struct  {");
+    assert !anon_struct("structx { a : u8 }");
+    assert !anon_struct("struct");
+    assert !anon_struct("struct x");
+    assert !anon_struct("Spot");
+    assert !anon_struct("");
+    assert !anon_struct("?struct { a : u8 }");
+}
+
+test the_field_list_lies_between_the_braces {
+    assert anon_fields("struct { a : u8 }") == pack(8, 16);
+    assert anon_fields(" struct{a:u8} ") == pack(8, 12);
+    assert anon_fields("struct { }") == pack(8, 9);
+    assert anon_fields("struct {}") == pack(8, 8);
+    assert anon_fields("struct { u : struct { l : u8 } , s : u8 , }") == pack(8, 42);
+    assert anon_fields("struct { r : struct { v : struct { t : u8 , } , } , }") == pack(8, 52);
+}
+
+test a_field_list_with_a_default_a_call_or_odd_braces_is_none {
+    assert anon_fields("struct { a : u8 = 1 }") == NONE;
+    assert anon_fields("struct { a : f ( ) }") == NONE;
+    assert anon_fields("struct { a : u8 } }") == NONE;
+    assert anon_fields("struct { a : struct { b : u8 }") == NONE;
+    assert anon_fields("struct { a : u8 ") == NONE;
+    assert anon_fields("struct {") == NONE;
+    assert anon_fields("Spot") == NONE;
+    assert anon_fields("") == NONE;
+}
+
+test a_field_ends_at_the_first_comma_outside_nested_braces {
+    const s : str = "a : u8 , u : struct { l : u8 , m : u8 } , t : u8";
+    assert field_end(s, 0, 48) == 7;
+    assert field_end(s, 8, 48) == 40;
+    assert field_end(s, 41, 48) == 48;
+    assert field_end(s, 48, 48) == 48;
+    assert field_end("", 0, 0) == 0;
+    assert field_end(s, 0, 5) == 5;
+}
+
+test a_zig_spelled_field_type_is_a_name_under_prefixes {
+    assert zig_spelled_base("u8") == pack(0, 2);
+    assert zig_spelled_base(" Spot ") == pack(1, 5);
+    assert zig_spelled_base("[]const u8") == pack(8, 10);
+    assert zig_spelled_base("[]u8") == pack(2, 4);
+    assert zig_spelled_base("?*const Spot") == pack(8, 12);
+    assert zig_spelled_base("*u8") == pack(1, 3);
+    assert zig_spelled_base("[4]u8") == pack(3, 5);
+    assert zig_spelled_base("[ N_2 ]u8") == pack(7, 9);
+    assert zig_spelled_base("[2][3]?u8") == pack(7, 9);
+    assert zig_spelled_base("? []const  u8") == pack(11, 13);
+    assert zig_spelled_base("") == pack(0, 0);
+    assert zig_spelled_base("?") == pack(1, 1);
+    assert zig_spelled_base("*constu8") == pack(1, 8);
+}
+
+test a_zig_spelled_field_type_with_an_odd_length_is_none {
+    assert zig_spelled_base("[ ]u8") == NONE;
+    assert zig_spelled_base("[N+1]u8") == NONE;
+    assert zig_spelled_base("[4") == NONE;
+    assert zig_spelled_base("[u8; 4]") == NONE;
+    assert zig_spelled_base("[[2]]u8") == NONE;
+    assert zig_spelled_base("?[x.y]u8") == NONE;
 }

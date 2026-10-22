@@ -253,7 +253,7 @@ def reduce_tool():
     import t27b_reduce
     return t27b_reduce
 
-LAB = "https://t27b-lab-production.up.railway.app"
+LAB = os.environ.get("T27B_LAB", "https://t27b-lab-production.up.railway.app")  # lab 2 (requests first): t27b-lab-2-production
 REPO = "gHashTag/t27"
 STATE = os.path.expanduser("~/.local/state/t27b-queen")
 REQUIRED = ("validate", "check-linked-issue", "parse-ratchet")
