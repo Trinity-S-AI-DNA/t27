@@ -56,7 +56,7 @@ fn run(src: &str) -> Vec<(String, bool, Outcome)> {
 /// The first rejection message, which must exist.
 fn rejected(src: &str) -> String {
     match lower_src(src) {
-        Ok(_) => panic!("expected a rejection"),
+        Ok(_) => panic!("expected a rejection of {}", src),
         Err(e) => e[0].clone(),
     }
 }
@@ -1040,10 +1040,10 @@ fn slice_rejections_are_precise() {
         ("test t { assert(A[1..4].len == 3); }", "ExprIndex(slice)", "end 4 out of bounds for `[3]u32`"),
         ("test t { assert(A[2..1].len == 0); }", "ExprIndex(slice)", "start 2 is past end 1"),
         ("test t { assert(\"ab\"[2] == 0); }", "ExprIndex", "index 2 out of bounds for a string of length 2"),
-        ("fn f(xs: []u32) void { xs.len = 0; }\ntest t { }", "StmtAssign", "assignment through a constant"),
-        ("fn f(xs: []const u32) void { xs[0] = 1; }\ntest t { }", "StmtAssign", "assignment through a constant"),
+        ("fn f(xs: []u32) void { xs.len = 0; }\ntest t { f(&A); }", "StmtAssign", "assignment through a constant"),
+        ("fn f(xs: []const u32) void { xs[0] = 1; }\ntest t { f(&A); }", "StmtAssign", "assignment through a constant"),
         ("const S: []const u32 = A[0..];\ntest t { assert(S.len == 3); }", "ConstDecl(slice)", "module-level slice"),
-        ("fn f(xs: []u32) u32 { return xs.ptr; }\ntest t { }", "ExprFieldAccess(slice)", "`.ptr` of a []u32"),
+        ("fn f(xs: []u32) u32 { return xs.ptr; }\ntest t { assert(f(&A) == 0); }", "ExprFieldAccess(slice)", "`.ptr` of a []u32"),
     ];
     for (body, construct, detail) in cases {
         let m = rejected(&format!("{}{}\n", head, body));
@@ -2838,7 +2838,7 @@ fn tuples_rejections() {
         ),
         ("fn f() -> (u32, u32) { return (1, 2, 3); }", "ExprTuple", "3 values for `(u32, u32)`"),
         ("test t { const (a, b, c) = p(); assert(a == 1); }", "StmtLocal(destructure)", "3 names for 2 elements"),
-        ("fn g(i: usize) -> u32 { const t = p(); return t[i]; }", "ExprIndex(tuple)", "not known at compile time"),
+        ("fn g(i: usize) -> u32 { const t = p(); return t[i]; }\ntest t { assert(g(0) == 1); }", "ExprIndex(tuple)", "not known at compile time"),
         ("test t { const t = p(); assert(t[2] == 1); }", "ExprIndex(tuple)", "index 2 out of bounds"),
         ("test t { const t = q(); assert(t.0.x == 1); }", "ExprFieldAccess", "no field `0.x`"),
         ("fn g(v: u32) -> u32 { const t = (v, 2); return t[0]; }", "ExprTuple", ""),
@@ -2863,7 +2863,7 @@ fn untyped_locals_follow_the_reference() {
         ("    var x = undefined;\n    return 0;\n}", "StmtLocal", "neither type nor value"),
         ("    const c = undefined;\n    return c;\n}", "ExprIdentifier", "`c`"),
     ] {
-        let m = rejected(&format!("{}{}\n", head, body));
+        let m = rejected(&format!("{}{}\ntest t {{ assert(f() == 0); }}\n", head, body));
         assert!(m.starts_with(&format!("t27b: unsupported construct {}", construct)), "{}: {}", body, m);
         assert!(m.contains(detail), "{}: {}", body, m);
     }
@@ -2939,7 +2939,7 @@ fn parameter_discard_rejections() {
         ("fn f(x: u32, y: u32) -> u32 { if (y > 1) { _ = x; _ = x; } return x; }", "StmtAssign(discard)", "`_ = x;`"),
         ("fn f(x: u32, y: u32) -> u32 { _ = x; if (y > 1) { _ = x; } return y + x; }", "StmtAssign(discard)", "`_ = x;`"),
         ("fn f(K: u32, y: u32) -> u32 { if (y > 1) { _ = K; } return y + K; }", "StmtAssign(discard)", "`_ = K;`"),
-        ("fn f(x: u32) -> u32 { var y: u32 = x; _ = y; return 1; }", "StmtAssign(undeclared)", "`_`"),
+        ("fn f(x: u32) -> u32 { var y: u32 = x; _ = y; return 1; }\ntest t { assert(f(1) == 1); }", "StmtAssign(undeclared)", "`_`"),
     ];
     for (body, construct, detail) in cases {
         let m = rejected(&format!("{}{}\n", head, body));
@@ -3012,8 +3012,8 @@ fn type_alias_rejections() {
         ("const S = str;\nfn f(x: S) -> u32 { return 1; }", "type (alias)", "`S`"),
         ("const W = [4]str;\nfn f(x: W) -> u32 { return 1; }", "type (alias)", "`W`"),
         // a struct literal of a scalar alias: refused, not recursed into
-        ("const Code = u8;\nconst Duo = Code;\nfn f() -> u32 {\n    const p: Duo = Duo{ .lo = 3, .hi = 9 };\n    return 1;\n}", "ExprStructLit", "`Duo` is"),
-        ("const Code = u8;\nfn f() -> u32 { return Code; }", "ExprIdentifier(type as value)", "`Code`"),
+        ("const Code = u8;\nconst Duo = Code;\nfn f() -> u32 {\n    const p: Duo = Duo{ .lo = 3, .hi = 9 };\n    return 1;\n}\ntest t { assert(f() == 1); }", "ExprStructLit", "`Duo` is"),
+        ("const Code = u8;\nfn f() -> u32 { return Code; }\ntest t { assert(f() == 1); }", "ExprIdentifier(type as value)", "`Code`"),
     ];
     for (body, construct, detail) in cases {
         let m = rejected(&format!("module a;\n{}\n", body));
