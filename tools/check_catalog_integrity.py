@@ -108,7 +108,7 @@ def check(root):
     for m in re.finditer(r"id=(tnf\d+)\b", text):
         rung = m.group(1)
         row = text[m.start():text.find("\n", m.start())]
-        want = 'former_name="GF-T%s"' % rung[3:]
+        want = 'former_name="GF-T%s (historical)"' % rung[3:]
         if want not in row:
             problems.append(f"LOST      {rung} no longer carries {want}")
 
@@ -137,7 +137,7 @@ _ROWS = [
     'id=gf16 name="GF16" bits=16 source="specs/numeric/gf16.t27"',
     'id=gft16 name="GF-T16" bits=16 source="specs/numeric/gft16.t27"',
     'id=bnf16 name="BNF16" bits=16 source="specs/numeric/bnf16.t27"',
-    'id=tnf16 name="TNF16" former_name="GF-T16" bits=16 source="specs/numeric/tnf16.t27"',
+    'id=tnf16 name="TNF16" former_name="GF-T16 (historical)" bits=16 source="specs/numeric/tnf16.t27"',
     'id=gfternary name="GFTernary" bits=2 source="specs/numeric/gfternary.t27"',
 ]
 _RULE = "  // Closed-form normative rule: e = round((N-1)/phi^2); m = N-1-e;"
@@ -147,7 +147,7 @@ _RULE = "  // Closed-form normative rule: e = round((N-1)/phi^2); m = N-1-e;"
 # somewhere else in the file a `row`->`text` slip stops the check from ever
 # firing. Without this line the two spellings are indistinguishable and that
 # mutant survives. Must contain no `id=`, or it would join `ids`.
-_PROSE = '  // T82: every tnf rung carries former_name="GF-T16" and its siblings.'
+_PROSE = '  // T82: every tnf rung carries former_name="GF-T16 (historical)" and its siblings.'
 
 
 def _plant(td, rows=None, specs=None, rule=True):
@@ -253,9 +253,9 @@ def self_check():
     #    the thing that must be absent -- the exit code alone cannot tell them
     #    apart, and neither can the first word.
     case("5 former_name stripped",
-         ['LOST      tnf16 no longer carries former_name="GF-T16"'],
+         ['LOST      tnf16 no longer carries former_name="GF-T16 (historical)"'],
          absent=("DANGLING", "MISSING", "COLLAPSED", "ALIAS", "golden-section"),
-         rows=[r.replace(' former_name="GF-T16"', '') for r in _ROWS])
+         rows=[r.replace(' former_name="GF-T16 (historical)"', '') for r in _ROWS])
 
     # 6. The golden-section rule string gone from the file.
     case("6 golden-section rule gone",

@@ -1,0 +1,210 @@
+// Port of gHashTag/trios crates/trios-cli/src/main.rs @ 8b229e9489ee (274 lines).
+//
+// The task lists one function: main (line 184). Its body is plumbing: it
+// initialises the tracing subscriber, lets clap derive parse argv into Cmd,
+// and dispatches each of the 16 subcommands to a handler that touches the
+// world (git, the runner, HTTP, Postgres) before the process exits. Per
+// "port the decision, not the plumbing", the shell keeps its name with an
+// undefined; body that no test calls, and the decisions main makes on the
+// way are ported as pure helpers below, each tested against the behaviour
+// of the original lines named in its comment.
+//
+// Named as not ported rather than faked:
+// - the clap derive itself (lines 28-182): a declarative macro, not hand
+//   written parsing code to re-author;
+// - the "Average BPB: {:.3}" float formatting (line 256): no string
+//   building here; the decision (the average over the per-seed results)
+//   is ported as average_bpb, the printing stays with the caller;
+// - the handler calls (run, sweep, report, ...) live in other modules of
+//   the trios crate, outside this file's boundary;
+// - Rust trim() removes all Unicode whitespace; parse_seed_list ports the
+//   ASCII set (space, tab, CR, LF), which covers CLI arguments;
+// - the Vec<u64> seed list grows unbounded; this port carries the first
+//   64 seeds, far more than any invocation, and drops the rest.
+
+module port::trios::crates::trios_cli::src::main;
+
+// main returns anyhow::Result<()>; Err aborts with a failure exit code.
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAIL: i32 = 1;
+
+// main.rs line 262: the Neon URL used when --neon-url is absent and the
+// NEON_DATABASE_URL environment variable is unset.
+pub const DEFAULT_NEON_URL: str = "postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/neondb";
+
+// GateStatus from cmd::gates, matched at main.rs lines 219-224.
+pub enum GateStatus {
+    Pass,
+    Warn,
+    Fail,
+    Unknown,
+}
+
+// main.rs lines 216-224: gate_check yields a status; main prints exactly
+// one line per variant. The check itself lives in the gates module; the
+// status-to-message mapping printed by main is the decision kept here.
+pub fn gate_message(status: GateStatus) -> []const u8 {
+    return switch (status) {
+        .Pass => "✅ All gates passed",
+        .Warn => "⚠️  Some gates warn",
+        .Fail => "❌ Gates failed",
+        .Unknown => "❓ Gates unknown",
+    };
+}
+
+// u64::MAX == 18446744073709551615 == 1844674407370955161 * 10 + 5; used to
+// detect overflow exactly as Rust's u64::from_str does.
+pub const U64_MAX_DIV_10: u64 = 1844674407370955161;
+pub const U64_MAX_REM: u64 = 5;
+
+// main.rs lines 248-250:
+//   seeds.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+// A comma-separated field counts only when, after trimming ASCII spaces
+// and tabs, it parses as u64 (Rust's u64 grammar allows a single '+').
+// Fields that fail to parse -- empty, other characters, whitespace inside
+// the digits, values past u64::MAX -- are dropped, never zeroed.
+pub struct SeedList {
+    items: [64]u64,
+    len: usize,
+}
+
+pub fn parse_seed_list(seeds: []const u8) -> SeedList {
+    var items: [64]u64 = [_]u64{0} ** 64;
+    var n: usize = 0;
+    var value: u64 = 0;
+    var seen_digit: bool = false;
+    var seen_plus: bool = false;
+    var trailing_ws: bool = false;
+    var field_bad: bool = false;
+    for c in seeds {
+        if (c == ',') {
+            if (seen_digit and !field_bad and n < 64) {
+                items[n] = value;
+                n += 1;
+            }
+            value = 0;
+            seen_digit = false;
+            seen_plus = false;
+            trailing_ws = false;
+            field_bad = false;
+        } else if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            if (seen_digit and !field_bad) {
+                trailing_ws = true;
+            } else if (seen_plus and !field_bad) {
+                // "+ 5": the sign must sit flush against the digits.
+                field_bad = true;
+            }
+        } else if (c >= '0' and c <= '9') {
+            if (!field_bad) {
+                if (trailing_ws) {
+                    // "4 2": trim leaves the inner space, parse fails.
+                    field_bad = true;
+                } else {
+                    const d: u64 = (c - '0') as u64;
+                    if (value > U64_MAX_DIV_10 or (value == U64_MAX_DIV_10 and d > U64_MAX_REM)) {
+                        // The field overflows u64, so from_str returns Err.
+                        field_bad = true;
+                    } else {
+                        value = value * 10 + d;
+                        seen_digit = true;
+                    }
+                }
+            }
+        } else if (c == '+') {
+            if (seen_digit or seen_plus or trailing_ws or field_bad) {
+                field_bad = true;
+            } else {
+                seen_plus = true;
+            }
+        } else {
+            field_bad = true;
+        }
+    }
+    if (seen_digit and !field_bad and n < 64) {
+        items[n] = value;
+        n += 1;
+    }
+    return SeedList { items: items, len: n };
+}
+
+// main.rs lines 255-256:
+//   let avg = results.iter().map(|r| r.best_bpb).sum::<f64>()
+//       / results.len() as f64;
+// The sum of the per-seed best BPB divided by the seed count. An empty
+// result list divides zero by zero, as in the original.
+pub fn average_bpb(values: []const f64) -> f64 {
+    var sum: f64 = 0.0;
+    for v in values {
+        sum += v;
+    }
+    return sum / (values.len as f64);
+}
+
+// main.rs lines 259-266: RaceSub::Init resolves the connection URL as
+//   neon_url.unwrap_or_else(|| env::var("NEON_DATABASE_URL")
+//       .unwrap_or_else(|_| DEFAULT.to_string()))
+// The env read is plumbing; the caller passes whether it produced a value.
+pub fn race_neon_url(has_explicit: bool, explicit: []const u8, has_env: bool, env_url: []const u8) -> []const u8 {
+    if (has_explicit) {
+        return explicit;
+    }
+    if (has_env) {
+        return env_url;
+    }
+    return DEFAULT_NEON_URL;
+}
+
+// main.rs line 184: fn main() -> Result<()>. All plumbing: tracing init,
+// clap parse, dispatch into world-touching handlers, process exit. The
+// decisions it makes on the way are the helpers above; no test calls this.
+pub fn main() -> i32 {
+    undefined;
+}
+
+test gate_message_lines {
+    const m1: []const u8 = gate_message(GateStatus.Pass);
+    assert(m1 == "✅ All gates passed");
+    const m2: []const u8 = gate_message(GateStatus.Warn);
+    assert(m2 == "⚠️  Some gates warn");
+    const m3: []const u8 = gate_message(GateStatus.Fail);
+    assert(m3 == "❌ Gates failed");
+    const m4: []const u8 = gate_message(GateStatus.Unknown);
+    assert(m4 == "❓ Gates unknown");
+}
+
+test neon_url_resolution_order {
+    const u1: []const u8 = race_neon_url(true, "postgresql://explicit", true, "postgresql://from-env");
+    assert(u1 == "postgresql://explicit");
+    const u2: []const u8 = race_neon_url(false, "", true, "postgresql://from-env");
+    assert(u2 == "postgresql://from-env");
+    const u3: []const u8 = race_neon_url(false, "", false, "");
+    assert(u3 == "postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/neondb");
+}
+
+test seeds_default_train_seeds {
+    const l: SeedList = parse_seed_list("42,43,44");
+    assert(l.len == 3);
+    assert(l.items[0] == 42 and l.items[1] == 43 and l.items[2] == 44);
+}
+
+test seeds_skip_unparseable_fields {
+    const l: SeedList = parse_seed_list(" 7 , x , 9 , -1 , 99999999999999999999999 , 4 2 , +5 ");
+    assert(l.len == 3);
+    assert(l.items[0] == 7);
+    assert(l.items[1] == 9);
+    assert(l.items[2] == 5);
+}
+
+test seeds_empty_and_blank {
+    const l: SeedList = parse_seed_list("");
+    assert(l.len == 0);
+    const l2: SeedList = parse_seed_list(" , , ");
+    assert(l2.len == 0);
+}
+
+test average_bpb_is_sum_over_count {
+    const vals: [3]f64 = [1.0, 2.0, 3.0];
+    assert(average_bpb(&vals) == 2.0);
+    const one: [1]f64 = [4.5];
+    assert(average_bpb(&one) == 4.5);
+}
