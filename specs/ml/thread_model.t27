@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/thread_model.t27 -- OS threads and per-thread variables under `t27c --backend ml`.
+; Issue #10876 (lever (a) of specs/t27t/t27t.t27: the windows of a training step on N cores).
+
+; WHY: a training step of specs/ml/train_hslm.t27 is 66 independent windows; their gradients are
+; summed at the end. Running them on N cores needs two things t27 did not have: a way to start a
+; thread and wait for it, and variables of which every thread has its own copy (the forward and
+; backward of nn/hslm.t27 keep activations, KV caches and gradients in module-level variables).
+; This spec is the contract of both, and its tests are the proof that t27c lowers them right.
+
+; THE FORM (parsed by t27c, emitted for --backend ml):
+;   threadlocal var name : T = init;   one copy per thread. A new thread's copy starts at init,
+;                                      NOT at the value the spawning thread holds.
+
+; HOST CALLS (lowered by t27c to Zig std.Thread; nothing here is implemented in this file):
+;   thread_spawn(slot, f, arg)  starts f(arg) on a new thread in slot 0..255; f is a function
+;                               fn(usize) -> void named directly. Returns false when the slot is
+;                               taken (spawned and not joined) or the OS refuses the thread.
+;   thread_join(slot)           waits for the slot's thread and frees the slot; false when the
+;                               slot holds no thread.
+;   thread_cores()              the CPU count the OS reports, 1 when it reports nothing.
+
+; Not claimed: no mutex, no atomics, no thread pool. Threads may share data only by writing
+; disjoint elements; a result that has to be the same bits for any thread count is combined by
+; the spawning thread, in a fixed order, after every join (the last test shows the method).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module thread_model;
+
+pub const MAX_WORKERS : usize = 16;
+pub const PARTS : usize = 64;
+pub const PART_LEN : usize = 1000;
+
+; Shared: every worker writes its own elements only.
+var tm_out : [MAX_WORKERS]u64 = undefined;
+var tm_seen_init : [MAX_WORKERS]u64 = undefined;
+var tm_part : [PARTS]f64 = undefined;
+var tm_nworkers : usize = 1;
+
+; One copy per thread.
+threadlocal var tm_own : u64 = 5;
+threadlocal var tm_acc : [PART_LEN]f64 = undefined;
+
+/// Worker for the copy tests: records the copy it started with, then makes the copy its own and
+/// reads it back after a long loop that would be disturbed by any other thread writing it
+pub fn tm_own_worker(id: usize) -> void {
+    tm_seen_init[id] = tm_own;
+    tm_own = @as(u64, id) * 1000003;
+    var spin : u64 = 0;
+    var i : u64 = 0;
+    while (i < 200000) {
+        spin = spin + (tm_own ^ i);
+        i = i + 1;
+    }
+    tm_out[id] = tm_own + (spin & 0);
+}
+
+/// Start n workers in slots 0..n-1 and join them all; the number that started
+pub fn tm_run(n: usize) -> usize {
+    var started : usize = 0;
+    var s : usize = 0;
+    while (s < n) {
+        if (thread_spawn(s, tm_own_worker, s)) {
+            started = started + 1;
+        }
+        s = s + 1;
+    }
+    s = 0;
+    while (s < n) {
+        if (!thread_join(s)) {
+            started = started + 1000;
+        }
+        s = s + 1;
+    }
+    return started;
+}
+
+/// The float value of part p: a sum in a thread-local scratch, so two threads computing two parts
+/// at once cannot see each other's partial sums
+pub fn tm_part_value(p: usize) -> f64 {
+    var i : usize = 0;
+    while (i < PART_LEN) {
+        tm_acc[i] = 1.0 / @as(f64, @floatFromInt(p * PART_LEN + i + 1));
+        i = i + 1;
+    }
+    var s : f64 = 0.0;
+    i = 0;
+    while (i < PART_LEN) {
+        s = s + tm_acc[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Worker id of tm_nworkers takes parts id, id + n, id + 2n, ...
+pub fn tm_part_worker(id: usize) -> void {
+    var p : usize = id;
+    while (p < PARTS) {
+        tm_part[p] = tm_part_value(p);
+        p = p + tm_nworkers;
+    }
+}
+
+/// The parts on n threads (n = 1 runs on the caller), then their sum in part order 0..PARTS-1
+pub fn tm_parts_sum(n: usize) -> f64 {
+    tm_nworkers = n;
+    if (n == 1) {
+        tm_part_worker(0);
+    } else {
+        var spawned : [MAX_WORKERS]bool = undefined;
+        var s : usize = 0;
+        while (s < n) {
+            spawned[s] = thread_spawn(s, tm_part_worker, s);
+            if (!spawned[s]) {
+                tm_part_worker(s);
+            }
+            s = s + 1;
+        }
+        s = 0;
+        while (s < n) {
+            if (spawned[s]) {
+                assert thread_join(s);
+            }
+            s = s + 1;
+        }
+    }
+    var sum : f64 = 0.0;
+    var p : usize = 0;
+    while (p < PARTS) {
+        sum = sum + tm_part[p];
+        p = p + 1;
+    }
+    return sum;
+}
+
+/// The same 64000 terms summed in one running sum, the order a serial loop would use without parts
+pub fn tm_running_sum() -> f64 {
+    var sum : f64 = 0.0;
+    var k : usize = 0;
+    while (k < PARTS * PART_LEN) {
+        sum = sum + 1.0 / @as(f64, @floatFromInt(k + 1));
+        k = k + 1;
+    }
+    return sum;
+}
+
+pub fn main() -> void {
+    assert tm_run(8) == 8;
+    assert @as(u64, @bitCast(tm_parts_sum(8))) == @as(u64, @bitCast(tm_parts_sum(1)));
+}
+
+test every_thread_gets_its_own_copy {
+    assert tm_run(8) == 8;
+    var id : usize = 0;
+    while (id < 8) {
+        assert tm_out[id] == @as(u64, id) * 1000003;
+        id = id + 1;
+    }
+}
+
+test a_new_thread_starts_at_the_initializer_not_at_the_spawners_value {
+    tm_own = 99;
+    assert tm_run(4) == 4;
+    var id : usize = 0;
+    while (id < 4) {
+        assert tm_seen_init[id] == 5;
+        id = id + 1;
+    }
+    assert tm_own == 99;
+}
+
+test a_taken_slot_is_refused_and_a_free_slot_cannot_be_joined {
+    assert thread_spawn(3, tm_own_worker, 3);
+    assert !thread_spawn(3, tm_own_worker, 3);
+    assert thread_join(3);
+    assert !thread_join(3);
+    assert !thread_spawn(256, tm_own_worker, 0);
+}
+
+test the_fixed_order_sum_has_the_same_bits_on_1_2_3_8_and_16_threads {
+    const one : u64 = @bitCast(tm_parts_sum(1));
+    assert @as(u64, @bitCast(tm_parts_sum(2))) == one;
+    assert @as(u64, @bitCast(tm_parts_sum(3))) == one;
+    assert @as(u64, @bitCast(tm_parts_sum(8))) == one;
+    assert @as(u64, @bitCast(tm_parts_sum(16))) == one;
+}
+
+test the_part_order_is_not_the_running_order {
+    // the fixed part order is a different association of the same terms: the bits differ, so a
+    // serial path that has to match the threaded one must sum in parts too
+    const parts : u64 = @bitCast(tm_parts_sum(1));
+    const running : u64 = @bitCast(tm_running_sum());
+    assert parts != running;
+    assert abs(tm_parts_sum(1) - tm_running_sum()) < 1.0e-12;
+}
+
+test the_os_reports_at_least_one_core {
+    assert thread_cores() >= 1;
+}

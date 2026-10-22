@@ -122,7 +122,7 @@ Wave Loop 356 delivered 168 generic ∀ theorems, 32-variable accumulation, and 
 ### Pros
 - Directly addresses critical silicon evidence gap
 - Combined 172 generic ∀ + FPGA metrics creates unbeatable narrative
-- Positions Trinity for NSF SHF or DARPA Fast and Curious grant applications
+- Positions Trinity for NSF SHF or federal fast-track grant applications
 - Generates content for arXiv submission
 
 ### Cons
