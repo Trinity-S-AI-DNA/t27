@@ -1,0 +1,1056 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/lab/verdict.t27 -- what the t27c lab's gates are, how a gate's log is read, and when a commit is green (gHashTag/t27#11041, #11040)
+; The t27c lab (infra/t27c-lab/lab.py) runs every commit it queues through eight gates in CI's order and records for each one an
+; exit code, the seconds, and one line a person reads first (the gate's `summary`). The commit is green when every gate that
+; counts exited 0. This file is those decisions as pure functions of text and numbers, one per Python function (the Python being
+; the oracle until the cutover), on no host in particular: whoever runs a gate hands the exit code and the log to these. The eight
+; gates are a closed table (lab_gate_*): the ids and the commands a lab job kind (#11043) may name, for any node that takes one.
+;   GATES, NEEDS_BUILD, REPORT_ONLY     the lab_gate_* table
+;   summary(text, pattern)              lab_summary, lab_summary_write
+;   misread_counts(text)                lab_misread_counts
+;   misread_line(counts, fallback)      lab_misread_line
+;   verdict(gates)                      lab_verdict
+;   run_item(): red_gates, a skipped gate, built, when the seals are refreshed   lab_red_gates, lab_gate_skipped, lab_built_after, lab_seals_due
+;   sh(): a limit kills the gate, exit 124   lab_exit_after
+;   publish_latest(): what a head's state is   lab_head_state
+; THE PATTERNS. summary() takes a regex. The lab uses five: none, and the four of GATES (`Finished|^error`, `RATCHET`,
+; `test result:`, `pair\(s\) are silent|^\s*Nothing found|CONTROL FAILED`). They are the LAB_PAT_* rows, each coded as the literals
+; it holds, the anchor and the leading spaces; a sixth pattern is a new row, not a regex engine.
+; THE TEXTS. A gate row is `<name> TAB <exit>` on a line: the name may be empty (a gate with no name), the exit is the decimal
+; integer Python would print, or empty for None (a gate that did not run, or no exit at all). A gate counts unless its name
+; is `misread`. verdict() is green when at least one gate counts and every counting gate has the exit text `0`.
+; THE LINES. summary() and misread_counts() read command output the way Python does: str.splitlines() breaks, str.strip()
+; spaces, `[:300]` characters (spec text.t27). The misread rows are the regex `^\s+(\d+)\s+(\d+)\s+(\d+)\s+\S` with re.M, run as
+; findall does: left to right, each match ending where the next search starts. `\s` crosses lines, so a row of three numbers
+; with nothing after them still matches when the next line starts with a non-space, and then it takes that character: the port
+; does the same, and tests it. Not ported: a count of more than 18 digits (Python reads any size; the lab's logs carry none), and
+; a Unicode digit that is not 0-9. A log with either is read as NOT READ (fail closed), and the summary falls back to its log line.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LabVerdict;
+
+use tri::lab::receipt::span_is;
+use lab::text::LAB_NO;
+use lab::text::LAB_DEC_BAD;
+use lab::text::lab_line_end;
+use lab::text::lab_line_next;
+use lab::text::lab_find_byte;
+use lab::text::lab_has_text;
+use lab::text::lab_has_lit;
+use lab::text::lab_lit_at;
+use lab::text::lab_strip_from;
+use lab::text::lab_strip_to;
+use lab::text::lab_cut_chars;
+use lab::text::lab_space_len;
+use lab::text::lab_char_len;
+use lab::text::lab_count_of;
+use lab::text::lab_put_span;
+use lab::text::lab_put_lit;
+use lab::text::lab_put_count;
+
+/// The number of gates, in CI's order: nothing runs on a failed build.
+pub const LAB_GATE_COUNT : usize = 8;
+
+/// The summary patterns (the regex of a gate, or none: the last non-empty line).
+pub const LAB_PAT_NONE : u8 = 0;
+pub const LAB_PAT_BUILD : u8 = 1;
+pub const LAB_PAT_SUITE : u8 = 2;
+pub const LAB_PAT_LEAN : u8 = 3;
+pub const LAB_PAT_MISREAD : u8 = 4;
+
+/// The longest summary line: 300 characters.
+pub const LAB_SUMMARY_CHARS : usize = 300;
+
+/// What the lab publishes of a verdict.
+pub const LAB_V_RED : u8 = 0;
+pub const LAB_V_GREEN : u8 = 1;
+
+/// The most any one of the three misread counts, and their sums, may hold: 10^18 - 1 (an 18-digit count fits u64 with room to add).
+pub const LAB_COUNT_MAX : u64 = 999999999999999999;
+
+/// The exit codes the lab itself makes up: a limit killed the gate, the program was not found.
+pub const LAB_EXIT_TIMEOUT : i64 = 124;
+pub const LAB_EXIT_NOT_FOUND : i64 = 127;
+
+/// What a head shows in /latest.json.
+pub const LAB_HS_NOT_RUN : u8 = 0;
+pub const LAB_HS_QUEUED : u8 = 1;
+pub const LAB_HS_RUNNING : u8 = 2;
+pub const LAB_HS_UNREADABLE : u8 = 3;
+pub const LAB_HS_FROM_RUN : u8 = 4;
+
+/// The record the lab writes for a gate it skipped, and the log line.
+pub const LAB_SKIPPED : string = "skipped: the build failed";
+
+/// Gates the lab invents when no gate of the table ran: a checkout that failed, and an error of the lab itself.
+pub const LAB_GATE_CHECKOUT : string = "checkout";
+pub const LAB_GATE_LAB : string = "lab";
+
+/// The name of gate i (GATES[i][0]).
+pub fn lab_gate_name(i: usize) -> string {
+    if (i == 0) { return "build"; }
+    if (i == 1) { return "suite"; }
+    if (i == 2) { return "lean"; }
+    if (i == 3) { return "seal-currency"; }
+    if (i == 4) { return "seal-coverage"; }
+    if (i == 5) { return "specs-parse"; }
+    if (i == 6) { return "specs-generate"; }
+    return "misread";
+}
+
+/// The command of gate i, argv joined by single spaces as the record's `cmd` holds it ({run} is the run's directory).
+pub fn lab_gate_cmd(i: usize) -> string {
+    if (i == 0) { return "cargo build --release -p t27c -p tri"; }
+    if (i == 1) { return "./target/release/t27c suite --repo-root . --corpus-only --ratchet --json {run}/suite.json"; }
+    if (i == 2) { return "cargo test --release -p t27c --test icarus_lowerable corpus_classifier_matches_lean_completeness"; }
+    if (i == 3) { return "python3 tools/check_seal_currency.py"; }
+    if (i == 4) { return "python3 tools/check_seal_coverage.py"; }
+    if (i == 5) { return "python3 tools/ci/check_specs_still_parse.py --base origin/master"; }
+    if (i == 6) { return "python3 tools/check_specs_generate.py"; }
+    return "./target/release/tri misread --list";
+}
+
+/// The limit of gate i, in seconds.
+pub fn lab_gate_timeout(i: usize) -> u32 {
+    if (i == 0 or i == 2) { return 3600; }
+    if (i == 1) { return 5400; }
+    return 1800;
+}
+
+/// The pattern whose last matching line is gate i's summary.
+pub fn lab_gate_pattern(i: usize) -> u8 {
+    if (i == 0) { return LAB_PAT_BUILD; }
+    if (i == 1) { return LAB_PAT_SUITE; }
+    if (i == 2) { return LAB_PAT_LEAN; }
+    if (i == 7) { return LAB_PAT_MISREAD; }
+    return LAB_PAT_NONE;
+}
+
+/// Is the text t[from..to] the name of gate i?
+pub fn lab_gate_is(i: usize, t: string, from: usize, to: usize) -> bool {
+    return span_is(t, from, to, lab_gate_name(i));
+}
+
+/// The index of the gate named t[from..to] in the table, or LAB_NO (the invented gates are not in it).
+pub fn lab_gate_index(t: string, from: usize, to: usize) -> usize {
+    var i : usize = 0;
+    while (i < LAB_GATE_COUNT) {
+        if (lab_gate_is(i, t, from, to)) { return i; }
+        i = i + 1;
+    }
+    return LAB_NO;
+}
+
+/// Is t[from..to] the name of a gate of the table? The table is a CLOSED set: a name outside it (a branch's text, a command, an
+/// upper-case or padded spelling) is no gate, so whoever hands out work (one lab, or a network of nodes, #11043) refuses it before
+/// anyone runs it, and the command a gate runs is only ever lab_gate_cmd(i), never text from a pull request.
+pub fn lab_gate_known(t: string, from: usize, to: usize) -> bool {
+    return lab_gate_index(t, from, to) != LAB_NO;
+}
+
+/// REPORT_ONLY: measured and published, never part of the verdict. Any name, in the table or not.
+pub fn lab_name_report_only(t: string, from: usize, to: usize) -> bool {
+    return span_is(t, from, to, "misread");
+}
+
+/// NEEDS_BUILD: every gate of the table but `build` itself.
+pub fn lab_name_needs_build(t: string, from: usize, to: usize) -> bool {
+    const i : usize = lab_gate_index(t, from, to);
+    return i != LAB_NO and i != 0;
+}
+
+/// Does the line t[from..to] (already stripped on the right) match the gate pattern pid, as `re.search` would?
+pub fn lab_pattern_hits(pid: u8, t: string, from: usize, to: usize) -> bool {
+    if (pid == LAB_PAT_BUILD) { return lab_has_lit(t, from, to, "Finished") or lab_lit_at(t, from, to, "error"); }
+    if (pid == LAB_PAT_SUITE) { return lab_has_lit(t, from, to, "RATCHET"); }
+    if (pid == LAB_PAT_LEAN) { return lab_has_lit(t, from, to, "test result:"); }
+    if (pid == LAB_PAT_MISREAD) {
+        if (lab_has_lit(t, from, to, "pair(s) are silent") or lab_has_lit(t, from, to, "CONTROL FAILED")) { return true; }
+        return lab_lit_at(t, lab_strip_from(t, from, to), to, "Nothing found");
+    }
+    return false;
+}
+
+/// A span of the text a summary is: t[from..to].
+pub struct LabSummarySpan { from: usize, to: usize }
+
+/// summary(text, pattern): the last line that matches the pattern, else the last non-empty line, stripped and cut to 300 characters;
+/// an empty span when the text has no non-empty line. (A line is str.splitlines()'s; empty means all spaces.)
+pub fn lab_summary(t: string, pid: u8) -> LabSummarySpan {
+    var hit_s : usize = LAB_NO;
+    var hit_e : usize = 0;
+    var last_s : usize = LAB_NO;
+    var last_e : usize = 0;
+    var s : usize = 0;
+    while (s < t.len) {
+        const e : usize = lab_line_end(t, s);
+        if (lab_has_text(t, s, e)) {
+            const r : usize = lab_strip_to(t, s, e);
+            last_s = s;
+            last_e = r;
+            if (lab_pattern_hits(pid, t, s, r)) {
+                hit_s = s;
+                hit_e = r;
+            }
+        }
+        s = lab_line_next(t, e);
+    }
+    var from : usize = last_s;
+    var to : usize = last_e;
+    if (hit_s != LAB_NO) {
+        from = hit_s;
+        to = hit_e;
+    }
+    if (from == LAB_NO) { return LabSummarySpan { from: 0, to: 0 }; }
+    const f : usize = lab_strip_from(t, from, to);
+    return LabSummarySpan { from: f, to: lab_cut_chars(t, f, to, LAB_SUMMARY_CHARS) };
+}
+
+/// summary(): write the summary line into dst at w, clipped at cap; the new cursor.
+pub fn lab_summary_write(t: string, pid: u8, dst: []u8, cap: usize, w: usize) -> usize {
+    const sp : LabSummarySpan = lab_summary(t, pid);
+    return lab_put_span(dst, cap, w, t, sp.from, sp.to);
+}
+
+/// The three totals of `tri misread`'s table; `read` is false when the output did not reach its table (or this port cannot read it).
+pub struct LabMisread { read: bool, pairs: u64, refused: u64, silent: u64 }
+
+/// A row of the table: the end of its match (LAB_NO when it does not match) and its three counts.
+pub struct LabMisreadRow { end: usize, pairs: u64, refused: u64, silent: u64 }
+
+/// The end of the run of spaces that starts at q (q itself when none does).
+pub fn lab_space_run(t: string, q: usize) -> usize {
+    var k : usize = q;
+    while (k < t.len) {
+        const n : usize = lab_space_len(t, k, t.len);
+        if (n == 0) { return k; }
+        k = k + n;
+    }
+    return k;
+}
+
+/// The end of the run of ASCII digits that starts at q (q itself when none does).
+pub fn lab_digit_run(t: string, q: usize) -> usize {
+    var k : usize = q;
+    while (k < t.len and t[k] >= 48 and t[k] <= 57) {
+        k = k + 1;
+    }
+    return k;
+}
+
+/// Try the row regex `\s+(\d+)\s+(\d+)\s+(\d+)\s+\S` at p. Greedy runs never need to give back: a space is not a digit and a
+/// digit is not a space, so the first way to match is the only one.
+pub fn lab_misread_row(t: string, p: usize) -> LabMisreadRow {
+    const no_row : LabMisreadRow =LabMisreadRow { end: LAB_NO, pairs: 0, refused: 0, silent: 0 };
+    const a0 : usize = lab_space_run(t, p);
+    if (a0 == p) { return no_row; }
+    const a1 : usize = lab_digit_run(t, a0);
+    if (a1 == a0) { return no_row; }
+    const b0 : usize = lab_space_run(t, a1);
+    if (b0 == a1) { return no_row; }
+    const b1 : usize = lab_digit_run(t, b0);
+    if (b1 == b0) { return no_row; }
+    const c0 : usize = lab_space_run(t, b1);
+    if (c0 == b1) { return no_row; }
+    const c1 : usize = lab_digit_run(t, c0);
+    if (c1 == c0) { return no_row; }
+    const d0 : usize = lab_space_run(t, c1);
+    if (d0 == c1 or d0 >= t.len) { return no_row; }
+    return LabMisreadRow { end: d0 + lab_char_len(t, d0, t.len), pairs: lab_count_of(t, a0, a1), refused: lab_count_of(t, b0, b1), silent: lab_count_of(t, c0, c1) };
+}
+
+/// misread_counts(text): the totals of the rows of `tri misread`'s table; not read when the text has CONTROL FAILED, has no table
+/// header (`pairs  refused  silent`, two spaces between), or a count is one this port refuses (see the header).
+pub fn lab_misread_counts(t: string) -> LabMisread {
+    const unread : LabMisread = LabMisread { read: false, pairs: 0, refused: 0, silent: 0 };
+    if (lab_has_lit(t, 0, t.len, "CONTROL FAILED")) { return unread; }
+    if (lab_has_lit(t, 0, t.len, "pairs  refused  silent") == false) { return unread; }
+    var pairs : u64 = 0;
+    var refused : u64 = 0;
+    var silent : u64 = 0;
+    var p : usize = 0;
+    while (p < t.len) {
+        var step : usize = 1;
+        if (p == 0 or t[p - 1] == 10) {
+            const row : LabMisreadRow = lab_misread_row(t, p);
+            if (row.end != LAB_NO) {
+                if (row.pairs == LAB_DEC_BAD or row.refused == LAB_DEC_BAD or row.silent == LAB_DEC_BAD) { return unread; }
+                if (pairs + row.pairs > LAB_COUNT_MAX or refused + row.refused > LAB_COUNT_MAX or silent + row.silent > LAB_COUNT_MAX) { return unread; }
+                pairs = pairs + row.pairs;
+                refused = refused + row.refused;
+                silent = silent + row.silent;
+                step = row.end - p;
+            }
+        }
+        p = p + step;
+    }
+    return LabMisread { read: true, pairs: pairs, refused: refused, silent: silent };
+}
+
+/// misread_line(counts, fallback): the counts in words (`<silent> of <pairs> pair(s) silent, <refused> refused by typecheck`; refused
+/// LAB_DEC_BAD is None: `refusals not measured`), else the fallback line fb[ff..ft], into dst at w, clipped at cap; the new cursor.
+pub fn lab_misread_line(m: LabMisread, fb: string, ff: usize, ft: usize, dst: []u8, cap: usize, w: usize) -> usize {
+    if (m.read == false) { return lab_put_span(dst, cap, w, fb, ff, ft); }
+    var x : usize = lab_put_count(dst, cap, w, m.silent);
+    x = lab_put_lit(dst, cap, x, " of ");
+    x = lab_put_count(dst, cap, x, m.pairs);
+    x = lab_put_lit(dst, cap, x, " pair(s) silent, ");
+    if (m.refused == LAB_DEC_BAD) { return lab_put_lit(dst, cap, x, "refusals not measured"); }
+    x = lab_put_count(dst, cap, x, m.refused);
+    return lab_put_lit(dst, cap, x, " refused by typecheck");
+}
+
+/// verdict(gates): green when at least one gate counts (its name is not REPORT_ONLY) and every counting gate has the exit text 0.
+pub fn lab_verdict(rows: string) -> u8 {
+    var counted : usize = 0;
+    var s : usize = 0;
+    while (s < rows.len) {
+        const e : usize = lab_line_end(rows, s);
+        var name_to : usize = lab_find_byte(rows, s, e, 9);
+        var exit_from : usize = e;
+        if (name_to == LAB_NO) {
+            name_to = e;
+        } else {
+            exit_from = name_to + 1;
+        }
+        if (lab_name_report_only(rows, s, name_to) == false) {
+            counted = counted + 1;
+            if (span_is(rows, exit_from, e, "0") == false) { return LAB_V_RED; }
+        }
+        s = lab_line_next(rows, e);
+    }
+    if (counted == 0) { return LAB_V_RED; }
+    return LAB_V_GREEN;
+}
+
+/// The word the lab publishes for a verdict.
+pub fn lab_verdict_name(v: u8) -> string {
+    if (v == LAB_V_GREEN) { return "green"; }
+    return "red";
+}
+
+/// run_item()'s red_gates: the names of the gates whose exit is not 0 and that are not REPORT_ONLY, one per line, in order, into dst
+/// at w, clipped at cap; the new cursor. (A gate with no exit is red.)
+pub fn lab_red_gates(rows: string, dst: []u8, cap: usize, w: usize) -> usize {
+    var x : usize = w;
+    var s : usize = 0;
+    while (s < rows.len) {
+        const e : usize = lab_line_end(rows, s);
+        var name_to : usize = lab_find_byte(rows, s, e, 9);
+        var exit_from : usize = e;
+        if (name_to == LAB_NO) {
+            name_to = e;
+        } else {
+            exit_from = name_to + 1;
+        }
+        if (lab_name_report_only(rows, s, name_to) == false and span_is(rows, exit_from, e, "0") == false) {
+            x = lab_put_span(dst, cap, x, rows, s, name_to);
+            x = lab_put_lit(dst, cap, x, "\n");
+        }
+        s = lab_line_next(rows, e);
+    }
+    return x;
+}
+
+/// run_item(): a gate that needs the build is skipped once the build failed.
+pub fn lab_gate_skipped(i: usize, built: bool) -> bool {
+    return i != 0 and i < LAB_GATE_COUNT and built == false;
+}
+
+/// run_item(): the build is still good after gate i exited with code, unless this is the build and it did not exit 0.
+pub fn lab_built_after(i: usize, code: i64, built: bool) -> bool {
+    if (i == 0 and code != 0) { return false; }
+    return built;
+}
+
+/// run_item(): the seal refresh of #9080 runs after the gates of a commit a `master` branch points at, and only if it built.
+pub fn lab_seals_due(has_master: bool, built: bool) -> bool {
+    return has_master and built;
+}
+
+/// sh(): a gate that ran longer than its limit is killed and exits 124, whatever the program said.
+pub fn lab_exit_after(code: i64, elapsed: f64, limit: i64) -> i64 {
+    if (elapsed > (limit as f64)) { return LAB_EXIT_TIMEOUT; }
+    return code;
+}
+
+/// publish_latest(): what a head shows. A run file that exists but cannot be read is `unreadable`; one that reads shows its own
+/// verdict; no run file: `running` when it is the commit being run, else `queued` when it is in the queue, else `not run`.
+pub fn lab_head_state(run_exists: bool, run_readable: bool, is_running: bool, is_queued: bool) -> u8 {
+    if (run_exists) {
+        if (run_readable) { return LAB_HS_FROM_RUN; }
+        return LAB_HS_UNREADABLE;
+    }
+    if (is_running) { return LAB_HS_RUNNING; }
+    if (is_queued) { return LAB_HS_QUEUED; }
+    return LAB_HS_NOT_RUN;
+}
+
+/// The word a head shows for a state (LAB_HS_FROM_RUN shows the run's own verdict, so it has none here).
+pub fn lab_head_state_name(h: u8) -> string {
+    if (h == LAB_HS_QUEUED) { return "queued"; }
+    if (h == LAB_HS_RUNNING) { return "running"; }
+    if (h == LAB_HS_UNREADABLE) { return "unreadable"; }
+    if (h == LAB_HS_NOT_RUN) { return "not run"; }
+    return "";
+}
+
+// ---- tests ----
+// The oracle is infra/t27c-lab/lab.py. Every case below is its answer (Python 3.14.6), pinned: first the asserts of its
+// self_check(), one to one, then the gate table and tables of inputs run through its own functions (summary, misread_counts,
+// misread_line, verdict, the red_gates expression, sh()'s limit, publish_latest()'s head state).
+
+/// summary(text, pattern) for the five patterns: none, GATES[0], GATES[1], GATES[2], GATES[7].
+fn lab_test_summary(t: string, pid: u8, want: string) -> bool {
+    var out : [1400]u8 = undefined;
+    const w : usize = lab_summary_write(t, pid, &out, 1400, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+fn lab_test_summaries(t: string, w0: string, w1: string, w2: string, w3: string, w4: string) -> bool {
+    return lab_test_summary(t, LAB_PAT_NONE, w0) and lab_test_summary(t, LAB_PAT_BUILD, w1) and lab_test_summary(t, LAB_PAT_SUITE, w2) and lab_test_summary(t, LAB_PAT_LEAN, w3) and lab_test_summary(t, LAB_PAT_MISREAD, w4);
+}
+
+/// misread_counts(text): read or not, and the three totals.
+fn lab_test_misread(t: string, read: bool, pairs: u64, refused: u64, silent: u64) -> bool {
+    const m : LabMisread = lab_misread_counts(t);
+    if (m.read != read) { return false; }
+    if (read == false) { return m.pairs == 0 and m.refused == 0 and m.silent == 0; }
+    return m.pairs == pairs and m.refused == refused and m.silent == silent;
+}
+
+/// misread_line(misread_counts(text), fallback)
+fn lab_test_misread_line(t: string, fb: string, want: string) -> bool {
+    var out : [256]u8 = undefined;
+    const w : usize = lab_misread_line(lab_misread_counts(t), fb, 0, fb.len, &out, 256, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+fn lab_test_verdict(rows: string, green: bool) -> bool {
+    if (green) { return lab_verdict(rows) == LAB_V_GREEN; }
+    return lab_verdict(rows) == LAB_V_RED;
+}
+
+fn lab_test_red(rows: string, want: string) -> bool {
+    var out : [256]u8 = undefined;
+    const w : usize = lab_red_gates(rows, &out, 256, 0);
+    return w == want.len and span_is(&out, 0, w, want);
+}
+
+/// One row of GATES: its name, limit, summary pattern, whether it needs the build, whether it is report-only, and its command.
+fn lab_test_gate(i: usize, name: string, limit: u32, pid: u8, needs_build: bool, report_only: bool, cmd: string) -> bool {
+    const n : string = lab_gate_name(i);
+    const c : string = lab_gate_cmd(i);
+    if (span_is(n, 0, n.len, name) == false or span_is(c, 0, c.len, cmd) == false) { return false; }
+    if (lab_gate_timeout(i) != limit or lab_gate_pattern(i) != pid) { return false; }
+    if (lab_gate_index(name, 0, name.len) != i) { return false; }
+    return lab_name_needs_build(name, 0, name.len) == needs_build and lab_name_report_only(name, 0, name.len) == report_only;
+}
+
+// <<< pinned table: verdict_self_check
+test lab_py_self_check_summary_is_the_last_matching_line_else_the_last_non_empty_line {
+    assert lab_test_summary("x\nRATCHET CLEAN 113/113\ny\n", LAB_PAT_SUITE, "RATCHET CLEAN 113/113");
+    assert lab_test_summary("x\n\nlast\n\n", LAB_PAT_NONE, "last");
+    assert lab_test_summary("", LAB_PAT_SUITE, "");
+    assert lab_test_summary("  pairs  refused  silent\n     12       12       0  an empty type slot\n      5        3       2  a colon inside a field type\n\n  2 of 17 pair(s) are silent: the spec parses\n", LAB_PAT_MISREAD, "2 of 17 pair(s) are silent: the spec parses");
+}
+
+test lab_py_self_check_verdict_is_green_only_when_every_counting_gate_exited_zero {
+    assert lab_test_verdict("\t0\n\t0\n", true);
+    assert lab_test_verdict("\t0\n\n", false);
+    assert lab_test_verdict("", false);
+    assert lab_test_verdict("build\t0\nmisread\t1\n", true);
+    assert lab_test_verdict("misread\t0\n", false);
+}
+
+test lab_py_self_check_misread_counts_reads_the_table_and_nothing_else {
+    assert lab_test_misread("  pairs  refused  silent\n     12       12       0  an empty type slot\n      5        3       2  a colon inside a field type\n\n  2 of 17 pair(s) are silent: the spec parses\n", true, 17, 15, 2);
+    assert lab_test_misread("  CONTROL FAILED -- these shapes did not fire\n", false, 0, 0, 0);
+    assert lab_test_misread("error: target/release/t27c is not built\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n\n  Nothing found\n", true, 0, 0, 0);
+}
+
+test lab_py_self_check_misread_line_says_the_counts_in_words {
+    assert lab_test_misread_line("  pairs  refused  silent\n     12       12       0  an empty type slot\n      5        3       2  a colon inside a field type\n\n  2 of 17 pair(s) are silent: the spec parses\n", "", "2 of 17 pair(s) silent, 15 refused by typecheck");
+}
+
+// >>> pinned table: verdict_self_check
+// <<< pinned table: verdict_gates
+// GATES, NEEDS_BUILD and REPORT_ONLY, row by row.
+test lab_py_table_gates {
+    assert lab_test_gate(0, "build", 3600, 1, false, false, "cargo build --release -p t27c -p tri");
+    assert lab_test_gate(1, "suite", 5400, 2, true, false, "./target/release/t27c suite --repo-root . --corpus-only --ratchet --json {run}/suite.json");
+    assert lab_test_gate(2, "lean", 3600, 3, true, false, "cargo test --release -p t27c --test icarus_lowerable corpus_classifier_matches_lean_completeness");
+    assert lab_test_gate(3, "seal-currency", 1800, 0, true, false, "python3 tools/check_seal_currency.py");
+    assert lab_test_gate(4, "seal-coverage", 1800, 0, true, false, "python3 tools/check_seal_coverage.py");
+    assert lab_test_gate(5, "specs-parse", 1800, 0, true, false, "python3 tools/ci/check_specs_still_parse.py --base origin/master");
+    assert lab_test_gate(6, "specs-generate", 1800, 0, true, false, "python3 tools/check_specs_generate.py");
+    assert lab_test_gate(7, "misread", 1800, 4, true, true, "./target/release/tri misread --list");
+    assert lab_gate_index("checkout", 0, 8) == LAB_NO and lab_gate_index("lab", 0, 3) == LAB_NO;
+}
+
+// The names outside the table: not in NEEDS_BUILD, not in REPORT_ONLY, unless they are `misread`.
+test lab_py_table_names_outside_the_table {
+    assert lab_name_needs_build("checkout", 0, 8) == false and lab_name_report_only("checkout", 0, 8) == false;
+    assert lab_name_needs_build("lab", 0, 3) == false and lab_name_report_only("lab", 0, 3) == false;
+    assert lab_name_needs_build("", 0, 0) == false and lab_name_report_only("", 0, 0) == false;
+    assert lab_name_needs_build("build ", 0, 6) == false and lab_name_report_only("build ", 0, 6) == false;
+    assert lab_name_needs_build(" misread", 0, 8) == false and lab_name_report_only(" misread", 0, 8) == false;
+    assert lab_name_needs_build("Misread", 0, 7) == false and lab_name_report_only("Misread", 0, 7) == false;
+    assert lab_name_needs_build("misread ", 0, 8) == false and lab_name_report_only("misread ", 0, 8) == false;
+    assert lab_name_needs_build("misreads", 0, 8) == false and lab_name_report_only("misreads", 0, 8) == false;
+    assert lab_name_needs_build("specs", 0, 5) == false and lab_name_report_only("specs", 0, 5) == false;
+    assert lab_name_needs_build("specs-generate", 0, 14) == true and lab_name_report_only("specs-generate", 0, 14) == false;
+    assert lab_name_needs_build("seal", 0, 4) == false and lab_name_report_only("seal", 0, 4) == false;
+    assert lab_name_needs_build("suite", 0, 5) == true and lab_name_report_only("suite", 0, 5) == false;
+    assert lab_name_needs_build("BUILD", 0, 5) == false and lab_name_report_only("BUILD", 0, 5) == false;
+    assert lab_name_needs_build("lean", 0, 4) == true and lab_name_report_only("lean", 0, 4) == false;
+    assert lab_name_needs_build("x", 0, 1) == false and lab_name_report_only("x", 0, 1) == false;
+}
+
+// >>> pinned table: verdict_gates
+// <<< pinned table: verdict_summary
+// summary(text, pattern) under each of the five patterns (none, GATES[0], GATES[1], GATES[2], GATES[7]), one row per text.
+test lab_py_table_summary {
+    assert lab_test_summaries("", "", "", "", "", "");
+    assert lab_test_summaries("\n", "", "", "", "", "");
+    assert lab_test_summaries("   ", "", "", "", "", "");
+    assert lab_test_summaries("\n\n\n", "", "", "", "", "");
+    assert lab_test_summaries("  \n \n", "", "", "", "", "");
+    assert lab_test_summaries("x", "x", "x", "x", "x", "x");
+    assert lab_test_summaries("x\n", "x", "x", "x", "x", "x");
+    assert lab_test_summaries("\nx", "x", "x", "x", "x", "x");
+    assert lab_test_summaries("last\n\n", "last", "last", "last", "last", "last");
+    assert lab_test_summaries("RATCHET", "RATCHET", "RATCHET", "RATCHET", "RATCHET", "RATCHET");
+    assert lab_test_summaries("  RATCHET  ", "RATCHET", "RATCHET", "RATCHET", "RATCHET", "RATCHET");
+    assert lab_test_summaries("  Nothing found", "Nothing found", "Nothing found", "Nothing found", "Nothing found", "Nothing found");
+    assert lab_test_summaries("Nothing found\n  Nothing found 2\n", "Nothing found 2", "Nothing found 2", "Nothing found 2", "Nothing found 2", "Nothing found 2");
+    assert lab_test_summaries("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    assert lab_test_summaries("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    assert lab_test_summaries("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    assert lab_test_summaries("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    assert lab_test_summaries("  yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy");
+    assert lab_test_summaries("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz   ", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    assert lab_test_summaries("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz   ", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    assert lab_test_summaries("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATCHET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATC", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATC", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATC", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATC", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RATC");
+    assert lab_test_summaries("RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "RATCHET qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq");
+    assert lab_test_summaries("a\nRATCHET kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\nz\n", "z", "z", "RATCHET kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk", "z", "z");
+    assert lab_test_summaries("Finished early\nCONTROL FAILED -- these shapes did not fire\npair(s) are not silent\nFinished late\n  \n", "Finished late", "Finished late", "Finished late", "Finished late", "CONTROL FAILED -- these shapes did not fire");
+    assert lab_test_summaries("Finished late\n  leading\nerror: could not compile `t27c`\nlast\ntest result: FAILED. 0 passed; 1 failed\n  2 of 17 pair(s) are silent: the spec parses\n\n", "2 of 17 pair(s) are silent: the spec parses", "error: could not compile `t27c`", "2 of 17 pair(s) are silent: the spec parses", "test result: FAILED. 0 passed; 1 failed", "2 of 17 pair(s) are silent: the spec parses");
+    assert lab_test_summaries("error: first\n   \n  error: x\nnothing found\n  error: x\nFinished early\n  \n", "Finished early", "Finished early", "Finished early", "Finished early", "Finished early");
+    assert lab_test_summaries("  Nothing found\nok\nRATCHET CLEAN 113/113\n\n", "RATCHET CLEAN 113/113", "RATCHET CLEAN 113/113", "RATCHET CLEAN 113/113", "RATCHET CLEAN 113/113", "Nothing found");
+    assert lab_test_summaries("RATCHET FAILED: 3 new\nerror\nNothing  found\n  leading\nwarning: unused\nratchet\n\n", "ratchet", "error", "RATCHET FAILED: 3 new", "ratchet", "ratchet");
+    assert lab_test_summaries("Nothing found\nNothing  found\nwarning: unused\n", "warning: unused", "warning: unused", "warning: unused", "warning: unused", "Nothing found");
+    assert lab_test_summaries("Nothing found\nFinished late\nRATCHET CLEAN 113/113\n\n", "RATCHET CLEAN 113/113", "Finished late", "RATCHET CLEAN 113/113", "RATCHET CLEAN 113/113", "Nothing found");
+    assert lab_test_summaries("Finished early\nError: capital\ntrailing space   \ntest result: FAILED. 0 passed; 1 failed\n  \n", "test result: FAILED. 0 passed; 1 failed", "Finished early", "test result: FAILED. 0 passed; 1 failed", "test result: FAILED. 0 passed; 1 failed", "test result: FAILED. 0 passed; 1 failed");
+    assert lab_test_summaries("a\tb\n\n", "a\tb", "a\tb", "a\tb", "a\tb", "a\tb");
+    assert lab_test_summaries("\tNothing found\npair(s) are not silent\nNothing found\n\tNothing found\nRATCHET FAILED: 3 new\npair(s) are not silent", "pair(s) are not silent", "pair(s) are not silent", "RATCHET FAILED: 3 new", "pair(s) are not silent", "Nothing found");
+    assert lab_test_summaries("Finished early\n  2 of 17 pair(s) are silent: the spec parses\ntrailing space   \n", "trailing space", "Finished early", "trailing space", "trailing space", "2 of 17 pair(s) are silent: the spec parses");
+    assert lab_test_summaries("Finished\nNothing found\ntest result: FAILED. 0 passed; 1 failed\n  leading\ntrailing space   \nCONTROL FAILED -- these shapes did not fire\n", "CONTROL FAILED -- these shapes did not fire", "Finished", "CONTROL FAILED -- these shapes did not fire", "test result: FAILED. 0 passed; 1 failed", "CONTROL FAILED -- these shapes did not fire");
+    assert lab_test_summaries("   \na\tb\n\tindented by a tab\n\tNothing found\n  \n", "Nothing found", "Nothing found", "Nothing found", "Nothing found", "Nothing found");
+    assert lab_test_summaries("CONTROL FAILED -- these shapes did not fire\n\n", "CONTROL FAILED -- these shapes did not fire", "CONTROL FAILED -- these shapes did not fire", "CONTROL FAILED -- these shapes did not fire", "CONTROL FAILED -- these shapes did not fire", "CONTROL FAILED -- these shapes did not fire");
+    assert lab_test_summaries("   Compiling t27c v0.5.2\nlast\nlast\nCONTROL FAILED -- these shapes did not fire\nerror\n\tindented by a tab\n  \n", "indented by a tab", "error", "indented by a tab", "indented by a tab", "CONTROL FAILED -- these shapes did not fire");
+    assert lab_test_summaries("a\tb\n\tNothing found\nx Nothing found\n\tNothing found\n\t\n  \n", "Nothing found", "Nothing found", "Nothing found", "Nothing found", "Nothing found");
+    assert lab_test_summaries("Nothing  found\nnothing found\nratchet", "ratchet", "ratchet", "ratchet", "ratchet", "ratchet");
+    assert lab_test_summaries("  error: x\nRATCHET FAILED: 3 new\n\n", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new");
+    assert lab_test_summaries("RATCHET FAILED: 3 new\nfinished\na\tb\n   \npair(s) are silent\n   ", "pair(s) are silent", "pair(s) are silent", "RATCHET FAILED: 3 new", "pair(s) are silent", "pair(s) are silent");
+    assert lab_test_summaries("test result\n\tindented by a tab\nok\n  2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses");
+    assert lab_test_summaries("   Compiling t27c v0.5.2\nRATCHET\n\n", "RATCHET", "RATCHET", "RATCHET", "RATCHET", "RATCHET");
+    assert lab_test_summaries("RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new", "RATCHET FAILED: 3 new");
+    assert lab_test_summaries("RATCHET CLEAN 113/113\n  leading\n\tNothing found\n  \n", "Nothing found", "Nothing found", "RATCHET CLEAN 113/113", "Nothing found", "Nothing found");
+    assert lab_test_summaries("    Finished `release` profile [optimized] target(s) in 1m 02s\n\n  leading\nlast\n  error: x\n  leading\n", "leading", "Finished `release` profile [optimized] target(s) in 1m 02s", "leading", "leading", "leading");
+    assert lab_test_summaries("warning: unused\nerror: second\n\n", "error: second", "error: second", "error: second", "error: second", "error: second");
+    assert lab_test_summaries("test result: ok. 1 passed; 0 failed\n  1 2 3  x  \n\n  2 of 17 pair(s) are silent: the spec parses\n\npair(s) are silent\n", "pair(s) are silent", "pair(s) are silent", "pair(s) are silent", "test result: ok. 1 passed; 0 failed", "pair(s) are silent");
+    assert lab_test_summaries("Finished late\n    Finished `release` profile [optimized] target(s) in 1m 02s", "Finished `release` profile [optimized] target(s) in 1m 02s", "Finished `release` profile [optimized] target(s) in 1m 02s", "Finished `release` profile [optimized] target(s) in 1m 02s", "Finished `release` profile [optimized] target(s) in 1m 02s", "Finished `release` profile [optimized] target(s) in 1m 02s");
+    assert lab_test_summaries("error: second\nRATCHET\nok", "ok", "error: second", "RATCHET", "ok", "ok");
+}
+
+// >>> pinned table: verdict_summary
+// <<< pinned table: verdict_misread
+// misread_counts(text): the totals, or None (not read), for tables of every shape; the cross-line rows of `\s` included.
+test lab_py_table_misread_counts {
+    assert lab_test_misread("", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n", true, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n\n", true, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n\n  Nothing found\n", true, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n     12       12       0  an empty type slot\n", true, 12, 12, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3", true, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3\n  y", true, 1, 2, 3);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3\n  5 5 5\n\n\nerror: target/release/t27c is not built\n\n\n\n", true, 1, 2, 3);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2\n3 x\n", true, 1, 2, 3);
+    assert lab_test_misread("1 2 3 x\n  1.5 2 3 x\n pairs refused silent\n\n\n  -1 2 3 x\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n\t7\t8\t9\tzz\nerror: target/release/t27c is not built\n", true, 7, 8, 9);
+    assert lab_test_misread("  pairs  refused  silent\n      5        3       2  a colon inside a field type\n     12       12       0  an empty type slot\n     12       12       0  an empty type slot\n", true, 29, 27, 2);
+    assert lab_test_misread("  1 2 3\n  2 of 17 pair(s) are silent: the spec parses\npairs refused silent\n  Nothing found\n  Nothing found\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n     12       12       0  an empty type slot\n  4 5 6\n  7 8 9\n  pairs  refused  silent\n", true, 16, 17, 6);
+    assert lab_test_misread("  pairs  refused  silent\n\t7\t8\t9\tzz\n  pairs  refused  silent\nerror: target/release/t27c is not built\npairs  refused  silent", true, 7, 8, 9);
+    assert lab_test_misread("  pairs  refused  silent\n  5 5 5\n\n\n  1 2\n3 x\n  1 2\n   0   0   0  none\n  1 2\n", true, 6, 7, 5);
+    assert lab_test_misread("  1.5 2 3 x\n  10 20 30  \n  1.5 2 3 x\n  3 4 5 x\n  1.5 2 3 x\n", false, 0, 0, 0);
+    assert lab_test_misread("  01 002 0003 pad\n  12  12  0\nerror: target/release/t27c is not built\n  1 2 3 \n  1 2 3  1 2 3x\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  3  4  5\t\n  y\n\n  1.5 2 3 x\n  100 200 300 a\n  400 500 600 b\n  700 800 900 c\n", true, 1203, 1504, 1805);
+    assert lab_test_misread("  pairs  refused  silent\n   0   0   0  none\n  CONTROL FAILED -- these shapes did not fire\n  1\n2\n3\nx\n  12  12  0\n", false, 0, 0, 0);
+    assert lab_test_misread("\t7\t8\t9\tzz\n  a b c d\n  CONTROL FAILED -- these shapes did not fire\n", false, 0, 0, 0);
+    assert lab_test_misread("x  9 9 9 y\n  1.5 2 3 x\n  12  12  0\n  CONTROL FAILED -- these shapes did not fire\n  -1 2 3 x\n", false, 0, 0, 0);
+    assert lab_test_misread("x  9 9 9 y\n", false, 0, 0, 0);
+    assert lab_test_misread("  1 2 3x\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2\n pairs refused silent\n   0   0   0  none\n  1 2 3 \n  12  12  0\n  3 4 5 x\n", true, 4, 6, 8);
+    assert lab_test_misread("  pairs  refused  silent\n 1 2 3 q q q\n\t7\t8\t9\tzz\n", true, 8, 10, 12);
+    assert lab_test_misread("  pairs  refused  silent\n   0   0   0  none\n", true, 0, 0, 0);
+    assert lab_test_misread("  Nothing found\n  18 17 16 15\n     12       12       0  an empty type slot\n  9 9 9 9 9 9 y\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  4 5 6\n  7 8 9\n  pairs  refused  silent\n  100 200 300 a\n  400 500 600 b\n  700 800 900 c\n", true, 1204, 1505, 1806);
+    assert lab_test_misread("  pairs  refused  silent\n1 2 3 x\n  1.5 2 3 x\n pairs refused silent\n  100 200 300 a\n  400 500 600 b\n  700 800 900 c\n  Nothing found\n", true, 1200, 1500, 1800);
+    assert lab_test_misread("  pairs  refused  silent\n  3  4  5\t\n  y\n1 2 3 x\n\n  pairs  refused  silent\n", true, 3, 4, 5);
+    assert lab_test_misread("  pairs  refused  silent\n  5 5 5\n\n\n  6 6 6 z\n   0   0   0  none\n  3 4 5 x\n  3  4  5\t\n  y\n  3 4 5 6\n\t7\t8\t9\tzz\n", true, 21, 25, 29);
+    assert lab_test_misread("  pairs  refused  silent\n  3  4  5\t\n  y\n  pairs  refused  silent\n", true, 3, 4, 5);
+    assert lab_test_misread("  CONTROL FAILED -- these shapes did not fire\n  1 2\n  12  12  0\n  -1 2 3 x\nerror: target/release/t27c is not built\n   0   0   0  none\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\npairs  refused  silent  4 5 6\n  7 8 9\nerror: target/release/t27c is not built\nx  9 9 9 y\n", true, 7, 8, 9);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3x\n  1 2 3\n", true, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  Nothing found\n\t7\t8\t9\tzz\n", true, 7, 8, 9);
+}
+
+// >>> pinned table: verdict_misread
+// <<< pinned table: verdict_misread_line
+// misread_line(misread_counts(text), fallback): the counts in words, else the fallback.
+test lab_py_table_misread_line {
+    assert lab_test_misread_line("", "", "");
+    assert lab_test_misread_line("  pairs  refused  silent\n", "error: target/release/t27c is not built", "0 of 0 pair(s) silent, 0 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n\n", "2 of 17 pair(s) are silent: the spec parses", "0 of 0 pair(s) silent, 0 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n\n  Nothing found\n", "error: target/release/t27c is not built", "0 of 0 pair(s) silent, 0 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n     12       12       0  an empty type slot\n", "", "0 of 12 pair(s) silent, 12 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n  1 2 3", "2 of 17 pair(s) are silent: the spec parses", "0 of 0 pair(s) silent, 0 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n  1 2 3\n  y", "2 of 17 pair(s) are silent: the spec parses", "3 of 1 pair(s) silent, 2 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n  1 2 3\n  5 5 5\n\n\nerror: target/release/t27c is not built\n\n\n\n", "error: target/release/t27c is not built", "3 of 1 pair(s) silent, 2 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n  1 2\n3 x\n", "error: target/release/t27c is not built", "3 of 1 pair(s) silent, 2 refused by typecheck");
+    assert lab_test_misread_line("1 2 3 x\n  1.5 2 3 x\n pairs refused silent\n\n\n  -1 2 3 x\n", "fallback line", "fallback line");
+    assert lab_test_misread_line("  pairs  refused  silent\n\t7\t8\t9\tzz\nerror: target/release/t27c is not built\n", "fallback line", "9 of 7 pair(s) silent, 8 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n      5        3       2  a colon inside a field type\n     12       12       0  an empty type slot\n     12       12       0  an empty type slot\n", "", "2 of 29 pair(s) silent, 27 refused by typecheck");
+    assert lab_test_misread_line("  1 2 3\n  2 of 17 pair(s) are silent: the spec parses\npairs refused silent\n  Nothing found\n  Nothing found\n", "2 of 17 pair(s) are silent: the spec parses", "2 of 17 pair(s) are silent: the spec parses");
+    assert lab_test_misread_line("  pairs  refused  silent\n     12       12       0  an empty type slot\n  4 5 6\n  7 8 9\n  pairs  refused  silent\n", "error: target/release/t27c is not built", "6 of 16 pair(s) silent, 17 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n\t7\t8\t9\tzz\n  pairs  refused  silent\nerror: target/release/t27c is not built\npairs  refused  silent", "error: target/release/t27c is not built", "9 of 7 pair(s) silent, 8 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n  5 5 5\n\n\n  1 2\n3 x\n  1 2\n   0   0   0  none\n  1 2\n", "", "5 of 6 pair(s) silent, 7 refused by typecheck");
+    assert lab_test_misread_line("  1.5 2 3 x\n  10 20 30  \n  1.5 2 3 x\n  3 4 5 x\n  1.5 2 3 x\n", "", "");
+    assert lab_test_misread_line("  01 002 0003 pad\n  12  12  0\nerror: target/release/t27c is not built\n  1 2 3 \n  1 2 3  1 2 3x\n", "error: target/release/t27c is not built", "error: target/release/t27c is not built");
+    assert lab_test_misread_line("  pairs  refused  silent\n  3  4  5\t\n  y\n\n  1.5 2 3 x\n  100 200 300 a\n  400 500 600 b\n  700 800 900 c\n", "error: target/release/t27c is not built", "1805 of 1203 pair(s) silent, 1504 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n   0   0   0  none\n  CONTROL FAILED -- these shapes did not fire\n  1\n2\n3\nx\n  12  12  0\n", "error: target/release/t27c is not built", "error: target/release/t27c is not built");
+    assert lab_test_misread_line("\t7\t8\t9\tzz\n  a b c d\n  CONTROL FAILED -- these shapes did not fire\n", "", "");
+    assert lab_test_misread_line("x  9 9 9 y\n  1.5 2 3 x\n  12  12  0\n  CONTROL FAILED -- these shapes did not fire\n  -1 2 3 x\n", "fallback line", "fallback line");
+    assert lab_test_misread_line("x  9 9 9 y\n", "error: target/release/t27c is not built", "error: target/release/t27c is not built");
+    assert lab_test_misread_line("  1 2 3x\n", "fallback line", "fallback line");
+    assert lab_test_misread_line("  pairs  refused  silent\n  1 2\n pairs refused silent\n   0   0   0  none\n  1 2 3 \n  12  12  0\n  3 4 5 x\n", "fallback line", "8 of 4 pair(s) silent, 6 refused by typecheck");
+    assert lab_test_misread_line("  pairs  refused  silent\n 1 2 3 q q q\n\t7\t8\t9\tzz\n", "fallback line", "12 of 8 pair(s) silent, 10 refused by typecheck");
+}
+
+// >>> pinned table: verdict_misread_line
+// <<< pinned table: verdict_verdict
+// verdict(gates): green when at least one gate counts and every counting gate exited 0; misread is left out.
+test lab_py_table_verdict {
+    assert lab_test_verdict("build\t-9\nlean\t0\nbuild\t127\n\t1\n", false);
+    assert lab_test_verdict("suite\t0\nsuite\t-9\nbuild\t\n", false);
+    assert lab_test_verdict("specs-parse\t-9\nseal-coverage\t0\nsuite\t-9\nseal-coverage\t0\n", false);
+    assert lab_test_verdict("", false);
+    assert lab_test_verdict("seal-coverage\t124\nlean\t-9\nlean\t0\nsuite\t1\n", false);
+    assert lab_test_verdict("seal-coverage\t0\nseal-coverage\t0\nspecs-generate\t0\nlab\t2\nbuild\t1\nspecs-parse\t1\nseal-currency\t1\nmisread\t-9\n", false);
+    assert lab_test_verdict("seal-coverage\t0\nspecs-parse\t127\nspecs-generate\t124\nlean\t124\nseal-coverage\t0\nspecs-parse\t1\n", false);
+    assert lab_test_verdict("specs-parse\t127\n\t124\nseal-coverage\t124\n", false);
+    assert lab_test_verdict("\t1\nlean\t127\ncheckout\t0\nsuite\t0\nseal-currency\t124\n", false);
+    assert lab_test_verdict("specs-generate\t0\nseal-currency\t1\n\t0\nspecs-generate\t0\n", false);
+    assert lab_test_verdict("lean\t124\n\nlean\t124\nspecs-generate\t1\nspecs-generate\t0\nmisread\t0\ncheckout\t2\n", false);
+    assert lab_test_verdict("suite\t124\nseal-coverage\t0\n", false);
+    assert lab_test_verdict("seal-coverage\t124\nlab\t127\n\t124\nbuild\t127\n\nbuild\t0\nspecs-parse\t124\n", false);
+    assert lab_test_verdict("build\t124\nseal-coverage\t124\nspecs-parse\t\nbuild\t0\nmisread\t0\nmisread\t0\nsuite\t-9\n", false);
+    assert lab_test_verdict("specs-parse\t124\nbuild\t0\nspecs-generate\t1\nbuild\t-9\n\t0\nmisread\t0\nlean\t1\nsuite\t0\n", false);
+    assert lab_test_verdict("specs-parse\t2\nseal-coverage\t2\nmisread\t124\nsuite\t1\nbuild\t0\n", false);
+    assert lab_test_verdict("suite\t0\nlab\nbuild\t1\nlab\t124\nseal-coverage\t2\nsuite\t2\nspecs-generate\t127\n", false);
+    assert lab_test_verdict("checkout\t-9\nmisread\t0\ncheckout\t-9\nlab\t-9\nmisread\t124\n\t2\n\t0\n\t0\n", false);
+    assert lab_test_verdict("specs-generate\t0\nlab\t0\nseal-coverage\t-9\nmisread\t124\nlab\t124\nmisread\t1\nmisread\t0\ncheckout\t0\n", false);
+    assert lab_test_verdict("specs-parse\t0\ncheckout\t0\nspecs-parse\t-9\nseal-currency\t\nlean\t0\nseal-coverage\t0\n\t0\nsuite\t127\n", false);
+    assert lab_test_verdict("build\t0\n\t0\nseal-coverage\t0\nbuild\t0\n\t-9\nseal-coverage\t124\ncheckout\t-9\nmisread\t0\n", false);
+    assert lab_test_verdict("seal-currency\t0\n", true);
+    assert lab_test_verdict("misread\t0\nlean\t0\nseal-currency\t\nseal-currency\t\nspecs-parse\t0\nlean\t0\nseal-coverage\t127\nspecs-generate\t0\n", false);
+    assert lab_test_verdict("suite\t0\nlab\t0\nmisread\t2\nbuild\t0\n", true);
+    assert lab_test_verdict("misread\t0\nlean\t0\nseal-coverage\t-9\nseal-coverage\t-9\n", false);
+    assert lab_test_verdict("misread\t-9\ncheckout\t1\n", false);
+    assert lab_test_verdict("lab\t1\nbuild\t127\nspecs-generate\t0\nbuild\t1\nlean\t1\nlean\t124\nmisread\t0\nspecs-generate\t-9\n", false);
+    assert lab_test_verdict("specs-parse\t0\nspecs-parse\t127\n\t0\nlab\t2\nbuild\t2\ncheckout\t0\nmisread\t127\n", false);
+    assert lab_test_verdict("specs-parse\t2\nlean\t0\nspecs-parse\t0\nlean\nsuite\t-9\nseal-coverage\t0\nlab\n", false);
+    assert lab_test_verdict("specs-generate\t1\nseal-currency\t\nsuite\t127\n\t0\n\t0\nspecs-parse\t0\nspecs-generate\t0\n", false);
+    assert lab_test_verdict("specs-parse\t0\nlab\t127\nspecs-parse\t124\n", false);
+    assert lab_test_verdict("lab\t0\nseal-currency\t2\nseal-currency\t-9\nlab\t-9\n\t0\nseal-coverage\t0\n", false);
+    assert lab_test_verdict("checkout\t2\nlean\t1\nspecs-generate\nspecs-parse\t-9\ncheckout\t124\n", false);
+    assert lab_test_verdict("seal-currency\t0\ncheckout\t0\nlean\t124\ncheckout\t0\nspecs-parse\t0\nspecs-parse\t127\n", false);
+    assert lab_test_verdict("misread\t0\n", false);
+    assert lab_test_verdict("seal-coverage\t1\nseal-coverage\t127\nlab\t\ncheckout\t0\nspecs-parse\t124\n", false);
+    assert lab_test_verdict("seal-coverage\nsuite\t0\nlab\t0\nlean\t0\n", false);
+    assert lab_test_verdict("seal-currency\t\nseal-currency\t0\nlab\t0\nseal-currency\t\nbuild\t0\nspecs-generate\t2\nseal-currency\t1\n", false);
+    assert lab_test_verdict("lab\t0\ncheckout\nseal-currency\t-9\nseal-coverage\t2\nlean\t2\nmisread\t0\nlean\t-9\n\t0\n", false);
+    assert lab_test_verdict("seal-coverage\t-9\nseal-coverage\t2\nsuite\t1\n", false);
+    assert lab_test_verdict("lean\t2\nlab\t0\nspecs-parse\t0\n", false);
+    assert lab_test_verdict("misread\t\nsuite\t1\nbuild\t0\nbuild\t-9\nlab\t0\nsuite\t0\n\t124\nbuild\t0\n", false);
+    assert lab_test_verdict("seal-currency\t-9\nseal-currency\t0\nmisread\t0\nmisread\t2\nsuite\t-9\nmisread\nmisread\t0\n", false);
+    assert lab_test_verdict("suite\t0\nmisread\t0\nmisread\t124\nlean\t0\nspecs-generate\t0\n", true);
+    assert lab_test_verdict("suite\t0\ncheckout\t1\nseal-coverage\t1\nbuild\t127\nbuild\t0\n", false);
+    assert lab_test_verdict("lab\t0\n\t0\nseal-coverage\t1\ncheckout\t0\nseal-coverage\nmisread\t0\nspecs-generate\t0\nspecs-parse\t0\n", false);
+    assert lab_test_verdict("seal-coverage\t\nmisread\t0\nsuite\t0\ncheckout\t0\nbuild\t0\nseal-currency\t\ncheckout\t-9\nseal-currency\t0\n", false);
+    assert lab_test_verdict("checkout\t2\nmisread\t2\nsuite\t0\nbuild\t2\n\t1\n", false);
+    assert lab_test_verdict("lean\t0\nlab\t0\nspecs-generate\t127\nlean\t1\nlab\t0\n", false);
+    assert lab_test_verdict("seal-currency\t-9\nsuite\nspecs-parse\t0\nseal-coverage\t127\nsuite\t0\nlab\t0\nsuite\t127\ncheckout\t0\n", false);
+    assert lab_test_verdict("build\t0\nsuite\t0\nseal-coverage\t127\nspecs-parse\t0\n\t124\n", false);
+    assert lab_test_verdict("seal-coverage\t0\n", true);
+    assert lab_test_verdict("specs-parse\t0\ncheckout\t2\nseal-coverage\t2\nlab\t0\n\t0\nspecs-parse\t127\nseal-currency\t0\nseal-coverage\t0\n", false);
+    assert lab_test_verdict("lab\t0\n\t124\nseal-coverage\t127\n", false);
+    assert lab_test_verdict("specs-generate\t0\nlab\t127\nmisread\t0\nspecs-parse\t0\ncheckout\t0\nseal-coverage\t2\nlab\t0\n", false);
+    assert lab_test_verdict("build\t2\nlab\t124\n", false);
+    assert lab_test_verdict("misread\t124\nsuite\t2\nlab\nseal-coverage\t-9\nspecs-parse\t1\ncheckout\t2\nsuite\t0\n", false);
+    assert lab_test_verdict("lab\t0\nbuild\t124\nmisread\t124\nsuite\t-9\nspecs-parse\t-9\nspecs-generate\t127\ncheckout\t-9\nspecs-generate\t127\n", false);
+    assert lab_test_verdict("\t-9\nseal-coverage\t0\n", false);
+    assert lab_test_verdict("lab\t\n", false);
+    assert lab_test_verdict("specs-generate\t0\nbuild\t1\nmisread\t127\ncheckout\t127\nlab\t0\nlean\t0\nspecs-parse\t1\n", false);
+    assert lab_test_verdict("lab\t2\n\t1\ncheckout\t-9\n", false);
+    assert lab_test_verdict("build\t0\nlab\t0\nbuild\t0\ncheckout\t0\nspecs-parse\t1\n", false);
+    assert lab_test_verdict("misread\t0\nsuite\t0\nmisread\t1\n", true);
+}
+
+// run_item(): red = [g['name'] for g in gates if g.get('exit') != 0 and g['name'] not in REPORT_ONLY]
+test lab_py_table_red_gates {
+    assert lab_test_red("build\t-9\nlean\t0\nbuild\t127\n", "build\nbuild\n");
+    assert lab_test_red("suite\t0\nsuite\t-9\nbuild\t\n", "suite\nbuild\n");
+    assert lab_test_red("specs-parse\t-9\nseal-coverage\t0\nsuite\t-9\nseal-coverage\t0\n", "specs-parse\nsuite\n");
+    assert lab_test_red("", "");
+    assert lab_test_red("seal-coverage\t124\nlean\t-9\nlean\t0\nsuite\t1\n", "seal-coverage\nlean\nsuite\n");
+    assert lab_test_red("seal-coverage\t0\nseal-coverage\t0\nspecs-generate\t0\nlab\t2\nbuild\t1\nspecs-parse\t1\nseal-currency\t1\nmisread\t-9\n", "lab\nbuild\nspecs-parse\nseal-currency\n");
+    assert lab_test_red("seal-coverage\t0\nspecs-parse\t127\nspecs-generate\t124\nlean\t124\nseal-coverage\t0\nspecs-parse\t1\n", "specs-parse\nspecs-generate\nlean\nspecs-parse\n");
+    assert lab_test_red("specs-parse\t127\nseal-coverage\t124\n", "specs-parse\nseal-coverage\n");
+    assert lab_test_red("lean\t127\ncheckout\t0\nsuite\t0\nseal-currency\t124\n", "lean\nseal-currency\n");
+    assert lab_test_red("specs-generate\t0\nseal-currency\t1\nspecs-generate\t0\n", "seal-currency\n");
+    assert lab_test_red("lean\t124\nlean\t124\nspecs-generate\t1\nspecs-generate\t0\nmisread\t0\ncheckout\t2\n", "lean\nlean\nspecs-generate\ncheckout\n");
+    assert lab_test_red("suite\t124\nseal-coverage\t0\n", "suite\n");
+    assert lab_test_red("seal-coverage\t124\nlab\t127\nbuild\t127\nbuild\t0\nspecs-parse\t124\n", "seal-coverage\nlab\nbuild\nspecs-parse\n");
+    assert lab_test_red("build\t124\nseal-coverage\t124\nspecs-parse\t\nbuild\t0\nmisread\t0\nmisread\t0\nsuite\t-9\n", "build\nseal-coverage\nspecs-parse\nsuite\n");
+    assert lab_test_red("specs-parse\t124\nbuild\t0\nspecs-generate\t1\nbuild\t-9\nmisread\t0\nlean\t1\nsuite\t0\n", "specs-parse\nspecs-generate\nbuild\nlean\n");
+    assert lab_test_red("specs-parse\t2\nseal-coverage\t2\nmisread\t124\nsuite\t1\nbuild\t0\n", "specs-parse\nseal-coverage\nsuite\n");
+    assert lab_test_red("suite\t0\nlab\t\nbuild\t1\nlab\t124\nseal-coverage\t2\nsuite\t2\nspecs-generate\t127\n", "lab\nbuild\nlab\nseal-coverage\nsuite\nspecs-generate\n");
+    assert lab_test_red("checkout\t-9\nmisread\t0\ncheckout\t-9\nlab\t-9\nmisread\t124\n", "checkout\ncheckout\nlab\n");
+    assert lab_test_red("specs-generate\t0\nlab\t0\nseal-coverage\t-9\nmisread\t124\nlab\t124\nmisread\t1\nmisread\t0\ncheckout\t0\n", "seal-coverage\nlab\n");
+    assert lab_test_red("specs-parse\t0\ncheckout\t0\nspecs-parse\t-9\nseal-currency\t\nlean\t0\nseal-coverage\t0\nsuite\t127\n", "specs-parse\nseal-currency\nsuite\n");
+    assert lab_test_red("build\t0\nseal-coverage\t0\nbuild\t0\nseal-coverage\t124\ncheckout\t-9\nmisread\t0\n", "seal-coverage\ncheckout\n");
+    assert lab_test_red("seal-currency\t0\n", "");
+    assert lab_test_red("misread\t0\nlean\t0\nseal-currency\t\nseal-currency\t\nspecs-parse\t0\nlean\t0\nseal-coverage\t127\nspecs-generate\t0\n", "seal-currency\nseal-currency\nseal-coverage\n");
+    assert lab_test_red("suite\t0\nlab\t0\nmisread\t2\nbuild\t0\n", "");
+    assert lab_test_red("misread\t0\nlean\t0\nseal-coverage\t-9\nseal-coverage\t-9\n", "seal-coverage\nseal-coverage\n");
+    assert lab_test_red("misread\t-9\ncheckout\t1\n", "checkout\n");
+    assert lab_test_red("lab\t1\nbuild\t127\nspecs-generate\t0\nbuild\t1\nlean\t1\nlean\t124\nmisread\t0\nspecs-generate\t-9\n", "lab\nbuild\nbuild\nlean\nlean\nspecs-generate\n");
+    assert lab_test_red("specs-parse\t0\nspecs-parse\t127\nlab\t2\nbuild\t2\ncheckout\t0\nmisread\t127\n", "specs-parse\nlab\nbuild\n");
+    assert lab_test_red("specs-parse\t2\nlean\t0\nspecs-parse\t0\nlean\t\nsuite\t-9\nseal-coverage\t0\nlab\t\n", "specs-parse\nlean\nsuite\nlab\n");
+    assert lab_test_red("specs-generate\t1\nseal-currency\t\nsuite\t127\nspecs-parse\t0\nspecs-generate\t0\n", "specs-generate\nseal-currency\nsuite\n");
+    assert lab_test_red("specs-parse\t0\nlab\t127\nspecs-parse\t124\n", "lab\nspecs-parse\n");
+    assert lab_test_red("lab\t0\nseal-currency\t2\nseal-currency\t-9\nlab\t-9\nseal-coverage\t0\n", "seal-currency\nseal-currency\nlab\n");
+    assert lab_test_red("checkout\t2\nlean\t1\nspecs-generate\t\nspecs-parse\t-9\ncheckout\t124\n", "checkout\nlean\nspecs-generate\nspecs-parse\ncheckout\n");
+    assert lab_test_red("seal-currency\t0\ncheckout\t0\nlean\t124\ncheckout\t0\nspecs-parse\t0\nspecs-parse\t127\n", "lean\nspecs-parse\n");
+    assert lab_test_red("misread\t0\n", "");
+    assert lab_test_red("seal-coverage\t1\nseal-coverage\t127\nlab\t\ncheckout\t0\nspecs-parse\t124\n", "seal-coverage\nseal-coverage\nlab\nspecs-parse\n");
+    assert lab_test_red("seal-coverage\t\nsuite\t0\nlab\t0\nlean\t0\n", "seal-coverage\n");
+    assert lab_test_red("seal-currency\t\nseal-currency\t0\nlab\t0\nseal-currency\t\nbuild\t0\nspecs-generate\t2\nseal-currency\t1\n", "seal-currency\nseal-currency\nspecs-generate\nseal-currency\n");
+    assert lab_test_red("lab\t0\ncheckout\t\nseal-currency\t-9\nseal-coverage\t2\nlean\t2\nmisread\t0\nlean\t-9\n", "checkout\nseal-currency\nseal-coverage\nlean\nlean\n");
+    assert lab_test_red("seal-coverage\t-9\nseal-coverage\t2\nsuite\t1\n", "seal-coverage\nseal-coverage\nsuite\n");
+    assert lab_test_red("lean\t2\nlab\t0\nspecs-parse\t0\n", "lean\n");
+    assert lab_test_red("misread\t\nsuite\t1\nbuild\t0\nbuild\t-9\nlab\t0\nsuite\t0\nbuild\t0\n", "suite\nbuild\n");
+    assert lab_test_red("seal-currency\t-9\nseal-currency\t0\nmisread\t0\nmisread\t2\nsuite\t-9\nmisread\t\nmisread\t0\n", "seal-currency\nsuite\n");
+    assert lab_test_red("suite\t0\nmisread\t0\nmisread\t124\nlean\t0\nspecs-generate\t0\n", "");
+    assert lab_test_red("suite\t0\ncheckout\t1\nseal-coverage\t1\nbuild\t127\nbuild\t0\n", "checkout\nseal-coverage\nbuild\n");
+    assert lab_test_red("lab\t0\nseal-coverage\t1\ncheckout\t0\nseal-coverage\t\nmisread\t0\nspecs-generate\t0\nspecs-parse\t0\n", "seal-coverage\nseal-coverage\n");
+    assert lab_test_red("seal-coverage\t\nmisread\t0\nsuite\t0\ncheckout\t0\nbuild\t0\nseal-currency\t\ncheckout\t-9\nseal-currency\t0\n", "seal-coverage\nseal-currency\ncheckout\n");
+    assert lab_test_red("checkout\t2\nmisread\t2\nsuite\t0\nbuild\t2\n", "checkout\nbuild\n");
+    assert lab_test_red("lean\t0\nlab\t0\nspecs-generate\t127\nlean\t1\nlab\t0\n", "specs-generate\nlean\n");
+    assert lab_test_red("seal-currency\t-9\nsuite\t\nspecs-parse\t0\nseal-coverage\t127\nsuite\t0\nlab\t0\nsuite\t127\ncheckout\t0\n", "seal-currency\nsuite\nseal-coverage\nsuite\n");
+    assert lab_test_red("build\t0\nsuite\t0\nseal-coverage\t127\nspecs-parse\t0\n", "seal-coverage\n");
+    assert lab_test_red("seal-coverage\t0\n", "");
+    assert lab_test_red("specs-parse\t0\ncheckout\t2\nseal-coverage\t2\nlab\t0\nspecs-parse\t127\nseal-currency\t0\nseal-coverage\t0\n", "checkout\nseal-coverage\nspecs-parse\n");
+    assert lab_test_red("lab\t0\nseal-coverage\t127\n", "seal-coverage\n");
+    assert lab_test_red("specs-generate\t0\nlab\t127\nmisread\t0\nspecs-parse\t0\ncheckout\t0\nseal-coverage\t2\nlab\t0\n", "lab\nseal-coverage\n");
+    assert lab_test_red("build\t2\nlab\t124\n", "build\nlab\n");
+    assert lab_test_red("misread\t124\nsuite\t2\nlab\t\nseal-coverage\t-9\nspecs-parse\t1\ncheckout\t2\nsuite\t0\n", "suite\nlab\nseal-coverage\nspecs-parse\ncheckout\n");
+    assert lab_test_red("lab\t0\nbuild\t124\nmisread\t124\nsuite\t-9\nspecs-parse\t-9\nspecs-generate\t127\ncheckout\t-9\nspecs-generate\t127\n", "build\nsuite\nspecs-parse\nspecs-generate\ncheckout\nspecs-generate\n");
+    assert lab_test_red("lab\t\n", "lab\n");
+    assert lab_test_red("specs-generate\t0\nbuild\t1\nmisread\t127\ncheckout\t127\nlab\t0\nlean\t0\nspecs-parse\t1\n", "build\ncheckout\nspecs-parse\n");
+    assert lab_test_red("lab\t2\ncheckout\t-9\n", "lab\ncheckout\n");
+    assert lab_test_red("build\t0\nlab\t0\nbuild\t0\ncheckout\t0\nspecs-parse\t1\n", "specs-parse\n");
+    assert lab_test_red("misread\t0\nsuite\t0\nmisread\t1\n", "");
+}
+
+// >>> pinned table: verdict_verdict
+// <<< pinned table: verdict_run
+// run_item(): `name in NEEDS_BUILD and not built` skips a gate; `name == 'build' and code != 0` ends `built`; `'master' in branches and built` refreshes seals.
+test lab_py_table_run_item_decisions {
+    assert lab_gate_skipped(0, true) == false;
+    assert lab_built_after(0, 0, true) == true;
+    assert lab_built_after(0, 1, true) == false;
+    assert lab_built_after(0, 124, true) == false;
+    assert lab_built_after(0, 127, true) == false;
+    assert lab_built_after(0, -9, true) == false;
+    assert lab_gate_skipped(0, false) == false;
+    assert lab_built_after(0, 0, false) == false;
+    assert lab_built_after(0, 1, false) == false;
+    assert lab_built_after(0, 124, false) == false;
+    assert lab_built_after(0, 127, false) == false;
+    assert lab_built_after(0, -9, false) == false;
+    assert lab_gate_skipped(1, true) == false;
+    assert lab_built_after(1, 0, true) == true;
+    assert lab_built_after(1, 1, true) == true;
+    assert lab_built_after(1, 124, true) == true;
+    assert lab_built_after(1, 127, true) == true;
+    assert lab_built_after(1, -9, true) == true;
+    assert lab_gate_skipped(1, false) == true;
+    assert lab_built_after(1, 0, false) == false;
+    assert lab_built_after(1, 1, false) == false;
+    assert lab_built_after(1, 124, false) == false;
+    assert lab_built_after(1, 127, false) == false;
+    assert lab_built_after(1, -9, false) == false;
+    assert lab_gate_skipped(2, true) == false;
+    assert lab_built_after(2, 0, true) == true;
+    assert lab_built_after(2, 1, true) == true;
+    assert lab_built_after(2, 124, true) == true;
+    assert lab_built_after(2, 127, true) == true;
+    assert lab_built_after(2, -9, true) == true;
+    assert lab_gate_skipped(2, false) == true;
+    assert lab_built_after(2, 0, false) == false;
+    assert lab_built_after(2, 1, false) == false;
+    assert lab_built_after(2, 124, false) == false;
+    assert lab_built_after(2, 127, false) == false;
+    assert lab_built_after(2, -9, false) == false;
+    assert lab_gate_skipped(3, true) == false;
+    assert lab_built_after(3, 0, true) == true;
+    assert lab_built_after(3, 1, true) == true;
+    assert lab_built_after(3, 124, true) == true;
+    assert lab_built_after(3, 127, true) == true;
+    assert lab_built_after(3, -9, true) == true;
+    assert lab_gate_skipped(3, false) == true;
+    assert lab_built_after(3, 0, false) == false;
+    assert lab_built_after(3, 1, false) == false;
+    assert lab_built_after(3, 124, false) == false;
+    assert lab_built_after(3, 127, false) == false;
+    assert lab_built_after(3, -9, false) == false;
+    assert lab_gate_skipped(4, true) == false;
+    assert lab_built_after(4, 0, true) == true;
+    assert lab_built_after(4, 1, true) == true;
+    assert lab_built_after(4, 124, true) == true;
+    assert lab_built_after(4, 127, true) == true;
+    assert lab_built_after(4, -9, true) == true;
+    assert lab_gate_skipped(4, false) == true;
+    assert lab_built_after(4, 0, false) == false;
+    assert lab_built_after(4, 1, false) == false;
+    assert lab_built_after(4, 124, false) == false;
+    assert lab_built_after(4, 127, false) == false;
+    assert lab_built_after(4, -9, false) == false;
+    assert lab_gate_skipped(5, true) == false;
+    assert lab_built_after(5, 0, true) == true;
+    assert lab_built_after(5, 1, true) == true;
+    assert lab_built_after(5, 124, true) == true;
+    assert lab_built_after(5, 127, true) == true;
+    assert lab_built_after(5, -9, true) == true;
+    assert lab_gate_skipped(5, false) == true;
+    assert lab_built_after(5, 0, false) == false;
+    assert lab_built_after(5, 1, false) == false;
+    assert lab_built_after(5, 124, false) == false;
+    assert lab_built_after(5, 127, false) == false;
+    assert lab_built_after(5, -9, false) == false;
+    assert lab_gate_skipped(6, true) == false;
+    assert lab_built_after(6, 0, true) == true;
+    assert lab_built_after(6, 1, true) == true;
+    assert lab_built_after(6, 124, true) == true;
+    assert lab_built_after(6, 127, true) == true;
+    assert lab_built_after(6, -9, true) == true;
+    assert lab_gate_skipped(6, false) == true;
+    assert lab_built_after(6, 0, false) == false;
+    assert lab_built_after(6, 1, false) == false;
+    assert lab_built_after(6, 124, false) == false;
+    assert lab_built_after(6, 127, false) == false;
+    assert lab_built_after(6, -9, false) == false;
+    assert lab_gate_skipped(7, true) == false;
+    assert lab_built_after(7, 0, true) == true;
+    assert lab_built_after(7, 1, true) == true;
+    assert lab_built_after(7, 124, true) == true;
+    assert lab_built_after(7, 127, true) == true;
+    assert lab_built_after(7, -9, true) == true;
+    assert lab_gate_skipped(7, false) == true;
+    assert lab_built_after(7, 0, false) == false;
+    assert lab_built_after(7, 1, false) == false;
+    assert lab_built_after(7, 124, false) == false;
+    assert lab_built_after(7, 127, false) == false;
+    assert lab_built_after(7, -9, false) == false;
+    assert lab_seals_due(true, true) == true;
+    assert lab_seals_due(true, false) == false;
+    assert lab_seals_due(false, true) == false;
+    assert lab_seals_due(false, false) == false;
+}
+
+// sh(): `if time.time() - start > timeout: return 124` else the program's code.
+test lab_py_table_a_limit_kills_the_gate {
+    assert lab_exit_after(0, 10.0, 1800) == 0;
+    assert lab_exit_after(0, 1800.0, 1800) == 0;
+    assert lab_exit_after(0, 1800.5, 1800) == 124;
+    assert lab_exit_after(1, 1799.9, 1800) == 1;
+    assert lab_exit_after(0, 3600.01, 3600) == 124;
+    assert lab_exit_after(-9, 3601.0, 3600) == 124;
+    assert lab_exit_after(2, 0.0, 1800) == 2;
+    assert lab_exit_after(0, 5400.0, 5400) == 0;
+    assert lab_exit_after(0, 5400.000001, 5400) == 124;
+    assert lab_exit_after(127, 0.1, 3600) == 127;
+    assert lab_exit_after(-9, 1800.2, 1800) == 124;
+    assert lab_exit_after(0, 0.0, 0) == 0;
+    assert LAB_EXIT_TIMEOUT == 124 and LAB_EXIT_NOT_FOUND == 127;
+}
+
+// publish_latest(): the state a head shows.
+test lab_py_table_head_state {
+    assert lab_head_state(true, true, true, true) == 4;
+    assert lab_head_state(true, true, true, false) == 4;
+    assert lab_head_state(true, true, false, true) == 4;
+    assert lab_head_state(true, true, false, false) == 4;
+    assert lab_head_state(true, false, true, true) == 3;
+    assert lab_head_state(true, false, true, false) == 3;
+    assert lab_head_state(true, false, false, true) == 3;
+    assert lab_head_state(true, false, false, false) == 3;
+    assert lab_head_state(false, true, true, true) == 2;
+    assert lab_head_state(false, true, true, false) == 2;
+    assert lab_head_state(false, true, false, true) == 1;
+    assert lab_head_state(false, true, false, false) == 0;
+    assert lab_head_state(false, false, true, true) == 2;
+    assert lab_head_state(false, false, true, false) == 2;
+    assert lab_head_state(false, false, false, true) == 1;
+    assert lab_head_state(false, false, false, false) == 0;
+    assert span_is(lab_head_state_name(LAB_HS_NOT_RUN), 0, 7, "not run") and span_is(lab_head_state_name(LAB_HS_QUEUED), 0, 6, "queued");
+    assert span_is(lab_head_state_name(LAB_HS_RUNNING), 0, 7, "running") and span_is(lab_head_state_name(LAB_HS_UNREADABLE), 0, 10, "unreadable");
+    assert lab_head_state_name(LAB_HS_FROM_RUN).len == 0;
+}
+
+// >>> pinned table: verdict_run
+
+// Scenario: `\s` crosses lines. A row with no description still matches when the next line starts with a non-space, and it
+// takes that character; the next row then loses its first digit and is not read (Python: 1 2 3 only). Checked on Python.
+test the_row_regex_crosses_lines_as_python_does {
+    assert lab_test_misread("  pairs  refused  silent\n  10 20 30  \nx", true, 10, 20, 30);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3\n4 5 6 x\n", true, 1, 2, 3);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3\n  4 5 6 x\n", true, 1, 2, 3);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3 a\n  4 5 6 x\n", true, 5, 7, 9);
+    assert lab_test_misread("  pairs  refused  silent\n  1 2 3", true, 0, 0, 0);
+}
+
+// Scenario: the one branch of misread_line() no input of misread_counts() reaches: a refused count of None.
+test refusals_not_measured_is_said_when_the_refused_count_is_none {
+    var out : [128]u8 = undefined;
+    const m : LabMisread = LabMisread { read: true, pairs: 3, refused: LAB_DEC_BAD, silent: 1 };
+    const w : usize = lab_misread_line(m, "fb", 0, 2, &out, 128, 0);
+    assert w == 44;
+    assert span_is(&out, 0, w, "1 of 3 pair(s) silent, refusals not measured");
+    const n : LabMisread = LabMisread { read: false, pairs: 3, refused: 1, silent: 1 };
+    const x : usize = lab_misread_line(n, "fb", 0, 2, &out, 128, 0);
+    assert x == 2 and span_is(&out, 0, 2, "fb");
+}
+
+// Scenario (NOT Python): a count of more than 18 digits, or a total past 10^18 - 1, is not read. Python reads both
+// (12345678901234567890, and 999999999999999999 + 1); the port fails closed, and the summary falls back to the log's own line.
+test a_count_this_port_cannot_hold_makes_the_table_unread {
+    assert lab_test_misread("  pairs  refused  silent\n  12345678901234567890 2 3 x\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  999999999999999999 2 3 x\n  1 1 1 y\n", false, 0, 0, 0);
+    assert lab_test_misread("  pairs  refused  silent\n  999999999999999999 2 3 x\n", true, 999999999999999999, 2, 3);
+    assert lab_test_misread_line("  pairs  refused  silent\n  12345678901234567890 2 3 x\n", "the log line", "the log line");
+}
+
+// Scenario: summary() cuts at 300 CHARACTERS: 299 letters, then e-acute (2 bytes), then z is 302 bytes and 301 characters; the
+// summary is the first 300 characters, 301 bytes. (Python: len 300, ends 'aae-acute'.)
+test the_summary_is_cut_at_300_characters_not_bytes {
+    var b : [302]u8 = undefined;
+    var k : usize = 0;
+    while (k < 299) {
+        b[k] = 97;
+        k = k + 1;
+    }
+    b[299] = 195;
+    b[300] = 169;
+    b[301] = 122;
+    var out : [1400]u8 = undefined;
+    assert lab_summary_write(&b, LAB_PAT_NONE, &out, 1400, 0) == 301;
+    assert out[298] == 97 and out[299] == 195 and out[300] == 169;
+    const sp : LabSummarySpan = lab_summary(&b, LAB_PAT_NONE);
+    assert sp.from == 0 and sp.to == 301;
+}
+
+// Scenario: the lines of a log are split on the ten characters splitlines() splits on, and stripped of the Unicode spaces
+// (checked on Python: 'a VT b' -> 'b'; 'x CR y' -> 'y'; 'RATCHET NEL two' under RATCHET -> 'RATCHET'; NBSP x NBSP -> 'x'; US is
+// not a break; a zero width space is not a space).
+test the_summary_reads_lines_and_spaces_the_way_python_does {
+    var vt : [3]u8 = undefined;
+    vt[0] = 97;
+    vt[1] = 11;
+    vt[2] = 98;
+    assert lab_test_summary(&vt, LAB_PAT_NONE, "b");
+    var cr : [3]u8 = undefined;
+    cr[0] = 120;
+    cr[1] = 13;
+    cr[2] = 121;
+    assert lab_test_summary(&cr, LAB_PAT_NONE, "y");
+    var nel : [12]u8 = undefined;
+    nel[0] = 82;
+    nel[1] = 65;
+    nel[2] = 84;
+    nel[3] = 67;
+    nel[4] = 72;
+    nel[5] = 69;
+    nel[6] = 84;
+    nel[7] = 194;
+    nel[8] = 133;
+    nel[9] = 116;
+    nel[10] = 119;
+    nel[11] = 111;
+    assert lab_test_summary(&nel, LAB_PAT_SUITE, "RATCHET");
+    var nb : [5]u8 = undefined;
+    nb[0] = 194;
+    nb[1] = 160;
+    nb[2] = 120;
+    nb[3] = 194;
+    nb[4] = 160;
+    assert lab_test_summary(&nb, LAB_PAT_NONE, "x");
+    var us : [3]u8 = undefined;
+    us[0] = 97;
+    us[1] = 31;
+    us[2] = 98;
+    const sp : LabSummarySpan = lab_summary(&us, LAB_PAT_NONE);
+    assert sp.from == 0 and sp.to == 3;
+    var zw : [4]u8 = undefined;
+    zw[0] = 120;
+    zw[1] = 226;
+    zw[2] = 128;
+    zw[3] = 139;
+    const zs : LabSummarySpan = lab_summary(&zw, LAB_PAT_NONE);
+    assert zs.from == 0 and zs.to == 4;
+}
+
+// Scenario: the gate table is a closed set of eight; a name outside it is no gate (negative control: a command, a padded or
+// upper-case spelling, a path, a prefix and a longer name are all refused), and every gate of the table has a command.
+test only_the_eight_gates_of_the_table_are_known {
+    var i : usize = 0;
+    while (i < LAB_GATE_COUNT) {
+        const n : string = lab_gate_name(i);
+        assert lab_gate_known(n, 0, n.len) == true;
+        assert lab_gate_index(n, 0, n.len) == i;
+        assert lab_gate_cmd(i).len > 10;
+        assert lab_gate_timeout(i) >= 1800;
+        i = i + 1;
+    }
+    assert lab_gate_known("", 0, 0) == false;
+    assert lab_gate_known("Build", 0, 5) == false;
+    assert lab_gate_known("build ", 0, 6) == false;
+    assert lab_gate_known("buil", 0, 4) == false;
+    assert lab_gate_known("builds", 0, 6) == false;
+    assert lab_gate_known("build;ls", 0, 8) == false;
+    assert lab_gate_known("rm -rf /", 0, 8) == false;
+    assert lab_gate_known("../suite", 0, 8) == false;
+    assert lab_gate_known("specs", 0, 5) == false;
+    assert lab_gate_known("seal-currency", 0, 13) == true;
+    assert lab_gate_known("seal-currencyX", 0, 13) == true;
+    assert lab_gate_known("seal-currencyX", 0, 14) == false;
+    assert lab_gate_known("checkout", 0, 8) == false;
+    assert lab_gate_known("lab", 0, 3) == false;
+    assert LAB_GATE_COUNT == 8;
+}

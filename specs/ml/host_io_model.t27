@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/host_io_model.t27 -- a model spec that writes a token stream to a REAL file and reads it back.
+; Part of gHashTag/t27#10024 (our own model), cell 25 "t27c --backend ml"; issue #10085.
+
+; WHY: specs/ml/file_io_contract.t27 is a model of files: four slots of bytes in a caller-owned
+; array. A trainer needs the bytes on a disk. This spec is the bridge, and it is all t27: the token
+; stream is built and parsed by the contract's own tokens_write and tokens_read; the only thing it
+; asks of the host is four calls on a file descriptor, host_open, host_read, host_write and
+; host_close. t27c lowers those four (and nothing else) to the host's syscalls; that lowering is
+; the entire hand-written part of `t27c compile --backend ml`, and the PR that adds it counts its
+; lines.
+
+; HOST CALLS (the contract with t27c, nothing here is implemented in this file):
+;   host_open(path, mode)  path is a string literal; mode 0 reads, 1 creates or truncates for
+;                          writing. Returns a descriptor >= 0, or a negative errno.
+;   host_read(fd, buf)     reads up to buf.len bytes. Returns the count, 0 at the end, or -errno.
+;   host_write(fd, buf)    writes buf. Returns the count or -errno.
+;   host_close(fd)         returns 0 or -errno.
+
+; Not claimed: no partial-write retry loop beyond the one below, no seek, no directories, no
+; descriptor other than the one this spec opened.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module host_io_model;
+
+use ml::file_io_contract;
+
+pub const HOST_OK : i32 = 0;
+pub const HOST_ERR_OPEN : i32 = 50;
+pub const HOST_ERR_IO : i32 = 51;
+pub const HOST_ERR_SHORT : i32 = 52;
+
+/// Copy the bytes of one slot of the model volume to the real file at /tmp/t27_tokens.bin.
+pub fn flush_tokens(data: []const u8, lens: []const i32, slot: i32) -> i32 {
+    const n : i32 = io_size(lens, slot);
+    if (n < 0) {
+        return HOST_ERR_SHORT;
+    }
+    const fd : i32 = host_open("/tmp/t27_tokens.bin", 1);
+    if (fd < 0) {
+        return HOST_ERR_OPEN;
+    }
+    const base : usize = @intCast(slot * FILE_CAP);
+    const count : usize = @intCast(n);
+    const w : i32 = host_write(fd, data[base .. base + count]);
+    const c : i32 = host_close(fd);
+    if (w != n or c != 0) {
+        return HOST_ERR_IO;
+    }
+    return HOST_OK;
+}
+
+/// Read the real file at /tmp/t27_tokens.bin into one slot of the model volume and set its length.
+pub fn load_tokens(data: []u8, lens: []i32, slot: i32) -> i32 {
+    const fd : i32 = host_open("/tmp/t27_tokens.bin", 0);
+    if (fd < 0) {
+        return HOST_ERR_OPEN;
+    }
+    const base : usize = @intCast(slot * FILE_CAP);
+    const got : i32 = host_read(fd, data[base .. base + @as(usize, @intCast(FILE_CAP))]);
+    const c : i32 = host_close(fd);
+    if (got < 0 or c != 0) {
+        return HOST_ERR_IO;
+    }
+    lens[@intCast(slot)] = got;
+    return HOST_OK;
+}
+
+/// Write n token ids through the contract, flush them to disk, load them into a second volume and
+/// compare the two volumes byte for byte. Returns HOST_OK or the first failing code.
+pub fn roundtrip(toks: []const u32, n: i32) -> i32 {
+    var out_data : [1024]u8 = undefined;
+    var out_lens : [4]i32 = undefined;
+    var in_data : [1024]u8 = undefined;
+    var in_lens : [4]i32 = undefined;
+    var back : [64]u32 = undefined;
+    vol_init(&out_lens);
+    vol_init(&in_lens);
+    var z : usize = 0;
+    while (z < 1024) {
+        out_data[z] = 0;
+        in_data[z] = 0;
+        z = z + 1;
+    }
+    const wc : i32 = tokens_write(&out_data, &out_lens, 1, toks, n);
+    if (wc != TOK_OK) {
+        return wc;
+    }
+    const fc : i32 = flush_tokens(&out_data, &out_lens, 1);
+    if (fc != HOST_OK) {
+        return fc;
+    }
+    const lc : i32 = load_tokens(&in_data, &in_lens, 2);
+    if (lc != HOST_OK) {
+        return lc;
+    }
+    if (in_lens[2] != out_lens[1]) {
+        return HOST_ERR_SHORT;
+    }
+    var i : usize = 0;
+    while (i < @as(usize, @intCast(in_lens[2]))) {
+        if (in_data[2 * 256 + i] != out_data[256 + i]) {
+            return HOST_ERR_IO;
+        }
+        i = i + 1;
+    }
+    // read the stream back as ids from the volume that came off the disk
+    in_lens[1] = in_lens[2];
+    var k : usize = 0;
+    while (k < @as(usize, @intCast(in_lens[2]))) {
+        in_data[256 + k] = in_data[2 * 256 + k];
+        k = k + 1;
+    }
+    const info : TokenInfo = tokens_read(&in_data, &in_lens, 1, &back, 64);
+    if (info.code != TOK_OK or info.count != n) {
+        return HOST_ERR_SHORT;
+    }
+    var j : usize = 0;
+    while (j < @as(usize, @intCast(n))) {
+        if (back[j] != toks[j]) {
+            return HOST_ERR_IO;
+        }
+        j = j + 1;
+    }
+    return HOST_OK;
+}
+
+/// The program `t27c compile --backend ml` builds: round-trip a fixed stream, die loudly on any difference.
+pub fn main() -> void {
+    const toks : [6]u32 = [0, 1, 50256, 4294967295, 7, 305419896];
+    assert roundtrip(&toks, 6) == HOST_OK;
+}
+
+test a_token_stream_survives_a_real_file {
+    const toks : [6]u32 = [0, 1, 50256, 4294967295, 7, 305419896];
+    assert roundtrip(&toks, 6) == HOST_OK;
+}
+
+test an_empty_stream_survives_a_real_file {
+    const toks : [1]u32 = [0];
+    assert roundtrip(&toks, 0) == HOST_OK;
+}
+
+test the_comparison_can_fail {
+    // a stream too long for one slot is refused by the contract before any byte reaches the disk
+    var many : [65]u32 = undefined;
+    var i : usize = 0;
+    while (i < 65) {
+        many[i] = 7;
+        i = i + 1;
+    }
+    assert roundtrip(&many, 65) == IO_ERR_FULL;
+}

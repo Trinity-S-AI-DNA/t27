@@ -1,0 +1,451 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/keyed_batch.t27 -- the bee admission admits a batch of ready issues per queend choose
+; gHashTag/t27#10033, under the keyed-actors epic gHashTag/t27#7851.
+; The production trial of 2026-10-17 (gHashTag/t27#7851, comment 6237225782) ran the Queen's bee
+; dispatch as keyed actors on trios build 42042a5. It started about 9x fewer bees than the round's
+; loop: 2 runner starts in 20 minutes, against the loop's 18.5. The trial was reverted.
+; The cause: the round readies every candidate (825-827 of them), and the one admission actor answers
+; each ready in turn by awaiting one queend choose for that one issue (queen-bee-actors.ts, line 298
+; of 42042a5). Admission was serial at one queend round trip per issue, while the loop asks queend
+; once per round about the whole list (queen-batch-choose.ts, control.t27 batch_quota). keyed.t27
+; LANES_MEASURED (70) was not the limit.
+; How others do it:
+; - Group commit (databases since the 1980s, PostgreSQL commit_delay, the Linux block layer's plug):
+;   requests that arrive while one flush is in flight wait for the next flush, so the flush count
+;   follows the flush time, not the request count.
+; - Erlang/OTP: a gen_server that serves a slow resource drains its mailbox into one request
+;   (selective receive with an after 0 clause) instead of one request per message.
+; This card keeps the admission's answers of keyed_guard.t27 section 2 and changes only how often
+; queend is asked:
+; 1. which asks join a batch: exactly those keyed_guard admit_answer would send to queend; every
+;    other ask is answered at once (joins_batch, answer_now);
+; 2. group commit: a batch goes out when no choose is in flight; asks that come meanwhile join the
+;    next one (batch_goes_out, batch_take, chooses_for);
+; 3. quota: a batch takes at most control.t27 batch_quota new lanes, the loop's own cap
+;    (new_lane_quota);
+; 4. the policy word: queend's one answer gives each issue PICK, LATER or NO, and the word becomes
+;    the answer admit_answer gives a lone ask (word_of, batch_answer, batch_grants);
+; 5. the wake: when a lane frees, every waiting issue asks again, in one batch (batch_wake_count);
+; 6. the model: chooses and grants for one round, serial against batched (round_chooses);
+; 7. bounds: an ask's call outlasts two chooses, or a slow queend takes back every grant
+;    (ask_wait_ms, ask_bound_ok, word_after_choose).
+; Reused, not restated: keyed.t27 (lane_free), keyed_guard.t27 (the AD_ answers, admit_answer,
+; wake_count) and control.t27 (batch_quota). gen-c compiles them in.
+; Not here: the actor runtime and queend itself (gHashTag/trios).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenKeyedBatch;
+
+use queen::keyed::lane_free;
+use queen::keyed_guard::AD_ASK;
+use queen::keyed_guard::AD_GRANT;
+use queen::keyed_guard::AD_KEEP;
+use queen::keyed_guard::AD_WAIT;
+use queen::keyed_guard::AD_REFUSED;
+use queen::keyed_guard::AD_GIVE_BACK;
+use queen::keyed_guard::admit_answer;
+use queen::keyed_guard::wake_count;
+use queen::control::batch_quota;
+
+; --- 1. Which asks join a batch ----------------------------------------------------------------------
+; keyed_guard admit_answer asks queend only when its word can change the answer. The same rule picks
+; the asks that wait for a batch, so a batch never holds an ask whose answer was already known.
+
+/// `kept`, `holds_lane` and `free` as in keyed_guard admit_answer (`free` is its `lane_free`).
+/// True when the ask needs queend's word: a kept lane (KEEP or GIVE_BACK), or a new issue while a
+/// lane is free.
+pub fn joins_batch(kept: bool, holds_lane: bool, free: bool) -> bool {
+    return admit_answer(kept, holds_lane, free, false, false) == AD_ASK;
+}
+
+/// The answer for an ask that does not join a batch, with no queend call: REFUSED for an issue that
+/// already holds a lane, WAIT for a new issue while no lane is free.
+pub fn answer_now(kept: bool, holds_lane: bool, free: bool) -> u8 {
+    return admit_answer(kept, holds_lane, free, false, false);
+}
+
+; --- 2. Group commit ---------------------------------------------------------------------------------
+; The admission holds an open batch of asks and at most one choose in flight. A batch goes out as
+; soon as no choose is in flight: there is no timer to wait out, and an ask that comes while a choose
+; runs joins the next batch. So the choose count follows queend's time per choose, not the ask count.
+
+/// The most asks one choose answers. At least MEASURED_CANDIDATES, so one round's candidates fit in
+/// one choose, the way the loop asks queend about the whole round at once.
+pub const BATCH_ASKS_MAX : u32 = 1024;
+
+/// The most candidates one round readied on 2026-10-17 (825-827; gHashTag/t27#7851).
+pub const MEASURED_CANDIDATES : u32 = 826;
+
+/// Runner starts per 20 minutes on 2026-10-17, in tenths: the loop 18.5, the serial actors 2.
+pub const STARTS_LOOP_TENTHS : u32 = 185;
+pub const STARTS_SERIAL_TENTHS : u32 = 20;
+
+/// Whether the open batch goes out now. `open`: asks in the open batch. `choose_out`: a choose is in
+/// flight.
+pub fn batch_goes_out(open: u32, choose_out: bool) -> bool {
+    return open > 0 and choose_out == false;
+}
+
+/// How many of the open asks the choose that goes out takes, oldest first. The rest stay open for
+/// the next one.
+pub fn batch_take(open: u32) -> u32 {
+    if (open < BATCH_ASKS_MAX) { return open; }
+    return BATCH_ASKS_MAX;
+}
+
+/// How many chooses answer `asks` asks that are all open at once. The serial admission made `asks`.
+pub fn chooses_for(asks: u32) -> u32 {
+    if (asks % BATCH_ASKS_MAX == 0) { return asks / BATCH_ASKS_MAX; }
+    return asks / BATCH_ASKS_MAX + 1;
+}
+
+; --- 3. Quota ----------------------------------------------------------------------------------------
+
+/// How many new lanes one batch may grant: control.t27 batch_quota over the admission's lanes, the
+/// lanes in use, and the batch's new asks (asks that are not kept). The loop's batch uses the same
+/// cap. A kept ask takes no new lane, so it is outside the quota.
+pub fn new_lane_quota(lanes: u32, in_use: u32, new_asks: u32) -> u32 {
+    return batch_quota(lanes, in_use, new_asks);
+}
+
+; --- 4. The policy word ------------------------------------------------------------------------------
+; queend's one answer (queen-batch-choose.ts readAnswer and planBatch) gives each issue of the batch
+; one word.
+; PW_PICK: picked, within new_lane_quota. PW_LATER: eligible but not picked: not first, past the
+; quota, or its edit meets a pick's (control.t27 pick_admits). PW_NO: queend held or refused it.
+
+pub const PW_PICK : u8 = 0;
+pub const PW_LATER : u8 = 1;
+pub const PW_NO : u8 = 2;
+
+/// The word for one issue. `picked`: planBatch picked it. `eligible`: queend chose it or skipped it
+/// only as not first.
+pub fn word_of(picked: bool, eligible: bool) -> u8 {
+    if (picked) { return PW_PICK; }
+    if (eligible) { return PW_LATER; }
+    return PW_NO;
+}
+
+/// The admission's answer to one ask of a batch, given its word. `free` is keyed.t27 lane_free read
+/// again for each answer, in batch order, after the grants before it. So a pick past the free lanes
+/// waits instead of taking a lane that is not there.
+/// A kept ask keeps its lane unless queend said no. Being eligible is enough, since it takes no new
+/// lane. A LATER word is a wait: the issue stays on the board and asks again at the next wake.
+/// For a batch of one ask, PICK and NO answer exactly as admit_answer with policy_ok true and
+/// false (test a_lone_ask_answers_as_the_serial_admission).
+pub fn batch_answer(kept: bool, holds_lane: bool, free: bool, word: u8) -> u8 {
+    if (kept) { return admit_answer(true, holds_lane, free, true, word != PW_NO); }
+    if (holds_lane) { return AD_REFUSED; }
+    if (word == PW_LATER) { return AD_WAIT; }
+    return admit_answer(false, holds_lane, free, true, word == PW_PICK);
+}
+
+/// The grants of a batch of `picks` new picks, answered in order on a board with `in_use` of
+/// `lanes` lanes in use. The invariant a_batch_grants_its_quota_and_no_more pins this to
+/// new_lane_quota.
+pub fn batch_grants(in_use: u32, lanes: u32, picks: u32) -> u32 {
+    var granted : u32 = 0;
+    var i : u32 = 0;
+    while (i < picks) {
+        if (batch_answer(false, false, lane_free(in_use + granted, lanes), PW_PICK) == AD_GRANT) {
+            granted = granted + 1;
+        }
+        i = i + 1;
+    }
+    return granted;
+}
+
+; --- 5. The wake -------------------------------------------------------------------------------------
+; keyed_guard wake_count wakes one waiting issue per free lane. That fits a serial admission, where
+; each woken issue is one choose. A batched admission wakes every waiting issue, up to one batch,
+; once any lane is free. The batch then picks who takes the lanes, and the issues it does not pick
+; wait again. Waking one per lane would hand the lanes to whoever waited longest, not to queend's
+; picks, and an issue told LATER would never be asked again while others wait ahead of it.
+
+pub fn batch_wake_count(in_use: u32, lanes: u32, waiting: u32) -> u32 {
+    if (lane_free(in_use, lanes) == false) { return 0; }
+    if (waiting < BATCH_ASKS_MAX) { return waiting; }
+    return BATCH_ASKS_MAX;
+}
+
+; --- 6. The model: one round, serial against batched ------------------------------------------------
+; A round readies `candidates` asks onto `free` free lanes. Candidate i is one queend would pick when
+; `ok_every` is not 0 and i % ok_every == 0. The serial admission makes one choose per ask until the
+; lanes are full. The batched one makes one choose per BATCH_ASKS_MAX asks.
+; The result packs the chooses in the high 32 bits and the grants in the low 32 (chooses_of,
+; grants_of).
+
+pub fn round_chooses(candidates: u32, free: u32, ok_every: u32, batched: bool) -> u64 {
+    var chooses : u32 = 0;
+    var grants : u32 = 0;
+    var i : u32 = 0;
+    if (batched == false) {
+        while (i < candidates and grants < free) {
+            chooses = chooses + 1;
+            if (ok_every != 0 and i % ok_every == 0) { grants = grants + 1; }
+            i = i + 1;
+        }
+    } else {
+        while (i < candidates and grants < free) {
+            let chunk : u32 = batch_take(candidates - i);
+            var eligible : u32 = 0;
+            var j : u32 = i;
+            while (j < i + chunk) {
+                if (ok_every != 0 and j % ok_every == 0) { eligible = eligible + 1; }
+                j = j + 1;
+            }
+            chooses = chooses + 1;
+            grants = grants + new_lane_quota(free, grants, eligible);
+            i = i + chunk;
+        }
+    }
+    return ((chooses as u64) << 32) | (grants as u64);
+}
+
+pub fn chooses_of(packed: u64) -> u32 {
+    return (packed >> 32) as u32;
+}
+
+pub fn grants_of(packed: u64) -> u32 {
+    return (packed & 4294967295) as u32;
+}
+
+; --- 7. Bounds ---------------------------------------------------------------------------------------
+; An ask that joins a batch while a choose is in flight waits for that choose, then for its own. If
+; its call (keyed_guard after_admission, CALL_TIMEOUT) runs out first, it waits on the board, and
+; keyed_guard grant_lands gives back the lane its batch granted it. The next wake asks again, and if
+; queend is just as slow the batch never lands. So each choose needs a bound, and an ask's call must
+; outlast two chooses.
+; askQueend (queen-tick.ts, 42042a5) spawns queend per call with no bound. The issue actors' call to
+; the admission is bounded by admitAfterMs, 30000 by default (ASK_BOUND_MS). CHOOSE_BOUND_MS is the
+; bound this card sets for one choose. It is a chosen bound, not a measurement: the trios wiring
+; measures the choose time over a full round and reports it before any trial.
+
+pub const ASK_BOUND_MS : u32 = 30000;
+pub const CHOOSE_BOUND_MS : u32 = 12000;
+
+/// The longest an ask in a batch waits for its answer: the choose in flight, then its own.
+pub fn ask_wait_ms(choose_bound_ms: u32) -> u64 {
+    return 2 * (choose_bound_ms as u64);
+}
+
+/// Whether an ask's call bound outlasts its longest wait. An unbounded choose (0) never fits.
+pub fn ask_bound_ok(ask_bound_ms: u32, choose_bound_ms: u32) -> bool {
+    return choose_bound_ms > 0 and (ask_bound_ms as u64) > ask_wait_ms(choose_bound_ms);
+}
+
+/// The word every ask of a batch gets once its choose ends. A choose that failed or ran out of its
+/// bound said neither yes nor no, so its asks wait, LATER, and no lane moves.
+pub fn word_after_choose(answered: bool, word: u8) -> u8 {
+    if (answered) { return word; }
+    return PW_LATER;
+}
+
+; --- Tests -------------------------------------------------------------------------------------------
+
+test only_asks_whose_answer_needs_queend_join_a_batch {
+    // a kept lane always needs the word: KEEP or GIVE_BACK
+    assert joins_batch(true, true, true) == true;
+    assert joins_batch(true, true, false) == true;
+    assert joins_batch(true, false, false) == true;
+    // a new issue joins while a lane is free
+    assert joins_batch(false, false, true) == true;
+    // the rest are answered at once, with no call
+    assert joins_batch(false, true, true) == false;
+    assert joins_batch(false, true, false) == false;
+    assert joins_batch(false, false, false) == false;
+    assert answer_now(false, true, true) == AD_REFUSED;
+    assert answer_now(false, false, false) == AD_WAIT;
+}
+
+test a_batch_goes_out_when_no_choose_is_in_flight {
+    assert batch_goes_out(1, false) == true;
+    assert batch_goes_out(826, false) == true;
+    // asks that come while a choose runs wait for the next one
+    assert batch_goes_out(826, true) == false;
+    // nothing to ask
+    assert batch_goes_out(0, false) == false;
+    assert batch_take(826) == 826;
+    assert batch_take(BATCH_ASKS_MAX) == BATCH_ASKS_MAX;
+    assert batch_take(BATCH_ASKS_MAX + 1) == BATCH_ASKS_MAX;
+    assert batch_take(0) == 0;
+}
+
+test one_choose_answers_a_whole_round {
+    assert chooses_for(MEASURED_CANDIDATES) == 1;
+    assert chooses_for(1) == 1;
+    assert chooses_for(0) == 0;
+    assert chooses_for(BATCH_ASKS_MAX) == 1;
+    assert chooses_for(BATCH_ASKS_MAX + 1) == 2;
+    assert chooses_for(3 * BATCH_ASKS_MAX) == 3;
+}
+
+test the_quota_is_the_loops_batch_quota {
+    // 70 lanes, 17 in use, 145 new asks: 53 new lanes, as control.t27 batch_quota
+    assert new_lane_quota(70, 17, 145) == 53;
+    assert new_lane_quota(70, 17, 3) == 3;
+    assert new_lane_quota(70, 70, 826) == 0;
+    assert new_lane_quota(70, 75, 826) == 0;
+}
+
+test queends_answer_gives_each_issue_one_word {
+    assert word_of(true, true) == PW_PICK;
+    assert word_of(true, false) == PW_PICK;
+    assert word_of(false, true) == PW_LATER;
+    assert word_of(false, false) == PW_NO;
+}
+
+test a_lone_ask_answers_as_the_serial_admission {
+    var c : u32 = 0;
+    while (c < 8) {
+        let k : bool = (c & 4) != 0;
+        let h : bool = (c & 2) != 0;
+        let f : bool = (c & 1) != 0;
+        assert batch_answer(k, h, f, PW_PICK) == admit_answer(k, h, f, true, true);
+        assert batch_answer(k, h, f, PW_NO) == admit_answer(k, h, f, true, false);
+        c = c + 1;
+    }
+}
+
+test a_batch_answers_each_word {
+    // a pick takes a free lane, and waits when none is left
+    assert batch_answer(false, false, true, PW_PICK) == AD_GRANT;
+    assert batch_answer(false, false, false, PW_PICK) == AD_WAIT;
+    // an eligible issue that was not picked waits, even with a lane free
+    assert batch_answer(false, false, true, PW_LATER) == AD_WAIT;
+    assert batch_answer(false, false, true, PW_NO) == AD_REFUSED;
+    // a kept lane stays unless queend said no
+    assert batch_answer(true, true, false, PW_PICK) == AD_KEEP;
+    assert batch_answer(true, true, false, PW_LATER) == AD_KEEP;
+    assert batch_answer(true, true, true, PW_NO) == AD_GIVE_BACK;
+    // an issue that already holds a lane is refused whatever its word
+    assert batch_answer(false, true, true, PW_PICK) == AD_REFUSED;
+    assert batch_answer(false, true, true, PW_LATER) == AD_REFUSED;
+}
+
+test the_picks_past_the_free_lanes_wait {
+    // 70 lanes, 17 in use: 53 of 60 picks get a lane, 7 wait
+    assert batch_grants(17, 70, 60) == 53;
+    assert batch_grants(17, 70, 53) == 53;
+    assert batch_grants(17, 70, 3) == 3;
+    assert batch_grants(70, 70, 10) == 0;
+    assert batch_grants(0, 70, 0) == 0;
+}
+
+test the_walk_grants_the_quota_on_every_small_board {
+    var lanes : u32 = 0;
+    while (lanes < 9) {
+        var in_use : u32 = 0;
+        while (in_use < 11) {
+            var picks : u32 = 0;
+            while (picks < 13) {
+                assert batch_grants(in_use, lanes, picks) == new_lane_quota(lanes, in_use, picks);
+                picks = picks + 1;
+            }
+            in_use = in_use + 1;
+        }
+        lanes = lanes + 1;
+    }
+}
+
+test a_freed_lane_wakes_every_waiting_issue_into_one_batch {
+    assert batch_wake_count(69, 70, 500) == 500;
+    assert batch_wake_count(69, 70, 2000) == BATCH_ASKS_MAX;
+    assert batch_wake_count(70, 70, 500) == 0;
+    assert batch_wake_count(0, 70, 0) == 0;
+    // keyed_guard wake_count would wake one, the one that waited longest
+    assert wake_count(69, 70, 500) == 1;
+}
+
+test the_measured_round_takes_hundreds_of_chooses_serially_and_one_batched {
+    // 826 candidates, 47 free lanes, one candidate in ten is a pick
+    let serial : u64 = round_chooses(MEASURED_CANDIDATES, 47, 10, false);
+    let batched : u64 = round_chooses(MEASURED_CANDIDATES, 47, 10, true);
+    assert chooses_of(serial) == 461 and grants_of(serial) == 47;
+    assert chooses_of(batched) == 1 and grants_of(batched) == 47;
+    // nothing to pick: the serial admission asks about all 826, one by one
+    let serial_none : u64 = round_chooses(MEASURED_CANDIDATES, 47, 0, false);
+    let batched_none : u64 = round_chooses(MEASURED_CANDIDATES, 47, 0, true);
+    assert chooses_of(serial_none) == 826 and grants_of(serial_none) == 0;
+    assert chooses_of(batched_none) == 1 and grants_of(batched_none) == 0;
+    // every candidate a pick: both fill the lanes; serial asks once per lane
+    let serial_all : u64 = round_chooses(MEASURED_CANDIDATES, 47, 1, false);
+    let batched_all : u64 = round_chooses(MEASURED_CANDIDATES, 47, 1, true);
+    assert chooses_of(serial_all) == 47 and grants_of(serial_all) == 47;
+    assert chooses_of(batched_all) == 1 and grants_of(batched_all) == 47;
+    // more candidates than a batch holds, too few picks in the first: a second choose
+    let two : u64 = round_chooses(1500, 300, 5, true);
+    assert chooses_of(two) == 2 and grants_of(two) == 300;
+    // the second choose counts only the candidates left: 205 picks in the first 1024, 95 in the
+    // last 476, so 300 of 400 lanes, not 400
+    let rest : u64 = round_chooses(1500, 400, 5, true);
+    assert chooses_of(rest) == 2 and grants_of(rest) == 300;
+    // no free lane: no choose at all
+    assert round_chooses(MEASURED_CANDIDATES, 0, 10, true) == 0;
+    assert round_chooses(MEASURED_CANDIDATES, 0, 10, false) == 0;
+}
+
+test an_ask_outlasts_two_chooses {
+    assert ask_wait_ms(12000) == 24000;
+    assert ask_bound_ok(30000, 12000) == true;
+    assert ask_bound_ok(30000, 15000) == false;
+    assert ask_bound_ok(30001, 15000) == true;
+    // an unbounded choose (askQueend at 42042a5) never fits
+    assert ask_bound_ok(30000, 0) == false;
+    // no overflow at the top of u32
+    assert ask_bound_ok(4294967295, 4294967295) == false;
+    assert ask_wait_ms(4294967295) == 8589934590;
+}
+
+test a_choose_that_ended_without_an_answer_moves_no_lane {
+    assert word_after_choose(true, PW_PICK) == PW_PICK;
+    assert word_after_choose(true, PW_NO) == PW_NO;
+    assert word_after_choose(false, PW_PICK) == PW_LATER;
+    assert word_after_choose(false, PW_NO) == PW_LATER;
+    assert batch_answer(false, false, true, word_after_choose(false, PW_PICK)) == AD_WAIT;
+    assert batch_answer(true, true, true, word_after_choose(false, PW_NO)) == AD_KEEP;
+}
+
+; --- Invariants --------------------------------------------------------------------------------------
+
+invariant the_words_never_move {
+    assert PW_PICK == 0 and PW_LATER == 1 and PW_NO == 2;
+}
+
+invariant one_choose_holds_a_measured_round {
+    assert BATCH_ASKS_MAX >= MEASURED_CANDIDATES;
+    assert chooses_for(MEASURED_CANDIDATES) == 1;
+}
+
+invariant a_batch_answer_is_never_another_ask {
+    var c : u32 = 0;
+    while (c < 24) {
+        let k : bool = (c & 4) != 0;
+        let h : bool = (c & 2) != 0;
+        let f : bool = (c & 1) != 0;
+        let w : u8 = (c / 8) as u8;
+        let a : u8 = batch_answer(k, h, f, w);
+        assert a != AD_ASK;
+        assert a == AD_GRANT or a == AD_KEEP or a == AD_WAIT or a == AD_REFUSED or a == AD_GIVE_BACK;
+        // only a pick takes a new lane
+        if (a == AD_GRANT) { assert w == PW_PICK and k == false; }
+        c = c + 1;
+    }
+}
+
+invariant a_batch_grants_its_quota_and_no_more {
+    // the full sweep is test the_walk_grants_the_quota_on_every_small_board: an invariant is
+    // evaluated at comptime, which bounds its loops
+    assert batch_grants(17, 70, 60) == new_lane_quota(70, 17, 60);
+    assert batch_grants(70, 70, 5) == new_lane_quota(70, 70, 5);
+    assert batch_grants(3, 4, 5) == new_lane_quota(4, 3, 5);
+}
+
+invariant the_measured_starts_were_about_nine_times_apart {
+    assert STARTS_LOOP_TENTHS / STARTS_SERIAL_TENTHS == 9;
+}
+
+invariant the_bounds_this_card_sets_fit {
+    assert ask_bound_ok(ASK_BOUND_MS, CHOOSE_BOUND_MS);
+}
