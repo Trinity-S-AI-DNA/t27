@@ -165,46 +165,6 @@ pub async fn set_service_variables(
     Ok(())
 }
 
-/// Delete a Railway service
-///
-/// # Arguments
-/// * `service_id` - ID of the Railway service to delete
-/// * `railway_token` - Railway API token for authentication
-pub async fn delete_railway_service(
-    service_id: &str,
-    railway_token: &str,
-) -> Result<()> {
-    let client = Client::new();
-
-    let mutation = format!(
-        r#"mutation {{
-            serviceDelete(input: {{ id: "{}" }}) {{
-                id
-            }}
-        }}"#,
-        service_id
-    );
-
-    let resp = client.post(RAILWAY_GRAPHQL)
-        .header("Authorization", format!("Bearer {}", railway_token))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({"query": mutation}))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "Unable to read body".to_string());
-        return Err(anyhow::anyhow!(
-            "Failed to delete Railway service: {} - {}",
-            status,
-            body
-        ));
-    }
-
-    Ok(())
-}
-
 /// Get the health status of a Railway service
 ///
 /// # Arguments

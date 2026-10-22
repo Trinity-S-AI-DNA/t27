@@ -1,18 +1,5 @@
 //! `t27b`: t27's own native backend (MVP), command line.
-//!
-//! ```text
-//! t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-//! t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
-//! t27b asm    <file.t27> [--overflow trap|wrap]
-//! t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
-//!                   [--json <path>] [--runner "<cmd> [args]"]
-//!                   [--blockers [--reference <t27c> [--reference-cache <file>]
-//!                                [--reference-timeout-ms N]]]
-//! ```
-//!
-//! Exit codes: 0 success; 1 a test failed; 2 unsupported construct;
-//! 3 front-end (parse or typecheck) error; 4 JIT and interpreter disagree
-//! (`--check`); 5 code generation limit; 64 usage; 74 I/O error.
+//! Usage and exit codes: specs/tri/t27b/usage.t27 (`t27b help`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -25,9 +12,8 @@ use t27b::eval::{Interp, Stop};
 use t27b::ir::{OverflowMode, Program, Ty};
 use t27b::jit::Jit;
 use t27b::timing::Phases;
-#[path = "../../../gen/rust/tri/t27b/check_budget.rs"]
-#[allow(dead_code, unused_parens)]
-mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
+#[path = "../../../gen/rust/tri/t27b/check_budget.rs"] #[allow(dead_code, unused_parens)] mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
+#[path = "../../../gen/rust/tri/t27b/watch_build.rs"] #[allow(dead_code, unused_parens)] mod watch_build; // `t27b watch`: when to build, the temp path, when --then runs (#10859)
 use t27b::blockers::{self, Reference, Verdicts};
 use t27b::{a64, front, lower, macho};
 
@@ -63,44 +49,18 @@ macro_rules! errln {
     }};
 }
 
-const USAGE: &str = "usage:
-  t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
-  t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
-  t27b asm    <file.t27> [--overflow trap|wrap]
-  t27b verilog <file.t27>   (the module, and its test bench under `ifdef T27B_TESTBENCH)
-  t27b ts      <file.t27>   (consts, scalar fns and tests as TypeScript; specs/tri/t27b/ts_emit.t27)
-  t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
-                    [--json <path>] [--runner \"<cmd> [args]\"]
-                    [--blockers [--reference <t27c> [--reference-cache <file>]
-                                 [--reference-timeout-ms N]]]
+#[path = "../../../gen/rust/tri/t27b/usage.rs"] #[allow(dead_code)] mod usage; use usage::T27B_USAGE as USAGE; // the usage text, t27c gen-rust of specs/tri/t27b/usage.t27
 
-  --elf        build: an ELF64 object for aarch64 Linux (specs/tri/t27b/elf.t27), the default on
-               Linux; --macho: a Mach-O object for arm64 macOS, the default elsewhere
-  --json       corpus: also write per-file results and totals to <path> as JSON
-               (with --reference, the reference verdicts too)
-  --runner     corpus: start each per-file `t27b test` as `<cmd> [args] <t27b> test ...`,
-               e.g. --runner \"qemu-aarch64 -L /usr/aarch64-linux-gnu\" when the corpus
-               itself runs under qemu-user without binfmt_misc
-  --blockers   test: report every unsupported construct, not just the first.
-               corpus: per file, every construct t27b lacks; then the greedy
-               order in which supporting them unlocks the most whole files.
-  --reference  corpus: also run the reference path (`<t27c> test-report`,
-               t27c's Zig backend) on every file, and leave the files it fails
-               out of the denominator. Where both sides ran a file's tests,
-               compare them test by test: `reference_disagree` counts files
-               where a test's verdict differs or only one side has it (#6441).
-               `mismatch` (= `jit_interp_mismatch`) is t27b's JIT against
-               t27b's own interpreter, not against the reference.";
-
+#[derive(Clone)]
 struct Opts {
+    then: Option<String>,
     cmd: String,
     input: Option<String>,
     out: Option<String>,
     mode: OverflowMode,
     time: bool,
     quiet: bool,
-    check: bool,
-    list: bool,
+    check: bool, list: bool, top: String,
     timeout_ms: u64,
     jobs: usize,
     json: Option<String>,
@@ -125,13 +85,13 @@ fn parse_args() -> Result<Opts, String> {
     let cmd = args.next().ok_or("missing command")?;
     let mut o = Opts {
         cmd,
+        then: None,
         input: None,
         out: None,
         mode: OverflowMode::Trap,
         time: false,
         quiet: false,
-        check: false,
-        list: false,
+        check: false, list: false, top: String::new(),
         timeout_ms: 10_000,
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         json: None,
@@ -152,10 +112,12 @@ fn parse_args() -> Result<Opts, String> {
                     _ => return Err("--overflow takes trap or wrap".into()),
                 }
             }
+            "--then" => o.then = Some(args.next().ok_or("--then needs a command")?),
             "--time" => o.time = true,
             "--quiet" | "-q" => o.quiet = true,
             "--check" => o.check = true,
             "--list" => o.list = true,
+            "--top" => o.top = args.next().ok_or("--top needs a fn name")?,
             "--blockers" => o.blockers = true,
             "--elf" => o.elf = true,
             "--macho" => o.elf = false,
@@ -226,12 +188,14 @@ fn main() -> ExitCode {
                 Err(code) => ExitCode::from(code),
             }
         }
+        "watch" => cmd_watch(&o),
         "corpus" => {
             let Some(dir) = o.input.clone() else {
                 return usage("missing directory");
             };
             cmd_corpus(Path::new(&dir), &o)
         }
+        "--version" | "-V" => { outln!("t27b {}\nbuild {} commit {}", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").unwrap_or("0"), option_env!("T27_COMMIT").unwrap_or("unknown")); ExitCode::SUCCESS }
         "help" | "--help" | "-h" => {
             outln!("{}", USAGE);
             ExitCode::SUCCESS
@@ -269,7 +233,7 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
         return Err(EXIT_FRONTEND);
     }
     if o.cmd == "verilog" || o.cmd == "ts" {
-        return Err(lower::verilog(&parsed.ast, o.cmd == "ts").map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
+        return Err(lower::verilog(&parsed.ast, o.cmd == "ts", &o.top).map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
     }
     if o.blockers {
         // Every unsupported construct, not just the first; a file with none
@@ -499,6 +463,37 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         errln!("t27b code: __text {} bytes, object {} bytes", words * 4, obj.len());
     }
     ExitCode::SUCCESS
+}
+
+/// `t27b watch` (#10859): I/O only; when to build, the temp path and when --then runs are watch_build.t27.
+fn cmd_watch(o: &Opts) -> ExitCode {
+    let (Some(input), Some(out)) = (o.input.clone(), o.out.clone()) else { return usage("watch needs <file.t27> -o <out.o>") };
+    let (tmp, ms) = (format!("{}{}", out, watch_build::WATCH_TMP_SUFFIX), |t: Instant| t.elapsed().as_millis().min(u32::MAX as u128) as u32);
+    let stamp = |p: &PathBuf| std::fs::metadata(p).and_then(|m| Ok((m.modified()?, m.len()))).ok();
+    let (mut files, mut seen, mut first, mut last, mut opened) = (Vec::<PathBuf>::new(), Vec::new(), true, Instant::now(), None::<Instant>);
+    loop {
+        let now: Vec<_> = files.iter().map(stamp).collect();
+        if now != seen { (seen, last) = (now, Instant::now()); opened.get_or_insert(last); }
+        let (quiet, waited) = (ms(last), opened.map_or(0, ms));
+        if watch_build::watch_build_now(first, opened.is_some(), quiet, waited) {
+            (first, opened, files) = (false, None, use_closure(Path::new(&input)));
+            seen = files.iter().map(stamp).collect(); // stats before the build: a save during it is seen next look
+            let _ = std::fs::remove_file(&tmp);
+            let ok = compile_front(&input, o).map(|(prog, mut ph)| cmd_build(&prog, &mut ph, &Opts { out: Some(tmp.clone()), ..o.clone() })).is_ok() && Path::new(&tmp).exists();
+            if watch_build::watch_publish(ok) && std::fs::rename(&tmp, &out).is_ok() { errln!("t27b watch: built {} ({} files)", out, files.len()); }
+            if watch_build::watch_run_then(ok, o.then.is_some()) { errln!("t27b watch: then exited {:?}", Command::new("sh").arg("-c").arg(o.then.as_deref().unwrap_or("")).status().ok().and_then(|s| s.code())); }
+        }
+        std::thread::sleep(Duration::from_millis(watch_build::watch_sleep_ms(opened.is_some(), quiet, waited) as u64));
+    }
+}
+fn use_closure(input: &Path) -> Vec<PathBuf> { // the spec and every spec its `use` lines reach (t27c's resolver)
+    let root = input.ancestors().find(|a| a.ends_with("specs")).map(Path::to_path_buf).unwrap_or_default();
+    let (mut files, mut i) = (vec![input.to_path_buf()], 0);
+    while let Some(f) = files.get(i).cloned() {
+        for t in t27b::use_resolve::use_edges(&std::fs::read_to_string(f).unwrap_or_default(), &root) { if !files.contains(&t) { files.push(t) } }
+        i += 1;
+    }
+    files
 }
 
 fn cmd_asm(prog: &Program) -> ExitCode {
@@ -744,20 +739,17 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             cmd: String::new(),
             input: None,
             out: None,
-            mode: o.mode,
             time: false,
             quiet: true,
             check: true,
             list: false,
-            timeout_ms: o.timeout_ms,
             jobs: 1,
             json: None,
-            runner: o.runner.clone(),
-            blockers: o.blockers,
             elf: false,
             reference: None,
             reference_cache: None,
             reference_timeout_ms: 0,
+            ..o.clone() // mode, timeout_ms, runner, blockers
         };
         handles.push(std::thread::spawn(move || loop {
             let i = {

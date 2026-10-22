@@ -1100,6 +1100,9 @@ ENV_ZAI_FILE = "BEE_ZAI_ENV_FILE"
 # ZAI_KEY_1.. (~/.claude/.env) and ZAI_API_KEY, ZAI_API_KEY_2.. (the Queen's pool
 # names). Not ZAI_API: on this machine that one is the endpoint URL.
 ZAI_KEY_RE = re.compile(r"ZAI_(?:API_)?KEY(?:_(\d+))?")
+# The Queen's lease route and its token (specs/queen/key_vault.t27, #10564): with both set the agent
+# calls her store and holds no z.ai key; a z.ai key kept here beside them is refused (consumer_start).
+ENV_LEASE_URL, ENV_LEASE_TOKEN = "BEE_QUEEN_LEASE_URL", "BEE_QUEEN_LEASE_TOKEN"
 # Another provider's login or model choice would route the agent past z.ai, or
 # past the Keychain token: the agent gets exactly the provider set here.
 PROVIDER_STRIP = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -1150,9 +1153,19 @@ def zai_keys(env=None, env_file=None):
     return keys
 
 
+def queen_lease(env=None, env_file=None):
+    """(url, token) of the Queen's lease route, environment first, then the dotenv; None if unset."""
+    env = os.environ if env is None else env
+    path = pathlib.Path(env_file or env.get(ENV_ZAI_FILE) or ZAI_ENV_FILE)
+    got = dict(env_file_pairs(path)) if path.is_file() else {}
+    got.update({k: v for k, v in env.items() if k in (ENV_LEASE_URL, ENV_LEASE_TOKEN) and v})
+    url, token = got.get(ENV_LEASE_URL), got.get(ENV_LEASE_TOKEN)
+    return (url, token) if url and token else None
+
+
 def agent_env(env=None):
     env = dict(os.environ if env is None else env)
-    for k in STRIP_ENV + PROVIDER_STRIP:
+    for k in STRIP_ENV + PROVIDER_STRIP + (ENV_LEASE_TOKEN,):
         env.pop(k, None)
     for k in [k for k in env if ZAI_KEY_RE.fullmatch(k)]:
         env.pop(k)   # the agent gets one key, as ANTHROPIC_AUTH_TOKEN, not the pool
@@ -1215,11 +1228,21 @@ class Agent:
         self.pool = KeyPool(keys)
         self.claude_token = claude_token
         self.runner = runner or run_agent
+        self.base_url = ZAI_BASE_URL
 
     @classmethod
     def configured(cls, provider, model=None):
         if provider == "zai":
-            keys = zai_keys()
+            keys, lease = zai_keys(), queen_lease()
+            if lease and keys:   # key_vault.t27 consumer_start: two homes for one key
+                raise AgentUnavailable(f"{len(keys)} z.ai key(s) kept here beside the Queen's lease: move them "
+                                       "into her store, then delete them here (specs/queen/key_vault.t27)")
+            if lease:
+                agent = cls("zai", model, keys=[lease[1]])
+                agent.base_url = lease[0]
+                return agent
+            if keys:
+                log(f"running on {len(keys)} private z.ai key(s) outside the Queen's store (key_vault.t27)")
             if not keys:
                 raise AgentUnavailable("no z.ai key found. " + HINT["zai"])
             return cls("zai", model, keys=keys)
@@ -1229,7 +1252,7 @@ class Agent:
     def env(self, key=None, base=None):
         env = agent_env(base)
         if self.provider == "zai":
-            env.update({"ANTHROPIC_BASE_URL": ZAI_BASE_URL, "ANTHROPIC_AUTH_TOKEN": key,
+            env.update({"ANTHROPIC_BASE_URL": self.base_url, "ANTHROPIC_AUTH_TOKEN": key,
                         # any background call the CLI makes goes to the same free model
                         "ANTHROPIC_SMALL_FAST_MODEL": self.model,
                         "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.model,
@@ -1246,7 +1269,7 @@ class Agent:
         """The same provider, keys and runner on another model, with no fallback:
         a fallback could land the second opinion on the first one's model."""
         t = Agent(self.provider, model, claude_token=self.claude_token, runner=self.runner)
-        t.pool, t.fallback = self.pool, None
+        t.pool, t.fallback, t.base_url = self.pool, None, self.base_url
         return t
 
     def run(self, argv, cwd, timeout, key=None):
@@ -2322,8 +2345,9 @@ def doctor_findings(fix=False, launchd=launchd_job, now=None, version=claude_ver
         "the installed copy imports the Queen's criterion gate" if probe.returncode == 0 else
         "the installed copy cannot import the criterion gate, so it measures nothing: "
         + (probe.stderr.strip().splitlines() or ["?"])[-1][:160])
-    keys = zai_keys()
-    add("ok" if keys else "fail", "keys", f"{len(keys)} z.ai key(s) in the pool (names only, never values)")
+    keys, lease = zai_keys(), queen_lease()
+    add("fail" if keys and lease else "ok" if lease else "warn" if keys else "fail", "keys",
+        f"{len(keys)} private z.ai key(s), Queen lease {'set' if lease else 'unset'} (key_vault.t27; names only)")
     t27c = find_t27c()
     add("ok" if t27c else "warn", "t27c", t27c or "none: every criterion that calls t27c is unrunnable")
     level, text, repaired = tamper_check(read_tamper(), version(), tamper if fix else None)
@@ -2785,6 +2809,10 @@ def self_test():
     check("z.ai keys: the file is named by BEE_ZAI_ENV_FILE",
           zai_keys({ENV_ZAI_FILE: str(tmp / "env")}) == ["one", "two", "ten"])
     check("z.ai keys: none is an empty list", zai_keys({}, tmp / "missing") == [])
+    lease = {ENV_LEASE_URL: "https://q.test/zai", ENV_LEASE_TOKEN: "lt"}
+    check("queen lease: both names or none, and the agent never sees its token",
+          queen_lease(lease, tmp / "env") == ("https://q.test/zai", "lt") and queen_lease({ENV_LEASE_URL: "u"},
+          tmp / "missing") is None and ENV_LEASE_TOKEN not in agent_env(lease))
     shutil.rmtree(tmp, ignore_errors=True)
 
     pool = KeyPool(["a", "b", "c"])
