@@ -1,1069 +1,452 @@
 // SPDX-License-Identifier: Apache-2.0
 // t27/specs/ml/optimizer/adamw.t27
-// AdamW - Adam with decoupled weight decay and φ-optimizations | φ² + 1/φ² = 3 | TRINITY
+// AdamW - Adam with decoupled weight decay | phi^2 + 1/phi^2 = 3 | TRINITY
+
+// Why this file was rewritten (epic gHashTag/t27#10024, own_model cell 24):
+//
+//   Before: 1100 lines whose function bodies were comments, a second copy of every
+//   declaration under a _V1 suffix, tests that were prose (`then elapsed_time_ns < 10`),
+//   and `init_v1` calling `allocate_array`, which t27c does not have. On the Railway lab
+//   `t27c test-report` answered BLOCKED: undeclared identifier 'allocate_array'. Removing
+//   that call alone was not enough: the next error was in the prose tests.
+//
+//   Now: AdamW as arithmetic that runs, in the shape of adam.t27 (#8980), with the three
+//   moment buffers (first moment m, second moment v, AMSGrad maximum x) living in ONE
+//   caller-owned f32 array at offsets. Where the offsets come from is the caller's choice:
+//   a fixed array, or ml/arena_heap.t27, which is the t27 answer to "no heap": a bump
+//   allocator over that array. `state_alloc` below is the arena path.
+//
+// What was dropped, and why (nothing true was lost, and nothing here pretends to keep it):
+//   - the GF16 types: gf16 arithmetic had no working bodies behind them; this is f32.
+//   - the _V1 duplicate block and its benches: every body was a comment.
+//   - run_adamw / b1_control_ablation_produces_distinct_bpb: needs a trainer and a data
+//     set, not an optimizer. The four arms stay as variant_config(0..3); the experiment
+//     itself belongs to the trainer spec, and its falsification rule (a phi-free control
+//     matching the phi arm within Monte-Carlo error on equal budget FALSIFIES phi
+//     specificity) is kept verbatim below.
+//
+// Non-claims: this proves the update rule on small exact cases and a quadratic. It does not
+// say AdamW trains an HSLM; it does not say any phi value is better than a control.
 
 module AdamW;
-    use base::types;
-    use math::constants;
-    use numeric::gf16;
+use base::types;
+use math::constants;
+use ml::optimizer::adam;
+use ml::arena_heap;
 
-    // ═══════════════════════════════════════════════════════════
-    // 1. Constants
-    // ═══════════════════════════════════════════════════════════
+// ---- constants ----
 
-    const PHI : gf16::GF16 = 1.618033988749895;
-    const DEFAULT_LEARNING_RATE : gf16::GF16 = 1e-3;
-    const DEFAULT_BETA1 : gf16::GF16 = 0.9;
-    const DEFAULT_BETA2 : gf16::GF16 = 0.999;
-    const PHI_BETA1 : gf16::GF16 = 0.9 / PHI; // ≈ 0.556, φ-damped beta1
-    const PHI_BETA2 : gf16::GF16 = 0.999 / PHI; // ≈ 0.617, φ-damped beta2
-    const DEFAULT_WEIGHT_DECAY : gf16::GF16 = 0.01;
-    const DEFAULT_EPSILON : gf16::GF16 = 1e-8;
-    const DEFAULT_AMSGRAD : bool = false;
+// Standard AdamW defaults (Kingma and Ba 2015; Loshchilov and Hutter 2019)
+const DEFAULT_LEARNING_RATE : f32 = 0.001;
+const DEFAULT_BETA1 : f32 = 0.9;
+const DEFAULT_BETA2 : f32 = 0.999;
+const DEFAULT_WEIGHT_DECAY : f32 = 0.01;
+const DEFAULT_EPSILON : f32 = 0.00000001;
 
-    // ═══════════════════════════════════════════════════════════
-    // 2. Types
-    // ═══════════════════════════════════════════════════════════
+// phi anchors. [Open conjecture]: no momentum theory singles out phi. The only verified
+// phi fact here is the identity phi^2 + phi^-2 = 3 (Law L5), tested below.
+const PHI : f32 = 1.618033988749895;
+const PHI_INV : f32 = 0.618033988749895;
+const PHI_INV_CUBED : f32 = 0.23606797749979;
+const PHI_DAMPED_BETA1 : f32 = 0.5562305898749055;
+const PHI_DAMPED_BETA2 : f32 = 0.617415954761145;
 
-    pub const AdamWConfig = struct {
-        learning_rate : gf16::GF16,        // η: step size
-        beta1 : gf16::GF16,                // β₁: first moment decay
-        beta2 : gf16::GF16,                // β₂: second moment decay
-        weight_decay : gf16::GF16,         // λ: decoupled weight decay
-        epsilon : gf16::GF16,              // ε: numerical stability
-        amsgrad : bool,             // Use AMSGrad variant
-        use_phi_betas : bool,       // Use φ-damped β₁, β₂
-    };
+// Control arm: non-Fibonacci rationals of comparable description cost (4 and 7 and 30 are
+// outside {1, 2, 3, 5, 8, 13, 21, ...}); 5/8 was rejected as phi-biased.
+const RATIONAL_BETA1 : f32 = 0.5714285714285714;
+const RATIONAL_WEIGHT_DECAY : f32 = 0.2333333333333333;
 
-    pub const AdamWState = struct {
-        m : []gf16::GF16,                  // First moment (moving average of gradients)
-        v : []gf16::GF16,                  // Second moment (moving average of squared gradients)
-        v_max : []gf16::GF16,              // Max of v (for AMSGrad)
-        param_count : u32,          // Number of parameters
-        step : u64,                 // Current optimization step (t)
-    };
+// The four ablation arms of Phase B1 (epic #181). Codes, not an enum, so the tests stay plain.
+const VARIANT_CANONICAL : i32 = 0;
+const VARIANT_DAMPED : i32 = 1;
+const VARIANT_TUNED_STD : i32 = 2;
+const VARIANT_RANDOM_RAT : i32 = 3;
 
-    pub const OptimizerStepResult = struct {
-        updated_params : []gf16::GF16,     // New parameter values
-        m : []gf16::GF16,                  // Updated first moments
-        v : []gf16::GF16,                  // Updated second moments
-        step_norm : gf16::GF16,            // L2 norm of the parameter update
-    };
+// ---- types ----
 
-    // ═══════════════════════════════════════════════════════════
-    // 3. Core Functions
-    // ═══════════════════════════════════════════════════════════
+pub const AdamWConfig = struct {
+    learning_rate : f32,
+    beta1 : f32,
+    beta2 : f32,
+    weight_decay : f32,
+    epsilon : f32,
+    amsgrad : bool,
+};
 
-    // init(config: AdamWConfig, param_count: u32) → AdamWState
-    // Initializes AdamW state with zero moments.
-    fn init(config: AdamWConfig, param_count: u32) -> AdamWState {
-        // m[i] = 0.0 for all i
-        // v[i] = 0.0 for all i
-        // v_max[i] = 0.0 for all i (if amsgrad)
-        // step = 0
+/// Offsets of the three moment buffers inside one backing array. code is ARENA_OK (0) or the
+/// arena's error; on an error the offsets are ARENA_NO_OFFSET and the arena is the one that
+/// went in.
+pub const AdamWState = struct {
+    arena : Arena,
+    m_off : i32,
+    v_off : i32,
+    x_off : i32,
+    code : i32,
+};
+
+/// One parameter, its three moments, and whether the step was applied. Test scaffolding.
+pub const Probe = struct {
+    p : f32,
+    m : f32,
+    v : f32,
+    x : f32,
+    ok : bool,
+};
+
+// ---- configuration ----
+
+/// Variant 0 canonical (beta1 = 1/phi, wd = phi^-3), 1 damped (0.9/phi, 0.01),
+/// 2 tuned standard (0.9, 0.01), 3 random rational (4/7, 7/30). Any other code is the
+/// standard arm, the one a typo cannot make exotic. beta2 is 0.999 in every arm.
+pub fn variant_config(variant: i32, lr: f32) -> AdamWConfig {
+    var b1 : f32 = DEFAULT_BETA1;
+    var wd : f32 = DEFAULT_WEIGHT_DECAY;
+    if (variant == VARIANT_CANONICAL) {
+        b1 = PHI_INV;
+        wd = PHI_INV_CUBED;
     }
-
-    // step(state: AdamWState, params: []gf16::GF16, grads: []gf16::GF16) → OptimizerStepResult
-    // Performs one AdamW optimization step.
-    fn step(state: AdamWState, params: []gf16::GF16, grads: []gf16::GF16) -> OptimizerStepResult {
-        // t = step + 1
-        // bias_correction1 = 1 - β₁^t
-        // bias_correction2 = 1 - β₂^t
-        // lr_t = lr * √(bias_correction2) / bias_correction1
-        //
-        // Apply weight decay (decoupled):
-        //   params[i] = params[i] * (1 - lr * weight_decay)
-        //
-        // Update moments:
-        //   m_t = β₁ * m_{t-1} + (1 - β₁) * g_t
-        //   v_t = β₂ * v_{t-1} + (1 - β₂) * g_t²
-        //
-        // If amsgrad:
-        //   v_max_t = max(v_max_{t-1}, v_t)
-        //   denominator = √(v_max_t) + ε
-        // else:
-        //   denominator = √(v_t) + ε
-        //
-        // Update parameters:
-        //   params[i] = params[i] - lr_t * m_t / denominator
+    if (variant == VARIANT_DAMPED) {
+        b1 = PHI_DAMPED_BETA1;
     }
-
-    // compute_bias_correction(beta: gf16::GF16, t: u64) → f32
-    // Computes bias correction factor.
-    fn compute_bias_correction(beta: gf16::GF16, t: u64) -> gf16::GF16 {
-        // return 1 - pow(beta, t)
+    if (variant == VARIANT_RANDOM_RAT) {
+        b1 = RATIONAL_BETA1;
+        wd = RATIONAL_WEIGHT_DECAY;
     }
+    return AdamWConfig{ .learning_rate = lr, .beta1 = b1, .beta2 = DEFAULT_BETA2, .weight_decay = wd, .epsilon = DEFAULT_EPSILON, .amsgrad = false };
+}
 
-    // update_first_moment(m_prev: gf16::GF16, grad: gf16::GF16, beta1: gf16::GF16) → f32
-    // Updates first moment estimate.
-    fn update_first_moment(m_prev: gf16::GF16, grad: gf16::GF16, beta1: gf16::GF16) -> gf16::GF16 {
-        // return beta1 * m_prev + (1 - beta1) * grad
+pub fn plain_config(lr: f32, wd: f32, amsgrad: bool) -> AdamWConfig {
+    return AdamWConfig{ .learning_rate = lr, .beta1 = DEFAULT_BETA1, .beta2 = DEFAULT_BETA2, .weight_decay = wd, .epsilon = DEFAULT_EPSILON, .amsgrad = amsgrad };
+}
+
+// ---- state in an arena ----
+
+/// Take m, v and x (n slots each) from the arena, all three or none, zeroed in the backing
+/// array. When the third does not fit, the arena and the backing array are as they came in.
+pub fn state_alloc(a: Arena, backing: []f32, n: i32) -> AdamWState {
+    const r1 : AllocResult = arena_alloc(a, n, 1);
+    if (r1.code != ARENA_OK) {
+        return AdamWState{ .arena = a, .m_off = ARENA_NO_OFFSET, .v_off = ARENA_NO_OFFSET, .x_off = ARENA_NO_OFFSET, .code = r1.code };
     }
-
-    // update_second_moment(v_prev: gf16::GF16, grad: gf16::GF16, beta2: gf16::GF16) -> gf16::GF16
-    // Updates second moment estimate.
-    fn update_second_moment(v_prev: gf16::GF16, grad: gf16::GF16, beta2: gf16::GF16) -> gf16::GF16 {
-        // return beta2 * v_prev + (1 - beta2) * grad * grad
+    const r2 : AllocResult = arena_alloc(r1.arena, n, 1);
+    if (r2.code != ARENA_OK) {
+        return AdamWState{ .arena = a, .m_off = ARENA_NO_OFFSET, .v_off = ARENA_NO_OFFSET, .x_off = ARENA_NO_OFFSET, .code = r2.code };
     }
-
-    // apply_weight_decay(params: []gf16::GF16, lr: gf16::GF16, weight_decay: gf16::GF16) → []gf16::GF16
-    // Applies decoupled weight decay to parameters.
-    fn apply_weight_decay(params: []gf16::GF16, lr: gf16::GF16, weight_decay: gf16::GF16) -> []gf16::GF16 {
-        // params[i] = params[i] * (1 - lr * weight_decay)
+    const r3 : AllocResult = arena_alloc(r2.arena, n, 1);
+    if (r3.code != ARENA_OK) {
+        return AdamWState{ .arena = a, .m_off = ARENA_NO_OFFSET, .v_off = ARENA_NO_OFFSET, .x_off = ARENA_NO_OFFSET, .code = r3.code };
     }
+    fill_slots(backing, r1.offset, n, 0.0);
+    fill_slots(backing, r2.offset, n, 0.0);
+    fill_slots(backing, r3.offset, n, 0.0);
+    return AdamWState{ .arena = r3.arena, .m_off = r1.offset, .v_off = r2.offset, .x_off = r3.offset, .code = ARENA_OK };
+}
 
-    // compute_update(m: gf16::GF16, v: gf16::GF16, lr_t: gf16::GF16, epsilon: gf16::GF16) → f32
-    // Computes parameter update from moments.
-    fn compute_update(m: gf16::GF16, v: gf16::GF16, lr_t: gf16::GF16, epsilon: gf16::GF16) -> gf16::GF16 {
-        // return lr_t * m / (sqrt(v) + epsilon)
+// ---- the update ----
+
+/// One AdamW step number t (1-based) over params. mom holds m at m_off, v at v_off and the
+/// AMSGrad maximum at x_off, each params.len slots.
+///   p = p (1 - lr wd)                                 decay, decoupled: never enters m or v
+///   m = b1 m + (1 - b1) g       v = b2 v + (1 - b2) g^2
+///   x = max(x, v)                                     only when amsgrad
+///   m_hat = m / (1 - b1^t)      v_hat = (amsgrad ? x : v) / (1 - b2^t)
+///   p = p - lr m_hat / (sqrt(v_hat) + eps)
+/// Returns false and changes nothing when t is 0 or a gradient is NaN or infinite.
+pub fn adamw_step(params: []f32, grads: []const f32, mom: []f32, m_off: i32, v_off: i32, x_off: i32, t: u32, c: AdamWConfig) -> bool {
+    if (t == 0) {
+        return false;
     }
-
-    // get_effective_beta(config: AdamWConfig, beta_type: "beta1" | "beta2") → f32
-    // Returns effective β with φ-damping if enabled.
-    fn get_effective_beta(config: AdamWConfig, beta_type: []const u8) -> gf16::GF16 {
-        // if not use_phi_betas: return corresponding config beta
-        // if beta_type == "beta1": return PHI_BETA1
-        // else: return PHI_BETA2
-    }
-
-    // amsgrad_update(v: gf16::GF16, v_max: gf16::GF16) → f32
-    // Computes AMSGrad maximum tracking.
-    fn amsgrad_update(v: gf16::GF16, v_max: gf16::GF16) -> gf16::GF16 {
-        // return max(v_max, v)
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // TDD: Tests
-    // ═══════════════════════════════════════════════════════════
-
-    test init_creates_zero_moments
-        given config = AdamWConfig{.learning_rate = 1e-3, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.01, .epsilon = 1e-8, .amsgrad = false, .use_phi_betas = false}
-        when state = init(config, 10)
-        then state.m.len == 10
-        and   state.v.len == 10
-        and   all(state.m, is_zero)
-        and   all(state.v, is_zero)
-        and   state.step == 0
-
-    test init_with_amsgrad_creates_v_max
-        given config = AdamWConfig{.amsgrad = true}
-        when state = init(config, 10)
-        then state.v_max.len == 10
-        and   all(state.v_max, is_zero)
-
-    test compute_bias_correction_first_step
-        given beta = 0.9
-        and   t = 1
-        when result = compute_bias_correction(beta, t)
-        then approximately_equal(result, 0.1)
-
-    test compute_bias_correction_later_steps
-        given beta = 0.9
-        and   t = 10
-        when result = compute_bias_correction(beta, t)
-        then result < 1.0
-        and   result > 0.0
-
-    test update_first_momentum_basic
-        given m_prev = 0.0
-        and   grad = 1.0
-        and   beta1 = 0.9
-        when result = update_first_moment(m_prev, grad, beta1)
-        then approximately_equal(result, 0.1) // 0.9 * 0 + 0.1 * 1
-
-    test update_first_momentum_with_history
-        given m_prev = 0.5
-        and   grad = 1.0
-        and   beta1 = 0.9
-        when result = update_first_moment(m_prev, grad, beta1)
-        then approximately_equal(result, 0.9 * 0.5 + 0.1)
-
-    test update_second_momentum_basic
-        given v_prev = 0.0
-        and   grad = 2.0
-        and   beta2 = 0.999
-        when result = update_second_moment(v_prev, grad, beta2)
-        then approximately_equal(result, 0.001 * 4.0) // 0.999 * 0 + 0.001 * 4
-
-    test compute_update_basic
-        given m = 0.1
-        and   v = 0.01
-        and   lr_t = 0.001
-        and   epsilon = 1e-8
-        when result = compute_update(m, v, lr_t, epsilon)
-        then result > 0.0
-
-    test apply_weight_decay_reduces_parameters
-        given params = [1.0, 2.0, 3.0]
-        and   lr = 0.01
-        and   weight_decay = 0.1
-        when result = apply_weight_decay(params, lr, weight_decay)
-        then result[0] < 1.0
-        and   result[1] < 2.0
-        and   result[2] < 3.0
-
-    test step_without_weight_decay_matches_adam
-        given config = AdamWConfig{.learning_rate = 0.001, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.0}
-        and   state = init(config, 1)
-        and   params = [1.0]
-        and   grads = [0.1]
-        when result = step(state, params, grads)
-        then result.updated_params.len == 1
-
-    test step_with_weight_decay_shrinks_params
-        given config = AdamWConfig{.learning_rate = 0.01, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.1}
-        and   state = init(config, 1)
-        and   params = [1.0]
-        and   grads = [0.0] // No gradient, only weight decay
-        when result = step(state, params, grads)
-        then result.updated_params[0] < 1.0
-
-    test amsgrad_update_tracks_maximum
-        given v = 0.05
-        and   v_max = 0.03
-        when result = amsgrad_update(v, v_max)
-        then result == 0.05
-
-    test amsgrad_update_preserves_maximum
-        given v = 0.02
-        and   v_max = 0.05
-        when result = amsgrad_update(v, v_max)
-        then result == 0.05
-
-    test get_effective_beta_phi_damped
-        given config = AdamWConfig{.beta1 = 0.9, .beta2 = 0.999, .use_phi_betas = true}
-        when beta1 = get_effective_beta(config, "beta1")
-        and   beta2 = get_effective_beta(config, "beta2")
-        then approximately_equal(beta1, PHI_BETA1)
-        and   approximately_equal(beta2, PHI_BETA2)
-
-    test get_effective_beta_uses_config
-        given config = AdamWConfig{.beta1 = 0.85, .beta2 = 0.995, .use_phi_betas = false}
-        when beta1 = get_effective_beta(config, "beta1")
-        and   beta2 = get_effective_beta(config, "beta2")
-        then approximately_equal(beta1, 0.85)
-        and   approximately_equal(beta2, 0.995)
-
-    test step_increases_step_counter
-        given config = AdamWConfig{}
-        and   state = init(config, 10)
-        and   params = random_input(10)
-        and   grads = random_input(10)
-        when result = step(state, params, grads)
-        then result.step_norm >= 0.0 // Step was executed
-
-    // ═══════════════════════════════════════════════════════════
-    // TDD: Invariants
-    // ═══════════════════════════════════════════════════════════
-
-    invariant step_preserves_param_count
-        given config = any_adamw_config()
-        and   state = init(config, 100)
-        and   params = random_input(100)
-        and   grads = random_input(100)
-        when result = step(state, params, grads)
-        then result.updated_params.len == 100
-
-    invariant moments_have_same_length
-        given config = any_adamw_config()
-        and   state = init(config, 50)
-        then state.m.len == 50
-        and   state.v.len == 50
-
-    invariant first_moment_remains_bounded
-        given config = any_adamw_config()
-        and   state = init(config, 10)
-        and   params = finite_input(10)
-        and   grads = bounded_input(10, -1.0, 1.0)
-        and   result = step(state, params, grads)
-        then all(result.m, is_finite)
-
-    invariant second_moment_non_negative
-        given config = any_adamw_config()
-        and   state = init(config, 10)
-        and   params = finite_input(10)
-        and   grads = finite_input(10)
-        and   result = step(state, params, grads)
-        then all(result.v, fn(x) x >= 0.0)
-
-    invariant bias_correction_in_zero_one_range
-        given beta = random_gf16_in_range(0.0, 0.999)
-        and   t = random_u64_in_range(1, 1000)
-        when bc = compute_bias_correction(beta, t)
-        then bc >= 0.0
-        and   bc <= 1.0
-
-    invariant phi_betas_smaller_than_defaults
-        then PHI_BETA1 < DEFAULT_BETA1
-        and   PHI_BETA2 < DEFAULT_BETA2
-
-    invariant weight_decay_preserves_sign
-        given params = [-1.0, 0.0, 1.0]
-        and   lr = 0.01
-        and   weight_decay = 0.1
-        when result = apply_weight_decay(params, lr, weight_decay)
-        then result[0] < 0.0
-        and   result[2] > 0.0
-
-    invariant amsgrad_v_max_non_decreasing
-        given config = AdamWConfig{.amsgrad = true}
-        and   state = init(config, 10)
-        and   params = random_input(10)
-        and   grads = random_input(10)
-        and   result1 = step(state, params, grads)
-        and   result2 = step(state, result1.updated_params, grads)
-        then all_pairs(result1.v_max, result2.v_max, fn(a, b) b >= a)
-
-    invariant denominator_positive
-        given v = 0.0
-        and   epsilon = 1e-8
-        when denom = sqrt(v) + epsilon
-        then denom > 0.0
-
-    // ═══════════════════════════════════════════════════════════
-    // TDD: Benchmarks
-    // ═══════════════════════════════════════════════════════════
-
-    bench init_small
-        given config = any_adamw_config()
-        when result = init(config, 100)
-        then elapsed_time_us < 50
-
-    bench init_large
-        given config = any_adamw_config()
-        when result = init(config, 1000000)
-        then elapsed_time_ms < 20
-
-    bench step_small
-        given config = any_adamw_config()
-        and   state = init(config, 100)
-        and   params = random_input(100)
-        and   grads = random_input(100)
-        when result = step(state, params, grads)
-        then elapsed_time_us < 200
-
-    bench step_medium
-        given config = any_adamw_config()
-        and   state = init(config, 10000)
-        and   params = random_input(10000)
-        and   grads = random_input(10000)
-        when result = step(state, params, grads)
-        then elapsed_time_ms < 10
-
-    bench step_large
-        given config = any_adamw_config()
-        and   state = init(config, 1000000)
-        and   params = random_input(1000000)
-        and   grads = random_input(1000000)
-        when result = step(state, params, grads)
-        then elapsed_time_ms < 200
-
-    bench compute_bias_correction
-        given beta = 0.9
-        and   t = 100
-        when result = compute_bias_correction(beta, t)
-        then elapsed_time_ns < 50
-
-    bench amsgrad_update
-        given v = random_positive_gf16()
-        and   v_max = random_positive_gf16()
-        when result = amsgrad_update(v, v_max)
-        then elapsed_time_ns < 10
-
-    // ═══════════════════════════════════════════════════════════
-    // Mathematical Notes
-    // ═══════════════════════════════════════════════════════════
-    //
-    // AdamW Update Rule:
-    //   1. Apply weight decay (decoupled):
-    //      θ_t = θ_{t-1} * (1 - η * λ)
-    //
-    //   2. Update moments:
-    //      m_t = β₁ * m_{t-1} + (1 - β₁) * g_t
-    //      v_t = β₂ * v_{t-1} + (1 - β₂) * g_t²
-    //
-    //   3. Bias correction:
-    //      m̂_t = m_t / (1 - β₁^t)
-    //      v̂_t = v_t / (1 - β₂^t)
-    //
-    //   4. Parameter update:
-    //      θ_t = θ_t - η * m̂_t / (√v̂_t + ε)
-    //
-    // AMSGrad Variant:
-    //   v_max_t = max(v_max_{t-1}, v_t)
-    //   Use √v_max_t instead of √v̂_t in denominator
-    //
-    // Phi-Damped Betas:
-    //   β₁_eff = β₁ / φ ≈ 0.556 for β₁ = 0.9
-    //   β₂_eff = β₂ / φ ≈ 0.617 for β₂ = 0.999
-    //   Reduces momentum, provides smoother convergence
-    //
-    // Difference from Adam:
-    //   Adam: weight decay added to gradients before moment update
-    //   AdamW: weight decay applied directly to parameters (decoupled)
-    //
-    // ═══════════════════════════════════════════════════════════
-
-    // =====================================================================
-    // Phase B1 (epic #181) -- optimizer control ablation blocks (appended)
-    // phi-canonical (beta1=phi^-1, wd=phi^-3) vs Damped vs TunedStd vs RandomRat.
-    // All phi claims [Open conjecture]; falsification: non-phi control within MC error.
-    // =====================================================================
-
-    // =========================================================
-    // 1. Constants
-    // =========================================================
-
-    const PHI : gf16::GF16 = 1.618033988749895;
-
-    // Standard AdamW defaults (tuning convention; Kingma & Ba 2015, Loshchilov & Hutter 2019)
-    const DEFAULT_LEARNING_RATE : gf16::GF16 = 1e-3;
-    const DEFAULT_BETA1 : gf16::GF16 = 0.9;
-    const DEFAULT_BETA2 : gf16::GF16 = 0.999;
-    const DEFAULT_WEIGHT_DECAY : gf16::GF16 = 0.01;
-    const DEFAULT_EPSILON : gf16::GF16 = 1e-8;
-    const DEFAULT_AMSGRAD : bool = false;
-
-    // ---------------------------------------------------------
-    // CANONICAL phi anchor (matches igla-peek/src/optimizer.rs)
-    //   [Open conjecture] -- no momentum theory singles out phi.
-    //   beta1 = phi^(-1) ~ 0.618034
-    //   weight_decay = phi^(-3) ~ 0.236068  (NOT 0.118034; see NOTES.md)
-    //   lr_default = phi^(-3) ~ 0.236068
-    // ---------------------------------------------------------
-    const PHI_INV : gf16::GF16 = 0.618033988749895;        // phi^(-1)
-    const PHI_INV_SQ : gf16::GF16 = 0.381966011250105;     // phi^(-2)
-    const PHI_INV_CUBED : gf16::GF16 = 0.236067977499790;  // phi^(-3) = 1/(phi^3)
-    // NOTE: igla-peek/src/optimizer.rs test confirms phi^(-3) ~ 0.23607
-    // (see: assert!((expected_wd - 0.23607).abs() < 0.001))
-    // The brief's "0.118034" for phi^(-3) is a typo; 0.118034 ~ phi^(-4.44),
-    // which is not a clean phi power.
-    const PHI_CANONICAL_BETA1 : gf16::GF16 = PHI_INV;          // [Open conjecture]
-    const PHI_CANONICAL_BETA2 : gf16::GF16 = 0.999;            // unchanged (standard)
-    const PHI_CANONICAL_WEIGHT_DECAY : gf16::GF16 = PHI_INV_CUBED; // [Open conjecture]
-    const PHI_CANONICAL_LR : gf16::GF16 = PHI_INV_CUBED;       // [Open conjecture]
-
-    // ---------------------------------------------------------
-    // PHI-DAMPED variant (old PHI_BETA1 from pre-B1 spec)
-    //   [Open conjecture] -- 0.9/phi is an ad hoc rescaling with no
-    //   theoretical derivation. Kept as named comparison variant.
-    //   beta1 = 0.9 / phi ~ 0.556
-    //   beta2 = 0.999 / phi ~ 0.617 (for completeness)
-    // ---------------------------------------------------------
-    const PHI_DAMPED_BETA1 : gf16::GF16 = 0.9 / PHI;   // ~ 0.556 [Open conjecture]
-    const PHI_DAMPED_BETA2 : gf16::GF16 = 0.999 / PHI; // ~ 0.617 [Open conjecture]
-
-    // ---------------------------------------------------------
-    // Description-cost anchor (for random-rational control B1d)
-    //   A NON-Fibonacci rational with comparable bit-description cost to PHI_INV.
-    //   Parent decision: 5/8 was rejected (5,8 are Fibonacci numbers, so it is
-    //   a phi-biased control). Use 4/7 and 7/30 -- all of {4,7,30} are outside
-    //   the Fibonacci sequence {1,2,3,5,8,13,21,...}, giving a clean phi-free
-    //   baseline. Magnitudes are matched to the phi anchors (beta1 ~ 0.57 vs
-    //   phi^(-1) ~ 0.62; wd ~ 0.233 vs phi^(-3) ~ 0.236).
-    //   Source: Li & Talwalkar 2019 random-search; MDL: Shaw 2025 (2509.22445)
-    // ---------------------------------------------------------
-    const RATIONAL_BETA1 : gf16::GF16 = 0.5714285714285714; // 4/7 -- non-Fibonacci control
-    const RATIONAL_WEIGHT_DECAY : gf16::GF16 = 0.2333333333333333; // 7/30 -- comparable cost
-
-    // =========================================================
-    // 2. Types
-    // =========================================================
-
-    // No language-level default is forced: every ablation arm names its variant
-    // explicitly. The TRAINER runtime default (with_phi_defaults) is Canonical;
-    // TunedStd is the standard-AdamW CONTROL arm, not a silent default.
-    pub const PhiVariant = enum {
-        Canonical,   // beta1=phi^(-1)~0.618, wd=phi^(-3)~0.236068  [Open conjecture] (trainer default)
-        Damped,      // beta1=0.9/phi~0.556,  wd=0.01               [Open conjecture]
-        TunedStd,    // beta1=0.9,            wd=0.01               (AdamW field-standard control)
-        RandomRat,   // beta1=4/7~0.571,      wd=7/30~0.233         (non-Fibonacci control)
-    };
-
-    pub const AdamWConfig = struct {
-        learning_rate : gf16::GF16,        // eta: step size
-        beta1 : gf16::GF16,                // beta1: first moment decay
-        beta2 : gf16::GF16,                // beta2: second moment decay
-        weight_decay : gf16::GF16,         // lambda: decoupled weight decay
-        epsilon : gf16::GF16,              // eps: numerical stability
-        amsgrad : bool,             // Use AMSGrad variant
-        phi_variant : PhiVariant,   // Which parametrisation to use
-    };
-
-    pub const AdamWState = struct {
-        m : []gf16::GF16,                  // First moment (moving average of gradients)
-        v : []gf16::GF16,                  // Second moment (moving average of squared gradients)
-        v_max : []gf16::GF16,              // Max of v (for AMSGrad)
-        param_count : u32,          // Number of parameters
-        step : u64,                 // Current optimization step (t)
-    };
-
-    pub const OptimizerStepResult = struct {
-        updated_params : []gf16::GF16,     // New parameter values
-        m : []gf16::GF16,                  // Updated first moments
-        v : []gf16::GF16,                  // Updated second moments
-        step_norm : gf16::GF16,            // L2 norm of the parameter update
-    };
-
-    // =========================================================
-    // 3. Core Functions
-    // =========================================================
-
-    // init(config: AdamWConfig, param_count: u32) -> AdamWState
-    fn init(config: AdamWConfig, param_count: u32) -> AdamWState {
-        // m[i] = 0.0 for all i
-        // v[i] = 0.0 for all i
-        // v_max[i] = 0.0 for all i (if amsgrad)
-        // step = 0
-    }
-
-    // step(state: AdamWState, params: []gf16::GF16, grads: []gf16::GF16) -> OptimizerStepResult
-    fn step(state: AdamWState, params: []gf16::GF16, grads: []gf16::GF16) -> OptimizerStepResult {
-        // t = step + 1
-        // bias_correction1 = 1 - beta1^t
-        // bias_correction2 = 1 - beta2^t
-        // lr_t = lr * sqrt(bias_correction2) / bias_correction1
-        //
-        // Apply weight decay (decoupled):
-        //   params[i] = params[i] * (1 - lr * weight_decay)
-        //
-        // Update moments:
-        //   m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-        //   v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-        //
-        // If amsgrad:
-        //   v_max_t = max(v_max_{t-1}, v_t)
-        //   denominator = sqrt(v_max_t) + eps
-        // else:
-        //   denominator = sqrt(v_t) + eps
-        //
-        // Update parameters:
-        //   params[i] = params[i] - lr_t * m_t / denominator
-    }
-
-    fn compute_bias_correction(beta: gf16::GF16, t: u64) -> gf16::GF16 {
-        // return 1 - pow(beta, t)
-    }
-
-    fn update_first_moment(m_prev: gf16::GF16, grad: gf16::GF16, beta1: gf16::GF16) -> gf16::GF16 {
-        // return beta1 * m_prev + (1 - beta1) * grad
-    }
-
-    fn update_second_moment(v_prev: gf16::GF16, grad: gf16::GF16, beta2: gf16::GF16) -> gf16::GF16 {
-        // return beta2 * v_prev + (1 - beta2) * grad * grad
-    }
-
-    fn apply_weight_decay(params: []gf16::GF16, lr: gf16::GF16, weight_decay: gf16::GF16) -> []gf16::GF16 {
-        // params[i] = params[i] * (1 - lr * weight_decay)
-    }
-
-    fn compute_update(m: gf16::GF16, v: gf16::GF16, lr_t: gf16::GF16, epsilon: gf16::GF16) -> gf16::GF16 {
-        // return lr_t * m / (sqrt(v) + epsilon)
-    }
-
-    // get_effective_betas(variant: PhiVariant) -> (beta1, beta2, weight_decay)
-    // Returns (beta1, beta2, weight_decay) for the given variant.
-    fn get_effective_betas(variant: PhiVariant) -> (gf16::GF16, gf16::GF16, gf16::GF16) {
-        // TODO: Implement proper conditional logic
-        DEFAULT_BETA1
-    }
-
-    test get_effective_betas {
-        // Test Canonical variant
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.Canonical)
-        then approximately_equal(b1, PHI_CANONICAL_BETA1)  // ~ 0.618
-        and   approximately_equal(b2, PHI_CANONICAL_BETA2)  // 0.999
-        and   approximately_equal(wd, PHI_CANONICAL_WEIGHT_DECAY) // ~ 0.236068
-
-        // Test Damped variant
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.Damped)
-        then approximately_equal(b1, PHI_DAMPED_BETA1)    // ~ 0.556
-        and   approximately_equal(b2, DEFAULT_BETA2)     // 0.999
-        and   approximately_equal(wd, DEFAULT_WEIGHT_DECAY) // 0.01
-
-        // Test TunedStd variant
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.TunedStd)
-        then approximately_equal(b1, DEFAULT_BETA1)        // 0.9
-        and   approximately_equal(b2, DEFAULT_BETA2)     // 0.999
-        and   approximately_equal(wd, DEFAULT_WEIGHT_DECAY) // 0.01
-
-        // Test RandomRat variant
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.RandomRat)
-        then approximately_equal(b1, RATIONAL_BETA1)       // 4/7 ~ 0.5714
-        and   approximately_equal(b2, DEFAULT_BETA2)     // 0.999
-        and   approximately_equal(wd, RATIONAL_WEIGHT_DECAY) // 7/30 ~ 0.2333
-    }
-
-    fn amsgrad_update(v: gf16::GF16, v_max: gf16::GF16) -> gf16::GF16 {
-        // return max(v_max, v)
-        when v > v_max {
-            v
-        } else {
-            v_max
+    var i : usize = 0;
+    while (i < grads.len) {
+        if (!is_finite(grads[i])) {
+            return false;
         }
+        i = i + 1;
     }
-
-    test amsgrad_update {
-        // Test when v > v_max
-        given result = amsgrad_update(5.0, 3.0)
-        then result == 5.0
-
-        // Test when v <= v_max
-        given result = amsgrad_update(2.0, 4.0)
-        then result == 4.0
-
-        // Test when v == v_max
-        given result = amsgrad_update(3.0, 3.0)
-        then result == 3.0
-
-        // Test with negative values
-        given result = amsgrad_update(-1.0, -2.0)
-        then result == -1.0
-
-        given result = amsgrad_update(-3.0, -1.0)
-        then result == -1.0
+    const mo : usize = @intCast(m_off);
+    const vo : usize = @intCast(v_off);
+    const xo : usize = @intCast(x_off);
+    const c1 = 1.0 - powi(c.beta1, t);
+    const c2 = 1.0 - powi(c.beta2, t);
+    const keep = 1.0 - c.learning_rate * c.weight_decay;
+    i = 0;
+    while (i < params.len) {
+        const g = grads[i];
+        const decayed = params[i] * keep;
+        mom[mo + i] = c.beta1 * mom[mo + i] + (1.0 - c.beta1) * g;
+        mom[vo + i] = c.beta2 * mom[vo + i] + (1.0 - c.beta2) * g * g;
+        var second = mom[vo + i];
+        if (c.amsgrad) {
+            if (mom[vo + i] > mom[xo + i]) {
+                mom[xo + i] = mom[vo + i];
+            }
+            second = mom[xo + i];
+        }
+        const m_hat = mom[mo + i] / c1;
+        const v_hat = second / c2;
+        params[i] = decayed - c.learning_rate * m_hat / (sqrt(v_hat) + c.epsilon);
+        i = i + 1;
     }
+    return true;
+}
 
-    // =========================================================
-    // EXISTING TDD: Tests (preserved from pre-B1 spec)
-    // =========================================================
+// ---- helpers that exist only so the tests go through function calls ----
 
-    test init_creates_zero_moments_v2
-        given config = AdamWConfig{.learning_rate = 1e-3, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.01, .epsilon = 1e-8, .amsgrad = false, .phi_variant = PhiVariant.TunedStd}
-        when state = init(config, 10)
-        then state.m.len == 10
-        and   state.v.len == 10
-        and   all(state.m, is_zero)
-        and   all(state.v, is_zero)
-        and   state.step == 0
+/// One parameter p with moments (m, v, x) taking step number t with gradient g.
+fn probe_step(p: f32, g: f32, m: f32, v: f32, x: f32, t: u32, c: AdamWConfig) -> Probe {
+    var params : [1]f32 = [p];
+    const grads : [1]f32 = [g];
+    var mom : [3]f32 = [m, v, x];
+    const ok : bool = adamw_step(&params, &grads, &mom, 0, 1, 2, t, c);
+    return Probe{ .p = params[0], .m = mom[0], .v = mom[1], .x = mom[2], .ok = ok };
+}
 
-    test init_with_amsgrad_creates_v_max_v2
-        given config = AdamWConfig{.amsgrad = true}
-        when state = init(config, 10)
-        then state.v_max.len == 10
-        and   all(state.v_max, is_zero)
+/// Parameter 2.0 with a zero gradient for `steps` steps at lr 0.1, wd 0.5. which: 0 = p, 1 = m, 2 = v.
+fn zero_grad_run(steps: u32, which: i32) -> f32 {
+    var params : [1]f32 = [2.0];
+    const grads : [1]f32 = [0.0];
+    var mom : [3]f32 = [0.0, 0.0, 0.0];
+    const c : AdamWConfig = plain_config(0.1, 0.5, false);
+    var t : u32 = 1;
+    while (t <= steps) {
+        const ok : bool = adamw_step(&params, &grads, &mom, 0, 1, 2, t, c);
+        t = t + 1;
+    }
+    if (which == 1) {
+        return mom[0];
+    }
+    if (which == 2) {
+        return mom[1];
+    }
+    return params[0];
+}
 
-    test compute_bias_correction_first_step_v2
-        given beta = 0.9
-        and   t = 1
-        when result = compute_bias_correction(beta, t)
-        then approximately_equal(result, 0.1)
+/// Two steps from p = 1.0, lr 0.1, wd 0: gradient 2.0 then 0.0. which: 0 = p, 1 = v, 2 = x.
+fn two_step_run(amsgrad: bool, which: i32) -> f32 {
+    var params : [1]f32 = [1.0];
+    var grads : [1]f32 = [2.0];
+    var mom : [3]f32 = [0.0, 0.0, 0.0];
+    const c : AdamWConfig = plain_config(0.1, 0.0, amsgrad);
+    const first : bool = adamw_step(&params, &grads, &mom, 0, 1, 2, 1, c);
+    grads[0] = 0.0;
+    const second : bool = adamw_step(&params, &grads, &mom, 0, 1, 2, 2, c);
+    if (which == 1) {
+        return mom[1];
+    }
+    if (which == 2) {
+        return mom[2];
+    }
+    return params[0];
+}
 
-    test compute_bias_correction_later_steps_v2
-        given beta = 0.9
-        and   t = 10
-        when result = compute_bias_correction(beta, t)
-        then result < 1.0
-        and   result > 0.0
+/// a / b at run time, where IEEE gives NaN for 0 / 0 and inf for 1 / 0
+fn ratio(a: f32, b: f32) -> f32 {
+    return a / b;
+}
 
-    test update_first_momentum_basic_v2
-        given m_prev = 0.0
-        and   grad = 1.0
-        and   beta1 = 0.9
-        when result = update_first_moment(m_prev, grad, beta1)
-        then approximately_equal(result, 0.1) // 0.9 * 0 + 0.1 * 1
+/// 1 if the step was applied, 0 if it was refused; a refused step must leave p, m, v alone.
+fn applied(g: f32, t: u32) -> i32 {
+    const r : Probe = probe_step(1.0, g, 0.25, 0.5, 0.75, t, plain_config(0.001, 0.1, true));
+    if (r.ok) {
+        return 1;
+    }
+    if (r.p != 1.0) {
+        return 7;
+    }
+    if (r.m != 0.25) {
+        return 7;
+    }
+    if (r.v != 0.5) {
+        return 7;
+    }
+    if (r.x != 0.75) {
+        return 7;
+    }
+    return 0;
+}
 
-    test update_first_momentum_with_history_v2
-        given m_prev = 0.5
-        and   grad = 1.0
-        and   beta1 = 0.9
-        when result = update_first_moment(m_prev, grad, beta1)
-        then approximately_equal(result, 0.9 * 0.5 + 0.1)
+/// Minimise (x - 3)^2 from 0 at lr 0.1.
+fn descend(steps: u32, wd: f32) -> f32 {
+    var params : [1]f32 = [0.0];
+    var mom : [3]f32 = [0.0, 0.0, 0.0];
+    const c : AdamWConfig = plain_config(0.1, wd, false);
+    var t : u32 = 1;
+    while (t <= steps) {
+        const grads : [1]f32 = [2.0 * (params[0] - 3.0)];
+        const ok : bool = adamw_step(&params, &grads, &mom, 0, 1, 2, t, c);
+        t = t + 1;
+    }
+    return params[0];
+}
 
-    test update_second_momentum_basic_v2
-        given v_prev = 0.0
-        and   grad = 2.0
-        and   beta2 = 0.999
-        when result = update_second_moment(v_prev, grad, beta2)
-        then approximately_equal(result, 0.001 * 4.0)
+/// The error code of allocating state for 3 parameters from an arena of cap slots.
+fn arena_code(cap: i32) -> i32 {
+    var backing : [24]f32 = undefined;
+    fill_slots(&backing, 0, 24, 9.0);
+    return state_alloc(arena_new(cap), &backing, 3).code;
+}
 
-    test compute_update_basic_v2
-        given m = 0.1
-        and   v = 0.01
-        and   lr_t = 0.001
-        and   epsilon = 1e-8
-        when result = compute_update(m, v, lr_t, epsilon)
-        then result > 0.0
+/// The arena's top after that allocation.
+fn arena_top(cap: i32) -> i32 {
+    var backing : [24]f32 = undefined;
+    fill_slots(&backing, 0, 24, 9.0);
+    return state_alloc(arena_new(cap), &backing, 3).arena.top;
+}
 
-    test apply_weight_decay_reduces_parameters_v2
-        given params = [1.0, 2.0, 3.0]
-        and   lr = 0.01
-        and   weight_decay = 0.1
-        when result = apply_weight_decay(params, lr, weight_decay)
-        then result[0] < 1.0
-        and   result[1] < 2.0
-        and   result[2] < 3.0
+/// Allocate state for 3 parameters from a backing array of 24 slots, step the three parameters
+/// once through the arena offsets, and return parameter `index` (which 0) or the first-moment
+/// slot of that parameter (which 1).
+fn arena_driven(index: usize, which: i32, amsgrad: bool) -> f32 {
+    var backing : [24]f32 = undefined;
+    fill_slots(&backing, 0, 24, 9.0);
+    var params : [3]f32 = [1.0, 2.0, 3.0];
+    const grads : [3]f32 = [0.1, 0.2, 0.3];
+    const s : AdamWState = state_alloc(arena_new(24), &backing, 3);
+    const ok : bool = adamw_step(&params, &grads, &backing, s.m_off, s.v_off, s.x_off, 1, plain_config(0.001, 0.0, amsgrad));
+    if (which == 1) {
+        const base : usize = @intCast(s.m_off);
+        return backing[base + index];
+    }
+    return params[index];
+}
 
-    test step_without_weight_decay_matches_adam_v2
-        given config = AdamWConfig{.learning_rate = 0.001, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.0}
-        and   state = init(config, 1)
-        and   params = [1.0]
-        and   grads = [0.1]
-        when result = step(state, params, grads)
-        then result.updated_params.len == 1
+/// The same three parameters stepped through three separate caller-owned arrays.
+fn separate_driven(index: usize, amsgrad: bool) -> f32 {
+    var params : [3]f32 = [1.0, 2.0, 3.0];
+    const grads : [3]f32 = [0.1, 0.2, 0.3];
+    var mom : [9]f32 = [0.0] ** 9;
+    const ok : bool = adamw_step(&params, &grads, &mom, 0, 3, 6, 1, plain_config(0.001, 0.0, amsgrad));
+    return params[index];
+}
 
-    test step_with_weight_decay_shrinks_params_v2
-        given config = AdamWConfig{.learning_rate = 0.01, .beta1 = 0.9, .beta2 = 0.999, .weight_decay = 0.1}
-        and   state = init(config, 1)
-        and   params = [1.0]
-        and   grads = [0.0]
-        when result = step(state, params, grads)
-        then result.updated_params[0] < 1.0
+fn phi_identity() -> f32 {
+    return PHI * PHI + 1.0 / (PHI * PHI);
+}
 
-    test amsgrad_update_tracks_maximum_v2
-        given v = 0.05
-        and   v_max = 0.03
-        when result = amsgrad_update(v, v_max)
-        then result == 0.05
+// ---- tests ----
 
-    test amsgrad_update_preserves_maximum_v2
-        given v = 0.02
-        and   v_max = 0.05
-        when result = amsgrad_update(v, v_max)
-        then result == 0.05
+// Bias correction makes the first step lr * sign(g), whatever |g| is.
+test the_first_step_is_lr_times_the_sign_of_the_gradient {
+    const c : AdamWConfig = plain_config(0.001, 0.0, false);
+    const small : Probe = probe_step(1.0, 0.1, 0.0, 0.0, 0.0, 1, c);
+    const large : Probe = probe_step(1.0, 100.0, 0.0, 0.0, 0.0, 1, c);
+    const neg : Probe = probe_step(1.0, -5.0, 0.0, 0.0, 0.0, 1, c);
+    assert small.ok;
+    assert @abs(small.p - 0.999) < 0.000001;
+    assert @abs(large.p - 0.999) < 0.000001;
+    assert @abs(neg.p - 1.001) < 0.000001;
+}
 
-    test step_increases_step_counter_v2
-        given config = AdamWConfig{}
-        and   state = init(config, 10)
-        and   params = random_input(10)
-        and   grads = random_input(10)
-        when result = step(state, params, grads)
-        then result.step_norm >= 0.0
+// m = (1 - b1) g and v = (1 - b2) g^2 after the first step, and x stays 0 without amsgrad.
+test the_moments_after_one_step_are_exact {
+    const c : AdamWConfig = plain_config(0.001, 0.0, false);
+    const r : Probe = probe_step(1.0, 0.3, 0.0, 0.0, 0.0, 1, c);
+    assert @abs(r.m - 0.03) < 0.0000001;
+    assert @abs(r.v - 0.00009) < 0.0000001;
+    assert r.x == 0.0;
+}
 
-    // =========================================================
-    // PHASE B1: Constant-identity tests (reconciliation)
-    // =========================================================
+// Decoupled: with a zero gradient the parameter shrinks by (1 - lr wd) per step and the
+// moments never see the decay. Adam with L2 would put wd p into m and v.
+test the_decay_is_decoupled_from_the_moments {
+    assert @abs(zero_grad_run(1, 0) - 1.9) < 0.00001;
+    assert @abs(zero_grad_run(3, 0) - 1.71475) < 0.00001;
+    assert zero_grad_run(3, 1) == 0.0;
+    assert zero_grad_run(3, 2) == 0.0;
+}
 
-    // B1-CONST-1: Canonical phi anchor matches igla-peek/src/optimizer.rs
-    // [Verified arithmetic] phi^(-1) = 1/phi ~ 0.618034
-    test b1_canonical_beta1_matches_trainer
-        given expected = 1.0 / 1.618033988749895
-        when val = PHI_CANONICAL_BETA1
-        then approximately_equal(val, expected) // tolerance 1e-9
+// With amsgrad the denominator uses the largest v seen: after gradients 2.0 then 0.0, v has
+// decayed to 0.003996 but x still holds 0.004, so the second step is a little shorter.
+test amsgrad_keeps_the_largest_second_moment {
+    assert @abs(two_step_run(true, 1) - 0.003996) < 0.000001;
+    assert @abs(two_step_run(true, 2) - 0.004) < 0.000001;
+    assert two_step_run(false, 2) == 0.0;
+    const gap : f32 = two_step_run(true, 0) - two_step_run(false, 0);
+    assert gap > 0.00002;
+    assert gap < 0.00005;
+}
 
-    // B1-CONST-2: Canonical weight_decay matches trainer phi^(-3)
-    // [Verified arithmetic] phi^(-3) = 1/(phi^3) ~ 0.236068
-    // igla-peek test: assert!((expected_wd - 0.23607).abs() < 0.001)
-    test b1_canonical_wd_matches_trainer
-        given expected = 1.0 / (1.618033988749895 * 1.618033988749895 * 1.618033988749895)
-        when val = PHI_CANONICAL_WEIGHT_DECAY
-        then approximately_equal(val, expected) // ~ 0.23607, tolerance 1e-9
+// NaN, infinity and step 0 are refused, and a refused step changes nothing.
+test a_bad_gradient_or_step_zero_is_refused {
+    assert applied(1.5, 1) == 1;
+    assert applied(-2.3, 4) == 1;
+    assert applied(ratio(0.0, 0.0), 1) == 0;
+    assert applied(ratio(1.0, 0.0), 1) == 0;
+    assert applied(ratio(-1.0, 0.0), 1) == 0;
+    assert applied(1.5, 0) == 0;
+}
 
-    // B1-CONST-3: Damped beta1 (legacy) equals 0.9/phi
-    test b1_damped_beta1_is_0p9_over_phi
-        given expected = 0.9 / 1.618033988749895
-        when val = PHI_DAMPED_BETA1
-        then approximately_equal(val, expected) // ~ 0.556
+test it_descends_a_quadratic {
+    assert @abs(descend(500, 0.0) - 3.0) < 0.01;
+}
 
-    // B1-CONST-4: Canonical and damped are numerically distinct
-    test b1_canonical_and_damped_are_distinct
-        then PHI_CANONICAL_BETA1 > PHI_DAMPED_BETA1
-        and  approximately_equal(PHI_CANONICAL_BETA1, 0.618034) // 3 sig figs
-        and  approximately_equal(PHI_DAMPED_BETA1, 0.55557)     // 3 sig figs
+// Decoupled decay pulls the minimiser toward 0, without removing it from the basin.
+test decay_pulls_the_minimiser_toward_zero {
+    const free : f32 = descend(500, 0.0);
+    const decayed : f32 = descend(500, 0.1);
+    assert decayed < free - 0.05;
+    assert decayed > 0.0;
+}
 
-    // B1-CONST-5: Identity law L5 -- [Verified]
-    // phi^2 + phi^(-2) = 3  (Law L5, the only Verified phi-fact)
-    test b1_trinity_identity_l5
-        given phi = 1.618033988749895
-        when lhs = phi * phi + 1.0 / (phi * phi)
-        then approximately_equal(lhs, 3.0) // tolerance 1e-12
+test the_four_ablation_arms_are_what_the_comment_says {
+    const canon : AdamWConfig = variant_config(VARIANT_CANONICAL, 0.001);
+    assert @abs(canon.beta1 - 0.618034) < 0.000001;
+    assert @abs(canon.weight_decay - 0.236068) < 0.000001;
+    const damped : AdamWConfig = variant_config(VARIANT_DAMPED, 0.001);
+    assert @abs(damped.beta1 - 0.556231) < 0.000001;
+    assert damped.weight_decay == DEFAULT_WEIGHT_DECAY;
+    const tuned : AdamWConfig = variant_config(VARIANT_TUNED_STD, 0.001);
+    assert tuned.beta1 == 0.9;
+    assert tuned.weight_decay == DEFAULT_WEIGHT_DECAY;
+    const rat : AdamWConfig = variant_config(VARIANT_RANDOM_RAT, 0.001);
+    assert @abs(rat.beta1 - 0.571429) < 0.000001;
+    assert @abs(rat.weight_decay - 0.233333) < 0.000001;
+    assert canon.beta2 == 0.999;
+    assert rat.beta2 == 0.999;
+    assert canon.learning_rate == 0.001;
+}
 
-    // B1-CONST-6: Random-rational is distinct from all phi values
-    test b1_random_rational_distinct_from_phi
-        then RATIONAL_BETA1 != PHI_CANONICAL_BETA1
-        and  RATIONAL_BETA1 != PHI_DAMPED_BETA1
-        and  RATIONAL_BETA1 != DEFAULT_BETA1
+test an_unknown_variant_is_the_standard_arm {
+    const odd : AdamWConfig = variant_config(99, 0.002);
+    assert odd.beta1 == 0.9;
+    assert odd.weight_decay == DEFAULT_WEIGHT_DECAY;
+    assert odd.learning_rate == 0.002;
+}
 
-    // =========================================================
-    // PHASE B1: Control-test design (ablation)
-    //
-    // FALSIFICATION CRITERION (mandatory, non-negotiable):
-    //   If ANY of variants (b), (c), or (d) achieves BPB within
-    //   Monte-Carlo error of variant (a) on an equal tuning budget,
-    //   phi-specificity of AdamW hyperparameters is FALSIFIED.
-    //   The experiment reports the null first.
-    //
-    // Experimental protocol:
-    //   - Metric: BPB (bits-per-byte) on held-out validation set
-    //   - Champion baseline: BPB = 2.1919 (seed=43, ~81K steps,
-    //     AdamW, hidden=828, sha=cd91c45), Hoffmann 2022 (2203.15556) regime
-    //   - Budget: equal total gradient steps AND equal HP-tuning budget
-    //     (Li & Talwalkar 2019 random-search, arXiv:1902.07638;
-    //      Melis/Dyer/Blunsom 2017 equal-budget, arXiv:1707.05589)
-    //   - Seeds: minimum 3 seeds per variant; report mean +/- std
-    //   - Monte-Carlo error: estimate via bootstrap on validation set
-    //   - AdamW implicit L-inf bias: Xie & Li 2024 (arXiv:2404.04454)
-    //   - Weight-decay scaling: Wang & Aitchison 2025 (arXiv:2405.13698)
-    //   - Cautious weight decay: Chen 2025 (arXiv:2510.12402)
-    // =========================================================
+test the_phi_identity_is_the_only_verified_phi_fact {
+    assert @abs(phi_identity() - 3.0) < 0.000001;
+    assert @abs(PHI * PHI_INV - 1.0) < 0.000001;
+    assert @abs(PHI_INV * PHI_INV * PHI_INV - PHI_INV_CUBED) < 0.000001;
+    assert PHI_INV > PHI_DAMPED_BETA1;
+    assert RATIONAL_BETA1 != PHI_INV;
+    assert RATIONAL_BETA1 != PHI_DAMPED_BETA1;
+}
 
-    // B1a: phi-canonical  (beta1=phi^(-1)~0.618, wd=phi^(-3)~0.236068)
-    //      [Open conjecture] -- this is the trainer default
-    test b1_variant_a_phi_canonical_config
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.Canonical)
-        then approximately_equal(b1, PHI_CANONICAL_BETA1)  // ~ 0.618
-        and  approximately_equal(b2, 0.999)
-        and  approximately_equal(wd, PHI_CANONICAL_WEIGHT_DECAY) // ~ 0.236068
+// The arena path: three buffers of 3 slots at offsets 0, 3, 6, all zeroed from a backing array
+// that held 9.0, and stepping through them gives exactly the separate-arrays result.
+test the_state_comes_from_the_arena {
+    assert arena_code(24) == 0;
+    assert arena_top(24) == 9;
+    assert arena_driven(1, 0, false) == separate_driven(1, false);
+    assert arena_driven(2, 0, false) == separate_driven(2, false);
+    assert @abs(arena_driven(2, 1, false) - 0.03) < 0.0000001;
+    assert arena_driven(1, 0, true) == separate_driven(1, true);
+    assert arena_driven(2, 0, true) == separate_driven(2, true);
+}
 
-    // B1b: phi-damped     (beta1=0.9/phi~0.556, wd=0.01)
-    //      [Open conjecture] -- pre-B1 spec default
-    test b1_variant_b_phi_damped_config
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.Damped)
-        then approximately_equal(b1, PHI_DAMPED_BETA1)  // ~ 0.556
-        and  approximately_equal(b2, DEFAULT_BETA2)     // 0.999
-        and  approximately_equal(wd, DEFAULT_WEIGHT_DECAY) // 0.01
+// 3 buffers of 3 need 9 slots; with 8 the third fails and the arena is as it came in.
+test an_arena_too_small_is_a_code_not_a_trap {
+    assert arena_code(8) == 1;
+    assert arena_top(8) == 0;
+    assert arena_code(9) == 0;
+    assert arena_top(9) == 9;
+}
 
-    // B1c: tuned-standard AdamW  (beta1=0.9, wd=0.01)
-    //      Tuning convention from Kingma & Ba 2015 / Loshchilov & Hutter 2019
-    test b1_variant_c_tuned_standard_config
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.TunedStd)
-        then approximately_equal(b1, 0.9)
-        and  approximately_equal(b2, 0.999)
-        and  approximately_equal(wd, 0.01)
-
-    // B1d: random-rational  (beta1=4/7, wd=7/30 -- non-Fibonacci control)
-    //      Equal description-cost control; MDL Shaw 2025 (2509.22445)
-    test b1_variant_d_random_rational_config
-        given (b1, b2, wd) = get_effective_betas(PhiVariant.RandomRat)
-        then approximately_equal(b1, RATIONAL_BETA1)       // 4/7 ~ 0.5714
-        and  approximately_equal(b2, DEFAULT_BETA2)         // 0.999
-        and  approximately_equal(wd, RATIONAL_WEIGHT_DECAY) // 7/30 ~ 0.2333
-
-    // B1e: Falsification integration test (runs the ablation scaffold)
-    //
-    // HEADLINE: phi-specificity is FALSIFIED if any non-phi control
-    // matches variant (a) within Monte-Carlo error on equal budget.
-    //
-    // This test verifies the scaffold produces distinct BPB measurements
-    // (not that phi wins -- that is the experimental outcome to determine).
-    test b1_control_ablation_produces_distinct_bpb
-        given n_steps = 1000  // mini-run for CI; full run uses 81000
-        and   seed = 43
-        and   bpb_a = run_adamw(PhiVariant.Canonical, n_steps, seed)
-        and   bpb_b = run_adamw(PhiVariant.Damped, n_steps, seed)
-        and   bpb_c = run_adamw(PhiVariant.TunedStd, n_steps, seed)
-        and   bpb_d = run_adamw(PhiVariant.RandomRat, n_steps, seed)
-        then all_finite([bpb_a, bpb_b, bpb_c, bpb_d])
-        and  all_positive([bpb_a, bpb_b, bpb_c, bpb_d])
-        // Note: NOT asserting bpb_a < bpb_b, bpb_c, bpb_d -- that would
-        // beg the question. The experiment records which variant wins.
-
-    // =========================================================
-    // EXISTING TDD: Invariants (preserved)
-    // =========================================================
-
-    invariant step_preserves_param_count_v2
-        given config = any_adamw_config()
-        and   state = init(config, 100)
-        and   params = random_input(100)
-        and   grads = random_input(100)
-        when result = step(state, params, grads)
-        then result.updated_params.len == 100
-
-    invariant moments_have_same_length_v2
-        given config = any_adamw_config()
-        and   state = init(config, 50)
-        then state.m.len == 50
-        and   state.v.len == 50
-
-    invariant first_moment_remains_bounded_v2
-        given config = any_adamw_config()
-        and   state = init(config, 10)
-        and   params = finite_input(10)
-        and   grads = bounded_input(10, -1.0, 1.0)
-        and   result = step(state, params, grads)
-        then all(result.m, is_finite)
-
-    invariant second_moment_non_negative_v2
-        given config = any_adamw_config()
-        and   state = init(config, 10)
-        and   params = finite_input(10)
-        and   grads = finite_input(10)
-        and   result = step(state, params, grads)
-        then all(result.v, fn(x) x >= 0.0)
-
-    invariant bias_correction_in_zero_one_range_v2
-        given beta = random_gf16_in_range(0.0, 0.999)
-        and   t = random_u64_in_range(1, 1000)
-        when bc = compute_bias_correction(beta, t)
-        then bc >= 0.0
-        and   bc <= 1.0
-
-    invariant weight_decay_preserves_sign_v2
-        given params = [-1.0, 0.0, 1.0]
-        and   lr = 0.01
-        and   weight_decay = 0.1
-        when result = apply_weight_decay(params, lr, weight_decay)
-        then result[0] < 0.0
-        and   result[2] > 0.0
-
-    invariant amsgrad_v_max_non_decreasing_v2
-        given config = AdamWConfig{.amsgrad = true}
-        and   state = init(config, 10)
-        and   params = random_input(10)
-        and   grads = random_input(10)
-        and   result1 = step(state, params, grads)
-        and   result2 = step(state, result1.updated_params, grads)
-        then all_pairs(result1.v_max, result2.v_max, fn(a, b) b >= a)
-
-    invariant denominator_positive_v2
-        given v = 0.0
-        and   epsilon = 1e-8
-        when denom = sqrt(v) + epsilon
-        then denom > 0.0
-
-    // =========================================================
-    // PHASE B1: New invariants for reconciliation
-    // =========================================================
-
-    // B1-INV-1: Canonical beta1 is in valid range for convergence theory
-    //   Heavy-ball / EMA window 1/(1-beta1); valid range (0, 1) open.
-    //   [Open conjecture] that phi^(-1) is "optimal" -- no theorem backs this.
-    invariant b1_canonical_beta1_valid
-        then PHI_CANONICAL_BETA1 > 0.0
-        and  PHI_CANONICAL_BETA1 < 1.0
-
-    // B1-INV-2: Canonical weight_decay is in sensible range
-    invariant b1_canonical_wd_valid
-        then PHI_CANONICAL_WEIGHT_DECAY > 0.0
-        and  PHI_CANONICAL_WEIGHT_DECAY < 1.0
-
-    // B1-INV-3: Canonical beta1 > damped beta1 (ordering fact, not a claim)
-    invariant b1_canonical_greater_than_damped
-        then PHI_CANONICAL_BETA1 > PHI_DAMPED_BETA1
-
-    // B1-INV-4: All four control variants have distinct beta1 values
-    //   (ensures the ablation is not degenerate)
-    invariant b1_variants_distinct
-        then PHI_CANONICAL_BETA1 != PHI_DAMPED_BETA1
-        and  PHI_CANONICAL_BETA1 != DEFAULT_BETA1
-        and  PHI_CANONICAL_BETA1 != RATIONAL_BETA1
-        and  PHI_DAMPED_BETA1 != DEFAULT_BETA1
-        and  PHI_DAMPED_BETA1 != RATIONAL_BETA1
-        and  DEFAULT_BETA1 != RATIONAL_BETA1
-
-    // B1-INV-5: Trinity identity L5 -- [Verified] -- must hold to fp tolerance
-    invariant b1_trinity_l5_verified
-        given phi = 1.618033988749895
-        when lhs = phi * phi + 1.0 / (phi * phi)
-        then approximately_equal(lhs, 3.0) // tolerance 1e-10
-
-    // B1-INV-6: Weight decay values are distinct across variants that differ
-    invariant b1_canonical_wd_differs_from_default
-        then PHI_CANONICAL_WEIGHT_DECAY != DEFAULT_WEIGHT_DECAY
-
-    // B1-INV-7: No phi anchor is presented as Verified (enforces honesty)
-    //   This invariant is meta-level: code review must confirm no .t27 comment
-    //   or doc labels PHI_CANONICAL_BETA1 or PHI_DAMPED_BETA1 as [Verified].
-    //   [Verified] is reserved for phi^2 + phi^(-2) = 3 (Law L5 only).
-    invariant b1_phi_anchors_labeled_open_conjecture
-        // Verified in code review: PHI_CANONICAL_BETA1, PHI_CANONICAL_WEIGHT_DECAY,
-        // PHI_DAMPED_BETA1, PHI_DAMPED_BETA2 all carry [Open conjecture] in comments.
-        assert true // placeholder; enforcement is by CI lint on claim labels
-
-    // =========================================================
-    // EXISTING TDD: Benchmarks (preserved)
-    // =========================================================
-
-    bench init_small_v2
-        given config = any_adamw_config()
-        when result = init(config, 100)
-        then elapsed_time_us < 50
-
-    bench init_large_v2
-        given config = any_adamw_config()
-        when result = init(config, 1000000)
-        then elapsed_time_ms < 20
-
-    bench step_small_v2
-        given config = any_adamw_config()
-        and   state = init(config, 100)
-        and   params = random_input(100)
-        and   grads = random_input(100)
-        when result = step(state, params, grads)
-        then elapsed_time_us < 200
-
-    bench step_medium_v2
-        given config = any_adamw_config()
-        and   state = init(config, 10000)
-        and   params = random_input(10000)
-        and   grads = random_input(10000)
-        when result = step(state, params, grads)
-        then elapsed_time_ms < 10
-
-    bench step_large_v2
-        given config = any_adamw_config()
-        and   state = init(config, 1000000)
-        and   params = random_input(1000000)
-        and   grads = random_input(1000000)
-        when result = step(state, params, grads)
-        then elapsed_time_ms < 200
-
-    bench compute_bias_correction_v2
-        given beta = 0.9
-        and   t = 100
-        when result = compute_bias_correction(beta, t)
-        then elapsed_time_ns < 50
-
-    bench amsgrad_update_v2
-        given v = random_positive_gf16()
-        and   v_max = random_positive_gf16()
-        when result = amsgrad_update(v, v_max)
-        then elapsed_time_ns < 10
-
-    // =========================================================
-    // PHASE B1: Ablation benchmark
-    // =========================================================
-
-    // B1-BENCH: Compare throughput of all four variants at equal step count.
-    //   Purpose: confirm no variant has a hidden compute advantage.
-    bench b1_ablation_equal_budget_throughput
-        given n = 10000
-        and   steps = 1000
-        and   config_a = AdamWConfig{.phi_variant = PhiVariant.Canonical}
-        and   config_b = AdamWConfig{.phi_variant = PhiVariant.Damped}
-        and   config_c = AdamWConfig{.phi_variant = PhiVariant.TunedStd}
-        and   config_d = AdamWConfig{.phi_variant = PhiVariant.RandomRat}
-        when  throughput_a = steps_per_second(config_a, n, steps)
-        and   throughput_b = steps_per_second(config_b, n, steps)
-        and   throughput_c = steps_per_second(config_c, n, steps)
-        and   throughput_d = steps_per_second(config_d, n, steps)
-        // All variants must be within 5% of each other (same algo, different scalars)
-        then ratio(throughput_a, throughput_c) > 0.95
-        and  ratio(throughput_b, throughput_c) > 0.95
-        and  ratio(throughput_d, throughput_c) > 0.95
-
-    // =========================================================
-    // Mathematical Notes
-    // =========================================================
-    //
-    // AdamW Update Rule (Loshchilov & Hutter 2019):
-    //   1. Apply weight decay (decoupled):
-    //      theta_t = theta_{t-1} * (1 - eta * lambda)
-    //
-    //   2. Update moments:
-    //      m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-    //      v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-    //
-    //   3. Bias correction:
-    //      m_hat_t = m_t / (1 - beta1^t)
-    //      v_hat_t = v_t / (1 - beta2^t)
-    //
-    //   4. Parameter update:
-    //      theta_t = theta_t - eta * m_hat_t / (sqrt(v_hat_t) + eps)
-    //
-    // EMA window: 1/(1-beta1) steps. For phi^(-1): window = phi^2 ~ 2.618.
-    // For 0.9: window = 10. For 0.9/phi: window ~ 2.24.
-    // Shorter window means faster response to gradient changes but
-    // noisier estimates -- no theory singles out phi as optimal.
-    //
-    // Literature context (used as BASELINES, not as phi validation):
-    //   Xie & Li 2024 (2404.04454): AdamW has implicit L-inf gradient bias;
-    //     relevant to comparing variants with different beta1 values.
-    //   Wang & Aitchison 2025 (2405.13698): weight-decay scaling matters at scale.
-    //   Chen 2025 (2510.12402): Cautious Weight Decay; reference for wd ablation.
-    //   Li & Talwalkar 2019 (1902.07638): random-search is a strong HP baseline.
-    //   Melis/Dyer/Blunsom 2017 (1707.05589): equal-budget comparison protocol.
-    //   Hoffmann 2022 (2203.15556): BPB / Chinchilla scaling; our metric anchor.
-    //
-    // =========================================================
+invariant adamw_defaults_are_valid {
+    assert DEFAULT_BETA1 < 1.0;
+    assert DEFAULT_BETA2 < 1.0;
+    assert DEFAULT_BETA1 < DEFAULT_BETA2;
+    assert DEFAULT_EPSILON > 0.0;
+    assert DEFAULT_WEIGHT_DECAY >= 0.0;
+    assert DEFAULT_WEIGHT_DECAY < 1.0;
+}

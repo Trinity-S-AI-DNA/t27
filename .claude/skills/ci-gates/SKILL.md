@@ -5,12 +5,27 @@ description: How a CI gate lies. Six confirmed cases from one day in this reposi
 
 # How a gate lies
 
+<!-- only-t27-rule -->
+> **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
+> - New logic starts as a `.t27` spec with `test` / `invariant` blocks. It reaches Rust, C, Zig, JS or Python only through `t27c gen-*`, and generated files are never hand-edited (L2).
+> - Hand-written code in any other language is denied by the hooks and by CI: `.rs .py .ts .js .sh .zig .c .go .v .yml .toml`, Dockerfile, Makefile; the full list is in `specs/policy/own_language.t27`.
+> - Existing foreign code is debt that only shrinks. Delete it, or replace it with a spec and its generated output.
+> - Thin hand-written glue is capped at 40 added lines per file and 80 per PR. No label lifts the cap. Never split a PR to slip under it.
+> - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
+> - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
+
 Every rule below is a specific failure found in this repository on 2026-08-18, with the
 path. None is a principle someone liked.
 
 The day's arithmetic: **one missing brace cost four days of a red gate**, and the four days
 were spent because three layers of diagnostics each named a different subsystem and only
 the innermost one was right.
+
+**Which contexts are required is not recorded here.** Sections below that name a required
+set are dated readings, not the rule. The rule is the ruleset:
+`gh api repos/gHashTag/t27/rules/branches/master`. The NOW gate (contexts
+`check-now-freshness` and `check`, a `docs/now/` entry per PR) was removed by owner
+decision 2026-10-04 (#5935); no hook and no CI job asks for an entry any more.
 
 ---
 
@@ -38,9 +53,9 @@ a claim that isn't true.
 
 Replacing one `echo` with *does every tracked JSON parse* — the weakest question worth
 asking, chosen because it carries no theory that could itself be wrong — immediately found
-`clara-bridge/audit-trail/experience-schema.json` with a literal `...` on line 40, which
-`clara-bridge/tests/run_tests.py:152` loads with `json.load()`. **3 of its 11 tests were
-failing** and no workflow ran that suite at all.
+a vendored audit-trail schema with a literal `...` on line 40, which its own test
+runner loaded with `json.load()` (both files have since been deleted). **3 of that
+suite's 11 tests were failing** and no workflow ran it at all.
 
 ## 2. A gate is green until proven otherwise — check its SCOPE separately from its result
 
@@ -6920,7 +6935,8 @@ Third this session, after `Numbering holds in 5 file(s)` and
 
 ## 267. Four required checks, and all four assert something
 
-`t27-master-protection` requires exactly four contexts on this repository:
+`t27-master-protection` requires exactly four contexts on this repository
+(a reading at the time; the NOW gate rows below were removed in #5935, see the note at the top):
 `check-now-freshness`, `validate`, `check`, `check-linked-issue`. Everything
 else — 42 workflow files — is advisory.
 
@@ -12014,7 +12030,8 @@ TOMORROW=$(date -u -d tomorrow  +%Y-%m-%d 2>/dev/null || date -u -v+1d +%Y-%m-%d
 The entry's date is frozen at commit time; the window moves every midnight. So a branch
 whose gate runs on two different UTC days can flip from green to red **with no change to
 the branch**, and the remedy is to re-date a file -- a failure that teaches nothing. The
-job is `check-now-freshness`, which is in the required set.
+job is `check-now-freshness`, which was in the required set (the gate was removed in
+#5935; see the note at the top).
 
 **Then it was priced, and the price is zero.** Over the 100 most recent runs of this
 workflow, `2026-08-30 .. 2026-09-03`, there were 5 failures and **not one came from the
@@ -13113,7 +13130,7 @@ contained** #3097. The gate ran on that head at **01:35:11 and concluded
 failure**, naming the six mentions. It merged three minutes later anyway.
 
 Nothing malfunctioned. `gh pr merge --auto` decides on the **required set**, and
-this repository requires four contexts — `check-now-freshness`, `validate`,
+this repository then required four contexts (see the note at the top for today's set) — `check-now-freshness`, `validate`,
 `check`, `check-linked-issue`. Everything else is advisory, including the gate I
 had just written. Measured the same hour: **19 workflows claim MERGE_CRITICAL in
 the tree and 15 of those claims are hollow**, the newest being mine.
@@ -15667,9 +15684,9 @@ Replayed against the real pair -- branch tip `2ded340a`, master `747e4a1`, merge
 and the file it wrote contained:
 
 ```
-## 546. A mutation that also edits the test is not a mutation test
-## 547. A mutation that also edits the test is not a mutation test     <-- twice
-## 548. The tool that finds unchecked constants was counting its own tests
+    ## 546. A mutation that also edits the test is not a mutation test
+    ## 547. A mutation that also edits the test is not a mutation test     <-- twice
+    ## 548. The tool that finds unchecked constants was counting its own tests
 ```
 
 **The byte-prefix tail is everything appended since the merge base, and that is wrong the moment a
@@ -17478,3 +17495,10 @@ fixing a defect and fixing a sighting.
 auto-merged on the required four while the Coq run was still in progress. The repair is
 correct and was measured locally; but note what the merge gate can and cannot say about a
 change to a non-required workflow — nothing. See §550 and the merge-critical census.
+
+## Traps
+
+- 2026-10-19 The L1 check reads every commit message of a PR for Closes/Fixes/Resolves/Refs/Updates #N and rejects 'Part of #N'; pushed history is not rewritten, so tell lane agents to end each commit message with 'Updates #N' before the first push. (#11106)
+- 2026-10-19 One seal the emitter PR did not re-save (ml_host_io_model after the gen-verilog fix) turns coverage and spec-guards red on master for every open PR; read 'tools/check_seal_currency.py' output for the one name, and run it with TRI_T27C set when the tree has no target/. (#11102)
+- 2026-10-19 On a Mac a spec that no longer compiles under Zig cannot be re-sealed: 't27c seal --save' refuses, rightly. If gen_hash_zig, c and rust still MATCH in 'seal --verify', the recorded test pass is still the evidence for that Zig and only the moved hash is set, to the value verify prints; say so in the PR. (#11103)
+- 2026-10-19 't27b test <spec> --check' cross-checks the JIT against the interpreter; a scratch array declared without a value passes the JIT and faults the interpreter on a read of bytes never written, which turns t27b-native-ratchet red for every PR: run --check on every new spec and start scratch arrays at zero. (#11131)

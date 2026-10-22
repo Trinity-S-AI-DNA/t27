@@ -148,11 +148,32 @@ def build(rel):
     if not fn_now.isdigit() or not test_now.isdigit():
         log(f"skip {rel}: the counting commands printed {fn_now!r} and {test_now!r}")
         return None
+    # The one-word verdict, or no issue. An empty answer here produced eight
+    # issues reading ``prints `` (today: )`` - a criterion nobody can satisfy,
+    # on work the oracle had already passed.
+    if not status_now:
+        log(f"skip {rel}: `{status_cmd}` printed nothing, and an empty answer is "
+            "not a measurement")
+        return None
     # Every number the issue prints, produced by the command the issue prints.
     if not claims_hold(rel, [(cov_cmd, 0), (fn_cmd, fn_now), (test_cmd, test_now),
                              (status_cmd, status_now)]):
         return None
-    blocked = bee_shell(f"{BEE_T27C} test-report {rel} 2>&1 | grep -c BLOCKED")
+    # `grep -c` PRINTS ZERO FOR AN EMPTY INPUT, so a t27c that did not run at all
+    # produces the same `0` as a spec that compiles. Measured 2026-09-20 on
+    # issue #4446: the criterion went out reading "this spec compiles today and
+    # must still compile (today: 0)" for specs/fpga/linker.t27, which has never
+    # compiled - its generated Zig writes `.align = 4`, and `align` is a
+    # reserved word in Zig. The bee added a correct four-line test, met four
+    # criteria of five, and was sent back for a generator defect it did not
+    # cause and could not fix inside its boundary.
+    #
+    # So the report must SAY it ran before its count is believed.
+    report = bee_shell(f"{BEE_T27C} test-report {rel} 2>&1")
+    ran = "test report:" in report
+    blocked = str(report.count("BLOCKED")) if ran else ""
+    if not ran:
+        log(f"note {rel}: `test-report` did not run, so no compile criterion is written")
 
     title = (f"Test the {untested} untested function"
              f"{'' if untested == 1 else 's'} in {rel}")
@@ -233,6 +254,20 @@ def population():
     return small, big, none
 
 
+
+def refuse_unshaped(title: str, body: str) -> list[str]:
+    """Nothing here may open an issue the Queen could never dispatch.
+
+    A feed that files a task with no `## Boundary` does not add work to the
+    board, it adds a row the Queen skips every round for good. 565 of the 649
+    candidates on 2026-09-23 got there this way. The rule is `task_shape`,
+    which is a pinned twin of her own parser - so what this refuses is exactly
+    what she would have refused, and no more.
+    """
+    from task_shape import problems
+
+    return problems(body, set())
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=8)
@@ -280,6 +315,10 @@ def main():
         if args.dry_run:
             log(f"dry-run: {title} -> {path}")
             made += 1
+            continue
+        unshaped = refuse_unshaped(title, body)
+        if unshaped:
+            log(f"REFUSED {title[:60]}: {unshaped[0]}")
             continue
         done = subprocess.run(
             ["gh", "issue", "create", "--repo", REPO, "--title", title, "--body-file", path],
