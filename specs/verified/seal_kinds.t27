@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/seal_kinds.t27 -- a seal that survives a compiler bump: which of its parts are identity,
+; which are derived, and what a mismatch of each one asks for. Epic gHashTag/t27#8095 (reuse), CI speed
+; request of the owner, 2026-10-20.
+; --
+; The defect. On 2026-10-20, 27 of 32 waiting pull requests were refused only because their seals went stale
+; when t27c changed, while their specs did not. `seal --verify` compares five hashes (spec_hash and the four
+; gen_hash_*) and refuses on any one of them. spec_hash is the sha256 of the raw spec BYTES, so a comment or a
+; trailing space moves it; the four gen_hash_* are the sha256 of what the compiler emits TODAY, so any backend
+; repair moves them for every spec. Those are two different facts treated as one.
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/reuse.t27: the five parts (spec, closure, toolchain, config, verdict), PART_MISSING fails
+;   closed, reuse_decision().
+; - specs/verified/seal_identity.t27: the seal v2 record, toolchain judged by OUTPUT, remint_keeps(),
+;   blocked_reseal_allowed(). A reseal is already guarded there; this file only says WHEN a reseal is the
+;   answer instead of a refusal.
+; - specs/verified/seal_check.t27: the independent checker; its CHECK_* codes stay as they are.
+; - specs/verified/seal_write.t27: the write safety of one seal. Unchanged.
+; This file computes no hash. The sha256 stays in t27c; this file says what bytes it is fed (canon below) and
+; what a difference between two recorded hashes means.
+; --
+; The two kinds of part.
+; IDENTITY parts are claims about the spec. A difference is a change of meaning and is judged by a person
+; and by the tests:
+;   spec_norm_hash   sha256 of canon(spec bytes): the normalized spec, comments and layout removed, every
+;                    code line and every test block kept. A new seal field (schema 3).
+;   closure          the spec_norm_hash of every seal in the `use` closure (reuse.t27 closure part).
+;   tests            the verdict: passed, failed, vacuous, forced.
+; DERIVED parts are claims about the toolchain's output for that spec. A difference is not a change of the
+; spec; it is the compiler having moved:
+;   gen_hash_c, gen_hash_rust, gen_hash_verilog, gen_hash_zig, built_by, sealed_at, toolchain.
+; spec_hash (the raw bytes) stays in the record as it is. It is neither: it only says whether the bytes of the
+; file are the bytes that were sealed, and it becomes the cheap first test (equal raw bytes -> equal canon).
+; --
+; The rule, in one table (drift_action below):
+;   all equal                                       -> ACT_NONE         the seal holds
+;   raw bytes differ, canon equal, derived equal    -> ACT_REFRESH      rewrite spec_hash only; nothing refused
+;   canon equal, derived differ (compiler moved)    -> ACT_REGENERATE   seal again, tests rerun; a CI bot
+;                                                                       commits it, the pull request is not refused
+;   canon differs                                   -> ACT_REFUSE       the spec changed: seal it on purpose
+;   closure differs                                 -> ACT_RETEST       an import changed meaning: rerun, then judge
+;   a seal without spec_norm_hash (schema 2)        -> only the raw bytes can be compared; equal raw bytes
+;                                                      keep the old behaviour, different raw bytes refuse (MISSING
+;                                                      is never SAME) and the next reseal records the field
+; Two guards stay exactly as they are, and a regeneration is not allowed past either:
+; - A backend that emitted before and refuses now (gen_hash goes from a hash to "none") is a regression, not a
+;   drift: ACT_REFUSE (seal_identity blocked_reseal_allowed).
+; - A regeneration whose tests fail or are vacuous (checks_pass) is not kept: ACT_REFUSE, the old seal is written
+;   back (remint_keeps).
+; --
+; canon(), the normalized form. For each line of the spec, in order:
+;   - a CR before the LF is dropped (policy::text_lines, one rule for line handling);
+;   - trailing spaces and tabs are dropped;
+;   - a line that is empty after that is dropped;
+;   - a line whose first non-blank byte is `;` is dropped: in a .t27 file a prose line is a `;` comment;
+;   - a line whose first non-blank bytes are `//` and not `///` is dropped: a plain comment. `///` is kept,
+;     a doc comment can reach generated output;
+;   - every other line is kept whole, indentation included, and ends with one LF.
+; A trailing comment after code is NOT stripped: finding where it starts needs the lexer's string rules, and a
+; wrong cut would hide a code change. The cost is a false REFUSE, never a false SAME. Test blocks are code lines
+; and are kept: a changed assertion changes canon.
+; --
+; Migration (no seal is rewritten by hand):
+; 1. Land this file. Nothing reads it yet; no behaviour changes.
+; 2. `t27c seal --save` writes seal_schema 3: the old fields plus spec_norm_hash (sha256 of canon, also the key
+;    of the git note in specs/verified/verdict_notes.t27). Schema 2 seals stay valid and read as MISSING for the
+;    norm hash. `frontier --reseal` upgrades them in the waves it already runs.
+; 3. `t27c seal --verify` and tools/check_seal_currency.py print drift_action() beside each MISMATCH line, and
+;    exit 1 only for ACT_REFUSE and ACT_RETEST. ACT_REFRESH and ACT_REGENERATE exit 0 with the action named.
+; 4. A bot job on pull requests runs `frontier --reseal` for exactly the specs whose action is ACT_REGENERATE
+;    or ACT_REFRESH and pushes one commit of seals (the seal merge driver, owned elsewhere, handles the
+;    conflicts). The required check stays red until that commit lands, then turns green by itself.
+; Minimal glue change list (all thin; the decisions are the functions below):
+;   bootstrap/src/main.rs   compute_seal_hashes: add spec_norm_hash (needs canon from gen-rust of this file);
+;                           run_seal --verify: print the action. net hand lines must be <= 0, so the printing
+;                           moves into a generated fn, and FROZEN_HASH is updated by the port (owner rule).
+;   tools/check_seal_currency.py, tools/check_seal_coverage.py: read the action instead of a bare stale bit.
+;   .github/workflows/seal-coverage.yml: the regenerate step (owner label, see specs/ci/heavy_skip.t27).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedSealKinds;
+
+use policy::text_lines;
+use ci::affected;
+
+/// The seal schema that adds spec_norm_hash. seal_identity.t27 SEAL_SCHEMA (2) stays the floor that frontier
+/// can reuse; schema 3 is a superset.
+pub const SEAL_SCHEMA_NORM : u32 = 3;
+
+/// drift_action() answers.
+pub const ACT_NONE : u8 = 0;
+pub const ACT_REFRESH : u8 = 1;
+pub const ACT_REGENERATE : u8 = 2;
+pub const ACT_RETEST : u8 = 3;
+pub const ACT_REFUSE : u8 = 4;
+
+/// A part's kind, so a report can say which side a mismatch is on.
+pub const KIND_IDENTITY : u8 = 1;
+pub const KIND_DERIVED : u8 = 2;
+
+/// The kind of a seal field, by name code: 1 spec_norm_hash, 2 closure, 3 tests, 4 spec_hash (raw bytes),
+/// 5 gen_hash_c, 6 gen_hash_rust, 7 gen_hash_verilog, 8 gen_hash_zig, 9 built_by, 10 sealed_at, 11 toolchain.
+/// The raw spec_hash is DERIVED from the point of view of a refusal: it alone never refuses.
+pub fn field_kind(field: u8) -> u8 {
+    if (field >= 1 and field <= 3) { return KIND_IDENTITY; }
+    return KIND_DERIVED;
+}
+
+/// Is the line buf[f..t] (already without trailing blanks) a comment that canon drops?
+pub fn is_dropped_comment(buf: []const u8, f: usize, t: usize) -> bool {
+    if (buf[f] == ';') { return true; }
+    if (f + 1 < t and buf[f] == '/' and buf[f + 1] == '/') {
+        if (f + 2 < t and buf[f + 2] == '/') { return false; }
+        return true;
+    }
+    return false;
+}
+
+/// canon: write the normalized form of src[0..n] into out[0..cap] and return its length, or cap + 1 when it does
+/// not fit (the caller then treats the spec as not normalizable: ACT_REFUSE on a difference, never SAME).
+pub fn canon(src: []const u8, n: usize, out: []u8, cap: usize) -> usize {
+    var w : usize = 0;
+    var s : usize = 0;
+    while (s < n) {
+        const e : usize = line_end(src, s, n);
+        var t : usize = text_end(src, s, e);
+        while (t > s and (src[t - 1] == ' ' or src[t - 1] == '\t')) { t -= 1; }
+        var f : usize = s;
+        while (f < t and (src[f] == ' ' or src[f] == '\t')) { f += 1; }
+        if (f < t and is_dropped_comment(src, f, t) == false) {
+            var i : usize = s;
+            while (i < t) {
+                w = put(out, w, cap, src[i]);
+                i += 1;
+            }
+            w = put(out, w, cap, '\n');
+        }
+        s = e + 1;
+    }
+    if (w > cap) { return cap + 1; }
+    return w;
+}
+
+/// Do two spec texts have the same normalized form? Both are normalized into the scratch buffers a[0..cap] and
+/// b[0..cap]; a text that does not fit is never equal (fail closed).
+pub fn canon_equal(x: []const u8, xn: usize, y: []const u8, yn: usize, a: []u8, b: []u8, cap: usize) -> bool {
+    const la : usize = canon(x, xn, a, cap);
+    const lb : usize = canon(y, yn, b, cap);
+    if (la > cap or lb > cap) { return false; }
+    return same(a, 0, la, b, 0, lb);
+}
+
+/// Did a backend that emitted before refuse now? hash_was_none / hash_is_none are the recorded and current
+/// gen_hash == "none". Only emitted -> refused is a regression; refused -> emitted is a cure.
+pub fn backend_regressed(was_none: bool, is_none: bool) -> bool {
+    if (was_none) { return false; }
+    return is_none;
+}
+
+/// The action a recorded seal asks for against the current state.
+/// has_norm: the seal records spec_norm_hash. raw_same / norm_same / closure_same / derived_same: equal to the
+/// recorded ones. regressed: backend_regressed() for any of the four backends. The outcome of a regeneration is
+/// judged afterwards by regenerated_action().
+pub fn drift_action(has_norm: bool, raw_same: bool, norm_same: bool, closure_same: bool, derived_same: bool, regressed: bool) -> u8 {
+    if (has_norm == false) {
+        // Schema 2: only the raw bytes can be compared. MISSING is never SAME.
+        if (raw_same and derived_same) { return ACT_NONE; }
+        if (raw_same) {
+            if (regressed) { return ACT_REFUSE; }
+            return ACT_REGENERATE;
+        }
+        return ACT_REFUSE;
+    }
+    if (norm_same == false) { return ACT_REFUSE; }
+    if (closure_same == false) { return ACT_RETEST; }
+    if (derived_same) {
+        if (raw_same) { return ACT_NONE; }
+        return ACT_REFRESH;
+    }
+    if (regressed) { return ACT_REFUSE; }
+    return ACT_REGENERATE;
+}
+
+/// Does this action fail the gate? Only a change of meaning, or a regression, does.
+pub fn action_fails(action: u8) -> bool {
+    return action == ACT_REFUSE or action == ACT_RETEST;
+}
+
+/// After a regeneration ran: keep its seal, or write the old one back. A regeneration is kept only when its
+/// checks ran and passed; otherwise the drift was hiding a real break and the answer is a refusal.
+pub fn regenerated_action(checks_ok: bool) -> u8 {
+    if (checks_ok) { return ACT_NONE; }
+    return ACT_REFUSE;
+}
+
+/// How many of `total` stale seals the rule cures without a refusal, in permille. The line CI prints: the
+/// 2026-10-20 sweep was 27 of 32 pull requests.
+pub fn cured_permille(cured: u32, total: u32) -> u32 {
+    if (total == 0) { return 0; }
+    if (cured >= total) { return 1000; }
+    return (cured * 1000 + total / 2) / total;
+}
+
+test canon_drops_comments_blank_lines_and_trailing_blanks {
+    var a : [128]u8 = undefined;
+    // a prose line, a plain comment, a blank line, trailing blanks and a CR
+    const src : []const u8 = "; prose\nmodule M;\n\n// plain\nfn f() {  \n}\n";
+    const n : usize = canon(src, 41, &a, 128);
+    assert n == 21;
+    assert same(&a, 0, n, "module M;\nfn f() {\n}\n", 0, 21);
+}
+
+test canon_keeps_doc_comments_and_indentation_and_test_blocks {
+    var a : [128]u8 = undefined;
+    const src : []const u8 = "/// doc\n  x;\ntest t {\n  assert 1 == 1;\n}\n";
+    const n : usize = canon(src, 41, &a, 128);
+    assert n == 41;
+    assert same(&a, 0, n, src, 0, 41);
+}
+
+// The CR is set by number: t27c does not read "\r" in a string literal as an escape (policy/text_lines.t27).
+test a_crlf_file_normalizes_like_an_lf_one {
+    var c : [6]u8 = undefined;
+    var a : [16]u8 = undefined;
+    var b : [16]u8 = undefined;
+    c[0] = 'x';
+    c[1] = ';';
+    c[2] = 13;
+    c[3] = 10;
+    c[4] = 'y';
+    c[5] = 10;
+    assert canon_equal(&c, 6, "x;\ny\n", 5, &a, &b, 16) == true;
+}
+
+test a_trailing_comment_is_code_so_a_change_there_is_a_difference {
+    var a : [64]u8 = undefined;
+    var b : [64]u8 = undefined;
+    assert canon_equal("x; // one\n", 10, "x; // two\n", 10, &a, &b, 64) == false;
+    assert canon_equal("x;\n", 3, "x;   \n", 6, &a, &b, 64) == true;
+}
+
+test negative_control_a_changed_assertion_is_a_changed_spec {
+    var a : [64]u8 = undefined;
+    var b : [64]u8 = undefined;
+    assert canon_equal("assert 1 == 1;\n", 15, "assert 1 == 2;\n", 15, &a, &b, 64) == false;
+    assert canon_equal("; a\nx;\n", 7, "; b\n\nx;\n", 8, &a, &b, 64) == true;
+}
+
+test a_text_that_does_not_fit_is_never_equal {
+    var a : [4]u8 = undefined;
+    var b : [4]u8 = undefined;
+    assert canon("module Long;\n", 13, &a, 4) == 5;
+    assert canon_equal("module Long;\n", 13, "module Long;\n", 13, &a, &b, 4) == false;
+}
+
+test a_compiler_bump_that_moves_only_the_derived_part_is_regenerated_not_refused {
+    // 27 of 32 on 2026-10-20: same canon, same closure, new gen hashes
+    assert drift_action(true, true, true, true, false, false) == ACT_REGENERATE;
+    assert action_fails(ACT_REGENERATE) == false;
+    assert action_fails(ACT_REFRESH) == false;
+}
+
+test nothing_moved_is_a_seal_that_holds {
+    assert drift_action(true, true, true, true, true, false) == ACT_NONE;
+    // cosmetic edit only: the raw bytes moved, canon and output did not
+    assert drift_action(true, false, true, true, true, false) == ACT_REFRESH;
+    // cosmetic edit and a compiler bump together
+    assert drift_action(true, false, true, true, false, false) == ACT_REGENERATE;
+}
+
+test a_changed_spec_or_closure_is_never_cured_by_regeneration {
+    assert drift_action(true, false, false, true, true, false) == ACT_REFUSE;
+    assert drift_action(true, false, false, true, false, false) == ACT_REFUSE;
+    assert drift_action(true, true, true, false, true, false) == ACT_RETEST;
+    assert action_fails(ACT_RETEST);
+    assert action_fails(ACT_REFUSE);
+}
+
+test a_backend_that_stopped_emitting_is_a_regression {
+    assert backend_regressed(false, true) == true;
+    assert backend_regressed(true, true) == false;
+    assert backend_regressed(true, false) == false;
+    assert backend_regressed(false, false) == false;
+    assert drift_action(true, true, true, true, false, true) == ACT_REFUSE;
+}
+
+test a_schema_2_seal_without_the_norm_hash_fails_closed {
+    // equal raw bytes: the old behaviour, drift still regenerates
+    assert drift_action(false, true, false, true, true, false) == ACT_NONE;
+    assert drift_action(false, true, false, true, false, false) == ACT_REGENERATE;
+    // different raw bytes and no norm hash: MISSING is never SAME
+    assert drift_action(false, false, false, true, true, false) == ACT_REFUSE;
+    assert drift_action(false, true, false, true, false, true) == ACT_REFUSE;
+}
+
+test a_regeneration_is_kept_only_when_its_checks_passed {
+    assert regenerated_action(true) == ACT_NONE;
+    assert regenerated_action(false) == ACT_REFUSE;
+}
+
+test field_kinds_split_identity_from_derived {
+    assert field_kind(1) == KIND_IDENTITY;
+    assert field_kind(2) == KIND_IDENTITY;
+    assert field_kind(3) == KIND_IDENTITY;
+    assert field_kind(4) == KIND_DERIVED;
+    assert field_kind(5) == KIND_DERIVED;
+    assert field_kind(11) == KIND_DERIVED;
+}
+
+test the_cured_share_is_a_number {
+    assert cured_permille(27, 32) == 844;
+    assert cured_permille(0, 0) == 0;
+    assert cured_permille(5, 5) == 1000;
+}

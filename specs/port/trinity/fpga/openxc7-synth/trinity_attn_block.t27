@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MIT
+// specs/port/trinity/fpga/openxc7-synth/trinity_attn_block.t27
+//
+// Port of fpga/openxc7-synth/trinity_attn_block.v (gHashTag/trinity @
+// 5aabfbe8346f), 235 lines of hand-written Verilog: the full Trinity
+// transformer layer for the Artix-7 FPGA build.
+//
+// Architecture of the original (its header, lines 6-19):
+//   x -> Attention(x) -> +x -> FFN(y) -> +y -> RMSNorm -> output
+//   Attention = ternary_attention (Q/K/V projection + score + weighted sum)
+//   FFN       = trinity_block (MatVec -> ReLU -> MatVec -> Residual -> RMSNorm)
+//
+// What this spec ports: the module's own decisions - the control FSM
+// (lines 150-232), the reset state (lines 167-173), the read-address mux
+// (line 148), the attention residual add (lines 108-114) and the
+// zero-padding of the dimensions past HEAD_DIM (lines 107 and 206).
+// The submodules ternary_attention (line 93) and trinity_block (line 130)
+// are instantiated hardware whose streams enter this module as data; their
+// values and the weight .mem images are the undefined bodies below and no
+// test reaches them (FR-001).
+//
+// Not ported (no decision in them): the two BUF_DEPTH=256 register buffers
+// input_buf/attn_res_buf (lines 75-77) are storage, and the direct output
+// wiring out_valid/out_data/out_addr = ffn_out_* (lines 143-145) is
+// passthrough. The Verilog `default: state <= S_IDLE` (line 229) has no
+// counterpart here: the State enum below has no encoding outside
+// S_IDLE..S_DONE.
+//
+// Generated Verilog: t27c gen-verilog emits module trinity_attn_block with
+// the read-address mux as the combinational surface via on_comb: the state
+// and fill_idx parameters become inputs and the return becomes `result`.
+// The state arrives as the S_* 3-bit encoding below because an enum has no
+// derivable port width; test state_encoding_matches pins the S_* constants
+// and the State enum to each other.
+
+module trinity_attn_block {
+
+// =========================================================================
+// Parameters (module header, lines 35-51)
+// =========================================================================
+
+pub const DIM: u32 = 243;           // 3^5 tokens
+pub const HEAD_DIM: u32 = 64;
+pub const CTX_LEN: u32 = 16;
+pub const N_LARGE: u32 = 729;       // 3^6
+pub const ACC_WIDTH: u32 = 20;      // signed fixed-point accumulator width
+pub const FRAC_BITS: u32 = 8;
+pub const LOG2_CTX: u32 = 4;
+pub const DIM_WIDTH: u32 = 8;
+pub const HD_WIDTH: u32 = 7;
+pub const CTX_WIDTH: u32 = 4;
+pub const ADDR_WIDTH: u32 = 18;
+
+// localparam BUF_DEPTH = 256 (line 75): both buffers hold 256 samples of
+// ACC_WIDTH signed bits.
+pub const BUF_DEPTH: u32 = 256;
+// localparam [DIM_WIDTH-1:0] LAST_DIM = DIM - 1 (line 164).
+pub const LAST_DIM: u32 = DIM - 1;
+
+// Weight images (parameters, lines 47-51).
+pub const WQ_FILE: str = "fpga/weights/attn_wq.mem";
+pub const WK_FILE: str = "fpga/weights/attn_wk.mem";
+pub const WV_FILE: str = "fpga/weights/attn_wv.mem";
+pub const MEM_FILE_UP: str = "fpga/openxc7-synth/ternary_matvec_243x729_weights.mem";
+pub const MEM_FILE_DOWN: str = "fpga/openxc7-synth/ternary_matvec_729x243_weights.mem";
+
+// =========================================================================
+// External data moving in - undefined bodies, no test calls these (FR-001)
+// =========================================================================
+
+// input wire signed [ACC_WIDTH-1:0] x_rd_data (line 59): the sample the
+// external source drives for the address this module presents on x_rd_addr.
+pub fn x_rd_data(addr: u32) -> i32 { undefined; }
+
+// ternary_attention instance outputs (lines 86-104): the attention stream
+// this module residuals into attn_res_buf.
+pub fn attention_out(addr: u32) -> i32 { undefined; }
+
+// trinity_block instance outputs (lines 123-141): the FFN stream this
+// module presents as out_valid/out_data/out_addr (lines 143-145).
+pub fn ffn_out(addr: u32) -> i32 { undefined; }
+
+// =========================================================================
+// Control FSM (lines 150-232)
+// =========================================================================
+
+// localparams S_IDLE..S_DONE (lines 153-159), in the original's encoding
+// order 0..6 for the 3-bit state register.
+pub enum State {
+    Idle,
+    Fill,
+    Attn,
+    AttnWait,
+    Ffn,
+    FfnWait,
+    Done,
+}
+
+// localparam [2:0] S_IDLE..S_DONE (lines 153-159): the encoding the
+// original's `state` register and the read-address mux speak.
+pub const S_IDLE: u32 = 0;
+pub const S_FILL: u32 = 1;
+pub const S_ATTN: u32 = 2;
+pub const S_ATTN_WAIT: u32 = 3;
+pub const S_FFN: u32 = 4;
+pub const S_FFN_WAIT: u32 = 5;
+pub const S_DONE: u32 = 6;
+
+// The state registers the FSM drives: state (line 161), fill_idx
+// (line 162), busy/done (lines 68-69) and the one-shot submodule starts
+// attn_start/ffn_start (lines 91, 128).
+pub struct Step {
+    state: State,
+    fill_idx: u32,
+    busy: bool,
+    done: bool,
+    attn_start: bool,
+    ffn_start: bool,
+}
+
+// Reset (lines 167-173): S_IDLE, busy=0, done=0, both starts low,
+// fill_idx=0.
+pub fn init_state() -> Step {
+    return Step{
+        .state = State.Idle,
+        .fill_idx = 0,
+        .busy = false,
+        .done = false,
+        .attn_start = false,
+        .ffn_start = false,
+    };
+}
+
+// Lines 175-177: on every non-reset cycle, before the case statement runs,
+// attn_start, ffn_start and done fall back to 0 unless the state overrides
+// them. Fields the case leaves unassigned (state, fill_idx, busy) hold.
+fn hold(st: Step) -> Step {
+    return Step{
+        .state = st.state,
+        .fill_idx = st.fill_idx,
+        .busy = st.busy,
+        .done = false,
+        .attn_start = false,
+        .ffn_start = false,
+    };
+}
+
+// One clock of the control FSM (lines 166-232, rst low):
+//   S_IDLE      start begins a run: busy, fill_idx=0, go fill (lines 180-186)
+//   S_FILL      sample one address per cycle until fill_idx == LAST_DIM
+//               (lines 189-196)
+//   S_ATTN      pulse attn_start for one cycle (lines 199-202)
+//   S_ATTN_WAIT wait for attn_done (lines 204-209)
+//   S_FFN       pulse ffn_start for one cycle (lines 212-215)
+//   S_FFN_WAIT  wait for ffn_done (lines 217-221)
+//   S_DONE      assert done, drop busy, return to S_IDLE (lines 223-227)
+pub fn fsm_step(st: Step, start: bool, attn_done: bool, ffn_done: bool) -> Step {
+    switch (st.state) {
+        .Idle => if (start) Step{.state = State.Fill, .fill_idx = 0, .busy = true, .done = false, .attn_start = false, .ffn_start = false} else hold(st),
+        .Fill => if (st.fill_idx == LAST_DIM) Step{.state = State.Attn, .fill_idx = st.fill_idx, .busy = true, .done = false, .attn_start = false, .ffn_start = false} else Step{.state = State.Fill, .fill_idx = st.fill_idx + 1, .busy = true, .done = false, .attn_start = false, .ffn_start = false},
+        .Attn => Step{.state = State.AttnWait, .fill_idx = st.fill_idx, .busy = true, .done = false, .attn_start = true, .ffn_start = false},
+        .AttnWait => if (attn_done) Step{.state = State.Ffn, .fill_idx = st.fill_idx, .busy = true, .done = false, .attn_start = false, .ffn_start = false} else hold(st),
+        .Ffn => Step{.state = State.FfnWait, .fill_idx = st.fill_idx, .busy = true, .done = false, .attn_start = false, .ffn_start = true},
+        .FfnWait => if (ffn_done) Step{.state = State.Done, .fill_idx = st.fill_idx, .busy = true, .done = false, .attn_start = false, .ffn_start = false} else hold(st),
+        .Done => Step{.state = State.Idle, .fill_idx = st.fill_idx, .busy = false, .done = true, .attn_start = false, .ffn_start = false},
+    }
+}
+
+// =========================================================================
+// Datapath decisions
+// =========================================================================
+
+// State enum value -> its S_* encoding (lines 153-159). The spec keeps the
+// enum for the exhaustive FSM switch and these codes for the port surface;
+// test state_encoding_matches guarantees they never drift apart.
+pub fn state_code(st: Step) -> u32 {
+    if (st.state == State.Idle) { return S_IDLE; }
+    if (st.state == State.Fill) { return S_FILL; }
+    if (st.state == State.Attn) { return S_ATTN; }
+    if (st.state == State.AttnWait) { return S_ATTN_WAIT; }
+    if (st.state == State.Ffn) { return S_FFN; }
+    if (st.state == State.FfnWait) { return S_FFN_WAIT; }
+    return S_DONE;
+}
+
+// Read-address mux (line 148): assign x_rd_addr = (state == S_FILL) ?
+// fill_idx : {DIM_WIDTH{1'b0}}. This is the module's combinational surface:
+// in the generated Verilog the state and fill_idx parameters become inputs
+// and the return becomes `result`.
+pub fn on_comb(state: u32, fill_idx: u32) -> u32 {
+    if (state == S_FILL) {
+        return fill_idx;
+    }
+    return 0;
+}
+
+// Residual add (line 112): attn_res_buf[attn_out_addr] <= attn_out_data +
+// input_buf[attn_out_addr]. input_val is input_buf at the same address.
+pub fn residual(attn_out_data: i32, input_val: i32) -> i32 {
+    return attn_out_data + input_val;
+}
+
+// What attn_res_buf holds after the attention phase: addresses 0..HEAD_DIM-1
+// carry the residual (attention emits HEAD_DIM values, line 107), the
+// remaining dimensions up to DIM-1 are zero-filled (line 206) before the
+// FFN reads the buffer.
+pub fn attn_res_buf_value(addr: u32, attn_out_data: i32, input_val: i32) -> i32 {
+    if (addr < HEAD_DIM) {
+        return residual(attn_out_data, input_val);
+    }
+    return 0;
+}
+
+// =========================================================================
+// Tests - values the original produces (FR-004)
+// =========================================================================
+
+// Reset (lines 167-173).
+test reset_state {
+    var st = init_state();
+    assert(st.state == State.Idle);
+    assert(st.fill_idx == 0);
+    assert(!st.busy);
+    assert(!st.done);
+    assert(!st.attn_start);
+    assert(!st.ffn_start);
+}
+
+// S_IDLE holds until start, then begins a run (lines 180-186).
+test idle_holds_until_start {
+    var st = init_state();
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.Idle);
+    assert(!st.busy);
+    st = fsm_step(st, true, false, false);
+    assert(st.state == State.Fill);
+    assert(st.busy);
+    assert(st.fill_idx == 0);
+    assert(!st.attn_start);
+    assert(!st.ffn_start);
+    assert(!st.done);
+}
+
+// S_FILL samples one address per cycle and leaves for S_ATTN once
+// fill_idx reaches LAST_DIM = 242 (lines 189-196).
+test fill_counts_to_last_dim {
+    var st = init_state();
+    st = fsm_step(st, true, false, false);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.Fill);
+    assert(st.fill_idx == 1);
+    var i: u32 = 1;
+    while (i < LAST_DIM) {
+        st = fsm_step(st, false, false, false);
+        i += 1;
+    }
+    assert(st.fill_idx == LAST_DIM);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.Attn);
+}
+
+// S_ATTN pulses attn_start for exactly one cycle, then S_ATTN_WAIT holds
+// until attn_done (lines 199-209).
+test attn_start_pulses_once {
+    var st = init_state();
+    st = fsm_step(st, true, false, false);
+    var i: u32 = 0;
+    while (i < LAST_DIM + 1) {
+        st = fsm_step(st, false, false, false);
+        i += 1;
+    }
+    assert(st.state == State.Attn);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.AttnWait);
+    assert(st.attn_start);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.AttnWait);
+    assert(!st.attn_start);
+    st = fsm_step(st, false, true, false);
+    assert(st.state == State.Ffn);
+    assert(!st.attn_start);
+}
+
+// S_FFN pulses ffn_start for one cycle, S_FFN_WAIT waits for ffn_done, and
+// S_DONE raises done and drops busy on its way back to S_IDLE
+// (lines 212-227).
+test ffn_pulse_then_done_and_idle {
+    var st = init_state();
+    st = fsm_step(st, true, false, false);
+    var i: u32 = 0;
+    while (i < LAST_DIM + 1) {
+        st = fsm_step(st, false, false, false);
+        i += 1;
+    }
+    st = fsm_step(st, false, false, false);
+    st = fsm_step(st, false, true, false);
+    assert(st.state == State.Ffn);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.FfnWait);
+    assert(st.ffn_start);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.FfnWait);
+    assert(!st.ffn_start);
+    st = fsm_step(st, false, false, true);
+    assert(st.state == State.Done);
+    assert(!st.done);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.Idle);
+    assert(st.done);
+    assert(!st.busy);
+}
+
+// Lines 175-177: a cycle the case gives no assignment to keeps state,
+// fill_idx and busy but clears the start pulses and done.
+test nonreset_defaults_clear_pulses {
+    var st = Step{.state = State.AttnWait, .fill_idx = 9, .busy = true, .done = false, .attn_start = true, .ffn_start = false};
+    st = hold(st);
+    assert(st.state == State.AttnWait);
+    assert(st.fill_idx == 9);
+    assert(st.busy);
+    assert(!st.attn_start);
+    var dn = Step{.state = State.Idle, .fill_idx = 0, .busy = false, .done = true, .attn_start = false, .ffn_start = false};
+    dn = hold(dn);
+    assert(!dn.done);
+}
+
+// One full layer from start to done: 1 start cycle + 243 fill cycles + 1
+// attention pulse + 1 wait + 1 FFN pulse + 1 wait + 1 done cycle = 249
+// clocks with both handshakes asserted (lines 179-227).
+test whole_layer_latency {
+    var st = init_state();
+    st = fsm_step(st, true, true, true);
+    var i: u32 = 1;
+    while (i < 249) {
+        st = fsm_step(st, false, true, true);
+        i += 1;
+    }
+    assert(st.state == State.Idle);
+    assert(st.done);
+    assert(!st.busy);
+}
+
+// Lines 153-159: the enum arms of the FSM and the S_* codes of the port
+// surface describe the same 3-bit register; if they drift, the generated
+// module would mux the wrong phase.
+test state_encoding_matches {
+    assert(state_code(init_state()) == S_IDLE);
+    assert(state_code(fsm_step(init_state(), true, false, false)) == S_FILL);
+    assert(state_code(Step{.state = State.Attn, .fill_idx = 0, .busy = true, .done = false, .attn_start = false, .ffn_start = false}) == S_ATTN);
+    assert(state_code(Step{.state = State.AttnWait, .fill_idx = 0, .busy = true, .done = false, .attn_start = false, .ffn_start = false}) == S_ATTN_WAIT);
+    assert(state_code(Step{.state = State.Ffn, .fill_idx = 0, .busy = true, .done = false, .attn_start = false, .ffn_start = false}) == S_FFN);
+    assert(state_code(Step{.state = State.FfnWait, .fill_idx = 0, .busy = true, .done = false, .attn_start = false, .ffn_start = false}) == S_FFN_WAIT);
+    assert(state_code(Step{.state = State.Done, .fill_idx = 0, .busy = true, .done = true, .attn_start = false, .ffn_start = false}) == S_DONE);
+}
+
+// Line 148: x_rd_addr follows fill_idx in S_FILL and reads 0 everywhere
+// else.
+test rd_addr_mux_follows_fill {
+    assert(on_comb(S_FILL, 0) == 0);
+    assert(on_comb(S_FILL, 1) == 1);
+    assert(on_comb(S_FILL, LAST_DIM) == LAST_DIM);
+    assert(on_comb(S_IDLE, 7) == 0);
+    assert(on_comb(S_ATTN, 7) == 0);
+    assert(on_comb(S_ATTN_WAIT, 9) == 0);
+    assert(on_comb(S_FFN, 9) == 0);
+    assert(on_comb(S_FFN_WAIT, 9) == 0);
+    assert(on_comb(S_DONE, 9) == 0);
+}
+
+// Line 148 driven by the FSM of lines 179-227: the address walks 0, 1, 2
+// through S_FILL, reaches LAST_DIM with the buffer full and returns to 0
+// the cycle attention starts.
+test rd_mux_follows_fsm {
+    var st = init_state();
+    st = fsm_step(st, true, false, false);
+    assert(on_comb(state_code(st), st.fill_idx) == 0);
+    st = fsm_step(st, false, false, false);
+    assert(on_comb(state_code(st), st.fill_idx) == 1);
+    st = fsm_step(st, false, false, false);
+    assert(on_comb(state_code(st), st.fill_idx) == 2);
+    var i: u32 = 0;
+    while (i < LAST_DIM - 2) {
+        st = fsm_step(st, false, false, false);
+        i += 1;
+    }
+    assert(st.state == State.Fill);
+    assert(on_comb(state_code(st), st.fill_idx) == LAST_DIM);
+    st = fsm_step(st, false, false, false);
+    assert(st.state == State.Attn);
+    assert(on_comb(state_code(st), st.fill_idx) == 0);
+}
+
+// Lines 107-114 and 206: the residual adds the attention output to the
+// input at the same address for HEAD_DIM values; the dimensions past
+// HEAD_DIM read zero.
+test residual_then_zero_pad {
+    assert(residual(100, -3) == 97);
+    assert(residual(-128, 5) == -123);
+    assert(attn_res_buf_value(0, 100, -3) == 97);
+    assert(attn_res_buf_value(HEAD_DIM - 1, 12, 30) == 42);
+    assert(attn_res_buf_value(HEAD_DIM, 100, -3) == 0);
+    assert(attn_res_buf_value(LAST_DIM, 100, -3) == 0);
+}
+}
