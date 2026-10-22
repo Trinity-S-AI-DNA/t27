@@ -37,11 +37,19 @@
 //! every shape it claims to detect actually fired on a case known to contain it.
 //!
 //! A GATE NOW REFUSES PART OF IT. `typecheck` refuses a struct field whose type
-//! is empty or an integer literal (#3225), which covers three of the five shapes.
-//! Generation does not run `typecheck`, so those specs still generate and are
-//! still counted here -- the output is as wrong as it was. What changed is that a
-//! gate goes red on them, so each spec-shape pair is reported as REFUSED or as
-//! SILENT, and only a silent one is a spec on which every gate is green.
+//! is empty or an integer literal (#3225), and a field that swallowed the next
+//! one (#5968), which covers four of the five shapes. Since #6446 every `gen*`
+//! command runs `typecheck` first, so a refused spec generates NOTHING: its
+//! shapes cannot reach the output this command reads. The control is split to
+//! match. The refused reproducer must be refused by every backend read here --
+//! that proves the gate, not the detectors. The silent reproducer carries the
+//! shape `typecheck` still accepts (`Vec<>`) and must fire on real output.
+//! The detectors (specs/tri/misread/shapes.t27, #8967) for the refused shapes are
+//! held by its tests and the unit tests below,
+//! against the exact text the backends printed before the gate.
+//!
+//! Each spec-shape pair is still reported as REFUSED or SILENT; with the gate a
+//! refused spec has no output, so a pair found in the corpus is silent.
 //!
 //! The refused column has a negative control of its own. A `typecheck` that
 //! refused everything -- a broken binary, a usage error -- would turn the whole
@@ -51,6 +59,8 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
+#[path = "../../../gen/rust/tri/misread/shapes.rs"] #[allow(dead_code, unused_parens)]
+mod ms; // t27c gen-rust of specs/tri/misread/shapes.t27: the five shapes, each anchored on the whole line
 use std::process::Command;
 
 #[derive(Args, Debug)]
@@ -114,104 +124,6 @@ impl Shape {
     }
 }
 
-/// Does this line of generated Rust declare a field whose type slot is empty?
-///
-/// Anchored on the whole line rather than on a substring: `pub f: ,` inside a
-/// comment or a string would otherwise count, and a census that counts prose is
-/// the defect this repository names most often.
-pub fn rust_empty_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    is_ident(name.trim()) && ty.trim() == ","
-}
-
-/// Does this line declare a field whose type is an integer literal?
-///
-/// `pub bad: 0,` — accepted by `parse`, refused by `typecheck` since #3225, and
-/// unparseable as Rust. A negative literal counts: the sign does not make it a
-/// type.
-pub fn rust_literal_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    if !is_ident(name.trim()) {
-        return false;
-    }
-    let ty = ty.trim().trim_end_matches(',').trim();
-    is_int_literal(ty)
-}
-
-/// `Vec<>` — the element type was dropped on the way in.
-pub fn rust_empty_generic(line: &str) -> bool {
-    line.contains("Vec<>")
-}
-
-/// Does this line declare a field whose TYPE contains a bare colon?
-///
-/// A Rust type never does: a path spells its separator `::` and no other type
-/// syntax admits a lone `:`. So the line is wreckage either way -- but the shape
-/// does NOT say which wreck, and naming it for one cause was wrong. Measured on
-/// this corpus it arrives two ways:
-///
-///   * a field swallowed by the one before it. An inline `#` comment on a field
-///     consumes the rest of the line AND the next declaration, so
-///     `id : U8  # note,` followed by three fields yields the single field
-///     `pub id: U8command:Stringargs:Stringgroup_id:U8status:JobStatus`. Four
-///     declarations gone, and `parse` and `typecheck` both accept the spec.
-///   * a map type the emitter cannot spell. `[str: str]` comes out as
-///     `Vec<str:str>`, which is a different defect with the same footprint.
-///
-/// The detector reports the shape and leaves the cause to whoever reads the spec,
-/// which is the rule this module states at the top and which I broke by calling
-/// this `RustSwallowedField` first.
-pub fn rust_colon_in_type(line: &str) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix("pub ") else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    if !is_ident(name.trim()) {
-        return false;
-    }
-    let ty = ty.trim().trim_end_matches(',');
-    // Strip every `::` before looking for a lone `:`, so a legitimate path type
-    // cannot be reported.
-    let without_paths = ty.replace("::", "");
-    without_paths.contains(':')
-}
-
-/// The C half: `0 field;` — a literal where a type specifier must stand.
-pub fn c_literal_type(line: &str) -> bool {
-    let t = line.trim().trim_end_matches(';');
-    let mut parts = t.split_whitespace();
-    let (Some(first), Some(second), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    is_int_literal(first) && is_ident(second)
-}
-
-fn is_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn is_int_literal(s: &str) -> bool {
-    let s = s.strip_prefix('-').unwrap_or(s);
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-}
-
 /// Apply every shape to one generated file, returning the ones present.
 pub fn shapes_in(text: &str, backend: &str) -> Vec<Shape> {
     let mut found = Vec::new();
@@ -220,11 +132,11 @@ pub fn shapes_in(text: &str, backend: &str) -> Vec<Shape> {
             continue;
         }
         let hit = text.lines().any(|l| match shape {
-            Shape::RustEmptyType => rust_empty_type(l),
-            Shape::RustLiteralType => rust_literal_type(l),
-            Shape::RustEmptyGeneric => rust_empty_generic(l),
-            Shape::CLiteralType => c_literal_type(l),
-            Shape::RustColonInType => rust_colon_in_type(l),
+            Shape::RustEmptyType => ms::rust_empty_type(l.as_bytes()),
+            Shape::RustLiteralType => ms::rust_literal_type(l.as_bytes()),
+            Shape::RustEmptyGeneric => ms::rust_empty_generic(l.as_bytes()),
+            Shape::CLiteralType => ms::c_literal_type(l.as_bytes()),
+            Shape::RustColonInType => ms::rust_colon_in_type(l.as_bytes()),
         });
         if hit {
             found.push(shape);
@@ -234,8 +146,8 @@ pub fn shapes_in(text: &str, backend: &str) -> Vec<Shape> {
 }
 
 /// The spec whose whole purpose is to contain every shape this command claims to
-/// find. If the compiler stops producing it, the detectors are unproven and the
-/// corpus reading is worthless.
+/// find. Since #6446 the backends refuse it -- `typecheck` refuses four of its
+/// shapes -- and that refusal is what the control now requires.
 const CONTROL_SPEC: &str = concat!(
     "module probe {\n",
     "    pub const Thing = struct {\n",
@@ -248,6 +160,23 @@ const CONTROL_SPEC: &str = concat!(
     "    };\n",
     "}\n",
 );
+
+/// The shapes `typecheck` does NOT refuse, so they still reach the output and
+/// the detectors must be proven on it. If a shape moves here or out of here,
+/// `the_silent_control_is_exactly_the_shapes_typecheck_accepts` says so.
+const SILENT_CONTROL_SPEC: &str = concat!(
+    "module probe_silent {\n",
+    "    pub const Thing = struct {\n",
+    "        ok : u8,\n",
+    "        nogen : [],\n",  // -> RustEmptyGeneric, typecheck OK
+    "    };\n",
+    "}\n",
+);
+
+/// The shapes `SILENT_CONTROL_SPEC` carries.
+fn silent_shapes() -> Vec<Shape> {
+    vec![Shape::RustEmptyGeneric]
+}
 
 /// The negative control: well formed, so it must typecheck and must show no
 /// shape. If either fails, the refused column and the detectors are unproven.
@@ -283,16 +212,25 @@ fn t27c(root: &Path) -> PathBuf {
 }
 
 fn generate(root: &Path, backend: &str, spec: &Path) -> Option<String> {
+    match run_backend(root, backend, spec) {
+        Some((true, text, _)) => Some(text),
+        _ => None,
+    }
+}
+
+/// Run one backend: (exit ok, stdout, stderr). `None` when the binary did not run.
+fn run_backend(root: &Path, backend: &str, spec: &Path) -> Option<(bool, String, String)> {
     let out = Command::new(t27c(root))
         .arg(backend)
         .arg(spec)
         .current_dir(root)
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 /// Does `t27c typecheck` accept this spec? `None` when the binary did not run,
@@ -342,27 +280,49 @@ fn clean_control(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run the reproducer through the real compiler and require every shape to fire.
+/// Run both reproducers through the real compiler.
 ///
-/// Returns the shapes that did NOT fire. An empty vec is the only result that
-/// makes the corpus reading below mean anything.
+/// The refused one must be refused by every backend read here, with the
+/// typecheck refusal on stderr and nothing on stdout (#6446). The silent one
+/// must generate, and every shape it carries must fire. Returns the shapes that
+/// did NOT fire; an empty vec is the only result that makes the corpus reading
+/// below mean anything.
 fn control_failures(root: &Path) -> Result<Vec<Shape>> {
     let dir = std::env::temp_dir().join(format!("tri-misread-{}", std::process::id()));
     std::fs::create_dir_all(&dir).context("creating the control directory")?;
     let spec = dir.join("probe.t27");
     std::fs::write(&spec, CONTROL_SPEC).context("writing the control spec")?;
+    let silent = dir.join("probe_silent.t27");
+    std::fs::write(&silent, SILENT_CONTROL_SPEC).context("writing the silent control spec")?;
 
     let mut missed = Vec::new();
     for backend in ["gen-rust", "gen-c"] {
-        let Some(text) = generate(root, backend, &spec) else {
+        match run_backend(root, backend, &spec) {
+            None => anyhow::bail!("`t27c {backend}` did not run on the control spec"),
+            Some((true, _, _)) => anyhow::bail!(
+                "`t27c {backend}` GENERATED the control spec, which `typecheck` refuses.\n\
+                 Every gen path must run typecheck first (#6446); a backend that emits\n\
+                 a refused spec is the defect this command was written to find."
+            ),
+            Some((false, stdout, stderr)) => {
+                if !stdout.is_empty() || !stderr.contains("typecheck refused") {
+                    anyhow::bail!(
+                        "`t27c {backend}` failed on the control spec, but not with the\n\
+                         typecheck refusal (or it printed output). A broken binary and a\n\
+                         working gate must not read the same."
+                    );
+                }
+            }
+        }
+        let Some(text) = generate(root, backend, &silent) else {
             anyhow::bail!(
-                "the control spec did not survive `{backend}`.\n\
-                 It is four lines and the compiler must emit for it; a failure here\n\
-                 is a broken build or a moved binary, not a clean corpus."
+                "the silent control spec did not survive `{backend}`.\n\
+                 It is four lines that typecheck accepts; a failure here is a broken\n\
+                 build or a moved binary, not a clean corpus."
             );
         };
         let seen = shapes_in(&text, backend);
-        for shape in Shape::all().into_iter().filter(|s| s.backend() == backend) {
+        for shape in silent_shapes().into_iter().filter(|s| s.backend() == backend) {
             if !seen.contains(&shape) {
                 missed.push(shape);
             }
@@ -422,7 +382,10 @@ pub fn run(args: &Misread) -> Result<()> {
              was written for."
         );
     }
-    println!("  control: all {} shape(s) fired on the reproducer", Shape::all().len());
+    println!(
+        "  control: every gen backend refuses the reproducer (#6446); {} shape(s) typecheck accepts fired",
+        silent_shapes().len()
+    );
     clean_control(&root)?;
     println!("  control: the clean spec typechecks and shows no shape");
 
@@ -503,8 +466,8 @@ pub fn run(args: &Misread) -> Result<()> {
         println!("  rather than as a silence.");
     } else {
         println!("  {} of {} pair(s) are silent: the spec parses, typechecks and generates", silent_total, total);
-        println!("  output its backend cannot parse. A refused pair is caught by `typecheck`,");
-        println!("  but generation does not run it, so the output is as wrong as before.");
+        println!("  output its backend cannot parse. Since #6446 a spec `typecheck` refuses");
+        println!("  generates nothing, so a refused pair here means the gate was bypassed.");
         println!("  The counts are SPEC-SHAPE pairs, not specs: one spec can carry more");
         println!("  than one, and a refused spec may be refused for a different shape.");
         println!("  `--list` names them.");
@@ -515,63 +478,6 @@ pub fn run(args: &Misread) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_empty_type_slot_is_found() {
-        assert!(rust_empty_type("    pub variants: ,"));
-        assert!(rust_empty_type("pub f: ,"));
-    }
-
-    #[test]
-    fn a_real_field_is_not_an_empty_type_slot() {
-        assert!(!rust_empty_type("    pub kind: u8,"));
-        assert!(!rust_empty_type("    pub name: String,"));
-        assert!(!rust_empty_type("// pub f: ,"));
-    }
-
-    #[test]
-    fn a_literal_in_type_position_is_found_with_either_sign() {
-        assert!(rust_literal_type("    pub success: 0,"));
-        assert!(rust_literal_type("    pub offset: -1,"));
-    }
-
-    #[test]
-    fn a_numeric_looking_type_name_is_not_a_literal() {
-        assert!(!rust_literal_type("    pub v: u8,"));
-        assert!(!rust_literal_type("    pub v: i32,"));
-        assert!(!rust_literal_type("    pub v: f64,"));
-    }
-
-    #[test]
-    fn the_c_half_needs_exactly_a_literal_and_a_name() {
-        assert!(c_literal_type("    0 bad;"));
-        assert!(!c_literal_type("    int32_t good;"));
-        // Three tokens is a declaration with a qualifier, not this defect.
-        assert!(!c_literal_type("    const int x;"));
-    }
-
-    #[test]
-    fn a_bare_colon_in_a_type_is_found_whatever_wrecked_it() {
-        // A swallowed field...
-        assert!(rust_colon_in_type("    pub a: Floatb:String,"));
-        // ...and a map type the emitter could not spell. Same shape, other cause.
-        assert!(rust_colon_in_type("    pub env: Vec<str:str>,"));
-    }
-
-    #[test]
-    fn a_path_type_is_not_a_bare_colon() {
-        // `::` is how a Rust path spells its separator and must not be read as
-        // the wreckage of two declarations.
-        assert!(!rust_colon_in_type("    pub a: std::mem::Allocator,"));
-        assert!(!rust_colon_in_type("    pub v: Vec<HashMap<K, V>>,"));
-        assert!(!rust_colon_in_type("    pub p: *mut (),"));
-    }
-
-    #[test]
-    fn an_empty_generic_is_found_anywhere_in_the_line() {
-        assert!(rust_empty_generic("    pub adj: Vec<>,"));
-        assert!(!rust_empty_generic("    pub adj: Vec<u8>,"));
-    }
 
     #[test]
     fn shapes_are_read_only_from_the_backend_that_can_show_them() {
@@ -593,6 +499,28 @@ mod tests {
         for needle in ["bad : 0", "empty : ,", "nogen : []", "eaten : u8  # a note", "victim : u8"] {
             assert!(CONTROL_SPEC.contains(needle), "control lost `{needle}`");
         }
+    }
+
+    #[test]
+    fn the_silent_control_carries_its_shapes_and_nothing_typecheck_refuses() {
+        assert!(SILENT_CONTROL_SPEC.contains("nogen : []"));
+        for needle in [": 0", ": ,", "#"] {
+            assert!(!SILENT_CONTROL_SPEC.contains(needle), "silent control carries `{needle}`");
+        }
+        // The detector for its shape must still fire on the backend text.
+        assert!(shapes_in("    pub nogen: Vec<>,\n", "gen-rust").contains(&Shape::RustEmptyGeneric));
+    }
+
+    #[test]
+    fn the_refused_shapes_are_still_detected_on_the_pre_gate_output() {
+        // The text the backends printed for CONTROL_SPEC before #6446. The gate
+        // keeps it from being produced; the detectors must still know it.
+        let rust = "pub struct Thing {\n    pub ok: u8,\n    pub bad: 0,\n    pub empty: ,\n    pub eaten: u8victim:u8,\n}\n";
+        let seen = shapes_in(rust, "gen-rust");
+        for s in [Shape::RustLiteralType, Shape::RustEmptyType, Shape::RustColonInType] {
+            assert!(seen.contains(&s), "{:?}", s);
+        }
+        assert!(shapes_in("    0 bad;\n", "gen-c").contains(&Shape::CLiteralType));
     }
 
     #[test]

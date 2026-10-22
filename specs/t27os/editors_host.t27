@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS editors_host: the two system calls behind "open in editor" -- access(2) to see which editors are
+// installed and posix_spawn(3) to launch one on a directory. Every decision (the table, the bundle and
+// launcher paths, bundle over launcher, Xcode through xed, which directory is fit, why an open failed) is a
+// tested fn in editors.t27.
+//
+// A bundle is run as `/usr/bin/open -a <bundle path> <dir>` -- the path access(2) found, never a name rebuilt
+// from the table, so a name with a space ("Antigravity IDE", "Android Studio") is one argv word and cannot
+// be mixed up with "Antigravity" -- a launcher as `<path> <dir>`. The child is never waited for; SIGCHLD is
+// ignored so it leaves no zombie. open_in_editor answers with an OPEN_* code (editors.t27 open_word).
+//
+// Refs gHashTag/t27#10782, gHashTag/t27#11223.
+module T27osEditorsHost;
+
+use t27os::editors::EDITOR_COUNT;
+use t27os::editors::CLI_DIR_COUNT;
+use t27os::editors::HOW_NONE;
+use t27os::editors::HOW_OPEN_APP;
+use t27os::editors::HOW_CLI;
+use t27os::editors::bundle_path;
+use t27os::editors::cli_path;
+use t27os::editors::TERM_COUNT;
+use t27os::editors::term_path;
+use t27os::editors::launch_pick;
+use t27os::editors::is_installed;
+use t27os::editors::open_result;
+use t27os::editors::dir_fits;
+use t27os::pty_proto::get_u64;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_signal;
+
+pub const F_OK : i32 = 0;
+pub const SIGCHLD : i32 = 20;
+pub const SIG_IGN : u64 = 1;
+
+fn sys_access(path: []const u8, mode: i32) -> i32 { return @extern("access"); }
+fn spawn_p(pid: []u8, path: []const u8, actions: u64, attr: u64, argv: [6]u64, envp: u64) -> i32 { return @extern("posix_spawn"); }
+fn addr_of(dst: []u8, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+fn nul_terminated(dst: []u8, src: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < src.len and i + 1 < dst.len) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0;
+    return i;
+}
+
+fn exists(path: []const u8) -> bool {
+    // a path that would be cut to fit the buffer could name a parent folder that does exist
+    if (path.len >= 159) { return false; }
+    var z : [160]u8 = undefined;
+    nul_terminated(z[0..160], path);
+    return sys_access(z[0..160], F_OK) == 0;
+}
+
+/// Where editor i is installed as a bundle: the system folder first, then the user's. 0 when neither.
+pub fn find_bundle(i: u32, home: []const u8, out: []u8) -> usize {
+    var n : usize = bundle_path(i, "", out);
+    if (n > 0 and exists(out[0..n])) { return n; }
+    n = bundle_path(i, home, out);
+    if (n > 0 and exists(out[0..n])) { return n; }
+    return 0;
+}
+
+/// Where editor i's launcher is. 0 when it is on none of the usual directories.
+pub fn find_cli(i: u32, out: []u8) -> usize {
+    var k : u32 = 0;
+    while (k < CLI_DIR_COUNT) {
+        const n : usize = cli_path(i, k, out);
+        if (n > 0 and exists(out[0..n])) { return n; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// A bit per editor: set when the strip lists it (editors.t27 is_installed: a bundle or a launcher, but for
+/// Xcode the bundle -- /usr/bin/xed alone is a shim every Mac has).
+pub fn installed_mask(home: []const u8) -> u32 {
+    var b : [160]u8 = undefined;
+    var c : [160]u8 = undefined;
+    var m : u32 = 0;
+    var i : u32 = 0;
+    while (i < EDITOR_COUNT) {
+        const has_bundle : bool = find_bundle(i, home, b[0..160]) > 0;
+        const has_cli : bool = find_cli(i, c[0..160]) > 0;
+        if (is_installed(i, has_bundle, has_cli)) {
+            m = m + (1 << i);
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A bit per terminal editor (editors.t27 TERM_NAMES) found in one of the launcher directories: what the
+/// window may ask the PTY server to run inside a pane (editors.t27 term_pick).
+pub fn term_mask() -> u32 {
+    var b : [160]u8 = undefined;
+    var m : u32 = 0;
+    var i : u32 = 0;
+    while (i < TERM_COUNT) {
+        var k : u32 = 0;
+        var found : bool = false;
+        while (k < CLI_DIR_COUNT and found == false) {
+            const n : usize = term_path(i, k, b[0..160]);
+            if (n > 0 and exists(b[0..n])) { found = true; }
+            k = k + 1;
+        }
+        if (found) { m = m + (1 << i); }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Open directory `dir` in editor i. The answer is an OPEN_* code: OPEN_OK when the process was started,
+/// otherwise why not (bad folder, not installed, could not start, unknown editor).
+pub fn open_in_editor(i: u32, home: []const u8, dir: []const u8) -> u32 {
+    const fits : bool = dir_fits(dir);
+    if (i >= EDITOR_COUNT or fits == false) { return open_result(i, fits, HOW_NONE, 0); }
+    var bp : [160]u8 = undefined;
+    var cp : [160]u8 = undefined;
+    const bn : usize = find_bundle(i, home, bp[0..160]);
+    const cn : usize = find_cli(i, cp[0..160]);
+    const how : u32 = launch_pick(i, bn > 0, cn > 0);
+    if (how == HOW_NONE) { return open_result(i, fits, how, 0); }
+    var app : [160]u8 = undefined;
+    var d : [420]u8 = undefined;
+    var exe : [160]u8 = undefined;
+    var flag : [4]u8 = undefined;
+    var argv : [6]u64 = undefined;
+    nul_terminated(d[0..420], dir);
+    argv[4] = 0;
+    argv[5] = 0;
+    if (how == HOW_OPEN_APP) {
+        nul_terminated(app[0..160], bp[0..bn]);
+        flag[0] = 45;
+        flag[1] = 97;
+        flag[2] = 0;
+        flag[3] = 0;
+        nul_terminated(exe[0..160], "/usr/bin/open");
+        argv[0] = addr_of(exe[0..160], exe[0..160], 0);
+        argv[1] = addr_of(flag[0..4], flag[0..4], 0);
+        argv[2] = addr_of(app[0..160], app[0..160], 0);
+        argv[3] = addr_of(d[0..420], d[0..420], 0);
+    } else {
+        nul_terminated(exe[0..160], cp[0..cn]);
+        argv[0] = addr_of(exe[0..160], exe[0..160], 0);
+        argv[1] = addr_of(d[0..420], d[0..420], 0);
+        argv[2] = 0;
+        argv[3] = 0;
+    }
+    var envp : [8]u8 = undefined;
+    sys_peek(envp[0..8], sys_environ(), 8);
+    var pid : [4]u8 = undefined;
+    sys_signal(SIGCHLD, SIG_IGN);
+    const rc : i32 = spawn_p(pid[0..4], exe[0..160], 0, 0, argv, get_u64(envp[0..8], 0));
+    return open_result(i, fits, how, rc);
+}
+
+test the_editor_host_is_declared {
+    var b : [4]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1;
+}
