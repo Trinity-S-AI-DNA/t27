@@ -1,0 +1,538 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/effects/fs_cap.t27 -- the fs capability: read and write a file through a handle passed as an
+; argument (#9001). The first capability, and the template for every next one: capability.t27 holds
+; the design (handles, handlers, the run's tape) and this file applies it.
+; --
+; The contract. Two calls, ops 16 and 17 of the fs block:
+;   fs_read(fs, path) -> ?[]const u8           Rust's std::fs::read; t27o maps Result<Vec<u8>> to ?T
+;   fs_write(fs, path, data) -> bool           std::fs::write; Result<(), E> is a bool in t27o
+; After each call fs.status says how it went (capability.t27's ST_* codes). fs_read_post and
+; fs_write_post are the contract as predicates on one call's outcome: what any handler, simulated or
+; real, may answer. The law every handler keeps: a read of a path returns exactly the bytes the last
+; successful write of it wrote, and a path never written is ST_NOT_FOUND. A failed write changes
+; nothing.
+; --
+; Rights (WASI preopens, Eio's path capabilities). A handle holds FS_RIGHT_READ and FS_RIGHT_WRITE;
+; fs_restrict narrows them and nothing widens them, so a caller can hand a callee a read-only file
+; system. A call without its right is ST_DENIED, decided by the handle before any store or tape is
+; asked, so a denial is never recorded and replays from the handle alone.
+; --
+; The simulated handler is a minimal in-memory store: FS_FILES paths of up to FS_MAX_PATH bytes, each
+; with up to FS_MAX_DATA bytes. It switches to specs/effects/sim_fs.t27 (#9012) when that lands, by
+; `use`, and keeps this contract. Its seed injects faults: with fault_permille p, each call that
+; reaches the store fails with ST_IO when sim_roll(seed, FS_STREAM_FAULT, call index) mod 1000 < p
+; (FoundationDB's BUGGIFY, TigerBeetle's storage faults). p = 0 is a perfect disk.
+; --
+; fs_serve is the real handler's shape written in t27: it performs the fs call waiting on a CAP_HOST
+; tape against another handle and answers it. The glue a backend generates is the same loop with the
+; OS in place of that handle (std::fs::read / write, fopen / fread / fwrite).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module EffectsFs;
+
+use effects::capability;
+use queen::simulation;
+
+; --- 1. The contract -------------------------------------------------------------------------------
+
+pub const FS_READ : u8 = 16;
+pub const FS_WRITE : u8 = 17;
+
+pub const FS_RIGHT_READ : u8 = 1;
+pub const FS_RIGHT_WRITE : u8 = 2;
+pub const FS_RIGHTS_ALL : u8 = 3;
+
+/// fs_read's outcome is allowed: bytes exactly when ST_OK; without the read right always ST_DENIED,
+/// and ST_DENIED only then; never ST_FULL, since a read takes no room.
+pub fn fs_read_post(rights: u8, status: u8, got: bool) -> bool {
+    if ((rights & FS_RIGHT_READ) == 0) { return status == ST_DENIED and got == false; }
+    if (got) { return status == ST_OK; }
+    if (status == ST_OK or status == ST_FULL or status == ST_DENIED) { return false; }
+    return status <= ST_DIVERGED;
+}
+
+/// fs_write's outcome is allowed: true exactly when ST_OK; without the write right always ST_DENIED,
+/// and ST_DENIED only then; never ST_NOT_FOUND, since a write creates its path.
+pub fn fs_write_post(rights: u8, status: u8, ok: bool) -> bool {
+    if ((rights & FS_RIGHT_WRITE) == 0) { return status == ST_DENIED and ok == false; }
+    if (ok) { return status == ST_OK; }
+    if (status == ST_OK or status == ST_NOT_FOUND or status == ST_DENIED) { return false; }
+    return status <= ST_DIVERGED;
+}
+
+; --- 2. The handle ---------------------------------------------------------------------------------
+
+pub const FS_FILES : u32 = 8;
+pub const FS_MAX_PATH : u32 = 32;
+pub const FS_MAX_DATA : u32 = 64;
+
+/// The seed's stream for injected faults. simulation.t27's own streams are 1..9.
+pub const FS_STREAM_FAULT : u32 = 16;
+pub const PERMILLE : u32 = 1000;
+
+/// The simulated store: slot i holds path_len[i] bytes of path at i * FS_MAX_PATH and data_len[i]
+/// bytes of data at i * FS_MAX_DATA. Slots 0 .. n - 1 are in use.
+pub const FsStore = struct {
+    n : u32,
+    path_len : [8]u32,
+    data_len : [8]u32,
+    path : [256]u8,
+    data : [512]u8,
+};
+
+/// mode is the handler (capability.t27 CAP_*); calls counts the calls that reached the store, the
+/// index of the next fault roll; tape is the run's.
+pub const Fs = struct {
+    mode : u8,
+    rights : u8,
+    status : u8,
+    seed : u32,
+    fault_permille : u32,
+    calls : u32,
+    store : FsStore,
+    tape : *EffectTape,
+};
+
+pub fn fs_store_new() -> FsStore {
+    return FsStore{ .n = 0, .path_len = [0] ** 8, .data_len = [0] ** 8, .path = [0] ** 256, .data = [0] ** 512 };
+}
+
+fn fs_make(mode: u8, t: *EffectTape, seed: u32, fault_permille: u32) -> Fs {
+    return Fs{ .mode = mode, .rights = FS_RIGHTS_ALL, .status = ST_OK, .seed = seed,
+        .fault_permille = fault_permille, .calls = 0, .store = fs_store_new(), .tape = t };
+}
+
+/// The simulated handler: an empty store under a seed. It never touches the tape.
+pub fn fs_sim(t: *EffectTape, seed: u32, fault_permille: u32) -> Fs {
+    return fs_make(CAP_SIM, t, seed, fault_permille);
+}
+
+/// The simulated handler, recording every call on the run's tape.
+pub fn fs_recorder(t: *EffectTape, seed: u32, fault_permille: u32) -> Fs {
+    return fs_make(CAP_RECORD, t, seed, fault_permille);
+}
+
+/// A replayer of the recording on t, which the caller has rewound.
+pub fn fs_replayer(t: *EffectTape) -> Fs {
+    return fs_make(CAP_REPLAY, t, 0, 0);
+}
+
+/// The real handler's handle: the host's loop answers it (capability.t27, CAP_HOST).
+pub fn fs_host(t: *EffectTape) -> Fs {
+    return fs_make(CAP_HOST, t, 0, 0);
+}
+
+/// Keeps only the rights in keep; a handle never gains one.
+pub fn fs_restrict(fs: *Fs, keep: u8) -> void {
+    fs.rights = fs.rights & keep;
+}
+
+pub fn fs_may(fs: *Fs, right: u8) -> bool {
+    return (fs.rights & right) == right;
+}
+
+; --- 3. The simulated store ------------------------------------------------------------------------
+
+/// The slot holding path, or FS_FILES.
+pub fn fs_slot(st: *FsStore, path: []const u8) -> u32 {
+    var i : u32 = 0;
+    while (i < st.n) {
+        const at : u32 = i * FS_MAX_PATH;
+        if (same_text(st.path[at .. at + st.path_len[i]], path)) { return i; }
+        i = i + 1;
+    }
+    return FS_FILES;
+}
+
+/// Does this call fail with an injected fault? Every call that reaches the store draws once.
+fn fs_fault(fs: *Fs) -> bool {
+    const roll : u32 = sim_roll(fs.seed, FS_STREAM_FAULT, fs.calls);
+    fs.calls = fs.calls + 1;
+    return roll % PERMILLE < fs.fault_permille;
+}
+
+fn fs_store_read(fs: *Fs, path: []const u8) -> ?[]const u8 {
+    if ((path.len as u32) > FS_MAX_PATH) {
+        fs.status = ST_TOO_BIG;
+        return null;
+    }
+    if (fs_fault(fs)) {
+        fs.status = ST_IO;
+        return null;
+    }
+    const i : u32 = fs_slot(&fs.store, path);
+    if (i == FS_FILES) {
+        fs.status = ST_NOT_FOUND;
+        return null;
+    }
+    fs.status = ST_OK;
+    const at : u32 = i * FS_MAX_DATA;
+    return fs.store.data[at .. at + fs.store.data_len[i]];
+}
+
+fn fs_store_write(fs: *Fs, path: []const u8, data: []const u8) -> bool {
+    if ((path.len as u32) > FS_MAX_PATH or (data.len as u32) > FS_MAX_DATA) {
+        fs.status = ST_TOO_BIG;
+        return false;
+    }
+    if (fs_fault(fs)) {
+        fs.status = ST_IO;
+        return false;
+    }
+    var i : u32 = fs_slot(&fs.store, path);
+    if (i == FS_FILES) {
+        if (fs.store.n == FS_FILES) {
+            fs.status = ST_FULL;
+            return false;
+        }
+        i = fs.store.n;
+        fs.store.n = i + 1;
+        fs.store.path_len[i] = path.len as u32;
+        _ = put_bytes(fs.store.path[0 .. 256], (i * FS_MAX_PATH) as usize, path);
+    }
+    fs.store.data_len[i] = data.len as u32;
+    _ = put_bytes(fs.store.data[0 .. 512], (i * FS_MAX_DATA) as usize, data);
+    fs.status = ST_OK;
+    return true;
+}
+
+; --- 4. The calls ----------------------------------------------------------------------------------
+
+/// The bytes at path, or null; fs.status says why.
+pub fn fs_read(fs: *Fs, path: []const u8) -> ?[]const u8 {
+    if (!fs_may(fs, FS_RIGHT_READ)) {
+        fs.status = ST_DENIED;
+        return null;
+    }
+    if (cap_replays(fs.mode)) {
+        if (!tape_take(fs.tape, FS_READ, 0, path, "", fs.mode == CAP_HOST)) {
+            fs.status = fs.tape.state;
+            return null;
+        }
+        const i : u32 = tape_last(fs.tape);
+        fs.status = fs.tape.status[i];
+        if (fs.status != ST_OK) { return null; }
+        return tape_out(fs.tape, i);
+    }
+    const got : ?[]const u8 = fs_store_read(fs, path);
+    if (fs.mode == CAP_RECORD) {
+        if (got == null) {
+            _ = tape_record(fs.tape, FS_READ, 0, path, "", fs.status, 0, "");
+        } else {
+            _ = tape_record(fs.tape, FS_READ, 0, path, "", ST_OK, got.?.len as u64, got.?);
+        }
+    }
+    return got;
+}
+
+/// Creates or replaces the file at path with data; false when it did not, and fs.status says why.
+pub fn fs_write(fs: *Fs, path: []const u8, data: []const u8) -> bool {
+    if (!fs_may(fs, FS_RIGHT_WRITE)) {
+        fs.status = ST_DENIED;
+        return false;
+    }
+    if (cap_replays(fs.mode)) {
+        if (!tape_take(fs.tape, FS_WRITE, 0, path, data, fs.mode == CAP_HOST)) {
+            fs.status = fs.tape.state;
+            return false;
+        }
+        fs.status = fs.tape.status[tape_last(fs.tape)];
+        return fs.status == ST_OK;
+    }
+    const ok : bool = fs_store_write(fs, path, data);
+    if (fs.mode == CAP_RECORD) {
+        _ = tape_record(fs.tape, FS_WRITE, 0, path, data, fs.status, 0, "");
+    }
+    return ok;
+}
+
+; --- 5. Recordings and the host --------------------------------------------------------------------
+
+/// A recording written back as calls, the form the t27o oracle emits: one fs_read of path that
+/// answered status with the bytes got (empty unless ST_OK).
+pub fn fs_tape_read(t: *EffectTape, path: []const u8, status: u8, got: []const u8) -> bool {
+    return tape_record(t, FS_READ, 0, path, "", status, got.len as u64, got);
+}
+
+/// One fs_write of data to path that answered status.
+pub fn fs_tape_write(t: *EffectTape, path: []const u8, data: []const u8, status: u8) -> bool {
+    return tape_record(t, FS_WRITE, 0, path, data, status, 0, "");
+}
+
+/// The real handler's shape: perform the fs call waiting on the CAP_HOST tape t against world, and
+/// answer it with world's status and result. False when no call waits or it is not an fs call.
+pub fn fs_serve(t: *EffectTape, world: *Fs) -> bool {
+    if (!tape_pending(t)) { return false; }
+    const i : u32 = tape_pending_at(t);
+    if (t.op[i] == FS_READ) {
+        const got : ?[]const u8 = fs_read(world, tape_a(t, i));
+        if (got == null) { return tape_answer(t, world.status, 0, ""); }
+        return tape_answer(t, ST_OK, got.?.len as u64, got.?);
+    }
+    if (t.op[i] == FS_WRITE) {
+        _ = fs_write(world, tape_a(t, i), tape_b(t, i));
+        return tape_answer(t, world.status, 0, "");
+    }
+    return false;
+}
+
+; --- tests -----------------------------------------------------------------------------------------
+
+/// A core that uses the capability: copy one file to another path.
+fn copy_file(fs: *Fs, from: []const u8, to: []const u8) -> bool {
+    const got : ?[]const u8 = fs_read(fs, from);
+    if (got == null) { return false; }
+    return fs_write(fs, to, got.?);
+}
+
+test "a_write_reads_back_byte_for_byte_and_a_missing_path_is_not_found" {
+    var t = tape_new();
+    var fs = fs_sim(&t, 1, 0);
+    assert fs_write(&fs, "a.txt", "alpha");
+    assert fs_write_post(fs.rights, fs.status, true);
+    assert fs_write(&fs, "b.txt", "beta");
+    const a : ?[]const u8 = fs_read(&fs, "a.txt");
+    assert a != null;
+    assert same_text(a.?, "alpha");
+    assert fs_read_post(fs.rights, fs.status, true);
+    const b : ?[]const u8 = fs_read(&fs, "b.txt");
+    assert same_text(b.?, "beta");
+    assert fs_write(&fs, "a.txt", "omega!");
+    assert same_text(fs_read(&fs, "a.txt").?, "omega!");
+    assert fs.store.n == 2;
+    assert fs_read(&fs, "c.txt") == null;
+    assert fs.status == ST_NOT_FOUND;
+    assert fs_read_post(fs.rights, fs.status, false);
+    // an empty file is a file
+    assert fs_write(&fs, "empty", "");
+    assert fs_read(&fs, "empty") != null;
+    assert fs_read(&fs, "empty").?.len == 0;
+    // the simulated handler kept nothing on the tape
+    assert t.len == 0;
+}
+
+test "too_big_and_full_fail_and_change_nothing" {
+    var t = tape_new();
+    var fs = fs_sim(&t, 1, 0);
+    assert fs_write(&fs, "keep", "kept");
+    assert fs_write(&fs, "012345678901234567890123456789012", "x") == false;
+    assert fs.status == ST_TOO_BIG;
+    assert fs_write_post(fs.rights, fs.status, false);
+    const wide : [65]u8 = [66] ** 65;
+    assert fs_write(&fs, "keep", wide[0 .. 65]) == false;
+    assert fs.status == ST_TOO_BIG;
+    assert same_text(fs_read(&fs, "keep").?, "kept");
+    assert fs_read(&fs, "012345678901234567890123456789012") == null;
+    assert fs.status == ST_TOO_BIG;
+    // a path of exactly FS_MAX_PATH bytes and data of exactly FS_MAX_DATA bytes fit
+    assert fs_read(&fs, "01234567890123456789012345678901") == null;
+    assert fs.status == ST_NOT_FOUND;
+    const full : [64]u8 = [67] ** 64;
+    assert fs_write(&fs, "01234567890123456789012345678901", full[0 .. 64]);
+    assert fs_read(&fs, "01234567890123456789012345678901").?.len == 64;
+    assert fs.store.n == 2;
+    assert fs_write(&fs, "f1", "1");
+    assert fs_write(&fs, "f2", "2");
+    assert fs_write(&fs, "f3", "3");
+    assert fs_write(&fs, "f4", "4");
+    assert fs_write(&fs, "f5", "5");
+    assert fs_write(&fs, "f6", "6");
+    assert fs.store.n == FS_FILES;
+    assert fs_write(&fs, "f8", "8") == false;
+    assert fs.status == ST_FULL;
+    assert fs_write_post(fs.rights, fs.status, false);
+    assert fs_read(&fs, "f8") == null;
+    // a full store still replaces what it holds
+    assert fs_write(&fs, "f6", "six");
+    assert same_text(fs_read(&fs, "f6").?, "six");
+}
+
+test "rights_narrow_never_widen_and_a_denial_is_not_recorded" {
+    var t = tape_new();
+    var fs = fs_recorder(&t, 1, 0);
+    assert fs_write(&fs, "cfg", "v1");
+    fs_restrict(&fs, FS_RIGHT_READ);
+    assert fs_write(&fs, "cfg", "v2") == false;
+    assert fs.status == ST_DENIED;
+    assert fs_write_post(fs.rights, fs.status, false);
+    assert same_text(fs_read(&fs, "cfg").?, "v1");
+    // restricting to everything gives nothing back
+    fs_restrict(&fs, FS_RIGHTS_ALL);
+    assert fs_may(&fs, FS_RIGHT_WRITE) == false;
+    assert fs_write(&fs, "cfg", "v3") == false;
+    fs_restrict(&fs, 0);
+    assert fs_read(&fs, "cfg") == null;
+    assert fs.status == ST_DENIED;
+    assert fs_read_post(fs.rights, fs.status, false);
+    // the denied calls reached neither the store nor the tape: one write and one read were recorded
+    assert fs.calls == 2;
+    assert t.len == 2;
+}
+
+test "faults_are_a_function_of_the_seed" {
+    var t = tape_new();
+    var always = fs_sim(&t, 5, 1000);
+    assert fs_write(&always, "x", "1") == false;
+    assert always.status == ST_IO;
+    assert fs_write_post(always.rights, always.status, false);
+    assert fs_read(&always, "x") == null;
+    assert always.status == ST_IO;
+    var one = fs_sim(&t, 7, 300);
+    var same = fs_sim(&t, 7, 300);
+    var other = fs_sim(&t, 8, 300);
+    var never = fs_sim(&t, 7, 0);
+    var k : u32 = 0;
+    var failed : u32 = 0;
+    var differ : u32 = 0;
+    while (k < 40) {
+        const a : bool = fs_write(&one, "p", "d");
+        const b : bool = fs_write(&same, "p", "d");
+        const c : bool = fs_write(&other, "p", "d");
+        assert a == b;
+        assert fs_write(&never, "p", "d");
+        if (a == false) { failed = failed + 1; }
+        if (a != c) { differ = differ + 1; }
+        k = k + 1;
+    }
+    assert failed > 0;
+    assert failed < 40;
+    assert differ > 0;
+}
+
+test "a_recording_replays_to_the_same_answers" {
+    var t = tape_new();
+    var rec = fs_recorder(&t, 3, 0);
+    assert fs_write(&rec, "in", "payload");
+    assert copy_file(&rec, "in", "out");
+    assert copy_file(&rec, "nope", "out2") == false;
+    assert t.len == 4;
+    assert tape_done(&t);
+    var again = t;
+    tape_rewind(&again);
+    var rep = fs_replayer(&again);
+    assert fs_write(&rep, "in", "payload");
+    assert copy_file(&rep, "in", "out");
+    assert copy_file(&rep, "nope", "out2") == false;
+    assert rep.status == ST_NOT_FOUND;
+    assert tape_done(&again);
+    // the replayer has no store: everything came from the tape
+    assert rep.store.n == 0;
+    assert rep.calls == 0;
+}
+
+test "a_replay_catches_a_different_write" {
+    var t = tape_new();
+    var rec = fs_recorder(&t, 3, 0);
+    assert fs_write(&rec, "in", "payload");
+    assert copy_file(&rec, "in", "out");
+    var again = t;
+    tape_rewind(&again);
+    var rep = fs_replayer(&again);
+    assert fs_write(&rep, "in", "payload");
+    assert fs_read(&rep, "in") != null;
+    assert fs_write(&rep, "out", "PAYLOAD") == false;
+    assert rep.status == ST_DIVERGED;
+    assert fs_write_post(rep.rights, rep.status, false);
+    assert tape_done(&again) == false;
+}
+
+test "the_host_protocol_matches_the_simulation" {
+    // the simulation's answer
+    var ts = tape_new();
+    var sim = fs_sim(&ts, 9, 0);
+    assert fs_write(&sim, "in", "payload");
+    const want : bool = copy_file(&sim, "in", "out");
+    // the host: world stands in for the OS, and this loop is the generated glue's
+    var tw = tape_new();
+    var world = fs_sim(&tw, 9, 0);
+    assert fs_write(&world, "in", "payload");
+    var t = tape_new();
+    var host = fs_host(&t);
+    var runs : u32 = 0;
+    var got : bool = false;
+    var waiting : bool = true;
+    while (waiting and runs < TAPE_ENTRIES + 1) {
+        got = copy_file(&host, "in", "out");
+        runs = runs + 1;
+        waiting = tape_pending(&t);
+        if (waiting) {
+            assert fs_serve(&t, &world);
+            tape_rewind(&t);
+        }
+    }
+    assert got == want;
+    assert got;
+    // two effects, three runs, and each effect performed once
+    assert runs == 3;
+    assert world.calls == 3;
+    assert t.len == 2;
+    assert tape_done(&t);
+    assert same_text(fs_read(&world, "out").?, "payload");
+    // with nothing waiting, serve does nothing: the world sees no call
+    assert fs_serve(&t, &world) == false;
+    assert world.calls == 4;
+}
+
+test "the_host_passes_a_failure_through" {
+    var tw = tape_new();
+    var world = fs_sim(&tw, 9, 0);
+    var t = tape_new();
+    var host = fs_host(&t);
+    assert copy_file(&host, "missing", "out") == false;
+    assert host.status == ST_PENDING;
+    assert fs_serve(&t, &world);
+    assert t.status[0] == ST_NOT_FOUND;
+    tape_rewind(&t);
+    assert copy_file(&host, "missing", "out") == false;
+    assert host.status == ST_NOT_FOUND;
+    assert tape_pending(&t) == false;
+    assert tape_done(&t);
+    assert world.calls == 1;
+}
+
+test "a_recording_written_as_calls_replays" {
+    var t = tape_new();
+    assert fs_tape_read(&t, "in", ST_OK, "payload");
+    assert fs_tape_write(&t, "out", "payload", ST_OK);
+    tape_rewind(&t);
+    var fs = fs_replayer(&t);
+    assert copy_file(&fs, "in", "out");
+    assert tape_done(&t);
+    var tm = tape_new();
+    assert fs_tape_read(&tm, "in", ST_NOT_FOUND, "");
+    tape_rewind(&tm);
+    var missing = fs_replayer(&tm);
+    assert copy_file(&missing, "in", "out") == false;
+    assert missing.status == ST_NOT_FOUND;
+    assert tape_done(&tm);
+}
+
+test "the_contract_predicates" {
+    assert fs_read_post(FS_RIGHTS_ALL, ST_OK, true);
+    assert fs_read_post(FS_RIGHTS_ALL, ST_NOT_FOUND, false);
+    assert fs_read_post(FS_RIGHTS_ALL, ST_PENDING, false);
+    assert fs_read_post(FS_RIGHTS_ALL, ST_OK, false) == false;
+    assert fs_read_post(FS_RIGHTS_ALL, ST_NOT_FOUND, true) == false;
+    assert fs_read_post(FS_RIGHTS_ALL, ST_FULL, false) == false;
+    assert fs_read_post(FS_RIGHTS_ALL, ST_DENIED, false) == false;
+    assert fs_read_post(FS_RIGHT_WRITE, ST_DENIED, false);
+    assert fs_read_post(FS_RIGHT_WRITE, ST_OK, true) == false;
+    assert fs_read_post(FS_RIGHTS_ALL, 8, false) == false;
+    assert fs_read_post(FS_RIGHTS_ALL, ST_DIVERGED, false);
+    assert fs_read_post(FS_RIGHT_WRITE, ST_DENIED, true) == false;
+    assert fs_read_post(FS_RIGHT_WRITE, ST_NOT_FOUND, false) == false;
+    assert fs_write_post(FS_RIGHTS_ALL, ST_OK, true);
+    assert fs_write_post(FS_RIGHTS_ALL, ST_FULL, false);
+    assert fs_write_post(FS_RIGHTS_ALL, ST_NOT_FOUND, false) == false;
+    assert fs_write_post(FS_RIGHTS_ALL, ST_OK, false) == false;
+    assert fs_write_post(FS_RIGHT_READ, ST_DENIED, false);
+    assert fs_write_post(FS_RIGHT_READ, ST_OK, true) == false;
+    assert fs_write_post(FS_RIGHTS_ALL, ST_DENIED, false) == false;
+    assert fs_write_post(FS_RIGHTS_ALL, ST_DIVERGED, false);
+    assert fs_write_post(FS_RIGHTS_ALL, 8, false) == false;
+    assert fs_write_post(FS_RIGHT_READ, ST_DENIED, true) == false;
+    assert fs_write_post(FS_RIGHT_READ, ST_FULL, false) == false;
+    assert cap_of_op(FS_READ) == CAP_FS;
+    assert cap_of_op(FS_WRITE) == CAP_FS;
+}

@@ -147,7 +147,7 @@ Use `fpga/verilog/ternary_mac_synth.v` from W359 and push through OpenXC7 bitstr
 ### Pros
 - Maximum pressure on all fronts: formal depth, backend fix, silicon evidence
 - If successful, creates an unbeatable competitive narrative (184 generic ∀ + generated + silicon)
-- Positions Trinity for NSF SHF / DARPA grant applications
+- Positions Trinity for NSF SHF / federal grant applications
 
 ### Cons
 - HIGH risk of partial failure due to toolchain/backend complexity
