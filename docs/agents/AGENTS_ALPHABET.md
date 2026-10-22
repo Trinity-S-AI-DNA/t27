@@ -117,35 +117,35 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 
 ## 27 AGENTS — FULL TABLE
 
-| Agent | Letter | Domain (core) | Archetype | Key files | Entry invariant | Exit invariant | CLARA role |
+| Agent | Letter | Domain (core) | Archetype | Key files | Entry invariant | Exit invariant | AR role |
 |-------|--------|---------------|----------|-----------|-----------------|----------------|------------|
-| **A** | Alpha α | Architecture / ADR / SOUL | Bull — leader, primary force | `SOUL.md`, `architecture/ADR-*.md` | `SOUL.md` exists and is ASCII-only | All ADRs reviewed and consistent | TA1: AR Architecture Design |
-| **B** | Beta β | Build / Pipeline | House — container, dwelling | `build.tri`, `src/tri/pipeline/` | Build system is clean | All tests pass in pipeline | — |
-| **C** | Gamma γ | Compiler Core | Camel — carrier across borders | `t27/compiler/parser/`, `specs/ar/*.t27` | Parser can handle all AR specs | Generated code compiles | TA1: AR Language Implementation |
-| **D** | Delta δ | De-Zigfication | Door — transition between worlds | `docs/migration-map.md`, `specs/ar/*.t27` | Legacy Zig modules mapped | All AR specs in .t27 format | — |
-| **E** | Epsilon ε | Experience / Mistakes | Window — view into the past | `.trinity/experience/`, `specs/ar/explainability.t27` | Episode log is append-only | Lessons learned catalogued | TA2: AR Explanation & XAI |
-| **F** | Phi φ | Formal Conformance | Nail — connection, binding | `t27/conformance/*.json` | All sacred vectors valid | Conformance > 95% | — |
-| **G** | Gamma (var.) | Graph / ArchBench | Return — feedback | `architecture/graph_v2.json` | Graph is acyclic | All edges satisfied | — |
-| **H** | Eta η | HSLM / NN Architectures | Fence — boundary, life | `t27/specs/nn/hslm.t27` | HSLM layers defined | Attention traces validated | — |
-| **I** | Iota ι | ISA / Registers | Hand — action, point | `t27/specs/isa/registers.t27` | 27 registers defined | Coptic mapping verified | — |
-| **J** | Iota‑extended | Jobs / Task Routing | Hand with grip — dispatcher | `src/tri/dev_commands.zig` | Task queue exists | No stuck jobs > 1 hour | — |
-| **K** | Kappa κ | Kernel / FPGA MAC | Palm — open hand | `t27/specs/fpga/mac.t27` | MAC spec is zero-DSP | Synthesis verified | — |
-| **L** | Lambda λ | Language / Syntax vNEXT | Staff — teacher, guide | `docs/nona-02-organism/TRI_SYNTAX_VNEXT.md` | Syntax vNEXT documented | Parser implements vNEXT | — |
-| **M** | Mu μ | Metrics / Telemetry | Water — flow of data | `.trinity/bench/` | Bench baseline exists | No regression > 5% | — |
-| **N** | Nu ν | Numeric / GoldenFloat Family | Fish — offspring, multiplication | `t27/specs/numeric/` | GF family defined | φ identity validated | — |
-| **O** | Omicron ο | Orchestration / Phases | Eye — all-seeing oko | `src/tri/pipeline/`, `specs/ar/composition.t27` | All phases defined | Orchestration completes | TA2: AR Composition Engine |
-| **P** | Pi π | Physics / SacredPhysics | Mouth — speech of universe | `t27/specs/math/sacred_physics.t27` | φ² + φ⁻² = 3 holds | Sacred constants verified | TA1: AR Theoretical Foundations |
-| **Q** | Theta θ | Queue / Scheduling | Needle's eye — bottleneck | `src/tri/dev_commands.zig` | Queue is not empty | MNL pattern enforced | — |
-| **R** | Rho ρ | Runtime | Head — beginning of execution | `t27/compiler/runtime/` | Runtime initialized | No memory leaks | — |
-| **S** | Sigma σ | Specs / Standardization | Teeth — sharpness, flame | `specs/`, `specs/ar/*.t27`, `docs/NUMERIC-*.md` | All specs have TDD | Standards are consistent | TA1: AR Spec Standards |
-| **T** | Tau τ | TRINITY Queen / Lotus | CROSS — seal, signature, truth | `t27/specs/queen/lotus.t27` | Queen health >= 0.9 | All rings sealed | TA2: AR Orchestrator |
-| **U** | Upsilon υ | Universe Levels / Domains | Fork — branching | `t27/domains/` | Domain boundaries defined | No circular dependencies | — |
-| **V** | Vau (var.) | Verdict / Bench | Hook — connection, conjunction | `src/tri/verdict.zig`, `specs/ar/proof_trace.t27` | Verdict engine ready | Toxicity detected | TA2: AR Validation & Proof |
-| **W** | Double‑Vav | Workflow / tri cell | Double hook — double seal | `src/tri/cell.zig` | Cell is sealed | Hash verified | — |
-| **X** | Chi χ | eXternal Bindings / Interop | Intersection — point of exchange | `bindings/` | Bindings documented | Interop tests pass | — |
-| **Y** | Psi ψ | Yield / DePIN / Fitness | Merging paths — evolutionary selection | `deploy/contracts/` | DePIN nodes defined | Fitness score > 0.8 | — |
-| **Z** | Zeta ζ | Zero‑Touch UX / Docs | Sword — cutting edge, point | `docs/` | All docs in English | DX score > 4/5 | — |
-| **27th** | Ti Ϯ | Reserve / Security | Egyptian cross — "sacred gift" | — | Security policy exists | AAIF compliance ready | — |
+| **A** | Alpha α | Architecture / ADR / SOUL | Bull — leader, primary force | `SOUL.md`, `AGENTS.md`, `CLAUDE.md`, `architecture/ADR-*.md`, `architecture/CANON_DE_ZIGFICATION.md`, `docs/T27-CONSTITUTION.md`, `specs/agents/` | `SOUL.md` exists and is ASCII-only | All ADRs reviewed and consistent | TA1: AR Architecture Design |
+| **B** | Beta β | Build / Pipeline | House — container, dwelling | `.github/workflows/`, `.trinity/seals/`, `scripts/`, `tools/`, `tools/policy/`, `specs/claw/`, `specs/ci/`, `specs/pipeline/`, `specs/policy/`, `Cargo.toml`, `Cargo.lock`, `.trinity/` | Build system is clean | All tests pass in pipeline | — |
+| **C** | Gamma γ | Compiler Core | Camel — carrier across borders | `bootstrap/src/`, `bootstrap/tests/`, `bootstrap/gen/`, `bootstrap/src/compiler.rs`, `specs/compiler/`, `gen/rust/`, `gen/c/`, `specs/ar/*.t27` | Parser can handle all AR specs | Generated code compiles | TA1: AR Language Implementation |
+| **D** | Delta δ | De-Zigfication | Door — transition between worlds | `specs/port/`, `specs/ar/*.t27` | Legacy Zig modules mapped | All AR specs in .t27 format | — |
+| **E** | Epsilon ε | Experience / Mistakes | Window — view into the past | `.trinity/experience/`, `docs/now/`, `specs/experience/`, `specs/memory/`, `specs/brain/`, `specs/ar/explainability.t27` | Episode log is append-only | Lessons learned catalogued | TA2: AR Explanation & XAI |
+| **F** | Phi φ | Formal Conformance | Nail — connection, binding | `conformance/`, `conformance/*.json`, `conformance/FORMAT-SPEC-001.json`, `specs/conformance/`, `specs/test_framework/` | All sacred vectors valid | Conformance > 95% | — |
+| **G** | Gamma (var.) | Graph / ArchBench | Return — feedback | `architecture/graph_v2.json`, `architecture/graph.tri`, `specs/graph/` | Graph is acyclic | All edges satisfied | — |
+| **H** | Eta η | HSLM / NN Architectures | Fence — boundary, life | `specs/ml/`, `specs/nn/`, `specs/hslm/`, `specs/igla/`, `specs/neural/`, `specs/dataset/`, `specs/nn/hslm.t27`, `specs/nn/attention.t27` | HSLM layers defined | Attention traces validated | — |
+| **I** | Iota ι | ISA / Registers | Hand — action, point | `specs/isa/`, `specs/isa/registers.t27` | 27 registers defined | Coptic mapping verified | — |
+| **J** | Iota‑extended | Jobs / Task Routing | Hand with grip — dispatcher | `specs/automation/`, `specs/functions/`, `specs/jobs/` | Task queue exists | No stuck jobs > 1 hour | — |
+| **K** | Kappa κ | Kernel / FPGA MAC | Palm — open hand | `cli/t27b/`, `specs/tri/t27b/`, `specs/fpga/`, `fpga/`, `gen/verilog/`, `tools/jtag/`, `specs/xilinx7/`, `specs/math/e8_lie_algebra.t27`, `tests/fixtures/t27b-fuzz/` | MAC spec is zero-DSP | Synthesis verified | — |
+| **L** | Lambda λ | Language / Syntax vNEXT | Staff — teacher, guide | `specs/tri/`, `specs/basics/`, `specs/tutorial/`, `specs/lsp/`, `docs/nona-02-organism/TRI_SYNTAX_VNEXT.md` | Syntax vNEXT documented | Parser implements vNEXT | — |
+| **M** | Mu μ | Metrics / Telemetry | Water — flow of data | `docs/reports/`, `tools/census/`, `specs/benchmarks/`, `benchmarks/`, `bench/`, `docs/qualification/TVP.md` | Bench baseline exists | No regression > 5% | — |
+| **N** | Nu ν | Numeric / GoldenFloat Family | Fish — offspring, multiplication | `specs/numeric/` | GF family defined | φ identity validated | — |
+| **O** | Omicron ο | Orchestration / Phases | Eye — all-seeing oko | `cli/tri/`, `specs/tools/tri/`, `specs/rings/`, `specs/ar/composition.t27` | All phases defined | Orchestration completes | TA2: AR Composition Engine |
+| **P** | Pi π | Physics / SacredPhysics | Mouth — speech of universe | `specs/physics/`, `specs/math/`, `specs/analog/`, `specs/sacred/`, `specs/math/sacred_physics.t27`, `specs/physics/su2_chern_simons.t27` | φ² + φ⁻² = 3 holds | Sacred constants verified | TA1: AR Theoretical Foundations |
+| **Q** | Theta θ | Queue / Scheduling | Needle's eye — bottleneck | `specs/crons/` | Queue is not empty | MNL pattern enforced | — |
+| **R** | Rho ρ | Runtime | Head — beginning of execution | `bootstrap/stage0/`, `bootstrap/`, `specs/runtime/`, `specs/vm/`, `specs/jit/`, `bootstrap/src/compiler.rs`, `specs/effects/`, `specs/base/` | Runtime initialized | No memory leaks | — |
+| **S** | Sigma σ | Specs / Standardization | Teeth — sharpness, flame | `specs/`, `specs/ar/*.t27` | All specs have TDD | Standards are consistent | TA1: AR Spec Standards |
+| **T** | Tau τ | TRINITY Queen / Lotus | CROSS — seal, signature, truth | `specs/queen/`, `tools/queen/`, `tools/bees/`, `specs/queen/lotus.t27` | Queen health >= 0.9 | All rings sealed | TA2: AR Orchestrator |
+| **U** | Upsilon υ | Universe Levels / Domains | Fork — branching | `specs/ternary/`, `specs/scenes/`, `specs/vsa/` | Domain boundaries defined | No circular dependencies | — |
+| **V** | Vau (var.) | Verdict / Bench | Hook — connection, conjunction | `specs/verified/`, `specs/ar/proof_trace.t27`, `specs/ar/restraint.t27`, `.trinity/receipts/` | Verdict engine ready | Toxicity detected | TA2: AR Validation & Proof |
+| **W** | Double‑Vav | Workflow / tri cell | Double hook — double seal | `.claude/skills/`, `specs/skills/`, `specs/shell/`, `.claude/agents/` | Cell is sealed | Hash verified | — |
+| **X** | Chi χ | eXternal Bindings / Interop | Intersection — point of exchange | `bindings/`, `specs/tools/mcp/`, `specs/tools/trinity/`, `specs/mcp/`, `specs/t27mcp/`, `specs/api/`, `specs/interop/`, `specs/providers/`, `specs/provider/`, `specs/server/`, `specs/trinity/` | Bindings documented | Interop tests pass | — |
+| **Y** | Psi ψ | Yield / DePIN / Fitness | Merging paths — evolutionary selection | `specs/depin/`, `specs/hosting/`, `specs/network/`, `specs/trinet/` | DePIN nodes defined | Fitness score > 0.8 | — |
+| **Z** | Zeta ζ | Zero‑Touch UX / Docs | Sword — cutting edge, point | `specs/t27os/`, `specs/t27f/`, `specs/widgets/`, `specs/ui/`, `specs/tools/t27o/`, `specs/i18n/`, `docs/`, `specs/docs/` | All docs in English | DX score > 4/5 | — |
+| **27th** | Ti Ϯ | Reserve / Security | Egyptian cross — "sacred gift" | `specs/sandbox/`, `specs/vault/` | Security policy exists | AAIF compliance ready | — |
 
 ---
 
@@ -158,7 +158,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `SOUL.md`, `architecture/ADR-*.md`, `architecture/CANON_DE_ZIGFICATION.md`
 **Entry Invariant**: `SOUL.md` exists, is ASCII-only, and defines L1-L7 laws
 **Exit Invariant**: All ADRs reviewed, consistent with constitution, no conflicts
-**CLARA Role**: TA1: AR Architecture Design — designs AR module architecture, ensures composability
+**AR Role**: AR Architecture Design — designs AR module architecture, ensures composability
 
 ### Agent B — Beta (Build)
 
@@ -175,7 +175,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `t27/compiler/parser/`, `bootstrap/src/compiler.rs`, `specs/ar/*.t27`
 **Entry Invariant**: Parser can handle all AR syntax (ternary logic, rules, proofs)
 **Exit Invariant**: Generated code compiles, AST is valid
-**CLARA Role**: TA1: AR Language Implementation — implements AR language features in t27 compiler
+**AR Role**: AR Language Implementation — implements AR language features in t27 compiler
 
 ### Agent D — Delta (De-Zigfication)
 
@@ -192,7 +192,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `.trinity/experience/`, `specs/ar/explainability.t27`, `specs/ar/proof_trace.t27`
 **Entry Invariant**: Episode log is append-only, no deletions
 **Exit Invariant**: Lessons learned are catalogued, explanations are generated
-**CLARA Role**: TA2: AR Explanation & XAI — generates human-readable explanations for AR outputs
+**AR Role**: AR Explanation & XAI — generates human-readable explanations for AR outputs
 
 ### Agent F — Phi (Formal Conformance)
 
@@ -273,7 +273,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `src/tri/pipeline/`, `specs/ar/composition.t27`
 **Entry Invariant**: All phases (1-6) are defined, phase transitions valid
 **Exit Invariant**: Orchestration completes, no stuck phases
-**CLARA Role**: TA2: AR Composition Engine — composes ML and AR components, manages interactions
+**AR Role**: AR Composition Engine — composes ML and AR components, manages interactions
 
 ### Agent P — Pi (Physics)
 
@@ -282,7 +282,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `t27/specs/math/sacred_physics.t27`, `specs/physics/su2_chern_simons.t27`
 **Entry Invariant**: φ² + φ⁻² = 3 holds in all calculations
 **Exit Invariant**: Sacred constants (G, ΩΛ, φ, tpresent) are verified
-**CLARA Role**: TA1: AR Theoretical Foundations — provides mathematical basis for AR reasoning
+**AR Role**: AR Theoretical Foundations — provides mathematical basis for AR reasoning
 
 ### Agent Q — Theta (Queue)
 
@@ -307,7 +307,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `specs/`, `specs/ar/*.t27`, `docs/NUMERIC-*.md`
 **Entry Invariant**: All specs have TDD (test/invariant/bench)
 **Exit Invariant**: Standards are consistent, naming rules followed
-**CLARA Role**: TA1: AR Spec Standards — defines and enforces AR spec conventions
+**AR Role**: AR Spec Standards — defines and enforces AR spec conventions
 
 ### Agent T — Tau (TRINITY Queen)
 
@@ -316,7 +316,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `t27/specs/queen/lotus.t27`
 **Entry Invariant**: Queen health >= 0.9, graph is loaded
 **Exit Invariant**: All rings are sealed, verdict is clean
-**CLARA Role**: TA2: AR Orchestrator — coordinates all AR agents for CLARA submission
+**AR Role**: AR Orchestrator — coordinates all AR agents
 
 ### Agent U — Upsilon (Universe)
 
@@ -333,7 +333,7 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 **Key Files**: `src/tri/verdict.zig`, `specs/ar/proof_trace.t27`, `specs/ar/restraint.t27`
 **Entry Invariant**: Verdict engine is ready, toxic thresholds defined
 **Exit Invariant**: Toxicity is detected, proof traces are generated
-**CLARA Role**: TA2: AR Validation & Proof — validates AR reasoning, generates proofs
+**AR Role**: AR Validation & Proof — validates AR reasoning, generates proofs
 
 ### Agent W — Double-Vav (Workflow)
 
@@ -628,12 +628,12 @@ two domains, and a tool the Queen runs daily may still be N's or K's to answer f
 | **V** | 8 | 3 | `gHashTag/trinity:tri/bench`, `gHashTag/trinity:tri/test`, `tri/competitors`, `tri/mutate`, `tri/orphaned`, `tri/test`, `tri/verdict`, `tri/vsim`, *t27/tri-pipeline*, *trinity/review-code*, *trinity/status* |
 | **W** | 7 | 3 | `mcp/t27-traceability`, `mcp/tri-mcp`, `tri/cell`, `tri/merging`, `tri/pr`, `tri/status`, `tri/worktrees`, *t27/phi-loop*, *t27/tri*, *trinity/implement-issue* |
 | **X** | 0 | 1 | *trinity/scholar* |
-| **Y** | 7 | 2 | `gHashTag/trinity:tri/govern`, `gHashTag/trinity:tri/hardware`, `gHashTag/trinity:tri/identity`, `gHashTag/trinity:tri/mesh`, `gHashTag/trinity:tri/reputation`, `gHashTag/trinity:tri/wallet`, `tri/serve`, *trinity/farm-garden*, *trinity/wave* |
+| **Y** | 7 | 3 | `gHashTag/trinity:tri/govern`, `gHashTag/trinity:tri/hardware`, `gHashTag/trinity:tri/identity`, `gHashTag/trinity:tri/mesh`, `gHashTag/trinity:tri/reputation`, `gHashTag/trinity:tri/wallet`, `tri/serve`, *t27/providers-steward*, *trinity/farm-garden*, *trinity/wave* |
 | **Z** | 2 | 4 | `mcp/tri-ssot`, `tri/now`, *trinity/blog-post*, *trinity/doctor*, *trinity/queen-hive-visuals*, *trinity/ux-wave* |
 | **TI** | 1 | 0 | `gHashTag/trinity:tri/identity` |
 
 Tools are written in `code`, skills in *italics*. The Queen is not listed: she
-holds all 92 tools and all 26 skills by rule 1, which is why her own cards say so
+holds all 93 tools and all 27 skills by rule 1, which is why her own cards say so
 rather than repeating this table.
 
 Each binding is recorded twice and checked both ways: a tool card's `AGENTS` must
