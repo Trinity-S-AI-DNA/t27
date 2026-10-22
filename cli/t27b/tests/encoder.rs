@@ -58,6 +58,12 @@ fn encoders_match_clang() {
         ("lsl w0, w1, w2", lslv(false, 0, 1, 2), 0x1ac2_2020),
         ("lsr x0, x1, x2", lsrv(true, 0, 1, 2), 0x9ac2_2420),
         ("asr w0, w1, w2", asrv(false, 0, 1, 2), 0x1ac2_2820),
+        // The other width of each register shift, and the X16/X8 operand
+        // registers codegen uses for a narrowed amount (words from clang).
+        ("lsl x3, x4, x5", lslv(true, 3, 4, 5), 0x9ac5_2083),
+        ("lsr w7, w8, w9", lsrv(false, 7, 8, 9), 0x1ac9_2507),
+        ("asr x10, x11, x12", asrv(true, 10, 11, 12), 0x9acc_296a),
+        ("lsl w17, w16, w8", lslv(false, 17, 16, 8), 0x1ac8_2211),
         ("madd x0, x1, x2, x3", madd(true, 0, 1, 2, 3), 0x9b02_0c20),
         ("msub w2, w8, w17, w2", msub(false, 2, 8, 17, 2), 0x1b11_8902),
         ("mul w9, w2, w17", mul(false, 9, 2, 17), 0x1b11_7c49),
@@ -72,6 +78,8 @@ fn encoders_match_clang() {
         ("lsl x0, x1, #1", lsl_imm(true, 0, 1, 1), 0xd37f_f820),
         ("asr w3, w4, #31", asr_imm(false, 3, 4, 31), 0x131f_7c83),
         ("lsr x5, x6, #0", lsr_imm(true, 5, 6, 0), 0xd340_fcc5),
+        ("lsr x0, x16, #63", lsr_imm(true, 0, 16, 63), 0xd37f_fe00),
+        ("lsl w0, w16, #31", lsl_imm(false, 0, 16, 31), 0x5301_0200),
         ("uxtb w0, w1", uxtb(0, 1), 0x5300_1c20),
         ("uxth w0, w1", uxth(0, 1), 0x5300_3c20),
         ("sxtb w0, w1", sxtb(0, 1), 0x1300_1c20),
@@ -107,6 +115,93 @@ fn encoders_match_clang() {
         ("ldp x29, x30, [sp], #16", ldp_x_post(29, 30, SP, 16), 0xa8c1_7bfd),
         ("stp x29, x30, [sp, #-96]!", stp_x_pre(29, 30, SP, -96), 0xa9ba_7bfd),
         ("ldp x29, x30, [sp], #96", ldp_x_post(29, 30, SP, 96), 0xa8c6_7bfd),
+        ("strb w1, [x2, #3]", ldst_uimm(0, ST, 1, 2, 3), 0x3900_0c41),
+        ("ldrb w1, [x2, #4095]", ldst_uimm(0, LD, 1, 2, 4095), 0x397f_fc41),
+        ("ldrsb w3, [x4, #1]", ldst_uimm(0, LDS32, 3, 4, 1), 0x39c0_0483),
+        ("ldrsb x3, [x4, #1]", ldst_uimm(0, LDS64, 3, 4, 1), 0x3980_0483),
+        ("strh w5, [x6, #2]", ldst_uimm(1, ST, 5, 6, 2), 0x7900_04c5),
+        ("ldrh w5, [x6, #8190]", ldst_uimm(1, LD, 5, 6, 8190), 0x797f_fcc5),
+        ("ldrsh w7, [x8, #4]", ldst_uimm(1, LDS32, 7, 8, 4), 0x79c0_0907),
+        ("str w9, [x10, #16380]", ldst_uimm(2, ST, 9, 10, 16380), 0xb93f_fd49),
+        ("ldr w9, [sp, #4]", ldst_uimm(2, LD, 9, SP, 4), 0xb940_07e9),
+        ("ldrsw x9, [x10, #8]", ldst_uimm(2, LDS64, 9, 10, 8), 0xb980_0949),
+        ("str x11, [x12, #8]", ldst_uimm(3, ST, 11, 12, 8), 0xf900_058b),
+        ("ldr x11, [x29, #32760]", ldst_uimm(3, LD, 11, 29, 32760), 0xf97f_ffab),
+        ("strb wzr, [x1]", ldst_uimm(0, ST, ZR, 1, 0), 0x3900_003f),
+        ("ldurb w1, [x29, #-1]", ldst_unscaled(0, LD, 1, 29, -1), 0x385f_f3a1),
+        ("sturh w2, [x29, #-256]", ldst_unscaled(1, ST, 2, 29, -256), 0x7810_03a2),
+        ("ldur w3, [x29, #255]", ldst_unscaled(2, LD, 3, 29, 255), 0xb84f_f3a3),
+        ("stur x4, [x29, #-8]", ldst_unscaled(3, ST, 4, 29, -8), 0xf81f_83a4),
+        ("ldursb w5, [x29, #-3]", ldst_unscaled(0, LDS32, 5, 29, -3), 0x38df_d3a5),
+        ("ldursh w5, [x29, #-4]", ldst_unscaled(1, LDS32, 5, 29, -4), 0x78df_c3a5),
+        ("ldrb w1, [x2, x3]", ldst_reg(0, LD, 1, 2, 3, false), 0x3863_6841),
+        ("ldrsh w1, [x2, x3, lsl #1]", ldst_reg(1, LDS32, 1, 2, 3, true), 0x78e3_7841),
+        ("str w4, [x5, x6, lsl #2]", ldst_reg(2, ST, 4, 5, 6, true), 0xb826_78a4),
+        ("ldr x7, [x8, x9]", ldst_reg(3, LD, 7, 8, 9, false), 0xf869_6907),
+        ("ldr x7, [x8, x9, lsl #3]", ldst_reg(3, LD, 7, 8, 9, true), 0xf869_7907),
+        ("strb w8, [x16], #1", ldst_post(0, ST, 8, 16, 1), 0x3800_1608),
+        ("ldrb w30, [x17], #1", ldst_post(0, LD, 30, 17, 1), 0x3840_163e),
+        ("ldr x8, [x17], #8", ldst_post(3, LD, 8, 17, 8), 0xf840_8628),
+        ("str x8, [x16], #8", ldst_post(3, ST, 8, 16, 8), 0xf800_8608),
+        ("adr x3, L0 (-112)", adr(3, -112), 0x10ff_fc83),
+        ("adr x4, L1 (+12)", adr(4, 12), 0x1000_0064),
+        ("adrp x5, #8192", adrp(5, 2), 0xd000_0005),
+        ("adrp x6, #-4096", adrp(6, -1), 0xf0ff_ffe6),
+        // Floating point, double precision (ftype 01). ARM ARM C7.2:
+        // FMOV (general) "FMOV <Dd>, <Xn>" sf=1 type=01 rmode=00 opcode=111
+        // and "FMOV <Xd>, <Dn>" opcode=110.
+        ("fmov d16, x9", fmov_d_x(16, 9), 0x9e67_0130),
+        ("fmov d0, xzr", fmov_d_x(0, ZR), 0x9e67_03e0),
+        ("fmov x9, d16", fmov_x_d(9, 16), 0x9e66_0209),
+        ("fmov x0, d0", fmov_x_d(0, 0), 0x9e66_0000),
+        // FADD/FSUB/FMUL/FDIV (scalar) "<op> <Dd>, <Dn>, <Dm>",
+        // floating-point data-processing (2 source), opcode 0010/0011/0000/0001.
+        ("fadd d16, d16, d17", fadd(16, 16, 17), 0x1e71_2a10),
+        ("fsub d0, d1, d2", fsub(0, 1, 2), 0x1e62_3820),
+        ("fmul d16, d16, d17", fmul(16, 16, 17), 0x1e71_0a10),
+        ("fdiv d3, d4, d5", fdiv(3, 4, 5), 0x1e65_1883),
+        // FNEG (scalar) "FNEG <Dd>, <Dn>", data-processing (1 source) opc=10.
+        ("fneg d16, d16", fneg(16, 16), 0x1e61_4210),
+        // FSQRT (scalar) "FSQRT <Dd>, <Dn>", data-processing (1 source) opcode=000011.
+        ("fsqrt d16, d16", fsqrt(16, 16), 0x1e61_c210),
+        // FCMP "FCMP <Dn>, <Dm>", opc=00 (quiet, register form).
+        ("fcmp d16, d17", fcmp(16, 17), 0x1e71_2200),
+        // SCVTF / UCVTF (scalar, integer) "<op> <Dd>, <Wn>|<Xn>", rmode=00
+        // opcode=010 / 011.
+        ("scvtf d16, w9", scvtf(false, 16, 9), 0x1e62_0130),
+        ("scvtf d16, x9", scvtf(true, 16, 9), 0x9e62_0130),
+        ("ucvtf d16, w9", ucvtf(false, 16, 9), 0x1e63_0130),
+        ("ucvtf d16, x9", ucvtf(true, 16, 9), 0x9e63_0130),
+        // FCVTZS / FCVTZU (scalar, integer) "<op> <Wd>|<Xd>, <Dn>", rmode=11
+        // opcode=000 / 001.
+        ("fcvtzs w9, d16", fcvtzs(false, 9, 16), 0x1e78_0209),
+        ("fcvtzs x9, d16", fcvtzs(true, 9, 16), 0x9e78_0209),
+        ("fcvtzu w9, d16", fcvtzu(false, 9, 16), 0x1e79_0209),
+        ("fcvtzu x9, d16", fcvtzu(true, 9, 16), 0x9e79_0209),
+        // STR / LDR (immediate, SIMD&FP) unsigned offset, size=11 opc=00/01.
+        ("str d0, [x9, #40]", str_d(0, 9, 40), 0xfd00_1520),
+        ("ldr d1, [sp, #16]", ldr_d(1, SP, 16), 0xfd40_0be1),
+        // LDP (SIMD&FP) signed offset, opc=01 L=1.
+        ("ldp d0, d1, [x17, #64]", ldp_d(0, 1, 17, 64), 0x6d44_0620),
+        ("ldp d6, d7, [x17, #112]", ldp_d(6, 7, 17, 112), 0x6d47_1e26),
+        // Single precision (ftype 00): the double encoding with bit 22
+        // clear, plus FMOV (general) 32-bit and FCVT between precisions.
+        // Words from clang -arch arm64 + objdump.
+        ("fmov s16, w9", fmov_s_w(16, 9), 0x1e27_0130),
+        ("fmov w9, s16", fmov_w_s(9, 16), 0x1e26_0209),
+        ("fcvt d16, s17", fcvt_d_s(16, 17), 0x1e22_c230),
+        ("fcvt s16, d17", fcvt_s_d(16, 17), 0x1e62_4230),
+        ("fadd s16, s16, s17", single(fadd(16, 16, 17)), 0x1e31_2a10),
+        ("fsub s0, s1, s2", single(fsub(0, 1, 2)), 0x1e22_3820),
+        ("fmul s16, s16, s17", single(fmul(16, 16, 17)), 0x1e31_0a10),
+        ("fdiv s3, s4, s5", single(fdiv(3, 4, 5)), 0x1e25_1883),
+        ("fneg s16, s16", single(fneg(16, 16)), 0x1e21_4210),
+        ("fsqrt s16, s16", single(fsqrt(16, 16)), 0x1e21_c210),
+        ("fcmp s16, s17", single(fcmp(16, 17)), 0x1e31_2200),
+        ("scvtf s16, w9", single(scvtf(false, 16, 9)), 0x1e22_0130),
+        ("scvtf s16, x9", single(scvtf(true, 16, 9)), 0x9e22_0130),
+        ("ucvtf s16, w9", single(ucvtf(false, 16, 9)), 0x1e23_0130),
+        ("ucvtf s16, x9", single(ucvtf(true, 16, 9)), 0x9e23_0130),
     ];
     let mut bad = Vec::new();
     for (asm, got, want) in cases {
@@ -115,7 +210,29 @@ fn encoders_match_clang() {
         }
     }
     assert!(bad.is_empty(), "encoder mismatches:\n{}", bad.join("\n"));
-    assert_eq!(cases.len(), 97);
+    assert_eq!(cases.len(), 173);
+}
+
+#[test]
+fn disassembler_matches_otool_for_memory_forms() {
+    // Text from `otool -tv` of the same assembled file, immediates in decimal.
+    for (w, pc, want) in [
+        (0x39c0_0483u32, 0usize, "ldrsb w3, [x4, #1]"),
+        (0x3980_0483, 0, "ldrsb x3, [x4, #1]"),
+        (0xb980_0949, 0, "ldrsw x9, [x10, #8]"),
+        (0x3900_003f, 0, "strb wzr, [x1, #0]"),
+        (0x7810_03a2, 0, "sturh w2, [x29, #-256]"),
+        (0x38df_d3a5, 0, "ldursb w5, [x29, #-3]"),
+        (0x78e3_7841, 0, "ldrsh w1, [x2, x3, lsl #1]"),
+        (0xf869_6907, 0, "ldr x7, [x8, x9]"),
+        (0x3840_163e, 0, "ldrb w30, [x17], #1"),
+        (0x10ff_fc83, 0x70, "adr x3, 0x0"),
+        (0xd000_0005, 0x78, "adrp x5, 0x2000"),
+    ] {
+        assert_eq!(disasm(w, pc), want, "{:08x}", w);
+    }
+    assert_eq!(adrp_patch(adrp(5, 0), 2), 0xd000_0005);
+    assert_eq!(add_imm_patch(add_imm(true, 5, 5, 0), 0x123), add_imm(true, 5, 5, 0x123));
 }
 
 #[test]
@@ -130,6 +247,37 @@ fn disassembler_reads_back_the_subset() {
         cset(false, 9, Cond::Lo),
         cbnz(true, 8, -8),
         ldp_x_post(29, 30, SP, 96),
+        ldst_uimm(0, LDS32, 3, 4, 1),
+        ldst_unscaled(1, ST, 2, 29, -256),
+        ldst_reg(1, LDS32, 1, 2, 3, true),
+        ldst_post(3, LD, 8, 17, 8),
+        adr(3, -112),
+        adrp(5, 2),
+        fmov_d_x(16, 9),
+        fmov_x_d(9, 16),
+        fadd(16, 16, 17),
+        fsub(0, 1, 2),
+        fmul(16, 16, 17),
+        fdiv(3, 4, 5),
+        fneg(16, 16),
+        fsqrt(16, 16),
+        single(fsqrt(16, 16)),
+        fcmp(16, 17),
+        scvtf(false, 16, 9),
+        ucvtf(true, 16, 9),
+        fcvtzs(true, 9, 16),
+        fcvtzu(false, 9, 16),
+        str_d(0, 9, 40),
+        ldr_d(1, SP, 16),
+        ldp_d(0, 1, 17, 64),
+        fmov_s_w(16, 9),
+        fmov_w_s(9, 16),
+        fcvt_d_s(16, 17),
+        fcvt_s_d(16, 17),
+        single(fadd(16, 16, 17)),
+        single(fcmp(16, 17)),
+        single(scvtf(true, 16, 9)),
+        single(fcvtzs(false, 9, 16)),
     ] {
         let d = disasm(w, 0);
         assert!(!d.starts_with(".word"), "{:08x} -> {}", w, d);

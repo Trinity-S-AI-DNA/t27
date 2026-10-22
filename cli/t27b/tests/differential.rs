@@ -7,20 +7,26 @@
 //! the front-end rarely produces: expression trees deep enough to spill the
 //! temp stack, calls with live temps, eight-argument calls, narrow types with
 //! garbage in the upper half of argument registers, every division and shift
-//! corner, and loops with `break` / `continue`.
+//! corner, and loops with `break` / `continue`. Memory: frame slots of every
+//! size up to a multi-page aggregate area, read-only data blobs, loads and
+//! stores of every scalar type at constant, masked and bounds-checked
+//! indices, copies short and long, and pointer parameters into the caller's
+//! frame (the hidden-pointer ABI for aggregates).
 //!
 //! Knobs (environment variables):
 //!   T27B_DIFF_CASES  programs per overflow mode (default 2500)
 //!   T27B_DIFF_SEED   base seed (default 0x7427)
 //!   T27B_DIFF_TRACE  print each case seed before running it (to find a crash)
 //!
-//! The JIT runs only on arm64 macOS, so this file is empty elsewhere.
-#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+//! The JIT runs only on arm64 macOS and arm64 Linux, so this file is empty
+//! elsewhere.
+#![cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 
 use t27b::codegen::{self, canon, TrapStyle};
 use t27b::eval::{Interp, Stop};
 use t27b::ir::*;
 use t27b::jit::Jit;
+use t27b::{front, lower};
 
 // ------------------------------------------------------------------ rng
 
@@ -64,6 +70,24 @@ const ALL: [Ty; 9] = [
     Ty::I16,
     Ty::I32,
     Ty::I64,
+];
+
+/// Odd widths (`u1`, `i21`): canonical like u8/u16 in a W register, with
+/// bitfield extracts where those have byte and halfword extends. The edge-
+/// value tests run them next to `Ty::INTS`; the random generator does not.
+const ODD: [Ty; 12] = [
+    Ty::UN(1),
+    Ty::IN(1),
+    Ty::IN(2),
+    Ty::UN(4),
+    Ty::IN(5),
+    Ty::UN(7),
+    Ty::UN(17),
+    Ty::IN(17),
+    Ty::UN(21),
+    Ty::IN(21),
+    Ty::UN(31),
+    Ty::IN(31),
 ];
 
 /// A value of `ty`, biased towards the edges of its range.
@@ -115,13 +139,53 @@ fn cmp(op: CmpOp, lhs: Expr, rhs: Expr) -> Expr {
 
 const CMPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge];
 
+fn offset(base: Expr, idx: Expr, scale: u32) -> Expr {
+    Expr {
+        ty: Ty::Ptr,
+        kind: ExprKind::Offset { base: Box::new(base), idx: Box::new(idx), scale },
+    }
+}
+
+/// `base + by` bytes (no node at all for 0).
+fn ptr_add(base: Expr, by: u32) -> Expr {
+    if by == 0 {
+        base
+    } else {
+        offset(base, konst(Ty::U64, by as i128), 1)
+    }
+}
+
 // ------------------------------------------------------------ generator
 
 #[derive(Clone)]
 struct Sig {
     params: Vec<Ty>,
     ret: Option<Ty>,
+    /// Bytes behind the `Ty::Ptr` parameter, if there is one (at most one, so
+    /// the callee never sees two names for the same memory).
+    need: u32,
 }
+
+/// Memory the generated code may address: a frame slot, the caller's memory
+/// behind a pointer parameter, a pointer local into either, or a data blob.
+#[derive(Clone)]
+struct Region {
+    /// Side-effect-free Ptr expression for the first byte of the region.
+    base: Expr,
+    /// The underlying object: slot k, `OBJ_PARAM`, or `OBJ_DATA + k`.
+    obj: usize,
+    /// Offset of `base` within that object.
+    start: u32,
+    size: u32,
+    writable: bool,
+    /// Holds only 0/1 bytes: loaded and stored as Bool, never copied, so a
+    /// Bool load never meets another byte value.
+    boolean: bool,
+}
+
+const OBJ_PARAM: usize = 1000;
+const OBJ_DATA: usize = 2000;
+const SCALES: [u32; 9] = [1, 2, 3, 4, 5, 8, 12, 16, 24];
 
 struct Gen<'r> {
     rng: &'r mut Rng,
@@ -137,6 +201,14 @@ struct Gen<'r> {
     nodes: usize,
     calls: usize,
     line: u32,
+    /// Sizes of the program's data blobs.
+    data_sizes: Vec<u32>,
+    slots: Vec<SlotInfo>,
+    regions: Vec<Region>,
+    /// Nesting of loads inside index expressions, kept shallow.
+    mem_depth: u32,
+    /// Inside a `Seq` (whose statements are not nested again).
+    in_seq: bool,
 }
 
 impl<'r> Gen<'r> {
@@ -154,6 +226,11 @@ impl<'r> Gen<'r> {
     }
 
     fn leaf(&mut self, ty: Ty) -> Expr {
+        if self.rng.chance(10) {
+            if let Some(e) = self.load(ty) {
+                return e;
+            }
+        }
         let same: Vec<usize> =
             (0..self.vars.len()).filter(|&i| self.visible[i] && self.vars[i].ty == ty).collect();
         if !same.is_empty() && self.rng.chance(65) {
@@ -204,11 +281,24 @@ impl<'r> Gen<'r> {
             let inner = self.expr(t, depth - 1);
             return Expr { ty, kind: ExprKind::Widen(Box::new(inner)) };
         }
-        if r < 83 {
+        if r < 81 {
+            // `x as T` from any other type: a bool widens to 0 / 1; an
+            // integer either truncates (site 0) or traps when out of range.
+            if self.rng.chance(15) {
+                let inner = self.expr(Ty::Bool, depth - 1);
+                return Expr { ty, kind: ExprKind::Widen(Box::new(inner)) };
+            }
+            let from: Vec<Ty> = Ty::INTS.iter().copied().filter(|&t| t != ty).collect();
+            let t = self.rng.pick(&from);
+            let inner = self.expr(t, depth - 1);
+            let site = if self.rng.chance(50) { 0 } else { self.site(TrapKind::Cast, ty) };
+            return Expr { ty, kind: ExprKind::Cast { arg: Box::new(inner), site } };
+        }
+        if r < 86 {
             let inner = self.expr(ty, depth - 1);
             return Expr { ty, kind: ExprKind::BitNot(Box::new(inner)) };
         }
-        if r < 90 && ty.signed() {
+        if r < 91 && ty.signed() {
             // Unary minus lowers to `0 - x`.
             let inner = self.expr(ty, depth - 1);
             let (op, site) = if self.mode == OverflowMode::Trap {
@@ -218,10 +308,45 @@ impl<'r> Gen<'r> {
             };
             return arith(ty, op, konst(ty, 0), inner, site);
         }
-        if r < 95 {
+        if r < 94 {
+            if let Some(e) = self.seq(ty, depth) {
+                return e;
+            }
+        }
+        if r < 96 && self.rng.chance(50) {
+            // `if (c) a else b` as a value: only the taken arm may trap.
+            let cond = self.expr(Ty::Bool, depth - 1);
+            let then = self.expr(ty, depth - 1);
+            let els = self.expr(ty, depth - 1);
+            return Expr {
+                ty,
+                kind: ExprKind::Select { cond: Box::new(cond), then: Box::new(then), els: Box::new(els) },
+            };
+        }
+        if r < 96 {
             return self.chain(ty);
         }
         self.leaf(ty)
+    }
+
+    /// Stores and copies run in the middle of an expression, as lowering
+    /// builds a struct temporary: often with temps live around them.
+    fn seq(&mut self, ty: Ty, depth: u32) -> Option<Expr> {
+        if self.in_seq || self.mem_depth > 0 {
+            return None;
+        }
+        self.in_seq = true;
+        let mut stmts = Vec::new();
+        for _ in 0..1 + self.rng.below(2) {
+            let s = if self.rng.chance(60) { self.store() } else { self.copy() };
+            stmts.extend(s);
+        }
+        let value = self.expr(ty, depth - 1);
+        self.in_seq = false;
+        if stmts.is_empty() {
+            return None;
+        }
+        Some(Expr { ty, kind: ExprKind::Seq { stmts, value: Box::new(value) } })
     }
 
     /// A right-leaning chain whose left operands are all computed values, so
@@ -341,6 +466,11 @@ impl<'r> Gen<'r> {
     }
 
     fn bool_expr(&mut self, depth: u32) -> Expr {
+        if self.rng.chance(6) {
+            if let Some(e) = self.load(Ty::Bool) {
+                return e;
+            }
+        }
         let r = self.rng.below(100);
         if r < 45 {
             let t = self.rng.pick(&Ty::INTS);
@@ -379,10 +509,322 @@ impl<'r> Gen<'r> {
         self.leaf(Ty::Bool)
     }
 
-    fn args(&mut self, f: usize, depth: u32) -> Vec<Expr> {
+    /// Writable regions of at least `need` bytes that may be lent to a callee.
+    fn lendable(&self, need: u32) -> Vec<usize> {
+        (0..self.regions.len())
+            .filter(|&i| {
+                let r = &self.regions[i];
+                r.writable && !r.boolean && r.size >= need
+            })
+            .collect()
+    }
+
+    /// Arguments for a call to `f`; None when it takes a pointer and no
+    /// region here is large enough to lend it.
+    fn args(&mut self, f: usize, depth: u32) -> Option<Vec<Expr>> {
         let params = self.sigs[f].params.clone();
+        let need = self.sigs[f].need;
+        let cands = if params.contains(&Ty::Ptr) { self.lendable(need) } else { Vec::new() };
+        if params.contains(&Ty::Ptr) && cands.is_empty() {
+            return None;
+        }
         let d = depth.saturating_sub(1).min(2);
-        params.iter().map(|&p| self.expr(p, d)).collect()
+        let mut out = Vec::new();
+        for &p in &params {
+            if p == Ty::Ptr {
+                let r = self.regions[self.rng.pick(&cands)].clone();
+                let o = self.rng.below((r.size - need) as usize + 1) as u32;
+                out.push(ptr_add(r.base, o));
+            } else {
+                out.push(self.expr(p, d));
+            }
+        }
+        Some(out)
+    }
+
+    // --------------------------------------------------------- memory
+
+    /// An index expression for a computed address (any U64 value).
+    fn idx_expr(&mut self) -> Expr {
+        self.mem_depth += 1;
+        let e = if self.rng.chance(60) {
+            self.expr(Ty::U64, 2)
+        } else {
+            let t = self.rng.pick(&[Ty::U8, Ty::U16, Ty::U32]);
+            let inner = self.expr(t, 2);
+            Expr { ty: Ty::U64, kind: ExprKind::Widen(Box::new(inner)) }
+        };
+        self.mem_depth -= 1;
+        e
+    }
+
+    /// An in-bounds address for a `bytes`-wide access into region `r`, as
+    /// (address expression, immediate offset). The checked-index form may
+    /// trap instead, at its own Bounds site.
+    fn access(&mut self, r: usize, bytes: u32) -> (Expr, u32) {
+        let reg = self.regions[r].clone();
+        let room = reg.size - bytes;
+        let s = self.rng.pick(&SCALES);
+        let rest = self.rng.below(room.min(7) as usize + 1) as u32;
+        let avail = room - rest;
+        match self.rng.below(10) {
+            0..=3 => {
+                let o = self.rng.below(room as usize + 1) as u32;
+                (reg.base, o)
+            }
+            4 | 5 => {
+                let o = self.rng.below(room as usize + 1) as u32;
+                let i = self.rng.below((o / s) as usize + 1) as u32;
+                (offset(reg.base, konst(Ty::U64, i as i128), s), o - i * s)
+            }
+            6 | 7 => {
+                // Masked index (largest 2^k - 1 that fits): never out of range.
+                let mut m: u32 = 0;
+                while (2 * m + 1) * s <= avail {
+                    m = 2 * m + 1;
+                }
+                let e = self.idx_expr();
+                let idx = arith(Ty::U64, ArithOp::And, e, konst(Ty::U64, m as i128), 0);
+                (offset(reg.base, idx, s), rest)
+            }
+            _ => {
+                // Checked index: n valid elements of `s` bytes.
+                let n = (avail / s + 1) as u64;
+                // Mostly in range, so that most runs get past the check.
+                let i = match self.rng.below(20) {
+                    0 => self.idx_expr(),
+                    1 => konst(Ty::U64, self.rng.below(2 * n as usize) as i128),
+                    2..=4 => konst(Ty::U64, self.rng.below(n as usize) as i128),
+                    r => {
+                        let mask = if r <= 10 {
+                            // Traps for an index in n..next_power_of_two(n).
+                            n.next_power_of_two() - 1
+                        } else {
+                            // The largest 2^k - 1 below n: never traps.
+                            (n + 1).next_power_of_two() / 2 - 1
+                        };
+                        let e = self.idx_expr();
+                        arith(Ty::U64, ArithOp::And, e, konst(Ty::U64, mask as i128), 0)
+                    }
+                };
+                let len = if n > 1 && self.rng.chance(30) {
+                    // A length in a register, not an immediate.
+                    let k = self.rng.below(n as usize) as i128;
+                    arith(Ty::U64, ArithOp::AddW, konst(Ty::U64, n as i128 - k), konst(Ty::U64, k), 0)
+                } else {
+                    konst(Ty::U64, n as i128)
+                };
+                let site = self.site(TrapKind::Bounds, Ty::U64);
+                let idx = Expr {
+                    ty: Ty::U64,
+                    kind: ExprKind::Bounds { idx: Box::new(i), len: Box::new(len), site },
+                };
+                (offset(reg.base, idx, s), rest)
+            }
+        }
+    }
+
+    fn load(&mut self, ty: Ty) -> Option<Expr> {
+        if self.mem_depth >= 2 {
+            return None;
+        }
+        let want_bool = ty == Ty::Bool;
+        let cands: Vec<usize> = (0..self.regions.len())
+            .filter(|&i| self.regions[i].boolean == want_bool && self.regions[i].size >= ty.bytes())
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+        let r = self.rng.pick(&cands);
+        self.mem_depth += 1;
+        let (addr, off) = self.access(r, ty.bytes());
+        self.mem_depth -= 1;
+        Some(Expr { ty, kind: ExprKind::Load { addr: Box::new(addr), off } })
+    }
+
+    fn store(&mut self) -> Option<Stmt> {
+        let cands: Vec<usize> = (0..self.regions.len()).filter(|&i| self.regions[i].writable).collect();
+        if cands.is_empty() {
+            return None;
+        }
+        let r = self.rng.pick(&cands);
+        let (size, boolean) = (self.regions[r].size, self.regions[r].boolean);
+        let ty = if boolean {
+            Ty::Bool
+        } else {
+            let fit: Vec<Ty> = Ty::INTS.iter().copied().filter(|t| t.bytes() <= size).collect();
+            self.rng.pick(&fit)
+        };
+        let (addr, off) = self.access(r, ty.bytes());
+        let value = self.expr(ty, 3);
+        Some(Stmt::Store { addr, off, value })
+    }
+
+    /// A copy between two regions, disjoint or identical (never partially
+    /// overlapping, which lowering never makes either).
+    fn copy(&mut self) -> Option<Stmt> {
+        let dsts = self.lendable(1);
+        let srcs: Vec<usize> = (0..self.regions.len()).filter(|&i| !self.regions[i].boolean).collect();
+        if dsts.is_empty() {
+            return None;
+        }
+        let d = self.regions[self.rng.pick(&dsts)].clone();
+        let s = self.regions[self.rng.pick(&srcs)].clone();
+        let max = d.size.min(s.size);
+        let n = if max > 64 && self.rng.chance(50) {
+            65 + self.rng.below((max - 64) as usize) as u32
+        } else {
+            1 + self.rng.below(max.min(64) as usize) as u32
+        };
+        let dofs = self.rng.below((d.size - n) as usize + 1) as u32;
+        let mut sofs = self.rng.below((s.size - n) as usize + 1) as u32;
+        if d.obj == s.obj {
+            let a = d.start + dofs;
+            let b = s.start + sofs;
+            if a != b && a < b + n && b < a + n {
+                if a >= s.start && a - s.start + n <= s.size {
+                    sofs = a - s.start;
+                } else {
+                    return None;
+                }
+            }
+        }
+        Some(Stmt::Copy { dst: ptr_add(d.base, dofs), src: ptr_add(s.base, sofs), size: n })
+    }
+
+    /// Statements writing every byte of the slot behind `reg`, so no
+    /// later load reads uninitialised memory.
+    fn init_slot(&mut self, reg: &Region, out: &mut Vec<Stmt>) {
+        let reg = reg.clone();
+        let size = reg.size;
+        if reg.boolean {
+            for o in 0..size {
+                let v = self.expr(Ty::Bool, 1);
+                out.push(Stmt::Store { addr: reg.base.clone(), off: o, value: v });
+            }
+            return;
+        }
+        let blobs: Vec<usize> = (0..self.data_sizes.len()).filter(|&b| self.data_sizes[b] >= size).collect();
+        if !blobs.is_empty() && self.rng.chance(35) {
+            let b = self.rng.pick(&blobs);
+            let o = self.rng.below((self.data_sizes[b] - size) as usize + 1) as u32;
+            let src = ptr_add(Expr { ty: Ty::Ptr, kind: ExprKind::Data(b as u32) }, o);
+            out.push(Stmt::Copy { dst: reg.base, src, size });
+            return;
+        }
+        let mut o = 0;
+        if size >= 256 {
+            // Fill the 8-byte words in a loop: i < size / 8, store at slot + 8i.
+            let n8 = size / 8;
+            let i = self.new_var(Ty::U64);
+            self.locked[i] = true;
+            out.push(Stmt::Assign { var: i as VarId, value: konst(Ty::U64, 0) });
+            let k1 = (self.rng.next() | 1) as i128;
+            let k2 = self.rng.next() as i128;
+            let value = arith(
+                Ty::U64,
+                ArithOp::Xor,
+                arith(Ty::U64, ArithOp::MulW, var(Ty::U64, i), konst(Ty::U64, k1), 0),
+                konst(Ty::U64, k2),
+                0,
+            );
+            out.push(Stmt::While {
+                cond: cmp(CmpOp::Lt, var(Ty::U64, i), konst(Ty::U64, n8 as i128)),
+                body: vec![Stmt::Store { addr: offset(reg.base.clone(), var(Ty::U64, i), 8), off: 0, value }],
+                step: vec![Stmt::Assign {
+                    var: i as VarId,
+                    value: arith(Ty::U64, ArithOp::AddW, var(Ty::U64, i), konst(Ty::U64, 1), 0),
+                }],
+            });
+            o = n8 * 8;
+        }
+        while o < size {
+            let left = size - o;
+            let fit: Vec<Ty> = Ty::INTS.iter().copied().filter(|t| t.bytes() <= left).collect();
+            let t = if self.rng.chance(70) {
+                *fit.iter().max_by_key(|t| t.bytes()).unwrap()
+            } else {
+                self.rng.pick(&fit)
+            };
+            let v = self.expr(t, 1);
+            out.push(Stmt::Store { addr: reg.base.clone(), off: o, value: v });
+            o += t.bytes();
+        }
+    }
+
+    /// Frame slots (initialised), pointer locals and the data regions.
+    fn memory(&mut self, sig: &Sig, out: &mut Vec<Stmt>) {
+        self.slots.clear();
+        self.regions.clear();
+        for b in 0..self.data_sizes.len() {
+            self.regions.push(Region {
+                base: Expr { ty: Ty::Ptr, kind: ExprKind::Data(b as u32) },
+                obj: OBJ_DATA + b,
+                start: 0,
+                size: self.data_sizes[b],
+                writable: false,
+                boolean: false,
+            });
+        }
+        if let Some(pi) = sig.params.iter().position(|&t| t == Ty::Ptr) {
+            self.regions.push(Region {
+                base: var(Ty::Ptr, pi),
+                obj: OBJ_PARAM,
+                start: 0,
+                size: sig.need,
+                writable: true,
+                boolean: false,
+            });
+        }
+        let nslots = if self.rng.chance(40) { 0 } else { 1 + self.rng.below(4) };
+        let mut big = false;
+        for k in 0..nslots {
+            let boolean = self.rng.chance(15);
+            let size = if boolean {
+                1 + self.rng.below(8)
+            } else if !big && self.rng.chance(8) {
+                // Past 4 KiB below the frame pointer: the two-instruction
+                // slot address and the register-offset load/store forms.
+                big = true;
+                4000 + self.rng.below(5000)
+            } else if self.rng.chance(25) {
+                25 + self.rng.below(136)
+            } else {
+                1 + self.rng.below(24)
+            } as u32;
+            let align = self.rng.pick(&[1, 2, 4, 8]);
+            self.slots.push(SlotInfo { size, align });
+            let reg = Region {
+                base: Expr { ty: Ty::Ptr, kind: ExprKind::Slot(k as u32) },
+                obj: k,
+                start: 0,
+                size,
+                writable: true,
+                boolean,
+            };
+            // The initialising expressions may load, but only from regions
+            // already written: this one is published once it is.
+            self.init_slot(&reg, out);
+            self.regions.push(reg);
+        }
+        // A pointer local into a slot or into the caller's memory.
+        let cands = self.lendable(1);
+        if !cands.is_empty() && self.rng.chance(30) {
+            let reg = self.regions[self.rng.pick(&cands)].clone();
+            let o = self.rng.below(reg.size as usize) as u32;
+            let p = self.new_var(Ty::Ptr);
+            self.visible[p] = true;
+            self.locked[p] = true;
+            out.push(Stmt::Assign { var: p as VarId, value: ptr_add(reg.base, o) });
+            self.regions.push(Region {
+                base: var(Ty::Ptr, p),
+                obj: reg.obj,
+                start: reg.start + o,
+                size: reg.size - o,
+                writable: true,
+                boolean: false,
+            });
+        }
     }
 
     fn call_expr(&mut self, ty: Ty, depth: u32) -> Option<Expr> {
@@ -401,7 +843,7 @@ impl<'r> Gen<'r> {
         self.calls += 1;
         let j = self.rng.pick(&cands);
         let rt = self.sigs[j].ret.unwrap();
-        let args = self.args(j, depth);
+        let args = self.args(j, depth)?;
         let call = Expr { ty: rt, kind: ExprKind::Call { func: j as FuncId, args } };
         Some(if rt == ty { call } else { Expr { ty, kind: ExprKind::Widen(Box::new(call)) } })
     }
@@ -411,6 +853,11 @@ impl<'r> Gen<'r> {
         for _ in 0..len {
             if self.nodes > 500 {
                 break;
+            }
+            if !self.regions.is_empty() && self.rng.chance(16) {
+                let s = if self.rng.chance(70) { self.store() } else { self.copy() };
+                out.extend(s);
+                continue;
             }
             let r = self.rng.below(100);
             if r < 38 {
@@ -491,9 +938,10 @@ impl<'r> Gen<'r> {
                 if self.cur > 0 && self.calls < 8 {
                     self.calls += 1;
                     let j = self.rng.below(self.cur);
-                    let args = self.args(j, 3);
-                    let ty = self.sigs[j].ret.unwrap_or(Ty::U8);
-                    out.push(Stmt::Eval(Expr { ty, kind: ExprKind::Call { func: j as FuncId, args } }));
+                    if let Some(args) = self.args(j, 3) {
+                        let ty = self.sigs[j].ret.unwrap_or(Ty::U8);
+                        out.push(Stmt::Eval(Expr { ty, kind: ExprKind::Call { func: j as FuncId, args } }));
+                    }
                 }
             } else if r < 92 {
                 let cond = if self.rng.chance(70) {
@@ -531,9 +979,11 @@ impl<'r> Gen<'r> {
             let v = self.new_var(p);
             self.visible[v] = true;
             // Parameters are immutable in the language; keep most of them so.
-            self.locked[v] = !self.rng.chance(15);
+            // A pointer is never reassigned (it names its region).
+            self.locked[v] = p == Ty::Ptr || !self.rng.chance(15);
         }
         let mut body = Vec::new();
+        self.memory(&sig, &mut body);
         for _ in 0..self.rng.below(7) {
             let t = self.rng.pick(&ALL);
             let value = self.expr(t, 2);
@@ -551,7 +1001,7 @@ impl<'r> Gen<'r> {
                 }
                 let j = self.rng.below(self.cur);
                 if let Some(rt) = self.sigs[j].ret {
-                    let args = self.args(j, 2);
+                    let Some(args) = self.args(j, 2) else { continue };
                     let lhs = Expr { ty: rt, kind: ExprKind::Call { func: j as FuncId, args } };
                     let rhs = self.leaf(rt);
                     let site = self.site(TrapKind::AssertEq, rt);
@@ -579,7 +1029,9 @@ impl<'r> Gen<'r> {
             body,
             line: self.line,
             is_test,
+            is_invariant: false,
             noreturn_site,
+            slots: self.slots.clone(),
         }
     }
 }
@@ -590,10 +1042,25 @@ fn program(rng: &mut Rng, mode: OverflowMode) -> Program {
     let mut sigs = Vec::new();
     for _ in 0..nhelpers {
         let np = if rng.chance(15) { 8 } else { rng.below(9) };
-        let params = (0..np).map(|_| rng.pick(&ALL)).collect();
+        let mut params: Vec<Ty> = (0..np).map(|_| rng.pick(&ALL)).collect();
+        let mut need = 0;
+        if np > 0 && rng.chance(25) {
+            // An aggregate passed (or returned) by hidden pointer.
+            let i = rng.below(np);
+            params[i] = Ty::Ptr;
+            let max = if rng.chance(20) { 160 } else { 32 };
+            need = 1 + rng.below(max) as u32;
+        }
         let ret = if rng.chance(88) { Some(rng.pick(&ALL)) } else { None };
-        sigs.push(Sig { params, ret });
+        sigs.push(Sig { params, ret, need });
     }
+    let ndata = rng.below(4);
+    let data: Vec<Vec<u8>> = (0..ndata)
+        .map(|_| {
+            let n = if rng.chance(20) { 65 + rng.below(200) } else { 1 + rng.below(64) };
+            (0..n).map(|_| rng.next() as u8).collect()
+        })
+        .collect();
     let placeholder = Site { kind: TrapKind::Overflow, line: 0, what: String::new(), ty: Ty::U8 };
     let mut g = Gen {
         rng,
@@ -608,19 +1075,26 @@ fn program(rng: &mut Rng, mode: OverflowMode) -> Program {
         nodes: 0,
         calls: 0,
         line: 0,
+        data_sizes: data.iter().map(|d| d.len() as u32).collect(),
+        slots: Vec::new(),
+        regions: Vec::new(),
+        mem_depth: 0,
+        in_seq: false,
     };
     let mut funcs = Vec::new();
     for i in 0..nhelpers {
         funcs.push(g.func(i, false));
     }
     for t in 0..ntests {
-        g.sigs.push(Sig { params: Vec::new(), ret: None });
+        g.sigs.push(Sig { params: Vec::new(), ret: None, need: 0 });
         let mut f = g.func(nhelpers, true);
         f.name = format!("test{}", t);
+        // An invariant block is lowered exactly like a test.
+        f.is_invariant = g.rng.chance(30);
         funcs.push(f);
         g.sigs.pop();
     }
-    Program { module: "rnd".into(), funcs, sites: g.sites, mode }
+    Program { module: "rnd".into(), funcs, sites: g.sites, mode, unchecked: Vec::new(), data, globals: Vec::new(), internal_abi: Vec::new() }
 }
 
 // ------------------------------------------------------- pretty printer
@@ -654,6 +1128,38 @@ fn show_expr(p: &Program, f: &Func, e: &Expr) -> String {
             format!("{}({})", p.funcs[*func as usize].name, a.join(", "))
         }
         ExprKind::Widen(a) => format!("{}({})", e.ty.name(), show_expr(p, f, a)),
+        ExprKind::Cast { arg, site } => {
+            let how = if *site != 0 { format!("@{}", site) } else { "%".into() };
+            format!("({} as{} {})", show_expr(p, f, arg), how, e.ty.name())
+        }
+        ExprKind::FArith { op, lhs, rhs } => {
+            format!("({} f{} {})", show_expr(p, f, lhs), op.symbol(), show_expr(p, f, rhs))
+        }
+        ExprKind::FNeg(a) => format!("-f{}", show_expr(p, f, a)),
+        ExprKind::FSqrt(a) => format!("@sqrt({})", show_expr(p, f, a)),
+        ExprKind::IntToFloat(a) => format!("@floatFromInt({})", show_expr(p, f, a)),
+        ExprKind::FloatCast(a) => format!("@floatCast({}):{}", show_expr(p, f, a), e.ty.name()),
+        ExprKind::FloatToInt { arg, site } => {
+            format!("@intFromFloat@{}({}):{}", site, show_expr(p, f, arg), e.ty.name())
+        }
+        ExprKind::Slot(k) => format!("&s{}", k),
+        ExprKind::Data(k) => format!("&d{}", k),
+        ExprKind::Global(k) => format!("&g{}", k),
+        ExprKind::Load { addr, off } => format!("{}[{} + {}]", e.ty.name(), show_expr(p, f, addr), off),
+        ExprKind::Offset { base, idx, scale } => {
+            format!("({} + {}*{})", show_expr(p, f, base), show_expr(p, f, idx), scale)
+        }
+        ExprKind::Bounds { idx, len, site } => {
+            format!("chk@{}({} < {})", site, show_expr(p, f, idx), show_expr(p, f, len))
+        }
+        ExprKind::Seq { stmts, value } => {
+            let mut b = String::new();
+            show_block(p, f, stmts, 0, &mut b);
+            format!("seq{{ {}; {} }}", b.trim().replace('\n', " "), show_expr(p, f, value))
+        }
+        ExprKind::Select { cond, then, els } => {
+            format!("(if {} {} else {})", show_expr(p, f, cond), show_expr(p, f, then), show_expr(p, f, els))
+        }
     }
 }
 
@@ -695,6 +1201,21 @@ fn show_block(p: &Program, f: &Func, ss: &[Stmt], ind: usize, out: &mut String) 
                 show_expr(p, f, lhs),
                 show_expr(p, f, rhs)
             )),
+            Stmt::Store { addr, off, value } => out.push_str(&format!(
+                "{}{}[{} + {}] = {};\n",
+                pad,
+                value.ty.name(),
+                show_expr(p, f, addr),
+                off,
+                show_expr(p, f, value)
+            )),
+            Stmt::Copy { dst, src, size } => out.push_str(&format!(
+                "{}copy {} bytes {} <- {};\n",
+                pad,
+                size,
+                show_expr(p, f, dst),
+                show_expr(p, f, src)
+            )),
         }
     }
 }
@@ -702,17 +1223,22 @@ fn show_block(p: &Program, f: &Func, ss: &[Stmt], ind: usize, out: &mut String) 
 /// Source-like rendering of a generated program, for failure reports.
 fn show_program(p: &Program) -> String {
     let mut out = String::new();
+    for (k, d) in p.data.iter().enumerate() {
+        out.push_str(&format!("data d{} = {:02x?}\n", k, d));
+    }
     for f in &p.funcs {
         let params: Vec<String> =
             f.vars[..f.nparams].iter().map(|v| format!("{}: {}", v.name, v.ty.name())).collect();
         let locals: Vec<String> =
             f.vars[f.nparams..].iter().map(|v| format!("{}: {}", v.name, v.ty.name())).collect();
+        let slots: Vec<String> = f.slots.iter().map(|s| format!("{}/{}", s.size, s.align)).collect();
         out.push_str(&format!(
-            "fn {}({}) -> {} {{  // locals {}\n",
+            "fn {}({}) -> {} {{  // locals {}; slots {}\n",
             f.name,
             params.join(", "),
             f.ret.map_or("void", |t| t.name()),
-            locals.join(", ")
+            locals.join(", "),
+            slots.join(", ")
         ));
         show_block(p, f, &f.body, 1, &mut out);
         out.push_str("}\n");
@@ -728,8 +1254,13 @@ struct Stats {
     functions: usize,
     calls: usize,
     returns: usize,
-    traps: [usize; 7],
+    /// Indexed by `TrapKind as usize`.
+    traps: [usize; 17],
     skipped: usize,
+    /// Functions with frame slots, and functions only called from others
+    /// (they take a pointer, which only a caller can supply).
+    with_slots: usize,
+    ptr_only: usize,
 }
 
 /// Raw register image of an argument: canonical form, plus random garbage in
@@ -755,11 +1286,18 @@ fn check_value(ty: Ty, want: i128, raw: u64) -> bool {
 fn compare(prog: &Program, rng: &mut Rng, calls_per_fn: usize, stats: &mut Stats) -> Result<(), String> {
     let code = codegen::compile(prog, TrapStyle::Jit, true)
         .map_err(|e| format!("codegen error in {}: {} {}", e.func, e.construct, e.detail))?;
-    let mut jit = Jit::load(&code, prog.funcs.len())?;
+    let mut jit = Jit::load(&code, prog.funcs.len(), &prog.data, &prog.globals)?;
     stats.programs += 1;
     for (fi, f) in prog.funcs.iter().enumerate() {
         stats.functions += 1;
+        if !f.slots.is_empty() {
+            stats.with_slots += 1;
+        }
         let ptys: Vec<Ty> = f.vars[..f.nparams].iter().map(|v| v.ty).collect();
+        if ptys.contains(&Ty::Ptr) {
+            stats.ptr_only += 1;
+            continue;
+        }
         let n = if f.is_test || ptys.is_empty() { 1 } else { calls_per_fn };
         for _ in 0..n {
             let args: Vec<i128> = ptys.iter().map(|&t| value(rng, t)).collect();
@@ -876,7 +1414,8 @@ fn random_programs_jit_matches_interpreter() {
         }
         eprintln!(
             "differential {:?}: {} programs, {} functions, {} calls compared ({} returns, traps: \
-             overflow {}, div-zero {}, shift {}, assert {}, assert_eq {}, no-return {}), {} skipped (fuel)",
+             overflow {}, div-zero {}, shift {}, assert {}, assert_eq {}, no-return {}, cast {}, bounds {}), {} skipped (fuel); \
+             {} functions with frame slots, {} reached only through a pointer-passing call",
             mode,
             stats.programs,
             stats.functions,
@@ -888,7 +1427,11 @@ fn random_programs_jit_matches_interpreter() {
             stats.traps[4],
             stats.traps[5],
             stats.traps[6],
-            stats.skipped
+            stats.traps[TrapKind::Cast as usize],
+            stats.traps[TrapKind::Bounds as usize],
+            stats.skipped,
+            stats.with_slots,
+            stats.ptr_only
         );
     }
     assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
@@ -934,7 +1477,9 @@ fn one_func(name: &str, params: &[Ty], ret: Ty, body: Vec<Stmt>, nsite: SiteId) 
         body,
         line: 1,
         is_test: false,
+        is_invariant: false,
         noreturn_site: nsite,
+        slots: Vec::new(),
     }
 }
 
@@ -991,9 +1536,14 @@ fn every_operator_at_edge_values() {
     let mut rng = Rng::new(99);
     let mut stats = Stats::default();
     let mut failures = Vec::new();
-    for ty in Ty::INTS {
+    for ty in Ty::INTS.into_iter().chain(ODD) {
         let vals = edge_values(ty);
         for op in OPS {
+            // A runtime wrap-mode shift of an odd width is refused by
+            // lowering (`bits - 1` is no mask); its constant form is below.
+            if ty.is_odd() && matches!(op, ArithOp::ShlW | ArithOp::ShrW) {
+                continue;
+            }
             let amt_tys: Vec<Ty> = if op.is_shift() {
                 vec![ty, Ty::U8, Ty::I8, Ty::U32, Ty::I64]
             } else {
@@ -1032,7 +1582,7 @@ fn every_operator_at_edge_values() {
                     funcs.push(one_func("cr", &[at], ty, vec![Stmt::Return(Some(e))], 1));
                     lconst.push((funcs.len() - 1, c));
                 }
-                let prog = Program { module: "edge".into(), funcs, sites, mode: OverflowMode::Trap };
+                let prog = Program { module: "edge".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
                 let mut calls: Vec<(usize, Vec<i128>)> = Vec::new();
                 for &a in &vals {
                     for &b in &rvals {
@@ -1055,6 +1605,25 @@ fn every_operator_at_edge_values() {
             }
         }
     }
+    // Constant shifts of the odd widths: every in-range amount, the form
+    // lowering gives a comptime-known amount.
+    for ty in ODD {
+        let vals = edge_values(ty);
+        let (sites, _) = sites_for(ArithOp::ShlW, ty);
+        let mut funcs = Vec::new();
+        for c in 0..ty.bits() as i128 {
+            for op in [ArithOp::ShlW, ArithOp::ShrW] {
+                let e = arith(ty, op, var(ty, 0), konst(Ty::U32, c), 0);
+                funcs.push(one_func("sc", &[ty], ty, vec![Stmt::Return(Some(e))], 1));
+            }
+        }
+        let n = funcs.len();
+        let prog = Program { module: "oddshift".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
+        let calls: Vec<(usize, Vec<i128>)> = (0..n).flat_map(|f| vals.iter().map(move |&a| (f, vec![a]))).collect();
+        if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+            failures.push(format!("constant shifts on {}: {}", ty.name(), e));
+        }
+    }
     eprintln!(
         "edge values: {} programs, {} calls compared ({} returns, {} traps)",
         stats.programs,
@@ -1073,7 +1642,7 @@ fn compare_unary_widen_at_edge_values() {
     let mut stats = Stats::default();
     let mut failures = Vec::new();
     let mk = |kind, ty| Site { kind, line: 1, what: String::new(), ty };
-    for ty in ALL {
+    for ty in ALL.into_iter().chain(ODD) {
         let vals = edge_values(ty);
         let ops: Vec<CmpOp> = if ty == Ty::Bool { vec![CmpOp::Eq, CmpOp::Ne] } else { CMPS.to_vec() };
         for op in ops {
@@ -1101,7 +1670,7 @@ fn compare_unary_widen_at_edge_values() {
                 funcs.push(one_func("cb", &[ty], Ty::U32, as_branch(cmp(op, konst(ty, c), var(ty, 0))), 1));
                 single.push(funcs.len() - 1);
             }
-            let prog = Program { module: "cmp".into(), funcs, sites, mode: OverflowMode::Trap };
+            let prog = Program { module: "cmp".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
             let mut calls = Vec::new();
             for &a in &vals {
                 for &b in &vals {
@@ -1129,14 +1698,14 @@ fn compare_unary_widen_at_edge_values() {
             }
         }
         let n = funcs.len();
-        let prog = Program { module: "unary".into(), funcs, sites, mode: OverflowMode::Trap };
+        let prog = Program { module: "unary".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
         let calls: Vec<(usize, Vec<i128>)> =
             (0..n).flat_map(|f| vals.iter().map(move |&a| (f, vec![a]))).collect();
         if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
             failures.push(format!("unary on {}: {}", ty.name(), e));
         }
         // Widening into every wider type.
-        for to in Ty::INTS {
+        for to in Ty::INTS.into_iter().chain(ODD) {
             if to == ty || !to.can_widen_from(ty) {
                 continue;
             }
@@ -1149,7 +1718,7 @@ fn compare_unary_widen_at_edge_values() {
                 one_func("wa", &[ty], to, vec![Stmt::Return(Some(arith(to, ArithOp::ShrW, use_, konst(Ty::U32, 1), 0)))], 1),
                 one_func("wc", &[ty], Ty::Bool, vec![Stmt::Return(Some(cmp(CmpOp::Lt, w, konst(to, 0))))], 1),
             ];
-            let prog = Program { module: "widen".into(), funcs, sites, mode: OverflowMode::Trap };
+            let prog = Program { module: "widen".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
             let calls: Vec<(usize, Vec<i128>)> =
                 (0..3).flat_map(|f| vals.iter().map(move |&a| (f, vec![a]))).collect();
             if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
@@ -1164,6 +1733,63 @@ fn compare_unary_widen_at_edge_values() {
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// `x as T` between every pair of types, truncating and checked, at every
+/// edge value of the source: the result returned, fed to 64-bit-sensitive
+/// arithmetic and compared, and the operand as a constant.
+#[test]
+fn casts_at_edge_values() {
+    let mut rng = Rng::new(27);
+    let mut stats = Stats::default();
+    let mut failures = Vec::new();
+    let mk = |kind, ty| Site { kind, line: 1, what: String::new(), ty };
+    for from in ALL.into_iter().chain(ODD) {
+        let vals = edge_values(from);
+        for to in Ty::INTS.into_iter().chain(ODD) {
+            if to == from {
+                continue;
+            }
+            for checked in [false, true] {
+                let sites = vec![mk(TrapKind::Overflow, to), mk(TrapKind::NoReturn, to), mk(TrapKind::Cast, to)];
+                let site = if checked { 2 } else { 0 };
+                let cast = |arg: Expr| {
+                    if from == Ty::Bool {
+                        Expr { ty: to, kind: ExprKind::Widen(Box::new(arg)) }
+                    } else {
+                        Expr { ty: to, kind: ExprKind::Cast { arg: Box::new(arg), site } }
+                    }
+                };
+                let c = cast(var(from, 0));
+                let use_ = arith(to, ArithOp::AddW, c.clone(), konst(to, 0), 0);
+                let mut funcs = vec![
+                    one_func("c", &[from], to, vec![Stmt::Return(Some(c.clone()))], 1),
+                    one_func("ca", &[from], to, vec![Stmt::Return(Some(arith(to, ArithOp::ShrW, use_, konst(Ty::U32, 1), 0)))], 1),
+                    one_func("cc", &[from], Ty::Bool, vec![Stmt::Return(Some(cmp(CmpOp::Lt, c, konst(to, 0))))], 1),
+                ];
+                // The operand as a constant (the generator never folds it).
+                for &k in &vals {
+                    funcs.push(one_func("k", &[from], to, vec![Stmt::Return(Some(cast(konst(from, k))))], 1));
+                }
+                let n = funcs.len();
+                let prog = Program { module: "cast".into(), funcs, sites, mode: OverflowMode::Trap, unchecked: Vec::new(), data: Vec::new(), globals: Vec::new(), internal_abi: Vec::new() };
+                let mut calls: Vec<(usize, Vec<i128>)> =
+                    (0..3).flat_map(|f| vals.iter().map(move |&a| (f, vec![a]))).collect();
+                for f in 3..n {
+                    calls.push((f, vec![0]));
+                }
+                if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+                    failures.push(format!("{} as {} ({}): {}", from.name(), to.name(), if checked { "checked" } else { "truncating" }, e));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "casts: {} programs, {} calls compared ({} returns, {} cast traps)",
+        stats.programs, stats.calls, stats.returns, stats.traps[TrapKind::Cast as usize]
+    );
+    assert!(stats.traps[TrapKind::Cast as usize] > 0);
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
 /// Like `compare`, for an explicit list of (function, arguments).
 fn compare_calls(
     prog: &Program,
@@ -1173,15 +1799,27 @@ fn compare_calls(
 ) -> Result<(), String> {
     let code = codegen::compile(prog, TrapStyle::Jit, true)
         .map_err(|e| format!("codegen error in {}: {} {}", e.func, e.construct, e.detail))?;
-    let mut jit = Jit::load(&code, prog.funcs.len())?;
+    let mut jit = Jit::load(&code, prog.funcs.len(), &prog.data, &prog.globals)?;
     stats.programs += 1;
     let mut bad = Vec::new();
     for (fi, args) in calls {
         let f = &prog.funcs[*fi];
         let ptys: Vec<Ty> = f.vars[..f.nparams].iter().map(|v| v.ty).collect();
         let want = Interp::new(prog).call(*fi, args);
-        let raw: Vec<u64> = args.iter().zip(&ptys).map(|(&v, &t)| raw_arg(rng, v, t)).collect();
-        let got = jit.call(*fi as FuncId, &raw);
+        // AAPCS64: integer arguments in x0-x7, float ones in d0-d7 (s0-s7), each
+        // class numbered on its own; a float result comes back in d0 (s0).
+        let (mut xs, mut ds) = (Vec::new(), Vec::new());
+        for (&v, &t) in args.iter().zip(&ptys) {
+            if t.is_float() {
+                ds.push(v as u64);
+            } else {
+                xs.push(raw_arg(rng, v, t));
+            }
+        }
+        let fp_ret = f.ret.is_some_and(|t| t.is_float());
+        let got = jit
+            .call_fp(*fi as FuncId, &xs, &ds)
+            .map(|(x0, d0)| if fp_ret { d0 } else { x0 });
         stats.calls += 1;
         let ok = match (&want, &got) {
             (Ok(Some(v)), Ok(r)) => {
@@ -1209,4 +1847,1058 @@ fn compare_calls(
     } else {
         Err(bad.join("; "))
     }
+}
+
+// ------------------------------------------------------------------ f64
+
+/// Binary64 edge values as IR values (bit patterns): signed zeros, the
+/// infinities, quiet and signalling NaNs with payloads, subnormals, the
+/// integer-exactness edge 2^53, and the bounds of every `@intFromFloat`.
+fn f64_edges() -> Vec<i128> {
+    let mut v: Vec<i128> = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        -0.5,
+        1.5,
+        2.0,
+        3.0,
+        0.1,
+        1.0 / 3.0,
+        -2.5,
+        127.99,
+        128.0,
+        -128.5,
+        -129.0,
+        255.5,
+        256.0,
+        65535.75,
+        2147483647.5,
+        -2147483648.75,
+        -2147483649.0,
+        4294967295.9,
+        4294967296.0,
+        9007199254740992.0,  // 2^53
+        9007199254740994.0,  // 2^53 + 2
+        -9007199254740992.0,
+        9223372036854775807.0, // rounds to 2^63
+        -9223372036854775808.0,
+        -9223372036854777856.0, // the next f64 below -2^63
+        18446744073709551615.0, // rounds to 2^64
+        18446744073709549568.0, // the largest f64 below 2^64
+        1.0e300,
+        -1.0e300,
+        1.0e-300,
+        f64::MAX,
+        f64::MIN,
+        f64::MIN_POSITIVE,
+        f64::EPSILON,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ]
+    .iter()
+    .map(|&x: &f64| f64_bits(x))
+    .collect();
+    v.extend([
+        1,                       // smallest subnormal
+        0x8000_0000_0000_0001,   // its negation
+        0x000f_ffff_ffff_ffff,   // largest subnormal
+        0x7ff8_0000_0000_0000,   // the default quiet NaN
+        0xfff8_0000_0000_0000,   // negative quiet NaN
+        0x7ff8_0000_0000_beef,   // quiet NaN with a payload
+        0x7ff0_0000_0000_0001,   // signalling NaN
+    ]);
+    v
+}
+
+fn f64_konst(x: f64) -> Expr {
+    konst(Ty::F64, f64_bits(x))
+}
+
+fn farith(op: FOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr { ty: Ty::F64, kind: ExprKind::FArith { op, lhs: Box::new(lhs), rhs: Box::new(rhs) } }
+}
+
+fn f64_program(name: &str, funcs: Vec<Func>, sites: Vec<Site>) -> Program {
+    Program {
+        module: name.into(),
+        funcs,
+        sites,
+        mode: OverflowMode::Trap,
+        unchecked: Vec::new(),
+        data: Vec::new(),
+        globals: Vec::new(),
+        internal_abi: Vec::new(),
+    }
+}
+
+/// `+ - * /`, negation and the six comparisons on every pair of edge
+/// values, operands in d registers and as constants: the JIT's d0 (or x0
+/// for a bool) must be the interpreter's bit pattern exactly.
+#[test]
+fn f64_arith_and_compare_match_interpreter() {
+    let mut rng = Rng::new(64);
+    let mut stats = Stats::default();
+    let mut failures = Vec::new();
+    let vals = f64_edges();
+    let nsite = |ty| vec![Site { kind: TrapKind::Overflow, line: 1, what: String::new(), ty }, Site { kind: TrapKind::NoReturn, line: 1, what: String::new(), ty }];
+    for op in [FOp::Add, FOp::Sub, FOp::Mul, FOp::Div] {
+        let (a, b) = (var(Ty::F64, 0), var(Ty::F64, 1));
+        let mut funcs = vec![
+            one_func("f", &[Ty::F64, Ty::F64], Ty::F64, vec![Stmt::Return(Some(farith(op, a.clone(), b.clone())))], 1),
+            // Both orders with a constant operand, and a nested tree.
+            one_func("fk", &[Ty::F64, Ty::F64], Ty::F64, vec![Stmt::Return(Some(farith(op, a.clone(), f64_konst(0.1))))], 1),
+            one_func("kf", &[Ty::F64, Ty::F64], Ty::F64, vec![Stmt::Return(Some(farith(op, f64_konst(-3.0), b.clone())))], 1),
+            one_func(
+                "tree",
+                &[Ty::F64, Ty::F64],
+                Ty::F64,
+                vec![Stmt::Return(Some(farith(
+                    op,
+                    farith(FOp::Mul, a.clone(), b.clone()),
+                    Expr { ty: Ty::F64, kind: ExprKind::FNeg(Box::new(farith(op, b.clone(), a.clone()))) },
+                )))],
+                1,
+            ),
+        ];
+        if op == FOp::Add {
+            funcs.push(one_func("neg", &[Ty::F64, Ty::F64], Ty::F64, vec![Stmt::Return(Some(Expr { ty: Ty::F64, kind: ExprKind::FNeg(Box::new(a.clone())) }))], 1));
+            for c in CMPS {
+                funcs.push(one_func("cmp", &[Ty::F64, Ty::F64], Ty::Bool, vec![Stmt::Return(Some(cmp(c, a.clone(), b.clone())))], 1));
+                // A comparison as a branch condition, not only as a value.
+                funcs.push(one_func(
+                    "br",
+                    &[Ty::F64, Ty::F64],
+                    Ty::I32,
+                    vec![
+                        Stmt::If { cond: cmp(c, a.clone(), b.clone()), then: vec![Stmt::Return(Some(konst(Ty::I32, 1)))], els: vec![] },
+                        Stmt::Return(Some(konst(Ty::I32, 2))),
+                    ],
+                    1,
+                ));
+            }
+        }
+        let n = funcs.len();
+        let prog = f64_program("f64", funcs, nsite(Ty::F64));
+        let mut calls = Vec::new();
+        for fi in 0..n {
+            for &x in &vals {
+                for &y in &vals {
+                    calls.push((fi, vec![x, y]));
+                }
+            }
+        }
+        if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+            failures.push(format!("f{}: {}", op.symbol(), e));
+        }
+    }
+    eprintln!("f64 arith: {} programs, {} calls compared ({} returns)", stats.programs, stats.calls, stats.returns);
+    assert!(stats.returns > 0);
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// `@floatFromInt` from every integer type at its edge values, and
+/// `@intFromFloat` to every integer type at every f64 edge value: in range
+/// the same integer (0 for a NaN, as in Zig 0.16 Debug), out of range (the
+/// infinities included) the same trap site.
+#[test]
+fn f64_conversions_match_interpreter() {
+    let mut rng = Rng::new(65);
+    let mut stats = Stats::default();
+    let mut failures = Vec::new();
+    let mk = |kind, ty| Site { kind, line: 1, what: String::new(), ty };
+    for ty in Ty::INTS {
+        let sites = vec![mk(TrapKind::Overflow, ty), mk(TrapKind::NoReturn, ty), mk(TrapKind::FloatToInt, ty)];
+        let to_f = Expr { ty: Ty::F64, kind: ExprKind::IntToFloat(Box::new(var(ty, 0))) };
+        let to_i = Expr { ty, kind: ExprKind::FloatToInt { arg: Box::new(var(Ty::F64, 0)), site: 2 } };
+        // Round trip through f64 and back, mixed with integer arithmetic.
+        let back = Expr {
+            ty,
+            kind: ExprKind::FloatToInt { arg: Box::new(farith(FOp::Mul, to_f.clone(), f64_konst(0.5))), site: 2 },
+        };
+        let funcs = vec![
+            one_func("ff", &[ty], Ty::F64, vec![Stmt::Return(Some(to_f))], 1),
+            one_func("fi", &[Ty::F64], ty, vec![Stmt::Return(Some(to_i))], 1),
+            one_func("rt", &[ty], ty, vec![Stmt::Return(Some(back))], 1),
+        ];
+        let prog = f64_program("conv", funcs, sites);
+        let mut calls: Vec<(usize, Vec<i128>)> = Vec::new();
+        for &v in &edge_values(ty) {
+            calls.push((0, vec![v]));
+            calls.push((2, vec![v]));
+        }
+        for &x in &f64_edges() {
+            calls.push((1, vec![x]));
+        }
+        if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+            failures.push(format!("{}: {}", ty.name(), e));
+        }
+    }
+    eprintln!(
+        "f64 conversions: {} programs, {} calls compared ({} returns, {} @intFromFloat traps)",
+        stats.programs, stats.calls, stats.returns, stats.traps[TrapKind::FloatToInt as usize]
+    );
+    assert!(stats.traps[TrapKind::FloatToInt as usize] > 0);
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// AAPCS64: F64 and integer parameters interleaved (the d and x registers
+/// are numbered per class), all eight d registers in use, and a non-leaf
+/// caller passing its arguments on in another order, with the F64 result
+/// crossing the call in d0.
+#[test]
+fn f64_mixed_arguments_and_calls_match_interpreter() {
+    let mut rng = Rng::new(66);
+    let mut stats = Stats::default();
+    let params = [Ty::F64, Ty::I32, Ty::F64, Ty::U8, Ty::F64, Ty::F64, Ty::I64, Ty::F64];
+    let v = |i: usize| var(params[i], i);
+    let fl = |i: usize| Expr { ty: Ty::F64, kind: ExprKind::IntToFloat(Box::new(v(i))) };
+    // callee: ((p0 - p2) * p4 + p5 / p7) + float(p1) - float(p3) * float(p6)
+    let body = farith(
+        FOp::Sub,
+        farith(FOp::Add, farith(FOp::Add, farith(FOp::Mul, farith(FOp::Sub, v(0), v(2)), v(4)), farith(FOp::Div, v(5), v(7))), fl(1)),
+        farith(FOp::Mul, fl(3), fl(6)),
+    );
+    let callee = one_func("callee", &params, Ty::F64, vec![Stmt::Return(Some(body))], 1);
+    // caller: callee with its F64 arguments rotated, then the result used
+    // after the call alongside a parameter that lives across it.
+    let call = Expr {
+        ty: Ty::F64,
+        kind: ExprKind::Call { func: 0, args: vec![v(7), v(1), v(0), v(3), v(2), v(4), v(6), v(5)] },
+    };
+    let caller = one_func("caller", &params, Ty::F64, vec![Stmt::Return(Some(farith(FOp::Add, call, v(5))))], 1);
+    // Only F64 parameters: all eight d registers.
+    let eight = [Ty::F64; 8];
+    let w = |i: usize| var(Ty::F64, i);
+    let mut sum = w(0);
+    for i in 1..8 {
+        sum = farith(if i % 2 == 1 { FOp::Sub } else { FOp::Div }, sum, w(i));
+    }
+    let all_d = one_func("all_d", &eight, Ty::F64, vec![Stmt::Return(Some(sum))], 1);
+    let sites = vec![
+        Site { kind: TrapKind::Overflow, line: 1, what: String::new(), ty: Ty::F64 },
+        Site { kind: TrapKind::NoReturn, line: 1, what: String::new(), ty: Ty::F64 },
+    ];
+    let prog = f64_program("mixed", vec![callee, caller, all_d], sites);
+    let edges = f64_edges();
+    let ints = |ty: Ty| edge_values(ty);
+    let mut calls = Vec::new();
+    for k in 0..400 {
+        let mut args = Vec::new();
+        for &t in &params {
+            args.push(if t == Ty::F64 { edges[rng.below(edges.len())] } else { rng.pick(&ints(t)) });
+        }
+        calls.push((k % 2, args));
+        let all: Vec<i128> = (0..8).map(|_| edges[rng.below(edges.len())]).collect();
+        calls.push((2, all));
+    }
+    let r = compare_calls(&prog, &calls, &mut rng, &mut stats);
+    eprintln!("f64 calls: {} calls compared ({} returns)", stats.calls, stats.returns);
+    assert!(r.is_ok(), "{}", r.unwrap_err());
+    assert_eq!(stats.returns, calls.len());
+}
+
+// ------------------------------------------------------------ f64 source
+
+fn f64_lower(src: &str) -> Result<Program, Vec<String>> {
+    let parsed = front::parse(std::path::Path::new("/nonexistent/f.t27"), src).map_err(|e| vec![format!("parse: {}", e)])?;
+    lower::lower_src(&parsed.ast, OverflowMode::Trap, Some(src)).map_err(|rs| rs.iter().map(|r| r.message()).collect())
+}
+
+/// Every test block of `src` in both engines: (name, passed). A block on
+/// which they disagree fails the test outright.
+fn f64_run(src: &str) -> Vec<(String, Result<(), TrapKind>)> {
+    let prog = f64_lower(src).unwrap_or_else(|e| panic!("lowering failed:\n{}", e.join("\n")));
+    let code = codegen::compile(&prog, TrapStyle::Jit, true).expect("codegen");
+    let mut jit = Jit::load(&code, prog.funcs.len(), &prog.data, &prog.globals).expect("jit load");
+    let mut out = Vec::new();
+    for (id, f) in prog.tests() {
+        let want = Interp::new(&prog).call(id, &[]);
+        let got = jit.call(id as FuncId, &[]);
+        let o = match (&want, &got) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(Stop::Trap { site, .. }), Err(t)) if *site == t.site => Err(prog.sites[*site as usize].kind),
+            _ => panic!("{}: interpreter {:?}, jit {:?}", f.name, want, got),
+        };
+        out.push((f.name.clone(), o));
+    }
+    out
+}
+
+// ------------------------------------------------------------ bench blocks
+
+const BENCH_SRC: &str = r#"module b;
+
+fn sq(x: u32) u32 {
+    return x * x;
+}
+
+test sq_small {
+    assert(sq(3) == 9);
+}
+
+bench "sq_loop" {
+    var acc: u32 = 0;
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        acc = acc +% sq(i);
+    }
+    assert(acc == 0);
+}
+
+bench sq_colon: sq(2) == 5
+"#;
+
+fn lower_text(src: &str) -> Result<Program, Vec<String>> {
+    let parsed = t27b::front::parse(std::path::Path::new("/nonexistent/b.t27"), src).map_err(|e| vec![format!("parse: {}", e)])?;
+    t27b::lower::lower_src(&parsed.ast, OverflowMode::Trap, Some(src)).map_err(|rs| rs.iter().map(|r| r.message()).collect())
+}
+
+/// Every test of `prog` in the JIT and the interpreter: (name, trapped).
+fn run_both(prog: &Program) -> Vec<(String, bool)> {
+    let code = codegen::compile(prog, TrapStyle::Jit, true).expect("codegen");
+    let mut jit = Jit::load(&code, prog.funcs.len(), &prog.data, &prog.globals).expect("jit load");
+    let mut out = Vec::new();
+    for (id, f) in prog.tests() {
+        let want = Interp::new(prog).call(id, &[]);
+        let got = jit.call(id as FuncId, &[]);
+        let trapped = match (&want, &got) {
+            (Ok(_), Ok(_)) => false,
+            (Err(Stop::Trap { site, .. }), Err(t)) if *site == t.site => true,
+            _ => panic!("{}: interpreter {:?}, jit {:?}", f.name, want, got),
+        };
+        out.push((f.name.clone(), trapped));
+    }
+    out
+}
+
+/// f64 from source: literals, `+ - * /`, negation, comparisons, f64
+/// parameters, results, locals and constants, and the two conversions in
+/// Zig's spelling with the result type from context. Every block's verdict
+/// is the one `t27c gen` + `zig test` gives for the same text.
+#[test]
+fn f64_source_programs_run_in_both_engines() {
+    let src = "module f64src;
+
+const PHI: f64 = 1.618033988749895;
+const THIRD: f64 = 1.0 / 3.0;
+const QUARTER = 0.25;
+
+fn half(x: f64) f64 {
+    return x / 2.0;
+}
+
+fn mix(n: i32, x: f64) i32 {
+    const y: f64 = @as(f64, @floatFromInt(n)) * x;
+    var z: f64 = -y + 0.5;
+    z = z * 2.0;
+    return @intFromFloat(z);
+}
+
+fn many(a: f64, b: i64, c: f64, d: u8, e: f64) f64 {
+    return a - c * e + @as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(d));
+}
+
+fn to_i8(x: f64) i8 {
+    return @intFromFloat(x);
+}
+
+fn nan() f64 {
+    const z: f64 = 0.0;
+    return z / z;
+}
+
+test half_works {
+    assert(half(3.0) == 1.5);
+    assert(mix(3, 1.5) == -8);
+    assert(PHI * PHI - PHI > 0.99);
+    assert(THIRD < 0.34);
+    assert(many(2.0, 3, 2.0, 4, 0.5) + QUARTER == 2.0);
+    const q: f64 = 0.5 * 3.0;
+    assert(q == 1.5);
+    assert(QUARTER * 4.0 == 1.0);
+    assert_eq(half(-0.0), 0.0);
+    assert(nan() != nan());
+    assert(to_i8(-128.9) == -128);
+}
+
+test out_of_range {
+    assert(to_i8(128.0) == 0);
+}
+
+test nan_to_int {
+    assert(to_i8(nan()) == 0);
+}
+";
+    let r = f64_run(src);
+    let got: Vec<(&str, Result<(), TrapKind>)> = r.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("half_works", Ok(())),
+            ("out_of_range", Err(TrapKind::FloatToInt)),
+            ("nan_to_int", Ok(())),
+        ]
+    );
+}
+
+/// What stays refused, each named: `@sqrt` of a negative literal (a non-negative one folds), `std.math.*`, a
+/// conversion with no result type, f16, `as` from an f64 t27c gen does not
+/// spell as a float (here an array element; a spelled one, a call of a fn
+/// declared `-> f64` included, is lowered, see `float_as_plan.t27`) or from a bool to f64 (an integer `as f64` is
+/// `@floatFromInt`, see `source.rs`), a folded value
+/// past the f64 range, and `x * 2^k` on f64 (t27c gen rewrites it into a
+/// shift that cannot compile).
+#[test]
+fn f64_refusals_name_the_construct() {
+    let first = |body: &str| -> String {
+        let src = format!("module f64rej;\nfn f(x: f64, n: i32) f64 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
+        match f64_lower(&src) {
+            Ok(_) => panic!("expected a rejection for {}", body),
+            Err(e) => e[0].clone(),
+        }
+    };
+    for (body, want) in [
+        ("return @sqrt(-2.0) + x;", "ExprCall(@sqrt)"),
+        ("return std.math.sqrt(x);", "ExprCall(std.*)"),
+        ("return @floatFromInt(n) + x;", "ExprCall(@floatFromInt)"),
+        ("const y: f16 = 1.0;\nreturn x;", "type f16"),
+        ("const a: [1]f64 = [x];\nreturn a[0] as f64;", "ExprCast(f64)"),
+        ("const a: [1]f64 = [x];\nconst k: i32 = a[0] as i32;\nreturn x;", "ExprCast(f64)"),
+        ("return (n > 0) as f64;", "ExprCast(f64)"),
+        ("return x + 1e308 * 10.0;", "literal out of range"),
+        ("return x + 1.0 / 0.0;", "ExprBinary"),
+        ("return x * 2;", "ExprBinary(f64 * 2^k)"),
+        ("return x % 2.0;", "ExprBinary(%)"),
+        ("return x + @as(i64, n);", "type mismatch"),
+    ] {
+        let msg = first(body);
+        assert!(msg.contains(&format!("unsupported construct {} ", want)), "{}: {}", body, msg);
+    }
+    // Literals fold whether or not they are an f64 exactly (in binary128,
+    // see `comptime_floats_fold_in_binary128`): 1e22 is one, 1e23 is not.
+    assert!(f64_lower("module ok;\nfn f() f64 {\nreturn 1e22 * 0.5 + 0.5 * 3.0;\n}\n").is_ok());
+    assert!(f64_lower("module ok;\nfn f(x: f64) f64 {\nreturn x + 1e23 * 1.0 + 0.1 * 3.0;\n}\n").is_ok());
+}
+
+// ------------------------------------------------------------------ f32
+
+/// Binary32 edge values as IR values (zero-extended bit patterns): signed
+/// zeros, infinities, NaNs with payloads, subnormals, 2^24 (the integer
+/// exactness edge) and the bounds of every `@intFromFloat`.
+fn f32_edges() -> Vec<i128> {
+    let mut v: Vec<i128> = [
+        0.0f32, -0.0, 1.0, -1.0, 0.5, 1.5, 2.0, 3.0, 0.1, 1.0 / 3.0, -2.5, 127.99, 128.0, -128.5, -129.0, 255.5,
+        256.0, 65535.75, 16777216.0, 16777218.0, -16777216.0, 2147483520.0, 2147483648.0, -2147483648.0,
+        -2147483904.0, 4294967040.0, 4294967296.0, 9223371487098961920.0, 9223372036854775808.0,
+        18446742974197923840.0, 18446744073709551616.0, 1.0e30, -1.0e30, 1.0e-30, f32::MAX, f32::MIN,
+        f32::MIN_POSITIVE, f32::EPSILON, f32::INFINITY, f32::NEG_INFINITY,
+    ]
+    .iter()
+    .map(|&x: &f32| f32_bits(x))
+    .collect();
+    v.extend([
+        1,           // smallest subnormal
+        0x8000_0001, // its negation
+        0x007f_ffff, // largest subnormal
+        0x7fc0_0000, // the default quiet NaN
+        0xffc0_0000, // negative quiet NaN
+        0x7fc0_beef, // quiet NaN with a payload
+        0x7f80_0001, // signalling NaN
+    ]);
+    v
+}
+
+fn f32_konst(x: f32) -> Expr {
+    konst(Ty::F32, f32_bits(x))
+}
+
+fn farith32(op: FOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr { ty: Ty::F32, kind: ExprKind::FArith { op, lhs: Box::new(lhs), rhs: Box::new(rhs) } }
+}
+
+fn fcast(to: Ty, e: Expr) -> Expr {
+    Expr { ty: to, kind: ExprKind::FloatCast(Box::new(e)) }
+}
+
+/// `+ - * /`, negation and the six comparisons on every pair of f32 edge
+/// values, in s registers and as constants: the JIT's s0 (or x0 for a
+/// bool) must be the interpreter's bit pattern exactly.
+#[test]
+fn f32_arith_and_compare_match_interpreter() {
+    let mut rng = Rng::new(32);
+    let mut stats = Stats::default();
+    let mut failures = Vec::new();
+    let vals = f32_edges();
+    let nsite = |ty| vec![Site { kind: TrapKind::Overflow, line: 1, what: String::new(), ty }, Site { kind: TrapKind::NoReturn, line: 1, what: String::new(), ty }];
+    for op in [FOp::Add, FOp::Sub, FOp::Mul, FOp::Div] {
+        let (a, b) = (var(Ty::F32, 0), var(Ty::F32, 1));
+        let mut funcs = vec![
+            one_func("f", &[Ty::F32, Ty::F32], Ty::F32, vec![Stmt::Return(Some(farith32(op, a.clone(), b.clone())))], 1),
+            one_func("fk", &[Ty::F32, Ty::F32], Ty::F32, vec![Stmt::Return(Some(farith32(op, a.clone(), f32_konst(0.1))))], 1),
+            one_func("kf", &[Ty::F32, Ty::F32], Ty::F32, vec![Stmt::Return(Some(farith32(op, f32_konst(-3.0), b.clone())))], 1),
+            one_func(
+                "tree",
+                &[Ty::F32, Ty::F32],
+                Ty::F32,
+                vec![Stmt::Return(Some(farith32(
+                    op,
+                    farith32(FOp::Mul, a.clone(), b.clone()),
+                    Expr { ty: Ty::F32, kind: ExprKind::FNeg(Box::new(farith32(op, b.clone(), a.clone()))) },
+                )))],
+                1,
+            ),
+            // The same op in f64 on the widened operands, narrowed back.
+            one_func(
+                "wide",
+                &[Ty::F32, Ty::F32],
+                Ty::F32,
+                vec![Stmt::Return(Some(fcast(Ty::F32, farith(op, fcast(Ty::F64, a.clone()), fcast(Ty::F64, b.clone())))))],
+                1,
+            ),
+        ];
+        if op == FOp::Add {
+            funcs.push(one_func("neg", &[Ty::F32, Ty::F32], Ty::F32, vec![Stmt::Return(Some(Expr { ty: Ty::F32, kind: ExprKind::FNeg(Box::new(a.clone())) }))], 1));
+            for c in CMPS {
+                funcs.push(one_func("cmp", &[Ty::F32, Ty::F32], Ty::Bool, vec![Stmt::Return(Some(cmp(c, a.clone(), b.clone())))], 1));
+                funcs.push(one_func(
+                    "br",
+                    &[Ty::F32, Ty::F32],
+                    Ty::I32,
+                    vec![
+                        Stmt::If { cond: cmp(c, a.clone(), b.clone()), then: vec![Stmt::Return(Some(konst(Ty::I32, 1)))], els: vec![] },
+                        Stmt::Return(Some(konst(Ty::I32, 2))),
+                    ],
+                    1,
+                ));
+            }
+        }
+        let n = funcs.len();
+        let prog = f64_program("f32", funcs, nsite(Ty::F32));
+        let mut calls = Vec::new();
+        for fi in 0..n {
+            for &x in &vals {
+                for &y in &vals {
+                    calls.push((fi, vec![x, y]));
+                }
+            }
+        }
+        if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+            failures.push(format!("f{}: {}", op.symbol(), e));
+        }
+    }
+    eprintln!("f32 arith: {} programs, {} calls compared ({} returns)", stats.programs, stats.calls, stats.returns);
+    assert!(stats.returns > 0);
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// `@floatFromInt` to f32 from every integer type at its edge values (one
+/// rounding, straight from the integer), `@intFromFloat` from every f32
+/// edge value, and `@floatCast` both ways over the f32 and f64 edges.
+#[test]
+fn f32_conversions_match_interpreter() {
+    let mut rng = Rng::new(33);
+    let mut stats = Stats::default();
+    let mut failures = Vec::new();
+    let mk = |kind, ty| Site { kind, line: 1, what: String::new(), ty };
+    for ty in Ty::INTS {
+        let sites = vec![mk(TrapKind::Overflow, ty), mk(TrapKind::NoReturn, ty), mk(TrapKind::FloatToInt, ty)];
+        let to_f = Expr { ty: Ty::F32, kind: ExprKind::IntToFloat(Box::new(var(ty, 0))) };
+        let to_i = Expr { ty, kind: ExprKind::FloatToInt { arg: Box::new(var(Ty::F32, 0)), site: 2 } };
+        let back = Expr {
+            ty,
+            kind: ExprKind::FloatToInt { arg: Box::new(farith32(FOp::Mul, to_f.clone(), f32_konst(0.5))), site: 2 },
+        };
+        let funcs = vec![
+            one_func("ff", &[ty], Ty::F32, vec![Stmt::Return(Some(to_f))], 1),
+            one_func("fi", &[Ty::F32], ty, vec![Stmt::Return(Some(to_i))], 1),
+            one_func("rt", &[ty], ty, vec![Stmt::Return(Some(back))], 1),
+        ];
+        let prog = f64_program("conv32", funcs, sites);
+        let mut calls: Vec<(usize, Vec<i128>)> = Vec::new();
+        for &v in &edge_values(ty) {
+            calls.push((0, vec![v]));
+            calls.push((2, vec![v]));
+        }
+        for &x in &f32_edges() {
+            calls.push((1, vec![x]));
+        }
+        if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+            failures.push(format!("{}: {}", ty.name(), e));
+        }
+    }
+    let sites = vec![mk(TrapKind::Overflow, Ty::F32), mk(TrapKind::NoReturn, Ty::F32)];
+    let funcs = vec![
+        one_func("narrow", &[Ty::F64], Ty::F32, vec![Stmt::Return(Some(fcast(Ty::F32, var(Ty::F64, 0))))], 1),
+        one_func("widen", &[Ty::F32], Ty::F64, vec![Stmt::Return(Some(fcast(Ty::F64, var(Ty::F32, 0))))], 1),
+    ];
+    let prog = f64_program("cast32", funcs, sites);
+    let mut calls: Vec<(usize, Vec<i128>)> = Vec::new();
+    let mut narrow_in = f64_edges();
+    // Every f32 edge widened, and the f32 midpoints next to some of them.
+    for &x in &f32_edges() {
+        let w = f32_of(x) as f64;
+        narrow_in.push(f64_bits(w));
+        if w.is_finite() {
+            let up = f32_of(x).next_up() as f64;
+            narrow_in.push(f64_bits((w + up) / 2.0));
+        }
+    }
+    for &x in &narrow_in {
+        calls.push((0, vec![x]));
+    }
+    for &x in &f32_edges() {
+        calls.push((1, vec![x]));
+    }
+    if let Err(e) = compare_calls(&prog, &calls, &mut rng, &mut stats) {
+        failures.push(format!("floatCast: {}", e));
+    }
+    eprintln!(
+        "f32 conversions: {} programs, {} calls compared ({} returns, {} @intFromFloat traps)",
+        stats.programs, stats.calls, stats.returns, stats.traps[TrapKind::FloatToInt as usize]
+    );
+    assert!(stats.traps[TrapKind::FloatToInt as usize] > 0);
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// AAPCS64 with f32 and f64 parameters interleaved with integers (s_k and
+/// d_k are the same register), and a non-leaf caller passing them on
+/// rotated, the f32 result crossing the call in s0.
+#[test]
+fn f32_mixed_arguments_and_calls_match_interpreter() {
+    let mut rng = Rng::new(34);
+    let mut stats = Stats::default();
+    let params = [Ty::F32, Ty::I32, Ty::F64, Ty::U8, Ty::F32, Ty::F32, Ty::I64, Ty::F64];
+    let v = |i: usize| var(params[i], i);
+    let w = |i: usize| if params[i] == Ty::F32 { fcast(Ty::F64, v(i)) } else { v(i) };
+    let fl = |i: usize| Expr { ty: Ty::F32, kind: ExprKind::IntToFloat(Box::new(v(i))) };
+    // callee: f32(((p0 - p2) * p4 + p5 / p7)) + float32(p1) - float32(p3) * float32(p6)
+    let wide = farith(FOp::Add, farith(FOp::Mul, farith(FOp::Sub, w(0), w(2)), w(4)), farith(FOp::Div, w(5), w(7)));
+    let body = farith32(FOp::Sub, farith32(FOp::Add, fcast(Ty::F32, wide), fl(1)), farith32(FOp::Mul, fl(3), fl(6)));
+    let callee = one_func("callee", &params, Ty::F32, vec![Stmt::Return(Some(body))], 1);
+    let call = Expr {
+        ty: Ty::F32,
+        kind: ExprKind::Call { func: 0, args: vec![v(5), v(1), v(7), v(3), v(0), v(4), v(6), v(2)] },
+    };
+    let caller = one_func("caller", &params, Ty::F32, vec![Stmt::Return(Some(farith32(FOp::Add, call, v(5))))], 1);
+    let sites = vec![
+        Site { kind: TrapKind::Overflow, line: 1, what: String::new(), ty: Ty::F32 },
+        Site { kind: TrapKind::NoReturn, line: 1, what: String::new(), ty: Ty::F32 },
+    ];
+    let prog = f64_program("mixed32", vec![callee, caller], sites);
+    let (e32, e64) = (f32_edges(), f64_edges());
+    let mut calls = Vec::new();
+    for k in 0..400 {
+        let mut args = Vec::new();
+        for &t in &params {
+            args.push(match t {
+                Ty::F32 => e32[rng.below(e32.len())],
+                Ty::F64 => e64[rng.below(e64.len())],
+                t => rng.pick(&edge_values(t)),
+            });
+        }
+        calls.push((k % 2, args));
+    }
+    let r = compare_calls(&prog, &calls, &mut rng, &mut stats);
+    eprintln!("f32 calls: {} calls compared ({} returns)", stats.calls, stats.returns);
+    assert!(r.is_ok(), "{}", r.unwrap_err());
+    assert_eq!(stats.returns, calls.len());
+}
+
+/// f32 from source: literals rounded like Zig's comptime_float -> f32,
+/// arithmetic, comparisons with a literal (coerced to f32), widening to f64
+/// as a peer, `@floatCast`, and the conversions. The verdicts are the ones
+/// `t27c gen` + `zig test` (Zig 0.16) gives for the same text.
+#[test]
+fn f32_source_programs_run_in_both_engines() {
+    let src = "module f32src;
+
+const K: f32 = 0.1;
+const BIG: f32 = 1e39;
+const WIDE: f64 = 0.1;
+
+fn half(x: f32) f32 {
+    return x / 2.0;
+}
+
+fn widen(x: f32) f64 {
+    return x;
+}
+
+fn mix(a: f32, n: i32, b: f64, m: u8, c: f32) f64 {
+    const s: f32 = a * @as(f32, @floatFromInt(n)) - c;
+    return s + b * @as(f64, @floatFromInt(m));
+}
+
+fn narrow(x: f64) f32 {
+    return @floatCast(x);
+}
+
+fn to_i8(x: f32) i8 {
+    return @intFromFloat(x);
+}
+
+fn big_int(n: i64) f32 {
+    return @floatFromInt(n);
+}
+
+test f32_works {
+    assert(half(3.0) == 1.5);
+    const w: f64 = widen(K);
+    assert(w == 0.100000001490116119384765625);
+    assert(w != WIDE);
+    assert(K == 0.1);
+    assert(widen(BIG) > 1e308);
+    assert(mix(1.5, 3, 0.25, 4, 0.5) == 5.0);
+    assert(narrow(0.1) == K);
+    assert(widen(narrow(1e300)) > 1e308);
+    assert(-K < 0.0);
+    assert(to_i8(-128.9) == -128);
+    const big: f64 = widen(big_int(9007199254740993));
+    assert(big == 9007199254740992.0);
+    const t: f32 = 16777216.0;
+    assert(widen(t + 1.0) == 16777216.0);
+    assert(widen(@as(f32, 0.1) + 0.2) == 0.300000011920928955078125);
+}
+
+test f32_out_of_range {
+    assert(to_i8(128.0) == 0);
+}
+";
+    let r = f64_run(src);
+    let got: Vec<(&str, Result<(), TrapKind>)> = r.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    assert_eq!(got, vec![("f32_works", Ok(())), ("f32_out_of_range", Err(TrapKind::FloatToInt))]);
+}
+
+/// What stays refused for f32, each named: an integer literal that is not
+/// exactly an f32 (a Zig compile error), `as` from a float t27c gen does
+/// not spell as one (an array element), and
+/// `@floatCast` of a literal or with no result type. (A literal one f64
+/// apart from an f32 midpoint rounds from its binary128 value, see
+/// `comptime_floats_fold_in_binary128`.)
+#[test]
+fn f32_refusals_name_the_construct() {
+    let first = |body: &str| -> String {
+        let src = format!("module f32rej;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\ntest t {{ assert(f(1.0, 1) == 0.0); }}\n", body);
+        match f64_lower(&src) {
+            Ok(_) => panic!("expected a rejection for {}", body),
+            Err(e) => e[0].clone(),
+        }
+    };
+    for (body, want) in [
+        ("return 16777217;", "literal out of range"),
+        ("const a: [1]f32 = [x];\nreturn a[0] as f32;", "ExprCast(f32)"),
+        ("const a: [1]f32 = [x];\nconst k: i32 = a[0] as i32;\nreturn x;", "ExprCast(f32)"),
+        ("return @floatCast(0.5);", "ExprCall(@floatCast)"),
+        ("return @floatCast(x) + x;", "ExprCall(@floatCast)"),
+        ("return x * 4;", "ExprBinary(f64 * 2^k)"),
+        ("return x + n;", "type mismatch"),
+    ] {
+        let msg = first(body);
+        assert!(msg.contains(&format!("unsupported construct {} ", want)), "{}: {}", body, msg);
+    }
+    // Exact or plainly rounded literals are fine: 16777216, 0.1, and the
+    // midpoints 2^24 + 1 and 2^24 + 3 written as exact float literals
+    // (ties to even: 0x4b800000 and 0x4b800002 in Zig too).
+    for body in ["return 16777216;", "return 0.1 + x;", "return 16777217.0;", "return 16777219.0 - x;", "return n as f32;"] {
+        let src = format!("module f32ok;\nfn f(x: f32, n: i32) f32 {{\n{}\n}}\n", body);
+        assert!(f64_lower(&src).is_ok(), "{}", body);
+    }
+}
+
+/// Zig keeps a comptime_float in binary128: `+ - * /` of two of them round
+/// to binary128, they compare as binary128 values, and a typed f64 or f32
+/// takes one rounding of the result. Every value below was checked with
+/// exact rational arithmetic, and the same text passes `t27c gen` + `zig
+/// test` 6/6 with every assert run at run time (the conformance spec
+/// `specs/tri/t27b/conformance/comptime_float.t27` holds the first cases).
+#[test]
+fn comptime_floats_fold_in_binary128() {
+    let src = "module cfwide;
+
+fn add(x: f64, y: f64) f64 {
+    return x + y;
+}
+
+fn sub(x: f64, y: f64) f64 {
+    return x - y;
+}
+
+fn mul(x: f64, y: f64) f64 {
+    return x * y;
+}
+
+fn same(b: bool) bool {
+    return b;
+}
+
+fn widen(x: f32) f64 {
+    return x;
+}
+
+fn to_i32(x: f64) i32 {
+    return @intFromFloat(x);
+}
+
+test past_f64_and_back {
+    const big: f64 = 1e308 * 10.0 / 10.0;
+    assert(add(big, 0.0) == 1e308);
+    assert(mul(mul(1e308, 10.0), 0.1) > 1e308);
+}
+
+test subnormal_results_round_once {
+    const half: f64 = 5e-324 * 0.5;
+    const quarter: f64 = 5e-324 * 0.25;
+    assert(add(half, 0.0) == 5e-324);
+    assert(add(quarter, 0.0) == 0.0);
+}
+
+test comptime_ints_take_part {
+    assert(same(0.1 * 10.0 == 1));
+    assert(same(0.1 * 3.0 != 0.3));
+    const one: f64 = (1.0 / 3.0) * 3.0;
+    assert(add(one, 0.0) == 1.0);
+}
+
+test differences_and_squares_fold {
+    const d: f64 = 0.3 - 0.1;
+    assert(add(d, 0.0) == 0.2);
+    assert(sub(0.3, 0.1) < 0.2);
+    const sq: f64 = 1.1 * 1.1;
+    assert(add(sq, 0.0) == 1.21);
+    assert(mul(1.1, 1.1) > 1.21);
+}
+
+test f32_rounds_once_from_binary128 {
+    const f: f32 = 0.1 + 0.2;
+    assert(widen(f) == 0.300000011920928955078125);
+    const up: f32 = 1.0000000596046447753906250001;
+    const down: f32 = 1.00000005960464477539062499;
+    assert(widen(up) == 1.00000011920928955078125);
+    assert(widen(down) == 1.0);
+}
+
+test exact_folds_convert {
+    assert(to_i32(0.5 * 4.0) == 2);
+    const k: i32 = @intFromFloat(0.5 * 4.0);
+    assert(same(k == 2));
+}
+";
+    let r = f64_run(src);
+    assert_eq!(r.len(), 6, "{:?}", r);
+    for (name, o) in &r {
+        assert_eq!(*o, Ok(()), "{}", name);
+    }
+    // The same asserts with the folded and the run-time values swapped fail.
+    for (from, to) in [
+        ("assert(add(big, 0.0) == 1e308);", "assert(add(big, 0.0) != 1e308);"),
+        ("assert(add(quarter, 0.0) == 0.0);", "assert(add(quarter, 0.0) == 5e-324);"),
+        ("assert(same(0.1 * 3.0 != 0.3));", "assert(same(0.1 * 3.0 == 0.3));"),
+        ("assert(add(d, 0.0) == 0.2);", "assert(add(d, 0.0) < 0.2);"),
+        ("assert(widen(up) == 1.00000011920928955078125);", "assert(widen(up) == 1.0);"),
+    ] {
+        assert!(src.contains(from), "{}", from);
+        let r = f64_run(&src.replace(from, to));
+        assert_eq!(r.iter().filter(|(_, o)| o.is_err()).count(), 1, "{}: {:?}", to, r);
+    }
+}
+
+/// t27c emits a bench as `fn bench_<name>() void { ... }` that nothing calls,
+/// so `zig test` neither runs nor counts it. t27b compiles the body and leaves
+/// it out of the tests: the failing asserts in both benches here do not fail
+/// the file. The same bodies, renamed to tests, run and trap identically in
+/// the JIT and the interpreter, so what was compiled is the body as written.
+#[test]
+fn bench_bodies_compile_but_never_run() {
+    let prog = lower_text(BENCH_SRC).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+    assert_eq!(run_both(&prog), vec![("sq_small".to_string(), false)]);
+    assert!(prog.funcs.iter().all(|f| !f.name.starts_with("sq_loop") && !f.name.starts_with("sq_colon")));
+
+    let as_tests = BENCH_SRC.replace("bench \"sq_loop\"", "test \"sq_loop\"").replace("bench sq_colon: sq(2) == 5", "invariant sq_colon: sq(2) == 5");
+    let prog = lower_text(&as_tests).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+    let r = run_both(&prog);
+    assert_eq!(r.len(), 3, "{:?}", r);
+    assert!(r.iter().any(|(n, t)| n == "sq_small" && !t), "{:?}", r);
+    assert!(r.iter().any(|(n, t)| n == "sq_loop" && *t), "{:?}", r);
+    assert!(r.iter().any(|(n, t)| n == "sq_colon" && *t), "{:?}", r);
+}
+
+/// A bench body t27b cannot lower rejects the file under the construct it
+/// contains, never under `BenchBlock`.
+#[test]
+fn bench_unlowerable_body_names_its_construct() {
+    let src = BENCH_SRC.replace(
+        "    var i: u32 = 0;\n    while (i < 10) : (i += 1) {\n        acc = acc +% sq(i);\n    }",
+        "    for (0..10, 0..10) |i, j| {\n        acc = acc +% sq(@as(u32, i + j));\n    }",
+    );
+    let e = lower_text(&src).err().expect("a rejection");
+    assert!(e[0].starts_with("t27b: unsupported construct StmtFor(multi-object) at line "), "{:?}", e);
+    assert!(e.iter().all(|m| !m.contains("BenchBlock")), "{:?}", e);
+}
+
+/// A bench written as prose clauses (`measure: nanoseconds to f(x)`,
+/// `target: < 10ns`) reaches lowering as childless StmtExpr nodes holding the
+/// text. t27c writes `// NOT LOWERED: empty statement` for each, so the bench
+/// compiles to an empty body and the file's tests run as before.
+#[test]
+fn bench_prose_clauses_lower_to_nothing() {
+    let src = "module bp;
+
+fn sq(x: u32) u32 {
+    return x * x;
+}
+
+test sq_small {
+    assert(sq(3) == 9);
+}
+
+bench sq_latency
+    measure: nanoseconds to sq(sq(2)) when 2 bytes available
+    target: < 10ns
+";
+    let prog = lower_text(src).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+    assert_eq!(run_both(&prog), vec![("sq_small".to_string(), false)]);
+}
+
+// ------------------------------------------------------------ shift source
+
+/// `<<` and `>>` from source, in the shapes t27c's Zig backend emits: a
+/// non-literal amount goes through `@intCast` to `Log2Int(T)` (a negative or
+/// too-wide amount traps), and an untyped literal on the left is pinned with
+/// `@as(T, lit)`: T is the declared integer type of the local being
+/// initialized, else u32, else u64 when the literal does not fit u32 -- even
+/// when the amount is a named constant (`0xFF << K` wraps in u32). `<<`
+/// drops the bits that leave the type (no `@shlExact`); `>>` is arithmetic on
+/// signed types and logical on unsigned ones. Every block's verdict here is
+/// the one `t27c gen` + `zig test` (Zig 0.16) gives for the same text.
+const SHIFT_SRC: &str = r#"module shiftsrc;
+
+const K = 28;
+
+fn pow2(d: i32) i32 {
+    var hf: i32 = 1 << d;
+    return hf;
+}
+
+fn mask(width: u32) u32 {
+    return (1 << width) - 1;
+}
+
+fn wide(d: u32) u64 {
+    var m: u64 = 1 << d;
+    return m;
+}
+
+fn big(d: u32) u64 {
+    return 0x100000000 << d;
+}
+
+fn shl_i8(x: i8, n: u8) i8 {
+    return x << n;
+}
+
+fn sar(x: i32, n: i32) i32 {
+    return x >> n;
+}
+
+fn shr(x: u32, n: u32) u32 {
+    return x >> n;
+}
+
+fn named() u64 {
+    return 0xFF << K;
+}
+
+fn folded() u32 {
+    const s = 3;
+    return 1 << (s + 2);
+}
+
+fn folded_right() u32 {
+    return 0x100 >> (2 + 2);
+}
+
+fn compound(x: u16, n: u16) u16 {
+    var y: u16 = x;
+    y = y << n;
+    y = y >> 1;
+    return y;
+}
+
+test shift_basics {
+    assert(pow2(0) == 1);
+    assert(pow2(31) == -2147483648);
+    assert(mask(8) == 255);
+    assert(mask(0) == 0);
+    assert(wide(40) == 1099511627776);
+    assert(big(4) == 68719476736);
+    assert(shl_i8(3, 6) == -64);
+    assert(sar(-8, 1) == -4);
+    assert(sar(-1, 31) == -1);
+    assert(shr(0x80000000, 31) == 1);
+    assert(named() == 0xF0000000);
+    assert(compound(3, 15) == 0x4000);
+    assert(folded() == 32);
+    assert(folded_right() == 16);
+}
+
+test shift_amount_too_wide {
+    assert(pow2(32) == 0);
+}
+
+test shift_negative_amount {
+    assert(sar(1, -1) == 0);
+}
+
+test shift_literal_pinned_to_u32 {
+    assert(mask(32) == 0);
+}
+"#;
+
+#[test]
+fn shift_source_programs_run_in_both_engines() {
+    let r = f64_run(SHIFT_SRC);
+    let got: Vec<(&str, Result<(), TrapKind>)> = r.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("shift_basics", Ok(())),
+            ("shift_amount_too_wide", Err(TrapKind::ShiftRange)),
+            ("shift_negative_amount", Err(TrapKind::ShiftRange)),
+            ("shift_literal_pinned_to_u32", Err(TrapKind::ShiftRange)),
+        ]
+    );
+}
+
+/// Shift shapes refused by name. A constant amount out of range for the left
+/// type (a literal or a typed constant) is a Zig compile error. An untyped
+/// left operand that is not a literal (`(1 + 1) << n`) has a width only if
+/// t27c's optimizer happens to fold it, which depends on where it stands, so
+/// it is refused. So is an untyped literal shifted by a literal-only amount
+/// whose value differs between the folded (comptime_int) and the pinned
+/// (`@as(u32, ..)`) readings.
+#[test]
+fn shift_refusals_name_the_construct() {
+    let first = |body: &str| -> String {
+        let src = format!("module shiftrej;\nconst KB: u32 = 40;\nfn f(x: u32, n: u32) u32 {{\n{}\n}}\ntest t {{ assert(f(1, 1) == 0); }}\n", body);
+        match f64_lower(&src) {
+            Ok(_) => panic!("expected a rejection for {}", body),
+            Err(e) => e[0].clone(),
+        }
+    };
+    for (body, want) in [
+        ("return x << 32;", "shift amount 32 out of range for u32"),
+        ("return x >> KB;", "shift amount 40 out of range for u32"),
+        ("return 1 << KB;", "shift amount 40 out of range for u32"),
+        ("return (1 + 1) << n;", "untyped literal shifted by a runtime amount"),
+        ("return 0xFF << (20 + 8);", "width depends on t27c constant folding"),
+    ] {
+        let msg = first(body);
+        assert!(msg.contains("unsupported construct ExprBinary(<< >>) "), "{}: {}", body, msg);
+        assert!(msg.contains(want), "{}: {}", body, msg);
+    }
+    // In range, a typed constant amount folds like a literal one.
+    assert!(f64_lower("module ok;\nconst KS: u32 = 31;\nfn f(x: u32) u32 {\nreturn (x >> KS) + (1 << KS);\n}\n").is_ok());
 }
