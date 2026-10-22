@@ -1,0 +1,624 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/finalize.t27 -- how a Queen bee run, or a claw check run, ends: what it keeps, what it owes
+; Idea taken from REA (morluto/rea, rea-agents 6.6 and 6.7, MIT): its fixes in those releases harden one
+; pattern over and over. A cancelled run keeps what it already observed and the exact reason it was
+; cancelled. A cleanup that fails keeps ownership of what it could not release, for a retry, and does
+; not replace the error that ended the run. A resource that comes back leaves the pending-cleanup
+; report. A status nobody could read while the run was ending stays unknown. Only the idea is taken;
+; no REA code is used, and nothing here depends on it.
+; Why t27 needs it, measured:
+; - 2026-10-06, the bee-runner disk jam: both runner volumes (49 GB each, trios-bee-runner-1 and -2)
+;   had about 6.8 GB free, every claimed bee was refused for disk, and bee merges were 0 for about
+;   eight hours. Finished worktrees had leaked, about 294 MB each; 80 and 98 were removed by hand.
+;   Nothing listed them as owed: the reaper had to rediscover each one by scanning the volume and
+;   guessing whether it was still somebody's. The hourly launchd job ai.t27.runner-reap was added
+;   after the jam; the pending-cleanup list below is what it should read instead of guessing.
+; - a cancelled or drained bee loses what it had done: drain.t27 salvages the branch of a bee still
+;   running at the cap, and its conversation is lost; control.t27 CANCEL_RULE (dispatch.t27) says no
+;   route drops a dispatch's observations, but nothing says the end of a run must keep them.
+; - dispatch_exit.t27 exit_reason turns every cancel frame into DX_SHUTDOWN: an operator's cancel, a
+;   drain and a closed issue read the same. The exit reason stays as it is; this card keeps the cancel
+;   reason beside it.
+; What is reused, not restated:
+; - worktree_keep.t27: facts are ST_NO, ST_YES or ST_UNKNOWN, and a worktree or a reaped tree is
+;   released only on reap_verdict's positive proof. The pending list never replaces that proof.
+; - control.t27 section 7: the effects journal (EFF_NONE, EFF_INTENT, EFF_DONE) is where a completed
+;   observation lives; an entry it does not know counts as an intent.
+; - dispatch.t27: the verdicts V_FAILED and V_CANCELLED a finished row carries.
+; - dispatch_exit.t27: the exit reasons DX_NORMAL, DX_SHUTDOWN and DX_UNKNOWN.
+; - turn_stop.t27: a finalizer always runs (step_on_abort), and a process group is killed whole.
+; - drain.t27 exit_step: the process waits for held work and for its stops to land; this card adds
+;   the probes it must also wait for.
+; - claw/t27f_gate.t27: the three conclusions a claw check posts (restated and pinned, section 3).
+; Not here: the store, the reaper, the runner (gHashTag/trios and the launchd job). Rules for each
+; failure kind live in the cards above; this card is only the end of a run. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenFinalize;
+
+use queen::worktree_keep::ST_NO;
+use queen::worktree_keep::ST_YES;
+use queen::worktree_keep::ST_UNKNOWN;
+use queen::worktree_keep::WT_RELEASE;
+use queen::worktree_keep::reap_verdict;
+use queen::control::EFF_NONE;
+use queen::control::EFF_INTENT;
+use queen::control::EFF_DONE;
+use queen::dispatch::V_NONE;
+use queen::dispatch::V_FAILED;
+use queen::dispatch::V_CANCELLED;
+use queen::dispatch_exit::DX_NORMAL;
+use queen::dispatch_exit::DX_SHUTDOWN;
+use queen::dispatch_exit::DX_KILLED;
+use queen::dispatch_exit::DX_TIMEOUT;
+use queen::dispatch_exit::DX_UNKNOWN;
+use queen::turn_stop::step_on_abort;
+use queen::turn_stop::STEP_RUN;
+use queen::turn_stop::TURN_STOP_GRACE_MS;
+use queen::drain::exit_step;
+use queen::drain::EXIT_NOW;
+use queen::drain::EXIT_WAIT;
+use queen::drain::EXIT_SECONDS;
+
+/// The three conclusions a claw check posts, restated from claw/t27f_gate.t27 (lines 57-59) and pinned
+/// by an invariant below. Not imported: that card pulls in ci/affected.t27 and policy/own_language.t27,
+/// which both declare KINDS, and the splice refuses the ambiguous name.
+pub const CONCL_SUCCESS : u8 = 0;
+pub const CONCL_NEUTRAL : u8 = 1;
+pub const CONCL_FAILURE : u8 = 2;
+
+; --- 1. What ended the run first ------------------------------------------------------------------
+
+/// The kind of an end event, in the order the host sees them.
+/// PK_NONE: nothing has ended the run yet. PK_FAILURE: the work failed (an exit reason other than
+/// DX_NORMAL, a refused push, a crashed tool). PK_CANCEL: someone or something cancelled it (the
+/// reasons below). PK_CLEANUP: a release of something the run held failed while it was ending.
+pub const PK_NONE : u8 = 0;
+pub const PK_FAILURE : u8 = 1;
+pub const PK_CANCEL : u8 = 2;
+pub const PK_CLEANUP : u8 = 3;
+
+/// Whether an incoming end event becomes the run's primary end, together with its code. The first
+/// failure or cancel wins: a timeout that a cancel provoked, a crash that followed a kill, a second
+/// cancel, none of them renames the end that came first. A cleanup error never becomes primary, at
+/// any time: it goes to the cleanup slot below and to the pending list (section 3). This is the bug the
+/// rule exists for: a `git worktree remove` that fails in a finalizer must not report the run as
+/// "cleanup failed" and hide the timeout that ended it.
+pub fn takes_primary(recorded: u8, incoming: u8) -> bool {
+    if (incoming == PK_CLEANUP) { return false; }
+    if (incoming != PK_FAILURE and incoming != PK_CANCEL) { return false; }
+    if (recorded != PK_NONE) { return false; }
+    return true;
+}
+
+/// The first cleanup error is kept with its resource; later ones are counted, not stored over it.
+pub fn takes_cleanup_slot(cleanup_recorded: bool) -> bool {
+    return cleanup_recorded == false;
+}
+
+pub const U32_MAX : u32 = 4294967295;
+
+pub fn cleanup_errors_after(errors: u32) -> u32 {
+    if (errors == U32_MAX) { return U32_MAX; }
+    return errors + 1;
+}
+
+; --- 2. The exact cancellation reason -------------------------------------------------------------
+
+/// Why a run was cancelled. dispatch_exit.t27 maps every one of them to DX_SHUTDOWN; this is the
+/// reason kept beside it.
+/// CR_OPERATOR: a person cancelled it (control.t27 section 3). CR_DRAIN: the process drained
+/// (drain.t27, a bee stopped or handed back at the cap). CR_TURN_LIMIT: the turn passed its bound
+/// (actors.t27 turn_signal). CR_FENCED: its lease moved to another holder (control.t27 write_lands
+/// false). CR_ISSUE_CLOSED: the issue closed under it. CR_UNSTATED: a cancel arrived that carried no
+/// reason; it is shown as unstated, never guessed.
+pub const CR_NONE : u8 = 0;
+pub const CR_OPERATOR : u8 = 1;
+pub const CR_DRAIN : u8 = 2;
+pub const CR_TURN_LIMIT : u8 = 3;
+pub const CR_FENCED : u8 = 4;
+pub const CR_ISSUE_CLOSED : u8 = 5;
+pub const CR_UNSTATED : u8 = 6;
+pub const CANCEL_REASONS : u8 = 7;
+pub const CR_NAMES : [7]str = ["none", "operator", "drain", "turn-limit", "fenced", "issue-closed", "unstated"];
+
+/// The reason after another cancel arrives. The first named reason stays: a drain that reaches a run
+/// an operator already cancelled does not turn it into a drain. An unstated reason is the one thing a
+/// later named reason may fill in, because it is the same cancel whose reason was read late. A code
+/// this card does not know reads as unstated, never as some named reason.
+pub fn cancel_reason_after(recorded: u8, incoming: u8) -> u8 {
+    var named : u8 = incoming;
+    if (incoming >= CANCEL_REASONS) { named = CR_UNSTATED; }
+    if (recorded == CR_NONE) { return named; }
+    if (recorded == CR_UNSTATED and named != CR_NONE) { return named; }
+    return recorded;
+}
+
+; --- 3. The outcome, and what it writes on the row ------------------------------------------------
+
+/// OUT_UNKNOWN: the run's end could not be read (dispatch_exit.t27 DX_UNKNOWN, a stream with no end
+/// that contradicts its lease). It is its own outcome and is never folded into failed.
+pub const OUT_SUCCEEDED : u8 = 0;
+pub const OUT_FAILED : u8 = 1;
+pub const OUT_CANCELLED : u8 = 2;
+pub const OUT_UNKNOWN : u8 = 3;
+pub const OUTCOMES : u8 = 4;
+
+/// The outcome from the primary end (section 1) and the exit reason. A cleanup error has no input
+/// here: no failure to release anything can change what the run itself did. A cancel frame that came
+/// with no recorded cancel is still a cancel (its reason is CR_UNSTATED).
+pub fn outcome_of(primary: u8, exit_reason: u8) -> u8 {
+    if (primary == PK_CANCEL) { return OUT_CANCELLED; }
+    if (primary == PK_FAILURE) { return OUT_FAILED; }
+    if (exit_reason == DX_NORMAL) { return OUT_SUCCEEDED; }
+    if (exit_reason == DX_SHUTDOWN) { return OUT_CANCELLED; }
+    if (exit_reason == DX_UNKNOWN) { return OUT_UNKNOWN; }
+    return OUT_FAILED;
+}
+
+/// The verdict the end writes on its dispatch row. A success writes none: the reviewer judges it. An
+/// unknown end writes none either: V_FAILED would be a claim nobody observed.
+pub fn verdict_of(outcome: u8) -> u32 {
+    if (outcome == OUT_FAILED) { return V_FAILED; }
+    if (outcome == OUT_CANCELLED) { return V_CANCELLED; }
+    return V_NONE;
+}
+
+/// What a claw check run posts when it ends. A cancelled check and one whose end is unknown post
+/// neutral with their reason: failure would say the spec is wrong, and success that it was checked.
+pub fn check_conclusion(outcome: u8) -> u8 {
+    if (outcome == OUT_SUCCEEDED) { return CONCL_SUCCESS; }
+    if (outcome == OUT_FAILED) { return CONCL_FAILURE; }
+    return CONCL_NEUTRAL;
+}
+
+; --- 4. Completed observations survive the end ----------------------------------------------------
+
+/// The entry a completed or started observation has after finalization, for any outcome. A done
+/// entry stays done and an open intent stays an intent: finalization neither erases what was observed
+/// nor promotes what was not. An entry this card does not know counts as an intent, as in control.t27.
+pub fn entry_after_finalize(entry: u8, outcome: u8) -> u8 {
+    if (entry == EFF_NONE) { return EFF_NONE; }
+    if (entry == EFF_DONE) { return EFF_DONE; }
+    return EFF_INTENT;
+}
+
+/// How many completed observations the run's report carries: all of them, whatever ended the run.
+pub fn observations_kept(completed: u32, outcome: u8) -> u32 {
+    return completed;
+}
+
+/// What the report says about the observations, beside the outcome. RK_ALL: the run succeeded.
+/// RK_PARTIAL: it did not, and it observed something, which is kept. RK_NONE: it did not, and it had
+/// observed nothing yet. A cancelled bee with ten finished steps is partial, never empty.
+pub const RK_ALL : u8 = 0;
+pub const RK_PARTIAL : u8 = 1;
+pub const RK_NONE : u8 = 2;
+
+pub fn report_kind(outcome: u8, completed: u32) -> u8 {
+    if (outcome == OUT_SUCCEEDED) { return RK_ALL; }
+    if (completed > 0) { return RK_PARTIAL; }
+    return RK_NONE;
+}
+
+/// The phases of a finalizer, in order. It records the end, journals the observations, then releases
+/// what the run held, and only then publishes the report: a release that fails or hangs cannot take
+/// the observations with it, and the report already lists what is still owed. The finalizer itself
+/// always runs (turn_stop.t27 step_on_abort with finalizer true).
+pub const FP_RECORD : u8 = 0;
+pub const FP_JOURNAL : u8 = 1;
+pub const FP_RELEASE : u8 = 2;
+pub const FP_REPORT : u8 = 3;
+pub const FP_DONE : u8 = 4;
+
+/// The next phase. A failed release moves on to the report like a good one: what it could not release
+/// is in the pending list, and the report is not held hostage to it.
+pub fn next_phase(phase: u8, release_failed: bool) -> u8 {
+    if (phase == FP_RECORD) { return FP_JOURNAL; }
+    if (phase == FP_JOURNAL) { return FP_RELEASE; }
+    if (phase == FP_RELEASE) { return FP_REPORT; }
+    return FP_DONE;
+}
+
+; --- 5. The pending-cleanup list ------------------------------------------------------------------
+
+/// What a run may hold that must be given back. A worktree (the disk jam's 294 MB each), a process
+/// group (turn_stop.t27), a branch the runner cut, a temporary directory.
+pub const RES_WORKTREE : u8 = 0;
+pub const RES_PROCESS_GROUP : u8 = 1;
+pub const RES_BRANCH : u8 = 2;
+pub const RES_TEMP_DIR : u8 = 3;
+pub const RESOURCE_KINDS : u8 = 4;
+
+/// The state of one resource a run held. PC_HELD: a live run holds it; it is not in the list.
+/// PC_PENDING: the run ended and the resource is not confirmed gone; it is in the list with its owner
+/// (the run, and the worktree path, the process group id or the branch name). PC_RELEASED: a read
+/// confirmed it is gone; it leaves the list.
+pub const PC_HELD : u8 = 0;
+pub const PC_PENDING : u8 = 1;
+pub const PC_RELEASED : u8 = 2;
+
+/// The state after a release attempt, or after any later check, read from one fact: whether the
+/// resource still exists. Only a read that says it is gone (ST_NO) takes it out of the list. A
+/// release that answered success while the directory is still there stays pending; a read that failed
+/// (ST_UNKNOWN) stays pending. A resource found gone that somebody else released, or a process group
+/// that exited on its own, is recovered by the same read and leaves the list the same way.
+pub fn entry_after_check(still_exists: u8) -> u8 {
+    if (still_exists == ST_NO) { return PC_RELEASED; }
+    return PC_PENDING;
+}
+
+pub fn in_pending_list(state: u8) -> bool {
+    return state == PC_PENDING;
+}
+
+/// Whether the entry still names its owner. It does until it is released: an entry without its owner
+/// is the leaked worktree of 2026-10-06 again, a directory nobody can say is safe to remove.
+pub fn owner_kept(state: u8) -> bool {
+    return state != PC_RELEASED;
+}
+
+/// What the reaper (launchd ai.t27.runner-reap, or the runner's own reaper) does with one entry.
+/// RA_LEAVE: the entry is held by a live run; not the reaper's. RA_RELEASE: try to release it, then
+/// entry_after_check. RA_HOLD: keep it in the list and report it. RA_DROP: confirmed gone; remove the
+/// entry. `proof` is the kind's own permission to remove: for a worktree, worktree_keep.t27
+/// reap_verdict == WT_RELEASE (worktree_proof below); for a process group, that its run ended. The list
+/// says what is owed, never that it may be destroyed.
+pub const RA_LEAVE : u8 = 0;
+pub const RA_RELEASE : u8 = 1;
+pub const RA_HOLD : u8 = 2;
+pub const RA_DROP : u8 = 3;
+
+pub fn reap_action(state: u8, proof: u8) -> u8 {
+    if (state == PC_RELEASED) { return RA_DROP; }
+    if (state != PC_PENDING) { return RA_LEAVE; }
+    if (proof == ST_YES) { return RA_RELEASE; }
+    return RA_HOLD;
+}
+
+/// The proof for a worktree entry: worktree_keep.t27 reap_verdict, as a fact. Anything but its
+/// positive answer, an unknown above all, is no proof.
+pub fn worktree_proof(running: u8, dirty_with_ignored: u8, unpushed: u8, read_ok: u8) -> u8 {
+    if (reap_verdict(running, dirty_with_ignored, unpushed, read_ok) == WT_RELEASE) { return ST_YES; }
+    return ST_NO;
+}
+
+/// After this many failed releases an entry is flagged for a person to see on the report. It is
+/// never dropped for failing: a dropped entry is a leak.
+pub const PENDING_FLAG_FAILURES : u32 = 3;
+
+pub fn flagged(failures: u32) -> bool {
+    return failures >= PENDING_FLAG_FAILURES;
+}
+
+pub fn drops_for_failures(failures: u32) -> bool {
+    return false;
+}
+
+/// The size of the list after a reap: entries added by runs that ended, minus entries confirmed gone.
+/// It saturates instead of wrapping, and cannot fall below zero.
+pub fn pending_after(pending: u32, added: u32, confirmed: u32) -> u32 {
+    var total : u32 = U32_MAX;
+    if (added <= U32_MAX - pending) { total = pending + added; }
+    if (confirmed >= total) { return 0; }
+    return total - confirmed;
+}
+
+; --- 6. Shutdown waits for in-flight readiness probes ---------------------------------------------
+
+/// A readiness probe is one request that asks whether a key, a provider or a runner can take work.
+/// Cut by an exit, it leaves no answer, and the next process must not read that silence as "down".
+/// The process waits for its probes as it waits for its held work, up to PROBE_GRACE_MS from the
+/// start of the shutdown; a probe still running then is cut and its answer is ST_UNKNOWN (section 7).
+/// Chosen, not measured: the grace a stopped turn has (turn_stop.t27 TURN_STOP_GRACE_MS), small
+/// enough that the wait and the server's own close (SERVER_CLOSE_MS, main.ts gives it 2 s) fit inside
+/// drain.t27 EXIT_SECONDS.
+pub const PROBE_GRACE_MS : u32 = 3000;
+pub const SERVER_CLOSE_MS : u32 = 2000;
+
+/// The exit step: drain.t27 exit_step first, then the probes.
+pub fn shutdown_step(holding: u32, stopping: u32, since_stop_ms: u32, probes: u32, since_shutdown_ms: u32) -> u8 {
+    if (exit_step(holding, stopping, since_stop_ms) == EXIT_WAIT) { return EXIT_WAIT; }
+    if (probes == 0) { return EXIT_NOW; }
+    if (since_shutdown_ms >= PROBE_GRACE_MS) { return EXIT_NOW; }
+    return EXIT_WAIT;
+}
+
+/// No probe starts once the shutdown began: a new probe would make the wait never end.
+pub fn probe_may_start(shutting_down: bool) -> bool {
+    return shutting_down == false;
+}
+
+/// The answer of a probe the shutdown cut.
+pub fn cut_probe_answer() -> u8 {
+    return ST_UNKNOWN;
+}
+
+; --- 7. Unknown stays unknown ---------------------------------------------------------------------
+
+/// A status read while a run is ending: ST_YES available, ST_NO unavailable, ST_UNKNOWN not read or
+/// the read failed. Finalizing changes nothing: an unknown status is stored as unknown, and only a
+/// read that answered ST_NO is unavailable. A code this card does not know is unknown.
+pub fn final_status(observed: u8, finalizing: bool) -> u8 {
+    if (observed == ST_YES) { return ST_YES; }
+    if (observed == ST_NO) { return ST_NO; }
+    return ST_UNKNOWN;
+}
+
+pub fn counts_as_unavailable(status: u8) -> bool {
+    return status == ST_NO;
+}
+
+/// What the next process does with a stored status. SA_USE: available. SA_SKIP: unavailable, as read.
+/// SA_PROBE: unknown; ask again before deciding either way.
+pub const SA_USE : u8 = 0;
+pub const SA_SKIP : u8 = 1;
+pub const SA_PROBE : u8 = 2;
+
+pub fn status_action(status: u8) -> u8 {
+    if (status == ST_YES) { return SA_USE; }
+    if (status == ST_NO) { return SA_SKIP; }
+    return SA_PROBE;
+}
+
+; --- tests: rule 1, completed observations survive -------------------------------------------------
+
+test a_cancelled_or_failed_run_keeps_every_completed_observation {
+    assert observations_kept(10, OUT_CANCELLED) == 10;
+    assert observations_kept(10, OUT_FAILED) == 10;
+    assert observations_kept(10, OUT_UNKNOWN) == 10;
+    assert observations_kept(10, OUT_SUCCEEDED) == 10;
+    assert observations_kept(0, OUT_CANCELLED) == 0;
+    assert observations_kept(U32_MAX, OUT_FAILED) == U32_MAX;
+}
+
+test finalization_never_erases_a_done_entry_nor_promotes_an_intent {
+    assert entry_after_finalize(EFF_DONE, OUT_CANCELLED) == EFF_DONE;
+    assert entry_after_finalize(EFF_DONE, OUT_FAILED) == EFF_DONE;
+    assert entry_after_finalize(EFF_DONE, OUT_UNKNOWN) == EFF_DONE;
+    assert entry_after_finalize(EFF_INTENT, OUT_CANCELLED) == EFF_INTENT;
+    assert entry_after_finalize(EFF_INTENT, OUT_SUCCEEDED) == EFF_INTENT;
+    assert entry_after_finalize(EFF_NONE, OUT_FAILED) == EFF_NONE;
+    // an entry this card does not know may have happened: it is an intent, never erased
+    assert entry_after_finalize(7, OUT_CANCELLED) == EFF_INTENT;
+}
+
+test a_stopped_run_with_work_done_reports_partial_not_empty {
+    assert report_kind(OUT_CANCELLED, 10) == RK_PARTIAL;
+    assert report_kind(OUT_FAILED, 1) == RK_PARTIAL;
+    assert report_kind(OUT_UNKNOWN, 3) == RK_PARTIAL;
+    assert report_kind(OUT_CANCELLED, 0) == RK_NONE;
+    assert report_kind(OUT_SUCCEEDED, 0) == RK_ALL;
+    assert report_kind(OUT_SUCCEEDED, 5) == RK_ALL;
+}
+
+test the_finalizer_runs_and_journals_before_it_releases {
+    // the finalizer is never cut, started or not (turn_stop.t27)
+    assert step_on_abort(false, false, true) == STEP_RUN;
+    assert step_on_abort(true, true, true) == STEP_RUN;
+    assert next_phase(FP_RECORD, false) == FP_JOURNAL;
+    assert next_phase(FP_JOURNAL, false) == FP_RELEASE;
+    assert next_phase(FP_RELEASE, false) == FP_REPORT;
+    assert next_phase(FP_REPORT, false) == FP_DONE;
+    assert next_phase(FP_DONE, false) == FP_DONE;
+}
+
+test a_failed_release_still_reaches_the_report {
+    assert next_phase(FP_RELEASE, true) == FP_REPORT;
+    assert next_phase(FP_REPORT, true) == FP_DONE;
+}
+
+; --- tests: rule 2, the exact reason and the first failure survive ----------------------------------
+
+test the_first_failure_or_cancel_is_primary {
+    assert takes_primary(PK_NONE, PK_FAILURE) == true;
+    assert takes_primary(PK_NONE, PK_CANCEL) == true;
+    assert takes_primary(PK_FAILURE, PK_FAILURE) == false;
+    assert takes_primary(PK_FAILURE, PK_CANCEL) == false;
+    assert takes_primary(PK_CANCEL, PK_FAILURE) == false;
+    assert takes_primary(PK_CANCEL, PK_CANCEL) == false;
+    assert takes_primary(PK_NONE, PK_NONE) == false;
+}
+
+test a_cleanup_error_never_replaces_the_primary_error {
+    assert takes_primary(PK_FAILURE, PK_CLEANUP) == false;
+    assert takes_primary(PK_CANCEL, PK_CLEANUP) == false;
+    // not even when nothing else ended the run: a success with a failed cleanup is a success that owes
+    assert takes_primary(PK_NONE, PK_CLEANUP) == false;
+    assert takes_primary(PK_NONE, 9) == false;
+    // and it cannot reach the outcome through the exit reason either
+    assert outcome_of(PK_NONE, DX_NORMAL) == OUT_SUCCEEDED;
+    assert outcome_of(PK_FAILURE, DX_NORMAL) == OUT_FAILED;
+}
+
+test the_first_cleanup_error_is_kept_and_later_ones_counted {
+    assert takes_cleanup_slot(false) == true;
+    assert takes_cleanup_slot(true) == false;
+    assert cleanup_errors_after(0) == 1;
+    assert cleanup_errors_after(4) == 5;
+    assert cleanup_errors_after(U32_MAX) == U32_MAX;
+}
+
+test the_first_named_cancel_reason_stays {
+    assert cancel_reason_after(CR_NONE, CR_OPERATOR) == CR_OPERATOR;
+    assert cancel_reason_after(CR_OPERATOR, CR_DRAIN) == CR_OPERATOR;
+    assert cancel_reason_after(CR_DRAIN, CR_FENCED) == CR_DRAIN;
+    assert cancel_reason_after(CR_TURN_LIMIT, CR_UNSTATED) == CR_TURN_LIMIT;
+    assert cancel_reason_after(CR_ISSUE_CLOSED, CR_NONE) == CR_ISSUE_CLOSED;
+}
+
+test an_unstated_reason_is_filled_in_never_guessed {
+    assert cancel_reason_after(CR_NONE, CR_UNSTATED) == CR_UNSTATED;
+    assert cancel_reason_after(CR_UNSTATED, CR_DRAIN) == CR_DRAIN;
+    assert cancel_reason_after(CR_UNSTATED, CR_NONE) == CR_UNSTATED;
+    // a code this card does not know is unstated, not some named reason
+    assert cancel_reason_after(CR_NONE, 42) == CR_UNSTATED;
+    assert cancel_reason_after(CR_NONE, CANCEL_REASONS) == CR_UNSTATED;
+    assert cancel_reason_after(CR_OPERATOR, 42) == CR_OPERATOR;
+}
+
+test the_outcome_comes_from_the_primary_end_then_the_exit_reason {
+    assert outcome_of(PK_CANCEL, DX_TIMEOUT) == OUT_CANCELLED;
+    assert outcome_of(PK_FAILURE, DX_SHUTDOWN) == OUT_FAILED;
+    assert outcome_of(PK_NONE, DX_SHUTDOWN) == OUT_CANCELLED;
+    assert outcome_of(PK_NONE, DX_KILLED) == OUT_FAILED;
+    assert outcome_of(PK_NONE, DX_TIMEOUT) == OUT_FAILED;
+    assert outcome_of(PK_NONE, DX_UNKNOWN) == OUT_UNKNOWN;
+}
+
+test the_row_verdict_names_a_cancel_and_a_failure_and_nothing_else {
+    assert verdict_of(OUT_CANCELLED) == V_CANCELLED;
+    assert verdict_of(OUT_FAILED) == V_FAILED;
+    assert verdict_of(OUT_SUCCEEDED) == V_NONE;
+    assert verdict_of(OUT_UNKNOWN) == V_NONE;
+}
+
+; --- tests: rule 3, a failed cleanup keeps its owner until release is confirmed ---------------------
+
+test only_a_read_that_says_gone_takes_an_entry_out {
+    assert entry_after_check(ST_NO) == PC_RELEASED;
+    assert entry_after_check(ST_YES) == PC_PENDING;
+    assert entry_after_check(ST_UNKNOWN) == PC_PENDING;
+    assert entry_after_check(9) == PC_PENDING;
+    assert in_pending_list(entry_after_check(ST_YES)) == true;
+    assert in_pending_list(entry_after_check(ST_UNKNOWN)) == true;
+    assert in_pending_list(entry_after_check(ST_NO)) == false;
+    assert in_pending_list(PC_HELD) == false;
+}
+
+test a_pending_entry_keeps_its_owner {
+    assert owner_kept(PC_HELD) == true;
+    assert owner_kept(PC_PENDING) == true;
+    assert owner_kept(PC_RELEASED) == false;
+}
+
+test the_reaper_releases_only_with_the_kinds_own_proof {
+    assert reap_action(PC_PENDING, ST_YES) == RA_RELEASE;
+    assert reap_action(PC_PENDING, ST_NO) == RA_HOLD;
+    assert reap_action(PC_PENDING, ST_UNKNOWN) == RA_HOLD;
+    assert reap_action(PC_HELD, ST_YES) == RA_LEAVE;
+    assert reap_action(PC_RELEASED, ST_NO) == RA_DROP;
+    assert reap_action(PC_RELEASED, ST_UNKNOWN) == RA_DROP;
+}
+
+test a_worktree_entry_is_released_only_on_reap_verdicts_proof {
+    // running, dirty_with_ignored, unpushed, read_ok
+    assert worktree_proof(ST_NO, ST_NO, ST_NO, ST_YES) == ST_YES;
+    assert worktree_proof(ST_UNKNOWN, ST_NO, ST_NO, ST_YES) == ST_NO;
+    assert worktree_proof(ST_NO, ST_YES, ST_NO, ST_YES) == ST_NO;
+    assert worktree_proof(ST_NO, ST_NO, ST_YES, ST_YES) == ST_NO;
+    assert worktree_proof(ST_NO, ST_NO, ST_NO, ST_UNKNOWN) == ST_NO;
+    assert reap_action(PC_PENDING, worktree_proof(ST_NO, ST_NO, ST_YES, ST_YES)) == RA_HOLD;
+}
+
+test a_failing_entry_is_flagged_never_dropped {
+    assert flagged(0) == false;
+    assert flagged(2) == false;
+    assert flagged(3) == true;
+    assert flagged(U32_MAX) == true;
+    assert drops_for_failures(0) == false;
+    assert drops_for_failures(U32_MAX) == false;
+}
+
+test the_list_size_saturates_and_never_goes_below_zero {
+    assert pending_after(0, 3, 0) == 3;
+    assert pending_after(178, 0, 178) == 0;
+    assert pending_after(5, 2, 4) == 3;
+    assert pending_after(1, 0, 9) == 0;
+    assert pending_after(U32_MAX, 1, 0) == U32_MAX;
+    assert pending_after(U32_MAX - 1, 1, 1) == U32_MAX - 1;
+}
+
+; --- tests: rule 4, shutdown waits for in-flight readiness probes ---------------------------------
+
+test shutdown_waits_for_a_probe_in_flight {
+    assert shutdown_step(0, 0, 0, 1, 0) == EXIT_WAIT;
+    assert shutdown_step(0, 0, 0, 2, PROBE_GRACE_MS - 1) == EXIT_WAIT;
+    assert shutdown_step(0, 0, 0, 0, 0) == EXIT_NOW;
+}
+
+test a_probe_past_its_grace_is_cut_and_answers_unknown {
+    assert shutdown_step(0, 0, 0, 1, PROBE_GRACE_MS) == EXIT_NOW;
+    assert cut_probe_answer() == ST_UNKNOWN;
+    assert counts_as_unavailable(cut_probe_answer()) == false;
+}
+
+test held_work_still_holds_the_exit_whatever_the_probes {
+    assert shutdown_step(1, 0, 0, 0, 0) == EXIT_WAIT;
+    assert shutdown_step(1, 0, 0, 0, U32_MAX) == EXIT_WAIT;
+    assert shutdown_step(0, 1, 0, 0, U32_MAX) == EXIT_WAIT;
+}
+
+test no_probe_starts_during_a_shutdown {
+    assert probe_may_start(false) == true;
+    assert probe_may_start(true) == false;
+}
+
+; --- tests: rule 5, unknown stays unknown ---------------------------------------------------------
+
+test an_unknown_status_stays_unknown_while_finalizing {
+    assert final_status(ST_UNKNOWN, true) == ST_UNKNOWN;
+    assert final_status(ST_UNKNOWN, false) == ST_UNKNOWN;
+    assert final_status(200, true) == ST_UNKNOWN;
+    assert counts_as_unavailable(final_status(ST_UNKNOWN, true)) == false;
+}
+
+test only_a_read_of_no_is_unavailable {
+    assert final_status(ST_NO, true) == ST_NO;
+    assert final_status(ST_YES, true) == ST_YES;
+    assert counts_as_unavailable(ST_NO) == true;
+    assert counts_as_unavailable(ST_YES) == false;
+    assert counts_as_unavailable(ST_UNKNOWN) == false;
+}
+
+test an_unknown_status_is_probed_again_not_skipped {
+    assert status_action(ST_YES) == SA_USE;
+    assert status_action(ST_NO) == SA_SKIP;
+    assert status_action(ST_UNKNOWN) == SA_PROBE;
+    assert status_action(final_status(ST_UNKNOWN, true)) == SA_PROBE;
+}
+
+test an_unknown_end_is_not_a_failure_on_the_row_or_the_check {
+    assert outcome_of(PK_NONE, DX_UNKNOWN) == OUT_UNKNOWN;
+    assert verdict_of(OUT_UNKNOWN) != V_FAILED;
+    assert check_conclusion(OUT_UNKNOWN) == CONCL_NEUTRAL;
+    assert check_conclusion(OUT_CANCELLED) == CONCL_NEUTRAL;
+    assert check_conclusion(OUT_FAILED) == CONCL_FAILURE;
+    assert check_conclusion(OUT_SUCCEEDED) == CONCL_SUCCESS;
+}
+
+; --- invariants -----------------------------------------------------------------------------------
+
+invariant the_end_kinds_and_outcomes_are_pinned {
+    assert PK_NONE == 0 and PK_FAILURE == 1 and PK_CANCEL == 2 and PK_CLEANUP == 3;
+    assert OUT_SUCCEEDED == 0 and OUT_FAILED == 1 and OUT_CANCELLED == 2 and OUT_UNKNOWN == 3;
+    assert OUTCOMES == OUT_UNKNOWN + 1;
+}
+
+invariant every_cancel_reason_has_a_name {
+    assert CANCEL_REASONS == 7;
+    assert CR_UNSTATED == CANCEL_REASONS - 1;
+    assert CR_NONE == 0;
+}
+
+invariant the_list_states_and_actions_are_pinned {
+    assert PC_HELD == 0 and PC_PENDING == 1 and PC_RELEASED == 2;
+    assert RA_LEAVE == 0 and RA_RELEASE == 1 and RA_HOLD == 2 and RA_DROP == 3;
+    assert RES_WORKTREE == 0 and RES_TEMP_DIR == RESOURCE_KINDS - 1;
+    assert PENDING_FLAG_FAILURES == 3;
+}
+
+invariant the_probe_wait_fits_the_exit {
+    assert PROBE_GRACE_MS == TURN_STOP_GRACE_MS;
+    assert PROBE_GRACE_MS + SERVER_CLOSE_MS <= EXIT_SECONDS * 1000;
+    assert PROBE_GRACE_MS > 0;
+}
+
+invariant the_reused_facts_are_three_and_distinct {
+    assert ST_NO != ST_YES and ST_YES != ST_UNKNOWN and ST_NO != ST_UNKNOWN;
+    assert SA_USE == 0 and SA_SKIP == 1 and SA_PROBE == 2;
+}
+
+invariant the_claw_conclusions_match_t27f_gate {
+    assert CONCL_SUCCESS == 0 and CONCL_NEUTRAL == 1 and CONCL_FAILURE == 2;
+}

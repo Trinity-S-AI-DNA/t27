@@ -42,7 +42,6 @@ pub struct EpochChallengeResponse {
 pub struct MiningEpoch {
     pub epoch_id: u64,
     pub phi_seed: [u8; 16],
-    pub start_ts: u64,
     pub block_reward: u64,
 }
 
@@ -51,20 +50,7 @@ impl MiningEpoch {
         Self {
             epoch_id: 0,
             phi_seed: [0u8; 16],
-            start_ts: 0,
             block_reward: 50_000_000,
-        }
-    }
-
-    pub fn next(&self) -> Self {
-        let mut seed = [0u8; 16];
-        let hash = sha2_hash(&[b"EPOCH_SEED", &self.epoch_id.to_le_bytes(), &self.phi_seed]);
-        seed.copy_from_slice(&hash[..16]);
-        Self {
-            epoch_id: self.epoch_id + 1,
-            phi_seed: seed,
-            start_ts: 0,
-            block_reward: self.block_reward,
         }
     }
 }
