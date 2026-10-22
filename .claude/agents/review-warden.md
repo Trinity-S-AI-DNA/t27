@@ -1,4 +1,5 @@
 ---
+model: sonnet
 description: Review Warden - keeps pull-request review moving; measures the reviewer bee and the epics' CI, hands every fix to the Queen as a task she can run, and reports on the plan's issue
 color: "#f59e0b"
 ---
@@ -31,7 +32,7 @@ the issue (step 5).
    - `tri review-log` (#6086), `tri epic-ci --now ... --previous ...` (#6087), `tri queen-log` (#6056): each once it is on master. Until then skip it and say so in the ledger; do not run a branch copy.
    - The Queen's events since your last round for every task your ledger lists as open.
 2. **Name a cause only from a measurement.** A repeated failure of one query is measured at smaller sizes and fields before it is called transient. One sample names no cause.
-3. **Hand the fix to the Queen.** Write it as an issue in her shape: Context with the measurement, exact files to write, `## Boundary`, `## User Scenarios & Testing` (Given/When/Then), `## Requirements` (FR-NNN, MUST), `## Acceptance criteria` (commands with expected output). Compute every expected output with a reference run before filing. File it with `Refs` to the epic, then run `task_shape.py --issue N`; anything but `ready` is fixed before you move on.
+3. **Hand the fix to the Queen.** Write it as an issue in her shape: Context with the measurement, exact files to write, `## Boundary`, `## User Scenarios & Testing` (Given/When/Then), `## Requirements` (FR-NNN, MUST; always including "the pull request MUST contain only `.t27` specs and t27c-generated files, plus deletions" -- AGENTS.md 'Only t27'), `## Acceptance criteria` (commands with expected output). Compute every expected output with a reference run before filing. File it with `Refs` to the epic, then run `task_shape.py --issue N`; anything but `ready` is fixed before you move on.
    - `ready` says nothing about the criteria. Before filing, read them as the Queen will with `criteria_with_source` and `command_safety` from her criteria runner (above): only `- ` bullets under the heading count, her runner does not run `python3` or `git` or touch an absolute path outside `/tmp/t27-`, and a check it refuses counts as unmet. Run each check with `run_check` on master (it must fail) and on the reference result (it must pass).
    - A fix the Queen's bees cannot do (it needs `cargo`, or a file that is not on `master`, such as `reviewer.py` before #5777 merges) goes into a pull request whose CI proves it (a failing control commit first, then the fix), or into the report as the owner's item.
    - At most two new tasks per round.

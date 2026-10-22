@@ -40,15 +40,14 @@ pub fn edges_from(src: &str, here: &Path, dir: &Path) -> Vec<Edge> {
     let mut out = Vec::new();
     let mut pending_path: Option<String> = None;
     for line in src.lines() {
-        let t = line.trim();
+        let mut t = line.trim();
         if let Some(p) = attr_path(t) {
             pending_path = Some(p);
-            continue;
+            t = t.split("//").next().unwrap_or("").rsplit_once(']').map_or("", |(_, r)| r.trim()); // `#[path = ".."] #[allow(..)] mod x;` on one line (#10936)
+            if t.is_empty() { continue; }
         }
         if let Some(p) = include_path(t) {
-            out.push(Edge {
-                candidates: vec![own.join(p)],
-            });
+            out.push(Edge { candidates: vec![own.join(p)] });
             continue;
         }
         let Some(name) = mod_decl(t) else {
@@ -548,10 +547,11 @@ mod tests {
     #[test]
     fn a_path_attribute_does_not_carry_to_a_later_unrelated_mod() {
         let e = edges_from(
-            "#[path = \"x.rs\"]\nmod c;\nmod d;\n",
+            "#[path = \"x.rs\"] #[allow(dead_code)] mod c; // one line (#10936)\nmod d;\n",
             Path::new("/s/a/b.rs"),
             Path::new("/s/a/b"),
         );
+        assert_eq!(e[0].candidates[0], PathBuf::from("/s/a/x.rs"), "the path binds the mod on its own line");
         assert_eq!(
             e[1].candidates[0],
             PathBuf::from("/s/a/b/d.rs"),

@@ -162,6 +162,8 @@ fn encoders_match_clang() {
         ("fdiv d3, d4, d5", fdiv(3, 4, 5), 0x1e65_1883),
         // FNEG (scalar) "FNEG <Dd>, <Dn>", data-processing (1 source) opc=10.
         ("fneg d16, d16", fneg(16, 16), 0x1e61_4210),
+        // FSQRT (scalar) "FSQRT <Dd>, <Dn>", data-processing (1 source) opcode=000011.
+        ("fsqrt d16, d16", fsqrt(16, 16), 0x1e61_c210),
         // FCMP "FCMP <Dn>, <Dm>", opc=00 (quiet, register form).
         ("fcmp d16, d17", fcmp(16, 17), 0x1e71_2200),
         // SCVTF / UCVTF (scalar, integer) "<op> <Dd>, <Wn>|<Xn>", rmode=00
@@ -182,6 +184,24 @@ fn encoders_match_clang() {
         // LDP (SIMD&FP) signed offset, opc=01 L=1.
         ("ldp d0, d1, [x17, #64]", ldp_d(0, 1, 17, 64), 0x6d44_0620),
         ("ldp d6, d7, [x17, #112]", ldp_d(6, 7, 17, 112), 0x6d47_1e26),
+        // Single precision (ftype 00): the double encoding with bit 22
+        // clear, plus FMOV (general) 32-bit and FCVT between precisions.
+        // Words from clang -arch arm64 + objdump.
+        ("fmov s16, w9", fmov_s_w(16, 9), 0x1e27_0130),
+        ("fmov w9, s16", fmov_w_s(9, 16), 0x1e26_0209),
+        ("fcvt d16, s17", fcvt_d_s(16, 17), 0x1e22_c230),
+        ("fcvt s16, d17", fcvt_s_d(16, 17), 0x1e62_4230),
+        ("fadd s16, s16, s17", single(fadd(16, 16, 17)), 0x1e31_2a10),
+        ("fsub s0, s1, s2", single(fsub(0, 1, 2)), 0x1e22_3820),
+        ("fmul s16, s16, s17", single(fmul(16, 16, 17)), 0x1e31_0a10),
+        ("fdiv s3, s4, s5", single(fdiv(3, 4, 5)), 0x1e25_1883),
+        ("fneg s16, s16", single(fneg(16, 16)), 0x1e21_4210),
+        ("fsqrt s16, s16", single(fsqrt(16, 16)), 0x1e21_c210),
+        ("fcmp s16, s17", single(fcmp(16, 17)), 0x1e31_2200),
+        ("scvtf s16, w9", single(scvtf(false, 16, 9)), 0x1e22_0130),
+        ("scvtf s16, x9", single(scvtf(true, 16, 9)), 0x9e22_0130),
+        ("ucvtf s16, w9", single(ucvtf(false, 16, 9)), 0x1e23_0130),
+        ("ucvtf s16, x9", single(ucvtf(true, 16, 9)), 0x9e23_0130),
     ];
     let mut bad = Vec::new();
     for (asm, got, want) in cases {
@@ -190,7 +210,7 @@ fn encoders_match_clang() {
         }
     }
     assert!(bad.is_empty(), "encoder mismatches:\n{}", bad.join("\n"));
-    assert_eq!(cases.len(), 157);
+    assert_eq!(cases.len(), 173);
 }
 
 #[test]
@@ -240,6 +260,8 @@ fn disassembler_reads_back_the_subset() {
         fmul(16, 16, 17),
         fdiv(3, 4, 5),
         fneg(16, 16),
+        fsqrt(16, 16),
+        single(fsqrt(16, 16)),
         fcmp(16, 17),
         scvtf(false, 16, 9),
         ucvtf(true, 16, 9),
@@ -248,6 +270,14 @@ fn disassembler_reads_back_the_subset() {
         str_d(0, 9, 40),
         ldr_d(1, SP, 16),
         ldp_d(0, 1, 17, 64),
+        fmov_s_w(16, 9),
+        fmov_w_s(9, 16),
+        fcvt_d_s(16, 17),
+        fcvt_s_d(16, 17),
+        single(fadd(16, 16, 17)),
+        single(fcmp(16, 17)),
+        single(scvtf(true, 16, 9)),
+        single(fcvtzs(false, 9, 16)),
     ] {
         let d = disasm(w, 0);
         assert!(!d.starts_with(".word"), "{:08x} -> {}", w, d);

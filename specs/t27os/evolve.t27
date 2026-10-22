@@ -1,0 +1,508 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/evolve.t27 -- the rule GOD MODE runs: gaps from the panel, one priority, guardrails, one lane per task
+; Owner, 2026-10-20: tie everything into one working T27 OS; in GOD MODE the system evolves by itself. The law is
+; AGENTS.md "T27 OS: the instrument panel, and GOD MODE evolution". Closes #11275. ASCII only (L3), English (LANG-EN).
+; Pure: the host (glass_window) reads the panel and supplies plain integers; this module only decides. Letters are
+; 1..27 (agent_parts), a set of letters is a u32 mask with bit (letter - 1). It cannot start anything itself.
+;   GAPS      what the panel shows is missing, in priority order (G_*): red on master, a BLOCKED domain, a stale
+;             seal, unowned paths, a letter with no instrument (agent_parts NO_WIDGETS), a letter never pinned,
+;             a spec no widget shows (the census count). One gap -> one TASK for one letter.
+;   GUARDRAILS never when GOD MODE is off or the panel is closed (queen.t27 rule); at most EV_MAX_AGENTS running;
+;             one task per letter in flight; at most MAX_PER_HOUR tasks an hour; a gap that touches a forbidden
+;             class (CLAUDE.md "Proactivity": owner-only gate files, secrets, payments, public claims without a
+;             measurement, passwords and keys) becomes an OWNER REQUEST, never a task.
+;   LANE      worktree /tmp/claude-501/lanes/<letter>-<n>, branch claude/evolve-<letter>-<n>, pane agent 9 (bash),
+;             one `claude -p --model sonnet` line under the pty server's 200-byte cap (run-local.md section 6).
+;             Landing is only a PR with `Closes #N` and the normal gates, never a push to master.
+; Decisions: red on master has no letter, it goes to B (build pipeline); unowned paths go to S (specs and
+; standards, who owns ownership). Both are guesses, labelled so; the host may override by masks.
+; queen.t27 cannot call this (evolve uses its ring packing, so a call back would be a cycle): the window calls
+; next_action and passes the result to the suggestion strip.
+
+module T27osEvolve;
+
+use t27os::queen::ev_pack;
+use t27os::queen_board::quiet;
+use t27os::queen::ev_control;
+use t27os::queen::ev_arg;
+use t27os::queen::ev_sec;
+use t27os::queen::by_queen;
+use t27os::queen::VIEW_HOME;
+use t27os::queen::C_QUEEN_STARTED;
+use t27os::queen::C_QUEEN_ASKED;
+use t27os::keys::profile_agent;
+use t27os::keys::PROFILE_COUNT;
+use t27os::keys::PROFILE_PROVIDER;
+
+pub const EV_MAX_AGENTS : u32 = 3;
+pub const MAX_PER_HOUR : u32 = 4;
+pub const LETTERS : u32 = 27;
+pub const PTY_CAP : u32 = 200;
+pub const LANE_AGENT : u32 = 0;
+pub const LETTER_RED : u32 = 2;
+pub const LETTER_UNOWNED : u32 = 19;
+
+// gap kinds, most urgent first
+pub const G_NONE : u32 = 0;
+pub const G_RED : u32 = 1;
+pub const G_BLOCKED : u32 = 2;
+pub const G_STALE : u32 = 3;
+pub const G_UNOWNED : u32 = 4;
+pub const G_NO_INSTRUMENT : u32 = 5;
+pub const G_NEVER_PINNED : u32 = 6;
+pub const G_NO_WIDGET : u32 = 7;
+
+// what the rule decides
+pub const D_NONE : u32 = 0;
+pub const D_TASK : u32 = 1;
+pub const D_REQUEST : u32 = 2;
+
+// why it did nothing
+pub const R_OK : u32 = 0;
+pub const R_GOD_OFF : u32 = 1;
+pub const R_PANEL_CLOSED : u32 = 2;
+pub const R_AGENT_CAP : u32 = 3;
+pub const R_BUDGET : u32 = 4;
+pub const R_NO_GAP : u32 = 5;
+
+// forbidden classes (bits)
+pub const F_GATE : u32 = 1;
+pub const F_SECRET : u32 = 2;
+pub const F_PAYMENT : u32 = 4;
+pub const F_PUBLIC : u32 = 8;
+pub const F_KEYS : u32 = 16;
+pub const F_ALL : u32 = 31;
+
+pub fn letter_bit(letter: u32) -> u32 {
+    if (letter == 0 or letter > LETTERS) { return 0; }
+    return @as(u32, 1) << (letter - 1);
+}
+
+pub fn mask_has(mask: u32, letter: u32) -> bool {
+    return mask & letter_bit(letter) != 0;
+}
+
+/// Lowest letter in the mask, 0 if empty (ties by letter order).
+pub fn first_letter(mask: u32) -> u32 {
+    var l : u32 = 1;
+    while (l <= LETTERS) {
+        if (mask_has(mask, l)) { return l; }
+        l = l + 1;
+    }
+    return 0;
+}
+
+pub fn touches_forbidden(classes: u32) -> bool {
+    return classes & F_ALL != 0;
+}
+
+/// The gap state the host reads off the panel. Masks are letters with that gap.
+pub struct Panel {
+    master_red: bool,
+    blocked: u32,
+    stale: u32,
+    unowned_count: u32,
+    no_instrument: u32,
+    never_pinned: u32,
+    no_widget_count: u32,
+    no_widget: u32,
+}
+
+/// The most urgent gap not already in flight: its kind (letter via gap_letter).
+pub fn gap_kind(p: Panel, inflight: u32) -> u32 {
+    if (p.master_red and mask_has(inflight, LETTER_RED) == false) { return G_RED; }
+    if (first_letter(p.blocked & ~inflight) != 0) { return G_BLOCKED; }
+    if (first_letter(p.stale & ~inflight) != 0) { return G_STALE; }
+    if (p.unowned_count > 0 and mask_has(inflight, LETTER_UNOWNED) == false) { return G_UNOWNED; }
+    if (first_letter(p.no_instrument & ~inflight) != 0) { return G_NO_INSTRUMENT; }
+    if (first_letter(p.never_pinned & ~inflight) != 0) { return G_NEVER_PINNED; }
+    if (p.no_widget_count > 0 and first_letter(p.no_widget & ~inflight) != 0) { return G_NO_WIDGET; }
+    return G_NONE;
+}
+
+pub fn gap_letter(p: Panel, inflight: u32, kind: u32) -> u32 {
+    if (kind == G_RED) { return LETTER_RED; }
+    if (kind == G_BLOCKED) { return first_letter(p.blocked & ~inflight); }
+    if (kind == G_STALE) { return first_letter(p.stale & ~inflight); }
+    if (kind == G_UNOWNED) { return LETTER_UNOWNED; }
+    if (kind == G_NO_INSTRUMENT) { return first_letter(p.no_instrument & ~inflight); }
+    if (kind == G_NEVER_PINNED) { return first_letter(p.never_pinned & ~inflight); }
+    if (kind == G_NO_WIDGET) { return first_letter(p.no_widget & ~inflight); }
+    return 0;
+}
+
+/// Why nothing may start now, R_OK if a task may. The gates of queen.t27 first, then the caps.
+pub fn why_not(god: bool, panel_open: bool, running: u32, started_hour: u32) -> u32 {
+    return why_not_cap(god, panel_open, running, started_hour, EV_MAX_AGENTS);
+}
+
+/// The same with the agent cap as an input: kernel.t27 computes it from the machine's resources and passes it
+/// (kernel uses evolve, so evolve cannot call kernel: that would be a cycle). EV_MAX_AGENTS is the fallback cap.
+pub fn why_not_cap(god: bool, panel_open: bool, running: u32, started_hour: u32, cap: u32) -> u32 {
+    if (god == false) { return R_GOD_OFF; }
+    if (panel_open == false) { return R_PANEL_CLOSED; }
+    if (running >= cap) { return R_AGENT_CAP; }
+    if (started_hour >= MAX_PER_HOUR) { return R_BUDGET; }
+    return R_OK;
+}
+
+/// The decision packed in a u32: action + 4 * kind + 64 * letter.
+pub fn dec_pack(action: u32, kind: u32, letter: u32) -> u32 {
+    return action + 4 * kind + 64 * letter;
+}
+pub fn dec_action(d: u32) -> u32 { return d % 4; }
+pub fn dec_kind(d: u32) -> u32 { return d / 4 % 16; }
+pub fn dec_letter(d: u32) -> u32 { return d / 64; }
+
+/// The one entry point: what GOD MODE does next. `risk_mask` are letters whose gap touches `risk_class`.
+/// A request needs only the gates; a task also needs a free agent slot and budget.
+pub fn next_action(p: Panel, inflight: u32, god: bool, panel_open: bool, running: u32, started_hour: u32, risk_mask: u32, risk_class: u32) -> u32 {
+    if (god == false or panel_open == false) { return D_NONE; }
+    const kind : u32 = gap_kind(p, inflight);
+    if (kind == G_NONE) { return D_NONE; }
+    const letter : u32 = gap_letter(p, inflight, kind);
+    if (mask_has(risk_mask, letter) and touches_forbidden(risk_class)) { return dec_pack(D_REQUEST, kind, letter); }
+    if (why_not(god, panel_open, running, started_hour) != R_OK) { return D_NONE; }
+    return dec_pack(D_TASK, kind, letter);
+}
+
+/// The reason next_action did nothing, for the log: R_NO_GAP when only the gap is missing.
+pub fn idle_reason(p: Panel, inflight: u32, god: bool, panel_open: bool, running: u32, started_hour: u32) -> u32 {
+    const w : u32 = why_not(god, panel_open, running, started_hour);
+    if (w != R_OK) { return w; }
+    if (gap_kind(p, inflight) == G_NONE) { return R_NO_GAP; }
+    return R_OK;
+}
+
+// ---- the Queen's own log entry (RECENT ring) ----
+
+/// An action logged as hers: C_QUEEN_STARTED for a task, C_QUEEN_ASKED for an owner request; arg = letter.
+pub fn log_event(d: u32, sec: u64) -> u64 {
+    if (dec_action(d) == D_TASK) { return ev_pack(VIEW_HOME, C_QUEEN_STARTED, dec_letter(d), sec); }
+    if (dec_action(d) == D_REQUEST) { return ev_pack(VIEW_HOME, C_QUEEN_ASKED, dec_letter(d), sec); }
+    return 0;
+}
+
+// ---- the task: title and the 4-heading issue body, as text pieces the host joins ----
+
+pub fn kind_phrase(kind: u32) -> string {
+    if (kind == G_RED) { return "fix the red check on master"; }
+    if (kind == G_BLOCKED) { return "unblock the BLOCKED domain"; }
+    if (kind == G_STALE) { return "reseal the stale seals"; }
+    if (kind == G_UNOWNED) { return "give the unowned paths an owner"; }
+    if (kind == G_NO_INSTRUMENT) { return "give the letter its first instrument"; }
+    if (kind == G_NEVER_PINNED) { return "pin an instrument of the letter in the panel"; }
+    if (kind == G_NO_WIDGET) { return "show a spec no widget shows"; }
+    return "nothing";
+}
+
+pub fn letter_char(l: u32) -> string {
+    if (l == 1) { return "a"; } if (l == 2) { return "b"; } if (l == 3) { return "c"; } if (l == 4) { return "d"; }
+    if (l == 5) { return "e"; } if (l == 6) { return "f"; } if (l == 7) { return "g"; } if (l == 8) { return "h"; }
+    if (l == 9) { return "i"; } if (l == 10) { return "j"; } if (l == 11) { return "k"; } if (l == 12) { return "l"; }
+    if (l == 13) { return "m"; } if (l == 14) { return "n"; } if (l == 15) { return "o"; } if (l == 16) { return "p"; }
+    if (l == 17) { return "q"; } if (l == 18) { return "r"; } if (l == 19) { return "s"; } if (l == 20) { return "t"; }
+    if (l == 21) { return "u"; } if (l == 22) { return "v"; } if (l == 23) { return "w"; } if (l == 24) { return "x"; }
+    if (l == 25) { return "y"; } if (l == 26) { return "z"; } if (l == 27) { return "ti"; }
+    return "-";
+}
+
+pub const TITLE_HEAD : string = "t27os evolve: ";
+pub const TITLE_MID : string = " -- letter ";
+
+/// Title = TITLE_HEAD + kind_phrase + TITLE_MID + letter_char; its length for a counted buffer.
+pub fn title_len(kind: u32, letter: u32) -> u32 {
+    return (TITLE_HEAD.len as u32) + (kind_phrase(kind).len as u32) + (TITLE_MID.len as u32) + (letter_char(letter).len as u32);
+}
+
+pub const H_BOUNDARY : string = "Boundary";
+pub const H_SCENARIO : string = "User Scenario";
+pub const H_REQUIREMENT : string = "Requirement";
+pub const H_SUCCESS : string = "Success Criteria";
+
+/// Heading i (0..3) of the issue body.
+pub fn ev_heading(i: u32) -> string {
+    if (i == 0) { return H_BOUNDARY; }
+    if (i == 1) { return H_SCENARIO; }
+    if (i == 2) { return H_REQUIREMENT; }
+    return H_SUCCESS;
+}
+
+pub fn body_boundary(kind: u32) -> string {
+    if (kind == G_RED) { return "only the files of the failing check; no gate files"; }
+    if (kind == G_BLOCKED) { return "only the files of the blocked domain path"; }
+    if (kind == G_STALE) { return "the stale seals under .trinity/seals and their specs"; }
+    if (kind == G_UNOWNED) { return "OWNERS.md of the unowned paths"; }
+    if (kind == G_NO_WIDGET) { return "the spec and the widget catalog entry"; }
+    return "specs/t27os/ and the letter's entry in agent_parts.t27";
+}
+
+pub fn body_scenario(kind: u32) -> string {
+    if (kind == G_NONE) { return "-"; }
+    return "GOD MODE found this gap on the panel and opened this issue.";
+}
+
+pub fn body_requirement(kind: u32) -> string {
+    return kind_phrase(kind);
+}
+
+pub const BODY_SUCCESS : string = "Tests pass with no vacuous test, seals refreshed, Only t27, DRY, merged by PR.";
+pub const LAND_FOOTER : string = "Closes #";
+
+pub fn body_success(kind: u32) -> string {
+    if (kind == G_NONE) { return "-"; }
+    return BODY_SUCCESS;
+}
+
+// ---- the lane ----
+
+pub const LANE_DIR : string = "/tmp/claude-501/lanes/";
+pub const BRANCH_HEAD : string = "claude/evolve-";
+pub const WORKTREE_CMD : string = "git worktree add -b ";
+// The lane runs in a Claude Code pane (agent 0), started by the server through the KEY MASTER (keys.t27 profile, pty_logic
+// plan_pane_keys): the key comes from the keychain at spawn and never appears in a line, a plan string, the RECENT log or a
+// test. The pane's first line is the prompt file run inside that session: CMD_A + <lane path> + CMD_B. Not `claude -p`.
+pub const CMD_A : string = "Read ";
+pub const CMD_B : string = ".prompt and do exactly what it says. Reply DONE when finished.";
+pub const PROFILE_NONE : u32 = 255;
+/// Failovers a lane may take to the next profile after a key fails (mirrors keys-lane MAX_FAILOVERS; unify on merge).
+pub const LANE_MAX_FAILOVERS : u32 = 3;
+pub const KEYS_REQUEST : string = "add or fix a key in KEYS";
+
+/// A pane is profile-enabled when keys.t27 gives its agent a profile: the lane agent must be.
+pub fn lane_uses_key_master() -> bool { return profile_agent(LANE_AGENT); }
+
+/// The first profile whose provider holds a key (bit p of `stored`) and is not marked bad (bit pr of `bad`);
+/// PROFILE_NONE when none. Rotation order is the profile order (zai first).
+pub fn lane_profile(stored: u32, bad: u32) -> u32 {
+    var pr : u32 = 0;
+    while (pr < PROFILE_COUNT) {
+        if ((stored >> PROFILE_PROVIDER[pr]) % 2 == 1 and (bad >> pr) % 2 == 0) { return pr; }
+        pr = pr + 1;
+    }
+    return PROFILE_NONE;
+}
+
+/// After `tries` failovers the profile to move to: the next usable one with the failed one marked bad, and
+/// PROFILE_NONE once LANE_MAX_FAILOVERS is spent.
+pub fn lane_failover(stored: u32, bad: u32, failed: u32, tries: u32) -> u32 {
+    if (tries >= LANE_MAX_FAILOVERS or failed >= PROFILE_COUNT) { return PROFILE_NONE; }
+    return lane_profile(stored, bad + (1 << failed) - ((bad >> failed) % 2) * (1 << failed));
+}
+
+/// A decision made real: a task with no usable profile becomes an OWNER REQUEST (KEYS_REQUEST), never a task.
+pub fn lane_gate(d: u32, stored: u32, bad: u32) -> u32 {
+    if (dec_action(d) != D_TASK) { return d; }
+    if (lane_profile(stored, bad) == PROFILE_NONE) { return dec_pack(D_REQUEST, dec_kind(d), dec_letter(d)); }
+    return d;
+}
+
+pub fn ev_digits(n: u32) -> u32 {
+    if (n < 10) { return 1; }
+    if (n < 100) { return 2; }
+    return 3;
+}
+
+/// <letter>-<n> as used in the path and the branch.
+pub fn lane_id_len(letter: u32, n: u32) -> u32 {
+    return (letter_char(letter).len as u32) + 1 + ev_digits(n);
+}
+
+pub fn lane_path_len(letter: u32, n: u32) -> u32 {
+    return (LANE_DIR.len as u32) + lane_id_len(letter, n);
+}
+
+pub fn branch_len(letter: u32, n: u32) -> u32 {
+    return (BRANCH_HEAD.len as u32) + lane_id_len(letter, n);
+}
+
+/// The one line written into the bash pane (agent 9): stdin from the prompt file, output to a file, a sentinel.
+pub fn agent_cmd_len(letter: u32, n: u32) -> u32 {
+    return (CMD_A.len as u32) + lane_path_len(letter, n) + (CMD_B.len as u32);
+}
+
+/// The line that makes the worktree: git worktree add -b <branch> <path> master.
+pub fn worktree_cmd_len(letter: u32, n: u32) -> u32 {
+    return (WORKTREE_CMD.len as u32) + branch_len(letter, n) + 1 + lane_path_len(letter, n) + 7;
+}
+
+pub fn fits_pty(len: u32) -> bool {
+    return len <= PTY_CAP;
+}
+
+/// No lane ever pushes to master; the only landing is a PR whose body carries LAND_FOOTER and the gates.
+pub fn may_push_master() -> bool {
+    return false;
+}
+
+pub fn lands_by_pr(has_closes: bool, gates_green: bool) -> bool {
+    return has_closes and gates_green;
+}
+
+// ---- tests ----
+
+test priority_runs_from_red_on_master_down_to_a_spec_no_widget_shows {
+    var p : Panel = quiet();
+    assert gap_kind(p, 0) == G_NONE;
+    p.no_widget_count = 5; p.no_widget = letter_bit(9);
+    assert gap_kind(p, 0) == G_NO_WIDGET;
+    p.never_pinned = letter_bit(4);
+    assert gap_kind(p, 0) == G_NEVER_PINNED;
+    p.no_instrument = letter_bit(7);
+    assert gap_kind(p, 0) == G_NO_INSTRUMENT;
+    p.unowned_count = 3;
+    assert gap_kind(p, 0) == G_UNOWNED;
+    p.stale = letter_bit(12);
+    assert gap_kind(p, 0) == G_STALE;
+    p.blocked = letter_bit(3);
+    assert gap_kind(p, 0) == G_BLOCKED;
+    p.master_red = true;
+    assert gap_kind(p, 0) == G_RED;
+    assert gap_letter(p, 0, G_RED) == LETTER_RED;
+}
+
+test ties_go_to_the_lowest_letter_and_a_task_has_a_kind_letter_and_title {
+    var p : Panel = quiet();
+    p.no_instrument = letter_bit(20) + letter_bit(7) + letter_bit(11);
+    assert gap_kind(p, 0) == G_NO_INSTRUMENT;
+    assert gap_letter(p, 0, G_NO_INSTRUMENT) == 7;
+    assert first_letter(0) == 0;
+    assert letter_bit(0) == 0 and letter_bit(28) == 0 and letter_bit(27) == 67108864;
+    // the title is counted: head + phrase + mid + letter
+    assert title_len(G_NO_INSTRUMENT, 7) == 14 + 36 + 11 + 1;
+    assert title_len(G_NO_INSTRUMENT, 27) == 14 + 36 + 11 + 2;
+    assert (ev_heading(0).len as u32) == 8 and (ev_heading(1).len as u32) == 13;
+    assert (ev_heading(2).len as u32) == 11 and (ev_heading(3).len as u32) == 16;
+    assert (body_boundary(G_STALE).len as u32) > 0;
+    assert (body_scenario(G_RED).len as u32) > 0 and (body_success(G_RED).len as u32) > 0;
+    assert (body_requirement(G_STALE).len as u32) == (kind_phrase(G_STALE).len as u32);
+    assert (LAND_FOOTER.len as u32) == 8;
+}
+
+test one_task_per_letter_in_flight {
+    var p : Panel = quiet();
+    p.no_instrument = letter_bit(7) + letter_bit(11);
+    assert dec_letter(next_action(p, 0, true, true, 0, 0, 0, 0)) == 7;
+    // letter 7 already runs: the next letter, never a second task on 7
+    assert dec_letter(next_action(p, letter_bit(7), true, true, 1, 1, 0, 0)) == 11;
+    assert next_action(p, letter_bit(7) + letter_bit(11), true, true, 2, 2, 0, 0) == D_NONE;
+    // red on master is also one task: in flight (letter B) it is skipped
+    p.master_red = true;
+    assert dec_kind(next_action(p, letter_bit(LETTER_RED), true, true, 1, 1, 0, 0)) == G_NO_INSTRUMENT;
+}
+
+test never_when_god_mode_is_off_or_the_panel_is_closed {
+    var p : Panel = quiet();
+    p.master_red = true;
+    assert next_action(p, 0, false, true, 0, 0, 0, 0) == D_NONE;
+    assert next_action(p, 0, true, false, 0, 0, 0, 0) == D_NONE;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, 0, 0)) == D_TASK;
+    assert why_not(false, true, 0, 0) == R_GOD_OFF;
+    assert why_not(true, false, 0, 0) == R_PANEL_CLOSED;
+    assert idle_reason(quiet(), 0, true, true, 0, 0) == R_NO_GAP;
+}
+
+test at_most_three_agents_and_a_budget_per_hour {
+    var p : Panel = quiet();
+    p.stale = letter_bit(5);
+    assert dec_action(next_action(p, 0, true, true, 2, 0, 0, 0)) == D_TASK;
+    assert next_action(p, 0, true, true, EV_MAX_AGENTS, 0, 0, 0) == D_NONE;
+    assert next_action(p, 0, true, true, 9, 0, 0, 0) == D_NONE;
+    assert why_not(true, true, EV_MAX_AGENTS, 0) == R_AGENT_CAP;
+    assert dec_action(next_action(p, 0, true, true, 0, MAX_PER_HOUR - 1, 0, 0)) == D_TASK;
+    assert next_action(p, 0, true, true, 0, MAX_PER_HOUR, 0, 0) == D_NONE;
+    assert why_not(true, true, 0, MAX_PER_HOUR) == R_BUDGET;
+    assert EV_MAX_AGENTS == 3;
+}
+
+test a_forbidden_class_becomes_an_owner_request_not_a_task {
+    var p : Panel = quiet();
+    p.blocked = letter_bit(11);
+    // the gap touches a gate file: a request, even with all agent slots busy (it starts no agent)
+    const d : u32 = next_action(p, 0, true, true, EV_MAX_AGENTS, MAX_PER_HOUR, letter_bit(11), F_GATE);
+    assert dec_action(d) == D_REQUEST and dec_letter(d) == 11 and dec_kind(d) == G_BLOCKED;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(11), F_SECRET)) == D_REQUEST;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(11), F_PAYMENT)) == D_REQUEST;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(11), F_PUBLIC)) == D_REQUEST;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(11), F_KEYS)) == D_REQUEST;
+    // a risk on another letter, or no class, stays a task
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(4), F_GATE)) == D_TASK;
+    assert dec_action(next_action(p, 0, true, true, 0, 0, letter_bit(11), 0)) == D_TASK;
+    // still never when off or closed
+    assert next_action(p, 0, false, true, 0, 0, letter_bit(11), F_GATE) == D_NONE;
+    assert next_action(p, 0, true, false, 0, 0, letter_bit(11), F_GATE) == D_NONE;
+    assert touches_forbidden(0) == false and touches_forbidden(F_KEYS);
+}
+
+test every_action_is_logged_as_the_queens_own {
+    const t : u32 = dec_pack(D_TASK, G_STALE, 12);
+    const e : u64 = log_event(t, 1234);
+    assert by_queen(ev_control(e)) and ev_control(e) == C_QUEEN_STARTED;
+    assert ev_arg(e) == 12 and ev_sec(e) == 1234;
+    const r : u64 = log_event(dec_pack(D_REQUEST, G_RED, 2), 99);
+    assert by_queen(ev_control(r)) and ev_control(r) == C_QUEEN_ASKED and ev_arg(r) == 2;
+    assert log_event(D_NONE, 5) == 0;
+    assert dec_action(t) == D_TASK and dec_kind(t) == G_STALE and dec_letter(t) == 12;
+}
+
+test the_lane_fits_the_pty_cap_and_lands_only_by_pr {
+    assert LANE_AGENT == 0;
+    assert (LANE_DIR.len as u32) == 22 and (BRANCH_HEAD.len as u32) == 14;
+    assert lane_path_len(3, 1) == 22 + 3 and branch_len(3, 1) == 14 + 3;
+    assert lane_path_len(27, 100) == 22 + 2 + 1 + 3;
+    // the worst case (letter ti, three digits) stays under 200 bytes, both lines
+    assert agent_cmd_len(3, 1) == 5 + 25 + 62;
+    assert fits_pty(agent_cmd_len(27, 999)) and fits_pty(worktree_cmd_len(27, 999));
+    assert agent_cmd_len(27, 999) < PTY_CAP;
+    // the cap really bites: a 201-byte line does not fit
+    assert fits_pty(PTY_CAP) and fits_pty(PTY_CAP + 1) == false;
+    assert may_push_master() == false;
+    assert lands_by_pr(true, true) and lands_by_pr(false, true) == false and lands_by_pr(true, false) == false;
+    assert (letter_char(27).len as u32) == 2 and (letter_char(0).len as u32) == 1;
+}
+
+test the_lane_runs_through_the_key_master_never_a_bare_claude_p {
+    assert lane_uses_key_master();
+    assert LANE_AGENT == 0;
+    // no line of the plan is a bare `claude -p`, and none holds a key
+    assert CMD_A.len == 5 and CMD_B.len == 62;
+    // stored: zai (provider 4) only -> profile 0; anthropic (0) only -> profile 1; openrouter (3) -> 2; ollama (5) -> 3
+    assert lane_profile(16, 0) == 0;
+    assert lane_profile(1, 0) == 1;
+    assert lane_profile(8, 0) == 2;
+    assert lane_profile(32, 0) == 3;
+    // a bad profile is skipped; all bad or nothing stored -> none
+    assert lane_profile(16 + 1, 1) == 1;
+    assert lane_profile(16, 1) == PROFILE_NONE;
+    assert lane_profile(0, 0) == PROFILE_NONE;
+    assert lane_profile(2, 0) == PROFILE_NONE;
+}
+
+test a_plan_with_no_usable_profile_is_an_owner_request_to_fix_a_key {
+    const t : u32 = dec_pack(D_TASK, G_STALE, 12);
+    assert lane_gate(t, 16, 0) == t;
+    const r : u32 = lane_gate(t, 0, 0);
+    assert dec_action(r) == D_REQUEST and dec_kind(r) == G_STALE and dec_letter(r) == 12;
+    assert dec_action(lane_gate(t, 16, 1)) == D_REQUEST;
+    // a request stays what it was
+    const q : u32 = dec_pack(D_REQUEST, G_RED, 2);
+    assert lane_gate(q, 0, 0) == q;
+    assert KEYS_REQUEST.len == 24;
+}
+
+test failover_is_bounded_by_the_max_failovers {
+    // zai and anthropic stored: failing zai moves to anthropic, failing that leaves nothing
+    assert lane_failover(17, 0, 0, 0) == 1;
+    assert lane_failover(17, 1, 1, 1) == PROFILE_NONE;
+    assert lane_failover(17, 0, 0, LANE_MAX_FAILOVERS) == PROFILE_NONE;
+    assert lane_failover(17, 0, 99, 0) == PROFILE_NONE;
+    var tries : u32 = 0;
+    var bad : u32 = 0;
+    var pr : u32 = lane_profile(63, bad);
+    while (pr != PROFILE_NONE and tries < 10) {
+        bad = bad + (1 << pr);
+        pr = lane_failover(63, bad, pr, tries);
+        tries = tries + 1;
+    }
+    assert tries <= LANE_MAX_FAILOVERS + 1;
+}
