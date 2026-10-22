@@ -6,75 +6,23 @@
 //! in the architecture; the doc comment of each function says which.
 //!
 //! The words are checked against the system assembler in tests/encoder.rs.
+//! The encoders are generated: specs/tri/t27b/a64.t27 -> `t27c gen-rust` ->
+//! gen/rust/tri/t27b/a64.rs (#7531, #7549). This file keeps what gen-rust
+//! cannot express yet: Cond::from_bits, the tuple and Vec adapters
+//! `bitmask_imm` and `mov_imm`, and the disassembler.
+
+#[path = "../../../gen/rust/tri/t27b/a64.rs"]
+#[allow(dead_code, unused_parens, unexpected_cfgs)]
+mod enc;
+pub use enc::branch as b;
+pub use enc::*;
 
 pub type Reg = u8;
 
-pub const ZR: Reg = 31;
-pub const SP: Reg = 31;
-pub const FP: Reg = 29;
-pub const LR: Reg = 30;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Cond {
-    Eq = 0,
-    Ne = 1,
-    Hs = 2,
-    Lo = 3,
-    Mi = 4,
-    Pl = 5,
-    Vs = 6,
-    Vc = 7,
-    Hi = 8,
-    Ls = 9,
-    Ge = 10,
-    Lt = 11,
-    Gt = 12,
-    Le = 13,
-    Al = 14,
-}
-
 impl Cond {
-    pub fn invert(self) -> Cond {
-        use Cond::*;
-        match self {
-            Eq => Ne,
-            Ne => Eq,
-            Hs => Lo,
-            Lo => Hs,
-            Mi => Pl,
-            Pl => Mi,
-            Vs => Vc,
-            Vc => Vs,
-            Hi => Ls,
-            Ls => Hi,
-            Ge => Lt,
-            Lt => Ge,
-            Gt => Le,
-            Le => Gt,
-            Al => Al,
-        }
-    }
+    pub fn invert(self) -> Cond { Cond::from_bits(enc::invert_bits(self as u32)) }
 
-    pub fn name(self) -> &'static str {
-        use Cond::*;
-        match self {
-            Eq => "eq",
-            Ne => "ne",
-            Hs => "hs",
-            Lo => "lo",
-            Mi => "mi",
-            Pl => "pl",
-            Vs => "vs",
-            Vc => "vc",
-            Hi => "hi",
-            Ls => "ls",
-            Ge => "ge",
-            Lt => "lt",
-            Gt => "gt",
-            Le => "le",
-            Al => "al",
-        }
-    }
+    pub fn name(self) -> &'static str { enc::cond_name(self as u32) }
 
     pub fn from_bits(b: u32) -> Cond {
         use Cond::*;
@@ -82,533 +30,21 @@ impl Cond {
     }
 }
 
-/// Extend option of the add/sub (extended register) form.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ext {
-    Uxtb = 0,
-    Uxth = 1,
-    Uxtw = 2,
-    Uxtx = 3,
-    Sxtb = 4,
-    Sxth = 5,
-    Sxtw = 6,
-    Sxtx = 7,
-}
-
-/// Shift type of the shifted-register forms.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Shift {
-    Lsl = 0,
-    Lsr = 1,
-    Asr = 2,
-}
-
-#[inline]
-fn sfb(sf: bool) -> u32 {
-    (sf as u32) << 31
-}
-
-#[inline]
-fn r(x: Reg) -> u32 {
-    (x as u32) & 31
-}
-
-// ------------------------------------------------------------ add / subtract
-
-/// ADD/ADDS/SUB/SUBS (shifted register). `op`: 0 add, 1 sub. Reg 31 is ZR.
-pub fn addsub_reg(sf: bool, sub: bool, setflags: bool, rd: Reg, rn: Reg, rm: Reg, sh: Shift, amt: u32) -> u32 {
-    sfb(sf)
-        | (sub as u32) << 30
-        | (setflags as u32) << 29
-        | 0x0B00_0000
-        | (sh as u32) << 22
-        | r(rm) << 16
-        | (amt & 63) << 10
-        | r(rn) << 5
-        | r(rd)
-}
-
-pub fn add(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    addsub_reg(sf, false, false, rd, rn, rm, Shift::Lsl, 0)
-}
-pub fn adds(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    addsub_reg(sf, false, true, rd, rn, rm, Shift::Lsl, 0)
-}
-pub fn sub(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    addsub_reg(sf, true, false, rd, rn, rm, Shift::Lsl, 0)
-}
-pub fn subs(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    addsub_reg(sf, true, true, rd, rn, rm, Shift::Lsl, 0)
-}
-/// CMP rn, rm (SUBS ZR).
-pub fn cmp(sf: bool, rn: Reg, rm: Reg) -> u32 {
-    subs(sf, ZR, rn, rm)
-}
-/// CMP rn, rm, <sh> #amt.
-pub fn cmp_shifted(sf: bool, rn: Reg, rm: Reg, sh: Shift, amt: u32) -> u32 {
-    addsub_reg(sf, true, true, ZR, rn, rm, sh, amt)
-}
-
-/// ADD/ADDS/SUB/SUBS (extended register). Rn and (non-flag-setting) Rd 31 are
-/// SP; Rd 31 with flags is ZR.
-pub fn addsub_ext(sf: bool, sub: bool, setflags: bool, rd: Reg, rn: Reg, rm: Reg, ext: Ext, lsl: u32) -> u32 {
-    sfb(sf)
-        | (sub as u32) << 30
-        | (setflags as u32) << 29
-        | 0x0B20_0000
-        | r(rm) << 16
-        | (ext as u32) << 13
-        | (lsl & 7) << 10
-        | r(rn) << 5
-        | r(rd)
-}
-
-/// CMP rn, rm, <ext>: compares rn with the extended low part of rm.
-pub fn cmp_ext(sf: bool, rn: Reg, rm: Reg, ext: Ext) -> u32 {
-    addsub_ext(sf, true, true, ZR, rn, rm, ext, 0)
-}
-
-/// ADD/ADDS/SUB/SUBS (immediate): imm12, optionally shifted left by 12.
-/// Rn 31 is SP; Rd 31 is SP without flags, ZR with flags.
-pub fn addsub_imm(sf: bool, sub: bool, setflags: bool, rd: Reg, rn: Reg, imm12: u32, lsl12: bool) -> u32 {
-    debug_assert!(imm12 < 4096);
-    sfb(sf)
-        | (sub as u32) << 30
-        | (setflags as u32) << 29
-        | 0x1100_0000
-        | (lsl12 as u32) << 22
-        | (imm12 & 0xfff) << 10
-        | r(rn) << 5
-        | r(rd)
-}
-
-pub fn add_imm(sf: bool, rd: Reg, rn: Reg, imm12: u32) -> u32 {
-    addsub_imm(sf, false, false, rd, rn, imm12, false)
-}
-pub fn sub_imm(sf: bool, rd: Reg, rn: Reg, imm12: u32) -> u32 {
-    addsub_imm(sf, true, false, rd, rn, imm12, false)
-}
-pub fn cmp_imm(sf: bool, rn: Reg, imm12: u32) -> u32 {
-    addsub_imm(sf, true, true, ZR, rn, imm12, false)
-}
-pub fn cmn_imm(sf: bool, rn: Reg, imm12: u32) -> u32 {
-    addsub_imm(sf, false, true, ZR, rn, imm12, false)
-}
-
-/// MOV between a general register and SP (ADD #0).
-pub fn mov_sp(rd: Reg, rn: Reg) -> u32 {
-    add_imm(true, rd, rn, 0)
-}
-
-// ------------------------------------------------------------------- logical
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LogOp {
-    And = 0,
-    Orr = 1,
-    Eor = 2,
-    Ands = 3,
-}
-
-/// AND/ORR/EOR/ANDS (shifted register); `not` gives BIC/ORN/EON/BICS. Reg 31 is ZR.
-pub fn logic_reg(sf: bool, op: LogOp, not: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    sfb(sf) | (op as u32) << 29 | 0x0A00_0000 | (not as u32) << 21 | r(rm) << 16 | r(rn) << 5 | r(rd)
-}
-
-/// MOV rd, rm (ORR rd, ZR, rm). The W form zero-extends into the X register.
-pub fn mov(sf: bool, rd: Reg, rm: Reg) -> u32 {
-    logic_reg(sf, LogOp::Orr, false, rd, ZR, rm)
-}
-
-/// MVN rd, rm (ORN rd, ZR, rm).
-pub fn mvn(sf: bool, rd: Reg, rm: Reg) -> u32 {
-    logic_reg(sf, LogOp::Orr, true, rd, ZR, rm)
-}
-
-/// Encode a logical (bitmask) immediate. Returns (N, immr, imms).
+/// Encode a logical (bitmask) immediate: (N, immr, imms), split from
+/// enc::bitmask_field's packed field.
 pub fn bitmask_imm(value: u64, sf: bool) -> Option<(u32, u32, u32)> {
-    let width = if sf { 64 } else { 32 };
-    let v = if sf { value } else { value & 0xffff_ffff };
-    if v == 0 || (sf && v == u64::MAX) || (!sf && v == 0xffff_ffff) {
-        return None;
-    }
-    // Replicate a 32-bit value so the 64-bit search covers both forms.
-    let v64 = if sf { v } else { v | (v << 32) };
-    // Find the smallest element size whose replication gives v64.
-    let mut size = 64u32;
-    while size > 2 {
-        let half = size / 2;
-        let mask = (1u64 << half) - 1;
-        if (v64 & mask) != ((v64 >> half) & mask) {
-            break;
-        }
-        size = half;
-    }
-    if !sf && size == 64 {
-        return None;
-    }
-    let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
-    let elem = v64 & mask;
-    // elem must be a rotated run of ones.
-    let ones = elem.count_ones();
-    if ones == 0 || ones == size {
-        return None;
-    }
-    // Find rotation r such that rotating elem right by r gives 0..01..1.
-    let run = if ones == 64 { u64::MAX } else { (1u64 << ones) - 1 };
-    let mut rot = None;
-    for rr in 0..size {
-        // rotate right by rr within `size` bits
-        let rotated = if rr == 0 {
-            elem
-        } else {
-            ((elem >> rr) | (elem << (size - rr))) & mask
-        };
-        if rotated == run {
-            rot = Some(rr);
-            break;
-        }
-    }
-    let rr = rot?;
-    // The instruction rotates the run RIGHT by immr; we found the right
-    // rotation that normalises elem, so immr is the inverse rotation.
-    let immr = (size - rr) % size;
-    let n = (size == 64) as u32;
-    let imms = ((!(size * 2 - 1)) & 0x3f) | (ones - 1);
-    let _ = width;
-    Some((n, immr, imms & 0x3f))
+    enc::bitmask_field(value, sf).map(|f| (f >> 12, (f >> 6) & 63, f & 63))
 }
 
-/// AND/ORR/EOR/ANDS (immediate). Rd 31 is SP for AND/ORR/EOR, ZR for ANDS.
-pub fn logic_imm(sf: bool, op: LogOp, rd: Reg, rn: Reg, value: u64) -> Option<u32> {
-    let (n, immr, imms) = bitmask_imm(value, sf)?;
-    Some(sfb(sf) | (op as u32) << 29 | 0x1200_0000 | n << 22 | immr << 16 | imms << 10 | r(rn) << 5 | r(rd))
-}
-
-// ---------------------------------------------------------------- move wide
-
-/// MOVZ rd, #imm16, LSL #(16*hw).
-pub fn movz(sf: bool, rd: Reg, imm16: u32, hw: u32) -> u32 {
-    sfb(sf) | 0x5280_0000 | (hw & 3) << 21 | (imm16 & 0xffff) << 5 | r(rd)
-}
-/// MOVN rd, #imm16, LSL #(16*hw).
-pub fn movn(sf: bool, rd: Reg, imm16: u32, hw: u32) -> u32 {
-    sfb(sf) | 0x1280_0000 | (hw & 3) << 21 | (imm16 & 0xffff) << 5 | r(rd)
-}
-/// MOVK rd, #imm16, LSL #(16*hw).
-pub fn movk(sf: bool, rd: Reg, imm16: u32, hw: u32) -> u32 {
-    sfb(sf) | 0x7280_0000 | (hw & 3) << 21 | (imm16 & 0xffff) << 5 | r(rd)
-}
-
-/// The shortest MOVZ/MOVN/MOVK (or ORR bitmask) sequence putting `value` in
-/// rd. For W registers only the low 32 bits of `value` are used.
+/// The words of enc::mov_imm_at, pushed into `out`.
 pub fn mov_imm(sf: bool, rd: Reg, value: u64, out: &mut Vec<u32>) {
-    let v = if sf { value } else { value & 0xffff_ffff };
-    let nhw = if sf { 4 } else { 2 };
-    let chunk = |x: u64, i: u32| ((x >> (16 * i)) & 0xffff) as u32;
-    let zeros = (0..nhw).filter(|&i| chunk(v, i) == 0).count();
-    let ones = (0..nhw).filter(|&i| chunk(v, i) == 0xffff).count();
-    if zeros == nhw as usize {
-        out.push(movz(sf, rd, 0, 0));
-        return;
-    }
-    let need_z = nhw as usize - zeros;
-    let need_n = nhw as usize - ones;
-    if need_z > 1 && need_n > 1 {
-        if let Some(w) = logic_imm(sf, LogOp::Orr, rd, ZR, v) {
-            out.push(w);
-            return;
-        }
-    }
-    if need_n < need_z {
-        // MOVN: start from all ones.
-        let mut first = true;
-        for i in 0..nhw {
-            let c = chunk(v, i);
-            if c != 0xffff {
-                if first {
-                    out.push(movn(sf, rd, !c & 0xffff, i));
-                    first = false;
-                } else {
-                    out.push(movk(sf, rd, c, i));
-                }
-            }
-        }
-        if first {
-            out.push(movn(sf, rd, 0, 0));
-        }
-    } else {
-        let mut first = true;
-        for i in 0..nhw {
-            let c = chunk(v, i);
-            if c != 0 {
-                if first {
-                    out.push(movz(sf, rd, c, i));
-                    first = false;
-                } else {
-                    out.push(movk(sf, rd, c, i));
-                }
-            }
-        }
-    }
-}
-
-// ------------------------------------------------- data processing, 2 and 3
-
-fn dp2(sf: bool, opcode: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    sfb(sf) | 0x1AC0_0000 | r(rm) << 16 | opcode << 10 | r(rn) << 5 | r(rd)
-}
-pub fn udiv(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    dp2(sf, 0b000010, rd, rn, rm)
-}
-pub fn sdiv(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    dp2(sf, 0b000011, rd, rn, rm)
-}
-pub fn lslv(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    dp2(sf, 0b001000, rd, rn, rm)
-}
-pub fn lsrv(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    dp2(sf, 0b001001, rd, rn, rm)
-}
-pub fn asrv(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    dp2(sf, 0b001010, rd, rn, rm)
-}
-
-/// MADD rd, rn, rm, ra (rd = ra + rn*rm).
-pub fn madd(sf: bool, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
-    sfb(sf) | 0x1B00_0000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd)
-}
-/// MSUB rd, rn, rm, ra (rd = ra - rn*rm).
-pub fn msub(sf: bool, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
-    sfb(sf) | 0x1B00_8000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd)
-}
-pub fn mul(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    madd(sf, rd, rn, rm, ZR)
-}
-/// SMULL xd, wn, wm (64-bit product of signed 32-bit operands).
-pub fn smull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    0x9B20_0000 | r(rm) << 16 | r(ZR) << 10 | r(rn) << 5 | r(rd)
-}
-/// UMULL xd, wn, wm.
-pub fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    0x9BA0_0000 | r(rm) << 16 | r(ZR) << 10 | r(rn) << 5 | r(rd)
-}
-/// SMULH xd, xn, xm (high 64 bits of the signed 128-bit product).
-pub fn smulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    0x9B40_0000 | r(rm) << 16 | r(ZR) << 10 | r(rn) << 5 | r(rd)
-}
-/// UMULH xd, xn, xm.
-pub fn umulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
-    0x9BC0_0000 | r(rm) << 16 | r(ZR) << 10 | r(rn) << 5 | r(rd)
-}
-
-// ----------------------------------------------------------------- bitfield
-
-pub fn sbfm(sf: bool, rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
-    sfb(sf) | 0x1300_0000 | (sf as u32) << 22 | (immr & 63) << 16 | (imms & 63) << 10 | r(rn) << 5 | r(rd)
-}
-pub fn ubfm(sf: bool, rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
-    sfb(sf) | 0x5300_0000 | (sf as u32) << 22 | (immr & 63) << 16 | (imms & 63) << 10 | r(rn) << 5 | r(rd)
-}
-pub fn lsl_imm(sf: bool, rd: Reg, rn: Reg, sh: u32) -> u32 {
-    let size = if sf { 64 } else { 32 };
-    ubfm(sf, rd, rn, (size - sh) % size, size - 1 - sh)
-}
-pub fn lsr_imm(sf: bool, rd: Reg, rn: Reg, sh: u32) -> u32 {
-    let size = if sf { 64 } else { 32 };
-    ubfm(sf, rd, rn, sh, size - 1)
-}
-pub fn asr_imm(sf: bool, rd: Reg, rn: Reg, sh: u32) -> u32 {
-    let size = if sf { 64 } else { 32 };
-    sbfm(sf, rd, rn, sh, size - 1)
-}
-pub fn uxtb(rd: Reg, rn: Reg) -> u32 {
-    ubfm(false, rd, rn, 0, 7)
-}
-pub fn uxth(rd: Reg, rn: Reg) -> u32 {
-    ubfm(false, rd, rn, 0, 15)
-}
-pub fn sxtb(rd: Reg, rn: Reg) -> u32 {
-    sbfm(false, rd, rn, 0, 7)
-}
-pub fn sxth(rd: Reg, rn: Reg) -> u32 {
-    sbfm(false, rd, rn, 0, 15)
-}
-/// SXTW xd, wn.
-pub fn sxtw(rd: Reg, rn: Reg) -> u32 {
-    sbfm(true, rd, rn, 0, 31)
-}
-
-// --------------------------------------------------------- conditional select
-
-/// CSINC rd, rn, rm, cond.
-pub fn csinc(sf: bool, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
-    sfb(sf) | 0x1A80_0400 | r(rm) << 16 | (cond as u32) << 12 | r(rn) << 5 | r(rd)
-}
-/// CSET rd, cond (rd = cond ? 1 : 0).
-pub fn cset(sf: bool, rd: Reg, cond: Cond) -> u32 {
-    csinc(sf, rd, ZR, ZR, cond.invert())
-}
-
-// ----------------------------------------------------------------- branches
-
-/// B with a word offset (target - pc) / 4.
-pub fn b(off: i32) -> u32 {
-    0x1400_0000 | (off as u32 & 0x03ff_ffff)
-}
-pub fn bl(off: i32) -> u32 {
-    0x9400_0000 | (off as u32 & 0x03ff_ffff)
-}
-pub fn b_cond(cond: Cond, off: i32) -> u32 {
-    0x5400_0000 | (off as u32 & 0x7ffff) << 5 | cond as u32
-}
-pub fn cbz(sf: bool, rt: Reg, off: i32) -> u32 {
-    sfb(sf) | 0x3400_0000 | (off as u32 & 0x7ffff) << 5 | r(rt)
-}
-pub fn cbnz(sf: bool, rt: Reg, off: i32) -> u32 {
-    sfb(sf) | 0x3500_0000 | (off as u32 & 0x7ffff) << 5 | r(rt)
-}
-pub fn ret() -> u32 {
-    0xD65F_03C0
-}
-pub fn blr(rn: Reg) -> u32 {
-    0xD63F_0000 | r(rn) << 5
-}
-pub fn brk(imm16: u32) -> u32 {
-    0xD420_0000 | (imm16 & 0xffff) << 5
-}
-pub fn nop() -> u32 {
-    0xD503_201F
-}
-
-// -------------------------------------------------------------- load/store
-
-/// STR xt, [xn, #imm] with imm a multiple of 8 in 0..32760. Xn 31 is SP.
-pub fn str_x(rt: Reg, rn: Reg, imm: u32) -> u32 {
-    debug_assert!(imm % 8 == 0 && imm / 8 < 4096);
-    0xF900_0000 | (imm / 8) << 10 | r(rn) << 5 | r(rt)
-}
-pub fn ldr_x(rt: Reg, rn: Reg, imm: u32) -> u32 {
-    debug_assert!(imm % 8 == 0 && imm / 8 < 4096);
-    0xF940_0000 | (imm / 8) << 10 | r(rn) << 5 | r(rt)
-}
-/// STUR xt, [xn, #simm9].
-pub fn stur_x(rt: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!((-256..256).contains(&simm));
-    0xF800_0000 | (simm as u32 & 0x1ff) << 12 | r(rn) << 5 | r(rt)
-}
-pub fn ldur_x(rt: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!((-256..256).contains(&simm));
-    0xF840_0000 | (simm as u32 & 0x1ff) << 12 | r(rn) << 5 | r(rt)
-}
-/// STP xt1, xt2, [xn, #simm] (signed offset, multiple of 8 in -512..504).
-pub fn stp_x(rt1: Reg, rt2: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!(simm % 8 == 0 && (-512..=504).contains(&simm));
-    0xA900_0000 | ((simm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt1)
-}
-pub fn ldp_x(rt1: Reg, rt2: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!(simm % 8 == 0 && (-512..=504).contains(&simm));
-    0xA940_0000 | ((simm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt1)
-}
-/// STP xt1, xt2, [xn, #simm]! (pre-index).
-pub fn stp_x_pre(rt1: Reg, rt2: Reg, rn: Reg, simm: i32) -> u32 {
-    0xA980_0000 | ((simm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt1)
-}
-/// LDP xt1, xt2, [xn], #simm (post-index).
-pub fn ldp_x_post(rt1: Reg, rt2: Reg, rn: Reg, simm: i32) -> u32 {
-    0xA8C0_0000 | ((simm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt1)
-}
-
-// ------------------------------------------------------ sized load/store
-//
-// The general forms behind the memory lane. `size` is log2 of the access
-// width in bytes (0 byte, 1 half, 2 word, 3 double); `opc` is one of the
-// four constants below. Register 31 as the base is SP, as the data register
-// it is ZR.
-
-/// Store.
-pub const ST: u32 = 0;
-/// Load, zero-extending.
-pub const LD: u32 = 1;
-/// Load, sign-extending to 64 bits (`ldrsb x`, `ldrsh x`, `ldrsw`).
-pub const LDS64: u32 = 2;
-/// Load, sign-extending to 32 bits (`ldrsb w`, `ldrsh w`).
-pub const LDS32: u32 = 3;
-
-/// log2 of an access width of 1, 2, 4 or 8 bytes.
-pub fn size_log2(bytes: u32) -> u32 {
-    match bytes {
-        1 => 0,
-        2 => 1,
-        4 => 2,
-        8 => 3,
-        _ => panic!("no {}-byte access", bytes),
-    }
-}
-
-/// True when `imm` fits the scaled unsigned-offset form for this size.
-pub fn uimm_fits(size: u32, imm: u32) -> bool {
-    imm % (1 << size) == 0 && (imm >> size) < 4096
-}
-
-/// LDR/STR [xn, #imm] (unsigned offset, scaled by the access width).
-pub fn ldst_uimm(size: u32, opc: u32, rt: Reg, rn: Reg, imm: u32) -> u32 {
-    debug_assert!(uimm_fits(size, imm));
-    size << 30 | 0x3900_0000 | opc << 22 | (imm >> size) << 10 | r(rn) << 5 | r(rt)
-}
-
-/// LDUR/STUR [xn, #simm9] (unscaled signed offset).
-pub fn ldst_unscaled(size: u32, opc: u32, rt: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!((-256..256).contains(&simm));
-    size << 30 | 0x3800_0000 | opc << 22 | (simm as u32 & 0x1ff) << 12 | r(rn) << 5 | r(rt)
-}
-
-/// LDR/STR [xn, xm] or, when `scaled`, [xn, xm, lsl #size].
-pub fn ldst_reg(size: u32, opc: u32, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
-    size << 30 | 0x3820_0800 | opc << 22 | r(rm) << 16 | 0b011 << 13 | (scaled as u32) << 12 | r(rn) << 5 | r(rt)
-}
-
-/// LDR/STR [xn], #simm9 (post-index: xn += simm after the access).
-pub fn ldst_post(size: u32, opc: u32, rt: Reg, rn: Reg, simm: i32) -> u32 {
-    debug_assert!((-256..256).contains(&simm));
-    size << 30 | 0x3800_0400 | opc << 22 | (simm as u32 & 0x1ff) << 12 | r(rn) << 5 | r(rt)
-}
-
-/// ADR xd, pc + off (bytes, within +-1 MiB).
-pub fn adr(rd: Reg, off: i32) -> u32 {
-    debug_assert!((-(1 << 20)..(1 << 20)).contains(&off));
-    let v = off as u32;
-    0x1000_0000 | (v & 3) << 29 | ((v >> 2) & 0x7ffff) << 5 | r(rd)
-}
-
-/// ADRP xd, page(pc) + pages * 4096.
-pub fn adrp(rd: Reg, pages: i32) -> u32 {
-    debug_assert!((-(1 << 20)..(1 << 20)).contains(&pages));
-    let v = pages as u32;
-    0x9000_0000 | (v & 3) << 29 | ((v >> 2) & 0x7ffff) << 5 | r(rd)
-}
-
-/// Patch the page delta of an `adrp` word.
-pub fn adrp_patch(w: u32, pages: i32) -> u32 {
-    (w & 0x9F00_001F) | (adrp(0, pages) & !0x9F00_001F)
-}
-
-/// Patch the imm12 of an `add (immediate)` word.
-pub fn add_imm_patch(w: u32, imm12: u32) -> u32 {
-    debug_assert!(imm12 < 4096);
-    (w & !(0xfff << 10)) | imm12 << 10
+    out.extend((0..enc::mov_imm_len(sf, value)).map(|k| enc::mov_imm_at(sf, rd, value, k)));
 }
 
 // -------------------------------------------------------------- disassembly
 
 fn xr(sf: bool, n: u32, sp_ctx: bool) -> String {
-    if n == 31 {
-        if sp_ctx {
-            return if sf { "sp".into() } else { "wsp".into() };
-        }
-        return if sf { "xzr".into() } else { "wzr".into() };
-    }
-    format!("{}{}", if sf { 'x' } else { 'w' }, n)
+    if n == 31 { [["wzr", "xzr"], ["wsp", "sp"]][sp_ctx as usize][sf as usize].into() } else { format!("{}{}", if sf { 'x' } else { 'w' }, n) }
 }
 
 /// Disassemble one word of the subset this module encodes (for `t27b asm`).
@@ -620,6 +56,9 @@ pub fn disasm(w: u32, pc: usize) -> String {
     let rm = (w >> 16) & 31;
     let tgt = |off: i64| format!("{:#x}", pc as i64 + off * 4);
     let sext = |v: u32, bits: u32| ((v << (32 - bits)) as i32 >> (32 - bits)) as i64;
+    if let Some(t) = disasm_fp(w) {
+        return t;
+    }
     match w {
         0xD65F_03C0 => return "ret".into(),
         0xD503_201F => return "nop".into(),
@@ -650,12 +89,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let s = (w >> 29) & 1 == 1;
         let imm = (w >> 10) & 0xfff;
         let sh = if (w >> 22) & 1 == 1 { ", lsl #12" } else { "" };
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if s && rd == 31 {
             return format!("{} {}, #{}{}", if sub { "cmp" } else { "cmn" }, xr(sf, rn, true), imm, sh);
         }
@@ -668,12 +102,7 @@ pub fn disasm(w: u32, pc: usize) -> String {
     if w & 0x1F00_0000 == 0x0B00_0000 {
         let sub = (w >> 30) & 1 == 1;
         let s = (w >> 29) & 1 == 1;
-        let name = match (sub, s) {
-            (false, false) => "add",
-            (false, true) => "adds",
-            (true, false) => "sub",
-            (true, true) => "subs",
-        };
+        let name = ["add", "adds", "sub", "subs"][2 * sub as usize + s as usize];
         if (w >> 21) & 1 == 1 {
             let opt = (w >> 13) & 7;
             let ext = ["uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"][opt as usize];
@@ -728,26 +157,14 @@ pub fn disasm(w: u32, pc: usize) -> String {
         let opc = (w >> 29) & 3;
         let hw = (w >> 21) & 3;
         let imm = (w >> 5) & 0xffff;
-        let name = match opc {
-            0 => "movn",
-            2 => "movz",
-            3 => "movk",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let Some(name) = [Some("movn"), None, Some("movz"), Some("movk")][opc as usize] else { return format!(".word {:#010x}", w) };
         let sh = if hw != 0 { format!(", lsl #{}", hw * 16) } else { String::new() };
         return format!("{} {}, #{:#x}{}", name, xr(sf, rd, false), imm, sh);
     }
     // data processing 2 source
     if w & 0x7FE0_0000 == 0x1AC0_0000 {
         let op = (w >> 10) & 63;
-        let name = match op {
-            2 => "udiv",
-            3 => "sdiv",
-            8 => "lsl",
-            9 => "lsr",
-            10 => "asr",
-            _ => return format!(".word {:#010x}", w),
-        };
+        let name = match op { 2 => "udiv", 3 => "sdiv", 8 => "lsl", 9 => "lsr", 10 => "asr", _ => return format!(".word {:#010x}", w) };
         return format!("{} {}, {}, {}", name, xr(sf, rd, false), xr(sf, rn, false), xr(sf, rm, false));
     }
     // data processing 3 source
@@ -871,6 +288,64 @@ pub fn disasm(w: u32, pc: usize) -> String {
         };
     }
     format!(".word {:#010x}", w)
+}
+
+/// The floating-point forms `disasm` knows, or None.
+fn disasm_fp(w: u32) -> Option<String> {
+    let rd = w & 31;
+    let rn = (w >> 5) & 31;
+    let rm = (w >> 16) & 31;
+    let g = |sf: bool, n: u32| xr(sf, n, false);
+    let sf = w >> 31 == 1;
+    let opcode = (w >> 10) & 0x3f;
+    // Bit 22 picks double (1) or single (0) in the forms matched through `v`.
+    let p = if (w >> 22) & 1 == 1 { 'd' } else { 's' };
+    let v = w | 0x0040_0000;
+    Some(if w & 0xFFFF_FC00 == 0x1E22_C000 {
+        format!("fcvt d{}, s{}", rd, rn)
+    } else if w & 0xFFFF_FC00 == 0x1E62_4000 {
+        format!("fcvt s{}, d{}", rd, rn)
+    } else if w & 0xFFFF_FC00 == 0x1E27_0000 {
+        format!("fmov s{}, {}", rd, g(false, rn))
+    } else if w & 0xFFFF_FC00 == 0x1E26_0000 {
+        format!("fmov w{}, s{}", rd, rn)
+    } else if v & 0xFFE0_0C00 == 0x1E60_0800 && matches!(opcode, 0x02 | 0x06 | 0x0A | 0x0E) {
+        // FP data processing, 2 source
+        let name = match opcode {
+            0x02 => "fmul",
+            0x06 => "fdiv",
+            0x0A => "fadd",
+            _ => "fsub",
+        };
+        format!("{} {p}{}, {p}{}, {p}{}", name, rd, rn, rm)
+    } else if v & 0xFFE0_FC1F == 0x1E60_2000 {
+        format!("fcmp {p}{}, {p}{}", rn, rm)
+    } else if v & 0xFFFF_FC00 == 0x1E61_4000 {
+        format!("fneg {p}{}, {p}{}", rd, rn)
+    } else if v & 0xFFFF_FC00 == 0x1E61_C000 {
+        format!("fsqrt {p}{}, {p}{}", rd, rn)
+    } else if w & 0xFFFF_FC00 == 0x9E67_0000 {
+        format!("fmov d{}, {}", rd, g(true, rn))
+    } else if w & 0xFFFF_FC00 == 0x9E66_0000 {
+        format!("fmov x{}, d{}", rd, rn)
+    } else if v & 0x7FFF_FC00 == 0x1E62_0000 {
+        format!("scvtf {p}{}, {}", rd, g(sf, rn))
+    } else if v & 0x7FFF_FC00 == 0x1E63_0000 {
+        format!("ucvtf {p}{}, {}", rd, g(sf, rn))
+    } else if v & 0x7FFF_FC00 == 0x1E78_0000 {
+        format!("fcvtzs {}, {p}{}", g(sf, rd), rn)
+    } else if v & 0x7FFF_FC00 == 0x1E79_0000 {
+        format!("fcvtzu {}, {p}{}", g(sf, rd), rn)
+    } else if w & 0xFF80_0000 == 0xFD00_0000 {
+        let ld = (w >> 22) & 1 == 1;
+        let imm = ((w >> 10) & 0xfff) * 8;
+        format!("{} d{}, [{}, #{}]", if ld { "ldr" } else { "str" }, rd, xr(true, rn, true), imm)
+    } else if w & 0xFFC0_0000 == 0x6D40_0000 {
+        let imm = ((((w >> 15) & 0x7f) << 25) as i32) >> 25;
+        format!("ldp d{}, d{}, [{}, #{}]", rd, (w >> 10) & 31, xr(true, rn, true), imm * 8)
+    } else {
+        return None;
+    })
 }
 
 /// Decode (N, immr, imms) back to the bitmask value (for disassembly/tests).
