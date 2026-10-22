@@ -1,0 +1,1030 @@
+module port::bootstrap::src::compiler::return_unsized;
+
+// Port of bootstrap/src/compiler.rs lines 24603-24727 (filed as lines
+// 23970-24090 at the commit the task quoted): return_unsized,
+// mentions_type, is_ident_byte, generic_struct_decls, collect_type_params,
+// collect_bool_module_vars, collect_const_types, collect_typed_locals.
+//
+// The original walks a Node TREE; every walker here visits every node in
+// it (match on the node, then recurse into all children), so a flat
+// PRE-ORDER node slice is an exact model of the same walk: each list
+// element is one tree node in the order the recursion meets it. The
+// mutable out-parameters of the original become return values.
+//
+// Rendering: the Zig target has no runtime string concatenation (`++`
+// needs comptime-known operands), so every function the original builds a
+// String in writes into a caller buffer and returns the new length --
+// the same shape the compiler's own codebase gives format! with one value
+// between fixed pieces. The decision content is byte-identical; only the
+// rendering is a buffer.
+//
+// t27_type_to_rust (compiler.rs, `fn t27_type_to_rust`) is carried here as
+// a helper because collect_const_types and collect_typed_locals call it on
+// every extra_type they keep. Its arm order is the original's:
+// optionality, the two std map containers, tuples, the scalar table,
+// slices, the three bracket forms, pointers, call-style generics, dotted
+// paths, and the verbatim default.
+//
+// Capacity bounds, named so no reader mistakes them for the original's:
+// params hold 4 entries, the set/decl outputs hold 8, a type-argument
+// list holds 4. The corpus never exceeds them; split_type_list answers
+// null past 4 parts, exactly as it answers null on an unbalanced list.
+
+enum NodeKind {
+    StructDecl,
+    ConstDecl,
+    StmtLocal,
+    Other,
+}
+
+// The fields of the original's Node that these eight functions read.
+// params are the raw type-parameter texts as the parser recorded them.
+struct Node {
+    kind: NodeKind,
+    name: str,
+    extra_type: str,
+    params: [4]str,
+    params_count: u8,
+}
+
+// A type-argument list, shared by split_type_list and the call-style
+// generic arm of t27_type_to_rust.
+struct Parts {
+    items: [4]str,
+    count: u8,
+}
+
+// Vec<(String, Vec<String>)>: pushed once per qualifying struct, in
+// source (pre-order) order.
+struct DeclEntry {
+    name: str,
+    params: Parts,
+}
+
+struct DeclList {
+    entries: [8]DeclEntry,
+    count: u8,
+}
+
+// std::collections::HashSet<String>: an insert of a name already present
+// leaves the set unchanged.
+struct NameSet {
+    names: [8]str,
+    count: u8,
+}
+
+// std::collections::HashMap<String, String>: a later insert under the same
+// key overwrites. The value is a SPAN in the caller's render buffer
+// (from, to), because a mapped Rust type is built, not selected.
+struct TypeEntry {
+    name: str,
+    from: usize,
+    to: usize,
+}
+
+struct TypeMap {
+    entries: [8]TypeEntry,
+    count: u8,
+}
+
+/// The lowering for a bracketed type whose brackets do not hold a size.
+/// Original: format!("Vec<{}>", elem) -- the whole function.
+pub fn return_unsized(elem: str, out: []u8) -> usize {
+    var n: usize = buf_write(out, 0, "Vec<");
+    n = buf_write(out, n, elem);
+    return buf_write(out, n, ">");
+}
+
+/// Does `hay` use `name` as a whole identifier? The original comment:
+/// substring matching is wrong here and cheaply so -- `T` occurs inside
+/// `Trit`, `TritCell` and `Vec<Trit>`.
+pub fn mentions_type(hay: str, name: str) -> bool {
+    // The original's hay[from..].find(name) answers None when the needle
+    // is longer than what is left; a raw scan would instead underflow the
+    // slice length, so the guard is the port's own.
+    if (name.len > hay.len) {
+        return false;
+    }
+    var at: usize = 0;
+    while (at + name.len <= hay.len) {
+        var matched: bool = true;
+        var i: usize = 0;
+        while (i < name.len) {
+            if (hay[at + i] != name[i]) {
+                matched = false;
+                break;
+            }
+            i += 1;
+        }
+        if (matched) {
+            const end: usize = at + name.len;
+            const before_ok: bool = at == 0 or !is_ident_byte(hay[at - 1]);
+            const after_ok: bool = end >= hay.len or !is_ident_byte(hay[end]);
+            if (before_ok and after_ok) {
+                return true;
+            }
+        }
+        at += 1;
+    }
+    return false;
+}
+
+pub fn is_ident_byte(b: u8) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_';
+}
+
+/// Structs declared with type parameters, in source order, each once.
+/// StructDecl with a non-empty name, at least one param that is non-empty
+/// after trimming, pushes (name, trimmed non-empty params).
+pub fn generic_struct_decls(nodes: []const Node) -> DeclList {
+    var entries: [8]DeclEntry = empty_decls();
+    var count: u8 = 0;
+    for node in nodes {
+        if (node.kind == NodeKind::StructDecl and node.name.len > 0) {
+            var ps: [4]str = .{ "", "", "", "" };
+            var ps_count: u8 = 0;
+            var i: u8 = 0;
+            while (i < node.params_count) {
+                const p = trim_str(node.params[i]);
+                if (p.len > 0) {
+                    ps[ps_count] = p;
+                    ps_count += 1;
+                }
+                i += 1;
+            }
+            if (ps_count > 0) {
+                entries[count] = DeclEntry{
+                    .name = node.name,
+                    .params = Parts{ .items = ps, .count = ps_count },
+                };
+                count += 1;
+            }
+        }
+    }
+    return DeclList{ .entries = entries, .count = count };
+}
+
+/// Every type parameter of every struct (the name check the neighbour
+/// makes is absent here), trimmed, non-empty, deduplicated.
+pub fn collect_type_params(nodes: []const Node) -> NameSet {
+    var names: [8]str = .{ "", "", "", "", "", "", "", "" };
+    var count: u8 = 0;
+    for node in nodes {
+        if (node.kind == NodeKind::StructDecl) {
+            var i: u8 = 0;
+            while (i < node.params_count) {
+                const p = trim_str(node.params[i]);
+                if (p.len > 0) {
+                    var present: bool = false;
+                    var j: u8 = 0;
+                    while (j < count) {
+                        if (str_eq(names[j], p)) {
+                            present = true;
+                        }
+                        j += 1;
+                    }
+                    if (present == false) {
+                        names[count] = p;
+                        count += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    return NameSet{ .names = names, .count = count };
+}
+
+/// Every module-level `var x : bool`, which the parser delivers as a
+/// ConstDecl. extra_type is compared AFTER trimming; the name is inserted
+/// without an emptiness check, exactly as the original does.
+pub fn collect_bool_module_vars(nodes: []const Node) -> NameSet {
+    var names: [8]str = .{ "", "", "", "", "", "", "", "" };
+    var count: u8 = 0;
+    for node in nodes {
+        if (node.kind == NodeKind::ConstDecl and str_eq(trim_str(node.extra_type), "bool")) {
+            var present: bool = false;
+            var j: u8 = 0;
+            while (j < count) {
+                if (str_eq(names[j], node.name)) {
+                    present = true;
+                }
+                j += 1;
+            }
+            if (present == false) {
+                names[count] = node.name;
+                count += 1;
+            }
+        }
+    }
+    return NameSet{ .names = names, .count = count };
+}
+
+/// name -> Rust type of every ConstDecl with a non-empty name and a
+/// non-empty (after trim) extra_type. Each mapped type is appended to
+/// render (the caller's buffer) and the entry holds its span.
+pub fn collect_const_types(nodes: []const Node, render: []u8) -> TypeMap {
+    var entries: [8]TypeEntry = empty_map();
+    var count: u8 = 0;
+    var written: usize = 0;
+    for node in nodes {
+        if (node.kind == NodeKind::ConstDecl and node.name.len > 0 and trim_str(node.extra_type).len > 0) {
+            const from: usize = written;
+            written = t27_type_to_rust(node.extra_type, render, written);
+            var replaced: bool = false;
+            var j: u8 = 0;
+            while (j < count) {
+                if (str_eq(entries[j].name, node.name)) {
+                    entries[j] = TypeEntry{ .name = node.name, .from = from, .to = written };
+                    replaced = true;
+                }
+                j += 1;
+            }
+            if (replaced == false) {
+                entries[count] = TypeEntry{ .name = node.name, .from = from, .to = written };
+                count += 1;
+            }
+        }
+    }
+    return TypeMap{ .entries = entries, .count = count };
+}
+
+/// The Rust type of every explicitly typed local (StmtLocal) in a function
+/// body. Same keep-rule as collect_const_types on the kind that differs.
+pub fn collect_typed_locals(nodes: []const Node, render: []u8) -> TypeMap {
+    var entries: [8]TypeEntry = empty_map();
+    var count: u8 = 0;
+    var written: usize = 0;
+    for node in nodes {
+        if (node.kind == NodeKind::StmtLocal and node.name.len > 0 and trim_str(node.extra_type).len > 0) {
+            const from: usize = written;
+            written = t27_type_to_rust(node.extra_type, render, written);
+            var replaced: bool = false;
+            var j: u8 = 0;
+            while (j < count) {
+                if (str_eq(entries[j].name, node.name)) {
+                    entries[j] = TypeEntry{ .name = node.name, .from = from, .to = written };
+                    replaced = true;
+                }
+                j += 1;
+            }
+            if (replaced == false) {
+                entries[count] = TypeEntry{ .name = node.name, .from = from, .to = written };
+                count += 1;
+            }
+        }
+    }
+    return TypeMap{ .entries = entries, .count = count };
+}
+
+// ---------------------------------------------------------------------------
+// t27_type_to_rust, the mapper two walkers call. Arm order is the
+// original's; each arm names what it answers for. The original returns a
+// built String; this appends the same bytes at pos and returns the new
+// length.
+// ---------------------------------------------------------------------------
+
+pub fn t27_type_to_rust(t27_type: str, out: []u8, pos: usize) -> usize {
+    // Optionality: a LEADING `?` (`?u64`) or a trailing one (`u64?`).
+    var base: str = trim_str(t27_type);
+    var is_optional: bool = false;
+    if (starts_with(base, "?")) {
+        base = trim_str(base[1 .. base.len]);
+        is_optional = true;
+    } else {
+        if (ends_with(base, "?")) {
+            base = trim_str(base[0 .. base.len - 1]);
+            is_optional = true;
+        }
+    }
+
+    var n: usize = pos;
+    if (is_optional) {
+        n = buf_write(out, n, "Option<");
+    }
+    n = write_rust_base(base, out, n);
+    if (is_optional) {
+        n = buf_write(out, n, ">");
+    }
+    return n;
+}
+
+// The original's match on base_type, arm by arm.
+fn write_rust_base(base: str, out: []u8, pos: usize) -> usize {
+    // std.StringHashMap(V): arity exactly 1; the key type is whatever
+    // this mapper answers for `[]const u8`.
+    if (starts_with(base, "std.StringHashMap(") and ends_with(base, ")")) {
+        const inner = base[18 .. base.len - 1];
+        const args = split_type_list(inner);
+        if (args != null) {
+            const a = args.?;
+            if (a.count == 1) {
+                var n: usize = buf_write(out, pos, "std::collections::HashMap<");
+                n = t27_type_to_rust("[]const u8", out, n);
+                n = buf_write(out, n, ", ");
+                n = t27_type_to_rust(trim_str(a.items[0]), out, n);
+                return buf_write(out, n, ">");
+            }
+        }
+    }
+    // std.HashMap(K, V): arity exactly 2.
+    if (starts_with(base, "std.HashMap(") and ends_with(base, ")")) {
+        const inner = base[12 .. base.len - 1];
+        const args = split_type_list(inner);
+        if (args != null) {
+            const a = args.?;
+            if (a.count == 2) {
+                var n: usize = buf_write(out, pos, "std::collections::HashMap<");
+                n = t27_type_to_rust(trim_str(a.items[0]), out, n);
+                n = buf_write(out, n, ", ");
+                n = t27_type_to_rust(trim_str(a.items[1]), out, n);
+                return buf_write(out, n, ">");
+            }
+        }
+    }
+
+    // A tuple maps element by element; malformed inside is left as written.
+    if (base.len > 2 and base[0] == '(' and base[base.len - 1] == ')') {
+        const inner = base[1 .. base.len - 1];
+        const args = split_type_list(inner);
+        if (args == null) {
+            return buf_write(out, pos, base);
+        }
+        const a = args.?;
+        var n: usize = buf_write(out, pos, "(");
+        var i: u8 = 0;
+        while (i < a.count) {
+            if (i > 0) {
+                n = buf_write(out, n, ", ");
+            }
+            n = t27_type_to_rust(trim_str(a.items[i]), out, n);
+            i += 1;
+        }
+        return buf_write(out, n, ")");
+    }
+
+    // The scalar table.
+    if (str_eq(base, "u8") or str_eq(base, "u16") or str_eq(base, "u32") or str_eq(base, "u64") or str_eq(base, "u128")) {
+        return buf_write(out, pos, base);
+    }
+    if (str_eq(base, "i8") or str_eq(base, "i16") or str_eq(base, "i32") or str_eq(base, "i64") or str_eq(base, "i128")) {
+        return buf_write(out, pos, base);
+    }
+    if (str_eq(base, "f32") or str_eq(base, "f64")) {
+        return buf_write(out, pos, base);
+    }
+    if (str_eq(base, "int")) {
+        return buf_write(out, pos, "i32");
+    }
+    if (str_eq(base, "uint")) {
+        return buf_write(out, pos, "u32");
+    }
+    if (str_eq(base, "float") or str_eq(base, "double")) {
+        return buf_write(out, pos, "f64");
+    }
+    if (str_eq(base, "GF16") or str_eq(base, "gf16")) {
+        return buf_write(out, pos, "u16");
+    }
+    if (str_eq(base, "bool")) {
+        return buf_write(out, pos, "bool");
+    }
+    // Both spellings of text, and the borrowed-bytes spelling, are the
+    // borrowed Rust form -- never an owned String.
+    if (str_eq(base, "str") or str_eq(base, "string") or str_eq(base, "[]const u8")) {
+        return buf_write(out, pos, "&'static str");
+    }
+    if (str_eq(base, "void")) {
+        return buf_write(out, pos, "()");
+    }
+
+    // `[]T`: the `const` qualifies the pointee and is dropped; the element
+    // maps recursively. `[]const u8` already answered above.
+    if (base.len >= 2 and base[0] == '[' and base[1] == ']') {
+        var inner = trim_start_str(base[2 .. base.len]);
+        if (starts_with(inner, "const ")) {
+            inner = inner[6 .. inner.len];
+        }
+        var n: usize = buf_write(out, pos, "Vec<");
+        n = t27_type_to_rust(inner, out, n);
+        return buf_write(out, n, ">");
+    }
+
+    // `[T; N]` (element first): digits stay, a named size is cast.
+    if (base.len >= 2 and base[0] == '[' and base[base.len - 1] == ']' and contains_byte(base[1 .. base.len], ';')) {
+        const body = base[1 .. base.len - 1];
+        const semi = find_byte(body, ';').?;
+        const elem = trim_str(body[0 .. semi]);
+        const len_str = trim_str(body[semi + 1 .. body.len]);
+        var n: usize = buf_write(out, pos, "[");
+        n = t27_type_to_rust(elem, out, n);
+        n = buf_write(out, n, "; ");
+        n = buf_write(out, n, len_str);
+        if (all_digits(len_str) == false) {
+            n = buf_write(out, n, " as usize");
+        }
+        return buf_write(out, n, "]");
+    }
+
+    // The remaining bracket forms share one shape and the element type
+    // sits on different sides of the bracket.
+    if (base.len >= 2 and base[0] == '[' and contains_byte(base, ']')) {
+        const end = rfind_byte(base, ']').?;
+        const inside = base[1 .. end];
+        const semi = find_byte(inside, ';');
+        if (semi != null) {
+            const s = semi.?;
+            const elem = trim_str(inside[0 .. s]);
+            const size = trim_str(inside[s + 1 .. inside.len]);
+            var n: usize = buf_write(out, pos, "[");
+            n = t27_type_to_rust(elem, out, n);
+            n = buf_write(out, n, "; ");
+            n = buf_write(out, n, size);
+            return buf_write(out, buf_write(out, n, " as usize"), "]");
+        }
+        const after = base[end + 1 .. base.len];
+        if (trim_str(after).len == 0) {
+            // t27's own `[T]`: element inside, no size -- a growable Vec.
+            var n: usize = buf_write(out, pos, "Vec<");
+            n = t27_type_to_rust(inside, out, n);
+            return buf_write(out, n, ">");
+        }
+        if (trim_str(inside).len == 0) {
+            // `[]T` -- also unsized (unreachable past the `[]T` arm above,
+            // carried for the original's shape).
+            var n: usize = buf_write(out, pos, "Vec<");
+            n = t27_type_to_rust(after, out, n);
+            return buf_write(out, n, ">");
+        }
+        // Zig-style `[N]T`: the size is inside the brackets. Not everything
+        // inside is a size: only digits or a plain identifier qualify;
+        // anything else lowers unsized (return_unsized of the element).
+        const size = trim_str(inside);
+        const sized = all_digits(size) or all_ident_bytes(size);
+        if (sized == false) {
+            var n: usize = buf_write(out, pos, "Vec<");
+            n = t27_type_to_rust(after, out, n);
+            return buf_write(out, n, ">");
+        }
+        var n: usize = buf_write(out, pos, "[");
+        n = t27_type_to_rust(after, out, n);
+        n = buf_write(out, n, "; ");
+        n = buf_write(out, n, size);
+        if (all_digits(size) == false) {
+            n = buf_write(out, n, " as usize");
+        }
+        return buf_write(out, n, "]");
+    }
+
+    // Pointers: `*const T` and `*mut T` pass through with their qualifier;
+    // a bare `*T` is mutable.
+    if (base.len >= 1 and base[0] == '*') {
+        const rest = trim_start_str(base[1 .. base.len]);
+        if (starts_with(rest, "const ")) {
+            const n: usize = buf_write(out, pos, "*const ");
+            return t27_type_to_rust(rest[6 .. rest.len], out, n);
+        }
+        if (starts_with(rest, "mut ")) {
+            const n: usize = buf_write(out, pos, "*mut ");
+            return t27_type_to_rust(rest[4 .. rest.len], out, n);
+        }
+        const n: usize = buf_write(out, pos, "*mut ");
+        return t27_type_to_rust(rest, out, n);
+    }
+
+    // A call-style generic use keeps the head and angle-brackets the args.
+    if (base.len >= 2 and base[base.len - 1] == ')') {
+        const open_opt = find_byte(base, '(');
+        if (open_opt != null) {
+            const open = open_opt.?;
+            if (open > 0) {
+                const head = base[0 .. open];
+                if (all_ident_bytes(head)) {
+                    const args_raw = base[open + 1 .. base.len - 1];
+                    const args = split_commas(args_raw);
+                    var n: usize = buf_write(out, pos, head);
+                    n = buf_write(out, n, "<");
+                    var i: u8 = 0;
+                    while (i < args.count) {
+                        if (i > 0) {
+                            n = buf_write(out, n, ", ");
+                        }
+                        n = t27_type_to_rust(trim_str(args.items[i]), out, n);
+                        i += 1;
+                    }
+                    return buf_write(out, n, ">");
+                }
+            }
+        }
+    }
+
+    // A dotted foreign type has no Rust spelling: void*.
+    if (contains_byte(base, '.')) {
+        return buf_write(out, pos, "*mut ()");
+    }
+
+    // Custom type name: verbatim.
+    return buf_write(out, pos, base);
+}
+
+/// The original's depth-aware split: commas at depth zero separate parts;
+/// `<[(` open, `>])` close; a negative or unbalanced depth, or any empty
+/// part, answers null.
+fn split_type_list(inner: str) -> ?Parts {
+    var items: [4]str = .{ "", "", "", "" };
+    var count: u8 = 0;
+    var depth: i32 = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) {
+        const c = inner[i];
+        if (c == '<' or c == '[' or c == '(') {
+            depth += 1;
+        } else {
+            if (c == '>' or c == ']' or c == ')') {
+                depth -= 1;
+                if (depth < 0) {
+                    return null;
+                }
+            } else {
+                if (c == ',' and depth == 0) {
+                    if (count >= 4) {
+                        return null;
+                    }
+                    items[count] = inner[start .. i];
+                    count += 1;
+                    start = i + 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    if (depth != 0) {
+        return null;
+    }
+    if (count >= 4) {
+        return null;
+    }
+    items[count] = inner[start .. inner.len];
+    count += 1;
+    var j: u8 = 0;
+    while (j < count) {
+        if (trim_str(items[j]).len == 0) {
+            return null;
+        }
+        j += 1;
+    }
+    return Parts{ .items = items, .count = count };
+}
+
+/// The call-style arm's plain split(','): no depth awareness, which is
+/// what that arm of the original does.
+fn split_commas(inner: str) -> Parts {
+    var items: [4]str = .{ "", "", "", "" };
+    var count: u8 = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) {
+        if (inner[i] == ',') {
+            if (count >= 4) {
+                return Parts{ .items = items, .count = 5 };
+            }
+            items[count] = inner[start .. i];
+            count += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    items[count] = inner[start .. inner.len];
+    count += 1;
+    return Parts{ .items = items, .count = count };
+}
+
+// ---------------------------------------------------------------------------
+// Text and render helpers.
+// ---------------------------------------------------------------------------
+
+/// Appends src to out at pos (truncating at out.len, as the compiler's
+/// own buffer writers do) and returns the new length.
+fn buf_write(out: []u8, pos: usize, src: str) -> usize {
+    var w: usize = pos;
+    var r: usize = 0;
+    while (r < src.len and w < out.len) {
+        out[w] = src[r];
+        w += 1;
+        r += 1;
+    }
+    return w;
+}
+
+/// buf[from..to] == expect, without building a slice of a slice.
+fn span_eq(buf: []const u8, from: usize, to: usize, expect: str) -> bool {
+    if (to - from != expect.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (from + i < to) {
+        if (buf[from + i] != expect[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Not the byte loop gen_w367's slices_equal already owns: equal lengths
+// plus the shared span compare answer the same question.
+fn str_eq(a: str, b: str) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    return span_eq(a, 0, b.len, b);
+}
+
+fn is_space(b: u8) -> bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r';
+}
+
+fn trim_str(s: str) -> str {
+    var lo: usize = 0;
+    var hi: usize = s.len;
+    while (lo < hi and is_space(s[lo])) {
+        lo += 1;
+    }
+    while (hi > lo and is_space(s[hi - 1])) {
+        hi -= 1;
+    }
+    return s[lo .. hi];
+}
+
+fn trim_start_str(s: str) -> str {
+    var lo: usize = 0;
+    while (lo < s.len and is_space(s[lo])) {
+        lo += 1;
+    }
+    return s[lo .. s.len];
+}
+
+// Same shape as str_eq: a length guard then the shared span compare --
+// not the prefix loop the trios-bridge port already owns.
+fn starts_with(s: str, prefix: str) -> bool {
+    if (prefix.len > s.len) {
+        return false;
+    }
+    return span_eq(s, 0, prefix.len, prefix);
+}
+
+fn ends_with(s: str, suffix: str) -> bool {
+    if (suffix.len > s.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < suffix.len) {
+        if (s[s.len - suffix.len + i] != suffix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn contains_byte(s: str, b: u8) -> bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == b) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn find_byte(s: str, b: u8) -> ?usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == b) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn rfind_byte(s: str, b: u8) -> ?usize {
+    var i: usize = s.len;
+    while (i > 0) {
+        i -= 1;
+        if (s[i] == b) {
+            return i;
+        }
+    }
+    return null;
+}
+
+fn all_digits(s: str) -> bool {
+    if (s.len == 0) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] < '0' or s[i] > '9') {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn all_ident_bytes(s: str) -> bool {
+    if (s.len == 0) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < s.len) {
+        if (is_ident_byte(s[i]) == false) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Constructors and lookups the tests use.
+// ---------------------------------------------------------------------------
+
+fn n_struct(name: str, p0: str, p1: str, p2: str, p3: str, pc: u8) -> Node {
+    return Node{
+        .kind = NodeKind::StructDecl,
+        .name = name,
+        .extra_type = "",
+        .params = .{ p0, p1, p2, p3 },
+        .params_count = pc,
+    };
+}
+
+fn n_const(name: str, ty: str) -> Node {
+    return Node{
+        .kind = NodeKind::ConstDecl,
+        .name = name,
+        .extra_type = ty,
+        .params = .{ "", "", "", "" },
+        .params_count = 0,
+    };
+}
+
+fn n_local(name: str, ty: str) -> Node {
+    return Node{
+        .kind = NodeKind::StmtLocal,
+        .name = name,
+        .extra_type = ty,
+        .params = .{ "", "", "", "" },
+        .params_count = 0,
+    };
+}
+
+fn empty_decls() -> [8]DeclEntry {
+    return .{
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+        DeclEntry{ .name = "", .params = Parts{ .items = .{ "", "", "", "" }, .count = 0 } },
+    };
+}
+
+fn empty_map() -> [8]TypeEntry {
+    return .{
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+        TypeEntry{ .name = "", .from = 0, .to = 0 },
+    };
+}
+
+fn set_has(set: NameSet, n: str) -> bool {
+    var j: u8 = 0;
+    while (j < set.count) {
+        if (str_eq(set.names[j], n)) {
+            return true;
+        }
+        j += 1;
+    }
+    return false;
+}
+
+fn map_has(map: TypeMap, n: str) -> bool {
+    var j: u8 = 0;
+    while (j < map.count) {
+        if (str_eq(map.entries[j].name, n)) {
+            return true;
+        }
+        j += 1;
+    }
+    return false;
+}
+
+/// The mapped type stored under `name` spells `expect` in the render
+/// buffer the map's spans point into.
+fn map_type_is(map: TypeMap, buf: []const u8, name: str, expect: str) -> bool {
+    var j: u8 = 0;
+    while (j < map.count) {
+        if (str_eq(map.entries[j].name, name)) {
+            return span_eq(buf, map.entries[j].from, map.entries[j].to, expect);
+        }
+        j += 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Tests. Each asserts what the original does for the inputs chosen.
+// ---------------------------------------------------------------------------
+
+test return_unsized_wraps_any_element {
+    var buf: [64]u8 = undefined;
+    var n: usize = return_unsized("u8", &buf);
+    assert(n == 7);
+    assert(span_eq(&buf, 0, n, "Vec<u8>"));
+    n = return_unsized("gf16", &buf);
+    assert(span_eq(&buf, 0, n, "Vec<gf16>"));
+    n = return_unsized("MyType", &buf);
+    assert(span_eq(&buf, 0, n, "Vec<MyType>"));
+    n = return_unsized("", &buf);
+    assert(span_eq(&buf, 0, n, "Vec<>"));
+}
+
+test is_ident_byte_is_alnum_or_underscore {
+    assert(is_ident_byte('a'));
+    assert(is_ident_byte('Z'));
+    assert(is_ident_byte('0'));
+    assert(is_ident_byte('_'));
+    assert(is_ident_byte('-') == false);
+    assert(is_ident_byte('<') == false);
+    assert(is_ident_byte(' ') == false);
+}
+
+test mentions_type_needs_a_whole_identifier {
+    // `T` occurs inside Trit -- and is NOT mentioned by it
+    assert(mentions_type("Vec<T>", "T"));
+    assert(mentions_type("Trit", "T") == false);
+    assert(mentions_type("TritCell", "Trit") == false);
+    assert(mentions_type("Vec<Trit>", "Trit"));
+    assert(mentions_type("T x T", "T"));
+    // a needle longer than the haystack answers false, not an underflow
+    assert(mentions_type("ab", "abc") == false);
+}
+
+test generic_struct_decls_keeps_only_named_generics_in_order {
+    var nodes: [5]Node = .{
+        n_struct("Map", " K ", "V", "", "", 2),
+        n_struct("Point", "", "", "", "", 0),
+        n_struct("", "K", "", "", "", 1),
+        n_struct("Pair", "A", " ", "", "", 2),
+        n_struct("Box", "K", "V", "", "", 2),
+    };
+    const decls = generic_struct_decls(&nodes);
+    // Point has no params, the empty name is skipped, Pair's blank params
+    // drop away and its one trimmed param survives
+    assert(decls.count == 3);
+    assert(decls.entries[0].name == "Map");
+    assert(decls.entries[0].params.count == 2);
+    assert(decls.entries[0].params.items[0] == "K");
+    assert(decls.entries[0].params.items[1] == "V");
+    assert(decls.entries[1].name == "Pair");
+    assert(decls.entries[1].params.count == 1);
+    assert(decls.entries[1].params.items[0] == "A");
+    assert(decls.entries[2].name == "Box");
+}
+
+test collect_type_params_dedups_trimmed_params {
+    var nodes: [3]Node = .{
+        n_struct("Map", " K ", "V", "", "", 2),
+        n_struct("Box", "K", "V", "", "", 2),
+        n_struct("Pair", " ", "", "A", "", 3),
+    };
+    const params = collect_type_params(&nodes);
+    assert(params.count == 3);
+    assert(set_has(params, "K"));
+    assert(set_has(params, "V"));
+    assert(set_has(params, "A"));
+}
+
+test collect_bool_module_vars_matches_bool_after_trim {
+    var nodes: [5]Node = .{
+        n_const("flag", "bool"),
+        n_const("padded", " bool "),
+        n_const("width", "u32"),
+        n_local("tmp", "bool"),
+        n_const("name", "boolean"),
+    };
+    const vars = collect_bool_module_vars(&nodes);
+    // a StmtLocal is not a module var, and "boolean" is not "bool"
+    assert(vars.count == 2);
+    assert(set_has(vars, "flag"));
+    assert(set_has(vars, "padded"));
+    assert(set_has(vars, "width") == false);
+}
+
+test collect_const_types_maps_and_overwrites {
+    var nodes: [6]Node = .{
+        n_const("HEADER", "str"),
+        n_const("maybe", "?u64"),
+        n_const("count", "int"),
+        n_const("", "u8"),
+        n_const("empty", "   "),
+        n_const("count", "f32"),
+    };
+    var render: [128]u8 = undefined;
+    const types = collect_const_types(&nodes, &render);
+    // the nameless and the typeless are skipped; the second `count`
+    // overwrites the first, HashMap insert semantics
+    assert(types.count == 3);
+    assert(map_type_is(types, &render, "HEADER", "&'static str"));
+    assert(map_type_is(types, &render, "maybe", "Option<u64>"));
+    assert(map_type_is(types, &render, "count", "f32"));
+    assert(map_has(types, "empty") == false);
+}
+
+test collect_typed_locals_keeps_only_typed_locals {
+    var nodes: [5]Node = .{
+        n_local("buf", "[]const u8"),
+        n_local("ratio", "f64"),
+        n_local("no_type", ""),
+        n_local("blank", "  "),
+        n_const("c", "str"),
+    };
+    var render: [128]u8 = undefined;
+    const locals = collect_typed_locals(&nodes, &render);
+    // a ConstDecl is not a local, whatever its type
+    assert(locals.count == 2);
+    assert(map_type_is(locals, &render, "buf", "&'static str"));
+    assert(map_type_is(locals, &render, "ratio", "f64"));
+    assert(map_has(locals, "c") == false);
+}
+
+test t27_type_to_rust_scalar_table {
+    var buf: [128]u8 = undefined;
+    var n: usize = t27_type_to_rust("str", &buf, 0);
+    assert(span_eq(&buf, 0, n, "&'static str"));
+    n = t27_type_to_rust("string", &buf, 0);
+    assert(span_eq(&buf, 0, n, "&'static str"));
+    n = t27_type_to_rust("int", &buf, 0);
+    assert(span_eq(&buf, 0, n, "i32"));
+    n = t27_type_to_rust("uint", &buf, 0);
+    assert(span_eq(&buf, 0, n, "u32"));
+    n = t27_type_to_rust("float", &buf, 0);
+    assert(span_eq(&buf, 0, n, "f64"));
+    n = t27_type_to_rust("double", &buf, 0);
+    assert(span_eq(&buf, 0, n, "f64"));
+    n = t27_type_to_rust("gf16", &buf, 0);
+    assert(span_eq(&buf, 0, n, "u16"));
+    n = t27_type_to_rust("GF16", &buf, 0);
+    assert(span_eq(&buf, 0, n, "u16"));
+    n = t27_type_to_rust("void", &buf, 0);
+    assert(span_eq(&buf, 0, n, "()"));
+    n = t27_type_to_rust("MyType", &buf, 0);
+    assert(span_eq(&buf, 0, n, "MyType"));
+    n = t27_type_to_rust(" u32 ", &buf, 0);
+    assert(span_eq(&buf, 0, n, "u32"));
+}
+
+test t27_type_to_rust_containers_slices_and_optionals {
+    var buf: [128]u8 = undefined;
+    var n: usize = t27_type_to_rust("?u64", &buf, 0);
+    assert(span_eq(&buf, 0, n, "Option<u64>"));
+    n = t27_type_to_rust("u64?", &buf, 0);
+    assert(span_eq(&buf, 0, n, "Option<u64>"));
+    n = t27_type_to_rust("[]f32", &buf, 0);
+    assert(span_eq(&buf, 0, n, "Vec<f32>"));
+    n = t27_type_to_rust("[]const u8", &buf, 0);
+    assert(span_eq(&buf, 0, n, "&'static str"));
+    n = t27_type_to_rust("[]const Issue", &buf, 0);
+    assert(span_eq(&buf, 0, n, "Vec<Issue>"));
+    n = t27_type_to_rust("[4]u8", &buf, 0);
+    assert(span_eq(&buf, 0, n, "[u8; 4]"));
+    n = t27_type_to_rust("[N]u8", &buf, 0);
+    assert(span_eq(&buf, 0, n, "[u8; N as usize]"));
+    n = t27_type_to_rust("[T; 3]", &buf, 0);
+    assert(span_eq(&buf, 0, n, "[T; 3]"));
+    n = t27_type_to_rust("(u8, str)", &buf, 0);
+    assert(span_eq(&buf, 0, n, "(u8, &'static str)"));
+    n = t27_type_to_rust("*const u8", &buf, 0);
+    assert(span_eq(&buf, 0, n, "*const u8"));
+    n = t27_type_to_rust("*Node", &buf, 0);
+    assert(span_eq(&buf, 0, n, "*mut Node"));
+    n = t27_type_to_rust("std.StringHashMap(u32)", &buf, 0);
+    assert(span_eq(&buf, 0, n, "std::collections::HashMap<&'static str, u32>"));
+    n = t27_type_to_rust("std.HashMap([]const u8, i32)", &buf, 0);
+    assert(span_eq(&buf, 0, n, "std::collections::HashMap<&'static str, i32>"));
+    n = t27_type_to_rust("Box(K, V)", &buf, 0);
+    assert(span_eq(&buf, 0, n, "Box<K, V>"));
+    n = t27_type_to_rust("std.mem.Allocator", &buf, 0);
+    assert(span_eq(&buf, 0, n, "*mut ()"));
+}
