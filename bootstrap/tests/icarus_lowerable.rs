@@ -7578,14 +7578,21 @@ fn lowerability_models_keep_real_source_signatures() {
     for (module, source, signatures) in [
         ("nn_phi_rope", "specs/nn/phi_rope.t27", vec![
             ("pub fn phi_rope_theta(i: usize, dim: usize) -> f64", r#"{ name := "phi_rope_theta", params := [("i", (.struct "usize")), ("dim", (.struct "usize"))], ret := (some (.struct "f64")), body := [] }"#),
-            ("pub fn phi_rope_rotate(x: Vec<f64>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
+            ("pub fn phi_rope_rotate(x: impl AsRef<[f64]>, x_rotated: &mut [f64], seq: usize, dim: usize, position: i64) -> ()", r#"{ name := "phi_rope_rotate", params := [("x", (.struct "[]const f64")), ("x_rotated", (.struct "[]f64")), ("seq", (.struct "usize")), ("dim", (.struct "usize")), ("position", .i64)], ret := none, body := [] }"#),
         ]),
         ("nn_sacred_attention", "specs/nn/sacred_attention.t27", vec![
             ("pub fn sacred_scale() -> f64", r#"{ name := "sacred_scale", params := [], ret := (some (.struct "f64")), body := [] }"#),
         ]),
         ("ar_asp_solver", "specs/ar/asp_solver.t27", vec![
-            ("pub struct Program { pub clauses: Vec<Clause>, pub constraints: Vec<Clause>, }", r#"structs := [("Program", [("clauses", (.struct "[Clause]")), ("constraints", (.struct "[Clause]"))])]"#),
-            ("pub fn solve(prog: Program) -> Vec<AnswerSet>", r#"{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "[AnswerSet]")), body := [] }"#),
+            ("pub struct Program { pub clauses: [Clause; MAX_CLAUSES as usize], pub nclauses: u32, pub constraints: [Clause; MAX_CLAUSES as usize], pub nconstraints: u32, }", r#"("Program", [("clauses", (.array 16 (.struct "Clause"))), ("nclauses", .u32), ("constraints", (.array 16 (.struct "Clause"))), ("nconstraints", .u32)])"#),
+            ("pub fn solve(prog: Program) -> SolveResult", r#"{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "SolveResult")), body := [] }"#),
+        ]),
+        // #6658: the model was empty and proved the empty module lowerable.
+        ("ar_ternary_logic", "specs/ar/ternary_logic.t27", vec![
+            ("pub fn k3_and(a: i8, b: i8) -> i8", r#"{ name := "k3_and", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }"#),
+            ("pub fn backward_chain(goal: i8, rules: Vec<Rule>) -> i8", r#"{ name := "backward_chain", params := [("goal", .i8), ("rules", (.struct "[]const Rule"))], ret := (some .i8), body := [] }"#),
+            ("pub fn resolve(clause_a: impl AsRef<[i8]>, clause_b: impl AsRef<[i8]>) -> Vec<i8>", r#"{ name := "resolve", params := [("clause_a", (.struct "[]const i8")), ("clause_b", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }"#),
+            ("pub fn apply_restraint(values: impl AsRef<[i8]>) -> Vec<i8>", r#"{ name := "apply_restraint", params := [("values", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }"#),
         ]),
     ] {
         let output = Command::new(bin()).arg("gen-rust").arg(repo.join(source))
@@ -7834,10 +7841,11 @@ fn corpus_classifier_matches_lean_completeness() {
     // The floor guards against this test quietly checking nothing. Skipping the
     // prose files moved `checked` 245 -> 225, so the floor is held on the SUM:
     // a spec may move from checked to skipped when it turns out to be Markdown,
-    // but neither number may simply evaporate.
+    // but neither number may simply evaporate. #8054 deleted 22 empty generated stubs and #8222 their
+    // theorems, so the sum moved 245 -> 223 by deletion, not by a theorem going quiet; #8908 deleted 3 more, 220.
     assert!(
-        checked + skipped_prose >= 245,
-        "expected at least 245 corpus theorems reached, got {} checked + {} skipped as prose",
+        checked + skipped_prose >= 220,
+        "expected at least 220 corpus theorems reached, got {} checked + {} skipped as prose",
         checked,
         skipped_prose
     );

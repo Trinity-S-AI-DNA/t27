@@ -1,0 +1,1194 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/queen_board.t27 -- the live board of the Q page: see the Queen work and improve the system in GOD MODE
+; Owner, 2026-10-20: in GOD MODE we must SEE her working and improving the system live. Data model only (pure,
+; tested); the window draws it later. Everything on the page is a widget (nested rects, see LAYOUT). Closes #11275.
+; ASCII only (L3), English only (LANG-EN).
+; --
+; DRY: nothing is copied. Gaps, priority, why-not and the caps come from evolve.t27 (used); the ring and its
+; controls from queen.t27 (used); the lamp aggregates from domain_pulse.t27 (used); the counters of the meter from
+; agent_parts.t27 (used); the packer from dash.t27 (used, read only). Only genuinely new data lives here: the feed
+; kinds, the board rows, the meter's provenance and the page layout.
+; --
+; WHAT THE HOST MUST FEED (this file runs no command), and when:
+;   RING      the queen.t27 ring (8 u64 events), read from memory each frame; no command.
+;   LANE LOG  lines "sec QB_TAB kind QB_TAB letter QB_TAB text LF", kind = FK_* below (task opened, lane started, test
+;             verdict, landed); written by the host when a lane changes state; text is a profile name or a short
+;             sentence, NEVER a key (profile_ok refuses a key-looking text). Newest line last in the file.
+;   PANEL     the evolve.t27 Panel (masks), the in-flight mask, running, started_hour, risk mask+class: each time
+;             the panel refreshes (same cadence as the lamps).
+;   LAMPS     `git log --since=7.days --name-only --format=%x1e%H%x1f%ct%x1f%s` plus the red-path list, ONCE A
+;             MINUTE, only while the window is open (lamp_refresh_due). domain_pulse.t27 is used directly.
+;   METER     six counters at each refresh, commands in meter_cmd; the first refresh after LOCAL midnight is the
+;             "start of day" snapshot (snapshot_due).
+;   SAFETY    tasks this hour, agents running, god flag, and the key tier name as a TEXT ENUM from the keys lane
+;             (never a key, never a prefix of a key).
+
+module T27osQueenBoard;
+
+use tools::t27o::rust_std::alnum;
+use t27os::queen::ev_control;
+use t27os::queen::ev_arg;
+use t27os::queen::ev_sec;
+use t27os::queen::C_QUEEN_PICKED;
+use t27os::queen::C_QUEEN_STARTED;
+use t27os::queen::C_QUEEN_ASKED;
+use t27os::queen::C_QUEEN_OPENED;
+use t27os::queen::C_QUEEN_EDITED;
+use t27os::queen::C_GOD_ON;
+use t27os::queen::C_GOD_OFF;
+use t27os::queen::C_NONE;
+use t27os::queen::ring_len;
+use t27os::queen::ring_at;
+use t27os::queen::ring_next;
+use t27os::queen::ev_pack;
+use t27os::queen::VIEW_HOME;
+use t27os::evolve::Panel;
+use t27os::evolve::letter_bit;
+use t27os::evolve::mask_has;
+use t27os::evolve::why_not;
+use t27os::evolve::next_action;
+use t27os::evolve::touches_forbidden;
+use t27os::evolve::dec_kind;
+use t27os::evolve::dec_letter;
+use t27os::evolve::dec_action;
+use t27os::evolve::kind_phrase;
+use t27os::evolve::letter_char;
+use t27os::evolve::LETTERS;
+use t27os::evolve::LETTER_RED;
+use t27os::evolve::LETTER_UNOWNED;
+use t27os::evolve::G_RED;
+use t27os::evolve::G_BLOCKED;
+use t27os::evolve::G_STALE;
+use t27os::evolve::G_UNOWNED;
+use t27os::evolve::G_NO_INSTRUMENT;
+use t27os::evolve::G_NEVER_PINNED;
+use t27os::evolve::G_NO_WIDGET;
+use t27os::evolve::D_TASK;
+use t27os::evolve::D_REQUEST;
+use t27os::evolve::D_NONE;
+use t27os::evolve::R_OK;
+use t27os::evolve::R_GOD_OFF;
+use t27os::evolve::R_PANEL_CLOSED;
+use t27os::evolve::R_AGENT_CAP;
+use t27os::evolve::R_BUDGET;
+use t27os::agent_parts::letters_without_widgets;
+use t27os::dash::pack_cols;
+use t27os::dash::cell_w;
+use t27os::dash::dash_cell_x;
+use t27os::dash::dash_cell_y;
+use t27os::dash::pack_h;
+use t27os::dash::pack_at;
+use t27os::dash::clampf;
+
+pub const QB_NL : u32 = 10;
+pub const QB_TAB : u32 = 9;
+pub const QB_NOT_MEASURED : u32 = 4294967295;
+
+fn fl(x: u32) -> f64 { return @as(f64, @floatFromInt(x)); }
+
+pub fn digits(n: u32) -> u32 {
+    var d : u32 = 1;
+    var v : u32 = n;
+    while (v >= 10) { v = v / 10; d = d + 1; }
+    return d;
+}
+
+// ================================================================ 1. FEED
+
+// kinds of a feed entry, in FEED_WORDS order
+pub const FK_NONE : u32 = 0;
+pub const FK_PICKED : u32 = 1;
+pub const FK_TASK : u32 = 2;
+pub const FK_LANE : u32 = 3;
+pub const FK_PASS : u32 = 4;
+pub const FK_FAIL : u32 = 5;
+pub const FK_LANDED : u32 = 6;
+pub const FK_ASKED : u32 = 7;
+pub const FK_GOD : u32 = 8;
+pub const FK_WORKED : u32 = 9;
+pub const FK_COUNT : u32 = 10;
+pub const FEED_WORDS : str = "-,picked a gap,opened a task,started a lane,tests passed,tests failed,landed,asked the owner,GOD MODE,worked";
+pub const FEED_TEXT_MAX : u32 = 56;
+pub const QB_SRC_RING : u32 = 0;
+pub const QB_SRC_LANE : u32 = 1;
+pub const QB_SRC_NONE : u32 = 2;
+
+/// The feed kind of a ring control; FK_NONE for the user's own actions (the feed is hers only).
+pub fn feed_kind_of_control(c: u32) -> u32 {
+    if (c == C_QUEEN_PICKED) { return FK_PICKED; }
+    if (c == C_QUEEN_STARTED) { return FK_LANE; }
+    if (c == C_QUEEN_ASKED) { return FK_ASKED; }
+    if (c == C_GOD_ON or c == C_GOD_OFF) { return FK_GOD; }
+    if (c == C_QUEEN_OPENED or c == C_QUEEN_EDITED) { return FK_WORKED; }
+    return FK_NONE;
+}
+
+/// The letter of a ring event: the argument for her lane and her request (evolve.log_event), else 0.
+pub fn feed_letter_of_event(e: u64) -> u32 {
+    const c : u32 = ev_control(e);
+    if (c == C_QUEEN_STARTED or c == C_QUEEN_ASKED) { return ev_arg(e); }
+    return 0;
+}
+
+/// Fixed text of a ring entry (the ring carries no text), counted: head + letter_char.
+pub fn ring_text_head(kind: u32) -> string {
+    if (kind == FK_PICKED) { return "picked a gap"; }
+    if (kind == FK_LANE) { return "started a lane for letter "; }
+    if (kind == FK_ASKED) { return "asked the owner about letter "; }
+    if (kind == FK_GOD) { return "GOD MODE switched"; }
+    if (kind == FK_WORKED) { return "worked in the editor"; }
+    return "-";
+}
+
+pub fn ring_text_len(kind: u32, letter: u32) -> u32 {
+    var n : u32 = ring_text_head(kind).len as u32;
+    if (letter != 0 and (kind == FK_LANE or kind == FK_ASKED)) { n = n + (letter_char(letter).len as u32); }
+    return n;
+}
+
+/// Newest first merge of the two sources: QB_SRC_RING or QB_SRC_LANE for the newer next entry, QB_SRC_NONE when both ran
+/// out. A sec of 0 with `left == 0` means that source is empty. Ties go to the lane log (it is the more specific).
+pub fn merge_pick(ring_left: u32, ring_sec: u64, lane_left: u32, lane_sec: u64) -> u32 {
+    if (ring_left == 0 and lane_left == 0) { return QB_SRC_NONE; }
+    if (ring_left == 0) { return QB_SRC_LANE; }
+    if (lane_left == 0) { return QB_SRC_RING; }
+    if (ring_sec > lane_sec) { return QB_SRC_RING; }
+    return QB_SRC_LANE;
+}
+
+/// Length of the shown text (counted) and whether "..." follows.
+pub fn feed_text_len(len: u32) -> u32 {
+    if (len > FEED_TEXT_MAX) { return FEED_TEXT_MAX; }
+    return len;
+}
+pub fn feed_dots(len: u32) -> bool { return len > FEED_TEXT_MAX; }
+
+fn has_sub(t: string, p: string) -> bool {
+    const n : u32 = t.len as u32;
+    const m : u32 = p.len as u32;
+    if (m == 0 or n < m) { return false; }
+    var i : u32 = 0;
+    while (i + m <= n) {
+        var j : u32 = 0;
+        while (j < m) {
+            if ((t[i + j] as u32) != (p[j] as u32)) { break; }
+            j = j + 1;
+        }
+        if (j == m) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A text that looks like a key or a token: known prefixes, a "key=" form, or 32+ letters/digits in a row.
+pub fn looks_like_key(t: string) -> bool {
+    if (has_sub(t, "sk-") or has_sub(t, "gsk_") or has_sub(t, "ghp_") or has_sub(t, "github_pat_")) { return true; }
+    if (has_sub(t, "Bearer ") or has_sub(t, "api_key") or has_sub(t, "token=") or has_sub(t, "KEY=")) { return true; }
+    var run : u32 = 0;
+    var i : u32 = 0;
+    const n : u32 = t.len as u32;
+    while (i < n) {
+        if (alnum(t[i])) { run = run + 1; if (run >= 32) { return true; } } else { run = 0; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Only a profile name or a plain sentence enters the feed; the window shows the placeholder otherwise.
+pub fn profile_ok(t: string) -> bool { return looks_like_key(t) == false; }
+pub const KEY_PLACEHOLDER : string = "[profile hidden]";
+
+fn qb_line_end(log: string, p: u32) -> u32 {
+    const n : u32 = log.len as u32;
+    var q : u32 = p;
+    while (q < n) {
+        if ((log[q] as u32) == QB_NL) { break; }
+        q = q + 1;
+    }
+    return q;
+}
+
+/// End of the QB_TAB field that starts at p, bounded by the line end e.
+fn field_end(log: string, p: u32, e: u32) -> u32 {
+    var q : u32 = p;
+    while (q < e) {
+        if ((log[q] as u32) == QB_TAB) { break; }
+        q = q + 1;
+    }
+    return q;
+}
+
+fn num_in(log: string, a: u32, b: u32) -> u64 {
+    var v : u64 = 0;
+    var i : u32 = a;
+    while (i < b) {
+        const c : u32 = log[i] as u32;
+        if (c >= 48 and c <= 57) { v = v * 10 + @as(u64, c - 48); }
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Start offset of lane line k (0 = the newest = the last line), or QB_NOT_MEASURED when there is none.
+pub fn lane_line_start(log: string, k: u32) -> u32 {
+    const n : u32 = log.len as u32;
+    if (n == 0) { return QB_NOT_MEASURED; }
+    var end : u32 = n;
+    if ((log[n - 1] as u32) == QB_NL) { end = n - 1; }
+    var left : u32 = k;
+    while (true) {
+        var s : u32 = end;
+        while (s > 0) {
+            if ((log[s - 1] as u32) == QB_NL) { break; }
+            s = s - 1;
+        }
+        if (s == end) { return QB_NOT_MEASURED; }
+        if (left == 0) { return s; }
+        if (s == 0) { return QB_NOT_MEASURED; }
+        left = left - 1;
+        end = s - 1;
+    }
+    return QB_NOT_MEASURED;
+}
+
+pub fn lane_lines(log: string) -> u32 {
+    var k : u32 = 0;
+    while (lane_line_start(log, k) != QB_NOT_MEASURED) { k = k + 1; if (k > 4096) { break; } }
+    return k;
+}
+
+pub fn lane_sec(log: string, s: u32) -> u64 { return num_in(log, s, field_end(log, s, qb_line_end(log, s))); }
+
+pub fn lane_kind(log: string, s: u32) -> u32 {
+    const e : u32 = qb_line_end(log, s);
+    const a : u32 = field_end(log, s, e) + 1;
+    return num_in(log, a, field_end(log, a, e)) as u32;
+}
+
+pub fn lane_letter(log: string, s: u32) -> u32 {
+    const e : u32 = qb_line_end(log, s);
+    const a : u32 = field_end(log, s, e) + 1;
+    const b : u32 = field_end(log, a, e) + 1;
+    return num_in(log, b, field_end(log, b, e)) as u32;
+}
+
+/// Start of the text field and its length; the text is the rest of the line after the third QB_TAB.
+pub fn lane_text_start(log: string, s: u32) -> u32 {
+    const e : u32 = qb_line_end(log, s);
+    const a : u32 = field_end(log, s, e) + 1;
+    const b : u32 = field_end(log, a, e) + 1;
+    return field_end(log, b, e) + 1;
+}
+
+pub fn lane_text_len(log: string, s: u32) -> u32 {
+    const e : u32 = qb_line_end(log, s);
+    const t : u32 = lane_text_start(log, s);
+    if (t >= e) { return 0; }
+    return e - t;
+}
+
+/// A lane text is shown only when it carries no key; the length shown otherwise is the placeholder's.
+pub fn lane_text_shown_len(log: string, s: u32) -> u32 {
+    const t : u32 = lane_text_start(log, s);
+    const n : u32 = lane_text_len(log, s);
+    var i : u32 = 0;
+    var run : u32 = 0;
+    var bad : bool = false;
+    while (i < n) {
+        if (alnum(log[t + i])) { run = run + 1; if (run >= 32) { bad = true; } } else { run = 0; }
+        i = i + 1;
+    }
+    if (bad) { return KEY_PLACEHOLDER.len as u32; }
+    return feed_text_len(n);
+}
+
+// ================================================================ 2. GAPS BOARD
+
+pub const GAP_ROWS : u32 = 10;
+pub const P_CRIT : u32 = 0;
+pub const P_HIGH : u32 = 1;
+pub const P_MED : u32 = 2;
+pub const P_LOW : u32 = 3;
+pub const CLASS_WORDS : str = "P0,P1,P2,P3";
+
+// why a row is or is not started now
+pub const WN_NEXT : u32 = 0;
+pub const WN_QUEUED : u32 = 1;
+pub const WN_INFLIGHT : u32 = 2;
+pub const WN_GOD_OFF : u32 = 3;
+pub const WN_PANEL : u32 = 4;
+pub const WN_CAP : u32 = 5;
+pub const WN_BUDGET : u32 = 6;
+pub const WN_OWNER : u32 = 7;
+pub const WN_COUNT : u32 = 8;
+pub const WN_WORDS : str = "next,queued,in flight,GOD MODE off,panel closed,agent cap 3,budget per hour,owner request";
+
+pub fn class_of_kind(kind: u32) -> u32 {
+    if (kind == G_RED) { return P_CRIT; }
+    if (kind == G_BLOCKED) { return P_HIGH; }
+    if (kind == G_STALE or kind == G_UNOWNED) { return P_MED; }
+    return P_LOW;
+}
+
+/// The letters that have a gap of this kind (evolve.t27 gap_kind order).
+pub fn kind_mask(p: Panel, kind: u32) -> u32 {
+    if (kind == G_RED) { if (p.master_red) { return letter_bit(LETTER_RED); } return 0; }
+    if (kind == G_BLOCKED) { return p.blocked; }
+    if (kind == G_STALE) { return p.stale; }
+    if (kind == G_UNOWNED) { if (p.unowned_count > 0) { return letter_bit(LETTER_UNOWNED); } return 0; }
+    if (kind == G_NO_INSTRUMENT) { return p.no_instrument; }
+    if (kind == G_NEVER_PINNED) { return p.never_pinned; }
+    if (kind == G_NO_WIDGET) { if (p.no_widget_count > 0) { return p.no_widget; } return 0; }
+    return 0;
+}
+
+pub fn popcount(m: u32) -> u32 {
+    var n : u32 = 0;
+    var l : u32 = 1;
+    while (l <= LETTERS) { if (mask_has(m, l)) { n = n + 1; } l = l + 1; }
+    return n;
+}
+
+/// The k-th set letter of a mask (0 = lowest), 0 when none.
+pub fn nth_letter(m: u32, k: u32) -> u32 {
+    var left : u32 = k;
+    var l : u32 = 1;
+    while (l <= LETTERS) {
+        if (mask_has(m, l)) {
+            if (left == 0) { return l; }
+            left = left - 1;
+        }
+        l = l + 1;
+    }
+    return 0;
+}
+
+/// The n-th gap, most urgent first: kind + 16 * letter, 0 when there is none. All gaps, in flight or not.
+pub fn nth_gap(p: Panel, n: u32) -> u32 {
+    var left : u32 = n;
+    var k : u32 = G_RED;
+    while (k <= G_NO_WIDGET) {
+        const m : u32 = kind_mask(p, k);
+        const c : u32 = popcount(m);
+        if (left < c) { return k + 16 * nth_letter(m, left); }
+        left = left - c;
+        k = k + 1;
+    }
+    return 0;
+}
+
+pub fn gap_kind_of(g: u32) -> u32 { return g % 16; }
+pub fn gap_letter_of(g: u32) -> u32 { return g / 16; }
+
+pub fn gap_total(p: Panel) -> u32 {
+    var n : u32 = 0;
+    var k : u32 = G_RED;
+    while (k <= G_NO_WIDGET) { n = n + popcount(kind_mask(p, k)); k = k + 1; }
+    return n;
+}
+
+/// Row shown on the board for the n-th gap: false past the end or past the top-10.
+pub fn row_exists(p: Panel, n: u32) -> bool {
+    if (n >= GAP_ROWS) { return false; }
+    return nth_gap(p, n) != 0;
+}
+
+/// Index of the first gap not in flight, i.e. the one next_action would take, or QB_NOT_MEASURED when none.
+pub fn next_index(p: Panel, inflight: u32) -> u32 {
+    var n : u32 = 0;
+    while (nth_gap(p, n) != 0) {
+        if (mask_has(inflight, gap_letter_of(nth_gap(p, n))) == false) { return n; }
+        n = n + 1;
+    }
+    return QB_NOT_MEASURED;
+}
+
+/// Why row n is not started now (WN_*), mirroring evolve.t27 exactly: the gates first, then in flight, then a
+/// forbidden class (an owner request, which needs no slot), then the caps, then next / queued.
+pub fn row_why(p: Panel, n: u32, inflight: u32, god: bool, panel_open: bool, running: u32, started_hour: u32, risk_mask: u32, risk_class: u32) -> u32 {
+    const g : u32 = nth_gap(p, n);
+    if (g == 0) { return WN_QUEUED; }
+    const letter : u32 = gap_letter_of(g);
+    const w : u32 = why_not(god, panel_open, running, started_hour);
+    if (w == R_GOD_OFF) { return WN_GOD_OFF; }
+    if (w == R_PANEL_CLOSED) { return WN_PANEL; }
+    if (mask_has(inflight, letter)) { return WN_INFLIGHT; }
+    if (mask_has(risk_mask, letter) and touches_forbidden(risk_class)) { return WN_OWNER; }
+    if (w == R_AGENT_CAP) { return WN_CAP; }
+    if (w == R_BUDGET) { return WN_BUDGET; }
+    if (n == next_index(p, inflight)) { return WN_NEXT; }
+    return WN_QUEUED;
+}
+
+/// Reason text of a row = kind_phrase of evolve; its counted length.
+pub fn row_reason_len(g: u32) -> u32 { return kind_phrase(gap_kind_of(g)).len as u32; }
+
+// ================================================================ 3. DOMAIN LAMPS LIVE
+
+pub const LAMP_COUNT : u32 = 27;
+pub const LAMP_PERIOD : u32 = 60;
+pub const LAMP_STALE_AFTER : u32 = 180;
+
+/// Refresh rule: at most once per 60 s and only while the window is open. last = 0 means never refreshed;
+/// a clock that went back refreshes at once.
+pub fn lamp_refresh_due(window_open: bool, now: u64, last: u64) -> bool {
+    if (window_open == false) { return false; }
+    if (last == 0) { return true; }
+    if (now < last) { return true; }
+    return now - last >= (LAMP_PERIOD as u64);
+}
+
+/// Seconds to the next refresh, 0 when due or the window is closed.
+pub fn lamp_next_in(window_open: bool, now: u64, last: u64) -> u32 {
+    if (lamp_refresh_due(window_open, now, last)) { return 0; }
+    if (window_open == false) { return 0; }
+    return (LAMP_PERIOD as u64 - (now - last)) as u32;
+}
+
+/// The strip's data went three periods without a refresh: the window dims it and says so.
+pub fn lamps_stale(now: u64, last: u64) -> bool {
+    if (last == 0 or now < last) { return false; }
+    return now - last >= (LAMP_STALE_AFTER as u64);
+}
+
+// domain_pulse.t27 cannot be `use`d here: it splices 27 agents::X::KEY_FILES modules and the splice drops the
+// constants of every other `use` (MAX_AGENTS "undeclared", measured 2026-10-20). So the host (glass_window, which
+// does link domain_pulse) feeds the PER-LETTER AGGREGATES, one line each, and this file decides nothing twice:
+//   "letter QB_TAB status QB_TAB commits24 QB_TAB guess LF"
+//   status  = domain_pulse.status_of(...) as 1 QUIET, 2 WARM, 3 ACTIVE, 4 BLOCKED (its ST_* values, unchanged)
+//   commits24 = domain_pulse.commits_24h; guess = 1 when domain_pulse.letter_label is GUESS (OPEN files exist)
+pub const LS_NONE : u32 = 0;
+pub const LS_QUIET : u32 = 1;
+pub const LS_WARM : u32 = 2;
+pub const LS_ACTIVE : u32 = 3;
+pub const LS_BLOCKED : u32 = 4;
+
+/// Start offset of the line of this letter in the aggregate text, or QB_NOT_MEASURED (the lamp is drawn dark).
+pub fn lamp_line(agg: string, letter: u32) -> u32 {
+    const n : u32 = agg.len as u32;
+    var s : u32 = 0;
+    while (s < n) {
+        const e : u32 = qb_line_end(agg, s);
+        if (num_in(agg, s, field_end(agg, s, e)) == (letter as u64)) { return s; }
+        s = e + 1;
+    }
+    return QB_NOT_MEASURED;
+}
+
+fn lamp_field(agg: string, letter: u32, k: u32) -> u64 {
+    const s : u32 = lamp_line(agg, letter);
+    if (s == QB_NOT_MEASURED) { return 0; }
+    const e : u32 = qb_line_end(agg, s);
+    var a : u32 = s;
+    var i : u32 = 0;
+    while (i < k) { a = field_end(agg, a, e) + 1; i = i + 1; }
+    return num_in(agg, a, field_end(agg, a, e));
+}
+
+pub fn lamp_status(agg: string, letter: u32) -> u32 {
+    if (lamp_line(agg, letter) == QB_NOT_MEASURED) { return LS_NONE; }
+    return lamp_field(agg, letter, 1) as u32;
+}
+pub fn lamp_commits(agg: string, letter: u32) -> u64 { return lamp_field(agg, letter, 2); }
+pub fn lamp_is_guess(agg: string, letter: u32) -> bool { return lamp_field(agg, letter, 3) != 0; }
+
+// ================================================================ 4. SELF-IMPROVEMENT METER
+
+pub const M_LINKS : u32 = 0;
+pub const M_TESTS : u32 = 1;
+pub const M_UNOWNED : u32 = 2;
+pub const M_NO_INSTRUMENT : u32 = 3;
+pub const M_UNASSIGNED : u32 = 4;
+pub const M_STALE : u32 = 5;
+pub const M_COUNT : u32 = 6;
+pub const M_LABELS : str = "links landed today,tests,unowned paths,letters with no instrument,unassigned widgets,stale seals";
+pub const M_UNITS : str = "links,tests,unowned,no instrument,unassigned,stale";
+
+/// Higher is better for links and tests; lower is better for the other four.
+pub fn m_up_is_good(m: u32) -> bool { return m == M_LINKS or m == M_TESTS; }
+
+/// Provenance: how the host measures it. Every number is MEASURED by this command, never typed.
+pub fn meter_cmd(m: u32) -> string {
+    if (m == M_LINKS) { return "git log master --since=midnight --grep='Closes #' --format=%H | wc -l"; }
+    if (m == M_TESTS) { return "grep -rch '^test ' specs --include=*.t27 | paste -sd+ - | bc"; }
+    if (m == M_UNOWNED) { return "domain_pulse open_count of letter 0 over the git log of 7 days"; }
+    if (m == M_NO_INSTRUMENT) { return "agent_parts letters_without_widgets()"; }
+    if (m == M_UNASSIGNED) { return "gallery ids (tri widget list) not in agent_parts LETTER_OF_WIDGET"; }
+    if (m == M_STALE) { return "t27c suite --repo-root . seal rows reported stale"; }
+    return "-";
+}
+
+/// The only counter this module can read itself, from the used spec.
+pub fn live_no_instrument() -> u32 { return letters_without_widgets(); }
+
+/// The local day number of a time: the first refresh after local midnight starts a new day.
+pub fn local_day(now: u64, tz_offset_s: i64) -> u64 {
+    const t : i64 = @as(i64, @intCast(now)) + tz_offset_s;
+    if (t < 0) { return 0; }
+    return @as(u64, @intCast(t)) / 86400;
+}
+
+/// Take the start-of-day snapshot at this refresh? Never taken, or the local day changed since.
+pub fn snapshot_due(now: u64, snap_at: u64, tz_offset_s: i64) -> bool {
+    if (snap_at == 0) { return true; }
+    return local_day(now, tz_offset_s) != local_day(snap_at, tz_offset_s);
+}
+
+pub const D_SAME : u32 = 0;
+pub const D_BETTER : u32 = 1;
+pub const D_WORSE : u32 = 2;
+pub const D_UNKNOWN : u32 = 3;
+
+/// Better, worse, same or unknown ("not measured": either side missing).
+pub fn delta_state(m: u32, before: u32, after: u32) -> u32 {
+    if (before == QB_NOT_MEASURED or after == QB_NOT_MEASURED) { return D_UNKNOWN; }
+    if (before == after) { return D_SAME; }
+    if (after > before) { if (m_up_is_good(m)) { return D_BETTER; } return D_WORSE; }
+    if (m_up_is_good(m)) { return D_WORSE; }
+    return D_BETTER;
+}
+
+pub fn delta_abs(before: u32, after: u32) -> u32 {
+    if (after >= before) { return after - before; }
+    return before - after;
+}
+
+/// The sign character of the delta text: "+", "-" or "=".
+pub fn delta_sign(before: u32, after: u32) -> string {
+    if (after > before) { return "+"; }
+    if (after < before) { return "-"; }
+    return "=";
+}
+
+pub const TEXT_NOT_MEASURED : string = "not measured";
+
+/// "+3 tests" = sign + digits + " " + unit; its counted length. Unit words are M_UNITS entries (host splits).
+pub fn delta_text_len(m: u32, before: u32, after: u32, unit_len: u32) -> u32 {
+    if (before == QB_NOT_MEASURED or after == QB_NOT_MEASURED) { return TEXT_NOT_MEASURED.len as u32; }
+    if (before == after) { return 1 + 1 + 1 + unit_len; }
+    return 1 + digits(delta_abs(before, after)) + 1 + unit_len;
+}
+
+/// The unit word length per counter (M_UNITS entry), so the text can be counted without splitting the CSV.
+pub fn unit_len(m: u32) -> u32 {
+    if (m == M_LINKS) { return 5; }
+    if (m == M_TESTS) { return 5; }
+    if (m == M_UNOWNED) { return 7; }
+    if (m == M_NO_INSTRUMENT) { return 13; }
+    if (m == M_UNASSIGNED) { return 10; }
+    return 5;
+}
+
+/// How many of the six moved the right way since the start of the day.
+pub fn better_count(b0: u32, b1: u32, b2: u32, b3: u32, b4: u32, b5: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> u32 {
+    var n : u32 = 0;
+    if (delta_state(M_LINKS, b0, a0) == D_BETTER) { n = n + 1; }
+    if (delta_state(M_TESTS, b1, a1) == D_BETTER) { n = n + 1; }
+    if (delta_state(M_UNOWNED, b2, a2) == D_BETTER) { n = n + 1; }
+    if (delta_state(M_NO_INSTRUMENT, b3, a3) == D_BETTER) { n = n + 1; }
+    if (delta_state(M_UNASSIGNED, b4, a4) == D_BETTER) { n = n + 1; }
+    if (delta_state(M_STALE, b5, a5) == D_BETTER) { n = n + 1; }
+    return n;
+}
+
+// ================================================================ 5. SAFETY STRIP
+
+// key tier in use, a text enum from the keys lane (never the key)
+pub const KT_NONE : u32 = 0;
+pub const KT_FREE_ZAI : u32 = 1;
+pub const KT_OR_FREE : u32 = 2;
+pub const KT_PAID : u32 = 3;
+pub const KT_WORDS : str = "no key,free z.ai flash,OpenRouter free,paid";
+
+/// A paid tier is the only one the strip paints as a warning.
+pub fn tier_is_warning(t: u32) -> bool { return t == KT_PAID; }
+pub fn tier_ok(t: u32) -> bool { return t <= KT_PAID; }
+
+/// The caps are read off evolve.why_not, not copied: dash.t27 also declares MAX_AGENTS, so a bare use of the
+/// name is ambiguous after the splice ("UNRESOLVED MAX_AGENTS ... ambiguous").
+pub fn agents_cap() -> u32 {
+    var n : u32 = 0;
+    while (n < 64) {
+        if (why_not(true, true, n, 0) == R_AGENT_CAP) { return n; }
+        n = n + 1;
+    }
+    return 0;
+}
+pub fn budget_cap() -> u32 {
+    var n : u32 = 0;
+    while (n < 64) {
+        if (why_not(true, true, 0, n) == R_BUDGET) { return n; }
+        n = n + 1;
+    }
+    return 0;
+}
+pub fn tasks_left(started_hour: u32) -> u32 {
+    if (started_hour >= budget_cap()) { return 0; }
+    return budget_cap() - started_hour;
+}
+pub fn agents_free(running: u32) -> u32 {
+    if (running >= agents_cap()) { return 0; }
+    return agents_cap() - running;
+}
+
+/// Fill of a bar 0..1: used / cap.
+pub fn bar_fill(used: u32, cap: u32) -> f64 {
+    if (cap == 0) { return 0.0; }
+    return clampf(fl(used) / fl(cap), 0.0, 1.0);
+}
+
+/// STOP is GOD MODE off, the same as Cmd+J while she acts: it returns the control to log (C_GOD_OFF), or C_NONE
+/// when GOD MODE is already off (nothing to stop).
+pub fn stop_control(god: bool) -> u32 {
+    if (god) { return C_GOD_OFF; }
+    return C_NONE;
+}
+
+/// What STOP changes: GOD MODE goes off, so evolve.next_action returns D_NONE and no new lane starts. It kills
+/// nothing that already runs.
+pub fn stop_effect(god: bool) -> string {
+    if (god) { return "GOD MODE off: no new lane starts; lanes already running are left alone"; }
+    return "GOD MODE is already off";
+}
+
+// ================================================================ 6. LAYOUT of the Q page (nested rects)
+
+pub const QN_PAGE : u32 = 0;
+pub const QN_LAMPS : u32 = 1;
+pub const QN_FEED : u32 = 2;
+pub const QN_GAPS : u32 = 3;
+pub const QN_METER : u32 = 4;
+pub const QN_SAFETY : u32 = 5;
+pub const QN_COUNT : u32 = 6;
+pub const QN_NAMES : str = "Q PAGE,LAMPS,FEED,GAPS,METER,SAFETY";
+
+pub const Q_PAD : f64 = 12.0;
+pub const Q_GAP : f64 = 8.0;
+pub const Q_HEAD : f64 = 20.0;
+pub const LAMP_MIN_W : f64 = 44.0;
+pub const LAMP_H : f64 = 40.0;
+pub const LAMP_GAP : f64 = 4.0;
+pub const BOTTOM_H : f64 = 132.0;
+pub const FEED_FRAC : f64 = 0.42;
+pub const FEED_ROW_H : f64 = 34.0;
+pub const GAP_ROW_MIN : f64 = 30.0;
+pub const METER_FRAC : f64 = 0.6;
+pub const METER_COLS : u32 = 3;
+pub const SAFETY_COLS : u32 = 2;
+pub const SAFETY_CELLS : u32 = 4;
+pub const SC_TASKS : u32 = 0;
+pub const SC_AGENTS : u32 = 1;
+pub const SC_TIER : u32 = 2;
+pub const SC_STOP : u32 = 3;
+
+pub fn qb_inner_w(pw: f64) -> f64 { return pw - 2.0 * Q_PAD; }
+
+pub fn lamp_cols(pw: f64) -> u32 { return pack_cols(qb_inner_w(pw), LAMP_MIN_W, LAMP_GAP); }
+pub fn lamps_h(pw: f64) -> f64 { return Q_HEAD + pack_h(LAMP_COUNT, lamp_cols(pw), LAMP_H, LAMP_GAP); }
+
+/// The body (FEED + GAPS) takes what is left between the lamp strip and the bottom row.
+pub fn qb_body_h(pw: f64, ph: f64) -> f64 {
+    const h : f64 = ph - 2.0 * Q_PAD - lamps_h(pw) - BOTTOM_H - 2.0 * Q_GAP;
+    if (h < 120.0) { return 120.0; }
+    return h;
+}
+
+pub fn qb_body_y(pw: f64) -> f64 { return Q_PAD + lamps_h(pw) + Q_GAP; }
+pub fn bottom_y(pw: f64, ph: f64) -> f64 { return qb_body_y(pw) + qb_body_h(pw, ph) + Q_GAP; }
+
+pub fn feed_w(pw: f64) -> f64 { return (qb_inner_w(pw) - Q_GAP) * FEED_FRAC; }
+pub fn gaps_w(pw: f64) -> f64 { return qb_inner_w(pw) - Q_GAP - feed_w(pw); }
+pub fn meter_w(pw: f64) -> f64 { return (qb_inner_w(pw) - Q_GAP) * METER_FRAC; }
+pub fn safety_w(pw: f64) -> f64 { return qb_inner_w(pw) - Q_GAP - meter_w(pw); }
+
+pub fn node_x(n: u32, pw: f64) -> f64 {
+    if (n == QN_PAGE) { return 0.0; }
+    if (n == QN_GAPS) { return Q_PAD + feed_w(pw) + Q_GAP; }
+    if (n == QN_SAFETY) { return Q_PAD + meter_w(pw) + Q_GAP; }
+    return Q_PAD;
+}
+
+pub fn node_y(n: u32, pw: f64, ph: f64) -> f64 {
+    if (n == QN_PAGE) { return 0.0; }
+    if (n == QN_LAMPS) { return Q_PAD; }
+    if (n == QN_FEED or n == QN_GAPS) { return qb_body_y(pw); }
+    return bottom_y(pw, ph);
+}
+
+pub fn node_w(n: u32, pw: f64) -> f64 {
+    if (n == QN_PAGE) { return pw; }
+    if (n == QN_LAMPS) { return qb_inner_w(pw); }
+    if (n == QN_FEED) { return feed_w(pw); }
+    if (n == QN_GAPS) { return gaps_w(pw); }
+    if (n == QN_METER) { return meter_w(pw); }
+    return safety_w(pw);
+}
+
+pub fn node_h(n: u32, pw: f64, ph: f64) -> f64 {
+    if (n == QN_PAGE) { return ph; }
+    if (n == QN_LAMPS) { return lamps_h(pw); }
+    if (n == QN_FEED or n == QN_GAPS) { return qb_body_h(pw, ph); }
+    return BOTTOM_H;
+}
+
+/// The widget under (x, y) of the page, QN_PAGE when on none.
+pub fn node_at(x: f64, y: f64, pw: f64, ph: f64) -> u32 {
+    var n : u32 = QN_LAMPS;
+    while (n < QN_COUNT) {
+        const nx : f64 = node_x(n, pw);
+        const ny : f64 = node_y(n, pw, ph);
+        if (x >= nx and x < nx + node_w(n, pw) and y >= ny and y < ny + node_h(n, pw, ph)) { return n; }
+        n = n + 1;
+    }
+    return QN_PAGE;
+}
+
+// children, relative to the corner of their parent, packed with dash.t27
+pub fn lamp_x(i: u32, pw: f64) -> f64 { return dash_cell_x(i, qb_inner_w(pw), lamp_cols(pw), LAMP_GAP); }
+pub fn lamp_y(i: u32, pw: f64) -> f64 { return Q_HEAD + dash_cell_y(i, lamp_cols(pw), LAMP_H, LAMP_GAP); }
+pub fn lamp_w(pw: f64) -> f64 { return cell_w(qb_inner_w(pw), lamp_cols(pw), LAMP_GAP); }
+pub fn lamp_at(x: f64, y: f64, pw: f64) -> u32 {
+    return pack_at(LAMP_COUNT, qb_inner_w(pw), lamp_cols(pw), LAMP_H, LAMP_GAP, x, y - Q_HEAD);
+}
+
+/// Feed rows that fit under the head of the FEED column.
+pub fn feed_rows(pw: f64, ph: f64) -> u32 {
+    const room : f64 = qb_body_h(pw, ph) - Q_HEAD;
+    if (room < FEED_ROW_H) { return 0; }
+    return @as(u32, @intFromFloat((room + LAMP_GAP) / (FEED_ROW_H + LAMP_GAP)));
+}
+pub fn feed_row_y(i: u32) -> f64 { return Q_HEAD + fl(i) * (FEED_ROW_H + LAMP_GAP); }
+
+/// GAPS rows: always GAP_ROWS, as tall as the column allows (never under GAP_ROW_MIN, then the column scrolls).
+pub fn gap_row_h(pw: f64, ph: f64) -> f64 {
+    const h : f64 = (qb_body_h(pw, ph) - Q_HEAD - fl(GAP_ROWS - 1) * LAMP_GAP) / fl(GAP_ROWS);
+    if (h < GAP_ROW_MIN) { return GAP_ROW_MIN; }
+    return h;
+}
+pub fn gap_row_y(i: u32, pw: f64, ph: f64) -> f64 { return Q_HEAD + fl(i) * (gap_row_h(pw, ph) + LAMP_GAP); }
+
+pub fn meter_cell_h() -> f64 { return (BOTTOM_H - Q_HEAD - LAMP_GAP) / 2.0; }
+pub fn meter_cell_x(i: u32, pw: f64) -> f64 { return dash_cell_x(i, meter_w(pw), METER_COLS, LAMP_GAP); }
+pub fn meter_cell_y(i: u32) -> f64 { return Q_HEAD + dash_cell_y(i, METER_COLS, meter_cell_h(), LAMP_GAP); }
+pub fn meter_cell_w(pw: f64) -> f64 { return cell_w(meter_w(pw), METER_COLS, LAMP_GAP); }
+
+pub fn safety_cell_x(i: u32, pw: f64) -> f64 { return dash_cell_x(i, safety_w(pw), SAFETY_COLS, LAMP_GAP); }
+pub fn safety_cell_y(i: u32) -> f64 { return Q_HEAD + dash_cell_y(i, SAFETY_COLS, meter_cell_h(), LAMP_GAP); }
+pub fn safety_cell_w(pw: f64) -> f64 { return cell_w(safety_w(pw), SAFETY_COLS, LAMP_GAP); }
+
+/// Is (x, y) (relative to the SAFETY widget) on the STOP button?
+pub fn on_stop(x: f64, y: f64, pw: f64) -> bool {
+    return pack_at(SAFETY_CELLS, safety_w(pw), SAFETY_COLS, meter_cell_h(), LAMP_GAP, x, y - Q_HEAD) == SC_STOP;
+}
+
+// ================================================================ 7. THE HOST FEED of the Q page (2026-10-20)
+// While the Q page is open the host runs ONE background `/bin/sh -c` every LAMP_PERIOD seconds (60): it goes to the
+// repository folder of the space and writes the two counters it can measure there, links landed today and tests,
+// into ~/.t27os/queen/links.txt and tests.txt (renamed into place). The other four counters come from the window
+// itself (letters with no instrument, unassigned widgets) or are NOT MEASURED (unowned paths, stale seals: they
+// need domain_pulse, which t27b cannot link into the window yet, #5980). The 27 lamps are NOT MEASURED for the
+// same reason: lamp_status answers LS_NONE for an empty aggregate and the strip says so.
+pub const QUEEN_DIR : str = "/.t27os/queen/";
+pub const FILE_LINKS : str = "links.txt";
+pub const FILE_TESTS : str = "tests.txt";
+pub const FILE_LANES : str = "lanes.log";
+pub const Q_HEAD_A : str = "export HOME=\"";
+pub const Q_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; D=$HOME/.t27os/queen; mkdir -p $D; cd \"";
+pub const Q_HEAD_C : str = "\" || exit 0; ";
+pub const Q_LINKS_TAIL : str = " | tr -d ' ' > $D/links.txt.part && mv $D/links.txt.part $D/links.txt; ";
+pub const Q_TESTS_TAIL : str = " | tr -d ' ' > $D/tests.txt.part && mv $D/tests.txt.part $D/tests.txt; true";
+
+/// Only plain path characters reach the shell as the repository folder.
+pub fn root_safe(root: string) -> bool {
+    const n : u32 = root.len as u32;
+    if (n == 0 or n > 200) { return false; }
+    var i : u32 = 0;
+    while (i < n) {
+        const c : u32 = root[i] as u32;
+        var ok : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+        if (c == 45 or c == 46 or c == 47 or c == 95 or c == 43) { ok = true; }
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return (root[0] as u32) == 47;
+}
+
+/// The counter a file holds: its decimal digits (the first line), QB_NOT_MEASURED when there are none.
+pub fn counter_text(t: string) -> u32 {
+    const n : u32 = t.len as u32;
+    var i : u32 = 0;
+    var v : u32 = 0;
+    var any : bool = false;
+    while (i < n) {
+        const c : u32 = t[i] as u32;
+        if (c >= 48 and c <= 57) {
+            if (v > 400000000) { return QB_NOT_MEASURED; }
+            v = v * 10 + (c - 48);
+            any = true;
+        } else {
+            i = n;
+        }
+        if (i < n) { i = i + 1; }
+    }
+    if (any == false) { return QB_NOT_MEASURED; }
+    return v;
+}
+
+/// The key tier in use from the providers that hold a key (bit p of `stored` = provider p of keys.t27): the free
+/// z.ai first (index 4), then OpenRouter (3), then a paid Anthropic key (0), else none. The chain order is the
+/// key master's PROFILE_PROVIDER; a TEXT ENUM, never a key.
+pub fn tier_of(stored: u32) -> u32 {
+    if ((stored & 16) != 0) { return KT_FREE_ZAI; }
+    if ((stored & 8) != 0) { return KT_OR_FREE; }
+    if ((stored & 1) != 0) { return KT_PAID; }
+    return KT_NONE;
+}
+
+// ================================================================ tests
+
+pub fn quiet() -> Panel {
+    return Panel { master_red: false, blocked: 0, stale: 0, unowned_count: 0, no_instrument: 0, never_pinned: 0, no_widget_count: 0, no_widget: 0 };
+}
+
+fn qb_busy_panel() -> Panel {
+    var p : Panel = quiet();
+    p.master_red = true;
+    p.blocked = letter_bit(3) + letter_bit(11);
+    p.stale = letter_bit(12);
+    p.unowned_count = 4;
+    p.no_instrument = letter_bit(7) + letter_bit(20);
+    p.never_pinned = letter_bit(4);
+    p.no_widget_count = 2;
+    p.no_widget = letter_bit(9);
+    return p;
+}
+
+test feed_keeps_only_her_actions_and_the_ring_merges_newest_first_with_the_lane_log {
+    assert feed_kind_of_control(C_QUEEN_STARTED) == FK_LANE;
+    assert feed_kind_of_control(C_QUEEN_ASKED) == FK_ASKED;
+    assert feed_kind_of_control(C_QUEEN_PICKED) == FK_PICKED;
+    assert feed_kind_of_control(C_GOD_ON) == FK_GOD and feed_kind_of_control(C_GOD_OFF) == FK_GOD;
+    assert feed_kind_of_control(0) == FK_NONE;
+    assert feed_kind_of_control(7) == FK_NONE;
+    const e : u64 = ev_pack(VIEW_HOME, C_QUEEN_STARTED, 12, 1000);
+    assert feed_letter_of_event(e) == 12 and ev_sec(e) == 1000;
+    assert feed_letter_of_event(ev_pack(VIEW_HOME, C_QUEEN_PICKED, 9, 5)) == 0;
+    assert ring_text_len(FK_LANE, 12) == 26 + 1;
+    assert ring_text_len(FK_LANE, 27) == 26 + 2;
+    assert ring_text_len(FK_GOD, 0) == 17;
+    assert merge_pick(2, 100, 2, 90) == QB_SRC_RING;
+    assert merge_pick(2, 90, 2, 100) == QB_SRC_LANE;
+    assert merge_pick(2, 100, 2, 100) == QB_SRC_LANE;
+    assert merge_pick(0, 0, 3, 5) == QB_SRC_LANE;
+    assert merge_pick(3, 5, 0, 0) == QB_SRC_RING;
+    assert merge_pick(0, 0, 0, 0) == QB_SRC_NONE;
+    assert ring_len(11) == 8 and ring_at(11, 0) == 2 and ring_next(10) == 2;
+    assert feed_text_len(10) == 10 and feed_text_len(200) == FEED_TEXT_MAX;
+    assert feed_dots(57) and feed_dots(56) == false;
+}
+
+test the_lane_log_reads_newest_first_with_kind_letter_and_counted_text {
+    const log : string = "100\t2\t7\topened issue 11300\n130\t3\t7\tz.ai-flash\n190\t4\t7\t12 tests pass\n250\t6\t7\tlanded in PR 11301\n";
+    assert lane_lines(log) == 4;
+    const s0 : u32 = lane_line_start(log, 0);
+    assert lane_sec(log, s0) == 250 and lane_kind(log, s0) == FK_LANDED and lane_letter(log, s0) == 7;
+    assert lane_text_len(log, s0) == 18;
+    const s2 : u32 = lane_line_start(log, 2);
+    assert lane_sec(log, s2) == 130 and lane_kind(log, s2) == FK_LANE;
+    assert lane_text_len(log, s2) == 10;
+    const s3 : u32 = lane_line_start(log, 3);
+    assert lane_kind(log, s3) == FK_TASK and lane_sec(log, s3) == 100;
+    assert lane_line_start(log, 4) == QB_NOT_MEASURED;
+    assert lane_lines("") == 0;
+    assert lane_line_start("", 0) == QB_NOT_MEASURED;
+    // a profile name is shown, a key-looking text is replaced by the placeholder
+    assert lane_text_shown_len(log, s2) == 10;
+    const bad : string = "300\t3\t7\tsk-abcdef0123\n";
+    assert profile_ok("z.ai-flash") and profile_ok("OpenRouter free");
+    assert looks_like_key("sk-abcdef0123") and looks_like_key("Bearer abc") and looks_like_key("ghp_abc");
+    assert looks_like_key("api_key") and looks_like_key("token=1");
+    assert looks_like_key("0123456789abcdef0123456789abcdef") and looks_like_key("0123456789abcdef") == false;
+    assert profile_ok("sk-abcdef0123") == false;
+    assert (KEY_PLACEHOLDER.len as u32) == 16;
+    const bad2 : string = "300\t3\t7\t0123456789abcdef0123456789abcdef0123\n";
+    assert lane_text_shown_len(bad2, lane_line_start(bad2, 0)) == 16;
+    assert lane_text_shown_len(bad, lane_line_start(bad, 0)) == 13;
+}
+
+test the_gaps_board_lists_the_top_ten_in_evolve_order {
+    const p : Panel = qb_busy_panel();
+    assert gap_total(p) == 9;
+    assert nth_gap(p, 0) == G_RED + 16 * LETTER_RED;
+    assert nth_gap(p, 1) == G_BLOCKED + 16 * 3;
+    assert nth_gap(p, 2) == G_BLOCKED + 16 * 11;
+    assert nth_gap(p, 3) == G_STALE + 16 * 12;
+    assert nth_gap(p, 4) == G_UNOWNED + 16 * LETTER_UNOWNED;
+    assert nth_gap(p, 5) == G_NO_INSTRUMENT + 16 * 7;
+    assert nth_gap(p, 6) == G_NO_INSTRUMENT + 16 * 20;
+    assert nth_gap(p, 7) == G_NEVER_PINNED + 16 * 4;
+    assert nth_gap(p, 8) == G_NO_WIDGET + 16 * 9;
+    assert nth_gap(p, 9) == 0 and row_exists(p, 8) and row_exists(p, 9) == false;
+    assert gap_kind_of(nth_gap(p, 5)) == G_NO_INSTRUMENT and gap_letter_of(nth_gap(p, 6)) == 20;
+    assert gap_total(quiet()) == 0 and nth_gap(quiet(), 0) == 0;
+    assert popcount(letter_bit(1) + letter_bit(27)) == 2 and nth_letter(letter_bit(5) + letter_bit(9), 1) == 9;
+    assert class_of_kind(G_RED) == P_CRIT and class_of_kind(G_BLOCKED) == P_HIGH;
+    assert class_of_kind(G_STALE) == P_MED and class_of_kind(G_UNOWNED) == P_MED;
+    assert class_of_kind(G_NO_WIDGET) == P_LOW;
+    assert row_reason_len(nth_gap(p, 3)) == (kind_phrase(G_STALE).len as u32);
+}
+
+test the_next_row_is_exactly_what_evolve_next_action_takes {
+    const p : Panel = qb_busy_panel();
+    // nothing in flight: row 0 (red on master, letter B)
+    var inflight : u32 = 0;
+    var k : u32 = 0;
+    while (k < 4) {
+        const n : u32 = next_index(p, inflight);
+        const d : u32 = next_action(p, inflight, true, true, 0, 0, 0, 0);
+        assert dec_action(d) == D_TASK;
+        assert gap_kind_of(nth_gap(p, n)) == dec_kind(d);
+        assert gap_letter_of(nth_gap(p, n)) == dec_letter(d);
+        assert row_why(p, n, inflight, true, true, 0, 0, 0, 0) == WN_NEXT;
+        inflight = inflight + letter_bit(dec_letter(d));
+        k = k + 1;
+    }
+    assert next_index(quiet(), 0) == QB_NOT_MEASURED;
+}
+
+test a_row_says_why_it_is_not_started_now {
+    const p : Panel = qb_busy_panel();
+    // row 0 is next, row 1 is queued
+    assert row_why(p, 0, 0, true, true, 0, 0, 0, 0) == WN_NEXT;
+    assert row_why(p, 1, 0, true, true, 0, 0, 0, 0) == WN_QUEUED;
+    // in flight
+    assert row_why(p, 0, letter_bit(LETTER_RED), true, true, 1, 1, 0, 0) == WN_INFLIGHT;
+    assert row_why(p, 1, letter_bit(LETTER_RED), true, true, 1, 1, 0, 0) == WN_NEXT;
+    // GOD MODE off / panel closed beat everything
+    assert row_why(p, 0, 0, false, true, 0, 0, 0, 0) == WN_GOD_OFF;
+    assert row_why(p, 0, 0, true, false, 0, 0, 0, 0) == WN_PANEL;
+    // caps: 3 agents, 4 tasks an hour
+    assert row_why(p, 0, 0, true, true, agents_cap(), 0, 0, 0) == WN_CAP;
+    assert row_why(p, 0, 0, true, true, 0, budget_cap(), 0, 0) == WN_BUDGET;
+    // forbidden class: an owner request, even with the caps hit (it starts no agent)
+    assert row_why(p, 1, 0, true, true, agents_cap(), budget_cap(), letter_bit(3), 1) == WN_OWNER;
+    assert row_why(p, 2, 0, true, true, agents_cap(), budget_cap(), letter_bit(3), 1) == WN_CAP;
+    assert row_why(p, 1, 0, false, true, 0, 0, letter_bit(3), 1) == WN_GOD_OFF;
+    // a request row matches evolve: the decision is D_REQUEST
+    assert dec_action(next_action(quiet(), 0, true, true, 0, 0, 0, 0)) == D_NONE;
+    var b : Panel = quiet();
+    b.blocked = letter_bit(11);
+    assert dec_action(next_action(b, 0, true, true, 3, 4, letter_bit(11), 1)) == D_REQUEST;
+    assert row_why(b, 0, 0, true, true, 3, 4, letter_bit(11), 1) == WN_OWNER;
+    assert (WN_COUNT == 8) and WN_OWNER < WN_COUNT;
+}
+
+test lamps_refresh_at_most_once_a_minute_and_only_while_the_window_is_open {
+    assert lamp_refresh_due(false, 1000, 0) == false;
+    assert lamp_refresh_due(true, 1000, 0);
+    assert lamp_refresh_due(true, 1059, 1000) == false;
+    assert lamp_refresh_due(true, 1060, 1000);
+    assert lamp_refresh_due(true, 900, 1000);
+    assert lamp_refresh_due(false, 5000, 1000) == false;
+    assert lamp_next_in(true, 1010, 1000) == 50;
+    assert lamp_next_in(true, 1060, 1000) == 0 and lamp_next_in(false, 1010, 1000) == 0;
+    assert lamps_stale(1179, 1000) == false and lamps_stale(1180, 1000);
+    assert lamps_stale(5, 0) == false;
+    assert LAMP_COUNT == 27;
+}
+
+test lamps_read_the_per_letter_aggregates_the_host_feeds {
+    const agg : string = "1\t3\t4\t0\n2\t4\t0\t1\n27\t1\t0\t0\n";
+    assert lamp_status(agg, 1) == LS_ACTIVE and lamp_commits(agg, 1) == 4 and lamp_is_guess(agg, 1) == false;
+    assert lamp_status(agg, 2) == LS_BLOCKED and lamp_is_guess(agg, 2);
+    assert lamp_status(agg, 27) == LS_QUIET;
+    // a letter the host did not feed is dark, not quiet
+    assert lamp_status(agg, 5) == LS_NONE and lamp_commits(agg, 5) == 0;
+    assert lamp_line("", 1) == QB_NOT_MEASURED;
+    // letter 1 must not match line "10" or "12"
+    assert lamp_status("10\t3\t1\t0\n12\t2\t1\t0\n", 1) == LS_NONE;
+}
+
+test the_meter_counts_before_and_after_with_the_right_direction {
+    assert m_up_is_good(M_LINKS) and m_up_is_good(M_TESTS);
+    assert m_up_is_good(M_UNOWNED) == false and m_up_is_good(M_STALE) == false;
+    assert delta_state(M_TESTS, 100, 103) == D_BETTER;
+    assert delta_state(M_UNOWNED, 40, 28) == D_BETTER;
+    assert delta_state(M_UNOWNED, 28, 40) == D_WORSE;
+    assert delta_state(M_LINKS, 5, 5) == D_SAME;
+    assert delta_state(M_STALE, 3, QB_NOT_MEASURED) == D_UNKNOWN;
+    assert delta_abs(40, 28) == 12 and delta_abs(100, 103) == 3;
+    assert delta_sign(100, 103) == "+" and delta_sign(40, 28) == "-" and delta_sign(5, 5) == "=";
+    // '+3 tests' = 1 + 1 + 1 + 5 ; '-12 unowned' = 1 + 2 + 1 + 7
+    assert delta_text_len(M_TESTS, 100, 103, unit_len(M_TESTS)) == 8;
+    assert delta_text_len(M_UNOWNED, 40, 28, unit_len(M_UNOWNED)) == 11;
+    assert delta_text_len(M_STALE, 3, QB_NOT_MEASURED, unit_len(M_STALE)) == 12;
+    assert (TEXT_NOT_MEASURED.len as u32) == 12;
+    assert better_count(0, 100, 40, 20, 5, 3, 2, 103, 28, 20, 5, 4) == 3;
+    assert better_count(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1) == 0;
+    assert (meter_cmd(M_LINKS).len as u32) > 0 and (meter_cmd(M_STALE).len as u32) > 0;
+    assert (meter_cmd(M_COUNT).len as u32) == 1;
+    assert live_no_instrument() == letters_without_widgets();
+    assert digits(0) == 1 and digits(9) == 1 and digits(10) == 2 and digits(1000) == 4;
+}
+
+test the_start_of_day_snapshot_is_the_first_refresh_after_local_midnight {
+    const tz : i64 = 7200;
+    // local midnight of day 20000 at UTC+2 is 20000 * 86400 - 7200 in UTC seconds
+    const mid : u64 = 20000 * 86400 - 7200;
+    assert local_day(mid, tz) == 20000 and local_day(mid - 1, tz) == 19999;
+    assert snapshot_due(mid, 0, tz);
+    // the last minute before midnight and the first one after: a new snapshot
+    assert snapshot_due(mid, mid - 60, tz);
+    // later the same local day: none
+    assert snapshot_due(mid + 60, mid, tz) == false;
+    assert snapshot_due(mid + 86399, mid, tz) == false;
+    assert snapshot_due(mid + 86400, mid, tz);
+    // UTC day and local day differ by the offset
+    assert local_day(mid, 0) + 1 == local_day(mid, tz);
+    // a time before the epoch plus a big negative offset does not wrap
+    assert local_day(100, -86400 * 2) == 0;
+}
+
+test the_safety_strip_counts_the_hour_the_agents_and_names_the_tier_without_a_key {
+    assert tasks_left(0) == budget_cap() and tasks_left(3) == 1 and tasks_left(9) == 0;
+    assert agents_free(0) == agents_cap() and agents_free(2) == 1 and agents_free(5) == 0;
+    assert bar_fill(2, 4) == 0.5 and bar_fill(9, 4) == 1.0 and bar_fill(1, 0) == 0.0;
+    assert tier_is_warning(KT_PAID) and tier_is_warning(KT_FREE_ZAI) == false;
+    assert tier_is_warning(KT_OR_FREE) == false and tier_ok(KT_PAID) and tier_ok(4) == false;
+    assert agents_cap() == 3 and budget_cap() == 4;
+}
+
+test stop_is_god_mode_off_and_starts_nothing_afterwards {
+    assert stop_control(true) == C_GOD_OFF;
+    assert stop_control(false) == C_NONE;
+    assert (stop_effect(true).len as u32) > (stop_effect(false).len as u32);
+    // the effect, as the rule sees it: before STOP a task starts, after STOP evolve decides nothing
+    const p : Panel = qb_busy_panel();
+    assert dec_action(next_action(p, 0, true, true, 0, 0, 0, 0)) == D_TASK;
+    assert next_action(p, 0, false, true, 0, 0, 0, 0) == D_NONE;
+    // the feed shows the same control as GOD MODE
+    assert feed_kind_of_control(stop_control(true)) == FK_GOD;
+}
+
+test the_q_page_nests_lamps_on_top_feed_left_gaps_right_meter_and_safety_below {
+    const pw : f64 = 1200.0;
+    const ph : f64 = 800.0;
+    // lamps: a strip across the top, inside the padding
+    assert node_y(QN_LAMPS, pw, ph) == Q_PAD and node_w(QN_LAMPS, pw) == pw - 2.0 * Q_PAD;
+    assert lamp_cols(pw) >= 9;
+    // feed left, gaps right, same row, same height, no overlap
+    assert node_x(QN_FEED, pw) < node_x(QN_GAPS, pw);
+    assert node_x(QN_FEED, pw) + node_w(QN_FEED, pw) + Q_GAP == node_x(QN_GAPS, pw);
+    assert node_y(QN_FEED, pw, ph) == node_y(QN_GAPS, pw, ph) and node_h(QN_FEED, pw, ph) == node_h(QN_GAPS, pw, ph);
+    assert node_y(QN_FEED, pw, ph) >= node_y(QN_LAMPS, pw, ph) + node_h(QN_LAMPS, pw, ph);
+    // meter and safety below, side by side, ending inside the page
+    assert node_y(QN_METER, pw, ph) == node_y(QN_SAFETY, pw, ph);
+    assert node_y(QN_METER, pw, ph) >= node_y(QN_FEED, pw, ph) + node_h(QN_FEED, pw, ph);
+    assert node_x(QN_METER, pw) + node_w(QN_METER, pw) + Q_GAP == node_x(QN_SAFETY, pw);
+    assert node_y(QN_SAFETY, pw, ph) + node_h(QN_SAFETY, pw, ph) + Q_PAD <= ph;
+    assert node_x(QN_SAFETY, pw) + node_w(QN_SAFETY, pw) + Q_PAD == pw;
+    // hit test
+    assert node_at(30.0, 30.0, pw, ph) == QN_LAMPS;
+    assert node_at(30.0, node_y(QN_FEED, pw, ph) + 5.0, pw, ph) == QN_FEED;
+    assert node_at(node_x(QN_GAPS, pw) + 5.0, node_y(QN_GAPS, pw, ph) + 5.0, pw, ph) == QN_GAPS;
+    assert node_at(30.0, node_y(QN_METER, pw, ph) + 5.0, pw, ph) == QN_METER;
+    assert node_at(node_x(QN_SAFETY, pw) + 5.0, node_y(QN_SAFETY, pw, ph) + 5.0, pw, ph) == QN_SAFETY;
+    assert node_at(2.0, 2.0, pw, ph) == QN_PAGE;
+}
+
+test the_children_are_packed_by_dash_and_stay_inside_their_parents {
+    const pw : f64 = 1200.0;
+    const ph : f64 = 800.0;
+    var i : u32 = 0;
+    while (i < LAMP_COUNT) {
+        assert lamp_x(i, pw) >= 0.0 and lamp_x(i, pw) + lamp_w(pw) <= node_w(QN_LAMPS, pw) + 0.001;
+        assert lamp_y(i, pw) + LAMP_H <= node_h(QN_LAMPS, pw, ph) + 0.001;
+        i = i + 1;
+    }
+    assert lamp_at(lamp_x(5, pw) + 1.0, lamp_y(5, pw) + 1.0, pw) == 5;
+    assert lamp_at(-1.0, 0.0, pw) == LAMP_COUNT;
+    assert feed_rows(pw, ph) >= 8;
+    assert feed_row_y(feed_rows(pw, ph) - 1) + FEED_ROW_H <= node_h(QN_FEED, pw, ph) + 0.001;
+    assert gap_row_h(pw, ph) >= GAP_ROW_MIN;
+    assert gap_row_y(GAP_ROWS - 1, pw, ph) + gap_row_h(pw, ph) <= node_h(QN_GAPS, pw, ph) + 0.001;
+    i = 0;
+    while (i < M_COUNT) {
+        assert meter_cell_x(i, pw) + meter_cell_w(pw) <= node_w(QN_METER, pw) + 0.001;
+        assert meter_cell_y(i) + meter_cell_h() <= BOTTOM_H + 0.001;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < SAFETY_CELLS) {
+        assert safety_cell_x(i, pw) + safety_cell_w(pw) <= node_w(QN_SAFETY, pw) + 0.001;
+        assert safety_cell_y(i) + meter_cell_h() <= BOTTOM_H + 0.001;
+        i = i + 1;
+    }
+    // the STOP button is the fourth safety cell
+    assert on_stop(safety_cell_x(SC_STOP, pw) + 2.0, safety_cell_y(SC_STOP) + 2.0, pw);
+    assert on_stop(safety_cell_x(SC_TASKS, pw) + 2.0, safety_cell_y(SC_TASKS) + 2.0, pw) == false;
+    // a small window still gets a body at least 120 high
+    assert qb_body_h(600.0, 500.0) >= 120.0;
+}
+
+test the_queen_feed_runs_the_two_counters_in_the_repo_folder_and_renames_into_place {
+    assert root_safe("/srv/t27");
+    assert root_safe("/srv/my t27") == false;
+    assert root_safe("/tmp/x\";id") == false;
+    assert root_safe("relative/path") == false;
+    assert root_safe("") == false;
+    assert has_sub(Q_HEAD_B, "mkdir -p $D");
+    assert has_sub(Q_HEAD_B, "cd \"");
+    assert has_sub(meter_cmd(M_LINKS), "git log master --since=midnight");
+    assert has_sub(meter_cmd(M_TESTS), "grep -rch");
+    assert has_sub(meter_cmd(M_TESTS), "bc");
+    assert has_sub(Q_LINKS_TAIL, "&& mv $D/links.txt.part $D/links.txt");
+    assert has_sub(Q_TESTS_TAIL, "&& mv $D/tests.txt.part $D/tests.txt");
+    // nothing in the feed touches the network or writes the repository
+    assert has_sub(meter_cmd(M_LINKS), "push") == false;
+    assert has_sub(meter_cmd(M_TESTS), "curl") == false;
+    assert FILE_LINKS == "links.txt";
+}
+
+
+test a_counter_file_reads_to_its_digits_and_nothing_else_is_not_measured {
+    assert counter_text("42\n") == 42;
+    assert counter_text("0\n") == 0;
+    assert counter_text("") == QB_NOT_MEASURED;
+    assert counter_text("\n") == QB_NOT_MEASURED;
+    assert counter_text("fatal: not a git repository\n") == QB_NOT_MEASURED;
+    assert counter_text("14997") == 14997;
+    assert counter_text("99999999999") == QB_NOT_MEASURED;
+}
+
+test the_key_tier_is_a_text_enum_chosen_in_the_chain_order_and_only_paid_warns {
+    assert tier_of(0) == KT_NONE;
+    assert tier_of(16) == KT_FREE_ZAI;
+    assert tier_of(16 + 1) == KT_FREE_ZAI;
+    assert tier_of(8 + 1) == KT_OR_FREE;
+    assert tier_of(1) == KT_PAID;
+    assert tier_of(2) == KT_NONE;
+    assert tier_is_warning(tier_of(1));
+    assert tier_is_warning(tier_of(16)) == false;
+    assert tier_ok(tier_of(255));
+}
+
+/// The "not measured" value of a counter, for importers whose own QB_NOT_MEASURED would clash.
+pub fn qb_nm() -> u32 { return QB_NOT_MEASURED; }
+pub fn qb_measured(v: u32) -> bool { return v != QB_NOT_MEASURED; }
+
+test the_not_measured_value_is_exported_by_function {
+    assert qb_nm() == QB_NOT_MEASURED;
+    assert qb_measured(0);
+    assert qb_measured(qb_nm()) == false;
+}
+
+/// The three sources of a merged feed entry, by function (the window also imports bench's SRC_ names).
+pub fn qb_src_ring() -> u32 { return QB_SRC_RING; }
+pub fn qb_src_lane() -> u32 { return QB_SRC_LANE; }
+pub fn qb_src_none() -> u32 { return QB_SRC_NONE; }
+
+test the_feed_sources_are_exported_by_function {
+    assert merge_pick(1, 5, 1, 4) == qb_src_ring();
+    assert merge_pick(1, 4, 1, 5) == qb_src_lane();
+    assert merge_pick(0, 0, 0, 0) == qb_src_none();
+}

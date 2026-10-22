@@ -1,0 +1,790 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/lab/paths.t27 -- which names and which GET paths the t27c lab accepts (gHashTag/t27#11041, epic #11040)
+; The t27c lab (infra/t27c-lab/lab.py) serves its runs over plain HTTP GET and takes work from two kinds of name: a
+; 40-hex commit sha and a branch name. Every decision about what may be read, fetched or queued is one of five
+; patterns, and each is ported here exactly, the Python function is the oracle:
+;   SHA_RE        ^[0-9a-f]{40}$                              lab_is_sha
+;   BRANCH_RE     ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$         lab_is_branch
+;   checkout()    BRANCH_RE and ".." not in b                 lab_branch_fetchable  (the refspec guard)
+;   enqueue()     SHA_RE or (BRANCH_RE and ".." not in ref)   lab_ref_enqueueable
+;   take_requests SHA_RE, else BRANCH_RE and the ref is a head  lab_request_kind
+;   safe_path()   the four routes a GET may read              lab_path_parts, lab_path_write
+;   do_GET        /health, /, a file, or 404                  lab_route, lab_path_is_json
+; THE `$` OF PYTHON. In `re` a `$` without MULTILINE matches at the end of the text AND just before a newline that ends
+; it. So `SHA_RE.match(sha + "\n")` and `BRANCH_RE.match("main\n")` are matches, and so is every route below with one
+; LF after its last byte; the path a route returns carries no LF (it is built from the captured groups). This file does
+; the same, and tests it (the oracle is the specification here): the one extra LF is accepted and a second is not. In
+; the lab no such text reaches these functions today (a git ref has no control byte, an HTTP request line ends at its
+; LF), so it is a property of the port, not a hole.
+; The routes (path with its query, from the first `?`, cut off):
+;   /latest.json                                   -> latest.json                (exact; no LF accepted)
+;   /runs/<sha>.json                               -> runs/<sha>.json
+;   /runs/<sha>/<gate>.<log|json>   gate [a-z-]{1,40}  -> runs/<sha>/<gate>.<ext>
+;   /seals/<sha>.<json|patch>                      -> runs/<sha>/seals.<ext>    (#9080)
+; Anything else, any upper-case sha or gate, any `..`, any other extension, is no route. do_GET answers /health and
+; /health/ (the whole path, a query makes it a 404), / (the banner), a route whose file exists, and 404 otherwise.
+; The glue that serves the files and queues a request is thin; this file holds the decisions, and names no host: whatever runs
+; the lab (one machine, or any node that takes a lab job, #11043) asks these functions what a name or a path is.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LabPaths;
+
+use tri::lab::receipt::span_is;
+use lab::text::LAB_NO;
+use lab::text::lab_has_lit;
+use lab::text::lab_lit_at;
+use lab::text::lab_find_byte;
+use lab::text::lab_put_lit;
+use lab::text::lab_put_span;
+
+pub const LAB_SHA_LEN : usize = 40;
+/// BRANCH_RE: one leading letter or digit and at most 199 more of [A-Za-z0-9._/-].
+pub const LAB_BRANCH_MAX : usize = 200;
+/// A gate's file name in a route: [a-z-]{1,40}.
+pub const LAB_GATE_MAX : usize = 40;
+
+/// What a request name is (take_requests).
+pub const LAB_REQ_NONE : u8 = 0;
+pub const LAB_REQ_SHA : u8 = 1;
+pub const LAB_REQ_BRANCH : u8 = 2;
+
+/// What a GET path is (safe_path).
+pub const LAB_P_NONE : u8 = 0;
+pub const LAB_P_LATEST : u8 = 1;
+pub const LAB_P_RUN : u8 = 2;
+pub const LAB_P_GATE : u8 = 3;
+pub const LAB_P_SEAL : u8 = 4;
+
+/// What do_GET does with a path.
+pub const LAB_R_NOT_FOUND : u8 = 0;
+pub const LAB_R_HEALTH : u8 = 1;
+pub const LAB_R_ROOT : u8 = 2;
+pub const LAB_R_FILE : u8 = 3;
+
+/// Is the byte a lower-case hex digit?
+pub fn lab_is_hex(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102);
+}
+
+/// The end of text[from..to] without the one LF that Python's `$` lets a match leave behind it.
+pub fn lab_dollar_end(t: string, from: usize, to: usize) -> usize {
+    if (to > from and t[to - 1] == 10) { return to - 1; }
+    return to;
+}
+
+/// SHA_RE.match on text[from..to]: exactly 40 lower-case hex digits, then the end or one LF.
+pub fn lab_is_sha(t: string, from: usize, to: usize) -> bool {
+    const e : usize = lab_dollar_end(t, from, to);
+    if (e - from != LAB_SHA_LEN) { return false; }
+    var k : usize = from;
+    while (k < e) {
+        if (lab_is_hex(t[k]) == false) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Is the byte one of [A-Za-z0-9]?
+pub fn lab_is_alnum(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+}
+
+/// BRANCH_RE.match on text[from..to]: a letter or digit, then up to 199 of [A-Za-z0-9._/-], then the end or one LF.
+pub fn lab_is_branch(t: string, from: usize, to: usize) -> bool {
+    const e : usize = lab_dollar_end(t, from, to);
+    if (e <= from or e - from > LAB_BRANCH_MAX) { return false; }
+    if (lab_is_alnum(t[from]) == false) { return false; }
+    var k : usize = from + 1;
+    while (k < e) {
+        const c : u8 = t[k];
+        if (lab_is_alnum(c) == false and c != 46 and c != 95 and c != 47 and c != 45) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// checkout(): a branch the lab puts into a refspec: BRANCH_RE and no `..` anywhere in it.
+pub fn lab_branch_fetchable(t: string, from: usize, to: usize) -> bool {
+    return lab_is_branch(t, from, to) and lab_has_lit(t, from, to, "..") == false;
+}
+
+/// enqueue(): a request the lab drops into its queue: a sha, or a branch with no `..` in it.
+pub fn lab_ref_enqueueable(t: string, from: usize, to: usize) -> bool {
+    return lab_is_sha(t, from, to) or lab_branch_fetchable(t, from, to);
+}
+
+/// take_requests(): a sha is a request for that commit; a branch is one only when it is a head of the repository
+/// (in_heads), and then without the `..` rule; everything else is dropped.
+pub fn lab_request_kind(t: string, from: usize, to: usize, in_heads: bool) -> u8 {
+    if (lab_is_sha(t, from, to)) { return LAB_REQ_SHA; }
+    if (lab_is_branch(t, from, to) and in_heads) { return LAB_REQ_BRANCH; }
+    return LAB_REQ_NONE;
+}
+
+/// Where a route's last byte may be followed by nothing or by the one LF.
+pub fn lab_route_end_ok(t: string, q: usize, n: usize) -> bool {
+    return q == n or (q + 1 == n and t[q] == 10);
+}
+
+/// The parts of a route: its kind, the sha, the gate name or the file word, and the extension. Offsets into the path.
+pub struct LabPathParts { kind: u8, sha_from: usize, name_from: usize, name_to: usize, ext_from: usize, ext_to: usize }
+
+fn lab_no_parts() -> LabPathParts {
+    return LabPathParts { kind: LAB_P_NONE, sha_from: 0, name_from: 0, name_to: 0, ext_from: 0, ext_to: 0 };
+}
+
+/// Is text[from..from + 40] 40 lower-case hex digits?
+pub fn lab_hex40_at(t: string, from: usize, n: usize) -> bool {
+    if (from + LAB_SHA_LEN > n) { return false; }
+    var k : usize = 0;
+    while (k < LAB_SHA_LEN) {
+        if (lab_is_hex(t[from + k]) == false) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// safe_path(): which route the path is and where its parts are. The query (from the first `?`) is cut off first.
+pub fn lab_path_parts(path: string) -> LabPathParts {
+    var n : usize = path.len;
+    const qm : usize = lab_find_byte(path, 0, n, 63);
+    if (qm != LAB_NO) { n = qm; }
+    if (span_is(path, 0, n, "/latest.json")) {
+        return LabPathParts { kind: LAB_P_LATEST, sha_from: 0, name_from: 1, name_to: 7, ext_from: 8, ext_to: 12 };
+    }
+    if (lab_lit_at(path, 0, n, "/runs/") and lab_hex40_at(path, 6, n)) {
+        const a : usize = 6 + LAB_SHA_LEN;
+        if (lab_lit_at(path, a, n, ".json") and lab_route_end_ok(path, a + 5, n)) {
+            return LabPathParts { kind: LAB_P_RUN, sha_from: 6, name_from: 0, name_to: 0, ext_from: a + 1, ext_to: a + 5 };
+        }
+        if (lab_lit_at(path, a, n, "/")) {
+            var q : usize = a + 1;
+            while (q < n and ((path[q] >= 97 and path[q] <= 122) or path[q] == 45)) {
+                q = q + 1;
+            }
+            if (q > a + 1 and q - (a + 1) <= LAB_GATE_MAX and lab_lit_at(path, q, n, ".")) {
+                if (lab_lit_at(path, q + 1, n, "log") and lab_route_end_ok(path, q + 4, n)) {
+                    return LabPathParts { kind: LAB_P_GATE, sha_from: 6, name_from: a + 1, name_to: q, ext_from: q + 1, ext_to: q + 4 };
+                }
+                if (lab_lit_at(path, q + 1, n, "json") and lab_route_end_ok(path, q + 5, n)) {
+                    return LabPathParts { kind: LAB_P_GATE, sha_from: 6, name_from: a + 1, name_to: q, ext_from: q + 1, ext_to: q + 5 };
+                }
+            }
+        }
+    }
+    if (lab_lit_at(path, 0, n, "/seals/") and lab_hex40_at(path, 7, n)) {
+        const b : usize = 7 + LAB_SHA_LEN;
+        if (lab_lit_at(path, b, n, ".json") and lab_route_end_ok(path, b + 5, n)) {
+            return LabPathParts { kind: LAB_P_SEAL, sha_from: 7, name_from: 0, name_to: 0, ext_from: b + 1, ext_to: b + 5 };
+        }
+        if (lab_lit_at(path, b, n, ".patch") and lab_route_end_ok(path, b + 6, n)) {
+            return LabPathParts { kind: LAB_P_SEAL, sha_from: 7, name_from: 0, name_to: 0, ext_from: b + 1, ext_to: b + 6 };
+        }
+    }
+    return lab_no_parts();
+}
+
+/// safe_path(): the kind of route; LAB_P_NONE for a path nothing may read.
+pub fn lab_path_kind(path: string) -> u8 {
+    return lab_path_parts(path).kind;
+}
+
+/// safe_path(): write the file under www a route reads (runs/<sha>.json, ...) into dst at w, clipped at cap; the new
+/// cursor. A path that is no route writes nothing.
+pub fn lab_path_write(path: string, dst: []u8, cap: usize, w: usize) -> usize {
+    const p : LabPathParts = lab_path_parts(path);
+    if (p.kind == LAB_P_NONE) { return w; }
+    if (p.kind == LAB_P_LATEST) { return lab_put_lit(dst, cap, w, "latest.json"); }
+    var x : usize = lab_put_lit(dst, cap, w, "runs/");
+    x = lab_put_span(dst, cap, x, path, p.sha_from, p.sha_from + LAB_SHA_LEN);
+    if (p.kind == LAB_P_RUN) { return lab_put_span(dst, cap, lab_put_lit(dst, cap, x, "."), path, p.ext_from, p.ext_to); }
+    if (p.kind == LAB_P_GATE) {
+        x = lab_put_span(dst, cap, lab_put_lit(dst, cap, x, "/"), path, p.name_from, p.name_to);
+    } else {
+        x = lab_put_lit(dst, cap, x, "/seals");
+    }
+    return lab_put_span(dst, cap, lab_put_lit(dst, cap, x, "."), path, p.ext_from, p.ext_to);
+}
+
+/// do_GET: the content type is application/json when the file the route reads ends in .json, else text/plain.
+pub fn lab_path_is_json(path: string) -> bool {
+    const p : LabPathParts = lab_path_parts(path);
+    if (p.kind == LAB_P_NONE) { return false; }
+    return span_is(path, p.ext_from, p.ext_to, "json");
+}
+
+/// do_GET: what the request line asks for. /health and /health/ are the whole path, a query makes it no health check.
+pub fn lab_route(path: string) -> u8 {
+    if (span_is(path, 0, path.len, "/health") or span_is(path, 0, path.len, "/health/")) { return LAB_R_HEALTH; }
+    if (span_is(path, 0, path.len, "/")) { return LAB_R_ROOT; }
+    if (lab_path_kind(path) != LAB_P_NONE) { return LAB_R_FILE; }
+    return LAB_R_NOT_FOUND;
+}
+
+// ---- tests ----
+// The oracle is infra/t27c-lab/lab.py. Every case below is its answer (Python 3.14.6), pinned: first the asserts of its
+// self_check(), one to one, then tables of inputs run through its own functions (SHA_RE, BRANCH_RE, safe_path, do_GET's
+// routing, enqueue's and take_requests' guards).
+
+fn lab_test_sha(s: string) -> bool {
+    return lab_is_sha(s, 0, s.len);
+}
+
+fn lab_test_branch(s: string) -> bool {
+    return lab_is_branch(s, 0, s.len);
+}
+
+fn lab_test_fetchable(s: string) -> bool {
+    return lab_branch_fetchable(s, 0, s.len);
+}
+
+fn lab_test_enqueueable(s: string) -> bool {
+    return lab_ref_enqueueable(s, 0, s.len);
+}
+
+fn lab_test_request(s: string, in_heads: bool) -> u8 {
+    return lab_request_kind(s, 0, s.len, in_heads);
+}
+
+/// The kind, the file the route reads and its content type, all three, for one path.
+fn lab_test_path(path: string, kind: u8, rel: string, json: bool) -> bool {
+    var out : [128]u8 = undefined;
+    const w : usize = lab_path_write(path, &out, 128, 0);
+    if (w != rel.len or span_is(&out, 0, w, rel) == false) { return false; }
+    return lab_path_kind(path) == kind and lab_path_is_json(path) == json;
+}
+
+// <<< pinned table: paths_self_check
+test lab_py_self_check_safe_path_reads_the_four_routes {
+    assert lab_test_path("/latest.json", LAB_P_LATEST, "latest.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_RUN, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch", LAB_P_SEAL, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.patch", false);
+}
+
+test lab_py_self_check_safe_path_refuses_the_wrong_extension_and_every_traversal {
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch", LAB_P_NONE, "", false);
+    assert lab_test_path("/../etc/passwd", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../../x.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/abc.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Suite.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/data/src/.git/config", LAB_P_NONE, "", false);
+}
+
+test lab_py_self_check_branch_re {
+    assert lab_test_branch("claude/t27c-match-tail-expr") == true;
+    assert lab_test_branch("-x") == false;
+    assert lab_test_branch("a b") == false;
+}
+
+// >>> pinned table: paths_self_check
+// <<< pinned table: paths_sha
+// SHA_RE.match(s): 40 lower-case hex digits; Python's $ also lets one LF follow.
+test lab_py_table_sha_re {
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_sha("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == true;
+    assert lab_test_sha("0123456789abcdef0123456789abcdef01234567") == true;
+    assert lab_test_sha("ffffffffffffffffffffffffffffffffffffffff") == true;
+    assert lab_test_sha("0000000000000000000000000000000000000000") == true;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("") == false;
+    assert lab_test_sha("a") == false;
+    assert lab_test_sha("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaG") == false;
+    assert lab_test_sha("gggggggggggggggggggggggggggggggggggggggg") == false;
+    assert lab_test_sha(" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == false;
+    assert lab_test_sha("\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("\n") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax") == false;
+    assert lab_test_sha("xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-") == false;
+    assert lab_test_sha("master") == false;
+    assert lab_test_sha("HEAD") == false;
+    assert lab_test_sha("9999999999999999999999999999999999999999") == true;
+    assert lab_test_sha("abcdefabcdefabcdefabcdefabcdefabcdefabcd") == true;
+    assert lab_test_sha("abcdefabcdefabcdefabcdefabcdefabcdefabc") == false;
+    assert lab_test_sha("abcdefgabcdefgabcdefgabcdefgabcdefgabcde") == false;
+}
+
+// >>> pinned table: paths_sha
+// <<< pinned table: paths_branch
+// BRANCH_RE.match(b); checkout()'s guard (BRANCH_RE and no ..); enqueue()'s rule (a sha, or that guard).
+test lab_py_table_branch_re {
+    assert lab_test_branch("master") == true;
+    assert lab_test_branch("main") == true;
+    assert lab_test_branch("claude/t27c-x") == true;
+    assert lab_test_branch("claude/lab-l1-t27c-11041") == true;
+    assert lab_test_branch("a") == true;
+    assert lab_test_branch("A") == true;
+    assert lab_test_branch("0") == true;
+    assert lab_test_branch("9z") == true;
+    assert lab_test_branch("a.b") == true;
+    assert lab_test_branch("a_b") == true;
+    assert lab_test_branch("a-b") == true;
+    assert lab_test_branch("a/b") == true;
+    assert lab_test_branch("-x") == false;
+    assert lab_test_branch(".x") == false;
+    assert lab_test_branch("_x") == false;
+    assert lab_test_branch("/x") == false;
+    assert lab_test_branch("x/") == true;
+    assert lab_test_branch("x.") == true;
+    assert lab_test_branch("x..y") == true;
+    assert lab_test_branch("x/../y") == true;
+    assert lab_test_branch("..") == false;
+    assert lab_test_branch("a..") == true;
+    assert lab_test_branch("..a") == false;
+    assert lab_test_branch("a/..") == true;
+    assert lab_test_branch("a b") == false;
+    assert lab_test_branch(" a") == false;
+    assert lab_test_branch("a ") == false;
+    assert lab_test_branch("a\tb") == false;
+    assert lab_test_branch("a\n") == true;
+    assert lab_test_branch("a\n\n") == false;
+    assert lab_test_branch("\na") == false;
+    assert lab_test_branch("a\nb") == false;
+    assert lab_test_branch("") == false;
+    assert lab_test_branch("\n") == false;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == false;
+    assert lab_test_branch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_branch("a-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------") == true;
+    assert lab_test_branch("a--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------") == false;
+    assert lab_test_branch("refs/heads/master") == true;
+    assert lab_test_branch("refs/pull/1/head") == true;
+    assert lab_test_branch("feature#1") == false;
+    assert lab_test_branch("a+b") == false;
+    assert lab_test_branch("a:b") == false;
+    assert lab_test_branch("a~1") == false;
+    assert lab_test_branch("a^") == false;
+    assert lab_test_branch("a?") == false;
+    assert lab_test_branch("a*") == false;
+    assert lab_test_branch("a[0]") == false;
+    assert lab_test_branch("a@b") == false;
+    assert lab_test_branch("a,b") == false;
+    assert lab_test_branch("a;b") == false;
+    assert lab_test_branch("a$b") == false;
+    assert lab_test_branch("a%b") == false;
+    assert lab_test_branch("a\\b") == false;
+    assert lab_test_branch("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") == true;
+    assert lab_test_branch("ab12cd") == true;
+    assert lab_test_branch("Release/1.2.3") == true;
+    assert lab_test_branch("v1.0-rc.1") == true;
+    assert lab_test_branch("t27c") == true;
+    assert lab_test_branch("t27c-lab") == true;
+    assert lab_test_branch("claude/t27c-*") == false;
+}
+
+test lab_py_table_checkout_guard {
+    assert lab_test_fetchable("master") == true;
+    assert lab_test_fetchable("main") == true;
+    assert lab_test_fetchable("claude/t27c-x") == true;
+    assert lab_test_fetchable("claude/lab-l1-t27c-11041") == true;
+    assert lab_test_fetchable("a") == true;
+    assert lab_test_fetchable("A") == true;
+    assert lab_test_fetchable("0") == true;
+    assert lab_test_fetchable("9z") == true;
+    assert lab_test_fetchable("a.b") == true;
+    assert lab_test_fetchable("a_b") == true;
+    assert lab_test_fetchable("a-b") == true;
+    assert lab_test_fetchable("a/b") == true;
+    assert lab_test_fetchable("-x") == false;
+    assert lab_test_fetchable(".x") == false;
+    assert lab_test_fetchable("_x") == false;
+    assert lab_test_fetchable("/x") == false;
+    assert lab_test_fetchable("x/") == true;
+    assert lab_test_fetchable("x.") == true;
+    assert lab_test_fetchable("x..y") == false;
+    assert lab_test_fetchable("x/../y") == false;
+    assert lab_test_fetchable("..") == false;
+    assert lab_test_fetchable("a..") == false;
+    assert lab_test_fetchable("..a") == false;
+    assert lab_test_fetchable("a/..") == false;
+    assert lab_test_fetchable("a b") == false;
+    assert lab_test_fetchable(" a") == false;
+    assert lab_test_fetchable("a ") == false;
+    assert lab_test_fetchable("a\tb") == false;
+    assert lab_test_fetchable("a\n") == true;
+    assert lab_test_fetchable("a\n\n") == false;
+    assert lab_test_fetchable("\na") == false;
+    assert lab_test_fetchable("a\nb") == false;
+    assert lab_test_fetchable("") == false;
+    assert lab_test_fetchable("\n") == false;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == false;
+    assert lab_test_fetchable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_fetchable("a-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------") == true;
+    assert lab_test_fetchable("a--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------") == false;
+    assert lab_test_fetchable("refs/heads/master") == true;
+    assert lab_test_fetchable("refs/pull/1/head") == true;
+    assert lab_test_fetchable("feature#1") == false;
+    assert lab_test_fetchable("a+b") == false;
+    assert lab_test_fetchable("a:b") == false;
+    assert lab_test_fetchable("a~1") == false;
+    assert lab_test_fetchable("a^") == false;
+    assert lab_test_fetchable("a?") == false;
+    assert lab_test_fetchable("a*") == false;
+    assert lab_test_fetchable("a[0]") == false;
+    assert lab_test_fetchable("a@b") == false;
+    assert lab_test_fetchable("a,b") == false;
+    assert lab_test_fetchable("a;b") == false;
+    assert lab_test_fetchable("a$b") == false;
+    assert lab_test_fetchable("a%b") == false;
+    assert lab_test_fetchable("a\\b") == false;
+    assert lab_test_fetchable("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") == true;
+    assert lab_test_fetchable("ab12cd") == true;
+    assert lab_test_fetchable("Release/1.2.3") == true;
+    assert lab_test_fetchable("v1.0-rc.1") == true;
+    assert lab_test_fetchable("t27c") == true;
+    assert lab_test_fetchable("t27c-lab") == true;
+    assert lab_test_fetchable("claude/t27c-*") == false;
+}
+
+test lab_py_table_enqueue_rule {
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_enqueueable("0123456789abcdef0123456789abcdef01234567") == true;
+    assert lab_test_enqueueable("0000000000000000000000000000000000000000") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_enqueueable("") == false;
+    assert lab_test_enqueueable("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag") == true;
+    assert lab_test_enqueueable("gggggggggggggggggggggggggggggggggggggggg") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ") == false;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t") == false;
+    assert lab_test_enqueueable("xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-") == true;
+    assert lab_test_enqueueable("HEAD") == true;
+    assert lab_test_enqueueable("abcdefabcdefabcdefabcdefabcdefabcdefabcd") == true;
+    assert lab_test_enqueueable("abcdefgabcdefgabcdefgabcdefgabcdefgabcde") == true;
+    assert lab_test_enqueueable("main") == true;
+    assert lab_test_enqueueable("claude/lab-l1-t27c-11041") == true;
+    assert lab_test_enqueueable("A") == true;
+    assert lab_test_enqueueable("9z") == true;
+    assert lab_test_enqueueable("a_b") == true;
+    assert lab_test_enqueueable("a/b") == true;
+    assert lab_test_enqueueable(".x") == false;
+    assert lab_test_enqueueable("/x") == false;
+    assert lab_test_enqueueable("x.") == true;
+    assert lab_test_enqueueable("x/../y") == false;
+    assert lab_test_enqueueable("a..") == false;
+    assert lab_test_enqueueable("a/..") == false;
+    assert lab_test_enqueueable(" a") == false;
+    assert lab_test_enqueueable("a\tb") == false;
+    assert lab_test_enqueueable("a\n\n") == false;
+    assert lab_test_enqueueable("a\nb") == false;
+    assert lab_test_enqueueable("\n") == false;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == false;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_enqueueable("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == true;
+    assert lab_test_enqueueable("a--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------") == false;
+    assert lab_test_enqueueable("refs/pull/1/head") == true;
+    assert lab_test_enqueueable("a+b") == false;
+    assert lab_test_enqueueable("a~1") == false;
+    assert lab_test_enqueueable("a?") == false;
+    assert lab_test_enqueueable("a[0]") == false;
+    assert lab_test_enqueueable("a,b") == false;
+    assert lab_test_enqueueable("a$b") == false;
+    assert lab_test_enqueueable("a\\b") == false;
+    assert lab_test_enqueueable("ab12cd") == true;
+    assert lab_test_enqueueable("v1.0-rc.1") == true;
+    assert lab_test_enqueueable("t27c-lab") == true;
+}
+
+test lab_py_table_take_requests_kind {
+    assert lab_test_request("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true) == LAB_REQ_SHA;
+    assert lab_test_request("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", false) == LAB_REQ_SHA;
+    assert lab_test_request("0000000000000000000000000000000000000000", true) == LAB_REQ_SHA;
+    assert lab_test_request("0000000000000000000000000000000000000000", false) == LAB_REQ_SHA;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false) == LAB_REQ_NONE;
+    assert lab_test_request("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaG", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaG", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ", true) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n", true) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaa", true) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaa", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-", false) == LAB_REQ_NONE;
+    assert lab_test_request("9999999999999999999999999999999999999999", true) == LAB_REQ_SHA;
+    assert lab_test_request("9999999999999999999999999999999999999999", false) == LAB_REQ_SHA;
+    assert lab_test_request("abcdefgabcdefgabcdefgabcdefgabcdefgabcde", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("abcdefgabcdefgabcdefgabcdefgabcdefgabcde", false) == LAB_REQ_NONE;
+    assert lab_test_request("claude/t27c-x", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("claude/t27c-x", false) == LAB_REQ_NONE;
+    assert lab_test_request("A", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("A", false) == LAB_REQ_NONE;
+    assert lab_test_request("a.b", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("a.b", false) == LAB_REQ_NONE;
+    assert lab_test_request("a/b", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("a/b", false) == LAB_REQ_NONE;
+    assert lab_test_request("_x", true) == LAB_REQ_NONE;
+    assert lab_test_request("_x", false) == LAB_REQ_NONE;
+    assert lab_test_request("x.", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("x.", false) == LAB_REQ_NONE;
+    assert lab_test_request("..", true) == LAB_REQ_NONE;
+    assert lab_test_request("..", false) == LAB_REQ_NONE;
+    assert lab_test_request("a/..", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("a/..", false) == LAB_REQ_NONE;
+    assert lab_test_request("a ", true) == LAB_REQ_NONE;
+    assert lab_test_request("a ", false) == LAB_REQ_NONE;
+    assert lab_test_request("a\n\n", true) == LAB_REQ_NONE;
+    assert lab_test_request("a\n\n", false) == LAB_REQ_NONE;
+    assert lab_test_request("", true) == LAB_REQ_NONE;
+    assert lab_test_request("", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", true) == LAB_REQ_NONE;
+    assert lab_test_request("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", false) == LAB_REQ_NONE;
+    assert lab_test_request("a--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------", true) == LAB_REQ_NONE;
+    assert lab_test_request("a--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------", false) == LAB_REQ_NONE;
+    assert lab_test_request("feature#1", true) == LAB_REQ_NONE;
+    assert lab_test_request("feature#1", false) == LAB_REQ_NONE;
+    assert lab_test_request("a~1", true) == LAB_REQ_NONE;
+    assert lab_test_request("a~1", false) == LAB_REQ_NONE;
+    assert lab_test_request("a*", true) == LAB_REQ_NONE;
+    assert lab_test_request("a*", false) == LAB_REQ_NONE;
+    assert lab_test_request("a,b", true) == LAB_REQ_NONE;
+    assert lab_test_request("a,b", false) == LAB_REQ_NONE;
+    assert lab_test_request("a%b", true) == LAB_REQ_NONE;
+    assert lab_test_request("a%b", false) == LAB_REQ_NONE;
+    assert lab_test_request("ab12cd", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("ab12cd", false) == LAB_REQ_NONE;
+    assert lab_test_request("t27c", true) == LAB_REQ_BRANCH;
+    assert lab_test_request("t27c", false) == LAB_REQ_NONE;
+}
+
+// >>> pinned table: paths_branch
+// <<< pinned table: paths_routes
+// safe_path(): every path of the table, the file it reads, its route and its content type (rel.endswith('.json')).
+test lab_py_table_safe_path {
+    assert lab_test_path("/latest.json", LAB_P_LATEST, "latest.json", true);
+    assert lab_test_path("/latest.json?x=1", LAB_P_LATEST, "latest.json", true);
+    assert lab_test_path("/latest.json?", LAB_P_LATEST, "latest.json", true);
+    assert lab_test_path("/latest.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/Latest.json", LAB_P_NONE, "", false);
+    assert lab_test_path("latest.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.jsonx", LAB_P_NONE, "", false);
+    assert lab_test_path("//latest.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json#x", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json.", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json%00", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json?/runs/", LAB_P_LATEST, "latest.json", true);
+    assert lab_test_path("/latest.json\n?x", LAB_P_NONE, "", false);
+    assert lab_test_path("", LAB_P_NONE, "", false);
+    assert lab_test_path("/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs//x", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals", LAB_P_NONE, "", false);
+    assert lab_test_path("/../etc/passwd", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/../x", LAB_P_NONE, "", false);
+    assert lab_test_path("/data/src/.git/config", LAB_P_NONE, "", false);
+    assert lab_test_path("/healthz", LAB_P_NONE, "", false);
+    assert lab_test_path("/health", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_RUN, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json?x", LAB_P_RUN, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_RUN, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.patch", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.LOG", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log\n", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log?x=1", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seal-currency.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seal-currency.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/specs-generate.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/specs-generate.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.patch", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Suite.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite2.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite_x.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a.b.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a/b.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../x.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../../x.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/-.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/-.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/--.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/--.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa//x.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x.log.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_SEAL, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.json", true);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch", LAB_P_SEAL, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.patch", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_SEAL, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.json", true);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch?x", LAB_P_SEAL, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/seals.patch", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/RUNS/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/Runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("//runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path(" /runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json ", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.json", LAB_P_RUN, "runs/0123456789abcdef0123456789abcdef01234567.json", true);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.json?x", LAB_P_RUN, "runs/0123456789abcdef0123456789abcdef01234567.json", true);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.json\n", LAB_P_RUN, "runs/0123456789abcdef0123456789abcdef01234567.json", true);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/0123456789abcdef0123456789abcdef01234567/suite.log", LAB_P_GATE, "runs/0123456789abcdef0123456789abcdef01234567/suite.log", false);
+    assert lab_test_path("/seals/0123456789abcdef0123456789abcdef01234567.json", LAB_P_SEAL, "runs/0123456789abcdef0123456789abcdef01234567/seals.json", true);
+    assert lab_test_path("/seals/0123456789abcdef0123456789abcdef01234567.json\n", LAB_P_SEAL, "runs/0123456789abcdef0123456789abcdef01234567/seals.json", true);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json?x", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/suite.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json?x", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json?x", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.JSON", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json/", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-b.log", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-b.json", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-b.txt", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/z.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/z.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/z.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/z.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/z.txt", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/build.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/build.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/build.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/build.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/build.txt", LAB_P_NONE, "", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/misread.log", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/misread.log", false);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/misread.json", LAB_P_GATE, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/misread.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/misread.txt", LAB_P_NONE, "", false);
+}
+
+// >>> pinned table: paths_routes
+// <<< pinned table: paths_http
+// do_GET: /health and /health/ whole, / the banner, a route (its file may still be missing: 404), else 404.
+test lab_py_table_routing {
+    assert lab_route("/health") == LAB_R_HEALTH;
+    assert lab_route("/health/") == LAB_R_HEALTH;
+    assert lab_route("/health//") == LAB_R_NOT_FOUND;
+    assert lab_route("/health?x") == LAB_R_NOT_FOUND;
+    assert lab_route("/health/?x") == LAB_R_NOT_FOUND;
+    assert lab_route("/Health") == LAB_R_NOT_FOUND;
+    assert lab_route("/healthz") == LAB_R_NOT_FOUND;
+    assert lab_route("/heal") == LAB_R_NOT_FOUND;
+    assert lab_route("health") == LAB_R_NOT_FOUND;
+    assert lab_route("/") == LAB_R_ROOT;
+    assert lab_route("//") == LAB_R_NOT_FOUND;
+    assert lab_route("/?") == LAB_R_NOT_FOUND;
+    assert lab_route("/?x=1") == LAB_R_NOT_FOUND;
+    assert lab_route("/ ") == LAB_R_NOT_FOUND;
+    assert lab_route("/index.html") == LAB_R_NOT_FOUND;
+    assert lab_route("/latest.json") == LAB_R_FILE;
+    assert lab_route("/latest.json?x") == LAB_R_FILE;
+    assert lab_route("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json") == LAB_R_FILE;
+    assert lab_route("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/suite.log") == LAB_R_FILE;
+    assert lab_route("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.patch") == LAB_R_FILE;
+    assert lab_route("/seals/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log") == LAB_R_NOT_FOUND;
+    assert lab_route("/runs/") == LAB_R_NOT_FOUND;
+    assert lab_route("") == LAB_R_NOT_FOUND;
+    assert lab_route("/a") == LAB_R_NOT_FOUND;
+    assert lab_route("/runs/x.json") == LAB_R_NOT_FOUND;
+    assert lab_route("/health\n") == LAB_R_NOT_FOUND;
+    assert lab_route("/\n") == LAB_R_NOT_FOUND;
+    assert lab_route("/health/\n") == LAB_R_NOT_FOUND;
+}
+
+// >>> pinned table: paths_http
+
+// Scenario (the oracle is the specification): Python's `$` lets ONE newline follow a match. A sha, a branch and a route all
+// accept it and a second one is no match; /latest.json is compared whole, so it takes none; the route written carries no newline.
+test the_one_newline_a_dollar_lets_through {
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == true;
+    assert lab_test_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n") == false;
+    assert lab_test_branch("master\n") == true;
+    assert lab_test_branch("master\n\n") == false;
+    assert lab_test_branch("\n") == false;
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n", LAB_P_RUN, "runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", true);
+    assert lab_test_path("/runs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\n\n", LAB_P_NONE, "", false);
+    assert lab_test_path("/latest.json\n", LAB_P_NONE, "", false);
+    assert lab_dollar_end("ab\n", 0, 3) == 2;
+    assert lab_dollar_end("ab\n\n", 0, 4) == 3;
+    assert lab_dollar_end("ab", 0, 2) == 2;
+    assert lab_dollar_end("", 0, 0) == 0;
+}
+
+// Scenario: the parts of a route are offsets into the path, and the query is cut off before anything is read.
+test the_parts_of_a_route_are_offsets_into_the_path {
+    const g : string = "/runs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/suite.log?x=1";
+    const p : LabPathParts = lab_path_parts(g);
+    assert p.kind == LAB_P_GATE and p.sha_from == 6 and p.name_from == 47 and p.name_to == 52 and p.ext_from == 53 and p.ext_to == 56;
+    const s : LabPathParts = lab_path_parts("/seals/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.patch");
+    assert s.kind == LAB_P_SEAL and s.sha_from == 7 and s.ext_from == 48 and s.ext_to == 53;
+    const l : LabPathParts = lab_path_parts("/latest.json?x");
+    assert l.kind == LAB_P_LATEST and l.ext_from == 8 and l.ext_to == 12;
+    assert lab_path_parts("/latest.json?x").kind == lab_path_parts("/latest.json").kind;
+    assert lab_path_parts("/runs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json?/../x").kind == LAB_P_RUN;
+    assert lab_path_parts("/runs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/../x.log").kind == LAB_P_NONE;
+    assert LAB_SHA_LEN == 40 and LAB_BRANCH_MAX == 200 and LAB_GATE_MAX == 40;
+}

@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27mcp/dashboard.t27 -- the session dashboard of the t27 MCP server (gHashTag/t27-mcp): one page that
+; tells the agent and the human operator what state the corpus and the session are in, and what to do next.
+; See the epic #10066.
+; --
+; Agent and operator ask the same questions: is the corpus healthy enough to reuse from, did a tool call fail,
+; did a reply grow past what the host shows inline, and what is the next step. This spec grades each number
+; and picks the next step; the server only counts its calls, reads the manifest and fills the templates below.
+; --
+; The rules:
+; - A grade (tone) is one of OK, UNKNOWN, WARN, BAD, in that order of severity. worst() of two grades is the
+;   more severe one, so UNKNOWN never adds up to OK: a panel with nothing to judge is not a passing panel.
+; - Corpus health: BAD when at least 5 in 100 specs fail, WARN when any spec fails or at least 20 in 100 warn,
+;   UNKNOWN when the manifest names no spec.
+; - Session calls: UNKNOWN before the first call, BAD when at least one call in four failed, WARN when any did.
+; - Reply size: a reply over REPLY_WARN_BYTES costs the agent context on every turn that keeps it; over
+;   REPLY_BAD_BYTES the host stores it in a file instead of showing it, and the agent pays a second read.
+;   On 2026-10-18 a plain t27_status reply was 57,084 bytes, 44 KB of it the list of failing specs.
+; - next_step() picks one line of NEXT_TEXT, most urgent first: a failed call, an oversized reply, a failing
+;   corpus, no call yet, nothing to fix.
+; - UNKNOWN_TEXT names what the page cannot know from the server's own data, so a blank is read as unknown
+;   and not as absent.
+; The templates use `{}` for the values the server fills in, left to right, and only single quotes inside.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27mcpDashboard;
+
+/// Grades, in order of severity.
+pub const T_OK : u32 = 0;
+pub const T_UNKNOWN : u32 = 1;
+pub const T_WARN : u32 = 2;
+pub const T_BAD : u32 = 3;
+
+pub const TONE_NAME : [4]str = ["ok", "unknown", "warn", "bad"];
+
+/// Reply size thresholds in bytes (see the rules above).
+pub const REPLY_WARN_BYTES : u32 = 8192;
+pub const REPLY_BAD_BYTES : u32 = 25000;
+
+/// next_step() answers, as indices into NEXT_TEXT.
+pub const N_ERRORS : u32 = 0;
+pub const N_BIG : u32 = 1;
+pub const N_FAILING : u32 = 2;
+pub const N_START : u32 = 3;
+pub const N_READY : u32 = 4;
+
+pub const NEXT_TEXT : [5]str = [
+    "A tool call failed in this session. Read its error text before you call again: the same arguments give the same error.",
+    "A reply passed the size the host shows inline, so it was stored in a file. Ask for less: a limit, a path filter, or t27_spec without source.",
+    "Many corpus specs fail. t27_status names them; reuse only a spec whose health is ok.",
+    "No call yet. Look up first: t27_find with what the module does, then t27_spec; write new .t27 only on a miss.",
+    "Nothing to fix. Look up first (t27_find, t27_specs), run t27_check on .t27 you write, and take the verdict from t27c test-report."
+];
+
+pub const PANEL_TITLES : [5]str = ["Corpus", "This session", "Next step", "Server", "Not known here"];
+
+pub const UNKNOWN_TEXT : [3]str = [
+    "Seal frontier: which specs reuse a sealed verdict needs t27c frontier on a checkout.",
+    "Test receipts: the manifest records that a spec has tests, not that they pass.",
+    "CI and review state of open pull requests."
+];
+
+pub const PAGE_TEXT : str = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>t27 MCP dashboard</title><style>:root{color-scheme:light dark;--ok:#2e9d5b;--unknown:#8a8f98;--warn:#c98a12;--bad:#d64545}body{font:14px/1.45 system-ui,sans-serif;margin:0;padding:16px;max-width:1000px}header{display:flex;gap:10px;align-items:baseline;margin-bottom:12px}header b{font-size:18px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}section{border:1px solid #8884;border-left:4px solid var(--c);border-radius:8px;padding:10px 12px}h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin:0 0 6px;opacity:.75}p{margin:3px 0;display:flex;justify-content:space-between;gap:12px}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{padding:2px 4px;text-align:right;font-weight:normal}td:first-child,th:first-child{text-align:left}th{opacity:.7}.pill{color:#fff;background:var(--c);border-radius:10px;padding:1px 8px;font-size:12px}.t0{--c:var(--ok)}.t1{--c:var(--unknown)}.t2{--c:var(--warn)}.t3{--c:var(--bad)}tr.t2 td,tr.t3 td{color:var(--c)}small{opacity:.7}</style></head><body><header><b>t27 MCP</b><span class='pill t{}'>{}</span><small>{}</small></header><main>{}</main></body></html>";
+pub const PANEL_TEXT : str = "<section class='t{}'><h2>{}</h2>{}</section>";
+pub const KV_TEXT : str = "<p><span>{}</span><b>{}</b></p>";
+pub const LINE_TEXT : str = "<p>{}</p>";
+pub const TABLE_HEAD : str = "<table><tr><th>tool</th><th>calls</th><th>errors</th><th>largest reply, bytes</th></tr>";
+pub const ROW_TEXT : str = "<tr class='t{}'><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>";
+pub const TABLE_TAIL : str = "</table>";
+
+/// The reply of t27_dashboard to the agent: the same grades in one line, and where the page is.
+pub const AGENT_TEXT : str = "t27 MCP {} | corpus at {}: {} specs, {} ok, {} warn, {} fail ({}) | session: {} calls, {} errors, largest reply {} bytes ({}) | next: {} | page: {}";
+
+/// The more severe of two grades.
+pub fn worst(a: u32, b: u32) -> u32 {
+    if (a > b) { return a; }
+    return b;
+}
+
+/// The grade of the corpus from the manifest's health split.
+pub fn health_tone(total: u32, fail: u32, warn: u32) -> u32 {
+    if (total == 0) { return T_UNKNOWN; }
+    if (fail * 100 >= total * 5) { return T_BAD; }
+    if (fail > 0) { return T_WARN; }
+    if (warn * 100 >= total * 20) { return T_WARN; }
+    return T_OK;
+}
+
+/// The grade of a set of calls: all of one tool, or the whole session.
+pub fn calls_tone(calls: u32, errors: u32) -> u32 {
+    if (calls == 0) { return T_UNKNOWN; }
+    if (errors * 4 >= calls) {
+        if (errors > 0) { return T_BAD; }
+    }
+    if (errors > 0) { return T_WARN; }
+    return T_OK;
+}
+
+/// The grade of the largest reply in bytes; 0 means no reply yet.
+pub fn reply_tone(bytes: u32) -> u32 {
+    if (bytes == 0) { return T_UNKNOWN; }
+    if (bytes > REPLY_BAD_BYTES) { return T_BAD; }
+    if (bytes > REPLY_WARN_BYTES) { return T_WARN; }
+    return T_OK;
+}
+
+/// One line of NEXT_TEXT for the three grades, most urgent first.
+pub fn next_step(health: u32, calls: u32, reply: u32) -> u32 {
+    if (calls >= T_WARN) { return N_ERRORS; }
+    if (reply == T_BAD) { return N_BIG; }
+    if (health == T_BAD) { return N_FAILING; }
+    if (calls == T_UNKNOWN) { return N_START; }
+    return N_READY;
+}
+
+test "worst: the more severe grade wins, in either order" {
+    assert worst(T_OK, T_BAD) == T_BAD;
+    assert worst(T_BAD, T_OK) == T_BAD;
+    assert worst(T_WARN, T_UNKNOWN) == T_WARN;
+}
+
+test "negative control: unknown never adds up to ok" {
+    assert worst(T_OK, T_UNKNOWN) == T_UNKNOWN;
+    assert worst(T_UNKNOWN, T_OK) != T_OK;
+}
+
+test "health_tone: the 2026-10-18 manifest (2402 specs, 113 fail, 4.7 in 100) warns, 121 fails is bad" {
+    assert health_tone(2402, 113, 257) == T_WARN;
+    assert health_tone(2402, 121, 257) == T_BAD;
+}
+
+test "health_tone: the 5 in 100 boundary, any fail, many warnings, no specs" {
+    assert health_tone(100, 5, 0) == T_BAD;
+    assert health_tone(100, 4, 0) == T_WARN;
+    assert health_tone(100, 0, 20) == T_WARN;
+    assert health_tone(100, 0, 19) == T_OK;
+    assert health_tone(0, 0, 0) == T_UNKNOWN;
+}
+
+test "calls_tone: before the first call, one in four failed, one failed, none failed" {
+    assert calls_tone(0, 0) == T_UNKNOWN;
+    assert calls_tone(4, 1) == T_BAD;
+    assert calls_tone(5, 1) == T_WARN;
+    assert calls_tone(7, 0) == T_OK;
+}
+
+test "reply_tone: the 57,084 byte t27_status reply is bad; the thresholds are exclusive" {
+    assert reply_tone(57084) == T_BAD;
+    assert reply_tone(REPLY_BAD_BYTES) == T_WARN;
+    assert reply_tone(REPLY_WARN_BYTES) == T_OK;
+    assert reply_tone(REPLY_WARN_BYTES + 1) == T_WARN;
+    assert reply_tone(0) == T_UNKNOWN;
+}
+
+test "next_step: a failed call comes before everything, then size, then health, then the first call" {
+    assert next_step(T_BAD, T_WARN, T_BAD) == N_ERRORS;
+    assert next_step(T_BAD, T_OK, T_BAD) == N_BIG;
+    assert next_step(T_BAD, T_OK, T_WARN) == N_FAILING;
+    assert next_step(T_OK, T_UNKNOWN, T_UNKNOWN) == N_START;
+    assert next_step(T_OK, T_OK, T_OK) == N_READY;
+}
+
+test "next_step: a warning-sized reply on a healthy corpus needs no action" {
+    assert next_step(T_WARN, T_OK, T_WARN) == N_READY;
+}

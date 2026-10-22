@@ -33,6 +33,7 @@ RATCHETS = (None, "VACUITY MEASURED", "UNEXPECTED FAILURE", "UNEXPECTED PASS", "
 REASONS = (None, "unimplemented", "reference-bug", "n/a")
 CLAIMS = (None, "CLAIM-DEAD", "CLAIM-OLD")
 CHECKOUTS = (None, "LAB-CHECKOUT", "LAB-RECLONED")
+IMAGES = (None, "LAB-IMAGE-STALE")
 # Merge gate (#6244): GitHub's check states, in the spec's state codes.
 CHECK_STATES = {"SUCCESS": 0,
                 "PENDING": 1, "QUEUED": 1, "IN_PROGRESS": 1, "WAITING": 1, "REQUESTED": 1, "EXPECTED": 1,
@@ -108,10 +109,16 @@ def _build():
     so.railway_old.restype = ctypes.c_bool
     so.checkout_code.argtypes = [ctypes.c_bool, ctypes.c_bool]
     so.checkout_code.restype = ctypes.c_uint8
+    so.image_code.argtypes = [ctypes.c_bool] * 3
+    so.image_code.restype = ctypes.c_uint8
     so.cap_rise_is_new.argtypes = [ctypes.c_uint32] * 3
     so.cap_rise_is_new.restype = ctypes.c_bool
     so.is_alarm.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
     so.is_alarm.restype = ctypes.c_bool
+    so.is_alarm_tests.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_bool, ctypes.c_uint32]
+    so.is_alarm_tests.restype = ctypes.c_bool
+    so.lanes_stop.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    so.lanes_stop.restype = ctypes.c_bool
     so.check_effect.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_bool]
     so.check_effect.restype = ctypes.c_uint8
     so.master_state.argtypes = [ctypes.c_bool, ctypes.c_uint8]
@@ -224,6 +231,11 @@ def checkout(ok, recloned):
     return CHECKOUTS[lib().checkout_code(bool(ok), bool(recloned))]
 
 
+def image(master_known, reported, same):
+    """LAB-IMAGE-STALE or None: is the running lab image master's (#6443)?"""
+    return IMAGES[lib().image_code(bool(master_known), bool(reported), bool(same))]
+
+
 def cap_rise_is_new(not_pass, old_cap, new_not_pass):
     """True when the rise over `old_cap` is no larger than the specs new to the ledger."""
     return bool(lib().cap_rise_is_new(_minutes(not_pass), _minutes(old_cap), _minutes(new_not_pass)))
@@ -233,6 +245,19 @@ def is_alarm(t27b, reference):
     """True when a run record is a lab alarm: a mismatch or crash always, a fail or
     timeout only where the reference passes."""
     return bool(lib().is_alarm(verdict(t27b), verdict(reference)))
+
+
+def is_alarm_tests(t27b, reference, compared, disagree):
+    """is_alarm judged test by test (#6441): with the per-test differential
+    (`compared`), a fail the reference shares is an alarm when other tests fail,
+    and a pass is one when any test's verdict differs."""
+    return bool(lib().is_alarm_tests(verdict(t27b), verdict(reference), bool(compared), int(disagree or 0)))
+
+
+def lanes_stop(jit_interp_mismatch, reference_disagree):
+    """True when the lanes stop (#6441): t27b's JIT against its own interpreter
+    disagrees, or t27b against the reference disagrees on some test."""
+    return bool(lib().lanes_stop(int(jit_interp_mismatch or 0), int(reference_disagree or 0)))
 
 
 def check_state(s):

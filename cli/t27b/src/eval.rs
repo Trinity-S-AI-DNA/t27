@@ -14,6 +14,10 @@
 
 use crate::ir::*;
 
+#[path = "../../../gen/rust/tri/t27b/eval_arith.rs"]
+#[allow(dead_code, unused_parens, unexpected_cfgs, clippy::all)]
+pub(crate) mod spec; // t27c gen-rust of specs/tri/t27b/eval_arith.t27; also Ty::min, max, fits and wrap
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stop {
     /// A trap at the given site; for AssertEq, the two compared values.
@@ -159,6 +163,7 @@ impl Mem {
     fn load(&self, addr: u64, ty: Ty) -> Result<i128, Stop> {
         let n = ty.bytes() as usize;
         let b = self.read(addr, n)?;
+        if n > 8 { return Ok(wide(b)); } // an i128, out of line (`wide`)
         let mut raw = [0u8; 8];
         raw[..n].copy_from_slice(b);
         let v = u64::from_le_bytes(raw);
@@ -169,11 +174,17 @@ impl Mem {
     }
 
     fn store(&mut self, addr: u64, ty: Ty, v: i128) -> Result<(), Stop> {
+        if ty == Ty::I128 { return self.store16(addr, v); }
         let n = ty.bytes() as usize;
         let raw = (v as u64).to_le_bytes();
         self.write(addr, &raw[..n])
     }
+
+    #[cold] #[inline(never)] fn store16(&mut self, addr: u64, v: i128) -> Result<(), Stop> { self.write(addr, &v.to_le_bytes()) }
 }
+
+/// An i128 in memory: 16 bytes, its two words, little-endian. Cold and out of line, so a scalar load stays as it was.
+#[cold] #[inline(never)] fn wide(b: &[u8]) -> i128 { i128::from_le_bytes(b.try_into().unwrap()) }
 
 enum Flow {
     Next,
@@ -201,58 +212,15 @@ fn is_const(e: &Expr) -> bool {
     matches!(e.kind, ExprKind::Const(_))
 }
 
-/// Exact arithmetic of one IR operation on in-range operands.
-/// Returns Err(site offset 0 or 1) for a trap; the caller maps it to a site.
-pub fn arith(op: ArithOp, ty: Ty, a: i128, b: i128, amt_ty: Ty) -> Result<i128, TrapKind> {
-    let bits = ty.bits() as i128;
-    let fit = |r: i128| if ty.fits(r) { Ok(r) } else { Err(TrapKind::Overflow) };
-    match op {
-        ArithOp::Add => fit(a + b),
-        ArithOp::Sub => fit(a - b),
-        ArithOp::Mul => match a.checked_mul(b) {
-            Some(r) => fit(r),
-            None => Err(TrapKind::Overflow),
-        },
-        ArithOp::AddW => Ok(ty.wrap(a + b)),
-        ArithOp::SubW => Ok(ty.wrap(a - b)),
-        ArithOp::MulW => Ok(ty.wrap(((a as u128).wrapping_mul(b as u128)) as i128)),
-        ArithOp::Div => {
-            if b == 0 {
-                return Err(TrapKind::DivZero);
-            }
-            fit(a / b)
-        }
-        ArithOp::DivW => {
-            if b == 0 {
-                return Err(TrapKind::DivZero);
-            }
-            Ok(ty.wrap(a / b))
-        }
-        ArithOp::Rem => {
-            if b == 0 {
-                return Err(TrapKind::DivZero);
-            }
-            Ok(a % b)
-        }
-        ArithOp::And => Ok(a & b),
-        ArithOp::Or => Ok(a | b),
-        ArithOp::Xor => Ok(a ^ b),
-        ArithOp::Shl | ArithOp::Shr | ArithOp::ShlW | ArithOp::ShrW => {
-            let _ = amt_ty;
-            let amt = if matches!(op, ArithOp::Shl | ArithOp::Shr) {
-                if b < 0 || b >= bits {
-                    return Err(TrapKind::ShiftRange);
-                }
-                b
-            } else {
-                b & (bits - 1)
-            };
-            if matches!(op, ArithOp::Shl | ArithOp::ShlW) {
-                Ok(ty.wrap(((a as u128) << amt) as i128))
-            } else {
-                Ok(a >> amt)
-            }
-        }
+/// Exact arithmetic of one IR operation on in-range operands, as
+/// `specs/tri/t27b/eval_arith.t27` states it. `amt_ty` is unused.
+pub fn arith(op: ArithOp, ty: Ty, a: i128, b: i128, _amt_ty: Ty) -> Result<i128, TrapKind> {
+    let r = spec::arith(op as u8, ty.bits(), ty.signed(), ty == Ty::Bool, a, b);
+    match r.trap {
+        spec::TRAP_NONE => Ok(r.value),
+        spec::TRAP_OVERFLOW => Err(TrapKind::Overflow),
+        spec::TRAP_DIV_ZERO => Err(TrapKind::DivZero),
+        _ => Err(TrapKind::ShiftRange),
     }
 }
 
@@ -381,7 +349,7 @@ impl<'p> Interp<'p> {
                 let a = self.expr(lhs, env)?;
                 let b = self.expr(rhs, env)?;
                 // Floats compare as IEEE values: NaN never equals, -0.0 == 0.0.
-                let differ = if lhs.ty == Ty::F64 { f64_of(a) != f64_of(b) } else { a != b };
+                let differ = if lhs.ty.is_float() { float_of(a, lhs.ty) != float_of(b, lhs.ty) } else { a != b };
                 if differ {
                     return Err(Stop::Trap { site: *site, a, b });
                 }
@@ -448,11 +416,7 @@ impl<'p> Interp<'p> {
                     Ok(r) => Ok(r),
                     Err(kind) => {
                         // Div has two sites: zero divisor first, overflow next.
-                        let s = if *op == ArithOp::Div && kind == TrapKind::Overflow {
-                            site + 1
-                        } else {
-                            *site
-                        };
+                        let s = site + spec::site_offset(*op as u8, kind as u8);
                         Err(Stop::Trap { site: s, a: 0, b: 0 })
                     }
                 }
@@ -460,29 +424,39 @@ impl<'p> Interp<'p> {
             ExprKind::Cmp { op, lhs, rhs } => {
                 let a = self.expr(lhs, env)?;
                 let b = self.expr(rhs, env)?;
-                if lhs.ty == Ty::F64 {
-                    return Ok(op.holds_f64(f64_of(a), f64_of(b)) as i128);
+                if lhs.ty.is_float() {
+                    // A binary32 widens to binary64 exactly: same order.
+                    return Ok(op.holds_f64(float_of(a, lhs.ty), float_of(b, lhs.ty)) as i128);
                 }
                 Ok(op.holds(a, b) as i128)
             }
             ExprKind::FArith { op, lhs, rhs } => {
                 let a = self.expr(lhs, env)?;
                 let b = self.expr(rhs, env)?;
-                Ok(f64_bits(op.apply(f64_of(a), f64_of(b))))
+                Ok(op.apply_bits(e.ty, a, b))
             }
             ExprKind::FNeg(a) => {
+                // Flips the sign bit, of a NaN too.
                 let v = self.expr(a, env)?;
-                Ok(f64_bits(-f64_of(v)))
+                Ok(v ^ (1i128 << (e.ty.bits() - 1)))
+            }
+            ExprKind::FSqrt(a) => {
+                let v = self.expr(a, env)?;
+                Ok(if e.ty == Ty::F32 { f32_bits(f32_of(v).sqrt()) } else { f64_bits(f64_of(v).sqrt()) })
             }
             ExprKind::IntToFloat(a) => {
-                // i128 to f64 rounds to nearest, ties to even; every integer
-                // operand is below 2^64, so this is the one rounding.
+                // i128 to f64 / f32 rounds to nearest, ties to even; every
+                // integer operand is below 2^64, so this is the one rounding.
                 let v = self.expr(a, env)?;
-                Ok(f64_bits(v as f64))
+                Ok(if e.ty == Ty::F32 { f32_bits(v as f32) } else { f64_bits(v as f64) })
+            }
+            ExprKind::FloatCast(a) => {
+                let v = self.expr(a, env)?;
+                Ok(if e.ty == Ty::F32 { f32_bits(f64_of(v) as f32) } else { f64_bits(f32_of(v) as f64) })
             }
             ExprKind::FloatToInt { arg, site } => {
                 let v = self.expr(arg, env)?;
-                match float_to_int(f64_of(v), e.ty) {
+                match float_to_int(float_of(v, arg.ty), e.ty) {
                     Some(r) => Ok(r),
                     None => Err(Stop::Trap { site: *site, a: 0, b: 0 }),
                 }
