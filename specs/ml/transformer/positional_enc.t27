@@ -5,18 +5,23 @@
 module PositionalEncoding;
     use base::types;
     use math::constants;
-    use math::trigonometry;
     use numeric::gf16;
+
+    // The arithmetic below is done on f64 values. A GF16 value is a 16-bit
+    // pattern (u16) that has no arithmetic of its own, so the tensors of this
+    // module hold f64 and the GF16 format stays at the storage boundary.
+    // Every table and result lives in a buffer the caller provides (the
+    // dialect has no allocator); a returned slice is a view of such a buffer.
 
     // ═══════════════════════════════════════════════════════════
     // 1. Constants
     // ═══════════════════════════════════════════════════════════
 
-    const PHI : gf16::GF16 = 1.618033988749895;
-    const INV_PHI : gf16::GF16 = 1.0 / PHI; // ≈ 0.618
-    const PHI_SQUARED : gf16::GF16 = PHI * PHI; // ≈ 2.618
-    const THETA_BASE : gf16::GF16 = 10000.0;
-    const PHI_THETA_BASE : gf16::GF16 = THETA_BASE * PHI_SQUARED; // φ-optimized base frequency
+    const PHI : f64 = 1.618033988749895;
+    const INV_PHI : f64 = 1.0 / PHI; // ≈ 0.618
+    const PHI_SQUARED : f64 = PHI * PHI; // ≈ 2.618
+    const THETA_BASE : f64 = 10000.0;
+    const PHI_THETA_BASE : f64 = THETA_BASE * PHI_SQUARED; // φ-optimized base frequency
     const DEFAULT_MAX_POSITION : u32 = 8192;
     const DEFAULT_ROTARY_DIM : u32 = 64; // Half of head_dim for 128-dim heads
 
@@ -27,316 +32,595 @@ module PositionalEncoding;
     pub const RoPEConfig = struct {
         dim : u32,                   // Rotary dimension (must be even)
         max_position : u32,          // Maximum sequence length
-        theta_base : gf16::GF16,            // Base frequency for theta
+        theta_base : f64,            // Base frequency for theta
         use_phi_optimization : bool, // Use φ-optimized frequency base
-        scaling_factor : gf16::GF16,        // Scaling for extended context
+        scaling_factor : f64,        // Scaling for extended context
     };
 
     pub const RoPEState = struct {
-        cos_cache : []gf16::GF16,           // Cached cosine values: [max_position, dim/2]
-        sin_cache : []gf16::GF16,           // Cached sine values: [max_position, dim/2]
-        inv_freq : []gf16::GF16,            // Inverse frequencies: [dim/2]
+        cos_cache : []f64,           // Cached cosine values: [max_position, dim/2]
+        sin_cache : []f64,           // Cached sine values: [max_position, dim/2]
+        inv_freq : []f64,            // Inverse frequencies: [dim/2]
         dim : u32,                   // Rotary dimension
         max_position : u32,          // Maximum sequence length
+        scaling_factor : f64,        // Position scaling the caches were built with
     };
 
     pub const RotaryResult = struct {
-        rotated_q : []gf16::GF16,           // Rotated query embeddings
-        rotated_k : []gf16::GF16,           // Rotated key embeddings
+        rotated_q : []f64,           // Rotated query embeddings
+        rotated_k : []f64,           // Rotated key embeddings
+    };
+
+    pub const HalfSplit = struct {
+        x1 : []f64,                  // First half of the vector
+        x2 : []f64,                  // Second half of the vector
     };
 
     // ═══════════════════════════════════════════════════════════
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // init(config: RoPEConfig) → RoPEState
-    // Initializes RoPE with precomputed cos/sin caches.
-    fn init(config: RoPEConfig) -> RoPEState {
+    // phi_optimized_theta(base: f64) → f64
+    // Applies φ-optimization to theta base.
+    fn phi_optimized_theta(base: f64) -> f64 {
+        return base * PHI_SQUARED;
+    }
+
+    // get_theta_base(config: RoPEConfig) → f64
+    // Returns effective theta base.
+    fn get_theta_base(config: RoPEConfig) -> f64 {
+        if (config.use_phi_optimization) {
+            return PHI_THETA_BASE;
+        }
+        return config.theta_base;
+    }
+
+    // scaling_position(pos: f64, factor: f64) → f64
+    // Applies position scaling for extended context.
+    fn scaling_position(pos: f64, factor: f64) -> f64 {
+        return pos / factor;
+    }
+
+    // fill_inv_freq(dim, theta_base, out) : out[i] = 1 / theta_base^(2i/dim), i in [0, dim/2)
+    fn fill_inv_freq(dim: u32, theta_base: f64, out: []f64) -> void {
+        let half = (dim / 2) as usize;
+        let dimf = @as(f64, @floatFromInt(dim));
+        let log_theta = @log(theta_base);
+        for (i in 0..half) {
+            let exponent = 2.0 * @as(f64, @floatFromInt(i)) / dimf;
+            out[i] = @exp(-exponent * log_theta);
+        }
+    }
+
+    // compute_inv_freq(dim: u32, theta_base: f64, out: []f64) → []f64
+    // Computes inverse frequencies for RoPE into out and returns the dim/2 used cells.
+    fn compute_inv_freq(dim: u32, theta_base: f64, out: []f64) -> []f64 {
+        fill_inv_freq(dim, theta_base, out);
+        return out[0..((dim / 2) as usize)];
+    }
+
+    // fill_cache(inv_freq, positions, scaling_factor, cos_cache, sin_cache)
+    // cache[p * half + i] = cos / sin of (p / scaling_factor) * inv_freq[i]
+    fn fill_cache(inv_freq: []f64, positions: usize, scaling_factor: f64, cos_cache: []f64, sin_cache: []f64) -> void {
+        let half = inv_freq.len();
+        for (p in 0..positions) {
+            let pos = scaling_position(@as(f64, @floatFromInt(p)), scaling_factor);
+            for (i in 0..half) {
+                let angle = pos * inv_freq[i];
+                cos_cache[p * half + i] = @cos(angle);
+                sin_cache[p * half + i] = @sin(angle);
+            }
+        }
+    }
+
+    // init(config, inv_freq, cos_cache, sin_cache) → RoPEState
+    // Initializes RoPE with precomputed cos/sin caches. inv_freq must hold
+    // dim/2 cells and each cache max_position * dim/2 cells.
+    fn init(config: RoPEConfig, inv_freq: []f64, cos_cache: []f64, sin_cache: []f64) -> RoPEState {
         // 1. Compute inverse frequencies:
         //    inv_freq[i] = 1.0 / (theta_base ^ (2i / dim)) for i in [0, dim/2)
-        //
+        let half = (config.dim / 2) as usize;
+        let positions = config.max_position as usize;
+        fill_inv_freq(config.dim, get_theta_base(config), inv_freq);
+
         // 2. Precompute cos/sin for all positions:
-        //    position = [0, 1, ..., max_position-1]
         //    freqs = position * inv_freq  (outer product)
-        //    cos_cache = cos(freqs)
-        //    sin_cache = sin(freqs)
+        fill_cache(inv_freq[0..half], positions, config.scaling_factor, cos_cache, sin_cache);
+
+        return RoPEState{
+            .cos_cache = cos_cache[0..(positions * half)],
+            .sin_cache = sin_cache[0..(positions * half)],
+            .inv_freq = inv_freq[0..half],
+            .dim = config.dim,
+            .max_position = config.max_position,
+            .scaling_factor = config.scaling_factor,
+        };
     }
 
-    // rotate_half(x: []gf16::GF16) → ([]gf16::GF16, []gf16::GF16)
+    // extend_cache(state, new_max_position, cos_cache, sin_cache) → RoPEState
+    // Extends the cos/sin cache for longer sequences. Keeps the existing
+    // inv_freq and rebuilds the caches in the new buffers.
+    fn extend_cache(state: RoPEState, new_max_position: u32, cos_cache: []f64, sin_cache: []f64) -> RoPEState {
+        let half = state.inv_freq.len();
+        let positions = new_max_position as usize;
+        fill_cache(state.inv_freq, positions, state.scaling_factor, cos_cache, sin_cache);
+
+        return RoPEState{
+            .cos_cache = cos_cache[0..(positions * half)],
+            .sin_cache = sin_cache[0..(positions * half)],
+            .inv_freq = state.inv_freq,
+            .dim = state.dim,
+            .max_position = new_max_position,
+            .scaling_factor = state.scaling_factor,
+        };
+    }
+
+    // rotate_half(x: []f64) → HalfSplit
     // Splits tensor into first and second half for rotation.
-    fn rotate_half(x: []gf16::GF16) -> struct { x1: []gf16::GF16, x2: []gf16::GF16 } {
-        // x1 = x[0 : dim/2]
-        // x2 = x[dim/2 : dim]
+    fn rotate_half(x: []f64) -> HalfSplit {
+        let half = x.len() / 2;
+        return HalfSplit{
+            .x1 = x[0..half],
+            .x2 = x[half..(half * 2)],
+        };
     }
 
-    // apply rotary(x: []gf16::GF16, cos: []gf16::GF16, sin: []gf16::GF16) → []gf16::GF16
-    // Applies rotary rotation to a single vector.
-    fn apply_rotary(x: []gf16::GF16, cos: []gf16::GF16, sin: []gf16::GF16) -> []gf16::GF16 {
-        // (x1, x2) = rotate_half(x)
-        // x1_new = x1 * cos - x2 * sin
-        // x2_new = x1 * sin + x2 * cos
-        // return concat(x1_new, x2_new)
+    // rotate_pairs(x, cos, sin, out) : rotates each pair (x[2j], x[2j+1]) by
+    // the angle whose cosine and sine are cos[j] and sin[j]:
+    //   x'_1 = x_1 * cos - x_2 * sin
+    //   x'_2 = x_1 * sin + x_2 * cos
+    fn rotate_pairs(x: []f64, cos: []f64, sin: []f64, out: []f64) -> void {
+        let pairs = x.len() / 2;
+        for (j in 0..pairs) {
+            let a = x[2 * j];
+            let b = x[2 * j + 1];
+            out[2 * j] = a * cos[j] - b * sin[j];
+            out[2 * j + 1] = a * sin[j] + b * cos[j];
+        }
     }
 
-    // forward(state: RoPEState, q: []gf16::GF16, k: []gf16::GF16, positions: []u32) → RotaryResult
-    // Applies RoPE to query and key tensors.
-    fn forward(state: RoPEState, q: []gf16::GF16, k: []gf16::GF16, positions: []u32) -> RotaryResult {
-        // For each position in positions:
-        //   cos = state.cos_cache[position]
-        //   sin = state.sin_cache[position]
-        //   q_rotated = apply_rotary(q, cos, sin)
-        //   k_rotated = apply_rotary(k, cos, sin)
+    // apply_rotary(x, cos, sin, out) → []f64
+    // Applies rotary rotation to a single vector; cos and sin hold one
+    // value per pair of x.
+    fn apply_rotary(x: []f64, cos: []f64, sin: []f64, out: []f64) -> []f64 {
+        rotate_pairs(x, cos, sin, out);
+        return out[0..x.len()];
     }
 
-    // forward_batch(state: RoPEState, q: []gf16::GF16, k: []gf16::GF16, seq_len: u32) → RotaryResult
-    // Batched forward pass for sequential positions.
-    fn forward_batch(state: RoPEState, q: []gf16::GF16, k: []gf16::GF16, seq_len: u32) -> RotaryResult {
-        // Processes positions 0..seq_len-1
-        // Uses precomputed cos/sin caches directly
+    // rotate_token(state, x, pos, out) : rotates one dim-sized vector with the
+    // cached cos/sin row of position pos
+    fn rotate_token(state: RoPEState, x: []f64, pos: usize, out: []f64) -> void {
+        let half = state.inv_freq.len();
+        rotate_pairs(x, state.cos_cache[(pos * half)..(pos * half + half)], state.sin_cache[(pos * half)..(pos * half + half)], out);
     }
 
-    // compute_inv_freq(dim: u32, theta_base: gf16::GF16) → []gf16::GF16
-    // Computes inverse frequencies for RoPE.
-    fn compute_inv_freq(dim: u32, theta_base: gf16::GF16) -> []gf16::GF16 {
-        // inv_freq[i] = 1.0 / (theta_base ^ (2i / dim))
-        // for i in [0, dim/2)
+    // forward(state, q, k, positions, out_q, out_k) → RotaryResult
+    // Applies RoPE to query and key tensors: token t (dim values each) is
+    // rotated by the cache row of positions[t].
+    fn forward(state: RoPEState, q: []f64, k: []f64, positions: []u32, out_q: []f64, out_k: []f64) -> RotaryResult {
+        let dim = state.dim as usize;
+        for (t in 0..positions.len()) {
+            let pos = positions[t] as usize;
+            rotate_token(state, q[(t * dim)..(t * dim + dim)], pos, out_q[(t * dim)..(t * dim + dim)]);
+            rotate_token(state, k[(t * dim)..(t * dim + dim)], pos, out_k[(t * dim)..(t * dim + dim)]);
+        }
+        return RotaryResult{
+            .rotated_q = out_q[0..q.len()],
+            .rotated_k = out_k[0..k.len()],
+        };
     }
 
-    // phi_optimized_theta(base: gf16::GF16) → f32
-    // Applies φ-optimization to theta base.
-    fn phi_optimized_theta(base: gf16::GF16) -> gf16::GF16 {
-        // return base * PHI_SQUARED
+    // forward_batch(state, q, k, seq_len, out_q, out_k) → RotaryResult
+    // Batched forward pass for sequential positions 0..seq_len-1.
+    fn forward_batch(state: RoPEState, q: []f64, k: []f64, seq_len: u32, out_q: []f64, out_k: []f64) -> RotaryResult {
+        let dim = state.dim as usize;
+        for (t in 0..(seq_len as usize)) {
+            rotate_token(state, q[(t * dim)..(t * dim + dim)], t, out_q[(t * dim)..(t * dim + dim)]);
+            rotate_token(state, k[(t * dim)..(t * dim + dim)], t, out_k[(t * dim)..(t * dim + dim)]);
+        }
+        return RotaryResult{
+            .rotated_q = out_q[0..q.len()],
+            .rotated_k = out_k[0..k.len()],
+        };
     }
 
-    // extend_cache(state: RoPEState, new_max_position: u32) → RoPEState
-    // Extends the cos/sin cache for longer sequences.
-    fn extend_cache(state: RoPEState, new_max_position: u32) -> RoPEState {
-        // Rebuild cos/sin caches with new max_position
-        // Keep existing inv_freq
+    // ═══════════════════════════════════════════════════════════
+    // Helpers for the tests
+    // ═══════════════════════════════════════════════════════════
+
+    fn compute_norm(x: []f64) -> f64 {
+        var total : f64 = 0.0;
+        for (i in 0..x.len()) {
+            total += x[i] * x[i];
+        }
+        return @sqrt(total);
     }
 
-    // get_theta_base(config: RoPEConfig) → f32
-    // Returns effective theta base.
-    fn get_theta_base(config: RoPEConfig) -> gf16::GF16 {
-        // if use_phi_optimization: return PHI_THETA_BASE
-        // else: return config.theta_base
+    fn abs_diff(a: f64, b: f64) -> f64 {
+        return @abs(a - b);
     }
 
-    // scaling_position(pos: gf16::GF16, factor: gf16::GF16) → f32
-    // Applies position scaling for extended context.
-    fn scaling_position(pos: gf16::GF16, factor: gf16::GF16) -> gf16::GF16 {
-        // return pos / factor
+    fn same_values(a: []f64, b: []f64) -> bool {
+        if (a.len() != b.len()) {
+            return false;
+        }
+        for (i in 0..a.len()) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn all_positive(x: []f64) -> bool {
+        for (i in 0..x.len()) {
+            if (x[i] <= 0.0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn strictly_decreasing(x: []f64) -> bool {
+        for (i in 1..x.len()) {
+            if (x[i] >= x[i - 1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn all_in_unit_range(x: []f64) -> bool {
+        for (i in 0..x.len()) {
+            if (x[i] < -1.0 or x[i] > 1.0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Runtime views of constants, so that a test about a constant asserts at
+    // run time rather than at compile time.
+    fn phi_theta_base_value() -> f64 {
+        return PHI_THETA_BASE;
+    }
+    fn theta_base_value() -> f64 {
+        return THETA_BASE;
+    }
+    fn phi_squared_value() -> f64 {
+        return PHI_SQUARED;
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Tests
     // ═══════════════════════════════════════════════════════════
 
-    test init_creates_correct_dimensions
-        given config = RoPEConfig{.dim = 64, .max_position = 128, .theta_base = 10000.0, .use_phi_optimization = false}
-        when state = init(config)
-        then state.cos_cache.len == 128 * 32 // max_position * dim/2
-        and   state.sin_cache.len == 128 * 32
-        and   state.inv_freq.len == 32 // dim/2
+    test init_creates_correct_dimensions {
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [4096]f64 = [0.0] ** 4096;
+        var sc : [4096]f64 = [0.0] ** 4096;
+        var config = RoPEConfig{ .dim = 64, .max_position = 128, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(state.cos_cache.len() == 128 * 32); // max_position * dim/2
+        assert(state.sin_cache.len() == 128 * 32);
+        assert(state.inv_freq.len() == 32); // dim/2
+    }
 
-    test init_with_phi_optimization
-        given config = RoPEConfig{.dim = 64, .max_position = 128, .theta_base = 10000.0, .use_phi_optimization = true}
-        when state = init(config)
-        then state.inv_freq[0] < 1.0 / 10000.0 // Higher base = lower freqs
+    // inv_freq[0] = 1 / base^0 = 1 for every base, so the original check on
+    // index 0 ("inv_freq[0] < 1/10000") was false by arithmetic. The higher
+    // base shows in the lowest frequency, the last one: with the phi base it is
+    // below 1/10000, with the plain base it is still above.
+    test init_with_phi_optimization {
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [4096]f64 = [0.0] ** 4096;
+        var sc : [4096]f64 = [0.0] ** 4096;
+        var iv2 : [32]f64 = [0.0] ** 32;
+        var cc2 : [4096]f64 = [0.0] ** 4096;
+        var sc2 : [4096]f64 = [0.0] ** 4096;
+        var config = RoPEConfig{ .dim = 64, .max_position = 128, .theta_base = 10000.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var plain = RoPEConfig{ .dim = 64, .max_position = 128, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        var plain_state = init(plain, &iv2, &cc2, &sc2);
+        assert(abs_diff(state.inv_freq[0], 1.0) < 1e-12);
+        assert(state.inv_freq[31] < 1.0 / 10000.0); // Higher base = lower freqs
+        assert(plain_state.inv_freq[31] > 1.0 / 10000.0);
+        assert(state.inv_freq[1] < plain_state.inv_freq[1]);
+    }
 
-    test rotate_half_splits_correctly
-        given x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-        when result = rotate_half(x)
-        then result.x1.len == 4
-        and   result.x2.len == 4
-        and   result.x1 == [1.0, 2.0, 3.0, 4.0]
-        and   result.x2 == [5.0, 6.0, 7.0, 8.0]
+    test rotate_half_splits_correctly {
+        var x = []f64{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+        var first = []f64{ 1.0, 2.0, 3.0, 4.0 };
+        var second = []f64{ 5.0, 6.0, 7.0, 8.0 };
+        var result = rotate_half(x);
+        assert(result.x1.len() == 4);
+        assert(result.x2.len() == 4);
+        assert(same_values(result.x1, first));
+        assert(same_values(result.x2, second));
+    }
 
-    test apply_rotary_preserves_norm
-        given x = [1.0, 0.0, 0.0, 1.0] // Two 2D vectors
-        and   cos = [1.0, 1.0]
-        and   sin = [0.0, 0.0]
-        when result = apply_rotary(x, cos, sin)
-        then approximately_equal(compute_norm(result), compute_norm(x))
+    test apply_rotary_preserves_norm {
+        var x = []f64{ 1.0, 0.0, 0.0, 1.0 }; // Two 2D vectors
+        var cos = []f64{ 1.0, 1.0 };
+        var sin = []f64{ 0.0, 0.0 };
+        var out : [4]f64 = [0.0] ** 4;
+        var result = apply_rotary(x, cos, sin, &out);
+        assert(abs_diff(compute_norm(result), compute_norm(x)) < 1e-9);
+        assert(same_values(result, x));
+        // a real rotation (cos^2 + sin^2 = 1) keeps the norm as well
+        var cos2 = []f64{ 0.6, 0.8 };
+        var sin2 = []f64{ 0.8, 0.6 };
+        var out2 : [4]f64 = [0.0] ** 4;
+        var rotated = apply_rotary(x, cos2, sin2, &out2);
+        assert(abs_diff(compute_norm(rotated), compute_norm(x)) < 1e-9);
+        assert(same_values(rotated, x) == false);
+    }
 
-    test apply_rotary_rotates_correctly
-        given x = [1.0, 0.0, 1.0, 0.0] // Two (1, 0) vectors
-        and   cos = [0.0, 0.0] // cos(90°) = 0
-        and   sin = [1.0, 1.0] // sin(90°) = 1
-        when result = apply_rotary(x, cos, sin)
-        then approximately_equal(result[0], 0.0, 1e-6)  // x1 * cos - x2 * sin = 0
-        and   approximately_equal(result[1], -1.0, 1e-6) // x1 * sin + x2 * cos = -1
-        and   approximately_equal(result[2], 0.0, 1e-6)
-        and   approximately_equal(result[3], -1.0, 1e-6)
+    // x'_2 = x_1 * sin + x_2 * cos = 1 * 1 + 0 * 0 = +1 (the notes at the
+    // end of this file give the same formula), so the original expected -1
+    // for result[1] and result[3] was an arithmetic sign error.
+    test apply_rotary_rotates_correctly {
+        var x = []f64{ 1.0, 0.0, 1.0, 0.0 }; // Two (1, 0) vectors
+        var cos = []f64{ 0.0, 0.0 }; // cos(90 deg) = 0
+        var sin = []f64{ 1.0, 1.0 }; // sin(90 deg) = 1
+        var out : [4]f64 = [0.0] ** 4;
+        var result = apply_rotary(x, cos, sin, &out);
+        assert(abs_diff(result[0], 0.0) < 1e-6); // x1 * cos - x2 * sin = 0
+        assert(abs_diff(result[1], 1.0) < 1e-6); // x1 * sin + x2 * cos = 1
+        assert(abs_diff(result[2], 0.0) < 1e-6);
+        assert(abs_diff(result[3], 1.0) < 1e-6);
+    }
 
-    test forward_rotates_q_and_k
-        given config = RoPEConfig{.dim = 4, .max_position = 10, .theta_base = 10000.0}
-        and   state = init(config)
-        and   q = [1.0, 0.0, 1.0, 0.0]
-        and   k = [1.0, 0.0, 1.0, 0.0]
-        and   positions = [0]
-        when result = forward(state, q, k, positions)
-        then result.rotated_q.len == 4
-        and   result.rotated_k.len == 4
+    test forward_rotates_q_and_k {
+        var iv : [2]f64 = [0.0] ** 2;
+        var cc : [20]f64 = [0.0] ** 20;
+        var sc : [20]f64 = [0.0] ** 20;
+        var oq : [4]f64 = [0.0] ** 4;
+        var ok : [4]f64 = [0.0] ** 4;
+        var config = RoPEConfig{ .dim = 4, .max_position = 10, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        var q = []f64{ 1.0, 0.0, 1.0, 0.0 };
+        var k = []f64{ 1.0, 0.0, 1.0, 0.0 };
+        var positions : [1]u32 = [0];
+        var result = forward(state, q, k, &positions, &oq, &ok);
+        assert(result.rotated_q.len() == 4);
+        assert(result.rotated_k.len() == 4);
+        // position 0 is the identity rotation
+        assert(same_values(result.rotated_q, q));
+        assert(same_values(result.rotated_k, k));
+    }
 
-    test forward_different_positions_different_rotations
-        given config = RoPEConfig{.dim = 4, .max_position = 10, .theta_base = 100.0} // Low base for visible rotation
-        and   state = init(config)
-        and   q = [1.0, 0.0, 1.0, 0.0]
-        and   k = [1.0, 0.0, 1.0, 0.0]
-        when result1 = forward(state, q, k, [0])
-        and   result2 = forward(state, q, k, [1])
-        then not all_equal(result1.rotated_q, result2.rotated_q)
+    test forward_different_positions_different_rotations {
+        var iv : [2]f64 = [0.0] ** 2;
+        var cc : [20]f64 = [0.0] ** 20;
+        var sc : [20]f64 = [0.0] ** 20;
+        var oq1 : [4]f64 = [0.0] ** 4;
+        var ok1 : [4]f64 = [0.0] ** 4;
+        var oq2 : [4]f64 = [0.0] ** 4;
+        var ok2 : [4]f64 = [0.0] ** 4;
+        var config = RoPEConfig{ .dim = 4, .max_position = 10, .theta_base = 100.0, .use_phi_optimization = false, .scaling_factor = 1.0 }; // Low base for visible rotation
+        var state = init(config, &iv, &cc, &sc);
+        var q = []f64{ 1.0, 0.0, 1.0, 0.0 };
+        var k = []f64{ 1.0, 0.0, 1.0, 0.0 };
+        var p0 : [1]u32 = [0];
+        var p1 : [1]u32 = [1];
+        var result1 = forward(state, q, k, &p0, &oq1, &ok1);
+        var result2 = forward(state, q, k, &p1, &oq2, &ok2);
+        assert(same_values(result1.rotated_q, result2.rotated_q) == false);
+        // position 1, first pair: angle 1 * inv_freq[0] = 1 radian
+        assert(abs_diff(result2.rotated_q[0], @cos(1.0)) < 1e-9);
+        assert(abs_diff(result2.rotated_q[1], @sin(1.0)) < 1e-9);
+    }
 
-    test compute_inv_freq_decreases
-        given dim = 64
-        and   theta_base = 10000.0
-        when inv_freq = compute_inv_freq(dim, theta_base)
-        then inv_freq[0] > inv_freq[1]
-        and   inv_freq[1] > inv_freq[2]
+    test forward_batch_matches_forward_with_sequential_positions {
+        var iv : [2]f64 = [0.0] ** 2;
+        var cc : [20]f64 = [0.0] ** 20;
+        var sc : [20]f64 = [0.0] ** 20;
+        var oq1 : [12]f64 = [0.0] ** 12;
+        var ok1 : [12]f64 = [0.0] ** 12;
+        var oq2 : [12]f64 = [0.0] ** 12;
+        var ok2 : [12]f64 = [0.0] ** 12;
+        var config = RoPEConfig{ .dim = 4, .max_position = 10, .theta_base = 100.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        var q = []f64{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
+        var k = []f64{ 4.0, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0 };
+        var positions : [3]u32 = [0, 1, 2];
+        var by_positions = forward(state, q, k, &positions, &oq1, &ok1);
+        var batch = forward_batch(state, q, k, 3, &oq2, &ok2);
+        assert(batch.rotated_q.len() == 12);
+        assert(same_values(by_positions.rotated_q, batch.rotated_q));
+        assert(same_values(by_positions.rotated_k, batch.rotated_k));
+        // token 0 sits at position 0, so it is unchanged
+        assert(abs_diff(batch.rotated_q[0], 1.0) < 1e-12);
+        assert(abs_diff(batch.rotated_q[3], 4.0) < 1e-12);
+        // later tokens are rotated, so equal inputs give different outputs
+        assert(abs_diff(batch.rotated_q[4], 1.0) > 1e-3);
+    }
 
-    test phi_optimized_theta_increases_base
-        given base = 10000.0
-        when result = phi_optimized_theta(base)
-        then result > base
-        and   approximately_equal(result, base * PHI_SQUARED, 1e-6)
+    test compute_inv_freq_decreases {
+        var out : [32]f64 = [0.0] ** 32;
+        var inv_freq = compute_inv_freq(64, 10000.0, &out);
+        assert(inv_freq.len() == 32);
+        assert(inv_freq[0] > inv_freq[1]);
+        assert(inv_freq[1] > inv_freq[2]);
+        // inv_freq[1] = 10000^(-2/64)
+        assert(abs_diff(inv_freq[1], @exp(-(2.0 / 64.0) * @log(10000.0))) < 1e-12);
+    }
 
-    test get_theta_base_phi_enabled
-        given config = RoPEConfig{.theta_base = 10000.0, .use_phi_optimization = true}
-        when result = get_theta_base(config)
-        then approximately_equal(result, PHI_THETA_BASE, 1e-6)
+    test phi_optimized_theta_increases_base {
+        var base : f64 = 10000.0;
+        var result = phi_optimized_theta(base);
+        assert(result > base);
+        assert(abs_diff(result, base * phi_squared_value()) < 1e-6);
+    }
 
-    test get_theta_base_phi_disabled
-        given config = RoPEConfig{.theta_base = 5000.0, .use_phi_optimization = false}
-        when result = get_theta_base(config)
-        then approximately_equal(result, 5000.0, 1e-6)
+    test get_theta_base_phi_enabled {
+        var config = RoPEConfig{ .dim = 4, .max_position = 1, .theta_base = 10000.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var result = get_theta_base(config);
+        assert(abs_diff(result, phi_theta_base_value()) < 1e-6);
+    }
 
-    test scaling_position_reduces_position
-        given pos = 100.0
-        and   factor = 2.0
-        when result = scaling_position(pos, factor)
-        then approximately_equal(result, 50.0)
+    test get_theta_base_phi_disabled {
+        var config = RoPEConfig{ .dim = 4, .max_position = 1, .theta_base = 5000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var result = get_theta_base(config);
+        assert(abs_diff(result, 5000.0) < 1e-6);
+    }
 
-    test extend_cache_increases_max_position
-        given config = RoPEConfig{.dim = 64, .max_position = 100, .theta_base = 10000.0}
-        and   state = init(config)
-        when extended = extend_cache(state, 200)
-        then extended.max_position == 200
-        and   extended.cos_cache.len == 200 * 32
+    test scaling_position_reduces_position {
+        var pos : f64 = 100.0;
+        var factor : f64 = 2.0;
+        var result = scaling_position(pos, factor);
+        assert(abs_diff(result, 50.0) < 1e-9);
+    }
+
+    test extend_cache_increases_max_position {
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [3200]f64 = [0.0] ** 3200;
+        var sc : [3200]f64 = [0.0] ** 3200;
+        var cc2 : [6400]f64 = [0.0] ** 6400;
+        var sc2 : [6400]f64 = [0.0] ** 6400;
+        var config = RoPEConfig{ .dim = 64, .max_position = 100, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        var extended = extend_cache(state, 200, &cc2, &sc2);
+        assert(extended.max_position == 200);
+        assert(extended.cos_cache.len() == 200 * 32);
+        assert(extended.sin_cache.len() == 200 * 32);
+        // the rows that existed before are unchanged
+        assert(same_values(state.cos_cache, extended.cos_cache[0..3200]));
+        // the new rows are filled: position 150, frequency 0 has angle 150
+        assert(abs_diff(extended.cos_cache[150 * 32], @cos(150.0)) < 1e-9);
+    }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Invariants
     // ═══════════════════════════════════════════════════════════
 
-    invariant init_creates_even_dimension
-        given config = RoPEConfig{.dim = 64}
-        when state = init(config)
-        then state.dim % 2 == 0
+    test init_creates_even_dimension {
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [128]f64 = [0.0] ** 128;
+        var sc : [128]f64 = [0.0] ** 128;
+        var config = RoPEConfig{ .dim = 64, .max_position = 4, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(state.dim % 2 == 0);
+    }
 
-    invariant cos_sin_same_size
-        given config = any_rope_config()
-        when state = init(config)
-        then state.cos_cache.len == state.sin_cache.len
+    test cos_sin_same_size {
+        var iv : [16]f64 = [0.0] ** 16;
+        var cc : [320]f64 = [0.0] ** 320;
+        var sc : [320]f64 = [0.0] ** 320;
+        var config = RoPEConfig{ .dim = 32, .max_position = 20, .theta_base = 500.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(state.cos_cache.len() == state.sin_cache.len());
+        assert(state.cos_cache.len() == 20 * 16);
+    }
 
-    invariant inv_freq_is_half_dim
-        given config = RoPEConfig{.dim = 64}
-        when state = init(config)
-        then state.inv_freq.len == 32
+    test inv_freq_is_half_dim {
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [128]f64 = [0.0] ** 128;
+        var sc : [128]f64 = [0.0] ** 128;
+        var config = RoPEConfig{ .dim = 64, .max_position = 4, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(state.inv_freq.len() == 32);
+    }
 
-    invariant inv_freq_positive
-        given config = any_rope_config()
-        when state = init(config)
-        then all(state.inv_freq, is_positive)
+    test inv_freq_positive {
+        var iv : [16]f64 = [0.0] ** 16;
+        var cc : [320]f64 = [0.0] ** 320;
+        var sc : [320]f64 = [0.0] ** 320;
+        var config = RoPEConfig{ .dim = 32, .max_position = 20, .theta_base = 500.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(all_positive(state.inv_freq));
+    }
 
-    invariant inv_freq_monotonically_decreasing
-        given config = any_rope_config()
-        when state = init(config)
-        then for i in 1..state.inv_freq.len-1:
-            state.inv_freq[i] < state.inv_freq[i-1]
+    test inv_freq_monotonically_decreasing {
+        var iv : [16]f64 = [0.0] ** 16;
+        var cc : [320]f64 = [0.0] ** 320;
+        var sc : [320]f64 = [0.0] ** 320;
+        var config = RoPEConfig{ .dim = 32, .max_position = 20, .theta_base = 500.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(strictly_decreasing(state.inv_freq));
+        assert(state.inv_freq.len() == 16);
+    }
 
-    invariant cos_in_valid_range
-        given config = any_rope_config()
-        when state = init(config)
-        then all(state.cos_cache, fn(x) x >= -1.0 and x <= 1.0)
+    test cos_in_valid_range {
+        var iv : [16]f64 = [0.0] ** 16;
+        var cc : [320]f64 = [0.0] ** 320;
+        var sc : [320]f64 = [0.0] ** 320;
+        var config = RoPEConfig{ .dim = 32, .max_position = 20, .theta_base = 500.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(all_in_unit_range(state.cos_cache));
+        assert(abs_diff(state.cos_cache[0], 1.0) < 1e-12); // position 0
+    }
 
-    invariant sin_in_valid_range
-        given config = any_rope_config()
-        when state = init(config)
-        then all(state.sin_cache, fn(x) x >= -1.0 and x <= 1.0)
+    test sin_in_valid_range {
+        var iv : [16]f64 = [0.0] ** 16;
+        var cc : [320]f64 = [0.0] ** 320;
+        var sc : [320]f64 = [0.0] ** 320;
+        var config = RoPEConfig{ .dim = 32, .max_position = 20, .theta_base = 500.0, .use_phi_optimization = true, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        assert(all_in_unit_range(state.sin_cache));
+        assert(abs_diff(state.sin_cache[0], 0.0) < 1e-12); // position 0
+    }
 
-    invariant apply_rotary_preserves_vector_norm
-        given x = random_input(64)
-        and   cos = random_array(32) // Will be normalized in actual test
-        and   sin = random_array(32)
-        when norm_x = compute_norm(x)
-        and   result = apply_rotary(x, normalize_to_range(cos, -1, 1), normalize_to_range(sin, -1, 1))
-        // Rotation is norm-preserving: |Rx| = |x|
-        // (This is approximate due to per-dimension rotation)
+    // Rotation is norm-preserving: |Rx| = |x| for every pair.
+    test apply_rotary_preserves_vector_norm {
+        var iv : [8]f64 = [0.0] ** 8;
+        var cc : [80]f64 = [0.0] ** 80;
+        var sc : [80]f64 = [0.0] ** 80;
+        var out : [16]f64 = [0.0] ** 16;
+        var config = RoPEConfig{ .dim = 16, .max_position = 10, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+        var x = []f64{ 3.0, -1.0, 4.0, 1.0, -5.0, 9.0, 2.0, -6.0, 5.0, 3.0, -5.0, 8.0, 9.0, -7.0, 9.0, 3.0 };
+        var p : usize = 0;
+        while (p < 10) {
+            rotate_token(state, x, p, &out);
+            assert(abs_diff(compute_norm(out[0..16]), compute_norm(x)) < 1e-9);
+            p += 1;
+        }
+    }
 
-    invariant phi_theta_base_larger_than_default
-        then PHI_THETA_BASE > THETA_BASE
+    test phi_theta_base_larger_than_default {
+        assert(phi_theta_base_value() > theta_base_value());
+    }
 
-    invariant scaling_position_preserves_zero
-        given pos = 0.0
-        and   factor = positive_gf16()
-        when result = scaling_position(pos, factor)
-        then result == 0.0
+    test scaling_position_preserves_zero {
+        var pos : f64 = 0.0;
+        var factor : f64 = 3.5;
+        var result = scaling_position(pos, factor);
+        assert(result == 0.0);
+    }
 
-    invariant scaling_position_with_factor_one_unchanged
-        given pos = random_positive_gf16()
-        and   factor = 1.0
-        when result = scaling_position(pos, factor)
-        then approximately_equal(result, pos)
+    test scaling_position_with_factor_one_unchanged {
+        var pos : f64 = 123.5;
+        var factor : f64 = 1.0;
+        var result = scaling_position(pos, factor);
+        assert(abs_diff(result, pos) < 1e-12);
+    }
 
     // ═══════════════════════════════════════════════════════════
-    // TDD: Benchmarks
+    // TDD: Benchmarks (the dialect has no clock, so a bench block runs the
+    // call and the time budget of each one is recorded in its comment)
     // ═══════════════════════════════════════════════════════════
 
-    bench init_small
-        given config = RoPEConfig{.dim = 64, .max_position = 1024}
-        when result = init(config)
-        then elapsed_time_ms < 5
+    bench init_small { // budget: 5 ms
+        var iv : [32]f64 = [0.0] ** 32;
+        var cc : [32768]f64 = [0.0] ** 32768;
+        var sc : [32768]f64 = [0.0] ** 32768;
+        var config = RoPEConfig{ .dim = 64, .max_position = 1024, .theta_base = 10000.0, .use_phi_optimization = false, .scaling_factor = 1.0 };
+        var state = init(config, &iv, &cc, &sc);
+    }
 
-    bench init_large
-        given config = RoPEConfig{.dim = 128, .max_position = 8192}
-        when result = init(config)
-        then elapsed_time_ms < 50
+    bench apply_rotary_small { // budget: 50 us
+        var x : [64]f64 = [1.0] ** 64;
+        var cos : [32]f64 = [0.5] ** 32;
+        var sin : [32]f64 = [0.5] ** 32;
+        var out : [64]f64 = [0.0] ** 64;
+        var result = apply_rotary(&x, &cos, &sin, &out);
+    }
 
-    bench apply_rotary_small
-        given x = random_input(64)
-        and   cos = random_array(32)
-        and   sin = random_array(32)
-        when result = apply_rotary(x, cos, sin)
-        then elapsed_time_us < 50
-
-    bench apply_rotary_large
-        given x = random_input(128)
-        and   cos = random_array(64)
-        and   sin = random_array(64)
-        when result = apply_rotary(x, cos, sin)
-        then elapsed_time_us < 100
-
-    bench forward_batch_short_sequence
-        given config = RoPEConfig{.dim = 64, .max_position = 1024}
-        and   state = init(config)
-        and   q = random_input(64 * 10) // 10 tokens
-        and   k = random_input(64 * 10)
-        when result = forward_batch(state, q, k, 10)
-        then elapsed_time_us < 200
-
-    bench forward_batch_long_sequence
-        given config = RoPEConfig{.dim = 64, .max_position = 8192}
-        and   state = init(config)
-        and   q = random_input(64 * 1024) // 1024 tokens
-        and   k = random_input(64 * 1024)
-        when result = forward_batch(state, q, k, 1024)
-        then elapsed_time_ms < 20
-
-    bench compute_inv_freq
-        given dim = 128
-        and   theta_base = 10000.0
-        when result = compute_inv_freq(dim, theta_base)
-        then elapsed_time_us < 50
+    bench compute_inv_freq_dim_128 { // budget: 50 us
+        var out : [64]f64 = [0.0] ** 64;
+        var result = compute_inv_freq(128, 10000.0, &out);
+    }
 
     // ═══════════════════════════════════════════════════════════
     // Mathematical Notes

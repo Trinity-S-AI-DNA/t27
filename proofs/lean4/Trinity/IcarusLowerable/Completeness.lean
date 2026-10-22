@@ -40,12 +40,15 @@ def api_tri_net_api_module : Module := {
   benches := [{ name := "", params := [], ret := none, body := [] }, { name := "", params := [], ret := none, body := [] }]
 }
 
--- Negative signature projection from specs/ar/asp_solver.t27. Program has
--- variable-length Clause fields and solve returns variable-length AnswerSet.
--- This shallow AST keeps these unmodeled types under their source names.
--- The old unused marker left an empty module; it could not prove false.
+-- Negative signature projection from specs/ar/asp_solver.t27. Since #8980 its
+-- arrays are fixed (MAX_CLAUSES 16, MAX_CLAUSE_LITS 4, MAX_LARGS 2, MAX_LITS 16,
+-- MAX_ANSWERS 4); `string` (Literal.name/args, reached via Clause) keeps it
+-- unlowerable. Function bodies are left out.
 def ar_asp_solver_env : Env := {
-  structs := [("Program", [("clauses", (.struct "[Clause]")), ("constraints", (.struct "[Clause]"))])],
+  structs := [
+    ("Literal", [("name", .string), ("is_negated", .bool), ("args", (.array 2 .string)), ("nargs", .u32)]), ("Clause", [("lits", (.array 4 (.struct "Literal"))), ("count", .u32)]), ("LitList", [("items", (.array 16 (.struct "Literal"))), ("count", .u32)]),
+    ("Program", [("clauses", (.array 16 (.struct "Clause"))), ("nclauses", .u32), ("constraints", (.array 16 (.struct "Clause"))), ("nconstraints", .u32)]),
+    ("AnswerSet", [("literals", (.struct "LitList")), ("proven", .bool), ("cost", .i32)]), ("SolveResult", [("answers", (.array 4 (.struct "AnswerSet"))), ("count", .u32), ("steps", .u32), ("trace_len", .u32)])],
   constructors := [],
   enums := [],
   imports := [],
@@ -57,7 +60,7 @@ def ar_asp_solver_module : Module := {
   name := "ar_asp_solver",
   imports := [],
   globals := [],
-  functions := [{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "[AnswerSet]")), body := [] }],
+  functions := [{ name := "solve", params := [("prog", (.struct "Program"))], ret := (some (.struct "SolveResult")), body := [] }],
   tests := [],
   benches := []
 }
@@ -171,22 +174,13 @@ def ar_restraint_module : Module := {
 }
 
 -- Negative signature projection from specs/ar/ternary_logic.t27 (#6658).
--- The previous model was EMPTY (no functions, globals or tests), so
--- `native_decide` proved the empty module lowerable -- true of nothing in
--- the spec. This one keeps every declaration the classifier reads, with
--- unmodeled types under their source names, as ar_asp_solver does:
---   * `Trit` is neither a primitive nor a struct declared in this module,
---     so the Rust classifier already rejects k3_and's interface, and the
---     Lean predicate rejects `.struct "Trit"` (not in `structs`).
---   * resolve and apply_restraint take and return variable-length `[Trit]`;
---     backward_chain takes variable-length `[Rule]`. Those three stay
---     unlowerable even when `Trit` is declared as a lowerable type -- see
---     `ar_ternary_logic_slices_block_with_trit_declared` below.
--- Function bodies are left out (as for ar_asp_solver): the interfaces
--- alone decide the verdict, and they are the part a regenerated signature
--- can be compared against. Tests and benches carry the spec's names.
+-- Since #8980 a Trit is an `i8` (-1, 0, +1), so the scalar K3 functions are
+-- lowerable. Unlowerable, by name under their source types: resolve,
+-- apply_restraint and backward_chain (variable-length slices, no fixed width;
+-- see `ar_ternary_logic_slices_block`) and pool_take (`usize`). Bodies are
+-- left out; the interfaces alone decide.
 def ar_ternary_logic_env : Env := {
-  structs := [("Rule", [("antecedent", (.struct "Trit")), ("consequent", (.struct "Trit"))])],
+  structs := [("Rule", [("antecedent", .i8), ("consequent", .i8)])],
   constructors := [],
   enums := [],
   imports := [],
@@ -197,24 +191,19 @@ def ar_ternary_logic_env : Env := {
 def ar_ternary_logic_module : Module := {
   name := "ar_ternary_logic",
   imports := [],
-  globals := [.constDecl "K_FALSE" (.struct "Trit") (some (.enumVal "Trit" "FALSE")), .constDecl "K_UNKNOWN" (.struct "Trit") (some (.enumVal "Trit" "UNKNOWN")), .constDecl "K_TRUE" (.struct "Trit") (some (.enumVal "Trit" "TRUE"))],
-  functions := [{ name := "k3_and", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_or", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_not", params := [("a", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_implies", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "k3_equiv", params := [("a", (.struct "Trit")), ("b", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "forward_chain", params := [("rule", (.struct "Rule")), ("fact", (.struct "Trit"))], ret := (some (.struct "Trit")), body := [] }, { name := "backward_chain", params := [("goal", (.struct "Trit")), ("rules", (.struct "[Rule]"))], ret := (some (.struct "Trit")), body := [] }, { name := "resolve", params := [("clause_a", (.struct "[Trit]")), ("clause_b", (.struct "[Trit]"))], ret := (some (.struct "[Trit]")), body := [] }, { name := "is_restraint", params := [("t", (.struct "Trit"))], ret := (some .bool), body := [] }, { name := "apply_restraint", params := [("values", (.struct "[Trit]"))], ret := (some (.struct "[Trit]")), body := [] }],
+  globals := [.constDecl "K_FALSE" .i8 (some (.intLit (-1))), .constDecl "K_UNKNOWN" .i8 (some (.intLit 0)), .constDecl "K_TRUE" .i8 (some (.intLit 1)), .constDecl "K3_VALUES" (.array 3 .i8) (some (.arrayLit .i8 [(.identifier "K_FALSE"), (.identifier "K_UNKNOWN"), (.identifier "K_TRUE")])), .varDecl "trit_pool" (.array 256 .i8) none, .varDecl "trit_pool_used" (.struct "usize") (some (.intLit 0))],
+  functions := [{ name := "pool_take", params := [("n", (.struct "usize"))], ret := (some (.struct "usize")), body := [] }, { name := "holds", params := [("t", .i8)], ret := (some .bool), body := [] }, { name := "k3_and", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_or", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_not", params := [("a", .i8)], ret := (some .i8), body := [] }, { name := "k3_implies", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "k3_equiv", params := [("a", .i8), ("b", .i8)], ret := (some .i8), body := [] }, { name := "forward_chain", params := [("rule", (.struct "Rule")), ("fact", .i8)], ret := (some .i8), body := [] }, { name := "backward_chain", params := [("goal", .i8), ("rules", (.struct "[]const Rule"))], ret := (some .i8), body := [] }, { name := "resolve", params := [("clause_a", (.struct "[]const i8")), ("clause_b", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }, { name := "is_restraint", params := [("t", .i8)], ret := (some .bool), body := [] }, { name := "apply_restraint", params := [("values", (.struct "[]const i8"))], ret := (some (.struct "[]i8")), body := [] }],
   tests := [{ name := "k3_and_truth_table", params := [], ret := none, body := [] }, { name := "k3_or_truth_table", params := [], ret := none, body := [] }, { name := "k3_not_truth_table", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_false", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_true", params := [], ret := none, body := [] }, { name := "k3_no_tautology_or_not_unknown_violation", params := [], ret := none, body := [] }, { name := "k3_no_tautology_exists_violating_value", params := [], ret := none, body := [] }, { name := "k3_no_tautology_all_values_tested", params := [], ret := none, body := [] }, { name := "k3_restraint_from_no_tautology", params := [], ret := none, body := [] }, { name := "k3_implication_ex_falso", params := [], ret := none, body := [] }, { name := "k3_implication_when_antecedent_true", params := [], ret := none, body := [] }, { name := "k3_implication_when_consequent_true", params := [], ret := none, body := [] }, { name := "k3_implication_with_unknown", params := [], ret := none, body := [] }, { name := "k3_equiv_reflexive", params := [], ret := none, body := [] }, { name := "k3_equiv_symmetric", params := [], ret := none, body := [] }, { name := "k3_equiv_transitive", params := [], ret := none, body := [] }, { name := "k3_equiv_when_both_true", params := [], ret := none, body := [] }, { name := "k3_equiv_when_both_false", params := [], ret := none, body := [] }, { name := "k3_equiv_when_opposite", params := [], ret := none, body := [] }, { name := "forward_chain_modus_ponens_true", params := [], ret := none, body := [] }, { name := "forward_chain_modus_ponens_false_consequent", params := [], ret := none, body := [] }, { name := "forward_chain_with_unknown_fact", params := [], ret := none, body := [] }, { name := "forward_chain_no_match", params := [], ret := none, body := [] }, { name := "backward_chain_finds_support", params := [], ret := none, body := [] }, { name := "backward_chain_no_support", params := [], ret := none, body := [] }, { name := "backward_chain_multiple_rules", params := [], ret := none, body := [] }, { name := "resolve_complementary_literals", params := [], ret := none, body := [] }, { name := "resolve_non_complementary", params := [], ret := none, body := [] }, { name := "is_restraint_true_for_unknown", params := [], ret := none, body := [] }, { name := "is_restraint_false_for_false", params := [], ret := none, body := [] }, { name := "is_restraint_false_for_true", params := [], ret := none, body := [] }, { name := "apply_restraint_replaces_unknown", params := [], ret := none, body := [] }, { name := "apply_restraint_preserves_known", params := [], ret := none, body := [] }],
   benches := [{ name := "k3_and_latency", params := [], ret := none, body := [] }, { name := "k3_or_latency", params := [], ret := none, body := [] }, { name := "k3_not_latency", params := [], ret := none, body := [] }, { name := "k3_implies_latency", params := [], ret := none, body := [] }, { name := "k3_equiv_latency", params := [], ret := none, body := [] }, { name := "forward_chain_latency", params := [], ret := none, body := [] }, { name := "backward_chain_latency", params := [], ret := none, body := [] }, { name := "resolve_latency", params := [], ret := none, body := [] }, { name := "apply_restraint_latency", params := [], ret := none, body := [] }]
 }
 
-/-- #6658: the variable-length `[Trit]` / `[Rule]` interfaces block on their
-    own. Declare `Trit` as a lowerable one-field struct and every scalar K3
-    function becomes lowerable; exactly the three functions with a slice in
-    their signature still are not. -/
-def ar_ternary_logic_trit_declared_env : Env :=
-  { ar_ternary_logic_env with
-    structs := ("Trit", [("v", .i8)]) :: ar_ternary_logic_env.structs }
-
-theorem ar_ternary_logic_slices_block_with_trit_declared :
+/-- #6658: the slice interfaces block on their own. Exactly the three functions
+    with a slice in their signature, plus `pool_take` (which takes `usize`),
+    are unlowerable; every scalar K3 function over `i8` is lowerable. -/
+theorem ar_ternary_logic_slices_block :
     (ar_ternary_logic_module.functions.filter
-        (fun f => !Function.isLowerable ar_ternary_logic_trit_declared_env f)).map (fun f => f.name)
-      = ["backward_chain", "resolve", "apply_restraint"] := by native_decide
+        (fun f => !Function.isLowerable ar_ternary_logic_env f)).map (fun f => f.name)
+      = ["pool_take", "backward_chain", "resolve", "apply_restraint"] := by native_decide
 
 def automation_wrapup_auto_env : Env := {
   structs := [],
@@ -1062,24 +1051,6 @@ def math_property_test_template_module : Module := {
   benches := [{ name := "property_test_associative", params := [], ret := none, body := [] }, { name := "property_test_commutative", params := [], ret := none, body := [] }, { name := "property_test_distributive", params := [], ret := none, body := [] }, { name := "property_test_identity", params := [], ret := none, body := [] }]
 }
 
-def ml_activation_silu_swish_vbt_activation_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def ml_activation_silu_swish_vbt_activation_module : Module := {
-  name := "ml_activation_silu_swish_vbt_activation",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def ml_igla_champion_capsule_env : Env := {
   structs := [("f64", [("value", .u32)])],
   constructors := [],
@@ -1878,24 +1849,6 @@ def physics_lqg_cs_bridge_module : Module := {
   benches := []
 }
 
-def physics_lqg_entropy_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [],
-  hostOnly := [],
-  reachable := []
-}
-
-def physics_lqg_entropy_module : Module := {
-  name := "physics_lqg_entropy",
-  imports := [],
-  globals := [],
-  functions := [],
-  tests := [{ name := "lqg_entropy_module_exists", params := [], ret := none, body := [] }, { name := "lqg_cs_gamma_origin_different_from_lqg", params := [], ret := none, body := [] }],
-  benches := []
-}
-
 def physics_quantum_env : Env := {
   structs := [],
   constructors := [],
@@ -1968,114 +1921,6 @@ def runtime_instance_module : Module := {
   benches := []
 }
 
-def sacred_cosmology_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_cosmology_module : Module := {
-  name := "sacred_cosmology",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def sacred_dark_matter_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_dark_matter_module : Module := {
-  name := "sacred_dark_matter",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def sacred_gravity_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_gravity_module : Module := {
-  name := "sacred_gravity",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def sacred_monopoles_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_monopoles_module : Module := {
-  name := "sacred_monopoles",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def sacred_quantum_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_quantum_module : Module := {
-  name := "sacred_quantum",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def sacred_quantum_gravity_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_quantum_gravity_module : Module := {
-  name := "sacred_quantum_gravity",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def sacred_sacred_constants_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -2130,24 +1975,6 @@ def sacred_sacred_identity_module : Module := {
   benches := []
 }
 
-def sacred_superconductivity_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def sacred_superconductivity_module : Module := {
-  name := "sacred_superconductivity",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def sync_index_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -2162,42 +1989,6 @@ def sync_index_module : Module := {
   imports := [{ path := "std", items := ["std"] }, { path := "sync", items := ["sync"] }],
   globals := [],
   functions := [{ name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
-  tests := [],
-  benches := []
-}
-
-def tri_agent_agent_run_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_agent_agent_run_module : Module := {
-  name := "tri_agent_agent_run",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def tri_agent_agents_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_agent_agents_module : Module := {
-  name := "tri_agent_agents",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
   tests := [],
   benches := []
 }
@@ -2220,24 +2011,6 @@ def tri_agent_autonomous_lifecycle_module : Module := {
   benches := []
 }
 
-def tri_agent_autonomous_universe_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_agent_autonomous_universe_module : Module := {
-  name := "tri_agent_autonomous_universe",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_agent_eternal_monitor_env : Env := {
   structs := [],
   constructors := [],
@@ -2249,24 +2022,6 @@ def tri_agent_eternal_monitor_env : Env := {
 
 def tri_agent_eternal_monitor_module : Module := {
   name := "tri_agent_eternal_monitor",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def tri_agent_experience_hooks_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_agent_experience_hooks_module : Module := {
-  name := "tri_agent_experience_hooks",
   imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
   globals := [],
   functions := [],
@@ -2324,24 +2079,6 @@ def tri_agent_handoff_module : Module := {
   imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
   globals := [],
   functions := [{ name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
-  tests := [],
-  benches := []
-}
-
-def tri_agent_memory_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_agent_memory_module : Module := {
-  name := "tri_agent_memory",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
   tests := [],
   benches := []
 }
@@ -2447,24 +2184,6 @@ def tri_collections_circular_buffer_env : Env := {
 
 def tri_collections_circular_buffer_module : Module := {
   name := "tri_collections_circular_buffer",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def tri_collections_context_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_collections_context_module : Module := {
-  name := "tri_collections_context",
   imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
   globals := [],
   functions := [],
@@ -3462,24 +3181,6 @@ def tri_net_channel_module : Module := {
   benches := []
 }
 
-def tri_net_cloud_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_net_cloud_module : Module := {
-  name := "tri_net_cloud",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_net_http_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -3570,24 +3271,6 @@ def tri_pipeline_builder_module : Module := {
   benches := []
 }
 
-def tri_pipeline_cloud_orchestrator_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_pipeline_cloud_orchestrator_module : Module := {
-  name := "tri_pipeline_cloud_orchestrator",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_pipeline_codegen_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -3602,24 +3285,6 @@ def tri_pipeline_codegen_module : Module := {
   imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
   globals := [],
   functions := [{ name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
-  tests := [],
-  benches := []
-}
-
-def tri_pipeline_pipeline_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_pipeline_pipeline_module : Module := {
-  name := "tri_pipeline_pipeline",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
   tests := [],
   benches := []
 }
@@ -3642,24 +3307,6 @@ def tri_pipeline_pipeline_parallel_module : Module := {
   benches := []
 }
 
-def tri_pipeline_spec_parser_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_pipeline_spec_parser_module : Module := {
-  name := "tri_pipeline_spec_parser",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_pipeline_workflow_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -3674,42 +3321,6 @@ def tri_pipeline_workflow_module : Module := {
   imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
   globals := [],
   functions := [{ name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
-  tests := [],
-  benches := []
-}
-
-def tri_pipeline_workflow_executor_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_pipeline_workflow_executor_module : Module := {
-  name := "tri_pipeline_workflow_executor",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
-def tri_pipeline_workflow_parser_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_pipeline_workflow_parser_module : Module := {
-  name := "tri_pipeline_workflow_parser",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
   tests := [],
   benches := []
 }
@@ -4326,24 +3937,6 @@ def tri_utils_args_module : Module := {
   benches := []
 }
 
-def tri_utils_arrow_time_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_arrow_time_module : Module := {
-  name := "tri_utils_arrow_time",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_utils_bytes_env : Env := {
   structs := [],
   constructors := [],
@@ -4380,24 +3973,6 @@ def tri_utils_color_module : Module := {
   benches := []
 }
 
-def tri_utils_colors_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("types", ("base::types", "types")), ("constants", ("math::constants", "constants"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_colors_module : Module := {
-  name := "tri_utils_colors",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
-  benches := []
-}
-
 def tri_utils_config_env : Env := {
   structs := [("w537_non_lowerable_marker", [("dummy", .f32)])],
   constructors := [],
@@ -4413,24 +3988,6 @@ def tri_utils_config_module : Module := {
   globals := [],
   functions := [{ name := "parse", params := [("allocator", (.struct "Std")), ("mem", (.u32)), ("Allocator", (.u32))], ret := (some (.struct "void")), body := [] }, { name := "get_string", params := [("config", (.struct "Config"))], ret := (some (.struct "void")), body := [] }, { name := "get_number", params := [("config", (.struct "Config"))], ret := (some (.struct "void")), body := [] }, { name := "get_bool", params := [("config", (.struct "Config"))], ret := (some (.struct "void")), body := [] }, { name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
   tests := [{ name := "parse_basic_case", params := [], ret := none, body := [] }, { name := "get_string_basic_case", params := [], ret := none, body := [] }, { name := "get_number_basic_case", params := [], ret := none, body := [] }, { name := "get_bool_basic_case", params := [], ret := none, body := [] }],
-  benches := []
-}
-
-def tri_utils_error_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_error_module : Module := {
-  name := "tri_utils_error",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
   benches := []
 }
 
@@ -4503,24 +4060,6 @@ def tri_utils_random_module : Module := {
   globals := [],
   functions := [{ name := "init", params := [("seed", (.u64))], ret := (some (.struct "void")), body := [] }, { name := "next", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "range_inclusive", params := [("rng", (.struct "*Rng"))], ret := (some (.struct "void")), body := [] }, { name := "_w537_non_lowerable_marker", params := [("dummy", (.struct "w537_non_lowerable_marker"))], ret := none, body := [] }],
   tests := [{ name := "init_basic_case", params := [], ret := none, body := [] }, { name := "next_basic_case", params := [], ret := none, body := [] }, { name := "range_basic_case", params := [], ret := none, body := [] }, { name := "range_inclusive_basic_case", params := [], ret := none, body := [] }],
-  benches := []
-}
-
-def tri_utils_string_env : Env := {
-  structs := [],
-  constructors := [],
-  enums := [],
-  imports := [("constants", ("math::constants", "constants")), ("types", ("base::types", "types"))],
-  hostOnly := [],
-  reachable := []
-}
-
-def tri_utils_string_module : Module := {
-  name := "tri_utils_string",
-  imports := [{ path := "base::types", items := ["types"] }, { path := "math::constants", items := ["constants"] }],
-  globals := [],
-  functions := [],
-  tests := [],
   benches := []
 }
 
@@ -4780,7 +4319,6 @@ theorem isa_ternary_encoding_lowerable : Module.isLowerable isa_ternary_encoding
 theorem isa_ternary_gates_lowerable : Module.isLowerable isa_ternary_gates_env isa_ternary_gates_module = false := by native_decide
 theorem isa_ternary_shift_lowerable : Module.isLowerable isa_ternary_shift_env isa_ternary_shift_module = true := by native_decide
 theorem math_property_test_template_lowerable : Module.isLowerable math_property_test_template_env math_property_test_template_module = true := by native_decide
-theorem ml_activation_silu_swish_vbt_activation_lowerable : Module.isLowerable ml_activation_silu_swish_vbt_activation_env ml_activation_silu_swish_vbt_activation_module = true := by native_decide
 theorem ml_igla_champion_capsule_lowerable : Module.isLowerable ml_igla_champion_capsule_env ml_igla_champion_capsule_module = true := by native_decide
 theorem ml_layers_avgpool2d_layer_lowerable : Module.isLowerable ml_layers_avgpool2d_layer_env ml_layers_avgpool2d_layer_module = true := by native_decide
 theorem ml_layers_conv2d_layer_lowerable : Module.isLowerable ml_layers_conv2d_layer_env ml_layers_conv2d_layer_module = false := by native_decide
@@ -4815,39 +4353,25 @@ theorem physics_e8_lqg_bridge_lowerable : Module.isLowerable physics_e8_lqg_brid
 theorem physics_gamma_conflict_lowerable : Module.isLowerable physics_gamma_conflict_env physics_gamma_conflict_module = true := by native_decide
 theorem physics_hslm_benchmark_lowerable : Module.isLowerable physics_hslm_benchmark_env physics_hslm_benchmark_module = true := by native_decide
 theorem physics_lqg_cs_bridge_lowerable : Module.isLowerable physics_lqg_cs_bridge_env physics_lqg_cs_bridge_module = true := by native_decide
-theorem physics_lqg_entropy_lowerable : Module.isLowerable physics_lqg_entropy_env physics_lqg_entropy_module = true := by native_decide
 theorem physics_quantum_lowerable : Module.isLowerable physics_quantum_env physics_quantum_module = true := by native_decide
 theorem physics_su2_chern_simons_lowerable : Module.isLowerable physics_su2_chern_simons_env physics_su2_chern_simons_module = false := by native_decide
 theorem queen_task_analysis_lowerable : Module.isLowerable queen_task_analysis_env queen_task_analysis_module = true := by native_decide
 theorem runtime_instance_lowerable : Module.isLowerable runtime_instance_env runtime_instance_module = false := by native_decide
-theorem sacred_cosmology_lowerable : Module.isLowerable sacred_cosmology_env sacred_cosmology_module = true := by native_decide
-theorem sacred_dark_matter_lowerable : Module.isLowerable sacred_dark_matter_env sacred_dark_matter_module = true := by native_decide
-theorem sacred_gravity_lowerable : Module.isLowerable sacred_gravity_env sacred_gravity_module = true := by native_decide
-theorem sacred_monopoles_lowerable : Module.isLowerable sacred_monopoles_env sacred_monopoles_module = true := by native_decide
-theorem sacred_quantum_lowerable : Module.isLowerable sacred_quantum_env sacred_quantum_module = true := by native_decide
-theorem sacred_quantum_gravity_lowerable : Module.isLowerable sacred_quantum_gravity_env sacred_quantum_gravity_module = true := by native_decide
 theorem sacred_sacred_constants_lowerable : Module.isLowerable sacred_sacred_constants_env sacred_sacred_constants_module = false := by native_decide
 theorem sacred_sacred_governance_lowerable : Module.isLowerable sacred_sacred_governance_env sacred_sacred_governance_module = false := by native_decide
 theorem sacred_sacred_identity_lowerable : Module.isLowerable sacred_sacred_identity_env sacred_sacred_identity_module = false := by native_decide
-theorem sacred_superconductivity_lowerable : Module.isLowerable sacred_superconductivity_env sacred_superconductivity_module = true := by native_decide
 theorem sync_index_lowerable : Module.isLowerable sync_index_env sync_index_module = false := by native_decide
-theorem tri_agent_agent_run_lowerable : Module.isLowerable tri_agent_agent_run_env tri_agent_agent_run_module = true := by native_decide
-theorem tri_agent_agents_lowerable : Module.isLowerable tri_agent_agents_env tri_agent_agents_module = true := by native_decide
 theorem tri_agent_autonomous_lifecycle_lowerable : Module.isLowerable tri_agent_autonomous_lifecycle_env tri_agent_autonomous_lifecycle_module = false := by native_decide
-theorem tri_agent_autonomous_universe_lowerable : Module.isLowerable tri_agent_autonomous_universe_env tri_agent_autonomous_universe_module = true := by native_decide
 theorem tri_agent_eternal_monitor_lowerable : Module.isLowerable tri_agent_eternal_monitor_env tri_agent_eternal_monitor_module = true := by native_decide
-theorem tri_agent_experience_hooks_lowerable : Module.isLowerable tri_agent_experience_hooks_env tri_agent_experience_hooks_module = true := by native_decide
 theorem tri_agent_faculty_board_lowerable : Module.isLowerable tri_agent_faculty_board_env tri_agent_faculty_board_module = true := by native_decide
 theorem tri_agent_governance_agent_lowerable : Module.isLowerable tri_agent_governance_agent_env tri_agent_governance_agent_module = false := by native_decide
 theorem tri_agent_handoff_lowerable : Module.isLowerable tri_agent_handoff_env tri_agent_handoff_module = false := by native_decide
-theorem tri_agent_memory_lowerable : Module.isLowerable tri_agent_memory_env tri_agent_memory_module = true := by native_decide
 theorem tri_agent_swarm_agents_lowerable : Module.isLowerable tri_agent_swarm_agents_env tri_agent_swarm_agents_module = false := by native_decide
 theorem tri_collections_bitmap_lowerable : Module.isLowerable tri_collections_bitmap_env tri_collections_bitmap_module = true := by native_decide
 theorem tri_collections_bitset_lowerable : Module.isLowerable tri_collections_bitset_env tri_collections_bitset_module = true := by native_decide
 theorem tri_collections_bitvector_lowerable : Module.isLowerable tri_collections_bitvector_env tri_collections_bitvector_module = true := by native_decide
 theorem tri_collections_btree_lowerable : Module.isLowerable tri_collections_btree_env tri_collections_btree_module = true := by native_decide
 theorem tri_collections_circular_buffer_lowerable : Module.isLowerable tri_collections_circular_buffer_env tri_collections_circular_buffer_module = true := by native_decide
-theorem tri_collections_context_lowerable : Module.isLowerable tri_collections_context_env tri_collections_context_module = true := by native_decide
 theorem tri_collections_deque_lowerable : Module.isLowerable tri_collections_deque_env tri_collections_deque_module = true := by native_decide
 theorem tri_collections_either_lowerable : Module.isLowerable tri_collections_either_env tri_collections_either_module = true := by native_decide
 theorem tri_collections_interval_lowerable : Module.isLowerable tri_collections_interval_env tri_collections_interval_module = true := by native_decide
@@ -4903,20 +4427,14 @@ theorem tri_math_statistics_lowerable : Module.isLowerable tri_math_statistics_e
 theorem tri_net_async_lowerable : Module.isLowerable tri_net_async_env tri_net_async_module = true := by native_decide
 theorem tri_net_async_stream_lowerable : Module.isLowerable tri_net_async_stream_env tri_net_async_stream_module = true := by native_decide
 theorem tri_net_channel_lowerable : Module.isLowerable tri_net_channel_env tri_net_channel_module = true := by native_decide
-theorem tri_net_cloud_lowerable : Module.isLowerable tri_net_cloud_env tri_net_cloud_module = true := by native_decide
 theorem tri_net_http_lowerable : Module.isLowerable tri_net_http_env tri_net_http_module = false := by native_decide
 theorem tri_net_net_lowerable : Module.isLowerable tri_net_net_env tri_net_net_module = false := by native_decide
 theorem tri_net_url_lowerable : Module.isLowerable tri_net_url_env tri_net_url_module = true := by native_decide
 theorem tri_pipeline_batch_runner_lowerable : Module.isLowerable tri_pipeline_batch_runner_env tri_pipeline_batch_runner_module = false := by native_decide
 theorem tri_pipeline_builder_lowerable : Module.isLowerable tri_pipeline_builder_env tri_pipeline_builder_module = true := by native_decide
-theorem tri_pipeline_cloud_orchestrator_lowerable : Module.isLowerable tri_pipeline_cloud_orchestrator_env tri_pipeline_cloud_orchestrator_module = true := by native_decide
 theorem tri_pipeline_codegen_lowerable : Module.isLowerable tri_pipeline_codegen_env tri_pipeline_codegen_module = false := by native_decide
-theorem tri_pipeline_pipeline_lowerable : Module.isLowerable tri_pipeline_pipeline_env tri_pipeline_pipeline_module = true := by native_decide
 theorem tri_pipeline_pipeline_parallel_lowerable : Module.isLowerable tri_pipeline_pipeline_parallel_env tri_pipeline_pipeline_parallel_module = false := by native_decide
-theorem tri_pipeline_spec_parser_lowerable : Module.isLowerable tri_pipeline_spec_parser_env tri_pipeline_spec_parser_module = true := by native_decide
 theorem tri_pipeline_workflow_lowerable : Module.isLowerable tri_pipeline_workflow_env tri_pipeline_workflow_module = false := by native_decide
-theorem tri_pipeline_workflow_executor_lowerable : Module.isLowerable tri_pipeline_workflow_executor_env tri_pipeline_workflow_executor_module = true := by native_decide
-theorem tri_pipeline_workflow_parser_lowerable : Module.isLowerable tri_pipeline_workflow_parser_env tri_pipeline_workflow_parser_module = true := by native_decide
 theorem tri_search_aho_corasick_lowerable : Module.isLowerable tri_search_aho_corasick_env tri_search_aho_corasick_module = true := by native_decide
 theorem tri_search_bloom_filter_lowerable : Module.isLowerable tri_search_bloom_filter_env tri_search_bloom_filter_module = true := by native_decide
 theorem tri_search_boyer_moore_lowerable : Module.isLowerable tri_search_boyer_moore_env tri_search_boyer_moore_module = true := by native_decide
@@ -4951,17 +4469,13 @@ theorem tri_trees_suffix_array_lowerable : Module.isLowerable tri_trees_suffix_a
 theorem tri_trees_tree_lowerable : Module.isLowerable tri_trees_tree_env tri_trees_tree_module = true := by native_decide
 theorem tri_trees_trie_lowerable : Module.isLowerable tri_trees_trie_env tri_trees_trie_module = true := by native_decide
 theorem tri_utils_args_lowerable : Module.isLowerable tri_utils_args_env tri_utils_args_module = true := by native_decide
-theorem tri_utils_arrow_time_lowerable : Module.isLowerable tri_utils_arrow_time_env tri_utils_arrow_time_module = true := by native_decide
 theorem tri_utils_bytes_lowerable : Module.isLowerable tri_utils_bytes_env tri_utils_bytes_module = true := by native_decide
 theorem tri_utils_color_lowerable : Module.isLowerable tri_utils_color_env tri_utils_color_module = false := by native_decide
-theorem tri_utils_colors_lowerable : Module.isLowerable tri_utils_colors_env tri_utils_colors_module = true := by native_decide
 theorem tri_utils_config_lowerable : Module.isLowerable tri_utils_config_env tri_utils_config_module = false := by native_decide
-theorem tri_utils_error_lowerable : Module.isLowerable tri_utils_error_env tri_utils_error_module = true := by native_decide
 theorem tri_utils_exit_codes_lowerable : Module.isLowerable tri_utils_exit_codes_env tri_utils_exit_codes_module = false := by native_decide
 theorem tri_utils_help_lowerable : Module.isLowerable tri_utils_help_env tri_utils_help_module = false := by native_decide
 theorem tri_utils_logging_lowerable : Module.isLowerable tri_utils_logging_env tri_utils_logging_module = false := by native_decide
 theorem tri_utils_random_lowerable : Module.isLowerable tri_utils_random_env tri_utils_random_module = false := by native_decide
-theorem tri_utils_string_lowerable : Module.isLowerable tri_utils_string_env tri_utils_string_module = true := by native_decide
 theorem tri_utils_template_lowerable : Module.isLowerable tri_utils_template_env tri_utils_template_module = true := by native_decide
 theorem tri_utils_terminal_lowerable : Module.isLowerable tri_utils_terminal_env tri_utils_terminal_module = false := by native_decide
 theorem tri_utils_text_lowerable : Module.isLowerable tri_utils_text_env tri_utils_text_module = false := by native_decide
