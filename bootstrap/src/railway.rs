@@ -5,7 +5,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-const RAILWAY_GRAPHQL: &str = "https://backpack.railway.com/graphql";
+const RAILWAY_GRAPHQL: &str = "https://backboard.railway.com/graphql/v2";
 
 #[derive(Serialize)]
 struct ServiceCreateInput {
@@ -165,46 +165,6 @@ pub async fn set_service_variables(
     Ok(())
 }
 
-/// Delete a Railway service
-///
-/// # Arguments
-/// * `service_id` - ID of the Railway service to delete
-/// * `railway_token` - Railway API token for authentication
-pub async fn delete_railway_service(
-    service_id: &str,
-    railway_token: &str,
-) -> Result<()> {
-    let client = Client::new();
-
-    let mutation = format!(
-        r#"mutation {{
-            serviceDelete(input: {{ id: "{}" }}) {{
-                id
-            }}
-        }}"#,
-        service_id
-    );
-
-    let resp = client.post(RAILWAY_GRAPHQL)
-        .header("Authorization", format!("Bearer {}", railway_token))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({"query": mutation}))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "Unable to read body".to_string());
-        return Err(anyhow::anyhow!(
-            "Failed to delete Railway service: {} - {}",
-            status,
-            body
-        ));
-    }
-
-    Ok(())
-}
-
 /// Get the health status of a Railway service
 ///
 /// # Arguments
@@ -262,4 +222,31 @@ pub async fn check_service_health(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RAILWAY_GRAPHQL;
+
+    /// FR-002: guard the Railway GraphQL endpoint's host and path, so the
+    /// retired host cannot come back unnoticed. The previous host stopped
+    /// answering entirely (HTTP 000 within 15 s, measured 2026-10-04, see
+    /// docs/now/2026-10-04-railway-graphql-host.md); Railway's public API
+    /// lives at backboard.railway.com/graphql/v2.
+    #[test]
+    fn railway_graphql_targets_public_api() {
+        assert_eq!(
+            RAILWAY_GRAPHQL,
+            "https://backboard.railway.com/graphql/v2"
+        );
+
+        let rest = RAILWAY_GRAPHQL
+            .strip_prefix("https://")
+            .expect("RAILWAY_GRAPHQL must use https");
+        let (host, path) = rest
+            .split_once('/')
+            .expect("RAILWAY_GRAPHQL must include a path");
+        assert_eq!(host, "backboard.railway.com");
+        assert_eq!(path, "graphql/v2");
+    }
 }
