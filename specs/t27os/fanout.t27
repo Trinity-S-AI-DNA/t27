@@ -1,0 +1,1087 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/fanout.t27 -- actors start actors: a lane splits a task, runs the parts in parallel, gathers the answers.
+; Owner, 2026-10-20: "actors must be able to start other actors when a task gets more complex and something has to be
+; done in parallel; the answers must be gathered back to the actor/agent that started the task. So we can parallelize
+; decomposed GitHub issues and solve them faster. Look how Claude Code visualizes it." Closes #11275. ASCII only (L3),
+; English only (LANG-EN). A sibling of kernel.t27 (which stays the tree and the resource formula); this file is the fan.
+; --
+; DRY: nothing is restated. Links, monitors, exit signals, mailboxes and edits_meet are actors.t27 (used); the lane
+; supervisor's restart decision, the global cap, the hold, the mailbox caps and the tree/state/view constants are
+; kernel.t27 (used); disjointness of edits, the landing pass (gc_land) and the ready test are golden_chain.t27 (used);
+; the 4-heading issue shape is evolve.t27 (used); the traffic light codes are keys.t27 (used); the packer is dash.t27
+; (used, read only). New here: the spawn gate, the decomposition rule, the RESULT message, the join rule, the view.
+; --
+; SPAWN BY MONITOR, NOT BY LINK. A child is started under the lanes supervisor (kernel.t27: transient, restarted until
+; MaxR) and MONITORED by the parent. A link would kill the parent when the child crashes (on_exit_signal(X_CRASH,
+; non-trapping) = ACT_DIE) and the parent would lose every sibling's work; a monitor sends a DOWN message and nothing
+; else happens to the parent (MONITOR_KILLS_WATCHER = false). The parent therefore survives a child crash and receives
+; the child's end as a message. A crash the supervisor heals (KD_RESTART) is invisible to the parent; the parent sees
+; only the child's FINAL end: a RESULT message, or a DOWN with no RESULT.
+; --
+; THE FAN, in order: spawn_admit (limits and capacity) -> decompose (disjoint path sets) -> put_* (one sub-issue text
+; per child, "Part of #N", never a closing keyword) -> each child sends RESULT to the parent's mailbox -> join_decide
+; (all done -> land; failed -> retry, bounded; forbidden or too many failures or timeout -> owner request) ->
+; fanin_land (gc_land, children in index order, so the order does not depend on who finished first).
+
+module T27osFanout;
+
+use queen::actors::MBOX_SLOTS;
+use queen::actors::mbox_push;
+use queen::actors::mbox_tag;
+use queen::actors::mbox_len;
+use queen::actors::mbox_remove;
+use queen::actors::X_NORMAL;
+use queen::actors::X_SHUTDOWN;
+use queen::actors::X_CRASH;
+use queen::actors::X_KILL;
+use queen::actors::X_NONE;
+use queen::actors::ACT_DIE;
+use queen::actors::on_exit_signal;
+use queen::actors::MONITOR_KILLS_WATCHER;
+use queen::actors::attach_answer;
+use queen::actors::monitors_after_monitor;
+use queen::actors::TURN_MAX_SECONDS;
+use queen::actors::hung_turn_signal;
+use queen::actors::D_QUEUED;
+use queen::golden_chain::GC_STAGES;
+use queen::golden_chain::GC_V_PASS;
+use queen::golden_chain::GC_EDIT_DERIVED;
+use queen::golden_chain::GC_PAIR_REGEN;
+use queen::golden_chain::GC_PAIR_MEET;
+use queen::golden_chain::GC_BATCH_MAX;
+use queen::golden_chain::GC_OUT_FORWARD;
+use queen::golden_chain::GC_OUT_CARRIED;
+use queen::golden_chain::GC_OUT_REGEN;
+use queen::golden_chain::GC_OUT_CONFLICT;
+use queen::golden_chain::gc_pair;
+use queen::golden_chain::gc_land;
+use queen::golden_chain::gc_landed;
+use queen::golden_chain::lane_ready;
+use t27os::kernel::LANES_MAX_R;
+use t27os::kernel::KD_RESTART;
+use t27os::kernel::KD_OWNER_REQUEST;
+use t27os::kernel::KN_LANE;
+use t27os::kernel::K_STOP;
+use t27os::kernel::K_TASK;
+use t27os::kernel::lane_decision;
+use t27os::kernel::may_spawn;
+use t27os::kernel::kernel_deliver;
+use t27os::kernel::kernel_lane;
+use t27os::kernel::min2;
+use t27os::kernel::NS_RUNNING;
+use t27os::kernel::NS_RESTARTING;
+use t27os::kernel::NS_HELD;
+use t27os::kernel::NS_STOPPED;
+use t27os::kernel::NS_ESCALATED;
+use t27os::kernel::KV_ROW_H;
+use t27os::kernel::KV_INDENT;
+use t27os::evolve::heading;
+use t27os::evolve::LANE_DIR;
+use t27os::keys::L_NONE;
+use t27os::keys::L_GREEN;
+use t27os::keys::L_YELLOW;
+use t27os::keys::L_RED;
+use t27os::dash::pack_cols;
+use t27os::dash::cell_w;
+use t27os::dash::dash_cell_x;
+use t27os::dash::dash_cell_y;
+use t27os::dash::pack_h;
+use t27os::dash::pack_at;
+use t27os::dash::GAP;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+; --- 1. Fan-out: the spawn gate --------------------------------------------------------------------------------
+
+/// Limits. Chosen, not measured. A top-level lane has depth 0; its child depth 1; FAN_DEPTH_MAX = 2 allows a
+/// grandchild (a part that is itself too big) and no more. A parent has at most FAN_CHILDREN_MAX children in all
+/// (retries reuse a child's place): the same 8 as one landing pass (GC_BATCH_MAX) and one actors.t27 model queue
+/// (MBOX_SLOTS), so the waiting children always fit the parent's queue. At most FAN_LIVE_MAX run at once: the global
+/// agent_cap (kernel.t27) binds first on a small machine; this binds one parent on a big one, so a single issue does
+/// not take the whole machine.
+pub const FAN_DEPTH_MAX : u32 = 2;
+pub const FAN_CHILDREN_MAX : u32 = 8;
+pub const FAN_LIVE_MAX : u32 = 4;
+/// A parent whose children all wait for capacity and none runs would wait for lanes it holds itself (cap 1: the
+/// parent IS the only lane). After this long it does the part itself, one after the other.
+pub const FAN_SELF_WAIT_SECONDS : u32 = 600;
+
+pub const SP_START : u32 = 0;
+pub const SP_WAIT : u32 = 1;
+pub const SP_REFUSE_DEPTH : u32 = 2;
+pub const SP_REFUSE_COUNT : u32 = 3;
+pub const SP_SELF : u32 = 4;
+
+/// May the parent at `parent_depth` start one more child now. `spawned`: children it has made so far. `live`: of
+/// those, running now. `running`/`cap`/`hold`: the global lane count, agent_cap and spawn_hold of kernel.t27.
+/// `waited`: seconds the next child has waited for capacity. A child that does not fit WAITS in the parent's queue
+/// (fan_queue_*), it is not dropped.
+pub fn spawn_admit(parent_depth: u32, spawned: u32, live: u32, running: u32, cap: u32, hold: u32, waited: u32) -> u32 {
+    if (parent_depth + 1 > FAN_DEPTH_MAX) { return SP_REFUSE_DEPTH; }
+    if (spawned >= FAN_CHILDREN_MAX) { return SP_REFUSE_COUNT; }
+    if (live >= FAN_LIVE_MAX) { return SP_WAIT; }
+    if (may_spawn(cap, running, hold) == false) {
+        if (live == 0 and running >= cap and waited >= FAN_SELF_WAIT_SECONDS) { return SP_SELF; }
+        return SP_WAIT;
+    }
+    return SP_START;
+}
+
+/// The parent is a plain (non-trapping) watcher: a link would kill it, a monitor does not.
+pub fn child_attach_kills_parent(by_link: bool, reason: u8) -> bool {
+    if (by_link) { return on_exit_signal(reason, false) == ACT_DIE; }
+    return MONITOR_KILLS_WATCHER;
+}
+
+/// The parent's queue of children that did not fit: the actors.t27 model mailbox, subtask j stored as tag j + 1,
+/// oldest first. fan_queue_head is 0 for an empty queue, else the subtask + 1 to start next.
+pub fn fan_queue_push(box: u64, subtask: u32) -> u64 { return mbox_push(box, @as(u64, subtask) + 1); }
+pub fn fan_queue_head(box: u64) -> u32 { return @as(u32, @intCast(mbox_tag(box, 0))); }
+pub fn fan_queue_pop(box: u64) -> u64 { return mbox_remove(box, 0); }
+pub fn fan_queue_len(box: u64) -> u32 { return @as(u32, @intCast(mbox_len(box))); }
+
+; --- 2. Decomposition of an issue by its Boundary --------------------------------------------------------------
+
+/// The Boundary is n entries: path hash, kind (EDIT_*, or GC_EDIT_DERIVED for a path the chain recomputes), the
+/// region (lo, hi) of a line range, and for a derived path the hash of the source it is computed from (0 if none).
+/// Split rule, in this order:
+///  1. ONE PATH, ONE CHILD: every entry of a path goes to the same child, even two line ranges that edits_meet would
+///     let run apart. The owner asked for disjoint PATH sets; the finer split stays with file_admit (actors.t27).
+///  2. A DERIVED path follows its source: if the source is in the Boundary the derived entry joins its child (the
+///     child regenerates it with the spec); if not, it is SHARED (FAN_SHARED): no child owns it, the parent
+///     recomputes it after the join, which is the REGEN carry of gc_land.
+///  3. Groups are dealt to at most maxc children (maxc <= FAN_CHILDREN_MAX), each to the child with the fewest
+///     entries so far, the lowest index on a tie: deterministic, and as even as the groups allow.
+pub const FAN_SHARED : u8 = 255;
+pub const FAN_PATHS_MAX : usize = 32;
+
+fn source_in(n: usize, path: []const u64, kind: []const u8, s: u64) -> bool {
+    var k : usize = 0;
+    while (k < n) {
+        if (path[k] == s and kind[k] != GC_EDIT_DERIVED) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+fn fan_key(i: usize, path: []const u64, kind: []const u8, src: []const u64) -> u64 {
+    if (kind[i] == GC_EDIT_DERIVED) { return src[i]; }
+    return path[i];
+}
+
+/// Fills child[i] (the child index of entry i, or FAN_SHARED). `load` is scratch of FAN_CHILDREN_MAX u32.
+/// Returns how many children there are (1 means: do not split).
+pub fn decompose(n: usize, path: []const u64, kind: []const u8, src: []const u64, maxc: u32, child: []u8, load: []u32) -> u32 {
+    const mc : u32 = min2(maxc, FAN_CHILDREN_MAX);
+    var z : usize = 0;
+    while (z < 8) { load[z] = 0; z = z + 1; }
+    var groups : u32 = 0;
+    var i : usize = 0;
+    while (i < n and i < FAN_PATHS_MAX) {
+        if (kind[i] == GC_EDIT_DERIVED and source_in(n, path, kind, src[i]) == false) {
+            child[i] = FAN_SHARED;
+        } else {
+            const key : u64 = fan_key(i, path, kind, src);
+            var found : bool = false;
+            var j : usize = 0;
+            while (j < i) {
+                if (found == false and child[j] != FAN_SHARED and fan_key(j, path, kind, src) == key) {
+                    child[i] = child[j];
+                    found = true;
+                }
+                j = j + 1;
+            }
+            if (found == false) {
+                groups = groups + 1;
+                var c : usize = 0;
+                var b : usize = 1;
+                while (b < @as(usize, mc)) {
+                    if (load[b] < load[c]) { c = b; }
+                    b = b + 1;
+                }
+                child[i] = @as(u8, @intCast(c));
+            }
+            load[@as(usize, child[i])] = load[@as(usize, child[i])] + 1;
+        }
+        i = i + 1;
+    }
+    return min2(groups, mc);
+}
+
+/// The invariant of a split: the number of entry pairs in DIFFERENT children that name the same path and are not
+/// both derived (those are carried by REGEN). Must be 0. Uses gc_pair for the derived case.
+pub fn fan_overlaps(n: usize, path: []const u64, kind: []const u8, lo: []const u32, hi: []const u32, child: []const u8) -> u32 {
+    var bad : u32 = 0;
+    var a : usize = 0;
+    while (a < n) {
+        var b : usize = a + 1;
+        while (b < n) {
+            if (child[a] != FAN_SHARED and child[b] != FAN_SHARED and child[a] != child[b] and path[a] == path[b]) {
+                if (gc_pair(path[a], kind[a], lo[a], hi[a], path[b], kind[b], lo[b], hi[b]) != GC_PAIR_REGEN) { bad = bad + 1; }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return bad;
+}
+
+/// Entries per child, for the view and the tests.
+pub fn child_entries(n: usize, child: []const u8, c: u32) -> u32 {
+    var k : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (@as(u32, child[i]) == c and child[i] != FAN_SHARED) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// The sub-issue text of child c (0-based) of `of`, in the 4-heading shape of evolve.t27 (heading(0..3)). The host
+/// writes the paths between the head and the tail with put_path_line. "Part of #N" names the parent; the text
+/// holds NO closing keyword (a closing keyword would close the parent's issue when a child lands).
+pub fn put_title(out: []u8, at: usize, parent: u64, c: u32, of: u32) -> usize {
+    var n : usize = put_bytes(out, at, "t27os fanout: part ");
+    n = put_dec(out, n, @as(u64, c + 1));
+    n = put_bytes(out, n, " of ");
+    n = put_dec(out, n, @as(u64, of));
+    n = put_bytes(out, n, " of #");
+    return put_dec(out, n, parent);
+}
+
+pub fn put_body_head(out: []u8, at: usize, parent: u64, c: u32, of: u32) -> usize {
+    var n : usize = put_bytes(out, at, "Part of #");
+    n = put_dec(out, n, parent);
+    n = put_bytes(out, n, " -- child ");
+    n = put_dec(out, n, @as(u64, c + 1));
+    n = put_bytes(out, n, " of ");
+    n = put_dec(out, n, @as(u64, of));
+    n = put_bytes(out, n, ", run in parallel with its siblings.\n\n## ");
+    n = put_bytes(out, n, heading(0));
+    return put_bytes(out, n, "\n");
+}
+
+pub fn put_path_line(out: []u8, at: usize, p: []const u8) -> usize {
+    var n : usize = put_bytes(out, at, "- ");
+    n = put_bytes(out, n, p);
+    return put_bytes(out, n, "\n");
+}
+
+pub fn put_body_tail(out: []u8, at: usize, parent: u64) -> usize {
+    var n : usize = put_bytes(out, at, "\n## ");
+    n = put_bytes(out, n, heading(1));
+    n = put_bytes(out, n, "\nThe lane of #");
+    n = put_dec(out, n, parent);
+    n = put_bytes(out, n, " split its Boundary into disjoint path sets and started one lane per part.\n\n## ");
+    n = put_bytes(out, n, heading(2));
+    n = put_bytes(out, n, "\nDo this part only and touch no path outside the Boundary above. Part of #");
+    n = put_dec(out, n, parent);
+    n = put_bytes(out, n, ". When done, send the RESULT message to the parent lane.\n\n## ");
+    n = put_bytes(out, n, heading(3));
+    return put_bytes(out, n, "\nTests pass with no vacuous test, seals refreshed, Only t27, DRY; the branch is golden from SPEC to RECEIPT so the parent can land it.\n");
+}
+
+/// The guard a skeleton must pass: no word that starts with close, fix or resolv (any case) anywhere in it.
+pub fn closing_keyword_in(buf: []const u8) -> bool {
+    var i : usize = 0;
+    while (i + 3 <= buf.len) {
+        const a : u8 = buf[i] | 32;
+        const b : u8 = buf[i + 1] | 32;
+        const c : u8 = buf[i + 2] | 32;
+        if (a == 102 and b == 105 and c == 120) { return true; }
+        if (i + 5 <= buf.len and a == 99 and b == 108 and c == 111 and (buf[i + 3] | 32) == 115 and (buf[i + 4] | 32) == 101) { return true; }
+        if (i + 6 <= buf.len and a == 114 and b == 101 and c == 115 and (buf[i + 3] | 32) == 111 and (buf[i + 4] | 32) == 108 and (buf[i + 5] | 32) == 118) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Where a child works: branch claude/fan-<parent>-<child>, worktree evolve.t27 LANE_DIR + fan-<parent>-<child>.
+pub fn put_child_branch(out: []u8, at: usize, parent: u64, c: u32) -> usize {
+    var n : usize = put_bytes(out, at, "claude/fan-");
+    n = put_dec(out, n, parent);
+    n = put_bytes(out, n, "-");
+    return put_dec(out, n, @as(u64, c + 1));
+}
+
+pub fn put_child_worktree(out: []u8, at: usize, parent: u64, c: u32) -> usize {
+    var n : usize = put_bytes(out, at, LANE_DIR);
+    n = put_bytes(out, n, "fan-");
+    n = put_dec(out, n, parent);
+    n = put_bytes(out, n, "-");
+    return put_dec(out, n, @as(u64, c + 1));
+}
+
+; --- 3. Fan-in: the RESULT message and the join -----------------------------------------------------------------
+
+/// Kernel message tags beside K_TASK (1), K_STOP (8), K_ESCALATE (9): both ride the data lane, after any control tag.
+pub const K_RESULT : u64 = 10;
+pub const K_DOWN : u64 = 11;
+
+/// A child's status in its RESULT.
+pub const ST_DONE : u32 = 0;
+pub const ST_FAILED : u32 = 1;
+pub const ST_FORBIDDEN : u32 = 2;
+
+pub const SUMMARY_MAX : u32 = 2047;
+
+/// The RESULT, in one u64: status (2 bits) | link verdicts SPEC..RECEIPT (2 bits each, GC_V_*, 10 bits) << 2 |
+/// summary length in bytes (11) << 12 | files changed (10) << 23 | lines added (14) << 33 | lines removed (14) << 47.
+/// The branch (its head id) and the summary TEXT travel beside it in the store row; the length is counted here so
+/// the parent can bound what it reads. Fields clamp at their width.
+pub fn res_pack(status: u32, verdicts: u32, summary: u32, files: u32, plus: u32, minus: u32) -> u64 {
+    return @as(u64, status & 3) | (@as(u64, verdicts & 1023) << 2) | (@as(u64, min2(summary, SUMMARY_MAX)) << 12) | (@as(u64, min2(files, 1023)) << 23) | (@as(u64, min2(plus, 16383)) << 33) | (@as(u64, min2(minus, 16383)) << 47);
+}
+
+pub fn res_status(r: u64) -> u32 { return @as(u32, @intCast(r & 3)); }
+pub fn res_verdicts(r: u64) -> u32 { return @as(u32, @intCast((r >> 2) & 1023)); }
+pub fn res_summary(r: u64) -> u32 { return @as(u32, @intCast((r >> 12) & 2047)); }
+pub fn res_files(r: u64) -> u32 { return @as(u32, @intCast((r >> 23) & 1023)); }
+pub fn res_plus(r: u64) -> u32 { return @as(u32, @intCast((r >> 33) & 16383)); }
+pub fn res_minus(r: u64) -> u32 { return @as(u32, @intCast((r >> 47) & 16383)); }
+/// Verdict of chain stage s (0 SPEC .. 4 RECEIPT).
+pub fn res_verdict(r: u64, s: u32) -> u32 { return (res_verdicts(r) >> (2 * s)) & 3; }
+
+/// All verdicts passing (GC_V_PASS) as a packed value; the golden chain's "every stage golden".
+pub fn verdicts_all_pass() -> u32 {
+    var v : u32 = 0;
+    var s : u32 = 0;
+    while (s < @as(u32, GC_STAGES)) { v = v | (@as(u32, GC_V_PASS) << (2 * s)); s = s + 1; }
+    return v;
+}
+
+/// A RESULT that says DONE but whose chain is not golden is not done: fail closed to FAILED. golden_chain.t27
+/// lane_ready is the test (every stage golden, in order).
+pub fn res_effective(r: u64) -> u32 {
+    if (res_status(r) != ST_DONE) { return res_status(r); }
+    var v : [5]u8 = undefined;
+    var s : u32 = 0;
+    while (s < 5) { v[@as(usize, s)] = @as(u8, @intCast(res_verdict(r, s))); s = s + 1; }
+    if (lane_ready(&v, 0)) { return ST_DONE; }
+    return ST_FAILED;
+}
+
+/// The parent's mailbox is a lane mailbox (kernel.t27 LANE_MBOX): a RESULT into a full one is a dead letter, and
+/// the child's DOWN still arrives, so the parent sees an end with no RESULT and treats it as FAILED (retry).
+pub fn result_delivery(reached: bool, queued: u32) -> u8 { return kernel_deliver(KN_LANE, reached, queued); }
+
+/// What a child's FINAL end means to the parent (a DOWN, plus the RESULT if one was delivered).
+pub const CE_RUNNING : u32 = 0;
+pub const CE_DONE : u32 = 1;
+pub const CE_FAILED : u32 = 2;
+pub const CE_FORBIDDEN : u32 = 3;
+pub const CE_REQUEUE : u32 = 4;
+
+/// `earlier`: restarts the lanes supervisor already made inside its window. A crash it will still restart is not an
+/// end (CE_RUNNING). A shed (X_SHUTDOWN, kernel.t27 shedding) is not a failure: the child goes back to the queue and
+/// no try is spent. A crash whose restart budget is spent, a normal end with no RESULT, and a RESULT that is not
+/// golden are FAILED; FORBIDDEN is a RESULT of that status.
+pub fn child_end(reason: u8, earlier: u32, got_result: bool, result: u64) -> u32 {
+    if (reason == X_SHUTDOWN) { return CE_REQUEUE; }
+    if (reason != X_NORMAL) {
+        if (lane_decision(reason, earlier) == KD_RESTART) { return CE_RUNNING; }
+        return CE_FAILED;
+    }
+    if (got_result == false) { return CE_FAILED; }
+    const s : u32 = res_effective(result);
+    if (s == ST_DONE) { return CE_DONE; }
+    if (s == ST_FORBIDDEN) { return CE_FORBIDDEN; }
+    return CE_FAILED;
+}
+
+/// Child slot states in the parent.
+pub const CS_QUEUED : u8 = 0;
+pub const CS_RUNNING : u8 = 1;
+pub const CS_DONE : u8 = 2;
+pub const CS_FAILED : u8 = 3;
+pub const CS_FORBIDDEN : u8 = 4;
+pub const CS_NAMES : [5]str = ["QUEUED", "RUNNING", "DONE", "FAILED", "FORBIDDEN"];
+
+/// Bounded retries: a failed child is started again at most this often (its place in the fan is reused).
+pub const FAN_RETRY_MAX : u32 = 2;
+/// The join waits at most two turns (a retry gets a second one) before it asks the owner. Chosen, not measured.
+pub const FAN_JOIN_TIMEOUT_SECONDS : u32 = 2 * TURN_MAX_SECONDS;
+
+/// A slot after an end: DONE, FAILED, FORBIDDEN, back to QUEUED (a shed), or unchanged while the supervisor heals it.
+pub fn slot_after_end(state: u8, ce: u32) -> u8 {
+    if (ce == CE_DONE) { return CS_DONE; }
+    if (ce == CE_FAILED) { return CS_FAILED; }
+    if (ce == CE_FORBIDDEN) { return CS_FORBIDDEN; }
+    if (ce == CE_REQUEUE) { return CS_QUEUED; }
+    return state;
+}
+
+/// A slot after a retry decision: back in the queue, one try spent.
+pub fn tries_after_retry(tries: u32) -> u32 { return tries + 1; }
+
+pub fn count_state(n: usize, st: []const u8, s: u8) -> u32 {
+    var k : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (st[i] == s) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// What the parent does at a join. Partial results are always visible (count_state, the RESULT words): the parent
+/// reads them while it waits, and the view draws them.
+///  JA_WAIT    some child still queued or running, inside the timeout.
+///  JA_LAND    every child DONE: the parent continues and lands the branches (fanin_land).
+///  JA_RETRY   a child FAILED with tries left: start it again (join_retry_which says which).
+///  JA_ASK     the owner is asked (Queen's owner request, kernel.t27 KD_OWNER_REQUEST): a child FORBIDDEN, a child
+///             FAILED with no tries left, or the timeout. Retries of other children go on meanwhile.
+/// Precedence: ask, then retry, then land, then wait. The default if the request goes unanswered is owner_default.
+pub const JA_WAIT : u32 = 0;
+pub const JA_LAND : u32 = 1;
+pub const JA_RETRY : u32 = 2;
+pub const JA_ASK : u32 = 3;
+
+pub fn join_decide(n: usize, st: []const u8, tries: []const u8, age_seconds: u32) -> u32 {
+    var asks : bool = false;
+    var retry : bool = false;
+    var open : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (st[i] == CS_FORBIDDEN) { asks = true; }
+        if (st[i] == CS_FAILED) {
+            if (@as(u32, tries[i]) >= FAN_RETRY_MAX) { asks = true; } else { retry = true; }
+        }
+        if (st[i] == CS_QUEUED or st[i] == CS_RUNNING) { open = open + 1; }
+        i = i + 1;
+    }
+    if (asks) { return JA_ASK; }
+    if (retry) { return JA_RETRY; }
+    if (open == 0 and n > 0) { return JA_LAND; }
+    if (age_seconds >= FAN_JOIN_TIMEOUT_SECONDS) { return JA_ASK; }
+    return JA_WAIT;
+}
+
+/// The lowest child that FAILED with tries left, or n.
+pub fn join_retry_which(n: usize, st: []const u8, tries: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        if (st[i] == CS_FAILED and @as(u32, tries[i]) < FAN_RETRY_MAX) { return i; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The default of an unanswered owner request (kernel.t27 REQUEST_DEFAULT_SECONDS, then it stands): the children
+/// that are DONE land (their paths are disjoint, so nothing waits on the others) and the parent issue stays OPEN with
+/// the rest as sub-issues in the backlog; with none done, the task goes back to the backlog.
+pub const FD_LAND_PARTIAL : u32 = 0;
+pub const FD_BACKLOG : u32 = 1;
+
+pub fn owner_default(done: u32) -> u32 {
+    if (done > 0) { return FD_LAND_PARTIAL; }
+    return FD_BACKLOG;
+}
+
+/// The landing pass of a finished join: gc_land over the children in INDEX order (never in arrival order, so two
+/// runs of one fan land the same way). Every child was built on `base`. Edits are the Boundary entries with
+/// owner = child[i] (shared entries have owner n_children, a link that does not exist, and are left to the parent's
+/// own regeneration). out[c] says what happened to child c (GC_OUT_*), pos[c] its place in the landing order.
+/// Returns how many landed. At most FAN_CHILDREN_MAX children.
+pub fn fanin_land(nc: usize, id: []const u64, res: []const u64, base: u64, m: usize, e_owner: []const usize, e_path: []const u64, e_kind: []const u8, e_lo: []const u32, e_hi: []const u32, out: []u8, pos: []usize) -> usize {
+    var parent : [8]u64 = [8]u64{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    var v : [40]u8 = undefined;
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 0 };
+    var c : usize = 0;
+    while (c < nc and c < 8) {
+        parent[c] = base;
+        var s : usize = 0;
+        while (s < 5) {
+            v[c * 5 + s] = @as(u8, @intCast(res_verdict(res[c], @as(u32, @intCast(s)))));
+            s = s + 1;
+        }
+        c = c + 1;
+    }
+    return gc_land(nc, id, &parent, &v, m, e_owner, e_path, e_kind, e_lo, e_hi, 0, &io, &ip, base, out, pos);
+}
+
+; --- 4. The view for the window ----------------------------------------------------------------------------------
+; Like Claude Code: a SIDEBAR TREE of lanes (a parent with its children nested under it, a branch glyph and a child
+; count on the parent's row), the main pane the selected lane's transcript (the window's, not here), and a right
+; INSPECTOR with Environment (machine, repo, branch, worktree), Context (parent task, sub-issue), Outputs (files
+; written) and Changes (PR, lines, failing checks, ready). Colors and glyph drawing stay in the window; this section
+; gives rows, order, packed fields and every x, y, w, h. The window's own lane list is `parent[]` (the lane index of
+; the parent, FAN_NONE for a top-level lane; a parent always has a LOWER index than its children).
+
+pub const FAN_NONE : u32 = 255;
+pub const LANES_VIEW_MAX : usize = 32;
+
+/// Depth-first order of the tree (a parent, then each child's subtree, siblings in index order). order[r] is the
+/// lane drawn in row r; dep[i] the depth of lane i. Returns the row count (n).
+pub fn tree_order(n: usize, parent: []const u32, order: []u32, dep: []u32) -> usize {
+    var count : usize = 0;
+    var i : usize = 0;
+    while (i < n and i < LANES_VIEW_MAX) {
+        if (parent[i] == FAN_NONE) {
+            dep[i] = 0;
+            order[count] = @as(u32, @intCast(i));
+            count = count + 1;
+        } else {
+            const p : u32 = parent[i];
+            dep[i] = dep[@as(usize, p)] + 1;
+            // after the last row of p's subtree: the rows after p with a greater depth
+            var at : usize = 0;
+            while (order[at] != p) { at = at + 1; }
+            at = at + 1;
+            while (at < count and dep[@as(usize, order[at])] > dep[@as(usize, p)]) { at = at + 1; }
+            var k : usize = count;
+            while (k > at) { order[k] = order[k - 1]; k = k - 1; }
+            order[at] = @as(u32, @intCast(i));
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn child_count(n: usize, parent: []const u32, i: u32) -> u32 {
+    var k : u32 = 0;
+    var j : usize = 0;
+    while (j < n) {
+        if (parent[j] == i) { k = k + 1; }
+        j = j + 1;
+    }
+    return k;
+}
+
+/// The branch glyph of a row: GL_NONE for a top-level lane, GL_MID for a child with a later sibling, GL_LAST for the
+/// last child of its parent. (A parent shows GL_NONE or its own place plus its child count.)
+pub const GL_NONE : u32 = 0;
+pub const GL_MID : u32 = 1;
+pub const GL_LAST : u32 = 2;
+pub const GLYPH_NAMES : [3]str = ["none", "mid", "last"];
+
+pub fn branch_glyph(n: usize, parent: []const u32, i: u32) -> u32 {
+    const p : u32 = parent[@as(usize, i)];
+    if (p == FAN_NONE) { return GL_NONE; }
+    var j : usize = @as(usize, i) + 1;
+    while (j < n) {
+        if (parent[j] == p) { return GL_MID; }
+        j = j + 1;
+    }
+    return GL_LAST;
+}
+
+/// The light of a parent row: the worst of its own and its children's (RED over YELLOW over GREEN, keys.t27 order),
+/// so a red child shows on the collapsed parent. `light` is the keys.t27 light_of value of each lane (an input).
+pub fn row_light(n: usize, parent: []const u32, light: []const u32, i: u32) -> u32 {
+    var w : u32 = light[@as(usize, i)];
+    var j : usize = 0;
+    while (j < n) {
+        if (parent[j] == i and light[j] > w) { w = light[j]; }
+        j = j + 1;
+    }
+    return w;
+}
+
+/// One tree row in a u64: state NS_* (3 bits) | light (2) << 3 | glyph (2) << 5 | depth (2) << 7 | children (4) << 9 |
+/// children done (4) << 13 | children failed (4) << 17 | children waiting (4) << 21 | restarts (4) << 25.
+pub fn lv_pack(state: u32, light: u32, glyph: u32, depth: u32, kids: u32, done: u32, failed: u32, waiting: u32, restarts: u32) -> u64 {
+    return @as(u64, state & 7) | (@as(u64, light & 3) << 3) | (@as(u64, glyph & 3) << 5) | (@as(u64, depth & 3) << 7) | (@as(u64, min2(kids, 15)) << 9) | (@as(u64, min2(done, 15)) << 13) | (@as(u64, min2(failed, 15)) << 17) | (@as(u64, min2(waiting, 15)) << 21) | (@as(u64, min2(restarts, 15)) << 25);
+}
+
+pub fn lv_state(v: u64) -> u32 { return @as(u32, @intCast(v & 7)); }
+pub fn lv_light(v: u64) -> u32 { return @as(u32, @intCast((v >> 3) & 3)); }
+pub fn lv_glyph(v: u64) -> u32 { return @as(u32, @intCast((v >> 5) & 3)); }
+pub fn lv_depth(v: u64) -> u32 { return @as(u32, @intCast((v >> 7) & 3)); }
+pub fn lv_kids(v: u64) -> u32 { return @as(u32, @intCast((v >> 9) & 15)); }
+pub fn lv_done(v: u64) -> u32 { return @as(u32, @intCast((v >> 13) & 15)); }
+pub fn lv_failed(v: u64) -> u32 { return @as(u32, @intCast((v >> 17) & 15)); }
+pub fn lv_waiting(v: u64) -> u32 { return @as(u32, @intCast((v >> 21) & 15)); }
+pub fn lv_restarts(v: u64) -> u32 { return @as(u32, @intCast((v >> 25) & 15)); }
+
+/// The state lamp of a lane from what the parent knows: the kernel.t27 node states.
+pub fn lane_state(slot: u8, restarting: bool, escalated: bool) -> u32 {
+    if (escalated) { return NS_ESCALATED; }
+    if (slot == CS_QUEUED) { return NS_HELD; }
+    if (slot == CS_RUNNING and restarting) { return NS_RESTARTING; }
+    if (slot == CS_RUNNING) { return NS_RUNNING; }
+    if (slot == CS_DONE) { return NS_STOPPED; }
+    return NS_ESCALATED;
+}
+
+/// The row of lane i, from the parent's slot arrays: `st`/`restart`/`esc` are per lane (a top-level lane passes
+/// CS_RUNNING), `light` the keys.t27 light of each lane. Child counts come from the tree, outcomes from the slots.
+pub fn lv_row(n: usize, parent: []const u32, dep: []const u32, st: []const u8, restarts: []const u32, esc: []const bool, light: []const u32, i: u32) -> u64 {
+    var done : u32 = 0;
+    var failed : u32 = 0;
+    var waiting : u32 = 0;
+    var j : usize = 0;
+    while (j < n) {
+        if (parent[j] == i) {
+            if (st[j] == CS_DONE) { done = done + 1; }
+            if (st[j] == CS_FAILED or st[j] == CS_FORBIDDEN) { failed = failed + 1; }
+            if (st[j] == CS_QUEUED) { waiting = waiting + 1; }
+        }
+        j = j + 1;
+    }
+    const ii : usize = @as(usize, i);
+    return lv_pack(lane_state(st[ii], restarts[ii] > 0 and st[ii] == CS_RUNNING, esc[ii]), row_light(n, parent, light, i), branch_glyph(n, parent, i), dep[ii], child_count(n, parent, i), done, failed, waiting, restarts[ii]);
+}
+
+; ---- the inspector of the selected lane --------------------------------------------------------------------------
+
+/// Sections and their fields. The host fills the TEXT of machine, repo, branch, worktree, parent task and sub-issue
+/// (put_child_branch / put_child_worktree give the last two for a child); this file fixes the rows.
+pub const IS_ENV : u32 = 0;
+pub const IS_CONTEXT : u32 = 1;
+pub const IS_OUTPUTS : u32 = 2;
+pub const IS_CHANGES : u32 = 3;
+pub const SECTION_NAMES : [4]str = ["Environment", "Context", "Outputs", "Changes"];
+
+pub const IF_MACHINE : u32 = 0;
+pub const IF_REPO : u32 = 1;
+pub const IF_BRANCH : u32 = 2;
+pub const IF_WORKTREE : u32 = 3;
+pub const IF_PARENT_TASK : u32 = 4;
+pub const IF_SUB_ISSUE : u32 = 5;
+pub const IF_PR : u32 = 6;
+pub const IF_LINES : u32 = 7;
+pub const IF_CHECKS : u32 = 8;
+pub const IF_READY : u32 = 9;
+pub const FIELD_NAMES : [10]str = ["Computer", "Repo", "Branch", "Worktree", "Parent task", "Sub-issue", "PR", "Lines", "Failing checks", "Mark ready"];
+
+/// Outputs lists the files written, at most this many rows and one "+N more" row.
+pub const OUT_ROWS_MAX : u32 = 6;
+
+/// Rows of the inspector for a lane that wrote `files` files: 4 headers, 4 + 2 + 4 fields, the file rows.
+pub fn ins_rows(files: u32) -> u32 {
+    var f : u32 = min2(files, OUT_ROWS_MAX);
+    if (files > OUT_ROWS_MAX) { f = f + 1; }
+    return 4 + 4 + 2 + 4 + f;
+}
+
+/// What row r shows: 1000 + section for a header, a field IF_*, 200 + k for the k-th file, 299 for "+N more".
+pub fn ins_code(r: u32, files: u32) -> u32 {
+    if (r == 0) { return 1000 + IS_ENV; }
+    if (r <= 4) { return r - 1; }
+    if (r == 5) { return 1000 + IS_CONTEXT; }
+    if (r <= 7) { return IF_PARENT_TASK + (r - 6); }
+    if (r == 8) { return 1000 + IS_OUTPUTS; }
+    const shown : u32 = min2(files, OUT_ROWS_MAX);
+    if (r < 9 + shown) { return 200 + (r - 9); }
+    var next : u32 = 9 + shown;
+    if (files > OUT_ROWS_MAX) {
+        if (r == next) { return 299; }
+        next = next + 1;
+    }
+    if (r == next) { return 1000 + IS_CHANGES; }
+    return IF_PR + (r - next - 1);
+}
+
+/// Changes in a u64: PR number (24 bits) | lines added (14) << 24 | lines removed (14) << 38 | checks failing (8) << 52
+/// | ready (1) << 60. PR 0 = none yet.
+pub fn ch_pack(pr: u64, plus: u32, minus: u32, failing: u32, ready: bool) -> u64 {
+    var r : u64 = pr & 16777215;
+    r = r | (@as(u64, min2(plus, 16383)) << 24) | (@as(u64, min2(minus, 16383)) << 38) | (@as(u64, min2(failing, 255)) << 52);
+    if (ready) { r = r | (@as(u64, 1) << 60); }
+    return r;
+}
+
+pub fn ch_pr(c: u64) -> u64 { return c & 16777215; }
+pub fn ch_plus(c: u64) -> u32 { return @as(u32, @intCast((c >> 24) & 16383)); }
+pub fn ch_minus(c: u64) -> u32 { return @as(u32, @intCast((c >> 38) & 16383)); }
+pub fn ch_failing(c: u64) -> u32 { return @as(u32, @intCast((c >> 52) & 255)); }
+pub fn ch_ready(c: u64) -> bool { return ((c >> 60) & 1) == 1; }
+
+/// "Mark ready" is offered when a PR exists, no check fails, and the lane's chain is golden SPEC..RECEIPT
+/// (golden_chain.t27 lane_ready on the verdicts of its RESULT).
+pub fn may_mark_ready(pr: u64, failing: u32, result: u64) -> bool {
+    if (pr == 0 or failing > 0) { return false; }
+    return res_effective(result) == ST_DONE;
+}
+
+; ---- geometry (dash.t27's packer) ----
+
+pub const FV_PANE_MIN : f64 = 240.0;
+pub const FV_SECTION_GAP : f64 = 6.0;
+
+fn ffl(x: u32) -> f64 { return @as(f64, @floatFromInt(x)); }
+
+/// Two panes, the tree and the inspector, side by side when each fits FV_PANE_MIN, stacked when not.
+pub fn fv_cols(w: f64) -> u32 { return min2(pack_cols(w, FV_PANE_MIN, GAP), 2); }
+pub fn fv_pane_w(w: f64) -> f64 { return cell_w(w, fv_cols(w), GAP); }
+pub fn fv_pane_x(p: u32, w: f64) -> f64 { return dash_cell_x(p, w, fv_cols(w), GAP); }
+/// The inspector pane sits below the tree when stacked; `tree_h` is fv_tree_h.
+pub fn fv_pane_y(p: u32, w: f64, tree_h: f64) -> f64 {
+    if (p == 0 or fv_cols(w) == 2) { return 0.0; }
+    return tree_h + GAP;
+}
+
+pub fn fv_row_x(dep: u32) -> f64 { return ffl(dep) * KV_INDENT; }
+pub fn fv_row_y(r: u32) -> f64 { return dash_cell_y(r, 1, KV_ROW_H, GAP); }
+pub fn fv_tree_h(rows: u32) -> f64 { return pack_h(rows, 1, KV_ROW_H, GAP); }
+pub fn fv_ins_y(r: u32) -> f64 { return dash_cell_y(r, 1, KV_ROW_H, GAP); }
+pub fn fv_ins_h(files: u32) -> f64 { return pack_h(ins_rows(files), 1, KV_ROW_H, GAP); }
+
+/// The lane row under (x, y) of the tree pane (origin at the pane), or FAN_NONE. A click left of the row's indent
+/// hits nothing, as in kernel.t27 kv_at.
+pub fn fv_tree_at(rows: u32, order: []const u32, dep: []const u32, w: f64, x: f64, y: f64) -> u32 {
+    const r : u32 = pack_at(rows, w, 1, KV_ROW_H, GAP, x, y);
+    if (r >= rows) { return FAN_NONE; }
+    const lane : u32 = order[@as(usize, r)];
+    if (x < fv_row_x(dep[@as(usize, lane)])) { return FAN_NONE; }
+    return lane;
+}
+
+; --- 5. Tests ------------------------------------------------------------------------------------------------------
+
+test a_child_is_spawned_by_monitor_so_the_parent_survives_its_crash_and_a_link_would_kill_it {
+    assert child_attach_kills_parent(true, X_CRASH);
+    assert child_attach_kills_parent(false, X_CRASH) == false;
+    assert child_attach_kills_parent(true, X_NORMAL) == false;
+    assert MONITOR_KILLS_WATCHER == false;
+    assert monitors_after_monitor(2) == 3;
+    // monitoring a child that is already dead is answered at once, not silently
+    assert attach_answer(false) != X_NONE and attach_answer(true) == X_NONE;
+}
+
+test the_spawn_gate_applies_depth_the_per_parent_limits_the_global_cap_and_the_hold {
+    // cap 3, parent is the 1 running lane
+    assert spawn_admit(0, 0, 0, 1, 3, 0, 0) == SP_START;
+    assert spawn_admit(1, 2, 1, 2, 3, 0, 0) == SP_START;
+    // depth: top lane 0 -> child 1 -> grandchild 2 -> no great-grandchild
+    assert spawn_admit(1, 0, 0, 2, 3, 0, 0) == SP_START;
+    assert spawn_admit(2, 0, 0, 2, 3, 0, 0) == SP_REFUSE_DEPTH;
+    // the per-parent total of 8
+    assert spawn_admit(0, 7, 0, 1, 16, 0, 0) == SP_START;
+    assert spawn_admit(0, 8, 0, 1, 16, 0, 0) == SP_REFUSE_COUNT;
+    // a child that does not fit waits: cap reached, hold, or the parent already runs FAN_LIVE_MAX
+    assert spawn_admit(0, 2, 2, 3, 3, 0, 0) == SP_WAIT;
+    assert spawn_admit(0, 2, 1, 2, 3, 1, 0) == SP_WAIT;
+    assert spawn_admit(0, 5, 4, 5, 16, 0, 0) == SP_WAIT;
+    assert spawn_admit(0, 5, 3, 5, 16, 0, 0) == SP_START;
+    // depth is named before the count, the count before capacity
+    assert spawn_admit(2, 8, 4, 9, 3, 1, 0) == SP_REFUSE_DEPTH;
+    assert spawn_admit(1, 8, 4, 9, 3, 1, 0) == SP_REFUSE_COUNT;
+    // a parent that holds the only lane (cap 1) would wait for itself: after FAN_SELF_WAIT_SECONDS it does the part
+    assert spawn_admit(0, 0, 0, 1, 1, 0, 0) == SP_WAIT;
+    assert spawn_admit(0, 0, 0, 1, 1, 0, FAN_SELF_WAIT_SECONDS - 1) == SP_WAIT;
+    assert spawn_admit(0, 0, 0, 1, 1, 0, FAN_SELF_WAIT_SECONDS) == SP_SELF;
+    // never self while a child runs (one of them will free a place), never for a hold (that passes)
+    assert spawn_admit(0, 1, 1, 2, 2, 0, 9999) == SP_WAIT;
+    assert spawn_admit(0, 0, 0, 1, 3, 1, 9999) == SP_WAIT;
+    assert FAN_CHILDREN_MAX == GC_BATCH_MAX and FAN_CHILDREN_MAX <= MBOX_SLOTS;
+}
+
+test children_that_do_not_fit_wait_in_the_parents_queue_oldest_first_and_start_as_places_free {
+    var q : u64 = 0;
+    q = fan_queue_push(q, 3);
+    q = fan_queue_push(q, 0);
+    q = fan_queue_push(q, 5);
+    assert fan_queue_len(q) == 3;
+    assert fan_queue_head(q) == 4;
+    q = fan_queue_pop(q);
+    assert fan_queue_head(q) == 1;
+    q = fan_queue_pop(q);
+    assert fan_queue_head(q) == 6 and fan_queue_len(q) == 1;
+    q = fan_queue_pop(q);
+    assert fan_queue_head(q) == 0 and fan_queue_len(q) == 0;
+    // all FAN_CHILDREN_MAX children fit the queue at once
+    var f : u64 = 0;
+    var k : u32 = 0;
+    while (k < FAN_CHILDREN_MAX) { f = fan_queue_push(f, k); k = k + 1; }
+    assert fan_queue_len(f) == FAN_CHILDREN_MAX;
+}
+
+test an_eight_path_boundary_splits_into_four_children_with_disjoint_path_sets {
+    // 0 fanout.t27 | 1,2 kernel.t27 two ranges | 3 gen of fanout | 4 evolve.t27 | 5 gen of evolve | 6 shared seal index | 7 append-only log
+    var path : [8]u64 = [8]u64{ 10, 20, 20, 11, 30, 12, 99, 40 };
+    var kind : [8]u8 = [8]u8{ 0, 1, 1, 3, 0, 3, 3, 2 };
+    var src : [8]u64 = [8]u64{ 0, 0, 0, 10, 0, 30, 0, 0 };
+    var lo : [8]u32 = [8]u32{ 0, 100, 600, 0, 0, 0, 0, 0 };
+    var hi : [8]u32 = [8]u32{ 0, 140, 640, 0, 0, 0, 0, 0 };
+    var child : [8]u8 = undefined;
+    var load : [8]u32 = undefined;
+    assert decompose(8, &path, &kind, &src, 4, &child, &load) == 4;
+    // one path, one child: both kernel.t27 ranges together, although edits_meet would let them run apart
+    assert child[1] == child[2];
+    // a derived path follows its source
+    assert child[3] == child[0] and child[5] == child[4];
+    // a derived path whose source is not in the Boundary is the parent's
+    assert child[6] == FAN_SHARED;
+    assert child[0] == 0 and child[1] == 1 and child[4] == 2 and child[7] == 3;
+    assert child_entries(8, &child, 0) == 2 and child_entries(8, &child, 1) == 2;
+    assert child_entries(8, &child, 2) == 2 and child_entries(8, &child, 3) == 1;
+    assert fan_overlaps(8, &path, &kind, &lo, &hi, &child) == 0;
+    // fewer children than groups: the extra group goes to the least loaded child, the lowest index on a tie
+    assert decompose(8, &path, &kind, &src, 3, &child, &load) == 3;
+    assert child[7] == 0;
+    assert fan_overlaps(8, &path, &kind, &lo, &hi, &child) == 0;
+    // maxc 1: no split at all
+    assert decompose(8, &path, &kind, &src, 1, &child, &load) == 1;
+    assert child_entries(8, &child, 0) == 7;
+    // one path only is one group: nothing to parallelize
+    var p1 : [2]u64 = [2]u64{ 5, 5 };
+    var k1 : [2]u8 = [2]u8{ 1, 1 };
+    var s1 : [2]u64 = [2]u64{ 0, 0 };
+    var c1 : [2]u8 = undefined;
+    assert decompose(2, &p1, &k1, &s1, 4, &c1, &load) == 1;
+    // negative control: put the two kernel.t27 ranges in different children by hand and the invariant sees it
+    var bad : [8]u8 = [8]u8{ 0, 1, 2, 0, 2, 2, 255, 3 };
+    assert fan_overlaps(8, &path, &kind, &lo, &hi, &bad) == 1;
+    // two derived entries of one path in two children are REGEN, not an overlap
+    var pd : [2]u64 = [2]u64{ 7, 7 };
+    var kd : [2]u8 = [2]u8{ 3, 3 };
+    var cd : [2]u8 = [2]u8{ 0, 1 };
+    var zl : [2]u32 = [2]u32{ 0, 0 };
+    assert fan_overlaps(2, &pd, &kd, &zl, &zl, &cd) == 0;
+}
+
+test the_sub_issue_skeleton_is_four_headings_part_of_the_parent_and_never_a_closing_keyword {
+    var out : [900]u8 = undefined;
+    var n : usize = put_title(&out, 0, 11275, 1, 4);
+    assert n == 35;
+    assert out[0] == 116 and out[n - 1] == 53;
+    var t : usize = put_body_head(&out, 0, 11275, 1, 4);
+    t = put_path_line(&out, t, "specs/t27os/kernel.t27");
+    t = put_body_tail(&out, t, 11275);
+    assert t > 400 and t < 900;
+    assert closing_keyword_in(out[0..t]) == false;
+    // "Part of #11275" opens it; the four headings are evolve.t27's, in order
+    assert out[0] == 80 and out[8] == 35 and out[9] == 49;
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i + 3 < t) {
+        if (out[i] == 10 and out[i + 1] == 35 and out[i + 2] == 35 and out[i + 3] == 32) { c = c + 1; }
+        i = i + 1;
+    }
+    assert c == 4;
+    // negative controls: the guard sees each closing keyword, in any case
+    assert closing_keyword_in("Closes #5") and closing_keyword_in("fixes #5") and closing_keyword_in("RESOLVED #5");
+    assert closing_keyword_in("Part of #5 -- child 1 of 4") == false;
+    // the branch and worktree of a child
+    var b : [64]u8 = undefined;
+    assert put_child_branch(&b, 0, 11275, 0) == 18;
+    var w : [96]u8 = undefined;
+    assert put_child_worktree(&w, 0, 11275, 2) == 33;
+}
+
+test a_result_packs_status_verdicts_summary_files_and_lines_and_a_not_golden_done_fails_closed {
+    const r : u64 = res_pack(ST_DONE, verdicts_all_pass(), 480, 7, 312, 41);
+    assert res_status(r) == ST_DONE and res_summary(r) == 480 and res_files(r) == 7;
+    assert res_plus(r) == 312 and res_minus(r) == 41;
+    assert res_verdict(r, 0) == GC_V_PASS and res_verdict(r, 4) == GC_V_PASS;
+    assert res_effective(r) == ST_DONE;
+    // DONE with the SEAL stage still unknown is not done
+    const half : u64 = res_pack(ST_DONE, verdicts_all_pass() - (1 << 4), 10, 1, 1, 1);
+    assert res_effective(half) == ST_FAILED;
+    assert res_effective(res_pack(ST_FORBIDDEN, 0, 0, 0, 0, 0)) == ST_FORBIDDEN;
+    assert res_effective(res_pack(ST_FAILED, verdicts_all_pass(), 0, 0, 0, 0)) == ST_FAILED;
+    // fields clamp, they do not spill into the next one
+    const c : u64 = res_pack(ST_DONE, verdicts_all_pass(), 99999, 99999, 99999, 99999);
+    assert res_summary(c) == SUMMARY_MAX and res_files(c) == 1023 and res_plus(c) == 16383 and res_minus(c) == 16383;
+    assert res_status(c) == ST_DONE;
+}
+
+test the_result_rides_the_data_lane_into_a_bounded_parent_mailbox {
+    assert kernel_lane(K_RESULT) == kernel_lane(K_TASK);
+    assert kernel_lane(K_STOP) != kernel_lane(K_RESULT);
+    assert result_delivery(true, 0) == D_QUEUED;
+    assert result_delivery(true, 16) != D_QUEUED;
+    assert result_delivery(false, 0) != D_QUEUED;
+    // a lost RESULT leaves a normal DOWN with no result: FAILED, so the parent retries and nothing is lost silently
+    assert child_end(X_NORMAL, 0, false, 0) == CE_FAILED;
+}
+
+test what_a_childs_end_means_a_healed_crash_is_invisible_a_shed_is_not_a_failure {
+    const ok : u64 = res_pack(ST_DONE, verdicts_all_pass(), 1, 1, 1, 1);
+    assert child_end(X_NORMAL, 0, true, ok) == CE_DONE;
+    assert child_end(X_NORMAL, 0, true, res_pack(ST_FORBIDDEN, 0, 0, 0, 0, 0)) == CE_FORBIDDEN;
+    assert child_end(X_NORMAL, 0, true, res_pack(ST_FAILED, 0, 0, 0, 0, 0)) == CE_FAILED;
+    // a crash the lanes supervisor still restarts is not an end
+    assert child_end(X_CRASH, 0, false, 0) == CE_RUNNING;
+    assert child_end(X_CRASH, LANES_MAX_R - 1, false, 0) == CE_RUNNING;
+    assert child_end(X_CRASH, LANES_MAX_R, false, 0) == CE_FAILED;
+    assert lane_decision(X_CRASH, LANES_MAX_R) == KD_OWNER_REQUEST;
+    // a shed child (kernel.t27 shedding) goes back to the queue with no try spent
+    assert child_end(X_SHUTDOWN, 0, false, 0) == CE_REQUEUE;
+    assert slot_after_end(CS_RUNNING, CE_REQUEUE) == CS_QUEUED;
+    assert slot_after_end(CS_RUNNING, CE_RUNNING) == CS_RUNNING;
+    assert slot_after_end(CS_RUNNING, CE_DONE) == CS_DONE;
+    assert hung_turn_signal(TURN_MAX_SECONDS - 1) == X_NONE and hung_turn_signal(TURN_MAX_SECONDS) == X_KILL;
+}
+
+test three_children_all_done_means_land_in_child_order_whoever_finished_first {
+    var st : [3]u8 = [3]u8{ CS_RUNNING, CS_RUNNING, CS_RUNNING };
+    var tr : [3]u8 = [3]u8{ 0, 0, 0 };
+    assert join_decide(3, &st, &tr, 0) == JA_WAIT;
+    st[2] = CS_DONE;
+    assert join_decide(3, &st, &tr, 100) == JA_WAIT;
+    assert count_state(3, &st, CS_DONE) == 1 and count_state(3, &st, CS_RUNNING) == 2;
+    st[0] = CS_DONE;
+    st[1] = CS_DONE;
+    assert join_decide(3, &st, &tr, 200) == JA_LAND;
+    // the landing: children 0..2 edit disjoint paths, all built on head 1
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var rs : [3]u64 = [3]u64{ res_pack(ST_DONE, verdicts_all_pass(), 5, 2, 30, 4), res_pack(ST_DONE, verdicts_all_pass(), 5, 1, 10, 0), res_pack(ST_DONE, verdicts_all_pass(), 5, 3, 99, 9) };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 200, 300 };
+    var ek : [3]u8 = [3]u8{ 0, 0, 0 };
+    var el : [3]u32 = [3]u32{ 0, 0, 0 };
+    var eh : [3]u32 = [3]u32{ 0, 0, 0 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert fanin_land(3, &id, &rs, 1, 3, &eo, &ep, &ek, &el, &eh, &out, &pos) == 3;
+    assert out[0] == GC_OUT_FORWARD and out[1] == GC_OUT_CARRIED and out[2] == GC_OUT_CARRIED;
+    assert pos[0] == 0 and pos[1] == 1 and pos[2] == 2;
+    // the same fan again lands the same way: the pass takes child order, not arrival order
+    var out2 : [3]u8 = undefined;
+    var pos2 : [3]usize = undefined;
+    assert fanin_land(3, &id, &rs, 1, 3, &eo, &ep, &ek, &el, &eh, &out2, &pos2) == 3;
+    assert out2[0] == out[0] and out2[1] == out[1] and out2[2] == out[2] and pos2[2] == pos[2];
+    // totals for the parent's summary line
+    assert res_files(rs[0]) + res_files(rs[1]) + res_files(rs[2]) == 6;
+}
+
+test a_shared_derived_file_is_regenerated_and_a_split_that_overlaps_conflicts_at_the_landing {
+    var id : [2]u64 = [2]u64{ 11, 12 };
+    var rs : [2]u64 = [2]u64{ res_pack(ST_DONE, verdicts_all_pass(), 1, 1, 1, 1), res_pack(ST_DONE, verdicts_all_pass(), 1, 1, 1, 1) };
+    // both children recompute the derived file 500: REGEN
+    var eo : [4]usize = [4]usize{ 0, 0, 1, 1 };
+    var ep : [4]u64 = [4]u64{ 100, 500, 200, 500 };
+    var ek : [4]u8 = [4]u8{ 0, 3, 0, 3 };
+    var el : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var eh : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var out : [2]u8 = undefined;
+    var pos : [2]usize = undefined;
+    assert fanin_land(2, &id, &rs, 1, 4, &eo, &ep, &ek, &el, &eh, &out, &pos) == 2;
+    assert out[1] == GC_OUT_REGEN and gc_landed(out[1]);
+    // negative control: the same SOURCE path in both children (a bad split) is a conflict, and nothing of it lands
+    var ep2 : [4]u64 = [4]u64{ 100, 500, 100, 500 };
+    var out3 : [2]u8 = undefined;
+    var pos3 : [2]usize = undefined;
+    assert fanin_land(2, &id, &rs, 1, 4, &eo, &ep2, &ek, &el, &eh, &out3, &pos3) == 1;
+    assert out3[1] == GC_OUT_CONFLICT and gc_landed(out3[1]) == false;
+}
+
+test one_crash_the_supervisor_gave_up_on_is_retried_by_the_parent_at_most_twice_then_the_owner_is_asked {
+    var st : [3]u8 = [3]u8{ CS_DONE, CS_RUNNING, CS_DONE };
+    var tr : [3]u8 = [3]u8{ 0, 0, 0 };
+    // the supervisor heals the first crashes: the parent sees nothing
+    assert child_end(X_CRASH, 1, false, 0) == CE_RUNNING;
+    assert join_decide(3, &st, &tr, 50) == JA_WAIT;
+    // its restart budget is spent: the end reaches the parent as FAILED
+    st[1] = slot_after_end(CS_RUNNING, child_end(X_CRASH, LANES_MAX_R, false, 0));
+    assert st[1] == CS_FAILED;
+    assert join_decide(3, &st, &tr, 60) == JA_RETRY and join_retry_which(3, &st, &tr) == 1;
+    // retry: back in the queue, one try spent; the others stay done and are not redone
+    st[1] = CS_QUEUED;
+    tr[1] = @as(u8, @intCast(tries_after_retry(@as(u32, tr[1]))));
+    assert tr[1] == 1 and st[0] == CS_DONE and st[2] == CS_DONE;
+    assert join_decide(3, &st, &tr, 70) == JA_WAIT;
+    st[1] = CS_RUNNING;
+    st[1] = CS_DONE;
+    assert join_decide(3, &st, &tr, 900) == JA_LAND;
+    // second failure, second retry, third failure: no tries left, the owner is asked
+    st[1] = CS_FAILED;
+    assert join_decide(3, &st, &tr, 900) == JA_RETRY;
+    tr[1] = 2;
+    assert join_decide(3, &st, &tr, 900) == JA_ASK;
+    assert join_retry_which(3, &st, &tr) == 3;
+}
+
+test a_forbidden_child_asks_the_owner_at_once_while_the_others_stay_visible_and_the_default_lands_the_done_ones {
+    var st : [3]u8 = [3]u8{ CS_DONE, CS_FORBIDDEN, CS_RUNNING };
+    var tr : [3]u8 = [3]u8{ 0, 0, 0 };
+    assert join_decide(3, &st, &tr, 10) == JA_ASK;
+    // partial results are visible while it waits
+    assert count_state(3, &st, CS_DONE) == 1 and count_state(3, &st, CS_RUNNING) == 1 and count_state(3, &st, CS_FORBIDDEN) == 1;
+    // forbidden is never retried
+    assert join_retry_which(3, &st, &tr) == 3;
+    // a failed sibling that still has tries is retried alongside the request
+    st[2] = CS_FAILED;
+    assert join_decide(3, &st, &tr, 10) == JA_ASK and join_retry_which(3, &st, &tr) == 2;
+    assert owner_default(1) == FD_LAND_PARTIAL;
+    assert owner_default(0) == FD_BACKLOG;
+}
+
+test the_join_times_out_after_two_turns_and_asks_the_owner_and_an_empty_fan_never_lands {
+    var st : [2]u8 = [2]u8{ CS_DONE, CS_RUNNING };
+    var tr : [2]u8 = [2]u8{ 0, 0 };
+    assert join_decide(2, &st, &tr, FAN_JOIN_TIMEOUT_SECONDS - 1) == JA_WAIT;
+    assert join_decide(2, &st, &tr, FAN_JOIN_TIMEOUT_SECONDS) == JA_ASK;
+    assert FAN_JOIN_TIMEOUT_SECONDS == 7200;
+    // a queued child (waiting for capacity) keeps the join open too
+    st[1] = CS_QUEUED;
+    assert join_decide(2, &st, &tr, 5) == JA_WAIT;
+    assert join_decide(0, &st, &tr, 5) == JA_WAIT;
+    // timeout does not hide a retry
+    st[1] = CS_FAILED;
+    assert join_decide(2, &st, &tr, 99999) == JA_RETRY;
+}
+
+test the_lane_tree_nests_children_under_their_parent_with_glyphs_counts_and_the_worst_light {
+    // lanes: 0 issue A (top) | 1 issue B (top) | 2,3,4 children of 0 | 5 grandchild of 3
+    var parent : [6]u32 = [6]u32{ 255, 255, 0, 0, 0, 3 };
+    var order : [6]u32 = undefined;
+    var dep : [6]u32 = undefined;
+    assert tree_order(6, &parent, &order, &dep) == 6;
+    // depth first: 0, 2, 3, 5, 4, then 1
+    assert order[0] == 0 and order[1] == 2 and order[2] == 3 and order[3] == 5 and order[4] == 4 and order[5] == 1;
+    assert dep[0] == 0 and dep[2] == 1 and dep[5] == 2 and dep[1] == 0;
+    assert child_count(6, &parent, 0) == 3 and child_count(6, &parent, 3) == 1 and child_count(6, &parent, 1) == 0;
+    assert branch_glyph(6, &parent, 0) == GL_NONE and branch_glyph(6, &parent, 2) == GL_MID;
+    assert branch_glyph(6, &parent, 4) == GL_LAST and branch_glyph(6, &parent, 5) == GL_LAST;
+    // lights come from keys.t27: the parent shows its worst child
+    var light : [6]u32 = [6]u32{ L_GREEN, L_NONE, L_GREEN, L_RED, L_YELLOW, L_GREEN };
+    assert row_light(6, &parent, &light, 0) == L_RED;
+    assert row_light(6, &parent, &light, 4) == L_YELLOW and row_light(6, &parent, &light, 1) == L_NONE;
+    // the row: counts of done, failed, waiting children and the lamp from the parent's slots
+    var st : [6]u8 = [6]u8{ CS_RUNNING, CS_RUNNING, CS_DONE, CS_FAILED, CS_QUEUED, CS_RUNNING };
+    var rst : [6]u32 = [6]u32{ 0, 0, 0, 3, 0, 1 };
+    var esc : [6]bool = [6]bool{ false, false, false, false, false, false };
+    const row : u64 = lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 0);
+    assert lv_kids(row) == 3 and lv_done(row) == 1 and lv_failed(row) == 1 and lv_waiting(row) == 1;
+    assert lv_state(row) == NS_RUNNING and lv_light(row) == L_RED and lv_depth(row) == 0 and lv_glyph(row) == GL_NONE;
+    assert lv_state(lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 4)) == NS_HELD;
+    assert lv_state(lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 2)) == NS_STOPPED;
+    assert lv_state(lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 5)) == NS_RESTARTING;
+    assert lv_restarts(lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 3)) == 3;
+    assert lv_glyph(lv_row(6, &parent, &dep, &st, &rst, &esc, &light, 4)) == GL_LAST;
+    assert lane_state(CS_FAILED, false, false) == NS_ESCALATED and lane_state(CS_RUNNING, false, true) == NS_ESCALATED;
+}
+
+test the_inspector_has_environment_context_outputs_and_changes_rows_and_mark_ready_needs_a_golden_pr {
+    assert ins_rows(0) == 14 and ins_rows(3) == 17 and ins_rows(6) == 20 and ins_rows(9) == 21;
+    assert ins_code(0, 3) == 1000 + IS_ENV and ins_code(1, 3) == IF_MACHINE and ins_code(4, 3) == IF_WORKTREE;
+    assert ins_code(5, 3) == 1000 + IS_CONTEXT and ins_code(6, 3) == IF_PARENT_TASK and ins_code(7, 3) == IF_SUB_ISSUE;
+    assert ins_code(8, 3) == 1000 + IS_OUTPUTS and ins_code(9, 3) == 200 and ins_code(11, 3) == 202;
+    assert ins_code(12, 3) == 1000 + IS_CHANGES and ins_code(13, 3) == IF_PR and ins_code(16, 3) == IF_READY;
+    // no files: Changes follows the Outputs header at once; more than 6: a "+N more" row
+    assert ins_code(9, 0) == 1000 + IS_CHANGES and ins_code(13, 0) == IF_READY;
+    assert ins_code(15, 9) == 299 and ins_code(16, 9) == 1000 + IS_CHANGES and ins_code(20, 9) == IF_READY;
+    const c : u64 = ch_pack(11290, 312, 41, 2, false);
+    assert ch_pr(c) == 11290 and ch_plus(c) == 312 and ch_minus(c) == 41 and ch_failing(c) == 2 and ch_ready(c) == false;
+    assert ch_ready(ch_pack(5, 1, 1, 0, true));
+    const ok : u64 = res_pack(ST_DONE, verdicts_all_pass(), 1, 1, 1, 1);
+    assert may_mark_ready(11290, 0, ok);
+    assert may_mark_ready(11290, 1, ok) == false and may_mark_ready(0, 0, ok) == false;
+    assert may_mark_ready(11290, 0, res_pack(ST_FAILED, verdicts_all_pass(), 1, 1, 1, 1)) == false;
+}
+
+test the_layout_uses_the_dash_packer_two_panes_side_by_side_or_stacked_and_hit_tests_the_tree {
+    assert fv_cols(800.0) == 2 and fv_cols(400.0) == 1;
+    assert fv_pane_x(0, 800.0) == 0.0 and fv_pane_x(1, 800.0) > fv_pane_w(800.0);
+    assert fv_pane_y(1, 800.0, 100.0) == 0.0 and fv_pane_y(1, 400.0, 100.0) == 100.0 + GAP;
+    assert fv_row_y(0) == 0.0 and fv_row_y(2) == 2.0 * (KV_ROW_H + GAP);
+    assert fv_row_x(2) == 2.0 * KV_INDENT;
+    assert fv_tree_h(6) == 6.0 * KV_ROW_H + 5.0 * GAP;
+    assert fv_ins_h(0) == 14.0 * KV_ROW_H + 13.0 * GAP;
+    var parent : [6]u32 = [6]u32{ 255, 255, 0, 0, 0, 3 };
+    var order : [6]u32 = undefined;
+    var dep : [6]u32 = undefined;
+    assert tree_order(6, &parent, &order, &dep) == 6;
+    // row 1 is lane 2 (depth 1), row 3 is lane 5 (depth 2)
+    assert fv_tree_at(6, &order, &dep, 300.0, 60.0, fv_row_y(1) + 3.0) == 2;
+    assert fv_tree_at(6, &order, &dep, 300.0, 60.0, fv_row_y(3) + 3.0) == 5;
+    assert fv_tree_at(6, &order, &dep, 300.0, 5.0, fv_row_y(3) + 3.0) == FAN_NONE;
+    assert fv_tree_at(6, &order, &dep, 300.0, 60.0, fv_row_y(1) + KV_ROW_H + 2.0) == FAN_NONE;
+    assert fv_tree_at(6, &order, &dep, 300.0, 400.0, 5.0) == FAN_NONE;
+}
