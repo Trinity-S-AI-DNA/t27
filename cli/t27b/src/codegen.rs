@@ -191,7 +191,7 @@ struct Gen<'a> {
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
     let mut out = Vec::with_capacity(prog.funcs.len());
     for (i, f) in prog.funcs.iter().enumerate() {
-        if f.is_test && !with_tests {
+        if (f.is_test && !with_tests) || (f.name.starts_with('@') && style != TrapStyle::Jit) { // an import (#8946) has no code in an object
             continue;
         }
         out.push(compile_func(prog, i as FuncId, style)?);
@@ -1617,7 +1617,11 @@ impl<'a> Gen<'a> {
         for &(v, _) in vals.iter().rev() {
             self.release(v);
         }
-        self.calls.push((self.code.len(), func));
+        match (self.prog.funcs[func as usize].name.starts_with('@'), self.style) { // a call to an import: its `bl` is a data ref with bit 31 set, which only macho.t27 resolves (#8946)
+            (true, TrapStyle::Brk) => self.data_refs.push((self.code.len(), 1 << 31 | func)),
+            (true, TrapStyle::Elf) => self.fail(format!("call to the import `{}` outside a Mach-O object", &self.prog.funcs[func as usize].name[1..])),
+            _ => self.calls.push((self.code.len(), func)), // the JIT runs an import as its empty body, which traps: eval refuses the call
+        }
         self.emit(a64::bl(0));
         if out_bytes > 0 {
             self.emit(a64::add_imm(true, SP, SP, out_bytes));
