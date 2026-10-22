@@ -1,0 +1,1578 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/vcd_wrapped_logic.t27 -- the vcd-wrapped widget's reader: IEEE 1364 VCD text read as a
+; stream of tokens into one counter row per signal, then summarised. Ported from trinity
+; apps/website/public/widgets/vcd-wrapped/vcdstats.js (281 lines). Epic gHashTag/t27#10937, issue #10938.
+; --
+; JS export          -> t27 function(s)                       note
+;   VcdError         -> the status codes below + vcd_err_* getters (code, detail)
+;   createVcdReader  -> vcd_begin(max_header_chars), vcd_push(chunk), vcd_end(), vcd_chars()
+;   summarize        -> vcd_summarize(top) (called by vcd_end with top 5), vs_* / row getters
+;   vcdSummary       -> vcd_summary(text, max_header_chars): chunks of 1048576 BYTES (JS: UTF-16 units; same for ASCII)
+;   spanUnits        -> span_units(ticks, has_timescale, mul, exp) + su_value(), su_unit()
+;   extend, flipsBetween, isUnknownChar, endCommand, record, headerToken, bodyToken, feed, topOf: internal
+; --
+; Status of vcd_push, vcd_end, vcd_summary: 0 ok; error codes as the JS VcdError.code:
+;   1 binary  2 not-vcd  3 timescale  4 bad-var  5 no-vars  6 unknown-id  7 bad-token  8 no-defs  9 empty;
+;   90 a case not carried (below); -1 over a table limit.
+;   vcd_err_info(f): 0 code 1 detail text offset 2 detail text length (bytes of err_byte) 3 time set 4 time (f64 in vcd_err_time())
+;   The detail text is the JS detail's token (first 40 UTF-16 units) or text; read it with err_byte(i).
+; Summary layout (after vcd_end returned 0): vs_info(f) (u64): 0 timescale set 1 mul 2 unit (0 s 1 ms 2 us 3 ns 4 ps 5 fs)
+;   3 exp 4 version offset 5 version length 6 stamps 7 chars 8 vars 9 signals 10 params 11 scopes 12 changes
+;   13 flips 14 busiest count 15 quietest count 16 stuck_xz 17 stuck names count 18 ends_xz 19 ends names count
+;   20 never_changed 21 movers;  vs_time(f): 0 t_first 1 t_last 2 span (f64, 0 when none).
+;   vs_row(kind, i, f): kind 0 busiest, 1 quietest; f 0 name off 1 name len 2 width 3 type off 4 type len
+;   5 changes 6 flips 7 aliases;  vs_name(kind, i, f): kind 0 stuck names, 1 ends names; f 0 off 1 len.
+;   Strings are read with pool_byte(i) (one pool for names, types, version).
+; --
+; Input: UTF-8 bytes; a chunk must end on a character boundary. Whitespace is the JavaScript \s set.
+; The JS decodes text into UTF-16 first; lengths of `chars` and of the 40-unit error tokens are counted in
+; UTF-16 units here too.
+; Not carried (status 90): a bit-vector value with a byte of 128 or more (JS lowercases Unicode letters
+; when counting flips); a $var width that is not a whole number below 65536 once read as a JavaScript
+; Number (2.5, 1e10, Infinity); a timestamp with more than 19 digits; a 4-byte character split by the
+; 40-unit cut of an error token. Table limits (the JS has none): 65536 signals, 1 MB per token, 16 MB of
+; names, 32 MB of values, scope depth 1024.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widget_vcd_wrapped_logic;
+
+pub const MS : usize = 65536;
+
+pub const R_STARTED : usize = 0;
+pub const R_HDR : usize = 1;
+pub const R_CHARS : usize = 2;
+pub const R_CMD : usize = 3;
+pub const R_NCT : usize = 4;
+pub const R_CBN : usize = 5;
+pub const R_NSC : usize = 6;
+pub const R_SCOPES : usize = 7;
+pub const R_TSS : usize = 8;
+pub const R_TSM : usize = 9;
+pub const R_TSU : usize = 10;
+pub const R_VERO : usize = 11;
+pub const R_VERL : usize = 12;
+pub const R_VARS : usize = 13;
+pub const R_NSIG : usize = 14;
+pub const R_BLOCK : usize = 15;
+pub const R_PEND : usize = 16;
+pub const R_PENDL : usize = 17;
+pub const R_TSET : usize = 18;
+pub const R_STAMPS : usize = 19;
+pub const R_TFS : usize = 20;
+pub const R_MAXH : usize = 21;
+pub const R_HOLD : usize = 22;
+pub const R_TOKN : usize = 23;
+pub const R_NP : usize = 24;
+pub const R_VP : usize = 25;
+pub const R_ECODE : usize = 26;
+pub const R_EO : usize = 27;
+pub const R_EL : usize = 28;
+pub const R_ETS : usize = 29;
+pub const R_UNSUP : usize = 30;
+pub const R_EBN : usize = 31;
+
+pub var R : [40]u64 = [0; 40];
+pub var TF : [4]f64 = [0.0; 4];
+pub var SUM : [32]u64 = [0; 32];
+pub var SUT : [4]f64 = [0.0; 4];
+pub var SUV : [2]f64 = [0.0; 2];
+pub var P10 : [23]f64 = [0.0; 23];
+
+pub var TOKB : [1048576]u8 = [0; 1048576];
+pub var PVB : [1048576]u8 = [0; 1048576];
+pub var CB : [1048576]u8 = [0; 1048576];
+pub var CTO : [65536]u32 = [0; 65536];
+pub var CTL : [65536]u32 = [0; 65536];
+pub var HOLD : [8388608]u8 = [0; 8388608];
+pub var ERRB : [1048576]u8 = [0; 1048576];
+pub var NAMEP : [16777216]u8 = [0; 16777216];
+pub var VALP : [33554432]u8 = [0; 33554432];
+pub var VE : [65536]u8 = [0; 65536];
+pub var SCO : [1024]u32 = [0; 1024];
+pub var SCL : [1024]u32 = [0; 1024];
+
+pub var SIO : [65536]u32 = [0; 65536];
+pub var SIL : [65536]u32 = [0; 65536];
+pub var SNO : [65536]u32 = [0; 65536];
+pub var SNL : [65536]u32 = [0; 65536];
+pub var STO : [65536]u32 = [0; 65536];
+pub var STL : [65536]u32 = [0; 65536];
+pub var SWD : [65536]u32 = [0; 65536];
+pub var SFG : [65536]u8 = [0; 65536];
+pub var SVO : [65536]u32 = [0; 65536];
+pub var SVL : [65536]u32 = [0; 65536];
+pub var SVC : [65536]u32 = [0; 65536];
+pub var SHV : [65536]u8 = [0; 65536];
+pub var SVA : [65536]u64 = [0; 65536];
+pub var SCH : [65536]u64 = [0; 65536];
+pub var SFL : [65536]u64 = [0; 65536];
+pub var SEK : [65536]u8 = [0; 65536];
+pub var SAL : [65536]u32 = [0; 65536];
+pub var HT : [262144]u32 = [0; 262144];
+
+pub var LIVE : [65536]u32 = [0; 65536];
+pub var SRT : [65536]u32 = [0; 65536];
+pub var STMP : [65536]u32 = [0; 65536];
+pub var BUSY : [8]u32 = [0; 8];
+pub var QUIET : [8]u32 = [0; 8];
+pub var STUCK : [8]u32 = [0; 8];
+pub var ENDSX : [8]u32 = [0; 8];
+
+// ---------------------------------------------------------------- bytes and whitespace
+pub fn ws_len_at(s: []const u8, p: usize, hi: usize) -> usize {
+    if (p >= hi) { return 0; }
+    const b : u8 = s[p];
+    if (b == 32 or (b >= 9 and b <= 13)) { return 1; }
+    if (b == 194 and p + 1 < hi and s[p + 1] == 160) { return 2; }
+    if (p + 3 <= hi) {
+        const b1 : u8 = s[p + 1];
+        const b2 : u8 = s[p + 2];
+        if (b == 225 and b1 == 154 and b2 == 128) { return 3; }
+        if (b == 226 and b1 == 128 and ((b2 >= 128 and b2 <= 138) or b2 == 168 or b2 == 169 or b2 == 175)) { return 3; }
+        if (b == 226 and b1 == 129 and b2 == 159) { return 3; }
+        if (b == 227 and b1 == 128 and b2 == 128) { return 3; }
+        if (b == 239 and b1 == 187 and b2 == 191) { return 3; }
+    }
+    return 0;
+}
+
+pub fn is_digit(b: u8) -> bool {
+    return b >= 48 and b <= 57;
+}
+
+/// The UTF-16 units of the UTF-8 bytes s[lo..hi).
+pub fn units_of(s: []const u8, lo: usize, hi: usize) -> u64 {
+    var n : u64 = 0;
+    var k : usize = lo;
+    while (k < hi) {
+        const b : u8 = s[k];
+        if (b < 128 or b >= 192) { n = n + 1; }
+        if (b >= 240) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The bytes of the first `units` UTF-16 units of s[lo..hi) (whole characters only); returns -1 when a pair would be split.
+pub fn prefix_bytes(s: []const u8, lo: usize, hi: usize, units: u64) -> i64 {
+    var n : u64 = 0;
+    var k : usize = lo;
+    while (k < hi) {
+        const b : u8 = s[k];
+        var step : usize = 1;
+        var u : u64 = 1;
+        if (b >= 192 and b < 224) { step = 2; }
+        if (b >= 224 and b < 240) { step = 3; }
+        if (b >= 240) {
+            step = 4;
+            u = 2;
+        }
+        if (n + u > units) {
+            if (u == 2 and n + 1 == units) { R[R_UNSUP] = 1; }
+            return (k - lo) as i64;
+        }
+        n = n + u;
+        k = k + step;
+    }
+    return (hi - lo) as i64;
+}
+
+pub fn fail(code: u64, o: usize, l: usize, src: u32) -> i32 {
+    R[R_ECODE] = code;
+    R[R_EO] = 0;
+    R[R_EL] = l as u64;
+    var k : usize = 0;
+    while (k < l and k < 1048576) {
+        if (src == 0) { ERRB[k] = TOKB[o + k]; }
+        if (src == 1) { ERRB[k] = CB[o + k]; }
+        if (src == 2) { ERRB[k] = PVB[o + k]; }
+        if (src == 3) { ERRB[k] = HOLD[o + k]; }
+        k = k + 1;
+    }
+    return code as i32;
+}
+
+pub fn tok_is(w: []const u8) -> bool {
+    if ((R[R_TOKN] as usize) != w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (TOKB[k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn cb_is(i: usize, w: []const u8) -> bool {
+    if ((CTL[i] as usize) != w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (CB[(CTO[i] as usize) + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- Number(token) for a $var width
+/// -1 NaN or negative, -3 not carried, else the whole number (0 for anything in [0, 1)).
+pub fn js_width(o: usize, l: usize) -> i64 {
+    var p : usize = 0;
+    var neg : bool = false;
+    if (l == 0) { return -1; }
+    const t : []const u8 = CB[0 .. 1048576];
+    const b0 : u8 = t[o];
+    if (b0 == 43 or b0 == 45) {
+        neg = b0 == 45;
+        p = 1;
+    }
+    if (l - p == 8 and t[o + p] == 73 and t[o + p + 1] == 110 and t[o + p + 2] == 102 and t[o + p + 3] == 105 and t[o + p + 4] == 110 and t[o + p + 5] == 105 and t[o + p + 6] == 116 and t[o + p + 7] == 121) {
+        if (neg) { return -1; }
+        return -3;
+    }
+    if (p == 0 and l > 2 and t[o] == 48) {
+        const c : u8 = t[o + 1] | 32;
+        var base : u64 = 0;
+        if (c == 120) { base = 16; }
+        if (c == 111) { base = 8; }
+        if (c == 98) { base = 2; }
+        if (base > 0) {
+            var v : u64 = 0;
+            var k : usize = 2;
+            while (k < l) {
+                const d : u8 = t[o + k];
+                var dv : u64 = 99;
+                if (is_digit(d)) { dv = (d - 48) as u64; }
+                if ((d | 32) >= 97 and (d | 32) <= 102) { dv = ((d | 32) - 87) as u64; }
+                if (dv >= base) { return -1; }
+                if (v < 4294967296) { v = v * base + dv; }
+                k = k + 1;
+            }
+            if (v >= 2147483648) { return -3; }
+            return v as i64;
+        }
+    }
+    var m : u64 = 0;
+    var nd : u64 = 0;
+    var e10 : i64 = 0;
+    var digits : u64 = 0;
+    var seen : bool = false;
+    var big : bool = false;
+    while (p < l and is_digit(t[o + p])) {
+        digits = digits + 1;
+        seen = true;
+        if (m == 0 and t[o + p] == 48) {
+            m = 0;
+        } else {
+            if (nd < 19) {
+                m = m * 10 + ((t[o + p] - 48) as u64);
+                nd = nd + 1;
+            } else {
+                big = true;
+            }
+        }
+        p = p + 1;
+    }
+    if (p < l and t[o + p] == 46) {
+        p = p + 1;
+        while (p < l and is_digit(t[o + p])) {
+            digits = digits + 1;
+            seen = true;
+            if (m == 0 and t[o + p] == 48) {
+                m = 0;
+            } else {
+                if (nd < 19) {
+                    m = m * 10 + ((t[o + p] - 48) as u64);
+                    nd = nd + 1;
+                } else {
+                    big = true;
+                }
+            }
+            e10 = e10 - 1;
+            p = p + 1;
+        }
+    }
+    if (!seen) { return -1; }
+    if (p < l and (t[o + p] == 101 or t[o + p] == 69)) {
+        p = p + 1;
+        var eneg : bool = false;
+        if (p < l and (t[o + p] == 43 or t[o + p] == 45)) {
+            eneg = t[o + p] == 45;
+            p = p + 1;
+        }
+        if (p >= l or !is_digit(t[o + p])) { return -1; }
+        var ev : i64 = 0;
+        while (p < l and is_digit(t[o + p])) {
+            if (ev < 100000) { ev = ev * 10 + ((t[o + p] - 48) as i64); }
+            p = p + 1;
+        }
+        if (eneg) { e10 = e10 - ev; } else { e10 = e10 + ev; }
+    }
+    if (p != l) { return -1; }
+    if (m == 0 and !big) { return 0; }
+    if (neg) { return -1; }
+    if (big) { return -3; }
+    while (m % 10 == 0) {
+        m = m / 10;
+        nd = nd - 1;
+        e10 = e10 + 1;
+    }
+    if ((nd as i64) + e10 <= 0) { return 0; }
+    if (e10 >= 0) {
+        if ((nd as i64) + e10 > 10) { return -3; }
+        var v2 : u64 = m;
+        var k2 : i64 = 0;
+        while (k2 < e10) {
+            v2 = v2 * 10;
+            k2 = k2 + 1;
+        }
+        if (v2 >= 2147483648) { return -3; }
+        return v2 as i64;
+    }
+    return -3;
+}
+
+// ---------------------------------------------------------------- the reader
+pub fn pool_put(w: []const u8, lo: usize, hi: usize, src: u32) -> i64 {
+    const at : u64 = R[R_NP];
+    if (at + ((hi - lo) as u64) >= 16777216) { return -1; }
+    var k : usize = lo;
+    while (k < hi) {
+        if (src == 0) { NAMEP[(at as usize) + (k - lo)] = TOKB[k]; }
+        if (src == 1) { NAMEP[(at as usize) + (k - lo)] = CB[k]; }
+        k = k + 1;
+    }
+    R[R_NP] = at + ((hi - lo) as u64);
+    return at as i64;
+}
+
+pub fn hash_id(o: usize, l: usize, src: u32) -> usize {
+    var h : u64 = 2166136261;
+    var k : usize = 0;
+    while (k < l) {
+        var b : u64 = 0;
+        if (src == 0) { b = TOKB[o + k] as u64; }
+        if (src == 1) { b = CB[o + k] as u64; }
+        h = ((h ^ b) * 16777619) % 4294967296;
+        k = k + 1;
+    }
+    return (h as usize) % 262144;
+}
+
+pub fn id_eq(si: usize, o: usize, l: usize, src: u32) -> bool {
+    if ((SIL[si] as usize) != l) { return false; }
+    var k : usize = 0;
+    while (k < l) {
+        var b : u8 = 0;
+        if (src == 0) { b = TOKB[o + k]; }
+        if (src == 1) { b = CB[o + k]; }
+        if (NAMEP[(SIO[si] as usize) + k] != b) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// byId.get(id): the signal index plus one, or 0.
+pub fn find_sig(o: usize, l: usize, src: u32) -> usize {
+    var p : usize = hash_id(o, l, src);
+    while (HT[p] != 0) {
+        if (id_eq((HT[p] - 1) as usize, o, l, src)) { return HT[p] as usize; }
+        p = (p + 1) % 262144;
+    }
+    return 0;
+}
+
+/// endCommand() for $var: tokens in CB.
+pub fn end_var() -> i32 {
+    const nct : usize = R[R_NCT] as usize;
+    if (nct < 4) { return bad_var_text(); }
+    const w : i64 = js_width(CTO[1] as usize, CTL[1] as usize);
+    if (w == -3) {
+        R[R_UNSUP] = 1;
+        return 90;
+    }
+    if (w < 0) { return bad_var_text(); }
+    if (w > 65536) { return -1; }
+    R[R_VARS] = R[R_VARS] + 1;
+    // name = [...scope, ref].join('.') plus the index when it has no ':'
+    const nm0 : u64 = R[R_NP];
+    var k : usize = 0;
+    var nlen : u64 = 0;
+    while (k < (R[R_NSC] as usize)) {
+        var q : usize = 0;
+        while (q < (SCL[k] as usize)) {
+            if (R[R_NP] >= 16777000) { return -1; }
+            NAMEP[R[R_NP] as usize] = NAMEP[(SCO[k] as usize) + q];
+            R[R_NP] = R[R_NP] + 1;
+            q = q + 1;
+        }
+        NAMEP[R[R_NP] as usize] = 46;
+        R[R_NP] = R[R_NP] + 1;
+        k = k + 1;
+    }
+    var q2 : usize = 0;
+    while (q2 < (CTL[3] as usize)) {
+        if (R[R_NP] >= 16777000) { return -1; }
+        NAMEP[R[R_NP] as usize] = CB[(CTO[3] as usize) + q2];
+        R[R_NP] = R[R_NP] + 1;
+        q2 = q2 + 1;
+    }
+    if (nct >= 5) {
+        var has_colon : bool = false;
+        var c : usize = 0;
+        while (c < (CTL[4] as usize)) {
+            if (CB[(CTO[4] as usize) + c] == 58) { has_colon = true; }
+            c = c + 1;
+        }
+        if (!has_colon) {
+            c = 0;
+            while (c < (CTL[4] as usize)) {
+                if (R[R_NP] >= 16777000) { return -1; }
+                NAMEP[R[R_NP] as usize] = CB[(CTO[4] as usize) + c];
+                R[R_NP] = R[R_NP] + 1;
+                c = c + 1;
+            }
+        }
+    }
+    nlen = R[R_NP] - nm0;
+    const ex : usize = find_sig(CTO[2] as usize, CTL[2] as usize, 1);
+    if (ex != 0) {
+        SAL[ex - 1] = SAL[ex - 1] + 1;
+        R[R_NP] = nm0;
+        return 0;
+    }
+    const si : usize = R[R_NSIG] as usize;
+    if (si >= MS) { return -1; }
+    const ido : i64 = pool_put(CB[0 .. 1048576], CTO[2] as usize, (CTO[2] + CTL[2]) as usize, 1);
+    const tyo : i64 = pool_put(CB[0 .. 1048576], CTO[0] as usize, (CTO[0] + CTL[0]) as usize, 1);
+    if (ido < 0 or tyo < 0) { return -1; }
+    SIO[si] = ido as u32;
+    SIL[si] = CTL[2];
+    SNO[si] = nm0 as u32;
+    SNL[si] = nlen as u32;
+    STO[si] = tyo as u32;
+    STL[si] = CTL[0];
+    var wd : u32 = w as u32;
+    if (wd < 1) { wd = 1; }
+    SWD[si] = wd;
+    var fl : u8 = 0;
+    if (cb_is(0, "real") or cb_is(0, "realtime")) { fl = fl + 1; }
+    if (cb_is(0, "parameter")) { fl = fl + 2; }
+    if (cb_is(0, "string")) { fl = fl + 4; }
+    SFG[si] = fl;
+    SHV[si] = 0;
+    SVL[si] = 0;
+    SVC[si] = 0;
+    SVA[si] = 0;
+    SCH[si] = 0;
+    SFL[si] = 0;
+    SEK[si] = 0;
+    SAL[si] = 0;
+    var p : usize = hash_id(CTO[2] as usize, CTL[2] as usize, 1);
+    while (HT[p] != 0) { p = (p + 1) % 262144; }
+    HT[p] = (si + 1) as u32;
+    R[R_NSIG] = (si + 1) as u64;
+    return 0;
+}
+
+pub fn bad_var_text() -> i32 {
+    // detail text = tokens joined with a space
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < (R[R_NCT] as usize)) {
+        if (i > 0 and n < 1048576) {
+            ERRB[n] = 32;
+            n = n + 1;
+        }
+        var k : usize = 0;
+        while (k < (CTL[i] as usize) and n < 1048576) {
+            ERRB[n] = CB[(CTO[i] as usize) + k];
+            n = n + 1;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    R[R_ECODE] = 4;
+    R[R_EO] = 0;
+    R[R_EL] = n as u64;
+    return 4;
+}
+
+pub fn timescale_fail() -> i32 {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < (R[R_NCT] as usize)) {
+        if (i > 0 and n < 1048576) {
+            ERRB[n] = 32;
+            n = n + 1;
+        }
+        var k : usize = 0;
+        while (k < (CTL[i] as usize) and n < 1048576) {
+            ERRB[n] = CB[(CTO[i] as usize) + k];
+            n = n + 1;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    R[R_ECODE] = 3;
+    R[R_EO] = 0;
+    R[R_EL] = n as u64;
+    return 3;
+}
+
+/// endCommand(): the command word is R_CMD (1 timescale 2 version 3 scope 4 upscope 5 var 6 enddefinitions 7 other).
+pub fn end_command() -> i32 {
+    const cmd : u64 = R[R_CMD];
+    const nct : usize = R[R_NCT] as usize;
+    var rc : i32 = 0;
+    if (cmd == 1) {
+        // join without spaces, then ^(1|10|100)\s*(s|ms|us|ns|ps|fs)$
+        var n : usize = 0;
+        var i : usize = 0;
+        while (i < nct) {
+            var k : usize = 0;
+            while (k < (CTL[i] as usize) and n < 64) {
+                VE[n] = CB[(CTO[i] as usize) + k];
+                n = n + 1;
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        var d : usize = 0;
+        while (d < n and is_digit(VE[d])) { d = d + 1; }
+        var mul : u64 = 0;
+        if (d == 1 and VE[0] == 49) { mul = 1; }
+        if (d == 2 and VE[0] == 49 and VE[1] == 48) { mul = 10; }
+        if (d == 3 and VE[0] == 49 and VE[1] == 48 and VE[2] == 48) { mul = 100; }
+        var unit : u64 = 9;
+        if (n - d == 1 and VE[d] == 115) { unit = 0; }
+        if (n - d == 2 and VE[d + 1] == 115) {
+            if (VE[d] == 109) { unit = 1; }
+            if (VE[d] == 117) { unit = 2; }
+            if (VE[d] == 110) { unit = 3; }
+            if (VE[d] == 112) { unit = 4; }
+            if (VE[d] == 102) { unit = 5; }
+        }
+        if (mul == 0 or unit == 9 or n >= 64) { return timescale_fail(); }
+        R[R_TSS] = 1;
+        R[R_TSM] = mul;
+        R[R_TSU] = unit;
+    }
+    if (cmd == 2) {
+        // version = tokens joined by a space
+        const at : u64 = R[R_NP];
+        var i2 : usize = 0;
+        while (i2 < nct) {
+            if (i2 > 0) {
+                if (R[R_NP] >= 16777000) { return -1; }
+                NAMEP[R[R_NP] as usize] = 32;
+                R[R_NP] = R[R_NP] + 1;
+            }
+            var k2 : usize = 0;
+            while (k2 < (CTL[i2] as usize)) {
+                if (R[R_NP] >= 16777000) { return -1; }
+                NAMEP[R[R_NP] as usize] = CB[(CTO[i2] as usize) + k2];
+                R[R_NP] = R[R_NP] + 1;
+                k2 = k2 + 1;
+            }
+            i2 = i2 + 1;
+        }
+        R[R_VERO] = at;
+        R[R_VERL] = R[R_NP] - at;
+    }
+    if (cmd == 3) {
+        var pick : usize = 99;
+        if (nct >= 2) { pick = 1; } else { if (nct >= 1) { pick = 0; } }
+        const at2 : u64 = R[R_NP];
+        if (pick == 99) {
+            NAMEP[at2 as usize] = 63;
+            R[R_NP] = at2 + 1;
+        } else {
+            const o : i64 = pool_put(CB[0 .. 1048576], CTO[pick] as usize, (CTO[pick] + CTL[pick]) as usize, 1);
+            if (o < 0) { return -1; }
+        }
+        if (R[R_NSC] >= 1024) { return -1; }
+        SCO[R[R_NSC] as usize] = at2 as u32;
+        SCL[R[R_NSC] as usize] = (R[R_NP] - at2) as u32;
+        R[R_NSC] = R[R_NSC] + 1;
+        R[R_SCOPES] = R[R_SCOPES] + 1;
+    }
+    if (cmd == 4) {
+        if (R[R_NSC] > 0) { R[R_NSC] = R[R_NSC] - 1; }
+    }
+    if (cmd == 5) {
+        rc = end_var();
+        if (rc != 0) { return rc; }
+    }
+    if (cmd == 6) {
+        R[R_HDR] = 0;
+        if (R[R_VARS] == 0) { return fail(5, 0, 0, 0); }
+    }
+    R[R_CMD] = 0;
+    R[R_NCT] = 0;
+    R[R_CBN] = 0;
+    return 0;
+}
+
+pub fn header_token() -> i32 {
+    if (R[R_CMD] != 0) {
+        if (tok_is("$end")) { return end_command(); }
+        const n : usize = R[R_NCT] as usize;
+        const tl : usize = R[R_TOKN] as usize;
+        if (n >= 65536 or (R[R_CBN] as usize) + tl >= 1048576) { return -1; }
+        CTO[n] = R[R_CBN] as u32;
+        CTL[n] = tl as u32;
+        var k : usize = 0;
+        while (k < tl) {
+            CB[(R[R_CBN] as usize) + k] = TOKB[k];
+            k = k + 1;
+        }
+        R[R_CBN] = R[R_CBN] + (tl as u64);
+        R[R_NCT] = (n + 1) as u64;
+        return 0;
+    }
+    if (TOKB[0] != 36) {
+        const pb : i64 = prefix_bytes(TOKB[0 .. 1048576], 0, R[R_TOKN] as usize, 40);
+        return fail(2, 0, pb as usize, 0);
+    }
+    var c : u64 = 7;
+    if (tok_is("$timescale")) { c = 1; }
+    if (tok_is("$version")) { c = 2; }
+    if (tok_is("$scope")) { c = 3; }
+    if (tok_is("$upscope")) { c = 4; }
+    if (tok_is("$var")) { c = 5; }
+    if (tok_is("$enddefinitions")) { c = 6; }
+    R[R_CMD] = c;
+    return 0;
+}
+
+pub fn extend_into(vl: usize, width: usize) -> bool {
+    // PVB[0..vl) -> VE[0..width): the rightmost width characters, or padded on the left
+    if (vl >= width) {
+        var k : usize = 0;
+        while (k < width) {
+            VE[k] = PVB[vl - width + k];
+            k = k + 1;
+        }
+        return true;
+    }
+    var fill : u8 = 48;
+    if (vl > 0) {
+        const c : u8 = PVB[0];
+        if (c == 120 or c == 88) { fill = 120; }
+        if (c == 122 or c == 90) { fill = 122; }
+    }
+    var i : usize = 0;
+    while (i < width - vl) {
+        VE[i] = fill;
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < vl) {
+        VE[width - vl + j] = PVB[j];
+        j = j + 1;
+    }
+    return true;
+}
+
+pub fn is_unknown_char(c: u8) -> bool {
+    return c == 120 or c == 88 or c == 122 or c == 90 or c == 117 or c == 85 or c == 119 or c == 87 or c == 45;
+}
+
+pub fn lower(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// /^(nan|x|z)$/i on PVB[0..vl)
+pub fn is_nan_x_z(vl: usize) -> bool {
+    if (vl == 1) {
+        const c : u8 = lower(PVB[0]);
+        return c == 120 or c == 122;
+    }
+    if (vl == 3) { return lower(PVB[0]) == 110 and lower(PVB[1]) == 97 and lower(PVB[2]) == 110; }
+    return false;
+}
+
+pub fn store_value(si: usize, src_is_ve: bool, len: usize) -> bool {
+    if ((SVC[si] as usize) < len) {
+        if (R[R_VP] + (len as u64) >= 33554432) { return false; }
+        SVO[si] = R[R_VP] as u32;
+        SVC[si] = len as u32;
+        R[R_VP] = R[R_VP] + (len as u64);
+    }
+    var k : usize = 0;
+    while (k < len) {
+        if (src_is_ve) { VALP[(SVO[si] as usize) + k] = VE[k]; } else { VALP[(SVO[si] as usize) + k] = PVB[k]; }
+        k = k + 1;
+    }
+    SVL[si] = len as u32;
+    SHV[si] = 1;
+    return true;
+}
+
+/// record(id, value, kind): kind 0 scalar, 1 b, 2 r, 3 s. The value is in PVB[0..vl); the id is TOKB[io..ih).
+pub fn record(io: usize, ih: usize, vl: usize, kind: u32) -> i32 {
+    if (R[R_BLOCK] == 1) { return 0; }
+    const sp : usize = find_sig(io, ih - io, 0);
+    if (sp == 0) {
+        R[R_ETS] = R[R_TSET];
+        return fail(6, io, ih - io, 0);
+    }
+    const si : usize = sp - 1;
+    SVA[si] = SVA[si] + 1;
+    const fl : u8 = SFG[si];
+    const isstr : bool = kind == 2 or kind == 3 or (fl % 2) == 1 or fl >= 4;
+    var known : bool = false;
+    var len : usize = vl;
+    if (isstr) {
+        known = !is_nan_x_z(vl);
+    } else {
+        var z : usize = 0;
+        while (z < vl) {
+            if (PVB[z] >= 128) {
+                R[R_UNSUP] = 1;
+                return 90;
+            }
+            z = z + 1;
+        }
+        len = SWD[si] as usize;
+        extend_into(vl, len);
+        known = true;
+        var i : usize = 0;
+        while (i < len) {
+            if (is_unknown_char(VE[i])) { known = false; }
+            i = i + 1;
+        }
+    }
+    if (known) { SEK[si] = 1; }
+    if (SHV[si] == 0) {
+        if (!store_value(si, !isstr, len)) { return -1; }
+        return 0;
+    }
+    var same : bool = (SVL[si] as usize) == len;
+    var c : usize = 0;
+    while (c < len and same) {
+        var nb : u8 = PVB[c];
+        if (!isstr) { nb = VE[c]; }
+        if (VALP[(SVO[si] as usize) + c] != nb) { same = false; }
+        c = c + 1;
+    }
+    if (same) { return 0; }
+    SCH[si] = SCH[si] + 1;
+    if (isstr) {
+        SFL[si] = SFL[si] + 1;
+    } else {
+        // flipsBetween(old, new) loops over the OLD length; a shorter new value makes JS throw
+        var f : u64 = 0;
+        var d : usize = 0;
+        while (d < (SVL[si] as usize)) {
+            if (d >= len) {
+                R[R_UNSUP] = 1;
+                return 90;
+            }
+            if (lower(VALP[(SVO[si] as usize) + d]) != lower(VE[d])) { f = f + 1; }
+            d = d + 1;
+        }
+        SFL[si] = SFL[si] + f;
+    }
+    if (!store_value(si, !isstr, len)) { return -1; }
+    return 0;
+}
+
+pub fn set_time_from_token() -> bool {
+    // TOKB[1..n) are digits
+    const n : usize = R[R_TOKN] as usize;
+    if (n - 1 > 19) { return false; }
+    var v : u64 = 0;
+    var k : usize = 1;
+    while (k < n) {
+        v = v * 10 + ((TOKB[k] - 48) as u64);
+        k = k + 1;
+    }
+    TF[0] = v as f64;
+    return true;
+}
+
+pub fn body_token() -> i32 {
+    const n : usize = R[R_TOKN] as usize;
+    if (R[R_PEND] != 0) {
+        const kind : u32 = R[R_PEND] as u32;
+        const vl : usize = R[R_PENDL] as usize;
+        R[R_PEND] = 0;
+        return record(0, n, vl, kind);
+    }
+    if (R[R_BLOCK] == 2) {
+        if (tok_is("$end")) { R[R_BLOCK] = 0; }
+        return 0;
+    }
+    const c : u8 = TOKB[0];
+    if (c == 35) {
+        var ok : bool = n >= 2;
+        var k : usize = 1;
+        while (k < n) {
+            if (!is_digit(TOKB[k])) { ok = false; }
+            k = k + 1;
+        }
+        if (!ok) {
+            const pb : i64 = prefix_bytes(TOKB[0 .. 1048576], 0, n, 40);
+            R[R_ETS] = R[R_TSET];
+            return fail(7, 0, pb as usize, 0);
+        }
+        if (!set_time_from_token()) { R[R_UNSUP] = 1; return 90; }
+        R[R_TSET] = 1;
+        if (R[R_TFS] == 0) {
+            TF[1] = TF[0];
+            R[R_TFS] = 1;
+        }
+        TF[2] = TF[0];
+        R[R_STAMPS] = R[R_STAMPS] + 1;
+        return 0;
+    }
+    if (c == 36) {
+        if (tok_is("$end")) {
+            R[R_BLOCK] = 0;
+        } else {
+            if (tok_is("$dumpoff")) { R[R_BLOCK] = 1; } else {
+                if (tok_is("$comment")) { R[R_BLOCK] = 2; } else { R[R_BLOCK] = 3; }
+            }
+        }
+        return 0;
+    }
+    var pk : u32 = 0;
+    if (c == 98 or c == 66) { pk = 1; }
+    if (c == 114 or c == 82) { pk = 2; }
+    if (c == 115 or c == 83) { pk = 3; }
+    if (pk != 0) {
+        var k2 : usize = 1;
+        while (k2 < n) {
+            PVB[k2 - 1] = TOKB[k2];
+            k2 = k2 + 1;
+        }
+        R[R_PEND] = pk as u64;
+        R[R_PENDL] = (n - 1) as u64;
+        return 0;
+    }
+    const sc : bool = c == 48 or c == 49 or c == 120 or c == 88 or c == 122 or c == 90 or c == 117 or c == 85 or c == 119 or c == 87 or c == 108 or c == 76 or c == 104 or c == 72 or c == 45;
+    if (sc and n > 1) {
+        PVB[0] = lower(c);
+        return record(1, n, 1, 0);
+    }
+    const pb2 : i64 = prefix_bytes(TOKB[0 .. 1048576], 0, n, 40);
+    R[R_ETS] = R[R_TSET];
+    return fail(7, 0, pb2 as usize, 0);
+}
+
+pub fn token_done() -> i32 {
+    var rc : i32 = 0;
+    if (R[R_HDR] == 1) { rc = header_token(); } else { rc = body_token(); }
+    R[R_TOKN] = 0;
+    return rc;
+}
+
+/// Feed bytes through the tokenizer (JS \s splits; a trailing partial token stays in TOKB).
+pub fn feed(s: []const u8, lo: usize, hi: usize) -> i32 {
+    var p : usize = lo;
+    while (p < hi) {
+        const w : usize = ws_len_at(s, p, hi);
+        if (w > 0) {
+            if (R[R_TOKN] > 0) {
+                const rc : i32 = token_done();
+                if (rc != 0) { return rc; }
+            }
+            p = p + w;
+        } else {
+            if (R[R_TOKN] >= 1048576) { return -1; }
+            TOKB[R[R_TOKN] as usize] = s[p];
+            R[R_TOKN] = R[R_TOKN] + 1;
+            p = p + 1;
+        }
+    }
+    return 0;
+}
+
+pub fn vcd_begin(max_header: u64) -> i32 {
+    var f : usize = 0;
+    while (f < 40) {
+        R[f] = 0;
+        f = f + 1;
+    }
+    var h : usize = 0;
+    while (h < 262144) {
+        HT[h] = 0;
+        h = h + 1;
+    }
+    R[R_HDR] = 1;
+    R[R_MAXH] = max_header;
+    TF[0] = 0.0;
+    TF[1] = 0.0;
+    TF[2] = 0.0;
+    return 0;
+}
+
+pub fn vcd_chars() -> u64 {
+    return R[R_CHARS];
+}
+
+pub fn vcd_push(text: []const u8) -> i32 {
+    if (R[R_STARTED] == 0) {
+        const hb : i64 = prefix_bytes(text, 0, text.len, 4096);
+        const hl : usize = hb as usize;
+        var z : usize = 0;
+        while (z < hl) {
+            if (text[z] == 0) { return fail(1, 0, 0, 0); }
+            z = z + 1;
+        }
+        var p : usize = 0;
+        var w : usize = ws_len_at(text, p, hl);
+        while (w > 0) {
+            p = p + w;
+            w = ws_len_at(text, p, hl);
+        }
+        if (p >= hl) {
+            if (R[R_HOLD] + (text.len as u64) > 8388608) { return -1; }
+            var k : usize = 0;
+            while (k < text.len) {
+                HOLD[(R[R_HOLD] as usize) + k] = text[k];
+                k = k + 1;
+            }
+            R[R_HOLD] = R[R_HOLD] + (text.len as u64);
+            R[R_CHARS] = R[R_CHARS] + units_of(text, 0, text.len);
+            return 0;
+        }
+        if (text[p] != 36) {
+            var e : usize = p;
+            while (e < hl and ws_len_at(text, e, hl) == 0) { e = e + 1; }
+            const pb : i64 = prefix_bytes(text, p, e, 40);
+            R[R_ECODE] = 2;
+            R[R_EL] = pb as u64;
+            var q : usize = 0;
+            while (q < (pb as usize)) {
+                ERRB[q] = text[p + q];
+                q = q + 1;
+            }
+            return 2;
+        }
+        R[R_STARTED] = 1;
+    }
+    R[R_CHARS] = R[R_CHARS] + units_of(text, 0, text.len);
+    if (R[R_HOLD] > 0) {
+        const rc0 : i32 = feed(HOLD[0 .. 8388608], 0, R[R_HOLD] as usize);
+        R[R_HOLD] = 0;
+        if (rc0 != 0) { return rc0; }
+    }
+    const rc : i32 = feed(text, 0, text.len);
+    if (rc != 0) { return rc; }
+    if (R[R_HDR] == 1 and R[R_CHARS] > R[R_MAXH]) { return fail(8, 0, 0, 0); }
+    return 0;
+}
+
+// ---------------------------------------------------------------- summarize
+pub fn name_less(a: u32, b: u32) -> bool {
+    const la : usize = SNL[a as usize] as usize;
+    const lb : usize = SNL[b as usize] as usize;
+    var k : usize = 0;
+    while (k < la and k < lb) {
+        const x : u8 = NAMEP[(SNO[a as usize] as usize) + k];
+        const y : u8 = NAMEP[(SNO[b as usize] as usize) + k];
+        if (x != y) { return x < y; }
+        k = k + 1;
+    }
+    return la < lb;
+}
+
+/// mode 0 busiest (changes desc, flips desc, name), 1 quietest (changes asc, flips asc, name), 2 name.
+/// true when a sorts strictly before b.
+pub fn before(mode: u32, a: u32, b: u32) -> bool {
+    const ca : u64 = SCH[a as usize];
+    const cb : u64 = SCH[b as usize];
+    const fa : u64 = SFL[a as usize];
+    const fb : u64 = SFL[b as usize];
+    if (mode == 0) {
+        if (ca != cb) { return ca > cb; }
+        if (fa != fb) { return fa > fb; }
+        return name_less(a, b);
+    }
+    if (mode == 1) {
+        if (ca != cb) { return ca < cb; }
+        if (fa != fb) { return fa < fb; }
+        return name_less(a, b);
+    }
+    return name_less(a, b);
+}
+
+/// Stable merge sort of SRT[0..n) by `before`.
+pub fn sort_idx(n: usize, mode: u32) -> bool {
+    var w : usize = 1;
+    while (w < n) {
+        var lo : usize = 0;
+        while (lo < n) {
+            var mid : usize = lo + w;
+            if (mid > n) { mid = n; }
+            var hi : usize = lo + 2 * w;
+            if (hi > n) { hi = n; }
+            var a : usize = lo;
+            var b : usize = mid;
+            var o : usize = lo;
+            while (a < mid or b < hi) {
+                if (b >= hi or (a < mid and !before(mode, SRT[b], SRT[a]))) {
+                    STMP[o] = SRT[a];
+                    a = a + 1;
+                } else {
+                    STMP[o] = SRT[b];
+                    b = b + 1;
+                }
+                o = o + 1;
+            }
+            lo = lo + 2 * w;
+        }
+        var c : usize = 0;
+        while (c < n) {
+            SRT[c] = STMP[c];
+            c = c + 1;
+        }
+        w = w * 2;
+    }
+    return true;
+}
+
+pub fn has_xzuw(si: usize) -> bool {
+    var k : usize = 0;
+    while (k < (SVL[si] as usize)) {
+        const c : u8 = lower(VALP[(SVO[si] as usize) + k]);
+        if (c == 120 or c == 122 or c == 117 or c == 119 or c == 45) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// summarize(state, top).
+pub fn vcd_summarize(top: usize) -> i32 {
+    const n : usize = R[R_NSIG] as usize;
+    var nlive : usize = 0;
+    var changes : u64 = 0;
+    var flips : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        changes = changes + SCH[i];
+        flips = flips + SFL[i];
+        if (SFG[i] / 2 % 2 == 0) {
+            LIVE[nlive] = i as u32;
+            nlive = nlive + 1;
+        }
+        i = i + 1;
+    }
+    var nm : usize = 0;
+    var never : u64 = 0;
+    var j : usize = 0;
+    while (j < nlive) {
+        const s : usize = LIVE[j] as usize;
+        if (SCH[s] > 0) {
+            SRT[nm] = s as u32;
+            nm = nm + 1;
+        } else {
+            never = never + 1;
+        }
+        j = j + 1;
+    }
+    sort_idx(nm, 0);
+    var nb : usize = nm;
+    if (nb > top) { nb = top; }
+    var k : usize = 0;
+    while (k < nb and k < 8) {
+        BUSY[k] = SRT[k];
+        k = k + 1;
+    }
+    var m2 : usize = 0;
+    while (m2 < nm) {
+        j = 0;
+        m2 = nm;
+    }
+    // quietest: the movers again, other order
+    var q : usize = 0;
+    var t : usize = 0;
+    while (t < nlive) {
+        const s2 : usize = LIVE[t] as usize;
+        if (SCH[s2] > 0) {
+            SRT[q] = s2 as u32;
+            q = q + 1;
+        }
+        t = t + 1;
+    }
+    sort_idx(q, 1);
+    var nq : usize = q;
+    if (nq > top) { nq = top; }
+    k = 0;
+    while (k < nq and k < 8) {
+        QUIET[k] = SRT[k];
+        k = k + 1;
+    }
+    // stuck: values and never known; ends unknown: known once and the last value has x z u w -
+    var ns : usize = 0;
+    var ne : usize = 0;
+    var stuck_all : usize = 0;
+    var ends_all : usize = 0;
+    t = 0;
+    while (t < nlive) {
+        const s3 : usize = LIVE[t] as usize;
+        if (SVA[s3] > 0 and SEK[s3] == 0) {
+            SRT[stuck_all] = s3 as u32;
+            stuck_all = stuck_all + 1;
+        }
+        t = t + 1;
+    }
+    sort_idx(stuck_all, 2);
+    k = 0;
+    while (k < stuck_all and k < top and k < 8) {
+        STUCK[k] = SRT[k];
+        k = k + 1;
+    }
+    ns = stuck_all;
+    t = 0;
+    while (t < nlive) {
+        const s4 : usize = LIVE[t] as usize;
+        if (SVA[s4] > 0 and SEK[s4] == 1 and SHV[s4] == 1 and (SFG[s4] % 2) == 0 and SFG[s4] < 4 and has_xzuw(s4)) {
+            SRT[ends_all] = s4 as u32;
+            ends_all = ends_all + 1;
+        }
+        t = t + 1;
+    }
+    sort_idx(ends_all, 2);
+    k = 0;
+    while (k < ends_all and k < top and k < 8) {
+        ENDSX[k] = SRT[k];
+        k = k + 1;
+    }
+    ne = ends_all;
+    SUM[0] = R[R_TSS];
+    SUM[1] = R[R_TSM];
+    SUM[2] = R[R_TSU];
+    SUM[4] = R[R_VERO];
+    SUM[5] = R[R_VERL];
+    SUM[6] = R[R_STAMPS];
+    SUM[7] = R[R_CHARS];
+    SUM[8] = R[R_VARS];
+    SUM[9] = n as u64;
+    SUM[10] = (n - nlive) as u64;
+    SUM[11] = R[R_SCOPES];
+    SUM[12] = changes;
+    SUM[13] = flips;
+    SUM[14] = nb as u64;
+    SUM[15] = nq as u64;
+    SUM[16] = ns as u64;
+    var shown : usize = ns;
+    if (shown > top) { shown = top; }
+    SUM[17] = shown as u64;
+    SUM[18] = ne as u64;
+    var shown2 : usize = ne;
+    if (shown2 > top) { shown2 = top; }
+    SUM[19] = shown2 as u64;
+    SUM[20] = never;
+    SUM[21] = nm as u64;
+    SUT[0] = 0.0;
+    SUT[1] = 0.0;
+    if (R[R_TFS] == 1) {
+        SUT[0] = TF[1];
+        SUT[1] = TF[2];
+    }
+    SUT[2] = SUT[1] - SUT[0];
+    return 0;
+}
+
+pub fn vcd_end() -> i32 {
+    if (R[R_HOLD] > 0) {
+        const rc0 : i32 = feed(HOLD[0 .. 8388608], 0, R[R_HOLD] as usize);
+        R[R_HOLD] = 0;
+        if (rc0 != 0) { return rc0; }
+    }
+    if (R[R_TOKN] > 0) {
+        const rc : i32 = token_done();
+        if (rc != 0) { return rc; }
+    }
+    if (R[R_STARTED] == 0) { return fail(9, 0, 0, 0); }
+    if (R[R_HDR] == 1) { return fail(8, 0, 0, 0); }
+    if (R[R_PEND] != 0) {
+        // token: kind letter + value
+        var kc : u8 = 98;
+        if (R[R_PEND] == 2) { kc = 114; }
+        if (R[R_PEND] == 3) { kc = 115; }
+        ERRB[0] = kc;
+        var k : usize = 0;
+        while (k < (R[R_PENDL] as usize)) {
+            ERRB[k + 1] = PVB[k];
+            k = k + 1;
+        }
+        R[R_ECODE] = 7;
+        R[R_EL] = R[R_PENDL] + 1;
+        R[R_ETS] = R[R_TSET];
+        return 7;
+    }
+    return vcd_summarize(5);
+}
+
+/// vcdSummary(text, opts): chunks of 1048576 bytes.
+pub fn vcd_summary(text: []const u8, max_header: u64) -> i32 {
+    vcd_begin(max_header);
+    var i : usize = 0;
+    while (i < text.len) {
+        var e : usize = i + 1048576;
+        if (e > text.len) { e = text.len; }
+        const rc : i32 = vcd_push(text[i .. e]);
+        if (rc != 0) { return rc; }
+        i = e;
+    }
+    return vcd_end();
+}
+
+pub fn vcd_err_info(f: u32) -> u64 {
+    if (f == 0) { return R[R_ECODE]; }
+    if (f == 1) { return R[R_EO]; }
+    if (f == 2) { return R[R_EL]; }
+    if (f == 3) { return R[R_ETS]; }
+    return 0;
+}
+
+pub fn vcd_err_time() -> f64 {
+    return TF[0];
+}
+
+pub fn err_byte(i: u32) -> u8 {
+    return ERRB[i as usize];
+}
+
+pub fn pool_byte(i: u32) -> u8 {
+    return NAMEP[i as usize];
+}
+
+pub fn vs_info(f: u32) -> u64 {
+    return SUM[f as usize];
+}
+
+pub fn vs_time(f: u32) -> f64 {
+    return SUT[f as usize];
+}
+
+pub fn vs_row(kind: u32, i: u32, f: u32) -> u64 {
+    var s : usize = BUSY[i as usize] as usize;
+    if (kind == 1) { s = QUIET[i as usize] as usize; }
+    if (f == 0) { return SNO[s] as u64; }
+    if (f == 1) { return SNL[s] as u64; }
+    if (f == 2) { return SWD[s] as u64; }
+    if (f == 3) { return STO[s] as u64; }
+    if (f == 4) { return STL[s] as u64; }
+    if (f == 5) { return SCH[s]; }
+    if (f == 6) { return SFL[s]; }
+    return SAL[s] as u64;
+}
+
+pub fn vs_name(kind: u32, i: u32, f: u32) -> u64 {
+    var s : usize = STUCK[i as usize] as usize;
+    if (kind == 1) { s = ENDSX[i as usize] as usize; }
+    if (f == 0) { return SNO[s] as u64; }
+    return SNL[s] as u64;
+}
+
+// ---------------------------------------------------------------- spanUnits
+/// Small big integers (16 limbs of 32 bits) to place a double exactly against powers of ten.
+pub var BA : [20]u64 = [0; 20];
+pub var BB : [20]u64 = [0; 20];
+
+pub fn big_set(a: u32, v: u64) -> bool {
+    var k : usize = 0;
+    while (k < 20) {
+        if (a == 0) { BA[k] = 0; } else { BB[k] = 0; }
+        k = k + 1;
+    }
+    if (a == 0) {
+        BA[0] = v % 4294967296;
+        BA[1] = v / 4294967296;
+    } else {
+        BB[0] = v % 4294967296;
+        BB[1] = v / 4294967296;
+    }
+    return true;
+}
+
+pub fn big_mul(a: u32, m: u64) -> bool {
+    var carry : u64 = 0;
+    var k : usize = 0;
+    while (k < 20) {
+        var cur : u64 = 0;
+        if (a == 0) { cur = BA[k] * m + carry; } else { cur = BB[k] * m + carry; }
+        if (a == 0) { BA[k] = cur % 4294967296; } else { BB[k] = cur % 4294967296; }
+        carry = cur / 4294967296;
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn big_mul_pow(a: u32, base: u64, e: i64) -> bool {
+    var k : i64 = 0;
+    while (k < e) {
+        big_mul(a, base);
+        k = k + 1;
+    }
+    return true;
+}
+
+/// compare BA with BB: -1, 0, 1
+pub fn big_cmp() -> i32 {
+    var k : usize = 20;
+    while (k > 0) {
+        k = k - 1;
+        if (BA[k] > BB[k]) { return 1; }
+        if (BA[k] < BB[k]) { return -1; }
+    }
+    return 0;
+}
+
+/// Is val (= m * 2^e2) at least 10^p ?  (p may be negative)
+pub fn val_ge_pow10(m: u64, e2: i64, p: i64) -> bool {
+    big_set(0, m);
+    big_set(1, 1);
+    if (e2 > 0) { big_mul_pow(0, 2, e2); } else { big_mul_pow(1, 2, 0 - e2); }
+    if (p < 0) { big_mul_pow(0, 10, 0 - p); } else { big_mul_pow(1, 10, p); }
+    return big_cmp() >= 0;
+}
+
+/// Number(val.toPrecision(4)) for a finite val >= 0 (set in SUV[0]); false when out of the carried range.
+pub fn to_precision4(val: f64) -> bool {
+    if (val == 0.0) {
+        SUV[0] = 0.0;
+        return true;
+    }
+    var x : f64 = val;
+    var e2 : i64 = 0;
+    while (x >= 9007199254740992.0) {
+        x = x / 2.0;
+        e2 = e2 + 1;
+    }
+    while (x < 4503599627370496.0) {
+        x = x * 2.0;
+        e2 = e2 - 1;
+    }
+    const m : u64 = x as u64;
+    var e0 : i64 = 0;
+    var y : f64 = val;
+    while (y >= 10.0) {
+        y = y / 10.0;
+        e0 = e0 + 1;
+    }
+    while (y < 1.0) {
+        y = y * 10.0;
+        e0 = e0 - 1;
+    }
+    while (!val_ge_pow10(m, e2, e0)) { e0 = e0 - 1; }
+    while (val_ge_pow10(m, e2, e0 + 1)) { e0 = e0 + 1; }
+    var q : i64 = e0 - 3;
+    // n = floor(val / 10^q + 1/2): the largest n with n * 2 * den <= 2 * num + den
+    var lo : u64 = 0;
+    var hi : u64 = 20000;
+    while (lo < hi) {
+        const mid : u64 = (lo + hi + 1) / 2;
+        // num = m * 2^e2 * 10^max(-q,0); den = 2^max(-e2,0) * 10^max(q,0)
+        big_set(0, m);
+        big_set(1, 1);
+        if (e2 > 0) { big_mul_pow(0, 2, e2); } else { big_mul_pow(1, 2, 0 - e2); }
+        if (q < 0) { big_mul_pow(0, 10, 0 - q); } else { big_mul_pow(1, 10, q); }
+        // left: mid * 2 * den (in BB), right: 2 * num + den
+        var k : usize = 0;
+        var carry : u64 = 0;
+        var tmp : [20]u64 = [0; 20];
+        while (k < 20) {
+            tmp[k] = BB[k];
+            k = k + 1;
+        }
+        big_mul(1, mid * 2);
+        // BA = 2 * num + den
+        big_mul(0, 2);
+        k = 0;
+        carry = 0;
+        while (k < 20) {
+            const cur : u64 = BA[k] + tmp[k] + carry;
+            BA[k] = cur % 4294967296;
+            carry = cur / 4294967296;
+            k = k + 1;
+        }
+        if (big_cmp() >= 0) { lo = mid; } else { hi = mid - 1; }
+    }
+    var n : u64 = lo;
+    if (n >= 10000) {
+        n = 1000;
+        q = q + 1;
+    }
+    if (q > 22 or q < -22) { return false; }
+    var r : f64 = n as f64;
+    if (q >= 0) { r = r * P10[q as usize]; } else { r = r / P10[(0 - q) as usize]; }
+    SUV[0] = r;
+    return true;
+}
+
+/// spanUnits(ticks, timescale): the value in su_value(), the unit index in the return (-1 without a timescale), -2 not carried.
+pub fn span_units(ticks: f64, has_ts: bool, mul: u64, exp: i64) -> i32 {
+    if (!has_ts) {
+        SUV[0] = ticks;
+        return -1;
+    }
+    P10[0] = 1.0;
+    var e : usize = 1;
+    while (e < 23) {
+        P10[e] = P10[e - 1] * 10.0;
+        e = e + 1;
+    }
+    const v : f64 = ticks * (mul as f64);
+    var i : i64 = 0;
+    while (i < 6) {
+        var ue : i64 = 0;
+        if (i == 1) { ue = -3; }
+        if (i == 2) { ue = -6; }
+        if (i == 3) { ue = -9; }
+        if (i == 4) { ue = -12; }
+        if (i == 5) { ue = -15; }
+        const shift : i64 = exp - ue;
+        var p : f64 = 1.0;
+        if (shift >= 0) { p = P10[shift as usize]; } else { p = 1.0 / P10[(0 - shift) as usize]; }
+        const val : f64 = v * p;
+        if (val >= 1.0 or i == 5) {
+            if (!to_precision4(val)) { return -2; }
+            return i as i32;
+        }
+        i = i + 1;
+    }
+    return -2;
+}
+
+pub fn su_value() -> f64 {
+    return SUV[0];
+}
+
+// ---------------------------------------------------------------- tests
+pub var LST : [1]u8 = [0; 1];
+
+pub fn pool_is(o: u64, l: u64, w: []const u8) -> bool {
+    if ((l as usize) != w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (NAMEP[(o as usize) + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn err_is(w: []const u8) -> bool {
+    if ((R[R_EL] as usize) != w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (ERRB[k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn counter_like() -> i32 {
+    return vcd_summary("$date Mon Oct 5 01:46:09 2026 $end $version Icarus Verilog $end $timescale 1ps $end $scope module tb $end $var wire 1 ! ready $end $var wire 8 \" count [7:0] $end $var reg 1 # clk $end $var reg 1 $ en $end $var parameter 32 % W [31:0] $end $scope module dut $end $var wire 1 # clk $end $upscope $end $upscope $end $enddefinitions $end $comment Show the parameter values. $end $dumpall $end #0 $dumpvars bx \" 0# 0$ b101 % 1! $end #5000 1# b1 \" #10000 0# 1# b11 \" #15000 0# b10 \" 1# #20000 bx \" 0#", 67108864);
+}
+
+test a_small_counter_dump_is_summarised {
+    assert counter_like() == 0;
+    assert vs_info(0) == 1;
+    assert vs_info(1) == 1;
+    assert vs_info(2) == 4;
+    assert pool_is(vs_info(4), vs_info(5), "Icarus Verilog");
+    assert vs_info(6) == 5;
+    assert vs_info(7) == 494;
+    assert vs_time(0) == 0.0;
+    assert vs_time(1) == 20000.0;
+    assert vs_time(2) == 20000.0;
+    assert vs_info(8) == 6;
+    assert vs_info(9) == 5;
+    assert vs_info(10) == 1;
+    assert vs_info(11) == 2;
+    assert vs_info(12) == 10;
+    assert vs_info(13) == 24;
+    assert vs_info(21) == 2;
+    assert vs_info(20) == 2;
+    assert vs_info(18) == 1;
+    assert pool_is(vs_name(1, 0, 0), vs_name(1, 0, 1), "tb.count");
+    assert vs_info(16) == 0;
+}
+
+test the_busiest_and_quietest_rows_sort_by_changes_flips_then_name {
+    assert counter_like() == 0;
+    assert vs_info(14) == 2;
+    assert pool_is(vs_row(0, 0, 0), vs_row(0, 0, 1), "tb.clk");
+    assert vs_row(0, 0, 5) == 6;
+    assert vs_row(0, 0, 6) == 6;
+    assert vs_row(0, 0, 7) == 1;
+    assert pool_is(vs_row(0, 0, 3), vs_row(0, 0, 4), "reg");
+    assert pool_is(vs_row(0, 1, 0), vs_row(0, 1, 1), "tb.count");
+    assert vs_row(0, 1, 2) == 8;
+    assert vs_row(0, 1, 5) == 4;
+    assert vs_row(0, 1, 6) == 18;
+    assert pool_is(vs_row(1, 0, 0), vs_row(1, 0, 1), "tb.count");
+    assert pool_is(vs_row(1, 1, 0), vs_row(1, 1, 1), "tb.clk");
+}
+
+test x_and_z_values_are_stuck_or_end_unknown {
+    assert vcd_summary("$timescale 10 ns $end $scope module m $end $var wire 1 a sa $end $var wire 4 b sb $end $var wire 1 c sc $end $upscope $end $enddefinitions $end #0 xa b1x1 b 1c #4 xa b0000 b 0c #9 zc", 1000) == 0;
+    assert vs_info(1) == 10;
+    assert vs_info(2) == 3;
+    assert vs_info(12) == 3;
+    assert vs_info(13) == 5;
+    assert vs_info(16) == 1;
+    assert pool_is(vs_name(0, 0, 0), vs_name(0, 0, 1), "m.sa");
+    assert vs_info(18) == 1;
+    assert pool_is(vs_name(1, 0, 0), vs_name(1, 0, 1), "m.sc");
+    assert vs_info(20) == 1;
+    assert vs_info(21) == 2;
+    assert pool_is(vs_row(0, 0, 0), vs_row(0, 0, 1), "m.sc");
+    assert vs_row(0, 1, 6) == 3;
+}
+
+test the_errors_carry_codes_and_details {
+    assert vcd_summary("", 1000) == 9;
+    assert vcd_summary("hello world", 1000) == 2;
+    assert err_is("hello");
+    assert vcd_summary("$timescale 5ns $end", 1000) == 3;
+    assert err_is("5ns");
+    assert vcd_summary("$var wire x ! a $end", 1000) == 4;
+    assert err_is("wire x ! a");
+    assert vcd_summary("$timescale 1ns $end $enddefinitions $end", 1000) == 5;
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 1 a s $end $upscope $end $enddefinitions $end #1 1q", 1000) == 6;
+    assert err_is("q");
+    assert vcd_err_time() == 1.0;
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 1 a s $end $upscope $end $enddefinitions $end #1 q", 1000) == 7;
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 1 a s $end", 1000) == 8;
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 1 a s $end $upscope $end $enddefinitions $end #1 b101", 1000) == 7;
+    assert err_is("b101");
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 1 a s $end $enddefinitions $end", 3) == 8;
+}
+
+test dumpoff_comments_aliases_and_extension_follow_the_javascript_rules {
+    assert vcd_summary("$timescale 1ns $end $scope module m $end $var wire 4 a v [3:0] $end $scope module n $end $var wire 4 a w $end $upscope $end $var real 1 r x $end $upscope $end $enddefinitions $end #0 b1 a r1.5 r #1 $dumpoff bx a $end b11 a r2.5 r #2 $comment b0 a $end 1a r2.5 r #3 b0101 a", 1000) == 0;
+    assert vs_info(8) == 3;
+    assert vs_info(9) == 2;
+    assert vs_info(12) == 4;
+    assert vs_info(13) == 4;
+    assert vs_row(0, 0, 7) == 1;
+    assert pool_is(vs_row(0, 0, 0), vs_row(0, 0, 1), "m.v");
+    assert vs_row(0, 0, 5) == 3;
+    assert vs_row(0, 0, 6) == 3;
+    assert pool_is(vs_row(0, 1, 0), vs_row(0, 1, 1), "m.x");
+    assert vs_info(21) == 2;
+}
+
+test span_units_picks_the_largest_unit_and_rounds_to_four_digits {
+    assert span_units(2925000.0, true, 1, -12) == 2;
+    assert su_value() == 2.925;
+    assert span_units(450000.0, true, 1, -12) == 3;
+    assert su_value() == 450.0;
+    assert span_units(1234567.0, true, 1, -9) == 1;
+    assert su_value() == 1.235;
+    assert span_units(12345.0, true, 10, -9) == 2;
+    assert su_value() == 123.5;
+    assert span_units(0.0, true, 1, -9) == 5;
+    assert su_value() == 0.0;
+    assert span_units(77.0, false, 1, 0) == -1;
+    assert su_value() == 77.0;
+    assert span_units(3.0, true, 1, 0) == 0;
+    assert su_value() == 3.0;
+}

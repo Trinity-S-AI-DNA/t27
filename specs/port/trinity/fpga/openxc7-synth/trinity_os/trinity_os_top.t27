@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: MIT
+// specs/port/trinity/fpga/openxc7-synth/trinity_os/trinity_os_top.t27
+//
+// Port of gHashTag/trinity@e71d166ad6ef
+// fpga/openxc7-synth/trinity_os/trinity_os_top.v (top-level wiring, 301 lines
+// of hand-written Verilog).
+// Pure wiring module: no state, no registers -- every function is a pure
+// rewrite of a concat, a replication, a tie-off or a status assign from the
+// original top.
+// Golden Identity: phi^2 + 1/phi^2 = 3
+//
+// source module          | lines | what it does
+// -----------------------+-------+-------------------------------------------------
+// trinity_os_top         |   301 | instantiation, pin-out, tie-offs, status wiring
+//   ternary_scheduler    |   sub | FSM + task tables (own port, not this one)
+//   trinity_interrupt    |   sub | priority + ack (sibling: trinity_interrupt.t27)
+//
+// Port map (original Verilog construct -> pure .t27 function):
+//   localparam MAX_TASKS=16, LOG2_MAX_TASKS=4   -> pub const (same names)
+//   localparam NUM_IRQS=8, LOG2_NUM_IRQS=3      -> pub const (same names)
+//   .int_mode_enable(1'b1) tie-off              -> INT_MODE_ENABLE
+//   irq_request[i] <= uart/sched irq wires      -> irq_request_word()
+//   assign irq_enable = {NUM_IRQS{1'b1}}        -> irq_enable_word()
+//   assign irq_priority = {8 x 2-bit codes}     -> default_priority_word()
+//   wire [3:0] sched_state = sched_state_o[3:0] -> scheduler_state_low()
+//   assign current_task_id = sched_current_task -> current_task_id_wide()
+//   assign irq_vector = {1'b0, irq_vector_out}  -> irq_vector_bus()
+//   PHI / GOLDEN_IDENTITY real localparams      -> golden_identity_scaled()
+//   initial begin $error band check end         -> golden_identity_ok()
+//   7 status output assigns                     -> StatusBundle / status_bundle()
+//   uart irq pass-through (pin-to-pin)          -> on_comb data ports (below)
+//
+// Type notes: the original's real-arithmetic golden identity check becomes
+// scaled u32 integer arithmetic (phi stored x1000, band edges in units of
+// 1e-6). 1/phi = phi - 1 is an exact golden-ratio identity, so PHI_INV_SCALED
+// = PHI_SCALED - GI_SCALE keeps everything in u32 without floats. The 8 x
+// 2-bit priority concat becomes u16; the {NUM_IRQS{1'b1}} replication becomes
+// an accumulating mask. All doubling is multiplication -- sibling ports avoid
+// shift operators, which lower unpredictably through the Zig backend.
+//
+// The one non-obvious transformation: trinity_os_top has no data ports, only
+// pin-to-pin pass-throughs, but `gen-verilog` needs a surface to attach the
+// wiring decisions to. The uart interrupt pass-through (uart_rx_irq,
+// uart_tx_irq, sched_preemption_irq -> irq_request[7:0]) becomes `on_comb`
+// data ports -- the tool's own T81 guidance for exactly this case.
+
+pub module trinity_os_top {
+
+    // === task capacity (original localparams MAX_TASKS / LOG2_MAX_TASKS) ===
+    pub const MAX_TASKS : u32 = 16;
+    pub const LOG2_MAX_TASKS : u32 = 4;
+
+    // === interrupt geometry (original localparams NUM_IRQS / LOG2_NUM_IRQS) ===
+    pub const NUM_IRQS : u32 = 8;
+    pub const LOG2_NUM_IRQS : u32 = 3;
+
+    // === interrupt-controller mode tie-off (original .int_mode_enable(1'b1)) ===
+    // Decided edge-triggered mode at the top level; a frozen design choice,
+    // so it is a const, not a parameter.
+    pub const INT_MODE_ENABLE : bool = true;
+
+    // === priority codes (original: 2-bit fields inside the irq_priority
+    //     concat; 2'b01 = normal task, 2'b10 = high priority) ===
+    pub const PRIO_NORMAL : u32 = 1;
+    pub const PRIO_HIGH : u32 = 2;
+
+    // === interrupt source positions ===
+    // Bit i of irq_request[7:0] belongs to source i. The original places the
+    // sources positionally in a concat (MSB-first: SPARE..UART_RX); here the
+    // positions are named constants so the tests can name what they assert.
+    pub const IRQ_UART_RX : u32 = 0;          // bit 0: uart_rx_irq
+    pub const IRQ_UART_TX : u32 = 1;          // bit 1: uart_tx_irq
+    pub const IRQ_VSA_COMPLETE : u32 = 2;     // bit 2: unused (tied 0)
+    pub const IRQ_TQNN_COMPLETE : u32 = 3;    // bit 3: unused (tied 0)
+    pub const IRQ_TIMER_TICK : u32 = 4;       // bit 4: sched_preemption_irq
+    pub const IRQ_PREEMPTION_YIELD : u32 = 5; // bit 5: unused (tied 0)
+    pub const IRQ_FAULT : u32 = 6;            // bit 6: unused (tied 0)
+    pub const IRQ_SPARE : u32 = 7;            // bit 7: unused (tied 0)
+
+    // === golden identity, scaled to integers ===
+    // Original: localparam real PHI = 1.6180339887498948482;
+    //           localparam real GOLDEN_IDENTITY = PHI*PHI + 1.0/(PHI*PHI);
+    //           initial check that it lies in [2.99, 3.01].
+    // Scaled port: phi x1000 = 1618; 1/phi = phi - 1 (exact identity), so
+    // phi^2 + 1/phi^2 lands in units of GI_UNIT = 1e-6.
+    pub const GI_SCALE : u32 = 1000;
+    pub const PHI_SCALED : u32 = 1618;                      // phi x GI_SCALE
+    pub const PHI_INV_SCALED : u32 = PHI_SCALED - GI_SCALE; // 1/phi = phi - 1
+    pub const GI_UNIT : u32 = 1_000_000;                    // GI_SCALE * GI_SCALE
+    pub const GI_LO_SCALED : u32 = 2_990_000;               // 2.99 in GI_UNITs
+    pub const GI_HI_SCALED : u32 = 3_010_000;               // 3.01 in GI_UNITs
+
+    // === StatusBundle: the top module's 7 status output assigns ===
+    // Field order follows the original's status section; widths follow the
+    // original's output ports. Zero-extensions are performed by helper
+    // functions below so the port map stays traceable.
+    pub struct StatusBundle {
+        scheduler_state : u8,    // [3:0]  sched_state[3:0]
+        active_task_count : u8,  // [3:0]  direct
+        cycle_counter : u32,     // [31:0] direct
+        sacred_counter : u32,    // [31:0] direct
+        current_task_id : u16,   // [15:0] zero-extended from [3:0]
+        irq_count : u8,          // [7:0]  direct
+        irq_vector : u8,         // [2:0]  {1'b0, irq_vector_out} (MSB truncated)
+        system_idle : bool,      // direct
+    }
+
+    // ---- interrupt request word ------------------------------------------
+    // original: concat of per-source irq_request bits
+    //   bit 0 = uart_rx_irq, bit 1 = uart_tx_irq, bit 4 = sched_preemption_irq
+    //   (all other positions tied 1'b0)
+    // Only the three live sources are parameters; the tied-zero bits never
+    // occur in the original either.
+    pub fn irq_request_word(uart_rx: bool, uart_tx: bool, preempt: bool) -> u8 {
+        var word : u8 = 0;
+        if (uart_rx) { word += 1; }    // bit 0
+        if (uart_tx) { word += 2; }    // bit 1
+        if (preempt) { word += 16; }   // bit 4
+        return word;
+    }
+
+    // ---- interrupt enable word -------------------------------------------
+    // original: assign irq_enable = {NUM_IRQS{1'b1}};
+    // Replication as accumulation: enabling bit i adds 2^i, built by doubling
+    // (multiplication, never shifts -- see type notes above).
+    pub fn irq_enable_word() -> u8 {
+        var mask : u8 = 0;
+        var bit : u8 = 1;
+        var i : u32 = 0;
+        while (i < NUM_IRQS) {
+            mask += bit;
+            i += 1;
+            if (i < NUM_IRQS) {
+                bit *= 2;
+            }
+        }
+        return mask;
+    }
+
+    // ---- default priority of one source -----------------------------------
+    // original: per-source 2-bit fields inside the irq_priority concat
+    //   UART_RX=HIGH, UART_TX=HIGH, VSA=NORMAL, TQNN=NORMAL, TIMER=NORMAL,
+    //   YIELD=NORMAL, FAULT=HIGH, SPARE=HIGH
+    pub fn default_priority(source: u32) -> u32 {
+        if (source == IRQ_UART_RX) {
+            return PRIO_HIGH;
+        } else if (source == IRQ_UART_TX) {
+            return PRIO_HIGH;
+        } else if (source == IRQ_VSA_COMPLETE) {
+            return PRIO_NORMAL;
+        } else if (source == IRQ_TQNN_COMPLETE) {
+            return PRIO_NORMAL;
+        } else if (source == IRQ_TIMER_TICK) {
+            return PRIO_NORMAL;
+        } else if (source == IRQ_PREEMPTION_YIELD) {
+            return PRIO_NORMAL;
+        } else if (source == IRQ_FAULT) {
+            return PRIO_HIGH;
+        } else {
+            return PRIO_HIGH;      // IRQ_SPARE
+        }
+    }
+
+    // ---- default priority word --------------------------------------------
+    // original: assign irq_priority = {SPARE,FAULT,YIELD,TIMER,TQNN,VSA,
+    //                                   UART_TX,UART_RX};  (8 x 2'b codes)
+    // Source 0 (UART_RX) occupies the least significant pair. The 2^(2i)
+    // place value is accumulated by *= 4 doubling; the result fits u16
+    // exactly, matching the original's [15:0] wire.
+    pub fn default_priority_word() -> u16 {
+        var word : u32 = 0;
+        var place : u32 = 1;
+        var source : u32 = 0;
+        while (source < NUM_IRQS) {
+            var weight : u32 = default_priority(source);
+            word += weight * place;
+            place *= 4;
+            source += 1;
+        }
+        return word as u16;
+    }
+
+    // ---- scheduler state low bits -----------------------------------------
+    // original: wire [3:0] sched_state = sched_state_o[3:0];
+    pub fn scheduler_state_low(sched_state: u8) -> u8 {
+        return sched_state & 0x0F;
+    }
+
+    // ---- current task id, zero-extended ------------------------------------
+    // original: assign current_task_id = sched_current_task;
+    // ([3:0] source zero-extended into the [15:0] status port)
+    pub fn current_task_id_wide(task_id: u8) -> u16 {
+        return task_id as u16;
+    }
+
+    // ---- irq vector bus ----------------------------------------------------
+    // original: assign irq_vector = {1'b0, irq_vector_out};
+    // The {1'b0, ...} concat targets the [2:0] port, so its MSB is truncated:
+    // the top pin is identity on the low 3 bits. Kept as a function so the
+    // status bundle stays traceable to the original assign.
+    pub fn irq_vector_bus(irq_vector: u8) -> u8 {
+        return irq_vector & 0x07;
+    }
+
+    // ---- golden identity, scaled -------------------------------------------
+    // original: GOLDEN_IDENTITY = PHI*PHI + 1.0/(PHI*PHI) in real arithmetic.
+    // Scaled: (phi^2 + 1/phi^2) x GI_UNIT, multiplication only.
+    pub fn golden_identity_scaled() -> u32 {
+        var phi_sq : u32 = PHI_SCALED * PHI_SCALED;
+        var phi_inv_sq : u32 = PHI_INV_SCALED * PHI_INV_SCALED;
+        return phi_sq + phi_inv_sq;
+    }
+
+    // ---- golden identity band check ----------------------------------------
+    // original: initial begin if ((GOLDEN_IDENTITY < 2.99) ||
+    //           (GOLDEN_IDENTITY > 3.01)) $error(...); end
+    // With PHI x1000 the scaled identity evaluates to 2.999848, inside the
+    // original's band.
+    pub fn golden_identity_ok() -> bool {
+        var gi : u32 = golden_identity_scaled();
+        return (gi >= GI_LO_SCALED) and (gi <= GI_HI_SCALED);
+    }
+
+    // ---- status bundle ------------------------------------------------------
+    // original: the 7 status output assigns
+    //   scheduler_state   = sched_state[3:0]
+    //   active_task_count = sched_active_count
+    //   cycle_counter     = sched_cycle_counter
+    //   sacred_counter    = sched_sacred_counter
+    //   current_task_id   = sched_current_task (zero-extended)
+    //   irq_count         = irq_count_out
+    //   irq_vector        = {1'b0, irq_vector_out}
+    //   system_idle       = sched_idle
+    pub fn empty_status_bundle() -> StatusBundle {
+        return StatusBundle{
+            .scheduler_state = 0,
+            .active_task_count = 0,
+            .cycle_counter = 0,
+            .sacred_counter = 0,
+            .current_task_id = 0,
+            .irq_count = 0,
+            .irq_vector = 0,
+            .system_idle = false,
+        };
+    }
+
+    pub fn status_bundle(sched_state: u8, active_count: u8, cycles: u32,
+                         sacred: u32, task_id: u8, idle: bool,
+                         irq_count: u8, irq_vector: u8) -> StatusBundle {
+        var b = empty_status_bundle();
+        b.scheduler_state = scheduler_state_low(sched_state);
+        b.active_task_count = active_count & 0x0F;
+        b.cycle_counter = cycles;
+        b.sacred_counter = sacred;
+        b.current_task_id = current_task_id_wide(task_id);
+        b.irq_count = irq_count;
+        b.irq_vector = irq_vector_bus(irq_vector);
+        b.system_idle = idle;
+        return b;
+    }
+
+    // ---- combinational data surface ------------------------------------------
+    // The original passes the uart/scheduler interrupt wires straight through
+    // to the interrupt controller instance (pin-to-pin). The data surface is
+    // declared as the `on_comb` function: its parameters become the module
+    // inputs, its return becomes the module output.
+    pub fn on_comb(uart_rx_irq: bool, uart_tx_irq: bool, sched_preemption_irq: bool) -> u8 {
+        return irq_request_word(uart_rx_irq, uart_tx_irq, sched_preemption_irq);
+    }
+
+    // ---- formal properties ----------------------------------------------------
+    // Compile-time invariants mirroring the original's elaboration-time checks.
+    invariant formal_irq_enable_all_sources_enabled
+        given mask = irq_enable_word()
+        assert mask == 0xFF
+        // original: assign irq_enable = {NUM_IRQS{1'b1}};
+
+    invariant formal_priority_word_matches_concat
+        given word = default_priority_word()
+        assert word == 0xA55A
+        // original: assign irq_priority = {2'd2,2'd2,2'd1,2'd1,2'd1,2'd1,2'd2,2'd2};
+
+    invariant formal_golden_identity_in_band
+        given gi = golden_identity_scaled()
+        assert (gi >= GI_LO_SCALED) and (gi <= GI_HI_SCALED)
+        // original: initial begin if ((GOLDEN_IDENTITY < 2.99) ||
+        //           (GOLDEN_IDENTITY > 3.01)) $error("GOLDEN_IDENTITY"); end
+}
+
+// ============================================================================
+// Tests -- every pub function needs at least one runtime assert; the
+// typechecker enforces coverage.
+// ============================================================================
+
+// ---- mirrored localparams and tie-offs ----
+// identity helper: forces the const compares below to run at runtime
+// (a bare `assert(CONST == lit)` is comptime-folded and would be vacuous,
+// T730).
+fn as_u32(c: u32) -> u32 {
+    return c;
+}
+
+test constants_match_original {
+    assert(as_u32(MAX_TASKS) == 16);
+    assert(as_u32(LOG2_MAX_TASKS) == 4);
+    assert(as_u32(NUM_IRQS) == 8);
+    assert(as_u32(LOG2_NUM_IRQS) == 3);
+    assert(INT_MODE_ENABLE == true);
+}
+
+// ---- priority codes: 2'b01 normal, 2'b10 high ----
+test priority_codes_match_original {
+    assert(PRIO_NORMAL == 1);
+    assert(PRIO_HIGH == 2);
+    assert(PRIO_NORMAL < PRIO_HIGH);
+    assert(default_priority(IRQ_UART_RX) == PRIO_HIGH);            // 2'b10
+    assert(default_priority(IRQ_UART_TX) == PRIO_HIGH);            // 2'b10
+    assert(default_priority(IRQ_VSA_COMPLETE) == PRIO_NORMAL);     // 2'b01
+    assert(default_priority(IRQ_TQNN_COMPLETE) == PRIO_NORMAL);    // 2'b01
+    assert(default_priority(IRQ_TIMER_TICK) == PRIO_NORMAL);       // 2'b01
+    assert(default_priority(IRQ_PREEMPTION_YIELD) == PRIO_NORMAL); // 2'b01
+    assert(default_priority(IRQ_FAULT) == PRIO_HIGH);              // 2'b10
+    assert(default_priority(IRQ_SPARE) == PRIO_HIGH);              // 2'b10
+}
+
+// ---- request word: bit positions from the original concat ----
+test irq_request_word_wiring {
+    assert(irq_request_word(false, false, false) == 0);    // no sources
+    assert(irq_request_word(true, false, false) == 1);     // bit 0
+    assert(irq_request_word(false, true, false) == 2);     // bit 1
+    assert(irq_request_word(false, false, true) == 16);    // bit 4
+    assert(irq_request_word(true, true, true) == 0b10011); // bits 0,1,4
+}
+
+// ---- enable word: {NUM_IRQS{1'b1}} replication ----
+test irq_enable_word_replication {
+    assert(irq_enable_word() == 0xFF);
+}
+
+// ---- priority word: the 8-source concat ----
+// original: {2'd2,2'd2,2'd1,2'd1,2'd1,2'd1,2'd2,2'd2} = 16'b1010010101011010
+test default_priority_word_concat {
+    assert(default_priority_word() == 0xA55A);
+}
+
+// ---- golden identity ----
+test golden_identity_scaled_value {
+    assert(golden_identity_scaled() == 2_999_848);   // 2.999848 in GI_UNITs
+}
+
+test golden_identity_ok_band {
+    assert(golden_identity_ok() == true);
+}
+
+// ---- status helpers ----
+test scheduler_state_low_masking {
+    assert(scheduler_state_low(0xFF) == 0x0F);
+    assert(scheduler_state_low(0x5A) == 0x0A);
+    assert(scheduler_state_low(0x03) == 0x03);
+}
+
+test current_task_id_zero_extension {
+    assert(current_task_id_wide(0x0C) == 12);
+    assert(current_task_id_wide(0x00) == 0);
+}
+
+test irq_vector_identity {
+    assert(irq_vector_bus(0x05) == 5);
+    assert(irq_vector_bus(0x07) == 7);
+}
+
+// ---- status bundle assembly: the 7 output assigns ----
+test status_bundle_assembly {
+    var b = status_bundle(0xAB, 5, 4242, 77, 0x0C, false, 200, 0x05);
+    assert(b.scheduler_state == 0x0B);        // 0xAB masked to [3:0]
+    assert(b.active_task_count == 5);
+    assert(b.cycle_counter == 4242);
+    assert(b.sacred_counter == 77);
+    assert(b.current_task_id == 0x000C);      // zero-extended
+    assert(b.irq_count == 200);
+    assert(b.irq_vector == 0x05);             // {1'b0, ...} low bits kept
+    assert(b.system_idle == false);
+
+    var busy = status_bundle(0x10, 0x1F, 0, 0, 0xFF, true, 0, 0x07);
+    assert(busy.scheduler_state == 0x00);
+    assert(busy.active_task_count == 0x0F);   // masked to [3:0]
+    assert(busy.current_task_id == 0x00FF);
+    assert(busy.system_idle == true);
+    assert(busy.irq_vector == 0x07);
+
+    var empty = empty_status_bundle();
+    assert(empty.cycle_counter == 0);
+    assert(empty.sacred_counter == 0);
+    assert(empty.irq_count == 0);
+    assert(empty.system_idle == false);
+}
