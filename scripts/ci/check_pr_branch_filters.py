@@ -56,11 +56,13 @@ except ImportError:
 
 # Merge-critical: failure of this workflow should be able to block a merge.
 # Reviewed as code on purpose -- see the docstring.
+# check-now-freshness.yml and now-sync-gate.yml left this list with the NOW gate,
+# owner decision 2026-10-04 (#5935).
 MERGE_CRITICAL = (
-    "check-now-freshness.yml",
     "issue-gate.yml",
-    "now-sync-gate.yml",
     "schema-validation.yml",
+    # The "Only t27" gate (owner rule 2026-10-05, #6510); meant to be required.
+    "own-language.yml",
 )
 
 # The two lists above are a partition ONLY of the files they name. Everything
@@ -69,8 +71,6 @@ MERGE_CRITICAL = (
 #   len(MERGE_CRITICAL) + len(NOT_MERGE_CRITICAL) + len(unclassified)
 # should equal the number of workflow files present.
 #
-# Two of those unclassified carried `pull_request: branches: [master]` -- the very defect
-# this check exists to detect. 
 #
 # A ceiling rather than a refusal, because some files cannot be classified in the
 # commit that discovers them and a gate that is red on the day it lands teaches
@@ -85,7 +85,6 @@ MAX_UNCLASSIFIED = 24
 # future reader can disagree with the reason rather than guess at the omission.
 NOT_MERGE_CRITICAL = {
     "pr-dashboard.yml": "reporting only; a stale dashboard does not gate a merge",
-    "notebook-sync.yml": "automation targeted at feature branches by design",
     "seal-staleness-warn.yml": "warn-only by name and by intent",
     "auto-merge-ready-prs.yml": "it merges pull requests on a schedule; its own failure gates nothing",
     "oracle-nightly.yml": "a nightly report over the whole corpus; it measures, it does not gate a merge",
@@ -95,6 +94,8 @@ NOT_MERGE_CRITICAL = {
     "needs-boundary.yml": "it labels issues that name no boundary; labelling gates no merge",
     "queen-export-push.yml": "it pushes bee branches from the container on a schedule; the gates on the pull requests they become are what gate a merge",
     "queen-publish.yml": "it opens pull requests on a schedule; the gates on those pull requests are what gate a merge",
+    "t27o-release.yml": "it publishes the signed t27o release on tag push; a tag is not a merge and it gates none",
+    "t27o-golden.yml": "a reusable golden-spec job other workflows call; the caller's own checks gate the merge, not this file",
     "queen-refile.yml": "it re-files issues no bee can take again; filing work gates no merge",
     "queen-watchdog.yml": "it asks whether the swarm answers and restarts it; nothing it does gates a merge",
     "pusher.yml": "it reads the system and writes one issue; it gates nothing and must never block a merge",
@@ -104,7 +105,7 @@ NOT_MERGE_CRITICAL = {
     "coq-kernel.yml": "not a required check for master branch protection",
     "emit-bitexact-gate.yml": "not a required check for master branch protection",
     "fpga-build.yml": "not a required check for master branch protection",
-    "notebook-gate.yml": "not a required check for master branch protection",
+    "fix-carries-source.yml": "not a required check for master branch protection",
     "phi-loop-ci.yml": "not a required check for master branch protection",
     "seal-coverage.yml": "not a required check for master branch protection",
     "secret-scan.yml": "not a required check for master branch protection",
@@ -112,6 +113,7 @@ NOT_MERGE_CRITICAL = {
     "damage-negatives.yml": "not a required check for master branch protection",
     "documented-commands.yml": "not a required check for master branch protection",
     "corpus-ratchet.yml": "not a required check for master branch protection",
+    "t27b-native.yml": "not a required check for master branch protection; tri t27b ready reads it (#6444)",
     "withdrawn-live-gate.yml": "not a required check for master branch protection",
     "harness-scratch.yml": "not a required check for master branch protection",
     "dupe-ratchet.yml": "not a required check for master branch protection",
@@ -120,6 +122,8 @@ NOT_MERGE_CRITICAL = {
     "untrusted-input-gate.yml": "not a required check for master branch protection",
     "spec-parse-ratchet.yml": "not a required check for master branch protection",
     "l1-traceability.yml": "not a required check for master branch protection",
+    "wasm-explorer.yml": "builds and tests the wasm explorer binding on bootstrap/** and bindings/wasm-explorer/** changes; not a required check for master branch protection (#4489)",
+    "xilinx7-l3-bench.yml": "a benchmark of the openXC7 back half on a shared runner; it measures, it does not gate a merge (#6068)",
 }
 
 FILTER_KEYS = ("branches", "branches-ignore")
