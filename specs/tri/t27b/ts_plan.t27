@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/ts_plan.t27 -- what t27b's TypeScript path lowers, and how (issue #9994, phase 1).
+; `t27b ts <spec>` writes a module's consts and its pure scalar fns as TypeScript with their real bodies,
+; and each `test` as an exported self-check; specs/tri/t27b/ts_emit.t27 is the writer and this file holds
+; every decision it takes. Both reach cli/t27b only through `t27c gen-rust`, as the Verilog path does; the
+; readers of the flat AST, of the meta records and of literals are verilog_plan.t27's, reused as they are.
+; --
+; The subset. Integers u1 to u32 and i1 to i32, bool, and an untyped (comptime) integer where it folds or
+; takes a type from its place. A module-level `const` of such a value; a fn whose parameters and result are
+; such values; the statements `const`/`var` locals, assignment (plain and compound), if/else, while (with a
+; continue expression), break, continue, return, assert and assert_eq. Everything else -- u64 and usize,
+; floats, str, arrays, structs, enums, switch, for, a module-level `var`, `use`, bench -- is refused by name
+; and line, `t27b: ts: unsupported construct <what> `<name>` at line <n>`, and nothing is written.
+; --
+; Numbers. A TypeScript number is an f64, exact on every integer below 2^53, so each value of the subset is
+; held exactly and each operator is written so that its result is the t27 result at the t27 type:
+; - `+ - *` and unary `-` are checked: t27_chk(v, lo, hi) throws RangeError `t27: integer overflow` when the
+;   exact value leaves the type's range, where Zig's safe build panics. A product of two u32 that f64 cannot
+;   hold exactly is far above 2^32, so the check still fires.
+; - `+% -% *%` wrap: t27_wrap(v, w, s) is `v >>> 0` for a u32, `v & (2^w - 1)` for a narrower unsigned type
+;   and `(v << (32 - w)) >> (32 - w)` for a signed one (`| 0` when w is 32); `*%` multiplies with
+;   Math.imul, whose low 32 bits are exact.
+; - `/` and `%` are unsigned only (t27c refuses them on a signed type, which needs @divTrunc or @rem):
+;   t27_div and t27_rem throw RangeError `t27: division by zero` on a zero divisor.
+; - `<<` and `>>` take the left operand's type; an amount at or above its width throws `t27: shift amount
+;   too large` (Zig panics there); `<<` drops the bits shifted out, `>>` is logical on an unsigned type and
+;   arithmetic on a signed one.
+; - `& | ^ ~` are written so a u32 stays unsigned (`>>> 0`) and a narrower unsigned value within its mask.
+; - `==` is `===`, `!=` is `!==`, `and` and `or` are `&&` and `||`.
+; - A cast `x as T` that narrows the width wraps (Zig's @truncate); one whose range holds the source's range
+;   is the value as it is; any other is checked (Zig's checked @intCast).
+; - A value goes where Zig coerces it: into a type whose range holds its own. A u32 into a u8 without a
+;   cast, or an i8 into a u8, is refused.
+; --
+; Tests. `test name { ... }` is `export function t27_test_name(): number`, which runs the body and returns
+; how many asserts it executed (an assert whose operands all fold is checked by t27_check and not counted,
+; as test-report does not count an assert on compile-time constants, #6509); t27_tests lists them, and t27_report() writes the lines of the assert table
+; of `t27c test-report`, so the two compare byte for byte. `invariant name { ... }` is
+; t27_invariant_name() in t27_invariants: test-report does not count them (Zig checks them at compile
+; time), so they are not in the table; t27_failures() runs both kinds and names each one that throws.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bTsPlan;
+
+use tri::t27b::verilog_plan;
+
+// ----------------------------------------------------------------------------------------------------------
+// Types. A type is one i64 code: 1 to 32 an unsigned integer of that width; TS_SIGNED + w a signed one of
+// width w (1 to 32); TS_BOOL; TS_COMPTIME an untyped integer; TS_VOID no value; TS_BAD anything else,
+// refused where it is used. A u64, a usize and every wider type are TS_BAD: f64 does not hold them.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const TS_BAD : i64 = -1;
+pub const TS_COMPTIME : i64 = 0;
+pub const TS_BOOL : i64 = 65;
+pub const TS_VOID : i64 = 66;
+pub const TS_SIGNED : i64 = 100;
+pub const TS_MAX_WIDTH : i64 = 32;
+
+/// The code of the type text s[a .. b] (trimmed).
+pub fn ts_type(s: []const u8, a: usize, b: usize) -> i64 {
+    // The trimmed text is passed on as s[p .. q], never bound to a local (#8812).
+    const p : usize = trim_lo(s, a, b);
+    const q : usize = trim_hi(s, p, b);
+    if (q == p or same(s[p .. q], "void")) { return TS_VOID; }
+    if (same(s[p .. q], "bool")) { return TS_BOOL; }
+    if (same(s[p .. q], "comptime_int")) { return TS_COMPTIME; }
+    if ((s[p] != 117 and s[p] != 105) or q - p < 2 or q - p > 3) { return TS_BAD; }
+    // p1 is bound once: t27c's Zig backend hoists a repeated `p + 1` above the declaration of p (#2629).
+    const p1 : usize = p + 1;
+    var w : i64 = 0;
+    var j : usize = p1;
+    while (j < q) {
+        if (!digit(s[j])) { return TS_BAD; }
+        const dv : i64 = @intCast(s[j] - 48);
+        w = w * 10 + dv;
+        j = j + 1;
+    }
+    if (s[p1] == 48 or w < 1 or w > TS_MAX_WIDTH) { return TS_BAD; }
+    if (s[p] == 105) { return TS_SIGNED + w; }
+    return w;
+}
+
+/// Is the type an unsigned integer this path holds?
+pub fn ts_unsigned(t: i64) -> bool {
+    return t >= 1 and t <= TS_MAX_WIDTH;
+}
+
+/// Is the type a signed integer this path holds?
+pub fn ts_signed(t: i64) -> bool {
+    return t > TS_SIGNED and t <= TS_SIGNED + TS_MAX_WIDTH;
+}
+
+/// Is the type an integer this path holds?
+pub fn ts_int(t: i64) -> bool {
+    return ts_unsigned(t) or ts_signed(t);
+}
+
+/// Is the type a value this path holds: an integer or a bool?
+pub fn ts_scalar(t: i64) -> bool {
+    return ts_int(t) or t == TS_BOOL;
+}
+
+/// The width in bits of a scalar type (a bool is one bit); 0 for anything else.
+pub fn ts_width(t: i64) -> i64 {
+    if (ts_unsigned(t)) { return t; }
+    if (ts_signed(t)) { return t - TS_SIGNED; }
+    if (t == TS_BOOL) { return 1; }
+    return 0;
+}
+
+/// 2^w, for w from 0 to 62.
+pub fn ts_pow2(w: i64) -> i64 {
+    var m : i64 = 1;
+    var j : i64 = 0;
+    while (j < w and j < 62) {
+        m = m * 2;
+        j = j + 1;
+    }
+    return m;
+}
+
+/// The smallest value of a scalar type.
+pub fn ts_min(t: i64) -> i64 {
+    if (ts_signed(t)) { return 0 - ts_pow2(ts_width(t) - 1); }
+    return 0;
+}
+
+/// The largest value of a scalar type (a bool holds 0 and 1); 0 for anything else.
+pub fn ts_max(t: i64) -> i64 {
+    if (ts_signed(t)) { return ts_pow2(ts_width(t) - 1) - 1; }
+    if (ts_unsigned(t) or t == TS_BOOL) { return ts_pow2(ts_width(t)) - 1; }
+    return 0;
+}
+
+/// Does v fit the scalar type t?
+pub fn ts_fits(v: i64, t: i64) -> bool {
+    if (!ts_scalar(t)) { return false; }
+    return v >= ts_min(t) and v <= ts_max(t);
+}
+
+/// Does a value of type own go, without a cast, where a value of type want is taken? The same scalar
+/// type, or an integer type whose range holds own's range (Zig's coercion: u8 into u16 or i16, never into
+/// i8; i8 never into an unsigned type).
+pub fn ts_coerces(own: i64, want: i64) -> bool {
+    if (own == want) { return ts_scalar(own); }
+    if (!ts_int(own) or !ts_int(want)) { return false; }
+    return ts_min(want) <= ts_min(own) and ts_max(own) <= ts_max(want);
+}
+
+/// The type both operands of an arithmetic or a comparison take (Zig's peer type): an untyped operand
+/// takes the other's type, two bools bool, two integers the one the other coerces to. TS_BAD when they do
+/// not meet (a bool and an integer, a u32 and an i32, anything not scalar).
+pub fn ts_peer(a: i64, b: i64) -> i64 {
+    if (a == TS_COMPTIME) {
+        if (b == TS_COMPTIME or ts_scalar(b)) { return b; }
+        return TS_BAD;
+    }
+    if (b == TS_COMPTIME) {
+        if (ts_scalar(a)) { return a; }
+        return TS_BAD;
+    }
+    if (a == TS_BOOL and b == TS_BOOL) { return TS_BOOL; }
+    if (ts_coerces(a, b)) { return b; }
+    if (ts_coerces(b, a)) { return a; }
+    return TS_BAD;
+}
+
+/// The TypeScript type a scalar is declared with.
+pub fn ts_annot(t: i64) -> str {
+    if (t == TS_BOOL) { return "boolean"; }
+    return "number";
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Folding. An untyped expression is folded to its value, over i64, and the value is written where it is
+// taken, checked to fit the type it takes there. Folding stays within 2^52 either way, so each value is
+// exact both here and in TypeScript; an expression that leaves it, or divides by 0, does not fold and is
+// refused.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const TS_FOLD_MAX : i64 = 4503599627370496;
+
+/// Is v within the folding range?
+pub fn ts_in_fold(v: i64) -> bool {
+    return v >= 0 - TS_FOLD_MAX and v <= TS_FOLD_MAX;
+}
+
+/// |v|.
+pub fn ts_abs(v: i64) -> i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+/// Does the binary operator s fold over a and b (both within the folding range) to a value within it?
+pub fn ts_fold_ok(s: []const u8, a: i64, b: i64) -> bool {
+    if (!ts_in_fold(a) or !ts_in_fold(b)) { return false; }
+    if (same(s, "+") or same(s, "+%") or same(s, "-") or same(s, "-%")) { return ts_in_fold(ts_fold_val(s, a, b)); }
+    if (same(s, "*") or same(s, "*%")) {
+        if (a == 0 or b == 0) { return true; }
+        const mq : i64 = @divTrunc(TS_FOLD_MAX, ts_abs(b));
+        return ts_abs(a) <= mq;
+    }
+    if (same(s, "/") or same(s, "%")) { return a >= 0 and b > 0; }
+    if (same(s, "<<")) {
+        if (a < 0 or b < 0 or b >= 53) { return false; }
+        const sq : i64 = @divTrunc(TS_FOLD_MAX, ts_pow2(b));
+        return a <= sq;
+    }
+    if (same(s, ">>")) { return a >= 0 and b >= 0; }
+    if (op_bitwise(s)) { return a >= 0 and b >= 0; }
+    if (op_class(s) == OP_CMP or op_class(s) == OP_LOGIC) { return true; }
+    return false;
+}
+
+/// The value of the binary operator s over a and b, when ts_fold_ok says it folds; a comparison or a
+/// logical operator gives 1 or 0.
+pub fn ts_fold_val(s: []const u8, a: i64, b: i64) -> i64 {
+    if (same(s, "+") or same(s, "+%")) { return a + b; }
+    if (same(s, "-") or same(s, "-%")) { return a - b; }
+    if (same(s, "*") or same(s, "*%")) { return a * b; }
+    if (same(s, "/")) {
+        const dq : i64 = @divTrunc(a, b);
+        return dq;
+    }
+    if (same(s, "%")) {
+        const dr : i64 = @rem(a, b);
+        return dr;
+    }
+    if (same(s, "<<")) { return a * ts_pow2(b); }
+    if (same(s, ">>")) {
+        if (b >= 53) { return 0; }
+        const ds : i64 = @divTrunc(a, ts_pow2(b));
+        return ds;
+    }
+    if (same(s, "&")) { return a & b; }
+    if (same(s, "|")) { return a | b; }
+    if (same(s, "^")) { return a ^ b; }
+    var t : bool = false;
+    if (same(s, "==")) { t = a == b; }
+    if (same(s, "!=")) { t = a != b; }
+    if (same(s, "<")) { t = a < b; }
+    if (same(s, "<=")) { t = a <= b; }
+    if (same(s, ">")) { t = a > b; }
+    if (same(s, ">=")) { t = a >= b; }
+    if (same(s, "and") or same(s, "&&")) { t = a == 1 and b == 1; }
+    if (same(s, "or") or same(s, "||")) { t = a == 1 or b == 1; }
+    if (t) { return 1; }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Operators. Each arithmetic operator is written in one of five forms (see the head of this file); a
+// comparison or a logical operator is one TypeScript operator.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const AR_BAD : u8 = 0;
+/// `+ - *`: `t27_chk(a op b, lo, hi)`.
+pub const AR_CHECKED : u8 = 1;
+/// `+% -% *%`: `t27_wrap(a op b, w, s)`, `*%` with Math.imul.
+pub const AR_WRAPS : u8 = 2;
+/// `/ %`: `t27_div(a, b)`, `t27_rem(a, b)`; unsigned only.
+pub const AR_DIVIDES : u8 = 3;
+/// `& | ^`: `(a op b)`, and `((a op b) >>> 0)` at u32; integers only.
+pub const AR_BITS : u8 = 4;
+/// `<< >>`: `t27_shl(a, b, w, s)`, `t27_shr(a, b, w, s)`.
+pub const AR_SHIFTS : u8 = 5;
+
+/// The form the arithmetic operator text s is written in; AR_BAD for any other operator.
+pub fn ts_arith(s: []const u8) -> u8 {
+    if (same(s, "+") or same(s, "-") or same(s, "*")) { return AR_CHECKED; }
+    if (same(s, "+%") or same(s, "-%") or same(s, "*%")) { return AR_WRAPS; }
+    if (same(s, "/") or same(s, "%")) { return AR_DIVIDES; }
+    if (op_bitwise(s)) { return AR_BITS; }
+    if (same(s, "<<") or same(s, ">>")) { return AR_SHIFTS; }
+    return AR_BAD;
+}
+
+/// The TypeScript operator, or helper, an arithmetic operator is written with.
+pub fn ts_arith_op(s: []const u8) -> str {
+    if (same(s, "+") or same(s, "+%")) { return "+"; }
+    if (same(s, "-") or same(s, "-%")) { return "-"; }
+    if (same(s, "*")) { return "*"; }
+    if (same(s, "*%")) { return "Math.imul"; }
+    if (same(s, "/")) { return "t27_div"; }
+    if (same(s, "%")) { return "t27_rem"; }
+    if (same(s, "&")) { return "&"; }
+    if (same(s, "|")) { return "|"; }
+    if (same(s, "^")) { return "^"; }
+    if (same(s, "<<")) { return "t27_shl"; }
+    if (same(s, ">>")) { return "t27_shr"; }
+    return "?";
+}
+
+/// The TypeScript spelling of a comparison or a logical operator; `?` for any other.
+pub fn ts_cmp(s: []const u8) -> str {
+    if (same(s, "==")) { return "==="; }
+    if (same(s, "!=")) { return "!=="; }
+    if (same(s, "<")) { return "<"; }
+    if (same(s, "<=")) { return "<="; }
+    if (same(s, ">")) { return ">"; }
+    if (same(s, ">=")) { return ">="; }
+    if (same(s, "and") or same(s, "&&")) { return "&&"; }
+    if (same(s, "or") or same(s, "||")) { return "||"; }
+    return "?";
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Names. A t27 name is written as it is; one TypeScript reserves, or one the prelude could collide with
+// (every name that starts with `t27_`), is refused by name rather than renamed, so the TypeScript reads as
+// the spec does.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const TS_KEYWORDS : [59]str = ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield", "let", "static", "implements", "interface", "package", "private", "protected", "public", "await", "arguments", "eval", "undefined", "NaN", "Infinity", "Math", "String", "Error", "RangeError", "Array", "Number", "Boolean", "Object"];
+
+/// Is s a name the TypeScript cannot carry as it is: a reserved word, a global the output uses, or a name
+/// that starts with `t27_`?
+pub fn ts_reserved(s: []const u8) -> bool {
+    if (s.len >= 4 and same(s[0 .. 4], "t27_")) { return true; }
+    var j : usize = 0;
+    while (j < 59) {
+        if (same(s, TS_KEYWORDS[j])) { return true; }
+        j = j + 1;
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// The prelude, written once at the head of every module, and the coda, after the tables of tests. Both are
+// fixed text; their strings are single-quoted, so neither holds a byte the spec would have to escape.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const TS_PRELUDE_LINES : usize = 12;
+
+pub const TS_PRELUDE : [12]str = [
+    "let t27_n: number = 0;",
+    "function t27_fail(m: string): never { throw new RangeError('t27: ' + m); }",
+    "function t27_chk(v: number, lo: number, hi: number): number { if (v < lo || v > hi) { t27_fail('integer overflow'); } return v; }",
+    "function t27_wrap(v: number, w: number, s: boolean): number { if (s) { return w === 32 ? v | 0 : (v << (32 - w)) >> (32 - w); } return w === 32 ? v >>> 0 : v & (2 ** w - 1); }",
+    "function t27_div(a: number, b: number): number { if (b === 0) { t27_fail('division by zero'); } return Math.trunc(a / b); }",
+    "function t27_rem(a: number, b: number): number { if (b === 0) { t27_fail('division by zero'); } return a % b; }",
+    "function t27_shl(a: number, b: number, w: number, s: boolean): number { if (b >= w) { t27_fail('shift amount too large'); } return t27_wrap(a << b, w, s); }",
+    "function t27_shr(a: number, b: number, w: number, s: boolean): number { if (b >= w) { t27_fail('shift amount too large'); } return s ? a >> b : a >>> b; }",
+    "function t27_check(c: boolean, test: string, line: number): void { if (!c) { throw new Error('t27: assert failed in ' + test + ' at line ' + String(line)); } }",
+    "function t27_assert(c: boolean, test: string, line: number): void { t27_n = t27_n + 1; t27_check(c, test, line); }",
+    "type t27_case = [string, () => number];",
+    ""
+];
+
+pub const TS_CODA_LINES : usize = 20;
+
+pub const TS_CODA : [20]str = [
+    "",
+    "/// The assert table of `t27c test-report`, line for line.",
+    "export function t27_report(): string {",
+    "  const lines: string[] = ['  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):'];",
+    "  let passed = 0;",
+    "  let vacuous = 0;",
+    "  for (const [name, run] of t27_tests) {",
+    "    let n = -1;",
+    "    try { n = run(); } catch (e) { n = -1; }",
+    "    if (n < 0) { lines.push('  ' + '-'.padStart(6) + '  ' + name + '   (failed, not counted)'); continue; }",
+    "    passed = passed + 1;",
+    "    if (n === 0) { vacuous = vacuous + 1; lines.push('  ' + '0'.padStart(6) + '  ' + name + '   VACUOUS'); } else { lines.push('  ' + String(n).padStart(6) + '  ' + name); }",
+    "  }",
+    "  lines.push('  vacuous passes  ' + String(vacuous) + ' of ' + String(passed) + '  (passed with 0 runtime asserts executed)');",
+    "  return lines.join(String.fromCharCode(10));",
+    "}",
+    "",
+    "/// Every test and invariant that throws, with what it threw; empty when all hold.",
+    "export function t27_failures(): string[] { const out: string[] = []; for (const [name, run] of t27_tests) { try { run(); } catch (e) { out.push('test ' + name + ': ' + String(e)); } } for (const [name, run] of t27_invariants) { try { run(); } catch (e) { out.push('invariant ' + name + ': ' + String(e)); } } return out; }",
+    ""
+];
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests.
+// ----------------------------------------------------------------------------------------------------------
+
+/// How many bytes of s are a double quote or a backslash.
+fn quotes_in(s: str) -> usize {
+    var n : usize = 0;
+    var k : usize = 0;
+    while (k < s.len) {
+        if (s[k] == 34 or s[k] == 92) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+test ts_type_texts_read_as_codes {
+    assert ts_type("u8", 0, 2) == 8;
+    assert ts_type("u32", 0, 3) == 32;
+    assert ts_type(" u1 ", 0, 4) == 1;
+    assert ts_type("i32", 0, 3) == TS_SIGNED + 32;
+    assert ts_type("xi8", 1, 3) == TS_SIGNED + 8;
+    assert ts_type("u33", 0, 3) == TS_BAD;
+    assert ts_type("u64", 0, 3) == TS_BAD and ts_type("i64", 0, 3) == TS_BAD;
+    assert ts_type("usize", 0, 5) == TS_BAD;
+    assert ts_type("u0", 0, 2) == TS_BAD and ts_type("i08", 0, 3) == TS_BAD;
+    assert ts_type("bool", 0, 4) == TS_BOOL;
+    assert ts_type("", 0, 0) == TS_VOID and ts_type("void", 0, 4) == TS_VOID;
+    assert ts_type("comptime_int", 0, 12) == TS_COMPTIME;
+    assert ts_type("f64", 0, 3) == TS_BAD and ts_type("str", 0, 3) == TS_BAD and ts_type("[4]u8", 0, 5) == TS_BAD;
+}
+
+test ranges_coercions_and_peers {
+    assert ts_width(8) == 8 and ts_width(TS_SIGNED + 16) == 16 and ts_width(TS_BOOL) == 1 and ts_width(TS_BAD) == 0;
+    assert ts_min(8) == 0 and ts_max(8) == 255 and ts_max(32) == 4294967295 and ts_max(1) == 1;
+    assert ts_min(TS_SIGNED + 8) == 0 - 128 and ts_max(TS_SIGNED + 8) == 127;
+    assert ts_min(TS_SIGNED + 32) == 0 - 2147483648 and ts_max(TS_SIGNED + 32) == 2147483647;
+    assert ts_min(TS_SIGNED + 1) == 0 - 1 and ts_max(TS_SIGNED + 1) == 0;
+    assert ts_fits(255, 8) and !ts_fits(256, 8) and !ts_fits(0 - 1, 32) and ts_fits(0 - 1, TS_SIGNED + 8);
+    assert ts_fits(1, TS_BOOL) and !ts_fits(2, TS_BOOL) and !ts_fits(0, TS_BAD);
+    assert ts_coerces(8, 16) and ts_coerces(8, TS_SIGNED + 16) and !ts_coerces(8, TS_SIGNED + 8);
+    assert !ts_coerces(TS_SIGNED + 8, 16) and !ts_coerces(32, 8) and ts_coerces(32, 32);
+    assert ts_coerces(TS_BOOL, TS_BOOL) and !ts_coerces(TS_BOOL, 8) and !ts_coerces(TS_BAD, TS_BAD);
+    assert ts_peer(8, 16) == 16 and ts_peer(32, 8) == 32 and ts_peer(8, TS_SIGNED + 16) == TS_SIGNED + 16;
+    assert ts_peer(TS_COMPTIME, 32) == 32 and ts_peer(32, TS_COMPTIME) == 32 and ts_peer(TS_COMPTIME, TS_COMPTIME) == TS_COMPTIME;
+    assert ts_peer(32, TS_SIGNED + 32) == TS_BAD and ts_peer(TS_BOOL, 8) == TS_BAD and ts_peer(TS_BOOL, TS_BOOL) == TS_BOOL;
+    assert same("boolean", ts_annot(TS_BOOL)) and same("number", ts_annot(TS_SIGNED + 8));
+}
+
+test untyped_values_fold_within_two_to_the_52 {
+    assert ts_fold_ok("+", 2, 3) and ts_fold_val("+", 2, 3) == 5;
+    assert ts_fold_ok("-", 2, 3) and ts_fold_val("-", 2, 3) == 0 - 1;
+    assert !ts_fold_ok("+", TS_FOLD_MAX, 1) and ts_fold_ok("+", TS_FOLD_MAX, 0);
+    assert ts_fold_val("*", 6, 7) == 42 and !ts_fold_ok("*", TS_FOLD_MAX, 2) and ts_fold_ok("*", 0 - 3, 5);
+    assert ts_fold_val("/", 7, 2) == 3 and !ts_fold_ok("/", 7, 0) and !ts_fold_ok("/", 0 - 7, 2);
+    assert ts_fold_val("%", 7, 4) == 3 and !ts_fold_ok("%", 7, 0);
+    assert ts_fold_ok("<<", 1, 52) and ts_fold_val("<<", 1, 31) == 2147483648;
+    assert !ts_fold_ok("<<", 2, 52) and !ts_fold_ok("<<", 1, 0 - 1);
+    assert ts_fold_val(">>", 4096, 3) == 512 and ts_fold_val(">>", 4096, 60) == 0;
+    assert ts_fold_val("&", 12, 10) == 8 and ts_fold_val("|", 12, 10) == 14 and ts_fold_val("^", 12, 10) == 6;
+    assert !ts_fold_ok("&", 0 - 1, 3);
+    assert ts_fold_val("<", 0 - 1, 2) == 1 and ts_fold_val("==", 5, 5) == 1 and ts_fold_val(">=", 1, 2) == 0;
+    assert ts_fold_val("and", 1, 0) == 0 and ts_fold_val("or", 1, 0) == 1;
+    assert !ts_fold_ok("**", 1, 1) and !ts_fold_ok("+", TS_FOLD_MAX + 1, 0);
+}
+
+test operators_have_a_form_and_a_spelling {
+    assert ts_arith("+") == AR_CHECKED and ts_arith("-") == AR_CHECKED and ts_arith("*") == AR_CHECKED;
+    assert ts_arith("+%") == AR_WRAPS and ts_arith("*%") == AR_WRAPS;
+    assert ts_arith("/") == AR_DIVIDES and ts_arith("%") == AR_DIVIDES;
+    assert ts_arith("^") == AR_BITS and ts_arith("<<") == AR_SHIFTS and ts_arith(">>") == AR_SHIFTS;
+    assert ts_arith("==") == AR_BAD and ts_arith("and") == AR_BAD and ts_arith("**") == AR_BAD;
+    assert same("Math.imul", ts_arith_op("*%")) and same("+", ts_arith_op("+%")) and same("t27_rem", ts_arith_op("%"));
+    assert same("t27_shl", ts_arith_op("<<")) and same("?", ts_arith_op("=="));
+    assert same("===", ts_cmp("==")) and same("!==", ts_cmp("!=")) and same("<=", ts_cmp("<="));
+    assert same("&&", ts_cmp("and")) and same("||", ts_cmp("or")) and same("?", ts_cmp("+"));
+}
+
+test reserved_names_are_refused_not_renamed {
+    assert ts_reserved("class") and ts_reserved("NaN") and ts_reserved("arguments") and ts_reserved("Object");
+    assert ts_reserved("t27_n") and ts_reserved("t27_");
+    assert !ts_reserved("step") and !ts_reserved("t27") and !ts_reserved("bit") and !ts_reserved("classes");
+}
+
+test the_prelude_and_the_coda_need_no_escape {
+    var bad : usize = 0;
+    var j : usize = 0;
+    while (j < TS_PRELUDE_LINES) {
+        bad = bad + quotes_in(TS_PRELUDE[j]);
+        j = j + 1;
+    }
+    j = 0;
+    while (j < TS_CODA_LINES) {
+        bad = bad + quotes_in(TS_CODA[j]);
+        j = j + 1;
+    }
+    assert bad == 0;
+    assert same("let t27_n: number = 0;", TS_PRELUDE[0]);
+    assert same("type t27_case = [string, () => number];", TS_PRELUDE[10]);
+    assert same("export function t27_report(): string {", TS_CODA[2]);
+}
+
+invariant the_codes_do_not_overlap {
+    assert TS_BOOL > TS_MAX_WIDTH and TS_VOID > TS_BOOL and TS_SIGNED > TS_VOID;
+    assert TS_FOLD_MAX == 4503599627370496;
+}
