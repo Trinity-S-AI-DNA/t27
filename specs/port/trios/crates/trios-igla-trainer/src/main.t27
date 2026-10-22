@@ -1,0 +1,455 @@
+// Port of gHashTag/trios `crates/trios-igla-trainer/src/main.rs` (206 lines) to the
+// t27 specification dialect, following the sibling ports in specs/port/trios.
+//
+// What is ported as testable decisions:
+//   - clap argument defaults (main.rs lines 9-48)            -> default_args()
+//   - the `--arch` routing verdict (main() lines 50-62)      -> main() + is_jepa_arch()
+//   - JepaConfig literal construction (lines 68-79)          -> jepa_config_defaults()
+//   - JepaTrainArgs assembly from args (lines 81-87)         -> build_jepa_train_args()
+//   - the `--schedule` string mapping (lines 98-104)         -> parse_schedule()
+//   - TrainConfig assembly from args (lines 106-112)         -> build_train_config()
+//   - the git-sha fallback "unknown" (lines 114-120)         -> git_sha_or_unknown()
+//   - the mock-training LCG/noise/loss math (lines 135-151)  -> next_rng_state(),
+//     rng_noise(), step_loss(), run_loss_series(); Rust wrapping_mul/wrapping_add
+//     semantics are rebuilt through 32-bit limb arithmetic (mul_u64_wrap /
+//     add_u64_wrap) because a plain t27 `*` on u64 traps on overflow.
+//   - the step%200 log / step%500 dump cadence (lines 153-161)
+//     -> should_log_step() / should_dump_metric()
+//   - the experience-log entry shape (lines 180-190)         -> exp_name_for() +
+//     build_experience_entry()
+//
+// What stays as plumbing stubs (never called by tests, mirroring jepa_runner.t27):
+//   - real argv clap parsing and tracing output
+//   - the crate-external run_jepa_training call and its "jepa_training_complete
+//     bpb=..." log line
+//   - the TrainingAuditLog and its dump_metric calls
+//   - the wall-clock timestamp, the .trinity/experience directory creation and the
+//     trios_YYYYMMDD.trinity file append
+//   - the `git rev-parse --short HEAD` subprocess
+// The stub names and signatures mirror the original so the port boundary stays visible.
+
+module port::trios::crates::trios_igla_trainer::src;
+
+// --- Clap argument defaults (main.rs lines 9-48) ---
+pub const DEFAULT_STEPS: u64 = 1000;
+pub const DEFAULT_BATCH_SIZE: usize = 4;
+pub const DEFAULT_SEQ_LEN: usize = 128;
+pub const DEFAULT_SEED: u64 = 42;
+pub const DEFAULT_HIDDEN: usize = 256;
+pub const DEFAULT_CONTEXT: usize = 6;
+
+// --- JepaConfig literals (main.rs lines 68-79) ---
+pub const JEPA_MASK_RATIO: f64 = 0.3;
+pub const JEPA_MIN_SPAN: usize = 1;
+pub const JEPA_NUM_SPANS: usize = 2;
+pub const JEPA_EMA_START: f64 = 0.996;
+pub const JEPA_EMA_END: f64 = 1.0;
+pub const JEPA_PREDICTOR_LR_MULT: f64 = 0.1;
+
+// --- Mock-training loop constants (main.rs lines 135-151, 161) ---
+pub const INITIAL_LOSS: f32 = 10.0;
+pub const MIN_LOSS: f32 = 0.01;
+pub const RNG_MULTIPLIER: u64 = 6364136223846793005;
+pub const NOISE_SCALE: f32 = 0.001;
+pub const LOG_EVERY: u64 = 200;
+pub const METRIC_DUMP_EVERY: u64 = 500;
+
+// --- Routing verdicts returned by main() ---
+pub const ROUTE_NONE: i32 = 0;
+pub const ROUTE_JEPA: i32 = 1;
+pub const ROUTE_MOCK: i32 = 2;
+
+pub enum Schedule { Cosine, PhiWarmup, Flat3e4 }
+
+pub struct Args {
+    model_id: []const u8,
+    steps: u64,
+    batch_size: usize,
+    seq_len: usize,
+    schedule: []const u8,
+    seed: u64,
+    exp_id: []const u8,
+    exp_id_present: bool,
+    repo: []const u8,
+    branch: []const u8,
+    arch: []const u8,
+    hidden: usize,
+    context: usize,
+    lr: f64,
+    lr_present: bool,
+}
+
+pub struct JepaConfig {
+    hidden: usize,
+    context: usize,
+    mask_ratio: f64,
+    min_span: usize,
+    num_spans: usize,
+    ema_start: f64,
+    ema_end: f64,
+    predictor_lr_mult: f64,
+}
+
+pub struct JepaTrainArgs {
+    hidden: usize,
+    context: usize,
+    steps: usize,
+    seed: u64,
+    exp_id: []const u8,
+    exp_id_present: bool,
+}
+
+pub struct TrainConfig {
+    model_id: []const u8,
+    steps: u64,
+    batch_size: usize,
+    seq_len: usize,
+    seed: u64,
+    schedule: Schedule,
+}
+
+pub struct ExperienceEntry {
+    timestamp: u64,
+    exp_name: []const u8,
+    model_id: []const u8,
+    seed: u64,
+    result_json: []const u8,
+}
+
+// Port of main.rs main() (lines 50-62): after clap fills the defaults, the only
+// control decision is the `--arch` routing. Ported as a pure verdict over the
+// argument count and the arch flag; actual argv parsing is clap plumbing.
+pub fn main(argc: u32, arch: []const u8) -> i32 {
+    if (argc < 1) {
+        return ROUTE_NONE;
+    }
+    if (is_jepa_arch(arch)) {
+        return ROUTE_JEPA;
+    }
+    return ROUTE_MOCK;
+}
+
+pub fn is_jepa_arch(arch: []const u8) -> bool {
+    return arch == "jepa";
+}
+
+pub fn default_args() -> Args {
+    return Args {
+        .model_id = "ngram",
+        .steps = DEFAULT_STEPS,
+        .batch_size = DEFAULT_BATCH_SIZE,
+        .seq_len = DEFAULT_SEQ_LEN,
+        .schedule = "cosine",
+        .seed = DEFAULT_SEED,
+        .exp_id = "",
+        .exp_id_present = false,
+        .repo = ".",
+        .branch = "main",
+        .arch = "ngram",
+        .hidden = DEFAULT_HIDDEN,
+        .context = DEFAULT_CONTEXT,
+        .lr = 0.0,
+        .lr_present = false,
+    };
+}
+
+pub fn jepa_config_defaults() -> JepaConfig {
+    return JepaConfig {
+        .hidden = DEFAULT_HIDDEN,
+        .context = DEFAULT_CONTEXT,
+        .mask_ratio = JEPA_MASK_RATIO,
+        .min_span = JEPA_MIN_SPAN,
+        .num_spans = JEPA_NUM_SPANS,
+        .ema_start = JEPA_EMA_START,
+        .ema_end = JEPA_EMA_END,
+        .predictor_lr_mult = JEPA_PREDICTOR_LR_MULT,
+    };
+}
+
+pub fn build_jepa_train_args(hidden: usize, context: usize, steps: u64, seed: u64, exp_id: []const u8, exp_id_present: bool) -> JepaTrainArgs {
+    return JepaTrainArgs {
+        .hidden = hidden,
+        .context = context,
+        .steps = steps as usize,
+        .seed = seed,
+        .exp_id = exp_id,
+        .exp_id_present = exp_id_present,
+    };
+}
+
+pub fn parse_schedule(name: []const u8) -> Schedule {
+    if (name == "cosine") {
+        return Schedule.Cosine;
+    }
+    if (name == "phi_warmup") {
+        return Schedule.PhiWarmup;
+    }
+    if (name == "flat3e4") {
+        return Schedule.Flat3e4;
+    }
+    return Schedule.Cosine;
+}
+
+// Test oracle for enum values (t27 has no enum equality operator).
+fn schedule_code(s: Schedule) -> i32 {
+    return switch (s) {
+        .Cosine => 0,
+        .PhiWarmup => 1,
+        .Flat3e4 => 2,
+    };
+}
+
+pub fn build_train_config(model_id: []const u8, steps: u64, batch_size: usize, seq_len: usize, seed: u64, schedule: Schedule) -> TrainConfig {
+    return TrainConfig {
+        .model_id = model_id,
+        .steps = steps,
+        .batch_size = batch_size,
+        .seq_len = seq_len,
+        .seed = seed,
+        .schedule = schedule,
+    };
+}
+
+pub fn git_sha_or_unknown(git_ok: bool, sha: []const u8) -> []const u8 {
+    if (git_ok) {
+        return sha;
+    }
+    return "unknown";
+}
+
+// Rust `wrapping_mul` for u64: full 64-bit product mod 2^64, rebuilt from 32-bit
+// limbs so that no single t27 multiply can overflow.
+pub fn mul_u64_wrap(a: u64, b: u64) -> u64 {
+    const al: u64 = a % 4294967296;
+    const ah: u64 = a / 4294967296;
+    const bl: u64 = b % 4294967296;
+    const bh: u64 = b / 4294967296;
+    const p: u64 = al * bl;
+    const n: u64 = ((ah * bl) % 4294967296) + ((al * bh) % 4294967296);
+    const mid: u64 = n + p / 4294967296;
+    return ((mid % 4294967296) * 4294967296) + p % 4294967296;
+}
+
+// Rust `wrapping_add` for u64, same limb treatment.
+pub fn add_u64_wrap(a: u64, b: u64) -> u64 {
+    const lo: u64 = (a % 4294967296) + (b % 4294967296);
+    const hi: u64 = (a / 4294967296) + (b / 4294967296) + (lo / 4294967296);
+    return ((hi % 4294967296) * 4294967296) + lo % 4294967296;
+}
+
+// main.rs line 136: state = state.wrapping_mul(6364136223846793005).wrapping_add(1)
+pub fn next_rng_state(state: u64) -> u64 {
+    return add_u64_wrap(mul_u64_wrap(state, RNG_MULTIPLIER), 1);
+}
+
+// main.rs line 142: noise = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5
+pub fn rng_noise(state: u64) -> f32 {
+    return ((state >> 33) as f32) / 4294967295.0 - 0.5;
+}
+
+// main.rs lines 144-146: loss = loss * (1.0 - lr * 10.0) + noise * NOISE_SCALE,
+// floored at MIN_LOSS.
+pub fn step_loss(loss: f32, lr: f32, noise: f32) -> f32 {
+    let updated: f32 = loss * (1.0 - lr * 10.0) + noise * NOISE_SCALE;
+    if (updated < MIN_LOSS) {
+        return MIN_LOSS;
+    }
+    return updated;
+}
+
+// The mock-training loss loop (main.rs lines 135-151) with the tracing output,
+// TrainingAuditLog and dump_metric side effects removed. The lr is a parameter
+// because the original resolves it from args.lr (Option<f64>) at runtime.
+pub fn run_loss_series(seed: u64, steps: u64, lr: f32) -> f32 {
+    var state: u64 = seed;
+    var loss: f32 = INITIAL_LOSS;
+    var i: u64 = 0;
+    while (i < steps) {
+        state = next_rng_state(state);
+        loss = step_loss(loss, lr, rng_noise(state));
+        i = i + 1;
+    }
+    return loss;
+}
+
+// main.rs line 153: `if step % LOG_EVERY == 0` gates the per-200-steps log line.
+pub fn should_log_step(step: u64) -> bool {
+    return step % LOG_EVERY == 0;
+}
+
+// main.rs line 161: `if step % METRIC_DUMP_EVERY == 0` gates audit.dump_metric.
+pub fn should_dump_metric(step: u64) -> bool {
+    return step % METRIC_DUMP_EVERY == 0;
+}
+
+// main.rs line 183: exp_name = exp_id.unwrap_or("training")
+pub fn exp_name_for(exp_id_present: bool, exp_id: []const u8) -> []const u8 {
+    if (exp_id_present) {
+        return exp_id;
+    }
+    return "training";
+}
+
+pub fn build_experience_entry(timestamp: u64, exp_id_present: bool, exp_id: []const u8, model_id: []const u8, seed: u64, result_json: []const u8) -> ExperienceEntry {
+    return ExperienceEntry {
+        .timestamp = timestamp,
+        .exp_name = exp_name_for(exp_id_present, exp_id),
+        .model_id = model_id,
+        .seed = seed,
+        .result_json = result_json,
+    };
+}
+
+// Port of main.rs run_jepa_arch (lines 64-96): builds JepaConfig + JepaTrainArgs
+// (both ported above as pure helpers), calls the crate-external run_jepa_training,
+// logs "jepa_training_complete bpb=..." and writes the experience log.
+pub fn run_jepa_arch(args: Args) -> void {
+    // Side effects: run_jepa_training call, tracing log, experience-log write (undefined)
+    let _ = undefined;
+}
+
+// Port of main.rs run_mock_training (lines 98-178): the schedule mapping, config
+// assembly and the LCG/noise/loss math are ported above as pure helpers; the
+// training loop itself only produces tracing output, TrainingAuditLog records and
+// dump_metric calls, so the orchestration stays a plumbing stub.
+pub fn run_mock_training(config: TrainConfig, git_sha: []const u8) -> void {
+    // Side effects: tracing output, TrainingAuditLog, dump_metric (undefined)
+    let _ = undefined;
+}
+
+// Port of main.rs write_experience_log (lines 180-206): the entry shape is ported
+// above; the wall-clock timestamp, the .trinity/experience directory creation and
+// the trios_YYYYMMDD.trinity append are filesystem side effects and stay stubbed.
+pub fn write_experience_log(exp_id_present: bool, exp_id: []const u8, model_id: []const u8, seed: u64, result_json: []const u8) -> void {
+    // Side effects: timestamp, fs::create_dir_all, file append (undefined)
+    let _ = undefined;
+}
+
+test main_routes_arch_by_flag {
+    assert(main(0, "jepa") == ROUTE_NONE);
+    assert(main(1, "jepa") == ROUTE_JEPA);
+    assert(main(1, "ngram") == ROUTE_MOCK);
+    assert(main(1, "transformer") == ROUTE_MOCK);
+    assert(is_jepa_arch("jepa") == true);
+    assert(is_jepa_arch("ngram") == false);
+}
+
+test clap_defaults_match_original {
+    let a: Args = default_args();
+    assert(a.model_id == "ngram");
+    assert(a.steps == 1000);
+    assert(a.batch_size == 4);
+    assert(a.seq_len == 128);
+    assert(a.schedule == "cosine");
+    assert(a.seed == 42);
+    assert(a.exp_id_present == false);
+    assert(a.repo == ".");
+    assert(a.branch == "main");
+    assert(a.arch == "ngram");
+    assert(a.hidden == 256);
+    assert(a.context == 6);
+    assert(a.lr_present == false);
+}
+
+test jepa_config_literals_from_args {
+    let c: JepaConfig = jepa_config_defaults();
+    assert(c.hidden == 256);
+    assert(c.context == 6);
+    assert(c.mask_ratio == 0.3);
+    assert(c.min_span == 1);
+    assert(c.num_spans == 2);
+    assert(c.ema_start == 0.996);
+    assert(c.ema_end == 1.0);
+    assert(c.predictor_lr_mult == 0.1);
+}
+
+test jepa_train_args_pack {
+    let a: JepaTrainArgs = build_jepa_train_args(512, 8, 3000, 7, "exp-123", true);
+    assert(a.hidden == 512);
+    assert(a.context == 8);
+    assert(a.steps == 3000);
+    assert(a.seed == 7);
+    assert(a.exp_id == "exp-123");
+    assert(a.exp_id_present == true);
+}
+
+test schedule_string_maps_with_fallback {
+    assert(schedule_code(parse_schedule("cosine")) == 0);
+    assert(schedule_code(parse_schedule("phi_warmup")) == 1);
+    assert(schedule_code(parse_schedule("flat3e4")) == 2);
+    assert(schedule_code(parse_schedule("linear")) == 0);
+    assert(schedule_code(parse_schedule("")) == 0);
+}
+
+test train_config_from_args {
+    let c: TrainConfig = build_train_config("ngram", 1000, 4, 128, 42, Schedule.PhiWarmup);
+    assert(c.model_id == "ngram");
+    assert(c.steps == 1000);
+    assert(c.batch_size == 4);
+    assert(c.seq_len == 128);
+    assert(c.seed == 42);
+    assert(schedule_code(c.schedule) == 1);
+}
+
+test git_sha_falls_back_to_unknown {
+    assert(git_sha_or_unknown(true, "eafe700af") == "eafe700af");
+    assert(git_sha_or_unknown(false, "eafe700af") == "unknown");
+}
+
+test rng_lcg_wraps_like_rust {
+    // Ground truth computed with Python: (state * 6364136223846793005 + 1) % 2**64
+    assert(next_rng_state(0) == 1);
+    assert(next_rng_state(1) == 6364136223846793006);
+    assert(next_rng_state(18446744073709551615) == 12082607849862758612);
+    assert(mul_u64_wrap(6364136223846793005, 6364136223846793005) == 7520897724310334953);
+    assert(add_u64_wrap(18446744073709551615, 1) == 0);
+    assert(next_rng_state(next_rng_state(next_rng_state(7))) == 995417631842978762);
+}
+
+test rng_noise_matches_formula {
+    assert(rng_noise(0) == -0.5);
+    assert(rng_noise(18446744069414584320) == 0.0);
+    assert(rng_noise(9223372036854775807) == -0.25);
+}
+
+test loss_step_update_and_floor {
+    assert(step_loss(10.0, 0.05, 0.0) == 5.0);
+    assert(step_loss(0.005, 0.0, 0.0) == 0.01);
+    assert(step_loss(0.01, 0.0, 0.0) == 0.01);
+    assert(step_loss(1.0, 0.0, 0.5) == 1.0005);
+}
+
+test loss_series_matches_rust_math {
+    // Exact f32 expectations computed with Python's struct.pack float32 model of
+    // the original update rule.
+    assert(run_loss_series(42, 0, 0.05) == 10.0);
+    assert(run_loss_series(42, 1, 0.0) == 9.99974536895752);
+    assert(run_loss_series(42, 3, 0.0) == 9.999258995056152);
+    assert(run_loss_series(42, 1000, 0.05) >= 0.01);
+    assert(run_loss_series(42, 1000, 0.05) < 10.0);
+}
+
+test log_and_dump_cadence {
+    assert(should_log_step(0) == true);
+    assert(should_log_step(199) == false);
+    assert(should_log_step(200) == true);
+    assert(should_dump_metric(499) == false);
+    assert(should_dump_metric(500) == true);
+    assert(should_dump_metric(1000) == true);
+}
+
+test experience_entry_carries_fields {
+    let e: ExperienceEntry = build_experience_entry(1710000000, true, "exp-9", "igla-gf16", 42, "{\"bpb\":1.42}");
+    assert(e.timestamp == 1710000000);
+    assert(e.exp_name == "exp-9");
+    assert(e.model_id == "igla-gf16");
+    assert(e.seed == 42);
+    assert(e.result_json == "{\"bpb\":1.42}");
+    let f: ExperienceEntry = build_experience_entry(1710000000, false, "", "igla-gf16", 42, "{}");
+    assert(f.exp_name == "training");
+}
+
+test exp_name_defaults_to_training {
+    assert(exp_name_for(true, "custom") == "custom");
+    assert(exp_name_for(false, "custom") == "training");
+}
