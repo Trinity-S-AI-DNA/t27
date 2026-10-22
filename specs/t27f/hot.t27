@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/hot.t27 -- when a saved spec is exported again, and what the browser is told. Issue
+; gHashTag/t27#10232. T27F hot reload: spec -> SpecGraph IR -> view, redrawn after a save.
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/reuse.t27 decides whether a sealed artifact may be reused: part_reason, and MISSING never
+;   means SAME. This file asks the same question of an export and calls part_reason for it.
+; - specs/verified/seal_identity.t27 recorded_part turns "was it recorded, is it equal" into a part.
+; - specs/verified/watch.t27 watch_take caps how many specs one look reruns. The cap is used as it is.
+; - specs/t27f/spec_graph_export.t27 is the exporter. It is a pure function of the spec bytes, so an export
+;   depends on exactly two things: the bytes of the spec and the bytes of the exporter (the wasm).
+; --
+; The key. An export is reusable when BOTH are unchanged: the sha256 of the spec bytes and the sha256 of the
+; exporter wasm, written as 64 lowercase hex digits each and joined by KEY_SEP. This file computes no hash;
+; the host does, and refuses a digest that is not DIGEST_HEX_LEN long. The path is not part of the key: the
+; same bytes at two paths export the same graph up to the path label, and the host keeps the path beside it.
+; --
+; The decision. The spec part is judged first, then the exporter, as reuse_decision orders its parts, so the
+; same pair of records always gives the same reason. A part never recorded is MISSING and never SAME: a spec
+; that was never exported is exported, it is not assumed fresh.
+; --
+; The debounce. An editor saves by write-then-rename, so one save is two or three file events a few
+; milliseconds apart. A burst is ready after HOT_DEBOUNCE_MS of quiet, or HOT_MAX_WAIT_MS after its first
+; event when the events never stop. The wait is a number a timer can use, not a yes or no a loop must poll.
+; --
+; The budget. The save-to-redraw target is HOT_BUDGET_MS. Measured on the Railway lab, 2026-10-18, over the
+; 2227 specs of gHashTag/t27 (fdb6b28): the slowest single export is 18.83 ms (t27core_ddc.t27, 1.36 MB), the
+; median 0.09 ms, so the export is not what the budget is spent on. The transport allowance (fs event, SSE
+; write, browser redraw) is an ASSUMPTION, not a measurement; the host change measures it end to end.
+; Not claimed: that a hub save, which changes many files, stays inside the budget -- it exports a batch per
+; look (hot_take), and 16 slow files are 300 ms. The budget is for one saved file.
+; --
+; The record. One event per exported file, named HOT_EVENT, carrying the HOT_FIELDS in that order. A save that
+; changes nothing (decision REUSE) broadcasts nothing; a client that connects, or asks for one graph, is sent
+; the current state with cache=hit.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fHot;
+
+use verified::reuse;
+use verified::seal_identity::recorded_part;
+use verified::watch::watch_take;
+use verified::watch::WATCH_BATCH;
+
+/// Joins the spec digest and the exporter digest into the key. Hex never holds a colon.
+pub const KEY_SEP : str = ":";
+
+/// A sha256 written as lowercase hex.
+pub const DIGEST_HEX_LEN : u32 = 64;
+
+/// The save-to-redraw target for one saved file, in milliseconds.
+pub const HOT_BUDGET_MS : u32 = 100;
+
+/// Quiet time that ends a burst of file events.
+pub const HOT_DEBOUNCE_MS : u32 = 20;
+
+/// A burst that never goes quiet is exported this long after its first event.
+pub const HOT_MAX_WAIT_MS : u32 = 60;
+
+/// The slowest single export measured over the corpus, rounded up (18.83 ms).
+pub const HOT_WORST_EXPORT_MS : u32 = 19;
+
+/// What the fs event, the SSE write and the browser redraw may take together. Assumed, see the header.
+pub const HOT_TRANSPORT_MS : u32 = 40;
+
+/// hot_decision() answers.
+pub const HOT_REUSE : u8 = 0;
+pub const HOT_REBUILD_SPEC : u8 = 1;
+pub const HOT_REBUILD_EXPORTER : u8 = 2;
+pub const HOT_MISSING : u8 = 3;
+
+/// Whether an export was served from the cache (hit) or run (miss).
+pub const CACHE_MISS : u8 = 0;
+pub const CACHE_HIT : u8 = 1;
+
+/// The SSE event name.
+pub const HOT_EVENT : str = "t27f";
+
+/// The fields of one record, in order.
+pub const HOT_FIELDS : [8]str = [
+    "path",
+    "digest",
+    "nodes",
+    "edges",
+    "verdict",
+    "cache",
+    "export_ms",
+    "decision"
+];
+
+/// The decision names carried in the `decision` field, indexed by the HOT_* answers.
+pub const HOT_DECISION_NAMES : [4]str = [
+    "reuse",
+    "rebuild_spec",
+    "rebuild_exporter",
+    "missing"
+];
+
+/// The cache values carried in the `cache` field, indexed by CACHE_*.
+pub const HOT_CACHE_NAMES : [2]str = [
+    "miss",
+    "hit"
+];
+
+/// A digest the host may key on: exactly DIGEST_HEX_LEN characters.
+pub fn digest_ok(len: u32) -> bool {
+    return len == DIGEST_HEX_LEN;
+}
+
+/// The length of a key built from two digests and the separator.
+pub fn hot_key_len() -> u32 {
+    return DIGEST_HEX_LEN + 1 + DIGEST_HEX_LEN;
+}
+
+/// The reuse answer mapped to this file's names. The exporter is the toolchain of an export.
+pub fn hot_from_reuse(r: u8) -> u8 {
+    if (r == REUSE) { return HOT_REUSE; }
+    if (r == REBUILD_SPEC) { return HOT_REBUILD_SPEC; }
+    if (r == REBUILD_TOOLCHAIN) { return HOT_REBUILD_EXPORTER; }
+    return HOT_MISSING;
+}
+
+/// Reuse the last export, or the first reason it must be run again (spec, then exporter). A part is
+/// recorded when the cache holds an export made from it, and equal when its digest is the cached one.
+pub fn hot_decision(spec_recorded: bool, spec_equal: bool, exporter_recorded: bool, exporter_equal: bool) -> u8 {
+    var r : u8 = part_reason(recorded_part(spec_recorded, spec_equal), REBUILD_SPEC);
+    if (r != REUSE) { return hot_from_reuse(r); }
+    r = part_reason(recorded_part(exporter_recorded, exporter_equal), REBUILD_TOOLCHAIN);
+    return hot_from_reuse(r);
+}
+
+/// Milliseconds to wait before the burst is exported: the shorter of what is left of the quiet window and
+/// of the maximum wait. quiet_ms is the time since the last event, waited_ms the time since the first.
+pub fn hot_wait_ms(quiet_ms: u32, waited_ms: u32) -> u32 {
+    var quiet_left : u32 = 0;
+    if (quiet_ms < HOT_DEBOUNCE_MS) { quiet_left = HOT_DEBOUNCE_MS - quiet_ms; }
+    var wait_left : u32 = 0;
+    if (waited_ms < HOT_MAX_WAIT_MS) { wait_left = HOT_MAX_WAIT_MS - waited_ms; }
+    if (quiet_left < wait_left) { return quiet_left; }
+    return wait_left;
+}
+
+/// The burst is exported now.
+pub fn hot_ready(quiet_ms: u32, waited_ms: u32) -> bool {
+    return hot_wait_ms(quiet_ms, waited_ms) == 0;
+}
+
+/// How many of `changed` files one look exports; the rest stay changed for the next look.
+pub fn hot_take(changed: u32) -> u32 {
+    return watch_take(changed);
+}
+
+/// A record is broadcast when the export was run, or when it replays the current state to a client.
+pub fn hot_emits(decision: u8, replay: bool) -> bool {
+    if (replay) { return true; }
+    return decision != HOT_REUSE;
+}
+
+/// The cache value of a record: a hit when the last export is reused.
+pub fn hot_cache(decision: u8) -> u8 {
+    if (decision == HOT_REUSE) { return CACHE_HIT; }
+    return CACHE_MISS;
+}
+
+test the_decision_reuses_only_when_both_parts_are_recorded_and_equal {
+    assert hot_decision(true, true, true, true) == HOT_REUSE;
+    assert hot_decision(true, false, true, true) == HOT_REBUILD_SPEC;
+    assert hot_decision(true, true, true, false) == HOT_REBUILD_EXPORTER;
+}
+
+test a_never_exported_spec_is_missing_not_fresh {
+    assert hot_decision(false, false, true, true) == HOT_MISSING;
+    assert hot_decision(false, true, true, true) == HOT_MISSING;
+    assert hot_decision(true, true, false, false) == HOT_MISSING;
+    assert hot_decision(false, false, false, false) == HOT_MISSING;
+}
+
+test the_spec_is_judged_before_the_exporter {
+    // both changed: the reason is the spec, as in reuse_decision's order
+    assert hot_decision(true, false, true, false) == HOT_REBUILD_SPEC;
+    // the spec changed and the exporter was never recorded: still the spec
+    assert hot_decision(true, false, false, false) == HOT_REBUILD_SPEC;
+    // the spec was never recorded and the exporter changed: missing
+    assert hot_decision(false, false, true, false) == HOT_MISSING;
+}
+
+test the_answers_follow_the_reuse_rule_they_are_built_on {
+    assert hot_from_reuse(REUSE) == HOT_REUSE;
+    assert hot_from_reuse(REBUILD_SPEC) == HOT_REBUILD_SPEC;
+    assert hot_from_reuse(REBUILD_TOOLCHAIN) == HOT_REBUILD_EXPORTER;
+    assert hot_from_reuse(REBUILD_MISSING) == HOT_MISSING;
+    // an answer an export cannot give is not a reuse
+    assert hot_from_reuse(REBUILD_CLOSURE) == HOT_MISSING;
+    assert hot_from_reuse(REBUILD_VERDICT) == HOT_MISSING;
+    assert HOT_REUSE == REUSE;
+}
+
+test a_digest_is_sixty_four_hex_characters {
+    assert digest_ok(64) == true;
+    assert digest_ok(63) == false;
+    assert digest_ok(65) == false;
+    assert digest_ok(0) == false;
+    assert hot_key_len() == 129;
+}
+
+test one_save_is_one_burst {
+    // an editor writes, then renames, 5 ms later: the quiet window has not passed
+    assert hot_ready(0, 0) == false;
+    assert hot_ready(5, 5) == false;
+    assert hot_wait_ms(5, 5) == 15;
+    // 20 ms of quiet ends the burst
+    assert hot_ready(20, 25) == true;
+    assert hot_wait_ms(20, 25) == 0;
+}
+
+test a_burst_that_never_goes_quiet_is_exported_at_the_maximum_wait {
+    assert hot_ready(1, 59) == false;
+    assert hot_wait_ms(1, 59) == 1;
+    assert hot_ready(1, 60) == true;
+    assert hot_ready(0, 500) == true;
+}
+
+test a_hub_save_exports_a_batch_per_look {
+    assert hot_take(1) == 1;
+    assert hot_take(WATCH_BATCH) == WATCH_BATCH;
+    assert hot_take(300) == WATCH_BATCH;
+    assert hot_take(0) == 0;
+}
+
+test a_save_that_changes_nothing_broadcasts_nothing {
+    assert hot_emits(HOT_REUSE, false) == false;
+    assert hot_emits(HOT_REBUILD_SPEC, false) == true;
+    assert hot_emits(HOT_REBUILD_EXPORTER, false) == true;
+    assert hot_emits(HOT_MISSING, false) == true;
+}
+
+test a_client_that_connects_is_sent_the_current_state {
+    assert hot_emits(HOT_REUSE, true) == true;
+    assert hot_cache(HOT_REUSE) == CACHE_HIT;
+    assert hot_cache(HOT_REBUILD_SPEC) == CACHE_MISS;
+    assert hot_cache(HOT_MISSING) == CACHE_MISS;
+}
+
+test the_record_names_line_up_with_their_codes {
+    assert HOT_FIELDS.len == 8;
+    assert HOT_FIELDS[0] == "path";
+    assert HOT_FIELDS[7] == "decision";
+    assert HOT_DECISION_NAMES.len == 4;
+    assert HOT_DECISION_NAMES[HOT_REUSE] == "reuse";
+    assert HOT_DECISION_NAMES[HOT_REBUILD_SPEC] == "rebuild_spec";
+    assert HOT_DECISION_NAMES[HOT_REBUILD_EXPORTER] == "rebuild_exporter";
+    assert HOT_DECISION_NAMES[HOT_MISSING] == "missing";
+    assert HOT_CACHE_NAMES[CACHE_MISS] == "miss";
+    assert HOT_CACHE_NAMES[CACHE_HIT] == "hit";
+    assert HOT_EVENT == "t27f";
+}
+
+invariant one_saved_file_fits_the_budget {
+    assert HOT_DEBOUNCE_MS + HOT_WORST_EXPORT_MS + HOT_TRANSPORT_MS <= HOT_BUDGET_MS;
+}
+
+invariant the_maximum_wait_outlasts_the_quiet_window {
+    assert HOT_MAX_WAIT_MS > HOT_DEBOUNCE_MS;
+    assert HOT_DEBOUNCE_MS > 0;
+}
+
+invariant only_a_recorded_equal_pair_reuses {
+    assert HOT_REUSE == 0;
+    assert HOT_REBUILD_SPEC != HOT_REBUILD_EXPORTER;
+    assert HOT_MISSING != HOT_REUSE;
+    assert CACHE_MISS != CACHE_HIT;
+}
