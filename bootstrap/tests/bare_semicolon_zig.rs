@@ -107,7 +107,8 @@ fn a_call_statement_keeps_its_semicolon_and_is_not_a_notice() {
     let src = "module m\n\nfn side(x: u32) -> u32 {\n    return x\n}\n\ntest t {\n    side(1);\n    assert_eq(side(2), 2);\n}\n";
     let z = gen_zig(src);
     assert!(
-        z.lines().any(|l| l.trim() == "side(1);"),
+        // `side` returns u32, so Zig needs the value discarded (#6315).
+        z.lines().any(|l| l.trim() == "_ = side(1);"),
         "a bare call statement lost its semicolon or became a notice:\n{z}"
     );
     assert!(
@@ -192,4 +193,13 @@ fn zig_accepts_the_generated_file() {
         out.status.success(),
         "zig rejected the generated file:\n{err}\n--- source ---\n{z}"
     );
+}
+
+/// #8980: a bench budget `then elapsed_time_ns < 100` named a clock no Zig 0.16 test has, and the
+/// undeclared identifier killed the whole file. Like a prose body, it becomes a notice.
+#[test]
+fn a_bench_clock_budget_is_a_notice_not_an_undeclared_name() {
+    let zig = gen_zig("module m;\nconst K : u32 = 3;\ntest t\n    given k = K\n    then k == 3\nbench b\n    given k = K\n    then elapsed_time_ns < 100\n");
+    assert!(!zig.contains("(elapsed_time_ns"), "{zig}");
+    assert!(zig.contains("// bench budget not lowered: elapsed_time_* has no clock here (#8980)"), "{zig}");
 }
