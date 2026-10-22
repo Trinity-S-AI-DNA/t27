@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/arena_heap.t27 -- a bump (arena) allocator model over a fixed backing array.
+; Part of gHashTag/t27#10024 (our own model), cell 24 "Heap and file I/O in t27c"; issue #10077.
+
+; WHY: training an HSLM needs buffers whose size is known only when the run starts (Adam moments,
+; activations, a data batch). t27 has no heap, and the lab shows it: specs/ml/optimizer/adamw.t27
+; calls allocate_array and is BLOCKED ("use of undeclared identifier 'allocate_array'"). The HSLM
+; spec (specs/nn/hslm.t27) gets around it with module storage (`var model : HSLMWeights`), which
+; fixes every size at compile time. An arena is the smallest thing that keeps one backing array
+; and hands out non-overlapping pieces of it, so a trainer can pick its sizes at run time.
+
+; WHAT THIS MODELS: the allocator is a value. `Arena` holds four integers and no memory; the
+; memory is a caller-owned `[]f32` backing array, and an allocation is an OFFSET into it, in
+; f32 slots (not bytes). alloc never traps: out of memory, a bad size and a bad alignment come
+; back as an error code with the arena unchanged. reset forgets every allocation but keeps the
+; high-water mark, which is how a trainer learns what capacity the next run needs.
+
+; WHAT t27c WOULD HAVE TO DO (the contract, not an implementation): lower `Arena` to the struct
+; below, lower `arena_alloc` to this exact arithmetic, and hand a trainer a backing array it
+; owns. specs/ml/file_io_contract.t27 is the twin for files. The Rust work is its own issue and
+; waits for the owner's owner-approved-foreign label; nothing here needs it.
+
+; Not claimed: no thread safety, no free of a single block (use arena_mark and arena_release for
+; scratch space), no bytes: sizes and offsets count f32 slots.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module arena_heap;
+
+pub const ARENA_OK : i32 = 0;
+pub const ARENA_ERR_OOM : i32 = 1;
+pub const ARENA_ERR_SIZE : i32 = 2;
+pub const ARENA_ERR_ALIGN : i32 = 3;
+pub const ARENA_ERR_MARK : i32 = 4;
+
+/// The offset an allocation returns when it fails; no real offset is negative.
+pub const ARENA_NO_OFFSET : i32 = -1;
+
+/// cap: slots in the backing array; top: first free slot; high: the largest top ever reached;
+/// resets: how many times reset ran.
+pub const Arena = struct {
+    cap : i32,
+    top : i32,
+    high : i32,
+    resets : i32,
+};
+
+/// offset is ARENA_NO_OFFSET whenever code is not ARENA_OK, and then arena is the arena that went in.
+pub const AllocResult = struct {
+    arena : Arena,
+    offset : i32,
+    code : i32,
+};
+
+/// Two equal-sized buffers for an optimizer's first and second moments.
+pub const MomentsResult = struct {
+    arena : Arena,
+    m_off : i32,
+    v_off : i32,
+    code : i32,
+};
+
+pub fn arena_new(cap: i32) -> Arena {
+    return Arena{ .cap = cap, .top = 0, .high = 0, .resets = 0 };
+}
+
+pub fn arena_used(a: Arena) -> i32 {
+    return a.top;
+}
+
+pub fn arena_left(a: Arena) -> i32 {
+    return a.cap - a.top;
+}
+
+pub fn arena_high_water(a: Arena) -> i32 {
+    return a.high;
+}
+
+/// Is n a positive power of two? Alignment must be one.
+pub fn is_pow2(n: i32) -> bool {
+    if (n < 1) {
+        return false;
+    }
+    var m : i32 = n;
+    while (m > 1) {
+        if (@mod(m, 2) != 0) {
+            return false;
+        }
+        m = @divTrunc(m, 2);
+    }
+    return true;
+}
+
+/// Smallest multiple of alignment that is >= x. alignment must be a positive power of two.
+pub fn align_up(x: i32, alignment: i32) -> i32 {
+    return @divTrunc(x + alignment - 1, alignment) * alignment;
+}
+
+fn failed(a: Arena, code: i32) -> AllocResult {
+    return AllocResult{ .arena = a, .offset = ARENA_NO_OFFSET, .code = code };
+}
+
+/// Take size slots, the first at a multiple of alignment. Never traps; on any error the arena is
+/// returned unchanged. The size test is against what is left, not top + size, so a size near
+/// the i32 maximum cannot overflow into a "fits".
+pub fn arena_alloc(a: Arena, size: i32, alignment: i32) -> AllocResult {
+    if (size < 1) {
+        return failed(a, ARENA_ERR_SIZE);
+    }
+    if (is_pow2(alignment) == false) {
+        return failed(a, ARENA_ERR_ALIGN);
+    }
+    const start : i32 = align_up(a.top, alignment);
+    if (start > a.cap) {
+        return failed(a, ARENA_ERR_OOM);
+    }
+    if (size > a.cap - start) {
+        return failed(a, ARENA_ERR_OOM);
+    }
+    const end : i32 = start + size;
+    var high : i32 = a.high;
+    if (end > high) {
+        high = end;
+    }
+    return AllocResult{
+        .arena = Arena{ .cap = a.cap, .top = end, .high = high, .resets = a.resets },
+        .offset = start,
+        .code = ARENA_OK
+    };
+}
+
+/// Forget every allocation. The high-water mark stays: it measures the whole run.
+pub fn arena_reset(a: Arena) -> Arena {
+    return Arena{ .cap = a.cap, .top = 0, .high = a.high, .resets = a.resets + 1 };
+}
+
+/// A mark is the current top. Release to a mark frees everything allocated after it.
+pub fn arena_mark(a: Arena) -> i32 {
+    return a.top;
+}
+
+/// Free back to a mark taken earlier. A mark above top (or below 0) is ARENA_ERR_MARK and the
+/// arena comes back unchanged; releasing to top is a no-op.
+pub fn arena_release(a: Arena, mark: i32) -> AllocResult {
+    if (mark < 0) {
+        return failed(a, ARENA_ERR_MARK);
+    }
+    if (mark > a.top) {
+        return failed(a, ARENA_ERR_MARK);
+    }
+    return AllocResult{
+        .arena = Arena{ .cap = a.cap, .top = mark, .high = a.high, .resets = a.resets },
+        .offset = mark,
+        .code = ARENA_OK
+    };
+}
+
+pub fn fill_slots(backing: []f32, from: i32, n: i32, value: f32) -> void {
+    var i : i32 = 0;
+    while (i < n) {
+        backing[@intCast(from + i)] = value;
+        i = i + 1;
+    }
+}
+
+/// The optimizer use: take two buffers of n slots for adam/adamw moments, both or neither.
+/// Both start at zero in the backing array. If the second does not fit, the arena and the
+/// backing array are exactly as they came in.
+pub fn moments_alloc(a: Arena, backing: []f32, n: i32) -> MomentsResult {
+    const first : AllocResult = arena_alloc(a, n, 1);
+    if (first.code != ARENA_OK) {
+        return MomentsResult{ .arena = a, .m_off = ARENA_NO_OFFSET, .v_off = ARENA_NO_OFFSET, .code = first.code };
+    }
+    const second : AllocResult = arena_alloc(first.arena, n, 1);
+    if (second.code != ARENA_OK) {
+        return MomentsResult{ .arena = a, .m_off = ARENA_NO_OFFSET, .v_off = ARENA_NO_OFFSET, .code = second.code };
+    }
+    fill_slots(backing, first.offset, n, 0.0);
+    fill_slots(backing, second.offset, n, 0.0);
+    return MomentsResult{ .arena = second.arena, .m_off = first.offset, .v_off = second.offset, .code = ARENA_OK };
+}
+
+// ---- helpers that exist only so the tests go through function calls ----
+
+fn alloc_offset(cap: i32, size: i32, alignment: i32) -> i32 {
+    return arena_alloc(arena_new(cap), size, alignment).offset;
+}
+
+fn alloc_code(cap: i32, size: i32, alignment: i32) -> i32 {
+    return arena_alloc(arena_new(cap), size, alignment).code;
+}
+
+/// Three allocations of 10, 5 (aligned to 4) and 3: returns the arena after them.
+fn three_allocs() -> Arena {
+    const r1 : AllocResult = arena_alloc(arena_new(100), 10, 1);
+    const r2 : AllocResult = arena_alloc(r1.arena, 5, 4);
+    const r3 : AllocResult = arena_alloc(r2.arena, 3, 1);
+    return r3.arena;
+}
+
+/// Moments of n=4 in a backing array of 16 slots that held 9.0 everywhere. Writes 2.5 into
+/// m[1] and 7.5 into v[2]; returns the sum of every slot of m and v, so a zero-fill that missed
+/// a slot, or an overlap between m and v, changes the number.
+fn moments_sum() -> f32 {
+    var backing : [16]f32 = undefined;
+    fill_slots(&backing, 0, 16, 9.0);
+    const r : MomentsResult = moments_alloc(arena_new(16), &backing, 4);
+    backing[@intCast(r.m_off + 1)] = 2.5;
+    backing[@intCast(r.v_off + 2)] = 7.5;
+    var sum : f32 = 0.0;
+    var i : i32 = 0;
+    while (i < 4) {
+        sum = sum + backing[@intCast(r.m_off + i)] + backing[@intCast(r.v_off + i)];
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// A failed moments_alloc must not touch the backing array: slot 0 stays 9.0.
+fn backing_after_failed_moments() -> f32 {
+    var backing : [16]f32 = undefined;
+    fill_slots(&backing, 0, 16, 9.0);
+    const r : MomentsResult = moments_alloc(arena_new(7), &backing, 4);
+    return backing[0] + backing[4];
+}
+
+/// The code and the top of a moments_alloc of n slots into capacity cap, as code * 1000 + top.
+fn moments_outcome(cap: i32, n: i32) -> i32 {
+    var backing : [16]f32 = undefined;
+    fill_slots(&backing, 0, 16, 9.0);
+    const r : MomentsResult = moments_alloc(arena_new(cap), &backing, n);
+    return r.code * 1000 + r.arena.top;
+}
+
+test a_fresh_arena_is_empty {
+    const a : Arena = arena_new(100);
+    assert arena_used(a) == 0;
+    assert arena_left(a) == 100;
+    assert arena_high_water(a) == 0;
+    assert a.resets == 0;
+}
+
+test alloc_returns_offsets_that_do_not_overlap {
+    const a : Arena = three_allocs();
+    // 10 at 0, then 5 aligned to 4 starts at 12 (slots 10 and 11 are padding), ends at 17,
+    // then 3 at 17 ends at 20
+    assert a.top == 20;
+    assert arena_left(a) == 80;
+    assert arena_high_water(a) == 20;
+    const r1 : AllocResult = arena_alloc(arena_new(100), 10, 1);
+    assert r1.offset == 0;
+    const r2 : AllocResult = arena_alloc(r1.arena, 5, 4);
+    assert r2.offset == 12;
+    assert r2.arena.top == 17;
+    const r3 : AllocResult = arena_alloc(r2.arena, 3, 1);
+    assert r3.offset == 17;
+}
+
+test alignment_pads_to_a_multiple {
+    assert align_up(0, 8) == 0;
+    assert align_up(1, 8) == 8;
+    assert align_up(8, 8) == 8;
+    assert align_up(9, 8) == 16;
+    assert align_up(13, 1) == 13;
+    assert alloc_offset(100, 4, 16) == 0;
+    const r1 : AllocResult = arena_alloc(arena_new(100), 4, 1);
+    const r2 : AllocResult = arena_alloc(r1.arena, 4, 16);
+    assert r2.offset == 16;
+    assert r2.arena.top == 20;
+}
+
+test an_exact_fit_succeeds_and_one_more_is_out_of_memory {
+    const r1 : AllocResult = arena_alloc(arena_new(100), 83, 1);
+    const r2 : AllocResult = arena_alloc(r1.arena, 17, 1);
+    assert r2.code == ARENA_OK;
+    assert r2.arena.top == 100;
+    assert arena_left(r2.arena) == 0;
+    const r3 : AllocResult = arena_alloc(r2.arena, 1, 1);
+    assert r3.code == ARENA_ERR_OOM;
+    assert r3.offset == ARENA_NO_OFFSET;
+    // the failed call returns the arena that went in
+    assert r3.arena.top == 100;
+    assert r3.arena.high == 100;
+}
+
+test out_of_memory_is_a_code_not_a_trap {
+    assert alloc_code(100, 101, 1) == ARENA_ERR_OOM;
+    assert alloc_offset(100, 101, 1) == ARENA_NO_OFFSET;
+    // the largest i32 must not wrap around into "fits"
+    assert alloc_code(100, 2147483647, 1) == ARENA_ERR_OOM;
+    // padding to the alignment can itself push the start past the end
+    const r1 : AllocResult = arena_alloc(arena_new(10), 9, 1);
+    const r2 : AllocResult = arena_alloc(r1.arena, 1, 16);
+    assert r2.code == ARENA_ERR_OOM;
+    assert r2.arena.top == 9;
+    // an empty arena of capacity 0 refuses everything
+    assert alloc_code(0, 1, 1) == ARENA_ERR_OOM;
+}
+
+test a_bad_size_or_alignment_is_a_code {
+    assert alloc_code(100, 0, 1) == ARENA_ERR_SIZE;
+    assert alloc_code(100, -5, 1) == ARENA_ERR_SIZE;
+    assert alloc_code(100, 4, 0) == ARENA_ERR_ALIGN;
+    assert alloc_code(100, 4, 3) == ARENA_ERR_ALIGN;
+    assert alloc_code(100, 4, -2) == ARENA_ERR_ALIGN;
+    assert alloc_code(100, 4, 12) == ARENA_ERR_ALIGN;
+    assert alloc_code(100, 4, 64) == ARENA_OK;
+    assert is_pow2(1);
+    assert is_pow2(2);
+    assert is_pow2(1024);
+    assert is_pow2(6) == false;
+    assert is_pow2(0) == false;
+}
+
+test the_high_water_mark_survives_reset {
+    const a : Arena = three_allocs();
+    assert a.high == 20;
+    const b : Arena = arena_reset(a);
+    assert b.top == 0;
+    assert b.high == 20;
+    assert b.resets == 1;
+    assert arena_left(b) == 100;
+    // after a reset the first allocation is at offset 0 again
+    const r : AllocResult = arena_alloc(b, 6, 1);
+    assert r.offset == 0;
+    // a smaller second run does not lower the mark
+    assert r.arena.high == 20;
+    // a larger one raises it
+    const big : AllocResult = arena_alloc(b, 64, 1);
+    assert big.arena.high == 64;
+    assert big.arena.resets == 1;
+}
+
+test release_to_a_mark_frees_scratch_space {
+    const r1 : AllocResult = arena_alloc(arena_new(100), 10, 1);
+    const m : i32 = arena_mark(r1.arena);
+    assert m == 10;
+    const scratch : AllocResult = arena_alloc(r1.arena, 30, 1);
+    assert scratch.offset == 10;
+    assert scratch.arena.top == 40;
+    const back : AllocResult = arena_release(scratch.arena, m);
+    assert back.code == ARENA_OK;
+    assert back.arena.top == 10;
+    // the mark of the run stays at 40
+    assert back.arena.high == 40;
+    // the freed space is handed out again at the same offset
+    const again : AllocResult = arena_alloc(back.arena, 30, 1);
+    assert again.offset == 10;
+    // a mark above top, or negative, is a code and changes nothing
+    const bad : AllocResult = arena_release(r1.arena, 11);
+    assert bad.code == ARENA_ERR_MARK;
+    assert bad.arena.top == 10;
+    assert arena_release(r1.arena, -1).code == ARENA_ERR_MARK;
+    // releasing to top is a no-op
+    assert arena_release(r1.arena, 10).arena.top == 10;
+}
+
+test moments_are_two_zeroed_non_overlapping_buffers {
+    const a : Arena = arena_new(16);
+    var backing : [16]f32 = undefined;
+    fill_slots(&backing, 0, 16, 9.0);
+    const r : MomentsResult = moments_alloc(a, &backing, 4);
+    assert r.code == ARENA_OK;
+    assert r.m_off == 0;
+    assert r.v_off == 4;
+    assert r.arena.top == 8;
+    // zeroed where allocated, untouched elsewhere
+    assert backing[0] == 0.0;
+    assert backing[3] == 0.0;
+    assert backing[4] == 0.0;
+    assert backing[7] == 0.0;
+    assert backing[8] == 9.0;
+    // 2.5 + 7.5 over zeros: a missed zero (9.0) or an overlap would change the sum
+    assert moments_sum() == 10.0;
+}
+
+test moments_are_both_or_neither {
+    // 7 slots cannot hold two buffers of 4: the first fits, the second does not
+    // code 1 (out of memory), top 0
+    assert moments_outcome(7, 4) == 1000;
+    // an exact fit: code 0, top 8
+    assert moments_outcome(8, 4) == 8;
+    // a size of 0 is a size error, code 2
+    assert moments_outcome(16, 0) == 2000;
+    // and the backing array was not touched: 9.0 + 9.0
+    assert backing_after_failed_moments() == 18.0;
+}
+
+invariant top_never_exceeds_cap {
+    const a : Arena = three_allocs();
+    assert a.top <= a.cap;
+    assert a.high >= a.top;
+    assert a.top >= 0;
+}

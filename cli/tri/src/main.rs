@@ -29,16 +29,49 @@ mod leanvac;
 mod ledgers;
 mod loopclaim;
 mod misread;
+mod night;
 mod oneaway;
+mod payout;
 mod window;
 mod modreach;
 mod mutate;
 mod nownote;
 mod orphaned;
+mod piddir;
 mod prcheck;
 mod prose;
 mod quant;
 mod red;
+#[path = "../../../gen/rust/tri/test/report.rs"] #[allow(dead_code, unused_parens)]
+mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of reading `t27c test-report`
+#[path = "../../../gen/rust/tri/lab/receipt.rs"] #[allow(dead_code, unused_parens)]
+mod lab; // t27c gen-rust of specs/tri/lab/receipt.t27: every rule of `tri lab receipt`
+#[path = "../../../gen/rust/tri/actors/metrics.rs"] #[allow(dead_code, unused_parens)]
+mod act; // t27c gen-rust of specs/tri/actors/metrics.t27: every rule of `tri actors`
+#[path = "../../../gen/rust/analog/raw_writer.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw` (#10909)
+#[path = "../../../gen/rust/tri/remote/remote_job.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
+#[path = "../../../gen/rust/tri/land/land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
+#[path = "../../../gen/rust/tri/land/golden_land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
+#[path = "../../../gen/rust/tri/trigit/verbs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod tv; // t27c gen-rust of specs/tri/trigit/verbs.t27: the trigit verbs (#11601, epic #11385 items 24-26)
+#[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod t27rel; // t27c gen-rust of specs/t27os/release.t27: the release plan and manifest text of `tri t27os` (#11315)
+#[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
+mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
+#[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
+mod bit_cache; // the bitstream cache's eviction limit, for `tri hot caches` (#8952)
+#[path = "../../../gen/rust/tri/hot/hot.rs"] #[allow(dead_code, unused_parens)]
+mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri hot`
+#[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)] mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525), which front end reads a file, what a .zig file is judged by (#10823)
+#[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
+mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
+#[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
+#[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
+#[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
 mod renum;
 mod reseal;
 mod rtl;
@@ -111,8 +144,12 @@ enum Commands {
     Gen {
         spec_path: String,
     },
+    /// Run a .t27 spec's tests with `t27c test-report` and fail unless every test passed and at least one ran (rules: specs/tri/test/report.t27).
     Test {
         spec_path: String,
+        /// The t27c binary; default target/release/t27c, then t27c on PATH.
+        #[arg(long)]
+        t27c: Option<String>,
     },
     Verdict {
         #[arg(long)]
@@ -162,6 +199,16 @@ enum Commands {
         #[command(subcommand)]
         action: fleet::FleetCmd,
     },
+    /// The whole overnight operation in one command: train order, per-PR
+    /// verdicts, failed runs, and the single next action.
+    Night {
+        /// Repository to read (default gHashTag/t27).
+        #[arg(long)]
+        repo: Option<String>,
+        /// How many failed runs to print.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
     /// Is this pull request actually safe to merge?
     Pr {
         #[command(subcommand)]
@@ -169,7 +216,7 @@ enum Commands {
     },
     /// Is a merge in flight here, and does this branch carry the base?
     Merging(inflight::Merging),
-    /// The specs the compiler reads WRONGLY. Every gate is green on them.
+    /// The specs the compiler reads WRONGLY, and which of them a gate refuses.
     Misread(misread::Misread),
     /// Failing specs one defect from compiling, and what that defect is
     OneAway(oneaway::OneAway),
@@ -332,6 +379,19 @@ enum Commands {
         #[command(subcommand)]
         action: seals::SealsCmd,
     },
+    /// A loop's lanes: its open pull requests into the base and its worktrees, each judged; a red, conflicting or stale lane is an alarm (rules: specs/tri/lanes/lanes.t27).
+    Lanes {
+        /// The repository: owner/name, or a name of gHashTag's.
+        #[arg(long, default_value = lanes::REPO)] repo: String,
+        /// The branch the lanes merge into.
+        #[arg(long, default_value = lanes::BASE)] base: String,
+        /// The git clone whose worktrees are the lanes.
+        #[arg(long, default_value = ".")] clone: String,
+        /// Only the clone's worktrees whose path starts with this are lanes.
+        #[arg(long, default_value = "")] dir: String,
+        /// Minutes without a commit or push after which a lane is stale.
+        #[arg(long, default_value_t = lanes::STALE_MINUTES)] stale: u64,
+    },
     /// Pure-Rust ports of repository commit / push gates.
     Hooks {
         #[command(subcommand)]
@@ -343,6 +403,72 @@ enum Commands {
         #[command(subcommand)]
         action: vectors::VectorsCmd,
     },
+    /// The t27b lab's verdict per spec (reference, t27b, tests, asserts) from its run; with two --sha, `t27c corpus-receipt compare` of their receipts (rules: specs/tri/lab/receipt.t27).
+    Lab {
+        #[arg(value_parser = ["receipt"])] action: String,
+        /// Show every spec whose path matches this glob ('*' any run, '?' one byte); without it only the RED and UNREAD ones are listed.
+        #[arg(long)] specs: Option<String>,
+        /// A full master commit sha: its run instead of the newest. Twice: compare the two commits' receipts.
+        #[arg(long)] sha: Vec<String>,
+    },
+    /// The hot paths timed against their budgets -- a warm frontier, a bitstream reuse hit; OVER when a cache broke (rules: specs/tri/hot/hot.t27).
+    Hot {
+        /// The t27c binary; default target/release/t27c, then t27c on PATH.
+        #[arg(long)] t27c: Option<String>,
+        /// check (default), watch, frontier, prebuild <spec> --top <v> [--pnr-seed N], suite, or caches.
+        #[arg(default_value = "check", value_parser = ["check", "watch", "frontier", "prebuild", "suite", "caches"])] action: String,
+        /// Passed on to t27c after the action's own arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)] rest: Vec<String>,
+    },
+    /// The M1 RLC trace as an ngspice RAW file (ASCII, or --binary) that ngspice and uberWAVE open; --date sets the Date line (rules: specs/analog/raw_writer.t27, #10909).
+    Raw { out: String, #[arg(long)] binary: bool, #[arg(long)] date: Option<String> },
+    /// An analog reference job on a remote Docker host over SSH (host: TRI_REMOTE_HOST): ping | run <deck> [--golden] [--threads N] | status <id> | logs <id> | stop <id> | fetch <id> <file> [--to dir]; --print shows the command lines and sends nothing (rules: specs/tri/remote/remote_job.t27, #11020).
+    Remote { action: String, name: Option<String>, file: Option<String>, #[arg(long)] to: Option<String>, #[arg(long)] golden: bool, #[arg(long, default_value_t = rj::DEFAULT_THREADS)] threads: u64, #[arg(long)] print: bool },
+    /// The Queen's actor telemetry: kinds, the deepest mailboxes, supervisors and threshold events, each row judged (rules: specs/tri/actors/metrics.t27, thresholds from specs/queen/telemetry.t27).
+    Actors {
+        /// The Queen's base URL.
+        #[arg(long, default_value = act::QUEEN_URL)] url: String,
+        /// The bound, in seconds, a turn in progress is judged against (long at half of it).
+        #[arg(long, default_value_t = act::DEFAULT_BOUND)] bound: u32,
+        /// Also read the decision log: list the records the sampling rule would refuse.
+        #[arg(long)] replay: bool,
+    },
+    /// The AUTHOR_ROYALTY table of one epoch (a UTC day) from git history, GitHub's signature check and both labs' receipts, with SHA-256 digests of its facts and of the table; accounting only (rules: specs/tri/network/payout.t27 over specs/network/attribution.t27 and usage.t27).
+    Payout {
+        /// The epoch: unix time / 86400, so 2026-10-10 is 20736. Its commits are HEAD's first-parent commits of that day.
+        #[arg(long)] epoch: u64,
+        /// The epoch's AUTHOR_ROYALTY pool, in credits.
+        #[arg(long, default_value_t = payout::pay::DEFAULT_POOL)] pool: u64,
+        /// Print one JSON object instead of the table.
+        #[arg(long)] json: bool,
+    },
+    /// t27o (Ouroboros): a Rust file as a t27 spec; --oracle prints the rustc harness, --check runs it and t27c test-report on the spec and its oracle tests (rules: specs/tools/t27o/rust_convert.t27). A .spice/.cir/.sp netlist prints its inventory or the refusal, and with --emit-cell the constants of the M1 linear cell folded from it (rules: specs/tools/t27o/spice_convert.t27). A .zig file prints the spec and its count line (rules: specs/tools/t27o/zig_convert.t27); its own tests are the oracle, so --check writes the spec and judges it by them, and --oracle says it does not apply.
+    T27o {
+        file: String,
+        /// The module name; default the file's stem.
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] oracle: bool,
+        /// Run the oracle and test the spec: `t27b test` judges, `t27c test-report` only when t27b cannot (specs/tools/t27o/ledger.t27).
+        #[arg(long)] check: bool,
+        /// The t27c binary; default target/release/t27c, then t27c on PATH.
+        #[arg(long)] t27c: Option<String>,
+        /// A netlist: print the M1 cell constants (CELL_N, CELL_D, CELL_NV) folded from it, or the refusal, instead of the inventory.
+        #[arg(long)] emit_cell: bool,
+    },
+    /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage, the files that convert whole, and the ranked first-refusal kinds, a cascade counted under its root (#11122; rules: specs/tools/t27o/ledger.t27).
+    T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
+    /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
+    Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
+    /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
+    Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
+    /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
+    Trigit { #[arg(trailing_var_arg = true)] argv: Vec<String> },
+    /// T27 OS release front door: `release --plan` prints the numbered steps; `manifest --build N --sums FILE` prints the release manifest, a t27 module the app reads; `publish --yes` builds app and toolchain from one clean commit and creates the t27os-v<version>-b<build> release and the t27os-latest pointer; without --yes it is refused (rules: specs/t27os/release.t27, #11315, #11403).
+    T27os { action: String, #[arg(long)] plan: bool, #[arg(long)] yes: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sums: String },
+    /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
+    Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
+    /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
+    Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
 }
 
 #[derive(Subcommand)]
@@ -867,10 +993,149 @@ fn cmd_gen(spec_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_test(spec_path: &str) -> Result<()> {
-    run_t27c(&["test", spec_path])?;
-    println!("tests passed: {}", spec_path);
+/// `t27c test` only lists the tests (#7369); they run in `t27c test-report`, which exits 0 when one FAILs (#7370).
+fn cmd_test(spec: &str, t27c: Option<&str>) -> Result<()> {
+    let (t, v) = test_report(&mutate::resolve_t27c(t27c), Path::new(spec), false)?;
+    println!("{t}{}", report_summary(t));
+    anyhow::ensure!(report::passes(v), "{spec}: {}", report::why(v));
     Ok(())
+}
+
+/// #8870: each hot path once to warm it, then once timed; one row each, judged by hot.t27. Silicon runs only with T27_OPENXC7.
+/// #8952: every speed-up of the hot-reload loop as one word (command strings: specs/tri/hot/hot.t27).
+fn cmd_hot(action: &str, rest: &[String], t27c: Option<&str>) -> u32 {
+    let t = mutate::resolve_t27c(t27c);
+    let pass = |base: &str, tail: &[&str]| Command::new(&t).args(base.split(' ')).args(rest).args(tail).status().map_or(1, |s| s.code().unwrap_or(1) as u32);
+    match action {
+        "watch" => pass(hot::HOT_WATCH, &[]),
+        "frontier" => pass(hot::HOT_FRONTIER, &[]),
+        "prebuild" => pass(hot::HOT_PREBUILD, &[hot::HOT_NO_CABLE]),
+        "suite" => pass(hot::HOT_SUITE, &[]),
+        "caches" => {
+            let c = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/t27");
+            for (name, keeps) in [("genhash", format!("{} binaries", gen_cache::GEN_CACHE_KEEP_BINARIES)), ("bitstreams", format!("{} bitstreams", bit_cache::BIT_CACHE_KEEP)), ("digests", "one 64-byte digest per stat".to_string())] {
+                let n = std::fs::read_dir(c.join(name)).map_or(0, |r| r.count());
+                let kb = Command::new("du").arg("-sk").arg(c.join(name)).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("0").to_string()).unwrap_or_default();
+                println!("{name:<11}{n:>6} entries {kb:>9} KB   keeps {keeps}");
+            }
+            0
+        }
+        _ => hot_check(t27c),
+    }
+}
+
+fn hot_check(t27c: Option<&str>) -> u32 {
+    let t = mutate::resolve_t27c(t27c);
+    let si = ["silicon", "specs/fpga/ternary_link.t27", "--top", "fpga/verilog/ternary_link_jtag.v", "--skip-hardware", "--pnr-seed", "11"];
+    let run = |a: &[&str]| { let s = std::time::Instant::now(); let o = Command::new(&t).args(a).output().ok(); (o.as_ref().map_or(false, |o| o.status.success()), s.elapsed().as_millis() as u32, o.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("AUDIT:"))) };
+    let mut over = 0;
+    for (name, args, can, budget) in [("frontier, warm", &["frontier", "--list"][..], true, hot::FRONTIER_WARM_BUDGET_MS), ("silicon, reuse hit", &si[..], std::env::var_os("T27_OPENXC7").is_some(), hot::SILICON_REUSE_BUDGET_MS)] {
+        let (mut ok, mut ms, aud) = if can { run(args); run(args) } else { (false, 0, false) };
+        if hot::hot_measure_again(aud, false) { (ok, ms, _) = run(args); } // the scheduled bitstream audit timed a build, not a hit
+        let v = hot::hot_verdict(can, ok, ms, budget);
+        over += (v == hot::HOT_OVER) as u32;
+        println!("{:<8} {name}: {ms} ms (budget {budget} ms){}", ["OK", "OVER", "SKIPPED"][v as usize], if can && !ok { " -- the command failed" } else { "" });
+    }
+    hot::hot_exit(over)
+}
+
+/// Run `<t27c> test-report <spec>`; the verdict is report.t27's, from the text and whether t27c exited 0.
+pub(crate) fn test_report(t27c: &str, spec: &Path, verbose: bool) -> Result<(&'static str, u8)> {
+    let out = Command::new(t27c).arg("test-report").arg(spec).args(verbose.then_some("--verbose")).stderr(std::process::Stdio::inherit()).output().with_context(|| format!("cannot start `{t27c} test-report`"))?;
+    let text: &'static str = String::from_utf8_lossy(&out.stdout).into_owned().leak(); // gen-rust's `string` is `&'static str` (#7449)
+    Ok((text, report::verdict(text, out.status.success())))
+}
+
+/// The report's names of one kind (FAIL, pass, or the BLOCKED why), joined.
+pub(crate) fn report_names(t: &'static str, k: u8) -> String {
+    (0..report::count(t, k)).map(|n| &t[report::name_from(t, k, n)..report::name_to(t, k, n)]).collect::<Vec<_>>().join(", ")
+}
+
+/// The one greppable line: `tests: N, pass: P, fail: F (names)`, or `, BLOCKED: <why>`, or `, vacuous: <names>` (#10497).
+pub(crate) fn report_summary(t: &'static str) -> String {
+    let (b, f, v, n) = (report_names(t, report::LINE_BLOCKED), report_names(t, report::LINE_FAIL_NAME), report_names(t, report::LINE_VACUOUS_NAME), |k| report::total(t, k));
+    let tail = if !b.is_empty() { format!(", BLOCKED: {b}") } else if !f.is_empty() { format!(" ({f})") } else if !v.is_empty() { format!(", vacuous: {v}") } else { String::new() };
+    format!("tests: {}, pass: {}, fail: {}{tail}", n(report::LINE_TESTS), n(report::LINE_PASS), n(report::LINE_FAIL))
+}
+
+#[test] // the glue's one line over report.t27's reading: the #7400 demo's red report, and a BLOCKED one
+fn the_summary_line_names_what_the_report_names() {
+    assert_eq!(report_summary("  FAIL  negz\n\n  tests       4\n  pass        3\n  FAIL        1\n"), "tests: 4, pass: 3, fail: 1 (negz)");
+    assert_eq!(report_summary("  BLOCKED  zig: error: x \n\n  A blocked spec\n"), "tests: 0, pass: 0, fail: 0, BLOCKED: zig: error: x");
+}
+
+/// `tri lab receipt`: curl the lab's run (or two receipts) and print what specs/tri/lab/receipt.t27 reads in it.
+fn cmd_lab(specs: Option<&str>, sha: &[String]) -> Result<u8> {
+    if sha.len() > lab::MAX_SHAS as usize { eprintln!("{}", lab::TOO_MANY_SHAS); return Ok(lab::EXIT_UNREAD); }
+    let get = |p: String| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "300", &format!("{}{p}", lab::LAB_URL)]).output()?; Ok(if o.status.success() { String::from_utf8_lossy(&o.stdout).into_owned().leak() } else { "" }) };
+    if let [a, b] = sha {
+        std::env::set_current_dir(find_trinity_root()?)?; // t27c reads the receipt keys' registry from the repository root
+        let f = |s: &String| -> Result<PathBuf> { let p = std::env::temp_dir().join(format!("tri-lab-{s}{}", lab::RECEIPT_EXT)); fs::write(&p, get(format!("{}{s}{}", lab::RUNS, lab::RECEIPT_EXT))?)?; Ok(p) };
+        let (pa, pb) = (f(a)?, f(b)?);
+        let rc = if lab::compare_runs(fs::metadata(&pa)?.len(), fs::metadata(&pb)?.len()) { Command::new(mutate::resolve_t27c(None)).args(["corpus-receipt", "compare"]).arg(pa).arg(pb).status()?.code().unwrap_or(-1) } else { -1 };
+        let x = lab::compare_exit(rc); println!("{}", lab::compare_why(x)); return Ok(x);
+    }
+    let t = get(sha.first().map_or(lab::LATEST.to_string(), |s| format!("{}{s}{}", lab::RUNS, lab::RUN_EXT)))?;
+    let pat: &'static str = specs.unwrap_or(lab::ALL_SPECS).to_string().leak();
+    println!("{}", (0..lab::HEAD_KEYS).map(|k| format!("{}={}", lab::head_key(k), &t[lab::head_from(t, k)..lab::head_to(t, k)])).collect::<Vec<_>>().join("  "));
+    let (mut n, mut o) = ([0u64; lab::CLASSES as usize], lab::next_object(t, lab::results_at(t)));
+    while o < t.len() {
+        let e = lab::object_end(t, o);
+        if lab::matches(t, o, e, pat) {
+            let v = lab::classify(t, o, e);
+            n[v as usize] += 1;
+            if lab::listed(v, specs.is_some()) { println!("{}  {}", (0..lab::COLUMNS).map(|k| format!("{}={}", lab::column(k), &t[lab::cell_from(t, o, e, k)..lab::cell_to(t, o, e, k)])).collect::<Vec<_>>().join(" "), lab::why(v)); }
+        }
+        o = lab::next_object(t, e);
+    }
+    println!("{}", (0..lab::CLASSES).map(|v| format!("{} {}", n[v as usize], lab::name(v))).collect::<Vec<_>>().join(", "));
+    let x = lab::exit_code(n.iter().sum(), n[lab::V_RED as usize], n[lab::V_UNREAD as usize]); println!("{}", lab::exit_why(x)); Ok(x)
+}
+
+/// `tri raw` (#10909): every rule is specs/analog/raw_writer.t27; this allocates its buffers and writes the file.
+fn cmd_raw(out: &str, binary: bool, date: Option<&str>) -> Result<u8> {
+    let d = date.map_or_else(|| chrono::Local::now().format("%a %b %e %H:%M:%S  %Y").to_string(), str::to_string);
+    let (mut buf, mut vals, mut limbs, mut dig) = (vec![0u8; 1 << 16], vec![0f64; raw::RLC_VALS], vec![0u64; raw::RAW_LIMBS], vec![0u8; raw::RAW_DIGITS]);
+    let n = raw::raw_rlc_file(&mut buf, d.as_bytes(), binary, &mut vals, &mut limbs, &mut dig);
+    anyhow::ensure!(n > 0 && n <= buf.len(), "raw: the trace is not the RLC cell's pinned simulation, or the file does not fit");
+    fs::write(out, &buf[..n])?;
+    Ok(0)
+}
+
+/// `tri remote` (#11020): every command line is specs/tri/remote/remote_job.t27; this reads TRI_REMOTE_HOST / _IMAGE / _DECK_URL, prints each line the spec builds and, without --print, runs it (no shell), stopping at the first that fails.
+fn cmd_remote(action: &str, name: Option<&str>, file: Option<&str>, to: Option<&str>, threads: u64, golden: bool, print: bool) -> Result<u8> {
+    let (env, arg) = (|k: &str, d: &str| -> &'static str { std::env::var(k).unwrap_or_else(|_| d.to_string()).leak() }, |o: Option<&str>| -> &'static str { o.unwrap_or("").to_string().leak() });
+    let r = rj::TriRemoteReq { op: rj::action_op(arg(Some(action))), host: env(rj::HOST_VAR, ""), image: env(rj::IMAGE_VAR, rj::DEFAULT_IMAGE), name: arg(name), file: arg(file), dest: arg(to), url: env(rj::URL_VAR, ""), threads, counter: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), golden };
+    let (mut buf, mut line, why) = (vec![0u8; rj::CMD_MAX], vec![0u8; rj::CMD_MAX], rj::refusal(r));
+    anyhow::ensure!(why == rj::R_OK, "tri remote: refused, nothing sent: {}", rj::refusal_text(why));
+    let id = rj::job_id(r, &mut buf); if id > 0 { println!("job {}", String::from_utf8_lossy(&buf[..id])); }
+    for step in 0u8.. {
+        let n = rj::command(r, step, &mut buf); if n == 0 { break; }
+        let m = rj::shell_form(&buf, n, &mut line); println!("{}", String::from_utf8_lossy(&line[..m]));
+        let argv: Vec<&str> = std::str::from_utf8(&buf[..n])?.lines().collect();
+        if !print { let s = Command::new(argv[0]).args(&argv[1..]).status()?; if !s.success() { return Ok(s.code().unwrap_or(1) as u8); } }
+    }
+    Ok(0)
+}
+
+/// `tri actors`: curl the telemetry (and with --replay the decision log), pretty-print it, and print what specs/tri/actors/metrics.t27 reads in it.
+fn cmd_actors(url: &str, bound: u32, replay: bool) -> Result<u8> {
+    let get = |p: &str| -> Result<&'static str> { let o = Command::new("curl").args(["-fsSL", "--max-time", "60", &format!("{url}{p}")]).output()?; Ok(serde_json::from_slice::<serde_json::Value>(&o.stdout).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak()) };
+    let docs = [get(act::METRICS)?, if replay { get(act::DECISIONS)? } else { "" }];
+    let (mut n, mut alarms, mut records) = ([0u64; act::VERDICTS as usize], 0u64, 0u64);
+    for s in 0..act::SECTIONS {
+        let t = docs[act::doc_of(s) as usize];
+        let mut o = act::next_item(t, act::section_at(t, s), s);
+        while o < t.len() {
+            let e = act::item_end(t, o);
+            let v = act::verdict(t, o, e, s, bound);
+            (n[v as usize], alarms, records) = (n[v as usize] + 1, alarms + act::is_alarm(v) as u64, records + act::is_record(s) as u64);
+            if act::listed(s, v) { println!("{} {}  {}", act::section_name(s), (0..act::columns(s)).map(|k| format!("{}={}", act::label(s, k), &t[act::cell_from(t, o, e, s, k)..act::cell_to(t, o, e, s, k)])).collect::<Vec<_>>().join(" "), act::why(v)); }
+            o = act::next_item(t, e, s);
+        }
+    }
+    if replay { println!("decision log: {records} records; {}", act::REPLAY_NOTE); }
+    let x = act::exit_code(act::enabled(docs[0]), alarms, n[act::V_UNREAD as usize], replay, records); println!("{}", act::exit_why(x)); Ok(x)
 }
 
 fn cmd_verdict(toxic: bool) -> Result<()> {
@@ -983,6 +1248,7 @@ fn cmd_health(root: &Path, target: Option<&str>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--version") { let mut b = [0u8; 256]; let n = t27rel::version_text(&mut b, 256, "tri", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").and_then(|s| s.parse().ok()).unwrap_or(0), option_env!("T27_COMMIT").unwrap_or("unknown")); print!("{}", String::from_utf8_lossy(&b[..n])); return Ok(()) }
     let cli = Cli::parse();
 
     match &cli.command {
@@ -1044,7 +1310,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Gen { spec_path } => cmd_gen(spec_path)?,
-        Commands::Test { spec_path } => cmd_test(spec_path)?,
+        Commands::Test { spec_path, t27c } => cmd_test(spec_path, t27c.as_deref())?,
         Commands::Verdict { toxic } => cmd_verdict(*toxic)?,
         Commands::Experience { action } => {
             let root = find_trinity_root()?;
@@ -1067,6 +1333,7 @@ fn main() -> Result<()> {
         Commands::Now { action } => nownote::run(action)?,
         Commands::Ci { action } => cibase::run(action)?,
         Commands::Fleet { action } => fleet::run(action)?,
+        Commands::Night { repo, limit } => night::run(repo.as_deref(), *limit)?,
         Commands::Pr { action } => prcheck::run(action)?,
         Commands::Merging(a) => inflight::run(a)?,
         Commands::Misread(a) => misread::run(a)?,
@@ -1112,10 +1379,115 @@ fn main() -> Result<()> {
         Commands::Jumps { action } => jumps::run(action)?,
         Commands::Vsim { action } => vsim::run(action)?,
         Commands::Seals { action } => seals::run(action)?,
+        Commands::Lanes { repo, base, clone, dir, stale } => std::process::exit(cmd_lanes(repo, base, clone, dir, *stale)? as i32),
         Commands::Hooks { action } => hooks::run(action)?,
+        Commands::Lab { specs, sha, .. } => std::process::exit(cmd_lab(specs.as_deref(), sha)? as i32),
+        Commands::Actors { url, bound, replay } => std::process::exit(cmd_actors(url, *bound, *replay)? as i32),
+        Commands::Raw { out, binary, date } => std::process::exit(cmd_raw(out, *binary, date.as_deref())? as i32),
+        Commands::Remote { action, name, file, to, golden, threads, print } => std::process::exit(cmd_remote(action, name.as_deref(), file.as_deref(), to.as_deref(), *threads, *golden, *print)? as i32),
+        Commands::Hot { t27c, action, rest } => std::process::exit(cmd_hot(action, rest, t27c.as_deref()) as i32),
+        Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
+        Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
+        Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
+        Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
+        Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
+        Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
+        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
+        Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
+        Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
 
     Ok(())
+}
+
+/// `tri t27o` (#8967): every rule is gen-rust of rust_convert.t27; this reads the file, runs rustc and t27c, and writes.
+fn zig_source(file: &Path, src: &[u8]) -> Vec<u8> { // a .zig source with the consts it imports from files of its own directory tree written in: zig_convert.t27 `imports` names the files, `inline_imports` writes the values, this only reads (a symlink out of the tree is not followed; #10823)
+    let (dir, mut want, mut ext, mut flat, mut st) = (file.parent().and_then(|d| fs::canonicalize(d).ok()).unwrap_or_default(), vec![0u8; src.len() + 64], Vec::new(), vec![0u8; 4 * src.len() + 64], vec![0usize; zig::ZI_SLOTS]);
+    let w = zig::imports(src, &mut want, &mut st).min(want.len()); for rel in String::from_utf8_lossy(&want[..w]).lines() { if let Some(t) = fs::canonicalize(dir.join(rel)).ok().filter(|f| f.starts_with(&dir)).and_then(|f| fs::read(f).ok()) { ext.extend([&[zig::Z_B_REC][..], rel.as_bytes(), b"\n", &t].concat()); } }
+    let n = zig::inline_imports(src, &ext, &mut flat, &mut st).min(flat.len()); flat.truncate(n); flat
+}
+
+fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Option<&str>, emit_cell: bool) -> Result<u8> {
+    let src = fs::read(file).with_context(|| format!("reading {file}"))?;
+    if spice::is_spice_name(file.as_bytes()) { // a netlist: every rule is specs/tools/t27o/spice_convert.t27 (#10509)
+        let (mut work, mut out, mut st) = (vec![0u8; 2 * src.len() + 8192], vec![0u8; 1 << 24], vec![0usize; 1 << 16]);
+        let n = if emit_cell { spice::emit_cell(&src, &mut work, &mut out, &mut st) } else { spice::inventory(&src, &mut work, &mut out, &mut st) };
+        std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?;
+        return Ok(spice::exit_code(&st));
+    }
+    let stem = name.map_or_else(|| Path::new(file).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned()), str::to_string);
+    let zig = t27o_ledger::front_end(file.as_bytes()) == t27o_ledger::FE_ZIG; if zig && oracle { println!("{}", t27o_ledger::NOTE_ZIG_ORACLE); return Ok(0); } // a .zig file: its own tests are the oracle (ledger.t27, #10823)
+    let src = if zig { zig_source(Path::new(file), &src) } else { src };
+    let (mut out, mut st, mut spec) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], vec![0u8; 1 << 24]);
+    let mut n = if zig { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else if oracle || check { t27o::oracle(&src, &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+    if !check { std::io::Write::write_all(&mut std::io::stdout(), &out[..n.min(out.len())])?; return Ok(0); }
+    let (h, exe, path) = (Path::new(file).with_file_name("zz_t27o_oracle.rs"), std::env::temp_dir().join("t27o_oracle"), PathBuf::from(format!("specs/t27o_check/{stem}.t27"))); // the harness sits next to the source, so its #[path] mods resolve; the spec under specs/, so its `use`s do
+    if !zig { // a Rust file: the harness rustc builds is run and its samples follow the spec
+        fs::write(&h, &out[..n.min(out.len())])?; let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&exe).arg(&h).status(); fs::remove_file(&h)?; anyhow::ensure!(built?.success(), "rustc refused the oracle harness of {file}");
+        let m = t27o::convert(&src, stem.as_bytes(), &mut spec, &mut st); out = [&spec[..m.min(spec.len())], &Command::new(&exe).output()?.stdout[..]].concat(); n = out.len();
+    }
+    fs::create_dir_all("specs/t27o_check")?; fs::write(&path, &out[..n.min(out.len())])?; println!("{}", path.display());
+    if !t27o_ledger::has_evidence(zig, st[zig::Z_NTEST]) { eprintln!("{}", t27o_ledger::NOTE_ZIG_UNJUDGED); return Ok(t27o_ledger::EXIT_UNJUDGED as u8); }
+    let b = ["target/release/t27b", "target/debug/t27b"].into_iter().find(|p| Path::new(p).exists()).unwrap_or("t27b"); let c = Command::new(b).arg("test").arg(&path).status().ok().and_then(|s| s.code()).unwrap_or(-1); // t27b judges first, t27c only when its exit is no verdict (specs/tools/t27o/ledger.t27, #10525)
+    if !t27o_ledger::needs_reference(t27o_ledger::t27b_outcome(c)) { return Ok(c as u8); } eprintln!("t27o: {b} test exited {c} ({}), so t27c test-report judges instead", t27o_ledger::ORC_NAMES[t27o_ledger::t27b_outcome(c) as usize]);
+    Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
+}
+
+/// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, whole files, a cascade's root, the ranking); this lists, hashes, converts in-process and keeps the cache.
+fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>, top: usize) -> Result<u8> {
+    let t0 = std::time::Instant::now(); let seal = |f: &str| -> Result<String> { let p = std::env::current_dir()?.join(f); Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(&p).with_context(|| format!("{}: cannot read the seal; {}", p.display(), t27o_ledger::SEAL_HINT))?)?["spec_hash"].as_str().with_context(|| format!("{}: no spec_hash", p.display()))?.to_string()) };
+    let (conv, std, zs) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?, seal(t27o_ledger::SEAL_ZIG)?); let zk = format!("{conv}+{zs}"); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
+    let root: &'static str = if t27o_ledger::repo_is_here(repo) { t27o_ledger::SWEEP_HERE } else { fs::canonicalize(repo).with_context(|| format!("{repo}: cannot open the repository"))?.to_string_lossy().into_owned().leak() }; let cache = cache.map_or_else(|| { let mut b = vec![0u8; 4096]; let n = t27o_ledger::cache_path(root, &mut b); String::from_utf8_lossy(&b[..n]).into_owned() }, str::to_string);
+    let old: &'static str = fs::read_to_string(&cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 11).map(|f| (f[0], f)).collect();
+    let ls = Command::new("git").args(["-C", root, "ls-files", "--"]).args(paths).output()?; anyhow::ensure!(ls.status.success(), "{root}: git ls-files failed: {}", String::from_utf8_lossy(&ls.stderr).trim()); let listing: &'static str = String::from_utf8(ls.stdout)?.leak();
+    let (mut tab, mut kinds, mut tot, mut n) = (String::new(), std::collections::BTreeMap::<&'static str, usize>::new(), [0usize; 6], [0usize; 4]);
+    for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
+        let Ok(src) = fs::read(Path::new(root).join(p)) else { continue };
+        if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
+        let z = t27o_ledger::front_end(p.as_bytes()) == t27o_ledger::FE_ZIG; let ck = if z { &zk } else { &conv }; // a .zig row is keyed by both converters' seals, and by the source with its imported consts written in (#10823)
+        let src = if z { zig_source(&Path::new(root).join(p), &src) } else { src }; let (sha, r) = (format!("{:x}", Sha256::digest(&src)), rows.get(p));
+        let reuse = t27o_ledger::reuse_row(t27o_ledger::key_check(r.is_some(), r.is_some_and(|r| r[1] == sha), r.is_some_and(|r| r[2] == *ck), r.is_some_and(|r| r[3] == std)));
+        let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
+            let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new()); let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
+            let m = if z { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
+            let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); let (mut at, mut via) = (t27o_ledger::next_refusal(o, 0), 0usize); while at < o.len() { let r = t27o_ledger::root_of(o, at); *k.entry(&o[t27o_ledger::kind_from(o, r)..t27o_ledger::kind_to(o, r)]).or_default() += 1; via += t27o_ledger::attributed(o, at, r) as usize; at = t27o_ledger::next_refusal(o, at + 1); }
+            format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{via}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
+        };
+        n[reuse as usize] += 1; tab += &format!("{}\n", f.join("\t"));
+        (0..6).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0)); n[3] += t27o_ledger::converts_whole(f[4].parse().unwrap_or(0), f[5].parse().unwrap_or(0)) as usize;
+        f[10].split(';').filter_map(|e| e.rsplit_once('=')).for_each(|(k, c)| *kinds.entry(k).or_default() += c.parse::<usize>().unwrap_or(0));
+        println!("{}  {} {} {}/{} {}  {}", f[0], f[4], f[5], f[6], f[7], f[8], if reuse { "reused" } else { "fresh" });
+    }
+    let cov = t27o_ledger::coverage_permille(tot[0], tot[1]); println!("total {} files  {} fn seen  {} converted  tests {}/{}  stubs {}  coverage {}", n[0] + n[1], tot[0], tot[1], tot[2], tot[3], tot[4], if t27o_ledger::coverage_known(cov) { format!("{}.{}%", cov / 10, cov % 10) } else { "unknown".into() });
+    let (casc, mut root): (Vec<_>, Vec<_>) = kinds.into_iter().partition(|(k, _)| t27o_ledger::is_cascade(*k));
+    root.sort_by(|a, b| t27o_ledger::rank_cmp(a.1, a.0, b.1, b.0).cmp(&0)); root.iter().take(top).for_each(|(k, c)| println!("{c:>7}  {k}"));
+    let ext = casc.iter().map(|k| k.1).sum::<usize>(); println!("{:>7}  files convert whole (every fn converted)\n{:>7}  refused only through a cascade: {} counted under their root above, {ext} {}\ncold {} / reused {} / skipped {}  wall {:.1} s", n[3], tot[5] + ext, tot[5], t27o_ledger::KIND_EXTERNAL, n[0], n[1], n[2], t0.elapsed().as_secs_f64());
+    if let Some(d) = Path::new(&cache).parent() { fs::create_dir_all(d)?; } fs::write(&cache, tab)?; Ok(0)
+}
+
+/// `tri lanes`: gh's open pull requests into the base, the clone's worktrees and branch times, and what specs/tri/lanes/lanes.t27 reads in them.
+fn cmd_lanes(repo: &str, base: &str, clone: &str, dir: &str, stale: u64) -> Result<u8> {
+    fn run(c: &str, a: &[&str]) -> Result<&'static str> { Ok(String::from_utf8_lossy(&Command::new(c).args(a).output()?.stdout).into_owned().leak()) }
+    let full = format!("{}{repo}", if lanes::needs_owner(repo.to_string().leak()) { lanes::OWNER } else { "" });
+    let prs: &'static str = serde_json::from_str::<serde_json::Value>(run("gh", &["pr", "list", "-R", &full, "--base", base, "--state", "open", "--limit", lanes::PR_LIMIT, "--json", lanes::PR_FIELDS])?).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or_default().leak();
+    let (wts, refs, done) = (run("git", &["-C", clone, "worktree", "list", "--porcelain"])?, run("git", &["-C", clone, "for-each-ref", lanes::REF_FORMAT, "refs/heads"])?, run("gh", &["pr", "list", "-R", &full, "--base", base, "--state", "merged", "--limit", lanes::PR_LIMIT, "--json", lanes::MERGED_FIELDS])?);
+    let (now, dir, mut alarms): (u64, &'static str, u64) = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), dir.to_string().leak(), 0);
+    let age = |a: u64| if lanes::age_known(a) { a.to_string() } else { lanes::UNKNOWN.to_string() };
+    let mut o = lanes::next_pr(prs, 0);
+    while o < prs.len() {
+        let e = lanes::pr_end(prs, o);
+        let w = lanes::worktree_of(wts, dir, prs, o, e);
+        let a = lanes::age_minutes(now, lanes::later(lanes::pr_updated(prs, o, e), lanes::commit_time(refs, wts, w))); let v = lanes::pr_verdict(prs, o, e, a, stale); alarms += lanes::is_alarm(v) as u64;
+        println!("{} checks={} age_min={} worktree={}  {}", (0..lanes::PR_CELLS).map(|k| format!("{}={}", lanes::pr_label(k), &prs[lanes::pr_from(prs, o, e, k)..lanes::pr_to(prs, o, e, k)])).collect::<Vec<_>>().join(" "), lanes::ci_name(lanes::ci(prs, o, e)), age(a), &wts[lanes::path_from(wts, w)..lanes::path_to(wts, w)], lanes::why(v));
+        o = lanes::next_pr(prs, e);
+    }
+    let mut w = lanes::next_worktree(wts, 0, dir);
+    while w < wts.len() {
+        let a = lanes::age_minutes(now, lanes::commit_time(refs, wts, w)); let v = lanes::worktree_verdict(wts, w, a, stale, lanes::merged(done, wts, w));
+        if !lanes::has_pr(prs, wts, w) { alarms += lanes::is_alarm(v) as u64; println!("worktree={} branch={} age_min={}  {}", &wts[lanes::path_from(wts, w)..lanes::path_to(wts, w)], &wts[lanes::branch_from(wts, w)..lanes::branch_to(wts, w)], age(a), lanes::why(v)); }
+        w = lanes::next_worktree(wts, lanes::record_end(wts, w), dir);
+    }
+    let x = lanes::exit_code(!prs.is_empty(), alarms); println!("{}", lanes::exit_why(x)); Ok(x)
 }
 
 fn cmd_serve(addr: &str) -> Result<()> {
@@ -1144,4 +1516,113 @@ fn cmd_serve(addr: &str) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
+fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bool) -> Result<u8> {
+    let leak = |s: String| -> &'static str { s.leak() };
+    let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan, seals };
+    let (mut ev, mut buf, mut code, mut at) = ("", vec![0u8; land::CMD_MAX], land::request_refusal(r), (0u8, 0u64));
+    let argv = |b: &[u8]| -> Vec<String> { String::from_utf8_lossy(b).lines().map(str::to_string).collect() };
+    if plan && code == land::L_OK { for k in 0..land::LAND_STEPS { let n = land::step_argv(r, "", k, 0, &mut buf); println!("{k:2} {:<17} {}", land::step_name(k), argv(&buf[..n]).join(" ")); } return Ok(0); }
+    while code == land::L_OK {
+        let s = land::next_slot(r, ev);
+        if s >= land::DONE { code = if check { land::L_CHECKED } else { land::L_LANDED }; break; }
+        at = ((s / land::SLOT) as u8, s % land::SLOT);
+        let n = land::step_argv(r, ev, at.0, at.1, &mut buf);
+        anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
+        let a = argv(&buf[..n]);
+        let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
+        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::cwd_scratch(r, at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
+        let text = leak(text);
+        let mut sec = vec![0u8; text.len() + 128];
+        let m = land::emit_section(&mut sec, 0, at.0, at.1, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..m])));
+        if at.0 == land::L_CHANGES { r.changes = text; }
+        code = land::judge(r, ev, at.0, at.1);
+        println!("{:<17} exit {x}", land::step_name(at.0));
+    }
+    let m = land::step_argv(r, ev, land::L_CLEAN, 0, &mut buf);
+    if m > 0 { let a = argv(&buf[..m]); let _ = Command::new(&a[0]).args(&a[1..]).output(); }
+    let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
+    println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
+    Ok(land::exit_code(code))
+}
+
+/// `tri golden land|push|status` (#11275): every rule is specs/tri/land/golden_land.t27 over golden_chain.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence and stops where the spec says.
+fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Result<u8> {
+    use golden_land as g;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let env = |k: &str, d: &str| leak(std::env::var(k).unwrap_or(d.into()));
+    let r = g::GolReq { verb: g::verb_of(leak(action.into())), plan, queued: queued.unwrap_or(g::ABSENT), issue, scratch: leak(std::env::temp_dir().join(format!("tri-golden-{}", std::process::id())).display().to_string()), t27b: env("T27B", "t27b"), t27c: env("T27C", "t27c"), tri: leak(std::env::current_exe()?.display().to_string()) };
+    let (mut ev, mut buf, mut code, mut wo, mut wp) = ("", vec![0u8; g::CMD_MAX], g::request_refusal(r), vec![0u8; 16], vec![0usize; 16]);
+    let run = |b: &[u8], dir: &str| { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); match Command::new(&a[0]).args(&a[1..]).current_dir(dir).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) } };
+    if code == g::C_OK { std::fs::create_dir_all(r.scratch)?; }
+    while code == g::C_OK {
+        let s = g::next_slot(r, ev, &mut wo, &mut wp);
+        if s >= g::DONE { break; }
+        let (k, n) = ((s / g::SLOT) as u8, s % g::SLOT);
+        let m = g::step_argv(r, ev, k, n, &mut buf, &mut wo, &mut wp);
+        anyhow::ensure!(m > 0, "tri golden: step {k} does not fit");
+        let argv = buf[..m].to_vec();
+        let c = g::step_cwd(r, k, n, &mut buf);
+        let (x, text) = run(&argv, if c > 0 { leak(String::from_utf8_lossy(&buf[..c]).into()) } else { "." });
+        let (text, mut sec) = (leak(text.clone()), vec![0u8; text.len() + 128]);
+        let w = g::emit_section(&mut sec, 0, k, n, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..w])));
+        code = g::judge(r, ev, k, n);
+        eprintln!("golden {k}.{n} exit {x}");
+    }
+    let m = g::step_argv(r, ev, g::G_PRUNE, 0, &mut buf, &mut wo, &mut wp);
+    if m > 0 { let _ = std::fs::remove_dir_all(r.scratch); run(&buf[..m].to_vec(), "."); }
+    let mut out = vec![0u8; 16384];
+    let w = g::report(r, ev, code, &mut out, &mut wo, &mut wp, &mut buf);
+    print!("{}", String::from_utf8_lossy(&out[..w]));
+    Ok(g::exit_code(code))
+}
+
+/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed, or prints the spec's words. Same shape as cmd_golden.
+fn cmd_trigit(args: &[String]) -> Result<u8> {
+    use tv as v;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let verb = if args.is_empty() { v::TV_UNKNOWN } else { v::verb_of(leak(args[0].to_lowercase())) };
+    let run = |b: &[u8], ident: bool| -> (u8, String) { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); if a.is_empty() { return (127, "empty argv".into()); } let mut c = Command::new(&a[0]); c.args(&a[1..]); if ident { for (k, val) in [("GIT_AUTHOR_NAME", "t27os"), ("GIT_AUTHOR_EMAIL", "t27os@localhost"), ("GIT_COMMITTER_NAME", "t27os"), ("GIT_COMMITTER_EMAIL", "t27os@localhost")] { c.env(k, val); } } match c.output() { Ok(o) => (o.status.code().unwrap_or(255) as u8, String::from_utf8_lossy(&o.stdout).trim().to_string()), Err(e) => (127, e.to_string()) } };
+    let mut buf = vec![0u8; 4096];
+    let say = |k: u8, r: &[u8], val: &[u8], b: &mut Vec<u8>| { let n = v::did_text(k, r, val, b.as_mut_slice(), 4096); println!("{}", String::from_utf8_lossy(&b[..n])); };
+    match v::host_action(verb) {
+        v::A_REFUSE => { let n = v::refusal_text(verb, &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+        v::A_ARGV => { let issue = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0); let sha = args.get(2).map(String::as_str).unwrap_or(""); let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
+            if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::CLAIM_PREF, issue)); say(v::TV_CLAIM, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_BEAT => { let host = leak(args.get(1).cloned().unwrap_or("localhost".to_string())); let build: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ver = leak(std::env::var("T27_VER").unwrap_or("0.1.0".into())); let tc = leak(std::env::var("T27_TC").unwrap_or("0.5.2".into()));
+            let m = v::beat_msg(&mut buf, 4096, host.as_bytes(), build, ver.as_bytes(), tc.as_bytes()); let msg = String::from_utf8_lossy(&buf[..m]).into_owned();
+            let n = v::beat_commit_argv(&mut buf, 4096, msg.as_bytes()); let (x, sha) = run(&buf[..n], true); if x != 0 { eprintln!("trigit beat: commit-tree exit {x}: {sha}"); return Ok(x); }
+            let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
+            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
+            println!("{}", String::from_utf8_lossy(&buf[..n])); }
+        v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
+            if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if o.is_empty() && x == 0 { println!("no verdict for {key}"); } else { println!("{}", o.trim()); } println!("{}", v::verdict_where()); }
+        v::A_GOLDEN => return cmd_golden("land", false, None, 0),
+        _ => { let n = v::usage_text(&mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+    }
+    Ok(0)
+}
+
+/// `tri t27os release --plan` | `manifest` | `publish --yes` (#11315, #11403): the texts are specs/t27os/release.t27.
+fn cmd_t27os(action: &str, plan: bool, yes: bool, build: u32, sums: &str) -> i32 {
+    let (mut buf, v, s) = (vec![0u8; 8192], t27rel::current_version(), std::fs::read(sums).unwrap_or_default());
+    let n = match action {
+        "release" if plan => t27rel::plan_text(&mut buf, 8192, v),
+        "manifest" if build > 0 => t27rel::manifest_from_sums(&mut buf, 8192, v, build, &s, s.len()),
+        "publish" if t27rel::publish_allowed(plan, yes) => { let n = t27rel::publish_text(&mut buf, 8192, v); return Command::new("sh").arg("-c").arg(String::from_utf8_lossy(&buf[..n.min(8192)]).as_ref()).status().map_or(2, |x| x.code().unwrap_or(2)) }
+        _ => { eprintln!("{}", if action == "manifest" { "tri t27os manifest: --build N and --sums <complete sums file> are required" } else { t27rel::REFUSAL }); return 2 }
+    };
+    print!("{}", String::from_utf8_lossy(&buf[..n.min(8192)])); (n == 0 || n > 8192) as i32
 }
