@@ -65,3 +65,11 @@
   `OWN_DOMAIN`; a matter with no address is not judged.
 - `mail_ball_weighed`: nobody to answer is `none`, otherwise jcrm's decision
   stands. Such matters are counted (`AUTOMATED_IS_COUNTED`), never dropped.
+
+## v6 -- a relay's no-reply speaks for a person (t27#5423)
+
+- v5 read live: 53 matters machine-only, 48 of them from `noreply@hh.ru`. hh.ru
+  relays an employer's message through its no-reply address, so v5 moved live
+  conversations off "on us". That was the spec's mistake, not jcrm's.
+- `relay_domain`: an address on `RELAY_DOMAIN` (or under it) is never a
+  machine's. `RELAY_SEEN` records the 48.
