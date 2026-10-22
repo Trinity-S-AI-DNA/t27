@@ -26,31 +26,24 @@ use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[path = "../../../gen/rust/tri/seals/drift.rs"] #[allow(dead_code, unused_parens)] mod drift; // t27c gen-rust of specs/tri/seals/drift.t27 (#11045)
+#[path = "../../../gen/rust/tri/seals/merge_driver.rs"] #[allow(dead_code, unused_parens)] mod merge_driver; // t27c gen-rust of specs/tri/seals/merge_driver.t27 (#11402)
 #[path = "../../../bootstrap/gen/rust/verified/suite_jobs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod suite_jobs; // specs/verified/suite_jobs.t27
 
 #[derive(Subcommand)]
 pub enum SealsCmd {
+    /// Re-save the seals of the specs changed against origin/master and of their importers, in this checkout (rules: specs/tri/land/land.t27 seals mode, #11402).
+    Changed,
+    /// Git merge driver for .trinity/seals/*.json, wired in .gitattributes: `tri seals merge-driver %O %A %B %P` (rules: specs/tri/seals/merge_driver.t27).
+    MergeDriver { base: String, ours: String, theirs: String, path: String },
     /// Is the built compiler newer than the source the seals are checked against?
     ///
-    /// Answers the one question that made a red gate read as green: a seal check
-    /// compares against WHAT THE COMPILER PRODUCES, and a compiler older than
-    /// its own source produces the previous answer. Absence of a binary is
-    /// already handled everywhere; staleness is not, and it is indistinguishable
-    /// from health in every output.
+    /// A compiler older than its own source produces the previous answer, so a seal check against it reads green.
     Fresh,
     /// Seals whose claims no longer match what the compiler produces, and the
     /// one command that repairs them.
     ///
-    /// The recipe is five steps and thirty seconds, and it is written down
-    /// nowhere: rebuild, list the drift, `seal --save` each, `sync-twins`,
-    /// re-check. Measured over twelve hours: SIX changes to the compiler, ONE
-    /// of which touched `.trinity/seals/`, and zero mentions of re-sealing in
-    /// CONTRIBUTING, docs/ or the pull-request template.
-    ///
-    /// The value is not the thirty seconds. It is the two refusals a hand-rolled
-    /// loop forgets: a compiler older than its own source answers with the
-    /// PREVIOUS output and every seal appears to hold, and `--force` writes
-    /// `gen_hash=none` as though absence were a hash.
+    /// Rebuild, list the drift, `seal --save` each, `sync-twins`, re-check; it refuses a compiler older
+    /// than its own source and never writes `gen_hash=none` (rules: specs/tri/seals/drift.t27).
     Drift {
         /// Re-seal what drifted, then sync the twins.
         ///
@@ -85,17 +78,8 @@ pub enum SealsCmd {
     },
     /// Seals that record `gen_hash=none` -- a spec that produced no output, sealed.
     ///
-    /// Two commands already REFUSE to write one: `drift --fix` calls
-    /// `is_sealable`, and `sync-twins` will not propagate one. Nothing counts
-    /// the ones already on disk, and every check reads them as healthy: the
-    /// spec_hash matches, so freshness passes; `none` equals `none`, so drift
-    /// reports zero; the file exists, so coverage counts it as covered.
-    ///
-    /// What such a seal actually records is that generation did not happen.
-    /// Measured on this repository the day the command was written: 218 seals
-    /// of 1316, and the split is total -- either all four hashes are real or
-    /// all four are `none`, never a mix, because a spec that fails to parse
-    /// fails all four backends at once.
+    /// `drift --fix` and `sync-twins` refuse to write one, but every check reads the ones on disk as healthy
+    /// (`none` equals `none`); this counts them. Either all four hashes are real or all four are `none`.
     Hollow {
         /// Also run the compiler on each spec and group the parse errors.
         ///
@@ -347,17 +331,23 @@ fn sync_twins(root: &PathBuf, dir: &PathBuf, dry_run: bool) -> Result<()> {
 }
 
 pub fn run(cmd: &SealsCmd) -> Result<()> {
+    let read = |p: &str| -> &'static str { std::fs::read_to_string(p).unwrap_or_default().leak() };
+    match cmd {
+        SealsCmd::Changed => std::process::exit(crate::cmd_land(None, 0, false, true, true)? as i32),
+        SealsCmd::MergeDriver { ours, theirs, path, .. } => { let d = merge_driver::decide(path.clone().leak(), read(ours.as_str()), read(theirs.as_str())); println!("{}", merge_driver::say(d)); std::process::exit(d as i32) }
+        _ => {}
+    }
     let root = repo_root()?;
     let dir = root.join(".trinity/seals");
     if !dir.is_dir() {
-        // Not "zero twins". There is no seal directory here, which is a
-        // different world from a directory with nothing wrong in it.
+        // Not "zero twins": no seal directory is not a directory with nothing wrong in it.
         anyhow::bail!(
             "no seal directory at {} -- nothing was read, so nothing is claimed",
             dir.display()
         );
     }
     let all = match cmd {
+        SealsCmd::Changed | SealsCmd::MergeDriver { .. } => return Ok(()), // answered above
         SealsCmd::SyncTwins { dry_run } => return sync_twins(&root, &dir, *dry_run),
         SealsCmd::Fresh => {
             // The SAME order `check_seal_coverage.py::_find_t27c` uses. Only the
@@ -715,7 +705,7 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
             sync_twins(&root, &dir, false)?;
             return Ok(());
         }
-        SealsCmd::Twins { all } => all,
+        SealsCmd::Twins { all } => all, SealsCmd::Changed | SealsCmd::MergeDriver { .. } => return Ok(()),
     };
     let by = collect(&dir)?;
 
@@ -766,6 +756,39 @@ pub fn run(cmd: &SealsCmd) -> Result<()> {
     println!("  A pair that disagrees is two answers to one question. Which one is");
     println!("  the truth is #2767's decision, not this command's -- it only reports.");
     Ok(())
+}
+
+// `tri coverage` (#11061): every rule is specs/tri/coverage/coverage.t27; this runs git and t27c (argument vectors, no shell) and prints what the rules write.
+#[path = "../../../gen/rust/tri/coverage/coverage.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod cov; // t27c gen-rust of specs/tri/coverage/coverage.t27: the five facts, a spec's row and the total
+/// What `t27c test-report` and `t27c seal --verify` say about one spec, and the spec's own text.
+fn cov_probe(t27c: &str, path: &str) -> cov::TriCoverageProbe {
+    let leak = |s: String| -> &'static str { s.leak() };
+    let (report, test_run) = crate::test_report(t27c, std::path::Path::new(path), false).unwrap_or(("", u8::MAX));
+    let seal = std::process::Command::new(t27c).args(["seal", path, "--verify"]).output();
+    cov::TriCoverageProbe { path: leak(path.into()), report, test_run, seal: leak(seal.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()), seal_ok: seal.map_or(false, |o| o.status.success()), source: leak(std::fs::read_to_string(path).unwrap_or_default()) }
+}
+
+pub fn coverage_run(patterns: &[String], strict: bool, t27c: Option<&str>) -> Result<i32> {
+    let t27c = crate::mutate::resolve_t27c(t27c);
+    let mut specs: Vec<String> = Vec::new();
+    for p in patterns {
+        let o = std::process::Command::new("git").args(["ls-files", "--cached", "--others", "--exclude-standard", "--"]).arg(format!(":(glob){p}")).output()?;
+        specs.extend(String::from_utf8_lossy(&o.stdout).lines().filter(|l| cov::is_spec_path(l.to_string().leak())).map(String::from));
+    }
+    specs.sort();
+    specs.dedup();
+    let mut probes: Vec<(usize, cov::TriCoverageProbe)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..cov::JOBS).map(|j| { let (t, sp) = (t27c.as_str(), &specs); s.spawn(move || (j..sp.len()).step_by(cov::JOBS).map(|i| (i, cov_probe(t, &sp[i]))).collect::<Vec<_>>()) }).collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    probes.sort_by_key(|p| p.0);
+    let mut buf = vec![0u8; cov::ROW_MAX.max(cov::TOTAL_MAX)];
+    let masks: Vec<u8> = probes.iter().map(|(_, p)| { let n = cov::emit_row(&mut buf, 0, *p); print!("{}", String::from_utf8_lossy(&buf[..n])); cov::facts(*p) }).collect();
+    let ok: Vec<u64> = (0..cov::FACTS).map(|k| masks.iter().filter(|m| cov::holds(**m, k)).count() as u64).collect();
+    let n = cov::emit_total(&mut buf, 0, masks.len() as u64, ok[0], ok[1], ok[2], ok[3], ok[4]);
+    print!("{}", String::from_utf8_lossy(&buf[..n]));
+    Ok(cov::coverage_exit(masks.len() as u64, ok.iter().sum(), strict) as i32)
 }
 
 #[cfg(test)]

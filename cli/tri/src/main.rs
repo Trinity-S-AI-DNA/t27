@@ -54,6 +54,12 @@ mod raw; // t27c gen-rust of specs/analog/raw_writer.t27: every rule of `tri raw
 mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line of `tri remote` (#11020)
 #[path = "../../../gen/rust/tri/land/land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
+#[path = "../../../gen/rust/tri/land/golden_land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
+#[path = "../../../gen/rust/tri/trigit/verbs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod tv; // t27c gen-rust of specs/tri/trigit/verbs.t27: the trigit verbs (#11601, epic #11385 items 24-26)
+#[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod t27rel; // t27c gen-rust of specs/t27os/release.t27: the release plan and manifest text of `tri t27os` (#11315)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
 mod gen_cache; // the gen-hash cache's eviction limit, for `tri hot caches` (#8952)
 #[path = "../../../bootstrap/gen/rust/verified/bitstream_reuse.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -449,10 +455,20 @@ enum Commands {
         /// A netlist: print the M1 cell constants (CELL_N, CELL_D, CELL_NV) folded from it, or the refusal, instead of the inventory.
         #[arg(long)] emit_cell: bool,
     },
-    /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage and the ranked first-refusal kinds (rules: specs/tools/t27o/ledger.t27).
+    /// t27o over a tree (#10543): every tracked .rs and .zig file converted in-process; a file's row is reused while its key holds (its SHA-256 and the seals of rust_convert.t27 and rust_std.t27, and of zig_convert.t27 for a .zig file, read from the t27 checkout this runs in); `--repo <dir>` sweeps another checkout, with a cache of its own (#10638); counts, coverage, the files that convert whole, and the ranked first-refusal kinds, a cascade counted under its root (#11122; rules: specs/tools/t27o/ledger.t27).
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
     /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
+    /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
+    Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
+    /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
+    Trigit { #[arg(trailing_var_arg = true)] argv: Vec<String> },
+    /// T27 OS release front door: `release --plan` prints the numbered steps; `manifest --build N --sums FILE` prints the release manifest, a t27 module the app reads; `publish --yes` builds app and toolchain from one clean commit and creates the t27os-v<version>-b<build> release and the t27os-latest pointer; without --yes it is refused (rules: specs/t27os/release.t27, #11315, #11403).
+    T27os { action: String, #[arg(long)] plan: bool, #[arg(long)] yes: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sums: String },
+    /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
+    Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
+    /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
+    Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
 }
 
 #[derive(Subcommand)]
@@ -1232,6 +1248,7 @@ fn cmd_health(root: &Path, target: Option<&str>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--version") { let mut b = [0u8; 256]; let n = t27rel::version_text(&mut b, 256, "tri", env!("CARGO_PKG_VERSION"), option_env!("T27_BUILD").and_then(|s| s.parse().ok()).unwrap_or(0), option_env!("T27_COMMIT").unwrap_or("unknown")); print!("{}", String::from_utf8_lossy(&b[..n])); return Ok(()) }
     let cli = Cli::parse();
 
     match &cli.command {
@@ -1372,7 +1389,12 @@ fn main() -> Result<()> {
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
-        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check)? as i32),
+        Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
+        Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
+        Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
+        Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
+        Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
+        Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
 
     Ok(())
@@ -1411,14 +1433,14 @@ fn cmd_t27o(file: &str, name: Option<&str>, oracle: bool, check: bool, t27c: Opt
     Ok(Command::new(mutate::resolve_t27c(t27c)).arg("test-report").arg(&path).status()?.code().unwrap_or(1) as u8)
 }
 
-/// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, root vs cascade, the ranking); this lists, hashes, converts in-process and keeps the cache.
+/// `tri t27o-sweep` (#10543): every rule is ledger.t27 (which files, whether a row is reusable, coverage, whole files, a cascade's root, the ranking); this lists, hashes, converts in-process and keeps the cache.
 fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>, top: usize) -> Result<u8> {
     let t0 = std::time::Instant::now(); let seal = |f: &str| -> Result<String> { let p = std::env::current_dir()?.join(f); Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(&p).with_context(|| format!("{}: cannot read the seal; {}", p.display(), t27o_ledger::SEAL_HINT))?)?["spec_hash"].as_str().with_context(|| format!("{}: no spec_hash", p.display()))?.to_string()) };
     let (conv, std, zs) = (seal(t27o_ledger::SEAL_CONVERTER)?, seal(t27o_ledger::SEAL_STD)?, seal(t27o_ledger::SEAL_ZIG)?); let zk = format!("{conv}+{zs}"); let repo: &'static str = repo.to_string().leak(); // the keys come from this checkout; the listing, the files and the cache belong to `root`
     let root: &'static str = if t27o_ledger::repo_is_here(repo) { t27o_ledger::SWEEP_HERE } else { fs::canonicalize(repo).with_context(|| format!("{repo}: cannot open the repository"))?.to_string_lossy().into_owned().leak() }; let cache = cache.map_or_else(|| { let mut b = vec![0u8; 4096]; let n = t27o_ledger::cache_path(root, &mut b); String::from_utf8_lossy(&b[..n]).into_owned() }, str::to_string);
-    let old: &'static str = fs::read_to_string(&cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 10).map(|f| (f[0], f)).collect();
+    let old: &'static str = fs::read_to_string(&cache).unwrap_or_default().leak(); let rows: std::collections::HashMap<&'static str, Vec<&'static str>> = old.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 11).map(|f| (f[0], f)).collect();
     let ls = Command::new("git").args(["-C", root, "ls-files", "--"]).args(paths).output()?; anyhow::ensure!(ls.status.success(), "{root}: git ls-files failed: {}", String::from_utf8_lossy(&ls.stderr).trim()); let listing: &'static str = String::from_utf8(ls.stdout)?.leak();
-    let (mut tab, mut kinds, mut tot, mut n) = (String::new(), std::collections::BTreeMap::<&'static str, usize>::new(), [0usize; 5], [0usize; 3]);
+    let (mut tab, mut kinds, mut tot, mut n) = (String::new(), std::collections::BTreeMap::<&'static str, usize>::new(), [0usize; 6], [0usize; 4]);
     for p in listing.lines().filter(|p| t27o_ledger::sweep_path(p)) {
         let Ok(src) = fs::read(Path::new(root).join(p)) else { continue };
         if t27o_ledger::over_cap(src.len(), max) { n[2] += 1; println!("{p}  {} bytes  skipped", src.len()); continue; }
@@ -1428,18 +1450,18 @@ fn cmd_t27o_sweep(paths: &[String], repo: &str, max: usize, cache: Option<&str>,
         let f: Vec<&'static str> = if reuse { r.unwrap().clone() } else {
             let (mut out, mut st, mut k) = (vec![0u8; 1 << 24], vec![0usize; 1 << 18], std::collections::BTreeMap::<&'static str, usize>::new()); let stem = Path::new(p).file_stem().map_or("Converted".into(), |s| s.to_string_lossy().into_owned());
             let m = if z { zig::to_t27(&src, stem.as_bytes(), &mut out, &mut st) } else { t27o::convert(&src, stem.as_bytes(), &mut out, &mut st) };
-            let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); for l in o.lines().filter(|l| t27o_ledger::is_refusal(l)) { *k.entry(&l[t27o_ledger::kind_from(l)..t27o_ledger::kind_to(l)]).or_default() += 1; }
-            format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
+            let o: &'static str = String::from_utf8_lossy(&out[..m.min(out.len())]).into_owned().leak(); let (mut at, mut via) = (t27o_ledger::next_refusal(o, 0), 0usize); while at < o.len() { let r = t27o_ledger::root_of(o, at); *k.entry(&o[t27o_ledger::kind_from(o, r)..t27o_ledger::kind_to(o, r)]).or_default() += 1; via += t27o_ledger::attributed(o, at, r) as usize; at = t27o_ledger::next_refusal(o, at + 1); }
+            format!("{p}\t{sha}\t{ck}\t{std}\t{}\t{}\t{}\t{}\t{}\t{via}\t{}", st[t27o::NFN], st[t27o::NOK], st[t27o::NTEST], st[t27o::NTS], st[t27o::NSTUB], k.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(";")).leak().split('\t').collect()
         };
         n[reuse as usize] += 1; tab += &format!("{}\n", f.join("\t"));
-        (0..5).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0));
-        f[9].split(';').filter_map(|e| e.rsplit_once('=')).for_each(|(k, c)| *kinds.entry(k).or_default() += c.parse::<usize>().unwrap_or(0));
+        (0..6).for_each(|i| tot[i] += f[4 + i].parse::<usize>().unwrap_or(0)); n[3] += t27o_ledger::converts_whole(f[4].parse().unwrap_or(0), f[5].parse().unwrap_or(0)) as usize;
+        f[10].split(';').filter_map(|e| e.rsplit_once('=')).for_each(|(k, c)| *kinds.entry(k).or_default() += c.parse::<usize>().unwrap_or(0));
         println!("{}  {} {} {}/{} {}  {}", f[0], f[4], f[5], f[6], f[7], f[8], if reuse { "reused" } else { "fresh" });
     }
     let cov = t27o_ledger::coverage_permille(tot[0], tot[1]); println!("total {} files  {} fn seen  {} converted  tests {}/{}  stubs {}  coverage {}", n[0] + n[1], tot[0], tot[1], tot[2], tot[3], tot[4], if t27o_ledger::coverage_known(cov) { format!("{}.{}%", cov / 10, cov % 10) } else { "unknown".into() });
     let (casc, mut root): (Vec<_>, Vec<_>) = kinds.into_iter().partition(|(k, _)| t27o_ledger::is_cascade(*k));
     root.sort_by(|a, b| t27o_ledger::rank_cmp(a.1, a.0, b.1, b.0).cmp(&0)); root.iter().take(top).for_each(|(k, c)| println!("{c:>7}  {k}"));
-    println!("{:>7}  cascade ({})\ncold {} / reused {} / skipped {}  wall {:.1} s", casc.iter().map(|k| k.1).sum::<usize>(), t27o_ledger::KIND_CASCADE, n[0], n[1], n[2], t0.elapsed().as_secs_f64());
+    let ext = casc.iter().map(|k| k.1).sum::<usize>(); println!("{:>7}  files convert whole (every fn converted)\n{:>7}  refused only through a cascade: {} counted under their root above, {ext} {}\ncold {} / reused {} / skipped {}  wall {:.1} s", n[3], tot[5] + ext, tot[5], t27o_ledger::KIND_EXTERNAL, n[0], n[1], n[2], t0.elapsed().as_secs_f64());
     if let Some(d) = Path::new(&cache).parent() { fs::create_dir_all(d)?; } fs::write(&cache, tab)?; Ok(0)
 }
 
@@ -1497,10 +1519,10 @@ fn cmd_serve(addr: &str) -> Result<()> {
 }
 
 /// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
-fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result<u8> {
+fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bool) -> Result<u8> {
     let leak = |s: String| -> &'static str { s.leak() };
     let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan };
+    let mut r = land::TriLandReq { branch: leak(branch.map_or_else(head, str::to_string)), issue, scratch: leak(std::env::temp_dir().join(format!("tri-land-{}", std::process::id())).display().to_string()), t27c: leak(std::env::var("T27C").unwrap_or("t27c".into())), tri: leak(std::env::current_exe()?.display().to_string()), changes: "", check, plan, seals };
     let (mut ev, mut buf, mut code, mut at) = ("", vec![0u8; land::CMD_MAX], land::request_refusal(r), (0u8, 0u64));
     let argv = |b: &[u8]| -> Vec<String> { String::from_utf8_lossy(b).lines().map(str::to_string).collect() };
     if plan && code == land::L_OK { for k in 0..land::LAND_STEPS { let n = land::step_argv(r, "", k, 0, &mut buf); println!("{k:2} {:<17} {}", land::step_name(k), argv(&buf[..n]).join(" ")); } return Ok(0); }
@@ -1512,7 +1534,7 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result
         anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
         let a = argv(&buf[..n]);
         let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
-        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::in_scratch(at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
+        while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::cwd_scratch(r, at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
         let text = leak(text);
         let mut sec = vec![0u8; text.len() + 128];
         let m = land::emit_section(&mut sec, 0, at.0, at.1, x, text);
@@ -1526,4 +1548,81 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool) -> Result
     let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
     println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
     Ok(land::exit_code(code))
+}
+
+/// `tri golden land|push|status` (#11275): every rule is specs/tri/land/golden_land.t27 over golden_chain.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence and stops where the spec says.
+fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Result<u8> {
+    use golden_land as g;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let env = |k: &str, d: &str| leak(std::env::var(k).unwrap_or(d.into()));
+    let r = g::GolReq { verb: g::verb_of(leak(action.into())), plan, queued: queued.unwrap_or(g::ABSENT), issue, scratch: leak(std::env::temp_dir().join(format!("tri-golden-{}", std::process::id())).display().to_string()), t27b: env("T27B", "t27b"), t27c: env("T27C", "t27c"), tri: leak(std::env::current_exe()?.display().to_string()) };
+    let (mut ev, mut buf, mut code, mut wo, mut wp) = ("", vec![0u8; g::CMD_MAX], g::request_refusal(r), vec![0u8; 16], vec![0usize; 16]);
+    let run = |b: &[u8], dir: &str| { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); match Command::new(&a[0]).args(&a[1..]).current_dir(dir).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) } };
+    if code == g::C_OK { std::fs::create_dir_all(r.scratch)?; }
+    while code == g::C_OK {
+        let s = g::next_slot(r, ev, &mut wo, &mut wp);
+        if s >= g::DONE { break; }
+        let (k, n) = ((s / g::SLOT) as u8, s % g::SLOT);
+        let m = g::step_argv(r, ev, k, n, &mut buf, &mut wo, &mut wp);
+        anyhow::ensure!(m > 0, "tri golden: step {k} does not fit");
+        let argv = buf[..m].to_vec();
+        let c = g::step_cwd(r, k, n, &mut buf);
+        let (x, text) = run(&argv, if c > 0 { leak(String::from_utf8_lossy(&buf[..c]).into()) } else { "." });
+        let (text, mut sec) = (leak(text.clone()), vec![0u8; text.len() + 128]);
+        let w = g::emit_section(&mut sec, 0, k, n, x, text);
+        ev = leak(format!("{ev}{}", String::from_utf8_lossy(&sec[..w])));
+        code = g::judge(r, ev, k, n);
+        eprintln!("golden {k}.{n} exit {x}");
+    }
+    let m = g::step_argv(r, ev, g::G_PRUNE, 0, &mut buf, &mut wo, &mut wp);
+    if m > 0 { let _ = std::fs::remove_dir_all(r.scratch); run(&buf[..m].to_vec(), "."); }
+    let mut out = vec![0u8; 16384];
+    let w = g::report(r, ev, code, &mut out, &mut wo, &mut wp, &mut buf);
+    print!("{}", String::from_utf8_lossy(&out[..w]));
+    Ok(g::exit_code(code))
+}
+
+/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed, or prints the spec's words. Same shape as cmd_golden.
+fn cmd_trigit(args: &[String]) -> Result<u8> {
+    use tv as v;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let verb = if args.is_empty() { v::TV_UNKNOWN } else { v::verb_of(leak(args[0].to_lowercase())) };
+    let run = |b: &[u8], ident: bool| -> (u8, String) { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); if a.is_empty() { return (127, "empty argv".into()); } let mut c = Command::new(&a[0]); c.args(&a[1..]); if ident { for (k, val) in [("GIT_AUTHOR_NAME", "t27os"), ("GIT_AUTHOR_EMAIL", "t27os@localhost"), ("GIT_COMMITTER_NAME", "t27os"), ("GIT_COMMITTER_EMAIL", "t27os@localhost")] { c.env(k, val); } } match c.output() { Ok(o) => (o.status.code().unwrap_or(255) as u8, String::from_utf8_lossy(&o.stdout).trim().to_string()), Err(e) => (127, e.to_string()) } };
+    let mut buf = vec![0u8; 4096];
+    let say = |k: u8, r: &[u8], val: &[u8], b: &mut Vec<u8>| { let n = v::did_text(k, r, val, b.as_mut_slice(), 4096); println!("{}", String::from_utf8_lossy(&b[..n])); };
+    match v::host_action(verb) {
+        v::A_REFUSE => { let n = v::refusal_text(verb, &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+        v::A_ARGV => { let issue = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0); let sha = args.get(2).map(String::as_str).unwrap_or(""); let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
+            if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::CLAIM_PREF, issue)); say(v::TV_CLAIM, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_BEAT => { let host = leak(args.get(1).cloned().unwrap_or("localhost".to_string())); let build: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ver = leak(std::env::var("T27_VER").unwrap_or("0.1.0".into())); let tc = leak(std::env::var("T27_TC").unwrap_or("0.5.2".into()));
+            let m = v::beat_msg(&mut buf, 4096, host.as_bytes(), build, ver.as_bytes(), tc.as_bytes()); let msg = String::from_utf8_lossy(&buf[..m]).into_owned();
+            let n = v::beat_commit_argv(&mut buf, 4096, msg.as_bytes()); let (x, sha) = run(&buf[..n], true); if x != 0 { eprintln!("trigit beat: commit-tree exit {x}: {sha}"); return Ok(x); }
+            let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
+            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
+            println!("{}", String::from_utf8_lossy(&buf[..n])); }
+        v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
+            if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if o.is_empty() && x == 0 { println!("no verdict for {key}"); } else { println!("{}", o.trim()); } println!("{}", v::verdict_where()); }
+        v::A_GOLDEN => return cmd_golden("land", false, None, 0),
+        _ => { let n = v::usage_text(&mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+    }
+    Ok(0)
+}
+
+/// `tri t27os release --plan` | `manifest` | `publish --yes` (#11315, #11403): the texts are specs/t27os/release.t27.
+fn cmd_t27os(action: &str, plan: bool, yes: bool, build: u32, sums: &str) -> i32 {
+    let (mut buf, v, s) = (vec![0u8; 8192], t27rel::current_version(), std::fs::read(sums).unwrap_or_default());
+    let n = match action {
+        "release" if plan => t27rel::plan_text(&mut buf, 8192, v),
+        "manifest" if build > 0 => t27rel::manifest_from_sums(&mut buf, 8192, v, build, &s, s.len()),
+        "publish" if t27rel::publish_allowed(plan, yes) => { let n = t27rel::publish_text(&mut buf, 8192, v); return Command::new("sh").arg("-c").arg(String::from_utf8_lossy(&buf[..n.min(8192)]).as_ref()).status().map_or(2, |x| x.code().unwrap_or(2)) }
+        _ => { eprintln!("{}", if action == "manifest" { "tri t27os manifest: --build N and --sums <complete sums file> are required" } else { t27rel::REFUSAL }); return 2 }
+    };
+    print!("{}", String::from_utf8_lossy(&buf[..n.min(8192)])); (n == 0 || n > 8192) as i32
 }
