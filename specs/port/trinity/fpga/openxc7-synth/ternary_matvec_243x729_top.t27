@@ -1,0 +1,602 @@
+//! Port of gHashTag/trinity `fpga/openxc7-synth/ternary_matvec_243x729_top.v`
+//! (original at commit e71d166ad6ef) to a t27 specification.
+//!
+//! The original is the openXC7 synthesis top level for the TrinityBlock-scale
+//! ternary matrix-vector multiply: a 243-input x 729-output mat-vec driving a
+//! power-on self-test, a status LED and a UART status report.
+//!
+//! Porting notes:
+//!  * The datapath itself (ternary_matvec_core, weight ROM {-81, 162, -81}
+//!    repeating, saturation accumulator) lives in the sibling port
+//!    `ternary_matvec.t27` in this directory. This file ports the top-level
+//!    wrapper: power-on reset, self-test FSM, LED, UART TX and report logic.
+//!  * Every `always @(posedge clk)` block of the original is modeled as a pure
+//!    next-state function over a state struct (por_step, self_test_step,
+//!    led_step, uart_tx_step), so the full sequential behavior is executable
+//!    and covered by `test` blocks below.
+//!  * The module hardware surface keeps the registers the original owned
+//!    (self-test FSM state, LED counter/state, pass/done flags). `on_clock`
+//!    advances them exactly as the original always block did; `on_comb`
+//!    drives the active-low LED pin. `gen-verilog` lowers this surface.
+//!  * Original constants are kept verbatim: POR_CYCLES=255, WAIT_CYCLES=20,
+//!    LED_TOGGLE_AT=6_250_000 (~8 Hz LED at 50 MHz), CLK_DIV=27 (~1.79 Mbaud),
+//!    frame type 0x42, 20-byte report frame.
+module ternary_matvec_243x729_top {
+
+    // ---- localparams of the original ----
+    pub const N_IN: i32 = 243;            // core input width
+    pub const N_OUT: i32 = 729;           // core output width (expected results)
+    pub const ACC_WIDTH: i32 = 20;        // core accumulator width
+    pub const J_WIDTH: i32 = 10;          // core address width
+    pub const POR_CYCLES: i32 = 255;      // internal power-on reset length
+    pub const WAIT_CYCLES: i32 = 20;      // ST_WAIT length before kick-off
+    pub const LED_TOGGLE_AT: i32 = 6250000; // 50 MHz / 6_250_001 ~ 8 Hz blink
+    pub const CLK_DIV: i32 = 27;          // UART bit period in clocks
+    pub const FRAME_TYPE: i32 = 0x42;     // status frame payload type
+    pub const REPORT_LEN: i32 = 20;       // [AA][BB][42][pass][hi lo]x8
+
+    // ---- self-test FSM states (original ST_*) ----
+    pub const ST_WAIT: i32 = 0;
+    pub const ST_START: i32 = 1;
+    pub const ST_COMPUTE: i32 = 2;
+    pub const ST_DONE: i32 = 3;
+
+    // ---- state structs, one per original always block ----
+
+    /// Power-on reset: internal 8-bit counter; rst held while counting.
+    pub struct Por { counter: i32, rst: bool }
+
+    /// Self-test FSM + streaming checker (original st_state/verify_fail/...).
+    pub struct SelfTest {
+        st_state: i32,
+        self_test_pass: bool,
+        computation_done: bool,
+        wait_cnt: i32,
+        verify_fail: bool,
+        check_count: i32,
+        j_mod3: i32,
+        mv_start: bool,
+    }
+
+    /// LED blinker (original led_state/led_counter; pin is active-low).
+    pub struct Led { state: bool, counter: i32 }
+
+    /// UART TX shifter (original uart_active/uart_shift/...).
+    pub struct UartTx { active: bool, shift: i32, bit_idx: i32, baud: i32, line: bool }
+
+    /// First 8 mat-vec results captured for the UART report (uart_results).
+    pub struct CapturedResults { r0: i32, r1: i32, r2: i32, r3: i32, r4: i32, r5: i32, r6: i32, r7: i32 }
+
+    // ---- expected value pattern ----
+
+    /// Expected core output for column j: {-81, 162, -81} repeating
+    /// (T23 weight pattern, i.e. 81 * {-1, +2, -1}).
+    /// Input is j mod 3, tracked by the counter in next_j_mod3 below.
+    pub fn expected_val(j_mod3: i32) -> i32 {
+        if (j_mod3 == 0) { return -81; }
+        if (j_mod3 == 1) { return 162; }
+        return -81;
+    }
+
+    /// j mod 3 advanced by counter instead of `% 3`, exactly as the original:
+    /// 0 -> 1 -> 2 -> 0.
+    pub fn next_j_mod3(j_mod3: i32) -> i32 {
+        if (j_mod3 == 2) { return 0; }
+        return j_mod3 + 1;
+    }
+
+    // ---- power-on reset ----
+
+    pub fn por_init() -> Por {
+        return Por{ .counter = 0, .rst = true };
+    }
+
+    /// One clock of the original por_counter always block: rst stays high
+    /// while the counter runs 0..254, and releases once it reaches 255.
+    pub fn por_step(p: Por) -> Por {
+        var next: Por = p;
+        if (p.counter < POR_CYCLES) {
+            next.counter = p.counter + 1;
+            next.rst = true;
+        } else {
+            next.rst = false;
+        }
+        return next;
+    }
+
+    // ---- self-test FSM ----
+
+    pub fn self_test_init() -> SelfTest {
+        return SelfTest{
+            .st_state = ST_WAIT,
+            .self_test_pass = false,
+            .computation_done = false,
+            .wait_cnt = 0,
+            .verify_fail = false,
+            .check_count = 0,
+            .j_mod3 = 0,
+            .mv_start = false,
+        };
+    }
+
+    /// One clock of the original self-test always block. `mv_valid`/`mv_data`
+    /// are the core result-stream handshake; `mv_done` ends the computation.
+    pub fn self_test_step(st: SelfTest, mv_valid: bool, mv_data: i32, mv_done: bool) -> SelfTest {
+        var next: SelfTest = st;
+        next.mv_start = false;   // default: mv_start pulses for one clock only
+        if (st.st_state == ST_WAIT) {
+            if (st.wait_cnt < WAIT_CYCLES) {
+                next.wait_cnt = st.wait_cnt + 1;
+            } else {
+                // original only moves state here: mv_start keeps its default 0
+                next.st_state = ST_START;
+            }
+            return next;
+        }
+        if (st.st_state == ST_START) {
+            next.j_mod3 = 0;
+            next.verify_fail = false;
+            next.check_count = 0;
+            next.st_state = ST_COMPUTE;
+            next.mv_start = true;
+            return next;
+        }
+        if (st.st_state == ST_COMPUTE) {
+            if (mv_valid) {
+                if (mv_data != expected_val(st.j_mod3)) {
+                    next.verify_fail = true;
+                }
+                next.j_mod3 = next_j_mod3(st.j_mod3);
+                next.check_count = st.check_count + 1;
+            }
+            if (mv_done) {
+                next.computation_done = true;
+                // original samples the pre-cycle values (nonblocking assigns)
+                next.self_test_pass = !st.verify_fail && st.check_count == N_OUT;
+                next.st_state = ST_DONE;
+            }
+            return next;
+        }
+        return next;   // ST_DONE: terminal
+    }
+
+    // ---- LED ----
+
+    pub fn led_init() -> Led {
+        return Led{ .state = false, .counter = 0 };
+    }
+
+    /// One clock of the original LED always block: free-running counter
+    /// toggles the LED every LED_TOGGLE_AT+1 clocks while the FSM runs;
+    /// once ST_DONE is reached the LED shows the self-test verdict instead.
+    pub fn led_step(led: Led, st_state: i32, self_test_pass: bool) -> Led {
+        var next: Led = led;
+        next.counter = led.counter + 1;
+        if (st_state == ST_DONE) {
+            next.state = self_test_pass;
+        } else if (led.counter == LED_TOGGLE_AT) {
+            next.counter = 0;
+            next.state = !led.state;
+        }
+        return next;
+    }
+
+    /// LED pin is active-low on the board: logical ON drives the pin low.
+    pub fn led_pin(led_state: bool) -> bool {
+        return !led_state;
+    }
+
+    // ---- debug_state pins ----
+
+    /// debug_state[0] = self_test_pass, debug_state[1] = computation_done.
+    pub fn debug_state(self_test_pass: bool, computation_done: bool) -> i32 {
+        var bits: i32 = 0;
+        if (self_test_pass) { bits = bits + 1; }
+        if (computation_done) { bits = bits + 2; }
+        return bits;
+    }
+
+    // ---- UART TX ----
+
+    pub fn uart_tx_init() -> UartTx {
+        return UartTx{ .active = false, .shift = 0, .bit_idx = 0, .baud = 0, .line = true };
+    }
+
+    /// One clock of the original uart_tx always block: idle-high line, on
+    /// `send` a start bit, then 8 data bits LSB-first, a stop bit, and back
+    /// to idle. Each bit lasts CLK_DIV clocks (baud 0..CLK_DIV-1).
+    pub fn uart_tx_step(u: UartTx, send: bool, byte: i32) -> UartTx {
+        var next: UartTx = u;
+        if (!u.active) {
+            next.line = true;
+            if (send) {
+                next.line = false;        // start bit
+                next.shift = byte;
+                next.active = true;
+                next.bit_idx = 0;
+                next.baud = 0;
+            }
+            return next;
+        }
+        if (u.baud < CLK_DIV - 1) {
+            next.baud = u.baud + 1;       // hold current bit
+            return next;
+        }
+        next.baud = 0;
+        if (u.bit_idx < 8) {
+            if (u.shift % 2 == 1) { next.line = true; } else { next.line = false; }
+            next.shift = u.shift >> 1;    // LSB first
+            next.bit_idx = u.bit_idx + 1;
+            return next;
+        }
+        if (u.bit_idx == 8) {
+            next.line = true;             // stop bit
+            next.bit_idx = u.bit_idx + 1;
+            return next;
+        }
+        next.active = false;              // back to idle, line high
+        next.line = true;
+        return next;
+    }
+
+    /// Ready for a new byte exactly when idle.
+    pub fn uart_tx_ready(u: UartTx) -> bool {
+        return !u.active;
+    }
+
+    // ---- UART report frame ----
+
+    /// uart_results[k] - captured first 8 core outputs.
+    pub fn captured_at(res: CapturedResults, k: i32) -> i32 {
+        if (k == 0) { return res.r0; }
+        if (k == 1) { return res.r1; }
+        if (k == 2) { return res.r2; }
+        if (k == 3) { return res.r3; }
+        if (k == 4) { return res.r4; }
+        if (k == 5) { return res.r5; }
+        if (k == 6) { return res.r6; }
+        if (k == 7) { return res.r7; }
+        return 0;
+    }
+
+    /// Byte `idx` of the 20-byte status frame the reporter sends once:
+    /// [0]=0xAA, [1]=0xBB, [2]=frame type, [3]=pass flag, [4..19]=the first
+    /// eight results as big-endian 16-bit words. Out-of-range returns 0.
+    pub fn report_frame_byte(idx: i32, pass: bool, res: CapturedResults) -> i32 {
+        if (idx == 0) { return 0xAA; }
+        if (idx == 1) { return 0xBB; }
+        if (idx == 2) { return FRAME_TYPE; }
+        if (idx == 3) {
+            if (pass) { return 1; }
+            return 0;
+        }
+        if (idx < REPORT_LEN) {
+            const k: i32 = (idx - 4) / 2;
+            const val: i32 = captured_at(res, k);
+            if (idx % 2 == 0) { return (val >> 8) & 0xFF; }   // high byte
+            return val & 0xFF;                                // low byte
+        }
+        return 0;
+    }
+
+    // ---- hardware surface ----
+
+    var st_state: i32 = ST_WAIT;
+    var wait_cnt: i32 = 0;
+    var self_test_pass: bool = false;
+    var computation_done: bool = false;
+    var led_state: bool = false;
+    var led_counter: i32 = 0;
+
+    /// Original always block, minus the core handshake itself: WAIT counts
+    /// out, START fires (the core would latch mv_start here and start the
+    /// mat-vec), COMPUTE stalls until mv_done arrives from the datapath, so
+    /// in this behavioral surface the FSM rests in ST_COMPUTE.
+    fn on_clock() {
+        if (st_state == ST_WAIT) {
+            if (wait_cnt < WAIT_CYCLES) {
+                wait_cnt = wait_cnt + 1;
+            } else {
+                st_state = ST_START;
+            }
+        } else if (st_state == ST_START) {
+            st_state = ST_COMPUTE;
+        }
+
+        if (st_state == ST_DONE) {
+            led_state = self_test_pass;
+        } else if (led_counter == LED_TOGGLE_AT) {
+            led_counter = 0;
+            led_state = !led_state;
+        } else {
+            led_counter = led_counter + 1;
+        }
+    }
+
+    /// Active-low LED pin.
+    fn on_comb() -> bool {
+        return !led_state;
+    }
+
+    // ---- tests ----
+
+    test expected_value_pattern {
+        // j = 0, 1, 2: the raw pattern
+        assert(expected_val(0) == -81);
+        assert(expected_val(1) == 162);
+        assert(expected_val(2) == -81);
+        // j = 3, 4, 5 repeat it, tracked by the mod-3 counter the original uses
+        var m: i32 = next_j_mod3(2);
+        assert(m == 0);
+        assert(expected_val(m) == -81);
+        m = next_j_mod3(m);
+        assert(m == 1);
+        assert(expected_val(m) == 162);
+        m = next_j_mod3(m);
+        assert(m == 2);
+        assert(expected_val(m) == -81);
+        // last output row of the 729: j = 728, 728 mod 3 = 2
+        assert(expected_val(2) == -81);
+    }
+
+    test mod3_counter_cycles {
+        var j: i32 = next_j_mod3(0);
+        assert(j == 1);
+        j = next_j_mod3(j);
+        assert(j == 2);
+        j = next_j_mod3(j);
+        assert(j == 0);
+        j = next_j_mod3(j);
+        assert(j == 1);
+    }
+
+    test por_releases_after_255 {
+        var p: Por = por_init();
+        assert(p.rst == true);
+        assert(p.counter == 0);
+        var i: i32 = 0;
+        while (i < POR_CYCLES) {
+            p = por_step(p);
+            i = i + 1;
+        }
+        assert(p.counter == POR_CYCLES);
+        assert(p.rst == true);       // held through the last count
+        p = por_step(p);
+        assert(p.rst == false);      // released
+        assert(p.counter == POR_CYCLES);
+        p = por_step(p);
+        assert(p.rst == false);      // stays released
+    }
+
+    test selftest_fsm_walk {
+        var st: SelfTest = self_test_init();
+        assert(st.st_state == ST_WAIT);
+        // WAIT counts 20 clocks...
+        var i: i32 = 0;
+        while (i < WAIT_CYCLES) {
+            st = self_test_step(st, false, 0, false);
+            i = i + 1;
+        }
+        assert(st.st_state == ST_WAIT);
+        assert(st.mv_start == false);
+        // ...then moves to START without pulsing yet (the original pulses in
+        // ST_START, not on the WAIT->START clock)...
+        st = self_test_step(st, false, 0, false);
+        assert(st.st_state == ST_START);
+        assert(st.mv_start == false);
+        // ...and the START clock fires the one-clock pulse into the first
+        // COMPUTE clock, where the core samples it.
+        st = self_test_step(st, false, 0, false);
+        assert(st.st_state == ST_COMPUTE);
+        assert(st.mv_start == true);
+        st = self_test_step(st, false, 0, false);
+        assert(st.st_state == ST_COMPUTE);
+        assert(st.mv_start == false);
+        assert(st.check_count == 0);
+        assert(st.verify_fail == false);
+    }
+
+    test selftest_full_stream_passes {
+        var st: SelfTest = self_test_init();
+        var i: i32 = 0;
+        while (i < WAIT_CYCLES + 2) {   // through WAIT + START into COMPUTE
+            st = self_test_step(st, false, 0, false);
+            i = i + 1;
+        }
+        assert(st.st_state == ST_COMPUTE);
+        var j: i32 = 0;
+        while (j < N_OUT) {             // 729 matching results stream by
+            st = self_test_step(st, true, expected_val(st.j_mod3), false);
+            j = j + 1;
+        }
+        assert(st.check_count == N_OUT);
+        assert(st.verify_fail == false);
+        assert(st.computation_done == false);
+        st = self_test_step(st, false, 0, true);   // core reports done
+        assert(st.computation_done == true);
+        assert(st.self_test_pass == true);
+        assert(st.st_state == ST_DONE);
+        // terminal state ignores further traffic
+        st = self_test_step(st, true, 999, false);
+        assert(st.check_count == N_OUT);
+    }
+
+    test selftest_mismatch_fails {
+        var st: SelfTest = self_test_init();
+        var i: i32 = 0;
+        while (i < WAIT_CYCLES + 2) {
+            st = self_test_step(st, false, 0, false);
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < N_OUT) {
+            if (j == 10) {
+                st = self_test_step(st, true, 999, false);   // corrupt result
+            } else {
+                st = self_test_step(st, true, expected_val(st.j_mod3), false);
+            }
+            j = j + 1;
+        }
+        assert(st.verify_fail == true);
+        assert(st.check_count == N_OUT);   // counted, but failed
+        st = self_test_step(st, false, 0, true);
+        assert(st.computation_done == true);
+        assert(st.self_test_pass == false);
+    }
+
+    test selftest_short_stream_fails {
+        var st: SelfTest = self_test_init();
+        var i: i32 = 0;
+        while (i < WAIT_CYCLES + 2) {
+            st = self_test_step(st, false, 0, false);
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < 100) {               // done arrives early
+            st = self_test_step(st, true, expected_val(st.j_mod3), false);
+            j = j + 1;
+        }
+        st = self_test_step(st, false, 0, true);
+        assert(st.computation_done == true);
+        assert(st.check_count == 100);
+        assert(st.self_test_pass == false);   // 100 != 729
+    }
+
+    test led_blinks_and_reports_verdict {
+        var led: Led = led_init();
+        assert(led_pin(led.state) == true);   // off while idle (active-low)
+        // one full blink period: LED_TOGGLE_AT idle ticks, then the toggle
+        var i: i32 = 0;
+        while (i < LED_TOGGLE_AT) {
+            led = led_step(led, ST_COMPUTE, false);
+            i = i + 1;
+        }
+        assert(led.state == false);
+        assert(led.counter == LED_TOGGLE_AT);
+        led = led_step(led, ST_COMPUTE, false);
+        assert(led.state == true);            // toggled on
+        assert(led.counter == 0);
+        assert(led_pin(led.state) == false);
+        // in ST_DONE the LED shows the verdict instead of blinking
+        led = led_step(led, ST_DONE, true);
+        assert(led.state == true);
+        assert(led_pin(led.state) == false);  // solid ON = passed
+        led = led_step(led, ST_DONE, false);
+        assert(led.state == false);
+        assert(led_pin(led.state) == true);   // OFF = failed
+    }
+
+    test debug_state_bits {
+        assert(debug_state(false, false) == 0);
+        assert(debug_state(true, false) == 1);
+        assert(debug_state(false, true) == 2);
+        assert(debug_state(true, true) == 3);
+    }
+
+    test uart_tx_sends_byte_lsb_first {
+        var u: UartTx = uart_tx_init();
+        assert(uart_tx_ready(u) == true);
+        assert(u.line == true);               // idle high
+        u = uart_tx_step(u, true, 0x42);      // 0x42 = 0b01000010
+        assert(u.active == true);
+        assert(uart_tx_ready(u) == false);
+        assert(u.line == false);              // start bit
+        var i: i32 = 0;
+        while (i < CLK_DIV - 1) {             // run out the start bit period
+            u = uart_tx_step(u, false, 0);
+            i = i + 1;
+        }
+        assert(u.line == false);              // still start bit
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == false);              // bit0 of 0x42 is 0
+        i = 0;
+        while (i < CLK_DIV - 1) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == true);               // bit1 of 0x42 is 1
+        i = 0;
+        while (i < CLK_DIV - 1) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == false);              // bit2 is 0
+        i = 0;
+        while (i < 5 * (CLK_DIV - 1)) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == true);               // bit6 of 0x42 is 1
+        i = 0;
+        while (i < CLK_DIV - 1) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == false);              // bit7 is 0
+        assert(u.active == true);             // stop bit still pending
+        i = 0;
+        while (i < CLK_DIV - 1) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.line == true);               // stop bit
+        i = 0;
+        while (i < CLK_DIV - 1) { u = uart_tx_step(u, false, 0); i = i + 1; }
+        u = uart_tx_step(u, false, 0);
+        assert(u.active == false);            // back to idle
+        assert(uart_tx_ready(u) == true);
+        assert(u.line == true);
+    }
+
+    test report_frame_layout {
+        var res: CapturedResults = CapturedResults{
+            .r0 = -81, .r1 = 162, .r2 = -81, .r3 = 162,
+            .r4 = -81, .r5 = 162, .r6 = -81, .r7 = 162,
+        };
+        // captured_at: the safe indexed read over the captured values
+        assert(captured_at(res, 0) == -81);
+        assert(captured_at(res, 1) == 162);
+        assert(captured_at(res, 7) == 162);
+        assert(captured_at(res, 8) == 0);   // out of range
+        assert(report_frame_byte(0, true, res) == 0xAA);
+        assert(report_frame_byte(1, true, res) == 0xBB);
+        assert(report_frame_byte(2, true, res) == FRAME_TYPE);
+        assert(report_frame_byte(3, true, res) == 1);
+        assert(report_frame_byte(3, false, res) == 0);
+        // -81 = 0xFFAF, 162 = 0x00A2, big-endian word per result
+        assert(report_frame_byte(4, true, res) == 0xFF);
+        assert(report_frame_byte(5, true, res) == 0xAF);
+        assert(report_frame_byte(6, true, res) == 0x00);
+        assert(report_frame_byte(7, true, res) == 0xA2);
+        assert(report_frame_byte(8, true, res) == 0xFF);
+        assert(report_frame_byte(9, true, res) == 0xAF);
+        assert(report_frame_byte(10, true, res) == 0x00);
+        assert(report_frame_byte(11, true, res) == 0xA2);
+        assert(report_frame_byte(12, true, res) == 0xFF);
+        assert(report_frame_byte(13, true, res) == 0xAF);
+        assert(report_frame_byte(14, true, res) == 0x00);
+        assert(report_frame_byte(15, true, res) == 0xA2);
+        assert(report_frame_byte(16, true, res) == 0xFF);
+        assert(report_frame_byte(17, true, res) == 0xAF);
+        assert(report_frame_byte(18, true, res) == 0x00);
+        assert(report_frame_byte(19, true, res) == 0xA2);
+        assert(report_frame_byte(20, true, res) == 0);   // out of range
+        assert(report_frame_byte(21, true, res) == 0);
+    }
+
+    test on_clock_walks_fsm_and_counts_led {
+        assert(st_state == ST_WAIT);
+        assert(wait_cnt == 0);
+        on_clock();
+        assert(wait_cnt == 1);
+        var i: i32 = 0;
+        while (i < WAIT_CYCLES - 1) {      // 20 WAIT ticks in total
+            on_clock();
+            i = i + 1;
+        }
+        assert(wait_cnt == WAIT_CYCLES);
+        assert(st_state == ST_WAIT);
+        on_clock();                        // WAIT -> START
+        assert(st_state == ST_START);
+        on_clock();                        // START -> COMPUTE
+        assert(st_state == ST_COMPUTE);
+        on_clock();                        // COMPUTE stalls without mv_done
+        assert(st_state == ST_COMPUTE);
+        assert(computation_done == false);
+        assert(self_test_pass == false);
+        // LED counter free-runs while the FSM is not DONE
+        assert(led_counter > 0);
+        assert(led_state == false);
+        assert(on_comb() == true);         // active-low pin mirrors led_state
+    }
+}
