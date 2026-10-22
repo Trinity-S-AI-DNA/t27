@@ -35,8 +35,12 @@ uint8_t claim_code(uint8_t alive, uint32_t age_min, uint32_t limit_min);
 bool railway_old(uint32_t major);
 bool ledger_quiet(uint32_t age_min, uint32_t limit_min);
 uint8_t checkout_code(bool ok, bool recloned);
+uint8_t image_code(bool master_known, bool reported, bool same);
 bool cap_rise_is_new(uint32_t not_pass, uint32_t old_cap, uint32_t new_not_pass);
+bool header_stored(uint8_t field);
 bool is_alarm(uint8_t t, uint8_t reference);
+bool is_alarm_tests(uint8_t t, uint8_t reference, bool compared, uint32_t disagree);
+bool lanes_stop(uint32_t jit_interp_mismatch, uint32_t reference_disagree);
 uint8_t check_effect(uint8_t state, uint8_t master, bool required);
 uint8_t master_state(bool running, uint8_t last);
 uint8_t effect_fold(uint8_t acc, uint8_t e);
@@ -269,11 +273,34 @@ uint8_t checkout_code(bool ok, bool recloned) {
     return 0;
 }
 
+uint8_t image_code(bool master_known, bool reported, bool same) {
+    if ((master_known == false)) {
+        return 0;
+    }
+    if ((reported == false)) {
+        return 1;
+    }
+    if ((same == false)) {
+        return 1;
+    }
+    return 0;
+}
+
 bool cap_rise_is_new(uint32_t not_pass, uint32_t old_cap, uint32_t new_not_pass) {
     if ((not_pass < new_not_pass)) {
         return true;
     }
     return ((not_pass - new_not_pass) <= old_cap);
+}
+
+bool header_stored(uint8_t field) {
+    if ((field == 5)) {
+        return false;
+    }
+    if ((field > 5)) {
+        return false;
+    }
+    return true;
 }
 
 bool is_alarm(uint8_t t, uint8_t reference) {
@@ -290,6 +317,28 @@ bool is_alarm(uint8_t t, uint8_t reference) {
         return true;
     }
     if ((t == 8)) {
+        return true;
+    }
+    return false;
+}
+
+bool is_alarm_tests(uint8_t t, uint8_t reference, bool compared, uint32_t disagree) {
+    if (is_alarm(t, reference)) {
+        return true;
+    }
+    if (compared) {
+        if ((disagree > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lanes_stop(uint32_t jit_interp_mismatch, uint32_t reference_disagree) {
+    if ((jit_interp_mismatch > 0)) {
+        return true;
+    }
+    if ((reference_disagree > 0)) {
         return true;
     }
     return false;
@@ -413,6 +462,12 @@ uint32_t with_tests(uint32_t reference, uint32_t vacuous) {
 /* -------------------------------------------------------
    Invariants (compile-time assertions)
    ------------------------------------------------------- */
+
+/* invariant: reference_disagree_always_stops */
+/* invariant reference_disagree_always_stops is not a C constant expression: lanes_stop(0, 1) */
+
+/* invariant: no_total_in_the_ledger_header */
+/* invariant no_total_in_the_ledger_header is not a C constant expression: (header_stored(5) == false) */
 
 /* invariant: gained_never_red */
 /* invariant gained_never_red is not a C constant expression: (delta_is_red(delta_code(0, 0, 2, 0, 0, 1)) == false) */
@@ -637,6 +692,22 @@ void test_doctor_checkout_kept(void) {
     assert_eq(checkout_code(true, false), 0);
 }
 
+void test_doctor_image_master_unknown(void) {
+    assert_eq(image_code(false, false, false), 0);
+}
+
+void test_doctor_image_unreported_is_stale(void) {
+    assert_eq(image_code(true, false, false), 1);
+}
+
+void test_doctor_image_differs(void) {
+    assert_eq(image_code(true, true, false), 1);
+}
+
+void test_doctor_image_current(void) {
+    assert_eq(image_code(true, true, true), 0);
+}
+
 void test_bless_rise_all_new(void) {
     assert(cap_rise_is_new(594, 582, 41));
 }
@@ -683,6 +754,44 @@ void test_alarm_mismatch_always(void) {
 
 void test_alarm_blocked_never(void) {
     assert((is_alarm(2, 0) == false));
+}
+
+void test_alarm_shared_fail_same_tests(void) {
+    assert((is_alarm_tests(5, 5, true, 0) == false));
+}
+
+void test_alarm_shared_fail_other_tests(void) {
+    assert(is_alarm_tests(5, 5, true, 1));
+}
+
+void test_alarm_shared_fail_not_compared(void) {
+    assert((is_alarm_tests(5, 5, false, 0) == false));
+}
+
+void test_alarm_pass_disagrees(void) {
+    assert(is_alarm_tests(0, 0, true, 2));
+}
+
+void test_alarm_pass_agrees(void) {
+    assert((is_alarm_tests(0, 0, true, 0) == false));
+}
+
+void test_alarm_tests_keeps_is_alarm(void) {
+    assert(is_alarm_tests(5, 0, true, 0));
+    assert(is_alarm_tests(6, 2, false, 0));
+    assert((is_alarm_tests(2, 0, false, 0) == false));
+}
+
+void test_stop_on_mismatch(void) {
+    assert(lanes_stop(1, 0));
+}
+
+void test_stop_on_reference_disagree(void) {
+    assert(lanes_stop(0, 3));
+}
+
+void test_stop_neither(void) {
+    assert((lanes_stop(0, 0) == false));
 }
 
 void test_gate_required_green(void) {
@@ -884,6 +993,22 @@ void test_next_with_tests_never_wraps(void) {
     assert_eq(with_tests(3, 5), 0);
 }
 
+void test_ledger_stores_its_cap(void) {
+    assert(header_stored(4));
+}
+
+void test_ledger_stores_where_it_came_from(void) {
+    assert(header_stored(2));
+}
+
+void test_ledger_derives_its_counts(void) {
+    assert((header_stored(5) == false));
+}
+
+void test_ledger_stores_no_unknown_field(void) {
+    assert((header_stored(6) == false));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -942,6 +1067,10 @@ int main(void) {
     test_doctor_checkout_reclone_failed();
     test_doctor_checkout_healed();
     test_doctor_checkout_kept();
+    test_doctor_image_master_unknown();
+    test_doctor_image_unreported_is_stale();
+    test_doctor_image_differs();
+    test_doctor_image_current();
     test_bless_rise_all_new();
     test_bless_rise_old_entries_over_cap();
     test_bless_rise_at_old_cap();
@@ -954,6 +1083,15 @@ int main(void) {
     test_alarm_crash_always();
     test_alarm_mismatch_always();
     test_alarm_blocked_never();
+    test_alarm_shared_fail_same_tests();
+    test_alarm_shared_fail_other_tests();
+    test_alarm_shared_fail_not_compared();
+    test_alarm_pass_disagrees();
+    test_alarm_pass_agrees();
+    test_alarm_tests_keeps_is_alarm();
+    test_stop_on_mismatch();
+    test_stop_on_reference_disagree();
+    test_stop_neither();
     test_gate_required_green();
     test_gate_required_pending_waits();
     test_gate_required_absent_waits();
@@ -1003,7 +1141,11 @@ int main(void) {
     test_next_score_value();
     test_next_with_tests();
     test_next_with_tests_never_wraps();
-    printf("All %d tests passed.\n", 111);
+    test_ledger_stores_its_cap();
+    test_ledger_stores_where_it_came_from();
+    test_ledger_derives_its_counts();
+    test_ledger_stores_no_unknown_field();
+    printf("All %d tests passed.\n", 128);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

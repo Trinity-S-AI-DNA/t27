@@ -6,7 +6,7 @@
 **Node URL:** https://osf.io/tza56
 
 ## OAuth2 Token
-Token: `[REDACTED rotate+see t27 issue 16]`
+Token: not stored in the repository. Read it from the `OSF_TOKEN` environment variable.
 Status: ✅ Valid (API accepts token)
 
 ## API Status

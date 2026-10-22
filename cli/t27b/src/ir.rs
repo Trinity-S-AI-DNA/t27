@@ -31,7 +31,30 @@ pub enum Ty {
     /// extended in the X register); arithmetic happens in S registers, and
     /// AAPCS64 passes and returns it in s0-s7.
     F32,
+    /// `uN` for an N in 1..=31 other than 8 and 16 (`u1`, `u4`, `u21`).
+    /// Canonical like u8/u16: zero-extended in its W register. Stored in the
+    /// bytes Zig gives it (`@sizeOf(u21) == 4`).
+    UN(u8),
+    /// `iN` for an N in 1..=31 other than 8 and 16: sign-extended in its W
+    /// register, like i8/i16.
+    IN(u8),
+    /// `i128`: a pair of X registers in generated code, the low word first (x0:x1 for a result, the next even
+    /// pair for a parameter), and 16 bytes in memory (specs/tri/t27b/i128_plan.t27, `ip` below).
+    I128,
 }
+
+#[path = "../../../gen/rust/tri/t27b/i128_plan.rs"] #[allow(dead_code, unused_parens)]
+pub(crate) mod ip; // t27c gen-rust of specs/tri/t27b/i128_plan.t27: a run-time i128 as a pair of X registers
+
+/// Names of the odd widths, so `Ty::name` stays a `&'static str`.
+const UN_NAMES: [&str; 32] = [
+    "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10", "u11", "u12", "u13", "u14", "u15",
+    "u16", "u17", "u18", "u19", "u20", "u21", "u22", "u23", "u24", "u25", "u26", "u27", "u28", "u29", "u30", "u31",
+];
+const IN_NAMES: [&str; 32] = [
+    "i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10", "i11", "i12", "i13", "i14", "i15",
+    "i16", "i17", "i18", "i19", "i20", "i21", "i22", "i23", "i24", "i25", "i26", "i27", "i28", "i29", "i30", "i31",
+];
 
 impl Ty {
     pub const INTS: [Ty; 8] = [
@@ -58,8 +81,34 @@ impl Ty {
             "i64" | "isize" => Ty::I64,
             "f64" => Ty::F64,
             "f32" => Ty::F32,
-            _ => return None,
+            _ => return Ty::odd_width(s),
         })
+    }
+
+    /// `u1`..`u31` and `i1`..`i31` other than the 8- and 16-bit ones. Wider
+    /// odd widths (`u48`, `u128`) are not in the subset: a W register holds
+    /// these, with the same overflow checks as u8/u16.
+    fn odd_width(s: &str) -> Option<Ty> {
+        let signed = match s.as_bytes().first() {
+            Some(b'u') => false,
+            Some(b'i') => true,
+            _ => return None,
+        };
+        let digits = &s[1..];
+        if digits.is_empty() || digits.len() > 2 || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u8 = digits.parse().ok()?;
+        if !(1..=31).contains(&n) || n == 8 || n == 16 {
+            return None;
+        }
+        Some(if signed { Ty::IN(n) } else { Ty::UN(n) })
+    }
+
+    /// An odd width (`Ty::UN` / `Ty::IN`): no 8/16-bit load or extend
+    /// instruction is exactly its canonical form.
+    pub fn is_odd(self) -> bool {
+        matches!(self, Ty::UN(_) | Ty::IN(_))
     }
 
     pub fn name(self) -> &'static str {
@@ -76,6 +125,9 @@ impl Ty {
             Ty::Ptr => "ptr",
             Ty::F64 => "f64",
             Ty::F32 => "f32",
+            Ty::UN(n) => UN_NAMES[n as usize],
+            Ty::IN(n) => IN_NAMES[n as usize],
+            Ty::I128 => "i128",
         }
     }
 
@@ -87,12 +139,9 @@ impl Ty {
         matches!(self, Ty::F64 | Ty::F32)
     }
 
-    /// Size in memory: a load or store of this type moves this many bytes.
+    /// Size in memory: a load or store of this type moves this many bytes, Zig's ABI size (specs/tri/t27b/builtin_plan.t27).
     pub fn bytes(self) -> u32 {
-        match self {
-            Ty::Bool => 1,
-            _ => self.bits() / 8,
-        }
+        crate::lower::bp::abi_bytes(self.bits())
     }
 
     /// Width in bits. `Bool` reports 8 (it is stored as a 0/1 byte value).
@@ -102,11 +151,13 @@ impl Ty {
             Ty::U16 | Ty::I16 => 16,
             Ty::U32 | Ty::I32 | Ty::F32 => 32,
             Ty::U64 | Ty::I64 | Ty::Ptr | Ty::F64 => 64,
+            Ty::UN(n) | Ty::IN(n) => n as u32,
+            Ty::I128 => 128,
         }
     }
 
     pub fn signed(self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
+        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128)
     }
 
     /// True when the value occupies a full 64-bit X register.
@@ -114,36 +165,15 @@ impl Ty {
         self.bits() == 64
     }
 
-    pub fn min(self) -> i128 {
-        match self {
-            Ty::Bool => 0,
-            _ if self.signed() => -(1i128 << (self.bits() - 1)),
-            _ => 0,
-        }
-    }
+    /// The bounds, as specs/tri/t27b/eval_arith.t27 has them (`ty_min`, `ty_max`, `fits`), an i128's too.
+    pub fn min(self) -> i128 { crate::eval::spec::ty_min(self.bits(), self.signed()) }
 
-    pub fn max(self) -> i128 {
-        match self {
-            Ty::Bool => 1,
-            _ if self.signed() => (1i128 << (self.bits() - 1)) - 1,
-            _ => (1i128 << self.bits()) - 1,
-        }
-    }
+    pub fn max(self) -> i128 { crate::eval::spec::ty_max(self.bits(), self.signed(), self == Ty::Bool) }
 
-    pub fn fits(self, v: i128) -> bool {
-        v >= self.min() && v <= self.max()
-    }
+    pub fn fits(self, v: i128) -> bool { crate::eval::spec::fits(v, self.bits(), self.signed(), self == Ty::Bool) }
 
     /// Two's-complement reduction of an arbitrary integer to this type's range.
-    pub fn wrap(self, v: i128) -> i128 {
-        let bits = self.bits();
-        let m = (v as u128) & ((1u128 << bits) - 1);
-        if self.signed() && (m >> (bits - 1)) & 1 == 1 {
-            (m as i128) - (1i128 << bits)
-        } else {
-            m as i128
-        }
-    }
+    pub fn wrap(self, v: i128) -> i128 { crate::eval::spec::wrap(v, self.bits(), self.signed()) }
 
     /// Interpret the low `bits` of a raw 64-bit register value as this type.
     pub fn from_raw(self, raw: u64) -> i128 {
@@ -154,20 +184,10 @@ impl Ty {
     }
 
     /// `self` can hold every value of `from`: the lossless implicit widening
-    /// the subset allows (Zig's rule: same signedness and not narrower, or
+    /// the subset allows (`widens` of specs/tri/t27b/int_cast_plan.t27: same signedness and not narrower, or
     /// unsigned into a strictly wider signed type).
     pub fn can_widen_from(self, from: Ty) -> bool {
-        if self == from {
-            return true;
-        }
-        if !self.is_int() || !from.is_int() {
-            return false;
-        }
-        if self.signed() == from.signed() {
-            self.bits() >= from.bits()
-        } else {
-            self.signed() && self.bits() > from.bits()
-        }
+        self == from || self.is_int() && from.is_int() && crate::lower::ic::widens(from.bits(), from.signed(), self.bits(), self.signed())
     }
 }
 
@@ -257,41 +277,17 @@ pub enum ArithOp {
     ShrW,
 }
 
+#[path = "../../../gen/rust/tri/t27b/arith_op.rs"]
+#[allow(dead_code, unused_parens)]
+mod ao; // t27c gen-rust of specs/tri/t27b/arith_op.t27: the integer operators by their ArithOp number
+const _: () = assert!(ArithOp::Add as u8 == ao::OP_ADD && ArithOp::Rem as u8 == ao::OP_REM && ArithOp::ShrW as u8 == ao::OP_SHR_W);
+
 impl ArithOp {
-    pub fn symbol(self) -> &'static str {
-        match self {
-            ArithOp::Add => "+",
-            ArithOp::Sub => "-",
-            ArithOp::Mul => "*",
-            ArithOp::AddW => "+%",
-            ArithOp::SubW => "-%",
-            ArithOp::MulW => "*%",
-            ArithOp::Div | ArithOp::DivW => "/",
-            ArithOp::Rem => "%",
-            ArithOp::And => "&",
-            ArithOp::Or => "|",
-            ArithOp::Xor => "^",
-            ArithOp::Shl | ArithOp::ShlW => "<<",
-            ArithOp::Shr | ArithOp::ShrW => ">>",
-        }
-    }
+    pub fn symbol(self) -> &'static str { ao::symbol(self as u8) }
 
-    pub fn is_shift(self) -> bool {
-        matches!(self, ArithOp::Shl | ArithOp::Shr | ArithOp::ShlW | ArithOp::ShrW)
-    }
+    pub fn is_shift(self) -> bool { ao::is_shift(self as u8) }
 
-    pub fn commutative(self) -> bool {
-        matches!(
-            self,
-            ArithOp::Add
-                | ArithOp::Mul
-                | ArithOp::AddW
-                | ArithOp::MulW
-                | ArithOp::And
-                | ArithOp::Or
-                | ArithOp::Xor
-        )
-    }
+    pub fn commutative(self) -> bool { ao::commutative(self as u8) }
 }
 
 /// IEEE-754 binary operations on F64.
@@ -353,64 +349,25 @@ pub enum CmpOp {
     Ge,
 }
 
+#[path = "../../../gen/rust/tri/t27b/cmp_op.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod co; // t27c gen-rust of specs/tri/t27b/cmp_op.t27: the comparisons by their CmpOp number; codegen's conditions
+const CMP_OPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge];
+const _: () = assert!(CmpOp::Eq as u8 == co::EQ && CmpOp::Lt as u8 == co::LT && CmpOp::Ge as u8 == co::GE);
+
 impl CmpOp {
-    pub fn symbol(self) -> &'static str {
-        match self {
-            CmpOp::Eq => "==",
-            CmpOp::Ne => "!=",
-            CmpOp::Lt => "<",
-            CmpOp::Le => "<=",
-            CmpOp::Gt => ">",
-            CmpOp::Ge => ">=",
-        }
-    }
+    pub fn symbol(self) -> &'static str { co::symbol(self as u8) }
 
-    pub fn holds(self, a: i128, b: i128) -> bool {
-        match self {
-            CmpOp::Eq => a == b,
-            CmpOp::Ne => a != b,
-            CmpOp::Lt => a < b,
-            CmpOp::Le => a <= b,
-            CmpOp::Gt => a > b,
-            CmpOp::Ge => a >= b,
-        }
-    }
+    pub fn holds(self, a: i128, b: i128) -> bool { co::holds(self as u8, a, b) }
 
-    pub fn negate(self) -> CmpOp {
-        match self {
-            CmpOp::Eq => CmpOp::Ne,
-            CmpOp::Ne => CmpOp::Eq,
-            CmpOp::Lt => CmpOp::Ge,
-            CmpOp::Le => CmpOp::Gt,
-            CmpOp::Gt => CmpOp::Le,
-            CmpOp::Ge => CmpOp::Lt,
-        }
-    }
+    pub fn negate(self) -> CmpOp { CMP_OPS[co::negate(self as u8) as usize] }
 
     /// The comparison on two binary64 values: false for every op but `!=`
     /// when either is NaN.
-    pub fn holds_f64(self, a: f64, b: f64) -> bool {
-        match self {
-            CmpOp::Eq => a == b,
-            CmpOp::Ne => a != b,
-            CmpOp::Lt => a < b,
-            CmpOp::Le => a <= b,
-            CmpOp::Gt => a > b,
-            CmpOp::Ge => a >= b,
-        }
-    }
+    pub fn holds_f64(self, a: f64, b: f64) -> bool { co::holds_f64(self as u8, a, b) }
 
     /// The comparison with operands exchanged: `a op b` == `b op.swap() a`.
-    pub fn swap(self) -> CmpOp {
-        match self {
-            CmpOp::Eq => CmpOp::Eq,
-            CmpOp::Ne => CmpOp::Ne,
-            CmpOp::Lt => CmpOp::Gt,
-            CmpOp::Le => CmpOp::Ge,
-            CmpOp::Gt => CmpOp::Lt,
-            CmpOp::Ge => CmpOp::Le,
-        }
-    }
+    pub fn swap(self) -> CmpOp { CMP_OPS[co::swap(self as u8) as usize] }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -438,6 +395,9 @@ pub enum TrapKind {
     // Memory lane: numbered from 16 so the scalar lane can add kinds below.
     /// An index at or past the length of an array, slice or string.
     Bounds = 16,
+    /// `for (a, b) |x, y|` over objects whose lengths differ at run time
+    /// (Zig's safety check before the first iteration).
+    ForLength = 17,
 }
 
 impl TrapKind {
@@ -453,6 +413,7 @@ impl TrapKind {
             TrapKind::EnumTag => "invalid enum value",
             TrapKind::FloatToInt => "integer part of floating point value out of bounds",
             TrapKind::Bounds => "index out of bounds",
+            TrapKind::ForLength => "for loop over objects with non-equal lengths",
             TrapKind::Null => "attempt to use null value",
             TrapKind::Stub => "reached a statement the reference never compiles (`undefined;` or an ignored value)",
         }
@@ -524,6 +485,10 @@ pub enum ExprKind {
     },
     /// Float negation: flips the sign bit (so `-0.0` and NaNs too).
     FNeg(Box<Expr>),
+    /// `@sqrt`: the IEEE-754 square root of the float operand, correctly
+    /// rounded to nearest, ties to even; a negative operand (not -0.0)
+    /// gives a NaN.
+    FSqrt(Box<Expr>),
     /// `@floatFromInt`: the integer operand converted to float `ty`, rounding
     /// to nearest, ties to even (once: an i64 goes straight to F32).
     IntToFloat(Box<Expr>),
@@ -643,7 +608,7 @@ pub enum Stmt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotInfo {
     pub size: u32,
-    /// 1, 2, 4 or 8.
+    /// 1, 2, 4, 8, or 16 for a struct with an i128 in it.
     pub align: u32,
 }
 
@@ -713,8 +678,9 @@ impl Program {
                     di += 1;
                     (true, di - 1)
                 } else {
-                    xi += 1;
-                    (false, xi - 1)
+                    let k = ip::arg_reg(xi, v.ty == Ty::I128); // an i128 takes the next even pair (i128_plan.t27)
+                    xi = ip::arg_next(k, v.ty == Ty::I128);
+                    (false, k as usize)
                 }
             })
             .collect()

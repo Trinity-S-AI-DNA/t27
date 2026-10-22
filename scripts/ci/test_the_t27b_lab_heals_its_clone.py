@@ -9,11 +9,17 @@ same way. The clone holds only git objects; a fresh clone is the repair.
   kept      a healthy clone is reused: steps.checkout says clone "kept".
   healed    a clone whose remote is gone is removed and cloned again; the run
             records clone "recloned" and the first error, so a heal is seen.
+  retry     a run whose checkout failed is tried again on the next poll;
+  refcache  (#6443) the reference cache keys on the `use` closure and t27c,
+            and a timeout is never cached;
+  image     (#6443) the lab names its own lab.py by the sha `git hash-object`
+            gives it, so tri t27b doctor can compare it with master's.
   control   master's checkout before this change fails the same broken clone
             (only when that file is given as argv[1]; CI runs the current one).
 All git work is local (file:// remote); no network.
 """
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -55,6 +61,12 @@ with tempfile.TemporaryDirectory() as t:
     spec.loader.exec_module(lab)
     log = lab.Log(pathlib.Path(t) / "lab.log")
 
+    if hasattr(lab, "IMAGE"):
+        want = subprocess.run(["git", "hash-object", LAB], capture_output=True, text=True).stdout.strip()
+        check(lab.IMAGE.get("lab_py_sha") == want, f"image: lab.py sha is git's blob sha ({want[:9]})")
+        lab.set_status(phase="test")
+        st = json.loads(pathlib.Path(os.environ["T27_SRV"], "status.json").read_text())
+        check(st.get("image") == lab.IMAGE, "image: status.json carries it")
     r = lab.checkout(sha, log)
     check(isinstance(r, dict) and r.get("clone") == "kept", f"kept: a fresh clone checks out ({r})")
     r = lab.checkout(sha, log)
@@ -71,6 +83,61 @@ with tempfile.TemporaryDirectory() as t:
           f"healed: a clone that cannot fetch is cloned again, and the run says so ({r})")
     check((lab.CLONE / "b.txt").exists() and git("rev-parse", "HEAD", cwd=str(lab.CLONE)) == sha,
           "healed: the new clone is at the requested commit")
+
+    if hasattr(lab, "run_done"):
+        check(lab.run_done({"steps": {"checkout": {"ok": True}, "ratchet": {"ok": False}}}),
+              "retry: a run that checked out settles its commit, even when a later step is red")
+        check(not lab.run_done({"steps": {"checkout": {"ok": False, "error": "git clone failed"}}}),
+              "retry: a run whose checkout failed does not, so the next poll tries it again")
+
+    if hasattr(lab, "reference_key"):
+        # #6443: the reference cache is keyed by the import closure and t27c,
+        # survives runs on the volume, and never keeps a timeout.
+        specs = lab.CLONE / "specs" / "a"
+        specs.mkdir(parents=True)
+        (specs / "b.t27").write_text("module b;\nuse a::c;   // imported\n")
+        (specs / "c.t27").write_text("module c;\n")
+        (specs / "d.t27").write_text("module d;\n")
+        fake = pathlib.Path(t) / "t27c"
+        fake.write_bytes(b"t27c v1")
+        lab.T27C = fake
+        calls = []
+        verdicts = {"specs/a/b.t27": ("pass", ""), "specs/a/d.t27": ("timeout", "over 300 s")}
+
+        per_test = {"specs/a/b.t27": [["t1", True]]}
+
+        def fake_one(worker, f, tests=None):
+            calls.append(f)
+            if tests is not None and f in per_test:
+                tests[f] = per_test[f]
+            return verdicts[f]
+
+        lab.reference_one = fake_one
+        files = ["specs/a/b.t27", "specs/a/d.t27"]
+        r, st = lab.reference_all(files, log)
+        check(r == verdicts and st == {"hits": 0, "misses": 1, "not_cached": 1}, f"refcache: cold run ({st})")
+        calls.clear()
+        r, st = lab.reference_all(files, log)
+        check(r == verdicts and calls == ["specs/a/d.t27"], f"refcache: a pass is reused, a timeout is not ({calls})")
+        calls.clear()
+        lab.reference_all(files, log, {})
+        check("specs/a/b.t27" in calls, f"refcache: a pass cached without per-test verdicts misses when they are wanted ({calls})")
+        calls.clear()
+        got = {}
+        lab.reference_all(files, log, got)
+        check(calls == ["specs/a/d.t27"] and got == per_test,
+              f"refcache: a hit gives back its per-test verdicts (#6441) ({calls}, {got})")
+        (specs / "c.t27").write_text("module c;\nconst X: u8 = 1;\n")
+        calls.clear()
+        lab.reference_all(files, log)
+        check("specs/a/b.t27" in calls, f"refcache: an imported spec's change misses ({calls})")
+        calls.clear()
+        lab.reference_all(files, log)
+        check(calls == ["specs/a/d.t27"], f"refcache: and hits again after ({calls})")
+        fake.write_bytes(b"t27c v2")
+        calls.clear()
+        lab.reference_all(files, log)
+        check("specs/a/b.t27" in calls, f"refcache: a rebuilt t27c misses ({calls})")
     log.close()
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {len(fails)} failure(s)")

@@ -21,6 +21,7 @@ Checks:
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,7 +52,12 @@ def runs_tests(src: Path) -> tuple[int, str]:
 
 
 code, out = runs_tests(GEN)
-check(code == 0 and "111 tests passed" in out, f"the generated C passes the spec's tests ({code}: {out})")
+# Count-agnostic: the number the generated C runs is the number of `test`
+# blocks the spec declares, so a spec-only PR that adds tests never breaks this.
+declared = len(re.findall(r"^\s*test\s+[A-Za-z_][A-Za-z0-9_]*\s*\{", SPEC.read_text(), re.M))
+m = re.search(r"All (\d+) tests passed", out)
+check(code == 0 and declared > 0 and m is not None and int(m.group(1)) == declared,
+      f"the generated C passes every one of the spec's {declared} tests ({code}: {out})")
 
 text = GEN.read_text()
 needle = "return (((in_ref * 1000) + (reference / 2)) / reference);"
@@ -131,6 +137,13 @@ check((r.is_alarm("fail", "pass"), r.is_alarm("fail", "fail"), r.is_alarm("timeo
        r.is_alarm("crash", "fail"), r.is_alarm("mismatch", "blocked"), r.is_alarm("blocked", "pass"))
       == (True, False, False, True, True, False),
       "doctor: a fail or timeout the reference shares is no alarm; a crash or mismatch always is")
+check((r.is_alarm_tests("fail", "fail", True, 0), r.is_alarm_tests("fail", "fail", True, 1),
+       r.is_alarm_tests("fail", "fail", False, 0), r.is_alarm_tests("pass", "pass", True, 2),
+       r.is_alarm_tests("pass", "pass", True, 0), r.is_alarm_tests("fail", "pass", False, 0))
+      == (False, True, False, True, False, True),
+      "doctor: a shared fail is no alarm only when the same tests fail (#6441)")
+check((r.lanes_stop(1, 0), r.lanes_stop(0, 3), r.lanes_stop(0, 0)) == (True, True, False),
+      "a jit/interp mismatch or a reference disagreement stops the lanes (#6441)")
 
 check((r.check_effect("FAILURE", "SUCCESS", False), r.check_effect("FAILURE", "FAILURE", False),
        r.check_effect("FAILURE", "ABSENT", False), r.check_effect("QUEUED", "SUCCESS", True),
@@ -189,7 +202,7 @@ check(all(f"R.{f}(" in body for f in ("lane_kind", "lane_score", "with_tests"))
 
 body = tool[tool.index("def anomalies("):tool.index("def lab_card(")]
 check(all(f"rules().{f}(" in body for f in ("lab_stale", "claim", "railway_old", "ledger_quiet", "checkout",
-                                                     "is_alarm"))
+                                                     "is_alarm_tests", "lanes_stop"))
       and "< 5" not in body and "age > args" not in body and "hrs > args" not in body,
       "t27b.py doctor asks the spec for every threshold it judges")
 
