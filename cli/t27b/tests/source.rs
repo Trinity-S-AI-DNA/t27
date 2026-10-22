@@ -3076,10 +3076,13 @@ test fails {
 fn bare_abs_rejections() {
     let own = "module a;\n\nfn abs(x: f64) -> f64 {\n    return x + 1.0;\n}\n\ntest t {\n    assert(abs(1.0) == 2.0);\n}\n";
     assert_eq!(names_ok(&run(own)), vec![("t", false, true)]);
+    // #9065: a bare name the reference rewrites (compiler.rs's declared_fns guard, libm_plan.t27's
+    // bare_target) is refused by the planned call, not as an undeclared fn. `tanh` is Zig's
+    // std.math.tanh, which libm.t27 has not ported: refused by name until it is.
     let cases: &[(&str, &str)] = &[
         ("fn f(x: i32) -> u32 { return abs(x); }", "ExprCall(abs of an integer)"),
         ("fn f(x: f64, y: f64) -> f64 { return abs(x, y); }", "ExprCall(undeclared fn)"),
-        ("fn f(x: f64) -> f64 { return tanh(x); }", "ExprCall(undeclared fn)"),
+        ("fn f(x: f64) -> f64 { return tanh(x); }", "ExprCall(std.math.tanh)"),
     ];
     for (body, construct) in cases {
         let m = rejected(&format!("module a;\n\n{}\n", body));
