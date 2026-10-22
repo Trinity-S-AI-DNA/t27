@@ -1,0 +1,806 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trios/crates/trios-mesh-node/src/crypto.t27
+// Port of gHashTag/trios crates/trios-mesh-node/src/crypto.rs (8b229e9489ee,
+// 149 lines, 7 functions) to t27.
+
+// The original is the mesh node's key-exchange layer: an X25519 keypair
+// (secret, public, and a 16-byte dest_hash cut from the SHA-256 of the
+// public key), a shared-secret KDF, and AEAD encrypt/decrypt between two
+// keypairs. Its own doc comment states the invariant this port is built
+// around: "Sorting pubkeys makes KDF commutative: encrypt(A->B) ==
+// decrypt(B<-A)."
+//
+// WHAT THIS PORT CARRIES AS CODE (pure, tested here):
+//   - from_seed's stretching layout: byte 0 = seed, byte 1 = 0xA3, rest
+//     zero (crypto.rs lines 27-30)
+//   - dest_hash = SHA256(public)[..16] (lines 35-37; original test
+//     dest_hash_from_pubkey at lines 143-147)
+//   - the KDF sorts the two pubkeys and hashes dh || pk_lo || pk_hi, a
+//     96-byte input (lines 60-69); the sort is what makes the KDF
+//     commutative, so the original's kdf_symmetric test (lines 128-132)
+//     reduces to the sort being symmetric with the hash fixed
+//   - lowercase hex pubkey encoding (line 75)
+//   - the base64 STANDARD alphabet and its padding rule, and the wire
+//     format base64(nonce || ciphertext) (lines 9, 84-91, 96)
+//   - the "payload too short" refusal below the 12-byte nonce (line 97)
+//   - random()'s decision that the raw 32 entropy bytes ARE the secret,
+//     with none of from_seed's stretching (lines 41-50)
+//
+// WHAT STAYS OUTSIDE (declared below with undefined bodies, never called
+// by a test): SHA-256 (sha2 crate, lines 30/35/69), X25519 public-key
+// derivation and Diffie-Hellman (x25519_dalek, lines 33-34/45-46/57-58),
+// OS randomness (rand, lines 44/84-85), and ChaCha20-Poly1305 seal/open
+// (chacha20poly1305, lines 82/87/100-101). Their results are parameters
+// the generated host passes in around the pure logic, the same way the
+// original's anyhow::Result became an ok-flag struct.
+
+module port::trios_mesh_node_crypto {
+
+    // ---- sizes (crypto.rs: 32-byte keys, 12-byte nonce, 16-byte dest_hash)
+
+    pub const KEY_LEN       : usize = 32;
+    pub const NONCE_LEN     : usize = 12;
+    pub const DEST_HASH_LEN : usize = 16;
+    pub const KDF_INPUT_LEN : usize = 96;   // dh || pk_lo || pk_hi
+
+    const B64_PAD : u8 = 61;                // '='
+
+    // ---- shapes
+
+    pub struct MeshKeypair {
+        secret: [32]u8,
+        public: [32]u8,
+        dest_hash: [16]u8,
+    }
+
+    pub struct SortedKeys {
+        lo: [32]u8,
+        hi: [32]u8,
+    }
+
+    pub struct CipherText {
+        bytes: [176]u8,
+        len: usize,
+    }
+
+    pub struct PlainText {
+        bytes: [176]u8,
+        len: usize,
+    }
+
+    pub struct CipherWire {
+        bytes: [192]u8,
+        len: usize,
+    }
+
+    pub struct B64Text {
+        text: [256]u8,
+        len: usize,
+        ok: bool,
+    }
+
+    pub struct B64Bytes {
+        bytes: [192]u8,
+        len: usize,
+        ok: bool,
+    }
+
+    // anyhow::Result<String> / anyhow::Result<Vec<u8>> become ok-flag
+    // structs carrying the value.
+    pub struct EncryptResult {
+        ok: bool,
+        text: [256]u8,
+        len: usize,
+    }
+
+    pub struct DecryptResult {
+        ok: bool,
+        payload: [176]u8,
+        len: usize,
+    }
+
+    const ZERO_PAYLOAD : [176]u8 = [_]u8{0} ** 176;
+
+    // ---- primitive cryptography: data in and out of the pure logic
+    // Declared, not defined: the generated Rust host binds these to the
+    // same crates the original called. No test calls any of them.
+
+    // sha2::Sha256, crypto.rs lines 30, 35, 69. Fixed-size variants keep
+    // every call site a plain array pass.
+    pub fn sha256_32(msg: [32]u8) -> [32]u8 { undefined; }
+    pub fn sha256_96(msg: [96]u8) -> [32]u8 { undefined; }
+
+    // x25519_dalek::PublicKey::from(&StaticSecret), lines 33-34, 45-46.
+    pub fn pubkey_from_secret(secret: [32]u8) -> [32]u8 { undefined; }
+
+    // x25519_dalek::StaticSecret::diffie_hellman, line 58.
+    pub fn x25519_dh(secret: [32]u8, remote: [32]u8) -> [32]u8 { undefined; }
+
+    // rand::RngCore::fill_bytes, lines 44, 84-85.
+    pub fn random_nonce12() -> [12]u8 { undefined; }
+
+    // chacha20poly1305::ChaCha20Poly1305: seal at lines 82, 87; open at
+    // lines 100-101 (wire is nonce || ciphertext, wire_len its used
+    // length, ciphertext after byte 12 with its 16-byte tag at the end).
+    pub fn chacha20poly1305_seal(key: [32]u8, nonce: [12]u8, payload: []const u8) -> CipherText { undefined; }
+    pub fn chacha20poly1305_open(key: [32]u8, nonce: [12]u8, wire: [192]u8, wire_len: usize) -> PlainText { undefined; }
+
+    // ---- pure decisions ported from the original
+
+    // crypto.rs lines 27-30: seed_bytes = [0u8; 32]; seed_bytes[0] = seed;
+    // seed_bytes[1] = 0xA3; SHA-256 then stretches this into the secret.
+    pub fn stretch_seed(seed: u8) -> [32]u8 {
+        var seed_bytes: [32]u8 = [_]u8{0} ** 32;
+        seed_bytes[0] = seed;
+        seed_bytes[1] = 0xA3;
+        return seed_bytes;
+    }
+
+    // crypto.rs lines 36-37: dest_hash = Sha256(public)[..16].
+    pub fn dest_hash_from_digest(digest: [32]u8) -> [16]u8 {
+        var out: [16]u8 = [_]u8{0} ** 16;
+        var i: usize = 0;
+        while (i < DEST_HASH_LEN) {
+            out[i] = digest[i];
+            i += 1;
+        }
+        return out;
+    }
+
+    // crypto.rs lines 31-38 with the crate calls lifted out: the stretched
+    // secret and the X25519 public key arrive computed; the keypair carries
+    // dest_hash cut from the public key's digest.
+    pub fn keypair_from_public(secret: [32]u8, public: [32]u8, digest: [32]u8) -> MeshKeypair {
+        const kp = MeshKeypair { secret: secret, public: public, dest_hash: dest_hash_from_digest(digest) };
+        return kp;
+    }
+
+    pub fn arr32_eq(a: [32]u8, b: [32]u8) -> bool {
+        var i: usize = 0;
+        while (i < 32) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    // crypto.rs lines 60-64: the KDF sorts the two pubkeys, so both sides
+    // derive the same key whatever the direction. The order is the byte-wise
+    // first difference (Rust's slice comparison); equal keys keep either
+    // order since both sides then agree.
+    pub fn sort_pubkeys(local: [32]u8, remote: [32]u8) -> SortedKeys {
+        var i: usize = 0;
+        while (i < KEY_LEN) {
+            if (local[i] < remote[i]) {
+                return SortedKeys { lo: local, hi: remote };
+            }
+            if (local[i] > remote[i]) {
+                return SortedKeys { lo: remote, hi: local };
+            }
+            i += 1;
+        }
+        return SortedKeys { lo: local, hi: remote };
+    }
+
+    // crypto.rs lines 65-68: kdf input = dh || pk_lo || pk_hi.
+    pub fn compose_kdf_input(dh: [32]u8, lo: [32]u8, hi: [32]u8) -> [96]u8 {
+        var kdf: [96]u8 = [_]u8{0} ** 96;
+        var i: usize = 0;
+        while (i < KEY_LEN) {
+            kdf[i] = dh[i];
+            kdf[KEY_LEN + i] = lo[i];
+            kdf[2 * KEY_LEN + i] = hi[i];
+            i += 1;
+        }
+        return kdf;
+    }
+
+    // crypto.rs line 75: hex::encode(self.public) -- lowercase, two chars
+    // per byte.
+    pub fn hex_digit(v: u8) -> u8 {
+        if (v < 10) {
+            return 48 + v;      // '0'..'9'
+        }
+        return 87 + v;          // 'a'..'f'
+    }
+
+    // ---- base64, the STANDARD engine with padding (lines 9, 91, 96)
+
+    const B64_ALPHABET : [64]u8 = [_]u8{ 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/' };
+
+    // Position in the standard alphabet, or -1 when the byte is not a
+    // base64 character (B64 decode reports that as an error).
+    pub fn b64_alphabet_index(c: u8) -> i32 {
+        var i: usize = 0;
+        while (i < 64) {
+            if (B64_ALPHABET[i] == c) {
+                return i as i32;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    // base64::STANDARD pads every 3-byte remainder: 1 byte -> '==', 2 -> '='.
+    pub fn b64_pad_count(rem: usize) -> usize {
+        if (rem == 1) {
+            return 2;
+        }
+        if (rem == 2) {
+            return 1;
+        }
+        return 0;
+    }
+
+    pub fn b64_encoded_len(n: usize) -> usize {
+        return 4 * ((n + 2) / 3);
+    }
+
+    pub fn b64_encode(data: []const u8, n: usize) -> B64Text {
+        var out: B64Text = B64Text { text: [_]u8{0} ** 256, len: 0, ok: true };
+        const full: usize = n / 3;
+        const rem: usize = n % 3;
+        var g: usize = 0;
+        while (g < full) {
+            const a: usize = data[g * 3] as usize;
+            const b: usize = data[g * 3 + 1] as usize;
+            const c: usize = data[g * 3 + 2] as usize;
+            const v: usize = (a << 16) | (b << 8) | c;
+            out.text[g * 4] = B64_ALPHABET[(v >> 18) & 63];
+            out.text[g * 4 + 1] = B64_ALPHABET[(v >> 12) & 63];
+            out.text[g * 4 + 2] = B64_ALPHABET[(v >> 6) & 63];
+            out.text[g * 4 + 3] = B64_ALPHABET[v & 63];
+            g += 1;
+        }
+        var pos: usize = full * 4;
+        if (rem == 1) {
+            const a1: usize = data[full * 3] as usize;
+            const v1: usize = a1 << 16;
+            out.text[pos] = B64_ALPHABET[(v1 >> 18) & 63];
+            out.text[pos + 1] = B64_ALPHABET[(v1 >> 12) & 63];
+            out.text[pos + 2] = B64_PAD;
+            out.text[pos + 3] = B64_PAD;
+            pos += 4;
+        }
+        if (rem == 2) {
+            const a2: usize = data[full * 3] as usize;
+            const b2: usize = data[full * 3 + 1] as usize;
+            const v2: usize = (a2 << 16) | (b2 << 8);
+            out.text[pos] = B64_ALPHABET[(v2 >> 18) & 63];
+            out.text[pos + 1] = B64_ALPHABET[(v2 >> 12) & 63];
+            out.text[pos + 2] = B64_ALPHABET[(v2 >> 6) & 63];
+            out.text[pos + 3] = B64_PAD;
+            pos += 4;
+        }
+        out.len = pos;
+        return out;
+    }
+
+    // The decoder mirrors B64 STANDARD: the input length must be a multiple
+    // of 4, '=' may sit only in the last two positions of the final group,
+    // every other byte must be in the alphabet. Anything else reports
+    // ok = false -- the original's anyhow!("base64: {e}") branch.
+    pub fn b64_decode(text: []const u8, n: usize) -> B64Bytes {
+        var out: B64Bytes = B64Bytes { bytes: [_]u8{0} ** 192, len: 0, ok: true };
+        if (n == 0) {
+            return out;
+        }
+        if (n % 4 != 0) {
+            out.ok = false;
+            return out;
+        }
+        var i: usize = 0;
+        var k: usize = 0;
+        while (i < n) {
+            const c0: u8 = text[i];
+            const c1: u8 = text[i + 1];
+            const c2: u8 = text[i + 2];
+            const c3: u8 = text[i + 3];
+            const v0: i32 = b64_alphabet_index(c0);
+            const v1: i32 = b64_alphabet_index(c1);
+            const v2: i32 = b64_alphabet_index(c2);
+            const v3: i32 = b64_alphabet_index(c3);
+            if (v0 < 0 or v1 < 0) {
+                out.ok = false;
+                return out;
+            }
+            if (v2 < 0 and c2 != B64_PAD) {
+                out.ok = false;
+                return out;
+            }
+            if (v3 < 0 and c3 != B64_PAD) {
+                out.ok = false;
+                return out;
+            }
+            if (c2 == B64_PAD and c3 != B64_PAD) {
+                out.ok = false;
+                return out;
+            }
+            var u2: usize = 0;
+            if (v2 >= 0) {
+                u2 = v2 as usize;
+            }
+            var u3: usize = 0;
+            if (v3 >= 0) {
+                u3 = v3 as usize;
+            }
+            const v: usize = ((v0 as usize) << 18) | ((v1 as usize) << 12) | (u2 << 6) | u3;
+            var used: usize = 3;
+            if (c2 == B64_PAD) {
+                used = 1;
+            }
+            if (c3 == B64_PAD and c2 != B64_PAD) {
+                used = 2;
+            }
+            out.bytes[k] = (v >> 16) as u8;
+            out.bytes[k + 1] = ((v >> 8) & 0xFF) as u8;
+            out.bytes[k + 2] = (v & 0xFF) as u8;
+            if (used == 1) {
+                k += 1;
+            }
+            if (used == 2) {
+                k += 2;
+            }
+            if (used == 3) {
+                k += 3;
+            }
+            i += 4;
+        }
+        out.len = k;
+        return out;
+    }
+
+    // crypto.rs lines 88-90: out = nonce(12) || ciphertext, then base64.
+    pub fn wrap_wire(nonce: [12]u8, ct: CipherText) -> CipherWire {
+        var wire: CipherWire = CipherWire { bytes: [_]u8{0} ** 192, len: NONCE_LEN + ct.len };
+        var i: usize = 0;
+        while (i < NONCE_LEN) {
+            wire.bytes[i] = nonce[i];
+            i += 1;
+        }
+        i = 0;
+        while (i < ct.len) {
+            wire.bytes[NONCE_LEN + i] = ct.bytes[i];
+            i += 1;
+        }
+        return wire;
+    }
+
+    // crypto.rs lines 99-100: nonce = raw[..12], ciphertext = raw[12..].
+    pub fn wire_nonce(raw: [192]u8) -> [12]u8 {
+        var nonce: [12]u8 = [_]u8{0} ** 12;
+        var i: usize = 0;
+        while (i < NONCE_LEN) {
+            nonce[i] = raw[i];
+            i += 1;
+        }
+        return nonce;
+    }
+
+    // crypto.rs line 97: if raw.len() < 12 { return Err("payload too short") }.
+    pub fn is_payload_too_short(raw_len: usize) -> bool {
+        return raw_len < NONCE_LEN;
+    }
+
+    // ---- the seven ported entry points
+
+    // crypto.rs lines 25-38: stretch, hash, derive, cut dest_hash.
+    pub fn MeshKeypair_from_seed(seed: u8) -> MeshKeypair {
+        const seed_bytes: [32]u8 = stretch_seed(seed);
+        const secret: [32]u8 = sha256_32(seed_bytes);
+        const public: [32]u8 = pubkey_from_secret(secret);
+        const digest: [32]u8 = sha256_32(public);
+        return keypair_from_public(secret, public, digest);
+    }
+
+    // crypto.rs lines 41-50: rand fills 32 bytes and they become the secret
+    // directly -- no stretching, unlike from_seed. The OS randomness is the
+    // parameter here; everything after it is the derivation from_seed tails
+    // with. The X25519 public key of the entropy and the SHA-256 of that public key
+    // are the host's results (the header: primitives are declared, never called by a
+    // test), so they arrive as parameters like the entropy; a body that called the
+    // undefined primitives read bytes nothing wrote, which t27b's interpreter refuses
+    // and Zig only hides by filling them.
+    pub fn MeshKeypair_random(entropy: [32]u8, public: [32]u8, digest: [32]u8) -> MeshKeypair {
+        return keypair_from_public(entropy, public, digest);
+    }
+
+    // crypto.rs lines 53-73: DH output, then KDF over the sorted pubkeys.
+    // Sorting (lines 60-64) is what makes this commutative.
+    pub fn MeshKeypair_shared_secret(self: MeshKeypair, remote_pubkey: [32]u8) -> [32]u8 {
+        const dh: [32]u8 = x25519_dh(self.secret, remote_pubkey);
+        const sorted: SortedKeys = sort_pubkeys(self.public, remote_pubkey);
+        const kdf: [96]u8 = compose_kdf_input(dh, sorted.lo, sorted.hi);
+        return sha256_96(kdf);
+    }
+
+    // crypto.rs line 75.
+    pub fn MeshKeypair_pubkey_hex(self: MeshKeypair) -> [64]u8 {
+        var out: [64]u8 = [_]u8{0} ** 64;
+        var i: usize = 0;
+        while (i < KEY_LEN) {
+            const b: u8 = self.public[i];
+            out[i * 2] = hex_digit(b >> 4);
+            out[i * 2 + 1] = hex_digit(b & 0x0F);
+            i += 1;
+        }
+        return out;
+    }
+
+    // crypto.rs line 76.
+    pub fn MeshKeypair_pubkey_bytes(self: MeshKeypair) -> [32]u8 {
+        return self.public;
+    }
+
+    // crypto.rs lines 79-95: shared key, fresh nonce, seal, then
+    // base64(nonce || ciphertext).
+    pub fn encrypt_for(payload: []const u8, keypair: MeshKeypair, recipient_pubkey: [32]u8) -> EncryptResult {
+        const shared: [32]u8 = MeshKeypair_shared_secret(keypair, recipient_pubkey);
+        const nonce: [12]u8 = random_nonce12();
+        const ct: CipherText = chacha20poly1305_seal(shared, nonce, payload);
+        const wire: CipherWire = wrap_wire(nonce, ct);
+        var buf: [192]u8 = [_]u8{0} ** 192;
+        var i: usize = 0;
+        while (i < wire.len) {
+            buf[i] = wire.bytes[i];
+            i += 1;
+        }
+        const enc: B64Text = b64_encode(&buf, wire.len);
+        return EncryptResult { ok: true, text: enc.text, len: enc.len };
+    }
+
+    // crypto.rs lines 96-112: decode base64, refuse payloads below the
+    // nonce length, split at byte 12, derive the shared key, open.
+    pub fn decrypt_from(b64: []const u8, keypair: MeshKeypair, sender_pubkey: [32]u8) -> DecryptResult {
+        const raw: B64Bytes = b64_decode(b64, b64.len);
+        if (!raw.ok) {
+            return DecryptResult { ok: false, payload: ZERO_PAYLOAD, len: 0 };
+        }
+        if (is_payload_too_short(raw.len)) {
+            return DecryptResult { ok: false, payload: ZERO_PAYLOAD, len: 0 };
+        }
+        const nonce: [12]u8 = wire_nonce(raw.bytes);
+        const shared: [32]u8 = MeshKeypair_shared_secret(keypair, sender_pubkey);
+        const pt: PlainText = chacha20poly1305_open(shared, nonce, raw.bytes, raw.len);
+        return DecryptResult { ok: true, payload: pt.bytes, len: pt.len };
+    }
+
+    // ---- tests: assertions on the original's behaviour
+
+    test stretch_seed_layout {
+        // crypto.rs lines 27-30: byte 0 is the seed, byte 1 is 0xA3.
+        const s: [32]u8 = stretch_seed(7);
+        assert(s[0] == 7);
+        assert(s[1] == 0xA3);
+        const z: [32]u8 = stretch_seed(0);
+        assert(z[0] == 0);
+        assert(z[1] == 0xA3);
+        assert(!arr32_eq(s, z));
+    }
+
+    test stretch_seed_tail_zero {
+        // everything above byte 1 stays zero, whatever the seed
+        const s: [32]u8 = stretch_seed(255);
+        var i: usize = 2;
+        while (i < 32) {
+            assert(s[i] == 0);
+            i += 1;
+        }
+    }
+
+    test dest_hash_is_digest_prefix {
+        // crypto.rs lines 36-37 (and its own test at 143-147): the first 16
+        // bytes of the public key's SHA-256.
+        var d: [32]u8 = [_]u8{0} ** 32;
+        var i: usize = 0;
+        while (i < 32) {
+            d[i] = i as u8;
+            i += 1;
+        }
+        const h: [16]u8 = dest_hash_from_digest(d);
+        assert(h[0] == d[0]);
+        assert(h[15] == d[15]);
+        assert(h[15] == 15);
+    }
+
+    test keypair_from_public_carries_fields {
+        // from_seed lines 31-38 with the crate calls lifted out.
+        const s: [32]u8 = stretch_seed(3);
+        const p: [32]u8 = stretch_seed(4);
+        const kp: MeshKeypair = keypair_from_public(s, p, s);
+        assert(arr32_eq(kp.secret, s));
+        assert(arr32_eq(kp.public, p));
+        const h: [16]u8 = dest_hash_from_digest(s);
+        assert(kp.dest_hash[0] == h[0]);
+        assert(kp.dest_hash[15] == h[15]);
+    }
+
+    test kdf_sort_is_commutative {
+        // The original test kdf_symmetric (lines 128-132) asserts
+        // a.shared_secret(b) == b.shared_secret(a); with the hash fixed,
+        // that reduces exactly to the sort being symmetric -- the comment
+        // on lines 5-6 says as much.
+        const a: [32]u8 = stretch_seed(1);
+        const b: [32]u8 = stretch_seed(2);
+        const ab: SortedKeys = sort_pubkeys(a, b);
+        const ba: SortedKeys = sort_pubkeys(b, a);
+        assert(arr32_eq(ab.lo, ba.lo));
+        assert(arr32_eq(ab.hi, ba.hi));
+    }
+
+    test kdf_sort_orders_low_high {
+        // lines 60-64: min goes first, max second, whatever the order of
+        // the arguments.
+        var lo: [32]u8 = [_]u8{0} ** 32;
+        var hi: [32]u8 = [_]u8{0} ** 32;
+        hi[0] = 0xFF;
+        const s1: SortedKeys = sort_pubkeys(hi, lo);
+        assert(arr32_eq(s1.lo, lo));
+        assert(arr32_eq(s1.hi, hi));
+        const s2: SortedKeys = sort_pubkeys(lo, hi);
+        assert(arr32_eq(s2.lo, lo));
+        assert(arr32_eq(s2.hi, hi));
+    }
+
+    test kdf_sort_identical_keys {
+        // equal keys: both sides agree, either order
+        const a: [32]u8 = stretch_seed(9);
+        const s: SortedKeys = sort_pubkeys(a, a);
+        assert(arr32_eq(s.lo, a));
+        assert(arr32_eq(s.hi, a));
+    }
+
+    test kdf_input_layout {
+        // lines 65-68: the KDF hashes exactly dh || pk_lo || pk_hi, a
+        // 96-byte input.
+        const dh: [32]u8 = stretch_seed(1);
+        const lo: [32]u8 = stretch_seed(2);
+        const hi: [32]u8 = stretch_seed(3);
+        const kdf: [96]u8 = compose_kdf_input(dh, lo, hi);
+        assert(kdf[0] == dh[0]);
+        assert(kdf[31] == dh[31]);
+        assert(kdf[32] == lo[0]);
+        assert(kdf[33] == lo[1]);
+        assert(kdf[63] == lo[31]);
+        assert(kdf[64] == hi[0]);
+        assert(kdf[65] == hi[1]);
+        assert(kdf[95] == hi[31]);
+    }
+
+    test hex_digit_lowercase {
+        // line 75: hex::encode is lowercase.
+        assert(hex_digit(0) == '0');
+        assert(hex_digit(9) == '9');
+        assert(hex_digit(10) == 'a');
+        assert(hex_digit(15) == 'f');
+    }
+
+    test pubkey_hex_encodes_public_key {
+        var p: [32]u8 = [_]u8{0} ** 32;
+        p[1] = 0x0F;
+        p[31] = 0xAB;
+        const kp: MeshKeypair = keypair_from_public(p, p, p);
+        const hex: [64]u8 = MeshKeypair_pubkey_hex(kp);
+        assert(hex[0] == '0');
+        assert(hex[1] == '0');
+        assert(hex[2] == '0');
+        assert(hex[3] == 'f');
+        assert(hex[62] == 'a');
+        assert(hex[63] == 'b');
+    }
+
+    test pubkey_bytes_returns_public {
+        const p: [32]u8 = stretch_seed(5);
+        const kp: MeshKeypair = keypair_from_public(p, p, p);
+        const pb: [32]u8 = MeshKeypair_pubkey_bytes(kp);
+        assert(arr32_eq(pb, p));
+    }
+
+    test random_keypair_uses_entropy_directly {
+        // lines 43-45: the raw 32 random bytes ARE the secret -- no 0xA3
+        // layout, no stretching; only from_seed does that.
+        const e: [32]u8 = stretch_seed(6);
+        const p: [32]u8 = stretch_seed(7);
+        const d: [32]u8 = stretch_seed(8);
+        const kp: MeshKeypair = MeshKeypair_random(e, p, d);
+        assert(arr32_eq(kp.secret, e));
+        assert(arr32_eq(kp.public, p));
+        assert(kp.secret[0] == 6);
+        assert(kp.public[0] == 7);
+        assert(kp.dest_hash[0] == 8);
+        assert(kp.dest_hash[1] == 0xA3);
+    }
+
+    test b64_alphabet_table {
+        // the standard alphabet of base64::STANDARD (line 9)
+        assert(b64_alphabet_index('A') == 0);
+        assert(b64_alphabet_index('Z') == 25);
+        assert(b64_alphabet_index('a') == 26);
+        assert(b64_alphabet_index('z') == 51);
+        assert(b64_alphabet_index('0') == 52);
+        assert(b64_alphabet_index('9') == 61);
+        assert(b64_alphabet_index('+') == 62);
+        assert(b64_alphabet_index('/') == 63);
+        assert(b64_alphabet_index('*') == -1);
+        assert(b64_alphabet_index('=') == -1);
+    }
+
+    test b64_lengths_and_padding {
+        assert(b64_encoded_len(0) == 0);
+        assert(b64_encoded_len(1) == 4);
+        assert(b64_encoded_len(3) == 4);
+        assert(b64_encoded_len(6) == 8);
+        assert(b64_encoded_len(15) == 20);
+        assert(b64_pad_count(0) == 0);
+        assert(b64_pad_count(1) == 2);
+        assert(b64_pad_count(2) == 1);
+    }
+
+    test b64_encode_standard {
+        // python3: base64.b64encode(b"foobar") == b"Zm9vYmFy"
+        const r: B64Text = b64_encode("foobar", 6);
+        assert(r.ok);
+        assert(r.len == 8);
+        assert(r.text[0] == 'Z');
+        assert(r.text[1] == 'm');
+        assert(r.text[2] == '9');
+        assert(r.text[3] == 'v');
+        assert(r.text[4] == 'Y');
+        assert(r.text[5] == 'm');
+        assert(r.text[6] == 'F');
+        assert(r.text[7] == 'y');
+        // base64.b64encode(b"f") == b"Zg==": one pad pair
+        const r1: B64Text = b64_encode("f", 1);
+        assert(r1.len == 4);
+        assert(r1.text[0] == 'Z');
+        assert(r1.text[1] == 'g');
+        assert(r1.text[2] == '=');
+        assert(r1.text[3] == '=');
+        // base64.b64encode(b"ab") == b"YWI="
+        const r3: B64Text = b64_encode("ab", 2);
+        assert(r3.len == 4);
+        assert(r3.text[0] == 'Y');
+        assert(r3.text[1] == 'W');
+        assert(r3.text[2] == 'I');
+        assert(r3.text[3] == '=');
+        // base64.b64encode(b"phi^2 + phi^-2 = 3") == b"cGhpXjIgKyBwaGleLTIgPSAz"
+        const r2: B64Text = b64_encode("phi^2 + phi^-2 = 3", 18);
+        assert(r2.len == 24);
+        assert(r2.text[0] == 'c');
+        assert(r2.text[1] == 'G');
+        assert(r2.text[2] == 'h');
+        assert(r2.text[3] == 'p');
+        assert(r2.text[20] == 'P');
+        assert(r2.text[23] == 'z');
+    }
+
+    test b64_decode_standard {
+        // base64.b64decode(b"Zm9vYmFy") == b"foobar"
+        const r: B64Bytes = b64_decode("Zm9vYmFy", 8);
+        assert(r.ok);
+        assert(r.len == 6);
+        assert(r.bytes[0] == 'f');
+        assert(r.bytes[1] == 'o');
+        assert(r.bytes[5] == 'r');
+        // base64.b64decode(b"Zg==") == b"f"
+        const r1: B64Bytes = b64_decode("Zg==", 4);
+        assert(r1.ok);
+        assert(r1.len == 1);
+        assert(r1.bytes[0] == 'f');
+        // roundtrip through the encoder
+        const e: B64Text = b64_encode("phi^2 + phi^-2 = 3", 18);
+        var buf: [256]u8 = [_]u8{0} ** 256;
+        var i: usize = 0;
+        while (i < e.len) {
+            buf[i] = e.text[i];
+            i += 1;
+        }
+        const d: B64Bytes = b64_decode(&buf, e.len);
+        assert(d.ok);
+        assert(d.len == 18);
+        assert(d.bytes[0] == 'p');
+        assert(d.bytes[17] == '3');
+    }
+
+    test b64_decode_rejects_bad_input {
+        // not a multiple of 4
+        const r: B64Bytes = b64_decode("Zm9vYm", 6);
+        assert(!r.ok);
+        // '*' is outside the alphabet
+        const r2: B64Bytes = b64_decode("Z*9vYmFy", 8);
+        assert(!r2.ok);
+    }
+
+    test payload_too_short_rejected {
+        // line 97: raw.len() < 12 is the "payload too short" error.
+        assert(is_payload_too_short(0));
+        assert(is_payload_too_short(11));
+        assert(!is_payload_too_short(12));
+        assert(!is_payload_too_short(96));
+    }
+
+    test wire_format_nonce_then_ciphertext {
+        // lines 88-90: the encrypted message is base64(nonce || ciphertext);
+        // the nonce leads, the ciphertext follows.
+        var n: [12]u8 = [_]u8{0} ** 12;
+        var i: usize = 0;
+        while (i < 12) {
+            n[i] = i as u8;
+            i += 1;
+        }
+        var ct: CipherText = CipherText { bytes: [_]u8{0} ** 176, len: 3 };
+        ct.bytes[0] = 'a';
+        ct.bytes[1] = 'b';
+        ct.bytes[2] = 'c';
+        const w: CipherWire = wrap_wire(n, ct);
+        assert(w.len == 15);
+        assert(w.bytes[0] == 0);
+        assert(w.bytes[11] == 11);
+        assert(w.bytes[12] == 'a');
+        assert(w.bytes[14] == 'c');
+    }
+
+    test wire_then_base64 {
+        // the full encrypt-side wire decision without the primitives
+        var n: [12]u8 = [_]u8{0} ** 12;
+        var i: usize = 0;
+        while (i < 12) {
+            n[i] = (i * 17) as u8;
+            i += 1;
+        }
+        var ct: CipherText = CipherText { bytes: [_]u8{0} ** 176, len: 3 };
+        ct.bytes[0] = 'a';
+        ct.bytes[1] = 'b';
+        ct.bytes[2] = 'c';
+        const w: CipherWire = wrap_wire(n, ct);
+        var buf: [192]u8 = [_]u8{0} ** 192;
+        i = 0;
+        while (i < w.len) {
+            buf[i] = w.bytes[i];
+            i += 1;
+        }
+        const enc: B64Text = b64_encode(&buf, w.len);
+        assert(enc.ok);
+        assert(enc.len == 20);
+        // python3: base64.b64encode(bytes(range(0, 12*17, 17)) + b"abc")
+        //        == b"ABEiM0RVZneImaq7YWJj"
+        assert(enc.text[0] == 'A');
+        assert(enc.text[1] == 'B');
+        assert(enc.text[2] == 'E');
+        assert(enc.text[3] == 'i');
+        assert(enc.text[16] == 'Y');
+        assert(enc.text[19] == 'j');
+    }
+
+    test wire_nonce_extracts_prefix {
+        var raw: [192]u8 = [_]u8{0} ** 192;
+        var i: usize = 0;
+        while (i < 15) {
+            raw[i] = (i + 1) as u8;
+            i += 1;
+        }
+        const n: [12]u8 = wire_nonce(raw);
+        assert(n[0] == 1);
+        assert(n[11] == 12);
+    }
+
+    test decrypt_from_rejects_undecodable {
+        // line 96: a B64 decode failure is an error before anything else
+        // runs -- no key material is touched on this path.
+        const kp: MeshKeypair = keypair_from_public(stretch_seed(1), stretch_seed(2), stretch_seed(3));
+        const r: DecryptResult = decrypt_from("Z*9vYmFy", kp, stretch_seed(4));
+        assert(!r.ok);
+    }
+
+    test decrypt_from_rejects_short_payload {
+        // lines 97-98: 12 valid base64 chars decode to 9 bytes, below the
+        // 12-byte nonce minimum: "payload too short".
+        const kp: MeshKeypair = keypair_from_public(stretch_seed(1), stretch_seed(2), stretch_seed(3));
+        const r: DecryptResult = decrypt_from("AAAAAAAAAAAA", kp, stretch_seed(4));
+        assert(!r.ok);
+        assert(is_payload_too_short(9));
+    }
+
+}
