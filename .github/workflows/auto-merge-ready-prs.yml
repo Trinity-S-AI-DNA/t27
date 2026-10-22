@@ -17,44 +17,34 @@ name: Auto Merge Ready PRs
 # decides what tools/queen/publish.py opens as a pull request; it never arms
 # or performs a merge (#5525).
 #
-# RED CHECKS THE BEE ANSWERED FOR. Measured 2026-10-03: this workflow merged
-# nothing since 2026-09-20 -- all 300 merges in that window were by hand --
-# because it wanted EVERY check green, while `spec-guards` is red on master
-# itself and every open bee pull request carries three to six red advisory
-# checks. So a red check passes here only when ALL of these hold:
+# RED CHECKS THE BEE ANSWERED FOR. A red check passes here only when ALL hold:
 #   - it is not a required check of the base branch's ruleset (those must be
 #     green: no review can discount them, and an unreadable ruleset makes
 #     every check required);
 #   - it has concluded (a running check is not a red one, nor a green one);
 #   - the bee's approving review of THIS head names it on a line
 #       discounted-check: <exact check name> -- <why it does not count>
+#   - and MASTER says red too: the newest completed run of the same job on the
+#     base branch, at the PR's merge base or later, is a FAILURE (#7317).
 # The bee that writes those lines is tools/bees/reviewer.py, which refuses to
 # approve until every red check has one and builds the body this gate reads.
+# The bee's line is necessary, not sufficient: on 2026-10-06 #6956 merged with
+# its Corpus ratchet red because master's run at its base was CANCELLED, and
+# "cancelled" was read as "red on master too". A cancelled, skipped, queued,
+# running, timed-out or missing master run is UNKNOWN, and UNKNOWN never
+# discounts. The rule is specs/queen/merger_gate.t27 (run_says, look_back,
+# discount_holds).
 
 on:
-  # ON A SCHEDULE, because the thing that used to call it was a laptop.
-  #
-  # The batch merge ran as a local scheduled task every 30 minutes. Measured
-  # 2026-09-19: every run since 07:39 the previous day had failed in three
-  # seconds on the session model the app asked for, and nobody saw it - the
-  # script logs nothing when it never starts. Meanwhile 52 bee pull requests
-  # sat green and unmerged. A merge job that lives on one machine is a merge
-  # job that stops when that machine does.
-  #
-  # Twenty minutes rather than five: every merge puts the remaining branches
-  # behind master, and their checks re-run.
+  # Backstop only: GitHub started this cron about every six hours, not every
+  # twenty minutes (measured 2026-10-04..06); a laptop-run merger failed unseen.
   schedule:
     - cron: '*/20 * * * *'
-  # AND ON THE BEE'S WORD. The bot applies `bee-reviewed` with an app token,
-  # and app-token events do start workflows, so a reviewed pull request is
-  # looked at within a minute. The schedule alone is not enough: measured
-  # 2026-10-04..06, GitHub started this cron about every six hours (02:19Z,
-  # 09:13Z, 18:28Z, 00:16Z, 06:25Z), not every twenty minutes. Only the base
-  # branch's copy of this file runs on this event, and the only thing read
-  # from the payload is the pull request's number: the gate below re-reads
-  # everything else from the API, exactly as on the schedule.
+  # One pull request per event: the bee's label, or a finished required check
+  # (#10396). Only its number is read; the gate re-reads the rest from the API.
   pull_request_target:
     types: [labeled]
+  workflow_run: {workflows: ["Schema Validation", "Issue Gate", "Spec Parse Ratchet", "Own Language"], types: [completed]}
   workflow_dispatch:
     inputs:
       reason:
@@ -67,10 +57,10 @@ on:
         type: boolean
         default: false
 
-# One run at a time. Two batches merging the same pull request is how a merge
-# fails for a reason that has nothing to do with the pull request.
+# One run at a time per pull request (a global group drops pending runs: GitHub
+# keeps one pending per group). Sweeps share `sweep`; the merge step tolerates "already merged".
 concurrency:
-  group: auto-merge-ready-prs
+  group: auto-merge-${{ github.event_name == 'workflow_run' && (github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha) || github.event_name == 'pull_request_target' && github.event.pull_request.number || 'sweep' }}
   cancel-in-progress: false
 
 permissions:
@@ -80,11 +70,19 @@ permissions:
 jobs:
   auto-merge:
     # Any other label is not the bee speaking; skip without a run's worth of work.
-    if: github.event_name != 'pull_request_target' || github.event.label.name == 'bee-reviewed'
+    if: (github.event_name != 'pull_request_target' || github.event.label.name == 'bee-reviewed') && (github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # workflow_run: the pull request of the finished check (head sha when GitHub gives a fork run none); "none" judges nothing.
+      - id: resolve
+        if: github.event_name == 'workflow_run'
+        env: {GH_TOKEN: "${{ github.token }}", R: "${{ github.repository }}", N: "${{ github.event.workflow_run.pull_requests[0].number }}", S: "${{ github.event.workflow_run.head_sha }}"}
+        run: |
+          [ -n "$N" ] || N=$(gh api "repos/$R/commits/$S/pulls" | jq -r --arg s "$S" '[.[]|select(.state=="open" and .base.ref=="master" and .head.sha==$s)]|if length==1 then .[0].number else empty end') || N=
+          echo "pr=${N:-none}" >> "$GITHUB_OUTPUT"
 
       - name: Find ready PRs
         id: find-ready
@@ -101,7 +99,7 @@ jobs:
           SELF_WORKFLOW: ${{ github.workflow }}
           # The labelled pull request when the bee's label started this run;
           # empty on the schedule and on a manual run.
-          EVENT_PR: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || '' }}
+          EVENT_PR: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || steps.resolve.outputs.pr || '' }}
         run: |
           READY_PRS=()
           # "<pr>:<head sha>" for every ready PR: the merge step pins the SHA
@@ -153,6 +151,66 @@ jobs:
           fi
 
           SKIPPED=0
+          REPO_API="repos/${{ github.repository }}"
+
+          # MASTER'S WORD, NOT THE BEE'S (#7317; specs/queen/merger_gate.t27
+          # run_says, look_back, discount_holds). Prints "red: <base> <sha>",
+          # "green: <base> <sha>" or "unknown: <why>" for one red check -- its
+          # job name and workflow -- against the PR's merge base. The runs of
+          # that workflow on the base branch are read newest first and the
+          # first DECISIVE job (completed failure or completed success) wins:
+          # a cancelled newest run is looked past, a green one is not. That run
+          # must sit at the merge base or later, or it says nothing about the
+          # code the PR started from. Every read fails closed to "unknown".
+          # The newest decisive run per job is cached for this sweep; the
+          # merge-base comparison is per pull request.
+          MASTER_RUNS=10
+          MASTER_CACHE=$(mktemp -d)
+          master_says() {
+            local wf="$1" name="$2" base="$3" mb="$4" key wid runs rid sha line verdict="" vsha="" rel
+            if [ -z "$wf" ]; then echo "unknown: not an Actions job, no $base run to read"; return; fi
+            if [ -z "$mb" ]; then echo "unknown: the merge base could not be read"; return; fi
+            key="$MASTER_CACHE/$(printf '%s\t%s\t%s' "$base" "$wf" "$name" | cksum | cut -d' ' -f1)"
+            if [ ! -f "$key" ]; then
+              if [ ! -f "$MASTER_CACHE/workflows" ]; then
+                gh api "$REPO_API/actions/workflows?per_page=100" \
+                  --jq '.workflows[] | [(.id | tostring), .name] | @tsv' > "$MASTER_CACHE/workflows" \
+                  || : > "$MASTER_CACHE/workflows"
+              fi
+              wid=$(awk -F'\t' -v n="$wf" '$2 == n { print $1 }' "$MASTER_CACHE/workflows")
+              runs=""
+              if [ -n "$wid" ] && [ "$(printf '%s\n' "$wid" | wc -l | tr -d ' ')" = "1" ]; then
+                runs=$(gh api "$REPO_API/actions/workflows/$wid/runs?branch=$base&per_page=$MASTER_RUNS" --jq \
+                  '.workflow_runs[] | select(.event | IN("push", "schedule", "workflow_dispatch"))
+                   | [(.id | tostring), .head_sha] | @tsv') || runs=""
+              fi
+              while IFS=$'\t' read -r rid sha; do
+                [ -n "$rid" ] || continue
+                line=$(gh api "$REPO_API/actions/runs/$rid/jobs?per_page=100" \
+                         --jq '.jobs[] | [.name, .status, (.conclusion // "")] | @tsv' \
+                       | awk -F'\t' -v n="$name" '$1 == n' | head -1) || line=""
+                if [ "$(printf '%s' "$line" | cut -f2)" = "completed" ]; then
+                  case "$(printf '%s' "$line" | cut -f3)" in
+                    failure) verdict=red; vsha="$sha"; break ;;
+                    success) verdict=green; vsha="$sha"; break ;;
+                  esac
+                fi
+              done <<< "$runs"
+              printf '%s %s\n' "${verdict:-unknown}" "${vsha:--}" > "$key"
+            fi
+            read -r verdict vsha < "$key"
+            if [ "$verdict" = "unknown" ]; then
+              echo "unknown: no completed failure or success of '$name' in the last $MASTER_RUNS '$wf' runs on $base"
+              return
+            fi
+            rel=$(gh api "$REPO_API/compare/$mb...$vsha" --jq '.status') || rel=""
+            if [ "$rel" = "identical" ] || [ "$rel" = "ahead" ]; then
+              echo "$verdict: $base ${vsha:0:9}"
+            else
+              echo "unknown: the newest completed run ($verdict at ${vsha:0:9}) is not at or after the merge base ${mb:0:9}"
+            fi
+          }
+
           L1_RE='(Closes?|Fixes?|Resolves?|Refs?|Updates?)\s*#[0-9]+'
 
           for pr in $PR_LIST; do
@@ -191,7 +249,6 @@ jobs:
             # Every read below FAILS CLOSED: a fetch that errors skips the pull
             # request, because a missing date would make the gate more lenient.
             HEAD_SHA=$(echo "$PR_METADATA" | jq -r '.headRefOid // empty')
-            REPO_API="repos/${{ github.repository }}"
             if [ -z "$HEAD_SHA" ] \
               || ! COMMIT_AT=$(gh api "$REPO_API/commits/$HEAD_SHA" --jq '.commit.committer.date') \
               || ! RUN_AT=$(gh api "$REPO_API/commits/$HEAD_SHA/check-runs?per_page=100" \
@@ -253,9 +310,9 @@ jobs:
               | select((.workflowName // "") != $self)
               | select(.name != "NotebookLM Auto-Sync" and .name != ".github/workflows/notebook-sync.yml")
               | if has("context") and (has("name") | not)
-                then {name: .context, conclusion: (.state // ""),
+                then {name: .context, conclusion: (.state // ""), workflow: "",
                       done: ((.state // "") | IN("", "PENDING", "EXPECTED") | not)}
-                else {name: (.name // ""), conclusion: (.conclusion // ""),
+                else {name: (.name // ""), conclusion: (.conclusion // ""), workflow: (.workflowName // ""),
                       done: ((.conclusion // "") != "")} end]')
             # An EMPTY rollup is not a clean one: zero checks is not zero failures.
             POSTED=$(echo "$CHECKS" | jq 'length')
@@ -283,13 +340,36 @@ jobs:
             DISCOUNTED=$(printf '%s\n' "$BEE_BODY" | jq -Rn '[inputs | sub("\r$"; "")
               | select(startswith("discounted-check: ") and contains(" -- "))
               | ltrimstr("discounted-check: ") | split(" -- ")[0]]')
-            BLOCKING=$(echo "$CHECKS" | jq -r --argjson req "$REQUIRED" --argjson disc "$DISCOUNTED" '
+            # What master says about each red the bee discounted (#7317). Read
+            # only where a discount could pass: a readable ruleset, not required.
+            MASTER_SAID='{}'
+            if [ "$REQUIRED" != "null" ]; then
+              TO_READ=$(echo "$CHECKS" | jq -r --argjson req "$REQUIRED" --argjson disc "$DISCOUNTED" '
+                [.[] | select(.conclusion | IN("SUCCESS", "SKIPPED") | not)
+                     | select(.name | IN($disc[])) | select(.name | IN($req[]) | not)
+                     | [.name, .workflow]] | unique[] | @tsv')
+              if [ -n "$TO_READ" ]; then
+                MERGE_BASE=$(gh api "$REPO_API/compare/$BASE_REF...$HEAD_SHA" --jq '.merge_base_commit.sha // ""') \
+                  || MERGE_BASE=""
+                while IFS=$'\t' read -r CNAME CWF; do
+                  SAID=$(master_says "$CWF" "$CNAME" "$BASE_REF" "$MERGE_BASE")
+                  echo "  $BASE_REF on '$CNAME': $SAID"
+                  MASTER_SAID=$(echo "$MASTER_SAID" | jq --arg n "$CNAME" --arg w "$CWF" --arg v "$SAID" \
+                    '. + {($n + "\t" + $w): $v}')
+                done <<< "$TO_READ"
+              fi
+            fi
+            BLOCKING=$(echo "$CHECKS" | jq -r --argjson req "$REQUIRED" --argjson disc "$DISCOUNTED" \
+              --argjson master "$MASTER_SAID" '
               [ ($req // [])[] as $r | select([.[] | select(.name == $r)] | length == 0)
                 | "\($r) (required, never posted)" ]
               + [ .[] | select(.conclusion | IN("SUCCESS", "SKIPPED") | not)
                   | if $req == null then "\(.name) (\(.conclusion); ruleset unreadable, nothing is discountable)"
                     elif (.name | IN($req[])) then "\(.name) (\(.conclusion); required, cannot be discounted)"
-                    elif (.name | IN($disc[])) then empty
+                    elif (.name | IN($disc[])) then
+                      ($master[.name + "\t" + .workflow] // "unknown: not read") as $m
+                      | if ($m | startswith("red: ")) then empty
+                        else "\(.name) (\(.conclusion); discounted by the bee, but master is not red -- \($m))" end
                     else "\(.name) (\(.conclusion); not discounted by the bee)" end ]
               | unique | join("; ")')
             CLEARED=$(echo "$CHECKS" | jq -r \
@@ -319,12 +399,22 @@ jobs:
           echo "PRs: ${{ steps.find-ready.outputs.ready_prs }}"
           exit 0
 
+      # Merge as TRI CLAW: github.token's events start no workflow, an App's do. The token is minted for the
+      # "merge-pr" row of specs/claw/github_surface.t27 (contents write, pull_requests write). No secret -> github.token.
+      - id: have
+        if: ${{ steps.find-ready.outputs.count != '0' && !inputs.dry_run }}
+        env: {K: "${{ secrets.CLAW_APP_PRIVATE_KEY }}", I: "${{ vars.CLAW_APP_ID || secrets.CLAW_APP_ID }}"}
+        run: if [ -n "$K" ] && [ -n "$I" ]; then echo ok=1 >> "$GITHUB_OUTPUT"; fi
+      - {id: tok, if: steps.have.outputs.ok, continue-on-error: true, uses: actions/create-github-app-token@v2, with: {app-id: "${{ vars.CLAW_APP_ID || secrets.CLAW_APP_ID }}", private-key: "${{ secrets.CLAW_APP_PRIVATE_KEY }}", owner: gHashTag, repositories: t27, permission-contents: write, permission-pull-requests: write}}
+
       - name: Merge Ready PRs
         if: ${{ steps.find-ready.outputs.count != '0' && !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.tok.outputs.token || github.token }}
+          AS: ${{ steps.tok.outputs.token && 'TRI CLAW' || 'github.token (the merge starts no downstream workflow; CLAW_APP_PRIVATE_KEY unset or not mintable)' }}
           READY_HEADS: ${{ steps.find-ready.outputs.ready_heads }}
         run: |
+          echo "claw/merge: merging as $AS" >> "$GITHUB_STEP_SUMMARY"
           echo "Merging ${{ steps.find-ready.outputs.count }} PRs..."
           MERGED=0
           FAILED=0
@@ -341,10 +431,10 @@ jobs:
             # --match-head-commit: the head that was judged above. A push that
             # lands between the gate and this line is a head no bee reviewed;
             # GitHub refuses the merge instead of taking it (#5547 review).
-            # `|| echo` made this step exit 0 whether every merge succeeded or
-            # every one failed: a batch where nothing merged reported green.
             if gh pr merge "$pr" --merge --delete-branch --match-head-commit "$sha"; then
               MERGED=$((MERGED + 1))
+            elif [ "$(gh pr view "$pr" --json state --jq .state)" = MERGED ]; then
+              echo "  PR #$pr was merged by another run"
             else
               echo "  Failed to merge PR #$pr"
               FAILED=$((FAILED + 1))
