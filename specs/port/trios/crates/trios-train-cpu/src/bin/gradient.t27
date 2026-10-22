@@ -1,0 +1,761 @@
+// Port of gHashTag/trios crates/trios-train-cpu/src/bin/gradient.rs
+// (T-JEPA next-token-prediction gradient computation) at 8b229e9489ee.
+//
+// Representation changes forced by .t27 (no allocator, no growable Vec):
+// - TrainGrads' vec![] buffers become caller-owned slices: passed in as
+//   out-params, zeroed here, and returned as a TrainGrads view (the
+//   original returned freshly allocated buffers by value).
+// - Vec<Vec<f32>> model.ctx and TrainGrads.g_ctx become one flat slice;
+//   row ci starts at ci * EMBED_LEN (EMBED_LEN = VOCAB * DIM).
+// - The three Vec<Vec<T>> values forward_pass returns become one
+//   fixed-capacity ForwardStates struct (MAX_SEQ positions; the original
+//   grows unbounded). A sequence longer than MAX_SEQ + NGRAM tokens fills
+//   only MAX_SEQ positions, so states.len != count and backward_pass
+//   skips the step, exactly like its own all_hidden.len() != count guard.
+// - crate::model::NgramModel (defined in model.rs, not in this file) is
+//   re-declared locally as a struct of slices; its layer_norm, predict
+//   and softmax methods become the free functions ngram_layer_norm,
+//   ngram_predict and ngram_softmax with their standard definitions
+//   (layer norm with E[(x-mean)^2] and the eps the caller passes,
+//   max-shifted softmax, linear head without bias - no bias gradient
+//   appears in the original backward pass).
+// - The eprintln! WARN in backward_pass is dropped; the mismatch still
+//   returns 0.0 without touching the gradient buffers.
+// - The assert!(count > 0) guards become graceful zero-value returns (a
+//   count of 0 contributes nothing and yields loss 0.0); the
+//   assert_eq!(all_ln.len(), count) is structural here: all_ln has
+//   exactly `count` rows by construction.
+
+module port::trios::crates::trios_train_cpu::gradient;
+
+// Constants from the original (gradient.rs lines 5-10).
+const DIM: usize = 64;
+const HIDDEN: usize = 384;
+const NUM_CTX: usize = 4;
+const NGRAM: usize = 6; // NUM_CTX + 2
+const VOCAB: usize = 128;
+const LN_2: f32 = 0.6931471805599453; // std::f32::consts::LN_2
+const LN_EPS: f32 = 0.00001; // 1e-5, the eps forward_pass passes to layer_norm
+const LOSS_FLOOR: f32 = 0.0000000001; // 1e-10, the .max() before ln() in backward_pass
+
+// Flattened buffer lengths.
+const EMBED_LEN: usize = 8192; // VOCAB * DIM
+const PROJ_LEN: usize = 24576; // HIDDEN * DIM
+const HEAD_LEN: usize = 49152; // VOCAB * HIDDEN
+const CTX_FLAT_LEN: usize = 32768; // NUM_CTX * EMBED_LEN
+const CTX_GRAD_LEN: usize = 32768; // NUM_CTX * EMBED_LEN
+
+// Fixed capacity of the per-position forward states (see header note).
+const MAX_SEQ: usize = 8;
+const STATES_HIDDEN_LEN: usize = 3072; // MAX_SEQ * HIDDEN
+const STATES_LN_LEN: usize = 512; // MAX_SEQ * DIM
+const STATES_CTX_LEN: usize = 48; // MAX_SEQ * NGRAM
+const TWO_DIM: usize = 128; // 2 * DIM
+
+// The model parameters read by this file, as slices into caller-owned
+// storage. Port of crate::model::NgramModel, only the fields
+// gradient.rs touches.
+pub struct NgramModel {
+    pub embed: []const f32, // [VOCAB * DIM]
+    pub ctx_weights: []const f32, // [NUM_CTX]
+    pub ctx_flat: []const f32, // [NUM_CTX][VOCAB * DIM] flattened
+    pub proj: []const f32, // [HIDDEN * DIM]
+    pub lm_head: []const f32, // [VOCAB * HIDDEN]
+}
+
+// Forward-pass intermediates for up to MAX_SEQ positions. Row i lives at
+// hidden[i * HIDDEN + hi], ln[i * DIM + di], contexts[i * NGRAM + k].
+pub struct ForwardStates {
+    pub hidden: [STATES_HIDDEN_LEN]f32,
+    pub ln: [STATES_LN_LEN]f32,
+    pub contexts: [STATES_CTX_LEN]usize,
+    pub len: usize, // positions filled; == count on success
+}
+
+// The gradient accumulators, as views of the caller's buffers.
+pub struct TrainGrads {
+    pub g_embed: []f32, // [VOCAB * DIM]
+    pub g_ctx: []f32, // [NUM_CTX][VOCAB * DIM] flattened
+    pub g_proj: []f32, // [HIDDEN * DIM]
+    pub g_head: []f32, // [VOCAB * HIDDEN]
+}
+
+fn zero_forward_states() ForwardStates {
+    var s: ForwardStates = undefined;
+    s.hidden = [0.0; STATES_HIDDEN_LEN];
+    s.ln = [0.0; STATES_LN_LEN];
+    s.contexts = [0; STATES_CTX_LEN];
+    s.len = 0;
+    return s;
+}
+
+// tokens.len().saturating_sub(NGRAM), used for the position count.
+fn saturating_sub_usize(a: usize, b: usize) usize {
+    if (a < b) {
+        return 0;
+    }
+    return a - b;
+}
+
+// .min(VOCAB - 1) on token ids.
+fn min_usize(a: usize, b: usize) usize {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+fn zero_f32(buf: []f32) void {
+    var k: usize = 0;
+    while (k < buf.len) {
+        buf[k] = 0.0;
+        k = k + 1;
+    }
+}
+
+// Port of NgramModel::layer_norm (model.rs): standardises DIM elements
+// starting at `off` into out[out_off .. out_off + DIM] with
+// (x - mean) / sqrt(var + eps), var = E[(x - mean)^2].
+fn ngram_layer_norm(x: []const f32, off: usize, eps: f32, out: []f32, out_off: usize) void {
+    var sum: f32 = 0.0;
+    var j: usize = 0;
+    while (j < DIM) {
+        sum = sum + x[off + j];
+        j = j + 1;
+    }
+    const fdim: f32 = DIM as f32;
+    const mean: f32 = sum / fdim;
+    var vsum: f32 = 0.0;
+    j = 0;
+    while (j < DIM) {
+        const d: f32 = x[off + j] - mean;
+        vsum = vsum + d * d;
+        j = j + 1;
+    }
+    const variance: f32 = vsum / fdim;
+    const inv_std: f32 = 1.0 / @sqrt(variance + eps);
+    j = 0;
+    while (j < DIM) {
+        out[out_off + j] = (x[off + j] - mean) * inv_std;
+        j = j + 1;
+    }
+}
+
+// Port of NgramModel::predict (model.rs): a linear head, no bias -
+// logits[v] = sum_hi lm_head[v * HIDDEN + hi] * hidden[h_off + hi].
+fn ngram_predict(model: NgramModel, hidden: []const f32, h_off: usize, out: []f32) void {
+    var vi: usize = 0;
+    while (vi < VOCAB) {
+        var acc: f32 = 0.0;
+        var hi: usize = 0;
+        while (hi < HIDDEN) {
+            acc = acc + model.lm_head[vi * HIDDEN + hi] * hidden[h_off + hi];
+            hi = hi + 1;
+        }
+        out[vi] = acc;
+        vi = vi + 1;
+    }
+}
+
+// Port of NgramModel::softmax (model.rs): max-shifted exp, in place.
+fn ngram_softmax(logits: []f32) void {
+    var m: f32 = logits[0];
+    var i: usize = 1;
+    while (i < VOCAB) {
+        if (logits[i] > m) {
+            m = logits[i];
+        }
+        i = i + 1;
+    }
+    var sum: f32 = 0.0;
+    i = 0;
+    while (i < VOCAB) {
+        const e: f32 = @exp(logits[i] - m);
+        logits[i] = e;
+        sum = sum + e;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < VOCAB) {
+        logits[i] = logits[i] / sum;
+        i = i + 1;
+    }
+}
+
+// Forward pass: compute all hidden states and intermediate values.
+// Port of forward_pass (gradient.rs line 60). The three Vec<Vec<T>>
+// returns of the original are the three ForwardStates fields.
+fn forward_pass(
+    model: NgramModel,
+    tokens: []const usize,
+    count: usize,
+) ForwardStates {
+    var states: ForwardStates = zero_forward_states();
+    // original: assert!(count > 0, "forward_pass: count=0");
+    if (count == 0) {
+        return states;
+    }
+    // Fixed capacity: positions beyond MAX_SEQ cannot be stored, so
+    // states.len ends below count and backward_pass skips the step.
+    const n: usize = min_usize(count, MAX_SEQ);
+    states.len = n;
+    var i: usize = 0;
+    while (i < n) {
+        // let context: Vec<usize> = tokens[i .. i + NGRAM].to_vec();
+        var cj: usize = 0;
+        while (cj < NGRAM) {
+            states.contexts[i * NGRAM + cj] = tokens[i + cj];
+            cj = cj + 1;
+        }
+        // let t0 = context[NGRAM - 1].min(VOCAB - 1);
+        const t0: usize = min_usize(states.contexts[i * NGRAM + (NGRAM - 1)], VOCAB - 1);
+        // let mut combined = model.embed[t0 * DIM .. (t0 + 1) * DIM].to_vec();
+        var combined: [DIM]f32 = [0.0; DIM];
+        var j: usize = 0;
+        while (j < DIM) {
+            combined[j] = model.embed[t0 * DIM + j];
+            j = j + 1;
+        }
+        // for (ci, cw) in model.ctx_weights.iter().enumerate()
+        var ci: usize = 0;
+        while (ci < NUM_CTX) {
+            const cw: f32 = model.ctx_weights[ci];
+            // let ctx_idx = NGRAM - 2 - ci;
+            const ctx_idx: usize = NGRAM - 2 - ci;
+            // let t = context[ctx_idx].min(VOCAB - 1);
+            const t: usize = min_usize(states.contexts[i * NGRAM + ctx_idx], VOCAB - 1);
+            // combined += cw * model.ctx[ci][t * DIM .. (t + 1) * DIM];
+            var jj: usize = 0;
+            while (jj < DIM) {
+                combined[jj] = combined[jj] + model.ctx_flat[ci * EMBED_LEN + t * DIM + jj] * cw;
+                jj = jj + 1;
+            }
+            ci = ci + 1;
+        }
+        // let ln = model.layer_norm(&combined, 1e-5);
+        ngram_layer_norm(&combined, 0, LN_EPS, &states.ln, i * DIM);
+        // hidden = relu(model.proj * ln)
+        var hi: usize = 0;
+        while (hi < HIDDEN) {
+            var acc: f32 = 0.0;
+            var jj: usize = 0;
+            while (jj < DIM) {
+                acc = acc + model.proj[hi * DIM + jj] * states.ln[i * DIM + jj];
+                jj = jj + 1;
+            }
+            // hidden[hi] = hidden[hi].max(0.0);
+            if (acc < 0.0) {
+                acc = 0.0;
+            }
+            states.hidden[i * HIDDEN + hi] = acc;
+            hi = hi + 1;
+        }
+        i = i + 1;
+    }
+    return states;
+}
+
+// Accumulate gradients for input embeddings.
+// Port of accumulate_input_grads (gradient.rs line 154). `context` is the
+// i-th NGRAM window, passed as the flat contexts array plus its offset
+// (the original passes &all_contexts[i], a sub-slice; .t27 has no slice
+// ranges). Same for `hidden` at h_off.
+fn accumulate_input_grads(
+    model: NgramModel,
+    contexts: []const usize,
+    ctx_off: usize,
+    hidden: []const f32,
+    h_off: usize,
+    d_hidden: []const f32,
+    g_embed: []f32,
+    g_ctx: []f32,
+) void {
+    // original: assert!(context.len() >= NGRAM, ...) - the caller passes
+    // exactly one NGRAM window by construction.
+    // let t0 = context[NGRAM - 1].min(VOCAB - 1);
+    const t0: usize = min_usize(contexts[ctx_off + (NGRAM - 1)], VOCAB - 1);
+    var di: usize = 0;
+    while (di < DIM) {
+        var grad_sum: f32 = 0.0;
+        var hi: usize = 0;
+        while (hi < HIDDEN) {
+            // if hidden[hi] > 0.0 - units the ReLU masked contribute nothing
+            if (hidden[h_off + hi] > 0.0) {
+                grad_sum = grad_sum + model.proj[hi * DIM + di] * d_hidden[hi];
+            }
+            hi = hi + 1;
+        }
+        // g_embed[t0 * DIM + di] += grad_sum;
+        g_embed[t0 * DIM + di] = g_embed[t0 * DIM + di] + grad_sum;
+        // for (ci, cw) in model.ctx_weights.iter().enumerate()
+        var ci: usize = 0;
+        while (ci < NUM_CTX) {
+            const cw: f32 = model.ctx_weights[ci];
+            const ctx_idx: usize = NGRAM - 2 - ci;
+            // let t = context[ctx_idx].min(VOCAB - 1);
+            const t: usize = min_usize(contexts[ctx_off + ctx_idx], VOCAB - 1);
+            // g_ctx[ci][t * DIM + di] += cw * grad_sum;
+            g_ctx[ci * EMBED_LEN + t * DIM + di] = g_ctx[ci * EMBED_LEN + t * DIM + di] + cw * grad_sum;
+            ci = ci + 1;
+        }
+        di = di + 1;
+    }
+}
+
+// Backward pass: compute gradients from hidden states.
+// Port of backward_pass (gradient.rs line 99). The three per-position
+// arrays and the four gradient buffers of the original are the
+// ForwardStates value and the four g_* slices. The eprintln! WARN on a
+// length mismatch is dropped; the mismatch still returns 0.0 without
+// touching the buffers. The caller owns zeroing the buffers
+// (compute_grads does it, like the original's vec![] allocation).
+fn backward_pass(
+    model: NgramModel,
+    states: ForwardStates,
+    tokens: []const usize,
+    count: usize,
+    g_embed: []f32,
+    g_ctx: []f32,
+    g_proj: []f32,
+    g_head: []f32,
+) f32 {
+    // original: assert!(count > 0, "backward_pass: count=0");
+    if (count == 0) {
+        return 0.0;
+    }
+    // if all_hidden.len() != count { eprintln!(WARN...); return 0.0; }
+    if (states.len != count) {
+        return 0.0;
+    }
+    var total_loss: f32 = 0.0;
+    var logits: [VOCAB]f32 = [0.0; VOCAB];
+    var d_hidden: [HIDDEN]f32 = [0.0; HIDDEN];
+    var i: usize = 0;
+    while (i < count) {
+        // let target = tokens[i + NGRAM].min(VOCAB - 1);
+        const target: usize = min_usize(tokens[i + NGRAM], VOCAB - 1);
+        const h_off: usize = i * HIDDEN;
+        var hi: usize = 0;
+        while (hi < HIDDEN) {
+            d_hidden[hi] = 0.0;
+            hi = hi + 1;
+        }
+        // let mut logits = model.predict(hidden); model.softmax(&mut logits);
+        ngram_predict(model, &states.hidden, h_off, &logits);
+        ngram_softmax(&logits);
+        // total_loss -= logits[target].max(1e-10).ln();
+        total_loss = total_loss - @log(@max(logits[target], LOSS_FLOOR));
+        // for (vi, prob) in logits.iter().enumerate()
+        var vi: usize = 0;
+        while (vi < VOCAB) {
+            var grad: f32 = logits[vi];
+            if (vi == target) {
+                grad = grad - 1.0;
+            }
+            hi = 0;
+            while (hi < HIDDEN) {
+                g_head[vi * HIDDEN + hi] = g_head[vi * HIDDEN + hi] + grad * states.hidden[h_off + hi];
+                d_hidden[hi] = d_hidden[hi] + grad * model.lm_head[vi * HIDDEN + hi];
+                hi = hi + 1;
+            }
+            vi = vi + 1;
+        }
+        // projection gradients, gated by the ReLU mask (hidden > 0)
+        hi = 0;
+        while (hi < HIDDEN) {
+            if (states.hidden[h_off + hi] > 0.0) {
+                var di: usize = 0;
+                while (di < DIM) {
+                    g_proj[hi * DIM + di] = g_proj[hi * DIM + di] + d_hidden[hi] * states.ln[i * DIM + di];
+                    di = di + 1;
+                }
+            }
+            hi = hi + 1;
+        }
+        accumulate_input_grads(model, &states.contexts, i * NGRAM, &states.hidden, h_off, &d_hidden, g_embed, g_ctx);
+        i = i + 1;
+    }
+    // total_loss / count as f32
+    const fc: f32 = count as f32;
+    return total_loss / fc;
+}
+
+// Compute gradients for a training sequence.
+// Port of compute_grads (gradient.rs line 31). Returns
+// (TrainGrads, ForwardStates, f32): the gradient views, the forward
+// states, and the mean next-token-prediction loss over `count`
+// positions. The four buffers must be at least EMBED_LEN, CTX_GRAD_LEN,
+// PROJ_LEN and HEAD_LEN long; they are zeroed here, exactly where the
+// original allocates them with vec![0.0; ...].
+pub fn compute_grads(
+    model: NgramModel,
+    tokens: []const usize,
+    g_embed: []f32,
+    g_ctx: []f32,
+    g_proj: []f32,
+    g_head: []f32,
+) (TrainGrads, ForwardStates, f32) {
+    // let count = tokens.len().saturating_sub(NGRAM);
+    const count: usize = saturating_sub_usize(tokens.len, NGRAM);
+    // original: assert!(count > 0, "sequence too short for gradient
+    // computation"); a too-short sequence contributes nothing.
+    if (count == 0) {
+        return (TrainGrads{ .g_embed = g_embed, .g_ctx = g_ctx, .g_proj = g_proj, .g_head = g_head }, zero_forward_states(), 0.0);
+    }
+    // let mut g_embed = vec![0.0f32; VOCAB * DIM]; (and the other three)
+    zero_f32(g_embed);
+    zero_f32(g_ctx);
+    zero_f32(g_proj);
+    zero_f32(g_head);
+    const states: ForwardStates = forward_pass(model, tokens, count);
+    const total_loss: f32 = backward_pass(model, states, tokens, count, g_embed, g_ctx, g_proj, g_head);
+    // for x in g_embed.iter_mut() { *x /= n; } (and the other three),
+    // with n = count as f32
+    const n: f32 = count as f32;
+    var k: usize = 0;
+    while (k < g_embed.len) {
+        g_embed[k] = g_embed[k] / n;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < g_ctx.len) {
+        g_ctx[k] = g_ctx[k] / n;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < g_proj.len) {
+        g_proj[k] = g_proj[k] / n;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < g_head.len) {
+        g_head[k] = g_head[k] / n;
+        k = k + 1;
+    }
+    return (TrainGrads{ .g_embed = g_embed, .g_ctx = g_ctx, .g_proj = g_proj, .g_head = g_head }, states, total_loss);
+}
+
+test saturating_sub_and_clamps {
+    // count = tokens.len().saturating_sub(NGRAM): never underflows.
+    assert(saturating_sub_usize(3, 6) == 0);
+    assert(saturating_sub_usize(6, 6) == 0);
+    assert(saturating_sub_usize(13, 6) == 7);
+    // token id clamps: .min(VOCAB - 1) on t0, context tokens and target.
+    assert(min_usize(200, VOCAB - 1) == 127);
+    assert(min_usize(3, VOCAB - 1) == 3);
+    // gradient buffers zeroed where the original allocates them.
+    var buf: [3]f32 = [9.0, 9.0, 9.0];
+    zero_f32(&buf);
+    assert(buf[0] == 0.0 and buf[2] == 0.0);
+    // the zero states sentinel used when count == 0.
+    const s0 = zero_forward_states();
+    assert(s0.len == 0);
+}
+
+test math_helpers_ln_exp_sqrt {
+    // Values are routed through a runtime array load so the asserts are
+    // not folded away at compile time.
+    var xs: [4]f32 = [0.0; 4];
+    xs[0] = 0.24610375;
+    xs[1] = 2.0;
+    xs[2] = 5.0;
+    xs[3] = 1.0;
+    assert(@exp(0.0) == 1.0);
+    assert(@abs(@sqrt(xs[0]) - 0.4960885) < 0.001);
+    // ln(2) = LN_2, the constant the original declares.
+    assert(@abs(@log(xs[1]) - LN_2) < 0.0001);
+    assert(@abs(@log(0.5 / xs[3]) + LN_2) < 0.0001);
+    // the loss floor path: ln(1e-10)
+    assert(@abs(@log(LOSS_FLOOR * xs[3]) + 23.025851) < 0.001);
+    assert(@abs(@exp(xs[3]) - 2.718282) < 0.001);
+    assert(@abs(@exp(@log(xs[2])) - 5.0) < 0.001);
+}
+
+test ngram_layer_norm_standardises {
+    // Standard layer norm: one 4.0 spike over 64 elements gives mean 1/16
+    // and variance 15.75/64.
+    var x: [DIM]f32 = [0.0; DIM];
+    x[0] = 4.0;
+    var out: [DIM]f32 = [0.0; DIM];
+    ngram_layer_norm(&x, 0, LN_EPS, &out, 0);
+    assert(@abs(out[0] - 7.937093) < 0.001);
+    assert(@abs(out[1] + 0.125985) < 0.001);
+    // with offset: same values from a second row start
+    var x2: [TWO_DIM]f32 = [0.0; TWO_DIM];
+    x2[DIM] = 4.0;
+    var out2: [TWO_DIM]f32 = [0.0; TWO_DIM];
+    ngram_layer_norm(&x2, DIM, LN_EPS, &out2, DIM);
+    assert(@abs(out2[DIM] - 7.937093) < 0.001);
+}
+
+test ngram_predict_reads_lm_head {
+    // Linear head, no bias: logits[v] = lm_head row v . hidden.
+    var unused: [4]f32 = [0.0; 4];
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    head[0] = 2.0;
+    head[HIDDEN] = 0.5;
+    head[HIDDEN + 1] = 3.0;
+    const model = NgramModel{ .embed = &unused, .ctx_weights = &unused, .ctx_flat = &unused, .proj = &unused, .lm_head = &head };
+    var hidden: [HIDDEN]f32 = [0.0; HIDDEN];
+    hidden[0] = 1.0;
+    hidden[1] = 2.0;
+    var logits: [VOCAB]f32 = [0.0; VOCAB];
+    ngram_predict(model, &hidden, 0, &logits);
+    assert(logits[0] == 2.0);
+    // Row v pairs with hidden[v*HIDDEN + hi] * hidden[hi]: 0.5*1.0 + 3.0*2.0.
+    assert(logits[1] == 6.5);
+    assert(logits[VOCAB - 1] == 0.0);
+}
+
+test ngram_softmax_distinct_logits {
+    // One logit ln(3) over 128 zeros: p0 = 3/130, the rest 1/130.
+    var lg: [VOCAB]f32 = [0.0; VOCAB];
+    lg[0] = @log(3.0);
+    ngram_softmax(&lg);
+    assert(@abs(lg[0] - 0.023077) < 0.001);
+    assert(@abs(lg[1] - 0.007692) < 0.001);
+    var s: f32 = 0.0;
+    var i: usize = 0;
+    while (i < VOCAB) {
+        s = s + lg[i];
+        i = i + 1;
+    }
+    assert(@abs(s - 1.0) < 0.0001);
+}
+
+test forward_pass_constant_row_gives_zero_hidden {
+    // A constant embedding row has zero variance, so layer_norm maps the
+    // whole row to 0 and the ReLU keeps every hidden unit at exactly 0.
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var j: usize = 0;
+    while (j < DIM) {
+        embed[0 * DIM + j] = 1.0; // t0 = tokens[5] = 0
+        j = j + 1;
+    }
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0;
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [7]usize = [0; 7];
+    tokens[6] = 1; // target, unused by forward_pass
+    const states = forward_pass(model, &tokens, 1);
+    assert(states.len == 1);
+    assert(states.contexts[0] == 0);
+    assert(states.contexts[5] == 0);
+    assert(states.ln[0] == 0.0);
+    assert(states.hidden[0] == 0.0);
+    assert(states.hidden[HIDDEN - 1] == 0.0);
+}
+
+test forward_pass_spike_relu_and_norm {
+    // Embedding row t0 holds a single 4.0 spike: layer_norm standardises
+    // it, the projection reads it out, and the ReLU clamps the negative
+    // unit to exactly 0.
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    embed[0] = 4.0;
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0; // hidden[0] = ln[0] > 0
+    proj[1 * DIM] = -1.0; // hidden[1] = -ln[0] -> ReLU clamps to 0
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [7]usize = [0; 7];
+    tokens[6] = 1;
+    const states = forward_pass(model, &tokens, 1);
+    // mean 4/64, variance 15.75/64: ln[0] = 3.9375 / sqrt(0.24609375 + 1e-5)
+    assert(@abs(states.ln[0] - 7.937093) < 0.001);
+    assert(@abs(states.ln[1] + 0.125985) < 0.001);
+    assert(@abs(states.hidden[0] - 7.937093) < 0.001);
+    assert(states.hidden[1] == 0.0); // the ReLU decision
+    assert(states.hidden[2] == 0.0);
+    assert(states.len == 1);
+}
+
+test backward_pass_uniform_logits_loss {
+    // lm_head all zero: every logit is 0, softmax is uniform 1/128, and
+    // the loss is -ln(1/128) = 7*ln(2). Target 200 clamps to 127. Head
+    // gradients get (p - onehot) * hidden; with lm_head zero nothing
+    // reaches d_hidden, so proj/embed/ctx gradients stay exactly 0.
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    embed[0] = 4.0;
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0;
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [7]usize = [0; 7];
+    tokens[6] = 200; // target token id, clamped to 127
+    const states = forward_pass(model, &tokens, 1);
+    var g_embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var g_ctx: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    var g_proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    var g_head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const loss = backward_pass(model, states, &tokens, 1, &g_embed, &g_ctx, &g_proj, &g_head);
+    assert(@abs(loss - 4.852030) < 0.001); // 7 * ln(2)
+    // target row 127: (1/128 - 1) * hidden[0]
+    assert(@abs(g_head[127 * HIDDEN] + 7.875084) < 0.01);
+    // every other vocab row: (1/128) * hidden[0]
+    assert(@abs(g_head[0] - 0.062009) < 0.001);
+    assert(g_head[1] == 0.0); // hidden[hi != 0] is 0
+    assert(g_proj[0] == 0.0);
+    assert(g_embed[0] == 0.0);
+    assert(g_ctx[0] == 0.0);
+}
+
+test backward_pass_gradient_flow {
+    // One active hidden unit and lm_head[0][0] = 1: logit[0] = hidden[0]
+    // ~ 7.937, so softmax puts p0 ~ 0.9566 on the target and the
+    // cross-entropy pulls gradients through head, proj (ReLU-gated),
+    // embed and the ctx rows of the context tokens.
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    embed[0] = 4.0;
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0;
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    head[0] = 1.0; // logits[0] = hidden[0]
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [7]usize = [0; 7]; // target = 0
+    const states = forward_pass(model, &tokens, 1);
+    var g_embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var g_ctx: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    var g_proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    var g_head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const loss = backward_pass(model, states, &tokens, 1, &g_embed, &g_ctx, &g_proj, &g_head);
+    assert(@abs(loss - 0.044363) < 0.005);
+    // g_head[0] = (p0 - 1) * hidden[0]
+    assert(@abs(g_head[0] + 0.344417) < 0.005);
+    // g_head row 1 = p1 * hidden[0]
+    assert(@abs(g_head[HIDDEN] - 0.002712) < 0.0005);
+    // g_proj[0] = d_hidden[0] * ln[0] with d_hidden[0] = p0 - 1
+    assert(@abs(g_proj[0] + 0.344417) < 0.005);
+    assert(@abs(g_proj[1] - 0.005467) < 0.002);
+    // g_embed[0] = proj[0][0] * d_hidden[0]
+    assert(@abs(g_embed[0] + 0.043393) < 0.002);
+    // ctx rows of the context tokens, weighted by ctx_weights
+    assert(@abs(g_ctx[0] + 0.021697) < 0.002);
+    assert(@abs(g_ctx[1 * EMBED_LEN] + 0.010848) < 0.002);
+}
+
+test compute_grads_averages_and_zeroes {
+    // Two identical positions: gradients accumulate to twice a single
+    // step and compute_grads divides by count, so the values match the
+    // single-step port. Buffers handed in dirty are zeroed first, exactly
+    // where the original does vec![0.0; ...].
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    embed[0] = 4.0;
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0;
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    head[0] = 1.0;
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [8]usize = [0; 8]; // count = 2, both positions identical
+    tokens[0] = 1; // lands in position 0's window, never in the math (t0 = 0)
+    var g_embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    g_embed[77] = 5.0; // dirty on purpose
+    var g_ctx: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    g_ctx[100] = 3.0;
+    var g_proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    g_proj[100 * DIM] = 7.0;
+    var g_head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    g_head[100] = 99.0;
+    const (grads, states, loss) = compute_grads(model, &tokens, &g_embed, &g_ctx, &g_proj, &g_head);
+    assert(states.len == 2);
+    assert(states.contexts[0] == 1); // position 0 starts at flat offset 0
+    assert(states.contexts[6] == 0); // position 1 starts at flat offset 6
+    assert(@abs(loss - 0.044363) < 0.005);
+    assert(@abs(grads.g_embed[0] + 0.043393) < 0.002);
+    assert(@abs(grads.g_ctx[0] + 0.021697) < 0.002);
+    assert(@abs(grads.g_ctx[8192] + 0.010859) < 0.002); // ci=1 row, weight 0.25
+    assert(@abs(grads.g_proj[0] + 0.344417) < 0.005);
+    assert(@abs(grads.g_head[0] + 0.344417) < 0.005);
+    // g_head[384] = 2 positions * p(1) * hidden[0] / 2 where p(1) is the
+    // softmax tail probability 0.000342 (logits[0] = 7.937 dominates).
+    assert(@abs(grads.g_head[384] - 0.0027124) < 0.0005); // v=1 logit row, p*hidden
+    // zeroed first: these slots are untouched by the gradients themselves
+    assert(grads.g_embed[77] == 0.0);
+    assert(grads.g_ctx[100] == 0.0);
+    assert(grads.g_proj[100 * DIM] == 0.0);
+    assert(grads.g_head[100] == 0.0);
+}
+
+test accumulate_input_grads_windows_and_relu_mask {
+    // Direct call: the context window maps context[NGRAM - 1] to the
+    // embed row and context[NGRAM - 2 - ci] to ctx row ci; units the
+    // ReLU masked (hidden <= 0) contribute nothing even with non-zero
+    // d_hidden.
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 2.0;
+    proj[1 * DIM] = 10.0; // hidden[1] < 0 -> masked out
+    proj[2 * DIM] = 1.0;
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var contexts: [12]usize = [0; 12];
+    contexts[0] = 5;
+    contexts[1] = 6;
+    contexts[2] = 7;
+    contexts[3] = 8;
+    contexts[4] = 9;
+    contexts[5] = 10;
+    contexts[11] = 200; // second window's t0, for the clamp below
+    var hidden: [HIDDEN]f32 = [0.0; HIDDEN];
+    hidden[0] = 1.0;
+    hidden[1] = -1.0;
+    hidden[2] = 2.0;
+    var d_hidden: [HIDDEN]f32 = [0.0; HIDDEN];
+    d_hidden[0] = 3.0;
+    d_hidden[1] = 5.0;
+    d_hidden[2] = 0.5;
+    var g_embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var g_ctx: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    accumulate_input_grads(model, &contexts, 0, &hidden, 0, &d_hidden, &g_embed, &g_ctx);
+    // grad_sum[0] = 2*3 (active) + 10*5 (masked) + 1*0.5 = 6.5
+    assert(g_embed[10 * DIM] == 6.5); // t0 = context[5] = 10
+    assert(g_embed[9 * DIM] == 0.0);
+    assert(g_ctx[0 * EMBED_LEN + 9 * DIM] == 3.25); // ci=0 -> context[4]=9
+    assert(g_ctx[1 * EMBED_LEN + 8 * DIM] == 1.625); // ci=1 -> context[3]=8
+    assert(g_ctx[2 * EMBED_LEN + 7 * DIM] == 0.8125); // ci=2 -> context[2]=7
+    assert(g_ctx[3 * EMBED_LEN + 6 * DIM] == 0.40625); // ci=3 -> context[1]=6
+    assert(g_ctx[0 * EMBED_LEN + 10 * DIM] == 0.0); // t0 row untouched in ctx
+    // token id clamp: context[11] = 200 -> t0 = VOCAB - 1 = 127
+    var g_embed2: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var g_ctx2: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    accumulate_input_grads(model, &contexts, 6, &hidden, 0, &d_hidden, &g_embed2, &g_ctx2);
+    assert(g_embed2[127 * DIM] == 6.5);
+    assert(g_embed2[10 * DIM] == 0.0);
+}
+
+test backward_pass_skips_on_len_mismatch {
+    // all_hidden.len() != count: the original warns and returns 0.0
+    // without touching the gradient buffers; so does the port.
+    var embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    embed[0] = 4.0;
+    var ctx_flat: [CTX_FLAT_LEN]f32 = [0.0; CTX_FLAT_LEN];
+    var cw: [NUM_CTX]f32 = [0.5, 0.25, 0.125, 0.0625];
+    var proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    proj[0] = 1.0;
+    var head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    head[0] = 1.0;
+    const model = NgramModel{ .embed = &embed, .ctx_weights = &cw, .ctx_flat = &ctx_flat, .proj = &proj, .lm_head = &head };
+    var tokens: [7]usize = [0; 7];
+    const states = forward_pass(model, &tokens, 1); // states.len == 1
+    var g_embed: [EMBED_LEN]f32 = [0.0; EMBED_LEN];
+    var g_ctx: [CTX_GRAD_LEN]f32 = [0.0; CTX_GRAD_LEN];
+    var g_proj: [PROJ_LEN]f32 = [0.0; PROJ_LEN];
+    var g_head: [HEAD_LEN]f32 = [0.0; HEAD_LEN];
+    g_head[0] = 7.0; // marker: must survive untouched
+    const loss = backward_pass(model, states, &tokens, 2, &g_embed, &g_ctx, &g_proj, &g_head);
+    assert(loss == 0.0);
+    assert(g_head[0] == 7.0);
+    assert(g_embed[0] == 0.0);
+}
