@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tri t27b -- the t27b steward's tick card (status), anomaly scan (doctor), per-spec ratchet between lab runs (delta), gen-c proof on the t27c lab (gen-check), the merge gate (ready), the stack merger (watch) and the reference-backed lane picker (next).
+"""tri t27b -- the t27b steward's tick card (status), anomaly scan (doctor), per-spec ratchet between lab runs (delta), gen-c proof on the t27c lab (gen-check), the merge gate (ready), the stack merger (watch), the reference-backed lane picker (next), our own specs first (dogfood), the repro reducer (reduce) and the differential fuzzer (fuzz).
 
 WHY THIS EXISTS
 ---------------
@@ -122,13 +122,29 @@ WHAT THIS DOES NOT ESTABLISH
     tri t27b gen-check             # is gen/c/tri/t27b/steward.c what master's t27c emits?
     tri t27b diff SPEC [--run R]   # t27b's per-test verdicts beside the reference's (#6441)
     tri t27b ready [N ...]         # may each open t27b PR merge now? (never merges)
+    tri t27b reduce SPEC [--family X | --disagree]  # shrink SPEC to a minimal repro (#6445)
+    tri t27b fuzz --cases N --seed S  # generated programs, t27b against the reference (#6442)
+
+REDUCE (#6445): a minimal repro, reference-guarded, decided in reduce.t27
+-------------------------------------------------------------------------
+ddmin over declarations, then statements, then expressions, until a cycle
+removes nothing. Every candidate must parse (`t27c parse`); one is kept only
+when the reference passes it and t27b's first blocker is still the family
+(--family, default the spec's own) or t27b still disagrees with it
+(--disagree). A spec the reference does not pass is refused with
+REFERENCE-NOT-PASS: it is a reference bug, not a lane (Q38). The fixture lands
+in cli/t27b/tests/reduced/ with a header naming its origin, and `next` links it
+under its lane. The reference runs through `t27b corpus --reference
+--reference-cache` (default ~/.cache/t27/t27b-reduce/refcache.tsv), so a rerun
+hits the cache. scripts/tri_loop/t27b_reduce.py; --help lists the flags.
 
 READY (#6244): the steward's merge gate, decided in steward.t27
 ---------------------------------------------------------------
 One line per PR: READY, WAIT, RED, CONFLICT, RETARGET, BLOCKED or CLOSED, then the
 checks that decided it. Required: validate, check-linked-issue,
-parse-ratchet, and loop-tools-tracked when it reports on the PR; each must be
-SUCCESS. A non-required check blocks only when it is red on the PR and its
+parse-ratchet, and loop-tools-tracked, t27b-native-linux and t27b-native-macos
+(#6444) when they report on the PR; each must be SUCCESS. t27b-native-ratchet
+(the native corpus against the ledger) is not required and falls under Q16. A non-required check blocks only when it is red on the PR and its
 latest completed result on master is success (Q16); red on master too means
 master broke it. Master's results are the newest completed run per check
 name over the last 12 master commits, looked up past a tip whose run is still
@@ -202,7 +218,9 @@ executed 0 runtime asserts), or its first blocker with a reason
 Exit 0 green, 1 red (or a refused bless), 2 usage or an unreadable input.
 """
 import argparse
+import ctypes
 import datetime as dt
+import functools
 import glob
 import json
 import os
@@ -220,11 +238,30 @@ def rules():
     import t27b_rules
     return t27b_rules
 
-LAB = "https://t27b-lab-production.up.railway.app"
+
+def dogfood_rules():
+    """Which specs are our own and what a lab row of one means, compiled from
+    specs/tri/t27b/dogfood.t27 (#6457). Loaded on first use."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import t27b_dogfood
+    return t27b_dogfood
+
+
+def reduce_tool():
+    """`tri t27b reduce` and the fixtures it wrote, decided in specs/tri/t27b/reduce.t27 (#6445)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import t27b_reduce
+    return t27b_reduce
+
+LAB = os.environ.get("T27B_LAB", "https://t27b-lab-production.up.railway.app")  # lab 2 (requests first): t27b-lab-2-production
 REPO = "gHashTag/t27"
 STATE = os.path.expanduser("~/.local/state/t27b-queen")
 REQUIRED = ("validate", "check-linked-issue", "parse-ratchet")
-REQUIRED_WHEN_PRESENT = ("loop-tools-tracked",)
+# t27b-native-linux / -macos (#6444): cargo test --release -p t27b on arm64 Linux
+# and Apple Silicon (workflow t27b-native.yml). Its third check,
+# t27b-native-ratchet, is not required: master's ledger may be red, so Q16
+# judges it like any other non-required check.
+REQUIRED_WHEN_PRESENT = ("loop-tools-tracked", "t27b-native-linux", "t27b-native-macos")
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LEDGER = os.path.join(ROOT, "docs", "reports", "t27b_expectations.json")
 
@@ -753,6 +790,9 @@ def lab_card(lab):
         lines.append(f"           of those {h['checked']} ran a test or invariant, {h['compile_only']} compile-only")
     lines.append(f"           not counted: {h['outside']} t27b pass(es) where the reference fails, "
                  f"{len(h['frontend'])} frontend reject(s) where it passes")
+    c = ((lab.get("steps") or {}).get("reference") or {}).get("cache") or {}
+    if "hits" in c:  # #8095: lab.py's reference cache, hits of all the specs it referenced
+        lines.append(f"           reference reused {c['hits']} of {c['hits'] + c.get('misses', 0) + c.get('not_cached', 0)} from the cache")
     for b in (lab.get("top_blockers") or [])[:5]:
         lines.append(f"           blocker {b.get('construct'):<34} first {b.get('first'):>4}  all {b.get('all')}")
     return lines
@@ -907,13 +947,8 @@ def bless(run, old, accept_new=False):
                            f"entry by hand with reason reference-bug or n/a")
             continue
         entries.append({"path": path, "t27b": got, "blocker": blocker, "reason": reason})
-    counts = {"pass": sum(1 for e in entries if e["t27b"] == "pass"),
-              "pass_vacuous": sum(1 for e in entries if e["t27b"] == "pass_vacuous")}
-    counts["not_pass"] = len(entries) - counts["pass"] - counts["pass_vacuous"]
     asserts_counted = any("asserts" in r for r in run["results"])
-    if not asserts_counted:
-        # The run's t27b did not count runtime asserts: 0 would be a claim.
-        counts["pass_vacuous"] = None
+    counts = ledger_counts(entries, asserts_counted)
     old_cap = (old or {}).get("max_not_pass")
     if r.cap_rises(counts["not_pass"], old_cap):
         # Accounting (#6237): specs the old ledger never named may raise the cap by exactly their
@@ -943,10 +978,36 @@ def bless(run, old, accept_new=False):
     return new, refused
 
 
+def ledger_counts(entries, asserts_counted=True):
+    """pass / pass_vacuous / not_pass over the entries. Never stored: a total
+    over the entries is derived where it is read (steward.t27 `header_stored`,
+    #7859). Without counted asserts pass_vacuous is None: 0 would be a claim."""
+    counts = {"pass": sum(1 for e in entries if e.get("t27b") == "pass"),
+              "pass_vacuous": sum(1 for e in entries if e.get("t27b") == "pass_vacuous")}
+    counts["not_pass"] = len(entries) - counts["pass"] - counts["pass_vacuous"]
+    if not asserts_counted:
+        counts["pass_vacuous"] = None
+    return counts
+
+
+# The ledger's header fields, in steward.t27's field codes (#7859).
+HEADER_FIELDS = ("schema_version", "generated_by", "source", "reasons", "max_not_pass", "counts")
+
+
+def header_stored(field):
+    """steward.t27 `header_stored`: does the ledger keep `field` on disk? An unknown field is an error."""
+    if field not in HEADER_FIELDS:
+        raise ValueError(f"unknown ledger header field {field!r}")
+    f = rules().lib().header_stored
+    f.argtypes, f.restype = [ctypes.c_uint8], ctypes.c_bool
+    return bool(f(HEADER_FIELDS.index(field)))
+
+
 def dump_ledger(doc):
     """The header indented, then one entry per line: a spec that moves is a
-    one-line diff in review."""
-    head = {k: v for k, v in doc.items() if k != "entries"}
+    one-line diff in review. Only the header fields steward.t27 stores are
+    written (#7859): a total over the entries would conflict on every spec PR."""
+    head = {k: v for k, v in doc.items() if k != "entries" and header_stored(k)}
     text = json.dumps(head, indent=1)[:-2]
     rows = ",\n".join("  " + json.dumps(e) for e in doc["entries"])
     return text + ',\n "entries": [\n' + rows + "\n ]\n}\n"
@@ -1494,6 +1555,7 @@ def next_lanes(lab):
     Slip Q38: a lane picked from blockers without the reference moved the
     counted pass number by 0, because the reference could not compile its files."""
     R = rules()
+    D = dogfood_rules()
     results = lab.get("results")
     if not isinstance(results, list) or not results:
         raise Unreadable("the lab run has no per-file results[]")
@@ -1510,13 +1572,21 @@ def next_lanes(lab):
             continue
         files[kind] += 1
         for i, b in enumerate(dict.fromkeys(blockers)):
-            f = fams[kind].setdefault(b, {"family": b, "sole": 0, "first": 0, "any": 0})
+            f = fams[kind].setdefault(b, {"family": b, "sole": 0, "first": 0, "any": 0, "own": 0})
             f["any"] += 1
+            f["own"] += 1 if D.own(x.get("file") or "") else 0
             f["first"] += 1 if i == 0 else 0
             f["sole"] += 1 if len(set(blockers)) == 1 else 0
     for f in fams["LANE"].values():
         f["score"] = R.lane_score(f["sole"], f["first"])
-    lanes = sorted(fams["LANE"].values(), key=lambda f: (-f["score"], -f["any"], f["family"]))
+    # Order: dogfood.t27's lane_before (score, then our own specs as the tie-break); then any, then name.
+    def cmp(a, b):
+        if D.lane_before(a["score"], a["own"], b["score"], b["own"]):
+            return -1
+        if D.lane_before(b["score"], b["own"], a["score"], a["own"]):
+            return 1
+        return (b["any"] - a["any"]) or ((a["family"] > b["family"]) - (a["family"] < b["family"]))
+    lanes = sorted(fams["LANE"].values(), key=functools.cmp_to_key(cmp))
     bugs = sorted(fams["REFERENCE-BUG"].values(), key=lambda f: (-f["any"], f["family"]))
     ref_pass = sum(split.values())
     tested = R.with_tests(ref_pass, split["pass_vacuous"])
@@ -1561,10 +1631,15 @@ def next_card(n, top):
            f"t27b pass {s['pass']} / {n['with_tests']} with tests ({n['pct_with_tests']}%)",
            "",
            f"next lane -- {n['lane_files']} files where the reference passes and t27b is blocked",
-           f"  {'rank':>4}  {'sole':>4}  {'first':>5}  {'any':>4}  family   (sole: unlocks on its own;"
-           " order: steward.t27 lane_score)"]
+           f"  {'rank':>4}  {'sole':>4}  {'first':>5}  {'any':>4}  {'own':>4}  family   (sole: unlocks on its own;"
+           " order: steward.t27 lane_score, ties: dogfood.t27 own specs)"]
     for i, f in enumerate(n["lanes"][:top], 1):
-        out.append(f"  {i:>4}  {f['sole']:>4}  {f['first']:>5}  {f['any']:>4}  {f['family']}")
+        out.append(f"  {i:>4}  {f['sole']:>4}  {f['first']:>5}  {f['any']:>4}  {f['own']:>4}  {f['family']}")
+        if f.get("repro"):
+            out.append(f"  {'':>4}  repro: {f['repro']}")
+    if n["lanes"] and "repro" in n["lanes"][0] and not n["lanes"][0]["repro"]:
+        out.append(f"  {'':>4}  no reduced repro for rank 1 yet: tri t27b reduce <a spec it blocks> "
+                   f"--family \"{n['lanes'][0]['family']}\"")
     if len(n["lanes"]) > top:
         out.append(f"  ... {len(n['lanes']) - top} more families (--top N)")
     out += ["",
@@ -1596,11 +1671,79 @@ def next_main(argv):
         print(f"tri t27b next: UNREADABLE {e}")
         return 2
     n["lab_behind"] = lab_behind(src, n["commit"])
+    # A reduced repro per family, from the headers `tri t27b reduce` wrote (#6445).
+    try:
+        found = reduce_tool().repros()
+    except Exception as e:  # the repro link is an extra: never let it hide the ranking
+        found = {}
+        print(f"tri t27b next: repro links unavailable: {e}", file=sys.stderr)
+    for f in n["lanes"] + n["reference_bugs"]:
+        f["repro"] = found.get(f["family"])
     if args.json:
         print(json.dumps(n, indent=1))
     else:
         line = behind_line(n["lab_behind"])
         print("\n".join(([line, ""] if line else []) + next_card(n, args.top)))
+    return 0
+
+
+# --- dogfood (#6457): our own specs first --------------------------------------
+
+def dogfood(lab):
+    """Every own spec of one lab run, by dogfood.t27's row. This only reads and counts."""
+    D = dogfood_rules()
+    results = lab.get("results")
+    if not isinstance(results, list) or not results:
+        raise Unreadable("the lab run has no per-file results[]")
+    names = D.text("ROW_NAMES").split(",")
+    rows = {k: [] for k in names[1:]}
+    for x in results:
+        try:
+            r = D.row(x)
+        except ValueError as e:
+            raise Unreadable(f"{x.get('file')}: {e}")
+        if r in rows:
+            rows[r].append(x)
+    return {"commit": lab.get("commit"), "ref": lab.get("ref"), "finished": lab.get("finished"),
+            "own_prefixes": D.text("OWN_PREFIXES"), "loader_dir": D.text("LOADER_DIR"), "fed": list(D.fed_specs()),
+            "counts": {k: len(v) for k, v in rows.items()},
+            "groups": [{"row": k, "title": D.text("GROUP_T27B_LANE" if i == 0 else "GROUP_T27C_ISSUE"),
+                        "specs": [{"file": x.get("file"), "reference": x.get("reference"), "t27b": x.get("t27b"),
+                                   "first": (x.get("blockers") or [])[:3] if k == "T27B-LANE"
+                                   else re.sub(r"^does not compile: \S*spec\.zig:", "zig:",
+                                               x.get("reference_detail") or "")[:110]}
+                                  for x in sorted(rows[k], key=lambda x: x.get("file") or "")]}
+                       for i, k in enumerate(n for n in names[1:] if D.is_work(n))]}
+
+
+def dogfood_card(d):
+    out = [f"tri t27b dogfood -- lab run {str(d['commit'])[:9]} ({d['ref']}), finished {d['finished']}",
+           f"our own specs: prefixes {d['own_prefixes']}; fed to {d['loader_dir']}: {', '.join(d['fed']) or '-'}",
+           "  " + "  ".join(f"{k} {v}" for k, v in d["counts"].items()) + f"  (total {sum(d['counts'].values())})"]
+    for g in d["groups"]:
+        out += ["", f"{g['title']} -- {len(g['specs'])}"]
+        for x in g["specs"]:
+            first = ", ".join(x["first"]) if isinstance(x["first"], list) else x["first"]
+            out.append(f"  {x['file']:<52} ref {x['reference']:<8} t27b {x['t27b']:<9} {first}")
+    return out
+
+
+def dogfood_main(argv):
+    ap = argparse.ArgumentParser(prog="tri t27b dogfood",
+                                 description="our own specs in one lab run: t27b lanes and t27c issues (#6457)")
+    ap.add_argument("--fixture", help="read lab.json from this directory instead of the lab")
+    ap.add_argument("--lab", default=LAB)
+    ap.add_argument("--json", action="store_true")
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code else 0
+    try:
+        d = dogfood(Sources(fixture=args.fixture, lab=args.lab).lab_json())
+    except Unreadable as e:
+        print(f"tri t27b dogfood: UNREADABLE {e}")
+        return 2
+    print(json.dumps(d, indent=1) if args.json else "\n".join(dogfood_card(d)))
     return 0
 
 
@@ -1660,8 +1803,12 @@ def diff_main(argv):
 def main(argv):
     if argv[:1] == ["diff"]:
         return diff_main(argv[1:])
+    if argv[:1] == ["dogfood"]:
+        return dogfood_main(argv[1:])
     if argv[:1] == ["next"]:
         return next_main(argv[1:])
+    if argv[:1] == ["reduce"]:
+        return reduce_tool().main(argv[1:])
     if argv[:1] == ["watch"]:
         return watch_main(argv[1:])
     if argv[:1] == ["ready"]:
@@ -1670,8 +1817,13 @@ def main(argv):
         return ratchet_main(argv[1:])
     if argv[:1] == ["gen-check"]:
         return gen_check_main(argv[1:])
+    if argv[:1] == ["fuzz"]:
+        # #6442: the generator and the judge are specs/tri/t27b/fuzz*.t27; t27b_fuzz.py is their I/O.
+        import t27b_fuzz
+        return t27b_fuzz.main(argv[1:])
     ap = argparse.ArgumentParser(prog="tri t27b", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("status", "doctor", "delta", "ratchet", "gen-check", "ready", "watch", "next", "diff"))
+    ap.add_argument("action", choices=("status", "doctor", "delta", "ratchet", "gen-check", "ready", "watch", "next", "diff",
+                                       "dogfood", "fuzz"))
     ap.add_argument("--from", dest="from_", help="delta: the earlier lab run's sha (default: the run before --to)")
     ap.add_argument("--to", default="latest", help="delta: the later run's sha (default: latest.json)")
     ap.add_argument("--fixture", help="read every source from this directory (tests)")
