@@ -125,6 +125,7 @@ fn object_with_const_data_links_and_runs() {
         mode: OverflowMode::Trap,
         unchecked: Vec::new(),
         data: vec![d0, d1, d2],
+        globals: Vec::new(),
         internal_abi: Vec::new(),
     };
 

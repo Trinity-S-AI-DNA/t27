@@ -2890,13 +2890,6 @@ fn extract_source_from_lean(text: &str) -> Option<String> {
     None
 }
 
-/// Combined dashboard gate: the OSCFSEL selection is within the documented 0..7
-/// range and the PVT context is inside the operating envelope. Mirrors
-/// `cclk_variant_and_xadc_envelope_check` in Lean 4.
-fn cclk_variant_and_xadc_envelope_check(oscfsel: u8, ctx: &PvtContext) -> bool {
-    oscfsel <= 7 && pvt_context_inside_envelope(ctx)
-}
-
 /// Structs used to persist and report a single cold-POR sweep attempt.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SweepLog {
@@ -6740,32 +6733,6 @@ fn build_theorem_matrix_report(
     })
 }
 
-/// Strip `fixture_dir` from the fixture paths inside matrix entries so that
-/// snapshots are stable across machines.
-#[cfg(test)]
-fn normalize_fixture_paths(
-    entries: &[serde_json::Value],
-    fixture_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
-    entries
-        .iter()
-        .map(|entry| {
-            let mut entry = entry.clone();
-            if let Some(serde_json::Value::Object(fixtures)) = entry.get_mut("fixtures") {
-                for (_key, value) in fixtures.iter_mut() {
-                    if let Some(path_str) = value.as_str() {
-                        let path = std::path::Path::new(path_str);
-                        if let Ok(rel) = path.strip_prefix(fixture_dir) {
-                            *value = serde_json::Value::String(rel.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-            entry
-        })
-        .collect()
-}
-
 fn boot_protocol(checklist: bool) -> Result<()> {
     println!("== Cold-POR boot-from-flash protocol ==");
     println!();
@@ -7669,16 +7636,7 @@ mod tests {
         )
         .expect("measured-to-lean standalone should succeed");
 
-        // Locate the repo root so the temp package can depend on the in-tree
-        // Trinity package.
-        let mut repo_root = std::path::PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR")
-                .as_deref()
-                .unwrap_or("."),
-        );
-        repo_root.pop(); // cli/tri
-        repo_root.pop(); // cli
-        let trinity_pkg = repo_root.join("proofs").join("lean4");
+        let trinity_pkg = m2l_trinity_pkg();
         assert!(
             trinity_pkg.join("lakefile.lean").is_file(),
             "in-repo Trinity lakefile must exist"
@@ -7697,6 +7655,15 @@ mod tests {
             trinity_pkg.display()
         );
         std::fs::write(pkg_dir.path().join("lakefile.lean"), lakefile).unwrap();
+        // Without its own `lean-toolchain` the package makes elan resolve the
+        // newest Lean, not the one Trinity is pinned to, and `require trinity`
+        // then builds against a toolchain mathlib was never built for (#5982).
+        // The pin is copied from Trinity's own file, never restated here.
+        std::fs::copy(
+            trinity_pkg.join("lean-toolchain"),
+            pkg_dir.path().join("lean-toolchain"),
+        )
+        .expect("the in-repo Trinity package must pin its toolchain in lean-toolchain");
         std::fs::copy(
             out_path.path(),
             pkg_dir.path().join("TrinityStandalone.lean"),
@@ -7712,6 +7679,35 @@ mod tests {
             status.success(),
             "lake build of standalone generated theorem package should succeed"
         );
+    }
+
+    /// The in-repo Trinity Lake package the standalone check depends on.
+    fn m2l_trinity_pkg() -> std::path::PathBuf {
+        let mut repo_root = std::path::PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR")
+                .as_deref()
+                .unwrap_or("."),
+        );
+        repo_root.pop(); // cli/tri
+        repo_root.pop(); // cli
+        repo_root.join("proofs").join("lean4")
+    }
+
+    /// #5982: the scratch package pins the same toolchain as Trinity. The build
+    /// step is `cmp`, run inside the package, so the check passes only if the
+    /// package's `lean-toolchain` exists and is byte-identical to Trinity's.
+    #[test]
+    fn m2l_package_pins_trinitys_lean_toolchain() {
+        let pin = m2l_trinity_pkg().join("lean-toolchain");
+        let text = std::fs::read_to_string(&pin).expect("Trinity pins its toolchain");
+        assert!(
+            text.trim().starts_with("leanprover/lean4:v"),
+            "unexpected pin in {}: {text:?}",
+            pin.display()
+        );
+        let parent = m2l_scratch_parent("pin");
+        let pin_arg = pin.to_string_lossy().into_owned();
+        m2l_standalone_lake_check(parent.path(), &["cmp", "lean-toolchain", &pin_arg]);
     }
 
     /// A private parent for a scratch-cleanup probe, so the probe never shares a

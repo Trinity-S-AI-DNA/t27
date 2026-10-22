@@ -1790,43 +1790,6 @@ fn decode_dr_32(resp: &[u8]) -> u32 {
     val
 }
 
-/// Extract `rx_len_bits` starting at `rx_start_bits` from the captured stream.
-/// Bits arrive in the same packed format as `decode_dr_32`: 16-bit LE words,
-/// LSB-first within each.
-#[allow(dead_code)]
-fn extract_rx(resp: &[u8], total_bits: usize, rx_start_bits: usize, rx_len_bits: usize) -> Vec<u8> {
-    let words: Vec<u16> = (0..resp.len() / 2)
-        .map(|i| u16::from_le_bytes([resp[2 * i], resp[2 * i + 1]]))
-        .collect();
-    let mut out = vec![0u8; rx_len_bits.div_ceil(8)];
-    for i in 0..rx_len_bits {
-        let src = rx_start_bits + i;
-        if src >= total_bits {
-            break;
-        }
-        let wi = src / 16;
-        let bi = src % 16;
-        if wi < words.len() && (words[wi] & (1 << bi)) != 0 {
-            out[i >> 3] |= 1 << (i & 7);
-        }
-    }
-    out
-}
-
-/// Default JTAG-bit latency between TDI presentation and the corresponding
-/// TDO bit for the Migen JTAG2SPI bridge. The Verilog has a 2-stage MISO
-/// flop (`negedge`/`miso_capture` then `tdo`) plus the JTAG host's own
-/// 1-bit Capture-DR delay — so a starting guess of 3 is reasonable. Can
-/// be overridden by `T27_DLC10_MIGEN_LATENCY` for empirical tuning.
-const MIGEN_TDO_LATENCY_BITS_DEFAULT: usize = 3;
-
-fn migen_latency() -> usize {
-    std::env::var("T27_DLC10_MIGEN_LATENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MIGEN_TDO_LATENCY_BITS_DEFAULT)
-}
-
 /// Index into the DLC10 16-bit-LE packed response by absolute Shift-DR
 /// bit position (LSB-first within each 16-bit word).
 fn bit_at(resp: &[u8], bit_idx: usize) -> bool {
