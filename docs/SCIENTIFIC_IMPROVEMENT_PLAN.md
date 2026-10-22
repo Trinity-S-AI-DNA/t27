@@ -4,7 +4,7 @@
 > line-level TRI-NET 2026 scientific improvement plan. It enumerates
 > what the **toolchain product** of the line (specs, compilers,
 > conformance vectors, schemas, Coq export, SDK) is expected to ship
-> in 2026 to support the line's DARPA-CLARA-aligned, energy-efficient,
+> in 2026 to support the line's assurance-oriented, energy-efficient,
 > SNN-fused, peer-reviewed, open-source posture.
 >
 > **R5-HONEST gating.** Every row in every table below carries one of
@@ -43,17 +43,16 @@ Cross-links to companion docs:
 
 ---
 
-## 2. DARPA CLARA alignment (CL-01..CL-04)
+## 2. Assurance alignment (CL-01..CL-04)
 
-> **No claim is made that CLARA has funded this work; no programme
-> date is named.** The rows below are technical alignments visible in
-> this repo today, not funding statements. The full assurance
-> workflow lives in `clara-bridge/` and `CLARA_TRACEABILITY.md`.
+> **No claim is made that any external programme has funded this
+> work; no programme date is named.** The rows below are technical
+> alignments visible in this repo today, not funding statements.
 
 | ID | Track | t27 deliverable | Label |
 |----|-------|------------------|-------|
 | CL-01 | Drain-on-restraint semantic surface | Toolchain-side hooks in `docs/TRI_NET_API.md` so chip-repo D2D protocols can be consumed by external auditors without scraping. **D2D protocol itself lives in `tt-trinity-euler` / `tt-trinity-gamma`, not here.** | `target` |
-| CL-02 | Assurance bridge (CLARA-style reasoning) | `clara-bridge/` exit-criteria documented; conformance vectors `conformance/ar_*.json` validated against the bridge demo. | `target` |
+| CL-02 | Assurance bridge (bounded reasoning) | Conformance vectors `conformance/ar_*.json` validated across all gen backends. | `target` |
 | CL-03 | Spec-to-RTL traceability | Every `gen/verilog/` artefact traceable to a sealed `.t27` spec; seal-hash field in `schemas/tri-net-api-v1.json#/$defs/RepoIdentity`. | `target` |
 | CL-04 | Formal cross-walk | Coq export crate that ingests `.v` files from `coq/` and `trios-coq/` and emits a citation-map JSON consumable by external review tooling. | `target` |
 
@@ -105,7 +104,7 @@ generated file. When in doubt, omit the row.
 | ID | Track | t27 deliverable | Label |
 |----|-------|------------------|-------|
 | PUB-01 | GoldenFloat family paper | `docs/WHITEPAPER/gf_paper_v3_imrad_draft.md` already exists in the repo. 2026 work: harden citations, run the NMSE protocol from PUB-02 on a fixed seed set, attach the manifest. | `target` |
-| PUB-02 | NMSE manifest contributing to a publication | One sealed-toolchain `bench/results/nmse-*.json` produced under `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md`. **No `Delta_dB` figure introduced before this manifest lands.** | `target` |
+| PUB-02 | NMSE manifest contributing to a publication | One sealed-toolchain `bench/results/nmse-*.json` produced under `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md`. **No `Delta_dB` figure introduced before this manifest lands.** First manifest landed 2026-10-17: `bench/results/nmse-railway-x86_64-0x2545F4914F6CDD1D-2026-10-17.json`, a sealed-toolchain software run of `specs/benchmarks/gf16_bfloat16_nmse_run.t27`. It is not a silicon measurement, and attaching it to a draft is still open. | `target` |
 | PUB-03 | Tooling / spec-first methodology paper | A whitepaper-derivative doc that bundles `docs/TRI_NET_WHITEPAPER.md`, `STATUS.md`, `LINEUP.md`, `COMPETITORS.md` for an external review venue (workshop / preprint server). Draft only; submission is downstream. | `target` |
 
 ---
@@ -154,7 +153,7 @@ chip-repo CI jobs, not the Python SDK.
 | `gen/verilog/` modules that pass simulation | `STATUS.md` 2.1 | 5/5 | `target` 5/5 maintained; new modules tracked |
 | Sealed artefacts under `.trinity/seals/` | `STATUS.md` 2.1 | 729 (at audit time) | `target` strictly non-decreasing |
 | Coq files with zero `Admitted` cited in line plans | `trios-coq/Physics/`, `coq/` | per `docs/NOW.md` ledger | `target` zero `Admitted` in any file cited by Zenodo v3 manifest |
-| Conforming NMSE manifests under `bench/results/` | `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md` | 0 | `target` at least 1 sealed manifest for PUB-02 |
+| Conforming NMSE manifests under `bench/results/` | `docs/GF16_BFLOAT16_NMSE_PROTOCOL.md` | 1 sealed software run (`nmse-railway-x86_64-0x2545F4914F6CDD1D-2026-10-17.json`) | `target` at least 1 sealed manifest for PUB-02 |
 | Schema files validating draft-07 | `schemas/` | 3 (numeric-format / tri-net-api / nmse-protocol) | `target` 3+ maintained; new schemas added only via constitutional / issue review |
 | Documents passing `scripts/check_first_party_doc_language.py` | the gate itself | PASS (today) | `target` PASS maintained |
 
@@ -176,7 +175,6 @@ silicon does land, the metric joins `STATUS.md`, not this plan.
 - `BENCHMARKS.md` -- restrained benchmark posture
 - `COMPETITORS.md` -- honest positioning
 - `FORMAT_REGISTRY.md` -- numeric SSOT mirror
-- `CLARA_TRACEABILITY.md` -- assurance bridge to DARPA CLARA
 - `docs/T27-CONSTITUTION.md` -- L1..L7 constitutional stack
 - `docs/TRI_NET_WHITEPAPER.md` -- positioning paper
 - `docs/TRI_NET_API.md` -- external integration contract
@@ -193,8 +191,6 @@ silicon does land, the metric joins `STATUS.md`, not this plan.
 
 **External (all `VERIFY` -- not quoted as fact in this doc):**
 
-- DARPA CLARA program page (darpa.mil; date / wording must be checked
-  at source before any derivative cites it).
 - Any 22FDX vendor brief from GlobalFoundries (vendor page; cite at
   use, not pre-cached here).
 - Any commercial-NPU TOPS/W figure (Coral / Hailo / Axelera / Qualcomm /
@@ -212,8 +208,8 @@ secondary to the in-repo Coq lemmas and are not restated here.
 
 ## 10. What this document is NOT
 
-- **NOT a funding statement.** No claim is made that DARPA / CLARA /
-  any other agency has funded this work, contracted it, or
+- **NOT a funding statement.** No claim is made that any agency has
+  funded this work, contracted it, or
   scheduled it. `CL-01..CL-04` are technical alignment rows, not
   funding rows.
 - **NOT a tape-out commitment.** No silicon arrival date is named.

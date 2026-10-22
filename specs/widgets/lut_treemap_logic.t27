@@ -1,0 +1,2099 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/widgets/lut-treemap_logic.t27 -- the logic of the lut-treemap widget as .t27: yosys
+; `stat -json` text in, per-module cell counts, instance multiplication down the hierarchy, the
+; view tree and the squarified treemap layout out. Ported from JavaScript (gHashTag/trinity,
+; apps/website/public/widgets/lut-treemap/treemap.js, 289 lines). Epic gHashTag/t27#10937, port
+; issue #10938. Owner rule (Only t27): the logic is written once, in .t27; treemap.js stays only
+; until the page loads the wasm built from this file.
+; --
+; HOW THE PAGE TALKS TO THIS FILE. There is no string or object return across wasm. The glue
+; passes the stat text as bytes (a TextEncoder result) to parse_hier and reads the answers
+; through the getters below; everything lives in module-level arrays, so ONE PARSE PER WASM
+; INSTANCE (the flattened-run drop of the page is a second instance). Strings (module names,
+; display names, creator, version) are offsets into POOL; read them with pool_byte(i).
+; --
+; JS EXPORT -> t27 (the table asked for by the port brief)
+;   METRICS                 metric ids: M_LUT=0 M_FF=1 M_DSP=2 M_BRAM=3, and 4 for "other"
+;   bare(name)              bare_skip(name) -> 1 when a leading backslash is dropped, else 0
+;   displayName(name)       display_name(name) -> byte length; bytes via display_byte(k)
+;   parseHier(text, lists)  parse_hier(text) -> status; the lists are the module constants of
+;                           group_of (the same strings as K_LUT_TYPES.. of specs/widgets/lut-treemap.t27)
+;       status: 0 ok, 1 empty, 2 nojson, 3 badjson, 4 nomodules, 5 nocells, 6 notop (= the order of
+;       SAY_ERROR_IDS, plus one), 7 toolarge (a capacity of this file was hit: NOT in the JS)
+;       fields of the JS result -> getters: version/creator -> version_len, creator_len and
+;       pool_byte(version_off() + k); key -> key_kind (1 num_cells_by_type, 2 cells);
+;       modules -> nid (name id, 0.. in first-seen order) with name_off/name_len, disp_off/disp_len,
+;       has_module, own(nid,k), sub_n(nid), sub_nid(nid,i), sub_count(nid,i); order -> order_n,
+;       order_nid(i); top -> top_nid; roots -> roots_n, root_nid(i); flat -> is_flat;
+;       design -> has_design, design_val(k)
+;   sameTotals(a, b)        same_totals(a0..a4, b0..b4) and same_as_design(nid)
+;   totalsOf(r, name)       totals_of(nid, k) (memoised, filled by calling totals(nid) first)
+;   instancesOf(r, top)     instances_of(nid), then inst_in(nid), inst_of(nid)
+;   moduleRows(r, top)      module_rows() -> row count; row_nid(i), row_instances(i), row_total(i,k);
+;                           each = own(nid,k), display = disp_off/disp_len
+;   viewTree(r, m, opt)     view_tree(m, expand_max, max_tiles) -> tile count. Tile i = id i of the JS
+;                           (ids are assigned in the same order). tile_nid, tile_copies, tile_index,
+;                           tile_of, tile_own, tile_value, tile_parent, tile_first, tile_next.
+;                           The JS `path` is the chain of parent tiles from the root, a tile whose
+;                           own flag is set sharing its parent's path entry: the glue rebuilds it.
+;   leavesOf(node)          leaves_n(), leaf_id(i) and leaves_sum() (left to right, as the page sums)
+;   squarify(items,x,y,w,h) squarify(n, x, y, w, h): item values are put with sq_set(i, v), the
+;                           placed rectangles are read with sq_out_item/x/y/w/h(j) (j < the return)
+;   layoutTree(root,..opt)  layout_tree(x, y, w, h, head, pad) -> rect count; rect_node, rect_x,
+;                           rect_y, rect_w, rect_h, rect_depth, rect_head
+;   listsOf(K)              NOT PORTED: it only copies the spec constants into an object. The
+;                           lists are group_of's literals here (the same strings as the K_*_TYPES
+;                           of specs/widgets/lut-treemap.t27 in trinity; the differential feeds
+;                           the JS the same lists).
+;   worst(row, side)        internal to squarify: sq_worst
+; WHAT IS NOT MATCHED (all measured or reasoned, none hidden; the differential never feeds these,
+; and says so in its output):
+;   - numbers with more than 15 significant digits, or an exponent beyond 22 (JS rounds the
+;     decimal text exactly; this file multiplies by an exact power of ten);
+;   - a count (num_cells_by_type value) given as a JSON array or object (JS: Number([5]) is 5; here 0)
+;     and a numeric string other than plain decimal (hex "0x10" etc: JS reads them, here 0);
+;   - module names equal to Object.prototype members (constructor, toString, __proto__ ..): JS
+;     misbehaves on them; a CELL TYPE of that name is dropped here exactly as JS drops it;
+;   - a cyclic module hierarchy: JS throws RangeError in viewTree; here the tree stops at depth
+;     128 and view_tree_failed() is true. totals(), instances_of() follow the same memo and
+;     visit rules as the JS, so their cyclic results match too;
+;   - a binary parameter wider than 53 bits in a $paramod name (JS prints a rounded double);
+;   - capacities (POOL 2097152 bytes, NODE 65536, names 4096, subs 32768, tiles 32768): over
+;     one, parse_hier returns 7 where the JS would just keep going;
+;   - JSON nesting deeper than 256;
+;   - lone UTF-16 surrogates in escapes decode to U+FFFD, as TextEncoder would hand them over.
+; JS quirks PORTED exactly: Object key order (integer-like keys first, ascending; a repeated key
+; keeps its first position and takes its last value); `order` keeps duplicates of a name that two
+; keys (\a and a) share, and moduleRows then lists that module twice; a module whose entry has no
+; cell map is "known" (its name is a submodule, not a cell type) but has no row; a cell type listed
+; twice under bare() names pushes two sub entries; "design" is only read when it has a cell map.
+; BUILD: t27c gen (Zig) + an export wrapper -> wasm32-freestanding, ReleaseSmall (21949 bytes). gen-c
+; cannot be used: it writes invalid C for byte slices. Memory layout for the glue: the stat text is
+; copied to any address and passed as (ptr, len) to parse_hier; strings are read from POOL at
+; pool_ptr() + offset; no other buffer crosses the boundary.
+; ASCII only (L3), English only (LANG-EN).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module widget_lut_treemap_logic;
+
+pub const E_OK : u32 = 0;
+pub const E_EMPTY : u32 = 1;
+pub const E_NOJSON : u32 = 2;
+pub const E_BADJSON : u32 = 3;
+pub const E_NOMODULES : u32 = 4;
+pub const E_NOCELLS : u32 = 5;
+pub const E_NOTOP : u32 = 6;
+pub const E_TOOLARGE : u32 = 7;
+
+pub const M_LUT : u32 = 0;
+pub const M_FF : u32 = 1;
+pub const M_DSP : u32 = 2;
+pub const M_BRAM : u32 = 3;
+pub const M_OTHER : u32 = 4;
+
+pub const J_NULL : u8 = 0;
+pub const J_FALSE : u8 = 1;
+pub const J_TRUE : u8 = 2;
+pub const J_NUM : u8 = 3;
+pub const J_STR : u8 = 4;
+pub const J_OBJ : u8 = 5;
+pub const J_ARR : u8 = 6;
+
+pub const B_BSLASH : u8 = 92;
+
+// --- State. One parse per instance. ------------------------------------------------------------
+pub var POOL : [2097152]u8 = [0; 2097152];
+pub var POOL_TOP : usize = 0;
+pub var OVER : bool = false;
+
+pub var N_KIND : [65536]u8 = [0; 65536];
+pub var N_NUM : [65536]f64 = [0.0; 65536];
+pub var N_SOFF : [65536]usize = [0; 65536];
+pub var N_SLEN : [65536]usize = [0; 65536];
+pub var N_KOFF : [65536]usize = [0; 65536];
+pub var N_KLEN : [65536]usize = [0; 65536];
+pub var N_FIRST : [65536]i32 = [0; 65536];
+pub var N_LAST : [65536]i32 = [0; 65536];
+pub var N_NEXT : [65536]i32 = [0; 65536];
+pub var NODE_TOP : usize = 0;
+
+pub var J_POS : usize = 0;
+pub var J_END : usize = 0;
+pub var J_ERR : bool = false;
+pub var J_SOFF : usize = 0;
+pub var J_SLEN : usize = 0;
+
+pub var NM_OFF : [4096]usize = [0; 4096];
+pub var NM_LEN : [4096]usize = [0; 4096];
+pub var DP_OFF : [4096]usize = [0; 4096];
+pub var DP_LEN : [4096]usize = [0; 4096];
+pub var NM_N : usize = 0;
+
+pub var HASMOD : [4096]u8 = [0; 4096];
+pub var USED : [4096]u8 = [0; 4096];
+pub var OWN : [20480]f64 = [0.0; 20480];
+pub var SUB_START : [4096]usize = [0; 4096];
+pub var SUB_N : [4096]usize = [0; 4096];
+pub var SUB_NID : [32768]usize = [0; 32768];
+pub var SUB_CNT : [32768]f64 = [0.0; 32768];
+pub var SUB_TOP : usize = 0;
+
+pub var ORDER : [4096]usize = [0; 4096];
+pub var ORDER_N : usize = 0;
+pub var R_ORDER : [4096]usize = [0; 4096];
+pub var R_ORDER_N : usize = 0;
+pub var ROOTS : [4096]usize = [0; 4096];
+pub var ROOTS_N : usize = 0;
+pub var TOP : usize = 0;
+pub var FLAT : bool = false;
+pub var HAS_DESIGN : bool = false;
+pub var DESIGN : [5]f64 = [0.0; 5];
+pub var KEY_KIND : u32 = 0;
+pub var CR_OFF : usize = 0;
+pub var CR_LEN : usize = 0;
+pub var HAS_CREATOR : bool = false;
+pub var VER_OFF : usize = 0;
+pub var VER_LEN : usize = 0;
+pub var HAS_VERSION : bool = false;
+pub var ACC : [5]f64 = [0.0; 5];
+
+pub var TOT : [20480]f64 = [0.0; 20480];
+pub var TOT_DONE : [4096]u8 = [0; 4096];
+pub var ON_STACK : [4096]u8 = [0; 4096];
+
+pub var SEEN : [4096]u8 = [0; 4096];
+pub var INST_IN : [4096]u8 = [0; 4096];
+pub var INST : [4096]f64 = [0.0; 4096];
+pub var POST : [4096]usize = [0; 4096];
+pub var POST_N : usize = 0;
+pub var ROW_NID : [4096]usize = [0; 4096];
+pub var ROW_N : usize = 0;
+
+// The view tree.
+pub var T_NID : [32768]usize = [0; 32768];
+pub var T_COPIES : [32768]f64 = [0.0; 32768];
+pub var T_INDEX : [32768]f64 = [0.0; 32768];
+pub var T_OF : [32768]f64 = [0.0; 32768];
+pub var T_OWN : [32768]u8 = [0; 32768];
+pub var T_VALUE : [32768]f64 = [0.0; 32768];
+pub var T_PARENT : [32768]i32 = [0; 32768];
+pub var T_FIRST : [32768]i32 = [0; 32768];
+pub var T_LAST : [32768]i32 = [0; 32768];
+pub var T_NEXT : [32768]i32 = [0; 32768];
+pub var T_N : usize = 0;
+pub var T_FAIL : bool = false;
+pub var T_BUDGET : f64 = 0.0;
+pub var T_METRIC : usize = 0;
+pub var T_EXPAND : f64 = 0.0;
+pub var KS : [32768]usize = [0; 32768];
+pub var KS_TOP : usize = 0;
+pub var LEAF : [32768]usize = [0; 32768];
+pub var LEAF_N : usize = 0;
+
+// Squarify scratch and output stack.
+pub var SQ_V : [8192]f64 = [0.0; 8192];
+pub var SQ_ID : [8192]usize = [0; 8192];
+pub var RS_I : [8192]usize = [0; 8192];
+pub var RS_A : [8192]f64 = [0.0; 8192];
+pub var P_ITEM : [65536]usize = [0; 65536];
+pub var P_X : [65536]f64 = [0.0; 65536];
+pub var P_Y : [65536]f64 = [0.0; 65536];
+pub var P_W : [65536]f64 = [0.0; 65536];
+pub var P_H : [65536]f64 = [0.0; 65536];
+pub var P_TOP : usize = 0;
+pub var SQ_FAIL : bool = false;
+
+pub var R_NODE : [32768]usize = [0; 32768];
+pub var R_X : [32768]f64 = [0.0; 32768];
+pub var R_Y : [32768]f64 = [0.0; 32768];
+pub var R_W : [32768]f64 = [0.0; 32768];
+pub var R_H : [32768]f64 = [0.0; 32768];
+pub var R_DEPTH : [32768]u32 = [0; 32768];
+pub var R_HEAD : [32768]u8 = [0; 32768];
+pub var R_N : usize = 0;
+pub var L_HEAD : f64 = 16.0;
+pub var L_PAD : f64 = 2.0;
+
+pub var D_OFF : usize = 0;
+pub var D_LEN : usize = 0;
+
+// --- Bytes and whitespace (JavaScript's trim and \s: the same set) ------------------------------
+pub fn is_digit(b: u8) -> bool {
+    return b >= 48 and b <= 57;
+}
+
+/// The length of the whitespace character that starts with these bytes; avail says how many are valid.
+pub fn ws_fwd(b0: u8, b1: u8, b2: u8, avail: usize) -> usize {
+    if (avail == 0) { return 0; }
+    if (b0 == 32 or (b0 >= 9 and b0 <= 13)) { return 1; }
+    if (b0 == 194) {
+        if (avail >= 2 and b1 == 160) { return 2; }
+        return 0;
+    }
+    if (avail < 3) { return 0; }
+    if (b0 == 225) {
+        if (b1 == 154 and b2 == 128) { return 3; }
+        return 0;
+    }
+    if (b0 == 226) {
+        if (b1 == 128) {
+            if (b2 >= 128 and b2 <= 138) { return 3; }
+            if (b2 == 168 or b2 == 169 or b2 == 175) { return 3; }
+        }
+        if (b1 == 129 and b2 == 159) { return 3; }
+        return 0;
+    }
+    if (b0 == 227) {
+        if (b1 == 128 and b2 == 128) { return 3; }
+        return 0;
+    }
+    if (b0 == 239) {
+        if (b1 == 187 and b2 == 191) { return 3; }
+        return 0;
+    }
+    return 0;
+}
+
+/// The length of the whitespace character that ENDS with these bytes (c is the last); avail as above.
+pub fn ws_back(a: u8, m: u8, c: u8, avail: usize) -> usize {
+    if (avail == 0) { return 0; }
+    if (c == 32 or (c >= 9 and c <= 13)) { return 1; }
+    if (avail >= 2 and m == 194 and c == 160) { return 2; }
+    if (avail < 3) { return 0; }
+    if (a == 225 and m == 154 and c == 128) { return 3; }
+    if (a == 226 and m == 128) {
+        if (c >= 128 and c <= 138) { return 3; }
+        if (c == 168 or c == 169 or c == 175) { return 3; }
+    }
+    if (a == 226 and m == 129 and c == 159) { return 3; }
+    if (a == 227 and m == 128 and c == 128) { return 3; }
+    if (a == 239 and m == 187 and c == 191) { return 3; }
+    return 0;
+}
+
+pub fn ws_at(s: []const u8, p: usize, hi: usize) -> usize {
+    if (p >= hi) { return 0; }
+    var b1 : u8 = 0;
+    var b2 : u8 = 0;
+    var avail : usize = 1;
+    if (p + 1 < hi) { b1 = s[p + 1]; avail = 2; }
+    if (p + 2 < hi) { b2 = s[p + 2]; avail = 3; }
+    return ws_fwd(s[p], b1, b2, avail);
+}
+
+pub fn ws_before(s: []const u8, lo: usize, e: usize) -> usize {
+    if (e <= lo) { return 0; }
+    var a : u8 = 0;
+    var m : u8 = 0;
+    var avail : usize = 1;
+    if (e >= lo + 2) { m = s[e - 2]; avail = 2; }
+    if (e >= lo + 3) { a = s[e - 3]; avail = 3; }
+    return ws_back(a, m, s[e - 1], avail);
+}
+
+pub fn pool_ws_at(p: usize, hi: usize) -> usize {
+    if (p >= hi) { return 0; }
+    var b1 : u8 = 0;
+    var b2 : u8 = 0;
+    var avail : usize = 1;
+    if (p + 1 < hi) { b1 = POOL[p + 1]; avail = 2; }
+    if (p + 2 < hi) { b2 = POOL[p + 2]; avail = 3; }
+    return ws_fwd(POOL[p], b1, b2, avail);
+}
+
+pub fn pool_ws_before(lo: usize, e: usize) -> usize {
+    if (e <= lo) { return 0; }
+    var a : u8 = 0;
+    var m : u8 = 0;
+    var avail : usize = 1;
+    if (e >= lo + 2) { m = POOL[e - 2]; avail = 2; }
+    if (e >= lo + 3) { a = POOL[e - 3]; avail = 3; }
+    return ws_back(a, m, POOL[e - 1], avail);
+}
+
+pub fn pool_push(b: u8) {
+    if (POOL_TOP >= 2097152) {
+        OVER = true;
+        J_ERR = true;
+        return;
+    }
+    POOL[POOL_TOP] = b;
+    POOL_TOP = POOL_TOP + 1;
+}
+
+pub fn pool_byte(i: usize) -> u8 {
+    return POOL[i];
+}
+
+/// Do POOL[a .. a+len] and POOL[b .. b+len] hold the same bytes?
+pub fn pool_same(a: usize, b: usize, len: usize) -> bool {
+    var k : usize = 0;
+    while (k < len) {
+        if (POOL[a + k] != POOL[b + k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Is POOL[off .. off+len] exactly w?
+pub fn pool_eq(off: usize, len: usize, w: []const u8) -> bool {
+    if (len != w.len) { return false; }
+    var k : usize = 0;
+    while (k < len) {
+        if (POOL[off + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Does POOL[off .. off+len] start with w?
+pub fn pool_prefix(off: usize, len: usize, w: []const u8) -> bool {
+    if (len < w.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (POOL[off + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn pool_push_uint(v: u64) {
+    var digits : u32 = 1;
+    var t : u64 = v / 10;
+    while (t > 0) {
+        digits = digits + 1;
+        t = t / 10;
+    }
+    var div : u64 = 1;
+    var k : u32 = 1;
+    while (k < digits) {
+        div = div * 10;
+        k = k + 1;
+    }
+    var r : u64 = v;
+    while (div > 0) {
+        pool_push(((r / div) as u8) + 48);
+        r = r % div;
+        div = div / 10;
+    }
+}
+
+pub fn push_utf8(cp: u32) {
+    if (cp < 128) {
+        pool_push(cp as u8);
+        return;
+    }
+    if (cp < 2048) {
+        pool_push(((cp / 64) + 192) as u8);
+        pool_push(((cp % 64) + 128) as u8);
+        return;
+    }
+    if (cp < 65536) {
+        pool_push(((cp / 4096) + 224) as u8);
+        pool_push((((cp / 64) % 64) + 128) as u8);
+        pool_push(((cp % 64) + 128) as u8);
+        return;
+    }
+    pool_push(((cp / 262144) + 240) as u8);
+    pool_push((((cp / 4096) % 64) + 128) as u8);
+    pool_push((((cp / 64) % 64) + 128) as u8);
+    pool_push(((cp % 64) + 128) as u8);
+}
+
+pub fn hexv(b: u8) -> i32 {
+    if (b >= 48 and b <= 57) { return (b as i32) - 48; }
+    if (b >= 97 and b <= 102) { return (b as i32) - 87; }
+    if (b >= 65 and b <= 70) { return (b as i32) - 55; }
+    return -1;
+}
+
+// --- A JSON reader with JSON.parse's grammar, into a node table --------------------------------
+pub fn new_node(kind: u8) -> i32 {
+    if (NODE_TOP >= 65536) {
+        OVER = true;
+        J_ERR = true;
+        return -1;
+    }
+    const i : usize = NODE_TOP;
+    NODE_TOP = NODE_TOP + 1;
+    N_KIND[i] = kind;
+    N_NUM[i] = 0.0;
+    N_SOFF[i] = 0;
+    N_SLEN[i] = 0;
+    N_KOFF[i] = 0;
+    N_KLEN[i] = 0;
+    N_FIRST[i] = -1;
+    N_LAST[i] = -1;
+    N_NEXT[i] = -1;
+    return (i as i32);
+}
+
+pub fn j_ws(s: []const u8) {
+    while (J_POS < J_END) {
+        const b : u8 = s[J_POS];
+        if (b == 32 or b == 9 or b == 10 or b == 13) {
+            J_POS = J_POS + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+/// Four hex digits at s[p ..]; -1 when they are not.
+pub fn hex4(s: []const u8, p: usize) -> i32 {
+    if (p + 4 > J_END) { return -1; }
+    var v : i32 = 0;
+    var k : usize = 0;
+    while (k < 4) {
+        const h : i32 = hexv(s[p + k]);
+        if (h < 0) { return -1; }
+        v = v * 16 + h;
+        k = k + 1;
+    }
+    return v;
+}
+
+/// A JSON string at J_POS (on its opening quote): the decoded bytes go to POOL, J_SOFF and J_SLEN name them.
+pub fn j_string(s: []const u8) -> bool {
+    J_POS = J_POS + 1;
+    J_SOFF = POOL_TOP;
+    while (J_POS < J_END) {
+        const b : u8 = s[J_POS];
+        if (b == 34) {
+            J_POS = J_POS + 1;
+            J_SLEN = POOL_TOP - J_SOFF;
+            return !OVER;
+        }
+        if (b < 32) { return false; }
+        if (b == B_BSLASH) {
+            if (J_POS + 1 >= J_END) { return false; }
+            const c : u8 = s[J_POS + 1];
+            J_POS = J_POS + 2;
+            if (c == 34) { pool_push(34); }
+            if (c == 92) { pool_push(92); }
+            if (c == 47) { pool_push(47); }
+            if (c == 98) { pool_push(8); }
+            if (c == 102) { pool_push(12); }
+            if (c == 110) { pool_push(10); }
+            if (c == 114) { pool_push(13); }
+            if (c == 116) { pool_push(9); }
+            if (c == 117) {
+                const h1 : i32 = hex4(s, J_POS);
+                if (h1 < 0) { return false; }
+                J_POS = J_POS + 4;
+                var cp : u32 = h1 as u32;
+                if (cp >= 55296 and cp <= 56319) {
+                    var joined : bool = false;
+                    if (J_POS + 6 <= J_END and s[J_POS] == 92 and s[J_POS + 1] == 117) {
+                        const h2 : i32 = hex4(s, J_POS + 2);
+                        if (h2 >= 56320 and h2 <= 57343) {
+                            cp = 65536 + (cp - 55296) * 1024 + ((h2 as u32) - 56320);
+                            J_POS = J_POS + 6;
+                            joined = true;
+                        }
+                    }
+                    if (!joined) { cp = 65533; }
+                } else {
+                    if (cp >= 56320 and cp <= 57343) { cp = 65533; }
+                }
+                push_utf8(cp);
+            }
+            if (c != 34 and c != 92 and c != 47 and c != 98 and c != 102 and c != 110 and c != 114 and c != 116 and c != 117) {
+                return false;
+            }
+        } else {
+            pool_push(b);
+            J_POS = J_POS + 1;
+        }
+    }
+    return false;
+}
+
+/// 10 to the power e, by repeated multiplication (exact up to 22).
+pub fn pow10(e: i32) -> f64 {
+    var v : f64 = 1.0;
+    var k : i32 = 0;
+    while (k < e) {
+        v = v * 10.0;
+        k = k + 1;
+    }
+    return v;
+}
+
+pub fn dec_value(m: f64, fd: i32, ex: i32) -> f64 {
+    if (m == 0.0) { return 0.0; }
+    const te : i32 = ex - fd;
+    if (te >= 0) { return m * pow10(te); }
+    return m / pow10(-te);
+}
+
+/// A JSON number at J_POS (a minus or a digit): RFC 8259's grammar.
+pub fn j_number(s: []const u8) -> f64 {
+    var neg : bool = false;
+    if (s[J_POS] == 45) {
+        neg = true;
+        J_POS = J_POS + 1;
+    }
+    if (J_POS >= J_END) {
+        J_ERR = true;
+        return 0.0;
+    }
+    var m : f64 = 0.0;
+    const b : u8 = s[J_POS];
+    if (b == 48) {
+        J_POS = J_POS + 1;
+    } else {
+        if (b >= 49 and b <= 57) {
+            while (J_POS < J_END and is_digit(s[J_POS])) {
+                m = m * 10.0 + (((s[J_POS] - 48) as u32) as f64);
+                J_POS = J_POS + 1;
+            }
+        } else {
+            J_ERR = true;
+            return 0.0;
+        }
+    }
+    var fd : i32 = 0;
+    if (J_POS < J_END and s[J_POS] == 46) {
+        J_POS = J_POS + 1;
+        const st : usize = J_POS;
+        while (J_POS < J_END and is_digit(s[J_POS])) {
+            m = m * 10.0 + (((s[J_POS] - 48) as u32) as f64);
+            fd = fd + 1;
+            J_POS = J_POS + 1;
+        }
+        if (J_POS == st) {
+            J_ERR = true;
+            return 0.0;
+        }
+    }
+    var ex : i32 = 0;
+    if (J_POS < J_END and (s[J_POS] == 101 or s[J_POS] == 69)) {
+        J_POS = J_POS + 1;
+        var eneg : bool = false;
+        if (J_POS < J_END and (s[J_POS] == 43 or s[J_POS] == 45)) {
+            eneg = s[J_POS] == 45;
+            J_POS = J_POS + 1;
+        }
+        const st2 : usize = J_POS;
+        while (J_POS < J_END and is_digit(s[J_POS])) {
+            if (ex < 100000) { ex = ex * 10 + (((s[J_POS] - 48) as u32) as i32); }
+            J_POS = J_POS + 1;
+        }
+        if (J_POS == st2) {
+            J_ERR = true;
+            return 0.0;
+        }
+        if (eneg) { ex = -ex; }
+    }
+    const v : f64 = dec_value(m, fd, ex);
+    if (neg) { return -v; }
+    return v;
+}
+
+pub fn lit_at(s: []const u8, w: []const u8) -> bool {
+    if (J_POS + w.len > J_END) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (s[J_POS + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn link_child(parent: i32, v: i32) {
+    const pu : usize = parent as usize;
+    const vu : usize = v as usize;
+    N_NEXT[vu] = -1;
+    if (N_LAST[pu] < 0) {
+        N_FIRST[pu] = v;
+    } else {
+        N_NEXT[(N_LAST[pu] as usize)] = v;
+    }
+    N_LAST[pu] = v;
+}
+
+/// The value of an array-index key ("0", "17", up to 4294967294), or -1.0 when the key is not one.
+pub fn index_key(off: usize, len: usize) -> f64 {
+    if (len == 0 or len > 10) { return -1.0; }
+    if (POOL[off] == 48) {
+        if (len == 1) { return 0.0; }
+        return -1.0;
+    }
+    var v : f64 = 0.0;
+    var k : usize = 0;
+    while (k < len) {
+        const b : u8 = POOL[off + k];
+        if (b < 48 or b > 57) { return -1.0; }
+        v = v * 10.0 + (((b - 48) as u32) as f64);
+        k = k + 1;
+    }
+    if (v > 4294967294.0) { return -1.0; }
+    return v;
+}
+
+/// Set the member koff/klen of object o to the value node v, with JavaScript's property order:
+/// a repeated key keeps its place and takes the new value, integer-like keys come first ascending.
+pub fn obj_put(o: i32, koff: usize, klen: usize, v: i32) {
+    const vu : usize = v as usize;
+    N_KOFF[vu] = koff;
+    N_KLEN[vu] = klen;
+    var c : i32 = N_FIRST[(o as usize)];
+    while (c >= 0) {
+        const cu : usize = c as usize;
+        if (N_KLEN[cu] == klen and pool_same(N_KOFF[cu], koff, klen)) {
+            N_KIND[cu] = N_KIND[vu];
+            N_NUM[cu] = N_NUM[vu];
+            N_SOFF[cu] = N_SOFF[vu];
+            N_SLEN[cu] = N_SLEN[vu];
+            N_FIRST[cu] = N_FIRST[vu];
+            N_LAST[cu] = N_LAST[vu];
+            return;
+        }
+        c = N_NEXT[cu];
+    }
+    const ik : f64 = index_key(koff, klen);
+    if (ik < 0.0) {
+        link_child(o, v);
+        return;
+    }
+    var prev : i32 = -1;
+    c = N_FIRST[(o as usize)];
+    while (c >= 0) {
+        const cu2 : usize = c as usize;
+        const ck : f64 = index_key(N_KOFF[cu2], N_KLEN[cu2]);
+        if (ck < 0.0 or ck > ik) { break; }
+        prev = c;
+        c = N_NEXT[cu2];
+    }
+    N_NEXT[vu] = c;
+    if (prev < 0) {
+        N_FIRST[(o as usize)] = v;
+    } else {
+        N_NEXT[(prev as usize)] = v;
+    }
+    if (c < 0) { N_LAST[(o as usize)] = v; }
+}
+
+pub fn j_object(s: []const u8, depth: u32) -> i32 {
+    const o : i32 = new_node(J_OBJ);
+    if (o < 0) { return -1; }
+    J_POS = J_POS + 1;
+    j_ws(s);
+    if (J_POS < J_END and s[J_POS] == 125) {
+        J_POS = J_POS + 1;
+        return o;
+    }
+    while (J_POS < J_END) {
+        j_ws(s);
+        if (J_POS >= J_END or s[J_POS] != 34) {
+            J_ERR = true;
+            return -1;
+        }
+        if (!j_string(s)) {
+            J_ERR = true;
+            return -1;
+        }
+        const koff : usize = J_SOFF;
+        const klen : usize = J_SLEN;
+        j_ws(s);
+        if (J_POS >= J_END or s[J_POS] != 58) {
+            J_ERR = true;
+            return -1;
+        }
+        J_POS = J_POS + 1;
+        const v : i32 = j_value(s, depth + 1);
+        if (v < 0 or J_ERR) {
+            J_ERR = true;
+            return -1;
+        }
+        obj_put(o, koff, klen, v);
+        j_ws(s);
+        if (J_POS >= J_END) {
+            J_ERR = true;
+            return -1;
+        }
+        const c : u8 = s[J_POS];
+        if (c == 44) {
+            J_POS = J_POS + 1;
+        } else {
+            if (c == 125) {
+                J_POS = J_POS + 1;
+                return o;
+            }
+            J_ERR = true;
+            return -1;
+        }
+    }
+    J_ERR = true;
+    return -1;
+}
+
+pub fn j_array(s: []const u8, depth: u32) -> i32 {
+    const a : i32 = new_node(J_ARR);
+    if (a < 0) { return -1; }
+    J_POS = J_POS + 1;
+    j_ws(s);
+    if (J_POS < J_END and s[J_POS] == 93) {
+        J_POS = J_POS + 1;
+        return a;
+    }
+    var idx : usize = 0;
+    while (J_POS < J_END) {
+        const v : i32 = j_value(s, depth + 1);
+        if (v < 0 or J_ERR) {
+            J_ERR = true;
+            return -1;
+        }
+        const koff : usize = POOL_TOP;
+        pool_push_uint(idx as u64);
+        if (OVER) { return -1; }
+        N_KOFF[(v as usize)] = koff;
+        N_KLEN[(v as usize)] = POOL_TOP - koff;
+        link_child(a, v);
+        idx = idx + 1;
+        j_ws(s);
+        if (J_POS >= J_END) {
+            J_ERR = true;
+            return -1;
+        }
+        const c : u8 = s[J_POS];
+        if (c == 44) {
+            J_POS = J_POS + 1;
+        } else {
+            if (c == 93) {
+                J_POS = J_POS + 1;
+                return a;
+            }
+            J_ERR = true;
+            return -1;
+        }
+    }
+    J_ERR = true;
+    return -1;
+}
+
+pub fn j_value(s: []const u8, depth: u32) -> i32 {
+    if (depth > 256) {
+        J_ERR = true;
+        return -1;
+    }
+    j_ws(s);
+    if (J_POS >= J_END) {
+        J_ERR = true;
+        return -1;
+    }
+    const b : u8 = s[J_POS];
+    if (b == 123) { return j_object(s, depth); }
+    if (b == 91) { return j_array(s, depth); }
+    if (b == 34) {
+        const n : i32 = new_node(J_STR);
+        if (n < 0) { return -1; }
+        if (!j_string(s)) {
+            J_ERR = true;
+            return -1;
+        }
+        N_SOFF[(n as usize)] = J_SOFF;
+        N_SLEN[(n as usize)] = J_SLEN;
+        return n;
+    }
+    if (b == 116) {
+        if (!lit_at(s, "true")) {
+            J_ERR = true;
+            return -1;
+        }
+        J_POS = J_POS + 4;
+        return new_node(J_TRUE);
+    }
+    if (b == 102) {
+        if (!lit_at(s, "false")) {
+            J_ERR = true;
+            return -1;
+        }
+        J_POS = J_POS + 5;
+        return new_node(J_FALSE);
+    }
+    if (b == 110) {
+        if (!lit_at(s, "null")) {
+            J_ERR = true;
+            return -1;
+        }
+        J_POS = J_POS + 4;
+        return new_node(J_NULL);
+    }
+    if (b == 45 or is_digit(b)) {
+        const x : f64 = j_number(s);
+        if (J_ERR) { return -1; }
+        const n2 : i32 = new_node(J_NUM);
+        if (n2 < 0) { return -1; }
+        N_NUM[(n2 as usize)] = x;
+        return n2;
+    }
+    J_ERR = true;
+    return -1;
+}
+
+/// JSON.parse of s[lo .. hi]: the root node, or -1.
+pub fn j_parse(s: []const u8, lo: usize, hi: usize) -> i32 {
+    NODE_TOP = 0;
+    POOL_TOP = 0;
+    J_ERR = false;
+    J_POS = lo;
+    J_END = hi;
+    const v : i32 = j_value(s, 0);
+    if (v < 0 or J_ERR) { return -1; }
+    j_ws(s);
+    if (J_POS != J_END) { return -1; }
+    return v;
+}
+
+pub fn key_is(n: usize, w: []const u8) -> bool {
+    return pool_eq(N_KOFF[n], N_KLEN[n], w);
+}
+
+/// The member of object/array node n called key, or -1.
+pub fn find_child(n: i32, key: []const u8) -> i32 {
+    var c : i32 = N_FIRST[(n as usize)];
+    while (c >= 0) {
+        if (key_is((c as usize), key)) { return c; }
+        c = N_NEXT[(c as usize)];
+    }
+    return -1;
+}
+
+pub fn is_objlike(n: i32) -> bool {
+    if (n < 0) { return false; }
+    const k : u8 = N_KIND[(n as usize)];
+    return k == J_OBJ or k == J_ARR;
+}
+
+// --- Number(raw) || 0 --------------------------------------------------------------------------
+/// Number(string) for a plain decimal string (the rest reads as 0 here: see the header).
+pub fn str_num(off: usize, len: usize) -> f64 {
+    var lo : usize = off;
+    var hi : usize = off + len;
+    while (lo < hi) {
+        const w : usize = pool_ws_at(lo, hi);
+        if (w == 0) { break; }
+        lo = lo + w;
+    }
+    while (hi > lo) {
+        const w2 : usize = pool_ws_before(lo, hi);
+        if (w2 == 0) { break; }
+        hi = hi - w2;
+    }
+    if (hi == lo) { return 0.0; }
+    var p : usize = lo;
+    var neg : bool = false;
+    if (POOL[p] == 43 or POOL[p] == 45) {
+        neg = POOL[p] == 45;
+        p = p + 1;
+    }
+    if (pool_eq(p, hi - p, "Infinity")) {
+        if (neg) { return -pow10(400); }
+        return pow10(400);
+    }
+    var m : f64 = 0.0;
+    var nd : usize = 0;
+    while (p < hi and is_digit(POOL[p])) {
+        m = m * 10.0 + (((POOL[p] - 48) as u32) as f64);
+        nd = nd + 1;
+        p = p + 1;
+    }
+    var fd : i32 = 0;
+    if (p < hi and POOL[p] == 46) {
+        p = p + 1;
+        while (p < hi and is_digit(POOL[p])) {
+            m = m * 10.0 + (((POOL[p] - 48) as u32) as f64);
+            nd = nd + 1;
+            fd = fd + 1;
+            p = p + 1;
+        }
+    }
+    if (nd == 0) { return 0.0; }
+    var ex : i32 = 0;
+    if (p < hi and (POOL[p] == 101 or POOL[p] == 69)) {
+        p = p + 1;
+        var eneg : bool = false;
+        if (p < hi and (POOL[p] == 43 or POOL[p] == 45)) {
+            eneg = POOL[p] == 45;
+            p = p + 1;
+        }
+        const st : usize = p;
+        while (p < hi and is_digit(POOL[p])) {
+            if (ex < 100000) { ex = ex * 10 + (((POOL[p] - 48) as u32) as i32); }
+            p = p + 1;
+        }
+        if (p == st) { return 0.0; }
+        if (eneg) { ex = -ex; }
+    }
+    if (p != hi) { return 0.0; }
+    const v : f64 = dec_value(m, fd, ex);
+    if (neg) { return -v; }
+    return v;
+}
+
+pub fn num_of(v: i32) -> f64 {
+    const vu : usize = v as usize;
+    const k : u8 = N_KIND[vu];
+    if (k == J_NUM) {
+        const x : f64 = N_NUM[vu];
+        if (x == 0.0) { return 0.0; }
+        return x;
+    }
+    if (k == J_TRUE) { return 1.0; }
+    if (k == J_STR) { return str_num(N_SOFF[vu], N_SLEN[vu]); }
+    return 0.0;
+}
+
+// --- Cell type groups, the names, display names ------------------------------------------------
+/// 0 lut, 1 ff, 2 dsp, 3 bram, 4 other, 5 internal (counted nowhere), 6 an Object.prototype member
+/// (JS drops the count: group[type] is a function there).
+pub fn group_of(off: usize, len: usize) -> u8 {
+    if (pool_eq(off, len, "LUT1") or pool_eq(off, len, "LUT2") or pool_eq(off, len, "LUT3") or pool_eq(off, len, "LUT4") or pool_eq(off, len, "LUT5") or pool_eq(off, len, "LUT6")) { return 0; }
+    if (pool_eq(off, len, "FDRE") or pool_eq(off, len, "FDSE") or pool_eq(off, len, "FDCE") or pool_eq(off, len, "FDPE")) { return 1; }
+    if (pool_eq(off, len, "DSP48E1")) { return 2; }
+    if (pool_eq(off, len, "RAMB18E1") or pool_eq(off, len, "RAMB36E1")) { return 3; }
+    if (pool_eq(off, len, "$scopeinfo")) { return 5; }
+    if (pool_eq(off, len, "constructor") or pool_eq(off, len, "__defineGetter__") or pool_eq(off, len, "__defineSetter__") or pool_eq(off, len, "hasOwnProperty") or pool_eq(off, len, "__lookupGetter__") or pool_eq(off, len, "__lookupSetter__") or pool_eq(off, len, "isPrototypeOf") or pool_eq(off, len, "propertyIsEnumerable") or pool_eq(off, len, "toString") or pool_eq(off, len, "valueOf") or pool_eq(off, len, "__proto__") or pool_eq(off, len, "toLocaleString")) { return 6; }
+    return 4;
+}
+
+pub fn name_find(off: usize, len: usize) -> i32 {
+    var i : usize = 0;
+    while (i < NM_N) {
+        if (NM_LEN[i] == len and pool_same(NM_OFF[i], off, len)) { return (i as i32); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn push_copy(off: usize, len: usize) {
+    var k : usize = 0;
+    while (k < len) {
+        pool_push(POOL[off + k]);
+        k = k + 1;
+    }
+}
+
+/// displayName of POOL[off .. off+len] (already bare): the result is appended to POOL at D_OFF, D_LEN long.
+pub fn disp_build(off: usize, len: usize) {
+    D_OFF = POOL_TOP;
+    if (!pool_prefix(off, len, "$paramod")) {
+        push_copy(off, len);
+        D_LEN = POOL_TOP - D_OFF;
+        return;
+    }
+    const end : usize = off + len;
+    // parts[0] ends at the first backslash; none: the whole name stands for itself
+    var p : usize = off;
+    while (p < end and POOL[p] != B_BSLASH) { p = p + 1; }
+    if (p >= end) {
+        push_copy(off, len);
+        D_LEN = POOL_TOP - D_OFF;
+        return;
+    }
+    p = p + 1;
+    const bstart : usize = p;
+    while (p < end and POOL[p] != B_BSLASH) { p = p + 1; }
+    push_copy(bstart, p - bstart);
+    while (p < end) {
+        // p is on a backslash: the next part runs to the next backslash or the end
+        p = p + 1;
+        const ps : usize = p;
+        while (p < end and POOL[p] != B_BSLASH) { p = p + 1; }
+        pool_push(32);
+        disp_param(ps, p - ps);
+    }
+    D_LEN = POOL_TOP - D_OFF;
+}
+
+/// One parameter part: "name=s32'0101" -> "name=5"; any other text stays as it is.
+pub fn disp_param(off: usize, len: usize) {
+    const end : usize = off + len;
+    var e : usize = off;
+    while (e < end and POOL[e] != 61) { e = e + 1; }
+    if (e >= end or e == off) {
+        push_copy(off, len);
+        return;
+    }
+    var q : usize = e + 1;
+    var signed : bool = false;
+    if (q < end and POOL[q] == 115) {
+        signed = true;
+        q = q + 1;
+    }
+    const d0 : usize = q;
+    while (q < end and is_digit(POOL[q])) { q = q + 1; }
+    if (q == d0 or q >= end or POOL[q] != 39) {
+        push_copy(off, len);
+        return;
+    }
+    q = q + 1;
+    const b0 : usize = q;
+    while (q < end and (POOL[q] == 48 or POOL[q] == 49)) { q = q + 1; }
+    if (q != end or q == b0) {
+        push_copy(off, len);
+        return;
+    }
+    const nb : usize = end - b0;
+    var v : f64 = 0.0;
+    var k : usize = 0;
+    while (k < nb) {
+        v = v * 2.0 + (((POOL[b0 + k] - 48) as u32) as f64);
+        k = k + 1;
+    }
+    if (signed and nb > 1 and POOL[b0] == 49) {
+        var w : f64 = 1.0;
+        var j : usize = 0;
+        while (j < nb) {
+            w = w * 2.0;
+            j = j + 1;
+        }
+        v = v - w;
+    }
+    push_copy(off, e - off);
+    pool_push(61);
+    if (v < 0.0) {
+        pool_push(45);
+        v = -v;
+    }
+    pool_push_uint(v as u64);
+}
+
+pub fn name_add(off: usize, len: usize) -> i32 {
+    if (NM_N >= 4096) {
+        OVER = true;
+        return -1;
+    }
+    const i : usize = NM_N;
+    NM_N = NM_N + 1;
+    NM_OFF[i] = off;
+    NM_LEN[i] = len;
+    disp_build(off, len);
+    DP_OFF[i] = D_OFF;
+    DP_LEN[i] = D_LEN;
+    return (i as i32);
+}
+
+/// bare(): the number of leading bytes dropped, 1 for a leading backslash, else 0.
+pub fn bare_skip(name: []const u8) -> u32 {
+    if (name.len > 0 and name[0] == B_BSLASH) { return 1; }
+    return 0;
+}
+
+/// displayName(name) on a caller's text: the display bytes are read with display_byte(k).
+pub fn display_name(name: []const u8) -> u32 {
+    const save : usize = POOL_TOP;
+    const src : usize = POOL_TOP;
+    var k : usize = 0;
+    while (k < name.len) {
+        pool_push(name[k]);
+        k = k + 1;
+    }
+    var off : usize = src;
+    var len : usize = name.len;
+    if (len > 0 and POOL[off] == B_BSLASH) {
+        off = off + 1;
+        len = len - 1;
+    }
+    disp_build(off, len);
+    const r : u32 = D_LEN as u32;
+    POOL_TOP = save;
+    return r;
+}
+
+pub fn display_byte(k: usize) -> u8 {
+    return POOL[D_OFF + k];
+}
+
+// --- parseHier ---------------------------------------------------------------------------------
+pub fn reset_all() {
+    var i : usize = 0;
+    while (i < 4096) {
+        HASMOD[i] = 0;
+        USED[i] = 0;
+        TOT_DONE[i] = 0;
+        ON_STACK[i] = 0;
+        SEEN[i] = 0;
+        INST_IN[i] = 0;
+        SUB_START[i] = 0;
+        SUB_N[i] = 0;
+        i = i + 1;
+    }
+    NM_N = 0;
+    SUB_TOP = 0;
+    ORDER_N = 0;
+    R_ORDER_N = 0;
+    ROOTS_N = 0;
+    TOP = 0;
+    FLAT = false;
+    HAS_DESIGN = false;
+    KEY_KIND = 0;
+    HAS_CREATOR = false;
+    HAS_VERSION = false;
+    CR_OFF = 0;
+    CR_LEN = 0;
+    VER_OFF = 0;
+    VER_LEN = 0;
+    OVER = false;
+    ROW_N = 0;
+    POST_N = 0;
+    T_N = 0;
+    T_FAIL = false;
+    R_N = 0;
+    LEAF_N = 0;
+    NODE_TOP = 0;
+    POOL_TOP = 0;
+    P_TOP = 0;
+    KS_TOP = 0;
+}
+
+/// byTypeOf(m): the cell-type map node of module node m (num_cells_by_type, else cells), or -1.
+/// KEY_KIND is NOT set here.
+pub fn by_type(m: i32) -> i32 {
+    if (!is_objlike(m)) { return -1; }
+    const a : i32 = find_child(m, "num_cells_by_type");
+    if (is_objlike(a)) { return a; }
+    const b : i32 = find_child(m, "cells");
+    if (is_objlike(b)) { return b; }
+    return -1;
+}
+
+pub fn by_type_kind(m: i32) -> u32 {
+    const a : i32 = find_child(m, "num_cells_by_type");
+    if (is_objlike(a)) { return 1; }
+    return 2;
+}
+
+/// splitTypes over the map node: the own cells go to ACC[0..5]; submodule entries are appended to
+/// the sub table when keep_subs.
+pub fn split_types(map: i32, keep_subs: bool) {
+    ACC[0] = 0.0;
+    ACC[1] = 0.0;
+    ACC[2] = 0.0;
+    ACC[3] = 0.0;
+    ACC[4] = 0.0;
+    var c : i32 = N_FIRST[(map as usize)];
+    while (c >= 0) {
+        const cu : usize = c as usize;
+        const n : f64 = num_of(c);
+        const off : usize = N_KOFF[cu];
+        const len : usize = N_KLEN[cu];
+        var boff : usize = off;
+        var blen : usize = len;
+        if (len > 0 and POOL[off] == B_BSLASH) {
+            boff = off + 1;
+            blen = len - 1;
+        }
+        const sub : i32 = name_find(boff, blen);
+        if (sub >= 0) {
+            if (keep_subs) {
+                if (SUB_TOP >= 32768) {
+                    OVER = true;
+                } else {
+                    SUB_NID[SUB_TOP] = sub as usize;
+                    SUB_CNT[SUB_TOP] = n;
+                    SUB_TOP = SUB_TOP + 1;
+                }
+            }
+        } else {
+            const g : u8 = group_of(off, len);
+            if (g <= 4) { ACC[(g as usize)] = ACC[(g as usize)] + n; }
+        }
+        c = N_NEXT[cu];
+    }
+}
+
+pub fn sum_of(a0: f64, a1: f64, a2: f64, a3: f64, a4: f64) -> f64 {
+    return ((((0.0 + a0) + a1) + a2) + a3) + a4;
+}
+
+pub fn same_totals(a0: f64, a1: f64, a2: f64, a3: f64, a4: f64, b0: f64, b1: f64, b2: f64, b3: f64, b4: f64) -> bool {
+    return a0 == b0 and a1 == b1 and a2 == b2 and a3 == b3 and a4 == b4;
+}
+
+pub fn totals(n: usize) {
+    if (TOT_DONE[n] == 1) { return; }
+    if (HASMOD[n] == 0 or ON_STACK[n] == 1) { return; }
+    ON_STACK[n] = 1;
+    var o0 : f64 = OWN[n * 5];
+    var o1 : f64 = OWN[n * 5 + 1];
+    var o2 : f64 = OWN[n * 5 + 2];
+    var o3 : f64 = OWN[n * 5 + 3];
+    var o4 : f64 = OWN[n * 5 + 4];
+    var i : usize = 0;
+    while (i < SUB_N[n]) {
+        const si : usize = SUB_START[n] + i;
+        const ch : usize = SUB_NID[si];
+        const cnt : f64 = SUB_CNT[si];
+        totals(ch);
+        var t0 : f64 = 0.0;
+        var t1 : f64 = 0.0;
+        var t2 : f64 = 0.0;
+        var t3 : f64 = 0.0;
+        var t4 : f64 = 0.0;
+        if (TOT_DONE[ch] == 1) {
+            t0 = TOT[ch * 5];
+            t1 = TOT[ch * 5 + 1];
+            t2 = TOT[ch * 5 + 2];
+            t3 = TOT[ch * 5 + 3];
+            t4 = TOT[ch * 5 + 4];
+        }
+        o0 = o0 + cnt * t0;
+        o1 = o1 + cnt * t1;
+        o2 = o2 + cnt * t2;
+        o3 = o3 + cnt * t3;
+        o4 = o4 + cnt * t4;
+        i = i + 1;
+    }
+    ON_STACK[n] = 0;
+    TOT[n * 5] = o0;
+    TOT[n * 5 + 1] = o1;
+    TOT[n * 5 + 2] = o2;
+    TOT[n * 5 + 3] = o3;
+    TOT[n * 5 + 4] = o4;
+    TOT_DONE[n] = 1;
+}
+
+/// totalsOf(r, name)[k]: the cells under one instance of the module, submodules expanded.
+pub fn totals_of(n: usize, k: usize) -> f64 {
+    totals(n);
+    if (TOT_DONE[n] == 1) { return TOT[n * 5 + k]; }
+    return 0.0;
+}
+
+pub fn same_as_design(n: usize) -> bool {
+    if (!HAS_DESIGN) { return false; }
+    return same_totals(totals_of(n, 0), totals_of(n, 1), totals_of(n, 2), totals_of(n, 3), totals_of(n, 4), DESIGN[0], DESIGN[1], DESIGN[2], DESIGN[3], DESIGN[4]);
+}
+
+/// /^Yosys\s+(\S+)/ on the creator string: sets VER_OFF/VER_LEN/HAS_VERSION.
+pub fn find_version() {
+    HAS_VERSION = false;
+    const hi : usize = CR_OFF + CR_LEN;
+    if (!pool_prefix(CR_OFF, CR_LEN, "Yosys")) { return; }
+    var p : usize = CR_OFF + 5;
+    const w0 : usize = p;
+    while (p < hi) {
+        const w : usize = pool_ws_at(p, hi);
+        if (w == 0) { break; }
+        p = p + w;
+    }
+    if (p == w0) { return; }
+    const v0 : usize = p;
+    while (p < hi) {
+        const w2 : usize = pool_ws_at(p, hi);
+        if (w2 > 0) { break; }
+        p = p + 1;
+    }
+    if (p == v0) { return; }
+    VER_OFF = v0;
+    VER_LEN = p - v0;
+    HAS_VERSION = true;
+}
+
+/// parseHier(text, lists): the status code (0 ok, see the header).
+pub fn parse_hier(s: []const u8) -> u32 {
+    reset_all();
+    var lo : usize = 0;
+    var hi : usize = s.len;
+    while (lo < hi) {
+        const w : usize = ws_at(s, lo, hi);
+        if (w == 0) { break; }
+        lo = lo + w;
+    }
+    while (hi > lo) {
+        const w2 : usize = ws_before(s, lo, hi);
+        if (w2 == 0) { break; }
+        hi = hi - w2;
+    }
+    if (hi == lo) { return E_EMPTY; }
+    var root : i32 = j_parse(s, lo, hi);
+    if (OVER) { return E_TOOLARGE; }
+    if (root < 0) {
+        var a : i64 = -1;
+        var b : i64 = -1;
+        var p : usize = lo;
+        while (p < hi) {
+            if (s[p] == 123 and a < 0) { a = p as i64; }
+            if (s[p] == 125) { b = p as i64; }
+            p = p + 1;
+        }
+        if (a < 0 or b <= a) { return E_NOJSON; }
+        root = j_parse(s, a as usize, (b as usize) + 1);
+        if (OVER) { return E_TOOLARGE; }
+        if (root < 0) { return E_BADJSON; }
+    }
+    if (!is_objlike(root)) { return E_NOMODULES; }
+    const mods : i32 = find_child(root, "modules");
+    if (!is_objlike(mods)) { return E_NOMODULES; }
+    const cr : i32 = find_child(root, "creator");
+    if (cr >= 0 and N_KIND[(cr as usize)] == J_STR) {
+        HAS_CREATOR = true;
+        CR_OFF = N_SOFF[(cr as usize)];
+        CR_LEN = N_SLEN[(cr as usize)];
+        find_version();
+    }
+    // order: every key of modules, bare, duplicates kept; the names become ids
+    var c : i32 = N_FIRST[(mods as usize)];
+    while (c >= 0) {
+        const cu : usize = c as usize;
+        var boff : usize = N_KOFF[cu];
+        var blen : usize = N_KLEN[cu];
+        if (blen > 0 and POOL[boff] == B_BSLASH) {
+            boff = boff + 1;
+            blen = blen - 1;
+        }
+        var nid : i32 = name_find(boff, blen);
+        if (nid < 0) { nid = name_add(boff, blen); }
+        if (nid < 0 or ORDER_N >= 4096) { return E_TOOLARGE; }
+        ORDER[ORDER_N] = nid as usize;
+        ORDER_N = ORDER_N + 1;
+        c = N_NEXT[cu];
+    }
+    // modules: the cells of each entry that has a cell map; a later entry of the same name replaces
+    var any : bool = false;
+    c = N_FIRST[(mods as usize)];
+    var ei : usize = 0;
+    while (c >= 0) {
+        const cu2 : usize = c as usize;
+        const map : i32 = by_type(c);
+        if (map >= 0) {
+            if (KEY_KIND == 0) { KEY_KIND = by_type_kind(c); }
+            const nid2 : usize = ORDER[ei];
+            const start : usize = SUB_TOP;
+            split_types(map, true);
+            if (OVER) { return E_TOOLARGE; }
+            HASMOD[nid2] = 1;
+            any = true;
+            OWN[nid2 * 5] = ACC[0];
+            OWN[nid2 * 5 + 1] = ACC[1];
+            OWN[nid2 * 5 + 2] = ACC[2];
+            OWN[nid2 * 5 + 3] = ACC[3];
+            OWN[nid2 * 5 + 4] = ACC[4];
+            SUB_START[nid2] = start;
+            SUB_N[nid2] = SUB_TOP - start;
+        }
+        ei = ei + 1;
+        c = N_NEXT[cu2];
+    }
+    if (!any) { return E_NOCELLS; }
+    var i : usize = 0;
+    while (i < NM_N) {
+        if (HASMOD[i] == 1) {
+            var j : usize = 0;
+            while (j < SUB_N[i]) {
+                USED[SUB_NID[SUB_START[i] + j]] = 1;
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < ORDER_N) {
+        const n : usize = ORDER[i];
+        if (HASMOD[n] == 1) {
+            R_ORDER[R_ORDER_N] = n;
+            R_ORDER_N = R_ORDER_N + 1;
+            if (USED[n] == 0) {
+                ROOTS[ROOTS_N] = n;
+                ROOTS_N = ROOTS_N + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (ROOTS_N == 0) { return E_NOTOP; }
+    const d : i32 = find_child(root, "design");
+    if (is_objlike(d)) {
+        const dm : i32 = by_type(d);
+        if (dm >= 0) {
+            split_types(dm, false);
+            HAS_DESIGN = true;
+            DESIGN[0] = ACC[0];
+            DESIGN[1] = ACC[1];
+            DESIGN[2] = ACC[2];
+            DESIGN[3] = ACC[3];
+            DESIGN[4] = ACC[4];
+        }
+    }
+    FLAT = true;
+    i = 0;
+    while (i < NM_N) {
+        if (HASMOD[i] == 1 and SUB_N[i] != 0) { FLAT = false; }
+        i = i + 1;
+    }
+    TOP = ROOTS[0];
+    if (ROOTS_N > 1) {
+        var found : bool = false;
+        if (HAS_DESIGN) {
+            i = 0;
+            while (i < ROOTS_N and !found) {
+                if (same_as_design(ROOTS[i])) {
+                    TOP = ROOTS[i];
+                    found = true;
+                }
+                i = i + 1;
+            }
+        }
+        if (!found) {
+            var best : f64 = 0.0;
+            i = 0;
+            while (i < ROOTS_N) {
+                const rn : usize = ROOTS[i];
+                const sm : f64 = sum_of(totals_of(rn, 0), totals_of(rn, 1), totals_of(rn, 2), totals_of(rn, 3), totals_of(rn, 4));
+                if (i == 0 or sm > best) {
+                    best = sm;
+                    TOP = rn;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return E_OK;
+}
+
+// --- getters for the glue ----------------------------------------------------------------------
+pub fn key_kind() -> u32 { return KEY_KIND; }
+pub fn name_n() -> usize { return NM_N; }
+pub fn name_off(n: usize) -> usize { return NM_OFF[n]; }
+pub fn name_len(n: usize) -> usize { return NM_LEN[n]; }
+pub fn disp_off(n: usize) -> usize { return DP_OFF[n]; }
+pub fn disp_len(n: usize) -> usize { return DP_LEN[n]; }
+pub fn has_module(n: usize) -> bool { return HASMOD[n] == 1; }
+pub fn own(n: usize, k: usize) -> f64 { return OWN[n * 5 + k]; }
+pub fn sub_n(n: usize) -> usize { return SUB_N[n]; }
+pub fn sub_nid(n: usize, i: usize) -> usize { return SUB_NID[SUB_START[n] + i]; }
+pub fn sub_count(n: usize, i: usize) -> f64 { return SUB_CNT[SUB_START[n] + i]; }
+pub fn order_n() -> usize { return R_ORDER_N; }
+pub fn order_nid(i: usize) -> usize { return R_ORDER[i]; }
+pub fn top_nid() -> usize { return TOP; }
+pub fn roots_n() -> usize { return ROOTS_N; }
+pub fn root_nid(i: usize) -> usize { return ROOTS[i]; }
+pub fn is_flat() -> bool { return FLAT; }
+pub fn has_design() -> bool { return HAS_DESIGN; }
+pub fn design_val(k: usize) -> f64 { return DESIGN[k]; }
+pub fn has_creator() -> bool { return HAS_CREATOR; }
+pub fn creator_off() -> usize { return CR_OFF; }
+pub fn creator_len() -> usize { return CR_LEN; }
+pub fn has_version() -> bool { return HAS_VERSION; }
+pub fn version_off() -> usize { return VER_OFF; }
+pub fn version_len() -> usize { return VER_LEN; }
+
+// --- instancesOf and moduleRows ----------------------------------------------------------------
+pub fn inst_visit(n: usize) {
+    if (SEEN[n] == 1 or HASMOD[n] == 0) { return; }
+    SEEN[n] = 1;
+    var i : usize = 0;
+    while (i < SUB_N[n]) {
+        inst_visit(SUB_NID[SUB_START[n] + i]);
+        i = i + 1;
+    }
+    POST[POST_N] = n;
+    POST_N = POST_N + 1;
+}
+
+/// How many instances of each module sit under one top, all paths added up.
+pub fn instances_of(top: usize) {
+    var i : usize = 0;
+    while (i < NM_N) {
+        SEEN[i] = 0;
+        INST_IN[i] = 0;
+        INST[i] = 0.0;
+        i = i + 1;
+    }
+    POST_N = 0;
+    inst_visit(top);
+    i = 0;
+    while (i < POST_N) {
+        INST_IN[POST[i]] = 1;
+        i = i + 1;
+    }
+    INST_IN[top] = 1;
+    INST[top] = 1.0;
+    var j : usize = POST_N;
+    while (j > 0) {
+        const n : usize = POST[j - 1];
+        var k : usize = 0;
+        while (k < SUB_N[n]) {
+            const si : usize = SUB_START[n] + k;
+            const ch : usize = SUB_NID[si];
+            if (INST_IN[ch] == 1) { INST[ch] = INST[ch] + INST[n] * SUB_CNT[si]; }
+            k = k + 1;
+        }
+        j = j - 1;
+    }
+}
+
+pub fn inst_in(n: usize) -> bool { return INST_IN[n] == 1; }
+pub fn inst_of(n: usize) -> f64 { return INST[n]; }
+
+/// moduleRows(r): one row per entry of r.order that sits under the top. Returns the row count.
+pub fn module_rows() -> usize {
+    instances_of(TOP);
+    ROW_N = 0;
+    var i : usize = 0;
+    while (i < R_ORDER_N) {
+        const n : usize = R_ORDER[i];
+        if (INST_IN[n] == 1) {
+            ROW_NID[ROW_N] = n;
+            ROW_N = ROW_N + 1;
+        }
+        i = i + 1;
+    }
+    return ROW_N;
+}
+
+pub fn row_nid(i: usize) -> usize { return ROW_NID[i]; }
+pub fn row_instances(i: usize) -> f64 { return INST[ROW_NID[i]]; }
+pub fn row_total(i: usize, k: usize) -> f64 { return INST[ROW_NID[i]] * OWN[ROW_NID[i] * 5 + k]; }
+
+// --- viewTree ----------------------------------------------------------------------------------
+pub fn per(n: usize) -> f64 {
+    return totals_of(n, T_METRIC);
+}
+
+pub fn tile_new(nid: usize, copies: f64, index: f64, of: f64, is_own: bool, value: f64, parent: i32) -> i32 {
+    if (T_N >= 32768) {
+        T_FAIL = true;
+        return -1;
+    }
+    const id : usize = T_N;
+    T_N = T_N + 1;
+    T_NID[id] = nid;
+    T_COPIES[id] = copies;
+    T_INDEX[id] = index;
+    T_OF[id] = of;
+    if (is_own) { T_OWN[id] = 1; } else { T_OWN[id] = 0; }
+    T_VALUE[id] = value;
+    T_PARENT[id] = parent;
+    T_FIRST[id] = -1;
+    T_LAST[id] = -1;
+    T_NEXT[id] = -1;
+    if (parent >= 0) {
+        const pu : usize = parent as usize;
+        if (T_LAST[pu] < 0) {
+            T_FIRST[pu] = id as i32;
+        } else {
+            T_NEXT[(T_LAST[pu] as usize)] = id as i32;
+        }
+        T_LAST[pu] = id as i32;
+    }
+    return (id as i32);
+}
+
+pub fn tile_build(nid: usize, copies: f64, index: f64, of: f64, parent: i32, depth: u32) -> i32 {
+    const id : i32 = tile_new(nid, copies, index, of, false, copies * per(nid), parent);
+    if (id < 0) { return -1; }
+    T_BUDGET = T_BUDGET - 1.0;
+    if (depth > 128) {
+        T_FAIL = true;
+        return id;
+    }
+    // kids: subs with a count above 0 and cells of this metric, widest first, ties in yosys order
+    const base : usize = KS_TOP;
+    var nk : usize = 0;
+    var i : usize = 0;
+    while (i < SUB_N[nid]) {
+        const si : usize = SUB_START[nid] + i;
+        const ch : usize = SUB_NID[si];
+        if (SUB_CNT[si] > 0.0 and per(ch) > 0.0) {
+            if (base + nk >= 32768) {
+                T_FAIL = true;
+                return id;
+            }
+            const key : f64 = SUB_CNT[si] * per(ch);
+            var j : usize = base + nk;
+            while (j > base) {
+                const pj : usize = KS[j - 1];
+                const pk : f64 = SUB_CNT[pj] * per(SUB_NID[pj]);
+                if (pk < key) {
+                    KS[j] = KS[j - 1];
+                    j = j - 1;
+                } else {
+                    break;
+                }
+            }
+            KS[j] = si;
+            nk = nk + 1;
+        }
+        i = i + 1;
+    }
+    if (nk == 0) { return id; }
+    KS_TOP = base + nk;
+    if (OWN[nid * 5 + T_METRIC] > 0.0) {
+        tile_new(nid, copies, 0.0, 0.0, true, copies * OWN[nid * 5 + T_METRIC], id);
+        T_BUDGET = T_BUDGET - 1.0;
+    }
+    var q : usize = 0;
+    while (q < nk) {
+        const sj : usize = KS[base + q];
+        const cn : usize = SUB_NID[sj];
+        const cnt : f64 = SUB_CNT[sj];
+        var each : bool = false;
+        if (copies == 1.0 and cnt <= T_EXPAND) {
+            if (T_BUDGET - cnt * (1.0 + (SUB_N[cn] as f64)) >= 0.0) { each = true; }
+        }
+        if (each) {
+            var ii : f64 = 1.0;
+            while (ii <= cnt) {
+                tile_build(cn, 1.0, ii, cnt, id, depth + 1);
+                ii = ii + 1.0;
+            }
+        } else {
+            tile_build(cn, copies * cnt, 0.0, cnt, id, depth + 1);
+        }
+        q = q + 1;
+    }
+    KS_TOP = base;
+    return id;
+}
+
+/// viewTree(r, metric, { expandMax, maxTiles }): the tile count; tile 0 is the root.
+pub fn view_tree(metric: usize, expand_max: f64, max_tiles: f64) -> usize {
+    T_N = 0;
+    T_FAIL = false;
+    KS_TOP = 0;
+    T_METRIC = metric;
+    T_EXPAND = expand_max;
+    T_BUDGET = max_tiles;
+    tile_build(TOP, 1.0, 0.0, 0.0, -1, 0);
+    return T_N;
+}
+
+pub fn view_tree_failed() -> bool { return T_FAIL; }
+pub fn tile_nid(i: usize) -> usize { return T_NID[i]; }
+pub fn tile_copies(i: usize) -> f64 { return T_COPIES[i]; }
+pub fn tile_index(i: usize) -> f64 { return T_INDEX[i]; }
+pub fn tile_of(i: usize) -> f64 { return T_OF[i]; }
+pub fn tile_own(i: usize) -> bool { return T_OWN[i] == 1; }
+pub fn tile_value(i: usize) -> f64 { return T_VALUE[i]; }
+pub fn tile_parent(i: usize) -> i32 { return T_PARENT[i]; }
+pub fn tile_first(i: usize) -> i32 { return T_FIRST[i]; }
+pub fn tile_next(i: usize) -> i32 { return T_NEXT[i]; }
+
+pub fn leaves_walk(id: usize) {
+    if (T_FIRST[id] < 0) {
+        LEAF[LEAF_N] = id;
+        LEAF_N = LEAF_N + 1;
+        return;
+    }
+    var c : i32 = T_FIRST[id];
+    while (c >= 0) {
+        leaves_walk(c as usize);
+        c = T_NEXT[(c as usize)];
+    }
+}
+
+/// leavesOf(root): the leaf tiles in order; returns how many.
+pub fn leaves_n() -> usize {
+    LEAF_N = 0;
+    if (T_N > 0) { leaves_walk(0); }
+    return LEAF_N;
+}
+
+pub fn leaf_id(i: usize) -> usize { return LEAF[i]; }
+
+/// The leaves' values added left to right, as the page does with reduce.
+pub fn leaves_sum() -> f64 {
+    leaves_n();
+    var s : f64 = 0.0;
+    var i : usize = 0;
+    while (i < LEAF_N) {
+        s = s + T_VALUE[LEAF[i]];
+        i = i + 1;
+    }
+    return s;
+}
+
+// --- squarify (Bruls, Huizing, van Wijk 2000) --------------------------------------------------
+pub fn fmax(a: f64, b: f64) -> f64 {
+    if (b > a) { return b; }
+    return a;
+}
+
+/// worst(row, side) over the rest entries a .. b-1.
+pub fn sq_worst(a: usize, b: usize, side: f64) -> f64 {
+    var s : f64 = 0.0;
+    var i : usize = a;
+    while (i < b) {
+        s = s + RS_A[i];
+        i = i + 1;
+    }
+    var mx : f64 = 0.0;
+    i = a;
+    while (i < b) {
+        const ar : f64 = RS_A[i];
+        mx = fmax(fmax(mx, (side * side * ar) / (s * s)), (s * s) / (side * side * ar));
+        i = i + 1;
+    }
+    return mx;
+}
+
+pub fn sq_set(i: usize, v: f64) {
+    SQ_V[i] = v;
+    SQ_ID[i] = i;
+}
+
+/// The core: items SQ_V[0..n) (ids SQ_ID) into the rectangle; the placements are pushed on the
+/// P stack (from the old P_TOP); returns how many.
+pub fn sq_core(n: usize, x0: f64, y0: f64, w0: f64, h0: f64) -> usize {
+    var x : f64 = x0;
+    var y : f64 = y0;
+    var w : f64 = w0;
+    var h : f64 = h0;
+    var total : f64 = 0.0;
+    var i : usize = 0;
+    while (i < n) {
+        total = total + SQ_V[i];
+        i = i + 1;
+    }
+    if (total <= 0.0 or w <= 0.0 or h <= 0.0) { return 0; }
+    const scale : f64 = (w * h) / total;
+    var nr : usize = 0;
+    i = 0;
+    while (i < n) {
+        if (SQ_V[i] > 0.0) {
+            const ar : f64 = SQ_V[i] * scale;
+            var j : usize = nr;
+            while (j > 0) {
+                if (RS_A[j - 1] < ar) {
+                    RS_A[j] = RS_A[j - 1];
+                    RS_I[j] = RS_I[j - 1];
+                    j = j - 1;
+                } else {
+                    break;
+                }
+            }
+            RS_A[j] = ar;
+            RS_I[j] = i;
+            nr = nr + 1;
+        }
+        i = i + 1;
+    }
+    const first : usize = P_TOP;
+    var rs : usize = 0;
+    var ri : usize = 0;
+    while (ri < nr) {
+        const side : f64 = if_min(w, h);
+        var take : bool = false;
+        if (ri == rs) {
+            take = true;
+        } else {
+            if (sq_worst(rs, ri + 1, side) <= sq_worst(rs, ri, side)) { take = true; }
+        }
+        if (take) {
+            ri = ri + 1;
+        } else {
+            sq_place(rs, ri, x, y, w, h);
+            const s : f64 = sq_sum(rs, ri);
+            if (w >= h) {
+                const cw : f64 = s / h;
+                x = x + cw;
+                w = w - cw;
+            } else {
+                const rh : f64 = s / w;
+                y = y + rh;
+                h = h - rh;
+            }
+            rs = ri;
+        }
+    }
+    if (ri > rs) { sq_place(rs, ri, x, y, w, h); }
+    return P_TOP - first;
+}
+
+pub fn if_min(a: f64, b: f64) -> f64 {
+    if (b < a) { return b; }
+    return a;
+}
+
+pub fn sq_sum(a: usize, b: usize) -> f64 {
+    var s : f64 = 0.0;
+    var i : usize = a;
+    while (i < b) {
+        s = s + RS_A[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+/// place(): lay the row rest[a .. b) along the shorter side.
+pub fn sq_place(a: usize, b: usize, x: f64, y: f64, w: f64, h: f64) {
+    const s : f64 = sq_sum(a, b);
+    var i : usize = a;
+    if (w >= h) {
+        const cw : f64 = s / h;
+        var yy : f64 = y;
+        while (i < b) {
+            const rh : f64 = RS_A[i] / cw;
+            sq_push(SQ_ID[RS_I[i]], x, yy, cw, rh);
+            yy = yy + rh;
+            i = i + 1;
+        }
+    } else {
+        const rh2 : f64 = s / w;
+        var xx : f64 = x;
+        while (i < b) {
+            const cw2 : f64 = RS_A[i] / rh2;
+            sq_push(SQ_ID[RS_I[i]], xx, y, cw2, rh2);
+            xx = xx + cw2;
+            i = i + 1;
+        }
+    }
+}
+
+pub fn sq_push(item: usize, x: f64, y: f64, w: f64, h: f64) {
+    if (P_TOP >= 65536) {
+        SQ_FAIL = true;
+        return;
+    }
+    P_ITEM[P_TOP] = item;
+    P_X[P_TOP] = x;
+    P_Y[P_TOP] = y;
+    P_W[P_TOP] = w;
+    P_H[P_TOP] = h;
+    P_TOP = P_TOP + 1;
+}
+
+/// squarify(items, x, y, w, h) for the items put with sq_set: the number of rectangles; read them
+/// with sq_out_*(j).
+pub fn squarify(n: usize, x: f64, y: f64, w: f64, h: f64) -> usize {
+    P_TOP = 0;
+    return sq_core(n, x, y, w, h);
+}
+
+pub fn sq_out_item(j: usize) -> usize { return P_ITEM[j]; }
+pub fn sq_out_x(j: usize) -> f64 { return P_X[j]; }
+pub fn sq_out_y(j: usize) -> f64 { return P_Y[j]; }
+pub fn sq_out_w(j: usize) -> f64 { return P_W[j]; }
+pub fn sq_out_h(j: usize) -> f64 { return P_H[j]; }
+
+// --- layoutTree --------------------------------------------------------------------------------
+pub fn rect_go(id: usize, x: f64, y: f64, w: f64, h: f64, depth: u32) {
+    if (R_N >= 32768) {
+        SQ_FAIL = true;
+        return;
+    }
+    const with_kids : bool = T_FIRST[id] >= 0;
+    var has_head : bool = false;
+    if (with_kids and h >= L_HEAD * 2.5 and w >= L_HEAD * 3.0) { has_head = true; }
+    const r : usize = R_N;
+    R_N = R_N + 1;
+    R_NODE[r] = id;
+    R_X[r] = x;
+    R_Y[r] = y;
+    R_W[r] = w;
+    R_H[r] = h;
+    R_DEPTH[r] = depth;
+    if (has_head) { R_HEAD[r] = 1; } else { R_HEAD[r] = 0; }
+    if (!with_kids) { return; }
+    const ix : f64 = x + L_PAD;
+    var top : f64 = L_PAD;
+    if (has_head) { top = L_HEAD; }
+    const iy : f64 = y + top;
+    const iw : f64 = w - 2.0 * L_PAD;
+    const ih : f64 = h - top - L_PAD;
+    if (iw < 2.0 or ih < 2.0) { return; }
+    var n : usize = 0;
+    var c : i32 = T_FIRST[id];
+    while (c >= 0) {
+        if (n >= 8192) {
+            SQ_FAIL = true;
+            return;
+        }
+        SQ_V[n] = T_VALUE[(c as usize)];
+        SQ_ID[n] = c as usize;
+        n = n + 1;
+        c = T_NEXT[(c as usize)];
+    }
+    const base : usize = P_TOP;
+    const cnt : usize = sq_core(n, ix, iy, iw, ih);
+    var k : usize = 0;
+    while (k < cnt) {
+        rect_go(P_ITEM[base + k], P_X[base + k], P_Y[base + k], P_W[base + k], P_H[base + k], depth + 1);
+        k = k + 1;
+    }
+    P_TOP = base;
+}
+
+/// layoutTree(root, x, y, w, h, { head, pad }) over the view tree: the rectangle count.
+pub fn layout_tree(x: f64, y: f64, w: f64, h: f64, head: f64, pad: f64) -> usize {
+    R_N = 0;
+    P_TOP = 0;
+    SQ_FAIL = false;
+    L_HEAD = head;
+    L_PAD = pad;
+    if (T_N > 0) { rect_go(0, x, y, w, h, 0); }
+    return R_N;
+}
+
+pub fn layout_failed() -> bool { return SQ_FAIL; }
+pub fn rect_node(i: usize) -> usize { return R_NODE[i]; }
+pub fn rect_x(i: usize) -> f64 { return R_X[i]; }
+pub fn rect_y(i: usize) -> f64 { return R_Y[i]; }
+pub fn rect_w(i: usize) -> f64 { return R_W[i]; }
+pub fn rect_h(i: usize) -> f64 { return R_H[i]; }
+pub fn rect_depth(i: usize) -> u32 { return R_DEPTH[i]; }
+pub fn rect_head(i: usize) -> bool { return R_HEAD[i] == 1; }
+
+// --- Tests: real inputs (the tool's own samples, minified byte for byte otherwise) and the answers the original treemap.js gives ---
+pub const SAMPLE : []const u8 = "{\"creator\":\"Yosys 0.67+post (git sha1 b8e7da6f40ae8f552c116bf6c359b07c6533e159, Release, AppleClang clang++ 21.0.0.21000099)\",\"invocation\":\"stat -json \",\"modules\":{\"\\\\gf16_add\":{\"num_wires\":263,\"num_wire_bits\":1123,\"num_pub_wires\":9,\"num_pub_wire_bits\":80,\"num_ports\":3,\"num_port_bits\":48,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":391,\"num_submodules\":0,\"num_cells_by_type\":{\"CARRY4\":31,\"INV\":12,\"LUT1\":11,\"LUT2\":73,\"LUT3\":78,\"LUT4\":23,\"LUT5\":24,\"LUT6\":84,\"MUXF7\":41,\"MUXF8\":14}},\"\\\\gf16_dot4_p\":{\"num_wires\":136,\"num_wire_bits\":466,\"num_pub_wires\":24,\"num_pub_wire_bits\":354,\"num_ports\":11,\"num_port_bits\":146,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":224,\"num_submodules\":7,\"num_cells_by_type\":{\"FDRE\":112,\"INV\":112,\"gf16_add\":3,\"gf16_mul\":4}},\"\\\\gf16_matmul4x4_p\":{\"num_wires\":101,\"num_wire_bits\":1541,\"num_pub_wires\":50,\"num_pub_wire_bits\":770,\"num_ports\":50,\"num_port_bits\":770,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":771,\"num_submodules\":16,\"num_cells_by_type\":{\"BUFG\":1,\"IBUF\":514,\"OBUF\":256,\"gf16_dot4_p\":16}},\"\\\\gf16_mul\":{\"num_wires\":135,\"num_wire_bits\":603,\"num_pub_wires\":12,\"num_pub_wire_bits\":120,\"num_ports\":3,\"num_port_bits\":48,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":159,\"num_submodules\":0,\"num_cells_by_type\":{\"CARRY4\":13,\"DSP48E1\":1,\"INV\":7,\"LUT1\":21,\"LUT2\":12,\"LUT3\":8,\"LUT4\":5,\"LUT5\":27,\"LUT6\":27,\"MUXF7\":35,\"MUXF8\":3}}},\"design\":{\"num_wires\":23541,\"num_wire_bits\":101493,\"num_pub_wires\":1634,\"num_pub_wire_bits\":17954,\"num_ports\":562,\"num_port_bits\":8482,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":33299,\"num_submodules\":16,\"num_cells_by_type\":{\"BUFG\":1,\"CARRY4\":2320,\"DSP48E1\":64,\"FDRE\":1792,\"IBUF\":514,\"INV\":2816,\"LUT1\":1872,\"LUT2\":4272,\"LUT3\":4256,\"LUT4\":1424,\"LUT5\":2880,\"LUT6\":5760,\"MUXF7\":4208,\"MUXF8\":864,\"OBUF\":256,\"gf16_dot4_p\":16}}}";
+
+pub const SAMPLE_FLAT : []const u8 = "{\"creator\":\"Yosys 0.67+post (git sha1 b8e7da6f40ae8f552c116bf6c359b07c6533e159, Release, AppleClang clang++ 21.0.0.21000099)\",\"invocation\":\"stat -json \",\"modules\":{\"\\\\gf16_matmul4x4_p\":{\"num_wires\":18323,\"num_wire_bits\":92285,\"num_pub_wires\":1554,\"num_pub_wire_bits\":16674,\"num_ports\":50,\"num_port_bits\":770,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":26668,\"num_submodules\":0,\"num_cells_by_type\":{\"$scopeinfo\":128,\"BUFG\":1,\"CARRY4\":2273,\"DSP48E1\":64,\"FDRE\":1792,\"IBUF\":514,\"INV\":1311,\"LUT1\":585,\"LUT2\":4394,\"LUT3\":4928,\"LUT4\":1206,\"LUT5\":2154,\"LUT6\":5463,\"MUXF7\":1224,\"MUXF8\":375,\"OBUF\":256}}},\"design\":{\"num_wires\":18323,\"num_wire_bits\":92285,\"num_pub_wires\":1554,\"num_pub_wire_bits\":16674,\"num_ports\":50,\"num_port_bits\":770,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":26668,\"num_submodules\":0,\"num_cells_by_type\":{\"$scopeinfo\":128,\"BUFG\":1,\"CARRY4\":2273,\"DSP48E1\":64,\"FDRE\":1792,\"IBUF\":514,\"INV\":1311,\"LUT1\":585,\"LUT2\":4394,\"LUT3\":4928,\"LUT4\":1206,\"LUT5\":2154,\"LUT6\":5463,\"MUXF7\":1224,\"MUXF8\":375,\"OBUF\":256}}}";
+
+pub const PARAMOD : []const u8 = "{\"creator\":\"Yosys 0.67+post (git sha1 b8e7da6f40ae8f552c116bf6c359b07c6533e159, Release, AppleClang clang++ 21.0.0.21000099)\",\"invocation\":\"stat -json \",\"modules\":{\"$paramod\\\\leaf\\\\W=s32'00000000000000000000000000000100\":{\"num_wires\":7,\"num_wire_bits\":25,\"num_pub_wires\":4,\"num_pub_wire_bits\":13,\"num_ports\":4,\"num_port_bits\":13,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":9,\"num_submodules\":0,\"num_cells_by_type\":{\"CARRY4\":1,\"FDRE\":4,\"LUT2\":4}},\"$paramod\\\\leaf\\\\W=s32'00000000000000000000000000001000\":{\"num_wires\":7,\"num_wire_bits\":49,\"num_pub_wires\":4,\"num_pub_wire_bits\":25,\"num_ports\":4,\"num_port_bits\":25,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":18,\"num_submodules\":0,\"num_cells_by_type\":{\"CARRY4\":2,\"FDRE\":8,\"LUT2\":8}},\"\\\\mid\":{\"num_wires\":5,\"num_wire_bits\":17,\"num_pub_wires\":5,\"num_pub_wire_bits\":17,\"num_ports\":4,\"num_port_bits\":13,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":0,\"num_submodules\":2,\"num_cells_by_type\":{\"$paramod\\\\leaf\\\\W=s32'00000000000000000000000000000100\":2}},\"\\\\pmtop\":{\"num_wires\":13,\"num_wire_bits\":67,\"num_pub_wires\":6,\"num_pub_wire_bits\":33,\"num_ports\":6,\"num_port_bits\":33,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":34,\"num_submodules\":3,\"num_cells_by_type\":{\"BUFG\":1,\"IBUF\":17,\"OBUF\":16,\"$paramod\\\\leaf\\\\W=s32'00000000000000000000000000001000\":1,\"mid\":2}}},\"design\":{\"num_wires\":58,\"num_wire_bits\":250,\"num_pub_wires\":36,\"num_pub_wire_bits\":144,\"num_ports\":34,\"num_port_bits\":136,\"num_memories\":0,\"num_memory_bits\":0,\"num_processes\":0,\"num_cells\":88,\"num_submodules\":3,\"num_cells_by_type\":{\"BUFG\":1,\"CARRY4\":6,\"FDRE\":24,\"IBUF\":17,\"LUT2\":24,\"OBUF\":16,\"$paramod\\\\leaf\\\\W=s32'00000000000000000000000000001000\":1,\"mid\":2}}}";
+
+pub fn nid_named(w: []const u8) -> i32 {
+    var i : usize = 0;
+    while (i < NM_N) {
+        if (pool_eq(NM_OFF[i], NM_LEN[i], w)) { return (i as i32); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn disp_is(n: usize, w: []const u8) -> bool {
+    return pool_eq(DP_OFF[n], DP_LEN[n], w);
+}
+
+test the_sample_adds_up_to_yosys_total {
+    assert parse_hier(SAMPLE) == E_OK;
+    assert pool_eq(NM_OFF[TOP], NM_LEN[TOP], "gf16_matmul4x4_p");
+    assert totals_of(TOP, 0) == 20464.0;
+    assert totals_of(TOP, 1) == 1792.0;
+    assert totals_of(TOP, 2) == 64.0;
+    assert same_as_design(TOP);
+    assert has_creator();
+    assert pool_eq(VER_OFF, VER_LEN, "0.67+post");
+    assert key_kind() == 1;
+    assert is_flat() == false;
+    assert order_n() == 4;
+    assert roots_n() == 1;
+}
+
+test instances_multiply_down_the_hierarchy_and_rows_list_them {
+    assert parse_hier(SAMPLE) == E_OK;
+    assert module_rows() == 4;
+    const add : usize = nid_named("gf16_add") as usize;
+    const dot : usize = nid_named("gf16_dot4_p") as usize;
+    const mul : usize = nid_named("gf16_mul") as usize;
+    assert inst_of(add) == 48.0;
+    assert inst_of(dot) == 16.0;
+    assert inst_of(mul) == 64.0;
+    assert own(add, 0) == 293.0;
+    assert own(mul, 0) == 100.0;
+    assert own(mul, 2) == 1.0;
+    assert own(dot, 1) == 112.0;
+    assert row_total(0, 0) == 14064.0;
+    assert sub_n(dot) == 2;
+    assert sub_count(dot, 0) == 3.0;
+}
+
+test the_flat_run_has_one_module_and_fewer_luts {
+    assert parse_hier(SAMPLE_FLAT) == E_OK;
+    assert is_flat();
+    assert totals_of(TOP, 0) == 18730.0;
+    assert totals_of(TOP, 1) == 1792.0;
+    assert own(TOP, 4) > 0.0;
+    assert has_design();
+    assert design_val(0) == 18730.0;
+    assert sub_n(TOP) == 0;
+}
+
+test paramod_names_are_decoded_and_two_paths_are_added {
+    assert parse_hier(PARAMOD) == E_OK;
+    const l4 : usize = nid_named("$paramod\\leaf\\W=s32'00000000000000000000000000000100") as usize;
+    const l8 : usize = nid_named("$paramod\\leaf\\W=s32'00000000000000000000000000001000") as usize;
+    assert disp_is(l4, "leaf W=4");
+    assert disp_is(l8, "leaf W=8");
+    assert module_rows() == 4;
+    assert inst_of(l4) == 4.0;
+    assert inst_of(l8) == 1.0;
+    assert same_as_design(TOP);
+    assert display_name("$paramod\\m\\P=s8'11111111\\Q=8'11111111\\R=s4'0101") == 16;
+    assert display_byte(0) == 109;
+    assert display_name("\\plain") == 5;
+    assert bare_skip("\\x") == 1;
+}
+
+test the_view_tree_has_one_tile_per_instance_and_the_leaves_add_up {
+    assert parse_hier(SAMPLE) == E_OK;
+    assert view_tree(0, 64.0, 600.0) == 129;
+    assert view_tree_failed() == false;
+    assert leaves_n() == 112;
+    assert leaves_sum() == 20464.0;
+    assert tile_value(0) == 20464.0;
+    assert tile_own(0) == false;
+    assert view_tree(1, 64.0, 600.0) == 17;
+    assert leaves_sum() == 1792.0;
+    assert view_tree(0, 2.0, 600.0) == 4;
+    assert leaves_sum() == 20464.0;
+    assert view_tree(3, 64.0, 600.0) == 1;
+}
+
+test the_layout_places_every_tile_inside_the_map {
+    assert parse_hier(SAMPLE) == E_OK;
+    assert view_tree(0, 64.0, 600.0) > 0;
+    assert layout_tree(0.0, 0.0, 900.0, 600.0, 16.0, 2.0) == 129;
+    assert layout_failed() == false;
+    assert rect_x(0) == 0.0;
+    assert rect_w(0) == 900.0;
+    assert rect_head(0);
+    assert rect_x(1) == 2.0;
+    assert rect_y(1) == 16.0;
+    assert rect_w(1) == 168.00000000000003;
+    assert rect_h(1) == 194.0;
+    assert rect_x(128) == 858.6743626743628;
+    assert rect_h(128) == 61.34594214229872;
+    assert rect_depth(128) == 2;
+}
+
+test squarify_follows_bruls_huizing_van_wijk {
+    sq_set(0, 6.0);
+    sq_set(1, 6.0);
+    sq_set(2, 4.0);
+    sq_set(3, 3.0);
+    sq_set(4, 2.0);
+    sq_set(5, 2.0);
+    sq_set(6, 1.0);
+    assert squarify(7, 0.0, 0.0, 6.0, 4.0) == 7;
+    assert sq_out_item(0) == 0;
+    assert sq_out_x(0) == 0.0;
+    assert sq_out_w(0) == 3.0;
+    assert sq_out_h(0) == 2.0;
+    assert sq_out_x(6) == 5.4;
+    assert sq_out_y(6) == 2.3333333333333335;
+    assert sq_out_w(6) == 0.5999999999999996;
+    assert sq_out_h(6) == 1.6666666666666676;
+    assert squarify(0, 0.0, 0.0, 6.0, 4.0) == 0;
+}
+
+test parse_failures_are_named_the_way_the_page_says {
+    assert parse_hier("") == E_EMPTY;
+    assert parse_hier("   ") == E_EMPTY;
+    assert parse_hier("run stat with -json please") == E_NOJSON;
+    assert parse_hier("{\"modules\": }") == E_BADJSON;
+    assert parse_hier("[1, 2]") == E_NOMODULES;
+    assert parse_hier("{\"modules\": 5}") == E_NOMODULES;
+    assert parse_hier("{\"creator\": \"Yosys 0.9\", \"modules\": {\"a\": {}}}") == E_NOCELLS;
+    assert pool_eq(VER_OFF, VER_LEN, "0.9");
+    assert parse_hier("{\"modules\": {\"a\": {\"cells\": {\"b\": 1}}, \"b\": {\"cells\": {\"a\": 1}}}}") == E_NOTOP;
+}
+
+test json_quirks_are_read_the_way_javascript_reads_them {
+    assert parse_hier("log line {\"modules\": {\"\\\\a\": {\"cells\": {\"LUT2\": 7}}}} tail") == E_OK;
+    assert key_kind() == 2;
+    assert own(TOP, 0) == 7.0;
+    assert parse_hier("{\"modules\": {\"a\": {\"cells\": {\"LUT2\": 1, \"LUT2\": 5, \"FDRE\": \"3\", \"BUFG\": true}}}}") == E_OK;
+    assert own(TOP, 0) == 5.0;
+    assert own(TOP, 1) == 3.0;
+    assert own(TOP, 4) == 1.0;
+    assert parse_hier("{\"modules\": {\"b\": {\"cells\": {\"LUT1\": 1}}, \"2\": {\"cells\": {\"LUT1\": 2}}, \"1\": {\"cells\": {\"LUT1\": 3}}}}") == E_OK;
+    assert order_n() == 3;
+    assert pool_eq(NM_OFF[order_nid(0)], NM_LEN[order_nid(0)], "1");
+    assert pool_eq(NM_OFF[order_nid(2)], NM_LEN[order_nid(2)], "b");
+    assert parse_hier("{\"modules\": {\"a\": {\"cells\": {\"LUT1\": 1e2, \"LUT2\": 2.5E-1, \"LUT3\": 01}}}}") == E_BADJSON;
+    assert parse_hier("{\"modules\": {\"a\": {\"cells\": {\"LUT1\": 1e2, \"LUT2\": 2.5E-1, \"LUT3\": 0.5}}}}") == E_OK;
+    assert own(TOP, 0) == 100.75;
+}
