@@ -1,0 +1,320 @@
+module port::trinity::src::vibeec::ssa_regalloc;
+
+// Port of gHashTag/trinity src/phi-engine/vibeec_original/ssa_regalloc.zig
+// (linear-scan register allocator for SSA virtual registers).
+//
+// Port notes (decision logic kept, plumbing dropped):
+// - The original keeps live ranges in a growable std.ArrayList(LiveRange);
+//   here that is a fixed inline array of MAX_RANGES entries plus an explicit
+//   range_count. addRange returns false when the cap is hit, standing in for
+//   the original's OutOfMemory error from append.
+// - std.mem.Allocator is carried by init/deinit as a placeholder struct; the
+//   inline array needs no allocation, so deinit frees nothing.
+// - The original's reg_state is [NUM_REGS]?u32 with null marking a free
+//   register. t27c has no optional array element type, so reg_state is
+//   [NUM_REGS]i64 with REG_FREE (-1) in place of null; held registers store
+//   the owning vreg, exactly like the original.
+// - std.mem.sort with a less-than on start becomes an insertion sort by
+//   start; equal starts keep insertion order, matching the stable sort.
+// - PHI and GOLDEN_IDENTITY are constants in the original file and are
+//   ported unchanged.
+
+pub const NUM_REGS: usize = 16;
+pub const MAX_RANGES: usize = 64;
+
+// Zig's reg_state is [NUM_REGS]?u32; t27c cannot spell optional array
+// element types, so REG_FREE (-1) replaces null and held registers hold
+// the owning vreg.
+pub const REG_FREE: i64 = -1;
+
+pub const PHI: f64 = 1.618033988749895;
+pub const GOLDEN_IDENTITY: f64 = 3.0;
+
+pub struct Allocator {}
+
+pub struct LiveRange {
+    vreg: u32,
+    start: u32,
+    end: u32,
+    assigned_reg: ?u8,
+    spill_slot: ?u16,
+    weight: f32,
+}
+
+pub struct AllocStats {
+    allocated: u64,
+    spilled: u64,
+}
+
+pub struct SSARegAlloc {
+    ranges: [MAX_RANGES]LiveRange,
+    range_count: usize,
+    reg_state: [NUM_REGS]i64,
+    spill_count: u16,
+    stats: AllocStats,
+}
+
+// Default LiveRange mirroring the original's struct field defaults
+// (assigned_reg = null, spill_slot = null, weight = 1.0).
+const LR_NONE: LiveRange = LiveRange{ .vreg = 0, .start = 0, .end = 0, .assigned_reg = null, .spill_slot = null, .weight = 1.0 };
+
+const test_allocator = Allocator{};
+
+fn mkLR(vreg: u32, start: u32, end: u32) LiveRange {
+    return LiveRange{ .vreg = vreg, .start = start, .end = end, .assigned_reg = null, .spill_slot = null, .weight = 1.0 };
+}
+
+pub fn LiveRange_overlaps(self: LiveRange, other: LiveRange) -> bool {
+    return self.start < other.end and other.start < self.end;
+}
+
+pub fn LiveRange_length(self: LiveRange) -> u32 {
+    return self.end - self.start;
+}
+
+pub fn SSARegAlloc_init(alloc: *Allocator) -> SSARegAlloc {
+    return SSARegAlloc{
+        .ranges = [_]LiveRange{LR_NONE} ** MAX_RANGES,
+        .range_count = 0,
+        .reg_state = [_]i64{REG_FREE} ** NUM_REGS,
+        .spill_count = 0,
+        .stats = AllocStats{ .allocated = 0, .spilled = 0 },
+    };
+}
+
+pub fn SSARegAlloc_deinit(_self: *SSARegAlloc) void {
+    // Port the decision, not the plumbing: the fixed-capacity range array is
+    // inline, so unlike the original there is no allocation to free.
+    return;
+}
+
+pub fn SSARegAlloc_addRange(self: *SSARegAlloc, vreg: u32, start: u32, end: u32) -> bool {
+    // The original returns !void; its only failure path is list growth
+    // (OutOfMemory), which here is the fixed capacity being exhausted.
+    if (self.range_count >= MAX_RANGES) {
+        return false;
+    }
+    self.ranges[self.range_count] = mkLR(vreg, start, end);
+    self.range_count += 1;
+    return true;
+}
+
+pub fn SSARegAlloc_allocate(self: *SSARegAlloc) void {
+    // The original sorts ranges by start (std.mem.sort + lessThan on start).
+    // Insertion sort keeps the same order; equal starts keep insertion
+    // order, matching the original's stable sort.
+    var i: usize = 1;
+    while (i < self.range_count) {
+        var j: usize = i;
+        while (j > 0) {
+            if (self.ranges[j - 1].start > self.ranges[j].start) {
+                const tmp = self.ranges[j - 1];
+                self.ranges[j - 1] = self.ranges[j];
+                self.ranges[j] = tmp;
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    var k: usize = 0;
+    while (k < self.range_count) {
+        // First fit: scan reg_state for the lowest-numbered free register,
+        // exactly like the original; 255 stands in for "none found".
+        var reg: u8 = 255;
+        var r: usize = 0;
+        while (r < NUM_REGS) {
+            if (self.reg_state[r] == REG_FREE) {
+                reg = r as u8;
+                break;
+            }
+            r += 1;
+        }
+        if (reg != 255) {
+            self.ranges[k].assigned_reg = reg;
+            self.reg_state[reg] = self.ranges[k].vreg as i64;
+            self.stats.allocated += 1;
+        } else {
+            // No register free: spill, mirroring the original's spill branch.
+            self.ranges[k].spill_slot = self.spill_count;
+            self.spill_count += 1;
+            self.stats.spilled += 1;
+        }
+        k += 1;
+    }
+}
+
+pub fn SSARegAlloc_expireOld(self: *SSARegAlloc, pos: u32) void {
+    // Free every register still held by a range that has ended
+    // (range.end <= pos). The range keeps its assigned_reg marking, as in
+    // the original; only reg_state is cleared.
+    var k: usize = 0;
+    while (k < self.range_count) {
+        const range = self.ranges[k];
+        if (range.end <= pos) {
+            // t27c cannot unwrap an optional binder (generated code drops the
+            // capture), so free the register by matching on vreg instead: SSA
+            // vregs are unique, so the register holding this range's vreg is
+            // exactly the one the original frees via range.assigned_reg.
+            var r: usize = 0;
+            while (r < NUM_REGS) {
+                if (self.reg_state[r] == range.vreg as i64) {
+                    self.reg_state[r] = REG_FREE;
+                }
+                r += 1;
+            }
+        }
+        k += 1;
+    }
+}
+
+test live_range_overlaps {
+    const a = mkLR(1, 0, 10);
+    const b = mkLR(2, 5, 15);
+    assert(LiveRange_overlaps(a, b));
+    assert(LiveRange_overlaps(b, a));
+    // Touching ranges do not overlap.
+    const c = mkLR(3, 10, 20);
+    assert(!LiveRange_overlaps(a, c));
+    assert(!LiveRange_overlaps(c, a));
+    // Disjoint ranges do not overlap.
+    const d = mkLR(4, 30, 40);
+    assert(!LiveRange_overlaps(a, d));
+}
+
+test live_range_length {
+    assert(LiveRange_length(mkLR(1, 0, 10)) == 10);
+    assert(LiveRange_length(mkLR(1, 5, 5)) == 0);
+    assert(LiveRange_length(mkLR(1, 100, 260)) == 160);
+}
+
+test regalloc_init_defaults {
+    var test_alloc = Allocator{};
+    const ra = SSARegAlloc_init(&test_alloc);
+    assert(ra.range_count == 0);
+    assert(ra.spill_count == 0);
+    assert(ra.stats.allocated == 0);
+    assert(ra.stats.spilled == 0);
+    assert(ra.reg_state[0] == REG_FREE);
+    assert(ra.reg_state[NUM_REGS - 1] == REG_FREE);
+}
+
+test regalloc_add_range_stores {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    assert(SSARegAlloc_addRange(&ra, 7, 0, 10));
+    assert(SSARegAlloc_addRange(&ra, 8, 5, 15));
+    assert(ra.range_count == 2);
+    assert(ra.ranges[0].vreg == 7);
+    assert(ra.ranges[0].start == 0);
+    assert(ra.ranges[0].end == 10);
+    assert(ra.ranges[1].vreg == 8);
+    assert(ra.ranges[1].start == 5);
+    // weight defaults to 1.0 like the original's struct default.
+    assert(ra.ranges[0].weight == 1.0);
+    // Freshly added ranges carry no register assignment yet.
+    assert(ra.ranges[0].assigned_reg == null);
+}
+
+test regalloc_add_range_full {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    var i: usize = 0;
+    while (i < MAX_RANGES) {
+        const v = i as u32;
+        assert(SSARegAlloc_addRange(&ra, v, v, v + 1));
+        i += 1;
+    }
+    assert(ra.range_count == MAX_RANGES);
+    // Capacity exhausted: addRange reports failure, like the original's
+    // OutOfMemory error from a failed append.
+    assert(!SSARegAlloc_addRange(&ra, 999, 0, 1));
+    assert(ra.range_count == MAX_RANGES);
+}
+
+test regalloc_allocate_first_fit {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    assert(SSARegAlloc_addRange(&ra, 7, 0, 10));
+    assert(SSARegAlloc_addRange(&ra, 8, 5, 15));
+    assert(SSARegAlloc_addRange(&ra, 9, 20, 30));
+    SSARegAlloc_allocate(&ra);
+    assert(ra.stats.allocated == 3);
+    assert(ra.stats.spilled == 0);
+    assert(ra.reg_state[0] == 7);
+    assert(ra.reg_state[1] == 8);
+    assert(ra.reg_state[2] == 9);
+    assert(ra.reg_state[3] == REG_FREE);
+    // First range in start order holds register 0 (pinned via reg_state
+    // above); the optional is non-null but its value is not readable without
+    // an optional binder, which t27c does not support.
+    assert(ra.ranges[0].assigned_reg != null);
+}
+
+test regalloc_allocate_sorts_by_start {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    assert(SSARegAlloc_addRange(&ra, 9, 100, 110));
+    assert(SSARegAlloc_addRange(&ra, 1, 0, 5));
+    SSARegAlloc_allocate(&ra);
+    assert(ra.ranges[0].vreg == 1);
+    assert(ra.ranges[1].vreg == 9);
+    assert(ra.reg_state[0] == 1);
+    assert(ra.reg_state[1] == 9);
+}
+
+test regalloc_allocate_spills {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    var i: usize = 0;
+    while (i < 20) {
+        const v = i as u32;
+        assert(SSARegAlloc_addRange(&ra, v, v, v + 1));
+        i += 1;
+    }
+    SSARegAlloc_allocate(&ra);
+    // 16 registers cover the first 16 ranges; the remaining 4 spill.
+    assert(ra.stats.allocated == NUM_REGS);
+    assert(ra.stats.spilled == 4);
+    assert(ra.spill_count == 4);
+    assert(ra.ranges[NUM_REGS - 1].assigned_reg != null);
+    assert(ra.ranges[NUM_REGS].spill_slot != null);
+    assert(ra.ranges[NUM_REGS + 1].spill_slot != null);
+    assert(ra.ranges[NUM_REGS + 2].spill_slot != null);
+    assert(ra.ranges[NUM_REGS + 3].spill_slot != null);
+}
+
+test regalloc_expire_old {
+    var test_alloc = Allocator{};
+    var ra = SSARegAlloc_init(&test_alloc);
+    assert(SSARegAlloc_addRange(&ra, 1, 0, 10));
+    assert(SSARegAlloc_addRange(&ra, 2, 5, 15));
+    SSARegAlloc_allocate(&ra);
+    assert(ra.reg_state[0] == 1);
+    assert(ra.reg_state[1] == 2);
+    // Nothing has ended yet.
+    SSARegAlloc_expireOld(&ra, 0);
+    assert(ra.reg_state[0] == 1);
+    assert(ra.reg_state[1] == 2);
+    // Range (0,10) has ended at pos 10; register 0 is freed, register 1
+    // (held by the range ending at 15) is kept.
+    SSARegAlloc_expireOld(&ra, 10);
+    assert(ra.reg_state[0] == REG_FREE);
+    assert(ra.reg_state[1] == 2);
+    SSARegAlloc_expireOld(&ra, 15);
+    assert(ra.reg_state[0] == REG_FREE);
+    assert(ra.reg_state[1] == REG_FREE);
+}
+
+fn goldenLhs(phi: f64) f64 {
+    const phi_sq = phi * phi;
+    return phi_sq + 1.0 / phi_sq;
+}
+
+test golden_identity {
+    // Calls in the assert expression keep the check at runtime; consts-only
+    // arithmetic folds to comptime and the test reports as vacuous.
+    assert(GOLDEN_IDENTITY - goldenLhs(PHI) < 0.0001 and goldenLhs(PHI) - GOLDEN_IDENTITY < 0.0001);
+}
