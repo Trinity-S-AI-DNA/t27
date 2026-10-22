@@ -40,10 +40,25 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 /// set-but-empty search list whose treatment differs between libcs, while a real
 /// directory with nothing in it fails every lookup everywhere.
 fn corpus_with_no_tools(extra: &[&str], empty_dir: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_t27c"))
-        .args(["corpus", "--limit", "3"])
-        .args(extra)
-        .env("PATH", empty_dir)
+    corpus_with_no_tools_and_tmpdir(extra, empty_dir, None)
+}
+
+fn corpus_with_no_tools_and_tmpdir(
+    extra: &[&str],
+    empty_dir: &std::path::Path,
+    tmpdir: Option<&std::path::Path>,
+) -> std::process::Output {
+    // Bound first, configured second: chaining `.args()` straight off
+    // `Command::new` keeps only a `&mut` to a temporary that dies at the end of
+    // the statement (E0716, #5448).
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_t27c"));
+    cmd.args(["corpus", "--limit", "3"]).args(extra);
+
+    if let Some(tmp) = tmpdir {
+        cmd.env("TMPDIR", tmp);
+    }
+
+    cmd.env("PATH", empty_dir)
         .current_dir(repo_root())
         .output()
         .expect("run t27c corpus")
@@ -53,8 +68,11 @@ fn corpus_with_no_tools(extra: &[&str], empty_dir: &std::path::Path) -> std::pro
 fn a_run_whose_tools_cannot_be_spawned_is_refused_and_prints_no_percentages() {
     let empty = scratch("path");
     std::fs::create_dir_all(&empty).expect("empty PATH dir");
-    let out = corpus_with_no_tools(&[], &empty);
+    let tmp = scratch("tmp");
+    std::fs::create_dir_all(&tmp).expect("private TMPDIR");
+    let out = corpus_with_no_tools_and_tmpdir(&[], &empty, Some(&tmp));
     let _ = std::fs::remove_dir_all(&empty);
+    let _ = std::fs::remove_dir_all(&tmp);
     let text = String::from_utf8_lossy(&out.stdout).to_string();
 
     assert_eq!(
@@ -86,8 +104,11 @@ fn a_run_whose_tools_cannot_be_spawned_is_refused_and_prints_no_percentages() {
 fn the_refused_json_carries_no_acceptance_column_for_a_ratchet_to_read() {
     let empty = scratch("json");
     std::fs::create_dir_all(&empty).expect("empty PATH dir");
-    let out = corpus_with_no_tools(&["--json"], &empty);
+    let tmp = scratch("tmp");
+    std::fs::create_dir_all(&tmp).expect("private TMPDIR");
+    let out = corpus_with_no_tools_and_tmpdir(&["--json"], &empty, Some(&tmp));
     let _ = std::fs::remove_dir_all(&empty);
+    let _ = std::fs::remove_dir_all(&tmp);
     let text = String::from_utf8_lossy(&out.stdout).to_string();
 
     assert_eq!(out.status.code(), Some(2), "must exit 2. stdout:\n{text}");
@@ -126,13 +147,17 @@ fn a_refused_run_writes_no_per_spec_table() {
     std::fs::create_dir_all(&empty).expect("empty PATH dir");
     let table = dir.join("per-spec.txt");
 
+    let tmp = scratch("perspec-tmp");
+    std::fs::create_dir_all(&tmp).expect("private TMPDIR");
     let out = Command::new(env!("CARGO_BIN_EXE_t27c"))
         .args(["corpus", "--limit", "3", "--per-spec"])
         .arg(&table)
         .env("PATH", &empty)
+        .env("TMPDIR", &tmp)
         .current_dir(repo_root())
         .output()
         .expect("run t27c corpus");
+    let _ = std::fs::remove_dir_all(&tmp);
     let existed = table.exists();
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -265,6 +290,49 @@ fn a_scratch_directory_that_refuses_writes_refuses_the_run() {
 /// same call, and it is the only cause a test can aim at ONE of the four.
 #[test]
 fn each_backend_artefact_write_is_guarded_at_its_own_call_site() {
+    // #5903: corpus uses the child's PID in its filenames. On Unix a small
+    // launcher creates the exact directory, then exec preserves that PID while
+    // running the real compiler. No compiler outcome is simulated here.
+    let launcher_home = scratch("eisdir-launcher");
+    let launcher = if cfg!(unix) {
+        std::fs::create_dir_all(&launcher_home).expect("launcher scratch");
+        let source = launcher_home.join("launcher.rs");
+        std::fs::write(
+            &source,
+            r#"
+use std::os::unix::process::CommandExt;
+fn main() {
+    let args: Vec<_> = std::env::args_os().collect();
+    let home = std::path::Path::new(&args[2]);
+    let extension = args[3].to_str().expect("extension");
+    let target = home.join("t27-corpus")
+        .join(format!("c-{}.{}", std::process::id(), extension));
+    std::fs::create_dir_all(target).expect("artefact as a directory");
+    let error = std::process::Command::new(&args[1])
+        .args(["corpus", "--limit", "3"])
+        .env("TMPDIR", home).exec();
+    panic!("exec real t27c: {error}");
+}
+"#,
+        )
+        .expect("launcher source");
+        let binary = launcher_home.join("launcher");
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-D", "warnings"])
+            .arg(source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compile launcher");
+        assert!(
+            output.status.success(),
+            "launcher compilation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(binary)
+    } else {
+        None
+    };
     for (artefact, tool) in [
         ("c.rs", "write c.rs"),
         ("c.c", "write c.c"),
@@ -273,15 +341,26 @@ fn each_backend_artefact_write_is_guarded_at_its_own_call_site() {
     ] {
         let home = scratch("eisdir");
         let corpus_tmp = home.join("t27-corpus");
-        // The artefact path itself, as a directory.
-        std::fs::create_dir_all(corpus_tmp.join(artefact)).expect("artefact as a dir");
-
-        let out = Command::new(env!("CARGO_BIN_EXE_t27c"))
-            .args(["corpus", "--limit", "3"])
-            .env("TMPDIR", &home)
+        let mut command = if let Some(launcher) = &launcher {
+            let mut command = Command::new(launcher);
+            command
+                .arg(env!("CARGO_BIN_EXE_t27c"))
+                .arg(&home)
+                .arg(artefact.strip_prefix("c.").expect("extension"));
+            command
+        } else {
+            // Preserve the existing non-Unix fixture; exec is a Unix API.
+            std::fs::create_dir_all(corpus_tmp.join(artefact)).expect("artefact as a dir");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_t27c"));
+            command
+                .args(["corpus", "--limit", "3"])
+                .env("TMPDIR", &home);
+            command
+        };
+        let out = command
             .current_dir(repo_root())
             .output()
-            .expect("run t27c corpus");
+            .expect("run real t27c corpus");
         let _ = std::fs::remove_dir_all(&home);
         let text = String::from_utf8_lossy(&out.stdout).to_string();
 
@@ -311,6 +390,7 @@ fn each_backend_artefact_write_is_guarded_at_its_own_call_site() {
             );
         }
     }
+    let _ = std::fs::remove_dir_all(&launcher_home);
 }
 
 /// THE OTHER WAY TO PRODUCE NO NUMBERS: a population that was never asked.

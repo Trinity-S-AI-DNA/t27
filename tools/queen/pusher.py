@@ -272,6 +272,33 @@ def rules(now: dict, before: dict | None) -> list[dict]:
             "python3 tools/queen/feed_untested.py --dry-run --limit 3",
         )
 
+    # A LANE COUNT BELOW WHAT THE DEPLOYMENT PAYS FOR, whatever the reason.
+    #
+    # `capacity-shrank` needs two readings and sees only a CHANGE, so a swarm
+    # that has been small since before the first reading is invisible to it.
+    # Measured across 2026-09-20: something outside both repositories rewrote
+    # TRIOS_QUEEN_MAX_WORKERS to 8, then 9, then 1, then 16, and each write
+    # redeployed the service. The image built that day derives the lane count
+    # and ignores that variable - but an older image does not, and a redeploy
+    # can bring one back, which is exactly when the value bites.
+    #
+    # So the floor is stated here rather than inferred: ten credentials at two
+    # lanes each is twenty. Set PUSHER_EXPECTED_LANES when that changes.
+    expected = os.environ.get("PUSHER_EXPECTED_LANES", "20")
+    expected = int(expected) if expected.isdigit() else 0
+    lanes_now = now.get("workers_capacity", -1)
+    if expected > 0 and 0 <= lanes_now < expected:
+        fire(
+            "capacity-below-expected",
+            f"The swarm reports {lanes_now} lanes where the deployment pays for "
+            f"{expected}. Either the running image is one that still honours "
+            "TRIOS_QUEEN_MAX_WORKERS, or a credential stopped being counted.",
+            f"curl -s {QUEEN}/status | python3 -c \"import json,sys;"
+            "print(json.load(sys.stdin)['workers'])\"",
+            "the image built on 2026-09-20 derives the lane count and prints "
+            "`(derived)` in its entrypoint log; an older one does not",
+        )
+
     # A swarm that got smaller without anyone saying so. The cap lives in the
     # deployment's environment (TRIOS_QUEEN_MAX_WORKERS), so it can change
     # between readings with no commit anywhere to show for it.
@@ -300,15 +327,28 @@ def rules(now: dict, before: dict | None) -> list[dict]:
     # Review cost is linear in running workers, so the backlog is what binds
     # next after the lanes are full. Reported, not repaired: there is no
     # mechanical answer to "the reviewers are behind" that this file may take.
+    # ONE LANE'S WORTH, not two. The threshold was 2x the lanes, which at twenty
+    # lanes means forty unreviewed - and the queue that mattered on 2026-09-20
+    # sat at sixteen to twenty all afternoon, under the threshold, while every
+    # bee that finished waited. The number that matters is whether the backlog
+    # is bigger than what the swarm can produce in one round, because that is
+    # the point at which it can only grow.
+    #
+    # THE CAUSE IS A BUDGET, and the rule names it: the review sweep buys
+    # `TRIOS_QUEEN_REVIEWS_PER_ROUND` reviews a round (default 3) and
+    # `TRIOS_QUEEN_MEASUREMENTS_PER_ROUND` criteria measurements (default 3),
+    # both capped at 32. Faster bees do not make the swarm faster if the sweep
+    # still buys three.
     unreviewed = now.get("dispatch_unreviewed", -1)
-    if (before and unreviewed >= 2 * max(1, now.get("workers_capacity", 1))
-            and unreviewed > before.get("dispatch_unreviewed", unreviewed)):
+    lanes_for_review = max(1, now.get("workers_capacity", 1))
+    if (before and unreviewed >= lanes_for_review
+            and unreviewed >= before.get("dispatch_unreviewed", unreviewed)):
         fire(
             "review-backlog",
-            f"{unreviewed} finished bees are unreviewed, up from "
-            f"{before.get('dispatch_unreviewed')}, against "
-            f"{now.get('workers_capacity')} lanes. Nothing they wrote can land "
-            "until it is judged.",
+            f"{unreviewed} finished bees are unreviewed, against "
+            f"{now.get('workers_capacity')} lanes and a sweep that buys "
+            "TRIOS_QUEEN_REVIEWS_PER_ROUND reviews a round (default 3). Nothing "
+            "they wrote can land until it is judged.",
             f"curl -s {QUEEN}/status | python3 -c \"import json,sys;"
             "print(json.load(sys.stdin)['dispatches'])\"",
         )
@@ -402,7 +442,7 @@ def rules(now: dict, before: dict | None) -> list[dict]:
 # Bounded on purpose: only the feeders, only when a fuel-shaped rule fired, and
 # never twice inside twenty minutes. A watchdog that can dispatch anything is a
 # second Queen with none of her gates.
-FEEDERS = ("queen-feed-untested.yml", "queen-feed-empty-bodies.yml")
+FEEDERS = ("queen-feed-untested.yml", "queen-feed-empty-bodies.yml", "queen-feed-roadmap.yml")
 FUEL_KEYS = {"out-of-fuel", "fuel-runway", "lanes-idle"}
 REFILL_COOLDOWN_MINUTES = 20
 
@@ -576,6 +616,10 @@ def self_test() -> int:
               "dispatch_running": 20}
     shipping = {**outage, "bee_merged_last_6h": 4}
     cases += [
+        ("a lane count under what is paid for fires",
+         {**full, "workers_capacity": 16}, "capacity-below-expected", True),
+        ("the full count does not",
+         {**full, "workers_capacity": 20}, "capacity-below-expected", False),
         ("a swarm that publishes nothing fires", outage, "nothing-published", True),
         ("a swarm whose work lands does not", shipping, "nothing-published", False),
         ("and a repository that merged only its operator's work still fires",
@@ -622,19 +666,27 @@ def self_test() -> int:
         bad += 1
     piling_up = any(
         item["key"] == "review-backlog"
-        for item in rules({**full, "dispatch_unreviewed": 30},
-                          {**full, "dispatch_unreviewed": 22})
+        for item in rules({**full, "dispatch_unreviewed": 12},
+                          {**full, "dispatch_unreviewed": 11})
     )
     if not piling_up:
-        print("  self-test FAILED: 22 -> 30 unreviewed against 10 lanes must fire")
+        print("  self-test FAILED: 11 -> 12 unreviewed against 10 lanes must fire")
         bad += 1
     draining = any(
         item["key"] == "review-backlog"
-        for item in rules({**full, "dispatch_unreviewed": 22},
+        for item in rules({**full, "dispatch_unreviewed": 8},
                           {**full, "dispatch_unreviewed": 30})
     )
     if draining:
         print("  self-test FAILED: a backlog that is going DOWN must not fire")
+        bad += 1
+    under = any(
+        item["key"] == "review-backlog"
+        for item in rules({**full, "dispatch_unreviewed": 3},
+                          {**full, "dispatch_unreviewed": 2})
+    )
+    if under:
+        print("  self-test FAILED: three unreviewed against ten lanes is not a backlog")
         bad += 1
 
     # Capacity shrinking needs two readings, and so does throughput halving.
@@ -683,7 +735,7 @@ def self_test() -> int:
         bad += 1
     if bad:
         return 1
-    print(f"ok: {len(cases) + 10} rule shapes, including ten a moving system must NOT fire")
+    print(f"ok: {len(cases) + 11} rule shapes, including twelve a moving system must NOT fire")
     return 0
 
 

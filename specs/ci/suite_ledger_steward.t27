@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ci/suite_ledger_steward.t27 -- which corpus-ratchet findings on a master run the suite ledger
+; steward applies by itself, and which it refuses and leaves to a person.
+; docs/reports/suite_expectations.json is the corpus ledger: one row per (spec, first failing phase),
+; a discard pin on every parse-no-discard row, the gate-failure pin max_gate_failures, and the cap
+; max_entries. `t27c suite --ratchet --corpus-only` (bootstrap/src/suite.rs ratchet_compare) is red
+; for a fall as well as for a rise: an UNEXPECTED PASS (the spec now passes every phase) and a
+; DISCARD IMPROVED (fewer tokens lost than pinned) fail the check until the ledger says so. Each one
+; turned `Corpus ratchet` red on master, and every PR inherited the red until someone wrote a hand PR.
+; #10172 is the latest: 8 rows dropped (seven igla/coder specs from #10101, nn/attention from #10095),
+; bench_proxy 738 -> 696 and prm 521 -> 520 re-pinned, the cap 81 -> 73. The same shape is in #7804
+; (3 rows, 77 -> 74), #6437 (4 rows, 113 -> 109) and #8345 (one pin 386 -> 349, cap 74 -> 71).
+; specs/ci/derived_data.t27 says lag is PENDING and one bot re-derives it on master. This file is
+; that bot's decision for the corpus ledger, the counterpart of specs/tri/t27b/ledger_steward.t27.
+; The job card is specs/jobs/suite_ledger_steward.t27.
+; What the steward applies, per ledger row and per run:
+;   DROP    the row's spec fails no phase in the run: the row goes (an UNEXPECTED PASS)
+;   REPIN   a parse-no-discard row whose total fell and whose channels each held or fell: the pin
+;           becomes the run's total and split (DISCARD IMPROVED, DISCARD CHANNEL)
+;   the gate-failure pin falls to the run's count
+;   the cap  max_entries becomes the composed ledger's row count, which only falls
+; What it refuses, so a person reads it (derived_data.t27 rule 4: the bot never writes a cap rise or
+; a non-pass reason):
+;   a NEW FAILURE (a spec failing with no row: a regression, or a ported spec that needs a reason);
+;   a MOVED row (the spec fails another phase now: the reason must be rewritten); an EXPIRED row;
+;   a discard total that ROSE, a channel that rose while the total held or fell, a pinned row the
+;   run took NO READING of, a row with no total or no split (UNPINNED), a row whose split does not sum
+;   to its total (the ledger disagrees with itself); a gate-failure count that rose or has no pin;
+;   a cap rise (the composed ledger still over max_entries); and more drops in one run than
+;   DROP_LIMIT (a broken run looks like a corpus where everything passes).
+; A rise is never applied, not even a small one with a good story. #10172 raised benchmark 315 -> 319
+; by hand, with the reason in _why_entries_rose; suite.rs's bless says a worsened pin is raised
+; "ONLY by a human running bless and reviewing the diff". On #10172's run the steward applies the
+; other ten changes and leaves benchmark as master has it, listed in its PR.
+; A refused row stays as master has it and the rest of the run is applied (#10192's rule): only a run
+; with nothing to apply, a cap rise or a drop flood is refused as a whole.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module SuiteLedgerSteward;
+
+use ci::derived_data::bot_may_bless;
+
+/// What the steward does with one ledger row, the gate-failure pin, or one run failure with no row.
+///   KEEP    the row holds, or there is nothing to do
+///   DROP    the row's spec passes every phase: the row goes
+///   REPIN   the discard (or gate-failure) pin fell: it becomes the run's number
+///   REFUSE  a person reads it: the row stays as master has it and the PR lists it
+pub const ACT_KEEP : u8 = 0;
+pub const ACT_DROP : u8 = 1;
+pub const ACT_REPIN : u8 = 2;
+pub const ACT_REFUSE : u8 = 3;
+
+/// Why something was refused, as the PR table or the issue words it.
+pub const RR_NONE : u8 = 0;
+pub const RR_NEW_FAILURE : u8 = 1;
+pub const RR_MOVED : u8 = 2;
+pub const RR_EXPIRED : u8 = 3;
+pub const RR_DISCARD_ROSE : u8 = 4;
+pub const RR_CHANNEL_ROSE : u8 = 5;
+pub const RR_NO_READING : u8 = 6;
+pub const RR_UNPINNED : u8 = 7;
+pub const RR_LEDGER_SELF : u8 = 8;
+pub const RR_GATE_ROSE : u8 = 9;
+pub const RR_GATE_UNPINNED : u8 = 10;
+pub const RR_CAP_RISE : u8 = 11;
+pub const RR_DROP_FLOOD : u8 = 12;
+
+/// The run's verdict, as ledger_steward.t27 has it.
+///   NOTHING  no finding: the ratchet is green, no job
+///   APPLY    something is the steward's: compose the ledger from it, one PR, auto-merge; a refused
+///            row stays as master has it and is listed in the PR
+///   REFUSE   nothing to apply but a person's finding, or the run as a whole is refused (a cap rise,
+///            a drop flood): one issue for the run, no PR
+///   SKIP     not a run the steward reads (run_stewardable)
+pub const RV_NOTHING : u8 = 0;
+pub const RV_APPLY : u8 = 1;
+pub const RV_REFUSE : u8 = 2;
+pub const RV_SKIP : u8 = 3;
+
+/// More rows dropped in one run than this says the run is broken, not the corpus better: a suite
+/// that stopped early observes few failures, and every row it did not reach reads as a pass. The
+/// hand batches dropped 8 (#10172), 4 (#6437), 3 (#7804) and 2 (#6186); #5497 dropped 51 after a
+/// parser change, and a person reading one issue for that is the cheap side of the mistake.
+pub const DROP_LIMIT : u32 = 16;
+
+/// The effects a steward job may run, by the job card's effect steps (ledger_steward.t27's numbering).
+pub const EF_REFUSAL_ISSUE : u8 = 0;
+pub const EF_COMPOSE : u8 = 1;
+pub const EF_LEDGER_ISSUE : u8 = 2;
+pub const EF_PULL_REQUEST : u8 = 3;
+pub const EF_AUTO_MERGE : u8 = 4;
+
+/// Why one row (or one run failure) is refused, from where the run and the ledger put its spec.
+///   in_ledger   the ledger has a row for this spec
+///   run_fails   the run observed the spec failing some phase (its first failing phase)
+///   same_phase  that phase is the row's phase
+///   expired     the row's `expires` date is before the run's day
+pub fn row_refusal(in_ledger: bool, run_fails: bool, same_phase: bool, expired: bool) -> u8 {
+    if (in_ledger == false) {
+        if (run_fails) { return RR_NEW_FAILURE; }
+        return RR_NONE;
+    }
+    if (run_fails == false) { return RR_NONE; }
+    if (same_phase == false) { return RR_MOVED; }
+    if (expired) { return RR_EXPIRED; }
+    return RR_NONE;
+}
+
+/// The steward's action on one row by its phase alone. A row whose spec passes is dropped even when
+/// its date ran out: there is nothing left to renew.
+pub fn row_action(in_ledger: bool, run_fails: bool, same_phase: bool, expired: bool) -> u8 {
+    if (row_refusal(in_ledger, run_fails, same_phase, expired) != RR_NONE) { return ACT_REFUSE; }
+    if (in_ledger and run_fails == false) { return ACT_DROP; }
+    return ACT_KEEP;
+}
+
+/// Why a parse-no-discard row's pin is refused.
+///   consistent     the pinned split sums to the pinned total
+///   pinned         the row has both a total and a split
+///   has_reading    the run measured the spec (no reading is not zero: suite.rs)
+///   old, seen      the pinned and the measured totals
+///   channels_rose  how many channels the run saw above their pin (a channel absent counts as 0)
+pub fn discard_refusal(consistent: bool, pinned: bool, has_reading: bool, old: u32, seen: u32, channels_rose: u32) -> u8 {
+    if (pinned == false) { return RR_UNPINNED; }
+    if (consistent == false) { return RR_LEDGER_SELF; }
+    if (has_reading == false) { return RR_NO_READING; }
+    if (seen > old) { return RR_DISCARD_ROSE; }
+    if (channels_rose > 0) { return RR_CHANNEL_ROSE; }
+    return RR_NONE;
+}
+
+/// The steward's action on a parse-no-discard row that holds its phase. `channels_fell` is how many
+/// channels the run saw below their pin; with no channel risen, a split can move only by falling.
+pub fn discard_action(consistent: bool, pinned: bool, has_reading: bool, old: u32, seen: u32, channels_rose: u32, channels_fell: u32) -> u8 {
+    if (discard_refusal(consistent, pinned, has_reading, old, seen, channels_rose) != RR_NONE) { return ACT_REFUSE; }
+    if (seen < old) { return ACT_REPIN; }
+    if (channels_fell > 0) { return ACT_REPIN; }
+    return ACT_KEEP;
+}
+
+/// One row's action: the phase decides first, and only a row that keeps its phase has its pin read.
+/// A row of any other phase carries no pin, so its `discard` is KEEP.
+pub fn entry_action(row: u8, discard: u8) -> u8 {
+    if (row != ACT_KEEP) { return row; }
+    return discard;
+}
+
+/// The gate-failure pin: it falls with the run's count, and a rise or a missing pin is a person's.
+pub fn gate_refusal(pinned: bool, old: u32, seen: u32) -> u8 {
+    if (pinned == false) { return RR_GATE_UNPINNED; }
+    if (seen > old) { return RR_GATE_ROSE; }
+    return RR_NONE;
+}
+
+pub fn gate_action(pinned: bool, old: u32, seen: u32) -> u8 {
+    if (gate_refusal(pinned, old, seen) != RR_NONE) { return ACT_REFUSE; }
+    if (seen < old) { return ACT_REPIN; }
+    return ACT_KEEP;
+}
+
+/// Folds over one run's actions, grouped by action with `n` rows in the group.
+pub fn tally_refused(acc: u32, act: u8, n: u32) -> u32 {
+    if (act == ACT_REFUSE) { return acc + n; }
+    return acc;
+}
+
+pub fn tally_applied(acc: u32, act: u8, n: u32) -> u32 {
+    if (act == ACT_DROP) { return acc + n; }
+    if (act == ACT_REPIN) { return acc + n; }
+    return acc;
+}
+
+pub fn tally_drops(acc: u32, act: u8, n: u32) -> u32 {
+    if (act == ACT_DROP) { return acc + n; }
+    return acc;
+}
+
+pub fn drop_flood(drops: u32) -> bool {
+    return drops > DROP_LIMIT;
+}
+
+/// The composed ledger's row count: the steward only drops rows, so the count only falls.
+pub fn rows_after(rows_before: u32, drops: u32) -> u32 {
+    if (drops > rows_before) { return 0; }
+    return rows_before - drops;
+}
+
+/// The cap the composed ledger writes is its row count, and only when that holds or lowers the old
+/// cap (derived_data.t27 bot_may_bless). A ledger still over its cap after the drops needs a cap rise,
+/// which is a person's: the whole run is refused and the old cap stays.
+pub fn cap_fits(rows: u32, old_cap: u32) -> bool {
+    return bot_may_bless(old_cap, rows);
+}
+
+pub fn cap_after(rows: u32, old_cap: u32) -> u32 {
+    if (cap_fits(rows, old_cap)) { return rows; }
+    return old_cap;
+}
+
+/// A run the steward reads: a master run, whose t27c was built from that same commit (a lab binary
+/// older than master reported a false UNEXPECTED FAILURE on #10172's tree), whose ratchet reached its
+/// verdict (a crash before the Ratchet section leaves nothing to read), and whose ledger is the one
+/// master has now (otherwise its findings describe a file that is gone).
+pub fn run_stewardable(is_master: bool, same_compiler: bool, ratchet_ran: bool, same_ledger: bool) -> bool {
+    if (is_master == false) { return false; }
+    if (same_compiler == false) { return false; }
+    if (ratchet_ran == false) { return false; }
+    if (same_ledger == false) { return false; }
+    return true;
+}
+
+/// A refused row never holds back the steward's own: they are applied and the refused row stays.
+pub fn run_verdict(stewardable: bool, refused: u32, applied: u32, drops: u32, cap_ok: bool) -> u8 {
+    if (stewardable == false) { return RV_SKIP; }
+    if (drop_flood(drops)) { return RV_REFUSE; }
+    if (cap_ok == false) { return RV_REFUSE; }
+    if (applied > 0) { return RV_APPLY; }
+    if (refused > 0) { return RV_REFUSE; }
+    return RV_NOTHING;
+}
+
+/// The run-level reason the issue leads with when no single row was refused.
+pub fn run_refusal(refused: u32, drops: u32, cap_ok: bool) -> u8 {
+    if (refused > 0) { return RR_NONE; }
+    if (drop_flood(drops)) { return RR_DROP_FLOOD; }
+    if (cap_ok == false) { return RR_CAP_RISE; }
+    return RR_NONE;
+}
+
+/// Which effects a verdict runs: a refused run opens its issue and nothing else, an applied run its
+/// PR and nothing else.
+pub fn effect_wanted(verdict: u8, effect: u8) -> bool {
+    if (effect == EF_REFUSAL_ISSUE) { return verdict == RV_REFUSE; }
+    if (effect > EF_AUTO_MERGE) { return false; }
+    return verdict == RV_APPLY;
+}
+
+/// A run starts a steward job when it is a master run whose ratchet is red and no job was started
+/// for its commit yet.
+pub fn run_starts_job(is_master: bool, ratchet_red: bool, commit_seen: bool) -> bool {
+    if (is_master == false) { return false; }
+    if (ratchet_red == false) { return false; }
+    if (commit_seen) { return false; }
+    return true;
+}
+
+test pr_10172_applies_ten_rows_and_refuses_the_rise {
+    // #10172's run: seven igla/coder specs (#10101) and nn/attention (#10095) pass every phase
+    var drop : u8 = row_action(true, false, false, false);
+    assert drop == ACT_DROP;
+    // bench_proxy 738 -> 696: bdd-block-fallback 712 -> 696, stray-brace 1 -> 0, top-level-resync 25 -> 0
+    var bench_proxy : u8 = entry_action(row_action(true, true, true, false), discard_action(true, true, true, 738, 696, 0, 3));
+    assert bench_proxy == ACT_REPIN;
+    // prm 521 -> 520: stray-brace 1 -> 0, bdd-block-fallback held at 520
+    var prm : u8 = entry_action(row_action(true, true, true, false), discard_action(true, true, true, 521, 520, 0, 1));
+    assert prm == ACT_REPIN;
+    // benchmark 315 -> 319: bdd-block-fallback rose by 4; the hand PR raised the pin, the steward does not
+    var benchmark : u8 = entry_action(row_action(true, true, true, false), discard_action(true, true, true, 315, 319, 1, 0));
+    assert benchmark == ACT_REFUSE;
+    assert discard_refusal(true, true, true, 315, 319, 1) == RR_DISCARD_ROSE;
+    var refused : u32 = tally_refused(0, benchmark, 1);
+    var applied : u32 = tally_applied(0, drop, 8);
+    applied = tally_applied(applied, bench_proxy, 1);
+    applied = tally_applied(applied, prm, 1);
+    var drops : u32 = tally_drops(0, drop, 8);
+    drops = tally_drops(drops, bench_proxy, 1);
+    assert refused == 1;
+    assert applied == 10;
+    assert drops == 8;
+    // 81 rows, 8 dropped: the cap follows the count down, 81 -> 73
+    assert rows_after(81, drops) == 73;
+    assert cap_fits(73, 81) == true;
+    assert cap_after(73, 81) == 73;
+    assert run_verdict(run_stewardable(true, true, true, true), refused, applied, drops, cap_fits(73, 81)) == RV_APPLY;
+    assert effect_wanted(RV_APPLY, EF_PULL_REQUEST) == true;
+    assert effect_wanted(RV_APPLY, EF_REFUSAL_ISSUE) == false;
+}
+
+test pr_10172_benchmark_alone_is_a_persons {
+    // after the steward's PR, benchmark's rise is the only finding left: one issue, no PR
+    var benchmark : u8 = discard_action(true, true, true, 315, 319, 1, 0);
+    var refused : u32 = tally_refused(0, benchmark, 1);
+    var applied : u32 = tally_applied(0, benchmark, 1);
+    assert run_verdict(true, refused, applied, 0, cap_fits(73, 73)) == RV_REFUSE;
+    assert effect_wanted(RV_REFUSE, EF_REFUSAL_ISSUE) == true;
+    assert effect_wanted(RV_REFUSE, EF_COMPOSE) == false;
+}
+
+test pr_8345_repins_one_and_lowers_a_slack_cap {
+    // #8345: math/constants top-level-resync 37 -> 0, discard 386 -> 349; 71 rows under a cap of 74
+    var constants : u8 = entry_action(row_action(true, true, true, false), discard_action(true, true, true, 386, 349, 0, 1));
+    assert constants == ACT_REPIN;
+    var applied : u32 = tally_applied(0, constants, 1);
+    var drops : u32 = tally_drops(0, constants, 1);
+    assert drops == 0;
+    assert cap_after(rows_after(71, drops), 74) == 71;
+    assert run_verdict(true, 0, applied, drops, cap_fits(71, 74)) == RV_APPLY;
+}
+
+test pr_7804_and_6437_drop_their_passes {
+    // #7804: three GoldenFloat lesson specs pass every phase, 77 -> 74
+    var drops : u32 = tally_drops(0, row_action(true, false, false, false), 3);
+    assert rows_after(77, drops) == 74;
+    assert run_verdict(true, 0, tally_applied(0, ACT_DROP, 3), drops, cap_fits(74, 77)) == RV_APPLY;
+    // #6437: four rewritten specs, 113 -> 109
+    drops = tally_drops(0, ACT_DROP, 4);
+    assert cap_after(rows_after(113, drops), 113) == 109;
+}
+
+test night_tick_9281_is_refused {
+    // #9281: six ported specs fail codegen with no row, and the ledger already held 77 under a cap of 75
+    var fresh : u8 = row_action(false, true, false, false);
+    assert fresh == ACT_REFUSE;
+    assert row_refusal(false, true, false, false) == RR_NEW_FAILURE;
+    var refused : u32 = tally_refused(0, fresh, 6);
+    assert refused == 6;
+    // the new rows are never written, so the count stays 77, and 77 over 75 is a cap rise
+    assert cap_fits(rows_after(77, 0), 75) == false;
+    assert cap_after(77, 75) == 75;
+    assert run_verdict(true, refused, 0, 0, false) == RV_REFUSE;
+}
+
+test pr_8823_two_new_failures_are_refused {
+    // #8823: gen_w698 and railway fail gen-verilog with no row (72 -> 74 by hand)
+    var refused : u32 = tally_refused(0, row_action(false, true, false, false), 2);
+    assert refused == 2;
+    assert run_verdict(true, refused, 0, 0, cap_fits(72, 72)) == RV_REFUSE;
+    assert run_refusal(refused, 0, true) == RR_NONE;
+}
+
+test pr_5497_is_a_drop_flood {
+    // #5497: 51 rows passed after a parser change, 6 moved one phase later, 33 ports failed with no row
+    var drops : u32 = tally_drops(0, ACT_DROP, 51);
+    var refused : u32 = tally_refused(0, row_action(true, true, false, false), 6);
+    refused = tally_refused(refused, row_action(false, true, false, false), 33);
+    assert row_refusal(true, true, false, false) == RR_MOVED;
+    assert drops == 51;
+    assert refused == 39;
+    assert drop_flood(drops) == true;
+    assert run_verdict(true, refused, 56, drops, cap_fits(rows_after(151, drops), 151)) == RV_REFUSE;
+    assert run_refusal(0, drops, true) == RR_DROP_FLOOD;
+    assert run_verdict(true, 0, DROP_LIMIT, DROP_LIMIT, true) == RV_APPLY;
+}
+
+test the_steward_refuses_these {
+    // a discard rise, however small
+    assert discard_action(true, true, true, 220, 221, 1, 0) == ACT_REFUSE;
+    // a channel that rose while the total fell: one defect swapped for another
+    assert discard_refusal(true, true, true, 100, 90, 1) == RR_CHANNEL_ROSE;
+    assert discard_action(true, true, true, 100, 90, 1, 2) == ACT_REFUSE;
+    // a pinned row the run took no reading of: silence is not zero
+    assert discard_refusal(true, true, false, 52, 0, 0) == RR_NO_READING;
+    // no bound, or a bound that disagrees with itself
+    assert discard_refusal(true, false, true, 0, 30, 0) == RR_UNPINNED;
+    assert discard_refusal(false, true, true, 30, 30, 0) == RR_LEDGER_SELF;
+    // an expired row that still fails: renewing it needs a reason
+    assert row_refusal(true, true, true, true) == RR_EXPIRED;
+    assert row_action(true, true, true, true) == ACT_REFUSE;
+    // the gate-failure count
+    assert gate_refusal(true, 2, 3) == RR_GATE_ROSE;
+    assert gate_refusal(false, 0, 2) == RR_GATE_UNPINNED;
+    assert gate_action(true, 2, 3) == ACT_REFUSE;
+}
+
+test the_steward_applies_these {
+    // a passing row is dropped even past its date: nothing is left to renew
+    assert row_action(true, false, false, true) == ACT_DROP;
+    assert row_refusal(true, false, false, true) == RR_NONE;
+    // a row that holds is kept, and a spec with no row that passes is no finding
+    assert row_action(true, true, true, false) == ACT_KEEP;
+    assert row_action(false, false, false, false) == ACT_KEEP;
+    assert discard_action(true, true, true, 52, 52, 0, 0) == ACT_KEEP;
+    // the gate-failure pin follows the count down
+    assert gate_action(true, 2, 1) == ACT_REPIN;
+    assert gate_action(true, 2, 2) == ACT_KEEP;
+    // the phase decides before the pin
+    assert entry_action(ACT_DROP, ACT_REFUSE) == ACT_DROP;
+    assert entry_action(ACT_REFUSE, ACT_REPIN) == ACT_REFUSE;
+    assert entry_action(ACT_KEEP, ACT_REPIN) == ACT_REPIN;
+    assert tally_applied(3, ACT_KEEP, 2) == 3;
+    assert tally_refused(3, ACT_REPIN, 2) == 3;
+}
+
+test only_a_master_run_of_its_own_compiler_is_read {
+    assert run_stewardable(true, true, true, true) == true;
+    assert run_stewardable(false, true, true, true) == false;
+    // #10172's lab binary predated #10084 and saw verilog_odd_cast fail parse; CI's master build did not
+    assert run_stewardable(true, false, true, true) == false;
+    assert run_stewardable(true, true, false, true) == false;
+    assert run_stewardable(true, true, true, false) == false;
+    assert run_verdict(run_stewardable(true, false, true, true), 1, 10, 8, true) == RV_SKIP;
+    assert run_verdict(true, 0, 0, 0, true) == RV_NOTHING;
+    assert effect_wanted(RV_NOTHING, EF_COMPOSE) == false;
+    assert effect_wanted(RV_SKIP, EF_REFUSAL_ISSUE) == false;
+    assert effect_wanted(RV_APPLY, EF_AUTO_MERGE + 1) == false;
+    assert rows_after(3, 5) == 0;
+}
+
+test a_red_master_run_starts_one_job {
+    assert run_starts_job(true, true, false) == true;
+    assert run_starts_job(true, true, true) == false;
+    assert run_starts_job(true, false, false) == false;
+    assert run_starts_job(false, true, false) == false;
+}
+
+// derived_data.t27 rule 4: the bot never writes a cap rise. Its bot_may_bless and this cap agree.
+invariant the_cap_never_rises {
+    assert cap_fits(74, 73) == false;
+    assert cap_after(74, 73) == 73;
+    assert cap_fits(73, 73) == true;
+    assert bot_may_bless(81, 73) == cap_fits(73, 81);
+    assert cap_after(0, 5) == 0;
+}
+
+invariant a_rise_or_a_new_failure_is_never_applied {
+    assert row_action(false, true, false, false) == ACT_REFUSE;
+    assert row_action(false, true, true, false) == ACT_REFUSE;
+    assert row_action(true, true, false, false) == ACT_REFUSE;
+    assert discard_action(true, true, true, 0, 1, 0, 0) == ACT_REFUSE;
+    assert discard_action(true, true, true, 10, 10, 1, 1) == ACT_REFUSE;
+    assert gate_action(true, 0, 1) == ACT_REFUSE;
+    assert tally_applied(0, ACT_REFUSE, 9) == 0;
+}
+
+invariant the_steward_codes_never_move {
+    assert ACT_KEEP == 0;
+    assert ACT_DROP == 1;
+    assert ACT_REPIN == 2;
+    assert ACT_REFUSE == 3;
+    assert RV_NOTHING == 0;
+    assert RV_APPLY == 1;
+    assert RV_REFUSE == 2;
+    assert RV_SKIP == 3;
+    assert RR_DROP_FLOOD == 12;
+    assert EF_AUTO_MERGE == 4;
+    assert DROP_LIMIT == 16;
+}
