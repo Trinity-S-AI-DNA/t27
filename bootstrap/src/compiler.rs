@@ -20174,6 +20174,23 @@ long double: fabsl, default: llabs)(x)",
         false
     }
 
+    /// The C element type of an untyped array literal (#11183): its own, a numeric or call list's, a struct literal's, else its first non-number element's.
+    fn c_list_elem(&mut self, lit: &Node) -> String {
+        if !lit.extra_type.is_empty() { return lit.extra_type.clone(); }
+        if let Some(t) = Self::c_literal_list_elem(lit).or_else(|| self.c_call_list_elem(lit)) { return t; }
+        let pick = lit.children.iter().find(|e| e.kind != NodeKind::ExprUnary && !(e.kind == NodeKind::ExprLiteral && e.value.starts_with(|c: char| c.is_ascii_digit()))).or(lit.children.first());
+        match pick {
+            Some(e) if e.kind == NodeKind::ExprStructLit => e.name.clone(),
+            Some(e) => {
+                let saved = std::mem::take(&mut self.output);
+                self.gen_c_expr(e);
+                let text = std::mem::replace(&mut self.output, saved);
+                if e.extra_kind == "string" { "str".to_string() } else { format!("__typeof__({text})") }
+            }
+            None => format!("__typeof__({})", lit.extra_size.trim()),
+        }
+    }
+
     fn gen_c_const(&mut self, node: &Node) {
         // Detect type alias pattern: ConstDecl with single ExprIdentifier child
         // that looks like a type name (e.g., pub const PackedTrit = u8;)
@@ -20277,9 +20294,14 @@ long double: fabsl, default: llabs)(x)",
                 // builds it rather than a fourth copy of the rule: parameters
                 // want `T x[static N]` (#3435), fields and now consts want
                 // `T name[N]` (#3446), and a local wants it too (#3448).
-                match Self::c_module_array_decl(&node.extra_type, &node.name) {
-                    Some(decl) => self.write(&format!("static const {} = ", decl)),
-                    None => self.write(&format!("static const {} {} = ", c_type, node.name)),
+                if node.extra_type.is_empty() && child.children.first().is_some_and(|e| child.kind == NodeKind::ExprArrayLiteral && !matches!(e.kind, NodeKind::ExprArrayLiteral | NodeKind::ExprStructLit | NodeKind::ExprTuple)) {
+                    let elem = self.c_list_elem(child); // #11183: an untyped list constant is an array, not an `int`
+                    self.write(&format!("static {} const {}[{}] = ", Self::type_to_c(&elem), node.name, child.children.len()));
+                } else {
+                    match Self::c_module_array_decl(&node.extra_type, &node.name) {
+                        Some(decl) => self.write(&format!("static const {} = ", decl)),
+                        None => self.write(&format!("static const {} {} = ", c_type, node.name)),
+                    }
                 }
                 self.gen_c_expr(child);
                 self.write_line(";");
@@ -21560,13 +21582,13 @@ long double: fabsl, default: llabs)(x)",
                             None => ("", elem),
                         };
                         let c_elem = format!("{}{}", qual, Self::type_to_c(elem));
-                        if size.is_empty() && node.children.is_empty() {
+                        if size.is_empty() && node.children.first().map_or(true, |c| c.kind == NodeKind::ExprIndex) {
                             // A slice `[]T` has no compile-time length, and
                             // `uint8_t x[];` is not a definition -- clang says
                             // "definition of variable with array type needs an
                             // explicit size or an initializer".
                             //
-                            // ONLY when there is no initialiser. `T x[] = {…}`
+                            // ONLY when there is no initialiser, or a slice of one (#11183: a range slice is a pointer). `T x[] = {…}`
                             // is legal C and takes its size from the list, and
                             // rewriting that to `T* x = {…}` made the one
                             // corpus file carrying the shape WORSE -- measured,
@@ -21653,7 +21675,9 @@ long double: fabsl, default: llabs)(x)",
                                     || Self::c_literal_list_elem(c).is_some()
                                     // ... and a list of calls, whose element
                                     // type is a LOOKUP in `fn_return_types`.
-                                    || self.c_call_list_elem(c).is_some())
+                                    || self.c_call_list_elem(c).is_some()
+                                    || (c.children.first().is_some_and(|e| !matches!(e.kind, NodeKind::ExprArrayLiteral | NodeKind::ExprStructLit | NodeKind::ExprTuple)) && c.children.iter().any(|e| e.kind != NodeKind::ExprCall || e.name.starts_with('@')))
+                                    || (c.children.is_empty() && !c.extra_size.contains([';', ',']))) // #11183
                         })
                 {
                     // W699 rung 3: `const vals = [_]i32{...}` has no annotation,
@@ -21662,17 +21686,7 @@ long double: fabsl, default: llabs)(x)",
                     // '__auto_type' with initializer list". The literal carries
                     // its own element type and its own length; use them.
                     let lit = node.children.first().unwrap();
-                    let elem: String = if !lit.extra_type.is_empty() {
-                        lit.extra_type.clone()
-                    } else if let Some(t) = Self::c_literal_list_elem(lit) {
-                        t
-                    } else if let Some(t) = self.c_call_list_elem(lit) {
-                        t
-                    } else {
-                        // Recovered from the first element; the condition above
-                        // established it is a named struct literal.
-                        lit.children.first().map(|e| e.name.clone()).unwrap_or_default()
-                    };
+                    let elem = self.c_list_elem(lit);
                     // W583, third instance. The `is_primitive` gate lists only
                     // the integer scalars, so `f32`, `f64`, `str` and `gf16`
                     // took the pass-through arm; `type_to_c` passes a genuinely
@@ -22632,6 +22646,12 @@ long double: fabsl, default: llabs)(x)",
             }
             NodeKind::ExprIndex => {
                 if node.children.len() >= 2 {
+                    // #11183: `a[lo..hi]`, `a[lo..]`, `a[lo:hi]` is a slice, and a slice is a pointer in C (its length is lost
+                    // where every `[]T` loses it, D4): the address of element `lo`, not `a[lo]` and not `a[(lo .. hi)]`.
+                    let r = &node.children[1];
+                    let range = r.kind == NodeKind::ExprBinary && r.extra_op == ".." && r.children.len() == 2;
+                    let slice = range || node.extra_op.starts_with("slice");
+                    self.write(if slice { "(" } else { "" });
                     self.gen_c_expr(&node.children[0]);
                     // [T; N] values are by-value structs: index the .v member.
                     if node.children[0].kind == NodeKind::ExprIdentifier
@@ -22639,9 +22659,9 @@ long double: fabsl, default: llabs)(x)",
                     {
                         self.write(".v");
                     }
-                    self.write("[");
-                    self.gen_c_expr(&node.children[1]);
-                    self.write("]");
+                    self.write(if slice { " + " } else { "[" });
+                    self.gen_c_expr(if range { &r.children[0] } else { r });
+                    self.write(if slice { ")" } else { "]" });
                 }
             }
             NodeKind::ExprSwitch => {
@@ -28630,15 +28650,12 @@ impl RustCodegen {
                         None
                     }
                 }),
-            // The FIELD form `x.len` is lowered to `x.len()` (see the
-            // ExprFieldAccess arm of `expr_to_rust`) and is just as `usize`, but
-            // only the CALL form above was known, so `k < text.len` with a u32
-            // `k` reached rustc uncast: E0308, six times in specs/isa/t27a.t27
-            // (#6507). Same field-census guard as the lowering itself.
+            // The FIELD form `x.len` is lowered to `x.len()` (see `expr_to_rust`) and is just as `usize`: `k < text.len`
+            // with a u32 `k` reached rustc uncast, E0308, six times in specs/isa/t27a.t27 (#6507). Same guard as the lowering.
             NodeKind::ExprFieldAccess
                 if node.name == "len"
                     && !node.children.is_empty()
-                    && !self.field_names.contains("len") =>
+                    && self.len_is_method(&node.children[0]) =>
             {
                 Some("usize".to_string())
             }
@@ -28712,15 +28729,25 @@ impl RustCodegen {
     /// to have the *same* integer type; t27 does not. Cast the narrower side up
     /// so the emitted operator compiles. Shifts are exempt — Rust already
     /// accepts any integer type as the shift amount.
-    fn rust_type_of(&self, n: &Node) -> Option<&str> { // #8971: the declared Rust type of a name
-        self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).filter(|_| n.kind == NodeKind::ExprIdentifier).map(|t| t.as_str())
+    fn rust_type_of(&self, n: &Node) -> Option<String> { // #8971, #11182: the declared Rust type of a name, a typed field or an element
+        let t = match (&n.kind, n.children.first()) {
+            (NodeKind::ExprIdentifier, _) => return self.var_types.get(&n.name).or_else(|| self.const_types.get(&n.name)).cloned(),
+            (NodeKind::ExprCall, _) => return self.fn_ret_types.get(&n.name).cloned(),
+            (NodeKind::ExprFieldAccess, Some(b)) => return self.decl_types.get(&format!("{}.{}", self.rust_type_of(b)?.trim_start_matches("*mut "), n.name)).cloned(),
+            (NodeKind::ExprIndex, Some(b)) if n.children.get(1).is_some_and(|i| i.extra_op != "..") => self.rust_type_of(b)?,
+            _ => return None,
+        };
+        t.strip_prefix("Vec<").and_then(|r| r.strip_suffix('>')).or_else(|| t.strip_prefix('[')?.rsplit_once(';').map(|x| x.0)).map(str::to_string)
     }
+
+    /// #11182: `x.len` is a length METHOD unless `x` is a struct with a field `len`; with one in the file the base's declared type decides.
+    fn len_is_method(&self, base: &Node) -> bool { !self.field_names.contains("len") || self.rust_type_of(base).is_some_and(|t| ["Vec<", "[", "&[", "&mut [", "&'static str"].iter().any(|p| t.starts_with(p))) }
 
     fn coerce_binary_operands(&self, node: &Node, left: &mut String, right: &mut String) {
         let text = |n: &Node, s: &mut String| if n.kind == NodeKind::ExprLiteral && n.extra_kind == "string" { s.insert(0, 'b') }
-            else if self.rust_type_of(n) == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
-        if self.rust_type_of(&node.children[0]) == Some("&[u8]") { text(&node.children[1], right) }
-        if self.rust_type_of(&node.children[1]) == Some("&[u8]") { text(&node.children[0], left) }
+            else if self.rust_type_of(n).as_deref() == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
+        if self.rust_type_of(&node.children[0]).as_deref() == Some("&[u8]") { text(&node.children[1], right) }
+        if self.rust_type_of(&node.children[1]).as_deref() == Some("&[u8]") { text(&node.children[0], left) }
         if matches!(node.extra_op.as_str(), "<<" | ">>") {
             return;
         }
@@ -28898,18 +28925,8 @@ impl RustCodegen {
                 // slice length as a field, so specs write both `x.len` and
                 // `len(x)`; the second reached rustc as a call to a function
                 // that does not exist -- 38 of the corpus's E0425 diagnostics.
-                // Two guards, and the code checks both: `declared_fns` because
-                // 3 specs declare their own `fn len`, and `field_names` because
-                // 6 declare a struct field named `len`. The second is stricter
-                // than this form strictly needs -- a free `len(x)` is a length
-                // call even in a file that also has a `len` field -- and it is
-                // kept deliberately so both spellings answer to one condition
-                // rather than drifting apart.
-                if node.name == "len"
-                    && args.len() == 1
-                    && !self.declared_fns.contains("len")
-                    && !self.field_names.contains("len")
-                {
+                // Guarded by `declared_fns` (3 specs declare their own `fn len`), not by a `len` field (#11182).
+                if node.name == "len" && args.len() == 1 && !self.declared_fns.contains("len") {
                     return format!("({}).len()", args[0]);
                 }
                 if let Some(callee_params) = self.param_names.get(&node.name) {
@@ -28932,7 +28949,7 @@ impl RustCodegen {
                     for (i, a) in args.iter_mut().enumerate() {
                         let (Some((_, t)), Some(c)) = (callee_params.get(i), node.children.get(i)) else { continue };
                         let t = t.trim();
-                        if t == "[]const u8" && self.rust_type_of(c) == Some("&'static str") {
+                        if t == "[]const u8" && self.rust_type_of(c).as_deref() == Some("&'static str") {
                             a.push_str(".as_bytes()");
                         } else if c.kind == NodeKind::ExprUnary && c.extra_op == "&" && t.starts_with('*')
                             && !t[1..].trim_start().starts_with("const ")
@@ -29146,18 +29163,9 @@ impl RustCodegen {
                             format!("(*{})", base)
                         } else if node.name == "?" {
                             format!("{}.unwrap()", base)
-                        } else if node.name == "len" && !self.field_names.contains("len") {
-                            // Zig exposes a slice length as the FIELD `.len` and
-                            // specs are written in that shape, so `data.len`
-                            // reached rustc verbatim: "attempted to take value
-                            // of method `len`" (E0615, 26 diagnostics). Rust
-                            // spells it as a method. The Zig backend documents
-                            // the mirror image of this at its own `.len` site.
-                            //
-                            // Guarded by the whole-file field census: 6 corpus
-                            // specs declare a struct field genuinely named
-                            // `len`, and in those files the access is a field
-                            // and must stay one.
+                        } else if node.name == "len" && self.len_is_method(&node.children[0]) {
+                            // Zig's slice length is the FIELD `.len`; Rust's is a method (E0615, 26 diagnostics). A struct
+                            // field named `len` (6 corpus specs) stays a field; `len_is_method` tells them apart (#11182).
                             format!("{}.len()", base)
                         } else {
                             format!("{}.{}", base, rust_ident(&node.name))
@@ -29176,14 +29184,7 @@ impl RustCodegen {
                     // times in specs/isa/t27a.t27, #6507). The bytes are what the
                     // spec means, and `.as_bytes()` is the zero-cost view.
                     let base_node = &node.children[0];
-                    if base_node.kind == NodeKind::ExprIdentifier
-                        && self
-                            .var_types
-                            .get(&base_node.name)
-                            .or_else(|| self.const_types.get(&base_node.name))
-                            .map(|t| t == "&'static str")
-                            .unwrap_or(false)
-                    {
+                    if self.rust_type_of(base_node).is_some_and(|t| t == "&'static str") && (base_node.kind == NodeKind::ExprIdentifier || node.children[1].extra_op != "..") {
                         base = format!("{}.as_bytes()", base);
                     }
                     let idx = &node.children[1];

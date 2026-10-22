@@ -407,12 +407,51 @@ pub fn lg_lam(t: []const u32, vg: u32, vd: u32) -> u32 {
     return read_w(t, 1, vg, vd, LG_GBITS, LG_DBITS, LG_NG, LG_ND);
 }
 
+/// The current in IUNIT from a log word lam and an rv word at the drain voltage dv (units of 2^-24 V): F * 2^(lam / 2^16), both rounded. The common tail of `lg_fine` (lam read from
+/// one table) and `lg_fine_vsb` (lam blended from two slices along the source-to-bulk axis), so the two cannot drift apart.
+pub fn lg_cur(lam: u32, rv: u64, dv: u32) -> u64 {
+    const x24 : u64 = (((dv as u64) * rv) + 2048) >> 12;
+    return (exp2_lam(lam) * vds_factor(x24) + 8388608) >> 24;
+}
+
 /// Id(vg, vd) of a log table in IUNIT = 2^-8 of a linear-table word (1.164 pA): F * 2^(lam / 2^16), both rounded. The largest, 402 uA, is 3.5e8 under 2^29.
 pub fn lg_fine(t: []const u32, vg: u32, vd: u32) -> u64 {
     const gv : u32 = lim(vg);
     const dv : u32 = lim(vd);
-    const x24 : u64 = (((dv as u64) * lg_rv(t, gv)) + 2048) >> 12;
-    return (exp2_lam(lg_lam(t, gv, dv)) * vds_factor(x24) + 8388608) >> 24;
+    return lg_cur(lg_lam(t, gv, dv), lg_rv(t, gv), dv);
+}
+
+; --- the source-to-bulk axis (M3e, #11283): the log table read as a function of three voltages -------------------------------------------------------------------------------------
+; The 2-D tables have each bulk tied to its source, so they hold no body effect; a device whose bulk sits on a rail while its source moves (the transmission gate's two devices) is
+; read at a source-to-bulk voltage Vsb > 0. The third axis is a stack of LG_NV + 1 = 7 log tables (the slices) at Vsb = k * 2^22 units = k * 0.25 V, k = 0 .. 6, each a legal log
+; table of its own (tag word, 4753 log words, 97 rv words), the slice 0 being the 2-D table itself. The read of a point is the read of the two slices around its Vsb with the LOG
+; WORD blended linearly between them (`blend1_w`, weights 2^22): the weak-inversion current is exponential in the threshold, and the threshold moves with Vsb nearly linearly over a
+; slice, so the blend of the log word is the right one (a blend of the currents would be a chord of an exponential). At Vsb = 0 the weight of the second slice is 0 and the read is the
+; 2-D read bit for bit (`blend1_w` with f = 0 returns d0: the rounding half is below the weight 2^22), a test. rv is a function of Vgs only, the same in every slice, and is read from
+; the first slice of the pair. The slices of a device are the arguments, not a global, so that the tables of another corner or temperature can use the same read.
+/// The Vsb axis: 2^22 units (0.25 V) per cell, 6 cells, 7 slices.
+pub const LG_VBITS : u32 = 22;
+pub const LG_NV : u32 = 6;
+
+/// The cell of a source-to-bulk voltage on the axis (0 .. 5): the top slice's voltage belongs to the last cell; a voltage above the supply is the supply.
+pub fn lg_vsb_cell(vsb: u32) -> u32 {
+    return cell_w(lim(vsb), LG_VBITS, LG_NV);
+}
+
+/// The position of a source-to-bulk voltage in its cell, 0 .. 2^22 (2^22 only at the top of the axis).
+pub fn lg_vsb_frac(vsb: u32) -> u32 {
+    const v : u32 = lim(vsb);
+    return v - (cell_w(v, LG_VBITS, LG_NV) << LG_VBITS);
+}
+
+/// Id(vg, vd) at a source-to-bulk voltage a fraction fz (0 .. 2^22) of the way from the slice ta to the slice tb: the log word of the two slices blended with weights 2^22, then the
+/// same tail as `lg_fine`. fz = 0 is `lg_fine(ta, vg, vd)` exactly, fz = 2^22 is `lg_fine(tb, vg, vd)` exactly.
+pub fn lg_fine_vsb(ta: []const u32, tb: []const u32, vg: u32, vd: u32, fz: u32) -> u64 {
+    const gv : u32 = lim(vg);
+    const dv : u32 = lim(vd);
+    const la : u64 = (lg_lam(ta, gv, dv)) as u64;
+    const lb : u64 = (lg_lam(tb, gv, dv)) as u64;
+    return lg_cur(blend1_w(la, lb, fz, LG_VBITS) as u32, lg_rv(ta, gv), dv);
 }
 
 /// Id(vg, vd) of a log table in table units (words of 298 pA), rounded half up: what the Newton step adds.
@@ -1599,4 +1638,78 @@ test a_synthetic_log_table_gives_the_closed_form_value_and_slope {
     assert gds_log(&tabp, 12000000, 3000000) > 0;
     assert_eq(gds_log(&tabz, 12000000, 3000000), 0);
     assert lg_fine(&tabz, 12000000, 3000000) > 0;
+}
+
+test the_source_to_bulk_read_blends_the_log_word_between_two_slices_and_is_the_2d_read_at_the_ends {
+    // M3e (#11283). Two slices of one synthetic device: the log word of the first is L0 + 8192 ix, the second's is 65536 higher (a factor 2 in the current), rv = 50000 in both. So the
+    // current at a fraction fz of the way is F 2^(lam / 65536) with lam = L0 + vg / 32 + fz / 64 (fz in units of 2^-22 of a slice: 65536 / 2^22 = 1 / 64).
+    var ta : [4851]u32 = [0] ** 4851;
+    var tb : [4851]u32 = [0] ** 4851;
+    ta[0] = LG_TAG;
+    tb[0] = LG_TAG;
+    var ix : u32 = 0;
+    while (ix < 97) {
+        var iy : u32 = 0;
+        while (iy < 49) {
+            const at : usize = (1 + ix * 49 + iy) as usize;
+            ta[at] = 700000 + 8192 * ix;
+            tb[at] = 765536 + 8192 * ix;
+            iy = iy + 1;
+        }
+        ta[(4754 + ix) as usize] = 50000;
+        tb[(4754 + ix) as usize] = 50000;
+        ix = ix + 1;
+    }
+    var full : u32 = 4194304;
+    var half : u32 = 2097152;
+    var worst : f64 = 0.0;
+    var at_ends : u32 = 0;
+    var rising : u32 = 0;
+    var checked : u32 = 0;
+    var vg : u32 = 100000;
+    while (vg < VDD) {
+        var vd : u32 = 70000;
+        while (vd < VDD) {
+            // the two ends are the 2-D reads of the slices, exactly
+            if (lg_fine_vsb(&ta, &tb, vg, vd, 0) == lg_fine(&ta, vg, vd)) { at_ends = at_ends + 1; }
+            if (lg_fine_vsb(&ta, &tb, vg, vd, full) == lg_fine(&tb, vg, vd)) { at_ends = at_ends + 1; }
+            // the middle is the closed form: the rounding of an integer (half) and a part in 1e5 of the value
+            const x : f64 = (vd as f64) * 50000.0 / 68719476736.0;
+            const f : f64 = 1.0 - exp_f64(0.0 - x);
+            const lamh : f64 = 700000.0 + (vg as f64) / 32.0 + 32768.0;
+            const eh : f64 = exp_f64(lamh * 0.6931471805599453 / 65536.0);
+            worst = fmax64(worst, fabs64(((lg_fine_vsb(&ta, &tb, vg, vd, half)) as f64) - f * eh) - 0.00007 * f * eh);
+            // and the current rises with the fraction (the second slice is the higher)
+            if (lg_fine_vsb(&ta, &tb, vg, vd, half) > lg_fine_vsb(&ta, &tb, vg, vd, 1048576)) { rising = rising + 1; }
+            checked = checked + 1;
+            vd = vd + 1700003;
+        }
+        vg = vg + 1300007;
+    }
+    assert checked > 100;
+    assert_eq(at_ends, 2 * checked);
+    assert_eq(rising, checked);
+    assert worst < 1.01;
+    // NEGATIVE CONTROL: the slices in each other's places read the other end (the second slice is twice the first), so a swap is seen at both ends
+    assert lg_fine_vsb(&tb, &ta, 12000000, 3000000, 0) != lg_fine_vsb(&ta, &tb, 12000000, 3000000, 0);
+    assert lg_fine_vsb(&tb, &ta, 12000000, 3000000, 0) > lg_fine_vsb(&ta, &tb, 12000000, 3000000, 0);
+    // the cell and the position of a source-to-bulk voltage: 0.25 V = 2^22 units, the top of the axis is the end of the last cell, and a voltage above the supply is the supply
+    var v0 : u32 = 0;
+    var v1 : u32 = 4194303;
+    var v2 : u32 = 4194304;
+    var v3 : u32 = 10000000;
+    var top : u32 = VDD;
+    var over : u32 = VDD + 5;
+    assert_eq(lg_vsb_cell(v0), 0);
+    assert_eq(lg_vsb_frac(v0), 0);
+    assert_eq(lg_vsb_cell(v1), 0);
+    assert_eq(lg_vsb_frac(v1), 4194303);
+    assert_eq(lg_vsb_cell(v2), 1);
+    assert_eq(lg_vsb_frac(v2), 0);
+    assert_eq(lg_vsb_cell(v3), 2);
+    assert_eq(lg_vsb_frac(v3), 1611392);
+    assert_eq(lg_vsb_cell(top), 5);
+    assert_eq(lg_vsb_frac(top), 4194304);
+    assert_eq(lg_vsb_cell(over), 5);
+    assert_eq(lg_vsb_frac(over), 4194304);
 }
