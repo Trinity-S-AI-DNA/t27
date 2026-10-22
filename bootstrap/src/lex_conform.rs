@@ -300,6 +300,12 @@ pub const CASES: &[Case] = &[
         note: "BOUNDARY: \\n is unescaped in the lexeme, so a backend must RE-escape it",
         boundary: true,
     },
+    Case {
+        input: "\"\\xD0\\x96\"",
+        expect: &[(TokenKind::String, "\u{d0}\u{96}")],
+        note: "BOUNDARY (#10793): \\xNN is one byte, held as the char of that value",
+        boundary: true,
+    },
 ];
 
 /// Run every case; return only those whose tokenisation differs.

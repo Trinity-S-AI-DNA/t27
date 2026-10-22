@@ -5602,8 +5602,8 @@ mod unresolved_is_not_a_rejection {
 
 /// #8095 step 3: every spec under specs/, REUSE or why it must be rebuilt. Each decision is the generated
 /// specs/verified/seal_identity.t27 node_decision(); this walks the `use` graph only (#8102 blocks frontier.t27).
-pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -> anyhow::Result<()> {
-    use crate::{gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
+pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool, only: Vec<String>, since: Option<String>) -> anyhow::Result<()> {
+    use crate::{affected, frontier_scope as sc, gen_hash_cache as gc, seal_identity as si, verdict_audit as va, watch as wt};
     let (mut tc, mut memo, mut stack, mut specs) = (crate::seal_toolchain(), std::collections::HashMap::new(), vec![std::path::PathBuf::from("specs")], Vec::new());
     tc["gen_cache_bin"] = std::fs::read(std::env::current_exe()?).map(|b| crate::sha256_hex(&b)).unwrap_or_default().into(); // #8737: the generator's identity
     // #8928: one directory per binary; keep the current one and the newest others (gen_cache_keep), drop the rest and the old flat files
@@ -5648,13 +5648,14 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         memo.insert(p.to_string(), d);
         Some(d)
     }
-    let mut counts = [0u32; 7];
-    specs.sort();
+    let mut counts = [0u32; 7]; specs.sort();
+    // #10236: --only / --since walk the specs frontier_scope.t27 picks (affected.t27: the seeds and their transitive importers), not the corpus; each closure is still read in full
+    let diff = sc::scope_wanted(!only.is_empty(), since.is_some()).then(|| -> anyhow::Result<String> { Ok(match &since { Some(r) => { let o = std::process::Command::new("git").args(["diff", "--name-status", r]).output()?; anyhow::ensure!(o.status.success(), "git diff --name-status {r} failed"); String::from_utf8_lossy(&o.stdout).into_owned() } None => only.iter().map(|o| format!("M\t{o}\n")).collect() }) }).transpose()?;
+    if let Some(d) = diff { let (all, edges) = (specs.len(), specs.iter().flat_map(|p| std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| l.trim().strip_prefix("use ")).map(|u| format!("{p}\t{}\n", crate::use_spec_path(u))).collect::<Vec<_>>()).collect::<String>()); let buf = format!("{d}--graph\n{edges}--corpus\n{}", specs.iter().map(|p| format!("{p}\n")).collect::<String>()); let (mut set, mut out) = (vec![0u8; buf.len() + 1], vec![0u8; buf.len() + 1]); let k = affected::select_affected(buf.as_bytes(), buf.len(), &mut set, buf.len() + 1, &mut out, buf.len() + 1); let narrows = sc::scope_narrows(k, affected::RUN_ALL); if narrows { let keep: std::collections::HashSet<&str> = std::str::from_utf8(&out).unwrap_or("").lines().collect(); specs.retain(|p| keep.contains(p.as_str())) } println!("frontier: scope {}", if narrows { format!("{k} of {all} specs") } else { "the whole corpus (a changed path outside specs/ cannot be judged)".into() }) }
     // #8846: a cold walk first fills the gen-hash cache with suite_jobs() workers (8 MiB stacks); decide() reads it
     crate::suite::par_in_order(&specs, |p: &String| { gen_cached(p, &tc); });
     for p in &specs { let d = decide(p, &tc, &mut memo, 0).unwrap_or(si::REBUILD_MISSING); counts[d as usize] += 1; if list && d != si::REUSE { println!("{d} {p}") } }
-    let total = specs.len() as u32;
-    println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], total, si::reused_permille(counts[0], total), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
+    println!("frontier: reused {} of {} ({} permille); rebuild: spec {} closure {} toolchain {} config {} verdict {} missing {}", counts[0], specs.len(), si::reused_permille(counts[0], specs.len() as u32), counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
     // --reseal (#8095): seal again what remint_wants names; keep the new seal only where remint_keeps allows,
     // copied onto every twin, else write the old seal back. `seal` exits on a refusal, so it runs as a child.
     let mut twins: std::collections::HashMap<String, Vec<std::path::PathBuf>> = Default::default();
@@ -5671,7 +5672,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         let keep = sealed && si::remint_keeps(new["seal_schema"].as_u64().unwrap_or(0) as u32, new.pointer("/tests/failed").and_then(|v| v.as_u64()) == Some(0), new.pointer("/tests/forced").and_then(|v| v.as_bool()) == Some(true), new.pointer("/tests/total").and_then(|v| v.as_u64()).unwrap_or(0) as u32, src.lines().filter(|l| l.trim_start().starts_with("invariant ")).count() as u32, new.pointer("/tests/vacuous").and_then(|v| v.as_u64()).unwrap_or(0) as u32, !old.iter().any(|(f, _, mine)| f == &primary && !mine));
         let same = |o: &str| serde_json::from_str::<serde_json::Value>(o).map_or(false, |mut v| { v["sealed_at"] = new["sealed_at"].clone(); v["built_by"] = new["built_by"].clone(); v == new }); // only when and by which build: no change
         if !keep && !old.iter().any(|(f, ..)| f == &primary) { let _ = std::fs::remove_file(&primary); }
-        for (f, o, mine) in &old { std::fs::write(f, if keep && *mine && !same(o) { serde_json::to_string_pretty(&new)? } else { o.clone() })? }
+        for (f, o, mine) in &old { let b = if keep && *mine && !same(o) { serde_json::to_string_pretty(&new)? } else { o.clone() }; anyhow::ensure!(crate::write_seal_atomic(f, b.as_bytes(), crate::staged_is(b.as_bytes()))? == crate::seal_write::WRITE_OK, "{} read back other bytes", f.display()) } // #10454 seal_write.t27 STAGE_THEN_RENAME: a killed reseal leaves no torn seal
         println!("{} {p}", if keep { "resealed" } else { "kept the old seal" });
     }
     let _ = std::fs::remove_dir_all(&zc);
@@ -5687,7 +5688,7 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
     }
     if poisoned > 0 { anyhow::bail!("{poisoned} reused verdict(s) disagree with their rerun (specs/verified/verdict_audit.t27)") }
     // --watch (#8737 H5): rerun every spec whose closure digest changed since the last look (watch.t27).
-    let mut last: std::collections::HashMap<String, String> = Default::default();
+    let (mut last, mut gens): (std::collections::HashMap<String, String>, std::collections::HashMap<String, [String; 4]>) = Default::default(); // gens (#10237): the four gen hashes at the first look or last rerun; a moved digest over unchanged ones is not rerun (watch_skip), its digest is still recorded
     // #8821: stat every file the last walk read, before walking, and walk only when one moved (watch_walk)
     let stat = |p: &str| { use std::os::unix::fs::MetadataExt; std::fs::metadata(p).map(|m| (m.mtime(), m.mtime_nsec(), m.len(), m.ino())).unwrap_or_default() };
     let mut seen: std::collections::HashMap<String, (i64, i64, u64, u64)> = Default::default();
@@ -5697,16 +5698,16 @@ pub fn run_frontier(list: bool, reseal: bool, audit: Option<u32>, watch: bool) -
         seen = looked;
         DIG.with(|m| m.borrow_mut().clear());
         let now: Vec<(String, String)> = specs.iter().map(|p| (p.clone(), digest(p, 0))).collect();
-        let changed: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect();
+        let (changed, skipped): (Vec<&(String, String)>, Vec<&(String, String)>) = { let cand: Vec<&(String, String)> = now.iter().filter(|(p, d)| wt::watch_rerun(last.contains_key(p), last.get(p) != Some(d))).collect(); let gn = crate::suite::par_in_order(&cand, |c| gen_cached(&c.0, &tc)); let (a, b): (Vec<_>, Vec<_>) = cand.into_iter().zip(gn).partition(|(c, g)| !wt::watch_skip(gens.contains_key(&c.0), g.is_some(), g.as_ref() == gens.get(&c.0))); (a.into_iter().map(|x| x.0).collect(), b.into_iter().map(|x| x.0).collect()) };
         // #8852: reruns side by side, specs sharing a file stem on one worker (test_report names its scratch dir by stem and pid)
         let batch: Vec<&(String, String)> = changed.iter().take(wt::watch_take(changed.len() as u32) as usize).copied().collect();
         let mut stems: Vec<(String, Vec<usize>)> = Vec::new();
         for (i, (p, _)) in batch.iter().enumerate() { let st = Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default(); match stems.iter_mut().find(|g| g.0 == st) { Some(g) => g.1.push(i), None => stems.push((st, vec![i])) } }
         // #8956: each verdict prints the moment its rerun ends, from the worker that ran it; the digests are recorded after
         let done = crate::suite::par_in_order(&stems, |g| g.1.iter().map(|&i| { let p = &batch[i].0; let r = crate::test_report::run(Path::new(p), Path::new("specs")); println!("{} {p}: {} of {} pass{}", if r.blocked.is_some() { "BLOCKED" } else if r.failed > 0 { "FAIL" } else { "ok" }, r.passed, r.total, r.blocked.as_deref().map(|b| format!(" -- {}", b.lines().next().unwrap_or(""))).unwrap_or_default()); i }).collect::<Vec<_>>());
-        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); }
+        for i in done.into_iter().flatten() { let (p, d) = batch[i]; last.insert(p.clone(), d.clone()); if let Some(g) = gen_cached(p, &tc) { gens.insert(p.clone(), g); } } for (p, d) in &skipped { last.insert(p.clone(), d.clone()); }
         if changed.len() as u32 > wt::WATCH_BATCH { println!("watch: {} more changed specs wait for the next look", changed.len() as u32 - wt::WATCH_BATCH) }
-        for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
+        if last.is_empty() { for (p, g) in specs.iter().zip(crate::suite::par_in_order(&specs, |p| gen_cached(p, &tc))) { if let Some(g) = g { gens.insert(p.clone(), g); } } } for (p, d) in &now { last.entry(p.clone()).or_insert_with(|| d.clone()); }
         std::thread::sleep(std::time::Duration::from_millis(wt::WATCH_POLL_MS as u64));
     }
     Ok(())
