@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/trinity/fpga/openxc7-synth/trinity_v3_riscv.t27
+// trinity_v3 -- phi-synthesis RISC-V system integration top, ported from
+// trinity_v3_riscv.v (Xilinx 7-series wrapper for the openxc7 synth flow).
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// The original module wires together: a 3-stage reset synchronizer, an
+// 8-channel interrupt controller over the riscv_irq_map, the v2 subsystem
+// status LEDs (heartbeat + LFSR diagnostics), a UART loopback, and tied-off
+// memory-load defaults for the RISC-V soft core.
+//
+// Ported decisions below (every one is a pure function of the original's
+// input wires, so the Verilog backend can lower them):
+//   - reset synchronizer: rst_sync[2:0] <= {rst_sync[1:0], rst},
+//     rst_n = ~rst_sync[2]
+//   - uart_rx irq pending register
+//   - irq_sources[0..7] channel map (UART_TX / YIELD / FAULT / SPARE tied low)
+//   - LFSR diag source (taps 31/21/1/0, seed 0xDEADBEEF)
+//   - 26-bit heartbeat counter and the led_d5/d6/d7 decode
+//   - uart_tx = uart_rx loopback (v2 uart tx mux does not exist yet)
+//   - mem_load / mem_load_addr / mem_load_data tied off
+//
+// Not ported yet (structural, needs the Yosys/nextpnr backend):
+//   - the pinout (clk=P17, rst=P18, uart_rx=U22, uart_tx=P16, led_d5=P22,
+//     led_d6=P21, led_d7=P20), the `synth`/`pnr` blocks, the uart_rx_1m /
+//     uart_tx_1m instance plumbing, and the riscv_irq_map region comment.
+
+module trinity_v3 {
+
+    // === IRQ channel map (interrupt_controller block, riscv_irq_map) ===
+
+    pub const IRQ_CHANNELS : usize = 8;
+    pub const IRQ_UART_RX : usize = 0;
+    pub const IRQ_UART_TX : usize = 1;
+    pub const IRQ_VSA_COMPLETE : usize = 2;
+    pub const IRQ_TQNN_COMPLETE : usize = 3;
+    pub const IRQ_TIMER_PREEMPT : usize = 4;
+    pub const IRQ_YIELD : usize = 5;
+    pub const IRQ_FAULT : usize = 6;
+    pub const IRQ_SPARE : usize = 7;
+
+    // === Heartbeat / LFSR diagnostics ===
+
+    pub const HEARTBEAT_BITS : usize = 26;
+    pub const LFSR_SEED : u32 = 0xDEADBEEF;
+
+    // === Reset synchronizer width (3 stage flops) ===
+
+    pub const RESET_SYNC_STAGES : usize = 3;
+
+    // === Memory load interface defaults (tied off until the loader lands) ===
+
+    pub const MEM_LOAD_ENABLED : bool = false;
+    pub const MEM_LOAD_ADDR : u32 = 0;
+    pub const MEM_LOAD_DATA : u32 = 0;
+
+    // === Subsystem status wires the LED decode and interrupt controller read ===
+
+    pub struct V3Status {
+        riscv_running : bool,
+        riscv_halt : bool,
+        vsa_busy : bool,
+        tqnn_busy : bool,
+        inference_busy : bool,
+    }
+
+    pub fn status(riscv_running: bool, riscv_halt: bool, vsa_busy: bool, tqnn_busy: bool, inference_busy: bool) -> V3Status {
+        return V3Status{.riscv_running = riscv_running, .riscv_halt = riscv_halt, .vsa_busy = vsa_busy, .tqnn_busy = tqnn_busy, .inference_busy = inference_busy};
+    }
+
+    // === Reset synchronizer ===
+    // `rst_sync <= {rst_sync[1:0], rst}` shifts rst through 3 flops and
+    // `rst_n = ~rst_sync[2]` claims/releases the active-low reset.
+
+    pub fn rst_sync_next(rst_sync: u32, rst: bool) -> u32 {
+        var r : u32 = 0;
+        if (rst) {
+            r = 1;
+        }
+        return ((rst_sync << 1) | r) & 0x7;
+    }
+
+    pub fn rst_n(rst_sync: u32) -> bool {
+        return ((rst_sync >> 2) & 1) == 0;
+    }
+
+    // === UART RX interrupt ===
+    // Under reset the pending flag is cleared; otherwise it simply follows
+    // the char-valid flag from the not-yet-ported UART RX block.
+
+    pub fn uart_rx_irq_pending_next(rst_n: bool, uart_rx_char_valid: bool) -> bool {
+        if (!rst_n) {
+            return false;
+        }
+        return uart_rx_char_valid;
+    }
+
+    // === Interrupt controller (irq_sources[0..7]) ===
+    // The fixed 8-channel map from the riscv_irq_map comment. Channels with
+    // no driving block (UART_TX, YIELD, FAULT, SPARE) are tied low.
+
+    pub fn irq_source(uart_rx_pending: bool, vsa_busy: bool, tqnn_busy: bool, preemption_irq: bool, channel: usize) -> bool {
+        if (channel == IRQ_UART_RX) {
+            return uart_rx_pending;
+        }
+        if (channel == IRQ_VSA_COMPLETE) {
+            return vsa_busy;
+        }
+        if (channel == IRQ_TQNN_COMPLETE) {
+            return tqnn_busy;
+        }
+        if (channel == IRQ_TIMER_PREEMPT) {
+            return preemption_irq;
+        }
+        return false;
+    }
+
+    // === LFSR diagnostics source ===
+    // 32-bit left-shifting LFSR, taps 31/21/1/0, seeded 0xDEADBEEF.
+
+    pub fn lfsr_feedback(lfsr: u32) -> bool {
+        return (((lfsr >> 31) ^ (lfsr >> 21) ^ (lfsr >> 1) ^ lfsr) & 1) == 1;
+    }
+
+    pub fn lfsr_next(lfsr: u32) -> u32 {
+        var fb : u32 = 0;
+        if (lfsr_feedback(lfsr)) {
+            fb = 1;
+        }
+        return ((lfsr & 0x7FFFFFFF) << 1) | fb;
+    }
+
+    // === Heartbeat ===
+    // A 26-bit free-running counter; the D5 LED flashes once per wrap.
+
+    pub fn heartbeat_next(counter: u32) -> u32 {
+        return (counter + 1) & 0x03FFFFFF;
+    }
+
+    pub fn heartbeat_flash(counter: u32) -> bool {
+        return counter == 0;
+    }
+
+    // === LED decode ===
+    // D5 heartbeat while the soft CPU runs, D6 for any v2 accelerator
+    // activity, D7 for CPU halt.
+
+    pub fn led_d5(s: V3Status, heartbeat_counter: u32) -> bool {
+        if (!s.riscv_running) {
+            return false;
+        }
+        return heartbeat_flash(heartbeat_counter);
+    }
+
+    pub fn led_d6(s: V3Status) -> bool {
+        return s.vsa_busy or s.tqnn_busy or s.inference_busy;
+    }
+
+    pub fn led_d7(s: V3Status) -> bool {
+        return s.riscv_halt;
+    }
+
+    // === UART loopback ===
+    // The v2 UART TX mux does not exist yet: the original ties uart_tx to
+    // uart_rx so the console echoes.
+
+    pub fn uart_loopback(uart_rx: bool) -> bool {
+        return uart_rx;
+    }
+
+    test reset_synchronizer_claims_after_three_clocks_of_rst {
+        var sync : u32 = 0;
+        sync = rst_sync_next(sync, true);
+        assert_eq(sync, 1);
+        sync = rst_sync_next(sync, true);
+        assert_eq(sync, 3);
+        sync = rst_sync_next(sync, true);
+        assert_eq(sync, 7);
+        assert_eq(rst_n(sync), false);
+    }
+
+    test reset_synchronizer_releases_three_clocks_after_rst_falls {
+        var sync : u32 = 7;
+        sync = rst_sync_next(sync, false);
+        assert_eq(sync, 6);
+        assert_eq(rst_n(sync), false);
+        sync = rst_sync_next(sync, false);
+        assert_eq(sync, 4);
+        assert_eq(rst_n(sync), false);
+        sync = rst_sync_next(sync, false);
+        assert_eq(sync, 0);
+        assert_eq(rst_n(sync), true);
+    }
+
+    test uart_rx_irq_pending_follows_char_valid_and_clears_under_reset {
+        assert_eq(uart_rx_irq_pending_next(false, true), false);
+        assert_eq(uart_rx_irq_pending_next(true, true), true);
+        assert_eq(uart_rx_irq_pending_next(true, false), false);
+    }
+
+    test interrupt_controller_maps_the_eight_irq_channels {
+        assert_eq(irq_source(true, false, false, false, IRQ_UART_RX), true);
+        assert_eq(irq_source(false, true, false, false, IRQ_VSA_COMPLETE), true);
+        assert_eq(irq_source(false, false, true, false, IRQ_TQNN_COMPLETE), true);
+        assert_eq(irq_source(false, false, false, true, IRQ_TIMER_PREEMPT), true);
+        // Undriven channels stay tied low even with every source hot.
+        assert_eq(irq_source(true, true, true, true, IRQ_UART_TX), false);
+        assert_eq(irq_source(true, true, true, true, IRQ_YIELD), false);
+        assert_eq(irq_source(true, true, true, true, IRQ_FAULT), false);
+        assert_eq(irq_source(true, true, true, true, IRQ_SPARE), false);
+    }
+
+    test lfsr_walks_from_the_deadbeef_seed {
+        assert_eq(lfsr_feedback(LFSR_SEED), false);
+        assert_eq(lfsr_next(LFSR_SEED), 0xBD5B7DDE);
+        assert_eq(lfsr_feedback(0xBD5B7DDE), false);
+        assert_eq(lfsr_next(0xBD5B7DDE), 0x7AB6FBBC);
+        assert_eq(lfsr_feedback(0x7AB6FBBC), true);
+        assert_eq(lfsr_next(0x7AB6FBBC), 0xF56DF779);
+        assert_eq(lfsr_next(0xF56DF779), 0xEADBEEF3);
+        assert_eq(lfsr_next(0xEADBEEF3), 0xD5B7DDE7);
+    }
+
+    test heartbeat_flashes_once_per_twenty_six_bit_wrap {
+        assert_eq(heartbeat_flash(0), true);
+        assert_eq(heartbeat_flash(1), false);
+        assert_eq(heartbeat_next(0x03FFFFFF), 0);
+        assert_eq(heartbeat_flash(heartbeat_next(0x03FFFFFF)), true);
+    }
+
+    test led_d5_beats_heartbeat_only_while_the_cpu_runs {
+        var running : V3Status = status(true, false, false, false, false);
+        assert_eq(led_d5(running, 0), true);
+        assert_eq(led_d5(running, 1), false);
+        var halted : V3Status = status(false, true, false, false, false);
+        assert_eq(led_d5(halted, 0), false);
+    }
+
+    test led_d6_lights_for_any_v2_accelerator_activity {
+        var vsa : V3Status = status(false, false, true, false, false);
+        assert_eq(led_d6(vsa), true);
+        var tqnn : V3Status = status(false, false, false, true, false);
+        assert_eq(led_d6(tqnn), true);
+        var inference : V3Status = status(false, false, false, false, true);
+        assert_eq(led_d6(inference), true);
+        var idle : V3Status = status(false, false, false, false, false);
+        assert_eq(led_d6(idle), false);
+    }
+
+    test led_d7_lights_on_cpu_halt {
+        var halted : V3Status = status(false, true, false, false, false);
+        assert_eq(led_d7(halted), true);
+        var running : V3Status = status(true, false, false, false, false);
+        assert_eq(led_d7(running), false);
+    }
+
+    test uart_tx_is_a_direct_loopback_of_uart_rx {
+        assert_eq(uart_loopback(true), true);
+        assert_eq(uart_loopback(false), false);
+    }
+
+    test memory_load_interface_is_tied_off_until_the_loader_lands {
+        var enabled : bool = MEM_LOAD_ENABLED;
+        var addr : u32 = MEM_LOAD_ADDR;
+        var data : u32 = MEM_LOAD_DATA;
+        assert_eq(enabled, false);
+        assert_eq(addr, 0);
+        assert_eq(data, 0);
+    }
+
+}
