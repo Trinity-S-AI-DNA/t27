@@ -1,6 +1,6 @@
 # NOW -- Trinity t27 sync
 
-Last updated: 2026-09-05
+Last updated: 2026-10-22
 
 ## The compiler now runs in a browser, and 49 specs turned out to be losing declarations silently
 
