@@ -137,7 +137,7 @@ Wave Loop 357 delivered 172 generic ∀ theorems, 33-variable accumulation, and 
 ### Pros
 - Directly addresses critical silicon evidence gap
 - Combined 176 generic ∀ + FPGA bitstream creates unbeatable narrative
-- Positions Trinity for NSF SHF or DARPA Fast and Curious grant applications
+- Positions Trinity for NSF SHF or federal fast-track grant applications
 - Generates content for arXiv submission
 
 ### Cons

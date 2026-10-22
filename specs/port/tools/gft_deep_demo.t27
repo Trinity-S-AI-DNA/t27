@@ -48,6 +48,12 @@ fn magsub(hi: i32, lo: i32) -> i32 {
     if (rem > half) { mant = mant + 1; }
     else { if (rem == half) { if (sticky == 1) { mant = mant + 1; } else { if ((q & 1) == 1) { mant = mant + 1; } } } }
     if (mant >= 512) { mant = 0; off = off + 1; if (off >= 80) { off = 80; } }
+    // #5506: below the smallest binade the normalisation stops at its floor and
+    // q stays under 512, so mant goes negative and (off << 9) | mant is no
+    // GF-T16 encoding at all (sadd(256, 66047) gave 0xFFFFFEFF). There are no
+    // subnormals: such a difference is zero, exactly as enc() makes any
+    // value below 2^-40 zero.
+    if (mant < 0) { return 0; }
     return (off << 9) | mant;
 }
 
@@ -57,9 +63,12 @@ fn sadd(a: u32, b: u32) -> u32 {
     var sa : i32 = (a >> 16) as i32; var ma : i32 = (a & 65535) as i32;
     var sb : i32 = (b >> 16) as i32; var mb : i32 = (b & 65535) as i32;
     if (sa == sb) { return ((sa << 16) | magadd(ma, mb)) as u32; }
+    // #5506: order the operands BEFORE subtracting. magsub(hi, lo) shifts by
+    // hi_off - lo_off, so calling it unordered shifts by a negative count:
+    // undefined in C, unchecked in Rust -O, a trap in Zig ReleaseSafe.
     var bsign : i32 = sa;
-    var r : i32 = magsub(ma, mb);
-    if (ma < mb) { r = magsub(mb, ma); bsign = sb; }
+    var r : i32 = 0;
+    if (ma < mb) { r = magsub(mb, ma); bsign = sb; } else { r = magsub(ma, mb); }
     if (r == 0) { return 0; }
     return ((bsign << 16) | r) as u32;
 }
@@ -304,6 +313,168 @@ fn main() -> u32 {
     return lin_acc(w00, w01, w10, w11, v0, v1);
 }
 
+// relu_grad: exact ReLU gradient mask: 1.0 if x>0 else 0
+fn relu_grad(x: u32) -> u32 {
+    if (x == 0) { return 0; }
+    if (((x >> 16) & 1) == 1) { return 0; }
+    return 20480; // +1.0 in GF-T
+}
+
+// xor_label: return 0 if (x0 >= 0) == (x1 >= 0) else 1
+fn xor_label(x0: u32, x1: u32) -> u32 {
+    var x0_pos : bool = (x0 == 0) || (((x0 >> 16) & 1) == 0);
+    var x1_pos : bool = (x1 == 0) || (((x1 >> 16) & 1) == 0);
+    if (x0_pos == x1_pos) { return 0; } else { return 1; }
+}
+
+// A dataset of XOR samples: sample k is ((x0[k], x1[k]), label[k]). The
+// original held a growable array of ((u32, u32), u32) tuples; the generated
+// code has no tuples or growable arrays, so the same data is kept in three
+// fixed arrays of MAX_SAMPLES entries with `len` of them filled.
+const MAX_SAMPLES : u32 = 64;
+
+struct Dataset {
+    x0: [64]u32,
+    x1: [64]u32,
+    label: [64]u32,
+    len: u32,
+}
+
+fn empty_dataset() -> Dataset {
+    return Dataset{ .x0 = [0; 64], .x1 = [0; 64], .label = [0; 64], .len = 0 };
+}
+
+// One step of the linear congruential generator, modulo 2^31. The product is
+// formed in 64 bits so it cannot overflow a u32.
+fn lcg_next(state: u32) -> u32 {
+    var wide : u64 = (state as u64) * 1103515245 + 12345;
+    return (wide & 2147483647) as u32;
+}
+
+// gen: generate n XOR data points with given seed. Points too close to zero
+// are rejected and redrawn, and only ACCEPTED points count towards n (the
+// first version counted the rejected ones too and so returned fewer than n).
+// `tries` bounds the loop; n is capped at MAX_SAMPLES.
+fn gen(n: u32, seed: u32) -> Dataset {
+    var result : Dataset = empty_dataset();
+    var count : u32 = 0;
+    var tries : u32 = 0;
+    var rng_state : u32 = seed;
+
+    while (count < n && count < MAX_SAMPLES && tries < 4096) {
+        tries = tries + 1;
+        rng_state = lcg_next(rng_state);
+        var x0_flt : f32 = (((rng_state & 65535) as f32) / 65535.0) * 2.0 - 1.0;
+        rng_state = lcg_next(rng_state);
+        var x1_flt : f32 = (((rng_state & 65535) as f32) / 65535.0) * 2.0 - 1.0;
+
+        // Skip if too close to zero
+        if (x0_flt >= -0.2 && x0_flt <= 0.2) {
+            continue;
+        }
+        if (x1_flt >= -0.2 && x1_flt <= 0.2) {
+            continue;
+        }
+
+        // Convert to GF-T: +1.0 or -1.0
+        var x0 : u32 = 86016;
+        if (x0_flt >= 0.0) { x0 = 20480; }
+        var x1 : u32 = 86016;
+        if (x1_flt >= 0.0) { x1 = 20480; }
+
+        result.x0[count] = x0;
+        result.x1[count] = x1;
+        result.label[count] = xor_label(x0, x1);
+        count = count + 1;
+    }
+
+    result.len = count;
+    return result;
+}
+
+// _dot: dot product w · x + b
+fn _dot(w: u32, x: u32, b: u32) -> u32 {
+    var acc : u32 = b;
+    acc = sadd(acc, smul(w, x));
+    return acc;
+}
+
+// lin_fwd: linear forward pass W, x -> [4] outputs
+fn lin_fwd(W: [8]u32, x: [2]u32) -> [4]u32 {
+    var outputs : [4]u32 = [0; 4];
+    var c : u32 = 0;
+    while (c < 4) {
+        outputs[c] = _dot(W[c * 2], x[0], W[c * 2 + 1]);
+        c = c + 1;
+    }
+    return outputs;
+}
+
+// What deep_fwd returns: the hidden pre-activations, the hidden activations
+// and the output logits (the original returned the tuple (hpre, h, lg)).
+struct DeepOut {
+    hpre: [6]u32,
+    h: [6]u32,
+    lg: [4]u32,
+}
+
+// deep_fwd: deep forward pass W1, b1, W2, b2, x -> (hpre, h, lg)
+fn deep_fwd(W1: [12]u32, b1: [6]u32, W2: [24]u32, b2: [4]u32, x: [2]u32) -> DeepOut {
+    var out : DeepOut = DeepOut{ .hpre = [0; 6], .h = [0; 6], .lg = [0; 4] };
+
+    // Hidden layer forward pass
+    var k : u32 = 0;
+    while (k < 6) {
+        var pre : u32 = _dot(W1[k * 2], x[0], W1[k * 2 + 1]);
+        out.hpre[k] = pre;
+        out.h[k] = relu(pre);
+        k = k + 1;
+    }
+
+    // Output layer forward pass
+    var c : u32 = 0;
+    while (c < 4) {
+        out.lg[c] = _dot(W2[c * 6], out.h[0], W2[c * 6 + 1]);
+        c = c + 1;
+    }
+
+    return out;
+}
+
+// deep_acc: deep network accuracy on data
+fn deep_acc(W1: [12]u32, b1: [6]u32, W2: [24]u32, b2: [4]u32, data: Dataset) -> f32 {
+    var correct : u32 = 0;
+    var total : u32 = 0;
+
+    var i : u32 = 0;
+    while (i < data.len) {
+        var x : [2]u32 = [data.x0[i], data.x1[i]];
+        var target : u32 = data.label[i];
+
+        var fwd : DeepOut = deep_fwd(W1, b1, W2, b2, x);
+
+        // Find class with maximum output
+        var max_class : u32 = 0;
+        var max_val : u32 = fwd.lg[0];
+        var c : u32 = 1;
+        while (c < 4) {
+            if (fwd.lg[c] > max_val) {
+                max_val = fwd.lg[c];
+                max_class = c;
+            }
+            c = c + 1;
+        }
+
+        if (max_class == target) {
+            correct = correct + 1;
+        }
+        total = total + 1;
+        i = i + 1;
+    }
+
+    return ((correct as f32)) / ((total as f32));
+}
+
 test lin_acc_perfect {
     // Perfect weights: W=[[1,1],[1,1]], v=[1,-2] -> solves XOR
     // Hidden: z0 = x0+x1, z1 = x0+x1, h0=relu(z0), h1=relu(z1)
@@ -322,4 +493,107 @@ test main_runs {
     // Test that main completes and returns accuracy 0-4
     var acc : u32 = main();
     assert_eq(acc <= 4, true);
+}
+
+test relu_grad_positive {
+    // relu_grad of positive value should return 20480 (+1.0)
+    var result : u32 = relu_grad(20480); // +1.0
+    assert_eq(result, 20480);
+}
+
+test relu_grad_negative {
+    // relu_grad of negative value should return 0
+    var result : u32 = relu_grad(86016); // -1.0
+    assert_eq(result, 0);
+}
+
+test relu_grad_zero {
+    // relu_grad of zero should return 0
+    var result : u32 = relu_grad(0);
+    assert_eq(result, 0);
+}
+
+test xor_label_same_sign {
+    // xor_label of same sign inputs should return 0
+    var result : u32 = xor_label(20480, 20480); // +1, +1
+    assert_eq(result, 0);
+}
+
+test xor_label_different_sign {
+    // xor_label of different sign inputs should return 1
+    var result : u32 = xor_label(20480, 86016); // +1, -1
+    assert_eq(result, 1);
+}
+
+test gen_small {
+    // gen should return requested number of samples
+    var data : Dataset = gen(5, 12345);
+    assert_eq(data.len, 5);
+}
+
+test gen_xor_labels {
+    // gen should produce valid XOR labels
+    var data : Dataset = gen(10, 12345);
+    assert_eq(data.len, 10);
+    var i : u32 = 0;
+    while (i < data.len) {
+        var label : u32 = data.label[i];
+        assert_eq(label == 0 || label == 1, true);
+        // and the label must be the XOR of the two stored signs
+        assert_eq(label, xor_label(data.x0[i], data.x1[i]));
+        i = i + 1;
+    }
+}
+
+test lin_fwd_simple {
+    // lin_fwd should compute 4 outputs
+    var W : [8]u32 = [20480, 0, 20480, 0, 20480, 0, 20480, 0]; // identity-like weights
+    var x : [2]u32 = [20480, 86016]; // +1, -1
+    var outputs : [4]u32 = lin_fwd(W, x);
+    assert_eq(outputs.len, 4);
+    // each output is w * x[0] + b = 1.0 * 1.0 + 0 = 1.0
+    assert_eq(outputs[0], 20480);
+    assert_eq(outputs[3], 20480);
+}
+
+test _dot_simple {
+    // _dot should compute w·x + b correctly
+    var result : u32 = _dot(20480, 20480, 0); // 1.0 * 1.0 + 0 = 1.0
+    assert_eq(result, 20480);
+}
+
+test deep_fwd_structure {
+    // deep_fwd should return correct tuple structure
+    var W1 : [12]u32 = [20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0]; // 6 hidden units
+    var b1 : [6]u32 = [0, 0, 0, 0, 0, 0];
+    var W2 : [24]u32 = [20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0]; // 4 output units
+    var b2 : [4]u32 = [0, 0, 0, 0];
+    var x : [2]u32 = [20480, 86016]; // +1, -1
+
+    var result : DeepOut = deep_fwd(W1, b1, W2, b2, x);
+
+    assert_eq(result.hpre.len, 6);  // 6 hidden units
+    assert_eq(result.h.len, 6);     // 6 hidden units after ReLU
+    assert_eq(result.lg.len, 4);    // 4 output units
+    // every hidden pre-activation is 1.0 * 1.0 + 0 = 1.0, and ReLU keeps it
+    assert_eq(result.hpre[0], 20480);
+    assert_eq(result.h[5], 20480);
+}
+
+test deep_acc_simple {
+    // deep_acc should compute accuracy between 0.0 and 1.0
+    var W1 : [12]u32 = [20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0];
+    var b1 : [6]u32 = [0, 0, 0, 0, 0, 0];
+    var W2 : [24]u32 = [20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0, 20480, 0];
+    var b2 : [4]u32 = [0, 0, 0, 0];
+    // Two same-sign samples: (+1, +1) and (-1, -1), both labelled 0
+    var data : Dataset = empty_dataset();
+    data.x0[0] = 20480;
+    data.x1[0] = 20480;
+    data.x0[1] = 86016;
+    data.x1[1] = 86016;
+    data.len = 2;
+
+    var accuracy : f32 = deep_acc(W1, b1, W2, b2, data);
+    assert_eq(accuracy >= 0.0 && accuracy <= 1.0, true);
 }
