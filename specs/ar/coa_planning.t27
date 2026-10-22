@@ -5,6 +5,19 @@
 use base::types;
 
 spec CoaPlanning {
+    // #8980: the spec did not compile (no Trit / ProofTrace / ProofStep in scope,
+    // dynamic `push`, `range`, `format` / `join` / `contains` / `now`, tuple
+    // returns, a string cast to a float). It is now self-contained:
+    //   Trit           -> i8 (-1 False, 0 Unknown, +1 True; AND is min)
+    //   [T] fields     -> fixed arrays plus a count (nsteps, nresources, ...)
+    //   string results -> Text, a fixed byte buffer + length filled by text_append_*
+    //   tuples         -> VerifyResult / PrereqResult structs
+    //   now()          -> a logical clock fixed at tick 0
+    //   counters       -> u32 (indices into fixed arrays)
+    // Further changes forced by the spec's own tests are listed at the places they
+    // happen: new_coa test calls, COAConstraint.max_duration, validate_prerequisites
+    // (empty `visited`), the cycle test's missing edge, the excessive-steps test.
+
     // COA action types
     enum ActionType {
         ASSESS = 0,           // Threat/situation assessment
@@ -20,29 +33,6 @@ spec CoaPlanning {
         MAINTAIN = 10          // Maintain position
     }
 
-    // COA step structure
-    struct COAStep {
-        step_id: int,
-        action_type: ActionType,
-        description: string,
-        resources: [string],
-        prerequisites: [int],
-        proof_trace: [ProofStep],
-        estimated_duration: float
-    }
-
-    // Complete COA plan
-    struct CourseOfAction {
-        coa_id: string,
-        objective: string,
-        threat_assessment: Trit,
-        steps: [COAStep],
-        total_steps: int,
-        total_duration: float,
-        verification_status: Trit,
-        proof_trace: ProofTrace
-    }
-
     // COA constraint type
     enum ConstraintType {
         TEMPORAL = 0,        // Time-based constraints
@@ -53,26 +43,319 @@ spec CoaPlanning {
         ROB = 5             // Rules of Engagement compliance
     }
 
+    // Maximum COA steps (bounded for explainability)
+    const MAX_COA_STEPS: u32 = 10
+
+    // Maximum planning depth
+    const MAX_PLANNING_DEPTH: u32 = 5
+
+    // Fixed capacities
+    const MAX_RESOURCES: u32 = 3
+    const MAX_PREREQ: u32 = 3
+    const MAX_PROOFS: u32 = 2
+    const MAX_PROOF_INPUTS: u32 = 2
+    const MAX_TRACE: u32 = 20
+    const MAX_ENFORCES: u32 = 3
+    const MAX_CONSTRAINTS: u32 = 4
+    const PREREQ_ERR_CAP: u32 = 32
+    const TEXT_CAP: u32 = 2048
+
+    // K3 values (AND is min)
+    const K_FALSE: i8 = -1
+    const K_UNKNOWN: i8 = 0
+    const K_TRUE: i8 = 1
+
+    // Logical clock: planning happens at tick 0
+    fn now() -> u32 {
+        return 0
+    }
+
+    // Text buffers (stand-in for string building with format!)
+    struct Text {
+        bytes: [TEXT_CAP]u8,
+        len: u32
+    }
+
+    fn text_empty() -> Text {
+        return Text { bytes: [0; TEXT_CAP], len: 0 }
+    }
+
+    // Bytes past TEXT_CAP are dropped
+    fn text_append_byte(t: *Text, b: u8) -> void {
+        if t.len < TEXT_CAP {
+            t.bytes[t.len] = b;
+            t.len = t.len + 1;
+        }
+    }
+
+    fn text_append_str(t: *Text, s: string) -> void {
+        let mut i: usize = 0;
+        while i < s.len {
+            text_append_byte(t, s[i]);
+            i = i + 1;
+        }
+    }
+
+    fn text_of(s: string) -> Text {
+        let mut t = text_empty();
+        text_append_str(&t, s);
+        return t
+    }
+
+    fn text_append_text(t: *Text, other: Text) -> void {
+        let mut i: u32 = 0;
+        while i < other.len {
+            text_append_byte(t, other.bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    // Decimal digits of v, the `{}` of a u32
+    fn text_append_u32(t: *Text, v: u32) -> void {
+        if v == 0 {
+            text_append_byte(t, 48);
+        } else {
+            let mut digits: [10]u8 = [0; 10];
+            let mut count: u32 = 0;
+            let mut n: u32 = v;
+            while n > 0 {
+                digits[count] = (48 + n % 10) as u8;
+                count = count + 1;
+                n = n / 10;
+            }
+            while count > 0 {
+                count = count - 1;
+                text_append_byte(t, digits[count]);
+            }
+        }
+    }
+
+    // The `{}` of an i32
+    fn text_append_i32(t: *Text, v: i32) -> void {
+        if v < 0 {
+            text_append_byte(t, 45);
+            text_append_u32(t, (0 - v) as u32);
+        } else {
+            text_append_u32(t, v as u32);
+        }
+    }
+
+    // One fraction digit, the `{:.1f}` of a non-negative f64
+    fn text_append_f1(t: *Text, x: f64) -> void {
+        let scaled: u32 = @as(u32, @intFromFloat(x * 10.0 + 0.5));
+        text_append_u32(t, scaled / 10);
+        text_append_byte(t, 46);
+        text_append_byte(t, (48 + scaled % 10) as u8);
+    }
+
+    // Start a new line (join("\n", lines) puts a newline between lines only)
+    fn text_line(t: *Text) -> void {
+        if t.len > 0 {
+            text_append_byte(t, 10);
+        }
+    }
+
+    // Does `hay` contain `needle` as a substring
+    fn contains(hay: Text, needle: string) -> bool {
+        if needle.len > hay.len {
+            return false
+        }
+        let mut start: u32 = 0;
+        while start + needle.len <= hay.len {
+            let mut k: u32 = 0;
+            let mut same = true;
+            while k < needle.len {
+                if hay.bytes[start + k] != needle[k] {
+                    same = false;
+                }
+                k = k + 1;
+            }
+            if same {
+                return true
+            }
+            start = start + 1;
+        }
+        return false
+    }
+
+    // Byte-wise string equality
+    fn str_eq(a: string, b: string) -> bool {
+        if a.len != b.len {
+            return false
+        }
+        let mut i: usize = 0;
+        while i < a.len {
+            if a[i] != b[i] {
+                return false
+            }
+            i = i + 1;
+        }
+        return true
+    }
+
+    // Proof step (the bounded reasoning record kept for each COA step)
+    struct ProofStep {
+        step_id: u32,
+        operation: string,
+        inputs: [MAX_PROOF_INPUTS]i8,
+        ninputs: u32,
+        output: i8,
+        timestamp: u32
+    }
+
+    fn empty_proof_step() -> ProofStep {
+        return ProofStep { step_id: 0, operation: "", inputs: [0; MAX_PROOF_INPUTS], ninputs: 0, output: K_UNKNOWN, timestamp: 0 }
+    }
+
+    // Complete proof trace
+    struct CoaProofTrace {
+        steps: [MAX_TRACE]ProofStep,
+        count: u32,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        verified: bool
+    }
+
+    fn new_proof_trace() -> CoaProofTrace {
+        let mut slots: [MAX_TRACE]ProofStep = undefined;
+        let mut k: u32 = 0;
+        while k < MAX_TRACE {
+            slots[k] = empty_proof_step();
+            k = k + 1;
+        }
+        return CoaProofTrace { steps: slots, count: 0, start_timestamp: 0, end_timestamp: 0, verified: false }
+    }
+
+    // COA step structure
+    struct COAStep {
+        step_id: u32,
+        action_type: ActionType,
+        description: string,
+        resources: [MAX_RESOURCES]string,
+        nresources: u32,
+        prerequisites: [MAX_PREREQ]i32,
+        nprereq: u32,
+        proof_trace: [MAX_PROOFS]ProofStep,
+        nproof: u32,
+        estimated_duration: f64
+    }
+
+    // A step with no resources, prerequisites or proof steps
+    fn plan_step(step_id: u32, action_type: ActionType, description: string, duration: f64) -> COAStep {
+        return COAStep {
+            step_id: step_id,
+            action_type: action_type,
+            description: description,
+            resources: ["", "", ""],
+            nresources: 0,
+            prerequisites: [0; MAX_PREREQ],
+            nprereq: 0,
+            proof_trace: [empty_proof_step(), empty_proof_step()],
+            nproof: 0,
+            estimated_duration: duration
+        }
+    }
+
+    fn with_resources(step: COAStep, a: string, b: string) -> COAStep {
+        let mut s = step;
+        s.resources = [a, b, ""];
+        s.nresources = 2;
+        return s
+    }
+
+    fn with_prerequisite(step: COAStep, prereq: i32) -> COAStep {
+        let mut s = step;
+        s.prerequisites = [prereq, 0, 0];
+        s.nprereq = 1;
+        return s
+    }
+
+    fn with_proof(step: COAStep, operation: string, input: i8, output: i8) -> COAStep {
+        let mut s = step;
+        s.proof_trace = [
+            ProofStep { step_id: step.step_id, operation: operation, inputs: [input, 0], ninputs: 1, output: output, timestamp: 0 },
+            empty_proof_step()
+        ];
+        s.nproof = 1;
+        return s
+    }
+
+    // Complete COA plan
+    struct CourseOfAction {
+        coa_id: Text,
+        objective: Text,
+        threat_assessment: i8,
+        steps: [MAX_COA_STEPS]COAStep,
+        nsteps: u32,
+        total_steps: u32,
+        total_duration: f64,
+        verification_status: i8,
+        proof_trace: CoaProofTrace
+    }
+
     // COA constraint
     struct COAConstraint {
         constraint_type: ConstraintType,
         description: string,
-        enforces: [Trit]  // K3 constraints
+        enforces: [MAX_ENFORCES]i8,  // K3 constraints
+        nenforces: u32,
+        // Duration limit of a TEMPORAL constraint (the original cast the
+        // description string to a number)
+        max_duration: f64
     }
 
-    // Maximum COA steps (bounded for explainability)
-    const MAX_COA_STEPS: int = 10
+    fn make_constraint(constraint_type: ConstraintType, description: string) -> COAConstraint {
+        return COAConstraint {
+            constraint_type: constraint_type,
+            description: description,
+            enforces: [0; MAX_ENFORCES],
+            nenforces: 0,
+            max_duration: 0.0
+        }
+    }
 
-    // Maximum planning depth
-    const MAX_PLANNING_DEPTH: int = 5
+    struct ConstraintSet {
+        items: [MAX_CONSTRAINTS]COAConstraint,
+        count: u32
+    }
 
-    // Create new COA
-    fn new_coa(coa_id: string, objective: string) -> CourseOfAction {
+    fn no_constraints() -> ConstraintSet {
+        let blank = make_constraint(ConstraintType::RESOURCE, "");
+        return ConstraintSet { items: [blank, blank, blank, blank], count: 0 }
+    }
+
+    fn one_constraint(c: COAConstraint) -> ConstraintSet {
+        let blank = make_constraint(ConstraintType::RESOURCE, "");
+        return ConstraintSet { items: [c, blank, blank, blank], count: 1 }
+    }
+
+    // Result of verify_coa (a tuple in the Rust-like original)
+    struct VerifyResult {
+        valid: bool,
+        message: Text
+    }
+
+    // Result of validate_prerequisites (a tuple in the Rust-like original)
+    struct PrereqResult {
+        valid: bool,
+        errors: [PREREQ_ERR_CAP]u32,
+        nerrors: u32
+    }
+
+    // Create new COA from text
+    fn new_coa_text(coa_id: Text, objective: Text) -> CourseOfAction {
+        let mut slots: [MAX_COA_STEPS]COAStep = undefined;
+        let mut k: u32 = 0;
+        while k < MAX_COA_STEPS {
+            slots[k] = plan_step(0, ActionType::ASSESS, "", 0.0);
+            k = k + 1;
+        }
         return CourseOfAction {
             coa_id: coa_id,
             objective: objective,
             threat_assessment: K_UNKNOWN,
-            steps: [],
+            steps: slots,
+            nsteps: 0,
             total_steps: 0,
             total_duration: 0.0,
             verification_status: K_UNKNOWN,
@@ -80,21 +363,27 @@ spec CoaPlanning {
         }
     }
 
+    // Create new COA
+    fn new_coa(coa_id: string, objective: string) -> CourseOfAction {
+        return new_coa_text(text_of(coa_id), text_of(objective))
+    }
+
     // Add step to COA
     fn add_step(coa: CourseOfAction, step: COAStep) -> CourseOfAction {
-        if len(coa.steps) >= MAX_COA_STEPS {
+        if coa.nsteps >= MAX_COA_STEPS {
             return coa  // Reject steps beyond MAX
         }
 
-        let new_steps = coa.steps;
-        new_steps.push(step);
+        let mut new_steps = coa.steps;
+        new_steps[coa.nsteps] = step;
 
         return CourseOfAction {
             coa_id: coa.coa_id,
             objective: coa.objective,
             threat_assessment: coa.threat_assessment,
             steps: new_steps,
-            total_steps: len(new_steps),
+            nsteps: coa.nsteps + 1,
+            total_steps: coa.nsteps + 1,
             total_duration: coa.total_duration + step.estimated_duration,
             verification_status: coa.verification_status,
             proof_trace: coa.proof_trace
@@ -102,69 +391,44 @@ spec CoaPlanning {
     }
 
     // Generate COA from threat assessment
-    fn generate_coa(threat_type: string, threat_severity: Trit) -> CourseOfAction {
-        let coa_id = format("COA-{}-{}", threat_type, now());
-        let objective = format("Neutralize {} threat", threat_type);
-        let coa = new_coa(coa_id, objective);
+    fn generate_coa(threat_type: string, threat_severity: i8) -> CourseOfAction {
+        let mut coa_id = text_of("COA-");
+        text_append_str(&coa_id, threat_type);
+        text_append_str(&coa_id, "-");
+        text_append_u32(&coa_id, now());
+        let mut objective = text_of("Neutralize ");
+        text_append_str(&objective, threat_type);
+        text_append_str(&objective, " threat");
+        let mut coa = new_coa_text(coa_id, objective);
 
         // Step 1: Assess threat
-        let step1 = COAStep {
-            step_id: 0,
-            action_type: ActionType::ASSESS,
-            description: "Assess threat level using K3 reasoning",
-            resources: ["Sensors", "K3Reasoner"],
-            prerequisites: [],
-            proof_trace: [ProofStep {step_id: 0, operation: "k3_assess", inputs: [threat_severity], output: threat_severity}],
-            estimated_duration: 1.0
-        };
+        let step1 = with_proof(
+            with_resources(plan_step(0, ActionType::ASSESS, "Assess threat level using K3 reasoning", 1.0), "Sensors", "K3Reasoner"),
+            "k3_assess", threat_severity, threat_severity);
         coa = add_step(coa, step1);
 
         // Step 2: Determine defensive posture
-        let step2 = COAStep {
-            step_id: 1,
-            action_type: ActionType::ALLOCATE,
-            description: "Determine defensive posture",
-            resources: ["MLP", "ConstraintSolver"],
-            prerequisites: [0],
-            proof_trace: [ProofStep {step_id: 1, operation: "neural_predict", inputs: [K_TRUE], output: K_TRUE}],
-            estimated_duration: 2.0
-        };
+        let step2 = with_proof(
+            with_prerequisite(with_resources(plan_step(1, ActionType::ALLOCATE, "Determine defensive posture", 2.0), "MLP", "ConstraintSolver"), 0),
+            "neural_predict", K_TRUE, K_TRUE);
         coa = add_step(coa, step2);
 
         // Step 3: Allocate resources
-        let step3 = COAStep {
-            step_id: 2,
-            action_type: ActionType::ALLOCATE,
-            description: "Allocate defensive resources",
-            resources: ["ResourceDB", "ASPSolver"],
-            prerequisites: [1],
-            proof_trace: [ProofStep {step_id: 2, operation: "asp_solve", inputs: [K_TRUE], output: K_TRUE}],
-            estimated_duration: 3.0
-        };
+        let step3 = with_proof(
+            with_prerequisite(with_resources(plan_step(2, ActionType::ALLOCATE, "Allocate defensive resources", 3.0), "ResourceDB", "ASPSolver"), 1),
+            "asp_solve", K_TRUE, K_TRUE);
         coa = add_step(coa, step3);
 
         // Step 4: Execute defensive actions
-        let step4 = COAStep {
-            step_id: 3,
-            action_type: ActionType::EXECUTE,
-            description: "Execute defensive actions",
-            resources: ["Actuators", "RLPolicy"],
-            prerequisites: [2],
-            proof_trace: [ProofStep {step_id: 3, operation: "rl_select", inputs: [K_TRUE], output: K_TRUE}],
-            estimated_duration: 5.0
-        };
+        let step4 = with_proof(
+            with_prerequisite(with_resources(plan_step(3, ActionType::EXECUTE, "Execute defensive actions", 5.0), "Actuators", "RLPolicy"), 2),
+            "rl_select", K_TRUE, K_TRUE);
         coa = add_step(coa, step4);
 
         // Step 5: Verify effectiveness
-        let step5 = COAStep {
-            step_id: 4,
-            action_type: ActionType::VERIFY,
-            description: "Verify defensive effectiveness",
-            resources: ["CNN", "K3Reasoner"],
-            prerequisites: [3],
-            proof_trace: [ProofStep {step_id: 4, operation: "k3_verify", inputs: [K_TRUE], output: K_TRUE}],
-            estimated_duration: 2.0
-        };
+        let step5 = with_proof(
+            with_prerequisite(with_resources(plan_step(4, ActionType::VERIFY, "Verify defensive effectiveness", 2.0), "CNN", "K3Reasoner"), 3),
+            "k3_verify", K_TRUE, K_TRUE);
         coa = add_step(coa, step5);
 
         coa.threat_assessment = threat_severity;
@@ -173,86 +437,144 @@ spec CoaPlanning {
     }
 
     // Verify COA meets constraints
-    fn verify_coa(coa: CourseOfAction, constraints: [COAConstraint]) -> (bool, string) {
-        let errors: [string] = [];
+    fn verify_coa(coa: CourseOfAction, constraints: ConstraintSet) -> VerifyResult {
+        let mut message = text_empty();
+        let mut nerrors: u32 = 0;
 
         // Check step count constraint
         if coa.total_steps > MAX_COA_STEPS {
-            errors.push(format("Too many steps: {} > {}", coa.total_steps, MAX_COA_STEPS));
+            text_line_sep(&message, nerrors);
+            text_append_str(&message, "Too many steps: ");
+            text_append_u32(&message, coa.total_steps);
+            text_append_str(&message, " > ");
+            text_append_u32(&message, MAX_COA_STEPS);
+            nerrors = nerrors + 1;
         }
 
         // Check each constraint
-        for constraint in constraints {
-            if !satisfies_constraint(coa, constraint) {
-                errors.push(format("Constraint failed: {}", constraint.description));
+        let mut c: u32 = 0;
+        while c < constraints.count {
+            if !satisfies_constraint(coa, constraints.items[c]) {
+                text_line_sep(&message, nerrors);
+                text_append_str(&message, "Constraint failed: ");
+                text_append_str(&message, constraints.items[c].description);
+                nerrors = nerrors + 1;
             }
+            c = c + 1;
         }
 
         // Verify proof trace
-        for step in coa.steps {
-            if len(step.proof_trace) == 0 {
-                errors.push(format("Step {} missing proof trace", step.step_id));
+        let mut i: u32 = 0;
+        while i < coa.nsteps {
+            let step = coa.steps[i];
+            if step.nproof == 0 {
+                text_line_sep(&message, nerrors);
+                text_append_str(&message, "Step ");
+                text_append_u32(&message, step.step_id);
+                text_append_str(&message, " missing proof trace");
+                nerrors = nerrors + 1;
             }
+            i = i + 1;
         }
 
-        if len(errors) == 0 {
-            return (true, "COA verified successfully")
+        if nerrors == 0 {
+            return VerifyResult { valid: true, message: text_of("COA verified successfully") }
         } else {
-            return (false, join("; ", errors))
+            return VerifyResult { valid: false, message: message }
         }
+    }
+
+    // The "; " of join("; ", errors), written before every error but the first
+    fn text_line_sep(t: *Text, nerrors: u32) -> void {
+        if nerrors > 0 {
+            text_append_str(t, "; ");
+        }
+    }
+
+    // K3 AND over all values: the minimum, True for an empty list
+    fn k3_and_all(values: [MAX_ENFORCES]i8, count: u32) -> i8 {
+        let mut result: i8 = K_TRUE;
+        let mut i: u32 = 0;
+        while i < count {
+            if values[i] < result {
+                result = values[i];
+            }
+            i = i + 1;
+        }
+        return result
     }
 
     // Check if COA satisfies a constraint
     fn satisfies_constraint(coa: CourseOfAction, constraint: COAConstraint) -> bool {
         // A Rust `match` here lowered to an empty body in every backend (#5949).
         // Its arms were blocks ending in `return`; each now returns its own value.
-        // TEMPORAL casts `description`, a `string`, to compare it with a duration;
-        // kept as written except `as float`, which t27 spells `as f64`.
         return switch (constraint.constraint_type) {
-            .TEMPORAL => coa.total_duration < constraint.description as f64,
+            .TEMPORAL => coa.total_duration < constraint.max_duration,
             .RESOURCE => true,
             .GEOSPATIAL => true,
             .TACTICAL => true,
-            .LOGICAL => k3_and_all(constraint.enforces) == K_TRUE,
+            .LOGICAL => k3_and_all(constraint.enforces, constraint.nenforces) == K_TRUE,
             .ROB => true,
         };
     }
 
     // Validate COA prerequisites
-    fn validate_prerequisites(coa: CourseOfAction) -> (bool, [int]) {
-        let mut errors: [int] = [];
-        let mut visited: [bool] = [];
+    fn validate_prerequisites(coa: CourseOfAction) -> PrereqResult {
+        let mut errors: [PREREQ_ERR_CAP]u32 = [0; PREREQ_ERR_CAP];
+        let mut nerrors: u32 = 0;
+        // The original started `visited` empty and then wrote visited[i]
+        let mut visited: [MAX_COA_STEPS]bool = [false; MAX_COA_STEPS];
 
-        for i in range(0, len(coa.steps)) {
+        let mut i: u32 = 0;
+        while i < coa.nsteps {
             let step = coa.steps[i];
 
             // Check prerequisites exist
-            for prereq in step.prerequisites {
-                if prereq < 0 || prereq >= i {
-                    errors.push(step.step_id);  // Invalid prerequisite
-                } else if !visited[prereq] {
-                    errors.push(step.step_id);  // Prerequisite not completed
+            let mut p: u32 = 0;
+            while p < step.nprereq {
+                let prereq = step.prerequisites[p];
+                let mut bad = false;
+                if prereq < 0 || prereq >= (i as i32) {
+                    bad = true;  // Invalid prerequisite
+                } else if !visited[prereq as u32] {
+                    bad = true;  // Prerequisite not completed
                 }
+                if bad && nerrors < PREREQ_ERR_CAP {
+                    errors[nerrors] = step.step_id;
+                    nerrors = nerrors + 1;
+                }
+                p = p + 1;
             }
 
-            visited[i] = true
+            visited[i] = true;
+            i = i + 1;
         }
 
-        return (len(errors) == 0, errors)
+        return PrereqResult { valid: nerrors == 0, errors: errors, nerrors: nerrors }
     }
 
     // Get total proof trace from COA
-    fn extract_proof_trace(coa: CourseOfAction) -> ProofTrace {
-        let mut all_steps: [ProofStep] = [];
+    fn extract_proof_trace(coa: CourseOfAction) -> CoaProofTrace {
+        let mut all_steps = new_proof_trace();
+        let mut n: u32 = 0;
 
-        for step in coa.steps {
-            for proof_step in step.proof_trace {
-                all_steps.push(proof_step)
+        let mut i: u32 = 0;
+        while i < coa.nsteps {
+            let step = coa.steps[i];
+            let mut j: u32 = 0;
+            while j < step.nproof {
+                if n < MAX_TRACE {
+                    all_steps.steps[n] = step.proof_trace[j];
+                    n = n + 1;
+                }
+                j = j + 1;
             }
+            i = i + 1;
         }
 
-        return ProofTrace {
-            steps: all_steps,
+        return CoaProofTrace {
+            steps: all_steps.steps,
+            count: n,
             start_timestamp: 0,
             end_timestamp: 0,
             verified: true
@@ -260,38 +582,87 @@ spec CoaPlanning {
     }
 
     // Format COA for human review
-    fn format_coa(coa: CourseOfAction) -> string {
-        let lines: [string] = [];
+    fn format_coa(coa: CourseOfAction) -> Text {
+        let mut out = text_empty();
 
-        lines.push("=== Course of Action ===");
-        lines.push(format("COA ID: {}", coa.coa_id));
-        lines.push(format("Objective: {}", coa.objective));
-        lines.push(format("Threat Assessment: {}", trit_to_string(coa.threat_assessment)));
-        lines.push(format("Total Steps: {} (Max: {})", coa.total_steps, MAX_COA_STEPS));
-        lines.push(format("Estimated Duration: {:.1f} hours", coa.total_duration));
-        lines.push(format("Verification Status: {}", trit_to_string(coa.verification_status)));
-        lines.push("");
+        text_append_str(&out, "=== Course of Action ===");
+        text_line(&out);
+        text_append_str(&out, "COA ID: ");
+        text_append_text(&out, coa.coa_id);
+        text_line(&out);
+        text_append_str(&out, "Objective: ");
+        text_append_text(&out, coa.objective);
+        text_line(&out);
+        text_append_str(&out, "Threat Assessment: ");
+        text_append_str(&out, trit_to_string(coa.threat_assessment));
+        text_line(&out);
+        text_append_str(&out, "Total Steps: ");
+        text_append_u32(&out, coa.total_steps);
+        text_append_str(&out, " (Max: ");
+        text_append_u32(&out, MAX_COA_STEPS);
+        text_append_str(&out, ")");
+        text_line(&out);
+        text_append_str(&out, "Estimated Duration: ");
+        text_append_f1(&out, coa.total_duration);
+        text_append_str(&out, " hours");
+        text_line(&out);
+        text_append_str(&out, "Verification Status: ");
+        text_append_str(&out, trit_to_string(coa.verification_status));
+        text_line(&out);
 
-        for i in range(0, len(coa.steps)) {
+        let mut i: u32 = 0;
+        while i < coa.nsteps {
             let step = coa.steps[i];
-            lines.push(format("Step {}: {}", i + 1));
-            lines.push(format("  Action: {}", action_type_to_string(step.action_type)));
-            lines.push(format("  Description: {}", step.description));
-            lines.push(format("  Resources: {}", join(", ", step.resources)));
-            if len(step.prerequisites) > 0 {
-                lines.push(format("  Prerequisites: {}", join(", ", step.prerequisites)));
-            } else {
-                lines.push("  Prerequisites: None");
+            text_line(&out);  // the empty line before the first step, then a line per field
+            text_line(&out);
+            text_append_str(&out, "Step ");
+            text_append_u32(&out, i + 1);
+            text_append_str(&out, ":");
+            text_line(&out);
+            text_append_str(&out, "  Action: ");
+            text_append_str(&out, action_type_to_string(step.action_type));
+            text_line(&out);
+            text_append_str(&out, "  Description: ");
+            text_append_str(&out, step.description);
+            text_line(&out);
+            text_append_str(&out, "  Resources: ");
+            let mut r: u32 = 0;
+            while r < step.nresources {
+                if r > 0 {
+                    text_append_str(&out, ", ");
+                }
+                text_append_str(&out, step.resources[r]);
+                r = r + 1;
             }
-            lines.push(format("  Duration: {:.1f}h", step.estimated_duration));
-            lines.push(format("  Proof Steps: {}", len(step.proof_trace)));
+            text_line(&out);
+            if step.nprereq > 0 {
+                text_append_str(&out, "  Prerequisites: ");
+                let mut p: u32 = 0;
+                while p < step.nprereq {
+                    if p > 0 {
+                        text_append_str(&out, ", ");
+                    }
+                    text_append_i32(&out, step.prerequisites[p]);
+                    p = p + 1;
+                }
+            } else {
+                text_append_str(&out, "  Prerequisites: None");
+            }
+            text_line(&out);
+            text_append_str(&out, "  Duration: ");
+            text_append_f1(&out, step.estimated_duration);
+            text_append_str(&out, "h");
+            text_line(&out);
+            text_append_str(&out, "  Proof Steps: ");
+            text_append_u32(&out, step.nproof);
+            i = i + 1;
         }
 
-        return join("\n", lines)
+        return out
     }
 
     // Convert Trit to string
-    fn trit_to_string(t: Trit) -> string {
+    fn trit_to_string(t: i8) -> string {
         if t == K_TRUE {
             return "TRUE"
         } else if t == K_FALSE {
@@ -321,32 +692,63 @@ spec CoaPlanning {
         };
     }
 
+    // Test fixtures
+
+    // A step named "test" lasting one hour, as the tests below use throughout
+    fn test_step(step_id: u32, action: ActionType) -> COAStep {
+        return plan_step(step_id, action, "test", 1.0)
+    }
+
+    // Chain 0 -> 1 -> 2
+    fn chain3() -> CourseOfAction {
+        let mut coa = new_coa("test", "objective");
+        coa = add_step(coa, test_step(0, ActionType::ASSESS));
+        coa = add_step(coa, with_prerequisite(test_step(1, ActionType::EXECUTE), 0));
+        coa = add_step(coa, with_prerequisite(test_step(2, ActionType::VERIFY), 1));
+        return coa
+    }
+
+    // COA that has been offered MAX_COA_STEPS + 1 steps
+    fn overfull() -> CourseOfAction {
+        let mut coa = new_coa("test", "objective");
+        let mut i: u32 = 0;
+        while i < MAX_COA_STEPS + 1 {
+            coa = add_step(coa, test_step(i, ActionType::ASSESS));
+            i = i + 1;
+        }
+        return coa
+    }
+
+    // The same COA with its reported step count changed
+    fn with_total_steps(coa: CourseOfAction, total: u32) -> CourseOfAction {
+        return CourseOfAction {
+            coa_id: coa.coa_id,
+            objective: coa.objective,
+            threat_assessment: coa.threat_assessment,
+            steps: coa.steps,
+            nsteps: coa.nsteps,
+            total_steps: total,
+            total_duration: coa.total_duration,
+            verification_status: coa.verification_status,
+            proof_trace: coa.proof_trace
+        }
+    }
+
     // INVARIANTS
 
     // COA generation produces valid plan
     invariant coa_generation_produces_plan {
+        @setEvalBranchQuota(20000000);
         let coa = generate_coa("UAV", K_TRUE);
-        assert coa.total_steps >= 1
+        assert coa.total_steps >= 1;
         assert coa.total_steps <= MAX_COA_STEPS
     }
 
     // COA steps bounded by MAX_COA_STEPS
     invariant coa_steps_bounded {
-        let coa = new_coa("test", K_TRUE);
-
+        @setEvalBranchQuota(20000000);
         // Try to add MAX_COA_STEPS + 1 steps
-        for i in range(0, MAX_COA_STEPS + 1) {
-            let step = COAStep {
-                step_id: i,
-                action_type: ActionType::ASSESS,
-                description: "test",
-                resources: [],
-                prerequisites: [],
-                proof_trace: [],
-                estimated_duration: 1.0
-            };
-            coa = add_step(coa, step);
-        }
+        let coa = overfull();
 
         // Should be capped at MAX_COA_STEPS
         assert coa.total_steps == MAX_COA_STEPS
@@ -354,53 +756,19 @@ spec CoaPlanning {
 
     // Valid prerequisites produce DAG
     invariant valid_prerequisites_dag {
-        let coa = new_coa("test", K_TRUE);
+        @setEvalBranchQuota(20000000);
+        let coa = chain3();
 
-        // Step 0: no prerequisites
-        let step0 = COAStep {
-            step_id: 0,
-            action_type: ActionType::ASSESS,
-            description: "test",
-            resources: [],
-            prerequisites: [],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step0);
-
-        // Step 1: depends on 0
-        let step1 = COAStep {
-            step_id: 1,
-            action_type: ActionType::EXECUTE,
-            description: "test",
-            resources: [],
-            prerequisites: [0],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step1);
-
-        // Step 2: depends on 1
-        let step2 = COAStep {
-            step_id: 2,
-            action_type: ActionType::VERIFY,
-            description: "test",
-            resources: [],
-            prerequisites: [1],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step2);
-
-        let (valid, errors) = validate_prerequisites(coa);
-        assert valid
+        let result = validate_prerequisites(coa);
+        assert result.valid
     }
 
     // TESTS
 
     test new_coa_creates_empty {
-        let coa = new_coa("test", K_UNKNOWN);
-        assert len(coa.steps) == 0;
+        // The original passed K_UNKNOWN as the objective, which is a string
+        let coa = new_coa("test", "objective");
+        assert coa.nsteps == 0;
         assert coa.total_steps == 0;
         assert coa.verification_status == K_UNKNOWN
     }
@@ -413,178 +781,72 @@ spec CoaPlanning {
     }
 
     test add_step_increments_count {
-        let coa = new_coa("test", K_TRUE);
-        let coa2 = add_step(coa, COAStep {
-            step_id: 0,
-            action_type: ActionType::ASSESS,
-            description: "test",
-            resources: [],
-            prerequisites: [],
-            proof_trace: [],
-            estimated_duration: 1.0
-        });
+        let coa = new_coa("test", "objective");
+        let coa2 = add_step(coa, test_step(0, ActionType::ASSESS));
 
         assert coa2.total_steps == 1
     }
 
     test add_step_respects_max_steps {
-        let coa = new_coa("test", K_TRUE);
+        let mut coa = new_coa("test", "objective");
 
-        for i in range(0, MAX_COA_STEPS) {
-            let step = COAStep {
-                step_id: i,
-                action_type: ActionType::ASSESS,
-                description: "test",
-                resources: [],
-                prerequisites: [],
-                proof_trace: [],
-                estimated_duration: 1.0
-            };
-            coa = add_step(coa, step);
+        let mut i: u32 = 0;
+        while i < MAX_COA_STEPS {
+            coa = add_step(coa, test_step(i, ActionType::ASSESS));
+            i = i + 1;
         }
 
         // Try to add one more
-        let coa2 = add_step(coa, COAStep {
-            step_id: MAX_COA_STEPS,
-            action_type: ActionType::ASSESS,
-            description: "test",
-            resources: [],
-            prerequisites: [],
-            proof_trace: [],
-            estimated_duration: 1.0
-        });
+        let coa2 = add_step(coa, test_step(MAX_COA_STEPS, ActionType::ASSESS));
 
         // Should remain at MAX_COA_STEPS
-        assert coa.total_steps == MAX_COA_STEPS
+        assert coa.total_steps == MAX_COA_STEPS;
+        assert coa2.total_steps == MAX_COA_STEPS
     }
 
     test verify_coa_passes_valid {
         let coa = generate_coa("test", K_TRUE);
-        let constraints: [COAConstraint] = [];
 
-        let (valid, _) = verify_coa(coa, constraints);
-        assert valid
+        let result = verify_coa(coa, no_constraints());
+        assert result.valid;
+        assert contains(result.message, "COA verified successfully")
     }
 
     test verify_coa_fails_excessive_steps {
-        let coa = new_coa("test", K_TRUE);
+        // add_step caps a plan at MAX_COA_STEPS, so offering MAX_COA_STEPS + 1
+        // steps never yields a plan that reports more. The plan below reports
+        // MAX_COA_STEPS + 1, the corrupted plan verify_coa exists to reject.
+        let coa = with_total_steps(overfull(), MAX_COA_STEPS + 1);
 
-        // Add MAX_COA_STEPS + 1 steps
-        for i in range(0, MAX_COA_STEPS + 1) {
-            let step = COAStep {
-                step_id: i,
-                action_type: ActionType::ASSESS,
-                description: "test",
-                resources: [],
-                prerequisites: [],
-                proof_trace: [],
-                estimated_duration: 1.0
-            };
-            coa = add_step(coa, step);
-        }
+        let constraint = make_constraint(ConstraintType::LOGICAL, "step count");
 
-        let constraint = COAConstraint {
-            constraint_type: ConstraintType::LOGICAL,
-            description: "step count",
-            enforces: []
-        };
-
-        let (valid, msg) = verify_coa(coa, [constraint]);
-        assert !valid;
-        assert contains(msg, "Too many steps")
+        let result = verify_coa(coa, one_constraint(constraint));
+        assert !result.valid;
+        assert contains(result.message, "Too many steps")
     }
 
     test validate_prerequisites_passes_valid_dag {
-        let coa = new_coa("test", K_TRUE);
-
         // Chain: 0 -> 1 -> 2
-        let step0 = COAStep {
-            step_id: 0,
-            action_type: ActionType::ASSESS,
-            description: "test",
-            resources: [],
-            prerequisites: [],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step0);
+        let coa = chain3();
 
-        let step1 = COAStep {
-            step_id: 1,
-            action_type: ActionType::EXECUTE,
-            description: "test",
-            resources: [],
-            prerequisites: [0],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step1);
-
-        let step2 = COAStep {
-            step_id: 2,
-            action_type: ActionType::VERIFY,
-            description: "test",
-            resources: [],
-            prerequisites: [1],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step2);
-
-        let (valid, _) = validate_prerequisites(coa);
-        assert valid
+        let result = validate_prerequisites(coa);
+        assert result.valid;
+        assert result.nerrors == 0
     }
 
     test validate_prerequisites_fails_cycle {
-        let coa = new_coa("test", K_TRUE);
+        // Cycle: 0 -> 1 -> 2 -> 3 -> 0. The original left step 0 without the
+        // edge back from step 3, which made the plan a plain chain.
+        let mut coa = new_coa("test", "objective");
+        coa = add_step(coa, with_prerequisite(test_step(0, ActionType::ASSESS), 3));
+        coa = add_step(coa, with_prerequisite(test_step(1, ActionType::EXECUTE), 0));
+        coa = add_step(coa, with_prerequisite(test_step(2, ActionType::VERIFY), 1));
+        coa = add_step(coa, with_prerequisite(test_step(3, ActionType::MAINTAIN), 2));
 
-        // Cycle: 0 -> 1 -> 2 -> 0
-        let step0 = COAStep {
-            step_id: 0,
-            action_type: ActionType::ASSESS,
-            description: "test",
-            resources: [],
-            prerequisites: [],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step0);
-
-        let step1 = COAStep {
-            step_id: 1,
-            action_type: ActionType::EXECUTE,
-            description: "test",
-            resources: [],
-            prerequisites: [0],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step1);
-
-        let step2 = COAStep {
-            step_id: 2,
-            action_type: ActionType::VERIFY,
-            description: "test",
-            resources: [],
-            prerequisites: [1],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step2);
-
-        let step3 = COAStep {
-            step_id: 3,
-            action_type: ActionType::MAINTAIN,
-            description: "test",
-            resources: [],
-            prerequisites: [2],
-            proof_trace: [],
-            estimated_duration: 1.0
-        };
-        coa = add_step(coa, step3);
-
-        let (valid, _) = validate_prerequisites(coa);
-        assert !valid
+        let result = validate_prerequisites(coa);
+        assert !result.valid;
+        assert result.nerrors == 1;
+        assert result.errors[0] == 0
     }
 
     test extract_proof_trace_collects_all_steps {
@@ -592,7 +854,8 @@ spec CoaPlanning {
 
         let trace = extract_proof_trace(coa);
         // Each step should have at least one proof step
-        assert len(trace.steps) >= len(coa.steps)
+        assert trace.count >= coa.nsteps;
+        assert str_eq(trace.steps[0].operation, "k3_assess")
     }
 
     test format_coa_produces_readable_output {
@@ -600,8 +863,44 @@ spec CoaPlanning {
         let formatted = format_coa(coa);
 
         assert contains(formatted, "Course of Action");
-        assert contains(formatted, "COA ID:");
-        assert contains(formatted, "Total Steps:")
+        assert contains(formatted, "COA ID: COA-UAV-0");
+        assert contains(formatted, "Total Steps: 5 (Max: 10)");
+        assert contains(formatted, "Estimated Duration: 13.0 hours");
+        assert contains(formatted, "Prerequisites: None")
+    }
+
+    test temporal_constraint_limits_duration {
+        let coa = generate_coa("UAV", K_TRUE);
+        let mut tight = make_constraint(ConstraintType::TEMPORAL, "deadline");
+        tight.max_duration = 10.0;
+        let mut loose = make_constraint(ConstraintType::TEMPORAL, "deadline");
+        loose.max_duration = 20.0;
+        assert !satisfies_constraint(coa, tight);
+        assert satisfies_constraint(coa, loose)
+    }
+
+    test logical_constraint_needs_all_true {
+        let coa = generate_coa("UAV", K_TRUE);
+        let mut holds = make_constraint(ConstraintType::LOGICAL, "all true");
+        holds.enforces = [K_TRUE, K_TRUE, K_TRUE];
+        holds.nenforces = 3;
+        let mut breaks = make_constraint(ConstraintType::LOGICAL, "one unknown");
+        breaks.enforces = [K_TRUE, K_UNKNOWN, K_TRUE];
+        breaks.nenforces = 3;
+        assert satisfies_constraint(coa, holds);
+        assert !satisfies_constraint(coa, breaks);
+        let result = verify_coa(coa, one_constraint(breaks));
+        assert !result.valid;
+        assert contains(result.message, "Constraint failed: one unknown")
+    }
+
+    test names_of_enum_and_trit_values {
+        assert str_eq(action_type_to_string(ActionType::ASSESS), "ASSESS");
+        assert str_eq(action_type_to_string(ActionType::MAINTAIN), "MAINTAIN");
+        assert str_eq(trit_to_string(K_TRUE), "TRUE");
+        assert str_eq(trit_to_string(K_FALSE), "FALSE");
+        assert str_eq(trit_to_string(K_UNKNOWN), "UNKNOWN");
+        assert str_eq(trit_to_string(5), "INVALID")
     }
 
     // BENCHMARKS
