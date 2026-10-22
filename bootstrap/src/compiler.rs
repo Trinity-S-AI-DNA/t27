@@ -20174,6 +20174,23 @@ long double: fabsl, default: llabs)(x)",
         false
     }
 
+    /// The C element type of an untyped array literal (#11183): its own, a numeric or call list's, a struct literal's, else its first non-number element's.
+    fn c_list_elem(&mut self, lit: &Node) -> String {
+        if !lit.extra_type.is_empty() { return lit.extra_type.clone(); }
+        if let Some(t) = Self::c_literal_list_elem(lit).or_else(|| self.c_call_list_elem(lit)) { return t; }
+        let pick = lit.children.iter().find(|e| e.kind != NodeKind::ExprUnary && !(e.kind == NodeKind::ExprLiteral && e.value.starts_with(|c: char| c.is_ascii_digit()))).or(lit.children.first());
+        match pick {
+            Some(e) if e.kind == NodeKind::ExprStructLit => e.name.clone(),
+            Some(e) => {
+                let saved = std::mem::take(&mut self.output);
+                self.gen_c_expr(e);
+                let text = std::mem::replace(&mut self.output, saved);
+                if e.extra_kind == "string" { "str".to_string() } else { format!("__typeof__({text})") }
+            }
+            None => format!("__typeof__({})", lit.extra_size.trim()),
+        }
+    }
+
     fn gen_c_const(&mut self, node: &Node) {
         // Detect type alias pattern: ConstDecl with single ExprIdentifier child
         // that looks like a type name (e.g., pub const PackedTrit = u8;)
@@ -20277,9 +20294,14 @@ long double: fabsl, default: llabs)(x)",
                 // builds it rather than a fourth copy of the rule: parameters
                 // want `T x[static N]` (#3435), fields and now consts want
                 // `T name[N]` (#3446), and a local wants it too (#3448).
-                match Self::c_module_array_decl(&node.extra_type, &node.name) {
-                    Some(decl) => self.write(&format!("static const {} = ", decl)),
-                    None => self.write(&format!("static const {} {} = ", c_type, node.name)),
+                if node.extra_type.is_empty() && child.children.first().is_some_and(|e| child.kind == NodeKind::ExprArrayLiteral && !matches!(e.kind, NodeKind::ExprArrayLiteral | NodeKind::ExprStructLit | NodeKind::ExprTuple)) {
+                    let elem = self.c_list_elem(child); // #11183: an untyped list constant is an array, not an `int`
+                    self.write(&format!("static {} const {}[{}] = ", Self::type_to_c(&elem), node.name, child.children.len()));
+                } else {
+                    match Self::c_module_array_decl(&node.extra_type, &node.name) {
+                        Some(decl) => self.write(&format!("static const {} = ", decl)),
+                        None => self.write(&format!("static const {} {} = ", c_type, node.name)),
+                    }
                 }
                 self.gen_c_expr(child);
                 self.write_line(";");
@@ -21560,13 +21582,13 @@ long double: fabsl, default: llabs)(x)",
                             None => ("", elem),
                         };
                         let c_elem = format!("{}{}", qual, Self::type_to_c(elem));
-                        if size.is_empty() && node.children.is_empty() {
+                        if size.is_empty() && node.children.first().map_or(true, |c| c.kind == NodeKind::ExprIndex) {
                             // A slice `[]T` has no compile-time length, and
                             // `uint8_t x[];` is not a definition -- clang says
                             // "definition of variable with array type needs an
                             // explicit size or an initializer".
                             //
-                            // ONLY when there is no initialiser. `T x[] = {…}`
+                            // ONLY when there is no initialiser, or a slice of one (#11183: a range slice is a pointer). `T x[] = {…}`
                             // is legal C and takes its size from the list, and
                             // rewriting that to `T* x = {…}` made the one
                             // corpus file carrying the shape WORSE -- measured,
@@ -21653,7 +21675,9 @@ long double: fabsl, default: llabs)(x)",
                                     || Self::c_literal_list_elem(c).is_some()
                                     // ... and a list of calls, whose element
                                     // type is a LOOKUP in `fn_return_types`.
-                                    || self.c_call_list_elem(c).is_some())
+                                    || self.c_call_list_elem(c).is_some()
+                                    || (c.children.first().is_some_and(|e| !matches!(e.kind, NodeKind::ExprArrayLiteral | NodeKind::ExprStructLit | NodeKind::ExprTuple)) && c.children.iter().any(|e| e.kind != NodeKind::ExprCall || e.name.starts_with('@')))
+                                    || (c.children.is_empty() && !c.extra_size.contains([';', ',']))) // #11183
                         })
                 {
                     // W699 rung 3: `const vals = [_]i32{...}` has no annotation,
@@ -21662,17 +21686,7 @@ long double: fabsl, default: llabs)(x)",
                     // '__auto_type' with initializer list". The literal carries
                     // its own element type and its own length; use them.
                     let lit = node.children.first().unwrap();
-                    let elem: String = if !lit.extra_type.is_empty() {
-                        lit.extra_type.clone()
-                    } else if let Some(t) = Self::c_literal_list_elem(lit) {
-                        t
-                    } else if let Some(t) = self.c_call_list_elem(lit) {
-                        t
-                    } else {
-                        // Recovered from the first element; the condition above
-                        // established it is a named struct literal.
-                        lit.children.first().map(|e| e.name.clone()).unwrap_or_default()
-                    };
+                    let elem = self.c_list_elem(lit);
                     // W583, third instance. The `is_primitive` gate lists only
                     // the integer scalars, so `f32`, `f64`, `str` and `gf16`
                     // took the pass-through arm; `type_to_c` passes a genuinely
@@ -22632,6 +22646,12 @@ long double: fabsl, default: llabs)(x)",
             }
             NodeKind::ExprIndex => {
                 if node.children.len() >= 2 {
+                    // #11183: `a[lo..hi]`, `a[lo..]`, `a[lo:hi]` is a slice, and a slice is a pointer in C (its length is lost
+                    // where every `[]T` loses it, D4): the address of element `lo`, not `a[lo]` and not `a[(lo .. hi)]`.
+                    let r = &node.children[1];
+                    let range = r.kind == NodeKind::ExprBinary && r.extra_op == ".." && r.children.len() == 2;
+                    let slice = range || node.extra_op.starts_with("slice");
+                    self.write(if slice { "(" } else { "" });
                     self.gen_c_expr(&node.children[0]);
                     // [T; N] values are by-value structs: index the .v member.
                     if node.children[0].kind == NodeKind::ExprIdentifier
@@ -22639,9 +22659,9 @@ long double: fabsl, default: llabs)(x)",
                     {
                         self.write(".v");
                     }
-                    self.write("[");
-                    self.gen_c_expr(&node.children[1]);
-                    self.write("]");
+                    self.write(if slice { " + " } else { "[" });
+                    self.gen_c_expr(if range { &r.children[0] } else { r });
+                    self.write(if slice { ")" } else { "]" });
                 }
             }
             NodeKind::ExprSwitch => {
