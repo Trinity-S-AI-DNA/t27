@@ -132,6 +132,61 @@ pub fn held_part(stored: []const u8, sn: usize, current: []const u8, cn: usize) 
     return HP_APART;
 }
 
+; --- A claim on the issue follows the work as it stands now (t27#9021 jam round, 2026-10-11) ----------
+; The files a row holds are decided above. The ISSUE a row claims is decided by its state
+; (QueenDelegationPolicy.claimOnIssue: running, queued, rejected and awaitingReview are live, accepted is
+; done, failed and cancelled are free). Two of those claims outlive the work they stand for.
+; Measured on the live Queen 2026-10-11 12:55Z, 89 open issues claimed (public tasks and drawers):
+;   running 16 (all on runners with a live lease; ages 2-102 min), wait 47 (lane A, t27#9069),
+;   empty 10 (0-24 min), sendBack 9 (6-55 min), escalate 5 (11-58 min), one app-registry task.
+; - A SEND-BACK claims its issue as "the same bee is expected back on it". No bee comes back: a verdict
+;   is written only on a finished row, a runner deletes the bee's session when its turn ends (runner logs
+;   2026-10-11: "Agent disposed", "Session deleted" in the same millisecond as "turn finished"), and
+;   nothing resumes a send-back (queen-tick.ts: "Nothing returns"). The runtime frees it as `failed` only
+;   after an idle hour, and its files after two, so from minute 60 to 120 it shuts its own next attempt
+;   out. 8 of the 9 send-backs were under the retry ceiling: each waited for nothing.
+; - An ACCEPT claims its issue as done for as long as the row is in the 7-day window. Of the 374 issues
+;   counted `completed` at 12:47Z, 2 had a pull request from queen-<issue> that was closed unmerged and
+;   none open or merged (#4374, #6414): the work will never land, and the issue is never chosen again.
+;   121 had an open pull request; closing a stale one would strand its issue the same way.
+; - An accept with NO pull request at all (213) is not freed. All 213 have a queen-<issue> branch; 206
+;   carry a head other than the one the Queen accepted, and that head is on no branch on GitHub: the
+;   accepted commit is still in the Queen's export, which queen-export-push.yml has failed to reach on
+;   every run since 2026-10-08 06:15Z ("The read operation timed out"). Freeing them would throw away
+;   accepted work and spend a bee on each; the repair is the export, not the claim.
+
+/// What a dispatch row claims on its issue. FREE: the issue may be chosen again. LIVE: someone has it or
+/// it waits on a verdict. DONE: the work is accepted and may still land.
+pub const CL_FREE : u8 = 0;
+pub const CL_LIVE : u8 = 1;
+pub const CL_DONE : u8 = 2;
+
+/// What a send-back claims. Under the retry ceiling its issue is free at once: the next attempt is a new
+/// bee, briefed with the review, starting from the branch it inherits (control.t27 attempt_start). At the
+/// ceiling the claim stays live and the review valve decides, as before.
+pub fn send_back_claim(send_backs: u32, ceiling: u32) -> u8 {
+    if (send_backs < ceiling) { return CL_FREE; }
+    return CL_LIVE;
+}
+
+/// What an accept claims, by the pull requests whose head is its branch, as read now. `read`: the list
+/// was read (an unreadable list frees nothing). Merged or open: the work landed or may land, DONE. Only
+/// closed unmerged: it never will, FREE. None at all: DONE, the work waits in the export (see above).
+pub fn accept_claim(read: bool, open: u32, merged: u32, closed_unmerged: u32) -> u8 {
+    if (read == false) { return CL_DONE; }
+    if (merged > 0) { return CL_DONE; }
+    if (open > 0) { return CL_DONE; }
+    if (closed_unmerged > 0) { return CL_FREE; }
+    return CL_DONE;
+}
+
+/// The stage a row holds files at, once its claim is known. A freed claim holds no files: the next
+/// attempt on the issue is its own, and a hold against it would shut its own issue out.
+pub fn held_stage(claim: u8, stage: u8) -> u8 {
+    if (claim == CL_FREE) { return HS_DONE; }
+    return stage;
+}
+
 test a_bee_at_work_holds_its_files {
     assert holds_files(HS_WORKING, 0) == true;
     assert holds_files(HS_WORKING, 4000000000) == true;
@@ -211,6 +266,55 @@ test a_dropped_path_holds_nothing {
     assert held_part("./", 2, "specs/a", 7) == HP_APART;
     // the length bounds the read
     assert held_part("specs/a.t27", 7, "specs/a", 7) == HP_STORED;
+}
+
+test a_send_back_under_the_ceiling_frees_its_issue {
+    // 12:55Z: 8 of 9 send-backs had 0 or 1 counted, under a ceiling of 2
+    assert send_back_claim(0, 2) == CL_FREE;
+    assert send_back_claim(1, 2) == CL_FREE;
+    // #8939 had spent its two: the review valve keeps it
+    assert send_back_claim(2, 2) == CL_LIVE;
+    assert send_back_claim(3, 2) == CL_LIVE;
+    // a ceiling of none frees nothing
+    assert send_back_claim(0, 0) == CL_LIVE;
+}
+
+test a_pull_request_closed_unmerged_frees_its_accept {
+    // #4374 (PR #4565 closed) and #6414 (PR #6752 closed), nothing open or merged
+    assert accept_claim(true, 0, 0, 1) == CL_FREE;
+    assert accept_claim(true, 0, 0, 3) == CL_FREE;
+}
+
+test an_open_or_merged_pull_request_keeps_the_accept {
+    // 121 issues with an open PR; #5074 and #6382 merged
+    assert accept_claim(true, 1, 0, 0) == CL_DONE;
+    assert accept_claim(true, 0, 1, 0) == CL_DONE;
+    // #4372: an old PR closed and a newer one open
+    assert accept_claim(true, 1, 0, 1) == CL_DONE;
+    assert accept_claim(true, 0, 1, 2) == CL_DONE;
+}
+
+test no_pull_request_or_no_reading_keeps_the_accept {
+    // the 213 that never reached a PR: the accepted head waits in the export
+    assert accept_claim(true, 0, 0, 0) == CL_DONE;
+    // GitHub could not be read: nothing is freed on a guess
+    assert accept_claim(false, 0, 0, 1) == CL_DONE;
+    assert accept_claim(false, 0, 0, 0) == CL_DONE;
+}
+
+test a_freed_claim_holds_no_files {
+    assert held_stage(CL_FREE, HS_SEND_BACK) == HS_DONE;
+    assert held_stage(CL_FREE, HS_WORKING) == HS_DONE;
+    assert holds_files(held_stage(CL_FREE, HS_SEND_BACK), 0) == false;
+    // a live or done claim keeps its stage, and the stage rule as before
+    assert held_stage(CL_LIVE, HS_SEND_BACK) == HS_SEND_BACK;
+    assert held_stage(CL_DONE, HS_DONE) == HS_DONE;
+    assert holds_files(held_stage(CL_LIVE, HS_SEND_BACK), SEND_BACK_HOLD_MINUTES - 1) == true;
+    assert holds_files(held_stage(CL_LIVE, HS_WORKING), 0) == true;
+}
+
+invariant the_claims_are_three {
+    assert CL_FREE != CL_LIVE and CL_LIVE != CL_DONE and CL_FREE != CL_DONE;
 }
 
 invariant a_send_back_waits_longer_than_finished_work {
