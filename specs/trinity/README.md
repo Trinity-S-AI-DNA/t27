@@ -45,21 +45,25 @@ owns its contract.
 ```
 python3 tools/trinity_manifest.py inventory --trinity-root <clean clone of gHashTag/trinity at PINNED_REVISION>
 python3 tools/trinity_manifest.py check
-python3 tools/trinity_manifest.py --self-check     # negative control: thirteen planted defects, each reported
+python3 tools/trinity_manifest.py --self-check     # negative control: sixteen planted defects, each reported, and the comment and vendored-copy rules end to end
 ```
 
 `inventory` refuses a tree with a modified tracked file. It reads `build.zig` (every
 `addExecutable` / `addTest` / `addLibrary`, every `b.step`, every `installArtifact` and the `if`
 that guards it), `build.zig.zon`, `.gitmodules`, the tracked tree (one entry per directory), the `.t27` / `.tri` /
-`.vibee` / `.zig` counts with the website mirror (`apps/website/public/t27/files/`) set apart,
+`.vibee` / `.zig` counts with the website mirror (`apps/website/public/t27/files/`) and the
+consumer's vendored copies of this repository's contracts (`external/t27/`) each set apart,
 the reachability of every `.zig` file from the files `build.zig` names through relative
-`@import`, `.trinity/registry.json` and the vendored catalog counts.
+`@import`, `.trinity/registry.json` and the vendored catalog counts. `build.zig` and the `.zig`
+files are read with their `//` comments blanked in place; a `//` inside a string or a multiline
+string line is kept, so a step, an install or an `@import` that exists only in a comment is not
+counted.
 
 `check` fails on: a pinned revision or a count that differs from the inventory; a dirty
 inventory; a target `build.zig` defines that no card owns, or two cards own, or a card owns
 that the build does not define; a default-installed target on a non-headless card or a
 `!ci_mode`-guarded target on a headless one; a `trinity:` path that is not tracked; a mirrored
-file cited as canonical; a `DIALECT` that disagrees with the extension of `CANONICAL_SPEC`; a
+or vendored file cited as canonical; a `DIALECT` that disagrees with the extension of `CANONICAL_SPEC`; a
 backend claimed by a card that is not executable, adapter or research; two owners for one
 canonical spec; two cards with one `ID`; `EVIDENCE = "measured"` without `ACCEPTANCE` and
 `EVIDENCE_SOURCE`; a work package without a card or a card naming a package the project does
@@ -97,13 +101,18 @@ in a repository or a public CI log, command and revision recorded in `EVIDENCE_S
 path is a file of this repository; `<repo>:<path>` names another repository and is recorded,
 not checked.
 
-## What the inventory measured at gHashTag/trinity@976df517 (2026-09-12)
+## What the inventory measured at gHashTag/trinity@976df517 (2026-09-12, corrected 2026-10-01)
 
-- 51 executables, 6 libraries, 73 tests and 68 steps in `build.zig`; 46 targets installed by
-  `zig build -Dci=true`, 5 guarded by `!ci_mode` (the raylib canvas and the node GUI).
-- 31 `.t27` files outside the website mirror, 1044 inside it; 764 `.tri`; 1981 `.vibee` (1428 of
-  them under `deploy/trinity-nexus`); 2830 `.zig`, of which 749 are reachable from the 173 files
-  `build.zig` names and 2081 are not.
+- 51 executables, 6 libraries, 73 tests and 66 steps in `build.zig`; 46 targets installed by
+  `zig build -Dci=true`, 3 guarded by `!ci_mode` (photon-demo, photon-immersive and the node GUI).
+  The steps `needle-mcp` and `trinity-mcp` and the installs of `trinity-canvas` and
+  `trinity-canvas-wasm-check` exist only in commented-out lines. Until 2026-10-01 the inventory
+  read comments and counted 68 steps and 5 guarded installs, and the two MCP cards owned the
+  two steps (gHashTag/trinity#989).
+- 31 `.t27` files outside the website mirror, 1044 inside it, none under `external/t27/` at this
+  revision; 764 `.tri`; 1981 `.vibee` (1428 of them under `deploy/trinity-nexus`); 2830 `.zig`, of
+  which 748 are reachable from the 173 files `build.zig` names and 2082 are not (749 and 2081
+  until 2026-10-01: one file is reached only through a commented-out `@import`).
 - Four pinned dependencies (`emsdk`, `raylib`, `zig_hdc`, `zig_golden_float`) and one submodule
   (`external/zig-golden-float`, a second, unpinned reference to the same repository).
 - 29 commands in `.trinity/registry.json`; the vendored catalog holds 856 distinct specs from 8
@@ -111,6 +120,12 @@ not checked.
 - The measured evidence of the headless profile is one public CI run (`Build & Test`,
   ubuntu-latest, zig 0.15.2) in which `zig build -Dci=true` succeeded; the test step is piped
   through `tee` there and its exit code is not measured (gHashTag/trinity#616).
+- One card is ahead of the pin. `brain.regions` (2026-10-04, gHashTag/t27#5953) owns the eleven
+  brain test targets that gHashTag/trinity#1333 puts back into `build.zig`: five steps and six
+  `src/brain` test roots. None of them exists at this revision, so `check` reports eleven
+  `UNKNOWN_TARGET` findings, and `report.json` keeps them until S01 re-pins. Against an
+  inventory of gHashTag/trinity@291ac8b24, the head of #1333, the card has no finding and none of
+  the eleven is unassigned. `research.unreferenced-sources` no longer names `src/brain`.
 
 ## The compiler matrix (S02)
 
@@ -421,7 +436,8 @@ python3 tools/trinity_tri_api_session.py --self-check [--trinity-root <clone> --
 `specs/queen/dispatch.t27` (`QueenDispatch`, `KIND = "queen-dispatch"`) is the canonical state machine of a
 Queen task: choose, start, end, review, retry, release. It is taken from the one cycle in this family that
 moves work, the round of the trios supervisor (gHashTag/BrowserOS `trios/agent-server`, branch
-`feat/queen-supervisor` at `c25e1b02`), and it names the others as adapters with their gaps:
+`fix/queen-worker-provider-and-prompt-size` at `879799a8`, the branch production deploys; re-pinned
+from the deleted `feat/queen-supervisor` at `c25e1b02` by #6368), and it names the others as adapters with their gaps:
 `lotus-policy` (gHashTag/trinity `src/tri/queen/lotus_cycle.zig`, a loop that tunes a resource policy and
 holds no task; `specs/queen/lotus.t27` is its design), the six AGENTS.md phases (documented as
 `tri queen lotus --phase`, implemented nowhere), the AEL v2.0 loop of an agent session and the PHI LOOP of a
@@ -435,10 +451,11 @@ The evidence runs the supervisor's own code, five kinds kept apart in `tools/tri
   the single-flight round gate;
 - **queend**: its Swift policy binary built at the pin -- choose over all 120 orders of five candidates,
   capacity, review over a grid, retry over every sequence of failure kinds;
-- **pg**: PostgreSQL 16 with its own migrations -- the singleton lease under 32 contenders for 20 rounds,
+- **pg**: PostgreSQL (17.7 at `879799a8`, 16.15 at `c25e1b02`) with its own migrations -- the singleton lease under 32 contenders for 20 rounds,
   expiry and fencing, the dispatch writers on real rows, the criteria release, the CI take-back, and the
   round's own SELECT read out of the pinned source;
-- **lotus**: the Zig cycle compiled with Zig 0.15.2, 29 of 29 tests in Debug and ReleaseFast;
+- **lotus**: the Zig cycle compiled with Zig 0.15.2, 29 of 29 tests in Debug and ReleaseFast (at the trinity
+  pin, measured in the `c25e1b02` run; the re-pin does not move it);
 - **live**: one snapshot of the deployed supervisor's public endpoints.
 
 `run` replays the spec through the generated C on 2488 cases drawn from these records; `--self-check`
@@ -449,8 +466,9 @@ issue in GitHub's listing order is taken. The one-release bound of a spent retry
 because neither the round nor the board selects `ceiling_releases`: a stored 1 reads as 0 and the issue is
 handed back every hour. The public board draws a closed issue as done whatever its verdict. Accept needs
 criteria, a commit and a reviewer, but no pull request, CI or merge. One Queen at a time holds under
-contention, but the dispatch writer itself enforces nothing, a bee has no heartbeat (reaped by age at 120
-minutes), and nothing cancels one. The 27 named agents are documentation, not workers.
+contention, but the dispatch writer itself enforces nothing, a bee the container runs has no heartbeat (reaped by age
+at 120 minutes; at `879799a8` a claimed bee or a runner's task is also reaped by a missed renewal), and
+nothing cancels one. The 27 named agents are documentation, not workers.
 
 `specs/queen/task_analysis.t27` is fixed in place: it sorted by returning its input and did not compile;
 it now orders by its score with tests on unsorted input (7 of 7 in C and Zig) and says no runtime applies
@@ -460,7 +478,7 @@ refreshed here.
 Not measured: GitHub, a real provider or bee, the Mac app's own loop, the revision Railway actually runs.
 
 ```
-python3 tools/trinity_queen_dispatch.py ts    --browseros-root <checkout at c25e1b02> --bun <bun 1.3.6> --queend <queend>
+python3 tools/trinity_queen_dispatch.py ts    --browseros-root <checkout at 879799a8> --bun <bun> --queend <queend>
 python3 tools/trinity_queen_dispatch.py pg    --browseros-root <checkout> --bun <bun> --database-url <throwaway postgres>
 python3 tools/trinity_queen_dispatch.py lotus --trinity-root <clone at afc9d384> --zig <zig 0.15.2> [--sysroot <dir>]
 python3 tools/trinity_queen_dispatch.py live
@@ -551,7 +569,7 @@ python3 tools/trinity_queen_views.py --self-check --zig <zig 0.15.2> [--sysroot 
 `specs/fpga/adapter.t27` (card: `trinity/fpga.adapter`) is the FPGA adapter
 contract of [gHashTag/t27#3573](https://github.com/gHashTag/t27/issues/3573):
 the versioned inputs a caller brings (bitstream path, sha256 tied to its
-provenance, board identity under the full-IDCODE rule — the full 32-bit value
+provenance, board identity under the full-IDCODE rule -- the full 32-bit value
 recorded beside the printed nibble-dropped form, so a masked match can never
 pass), the configuration (flasher, cable, sram/flash target), the eight
 distinct error statuses, and the receipt schema `trinity.fpga-receipt.v1`
@@ -562,5 +580,5 @@ bit-exact` line. No hardware run may be inferred from synthesis (#3573's
 law). `tools/trinity_fpga_adapter.py check` holds the receipts of
 `conformance/trinity/fpga_adapter.json` to the contract and `self-check`
 plants every defect; the device receipts are the stage-2 runs of
-dmitrii-f-t27/trinity-memory on the AX7203 — the golden chunk (dense5 and
+dmitrii-f-t27/trinity-memory on the AX7203 -- the golden chunk (dense5 and
 baseline2, 320/320 Y lines bit-exact) and the #65 measurements.
