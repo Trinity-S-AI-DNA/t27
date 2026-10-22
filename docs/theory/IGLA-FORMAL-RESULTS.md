@@ -3903,6 +3903,31 @@ exactly what the Zig backend turns into `@compileError("not yet implemented")`.
 > "40% of the specs that parse have no implementation" is over a denominator
 > that has changed twice.
 
+> **RE-TAKEN AT `4f65684d`.**
+> `t27c impl-status --specs-dir specs`, using the compiler built from
+> `d4c4f2f4` (its `bootstrap/` tree is identical at `4f65684d`), reports the
+> following on this exact tree (2026-10-02):
+>
+> | Classification | Count |
+> |---|---:|
+> | fully implemented | 736 |
+> | with NO functions | 350 |
+> | partly written | 16 |
+> | entirely unwritten | 17 |
+> | do not parse | 27 |
+> | **total** | **1146** |
+> | functions declared | 6721 |
+> | functions with no body | 187 |
+>
+> These are the implementation-status command's categories, not execution or
+> deployment results. The corpus at that commit -- `.t27` files under `specs/`
+> outside any `scratch` directory -- is <!-- corpus-count anchor=4f65684dffa799dab4e1068ce7c6416be5c8cca7 -->1146<!-- /corpus-count --> specs,
+> the same as the **total** row above. That figure is generated, not
+> typed: `python3 scripts/ci/test_retaken_propositions_still_match.py --write`
+> counts the tree at the anchor, and the same script fails CI when the block,
+> this heading's commit, or the total row disagree with that tree. It is the
+> corpus *at the anchor*; specs merged since do not make it stale (#5799).
+
 **Consequence for every earlier number.** `COMPILE_FAIL 216` was
 `COMPILE_FAIL 98 + UNIMPLEMENTED 118`. The metric this chain drove down from
 W560 to W585 was **more than half composed of specs nobody had written**, and no
@@ -4324,11 +4349,18 @@ the codegen reads from the AST".
 checks, until this wave. `t27c catalog-gate`:
 
 > **RE-TAKEN AT `15ac5b5b1` AND EVERY ROW HAS MOVED.** The table below is the W602
-> reading and is kept as one. Today the catalog holds **109** records, not 83 --
+> reading and is kept as one. At that commit the catalog holds
+> <!-- catalog-count anchor=15ac5b5b16c86076e3cf256ef78cf0371611e096 -->109<!-- /catalog-count --> records, not 83 --
 > `grep -c 'CATALOG:' specs/numeric/formats_catalog.t27`, which is an exact
 > re-take because `mandatory-field` is bumped once per parsed record with no
 > predicate. Two commits did it: 83 -> 92 at `08adcc39f` ("register the GF-T
 > ladder in the catalog SSOT, all nine rungs") and 92 -> 109 at `b92872507`.
+> That figure is generated, not typed:
+> `python3 scripts/ci/test_catalog_table_matches_the_gate.py --write` counts the
+> catalog at the anchor, and the same script fails CI when the block, this
+> heading's commit, or the `mandatory-field` row below disagree with that tree.
+> It is the only figure the check reads; the same number elsewhere in this
+> document no longer satisfies it (#5881).
 >
 > | Check | W602 | `15ac5b5b1` |
 > |---|---:|---:|
@@ -6495,7 +6527,7 @@ What is *not* implemented survives the correction:
 
 | object | status |
 |---|---|
-| **GF-T16** (accumulator float) | implemented, silicon-proven, 81-value trit-encoded exponent |
+| **GF-T16** (accumulator float) | implemented, FPGA-proven (AX7203), 81-value trit-encoded exponent |
 | **GA-T** (`{−φ,0,+φ}` weight alphabet) | defined, **consumed by nothing** |
 | **TNF** (signed rung) | **absent from every spec** |
 
@@ -6544,7 +6576,7 @@ stage is needed between nodes either. **Two boundaries, one closure.**
 
 `specs/numeric/tnf17.t27` is the first implementation of TNF in this project.
 `TNF17e = [ sign(1) | offset(7) | mantissa(9) ]`, magnitude bit-identical to the
-silicon-proven GF-T16, so **the sign is the only new thing to verify**.
+FPGA-proven (AX7203) GF-T16, so **the sign is the only new thing to verify**.
 
 Measured synthesis of `on_comb(x) = tnf_negate(x)`:
 
@@ -9450,7 +9482,7 @@ repositories in name only. And **forty-one of fifty-six sit in name families**:
 10  trinity-*      (6 empty)     8  zig-half*      (8 empty -- ALL)
  6  trios-*        (1 empty)     5  zig-*          (3 empty)
  3  goldenfloat*   (2 empty)     3  go-half*       (2 empty)
- 2  trios-railway* (1)           2  trinity-clara* (1)
+ 2  trios-railway* (1)
  2  trinity-railway* (1)
 ```
 
