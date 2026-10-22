@@ -1,0 +1,911 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/golden_chain.t27 -- the golden chain: the pipeline's own version control. Work lands on
+; its verdicts, not on a queue. Closes gHashTag/t27#9027.
+; Owner, 2026-10-11 (translated): "what if we build our own git to manage the pipeline, and create a
+; golden chain pipeline? Create an MVP, check it."
+; Measured 2026-10-11T10:26Z at the live Queen (/queen/status): 70 lanes, 22 active, 48 idle, and the
+; round chose nothing ("nothing to choose"): fileConflict 228, claimed 55, missingBoundary 95,
+; completed 373. Between a finished bee and master sit a branch, a pull request, required checks
+; queued behind the repository's Actions, a rebase, and a re-run of every check after every rebase.
+; Git versions files. The pipeline needs to version verdicts.
+; --
+; The same four ideas as git, over verdicts:
+; - object: a content hash. The host's (corpus_merkle.t27 merkle_leaf / merkle_node); this file only
+;   compares ids, it never hashes.
+; - commit: a LINK, one proposed change with the verdicts of its stages, in order:
+;     SPEC -> GEN -> SEAL -> TEST -> RECEIPT
+;   Each stage's input key is the previous stage's output, so a link is hash-linked the way a commit
+;   is. A stage is golden when it passed, or when the same input key was judged golden before: the
+;   verdict is reused, not re-run (verified/reuse.t27 reuse_decision, verified/frontier.t27 walk).
+; - ref: the GOLDEN HEAD, the last link whose every stage is golden. It only moves forward, as a
+;   compare-and-swap on the parent id: no merge commits, no rebase, no force.
+; - merge: CARRY. A link built on an older head is carried past the links that landed since, by what
+;   each one wrote:
+;   - a derived path (gen/ by policy/l2_generation.t27 is_gen, the ledger and the figures by
+;     ci/derived_data.t27) is never a conflict: the chain recomputes it from sources on the new head;
+;   - two edits of one source path conflict only when their regions meet. That is queen/actors.t27
+;     edits_meet, the same rule the file owner of section 10 admits by, reused here, not restated;
+;   - a source edit under an import of the other side re-judges from GEN; SPEC stays golden;
+;   - only a meeting source edit sends the work back to a bee.
+; actors.t27 section 10 decides who may START an edit. This file decides what may LAND.
+; Section 5 is the merge side of a declared region (policy/issue_shape.t27): a bee whose diff left
+; its region onto live work does not land (gHashTag/t27#9021, 2026-10-11).
+; Section 6 is the landing rule agents follow (#11275). Not in this card: the benchmark against the GitHub
+; loop on the same input (the actors rule, gHashTag/t27#7851) and the wiring into the Queen's merger
+; behind a flag.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenGoldenChain;
+
+use queen::actors;
+
+; --- 1. The stage chain ------------------------------------------------------------------------------
+
+pub const GC_STAGES : usize = 5;
+pub const GC_SPEC : u8 = 0;
+pub const GC_GEN : u8 = 1;
+pub const GC_SEAL : u8 = 2;
+pub const GC_TEST : u8 = 3;
+pub const GC_RECEIPT : u8 = 4;
+pub const GC_DONE : u8 = 5;
+
+/// A stage's verdict. NONE: not run. REUSED: its input key was judged golden before.
+pub const GC_V_NONE : u8 = 0;
+pub const GC_V_PASS : u8 = 1;
+pub const GC_V_REUSED : u8 = 2;
+pub const GC_V_FAIL : u8 = 3;
+
+pub fn gc_golden(v: u8) -> bool {
+    return v == GC_V_PASS or v == GC_V_REUSED;
+}
+
+/// The stage link i runs next: its first stage that is not golden, GC_DONE when all are.
+/// v holds GC_STAGES verdicts per link; link i starts at v[i * GC_STAGES].
+pub fn gc_next_stage(v: []const u8, i: usize) -> u8 {
+    var st : u8 = 0;
+    var k : usize = i * GC_STAGES;
+    while (st < GC_DONE) {
+        if (gc_golden(v[k]) == false) {
+            return st;
+        }
+        st = st + 1;
+        k = k + 1;
+    }
+    return GC_DONE;
+}
+
+/// Whether link i is in chain order: no golden stage after one that is not. A stage judged on an
+/// input nobody made golden is a verdict about nothing.
+pub fn gc_ordered(v: []const u8, i: usize) -> bool {
+    var gap : bool = false;
+    var k : usize = 0;
+    while (k < GC_STAGES) {
+        var g : bool = gc_golden(v[i * GC_STAGES + k]);
+        if (g and gap) {
+            return false;
+        }
+        if (g == false) {
+            gap = true;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+; --- 2. The golden head ------------------------------------------------------------------------------
+
+pub const GC_ADV_FORWARD : u8 = 0;
+pub const GC_ADV_STALE : u8 = 1;
+pub const GC_ADV_NOT_GOLDEN : u8 = 2;
+pub const GC_ADV_DISORDER : u8 = 3;
+
+/// Whether link i, built on `parent`, may become the head. FORWARD only when its parent IS the head
+/// and every stage is golden. STALE: golden, but the head moved; carry it (section 3). Out of order
+/// fails closed before anything else is read.
+pub fn gc_advance(head: u64, parent: u64, v: []const u8, i: usize) -> u8 {
+    if (gc_ordered(v, i) == false) {
+        return GC_ADV_DISORDER;
+    }
+    if (gc_next_stage(v, i) != GC_DONE) {
+        return GC_ADV_NOT_GOLDEN;
+    }
+    if (parent != head) {
+        return GC_ADV_STALE;
+    }
+    return GC_ADV_FORWARD;
+}
+
+; --- 3. Carry ------------------------------------------------------------------------------------------
+
+/// A fourth edit kind beside actors.t27 EDIT_WHOLE / EDIT_LINES / EDIT_APPEND: a path the chain
+/// recomputes from sources. The host marks it (is_gen, derived_data kinds); it never reaches
+/// edits_meet.
+pub const GC_EDIT_DERIVED : u8 = 3;
+
+pub const GC_PAIR_APART : u8 = 0;
+pub const GC_PAIR_REGEN : u8 = 1;
+pub const GC_PAIR_MEET : u8 = 2;
+
+/// Two edits. Different paths are apart. On one path: both derived is REGEN (recomputed on the new
+/// head); otherwise actors.t27 edits_meet decides. It reads a kind it does not know as the whole
+/// file, so one derived side against one source side meets: the sides disagree on what the path is,
+/// and that fails closed with no rule of its own here.
+pub fn gc_pair(a_path: u64, a_kind: u8, a_lo: u32, a_hi: u32, b_path: u64, b_kind: u8, b_lo: u32, b_hi: u32) -> u8 {
+    if (a_path != b_path) {
+        return GC_PAIR_APART;
+    }
+    if (a_kind == GC_EDIT_DERIVED and b_kind == GC_EDIT_DERIVED) {
+        return GC_PAIR_REGEN;
+    }
+    if (edits_meet(a_kind, a_lo, a_hi, b_kind, b_lo, b_hi)) {
+        return GC_PAIR_MEET;
+    }
+    return GC_PAIR_APART;
+}
+
+/// What happened to a link in a landing pass. The four carry answers are ordered by cost, and a link
+/// gets the worst it meets: CARRIED < REGEN < REJUDGE < CONFLICT.
+/// FORWARD: its parent was the head. CARRIED: carried past what landed, nothing re-run. REGEN: a
+/// derived file both wrote is recomputed on the new head and sealed again; the other verdicts carry.
+/// REJUDGE: back to GEN, the frontier picks the nodes. CONFLICT: a source edit met one that landed;
+/// back to a bee. NOT_GOLDEN: never landed. UNKNOWN_PARENT: it has no parent id at all (no merge-base)
+/// and fails closed. A parent that is neither the pass's head nor a link of the pass is carried (#11361).
+pub const GC_OUT_FORWARD : u8 = 0;
+pub const GC_OUT_CARRIED : u8 = 1;
+pub const GC_OUT_REGEN : u8 = 2;
+pub const GC_OUT_REJUDGE : u8 = 3;
+pub const GC_OUT_CONFLICT : u8 = 4;
+pub const GC_OUT_NOT_GOLDEN : u8 = 5;
+pub const GC_OUT_UNKNOWN_PARENT : u8 = 6;
+
+pub fn gc_landed(out: u8) -> bool {
+    return out == GC_OUT_FORWARD or out == GC_OUT_CARRIED or out == GC_OUT_REGEN;
+}
+
+/// Link i against link j, which landed before it. Edits are m rows: e_owner[k] is the link that
+/// wrote path e_path[k] with region (e_kind, e_lo, e_hi). Imports are q rows: link i_owner[k]
+/// imports i_path[k].
+pub fn gc_carry_one(i: usize, j: usize, m: usize, e_owner: []const usize, e_path: []const u64, e_kind: []const u8, e_lo: []const u32, e_hi: []const u32, q: usize, i_owner: []const usize, i_path: []const u64) -> u8 {
+    var worst : u8 = GC_OUT_CARRIED;
+    var a : usize = 0;
+    while (a < m) {
+        if (e_owner[a] == i) {
+            var b : usize = 0;
+            while (b < m) {
+                if (e_owner[b] == j) {
+                    var p : u8 = gc_pair(e_path[a], e_kind[a], e_lo[a], e_hi[a], e_path[b], e_kind[b], e_lo[b], e_hi[b]);
+                    if (p == GC_PAIR_MEET) {
+                        return GC_OUT_CONFLICT;
+                    }
+                    if (p == GC_PAIR_REGEN and worst < GC_OUT_REGEN) {
+                        worst = GC_OUT_REGEN;
+                    }
+                }
+                b = b + 1;
+            }
+        }
+        a = a + 1;
+    }
+    var k : usize = 0;
+    while (k < q) {
+        var o : usize = i_owner[k];
+        if (o == i or o == j) {
+            var other : usize = j;
+            if (o == j) {
+                other = i;
+            }
+            var e : usize = 0;
+            while (e < m) {
+                if (e_owner[e] == other and e_kind[e] != GC_EDIT_DERIVED and e_path[e] == i_path[k]) {
+                    worst = GC_OUT_REJUDGE;
+                }
+                e = e + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return worst;
+}
+
+/// Where the links that landed since link i's parent begin in the landing order: 0 when the parent
+/// is the pass's head, one past the parent's place when the parent landed in this pass, n when
+/// neither.
+pub fn gc_since(i: usize, n: usize, id: []const u64, p: u64, head: u64, pos: []const usize) -> usize {
+    if (p == head) {
+        return 0;
+    }
+    var j : usize = 0;
+    while (j < i) {
+        if (id[j] == p and pos[j] < n) {
+            return pos[j] + 1;
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+; --- 4. Land a whole queue in one pass ---------------------------------------------------------------
+
+/// Land n links in queue order on `head`. Returns how many landed. out[i] says what happened to link
+/// i; pos[i] is its place in the landing order, n when it did not land. A link that does not land
+/// moves nothing: the next one is judged against the same head and the same landed set.
+pub fn gc_land(n: usize, id: []const u64, parent: []const u64, v: []const u8, m: usize, e_owner: []const usize, e_path: []const u64, e_kind: []const u8, e_lo: []const u32, e_hi: []const u32, q: usize, i_owner: []const usize, i_path: []const u64, head: u64, out: []u8, pos: []usize) -> usize {
+    var landed : usize = 0;
+    var cur : u64 = head;
+    var i : usize = 0;
+    while (i < n) {
+        pos[i] = n;
+        var adv : u8 = gc_advance(cur, parent[i], v, i);
+        if (adv == GC_ADV_FORWARD) {
+            out[i] = GC_OUT_FORWARD;
+        } else {
+            if (adv != GC_ADV_STALE) {
+                out[i] = GC_OUT_NOT_GOLDEN;
+            } else {
+                // gc_since inlined: a read-only slice passed on from a written one is a move in generated Rust
+                var since : usize = n;
+                if (parent[i] == head) {
+                    since = 0;
+                } else {
+                    var jj : usize = 0;
+                    while (jj < i) {
+                        if (id[jj] == parent[i] and pos[jj] < n) {
+                            since = pos[jj] + 1;
+                            jj = i;
+                        } else {
+                            jj = jj + 1;
+                        }
+                    }
+                }
+                // A parent the chain never saw (a branch cut from an older master) is carried past every link that landed in
+                // this pass; the host's merge-tree then judges it against the real head (#11361). Only a link with no parent
+                // id at all (no merge-base) stays UNKNOWN_PARENT.
+                if (since == n and parent[i] != 0) {
+                    since = 0;
+                }
+                if (since == n) {
+                    out[i] = GC_OUT_UNKNOWN_PARENT;
+                } else {
+                    var worst : u8 = GC_OUT_CARRIED;
+                    var j : usize = 0;
+                    while (j < i) {
+                        if (pos[j] < n and pos[j] >= since) {
+                            var c : u8 = gc_carry_one(i, j, m, e_owner, e_path, e_kind, e_lo, e_hi, q, i_owner, i_path);
+                            if (c > worst) {
+                                worst = c;
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    out[i] = worst;
+                }
+            }
+        }
+        if (gc_landed(out[i])) {
+            pos[i] = landed;
+            landed = landed + 1;
+            cur = id[i];
+        }
+        i = i + 1;
+    }
+    return landed;
+}
+
+/// The head after a pass: the id of the link that landed last, or the old head when none did.
+pub fn gc_head_after(n: usize, id: []const u64, pos: []const usize, landed: usize, head: u64) -> u64 {
+    if (landed == 0) {
+        return head;
+    }
+    var i : usize = 0;
+    while (i < n) {
+        if (pos[i] == landed - 1) {
+            return id[i];
+        }
+        i = i + 1;
+    }
+    return head;
+}
+
+; --- 5. A region kept at merge ----------------------------------------------------------------------
+; Admission compares the regions a Boundary DECLARES (policy/issue_shape.t27 `path :: fn NAME`,
+; resolved by item_span at the base commit): two bees may edit one file while their regions do not
+; meet. Nothing made a bee keep to its region. Measured 2026-10-11 on the live Queen
+; (TRIOS_QUEEN_DISPATCH_BATCH on since 12:42Z): every region line that resolves is admitted as
+; EDIT_LINES, and no check after the bee read its diff. This section is the merge side, asked before
+; the Queen accepts finished work:
+; - every hunk of the bee's diff, as its lines on the base side, must lie inside a declared region of
+;   its file (issue_shape.t27 edit_inside, asked by the host per hunk and region);
+; - one hunk outside makes that file's edit EDIT_WHOLE again (gc_merge_kind), so nothing is less safe
+;   than a whole-file line;
+; - the widened edit is asked against every live edit by gc_pair, as admission asks;
+; - if it meets one, the work does not land and goes back to its bee: section 3's rule, that only a
+;   meeting source edit sends work back, applied at review. A widened edit that meets nothing lands.
+; - An accept whose issue, diff or base could not be read waits: a read that failed decides nothing.
+; The host reads the diff and carries values. It asks gc_region_step with both values of a fact it
+; has not read yet, and reads it only when the two answers differ, so only an accept costs a read.
+
+/// What the region check does to a review's verdict, ordered by severity: the worst answer of any
+/// file is the answer. STANDS: the verdict is the review's. WAIT: an accept waits a round. SEND_BACK:
+/// an accept goes back to its bee.
+pub const GC_RV_STANDS : u8 = 0;
+pub const GC_RV_WAIT : u8 = 1;
+pub const GC_RV_SEND_BACK : u8 = 2;
+
+/// The kind of one file's edit at merge: its declared region while every hunk kept inside one, the
+/// whole file once a hunk left.
+pub fn gc_merge_kind(kept: bool) -> u8 {
+    if (kept) {
+        return EDIT_LINES;
+    }
+    return EDIT_WHOLE;
+}
+
+/// One region file's answer folded into the answer so far (start from GC_RV_STANDS). `kind` is the
+/// file's merge edit (gc_merge_kind); `meets_live` whether gc_pair says it meets a live edit.
+/// - Only an accept lands, so only an accept is gated: any other verdict STANDS.
+/// - A file whose issue, diff or base could not be read WAITs.
+/// - A file whose merge edit is no longer its declared region and meets a live edit SENDs it BACK.
+/// - A region kept stands beside live work: admission compared it, and nothing it did is new.
+pub fn gc_region_step(so_far: u8, accepting: bool, read: bool, kind: u8, meets_live: bool) -> u8 {
+    if (accepting == false) {
+        return GC_RV_STANDS;
+    }
+    var here : u8 = GC_RV_STANDS;
+    if (read == false) {
+        here = GC_RV_WAIT;
+    } else {
+        if (kind != EDIT_LINES and meets_live) {
+            here = GC_RV_SEND_BACK;
+        }
+    }
+    if (so_far > here) {
+        return so_far;
+    }
+    return here;
+}
+
+/// Whether the answer is a finding charged to the issue's send-backs. A send-back is: the diff was
+/// measured and left its contract onto live work, as a compiler's refusal is measured. A wait is not.
+pub fn gc_region_counts(answer: u8) -> bool {
+    return answer == GC_RV_SEND_BACK;
+}
+
+; --- 6. Landing: our git first, GitHub once per batch (#11275) -----------------------------------------
+; Owner, 2026-10-20 (translated): "GitHub is our bottleneck. Build the best practices into the agents'
+; context so they use OUR git for the full build."
+; Where the time goes (measured, issues #10644 #10588 #6595 #3134): push -> Actions queue (800 to 900 runs
+; on 2026-10-18; the merger waited about 1 h for a runner) -> required checks -> rebase -> every check
+; again. Sections 1 to 5 already judge a link without GitHub; this section is the rule an agent follows.
+; - A lane VERIFIES LOCALLY first: t27b test on its changed specs and their importers, reseal, gen, the
+;   verdict-reuse keys. It records the verdicts of its link. lane_ready is true only when every stage is
+;   golden and in order (sections 1 and 2).
+; - A lane LANDS on the local golden head, a git ref (GC_REF) in the shared repository, advanced only by
+;   gc_land (compare-and-swap on the parent, section 2). No lane writes the ref by hand.
+; - GitHub receives ONE batched push per window from the golden head, never one per commit. The batch is
+;   at most GC_BATCH_MAX ready links, the window is GC_WINDOW_MIN minutes, doubled while the Actions
+;   queue holds GC_CI_JAM runs or more (a push into a jam only goes to the back of it, push_gate.t27).
+; - Required checks run once per batch. A derived-only rebase (CARRIED or REGEN) re-runs nothing.
+; - The chain follows master (#11361). GitHub squash-merges a batch, so the head is then no ancestor of
+;   origin/master: gc_rebase resets head and pushed to master when nothing is unpushed, and carries the
+;   unpushed links onto master as one commit otherwise. A link cut from an older master is carried, not
+;   refused (gc_land); a seal saved by an older t27c is saved again after the tests (gc_regen_ok, REGEN).
+; - A red batch is bisected here, by verdicts: gc_bisect finds the first link whose prefix is red from
+;   locally replayed prefix verdicts; it is not found by re-running GitHub.
+
+pub const GC_REF : str = "refs/golden/head";
+pub const GC_BATCH_MAX : usize = 8;
+pub const GC_WINDOW_MIN : u32 = 15;
+pub const GC_CI_JAM : u32 = 200;
+
+pub const GC_PUSH_NOTHING : u8 = 0;
+pub const GC_PUSH_WAIT : u8 = 1;
+pub const GC_PUSH_NOW : u8 = 2;
+
+/// Things a lane may try. The first two are the landing path; the rest are forbidden.
+pub const GC_ACT_LAND_LOCAL : u8 = 0;
+pub const GC_ACT_BATCH_PUSH : u8 = 1;
+pub const GC_ACT_PUSH_PER_COMMIT : u8 = 2;
+pub const GC_ACT_UPDATE_BRANCH : u8 = 3;
+pub const GC_ACT_RERUN_AFTER_DERIVED_REBASE : u8 = 4;
+pub const GC_ACT_WRITE_HEAD_BY_HAND : u8 = 5;
+pub const GC_ACT_PUSH_NOT_GOLDEN : u8 = 6;
+
+/// Whether link i may be queued for landing: every stage golden, in chain order.
+pub fn lane_ready(v: []const u8, i: usize) -> bool {
+    return gc_ordered(v, i) and gc_next_stage(v, i) == GC_DONE;
+}
+
+/// The batch from a queue of n links: indexes of the ready ones in queue order, at most GC_BATCH_MAX,
+/// written to out. Returns how many. A link that is not ready stays in the queue and never blocks one
+/// behind it.
+pub fn batch_from(n: usize, v: []const u8, out: []usize) -> usize {
+    var i : usize = 0;
+    var b : usize = 0;
+    while (i < n and b < GC_BATCH_MAX) {
+        if (lane_ready(v, i)) {
+            out[b] = i;
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+/// Whether to push the golden head to GitHub now. NOTHING: no ready link. NOW: the window has passed
+/// (doubled in a jam), or the batch is full and there is no jam. Otherwise WAIT.
+pub fn when_to_push(minutes_since_last: u32, batch_len: usize, ci_queued: u32) -> u8 {
+    if (batch_len == 0) {
+        return GC_PUSH_NOTHING;
+    }
+    var window : u32 = GC_WINDOW_MIN;
+    var jam : bool = ci_queued >= GC_CI_JAM;
+    if (jam) {
+        window = GC_WINDOW_MIN * 2;
+    }
+    if (minutes_since_last >= window) {
+        return GC_PUSH_NOW;
+    }
+    if (batch_len >= GC_BATCH_MAX and jam == false) {
+        return GC_PUSH_NOW;
+    }
+    return GC_PUSH_WAIT;
+}
+
+/// Whether a lane may do `act`. Only landing locally and the batched push are allowed.
+pub fn lane_may(act: u8) -> bool {
+    return act == GC_ACT_LAND_LOCAL or act == GC_ACT_BATCH_PUSH;
+}
+
+/// Whether a carry outcome sends the link back through local stages. FORWARD, CARRIED and REGEN
+/// re-run nothing, here or on GitHub; REJUDGE re-runs from GEN locally; CONFLICT goes back to a bee.
+pub fn gc_rerun_local(out: u8) -> bool {
+    return out >= GC_OUT_REJUDGE;
+}
+
+/// After GitHub squash-merges a batch, refs/golden/head is no longer an ancestor of origin/master, so every link
+/// cut from origin/master would read as a stranger (#11361). The chain follows master:
+///   NONE:  no head, no pushed mark, or origin/master already holds the head: nothing to do.
+///   RESET: nothing is unpushed (pushed is the head) and master does not hold it: head and pushed both move to master.
+///   CARRY: links are unpushed and master does not hold the head: they are carried onto master as one commit
+///          (merge-tree with the pushed mark as the base), then head moves to it and pushed to master.
+pub const GC_RB_NONE : u8 = 0;
+pub const GC_RB_RESET : u8 = 1;
+pub const GC_RB_CARRY : u8 = 2;
+
+pub fn gc_rebase(head_ok: bool, pushed_ok: bool, same: bool, master_has_head: bool) -> u8 {
+    if (head_ok == false or pushed_ok == false or master_has_head) {
+        return GC_RB_NONE;
+    }
+    if (same) {
+        return GC_RB_RESET;
+    }
+    return GC_RB_CARRY;
+}
+
+/// A link whose seals were saved by an older t27c has them saved again on its own tree (t27c seal --save, then
+/// --verify), after its tests passed. Only .trinity/seals/ may change: every changed path must be a seal.
+pub fn gc_regen_ok(changed: usize, seals: usize) -> bool {
+    return changed == seals;
+}
+
+/// The outcome to show: FORWARD or CARRIED become REGEN when the link's seals were re-saved; any other stands.
+pub fn gc_regen_view(out: u8, resealed: bool) -> u8 {
+    if (resealed and (out == GC_OUT_FORWARD or out == GC_OUT_CARRIED)) {
+        return GC_OUT_REGEN;
+    }
+    return out;
+}
+
+/// The first red prefix of a batch, by binary search. red[j-1] is true when the golden head after the
+/// first j links of the batch is red (replayed locally; monotone: once red, red). Returns j, the link
+/// that turned it red, or 0 when no prefix is red.
+pub fn gc_bisect(n: usize, red: []const bool) -> usize {
+    if (n == 0) {
+        return 0;
+    }
+    if (red[n - 1] == false) {
+        return 0;
+    }
+    var lo : usize = 1;
+    var hi : usize = n;
+    while (lo < hi) {
+        var mid : usize = lo + (hi - lo) / 2;
+        if (red[mid - 1]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+; --- Tests ---------------------------------------------------------------------------------------------
+; Verdict rows below: 1 = GC_V_PASS, 2 = GC_V_REUSED, 0 = GC_V_NONE, 3 = GC_V_FAIL. Path ids are any
+; distinct numbers; the host's are path hashes. The pass's head is 1 in every landing test.
+
+test next_stage_walks_the_chain_in_order {
+    var v : [15]u8 = [15]u8{ 0, 0, 0, 0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 3, 0 };
+    assert gc_next_stage(&v, 0) == GC_SPEC;
+    assert gc_next_stage(&v, 1) == GC_DONE;
+    assert gc_next_stage(&v, 2) == GC_TEST;
+}
+
+test a_golden_stage_after_a_gap_is_out_of_order {
+    var v : [10]u8 = [10]u8{ 1, 0, 1, 1, 1, 1, 1, 1, 0, 0 };
+    assert gc_ordered(&v, 0) == false;
+    assert gc_ordered(&v, 1) == true;
+    assert gc_advance(7, 7, &v, 0) == GC_ADV_DISORDER;
+    assert gc_advance(7, 7, &v, 1) == GC_ADV_NOT_GOLDEN;
+}
+
+test the_head_moves_only_from_its_own_parent {
+    var v : [5]u8 = [5]u8{ 1, 2, 1, 1, 2 };
+    assert gc_advance(7, 7, &v, 0) == GC_ADV_FORWARD;
+    assert gc_advance(8, 7, &v, 0) == GC_ADV_STALE;
+}
+
+test four_disjoint_links_land_in_one_pass_with_nothing_rerun {
+    var id : [4]u64 = [4]u64{ 11, 12, 13, 14 };
+    var parent : [4]u64 = [4]u64{ 1, 1, 1, 1 };
+    var v : [20]u8 = [20]u8{ 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2 };
+    var eo : [4]usize = [4]usize{ 0, 1, 2, 3 };
+    var ep : [4]u64 = [4]u64{ 100, 200, 300, 400 };
+    var ek : [4]u8 = [4]u8{ EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE };
+    var el : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var eh : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [4]u8 = undefined;
+    var pos : [4]usize = undefined;
+    assert gc_land(4, &id, &parent, &v, 4, &eo, &ep, &ek, &el, &eh, 1, &io, &ip, 1, &out, &pos) == 4;
+    assert out[0] == GC_OUT_FORWARD;
+    assert out[1] == GC_OUT_CARRIED;
+    assert out[2] == GC_OUT_CARRIED;
+    assert out[3] == GC_OUT_CARRIED;
+    assert gc_head_after(4, &id, &pos, 4, 1) == 14;
+}
+
+test one_file_in_disjoint_ranges_lands_twice_and_meeting_ranges_conflict {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 1, 1 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 100, 100 };
+    var ek : [3]u8 = [3]u8{ EDIT_LINES, EDIT_LINES, EDIT_LINES };
+    var el : [3]u32 = [3]u32{ 10, 50, 18 };
+    var eh : [3]u32 = [3]u32{ 20, 60, 30 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 2;
+    assert out[1] == GC_OUT_CARRIED;
+    assert out[2] == GC_OUT_CONFLICT;
+    assert pos[2] == 3;
+    assert gc_head_after(3, &id, &pos, 2, 1) == 12;
+}
+
+test a_derived_file_both_wrote_is_regenerated_not_a_conflict {
+    var id : [2]u64 = [2]u64{ 11, 12 };
+    var parent : [2]u64 = [2]u64{ 1, 1 };
+    var v : [10]u8 = [10]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [4]usize = [4]usize{ 0, 0, 1, 1 };
+    var ep : [4]u64 = [4]u64{ 100, 777, 200, 777 };
+    var ek : [4]u8 = [4]u8{ EDIT_WHOLE, GC_EDIT_DERIVED, EDIT_WHOLE, GC_EDIT_DERIVED };
+    var el : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var eh : [4]u32 = [4]u32{ 0, 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [2]u8 = undefined;
+    var pos : [2]usize = undefined;
+    assert gc_land(2, &id, &parent, &v, 4, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 2;
+    assert out[1] == GC_OUT_REGEN;
+}
+
+test a_changed_import_rejudges_in_both_directions {
+    var id : [2]u64 = [2]u64{ 11, 12 };
+    var parent : [2]u64 = [2]u64{ 1, 1 };
+    var v : [10]u8 = [10]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [2]usize = [2]usize{ 0, 1 };
+    var ep : [2]u64 = [2]u64{ 100, 200 };
+    var ek : [2]u8 = [2]u8{ EDIT_WHOLE, EDIT_WHOLE };
+    var el : [2]u32 = [2]u32{ 0, 0 };
+    var eh : [2]u32 = [2]u32{ 0, 0 };
+    var out : [2]u8 = undefined;
+    var pos : [2]usize = undefined;
+    // link 1 imports the file link 0 wrote
+    var io : [1]usize = [1]usize{ 1 };
+    var ip : [1]u64 = [1]u64{ 100 };
+    assert gc_land(2, &id, &parent, &v, 2, &eo, &ep, &ek, &el, &eh, 1, &io, &ip, 1, &out, &pos) == 1;
+    assert out[1] == GC_OUT_REJUDGE;
+    // negative control: link 0, already landed, imports the file link 1 writes
+    var io2 : [1]usize = [1]usize{ 0 };
+    var ip2 : [1]u64 = [1]u64{ 200 };
+    assert gc_land(2, &id, &parent, &v, 2, &eo, &ep, &ek, &el, &eh, 1, &io2, &ip2, 1, &out, &pos) == 1;
+    assert out[1] == GC_OUT_REJUDGE;
+}
+
+test negative_control_a_link_that_is_not_golden_never_lands_and_moves_nothing {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 1, 1 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 3, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 100, 300 };
+    var ek : [3]u8 = [3]u8{ EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE };
+    var el : [3]u32 = [3]u32{ 0, 0, 0 };
+    var eh : [3]u32 = [3]u32{ 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 2;
+    assert out[0] == GC_OUT_NOT_GOLDEN;
+    assert pos[0] == 3;
+    // link 1 wrote the file the failed link 0 wrote; nothing of link 0 landed, so link 1 is FORWARD
+    assert out[1] == GC_OUT_FORWARD;
+    assert out[2] == GC_OUT_CARRIED;
+}
+
+test negative_control_a_link_with_no_parent_id_fails_closed {
+    var id : [2]u64 = [2]u64{ 11, 12 };
+    var parent : [2]u64 = [2]u64{ 1, 0 };
+    var v : [10]u8 = [10]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [2]usize = [2]usize{ 0, 1 };
+    var ep : [2]u64 = [2]u64{ 100, 200 };
+    var ek : [2]u8 = [2]u8{ EDIT_WHOLE, EDIT_WHOLE };
+    var el : [2]u32 = [2]u32{ 0, 0 };
+    var eh : [2]u32 = [2]u32{ 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [2]u8 = undefined;
+    var pos : [2]usize = undefined;
+    assert gc_land(2, &id, &parent, &v, 2, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 1;
+    assert out[1] == GC_OUT_UNKNOWN_PARENT;
+}
+
+test a_link_built_on_a_link_of_the_same_pass_carries_only_past_what_came_after {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 1, 11 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    // link 2 rewrites the file link 0 wrote, but it was built on link 0, so only link 1 is in its way
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 200, 100 };
+    var ek : [3]u8 = [3]u8{ EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE };
+    var el : [3]u32 = [3]u32{ 0, 0, 0 };
+    var eh : [3]u32 = [3]u32{ 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 3;
+    assert out[2] == GC_OUT_CARRIED;
+    assert gc_head_after(3, &id, &pos, 3, 1) == 13;
+}
+
+test negative_control_a_path_one_side_calls_derived_conflicts {
+    assert gc_pair(5, GC_EDIT_DERIVED, 0, 0, 5, EDIT_LINES, 1, 2) == GC_PAIR_MEET;
+    assert gc_pair(5, EDIT_APPEND, 0, 0, 5, GC_EDIT_DERIVED, 0, 0) == GC_PAIR_MEET;
+    assert gc_pair(5, GC_EDIT_DERIVED, 0, 0, 5, GC_EDIT_DERIVED, 0, 0) == GC_PAIR_REGEN;
+    assert gc_pair(5, EDIT_WHOLE, 0, 0, 6, EDIT_WHOLE, 0, 0) == GC_PAIR_APART;
+    assert gc_pair(5, EDIT_APPEND, 0, 0, 5, EDIT_APPEND, 0, 0) == GC_PAIR_APART;
+}
+
+test the_same_queue_gives_the_same_landing {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 1, 1 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 100, 300 };
+    var ek : [3]u8 = [3]u8{ EDIT_LINES, EDIT_LINES, EDIT_WHOLE };
+    var el : [3]u32 = [3]u32{ 1, 40, 0 };
+    var eh : [3]u32 = [3]u32{ 9, 50, 0 };
+    var io : [1]usize = [1]usize{ 2 };
+    var ip : [1]u64 = [1]u64{ 100 };
+    var o1 : [3]u8 = undefined;
+    var o2 : [3]u8 = undefined;
+    var p1 : [3]usize = undefined;
+    var p2 : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 1, &io, &ip, 1, &o1, &p1) == gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 1, &io, &ip, 1, &o2, &p2);
+    var i : usize = 0;
+    while (i < 3) {
+        assert o1[i] == o2[i];
+        i = i + 1;
+    }
+    assert o1[1] == GC_OUT_CARRIED;
+    assert o1[2] == GC_OUT_REJUDGE;
+}
+
+test a_hunk_outside_its_region_widens_the_file_and_meets_every_edit_of_it {
+    // kept: the declared region, which is apart from a live region below it
+    assert gc_merge_kind(true) == EDIT_LINES;
+    assert gc_pair(100, gc_merge_kind(true), 10, 20, 100, EDIT_LINES, 40, 50) == GC_PAIR_APART;
+    // one hunk outside: the whole file, which meets that same live region
+    assert gc_merge_kind(false) == EDIT_WHOLE;
+    assert gc_pair(100, gc_merge_kind(false), 0, 0, 100, EDIT_LINES, 40, 50) == GC_PAIR_MEET;
+    // and a live edit of another file is still apart
+    assert gc_pair(100, gc_merge_kind(false), 0, 0, 200, EDIT_WHOLE, 0, 0) == GC_PAIR_APART;
+}
+
+test a_widened_edit_that_meets_live_work_goes_back_and_counts {
+    const rv : u8 = gc_region_step(GC_RV_STANDS, true, true, gc_merge_kind(false), true);
+    assert rv == GC_RV_SEND_BACK;
+    assert gc_region_counts(rv) == true;
+}
+
+test a_widened_edit_that_meets_nothing_lands {
+    const rv : u8 = gc_region_step(GC_RV_STANDS, true, true, gc_merge_kind(false), false);
+    assert rv == GC_RV_STANDS;
+    assert gc_region_counts(rv) == false;
+}
+
+test a_kept_region_lands_beside_live_work {
+    assert gc_region_step(GC_RV_STANDS, true, true, gc_merge_kind(true), true) == GC_RV_STANDS;
+    assert gc_region_step(GC_RV_STANDS, true, true, gc_merge_kind(true), false) == GC_RV_STANDS;
+}
+
+test only_an_accept_is_gated {
+    assert gc_region_step(GC_RV_STANDS, false, true, EDIT_WHOLE, true) == GC_RV_STANDS;
+    assert gc_region_step(GC_RV_STANDS, false, false, EDIT_WHOLE, true) == GC_RV_STANDS;
+    // so the host, asking both values of what it has not read, reads nothing for a send-back
+    assert gc_region_step(GC_RV_STANDS, false, true, EDIT_WHOLE, true) == gc_region_step(GC_RV_STANDS, false, false, EDIT_WHOLE, false);
+}
+
+test an_unread_file_waits_and_a_finding_outranks_it {
+    const unread : u8 = gc_region_step(GC_RV_STANDS, true, false, EDIT_LINES, false);
+    assert unread == GC_RV_WAIT;
+    assert gc_region_counts(unread) == false;
+    // a later file that widened onto live work sends the accept back all the same
+    assert gc_region_step(unread, true, true, EDIT_WHOLE, true) == GC_RV_SEND_BACK;
+    // and a later unread or clean file never softens a send-back
+    assert gc_region_step(GC_RV_SEND_BACK, true, false, EDIT_LINES, false) == GC_RV_SEND_BACK;
+    assert gc_region_step(GC_RV_SEND_BACK, true, true, EDIT_LINES, false) == GC_RV_SEND_BACK;
+    assert gc_region_step(unread, true, true, EDIT_LINES, false) == GC_RV_WAIT;
+}
+
+test negative_control_an_unknown_kind_is_not_a_kept_region {
+    // a kind this card does not know is read as wider than a region, as edits_meet reads it
+    assert gc_region_step(GC_RV_STANDS, true, true, EDIT_APPEND, true) == GC_RV_SEND_BACK;
+    assert gc_region_step(GC_RV_STANDS, true, true, GC_EDIT_DERIVED, true) == GC_RV_SEND_BACK;
+}
+
+invariant region_answers_are_ordered_by_severity {
+    assert GC_RV_STANDS < GC_RV_WAIT;
+    assert GC_RV_WAIT < GC_RV_SEND_BACK;
+}
+
+invariant carry_answers_are_ordered_by_cost {
+    assert GC_OUT_CARRIED < GC_OUT_REGEN;
+    assert GC_OUT_REGEN < GC_OUT_REJUDGE;
+    assert GC_OUT_REJUDGE < GC_OUT_CONFLICT;
+}
+
+invariant the_derived_kind_is_not_an_actors_kind {
+    assert GC_EDIT_DERIVED != EDIT_WHOLE;
+    assert GC_EDIT_DERIVED != EDIT_LINES;
+    assert GC_EDIT_DERIVED != EDIT_APPEND;
+}
+
+invariant five_stages_and_done_after_them {
+    assert GC_STAGES == 5;
+    assert GC_DONE == GC_RECEIPT + 1;
+}
+
+; --- Section 6 tests -----------------------------------------------------------------------------------
+
+test the_chain_follows_master_after_a_squash_merge {
+    // nothing unpushed and master lost the head: reset both refs to master
+    assert gc_rebase(true, true, true, false) == GC_RB_RESET;
+    // links unpushed and master lost the head: carry them onto master
+    assert gc_rebase(true, true, false, false) == GC_RB_CARRY;
+    // master holds the head, or a ref is missing: leave everything alone
+    assert gc_rebase(true, true, true, true) == GC_RB_NONE;
+    assert gc_rebase(true, true, false, true) == GC_RB_NONE;
+    assert gc_rebase(false, true, true, false) == GC_RB_NONE;
+    assert gc_rebase(true, false, false, false) == GC_RB_NONE;
+}
+
+test re_saved_seals_may_change_only_seals_and_land_as_regen {
+    assert gc_regen_ok(3, 3) == true and gc_regen_ok(0, 0) == true;
+    // a changed path that is not a seal refuses the re-save
+    assert gc_regen_ok(3, 2) == false;
+    assert gc_regen_view(GC_OUT_FORWARD, true) == GC_OUT_REGEN and gc_regen_view(GC_OUT_CARRIED, true) == GC_OUT_REGEN;
+    assert gc_regen_view(GC_OUT_FORWARD, false) == GC_OUT_FORWARD;
+    // a refusal is never dressed as a landing
+    assert gc_regen_view(GC_OUT_CONFLICT, true) == GC_OUT_CONFLICT and gc_regen_view(GC_OUT_NOT_GOLDEN, true) == GC_OUT_NOT_GOLDEN;
+}
+
+test a_parent_the_chain_never_saw_is_carried_and_a_meeting_edit_still_conflicts {
+    var id : [3]u64 = [3]u64{ 11, 12, 13 };
+    var parent : [3]u64 = [3]u64{ 1, 99, 98 };
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var eo : [3]usize = [3]usize{ 0, 1, 2 };
+    var ep : [3]u64 = [3]u64{ 100, 200, 100 };
+    var ek : [3]u8 = [3]u8{ EDIT_WHOLE, EDIT_WHOLE, EDIT_WHOLE };
+    var el : [3]u32 = [3]u32{ 0, 0, 0 };
+    var eh : [3]u32 = [3]u32{ 0, 0, 0 };
+    var io : [1]usize = [1]usize{ 0 };
+    var ip : [1]u64 = [1]u64{ 900 };
+    var out : [3]u8 = undefined;
+    var pos : [3]usize = undefined;
+    assert gc_land(3, &id, &parent, &v, 3, &eo, &ep, &ek, &el, &eh, 0, &io, &ip, 1, &out, &pos) == 2;
+    assert out[0] == GC_OUT_FORWARD and out[1] == GC_OUT_CARRIED;
+    // link 2 wrote the path link 0 wrote: carrying it past link 0 meets
+    assert out[2] == GC_OUT_CONFLICT;
+}
+
+test a_lane_is_ready_only_when_every_stage_is_golden_in_order {
+    var v : [15]u8 = [15]u8{ 1, 2, 1, 1, 1, 1, 1, 1, 3, 0, 1, 0, 1, 1, 1 };
+    assert lane_ready(&v, 0) == true;
+    assert lane_ready(&v, 1) == false;
+    assert lane_ready(&v, 2) == false;
+}
+
+test batch_takes_ready_links_in_order_and_skips_the_rest {
+    var v : [15]u8 = [15]u8{ 1, 1, 1, 1, 1, 1, 1, 3, 0, 0, 2, 2, 2, 2, 2 };
+    var out : [8]usize = [8]usize{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    assert batch_from(3, &v, &out) == 2;
+    assert out[0] == 0;
+    assert out[1] == 2;
+}
+
+test batch_stops_at_the_cap {
+    var v : [50]u8 = [50]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var out : [8]usize = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    assert batch_from(10, &v, &out) == GC_BATCH_MAX;
+    assert out[7] == 7;
+}
+
+test push_waits_for_the_window_then_goes_once {
+    assert when_to_push(3, 2, 0) == GC_PUSH_WAIT;
+    assert when_to_push(15, 2, 0) == GC_PUSH_NOW;
+    assert when_to_push(0, 8, 0) == GC_PUSH_NOW;
+}
+
+test a_jammed_queue_doubles_the_window_and_holds_a_full_batch {
+    assert when_to_push(20, 3, 200) == GC_PUSH_WAIT;
+    assert when_to_push(30, 3, 200) == GC_PUSH_NOW;
+    assert when_to_push(0, 8, 500) == GC_PUSH_WAIT;
+}
+
+test negative_control_nothing_ready_pushes_nothing_however_long_it_waited {
+    assert when_to_push(600, 0, 0) == GC_PUSH_NOTHING;
+}
+
+test negative_control_a_lane_may_only_land_locally_or_push_a_batch {
+    assert lane_may(GC_ACT_LAND_LOCAL) == true;
+    assert lane_may(GC_ACT_BATCH_PUSH) == true;
+    assert lane_may(GC_ACT_PUSH_PER_COMMIT) == false;
+    assert lane_may(GC_ACT_UPDATE_BRANCH) == false;
+    assert lane_may(GC_ACT_RERUN_AFTER_DERIVED_REBASE) == false;
+    assert lane_may(GC_ACT_WRITE_HEAD_BY_HAND) == false;
+    assert lane_may(GC_ACT_PUSH_NOT_GOLDEN) == false;
+}
+
+test a_derived_only_rebase_reruns_nothing {
+    assert gc_rerun_local(GC_OUT_FORWARD) == false;
+    assert gc_rerun_local(GC_OUT_CARRIED) == false;
+    assert gc_rerun_local(GC_OUT_REGEN) == false;
+    assert gc_rerun_local(GC_OUT_REJUDGE) == true;
+    assert gc_rerun_local(GC_OUT_CONFLICT) == true;
+}
+
+test bisect_finds_the_first_red_prefix_and_none_when_green {
+    var green : [8]bool = [8]bool{ false, false, false, false, false, false, false, false };
+    var r5 : [8]bool = [8]bool{ false, false, false, false, true, true, true, true };
+    var r1 : [8]bool = [8]bool{ true, true, true, true, true, true, true, true };
+    var r8 : [8]bool = [8]bool{ false, false, false, false, false, false, false, true };
+    assert gc_bisect(8, &green) == 0;
+    assert gc_bisect(8, &r5) == 5;
+    assert gc_bisect(8, &r1) == 1;
+    assert gc_bisect(8, &r8) == 8;
+    assert gc_bisect(0, &green) == 0;
+}
+
+invariant landing_constants_are_a_small_batch_in_a_real_window {
+    assert GC_BATCH_MAX >= 2;
+    assert GC_WINDOW_MIN > 0;
+    assert GC_CI_JAM > 0;
+    assert GC_PUSH_NOTHING < GC_PUSH_WAIT;
+    assert GC_PUSH_WAIT < GC_PUSH_NOW;
+}

@@ -1,0 +1,693 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/igla/coder/ternary_gemm_gpu.t27
+// Tiled ternary x int8 GEMM, written the way a GPU kernel runs it.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Why this spec exists: the RFC on a t27c CUDA/PTX backend asks whether a t27 kernel could make
+// the igla-coder-gpu training (tern-tc-100m, tern-tc-500m, today in PyTorch) cheaper. The only
+// place t27 has something PyTorch's bf16 path does not is the ternary weight {-1, 0, +1}: the
+// forward GEMM can run on int8 tensor cores (i8 x i8 -> i32) instead of bf16 ones. Before a
+// single GPU-hour is paid for, this spec pins the kernel's math and checks it on two independent
+// compilers (t27c's Zig backend and t27b's AArch64 JIT).
+//
+// What is modelled, construct by construct, is what a gen-cuda / gen-ptx backend would lower:
+//   - block_tile(.., bi, bj) is the __global__ kernel body for blockIdx = (bi, bj);
+//   - the shared tiles `as_tile` / `ws_tile` are __shared__ arrays, loaded cooperatively once per
+//     k-step and zero-padded past every matrix edge (the tail handling);
+//   - `acc` holds every thread's register micro-tile; thread (ty, tx) owns rows ty*tm .. ty*tm+tm-1
+//     and columns tx*tn .. tx*tn+tn-1 of the block;
+//   - the weights arrive packed, four 2-bit codes per byte, and are unpacked at tile-load time;
+//   - three inner products, chosen by `mode`:
+//       MODE_SELECT  add or subtract the activation (the multiplier-free FPGA/CPU form);
+//       MODE_I8_MMA  i8 x i8 -> i32 product, the int8 tensor-core (mma.sync s8) semantics;
+//       MODE_DP4A    four i8 products summed before they reach the accumulator (__dp4a).
+//   - gemm_tiled() is the grid launch, every block run in turn.
+//
+// The reference. specs/igla/race/ternary_gemm.t27 is the spec the RFC names as the reference, and
+// it does not compile under either compiler today (lab, 2026-10-18, t27c at e522149ef:
+// "BLOCKED does not compile: spec.zig:504:49"; t27b: unsupported constructs from line 1522), nor
+// does specs/igla/race/ternary_mac.t27 ("use of undeclared identifier 'acc'"). Its 2x2 and 4x4
+// kernels also call ternary_mac(a, w, acc) against the signature ternary_mac(acc, a, w), and its
+// ternary_mul negates in i8, so ternary_mul(-128, -1) overflows. So this spec cannot `use` it.
+// ref_* below mirrors the parts of the reference that are right -- the 2-bit code (0 -> 0,
+// 1 -> +1, 2 -> -1, anything else -> 0, ternary_decode), the select-and-negate product
+// (ternary_mul) and the row-major dot ternary_dot_8x8_elem, generalised from 8x8 to m x k x n --
+// widening to i32 before the negation. Repairing the race spec is its own issue.
+//
+// Bit-exact, and why it can be: every product lies in [-128, 128] and the accumulator is i32, so
+// no partial sum overflows while k <= K_MAX_I32 (128 * 16777215 = 2147483520). Integer addition is
+// then associative, so EVERY tiling, k-split and dp4a grouping gives the same bits as the naive
+// loop. bf16 accumulation has no such property; this is why the comparison can be ==.
+
+module igla-coder-ternary-gemm-gpu;
+
+// ============================================================================
+// 1. Sizes
+// ============================================================================
+
+// Test matrices are held in fixed buffers of MAX_DIM x MAX_DIM.
+const MAX_DIM: usize = 40;
+const MAX_ELEMS: usize = 1600;
+// Four 2-bit codes per byte.
+const MAX_PACKED: usize = 400;
+// Largest shared tile (bm * bk or bk * bn) and largest block (bm * bn) a test tiling may use.
+const MAX_TILE: usize = 512;
+const MAX_BLOCK: usize = 1024;
+
+// Inner-product modes.
+const MODE_SELECT: u32 = 0;
+const MODE_I8_MMA: u32 = 1;
+const MODE_DP4A: u32 = 2;
+
+// Longest k for which no i32 partial sum of i8 x ternary products can overflow.
+const K_MAX_I32: i64 = 16777215;
+
+// Shapes of the tern-tc-500m model the bench will measure (d_model, d_ff), and the tile the
+// bench kernel uses (128 x 128 blocks, k-step 32, 8 x 8 register micro-tile, 256 threads).
+const D_MODEL_500M: i64 = 1280;
+const D_FF_500M: i64 = 3456;
+const BENCH_BM: i64 = 128;
+const BENCH_BN: i64 = 128;
+const BENCH_BK: i64 = 32;
+const BENCH_TM: i64 = 8;
+const BENCH_TN: i64 = 8;
+
+// A block tiling: block rows bm, block columns bn, k-step bk, register micro-tile tm x tn.
+struct Tiling {
+    bm: usize;
+    bn: usize;
+    bk: usize;
+    tm: usize;
+    tn: usize;
+}
+
+// The tilings the tests run. T_SMALL and T_WIDE leave ragged tails on every test shape;
+// T_ONE is one thread per output element and a k-step of 4, the smallest dp4a can use.
+const T_SMALL: Tiling = Tiling{ bm = 16, bn = 16, bk = 8, tm = 4, tn = 4 };
+const T_WIDE: Tiling = Tiling{ bm = 32, bn = 16, bk = 16, tm = 8, tn = 2 };
+const T_ONE: Tiling = Tiling{ bm = 4, bn = 4, bk = 4, tm = 1, tn = 1 };
+
+// A tiling the kernel accepts: the micro-tile divides the block, k-step a multiple of 4 (dp4a),
+// and the shared tiles and block fit the buffers.
+fn tiling_ok(t: Tiling) -> bool {
+    if (t.tm == 0 or t.tn == 0 or t.bk == 0) {
+        return false;
+    }
+    if (t.bm % t.tm != 0 or t.bn % t.tn != 0 or t.bk % 4 != 0) {
+        return false;
+    }
+    if (t.bm * t.bk > MAX_TILE or t.bk * t.bn > MAX_TILE or t.bm * t.bn > MAX_BLOCK) {
+        return false;
+    }
+    return true;
+}
+
+// Blocks needed to cover `extent` with blocks of `b`: ceil(extent / b), the grid dimension.
+fn blocks_for(extent: usize, b: usize) -> usize {
+    return (extent + b - 1) / b;
+}
+
+// ============================================================================
+// 2. The ternary code (mirrors specs/igla/race/ternary_mac.t27)
+// ============================================================================
+
+// ternary_decode: 1 -> +1, 2 -> -1, anything else -> 0.
+fn decode(code: u8) -> i32 {
+    if (code == 1) {
+        return 1;
+    }
+    if (code == 2) {
+        return -1;
+    }
+    return 0;
+}
+
+// ternary_mul, widened to i32 before the negation so that a = -128 cannot overflow.
+fn tmul(a: i8, code: u8) -> i32 {
+    const d = decode(code);
+    if (d == 0) {
+        return 0;
+    }
+    const x = a as i32;
+    if (d == 1) {
+        return x;
+    }
+    return 0 - x;
+}
+
+// ============================================================================
+// 3. Packed weights: four 2-bit codes per byte, lane 0 in the low bits
+// ============================================================================
+
+fn pack4(c0: u8, c1: u8, c2: u8, c3: u8) -> u8 {
+    return c0 + c1 * 4 + c2 * 16 + c3 * 64;
+}
+
+fn unpack_code(byte: u8, lane: usize) -> u8 {
+    var b = byte;
+    var l: usize = 0;
+    while (l < lane) {
+        b = b / 4;
+        l += 1;
+    }
+    return b % 4;
+}
+
+// Pack a row-major code array of `count` codes; code i goes to byte i / 4, lane i % 4.
+fn pack_codes(codes: [MAX_ELEMS]u8, count: usize) -> [MAX_PACKED]u8 {
+    var out: [MAX_PACKED]u8 = [0; MAX_PACKED];
+    var i: usize = 0;
+    while (i < count) {
+        var c = codes[i];
+        var l: usize = 0;
+        while (l < i % 4) {
+            c = c * 4;
+            l += 1;
+        }
+        out[i / 4] = out[i / 4] + c;
+        i += 1;
+    }
+    return out;
+}
+
+fn packed_code(wp: [MAX_PACKED]u8, idx: usize) -> u8 {
+    return unpack_code(wp[idx / 4], idx % 4);
+}
+
+// ============================================================================
+// 4. The reference: naive C[row][col] = sum_kk A[row][kk] * W[kk][col]
+// ============================================================================
+
+// ternary_dot_8x8_elem, for any m x k x n: a is m x k, w is k x n, both row-major.
+fn ref_elem(a: [MAX_ELEMS]i8, w: [MAX_ELEMS]u8, k: usize, n: usize, row: usize, col: usize) -> i32 {
+    var acc: i32 = 0;
+    var kk: usize = 0;
+    while (kk < k) {
+        acc += tmul(a[row * k + kk], w[kk * n + col]);
+        kk += 1;
+    }
+    return acc;
+}
+
+fn ref_gemm(a: [MAX_ELEMS]i8, w: [MAX_ELEMS]u8, m: usize, n: usize, k: usize) -> [MAX_ELEMS]i32 {
+    var c: [MAX_ELEMS]i32 = [0; MAX_ELEMS];
+    var row: usize = 0;
+    while (row < m) {
+        var col: usize = 0;
+        while (col < n) {
+            c[row * n + col] = ref_elem(a, w, k, n, row, col);
+            col += 1;
+        }
+        row += 1;
+    }
+    return c;
+}
+
+// ============================================================================
+// 5. The kernel
+// ============================================================================
+
+// Cooperative load of the activation tile: rows row0 .. row0+bm-1, columns k0 .. k0+bk-1.
+// Out of range reads 0, so the tail contributes nothing.
+fn load_a_tile(a: [MAX_ELEMS]i8, m: usize, k: usize, row0: usize, k0: usize, t: Tiling) -> [MAX_TILE]i8 {
+    var s: [MAX_TILE]i8 = [0; MAX_TILE];
+    var r: usize = 0;
+    while (r < t.bm) {
+        var kk: usize = 0;
+        while (kk < t.bk) {
+            if (row0 + r < m and k0 + kk < k) {
+                s[r * t.bk + kk] = a[(row0 + r) * k + k0 + kk];
+            }
+            kk += 1;
+        }
+        r += 1;
+    }
+    return s;
+}
+
+// Cooperative load of the weight tile from the packed array, unpacked and decoded to i8 in
+// {-1, 0, +1}: rows k0 .. k0+bk-1, columns col0 .. col0+bn-1. Out of range is weight 0.
+fn load_w_tile(wp: [MAX_PACKED]u8, k: usize, n: usize, k0: usize, col0: usize, t: Tiling) -> [MAX_TILE]i8 {
+    var s: [MAX_TILE]i8 = [0; MAX_TILE];
+    var kk: usize = 0;
+    while (kk < t.bk) {
+        var c: usize = 0;
+        while (c < t.bn) {
+            if (k0 + kk < k and col0 + c < n) {
+                s[kk * t.bn + c] = decode(packed_code(wp, (k0 + kk) * n + col0 + c)) as i8;
+            }
+            c += 1;
+        }
+        kk += 1;
+    }
+    return s;
+}
+
+// One output element's contribution from one k-step, in the chosen mode.
+fn tile_dot(as_tile: [MAX_TILE]i8, ws_tile: [MAX_TILE]i8, t: Tiling, r: usize, c: usize, mode: u32) -> i32 {
+    var sum: i32 = 0;
+    var kk: usize = 0;
+    if (mode == MODE_DP4A) {
+        while (kk < t.bk) {
+            var four: i32 = 0;
+            var q: usize = 0;
+            while (q < 4) {
+                four += (as_tile[r * t.bk + kk + q] as i32) * (ws_tile[(kk + q) * t.bn + c] as i32);
+                q += 1;
+            }
+            sum += four;
+            kk += 4;
+        }
+        return sum;
+    }
+    while (kk < t.bk) {
+        const x = as_tile[r * t.bk + kk] as i32;
+        const wv = ws_tile[kk * t.bn + c];
+        if (mode == MODE_I8_MMA) {
+            sum += x * (wv as i32);
+        } else {
+            if (wv == 1) {
+                sum += x;
+            }
+            if (wv == -1) {
+                sum -= x;
+            }
+        }
+        kk += 1;
+    }
+    return sum;
+}
+
+// The __global__ body for blockIdx = (bi, bj): every k-step loads the two shared tiles, then
+// every thread (ty, tx) adds its micro-tile; at the end each thread stores the elements of its
+// micro-tile that lie inside C. Returns c with this block's elements written.
+fn block_tile(a: [MAX_ELEMS]i8, wp: [MAX_PACKED]u8, m: usize, n: usize, k: usize, t: Tiling, bi: usize, bj: usize, mode: u32, c_in: [MAX_ELEMS]i32) -> [MAX_ELEMS]i32 {
+    var c = c_in;
+    var acc: [MAX_BLOCK]i32 = [0; MAX_BLOCK];
+    const row0 = bi * t.bm;
+    const col0 = bj * t.bn;
+    var k0: usize = 0;
+    while (k0 < k) {
+        const as_tile = load_a_tile(a, m, k, row0, k0, t);
+        const ws_tile = load_w_tile(wp, k, n, k0, col0, t);
+        // __syncthreads()
+        var ty: usize = 0;
+        while (ty < t.bm / t.tm) {
+            var tx: usize = 0;
+            while (tx < t.bn / t.tn) {
+                var i: usize = 0;
+                while (i < t.tm) {
+                    var j: usize = 0;
+                    while (j < t.tn) {
+                        const r = ty * t.tm + i;
+                        const cc = tx * t.tn + j;
+                        acc[r * t.bn + cc] += tile_dot(as_tile, ws_tile, t, r, cc, mode);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                tx += 1;
+            }
+            ty += 1;
+        }
+        // __syncthreads()
+        k0 += t.bk;
+    }
+    var r: usize = 0;
+    while (r < t.bm) {
+        var cc: usize = 0;
+        while (cc < t.bn) {
+            if (row0 + r < m and col0 + cc < n) {
+                c[(row0 + r) * n + col0 + cc] = acc[r * t.bn + cc];
+            }
+            cc += 1;
+        }
+        r += 1;
+    }
+    return c;
+}
+
+// The grid launch: blocks_for(m, bm) x blocks_for(n, bn) blocks, run one after another.
+fn gemm_tiled(a: [MAX_ELEMS]i8, wp: [MAX_PACKED]u8, m: usize, n: usize, k: usize, t: Tiling, mode: u32) -> [MAX_ELEMS]i32 {
+    var c: [MAX_ELEMS]i32 = [0; MAX_ELEMS];
+    var bi: usize = 0;
+    while (bi < blocks_for(m, t.bm)) {
+        var bj: usize = 0;
+        while (bj < blocks_for(n, t.bn)) {
+            c = block_tile(a, wp, m, n, k, t, bi, bj, mode, c);
+            bj += 1;
+        }
+        bi += 1;
+    }
+    return c;
+}
+
+// ============================================================================
+// 6. Comparison
+// ============================================================================
+
+// Elements of the m x n result where x and y differ.
+fn mismatches(x: [MAX_ELEMS]i32, y: [MAX_ELEMS]i32, m: usize, n: usize) -> usize {
+    var bad: usize = 0;
+    var i: usize = 0;
+    while (i < m * n) {
+        if (x[i] != y[i]) {
+            bad += 1;
+        }
+        i += 1;
+    }
+    return bad;
+}
+
+// Deterministic inputs, so both compilers see the same matrices. The ZX81 generator
+// s -> (75 s + 74) mod 65537 never leaves [0, 65536], so no step overflows u32.
+fn next_seed(s: u32) -> u32 {
+    return (s * 75 + 74) % 65537;
+}
+
+// m x k activations covering all of [-128, 127].
+fn gen_a(m: usize, k: usize, seed: u32) -> [MAX_ELEMS]i8 {
+    var a: [MAX_ELEMS]i8 = [0; MAX_ELEMS];
+    var s = seed;
+    var i: usize = 0;
+    while (i < m * k) {
+        s = next_seed(s);
+        a[i] = ((s % 256) as i32 - 128) as i8;
+        i += 1;
+    }
+    return a;
+}
+
+// k x n codes, each of 0, 1, 2.
+fn gen_w(k: usize, n: usize, seed: u32) -> [MAX_ELEMS]u8 {
+    var w: [MAX_ELEMS]u8 = [0; MAX_ELEMS];
+    var s = seed;
+    var i: usize = 0;
+    while (i < k * n) {
+        s = next_seed(s);
+        w[i] = (s % 3) as u8;
+        i += 1;
+    }
+    return w;
+}
+
+// Random m x k x n case: mismatches of the tiled kernel (tiling t, mode) against the reference.
+fn random_case_mismatches(m: usize, n: usize, k: usize, seed: u32, t: Tiling, mode: u32) -> usize {
+    const a = gen_a(m, k, seed);
+    const w = gen_w(k, n, seed + 1);
+    const want = ref_gemm(a, w, m, n, k);
+    const got = gemm_tiled(a, pack_codes(w, k * n), m, n, k, t, mode);
+    return mismatches(want, got, m, n);
+}
+
+// The same, summed over the three modes.
+fn all_modes_mismatches(m: usize, n: usize, k: usize, seed: u32, t: Tiling) -> usize {
+    return random_case_mismatches(m, n, k, seed, t, MODE_SELECT) + random_case_mismatches(m, n, k, seed, t, MODE_I8_MMA) + random_case_mismatches(m, n, k, seed, t, MODE_DP4A);
+}
+
+// How many results differ from zero: a guard that a "0 mismatches" result compared real numbers.
+fn nonzero_count(x: [MAX_ELEMS]i32, m: usize, n: usize) -> usize {
+    var nz: usize = 0;
+    var i: usize = 0;
+    while (i < m * n) {
+        if (x[i] != 0) {
+            nz += 1;
+        }
+        i += 1;
+    }
+    return nz;
+}
+
+// A matrix of one value, and an identity code matrix.
+fn fill_a(count: usize, v: i8) -> [MAX_ELEMS]i8 {
+    var a: [MAX_ELEMS]i8 = [0; MAX_ELEMS];
+    var i: usize = 0;
+    while (i < count) {
+        a[i] = v;
+        i += 1;
+    }
+    return a;
+}
+
+fn fill_w(count: usize, code: u8) -> [MAX_ELEMS]u8 {
+    var w: [MAX_ELEMS]u8 = [0; MAX_ELEMS];
+    var i: usize = 0;
+    while (i < count) {
+        w[i] = code;
+        i += 1;
+    }
+    return w;
+}
+
+fn identity_w(n: usize) -> [MAX_ELEMS]u8 {
+    var w: [MAX_ELEMS]u8 = [0; MAX_ELEMS];
+    var i: usize = 0;
+    while (i < n) {
+        w[i * n + i] = 1;
+        i += 1;
+    }
+    return w;
+}
+
+// ============================================================================
+// 7. Tests
+// ============================================================================
+
+test decode_matches_the_race_code {
+    assert(decode(0) == 0);
+    assert(decode(1) == 1);
+    assert(decode(2) == -1);
+    // 3 is not a weight; the race spec's ternary_decode reads it as 0.
+    assert(decode(3) == 0);
+}
+
+test tmul_widens_before_negating {
+    assert(tmul(5, 1) == 5);
+    assert(tmul(5, 2) == -5);
+    assert(tmul(5, 0) == 0);
+    // -(-128) is 128: out of i8 range, which is where the race spec's i8 ternary_mul overflows.
+    assert(tmul(-128, 2) == 128);
+    assert(tmul(127, 2) == -127);
+}
+
+test pack_round_trips_every_code_quadruple {
+    // All 3^4 = 81 quadruples of real codes, plus code 3 in each lane.
+    var bad: u32 = 0;
+    var seen: u32 = 0;
+    var c0: u8 = 0;
+    while (c0 < 4) {
+        var c1: u8 = 0;
+        while (c1 < 4) {
+            var c2: u8 = 0;
+            while (c2 < 4) {
+                var c3: u8 = 0;
+                while (c3 < 4) {
+                    const b = pack4(c0, c1, c2, c3);
+                    if (unpack_code(b, 0) != c0 or unpack_code(b, 1) != c1 or unpack_code(b, 2) != c2 or unpack_code(b, 3) != c3) {
+                        bad += 1;
+                    }
+                    seen += 1;
+                    c3 += 1;
+                }
+                c2 += 1;
+            }
+            c1 += 1;
+        }
+        c0 += 1;
+    }
+    assert(seen == 256);
+    assert(bad == 0);
+}
+
+test pack_codes_places_code_i_in_byte_i_over_4 {
+    var w: [MAX_ELEMS]u8 = [0; MAX_ELEMS];
+    w[0] = 1;
+    w[1] = 2;
+    w[2] = 0;
+    w[3] = 1;
+    w[4] = 2;
+    const p = pack_codes(w, 5);
+    // 1 + 2*4 + 0*16 + 1*64 = 73; then code 2 alone in the next byte.
+    assert(p[0] == 73);
+    assert(p[1] == 2);
+    assert(packed_code(p, 1) == 2);
+    assert(packed_code(p, 4) == 2);
+}
+
+test reference_two_by_two_by_hand {
+    // A = [[5, 3], [7, 2]], W = [[-1, +1], [+1, -1]] (codes 2, 1, 1, 2).
+    // C00 = -5 + 3 = -2, C01 = 5 - 3 = 2, C10 = -7 + 2 = -5, C11 = 7 - 2 = 5.
+    // The race spec's test ternary_gemm_identity claims [5, 3, 7, 2] for these inputs.
+    var a: [MAX_ELEMS]i8 = [0; MAX_ELEMS];
+    a[0] = 5;
+    a[1] = 3;
+    a[2] = 7;
+    a[3] = 2;
+    var w: [MAX_ELEMS]u8 = [0; MAX_ELEMS];
+    w[0] = 2;
+    w[1] = 1;
+    w[2] = 1;
+    w[3] = 2;
+    const c = ref_gemm(a, w, 2, 2, 2);
+    assert(c[0] == -2);
+    assert(c[1] == 2);
+    assert(c[2] == -5);
+    assert(c[3] == 5);
+    const g = gemm_tiled(a, pack_codes(w, 4), 2, 2, 2, T_SMALL, MODE_I8_MMA);
+    assert(mismatches(c, g, 2, 2) == 0);
+}
+
+test ones_eight_cubed_gives_eight {
+    // The race spec's ternary_gemm_8x8_ones: all-ones A, all +1 W, k = 8 -> every element is 8.
+    const a = fill_a(64, 1);
+    const w = fill_w(64, 1);
+    const want = ref_gemm(a, w, 8, 8, 8);
+    assert(want[0] == 8);
+    assert(want[63] == 8);
+    const got = gemm_tiled(a, pack_codes(w, 64), 8, 8, 8, T_SMALL, MODE_DP4A);
+    assert(got[0] == 8);
+    assert(got[63] == 8);
+    assert(mismatches(want, got, 8, 8) == 0);
+}
+
+test extreme_activations_do_not_wrap {
+    // A all -128, W all -1, k = 37: every element is 37 * 128 = 4736, far outside i8.
+    const a = fill_a(3 * 37, -128);
+    const w = fill_w(37 * 5, 2);
+    const want = ref_gemm(a, w, 3, 5, 37);
+    assert(want[0] == 4736);
+    assert(want[14] == 4736);
+    const s = gemm_tiled(a, pack_codes(w, 37 * 5), 3, 5, 37, T_SMALL, MODE_SELECT);
+    const q = gemm_tiled(a, pack_codes(w, 37 * 5), 3, 5, 37, T_WIDE, MODE_I8_MMA);
+    const d = gemm_tiled(a, pack_codes(w, 37 * 5), 3, 5, 37, T_ONE, MODE_DP4A);
+    assert(s[14] == 4736);
+    assert(mismatches(want, s, 3, 5) == 0);
+    assert(mismatches(want, q, 3, 5) == 0);
+    assert(mismatches(want, d, 3, 5) == 0);
+}
+
+test identity_weights_return_the_activations {
+    // m = 19, k = n = 17 with W = I: C equals A, element by element.
+    const a = gen_a(19, 17, 11);
+    const w = identity_w(17);
+    const c = gemm_tiled(a, pack_codes(w, 17 * 17), 19, 17, 17, T_SMALL, MODE_SELECT);
+    var bad: usize = 0;
+    var i: usize = 0;
+    while (i < 19 * 17) {
+        if (c[i] != (a[i] as i32)) {
+            bad += 1;
+        }
+        i += 1;
+    }
+    assert(bad == 0);
+}
+
+test tiled_equals_reference_on_one_exact_tile {
+    // 16 x 16 x 8 is exactly one T_SMALL block and one k-step.
+    assert(all_modes_mismatches(16, 16, 8, 1, T_SMALL) == 0);
+}
+
+test tiled_equals_reference_on_ragged_tails {
+    // No dimension a multiple of any tile size: every block edge and the last k-step are partial.
+    assert(all_modes_mismatches(17, 19, 13, 2, T_SMALL) == 0);
+    assert(all_modes_mismatches(17, 19, 13, 2, T_WIDE) == 0);
+    assert(all_modes_mismatches(17, 19, 13, 2, T_ONE) == 0);
+}
+
+test tiled_equals_reference_on_many_blocks {
+    // 40 x 40 x 40: 3 x 3 T_SMALL blocks of 5 k-steps, 2 x 3 T_WIDE blocks of 3 k-steps.
+    assert(all_modes_mismatches(40, 40, 40, 3, T_SMALL) == 0);
+    assert(all_modes_mismatches(40, 40, 40, 3, T_WIDE) == 0);
+}
+
+test tiled_equals_reference_on_thin_shapes {
+    // One output element; one row; one column; k = 1 (shorter than every k-step).
+    assert(all_modes_mismatches(1, 1, 1, 4, T_SMALL) == 0);
+    assert(all_modes_mismatches(1, 40, 37, 5, T_WIDE) == 0);
+    assert(all_modes_mismatches(40, 1, 37, 6, T_ONE) == 0);
+    assert(all_modes_mismatches(23, 29, 1, 7, T_SMALL) == 0);
+}
+
+test random_results_are_not_trivial {
+    // Guard on the comparisons above: the random case really produces numbers, almost all nonzero.
+    const a = gen_a(40, 40, 3);
+    const w = gen_w(40, 40, 4);
+    const c = ref_gemm(a, w, 40, 40, 40);
+    assert(nonzero_count(c, 40, 40) > 1500);
+}
+
+test comparison_catches_one_flipped_weight {
+    // Negative control: flip one weight from +1 to -1 in the kernel's copy only. With A all ones,
+    // W[kk][col] reaches every row of column col, so exactly m = 9 elements must differ.
+    const a = fill_a(9 * 12, 1);
+    const w = fill_w(12 * 10, 1);
+    var bent = w;
+    bent[5 * 10 + 7] = 2;
+    const want = ref_gemm(a, w, 9, 10, 12);
+    const got = gemm_tiled(a, pack_codes(bent, 12 * 10), 9, 10, 12, T_SMALL, MODE_I8_MMA);
+    assert(mismatches(want, got, 9, 10) == 9);
+    // ...and each of them by exactly 2: one product went from +1 to -1.
+    assert(got[0 * 10 + 7] == 10);
+    assert(want[0 * 10 + 7] == 12);
+}
+
+test comparison_catches_a_dropped_k_step {
+    // Negative control: hand the kernel only the first 8 of the reference's k = 13 columns of A
+    // and rows of W, as a kernel that skipped the last partial k-step would see them.
+    const a = gen_a(17, 13, 8);
+    const w = gen_w(13, 19, 9);
+    const want = ref_gemm(a, w, 17, 19, 13);
+    var a8: [MAX_ELEMS]i8 = [0; MAX_ELEMS];
+    var row: usize = 0;
+    while (row < 17) {
+        var kk: usize = 0;
+        while (kk < 8) {
+            a8[row * 8 + kk] = a[row * 13 + kk];
+            kk += 1;
+        }
+        row += 1;
+    }
+    // The first 8 rows of W are already its first 8 * 19 codes.
+    const got = gemm_tiled(a8, pack_codes(w, 8 * 19), 17, 19, 8, T_SMALL, MODE_SELECT);
+    const cut = ref_gemm(a8, w, 17, 19, 8);
+    assert(mismatches(cut, got, 17, 19) == 0);
+    assert(mismatches(want, got, 17, 19) > 300);
+}
+
+test the_tilings_are_valid {
+    assert(tiling_ok(T_SMALL));
+    assert(tiling_ok(T_WIDE));
+    assert(tiling_ok(T_ONE));
+    // bk = 6 cannot be split into dp4a quads; tm = 3 does not divide bm = 16.
+    assert(!tiling_ok(Tiling{ bm = 16, bn = 16, bk = 6, tm = 4, tn = 4 }));
+    assert(!tiling_ok(Tiling{ bm = 16, bn = 16, bk = 8, tm = 3, tn = 4 }));
+}
+
+test grid_covers_ragged_extents {
+    assert(blocks_for(17, 16) == 2);
+    assert(blocks_for(16, 16) == 1);
+    assert(blocks_for(1, 16) == 1);
+    assert(blocks_for(3456, 128) == 27);
+    assert(blocks_for(1280, 128) == 10);
+}
+
+// ============================================================================
+// 8. Invariants
+// ============================================================================
+
+// No i32 partial sum can overflow while k <= K_MAX_I32.
+invariant accumulator_cannot_overflow { 128 * K_MAX_I32 <= 2147483647 }
+
+invariant one_more_would { 128 * (K_MAX_I32 + 1) > 2147483647 }
+
+// The 500m shapes are far inside that bound, and the bench tile divides them exactly.
+invariant d_ff_fits_the_accumulator { D_FF_500M <= K_MAX_I32 }
+
+invariant bench_tile_divides_d_model { D_MODEL_500M % BENCH_BM == 0 and D_MODEL_500M % BENCH_BN == 0 }
+
+invariant bench_tile_divides_d_ff { D_FF_500M % BENCH_BM == 0 and D_FF_500M % BENCH_BN == 0 and D_FF_500M % BENCH_BK == 0 }
+
+invariant bench_k_step_is_dp4a_quads { BENCH_BK % 4 == 0 }
+
+// 256 threads per block: (128 / 8) x (128 / 8).
+invariant bench_block_is_256_threads { (BENCH_BM / BENCH_TM) * (BENCH_BN / BENCH_TN) == 256 }

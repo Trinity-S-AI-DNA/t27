@@ -177,7 +177,7 @@ Create `fpga/verilog/ternary_mac_synth.v` as described in Variant B. This ensure
 ### Pros
 - Maximum pressure on all fronts: formal depth, backend fix, silicon evidence
 - If successful, creates an unbeatable competitive narrative (180 generic ∀ + working silicon)
-- Positions Trinity for NSF SHF or DARPA Fast and Curious grant applications
+- Positions Trinity for NSF SHF or federal fast-track grant applications
 - Generates content for arXiv submission
 
 ### Cons

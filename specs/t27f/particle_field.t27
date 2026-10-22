@@ -1,0 +1,512 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/particle_field.t27 -- T27F Live drawn as physics: talking to an agent becomes a field of
+// particles, and every motion on the screen is a step of a real integrator, not an easing curve.
+//
+// WHERE IT SITS: docs/nona-02-organism/t27f/genui-research.md section 5 has the pipeline
+//     agent events -> work graph -> scene -> display list -> paint.
+// This spec is the physical layer between the work graph and the scene. Nodes of the work graph
+// (the user, the agent, a tool) are massive particles; an edge is a damped spring; every pair of
+// nodes pushes apart like charges, so the layout finds itself (P. Eades, 1984; T. Fruchterman and
+// E. Reingold, Softw. Pract. Exper. 21, 1991). An event emits packets that fly along an edge and
+// give the receiving node a kick, so the picture moves only because something happened.
+//
+// THE EVENT VOCABULARY, each with a ternary charge (+1 flows toward the agent, -1 flows out of it,
+// 0 stays inside it) and a hue:
+//     USER_MSG    +1  gold    user -> agent, 1 + chars/8 packets (at most 16)
+//     THINK        0  violet  the agent heats up: a seeded random jitter, no direction
+//     TOOL_CALL   -1  green   agent -> tool
+//     TOOL_RESULT +1  green   tool -> agent
+//     AGENT_MSG   -1  cyan    agent -> user
+//     ERROR       -1  red     a radial burst around the agent
+//     DONE         0  white   damping rises and the field comes to rest
+// A finished exchange is neutral: what came in went out (test "the demo log is neutral").
+//
+// THE NUMERICS: a fixed step DT = 1/60 s, one step per displayed frame, so a frame index names a
+// state and replaying the same log gives the same picture bit for bit. The node field uses
+// semi-implicit Euler, the one-body checks use velocity Verlet (L. Verlet, Phys. Rev. 159, 98, 1967);
+// both are symplectic, so energy does not creep (E. Hairer, C. Lubich, G. Wanner, "Geometric
+// Numerical Integration", 2nd ed., 2006). The jitter comes from a fixed LCG, never from a clock.
+// Reduced motion (the OS setting) turns kicks and jitter off; the packets still travel, so nothing
+// is hidden, only nothing shakes.
+//
+// THE MESH: each particle is a camera-facing quad, 4 vertices and 2 triangles, so 16 particles fill
+// one meshlet of 64 vertices and 32 primitives, inside the 64 / 126 limits NVIDIA published for
+// Turing mesh shaders (2018). A WebGPU or canvas host consumes the same counts.
+//
+// WHAT IT DOES NOT CLAIM: the field is a picture of the conversation, not a model of the agent's
+// mind; temperature is a display parameter, not a sampling temperature. No constant here comes
+// from the V = n * 3^k * pi^m * phi^p * e^q lattice (specs/physics/sacred_lattice.t27 shows those
+// fits are at the chance rate). The physical constants in the Bohr check are CODATA 2022.
+// Claim status: every number on the screen is a test below; the field constants are design
+// choices, labelled as such.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module particle_field {
+
+    pub const KIND : str = "widget-logic";
+    pub const ID : str = "particle-field";
+    pub const VERSION : u8 = 1;
+
+    pub const DT : f64 = 0.016666666666666666;   // 1/60 s, one step per frame
+    pub const PI : f64 = 3.141592653589793;
+
+    // Event kinds.
+    pub const USER_MSG : i64 = 0;
+    pub const THINK : i64 = 1;
+    pub const TOOL_CALL : i64 = 2;
+    pub const TOOL_RESULT : i64 = 3;
+    pub const AGENT_MSG : i64 = 4;
+    pub const ERROR : i64 = 5;
+    pub const DONE : i64 = 6;
+
+    // Nodes.
+    pub const N_USER : usize = 0;
+    pub const N_AGENT : usize = 1;
+    pub const N_TOOL : usize = 2;
+
+    // Field constants: design choices, not measurements.
+    pub const SPRING_K : f64 = 4.0;
+    pub const REST : f64 = 1.0;
+    pub const REPULSE : f64 = 0.2;
+    pub const SOFT : f64 = 0.01;
+    pub const DAMP_LIVE : f64 = 0.8;
+    pub const DAMP_DONE : f64 = 6.0;
+    pub const KICK : f64 = 0.6;
+    pub const THINK_TEMP : f64 = 2.0;
+    pub const LOG_START : i64 = 120;              // the first event; frames before it settle the layout
+
+    // Mesh budget (NVIDIA Turing mesh shader limits).
+    pub const VERTS_PER_PARTICLE : i64 = 4;
+    pub const TRIS_PER_PARTICLE : i64 = 2;
+    pub const MESHLET_VERTS : i64 = 64;
+    pub const MESHLET_PRIMS : i64 = 126;
+
+    // CODATA 2022.
+    pub const E_CHARGE : f64 = 1.602176634e-19;
+    pub const EPS0 : f64 = 8.8541878188e-12;
+    pub const HBAR : f64 = 1.0545718176461565e-34;   // h / (2 pi), h = 6.62607015e-34 exact; 1.054571817e-34 is 6e-10 short
+    pub const C_LIGHT : f64 = 299792458.0;
+    pub const M_E : f64 = 9.1093837139e-31;
+    pub const ALPHA : f64 = 0.0072973525643;
+    pub const A0 : f64 = 5.29177210544e-11;
+
+    // ---- the event vocabulary ----
+
+    fn charge(kind: i64) -> i64 {
+        if (kind == USER_MSG || kind == TOOL_RESULT) {
+            return 1;
+        }
+        if (kind == TOOL_CALL || kind == AGENT_MSG || kind == ERROR) {
+            return 0 - 1;
+        }
+        return 0;
+    }
+
+    // Hue in degrees.
+    fn hue(kind: i64) -> f64 {
+        if (kind == USER_MSG) { return 45.0; }
+        if (kind == THINK) { return 275.0; }
+        if (kind == TOOL_CALL || kind == TOOL_RESULT) { return 140.0; }
+        if (kind == AGENT_MSG) { return 190.0; }
+        if (kind == ERROR) { return 0.0; }
+        return 0.0 - 1.0;  // DONE: white, no hue
+    }
+
+    // Packets a message of `chars` characters emits.
+    fn burst(chars: i64) -> i64 {
+        const n = 1 + @divTrunc(chars, 8);
+        if (n > 16) {
+            return 16;
+        }
+        return n;
+    }
+
+    fn sender(kind: i64) -> usize {
+        if (kind == USER_MSG) { return N_USER; }
+        if (kind == TOOL_RESULT) { return N_TOOL; }
+        return N_AGENT;
+    }
+
+    fn receiver(kind: i64) -> usize {
+        if (kind == USER_MSG || kind == TOOL_RESULT) { return N_AGENT; }
+        if (kind == TOOL_CALL) { return N_TOOL; }
+        if (kind == AGENT_MSG) { return N_USER; }
+        return N_AGENT;
+    }
+
+    // The demo conversation: one question, one thought, one tool round trip, one answer.
+    pub const LOG_LEN : i64 = 6;
+
+    fn log_kind(i: i64) -> i64 {
+        if (i == 0) { return USER_MSG; }
+        if (i == 1) { return THINK; }
+        if (i == 2) { return TOOL_CALL; }
+        if (i == 3) { return TOOL_RESULT; }
+        if (i == 4) { return AGENT_MSG; }
+        return DONE;
+    }
+
+    fn log_frame(i: i64) -> i64 {
+        if (i == 0) { return 120; }
+        if (i == 1) { return 150; }
+        if (i == 2) { return 210; }
+        if (i == 3) { return 260; }
+        if (i == 4) { return 300; }
+        return 330;
+    }
+
+    fn log_charge() -> i64 {
+        var s : i64 = 0;
+        var i : i64 = 0;
+        while (i < LOG_LEN) {
+            s = s + charge(log_kind(i));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // The owner's trit triangle, read row by row: +1 / -1 +1 / +1 0 +1 / -1 +1 +1 -1.
+    fn triangle_sum() -> i64 {
+        const t : [10]i64 = [1, -1, 1, 1, 0, 1, -1, 1, 1, -1];
+        var s : i64 = 0;
+        var i : usize = 0;
+        while (i < 10) {
+            s = s + t[i];
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // ---- packets ----
+
+    // Distance a packet launched at frame `start` has covered by frame `frame`.
+    fn packet_s(frame: i64, start: i64, speed: f64, dist: f64) -> f64 {
+        if (frame <= start) {
+            return 0.0;
+        }
+        const s = ((frame - start) as f64) * speed * DT;
+        if (s > dist) {
+            return dist;
+        }
+        return s;
+    }
+
+    fn arrival_frames(dist: f64, speed: f64) -> i64 {
+        return @as(i64, @intFromFloat(@ceil(dist / (speed * DT))));
+    }
+
+    fn arrival_by_steps(dist: f64, speed: f64) -> i64 {
+        var s : f64 = 0.0;
+        var n : i64 = 0;
+        while (s < dist) {
+            s = s + speed * DT;
+            n = n + 1;
+        }
+        return n;
+    }
+
+    // ---- mesh ----
+
+    fn mesh_verts(n: i64) -> i64 {
+        return n * VERTS_PER_PARTICLE;
+    }
+
+    fn mesh_tris(n: i64) -> i64 {
+        return n * TRIS_PER_PARTICLE;
+    }
+
+    fn meshlets(n: i64) -> i64 {
+        return @divTrunc(mesh_verts(n) + MESHLET_VERTS - 1, MESHLET_VERTS);
+    }
+
+    // ---- one-body checks of the integrator ----
+
+    // Period of x'' = -(k/m) x with velocity Verlet, measured between two downward zero crossings.
+    fn verlet_period(k: f64, m: f64) -> f64 {
+        const w2 = k / m;
+        var x : f64 = 1.0;
+        var v : f64 = 0.0;
+        var a : f64 = 0.0 - w2 * x;
+        var t : f64 = 0.0;
+        var first : f64 = 0.0 - 1.0;
+        var steps : i64 = 0;
+        while (steps < 1000000) {
+            const xn = x + v * DT + 0.5 * a * DT * DT;
+            const an = 0.0 - w2 * xn;
+            v = v + 0.5 * (a + an) * DT;
+            if (x > 0.0 && xn <= 0.0) {
+                const tc = t + DT * x / (x - xn);
+                if (first >= 0.0) {
+                    return tc - first;
+                }
+                first = tc;
+            }
+            x = xn;
+            a = an;
+            t = t + DT;
+            steps = steps + 1;
+        }
+        return 0.0;
+    }
+
+    // Relative energy drift of a circular Kepler orbit (GM = 1, r = 1, v = 1) after `orbits` turns.
+    // verlet = true: velocity Verlet; false: explicit Euler.
+    fn orbit_drift(orbits: i64, verlet: bool) -> f64 {
+        var x : f64 = 1.0;
+        var y : f64 = 0.0;
+        var vx : f64 = 0.0;
+        var vy : f64 = 1.0;
+        const e0 = 0.0 - 0.5;
+        const n = @as(i64, @intFromFloat(@round(2.0 * PI * (orbits as f64) / DT)));
+        var i : i64 = 0;
+        while (i < n) {
+            const r3 = @sqrt(x * x + y * y) * (x * x + y * y);
+            const ax = 0.0 - x / r3;
+            const ay = 0.0 - y / r3;
+            if (verlet) {
+                const xn = x + vx * DT + 0.5 * ax * DT * DT;
+                const yn = y + vy * DT + 0.5 * ay * DT * DT;
+                const rn3 = @sqrt(xn * xn + yn * yn) * (xn * xn + yn * yn);
+                vx = vx + 0.5 * (ax - xn / rn3) * DT;
+                vy = vy + 0.5 * (ay - yn / rn3) * DT;
+                x = xn;
+                y = yn;
+            } else {
+                x = x + vx * DT;
+                y = y + vy * DT;
+                vx = vx + ax * DT;
+                vy = vy + ay * DT;
+            }
+            i = i + 1;
+        }
+        const e = 0.5 * (vx * vx + vy * vy) - 1.0 / @sqrt(x * x + y * y);
+        return @abs((e - e0) / e0);
+    }
+
+    // Two nodes on one edge: where spring and repulsion balance, k (r - REST) = REPULSE / r^2.
+    fn edge_rest_newton() -> f64 {
+        var r : f64 = REST;
+        var i : i64 = 0;
+        while (i < 50) {
+            const g = SPRING_K * (r - REST) - REPULSE / (r * r);
+            const dg = SPRING_K + 2.0 * REPULSE / (r * r * r);
+            r = r - g / dg;
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // The same balance found by the integrator (relative coordinate, reduced mass 1/2).
+    fn edge_rest_sim(frames: i64) -> f64 {
+        var r : f64 = 0.5;
+        var v : f64 = 0.0;
+        var f : i64 = 0;
+        while (f < frames) {
+            const force = 0.0 - SPRING_K * (r - REST) + REPULSE / (r * r) - DAMP_LIVE * v;
+            v = v + 2.0 * force * DT;
+            r = r + v * DT;
+            f = f + 1;
+        }
+        return r;
+    }
+
+    // The speed of the electron on the first Bohr orbit, and that orbit's radius.
+    fn bohr_speed(e: f64, eps0: f64, hbar: f64) -> f64 {
+        return e * e / (4.0 * PI * eps0 * hbar);
+    }
+
+    fn bohr_radius(e: f64, eps0: f64, hbar: f64, me: f64) -> f64 {
+        return 4.0 * PI * eps0 * hbar * hbar / (me * e * e);
+    }
+
+    // ---- the field ----
+
+    fn lcg(seed: i64) -> i64 {
+        return @mod(seed * 1103515245 + 12345, 2147483648);
+    }
+
+    fn linked(i: usize, j: usize) -> bool {
+        return (i == N_AGENT || j == N_AGENT) && i != j;
+    }
+
+    // Run the demo log for `frames` frames. Returns the kinetic energy at the last frame, or, with
+    // want_peak, the largest kinetic energy seen after LOG_START.
+    fn field(frames: i64, reduced: bool, want_peak: bool) -> f64 {
+        var px : [3]f64 = [-1.0, 0.0, 1.0];
+        var py : [3]f64 = [0.0, 0.3, 0.0];
+        var vx : [3]f64 = [0.0, 0.0, 0.0];
+        var vy : [3]f64 = [0.0, 0.0, 0.0];
+        var seed : i64 = 27;
+        var temp : f64 = 0.0;
+        var damp : f64 = DAMP_LIVE;
+        var peak : f64 = 0.0;
+        var ke : f64 = 0.0;
+        var f : i64 = 0;
+        while (f < frames) {
+            var e : i64 = 0;
+            while (e < LOG_LEN) {
+                if (log_frame(e) == f) {
+                    const kind = log_kind(e);
+                    if (kind == THINK) {
+                        temp = THINK_TEMP;
+                    }
+                    if (kind == DONE) {
+                        temp = 0.0;
+                        damp = DAMP_DONE;
+                    }
+                    if (charge(kind) != 0 && reduced == false) {
+                        const s = sender(kind);
+                        const r = receiver(kind);
+                        const dx = px[r] - px[s];
+                        const dy = py[r] - py[s];
+                        const d = @sqrt(dx * dx + dy * dy + SOFT);
+                        vx[r] = vx[r] + KICK * dx / d;
+                        vy[r] = vy[r] + KICK * dy / d;
+                    }
+                }
+                e = e + 1;
+            }
+            var i : usize = 0;
+            while (i < 3) {
+                var ax : f64 = 0.0 - damp * vx[i];
+                var ay : f64 = 0.0 - damp * vy[i];
+                var j : usize = 0;
+                while (j < 3) {
+                    if (j != i) {
+                        const dx = px[i] - px[j];
+                        const dy = py[i] - py[j];
+                        const r2 = dx * dx + dy * dy + SOFT;
+                        const r = @sqrt(r2);
+                        var fm : f64 = REPULSE / r2;
+                        if (linked(i, j)) {
+                            fm = fm - SPRING_K * (r - REST);
+                        }
+                        ax = ax + fm * dx / r;
+                        ay = ay + fm * dy / r;
+                    }
+                    j = j + 1;
+                }
+                if (temp > 0.0 && reduced == false) {
+                    seed = lcg(seed);
+                    ax = ax + temp * ((seed as f64) / 2147483648.0 - 0.5);
+                    seed = lcg(seed);
+                    ay = ay + temp * ((seed as f64) / 2147483648.0 - 0.5);
+                }
+                vx[i] = vx[i] + ax * DT;
+                vy[i] = vy[i] + ay * DT;
+                i = i + 1;
+            }
+            ke = 0.0;
+            var k : usize = 0;
+            while (k < 3) {
+                px[k] = px[k] + vx[k] * DT;
+                py[k] = py[k] + vy[k] * DT;
+                ke = ke + 0.5 * (vx[k] * vx[k] + vy[k] * vy[k]);
+                k = k + 1;
+            }
+            if (f >= LOG_START && ke > peak) {
+                peak = ke;
+            }
+            f = f + 1;
+        }
+        if (want_peak) {
+            return peak;
+        }
+        return ke;
+    }
+
+    // ---- tests ----
+
+    test "the event vocabulary: charges and hues" {
+        assert(charge(USER_MSG) == 1);
+        assert(charge(THINK) == 0);
+        assert(charge(TOOL_CALL) == 0 - 1);
+        assert(charge(TOOL_RESULT) == 1);
+        assert(charge(AGENT_MSG) == 0 - 1);
+        assert(charge(ERROR) == 0 - 1);
+        assert(charge(DONE) == 0);
+        assert(hue(USER_MSG) == 45.0);
+        assert(hue(AGENT_MSG) == 190.0);
+        assert(hue(ERROR) == 0.0);
+        assert(hue(DONE) < 0.0);
+    }
+
+    test "a message bursts into 1 + chars/8 packets, at most 16" {
+        assert(burst(0) == 1);
+        assert(burst(48) == 7);
+        assert(burst(1000) == 16);
+    }
+
+    test "the demo log is neutral: what came in went out" {
+        assert(log_charge() == 0);
+        assert(charge(TOOL_CALL) + charge(TOOL_RESULT) == 0);
+    }
+
+    test "the owner's trit triangle sums to +3" {
+        assert(triangle_sum() == 3);
+    }
+
+    test "a packet arrives in ceil(dist / (speed * DT)) frames and stops at the node" {
+        assert(arrival_frames(1.0, 0.7) == 86);
+        assert(arrival_by_steps(1.0, 0.7) == 86);
+        assert(packet_s(120, 120, 0.7, 1.0) == 0.0);
+        assert(packet_s(400, 120, 0.7, 1.0) == 1.0);
+    }
+
+    test "16 particles fill one meshlet within the Turing limits" {
+        assert(mesh_verts(16) == MESHLET_VERTS);
+        assert(mesh_tris(16) <= MESHLET_PRIMS);
+        assert(meshlets(16) == 1);
+        assert(meshlets(17) == 2);
+        assert(meshlets(1000) == 63);
+    }
+
+    test "velocity Verlet keeps the harmonic period 2 pi sqrt(m / k)" {
+        const t1 = verlet_period(1.0, 1.0);
+        assert(@abs(t1 / (2.0 * PI) - 1.0) < 0.0001);
+        const t2 = verlet_period(4.0, 1.0);
+        assert(@abs(t2 / PI - 1.0) < 0.0001);
+    }
+
+    test "Verlet holds the orbit's energy; explicit Euler does not" {
+        assert(orbit_drift(10, true) < 0.00001);
+        assert(orbit_drift(10, false) > 0.01);
+    }
+
+    test "the Bohr speed is alpha c (CODATA 2022)" {
+        assert(@abs(bohr_speed(E_CHARGE, EPS0, HBAR) / C_LIGHT / ALPHA - 1.0) < 0.000000001);
+        assert(@abs(bohr_radius(E_CHARGE, EPS0, HBAR, M_E) / A0 - 1.0) < 0.000000001);
+        // the truncated hbar 1.054571817e-34 misses a0 by 1.2e-9, outside this tolerance
+        assert(@abs(bohr_radius(E_CHARGE, EPS0, 1.054571817e-34, M_E) / A0 - 1.0) > 0.000000001);
+    }
+
+    test "an edge settles where spring and repulsion balance" {
+        const r = edge_rest_newton();
+        assert(@abs(SPRING_K * (r - REST) - REPULSE / (r * r)) < 0.000000000001);
+        assert(@abs(edge_rest_sim(1200) - r) < 0.000001);
+    }
+
+    test "replaying the same log gives the same field, bit for bit" {
+        assert(field(360, false, false) == field(360, false, false));
+        assert(field(360, false, true) == field(360, false, true));
+    }
+
+    // The bend of user-agent-tool is held only by the weak user-tool repulsion, so the last motion
+    // to die is slow: measured, KE / peak is 3.2e-5 at frame 600 and 5.4e-6 at frame 2400.
+    test "after DONE the field comes to rest within 4.5 s" {
+        const peak = field(600, false, true);
+        assert(peak > 0.0);
+        assert(field(600, false, false) < peak * 0.0001);
+    }
+
+    test "reduced motion keeps the field calm" {
+        assert(field(600, true, true) < field(600, false, true) * 0.1);
+    }
+
+    test "VERSION says what the header says" {
+        assert(VERSION == 1);
+        assert(LOG_LEN == 6);
+        assert(log_frame(0) == LOG_START);
+    }
+}
+// phi^2 + 1/phi^2 = 3 | TRINITY
