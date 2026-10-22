@@ -28,18 +28,20 @@ trinity files, wave generators) and were read the same way on 2026-10-07:
 its source's own spec already defines (`AsmSection`, `LinkSection`, `HwType`
 against `specs/fpga/`), or a `gen_*` port of code generated from a `specs/tri/`
 spec (`LockFreeStack`, `RTree`, `Point`).
-Three more arrived with the 2026-10-19 CR-CHAT-03 wave-3 batch and the sar_adc
-merge (`Range`, `TreeNode`, `UpdatePathRecord`) and were read the same day:
-3 DISTINCT. `Range` has since been repaired on master by sar_adc's rename to
-`ErrRange` (#10892) and its row dropped. The other two are module-scoped
-facts of the trios-chat crate carried into the port by keeping the original
-Rust modules' own struct names.
 
     DRIFT     51
     DISTINCT  36
 
 The per-name evidence is `docs/reports/type_conflicts_classified.json`. This
 file is the summary; that file is the record.
+
+Twenty-one more arrived between 2026-10-18 and 2026-10-22 (measured 2026-10-22 at `tri types ratchet`
+ledger 107, observed 128; #11663) and were read the same way on 2026-10-22:
+5 DRIFT, 16 DISTINCT. All 5 DRIFT rows are the openxc7 uart_bridge v1/v2 pair (LedState, RxState,
+TxState) plus the two bogatyr/gft lineages (BogatyrResult) and one JTAG payload family (JtagData);
+the 16 DISTINCT rows are two unrelated subsystems that met on the noun (ternary-vs-GF16 AddResult,
+fuzz-case-vs-synth Module, generic Tree versus a numeric summary tuple, and per-binary wrappers in
+the trios ports).
 
 ## Why this is not a style complaint
 
@@ -67,7 +69,7 @@ definition moves. `tri types classified` cross-checks the file against a live
 Non-empty drift in either direction exits non-zero. A classification nobody
 re-reads becomes a claim about a tree that no longer exists.
 
-## DRIFT -- 60 names
+## DRIFT -- 65 names
 
 One concept, two definitions. These are the ones with a repair.
 
@@ -134,6 +136,12 @@ One concept, two definitions. These are the ones with a repair.
 | `VcdChange` | 2 | 2 files | Fold: one VCD type set under specs/fpga/vcd_trace.t27 (keeping the port's typed VcdVarKind enum); th... |
 | `VcdHeader` | 2 | 2 files | Same fold as VcdVar/VcdChange: one VcdHeader (no _dummy), owned by specs/fpga/vcd_trace.t27. |
 | `VcdVar` | 2 | 2 files | Fold the VCD trio into one type set; keep the typed-enum spelling in the specs/fpga owner and drop t... |
+| `BogatyrResult` | 2 | 2 files | Converge: keep spec_structure's verdict/errors/metrics as the owner; yaml_syntax derives checks_performed as errors.len() -- both cite the original's common.BogatyrResult. |
+| `JtagData` | 2 | 2 files | One JTAG payload spec for the gft family (train1's header word optional), or rename gft_train1's to Train1JtagWord; c_non/beat/ok are literally shared and evidence the lineage. |
+| `LedState` | 2 | 2 files | Converge the bridge v1/v2 fold onto one width (fixed's u24 preserves the Vivado register; v2 flattened it to u32). |
+| `RxState` | 2 | 2 files | Converge in the same bridge fold: fixed's typed widths (u16/u4/u8 bit-slicing) beat v2's all-u32 flattening. |
+| `TxState` | 2 | 2 files | Converge in the same bridge fold; decide v2's extra busy flag by reading the v2 top's handshake. |
+
 ### The one that was fixable with no cross-module decision
 
 `AdamWConfig` had **both definitions in one file**,
@@ -143,7 +151,7 @@ has had it: `tri types dup` no longer reports the name, and its row is gone.
 
 Every remaining DRIFT row needs a decision about which module owns the concept.
 
-## DISTINCT -- 49 names
+## DISTINCT -- 63 names
 
 Two concepts that met on a name. Nothing to converge; the question is only
 whether to rename.
@@ -185,8 +193,6 @@ whether to rename.
 | `Rule` | 2 | 2 files | Rename to DatalogRule and K3Implication — inside one package, an unqualified ar::Rule cannot ... |
 | `SimResult` | 2 | 2 files | No defect. If cross-spec resolution is ever attempted, rename the PRM one to TestbenchPassRat... |
 | `TaskResult` | 2 | 2 files | No defect in itself, but it inherits the Task ambiguity: rename to ProcessResult / AgentTaskR... |
-| `TreeNode` | 2 | 2 files | Accept as a module-scoped fact: the CR-CHAT-03 name mirrors its original Rust module's own struct, and the port convention keeps the original names of the files it ports. |
-| `UpdatePathRecord` | 2 | 2 files | Accept as a module-scoped fact: both names mirror the original Rust modules' own declarations; nothing outside each file depends on the bare name. |
 | `ValidationResult` | 2 | 2 files | No defect to fix today, but the name is unresolvable across specs: rename to ConfigValidation... |
 | `VerificationReport` | 2 | 2 files | No defect. If the name must resolve, GoldenFamilyAudit and FormulaConformanceTally describe w... |
 
@@ -200,6 +206,23 @@ whether to rename.
 | `Step` | 2 | 2 files | Rename the attn block's to FsmRegs (init_state/hold return it; it is a register snapshot, not a step... |
 | `TypeEntry` | 2 | 2 files | Rename return_unsized's to TypeSpan (name -> buffer span; nothing about it is a type); the typecheck... |
 | `VersionInfo` | 2 | 2 files | Rename migrate's to ConfigVersionInfo and trios-server's to VersionResponse (the /version sibling of... |
+| `AddResult` | 2 | 2 files | No defect. If resolution is ever attempted, rename gf16_add's to Gf16AddResult; ternary arithmetic and GF16 float-add are different systems. |
+| `AppState` | 2 | 2 files | Delete the empty placeholder in server's mcp_endpoints/experience.t27; the http ring's counters record may keep the name. |
+| `ChatResponse` | 2 | 2 files | Rename the HR-01 ring's to RingChatResponse or drop the ring scaffold; the server's models the live api_chat contract. |
+| `Cli` | 2 | 2 files | Rename rag_search's to RagSearchCli if needed; the doctor ring's subcommand selector keeps the bare name. |
+| `ClockConfig` | 2 | 2 files | Rename ternary_mac_demo_top_v2's to CfgMclkWire (it wraps the STARTUPE2 oscillator wire); the classifier's frequency plan keeps the name. |
+| `CoreRegs` | 2 | 2 files | No repair today; rename spi_flash_master's to FlashMasterRegs if a rename is required. |
+| `EchoState` | 2 | 2 files | Rename uart_bridge_fixed's to EchoPending (a bit, not a machine); the vivado echo demo keeps the name. |
+| `Module` | 2 | 2 files | Rename fuzz.t27's to FuzzCase (it is a generated case record, not a synth module entry). |
+| `PortParse` | 2 | 2 files | No defect; rename the MCP xtask's to EnvPortParse or align its field to `port` if a rename is required. |
+| `Segments` | 2 | 2 files | Rename spec_loader's to ChunkBuffer (or SpecSegments); both are fixed-cap attribute-free buffers of different items. |
+| `TestStatus` | 2 | 2 files | Rename tnf17's to SweepStatus (fields are sweep controls); per-program status bundles keep their scoping. |
+| `TrainConfig` | 2 | 2 files | No defect; rename igla-trainer's to IglaTrainConfig if a rename is required (its clap port is beside JepaTrainArgs). |
+| `TrainResult` | 2 | 2 files | Rename the CLI's to CliTrainResult if needed; the hypervector forward-pass keeps the name. |
+| `Tree` | 2 | 2 files | Rename gen_w734's to TreeSummary (it is build_tree's numeric tuple); the generic Tree(T) is the owner of the name. |
+| `ValidationContext` | 2 | 2 files | Rename the bogatyrs one to SpecParseContext (parse supplies, not validation switches). |
+| `ValidationError` | 2 | 2 files | Rename the bogatyrs one to BogatyrError; schema.t27's parameter error keeps the name. |
+
 ## Four verdicts the tool did not earn
 
 `tri types dup` decides CONFLICTED by comparing field lists. For four names --
