@@ -1,0 +1,1388 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS pty_server: the long-lived process that owns one pseudo-terminal per pane, so an agent CLI
+// (Claude Code, Codex, a shell) keeps running when the window closes or crashes (the herdr.dev model).
+// It spawns the pane's command in the pane's cwd, keeps a 64 KiB scrollback ring per pane, serves the
+// frames of pty_proto.t27 on ~/.t27os/pty.sock, and writes one record per pane under ~/.t27os/sessions
+// (session_store.t27) on every change. When the server dies, its masters close, the panes get SIGHUP, and
+// the next start reads the records and brings every pane back by the agents.t27 RESUME_* rules.
+//
+// One binary, three modes, picked by the environment so no argv parsing is needed:
+//   (none)             serve
+//   T27OS_HOOK=1       a Claude Code hook: read the payload on stdin, forward it as OP_HOOK to pane
+//                      T27OS_PANE, exit. The server writes ~/.t27os/hooks.json so claude panes run it.
+//   T27OS_CTL=<verb>   a tiny client for scripts and the live test: list, spawn, kill, read, write (keys)
+//                      (T27OS_AGENT, T27OS_CWD, T27OS_MODEL, T27OS_PANE, T27OS_KEYS carry the arguments).
+//                      An editor pane (T27 OS opens inside, 2026-10-20) is spawn with T27OS_AGENT=9 (the
+//                      shell cell) and T27OS_MODEL=vim|nvim|hx|micro|nano: the pane runs that editor on
+//                      T27OS_CWD, a folder or a file, instead of bash (pty_logic launch_command).
+//   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
+//                      the server at login, so panes come back (by session id, model kept) after a reboot.
+//
+// Keys (gHashTag/t27#11241): the server holds up to MAX_KEYS numbered keys for each provider, in memory only,
+// sent by the window with OP_SETKEY (the key number rides in the high nibble of the pane byte). Every agent
+// pane picks its key by rotation at each start; the pane record keeps the key NUMBER, never the key. The
+// claude cell's screen is read for an error row (pty_logic screen_text, keys.t27 error_row and classify_line):
+// the failed key rests, the pane is respawned (resumed) on the next key or profile, or stays with a line in its
+// scrollback. A restored pane waits for a key (or 20 s) before it starts. T27OS_CTL=list prints "key N" for
+// each pane.
+// The server does not depend on the window for its keys: it reads the Keychain itself, through the same
+// /usr/bin/security reader the window uses (keys_host kc_get_n, no SecItem call, no dialog), once at its start
+// before it restores panes and again at a spawn that finds no key for its agent when the last read is older than
+// a minute (pty_logic keys_reload_due, load_mask_agent). A read puts each key in the table by the code path of
+// OP_SETKEY (put_key), so a pane spawned while the window is closed, minimized or never connected is logged in,
+// a restarted server is not keyless, and a key added from a terminal is picked up. A window's OP_SETKEY still
+// works and overrides or adds.
+//
+// Every decision is a fn with a test that runs; the host loop only moves bytes through pty_sys.t27.
+//
+// Refs gHashTag/t27#10782.
+module T27osPtyServer;
+
+use t27os::agents::AGENT_COUNT;
+use t27os::agents::S_STOPPED;
+use t27os::agents::R_SKIP;
+use t27os::agents::R_RESUME;
+use t27os::agents::R_RELAUNCH;
+use t27os::pane_state::P_HOOK_START;
+use t27os::pane_state::P_OUTPUT;
+use t27os::pane_state::P_QUIET;
+use t27os::pane_state::P_KEY;
+use t27os::pane_state::P_SEEN;
+use t27os::pane_state::P_EXIT_OK;
+use t27os::pane_state::P_EXIT_FAIL;
+use t27os::pane_state::P_SPAWNED;
+use t27os::pane_state::P_COUNT;
+use t27os::pane_state::BIT_UNSEEN;
+use t27os::pane_state::ps_state;
+use t27os::pane_state::pane_step;
+use t27os::pane_state::shown_state;
+use t27os::pane_state::pane_needs_you;
+use t27os::pane_state::quiet_applies;
+use t27os::pane_state::is_quiet;
+use t27os::pane_state::hook_event;
+use t27os::session_store::SHELL_CELL;
+use t27os::session_store::F_SPACE;
+use t27os::session_store::F_AGENT;
+use t27os::session_store::F_SLOT;
+use t27os::session_store::F_STATE;
+use t27os::session_store::F_SID_AT;
+use t27os::session_store::F_SID_LEN;
+use t27os::session_store::F_CWD_AT;
+use t27os::session_store::F_CWD_LEN;
+use t27os::session_store::F_COUNT;
+use t27os::session_store::F_MODEL_AT;
+use t27os::session_store::F_MODEL_LEN;
+use t27os::session_store::model_ok;
+use t27os::session_store::transcript_path;
+use t27os::session_store::last_model;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_record;
+use t27os::session_store::parse_record;
+use t27os::session_store::sid_ok;
+use t27os::session_store::restore_plan;
+use t27os::session_store::build_command;
+use t27os::session_store::fresh_command;
+use t27os::session_store::json_field;
+use t27os::session_store::record_path;
+use t27os::session_store::uuid_text;
+use t27os::session_store::hooks_json;
+use t27os::pty_proto::OP_LIST;
+use t27os::pty_proto::OP_SPAWN;
+use t27os::pty_proto::OP_ATTACH;
+use t27os::pty_proto::OP_DETACH;
+use t27os::pty_proto::OP_KEYS;
+use t27os::pty_proto::OP_READ;
+use t27os::pty_proto::OP_KILL;
+use t27os::pty_proto::OP_HOOK;
+use t27os::pty_proto::RE_OK;
+use t27os::pty_proto::RE_ERR;
+use t27os::pty_proto::RE_DATA;
+use t27os::pty_proto::RE_LISTING;
+use t27os::pty_proto::HEADER;
+use t27os::pty_proto::RING_CAP;
+use t27os::pty_proto::MAX_PANES;
+use t27os::pty_proto::get_u16;
+use t27os::pty_proto::OP_RESIZE;
+use t27os::pty_proto::TIOCSWINSZ;
+use t27os::pty_proto::SIGWINCH;
+use t27os::pty_proto::resize_ok;
+use t27os::pty_proto::put_winsize;
+use t27os::pty_proto::ws_pack;
+use t27os::pty_proto::ws_cols;
+use t27os::pty_proto::ws_rows;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::put_header;
+use t27os::pty_proto::put_frame;
+use t27os::pty_proto::frame_need;
+use t27os::pty_proto::frame_complete;
+use t27os::pty_proto::is_request;
+use t27os::pty_proto::ring_window;
+use t27os::pty_proto::ring_slot;
+use t27os::pty_proto::data_chunk;
+use t27os::pty_proto::ring_append;
+use t27os::pty_proto::ring_copy;
+use t27os::pty_proto::put_list_entry;
+use t27os::pty_proto::spawn_ok;
+use t27os::pty_proto::socket_path;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_unlink;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_chdir;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_setenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_listen;
+use t27os::pty_sys::sys_accept;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_forkpty;
+use t27os::pty_sys::sys_execv;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_waitpid;
+use t27os::pty_sys::sys_kill;
+use t27os::pty_sys::sys_set_winsize;
+use t27os::pty_sys::sys_signal;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_sys::sys_random;
+use t27os::pty_sys::sys_exe_path;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_unsetenv;
+use t27os::pty_logic::O_KEYS;
+use t27os::pty_logic::KEY_CAP;
+use t27os::pty_proto::OP_SETKEY;
+use t27os::pty_logic::G_PANEK;
+use t27os::pty_logic::G_KLOAD;
+use t27os::pty_logic::load_all_mask;
+use t27os::pty_logic::load_mask_agent;
+use t27os::pty_logic::load_wants;
+use t27os::pty_logic::keys_reload_due;
+use t27os::pty_logic::G_START;
+use t27os::pty_logic::PK;
+use t27os::pty_logic::PK_PROF;
+use t27os::pty_logic::PK_WAIT;
+use t27os::pty_logic::W_DONE;
+use t27os::pty_logic::O_CARRY;
+use t27os::pty_logic::CARRY_SLOT;
+use t27os::pty_logic::O_SCAN;
+use t27os::pty_logic::SCAN_CAP;
+use t27os::pty_logic::CARRY_CAP;
+use t27os::pty_logic::key_slot;
+use t27os::pty_logic::keys_init;
+use t27os::pty_logic::pane_keys_reset;
+use t27os::pty_logic::pane_key_get;
+use t27os::pty_logic::pane_key_shown;
+use t27os::pty_logic::list_flags_key;
+use t27os::pty_logic::key_put;
+use t27os::pty_logic::plan_pane_keys;
+use t27os::pty_logic::plan_failover;
+use t27os::pty_logic::launch_model;
+use t27os::pty_logic::pane_mstep_get;
+use t27os::pty_logic::screen_text;
+use t27os::pty_logic::text_class;
+use t27os::pty_logic::carry_cut;
+use t27os::pty_logic::scan_applies;
+use t27os::pty_logic::scan_ready;
+use t27os::pty_logic::restore_waits;
+use t27os::pty_logic::restore_release;
+use t27os::pty_logic::wait_word;
+use t27os::pty_logic::waiting;
+use t27os::pty_logic::wait_plan;
+use t27os::pty_logic::after_wait;
+use t27os::pty_logic::keyless_respawn;
+use t27os::pty_logic::keyless_plan;
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::PROFILE_COUNT;
+use t27os::keys::FC_NONE;
+use t27os::keys::FA_KEEP;
+use t27os::keys::FA_GIVE_UP;
+use t27os::keys::setkey_provider;
+use t27os::keys::setkey_number;
+use t27os::keys::scan_goes_on;
+use t27os::keys_host::kc_get_n;
+use t27os::keys::agent_uses;
+use t27os::keys::provider_env;
+use t27os::keys::env_stripped;
+use t27os::keys::key_fits;
+use t27os::keys::profile_agent;
+use t27os::keys::claude_strips;
+use t27os::keys::PROFILE_PROVIDER;
+use t27os::keys::agent_var_count;
+use t27os::keys::agent_var_name;
+use t27os::keys::agent_var_is_key;
+use t27os::keys::agent_var_text_step;
+use t27os::keys::agent_strips;
+use t27os::keys::agent_config_file;
+use t27os::keys::crush_config_text;
+use t27os::keys::crush_config_dir;
+use t27os::keys::light_name;
+use t27os::keys::shown_state_of;
+use t27os::keys::shown_light_of;
+use t27os::pty_logic::list_shown;
+use t27os::pty_client::sockaddr_un;
+use t27os::pty_client::client_connect;
+use t27os::pty_client::client_list;
+use t27os::pty_client::client_spawn;
+use t27os::pty_client::client_keys;
+use t27os::pty_client::client_read;
+use t27os::pty_client::client_kill;
+use t27os::pty_client::client_call;
+use t27os::pty_client::AF_UNIX;
+use t27os::pty_client::SOCK_STREAM;
+use t27os::pty_client::SOCKADDR_LEN;
+use t27os::pty_logic::PF;
+use t27os::pty_logic::PF_USED;
+use t27os::pty_logic::PF_LIVE;
+use t27os::pty_logic::PF_PID;
+use t27os::pty_logic::PF_FD;
+use t27os::pty_logic::PF_AGENT;
+use t27os::pty_logic::PF_SPACE;
+use t27os::pty_logic::PF_SLOT;
+use t27os::pty_logic::PF_STATUS;
+use t27os::pty_logic::PF_TOTAL;
+use t27os::pty_logic::PF_LAST;
+use t27os::pty_logic::PF_SIDLEN;
+use t27os::pty_logic::PF_CWDLEN;
+use t27os::pty_logic::PF_BORN;
+use t27os::pty_logic::PF_PLAN;
+use t27os::pty_logic::resume_failed;
+use t27os::pty_logic::hook_stale;
+use t27os::pane_state::P_HOOK_STOP;
+use t27os::pty_logic::G_LISTEN;
+use t27os::pty_logic::G_HLEN;
+use t27os::pty_logic::G_BINLEN;
+use t27os::pty_logic::G_CFD;
+use t27os::pty_logic::G_CLEN;
+use t27os::pty_logic::G_WINSZ;
+use t27os::pty_logic::ST_SIZE;
+use t27os::pty_logic::MAX_CONNS;
+use t27os::pty_logic::SID_CAP;
+use t27os::pty_logic::CWD_CAP;
+use t27os::pty_logic::IN_CAP;
+use t27os::pty_logic::O_SID;
+use t27os::pty_logic::O_CWD;
+use t27os::pty_logic::O_IN;
+use t27os::pty_logic::O_TMP1;
+use t27os::pty_logic::O_TMP2;
+use t27os::pty_logic::O_OUT;
+use t27os::pty_logic::O_HOME;
+use t27os::pty_logic::O_POLL;
+use t27os::pty_logic::O_MISC;
+use t27os::pty_logic::O_BIN;
+use t27os::pty_logic::O_MODEL;
+use t27os::pty_logic::MODEL_CAP;
+use t27os::pty_logic::hook_model;
+use t27os::pty_logic::spawn_cwd_len;
+use t27os::pty_logic::O_RING;
+use t27os::pty_logic::MEM_SIZE;
+use t27os::pty_logic::TICK_MS;
+use t27os::pty_logic::SIGHUP_RING;
+use t27os::pty_logic::pane_alloc;
+use t27os::pty_logic::tv_ms;
+use t27os::pty_logic::put_pollfd;
+use t27os::pty_logic::poll_revents;
+use t27os::pty_logic::exit_event;
+use t27os::pty_logic::hooked_status;
+use t27os::pty_logic::list_flags;
+use t27os::pty_logic::launch_command;
+use t27os::pty_logic::editor_spawn_ok;
+use t27os::pty_logic::argv_text;
+use t27os::pty_logic::plist_text;
+use t27os::pty_logic::path_first;
+use t27os::pty_logic::c_path;
+
+// ---- the host loop: syscalls and bytes ----
+
+fn env_text(name: []const u8, mem: []u8, at: usize) -> usize {
+    const p : u64 = sys_getenv(name);
+    if (p == 0) { return 0; }
+    var n : u64 = sys_strlen(p);
+    if (n > 200) { n = 200; }
+    sys_peek(mem[at .. at + 200], p, n);
+    return @as(usize, @intCast(n));
+}
+
+fn now_ms(mem: []u8) -> u64 {
+    sys_gettimeofday(mem[O_MISC .. O_MISC + 16], 0);
+    return tv_ms(mem[O_MISC .. O_MISC + 16]);
+}
+
+fn home_slice(st: []const u64, mem: []const u8) -> []const u8 {
+    return mem[O_HOME .. O_HOME + @as(usize, @intCast(st[G_HLEN]))];
+}
+
+fn sid_of(st: []const u64, mem: []const u8, i: usize) -> []const u8 {
+    const at : usize = O_SID + i * SID_CAP;
+    return mem[at .. at + @as(usize, @intCast(st[i * PF + PF_SIDLEN]))];
+}
+
+fn cwd_of(st: []const u64, mem: []const u8, i: usize) -> []const u8 {
+    const at : usize = O_CWD + i * CWD_CAP;
+    return mem[at .. at + @as(usize, @intCast(st[i * PF + PF_CWDLEN]))];
+}
+
+fn model_of(mem: []const u8, i: usize) -> []const u8 {
+    const at : usize = O_MODEL + i * MODEL_CAP;
+    return mem[at + 1 .. at + 1 + @as(usize, mem[at])];
+}
+
+/// Set pane i's model from mem[at .. at + len] when model_ok() passes it; true when it changed.
+fn set_model(mem: []u8, i: usize, at: usize, len: usize) -> bool {
+    if (len >= MODEL_CAP or !model_ok(mem[at .. at + len])) { return false; }
+    const mo : usize = O_MODEL + i * MODEL_CAP;
+    var same : bool = @as(usize, mem[mo]) == len;
+    var k : usize = 0;
+    while (k < len) {
+        if (mem[mo + 1 + k] != mem[at + k]) { same = false; }
+        mem[mo + 1 + k] = mem[at + k];
+        k = k + 1;
+    }
+    mem[mo] = @as(u8, @intCast(len));
+    return !same;
+}
+
+/// The last model a claude pane's transcript names (session_store last_model), read in 32 KiB chunks
+/// with a 128-byte overlap so a value across a chunk edge is still seen. Runs only from restore_all,
+/// before any connection is accepted, so the connection buffers at O_IN are free.
+fn model_from_transcript(st: []const u64, mem: []u8, i: usize) -> void {
+    if (st[i * PF + PF_AGENT] != 0 or st[i * PF + PF_SIDLEN] == 0) { return; }
+    const pn : usize = transcript_path(mem[O_TMP2 + 1536 .. O_TMP2 + 2048], home_slice(st, mem), cwd_of(st, mem, i), sid_of(st, mem, i));
+    const fd : i32 = sys_open_ro(mem[O_TMP2 + 1536 .. O_TMP2 + 1536 + pn + 1], 0);
+    if (fd < 0) { return; }
+    var keep : usize = 0;
+    var ml : usize = 0;
+    var done : bool = false;
+    while (!done) {
+        const n : i64 = sys_read(fd, mem[O_IN + keep .. O_IN + keep + 32768], 32768);
+        if (n <= 0) {
+            done = true;
+        } else {
+            const total : usize = keep + @as(usize, @intCast(n));
+            var f : [2]u64 = undefined;
+            if (last_model(mem[O_IN .. O_IN + total], f[0..2])) {
+                ml = @as(usize, @intCast(f[1]));
+                var k : usize = 0;
+                while (k < ml) {
+                    mem[O_TMP2 + 2048 + k] = mem[O_IN + @as(usize, @intCast(f[0])) + k];
+                    k = k + 1;
+                }
+            }
+            keep = 128;
+            if (total < keep) { keep = total; }
+            var m : usize = 0;
+            while (m < keep) {
+                mem[O_IN + m] = mem[O_IN + total - keep + m];
+                m = m + 1;
+            }
+        }
+    }
+    sys_close(fd);
+    if (ml > 0) { set_model(mem, i, O_TMP2 + 2048, ml); }
+}
+
+fn ring_of(mem: []u8, i: usize) -> []u8 {
+    const at : usize = O_RING + i * 65536;
+    return mem[at .. at + 65536];
+}
+
+/// Write the record of pane i: temp file first, then rename over the real one.
+fn save_pane(st: []const u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    if (st[base + PF_USED] == 0) { return; }
+    var sid : []const u8 = sid_of(st, mem, i);
+    if (sid.len == 0) { sid = "-"; }
+    const rn : usize = put_record(mem[O_TMP2 + 512 .. O_TMP2 + 1536], @as(u32, @intCast(st[base + PF_SPACE])), @as(u32, @intCast(st[base + PF_AGENT])), @as(u32, @intCast(st[base + PF_SLOT])), ps_state(@as(u32, @intCast(st[base + PF_STATUS]))), sid, model_of(mem, i), cwd_of(st, mem, i));
+    const home : []const u8 = home_slice(st, mem);
+    const tn : usize = record_path(mem[O_TMP2 .. O_TMP2 + 255], home, @as(u32, @intCast(i)), true);
+    mem[O_TMP2 + tn] = 0;
+    const fn_ : usize = record_path(mem[O_TMP2 + 256 .. O_TMP2 + 511], home, @as(u32, @intCast(i)), false);
+    mem[O_TMP2 + 256 + fn_] = 0;
+    const fd : i32 = sys_creat(mem[O_TMP2 .. O_TMP2 + tn + 1], 420);
+    if (fd < 0) { return; }
+    sys_write(fd, mem[O_TMP2 + 512 .. O_TMP2 + 512 + rn], @as(u64, rn));
+    sys_close(fd);
+    sys_rename(mem[O_TMP2 .. O_TMP2 + tn + 1], mem[O_TMP2 + 256 .. O_TMP2 + 256 + fn_ + 1]);
+}
+
+fn drop_record(st: []const u64, mem: []u8, i: usize) -> void {
+    const fn_ : usize = record_path(mem[O_TMP2 + 256 .. O_TMP2 + 511], home_slice(st, mem), @as(u32, @intCast(i)), false);
+    mem[O_TMP2 + 256 + fn_] = 0;
+    sys_unlink(mem[O_TMP2 + 256 .. O_TMP2 + 256 + fn_ + 1]);
+}
+
+/// In the child: unset every environment variable env_stripped names (CLAUDECODE, CLAUDE_CODE_*) and, for
+/// the claude agent, every endpoint/login/model variable claude_strips names; these are the
+/// markers of the session that started this server. Each unset changes the array, so the walk restarts.
+fn strip_claude_env(mem: []u8, agent: u32) -> void {
+    var round : u32 = 0;
+    var again : bool = true;
+    while (again and round < 64) {
+        again = false;
+        round = round + 1;
+        sys_peek(mem[O_TMP2 .. O_TMP2 + 8], sys_environ(), 8);
+        const arr : u64 = get_u64(mem[O_TMP2 .. O_TMP2 + 8], 0);
+        var i : u64 = 0;
+        var live : bool = arr != 0;
+        while (live and i < 1024) {
+            sys_peek(mem[O_TMP2 + 8 .. O_TMP2 + 16], arr + i * 8, 8);
+            const ent : u64 = get_u64(mem[O_TMP2 + 8 .. O_TMP2 + 16], 0);
+            if (ent == 0) {
+                live = false;
+            } else {
+                var n : u64 = sys_strlen(ent);
+                if (n > 100) { n = 100; }
+                sys_peek(mem[O_TMP2 + 16 .. O_TMP2 + 120], ent, n);
+                var e : usize = 0;
+                while (e < @as(usize, @intCast(n)) and mem[O_TMP2 + 16 + e] != 61) { e = e + 1; }
+                if (e < @as(usize, @intCast(n)) and (env_stripped(mem[O_TMP2 + 16 .. O_TMP2 + 16 + e]) or (profile_agent(agent) and agent_strips(agent, mem[O_TMP2 + 16 .. O_TMP2 + 16 + e])))) {
+                    mem[O_TMP2 + 16 + e] = 0;
+                    sys_unsetenv(mem[O_TMP2 + 16 .. O_TMP2 + 16 + e + 1]);
+                    again = true;
+                    live = false;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// In the child, for the claude agent: set exactly the variables of the profile the parent chose for pane i
+/// (pty_logic plan_pane_keys: pick_profile over the providers that hold a key, or the profile a failover moved
+/// to) with the key of the number it picked by rotation. No usable key leaves the pane without one, and none of
+/// the other profiles' variables is set. The key is read from its slot; its number is all the pane record holds.
+fn inject_profile(st: []const u64, mem: []u8, i: usize, agent: u32) -> void {
+    const pr64 : u64 = st[G_PANEK + i * PK + PK_PROF];
+    if (pr64 >= @as(u64, PROFILE_COUNT)) { return; }
+    const pr : u32 = @as(u32, @intCast(pr64));
+    const prov : u32 = PROFILE_PROVIDER[pr];
+    const kn : u32 = pane_key_get(st, i, prov);
+    if (kn == 0) { return; }
+    const at : usize = key_slot(prov, kn - 1);
+    var k : u32 = 0;
+    while (k < agent_var_count(agent, pr)) {
+        const nl : usize = agent_var_name(agent, pr, k, mem[O_TMP2 .. O_TMP2 + 40]);
+        mem[O_TMP2 + nl] = 0;
+        if (agent_var_is_key(agent, pr, k)) {
+            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+        } else {
+            const vl : usize = agent_var_text_step(agent, pr, k, pane_mstep_get(st, i), home_slice(st, mem), mem[O_TMP2 + 3072 .. O_TMP2 + 4000]);
+            mem[O_TMP2 + 3072 + vl] = 0;
+            sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[O_TMP2 + 3072 .. O_TMP2 + 3072 + vl + 1], 1);
+        }
+        k = k + 1;
+    }
+}
+
+/// In the parent, before the fork, for a Crush pane: write the key-free crush.json of the pane's profile and model
+/// step into <home>/.t27os/crush/<profile>-<step>/ (keys.t27 crush_config_text; the pane gets that directory as
+/// CRUSH_GLOBAL_CONFIG). The file holds no key, so rewriting it at every start is harmless.
+fn write_agent_config(st: []const u64, mem: []u8, i: usize, agent: u32) -> void {
+    const pr64 : u64 = st[G_PANEK + i * PK + PK_PROF];
+    if (pr64 >= @as(u64, PROFILE_COUNT)) { return; }
+    const pr : u32 = @as(u32, @intCast(pr64));
+    if (agent_config_file(agent, pr) == false) { return; }
+    const step : u32 = pane_mstep_get(st, i);
+    const home : []const u8 = home_slice(st, mem);
+    var hn : usize = put_bytes(mem[O_TMP2 + 4200 .. O_TMP2 + 4400], 0, home);
+    hn = put_bytes(mem[O_TMP2 + 4200 .. O_TMP2 + 4400], hn, "/.t27os/crush");
+    mem[O_TMP2 + 4200 + hn] = 0;
+    sys_mkdir(mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + hn + 1], 493);
+    const dn : usize = crush_config_dir(home, pr, step, mem[O_TMP2 + 4200 .. O_TMP2 + 4400]);
+    mem[O_TMP2 + 4200 + dn] = 0;
+    sys_mkdir(mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + dn + 1], 493);
+    var fnn : usize = put_bytes(mem[O_TMP2 + 4500 .. O_TMP2 + 4800], 0, mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + dn]);
+    fnn = put_bytes(mem[O_TMP2 + 4500 .. O_TMP2 + 4800], fnn, "/crush.json");
+    mem[O_TMP2 + 4500 + fnn] = 0;
+    const tn : usize = crush_config_text(pr, step, mem[O_TMP2 + 4800 .. O_TMP2 + 5800]);
+    const fd : i32 = sys_creat(mem[O_TMP2 + 4500 .. O_TMP2 + 4500 + fnn + 1], 420);
+    if (fd >= 0) {
+        sys_write(fd, mem[O_TMP2 + 4800 .. O_TMP2 + 4800 + tn], @as(u64, tn));
+        sys_close(fd);
+    }
+}
+
+/// In the child: set the environment variable (keys.t27 PROVIDER_ENVS) of each provider the agent reads
+/// (AGENT_PROVIDERS) to the key plan_pane_keys picked for pane i from that provider's numbered keys. A
+/// provider that holds no key leaves its variable unset.
+fn inject_keys(st: []const u64, mem: []u8, i: usize, agent: u32) -> void {
+    if (profile_agent(agent)) {
+        inject_profile(st, mem, i, agent);
+        return;
+    }
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        const kn : u32 = pane_key_get(st, i, p);
+        if (agent_uses(agent, p) and kn > 0) {
+            const at : usize = key_slot(p, kn - 1);
+            if (mem[at] != 0) {
+                const nl : usize = provider_env(p, mem[O_TMP2 .. O_TMP2 + 40]);
+                mem[O_TMP2 + nl] = 0;
+                sys_setenv(mem[O_TMP2 .. O_TMP2 + nl + 1], mem[at + 1 .. at + 2 + @as(usize, mem[at])], 1);
+            }
+        }
+        p = p + 1;
+    }
+}
+
+/// Start the process of pane i (fields already in st/mem) under plan R_RESUME or R_RELAUNCH. `spawned` is true
+/// only for the first start of a SPAWN request, whose payload may name a model on purpose; a pane restored from
+/// its record, started again by a failover or relaunched after a resume that died is not "spawned" and runs the
+/// model its profile serves (pty_logic launch_model), never the one its record held.
+fn launch(st: []u64, mem: []u8, i: usize, plan: u32, spawned: bool) -> bool {
+    const base : usize = i * PF;
+    const agent : u32 = @as(u32, @intCast(st[base + PF_AGENT]));
+    if (agent == 0 and plan == R_RELAUNCH) {
+        sys_random(mem[O_MISC + 64 .. O_MISC + 80], 16);
+        const un : usize = uuid_text(mem[O_MISC + 64 .. O_MISC + 80], mem[O_SID + i * SID_CAP .. O_SID + i * SID_CAP + 40]);
+        st[base + PF_SIDLEN] = @as(u64, un);
+    }
+    // the keys of this start: the profile and the key number of each provider the agent reads, by rotation
+    // over the numbered keys (a failover has set what to skip); the unfinished screen row of the old process goes
+    plan_pane_keys(st, i, agent, now_ms(mem));
+    write_agent_config(st, mem, i, agent);
+    // the model of this start, from the profile just chosen; the pane's slot (and so its record) takes it
+    const mn : usize = launch_model(st, i, agent, spawned, model_of(mem, i), mem[O_TMP2 + 2048 .. O_TMP2 + 2112]);
+    mem[O_MODEL + i * MODEL_CAP] = 0;
+    if (mn > 0) { set_model(mem, i, O_TMP2 + 2048, mn); }
+    mem[O_CARRY + i * CARRY_SLOT] = 0;
+    const home : []const u8 = home_slice(st, mem);
+    const cn : usize = launch_command(agent, plan, sid_of(st, mem, i), model_of(mem, i), home, cwd_of(st, mem, i), mem[O_TMP1 + 4096 .. O_TMP1 + 8000]);
+    var f : [4]u64 = undefined;
+    const tn : usize = argv_text(mem[O_TMP1 + 4096 .. O_TMP1 + 4096 + cn], mem[O_TMP1 .. O_TMP1 + 3000], f[0..4]);
+    const cw : usize = c_path(mem[O_TMP1 + 3000 .. O_TMP1 + 3300], cwd_of(st, mem, i));
+    const idn : usize = put_dec(mem[O_TMP1 + 3300 .. O_TMP1 + 3340], 0, @as(u64, i));
+    mem[O_TMP1 + 3300 + idn] = 0;
+    var argv : [4]u64 = undefined;
+    argv[0] = sys_addr(mem[O_TMP1 .. O_TMP1 + 8], mem[O_TMP1 .. O_TMP1 + 8], 0);
+    argv[1] = sys_addr(mem[O_TMP1 + @as(usize, @intCast(f[0])) .. O_TMP1 + 3000], mem[O_TMP1 .. O_TMP1 + 8], 0);
+    argv[2] = sys_addr(mem[O_TMP1 + @as(usize, @intCast(f[1])) .. O_TMP1 + 3000], mem[O_TMP1 .. O_TMP1 + 8], 0);
+    argv[3] = 0;
+    // the pane's last RESIZE, 80x24 when the window never sent one; no pixel size
+    const wsw : u64 = st[G_WINSZ + i / 2];
+    const wsh : u32 = @as(u32, @intCast(i % 2));
+    put_winsize(mem[O_MISC + 96 .. O_MISC + 104], ws_cols(wsw, wsh), ws_rows(wsw, wsh));
+    var master : [2]u32 = undefined;
+    master[0] = 0;
+    master[1] = 0;
+    const pid : i32 = sys_forkpty(master, 0, 0, mem[O_MISC + 96 .. O_MISC + 104]);
+    if (pid == 0) {
+        // the child: keep only the pty on 0, 1 and 2, so a server that dies takes every master with it
+        var fd : i32 = 3;
+        while (fd < 256) {
+            sys_close(fd);
+            fd = fd + 1;
+        }
+        sys_chdir(mem[O_TMP1 + 3000 .. O_TMP1 + 3000 + cw + 1]);
+        sys_setenv("T27OS_PANE", mem[O_TMP1 + 3300 .. O_TMP1 + 3300 + idn + 1], 1);
+        pane_path_first(st, mem);
+        strip_claude_env(mem, agent);
+        inject_keys(st, mem, i, agent);
+        sys_execv(mem[O_TMP1 .. O_TMP1 + 8], argv);
+        sys_exit(127);
+        return false;
+    }
+    if (pid < 0) {
+        st[base + PF_LIVE] = 0;
+        st[base + PF_STATUS] = @as(u64, pane_step(0, P_EXIT_FAIL));
+        return false;
+    }
+    st[base + PF_LIVE] = 1;
+    st[base + PF_PID] = @as(u64, @intCast(pid));
+    st[base + PF_FD] = @as(u64, master[0]);
+    st[base + PF_STATUS] = @as(u64, pane_step(0, P_SPAWNED));
+    st[base + PF_TOTAL] = 0;
+    st[base + PF_LAST] = now_ms(mem);
+    st[base + PF_BORN] = st[base + PF_LAST];
+    st[base + PF_PLAN] = @as(u64, plan);
+    return true;
+}
+
+/// In the child: PATH starts with <home>/.t27os/bin, where the updater installs the release's t27b, t27c and tri,
+/// so every pane on every machine runs the same ones (pty_logic path_first).
+fn pane_path_first(st: []const u64, mem: []u8) -> void {
+    const p : u64 = sys_getenv("PATH");
+    var n : u64 = 0;
+    if (p != 0) {
+        n = sys_strlen(p);
+        if (n > 1500) { n = 1500; }
+        sys_peek(mem[O_TMP2 + 4200 .. O_TMP2 + 5700], p, n);
+    }
+    const l : usize = path_first(mem[O_TMP2 + 6000 .. O_TMP2 + 9000], home_slice(st, mem), mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + @as(usize, @intCast(n))]);
+    mem[O_TMP2 + 6000 + l] = 0;
+    sys_setenv("PATH", mem[O_TMP2 + 6000 .. O_TMP2 + 6000 + l + 1], 1);
+}
+
+fn reap(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, 0);
+    sys_close(@as(i32, @intCast(st[base + PF_FD])));
+    st[base + PF_LIVE] = 0;
+    if (resume_failed(@as(u32, @intCast(st[base + PF_PLAN])), st[base + PF_BORN], now_ms(mem), ws[0])) {
+        // nothing to resume: start the agent fresh in the same cwd
+        launch(st, mem, i, R_RELAUNCH, false);
+        save_pane(st, mem, i);
+        return;
+    }
+    // WIFEXITED with code 0 is a zero status word
+    st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), exit_event(ws[0])));
+    save_pane(st, mem, i);
+}
+
+/// Stop pane i's process (SIGKILL, wait, close the master); the pane's record and slot stay.
+fn stop_pane_process(st: []u64, i: usize) -> void {
+    const base : usize = i * PF;
+    if (st[base + PF_LIVE] != 0) {
+        sys_kill(@as(i32, @intCast(st[base + PF_PID])), 9);
+        var ws : [2]u32 = undefined;
+        ws[0] = 0;
+        ws[1] = 0;
+        sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, 0);
+        sys_close(@as(i32, @intCast(st[base + PF_FD])));
+    }
+    st[base + PF_LIVE] = 0;
+}
+
+fn kill_pane(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    stop_pane_process(st, i);
+    drop_record(st, mem, i);
+    st[base + PF_USED] = 0;
+}
+
+/// Start pane i again under `plan` (a failover onto another key or profile, or the one respawn of a restored
+/// pane that started without a key). The scrollback and its running count stay, so a window that reads the pane
+/// goes on from where it was; launch sets the count to 0 and it is put back.
+fn respawn_pane(st: []u64, mem: []u8, i: usize, plan: u32) -> void {
+    const total : u64 = st[i * PF + PF_TOTAL];
+    stop_pane_process(st, i);
+    launch(st, mem, i, plan, false);
+    st[i * PF + PF_TOTAL] = total;
+    save_pane(st, mem, i);
+}
+
+/// Pane i's screen showed failure `class`: pty_logic plan_failover decides (the key rests, the pane moves to the
+/// next key or profile, or stays), the why line goes into the pane's scrollback, and on a respawn the pane is
+/// started again (resumed when its session is known). A give-up writes the same line and leaves the pane as it is.
+fn failover(st: []u64, mem: []u8, i: usize, class: u32, now: u64) -> void {
+    const base : usize = i * PF;
+    var wl : [2]u64 = undefined;
+    wl[0] = 0;
+    wl[1] = 0;
+    const act : u32 = plan_failover(st, i, class, now, mem[O_OUT + 2 .. O_OUT + 130], wl[0..2]);
+    if (act == FA_KEEP) { return; }
+    const n : usize = @as(usize, @intCast(wl[0]));
+    mem[O_OUT] = 13;
+    mem[O_OUT + 1] = 10;
+    mem[O_OUT + 2 + n] = 13;
+    mem[O_OUT + 3 + n] = 10;
+    st[base + PF_TOTAL] = ring_append(ring_of(mem, i), st[base + PF_TOTAL], mem[O_OUT .. O_OUT + n + 4], n + 4);
+    if (act == FA_GIVE_UP) { return; }
+    var plan : u32 = R_RELAUNCH;
+    if (st[base + PF_SIDLEN] > 0) { plan = R_RESUME; }
+    respawn_pane(st, mem, i, plan);
+}
+
+/// Read the n new bytes of pane i (at O_MISC + 128) for a provider error row: only the claude cell, never in
+/// the first seconds after it starts, never while a give-up is quiet. The bytes become plain rows (screen_text),
+/// the unfinished last row of the previous read is put in front and the new one is kept for the next, and the
+/// rows go through keys.t27 error_row and classify_line (pty_logic text_class).
+fn scan_pane(st: []u64, mem: []u8, i: usize, n: usize) -> void {
+    const base : usize = i * PF;
+    if (scan_applies(@as(u32, @intCast(st[base + PF_AGENT]))) == false) { return; }
+    const now : u64 = now_ms(mem);
+    const ca : usize = O_CARRY + i * CARRY_SLOT;
+    if (scan_ready(st, i, st[base + PF_BORN], now) == false) {
+        mem[ca] = 0;
+        return;
+    }
+    const cl : usize = @as(usize, mem[ca]);
+    var k : usize = 0;
+    while (k < cl) {
+        mem[O_SCAN + k] = mem[ca + 1 + k];
+        k = k + 1;
+    }
+    const tl : usize = screen_text(mem[O_MISC + 128 .. O_MISC + 128 + n], mem[O_SCAN + cl .. O_SCAN + cl + n + 2]);
+    const total : usize = cl + tl;
+    const cls : u32 = text_class(mem[O_SCAN .. O_SCAN + total]);
+    var f : [2]u64 = undefined;
+    carry_cut(mem[O_SCAN .. O_SCAN + total], f[0..2]);
+    const fs : usize = @as(usize, @intCast(f[0]));
+    const fl : usize = @as(usize, @intCast(f[1]));
+    mem[ca] = @as(u8, @intCast(fl));
+    k = 0;
+    while (k < fl) {
+        mem[ca + 1 + k] = mem[O_SCAN + fs + k];
+        k = k + 1;
+    }
+    if (cls != FC_NONE) { failover(st, mem, i, cls, now); }
+}
+
+/// Put key number sk (0 = key 1) of provider sp into its slot from mem[src .. src + plen]: the one path both a
+/// window's OP_SETKEY frame and a read of the Keychain (load_keys) take. An empty key (plen 0) empties the slot.
+/// False when the provider or number is out of range or the bytes are no key (keys.t27 key_fits); nothing
+/// changes then. The table of times and rests follows the slot: the same key put again keeps its cooldown.
+fn put_key(st: []u64, mem: []u8, sp: u32, sk: u32, src: usize, plen: usize) -> bool {
+    if (sp >= PROVIDER_COUNT or sk >= MAX_KEYS or plen > KEY_CAP - 2) { return false; }
+    if (plen > 0 and !key_fits(mem[src .. src + plen])) { return false; }
+    const ka : usize = key_slot(sp, sk);
+    var same : bool = plen > 0 and @as(usize, mem[ka]) == plen;
+    var j : usize = 0;
+    while (j < plen) {
+        if (mem[ka + 1 + j] != mem[src + j]) { same = false; }
+        mem[ka + 1 + j] = mem[src + j];
+        j = j + 1;
+    }
+    mem[ka] = @as(u8, @intCast(plen));
+    // the rest of the slot is cleared, so a shorter or deleted key leaves none of the old one behind
+    var wp : usize = plen + 1;
+    while (wp < KEY_CAP) {
+        mem[ka + wp] = 0;
+        wp = wp + 1;
+    }
+    key_put(st, sp, sk, plen > 0, same);
+    return true;
+}
+
+/// Read the Keychain's keys of the providers in `mask` (pty_logic load_mask_agent, load_all_mask) into the table,
+/// each by put_key as an OP_SETKEY would put it. The reader is keys_host kc_get_n, which runs /usr/bin/security
+/// (never SecItem, so there is no dialog); a scan of one provider ends after two numbers in a row that hold
+/// nothing (keys.t27 scan_goes_on). A key is read into the scratch at O_TMP2 + 4096, which nothing else uses, and
+/// the scratch is wiped when the call ends. Sets G_KLOAD to now. Returns how many keys were put. It blocks the
+/// loop for the length of the reads (about 23 ms each, a few per provider): only the start and a spawn that
+/// found no key call it.
+fn load_keys(st: []u64, mem: []u8, mask: u32) -> u32 {
+    const at : usize = O_TMP2 + 4096;
+    var got : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        if (load_wants(mask, p)) {
+            var k : u32 = 0;
+            var misses : u32 = 0;
+            while (scan_goes_on(k, misses)) {
+                const n : usize = kc_get_n(p, k, mem[at .. at + KEY_CAP]);
+                if (n > 0) {
+                    misses = 0;
+                    if (put_key(st, mem, p, k, at, n)) { got = got + 1; }
+                } else {
+                    misses = misses + 1;
+                }
+                k = k + 1;
+            }
+        }
+        p = p + 1;
+    }
+    var w : usize = 0;
+    while (w < KEY_CAP) {
+        mem[at + w] = 0;
+        w = w + 1;
+    }
+    st[G_KLOAD] = now_ms(mem);
+    return got;
+}
+
+fn reply(fd: i32, mem: []u8, op: u8, pane: u8, plen: usize) -> void {
+    put_header(mem[O_OUT .. O_OUT + 8], op, pane, plen);
+    sys_write(fd, mem[O_OUT .. O_OUT + HEADER + plen], @as(u64, HEADER + plen));
+}
+
+fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
+    const op : u8 = mem[off];
+    const pane : u32 = @as(u32, mem[off + 1]);
+    const plen : usize = @as(usize, get_u16(mem[off .. off + HEADER], 2));
+    const p0 : usize = off + HEADER;
+    const base : usize = @as(usize, pane) * PF;
+    if (op == OP_LIST) {
+        var at : usize = O_OUT + HEADER;
+        var i : u32 = 0;
+        while (i < MAX_PANES) {
+            const b : usize = @as(usize, i) * PF;
+            if (st[b + PF_USED] != 0) {
+                const w : u32 = @as(u32, @intCast(st[b + PF_STATUS]));
+                // the flags byte carries the pane's key number + 1 in its high nibble (0 = no key); bits 0 to 2 as before
+                const kshown : u32 = pane_key_shown(st, @as(usize, i), @as(u32, @intCast(st[b + PF_AGENT])));
+                at = put_list_entry(mem[O_OUT .. O_OUT + 128], at - O_OUT, i, @as(u32, @intCast(st[b + PF_AGENT])), list_shown(st, @as(usize, i), @as(u32, @intCast(st[b + PF_AGENT])), shown_state(w), now_ms(mem)), list_flags_key(st[b + PF_LIVE] != 0, w, kshown)) + O_OUT;
+            }
+            i = i + 1;
+        }
+        reply(fd, mem, RE_LISTING, 0, at - O_OUT - HEADER);
+        return;
+    }
+    if (op == OP_SPAWN) {
+        if (!spawn_ok(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        const slot : u32 = pane_alloc(st);
+        const cl : usize = spawn_cwd_len(mem[p0 .. p0 + plen]);
+        // an editor pane (the shell cell with a terminal editor as its model; pty_logic wants_editor) takes the
+        // path as `<editor> '<path>'`: a path that would break the quoting is refused here
+        var ml : usize = 0;
+        if (3 + cl < plen) { ml = plen - 4 - cl; }
+        const edit_ok : bool = editor_spawn_ok(@as(u32, mem[p0]), mem[p0 + 4 + cl .. p0 + 4 + cl + ml], mem[p0 + 3 .. p0 + 3 + cl]);
+        if (slot >= MAX_PANES or cl > CWD_CAP - 1 or cl == 0 or mem[p0] >= AGENT_COUNT and mem[p0] != SHELL_CELL or edit_ok == false) {
+            reply(fd, mem, RE_ERR, 0, 0);
+            return;
+        }
+        const sb : usize = @as(usize, slot) * PF;
+        st[sb + PF_USED] = 1;
+        st[sb + PF_AGENT] = @as(u64, mem[p0]);
+        st[sb + PF_SPACE] = @as(u64, mem[p0 + 1]);
+        st[sb + PF_SLOT] = @as(u64, mem[p0 + 2]);
+        st[sb + PF_SIDLEN] = 0;
+        st[sb + PF_CWDLEN] = @as(u64, cl);
+        pane_keys_reset(st, @as(usize, slot));
+        st[G_WINSZ + @as(usize, slot) / 2] = ws_pack(st[G_WINSZ + @as(usize, slot) / 2], slot % 2, 0, 0);
+        var k : usize = 0;
+        while (k < cl) {
+            mem[O_CWD + @as(usize, slot) * CWD_CAP + k] = mem[p0 + 3 + k];
+            k = k + 1;
+        }
+        // a model after a TAB in the payload (T27OS_CTL=spawn with T27OS_MODEL) goes on the command line and into
+        // the record; without one the pane learns it from its SessionStart hook or, on restore, its transcript
+        mem[O_MODEL + @as(usize, slot) * MODEL_CAP] = 0;
+        if (3 + cl < plen) { set_model(mem, @as(usize, slot), p0 + 4 + cl, plen - 4 - cl); }
+        // no key in the table for this agent (the window has not pushed one, or is not there at all): read the
+        // Keychain for the providers the agent reads, unless that was done in the last minute (keys_reload_due)
+        const spawn_agent : u32 = @as(u32, mem[p0]);
+        if (keys_reload_due(st, spawn_agent, now_ms(mem), st[G_KLOAD])) { load_keys(st, mem, load_mask_agent(spawn_agent)); }
+        launch(st, mem, @as(usize, slot), R_RELAUNCH, true);
+        save_pane(st, mem, @as(usize, slot));
+        reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
+        return;
+    }
+    if (op == OP_SETKEY) {
+        // the pane byte is the provider in its low nibble and the key number (0 = key 1) in the high one
+        // (keys.t27 setkey_byte): key 1 is the frame this op always had, an older client changes nothing
+        if (!put_key(st, mem, setkey_provider(pane), setkey_number(pane), p0, plen)) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
+        return;
+    }
+    if (pane >= MAX_PANES or st[base + PF_USED] == 0) { reply(fd, mem, RE_ERR, 0, 0); return; }
+    if (op == OP_ATTACH) {
+        st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), P_SEEN));
+        put_u64(mem[O_OUT .. O_OUT + 16], HEADER, st[base + PF_TOTAL]);
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 8);
+        return;
+    }
+    if (op == OP_DETACH) { reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0); return; }
+    if (op == OP_RESIZE) {
+        if (resize_ok(mem[p0 .. p0 + plen]) == false) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        const rc : u32 = get_u16(mem[p0 .. p0 + 4], 0);
+        const rr : u32 = get_u16(mem[p0 .. p0 + 4], 2);
+        const wi : usize = G_WINSZ + @as(usize, pane) / 2;
+        st[wi] = ws_pack(st[wi], pane % 2, rc, rr);
+        if (st[base + PF_LIVE] != 0) {
+            // the kernel signals the pty's foreground group on a size change; the explicit SIGWINCH to the
+            // pane's own group covers a child that has not taken the terminal yet
+            put_winsize(mem[O_MISC + 112 .. O_MISC + 120], rc, rr);
+            sys_set_winsize(@as(i32, @intCast(st[base + PF_FD])), TIOCSWINSZ, mem[O_MISC + 112 .. O_MISC + 120]);
+            sys_kill(0 - @as(i32, @intCast(st[base + PF_PID])), SIGWINCH);
+        }
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
+        return;
+    }
+    if (op == OP_KEYS) {
+        if (st[base + PF_LIVE] == 0) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        sys_write(@as(i32, @intCast(st[base + PF_FD])), mem[p0 .. p0 + plen], @as(u64, plen));
+        st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), P_KEY));
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
+        return;
+    }
+    if (op == OP_READ) {
+        if (plen < 8) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        var w : [2]u64 = undefined;
+        ring_window(st[base + PF_TOTAL], get_u64(mem[p0 .. p0 + 8], 0), w[0..2]);
+        const n : usize = data_chunk(w[1]);
+        ring_copy(ring_of(mem, @as(usize, pane)), w[0], n, mem[O_OUT + HEADER + 8 .. O_OUT + HEADER + 8 + 4096]);
+        put_u64(mem[O_OUT .. O_OUT + 16], HEADER, w[0] + @as(u64, n));
+        reply(fd, mem, RE_DATA, @as(u8, @intCast(pane)), 8 + n);
+        return;
+    }
+    if (op == OP_KILL) {
+        kill_pane(st, mem, @as(usize, pane));
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
+        return;
+    }
+    if (op == OP_HOOK) {
+        var f : [2]u64 = undefined;
+        var changed : bool = false;
+        if (json_field(mem[p0 .. p0 + plen], "hook_event_name", f[0..2])) {
+            const e : usize = p0 + @as(usize, @intCast(f[0]));
+            const w : u32 = @as(u32, @intCast(st[base + PF_STATUS]));
+            const nw : u32 = hooked_status(w, mem[e .. e + @as(usize, @intCast(f[1]))]);
+            if (nw != w) { st[base + PF_STATUS] = @as(u64, nw); changed = true; }
+        }
+        if (st[base + PF_AGENT] == 0 and json_field(mem[p0 .. p0 + plen], "session_id", f[0..2])) {
+            const s0 : usize = p0 + @as(usize, @intCast(f[0]));
+            const sl : usize = @as(usize, @intCast(f[1]));
+            if (sid_ok(mem[s0 .. s0 + sl]) and sl <= SID_CAP) {
+                var k : usize = 0;
+                while (k < sl) {
+                    mem[O_SID + @as(usize, pane) * SID_CAP + k] = mem[s0 + k];
+                    k = k + 1;
+                }
+                st[base + PF_SIDLEN] = @as(u64, sl);
+                changed = true;
+            }
+        }
+        if (st[base + PF_AGENT] == 0 and hook_model(mem[p0 .. p0 + plen], f[0..2])) {
+            if (set_model(mem, @as(usize, pane), p0 + @as(usize, @intCast(f[0])), @as(usize, @intCast(f[1])))) { changed = true; }
+        }
+        if (changed) { save_pane(st, mem, @as(usize, pane)); }
+        reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
+        return;
+    }
+    reply(fd, mem, RE_ERR, 0, 0);
+}
+
+/// Serve the whole inbuf of connection c; false when the connection is bad and must be dropped.
+fn serve_conn(st: []u64, mem: []u8, c: usize) -> bool {
+    const off : usize = O_IN + c * IN_CAP;
+    const fd : i32 = @as(i32, @intCast(st[G_CFD + c] - 1));
+    const room : usize = IN_CAP - @as(usize, @intCast(st[G_CLEN + c]));
+    if (room == 0) { return false; }
+    const n : i64 = sys_read(fd, mem[off + @as(usize, @intCast(st[G_CLEN + c])) .. off + IN_CAP], @as(u64, room));
+    if (n <= 0) { return false; }
+    st[G_CLEN + c] = st[G_CLEN + c] + @as(u64, @intCast(n));
+    var go : bool = true;
+    while (go) {
+        const have : usize = @as(usize, @intCast(st[G_CLEN + c]));
+        const need : usize = frame_need(mem[off .. off + have]);
+        if (need == 1) { return false; }
+        if (need == 0 or have < need) {
+            go = false;
+        } else {
+            handle_frame(st, mem, fd, off);
+            var k : usize = 0;
+            while (k + need < have) {
+                mem[off + k] = mem[off + need + k];
+                k = k + 1;
+            }
+            st[G_CLEN + c] = @as(u64, have - need);
+        }
+    }
+    return true;
+}
+
+fn serve_pane(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    const n : i64 = sys_read(@as(i32, @intCast(st[base + PF_FD])), mem[O_MISC + 128 .. O_MISC + 128 + 4096], 4096);
+    if (n <= 0) {
+        reap(st, mem, i);
+        return;
+    }
+    st[base + PF_TOTAL] = ring_append(ring_of(mem, i), st[base + PF_TOTAL], mem[O_MISC + 128 .. O_MISC + 128 + 4096], @as(usize, @intCast(n)));
+    st[base + PF_LAST] = now_ms(mem);
+    st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), P_OUTPUT));
+    // last, because a failover starts the pane again
+    scan_pane(st, mem, i, @as(usize, @intCast(n)));
+}
+
+/// Once a tick: a restored pane that waits for a key of its provider starts when one arrived or the wait ran
+/// out (a pane that ran out starts as it always did, without a key); a restored pane that started keyless is
+/// started again, once, when its first key arrives. pty_logic holds both decisions.
+fn wait_tick(st: []u64, mem: []u8) -> void {
+    const now : u64 = now_ms(mem);
+    var i : usize = 0;
+    while (i < MAX_PANES) {
+        const base : usize = i * PF;
+        const wk : usize = G_PANEK + i * PK + PK_WAIT;
+        const ag : u32 = @as(u32, @intCast(st[base + PF_AGENT]));
+        if (st[base + PF_USED] != 0) {
+            const w : u64 = st[wk];
+            if (waiting(w)) {
+                if (restore_release(st, ag, now, st[G_START])) {
+                    st[wk] = after_wait(st, ag);
+                    launch(st, mem, i, wait_plan(w), false);
+                    save_pane(st, mem, i);
+                }
+            } else if (st[base + PF_LIVE] != 0 and keyless_respawn(w, st, ag)) {
+                st[wk] = W_DONE;
+                respawn_pane(st, mem, i, keyless_plan(ag, sid_of(st, mem, i)));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn quiet_tick(st: []u64, mem: []u8) -> void {
+    const now : u64 = now_ms(mem);
+    var i : usize = 0;
+    while (i < MAX_PANES) {
+        const base : usize = i * PF;
+        const w : u32 = @as(u32, @intCast(st[base + PF_STATUS]));
+        if (st[base + PF_LIVE] != 0 and quiet_applies(w) and is_quiet(now, st[base + PF_LAST])) {
+            st[base + PF_STATUS] = @as(u64, pane_step(w, P_QUIET));
+        }
+        if (st[base + PF_LIVE] != 0 and hook_stale(w, now, st[base + PF_LAST])) {
+            st[base + PF_STATUS] = @as(u64, pane_step(w, P_HOOK_STOP));
+        }
+        i = i + 1;
+    }
+}
+
+/// Bring back every pane that has a record: resume or relaunch by restore_plan.
+fn restore_all(st: []u64, mem: []u8) -> u32 {
+    var back : u32 = 0;
+    var i : u32 = 0;
+    while (i < MAX_PANES) {
+        const home : []const u8 = home_slice(st, mem);
+        const fn_ : usize = record_path(mem[O_TMP2 + 256 .. O_TMP2 + 511], home, i, false);
+        mem[O_TMP2 + 256 + fn_] = 0;
+        const fd : i32 = sys_open_ro(mem[O_TMP2 + 256 .. O_TMP2 + 256 + fn_ + 1], 0);
+        if (fd >= 0) {
+            const n : i64 = sys_read(fd, mem[O_TMP2 + 512 .. O_TMP2 + 1536], 1024);
+            sys_close(fd);
+            var f : [10]u64 = undefined;
+            if (n > 0 and parse_record(mem[O_TMP2 + 512 .. O_TMP2 + 512 + @as(usize, @intCast(n))], f[0..10])) {
+                const b : usize = @as(usize, i) * PF;
+                const sl : usize = @as(usize, @intCast(f[F_SID_LEN]));
+                const cl : usize = @as(usize, @intCast(f[F_CWD_LEN]));
+                if (sl <= SID_CAP and cl < CWD_CAP) {
+                    var k : usize = 0;
+                    while (k < sl) {
+                        mem[O_SID + @as(usize, i) * SID_CAP + k] = mem[O_TMP2 + 512 + @as(usize, @intCast(f[F_SID_AT])) + k];
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while (k < cl) {
+                        mem[O_CWD + @as(usize, i) * CWD_CAP + k] = mem[O_TMP2 + 512 + @as(usize, @intCast(f[F_CWD_AT])) + k];
+                        k = k + 1;
+                    }
+                    st[b + PF_USED] = 1;
+                    st[b + PF_AGENT] = f[F_AGENT];
+                    st[b + PF_SPACE] = f[F_SPACE];
+                    st[b + PF_SLOT] = f[F_SLOT];
+                    st[b + PF_SIDLEN] = @as(u64, sl);
+                    st[b + PF_CWDLEN] = @as(u64, cl);
+                    pane_keys_reset(st, @as(usize, i));
+                    // the record's model (a v1 record has none), then the newer one the transcript names
+                    mem[O_MODEL + @as(usize, i) * MODEL_CAP] = 0;
+                    set_model(mem, @as(usize, i), O_TMP2 + 512 + @as(usize, @intCast(f[F_MODEL_AT])), @as(usize, @intCast(f[F_MODEL_LEN])));
+                    model_from_transcript(st, mem, @as(usize, i));
+                    const sid : []const u8 = sid_of(st, mem, @as(usize, i));
+                    const sidv : []const u8 = sid;
+                    var plan : u32 = restore_plan(@as(u32, @intCast(f[F_AGENT])), @as(u32, @intCast(f[F_STATE])), sidv);
+                    if (plan == R_SKIP) {
+                        st[b + PF_STATUS] = @as(u64, @intCast(f[F_STATE]));
+                    } else if (restore_waits(st, @as(u32, @intCast(f[F_AGENT])))) {
+                        // the window has not sent its keys yet: a pane started now would run without the profile and
+                        // show "Not logged in". It waits for a key of its provider, or RESTORE_WAIT_MS since the
+                        // server started (wait_tick), and starts then.
+                        st[b + PF_STATUS] = @as(u64, @intCast(f[F_STATE]));
+                        st[G_PANEK + @as(usize, i) * PK + PK_WAIT] = wait_word(plan);
+                        back = back + 1;
+                    } else {
+                        if (launch(st, mem, @as(usize, i), plan, false)) { back = back + 1; }
+                        save_pane(st, mem, @as(usize, i));
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return back;
+}
+
+fn say(msg: []const u8) -> void {
+    sys_write(1, msg, @as(u64, msg.len));
+}
+
+/// Make ~/.t27os, ~/.t27os/sessions and the hooks settings file.
+fn prepare_dirs(st: []u64, mem: []u8) -> void {
+    const home : []const u8 = home_slice(st, mem);
+    var n : usize = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], 0, home);
+    n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/.t27os");
+    mem[O_TMP2 + n] = 0;
+    sys_mkdir(mem[O_TMP2 .. O_TMP2 + n + 1], 493);
+    n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/sessions");
+    mem[O_TMP2 + n] = 0;
+    sys_mkdir(mem[O_TMP2 .. O_TMP2 + n + 1], 493);
+    var f : [2]u64 = undefined;
+    if (hooks_json(mem[O_TMP2 + 512 .. O_TMP2 + 1536], mem[O_BIN .. O_BIN + @as(usize, @intCast(st[G_BINLEN]))], f[0..2])) {
+        var p : usize = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], 0, home);
+        p = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], p, "/.t27os/hooks.json");
+        mem[O_TMP2 + p] = 0;
+        const fd : i32 = sys_creat(mem[O_TMP2 .. O_TMP2 + p + 1], 420);
+        if (fd >= 0) {
+            sys_write(fd, mem[O_TMP2 + 512 .. O_TMP2 + 512 + @as(usize, @intCast(f[0]))], f[0]);
+            sys_close(fd);
+        }
+    }
+}
+
+fn open_socket(st: []u64, mem: []u8) -> bool {
+    const pn : usize = socket_path(mem[O_TMP2 .. O_TMP2 + 128], home_slice(st, mem));
+    if (pn == 0) { return false; }
+    mem[O_TMP2 + pn] = 0;
+    sys_unlink(mem[O_TMP2 .. O_TMP2 + pn + 1]);
+    sockaddr_un(mem[O_TMP2 + 256 .. O_TMP2 + 362], mem[O_TMP2 .. O_TMP2 + pn]);
+    const fd : i32 = sys_socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { return false; }
+    if (sys_bind(fd, mem[O_TMP2 + 256 .. O_TMP2 + 362], SOCKADDR_LEN) < 0) { return false; }
+    if (sys_listen(fd, 8) < 0) { return false; }
+    st[G_LISTEN] = @as(u64, @intCast(fd));
+    return true;
+}
+
+fn serve_loop(st: []u64, mem: []u8) -> void {
+    var kind : [64]u8 = undefined;
+    var idx : [64]u8 = undefined;
+    while (true) {
+        var k : usize = 0;
+        put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[G_LISTEN])));
+        kind[k] = 0;
+        idx[k] = 0;
+        k = k + 1;
+        var c : usize = 0;
+        while (c < MAX_CONNS) {
+            if (st[G_CFD + c] != 0) {
+                put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[G_CFD + c] - 1)));
+                kind[k] = 1;
+                idx[k] = @as(u8, @intCast(c));
+                k = k + 1;
+            }
+            c = c + 1;
+        }
+        var i : usize = 0;
+        while (i < MAX_PANES) {
+            if (st[i * PF + PF_LIVE] != 0) {
+                put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[i * PF + PF_FD])));
+                kind[k] = 2;
+                idx[k] = @as(u8, @intCast(i));
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        const r : i32 = sys_poll(mem[O_POLL .. O_POLL + 512], @as(u64, k), TICK_MS);
+        if (r > 0) {
+            var e : usize = 0;
+            while (e < k) {
+                if (poll_revents(mem[O_POLL .. O_POLL + 512], e) != 0) {
+                    if (kind[e] == 0) {
+                        const nfd : i32 = sys_accept(@as(i32, @intCast(st[G_LISTEN])), 0, 0);
+                        if (nfd >= 0) {
+                            var slot : usize = MAX_CONNS;
+                            var q : usize = 0;
+                            while (q < MAX_CONNS) {
+                                if (st[G_CFD + q] == 0 and slot == MAX_CONNS) { slot = q; }
+                                q = q + 1;
+                            }
+                            if (slot == MAX_CONNS) {
+                                sys_close(nfd);
+                            } else {
+                                st[G_CFD + slot] = @as(u64, @intCast(nfd)) + 1;
+                                st[G_CLEN + slot] = 0;
+                            }
+                        }
+                    } else if (kind[e] == 1) {
+                        const cc : usize = @as(usize, idx[e]);
+                        if (!serve_conn(st, mem, cc)) {
+                            sys_close(@as(i32, @intCast(st[G_CFD + cc] - 1)));
+                            st[G_CFD + cc] = 0;
+                            st[G_CLEN + cc] = 0;
+                        }
+                    } else {
+                        serve_pane(st, mem, @as(usize, idx[e]));
+                    }
+                }
+                e = e + 1;
+            }
+        }
+        quiet_tick(st, mem);
+        wait_tick(st, mem);
+    }
+}
+
+fn run_server(st: []u64, mem: []u8) -> void {
+    prepare_dirs(st, mem);
+    if (!open_socket(st, mem)) {
+        say("t27os-server: cannot open the socket\n");
+        return;
+    }
+    // the server reads the Keychain itself before it restores a pane, so a restored pane sees its key at once
+    // and does not wait for a window that may not be there (a number only is printed, never a key)
+    const loaded : u32 = load_keys(st, mem, load_all_mask());
+    say("t27os-server: keys read from the Keychain: ");
+    var lb : [8]u8 = undefined;
+    const ln : usize = put_dec(lb[0..8], 0, @as(u64, loaded));
+    lb[ln] = 10;
+    say(lb[0 .. ln + 1]);
+    // the moment a restored pane starts its wait for the window's keys from (pty_logic RESTORE_WAIT_MS)
+    st[G_START] = now_ms(mem);
+    const back : u32 = restore_all(st, mem);
+    say("t27os-server: listening, restored ");
+    var nb : [8]u8 = undefined;
+    const nn : usize = put_dec(nb[0..8], 0, @as(u64, back));
+    nb[nn] = 10;
+    say(nb[0 .. nn + 1]);
+    serve_loop(st, mem);
+}
+
+/// T27OS_HOOK=1: forward the hook payload on stdin to the pane named by T27OS_PANE.
+fn run_hook(st: []u64, mem: []u8) -> void {
+    var pane : usize = 0;
+    const pl : usize = env_text("T27OS_PANE", mem, O_MISC);
+    var i : usize = 0;
+    while (i < pl) {
+        pane = pane * 10 + @as(usize, mem[O_MISC + i]) - 48;
+        i = i + 1;
+    }
+    var have : usize = 0;
+    var done : bool = false;
+    while (!done and have < 3000) {
+        const n : i64 = sys_read(0, mem[O_TMP1 + have .. O_TMP1 + 3000], @as(u64, 3000 - have));
+        if (n <= 0) { done = true; } else { have = have + @as(usize, @intCast(n)); }
+    }
+    const fd : i32 = client_connect(home_slice(st, mem));
+    if (fd < 0) { return; }
+    client_call(fd, OP_HOOK, @as(u8, @intCast(pane)), mem[O_TMP1 .. O_TMP1 + have], mem[O_OUT .. O_OUT + 4200]);
+    sys_close(fd);
+}
+
+fn print_dec(v: u64, mem: []u8) -> void {
+    const n : usize = put_dec(mem[O_MISC + 200 .. O_MISC + 230], 0, v);
+    sys_write(1, mem[O_MISC + 200 .. O_MISC + 200 + n], @as(u64, n));
+}
+
+/// T27OS_CTL=<verb>: list | spawn | kill | read | write (keys) against a running server.
+fn run_ctl(st: []u64, mem: []u8, verb: u8) -> void {
+    const fd : i32 = client_connect(home_slice(st, mem));
+    if (fd < 0) { say("no server\n"); return; }
+    const out : []u8 = mem[O_OUT .. O_OUT + 4200];
+    var pane : u32 = 0;
+    const pl : usize = env_text("T27OS_PANE", mem, O_MISC + 256);
+    var i : usize = 0;
+    while (i < pl) {
+        pane = pane * 10 + @as(u32, mem[O_MISC + 256 + i]) - 48;
+        i = i + 1;
+    }
+    if (verb == 108) {
+        const n : usize = client_list(fd, out);
+        var at : usize = HEADER;
+        while (at + 4 <= n) {
+            say("pane ");
+            print_dec(@as(u64, out[at]), mem);
+            say(" agent ");
+            print_dec(@as(u64, out[at + 1]), mem);
+            say(" state ");
+            print_dec(@as(u64, shown_state_of(@as(u32, out[at + 2]))), mem);
+            say(" light ");
+            const ln : usize = light_name(shown_light_of(@as(u32, out[at + 2])), mem[O_TMP1 + 3900 .. O_TMP1 + 3930]);
+            sys_write(1, mem[O_TMP1 + 3900 .. O_TMP1 + 3900 + ln], @as(u64, ln));
+            // bits 0 to 2 of the flags byte as before; its high nibble is the key number (1 to 8) the pane holds
+            say(" flags ");
+            print_dec(@as(u64, out[at + 3] % 16), mem);
+            say(" key ");
+            if (out[at + 3] / 16 == 0) { say("-"); } else { print_dec(@as(u64, out[at + 3] / 16), mem); }
+            say("\n");
+            at = at + 4;
+        }
+    } else if (verb == 115) {
+        const al : usize = env_text("T27OS_AGENT", mem, O_MISC + 300);
+        var agent : u32 = 0;
+        var a : usize = 0;
+        while (a < al) {
+            agent = agent * 10 + @as(u32, mem[O_MISC + 300 + a]) - 48;
+            a = a + 1;
+        }
+        var cl : usize = env_text("T27OS_CWD", mem, O_TMP1);
+        const ml : usize = env_text("T27OS_MODEL", mem, O_TMP1 + cl + 1);
+        if (ml > 0) {
+            mem[O_TMP1 + cl] = 9;
+            cl = cl + 1 + ml;
+        }
+        client_spawn(fd, agent, 0, 0, mem[O_TMP1 .. O_TMP1 + cl], out);
+        say("spawned pane ");
+        print_dec(@as(u64, out[1]), mem);
+        say("\n");
+    } else if (verb == 107) {
+        client_kill(fd, pane, out);
+        say("killed\n");
+    } else if (verb == 114) {
+        const n : usize = client_read(fd, pane, 0, out);
+        if (n > HEADER + 8) { sys_write(1, out[HEADER + 8 .. n], @as(u64, n - HEADER - 8)); }
+    } else if (verb == 119) {
+        const kl : usize = env_text("T27OS_KEYS", mem, O_TMP1);
+        mem[O_TMP1 + kl] = 13;
+        client_keys(fd, pane, mem[O_TMP1 .. O_TMP1 + kl + 1], out);
+        say("sent\n");
+    }
+    sys_close(fd);
+}
+
+/// T27OS_INSTALL=1: write the launchd agent plist for this binary.
+fn run_install(st: []u64, mem: []u8) -> void {
+    const home : []const u8 = home_slice(st, mem);
+    var n : usize = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], 0, home);
+    n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/Library/LaunchAgents/ai.t27.os-server.plist");
+    mem[O_TMP2 + n] = 0;
+    const pl : usize = env_text("PATH", mem, O_TMP1);
+    const ll : usize = env_text("LANG", mem, O_TMP1 + 4096);
+    const pn : usize = plist_text(mem[O_TMP2 + 512 .. O_TMP2 + 8192], mem[O_BIN .. O_BIN + @as(usize, @intCast(st[G_BINLEN]))], home, mem[O_TMP1 .. O_TMP1 + pl], mem[O_TMP1 + 4096 .. O_TMP1 + 4096 + ll]);
+    const fd : i32 = sys_creat(mem[O_TMP2 .. O_TMP2 + n + 1], 420);
+    if (fd < 0) { say("cannot write the plist\n"); return; }
+    sys_write(fd, mem[O_TMP2 + 512 .. O_TMP2 + 512 + pn], @as(u64, pn));
+    sys_close(fd);
+    say("wrote the launchd plist; launchctl bootstrap gui/$UID it to start\n");
+}
+
+pub fn main() -> void {
+    var st : [512]u64 = undefined;
+    var mem : [1171712]u8 = undefined;
+    var z : usize = 0;
+    while (z < ST_SIZE) {
+        st[z] = 0;
+        z = z + 1;
+    }
+    keys_init(st[0..ST_SIZE]);
+    sys_signal(13, 1);
+    st[G_HLEN] = @as(u64, env_text("HOME", mem[0 .. MEM_SIZE], O_HOME));
+    var bsz : [2]u32 = undefined;
+    bsz[0] = 250;
+    bsz[1] = 0;
+    if (sys_exe_path(mem[O_BIN .. O_BIN + 256], bsz) == 0) {
+        st[G_BINLEN] = sys_strlen(sys_addr(mem[O_BIN .. O_BIN + 256], mem[O_BIN .. O_BIN + 256], 0));
+    }
+    if (st[G_HLEN] == 0) { say("t27os-server: HOME is not set\n"); return; }
+    if (sys_getenv("T27OS_HOOK") != 0) { run_hook(st[0..ST_SIZE], mem[0..MEM_SIZE]); return; }
+    if (sys_getenv("T27OS_INSTALL") != 0) { run_install(st[0..ST_SIZE], mem[0..MEM_SIZE]); return; }
+    const cl : usize = env_text("T27OS_CTL", mem[0..MEM_SIZE], O_MISC + 400);
+    if (cl > 0) { run_ctl(st[0..ST_SIZE], mem[0..MEM_SIZE], mem[O_MISC + 400]); return; }
+    run_server(st[0..ST_SIZE], mem[0..MEM_SIZE]);
+}
+
+
+// ---- the decisions are tested in pty_logic.t27; this one checks the arena layout the loop relies on ----
+
+test the_arena_regions_do_not_overlap {
+    assert O_SID + 16 * SID_CAP <= O_CWD;
+    assert O_CWD + 16 * CWD_CAP <= O_IN;
+    assert O_IN + MAX_CONNS * IN_CAP <= O_TMP1;
+    assert O_TMP1 + 8192 <= O_TMP2;
+    assert O_TMP2 + 8192 <= O_OUT;
+    assert O_OUT + 4200 <= O_HOME;
+    assert O_HOME + 256 <= O_POLL;
+    assert O_POLL + 512 <= O_MISC;
+    assert O_MISC + 328 <= O_BIN;
+    assert O_BIN + 256 <= O_RING;
+    assert O_RING + 16 * 65536 <= O_KEYS;
+    // the key table holds MAX_KEYS keys for each of the PROVIDER_COUNT providers, then the screen carry rows
+    // and the scratch for a chunk's plain text; main() sizes its arrays with these two literals
+    assert O_KEYS + @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS) * KEY_CAP <= O_CARRY;
+    assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
+    assert O_SCAN + SCAN_CAP <= MEM_SIZE;
+    assert MEM_SIZE == 1171712;
+    assert ST_SIZE == 512;
+    assert CARRY_SLOT == CARRY_CAP + 4;
+}
