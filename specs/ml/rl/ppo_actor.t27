@@ -2,6 +2,15 @@
 // t27/specs/
 // Reparameterization for gradient estimation | φ² + 1/φ² = 3 | TRINITY
 
+// The draft allocated its results with `[]f32{n, 0.0}`, called `math::exp`,
+// `math::log` and a `normal_random` that no spec defines, declared an empty enum
+// for the action space and a local named `var`, so it never compiled. Results now
+// go into caller-provided buffers, the Gaussian noise of a stochastic action is
+// an argument (the caller owns the random source), and the math builtins are
+// `exp` and `log`. The formulas are unchanged. The test parameter vectors were
+// one bias block short of the layout the code reads (weights, then bias, then
+// log-std) and are padded with zeros.
+
 module PpoActor;
     use base::types;
     use math::constants;
@@ -13,10 +22,16 @@ module PpoActor;
     const DEFAULT_INIT_LOG_STD : f32 = 0.0;
     const MIN_LOG_STD : f32 = -20.0;
     const MAX_LOG_STD : f32 = 2.0;
+    const HALF_LOG_TWO_PI : f32 = 0.9189385332046727;
 
     // ═══════════════════════════════════════════════════════════
     // 2. Types
     // ═══════════════════════════════════════════════════════════
+
+    pub const ActionSpace = enum(u8) {
+        Discrete,
+        Continuous,
+    };
 
     pub const ActorConfig = struct {
         state_dim : u32,
@@ -24,10 +39,6 @@ module PpoActor;
         hidden_dims : []u32,
         action_space : ActionSpace,
         init_log_std : f32,
-    };
-
-    pub const ActionSpace = struct {
-        enum : ,
     };
 
     pub const PolicyOutput = struct {
@@ -39,244 +50,283 @@ module PpoActor;
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // forward_discrete(state: []const f32, params: []const f32, config: ActorConfig) → []f32
-    fn forward_discrete(state: []const f32, params: []const f32, config: ActorConfig) -> []f32 {
-        var action_probs = []f32{config.action_dim, 0.0};
-        // Simple linear layer: logits = state * weights + bias
-        var i : usize = 0;
-        while (i < config.state_dim) : (i += 1) {
-            var j : usize = 0;
-            while (j < config.action_dim) : (j += 1) {
-                action_probs[j] += state[i] * params[i * config.action_dim + j];
-            }
-        }
-        // Add bias terms (stored after weights)
+    // log_std is kept inside [MIN_LOG_STD, MAX_LOG_STD]
+    fn clamp_log_std(x: f32) -> f32 {
+        return @min(@max(x, MIN_LOG_STD), MAX_LOG_STD);
+    }
+
+    // params, flat: W (state_dim x action_dim), bias (action_dim). Writes the action
+    // probabilities (softmax of state * W + bias) into out and returns them.
+    fn forward_discrete(state: []const f32, params: []const f32, config: ActorConfig, out: []f32) -> []f32 {
+        const n_s : usize = config.state_dim;
+        const n_a : usize = config.action_dim;
         var j : usize = 0;
-        while (j < config.action_dim) : (j += 1) {
-            action_probs[j] += params[config.state_dim * config.action_dim + j];
-        }
-        // Softmax to get probabilities
-        var max_logit = action_probs[0];
-        i = 1;
-        while (i < config.action_dim) : (i += 1) {
-            if (action_probs[i] > max_logit) {
-                max_logit = action_probs[i];
+        while (j < n_a) {
+            var z : f32 = params[n_s * n_a + j];
+            var i : usize = 0;
+            while (i < n_s) {
+                z = z + state[i] * params[i * n_a + j];
+                i = i + 1;
             }
+            out[j] = z;
+            j = j + 1;
         }
-        var sum_exp = 0.0;
-        i = 0;
-        while (i < config.action_dim) : (i += 1) {
-            action_probs[i] = math::exp(action_probs[i] - max_logit);
-            sum_exp += action_probs[i];
+        var max_logit : f32 = out[0];
+        j = 1;
+        while (j < n_a) {
+            max_logit = @max(max_logit, out[j]);
+            j = j + 1;
         }
-        i = 0;
-        while (i < config.action_dim) : (i += 1) {
-            action_probs[i] /= sum_exp;
+        var sum_exp : f32 = 0.0;
+        j = 0;
+        while (j < n_a) {
+            out[j] = exp(out[j] - max_logit);
+            sum_exp = sum_exp + out[j];
+            j = j + 1;
         }
-        return action_probs;
+        j = 0;
+        while (j < n_a) {
+            out[j] = out[j] / sum_exp;
+            j = j + 1;
+        }
+        return out[0..n_a];
     }
 
-    // forward_continuous(state: []const f32, params: []const f32, config: ActorConfig) → PolicyOutput
-    fn forward_continuous(state: []const f32, params: []const f32, config: ActorConfig) -> PolicyOutput {
-        var logits = []f32{config.action_dim, 0.0};
-        var log_std = []f32{config.action_dim, 0.0};
-        
-        // Compute mean (logits) using linear layer
-        var i : usize = 0;
-        while (i < config.state_dim) : (i += 1) {
-            var j : usize = 0;
-            while (j < config.action_dim) : (j += 1) {
-                logits[j] += state[i] * params[i * config.action_dim + j];
-            }
-        }
-        // Add bias terms for mean
+    // params, flat: W (state_dim x action_dim), bias (action_dim), log_std offset (action_dim).
+    // The mean goes into logits_buf and the clamped log-std into log_std_buf.
+    fn forward_continuous(state: []const f32, params: []const f32, config: ActorConfig, logits_buf: []f32, log_std_buf: []f32) -> PolicyOutput {
+        const n_s : usize = config.state_dim;
+        const n_a : usize = config.action_dim;
+        const log_std_at : usize = n_s * n_a + n_a;
         var j : usize = 0;
-        while (j < config.action_dim) : (j += 1) {
-            logits[j] += params[config.state_dim * config.action_dim + j];
-        }
-        
-        // Compute log standard deviation
-        var log_std_offset = config.state_dim * config.action_dim + config.action_dim;
-        j = 0;
-        while (j < config.action_dim) : (j += 1) {
-            log_std[j] = config.init_log_std + params[log_std_offset + j];
-        }
-        
-        // Clamp log_std to valid range
-        j = 0;
-        while (j < config.action_dim) : (j += 1) {
-            if (log_std[j] < MIN_LOG_STD) {
-                log_std[j] = MIN_LOG_STD;
-            } else if (log_std[j] > MAX_LOG_STD) {
-                log_std[j] = MAX_LOG_STD;
+        while (j < n_a) {
+            var z : f32 = params[n_s * n_a + j];
+            var i : usize = 0;
+            while (i < n_s) {
+                z = z + state[i] * params[i * n_a + j];
+                i = i + 1;
             }
+            logits_buf[j] = z;
+            log_std_buf[j] = clamp_log_std(config.init_log_std + params[log_std_at + j]);
+            j = j + 1;
         }
-        
-        return PolicyOutput{.logits = logits, .log_std = log_std};
+        return PolicyOutput{ .logits = logits_buf[0..n_a], .log_std = log_std_buf[0..n_a] };
     }
 
-    // sample_action(policy_output: PolicyOutput, action_space: ActionSpace, deterministic: bool) → []f32
-    fn sample_action(policy_output: PolicyOutput, action_space: ActionSpace, deterministic: bool) -> []f32 {
-        var action = []f32{policy_output.logits.len, 0.0};
-        
-        if (deterministic) {
-            // For deterministic action, use the mean
-            var i : usize = 0;
-            while (i < action.len) : (i += 1) {
-                action[i] = policy_output.logits[i];
-            }
-        } else {
-            // For stochastic action, add Gaussian noise
-            var i : usize = 0;
-            while (i < action.len) : (i += 1) {
-                // Convert log_std to std
-                var std = math::exp(policy_output.log_std[i]);
-                // Sample from normal distribution and scale
-                var noise = math::normal_random() * std;
-                action[i] = policy_output.logits[i] + noise;
-            }
-        }
-        
-        // Clip actions to reasonable range if needed
+    // The mean when deterministic, else mean + sigma * noise (the reparameterization);
+    // actions are clipped to [-10, 10]. noise holds standard-normal draws.
+    fn sample_action(policy_output: PolicyOutput, action_space: ActionSpace, deterministic: bool, noise: []const f32, out: []f32) -> []f32 {
+        const n : usize = policy_output.logits.len;
         var i : usize = 0;
-        while (i < action.len) : (i += 1) {
-            if (action[i] > 10.0) {
-                action[i] = 10.0;
-            } else if (action[i] < -10.0) {
-                action[i] = -10.0;
+        while (i < n) {
+            var a : f32 = policy_output.logits[i];
+            if (!deterministic) {
+                a = a + exp(policy_output.log_std[i]) * noise[i];
             }
+            out[i] = @min(@max(a, -10.0), 10.0);
+            i = i + 1;
         }
-        
-        return action;
+        return out[0..n];
     }
 
-    // log_prob(action: []f32, policy_output: PolicyOutput, action_space: ActionSpace) → f32
-    fn log_prob(action: []f32, policy_output: PolicyOutput, action_space: ActionSpace) -> f32 {
-        var log_prob_sum = 0.0;
-        
+    // Gaussian log probability: -0.5 ((x - mu) / sigma)^2 - log(sigma) - 0.5 log(2 pi), summed
+    fn log_prob(action: []const f32, policy_output: PolicyOutput, action_space: ActionSpace) -> f32 {
+        var log_prob_sum : f32 = 0.0;
         var i : usize = 0;
-        while (i < action.len) : (i += 1) {
-            // Gaussian log probability: -0.5 * ((x - μ) / σ)² - 0.5 * log(2π) - log(σ)
-            var diff = action[i] - policy_output.logits[i];
-            var std = math::exp(policy_output.log_std[i]);
-            var var = std * std;
-            
-            // Gaussian log probability formula
-            var gaussian_log_prob = -0.5 * (diff * diff) / var - policy_output.log_std[i] - 0.9189385332046727; // -0.5 * log(2π)
-            
-            log_prob_sum += gaussian_log_prob;
+        while (i < action.len) {
+            const diff : f32 = action[i] - policy_output.logits[i];
+            const sigma : f32 = exp(policy_output.log_std[i]);
+            const variance : f32 = sigma * sigma;
+            log_prob_sum = log_prob_sum + (-0.5 * (diff * diff) / variance - policy_output.log_std[i] - HALF_LOG_TWO_PI);
+            i = i + 1;
         }
-        
         return log_prob_sum;
     }
 
-    // entropy(policy_output: PolicyOutput, action_space: ActionSpace) → f32
+    // Differential entropy of a Gaussian: 0.5 log(2 pi e sigma^2), summed
     fn entropy(policy_output: PolicyOutput, action_space: ActionSpace) -> f32 {
-        var total_entropy = 0.0;
-        
+        var total_entropy : f32 = 0.0;
         var i : usize = 0;
-        while (i < policy_output.logits.len) : (i += 1) {
-            // Differential entropy of Gaussian: 0.5 * log(2πeσ²)
-            var std = math::exp(policy_output.log_std[i]);
-            var variance = std * std;
-            var gaussian_entropy = 0.5 * math::log(2.0 * 3.141592653589793 * variance * 2.718281828459045); // log(2πeσ²)
-            
-            total_entropy += gaussian_entropy;
+        while (i < policy_output.logits.len) {
+            const sigma : f32 = exp(policy_output.log_std[i]);
+            const variance : f32 = sigma * sigma;
+            total_entropy = total_entropy + 0.5 * log(2.0 * 3.141592653589793 * variance * 2.718281828459045);
+            i = i + 1;
         }
-        
         return total_entropy;
+    }
+
+    fn config_ok(config: ActorConfig) -> bool {
+        return config.action_dim >= 1 and config.hidden_dims.len >= 1;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Helpers for the invariants
+    // ═══════════════════════════════════════════════════════════
+
+    fn valid_input() -> f32 {
+        return 0.5;
+    }
+
+    fn sample_config_ok(action_dim: u32, hidden_len: usize) -> bool {
+        var hidden : [2]u32 = [64, 64];
+        const config = ActorConfig{ .state_dim = 3, .action_dim = action_dim, .hidden_dims = hidden[0..hidden_len], .action_space = ActionSpace.Discrete, .init_log_std = 0.0 };
+        return config_ok(config);
+    }
+
+    // log probability of an action one sigma above the mean of a unit Gaussian
+    fn log_prob_one_sigma() -> f32 {
+        var logits : [1]f32 = [2.0];
+        var log_std : [1]f32 = [0.0];
+        var action : [1]f32 = [3.0];
+        const po = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        return log_prob(&action, po, ActionSpace.Continuous);
+    }
+
+    // the sampled action for one unit-sigma dimension: mean 1, log_std 0, given noise
+    fn sampled_with(noise0: f32) -> f32 {
+        var logits : [1]f32 = [1.0];
+        var log_std : [1]f32 = [0.0];
+        var noise : [1]f32 = [noise0];
+        var out : [1]f32 = [0.0];
+        const po = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        return sample_action(po, ActionSpace.Continuous, false, &noise, &out)[0];
+    }
+
+    fn softmax_total() -> f32 {
+        var state : [2]f32 = [1.0, -1.0];
+        var params : [6]f32 = [0.5, -0.5, 0.25, 0.75, 0.0, 0.1];
+        var hidden : [1]u32 = [8];
+        var out : [2]f32 = [0.0, 0.0];
+        const config = ActorConfig{ .state_dim = 2, .action_dim = 2, .hidden_dims = &hidden, .action_space = ActionSpace.Discrete, .init_log_std = 0.0 };
+        const probs = forward_discrete(&state, &params, config, &out);
+        return probs[0] + probs[1];
+    }
+
+    fn entropy_at(log_std0: f32) -> f32 {
+        var logits : [1]f32 = [0.0];
+        var log_std : [1]f32 = [log_std0];
+        const po = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        return entropy(po, ActionSpace.Continuous);
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Tests (from .tri behaviors)
     // ═══════════════════════════════════════════════════════════
 
-    test forward_discrete_basic_case
-        given state = [1.0, 2.0, 3.0]
-             params = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 0.1, 0.2] // 3x4 weights + 4 bias
-             config = ActorConfig{state_dim: 3, action_dim: 4, hidden_dims: [], action_space: ActionSpace{}, init_log_std: 0.0}
-        when result = forward_discrete(state, params, config)
-        then result.len == 4
-             result[0] >= 0.0 && result[0] <= 1.0
-             result[1] >= 0.0 && result[1] <= 1.0
-             result[2] >= 0.0 && result[2] <= 1.0
-             result[3] >= 0.0 && result[3] <= 1.0
-             (result[0] + result[1] + result[2] + result[3] - 1.0) * (result[0] + result[1] + result[2] + result[3] - 1.0) <= 0.001 * 0.001
+    test forward_discrete_basic_case {
+        var state: [3]f32 = [1.0, 2.0, 3.0];
+        var params: [16]f32 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0];  // 3x4 weights + 4 bias
+        var hidden: [2]u32 = [64, 64];
+        var buf: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+        var config = ActorConfig{ .state_dim = 3, .action_dim = 4, .hidden_dims = &hidden, .action_space = ActionSpace.Discrete, .init_log_std = 0.0 };
+        var result = forward_discrete(&state, &params, config, &buf);
+        assert(result.len == 4);
+        assert(result[0] >= 0.0 and result[0] <= 1.0);
+        assert(result[1] >= 0.0 and result[1] <= 1.0);
+        assert(result[2] >= 0.0 and result[2] <= 1.0);
+        assert(result[3] >= 0.0 and result[3] <= 1.0);
+        var sum = result[0] + result[1] + result[2] + result[3];
+        assert((sum - 1.0) * (sum - 1.0) <= 0.001 * 0.001);  // a probability distribution
+        // logits (3.8, 4.4, 2.0, 2.6): the softmax is (0.30408, 0.55407, 0.05026, 0.09159)
+        assert(@abs(result[0] - 0.3040797) < 0.00001);
+        assert(@abs(result[1] - 0.5540693) < 0.00001);
+        assert(@abs(result[2] - 0.0502640) < 0.00001);
+        assert(@abs(result[3] - 0.0915870) < 0.00001);
     }
 
-    test forward_continuous_basic_case
-        given state = [1.0, 2.0, 3.0]
-             params = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0] // 3x4 weights + 4 bias + 4 log_std
-             config = ActorConfig{state_dim: 3, action_dim: 4, hidden_dims: [], action_space: ActionSpace{}, init_log_std: 0.0}
-        when result = forward_continuous(state, params, config)
-        then result.logits.len == 4
-             result.log_std.len == 4
-             var i : usize = 0;
-             while (i < result.logits.len) : (i += 1) {
-                 result.logits[i] != undefined
-                 result.log_std[i] >= MIN_LOG_STD && result.log_std[i] <= MAX_LOG_STD
-             }
+    test forward_continuous_basic_case {
+        var state: [3]f32 = [1.0, 2.0, 3.0];
+        var params: [20]f32 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];  // 3x4 weights + 4 bias + 4 log_std
+        var hidden: [2]u32 = [64, 64];
+        var logits_buf: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+        var log_std_buf: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+        var config = ActorConfig{ .state_dim = 3, .action_dim = 4, .hidden_dims = &hidden, .action_space = ActionSpace.Continuous, .init_log_std = 0.0 };
+        var result = forward_continuous(&state, &params, config, &logits_buf, &log_std_buf);
+        assert(result.logits.len == 4);
+        assert(result.log_std.len == 4);
+        var i : usize = 0;
+        while (i < result.log_std.len) {
+            assert(result.log_std[i] >= MIN_LOG_STD and result.log_std[i] <= MAX_LOG_STD);
+            i = i + 1;
+        }
+        assert(@abs(result.logits[0] - 3.8) < 0.00001);
+        assert(@abs(result.logits[3] - 2.6) < 0.00001);
     }
 
-    test sample_action_basic_case
-        given policy_output = PolicyOutput{logits: [1.0, 2.0, 3.0, 4.0], log_std: [0.1, 0.2, 0.3, 0.4]}
-             action_space = ActionSpace{}
-             deterministic = false
-        when result = sample_action(policy_output, action_space, deterministic)
-        then result.len == 4
-             var i : usize = 0;
-             while (i < result.len) : (i += 1) {
-                 result[i] != undefined
-                 result[i] >= -10.0 && result[i] <= 10.0
-             }
+    test sample_action_basic_case {
+        var logits: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        var log_std: [4]f32 = [0.1, 0.2, 0.3, 0.4];
+        var noise: [4]f32 = [0.5, -0.5, 1.0, 0.0];
+        var out: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+        var policy_output = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        var result = sample_action(policy_output, ActionSpace.Continuous, false, &noise, &out);
+        assert(result.len == 4);
+        var i : usize = 0;
+        while (i < result.len) {
+            assert(result[i] >= -10.0 and result[i] <= 10.0);
+            i = i + 1;
+        }
+        // mean + exp(log_std) * noise
+        assert(@abs(result[0] - 1.5525855) < 0.00001);
+        assert(@abs(result[1] - 1.3892986) < 0.00001);
+        assert(@abs(result[2] - 4.3498588) < 0.00001);
+        assert(result[3] == 4.0);
+        // deterministic: the mean
+        var det = sample_action(policy_output, ActionSpace.Continuous, true, &noise, &out);
+        assert(det[0] == 1.0 and det[1] == 2.0 and det[2] == 3.0 and det[3] == 4.0);
     }
 
-    test log_prob_basic_case
-        given action = [1.0, 2.0, 3.0, 4.0]
-             policy_output = PolicyOutput{logits: [1.0, 2.0, 3.0, 4.0], log_std: [0.1, 0.2, 0.3, 0.4]}
-             action_space = ActionSpace{}
-        when result = log_prob(action, policy_output, action_space)
-        then result != undefined
-             result != undefined
+    test log_prob_basic_case {
+        // The original asserted only `result != undefined`; the action is the mean, so each
+        // dimension contributes -log_std - 0.5 log(2 pi): -1.0 - 4 * 0.9189385 = -4.6757541.
+        var action: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        var logits: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        var log_std: [4]f32 = [0.1, 0.2, 0.3, 0.4];
+        var policy_output = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        var result = log_prob(&action, policy_output, ActionSpace.Continuous);
+        assert(result == result);  // not NaN
+        assert(@abs(result + 4.6757541) < 0.0001);
     }
 
-    test entropy_basic_case
-        given policy_output = PolicyOutput{logits: [1.0, 2.0, 3.0, 4.0], log_std: [0.1, 0.2, 0.3, 0.4]}
-             action_space = ActionSpace{}
-        when result = entropy(policy_output, action_space)
-        then result != undefined
-             result >= 0.0
+    test entropy_basic_case {
+        // 0.5 log(2 pi e) + log_std per dimension: 4 * 1.4189385 + 1.0 = 6.6757541
+        var logits: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        var log_std: [4]f32 = [0.1, 0.2, 0.3, 0.4];
+        var policy_output = PolicyOutput{ .logits = &logits, .log_std = &log_std };
+        var result = entropy(policy_output, ActionSpace.Continuous);
+        assert(result >= 0.0);
+        assert(@abs(result - 6.6757541) < 0.0001);
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Invariants (from .tri constraints)
     // ═══════════════════════════════════════════════════════════
 
+    // MIN_LOG_STD <= log_std <= MAX_LOG_STD
     invariant ppo_actor_constraint_0
-        given input = valid_input()
-        then true // MIN_LOG_STD <= log_std <= MAX_LOG_STD
+        assert MIN_LOG_STD < MAX_LOG_STD and clamp_log_std(-50.0) == MIN_LOG_STD and clamp_log_std(50.0) == MAX_LOG_STD and clamp_log_std(valid_input()) == valid_input()
 
+    // action_dim >= 1
     invariant ppo_actor_constraint_1
-        given input = valid_input()
-        then true // action_dim >= 1
+        assert sample_config_ok(4, 2) and !sample_config_ok(0, 2)
 
+    // len(hidden_dims) >= 1
     invariant ppo_actor_constraint_2
-        given input = valid_input()
-        then true // len(hidden_dims) >= 1
+        assert sample_config_ok(1, 1) and !sample_config_ok(1, 0)
 
+    // name: gaussian_log_prob -- one sigma above the mean of a unit Gaussian: -0.5 - 0.5 log(2 pi)
     invariant ppo_actor_constraint_3
-        given input = valid_input()
-        then true // name: gaussian_log_prob
+        assert @abs(log_prob_one_sigma() + 1.4189385) < 0.00001
 
+    // name: reparameterization -- action = mean + sigma * noise
     invariant ppo_actor_constraint_4
-        given input = valid_input()
-        then true // name: reparameterization
+        assert sampled_with(0.0) == 1.0 and @abs(sampled_with(2.0) - 3.0) < 0.00001
 
+    // "Schulman et al. (2017) - Proximal Policy Optimization": a discrete policy is a distribution
     invariant ppo_actor_constraint_5
-        given input = valid_input()
-        then true // "Schulman et al. (2017) - Proximal Policy Optimization"
+        assert @abs(softmax_total() - 1.0) < 0.00001
 
+    // "Haarnoja et al. (2018) - Soft Actor-Critic": Gaussian entropy grows with log_std by exactly that much
     invariant ppo_actor_constraint_6
-        given input = valid_input()
-        then true // "Haarnoja et al. (2018) - Soft Actor-Critic"
-
+        assert @abs(entropy_at(0.0) - 1.4189385) < 0.00001 and @abs(entropy_at(1.0) - entropy_at(0.0) - 1.0) < 0.00001
