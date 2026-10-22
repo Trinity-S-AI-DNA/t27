@@ -19,6 +19,9 @@ use clap::Subcommand;
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
+#[path = "../../../gen/rust/tri/pr/preflight.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod pf; // t27c gen-rust of specs/tri/pr/preflight.t27 (#10190, #11125): every rule of `tri pr preflight`
+
 #[derive(Subcommand)]
 pub enum PrCmd {
     /// Classify every failing check and say plainly whether it is safe to merge.
@@ -119,10 +122,17 @@ pub enum PrCmd {
         #[arg(long)]
         why: bool,
     },
+    /// Run the rules of specs/tri/pr/preflight.t27 on this branch against origin/master, before `gh pr create`. Exit 0 every rule passed, 1 a rule FAILed, 2 evidence could not be read. T27C names the t27c program (default t27c on PATH).
+    Preflight {
+        /// Leave out the corpus ratchet, which takes minutes.
+        #[arg(long)]
+        quick: bool,
+    },
 }
 
 pub fn run(cmd: &PrCmd) -> Result<()> {
     match cmd {
+        PrCmd::Preflight { quick } => std::process::exit(preflight(*quick)?),
         PrCmd::Ready {
             number,
             repo,
@@ -151,6 +161,36 @@ pub fn run(cmd: &PrCmd) -> Result<()> {
             files_present,
         } => landed(*number, repo.as_deref(), probes, files_present),
     }
+}
+
+/// `tri pr preflight` (#11126): every rule is specs/tri/pr/preflight.t27. This runs each command the spec names (`sh -c`; SPEC, T27C and TRI in the environment), frames the run as one evidence section, and prints the spec's verdict; the exit is the spec's.
+fn preflight(quick: bool) -> Result<i32> {
+    let (t27c, tri) = (std::env::var("T27C").unwrap_or("t27c".into()), std::env::current_exe()?);
+    let (mut ev, mut c) = (String::new(), "");
+    if let Some(o) = Command::new("git").args(["rev-parse", "--show-toplevel"]).output().ok().filter(|o| o.status.success()) { std::env::set_current_dir(String::from_utf8_lossy(&o.stdout).trim())?; }
+    for k in (0..pf::STEPS).filter(|&k| pf::step_runs(k, quick)) {
+        let each = pf::step_each(k);
+        for n in (0..if each { pf::entries(c) } else { 1 }).filter(|&n| !each || pf::is_target(c, n)) {
+            let spec = if each { &c[pf::path_start(c, n)..pf::path_end(c, n)] } else { "" };
+            let (x, out) = match Command::new("sh").args(["-c", pf::step_cmd(k)]).env("SPEC", spec).env("T27C", &t27c).env("TRI", &tri).output() {
+                Ok(o) => (o.status.code().unwrap_or(255), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+                Err(e) => (127, e.to_string()),
+            };
+            ev += &format!("@@ preflight {k} {n} {x} {}\n{out}\n", out.len());
+            eprintln!("preflight step {k} entry {n}: exit {x}");
+            if k == pf::STEP_CHANGES && x == 0 { c = out.leak(); }
+        }
+    }
+    let ev: &'static str = ev.leak();
+    for r in 0..pf::RULES {
+        let (v, n) = (pf::rule_verdict(c, ev, r, quick), pf::rule_at(c, ev, r, quick));
+        println!("{:<8}{}{}", pf::rule_name(r), pf::name(v), if v == pf::P_PASS { String::new() } else { format!("  {}", pf::rule_why(r, v)) });
+        let k = pf::evidence_step(c, ev, r, n);
+        if v != pf::P_PASS && k < pf::STEPS { println!("{}", String::from_utf8_lossy(&ev.as_bytes()[pf::evidence_from(ev, k, n)..pf::evidence_to(ev, k, n)])); }
+    }
+    let x = pf::preflight_exit(c, ev, quick);
+    println!("{}", pf::preflight_exit_why(x));
+    Ok(x as i32)
 }
 
 /// Check that what the pull request introduced is present in the default

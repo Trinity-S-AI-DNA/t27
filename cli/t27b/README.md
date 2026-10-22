@@ -309,13 +309,25 @@ Each cell is the outcome of that test (`inc_max`, `shr_big`, `rem_neg`):
 ```
 t27b test   <file.t27> [--overflow trap|wrap] [--time] [--quiet] [--check] [--blockers]
 t27b build  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--time]
+t27b watch  <file.t27> -o <out.o> [--elf | --macho] [--overflow trap|wrap] [--then "<cmd>"]
 t27b asm    <file.t27> [--overflow trap|wrap]
 t27b verilog <file.t27>
+t27b ts     <file.t27>
 t27b corpus <dir> [--timeout-ms N] [--jobs N] [--overflow trap|wrap] [--list]
                   [--json <path>] [--runner "<cmd> [args]"]
                   [--blockers [--reference <t27c> [--reference-cache <file>]
                                [--reference-timeout-ms N]]]
 ```
+
+`t27b watch` builds the object once, then again after every settled save to the spec or to any
+spec in its `use` closure (#10859). An idle look only stats the files the last build read; a
+save is built after `HOT_DEBOUNCE_MS` of quiet or `HOT_MAX_WAIT_MS` after its first event, so a
+save is rebuilt within `WATCH_POLL_MS` + `HOT_MAX_WAIT_MS` + the build. The object is written to
+`<out>.watch-tmp` and renamed over `<out>` only when the build succeeded: a type error prints the
+error and keeps the old object, and a hot-reloading app (`specs/t27os/hot_reload.t27`) never maps a
+half-written one. `--then "<cmd>"` runs through `sh -c` once per successful build, never after a
+failed one; its exit code is printed and never stops the watch. The decisions are
+`specs/tri/t27b/watch_build.t27`, reusing `specs/verified/watch.t27` and `specs/t27f/hot.t27`.
 
 `t27b verilog` writes a Verilog module for the spec to stdout, and after it, under
 `` `ifdef T27B_TESTBENCH ``, a test bench that runs the spec's own tests against
@@ -326,11 +338,46 @@ refused by name, exit 2. Every decision is in `specs/tri/t27b/verilog_plan.t27`:
 * how a spec declares an extern module, an instance and a net;
 * the port derivation;
 * the use closure;
-* exact widths;
-* the static loop bound.
+* exact widths, unsigned and signed;
+* the static loop bound;
+* constant tables (ROMs) and division by a constant (a multiply-shift, never a divider).
+
+A spec with no `fn on_clock`, var, net, instance or input is a library of decisions, and
+`t27b verilog <file> [--top <fn>]` writes one combinational module per `pub fn` whose parameters and
+result are integers or bools (inputs = the parameters, output `t27_y`), or only the module of `<fn>`.
+`i2`..`i64` lower as `signed`; `@as(T, x)`, `x as T`, `>>` (`>>>` when signed), `-x`, `T[i]` on a
+module-level `const T : [N]ty = [..]` and `x / k`, `x % k` for a constant `k` lower as well
+(`specs/tri/t27b/conformance/verilog_signed*.t27`; gHashTag/t27#11326). What still refuses: an
+`f64`/string parameter, a struct, a `while` with no static bound, a table read by a signed index, a
+divisor above 2^62, `@intCast` outside `@as`, and a general `x / y` is Verilog's divider.
 
 The writer is `specs/tri/t27b/verilog_emit.t27`. The fixtures are
 `specs/tri/t27b/conformance/verilog_*.t27` (#8796).
+
+`t27b ts` writes the spec's consts, its pure fns over `u8`..`u32`, `i8`..`i32`
+and `bool`, and its tests as one TypeScript module to stdout (#9994). Each
+`test` is an exported self-check that returns how many asserts it ran, and
+`t27_report()` prints the assert table of `t27c test-report`, line for line.
+Each `invariant` is an exported self-check too. `t27_failures()` names each
+check that throws. The integers keep Zig's meaning: `+ - *` throw on overflow,
+`+% -% *%` wrap, and a narrowing cast truncates. An assert whose operands are
+all compile-time constants is checked but not counted, the same as
+test-report. Anything outside that subset is refused, exit 2, with
+``t27b: ts: unsupported construct <what> `<name>` at line <n>``.
+
+The decisions are in `specs/tri/t27b/ts_plan.t27`: the types, the operator
+forms, folding, reserved names, and the prelude and coda. The writer is
+`specs/tri/t27b/ts_emit.t27`. It shares its byte writers, name resolver and
+test trees with the Verilog writer through `specs/tri/t27b/emit_kit.t27`.
+Node 24 runs the output as `.mts`:
+
+```
+t27b ts specs/queen/key_failover.t27 > /tmp/kf.mts
+node -e 'import("/tmp/kf.mts").then(m => console.log(m.t27_report()))'
+```
+
+A top-level declaration that is refused reports `at line 0`, because the t27c
+parser records no line for it.
 
 Options:
 
