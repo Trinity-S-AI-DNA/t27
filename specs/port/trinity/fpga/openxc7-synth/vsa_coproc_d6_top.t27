@@ -1,0 +1,430 @@
+module vsa_coproc_d6_top {
+
+    // Port of gHashTag/trinity fpga/openxc7-synth/vsacoproc_d6_top.v
+    // (TRINITY VSA coprocessor FPGA top module, D6 LED self-test; QMTECH
+    // Artix-7 XC7A100T-1FGG676C board, clk U22 = 50 MHz, led T23 = D6).
+    //
+    // On the board the module fills a 256x32 vector memory with two ternary
+    // patterns, issues BIND, then SIMILARITY against the on-chip
+    // vsa_coprocessor, and reports the outcome on LED D6:
+    //   - fast blink: Bind+Similarity passed (similarity != 0)
+    //   - slow blink: Similarity = 0
+    //   - chaotic blink: tests still running
+    //
+    // The board plumbing (the vec_mem RAM macro, the vsa_coprocessor
+    // instance, clock tree and pin constraints) is the caller's hardware.
+    // This spec carries the module's decisions: reset release, the memory
+    // map on the single write port, the fill loop, the command handshake,
+    // the similarity rounds, the verdict, and the LED driver.
+    //
+    // phi^2 + 1/phi^2 = 3
+
+    // ---- Parameters (localparam TEST_DIM, BLOCK_SIZE; word count) ----
+    const TEST_DIM: u32 = 1024;
+    const BLOCK_SIZE: u32 = 16;
+    const NUM_WORDS: u32 = (TEST_DIM * 2 + 31) / 32;
+
+    // ---- Coprocessor commands (cmd_reg command codes) ----
+    const CMD_NOP: u8 = 0;
+    const CMD_BIND: u8 = 1;
+    const CMD_SIMILARITY: u8 = 5;
+
+    // ---- Self-test state machine (state register) ----
+    const ST_INIT: u8 = 0;
+    const ST_FILL_A: u8 = 1;
+    const ST_FILL_B: u8 = 2;
+    const ST_CMD_BIND: u8 = 3;
+    const ST_WAIT_BIND: u8 = 4;
+    const ST_CMD_SIM: u8 = 5;
+    const ST_WAIT_SIM: u8 = 6;
+    const ST_DONE: u8 = 7;
+    const ST_LOOP: u8 = 8;
+
+    // ---- Ternary seed patterns; encoding -1=00, 0=01, +1=10 ----
+    const PATTERN_A: u32 = 0x89862892;
+    const PATTERN_B: u32 = 0x22629260;
+
+    // ---- Reset generator (rst_counter counts RST_CYCLES before release) ----
+    const RST_CYCLES: u32 = 15;
+
+    fn rst_counter_step(rst_counter: u32) -> u32 {
+        if (rst_counter < RST_CYCLES) {
+            return rst_counter + 1;
+        }
+        return rst_counter;
+    }
+
+    fn rst_n_released(rst_counter: u32) -> bool {
+        return rst_counter >= RST_CYCLES;
+    }
+
+    // ---- Vector memory map on the single write port ----
+    // vec_a fills the low 128 words, vec_b and the result share the high
+    // 128-word region (vec_b read at 0x80.., result written at 0x80..0xBF).
+
+    fn vec_a_read_index(addr_a: u32) -> u32 {
+        return addr_a & 0xFF;
+    }
+
+    fn vec_b_read_index(addr_b: u32) -> u32 {
+        return 0x80 | (addr_b & 0x7F);
+    }
+
+    fn result_write_index(result_addr: u32) -> u32 {
+        return 0x80 | (result_addr & 0x3F);
+    }
+
+    fn fill_a_write_index(fill_counter: u32) -> u32 {
+        return fill_counter & 0xFF;
+    }
+
+    fn fill_b_write_index(fill_counter: u32) -> u32 {
+        return 0x80 | (fill_counter & 0x7F);
+    }
+
+    // Single write port arbitration: the fill loop wins over the
+    // coprocessor's result write, and the old word is kept otherwise.
+
+    fn mem_write_next(old: u32, fill_wr_en: bool, fill_wr_data: u32, vec_wr_en: bool, vec_wr_data: u32) -> u32 {
+        if (fill_wr_en) {
+            return fill_wr_data;
+        }
+        if (vec_wr_en) {
+            return vec_wr_data;
+        }
+        return old;
+    }
+
+    // ---- Fill data: patterns XOR the counter byte ----
+
+    fn fill_a_data(fill_counter: u32) -> u32 {
+        return PATTERN_A ^ (fill_counter & 0xFF);
+    }
+
+    fn fill_b_data(fill_counter: u32) -> u32 {
+        return PATTERN_B ^ (fill_counter & 0xFF);
+    }
+
+    // ---- Fill enable: high exactly while filling vec_a or vec_b ----
+
+    fn fill_wr_en_next(state: u8) -> bool {
+        if (state == ST_FILL_A or state == ST_FILL_B) {
+            return true;
+        }
+        return false;
+    }
+
+    // ---- Fill loop counters (fill_counter is an 8-bit register) ----
+
+    fn fill_counter_next(state: u8, fill_counter: u32) -> u32 {
+        if (state == ST_INIT or state == ST_LOOP) {
+            return 0;
+        }
+        if (state == ST_FILL_A) {
+            if (fill_counter >= NUM_WORDS - 1) {
+                return 0;
+            }
+            return fill_counter + 1;
+        }
+        if (state == ST_FILL_B) {
+            if (fill_counter >= NUM_WORDS - 1) {
+                return fill_counter;
+            }
+            return fill_counter + 1;
+        }
+        return fill_counter;
+    }
+
+    // ---- Command issue: cmd_reg holds its value outside the issue arms ----
+
+    fn cmd_next(state: u8, cmd: u8, cmd_ready: bool) -> u8 {
+        if (state == ST_CMD_BIND and cmd_ready) {
+            return CMD_BIND;
+        }
+        if (state == ST_CMD_SIM and cmd_ready) {
+            return CMD_SIMILARITY;
+        }
+        return cmd;
+    }
+
+    // cmd_valid_reg is cleared every cycle unless an arm pulses it.
+
+    fn cmd_valid_next(state: u8, cmd_ready: bool) -> bool {
+        if ((state == ST_CMD_BIND or state == ST_CMD_SIM) and cmd_ready) {
+            return true;
+        }
+        return false;
+    }
+
+    // ---- Self-test next state (the case (state) statement + default arm) ----
+
+    fn test_next_state(state: u8, fill_counter: u32, test_cycle: u32, cmd_ready: bool, busy: bool) -> u8 {
+        if (state == ST_INIT) {
+            return ST_FILL_A;
+        }
+        if (state == ST_FILL_A) {
+            if (fill_counter >= NUM_WORDS - 1) {
+                return ST_FILL_B;
+            }
+            return ST_FILL_A;
+        }
+        if (state == ST_FILL_B) {
+            if (fill_counter >= NUM_WORDS - 1) {
+                return ST_CMD_BIND;
+            }
+            return ST_FILL_B;
+        }
+        if (state == ST_CMD_BIND) {
+            if (cmd_ready) {
+                return ST_WAIT_BIND;
+            }
+            return ST_CMD_BIND;
+        }
+        if (state == ST_WAIT_BIND) {
+            if (!busy and cmd_ready) {
+                return ST_CMD_SIM;
+            }
+            return ST_WAIT_BIND;
+        }
+        if (state == ST_CMD_SIM) {
+            if (cmd_ready) {
+                return ST_WAIT_SIM;
+            }
+            return ST_CMD_SIM;
+        }
+        if (state == ST_WAIT_SIM) {
+            if (!busy and cmd_ready) {
+                if (test_cycle >= 2) {
+                    return ST_DONE;
+                }
+                return ST_LOOP;
+            }
+            return ST_WAIT_SIM;
+        }
+        if (state == ST_DONE) {
+            return ST_DONE;
+        }
+        if (state == ST_LOOP) {
+            return ST_FILL_A;
+        }
+        return ST_INIT;
+    }
+
+    // ---- Similarity rounds (test_cycle is a 3-bit register) ----
+
+    fn test_cycle_next(state: u8, test_cycle: u32, busy: bool, cmd_ready: bool) -> u32 {
+        if (state == ST_WAIT_SIM and !busy and cmd_ready) {
+            return (test_cycle + 1) & 0x7;
+        }
+        return test_cycle;
+    }
+
+    // ---- Result latches: assigned only when a similarity round completes ----
+
+    fn saved_similarity_next(state: u8, saved_similarity: u32, similarity: u32, busy: bool, cmd_ready: bool) -> u32 {
+        if (state == ST_WAIT_SIM and !busy and cmd_ready) {
+            return similarity;
+        }
+        return saved_similarity;
+    }
+
+    fn test_passed_next(state: u8, test_passed: bool, test_cycle: u32, busy: bool, cmd_ready: bool, similarity: u32) -> bool {
+        if (state == ST_WAIT_SIM and !busy and cmd_ready and test_cycle >= 2) {
+            return similarity != 0;
+        }
+        return test_passed;
+    }
+
+    // ---- LED driver ----
+
+    fn led_counter_step(led_counter: u32) -> u32 {
+        return (led_counter + 1) & 0x3FFFFFF;
+    }
+
+    // led_out: fast blink (bit 22) after a passed test, slow blink
+    // (bit 25) after a zero similarity, chaotic XOR otherwise.
+
+    fn led_out_level(led_counter: u32, state: u8, test_passed: bool) -> u32 {
+        if (state == ST_DONE and test_passed) {
+            return (led_counter >> 22) & 1;
+        }
+        if (state == ST_DONE) {
+            return (led_counter >> 25) & 1;
+        }
+        return ((led_counter >> 23) ^ (led_counter >> 19) ^ (led_counter >> 15) ^ (led_counter >> 11)) & 1;
+    }
+
+    // led T23 is active low: the pin inverts led_out.
+
+    fn led_pin_level(led_out: u32) -> u32 {
+        return led_out ^ 1;
+    }
+
+    // ---- Ternary decoding (the -1=00, 0=01, +1=10 word encoding) ----
+
+    fn trit_pair(word: u32, index: u32) -> u32 {
+        return (word >> (index * 2)) & 3;
+    }
+
+    fn trit_value(word: u32, index: u32) -> i32 {
+        const pair: u32 = trit_pair(word, index);
+        if (pair == 0) {
+            return -1;
+        }
+        if (pair == 1) {
+            return 0;
+        }
+        return 1;
+    }
+
+    fn trit_encode(value: i32) -> u32 {
+        if (value == -1) {
+            return 0;
+        }
+        if (value == 0) {
+            return 1;
+        }
+        return 2;
+    }
+
+    test reset_generator_holds_reset_for_sixteen_cycles {
+        assert(rst_counter_step(0) == 1);
+        assert(rst_counter_step(14) == 15);
+        assert(rst_counter_step(15) == 15);
+        assert(!rst_n_released(0));
+        assert(!rst_n_released(14));
+        assert(rst_n_released(15));
+    }
+
+    test vector_memory_routes_the_three_regions {
+        assert(vec_a_read_index(0x123) == 0x23);
+        assert(vec_b_read_index(0x05) == 0x85);
+        assert(vec_b_read_index(0x7F) == 0xFF);
+        assert(result_write_index(0x00) == 0x80);
+        assert(result_write_index(0x3F) == 0xBF);
+        assert(result_write_index(0x40) == 0x80);
+        assert(fill_a_write_index(63) == 63);
+        assert(fill_b_write_index(63) == 0xBF);
+        assert(mem_write_next(0xAA, true, 7, true, 9) == 7);
+        assert(mem_write_next(0xAA, false, 7, true, 9) == 9);
+        assert(mem_write_next(0xAA, false, 7, false, 9) == 0xAA);
+    }
+
+    test fill_streams_the_ternary_patterns {
+        assert(fill_a_data(0) == PATTERN_A);
+        assert(fill_a_data(1) == 0x89862893);
+        assert(fill_a_data(3) == 0x89862891);
+        assert(fill_b_data(0) == PATTERN_B);
+        assert(fill_b_data(2) == 0x22629262);
+        assert(fill_counter_next(ST_INIT, 40) == 0);
+        assert(fill_counter_next(ST_FILL_A, 0) == 1);
+        assert(fill_counter_next(ST_FILL_A, 62) == 63);
+        assert(fill_counter_next(ST_FILL_A, 63) == 0);
+        assert(fill_counter_next(ST_FILL_B, 62) == 63);
+        assert(fill_counter_next(ST_FILL_B, 63) == 63);
+        assert(fill_counter_next(ST_CMD_BIND, 63) == 63);
+        assert(fill_counter_next(ST_LOOP, 63) == 0);
+    }
+
+    test command_issue_gates_on_ready_and_holds {
+        assert(cmd_next(ST_CMD_BIND, CMD_NOP, true) == CMD_BIND);
+        assert(cmd_next(ST_CMD_BIND, CMD_NOP, false) == CMD_NOP);
+        assert(cmd_next(ST_CMD_SIM, CMD_NOP, true) == CMD_SIMILARITY);
+        assert(cmd_next(ST_WAIT_BIND, CMD_BIND, true) == CMD_BIND);
+        assert(cmd_valid_next(ST_CMD_BIND, true));
+        assert(!cmd_valid_next(ST_CMD_BIND, false));
+        assert(!cmd_valid_next(ST_DONE, true));
+        assert(fill_wr_en_next(ST_FILL_A));
+        assert(fill_wr_en_next(ST_FILL_B));
+        assert(!fill_wr_en_next(ST_WAIT_SIM));
+    }
+
+    test similarity_rounds_decide_the_verdict {
+        assert(test_next_state(ST_WAIT_SIM, 0, 0, true, false) == ST_LOOP);
+        assert(test_next_state(ST_WAIT_SIM, 0, 1, true, false) == ST_LOOP);
+        assert(test_next_state(ST_WAIT_SIM, 0, 2, true, false) == ST_DONE);
+        assert(test_next_state(ST_WAIT_SIM, 0, 0, true, true) == ST_WAIT_SIM);
+        assert(test_next_state(ST_WAIT_SIM, 0, 0, false, false) == ST_WAIT_SIM);
+        assert(test_next_state(15, 0, 0, false, false) == ST_INIT);
+        assert(test_next_state(ST_DONE, 0, 0, true, true) == ST_DONE);
+        assert(test_cycle_next(ST_WAIT_SIM, 0, false, true) == 1);
+        assert(test_cycle_next(ST_WAIT_SIM, 7, false, true) == 0);
+        assert(test_cycle_next(ST_WAIT_SIM, 7, true, true) == 7);
+        assert(test_passed_next(ST_WAIT_SIM, false, 2, false, true, 42) == true);
+        assert(test_passed_next(ST_WAIT_SIM, true, 2, false, true, 0) == false);
+        assert(test_passed_next(ST_WAIT_SIM, true, 1, false, true, 0) == true);
+        assert(test_passed_next(ST_LOOP, true, 2, false, true, 0) == true);
+        assert(saved_similarity_next(ST_WAIT_SIM, 9, 42, false, true) == 42);
+        assert(saved_similarity_next(ST_WAIT_SIM, 9, 42, true, true) == 9);
+        assert(saved_similarity_next(ST_LOOP, 9, 42, false, true) == 9);
+    }
+
+    test self_test_walks_init_to_done {
+        var state: u8 = ST_INIT;
+        var fill_counter: u32 = 0;
+        var test_cycle: u32 = 0;
+        var cycles: u32 = 0;
+        const cmd_ready: bool = true;
+        const busy: bool = false;
+        const similarity: u32 = 0x1234;
+
+        while (state != ST_DONE and cycles < 1000) {
+            const next: u8 = test_next_state(state, fill_counter, test_cycle, cmd_ready, busy);
+            fill_counter = fill_counter_next(state, fill_counter);
+            test_cycle = test_cycle_next(state, test_cycle, busy, cmd_ready);
+            state = next;
+            cycles = cycles + 1;
+        }
+
+        assert(state == ST_DONE);
+        assert(cycles == 399);
+        assert(test_cycle == 3);
+        assert(test_passed_next(ST_WAIT_SIM, false, 2, false, true, similarity) == true);
+        assert(test_passed_next(ST_DONE, true, 3, false, true, similarity) == true);
+        assert(led_out_level(1 << 22, state, true) == 1);
+    }
+
+    test similarity_zero_verdict_fails_the_test {
+        const similarity: u32 = 0;
+        assert(!test_passed_next(ST_WAIT_SIM, false, 2, false, true, similarity));
+        assert(test_verdict_still_records_zero(similarity));
+    }
+
+    fn test_verdict_still_records_zero(similarity: u32) -> bool {
+        return saved_similarity_next(ST_WAIT_SIM, 0x55, similarity, false, true) == 0;
+    }
+
+    test led_driver_picks_blink_by_state {
+        assert(led_counter_step(0) == 1);
+        assert(led_counter_step(0x3FFFFFF) == 0);
+        assert(led_out_level(0x400000, ST_DONE, true) == 1);
+        assert(led_out_level(0x000000, ST_DONE, true) == 0);
+        assert(led_out_level(0x2000000, ST_DONE, true) == 0);
+        assert(led_out_level(0x2000000, ST_DONE, false) == 1);
+        assert(led_out_level(0x400000, ST_DONE, false) == 0);
+        assert(led_out_level(0x800000, ST_FILL_A, false) == 1);
+        assert(led_out_level(0x000000, ST_FILL_A, false) == 0);
+        assert(led_out_level(0x808000, ST_WAIT_SIM, true) == 0);
+        assert(led_out_level(0x808800, ST_WAIT_SIM, true) == 1);
+        assert(led_pin_level(1) == 0);
+        assert(led_pin_level(0) == 1);
+    }
+
+    test ternary_patterns_carry_the_encoding {
+        assert(trit_pair(PATTERN_A, 0) == 2);
+        assert(trit_pair(PATTERN_A, 1) == 0);
+        assert(trit_pair(PATTERN_A, 2) == 1);
+        assert(trit_pair(PATTERN_A, 3) == 2);
+        assert(trit_value(PATTERN_A, 0) == 1);
+        assert(trit_value(PATTERN_A, 1) == -1);
+        assert(trit_value(PATTERN_A, 2) == 0);
+        assert(trit_value(PATTERN_A, 3) == 1);
+        assert(trit_value(PATTERN_B, 0) == -1);
+        assert(trit_value(PATTERN_B, 1) == -1);
+        assert(trit_value(PATTERN_B, 2) == 1);
+        assert(trit_value(PATTERN_B, 3) == 0);
+        assert(trit_encode(trit_value(PATTERN_A, 7)) == trit_pair(PATTERN_A, 7));
+        assert(trit_encode(trit_value(PATTERN_B, 12)) == trit_pair(PATTERN_B, 12));
+        assert(trit_encode(trit_value(PATTERN_A, 15)) == trit_pair(PATTERN_A, 15));
+    }
+}

@@ -23,7 +23,7 @@
 #![cfg_attr(not(test), allow(unused_imports))]
 
 pub mod addrmap;
-pub mod bitmask;
+#[path = "../../gen/rust/host/bitmask.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, unexpected_cfgs, clippy::all)] pub mod bitmask; // specs/host/bitmask.t27, by `t27c gen-rust`
 pub mod bitstream;
 pub mod bufchain;
 pub mod capflags;
@@ -31,7 +31,7 @@ pub mod checksum;
 pub mod cmdq;
 pub mod config;
 pub mod configreg;
-pub mod csr_map;
+#[path = "../../gen/rust/host/csr_map.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, unexpected_cfgs, clippy::all)] pub mod csr_map; // specs/host/csr_map.t27, by `t27c gen-rust`
 pub mod descring;
 pub mod diag;
 pub mod dma;

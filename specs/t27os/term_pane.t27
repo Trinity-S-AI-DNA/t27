@@ -1,0 +1,741 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/term_pane.t27 -- the window side of a terminal pane: where the cell grid sits, how big a cell
+; is, which agent rows open one (the bytes a key press sends are term_input.t27).
+; Owner, 2026-10-19: Claude Code runs inside the T27 OS window. Clicking the Claude Code entry under AGENTS
+; opens a terminal pane in the current space's directory; the pane draws a grid of codepoints, monospace,
+; black and white, with a cursor, and every key typed in it goes to the agent as bytes.
+; The grid itself is specs/t27os/vt.t27 (bytes in, cells out). The PTY lives in the T27 OS terminal server
+; and is reached through specs/t27os/pty_client.t27 (connect, list, spawn, keys, read). When no server
+; answers on ~/.t27os/pty.sock the pane is OFFLINE: it says so on its first lines and echoes what it would
+; send, and the window tries to connect again every TP_RETRY frames.
+; The window stores no pane ids. Its k-th chat of an agent is the server's k-th pane of that agent
+; (tp_pick_pane over a LIST reply), so a window that quits and reopens finds the same panes; a chat with no
+; pane yet spawns one. When the grid that fits changes, the window sends RESIZE; the server sets the pty
+; size (__ioctl TIOCSWINSZ) and signals SIGWINCH, so the program redraws at the pane's full width.
+; The window keeps one grid. The server keeps every pane's output, so selecting another chat re-initialises
+; the grid and re-attaches; nothing here is the store of a session's history.
+
+module T27osTermPane;
+
+use t27os::pty_proto::HEADER;
+use t27os::pty_proto::RE_OK;
+use t27os::pty_proto::RE_DATA;
+use t27os::pty_proto::RE_LISTING;
+use t27os::windows::session_agent;
+use t27os::agents::S_STOPPED;
+use t27os::agents::S_DONE;
+use t27os::vt::VIEW_SUB;
+use t27os::vt::vt_init;
+use t27os::vt::vt_feed_all;
+use t27os::vt::vt_hist_rows;
+use t27os::pty_proto::RING_CAP;
+use t27os::pty_proto::MAX_PAYLOAD;
+
+/// The agent whose rows open a terminal pane: AGENT 0, Claude Code (agents.t27 AGENT_NAMES order).
+pub const TERM_AGENT : u32 = 0;
+/// The program a pane starts for TERM_AGENT, in the space's directory (agents.t27 AGENT_BINS).
+pub const TERM_BIN : str = "claude";
+
+/// Grid bounds. The host owns one [TP_CELLS]u32 buffer; a pane never asks for more.
+pub const TP_COLS_MAX : u32 = 400;
+pub const TP_ROWS_MAX : u32 = 120;
+pub const TP_CELLS : u32 = 48000;
+pub const TP_COLS_MIN : u32 = 20;
+pub const TP_ROWS_MIN : u32 = 4;
+/// One row of UTF-8 for drawing: four bytes a cell at most.
+pub const TP_ROW_BYTES : u32 = 1600;
+
+/// Cell metrics, in points: Menlo 12 advances 7.22 pt; a line is 15 pt. The grid sits TP_PAD inside the
+/// content area below the header.
+pub const TP_FONT : f64 = 12.0;
+pub const TP_CELL_W : f64 = 7.22;
+pub const TP_LINE_H : f64 = 15.0;
+pub const TP_PAD : f64 = 14.0;
+/// The baseline sits this far below a row's top.
+pub const TP_BASE : f64 = 11.5;
+/// The cursor is a block one cell wide; it blinks with a period of TP_BLINK frames (30 fps), and stays
+/// solid for TP_BLINK frames after any key so typing never hides it.
+pub const TP_BLINK : u32 = 30;
+
+/// Pane link state.
+pub const PANE_OFFLINE : u32 = 0;
+pub const PANE_LIVE : u32 = 1;
+pub const PANE_EXITED : u32 = 2;
+/// No pane open.
+pub const PANE_NONE : u32 = 999;
+/// Frames between connect attempts while the pane is OFFLINE (30 fps: three seconds).
+pub const TP_RETRY : u32 = 90;
+/// READ round trips a frame makes at most. Each brings up to 4096 bytes, so a fresh grid replays the
+/// server's whole 64 KiB ring in one frame and a busy pane never stalls the window for longer.
+pub const TP_READS_MAX : u32 = 24;
+/// Output bytes in one full READ reply: the payload holds the 8-byte cursor first (pty_proto data_chunk).
+pub const TP_CHUNK : usize = MAX_PAYLOAD - 8;
+/// Where the output bytes start in a RE_DATA reply: after the header and the 8-byte cursor.
+pub const TP_DATA_AT : usize = 12;
+
+/// The lines an OFFLINE pane prints first; the host writes the directory after TP_LINE_CWD, and the echo
+/// starts after TP_PROMPT.
+pub const TP_LINE_TITLE : str = "T27 OS terminal -- Claude Code";
+pub const TP_LINE_CWD : str = "cwd ";
+pub const TP_LINE_OFFLINE : str = "offline: no t27os pty server on ~/.t27os/pty.sock; keys echo here";
+/// What the pane server banner says (owner, 2026-10-20): never the raw offline line.
+pub const TP_SRV_STARTING : str = "Starting pane server...";
+pub const TP_SRV_FAILED : str = "The pane server did not start";
+pub const TP_SRV_RETRY : str = "Retry";
+pub const TP_PROMPT : str = "> ";
+/// The directory buffer the host fills for TP_LINE_CWD.
+pub const TP_PATH_MAX : u32 = 512;
+
+/// macOS virtual key codes the pane maps itself; every other key sends its characters.
+pub const VK_RETURN : u32 = 36;
+pub const VK_TAB : u32 = 48;
+pub const VK_DELETE : u32 = 51;
+pub const VK_ESCAPE : u32 = 53;
+pub const VK_ENTER_PAD : u32 = 76;
+pub const VK_HOME : u32 = 115;
+pub const VK_PAGE_UP : u32 = 116;
+pub const VK_FWD_DELETE : u32 = 117;
+pub const VK_END : u32 = 119;
+pub const VK_PAGE_DOWN : u32 = 121;
+pub const VK_LEFT : u32 = 123;
+pub const VK_RIGHT : u32 = 124;
+pub const VK_DOWN : u32 = 125;
+pub const VK_UP : u32 = 126;
+/// The longest sequence one key sends.
+pub const TP_KEY_MAX : u32 = 8;
+
+/// Does a selected chat of this agent show a terminal pane?
+pub fn opens_pane(agent: u32) -> bool {
+    return agent == TERM_AGENT;
+}
+
+/// The grid that fits w x h points of content area (header excluded), clamped to the buffer.
+pub fn tp_cols(w: f64) -> u32 {
+    const avail : f64 = w - 2.0 * TP_PAD;
+    if (avail < TP_CELL_W * @as(f64, TP_COLS_MIN)) { return TP_COLS_MIN; }
+    const n : u32 = @as(u32, @intFromFloat(avail / TP_CELL_W));
+    if (n > TP_COLS_MAX) { return TP_COLS_MAX; }
+    return n;
+}
+
+pub fn tp_rows(h: f64) -> u32 {
+    const avail : f64 = h - 2.0 * TP_PAD;
+    if (avail < TP_LINE_H * @as(f64, TP_ROWS_MIN)) { return TP_ROWS_MIN; }
+    const n : u32 = @as(u32, @intFromFloat(avail / TP_LINE_H));
+    if (n > TP_ROWS_MAX) { return TP_ROWS_MAX; }
+    return n;
+}
+
+/// A resize is due when the grid that fits differs from the one the pane has.
+pub fn tp_resize_due(cols: u32, rows: u32, w: f64, h: f64) -> bool {
+    return cols != tp_cols(w) or rows != tp_rows(h);
+}
+
+/// Frames the window's size must hold before the pane takes it (audit 2026-10-19: a drag re-ran the grid
+/// and the ring replay on every frame). About 0.2 s at 30 fps; hot_reload.t27 waits the same way.
+pub const TP_SETTLE : u32 = 6;
+
+/// Frames the wanted grid has held, after this frame: a different grid starts the count over.
+pub fn tp_settle(stable: u32, same: bool) -> u32 {
+    if (same == false) { return 0; }
+    if (stable >= TP_SETTLE) { return TP_SETTLE; }
+    return stable + 1;
+}
+
+/// The pane takes a new size once the grid that fits differs from its own and has held TP_SETTLE frames.
+pub fn tp_size_due(cols: u32, rows: u32, w: f64, h: f64, stable: u32) -> bool {
+    return stable >= TP_SETTLE and tp_resize_due(cols, rows, w, h);
+}
+
+/// Where cell (x, y) starts, from the content area's top-left (ox, oy).
+pub fn tp_cell_x(ox: f64, x: u32) -> f64 { return ox + TP_PAD + @as(f64, x) * TP_CELL_W; }
+pub fn tp_cell_y(oy: f64, y: u32) -> f64 { return oy + TP_PAD + @as(f64, y) * TP_LINE_H; }
+
+/// The cursor column shown: a cursor parked past the last column (deferred wrap) draws on the last one.
+pub fn tp_cursor_col(x: u32, cols: u32) -> u32 {
+    if (cols == 0) { return 0; }
+    if (x >= cols) { return cols - 1; }
+    return x;
+}
+
+/// Is the cursor drawn this frame? `since` is frames since the last key.
+pub fn tp_cursor_on(frame: u32, since: u32) -> bool {
+    if (since < TP_BLINK) { return true; }
+    return frame / TP_BLINK % 2 == 0;
+}
+
+/// Opening a pane for chat `cur` resets the grid unless that chat's pane is already the one shown.
+pub fn tp_reset_due(open_si: u32, cur: u32) -> bool {
+    return open_si != cur;
+}
+
+/// UTF-8 of one codepoint into out at `at`; returns the new end. A surrogate or out-of-range codepoint
+/// writes U+FFFD.
+pub fn tp_utf8(out: []u8, at: u32, cp0: u32) -> u32 {
+    var cp : u32 = cp0;
+    if (cp > 1114111 or (cp >= 55296 and cp <= 57343)) { cp = 65533; }
+    if (cp < 128) {
+        out[at] = @as(u8, @intCast(cp));
+        return at + 1;
+    }
+    if (cp < 2048) {
+        out[at] = @as(u8, @intCast(192 + cp / 64));
+        out[at + 1] = @as(u8, @intCast(128 + cp % 64));
+        return at + 2;
+    }
+    if (cp < 65536) {
+        out[at] = @as(u8, @intCast(224 + cp / 4096));
+        out[at + 1] = @as(u8, @intCast(128 + cp / 64 % 64));
+        out[at + 2] = @as(u8, @intCast(128 + cp % 64));
+        return at + 3;
+    }
+    out[at] = @as(u8, @intCast(240 + cp / 262144));
+    out[at + 1] = @as(u8, @intCast(128 + cp / 4096 % 64));
+    out[at + 2] = @as(u8, @intCast(128 + cp / 64 % 64));
+    out[at + 3] = @as(u8, @intCast(128 + cp % 64));
+    return at + 4;
+}
+
+/// The bytes a key press sends to the PTY are specs/t27os/term_input.t27 (tk_key_bytes): the table, with a test per key.
+
+/// OFFLINE echo: what the grid is fed for the bytes a key would send, so the echo reads like a shell line.
+/// Return echoes CR LF, Delete echoes BS space BS; everything else echoes as sent. Returns the length.
+pub fn tp_echo(sent: []const u8, n: u32, out: []u8) -> u32 {
+    if (n == 1 and sent[0] == 13) {
+        out[0] = 13;
+        out[1] = 10;
+        return 2;
+    }
+    if (n == 1 and sent[0] == 127) {
+        out[0] = 8;
+        out[1] = 32;
+        out[2] = 8;
+        return 3;
+    }
+    var i : u32 = 0;
+    while (i < n) {
+        out[i] = sent[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The k-th pane running `agent` in a LIST reply (`len` bytes of frame: the header, then pane, agent,
+/// state and flags per entry); PANE_NONE when the server has fewer, or the frame is not a listing.
+pub fn tp_pick_pane(frame: []const u8, len: usize, agent: u32, k: u32) -> u32 {
+    if (len < HEADER or frame[0] != RE_LISTING) { return PANE_NONE; }
+    var seen : u32 = 0;
+    var found : u32 = PANE_NONE;
+    var at : usize = HEADER;
+    while (at + 4 <= len and found == PANE_NONE) {
+        if (@as(u32, frame[at + 1]) == agent) {
+            if (seen == k) { found = @as(u32, frame[at]); }
+            seen = seen + 1;
+        }
+        at = at + 4;
+    }
+    return found;
+}
+
+/// True when a LIST reply (`len` bytes of frame) holds pane `pane` with its live flag (bit 0) set: the
+/// editor pane the window opened earlier is still running.
+pub fn tp_pane_live(frame: []const u8, len: usize, pane: u32) -> bool {
+    if (len < HEADER or frame[0] != RE_LISTING) { return false; }
+    var at : usize = HEADER;
+    while (at + 4 <= len) {
+        if (@as(u32, frame[at]) == pane) { return frame[at + 3] % 2 == 1; }
+        at = at + 4;
+    }
+    return false;
+}
+
+/// The state the server lists for the k-th pane of `agent` (entry byte 2, S_* of agents.t27), so a row shows
+/// what the pane really is: S_STOPPED when the server lists no such pane or its live flag (bit 0) is clear.
+pub fn tp_state_of(frame: []const u8, len: usize, agent: u32, k: u32) -> u32 {
+    if (len < HEADER or frame[0] != RE_LISTING) { return S_STOPPED; }
+    var seen : u32 = 0;
+    var at : usize = HEADER;
+    while (at + 4 <= len) {
+        if (@as(u32, frame[at + 1]) == agent) {
+            if (seen == k) {
+                if (frame[at + 3] % 2 == 0) { return S_STOPPED; }
+                const st : u32 = @as(u32, frame[at + 2]);
+                if (st > S_DONE) { return S_STOPPED; }
+                return st;
+            }
+            seen = seen + 1;
+        }
+        at = at + 4;
+    }
+    return S_STOPPED;
+}
+
+/// Which of the window's chats of its own agent chat `cur` is: 0 for the first, 1 for the second, ...
+pub fn tp_ordinal(ss: u64, cur: u32) -> u32 {
+    const a : u32 = session_agent(ss, cur);
+    var k : u32 = 0;
+    var i : u32 = 0;
+    while (i < cur) {
+        if (session_agent(ss, i) == a) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// The pane a SPAWN reply names, PANE_NONE when the server refused.
+pub fn tp_spawned(frame: []const u8, len: usize) -> u32 {
+    if (len < HEADER or frame[0] != RE_OK) { return PANE_NONE; }
+    return @as(u32, frame[1]);
+}
+
+/// How many output bytes a READ reply carries (from TP_DATA_AT); 0 for anything but RE_DATA.
+pub fn tp_data_len(frame: []const u8, len: usize) -> usize {
+    if (len < TP_DATA_AT or frame[0] != RE_DATA) { return 0; }
+    return len - TP_DATA_AT;
+}
+
+/// Another READ this frame? Only while the last one came back full and the budget lasts.
+pub fn tp_read_more(got: usize, reads: u32) -> bool {
+    return got >= TP_CHUNK and reads < TP_READS_MAX;
+}
+
+// ---- scrollback glue (#11398): the wheel over the pane, the jump-to-live chip ----------------------------------
+
+/// The host's whole cells buffer: the grid (TP_CELLS at most), a saved main screen and the history ring (vt.t27).
+pub const TP_BUF_CELLS : u32 = 960000;
+/// One wheel notch of a mouse (not a trackpad) counts as this many rows.
+pub const TP_NOTCH_ROWS : f64 = 3.0;
+
+/// The chip "jump to live", centred above the pane's bottom edge.
+pub const TP_CHIP_W : f64 = 112.0;
+pub const TP_CHIP_H : f64 = 26.0;
+pub const TP_CHIP_GAP : f64 = 14.0;
+
+pub fn tp_chip_x(ox: f64, pw: f64) -> f64 { return ox + 0.5 * (pw - TP_CHIP_W); }
+pub fn tp_chip_y(oy: f64, ph: f64) -> f64 { return oy + ph - TP_CHIP_H - TP_CHIP_GAP; }
+
+pub fn tp_chip_hit(px: f64, py: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    const x : f64 = tp_chip_x(ox, pw);
+    const y : f64 = tp_chip_y(oy, ph);
+    return px >= x and px < x + TP_CHIP_W and py >= y and py < y + TP_CHIP_H;
+}
+
+/// Is the pointer over the pane (the grid's rectangle)?
+pub fn tp_over_pane(px: f64, py: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    return px >= ox and px < ox + pw and py >= oy and py < oy + ph;
+}
+
+/// The wheel's travel in points (NSEvent scrollingDeltaY; `notch` = a mouse wheel, which reports lines) as sub-row
+/// units of the view: a trackpad moves the text by the pixels it travelled, a mouse notch by TP_NOTCH_ROWS rows.
+pub fn tp_wheel_units(dy: f64, notch: bool) -> u32 {
+    var d : f64 = dy;
+    if (d < 0.0) { d = 0.0 - d; }
+    var rows : f64 = d / TP_LINE_H;
+    if (notch) { rows = d * TP_NOTCH_ROWS; }
+    return @as(u32, @intFromFloat(rows * @as(f64, VIEW_SUB) + 0.5));
+}
+
+/// The cell under the pointer, for a mouse report: (column, row) clamped to the grid.
+pub fn tp_cell_col(px: f64, ox: f64, cols: u32) -> u32 {
+    if (px <= ox + TP_PAD) { return 0; }
+    const c : u32 = @as(u32, @intFromFloat((px - ox - TP_PAD) / TP_CELL_W));
+    if (c >= cols) { return cols - 1; }
+    return c;
+}
+
+pub fn tp_cell_row(py: f64, oy: f64, rows: u32) -> u32 {
+    if (py <= oy + TP_PAD) { return 0; }
+    const r : u32 = @as(u32, @intFromFloat((py - oy - TP_PAD) / TP_LINE_H));
+    if (r >= rows) { return rows - 1; }
+    return r;
+}
+
+/// A key press that sends bytes (n > 0) returns the view to live; so does a click on the chip.
+pub fn tp_key_goes_live(n: u32) -> bool { return n > 0; }
+
+/// Dirty draw gate: the pane needs a draw when the grid changed (generation) or the view moved.
+pub fn tp_draw_due(gen: u32, last_gen: u32, view: u32, last_view: u32) -> bool {
+    return gen != last_gen or view != last_view;
+}
+
+/// Try to connect this frame? At once on a fresh pane, then every TP_RETRY frames while offline.
+pub fn tp_retry_due(since_try: u32) -> bool {
+    return since_try >= TP_RETRY;
+}
+
+test claude_code_rows_open_a_pane {
+    assert opens_pane(0);
+    assert opens_pane(1) == false;
+    assert opens_pane(4) == false;
+}
+
+test the_grid_fits_the_content_area {
+    // 760 x 452 pt of content: (760 - 28) / 7.22 = 101 columns, (452 - 28) / 15 = 28 rows
+    assert tp_cols(760.0) == 101;
+    assert tp_rows(452.0) == 28;
+    assert tp_cols(10.0) == TP_COLS_MIN;
+    assert tp_rows(10.0) == TP_ROWS_MIN;
+    assert tp_cols(5000.0) == TP_COLS_MAX;
+    assert tp_rows(5000.0) == TP_ROWS_MAX;
+    assert TP_COLS_MAX * TP_ROWS_MAX <= TP_CELLS;
+    assert TP_COLS_MAX * 4 <= TP_ROW_BYTES;
+    assert tp_resize_due(101, 28, 760.0, 452.0) == false;
+    assert tp_resize_due(80, 24, 760.0, 452.0);
+}
+
+test cells_and_cursor_sit_on_the_grid {
+    assert tp_cell_x(200.0, 0) == 214.0;
+    assert tp_cell_y(44.0, 2) == 88.0;
+    assert tp_cursor_col(5, 80) == 5;
+    assert tp_cursor_col(80, 80) == 79;
+    assert tp_cursor_on(45, 0);
+    assert tp_cursor_on(0, 99);
+    assert tp_cursor_on(45, 99) == false;
+    assert tp_reset_due(PANE_NONE, 0);
+    assert tp_reset_due(2, 2) == false;
+}
+
+test codepoints_encode_as_utf8 {
+    var o : [8]u8 = undefined;
+    assert tp_utf8(o[0..8], 0, 65) == 1 and o[0] == 65;
+    // U+00E9 is C3 A9
+    assert tp_utf8(o[0..8], 0, 233) == 2 and o[0] == 195 and o[1] == 169;
+    // U+2500 (box drawing) is E2 94 80
+    assert tp_utf8(o[0..8], 0, 9472) == 3 and o[0] == 226 and o[1] == 148 and o[2] == 128;
+    // U+1F600 is F0 9F 98 80
+    assert tp_utf8(o[0..8], 0, 128512) == 4 and o[0] == 240 and o[1] == 159 and o[2] == 152 and o[3] == 128;
+    // a lone surrogate becomes U+FFFD, EF BF BD
+    assert tp_utf8(o[0..8], 0, 55296) == 3 and o[0] == 239 and o[1] == 191 and o[2] == 189;
+}
+
+test offline_echo_reads_like_a_line {
+    var s : [8]u8 = undefined;
+    var o : [8]u8 = undefined;
+    s[0] = 13;
+    assert tp_echo(s[0..8], 1, o[0..8]) == 2 and o[0] == 13 and o[1] == 10;
+    s[0] = 127;
+    assert tp_echo(s[0..8], 1, o[0..8]) == 3 and o[0] == 8 and o[1] == 32 and o[2] == 8;
+    s[0] = 104;
+    assert tp_echo(s[0..8], 1, o[0..8]) == 1 and o[0] == 104;
+}
+
+test a_reopened_window_finds_its_panes {
+    // LIST reply: header, then panes 3 (claude), 5 (codex), 7 (claude)
+    var f : [16]u8 = undefined;
+    f[0] = RE_LISTING; f[1] = 0; f[2] = 12; f[3] = 0;
+    f[4] = 3; f[5] = 0; f[6] = 1; f[7] = 1;
+    f[8] = 5; f[9] = 1; f[10] = 1; f[11] = 1;
+    f[12] = 7; f[13] = 0; f[14] = 1; f[15] = 1;
+    assert tp_pick_pane(f[0..16], 16, 0, 0) == 3;
+    assert tp_pick_pane(f[0..16], 16, 0, 1) == 7;
+    assert tp_pick_pane(f[0..16], 16, 0, 2) == PANE_NONE;
+    assert tp_pick_pane(f[0..16], 16, 1, 0) == 5;
+    assert tp_pick_pane(f[0..16], 4, 0, 0) == PANE_NONE;
+    f[0] = RE_OK;
+    assert tp_pick_pane(f[0..16], 16, 0, 0) == PANE_NONE;
+    // chats: claude in space 0, codex in space 0, claude in space 1 (slot byte = agent * 8 + space + 1)
+    const ss : u64 = 1 + 9 * 256 + 2 * 65536;
+    assert tp_ordinal(ss, 0) == 0;
+    assert tp_ordinal(ss, 1) == 0;
+    assert tp_ordinal(ss, 2) == 1;
+}
+
+test replies_read_as_pane_and_bytes {
+    var f : [20]u8 = undefined;
+    f[0] = RE_OK; f[1] = 6; f[2] = 0; f[3] = 0;
+    assert tp_spawned(f[0..20], 4) == 6;
+    assert tp_spawned(f[0..20], 3) == PANE_NONE;
+    f[0] = RE_DATA;
+    assert tp_spawned(f[0..20], 4) == PANE_NONE;
+    assert TP_DATA_AT == HEADER + 8;
+    assert tp_data_len(f[0..20], 20) == 8;
+    assert tp_data_len(f[0..20], 12) == 0;
+    assert tp_data_len(f[0..20], 11) == 0;
+    f[0] = RE_OK;
+    assert tp_data_len(f[0..20], 20) == 0;
+    assert tp_read_more(TP_CHUNK, 1);
+    assert tp_read_more(TP_CHUNK, TP_READS_MAX) == false;
+    assert tp_read_more(100, 1) == false;
+    assert tp_retry_due(0) == false;
+    assert tp_retry_due(TP_RETRY);
+    // the whole ring replays in one frame's budget
+    assert @as(u64, TP_READS_MAX) * @as(u64, TP_CHUNK) >= RING_CAP;
+}
+
+invariant grid_buffer_holds_the_largest_pane {
+    assert TP_COLS_MAX * TP_ROWS_MAX <= TP_CELLS;
+}
+
+test a_resize_waits_until_the_size_holds {
+    assert tp_settle(0, false) == 0;
+    assert tp_settle(3, false) == 0;
+    assert tp_settle(3, true) == 4;
+    assert tp_settle(TP_SETTLE, true) == TP_SETTLE;
+    assert tp_size_due(80, 24, 760.0, 452.0, TP_SETTLE - 1) == false;
+    assert tp_size_due(80, 24, 760.0, 452.0, TP_SETTLE);
+    assert tp_size_due(101, 28, 760.0, 452.0, TP_SETTLE) == false;
+}
+
+test an_editor_pane_is_reused_only_while_the_server_lists_it_live {
+    // LIST reply: header, then pane 3 (live), pane 5 (stopped), pane 7 (live, needs you)
+    var f : [16]u8 = undefined;
+    f[0] = RE_LISTING; f[1] = 0; f[2] = 12; f[3] = 0;
+    f[4] = 3; f[5] = 9; f[6] = 1; f[7] = 1;
+    f[8] = 5; f[9] = 9; f[10] = 0; f[11] = 0;
+    f[12] = 7; f[13] = 9; f[14] = 2; f[15] = 3;
+    assert tp_pane_live(f[0..16], 16, 3);
+    assert tp_pane_live(f[0..16], 16, 5) == false;
+    assert tp_pane_live(f[0..16], 16, 7);
+    assert tp_pane_live(f[0..16], 16, 4) == false;
+    assert tp_pane_live(f[0..16], 16, PANE_NONE) == false;
+    assert tp_pane_live(f[0..16], 8, 7) == false;
+    assert tp_pane_live(f[0..16], 3, 3) == false;
+    f[0] = RE_OK;
+    assert tp_pane_live(f[0..16], 16, 3) == false;
+}
+
+test a_row_shows_the_state_the_server_lists_not_the_seed {
+    // the live finding: "pane 0 agent 0 state 3 flags 1" is idle and live, not stopped
+    var f : [16]u8 = undefined;
+    f[0] = RE_LISTING; f[1] = 0; f[2] = 12; f[3] = 0;
+    f[4] = 0; f[5] = 0; f[6] = 3; f[7] = 1;
+    f[8] = 5; f[9] = 1; f[10] = 1; f[11] = 1;
+    f[12] = 7; f[13] = 0; f[14] = 2; f[15] = 0;
+    assert tp_state_of(f[0..16], 16, 0, 0) == 3;
+    assert tp_state_of(f[0..16], 16, 1, 0) == 1;
+    // the second claude pane is listed but its live flag is clear: stopped
+    assert tp_state_of(f[0..16], 16, 0, 1) == S_STOPPED;
+    // no such pane, a truncated frame, a frame that is not a listing, a state past S_DONE
+    assert tp_state_of(f[0..16], 16, 4, 0) == S_STOPPED;
+    assert tp_state_of(f[0..16], 4, 0, 0) == S_STOPPED;
+    f[4 + 2] = 9;
+    assert tp_state_of(f[0..16], 16, 0, 0) == S_STOPPED;
+    f[0] = RE_OK;
+    assert tp_state_of(f[0..16], 16, 1, 0) == S_STOPPED;
+}
+
+test the_chip_sits_above_the_bottom_edge_and_takes_clicks {
+    // a pane at (272, 45), 600 x 400
+    assert tp_chip_x(272.0, 600.0) == 272.0 + 244.0;
+    assert tp_chip_y(45.0, 400.0) == 45.0 + 400.0 - 26.0 - 14.0;
+    assert tp_chip_hit(272.0 + 300.0, 45.0 + 370.0, 272.0, 45.0, 600.0, 400.0);
+    assert tp_chip_hit(272.0 + 10.0, 45.0 + 370.0, 272.0, 45.0, 600.0, 400.0) == false;
+    assert tp_chip_hit(272.0 + 300.0, 45.0 + 100.0, 272.0, 45.0, 600.0, 400.0) == false;
+}
+
+test the_wheel_over_the_pane_converts_to_sub_rows {
+    // a trackpad: 15 pt of travel = one row = 16 sub-rows; 1 pt is about one sixteenth
+    assert tp_wheel_units(15.0, false) == 16;
+    assert tp_wheel_units(0.0 - 15.0, false) == 16;
+    assert tp_wheel_units(1.0, false) == 1;
+    assert tp_wheel_units(7.5, false) == 8;
+    // a mouse notch of 1 line is 3 rows
+    assert tp_wheel_units(1.0, true) == 48;
+    assert tp_over_pane(300.0, 100.0, 272.0, 45.0, 600.0, 400.0);
+    assert tp_over_pane(100.0, 100.0, 272.0, 45.0, 600.0, 400.0) == false;
+}
+
+test the_pointer_cell_for_a_mouse_report_stays_on_the_grid {
+    assert tp_cell_col(0.0, 272.0, 80) == 0;
+    assert tp_cell_col(272.0 + 14.0 + 7.22 * 10.0 + 1.0, 272.0, 80) == 10;
+    assert tp_cell_col(5000.0, 272.0, 80) == 79;
+    assert tp_cell_row(45.0 + 14.0 + 15.0 * 3.0 + 1.0, 45.0, 30) == 3;
+    assert tp_cell_row(5000.0, 45.0, 30) == 29;
+}
+
+test typing_and_a_moved_view_ask_for_a_draw {
+    assert tp_key_goes_live(1) and tp_key_goes_live(0) == false;
+    assert tp_draw_due(5, 5, 0, 0) == false;
+    assert tp_draw_due(6, 5, 0, 0);
+    assert tp_draw_due(5, 5, 16, 0);
+    assert TP_BUF_CELLS >= 2 * TP_CELLS;
+}
+
+// ---- the pane server starts itself (owner, 2026-10-20, #11412) ----
+// If ~/.t27os/pty.sock does not answer, the app starts the t27os-pty that sits next to its bundle (or inside it) with
+// one `/bin/sh -c` job that backgrounds it, shows the banner "Starting pane server..." with a Retry button, and keeps
+// asking the socket. The server owns every pane's history, so the app NEVER stops it on quit.
+
+pub const PTY_STOP_ON_QUIT : bool = false;
+pub const SRV_UP : u32 = 0;
+pub const SRV_STARTING : u32 = 1;
+pub const SRV_FAILED : u32 = 2;
+/// Frames the app waits for the socket after starting the server (30 fps: six seconds).
+pub const TP_START_WAIT : u32 = 180;
+/// Frames between two connect attempts while it starts.
+pub const TP_START_POLL : u32 = 15;
+pub const SERVER_NAME : str = "t27os-pty";
+pub const TP_SRV_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; ";
+
+/// The next phase. A socket that answers is UP. A socket that does not answer while UP starts the server. A start
+/// that has waited TP_START_WAIT frames has FAILED; FAILED stays until the Retry button.
+pub fn tp_server_step(phase: u32, connected: bool, waited: u32) -> u32 {
+    if (connected) { return SRV_UP; }
+    if (phase == SRV_UP) { return SRV_STARTING; }
+    if (phase == SRV_STARTING and waited >= TP_START_WAIT) { return SRV_FAILED; }
+    return phase;
+}
+
+/// Start the server job on this step? Only when the phase turns into STARTING.
+pub fn tp_server_spawn_due(old: u32, new: u32) -> bool { return new == SRV_STARTING and old != SRV_STARTING; }
+
+/// The Retry button: a failed start starts again; anything else is unchanged.
+pub fn tp_server_retry(phase: u32) -> u32 {
+    if (phase == SRV_FAILED) { return SRV_STARTING; }
+    return phase;
+}
+
+/// Poll the socket this frame while starting (and every TP_START_POLL frames).
+pub fn tp_server_poll_due(phase: u32, waited: u32) -> bool {
+    return phase == SRV_STARTING and waited % TP_START_POLL == 0;
+}
+
+fn tp_cp(out: []u8, at: usize, s: []const u8) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < s.len and p < out.len) { out[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+
+/// Index just past the last "/" before `end` in `s`, or 0.
+fn tp_last_slash(s: []const u8, end: usize) -> usize {
+    var i : usize = end;
+    while (i > 0) {
+        if (s[i - 1] == 47) { return i - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// The directory that holds the `.app` of the executable path `exe` (".../T27OS.app/Contents/MacOS/T27OS"), or the
+/// executable's own directory when there is no .app in it. Returns the length written to `out` (0 = unfit).
+pub fn tp_server_dirs(exe: []const u8, bundle_dir: []u8, exe_dir: []u8) -> usize {
+    var i : usize = 0;
+    var app_end : usize = 0;
+    while (i + 5 <= exe.len) {
+        if (exe[i] == 46 and exe[i + 1] == 97 and exe[i + 2] == 112 and exe[i + 3] == 112 and exe[i + 4] == 47) { app_end = i; }
+        i = i + 1;
+    }
+    const ed : usize = tp_last_slash(exe, exe.len);
+    if (ed == 0) { return 0; }
+    tp_cp(exe_dir, 0, exe[0 .. ed]);
+    if (app_end == 0) { return tp_cp(bundle_dir, 0, exe[0 .. ed]); }
+    const bd : usize = tp_last_slash(exe, app_end);
+    if (bd == 0) { return 0; }
+    return tp_cp(bundle_dir, 0, exe[0 .. bd]);
+}
+
+fn tp_path_fits(s: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < s.len) {
+        const b : u8 = s[i];
+        if (b < 33 or b > 126 or b == 39 or b == 34 or b == 96 or b == 36 or b == 92) { return false; }
+        i = i + 1;
+    }
+    return s.len > 0;
+}
+
+/// The job text (after the head that exports HOME and PATH): try the server next to the bundle, then inside it, and
+/// background the first that is executable. 0 when the executable path is not fit for a quoted shell word.
+pub fn tp_server_cmd(exe: []const u8, out: []u8) -> usize {
+    var bd : [512]u8 = undefined;
+    var ed : [512]u8 = undefined;
+    const bn : usize = tp_server_dirs(exe, bd[0..512], ed[0..512]);
+    if (bn == 0) { return 0; }
+    var en : usize = tp_last_slash(exe, exe.len);
+    if (tp_path_fits(bd[0..bn]) == false or tp_path_fits(ed[0..en]) == false) { return 0; }
+    var p : usize = tp_cp(out, 0, "for P in '");
+    p = tp_cp(out, p, bd[0..bn]);
+    p = tp_cp(out, p, "/t27os-pty' '");
+    p = tp_cp(out, p, ed[0..en]);
+    p = tp_cp(out, p, "/t27os-pty'; do if [ -x \"$P\" ]; then nohup \"$P\" >/dev/null 2>&1 & exit 0; fi; done; exit 1");
+    return p;
+}
+
+// the banner card, centred in the pane area: a title and a Retry button (shown when the start failed)
+pub const TP_BAN_W : f64 = 320.0;
+pub const TP_BAN_H : f64 = 112.0;
+pub const TP_BTN_W : f64 = 96.0;
+pub const TP_BTN_H : f64 = 28.0;
+pub fn tp_ban_x(ox: f64, pw: f64) -> f64 { return ox + 0.5 * (pw - TP_BAN_W); }
+pub fn tp_ban_y(oy: f64, ph: f64) -> f64 { return oy + 0.5 * (ph - TP_BAN_H); }
+pub fn tp_btn_x(ox: f64, pw: f64) -> f64 { return tp_ban_x(ox, pw) + 0.5 * (TP_BAN_W - TP_BTN_W); }
+pub fn tp_btn_y(oy: f64, ph: f64) -> f64 { return tp_ban_y(oy, ph) + TP_BAN_H - TP_BTN_H - 16.0; }
+
+/// Is the point on the Retry button? (The button is there in every phase but UP; only FAILED acts on it.)
+pub fn tp_retry_hit(mx: f64, my: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> bool {
+    const bx : f64 = tp_btn_x(ox, pw);
+    const by : f64 = tp_btn_y(oy, ph);
+    return mx >= bx and mx < bx + TP_BTN_W and my >= by and my < by + TP_BTN_H;
+}
+
+test the_server_phase_walks_up_starting_failed_and_back {
+    assert tp_server_step(SRV_UP, true, 0) == SRV_UP;
+    assert tp_server_step(SRV_UP, false, 0) == SRV_STARTING;
+    assert tp_server_spawn_due(SRV_UP, SRV_STARTING);
+    assert tp_server_spawn_due(SRV_STARTING, SRV_STARTING) == false;
+    assert tp_server_step(SRV_STARTING, false, 10) == SRV_STARTING;
+    assert tp_server_step(SRV_STARTING, true, 10) == SRV_UP;
+    assert tp_server_step(SRV_STARTING, false, TP_START_WAIT) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, false, 999) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, true, 0) == SRV_UP;
+    // Retry starts again, and spawns again
+    assert tp_server_retry(SRV_FAILED) == SRV_STARTING;
+    assert tp_server_spawn_due(SRV_FAILED, tp_server_retry(SRV_FAILED));
+    assert tp_server_retry(SRV_UP) == SRV_UP and tp_server_retry(SRV_STARTING) == SRV_STARTING;
+    assert tp_server_poll_due(SRV_STARTING, 0) and tp_server_poll_due(SRV_STARTING, 7) == false;
+    assert tp_server_poll_due(SRV_UP, 0) == false;
+}
+
+test the_app_never_stops_the_server_on_quit {
+    assert PTY_STOP_ON_QUIT == false;
+}
+
+test the_server_is_found_next_to_the_bundle_and_inside_it {
+    var bd : [512]u8 = undefined;
+    var ed : [512]u8 = undefined;
+    const exe : string = "/tmp/claude-501/t27os-int11/T27OS.app/Contents/MacOS/T27OS";
+    const n : usize = tp_server_dirs(exe, bd[0..512], ed[0..512]);
+    assert n == 27 and bd[0] == 47 and bd[26] == 49;
+    var o : [600]u8 = undefined;
+    const k : usize = tp_server_cmd(exe, o[0..600]);
+    assert k > 60;
+    assert o[0] == 102;
+    // a bare executable (no .app): its own directory
+    const n2 : usize = tp_server_dirs("/opt/x/T27OS", bd[0..512], ed[0..512]);
+    assert n2 == 6;
+    assert tp_server_dirs("T27OS", bd[0..512], ed[0..512]) == 0;
+}
+
+test a_path_with_a_quote_or_a_dollar_starts_nothing {
+    var o : [600]u8 = undefined;
+    assert tp_server_cmd("/tmp/it's/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+    assert tp_server_cmd("/tmp/$HOME/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+    assert tp_server_cmd("/tmp/a b/T27OS.app/Contents/MacOS/T27OS", o[0..600]) == 0;
+}
+
+test the_retry_button_sits_inside_the_banner {
+    const bx : f64 = tp_btn_x(240.0, 700.0);
+    const by : f64 = tp_btn_y(80.0, 400.0);
+    assert tp_retry_hit(bx + 5.0, by + 5.0, 240.0, 80.0, 700.0, 400.0);
+    assert tp_retry_hit(bx - 5.0, by + 5.0, 240.0, 80.0, 700.0, 400.0) == false;
+    assert tp_retry_hit(bx + 5.0, by + TP_BTN_H + 5.0, 240.0, 80.0, 700.0, 400.0) == false;
+    assert bx > tp_ban_x(240.0, 700.0) and by + TP_BTN_H < tp_ban_y(80.0, 400.0) + TP_BAN_H;
+}
+
+test the_ring_fills_the_history_so_earlier_output_is_there_on_opening {
+    // a pane that printed 200 lines: replayed from the server ring into a 10-row grid, 190 rows of history are
+    // kept and scrollable at once (vt.t27 history ring of 5000 rows)
+    var st : [32]u32 = undefined;
+    var cells : [960000]u32 = undefined;
+    vt_init(st[0..32], cells[0..960000], 40, 10);
+    var i : u32 = 0;
+    while (i < 200) {
+        vt_feed_all(st[0..32], cells[0..960000], "line of earlier output\r\n");
+        i = i + 1;
+    }
+    assert vt_hist_rows(st[0..32]) >= 190;
+    // and the whole ring comes across inside one frame's read budget, full reads continuing
+    assert @as(u64, TP_READS_MAX) * @as(u64, TP_CHUNK) >= RING_CAP;
+    assert TP_CHUNK == 4088 and tp_read_more(4088, 1) and tp_read_more(4087, 1) == false;
+}
