@@ -401,43 +401,6 @@ fn gate_script(root: &Path) -> Result<PathBuf> {
     Ok(script)
 }
 
-/// Did the entries this branch adds satisfy the gate? Written for the `check` row of
-/// `tri gates preview`, which needed the verdict rather than a process exit, and
-/// quietly. That row was removed in #5935, so nothing calls this now.
-///
-/// **An empty set is a FAIL here and an OK in `tri now check`, and that is not
-/// an inconsistency.** `tri now check` runs mid-work, where a commit that adds
-/// no entry has no shape to judge. `gates preview` asks what the gate would
-/// say about this branch AS A PULL REQUEST, and the gate's own words on an
-/// empty set are *"FAIL: this change adds no docs/now/ entry"*. Mirroring the
-/// gate includes mirroring what it does with nothing.
-pub fn check_added(base: &str) -> Result<bool> {
-    let root = repo_root()?;
-    let script = gate_script(&root)?;
-    let files = git_paths(
-        &root,
-        &["diff", "--name-only", "--diff-filter=A"],
-        Some(&format!("{base}...HEAD")),
-    )?;
-    if files.is_empty() {
-        return Ok(false);
-    }
-    let out = std::process::Command::new("python3")
-        .arg(&script)
-        .arg("--check-files")
-        .args(&files)
-        .current_dir(&root)
-        .output()
-        .context("failed to run tools/check_now_entry_shape.py")?;
-    Ok(out.status.success())
-}
-
-/// The shape of what the index adds. Was the pre-commit hook's entry point; `tri hooks
-/// pre-commit` stopped calling it in #5935, so nothing calls this now.
-pub fn check_staged() -> Result<()> {
-    check(&[], true, "origin/master")
-}
-
 /// Added `docs/now/*.md` paths from one git invocation, README excluded.
 fn git_paths(root: &Path, args: &[&str], range: Option<&str>) -> Result<Vec<String>> {
     let mut cmd = std::process::Command::new("git");

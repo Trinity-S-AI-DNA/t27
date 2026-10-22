@@ -56,6 +56,13 @@ Re-measurement cost one wave and invalidated 15 of 16 entries.
 
 ## Entries, with W621 verdicts
 
+> **Note, 2026-10-19 (t27#10700).** Fourteen of the fifteen verdict paragraphs
+> below stop in mid-word, at 900 to 906 bytes. They were cut when commit
+> 13b005fe4 wrote them, and the full text is not in the history: no other
+> commit or file contains it. Entry 9 (639 bytes) is the only one that ends on
+> a full sentence. Read each cut paragraph as far as it goes. Do not finish a
+> cut sentence from memory.
+
 
 ### 2. bram_weights_depth — contradictory tests
 
@@ -124,6 +131,16 @@ The entry poses "rename, or exclude from the parse census?" as a trade-off a mai
 
 It is not a decision, for three independent reasons, any one of which is sufficient. (1) THE CYCLE IS ALREADY CLOSED. Tarjan SCC over all 1063 spec modules puts {igla::coder::eval, igla::race::backend, igla::race::rtl} in ONE strongly connected component today, without the proposed edge: backend.t27:12 imports rtl and rtl.t27:11 imports backend (a direct mutual pair), while rtl.t27:18 imports eval and eval.t27:18 imports backend. Adding backend -> eval adds an edge inside an SCC that already contains all three nodes. The entry's premise -- that the import "would close a cycle" -- is false; nothing is closed that was open. Both in-file comments asserting non-circularity (W608 in eval.t27, W614 in rtl.t27) are factually wrong about the very graph they cite. (2) THE COMPILER HAS NO CYCLIC-IMPORT FAILURE MODE. bootstrap/src/use_resolve.rs::resolve computes the transitive closure of imports g
 
+
+> **Update, 2026-10-19 (t27#10700).** The graph above no longer exists. Today
+> `eval.t27` imports only `base::types` and `math::constants`, and `rtl.t27`
+> imports only `base::types` and `math::constants`. #10689 (t27#10682) removed
+> the last edge of the cycle, `rtl -> backend`, by moving the one invariant
+> that used it into `backend.t27`. `deps_cycles` in `specs/t27f/spec_deps.t27`
+> (t27#10693) lists no spec on a cycle over the corpus's `t27c use-edges`
+> after that change. So the cycle is gone, and the entry still needs no
+> decision. The W608 and W614 comments the verdict cites are no longer in
+> either file.
 
 ### 12. tokenizer decode — contradictory tests
 

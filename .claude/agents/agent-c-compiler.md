@@ -1,5 +1,6 @@
 ---
 id: agent-c-compiler
+model: sonnet
 name: Agent C - Compiler
 description: Compiles t27 specifications into executable code, manages three-roads generation and binary output
 triggers:
