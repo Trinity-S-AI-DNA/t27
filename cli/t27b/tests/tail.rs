@@ -160,7 +160,7 @@ fn wide_integer_constants_fold_or_are_refused() {
     let head = "module a;\n\nconst A: u128 = 340282366920938463463374607431768211455;\nconst B: u256 = 18446744073709551616;\nconst C: i128 = 5;\nconst D: u128 = 0 - 1;\nconst E: u128 = E + 1;\n\nfn g(x: u128) -> u256 {\n    return x;\n}\n\n";
     let t = |body: &str| format!("{}test t {{\n    assert({});\n}}\n", head, body);
     assert_eq!(names_ok(&run(&t("B < A and (A >> 64) as u64 == 18446744073709551615 and (0 - C) as i8 == -5"))), vec![("t", false, true)]);
-    let h = format!("{}fn h(x: u64) -> bool {{\n    return A > x;\n}}\n", head);
+    let h = format!("{}fn h(x: u64) -> bool {{\n    return A > x;\n}}\ntest t {{\n    assert(h(1));\n}}\n", head);
     for (src, ty, why) in [(t("A + 1 > 0"), "u128", "overflows"), (t("B as u64 == 0"), "u256", "does not fit"), (t("A << 128 == 0"), "u128", "shift amount"),
         (t("C / 0 == 1"), "i128", "by zero"), (t("A + B > 0"), "u128", "two different"), (t("(0 - C) / 2 < 0"), "i128", "negative"),
         (t("D > 0"), "u128", "does not fit"), (h, "u128", "beside a value"), (t("E > 0"), "u128", "beside a value"), (t("g(1) == 0"), "u128", "")] {
@@ -344,12 +344,12 @@ fn a_comptime_int_rounds_in_float_from_int() {
 
 /// #7819: of an f32 they call libm.t27's ports of compiler_rt (`roundf` half away from zero, `fmodf` signed as the
 /// dividend), and `@rem`'s second operand takes the first one's type (specs/tri/t27b/libm_plan.t27). An f64 is refused
-/// but by `@round` (#7923), so the first refusal there is `@floor`'s.
+/// but by `@round` (#7923), `@floor` and `@ceil` (#10405), so the first refusal there is `@trunc`'s.
 #[test]
 fn f32_rounding_and_rem_call_their_ports() {
     let src = "module a;\n\nfn f(x: f32) -> f32 {\n    return @round(x) + @floor(x) + @ceil(x) + @trunc(x) + @rem(x, 2.0);\n}\n\ntest t {\n    assert(f(-2.5) == -10.5);\n}\n";
     assert_eq!(names_ok(&run(src)), vec![("t", false, true)]);
-    for (from, to, what, why) in [("x: f32) -> f32", "x: f64) -> f64", "@floor", "no f64 routine"), ("@rem(x, 2.0)", "@rem(x)", "@rem", "`@rem` two")] {
+    for (from, to, what, why) in [("x: f32) -> f32", "x: f64) -> f64", "@trunc", "no f64 routine"), ("@rem(x, 2.0)", "@rem(x)", "@rem", "`@rem` and `@mod` two")] {
         let m = rejected(&src.replace(from, to));
         assert!(m.contains(&format!("construct ExprCall({}) at line 4", what)) && m.contains(why), "{}", m);
     }
@@ -359,11 +359,11 @@ fn f32_rounding_and_rem_call_their_ports() {
 
 /// `_ = e;` (collect_type_decls.t27): at the top of a fn body the reference's dead-store pass deletes it unless e
 /// holds a call; anywhere else e runs and its value is dropped (specs/tri/t27b/discard_plan.t27; `t27c test-report`
-/// passes the conformance spec 5/5, none vacuous). A nested `_ = a + b;` that overflows traps on both sides.
+/// passes the conformance spec 7/7, none vacuous). A nested `_ = a + b;` that overflows traps on both sides.
 #[test]
 fn a_discarded_value_runs_unless_the_reference_deletes_it() {
     let r = run(include_str!("../../../specs/tri/t27b/conformance/discard_value.t27"));
-    assert!(r.len() == 5 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
+    assert!(r.len() == 7 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
     let src = "module a;\n\nfn f(a: u8, b: u8) -> u8 {\n    _ = a + b;\n    return a;\n}\n\ntest t {\n    assert(f(200, 100) == 200);\n}\n";
     assert_eq!(names_ok(&run(src)), vec![("t", false, true)]);
     let r = run(&src.replace("    _ = a + b;\n", "    if (a > 0) {\n        _ = a + b;\n    }\n"));
@@ -375,7 +375,8 @@ fn a_discarded_value_runs_unless_the_reference_deletes_it() {
 /// `anytype` and `[*]T` in the signature of a fn no test reaches (gh.t27, trios-scarab-types SR-00 and SR-02, #7857):
 /// Zig never resolves them, so the reference passes the file (specs/tri/t27b/lazy_sig_plan.t27; `t27c test-report`
 /// passes the conformance spec 3/3, none vacuous). A call from a test, an undeclared element type and an undeclared
-/// name in the withdrawn body keep their refusals, as the reference refuses each.
+/// name in the withdrawn body keep their refusals, as the reference refuses each. The unit struct returned as a value
+/// by `lazy_unit_new` (#10897) is refused as soon as a test calls it (BLOCKED, "expected type 'spec.LazyUnit', found 'type'").
 #[test]
 fn a_signature_zig_never_resolves() {
     let src = include_str!("../../../specs/tri/t27b/conformance/lazy_signature.t27");
@@ -385,8 +386,21 @@ fn a_signature_zig_never_resolves() {
     assert!(rejected(&src.replace("assert(issue_score(i) == 34);", "format_into(i, 5);")).contains("type anytype"));
     assert!(rejected(&src.replace("?[*]Issue", "?[*]Missing")).contains("type [*]T"));
     assert!(rejected(&src.replace("all: [*]const Issue", "all: [*]const Issue, m: Missing")).contains("type [*]T"));
+    assert!(rejected(&src.replace("== 34);", "== 34);\n    lazy_unit_new();")).contains("unknown name `LazyUnit`"));
+    assert!(common::lower_src(&src.replace("return lazy_unit_new();", "return lazy_unit_nowhere();")).unwrap_err().join("\n").contains("ExprCall(undeclared fn)"));
+    assert!(rejected(&src.replace("fn issue_score(", "fn lazy_local() -> u32 {\n    var x : LazyMissing = 0;\n    return 1;\n}\n\nfn issue_score(")).contains("type (undeclared)")); // #11053: t27c BLOCKED
     let m = common::lower_src(&src.replace("f.write_num", "undeclared_thing")).unwrap_err().join("\n");
     assert!(m.contains("ExprIdentifier(undeclared) at line 23 (`undeclared_thing` in `format_into`"), "{}", m);
+}
+
+/// #10899, #10903: a constant no analyzed code names is never resolved (conformance/lazy_const.t27; `t27c test-report` 2/2); a test naming the slice (directly or through a fn) or the call-initialised struct, and a constant naming a type, fn or value declared nowhere, keep the refusal.
+#[test]
+fn a_constant_zig_never_resolves() {
+    let src = include_str!("../../../specs/tri/t27b/conformance/lazy_const.t27");
+    assert_eq!(names_ok(&run(src)).len(), 2);
+    for (from, to, want) in [("== 0x1100", "== 0x1100); assert(LAZY_ALLOWED.len == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_allowed_count() == 2", "ConstDecl(slice) at"), ("== 0x1100", "== 0x1100); assert(lazy_bram_end() == 0x100000", "ConstDecl at"), ("[][]const u8", "[]LazyMissing", "type (undeclared)"), ("lazy_region_new(0, 0x100000)", "lazy_region_nowhere(0, 0x100000)", "ExprCall(undeclared fn)"), ("= LAZY_CSR;", "= LAZY_NOWHERE;", "ExprIdentifier(undeclared)")] {
+        assert!(common::lower_src(&src.replace(from, to)).unwrap_err().join("\n").contains(want), "{}", to);
+    }
 }
 
 // ------------------------------------------------ f32 @log, @log2 and @log10
