@@ -14,7 +14,7 @@ ARG ZIG_VERSION=0.16.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user \
-      ca-certificates curl xz-utils git python3 \
+      ca-certificates curl xz-utils git python3 tini \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
@@ -35,7 +35,15 @@ ENV PATH=/opt/zig:$PATH \
 # A warm, blobless clone; lab.py fetches T27_REF before every run.
 RUN git clone --filter=blob:none --no-checkout "$T27_REPO" /work/t27
 
-COPY lab.py /opt/t27b-lab/lab.py
+# lab.py publishes the git blob sha of both files and the build time as
+# `image` in status.json and every run (#6443), so `tri t27b doctor` can tell
+# a stale deploy (LAB-IMAGE-STALE). image-built is written after both COPYs:
+# a changed file always gets a new time.
+COPY lab.py Dockerfile /opt/t27b-lab/
+RUN date -u +%Y-%m-%dT%H:%M:%SZ > /opt/t27b-lab/image-built
 
 WORKDIR /work
+# tini is PID 1 and reaps every orphan reparented to it; lab.py as PID 1 never
+# did, and the lab ran out of its 1000 pids on zombies (#7090).
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "-u", "/opt/t27b-lab/lab.py"]

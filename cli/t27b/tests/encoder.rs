@@ -58,6 +58,12 @@ fn encoders_match_clang() {
         ("lsl w0, w1, w2", lslv(false, 0, 1, 2), 0x1ac2_2020),
         ("lsr x0, x1, x2", lsrv(true, 0, 1, 2), 0x9ac2_2420),
         ("asr w0, w1, w2", asrv(false, 0, 1, 2), 0x1ac2_2820),
+        // The other width of each register shift, and the X16/X8 operand
+        // registers codegen uses for a narrowed amount (words from clang).
+        ("lsl x3, x4, x5", lslv(true, 3, 4, 5), 0x9ac5_2083),
+        ("lsr w7, w8, w9", lsrv(false, 7, 8, 9), 0x1ac9_2507),
+        ("asr x10, x11, x12", asrv(true, 10, 11, 12), 0x9acc_296a),
+        ("lsl w17, w16, w8", lslv(false, 17, 16, 8), 0x1ac8_2211),
         ("madd x0, x1, x2, x3", madd(true, 0, 1, 2, 3), 0x9b02_0c20),
         ("msub w2, w8, w17, w2", msub(false, 2, 8, 17, 2), 0x1b11_8902),
         ("mul w9, w2, w17", mul(false, 9, 2, 17), 0x1b11_7c49),
@@ -72,6 +78,8 @@ fn encoders_match_clang() {
         ("lsl x0, x1, #1", lsl_imm(true, 0, 1, 1), 0xd37f_f820),
         ("asr w3, w4, #31", asr_imm(false, 3, 4, 31), 0x131f_7c83),
         ("lsr x5, x6, #0", lsr_imm(true, 5, 6, 0), 0xd340_fcc5),
+        ("lsr x0, x16, #63", lsr_imm(true, 0, 16, 63), 0xd37f_fe00),
+        ("lsl w0, w16, #31", lsl_imm(false, 0, 16, 31), 0x5301_0200),
         ("uxtb w0, w1", uxtb(0, 1), 0x5300_1c20),
         ("uxth w0, w1", uxth(0, 1), 0x5300_3c20),
         ("sxtb w0, w1", sxtb(0, 1), 0x1300_1c20),
@@ -139,6 +147,61 @@ fn encoders_match_clang() {
         ("adr x4, L1 (+12)", adr(4, 12), 0x1000_0064),
         ("adrp x5, #8192", adrp(5, 2), 0xd000_0005),
         ("adrp x6, #-4096", adrp(6, -1), 0xf0ff_ffe6),
+        // Floating point, double precision (ftype 01). ARM ARM C7.2:
+        // FMOV (general) "FMOV <Dd>, <Xn>" sf=1 type=01 rmode=00 opcode=111
+        // and "FMOV <Xd>, <Dn>" opcode=110.
+        ("fmov d16, x9", fmov_d_x(16, 9), 0x9e67_0130),
+        ("fmov d0, xzr", fmov_d_x(0, ZR), 0x9e67_03e0),
+        ("fmov x9, d16", fmov_x_d(9, 16), 0x9e66_0209),
+        ("fmov x0, d0", fmov_x_d(0, 0), 0x9e66_0000),
+        // FADD/FSUB/FMUL/FDIV (scalar) "<op> <Dd>, <Dn>, <Dm>",
+        // floating-point data-processing (2 source), opcode 0010/0011/0000/0001.
+        ("fadd d16, d16, d17", fadd(16, 16, 17), 0x1e71_2a10),
+        ("fsub d0, d1, d2", fsub(0, 1, 2), 0x1e62_3820),
+        ("fmul d16, d16, d17", fmul(16, 16, 17), 0x1e71_0a10),
+        ("fdiv d3, d4, d5", fdiv(3, 4, 5), 0x1e65_1883),
+        // FNEG (scalar) "FNEG <Dd>, <Dn>", data-processing (1 source) opc=10.
+        ("fneg d16, d16", fneg(16, 16), 0x1e61_4210),
+        // FSQRT (scalar) "FSQRT <Dd>, <Dn>", data-processing (1 source) opcode=000011.
+        ("fsqrt d16, d16", fsqrt(16, 16), 0x1e61_c210),
+        // FCMP "FCMP <Dn>, <Dm>", opc=00 (quiet, register form).
+        ("fcmp d16, d17", fcmp(16, 17), 0x1e71_2200),
+        // SCVTF / UCVTF (scalar, integer) "<op> <Dd>, <Wn>|<Xn>", rmode=00
+        // opcode=010 / 011.
+        ("scvtf d16, w9", scvtf(false, 16, 9), 0x1e62_0130),
+        ("scvtf d16, x9", scvtf(true, 16, 9), 0x9e62_0130),
+        ("ucvtf d16, w9", ucvtf(false, 16, 9), 0x1e63_0130),
+        ("ucvtf d16, x9", ucvtf(true, 16, 9), 0x9e63_0130),
+        // FCVTZS / FCVTZU (scalar, integer) "<op> <Wd>|<Xd>, <Dn>", rmode=11
+        // opcode=000 / 001.
+        ("fcvtzs w9, d16", fcvtzs(false, 9, 16), 0x1e78_0209),
+        ("fcvtzs x9, d16", fcvtzs(true, 9, 16), 0x9e78_0209),
+        ("fcvtzu w9, d16", fcvtzu(false, 9, 16), 0x1e79_0209),
+        ("fcvtzu x9, d16", fcvtzu(true, 9, 16), 0x9e79_0209),
+        // STR / LDR (immediate, SIMD&FP) unsigned offset, size=11 opc=00/01.
+        ("str d0, [x9, #40]", str_d(0, 9, 40), 0xfd00_1520),
+        ("ldr d1, [sp, #16]", ldr_d(1, SP, 16), 0xfd40_0be1),
+        // LDP (SIMD&FP) signed offset, opc=01 L=1.
+        ("ldp d0, d1, [x17, #64]", ldp_d(0, 1, 17, 64), 0x6d44_0620),
+        ("ldp d6, d7, [x17, #112]", ldp_d(6, 7, 17, 112), 0x6d47_1e26),
+        // Single precision (ftype 00): the double encoding with bit 22
+        // clear, plus FMOV (general) 32-bit and FCVT between precisions.
+        // Words from clang -arch arm64 + objdump.
+        ("fmov s16, w9", fmov_s_w(16, 9), 0x1e27_0130),
+        ("fmov w9, s16", fmov_w_s(9, 16), 0x1e26_0209),
+        ("fcvt d16, s17", fcvt_d_s(16, 17), 0x1e22_c230),
+        ("fcvt s16, d17", fcvt_s_d(16, 17), 0x1e62_4230),
+        ("fadd s16, s16, s17", single(fadd(16, 16, 17)), 0x1e31_2a10),
+        ("fsub s0, s1, s2", single(fsub(0, 1, 2)), 0x1e22_3820),
+        ("fmul s16, s16, s17", single(fmul(16, 16, 17)), 0x1e31_0a10),
+        ("fdiv s3, s4, s5", single(fdiv(3, 4, 5)), 0x1e25_1883),
+        ("fneg s16, s16", single(fneg(16, 16)), 0x1e21_4210),
+        ("fsqrt s16, s16", single(fsqrt(16, 16)), 0x1e21_c210),
+        ("fcmp s16, s17", single(fcmp(16, 17)), 0x1e31_2200),
+        ("scvtf s16, w9", single(scvtf(false, 16, 9)), 0x1e22_0130),
+        ("scvtf s16, x9", single(scvtf(true, 16, 9)), 0x9e22_0130),
+        ("ucvtf s16, w9", single(ucvtf(false, 16, 9)), 0x1e23_0130),
+        ("ucvtf s16, x9", single(ucvtf(true, 16, 9)), 0x9e23_0130),
     ];
     let mut bad = Vec::new();
     for (asm, got, want) in cases {
@@ -147,7 +210,7 @@ fn encoders_match_clang() {
         }
     }
     assert!(bad.is_empty(), "encoder mismatches:\n{}", bad.join("\n"));
-    assert_eq!(cases.len(), 129);
+    assert_eq!(cases.len(), 173);
 }
 
 #[test]
@@ -190,6 +253,31 @@ fn disassembler_reads_back_the_subset() {
         ldst_post(3, LD, 8, 17, 8),
         adr(3, -112),
         adrp(5, 2),
+        fmov_d_x(16, 9),
+        fmov_x_d(9, 16),
+        fadd(16, 16, 17),
+        fsub(0, 1, 2),
+        fmul(16, 16, 17),
+        fdiv(3, 4, 5),
+        fneg(16, 16),
+        fsqrt(16, 16),
+        single(fsqrt(16, 16)),
+        fcmp(16, 17),
+        scvtf(false, 16, 9),
+        ucvtf(true, 16, 9),
+        fcvtzs(true, 9, 16),
+        fcvtzu(false, 9, 16),
+        str_d(0, 9, 40),
+        ldr_d(1, SP, 16),
+        ldp_d(0, 1, 17, 64),
+        fmov_s_w(16, 9),
+        fmov_w_s(9, 16),
+        fcvt_d_s(16, 17),
+        fcvt_s_d(16, 17),
+        single(fadd(16, 16, 17)),
+        single(fcmp(16, 17)),
+        single(scvtf(true, 16, 9)),
+        single(fcvtzs(false, 9, 16)),
     ] {
         let d = disasm(w, 0);
         assert!(!d.starts_with(".word"), "{:08x} -> {}", w, d);

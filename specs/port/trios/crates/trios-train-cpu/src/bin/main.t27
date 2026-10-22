@@ -1,0 +1,640 @@
+// Port of gHashTag/trios crates/trios-train-cpu/src/bin/main.rs
+// (196 lines at 8b229e9489ee) to .t27, one function per original function.
+//
+// The original is the coordinator for T-JEPA training. Its decisions are
+// ported here as pure functions, each covered by tests; everything that
+// moves data in or out of the process keeps its original name with an
+// `undefined;` body that no test calls:
+//
+//   load_data         (main.rs 106) - the file read, the stderr fallback
+//                                     message and the token vector build
+//   run_training_loop (main.rs 116) - drives the training stack living in
+//                                     the sibling modules this task does
+//                                     not port (train_state, model,
+//                                     training_step, gradient, evaluate,
+//                                     the neon_* hooks)
+//   main              (main.rs 182) - argv collection, banner and result
+//                                     printing, the wall clock
+//
+// Mappings, chosen where Rust has a construct .t27 does not:
+// - `find_arg<T: FromStr>` (main.rs 59-64): no generics in .t27, so one
+//   function per value type; the f64 variant keeps the name `find_arg`,
+//   the u64/usize variants are `find_arg_u64` / `find_arg_usize`.
+// - the six `assert!` lines of parse_config (main.rs 91-96) become
+//   `config_is_valid`, a bool verdict; .t27 has no panic.
+// - `Result` (main.rs 116, 182) becomes the EXIT_OK/EXIT_FAIL consts plus
+//   the verdict function `main_exit_code`; error values are not
+//   expressible in .t27.
+// - `trial_id`/`agent_id` label strings (main.rs 88-89) become given-flags:
+//   .t27 cannot slice a string, so the label text stays print plumbing and
+//   only the default-vs-override decision is ported.
+// - f32 widens to f64; the `Vec<usize>` tokens survive as the per-byte
+//   decision `byte_to_token` plus the fallback-size decision.
+// - number parsing (main.rs 62, `a[prefix.len()..].parse().ok()`) is
+//   re-implemented for the decimal shapes this CLI passes: digits, an
+//   optional sign, an optional fraction. Rust's exponent and special-value
+//   forms are out of scope and fall back to the default; the original's
+//   callers never pass them.
+// - seq_offset (main.rs 128) defines 0 where the original would panic on
+//   a modulo by zero (dl <= SEQ + 1); the training loop never reaches it.
+
+module port::trios::crates::trios_train_cpu::src::bin::main;
+
+// Model shape constants (main.rs 29-33).
+pub const HIDDEN: usize = 384;
+pub const DIM: usize = 64;
+pub const NUM_CTX: usize = 4;
+pub const NGRAM: usize = NUM_CTX + 2;
+pub const SEQ: usize = 64;
+
+// The fallback corpus of load_data (main.rs 108-109): when the data file
+// cannot be read, the original reads this sentence repeated 100 times.
+const FALLBACK_SENTENCE: str = "The quick brown fox jumps over the lazy dog. ";
+const FALLBACK_REPEAT: usize = 100;
+
+// Exit codes standing in for Rust's Result plumbing (main.rs 182-194).
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAIL: i32 = 1;
+
+// Optimizer kind selector (main.rs 52-56).
+pub enum OptKind {
+    AdamW,
+    Muon,
+}
+
+// Training configuration parsed from CLI arguments (main.rs 35-50), with
+// trial_id/agent_id carried as given-flags (see the header note).
+pub struct Config {
+    seed: u64,
+    steps: usize,
+    encoder_lr: f64,
+    ntp_lr: f64,
+    use_jepa: bool,
+    use_nca: bool,
+    ntp_weight: f64,
+    jepa_weight: f64,
+    nca_weight: f64,
+    opt_kind: OptKind,
+    jepa_warmup: usize,
+    trial_id_given: bool,
+    agent_id_given: bool,
+}
+
+// =====================================================================
+// String scanning: the starts_with and slicing half of find_arg
+// (main.rs 60-63), plus the exact-match scans of parse_config (main.rs
+// 68, 81-87).
+// =====================================================================
+
+// True when a and b are the same string, byte for byte.
+fn str_eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// True when s begins with prefix (main.rs 61).
+fn starts_with(s: []const u8, prefix: []const u8) -> bool {
+    if (prefix.len > s.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Index of the first argument starting with prefix, or args.len when there
+// is none. The sentinel stands in for Rust's Option (main.rs 60-63): .t27
+// cannot unwrap an ?T, so "not found" is the length bound.
+fn find_arg_index(args: []str, prefix: []const u8) -> usize {
+    var i: usize = 0;
+    while (i < args.len) {
+        if (starts_with(args[i], prefix)) {
+            return i;
+        }
+        i += 1;
+    }
+    return args.len;
+}
+
+// True when some argument equals want exactly (main.rs 81-87).
+fn has_exact_arg(args: []str, want: []const u8) -> bool {
+    var i: usize = 0;
+    while (i < args.len) {
+        if (str_eq(args[i], want)) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// True when some argument starts with prefix (main.rs 68).
+fn has_arg_prefix(args: []str, prefix: []const u8) -> bool {
+    return find_arg_index(args, prefix) != args.len;
+}
+
+// =====================================================================
+// Number parsing: the `a[prefix.len()..].parse().ok()` half of find_arg
+// (main.rs 62). Anything unparseable yields the default, the same shape
+// as the original's `.ok()` plus `unwrap_or(default)`.
+// =====================================================================
+
+// Decimal digit value of c, or -1 when c is not '0'..'9'.
+fn digit_val(c: u8) -> i64 {
+    if (c < '0' or c > '9') {
+        return -1;
+    }
+    return (c as i64) - 48;
+}
+
+// Rust `s.parse::<u64>()` applied from byte `start` (main.rs 62): digits
+// only. Any other byte, or no digits at all, yields default.
+fn parse_u64_from(s: []const u8, start: usize, default: u64) -> u64 {
+    var n: u64 = 0;
+    var seen: bool = false;
+    var i: usize = start;
+    while (i < s.len) {
+        const d: i64 = digit_val(s[i]);
+        if (d < 0) {
+            return default;
+        }
+        seen = true;
+        n = n * 10 + (d as u64);
+        i += 1;
+    }
+    if (!seen) {
+        return default;
+    }
+    return n;
+}
+
+// Rust `s.parse::<f64>()` applied from byte `start` (main.rs 62), for the
+// shapes this CLI passes: optional '-', digits, optional '.', digits.
+// Trailing junk, an empty value or a lone sign or dot all yield default,
+// exactly like a failed from_str in the original.
+fn parse_f64_from(s: []const u8, start: usize, default: f64) -> f64 {
+    var n: f64 = 0.0;
+    var seen: bool = false;
+    var neg: bool = false;
+    var i: usize = start;
+    if (i < s.len) {
+        if (s[i] == '-') {
+            neg = true;
+            i += 1;
+        }
+    }
+    while (i < s.len) {
+        const d: i64 = digit_val(s[i]);
+        if (d < 0) {
+            break;
+        }
+        seen = true;
+        n = n * 10.0 + (d as f64);
+        i += 1;
+    }
+    if (i < s.len) {
+        if (s[i] == '.') {
+            i += 1;
+            var scale: f64 = 0.1;
+            while (i < s.len) {
+                const d: i64 = digit_val(s[i]);
+                if (d < 0) {
+                    break;
+                }
+                seen = true;
+                n = n + (d as f64) * scale;
+                scale = scale * 0.1;
+                i += 1;
+            }
+        }
+    }
+    if (!seen) {
+        return default;
+    }
+    if (i != s.len) {
+        return default;
+    }
+    if (neg) {
+        return -n;
+    }
+    return n;
+}
+
+// =====================================================================
+// find_arg, specialized per value type (main.rs 59-64; .t27 has no
+// generics). Each variant finds the first argument with the prefix and
+// parses the remainder, else returns the default.
+// =====================================================================
+
+// find_arg for the f64 settings: --lr=, --encoder-lr=, --ntp-lr= and the
+// three weights (main.rs 70, 72, 76-78).
+fn find_arg(args: []str, prefix: []const u8, default: f64) -> f64 {
+    const idx: usize = find_arg_index(args, prefix);
+    if (idx == args.len) {
+        return default;
+    }
+    return parse_f64_from(args[idx], prefix.len, default);
+}
+
+// find_arg for --seed= (main.rs 74).
+fn find_arg_u64(args: []str, prefix: []const u8, default: u64) -> u64 {
+    const idx: usize = find_arg_index(args, prefix);
+    if (idx == args.len) {
+        return default;
+    }
+    return parse_u64_from(args[idx], prefix.len, default);
+}
+
+// find_arg for --steps= and --jepa-warmup= (main.rs 75, 80).
+fn find_arg_usize(args: []str, prefix: []const u8, default: usize) -> usize {
+    const idx: usize = find_arg_index(args, prefix);
+    if (idx == args.len) {
+        return default;
+    }
+    return parse_u64_from(args[idx], prefix.len, default) as usize;
+}
+
+// True when kind is the Muon optimizer (main.rs 83-87).
+fn opt_kind_is_muon(kind: OptKind) -> bool {
+    return kind == OptKind.Muon;
+}
+
+// =====================================================================
+// parse_config (main.rs 67-103). The six `assert!` lines of the original
+// are carried by `config_is_valid` below.
+// =====================================================================
+
+// Parse configuration from CLI arguments (main.rs 67-103). Defaults match
+// the original exactly; --encoder-lr= takes precedence over --lr=; the
+// --no-jepa and --no-nca flags disable their features; --optimizer=muon
+// selects Muon over the AdamW default.
+pub fn parse_config(args: []str) -> Config {
+    var encoder_lr: f64 = 0.004;
+    if (has_arg_prefix(args, "--encoder-lr=")) {
+        encoder_lr = find_arg(args, "--encoder-lr=", 0.004);
+    } else {
+        encoder_lr = find_arg(args, "--lr=", 0.004);
+    }
+    const seed: u64 = find_arg_u64(args, "--seed=", 43);
+    const steps: usize = find_arg_usize(args, "--steps=", 3000);
+    const ntp_lr: f64 = find_arg(args, "--ntp-lr=", 0.001);
+    const ntp_weight: f64 = find_arg(args, "--ntp-weight=", 1.0);
+    const jepa_weight: f64 = find_arg(args, "--jepa-weight=", 1.0);
+    const nca_weight: f64 = find_arg(args, "--nca-weight=", 0.25);
+    const jepa_warmup: usize = find_arg_usize(args, "--jepa-warmup=", 1500);
+    const use_jepa: bool = !has_exact_arg(args, "--no-jepa");
+    const use_nca: bool = !has_exact_arg(args, "--no-nca");
+    var kind: OptKind = OptKind.AdamW;
+    if (has_exact_arg(args, "--optimizer=muon")) {
+        kind = OptKind.Muon;
+    }
+    return Config { seed: seed, steps: steps, encoder_lr: encoder_lr, ntp_lr: ntp_lr, use_jepa: use_jepa, use_nca: use_nca, ntp_weight: ntp_weight, jepa_weight: jepa_weight, nca_weight: nca_weight, opt_kind: kind, jepa_warmup: jepa_warmup, trial_id_given: has_arg_prefix(args, "--trial-id="), agent_id_given: has_arg_prefix(args, "--agent-id=") };
+}
+
+// The six `assert!` checks of parse_config (main.rs 91-96) as a verdict:
+// .t27 has no panic, so validity is a bool the caller acts on. The
+// original rejects encoder_lr <= 0, ntp_lr <= 0, steps == 0 and any
+// negative loss weight.
+pub fn config_is_valid(cfg: Config) -> bool {
+    if (cfg.encoder_lr <= 0.0) {
+        return false;
+    }
+    if (cfg.ntp_lr <= 0.0) {
+        return false;
+    }
+    if (cfg.steps == 0) {
+        return false;
+    }
+    if (cfg.ntp_weight < 0.0) {
+        return false;
+    }
+    if (cfg.jepa_weight < 0.0) {
+        return false;
+    }
+    if (cfg.nca_weight < 0.0) {
+        return false;
+    }
+    return true;
+}
+
+// =====================================================================
+// load_data (main.rs 106-113) and the decisions inside it.
+// =====================================================================
+
+// Load training data from file (main.rs 106-113). The read, the stderr
+// fallback message and the token vector are data movement; the body stays
+// undefined and no test calls it. The usize result is the token count the
+// caller would hold. The decisions inside are ported below:
+// loaded_len_ok, byte_to_token and fallback_data_len.
+fn load_data(path: []const u8) -> usize {
+    undefined;
+}
+
+// main.rs 111: `assert!(!raw.is_empty(), "loaded data is empty")` as a
+// verdict; the original panics on an empty corpus.
+pub fn loaded_len_ok(n: usize) -> bool {
+    return n > 0;
+}
+
+// main.rs 112: each raw byte becomes a token modulo 128.
+pub fn byte_to_token(b: u8) -> usize {
+    return (b as usize) % 128;
+}
+
+// main.rs 108-109: the fallback corpus is FALLBACK_SENTENCE repeated
+// FALLBACK_REPEAT times.
+pub fn fallback_data_len() -> usize {
+    return FALLBACK_SENTENCE.len * FALLBACK_REPEAT;
+}
+
+// =====================================================================
+// run_training_loop (main.rs 116-179) and the decisions inside it.
+// =====================================================================
+
+// Run the complete training loop (main.rs 116-179). The loop drives the
+// training stack - train_state::init_training, compute_grads, the jepa
+// and nca steps, the optimizer wrappers, evaluate, the neon_* hooks -
+// none of which this task ports; its body stays undefined and no test
+// calls it. The original returns Result<f32> (the best validation
+// bits-per-byte); the port's shape is a plain f64, since .t27 has no
+// Result. The decisions the loop itself makes are ported below:
+// train_split_end, val_uses_dedicated, seq_offset, warmup_steps,
+// is_report_step and is_better_bpb.
+fn run_training_loop(cfg: Config) -> f64 {
+    undefined;
+}
+
+// main.rs 119: the 90/10 split, truncating like Rust's `as usize` cast.
+pub fn train_split_end(total: usize) -> usize {
+    return ((total as f64) * 0.9) as usize;
+}
+
+// main.rs 121: dedicated validation data is used only when it holds more
+// than 100 tokens; otherwise the tail of the train split stands in.
+pub fn val_uses_dedicated(val_len: usize) -> bool {
+    return val_len > 100;
+}
+
+// main.rs 128: the deterministic window offset,
+// `(step * 97 + seed) % dl.saturating_sub(SEQ + 1)`. The original panics
+// when dl <= SEQ + 1 (modulo by zero); this port defines 0 for that case.
+pub fn seq_offset(step: usize, seed: usize, dl: usize) -> usize {
+    var window: usize = 0;
+    if (dl > SEQ + 1) {
+        window = dl - (SEQ + 1);
+    }
+    if (window == 0) {
+        return 0;
+    }
+    return (step * 97 + seed) % window;
+}
+
+// main.rs 124: `let warmup = cfg.steps / 10;`
+pub fn warmup_steps(steps: usize) -> usize {
+    return steps / 10;
+}
+
+// main.rs 162: log on every 500th step and on the final step.
+pub fn is_report_step(step: usize, steps: usize) -> bool {
+    if (step % 500 == 0) {
+        return true;
+    }
+    return step == steps;
+}
+
+// main.rs 165: a validation result replaces the best only when it is
+// strictly smaller and finite. `val < best` already rejects NaN and +inf
+// (every comparison with NaN is false); the finiteness half adds the
+// rejection of -inf, which the bare comparison would accept.
+pub fn is_better_bpb(val: f64, best: f64) -> bool {
+    if (!(val < best)) {
+        return false;
+    }
+    if (val <= -1.0e308) {
+        return false;
+    }
+    return true;
+}
+
+// =====================================================================
+// main (main.rs 182-195) and the decision inside it.
+// =====================================================================
+
+// Main entry point for T-JEPA training (main.rs 182-195). Collecting argv
+// from the environment, printing the banner and the results, and reading
+// the wall clock are process plumbing; the body stays undefined and no
+// test calls it. The parsing decision lives in parse_config, the
+// training-orchestration decisions in the run_training_loop helpers, and
+// the Result-to-exit-status decision in main_exit_code.
+pub fn main() -> i32 {
+    undefined;
+}
+
+// main.rs 189: `run_training_loop(&cfg)?` - success yields exit 0,
+// failure yields the failure code (Rust turns the Err into exit 1).
+pub fn main_exit_code(loop_ok: bool) -> i32 {
+    if (loop_ok) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+test str_scanning_helpers {
+    assert(str_eq("abc", "abc"));
+    assert(!str_eq("abc", "abd"));
+    assert(!str_eq("abc", "ab"));
+    assert(starts_with("--lr=0.5", "--lr="));
+    assert(!starts_with("--ntp-lr=1", "--lr="));
+    assert(starts_with("--lr=", "--lr="));
+    var args: [3][]const u8 = ["prog", "--seed=7", "--no-jepa"];
+    assert(find_arg_index(&args, "--seed=") == 1);
+    // An absent prefix yields the args.len sentinel, standing in for None.
+    assert(find_arg_index(&args, "--steps=") == 3);
+    assert(has_exact_arg(&args, "--no-jepa"));
+    assert(!has_exact_arg(&args, "--no-nca"));
+    assert(has_arg_prefix(&args, "--seed="));
+    assert(!has_arg_prefix(&args, "--lr="));
+}
+
+test number_parsing_shapes {
+    assert(digit_val('0') == 0);
+    assert(digit_val('9') == 9);
+    assert(digit_val('-') == -1);
+    assert(digit_val('.') == -1);
+    assert(parse_u64_from("seed=43", 5, 1) == 43);
+    // Empty and negative values fail u64 parsing, as in Rust's from_str.
+    assert(parse_u64_from("seed=", 5, 1) == 1);
+    assert(parse_u64_from("seed=-2", 5, 1) == 1);
+    assert(parse_f64_from("lr=0.5", 3, 9.0) == 0.5);
+    assert(parse_f64_from("lr=2", 3, 9.0) == 2.0);
+    assert(parse_f64_from("lr=-1.5", 3, 9.0) == -1.5);
+    assert(parse_f64_from("lr=.5", 3, 9.0) == 0.5);
+    // Trailing junk, an empty value and a lone dot fail the whole parse.
+    assert(parse_f64_from("lr=0.5x", 3, 9.0) == 9.0);
+    assert(parse_f64_from("lr=", 3, 9.0) == 9.0);
+    assert(parse_f64_from("lr=.", 3, 9.0) == 9.0);
+}
+
+test find_arg_float_values {
+    var args: [3][]const u8 = ["prog", "--lr=0.5", "x"];
+    assert(find_arg(&args, "--lr=", 0.004) == 0.5);
+    // An absent prefix returns the default untouched (main.rs 64).
+    assert(find_arg(&args, "--ntp-lr=", 0.001) == 0.001);
+    // The first matching argument wins (main.rs 60).
+    var two: [3][]const u8 = ["--lr=1", "--lr=2", ""];
+    assert(find_arg(&two, "--lr=", 0.0) == 1.0);
+    // A malformed value falls back to the default (main.rs 62-64).
+    var bad: [2][]const u8 = ["--lr=abc", ""];
+    assert(find_arg(&bad, "--lr=", 0.75) == 0.75);
+}
+
+test find_arg_int_values {
+    var args: [2][]const u8 = ["--seed=7", "--steps=50"];
+    assert(find_arg_u64(&args, "--seed=", 43) == 7);
+    assert(find_arg_u64(&args, "--jepa-warmup=", 1500) == 1500);
+    assert(find_arg_usize(&args, "--steps=", 3000) == 50);
+    var junk: [2][]const u8 = ["--seed=abc", ""];
+    // Unparseable: the default, as the original's .ok() + unwrap_or.
+    assert(find_arg_u64(&junk, "--seed=", 43) == 43);
+}
+
+test parse_config_defaults {
+    var args: [1][]const u8 = ["prog"];
+    const cfg: Config = parse_config(&args);
+    assert(cfg.seed == 43);
+    assert(cfg.steps == 3000);
+    assert(cfg.encoder_lr == 0.004);
+    assert(cfg.ntp_lr == 0.001);
+    assert(cfg.use_jepa);
+    assert(cfg.use_nca);
+    assert(cfg.ntp_weight == 1.0);
+    assert(cfg.jepa_weight == 1.0);
+    assert(cfg.nca_weight == 0.25);
+    assert(cfg.jepa_warmup == 1500);
+    assert(!cfg.trial_id_given);
+    assert(!cfg.agent_id_given);
+    assert(!opt_kind_is_muon(cfg.opt_kind));
+}
+
+test parse_config_overrides {
+    var args: [5][]const u8 = [
+        "--encoder-lr=0.5", "--seed=7", "--steps=50",
+        "--no-jepa", "--optimizer=muon",
+    ];
+    const cfg: Config = parse_config(&args);
+    assert(cfg.encoder_lr == 0.5);
+    assert(cfg.seed == 7);
+    assert(cfg.steps == 50);
+    assert(!cfg.use_jepa);
+    assert(cfg.use_nca);
+    assert(opt_kind_is_muon(cfg.opt_kind));
+
+    // --lr= feeds encoder_lr when --encoder-lr= is absent (main.rs 68-73).
+    var lr_only: [2][]const u8 = ["prog", "--lr=0.25"];
+    const cfg2: Config = parse_config(&lr_only);
+    assert(cfg2.encoder_lr == 0.25);
+
+    // --encoder-lr= takes precedence over --lr= (main.rs 68-73).
+    var both: [3][]const u8 = ["--lr=0.25", "--encoder-lr=0.5", ""];
+    const cfg3: Config = parse_config(&both);
+    assert(cfg3.encoder_lr == 0.5);
+
+    // Trial and agent labels flip their given-flags (main.rs 88-89).
+    var labels: [3][]const u8 = ["--trial-id=t9", "--agent-id=BRAVO", ""];
+    const cfg4: Config = parse_config(&labels);
+    assert(cfg4.trial_id_given);
+    assert(cfg4.agent_id_given);
+}
+
+test config_is_valid_verdicts {
+    var ok_args: [1][]const u8 = ["prog"];
+    const ok_cfg: Config = parse_config(&ok_args);
+    assert(config_is_valid(ok_cfg));
+
+    // The original panics on encoder_lr == 0 (main.rs 91-92).
+    var zero_lr: [2][]const u8 = ["prog", "--encoder-lr=0"];
+    const zero_lr_cfg: Config = parse_config(&zero_lr);
+    assert(!config_is_valid(zero_lr_cfg));
+
+    // The original panics on steps == 0 (main.rs 93).
+    var zero_steps: [2][]const u8 = ["prog", "--steps=0"];
+    const zero_steps_cfg: Config = parse_config(&zero_steps);
+    assert(!config_is_valid(zero_steps_cfg));
+
+    // The original panics on a negative weight (main.rs 95).
+    var neg_weight: [2][]const u8 = ["prog", "--ntp-weight=-1"];
+    const neg_weight_cfg: Config = parse_config(&neg_weight);
+    assert(!config_is_valid(neg_weight_cfg));
+
+    // The original panics on ntp_lr <= 0 (main.rs 91-96).
+    var neg_lr: [2][]const u8 = ["prog", "--ntp-lr=-0.5"];
+    const neg_lr_cfg: Config = parse_config(&neg_lr);
+    assert(!config_is_valid(neg_lr_cfg));
+}
+
+test load_data_decisions {
+    assert(loaded_len_ok(1));
+    assert(!loaded_len_ok(0));
+    assert(byte_to_token(0) == 0);
+    assert(byte_to_token(127) == 127);
+    assert(byte_to_token(128) == 0);
+    assert(byte_to_token(200) == 72);
+    assert(byte_to_token(255) == 127);
+    // "The quick brown fox jumps over the lazy dog. " is 45 bytes,
+    // repeated 100 times (main.rs 108-109).
+    assert(fallback_data_len() == 4500);
+}
+
+test split_val_and_offset_decisions {
+    assert(train_split_end(100) == 90);
+    assert(train_split_end(10) == 9);
+    // 4.5 truncates to 4, like Rust's `as usize` cast (main.rs 119).
+    assert(train_split_end(5) == 4);
+    // Validation data needs more than 100 tokens (main.rs 121).
+    assert(val_uses_dedicated(101));
+    assert(!val_uses_dedicated(100));
+    assert(!val_uses_dedicated(0));
+    // The window offset is deterministic and wraps (main.rs 128).
+    assert(seq_offset(1, 43, 10000) == 140);
+    assert(seq_offset(2, 43, 10000) == 237);
+    assert(seq_offset(10, 0, 200) == 25);
+    assert(seq_offset(11, 0, 200) == 122);
+}
+
+test warmup_report_and_best_decisions {
+    assert(warmup_steps(3000) == 300);
+    assert(warmup_steps(9) == 0);
+    // Every 500th step and the final step are logged (main.rs 162).
+    assert(is_report_step(500, 3000));
+    assert(!is_report_step(501, 3000));
+    assert(is_report_step(3000, 3000));
+    // The best result only moves down, on finite values (main.rs 165).
+    assert(is_better_bpb(1.2, 1.5));
+    assert(!is_better_bpb(1.5, 1.5));
+    assert(!is_better_bpb(1.6, 1.5));
+}
+
+test exit_codes_match_result {
+    assert(main_exit_code(true) == 0);
+    assert(main_exit_code(false) == 1);
+    assert(EXIT_OK == 0);
+    assert(EXIT_FAIL == 1);
+}
