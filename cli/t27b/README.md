@@ -338,8 +338,18 @@ refused by name, exit 2. Every decision is in `specs/tri/t27b/verilog_plan.t27`:
 * how a spec declares an extern module, an instance and a net;
 * the port derivation;
 * the use closure;
-* exact widths;
-* the static loop bound.
+* exact widths, unsigned and signed;
+* the static loop bound;
+* constant tables (ROMs) and division by a constant (a multiply-shift, never a divider).
+
+A spec with no `fn on_clock`, var, net, instance or input is a library of decisions, and
+`t27b verilog <file> [--top <fn>]` writes one combinational module per `pub fn` whose parameters and
+result are integers or bools (inputs = the parameters, output `t27_y`), or only the module of `<fn>`.
+`i2`..`i64` lower as `signed`; `@as(T, x)`, `x as T`, `>>` (`>>>` when signed), `-x`, `T[i]` on a
+module-level `const T : [N]ty = [..]` and `x / k`, `x % k` for a constant `k` lower as well
+(`specs/tri/t27b/conformance/verilog_signed*.t27`; gHashTag/t27#11326). What still refuses: an
+`f64`/string parameter, a struct, a `while` with no static bound, a table read by a signed index, a
+divisor above 2^62, `@intCast` outside `@as`, and a general `x / y` is Verilog's divider.
 
 The writer is `specs/tri/t27b/verilog_emit.t27`. The fixtures are
 `specs/tri/t27b/conformance/verilog_*.t27` (#8796).
