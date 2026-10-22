@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/engine.t27 -- the TRI CLAW autofix control law (AF2, issue #9283; umbrella #9281; epic #9271).
+; Pure decision logic over an already-resolved (tool, class, attempt) triple. The red-signature ->
+; kind-slug -> row resolution and the table itself live in specs/claw/recipes.t27 (AF1, #9282/#9290) --
+; the SSOT, never re-stated here. The engine consumes exactly what recipes answers: tool_of (the
+; instrument string) and class_of (C_AUTO/C_REVIEW/C_OWNER, or C_NONE when no row matched).
+; Fail-closed on both sides: an unmatched signature reaches this file as tool "" (or class C_NONE),
+; reads as ACT_KIND_UNKNOWN and reports; the OWNER rows (tool "owner", cmd "") have no apply at all.
+; AF5 (#9288, owner directive 2026-10-12): no apply path consults a model. Every apply is a
+; deterministic tool call (ACT_KIND_TOOL) or a t27o port delegation (ACT_KIND_T27O); "t27o" reads as
+; deterministic today, so recipes' planned spec-first-port flip REVIEW -> AUTO needs no engine change.
+; A round that applied and did not verify escalates one risk class (RD_SAFE -> RD_REVIEW -> RD_OWNER,
+; values pinned to recipes' C_AUTO/C_REVIEW/C_OWNER literals), and after MAX_ROUNDS only reports go
+; out -- a third round would be a loop, not a fix. The dispatch that lowers this law is AF3
+; (#9284, rescoped after the owner's 2026-10-13 rule: no hand-written python); every instrument
+; it calls is itself a .t27 spec or an existing tracked tool, and the dispatch holds no decision
+; of its own.
+; phi^2 + phi^-2 = 3 | TRINITY
+
+module ClawEngine;
+
+/// Risk classes. The literals are pinned to recipes.t27's C_AUTO/C_REVIEW/C_OWNER
+/// by engine_pins_recipe_class_literals below: same numbers, one vocabulary.
+pub const RD_SAFE : u8 = 0;
+pub const RD_REVIEW : u8 = 1;
+pub const RD_OWNER : u8 = 2;
+
+/// What the runner does this round. WD_REPORT changes nothing.
+pub const WD_REPORT : u8 = 0;
+pub const WD_PROPOSE : u8 = 1;
+pub const WD_APPLY_VERIFY : u8 = 2;
+
+/// Fix rounds per gate per pull request.
+pub const MAX_ROUNDS : u8 = 2;
+
+/// Apply kinds. There is deliberately no model kind (AF5, #9288): nothing in
+/// this vocabulary consults a model to produce a fix.
+pub const ACT_KIND_NONE : u8 = 0;
+pub const ACT_KIND_TOOL : u8 = 1;
+pub const ACT_KIND_T27O : u8 = 2;
+pub const ACT_KIND_UNKNOWN : u8 = 255;
+
+/// One failing check, as the runner hands it to the engine. attempt is
+/// 1-based: 1 is the first look at this gate on this pull request.
+pub struct FixCheck {
+    name : str,
+    attempt : u8,
+}
+
+/// The engine's whole answer for one round. mode is what to do; kind is what
+/// the apply (if any) is made of; rounds_left is the budget after this one.
+pub struct FixDecision {
+    tool : str,
+    risk : u8,
+    mode : u8,
+    kind : u8,
+    rounds_left : u8,
+}
+
+/// The t27o port handoff (AF5): the apply for a t27o row is exactly this
+/// record -- a deterministic foreign-source-to-draft operation, checked by
+/// delegation_well_formed before the runner hands it to t27o. The engine never
+/// drafts the port itself, and neither does anything else in the fix loop.
+pub struct PortHandoff {
+    source_path : str,
+    draft_path : str,
+    source_sha : str,
+    marked_draft : bool,
+}
+
+fn text_differs(a : str, b : str) -> bool {
+    if (a.len != b.len) { return true; }
+    var diff : u32 = 0;
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { diff += 1; }
+        i += 1;
+    }
+    return diff > 0;
+}
+
+/// Effective risk after escalation: one class up per round already spent,
+/// clamped at RD_OWNER. attempt 0 is read as 1 (the first round).
+pub fn effective_risk(recipe_risk : u8, attempt : u8) -> u8 {
+    var a : u8 = attempt;
+    if (a < 1) { a = 1; }
+    const extra : u16 = (a - 1) as u16;
+    const lifted : u16 = (recipe_risk as u16) + extra;
+    if (lifted > (RD_OWNER as u16)) { return RD_OWNER; }
+    return (lifted) as u8;
+}
+
+/// Rounds left after `attempt` rounds were spent. attempt 0 reads as none
+/// spent yet.
+pub fn rounds_left(attempt : u8) -> u8 {
+    if (attempt < 1) { return MAX_ROUNDS; }
+    if (attempt >= MAX_ROUNDS) { return 0; }
+    return MAX_ROUNDS - attempt;
+}
+
+/// The kind of apply a tool stands for. The vocabulary is recipes' TOOLS
+/// column plus "t27o" (AF5 direction). "" -- no row matched, or an OWNER row's
+/// absent instrument -- and any tool not listed here fail closed to
+/// ACT_KIND_UNKNOWN / ACT_KIND_NONE and never apply.
+pub fn apply_kind_for_tool(tool : str) -> u8 {
+    if (tool.len == 0) { return ACT_KIND_UNKNOWN; }
+    if (text_differs(tool, "owner") == false) { return ACT_KIND_NONE; }
+    if (text_differs(tool, "t27o") == false) { return ACT_KIND_T27O; }
+    if (text_differs(tool, "tri") == false) { return ACT_KIND_TOOL; }
+    if (text_differs(tool, "t27c") == false) { return ACT_KIND_TOOL; }
+    if (text_differs(tool, "git") == false) { return ACT_KIND_TOOL; }
+    if (text_differs(tool, "python") == false) { return ACT_KIND_TOOL; }
+    return ACT_KIND_UNKNOWN;
+}
+
+/// AF5 surface: true only for the two deterministic apply kinds. The runner
+/// refuses to apply anything else, whatever a future recipe row claims.
+pub fn apply_is_deterministic(kind : u8) -> bool {
+    if (kind == ACT_KIND_TOOL) { return true; }
+    if (kind == ACT_KIND_T27O) { return true; }
+    return false;
+}
+
+/// Modes reachable by an applicable row: apply only at RD_SAFE inside the
+/// budget, propose one class up inside the budget, otherwise report.
+pub fn mode_for_applicable(eff_risk : u8, attempt : u8) -> u8 {
+    if (attempt > MAX_ROUNDS) { return WD_REPORT; }
+    if (eff_risk == RD_SAFE) { return WD_APPLY_VERIFY; }
+    if (eff_risk == RD_REVIEW) { return WD_PROPOSE; }
+    return WD_REPORT;
+}
+
+/// The whole round: what to do, with what instrument, at what risk, with what
+/// budget left. tool and class come from recipes' tool_of/class_of on the
+/// matched kind slug; the runner passes "" and RD_OWNER when nothing matched.
+pub fn decide(tool : str, recipe_risk : u8, attempt : u8) -> FixDecision {
+    const kind = apply_kind_for_tool(tool);
+    const eff = effective_risk(recipe_risk, attempt);
+    var mode : u8 = WD_REPORT;
+    if (kind == ACT_KIND_TOOL) {
+        mode = mode_for_applicable(eff, attempt);
+    } else if (kind == ACT_KIND_T27O) {
+        mode = mode_for_applicable(eff, attempt);
+    }
+    return FixDecision {
+        tool: tool,
+        risk: eff,
+        mode: mode,
+        kind: kind,
+        rounds_left: rounds_left(attempt),
+    };
+}
+
+/// The next round's check: same gate, one round further. The runner builds
+/// this only after a verify that stayed red.
+pub fn next_round(check : FixCheck) -> FixCheck {
+    var a : u8 = check.attempt;
+    if (a < 1) { a = 1; }
+    return FixCheck { name: check.name, attempt: a + 1 };
+}
+
+/// A handoff t27o may accept: real paths, a sha256 of the source it came
+/// from, the draft marker set, and a draft that is not the source overwriting
+/// itself.
+pub fn delegation_well_formed(h : PortHandoff) -> bool {
+    if (h.source_path.len == 0) { return false; }
+    if (h.draft_path.len == 0) { return false; }
+    if (h.source_sha.len != 64) { return false; }
+    if (h.marked_draft == false) { return false; }
+    if (text_differs(h.source_path, h.draft_path) == false) { return false; }
+    return true;
+}
+
+test engine_pins_recipe_class_literals {
+    // The join with recipes.t27 is by literal, gates.t27 style: same numbers,
+    // names apart. If recipes ever renumbers its classes, this fails here
+    // first, in the file that depends on the numbers. The compares go through
+    // vars so they stay runtime asserts instead of folding away.
+    var safe : u8 = RD_SAFE;
+    var review : u8 = RD_REVIEW;
+    var owner : u8 = RD_OWNER;
+    var zero : u8 = 0;
+    var one : u8 = 1;
+    var two : u8 = 2;
+    assert(safe == zero);
+    assert(review == one);
+    assert(owner == two);
+}
+
+test engine_unmatched_signature_reports_only {
+    // No row matched: recipes answers tool "" / class C_NONE; nothing is ever
+    // applied over an unresolved row.
+    const d = decide("", RD_OWNER, 1);
+    assert(d.mode == WD_REPORT);
+    assert(d.kind == ACT_KIND_UNKNOWN);
+    assert(apply_is_deterministic(d.kind) == false);
+}
+
+test engine_unknown_tool_reports_only {
+    // A recipe row naming an instrument this engine has not been told about
+    // fails closed the same way, from the other side.
+    const d = decide("cargo-magic", RD_SAFE, 1);
+    assert(d.kind == ACT_KIND_UNKNOWN);
+    assert(d.mode == WD_REPORT);
+}
+
+test engine_owner_rows_have_no_apply {
+    // OWNER rows (tool "owner", cmd "") report and stop, at every risk and
+    // round; the report names the one keystroke.
+    var attempt : u8 = 1;
+    while (attempt <= 3) {
+        var risk : u8 = 0;
+        while (risk <= 2) {
+            const d = decide("owner", risk, attempt);
+            assert(d.mode == WD_REPORT);
+            assert(d.kind == ACT_KIND_NONE);
+            risk += 1;
+        }
+        attempt += 1;
+    }
+}
+
+test engine_auto_first_round_applies_then_verifies {
+    const d = decide("t27c", RD_SAFE, 1);
+    assert(d.mode == WD_APPLY_VERIFY);
+    assert(d.kind == ACT_KIND_TOOL);
+    assert(d.risk == RD_SAFE);
+    assert(d.rounds_left == 1);
+}
+
+test engine_review_first_round_proposes {
+    const d = decide("git", RD_REVIEW, 1);
+    assert(d.mode == WD_PROPOSE);
+    assert(d.kind == ACT_KIND_TOOL);
+}
+
+test engine_owner_class_reports_even_when_applicable {
+    const d = decide("tri", RD_OWNER, 1);
+    assert(d.mode == WD_REPORT);
+    assert(d.kind == ACT_KIND_TOOL);
+}
+
+test engine_failed_round_escalates_one_class {
+    // An AUTO row whose apply did not verify: round 2 proposes instead of
+    // applying twice.
+    const d = decide("tri", RD_SAFE, 2);
+    assert(d.risk == RD_REVIEW);
+    assert(d.mode == WD_PROPOSE);
+    assert(d.rounds_left == 0);
+}
+
+test engine_rounds_exhausted_only_reports {
+    // Round 2 is the last in budget: a failed SAFE apply escalates and still
+    // proposes on it. Round 3 and beyond would be a loop, not a fix: report.
+    const last = decide("t27c", RD_SAFE, MAX_ROUNDS);
+    assert(last.mode == WD_PROPOSE);
+    assert(last.risk == RD_REVIEW);
+    assert(last.rounds_left == 0);
+
+    const d = decide("t27c", RD_SAFE, MAX_ROUNDS + 1);
+    assert(d.mode == WD_REPORT);
+    assert(d.rounds_left == 0);
+    const deep = decide("t27c", RD_SAFE, 7);
+    assert(deep.mode == WD_REPORT);
+    assert(deep.risk == RD_OWNER);
+}
+
+test engine_t27o_is_deterministic_today {
+    // AF5 direction: recipes plans spec-first-port REVIEW -> AUTO with tool
+    // t27o; the engine already reads t27o as a deterministic port apply, so
+    // that flip is a recipes-row edit, not an engine change.
+    assert(apply_kind_for_tool("t27o") == ACT_KIND_T27O);
+    const d = decide("t27o", RD_SAFE, 1);
+    assert(d.kind == ACT_KIND_T27O);
+    assert(d.mode == WD_APPLY_VERIFY);
+    assert(apply_is_deterministic(d.kind) == true);
+    const still_review = decide("t27o", RD_REVIEW, 1);
+    assert(still_review.mode == WD_PROPOSE);
+}
+
+test engine_mode_vocabulary_is_closed {
+    // AF5, as a population: over every instrument the vocabulary admits and
+    // every class and round, the mode stays inside the vocabulary, and
+    // WD_APPLY_VERIFY is reachable only for a deterministic kind at RD_SAFE
+    // inside the budget. There is no kind in this vocabulary that consults a
+    // model, so no mode can either.
+    var tools : [5]str = [ "tri", "t27c", "git", "python", "t27o" ];
+    var ti : usize = 0;
+    while (ti < 5) {
+        var risk : u8 = 0;
+        while (risk <= 2) {
+            var attempt : u8 = 0;
+            while (attempt <= 4) {
+                const d = decide(tools[ti], risk, attempt);
+                assert(d.mode <= WD_APPLY_VERIFY);
+                var known : bool = false;
+                if (d.kind == ACT_KIND_TOOL) { known = true; }
+                if (d.kind == ACT_KIND_T27O) { known = true; }
+                if (d.kind == ACT_KIND_NONE) { known = true; }
+                if (d.kind == ACT_KIND_UNKNOWN) { known = true; }
+                assert(known);
+                if (d.mode == WD_APPLY_VERIFY) {
+                    assert(apply_is_deterministic(d.kind) == true);
+                    assert(d.risk == RD_SAFE);
+                    assert(attempt < MAX_ROUNDS);
+                }
+                assert(d.risk <= RD_OWNER);
+                attempt += 1;
+            }
+            risk += 1;
+        }
+        ti += 1;
+    }
+}
+
+test engine_effective_risk_clamps_at_owner {
+    assert(effective_risk(RD_SAFE, 1) == RD_SAFE);
+    assert(effective_risk(RD_SAFE, 2) == RD_REVIEW);
+    assert(effective_risk(RD_SAFE, 200) == RD_OWNER);
+    assert(effective_risk(RD_REVIEW, 1) == RD_REVIEW);
+    assert(effective_risk(RD_OWNER, 1) == RD_OWNER);
+    assert(effective_risk(RD_SAFE, 0) == RD_SAFE);
+}
+
+test engine_rounds_left_math {
+    assert(rounds_left(0) == MAX_ROUNDS);
+    assert(rounds_left(1) == 1);
+    assert(rounds_left(2) == 0);
+    assert(rounds_left(9) == 0);
+}
+
+test engine_next_round_increments_once {
+    const first = FixCheck { name: "own-language", attempt: 1 };
+    const second = next_round(first);
+    assert(second.attempt == 2);
+    assert(second.name == "own-language");
+    const clamped = next_round(FixCheck { name: "cli-tri", attempt: 0 });
+    assert(clamped.attempt == 2);
+}
+
+test engine_handoff_requires_marker_sha_and_distinct_paths {
+    const good = PortHandoff {
+        source_path: "specs/port/x/src/lib.rs",
+        draft_path: "specs/port/x/src/lib.t27",
+        source_sha: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        marked_draft: true,
+    };
+    assert(delegation_well_formed(good) == true);
+
+    var no_marker = good;
+    no_marker.marked_draft = false;
+    assert(delegation_well_formed(no_marker) == false);
+
+    var short_sha = good;
+    short_sha.source_sha = "abc";
+    assert(delegation_well_formed(short_sha) == false);
+
+    var same_path = good;
+    same_path.draft_path = same_path.source_path;
+    assert(delegation_well_formed(same_path) == false);
+
+    var empty_source = good;
+    empty_source.source_path = "";
+    assert(delegation_well_formed(empty_source) == false);
+
+    // An empty draft differs from every source path, so only its own check refuses it.
+    var empty_draft = good;
+    empty_draft.draft_path = "";
+    assert(delegation_well_formed(empty_draft) == false);
+}
+
+test engine_case_9277_policy_then_ratchet {
+    // The chain this loop itself ran by hand on 2026-10-12, as two engine
+    // rounds over recipes' real rows. Round 1: PR #9277's own-language red on
+    // a ratchet constant inside a foreign gate tool matched kind
+    // spec-first-port (class C_REVIEW, tool t27c) -- propose, which landed as
+    // policy PR #9289. Round 2, after that base advanced: the dead-pin lower
+    // on documented-commands is still a proposal row today (the pin lives in
+    // foreign python; the entry and label came first), carried inside #9277
+    // by the loop itself. The fallback row answers everything else.
+    const round1 = decide("t27c", RD_REVIEW, 1);
+    assert(round1.mode == WD_PROPOSE);
+    assert(round1.kind == ACT_KIND_TOOL);
+
+    const round2 = decide("t27c", RD_REVIEW, 1);
+    assert(round2.mode == WD_PROPOSE);
+
+    const fallback = decide("", RD_OWNER, 1);
+    assert(fallback.mode == WD_REPORT);
+}
