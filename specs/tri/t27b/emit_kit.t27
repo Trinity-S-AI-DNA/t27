@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/emit_kit.t27 -- what the source writers of t27b share: verilog_emit.t27 (`t27b verilog`)
+; and ts_emit.t27 (`t27b ts`, issue #9994). Both walk the t27c AST of one spec, as `flat` in
+; cli/t27b/src/lower.rs writes it (specs/tri/t27b/ast_walk.t27), and both wrote these helpers out word for
+; word until tools/dupe_scan.py refused the second copy. A body written twice is a bug fixed twice.
+; --
+; Here: the byte writers (put_bytes, put_dec, put_ind), the line a refusal quotes (line_near), moving a
+; refusal written at the end of the output to its front (to_front), the scope and name resolver (resolve:
+; a local in scope, a parameter, a top-level declaration, a fn) with its symbol encoding, and the builders
+; of the hand-made trees their tests run on (tnode, tmeta, holds). Each writer keeps its own `fail`, since
+; the backend's name is in its message.
+; --
+; A writer must `use` this module by name: the splice pulls a name only when the writer does not declare it
+; itself, and gen-rust type-checks every declaration it pulls, so a whole-module `use` of the other writer
+; pulls that writer's fns too (any word in a string literal counts as a reference).
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bEmitKit;
+
+use tri::t27b::verilog_plan;
+
+/// The room at the end of `out` a refusal is first written to, so the text before it survives.
+pub const MSG_ROOM : usize = 400;
+/// The longest name a refusal quotes.
+pub const NAME_CAP : usize = 120;
+
+/// Symbols: a resolved name is a tag times SYM_UNIT plus a node index (a parameter: its position).
+pub const SYM_UNIT : i64 = 1099511627776;
+pub const SYM_LOCAL : i64 = 1;
+pub const SYM_PARAM : i64 = 2;
+pub const SYM_TOP : i64 = 3;
+pub const SYM_FN : i64 = 4;
+pub const NO_SYM : i64 = -1;
+
+// ----------------------------------------------------------------------------------------------------------
+// Writing bytes and placing a refusal.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Writes s[a .. b] at out[at ..].
+pub fn put_bytes(out: []u8, at: usize, s: []const u8, a: usize, b: usize) -> usize {
+    var k : usize = a;
+    var q : usize = at;
+    while (k < b) {
+        out[q] = s[k];
+        q = q + 1;
+        k = k + 1;
+    }
+    return q;
+}
+
+/// How many decimal digits v has.
+pub fn dec_len(v: u64) -> usize {
+    var n : usize = 1;
+    var x : u64 = v;
+    while (x >= 10) {
+        x = x / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Writes v in decimal.
+pub fn put_dec(out: []u8, at: usize, v: u64) -> usize {
+    const n : usize = dec_len(v);
+    var x : u64 = v;
+    var k : usize = n;
+    while (k > 0) {
+        const db : u8 = @intCast(x % 10 + 48);
+        out[at + k - 1] = db;
+        x = x / 10;
+        k = k - 1;
+    }
+    return at + n;
+}
+
+/// Writes n spaces.
+pub fn put_ind(out: []u8, at: usize, n: usize) -> usize {
+    var k : usize = 0;
+    while (k < n) {
+        out[at + k] = 32;
+        k = k + 1;
+    }
+    return at + n;
+}
+
+/// The first non-zero source line at or after node i within its subtree, else the nearest one before it.
+pub fn line_near(nodes: []const u8, meta: []const u8, i: usize) -> usize {
+    var j : usize = i;
+    while (j < end(nodes, i)) {
+        if (line_of(meta, j) != 0) { return line_of(meta, j); }
+        j = j + 1;
+    }
+    var k : usize = i;
+    while (k > 0) {
+        k = k - 1;
+        if (line_of(meta, k) != 0) { return line_of(meta, k); }
+    }
+    return 0;
+}
+
+/// Copies the refusal of length n from the end of out to its start; returns minus n.
+pub fn to_front(out: []u8, n: usize) -> i64 {
+    const base : usize = out.len - MSG_ROOM;
+    var k : usize = 0;
+    while (k < n) {
+        out[k] = out[base + k];
+        k = k + 1;
+    }
+    const ni : i64 = @intCast(n);
+    return 0 - ni;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Scopes and names.
+// ----------------------------------------------------------------------------------------------------------
+
+/// The child of node c that holds node d in its subtree (c < d < end(c)).
+pub fn child_holding(nodes: []const u8, c: usize, d: usize) -> usize {
+    var x : usize = c + 1;
+    while (x < end(nodes, c)) {
+        if (d < end(nodes, x)) { return x; }
+        x = end(nodes, x);
+    }
+    return c;
+}
+
+/// The node whose direct child d is, searching down from `root` (root < d).
+pub fn parent_of(nodes: []const u8, root: usize, d: usize) -> usize {
+    var cur : usize = root;
+    while (true) {
+        const nx : usize = child_holding(nodes, cur, d);
+        if (nx == d or nx == cur) { return cur; }
+        cur = nx;
+    }
+    return cur;
+}
+
+/// Is the local declared at node d (under item) in scope at node u: d comes before u, u is not in d's own
+/// initializer, and d's enclosing block holds u?
+pub fn in_scope(nodes: []const u8, item: usize, d: usize, u: usize) -> bool {
+    if (d >= u or u < end(nodes, d)) { return false; }
+    const pb : usize = parent_of(nodes, item, d);
+    return u < end(nodes, pb);
+}
+
+/// The position of the parameter named text[a .. b] in fn `item`'s parameter lines, or -1.
+pub fn param_index(text: []const u8, meta: []const u8, ptext: []const u8, item: usize, a: usize, b: usize) -> i64 {
+    const pa : usize = params_lo(meta, item);
+    const pb : usize = params_hi(meta, item);
+    var k : usize = 0;
+    var s : usize = pa;
+    while (s < pb) {
+        const e : usize = line_stop(ptext, s, pb);
+        const c : usize = colon_at(ptext, s, e);
+        if (c - s == b - a and has_at(ptext, s, c, text[a .. b])) {
+            const ki : i64 = @intCast(k);
+            return ki;
+        }
+        k = k + 1;
+        s = e + 1;
+    }
+    return -1;
+}
+
+/// Where parameter k's name starts in the params text of `item`.
+pub fn param_name_lo(meta: []const u8, ptext: []const u8, item: usize, k: usize) -> usize {
+    return param_at(ptext, params_lo(meta, item), params_hi(meta, item), k);
+}
+
+/// Where parameter k's name ends.
+pub fn param_name_hi(meta: []const u8, ptext: []const u8, item: usize, k: usize) -> usize {
+    const s : usize = param_name_lo(meta, ptext, item, k);
+    return colon_at(ptext, s, line_stop(ptext, s, params_hi(meta, item)));
+}
+
+/// Resolves the name text[a .. b] used at node u inside `item` (a fn, a test or an invariant; 0 for the
+/// module scope): a local in scope, a parameter of item, a top-level declaration, or a top-level fn. NO_SYM
+/// when there is none.
+pub fn resolve(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, u: usize, a: usize, b: usize) -> i64 {
+    if (item > 0) {
+        var j : usize = u;
+        while (j > item + 1) {
+            j = j - 1;
+            if (kind(nodes, j) == K_STMT_LOCAL and field_is(nodes, text, j, F_NAME, text[a .. b])) {
+                if (in_scope(nodes, item, j, u)) {
+                    const ji : i64 = @intCast(j);
+                    return SYM_LOCAL * SYM_UNIT + ji;
+                }
+            }
+        }
+        if (kind(nodes, item) == K_FN_DECL) {
+            const pk : i64 = param_index(text, meta, ptext, item, a, b);
+            if (pk >= 0) { return SYM_PARAM * SYM_UNIT + pk; }
+        }
+    }
+    const d : i64 = find_decl(nodes, text, a, b);
+    if (d != NO_NODE) { return SYM_TOP * SYM_UNIT + d; }
+    const f : i64 = find_fn(nodes, text, a, b);
+    if (f != NO_NODE) { return SYM_FN * SYM_UNIT + f; }
+    return NO_SYM;
+}
+
+/// The symbol of tag `tag` at node (or parameter position) `at`.
+pub fn sym_of(tag: i64, at: usize) -> i64 {
+    const ai : i64 = @intCast(at);
+    return tag * SYM_UNIT + ai;
+}
+
+/// The node index (or parameter position) of a symbol.
+pub fn sym_at(s: i64) -> usize {
+    const r : i64 = @rem(s, SYM_UNIT);
+    const ru : usize = @intCast(r);
+    return ru;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Hand-made trees for the writers' tests: ast_walk.t27's node records and verilog_plan.t27's meta records.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Node i: kind k, subtree end e, name text[a .. b], every other field empty.
+pub fn tnode(buf: []u8, i: usize, k: u8, e: usize, a: usize, b: usize) -> void {
+    buf[i * REC] = k;
+    vput32(buf, i * REC + 4, e);
+    var f : usize = 0;
+    while (f < FIELDS) {
+        vput32(buf, i * REC + 8 + f * 8, 0);
+        vput32(buf, i * REC + 12 + f * 8, 0);
+        f = f + 1;
+    }
+    vput32(buf, i * REC + 8, a);
+    vput32(buf, i * REC + 12, b);
+}
+
+/// Node i's meta record: flags, line, no parameters.
+pub fn tmeta(m: []u8, i: usize, flags: usize, line: usize) -> void {
+    vput32(m, i * META, flags);
+    vput32(m, i * META + 4, line);
+    vput32(m, i * META + 8, 0);
+    vput32(m, i * META + 12, 0);
+}
+
+/// Does out[0 .. n] hold w?
+pub fn holds(out: []const u8, n: usize, w: str) -> bool {
+    var i : usize = 0;
+    while (i + w.len <= n) {
+        var k : usize = 0;
+        while (k < w.len and out[i + k] == w[k]) { k = k + 1; }
+        if (k == w.len) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests.
+// ----------------------------------------------------------------------------------------------------------
+
+test bytes_and_numbers_are_written_where_asked {
+    var out : [64]u8 = undefined;
+    const n0 : usize = put_dec(out[0 .. 64], 0, 0);
+    assert n0 == 1 and out[0] == 48;
+    // written right after the first number: holds scans out[0 .. n1], and a gap would read bytes never written
+    const n1 : usize = put_dec(out[0 .. 64], 1, 4294967295);
+    assert n1 == 11 and holds(out[0 .. 64], n1, "4294967295");
+    const n2 : usize = put_ind(out[0 .. 64], 0, 4);
+    assert n2 == 4 and out[0] == 32 and out[3] == 32;
+    const n3 : usize = put_bytes(out[0 .. 64], n2, "xabcx", 1, 4);
+    assert n3 == 7 and holds(out[0 .. 64], n3, "    abc");
+    assert !holds(out[0 .. 64], n3, "abcx");
+}
+
+test a_refusal_written_at_the_end_moves_to_the_front {
+    var out : [512]u8 = undefined;
+    const base : usize = 512 - MSG_ROOM;
+    const n : usize = put_bytes(out[0 .. 512], base, "no", 0, 2);
+    const r : i64 = to_front(out[0 .. 512], n - base);
+    assert r == -2 and out[0] == 110 and out[1] == 111;
+}
+
+test symbols_keep_their_tag_and_position {
+    const s : i64 = sym_of(SYM_PARAM, 5);
+    assert sym_at(s) == 5 and s == SYM_PARAM * SYM_UNIT + 5;
+    assert sym_at(sym_of(SYM_FN, 0)) == 0;
+}
+
+/// The tree of `module M; fn f(x: u8) -> u8 { const y : u8 = 2; return y; }`.
+/// text: M 0..1, f 1..2, y 2..3, x 3..4
+fn ktree(nb: []u8, mb: []u8) -> void {
+    tnode(nb, 0, K_MODULE, 6, 0, 1);
+    tnode(nb, 1, K_FN_DECL, 6, 1, 2);
+    tnode(nb, 2, K_STMT_LOCAL, 4, 2, 3);
+    tnode(nb, 3, K_EXPR_LITERAL, 4, 0, 0);
+    tnode(nb, 4, K_EXPR_RETURN, 6, 0, 0);
+    tnode(nb, 5, K_EXPR_IDENTIFIER, 6, 2, 3);
+    var i : usize = 0;
+    while (i < 6) {
+        tmeta(mb, i, 0, 0);
+        i = i + 1;
+    }
+    // fn f, at line 2, with the one parameter line `x:u8` of the params text
+    tmeta(mb, 1, 0, 2);
+    vput32(mb, 1 * META + 12, 5);
+}
+
+test names_resolve_to_a_local_in_scope_a_parameter_or_a_fn {
+    const tx : str = "Mfyx";
+    const pt : str = "x:u8\n";
+    var nb : [432]u8 = undefined;
+    var mb : [96]u8 = undefined;
+    ktree(nb[0 .. 432], mb[0 .. 96]);
+    // y read by the return is the local at node 2
+    assert resolve(nb[0 .. 432], tx, mb[0 .. 96], pt, 1, 5, 2, 3) == SYM_LOCAL * SYM_UNIT + 2;
+    // y inside its own initializer is not yet in scope
+    assert resolve(nb[0 .. 432], tx, mb[0 .. 96], pt, 1, 3, 2, 3) == NO_SYM;
+    assert in_scope(nb[0 .. 432], 1, 2, 5) and !in_scope(nb[0 .. 432], 1, 2, 3);
+    assert parent_of(nb[0 .. 432], 1, 2) == 1 and child_holding(nb[0 .. 432], 1, 5) == 4;
+    // x is parameter 0, its name at ptext[0 .. 1]
+    assert resolve(nb[0 .. 432], tx, mb[0 .. 96], pt, 1, 5, 3, 4) == SYM_PARAM * SYM_UNIT;
+    assert param_index(tx, mb[0 .. 96], pt, 1, 3, 4) == 0 and param_index(tx, mb[0 .. 96], pt, 1, 2, 3) == -1;
+    assert param_name_lo(mb[0 .. 96], pt, 1, 0) == 0 and param_name_hi(mb[0 .. 96], pt, 1, 0) == 1;
+    // f is the fn at node 1
+    assert resolve(nb[0 .. 432], tx, mb[0 .. 96], pt, 1, 5, 1, 2) == SYM_FN * SYM_UNIT + 1;
+    // the line a refusal quotes is the nearest one recorded
+    assert line_near(nb[0 .. 432], mb[0 .. 96], 1) == 2 and line_near(nb[0 .. 432], mb[0 .. 96], 4) == 2;
+}
