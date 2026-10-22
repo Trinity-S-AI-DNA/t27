@@ -299,14 +299,14 @@ mod tests {
     }
 }
 
-// `t27c ptx-run` (#10404, #10847): load the PTX that ternary_gemm_ptx.t27 (kernel 0) or hslm_bwd_ptx.t27 (1, 2) wrote, run it, count mismatches with its reference.
+// `t27c ptx-run` (#10404, #10847): load the PTX that ternary_gemm_ptx.t27 (kernel 0) or hslm_bwd_ptx.t27 (1, 2, 3) wrote, run it, count mismatches with its reference.
 #[cfg(feature = "cuda")] #[link(name = "cuda")]
 extern "C" {
     fn cuInit(flags: u32) -> i32; fn cuDeviceGet(dev: *mut i32, ordinal: i32) -> i32;
     fn cuCtxCreate_v2(ctx: *mut usize, flags: u32, dev: i32) -> i32; fn cuCtxSynchronize() -> i32;
     fn cuModuleLoadData(module: *mut usize, image: *const u8) -> i32; fn cuModuleGetFunction(func: *mut usize, module: usize, name: *const u8) -> i32;
     fn cuMemAlloc_v2(ptr: *mut u64, bytes: usize) -> i32; fn cuMemcpyHtoD_v2(dst: u64, src: *const u8, bytes: usize) -> i32;
-    fn cuMemcpyDtoH_v2(dst: *mut u8, src: u64, bytes: usize) -> i32;
+    fn cuMemcpyDtoH_v2(dst: *mut u8, src: u64, bytes: usize) -> i32; fn cuMemsetD32_v2(dst: u64, v: u32, n: usize) -> i32;
     fn cuLaunchKernel(f: usize, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32, smem: u32, stream: usize, params: *mut *mut u8, extra: usize) -> i32;
 }
 #[cfg(feature = "cuda")]
@@ -328,7 +328,7 @@ pub fn ptx_run(kernel: u32, m: usize, n: usize, k: usize, iters: u32, stride: us
         ck(cuMemcpyHtoD_v2(da, a.as_ptr() as *const u8, a.len()))?; ck(cuMemcpyHtoD_v2(dw, wp.as_ptr(), wp.len()))?;
         let mut args: [*mut u8; 6] = [&mut da as *mut u64 as *mut u8, &mut dw as *mut u64 as *mut u8, &mut dc as *mut u64 as *mut u8,
             &mut pm as *mut u32 as *mut u8, &mut pn as *mut u32 as *mut u8, &mut pk as *mut u32 as *mut u8];
-        let mut launch = || ck(cuLaunchKernel(f, t::grid_dim(n), t::grid_dim(m), 1, t::THREADS, 1, 1, 0, 0, args.as_mut_ptr(), 0));
+        let mut launch = || { if u::zero_first(kernel) { ck(cuMemsetD32_v2(dc, 0, m * n))?; } ck(cuLaunchKernel(f, t::grid_dim(n), t::grid_dim(m), u::grid_z(kernel, m, n, k), t::THREADS, 1, 1, 0, 0, args.as_mut_ptr(), 0)) };
         launch()?; ck(cuCtxSynchronize())?; ck(cuMemcpyDtoH_v2(c.as_mut_ptr() as *mut u8, dc, c.len() * 4))?;
         let t0 = std::time::Instant::now();
         for _ in 0..iters { launch()?; } ck(cuCtxSynchronize())?;
