@@ -58,6 +58,8 @@ mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command li
 mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
 #[path = "../../../gen/rust/queen/local_dispatch.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod qld; // t27c gen-rust of specs/queen/local_dispatch.t27: the rules and command lines of `tri queen` (#11415)
+#[path = "../../../gen/rust/tri/trigit/verbs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod tv; // t27c gen-rust of specs/tri/trigit/verbs.t27: the trigit verbs (#11601, epic #11385 items 24-26)
 #[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27rel; // t27c gen-rust of specs/t27os/release.t27: the release plan and manifest text of `tri t27os` (#11315)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -463,6 +465,8 @@ enum Commands {
     /// The local Queen: `tick` reads the open P0 then P1 issues of gHashTag/t27, orders them by priority.t27, claims each pick by creating refs/swarm/claims/<n> on origin (shared by every machine), makes a worktree /tmp/claude-501/lane-<n> on claude/evolve-lane-<n>-<host> and starts the lane (a T27 OS pane when T27OS_PTY names the pty server, else a detached shell) on the free z.ai tier; a lane silent for 30 min loses its claim. --plan prints the picks and the reasons and starts nothing; --lanes N starts at most N; --host names this machine; --issues FILE reads the candidates from a feed file (rules: specs/queen/local_dispatch.t27, #11415).
     Queen { action: String, #[arg(long)] plan: bool, #[arg(long, default_value_t = 0)] lanes: u32, #[arg(long)] host: Option<String>, #[arg(long)] issues: Option<String> },
     Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
+    /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
+    Trigit { #[arg(trailing_var_arg = true)] argv: Vec<String> },
     /// T27 OS release front door: `release --plan` prints the numbered steps; `manifest --build N --sums FILE` prints the release manifest, a t27 module the app reads; `publish --yes` builds app and toolchain from one clean commit and creates the t27os-v<version>-b<build> release and the t27os-latest pointer; without --yes it is refused (rules: specs/t27os/release.t27, #11315, #11403).
     T27os { action: String, #[arg(long)] plan: bool, #[arg(long)] yes: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sums: String },
     /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
@@ -1391,6 +1395,7 @@ fn main() -> Result<()> {
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Queen { action, plan, lanes, host, issues } => std::process::exit(cmd_queen(action, *plan, *lanes, host.as_deref(), issues.as_deref())? as i32),
         Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
+        Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
         Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
@@ -1672,6 +1677,39 @@ fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Resu
     let w = g::report(r, ev, code, &mut out, &mut wo, &mut wp, &mut buf);
     print!("{}", String::from_utf8_lossy(&out[..w]));
     Ok(g::exit_code(code))
+}
+
+/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed, or prints the spec's words. Same shape as cmd_golden.
+fn cmd_trigit(args: &[String]) -> Result<u8> {
+    use tv as v;
+    let leak = |s: String| -> &'static str { s.leak() };
+    let verb = if args.is_empty() { v::TV_UNKNOWN } else { v::verb_of(leak(args[0].to_lowercase())) };
+    let run = |b: &[u8], ident: bool| -> (u8, String) { let a: Vec<String> = String::from_utf8_lossy(b).lines().map(str::to_string).collect(); if a.is_empty() { return (127, "empty argv".into()); } let mut c = Command::new(&a[0]); c.args(&a[1..]); if ident { for (k, val) in [("GIT_AUTHOR_NAME", "t27os"), ("GIT_AUTHOR_EMAIL", "t27os@localhost"), ("GIT_COMMITTER_NAME", "t27os"), ("GIT_COMMITTER_EMAIL", "t27os@localhost")] { c.env(k, val); } } match c.output() { Ok(o) => (o.status.code().unwrap_or(255) as u8, String::from_utf8_lossy(&o.stdout).trim().to_string()), Err(e) => (127, e.to_string()) } };
+    let mut buf = vec![0u8; 4096];
+    let say = |k: u8, r: &[u8], val: &[u8], b: &mut Vec<u8>| { let n = v::did_text(k, r, val, b.as_mut_slice(), 4096); println!("{}", String::from_utf8_lossy(&b[..n])); };
+    match v::host_action(verb) {
+        v::A_REFUSE => { let n = v::refusal_text(verb, &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+        v::A_ARGV => { let issue = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0); let sha = args.get(2).map(String::as_str).unwrap_or(""); let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
+            if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::CLAIM_PREF, issue)); say(v::TV_CLAIM, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_BEAT => { let host = leak(args.get(1).cloned().unwrap_or("localhost".to_string())); let build: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ver = leak(std::env::var("T27_VER").unwrap_or("0.1.0".into())); let tc = leak(std::env::var("T27_TC").unwrap_or("0.5.2".into()));
+            let m = v::beat_msg(&mut buf, 4096, host.as_bytes(), build, ver.as_bytes(), tc.as_bytes()); let msg = String::from_utf8_lossy(&buf[..m]).into_owned();
+            let n = v::beat_commit_argv(&mut buf, 4096, msg.as_bytes()); let (x, sha) = run(&buf[..n], true); if x != 0 { eprintln!("trigit beat: commit-tree exit {x}: {sha}"); return Ok(x); }
+            let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
+            let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
+            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
+            println!("{}", String::from_utf8_lossy(&buf[..n])); }
+        v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
+            if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
+            let (x, o) = run(&buf[..n], false); if o.is_empty() && x == 0 { println!("no verdict for {key}"); } else { println!("{}", o.trim()); } println!("{}", v::verdict_where()); }
+        v::A_GOLDEN => return cmd_golden("land", false, None, 0),
+        _ => { let n = v::usage_text(&mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
+    }
+    Ok(0)
 }
 
 /// `tri t27os release --plan` | `manifest` | `publish --yes` (#11315, #11403): the texts are specs/t27os/release.t27.

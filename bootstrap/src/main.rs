@@ -76,6 +76,13 @@ use corpus_receipt as cr;
 #[path = "../gen/rust/verified/ddc_receipt.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod ddc_receipt;
+// #10457: specs/verified/gen_file_check.t27 (seal --verify) and specs/compiler/compile_output.t27 (compile).
+#[path = "../gen/rust/verified/gen_file_check.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod gen_file_check;
+#[path = "../gen/rust/compiler/compile_output.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod compile_output;
 fn cr_sha(parts: &[&[u8]]) -> [u8; 32] { use sha2::Digest; parts.iter().fold(sha2::Sha256::new(), |h, p| h.chain_update(p)).finalize().into() }
 fn cr_root(l: &[String]) -> [u8; 32] { let k = cr::split_point(l.len() as u32) as usize;
     if l.len() < 2 { l.first().map_or(cr_sha(&[]), |x| cr_sha(&[&[cr::LEAF_PREFIX], x.as_bytes()])) } else { cr_sha(&[&[cr::NODE_PREFIX], &cr_root(&l[..k]), &cr_root(&l[k..])]) } }
@@ -4658,7 +4665,8 @@ fn gated_backend(
     }
 }
 
-fn run_gen(input_path: &str) -> anyhow::Result<()> {
+/// What gen, gen-c and gen-rust emit (W584: `use` resolution is backend-agnostic) and seal --verify reads.
+fn gen_resolved(input_path: &str, compile: fn(&str) -> Result<String, String>) -> anyhow::Result<String> {
     let path = Path::new(input_path);
     let raw = fs::read_to_string(path)?;
     typecheck_gate(path, &raw)?;
@@ -4674,9 +4682,9 @@ fn run_gen(input_path: &str) -> anyhow::Result<()> {
     for note in use_resolve::unresolved_notes(&resolved) {
         eprintln!("{}", note);
     }
-    let zig_code = match compiler::Compiler::compile(&resolved) {
+    let code = match compile(&resolved) {
         Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile(&raw) {
+        Err(spliced_err) => match compile(&raw) {
             Ok(code) => {
                 // The splice is discarded here and the unresolved source used
                 // instead. Without this line that is invisible: the command
@@ -4690,7 +4698,11 @@ fn run_gen(input_path: &str) -> anyhow::Result<()> {
             Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
         },
     };
-    print!("{}", zig_code);
+    Ok(code)
+}
+
+fn run_gen(input_path: &str) -> anyhow::Result<()> {
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile)?);
     Ok(())
 }
 
@@ -5500,64 +5512,12 @@ fn run_gen_testbench(input_path: &str, period_ns: u32, max_cycles: u32, output: 
 }
 
 fn run_gen_c(input_path: &str) -> anyhow::Result<()> {
-    let path = Path::new(input_path);
-    let raw = fs::read_to_string(path)?;
-    typecheck_gate(path, &raw)?;
-    // W584: `use` resolution is a source-to-source pass (W569), so it is
-    // backend-agnostic -- only `gen` was calling it, which is why the C headers
-    // failed on types declared in modules they import. Same safety contract:
-    // if the spliced source stops compiling, the original is used.
-    let resolved = use_resolve::resolve(path, &raw);
-    for note in use_resolve::unresolved_notes(&resolved) {
-        eprintln!("{}", note);
-    }
-    let c_code = match compiler::Compiler::compile_c(&resolved) {
-        Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile_c(&raw) {
-            Ok(code) => {
-                // The splice is discarded here and the unresolved source used
-                // instead. Without this line that is invisible: the command
-                // succeeds, and every import it resolved is silently gone.
-                eprintln!(
-                    "note: spliced source did not compile, falling back to the \
-            unresolved original -- imported declarations are NOT in this output"
-                );
-                code
-            }
-            Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
-        },
-    };
-    print!("{}", c_code);
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile_c)?);
     Ok(())
 }
 
 fn run_gen_rust(input_path: &str) -> anyhow::Result<()> {
-    let path = Path::new(input_path);
-    let raw = fs::read_to_string(path)?;
-    typecheck_gate(path, &raw)?;
-    // W584: same as gen-c -- `use` resolution is backend-agnostic and only
-    // `gen` was calling it.
-    let resolved = use_resolve::resolve(path, &raw);
-    for note in use_resolve::unresolved_notes(&resolved) {
-        eprintln!("{}", note);
-    }
-    let rust_code = match compiler::Compiler::compile_rust(&resolved) {
-        Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile_rust(&raw) {
-            Ok(code) => {
-                // The splice is discarded here and the unresolved source used
-                // instead. Without this line that is invisible: the command
-                // succeeds, and every import it resolved is silently gone.
-                eprintln!(
-                    "note: spliced source did not compile, falling back to the \
-            unresolved original -- imported declarations are NOT in this output"
-                );
-                code
-            }
-            Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
-        },
-    };
-    print!("{}", rust_code);
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile_rust)?);
     Ok(())
 }
 
@@ -6002,10 +5962,23 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
             std::process::exit(1);
         }
 
-        if all_match {
+        // specs/verified/gen_file_check.t27: a committed gen file is what its generator emits today.
+        // gen/json is not read yet: gen-json renders a spec-specific shape, with no in-memory producer.
+        let (rel, h) = (hashes.spec_path.trim_start_matches("specs/").trim_end_matches(".t27"), |b: &[u8]| u64::from_str_radix(&sha256_hex(b)[..16], 16).unwrap_or(0));
+        let check = |file: String, made: Option<&str>| {
+            let read = fs::read(&file);
+            let code = gen_file_check::gen_file_check(Path::new(&file).exists(), read.is_ok(), read.as_deref().map_or(0, h), made.is_some(), made.map_or(0, |m| h(m.as_bytes())));
+            if !gen_file_check::gen_file_passes(code) { println!("{}: {}", file, ["", "", "DRIFT (not what its generator emits today)", "UNREADABLE", "ORPHAN (its backend no longer generates this spec)"][code as usize]); }
+            code
+        };
+        let rust = gen_resolved(input_path, compiler::Compiler::compile_rust).ok();
+        let (r1, r2) = (check(format!("bootstrap/gen/rust/{rel}.rs"), rust.as_deref()), check(format!("gen/rust/{rel}.rs"), rust.as_deref()));
+        let c = check(format!("gen/c/{rel}.c"), gen_resolved(input_path, compiler::Compiler::compile_c).ok().as_deref());
+        let v = check(format!("gen/verilog/{rel}.v"), compiler::Compiler::compile_verilog_at_reporting(&fs::read_to_string(input_path)?, Path::new(input_path)).ok().map(|r| r.0).as_deref());
+        if gen_file_check::verify_passes(all_match, if gen_file_check::gen_file_passes(r1) { r2 } else { r1 }, c, v, gen_file_check::GEN_ABSENT) {
             println!("\nall hashes MATCH");
         } else {
-            println!("\nVERIFICATION FAILED — hashes differ from saved seal");
+            println!("\nVERIFICATION FAILED — {}", if all_match { "a committed gen file is not its generator's output" } else { "hashes differ from saved seal" });
             std::process::exit(1);
         }
     } else if save {
@@ -6272,6 +6245,13 @@ fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow:
         }
     };
 
+    // specs/compiler/compile_output.t27: never the spec itself, never a hand-written file unless -o names it.
+    let existing = fs::read(&out_path);
+    let marker = existing.as_deref().map_or(0, |b| String::from_utf8_lossy(b).lines().position(|l| l.contains("generated by t27c")).map_or(0, |i| i as u32 + 1));
+    match compile_output::output_check(fs::canonicalize(&out_path).ok() == fs::canonicalize(path).ok(), out_path.exists(), existing.is_ok(), marker, output.is_some()) {
+        compile_output::OUT_WRITE => {}
+        r => anyhow::bail!("refusing to write {}: {}", out_path.display(), ["", "it has no \"generated by t27c\" header; name it with -o to replace it", "it cannot be read", "it is the input spec"][r as usize]),
+    }
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }

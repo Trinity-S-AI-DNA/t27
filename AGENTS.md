@@ -456,6 +456,44 @@ Every spec is a running cost: a seal, a ledger row, CI minutes on every pull req
 - **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
 - **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
 
+## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
+
+Owner, 2026-10-22: trigit is the standard, and the swarm uses it to go faster.
+trigit is our own git -- the golden chain, the swarm refs and notes, and the
+trigit verbs -- while GitHub is a mirror and a window, not the truth (name and
+principle, owner 2026-10-20, epic #11385). Every spec, skill, doc and UI calls
+it trigit.
+
+- **How work lands now (the accelerating path; use it):** verify locally, land
+  on the local golden head `refs/golden/head` by compare-and-swap, reach GitHub
+  as one batch PR per 15-minute window. The law is `specs/queen/golden_chain.t27`
+  section 6; the operating manual is `.claude/skills/own-git-landing/SKILL.md`;
+  the verbs are `tri golden land | push | status`, hosted by
+  `specs/tri/land/golden_land.t27`. Read those; this section does not restate them.
+- **Why it accelerates:** a plain push restarts every required check at the back
+  of an Actions queue of 800-900 runs (#10644, #10588, #6595). trigit judges a
+  change by its verdicts locally and talks to GitHub once per batch, not once
+  per push.
+- **Running today (measured 2026-10-22):** the golden chain and its batch push;
+  the verdict cache in `refs/notes/verdicts` (`specs/verified/verdict_notes.t27`);
+  heartbeats and claims as refs (`refs/swarm/alive/*`, `refs/swarm/claims/*`,
+  written by `specs/t27os/devices.t27`); the T27 OS readers (`statusbar.t27`,
+  `queen_dash.t27` `trigit.txt`, `glass_window.t27` flow strip); `tri worktrees`
+  for what a checkout holds.
+- **The gaps, named so nobody mistakes the standard for the whole:** the
+  one-command `trigit claim|hold|release|beat|send|recv|join|board|verdict|status`
+  verbs and their TRI CLAW MCP twins (#11385 items 24-26); holds as refs (item 7,
+  today disk-based); the mailbox and event refs (items 9-10); the own remote, so
+  swarm refs stop riding on GitHub (Layer 0); rerere, co-change prediction,
+  speculative lanes, auto-bisect, range-diff review (P2); the `.t27` git core and
+  the hardware spikes (P3). Epic #11385 is closed; a gap found under it is filed
+  as a Queen-shaped child issue, never papered over with a second coordination
+  channel (no new `setInterval`, no second registry).
+- **Acceleration is the reason every rule above exists:** trigit was built to
+  remove waiting -- 190 tasks blocked by whole-file holds, a personal token
+  throttled to about 5 minutes per call, 135 PRs queued for CI (#11385). Do not
+  reintroduce a per-push or per-comment coordination path it already replaced.
+
 ## Actors, not threads (owner rule, 2026-10-08)
 
 Owner's rule, 2026-10-08: the Queen and the swarm move to the actor model.
