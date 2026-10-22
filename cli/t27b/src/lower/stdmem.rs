@@ -1,22 +1,24 @@
-//! Two `std.mem` calls on strings, as t27c's Zig backend prints them
+//! `std.mem` calls on strings, as t27c's Zig backend prints them
 //! (verbatim) and Zig 0.16 computes them:
 //!
 //! - `std.mem.eql(u8, a, b)`: equal lengths and equal bytes, exactly `a == b`
 //!   on two `str` values (two literals fold; otherwise `__t27b_str_eql`);
-//! - `std.mem.indexOf(u8, hay, needle) == null` / `!= null`: whether
-//!   `needle` occurs in `hay` (`std.mem.find`: a longer needle is never
-//!   found, an empty one always is, at 0), through the synthesized
-//!   `__t27b_str_contains`. The index itself (a `?usize` used any other
-//!   way) stays refused as `ExprCall(std.*)`.
+//! - `std.mem.indexOf(u8, hay, needle)`: the `?usize` index of the first
+//!   occurrence, null when there is none -- compared with `null` as any
+//!   optional is;
+//! - `std.mem.trim` / `std.mem.indexOfScalar` / `std.math.approxEqAbs` (with
+//!   `std.mem.indexOf` above): each a call of its routine from
+//!   specs/tri/t27b/stdmem.t27, spliced under t27b's reserved prefix, so the
+//!   bytes are Zig's own std's; stdmem_plan.t27 decides what runs and what
+//!   stays refused (#8965).
 //!
 //! The element type must be the identifier `u8`, and both slices `str`
-//! (`[]const u8`); anything else stays refused.
+//! (`[]const u8`), or bytes in a buffer that Zig coerces to one: a `[]u8`
+//! (`buf[a:b]`) or a `*[N]u8` (`&buf`). Anything else stays refused.
 
-use super::{LTy, Lower, Val, R, STR_EQL};
+use super::{is_agg, sm, LTy, Lower, Place, Val, R, STR_EQL};
 use crate::compiler::{Node, NodeKind};
 use crate::ir::*;
-
-pub const STR_CONTAINS: &str = "__t27b_str_contains";
 
 impl<'a> Lower<'a> {
     /// `std.mem.eql(u8, a, b)` as a value; None for any other call.
@@ -28,24 +30,29 @@ impl<'a> Lower<'a> {
         self.str_eq(false, a, b).map(Some)
     }
 
-    /// `std.mem.indexOf(u8, hay, needle)` compared with `null` (`op` is
-    /// `==` or `!=`); None when `c` is not that call.
-    pub(super) fn index_of_null(&mut self, op: &str, c: &Node) -> R<Option<Val>> {
-        if c.kind != NodeKind::ExprCall || c.name != "std.mem.indexOf" {
-            return Ok(None);
+    /// A builtin of stdmem_plan.t27 (`std.mem.trim`, `std.mem.indexOfScalar`,
+    /// `std.mem.indexOf`, `std.math.approxEqAbs`): a call of its routine from
+    /// stdmem.t27, spliced under the reserved prefix, so the bytes are Zig
+    /// 0.16's own std's (#8965). The plan weighs the arity and the element /
+    /// type operand; the routine's own parameters coerce the value operands.
+    pub(super) fn std_builtin_call(&mut self, n: &Node) -> R<Val> {
+        self.see(n);
+        let b = sm::BUILTINS.split(' ').position(|s| s == n.name).unwrap_or(0) as u8;
+        let t0 = |c: &Node| if c.kind == NodeKind::ExprIdentifier { match c.name.as_str() { "u8" => sm::K_U8, "f64" => sm::K_TYPE_F64, "f32" => sm::K_TYPE_F32, _ => sm::K_OTHER } } else { sm::K_OTHER };
+        let t = n.children.first().map_or(sm::K_OTHER, t0);
+        let a = sm::plan(b, n.children.len(), t);
+        if a != sm::CALL {
+            return self.reject(sm::what(b), format!("`{}`: {}", n.name, sm::detail(b, a)));
         }
-        self.see(c);
-        let (hay, needle) = self.u8_slices(c)?;
-        let mut args = Vec::new();
-        for v in [hay, needle] {
-            match self.coerce_to(v, &LTy::Str)? {
-                Val::M(p) => args.push(super::addr_of(&p)),
-                _ => return Err(()),
-            }
+        // The call node under the routine's spliced name, the type operand dropped.
+        let mut inner = n.clone();
+        inner.name = sm::routine(b).to_string();
+        inner.children.remove(0);
+        match self.call(&inner, None)? {
+            (call, Some(ty), temp) if is_agg(&ty) => Ok(Val::M(Place { addr: call, off: 0, ty, mutable: false, temp })),
+            (call, Some(_), _) => Ok(Val::E(call)),
+            _ => Err(()), // the routine returns a str, an optional or a bool by its own declaration
         }
-        self.contains_used = true;
-        let found = Expr { ty: Ty::Bool, kind: ExprKind::Call { func: self.nfuncs + 1, args } };
-        Ok(Some(Val::E(if op == "==" { Expr { ty: Ty::Bool, kind: ExprKind::Not(Box::new(found)) } } else { found })))
     }
 
     /// The two `str` operands of `std.mem.<f>(u8, x, y)`.
@@ -56,6 +63,7 @@ impl<'a> Lower<'a> {
             return self.reject("ExprCall(std.*)", format!("call to `{}` other than (u8, str, str)", c.name));
         }
         let (x, y) = (self.expr(&a[1])?, self.expr(&a[2])?);
+        let (x, y) = (self.bytes_as_str(x)?, self.bytes_as_str(y)?);
         for v in [&x, &y] {
             if !self.is_str(v) {
                 let d = self.val_desc(v);
@@ -65,100 +73,31 @@ impl<'a> Lower<'a> {
         Ok((x, y))
     }
 
-    /// The fns lowering synthesizes, after the source fns (ids `nfuncs`
-    /// and `nfuncs + 1`): `__t27b_str_eql` when either is used (the second
-    /// id needs the first taken), `__t27b_str_contains` when it is.
+    /// Bytes in a buffer read as a string, as Zig coerces them to
+    /// `[]const u8`: a `[]u8` (`buf[a:b]` of a `var buf: [N]u8`) or a
+    /// `*[N]u8` (`&buf`). Any other value is returned unchanged.
+    fn bytes_as_str(&mut self, v: Val) -> R<Val> {
+        let u8_ty = LTy::S(Ty::U8);
+        let bytes = match &v {
+            Val::M(p) => matches!(&p.ty, LTy::Slice(t, true) if **t == u8_ty),
+            Val::P(_, LTy::Ptr(inner, _)) => matches!(&**inner, LTy::Arr(t, _) if **t == u8_ty),
+            _ => false,
+        };
+        if bytes {
+            self.coerce_to(v, &LTy::Str)
+        } else {
+            Ok(v)
+        }
+    }
+
+    /// The fn lowering synthesizes, after the source fns (id `nfuncs`):
+    /// `__t27b_str_eql` when either comparison uses it.
     pub(super) fn synthesized(&mut self, funcs: &mut Vec<Func>) {
-        if self.eql_used || self.contains_used {
+        if self.eql_used {
             // Source fns are ids 0..nfuncs and come first in `funcs`, in order.
             let site = self.site(TrapKind::NoReturn, format!("end of fn {}", STR_EQL), Ty::Bool);
             funcs.insert(self.nfuncs as usize, super::str_eql_func(site));
             self.internal_abi.push(self.nfuncs);
         }
-        if self.contains_used {
-            let site = self.site(TrapKind::NoReturn, format!("end of fn {}", STR_CONTAINS), Ty::Bool);
-            funcs.insert(self.nfuncs as usize + 1, str_contains_func(site));
-            self.internal_abi.push(self.nfuncs + 1);
-        }
-    }
-}
-
-/// `__t27b_str_contains(hay: *const str, needle: *const str) bool`:
-/// `std.mem.indexOf(u8, hay, needle) != null`.
-fn str_contains_func(noreturn_site: SiteId) -> Func {
-    let var = |id: VarId| Expr { ty: Ty::U64, kind: ExprKind::Var(id) };
-    let cnst = |ty: Ty, v: i128| Expr { ty, kind: ExprKind::Const(v) };
-    let load = |addr: Expr, off: u32, ty: Ty| Expr { ty, kind: ExprKind::Load { addr: Box::new(addr), off } };
-    let cmp = |op: CmpOp, a: Expr, b: Expr| Expr { ty: Ty::Bool, kind: ExprKind::Cmp { op, lhs: Box::new(a), rhs: Box::new(b) } };
-    // Indices never wrap: i <= hn - nn and j < nn, so i + j < hn.
-    let add = |a: Expr, b: Expr| Expr {
-        ty: Ty::U64,
-        kind: ExprKind::Arith { op: ArithOp::AddW, lhs: Box::new(a), rhs: Box::new(b), site: 0 },
-    };
-    let sub = |a: Expr, b: Expr| Expr {
-        ty: Ty::U64,
-        kind: ExprKind::Arith { op: ArithOp::SubW, lhs: Box::new(a), rhs: Box::new(b), site: 0 },
-    };
-    let ptr = |id: VarId| Expr { ty: Ty::Ptr, kind: ExprKind::Var(id) };
-    let byte = |s: VarId, idx: Expr| {
-        let base = load(ptr(s), 0, Ty::Ptr);
-        load(Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(base), idx: Box::new(idx), scale: 1 } }, 0, Ty::U8)
-    };
-    let (h, nd, hn, nn, i, j, end) = (0, 1, 2, 3, 4, 5, 6);
-    let inner = Stmt::While {
-        cond: cmp(CmpOp::Lt, var(j), var(nn)),
-        body: vec![Stmt::If {
-            cond: cmp(CmpOp::Ne, byte(h, add(var(i), var(j))), byte(nd, var(j))),
-            then: vec![Stmt::Break],
-            els: vec![],
-        }],
-        step: vec![Stmt::Assign { var: j, value: add(var(j), cnst(Ty::U64, 1)) }],
-    };
-    let body = vec![
-        Stmt::Assign { var: hn, value: load(ptr(h), 8, Ty::U64) },
-        Stmt::Assign { var: nn, value: load(ptr(nd), 8, Ty::U64) },
-        Stmt::If {
-            cond: cmp(CmpOp::Gt, var(nn), var(hn)),
-            then: vec![Stmt::Return(Some(cnst(Ty::Bool, 0)))],
-            els: vec![],
-        },
-        Stmt::Assign { var: end, value: sub(var(hn), var(nn)) },
-        Stmt::Assign { var: i, value: cnst(Ty::U64, 0) },
-        Stmt::While {
-            cond: cmp(CmpOp::Le, var(i), var(end)),
-            body: vec![
-                Stmt::Assign { var: j, value: cnst(Ty::U64, 0) },
-                inner,
-                Stmt::If {
-                    cond: cmp(CmpOp::Eq, var(j), var(nn)),
-                    then: vec![Stmt::Return(Some(cnst(Ty::Bool, 1)))],
-                    els: vec![],
-                },
-            ],
-            // A string's length is far below 2^64 - 1, so i + 1 cannot wrap.
-            step: vec![Stmt::Assign { var: i, value: add(var(i), cnst(Ty::U64, 1)) }],
-        },
-        Stmt::Return(Some(cnst(Ty::Bool, 0))),
-    ];
-    let v = |name: &str, ty: Ty| Var { name: name.to_string(), ty };
-    Func {
-        name: STR_CONTAINS.to_string(),
-        nparams: 2,
-        ret: Some(Ty::Bool),
-        vars: vec![
-            v("hay", Ty::Ptr),
-            v("needle", Ty::Ptr),
-            v("hn", Ty::U64),
-            v("nn", Ty::U64),
-            v("i", Ty::U64),
-            v("j", Ty::U64),
-            v("end", Ty::U64),
-        ],
-        body,
-        line: 0,
-        is_test: false,
-        is_invariant: false,
-        noreturn_site,
-        slots: Vec::new(),
     }
 }

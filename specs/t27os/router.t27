@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS router (M12 stage 2, DESIGN + DECISIONS ONLY): the local Anthropic-compatible endpoint a claude
+// pane can point ANTHROPIC_BASE_URL at, so one pane survives the death of one provider. Stage 1 (keys.t27
+// PROFILE) picks ONE provider per pane at spawn; this router picks per REQUEST and walks the chain.
+//
+// Shape (nothing below is wired yet; each box is a later spec):
+//   claude pane --POST /v1/messages--> 127.0.0.1:ROUTER_PORT (this module's decisions)
+//        walk the chain: zai -> kie -> nemotron -> ollama   (order: specs/automation/agent-provider-chain.t27
+//        ORDER_DEFAULT "zai,kie,zai-lite,nemotron,reserve,ollama"; restated here because that spec uses the
+//        brace module syntax and cannot be `use`d; zai-lite and reserve join when they have a key path)
+//        a route whose protocol is not Anthropic's goes through specs/provider/transform.t27 (request) and
+//        specs/provider/stream.t27 (response); an Anthropic-protocol route (z.ai) passes through untouched.
+//   failover on 429 / 529 / 402 / transport failure / 5xx: next route, same request, same pane.
+//
+// What t27b must offer, and what is checked (t27c gap, issue-shaped if missing):
+//   - sockets: AF_INET + bind + listen + accept. pty_server.t27 already does AF_UNIX bind/listen/accept
+//     through pty_sys.t27, so only the sockaddr_in layout (family, port, 127.0.0.1) is new.
+//   - an outbound HTTPS client with a streaming body. keys_probe.t27 uses NSURLConnection synchronously, which
+//     covers a non-streaming probe; a streamed /v1/messages reply needs NSURLSession or a raw TLS socket.
+//     That is the real gap. Until it is closed the router cannot stream, and stage 2 stops at these decisions.
+//   - the app.t27.ai route (the user's server-side keys, no secret on this Mac) is a second upstream of the
+//     same walk: it is route R_QUEEN below, first in the order once a usable proxy endpoint exists.
+//
+// Refs gHashTag/t27#10782.
+module T27osRouter;
+
+use t27os::session_store::csv_field;
+
+pub const R_QUEEN : u32 = 0;
+pub const R_ZAI : u32 = 1;
+pub const R_KIE : u32 = 2;
+pub const R_NEMOTRON : u32 = 3;
+pub const R_OLLAMA : u32 = 4;
+pub const R_NONE : u32 = 255;
+pub const ROUTE_COUNT : u32 = 5;
+pub const ROUTE_NAMES : str = "queen,zai,kie,nemotron,ollama";
+/// 1 = the upstream already speaks the Anthropic protocol; 0 = a request goes through transform.t27 first.
+pub const ROUTE_ANTHROPIC : [5]u32 = [1, 1, 0, 0, 0];
+pub const ROUTER_PORT : u32 = 47127;
+pub const ROUTER_BIND : str = "127.0.0.1";
+
+/// What to do with an upstream answer.
+pub const A_DONE : u32 = 0;
+pub const A_NEXT : u32 = 1;
+pub const A_NEXT_BAD : u32 = 2;
+pub const A_RETURN : u32 = 3;
+
+/// 2xx ends the walk. Rate limited, overloaded, payment required, a server error or no answer at all
+/// (http 0) moves to the next route. 401/403 also moves on and marks the key bad (the window withholds it).
+/// Any other 4xx is the caller's own mistake: it goes back unchanged, another provider would say the same.
+pub fn answer_action(http: u32) -> u32 {
+    if (http >= 200 and http < 300) { return A_DONE; }
+    if (http == 0 or http == 402 or http == 429 or http == 529) { return A_NEXT; }
+    if (http >= 500) { return A_NEXT; }
+    if (http == 401 or http == 403) { return A_NEXT_BAD; }
+    return A_RETURN;
+}
+
+/// The next route to try: lowest route not yet tried and in the available mask; R_NONE when the walk is over.
+pub fn next_route(tried: u32, avail: u32) -> u32 {
+    var r : u32 = 0;
+    while (r < ROUTE_COUNT) {
+        if ((avail >> r) % 2 == 1 and (tried >> r) % 2 == 0) { return r; }
+        r = r + 1;
+    }
+    return R_NONE;
+}
+
+pub fn needs_transform(r: u32) -> bool {
+    if (r >= ROUTE_COUNT) { return false; }
+    return ROUTE_ANTHROPIC[r] == 0;
+}
+
+/// Does the router serve this request line? Only POST /v1/messages (the model call); everything else, count
+/// tokens included, is refused with 404 so a pane never gets a half-working endpoint.
+pub fn serves(is_post: bool, path_is_messages: bool) -> bool {
+    return is_post and path_is_messages;
+}
+
+pub fn route_name(r: u32, out: []u8) -> usize {
+    return csv_field(ROUTE_NAMES, r, out);
+}
+
+test a_good_answer_ends_the_walk_and_a_throttled_one_moves_on {
+    assert answer_action(200) == A_DONE;
+    assert answer_action(204) == A_DONE;
+    assert answer_action(429) == A_NEXT;
+    assert answer_action(529) == A_NEXT;
+    assert answer_action(402) == A_NEXT;
+    assert answer_action(0) == A_NEXT;
+    assert answer_action(500) == A_NEXT;
+    assert answer_action(503) == A_NEXT;
+}
+
+test a_rejected_login_moves_on_and_marks_the_key {
+    assert answer_action(401) == A_NEXT_BAD;
+    assert answer_action(403) == A_NEXT_BAD;
+}
+
+test the_callers_own_mistake_goes_back_unchanged {
+    assert answer_action(400) == A_RETURN;
+    assert answer_action(404) == A_RETURN;
+    assert answer_action(413) == A_RETURN;
+    assert answer_action(422) == A_RETURN;
+}
+
+test the_walk_visits_each_available_route_once_in_order {
+    assert next_route(0, 30) == R_ZAI;
+    assert next_route(2, 30) == R_KIE;
+    assert next_route(6, 30) == R_NEMOTRON;
+    assert next_route(14, 30) == R_OLLAMA;
+    assert next_route(30, 30) == R_NONE;
+    assert next_route(0, 0) == R_NONE;
+}
+
+test the_queen_route_goes_first_when_it_exists {
+    assert next_route(0, 31) == R_QUEEN;
+    assert next_route(1, 31) == R_ZAI;
+}
+
+test only_the_anthropic_routes_skip_the_transform {
+    assert needs_transform(R_QUEEN) == false;
+    assert needs_transform(R_ZAI) == false;
+    assert needs_transform(R_KIE);
+    assert needs_transform(R_NEMOTRON);
+    assert needs_transform(R_OLLAMA);
+    assert needs_transform(R_NONE) == false;
+}
+
+test the_router_serves_one_request_shape {
+    assert serves(true, true);
+    assert serves(true, false) == false;
+    assert serves(false, true) == false;
+    assert ROUTER_PORT > 1024;
+}

@@ -1,0 +1,629 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/pbr_sphere.t27 -- a polished sphere lit the way a product studio lights one: a
+// microfacet metal or a glazed dielectric, mirroring an analytic set of softboxes, its neighbours
+// and the floor's horizon, smeared by the camera's shutter.
+//
+// WHY: the owner, 2026-10-18, on the token_floor reel: the balls do not look real; study the best
+// practice of 3D modelling and bring it into t27f. The old shader was Lambert plus a Blinn
+// highlight plus a rim: a plastic look, because a real gold ball has almost no diffuse light at
+// all. Everything it shows is a reflection, tinted by gold's own Fresnel colour, and what makes it
+// read as real is WHAT it reflects: crisp rectangular softboxes, a dark room, the bright line where
+// the floor meets the backdrop, and the balls next to it. This module is that practice, as used in
+// physically based renderers (B. Karis, "Real Shading in Unreal Engine 4", SIGGRAPH 2013):
+//
+//     the lobe     GGX / Trowbridge-Reitz microfacets, alpha = roughness^2 (B. Walter et al., EGSR
+//                  2007; B. Burley, SIGGRAPH 2012). The lobe's half-width softens every edge the
+//                  sphere mirrors: a rough ball blurs the softbox, a polished one keeps it sharp.
+//     Fresnel      Schlick's approximation with a coloured F0 for a metal (C. Schlick, CGF 13, 1994).
+//                  Gold's F0 is (1.00, 0.71, 0.29) linear (N. Hoffman, "Physics and Math of
+//                  Shading", SIGGRAPH 2015 course): blue is mostly absorbed, so gold mirrors in gold.
+//                  Glaze is a dielectric, F0 0.04, and its reflections stay white.
+//     split sum    the light a lobe gathers is the environment, prefiltered to the lobe's width,
+//                  times a scale and bias on F0 that integrate the BRDF (Karis's analytic fit,
+//                  "Physically Based Shading on Mobile", 2014).
+//     the studio   four rectangular area lights and a horizon, analytic in the reflection
+//                  direction, so the reflection is exact and costs nothing to look up.
+//     neighbours   a reflected ray that strikes the ball above or below sees that ball, mirrored
+//                  once more: the stacked-balls look of every gold-sphere product shot.
+//     occlusion    a touching sphere hides the sky from the contact (I. Quilez's analytic sphere
+//                  occlusion): the dark ring between two balls.
+//     the shutter  a ball falling 6 m/s moves 100 px in half a frame. A camera with a 180 degree
+//                  shutter sees the time-average of the disk, not a sharp disk: swept_cover is that
+//                  average, exactly, for a disk sliding along a line.
+//
+// The frame is the screen's: x right, y DOWN, z toward the camera. The camera is orthographic, so
+// the view vector is (0, 0, 1) everywhere and a point on a unit sphere is its own normal.
+//
+// NOT CLAIMED: the light rig, the roughnesses and the glaze colour are design choices. The rig is
+// not measured from any studio; it is the classic three-plus-one (key, rim strip, top, fill).
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module pbr_sphere;
+
+pub const ID : str = "pbr-sphere";
+pub const PI : f64 = 3.141592653589793;
+
+// ---- materials ----
+// Gold's reflectance at normal incidence, linear r g b (Hoffman 2015).
+pub const GOLD_F0 : [3]f64 = [1.0, 0.71, 0.29];
+pub const GOLD_ROUGH : f64 = 0.24;          // polished, not mirror: the softbox edge stays crisp
+// A white glazed ceramic: a dielectric, F0 4 percent, with a slightly cool body.
+pub const GLAZE_F0 : f64 = 0.04;
+pub const GLAZE_ALBEDO : [3]f64 = [0.80, 0.81, 0.84];
+pub const GLAZE_ROUGH : f64 = 0.18;
+
+// ---- the studio (design choices) ----
+// Each light: its axis c (unit, the direction a reflected ray must point to see its centre), its
+// half-size along u and v in the tangent plane at distance 1, and its radiance r g b. u is
+// horizontal, c x Y normalised; v = u x c.
+pub const LIGHTS : usize = 4;
+pub const LIGHT : [36]f64 = [
+    // key: a tall softbox up-left, in front, a little warm
+    -0.55, -0.55, 0.62849, 0.42, 0.62, 5.0, 4.8, 4.5, 0.0,
+    // rim: a narrow strip behind-right, cool
+    0.80, -0.20, -0.565685, 0.10, 1.60, 2.6, 2.9, 3.2, 0.0,
+    // top: a wide overhead panel, tipped toward the camera
+    0.0, -0.939693, 0.342020, 0.90, 0.50, 1.35, 1.35, 1.35, 0.0,
+    // fill: a dim card low on the left, warm
+    -0.92, 0.10, 0.378946, 0.25, 0.50, 0.70, 0.64, 0.57, 0.0
+];
+pub const HOT : f64 = 0.25;                 // a softbox is hotter in its centre by this share
+// The room: black above, the glossy black floor below, and the bright line where they meet.
+pub const SKY : f64 = 0.012;
+pub const HZ_GLOW : f64 = 0.10;
+pub const HZ_UP : f64 = 0.14;               // how far up the horizon's glow reaches, in ry
+pub const FLOOR_L : f64 = 0.008;
+pub const FLOOR_LINE : f64 = 0.38;
+pub const HZ_DN : f64 = 0.035;              // the floor's line is thin
+pub const ROOM_TINT : [3]f64 = [1.0, 0.93, 0.84];
+pub const EDGE : f64 = 2.0;                 // a mirrored edge blurs over the lobe on both sides
+pub const NO_NB : f64 = 1000000.0;           // no neighbour
+
+pub const SHUTTER : f64 = 0.5;              // 180 degrees: the shutter is open half of each frame
+
+// ---- small helpers ----
+
+pub fn clamp01(x: f64) -> f64 {
+    if (x < 0.0) { return 0.0; }
+    if (x > 1.0) { return 1.0; }
+    return x;
+}
+
+// Hermite smoothstep from e0 to e1 (e0 > e1 runs it backwards).
+fn sstep(e0: f64, e1: f64, x: f64) -> f64 {
+    const t = clamp01((x - e0) / (e1 - e0));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn pow5(x: f64) -> f64 {
+    const x2 = x * x;
+    return x2 * x2 * x;
+}
+
+// arcsin by its series, accurate to 1e-4 below 0.5, which is all the rig needs.
+fn asin_small(x: f64) -> f64 {
+    const x2 = x * x;
+    return x * (1.0 + x2 * (1.0 / 6.0 + x2 * (3.0 / 40.0 + x2 * (5.0 / 112.0 + x2 * 35.0 / 1152.0))));
+}
+
+// ---- the microfacet lobe ----
+
+pub fn alpha_of(rough: f64) -> f64 {
+    return rough * rough;
+}
+
+// GGX: the density of microfacet normals at cos(theta_h) = noh.
+pub fn ggx_d(noh: f64, alpha: f64) -> f64 {
+    const a2 = alpha * alpha;
+    const t = noh * noh * (a2 - 1.0) + 1.0;
+    return a2 / (PI * t * t);
+}
+
+// The projected area of the lobe over the hemisphere, by the midpoint rule in s = sin^2(theta_h):
+// d(omega) cos = pi ds, so the integral is pi * sum D ds. A true distribution gives 1.
+fn ggx_projected(alpha: f64, n: i64) -> f64 {
+    const ds = 1.0 / @as(f64, @floatFromInt(n));
+    var sum : f64 = 0.0;
+    var i : i64 = 0;
+    while (i < n) {
+        const s = (@as(f64, @floatFromInt(i)) + 0.5) * ds;
+        sum = sum + ggx_d(@sqrt(1.0 - s), alpha);
+        i = i + 1;
+    }
+    return PI * sum * ds;
+}
+
+// sin of the half-angle at which D falls to half its peak: D(mu) = D(1) / 2 solved in closed form,
+// sin^2 = (sqrt 2 - 1) a^2 / (1 - a^2). A mirrored direction turns twice the half-vector's angle.
+pub fn lobe_sin(alpha: f64) -> f64 {
+    const a2 = alpha * alpha;
+    return @sqrt((1.4142135623730951 - 1.0) * a2 / (1.0 - a2));
+}
+
+pub fn blur_width(rough: f64) -> f64 {
+    return EDGE * lobe_sin(alpha_of(rough));
+}
+
+// ---- Fresnel and the split sum ----
+
+pub fn fresnel(f0: f64, c: f64) -> f64 {
+    return f0 + (1.0 - f0) * pow5(1.0 - clamp01(c));
+}
+
+// Karis's analytic fit of the integrated BRDF: the share of F0 (env_a) and the bias (env_b) that a
+// lobe of this roughness returns at this viewing cosine.
+fn env_r(rough: f64, k: i64) -> f64 {
+    if (k == 0) { return 1.0 - rough; }
+    if (k == 1) { return 0.0425 - 0.0275 * rough; }
+    if (k == 2) { return 1.04 - 0.572 * rough; }
+    return 0.022 * rough - 0.04;
+}
+
+fn env_a004(rough: f64, nov: f64) -> f64 {
+    const rx = env_r(rough, 0);
+    var m : f64 = rx * rx;
+    const e = @exp(0.0 - 9.28 * nov * 0.6931471805599453);
+    if (e < m) { m = e; }
+    return m * rx + env_r(rough, 1);
+}
+
+pub fn env_a(rough: f64, nov: f64) -> f64 {
+    var a : f64 = 0.0 - 1.04 * env_a004(rough, nov) + env_r(rough, 2);
+    if (a < 0.0) { a = 0.0; }
+    return a;
+}
+
+pub fn env_b(rough: f64, nov: f64) -> f64 {
+    var b : f64 = 1.04 * env_a004(rough, nov) + env_r(rough, 3);
+    if (b < 0.0) { b = 0.0; }
+    return b;
+}
+
+// What a lobe returns of the light it gathers, for reflectance f0; never more than all of it.
+pub fn spec_scale(f0: f64, rough: f64, nov: f64) -> f64 {
+    var s : f64 = f0 * env_a(rough, nov) + env_b(rough, nov);
+    if (s > 1.0) { s = 1.0; }
+    return s;
+}
+
+// ---- the studio ----
+
+fn lf(i: usize, f: usize) -> f64 {
+    return LIGHT[i * 9 + f];
+}
+
+// The solid angle of light i: a centred rectangle hu x hv at distance 1 subtends
+// 4 asin(hu hv / sqrt((1 + hu^2)(1 + hv^2))).
+pub fn light_omega(i: usize) -> f64 {
+    const hu = lf(i, 3);
+    const hv = lf(i, 4);
+    return 4.0 * asin_small(hu * hv / @sqrt((1.0 + hu * hu) * (1.0 + hv * hv)));
+}
+
+// How much of light i a reflected direction r sees, 0..1, its edges softened by w: r is projected
+// onto the light's tangent plane (gnomonic), and the rectangle is tested there.
+pub fn light_mask(i: usize, rx: f64, ry: f64, rz: f64, w: f64) -> f64 {
+    const cx = lf(i, 0);
+    const cy = lf(i, 1);
+    const cz = lf(i, 2);
+    const d = rx * cx + ry * cy + rz * cz;
+    if (d <= 0.05) {
+        return 0.0;
+    }
+    // u = c x Y / |c x Y| = (-cz, 0, cx) / sqrt(cz^2 + cx^2); v = u x c
+    const un = @sqrt(cz * cz + cx * cx);
+    const ux = 0.0 - cz / un;
+    const uz = cx / un;
+    const vx = 0.0 - uz * cy;
+    const vy = uz * cx - ux * cz;
+    const vz = ux * cy;
+    const a = (rx * ux + rz * uz) / d;
+    const b = (rx * vx + ry * vy + rz * vz) / d;
+    const hu = lf(i, 3);
+    const hv = lf(i, 4);
+    const m = sstep(hu + w, hu - w, @abs(a)) * sstep(hv + w, hv - w, @abs(b));
+    if (m <= 0.0) {
+        return 0.0;
+    }
+    const hot = 1.0 + HOT - 2.0 * HOT * clamp01((a * a / (hu * hu) + b * b / (hv * hv)) * 0.5);
+    return m * hot;
+}
+
+// The room's light in direction r: the black backdrop with a glow toward the horizon, the glossy
+// floor with a thin bright line under it. Both soften with the lobe's width w.
+fn room(ry: f64, w: f64) -> f64 {
+    if (ry < 0.0) {
+        return SKY + HZ_GLOW * @exp(ry / (HZ_UP + w));
+    }
+    return FLOOR_L + FLOOR_LINE * @exp(0.0 - ry / (HZ_DN + w)) * HZ_DN / (HZ_DN + w);
+}
+
+// The prefiltered studio seen in direction r through a lobe of edge width w, r g b into out.
+pub fn env(out: *[3]f64, rx: f64, ry: f64, rz: f64, w: f64) -> void {
+    const h = room(ry, w);
+    out[0] = h * ROOM_TINT[0];
+    out[1] = h * ROOM_TINT[1];
+    out[2] = h * ROOM_TINT[2];
+    var i : usize = 0;
+    while (i < LIGHTS) {
+        const m = light_mask(i, rx, ry, rz, w);
+        if (m > 0.0) {
+            out[0] = out[0] + m * lf(i, 5);
+            out[1] = out[1] + m * lf(i, 6);
+            out[2] = out[2] + m * lf(i, 7);
+        }
+        i = i + 1;
+    }
+}
+
+// The irradiance the rig sends a surface of normal n, over pi: the radiance a white Lambertian
+// surface would send back. The room adds a dim floor of its own.
+fn irradiance(ch: usize, nx: f64, ny: f64, nz: f64) -> f64 {
+    var e : f64 = 0.0;
+    var i : usize = 0;
+    while (i < LIGHTS) {
+        var c : f64 = nx * lf(i, 0) + ny * lf(i, 1) + nz * lf(i, 2);
+        if (c > 0.0) {
+            e = e + lf(i, 5 + ch) * light_omega(i) * c;
+        }
+        i = i + 1;
+    }
+    var up : f64 = 0.0 - ny;
+    if (up < 0.0) { up = 0.0; }
+    return e / PI + (SKY + 0.3 * HZ_GLOW) * ROOM_TINT[ch] * (0.5 + 0.5 * up);
+}
+
+// ---- neighbours: rays and occlusion between unit spheres on the y axis ----
+
+// Distance along unit direction r from point p to the unit sphere centred at (0, oy, 0), or -1 on
+// a miss. p is outside that sphere, so the nearer root is the one that counts.
+pub fn ray_sphere(px: f64, py: f64, pz: f64, rx: f64, ry: f64, rz: f64, oy: f64) -> f64 {
+    const qy = py - oy;
+    const b = px * rx + qy * ry + pz * rz;
+    const c = px * px + qy * qy + pz * pz - 1.0;
+    const disc = b * b - c;
+    if (disc < 0.0) {
+        return 0.0 - 1.0;
+    }
+    const t = 0.0 - b - @sqrt(disc);
+    if (t <= 0.000001) {
+        return 0.0 - 1.0;
+    }
+    return t;
+}
+
+// How much of the sky the unit sphere at (0, oy, 0) hides from point p with normal n
+// (Quilez's analytic sphere occlusion): (n . d) r^2 / |d|^3 with d = centre - p, 0..1.
+pub fn sphere_occ(nx: f64, ny: f64, nz: f64, oy: f64) -> f64 {
+    const dx = 0.0 - nx;
+    const dy = oy - ny;
+    const dz = 0.0 - nz;
+    const l2 = dx * dx + dy * dy + dz * dz;
+    const l = @sqrt(l2);
+    return clamp01((nx * dx + ny * dy + nz * dz) / (l2 * l));
+}
+
+// The light a neighbour sends back along ray r, which struck it at (hx, hy, hz) on the unit sphere
+// at (0, oy, 0): one more mirror bounce into the studio, and for glaze its body colour too.
+fn neighbour(out: *[3]f64, hx: f64, hy: f64, hz: f64, oy: f64, rx: f64, ry: f64, rz: f64, metal: bool) -> void {
+    const nx = hx;
+    const ny = hy - oy;
+    const nz = hz;
+    const dn = rx * nx + ry * ny + rz * nz;
+    const c = 0.0 - dn;
+    const sx = rx - 2.0 * dn * nx;
+    const sy = ry - 2.0 * dn * ny;
+    const sz = rz - 2.0 * dn * nz;
+    var rough : f64 = GOLD_ROUGH;
+    if (metal == false) { rough = GLAZE_ROUGH; }
+    env(out, sx, sy, sz, blur_width(rough));
+    var ch : usize = 0;
+    while (ch < 3) {
+        if (metal) {
+            out[ch] = out[ch] * spec_scale(GOLD_F0[ch], rough, c);
+        } else {
+            const f = fresnel(GLAZE_F0, c);
+            out[ch] = out[ch] * spec_scale(GLAZE_F0, rough, c) + GLAZE_ALBEDO[ch] * (1.0 - f) * irradiance(ch, nx, ny, nz);
+        }
+        ch = ch + 1;
+    }
+}
+
+// ---- the sphere ----
+
+// The light the unit sphere sends to the camera from the point whose normal is (nx, ny), screen
+// frame. up and down are the centres of the neighbours above and below in radii (NO_NB if absent),
+// up_metal and down_metal their material. r g b into out.
+pub fn shade(out: *[3]f64, nx: f64, ny: f64, metal: bool, up: f64, up_metal: bool, down: f64, down_metal: bool) -> void {
+    var q : f64 = 1.0 - nx * nx - ny * ny;
+    if (q < 0.0) { q = 0.0; }
+    const nz = @sqrt(q);
+    const nov = nz;
+    const rx = 2.0 * nz * nx;
+    const ry = 2.0 * nz * ny;
+    const rz = 2.0 * nz * nz - 1.0;
+    var rough : f64 = GOLD_ROUGH;
+    if (metal == false) { rough = GLAZE_ROUGH; }
+    // what the reflected ray sees: a neighbour, or the studio
+    var t : f64 = 0.0 - 1.0;
+    var oy : f64 = 0.0;
+    var om : bool = false;
+    if (up < NO_NB) {
+        const tu = ray_sphere(nx, ny, nz, rx, ry, rz, up);
+        if (tu > 0.0) { t = tu; oy = up; om = up_metal; }
+    }
+    if (t < 0.0 && down < NO_NB) {
+        const td = ray_sphere(nx, ny, nz, rx, ry, rz, down);
+        if (td > 0.0) { t = td; oy = down; om = down_metal; }
+    }
+    if (t > 0.0) {
+        neighbour(out, nx + t * rx, ny + t * ry, nz + t * rz, oy, rx, ry, rz, om);
+    } else {
+        env(out, rx, ry, rz, blur_width(rough));
+    }
+    // the sky the neighbours hide
+    var occ : f64 = 0.0;
+    if (up < NO_NB) { occ = occ + sphere_occ(nx, ny, nz, up); }
+    if (down < NO_NB) { occ = occ + sphere_occ(nx, ny, nz, down); }
+    const ao = 1.0 - clamp01(occ);
+    var ch : usize = 0;
+    while (ch < 3) {
+        if (metal) {
+            out[ch] = out[ch] * spec_scale(GOLD_F0[ch], rough, nov) * (0.35 + 0.65 * ao);
+        } else {
+            const f = fresnel(GLAZE_F0, nov);
+            out[ch] = out[ch] * spec_scale(GLAZE_F0, rough, nov) + GLAZE_ALBEDO[ch] * (1.0 - f) * irradiance(ch, nx, ny, nz) * ao;
+        }
+        ch = ch + 1;
+    }
+}
+
+// ---- the shutter ----
+
+// The share of the open shutter during which pixel (dx, dy) lies inside a disk of radius r whose
+// centre slides from -s/2 to +s/2 along y: the time-average a real camera records. Under a pixel
+// of travel it is the plain anti-aliased disk.
+pub fn swept_cover(dx: f64, dy: f64, r: f64, s: f64) -> f64 {
+    const sa = @abs(s);
+    if (sa < 1.0) {
+        return clamp01(r - @sqrt(dx * dx + dy * dy) + 0.5);
+    }
+    const ax = clamp01(r - @abs(dx) + 0.5);
+    if (ax <= 0.0) {
+        return 0.0;
+    }
+    var hx : f64 = @abs(dx);
+    if (hx > r) { hx = r; }
+    const h = @sqrt(r * r - hx * hx);
+    var lo : f64 = dy - h;
+    var hi : f64 = dy + h;
+    if (lo < 0.0 - 0.5 * sa) { lo = 0.0 - 0.5 * sa; }
+    if (hi > 0.5 * sa) { hi = 0.5 * sa; }
+    if (hi <= lo) {
+        return 0.0;
+    }
+    return ax * (hi - lo) / sa;
+}
+
+// Where the centre is, on average, while pixel (dx, dy) is covered: the shading uses the normal
+// at that moment.
+pub fn swept_mid(dx: f64, dy: f64, r: f64, s: f64) -> f64 {
+    const sa = @abs(s);
+    if (sa < 1.0) {
+        return 0.0;
+    }
+    var hx : f64 = @abs(dx);
+    if (hx > r) { hx = r; }
+    const h = @sqrt(r * r - hx * hx);
+    var lo : f64 = dy - h;
+    var hi : f64 = dy + h;
+    if (lo < 0.0 - 0.5 * sa) { lo = 0.0 - 0.5 * sa; }
+    if (hi > 0.5 * sa) { hi = 0.5 * sa; }
+    return 0.5 * (lo + hi);
+}
+
+// The light at normal (nx, ny) of a lone sphere, channel ch: a probe for the tests.
+fn lone(nx: f64, ny: f64, metal: bool, ch: usize) -> f64 {
+    var o : [3]f64 = [0.0, 0.0, 0.0];
+    shade(&o, nx, ny, metal, NO_NB, false, NO_NB, false);
+    return o[ch];
+}
+
+// The screen normal whose mirror direction is light i's axis: the half-vector of c and (0, 0, 1).
+fn aim(i: usize, k: usize) -> f64 {
+    const hx = lf(i, 0);
+    const hy = lf(i, 1);
+    const hz = lf(i, 2) + 1.0;
+    const n = @sqrt(hx * hx + hy * hy + hz * hz);
+    if (k == 0) { return hx / n; }
+    return hy / n;
+}
+
+// The swept cover summed over a pixel grid around the disk: its area on the screen, px^2.
+fn swept_area(r: f64, s: f64) -> f64 {
+    var a : f64 = 0.0;
+    var y : f64 = 0.0 - r - @abs(s) - 2.0;
+    while (y < r + @abs(s) + 2.0) {
+        var x : f64 = 0.0 - r - 2.0;
+        while (x < r + 2.0) {
+            a = a + swept_cover(x + 0.5, y + 0.5, r, s);
+            x = x + 1.0;
+        }
+        y = y + 1.0;
+    }
+    return a;
+}
+
+// ---- tests ----
+
+test "GGX is a distribution: its projected area is 1, for a polished and a rough surface" {
+    assert(@abs(ggx_projected(alpha_of(GOLD_ROUGH), 200000) - 1.0) < 0.002);
+    assert(@abs(ggx_projected(alpha_of(0.6), 20000) - 1.0) < 0.002);
+    // and its peak is 1 / (pi a^2)
+    const a = alpha_of(GOLD_ROUGH);
+    assert(@abs(ggx_d(1.0, a) * PI * a * a - 1.0) < 1e-12);
+}
+
+test "the lobe's half-width is where GGX falls to half its peak, and it grows with roughness" {
+    const a = alpha_of(GOLD_ROUGH);
+    const s = lobe_sin(a);
+    assert(@abs(ggx_d(@sqrt(1.0 - s * s), a) / ggx_d(1.0, a) - 0.5) < 1e-9);
+    assert(blur_width(0.5) > 3.0 * blur_width(GOLD_ROUGH));
+    // polished gold blurs a mirrored edge over about 0.07 of the tangent plane
+    assert(blur_width(GOLD_ROUGH) > 0.05);
+    assert(blur_width(GOLD_ROUGH) < 0.1);
+}
+
+test "Schlick's Fresnel: F0 face on, total at grazing, for gold in every channel" {
+    var ch : usize = 0;
+    while (ch < 3) {
+        assert(@abs(fresnel(GOLD_F0[ch], 1.0) - GOLD_F0[ch]) < 1e-12);
+        assert(@abs(fresnel(GOLD_F0[ch], 0.0) - 1.0) < 1e-12);
+        ch = ch + 1;
+    }
+    assert(fresnel(GLAZE_F0, 0.5) > GLAZE_F0);
+    assert(fresnel(GLAZE_F0, 0.5) < 0.1);
+}
+
+test "the split sum returns F0 for a mirror seen face on, and never more light than it gathers" {
+    assert(@abs(spec_scale(1.0, 0.0, 1.0) - 1.0) < 0.001);
+    assert(@abs(spec_scale(0.04, 0.0, 1.0) - 0.04) < 0.008);
+    var r : f64 = 0.0;
+    var worst : f64 = 0.0;
+    while (r <= 1.0) {
+        var c : f64 = 0.0;
+        while (c <= 1.0) {
+            if (spec_scale(1.0, r, c) > worst) { worst = spec_scale(1.0, r, c); }
+            assert(env_a(r, c) >= 0.0);
+            c = c + 0.05;
+        }
+        r = r + 0.05;
+    }
+    assert(worst <= 1.0);
+    // a rough surface loses some of its grazing reflection; a smooth one keeps it
+    assert(spec_scale(0.04, 0.0, 0.05) > spec_scale(0.04, 0.8, 0.05));
+}
+
+test "the rig's axes are unit vectors and their solid angles are exact" {
+    var i : usize = 0;
+    while (i < LIGHTS) {
+        const n = lf(i, 0) * lf(i, 0) + lf(i, 1) * lf(i, 1) + lf(i, 2) * lf(i, 2);
+        assert(@abs(n - 1.0) < 0.00001);
+        i = i + 1;
+    }
+    // a cube face seen from the centre is a sixth of the sphere: 4 asin(1/2) = 2 pi / 3
+    assert(@abs(4.0 * asin_small(0.5) - 2.0 * PI / 3.0) < 0.001);
+    // the key is the largest light, the rim strip the smallest
+    assert(light_omega(0) > light_omega(1) * 2.0);
+}
+
+test "a softbox mirrors as a crisp rectangle: bright on its axis, dark just past its edge" {
+    var o : [3]f64 = [0.0, 0.0, 0.0];
+    env(&o, lf(0, 0), lf(0, 1), lf(0, 2), blur_width(GOLD_ROUGH));
+    assert(o[0] > 5.0);
+    // a direction past the key's left edge: turn the axis sideways by 0.6 in the tangent plane
+    const un = @sqrt(lf(0, 2) * lf(0, 2) + lf(0, 0) * lf(0, 0));
+    const ex = lf(0, 0) - 0.6 * lf(0, 2) / un;
+    const ez = lf(0, 2) + 0.6 * lf(0, 0) / un;
+    const en = @sqrt(ex * ex + lf(0, 1) * lf(0, 1) + ez * ez);
+    var p : [3]f64 = [0.0, 0.0, 0.0];
+    env(&p, ex / en, lf(0, 1) / en, ez / en, blur_width(GOLD_ROUGH));
+    assert(o[0] > 20.0 * p[0]);
+    // the softbox's centre is hotter than its rim
+    assert(light_mask(0, lf(0, 0), lf(0, 1), lf(0, 2), 0.01) > 1.2);
+}
+
+test "gold mirrors in gold, glaze mirrors in white" {
+    const kx = aim(0, 0);
+    const ky = aim(0, 1);
+    // the key's highlight on gold keeps gold's colour
+    const r = lone(kx, ky, true, 0);
+    const g = lone(kx, ky, true, 1);
+    const b = lone(kx, ky, true, 2);
+    assert(r > 4.0);
+    assert(g / r > 0.62);
+    assert(g / r < 0.75);
+    assert(b / r < 0.35);
+    // the same highlight on glaze is white: the dielectric's reflection is untinted
+    const wr = lone(kx, ky, false, 0);
+    const wg = lone(kx, ky, false, 1);
+    assert(wg / wr > 0.9);
+}
+
+test "a metal has no body colour: it sends back only what it mirrors" {
+    // the normal (0, -0.5) mirrors the direction (0, -0.866, 0.5)
+    var o : [3]f64 = [0.0, 0.0, 0.0];
+    shade(&o, 0.0, 0.0 - 0.5, true, NO_NB, false, NO_NB, false);
+    var e : [3]f64 = [0.0, 0.0, 0.0];
+    env(&e, 0.0, 0.0 - 0.866, 0.5, blur_width(GOLD_ROUGH));
+    var ch : usize = 0;
+    while (ch < 3) {
+        assert(o[ch] <= e[ch] + 0.000001);
+        ch = ch + 1;
+    }
+    // and glaze at the same point still shows its lit body
+    assert(lone(0.0 - 0.3, 0.0 - 0.3, false, 1) > 0.6);
+}
+
+test "no point of a lone gold ball sends more light than the whole rig could" {
+    var worst : f64 = 0.0;
+    var y : f64 = 0.0 - 0.99;
+    while (y < 1.0) {
+        var x : f64 = 0.0 - 0.99;
+        while (x < 1.0) {
+            if (x * x + y * y < 1.0) {
+                const v = lone(x, y, true, 0);
+                if (v > worst) { worst = v; }
+            }
+            x = x + 0.03;
+        }
+        y = y + 0.03;
+    }
+    var rig : f64 = SKY + HZ_GLOW + FLOOR_L + FLOOR_LINE;
+    var i : usize = 0;
+    while (i < LIGHTS) {
+        rig = rig + lf(i, 5) * (1.0 + HOT);
+        i = i + 1;
+    }
+    assert(worst <= rig);
+    assert(worst > 4.0);
+}
+
+test "the equator mirrors the floor's bright line; the bottom mirrors the dark floor" {
+    // just below the equator the reflection grazes the floor near the horizon
+    const eq = lone(0.0, 0.08, true, 0);
+    const bottom = lone(0.0, 0.75, true, 0);
+    assert(eq > 3.0 * bottom);
+}
+
+test "a ray from a ball's top pole straight up strikes the ball above; a sideways one misses" {
+    assert(@abs(ray_sphere(0.0, 0.0 - 1.0, 0.0, 0.0, 0.0 - 1.0, 0.0, 0.0 - 2.2) - 0.2) < 1e-12);
+    assert(ray_sphere(1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0 - 2.0) < 0.0);
+    assert(ray_sphere(0.0, 0.0 - 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 - 2.2) < 0.0);
+}
+
+test "a touching neighbour darkens the contact, not the far side" {
+    // the ball above touches at the top pole
+    assert(@abs(sphere_occ(0.0, 0.0 - 1.0, 0.0, 0.0 - 2.0) - 1.0) < 1e-12);
+    assert(sphere_occ(1.0, 0.0, 0.0, 0.0 - 2.0) < 0.4);
+    assert(sphere_occ(0.0, 1.0, 0.0, 0.0 - 2.0) == 0.0);
+    // the near-pole of a stacked gold ball mirrors its neighbour, darker than the open sky's top
+    var o : [3]f64 = [0.0, 0.0, 0.0];
+    shade(&o, 0.0, 0.0 - 0.9, true, 0.0 - 2.0, true, 2.0, true);
+    const lone_top = lone(0.0, 0.0 - 0.9, true, 0);
+    assert(o[0] != lone_top);
+}
+
+test "the shutter spreads a falling ball but keeps its area" {
+    const r = 22.0;
+    const still = swept_area(r, 0.0);
+    const fast = swept_area(r, 90.0);
+    assert(@abs(still - PI * r * r) < 0.02 * PI * r * r);
+    assert(@abs(fast - still) < 0.02 * still);
+    // smeared over 90 px, no pixel is covered all the time but the middle of the streak is solid
+    assert(swept_cover(0.5, 0.5, r, 90.0) < 0.5);
+    assert(swept_cover(0.5, 0.5, r, 90.0) > 0.45);
+    assert(swept_cover(0.5, 70.0, r, 90.0) == 0.0);
+    // the shading normal follows the centre: at the streak's head, the head of the disk
+    assert(swept_mid(0.0, 40.0, r, 90.0) > 20.0);
+}
