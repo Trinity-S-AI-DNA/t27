@@ -1,0 +1,1367 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/keysync.t27 -- provider keys between the owner's Macs, sealed per device, published only as ciphertext.
+; Owner, 2026-10-20: "the agent on the second Mac says the keys were not received; add authorization through GitHub
+; TRI CLAW so keys can be shared SAFELY between computers." ASCII only (L3), English. Every test uses fake bytes.
+; --
+; WHAT THIS SPEC DECIDES (and nothing else): protocol states, the layout of every message, who may be trusted, who may
+; write, which copy wins, what a revocation does. It holds no key, no private key and no crypto. The host
+; (keysync_host.t27, @extern to the OS) generates the device keys, hashes, seals, opens, signs and verifies; this spec
+; is handed the facts ("the signature checked out") and answers. A spec that holds @extern cannot run tests, so every
+; rule lives HERE and the host only moves bytes.
+; --
+; THE HARD RULE  a key value never leaves a machine in plaintext: not in git, a log, a command line, a URL, an issue,
+;   a server. What may be published is the closed list FIELD_PUBLISHABLE (provider, slot, version, op, fingerprints,
+;   public keys, names, ciphertext, signatures). field_publishable() refuses plaintext, private keys, tokens and any
+;   masked key hint, and doc_leaks() is the last gate: a document that contains the plaintext is never sent.
+; IDENTITY  each device owns one sealing keypair and one signing keypair, in its own Keychain, never exported. Its
+;   FINGERPRINT is the first 10 bytes of SHA-256(suite || seal public || sign public) shown as 5 groups of 4 hex
+;   digits; the owner compares it on both screens. The device is registered under the owner's GitHub identity: the
+;   sign-in is share.t27's device flow (L_CONNECTED means the TRI CLAW App is installed), may_sync() needs it.
+; SUITE  suite 1 is what macOS offers as a C API (Security.framework): P-256, sealing = ECIES (cofactor ECDH, X9.63
+;   SHA-256 KDF, AES-GCM), signing = ECDSA over SHA-256, the private halves non-extractable. Suite 2 (X25519 sealing +
+;   Ed25519 signing, the owner's first choice) is RESERVED: CryptoKit has no C ABI, so it needs a Swift shim the repo
+;   does not have; the id is fixed here so a later host switches suites without changing any message.
+; ENROLMENT  a new device writes devices/<fp>.dev (its public keys and a signature by its own signing key). It is
+;   PENDING and receives nothing. It becomes TRUSTED only when a signature by an ALREADY trusted device sits in
+;   approvals/<new fp>.<approver fp>.apr. The very first device writes genesis/<fp>.gen; a registry with exactly one
+;   genesis record trusts it, a registry with two trusts neither (SY_CONTESTED: the owner removes the stray one).
+;   Trust is the closure from the genesis device along valid approvals, minus every device a trusted device revoked.
+; SYNC  a device holding a key seals it to the public sealing key of every OTHER trusted device (one ciphertext each)
+;   and publishes keys/<provider>-<slot>-<fp>.env into a PRIVATE repository of the owner's, with the App's narrow
+;   contents token (a gist is not an App surface: share.t27 gist_possible_with_app()). A receiver accepts an envelope
+;   only if it is addressed to it, the writer is trusted, the signature (over the metadata AND the ciphertext digest,
+;   so a relabelled ciphertext fails) checks out, and the version is newer; then it opens it locally and stores it in
+;   its own Keychain through keys_host. Newer = higher version; on a tie the higher writer fingerprint wins.
+; REVOCATION  removing a device re-seals every slot to the remaining trusted devices at version+1 and deletes the
+;   removed device's envelopes. It cannot un-read what that device already opened: revoke_needs_rotation() tells the
+;   owner to rotate the keys at the providers too. ROTATION is a new value at version+1, sealed the same way.
+; Reuse (no parallel spec): keys::PROVIDER_COUNT, MAX_KEYS, key_fits; editors::same_bytes. The sign-in and the token rows
+;   (share.t27, claw::github_surface) are in keysync_rules.t27: this module is imported by the window, and the window
+;   must not pull in their tables (a flattened build sees two L_NONE).
+; Refs gHashTag/t27#11444.
+
+module T27osKeysync;
+
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::key_fits;
+use t27os::editors::same_bytes;
+
+// ---------------------------------------------------------------- 1. constants
+
+pub const SUITE_P256 : u32 = 1;
+pub const SUITE_X25519_ED25519 : u32 = 2;
+
+pub const MAXD : u32 = 8;
+pub const FP_LEN : usize = 10;
+pub const FP_TEXT_LEN : usize = 24;
+pub const PUB_MAX : usize = 96;
+pub const NAME_MAX : usize = 24;
+pub const DOC_MAX : usize = 1536;
+pub const CT_MAX : usize = 480;
+
+/// The private repository (under the owner's account) and the four folders it holds.
+pub const STORE_REPO : str = "t27-keysync";
+pub const DIR_DEV : str = "devices/";
+pub const DIR_GEN : str = "genesis/";
+pub const DIR_APR : str = "approvals/";
+pub const DIR_REV : str = "revocations/";
+pub const DIR_ENV : str = "keys/";
+
+pub const WRITE_SURFACE : str = "autofix-commit";
+pub const READ_SURFACE : str = "spec-read";
+
+pub fn suite_supported(s: u32) -> bool {
+    return s == SUITE_P256;
+}
+
+// ---------------------------------------------------------------- 2. small byte helpers
+
+fn put1(out: []u8, o: usize, c: u8) -> usize {
+    if (o < out.len) { out[o] = c; return o + 1; }
+    return o;
+}
+
+fn putn(out: []u8, o: usize, lit: []const u8) -> usize {
+    var p : usize = o;
+    var i : usize = 0;
+    while (i < lit.len) {
+        p = put1(out, p, lit[i]);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn put_num(out: []u8, o: usize, v: u32) -> usize {
+    var digits : u32 = 1;
+    var t : u32 = v;
+    while (t >= 10) {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    var x : u32 = v;
+    var i : u32 = digits;
+    var p : usize = o;
+    if (o + @as(usize, digits) > out.len) { return o; }
+    while (i > 0) {
+        out[o + @as(usize, i) - 1] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        i = i - 1;
+        p = o + @as(usize, digits);
+    }
+    return p;
+}
+
+pub fn hexc(n: u8) -> u8 {
+    if (n < 10) { return 48 + n; }
+    return 87 + n;
+}
+
+pub fn put_hex(out: []u8, o: usize, b: []const u8) -> usize {
+    var p : usize = o;
+    var i : usize = 0;
+    while (i < b.len) {
+        p = put1(out, p, hexc(b[i] >> 4));
+        p = put1(out, p, hexc(b[i] & 15));
+        i = i + 1;
+    }
+    return p;
+}
+
+/// 0..15 for a lower-case hex digit, 255 otherwise (upper case is refused: one spelling, one meaning).
+pub fn hex_val(c: u8) -> u8 {
+    if (c >= 48 and c <= 57) { return c - 48; }
+    if (c >= 97 and c <= 102) { return c - 87; }
+    return 255;
+}
+
+/// Decode hex text into bytes; the byte count, 0 when the text is odd, not hex or does not fit.
+pub fn unhex(src: []const u8, out: []u8) -> usize {
+    if (src.len == 0 or src.len % 2 != 0 or src.len / 2 > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < src.len / 2) {
+        const hi : u8 = hex_val(src[2 * i]);
+        const lo : u8 = hex_val(src[2 * i + 1]);
+        if (hi == 255 or lo == 255) { return 0; }
+        out[i] = (hi << 4) | lo;
+        i = i + 1;
+    }
+    return src.len / 2;
+}
+
+fn starts_at(s: []const u8, at: usize, lit: []const u8) -> bool {
+    if (lit.len == 0 or at + lit.len > s.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (s[at + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Does `hay` contain `needle` (non-empty) anywhere.
+pub fn contains(hay: []const u8, needle: []const u8) -> bool {
+    if (needle.len == 0 or needle.len > hay.len) { return false; }
+    var i : usize = 0;
+    while (i + needle.len <= hay.len) {
+        if (starts_at(hay, i, needle)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- 3. what may leave a machine
+
+pub const F_PROVIDER : u32 = 0;
+pub const F_SLOT : u32 = 1;
+pub const F_VERSION : u32 = 2;
+pub const F_OP : u32 = 3;
+pub const F_FINGERPRINT : u32 = 4;
+pub const F_PUBLIC_KEY : u32 = 5;
+pub const F_NAME : u32 = 6;
+pub const F_CIPHERTEXT : u32 = 7;
+pub const F_SIGNATURE : u32 = 8;
+pub const F_PLAINTEXT_KEY : u32 = 9;
+pub const F_PRIVATE_KEY : u32 = 10;
+pub const F_TOKEN : u32 = 11;
+pub const F_KEY_MASK : u32 = 12;
+pub const F_KEY_HASH : u32 = 13;
+pub const F_COUNT : u32 = 14;
+
+/// The closed list of what a published document may carry. A masked key text and a hash of a key are refused too:
+/// both are a fact about the value.
+pub fn field_publishable(f: u32) -> bool {
+    return f <= F_SIGNATURE;
+}
+
+/// The last gate before an upload: the document must not contain the plaintext key.
+pub fn doc_leaks(doc: []const u8, plain: []const u8) -> bool {
+    return contains(doc, plain);
+}
+
+// ---------------------------------------------------------------- 4. fingerprints and names
+
+/// The fingerprint of a device = the first 10 bytes of the digest the host took of (suite || seal public || sign public).
+pub fn fp_from_digest(digest: []const u8, out: []u8) -> usize {
+    if (digest.len < FP_LEN or out.len < FP_LEN) { return 0; }
+    var i : usize = 0;
+    while (i < FP_LEN) {
+        out[i] = digest[i];
+        i = i + 1;
+    }
+    return FP_LEN;
+}
+
+/// The bytes a device's fingerprint is the digest of: one suite byte, the seal public key, the sign public key.
+/// 0 when a key is empty or too long or out is too small.
+pub fn fp_input(suite: u32, seal_pub: []const u8, sign_pub: []const u8, out: []u8) -> usize {
+    if (suite > 255 or seal_pub.len == 0 or seal_pub.len > PUB_MAX or sign_pub.len == 0 or sign_pub.len > PUB_MAX) { return 0; }
+    const n : usize = 1 + seal_pub.len + sign_pub.len;
+    if (n > out.len) { return 0; }
+    out[0] = @as(u8, @intCast(suite));
+    var i : usize = 0;
+    while (i < seal_pub.len) {
+        out[1 + i] = seal_pub[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < sign_pub.len) {
+        out[1 + seal_pub.len + i] = sign_pub[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The host took the digest of the record's public keys: does it name the fingerprint the record claims.
+pub fn fp_matches(digest: []const u8, fp: []const u8) -> bool {
+    return fp.len == FP_LEN and digest.len >= FP_LEN and same_bytes(digest[0..FP_LEN], fp);
+}
+
+/// "abcd-ef01-2345-6789-abcd": what both screens show and the owner compares.
+pub fn fp_text(fp: []const u8, out: []u8) -> usize {
+    if (fp.len != FP_LEN or out.len < FP_TEXT_LEN) { return 0; }
+    var o : usize = 0;
+    var i : usize = 0;
+    while (i < FP_LEN) {
+        o = put1(out, o, hexc(fp[i] >> 4));
+        o = put1(out, o, hexc(fp[i] & 15));
+        i = i + 1;
+        if (i % 2 == 0 and i < FP_LEN) { o = put1(out, o, 45); }
+    }
+    return o;
+}
+
+/// Parse "abcd-ef01-..." back into 10 bytes; 0 when it is not exactly that shape.
+pub fn fp_parse(text: []const u8, out: []u8) -> usize {
+    if (text.len != FP_TEXT_LEN or out.len < FP_LEN) { return 0; }
+    var i : usize = 0;
+    var o : usize = 0;
+    while (i < FP_TEXT_LEN) {
+        if (i % 5 == 4) {
+            if (text[i] != 45) { return 0; }
+            i = i + 1;
+        } else {
+            const hi : u8 = hex_val(text[i]);
+            const lo : u8 = hex_val(text[i + 1]);
+            if (hi == 255 or lo == 255) { return 0; }
+            out[o] = (hi << 4) | lo;
+            o = o + 1;
+            i = i + 2;
+        }
+    }
+    return o;
+}
+
+/// A device name: 1..NAME_MAX of letters, digits, '-', '_', '.'. No space, no '=', no newline: it sits in a line.
+pub fn name_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > NAME_MAX) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        const al : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+        if (!al and c != 45 and c != 95 and c != 46) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- 5. the signed messages (one tag each, never reusable)
+
+pub const TAG_ENROL : str = "t27os.keysync.v1.enrol";
+pub const TAG_GENESIS : str = "t27os.keysync.v1.genesis";
+pub const TAG_APPROVE : str = "t27os.keysync.v1.approve";
+pub const TAG_REVOKE : str = "t27os.keysync.v1.revoke";
+pub const TAG_ENVELOPE : str = "t27os.keysync.v1.envelope";
+
+/// What a new device signs with its own signing key: its suite, public keys and name. Proves it holds the key.
+pub fn msg_enrol(tag: []const u8, suite: u32, seal_pub: []const u8, sign_pub: []const u8, name: []const u8, out: []u8) -> usize {
+    if (!name_ok(name) or seal_pub.len == 0 or seal_pub.len > PUB_MAX or sign_pub.len == 0 or sign_pub.len > PUB_MAX) { return 0; }
+    var o : usize = putn(out, 0, tag);
+    o = put1(out, o, 10);
+    o = putn(out, o, "suite=");
+    o = put_num(out, o, suite);
+    o = putn(out, o, "\nseal=");
+    o = put_hex(out, o, seal_pub);
+    o = putn(out, o, "\nsign=");
+    o = put_hex(out, o, sign_pub);
+    o = putn(out, o, "\nname=");
+    o = putn(out, o, name);
+    o = put1(out, o, 10);
+    if (o >= out.len) { return 0; }
+    return o;
+}
+
+/// What a trusted device signs to approve (or, with TAG_REVOKE, to remove) another: both fingerprints.
+pub fn msg_pair(tag: []const u8, target: []const u8, by: []const u8, out: []u8) -> usize {
+    if (target.len != FP_LEN or by.len != FP_LEN) { return 0; }
+    var o : usize = putn(out, 0, tag);
+    o = putn(out, o, "\ntarget=");
+    o = put_hex(out, o, target);
+    o = putn(out, o, "\nby=");
+    o = put_hex(out, o, by);
+    o = put1(out, o, 10);
+    if (o >= out.len) { return 0; }
+    return o;
+}
+
+pub const OP_PUT : u32 = 0;
+pub const OP_DEL : u32 = 1;
+
+/// What a writer signs for one envelope: the metadata and the digest of the ciphertext, so moving a ciphertext to
+/// another provider, slot, version, writer or recipient breaks the signature.
+pub fn msg_envelope(p: u32, slot: u32, ver: u32, op: u32, writer: []const u8, to: []const u8, ct_digest: []const u8, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or slot >= MAX_KEYS or op > OP_DEL or writer.len != FP_LEN or to.len != FP_LEN or ct_digest.len != 32) { return 0; }
+    var o : usize = putn(out, 0, TAG_ENVELOPE);
+    o = putn(out, o, "\nprovider=");
+    o = put_num(out, o, p);
+    o = putn(out, o, "\nslot=");
+    o = put_num(out, o, slot);
+    o = putn(out, o, "\nversion=");
+    o = put_num(out, o, ver);
+    o = putn(out, o, "\nop=");
+    o = put_num(out, o, op);
+    o = putn(out, o, "\nwriter=");
+    o = put_hex(out, o, writer);
+    o = putn(out, o, "\nto=");
+    o = put_hex(out, o, to);
+    o = putn(out, o, "\nct=");
+    o = put_hex(out, o, ct_digest);
+    o = put1(out, o, 10);
+    if (o >= out.len) { return 0; }
+    return o;
+}
+
+// ---------------------------------------------------------------- 6. who is trusted
+
+pub const DS_PENDING : u32 = 0;
+pub const DS_TRUSTED : u32 = 1;
+pub const DS_REVOKED : u32 = 2;
+pub const DS_NAMES : str = "pending,trusted,revoked";
+
+/// The trust fold over a registry read from the store. Everything signed was already checked by the host and arrives
+/// as a flag (isgen: the device has a genesis record with a good self-signature; apok / rvok: the signature checked).
+/// out[d] = DS_*; the number of trusted devices is returned. Rules, in order:
+///  1. exactly one genesis record trusts that device; none or several trust nobody (contested);
+///  2. an approval by a device already trusted, of another device, with a good signature, trusts the target (to a
+///     fixed point, so the order of the records never matters);
+///  3. a revocation with a good signature by a device trusted in step 2 revokes its target (also a pending one:
+///     that is Reject); two devices revoking each other are both revoked;
+///  4. a revoked device's earlier approvals stay (the owner reviews them: approved_by()).
+pub fn fold_trust(n: u32, isgen: []const u32, m: u32, apt: []const u32, apa: []const u32, apok: []const u32, r: u32, rvt: []const u32, rvb: []const u32, rvok: []const u32, out: []u32) -> u32 {
+    var tr : [8]u32 = undefined;
+    var d : u32 = 0;
+    while (d < MAXD) {
+        tr[d] = 0;
+        d = d + 1;
+    }
+    var gens : u32 = 0;
+    var g : u32 = 0;
+    d = 0;
+    while (d < n and d < MAXD) {
+        if (isgen[d] != 0) {
+            gens = gens + 1;
+            g = d;
+        }
+        d = d + 1;
+    }
+    if (gens == 1) { tr[g] = 1; }
+    var round : u32 = 0;
+    while (round < MAXD) {
+        var i : u32 = 0;
+        while (i < m) {
+            if (apok[i] != 0 and apt[i] < n and apa[i] < n and apt[i] < MAXD and apa[i] < MAXD and apt[i] != apa[i]) {
+                if (tr[apa[i]] == 1 and tr[apt[i]] == 0) { tr[apt[i]] = 1; }
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    var rv : [8]u32 = undefined;
+    d = 0;
+    while (d < MAXD) {
+        rv[d] = 0;
+        d = d + 1;
+    }
+    var j : u32 = 0;
+    while (j < r) {
+        if (rvok[j] != 0 and rvt[j] < n and rvb[j] < n and rvt[j] < MAXD and rvb[j] < MAXD) {
+            if (tr[rvb[j]] == 1) { rv[rvt[j]] = 1; }
+        }
+        j = j + 1;
+    }
+    var live : u32 = 0;
+    d = 0;
+    while (d < n and d < MAXD) {
+        if (rv[d] == 1) {
+            out[d] = DS_REVOKED;
+        } else if (tr[d] == 1) {
+            out[d] = DS_TRUSTED;
+            live = live + 1;
+        } else {
+            out[d] = DS_PENDING;
+        }
+        d = d + 1;
+    }
+    return live;
+}
+
+/// The devices `dev` approved: a bit mask over device numbers, for the owner to review before or after revoking it.
+pub fn approved_by(dev: u32, m: u32, apt: []const u32, apa: []const u32, apok: []const u32) -> u32 {
+    var mask : u32 = 0;
+    var i : u32 = 0;
+    while (i < m) {
+        if (apok[i] != 0 and apa[i] == dev and apt[i] < MAXD) { mask = mask | (1 << apt[i]); }
+        i = i + 1;
+    }
+    return mask;
+}
+
+/// May this device approve another: only a trusted device, and never itself.
+pub fn may_approve(my_state: u32, me: u32, target: u32) -> bool {
+    return my_state == DS_TRUSTED and me != target;
+}
+
+/// No approval, no keys: a device receives keys only while trusted.
+pub fn may_receive(my_state: u32) -> bool {
+    return my_state == DS_TRUSTED;
+}
+
+/// The recipients of a publication by device `me`: every OTHER trusted device (a bit mask over device numbers).
+pub fn recipients(n: u32, states: []const u32, me: u32) -> u32 {
+    var mask : u32 = 0;
+    var d : u32 = 0;
+    while (d < n and d < MAXD) {
+        if (states[d] == DS_TRUSTED and d != me) { mask = mask | (1 << d); }
+        d = d + 1;
+    }
+    return mask;
+}
+
+/// What a re-seal must write and delete for one slot: `have` = recipients that hold a current envelope, `want` = the
+/// recipients now. add = want but not have; drop = have but not want (a revoked or removed device's envelope).
+pub fn plan_add(want: u32, have: u32) -> u32 {
+    return want & (have ^ 4294967295);
+}
+
+pub fn plan_drop(want: u32, have: u32) -> u32 {
+    return have & (want ^ 4294967295);
+}
+
+/// A revocation cannot take back what the device already opened.
+pub fn revoke_needs_rotation(device_ever_received: bool) -> bool {
+    return device_ever_received;
+}
+
+// ---------------------------------------------------------------- 7. versions, conflicts, acceptance
+
+/// The total order of publications of one slot: a higher version wins; on a tie the higher writer fingerprint.
+pub fn ver_newer(v1: u32, w1: []const u8, v2: u32, w2: []const u8) -> bool {
+    if (v1 != v2) { return v1 > v2; }
+    var i : usize = 0;
+    while (i < w1.len and i < w2.len) {
+        if (w1[i] != w2[i]) { return w1[i] > w2[i]; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The version of a new publication (a set, a rotation, a re-seal or a delete); 0 = the counter is exhausted.
+pub fn next_version(seen: u32) -> u32 {
+    if (seen >= 4294967295) { return 0; }
+    return seen + 1;
+}
+
+pub const AR_OK : u32 = 0;
+pub const AR_NOT_TRUSTED_ME : u32 = 1;
+pub const AR_NOT_FOR_ME : u32 = 2;
+pub const AR_WRITER : u32 = 3;
+pub const AR_SUITE : u32 = 4;
+pub const AR_BAD_SIG : u32 = 5;
+pub const AR_STALE : u32 = 6;
+pub const AR_BAD_FIELD : u32 = 7;
+pub const AR_WORDS : str = "accepted,this device is not trusted,not addressed to this device,writer is not trusted,unknown suite,bad signature,older than the stored key,bad field";
+
+/// Whether this device takes an envelope, and if not the first rule that refuses it. The order is fixed.
+pub fn accept(my_state: u32, to_me: bool, writer_state: u32, suite: u32, sig_ok: bool, fields_ok: bool, newer: bool) -> u32 {
+    if (my_state != DS_TRUSTED) { return AR_NOT_TRUSTED_ME; }
+    if (!fields_ok) { return AR_BAD_FIELD; }
+    if (!to_me) { return AR_NOT_FOR_ME; }
+    if (!suite_supported(suite)) { return AR_SUITE; }
+    if (writer_state != DS_TRUSTED) { return AR_WRITER; }
+    if (!sig_ok) { return AR_BAD_SIG; }
+    if (!newer) { return AR_STALE; }
+    return AR_OK;
+}
+
+/// A received key is stored only if it is a key keys.t27 would store.
+pub fn plain_fits(plain: []const u8) -> bool {
+    return key_fits(plain);
+}
+
+// ---------------------------------------------------------------- 8. documents in the store
+
+/// A path the store accepts: one of the five folders, then 1..60 of lower-case letters, digits, '-', '.', and no
+/// other directory, no "..", no leading dot.
+pub fn store_path_ok(p: []const u8) -> bool {
+    var ok : bool = starts_at(p, 0, DIR_DEV) or starts_at(p, 0, DIR_GEN) or starts_at(p, 0, DIR_APR) or starts_at(p, 0, DIR_REV) or starts_at(p, 0, DIR_ENV);
+    if (!ok) { return false; }
+    var i : usize = 0;
+    while (i < p.len and p[i] != 47) { i = i + 1; }
+    const rest : usize = p.len - i - 1;
+    if (rest == 0 or rest > 60) { return false; }
+    if (p[i + 1] == 46) { return false; }
+    var k : usize = i + 1;
+    while (k < p.len) {
+        const c : u8 = p[k];
+        const good : bool = (c >= 48 and c <= 57) or (c >= 97 and c <= 122) or c == 45 or c == 46;
+        if (!good) { return false; }
+        if (c == 46 and k + 1 < p.len and p[k + 1] == 46) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// keys/<provider>-<slot>-<recipient fingerprint hex>.env
+pub fn env_path(p: u32, slot: u32, to: []const u8, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or slot >= MAX_KEYS or to.len != FP_LEN) { return 0; }
+    var o : usize = putn(out, 0, DIR_ENV);
+    o = put_num(out, o, p);
+    o = put1(out, o, 45);
+    o = put_num(out, o, slot);
+    o = put1(out, o, 45);
+    o = put_hex(out, o, to);
+    o = putn(out, o, ".env");
+    if (o >= out.len) { return 0; }
+    return o;
+}
+
+/// One envelope document. The ciphertext and signature are hex; nothing else of the key is in it.
+pub fn doc_envelope(p: u32, slot: u32, ver: u32, op: u32, writer: []const u8, to: []const u8, suite: u32, ct: []const u8, sig: []const u8, out: []u8) -> usize {
+    if (p >= PROVIDER_COUNT or slot >= MAX_KEYS or op > OP_DEL or writer.len != FP_LEN or to.len != FP_LEN) { return 0; }
+    if (ct.len > CT_MAX or sig.len == 0 or sig.len > 96) { return 0; }
+    var o : usize = putn(out, 0, "t27os-keysync v1\nkind=env\nprovider=");
+    o = put_num(out, o, p);
+    o = putn(out, o, "\nslot=");
+    o = put_num(out, o, slot);
+    o = putn(out, o, "\nversion=");
+    o = put_num(out, o, ver);
+    o = putn(out, o, "\nop=");
+    o = put_num(out, o, op);
+    o = putn(out, o, "\nwriter=");
+    o = put_hex(out, o, writer);
+    o = putn(out, o, "\nto=");
+    o = put_hex(out, o, to);
+    o = putn(out, o, "\nsuite=");
+    o = put_num(out, o, suite);
+    o = putn(out, o, "\nct=");
+    o = put_hex(out, o, ct);
+    o = putn(out, o, "\nsig=");
+    o = put_hex(out, o, sig);
+    o = put1(out, o, 10);
+    if (o >= out.len) { return 0; }
+    return o;
+}
+
+/// Find "key=" at the start of a line; r[0] = where the value starts, r[1] = its length. False when absent.
+pub fn kv_find(doc: []const u8, key: []const u8, r: []u64) -> bool {
+    var i : usize = 0;
+    while (i < doc.len) {
+        const at_line : bool = i == 0 or doc[i - 1] == 10;
+        if (at_line and starts_at(doc, i, key) and i + key.len < doc.len and doc[i + key.len] == 61) {
+            const vs : usize = i + key.len + 1;
+            var e : usize = vs;
+            while (e < doc.len and doc[e] != 10) { e = e + 1; }
+            r[0] = @as(u64, vs);
+            r[1] = @as(u64, e - vs);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn dec_value(s: []const u8) -> u64 {
+    if (s.len == 0 or s.len > 10) { return 4294967296; }
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] < 48 or s[i] > 57) { return 4294967296; }
+        v = v * 10 + @as(u64, s[i] - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The numbers and fingerprints of an envelope document: f[0] provider, f[1] slot, f[2] version, f[3] op, f[4] suite.
+/// writer and to are decoded into the two 10-byte slices; the ciphertext and signature hex are decoded into ct, sig
+/// with their lengths in f[5], f[6]. False on a missing, malformed or out-of-range field, so a hostile store changes
+/// nothing: nothing is stored from a document that does not parse whole.
+pub fn parse_envelope(doc: []const u8, f: []u64, writer: []u8, to: []u8, ct: []u8, sig: []u8) -> bool {
+    if (!starts_at(doc, 0, "t27os-keysync v1\nkind=env\n")) { return false; }
+    var r : [2]u64 = undefined;
+    r[0] = 0;
+    r[1] = 0;
+    if (!kv_find(doc, "provider", r[0..2])) { return false; }
+    f[0] = dec_value(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])]);
+    if (!kv_find(doc, "slot", r[0..2])) { return false; }
+    f[1] = dec_value(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])]);
+    if (!kv_find(doc, "version", r[0..2])) { return false; }
+    f[2] = dec_value(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])]);
+    if (!kv_find(doc, "op", r[0..2])) { return false; }
+    f[3] = dec_value(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])]);
+    if (!kv_find(doc, "suite", r[0..2])) { return false; }
+    f[4] = dec_value(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])]);
+    if (f[0] >= @as(u64, PROVIDER_COUNT) or f[1] >= @as(u64, MAX_KEYS) or f[2] > 4294967295 or f[3] > 1 or f[4] > 255) { return false; }
+    if (!kv_find(doc, "writer", r[0..2])) { return false; }
+    if (r[1] != 20 or unhex(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])], writer) != FP_LEN) { return false; }
+    if (!kv_find(doc, "to", r[0..2])) { return false; }
+    if (r[1] != 20 or unhex(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])], to) != FP_LEN) { return false; }
+    if (!kv_find(doc, "ct", r[0..2])) { return false; }
+    f[5] = 0;
+    if (r[1] > 0) {
+        f[5] = @as(u64, unhex(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])], ct));
+        if (f[5] == 0) { return false; }
+    }
+    if (f[3] == 0 and f[5] == 0) { return false; }
+    if (!kv_find(doc, "sig", r[0..2])) { return false; }
+    f[6] = @as(u64, unhex(doc[@as(usize, r[0]) .. @as(usize, r[0] + r[1])], sig));
+    if (f[6] == 0) { return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- 9. the sign-in and sync status
+
+pub const SY_SIGNED_OUT : u32 = 0;
+pub const SY_NO_DEVICE : u32 = 1;
+pub const SY_CONTESTED : u32 = 2;
+pub const SY_PENDING : u32 = 3;
+pub const SY_REVOKED : u32 = 4;
+pub const SY_WAITING : u32 = 5;
+pub const SY_SYNCED : u32 = 6;
+pub const SY_ALONE : u32 = 7;
+pub const SY_WORDS : str = "sign in with TRI CLAW,no device key,two genesis records,waiting for approval,revoked,keys waiting,in sync,only device";
+
+/// The one line of the Devices section: `connected` TRI CLAW is connected (share.t27 connected(); keysync_rules.t27
+/// may_sync), `have_key` this device has its keypair, `contested` the registry holds two
+/// genesis records, `my_state` its place in the fold, `waiting` envelopes addressed to it it has not taken yet,
+/// `others` the other trusted devices.
+pub fn sync_status(connected: bool, have_key: bool, contested: bool, my_state: u32, waiting: u32, others: u32) -> u32 {
+    if (!connected) { return SY_SIGNED_OUT; }
+    if (!have_key) { return SY_NO_DEVICE; }
+    if (contested) { return SY_CONTESTED; }
+    if (my_state == DS_REVOKED) { return SY_REVOKED; }
+    if (my_state == DS_PENDING) { return SY_PENDING; }
+    if (waiting > 0) { return SY_WAITING; }
+    if (others == 0) { return SY_ALONE; }
+    return SY_SYNCED;
+}
+
+pub fn sync_word(s: u32, out: []u8) -> usize {
+    var idx : u32 = 0;
+    var i : usize = 0;
+    var n : usize = 0;
+    while (i < SY_WORDS.len) {
+        if (SY_WORDS[i] == 44) {
+            idx = idx + 1;
+        } else if (idx == s and n < out.len) {
+            out[n] = SY_WORDS[i];
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- 10. the Devices section of the KEYS tab
+
+pub const KD_ROW_H : f64 = 16.0;
+pub const KD_BTN_W : f64 = 50.0;
+pub const KD_BTN_H : f64 = 14.0;
+pub const KD_GAP : f64 = 6.0;
+pub const KD_NONE : u32 = 255;
+pub const KD_APPROVE : u32 = 0;
+pub const KD_REJECT : u32 = 1;
+
+/// A row of the section: device d (0 = this device), its text "<name>  <fp>  <state>".
+pub fn kd_row_text(name: []const u8, fp: []const u8, state: u32, mine: bool, out: []u8) -> usize {
+    var o : usize = 0;
+    if (mine) { o = putn(out, o, "this  "); }
+    o = putn(out, o, name);
+    o = putn(out, o, "  ");
+    var t : [24]u8 = undefined;
+    const n : usize = fp_text(fp, t[0..24]);
+    o = putn(out, o, t[0..n]);
+    o = putn(out, o, "  ");
+    var idx : u32 = 0;
+    var i : usize = 0;
+    while (i < DS_NAMES.len) {
+        if (DS_NAMES[i] == 44) {
+            idx = idx + 1;
+        } else if (idx == state) {
+            o = put1(out, o, DS_NAMES[i]);
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Approve and Reject show only on a pending device and only on a trusted device (may_approve).
+pub fn kd_buttons(my_state: u32, me: u32, target: u32, target_state: u32) -> bool {
+    return target_state == DS_PENDING and may_approve(my_state, me, target);
+}
+
+/// The x of a button (0 = Approve, 1 = Reject) at the right edge of a panel whose content spans [l+pad, l+w-pad].
+pub fn kd_btn_x(l: f64, w: f64, pad: f64, b: u32) -> f64 {
+    return l + w - pad - KD_BTN_W * @as(f64, 2.0 - @as(f64, b)) - KD_GAP * @as(f64, 1.0 - @as(f64, b));
+}
+
+/// Hit test for row r (top y given): KD_APPROVE, KD_REJECT or KD_NONE.
+pub fn kd_hit(x: f64, y: f64, l: f64, w: f64, pad: f64, row_top: f64) -> u32 {
+    if (y < row_top or y > row_top + KD_BTN_H) { return KD_NONE; }
+    var b : u32 = 0;
+    while (b < 2) {
+        const bx : f64 = kd_btn_x(l, w, pad, b);
+        if (x >= bx and x <= bx + KD_BTN_W) { return b; }
+        b = b + 1;
+    }
+    return KD_NONE;
+}
+
+/// The view buffer the window draws the Devices section from (it rides after the 144 mask bytes of the KEYS panel):
+/// byte 0 = rows used, then KD_ROWS rows of KD_ROW_BYTES: [0] text length, [1] flags, [2..] text.
+pub const KD_ROWS : u32 = 6;
+pub const KD_ROW_BYTES : usize = 64;
+pub const KD_VIEW_LEN : usize = 400;
+pub const KDF_MINE : u8 = 1;
+pub const KDF_BUTTONS : u8 = 2;
+
+pub fn kd_view_clear(view: []u8) -> void {
+    var i : usize = 0;
+    while (i < view.len) {
+        view[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// Put row i (0..KD_ROWS-1) and keep the row count; text is cut to fit. False when i is out of range.
+pub fn kd_view_set(view: []u8, i: u32, flags: u8, text: []const u8) -> bool {
+    if (i >= KD_ROWS or view.len < KD_VIEW_LEN) { return false; }
+    const at : usize = 1 + @as(usize, i) * KD_ROW_BYTES;
+    var n : usize = text.len;
+    if (n > KD_ROW_BYTES - 2) { n = KD_ROW_BYTES - 2; }
+    view[at] = @as(u8, @intCast(n));
+    view[at + 1] = flags;
+    var k : usize = 0;
+    while (k < n) {
+        view[at + 2 + k] = text[k];
+        k = k + 1;
+    }
+    if (view[0] < @as(u8, @intCast(i + 1))) { view[0] = @as(u8, @intCast(i + 1)); }
+    return true;
+}
+
+pub fn kd_view_rows(view: []const u8) -> u32 {
+    if (view.len < KD_VIEW_LEN or view[0] > @as(u8, @intCast(KD_ROWS))) { return 0; }
+    return @as(u32, view[0]);
+}
+
+/// Where row i's text starts in the view (its length is kd_view_text_len, its flags kd_view_flags).
+pub fn kd_view_text_at(view: []const u8, i: u32) -> usize {
+    return 1 + @as(usize, i) * KD_ROW_BYTES + 2;
+}
+
+pub fn kd_view_text_len(view: []const u8, i: u32) -> usize {
+    if (i >= KD_ROWS or view.len < KD_VIEW_LEN) { return 0; }
+    return @as(usize, view[1 + @as(usize, i) * KD_ROW_BYTES]);
+}
+
+pub fn kd_view_flags(view: []const u8, i: u32) -> u8 {
+    if (i >= KD_ROWS or view.len < KD_VIEW_LEN) { return 0; }
+    return view[1 + @as(usize, i) * KD_ROW_BYTES + 1];
+}
+
+/// The row for this device before any registry is read: its fingerprint, or why there is none.
+pub fn kd_local_row(have_fp: bool, fp: []const u8, out: []u8) -> usize {
+    if (!have_fp or fp.len != FP_LEN) { return putn(out, 0, "this device  no key yet"); }
+    var o : usize = putn(out, 0, "this device  ");
+    var t : [24]u8 = undefined;
+    const n : usize = fp_text(fp, t[0..24]);
+    o = putn(out, o, t[0..n]);
+    return o;
+}
+
+/// Rows of the section that fit between `top` and the bottom edge `sh` (a header line first, then KD_ROW_H a row).
+pub fn kd_rows_fit(top: f64, sh: f64, want: u32) -> u32 {
+    if (sh - top < 2.0 * KD_ROW_H) { return 0; }
+    const room : u32 = @as(u32, @intFromFloat((sh - top) / KD_ROW_H)) - 1;
+    if (want < room) { return want; }
+    return room;
+}
+
+// ---------------------------------------------------------------- tests (fake bytes only)
+
+fn kfill(b: []u8, v: u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = v;
+        i = i + 1;
+    }
+}
+
+fn kfpn(b: []u8, v: u8) -> void {
+    var i : usize = 0;
+    while (i < FP_LEN) {
+        b[i] = v + @as(u8, @intCast(i));
+        i = i + 1;
+    }
+}
+
+test hex_and_fingerprint_text_round_trip {
+    var fp : [10]u8 = undefined;
+    kfpn(fp[0..10], 1);
+    var t : [24]u8 = undefined;
+    assert fp_text(fp[0..10], t[0..24]) == 24;
+    assert same_bytes(t[0..24], "0102-0304-0506-0708-090a");
+    var back : [10]u8 = undefined;
+    assert fp_parse(t[0..24], back[0..10]) == 10;
+    assert same_bytes(back[0..10], fp[0..10]);
+    // negative controls: upper case, a space for a dash, a short text, a non-hex digit
+    assert fp_parse("0102-0304-0506-0708-090A", back[0..10]) == 0;
+    assert fp_parse("0102 0304-0506-0708-090a", back[0..10]) == 0;
+    assert fp_parse("0102-0304-0506-0708-09", back[0..10]) == 0;
+    assert fp_parse("0102-0304-0506-0708-090g", back[0..10]) == 0;
+    assert fp_text(fp[0..9], t[0..24]) == 0;
+}
+
+test the_fingerprint_is_the_front_of_the_digest {
+    var dg : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) { dg[i] = @as(u8, @intCast(i * 3)); i = i + 1; }
+    var fp : [10]u8 = undefined;
+    assert fp_from_digest(dg[0..32], fp[0..10]) == 10;
+    assert fp_matches(dg[0..32], fp[0..10]);
+    fp[9] = fp[9] ^ 1;
+    assert fp_matches(dg[0..32], fp[0..10]) == false;
+    assert fp_from_digest(dg[0..8], fp[0..10]) == 0;
+}
+
+test the_fingerprint_input_is_suite_then_both_public_keys {
+    var a : [3]u8 = undefined;
+    var b : [2]u8 = undefined;
+    a[0] = 1;
+    a[1] = 2;
+    a[2] = 3;
+    b[0] = 9;
+    b[1] = 8;
+    var o : [16]u8 = undefined;
+    assert fp_input(1, a[0..3], b[0..2], o[0..16]) == 6;
+    assert o[0] == 1 and o[1] == 1 and o[3] == 3 and o[4] == 9 and o[5] == 8;
+    // swapping the two keys, or the suite, changes the input (so the fingerprint)
+    var o2 : [16]u8 = undefined;
+    assert fp_input(1, b[0..2], a[0..3], o2[0..16]) == 6;
+    assert same_bytes(o[0..6], o2[0..6]) == false;
+    assert fp_input(2, a[0..3], b[0..2], o2[0..16]) == 6;
+    assert same_bytes(o[0..6], o2[0..6]) == false;
+    assert fp_input(1, a[0..0], b[0..2], o2[0..16]) == 0;
+    assert fp_input(1, a[0..3], b[0..2], o2[0..5]) == 0;
+}
+
+test device_names_cannot_break_a_line {
+    assert name_ok("mac-mini.2");
+    assert name_ok("") == false;
+    assert name_ok("a b") == false;
+    assert name_ok("a=b") == false;
+    assert name_ok("a\nb") == false;
+    assert name_ok("0123456789012345678901234") == false;
+}
+
+test only_the_closed_list_may_be_published {
+    var f : u32 = 0;
+    var ok : u32 = 0;
+    while (f < F_COUNT) {
+        if (field_publishable(f)) { ok = ok + 1; }
+        f = f + 1;
+    }
+    assert ok == 9;
+    assert field_publishable(F_CIPHERTEXT) and field_publishable(F_SIGNATURE) and field_publishable(F_PUBLIC_KEY);
+    assert field_publishable(F_PLAINTEXT_KEY) == false;
+    assert field_publishable(F_PRIVATE_KEY) == false;
+    assert field_publishable(F_TOKEN) == false;
+    assert field_publishable(F_KEY_MASK) == false;
+    assert field_publishable(F_KEY_HASH) == false;
+}
+
+test enrol_message_binds_keys_and_name {
+    var sp : [8]u8 = undefined;
+    var gp : [8]u8 = undefined;
+    kfill(sp[0..8], 4);
+    kfill(gp[0..8], 5);
+    var m : [256]u8 = undefined;
+    const n : usize = msg_enrol(TAG_ENROL, 1, sp[0..8], gp[0..8], "mini", m[0..256]);
+    assert n > 0;
+    assert same_bytes(m[0..n], "t27os.keysync.v1.enrol\nsuite=1\nseal=0404040404040404\nsign=0505050505050505\nname=mini\n");
+    // a different tag is a different message: a signature over an enrolment can never pass as a genesis
+    var m2 : [256]u8 = undefined;
+    const n2 : usize = msg_enrol(TAG_GENESIS, 1, sp[0..8], gp[0..8], "mini", m2[0..256]);
+    assert same_bytes(m[0..n], m2[0..n2]) == false;
+    // flipping one public key byte changes the message
+    sp[3] = 9;
+    const n3 : usize = msg_enrol(TAG_ENROL, 1, sp[0..8], gp[0..8], "mini", m2[0..256]);
+    assert same_bytes(m[0..n], m2[0..n3]) == false;
+    // a bad name, an empty key and a too-small buffer give no message
+    assert msg_enrol(TAG_ENROL, 1, sp[0..8], gp[0..8], "bad name", m2[0..256]) == 0;
+    assert msg_enrol(TAG_ENROL, 1, sp[0..0], gp[0..8], "mini", m2[0..256]) == 0;
+    assert msg_enrol(TAG_ENROL, 1, sp[0..8], gp[0..8], "mini", m2[0..20]) == 0;
+}
+
+test approve_and_revoke_messages_are_distinct_and_ordered {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    kfpn(a[0..10], 1);
+    kfpn(b[0..10], 50);
+    var m1 : [200]u8 = undefined;
+    var m2 : [200]u8 = undefined;
+    var m3 : [200]u8 = undefined;
+    const n1 : usize = msg_pair(TAG_APPROVE, a[0..10], b[0..10], m1[0..200]);
+    const n2 : usize = msg_pair(TAG_REVOKE, a[0..10], b[0..10], m2[0..200]);
+    const n3 : usize = msg_pair(TAG_APPROVE, b[0..10], a[0..10], m3[0..200]);
+    assert n1 > 0 and n2 > 0 and n3 > 0;
+    assert same_bytes(m1[0..n1], m2[0..n2]) == false;
+    assert same_bytes(m1[0..n1], m3[0..n3]) == false;
+    assert contains(m1[0..n1], "target=01020304050607080910") == false;
+    assert contains(m1[0..n1], "target=0102030405060708090a");
+    assert msg_pair(TAG_APPROVE, a[0..9], b[0..10], m1[0..200]) == 0;
+}
+
+test the_envelope_signature_covers_every_label {
+    var w : [10]u8 = undefined;
+    var t : [10]u8 = undefined;
+    kfpn(w[0..10], 1);
+    kfpn(t[0..10], 100);
+    var dg : [32]u8 = undefined;
+    kfill(dg[0..32], 7);
+    var base : [400]u8 = undefined;
+    const n : usize = msg_envelope(1, 2, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], base[0..400]);
+    assert n > 0;
+    var other : [400]u8 = undefined;
+    // each field alone changes the signed bytes
+    var k : usize = msg_envelope(2, 2, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    k = msg_envelope(1, 3, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    k = msg_envelope(1, 2, 6, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    k = msg_envelope(1, 2, 5, OP_DEL, w[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    k = msg_envelope(1, 2, 5, OP_PUT, t[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    k = msg_envelope(1, 2, 5, OP_PUT, w[0..10], w[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    dg[31] = 8;
+    k = msg_envelope(1, 2, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]);
+    assert same_bytes(base[0..n], other[0..k]) == false;
+    // an out-of-range provider, slot or op makes no message
+    assert msg_envelope(PROVIDER_COUNT, 2, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]) == 0;
+    assert msg_envelope(1, MAX_KEYS, 5, OP_PUT, w[0..10], t[0..10], dg[0..32], other[0..400]) == 0;
+    assert msg_envelope(1, 2, 5, 2, w[0..10], t[0..10], dg[0..32], other[0..400]) == 0;
+}
+
+test the_first_device_alone_is_trusted_and_a_new_one_is_pending {
+    var isgen : [3]u32 = undefined;
+    var out : [3]u32 = undefined;
+    var z : [1]u32 = undefined;
+    isgen[0] = 1;
+    isgen[1] = 0;
+    isgen[2] = 0;
+    z[0] = 0;
+    assert fold_trust(2, isgen[0..3], 0, z[0..1], z[0..1], z[0..1], 0, z[0..1], z[0..1], z[0..1], out[0..3]) == 1;
+    assert out[0] == DS_TRUSTED and out[1] == DS_PENDING;
+    assert may_receive(out[1]) == false;
+    assert may_receive(out[0]);
+}
+
+test a_device_is_trusted_only_by_the_signature_of_a_trusted_one {
+    var isgen : [4]u32 = undefined;
+    var out : [4]u32 = undefined;
+    var apt : [3]u32 = undefined;
+    var apa : [3]u32 = undefined;
+    var apok : [3]u32 = undefined;
+    var z : [1]u32 = undefined;
+    z[0] = 0;
+    isgen[0] = 1;
+    isgen[1] = 0;
+    isgen[2] = 0;
+    isgen[3] = 0;
+    // device 1 approved by 0 (good); device 2 approved by 3, which is itself unapproved; device 3 approves itself
+    apt[0] = 1;
+    apa[0] = 0;
+    apok[0] = 1;
+    apt[1] = 2;
+    apa[1] = 3;
+    apok[1] = 1;
+    apt[2] = 3;
+    apa[2] = 3;
+    apok[2] = 1;
+    assert fold_trust(4, isgen[0..4], 3, apt[0..3], apa[0..3], apok[0..3], 0, z[0..1], z[0..1], z[0..1], out[0..4]) == 2;
+    assert out[0] == DS_TRUSTED and out[1] == DS_TRUSTED and out[2] == DS_PENDING and out[3] == DS_PENDING;
+    // the same approval with a bad signature trusts nobody new
+    apok[0] = 0;
+    assert fold_trust(4, isgen[0..4], 3, apt[0..3], apa[0..3], apok[0..3], 0, z[0..1], z[0..1], z[0..1], out[0..4]) == 1;
+    assert out[1] == DS_PENDING;
+}
+
+test the_order_of_approval_records_never_matters {
+    var isgen : [3]u32 = undefined;
+    var out : [3]u32 = undefined;
+    var apt : [2]u32 = undefined;
+    var apa : [2]u32 = undefined;
+    var apok : [2]u32 = undefined;
+    var z : [1]u32 = undefined;
+    z[0] = 0;
+    isgen[0] = 1;
+    isgen[1] = 0;
+    isgen[2] = 0;
+    // chain 0 -> 1 -> 2, listed with the later link first
+    apt[0] = 2;
+    apa[0] = 1;
+    apok[0] = 1;
+    apt[1] = 1;
+    apa[1] = 0;
+    apok[1] = 1;
+    assert fold_trust(3, isgen[0..3], 2, apt[0..2], apa[0..2], apok[0..2], 0, z[0..1], z[0..1], z[0..1], out[0..3]) == 3;
+    assert out[2] == DS_TRUSTED;
+}
+
+test two_genesis_records_trust_nobody {
+    var isgen : [2]u32 = undefined;
+    var out : [2]u32 = undefined;
+    var z : [1]u32 = undefined;
+    z[0] = 0;
+    isgen[0] = 1;
+    isgen[1] = 1;
+    assert fold_trust(2, isgen[0..2], 0, z[0..1], z[0..1], z[0..1], 0, z[0..1], z[0..1], z[0..1], out[0..2]) == 0;
+    assert out[0] == DS_PENDING and out[1] == DS_PENDING;
+    isgen[0] = 0;
+    isgen[1] = 0;
+    assert fold_trust(2, isgen[0..2], 0, z[0..1], z[0..1], z[0..1], 0, z[0..1], z[0..1], z[0..1], out[0..2]) == 0;
+}
+
+test a_revocation_removes_a_device_and_a_reject_removes_a_pending_one {
+    var isgen : [3]u32 = undefined;
+    var out : [3]u32 = undefined;
+    var apt : [1]u32 = undefined;
+    var apa : [1]u32 = undefined;
+    var apok : [1]u32 = undefined;
+    var rvt : [2]u32 = undefined;
+    var rvb : [2]u32 = undefined;
+    var rvok : [2]u32 = undefined;
+    isgen[0] = 1;
+    isgen[1] = 0;
+    isgen[2] = 0;
+    apt[0] = 1;
+    apa[0] = 0;
+    apok[0] = 1;
+    // device 0 revokes 1 (trusted) and 2 (pending, i.e. Reject)
+    rvt[0] = 1;
+    rvb[0] = 0;
+    rvok[0] = 1;
+    rvt[1] = 2;
+    rvb[1] = 0;
+    rvok[1] = 1;
+    assert fold_trust(3, isgen[0..3], 1, apt[0..1], apa[0..1], apok[0..1], 2, rvt[0..2], rvb[0..2], rvok[0..2], out[0..3]) == 1;
+    assert out[0] == DS_TRUSTED and out[1] == DS_REVOKED and out[2] == DS_REVOKED;
+    // a revocation by a device that is not trusted does nothing; a bad signature does nothing
+    rvb[0] = 2;
+    rvok[1] = 0;
+    assert fold_trust(3, isgen[0..3], 1, apt[0..1], apa[0..1], apok[0..1], 2, rvt[0..2], rvb[0..2], rvok[0..2], out[0..3]) == 2;
+    assert out[1] == DS_TRUSTED and out[2] == DS_PENDING;
+}
+
+test mutual_revocation_revokes_both_and_approved_by_lists_the_children {
+    var isgen : [3]u32 = undefined;
+    var out : [3]u32 = undefined;
+    var apt : [2]u32 = undefined;
+    var apa : [2]u32 = undefined;
+    var apok : [2]u32 = undefined;
+    var rvt : [2]u32 = undefined;
+    var rvb : [2]u32 = undefined;
+    var rvok : [2]u32 = undefined;
+    isgen[0] = 1;
+    isgen[1] = 0;
+    isgen[2] = 0;
+    apt[0] = 1;
+    apa[0] = 0;
+    apok[0] = 1;
+    apt[1] = 2;
+    apa[1] = 1;
+    apok[1] = 1;
+    rvt[0] = 0;
+    rvb[0] = 1;
+    rvok[0] = 1;
+    rvt[1] = 1;
+    rvb[1] = 0;
+    rvok[1] = 1;
+    // 0 and 1 revoke each other; 2 stays (rule 4) and the owner is told 1 approved it
+    assert fold_trust(3, isgen[0..3], 2, apt[0..2], apa[0..2], apok[0..2], 2, rvt[0..2], rvb[0..2], rvok[0..2], out[0..3]) == 1;
+    assert out[0] == DS_REVOKED and out[1] == DS_REVOKED and out[2] == DS_TRUSTED;
+    assert approved_by(1, 2, apt[0..2], apa[0..2], apok[0..2]) == 4;
+    assert approved_by(0, 2, apt[0..2], apa[0..2], apok[0..2]) == 2;
+    assert approved_by(2, 2, apt[0..2], apa[0..2], apok[0..2]) == 0;
+}
+
+test approval_rights_and_recipients {
+    assert may_approve(DS_TRUSTED, 0, 1);
+    assert may_approve(DS_TRUSTED, 1, 1) == false;
+    assert may_approve(DS_PENDING, 0, 1) == false;
+    assert may_approve(DS_REVOKED, 0, 1) == false;
+    var st : [4]u32 = undefined;
+    st[0] = DS_TRUSTED;
+    st[1] = DS_PENDING;
+    st[2] = DS_TRUSTED;
+    st[3] = DS_REVOKED;
+    // device 0 seals to device 2 only: not to itself, not to a pending or revoked one
+    assert recipients(4, st[0..4], 0) == 4;
+    assert recipients(4, st[0..4], 2) == 1;
+    assert recipients(4, st[0..4], 1) == 5;
+}
+
+test a_reseal_adds_the_new_and_drops_the_removed {
+    // want devices 1 and 2 (mask 6), have 2 and 3 (mask 12)
+    assert plan_add(6, 12) == 2;
+    assert plan_drop(6, 12) == 8;
+    assert plan_add(6, 6) == 0 and plan_drop(6, 6) == 0;
+    assert plan_drop(0, 12) == 12;
+    assert revoke_needs_rotation(true);
+    assert revoke_needs_rotation(false) == false;
+}
+
+test the_newer_publication_wins_and_ties_break_on_the_writer {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    kfpn(a[0..10], 1);
+    kfpn(b[0..10], 1);
+    assert ver_newer(5, a[0..10], 4, b[0..10]);
+    assert ver_newer(4, a[0..10], 5, b[0..10]) == false;
+    // same version: the higher writer fingerprint wins, the same writer never beats itself
+    b[7] = b[7] + 1;
+    assert ver_newer(5, b[0..10], 5, a[0..10]);
+    assert ver_newer(5, a[0..10], 5, b[0..10]) == false;
+    assert ver_newer(5, a[0..10], 5, a[0..10]) == false;
+    // both sides agree on one winner
+    assert ver_newer(5, a[0..10], 5, b[0..10]) != ver_newer(5, b[0..10], 5, a[0..10]);
+    assert next_version(0) == 1 and next_version(7) == 8;
+    assert next_version(4294967295) == 0;
+}
+
+test accept_takes_only_what_every_rule_allows {
+    assert accept(DS_TRUSTED, true, DS_TRUSTED, 1, true, true, true) == AR_OK;
+    assert accept(DS_PENDING, true, DS_TRUSTED, 1, true, true, true) == AR_NOT_TRUSTED_ME;
+    assert accept(DS_REVOKED, true, DS_TRUSTED, 1, true, true, true) == AR_NOT_TRUSTED_ME;
+    assert accept(DS_TRUSTED, false, DS_TRUSTED, 1, true, true, true) == AR_NOT_FOR_ME;
+    assert accept(DS_TRUSTED, true, DS_PENDING, 1, true, true, true) == AR_WRITER;
+    assert accept(DS_TRUSTED, true, DS_REVOKED, 1, true, true, true) == AR_WRITER;
+    assert accept(DS_TRUSTED, true, DS_TRUSTED, 2, true, true, true) == AR_SUITE;
+    assert accept(DS_TRUSTED, true, DS_TRUSTED, 1, false, true, true) == AR_BAD_SIG;
+    assert accept(DS_TRUSTED, true, DS_TRUSTED, 1, true, true, false) == AR_STALE;
+    assert accept(DS_TRUSTED, true, DS_TRUSTED, 1, true, false, true) == AR_BAD_FIELD;
+    assert suite_supported(SUITE_P256) and suite_supported(SUITE_X25519_ED25519) == false;
+}
+
+test a_received_key_must_fit_the_key_manager {
+    assert plain_fits("sk-fake-0000000000000000");
+    assert plain_fits("") == false;
+    assert plain_fits("has space") == false;
+}
+
+test store_paths_stay_inside_the_five_folders {
+    assert store_path_ok("devices/0102030405060708090a.dev");
+    assert store_path_ok("genesis/0102030405060708090a.gen");
+    assert store_path_ok("approvals/aa.bb.apr");
+    assert store_path_ok("revocations/aa.bb.rev");
+    assert store_path_ok("keys/1-2-0102030405060708090a.env");
+    assert store_path_ok("keys/../x") == false;
+    assert store_path_ok("keys/.hidden") == false;
+    assert store_path_ok("keys/") == false;
+    assert store_path_ok("other/x") == false;
+    assert store_path_ok("keys/UPPER") == false;
+    assert store_path_ok("keys/a/b") == false;
+    assert store_path_ok("keys/a b") == false;
+    assert store_path_ok(".github/workflows/x.yml") == false;
+    var p : [64]u8 = undefined;
+    var to : [10]u8 = undefined;
+    kfpn(to[0..10], 1);
+    const n : usize = env_path(1, 2, to[0..10], p[0..64]);
+    assert same_bytes(p[0..n], "keys/1-2-0102030405060708090a.env");
+    assert store_path_ok(p[0..n]);
+    assert env_path(PROVIDER_COUNT, 0, to[0..10], p[0..64]) == 0;
+}
+
+test an_envelope_document_round_trips_and_holds_no_plaintext {
+    var w : [10]u8 = undefined;
+    var t : [10]u8 = undefined;
+    kfpn(w[0..10], 1);
+    kfpn(t[0..10], 100);
+    // the "key" and its "ciphertext" are fake: the ciphertext bytes are unrelated to the plaintext text
+    const plain : []const u8 = "sk-fake-AAAAAAAAAAAAAAAA";
+    var ct : [60]u8 = undefined;
+    var i : usize = 0;
+    while (i < 60) { ct[i] = @as(u8, @intCast(200 - i)); i = i + 1; }
+    var sg : [32]u8 = undefined;
+    kfill(sg[0..32], 9);
+    var doc : [1536]u8 = undefined;
+    const n : usize = doc_envelope(4, 1, 12, OP_PUT, w[0..10], t[0..10], 1, ct[0..60], sg[0..32], doc[0..1536]);
+    assert n > 0;
+    assert doc_leaks(doc[0..n], plain) == false;
+    // negative control: a document that does carry the plaintext is caught
+    var bad : [1536]u8 = undefined;
+    const nb : usize = putn(bad[0..1536], 0, "kind=env\nnote=");
+    const nb2 : usize = putn(bad[0..1536], nb, plain);
+    assert doc_leaks(bad[0..nb2], plain);
+    // parse it back
+    var f : [7]u64 = undefined;
+    var pw : [10]u8 = undefined;
+    var pt : [10]u8 = undefined;
+    var pct : [CT_MAX]u8 = undefined;
+    var psg : [96]u8 = undefined;
+    assert parse_envelope(doc[0..n], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]);
+    assert f[0] == 4 and f[1] == 1 and f[2] == 12 and f[3] == 0 and f[4] == 1 and f[5] == 60 and f[6] == 32;
+    assert same_bytes(pw[0..10], w[0..10]) and same_bytes(pt[0..10], t[0..10]);
+    assert same_bytes(pct[0..60], ct[0..60]) and same_bytes(psg[0..32], sg[0..32]);
+}
+
+test a_hostile_or_broken_envelope_document_parses_to_nothing {
+    var w : [10]u8 = undefined;
+    var t : [10]u8 = undefined;
+    kfpn(w[0..10], 1);
+    kfpn(t[0..10], 100);
+    var ct : [8]u8 = undefined;
+    kfill(ct[0..8], 3);
+    var sg : [8]u8 = undefined;
+    kfill(sg[0..8], 4);
+    var doc : [1536]u8 = undefined;
+    const n : usize = doc_envelope(4, 1, 12, OP_PUT, w[0..10], t[0..10], 1, ct[0..8], sg[0..8], doc[0..1536]);
+    var f : [7]u64 = undefined;
+    var pw : [10]u8 = undefined;
+    var pt : [10]u8 = undefined;
+    var pct : [CT_MAX]u8 = undefined;
+    var psg : [96]u8 = undefined;
+    assert parse_envelope(doc[0..n], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]);
+    // wrong header, truncated before the signature, and a provider out of range
+    assert parse_envelope("kind=env\n", f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]) == false;
+    assert parse_envelope(doc[0..n - 10], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]) == false;
+    var d2 : [1536]u8 = undefined;
+    const n2 : usize = doc_envelope(4, 1, 12, OP_PUT, w[0..10], t[0..10], 1, ct[0..8], sg[0..8], d2[0..1536]);
+    d2[n2 - 1] = 10;
+    var k : usize = 0;
+    while (k + 9 < n2) {
+        if (starts_at(d2[0..n2], k, "provider=4")) { d2[k + 9] = 57; }
+        k = k + 1;
+    }
+    assert parse_envelope(d2[0..n2], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]) == false;
+    // upper-case hex is refused, and a PUT with no ciphertext is not an envelope
+    assert unhex("0A", pct[0..4]) == 0;
+    assert unhex("0a", pct[0..4]) == 1;
+    assert unhex("0", pct[0..4]) == 0;
+    const n3 : usize = doc_envelope(4, 1, 12, OP_PUT, w[0..10], t[0..10], 1, ct[0..0], sg[0..8], d2[0..1536]);
+    assert parse_envelope(d2[0..n3], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]) == false;
+    // a delete with no ciphertext is fine
+    const n4 : usize = doc_envelope(4, 1, 13, OP_DEL, w[0..10], t[0..10], 1, ct[0..0], sg[0..8], d2[0..1536]);
+    assert parse_envelope(d2[0..n4], f[0..7], pw[0..10], pt[0..10], pct[0..CT_MAX], psg[0..96]);
+    assert f[3] == 1 and f[5] == 0;
+}
+
+test sync_status_follows_the_login_then_the_registry {
+    assert sync_status(false, true, false, DS_TRUSTED, 0, 1) == SY_SIGNED_OUT;
+    assert sync_status(true, false, false, DS_TRUSTED, 0, 1) == SY_NO_DEVICE;
+    assert sync_status(true, true, true, DS_TRUSTED, 0, 1) == SY_CONTESTED;
+    assert sync_status(true, true, false, DS_REVOKED, 0, 1) == SY_REVOKED;
+    assert sync_status(true, true, false, DS_PENDING, 3, 1) == SY_PENDING;
+    assert sync_status(true, true, false, DS_TRUSTED, 2, 1) == SY_WAITING;
+    assert sync_status(true, true, false, DS_TRUSTED, 0, 0) == SY_ALONE;
+    assert sync_status(true, true, false, DS_TRUSTED, 0, 2) == SY_SYNCED;
+    var w : [32]u8 = undefined;
+    assert same_bytes(w[0..sync_word(SY_SYNCED, w[0..32])], "in sync");
+    assert same_bytes(w[0..sync_word(SY_PENDING, w[0..32])], "waiting for approval");
+}
+
+test the_devices_rows_and_buttons {
+    var fp : [10]u8 = undefined;
+    kfpn(fp[0..10], 1);
+    var o : [80]u8 = undefined;
+    var n : usize = kd_row_text("mini", fp[0..10], DS_TRUSTED, true, o[0..80]);
+    assert same_bytes(o[0..n], "this  mini  0102-0304-0506-0708-090a  trusted");
+    n = kd_row_text("air", fp[0..10], DS_PENDING, false, o[0..80]);
+    assert same_bytes(o[0..n], "air  0102-0304-0506-0708-090a  pending");
+    // the buttons only on a pending device, only for a trusted viewer
+    assert kd_buttons(DS_TRUSTED, 0, 1, DS_PENDING);
+    assert kd_buttons(DS_PENDING, 0, 1, DS_PENDING) == false;
+    assert kd_buttons(DS_TRUSTED, 0, 1, DS_TRUSTED) == false;
+    assert kd_buttons(DS_TRUSTED, 1, 1, DS_PENDING) == false;
+    // hit test: Approve left of Reject, both inside the row band
+    const ax : f64 = kd_btn_x(100.0, 300.0, 16.0, KD_APPROVE);
+    const rx : f64 = kd_btn_x(100.0, 300.0, 16.0, KD_REJECT);
+    assert ax < rx and rx + KD_BTN_W == 384.0;
+    assert kd_hit(ax + 2.0, 50.0, 100.0, 300.0, 16.0, 45.0) == KD_APPROVE;
+    assert kd_hit(rx + 2.0, 50.0, 100.0, 300.0, 16.0, 45.0) == KD_REJECT;
+    assert kd_hit(ax - 5.0, 50.0, 100.0, 300.0, 16.0, 45.0) == KD_NONE;
+    assert kd_hit(ax + 2.0, 70.0, 100.0, 300.0, 16.0, 45.0) == KD_NONE;
+}
+
+test the_devices_view_buffer_holds_rows_and_refuses_what_does_not_fit {
+    var v : [400]u8 = undefined;
+    kd_view_clear(v[0..400]);
+    assert kd_view_rows(v[0..400]) == 0;
+    assert kd_view_set(v[0..400], 0, 0, "in sync");
+    assert kd_view_set(v[0..400], 1, KDF_MINE, "this device  0102-0304-0506-0708-090a");
+    assert kd_view_rows(v[0..400]) == 2;
+    assert kd_view_flags(v[0..400], 1) == KDF_MINE and kd_view_flags(v[0..400], 0) == 0;
+    const at : usize = kd_view_text_at(v[0..400], 1);
+    const ln : usize = kd_view_text_len(v[0..400], 1);
+    assert same_bytes(v[at..at + ln], "this device  0102-0304-0506-0708-090a");
+    // row 5 is the last; row 6 does not exist; a short buffer is refused
+    assert kd_view_set(v[0..400], 5, 0, "x");
+    assert kd_view_rows(v[0..400]) == 6;
+    assert kd_view_set(v[0..400], 6, 0, "x") == false;
+    assert kd_view_set(v[0..100], 0, 0, "x") == false;
+    // a long text is cut inside its row and never runs into the next
+    var long : [100]u8 = undefined;
+    kfill(long[0..100], 65);
+    assert kd_view_set(v[0..400], 2, 0, long[0..100]);
+    assert kd_view_text_len(v[0..400], 2) == 62;
+    assert kd_view_text_len(v[0..400], 3) == 0;
+}
+
+test the_local_row_and_the_room_for_the_section {
+    var fp : [10]u8 = undefined;
+    kfpn(fp[0..10], 1);
+    var o : [80]u8 = undefined;
+    var n : usize = kd_local_row(true, fp[0..10], o[0..80]);
+    assert same_bytes(o[0..n], "this device  0102-0304-0506-0708-090a");
+    n = kd_local_row(false, fp[0..10], o[0..80]);
+    assert same_bytes(o[0..n], "this device  no key yet");
+    // 100 pt of room: a header and five rows of 16 pt; less than two rows: nothing drawn
+    assert kd_rows_fit(500.0, 600.0, 6) == 5;
+    assert kd_rows_fit(500.0, 600.0, 2) == 2;
+    assert kd_rows_fit(500.0, 520.0, 2) == 0;
+    assert kd_rows_fit(500.0, 400.0, 2) == 0;
+}

@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/port/trinity/fpga/openxc7-synth/uart_bridge.t27
+//
+// Port of the lost FPGA project's uart_bridge.v (the ESP32 command bridge):
+// it receives command bytes from the ESP32 over a 115200-8N1 UART, answers
+// every byte (PING -> PONG, LED on/off -> OK, LED blink -> ACK, anything
+// else is echoed back unchanged), drives the board LED (forced on/off, or a
+// ~0.75 s blink), serialises its responses back over the same line, and
+// holds the fabric in a power-on reset window driven by a free-running
+// 16-bit counter.
+//
+// Not claimed: clock rate, bit widths, reset polarity and every other
+// exchange-specific decision are the Synthesizer's job, not this port's;
+// the shift/counter register plumbing (when values are clocked into
+// registers) stays in the Verilog backend. This file carries the
+// byte-level decisions: command decode, LED control, and the TX/RX frame
+// state machines.
+//
+// Claim status: [original file lost] -- uart_bridge.v is not in the git
+// history; the decisions below are a transcript of its register transfer
+// logic as recorded in the porting notes for #9310, with each function
+// naming the statement it mirrors.
+//
+// TRINITY: decisions come from uart_bridge.v (lost FPGA project, ESP32
+// protocol); they are the original's rules *mutatis mutandis* -- the
+// per-clock register plumbing is omitted, the decision logic is kept
+// one-to-one.
+
+module uart_bridge {
+
+    // ---- UART configuration (uart_bridge.v localparams) --------------------
+    // 16x oversampling: one oversample tick every CLK_DIV clocks
+    // (50 MHz / (16 * 115200) = 27).
+    const CLK_FREQ: u32 = 50_000_000;
+    const BAUD_RATE: u32 = 115200;
+    const OVERSAMPLE: u32 = 16;
+    const CLK_DIV: u32 = CLK_FREQ / (OVERSAMPLE * BAUD_RATE);
+
+    // ---- Power-on reset (uart_bridge.v reset_counter) -----------------------
+    // rst = (reset_counter < 16'hFFFF): reset is asserted while the
+    // free-running 16-bit counter is below the wrap point.
+    const RESET_WRAP: u32 = 0xFFFF;
+
+    // ---- LED blink period (uart_bridge.v BLINK_PERIOD, ~0.75 s) -------------
+    const BLINK_PERIOD: u32 = CLK_FREQ * 3 / 4;
+
+    // ---- ESP32 command set (uart_bridge.v case arms) ------------------------
+    const CMD_PING: u8 = 0x03;
+    const CMD_LED_ON: u8 = 0x10;
+    const CMD_LED_OFF: u8 = 0x11;
+    const CMD_LED_BLINK: u8 = 0x12;
+
+    const RESP_PONG: u8 = 0x83;
+    const RESP_OK: u8 = 0xFF;
+    const RESP_ACK: u8 = 0xAA;
+
+    // ---- TX FSM states (uart_bridge.v localparam TX_IDLE..TX_STOP) ----------
+    const TX_IDLE: u8 = 0;
+    const TX_START: u8 = 1;
+    const TX_DATA: u8 = 2;
+    const TX_STOP: u8 = 3;
+
+    // ---- RX FSM states (uart_bridge.v localparam RX_IDLE..RX_STOP) ----------
+    const RX_IDLE: u8 = 0;
+    const RX_START: u8 = 1;
+    const RX_DATA: u8 = 2;
+    const RX_STOP: u8 = 3;
+
+    // ---- Power-on reset ------------------------------------------------------
+
+    // uart_bridge.v: wire rst = (reset_counter < 16'hFFFF);
+    fn rst_active(counter: u32) -> bool {
+        return counter < RESET_WRAP;
+    }
+
+    // uart_bridge.v: reset_counter <= reset_counter + 1; -- a 16-bit
+    // register that free-runs and wraps at 0xFFFF.
+    fn counter_step(counter: u32) -> u32 {
+        if (counter == RESET_WRAP) { return 0; }
+        return counter + 1;
+    }
+
+    // ---- Command decode ------------------------------------------------------
+
+    // uart_bridge.v command processor: every received byte is answered.
+    // PING -> PONG, LED on/off -> OK, LED blink -> ACK, anything else is
+    // echoed back unchanged.
+    fn response_for(cmd: u8) -> u8 {
+        if (cmd == CMD_PING) { return RESP_PONG; }
+        if (cmd == CMD_LED_ON) { return RESP_OK; }
+        if (cmd == CMD_LED_OFF) { return RESP_OK; }
+        if (cmd == CMD_LED_BLINK) { return RESP_ACK; }
+        return cmd;
+    }
+
+    // uart_bridge.v LED decision: ON forces the LED on, OFF forces it off,
+    // BLINK toggles it whenever the blink counter has wrapped back to zero
+    // (if (blink_cnt == 0) led_reg <= ~led_reg), every other command
+    // leaves the LED as it is.
+    fn next_led(cmd: u8, led: bool, blink_tick: bool) -> bool {
+        if (cmd == CMD_LED_ON) { return true; }
+        if (cmd == CMD_LED_OFF) { return false; }
+        if (cmd == CMD_LED_BLINK) {
+            if (blink_tick) { return !led; }
+            return led;
+        }
+        return led;
+    }
+
+    // uart_bridge.v: blink_cnt <= (blink_cnt == BLINK_PERIOD - 1) ? 0 :
+    // blink_cnt + 1;
+    fn blink_next(count: u32) -> u32 {
+        if (count == BLINK_PERIOD - 1) { return 0; }
+        return count + 1;
+    }
+
+    // uart_bridge.v: the blink toggle fires when the counter has wrapped
+    // to zero.
+    fn blink_ticks(count: u32) -> bool {
+        return count == 0;
+    }
+
+    // ---- TX serializer -------------------------------------------------------
+
+    // uart_bridge.v: a byte is accepted only in TX_IDLE while a response
+    // is pending (if (tx_state == TX_IDLE && resp_pending)).
+    fn tx_accepts(state: u8, pending: bool) -> bool {
+        return state == TX_IDLE and pending;
+    }
+
+    // uart_bridge.v uart_tx_reg decision: the line idles and stops high,
+    // the start bit pulls it low, data bits are driven LSB-first from the
+    // shift register.
+    fn tx_line_level(state: u8, shift: u8) -> u8 {
+        if (state == TX_START) { return 0; }
+        if (state == TX_DATA) { return shift & 1; }
+        return 1;
+    }
+
+    // uart_bridge.v: state progression once a bit period has elapsed.
+    // START moves to DATA; DATA finishes after the eighth data bit
+    // (tx_bit_cnt == 7) into STOP; STOP returns to IDLE; IDLE waits for
+    // the next accepted byte.
+    fn tx_next_state(state: u8, bit_cnt: u8) -> u8 {
+        if (state == TX_START) { return TX_DATA; }
+        if (state == TX_DATA) {
+            if (bit_cnt == 7) { return TX_STOP; }
+            return TX_DATA;
+        }
+        return TX_IDLE;
+    }
+
+    // uart_bridge.v: the data bit counter only advances while serialising
+    // data bits (if (tx_bit_cnt < 7) tx_bit_cnt <= tx_bit_cnt + 1).
+    fn tx_next_bit_cnt(state: u8, bit_cnt: u8) -> u8 {
+        if (state == TX_DATA and bit_cnt < 7) { return bit_cnt + 1; }
+        return bit_cnt;
+    }
+
+    // uart_bridge.v: tx_busy is cleared once the stop bit period has
+    // completed (tx_busy <= 0 in the TX_STOP arm); it was raised when the
+    // byte was accepted.
+    fn tx_busy_next(state: u8, busy: bool) -> bool {
+        if (state == TX_STOP) { return false; }
+        return busy;
+    }
+
+    // ---- RX deserializer -----------------------------------------------------
+
+    // uart_bridge.v RX FSM, evaluated once per oversample tick. In
+    // RX_START the line is sampled at mid start bit (rx_sample == 7):
+    // still low means a real start bit and the FSM moves to RX_DATA; a
+    // line that never went low aborts the false start back to RX_IDLE
+    // after the sampling window. In RX_DATA the byte finishes after the
+    // eighth latched bit (rx_bit_cnt == 7) into RX_STOP. The stop period
+    // hands the finished byte to the command processor (rx_valid pulses,
+    // rx_data latches) and returns to RX_IDLE, where the FSM waits for
+    // the next falling edge on the line.
+    fn rx_next_state(state: u8, sample: u8, bit_cnt: u8, line: bool) -> u8 {
+        if (state == RX_START) {
+            if (sample == 7 and !line) { return RX_DATA; }
+            if (sample < 15) { return RX_START; }
+            return RX_IDLE;
+        }
+        if (state == RX_DATA) {
+            if (sample == 15 and bit_cnt == 7) { return RX_STOP; }
+            return RX_DATA;
+        }
+        return RX_IDLE;
+    }
+
+    // uart_bridge.v: the data bit counter advances only when a bit is
+    // latched (at rx_sample == 15) and the byte is not yet complete.
+    fn rx_next_bit_cnt(state: u8, sample: u8, bit_cnt: u8) -> u8 {
+        if (state == RX_DATA and sample == 15 and bit_cnt < 7) { return bit_cnt + 1; }
+        return bit_cnt;
+    }
+
+    // uart_bridge.v: the oversample phase counter runs 0..15 within each
+    // bit period and wraps after the last phase.
+    fn rx_sample_advance(sample: u8) -> u8 {
+        if (sample == 15) { return 0; }
+        return sample + 1;
+    }
+
+    // uart_bridge.v: data bits are assembled LSB-first
+    // (rx_shift_reg <= {uart_rx, rx_shift_reg[7:1]}).
+    fn rx_shift_in(shift: u8, line: bool) -> u8 {
+        if (line) { return (shift >> 1) | 0x80; }
+        return shift >> 1;
+    }
+
+    // ---- Tests (T9310: assert on values the original produces) --------------
+
+    test clock_divider_matches_16x_oversampling {
+        var ticks: u32 = CLK_DIV;
+        assert(ticks == 27);
+    }
+
+    test power_on_reset_holds_below_the_wrap_point {
+        assert(rst_active(0) == true);
+        assert(rst_active(RESET_WRAP - 1) == true);
+        assert(rst_active(RESET_WRAP) == false);
+    }
+
+    test reset_counter_free_runs_and_wraps {
+        assert(counter_step(0) == 1);
+        assert(counter_step(RESET_WRAP - 1) == RESET_WRAP);
+        assert(counter_step(RESET_WRAP) == 0);
+    }
+
+    test ping_answers_pong {
+        assert(response_for(CMD_PING) == RESP_PONG);
+    }
+
+    test led_on_and_off_answer_ok {
+        assert(response_for(CMD_LED_ON) == RESP_OK);
+        assert(response_for(CMD_LED_OFF) == RESP_OK);
+    }
+
+    test blink_answers_ack {
+        assert(response_for(CMD_LED_BLINK) == RESP_ACK);
+    }
+
+    test unknown_command_is_echoed {
+        assert(response_for(0x55) == 0x55);
+        assert(response_for(0x00) == 0x00);
+        assert(response_for(RESP_PONG) == RESP_PONG);
+    }
+
+    test on_comb_decodes_the_command_byte {
+        assert(on_comb(CMD_PING) == RESP_PONG);
+        assert(on_comb(0x55) == 0x55);
+    }
+
+    test led_follows_on_and_off_commands {
+        assert(next_led(CMD_LED_ON, false, false) == true);
+        assert(next_led(CMD_LED_OFF, true, false) == false);
+    }
+
+    test led_blink_toggles_on_the_wrap_tick {
+        assert(next_led(CMD_LED_BLINK, false, true) == true);
+        assert(next_led(CMD_LED_BLINK, true, true) == false);
+        assert(next_led(CMD_LED_BLINK, false, false) == false);
+        assert(next_led(CMD_LED_BLINK, true, false) == true);
+    }
+
+    test ping_and_echo_leave_the_led_alone {
+        assert(next_led(CMD_PING, true, true) == true);
+        assert(next_led(0x55, false, true) == false);
+    }
+
+    test blink_counter_wraps_after_the_period {
+        assert(blink_ticks(0) == true);
+        assert(blink_ticks(1) == false);
+        assert(blink_next(0) == 1);
+        assert(blink_next(BLINK_PERIOD - 1) == 0);
+    }
+
+    test tx_accepts_only_when_idle_and_pending {
+        assert(tx_accepts(TX_IDLE, true) == true);
+        assert(tx_accepts(TX_IDLE, false) == false);
+        assert(tx_accepts(TX_DATA, true) == false);
+    }
+
+    test tx_line_levels_form_8n1 {
+        assert(tx_line_level(TX_IDLE, 0) == 1);
+        assert(tx_line_level(TX_START, 0) == 0);
+        assert(tx_line_level(TX_DATA, 0x55) == 1);
+        assert(tx_line_level(TX_DATA, 0xAA) == 0);
+        assert(tx_line_level(TX_STOP, 0) == 1);
+    }
+
+    test tx_walks_start_data_stop {
+        assert(tx_next_state(TX_START, 0) == TX_DATA);
+        assert(tx_next_state(TX_DATA, 0) == TX_DATA);
+        assert(tx_next_state(TX_DATA, 6) == TX_DATA);
+        assert(tx_next_state(TX_DATA, 7) == TX_STOP);
+        assert(tx_next_state(TX_STOP, 7) == TX_IDLE);
+        assert(tx_next_state(TX_IDLE, 0) == TX_IDLE);
+    }
+
+    test tx_counts_eight_data_bits {
+        assert(tx_next_bit_cnt(TX_DATA, 0) == 1);
+        assert(tx_next_bit_cnt(TX_DATA, 6) == 7);
+        assert(tx_next_bit_cnt(TX_DATA, 7) == 7);
+        assert(tx_next_bit_cnt(TX_START, 0) == 0);
+    }
+
+    test tx_busy_clears_after_the_stop_bit {
+        assert(tx_busy_next(TX_STOP, true) == false);
+        assert(tx_busy_next(TX_DATA, true) == true);
+        assert(tx_busy_next(TX_IDLE, false) == false);
+    }
+
+    test rx_checks_the_start_bit_at_mid_bit {
+        assert(rx_next_state(RX_START, 7, 0, false) == RX_DATA);
+        assert(rx_next_state(RX_START, 7, 0, true) == RX_START);
+        assert(rx_next_state(RX_START, 15, 0, true) == RX_IDLE);
+        assert(rx_next_state(RX_START, 3, 0, false) == RX_START);
+    }
+
+    test rx_finishes_after_eight_latched_bits {
+        assert(rx_next_state(RX_DATA, 15, 7, false) == RX_STOP);
+        assert(rx_next_state(RX_DATA, 15, 6, false) == RX_DATA);
+        assert(rx_next_state(RX_STOP, 15, 7, false) == RX_IDLE);
+        assert(rx_next_state(RX_IDLE, 0, 0, true) == RX_IDLE);
+    }
+
+    test rx_counts_bits_only_when_latching {
+        assert(rx_next_bit_cnt(RX_DATA, 15, 0) == 1);
+        assert(rx_next_bit_cnt(RX_DATA, 15, 6) == 7);
+        assert(rx_next_bit_cnt(RX_DATA, 15, 7) == 7);
+        assert(rx_next_bit_cnt(RX_DATA, 8, 3) == 3);
+    }
+
+    test rx_oversample_phase_wraps {
+        assert(rx_sample_advance(0) == 1);
+        assert(rx_sample_advance(14) == 15);
+        assert(rx_sample_advance(15) == 0);
+    }
+
+    test rx_assembles_lsb_first {
+        assert(rx_shift_in(0x00, true) == 0x80);
+        assert(rx_shift_in(0x00, false) == 0x00);
+        assert(rx_shift_in(0x80, true) == 0xC0);
+        assert(rx_shift_in(0xFF, false) == 0x7F);
+        assert(rx_shift_in(0x55, true) == 0xAA);
+    }
+}
+
+// The hardware boundary (T187): the command decode is the bridge's purely
+// combinational surface -- a received command byte in, the response byte
+// out. specs/fpga/uart.t27 derives the same kind of port; response_for is
+// the function behind it here.
+fn on_comb(cmd: u8) -> u8 {
+    return response_for(cmd);
+}
