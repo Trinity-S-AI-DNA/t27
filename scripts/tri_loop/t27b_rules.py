@@ -12,6 +12,7 @@ spec's verdict codes. An unknown string is an error, never a guess.
 """
 
 import ctypes
+import functools
 import hashlib
 import os
 import subprocess
@@ -32,6 +33,24 @@ RATCHETS = (None, "VACUITY MEASURED", "UNEXPECTED FAILURE", "UNEXPECTED PASS", "
 REASONS = (None, "unimplemented", "reference-bug", "n/a")
 CLAIMS = (None, "CLAIM-DEAD", "CLAIM-OLD")
 CHECKOUTS = (None, "LAB-CHECKOUT", "LAB-RECLONED")
+IMAGES = (None, "LAB-IMAGE-STALE")
+# Merge gate (#6244): GitHub's check states, in the spec's state codes.
+CHECK_STATES = {"SUCCESS": 0,
+                "PENDING": 1, "QUEUED": 1, "IN_PROGRESS": 1, "WAITING": 1, "REQUESTED": 1, "EXPECTED": 1,
+                "FAILURE": 2, "ERROR": 2, "CANCELLED": 2, "TIMED_OUT": 2, "ACTION_REQUIRED": 2,
+                "STARTUP_FAILURE": 2,
+                "ABSENT": 3,
+                "SKIPPED": 4, "NEUTRAL": 4, "STALE": 4}
+# One name per state code, for a state the spec returns (master_state).
+STATE_NAMES = ("SUCCESS", "PENDING", "FAILURE", "ABSENT", "NEUTRAL")
+MERGEABLES = {"MERGEABLE": 0, "CONFLICTING": 1, "UNKNOWN": 2}
+EFFECTS = (None, "WAIT", "BLOCK")
+READINESS = ("READY", "WAIT", "RED", "CONFLICT", "RETARGET", "BLOCKED", "CLOSED")
+# `tri t27b watch` (#6285): the stacked parent's state, and what to do.
+PARENTS = ("NONE", "MERGED", "OPEN", "GONE")
+WATCH_ACTIONS = ("WAIT", "MERGE", "RETARGET", "STOP", "DONE")
+# `tri t27b next` (#6317): which side of the lane picker a file counts on.
+LANE_KINDS = (None, "LANE", "REFERENCE-BUG")
 
 
 class RulesUnavailable(RuntimeError):
@@ -90,6 +109,31 @@ def _build():
     so.railway_old.restype = ctypes.c_bool
     so.checkout_code.argtypes = [ctypes.c_bool, ctypes.c_bool]
     so.checkout_code.restype = ctypes.c_uint8
+    so.image_code.argtypes = [ctypes.c_bool] * 3
+    so.image_code.restype = ctypes.c_uint8
+    so.cap_rise_is_new.argtypes = [ctypes.c_uint32] * 3
+    so.cap_rise_is_new.restype = ctypes.c_bool
+    so.is_alarm.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
+    so.is_alarm.restype = ctypes.c_bool
+    so.is_alarm_tests.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_bool, ctypes.c_uint32]
+    so.is_alarm_tests.restype = ctypes.c_bool
+    so.lanes_stop.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    so.lanes_stop.restype = ctypes.c_bool
+    so.check_effect.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_bool]
+    so.check_effect.restype = ctypes.c_uint8
+    so.master_state.argtypes = [ctypes.c_bool, ctypes.c_uint8]
+    so.master_state.restype = ctypes.c_uint8
+    so.effect_fold.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
+    so.effect_fold.restype = ctypes.c_uint8
+    so.pr_ready.argtypes = [ctypes.c_bool, ctypes.c_uint8, ctypes.c_bool, ctypes.c_uint8, ctypes.c_uint8]
+    so.pr_ready.restype = ctypes.c_uint8
+    so.watch_action.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
+    so.watch_action.restype = ctypes.c_uint8
+    so.lane_kind.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
+    so.lane_kind.restype = ctypes.c_uint8
+    for name in ("lane_score", "with_tests"):
+        getattr(so, name).argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        getattr(so, name).restype = ctypes.c_uint32
     return so
 
 
@@ -185,3 +229,87 @@ def railway_old(major):
 
 def checkout(ok, recloned):
     return CHECKOUTS[lib().checkout_code(bool(ok), bool(recloned))]
+
+
+def image(master_known, reported, same):
+    """LAB-IMAGE-STALE or None: is the running lab image master's (#6443)?"""
+    return IMAGES[lib().image_code(bool(master_known), bool(reported), bool(same))]
+
+
+def cap_rise_is_new(not_pass, old_cap, new_not_pass):
+    """True when the rise over `old_cap` is no larger than the specs new to the ledger."""
+    return bool(lib().cap_rise_is_new(_minutes(not_pass), _minutes(old_cap), _minutes(new_not_pass)))
+
+
+def is_alarm(t27b, reference):
+    """True when a run record is a lab alarm: a mismatch or crash always, a fail or
+    timeout only where the reference passes."""
+    return bool(lib().is_alarm(verdict(t27b), verdict(reference)))
+
+
+def is_alarm_tests(t27b, reference, compared, disagree):
+    """is_alarm judged test by test (#6441): with the per-test differential
+    (`compared`), a fail the reference shares is an alarm when other tests fail,
+    and a pass is one when any test's verdict differs."""
+    return bool(lib().is_alarm_tests(verdict(t27b), verdict(reference), bool(compared), int(disagree or 0)))
+
+
+def lanes_stop(jit_interp_mismatch, reference_disagree):
+    """True when the lanes stop (#6441): t27b's JIT against its own interpreter
+    disagrees, or t27b against the reference disagrees on some test."""
+    return bool(lib().lanes_stop(int(jit_interp_mismatch or 0), int(reference_disagree or 0)))
+
+
+def check_state(s):
+    """A GitHub check state or conclusion as the spec's state code; an unknown one is an error."""
+    key = (s or "ABSENT").upper()
+    if key not in CHECK_STATES:
+        raise ValueError(f"unknown check state {s!r}")
+    return CHECK_STATES[key]
+
+
+def check_effect(state, master, required):
+    return EFFECTS[lib().check_effect(check_state(state), check_state(master), bool(required))]
+
+
+def is_red_state(s):
+    """A red check state (failure, error, cancelled, timed out): for reports only."""
+    return check_state(s) == CHECK_STATES["FAILURE"]
+
+
+def master_state(running, last):
+    """The master state a PR check is judged against (#6334): `last` is master's
+    newest completed verdict of it in the window (ABSENT when none), `running`
+    says a newer master run has no conclusion yet."""
+    return STATE_NAMES[lib().master_state(bool(running), check_state(last))]
+
+
+def pr_ready(is_open, mergeable, base_master, effects_required, effects_other):
+    """READY | WAIT | RED | CONFLICT | RETARGET | BLOCKED | CLOSED. The effects are lists of
+    check_effect results; the spec folds them."""
+    fold = lambda xs: functools.reduce(lambda a, e: lib().effect_fold(a, EFFECTS.index(e)), xs, 0)  # noqa: E731
+    m = MERGEABLES.get((mergeable or "UNKNOWN").upper(), 2)
+    return READINESS[lib().pr_ready(bool(is_open), m, bool(base_master), fold(effects_required), fold(effects_other))]
+
+
+def watch_action(verdict, parent):
+    """WAIT | MERGE | RETARGET | STOP | DONE for one PR: `verdict` is pr_ready's
+    string, `parent` one of PARENTS. An unknown string is an error."""
+    if verdict not in READINESS or parent not in PARENTS:
+        raise ValueError(f"unknown verdict/parent {verdict!r}/{parent!r}")
+    return WATCH_ACTIONS[lib().watch_action(READINESS.index(verdict), PARENTS.index(parent))]
+
+
+def lane_kind(reference, t27b):
+    """None | LANE | REFERENCE-BUG for one lab record (#6317, slip Q38)."""
+    return LANE_KINDS[lib().lane_kind(verdict(reference), verdict(t27b))]
+
+
+def lane_score(sole, first):
+    """The rank of a blocker family for the next lane; higher goes first."""
+    return int(lib().lane_score(sole, first))
+
+
+def with_tests(reference, vacuous):
+    """Reference passes that run at least one test or invariant."""
+    return int(lib().with_tests(reference, vacuous))

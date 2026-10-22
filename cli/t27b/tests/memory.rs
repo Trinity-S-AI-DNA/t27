@@ -45,6 +45,7 @@ fn run(funcs: Vec<Func>, data: Vec<Vec<u8>>) -> Result<Option<i128>, Stop> {
         mode: OverflowMode::Trap,
         unchecked: Vec::new(),
         data,
+        globals: Vec::new(),
         internal_abi: Vec::new(),
     };
     Interp::new(&prog).call(0, &[])

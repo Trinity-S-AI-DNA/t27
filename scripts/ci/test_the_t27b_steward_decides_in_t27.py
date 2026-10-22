@@ -21,6 +21,7 @@ Checks:
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,7 +52,12 @@ def runs_tests(src: Path) -> tuple[int, str]:
 
 
 code, out = runs_tests(GEN)
-check(code == 0 and "50 tests passed" in out, f"the generated C passes the spec's tests ({code}: {out})")
+# Count-agnostic: the number the generated C runs is the number of `test`
+# blocks the spec declares, so a spec-only PR that adds tests never breaks this.
+declared = len(re.findall(r"^\s*test\s+[A-Za-z_][A-Za-z0-9_]*\s*\{", SPEC.read_text(), re.M))
+m = re.search(r"All (\d+) tests passed", out)
+check(code == 0 and declared > 0 and m is not None and int(m.group(1)) == declared,
+      f"the generated C passes every one of the spec's {declared} tests ({code}: {out})")
 
 text = GEN.read_text()
 needle = "return (((in_ref * 1000) + (reference / 2)) / reference);"
@@ -125,6 +131,51 @@ check((r.checkout(False, False), r.checkout(False, True), r.checkout(True, True)
       == ("LAB-CHECKOUT", "LAB-CHECKOUT", "LAB-RECLONED", None),
       "doctor: a failed checkout outranks a heal; a heal is reported")
 
+check((r.cap_rise_is_new(594, 582, 41), r.cap_rise_is_new(624, 582, 41), r.cap_rise_is_new(583, 582, 0))
+      == (True, False, False), "bless: a cap rise is covered only by specs new to the ledger (#6237)")
+check((r.is_alarm("fail", "pass"), r.is_alarm("fail", "fail"), r.is_alarm("timeout", "timeout"),
+       r.is_alarm("crash", "fail"), r.is_alarm("mismatch", "blocked"), r.is_alarm("blocked", "pass"))
+      == (True, False, False, True, True, False),
+      "doctor: a fail or timeout the reference shares is no alarm; a crash or mismatch always is")
+check((r.is_alarm_tests("fail", "fail", True, 0), r.is_alarm_tests("fail", "fail", True, 1),
+       r.is_alarm_tests("fail", "fail", False, 0), r.is_alarm_tests("pass", "pass", True, 2),
+       r.is_alarm_tests("pass", "pass", True, 0), r.is_alarm_tests("fail", "pass", False, 0))
+      == (False, True, False, True, False, True),
+      "doctor: a shared fail is no alarm only when the same tests fail (#6441)")
+check((r.lanes_stop(1, 0), r.lanes_stop(0, 3), r.lanes_stop(0, 0)) == (True, True, False),
+      "a jit/interp mismatch or a reference disagreement stops the lanes (#6441)")
+
+check((r.check_effect("FAILURE", "SUCCESS", False), r.check_effect("FAILURE", "FAILURE", False),
+       r.check_effect("FAILURE", "ABSENT", False), r.check_effect("QUEUED", "SUCCESS", True),
+       r.check_effect("SKIPPED", "SUCCESS", True), r.check_effect("SUCCESS", "FAILURE", True))
+      == ("BLOCK", None, None, "WAIT", "WAIT", None),
+      "ready: a non-required red blocks only if master is green; a required check must be SUCCESS (#6244)")
+check(r.check_effect("FAILURE", "PENDING", False) == "WAIT",
+      "ready: a non-required red waits while master's newest run of it is still going (Q29)")
+check((r.master_state(False, "SUCCESS"), r.master_state(False, "FAILURE"), r.master_state(False, "ABSENT"),
+       r.master_state(True, "FAILURE"), r.master_state(True, "SUCCESS"), r.master_state(True, "ABSENT"))
+      == ("SUCCESS", "FAILURE", "ABSENT", "FAILURE", "PENDING", "PENDING"),
+      "ready: past a running master tip red stays red; green or no verdict is PENDING (#6334)")
+check(r.pr_ready(True, "MERGEABLE", True, [None], ["WAIT"]) == "WAIT",
+      "ready: a non-required WAIT holds the PR -- #6333 merged on 'master PENDING' (#6334)")
+check((r.pr_ready(True, "MERGEABLE", True, [None, None], [None]), r.pr_ready(True, "MERGEABLE", True, [None], ["BLOCK"]),
+       r.pr_ready(True, "CONFLICTING", True, ["BLOCK"], []), r.pr_ready(False, "MERGEABLE", True, [], []))
+      == ("READY", "BLOCKED", "CONFLICT", "CLOSED"), "ready: the spec folds the effects into one verdict")
+
+check(tuple(r.watch_action(v, "NONE") for v in r.READINESS)
+      == ("MERGE", "WAIT", "STOP", "STOP", "STOP", "STOP", "DONE"),
+      "watch: READY merges, WAIT waits, CLOSED is done, every red verdict stops the chain (#6285)")
+check(tuple(r.watch_action("RETARGET", p) for p in r.PARENTS) == ("STOP", "RETARGET", "WAIT", "STOP"),
+      "watch: a stacked PR is retargeted only once its parent merged (Q33)")
+
+check((r.lane_kind("pass", "blocked"), r.lane_kind("blocked", "blocked"), r.lane_kind("fail", "blocked"),
+       r.lane_kind("lab_error", "blocked"), r.lane_kind("pass", "frontend"), r.lane_kind("pass", "pass"))
+      == ("LANE", "REFERENCE-BUG", "REFERENCE-BUG", None, None, None),
+      "next: a lane is a t27b block where the reference passes; a reference failure is a bug to file (Q38, #6317)")
+check(r.lane_score(1, 0) > r.lane_score(0, 999) and r.lane_score(3, 10) > r.lane_score(3, 9)
+      and (r.with_tests(720, 271), r.with_tests(3, 5)) == (449, 0),
+      "next: sole outranks first, first breaks ties; the with-tests denominator never wraps")
+
 tool = TOOL.read_text()
 body = tool[tool.index("def delta("):tool.index("def previous_run(")]
 check('("fail", "mismatch", "crash")' not in body and "rules().delta(" in body,
@@ -133,11 +184,25 @@ body = tool[tool.index("def ratchet("):tool.index("def bless(")]
 check("r.entry(" in body and "got in PASSES" not in body and "want not in PASSES" not in body,
       "t27b.py ratchet asks the spec and keeps no branch of its own")
 body = tool[tool.index("def bless("):tool.index("def dump_ledger(")]
-check("r.bless_reason(" in body and "r.cap_rises(" in body and "UNIMPLEMENTED" not in tool and "PASSES" not in tool,
+check("r.bless_reason(" in body and "r.cap_rises(" in body and "r.cap_rise_is_new(" in body and "UNIMPLEMENTED" not in tool and "PASSES" not in tool,
       "t27b.py bless asks the spec and keeps no verdict tuple of its own")
 
+body = tool[tool.index("def ready("):tool.index("def ready_main(")]
+check("r.check_effect(" in body and "r.pr_ready(" in body and '"SUCCESS"' not in body and '"FAILURE"' not in body,
+      "t27b.py ready asks the spec and keeps no check-state branch of its own")
+
+body = tool[tool.index("def watch_step("):tool.index("def watch_act(")]
+check("rules().watch_action(" in body and '"RETARGET"' not in body and '"MERGED"' not in body,
+      "t27b.py watch asks the spec what to do and keeps no verdict branch of its own")
+
+body = tool[tool.index("def next_lanes("):tool.index("def next_card(")]
+check(all(f"R.{f}(" in body for f in ("lane_kind", "lane_score", "with_tests"))
+      and '== "blocked"' not in body and "1000" not in body,
+      "t27b.py next asks the spec which files count and how families rank, and keeps no rule of its own")
+
 body = tool[tool.index("def anomalies("):tool.index("def lab_card(")]
-check(all(f"rules().{f}(" in body for f in ("lab_stale", "claim", "railway_old", "ledger_quiet", "checkout"))
+check(all(f"rules().{f}(" in body for f in ("lab_stale", "claim", "railway_old", "ledger_quiet", "checkout",
+                                                     "is_alarm_tests", "lanes_stop"))
       and "< 5" not in body and "age > args" not in body and "hrs > args" not in body,
       "t27b.py doctor asks the spec for every threshold it judges")
 
