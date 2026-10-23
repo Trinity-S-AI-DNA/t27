@@ -95,7 +95,7 @@ if using t27's bootstrap environment.
 /tri doc sync
 
 # Create a GitHub PR
-/tri pr create "branch" "title" "body"
+gh pr create --head "branch" --title "title" --body "body"
 ```
 
 ### Via Wrapper Scripts

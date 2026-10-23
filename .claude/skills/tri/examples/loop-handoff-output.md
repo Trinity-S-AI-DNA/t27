@@ -29,9 +29,9 @@ Loop session ID: <loop-uuid>
 
 ## Когда выводить
 
-1. **В конце успешного PHI LOOP** (после `tri skill commit` или `tri git commit`)
-2. **При паузе лупа** (например, `/tri loop pause`)
-3. **При остановке** (например, `/tri loop stop` или SIGTERM)
+1. **В конце успешного PHI LOOP** (после `tri skill commit` или `tri git commit`) <!-- not built as a t27c subcommand -->
+2. **При паузе лупа** (например, `/tri loop pause`) <!-- not built as a t27c subcommand -->
+3. **При остановке** (например, `/tri loop stop` или SIGTERM) <!-- not built as a t27c subcommand -->
 
 ## Правила
 
