@@ -148,4 +148,4 @@
 
 ---
 
-*English only in this file.*
+*English only in this file.*- 2026-10-23T07:10Z | buffy-agent | tri-git release coverage (git.t27 0->100%, typecheck 0/0) + loop_guard safe-loop spec + issues #11730-#11733 reopened via issue-shape | landed in this PR | tooling bugs stay open in #11730-#11733; skill .claude/skills/tri-git-coverage/; no lock held
