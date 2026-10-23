@@ -41,6 +41,7 @@ mod piddir;
 mod prcheck;
 mod prose;
 mod quant;
+mod git;
 mod red;
 #[path = "../../../gen/rust/tri/test/report.rs"] #[allow(dead_code, unused_parens)]
 mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of reading `t27c test-report`
@@ -58,6 +59,8 @@ mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command li
 mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
 #[path = "../../../gen/rust/tri/trigit/verbs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod tv; // t27c gen-rust of specs/tri/trigit/verbs.t27: the trigit verbs (#11601, epic #11385 items 24-26)
+#[path = "../../../gen/rust/git/tri_workflow.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod gtw; // t27c gen-rust of specs/git/tri_workflow.t27: tri git commit/push/status gates (ADR-002, t27os#3)
 #[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod t27rel; // t27c gen-rust of specs/t27os/release.t27: the release plan and manifest text of `tri t27os` (#11315)
 #[path = "../../../bootstrap/gen/rust/verified/gen_hash_cache.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)]
@@ -467,6 +470,8 @@ enum Commands {
     Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
     /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
     Trigit { #[arg(trailing_var_arg = true)] argv: Vec<String> },
+    /// Git integration with skill gates: commit/push/status (ADR-002, specs/git/tri_workflow.t27).
+    Git { #[command(subcommand)] action: GitAction },
     /// T27 OS release front door: `release --plan` prints the numbered steps; `manifest --build N --sums FILE` prints the release manifest, a t27 module the app reads; `publish --yes` builds app and toolchain from one clean commit and creates the t27os-v<version>-b<build> release and the t27os-latest pointer; without --yes it is refused (rules: specs/t27os/release.t27, #11315, #11403).
     T27os { action: String, #[arg(long)] plan: bool, #[arg(long)] yes: bool, #[arg(long, default_value_t = 0)] build: u32, #[arg(long, default_value = "")] sums: String },
     /// Coverage of a set of specs by five facts each, one row per spec and a total: the tests ran and none failed, no vacuous pass, a test named for a refusal or a planted fault (negative control), the seal verifies, and the header names an issue. PATTERN is a path or a glob (`specs/lab/*.t27`); the last line is `gaps G  coverage N/D`, never rounded. Exit 0 once printed, 1 on a gap with --strict, 2 when no spec matched; --t27c names the t27c program (default target/release/t27c, then t27c on PATH) (rules: specs/tri/coverage/coverage.t27, #11061).
@@ -581,6 +586,25 @@ enum CellAction {
         step: String,
     },
     Seal,
+}
+
+#[derive(Subcommand)]
+enum GitAction {
+    Commit {
+        #[arg(short)]
+        all: bool,
+        #[arg(short)]
+        message: Option<String>,
+        #[arg(long, default_value = "normal")]
+        mode: String,
+    },
+    Push {
+        remote: Option<String>,
+        branch: Option<String>,
+        #[arg(long, default_value = "normal")]
+        mode: String,
+    },
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1395,6 +1419,7 @@ fn main() -> Result<()> {
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
         Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
         Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
+        Commands::Git { action } => std::process::exit(git::run(action)? as i32),
         Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
         Commands::Preflight => std::process::exit(cmd_preflight() as i32),
