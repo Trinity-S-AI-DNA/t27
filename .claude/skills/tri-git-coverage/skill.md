@@ -81,7 +81,10 @@ noise.
 
 ## tri git subcommands
 
-Parse/help work: `t27c run specs/git/tri_workflow.t27 release-plan` and
-`status-report` (ignore the "please install release build" note — the stub
-prints it by design, so confirm by overriding, never by trusting a bare run).
-The git release rules live in `specs/git/release_rules.t27`.
+Lifecycle checks you can trust (all verified against the current tree):
+`t27c parse`, `t27c typecheck`, `t27c test`, `t27c coverage`,
+`t27c gen`, `t27c seal <spec> --save` then `--verify`, `t27c lint`
+(expect the false WARNs above). The git release rules live in
+`specs/git/release_rules.t27`. There is no `t27c run` subcommand --
+documented-commands CI fails the skill on invented names, so only
+write subcommands you have actually seen in `t27c --help`.
