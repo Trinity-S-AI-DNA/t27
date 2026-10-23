@@ -1217,7 +1217,7 @@ fn enum_rejections_are_precise() {
         ("const E = enum(u8) { a = 1, b = 5 };\nfn f(x: u8) E { return @enumFromInt(x); }\ntest t { assert(f(1) == E.a); }", "ExprCall(@enumFromInt)", "whose tags are not contiguous"),
         ("fn f(d: Dir) u8 { const x = @intFromEnum(d); return x; }\ntest t { assert(f(.east) == 1); }", "ExprCall(@intFromEnum auto-tag)", "the tag type of `Dir` is u2"),
         ("test t { assert(@intFromEnum(.north) == 0); }", "ExprCall(@intFromEnum)", "of `.north`, which has no enum type here"),
-        ("fn f(d: Dir) u32 { return d; }\ntest t { assert(f(.east) == 1); }", "type mismatch", "found Dir"),
+        ("fn f(d: Dir) u32 { return d; }\ntest t { assert(f(.east) == 1); }", "type mismatch", "found a pointer to Dir"),
     ];
     for (body, construct, detail) in cases {
         let m = rejected(&format!("{}{}\n", head, body));

@@ -133,7 +133,7 @@ pub fn kind(ty: &'static str) -> u8 {
 }
 
 pub fn has_f32(b: u8) -> bool {
-    return ((((b != LOG1P) && (b != COS)) && (b != MOD)) && (b != SIN));
+    return ((b != LOG1P) && (b != MOD));
 }
 
 pub fn has_f64(b: u8) -> bool {
@@ -308,6 +308,12 @@ pub fn routine(b: u8, act: u8) -> &'static str {
     if ((b == COS) && (act == CALL_F64)) {
         return "__t27b_libm_cos";
     }
+    if ((b == COS) && (act == CALL_F32)) {
+        return "__t27b_libm_cosf";
+    }
+    if ((b == SIN) && (act == CALL_F32)) {
+        return "__t27b_libm_sinf";
+    }
     if ((b == TANH) && (act == CALL_F64)) {
         return "__t27b_libm_tanh";
     }
@@ -435,7 +441,7 @@ pub fn why(act: u8) -> &'static str {
         return "the operand is not an f64 or an f32";
     }
     if (act == REFUSE_NO_F32) {
-        return "libm.t27 has no f32 routine for it (std.math's log1p_32 and tanh, compiler_rt's cosf and sinf, and a float `@mod` are not ported)";
+        return "libm.t27 has no f32 routine for it (std.math's log1p_32 and a float `@mod` are not ported)";
     }
     if (act == REFUSE_NO_F64) {
         return "libm.t27 has no f64 routine for it (compiler_rt's, or a float `@mod`, is not ported)";
