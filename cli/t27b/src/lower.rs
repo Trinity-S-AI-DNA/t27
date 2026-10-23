@@ -3206,11 +3206,10 @@ impl<'a> Lower<'a> {
             Val::E(e) => self.reject("condition", format!("expected bool, found {}", e.ty.name())),
             Val::Ct(_) => self.reject("condition", "expected bool, found an integer literal".into()),
             Val::Cf(..) => self.reject("condition", "expected bool, found a float literal".into()),
-            Val::P(_, ref t @ LTy::Enum(..)) => {
-                let d = self.type_name(t);
-                self.reject("condition", format!("expected bool, found {}", d))
-            }
-            Val::P(..) => self.reject("condition", "expected bool, found a pointer".into()),
+            Val::P(_, ref t) => self.reject(
+                "condition",
+                format!("expected bool, found a pointer to {}", self.type_name(t)),
+            ),
             Val::M(ref p) if matches!(p.ty, LTy::Arr(..)) => self.reject("condition", "expected bool, found an array".into()),
             Val::A(..) => self.reject("condition", "expected bool, found an array".into()),
             Val::M(_) => self.reject("condition", "expected bool, found a struct".into()),
@@ -3280,11 +3279,12 @@ impl<'a> Lower<'a> {
                     format!("expected {}, found {}", to.name(), e.ty.name()),
                 )
             }
-            Val::P(_, ref t @ LTy::Enum(..)) => {
-                let d = self.type_name(t);
-                self.reject("type mismatch", format!("expected {}, found {}", to.name(), d))
-            }
-            Val::P(..) => self.reject("type mismatch", format!("expected {}, found a pointer", to.name())),
+            Val::P(_, ref t) => self.reject(
+                "type mismatch",
+                // #11788: the pointee names the construct -- a bare "found a pointer" at a merged
+                // line did not; the two conflicting types are both in the message now.
+                format!("expected {}, found a pointer to {}", to.name(), self.type_name(t)),
+            ),
             Val::M(ref p) if matches!(p.ty, LTy::Arr(..)) => {
                 self.reject("type mismatch", format!("expected {}, found an array", to.name()))
             }
