@@ -257,49 +257,39 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
 }
 impl<'a> Gen<'a> {
     // ----------------------------------------------------------- emission
-
     fn emit(&mut self, w: u32) {
         self.code.push(w);
     }
-
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
         self.labels.len() - 1
     }
-
     fn bind(&mut self, l: Label) {
         self.labels[l] = Some(self.code.len());
     }
-
     fn jump(&mut self, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(a64::b(0));
     }
-
     fn bcond(&mut self, c: Cond, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(a64::b_cond(c, 0));
     }
-
     fn cbz(&mut self, sf: bool, r: Reg, nz: bool, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(if nz { a64::cbnz(sf, r, 0) } else { a64::cbz(sf, r, 0) });
     }
-
     fn mov_imm(&mut self, sf: bool, rd: Reg, v: u64) {
         let mut buf = Vec::with_capacity(4);
         a64::mov_imm(sf, rd, v, &mut buf);
         self.code.extend_from_slice(&buf);
     }
-
     fn fail(&mut self, msg: String) {
         if self.error.is_none() {
             self.error = Some(msg);
         }
     }
-
     // ------------------------------------------------------- trap stubs
-
     fn stub_site(&mut self, site: SiteId) -> Label {
         match self.style {
             TrapStyle::Jit => {
@@ -317,7 +307,6 @@ impl<'a> Gen<'a> {
             }
         }
     }
-
     fn stub_brk(&mut self, kind: TrapKind) -> Label {
         let k = kind as u32;
         if let Some(&l) = self.brk_by_kind.get(&k) {
@@ -328,9 +317,7 @@ impl<'a> Gen<'a> {
         self.brk_by_kind.insert(k, l);
         l
     }
-
     // --------------------------------------------------- homes and frame
-
     fn assign_homes(&mut self) {
         let f = self.f;
         // w counts reads, wr writes; a variable that is never read gets no
@@ -401,7 +388,6 @@ impl<'a> Gen<'a> {
         }
         self.temp_base = 8 * (slots + self.used_callee.len() as u32);
     }
-
     fn slot_of_temp(&mut self, i: usize) -> u32 {
         if i + 1 > self.max_slot {
             self.max_slot = i + 1;
@@ -413,15 +399,12 @@ impl<'a> Gen<'a> {
         }
         off
     }
-
     fn ldr_slot(&mut self, rt: Reg, off: u32) {
         self.emit(a64::ldr_x(rt, SP, off));
     }
-
     fn str_slot(&mut self, rt: Reg, off: u32) {
         self.emit(a64::str_x(rt, SP, off));
     }
-
     /// Assemble prologue + body + epilogue + stubs, and resolve local branches.
     fn finish(&mut self, id: FuncId) -> FuncCode {
         let f = self.f;
@@ -619,14 +602,11 @@ impl<'a> Gen<'a> {
             data_refs: self.data_refs.iter().map(|&(p, k)| (p + shift, k)).collect(),
         }
     }
-
     // ------------------------------------------------------- temp stack
-
     fn alloc(&mut self) -> usize {
         self.depth += 1;
         self.depth - 1
     }
-
     fn release(&mut self, v: V) {
         if let V::Temp(i) = v {
             debug_assert_eq!(i + 1, self.depth, "temp stack is LIFO");
