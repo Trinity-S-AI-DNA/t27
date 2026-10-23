@@ -7307,7 +7307,7 @@ hazard, not a counterexample.
 
 ## 285. The tool worth building was the one that asserts nothing
 
-The obvious build was `tri quantifiers walk` — an evaluator. The argument
+The obvious build was `tri quantifiers walk` — an evaluator. The argument <!-- not built as a t27c subcommand -->
 against it, with numbers:
 
 * **Reach.** 77 clauses, minus 25 naming undefined functions, minus 4 struct
@@ -11656,7 +11656,7 @@ the second question distinguishes a dead guard from an unexercised one.
 
 ## 454. Two literals that must agree, linked only by prose
 
-`tri gates red` asks GitHub for `per_page=30` runs and prints a streak that
+`tri gates red` asks GitHub for `per_page=30` runs and prints a streak that <!-- not built as a t27c subcommand -->
 fills the page as `30+`, because a full page is a lower bound. The marker was
 `n >= 30` -- a *second* literal, two hundred lines from the first, with a
 comment explaining why they match.
@@ -13270,7 +13270,7 @@ dead name fails; removing one fails until the ceiling moves in the same commit.
 **The number is the check, and the list is what makes the number arguable.**
 
 One thing the gate cannot see, stated in its own docstring rather than papered
-over: it reads the **first token** after the binary. `tri skill seal` and
+over: it reads the **first token** after the binary. `tri skill seal` and <!-- not built as a t27c subcommand -->
 `tri skill commit` both pass, because `skill` resolves — and neither exists
 (`tri skill` offers check, refs, claims, renumber, begin, end). On the README's
 nine-step cycle, **which every change is told to follow, 4 steps are dead and

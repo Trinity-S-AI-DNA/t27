@@ -81,7 +81,7 @@ noise.
 
 ## tri git subcommands
 
-Parse/help work: `t27c run specs/git/tri_workflow.t27 release-plan` and
+Parse/help work: `t27c run specs/git/tri_workflow.t27 release-plan` and <!-- not built as a t27c subcommand -->
 `status-report` (ignore the "please install release build" note — the stub
 prints it by design, so confirm by overriding, never by trusting a bare run).
 The git release rules live in `specs/git/release_rules.t27`.
