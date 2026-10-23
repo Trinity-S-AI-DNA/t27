@@ -614,7 +614,8 @@ fn lower_mode<'a>(
     if bare_libm || xp::BUILTINS.split(' ').any(|b| named.contains(b)) {
         let libm = || include_str!("../../../specs/tri/t27b/libm.t27").replace(xp::PORT, xp::HELPER);
         let m = LIBM.get_or_init(|| crate::compiler::Compiler::parse_ast(&libm()).unwrap_or_default());
-        items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
+        // Include all HELPER-prefixed items (functions and constants), like original master
+    items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
     }
     static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's routines, for `@divTrunc` and `@rem`
     if ip::BUILTINS.split(' ').any(|b| named.contains(b)) {
