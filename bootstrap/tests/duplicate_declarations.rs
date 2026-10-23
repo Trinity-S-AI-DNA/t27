@@ -40,6 +40,7 @@ const DUP_STRUCT: &str = r#"
 module D1 {
     struct A { x : i32, }
     struct A { y : i32, }
+    const K : i32 = 1; const K : i32 = 2;
     fn f(a: A) -> i32 { return a.x; }
 }
 "#;
@@ -47,7 +48,8 @@ module D1 {
 const CLEAN: &str = r#"
 module D3 {
     struct C { x : i32, }
-    fn g(c: C) -> i32 { return c.x; }
+    fn g(c: C) -> i32 { const K : i32 = 1; return c.x + K; }
+    fn h(c: C) -> i32 { const K : i32 = 2; return c.x + K; }
 }
 "#;
 
@@ -55,11 +57,11 @@ module D3 {
 fn a_name_declared_twice_is_reported_with_its_count() {
     let (_, out) = check(DUP_STRUCT, "twice");
     assert!(
-        out.contains("`struct A` is declared 2 times"),
+        out.contains("`struct A` is declared 2 times") && out.contains("`const K` is declared 2 times"),
         "the finding must name the kind, the name and the count:\n{out}"
     );
     assert!(
-        out.contains("every backend rejects a redeclaration"),
+        out.contains("error: ") && out.contains("every backend rejects a redeclaration"),
         "and say what the consequence is:\n{out}"
     );
 }
@@ -119,20 +121,8 @@ module D4 {
         "structenum",
     );
     assert!(
-        out.contains("is declared 2 times") && out.contains("every backend rejects"),
+        out.contains("is declared 2 times") && out.contains("error: "),
         "struct and enum sharing a name is a same-namespace collision:\n{out}"
-    );
-}
-
-#[test]
-fn the_finding_is_a_warning_and_does_not_change_the_exit_code() {
-    // Measured over the corpus before this landed: 651 specs, 573 exit 0 and
-    // 78 exit 1, and not one spec's code moved. Pinned here so a later change
-    // to an error is a deliberate, test-visible decision.
-    let (rc, out) = check(DUP_STRUCT, "exitcode");
-    assert_eq!(
-        rc, 0,
-        "the duplicate finding is a warning; promoting it must be deliberate:\n{out}"
     );
 }
 
