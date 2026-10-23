@@ -37,6 +37,7 @@ mod modreach;
 mod mutate;
 mod nownote;
 mod orphaned;
+mod feed;
 mod piddir;
 mod prcheck;
 mod prose;
@@ -1595,6 +1596,8 @@ fn cmd_trigit(args: &[String]) -> Result<u8> {
         v::A_ARGV => { let issue = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0); let sha = args.get(2).map(String::as_str).unwrap_or(""); let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
             if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
+            let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit claim: no HOME"))?;
+            crate::feed::feed_append_claim(&home, issue)?;
             let r = leak(format!("{}{}", v::CLAIM_PREF, issue)); say(v::TV_CLAIM, r.as_bytes(), sha.as_bytes(), &mut buf); }
         v::A_BEAT => { let host = leak(args.get(1).cloned().unwrap_or("localhost".to_string())); let build: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             let ver = leak(std::env::var("T27_VER").unwrap_or("0.1.0".into())); let tc = leak(std::env::var("T27_TC").unwrap_or("0.5.2".into()));
@@ -1602,9 +1605,12 @@ fn cmd_trigit(args: &[String]) -> Result<u8> {
             let n = v::beat_commit_argv(&mut buf, 4096, msg.as_bytes()); let (x, sha) = run(&buf[..n], true); if x != 0 { eprintln!("trigit beat: commit-tree exit {x}: {sha}"); return Ok(x); }
             let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
+            let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit beat: no HOME"))?;
+            crate::feed::feed_append_trigit_status(&home, "actions", 1)?;
             let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
-        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
-            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; 
+            let (queue, unpushed, since, claims) = crate::feed::get_trigit_status(&home)?;
+            let n = crate::feed::status_text(queue, unpushed, since, claims, &mut buf, 4096);
             println!("{}", String::from_utf8_lossy(&buf[..n])); }
         v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
             if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
