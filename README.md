@@ -27,3 +27,9 @@ and an FPGA board (AX7203) at the end.
 
 Everything here is t27 or prose. Hand-written code in another language is not accepted. CI gates
 come from TRI CLAW (gHashTag/t27#9271), not from hand-written workflow files. See `CLAUDE.md`.
+
+## Where the specs live (SSOT rule, 2026-10-23)
+
+The operating specs of T27 OS -- kernel and agent cap, evolve, domain pulse, devices, panel surfaces -- live in gHashTag/t27 under `specs/t27os/` and are gated there by the compiler, seals and CI. This repo holds the OS shell that mounts them and the build recipe for the three surfaces (trios app, site, FPGA). The epic and its milestones live in gHashTag/t27#10782.
+
+A change to an OS rule belongs in t27; a change to a surface belongs here. Sync check: petal count, the tool-letter registry and the kernel agent cap must match between the two trees -- a mismatch is a defect, not a fork.
