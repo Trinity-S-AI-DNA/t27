@@ -605,10 +605,17 @@ fn lower_mode<'a>(
     static LIBM: std::sync::OnceLock<Node> = std::sync::OnceLock::new();
     let mut named = HashSet::new();
     names_in(std::slice::from_ref(ast), &mut named);
-    if xp::BUILTINS.split(' ').any(|b| named.contains(b)) {
+    // #9065: a bare name the reference rewrites names its builtin too -- `exp(` needs `@exp`'s routine in the
+    // program as surely as a written `@exp(` does (bare_target, libm_plan.t27).
+    let bare_libm = named.iter().any(|k| {
+        let t = xp::bare_target(k.as_bytes());
+        !t.is_empty() && xp::BUILTINS.split(' ').any(|b| b == t)
+    });
+    if bare_libm || xp::BUILTINS.split(' ').any(|b| named.contains(b)) {
         let libm = || include_str!("../../../specs/tri/t27b/libm.t27").replace(xp::PORT, xp::HELPER);
         let m = LIBM.get_or_init(|| crate::compiler::Compiler::parse_ast(&libm()).unwrap_or_default());
-        items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
+        // Include all HELPER-prefixed items (functions and constants), like original master
+    items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
     }
     static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's routines, for `@divTrunc` and `@rem`
     if ip::BUILTINS.split(' ').any(|b| named.contains(b)) {
@@ -3536,6 +3543,9 @@ impl<'a> Lower<'a> {
                     return Ok(v);
                 }
                 if let Some(v) = self.len_call(n)? {
+                    return Ok(v);
+                }
+                if let Some(v) = self.bare_builtin(n)? {
                     return Ok(v);
                 }
                 if let Some(v) = self.bare_abs(n)? {
