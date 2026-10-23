@@ -11103,6 +11103,31 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
 
     let total = test_names.len() + inv_names.len() + bench_names.len();
     println!("\n  Total: {} declarations", total);
+
+    // Execute the assertions (t27#11730): generate Zig and run `zig test` when it
+    // compiles; specs that do not compile keep the legacy declaration-only result.
+    let src = fs::read_to_string(input_path).unwrap_or_default();
+    if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
+        let mut codegen = compiler::Codegen::new();
+        codegen.gen_zig(&ast);
+        let zig = codegen.into_string();
+        let tmp = std::env::temp_dir().join("t27_test.zig");
+        if fs::write(&tmp, &zig).is_ok() {
+            let comp = std::process::Command::new("zig")
+                .args(["test", "--test-no-exec", tmp.to_str().unwrap_or("")])
+                .status();
+            if comp.map(|s| s.success()).unwrap_or(false) {
+                let st = std::process::Command::new("zig")
+                    .args(["test", tmp.to_str().unwrap_or("")])
+                    .status();
+                if let Ok(s) = st {
+                    if !s.success() {
+                        anyhow::bail!("zig test failed");
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
