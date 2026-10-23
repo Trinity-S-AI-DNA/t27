@@ -1593,12 +1593,56 @@ fn cmd_trigit(args: &[String]) -> Result<u8> {
     let say = |k: u8, r: &[u8], val: &[u8], b: &mut Vec<u8>| { let n = v::did_text(k, r, val, b.as_mut_slice(), 4096); println!("{}", String::from_utf8_lossy(&b[..n])); };
     match v::host_action(verb) {
         v::A_REFUSE => { let n = v::refusal_text(verb, &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
-        v::A_ARGV => { let issue = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0); let sha = args.get(2).map(String::as_str).unwrap_or(""); let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
-            if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
-            let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
-            let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit claim: no HOME"))?;
-            crate::feed::feed_append_claim(&home, issue)?;
-            let r = leak(format!("{}{}", v::CLAIM_PREF, issue)); say(v::TV_CLAIM, r.as_bytes(), sha.as_bytes(), &mut buf); }
+        v::A_ARGV => {
+            // args[0] is the verb (claim/hold/release)
+            let verb_str = args.get(0).map(String::as_str).unwrap_or("");
+            if verb_str == "hold" {
+                let region = args.get(1).map(String::as_str).unwrap_or("");
+                let sha = args.get(2).map(String::as_str).unwrap_or("");
+                if region.is_empty() || sha.is_empty() {
+                    println!("{}", v::hold_refusal("".as_bytes(), "".as_bytes()));
+                    return Ok(1);
+                }
+                let n = v::hold_argv(&mut buf, 4096, region.as_bytes(), sha.as_bytes());
+                if n == 0 {
+                    println!("{}", v::hold_refusal(region.as_bytes(), "".as_bytes()));
+                    return Ok(1);
+                }
+                let (x, o) = run(&buf[..n], false);
+                if x != 0 { eprintln!("trigit hold: git exit {x}: {o}"); return Ok(x); }
+                let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit hold: no HOME"))?;
+                crate::feed::feed_append_trigit_status(&home, "holds", 1)?;
+                let r = leak(format!("{}{}", v::HOLD_PREF, region));
+                say(v::TV_HOLD, r.as_bytes(), "".as_bytes(), &mut buf);
+            } else if verb_str == "release" {
+                let region = args.get(1).map(String::as_str).unwrap_or("");
+                let sha = args.get(2).map(String::as_str).unwrap_or("");
+                if region.is_empty() || sha.is_empty() {
+                    println!("hold refused: region name cannot be empty");
+                    return Ok(1);
+                }
+                let n = v::release_argv(&mut buf, 4096, region.as_bytes(), sha.as_bytes());
+                if n == 0 {
+                    println!("hold refused: region name cannot be empty");
+                    return Ok(1);
+                }
+                let (x, o) = run(&buf[..n], false);
+                if x != 0 { eprintln!("trigit release: git exit {x}: {o}"); return Ok(x); }
+                let r = leak(format!("{}{}", v::HOLD_PREF, region));
+                say(v::TV_RELEASE, r.as_bytes(), "".as_bytes(), &mut buf);
+            } else {
+                let issue = verb_str.parse::<u64>().ok().unwrap_or(0);
+                let sha = args.get(1).map(String::as_str).unwrap_or("");
+                let n = v::claim_argv(&mut buf, 4096, issue, sha.as_bytes());
+                if n == 0 { println!("{}", v::claim_refusal(issue, sha.as_bytes())); return Ok(1); }
+                let (x, o) = run(&buf[..n], false);
+                if x != 0 { eprintln!("trigit claim: git exit {x}: {o}"); return Ok(x); }
+                let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit claim: no HOME"))?;
+                crate::feed::feed_append_claim(&home, issue)?;
+                let r = leak(format!("{}{}", v::CLAIM_PREF, issue));
+                say(v::TV_CLAIM, r.as_bytes(), "".as_bytes(), &mut buf);
+            }
+        }
         v::A_BEAT => { let host = leak(args.get(1).cloned().unwrap_or("localhost".to_string())); let build: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             let ver = leak(std::env::var("T27_VER").unwrap_or("0.1.0".into())); let tc = leak(std::env::var("T27_TC").unwrap_or("0.5.2".into()));
             let m = v::beat_msg(&mut buf, 4096, host.as_bytes(), build, ver.as_bytes(), tc.as_bytes()); let msg = String::from_utf8_lossy(&buf[..m]).into_owned();
