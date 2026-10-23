@@ -1643,7 +1643,7 @@ impl<'a> Lower<'a> {
             let vars = params.iter().zip(&n.params).map(|(t, p)| Var { name: p.0.clone(), ty: ty(t) }).collect();
             if ret.as_ref().is_some_and(is_agg) { return self.reject("FnDecl(extern)", format!("`{}` returns an aggregate; an import returns a scalar (#8972)", n.name)); }
             let noreturn_site = if ret.is_some() { self.site(TrapKind::NoReturn, format!("import {} run outside an object", n.name), Ty::Bool) } else { 0 };
-            return Ok(Func { name, nparams: params.len(), ret: ret.map(|t| ty(&t)), vars, body: Vec::new(), slots: Vec::new(), line: n.line, is_test: false, is_invariant: false, noreturn_site });
+            return Ok(Func { name, nparams: params.len(), ret: ret.map(|t| ty(&t)), vars, body: Vec::new(), slots: Vec::new(), line: n.line, is_pub: n.extra_pub, is_test: false, is_invariant: false, noreturn_site });
         }
         // Parameters first (vars 0..), then the hidden result pointer, so
         // that they are exactly the first `nparams` variables.
@@ -1716,6 +1716,7 @@ impl<'a> Lower<'a> {
             slots: std::mem::take(&mut self.slots),
             body,
             line: n.line,
+            is_pub: n.extra_pub,
             is_test: false,
             is_invariant: false,
             noreturn_site,
@@ -1835,6 +1836,7 @@ impl<'a> Lower<'a> {
             slots: std::mem::take(&mut self.slots),
             body,
             line: n.line,
+            is_pub: false,
             is_test: true,
             is_invariant: invariant,
             noreturn_site: 0,
@@ -7495,6 +7497,7 @@ fn str_eql_func(noreturn_site: SiteId) -> Func {
         vars: vec![v("a", Ty::Ptr), v("b", Ty::Ptr), v("n", Ty::U64), v("i", Ty::U64)],
         body,
         line: 0,
+        is_pub: false,
         is_test: false,
         is_invariant: false,
         noreturn_site,

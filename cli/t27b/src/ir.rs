@@ -621,6 +621,8 @@ pub struct Func {
     pub vars: Vec<Var>,
     pub body: Vec<Stmt>,
     pub line: u32,
+    /// Declared `pub` (the `t27b run` entry check, #11824); false for tests.
+    pub is_pub: bool,
     /// A `test` or `invariant` block: no parameters, no return value, never
     /// callable.
     pub is_test: bool,
