@@ -133,7 +133,7 @@ pub fn kind(ty: &'static str) -> u8 {
 }
 
 pub fn has_f32(b: u8) -> bool {
-    return (((((b != LOG1P) && (b != COS)) && (b != MOD)) && (b != SIN)) && (b != TANH));
+    return ((((b != LOG1P) && (b != COS)) && (b != MOD)) && (b != SIN));
 }
 
 pub fn has_f64(b: u8) -> bool {
@@ -307,6 +307,12 @@ pub fn routine(b: u8, act: u8) -> &'static str {
     }
     if ((b == COS) && (act == CALL_F64)) {
         return "__t27b_libm_cos";
+    }
+    if ((b == TANH) && (act == CALL_F64)) {
+        return "__t27b_libm_tanh";
+    }
+    if ((b == TANH) && (act == CALL_F32)) {
+        return "__t27b_libm_tanhf";
     }
     return "";
 }
