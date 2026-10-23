@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/fpga/wasm_module.t27 -- the law of the WebAssembly module binary format (MVP):
+// the LEB128 number encodings, the magic+version header, the section walk. One format,
+// two directions: wasm_interp.t27's loader READS these bytes, the future emitter WRITES
+// them -- the round-trip on the same structures is the law. The companion table law
+// (specs/fpga/wasm_opcodes.t27) owns the opcodes; this file owns the CONTAINER.
+//
+// The test vectors are the WebAssembly spec appendix's own LEB examples plus a
+// hand-built minimal module; nothing is transcribed from an existing implementation.
+//
+// NOT CLAIMED: the type/function/code section BODIES beyond the walk (the import,
+// global, element payload grammars), validation, the name custom section's substructure,
+// threads/SIMD/bulk-memory extensions. phi^2 + 1/phi^2 = 3 | TRINITY
+
+module fpga_wasm_module;
+
+pub const MAGIC : [4]u8 = [0x00, 0x61, 0x73, 0x6d];
+pub const VERSION : u32 = 1;
+
+pub const SEC_CUSTOM : u8 = 0;
+pub const SEC_TYPE : u8 = 1;
+pub const SEC_IMPORT : u8 = 2;
+pub const SEC_FUNCTION : u8 = 3;
+pub const SEC_TABLE : u8 = 4;
+pub const SEC_MEMORY : u8 = 5;
+pub const SEC_GLOBAL : u8 = 6;
+pub const SEC_EXPORT : u8 = 7;
+pub const SEC_START : u8 = 8;
+pub const SEC_ELEMENT : u8 = 9;
+pub const SEC_CODE : u8 = 10;
+pub const SEC_DATA : u8 = 11;
+pub const SEC_DATACOUNT : u8 = 12;
+pub const SEC_KINDS : u8 = 13;
+
+/// The result of one LEB128 unsigned read: the value and the bytes consumed.
+pub const UlebRead = struct {
+    value: u64,
+    n: u32,
+};
+
+/// The result of one signed LEB128 read.
+pub const SlebRead = struct {
+    value: i32,
+    n: u32,
+};
+
+/// The result of one section-walk step: the id, the payload size, the payload offset.
+pub const SectionRef = struct {
+    id: u8,
+    size: u32,
+    payload: u32,
+};
+
+/// LEB128 unsigned length in bytes for a u64 value.
+pub fn uleb_len(x: u64) -> u32 {
+    var n : u32 = 1;
+    var v = x;
+    v = v >> 7;
+    while (v > 0) : (v = v >> 7) { n = n + 1; }
+    return n;
+}
+
+/// Write x as LEB128 unsigned into dst; returns the bytes written. Seven bits per byte,
+/// little-endian groups, the high bit marks a continuation.
+pub fn uleb_write(dst: []u8, x: u64) -> u32 {
+    var n : u32 = 0;
+    var v = x;
+    while (true) {
+        var b : u8 = (v & 0x7f) as u8;
+        v = v >> 7;
+        if (v != 0) { b = b | 0x80; }
+        dst[n] = b;
+        n = n + 1;
+        if (v == 0) { return n; }
+    }
+}
+
+/// Read one LEB128 unsigned at src[at..]; the corpus style: a result struct, no out-params.
+pub fn uleb_read(src: []const u8, at: u32) UlebRead {
+    var result : u64 = 0;
+    var shift : u32 = 0;
+    var i = at;
+    while (i < src.len) {
+        const b = src[i];
+        result = result + (((b & 0x7f) as u64) << shift);
+        i = i + 1;
+        if ((b & 0x80) == 0) {
+            return UlebRead { .value = result, .n = i - at };
+        }
+        shift = shift + 7;
+        if (shift > 63) { break; }
+    }
+    return UlebRead { .value = result, .n = i - at };
+}
+
+/// Signed LEB128 for the i32 range: accumulate in i64, then the low 32 bits ARE the i32.
+pub fn sleb32_read(src: []const u8, at: u32) SlebRead {
+    var result : i64 = 0;
+    var shift : u32 = 0;
+    var i = at;
+    var b : u8 = 0;
+    while (i < src.len) {
+        b = src[i];
+        result = result + (((b & 0x7f) as i64) << shift);
+        shift = shift + 7;
+        i = i + 1;
+        if ((b & 0x80) == 0) { break; }
+        if (shift >= 64) { break; }
+    }
+    // the sign extends from the last group's high bits (the WASM spec's own rule)
+    if (shift < 64 and (b & 0x40) != 0) {
+        result = result | ((-1 as i64) << shift);
+    }
+    return SlebRead { .value = result as i32, .n = i - at };
+}
+
+/// The module header: the magic and the version, the first eight bytes of every module.
+pub fn header_ok(src: []const u8) bool {
+    if (src.len < 8) { return false; }
+    var i : u32 = 0;
+    while (i < 4) : (i = i + 1) {
+        if (src[i] != MAGIC[i]) { return false; }
+    }
+    return src[4] == 1 and src[5] == 0 and src[6] == 0 and src[7] == 0;
+}
+
+/// The section walk: the section at src[at..] as (id, size, payload offset). A size past
+/// the source end returns the end sentinel (id 0xff, size 0, payload src.len).
+pub fn next_section(src: []const u8, at: u32) SectionRef {
+    if (at >= src.len) { return SectionRef { .id = 0xff, .size = 0, .payload = src.len as u32 }; }
+    const idv = src[at];
+    const r = uleb_read(src, at + 1);
+    const payload = at + 1 + r.n;
+    if (payload > src.len or r.value > src.len - payload) {
+        return SectionRef { .id = 0xff, .size = 0, .payload = src.len as u32 };
+    }
+    return SectionRef { .id = idv, .size = r.value as u32, .payload = payload };
+}
+
+test the_magic_and_version_are_the_wasm_header {
+    const mod : [8]u8 = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    assert header_ok(&mod);
+    var bad : [8]u8 = mod;
+    bad[1] = 0x00;
+    assert header_ok(&bad) == false;
+    var short : [7]u8 = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00];
+    assert header_ok(&short) == false;
+}
+
+test uleb_matches_the_spec_appendix_vectors {
+    var dst : [5]u8 = [0] ** 5;
+    const w1 = uleb_write(dst[0..5], 0);
+    assert w1 == 1 and dst[0] == 0x00;
+    const w2 = uleb_write(dst[0..5], 1);
+    assert w2 == 1 and dst[0] == 0x01;
+    const w3 = uleb_write(dst[0..5], 127);
+    assert w3 == 1 and dst[0] == 0x7f;
+    const w4 = uleb_write(dst[0..5], 128);
+    assert w4 == 2 and dst[0] == 0x80 and dst[1] == 0x01;
+    const w5 = uleb_write(dst[0..5], 624485);
+    assert w5 == 3 and dst[0] == 0xe5 and dst[1] == 0x8e and dst[2] == 0x26;
+    const r = uleb_read(dst[0..3], 0);
+    assert r.value == 624485 and r.n == 3;
+}
+
+test uleb_boundaries_round_trip {
+    var dst : [10]u8 = [0] ** 10;
+    const bounds : [6]u64 = [0, 1, 127, 128, 16383, 4294967295];
+    var i : u32 = 0;
+    while (i < 6) : (i = i + 1) {
+        const n = uleb_write(dst[0..10], bounds[i]);
+        const r = uleb_read(dst[0..10], 0);
+        assert r.value == bounds[i];
+        assert r.n == n;
+        assert n == uleb_len(bounds[i]);
+    }
+}
+
+test sleb32_carries_the_i32_const_immediate {
+    // the spec appendix: 64 encodes as C0 00; -64 as 40; -123456 as C0 BB 78
+    var dst : [3]u8 = [0] ** 3;
+    var n : u32 = 0;
+    dst[0] = 0xc0; dst[1] = 0x00;
+    var r = sleb32_read(dst[0..2], 0);
+    assert r.value == 64 and r.n == 2;
+    dst[0] = 0x40;
+    r = sleb32_read(dst[0..1], 0);
+    assert r.value == -64 and r.n == 1;
+    dst[0] = 0xc0; dst[1] = 0xbb; dst[2] = 0x78;
+    r = sleb32_read(dst[0..3], 0);
+    assert r.value == -123456 and r.n == 3;
+}
+
+test the_section_walk_crosses_two_sections {
+    // a hand-built module body: type section (id 1) with a () -> () func type,
+    // then function section (id 3) naming it
+    var mod : [18]u8 = [0] ** 18;
+    mod[0] = 0x00; mod[1] = 0x61; mod[2] = 0x73; mod[3] = 0x6d;
+    mod[4] = 0x01; mod[5] = 0x00; mod[6] = 0x00; mod[7] = 0x00;
+    mod[8] = 0x01; mod[9] = 0x04; mod[10] = 0x01; mod[11] = 0x60; mod[12] = 0x00; mod[13] = 0x00;
+    mod[14] = 0x03; mod[15] = 0x02; mod[16] = 0x01; mod[17] = 0x00;
+    assert header_ok(&mod);
+    var sec = next_section(&mod, 8);
+    assert sec.id == 1 and sec.size == 4 and sec.payload == 10;
+    assert mod[sec.payload] == 0x01;
+    sec = next_section(&mod, sec.payload + sec.size);
+    assert sec.id == 3 and sec.size == 2;
+}
+
+test a_truncated_section_size_refuses_the_walk {
+    var mod : [10]u8 = [0] ** 10;
+    mod[0] = 0x00; mod[1] = 0x61; mod[2] = 0x73; mod[3] = 0x6d;
+    mod[4] = 0x01; mod[5] = 0x00; mod[6] = 0x00; mod[7] = 0x00;
+    mod[8] = 0x01; mod[9] = 0x7f;
+    // a size of 127 past a 1-byte source end is the truncation: the walk refuses with
+    // the end sentinel (id 0xff, size 0, payload = the source end)
+    const sec = next_section(&mod, 8);
+    assert sec.id == 0xff and sec.size == 0 and sec.payload == 10;
+    const past = next_section(&mod, 8 + sec.size);
+    assert past.id == 0xff and past.size == 0 and past.payload == 10;
+}
