@@ -35,16 +35,16 @@ Execute the canonical t27 development workflow following all 7 invariant laws.
 
 ```bash
 # Start PHI LOOP for ring N
-tri phi-loop N
+tri phi-loop N <!-- not built as a t27c subcommand -->
 
 # Advance to next phase
-tri next-phase
+tri next-phase <!-- not built as a t27c subcommand -->
 
 # Show current phase status
 tri status
 
 # Reset current ring
-tri reset
+tri reset <!-- not built as a t27c subcommand -->
 ```
 
 ## Law Compliance

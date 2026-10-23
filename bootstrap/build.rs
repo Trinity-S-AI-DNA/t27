@@ -103,14 +103,14 @@ fn main() {
         .expect("bootstrap crate must live one level below repo root")
         .to_path_buf();
 
-    // Bake the building commit into the binary so a seal can name the build
-    // that minted it (#7075, prerequisite of #7072) and a silicon receipt can
-    // name the compiler that produced it (#7041). A runtime `git rev-parse`
-    // would name the tree the seal/receipt was WRITTEN in -- a different claim,
-    // and the wrong one for "which t27c made this". Outside a git checkout the
-    // identity is honestly "unknown" rather than absent.
+    // Bake the building commit into the binary: a seal can name the build that minted it (#7075,
+    // prerequisite of #7072) and a silicon receipt the compiler that produced it (#7041). A
+    // runtime `git rev-parse` would name the tree the seal was WRITTEN in -- a different claim,
+    // and the wrong one for "which t27c made this". Outside a git checkout the identity is
+    // "unknown". The abbreviation length is PINNED with -c core.abbrev=9 (#8148 measured): a
+    // depth-1 clone abbreviates to 7 and a full one to 9, and two builds of one commit differed.
     let git = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["-c", "core.abbrev=9", "rev-parse", "--short", "HEAD"])
         .current_dir(&manifest_dir)
         .output()
         .ok()
