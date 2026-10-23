@@ -19,7 +19,7 @@ description: The exact commands of the t27 toolchain (tri, t27c, t27b, tri t27o)
 
 | Name | What it is | Note |
 |---|---|---|
-| `scripts/tri` | bash front door; runs `scripts/tri_loop/*.py` helpers first (`pr-state`, `priority`, `triage`, `tick`, `t27b`, `toolbelt`, `damage`, `swarm`; list: `tri loop-help`), else forwards to `t27c` | `scripts/tri test` is the WHOLE-REPO `t27c suite`, not one spec |
+| `scripts/tri` | bash front door; runs `scripts/tri_loop/*.py` helpers first (`pr-state`, `priority`, `triage`, `tick`, `t27b`, `toolbelt`, `damage`, `swarm`; list: `tri loop-help`), else forwards to `t27c` | `scripts/tri test` is the WHOLE-REPO `t27c suite`, not one spec | <!-- not built as a t27c subcommand -->
 | `target/release/tri` | Rust CLI, `cargo build --release -p tri`, ~55 subcommands; `--help` is the authority | `tri test <spec>` is the one-spec runner |
 | `t27c` | the compiler, `cargo build --release -p t27c` | lands at `./target/release/t27c` (workspace root) |
 
@@ -79,7 +79,7 @@ export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-lo
 
 ## Experience
 
-- `tri experience save` (no flags) is the only experience command. There is no `tri experience query` and no `tri verify`.
+- `tri experience save` (no flags) is the only experience command. There is no `tri experience query` and no `tri verify`. <!-- not built as a t27c subcommand -->
 
 ## MCP servers
 
