@@ -8756,6 +8756,12 @@ impl Codegen {
 
     fn t27_array_type_to_zig(ty: &str) -> String {
         let t = ty.trim();
+        // #11940: `?fn(A) -> R` slipped past the fn arm (starts with `?`).
+        if let Some(mapped) = t.strip_prefix('?')
+            .and_then(|i| Self::t27_fn_type_to_zig(i.trim()))
+        {
+            return format!("?{mapped}");
+        }
         // #11940 sub-slice 3: a t27 fn TYPE is a type in every position this
         // mapper serves; it used to pass through verbatim, arrow and all.
         if let Some(mapped) = Self::t27_fn_type_to_zig(t) {
@@ -8889,16 +8895,25 @@ impl Codegen {
     }
 
     /// #11940 sub-slice 3: a t27 fn TYPE renders as Zig's `fn (S) R`; a
-    /// multi-value return is the anonymous struct the tuple mapper builds.
-    /// Shape mirrors `fn_type_alias` (return after the FIRST `)`, a named
-    /// parameter keeps only its type) and Zig's fn TYPE spells a void return.
+    /// multi-value return is the anonymous struct the tuple mapper builds. The
+    /// args end at the `)` MATCHING the opening one -- an argument may itself
+    /// be a fn type (`fn(A, ?fn(B) -> R) -> R2`), whose own `)` is not the end.
     fn t27_fn_type_to_zig(text: &str) -> Option<String> {
-        let (args, ret) = text.trim().strip_prefix("fn")?.trim_start()
-            .strip_prefix('(')?.split_once(')')?;
-        let args: Vec<String> = args.split(',').map(str::trim).filter(|a| !a.is_empty())
-            .map(|a| Self::t27_array_type_to_zig(a.rsplit(':').next().unwrap_or(a).trim()))
+        let body = text.trim().strip_prefix("fn")?.trim_start().strip_prefix('(')?;
+        if body.is_empty() { return Some("fn () void".to_string()); }
+        let (mut depth, mut end) = (1i32, None);
+        for (i, b) in body.bytes().enumerate() {
+            depth += (b == b'(') as i32;
+            depth -= (b == b')') as i32;
+            if depth == 0 { end = Some(i); break; }
+        }
+        let end = end?;
+        let ret = body[end + 1..].trim();
+        let args: Vec<String> = Self::t27_top_level_commas(&body[..end]).into_iter()
+            .map(|a| Self::t27_array_type_to_zig(
+                if a.contains('(') { a.trim() }
+                else { a.rsplit(':').next().unwrap_or(&a).trim() }))
             .collect();
-        let ret = ret.trim();
         let ret = ret.strip_prefix("->").map(str::trim).unwrap_or(ret);
         let tail = if ret.is_empty() || ret == "void" {
             " void".to_string()
@@ -8907,6 +8922,21 @@ impl Codegen {
                 .unwrap_or_else(|| Self::t27_array_type_to_zig(ret)))
         };
         Some(format!("fn ({}){}", args.join(", "), tail))
+    }
+
+    /// Split on commas OUTSIDE parens -- nested fn/tuple args carry their own.
+    fn t27_top_level_commas(args: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut depth = 0i32;
+        for c in args.chars() {
+            match c {
+                '(' => { depth += 1; out.last_mut().unwrap().push(c); },
+                ')' => { depth -= 1; out.last_mut().unwrap().push(c); },
+                ',' if depth == 0 => out.push(String::new()),
+                c => out.last_mut().unwrap().push(c),
+            }
+        }
+        out
     }
 
     fn t27_tuple_type_to_zig(ty: &str) -> Option<String> {
@@ -42684,75 +42714,6 @@ impl HirFirrtlEmitter {
 }
 
 #[derive(Debug, Clone)]
-pub struct HirDiff {
-    pub field: String,
-    pub left: String,
-    pub right: String,
-}
-
-#[derive(Debug)]
-pub struct HirDiffEngine;
-
-impl HirDiffEngine {
-    pub fn diff(a: &HirModule, b: &HirModule) -> Vec<HirDiff> {
-        let mut diffs = Vec::new();
-        if a.name != b.name {
-            diffs.push(HirDiff {
-                field: "name".into(),
-                left: a.name.clone(),
-                right: b.name.clone(),
-            });
-        }
-        if a.ports.len() != b.ports.len() {
-            diffs.push(HirDiff {
-                field: "port_count".into(),
-                left: a.ports.len().to_string(),
-                right: b.ports.len().to_string(),
-            });
-        }
-        if a.signals.len() != b.signals.len() {
-            diffs.push(HirDiff {
-                field: "signal_count".into(),
-                left: a.signals.len().to_string(),
-                right: b.signals.len().to_string(),
-            });
-        }
-        if a.memories.len() != b.memories.len() {
-            diffs.push(HirDiff {
-                field: "memory_count".into(),
-                left: a.memories.len().to_string(),
-                right: b.memories.len().to_string(),
-            });
-        }
-        if a.bus_ports.len() != b.bus_ports.len() {
-            diffs.push(HirDiff {
-                field: "bus_count".into(),
-                left: a.bus_ports.len().to_string(),
-                right: b.bus_ports.len().to_string(),
-            });
-        }
-        if a.gf16_accels.len() != b.gf16_accels.len() {
-            diffs.push(HirDiff {
-                field: "gf16_count".into(),
-                left: a.gf16_accels.len().to_string(),
-                right: b.gf16_accels.len().to_string(),
-            });
-        }
-        if a.ternary_cores.len() != b.ternary_cores.len() {
-            diffs.push(HirDiff {
-                field: "ternary_count".into(),
-                left: a.ternary_cores.len().to_string(),
-                right: b.ternary_cores.len().to_string(),
-            });
-        }
-        diffs
-    }
-    pub fn equivalent(a: &HirModule, b: &HirModule) -> bool {
-        Self::diff(a, b).is_empty()
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct BuildMetrics {
     pub build_id: u32,
     pub luts: u32,
@@ -43225,47 +43186,6 @@ mod tests_phase33_firrtl {
         assert!(s.contains("module firrtl_test"));
         assert!(s.contains("input in : UInt<8>"));
         assert!(s.contains("out <= tmp"));
-    }
-}
-
-#[cfg(test)]
-mod tests_phase34_diff {
-    use super::*;
-
-    fn mod_a() -> HirModule {
-        let mut m = HirModule::new("test");
-        m.ports.push(HirPort {
-            name: "clk".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Clock,
-        });
-        m
-    }
-
-    #[test]
-    fn test_diff_identical() {
-        assert!(HirDiffEngine::equivalent(&mod_a(), &mod_a()));
-    }
-
-    #[test]
-    fn test_diff_name() {
-        let mut b = mod_a();
-        b.name = "other".into();
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].field, "name");
-    }
-
-    #[test]
-    fn test_diff_ports() {
-        let mut b = mod_a();
-        b.ports.push(HirPort {
-            name: "extra".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Bool,
-        });
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert!(diffs.iter().any(|d| d.field == "port_count"));
     }
 }
 
