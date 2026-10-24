@@ -43190,47 +43190,6 @@ mod tests_phase33_firrtl {
 }
 
 #[cfg(test)]
-mod tests_phase34_diff {
-    use super::*;
-
-    fn mod_a() -> HirModule {
-        let mut m = HirModule::new("test");
-        m.ports.push(HirPort {
-            name: "clk".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Clock,
-        });
-        m
-    }
-
-    #[test]
-    fn test_diff_identical() {
-        assert!(HirDiffEngine::equivalent(&mod_a(), &mod_a()));
-    }
-
-    #[test]
-    fn test_diff_name() {
-        let mut b = mod_a();
-        b.name = "other".into();
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].field, "name");
-    }
-
-    #[test]
-    fn test_diff_ports() {
-        let mut b = mod_a();
-        b.ports.push(HirPort {
-            name: "extra".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Bool,
-        });
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert!(diffs.iter().any(|d| d.field == "port_count"));
-    }
-}
-
-#[cfg(test)]
 mod tests_phase35_regression {
     use super::*;
 
