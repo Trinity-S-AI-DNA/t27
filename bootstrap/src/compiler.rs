@@ -8507,12 +8507,40 @@ impl Codegen {
     }
 
     fn gen_struct_decl(&mut self, node: &Node) {
+        // A parameterised const struct (`pub const Box(T) = struct { ... }`,
+        // parser ADR-008) cannot render as a plain Zig struct: the parameter
+        // would reach the field types as an undeclared identifier and the
+        // module would refuse to compile on every target (#11912). Zig's
+        // idiom for a generic type is a function returning the struct, so a
+        // generic declaration renders as
+        // `fn Box(comptime T: type) type { return struct { ... }; }`.
+        // The call sites (`Box(u8)`) already render as calls and compose
+        // unchanged; the plain (no-params) render keeps its exact old shape.
+        let generic = !node.params.is_empty();
         if node.extra_pub {
             self.write("pub ");
         }
 
-        self.write_line(&format!("const {} = struct {{", node.name));
-        self.indent();
+        if generic {
+            let param_list = node
+                .params
+                .iter()
+                .map(|(pname, _)| format!("comptime {}: type", Self::zig_ident(pname)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.write_line(&format!(
+                "fn {}({}) type {{",
+                Self::zig_ident(&node.name),
+                param_list
+            ));
+            self.indent();
+            self.write_indent();
+            self.write_line("return struct {");
+            self.indent();
+        } else {
+            self.write_line(&format!("const {} = struct {{", node.name));
+            self.indent();
+        }
 
         for field in &node.children {
             self.write_indent();
@@ -8535,7 +8563,15 @@ impl Codegen {
         }
 
         self.dedent();
+        if generic {
+            self.write_indent();
+        }
         self.write_line("};");
+        if generic {
+            self.dedent();
+            self.write_indent();
+            self.write_line("}");
+        }
     }
 
     /// Map a t27 tuple type `(T, U, ...)` to a Zig anonymous tuple-struct type
@@ -30759,49 +30795,11 @@ pub enum AsmSectionKind {
     Rodata,
 }
 
-impl AsmSectionKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => AsmSectionKind::Text,
-            1 => AsmSectionKind::Data,
-            2 => AsmSectionKind::Bss,
-            3 => AsmSectionKind::Rodata,
-            _ => AsmSectionKind::Text,
-        }
-    }
-    pub fn to_i8(&self) -> i8 {
-        match self {
-            AsmSectionKind::Text => 0,
-            AsmSectionKind::Data => 1,
-            AsmSectionKind::Bss => 2,
-            AsmSectionKind::Rodata => 3,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum AsmRelocKind {
     Abs32,
     Rel21,
     Gf16Label,
-}
-
-impl AsmRelocKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => AsmRelocKind::Abs32,
-            1 => AsmRelocKind::Rel21,
-            2 => AsmRelocKind::Gf16Label,
-            _ => AsmRelocKind::Abs32,
-        }
-    }
-    pub fn to_i8(&self) -> i8 {
-        match self {
-            AsmRelocKind::Abs32 => 0,
-            AsmRelocKind::Rel21 => 1,
-            AsmRelocKind::Gf16Label => 2,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -38584,42 +38582,6 @@ mod tests_hir_assembler {
     fn test_assembler_validate() {
         let asm = HirAssembler::new("valid_asm");
         assert!(asm.validate().is_empty());
-    }
-
-    #[test]
-    fn test_section_kind_roundtrip() {
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Text.to_i8()),
-            AsmSectionKind::Text
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Data.to_i8()),
-            AsmSectionKind::Data
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Bss.to_i8()),
-            AsmSectionKind::Bss
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Rodata.to_i8()),
-            AsmSectionKind::Rodata
-        );
-    }
-
-    #[test]
-    fn test_reloc_kind_roundtrip() {
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Abs32.to_i8()),
-            AsmRelocKind::Abs32
-        );
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Rel21.to_i8()),
-            AsmRelocKind::Rel21
-        );
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Gf16Label.to_i8()),
-            AsmRelocKind::Gf16Label
-        );
     }
 
     #[test]
