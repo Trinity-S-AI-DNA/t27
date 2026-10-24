@@ -33,3 +33,22 @@ come from TRI CLAW (gHashTag/t27#9271), not from hand-written workflow files. Se
 The operating specs of T27 OS -- kernel and agent cap, evolve, domain pulse, devices, panel surfaces -- live in gHashTag/t27 under `specs/t27os/` and are gated there by the compiler, seals and CI. This repo holds the OS shell that mounts them and the build recipe for the three surfaces (trios app, site, FPGA). The epic and its milestones live in gHashTag/t27#10782.
 
 A change to an OS rule belongs in t27; a change to a surface belongs here. Sync check: petal count, the tool-letter registry and the kernel agent cap must match between the two trees -- a mismatch is a defect, not a fork.
+
+## Published numbers
+
+Every number this repository publishes about T27 OS carries the five-line footer that
+`specs/t27os/disclosure.t27` in gHashTag/t27 defines (reader, judge, n, cost, repro; t27os#20).
+A number without its footer is not published here.
+
+The first lab receipt, `runs/8f28c2d849.048f7f45.json` (2026-10-23):
+
+```
+specs/t27f/work_graph.t27|tests=9|pass=9|FAIL=0|vacuous=0|blocked=0
+specs/queen/actors.t27|tests=37|pass=37|FAIL=0|vacuous=0|blocked=0
+specs/t27f/export_video.t27|tests=6|pass=6|FAIL=0|vacuous=0|blocked=0
+reader: t27c 0.5.2 built from t27 8f28c2d849837d5deb43b7d2b37f6180fc5c8640 (the binary reports "build 0 commit unknown"); specs t27f/work_graph, queen/actors, t27f/export_video
+judge: t27c test-report; vacuous and blocked are counted, never passed (t27os#13)
+n: n=1 run + 1 requester reproduction; no confidence interval
+cost: 108 s on one GitHub runner (lab run 39944645613, job 11:14:06Z to 11:15:54Z); five failed dispatches before it, 10:53Z to 11:08Z, cost about 5 runner-minutes more
+repro: gh workflow run lab.yml --repo Trinity-S-AI-DNA/t27os -f sha=8f28c2d849837d5deb43b7d2b37f6180fc5c8640 -f challenge=<fresh hex> -f specs="specs/t27f/work_graph.t27 specs/queen/actors.t27 specs/t27f/export_video.t27"; the original challenge is bound by challenge_sha256 048f7f45151ce7b29b6109ab66bff18d325c49a7d8ae451412891b370892f561
+```
