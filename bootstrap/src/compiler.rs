@@ -3160,8 +3160,13 @@ the parser used to read it as `{}` followed by a negation",
             }
         }
 
-        // Main type identifier with namespace support (lexer::Lexer, base::types)
-        if self.current.kind == TokenKind::Ident {
+        // Main type identifier with namespace support (lexer::Lexer, base::types).
+        // The fn TYPE head rides here too (#11940 sub-slice 2a): `fn` lexes as
+        // KwFn, not Ident, so a fn-typed parameter (`cb: fn(S) -> S`) returned
+        // an EMPTY type and the header died on "Expected LBrace, got Comma".
+        if self.current.kind == TokenKind::Ident || self.current.kind == TokenKind::KwFn {
+            let fn_head = self.current.kind == TokenKind::KwFn;
+            let fn_line = self.current.line;
             ty.push_str(&self.current.lexeme);
             self.advance();
 
@@ -3203,6 +3208,21 @@ the parser used to read it as `{}` followed by a negation",
             // rather than in expression parsing, because the same tokens in an
             // expression position continue to mean a function call.
             self.parse_type_application_args(&mut ty);
+
+            // A fn TYPE's return rides with the type in both spellings: t27
+            // `fn(A) -> B`, Zig `fn(A) B`. After a complete type the only
+            // continuations are `,` `)` `}` `=`, so an arrow, or a type token
+            // on the fn's own line, is the return -- leaving Zig's `bool`
+            // behind made it a phantom struct field (#3225).
+            if fn_head {
+                let zig = self.current.line == fn_line && matches!(self.current.kind, TokenKind::Ident | TokenKind::KwVoid | TokenKind::KwFn | TokenKind::Question | TokenKind::Star | TokenKind::LBracket | TokenKind::LParen);
+                if self.current.kind == TokenKind::Arrow || zig {
+                    let arrow = self.current.kind == TokenKind::Arrow;
+                    if arrow { self.advance(); }
+                    let ret = self.parse_type_annotation();
+                    ty.push_str(&format!("{} {}", if arrow { "->" } else { "" }, ret));
+                }
+            }
         } else if self.current.kind == TokenKind::KwVoid {
             ty.push_str("void");
             self.advance();
@@ -3335,7 +3355,22 @@ the parser used to read it as `{}` followed by a negation",
             }
 
             // Parse param type
-            let param_type = self.parse_type_annotation();
+            let mut param_type = self.parse_type_annotation();
+
+            // #11940 sub-slice 2a: an ARROW inside a parameter list can only
+            // be the return of the parameter's own fn type -- after a complete
+            // type the list's only continuations are `,` and `)`. It was read
+            // as a phantom name, so `fn modify(fn: Fn(S) -> S)` parsed as
+            // [("fn", "Fn(S)"), ("S", "")] and Zig got `fn modify(... Fn(S), S: )`
+            // (state.t27 modify, reader.t27 asks/local, writer.t27 censor).
+            // The arrow and its return are consumed INTO the parameter.
+            if self.current.kind == TokenKind::Arrow
+                && (param_type.starts_with("fn(") || param_type.starts_with("Fn("))
+            {
+                self.advance(); // consume ->
+                let ret = self.parse_type_annotation();
+                param_type = format!("{} -> {}", param_type, ret);
+            }
 
             decl.params.push((param_name, param_type));
 
@@ -33082,10 +33117,6 @@ pub struct RouteEstimate {
 pub struct RouteModel;
 
 impl RouteModel {
-    pub const LOCAL_WIRE_UM: u32 = 500;
-    pub const MEDIUM_WIRE_UM: u32 = 2000;
-    pub const LONG_WIRE_UM: u32 = 5000;
-
     pub fn est_wire_length(fanout: u32) -> u32 {
         hir_cost_models::est_wire_length(fanout)
     }
