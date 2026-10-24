@@ -91,5 +91,8 @@ edit the functions above line 380 and the file must be regenerated. New tests go
 - The equivalence at line 361 is measured at one point (0.3 V, 2 pF, mode 0): the leak is bit for bit the same after the
   extra step. At another point (a different input, load or mode) the leak could move; the mutants are then not
   equivalent there and no test of this change would kill them.
+- Line 273 is accepted because no test builds a largest move equal to `QS_TOL` to the last bit of an f64; that is not a
+  proof the value is unreachable, so the accepted file says "not constructed", not "equivalent". The two mutants at
+  line 361 are marked "unobservable in the returned QsHold": the state differs, no field of the record shows it.
 - Only `sar_switch_q.t27` was gated here. The other analog specs have a census with survivors not yet pinned: #12096
   (`sar_adc`), #12097 (`sar_kick`), #12098 (`sar_cdac`), #12099 (`sar_comparator_psp`).
