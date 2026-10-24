@@ -54,6 +54,27 @@
 ; empty export set refuses at the module level: construct module, fn
 ; (module), line 0. The refusal line is `unsupported construct <construct> at
 ; line <line> (fn <func>: <detail>)` -- EmitError::message's exact shape.
+; Floor 9 (the BODY LOWERING, the last law slice -- ported from the same
+; held reference cli/t27b/src/wasm32_emitter.rs @ 5170be77b, port epic #6198,
+; tracking #11983) is the happy-path twin of floor 8's walk: the BYTES a fn the
+; walk admitted lowers to. lower_stack's postfix walk becomes lower_expr_node
+; (one node: EK_CONST emits i32.const through the carrier crossing, EK_VAR
+; emits local.get, EK_ARITH emits the operator's opcode byte -- Div via
+; i32.div_u, an operator outside + - * / writes nothing, fail closed);
+; const_insn's carrier crossing becomes const_insn over the type NAME through
+; floor 8's carrier map (the i32 crossing for every <=32-bit type, the i64
+; crossing for i64/u64, the f32/f64 LE bit patterns through the floor-4 fns);
+; the select pattern becomes select_body (the true constant, the false
+; constant, local.get of the parameter, eqz, select -- five instructions).
+; The crossings are arithmetic law, not bit tricks: an unsigned constant at or
+; above the carrier's signed midpoint crosses as the same bit pattern read
+; signed, exactly the reference's `v - (1 << 32)` / `v - (1 << 64)` rules,
+; because wasm's integer carriers are signed and the varint has no other valid
+; encoding of those bytes. sleb_value (the reader half of floor 1's writer)
+; decodes the emitted immediates back, so the crossing tests round-trip instead
+; of trusting the writer. The capstone re-derives the 117-byte live-scalar trio
+; through floor 7's compose_module over bodies this floor lowered, pinning the
+; code section byte for byte.
 
 ; Every fn writes into a caller buffer at an offset and returns the new offset -- the same contract
 ; as the Mach-O port (specs/tri/t27b/macho.t27) -- so the emitter composes sections without an
@@ -2303,4 +2324,314 @@ test fn_refusal_walks_the_emitter_order {
     // the module-level refusal fires on the empty export set only
     assert refused_module(0);
     assert !refused_module(1) and !refused_module(3);
+}
+
+// -- Floor 9: the BODY LOWERING (ported from cli/t27b/src/wasm32_emitter.rs on
+// lane/ma-params @ 5170be77b, port epic #6198, tracking #11983) -- the happy
+// path floor 8's refusal walk guards. Where floor 8 says WHICH pub fns carry,
+// this floor says the exact bytes each carried piece lowers to: lower_stack's
+// postfix walk (lower_expr_node), const_insn's carrier crossing for every
+// carried type (const_insn over the type name), and the select pattern's
+// five-instruction body (select_body). --
+
+/// Signed LEB128 read back from a whole buffer -- the reader half of floor
+/// 1's writer, so the crossing tests below decode the emitted immediate
+/// instead of trusting the writer (the same round trip the reference
+/// emitter's unit tests assert through read_sleb).
+pub fn sleb_value(t: []const u8) -> i64 {
+    var result : i64 = 0;
+    var ones : i64 = 0 - 1;
+    var shift : u32 = 0;
+    var i : usize = 0;
+    while (i < t.len) {
+        var b : u8 = t[i];
+        result = result | (((b & 0x7F) as i64) << shift);
+        i = i + 1;
+        if (b & 0x80 == 0) {
+            // the last chunk's sign bit extends everything above it
+            if (b & 0x40 != 0 and shift < 57) {
+                result = result | (ones << (shift + 7));
+            }
+            return result;
+        }
+        shift = shift + 7;
+    }
+    return result;
+}
+
+/// The signed i32 image of a constant on the i32 carrier: the low 32 bits of
+/// its two's-complement pattern, read signed -- the reference's `v - (1<<32)`
+/// when v sits above i32's midpoint (a u32 at or above 2^31) and v unchanged
+/// otherwise. An i32-carrier constant (bool, the <=32-bit ints, the odd
+/// widths) is fully determined by those low 32 bits.
+pub fn i32_signed_image(v : u64) -> i32 {
+    var lo : u64 = v & 0xFFFFFFFF;
+    var x : i64 = @intCast(lo);
+    if (lo >= 0x80000000) {
+        x = x - 0x100000000;
+    }
+    return @intCast(x);
+}
+
+/// The signed i64 image of a constant on the i64 carrier (i64/u64): the same
+/// crossing one width up -- a u64 at or above 2^63 is the same 64 bits the
+/// signed carrier holds. The subtraction rides in two 2^62 halves because no
+/// positive i64 literal reaches 2^63.
+pub fn i64_signed_image(v : u64) -> i64 {
+    var lo : u64 = v & 0x7FFFFFFFFFFFFFFF;
+    var x : i64 = @intCast(lo);
+    if (v >= 0x8000000000000000) {
+        x = x - 0x4000000000000000 - 0x4000000000000000;
+    }
+    return x;
+}
+
+/// The f32 bits of a float constant's 64-bit pattern: the low 32 bits (an IR
+/// float constant crosses as its IEEE-754 bit pattern).
+pub fn f32_const_bits(v : u64) -> u32 {
+    return @intCast(v & 0xFFFFFFFF);
+}
+
+/// The constant instruction for `<ty>.const <v>` -- const_insn's dispatch over
+/// the type NAME through floor 8's carrier map: f32/f64 through the floor-4
+/// bit-pattern fns, i64/u64 through the i64 crossing, every other carried type
+/// through the i32 crossing. An uncarried name (ptr, i128) writes nothing and
+/// the offset stands -- the walk refused the fn before this point.
+pub fn const_insn(out: []u8, at: usize, ty: []const u8, v: u64) -> usize {
+    var c : u8 = carrier(ty);
+    if (c == 0) { return at; }
+    if (c == VT_F32) { return f32_const(out, at, f32_const_bits(v)); }
+    if (c == VT_F64) { return f64_const(out, at, v); }
+    if (c == VT_I64) { return i64_const(out, at, i64_signed_image(v)); }
+    return i32_const(out, at, i32_signed_image(v));
+}
+
+/// The opcode byte one carried operator lowers to (lower_stack's match):
+/// + - * / via the floor-5 opcodes, Div -- the IR of both `/` and integer
+/// `@divTrunc` -- via i32.div_u. Any other operator has no opcode (0) and
+/// lowers nothing; floor 8's walk refused it before this point.
+pub fn arith_opcode(op: u8) -> u8 {
+    if (op == WOP_ADD) { return OP_I32_ADD; }
+    if (op == WOP_SUB) { return OP_I32_SUB; }
+    if (op == WOP_MUL) { return OP_I32_MUL; }
+    if (op == WOP_DIV) { return OP_I32_DIV_U; }
+    return 0;
+}
+
+/// One node of lower_stack's postfix walk, as bytes: EK_CONST emits i32.const
+/// through the carrier crossing (v the constant's 64-bit pattern), EK_VAR
+/// emits local.get of the parameter (the nparams bound is floor 8's walk),
+/// EK_ARITH emits the operator's opcode byte. Anything else writes nothing
+/// and the offset stands -- fail closed, exactly the kinds floor 8 refuses.
+pub fn lower_expr_node(out: []u8, at: usize, kind: u8, v: u64, var_idx: u32, op: u8) -> usize {
+    if (kind == EK_CONST) { return i32_const(out, at, i32_signed_image(v)); }
+    if (kind == EK_VAR) { return local_get(out, at, var_idx); }
+    if (kind == EK_ARITH) {
+        var oc : u8 = arith_opcode(op);
+        if (oc == 0) { return at; }
+        out[at] = oc;
+        return at + 1;
+    }
+    return at;
+}
+
+/// The select pattern's five-instruction body: the TRUE constant first (the
+/// then arm's `return <x>;`), then the FALSE constant (the fall-through
+/// return), then local.get of the compared parameter, eqz over it, select --
+/// select's stack is true value, false value, condition. x and y are the two
+/// constants' 64-bit patterns; each crosses as an i32-carrier constant.
+pub fn select_body(out: []u8, at: usize, x: u64, y: u64, pv: u32) -> usize {
+    var n : usize = i32_const(out, at, i32_signed_image(x));
+    n = i32_const(out, n, i32_signed_image(y));
+    n = local_get(out, n, pv);
+    n = i32_eqz(out, n);
+    return select(out, n);
+}
+
+test sleb_value_reads_floor_one_sleb_back {
+    // the canonical vectors of the reference emitter's own tests, decoded
+    var b : [10]u8 = undefined;
+    var n : usize = sleb(b[0..10], 0, 0);
+    assert n == 1 and b[0] == 0x00 and sleb_value(b[0..n]) == 0;
+    n = sleb(b[0..10], 0, 42);
+    assert n == 1 and b[0] == 0x2A and sleb_value(b[0..n]) == 42;
+    n = sleb(b[0..10], 0, 64);
+    assert n == 2 and b[0] == 0xC0 and b[1] == 0x00 and sleb_value(b[0..n]) == 64;
+    n = sleb(b[0..10], 0, -1);
+    assert n == 1 and b[0] == 0x7F and sleb_value(b[0..n]) == (0 - 1);
+    n = sleb(b[0..10], 0, -64);
+    assert n == 1 and b[0] == 0x40 and sleb_value(b[0..n]) == (0 - 64);
+    n = sleb(b[0..10], 0, -65);
+    assert b[0] == 0xBF and b[1] == 0x7F and sleb_value(b[0..n]) == (0 - 65);
+    n = sleb(b[0..10], 0, -123456);
+    assert b[0] == 0xC0 and b[1] == 0xBB and b[2] == 0x78;
+    assert sleb_value(b[0..n]) == (0 - 123456);
+    // the widest crossing: i64 min itself, reached through the i64 image
+    var vmin : i64 = i64_signed_image(0x8000000000000000);
+    n = sleb(b[0..10], 0, vmin);
+    assert sleb_value(b[0..n]) == vmin;
+    var vmax : i64 = i64_signed_image(0x7FFFFFFFFFFFFFFF);
+    n = sleb(b[0..10], 0, vmax);
+    assert sleb_value(b[0..n]) == vmax;
+}
+
+test carrier_crossings_pin_the_reference_images {
+    // the i32 crossing: u32 at or above 2^31 is the same bits read signed
+    assert i32_signed_image(4000000000) == (0 - 294967296);
+    assert i32_signed_image(2147483647) == 2147483647;
+    assert i32_signed_image(4294967295) == (0 - 1);
+    // a negative constant crosses through its low-32 pattern unchanged
+    assert i32_signed_image(0xFFFFFFFFFFFFFF80) == (0 - 128);
+    // the i64 crossing: 2^63 + 5 is the same 64 bits as -2^63 + 5
+    assert i64_signed_image(0x8000000000000005) == (0 - 9223372036854775803);
+    assert i64_signed_image(5) == 5;
+    assert i64_signed_image(0x7FFFFFFFFFFFFFFF) == 9223372036854775807;
+    // everything below the boundary passes through unchanged
+    assert i32_signed_image(2) == 2;
+    // the emitted varint carries the image: a runtime refuses anything else
+    var b : [11]u8 = undefined;
+    var n : usize = i32_const(b[0..11], 0, i32_signed_image(4000000000));
+    assert b[0] == 0x41 and sleb_value(b[1..n]) == (0 - 294967296);
+    n = i64_const(b[0..11], 0, i64_signed_image(0x8000000000000005));
+    assert b[0] == 0x42 and sleb_value(b[1..n]) == (0 - 9223372036854775803);
+}
+
+test const_insn_covers_every_carried_type {
+    var b : [12]u8 = undefined;
+    var n : usize = const_insn(b[0..12], 0, "i32", 42);
+    assert n == 2 and b[0] == 0x41 and b[1] == 0x2A;
+    // u32 above 2^31 crosses on the i32 carrier, opcode stays i32.const
+    n = const_insn(b[0..12], 0, "u32", 4000000000);
+    assert n == 6 and b[0] == 0x41 and sleb_value(b[1..n]) == (0 - 294967296);
+    // i64 and u64 ride the i64 carrier through the i64 crossing
+    n = const_insn(b[0..12], 0, "i64", 0xFFFFFFFFFFFFFFF9);
+    assert n == 2 and b[0] == 0x42 and b[1] == 0x79;
+    n = const_insn(b[0..12], 0, "u64", 0x8000000000000005);
+    assert n == 11 and b[0] == 0x42 and sleb_value(b[1..n]) == (0 - 9223372036854775803);
+    // f32: the opcode 0x43, then the four IEEE bytes little-endian (1.5)
+    n = const_insn(b[0..12], 0, "f32", 0x3FC00000);
+    assert n == 5 and b[0] == 0x43 and b[1] == 0x00 and b[2] == 0x00;
+    assert b[3] == 0xC0 and b[4] == 0x3F;
+    // f64: the opcode 0x44, then the eight IEEE bytes little-endian (3.5 =
+    // 0x400C000000000000, so 00 00 00 00 00 00 0C 40)
+    n = const_insn(b[0..12], 0, "f64", 0x400C000000000000);
+    assert n == 9 and b[0] == 0x44 and b[5] == 0x00 and b[6] == 0x00;
+    assert b[7] == 0x0C and b[8] == 0x40;
+    // every other carried type rides the i32 carrier: bool 1, u8 255
+    n = const_insn(b[0..12], 0, "bool", 1);
+    assert n == 2 and b[0] == 0x41 and b[1] == 0x01;
+    n = const_insn(b[0..12], 0, "u8", 255);
+    assert n == 3 and b[0] == 0x41 and b[1] == 0xFF and b[2] == 0x01;
+    // an uncarried name writes nothing: the offset stands
+    assert const_insn(b[0..12], 0, "ptr", 0) == 0;
+    assert const_insn(b[0..12], 7, "i128", 0) == 7;
+}
+
+test lower_expr_node_pins_each_postfix_node {
+    var b : [12]u8 = undefined;
+    // a parameter is a local.get
+    var n : usize = lower_expr_node(b[0..12], 0, EK_VAR, 0, 0, 0);
+    assert n == 2 and b[0] == 0x20 and b[1] == 0x00;
+    n = lower_expr_node(b[0..12], 0, EK_VAR, 0, 1, 0);
+    assert n == 2 and b[1] == 0x01;
+    // an i32-range constant is an i32.const through the crossing
+    n = lower_expr_node(b[0..12], 0, EK_CONST, 16, 0, 0);
+    assert n == 2 and b[0] == 0x41 and b[1] == 0x10;
+    n = lower_expr_node(b[0..12], 0, EK_CONST, 4000000000, 0, 0);
+    assert b[0] == 0x41 and sleb_value(b[1..n]) == (0 - 294967296);
+    // the four operators, Div via i32.div_u
+    assert lower_expr_node(b[0..12], 0, EK_ARITH, 0, 0, WOP_ADD) == 1 and b[0] == 0x6A;
+    assert lower_expr_node(b[0..12], 0, EK_ARITH, 0, 0, WOP_SUB) == 1 and b[0] == 0x6B;
+    assert lower_expr_node(b[0..12], 0, EK_ARITH, 0, 0, WOP_MUL) == 1 and b[0] == 0x6C;
+    assert lower_expr_node(b[0..12], 0, EK_ARITH, 0, 0, WOP_DIV) == 1 and b[0] == 0x6E;
+    // an operator outside + - * / writes nothing (Rem is floor 8's refusal)
+    assert lower_expr_node(b[0..12], 0, EK_ARITH, 0, 0, 8) == 0;
+    assert lower_expr_node(b[0..12], 5, EK_ARITH, 0, 0, 8) == 5;
+    // any other kind writes nothing
+    assert lower_expr_node(b[0..12], 0, 7, 0, 0, 0) == 0;
+    // arith_opcode is the pure half
+    assert arith_opcode(WOP_ADD) == OP_I32_ADD and arith_opcode(WOP_SUB) == OP_I32_SUB;
+    assert arith_opcode(WOP_MUL) == OP_I32_MUL and arith_opcode(WOP_DIV) == OP_I32_DIV_U;
+    assert arith_opcode(8) == 0 and arith_opcode(7) == 0;
+}
+
+test select_body_pins_the_five_instructions {
+    var b : [12]u8 = undefined;
+    // paints_due's body: true 0, false 1, local.get 0, eqz, select
+    var n : usize = select_body(b[0..12], 0, 0, 1, 0);
+    assert n == 8;
+    assert b[0] == 0x41 and b[1] == 0x00 and b[2] == 0x41 and b[3] == 0x01;
+    assert b[4] == 0x20 and b[5] == 0x00 and b[6] == 0x45 and b[7] == 0x1B;
+    // a crossing arm keeps the opcode and crosses the immediate (the crossed
+    // varint is five bytes, the whole body twelve)
+    n = select_body(b[0..12], 0, 4000000000, 1, 0);
+    assert b[0] == 0x41 and sleb_value(b[1..6]) == (0 - 294967296);
+    assert b[6] == 0x41 and b[7] == 0x01 and b[8] == 0x20 and b[9] == 0x00;
+    assert b[10] == 0x45 and b[11] == 0x1B and n == 12;
+}
+
+test floor9_lowering_composes_the_117_byte_trio {
+    // The three bodies of the live-scalar trio, lowered node by node through
+    // this floor, then composed by floor 7 -- the same 117 bytes Node's
+    // WebAssembly instantiated 2026-10-24.
+    var names : [33]u8 = undefined;
+    var nn : usize = copy_bytes(names[0..33], 0, "arrival_frame");
+    nn = copy_bytes(names[0..33], nn, "paints_due");
+    nn = copy_bytes(names[0..33], nn, "latency_ms");
+    assert nn == 33;
+    // arrival_frame: (p0 / 16) + 1, postfix
+    var bodies : [30]u8 = undefined;
+    var s : [16]u8 = undefined;
+    var z : usize = lower_expr_node(s[0..16], 0, EK_VAR, 0, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_CONST, 16, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_ARITH, 0, 0, WOP_DIV);
+    z = lower_expr_node(s[0..16], z, EK_CONST, 1, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_ARITH, 0, 0, WOP_ADD);
+    z = end(s[0..16], z);
+    assert z == 9;
+    var bn : usize = copy_bytes(bodies[0..30], 0, s[0..z]);
+    // paints_due: the select pattern, true 0, false 1, parameter 0
+    z = select_body(s[0..16], 0, 0, 1, 0);
+    z = end(s[0..16], z);
+    assert z == 9;
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    // latency_ms: ((p1 - p0) + 1) * 16, postfix
+    z = lower_expr_node(s[0..16], 0, EK_VAR, 0, 1, 0);
+    z = lower_expr_node(s[0..16], z, EK_VAR, 0, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_ARITH, 0, 0, WOP_SUB);
+    z = lower_expr_node(s[0..16], z, EK_CONST, 1, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_ARITH, 0, 0, WOP_ADD);
+    z = lower_expr_node(s[0..16], z, EK_CONST, 16, 0, 0);
+    z = lower_expr_node(s[0..16], z, EK_ARITH, 0, 0, WOP_MUL);
+    z = end(s[0..16], z);
+    assert z == 12;
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    assert bn == 30;
+    var d : [72]u8 = undefined;
+    desc_put(d[0..72], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..72], DESC_ROW, 13, 10, 1, VT_I32, 9, 9);
+    desc_put(d[0..72], 2 * DESC_ROW, 23, 10, 2, VT_I32, 18, 12);
+    var buf : [128]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    const n : usize = compose_module(buf[0..128], names[0..33], d[0..72], bodies[0..30], scratch[0..64]);
+    assert n == 117;
+    // the preamble and the section ladder stand as floor 7 pinned them
+    assert buf[0] == 0x00 and buf[1] == 0x61 and buf[2] == 0x73 and buf[3] == 0x6D;
+    assert buf[8] == 0x01 and buf[9] == 0x11 and buf[27] == 0x03 and buf[33] == 0x07;
+    // the code section: count 3, then the three size-prefixed entries -- the
+    // bytes this floor's lowering produced, byte for byte
+    assert buf[78] == 0x0A and buf[79] == 0x25 and buf[80] == 0x03;
+    // arrival_frame entry: size 0A, locals 00, get 0, const 16, div_u, const 1, add, end
+    assert buf[81] == 0x0A and buf[82] == 0x00 and buf[83] == 0x20 and buf[84] == 0x00;
+    assert buf[85] == 0x41 and buf[86] == 0x10 and buf[87] == 0x6E and buf[88] == 0x41;
+    assert buf[89] == 0x01 and buf[90] == 0x6A and buf[91] == 0x0B;
+    // paints_due entry: size 0A, locals 00, the select body, end
+    assert buf[92] == 0x0A and buf[93] == 0x00 and buf[94] == 0x41 and buf[95] == 0x00;
+    assert buf[96] == 0x41 and buf[97] == 0x01 and buf[98] == 0x20 and buf[99] == 0x00;
+    assert buf[100] == 0x45 and buf[101] == 0x1B and buf[102] == 0x0B;
+    // latency_ms entry: size 0D, locals 00, the postfix program, end
+    assert buf[103] == 0x0D and buf[104] == 0x00 and buf[105] == 0x20 and buf[106] == 0x01;
+    assert buf[107] == 0x20 and buf[108] == 0x00 and buf[109] == 0x6B and buf[110] == 0x41;
+    assert buf[111] == 0x01 and buf[112] == 0x6A and buf[113] == 0x41 and buf[114] == 0x10;
+    assert buf[115] == 0x6C and buf[116] == 0x0B;
 }
