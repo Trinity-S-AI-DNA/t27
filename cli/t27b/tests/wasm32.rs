@@ -299,3 +299,42 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
     let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
     assert_eq!(e.construct, "local variable");
 }
+
+// The live closure's trio module, held by the suite (the page's wasm is not a
+// one-off build): build specs/t27f/live_scalar_closure.t27, instantiate in
+// Node, and check the three laws' answers -- the exact numbers PROVENANCE and
+// t27f.build name (frames 1/2/3/65, latency 96/256, paints 0/1/1).
+#[test]
+fn live_closure_trio_module_node_verifies() {
+    use std::path::Path;
+    use std::process::Command;
+    let spec = Path::new("../../../specs/t27f/live_scalar_closure.t27");
+    if !spec.exists() {
+        eprintln!("closure spec not found; skipping");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("t27f-live-trio-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp);
+    let wasm = tmp.join("t27f.wasm");
+    let out = Command::new(env!("CARGO_BIN_EXE_t27b"))
+        .args(["build", "--target", "wasm32"])
+        .arg(spec)
+        .arg("-o").arg(&wasm)
+        .output()
+        .expect("spawn t27b");
+    assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let js = r#"
+const fs = require('fs');
+(async () => {
+  const e = (await WebAssembly.instantiate(fs.readFileSync(process.argv[2]))).instance.exports;
+  const ok = e.arrival_frame(0)===1 && e.arrival_frame(16)===2 && e.arrival_frame(33)===3
+    && e.arrival_frame(1024)===65 && e.latency_ms(2,7)===96 && e.latency_ms(0,15)===256
+    && e.paints_due(0)===0 && e.paints_due(1)===1 && e.paints_due(64)===1;
+  if (!ok) { console.error('TRIO MISMATCH'); process.exit(1); }
+  console.log('TRIO OK');
+})();
+"#;
+    let node = Command::new("node").arg("-e").arg(js).arg(&wasm).output().expect("spawn node");
+    assert!(node.status.success(), "node said: {}{}", String::from_utf8_lossy(&node.stdout), String::from_utf8_lossy(&node.stderr));
+    assert!(String::from_utf8_lossy(&node.stdout).contains("TRIO OK"));
+}
