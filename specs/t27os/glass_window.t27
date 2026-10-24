@@ -2931,10 +2931,24 @@ use t27os::queen_board::D_UNKNOWN;
 use t27os::queen_board::better_count;
 use t27os::queen_board::snapshot_due;
 use t27os::agent_parts::PAGE_HIVE;
+use t27os::agent_parts::PAGE_LOGS;
 use t27os::devices::DV_NM;
 use t27os::devices::DV_NONE;
 use t27os::devices::DV_DIR;
 use t27os::devices::DV_FILE;
+use t27os::devices::LG_DIR;
+use t27os::devices::LG_FILE;
+use t27os::devices::lg_rows;
+use t27os::devices::lg_tail_cmd;
+use t27os::devices::lg_clock;
+use t27os::devices::DL_F;
+use t27os::devices::DL_MAX;
+use t27os::devices::DL_EPOCH;
+use t27os::devices::DL_KIND;
+use t27os::devices::DL_SS;
+use t27os::devices::DL_SE;
+use t27os::devices::LK_BAD;
+use t27os::devices::LK_WORDS;
 use t27os::devices::DH_F;
 use t27os::devices::DH_NS;
 use t27os::devices::DH_NE;
@@ -7215,6 +7229,13 @@ pub const TPG_O_SEL : u32 = 125;
 pub const TPG_O_RM : u32 = 126;
 pub const TPG_O_RMAT : u32 = 127;
 pub const TPG_O_RMSYS : u32 = 128;
+// L. LOGS (t27os#23): the loop log's tail job and its buffer, in the free word gap before the profile block.
+pub const TPG_LG_LAST : u32 = 129;
+pub const TPG_LG_PID : u32 = 130;
+pub const TPG_LG_START : u32 = 131;
+pub const TPG_LG_LEN : u32 = 132;
+pub const TPG_LG_LOADED : u32 = 133;
+pub const TPG_LG_OFF : u32 = 134;
 pub const TPG_O_HX : u32 = 136;
 pub const TPG_O_HY : u32 = 168;
 pub const TPG_O_HP : u32 = 200;
@@ -7247,7 +7268,12 @@ pub const CN_NB_LEN : usize = 272;
 pub const TBO_RC : usize = 109432;
 pub const RC_FLAG : usize = 300;
 pub const RC_CAP : usize = 512;
-pub const TB_ALL : usize = 109944;
+// L. LOGS (t27os#23): the loop log tail region. Master appends it at the top of its store (above the dock); here
+// it follows the dock at the top of main's region, so every offset below keeps its value. TBO_LOG_N matches the
+// tail job's -c 6144.
+pub const TBO_LOG : usize = 109944;
+pub const TBO_LOG_N : usize = 6144;
+pub const TB_ALL : usize = 116088;
 pub const TG_KEY_RETURN : u64 = 36;
 pub const TG_KEY_BACKSPACE : u64 = 51;
 pub const TG_EV_CHAR : u32 = 99;
@@ -9132,6 +9158,108 @@ fn hive_publish(tg: []u64, tb: []u8, hb: []const u8, now: u64) -> void {
     }
 }
 
+// ---- L: the LOGS page (t27os#23) -- the night loop's own log tail, as the swarm's visible heartbeat ----
+
+/// The tail text into the LOG region; the length skips a cut first line (a byte-tail starts mid-line) and any
+/// cut last line (tg_whole_lines), so the parser only ever sees whole lines.
+fn lg_load(tg: []u64, tb: []u8, hb: []const u8) -> void {
+    const n : usize = tg_read(hb, LG_DIR, LG_FILE, tb[TBO_LOG .. TBO_LOG + TBO_LOG_N]);
+    // a full buffer means the tail job byte-cut the file: its first line starts mid-line; skip past its LF
+    var off : usize = 0;
+    if (n >= TBO_LOG_N) {
+        while (off < n and tb[TBO_LOG + off] != 10) { off = off + 1; }
+        if (off < n) { off = off + 1; }
+    }
+    if (off > n) { off = n; }
+    tg[TPG_LG_OFF] = @as(u64, off);
+    tg[TPG_LG_LEN] = @as(u64, off + tg_whole_lines(tb, TBO_LOG + off, n - off));
+}
+
+/// The tail job (tail -c 6144 log.txt into tail.txt) every PERIOD_LOGS while the page is open, and its reap.
+fn lg_tick(tg: []u64, tb: []u8, hb: []const u8, now: u64, open: bool) -> void {
+    if (tg[TPG_LG_LOADED] == 0) {
+        lg_load(tg, tb, hb);
+        tg[TPG_LG_LOADED] = 1;
+        tg_bump(tg);
+    }
+    if (tg[TPG_LG_PID] != 0) {
+        if (tg_done(tg[TPG_LG_PID]) == 0) {
+            tg_late(now, tg[TPG_LG_START], tg[TPG_LG_PID]);
+        } else {
+            tg[TPG_LG_PID] = 0;
+            lg_load(tg, tb, hb);
+            tg_bump(tg);
+        }
+    } else if (page_feed_due(PAGE_LOGS, open, now, tg[TPG_LG_LAST])) {
+        tg[TPG_LG_LAST] = now;
+        const w : usize = lg_tail_cmd(hb, tb[TBO_CMD + 6 .. TBO_ROOT]);
+        if (w > 0) {
+            const pid : u64 = tg_spawn(tb, TBO_CMD, TBO_CMD + 6 + w);
+            if (pid != 0) {
+                tg[TPG_LG_PID] = pid;
+                tg[TPG_LG_START] = now;
+            }
+        }
+    }
+}
+
+/// The bytes of f[a .. b) into out at w, sanitized (printable ASCII or a dot) and capped at cap; returns the new w.
+fn lg_put_clean(out: []u8, w: usize, f: []const u8, a: usize, b: usize, cap: usize) -> usize {
+    var i : usize = a;
+    var o : usize = w;
+    while (i < b and o < w + cap) {
+        var ch : u8 = f[i];
+        if (ch < 32 or ch > 126) { ch = 46; }
+        out[o] = ch;
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+fn draw_logs_page(c: u64, kit: [48]u64, tg: []const u64, tb: []const u8, x0: f64, y0: f64, pw: f64, ph: f64, mx: f64, my: f64, sw: f64, full: bool, a: f64, now: u64) -> void {
+    const off : usize = @as(usize, tg[TPG_LG_OFF]);
+    const len : usize = @as(usize, tg[TPG_LG_LEN]);
+    const f : []const u8 = tb[TBO_LOG + off .. TBO_LOG + len];
+    var tab : [DL_MAX * DL_F]u32 = undefined;
+    const n : u32 = lg_rows(f, false, tab[0 .. DL_MAX * DL_F]);
+    var line : [200]u8 = undefined;
+    // ---- header: the title, where the tail comes from, how many rows
+    plate(c, x0 + DV_PAD, y0 + 2.0, pw - 2.0 * DV_PAD, DV_HEAD_H - 4.0, sw, a);
+    tg_txt(c, kit, "LOOP LOG", x0 + DV_PAD + 10.0, y0 + 16.0, 10.5, WEIGHT_BOLD, a, 0.0);
+    var hn : usize = put_bytes(line[0..200], 0, "~/.t27os/loop/log.txt, tail 6 KB, ");
+    hn = put_dec(line[0..200], hn, @as(u64, n));
+    hn = put_bytes(line[0..200], hn, " events");
+    tg_txt(c, kit, line[0..hn], x0 + DV_PAD + 110.0, y0 + 16.0, 8.5, 0.0, 0.7 * a, 0.0);
+    if (n == 0 and tg[TPG_LG_PID] == 0) {
+        tg_txt(c, kit, "no tail yet -- the first job runs while this page is open", x0 + DV_PAD + 10.0, y0 + DV_HEAD_H + 18.0, 9.0, 0.0, 0.6 * a, 0.0);
+        return;
+    }
+    // ---- rows: the newest DL_MAX lines, the clock left, the kind word, the subject
+    const row_h : f64 = 15.0;
+    var y : f64 = y0 + DV_HEAD_H + 6.0;
+    var r : u32 = 0;
+    while (r < n) {
+        const q : usize = @as(usize, r) * DL_F;
+        const kind : u32 = tab[q + DL_KIND];
+        // the clock column (UTC; a malformed line shows the dashes)
+        const cw : usize = lg_clock(tab[q + DL_EPOCH], line[0..200]);
+        tg_txt(c, kit, line[0..cw], x0 + DV_PAD + 4.0, y + 11.0, 8.0, 0.0, 0.55 * a, 0.0);
+        // the kind word (LK_WORDS; BAD carries its own label)
+        tg_txt(c, kit, LK_WORDS[kind], x0 + DV_PAD + 84.0, y + 11.0, 9.0, 0.0, a, 0.0);
+        // the subject, sanitized and truncated
+        const ss : usize = @as(usize, tab[q + DL_SS]);
+        const se : usize = @as(usize, tab[q + DL_SE]);
+        if (se > ss) {
+            const w : usize = lg_put_clean(line[0..200], 0, f, ss, se, 72);
+            tg_txt(c, kit, line[0..w], x0 + DV_PAD + 210.0, y + 11.0, 9.0, 0.0, 0.8 * a, 0.0);
+        }
+        y = y + row_h;
+        r = r + 1;
+    }
+}
+
+
 /// The pinned agents of widget w as chips at (x, y), owner first and bold (the kanban card's chips).
 fn hv_chips(c: u64, kit: [48]u64, w: u32, x: f64, y: f64, a: f64) -> void {
     var k : u32 = 0;
@@ -9479,6 +9607,7 @@ fn draw_tool_page(c: u64, kit: [48]u64, kind: u32, tg: []const u64, tb: []const 
     if (kind == PAGE_KANBAN) { draw_kanban_page(c, kit, tg, tb, x0, y0, pw, ph, mx, my, sw, full, a, now); }
     if (kind == PAGE_QUEEN) { draw_queen_page(c, kit, tg, tb, x0, y0, pw, ph, mx, my, sw, full, a, now); }
     if (kind == PAGE_HIVE) { draw_hive_page(c, kit, tg, tb, x0, y0, pw, ph, mx, my, sw, full, a, now); }
+    if (kind == PAGE_LOGS) { draw_logs_page(c, kit, tg, tb, x0, y0, pw, ph, mx, my, sw, full, a, now); }
 }
 
 // ---- the key-light dot (owner directive gHashTag/t27#11314) ----
@@ -19308,6 +19437,8 @@ pub fn main() -> void {
         if (hv_up or tgv[TPG_H_WANT] != 0) { tgv[TPG_Q_ROOTLEN] = @as(u64, qn_root(dk, space, tbv[0..49152])); }
         if (bgoff == false) {
             hive_tick(tgv[0..256], tbv[0..71936], dhb[0..dhn], now, hv_up);
+            // L. the LOGS page tail job, only while its page is open; a call or quiet jobs hold it like the other feeds
+            lg_tick(tgv[0..256], tbv[0..TB_ALL], dhb[0..dhn], now, open2 and tpk2 == PAGE_LOGS);
             update_tick(tgv[0..256], tbv[0..49152], dhb[0..dhn], ubp[0..ubn], now, up_busy(sst[0..560]));
         }
         up_qa(tgv[0..256], now, bgoff);
@@ -21445,8 +21576,10 @@ test the_profile_region_fits_the_text_store_and_its_words_are_free {
     // the CALL region (CL) follows it and ends the store
     assert TBO_PF + PF_CAP == TBO_CL;
     assert TBO_CL + CL_CAP == TBO_CH and TBO_CH + CHV_CAP == TBO_IV and TBO_IV + IV_LEN == TBO_BK and TBO_BK + BK_CAP == TBO_GV and TBO_GV + GV_CAP == TBO_QC and TBO_QC + QC_CAP == TB_SIZE;
-    // the QUEEN CHAT dock's region (RC) comes after the trust table and the resolver's block and ends main's store
-    assert TBO_RC == TBO_NAT + CN_NB_LEN and TB_ALL == TBO_RC + RC_CAP;
+    // the QUEEN CHAT dock's region (RC) comes after the trust table and the resolver's block
+    assert TBO_RC == TBO_NAT + CN_NB_LEN and TBO_LOG == TBO_RC + RC_CAP;
+    // the LOGS tail region (L) follows the dock's region and ends main's store
+    assert TBO_LOG == TBO_RC + RC_CAP and TB_ALL == TBO_LOG + TBO_LOG_N;
     assert PF_TYPED + PRF_NICK_MAX_BYTES <= PF_SAVED;
     assert PF_SAVED + PRF_NICK_MAX_BYTES <= PF_CAP;
     assert PF_HOLD_HI < PF_TYPED;
@@ -21467,10 +21600,10 @@ test the_queen_chat_dock_is_shown_only_while_no_other_right_hand_panel_is_open {
     // a hidden dock is not docked: the keys, the clicks and the pane's size go back to the content
     assert rc_docked(rc_shown(true, false, false, false, false, false), 0, AGENT_QUEEN);
     assert rc_docked(rc_shown(true, false, false, false, false, true), 0, AGENT_QUEEN) == false;
-    // the dock's shown flag sits inside its own region, above the line and its length byte, and the region ends
-    // main's store past every region a slice ending at TB_SIZE reads
+    // the dock's shown flag sits inside its own region, above the line and its length byte, and the region lies past
+    // every region a slice ending at TB_SIZE reads, in main's store before the LOGS tail
     assert RC_FLAG > RC_TEXT_MAX and RC_FLAG < RC_CAP;
-    assert TBO_RC >= TB_SIZE and TBO_RC + RC_CAP == TB_ALL;
+    assert TBO_RC >= TB_SIZE and TBO_RC + RC_CAP == TBO_LOG and TBO_LOG + TBO_LOG_N == TB_ALL;
 }
 
 test the_header_cluster_and_the_footer_bar_are_where_they_are_drawn_and_a_merge_cannot_drop_them {
@@ -21520,7 +21653,7 @@ test the_queen_control_dashboard_is_where_it_is_drawn_and_nothing_overlaps_the_f
     assert qd_open(z[0..560], false, WS_EXPANDED) == false;
     // the dashboard's words and buffers do not collide with the other feeds
     assert TPG_QD_PLANN > TPG_G_NEXT and TPG_QD_FLAGS < TPG_N and SST_QDASH < SST_SIZE and SST_QDASH != SST_DISK;
-    assert TBO_QD_PLAN >= TB_LANES_END and TBO_QD_HIVE + QD_HIVE_CAP == TBO_PF and TBO_PF + PF_CAP == TBO_CL and TBO_CL + CL_CAP == TBO_CH and TBO_CH + CHV_CAP == TBO_IV and TBO_IV + IV_LEN == TBO_BK and TBO_BK + BK_CAP == TBO_GV and TBO_GV + GV_CAP == TBO_QC and TBO_QC + QC_CAP == TB_SIZE and TBO_RC == TBO_NAT + CN_NB_LEN and TB_ALL == TBO_RC + RC_CAP;
+    assert TBO_QD_PLAN >= TB_LANES_END and TBO_QD_HIVE + QD_HIVE_CAP == TBO_PF and TBO_PF + PF_CAP == TBO_CL and TBO_CL + CL_CAP == TBO_CH and TBO_CH + CHV_CAP == TBO_IV and TBO_IV + IV_LEN == TBO_BK and TBO_BK + BK_CAP == TBO_GV and TBO_GV + GV_CAP == TBO_QC and TBO_QC + QC_CAP == TB_SIZE and TBO_RC == TBO_NAT + CN_NB_LEN and TBO_LOG == TBO_RC + RC_CAP and TB_ALL == TBO_LOG + TBO_LOG_N;
     assert TBO_QD_TRIG == TBO_QD_PLAN + QD_PLAN_CAP and TBO_QD_BOARD == TBO_QD_TRIG + QD_TRIG_CAP and TBO_QD_HIVE == TBO_QD_BOARD + QD_BOARD_CAP;
     // the lanes table lists only work rows
     assert qd_lane_index(z[0..560], 0) == LV_NONE;
@@ -22655,7 +22788,7 @@ test ch_a_refused_key_is_written_once_per_session_and_outlives_a_restart {
     assert ch_trust_apply(v2[0..8192], w2[0..12], tt[0..TRU_LEN], a[0..10], CS_ID_VERIFIED, 50, false, now + 6016) == TRU_S_NONE;
     assert tru_refused(tt[0..TRU_LEN], a[0..10]) == 1 and chv_trust(v2[0..8192], a[0..10]) == FV_T_MISMATCH;
     assert CHW_RF_CALL < CHW_N and CHW_RF_MSG < CHW_N and CHW_RF_CALL != CHW_RF_MSG and CHW_SAY_N < CHW_RF_CALL;
-    assert TBO_TRU == TB_SIZE and TBO_NAT == TBO_TRU + TRU_LEN and TBO_RC == TBO_NAT + CN_NB_LEN and TB_ALL == TBO_RC + RC_CAP;
+    assert TBO_TRU == TB_SIZE and TBO_NAT == TBO_TRU + TRU_LEN and TBO_RC == TBO_NAT + CN_NB_LEN and TBO_LOG == TBO_RC + RC_CAP and TB_ALL == TBO_LOG + TBO_LOG_N;
     assert BE_LEN == CN_NB_REF and CN_NB_REF + 8 <= CN_NB_LEN and BE_HOST + CN_STUN_HOST.len + 1 <= BE_IP;
 }
 
