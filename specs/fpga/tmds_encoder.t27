@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/tmds_encoder.t27 -- the TMDS 8b/10b encoder of DVI 1.0 / HDMI (#11034, epic #10782, board AX7203).
+; One pixel clock turns an 8-bit value and its blanking state into a 10-bit word. While de is high the word carries
+; the pixel: stage one makes a 9-bit transition-minimised code (XOR or XNOR chain), stage two inverts the low eight
+; bits when that keeps the running disparity near zero. While de is low one of four control codes is sent and the
+; disparity resets. The running disparity cnt (ones minus zeros sent so far) is the caller's state, passed in and out.
+; Icarus-lowerable: integer arithmetic, shifts and masks only. No pin numbers here (they come from the schematic).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module FpgaTmdsEncoder;
+
+pub const CTL_00 : u32 = 852;
+pub const CTL_01 : u32 = 171;
+pub const CTL_10 : u32 = 340;
+pub const CTL_11 : u32 = 683;
+
+/// Ones in the low eight bits of v.
+pub fn tmds_ones8(v: u32) -> i32 {
+    var n : i32 = 0;
+    var i : u32 = 0;
+    while (i < 8) {
+        n = n + (((v >> i) & 1) as i32);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Stage one: the 9-bit transition-minimised code of d. Bit 8 says XOR (1) or XNOR (0).
+pub fn tmds_qm(d: u32) -> u32 {
+    const n1 : i32 = tmds_ones8(d);
+    const xnor : bool = n1 > 4 or (n1 == 4 and (d & 1) == 0);
+    var q : u32 = d & 1;
+    var i : u32 = 1;
+    while (i < 8) {
+        const prev : u32 = (q >> (i - 1)) & 1;
+        const bit : u32 = (d >> i) & 1;
+        var nb : u32 = prev ^ bit;
+        if (xnor) { nb = 1 - nb; }
+        q = q | (nb << i);
+        i = i + 1;
+    }
+    if (xnor == false) { q = q | 256; }
+    return q;
+}
+
+/// The control word for c1 c0 (two bits, c1 high).
+pub fn tmds_control(c: u32) -> u32 {
+    if (c == 0) { return CTL_00; }
+    if (c == 1) { return CTL_01; }
+    if (c == 2) { return CTL_10; }
+    return CTL_11;
+}
+
+/// The 10-bit word sent for pixel d (or control code c when de is false), given the running disparity cnt.
+pub fn tmds_word(d: u32, de: bool, c: u32, cnt: i32) -> u32 {
+    if (de == false) { return tmds_control(c); }
+    const qm : u32 = tmds_qm(d);
+    const low : u32 = qm & 255;
+    const inv : u32 = low ^ 255;
+    const n1 : i32 = tmds_ones8(qm);
+    const n0 : i32 = 8 - n1;
+    const q8 : u32 = (qm >> 8) & 1;
+    if (cnt == 0 or n1 == n0) {
+        if (q8 == 0) { return 512 | inv; }
+        return 256 | low;
+    }
+    if ((cnt > 0 and n1 > n0) or (cnt < 0 and n0 > n1)) { return 512 | (q8 << 8) | inv; }
+    return (q8 << 8) | low;
+}
+
+/// The running disparity after that word.
+pub fn tmds_cnt(d: u32, de: bool, c: u32, cnt: i32) -> i32 {
+    if (de == false) { return 0; }
+    const qm : u32 = tmds_qm(d);
+    const n1 : i32 = tmds_ones8(qm);
+    const n0 : i32 = 8 - n1;
+    const q8 : i32 = ((qm >> 8) & 1) as i32;
+    if (cnt == 0 or n1 == n0) {
+        if (q8 == 0) { return cnt + n0 - n1; }
+        return cnt + n1 - n0;
+    }
+    if ((cnt > 0 and n1 > n0) or (cnt < 0 and n0 > n1)) { return cnt + 2 * q8 + n0 - n1; }
+    return cnt - 2 * (1 - q8) + n1 - n0;
+}
+
+/// Back from a data word to the pixel (what a sink does): undo the inversion, then the XOR/XNOR chain.
+pub fn tmds_decode(w: u32) -> u32 {
+    var low : u32 = w & 255;
+    if (((w >> 9) & 1) == 1) { low = low ^ 255; }
+    const xor : bool = ((w >> 8) & 1) == 1;
+    var d : u32 = low & 1;
+    var i : u32 = 1;
+    while (i < 8) {
+        var b : u32 = ((low >> i) & 1) ^ ((low >> (i - 1)) & 1);
+        if (xor == false) { b = 1 - b; }
+        d = d | (b << i);
+        i = i + 1;
+    }
+    return d;
+}
+
+test the_four_control_codes {
+    assert tmds_word(0, false, 0, 0) == 852;
+    assert tmds_word(0, false, 1, 0) == 171;
+    assert tmds_word(0, false, 2, 0) == 340;
+    assert tmds_word(0, false, 3, 0) == 683;
+    assert tmds_cnt(0, false, 0, 5) == 0;
+}
+
+test known_pixel_words_from_a_zero_disparity {
+    assert tmds_word(0, true, 0, 0) == 256;
+    assert tmds_cnt(0, true, 0, 0) == 0 - 8;
+    assert tmds_word(255, true, 0, 0) == 512;
+    assert tmds_cnt(255, true, 0, 0) == 0 - 8;
+}
+
+test every_pixel_decodes_back {
+    var d : u32 = 0;
+    var ok : bool = true;
+    var cnt : i32 = 0;
+    while (d < 256) {
+        const w : u32 = tmds_word(d, true, 0, cnt);
+        if (tmds_decode(w) != d) { ok = false; }
+        cnt = tmds_cnt(d, true, 0, cnt);
+        d = d + 1;
+    }
+    assert ok;
+}
+
+test running_disparity_stays_bounded_over_a_ramp_and_a_flat_field {
+    var cnt : i32 = 0;
+    var worst : i32 = 0;
+    var i : u32 = 0;
+    while (i < 1024) {
+        const d : u32 = i & 255;
+        cnt = tmds_cnt(d, true, 0, cnt);
+        var a : i32 = cnt;
+        if (a < 0) { a = 0 - a; }
+        if (a > worst) { worst = a; }
+        i = i + 1;
+    }
+    assert worst <= 10;
+    var flat : i32 = 0;
+    var fw : i32 = 0;
+    var j : u32 = 0;
+    while (j < 200) {
+        flat = tmds_cnt(128, true, 0, flat);
+        var b : i32 = flat;
+        if (b < 0) { b = 0 - b; }
+        if (b > fw) { fw = b; }
+        j = j + 1;
+    }
+    assert fw <= 10;
+}
+
+test the_word_is_ten_bits_wide {
+    var d : u32 = 0;
+    var ok : bool = true;
+    var cnt : i32 = 0;
+    while (d < 256) {
+        if (tmds_word(d, true, 0, cnt) > 1023) { ok = false; }
+        cnt = tmds_cnt(d, true, 0, cnt);
+        d = d + 1;
+    }
+    assert ok;
+}
