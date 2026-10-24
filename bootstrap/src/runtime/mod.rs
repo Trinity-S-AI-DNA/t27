@@ -521,24 +521,4 @@ impl FormulaRuntime {
             _ => Err(RuntimeError::UnknownOperator(op.to_string())),
         }
     }
-
-    /// Get list of all loaded function names
-    pub fn get_function_names(&self) -> Vec<String> {
-        self.functions.keys().cloned().collect()
-    }
-
-    /// Get information about a loaded function
-    pub(crate) fn get_function_info<'a>(&'a self, name: &str) -> Option<&'a FunctionDef> {
-        self.functions.get(name)
-    }
-
-    /// Clear the memoization cache
-    pub fn clear_cache(&mut self) {
-        self.function_cache.clear();
-    }
-
-    /// Get cache statistics
-    pub fn cache_stats(&self) -> (usize, usize) {
-        (self.function_cache.len(), self.functions.len())
-    }
 }
