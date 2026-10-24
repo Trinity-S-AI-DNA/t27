@@ -86,7 +86,7 @@ jobs:
           i=0
           for spec in ${{ inputs.specs }}; do
             i=$((i+1))
-            if ./target/release/t27c test-report "$spec" > /tmp/out/report_$i.txt 2>&1; then :; fi
+            ./target/release/t27c test-report "$spec" > /tmp/out/report_$i.txt 2>&1 || echo "$spec|test-report exited non-zero" >> /tmp/out/failed.txt
             tests=$(grep -E '^  tests' /tmp/out/report_$i.txt | awk '{print $2}' || true)
             pass=$(grep -E '^  pass'  /tmp/out/report_$i.txt | awk '{print $2}' || true)
             fail=$(grep -E '^  FAIL' /tmp/out/report_$i.txt | awk '{print $2}' || true)
@@ -96,18 +96,23 @@ jobs:
           done
           cat /tmp/out/summary.txt
 
-      - name: check the encoder plumbing (M6 -- export_video encodes on the lab)
+      - name: check the encoder plumbing (M6 -- export_video encodes on the lab; distro ffmpeg first, static build as fallback, never fatal -- t27os#10)
         shell: bash
         run: |
-          curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ -C /tmp
-          echo "/tmp/ffmpeg-"*"-static" | xargs -I{} sh -c 'echo "{}"' > /dev/null
-          FFMPEG_DIR=$(ls -d /tmp/ffmpeg-*static | head -1)
-          export PATH="$FFMPEG_DIR:$PATH"
-          echo "$FFMPEG_DIR" >> "$GITHUB_PATH"
           if command -v ffmpeg >/dev/null 2>&1; then
             ffmpeg -version | head -1 | tee /tmp/ffmpeg.txt
           else
-            echo "ffmpeg absent" | tee /tmp/ffmpeg.txt
+            curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ -C /tmp || echo "ffmpeg: the static CDN failed; the receipt keeps the distro-absent state"
+            FFMPEG_DIR=$(ls -d /tmp/ffmpeg-*static 2>/dev/null | head -1)
+            if [ -n "$FFMPEG_DIR" ]; then
+              echo "$FFMPEG_DIR" >> "$GITHUB_PATH"
+              export PATH="$FFMPEG_DIR:$PATH"
+            fi
+            if command -v ffmpeg >/dev/null 2>&1; then
+              ffmpeg -version | head -1 | tee /tmp/ffmpeg.txt
+            else
+              echo "ffmpeg absent (receipt stays truthful, M6 encode will fail visibly)" | tee /tmp/ffmpeg.txt
+            fi
           fi
 
       - name: M6 -- render the 900-frame schedule and encode queen-live.mp4
@@ -148,7 +153,9 @@ jobs:
           # the heredoc carried the block-scalar indent; strip exactly 10 leading spaces
           sed -i 's/^          //' main.zig
           zig build-exe main.zig -O ReleaseFast
-          ./main queen_frames.ppm 900
+          # measured on this host (t27os#3 task 4): the render rate of the 900-frame loop
+          t0=$(date +%s%N); ./main queen_frames.ppm 900; t1=$(date +%s%N)
+          awk -v a="$t0" -v b="$t1" 'BEGIN{printf "render: %.2f fps, %.2f ms/frame avg over 900 frames (t27c gen frame_render.t27 -> zig ReleaseFast, whole loop clocked)\n", 900*1e9/(b-a), (b-a)/900/1e6}' | tee /tmp/render_stats.txt
           ffmpeg -y -loglevel error -f image2pipe -framerate 30 -vcodec ppm -i queen_frames.ppm -c:v libx264 -pix_fmt yuv420p queen-live.mp4
           sha256sum queen-live.mp4 | tee queen-live.mp4.sha256
           ls -la queen-live.mp4
@@ -156,6 +163,7 @@ jobs:
           printf '%s' "$CH" > "$GITHUB_WORKSPACE/runs/$file.challenge"
           cp queen-live.mp4 "$GITHUB_WORKSPACE/runs/queen-live.mp4"
           cp queen-live.mp4.sha256 "$GITHUB_WORKSPACE/runs/queen-live.mp4.sha256"
+          cp /tmp/render_stats.txt "$GITHUB_WORKSPACE/runs/render_stats.txt"
 
       - name: wasm -- build the live closure's scalar plane
         if: inputs.wasm == 'true'
@@ -241,10 +249,10 @@ jobs:
           c8=$(printf '%s' "$CH" | sha256sum | cut -c1-8)
           chash=$(printf '%s' "$CH" | sha256sum | cut -d' ' -f1)
           stamp=$(cd t27 && git rev-parse HEAD)
-          file="runs/${{ inputs.sha }}.${c8}.json"
+          file="runs/${{ steps.sha.outputs.resolved }}.${c8}.json"
           {
             echo '{'
-            echo "  \"sha\": \"${{ inputs.sha }}\","
+            echo "  \"sha\": \"${{ steps.sha.outputs.resolved }}\","
             echo "  \"challenge_sha256\": \"$chash\","
             echo "  \"t27c_build_stamp\": \"$stamp\","
             echo "  \"t27c_version\": \"$(cat /tmp/t27c_version.txt | tr '\n' ' ' | sed 's/"/\\"/g')\","
@@ -261,7 +269,7 @@ jobs:
             echo '  ]'
             echo '}'
           } > "$file"
-          cp /tmp/out/summary.txt "runs/${{ inputs.sha }}.${c8}.summary.txt"
+          cp /tmp/out/summary.txt "runs/${{ steps.sha.outputs.resolved }}.${c8}.summary.txt"
           cat "$file"
 
       - name: publish the receipt
@@ -270,7 +278,7 @@ jobs:
           git config user.name "t27os-lab"
           git config user.email "admin@t27.ai"
           git add runs/
-          git commit -m "lab receipt: t27@${{ inputs.sha }} challenge-sha256-published"
+          git commit -m "lab receipt: t27@${{ steps.sha.outputs.resolved }} challenge-sha256-published"
           # the surface master moves while a run builds; rebase onto it before publishing
           for attempt in 1 2 3; do
             git fetch origin
@@ -281,9 +289,21 @@ jobs:
             git rebase --onto origin/master HEAD~1 2>/dev/null || true
             # redo the commit on the fresh base, then try again
             git reset --soft origin/master
-            git commit -m "lab receipt: t27@${{ inputs.sha }} challenge-sha256-published"
+            git commit -m "lab receipt: t27@${{ steps.sha.outputs.resolved }} challenge-sha256-published"
           done
           git push
+
+      # The verdict gate (t27os#9): a named spec that is BLOCKED, FAIL or NA fails the run,
+      # after the receipt landed, so the evidence never disappears again.
+      - name: gate -- a named spec that is BLOCKED, FAIL or NA fails the run (receipt already published)
+        if: always()
+        shell: bash
+        run: |
+          { [ -s /tmp/out/summary.txt ] || { echo "::error::no test summary produced; a run without results is not a pass"; exit 1; }
+            BAD=$(grep -E '\|FAIL=([1-9]|NA)\||\|blocked=([1-9]|NA)' /tmp/out/summary.txt || true
+                  [ -s /tmp/out/failed.txt ] && grep -E . /tmp/out/failed.txt || true)
+            if [ -n "$BAD" ]; then echo "::error::regression rows above (BLOCKED, FAIL or non-zero test-report exit)"; echo "$BAD"; exit 1; fi
+            echo "gate: every named spec passed (FAIL=0, blocked=0)"; }
 
       # The closure watch (t27 specs/crons/t27-t27f-closure-lab.t27) names
       # Trinity-S-AI-DNA/trinity#1717 as its ON_FAILURE issue; this step is that
@@ -299,7 +319,7 @@ jobs:
           case "$SPECS" in *t27f*) ;; *) echo "not a t27f run; no closure comment"; exit 0;; esac
           SUM=/tmp/out/summary.txt
           {
-            echo "T27 OS lab run FAILED for t27@${{ inputs.sha }} (closure watch, t27 specs/crons/t27-t27f-closure-lab.t27)."
+            echo "T27 OS lab run FAILED for t27@${{ steps.sha.outputs.resolved }} (closure watch, t27 specs/crons/t27-t27f-closure-lab.t27)."
             echo 'Failed specs, where the summary exists:'
             echo '```'
             grep -Ev '\|FAIL=0\|' "$SUM" 2>/dev/null | head -20 || echo '(no summary produced)'
