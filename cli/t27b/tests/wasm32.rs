@@ -265,20 +265,11 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
     f.body = vec![Stmt::Eval(konst(Ty::U32, 9)), Stmt::Return(Some(konst(Ty::U32, 1)))];
     let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
     assert_eq!(e.construct, "fn body");
-    // a param'd fn returning through a comparison
-    let mut f = fn_const_ret("cmpy", Ty::U32, 0);
-    f.nparams = 1;
-    f.vars = vec![Var { name: "a".into(), ty: Ty::U32 }];
-    f.body = vec![Stmt::Return(Some(Expr {
-        ty: Ty::U32,
-        kind: ExprKind::Cmp {
-            op: CmpOp::Eq,
-            lhs: Box::new(konst(Ty::U32, 1)),
-            rhs: Box::new(konst(Ty::U32, 2)),
-        },
-    }))];
-    let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
-    assert_eq!(e.construct, "expression kind");
+    // `&` is not on the floor (comparisons are, M-C -- their own test below)
+    let src = "pub fn andy(a: u32) -> u32 { return a & 1; }\n";
+    let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
+    assert_eq!(e.construct, "arithmetic op");
+    assert_eq!(e.func, "andy");
     // a param'd fn computing a remainder (`%` is not on the floor)
     let src = "pub fn remf(a: u32) -> u32 { return a % 16; }\n";
     let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
@@ -337,4 +328,39 @@ const fs = require('fs');
     let node = Command::new("node").arg("-e").arg(js).arg(&wasm).output().expect("spawn node");
     assert!(node.status.success(), "node said: {}{}", String::from_utf8_lossy(&node.stdout), String::from_utf8_lossy(&node.stderr));
     assert!(String::from_utf8_lossy(&node.stdout).contains("TRIO OK"));
+}
+
+// The M-C cut (comparisons, t27os#3's named gap; the law's floor 11): the six
+// ops byte-pinned, the eqz fold, and a standard runtime proving lt SIGNED.
+#[test]
+fn comparisons_lower_to_floor_eleven_and_run() {
+    let src = concat!(
+        "pub fn lt(a: i32, b: i32) -> bool { return a < b; }\n",
+        "pub fn gt(a: i32, b: i32) -> bool { return a > b; }\n",
+        "pub fn le(a: i32, b: i32) -> bool { return a <= b; }\n",
+        "pub fn ge(a: i32, b: i32) -> bool { return a >= b; }\n",
+        "pub fn eq(a: i32, b: i32) -> bool { return a == b; }\n",
+        "pub fn ne(a: i32, b: i32) -> bool { return a != b; }\n",
+    );
+    let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
+    for opcode in [0x46u8, 0x47, 0x48, 0x4a, 0x4c, 0x4e] {
+        assert!(m.windows(5).any(|w| w == [0x20, 0x00, 0x20, 0x01, opcode]), "opcode {:#04x} missing", opcode);
+    }
+    // the eqz fold: `x == 0` is one eqz, `x != 0` two (the zero operand drops)
+    let z = wasm32_emitter::emit(&lower_src("pub fn z(a: i32) -> bool { return a == 0; }\n")).expect("emit");
+    assert!(z.ends_with(&[0x20, 0x00, 0x45, 0x0b]));
+    let nz = wasm32_emitter::emit(&lower_src("pub fn nz(a: i32) -> bool { return a != 0; }\n")).expect("emit");
+    assert!(nz.ends_with(&[0x20, 0x00, 0x45, 0x45, 0x0b]));
+    let dir = std::env::temp_dir().join(format!("t27b-wasm-mc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("mc.wasm");
+    std::fs::write(&path, &m).expect("write module");
+    let script = "const fs=require('fs');\
+const e=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),{}).exports;\
+const ok=e.lt(-5,2)===1&&e.lt(7,3)===0&&e.lt(-2147483648,2147483647)===1&&e.gt(-5,2)===0\
+&&e.le(3,3)===1&&e.ge(7,3)===1&&e.ge(-7,-3)===0&&e.eq(0,0)===1&&e.ne(3,3)===0;\
+console.log(ok?'MC OK':'MC MISMATCH');";
+    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-C gate needs Node's WebAssembly");
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("MC OK"), "a comparison mismatched in a standard runtime");
 }
