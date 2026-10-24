@@ -1,0 +1,1340 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/update_host.t27 -- self-update over the local network, the host half (Refs gHashTag/t27#11560).
+// Where update_core.t27 decides, this file does what only the OS can: SHA-256 of a bundle file (CommonCrypto
+// CC_SHA256_Init/Update/Final, in libSystem, a chunk at a time so a 200 MiB bundle is never in memory), the signature
+// with the identity key and its check (Security.framework through keysync_host.ks_sign / ks_verify: ECDSA P-256 over
+// SHA-256), the fingerprint of a key (peer_identity_host.ih_fingerprint). No decision lives here that update_core.t27
+// does not name. Part 2: the transfer (a TCP server that sends the bundle in 64 KiB chunks to a request that names
+// it, a client that resumes from the part on disk and hashes on the fly) and the install (unpack next to the app,
+// check the bundle, swap by rename(2) keeping <app>.prev, undo on any failure); the wire format, the steps and the undo
+// rule are update_core.t27. ASCII only (L3).
+
+module T27osUpdateHost;
+
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_unlink;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_connect;
+use t27os::pty_sys::sys_listen;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_spawn;
+use t27os::pty_sys::sys_waitpid;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_kill;
+use t27os::keysync_host::ks_sign;
+use t27os::keysync_host::ks_verify;
+use t27os::peer_identity::PUB_BYTES;
+use t27os::peer_identity::PRIV_BYTES;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::ID_OFF_PRIV;
+use t27os::peer_identity_host::ih_fingerprint;
+use t27os::update_core::UM_LEN;
+use t27os::update_core::UM_BODY_LEN;
+use t27os::update_core::UM_SIGIN_LEN;
+use t27os::update_core::UM_OFF_SHA;
+use t27os::update_core::UM_OFF_FP;
+use t27os::update_core::UM_OFF_PUB;
+use t27os::update_core::UM_OFF_SIG;
+use t27os::update_core::OF_OK;
+use t27os::update_core::um_body;
+use t27os::update_core::um_sign_input;
+use t27os::update_core::um_seal;
+use t27os::update_core::um_parse;
+use t27os::update_core::um_offer;
+use t27os::update_core::um_author_known;
+use t27os::update_core::um_sig_len;
+use t27os::update_core::um_size_of;
+use t27os::update_core::um_build_of;
+use t27os::update_core::um_version;
+use t27os::update_core::RQ_LEN;
+use t27os::update_core::RS_LEN;
+use t27os::update_core::CH_LEN;
+use t27os::update_core::RQ_MANIFEST;
+use t27os::update_core::RS_OK;
+use t27os::update_core::CH_OK;
+use t27os::update_core::CH_END;
+use t27os::update_core::rq_manifest;
+use t27os::update_core::rq_bundle;
+use t27os::update_core::rq_kind;
+use t27os::update_core::rq_offset;
+use t27os::update_core::us_answer;
+use t27os::update_core::rs_make;
+use t27os::update_core::rs_ok_shape;
+use t27os::update_core::rs_status;
+use t27os::update_core::rs_length;
+use t27os::update_core::ux_chunk_len;
+use t27os::update_core::ch_make;
+use t27os::update_core::ch_len;
+use t27os::update_core::ch_check;
+use t27os::update_core::ux_resume_from;
+use t27os::update_core::ux_part_discard;
+use t27os::update_core::ux_retry;
+use t27os::update_core::IS_UNPACK;
+use t27os::update_core::IS_CHECK;
+use t27os::update_core::IS_MOVE_OLD;
+use t27os::update_core::IS_MOVE_NEW;
+use t27os::update_core::IS_HEALTH;
+use t27os::update_core::IS_DONE;
+use t27os::update_core::UA_NONE;
+use t27os::update_core::UA_CLEAN;
+use t27os::update_core::UA_RESTORE;
+use t27os::update_core::UA_SWAP_BACK;
+use t27os::update_core::UB_OK;
+use t27os::update_core::UB_NOPLIST;
+use t27os::update_core::ui_next;
+use t27os::update_core::ui_undo;
+use t27os::update_core::ui_bundle_ok;
+use t27os::update_core::ui_join;
+use t27os::update_core::ui_base_at;
+use t27os::update_core::ui_part_path;
+use t27os::update_core::ui_exe_name_ok;
+use t27os::update_core::ui_app_path_ok;
+use t27os::update_core::fr_of_step;
+use t27os::update_core::FR_NONE;
+use t27os::update_core::FR_OFFER;
+use t27os::update_core::FR_NET;
+use t27os::update_core::FR_HASH;
+use t27os::update_core::FR_BUSY;
+use t27os::update_core::FR_UNDO;
+use t27os::update_core::ST_IDLE;
+use t27os::update_core::ST_FAILED;
+use t27os::update_core::ST_DONE;
+use t27os::update_core::ST_REJECT;
+use t27os::update_core::EV_START;
+use t27os::update_core::EV_FETCHED;
+use t27os::update_core::EV_VERIFIED;
+use t27os::update_core::EV_INSTALL;
+use t27os::update_core::EV_INSTALLED;
+use t27os::update_core::EV_FAIL;
+use t27os::update_core::st_next;
+use t27os::update_core::uk_verdict;
+use t27os::update_core::uk_pid_of;
+use t27os::update_core::uk_pid_text;
+use t27os::update_core::UK_NONE;
+use t27os::update_core::UK_REMOVE;
+use t27os::update_core::UW_LEN;
+use t27os::update_core::UW_PHASE;
+use t27os::update_core::UW_WHY;
+use t27os::update_core::UW_OFFER;
+use t27os::update_core::UW_FETCH;
+use t27os::update_core::UW_STEP;
+use t27os::update_core::UW_UNDO;
+use t27os::update_core::UW_HAVE;
+use t27os::update_core::UW_TOTAL;
+use t27os::update_core::UW_R_FETCH;
+use t27os::update_core::UW_P_MANIFEST;
+use t27os::update_core::UW_P_FETCH;
+use t27os::update_core::UW_P_INSTALL;
+use t27os::update_core::UW_P_DONE;
+use t27os::update_core::UW_P_FAILED;
+use t27os::update_core::uw_init;
+use t27os::update_core::uw_ok;
+use t27os::update_core::uw_put64;
+use t27os::update_core::uw_get64;
+use t27os::update_core::uw_from_manifest;
+
+// UH_* results of uh_check_manifest: 0 = good, 1..6 = the um_offer refusal (OF_*), 10 = the signature is not true.
+pub const UH_OK : u32 = 0;
+pub const UH_SIG : u32 = 10;
+
+// uh_file_sha results
+pub const UH_FILE_IO : i64 = -1;
+
+fn uh_sha_init(ctx: []u8) -> i32 { return @extern("CC_SHA256_Init"); }
+fn uh_sha_update(ctx: []u8, data: []const u8, n: u32) -> i32 { return @extern("CC_SHA256_Update"); }
+fn uh_sha_final(md: []u8, ctx: []u8) -> i32 { return @extern("CC_SHA256_Final"); }
+
+/// SHA-256 of the whole file at path (NUL-terminated) into out[0..32]; the file size in bytes, UH_FILE_IO (-1) when it
+/// cannot be opened or read. 16 KiB at a time.
+pub fn uh_file_sha(path: []const u8, out: []u8) -> i64 {
+    if (out.len < 32) { return UH_FILE_IO; }
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return UH_FILE_IO; }
+    var ctx : [128]u8 = undefined;
+    var i : usize = 0;
+    while (i < 128) {
+        ctx[i] = 0;
+        i = i + 1;
+    }
+    uh_sha_init(ctx[0..128]);
+    var buf : [16384]u8 = undefined;
+    var total : i64 = 0;
+    while (true) {
+        const r : i64 = sys_read(fd, buf[0..16384], 16384);
+        if (r < 0) {
+            sys_close(fd);
+            return UH_FILE_IO;
+        }
+        if (r == 0) { break; }
+        uh_sha_update(ctx[0..128], buf[0..@as(usize, @intCast(r))], @as(u32, @intCast(r)));
+        total = total + r;
+    }
+    sys_close(fd);
+    uh_sha_final(out, ctx[0..128]);
+    return total;
+}
+
+/// The manifest of a bundle, signed with the identity key. id = the 207-byte identity (peer_identity.ID_LEN) from
+/// ih_identity_open; sha and size describe the bundle. The 216 manifest bytes go to out; their count, 0 when an
+/// argument is refused (update_core.um_body) or the OS refuses to sign.
+pub fn uh_make_manifest(id: []const u8, major: u32, minor: u32, patch: u32, build: u32, size: u64, sha: []const u8, out: []u8) -> usize {
+    if (id.len < ID_LEN or out.len < UM_LEN) { return 0; }
+    var fp : [10]u8 = undefined;
+    if (ih_fingerprint(id[ID_OFF_PUB..ID_OFF_PUB + PUB_BYTES], fp[0..10]) == false) { return 0; }
+    var body : [143]u8 = undefined;
+    if (um_body(major, minor, patch, build, size, sha, fp[0..10], id[ID_OFF_PUB..ID_OFF_PUB + PUB_BYTES], body[0..143]) != UM_BODY_LEN) { return 0; }
+    var si : [159]u8 = undefined;
+    if (um_sign_input(body[0..143], si[0..159]) != UM_SIGIN_LEN) { return 0; }
+    var sig : [128]u8 = undefined;
+    const sn : usize = ks_sign(id[ID_OFF_PRIV..ID_OFF_PRIV + PRIV_BYTES], si[0..159], sig[0..128]);
+    if (sn == 0) { return 0; }
+    return um_seal(body[0..143], sig[0..sn], out);
+}
+
+/// Judge a manifest that arrived from the network. UH_OK only when: it parses, the fingerprint field is the fingerprint
+/// of the key in it, the author is a friend or this device, the build is strictly newer, the version not lower, the size
+/// in range (update_core.um_offer, whose code is returned otherwise) AND the signature is true under the key in it.
+/// UH_SIG when everything else agrees and the signature does not. ft = friends table (1108 bytes), own_fp = this device.
+pub fn uh_check_manifest(m: []const u8, ft: []const u8, own_fp: []const u8, cur_ver: u64, cur_build: u32) -> u32 {
+    if (um_parse(m) != 0) { return um_offer(m, false, false, cur_ver, cur_build); }
+    var fp : [10]u8 = undefined;
+    var fp_matches : bool = false;
+    if (ih_fingerprint(m[UM_OFF_PUB..UM_OFF_PUB + PUB_BYTES], fp[0..10])) {
+        fp_matches = true;
+        var i : usize = 0;
+        while (i < 10) {
+            if (fp[i] != m[UM_OFF_FP + i]) { fp_matches = false; }
+            i = i + 1;
+        }
+    }
+    const known : bool = um_author_known(ft, own_fp, m[UM_OFF_FP..UM_OFF_FP + 10]);
+    const o : u32 = um_offer(m, known, fp_matches, cur_ver, cur_build);
+    if (o != OF_OK) { return o; }
+    var si : [159]u8 = undefined;
+    if (um_sign_input(m[0..UM_BODY_LEN], si[0..159]) != UM_SIGIN_LEN) { return UH_SIG; }
+    const sn : usize = um_sig_len(m);
+    if (ks_verify(m[UM_OFF_PUB..UM_OFF_PUB + PUB_BYTES], si[0..159], m[UM_OFF_SIG..UM_OFF_SIG + sn]) == false) { return UH_SIG; }
+    return UH_OK;
+}
+
+/// Does the file at path (NUL-terminated) have the size and the SHA-256 the manifest names? Run after the bundle has been
+/// fetched; the manifest must already have passed uh_check_manifest.
+pub fn uh_file_matches(m: []const u8, path: []const u8) -> bool {
+    if (m.len < UM_LEN) { return false; }
+    var h : [32]u8 = undefined;
+    const n : i64 = uh_file_sha(path, h[0..32]);
+    if (n < 0 or @as(u64, @intCast(n)) != um_size_of(m)) { return false; }
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < 32) {
+        d = d | @as(u32, h[i] ^ m[UM_OFF_SHA + i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+// ================================================================ part 2: transfer
+//
+// The wire format is update_core.t27 (REQUEST 72, ANSWER 24, CHUNK 16 + up to 64 KiB). One request per connection; the
+// server answers one connection at a time; the client keeps what it received in a part file next to the app and, after
+// a broken connection, asks again from the part's size. The SHA-256 runs over the bytes as they are written; on a
+// resume the part already on disk is hashed first, so the digest always covers the whole file.
+
+fn uh_lseek(fd: i32, off: i64, whence: i32) -> i64 { return @extern("lseek"); }
+fn uh_setsockopt(fd: i32, level: i32, name: i32, v: []const u8, n: u32) -> i32 { return @extern("setsockopt"); }
+fn uh_rmdir(path: []const u8) -> i32 { return @extern("rmdir"); }
+fn uh_ftruncate(fd: i32, len: i64) -> i32 { return @extern("ftruncate"); }
+// accept(2) under its other libSystem name: keysync.t27 has a pub fn accept, and in a program that links both, a plain
+// @extern("accept") binds to that t27 fn instead of libc (seen in update_probe: it returned 1, a bool).
+fn uh_accept(fd: i32, addr: u64, len: u64) -> i32 { return @extern("accept$NOCANCEL"); }
+
+pub const UH_LOOPBACK : u64 = 2130706433;
+pub const UH_IO_MS : i32 = 10000;
+
+/// struct sockaddr_in for ip:port, ip as a<<24|b<<16|c<<8|d.
+pub fn uh_sockaddr(out: []u8, ip: u64, port: u64) -> void {
+    var i : usize = 0;
+    while (i < 16) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = 16;
+    out[1] = 2;
+    out[2] = @as(u8, @intCast((port >> 8) & 255));
+    out[3] = @as(u8, @intCast(port & 255));
+    out[4] = @as(u8, @intCast((ip >> 24) & 255));
+    out[5] = @as(u8, @intCast((ip >> 16) & 255));
+    out[6] = @as(u8, @intCast((ip >> 8) & 255));
+    out[7] = @as(u8, @intCast(ip & 255));
+}
+
+/// A listening TCP socket on ip:port (SO_REUSEADDR), -1 when it cannot be made.
+pub fn uh_listen(ip: u64, port: u64) -> i32 {
+    const fd : i32 = sys_socket(2, 1, 0);
+    if (fd < 0) { return -1; }
+    var one : [4]u8 = undefined;
+    one[0] = 1;
+    one[1] = 0;
+    one[2] = 0;
+    one[3] = 0;
+    uh_setsockopt(fd, 65535, 4, one[0..4], 4);
+    var sa : [16]u8 = undefined;
+    uh_sockaddr(sa[0..16], ip, port);
+    if (sys_bind(fd, sa[0..16], 16) < 0 or sys_listen(fd, 4) < 0) {
+        sys_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/// A TCP connection to ip:port, -1 when refused.
+pub fn uh_connect(ip: u64, port: u64) -> i32 {
+    const fd : i32 = sys_socket(2, 1, 0);
+    if (fd < 0) { return -1; }
+    var sa : [16]u8 = undefined;
+    uh_sockaddr(sa[0..16], ip, port);
+    if (sys_connect(fd, sa[0..16], 16) < 0) {
+        sys_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/// Wait up to ms for fd to be readable (or closed by the peer).
+pub fn uh_wait_in(fd: i32, ms: i32) -> bool {
+    var p : [8]u8 = undefined;
+    if (fd < 0) { return false; }
+    const u : u32 = @as(u32, @intCast(fd));
+    p[0] = @as(u8, @intCast(u & 255));
+    p[1] = @as(u8, @intCast((u >> 8) & 255));
+    p[2] = @as(u8, @intCast((u >> 16) & 255));
+    p[3] = @as(u8, @intCast((u >> 24) & 255));
+    p[4] = 1;
+    p[5] = 0;
+    p[6] = 0;
+    p[7] = 0;
+    return sys_poll(p[0..8], 1, ms) > 0;
+}
+
+/// Read exactly n bytes into b, each wait at most ms; false on a timeout, an error or the peer closing first.
+pub fn uh_read_full(fd: i32, b: []u8, n: usize, ms: i32) -> bool {
+    var got : usize = 0;
+    while (got < n) {
+        if (uh_wait_in(fd, ms) == false) { return false; }
+        const r : i64 = sys_read(fd, b[got..n], @as(u64, n - got));
+        if (r <= 0) { return false; }
+        got = got + @as(usize, @intCast(r));
+    }
+    return true;
+}
+
+pub fn uh_write_full(fd: i32, b: []const u8, n: usize) -> bool {
+    var put : usize = 0;
+    while (put < n) {
+        const w : i64 = sys_write(fd, b[put..n], @as(u64, n - put));
+        if (w <= 0) { return false; }
+        put = put + @as(usize, @intCast(w));
+    }
+    return true;
+}
+
+// uh_serve_one results
+pub const US_IDLE : u32 = 0;
+pub const US_MANIFEST : u32 = 1;
+pub const US_BUNDLE : u32 = 2;
+pub const US_REFUSED : u32 = 3;
+pub const US_CUT : u32 = 4;
+pub const US_IO : u32 = 5;
+
+/// Serve one connection on the listening socket lfd: the manifest m, or the bundle file at zip (NUL-terminated) from the
+/// offset asked for, when the request names this bundle (update_core.us_answer). Waits at most ms for a connection.
+/// stats[0] = bundle bytes sent, stats[1] = the offset the answer started at. Test aids (0 / the size for none):
+/// cut_at closes the connection once that many bundle bytes of this answer are out (in the middle of a chunk), flip_at
+/// sends the byte at that bundle offset with its lowest bit flipped.
+pub fn uh_serve_one(lfd: i32, m: []const u8, zip: []const u8, cut_at: u64, flip_at: u64, ms: i32, stats: []u64) -> u32 {
+    if (uh_wait_in(lfd, ms) == false) { return US_IDLE; }
+    const c : i32 = uh_accept(lfd, 0, 0);
+    if (c < 0) { return US_IO; }
+    var r : [72]u8 = undefined;
+    if (uh_read_full(c, r[0..72], RQ_LEN, 5000) == false) {
+        sys_close(c);
+        return US_IO;
+    }
+    var h : [24]u8 = undefined;
+    const st : u32 = us_answer(r[0..72], m);
+    if (st != RS_OK) {
+        rs_make(st, 0, h[0..24]);
+        uh_write_full(c, h[0..24], RS_LEN);
+        sys_close(c);
+        return US_REFUSED;
+    }
+    if (rq_kind(r[0..72]) == RQ_MANIFEST) {
+        rs_make(RS_OK, @as(u64, UM_LEN), h[0..24]);
+        const ok : bool = uh_write_full(c, h[0..24], RS_LEN) and uh_write_full(c, m, UM_LEN);
+        sys_close(c);
+        if (ok) { return US_MANIFEST; }
+        return US_IO;
+    }
+    const size : u64 = um_size_of(m);
+    const off : u64 = rq_offset(r[0..72]);
+    stats[1] = off;
+    const fd : i32 = sys_open_ro(zip, 0);
+    if (fd < 0 or uh_lseek(fd, @as(i64, @intCast(off)), 0) < 0) {
+        if (fd >= 0) { sys_close(fd); }
+        rs_make(2, 0, h[0..24]);
+        uh_write_full(c, h[0..24], RS_LEN);
+        sys_close(c);
+        return US_IO;
+    }
+    rs_make(RS_OK, size - off, h[0..24]);
+    if (uh_write_full(c, h[0..24], RS_LEN) == false) {
+        sys_close(fd);
+        sys_close(c);
+        return US_IO;
+    }
+    // t27b frames stay under 32 KiB (cli/t27b/README.md, code generation limit): a 64 KiB chunk goes out as its header
+    // and then 16 KiB pieces read from the file.
+    var buf : [16384]u8 = undefined;
+    var pos : u64 = off;
+    var seq : u32 = 0;
+    var sent : u64 = 0;
+    while (pos < size) {
+        const n : u64 = ux_chunk_len(size, pos);
+        ch_make(@as(u32, @intCast(n)), seq, pos, h[0..16]);
+        if (uh_write_full(c, h[0..16], CH_LEN) == false) {
+            sys_close(fd);
+            sys_close(c);
+            return US_IO;
+        }
+        var done : u64 = 0;
+        while (done < n) {
+            var want : u64 = n - done;
+            if (want > 16384) { want = 16384; }
+            const rr : i64 = sys_read(fd, buf[0..16384], want);
+            if (rr <= 0) {
+                sys_close(fd);
+                sys_close(c);
+                return US_IO;
+            }
+            const got : u64 = @as(u64, @intCast(rr));
+            const at0 : u64 = pos + done;
+            if (flip_at >= at0 and flip_at < at0 + got) {
+                const at : usize = @as(usize, @intCast(flip_at - at0));
+                buf[at] = buf[at] ^ 1;
+            }
+            var put : u64 = got;
+            if (cut_at > 0 and sent + got > cut_at) { put = cut_at - sent; }
+            if (uh_write_full(c, buf[0..@as(usize, @intCast(put))], @as(usize, @intCast(put))) == false) {
+                sys_close(fd);
+                sys_close(c);
+                return US_IO;
+            }
+            sent = sent + put;
+            stats[0] = stats[0] + put;
+            if (put < got) {
+                sys_close(fd);
+                sys_close(c);
+                return US_CUT;
+            }
+            done = done + got;
+        }
+        pos = pos + n;
+        seq = seq + 1;
+    }
+    sys_close(fd);
+    ch_make(0, seq, size, h[0..16]);
+    const fin : bool = uh_write_full(c, h[0..16], CH_LEN);
+    sys_close(c);
+    if (fin) { return US_BUNDLE; }
+    return US_IO;
+}
+
+/// Ask ip:port for its manifest (216 bytes into out). false when there is no answer or it is not a manifest-sized one.
+pub fn uh_fetch_manifest(ip: u64, port: u64, out: []u8) -> bool {
+    if (out.len < UM_LEN) { return false; }
+    const c : i32 = uh_connect(ip, port);
+    if (c < 0) { return false; }
+    var r : [72]u8 = undefined;
+    rq_manifest(r[0..72]);
+    var h : [24]u8 = undefined;
+    var ok : bool = uh_write_full(c, r[0..72], RQ_LEN) and uh_read_full(c, h[0..24], RS_LEN, 5000);
+    if (ok) { ok = rs_ok_shape(h[0..24]) and rs_status(h[0..24]) == RS_OK and rs_length(h[0..24]) == @as(u64, UM_LEN); }
+    if (ok) { ok = uh_read_full(c, out, UM_LEN, 5000); }
+    sys_close(c);
+    return ok;
+}
+
+// uh_fetch results
+pub const UF_DONE : u32 = 0;
+pub const UF_NET : u32 = 1;
+pub const UF_HASH : u32 = 2;
+pub const UF_REFUSED : u32 = 3;
+pub const UF_IO : u32 = 4;
+pub const UF_PROTO : u32 = 5;
+
+// stats of a fetch (u64 each): 0 the offset the last connection resumed from, 1 bundle bytes received in all, 2 chunks,
+// 3 the server's refusal status, 4 connections made, 5 the highest offset a connection resumed from (> 0: resumed)
+pub const FS_FROM : usize = 0;
+pub const FS_BYTES : usize = 1;
+pub const FS_CHUNKS : usize = 2;
+pub const FS_STATUS : usize = 3;
+pub const FS_CONNS : usize = 4;
+pub const FS_RESUMED : usize = 5;
+
+/// Hash the first n bytes of the file at path into ctx (already initialised). false when it is shorter or unreadable.
+fn uh_hash_prefix(path: []const u8, n: u64, ctx: []u8) -> bool {
+    if (n == 0) { return true; }
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return false; }
+    var buf : [16384]u8 = undefined;
+    var done : u64 = 0;
+    while (done < n) {
+        var want : u64 = n - done;
+        if (want > 16384) { want = 16384; }
+        const r : i64 = sys_read(fd, buf[0..16384], want);
+        if (r <= 0) {
+            sys_close(fd);
+            return false;
+        }
+        uh_sha_update(ctx, buf[0..@as(usize, @intCast(r))], @as(u32, @intCast(r)));
+        done = done + @as(u64, @intCast(r));
+    }
+    sys_close(fd);
+    return true;
+}
+
+/// One connection's worth of download of the bundle manifest m describes into the part file at part
+/// (NUL-terminated), starting at the part's size. UF_DONE when the whole file is there AND its SHA-256 is the
+/// manifest's; UF_HASH when it is all there and the hash is not (the part is removed: it is never resumed); UF_NET when
+/// the connection broke (the part keeps every whole chunk received); UF_REFUSED with the status in stats[FS_STATUS];
+/// UF_PROTO for an answer that breaks the format; UF_IO when the part cannot be written.
+pub fn uh_fetch_once(ip: u64, port: u64, m: []const u8, part: []const u8, stats: []u64) -> u32 {
+    const size : u64 = um_size_of(m);
+    var pfd : i32 = sys_open_ro(part, 9);
+    var have : i64 = -1;
+    if (pfd >= 0) { have = uh_lseek(pfd, 0, 2); }
+    if (pfd < 0 or have < 0 or ux_part_discard(have, size)) {
+        if (pfd >= 0) { sys_close(pfd); }
+        pfd = sys_creat(part, 384);
+        have = 0;
+    }
+    if (pfd < 0) { return UF_IO; }
+    const off : u64 = ux_resume_from(have, size);
+    var ctx : [128]u8 = undefined;
+    var i : usize = 0;
+    while (i < 128) {
+        ctx[i] = 0;
+        i = i + 1;
+    }
+    uh_sha_init(ctx[0..128]);
+    if (uh_hash_prefix(part, off, ctx[0..128]) == false) {
+        sys_close(pfd);
+        return UF_IO;
+    }
+    stats[FS_FROM] = off;
+    if (off > stats[FS_RESUMED]) { stats[FS_RESUMED] = off; }
+    const c : i32 = uh_connect(ip, port);
+    if (c < 0) {
+        sys_close(pfd);
+        return UF_NET;
+    }
+    stats[FS_CONNS] = stats[FS_CONNS] + 1;
+    var r : [72]u8 = undefined;
+    rq_bundle(m, off, r[0..72]);
+    var h : [24]u8 = undefined;
+    if (uh_write_full(c, r[0..72], RQ_LEN) == false or uh_read_full(c, h[0..24], RS_LEN, UH_IO_MS) == false) {
+        sys_close(c);
+        sys_close(pfd);
+        return UF_NET;
+    }
+    if (rs_ok_shape(h[0..24]) == false) {
+        sys_close(c);
+        sys_close(pfd);
+        return UF_PROTO;
+    }
+    if (rs_status(h[0..24]) != RS_OK) {
+        stats[FS_STATUS] = @as(u64, rs_status(h[0..24]));
+        sys_close(c);
+        sys_close(pfd);
+        return UF_REFUSED;
+    }
+    if (rs_length(h[0..24]) != size - off) {
+        sys_close(c);
+        sys_close(pfd);
+        return UF_PROTO;
+    }
+    var ch : [16]u8 = undefined;
+    var buf : [16384]u8 = undefined;
+    var pos : u64 = off;
+    var seq : u32 = 0;
+    while (true) {
+        if (uh_read_full(c, ch[0..16], CH_LEN, UH_IO_MS) == false) {
+            sys_close(c);
+            sys_close(pfd);
+            return UF_NET;
+        }
+        const k : u32 = ch_check(ch[0..16], seq, pos, size);
+        if (k == CH_END) { break; }
+        if (k != CH_OK) {
+            sys_close(c);
+            sys_close(pfd);
+            return UF_PROTO;
+        }
+        // a chunk is kept only whole: its pieces go to the part file as they come, and a chunk cut short is cut off
+        // the file again (the next request starts at a chunk boundary of this answer)
+        const n : usize = @as(usize, ch_len(ch[0..16]));
+        var done : usize = 0;
+        while (done < n) {
+            var want : usize = n - done;
+            if (want > 16384) { want = 16384; }
+            if (uh_read_full(c, buf[0..16384], want, UH_IO_MS) == false) {
+                sys_close(c);
+                uh_ftruncate(pfd, @as(i64, @intCast(pos)));
+                sys_close(pfd);
+                return UF_NET;
+            }
+            if (uh_write_full(pfd, buf[0..want], want) == false) {
+                sys_close(c);
+                uh_ftruncate(pfd, @as(i64, @intCast(pos)));
+                sys_close(pfd);
+                return UF_IO;
+            }
+            uh_sha_update(ctx[0..128], buf[0..want], @as(u32, @intCast(want)));
+            done = done + want;
+        }
+        pos = pos + @as(u64, n);
+        seq = seq + 1;
+        stats[FS_BYTES] = stats[FS_BYTES] + @as(u64, n);
+        stats[FS_CHUNKS] = stats[FS_CHUNKS] + 1;
+    }
+    sys_close(c);
+    sys_close(pfd);
+    var dg : [32]u8 = undefined;
+    uh_sha_final(dg[0..32], ctx[0..128]);
+    var d : u32 = 0;
+    i = 0;
+    while (i < 32) {
+        d = d | @as(u32, dg[i] ^ m[UM_OFF_SHA + i]);
+        i = i + 1;
+    }
+    if (d != 0) {
+        sys_unlink(part);
+        return UF_HASH;
+    }
+    return UF_DONE;
+}
+
+fn uh_pause_ms(ms: i32) -> void {
+    var p : [8]u8 = undefined;
+    sys_poll(p[0..8], 0, ms);
+}
+
+/// The whole download: uh_fetch_once again after each broken connection, while update_core.ux_retry allows (a
+/// connection that brought bytes resets the count). retry = false gives up after the first break (the part stays for
+/// a later run). stats as uh_fetch_once, zeroed by the caller.
+pub fn uh_fetch(ip: u64, port: u64, m: []const u8, part: []const u8, retry: bool, stats: []u64) -> u32 {
+    var fails : u32 = 0;
+    while (true) {
+        const before : u64 = stats[FS_BYTES];
+        const code : u32 = uh_fetch_once(ip, port, m, part, stats);
+        if (code != UF_NET) { return code; }
+        if (stats[FS_BYTES] > before) {
+            fails = 0;
+        } else {
+            fails = fails + 1;
+        }
+        if (retry == false or ux_retry(fails) == false) { return UF_NET; }
+        uh_pause_ms(200);
+    }
+    return UF_NET;
+}
+
+// ================================================================ part 2: install
+
+/// Run a program and wait for it. a holds n NUL-terminated words (n 1..7; the first is the program's full path).
+/// The exit code 0..255; 256 when it could not start or was ended by a signal. The environment is this process's.
+pub fn uh_run(a: []const u8, n: usize) -> u32 {
+    if (n == 0 or n > 7 or a.len > 2048) { return 256; }
+    var tb : [2048]u8 = undefined;
+    var i : usize = 0;
+    while (i < a.len) {
+        tb[i] = a[i];
+        i = i + 1;
+    }
+    var argv : [8]u64 = undefined;
+    var k : usize = 0;
+    while (k < 8) {
+        argv[k] = 0;
+        k = k + 1;
+    }
+    var at : usize = 0;
+    k = 0;
+    while (k < n) {
+        if (at >= a.len) { return 256; }
+        argv[k] = sys_addr(tb[at..2048], tb[0..1], 0);
+        while (at < a.len and tb[at] != 0) { at = at + 1; }
+        at = at + 1;
+        k = k + 1;
+    }
+    // _NSGetEnviron() is the address of environ; environ itself (a char **) is what posix_spawn takes
+    var ep : [8]u8 = undefined;
+    sys_peek(ep[0..8], sys_environ(), 8);
+    var envp : u64 = 0;
+    i = 0;
+    while (i < 8) {
+        envp = envp | (@as(u64, ep[i]) << @as(u6, @intCast(8 * i)));
+        i = i + 1;
+    }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    if (sys_spawn(pid, tb[0..2048], 0, 0, argv, envp) != 0 or pid[0] == 0) { return 256; }
+    var st : [2]u32 = undefined;
+    st[0] = 0;
+    st[1] = 0;
+    var w : i32 = -1;
+    while (w <= 0) {
+        w = sys_waitpid(@as(i32, @intCast(pid[0])), st, 0);
+        if (w < 0) { return 256; }
+    }
+    if ((st[0] & 127) != 0) { return 256; }
+    return (st[0] >> 8) & 255;
+}
+
+/// Append word w (NUL-terminated or the whole slice) and a NUL to a at p; the new p.
+pub fn uh_arg(a: []u8, p: usize, w: []const u8) -> usize {
+    var i : usize = 0;
+    var q : usize = p;
+    while (i < w.len and w[i] != 0) {
+        a[q] = w[i];
+        q = q + 1;
+        i = i + 1;
+    }
+    a[q] = 0;
+    return q + 1;
+}
+
+/// rm -rf of one of the installer's own siblings (path must be an app path's .new, .prev or .lock, NUL-terminated).
+fn uh_remove(path: []const u8) -> bool {
+    var a : [1024]u8 = undefined;
+    var p : usize = uh_arg(a[0..1024], 0, "/bin/rm");
+    p = uh_arg(a[0..1024], p, "-rf");
+    p = uh_arg(a[0..1024], p, path);
+    return uh_run(a[0..p], 3) == 0;
+}
+
+fn uh_cf_data(alloc: u64, b: []const u8, n: u64) -> u64 { return @extern("CFDataCreate"); }
+fn uh_cf_plist(alloc: u64, data: u64, opts: u64, fmt: u64, err: u64) -> u64 { return @extern("CFPropertyListCreateWithData"); }
+fn uh_cf_str(alloc: u64, b: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn uh_cf_get(d: u64, k: u64) -> u64 { return @extern("CFDictionaryGetValue"); }
+fn uh_cf_cstr(s: u64, buf: []u8, size: u64, enc: u32) -> bool { return @extern("CFStringGetCString"); }
+fn uh_cf_type(o: u64) -> u64 { return @extern("CFGetTypeID"); }
+fn uh_cf_str_type() -> u64 { return @extern("CFStringGetTypeID"); }
+fn uh_cf_dict_type() -> u64 { return @extern("CFDictionaryGetTypeID"); }
+fn uh_cf_drop(o: u64) -> void { @extern("CFRelease"); }
+
+pub const PL_FIELD : usize = 128;
+
+fn uh_pl_field(d: u64, key: []const u8, out: []u8) -> u64 {
+    out[0] = 0;
+    const k : u64 = uh_cf_str(0, key, key.len, 134217984, false);
+    if (k == 0) { return 0; }
+    const v : u64 = uh_cf_get(d, k);
+    uh_cf_drop(k);
+    if (v == 0 or uh_cf_type(v) != uh_cf_str_type()) { return 0; }
+    if (uh_cf_cstr(v, out, @as(u64, PL_FIELD), 134217984) == false) {
+        out[0] = 0;
+        return 0;
+    }
+    var n : u64 = 0;
+    while (n < @as(u64, PL_FIELD) and out[@as(usize, @intCast(n))] != 0) { n = n + 1; }
+    return n;
+}
+
+/// Read <app>/Contents/Info.plist (XML or binary): CFBundleIdentifier, CFBundleVersion and CFBundleExecutable into
+/// out[0..128], [128..256], [256..384], their lengths into lens[0..3]. false when the file is missing, unreadable, over
+/// 16 KiB (the app's own is under 2 KiB; t27b frames stay under 32 KiB) or not a dictionary. app = the app path, an bytes (not NUL-terminated).
+pub fn uh_plist(app: []const u8, an: usize, out: []u8, lens: []u64) -> bool {
+    lens[0] = 0;
+    lens[1] = 0;
+    lens[2] = 0;
+    var p : [512]u8 = undefined;
+    if (ui_join(app, an, "/Contents/Info.plist", p[0..512]) == 0) { return false; }
+    const fd : i32 = sys_open_ro(p[0..512], 0);
+    if (fd < 0) { return false; }
+    var buf : [16384]u8 = undefined;
+    var n : usize = 0;
+    while (n < 16384) {
+        const r : i64 = sys_read(fd, buf[n..16384], @as(u64, 16384 - n));
+        if (r < 0) {
+            sys_close(fd);
+            return false;
+        }
+        if (r == 0) { break; }
+        n = n + @as(usize, @intCast(r));
+    }
+    sys_close(fd);
+    if (n == 0 or n >= 16384) { return false; }
+    const data : u64 = uh_cf_data(0, buf[0..n], @as(u64, n));
+    if (data == 0) { return false; }
+    const pl : u64 = uh_cf_plist(0, data, 0, 0, 0);
+    uh_cf_drop(data);
+    if (pl == 0) { return false; }
+    if (uh_cf_type(pl) != uh_cf_dict_type()) {
+        uh_cf_drop(pl);
+        return false;
+    }
+    lens[0] = uh_pl_field(pl, "CFBundleIdentifier", out[0..PL_FIELD]);
+    lens[1] = uh_pl_field(pl, "CFBundleVersion", out[PL_FIELD..2 * PL_FIELD]);
+    lens[2] = uh_pl_field(pl, "CFBundleExecutable", out[2 * PL_FIELD..3 * PL_FIELD]);
+    uh_cf_drop(pl);
+    return true;
+}
+
+/// Is <app>/Contents/MacOS/<exe> a file that opens? exe = plist field (n bytes); a name that leaves Contents/MacOS
+/// (update_core.ui_exe_name_ok) is not.
+fn uh_exe_present(app: []const u8, an: usize, exe: []const u8, n: usize) -> bool {
+    if (ui_exe_name_ok(exe, n) == false) { return false; }
+    var p : [512]u8 = undefined;
+    const k : usize = ui_join(app, an, "/Contents/MacOS/", p[0..512]);
+    if (k == 0 or ui_join(p[0..512], k, exe[0..n], p[0..512]) == 0) { return false; }
+    const fd : i32 = sys_open_ro(p[0..512], 0);
+    if (fd < 0) { return false; }
+    sys_close(fd);
+    return true;
+}
+
+// health check of the installed copy
+pub const UH_HEALTH_NONE : u32 = 0;
+pub const UH_HEALTH_RUN : u32 = 1;
+pub const UH_HEALTH_CODESIGN : u32 = 2;
+
+/// UH_HEALTH_RUN runs <app>/Contents/MacOS/<exe> --t27os-health and wants exit 0: for test bundles only (the real app
+/// has no such flag and would open its window). UH_HEALTH_CODESIGN runs /usr/bin/codesign --verify --strict <app>:
+/// nothing is launched. UH_HEALTH_NONE passes.
+pub fn uh_health(app: []const u8, an: usize, mode: u32) -> bool {
+    if (mode == UH_HEALTH_NONE) { return true; }
+    var pa : [512]u8 = undefined;
+    if (ui_join(app, an, "", pa[0..512]) == 0) { return false; }
+    var a : [1024]u8 = undefined;
+    if (mode == UH_HEALTH_CODESIGN) {
+        var p : usize = uh_arg(a[0..1024], 0, "/usr/bin/codesign");
+        p = uh_arg(a[0..1024], p, "--verify");
+        p = uh_arg(a[0..1024], p, "--strict");
+        p = uh_arg(a[0..1024], p, pa[0..512]);
+        return uh_run(a[0..p], 4) == 0;
+    }
+    var pl : [384]u8 = undefined;
+    var ln : [3]u64 = undefined;
+    if (uh_plist(app, an, pl[0..384], ln[0..3]) == false) { return false; }
+    const en : usize = @as(usize, @intCast(ln[2]));
+    if (ui_exe_name_ok(pl[256..384], en) == false) { return false; }
+    var px : [512]u8 = undefined;
+    const k : usize = ui_join(app, an, "/Contents/MacOS/", px[0..512]);
+    if (k == 0 or ui_join(px[0..512], k, pl[256..256 + en], px[0..512]) == 0) { return false; }
+    var p2 : usize = uh_arg(a[0..1024], 0, px[0..512]);
+    p2 = uh_arg(a[0..1024], p2, "--t27os-health");
+    return uh_run(a[0..p2], 2) == 0;
+}
+
+// install result fields (u32 each)
+pub const IR_STEP : usize = 0;
+pub const IR_UNDO : usize = 1;
+pub const IR_WHY : usize = 2;
+pub const IR_BUNDLE : usize = 3;
+
+/// Install the verified zip at zip (NUL-terminated) over the app at app[0..an], as update_core.t27 says: unpack into
+/// <app>.new, check the bundle (same CFBundleIdentifier as the live app, CFBundleVersion = the manifest build, the
+/// executable there), rename the live app to <app>.prev (an older .prev removed first), rename the new one in, run the
+/// health check; at the first failure undo it by update_core.ui_undo and stop. res: IR_STEP the step that failed
+/// (IS_DONE when none did), IR_UNDO the undo done, IR_WHY the update_core FR_* reason, IR_BUNDLE the UB_* code.
+/// fail_at is a test aid: that step is taken as failed before it runs (0 for none). true only when installed and healthy.
+pub fn uh_install(app: []const u8, an: usize, zip: []const u8, m: []const u8, health: u32, fail_at: u32, res: []u32) -> bool {
+    res[IR_STEP] = 0;
+    res[IR_UNDO] = UA_NONE;
+    res[IR_WHY] = FR_NONE;
+    res[IR_BUNDLE] = UB_OK;
+    if (ui_app_path_ok(app, an) == false) {
+        res[IR_STEP] = IS_UNPACK;
+        res[IR_WHY] = fr_of_step(IS_UNPACK);
+        return false;
+    }
+    var live : [512]u8 = undefined;
+    var newd : [512]u8 = undefined;
+    var prev : [512]u8 = undefined;
+    var newapp : [640]u8 = undefined;
+    ui_join(app, an, "", live[0..512]);
+    ui_join(app, an, ".new", newd[0..512]);
+    ui_join(app, an, ".prev", prev[0..512]);
+    const nk : usize = ui_join(app, an, ".new/", newapp[0..640]);
+    const ba : usize = ui_base_at(app, an);
+    const nan : usize = ui_join(newapp[0..640], nk, app[ba..an], newapp[0..640]);
+    var step : u32 = IS_UNPACK;
+    var ok : bool = true;
+    while (step != IS_DONE and ok) {
+        if (step == fail_at) {
+            ok = false;
+        } else if (step == IS_UNPACK) {
+            uh_remove(newd[0..512]);
+            var a : [1200]u8 = undefined;
+            var p : usize = uh_arg(a[0..1200], 0, "/usr/bin/ditto");
+            p = uh_arg(a[0..1200], p, "-x");
+            p = uh_arg(a[0..1200], p, "-k");
+            p = uh_arg(a[0..1200], p, zip);
+            p = uh_arg(a[0..1200], p, newd[0..512]);
+            ok = sys_mkdir(newd[0..512], 493) == 0 and uh_run(a[0..p], 5) == 0;
+        } else if (step == IS_CHECK) {
+            var np : [384]u8 = undefined;
+            var nl : [3]u64 = undefined;
+            var cp : [384]u8 = undefined;
+            var cl : [3]u64 = undefined;
+            const has : bool = uh_plist(newapp[0..640], nan, np[0..384], nl[0..3]);
+            uh_plist(app, an, cp[0..384], cl[0..3]);
+            const en : usize = @as(usize, @intCast(nl[2]));
+            const exe : bool = has and uh_exe_present(newapp[0..640], nan, np[256..384], en);
+            const n0 : usize = @as(usize, @intCast(nl[0]));
+            const c0 : usize = @as(usize, @intCast(cl[0]));
+            const n1 : usize = @as(usize, @intCast(nl[1]));
+            res[IR_BUNDLE] = ui_bundle_ok(has, np[0..n0], cp[0..c0], np[128..128 + n1], um_build_of(m), exe);
+            ok = res[IR_BUNDLE] == UB_OK;
+        } else if (step == IS_MOVE_OLD) {
+            uh_remove(prev[0..512]);
+            ok = sys_rename(live[0..512], prev[0..512]) == 0;
+        } else if (step == IS_MOVE_NEW) {
+            ok = sys_rename(newapp[0..640], live[0..512]) == 0;
+        } else if (step == IS_HEALTH) {
+            ok = uh_health(app, an, health);
+        }
+        if (ok) { step = ui_next(step); }
+    }
+    if (ok) {
+        uh_remove(newd[0..512]);
+        res[IR_STEP] = IS_DONE;
+        return true;
+    }
+    res[IR_STEP] = step;
+    res[IR_WHY] = fr_of_step(step);
+    const undo : u32 = ui_undo(step);
+    res[IR_UNDO] = undo;
+    var undone : bool = true;
+    if (undo == UA_RESTORE) {
+        undone = sys_rename(prev[0..512], live[0..512]) == 0;
+    } else if (undo == UA_SWAP_BACK) {
+        undone = sys_rename(live[0..512], newapp[0..640]) == 0 and sys_rename(prev[0..512], live[0..512]) == 0;
+    }
+    if (undone) {
+        uh_remove(newd[0..512]);
+    } else {
+        res[IR_WHY] = FR_UNDO;
+    }
+    return false;
+}
+
+/// Start the installed copy as a new instance (/usr/bin/open -n <app>). The running one quits by itself after this
+/// returns true. NOT run by update_probe: the probe installs test bundles under /tmp and never starts T27OS.app.
+pub fn uh_relaunch(app: []const u8, an: usize) -> bool {
+    var pa : [512]u8 = undefined;
+    if (ui_join(app, an, "", pa[0..512]) == 0) { return false; }
+    var a : [1024]u8 = undefined;
+    var p : usize = uh_arg(a[0..1024], 0, "/usr/bin/open");
+    p = uh_arg(a[0..1024], p, "-n");
+    p = uh_arg(a[0..1024], p, pa[0..512]);
+    return uh_run(a[0..p], 3) == 0;
+}
+
+// ================================================================ part 2: one update, start to end
+
+// result fields of uh_update (u32 each)
+pub const UR_STATE : usize = 0;
+pub const UR_WHY : usize = 1;
+pub const UR_OFFER : usize = 2;
+pub const UR_FETCH : usize = 3;
+pub const UR_STEP : usize = 4;
+pub const UR_UNDO : usize = 5;
+pub const UR_BUNDLE : usize = 6;
+
+fn uh_getpid() -> i32 { return @extern("getpid"); }
+fn uh_errno_at() -> u64 { return @extern("__error"); }
+fn uh_stat(path: []const u8, st: []u8) -> i32 { return @extern("stat"); }
+fn uh_time(t: u64) -> i64 { return @extern("time"); }
+fn uh_getsockname(fd: i32, sa: []u8, len: []u8) -> i32 { return @extern("getsockname"); }
+
+/// The lock next to the app (<app>.lock, a directory: mkdir is atomic): taken by one update, refused to a second. The
+/// pid of the taker goes into <app>.lock/pid (update_core.uk_pid_text), so a lock left by a dead process can be judged.
+pub fn uh_lock(app: []const u8, an: usize) -> bool {
+    var p : [512]u8 = undefined;
+    if (ui_join(app, an, ".lock", p[0..512]) == 0) { return false; }
+    if (sys_mkdir(p[0..512], 448) != 0) { return false; }
+    var f : [512]u8 = undefined;
+    if (ui_join(app, an, ".lock/pid", f[0..512]) == 0) { return true; }
+    var t : [16]u8 = undefined;
+    const n : usize = uk_pid_text(@as(u32, @intCast(uh_getpid())), t[0..16]);
+    const fd : i32 = sys_creat(f[0..512], 420);
+    if (fd >= 0) {
+        uh_write_full(fd, t[0..n], n);
+        sys_close(fd);
+    }
+    return true;
+}
+
+pub fn uh_unlock(app: []const u8, an: usize) -> void {
+    var p : [512]u8 = undefined;
+    var f : [512]u8 = undefined;
+    if (ui_join(app, an, ".lock", p[0..512]) == 0 or ui_join(app, an, ".lock/pid", f[0..512]) == 0) { return; }
+    sys_unlink(f[0..512]);
+    uh_rmdir(p[0..512]);
+}
+
+/// Seconds since 1970.
+pub fn uh_now_s() -> u64 {
+    const t : i64 = uh_time(0);
+    if (t < 0) { return 0; }
+    return @as(u64, @intCast(t));
+}
+
+/// The modification second of path (NUL-terminated), -1 when it does not exist. struct stat of arm64 macOS: 144 bytes,
+/// st_mtimespec.tv_sec at 48.
+pub fn uh_mtime(path: []const u8) -> i64 {
+    var st : [144]u8 = undefined;
+    if (uh_stat(path, st[0..144]) != 0) { return -1; }
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < 8) {
+        v = v | (@as(u64, st[48 + i]) << @as(u6, @intCast(8 * i)));
+        i = i + 1;
+    }
+    return @as(i64, @intCast(v & 9223372036854775807));
+}
+
+/// Is a process with this pid there? kill(pid, 0) succeeds, or fails with EPERM (it runs under another user).
+pub fn uh_pid_alive(pid: u32) -> bool {
+    if (pid == 0) { return false; }
+    if (sys_kill(@as(i32, @intCast(pid)), 0) == 0) { return true; }
+    var e : [4]u8 = undefined;
+    sys_peek(e[0..4], uh_errno_at(), 4);
+    return e[0] == 1 and e[1] == 0;
+}
+
+// lock info fields (u64 each)
+pub const LK_EXISTS : usize = 0;
+pub const LK_AGE : usize = 1;
+pub const LK_OWNER : usize = 2;
+pub const LK_ALIVE : usize = 3;
+pub const LK_REMOVED : usize = 4;
+pub const LK_LEN : usize = 5;
+
+/// Look at the lock of the app and judge it (update_core.uk_verdict); remove it when the verdict is UK_REMOVE. info: whether
+/// it exists, its age in seconds (now - the directory's mtime), the owner pid from its file (0 when none), whether the
+/// owner runs, and 1 when it was removed. The verdict.
+pub fn uh_lock_sweep(app: []const u8, an: usize, now: u64, info: []u64) -> u32 {
+    var k : usize = 0;
+    while (k < LK_LEN) {
+        info[k] = 0;
+        k = k + 1;
+    }
+    var p : [512]u8 = undefined;
+    var f : [512]u8 = undefined;
+    if (ui_join(app, an, ".lock", p[0..512]) == 0 or ui_join(app, an, ".lock/pid", f[0..512]) == 0) { return UK_NONE; }
+    const mt : i64 = uh_mtime(p[0..512]);
+    if (mt < 0) { return UK_NONE; }
+    info[LK_EXISTS] = 1;
+    if (now > @as(u64, @intCast(mt))) { info[LK_AGE] = now - @as(u64, @intCast(mt)); }
+    var t : [16]u8 = undefined;
+    const fd : i32 = sys_open_ro(f[0..512], 0);
+    if (fd >= 0) {
+        const r : i64 = sys_read(fd, t[0..16], 16);
+        sys_close(fd);
+        if (r > 0) { info[LK_OWNER] = @as(u64, uk_pid_of(t[0..16], @as(usize, @intCast(r)))); }
+    }
+    const owner : u32 = @as(u32, @intCast(info[LK_OWNER]));
+    if (uh_pid_alive(owner)) { info[LK_ALIVE] = 1; }
+    const v : u32 = uk_verdict(true, info[LK_AGE], owner, info[LK_ALIVE] != 0);
+    if (v == UK_REMOVE) {
+        sys_unlink(f[0..512]);
+        if (uh_rmdir(p[0..512]) == 0) { info[LK_REMOVED] = 1; }
+    }
+    return v;
+}
+
+/// Remove the lock when its file names this pid (the window ends its own helper: the lock that helper took goes with it).
+pub fn uh_lock_release_of(app: []const u8, an: usize, pid: u32) -> bool {
+    var f : [512]u8 = undefined;
+    if (pid == 0 or ui_join(app, an, ".lock/pid", f[0..512]) == 0) { return false; }
+    var t : [16]u8 = undefined;
+    const fd : i32 = sys_open_ro(f[0..512], 0);
+    if (fd < 0) { return false; }
+    const r : i64 = sys_read(fd, t[0..16], 16);
+    sys_close(fd);
+    if (r <= 0 or uk_pid_of(t[0..16], @as(usize, @intCast(r))) != pid) { return false; }
+    uh_unlock(app, an);
+    return true;
+}
+
+/// The size of the file at path (NUL-terminated), -1 when it cannot be opened.
+pub fn uh_file_size(path: []const u8) -> i64 {
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return -1; }
+    const n : i64 = uh_lseek(fd, 0, 2);
+    sys_close(fd);
+    return n;
+}
+
+/// The port a listening socket was given (bound with port 0), 0 when it cannot be read.
+pub fn uh_bound_port(fd: i32) -> u32 {
+    var sa : [16]u8 = undefined;
+    var ln : [4]u8 = undefined;
+    ln[0] = 16;
+    ln[1] = 0;
+    ln[2] = 0;
+    ln[3] = 0;
+    if (uh_getsockname(fd, sa[0..16], ln[0..4]) != 0) { return 0; }
+    return (@as(u32, sa[2]) << 8) | @as(u32, sa[3]);
+}
+
+/// The bundle a device serves: the .app packed by ditto -c -k --keepParent with no compression (a compressed T27OS.app
+/// is under the 1 MiB the offer rule asks for; stored, it is the bundle's own size). zip and app NUL-terminated.
+pub fn uh_zip_app(app: []const u8, zip: []const u8) -> bool {
+    var a : [1200]u8 = undefined;
+    sys_unlink(zip);
+    // seven words, the most uh_run takes: -ck is -c -k
+    var p : usize = uh_arg(a[0..1200], 0, "/usr/bin/ditto");
+    p = uh_arg(a[0..1200], p, "-ck");
+    p = uh_arg(a[0..1200], p, "--zlibCompressionLevel");
+    p = uh_arg(a[0..1200], p, "0");
+    p = uh_arg(a[0..1200], p, "--keepParent");
+    p = uh_arg(a[0..1200], p, app);
+    p = uh_arg(a[0..1200], p, zip);
+    return uh_run(a[0..p], 7) == 0;
+}
+
+/// Write the helper's status record (update_core UW_*) to path (NUL-terminated) through path.tmp and a rename, so the
+/// window never reads half a record. Nothing when path is empty.
+pub fn uh_status_write(path: []const u8, r: []const u8) -> bool {
+    if (path.len == 0 or path[0] == 0) { return false; }
+    var n : usize = 0;
+    while (n < path.len and path[n] != 0) { n = n + 1; }
+    var tp : [520]u8 = undefined;
+    if (ui_join(path, n, ".tmp", tp[0..520]) == 0) { return false; }
+    const fd : i32 = sys_creat(tp[0..520], 420);
+    if (fd < 0) { return false; }
+    const ok : bool = uh_write_full(fd, r, UW_LEN);
+    sys_close(fd);
+    if (ok == false) { return false; }
+    return sys_rename(tp[0..520], path) == 0;
+}
+
+/// Read a status record; false when there is none or it is not whole.
+pub fn uh_status_read(path: []const u8, r: []u8) -> bool {
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return false; }
+    const n : i64 = sys_read(fd, r[0..UW_LEN], @as(u64, UW_LEN));
+    sys_close(fd);
+    if (n != @as(i64, @intCast(UW_LEN))) { return false; }
+    return uw_ok(r, UW_LEN);
+}
+
+/// Start the program at exe (NUL-terminated) with this process's environment and no arguments, without waiting. Its
+/// pid, 0 when it could not start.
+pub fn uh_spawn(exe: []const u8) -> u32 {
+    var tb : [1024]u8 = undefined;
+    var i : usize = 0;
+    while (i < exe.len and i < 1023 and exe[i] != 0) {
+        tb[i] = exe[i];
+        i = i + 1;
+    }
+    tb[i] = 0;
+    var argv : [8]u64 = undefined;
+    var k : usize = 0;
+    while (k < 8) {
+        argv[k] = 0;
+        k = k + 1;
+    }
+    argv[0] = sys_addr(tb[0..1024], tb[0..1], 0);
+    var ep : [8]u8 = undefined;
+    sys_peek(ep[0..8], sys_environ(), 8);
+    var envp : u64 = 0;
+    i = 0;
+    while (i < 8) {
+        envp = envp | (@as(u64, ep[i]) << @as(u6, @intCast(8 * i)));
+        i = i + 1;
+    }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    if (sys_spawn(pid, tb[0..1024], 0, 0, argv, envp) != 0) { return 0; }
+    return pid[0];
+}
+
+/// A helper started by uh_spawn: 0 while it runs, 1 when it ended with exit 0, 2 when it failed or is gone (reaped here).
+pub fn uh_reap(pid: u32) -> u32 {
+    if (pid == 0) { return 2; }
+    var st : [2]u32 = undefined;
+    st[0] = 0;
+    st[1] = 0;
+    const w : i32 = sys_waitpid(@as(i32, @intCast(pid)), st, 1);
+    if (w == 0) { return 0; }
+    if (w < 0) { return 2; }
+    if ((st[0] & 127) == 0 and ((st[0] >> 8) & 255) == 0) { return 1; }
+    return 2;
+}
+
+/// End a helper (SIGTERM) and wait for it.
+pub fn uh_stop(pid: u32) -> void {
+    if (pid == 0) { return; }
+    sys_kill(@as(i32, @intCast(pid)), 15);
+    var st : [2]u32 = undefined;
+    st[0] = 0;
+    st[1] = 0;
+    sys_waitpid(@as(i32, @intCast(pid)), st, 0);
+}
+
+// uh_update settings (u64 each; t27b passes at most 8 parameters, so the scalars travel in one slice)
+pub const UC_IP : usize = 0;
+pub const UC_PORT : usize = 1;
+pub const UC_VER : usize = 2;
+pub const UC_BUILD : usize = 3;
+pub const UC_RETRY : usize = 4;
+pub const UC_HEALTH : usize = 5;
+pub const UC_FAIL_AT : usize = 6;
+pub const UC_LEN : usize = 7;
+
+/// One update from the neighbour at cfg[UC_IP]:cfg[UC_PORT] over the app at app (cut to its length), following the
+/// state machine of update_core (st_next): the lock, then the manifest is fetched and judged BEFORE any bundle byte is
+/// asked for (uh_check_manifest: signature, known author, newer build than cfg[UC_BUILD], version not below
+/// cfg[UC_VER], size), then the bundle is fetched with resume and its SHA-256 compared AFTER, then installed with undo.
+/// res: UR_STATE ST_DONE / ST_FAILED (ST_IDLE when the lock was busy), UR_WHY the FR_* reason, UR_OFFER the manifest
+/// verdict (UH_OK or OF_* / UH_SIG), UR_FETCH the UF_* code, and the install fields. stats as uh_fetch. cfg[UC_RETRY]
+/// (1 = retry), cfg[UC_HEALTH], cfg[UC_FAIL_AT] as uh_fetch / uh_install. sp: where the status record goes (the helper
+/// of the window, update_core UW_*), written at each phase; an empty slice for none.
+pub fn uh_update(cfg: []const u64, ft: []const u8, own_fp: []const u8, app: []const u8, res: []u32, stats: []u64, sp: []const u8) -> bool {
+    var rec : [96]u8 = undefined;
+    uw_init(rec[0..96], UW_R_FETCH, @as(u32, @intCast(uh_getpid())));
+    rec[UW_PHASE] = @as(u8, @intCast(UW_P_MANIFEST));
+    uh_status_write(sp, rec[0..96]);
+    var z : usize = 0;
+    while (z < 7) {
+        res[z] = 0;
+        z = z + 1;
+    }
+    const ok : bool = uh_update_run(cfg, ft, own_fp, app, res, stats, sp, rec[0..96]);
+    rec[UW_WHY] = @as(u8, @intCast(res[UR_WHY] & 255));
+    rec[UW_OFFER] = @as(u8, @intCast(res[UR_OFFER] & 255));
+    rec[UW_FETCH] = @as(u8, @intCast(res[UR_FETCH] & 255));
+    rec[UW_STEP] = @as(u8, @intCast(res[UR_STEP] & 255));
+    rec[UW_UNDO] = @as(u8, @intCast(res[UR_UNDO] & 255));
+    if (ok) {
+        rec[UW_PHASE] = @as(u8, @intCast(UW_P_DONE));
+        uw_put64(rec[0..96], UW_HAVE, uw_get64(rec[0..96], UW_TOTAL));
+    } else {
+        rec[UW_PHASE] = @as(u8, @intCast(UW_P_FAILED));
+    }
+    uh_status_write(sp, rec[0..96]);
+    return ok;
+}
+
+fn uh_update_run(cfg: []const u64, ft: []const u8, own_fp: []const u8, app: []const u8, res: []u32, stats: []u64, sp: []const u8, rec: []u8) -> bool {
+    if (cfg.len < UC_LEN) { return false; }
+    const ip : u64 = cfg[UC_IP];
+    const port : u64 = cfg[UC_PORT];
+    const cur_ver : u64 = cfg[UC_VER];
+    const cur_build : u32 = @as(u32, @intCast(cfg[UC_BUILD] & 4294967295));
+    const retry : bool = cfg[UC_RETRY] != 0;
+    const health : u32 = @as(u32, @intCast(cfg[UC_HEALTH] & 255));
+    const fail_at : u32 = @as(u32, @intCast(cfg[UC_FAIL_AT] & 255));
+    const an : usize = app.len;
+    var k : usize = 0;
+    while (k < 7) {
+        res[k] = 0;
+        k = k + 1;
+    }
+    res[UR_STATE] = ST_IDLE;
+    if (uh_lock(app, an) == false) {
+        res[UR_WHY] = FR_BUSY;
+        return false;
+    }
+    var st : u32 = st_next(ST_IDLE, EV_START);
+    var m : [216]u8 = undefined;
+    if (uh_fetch_manifest(ip, port, m[0..216]) == false) {
+        res[UR_FETCH] = UF_NET;
+        res[UR_WHY] = FR_NET;
+        res[UR_STATE] = st_next(st, EV_FAIL);
+        uh_unlock(app, an);
+        return false;
+    }
+    res[UR_OFFER] = uh_check_manifest(m[0..216], ft, own_fp, cur_ver, cur_build);
+    if (res[UR_OFFER] != UH_OK) {
+        res[UR_WHY] = FR_OFFER;
+        res[UR_STATE] = st_next(st, EV_FAIL);
+        uh_unlock(app, an);
+        return false;
+    }
+    var part : [512]u8 = undefined;
+    var dn : usize = ui_base_at(app, an);
+    if (dn > 0) { dn = dn - 1; }
+    ui_part_path(app, dn, m[UM_OFF_SHA..UM_OFF_SHA + 32], part[0..512]);
+    uw_from_manifest(rec, m[0..216]);
+    rec[UW_PHASE] = @as(u8, @intCast(UW_P_FETCH));
+    uh_status_write(sp, rec);
+    res[UR_FETCH] = uh_fetch(ip, port, m[0..216], part[0..512], retry, stats);
+    if (res[UR_FETCH] != UF_DONE) {
+        res[UR_WHY] = FR_NET;
+        if (res[UR_FETCH] == UF_HASH) { res[UR_WHY] = FR_HASH; }
+        res[UR_STATE] = st_next(st, EV_FAIL);
+        uh_unlock(app, an);
+        return false;
+    }
+    st = st_next(st, EV_FETCHED);
+    st = st_next(st, EV_VERIFIED);
+    st = st_next(st, EV_INSTALL);
+    rec[UW_PHASE] = @as(u8, @intCast(UW_P_INSTALL));
+    uw_put64(rec, UW_HAVE, um_size_of(m[0..216]));
+    uh_status_write(sp, rec);
+    var ir : [4]u32 = undefined;
+    const ok : bool = uh_install(app, an, part[0..512], m[0..216], health, fail_at, ir[0..4]);
+    sys_unlink(part[0..512]);
+    res[UR_STEP] = ir[IR_STEP];
+    res[UR_UNDO] = ir[IR_UNDO];
+    res[UR_BUNDLE] = ir[IR_BUNDLE];
+    res[UR_WHY] = ir[IR_WHY];
+    if (ok) {
+        res[UR_STATE] = st_next(st, EV_INSTALLED);
+    } else {
+        res[UR_STATE] = st_next(st, EV_FAIL);
+    }
+    uh_unlock(app, an);
+    return ok;
+}
+
+test the_socket_address_is_bsd_sockaddr_in {
+    var sa : [16]u8 = undefined;
+    uh_sockaddr(sa[0..16], UH_LOOPBACK, 47790);
+    assert sa[0] == 16 and sa[1] == 2;
+    assert sa[2] == 186 and sa[3] == 174;
+    assert sa[4] == 127 and sa[5] == 0 and sa[6] == 0 and sa[7] == 1;
+    assert sa[8] == 0 and sa[15] == 0;
+}
+
+test program_words_are_nul_separated {
+    var a : [64]u8 = undefined;
+    var p : usize = uh_arg(a[0..64], 0, "/bin/rm");
+    p = uh_arg(a[0..64], p, "-rf");
+    assert p == 12;
+    assert a[7] == 0 and a[8] == 45 and a[11] == 0;
+    // a NUL-terminated buffer stops at its NUL
+    var w : [8]u8 = undefined;
+    w[0] = 120;
+    w[1] = 0;
+    w[2] = 121;
+    p = uh_arg(a[0..64], p, w[0..8]);
+    assert p == 14 and a[12] == 120 and a[13] == 0;
+}

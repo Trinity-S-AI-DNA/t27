@@ -24,6 +24,8 @@ use t27os::pty_proto::HEADER;
 use t27os::pty_proto::MAX_FRAME;
 use t27os::pty_proto::put_u64;
 use t27os::pty_proto::get_u64;
+use t27os::pty_proto::get_u16;
+use t27os::pty_logic::spawn_cwd_len;
 use t27os::pty_proto::put_frame;
 use t27os::pty_proto::frame_need;
 use t27os::pty_proto::socket_path;
@@ -101,9 +103,9 @@ pub fn client_list(fd: i32, out: []u8) -> usize {
     return client_call(fd, OP_LIST, 0, "", out);
 }
 
-/// SPAWN agent in `cwd` for a space/slot; the reply's pane byte is the new pane id.
-pub fn client_spawn(fd: i32, agent: u32, space: u32, slot: u32, cwd: []const u8, out: []u8) -> usize {
-    var p : [300]u8 = undefined;
+/// The SPAWN payload client_spawn sends, into p (at least 293 bytes): agent, space, slot, then the first 290
+/// bytes of `cwd`; its length.
+pub fn client_spawn_payload(agent: u32, space: u32, slot: u32, cwd: []const u8, p: []u8) -> usize {
     p[0] = @as(u8, @intCast(agent));
     p[1] = @as(u8, @intCast(space));
     p[2] = @as(u8, @intCast(slot));
@@ -112,7 +114,14 @@ pub fn client_spawn(fd: i32, agent: u32, space: u32, slot: u32, cwd: []const u8,
         p[3 + i] = cwd[i];
         i = i + 1;
     }
-    return client_call(fd, OP_SPAWN, 0, p[0 .. 3 + i], out);
+    return 3 + i;
+}
+
+/// SPAWN agent in `cwd` for a space/slot; the reply's pane byte is the new pane id.
+pub fn client_spawn(fd: i32, agent: u32, space: u32, slot: u32, cwd: []const u8, out: []u8) -> usize {
+    var p : [300]u8 = undefined;
+    const n : usize = client_spawn_payload(agent, space, slot, cwd, p[0..300]);
+    return client_call(fd, OP_SPAWN, 0, p[0 .. n], out);
 }
 
 /// SPAWN terminal editor `pick` (editors.t27 TERM_NAMES) on `path`, a folder or a file, for a space/slot: an
@@ -154,11 +163,17 @@ pub fn client_kill(fd: i32, pane: u32, out: []u8) -> usize {
     return client_call(fd, OP_KILL, @as(u8, @intCast(pane)), "", out);
 }
 
+/// The RESIZE payload client_resize sends, into p[0..4]: cols then rows, u16 each; its length.
+pub fn client_resize_payload(cols: u32, rows: u32, p: []u8) -> usize {
+    put_u16(p, 0, cols);
+    put_u16(p, 2, rows);
+    return 4;
+}
+
 /// RESIZE: the grid the window can show, applied to the pane's terminal and signalled with SIGWINCH.
 pub fn client_resize(fd: i32, pane: u32, cols: u32, rows: u32, out: []u8) -> usize {
     var p : [4]u8 = undefined;
-    put_u16(p[0..4], 0, cols);
-    put_u16(p[0..4], 2, rows);
+    client_resize_payload(cols, rows, p[0..4]);
     return client_call(fd, OP_RESIZE, @as(u8, @intCast(pane)), p[0..4], out);
 }
 
@@ -190,4 +205,82 @@ test a_long_path_is_cut_at_103 {
     sockaddr_un(a[0..106], p[0..200]);
     assert a[104] == 97;
     assert a[105] == 0;
+}
+
+test reply_cursor_reads_the_eight_bytes_after_the_header_little_endian {
+    var f : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) { f[i] = 255; i = i + 1; }
+    put_u64(f[0..32], HEADER, 0);
+    assert reply_cursor(f[0..32]) == 0;
+    put_u64(f[0..32], HEADER, 1);
+    assert reply_cursor(f[0..32]) == 1;
+    put_u64(f[0..32], HEADER, 4096);
+    assert reply_cursor(f[0..32]) == 4096;
+    put_u64(f[0..32], HEADER, 18446744073709551615);
+    assert reply_cursor(f[0..32]) == 18446744073709551615;
+    // the bytes before the header and after the cursor are not part of it
+    put_u64(f[0..32], HEADER, 258);
+    f[0] = 7;
+    f[HEADER + 8] = 9;
+    assert reply_cursor(f[0..32]) == 258;
+    assert f[HEADER] == 2 and f[HEADER + 1] == 1 and f[HEADER + 2] == 0;
+}
+
+test the_client_refuses_what_cannot_be_framed_or_addressed_before_it_touches_a_socket {
+    var out : [64]u8 = undefined;
+    // a home whose socket path would pass 103 bytes: no socket is made, -1
+    var home : [120]u8 = undefined;
+    var i : usize = 0;
+    while (i < 120) { home[i] = 97; i = i + 1; }
+    assert client_connect(home[0..88]) == -1;
+    assert client_connect(home[0..120]) == -1;
+    // a payload past MAX_PAYLOAD (4096) cannot be framed: 0 bytes, nothing is written to the (invalid) fd
+    var big : [4097]u8 = undefined;
+    i = 0;
+    while (i < 4097) { big[i] = 65; i = i + 1; }
+    assert client_call(-1, OP_KEYS, 0, big[0..4097], out[0..64]) == 0;
+    assert client_keys(-1, 0, big[0..4097], out[0..64]) == 0;
+    assert client_set_key(-1, 1, big[0..4097], out[0..64]) == 0;
+    // an editor pick that is not in the table gives no request at all
+    assert client_spawn_editor(-1, 0, 0, 4294967295, "/tmp", out[0..64]) == 0;
+}
+
+test the_spawn_payload_is_agent_space_slot_then_the_cwd_the_server_reads_back {
+    var p : [300]u8 = undefined;
+    const n : usize = client_spawn_payload(2, 5, 7, "/tmp/work", p[0..300]);
+    assert n == 12;
+    assert p[0] == 2 and p[1] == 5 and p[2] == 7;
+    assert p[3] == 47 and p[11] == 107;
+    // the server (pty_logic spawn_cwd_len) finds the whole cwd in it
+    assert spawn_cwd_len(p[0..n]) == 9;
+    // the largest byte values pass as they are
+    assert client_spawn_payload(255, 255, 255, "/", p[0..300]) == 4;
+    assert p[0] == 255 and p[1] == 255 and p[2] == 255 and p[3] == 47;
+    // an empty cwd is the three bytes alone: the server reads cwd length 0 and refuses it (pty_server OP_SPAWN)
+    assert client_spawn_payload(0, 0, 0, "", p[0..300]) == 3;
+    assert spawn_cwd_len(p[0..3]) == 0;
+    // a cwd past 290 bytes is cut at 290: the payload stays 293 bytes and fits the 300 the client keeps
+    var c : [400]u8 = undefined;
+    var i : usize = 0;
+    while (i < 400) { c[i] = 97; i = i + 1; }
+    c[290] = 98;
+    assert client_spawn_payload(1, 0, 0, c[0..290], p[0..300]) == 293;
+    assert client_spawn_payload(1, 0, 0, c[0..291], p[0..300]) == 293;
+    assert client_spawn_payload(1, 0, 0, c[0..400], p[0..300]) == 293;
+    assert p[292] == 97 and spawn_cwd_len(p[0..293]) == 290;
+    assert client_spawn_payload(1, 0, 0, c[0..289], p[0..300]) == 292;
+}
+
+test the_resize_payload_is_cols_then_rows_as_the_server_reads_them {
+    var p : [4]u8 = undefined;
+    assert client_resize_payload(80, 24, p[0..4]) == 4;
+    assert get_u16(p[0..4], 0) == 80 and get_u16(p[0..4], 2) == 24;
+    // cols first: swapping them is a different grid
+    assert client_resize_payload(24, 80, p[0..4]) == 4;
+    assert get_u16(p[0..4], 0) == 24 and get_u16(p[0..4], 2) == 80;
+    // the edges of a u16
+    assert client_resize_payload(0, 65535, p[0..4]) == 4;
+    assert get_u16(p[0..4], 0) == 0 and get_u16(p[0..4], 2) == 65535;
+    assert p[2] == 255 and p[3] == 255;
 }

@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/trust_probe.t27 -- the live check of trust.t27 against a running copy of the app (owner, 2026-10-23;
+// Refs gHashTag/t27#11560). Not part of the app. Two homes under /tmp, nothing else is touched:
+//   /tmp/trA  the app's HOME (identity "alice", friend B with B's key stored);
+//   /tmp/trB  this probe's HOME as B (identity "bee", friend A with A's key stored).
+// TP_MODE=setup     makes both identities and both friends files (keys are written to the files, never printed);
+// TP_MODE=impostor  as B, a message session to the app's chat port that proves C's key (a fresh pair in memory) under
+//                   B's fingerprint: the app refuses it (call_session CS_R_IDENTITY) and writes trust.t27;
+// TP_MODE=real      as B with B's own key: the app's stored key is proved again (VERIFIED) and the warning goes.
+// The app listens on 127.0.0.1, T27OS_CALL_PORT=47801, so its message session is on 47802; this probe uses 47811.
+// Build (Apple silicon):
+//   t27b build specs/t27os/trust_probe.t27 -o tp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -framework AudioToolbox \
+//      -framework CoreGraphics -framework ImageIO -framework CoreServices -o tp tp.o
+//   TP_MODE=setup ./tp; (start the app with HOME=/tmp/trA T27OS_CALL_PORT=47801); TP_MODE=impostor ./tp
+// Behaviour checks, not a security audit.
+module T27osTrustProbe;
+
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::call_core::ck_same;
+use t27os::call_core::ck_put;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_crypto_probe::ckh_line;
+use t27os::call_crypto_probe::ckh_check;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_crypto_probe::ckh_usleep;
+use t27os::callback_probe::cbp_fin;
+use t27os::callback_probe::cbp_fout;
+use t27os::call_session::cs_open;
+use t27os::call_session::cs_identity;
+use t27os::call_session::cs_id_state;
+use t27os::call_session::cs_call;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_hangup;
+use t27os::call_session::cs_dismiss;
+use t27os::call_session::cs_reason;
+use t27os::call_session::cs_set;
+use t27os::call_session::CS_LEN;
+use t27os::call_session::CS_ID;
+use t27os::call_session::CI_PUB;
+use t27os::call_session::CI_PRIV;
+use t27os::call_session::CS_AUDIO_NONE;
+use t27os::call_session::CS_K_VERIFY_MS;
+use t27os::call_session::CS_EV_NONE;
+use t27os::call_session::CS_EV_ACTIVE;
+use t27os::call_session::CS_EV_ENDED;
+use t27os::call_session::CS_EV_FAILED;
+use t27os::call_session::CS_ID_VERIFIED;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::ID_OFF_PRIV;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::FA_OK;
+use t27os::peer_identity::PIN_NEW;
+use t27os::peer_identity_host::ih_identity_open;
+use t27os::peer_identity_host::ih_friends_save;
+use t27os::peer_identity_host::ih_pin_put;
+use t27os::peer_identity_host::IH_CREATED;
+use t27os::peer_identity_host::IH_LOADED;
+use t27os::friends_view::fv_short_fp;
+use t27os::chat_view::chv_chat_port;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+fn tp_setenv(name: []const u8, value: []const u8, over: i32) -> i32 { return @extern("setenv"); }
+
+const TP_LO : u64 = 2130706433;
+const TP_APP_PORT : u64 = 47801;
+const TP_MY_PORT : u64 = 47811;
+
+fn tp_home(a: bool) -> bool {
+    if (a) { return tp_setenv("HOME", "/tmp/trA", 1) == 0; }
+    return tp_setenv("HOME", "/tmp/trB", 1) == 0;
+}
+
+/// This home's identity (made when absent): its 207 bytes into id, its fingerprint into fp.
+fn tp_id(a: bool, id: []u8, fp: []u8) -> bool {
+    if (tp_home(a) == false) { return false; }
+    var r : u32 = 0;
+    if (a) { r = ih_identity_open("alice", 5, id, fp); } else { r = ih_identity_open("bee", 3, id, fp); }
+    return r == IH_CREATED or r == IH_LOADED;
+}
+
+fn tp_say_fp(label: []const u8, fp: []const u8) -> void {
+    var line : [64]u8 = undefined;
+    var n : usize = put_bytes(line[0..64], 0, label);
+    n = n + fv_short_fp(fp, line[n..64]);
+    n = put_bytes(line[0..64], n, "\n");
+    ckh_line(line[0..n]);
+}
+
+/// The friends file of this home: one friend (fp) with its key stored.
+fn tp_friend(a: bool, me: []const u8, fp: []const u8, pubk: []const u8) -> bool {
+    if (tp_home(a) == false) { return false; }
+    var t : [1108]u8 = undefined;
+    ft_init(t[0..FT_LEN]);
+    var inv : [25]u8 = undefined;
+    invite_make(fp, inv[0..25]);
+    if (ft_add(t[0..FT_LEN], inv[0..25], me) != FA_OK) { return false; }
+    if (ih_friends_save(t[0..FT_LEN]) == false) { return false; }
+    return ih_pin_put(fp, pubk) == PIN_NEW;
+}
+
+fn tp_setup() -> bool {
+    var all : bool = true;
+    var ida : [208]u8 = undefined;
+    var idb : [208]u8 = undefined;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    all = ckh_check("identities: alice in /tmp/trA, bee in /tmp/trB", tp_id(true, ida[0..208], fa[0..10]) and tp_id(false, idb[0..208], fb[0..10])) and all;
+    tp_say_fp("A fp ", fa[0..10]);
+    tp_say_fp("B fp ", fb[0..10]);
+    all = ckh_check("A's friends file: B with B's key stored", tp_friend(true, fa[0..10], fb[0..10], idb[ID_OFF_PUB .. ID_OFF_PUB + 65])) and all;
+    all = ckh_check("B's friends file: A with A's key stored", tp_friend(false, fb[0..10], fa[0..10], ida[ID_OFF_PUB .. ID_OFF_PUB + 65])) and all;
+    return all;
+}
+
+/// As B: one message session to the app; impostor proves C's key under B's fingerprint.
+fn tp_session(impostor: bool) -> bool {
+    var all : bool = true;
+    var ida : [208]u8 = undefined;
+    var idb : [208]u8 = undefined;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    all = ckh_check("identities read (A for its fingerprint, B as this side)", tp_id(true, ida[0..208], fa[0..10]) and tp_id(false, idb[0..208], fb[0..10])) and all;
+    var m : [299648]u8 = undefined;
+    all = ckh_check("message session open on 127.0.0.1:47811 as B", cs_open(m[0..CS_LEN], fb[0..10], TP_LO, TP_MY_PORT, CS_AUDIO_NONE) and cs_identity(m[0..CS_LEN], idb[ID_OFF_PUB .. ID_OFF_PUB + 65], idb[ID_OFF_PRIV .. ID_OFF_PRIV + 97])) and all;
+    if (impostor) {
+        var pc : [65]u8 = undefined;
+        var kc : [97]u8 = undefined;
+        all = ckh_check("impostor: C's fresh key pair put in place of B's (B's fingerprint kept)", ks_gen_pair(kc[0..97], pc[0..65])) and all;
+        ck_put(m[0..CS_LEN], CS_ID + CI_PUB, pc[0..65]);
+        ck_put(m[0..CS_LEN], CS_ID + CI_PRIV, kc[0..97]);
+    }
+    cs_set(m[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    tp_say_fp("calling A ", fa[0..10]);
+    cs_call(m[0..CS_LEN], TP_LO, chv_chat_port(TP_APP_PORT), fa[0..10]);
+    const t0 : u64 = ckh_ms();
+    var active : bool = false;
+    var ended : bool = false;
+    var reason : u32 = 0;
+    var id : u32 = 0;
+    while (ckh_ms() - t0 < 12000 and ended == false) {
+        var ev : u32 = cs_poll(m[0..CS_LEN]);
+        while (ev != CS_EV_NONE) {
+            if (ev == CS_EV_ACTIVE) {
+                active = true;
+                id = cs_id_state(m[0..CS_LEN]);
+                ckh_usleep(300000);
+                cs_hangup(m[0..CS_LEN]);
+            }
+            if (ev == CS_EV_ENDED or ev == CS_EV_FAILED) {
+                reason = cs_reason(m[0..CS_LEN]);
+                cs_dismiss(m[0..CS_LEN]);
+                ended = true;
+            }
+            ev = cs_poll(m[0..CS_LEN]);
+        }
+        ckh_usleep(2000);
+    }
+    var line : [64]u8 = undefined;
+    var n : usize = put_bytes(line[0..64], 0, "session: active ");
+    if (active) { n = put_bytes(line[0..64], n, "yes"); } else { n = put_bytes(line[0..64], n, "no"); }
+    n = put_bytes(line[0..64], n, ", ended reason ");
+    n = put_dec(line[0..64], n, @as(u64, reason));
+    n = put_bytes(line[0..64], n, "\n");
+    ckh_line(line[0..n]);
+    if (impostor) { return ckh_check("impostor: the session never opened", active == false and ended) and all; }
+    return ckh_check("real B: the session opened with the stored keys (VERIFIED on this side)", active and id == CS_ID_VERIFIED) and all;
+}
+
+fn tp_mode(out: []u8) -> usize {
+    const p : u64 = sys_getenv("TP_MODE");
+    if (p == 0) { return 0; }
+    var i : usize = 0;
+    while (i < out.len) {
+        var c : [1]u8 = undefined;
+        sys_peek(c[0..1], p + @as(u64, i), 1);
+        if (c[0] == 0) { return i; }
+        out[i] = c[0];
+        i = i + 1;
+    }
+    return i;
+}
+
+pub fn main() -> void {
+    // Never true: makes sure the audio callbacks are emitted and so exported for dlsym.
+    var z : [8]u8 = undefined;
+    put_u64(z[0..8], 0, 0);
+    if (get_u64(z[0..8], 0) == 99) {
+        cbp_fin(0, 0, 0, 0, 0, 0);
+        cbp_fout(0, 0, 0);
+    }
+    var md : [16]u8 = undefined;
+    const mn : usize = tp_mode(md[0..16]);
+    var ok : bool = false;
+    if (mn == 5 and ck_same(md[0..5], "setup")) {
+        ok = tp_setup();
+    } else if (mn == 8 and ck_same(md[0..8], "impostor")) {
+        ok = tp_session(true);
+    } else if (mn == 4 and ck_same(md[0..4], "real")) {
+        ok = tp_session(false);
+    } else {
+        ckh_line("TP_MODE=setup|impostor|real\n");
+        sys_exit(2);
+    }
+    if (ok) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}
+
+test tp_the_ports_are_the_ones_the_app_is_started_with {
+    assert chv_chat_port(TP_APP_PORT) == 47802 and TP_MY_PORT != chv_chat_port(TP_APP_PORT);
+}

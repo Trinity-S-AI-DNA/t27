@@ -1,0 +1,1340 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/nvidia_direct.t27 -- the direct NVIDIA route of T27 OS: integrate.api.nvidia.com (OpenAI
+; protocol) with the owner's own key list, beside the OpenRouter route (nvidia/nemotron-*:free) keys.t27 has.
+; Owner, 2026-10-22: "a direct NVIDIA provider in the app, and mark the model that does not work".
+; Measured 2026-10-22 on the 34 keys of the Keychain item nvidia-api-keys (account dmitrii-f-t27):
+;   GET /v1/models                              HTTP 200 on 34 of 34 (84 models: the platform catalogue,
+;                                               not what this account may run)
+;   yi-large, granite, sea-lion, jamba, deepseek-coder  HTTP 404 "Function ... not found for account"
+;   nvidia/nemotron-3-ultra-550b-a55b           HTTP 200 on 34 of 34, 0.73 to 13.5 s, mean 1.81 s
+;   deepseek-ai/deepseek-v4.1-flash             no answer in 70 s -> NV_DEAD_MODELS, never sent
+; The key list is one Keychain item, a JSON object {"keys":["nvapi-...", ...]}; nv_parse reads it here, the
+; host (nvidia_host.t27) only fetches the bytes with /usr/bin/security. Rotation: a key answered 401 or 403
+; is dead and never sent again; 429 moves on to the next live key; the counters and the current key survive a
+; restart as ~/.t27os/nvidia/state.t27 (nv_state_text), which holds no key, only the list's FNV-1a hash so a
+; changed list starts from a clean state. Every test uses fake nvapi-test-... values.
+; Why not a tenth row of the provider tables (PROVIDER_COUNT 9 -> 10): those rows hold MAX_KEYS = 16 keys each (8 until 2026-10-23)
+; under the service ai.t27.os, and their count sizes the PTY server's shared key table and the window's mask
+; buffer; the 34 keys of one JSON item fit neither. The provider id is P_NVIDIA = 9 in keys.t27, the same
+; id the feat/t27os-key-auth-hold branch (dmitrii-f-t27/t27#6) gives its NVIDIA row.
+; Refs gHashTag/t27#10782.
+module T27osNvidiaDirect;
+
+use t27os::editors::same_bytes;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::csv_field;
+use t27os::keys::key_fits;
+use t27os::keys::begins_with;
+use t27os::keys::NV_CHAT_URL;
+use t27os::keys::NV_MODEL_DEFAULT;
+use t27os::keys::NV_DEAD_MODELS;
+use t27os::keys::NV_KC_SERVICE;
+use t27os::keys::NV_KC_ACCOUNT;
+use t27os::keys::SEC_OP_READ;
+use t27os::keys::sec_argv;
+
+/// nv_parse's answer for bytes that are not the expected JSON object.
+pub const NV_BAD : u32 = 4294967295;
+/// nv_pick's answer when no key is live.
+pub const NV_NONE : u32 = 4294967295;
+/// The most keys the list may hold; more are counted as over, not taken.
+pub const NV_MAX : u32 = 64;
+/// The longest key taken (the measured keys are 70 bytes).
+pub const NV_KEY_MAX : u32 = 128;
+/// The bytes the host reads from the Keychain item (34 keys measured 2527 bytes).
+pub const NV_JSON_CAP : u32 = 8192;
+/// Seconds one request waits for an answer. Measured 2026-10-23: the same request took 0.78, 2.71 and 24.83 s on
+/// three keys, and the 24.83 s key answered 0.82 and 1.36 s when asked again: a slow route, not a slow key. A
+/// longer wait holds the answer for that long; 15 s keeps the slowest measured 200 (13.5 s) and drops the hang.
+pub const NV_TIMEOUT_S : u32 = 15;
+/// The prefix every NVIDIA API key has.
+pub const NV_PREFIX : str = "nvapi-";
+
+/// The rotation state, u32 words: the header, then NV_STRIDE words for each key.
+pub const NV_S_N : usize = 0;
+pub const NV_S_CUR : usize = 1;
+pub const NV_S_HASH : usize = 2;
+pub const NV_HDR : usize = 4;
+pub const NV_STRIDE : usize = 15;
+pub const NV_K_FLAGS : usize = 0;
+pub const NV_K_OK : usize = 1;
+pub const NV_K_RATE : usize = 2;
+pub const NV_K_AUTH : usize = 3;
+/// The last answer time in ms (0: never answered), how many samples the window holds, where the next one goes,
+/// then the window itself: the last NV_LAT_WIN answer times.
+pub const NV_K_LAST : usize = 4;
+pub const NV_K_LCNT : usize = 5;
+pub const NV_K_LHEAD : usize = 6;
+pub const NV_K_LAT : usize = 7;
+pub const NV_LAT_WIN : usize = 8;
+/// The fields of a v1 state file (counters only).
+pub const NV_STRIDE_V1 : usize = 4;
+pub const NV_ST_LEN : usize = 964;
+pub const NV_F_DEAD : u32 = 1;
+/// Set by a 429, cleared by a 2xx: the key goes last until it answers again.
+pub const NV_F_RATED : u32 = 2;
+/// A sample is cut here; a request with no answer counts as this (the timeout).
+pub const NV_LAT_CAP : u32 = 15000;
+/// A key whose median is over this goes after every key that is not, and after the keys never measured.
+pub const NV_SLOW_MS : u32 = 5000;
+/// Medians in the same step of this many ms are equal: the pick goes round them instead of always the same key.
+pub const NV_LAT_STEP : u32 = 100;
+/// The order tiers of nv_rank: measured and fast, never measured, slow, rate limited.
+pub const NV_T_FAST : u32 = 0;
+pub const NV_T_NEW : u32 = 1;
+pub const NV_T_SLOW : u32 = 2;
+pub const NV_T_RATED : u32 = 3;
+/// Counters stop here rather than wrap.
+pub const NV_COUNT_CAP : u32 = 999999999;
+
+/// What one answer does (nv_on_status).
+pub const NV_A_NONE : u32 = 0;
+pub const NV_A_OK : u32 = 1;
+pub const NV_A_DEAD : u32 = 2;
+pub const NV_A_NEXT : u32 = 3;
+pub const NV_A_MODEL : u32 = 4;
+pub const NV_A_NET : u32 = 5;
+pub const NV_A_RETRY : u32 = 6;
+pub const NV_ACTION_WORDS : str = "none,ok,key dead (401/403),rate limited (429) next key,model not deployed for this account (404),no answer,server error";
+
+// ---- the key list --------------------------------------------------------------------------------------
+
+fn nv_ws(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+fn nv_skip_ws(s: []const u8, at: usize) -> usize {
+    var i : usize = at;
+    while (i < s.len) {
+        if (nv_ws(s[i]) == false) { return i; }
+        i = i + 1;
+    }
+    return i;
+}
+
+/// The index after the closing quote of the string that opens at s[at]; s.len + 1 when it never closes.
+fn nv_str_end(s: []const u8, at: usize) -> usize {
+    var i : usize = at + 1;
+    while (i < s.len) {
+        if (s[i] == 92) {
+            i = i + 2;
+        } else if (s[i] == 34) {
+            return i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return s.len + 1;
+}
+
+/// The index after the JSON value that starts at s[at] (a string, an object, an array or a scalar);
+/// s.len + 1 when it is broken.
+fn nv_value_end(s: []const u8, at: usize) -> usize {
+    if (at >= s.len) { return s.len + 1; }
+    const c : u8 = s[at];
+    if (c == 34) { return nv_str_end(s, at); }
+    if (c == 123 or c == 91) {
+        var depth : u32 = 0;
+        var i : usize = at;
+        while (i < s.len) {
+            const d : u8 = s[i];
+            if (d == 34) {
+                const e : usize = nv_str_end(s, i);
+                if (e > s.len) { return s.len + 1; }
+                i = e;
+            } else {
+                if (d == 123 or d == 91) { depth = depth + 1; }
+                if (d == 125 or d == 93) {
+                    depth = depth - 1;
+                    if (depth == 0) { return i + 1; }
+                }
+                i = i + 1;
+            }
+        }
+        return s.len + 1;
+    }
+    var j : usize = at;
+    while (j < s.len and s[j] != 44 and s[j] != 125 and s[j] != 93 and nv_ws(s[j]) == false) {
+        j = j + 1;
+    }
+    if (j == at) { return s.len + 1; }
+    return j;
+}
+
+/// Is s[a..a+n] equal to an earlier taken key?
+fn nv_seen(s: []const u8, a: usize, n: usize, offs: []const u32, lens: []const u32, count: u32) -> bool {
+    var k : u32 = 0;
+    while (k < count) {
+        const o : usize = @as(usize, offs[k]);
+        if (@as(usize, lens[k]) == n) {
+            if (same_bytes(s[o .. o + n], s[a .. a + n])) { return true; }
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// Take the string element s[a..e] (its quotes excluded) when it is a key: spaces around it trimmed, it
+/// starts with NV_PREFIX, has no escape, fits key_fits and NV_KEY_MAX, and is not a repeat. res[0] counts
+/// repeats, res[1] elements that are not keys or do not fit. The new count comes back.
+fn nv_take(s: []const u8, a: usize, e: usize, offs: []u32, lens: []u32, count: u32, res: []u32) -> u32 {
+    var x : usize = a;
+    var y : usize = e;
+    while (x < y and (s[x] == 32 or s[x] == 9)) { x = x + 1; }
+    while (y > x and (s[y - 1] == 32 or s[y - 1] == 9)) { y = y - 1; }
+    const n : usize = y - x;
+    var i : usize = x;
+    while (i < y) {
+        if (s[i] == 92) {
+            res[1] = res[1] + 1;
+            return count;
+        }
+        i = i + 1;
+    }
+    if (n <= 6 or n > @as(usize, NV_KEY_MAX) or begins_with(s[x .. y], NV_PREFIX) == false or key_fits(s[x .. y]) == false) {
+        res[1] = res[1] + 1;
+        return count;
+    }
+    if (nv_seen(s, x, n, offs, lens, count)) {
+        res[0] = res[0] + 1;
+        return count;
+    }
+    if (count >= NV_MAX or @as(usize, count) >= offs.len or @as(usize, count) >= lens.len) {
+        res[1] = res[1] + 1;
+        return count;
+    }
+    offs[count] = @as(u32, @intCast(x));
+    lens[count] = @as(u32, @intCast(n));
+    return count + 1;
+}
+
+/// Read the key list {"keys":["nvapi-...", ...]}: offs[k] and lens[k] give key k inside json (no copy).
+/// The count of keys taken, 0 for an empty list, NV_BAD when the bytes are not one JSON object with one
+/// "keys" array (broken JSON, a missing or a second "keys", trailing bytes). Other fields are skipped.
+/// res (2 words) counts the repeats dropped and the elements that are not keys.
+pub fn nv_parse(json: []const u8, offs: []u32, lens: []u32, res: []u32) -> u32 {
+    res[0] = 0;
+    res[1] = 0;
+    var i : usize = nv_skip_ws(json, 0);
+    if (i >= json.len or json[i] != 123) { return NV_BAD; }
+    i = nv_skip_ws(json, i + 1);
+    var found : bool = false;
+    var count : u32 = 0;
+    var more : bool = true;
+    if (i < json.len and json[i] == 125) { return NV_BAD; }
+    while (more) {
+        if (i >= json.len or json[i] != 34) { return NV_BAD; }
+        const ne : usize = nv_str_end(json, i);
+        if (ne > json.len) { return NV_BAD; }
+        const is_keys : bool = same_bytes(json[i + 1 .. ne - 1], "keys");
+        i = nv_skip_ws(json, ne);
+        if (i >= json.len or json[i] != 58) { return NV_BAD; }
+        i = nv_skip_ws(json, i + 1);
+        if (is_keys) {
+            if (found) { return NV_BAD; }
+            found = true;
+            if (i >= json.len or json[i] != 91) { return NV_BAD; }
+            i = nv_skip_ws(json, i + 1);
+            var items : bool = true;
+            if (i < json.len and json[i] == 93) { items = false; }
+            while (items) {
+                if (i >= json.len) { return NV_BAD; }
+                const ve : usize = nv_value_end(json, i);
+                if (ve > json.len) { return NV_BAD; }
+                if (json[i] == 34) {
+                    count = nv_take(json, i + 1, ve - 1, offs, lens, count, res);
+                } else {
+                    res[1] = res[1] + 1;
+                }
+                i = nv_skip_ws(json, ve);
+                if (i >= json.len) { return NV_BAD; }
+                if (json[i] == 93) {
+                    items = false;
+                } else if (json[i] == 44) {
+                    i = nv_skip_ws(json, i + 1);
+                } else {
+                    return NV_BAD;
+                }
+            }
+            i = i + 1;
+        } else {
+            const oe : usize = nv_value_end(json, i);
+            if (oe > json.len) { return NV_BAD; }
+            i = oe;
+        }
+        i = nv_skip_ws(json, i);
+        if (i >= json.len) { return NV_BAD; }
+        if (json[i] == 125) {
+            more = false;
+        } else if (json[i] == 44) {
+            i = nv_skip_ws(json, i + 1);
+        } else {
+            return NV_BAD;
+        }
+    }
+    if (nv_skip_ws(json, i + 1) < json.len) { return NV_BAD; }
+    if (found == false) { return NV_BAD; }
+    return count;
+}
+
+/// FNV-1a (32 bit) over the taken keys in order, a newline after each: the state file names the list by it,
+/// so a changed list (a key added, removed or reordered) starts from a clean state. Not a key, not reversible.
+pub fn nv_list_hash(json: []const u8, offs: []const u32, lens: []const u32, count: u32) -> u32 {
+    var h : u64 = 2166136261;
+    var k : u32 = 0;
+    while (k < count) {
+        const o : usize = @as(usize, offs[k]);
+        var i : usize = 0;
+        while (i < @as(usize, lens[k])) {
+            h = ((h ^ @as(u64, json[o + i])) * 16777619) % 4294967296;
+            i = i + 1;
+        }
+        h = ((h ^ 10) * 16777619) % 4294967296;
+        k = k + 1;
+    }
+    return @as(u32, @intCast(h));
+}
+
+// ---- rotation ------------------------------------------------------------------------------------------
+
+fn nv_at(i: u32, field: usize) -> usize {
+    return NV_HDR + @as(usize, i) * NV_STRIDE + field;
+}
+
+/// A clean state for a list of n keys (n is cut at NV_MAX) named by `hash`; key 0 goes first (the pick goes round
+/// from the key after the current one, so the current one starts as the last).
+pub fn nv_state_init(st: []u32, n: u32, hash: u32) -> void {
+    var i : usize = 0;
+    while (i < st.len) {
+        st[i] = 0;
+        i = i + 1;
+    }
+    var m : u32 = n;
+    if (m > NV_MAX) { m = NV_MAX; }
+    st[NV_S_N] = m;
+    st[NV_S_HASH] = hash;
+    if (m > 0) { st[NV_S_CUR] = m - 1; }
+}
+
+pub fn nv_dead(st: []const u32, i: u32) -> bool {
+    if (i >= st[NV_S_N]) { return true; }
+    return st[nv_at(i, NV_K_FLAGS)] % 2 == 1;
+}
+
+/// How many keys are not dead.
+pub fn nv_live(st: []const u32) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < st[NV_S_N]) {
+        if (nv_dead(st, i) == false) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// How many keys have answered a request at least once (2xx, 429, 401/403), by the saved counters: the keys the
+/// rotation has checked. A key never sent, or sent only into no answer, 404 or 5xx, is not counted.
+pub fn nv_answered(st: []const u32) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < st[NV_S_N]) {
+        if (nv_dead(st, i) or st[nv_at(i, NV_K_OK)] > 0 or st[nv_at(i, NV_K_RATE)] > 0 or st[nv_at(i, NV_K_AUTH)] > 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// How many keys are not dead and have answered 2xx at least once: the keys known to work.
+pub fn nv_ok_keys(st: []const u32) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < st[NV_S_N]) {
+        if (nv_dead(st, i) == false and st[nv_at(i, NV_K_OK)] > 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The first live key at `from` or after it, wrapping round; NV_NONE when none is live.
+fn nv_live_from(st: []const u32, from: u32) -> u32 {
+    const n : u32 = st[NV_S_N];
+    if (n == 0) { return NV_NONE; }
+    var j : u32 = 0;
+    while (j < n) {
+        const k : u32 = (from + j) % n;
+        if (nv_dead(st, k) == false) { return k; }
+        j = j + 1;
+    }
+    return NV_NONE;
+}
+
+// ---- answer times --------------------------------------------------------------------------------------
+
+/// The median of key i's window (the last NV_LAT_WIN answer times, ms); 0 when it holds none. The samples are
+/// copied and put in order by insertion (at most 8 of them); an even count takes the mean of the middle two.
+pub fn nv_median(st: []const u32, i: u32) -> u32 {
+    if (i >= st[NV_S_N]) { return 0; }
+    var c : usize = @as(usize, st[nv_at(i, NV_K_LCNT)]);
+    if (c > NV_LAT_WIN) { c = NV_LAT_WIN; }
+    if (c == 0) { return 0; }
+    const head : usize = @as(usize, st[nv_at(i, NV_K_LHEAD)]) % NV_LAT_WIN;
+    var a : [8]u32 = undefined;
+    var j : usize = 0;
+    while (j < c) {
+        const v : u32 = st[nv_at(i, NV_K_LAT + (head + NV_LAT_WIN - c + j) % NV_LAT_WIN)];
+        var p : usize = j;
+        while (p > 0 and a[p - 1] > v) {
+            a[p] = a[p - 1];
+            p = p - 1;
+        }
+        a[p] = v;
+        j = j + 1;
+    }
+    if (c % 2 == 1) { return a[c / 2]; }
+    return (a[c / 2 - 1] + a[c / 2]) / 2;
+}
+
+/// Put one answer time of key i into its window (the oldest of 8 drops out) and as its last time; cut at NV_LAT_CAP.
+pub fn nv_lat_note(st: []u32, i: u32, ms: u32) -> void {
+    if (i >= st[NV_S_N]) { return; }
+    var v : u32 = ms;
+    if (v > NV_LAT_CAP) { v = NV_LAT_CAP; }
+    const head : usize = @as(usize, st[nv_at(i, NV_K_LHEAD)]) % NV_LAT_WIN;
+    st[nv_at(i, NV_K_LAT + head)] = v;
+    st[nv_at(i, NV_K_LHEAD)] = @as(u32, @intCast((head + 1) % NV_LAT_WIN));
+    if (st[nv_at(i, NV_K_LCNT)] < @as(u32, @intCast(NV_LAT_WIN))) { st[nv_at(i, NV_K_LCNT)] = st[nv_at(i, NV_K_LCNT)] + 1; }
+    st[nv_at(i, NV_K_LAST)] = v;
+}
+
+/// Key i's place in the order, smaller first: the tier (fast, never measured, slow over NV_SLOW_MS, rate
+/// limited) times 1000, plus the median in NV_LAT_STEP steps for a measured key.
+pub fn nv_rank(st: []const u32, i: u32) -> u32 {
+    if ((st[nv_at(i, NV_K_FLAGS)] / NV_F_RATED) % 2 == 1) { return NV_T_RATED * 1000; }
+    if (st[nv_at(i, NV_K_LCNT)] == 0) { return NV_T_NEW * 1000; }
+    const m : u32 = nv_median(st, i);
+    if (m > NV_SLOW_MS) { return NV_T_SLOW * 1000 + m / NV_LAT_STEP; }
+    return NV_T_FAST * 1000 + m / NV_LAT_STEP;
+}
+
+/// The key the next request uses: the live key of the smallest nv_rank (the smallest median); among equal ranks
+/// the first after the current key, going round, so equal keys take turns. NV_NONE when none is live.
+pub fn nv_pick(st: []const u32) -> u32 {
+    const n : u32 = st[NV_S_N];
+    if (n == 0) { return NV_NONE; }
+    var best : u32 = NV_NONE;
+    var br : u32 = 0;
+    var j : u32 = 1;
+    while (j <= n) {
+        const k : u32 = (st[NV_S_CUR] + j) % n;
+        if (nv_dead(st, k) == false) {
+            const r : u32 = nv_rank(st, k);
+            if (best == NV_NONE or r < br) {
+                best = k;
+                br = r;
+            }
+        }
+        j = j + 1;
+    }
+    return best;
+}
+
+fn nv_bump(st: []u32, at: usize) -> void {
+    if (st[at] < NV_COUNT_CAP) { st[at] = st[at] + 1; }
+}
+
+/// Fold the HTTP status of a request sent with key i into the state, and say what it did. Key i becomes the
+/// current key in every case that moves one, so the next pick among equal keys starts after it.
+///   2xx      the key is current, a rate limit mark is cleared          NV_A_OK
+///   401/403  the key is dead for good                                  NV_A_DEAD
+///   429      the key is marked rate limited and goes last (stays live) NV_A_NEXT
+///   404      the model is not deployed for this account; no key moves  NV_A_MODEL
+///   0        no answer (network, timeout); no key moves                NV_A_NET
+///   other    a server error; no key moves                              NV_A_RETRY
+pub fn nv_on_status(st: []u32, i: u32, code: u32) -> u32 {
+    const n : u32 = st[NV_S_N];
+    if (i >= n) { return NV_A_NONE; }
+    const fl : usize = nv_at(i, NV_K_FLAGS);
+    if (code >= 200 and code < 300) {
+        nv_bump(st, nv_at(i, NV_K_OK));
+        if ((st[fl] / NV_F_RATED) % 2 == 1) { st[fl] = st[fl] - NV_F_RATED; }
+        st[NV_S_CUR] = i;
+        return NV_A_OK;
+    }
+    if (code == 401 or code == 403) {
+        st[fl] = st[fl] | NV_F_DEAD;
+        nv_bump(st, nv_at(i, NV_K_AUTH));
+        st[NV_S_CUR] = i;
+        return NV_A_DEAD;
+    }
+    if (code == 429) {
+        nv_bump(st, nv_at(i, NV_K_RATE));
+        st[fl] = st[fl] | NV_F_RATED;
+        st[NV_S_CUR] = i;
+        return NV_A_NEXT;
+    }
+    if (code == 404) { return NV_A_MODEL; }
+    if (code == 0) { return NV_A_NET; }
+    return NV_A_RETRY;
+}
+
+/// nv_on_status, and the answer time `ms` into key i's window: a 2xx puts its own time, no answer (0, the
+/// timeout) puts NV_LAT_CAP; every other answer (404, 429, 401/403, 5xx) leaves the window as it was.
+pub fn nv_on_answer(st: []u32, i: u32, code: u32, ms: u32) -> u32 {
+    const act : u32 = nv_on_status(st, i, code);
+    if (act == NV_A_OK) { nv_lat_note(st, i, ms); }
+    if (act == NV_A_NET) { nv_lat_note(st, i, NV_LAT_CAP); }
+    return act;
+}
+
+// ---- models --------------------------------------------------------------------------------------------
+
+/// Is the model on the dead list (it never answers on this account, so it is never sent)?
+pub fn nv_model_denied(model: []const u8) -> bool {
+    if (model.len == 0) { return false; }
+    var f : [96]u8 = undefined;
+    var k : u32 = 0;
+    var n : usize = csv_field(NV_DEAD_MODELS, 0, f[0..96]);
+    while (n > 0) {
+        if (same_bytes(f[0..n], model)) { return true; }
+        k = k + 1;
+        n = csv_field(NV_DEAD_MODELS, k, f[0..96]);
+    }
+    return false;
+}
+
+/// The model a request names: `want` unless it is empty or on the dead list, else NV_MODEL_DEFAULT.
+pub fn nv_model_for(want: []const u8, out: []u8) -> usize {
+    if (want.len == 0 or nv_model_denied(want)) { return put_bytes(out, 0, NV_MODEL_DEFAULT); }
+    return put_bytes(out, 0, want);
+}
+
+/// The model's short name for a status line: after the last '/', up to the first dash field that is a size
+/// (a digit then 'b' at its end: 550b, a55b). "nvidia/nemotron-3-ultra-550b-a55b" -> "nemotron-3-ultra".
+pub fn nv_model_short(model: []const u8, out: []u8) -> usize {
+    var a : usize = 0;
+    var i : usize = 0;
+    while (i < model.len) {
+        if (model[i] == 47) { a = i + 1; }
+        i = i + 1;
+    }
+    var end : usize = model.len;
+    var fs : usize = a;
+    var j : usize = a;
+    var stop : bool = false;
+    while (j <= model.len and stop == false) {
+        if (j == model.len or model[j] == 45) {
+            if (j >= fs + 2 and model[j - 1] == 98 and model[j - 2] >= 48 and model[j - 2] <= 57) {
+                end = fs;
+                if (end > a) { end = end - 1; }
+                stop = true;
+            }
+            fs = j + 1;
+        }
+        j = j + 1;
+    }
+    if (end <= a) { end = model.len; }
+    return put_bytes(out, 0, model[a .. end]);
+}
+
+/// The one-message body a check sends (out needs 160 bytes): one token of the model, no stream.
+pub fn nv_probe_body(model: []const u8, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "{\"model\":\"");
+    n = nv_model_for(model, out[n .. out.len]) + n;
+    n = put_bytes(out, n, "\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1,\"stream\":false}");
+    return n;
+}
+
+// ---- the state file ------------------------------------------------------------------------------------
+
+/// The state as text (out needs 64 + 100 per key): "nvidia-state v2 <n> <hash> <cur>" then one line per key,
+/// "<flags> <ok> <rate> <auth> <last ms> <samples> <next slot> <8 window ms>". No key and no part of one.
+pub fn nv_state_text(st: []const u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "nvidia-state v2 ");
+    n = put_dec(out, n, @as(u64, st[NV_S_N]));
+    out[n] = 32;
+    n = put_dec(out, n + 1, @as(u64, st[NV_S_HASH]));
+    out[n] = 32;
+    n = put_dec(out, n + 1, @as(u64, st[NV_S_CUR]));
+    out[n] = 10;
+    n = n + 1;
+    var i : u32 = 0;
+    while (i < st[NV_S_N]) {
+        var f : usize = 0;
+        while (f < NV_STRIDE) {
+            n = put_dec(out, n, @as(u64, st[nv_at(i, f)]));
+            if (f + 1 < NV_STRIDE) { out[n] = 32; } else { out[n] = 10; }
+            n = n + 1;
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// One decimal number at text[at] (spaces and newlines before it skipped): into v[0], the index after it;
+/// text.len + 1 when there is none or it does not fit 32 bits.
+fn nv_num(text: []const u8, at: usize, v: []u32) -> usize {
+    var i : usize = nv_skip_ws(text, at);
+    var x : u64 = 0;
+    const s : usize = i;
+    while (i < text.len and text[i] >= 48 and text[i] <= 57) {
+        x = x * 10 + @as(u64, text[i] - 48);
+        if (x > 4294967295) { return text.len + 1; }
+        i = i + 1;
+    }
+    if (i == s) { return text.len + 1; }
+    v[0] = @as(u32, @intCast(x));
+    return i;
+}
+
+/// Can field f of a saved key line hold v? Flags are DEAD and RATED only; a window count is at most NV_LAT_WIN,
+/// its next slot under it; answer times are at most NV_LAT_CAP. Anything else marks the file as broken.
+fn nv_field_ok(f: usize, v: u32) -> bool {
+    if (f == NV_K_FLAGS) { return v <= (NV_F_DEAD | NV_F_RATED); }
+    if (f == NV_K_LCNT) { return v <= @as(u32, @intCast(NV_LAT_WIN)); }
+    if (f == NV_K_LHEAD) { return v < @as(u32, @intCast(NV_LAT_WIN)); }
+    if (f == NV_K_LAST or f >= NV_K_LAT) { return v <= NV_LAT_CAP; }
+    return true;
+}
+
+/// Load a saved state for the list now in the Keychain (n keys, named by hash). True when the text is a
+/// whole state of that same list; otherwise st is a clean state for the list and false comes back. A v1 file
+/// (counters only, before answer times were kept) is read with empty windows; a field out of its range
+/// (nv_field_ok) makes the file broken.
+pub fn nv_state_load(text: []const u8, n: u32, hash: u32, st: []u32) -> bool {
+    nv_state_init(st, n, hash);
+    var fields : usize = NV_STRIDE;
+    if (begins_with(text, "nvidia-state v1 ")) {
+        fields = NV_STRIDE_V1;
+    } else if (begins_with(text, "nvidia-state v2 ") == false) {
+        return false;
+    }
+    var v : [2]u32 = undefined;
+    var i : usize = nv_num(text, 16, v[0..2]);
+    if (i > text.len or v[0] != st[NV_S_N]) { return false; }
+    i = nv_num(text, i, v[0..2]);
+    if (i > text.len or v[0] != hash) { return false; }
+    i = nv_num(text, i, v[0..2]);
+    if (i > text.len) { return false; }
+    var cur : u32 = v[0];
+    var tmp : [964]u32 = undefined;
+    var z : usize = 0;
+    while (z < NV_ST_LEN) {
+        tmp[z] = 0;
+        z = z + 1;
+    }
+    var k : u32 = 0;
+    while (k < st[NV_S_N]) {
+        var f : usize = 0;
+        while (f < fields) {
+            i = nv_num(text, i, v[0..2]);
+            if (i > text.len or nv_field_ok(f, v[0]) == false) { return false; }
+            tmp[nv_at(k, f)] = v[0];
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    if (cur >= st[NV_S_N]) { cur = 0; }
+    var c : usize = NV_HDR;
+    while (c < NV_HDR + @as(usize, st[NV_S_N]) * NV_STRIDE) {
+        st[c] = tmp[c];
+        c = c + 1;
+    }
+    st[NV_S_CUR] = cur;
+    return true;
+}
+
+// ---- the Keychain argument list -------------------------------------------------------------------------
+
+/// The login keychain under a home folder; `security` looks for it under $HOME when no keychain is named.
+pub const NV_KC_LOGIN : str = "/Library/Keychains/login.keychain-db";
+
+/// The argument words of the key list read (keys.t27 sec_argv READ for NV_KC_SERVICE / NV_KC_ACCOUNT); the count.
+/// `security` finds the default keychain through $HOME, so a process started with another HOME (a test run
+/// with HOME=/tmp/...) is answered 44, item not found, although the item is there. When `home` is not the
+/// user's own folder `user_home` (getpwuid), word 7 names <user_home>/Library/Keychains/login.keychain-db.
+/// An unknown user folder or a path that does not fit leaves the plain 7 words.
+pub fn nv_kc_argv(home: []const u8, user_home: []const u8, words: []u8, offs: []u32) -> u32 {
+    const argc : u32 = sec_argv(SEC_OP_READ, NV_KC_SERVICE, NV_KC_ACCOUNT, words, offs);
+    if (argc != 7 or user_home.len == 0 or same_bytes(home, user_home)) { return argc; }
+    const at : usize = @as(usize, offs[6]) + 3;
+    if (at + user_home.len + NV_KC_LOGIN.len + 1 > words.len or offs.len < 8) { return argc; }
+    offs[7] = @as(u32, @intCast(at));
+    var n : usize = put_bytes(words, at, user_home);
+    n = put_bytes(words, n, NV_KC_LOGIN);
+    words[n] = 0;
+    return 8;
+}
+
+// ---- the status line -----------------------------------------------------------------------------------
+
+/// The KEYS panel line (out needs 80 bytes): "NVIDIA: 34 keys, 33 live, model nemotron-3-ultra"; `listed` is what
+/// nv_parse said (NV_BAD: the item is not a key list). Numbers come from the state, the model from `model`.
+pub fn nv_status_line(st: []const u32, listed: u32, model: []const u8, out: []u8) -> usize {
+    if (listed == NV_BAD) {
+        var b : usize = put_bytes(out, 0, "NVIDIA: key list unreadable (Keychain ");
+        b = put_bytes(out, b, NV_KC_SERVICE);
+        return put_bytes(out, b, ")");
+    }
+    if (st[NV_S_N] == 0) {
+        var e : usize = put_bytes(out, 0, "NVIDIA: no keys (Keychain ");
+        e = put_bytes(out, e, NV_KC_SERVICE);
+        return put_bytes(out, e, ")");
+    }
+    var n : usize = put_bytes(out, 0, "NVIDIA: ");
+    n = put_dec(out, n, @as(u64, st[NV_S_N]));
+    if (st[NV_S_N] == 1) { n = put_bytes(out, n, " key, "); } else { n = put_bytes(out, n, " keys, "); }
+    n = put_dec(out, n, @as(u64, nv_live(st)));
+    n = put_bytes(out, n, " live, model ");
+    var m : [96]u8 = undefined;
+    const ml : usize = nv_model_for(model, m[0..96]);
+    var s : [96]u8 = undefined;
+    const sl : usize = nv_model_short(m[0..ml], s[0..96]);
+    return put_bytes(out, n, s[0..sl]);
+}
+
+// ---- tests (fake keys only) ----------------------------------------------------------------------------
+
+fn nv_key_is(json: []const u8, offs: []const u32, lens: []const u32, k: u32, want: []const u8) -> bool {
+    const o : usize = @as(usize, offs[k]);
+    return same_bytes(json[o .. o + @as(usize, lens[k])], want);
+}
+
+test an_empty_list_is_zero_keys_and_not_broken {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    assert nv_parse("{\"keys\":[]}", o[0..64], l[0..64], r[0..2]) == 0;
+    assert nv_parse(" { \"keys\" : [ ] } \n", o[0..64], l[0..64], r[0..2]) == 0;
+    assert r[0] == 0 and r[1] == 0;
+}
+
+test broken_json_is_bad {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    assert nv_parse("", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("[\"nvapi-test-a1\"]", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":[\"nvapi-test-a1\"", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":[\"nvapi-test-a1]}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":[\"nvapi-test-a1\" \"nvapi-test-b2\"]}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":[]} x", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":[],\"keys\":[]}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"other\":1}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+    assert nv_parse("{\"keys\":\"nvapi-test-a1\"}", o[0..64], l[0..64], r[0..2]) == NV_BAD;
+}
+
+test one_key_is_taken_with_its_prefix {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const j : str = "{\"keys\":[\"nvapi-test-0001\"]}";
+    assert nv_parse(j, o[0..64], l[0..64], r[0..2]) == 1;
+    assert nv_key_is(j, o[0..64], l[0..64], 0, "nvapi-test-0001");
+}
+
+test keys_without_the_prefix_or_with_inner_spaces_are_not_keys {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const j : str = "{\"keys\":[\"sk-test-1\",\"nvapi-\",\"nvapi-te st\",\"nvapi-test-a\\u0041\",7,null,\"nvapi-test-ok\"]}";
+    assert nv_parse(j, o[0..64], l[0..64], r[0..2]) == 1;
+    assert nv_key_is(j, o[0..64], l[0..64], 0, "nvapi-test-ok");
+    assert r[1] == 6 and r[0] == 0;
+}
+
+test spaces_around_and_inside_the_quotes_are_trimmed {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const j : str = "\n{ \"keys\" :\n [ \"  nvapi-test-a1 \" ,\t\"nvapi-test-b2\"\n ] }\n";
+    assert nv_parse(j, o[0..64], l[0..64], r[0..2]) == 2;
+    assert nv_key_is(j, o[0..64], l[0..64], 0, "nvapi-test-a1");
+    assert nv_key_is(j, o[0..64], l[0..64], 1, "nvapi-test-b2");
+}
+
+test repeats_are_dropped_and_counted {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const j : str = "{\"keys\":[\"nvapi-test-a1\",\"nvapi-test-b2\",\" nvapi-test-a1\",\"nvapi-test-b2\"]}";
+    assert nv_parse(j, o[0..64], l[0..64], r[0..2]) == 2;
+    assert r[0] == 2 and r[1] == 0;
+    assert nv_key_is(j, o[0..64], l[0..64], 1, "nvapi-test-b2");
+}
+
+test other_fields_are_skipped_in_any_order {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const j : str = "{\"note\":\"a ] } , string\",\"meta\":{\"n\":[1,{\"x\":\"]\"}]},\"keys\":[\"nvapi-test-a1\"],\"v\":true}";
+    assert nv_parse(j, o[0..64], l[0..64], r[0..2]) == 1;
+    assert nv_key_is(j, o[0..64], l[0..64], 0, "nvapi-test-a1");
+}
+
+test the_list_hash_follows_the_keys_and_their_order {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    const a : str = "{\"keys\":[\"nvapi-test-a1\",\"nvapi-test-b2\"]}";
+    const b : str = "{ \"keys\": [\"nvapi-test-a1\", \"nvapi-test-b2\"] }";
+    const c : str = "{\"keys\":[\"nvapi-test-b2\",\"nvapi-test-a1\"]}";
+    assert nv_parse(a, o[0..64], l[0..64], r[0..2]) == 2;
+    const ha : u32 = nv_list_hash(a, o[0..64], l[0..64], 2);
+    assert nv_parse(b, o[0..64], l[0..64], r[0..2]) == 2;
+    assert nv_list_hash(b, o[0..64], l[0..64], 2) == ha;
+    assert nv_parse(c, o[0..64], l[0..64], r[0..2]) == 2;
+    assert nv_list_hash(c, o[0..64], l[0..64], 2) != ha;
+}
+
+test the_pick_goes_round_from_the_key_after_the_current_one_and_skips_the_dead {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 4, 7);
+    assert nv_pick(st[0..964]) == 0;
+    st[nv_at(0, NV_K_FLAGS)] = NV_F_DEAD;
+    st[nv_at(1, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_pick(st[0..964]) == 2;
+    st[NV_S_CUR] = 2;
+    assert nv_pick(st[0..964]) == 3;
+    st[nv_at(3, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_pick(st[0..964]) == 2;
+    st[nv_at(2, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_pick(st[0..964]) == NV_NONE;
+    assert nv_live(st[0..964]) == 0;
+    nv_state_init(st[0..964], 0, 0);
+    assert nv_pick(st[0..964]) == NV_NONE;
+}
+
+test a_refused_key_dies_and_the_next_live_key_goes_next {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 3, 1);
+    assert nv_on_status(st[0..964], 0, 401) == NV_A_DEAD;
+    assert nv_dead(st[0..964], 0) and nv_pick(st[0..964]) == 1;
+    assert nv_on_status(st[0..964], 1, 403) == NV_A_DEAD;
+    assert nv_pick(st[0..964]) == 2 and nv_live(st[0..964]) == 1;
+    assert st[nv_at(1, NV_K_AUTH)] == 1;
+    // a dead key never comes back by an answer to another key
+    assert nv_on_status(st[0..964], 2, 200) == NV_A_OK;
+    assert nv_dead(st[0..964], 0) and nv_dead(st[0..964], 1) and nv_pick(st[0..964]) == 2;
+}
+
+test a_rate_limit_moves_to_the_next_key_and_keeps_this_one_live {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 3, 1);
+    st[NV_S_CUR] = 2;
+    assert nv_on_status(st[0..964], 2, 429) == NV_A_NEXT;
+    assert nv_pick(st[0..964]) == 0;
+    assert nv_dead(st[0..964], 2) == false and st[nv_at(2, NV_K_RATE)] == 1;
+    // the only live key stays current after a 429
+    st[nv_at(0, NV_K_FLAGS)] = NV_F_DEAD;
+    st[nv_at(1, NV_K_FLAGS)] = NV_F_DEAD;
+    st[NV_S_CUR] = 2;
+    assert nv_on_status(st[0..964], 2, 429) == NV_A_NEXT;
+    assert nv_pick(st[0..964]) == 2;
+}
+
+test model_network_and_server_errors_move_no_key {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 2, 1);
+    st[NV_S_CUR] = 1;
+    assert nv_on_status(st[0..964], 1, 404) == NV_A_MODEL;
+    assert nv_on_status(st[0..964], 1, 0) == NV_A_NET;
+    assert nv_on_status(st[0..964], 1, 500) == NV_A_RETRY;
+    assert nv_on_status(st[0..964], 1, 503) == NV_A_RETRY;
+    assert st[NV_S_CUR] == 1 and nv_live(st[0..964]) == 2;
+    assert nv_on_status(st[0..964], 5, 401) == NV_A_NONE;
+    assert nv_on_status(st[0..964], 1, 200) == NV_A_OK and st[nv_at(1, NV_K_OK)] == 1;
+}
+
+test answered_counts_only_keys_that_answered_and_ok_only_live_ones_with_a_2xx {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 4, 1);
+    // never sent: nothing checked, nothing known to work, yet all four are "live" (not dead)
+    assert nv_answered(st[0..964]) == 0 and nv_ok_keys(st[0..964]) == 0 and nv_live(st[0..964]) == 4;
+    // no answer, 404 and 5xx check nothing
+    assert nv_on_status(st[0..964], 0, 0) == NV_A_NET;
+    assert nv_on_status(st[0..964], 0, 404) == NV_A_MODEL;
+    assert nv_on_status(st[0..964], 0, 503) == NV_A_RETRY;
+    assert nv_answered(st[0..964]) == 0;
+    // 200, 429 and 401 each check one key; only the 200 one is ok
+    assert nv_on_status(st[0..964], 0, 200) == NV_A_OK;
+    assert nv_on_status(st[0..964], 1, 429) == NV_A_NEXT;
+    assert nv_on_status(st[0..964], 2, 401) == NV_A_DEAD;
+    assert nv_answered(st[0..964]) == 3 and nv_ok_keys(st[0..964]) == 1;
+    // a key that once answered 200 and then 401 is dead, not ok
+    assert nv_on_status(st[0..964], 0, 403) == NV_A_DEAD;
+    assert nv_answered(st[0..964]) == 3 and nv_ok_keys(st[0..964]) == 0;
+    nv_state_init(st[0..964], 0, 0);
+    assert nv_answered(st[0..964]) == 0 and nv_ok_keys(st[0..964]) == 0;
+}
+
+test the_dead_model_is_never_sent {
+    var m : [96]u8 = undefined;
+    assert nv_model_denied("deepseek-ai/deepseek-v4.1-flash");
+    assert nv_model_denied("deepseek-ai/deepseek-v4.1") == false;
+    assert nv_model_denied(NV_MODEL_DEFAULT) == false;
+    assert nv_model_denied("") == false;
+    var n : usize = nv_model_for("deepseek-ai/deepseek-v4.1-flash", m[0..96]);
+    assert same_bytes(m[0..n], "nvidia/nemotron-3-ultra-550b-a55b");
+    n = nv_model_for("", m[0..96]);
+    assert same_bytes(m[0..n], NV_MODEL_DEFAULT);
+    n = nv_model_for("z-ai/glm-5.3", m[0..96]);
+    assert same_bytes(m[0..n], "z-ai/glm-5.3");
+    var b : [200]u8 = undefined;
+    n = nv_probe_body("deepseek-ai/deepseek-v4.1-flash", b[0..200]);
+    assert begins_with(b[0..n], "{\"model\":\"nvidia/nemotron-3-ultra-550b-a55b\",\"messages\":");
+    assert b[n - 1] == 125;
+}
+
+test the_short_model_name_drops_the_vendor_and_the_sizes {
+    var s : [96]u8 = undefined;
+    var n : usize = nv_model_short("nvidia/nemotron-3-ultra-550b-a55b", s[0..96]);
+    assert same_bytes(s[0..n], "nemotron-3-ultra");
+    n = nv_model_short("z-ai/glm-5.3", s[0..96]);
+    assert same_bytes(s[0..n], "glm-5.3");
+    n = nv_model_short("plain", s[0..96]);
+    assert same_bytes(s[0..n], "plain");
+}
+
+test the_state_survives_a_restart_of_the_same_list_only {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 3, 77);
+    nv_on_status(st[0..964], 0, 403);
+    nv_on_status(st[0..964], 1, 429);
+    nv_on_answer(st[0..964], 2, 200, 800);
+    nv_on_answer(st[0..964], 2, 200, 900);
+    var t : [400]u8 = undefined;
+    const n : usize = nv_state_text(st[0..964], t[0..400]);
+    assert same_bytes(t[0..n], "nvidia-state v2 3 77 2\n1 0 0 1 0 0 0 0 0 0 0 0 0 0 0\n2 0 1 0 0 0 0 0 0 0 0 0 0 0 0\n0 2 0 0 900 2 2 800 900 0 0 0 0 0 0\n");
+    var back : [964]u32 = undefined;
+    assert nv_state_load(t[0..n], 3, 77, back[0..964]);
+    assert nv_pick(back[0..964]) == 2 and nv_live(back[0..964]) == 2 and back[nv_at(2, NV_K_OK)] == 2;
+    assert nv_dead(back[0..964], 0);
+    // another list (count or hash) or a cut file starts clean
+    assert nv_state_load(t[0..n], 4, 77, back[0..964]) == false;
+    assert nv_live(back[0..964]) == 4 and nv_pick(back[0..964]) == 0;
+    assert nv_state_load(t[0..n], 3, 78, back[0..964]) == false;
+    assert nv_state_load(t[0 .. n - 6], 3, 77, back[0..964]) == false;
+    assert nv_live(back[0..964]) == 3;
+    assert nv_state_load("", 3, 77, back[0..964]) == false;
+}
+
+test the_status_line_reads_the_numbers_from_the_state {
+    var st : [964]u32 = undefined;
+    var o : [96]u8 = undefined;
+    nv_state_init(st[0..964], 34, 5);
+    nv_on_status(st[0..964], 7, 401);
+    var n : usize = nv_status_line(st[0..964], 34, NV_MODEL_DEFAULT, o[0..96]);
+    assert same_bytes(o[0..n], "NVIDIA: 34 keys, 33 live, model nemotron-3-ultra");
+    n = nv_status_line(st[0..964], 34, "deepseek-ai/deepseek-v4.1-flash", o[0..96]);
+    assert same_bytes(o[0..n], "NVIDIA: 34 keys, 33 live, model nemotron-3-ultra");
+    nv_state_init(st[0..964], 1, 5);
+    n = nv_status_line(st[0..964], 1, NV_MODEL_DEFAULT, o[0..96]);
+    assert same_bytes(o[0..n], "NVIDIA: 1 key, 1 live, model nemotron-3-ultra");
+    nv_state_init(st[0..964], 0, 0);
+    n = nv_status_line(st[0..964], 0, NV_MODEL_DEFAULT, o[0..96]);
+    assert same_bytes(o[0..n], "NVIDIA: no keys (Keychain nvidia-api-keys)");
+    n = nv_status_line(st[0..964], NV_BAD, NV_MODEL_DEFAULT, o[0..96]);
+    assert same_bytes(o[0..n], "NVIDIA: key list unreadable (Keychain nvidia-api-keys)");
+    assert NV_CHAT_URL.len > 0;
+}
+
+test the_key_list_read_names_the_login_keychain_only_under_another_home {
+    var w : [256]u8 = undefined;
+    var o : [8]u32 = undefined;
+    var z : usize = 0;
+    while (z < 8) {
+        o[z] = 0;
+        z = z + 1;
+    }
+    var n : u32 = nv_kc_argv("/Users/a", "/Users/a", w[0..256], o[0..8]);
+    assert n == 7;
+    assert same_bytes(w[@as(usize, o[6]) .. @as(usize, o[6]) + 2], "-w");
+    n = nv_kc_argv("", "", w[0..256], o[0..8]);
+    assert n == 7;
+    n = nv_kc_argv("/tmp/nvchk/home", "/Users/a", w[0..256], o[0..8]);
+    assert n == 8;
+    const k : usize = @as(usize, o[7]);
+    assert same_bytes(w[k .. k + 44], "/Users/a/Library/Keychains/login.keychain-db");
+    assert w[k + 44] == 0;
+    assert same_bytes(w[@as(usize, o[3]) .. @as(usize, o[3]) + 15], "nvidia-api-keys");
+    n = nv_kc_argv("/tmp/h", "/Users/a", w[0..120], o[0..8]);
+    assert n == 7;
+}
+
+test nv_ws_is_space_tab_newline_and_return_only {
+    assert nv_ws(32) and nv_ws(9) and nv_ws(10) and nv_ws(13);
+    assert nv_ws(11) == false;
+    assert nv_ws(12) == false;
+    assert nv_ws(0) == false;
+    assert nv_ws(160) == false;
+    assert nv_ws(65) == false;
+    assert nv_ws(31) == false;
+    assert nv_ws(33) == false;
+}
+
+test nv_skip_ws_stops_at_the_first_other_byte_and_at_the_end {
+    assert nv_skip_ws("  \x09\x0a\x0d x", 0) == 6;
+    assert nv_skip_ws("x  ", 0) == 0;
+    assert nv_skip_ws("x  y", 1) == 3;
+    assert nv_skip_ws("   ", 0) == 3;
+    assert nv_skip_ws("", 0) == 0;
+    assert nv_skip_ws("ab", 2) == 2;
+    // a vertical tab is not blank
+    assert nv_skip_ws(" \x0b ", 0) == 1;
+}
+
+test nv_str_end_returns_the_index_after_the_closing_quote_and_honours_escapes {
+    assert nv_str_end("\"abc\"", 0) == 5;
+    assert nv_str_end("\"\"", 0) == 2;
+    assert nv_str_end("x\"ab\"y", 1) == 5;
+    // an escaped quote does not close the string
+    assert nv_str_end("\"a\\\"b\"", 0) == 6;
+    // an escaped backslash does, when a quote follows it
+    assert nv_str_end("\"a\\\\\"", 0) == 5;
+    // never closed, or a lone backslash at the end: len + 1
+    assert nv_str_end("\"abc", 0) == 5;
+    assert nv_str_end("\"ab\\", 0) == 5;
+    assert nv_str_end("\"", 0) == 2;
+    // Cyrillic bytes are plain bytes
+    assert nv_str_end("\"\xd0\xb0\xd0\xb1\"", 0) == 6;
+}
+
+test nv_value_end_finds_strings_nested_values_and_scalars_and_flags_broken_input {
+    assert nv_value_end("\"ab\",1", 0) == 4;
+    assert nv_value_end("{\"a\":1} x", 0) == 7;
+    assert nv_value_end("[1,[2,3],{\"k\":[4]}],", 0) == 19;
+    // braces and brackets inside a string do not count
+    assert nv_value_end("{\"a\":\"}]\"}z", 0) == 10;
+    assert nv_value_end("{\"a\":\"\\\"}\"}", 0) == 11;
+    // scalars end at a comma, a closing bracket or white space
+    assert nv_value_end("123,4", 0) == 3;
+    assert nv_value_end("true}", 0) == 4;
+    assert nv_value_end("null]", 0) == 4;
+    assert nv_value_end("12 3", 0) == 2;
+    assert nv_value_end("-1.5e3", 0) == 6;
+    // broken: past the end, empty scalar, truncated container, unclosed inner string
+    assert nv_value_end("abc", 3) == 4;
+    assert nv_value_end("abc", 9) == 4;
+    assert nv_value_end(",x", 0) == 3;
+    assert nv_value_end("{\"a\":1", 0) == 7;
+    assert nv_value_end("[[1]", 0) == 5;
+    assert nv_value_end("{\"a", 0) == 4;
+    assert nv_value_end("\"abc", 0) == 5;
+}
+
+test nv_seen_matches_only_equal_bytes_of_equal_length_among_the_first_count_keys {
+    const s : str = "nvapi-aa nvapi-bb nvapi-aa nvapi-a";
+    var o : [4]u32 = undefined;
+    var l : [4]u32 = undefined;
+    o[0] = 0; l[0] = 8;
+    o[1] = 9; l[1] = 8;
+    assert nv_seen(s, 18, 8, o[0..4], l[0..4], 2);
+    assert nv_seen(s, 18, 8, o[0..4], l[0..4], 1);
+    assert nv_seen(s, 9, 8, o[0..4], l[0..4], 2);
+    assert nv_seen(s, 9, 8, o[0..4], l[0..4], 1) == false;
+    assert nv_seen(s, 18, 8, o[0..4], l[0..4], 0) == false;
+    // same prefix but shorter: not the same key
+    assert nv_seen(s, 27, 7, o[0..4], l[0..4], 2) == false;
+    // differs in the last byte only
+    assert nv_seen("nvapi-aanvapi-ab", 8, 8, o[0..4], l[0..4], 1) == false;
+    assert nv_seen("nvapi-aanvapi-aa", 8, 8, o[0..4], l[0..4], 1);
+}
+
+test nv_take_trims_counts_repeats_and_refuses_what_is_not_a_key {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    r[0] = 0; r[1] = 0;
+    const s : str = "  nvapi-test-1\t nvapi-test-1 nvapi-a\\n nvapi- xx-test-12 nvapi-a b";
+    // trimmed, taken
+    assert nv_take(s, 0, 15, o[0..64], l[0..64], 0, r[0..2]) == 1;
+    assert o[0] == 2 and l[0] == 12 and r[0] == 0 and r[1] == 0;
+    // a repeat is dropped and counted
+    assert nv_take(s, 16, 28, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[0] == 1 and r[1] == 0;
+    // an escape inside refuses the element
+    assert nv_take(s, 29, 38, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[1] == 1;
+    // only the prefix (6 bytes) is too short
+    assert nv_take(s, 39, 45, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[1] == 2;
+    // wrong prefix
+    assert nv_take(s, 46, 56, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[1] == 3;
+    // an inner space does not fit
+    assert nv_take(s, 57, 66, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[1] == 4 and r[0] == 1;
+    // an all-blank element
+    assert nv_take("   ", 0, 3, o[0..64], l[0..64], 1, r[0..2]) == 1;
+    assert r[1] == 5;
+}
+
+test nv_take_refuses_a_key_over_the_length_cap_and_a_full_table {
+    var o : [64]u32 = undefined;
+    var l : [64]u32 = undefined;
+    var r : [2]u32 = undefined;
+    var big : [140]u8 = undefined;
+    var i : usize = 0;
+    while (i < 140) { big[i] = 97; i = i + 1; }
+    big[0] = 110; big[1] = 118; big[2] = 97; big[3] = 112; big[4] = 105; big[5] = 45;
+    r[0] = 0; r[1] = 0;
+    // the table starts empty: every slot an empty key at 0, so the repeat check reads only written words
+    i = 0;
+    while (i < 64) { o[i] = 0; l[i] = 0; i = i + 1; }
+    // exactly NV_KEY_MAX bytes fits, one more does not
+    assert nv_take(big[0..140], 0, 128, o[0..64], l[0..64], 0, r[0..2]) == 1;
+    assert l[0] == 128 and r[1] == 0;
+    assert nv_take(big[0..140], 0, 129, o[0..64], l[0..64], 0, r[0..2]) == 0;
+    assert r[1] == 1;
+    // the 65th key is over, not taken
+    assert nv_take(big[0..140], 0, 20, o[0..64], l[0..64], NV_MAX, r[0..2]) == NV_MAX;
+    assert r[1] == 2;
+    // output arrays shorter than the count are never written past
+    assert nv_take(big[0..140], 0, 20, o[0..1], l[0..1], 1, r[0..2]) == 1;
+    assert r[1] == 3;
+}
+
+test nv_live_from_wraps_round_and_skips_dead_keys {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 4, 1);
+    assert nv_live_from(st[0..964], 0) == 0;
+    st[nv_at(1, NV_K_FLAGS)] = NV_F_DEAD;
+    st[nv_at(2, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_live_from(st[0..964], 1) == 3;
+    assert nv_live_from(st[0..964], 3) == 3;
+    // the start index wraps modulo the count
+    assert nv_live_from(st[0..964], 4) == 0;
+    assert nv_live_from(st[0..964], 6) == 3;
+    st[nv_at(0, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_live_from(st[0..964], 1) == 3;
+    st[nv_at(3, NV_K_FLAGS)] = NV_F_DEAD;
+    assert nv_live_from(st[0..964], 0) == NV_NONE;
+    nv_state_init(st[0..964], 0, 1);
+    assert nv_live_from(st[0..964], 0) == NV_NONE;
+}
+
+test nv_bump_counts_up_and_stops_at_the_cap {
+    var st : [8]u32 = undefined;
+    st[0] = 7; st[1] = 8; st[7] = 9;
+    st[2] = 0; st[3] = 41; st[4] = NV_COUNT_CAP - 1; st[5] = NV_COUNT_CAP; st[6] = 4294967295;
+    nv_bump(st[0..8], 2);
+    nv_bump(st[0..8], 3);
+    nv_bump(st[0..8], 4);
+    nv_bump(st[0..8], 5);
+    nv_bump(st[0..8], 6);
+    assert st[2] == 1 and st[3] == 42;
+    assert st[4] == NV_COUNT_CAP;
+    assert st[5] == NV_COUNT_CAP;
+    assert st[6] == 4294967295;
+    // the words around the bumped ones are never touched
+    assert st[0] == 7 and st[1] == 8 and st[7] == 9;
+}
+
+test nv_num_reads_one_decimal_and_flags_missing_or_oversize_numbers {
+    var v : [2]u32 = undefined;
+    v[0] = 99;
+    assert nv_num("  42 7", 0, v[0..2]) == 4;
+    assert v[0] == 42;
+    assert nv_num("  42 7", 4, v[0..2]) == 6;
+    assert v[0] == 7;
+    assert nv_num("\x0a\x0d\x090", 0, v[0..2]) == 4;
+    assert v[0] == 0;
+    assert nv_num("4294967295", 0, v[0..2]) == 10;
+    assert v[0] == 4294967295;
+    // a number is a run of digits only: it stops at a letter or a minus
+    assert nv_num("12ab", 0, v[0..2]) == 2;
+    assert v[0] == 12;
+    // none or too big: len + 1, v untouched
+    v[0] = 5;
+    assert nv_num("   ", 0, v[0..2]) == 4;
+    assert nv_num("", 0, v[0..2]) == 1;
+    assert nv_num("-3", 0, v[0..2]) == 3;
+    assert nv_num("x", 0, v[0..2]) == 2;
+    assert nv_num("4294967296", 0, v[0..2]) == 11;
+    assert nv_num("99999999999999999999", 0, v[0..2]) == 21;
+    assert v[0] == 5;
+}
+
+test nv_take_trims_a_leading_tab_as_well_as_spaces {
+    var o : [4]u32 = undefined;
+    var l : [4]u32 = undefined;
+    var r : [2]u32 = undefined;
+    r[0] = 0; r[1] = 0;
+    assert nv_take(" \x09nvapi-test-9", 0, 14, o[0..4], l[0..4], 0, r[0..2]) == 1;
+    assert o[0] == 2 and l[0] == 12 and r[1] == 0;
+}
+
+// ---- answer times and the fast pick (fake times only) ---------------------------------------------------
+
+fn nv_t_window(st: []const u32, i: u32) -> u32 {
+    return st[nv_at(i, NV_K_LCNT)];
+}
+
+test one_request_waits_15_s_and_no_answer_counts_as_15000_ms {
+    assert NV_TIMEOUT_S == 15;
+    assert NV_LAT_CAP == NV_TIMEOUT_S * 1000;
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 2, 1);
+    assert nv_on_answer(st[0..964], 0, 0, 3) == NV_A_NET;
+    assert st[nv_at(0, NV_K_LAST)] == 15000 and nv_median(st[0..964], 0) == 15000;
+    // a 2xx slower than the cap is cut at it
+    assert nv_on_answer(st[0..964], 1, 200, 24830) == NV_A_OK;
+    assert st[nv_at(1, NV_K_LAST)] == 15000 and nv_median(st[0..964], 1) == 15000;
+}
+
+test the_fast_key_of_three_is_picked_whatever_the_current_key {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 3, 1);
+    nv_on_answer(st[0..964], 0, 200, 2710);
+    nv_on_answer(st[0..964], 1, 200, 780);
+    nv_on_answer(st[0..964], 2, 200, 4600);
+    st[NV_S_CUR] = 0;
+    assert nv_pick(st[0..964]) == 1;
+    st[NV_S_CUR] = 1;
+    assert nv_pick(st[0..964]) == 1;
+    st[NV_S_CUR] = 2;
+    assert nv_pick(st[0..964]) == 1;
+    // its answers keep it first; a slower answer that lifts its median past key 0 moves the pick
+    assert nv_on_answer(st[0..964], 1, 200, 820) == NV_A_OK and nv_pick(st[0..964]) == 1;
+    nv_on_answer(st[0..964], 1, 200, 9000);
+    nv_on_answer(st[0..964], 1, 200, 9000);
+    assert nv_median(st[0..964], 1) == 4910 and nv_pick(st[0..964]) == 0;
+}
+
+test equal_medians_take_turns {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 3, 1);
+    nv_on_answer(st[0..964], 0, 200, 800);
+    nv_on_answer(st[0..964], 1, 200, 850);
+    nv_on_answer(st[0..964], 2, 200, 820);
+    // 800, 850 and 820 are one 100 ms step: equal
+    assert nv_rank(st[0..964], 0) == nv_rank(st[0..964], 1) and nv_rank(st[0..964], 1) == nv_rank(st[0..964], 2);
+    var seen : [4]u32 = undefined;
+    var r : usize = 0;
+    while (r < 4) {
+        const k : u32 = nv_pick(st[0..964]);
+        seen[r] = k;
+        nv_on_answer(st[0..964], k, 200, 810);
+        r = r + 1;
+    }
+    assert seen[0] == 0 and seen[1] == 1 and seen[2] == 2 and seen[3] == 0;
+}
+
+test slow_keys_go_last_after_the_new_ones {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 4, 1);
+    nv_on_answer(st[0..964], 0, 200, 6000);
+    nv_on_answer(st[0..964], 2, 200, 4900);
+    nv_on_answer(st[0..964], 3, 200, 14000);
+    st[NV_S_CUR] = 3;
+    assert nv_rank(st[0..964], 0) > nv_rank(st[0..964], 1);
+    assert nv_pick(st[0..964]) == 2;
+    st[nv_at(2, NV_K_FLAGS)] = NV_F_DEAD;
+    // never measured before slow
+    assert nv_pick(st[0..964]) == 1;
+    st[nv_at(1, NV_K_FLAGS)] = NV_F_DEAD;
+    // of two slow keys the less slow one
+    assert nv_pick(st[0..964]) == 0;
+    // a rate limited key goes after the slow ones
+    assert nv_on_answer(st[0..964], 0, 429, 300) == NV_A_NEXT;
+    assert nv_pick(st[0..964]) == 3;
+    assert nv_on_answer(st[0..964], 0, 200, 6000) == NV_A_OK and nv_pick(st[0..964]) == 0;
+}
+
+test the_route_that_hung_once_comes_back_when_it_answers_fast {
+    // measured 2026-10-23: one key 24.83 s, then 0.82 and 1.36 s on the same key
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 2, 1);
+    nv_on_answer(st[0..964], 0, 200, 24830);
+    nv_on_answer(st[0..964], 1, 200, 2710);
+    assert nv_pick(st[0..964]) == 1;
+    nv_on_answer(st[0..964], 0, 200, 820);
+    nv_on_answer(st[0..964], 0, 200, 1360);
+    assert nv_median(st[0..964], 0) == 1360 and nv_pick(st[0..964]) == 0;
+}
+
+test the_median_keeps_the_last_8_answers {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 1, 1);
+    assert nv_median(st[0..964], 0) == 0 and nv_rank(st[0..964], 0) == NV_T_NEW * 1000;
+    nv_lat_note(st[0..964], 0, 900);
+    assert nv_median(st[0..964], 0) == 900;
+    nv_lat_note(st[0..964], 0, 100);
+    assert nv_median(st[0..964], 0) == 500;
+    nv_lat_note(st[0..964], 0, 300);
+    assert nv_median(st[0..964], 0) == 300;
+    nv_lat_note(st[0..964], 0, 700);
+    nv_lat_note(st[0..964], 0, 500);
+    nv_lat_note(st[0..964], 0, 200);
+    nv_lat_note(st[0..964], 0, 800);
+    nv_lat_note(st[0..964], 0, 600);
+    // 900 100 300 700 500 200 800 600: the middle two are 500 and 600
+    assert nv_t_window(st[0..964], 0) == 8 and nv_median(st[0..964], 0) == 550;
+    // the ninth pushes out the first (900): 100 200 300 500 600 700 800 50
+    nv_lat_note(st[0..964], 0, 50);
+    assert nv_t_window(st[0..964], 0) == 8 and nv_median(st[0..964], 0) == 400;
+    assert st[nv_at(0, NV_K_LAST)] == 50 and st[nv_at(0, NV_K_LHEAD)] == 1;
+    // eight more replace the whole window
+    var r : usize = 0;
+    while (r < 8) {
+        nv_lat_note(st[0..964], 0, 3000);
+        r = r + 1;
+    }
+    assert nv_median(st[0..964], 0) == 3000 and nv_t_window(st[0..964], 0) == 8;
+    nv_lat_note(st[0..964], 7, 10);
+    assert nv_median(st[0..964], 7) == 0;
+}
+
+test errors_other_than_no_answer_leave_the_median {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 2, 1);
+    nv_on_answer(st[0..964], 0, 200, 700);
+    assert nv_on_answer(st[0..964], 0, 500, 14000) == NV_A_RETRY;
+    assert nv_on_answer(st[0..964], 0, 503, 14000) == NV_A_RETRY;
+    assert nv_on_answer(st[0..964], 0, 404, 14000) == NV_A_MODEL;
+    assert nv_on_answer(st[0..964], 0, 429, 14000) == NV_A_NEXT;
+    assert nv_t_window(st[0..964], 0) == 1 and nv_median(st[0..964], 0) == 700 and st[nv_at(0, NV_K_LAST)] == 700;
+    assert nv_on_answer(st[0..964], 1, 401, 300) == NV_A_DEAD and nv_t_window(st[0..964], 1) == 0;
+    assert nv_on_answer(st[0..964], 0, 204, 1100) == NV_A_OK and nv_median(st[0..964], 0) == 900;
+}
+
+test the_answer_times_survive_a_restart_and_a_v1_file_still_loads {
+    var st : [964]u32 = undefined;
+    nv_state_init(st[0..964], 2, 9);
+    nv_on_answer(st[0..964], 1, 200, 640);
+    nv_on_answer(st[0..964], 1, 200, 1200);
+    nv_on_answer(st[0..964], 0, 0, 15000);
+    var t : [600]u8 = undefined;
+    const n : usize = nv_state_text(st[0..964], t[0..600]);
+    var back : [964]u32 = undefined;
+    assert nv_state_load(t[0..n], 2, 9, back[0..964]);
+    assert nv_median(back[0..964], 1) == 920 and nv_median(back[0..964], 0) == 15000;
+    assert nv_pick(back[0..964]) == 1;
+    // the counters-only file of before: dead flags kept, windows empty
+    assert nv_state_load("nvidia-state v1 2 9 1\n1 0 0 1\n0 4 0 0\n", 2, 9, back[0..964]);
+    assert nv_dead(back[0..964], 0) and back[nv_at(1, NV_K_OK)] == 4 and nv_t_window(back[0..964], 1) == 0;
+}
+
+test a_broken_state_file_starts_again {
+    var st : [964]u32 = undefined;
+    const ok : str = "nvidia-state v2 2 5 1\n0 1 0 0 700 1 1 700 0 0 0 0 0 0 0\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+    assert nv_state_load(ok, 2, 5, st[0..964]);
+    assert nv_median(st[0..964], 0) == 700;
+    // flags past DEAD and RATED, a window count over 8, a next slot of 8, a time over the cap, a word, v3, junk
+    assert nv_state_load("nvidia-state v2 2 5 1\n4 1 0 0 700 1 1 700 0 0 0 0 0 0 0\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("nvidia-state v2 2 5 1\n0 1 0 0 700 9 1 700 0 0 0 0 0 0 0\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("nvidia-state v2 2 5 1\n0 1 0 0 700 1 8 700 0 0 0 0 0 0 0\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("nvidia-state v2 2 5 1\n0 1 0 0 700 1 1 700 0 0 0 0 0 0 0\n0 0 0 0 0 1 1 99999 0 0 0 0 0 0 0\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("nvidia-state v2 2 5 1\n0 1 0 0 x 1 1 700 0 0 0 0 0 0 0\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("nvidia-state v3 2 5 1\n", 2, 5, st[0..964]) == false;
+    assert nv_state_load("\xff\x00nvidia", 2, 5, st[0..964]) == false;
+    // a v2 header with v1 lines is cut, not read as answer times
+    assert nv_state_load("nvidia-state v2 2 5 1\n0 1 0 0\n0 0 0 0\n", 2, 5, st[0..964]) == false;
+    // each refusal leaves a clean state of the list now in the Keychain
+    assert nv_live(st[0..964]) == 2 and nv_t_window(st[0..964], 0) == 0 and nv_median(st[0..964], 0) == 0;
+    assert st[NV_S_N] == 2 and st[NV_S_HASH] == 5 and nv_pick(st[0..964]) == 0;
+}

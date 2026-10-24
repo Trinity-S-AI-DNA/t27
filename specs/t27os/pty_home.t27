@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/pty_home.t27 -- the pane server in HOME, the decisions (owner, 2026-10-23).
+// The Claude Code hooks (session_store hooks_json), the launchd job of the update poll and the swap (release.t27
+// check_cmd, swap_cmd) all name ~/.t27os/t27os-pty. Only the swap and a hand copy put it there, so after the update
+// 7119 -> 7122 the hooks said "sh: $HOME/.t27os/t27os-pty: No such file or directory" and the window found no
+// server until the owner copied the file by hand. Now every start of the app makes ~/.t27os/t27os-pty the copy of
+// the server its own bundle carries, once, before the pane server is first started: inside the bundle
+// (Contents/MacOS/t27os-pty, the one this build was made with), else beside the .app. The file is written as
+// ~/.t27os/t27os-pty.new (O_CREAT | O_EXCL | O_NOFOLLOW, then fchmod 0700) and renamed over; a destination that
+// is a link or not a plain file is refused and left alone; a source under /tmp is not used. The host half is
+// pty_home_host.t27; every decision is here, tested without the OS. ASCII only (L3).
+
+module T27osPtyHome;
+
+use t27os::term_pane::tp_server_dirs;
+
+pub const PH_NAME : str = "t27os-pty";
+/// The mode of the copy and of ~/.t27os: the owner's alone (0700).
+pub const PH_MODE : u32 = 448;
+/// O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW: a new file, never a link's target, never an old file's content.
+pub const PH_WFLAGS : i32 = 2817;
+/// O_RDONLY | O_NOFOLLOW: the destination is read for the comparison without following a link.
+pub const PH_RFLAGS : i32 = 256;
+/// A pane server larger than this is not a pane server (it is 170 KB on build 7123).
+pub const PH_MAX_SIZE : u64 = 67108864;
+pub const PH_CHUNK : usize = 65536;
+
+// what a path is (lstat st_mode & S_IFMT)
+pub const PH_K_NONE : u32 = 0;
+pub const PH_K_FILE : u32 = 1;
+pub const PH_K_LINK : u32 = 2;
+pub const PH_K_DIR : u32 = 3;
+pub const PH_K_OTHER : u32 = 4;
+
+/// The kind of a path from its st_mode; `exists` false when lstat failed.
+pub fn ph_kind(exists: bool, mode: u32) -> u32 {
+    if (!exists) { return PH_K_NONE; }
+    const t : u32 = mode & 61440;
+    if (t == 32768) { return PH_K_FILE; }
+    if (t == 40960) { return PH_K_LINK; }
+    if (t == 16384) { return PH_K_DIR; }
+    return PH_K_OTHER;
+}
+
+// where the copy comes from
+pub const PH_SRC_NONE : u32 = 0;
+pub const PH_SRC_INSIDE : u32 = 1;
+pub const PH_SRC_BESIDE : u32 = 2;
+
+/// The server inside the bundle wins (it is the one this build was made with; the swap moves only the .app, so the
+/// one beside it may be a build older); the one beside the .app is the fallback for a bundle that carries none.
+pub fn ph_src_pick(inside_ok: bool, beside_ok: bool) -> u32 {
+    if (inside_ok) { return PH_SRC_INSIDE; }
+    if (beside_ok) { return PH_SRC_BESIDE; }
+    return PH_SRC_NONE;
+}
+
+/// A source candidate is usable: a plain file, not empty, not larger than PH_MAX_SIZE.
+pub fn ph_src_usable(kind: u32, size: u64) -> bool {
+    return kind == PH_K_FILE and size > 0 and size <= PH_MAX_SIZE;
+}
+
+fn ph_starts(s: []const u8, n: usize, p: []const u8) -> bool {
+    if (n < p.len) { return false; }
+    var i : usize = 0;
+    while (i < p.len) {
+        if (s[i] != p[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A path the copy may come from: absolute, printable ASCII, no "..", not under /tmp or /private/tmp (a file
+/// anyone can put there is never what the app runs).
+pub fn ph_src_fit(s: []const u8, n: usize) -> bool {
+    if (n < 2 or n > 480 or s[0] != 47) { return false; }
+    if (ph_starts(s, n, "/tmp/") or ph_starts(s, n, "/private/tmp/")) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (s[i] < 32 or s[i] > 126) { return false; }
+        if (i + 1 < n and s[i] == 46 and s[i + 1] == 46) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// what the start does with ~/.t27os/t27os-pty
+pub const PH_KEEP : u32 = 0;
+pub const PH_COPY : u32 = 1;
+pub const PH_CHMOD : u32 = 2;
+pub const PH_REFUSE : u32 = 3;
+
+/// The action for a destination of kind dk (size ds, permission bits dmode & 4095) and a source of size ss;
+/// `same` is the byte comparison, read only when the sizes match. Missing: copy. A link or anything but a plain
+/// file: refuse (never followed, never replaced). Other bytes: copy. The same bytes with another mode: chmod 0700.
+pub fn ph_action(dk: u32, ds: u64, dmode: u32, ss: u64, same: bool) -> u32 {
+    if (dk == PH_K_NONE) { return PH_COPY; }
+    if (dk != PH_K_FILE) { return PH_REFUSE; }
+    if (ds != ss or !same) { return PH_COPY; }
+    if ((dmode & 4095) != PH_MODE) { return PH_CHMOD; }
+    return PH_KEEP;
+}
+
+/// The access mode of open(2) flags f: 0 read only, 1 write only, 2 both.
+pub fn ph_access(f: i32) -> i32 { return f & 3; }
+
+/// True when open(2) flags f carry every bit of `bit` (O_NOFOLLOW 256, O_CREAT 512, O_TRUNC 1024, O_EXCL 2048).
+pub fn ph_flag(f: i32, bit: i32) -> bool { return (f & bit) == bit; }
+
+/// The permission bits mode m gives the group and the others: none for the copy and ~/.t27os (the owner's alone).
+pub fn ph_others(m: u32) -> u32 { return m & 63; }
+
+/// The bytes must be compared only when both sizes match (otherwise the answer is already COPY or REFUSE).
+pub fn ph_compare_due(dk: u32, ds: u64, ss: u64) -> bool { return dk == PH_K_FILE and ds == ss; }
+
+/// ~/.t27os must be a directory (not a link to one) before anything is written in it.
+pub fn ph_dir_ok(kind: u32) -> bool { return kind == PH_K_DIR; }
+
+fn ph_cp(out: []u8, at: usize, s: []const u8, n: usize) -> usize {
+    var p : usize = at;
+    var i : usize = 0;
+    while (i < n and p < out.len) { out[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+
+/// home + suffix + NUL into out; the length without the NUL, 0 when it does not fit.
+pub fn ph_join(home: []const u8, hn: usize, suffix: []const u8, out: []u8) -> usize {
+    if (hn == 0 or hn + suffix.len + 1 > out.len) { return 0; }
+    var p : usize = ph_cp(out, 0, home, hn);
+    p = ph_cp(out, p, suffix, suffix.len);
+    out[p] = 0;
+    return p;
+}
+
+/// The two source candidates of the executable path exe: inside (Contents/MacOS/t27os-pty) and beside (the folder
+/// that holds the .app). Each NUL-terminated; a length 0 when the path does not fit.
+pub fn ph_src_paths(exe: []const u8, inside: []u8, beside: []u8) -> [2]usize {
+    var r : [2]usize = undefined;
+    r[0] = 0;
+    r[1] = 0;
+    var bd : [512]u8 = undefined;
+    var ed : [512]u8 = undefined;
+    const bn : usize = tp_server_dirs(exe, bd[0..512], ed[0..512]);
+    if (bn == 0) { return r; }
+    var en : usize = exe.len;
+    while (en > 0 and exe[en - 1] != 47) { en = en - 1; }
+    if (en > 0) { en = en - 1; }
+    r[0] = ph_join(ed[0..512], en, "/t27os-pty", inside);
+    r[1] = ph_join(bd[0..512], bn, "/t27os-pty", beside);
+    return r;
+}
+
+// results of one start (pty_home_host ph_ensure)
+pub const PR_KEPT : u32 = 0;
+pub const PR_COPIED : u32 = 1;
+pub const PR_CHMOD : u32 = 2;
+pub const PR_NO_SOURCE : u32 = 3;
+pub const PR_LINK : u32 = 4;
+pub const PR_NOT_FILE : u32 = 5;
+pub const PR_NO_DIR : u32 = 6;
+pub const PR_WRITE_FAILED : u32 = 7;
+
+/// The result for a refused destination of kind dk.
+pub fn ph_refuse_reason(dk: u32) -> u32 {
+    if (dk == PH_K_LINK) { return PR_LINK; }
+    return PR_NOT_FILE;
+}
+
+/// The word of a result in the log line.
+pub fn ph_word(r: u32) -> str {
+    if (r == PR_KEPT) { return "up to date"; }
+    if (r == PR_COPIED) { return "copied"; }
+    if (r == PR_CHMOD) { return "mode set to 0700"; }
+    if (r == PR_NO_SOURCE) { return "not copied: no server in or beside the bundle"; }
+    if (r == PR_LINK) { return "refused: it is a link, left alone"; }
+    if (r == PR_NOT_FILE) { return "refused: not a plain file, left alone"; }
+    if (r == PR_NO_DIR) { return "refused: ~/.t27os is not a directory"; }
+    return "not copied: write failed";
+}
+
+fn ph_dec(out: []u8, at: usize, v: u64) -> usize {
+    var t : [20]u8 = undefined;
+    var k : usize = 0;
+    var x : u64 = v;
+    if (x == 0) { t[0] = 48; k = 1; }
+    while (x > 0) { t[k] = @as(u8, @intCast(48 + x % 10)); x = x / 10; k = k + 1; }
+    var p : usize = at;
+    while (k > 0 and p < out.len) { k = k - 1; out[p] = t[k]; p = p + 1; }
+    return p;
+}
+
+/// The one log line of the start (no newline): "pane server ~/.t27os/t27os-pty: <word> (<bytes> bytes from
+/// inside|beside the bundle, <ms> ms)"; the size and the source only when a source was found.
+pub fn ph_line(out: []u8, r: u32, src: u32, size: u64, ms: u64) -> usize {
+    const w : str = ph_word(r);
+    var p : usize = ph_cp(out, 0, "pane server ~/.t27os/t27os-pty: ", 32);
+    p = ph_cp(out, p, w, w.len);
+    p = ph_cp(out, p, " (", 2);
+    if (src != PH_SRC_NONE) {
+        p = ph_dec(out, p, size);
+        p = ph_cp(out, p, " bytes from ", 12);
+        if (src == PH_SRC_INSIDE) { p = ph_cp(out, p, "inside", 6); } else { p = ph_cp(out, p, "beside", 6); }
+        p = ph_cp(out, p, " the bundle, ", 13);
+    }
+    p = ph_dec(out, p, ms);
+    return ph_cp(out, p, " ms)", 4);
+}
+
+fn ph_has(s: []const u8, n: usize, w: []const u8) -> bool {
+    var i : usize = 0;
+    while (i + w.len <= n) {
+        var j : usize = 0;
+        while (j < w.len and s[i + j] == w[j]) { j = j + 1; }
+        if (j == w.len) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+test ph_a_missing_server_is_copied_and_a_link_is_never_followed {
+    // missing: copy (a mutant that keeps it fails here)
+    assert ph_action(PH_K_NONE, 0, 0, 170576, false) == PH_COPY;
+    // a link or a folder in its place: refused, whatever the sizes say
+    assert ph_action(PH_K_LINK, 170576, 493, 170576, true) == PH_REFUSE;
+    assert ph_action(PH_K_DIR, 0, 448, 170576, false) == PH_REFUSE;
+    assert ph_action(PH_K_OTHER, 0, 448, 170576, false) == PH_REFUSE;
+    assert ph_refuse_reason(PH_K_LINK) == PR_LINK and ph_refuse_reason(PH_K_DIR) == PR_NOT_FILE;
+    // another size or other bytes (an older build): copy
+    assert ph_action(PH_K_FILE, 170000, 448, 170576, false) == PH_COPY;
+    assert ph_action(PH_K_FILE, 170576, 448, 170576, false) == PH_COPY;
+    // the same bytes: kept at 0700, tightened from anything else (0755 of a hand copy, 0644)
+    assert ph_action(PH_K_FILE, 170576, 33216, 170576, true) == PH_KEEP;
+    assert ph_action(PH_K_FILE, 170576, 33261, 170576, true) == PH_CHMOD;
+    assert ph_action(PH_K_FILE, 170576, 420, 170576, true) == PH_CHMOD;
+    // the bytes are read only when it can matter
+    assert ph_compare_due(PH_K_FILE, 5, 5) and ph_compare_due(PH_K_FILE, 5, 6) == false;
+    assert ph_compare_due(PH_K_LINK, 5, 5) == false and ph_compare_due(PH_K_NONE, 0, 0) == false;
+}
+
+test ph_kinds_from_st_mode {
+    assert ph_kind(false, 33216) == PH_K_NONE;
+    assert ph_kind(true, 33216) == PH_K_FILE;
+    assert ph_kind(true, 41453) == PH_K_LINK;
+    assert ph_kind(true, 16832) == PH_K_DIR;
+    assert ph_kind(true, 49645) == PH_K_OTHER;
+    assert ph_dir_ok(PH_K_DIR) and ph_dir_ok(PH_K_LINK) == false and ph_dir_ok(PH_K_NONE) == false;
+}
+
+test ph_the_copy_is_0700_new_never_through_a_link {
+    // the owner's alone: no bit for the group or the others, and one such bit is seen
+    assert PH_MODE == 448 and ph_others(PH_MODE) == 0;
+    assert ph_others(PH_MODE | 4) == 4 and ph_others(PH_MODE | 32) == 32;
+    // write only, create, exclusive, no link followed, never truncated
+    assert ph_access(PH_WFLAGS) == 1;
+    assert ph_flag(PH_WFLAGS, 512) and ph_flag(PH_WFLAGS, 2048) and ph_flag(PH_WFLAGS, 256);
+    assert ph_flag(PH_WFLAGS, 1024) == false;
+    // the comparison read: read only, no link followed, nothing created
+    assert PH_RFLAGS == 256 and ph_access(PH_RFLAGS) == 0 and ph_flag(PH_RFLAGS, 256);
+    assert ph_flag(PH_RFLAGS, 512) == false and ph_flag(PH_RFLAGS, 2048) == false;
+    // the same 0700 decides ph_action: the same bytes under another mode are put back to 0700
+    assert ph_action(PH_K_FILE, 10, PH_MODE, 10, true) == PH_KEEP;
+    assert ph_action(PH_K_FILE, 10, PH_MODE | 4, 10, true) == PH_CHMOD;
+}
+
+test ph_the_server_inside_the_bundle_wins_then_the_one_beside_it {
+    assert ph_src_pick(true, true) == PH_SRC_INSIDE;
+    assert ph_src_pick(true, false) == PH_SRC_INSIDE;
+    assert ph_src_pick(false, true) == PH_SRC_BESIDE;
+    assert ph_src_pick(false, false) == PH_SRC_NONE;
+    assert ph_src_usable(PH_K_FILE, 170576) and ph_src_usable(PH_K_FILE, 0) == false;
+    assert ph_src_usable(PH_K_LINK, 170576) == false and ph_src_usable(PH_K_DIR, 96) == false;
+    assert ph_src_usable(PH_K_FILE, PH_MAX_SIZE + 1) == false;
+    var a : [512]u8 = undefined;
+    var b : [512]u8 = undefined;
+    const r : [2]usize = ph_src_paths("/Users/x/.t27os-safe/app/T27OS/T27OS.app/Contents/MacOS/T27OS", a[0..512], b[0..512]);
+    assert r[0] == 65 and ph_has(a[0..512], r[0], "/T27OS.app/Contents/MacOS/t27os-pty") and a[r[0]] == 0;
+    assert r[1] == 40 and ph_has(b[0..512], r[1], "/Users/x/.t27os-safe/app/T27OS/t27os-pty") and b[r[1]] == 0;
+    const r2 : [2]usize = ph_src_paths("T27OS", a[0..512], b[0..512]);
+    assert r2[0] == 0 and r2[1] == 0;
+}
+
+test ph_a_source_under_tmp_or_with_dots_is_not_used {
+    assert ph_src_fit("/Users/x/T27OS/t27os-pty", 24);
+    assert ph_src_fit("/tmp/relaunch/t27os-pty", 23) == false;
+    assert ph_src_fit("/private/tmp/relaunch/t27os-pty", 31) == false;
+    assert ph_src_fit("/Users/x/../tmp/t27os-pty", 25) == false;
+    assert ph_src_fit("relative/t27os-pty", 18) == false;
+    assert ph_src_fit("/Users/x/tmp/t27os-pty", 22);
+}
+
+test ph_the_paths_join_home_and_end_in_a_nul {
+    var o : [64]u8 = undefined;
+    const n : usize = ph_join("/Users/x", 8, "/.t27os/t27os-pty", o[0..64]);
+    assert n == 25 and o[25] == 0 and o[8] == 47;
+    assert ph_join("/Users/x", 8, "/.t27os/t27os-pty", o[0..20]) == 0;
+    assert ph_join("", 0, "/.t27os", o[0..64]) == 0;
+}
+
+test ph_one_log_line_says_what_happened {
+    var o : [200]u8 = undefined;
+    const n : usize = ph_line(o[0..200], PR_COPIED, PH_SRC_INSIDE, 170576, 3);
+    assert ph_has(o[0..200], n, "pane server ~/.t27os/t27os-pty: copied (170576 bytes from inside the bundle, 3 ms)");
+    assert n == 82;
+    const n2 : usize = ph_line(o[0..200], PR_NO_SOURCE, PH_SRC_NONE, 0, 0);
+    assert ph_has(o[0..200], n2, "not copied: no server in or beside the bundle (0 ms)");
+    const n3 : usize = ph_line(o[0..200], PR_LINK, PH_SRC_BESIDE, 7, 12);
+    assert ph_has(o[0..200], n3, "refused: it is a link, left alone (7 bytes from beside the bundle, 12 ms)");
+    // no line has a newline in it: the caller adds one
+    var i : usize = 0;
+    while (i < n) { assert o[i] != 10; i = i + 1; }
+}

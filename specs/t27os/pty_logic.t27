@@ -152,6 +152,11 @@ use t27os::keys::TI_DEFAULT;
 use t27os::keys::profile_var_text_step;
 use t27os::keys::setkey_provider;
 use t27os::keys::setkey_number;
+use t27os::keys::key_fp;
+use t27os::keys::key_health;
+use t27os::keys::health_pack;
+use t27os::keys::HL_DEAD;
+use t27os::keys::HEALTH_DEAD_HOLD_S;
 use t27os::editors::TERM_COUNT;
 use t27os::editors::TERM_NONE;
 use t27os::editors::TERM_PATH_MAX;
@@ -189,8 +194,9 @@ pub const G_CFD : usize = 232;
 pub const G_CLEN : usize = 240;
 /// Each pane's last RESIZE, two panes per word (pty_proto ws_pack); 8 words cover MAX_PANES.
 pub const G_WINSZ : usize = 248;
-/// The table grew from 256 to 512 words for the key rotation (gHashTag/t27#11241): per key slot of every
-/// provider (PROVIDER_COUNT * MAX_KEYS = 72) when it was last used (ms) and until when it rests (s, KEY_NEVER
+/// The table grew from 256 to 512 words for the key rotation (gHashTag/t27#11241), and to 1024 when MAX_KEYS went
+/// from 8 to 16 (the owner's 11 z.ai keys, 2026-10-23): per key slot of every provider (PROVIDER_COUNT * MAX_KEYS
+/// = 144) when it was last used (ms) and until when it rests (s, KEY_NEVER
 /// for a slot that holds no key), then PK words per pane: the key numbers the pane holds, its profile, its bad
 /// provider mask, its failover count, the key to skip at the next launch, the time until which its screen
 /// is not read (after a give-up) and its restore state (W_*). Key slot (p, k) is word p * MAX_KEYS + k.
@@ -208,9 +214,9 @@ pub const G_MSTEP : usize = 229;
 /// Word 230 was free; the connection tables begin at G_CFD.
 pub const G_AGENTS : usize = 230;
 pub const G_KLAST : usize = 256;
-pub const G_KREST : usize = 328;
-pub const G_PANEK : usize = 400;
-pub const KEY_SLOTS : usize = 72;
+pub const G_KREST : usize = 400;
+pub const G_PANEK : usize = 544;
+pub const KEY_SLOTS : usize = 144;
 pub const PK : usize = 7;
 pub const PK_KEYS : usize = 0;
 pub const PK_PROF : usize = 1;
@@ -239,7 +245,7 @@ pub const SCAN_GRACE_MS : u64 = 10000;
 /// After a give-up the pane's screen is read again only after this long, so one error row on screen is not
 /// answered with a line in the scrollback at every redraw.
 pub const GIVEUP_QUIET_MS : u64 = 60000;
-pub const ST_SIZE : usize = 512;
+pub const ST_SIZE : usize = 1024;
 pub const MAX_CONNS : usize = 8;
 
 pub const SID_CAP : usize = 64;
@@ -264,12 +270,12 @@ pub const O_RING : usize = 98304;
 /// and up to CARRY_CAP bytes, CARRY_SLOT apart) and the scratch where a chunk's plain text is built.
 pub const O_KEYS : usize = 1146880;
 pub const KEY_CAP : usize = 256;
-pub const O_CARRY : usize = 1165312;
+pub const O_CARRY : usize = 1183744;
 pub const CARRY_CAP : usize = 128;
 pub const CARRY_SLOT : usize = 132;
-pub const O_SCAN : usize = 1167424;
+pub const O_SCAN : usize = 1185856;
 pub const SCAN_CAP : usize = 4232;
-pub const MEM_SIZE : usize = 1171712;
+pub const MEM_SIZE : usize = 1190144;
 pub const TICK_MS : i32 = 500;
 pub const SIGHUP_RING : u64 = 65536;
 
@@ -598,16 +604,115 @@ pub fn key_put(st: []u64, p: u32, k: u32, present: bool, same: bool) -> void {
     st[G_KREST + ix] = 0;
 }
 
+// ---- a key the window took back stays out (keys.t27 key health, 2026-10-22) ----
+// The window takes a key back from the server (an empty OP_SETKEY) when its check answered 401 or 403. The
+// server reads the Keychain itself (load_keys, at its start and at a keyless spawn), and that read used to put
+// the dead key straight back. So an emptied slot remembers what it held: the fingerprint of the key (keys.t27
+// key_fp, never the key) and its health word, in the slot's own bytes after the length byte (0 = empty). A read
+// skips a key whose fingerprint matches while keys.t27 key_health calls it dead (24 h); another key, or the same
+// key after the hold, is read as before, and any key the window sends clears the hold.
+pub const HOLD_FP_AT : usize = 1;
+pub const HOLD_W_AT : usize = 9;
+
+fn slot_u64(slot: []const u8, at: usize) -> u64 {
+    var v : u64 = 0;
+    var b : usize = 0;
+    while (b < 8) {
+        v = v * 256 + @as(u64, slot[at + 7 - b]);
+        b = b + 1;
+    }
+    return v;
+}
+
+fn slot_put_u64(slot: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    var b : usize = 0;
+    while (b < 8) {
+        slot[at + b] = @as(u8, @intCast(x % 256));
+        x = x / 256;
+        b = b + 1;
+    }
+}
+
+/// Mark an emptied slot (length byte 0) as holding back the key with fingerprint `fp`, health word `w`.
+pub fn hold_set(slot: []u8, fp: u64, w: u64) -> void {
+    if (slot.len < HOLD_W_AT + 8 or slot[0] != 0) { return; }
+    slot_put_u64(slot, HOLD_FP_AT, fp);
+    slot_put_u64(slot, HOLD_W_AT, w);
+}
+
+/// Does a Keychain read of a key with fingerprint `fp` at `now_s` stay out of this slot?
+pub fn load_held(slot: []const u8, fp: u64, now_s: u64) -> bool {
+    if (slot.len < HOLD_W_AT + 8 or slot[0] != 0 or fp == 0) { return false; }
+    const hfp : u64 = slot_u64(slot, HOLD_FP_AT);
+    if (hfp == 0) { return false; }
+    return key_health(slot_u64(slot, HOLD_W_AT), hfp, fp, now_s) == HL_DEAD;
+}
+
+/// Is a key held back in this slot at `now_s` (any key that matches would stay out)?
+pub fn slot_held(slot: []const u8, now_s: u64) -> bool {
+    if (slot.len < HOLD_W_AT + 8) { return false; }
+    return load_held(slot, slot_u64(slot, HOLD_FP_AT), now_s);
+}
+
+/// The line a new claude pane gets in its scrollback: it starts with no profile while keys of its chain are held
+/// back as dead (keys.t27 NO_LIVE_KEYS), so it says why instead of a silent login screen.
+pub fn no_live_note(a: u32, prof: u64, held: u32) -> bool {
+    return profile_agent(a) and prof >= @as(u64, PROFILE_COUNT) and held > 0;
+}
+
+test a_dead_key_taken_back_is_not_read_again_until_it_changes_or_the_hold_ends {
+    const t : u64 = 1800000000;
+    var slot : [256]u8 = undefined;
+    var i : usize = 0;
+    while (i < 256) {
+        slot[i] = 0;
+        i = i + 1;
+    }
+    const fp : u64 = key_fp("sk-test-0000-dead");
+    // an empty slot that holds nothing back takes any key
+    assert load_held(slot[0..256], fp, t) == false;
+    assert slot_held(slot[0..256], t) == false;
+    hold_set(slot[0..256], fp, health_pack(t, 401));
+    assert load_held(slot[0..256], fp, t + 60);
+    assert slot_held(slot[0..256], t + 60);
+    // a new key in the Keychain is read
+    assert load_held(slot[0..256], key_fp("sk-test-0000-new1"), t + 60) == false;
+    // the hold ends after 24 h
+    assert load_held(slot[0..256], fp, t + HEALTH_DEAD_HOLD_S) == false;
+    // a slot that holds a key is never held back, and a hold is not written over a key
+    slot[0] = 5;
+    assert load_held(slot[0..256], fp, t + 60) == false;
+    var full : [256]u8 = undefined;
+    i = 0;
+    while (i < 256) {
+        full[i] = 0;
+        i = i + 1;
+    }
+    full[0] = 3;
+    hold_set(full[0..256], fp, health_pack(t, 401));
+    assert full[HOLD_FP_AT] == 0;
+}
+
+test a_claude_pane_with_only_dead_keys_says_so {
+    assert no_live_note(0, 255, 1);
+    assert no_live_note(0, 255, 0) == false;
+    assert no_live_note(0, 0, 3) == false;
+    assert no_live_note(1, 255, 3) == false;
+}
+
 /// The key of provider p a new pane takes (MAX_KEYS when it holds none); `skip` is a key not to take.
 pub fn key_pick(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
     const at : usize = key_index(p, 0);
-    return rotate_pick_soft(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
+    const e : usize = @as(usize, MAX_KEYS);
+    return rotate_pick_soft(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + e], st[G_KREST + at .. G_KREST + at + e], now_ms / 1000);
 }
 
 /// A key of provider p that is usable right now and is not `skip` (MAX_KEYS when none): the test for a swap.
 pub fn key_pick_free(st: []const u64, p: u32, skip: u32, now_ms: u64) -> u32 {
     const at : usize = key_index(p, 0);
-    return rotate_pick_except(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + 8], st[G_KREST + at .. G_KREST + at + 8], now_ms / 1000);
+    const e : usize = @as(usize, MAX_KEYS);
+    return rotate_pick_except(MAX_KEYS, skip, st[G_KLAST + at .. G_KLAST + at + e], st[G_KREST + at .. G_KREST + at + e], now_ms / 1000);
 }
 
 /// Every key of provider p is free again: a rest was earned on the model a pane ran, and the next model of the
@@ -632,14 +737,27 @@ pub fn key_rest(st: []u64, p: u32, k: u32, until_s: u64) -> void {
     if (until_s > st[ix]) { st[ix] = until_s; }
 }
 
-/// The key number + 1 pane i holds for provider p (0 = none): one nibble per provider.
+/// The key number + 1 pane i holds for provider p (0 = none): five bits per provider (0 to MAX_KEYS = 16 does
+/// not fit a nibble), nine providers in 45 bits of the word.
+pub const PANE_KEY_BASE : u64 = 32;
+
+fn pow32(n: u32) -> u64 {
+    var m : u64 = 1;
+    var j : u32 = 0;
+    while (j < n) {
+        m = m * PANE_KEY_BASE;
+        j = j + 1;
+    }
+    return m;
+}
+
 pub fn pane_key_get(st: []const u64, i: usize, p: u32) -> u32 {
-    return @as(u32, @intCast(st[G_PANEK + i * PK + PK_KEYS] / pow16(p) % 16));
+    return @as(u32, @intCast(st[G_PANEK + i * PK + PK_KEYS] / pow32(p) % PANE_KEY_BASE));
 }
 
 pub fn pane_key_set(st: []u64, i: usize, p: u32, v: u32) -> void {
     const at : usize = G_PANEK + i * PK + PK_KEYS;
-    const m : u64 = pow16(p);
+    const m : u64 = pow32(p);
     st[at] = st[at] - @as(u64, pane_key_get(st, i, p)) * m + @as(u64, v) * m;
 }
 
@@ -701,10 +819,15 @@ pub fn list_shown(st: []const u64, i: usize, a: u32, shown: u32, now_ms: u64) ->
     return shown_with_light(shown, pane_light(st, i, a, now_ms));
 }
 
-/// The flags byte of a LIST entry with the pane's key number + 1 in its high nibble (0 to 8). Bits 0 to 2 are
-/// list_flags as before, so a client that reads only those is not disturbed.
+/// The flags byte of a LIST entry with the pane's key number + 1 (0 to MAX_KEYS = 16): its low four bits in the
+/// high nibble as before, its fifth bit (16, key 16 only) in bit 3, which list_flags leaves free. Bits 0 to 2 are
+/// list_flags as before, so a client that reads only those is not disturbed; list_key_of reads the number back.
 pub fn list_flags_key(live: bool, w: u32, key1: u32) -> u32 {
-    return list_flags(live, w) + 16 * key1;
+    return list_flags(live, w) + 16 * (key1 % 16) + 8 * (key1 / 16 % 2);
+}
+
+pub fn list_key_of(flags: u32) -> u32 {
+    return flags / 16 % 16 + 16 * (flags / 8 % 2);
 }
 
 /// Choose the keys of pane i about to launch (agent a, `now_ms`): fills the pane's key numbers and profile
@@ -1349,7 +1472,7 @@ test an_editor_pane_survives_a_restart_in_its_record {
 
 fn t_table(st: []u64) -> void {
     var z : usize = 0;
-    while (z < 512) {
+    while (z < 1024) {
         st[z] = 0;
         z = z + 1;
     }
@@ -1374,7 +1497,7 @@ fn t_zai3(st: []u64) -> void {
     t_key(st, P_ANTHROPIC, 0);
 }
 
-test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
+test the_server_tables_and_the_arena_line_up_for_sixteen_keys_a_provider {
     assert KEY_SLOTS == @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS);
     assert G_KLAST + KEY_SLOTS <= G_KREST;
     assert G_KREST + KEY_SLOTS <= G_PANEK;
@@ -1388,265 +1511,267 @@ test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
     assert MAX_PANES <= 16;
     assert 16 * PF <= G_LISTEN;
     assert key_slot(0, 0) == O_KEYS;
-    assert key_slot(4, 2) == O_KEYS + (4 * 8 + 2) * KEY_CAP;
+    assert key_slot(4, 2) == O_KEYS + (4 * 16 + 2) * KEY_CAP;
     assert key_slot(PROVIDER_COUNT - 1, MAX_KEYS - 1) + KEY_CAP <= O_CARRY;
     assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
     assert O_SCAN + SCAN_CAP <= MEM_SIZE;
     assert CARRY_SLOT == CARRY_CAP + 4;
     assert SCAN_CAP >= CARRY_CAP + 4096 + 2;
-    assert MAX_KEYS <= 8;
+    assert MAX_KEYS == 16;
+    assert @as(u64, MAX_KEYS) < PANE_KEY_BASE;
+    assert pow32(PROVIDER_COUNT) < 1 << 62;
 }
 
 test an_empty_table_holds_no_key_and_a_put_fills_one_slot {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    assert keys_stored(st[0..512]) == 0;
-    assert key_count(st[0..512], P_ZAI) == 0;
-    assert key_present(st[0..512], P_ZAI, 3) == false;
-    t_key(st[0..512], P_ZAI, 3);
-    assert key_present(st[0..512], P_ZAI, 3);
-    assert key_count(st[0..512], P_ZAI) == 1;
-    assert keys_stored(st[0..512]) == 16;
-    t_key(st[0..512], P_OPENAI, 7);
-    assert keys_stored(st[0..512]) == 18;
-    key_put(st[0..512], P_ZAI, 3, false, false);
-    assert keys_stored(st[0..512]) == 2;
-    assert st[G_KREST + 4 * 8 + 3] == KEY_NEVER;
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    assert keys_stored(st[0..1024]) == 0;
+    assert key_count(st[0..1024], P_ZAI) == 0;
+    assert key_present(st[0..1024], P_ZAI, 3) == false;
+    t_key(st[0..1024], P_ZAI, 3);
+    assert key_present(st[0..1024], P_ZAI, 3);
+    assert key_count(st[0..1024], P_ZAI) == 1;
+    assert keys_stored(st[0..1024]) == 16;
+    t_key(st[0..1024], P_OPENAI, 7);
+    assert keys_stored(st[0..1024]) == 18;
+    key_put(st[0..1024], P_ZAI, 3, false, false);
+    assert keys_stored(st[0..1024]) == 2;
+    assert st[G_KREST + key_index(P_ZAI, 3)] == KEY_NEVER;
 }
 
 test sending_the_same_key_again_keeps_its_cooldown_and_a_new_key_starts_fresh {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    key_used(st[0..512], P_ZAI, 0, 777);
-    key_rest(st[0..512], P_ZAI, 0, 5000);
-    key_put(st[0..512], P_ZAI, 0, true, true);
-    assert st[G_KREST + 32] == 5000;
-    assert st[G_KLAST + 32] == 777;
-    key_put(st[0..512], P_ZAI, 0, true, false);
-    assert st[G_KREST + 32] == 0;
-    assert st[G_KLAST + 32] == 0;
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    key_used(st[0..1024], P_ZAI, 0, 777);
+    key_rest(st[0..1024], P_ZAI, 0, 5000);
+    key_put(st[0..1024], P_ZAI, 0, true, true);
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 5000;
+    assert st[G_KLAST + key_index(P_ZAI, 0)] == 777;
+    key_put(st[0..1024], P_ZAI, 0, true, false);
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 0;
+    assert st[G_KLAST + key_index(P_ZAI, 0)] == 0;
     // a rest never shortens, and an empty slot never gets one
-    key_rest(st[0..512], P_ZAI, 0, 900);
-    key_rest(st[0..512], P_ZAI, 0, 400);
-    assert st[G_KREST + 32] == 900;
-    key_rest(st[0..512], P_ZAI, 1, 900);
-    assert st[G_KREST + 33] == KEY_NEVER;
+    key_rest(st[0..1024], P_ZAI, 0, 900);
+    key_rest(st[0..1024], P_ZAI, 0, 400);
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 900;
+    key_rest(st[0..1024], P_ZAI, 1, 900);
+    assert st[G_KREST + key_index(P_ZAI, 1)] == KEY_NEVER;
 }
 
 test new_claude_panes_take_the_z_ai_keys_in_rotation {
-    var st : [512]u64 = undefined;
-    t_zai3(st[0..512]);
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
     var n : usize = 0;
     var want : [4]u32 = [1, 2, 3, 1];
     while (n < 4) {
-        plan_pane_keys(st[0..512], n, 0, 1000000 + @as(u64, n) * 100);
-        assert t_prof(st[0..512], n) == PR_ZAI;
-        assert pane_key_get(st[0..512], n, P_ZAI) == want[n];
-        assert pane_key_get(st[0..512], n, P_ANTHROPIC) == 0;
-        assert pane_key_shown(st[0..512], n, 0) == want[n];
+        plan_pane_keys(st[0..1024], n, 0, 1000000 + @as(u64, n) * 100);
+        assert t_prof(st[0..1024], n) == PR_ZAI;
+        assert pane_key_get(st[0..1024], n, P_ZAI) == want[n];
+        assert pane_key_get(st[0..1024], n, P_ANTHROPIC) == 0;
+        assert pane_key_shown(st[0..1024], n, 0) == want[n];
         n = n + 1;
     }
     // a key that rests is passed over
-    key_rest(st[0..512], P_ZAI, 1, 2000);
-    plan_pane_keys(st[0..512], 5, 0, 1000500);
-    assert pane_key_get(st[0..512], 5, P_ZAI) == 3;
+    key_rest(st[0..1024], P_ZAI, 1, 2000);
+    plan_pane_keys(st[0..1024], 5, 0, 1000500);
+    assert pane_key_get(st[0..1024], 5, P_ZAI) == 3;
     // every key resting: the one whose rest ends first
-    key_rest(st[0..512], P_ZAI, 0, 3000);
-    key_rest(st[0..512], P_ZAI, 2, 2500);
-    plan_pane_keys(st[0..512], 6, 0, 1000600);
-    assert pane_key_get(st[0..512], 6, P_ZAI) == 2;
+    key_rest(st[0..1024], P_ZAI, 0, 3000);
+    key_rest(st[0..1024], P_ZAI, 2, 2500);
+    plan_pane_keys(st[0..1024], 6, 0, 1000600);
+    assert pane_key_get(st[0..1024], 6, P_ZAI) == 2;
 }
 
 test every_other_agent_gets_a_key_of_each_provider_it_reads {
-    var st : [512]u64 = undefined;
-    t_zai3(st[0..512]);
-    t_key(st[0..512], P_OPENAI, 0);
-    t_key(st[0..512], P_OPENAI, 1);
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
+    t_key(st[0..1024], P_OPENAI, 0);
+    t_key(st[0..1024], P_OPENAI, 1);
     // Aider (cell 7) reads Anthropic, OpenAI, Gemini, OpenRouter: OpenRouter holds none
-    plan_pane_keys(st[0..512], 0, 7, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
-    assert pane_key_get(st[0..512], 0, P_OPENAI) == 1;
-    assert pane_key_get(st[0..512], 0, 3) == 0;
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    plan_pane_keys(st[0..1024], 0, 7, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ANTHROPIC) == 1;
+    assert pane_key_get(st[0..1024], 0, P_OPENAI) == 1;
+    assert pane_key_get(st[0..1024], 0, 3) == 0;
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 0;
     // Codex (cell 1) reads OpenAI only, and takes the key used longest ago
-    plan_pane_keys(st[0..512], 1, 1, 1000100);
-    assert pane_key_get(st[0..512], 1, P_OPENAI) == 2;
-    assert pane_key_get(st[0..512], 1, P_ANTHROPIC) == 0;
-    assert pane_key_shown(st[0..512], 1, 1) == 2;
+    plan_pane_keys(st[0..1024], 1, 1, 1000100);
+    assert pane_key_get(st[0..1024], 1, P_OPENAI) == 2;
+    assert pane_key_get(st[0..1024], 1, P_ANTHROPIC) == 0;
+    assert pane_key_shown(st[0..1024], 1, 1) == 2;
     // Crush (cell 5) takes the profile chain now (gHashTag/t27#11275): the z.ai profile with a z.ai key, no OpenAI one
-    plan_pane_keys(st[0..512], 2, 5, 1000200);
-    assert pane_key_get(st[0..512], 2, P_ZAI) > 0;
-    assert pane_key_get(st[0..512], 2, P_OPENAI) == 0;
-    assert t_prof(st[0..512], 2) == PR_ZAI;
+    plan_pane_keys(st[0..1024], 2, 5, 1000200);
+    assert pane_key_get(st[0..1024], 2, P_ZAI) > 0;
+    assert pane_key_get(st[0..1024], 2, P_OPENAI) == 0;
+    assert t_prof(st[0..1024], 2) == PR_ZAI;
     // a shell and an editor read none; an agent with no key of its provider gets nothing
-    plan_pane_keys(st[0..512], 3, 9, 1000300);
-    assert pane_key_shown(st[0..512], 3, 9) == 0;
+    plan_pane_keys(st[0..1024], 3, 9, 1000300);
+    assert pane_key_shown(st[0..1024], 3, 9) == 0;
     assert st[G_PANEK + 3 * PK + PK_KEYS] == 0;
-    plan_pane_keys(st[0..512], 4, 2, 1000400);
-    assert pane_key_shown(st[0..512], 4, 2) == 0;
+    plan_pane_keys(st[0..1024], 4, 2, 1000400);
+    assert pane_key_shown(st[0..1024], 4, 2) == 0;
     // the key numbers of one pane do not touch another's
-    assert pane_key_get(st[0..512], 0, P_OPENAI) == 1;
+    assert pane_key_get(st[0..1024], 0, P_OPENAI) == 1;
 }
 
 test an_overloaded_key_swaps_to_the_next_key_rests_and_is_passed_over_by_other_panes {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_zai3(st[0..512]);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
-    const act : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
+    t_zai3(st[0..1024]);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
+    const act : u32 = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
     assert act == FA_RESPAWN_KEY;
-    assert st[G_KREST + 32] == 1005 + 60;
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 1005 + 60;
     assert st[G_PANEK + PK_SKIP] == 1;
     assert st[G_PANEK + PK_DONE] == 1;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai overloaded (529), same profile with the next key");
-    plan_pane_keys(st[0..512], 0, 0, 1006000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    plan_pane_keys(st[0..1024], 0, 0, 1006000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 2;
     assert st[G_PANEK + PK_SKIP] == 0;
     // another pane started meanwhile does not take the resting key
-    plan_pane_keys(st[0..512], 1, 0, 1010000);
-    assert pane_key_get(st[0..512], 1, P_ZAI) == 3;
+    plan_pane_keys(st[0..1024], 1, 0, 1010000);
+    assert pane_key_get(st[0..1024], 1, P_ZAI) == 3;
     // and a rate limit rests the key for thirty seconds
-    const b : u32 = plan_failover(st[0..512], 1, FC_RATE_LIMITED, 1011000, why[0..128], wl[0..2]);
+    const b : u32 = plan_failover(st[0..1024], 1, FC_RATE_LIMITED, 1011000, why[0..128], wl[0..2]);
     assert b == FA_RESPAWN_KEY;
-    assert st[G_KREST + 34] == 1011 + 30;
+    assert st[G_KREST + key_index(P_ZAI, 2)] == 1011 + 30;
 }
 
 test when_every_z_ai_key_is_overloaded_the_pane_takes_the_next_model_then_the_next_profile_then_gives_up {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_zai3(st[0..512]);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
-    var a : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1001000, why[0..128], wl[0..2]);
+    t_zai3(st[0..1024]);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
+    var a : u32 = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1001000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 0, 1001500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1002000, why[0..128], wl[0..2]);
+    plan_pane_keys(st[0..1024], 0, 0, 1001500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 2;
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1002000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 0, 1002500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    plan_pane_keys(st[0..1024], 0, 0, 1002500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 3;
     // the third key is overloaded too and the other two still rest: no key is left on the first model, so
     // the pane takes the second model of the tier, and every key is free again for it
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1003000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1003000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_MODEL;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
-    assert pane_mstep_get(st[0..512], 0) == 1;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
+    assert pane_mstep_get(st[0..1024], 0) == 1;
     assert st[G_PANEK + PK_BAD] == 0;
-    assert st[G_KREST + 32] == 0 and st[G_KREST + 33] == 0 and st[G_KREST + 34] == 0;
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 0 and st[G_KREST + key_index(P_ZAI, 1)] == 0 and st[G_KREST + key_index(P_ZAI, 2)] == 0;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai overloaded (529), every key tried, same profile on the next model");
-    plan_pane_keys(st[0..512], 0, 0, 1003500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    plan_pane_keys(st[0..1024], 0, 0, 1003500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
     // the same walk over the keys on the second model
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1004000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1004000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 0, 1004500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
+    plan_pane_keys(st[0..1024], 0, 0, 1004500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 2;
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1005000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 0, 1005500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    plan_pane_keys(st[0..1024], 0, 0, 1005500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 3;
     // every key failed on the last model of the tier: next profile, z.ai marked bad, the model step is 0 again
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_mstep_get(st[0..512], 0) == 0;
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..1024], 0) == 0;
     assert st[G_PANEK + PK_BAD] == 16;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai overloaded (529), respawn on anthropic-api");
-    plan_pane_keys(st[0..512], 0, 0, 1006500);
-    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    plan_pane_keys(st[0..1024], 0, 0, 1006500);
+    assert pane_key_get(st[0..1024], 0, P_ANTHROPIC) == 1;
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 0;
     // the Anthropic key is overloaded: no profile is left, the pane stays and its screen is not read for a minute
-    a = plan_failover(st[0..512], 0, FC_OVERLOADED, 1007000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1007000, why[0..128], wl[0..2]);
     assert a == FA_GIVE_UP;
     assert st[G_PANEK + PK_DONE] == 6;
     assert st[G_PANEK + PK_STOP] == 1007000 + GIVEUP_QUIET_MS;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "no profile left in the chain");
-    assert scan_ready(st[0..512], 0, 1006500, 1020000) == false;
-    assert scan_ready(st[0..512], 0, 1006500, 1067001);
+    assert scan_ready(st[0..1024], 0, 1006500, 1020000) == false;
+    assert scan_ready(st[0..1024], 0, 1006500, 1067001);
 }
 
 test an_empty_balance_swaps_to_the_next_key_and_the_key_rests_ten_minutes {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_zai3(st[0..512]);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    const a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1005000, why[0..128], wl[0..2]);
+    t_zai3(st[0..1024]);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    const a : u32 = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1005000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    assert st[G_KREST + 32] == 1005 + 600;
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 1005 + 600;
     assert st[G_PANEK + PK_BAD] == 0;
     assert st[G_PANEK + PK_SKIP] == 1;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "zai out of balance, same profile with the next key");
     // the failure cap ends any loop
     st[G_PANEK + PK_DONE] = @as(u64, MAX_FAILOVERS);
-    const g : u32 = plan_failover(st[0..512], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
+    const g : u32 = plan_failover(st[0..1024], 0, FC_OVERLOADED, 1006000, why[0..128], wl[0..2]);
     assert g == FA_GIVE_UP;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "failover limit reached");
 }
 
 test a_pane_that_started_without_a_key_takes_the_first_stored_profile_on_a_subscription_row {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_table(st[0..512]);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_prof(st[0..512], 0) == PR_NONE;
-    assert pane_key_shown(st[0..512], 0, 0) == 0;
+    t_table(st[0..1024]);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_NONE;
+    assert pane_key_shown(st[0..1024], 0, 0) == 0;
     // nothing stored: nothing to move to
-    assert plan_failover(st[0..512], 0, FC_SUBSCRIPTION, 1001000, why[0..128], wl[0..2]) == FA_GIVE_UP;
+    assert plan_failover(st[0..1024], 0, FC_SUBSCRIPTION, 1001000, why[0..128], wl[0..2]) == FA_GIVE_UP;
     // the window's keys arrive; the pane asks again after its quiet time
-    t_key(st[0..512], P_ZAI, 4);
+    t_key(st[0..1024], P_ZAI, 4);
     st[G_PANEK + PK_STOP] = 0;
-    const a : u32 = plan_failover(st[0..512], 0, FC_SUBSCRIPTION, 1002000, why[0..128], wl[0..2]);
+    const a : u32 = plan_failover(st[0..1024], 0, FC_SUBSCRIPTION, 1002000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "no profile subscription disabled, respawn on zai");
-    plan_pane_keys(st[0..512], 0, 0, 1003000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 5;
+    plan_pane_keys(st[0..1024], 0, 0, 1003000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 5;
 }
 
 test a_new_spawn_starts_with_a_clean_pane_record {
-    var st : [512]u64 = undefined;
-    t_zai3(st[0..512]);
-    plan_pane_keys(st[0..512], 2, 0, 1000000);
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
+    plan_pane_keys(st[0..1024], 2, 0, 1000000);
     st[G_PANEK + 2 * PK + PK_DONE] = 5;
     st[G_PANEK + 2 * PK + PK_BAD] = 16;
-    pane_keys_reset(st[0..512], 2);
+    pane_keys_reset(st[0..1024], 2);
     assert st[G_PANEK + 2 * PK + PK_DONE] == 0;
     assert st[G_PANEK + 2 * PK + PK_BAD] == 0;
     assert st[G_PANEK + 2 * PK + PK_PROF] == PK_UNSET;
     assert st[G_PANEK + 2 * PK + PK_KEYS] == 0;
     assert st[G_PANEK + 2 * PK + PK_WAIT] == W_NONE;
-    plan_pane_keys(st[0..512], 2, 0, 1000100);
-    assert t_prof(st[0..512], 2) == PR_ZAI;
+    plan_pane_keys(st[0..1024], 2, 0, 1000100);
+    assert t_prof(st[0..1024], 2) == PR_ZAI;
 }
 
 test the_model_step_of_a_pane_is_its_own_nibble_and_a_reset_pane_starts_on_the_default_model {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
     assert st[G_MSTEP] == 0;
-    pane_mstep_set(st[0..512], 0, 1);
-    pane_mstep_set(st[0..512], 15, 1);
-    pane_mstep_set(st[0..512], 3, 2);
-    assert pane_mstep_get(st[0..512], 0) == 1;
-    assert pane_mstep_get(st[0..512], 15) == 1;
-    assert pane_mstep_get(st[0..512], 3) == 2;
-    assert pane_mstep_get(st[0..512], 7) == 0;
-    pane_mstep_set(st[0..512], 3, 0);
-    assert pane_mstep_get(st[0..512], 3) == 0;
-    assert pane_mstep_get(st[0..512], 0) == 1;
+    pane_mstep_set(st[0..1024], 0, 1);
+    pane_mstep_set(st[0..1024], 15, 1);
+    pane_mstep_set(st[0..1024], 3, 2);
+    assert pane_mstep_get(st[0..1024], 0) == 1;
+    assert pane_mstep_get(st[0..1024], 15) == 1;
+    assert pane_mstep_get(st[0..1024], 3) == 2;
+    assert pane_mstep_get(st[0..1024], 7) == 0;
+    pane_mstep_set(st[0..1024], 3, 0);
+    assert pane_mstep_get(st[0..1024], 3) == 0;
+    assert pane_mstep_get(st[0..1024], 0) == 1;
     // a new spawn and a restored pane both start from pane_keys_reset: the default model of the tier
-    pane_keys_reset(st[0..512], 0);
-    assert pane_mstep_get(st[0..512], 0) == 0;
-    assert pane_mstep_get(st[0..512], 15) == 1;
-    keys_init(st[0..512]);
-    assert pane_mstep_get(st[0..512], 15) == 0;
+    pane_keys_reset(st[0..1024], 0);
+    assert pane_mstep_get(st[0..1024], 0) == 0;
+    assert pane_mstep_get(st[0..1024], 15) == 1;
+    keys_init(st[0..1024]);
+    assert pane_mstep_get(st[0..1024], 15) == 0;
     assert st[G_MSTEP] == 0;
 }
 
@@ -1661,38 +1786,38 @@ fn t_restored(st: []u64, i: usize) -> void {
 }
 
 test a_restored_pane_takes_the_key_a_fresh_spawn_would_take_not_the_one_its_record_held {
-    var st : [512]u64 = undefined;
-    t_zai3(st[0..512]);
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
     // key 1 earned a rest, key 3 was used lately: the key used longest ago and not resting is key 2
-    st[G_KREST + 32] = 1000 + 600;
-    st[G_KLAST + 32] = 900000;
-    st[G_KLAST + 33] = 100;
-    st[G_KLAST + 34] = 500000;
-    const fresh : u32 = key_pick(st[0..512], P_ZAI, MAX_KEYS, 1000000);
+    st[G_KREST + key_index(P_ZAI, 0)] = 1000 + 600;
+    st[G_KLAST + key_index(P_ZAI, 0)] = 900000;
+    st[G_KLAST + key_index(P_ZAI, 1)] = 100;
+    st[G_KLAST + key_index(P_ZAI, 2)] = 500000;
+    const fresh : u32 = key_pick(st[0..1024], P_ZAI, MAX_KEYS, 1000000);
     assert fresh == 1;
-    t_restored(st[0..512], 3);
-    plan_pane_keys(st[0..512], 3, 0, 1000000);
-    assert t_prof(st[0..512], 3) == PR_ZAI;
-    assert pane_key_get(st[0..512], 3, P_ZAI) == fresh + 1;
-    assert pane_key_get(st[0..512], 3, P_ZAI) == 2;
-    assert st[G_KLAST + 33] == 1000000;
+    t_restored(st[0..1024], 3);
+    plan_pane_keys(st[0..1024], 3, 0, 1000000);
+    assert t_prof(st[0..1024], 3) == PR_ZAI;
+    assert pane_key_get(st[0..1024], 3, P_ZAI) == fresh + 1;
+    assert pane_key_get(st[0..1024], 3, P_ZAI) == 2;
+    assert st[G_KLAST + key_index(P_ZAI, 1)] == 1000000;
     // with no key in the table at all a restored pane has none, as a spawned one
-    var empty : [512]u64 = undefined;
-    t_table(empty[0..512]);
-    t_restored(empty[0..512], 0);
-    plan_pane_keys(empty[0..512], 0, 0, 1000000);
-    assert t_prof(empty[0..512], 0) == PR_NONE;
+    var empty : [1024]u64 = undefined;
+    t_table(empty[0..1024]);
+    t_restored(empty[0..1024], 0);
+    plan_pane_keys(empty[0..1024], 0, 0, 1000000);
+    assert t_prof(empty[0..1024], 0) == PR_NONE;
 }
 
 test a_restored_pane_resumes_its_session_on_the_free_flash_model_not_the_one_its_record_held {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var o : [64]u8 = undefined;
     var cmd : [200]u8 = undefined;
-    t_zai3(st[0..512]);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    t_zai3(st[0..1024]);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
     // the record said glm-5.2; the model the pane starts with is the free flash tier's default
-    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-5.2", o[0..64]);
+    const n : usize = launch_model(st[0..1024], 0, 0, false, "glm-5.2", o[0..64]);
     assert n == 13;
     assert has_bytes(o[0..n], "glm-4.5-flash");
     assert has_bytes(o[0..n], "glm-5.2") == false;
@@ -1701,82 +1826,82 @@ test a_restored_pane_resumes_its_session_on_the_free_flash_model_not_the_one_its
     assert pl_count(cmd[0..c], "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --model 'glm-4.5-flash' --settings /h/.t27os/hooks.json") == 1;
     assert has_bytes(cmd[0..c], "glm-5.2") == false;
     // a fresh spawn of the same agent computes the same default: the environment's model variable
-    t_restored(st[0..512], 1);
-    plan_pane_keys(st[0..512], 1, 0, 1000100);
-    const f : usize = tier_model_step(PR_ZAI, TI_DEFAULT, pane_mstep_get(st[0..512], 1), o[0..64]);
+    t_restored(st[0..1024], 1);
+    plan_pane_keys(st[0..1024], 1, 0, 1000100);
+    const f : usize = tier_model_step(PR_ZAI, TI_DEFAULT, pane_mstep_get(st[0..1024], 1), o[0..64]);
     assert f == 13;
     assert has_bytes(o[0..f], "glm-4.5-flash");
-    const e : usize = profile_var_text_step(PR_ZAI, 2, pane_mstep_get(st[0..512], 1), o[0..64]);
+    const e : usize = profile_var_text_step(PR_ZAI, 2, pane_mstep_get(st[0..1024], 1), o[0..64]);
     assert e == 13 and has_bytes(o[0..e], "glm-4.5-flash");
     // its first start passes no model of its own on the command line
-    assert launch_model(st[0..512], 1, 0, true, "", o[0..64]) == 0;
+    assert launch_model(st[0..1024], 1, 0, true, "", o[0..64]) == 0;
     // one a SPAWN names on purpose stays on that first start
-    const x : usize = launch_model(st[0..512], 1, 0, true, "glm-4.7-flash", o[0..64]);
+    const x : usize = launch_model(st[0..1024], 1, 0, true, "glm-4.7-flash", o[0..64]);
     assert x == 13 and has_bytes(o[0..x], "glm-4.7-flash");
     // but a restart of that pane is a restore: the profile's model again
-    const r : usize = launch_model(st[0..512], 1, 0, false, "glm-4.7-flash", o[0..64]);
+    const r : usize = launch_model(st[0..1024], 1, 0, false, "glm-4.7-flash", o[0..64]);
     assert r == 13 and has_bytes(o[0..r], "glm-4.5-flash");
     // another agent has no profile: its saved model stays
-    const g : usize = launch_model(st[0..512], 2, 1, false, "gpt-5.1", o[0..64]);
+    const g : usize = launch_model(st[0..1024], 2, 1, false, "gpt-5.1", o[0..64]);
     assert g == 7 and has_bytes(o[0..g], "gpt-5.1");
 }
 
 test a_pane_that_fails_over_to_another_profile_does_not_carry_the_model_of_the_one_it_left {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var o : [64]u8 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_key(st[0..512], P_ANTHROPIC, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_key(st[0..1024], P_ANTHROPIC, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     // the only z.ai key is empty: the second model of the tier first, then the next profile
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
-    plan_pane_keys(st[0..512], 0, 0, 1001500);
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
-    plan_pane_keys(st[0..512], 0, 0, 1002500);
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_mstep_get(st[0..512], 0) == 0;
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
+    plan_pane_keys(st[0..1024], 0, 0, 1001500);
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
+    plan_pane_keys(st[0..1024], 0, 0, 1002500);
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..1024], 0) == 0;
     // the pane's slot still says glm-4.7-flash; the Anthropic API does not serve it, so no model is passed
-    assert launch_model(st[0..512], 0, 0, false, "glm-4.7-flash", o[0..64]) == 0;
+    assert launch_model(st[0..1024], 0, 0, false, "glm-4.7-flash", o[0..64]) == 0;
     // a model of Anthropic's own that a person chose is kept
-    const n : usize = launch_model(st[0..512], 0, 0, false, "claude-opus-5-5", o[0..64]);
+    const n : usize = launch_model(st[0..1024], 0, 0, false, "claude-opus-5-5", o[0..64]);
     assert n == 15 and has_bytes(o[0..n], "claude-opus-5-5");
 }
 
 test a_restored_pane_fails_over_on_an_empty_or_rejected_key_like_a_spawned_one {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_zai3(st[0..512]);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    t_zai3(st[0..1024]);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
     // a restored claude pane's screen is read once its grace has passed, like any other pane's
     assert scan_applies(0);
-    assert scan_ready(st[0..512], 0, 1000000, 1000000 + SCAN_GRACE_MS - 1) == false;
-    assert scan_ready(st[0..512], 0, 1000000, 1000000 + SCAN_GRACE_MS);
+    assert scan_ready(st[0..1024], 0, 1000000, 1000000 + SCAN_GRACE_MS - 1) == false;
+    assert scan_ready(st[0..1024], 0, 1000000, 1000000 + SCAN_GRACE_MS);
     // an empty account: the key rests ten minutes and the pane respawns on the next key, the failed one skipped
-    var a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
+    var a : u32 = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    assert st[G_KREST + 32] == 1020 + 600;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 1020 + 600;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     assert st[G_PANEK + PK_DONE] == 1;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, same profile with the next key");
-    plan_pane_keys(st[0..512], 0, 0, 1021000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    plan_pane_keys(st[0..1024], 0, 0, 1021000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 2;
     // a rejected key rests an hour and the pane moves on to the third key
-    a = plan_failover(st[0..512], 0, FC_LOGIN_REJECTED, 1030000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_LOGIN_REJECTED, 1030000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_KEY;
-    assert st[G_KREST + 33] == 1030 + 3600;
-    plan_pane_keys(st[0..512], 0, 0, 1031000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 3;
+    assert st[G_KREST + key_index(P_ZAI, 1)] == 1030 + 3600;
+    plan_pane_keys(st[0..1024], 0, 0, 1031000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 3;
     // neither resting key is picked by the next pane that starts
-    t_restored(st[0..512], 1);
-    plan_pane_keys(st[0..512], 1, 0, 1032000);
-    assert pane_key_get(st[0..512], 1, P_ZAI) == 3;
+    t_restored(st[0..1024], 1);
+    plan_pane_keys(st[0..1024], 1, 0, 1032000);
+    assert pane_key_get(st[0..1024], 1, P_ZAI) == 3;
 }
 
 test the_retry_row_of_an_empty_account_is_a_failure_at_once_so_a_stuck_pane_fails_over {
@@ -1796,33 +1921,33 @@ test the_retry_row_of_an_empty_account_is_a_failure_at_once_so_a_stuck_pane_fail
 }
 
 test with_one_key_an_empty_pane_tries_the_next_model_once_then_gives_up_and_says_so_once {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
     var o : [64]u8 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
     // the only key is empty on the default model: nothing to swap to, so the second model of the tier
-    var a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
+    var a : u32 = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1020000, why[0..128], wl[0..2]);
     assert a == FA_RESPAWN_MODEL;
-    assert pane_mstep_get(st[0..512], 0) == 1;
-    plan_pane_keys(st[0..512], 0, 0, 1021000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
-    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-4.5-flash", o[0..64]);
+    assert pane_mstep_get(st[0..1024], 0) == 1;
+    plan_pane_keys(st[0..1024], 0, 0, 1021000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
+    const n : usize = launch_model(st[0..1024], 0, 0, false, "glm-4.5-flash", o[0..64]);
     assert n == 13 and has_bytes(o[0..n], "glm-4.7-flash");
     // empty on the second model too: no key, no model and no profile left, the pane stays
-    a = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1040000, why[0..128], wl[0..2]);
+    a = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1040000, why[0..128], wl[0..2]);
     assert a == FA_GIVE_UP;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, no profile left in the chain, the pane stays");
     assert st[G_PANEK + PK_DONE] == 1;
     // the give-up is said once: the screen is not read again until the key's rest is over
     assert st[G_PANEK + PK_STOP] == 1040000 + 600000;
-    assert scan_ready(st[0..512], 0, 1021000, 1100000) == false;
-    assert scan_ready(st[0..512], 0, 1021000, 1639999) == false;
-    assert scan_ready(st[0..512], 0, 1021000, 1640000);
+    assert scan_ready(st[0..1024], 0, 1021000, 1100000) == false;
+    assert scan_ready(st[0..1024], 0, 1021000, 1639999) == false;
+    assert scan_ready(st[0..1024], 0, 1021000, 1640000);
     assert giveup_quiet_ms(FC_NO_BALANCE) == 600000;
     assert giveup_quiet_ms(FC_LOGIN_REJECTED) == 3600000;
     assert giveup_quiet_ms(FC_RATE_LIMITED) == GIVEUP_QUIET_MS;
@@ -1830,13 +1955,13 @@ test with_one_key_an_empty_pane_tries_the_next_model_once_then_gives_up_and_says
 }
 
 test every_key_resting_for_an_empty_balance_moves_the_pane_on_and_no_dead_key_is_picked_twice_per_model {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_zai3(st[0..512]);
-    t_restored(st[0..512], 0);
+    t_zai3(st[0..1024]);
+    t_restored(st[0..1024], 0);
     var t : u64 = 1000000;
-    plan_pane_keys(st[0..512], 0, 0, t);
+    plan_pane_keys(st[0..1024], 0, 0, t);
     var seen : [2]u32 = [1, 0];
     var respawns : u32 = 0;
     var act : u32 = FA_KEEP;
@@ -1844,16 +1969,16 @@ test every_key_resting_for_an_empty_balance_moves_the_pane_on_and_no_dead_key_is
     var gave_up : bool = false;
     while (guard < 30 and gave_up == false) {
         t = t + 1000;
-        act = plan_failover(st[0..512], 0, FC_NO_BALANCE, t, why[0..128], wl[0..2]);
+        act = plan_failover(st[0..1024], 0, FC_NO_BALANCE, t, why[0..128], wl[0..2]);
         if (act == FA_GIVE_UP) {
             gave_up = true;
         } else {
             respawns = respawns + 1;
             t = t + 500;
-            plan_pane_keys(st[0..512], 0, 0, t);
-            if (t_prof(st[0..512], 0) == PR_ZAI) {
-                const kn : u32 = pane_key_get(st[0..512], 0, P_ZAI) - 1;
-                const sp : usize = @as(usize, pane_mstep_get(st[0..512], 0));
+            plan_pane_keys(st[0..1024], 0, 0, t);
+            if (t_prof(st[0..1024], 0) == PR_ZAI) {
+                const kn : u32 = pane_key_get(st[0..1024], 0, P_ZAI) - 1;
+                const sp : usize = @as(usize, pane_mstep_get(st[0..1024], 0));
                 // each z.ai key is tried once on each model of the tier, never twice on the same one
                 assert (seen[sp] >> kn) % 2 == 0;
                 seen[sp] = seen[sp] + (1 << kn);
@@ -1867,8 +1992,8 @@ test every_key_resting_for_an_empty_balance_moves_the_pane_on_and_no_dead_key_is
     assert seen[1] == 7;
     assert respawns == 6;
     assert st[G_PANEK + PK_DONE] == 6;
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_key_get(st[0..1024], 0, P_ANTHROPIC) == 1;
     assert st[G_PANEK + PK_BAD] == 16;
     assert st[G_PANEK + PK_STOP] == t + 600000;
 }
@@ -1892,114 +2017,114 @@ fn t_fail(st: []u64, class: u32, t: u64) -> u32 {
 }
 
 test when_every_zai_key_rests_the_pane_moves_to_openrouters_free_ids_and_then_to_the_paid_profile {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var o : [64]u8 = undefined;
-    t_chain(st[0..512]);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_prof(st[0..512], 0) == PR_ZAI;
+    t_chain(st[0..1024]);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
     // tier 1, z.ai: three keys on glm-4.5-flash, then the same three on glm-4.7-flash, every one overloaded
-    assert t_fail(st[0..512], FC_OVERLOADED, 1001000) == FA_RESPAWN_KEY;
-    assert t_fail(st[0..512], FC_OVERLOADED, 1002000) == FA_RESPAWN_KEY;
-    assert t_fail(st[0..512], FC_OVERLOADED, 1003000) == FA_RESPAWN_MODEL;
-    assert t_fail(st[0..512], FC_OVERLOADED, 1004000) == FA_RESPAWN_KEY;
-    assert t_fail(st[0..512], FC_OVERLOADED, 1005000) == FA_RESPAWN_KEY;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
-    assert pane_mstep_get(st[0..512], 0) == 1;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1001000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1002000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1003000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1004000) == FA_RESPAWN_KEY;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1005000) == FA_RESPAWN_KEY;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
+    assert pane_mstep_get(st[0..1024], 0) == 1;
     // the last z.ai key on the last model: tier 2, OpenRouter, on its first free id with its own key
-    assert t_fail(st[0..512], FC_OVERLOADED, 1006000) == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
-    assert pane_mstep_get(st[0..512], 0) == 0;
-    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 0;
+    assert t_fail(st[0..1024], FC_OVERLOADED, 1006000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
+    assert pane_mstep_get(st[0..1024], 0) == 0;
+    assert pane_key_get(st[0..1024], 0, P_OPENROUTER) == 1;
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 0;
     assert st[G_PANEK + PK_BAD] == 16;
-    var n : usize = launch_model(st[0..512], 0, 0, false, "glm-4.7-flash", o[0..64]);
+    var n : usize = launch_model(st[0..1024], 0, 0, false, "glm-4.7-flash", o[0..64]);
     assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
     // the environment the pane gets: ANTHROPIC_MODEL (variable 2 of the profile) names the same id
-    n = profile_var_text_step(PR_OPENROUTER, 2, pane_mstep_get(st[0..512], 0), o[0..64]);
+    n = profile_var_text_step(PR_OPENROUTER, 2, pane_mstep_get(st[0..1024], 0), o[0..64]);
     assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
     // the only OpenRouter key is throttled: its second and third free id, the key free again for each
-    assert t_fail(st[0..512], FC_RATE_LIMITED, 1007000) == FA_RESPAWN_MODEL;
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
-    assert pane_mstep_get(st[0..512], 0) == 1;
-    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
-    n = launch_model(st[0..512], 0, 0, false, "minimax/minimax-m3.1-flash:free", o[0..64]);
+    assert t_fail(st[0..1024], FC_RATE_LIMITED, 1007000) == FA_RESPAWN_MODEL;
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
+    assert pane_mstep_get(st[0..1024], 0) == 1;
+    assert pane_key_get(st[0..1024], 0, P_OPENROUTER) == 1;
+    n = launch_model(st[0..1024], 0, 0, false, "minimax/minimax-m3.1-flash:free", o[0..64]);
     assert n == 33 and begins_with(o[0..n], "nvidia/nemotron-3.5-super-vl:free");
     // both free tiers rest: only now the paid profile, whose model is not an OpenRouter id
-    assert t_fail(st[0..512], FC_RATE_LIMITED, 1009000) == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_mstep_get(st[0..512], 0) == 0;
-    assert pane_key_get(st[0..512], 0, P_ANTHROPIC) == 1;
+    assert t_fail(st[0..1024], FC_RATE_LIMITED, 1009000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_mstep_get(st[0..1024], 0) == 0;
+    assert pane_key_get(st[0..1024], 0, P_ANTHROPIC) == 1;
     assert st[G_PANEK + PK_BAD] == 24;
     assert st[G_PANEK + PK_DONE] == 8;
-    assert launch_model(st[0..512], 0, 0, false, "nvidia/nemotron-3.5-super-vl:free", o[0..64]) == 0;
+    assert launch_model(st[0..1024], 0, 0, false, "nvidia/nemotron-3.5-super-vl:free", o[0..64]) == 0;
     // the paid key fails too: no tier is left and the pane says so once
-    assert t_fail(st[0..512], FC_RATE_LIMITED, 1010000) == FA_GIVE_UP;
+    assert t_fail(st[0..1024], FC_RATE_LIMITED, 1010000) == FA_GIVE_UP;
     assert st[G_PANEK + PK_DONE] == 8;
     assert st[G_PANEK + PK_STOP] == 1010000 + GIVEUP_QUIET_MS;
 }
 
 test with_no_openrouter_key_stored_the_pane_skips_that_tier_to_the_paid_profile_or_the_give_up_line {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
     // z.ai and Anthropic keys, none of OpenRouter: the tier in the middle costs nothing
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_key(st[0..512], P_ANTHROPIC, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
-    assert t_fail(st[0..512], FC_NO_BALANCE, 1002000) == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 0;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_key(st[0..1024], P_ANTHROPIC, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_fail(st[0..1024], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..1024], FC_NO_BALANCE, 1002000) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_key_get(st[0..1024], 0, P_OPENROUTER) == 0;
     assert st[G_PANEK + PK_BAD] == 16;
     assert st[G_PANEK + PK_DONE] == 2;
     // z.ai alone: nothing after it, the give-up line, no loop
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
-    const a : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]);
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_fail(st[0..1024], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    const a : u32 = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]);
     assert a == FA_GIVE_UP;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, no profile left in the chain, the pane stays");
     assert st[G_PANEK + PK_DONE] == 1;
     // the same pane once an OpenRouter key arrives (an OP_SETKEY) and its quiet time has passed: the free tier is offered
-    t_key(st[0..512], P_OPENROUTER, 0);
+    t_key(st[0..1024], P_OPENROUTER, 0);
     st[G_PANEK + PK_STOP] = 0;
-    const b : u32 = plan_failover(st[0..512], 0, FC_NO_BALANCE, 1003000, why[0..128], wl[0..2]);
+    const b : u32 = plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1003000, why[0..128], wl[0..2]);
     assert b == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
     assert has_bytes(why[0 .. @as(usize, @intCast(wl[0]))], "claude: zai out of balance, respawn on openrouter");
     // an OpenRouter key alone ends in the give-up line after its three ids
-    t_table(st[0..512]);
-    t_key(st[0..512], P_OPENROUTER, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
-    assert t_fail(st[0..512], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
-    assert t_fail(st[0..512], FC_NO_BALANCE, 1003000) == FA_GIVE_UP;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_OPENROUTER, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
+    assert t_fail(st[0..1024], FC_NO_BALANCE, 1001000) == FA_RESPAWN_MODEL;
+    assert t_fail(st[0..1024], FC_NO_BALANCE, 1003000) == FA_GIVE_UP;
     assert st[G_PANEK + PK_DONE] == 1;
 }
 
 test a_pane_on_openrouter_names_the_free_id_on_its_command_line_and_in_its_environment {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var o : [64]u8 = undefined;
     var cmd : [200]u8 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_OPENROUTER, 0);
-    t_restored(st[0..512], 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
-    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
-    const n : usize = launch_model(st[0..512], 0, 0, false, "glm-5.2", o[0..64]);
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_OPENROUTER, 0);
+    t_restored(st[0..1024], 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
+    assert pane_key_get(st[0..1024], 0, P_OPENROUTER) == 1;
+    const n : usize = launch_model(st[0..1024], 0, 0, false, "glm-5.2", o[0..64]);
     assert n == 31 and begins_with(o[0..n], "minimax/minimax-m3.1-flash:free");
     // the id keeps its slash and its colon on the command line (session_store model_ok), so the flag is not dropped
     const c : usize = pane_command(0, R_RESUME, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab", o[0..n], "/h", cmd[0..200]);
     assert pl_count(cmd[0..c], "claude --resume 5f1c9a00-aaaa-bbbb-cccc-0123456789ab --model 'minimax/minimax-m3.1-flash:free' --settings /h/.t27os/hooks.json") == 1;
     // a SPAWN's first start passes no model of its own
-    assert launch_model(st[0..512], 0, 0, true, "", o[0..64]) == 0;
+    assert launch_model(st[0..1024], 0, 0, true, "", o[0..64]) == 0;
 }
 
 test a_list_entry_carries_the_key_number_in_the_high_nibble {
@@ -2007,7 +2132,10 @@ test a_list_entry_carries_the_key_number_in_the_high_nibble {
     assert list_flags_key(true, w, 0) == list_flags(true, w);
     assert list_flags_key(true, w, 3) % 16 == list_flags(true, w);
     assert list_flags_key(true, w, 3) / 16 == 3;
-    assert list_flags_key(false, w, MAX_KEYS) / 16 == MAX_KEYS;
+    assert list_key_of(list_flags_key(false, w, MAX_KEYS)) == MAX_KEYS;
+    assert list_key_of(list_flags_key(true, w, 15)) == 15;
+    assert list_key_of(list_flags_key(true, w, 3)) == 3;
+    assert list_flags_key(true, w, MAX_KEYS) % 8 == list_flags(true, w);
     assert list_flags_key(true, hooked_status(w, "Notification"), MAX_KEYS) < 256;
     // a client that reads bit 0, 1 or 2 only sees the old byte
     assert list_flags_key(true, hooked_status(w, "Notification"), 5) % 2 == 1;
@@ -2103,29 +2231,29 @@ test an_error_row_split_across_two_reads_is_still_one_row {
 }
 
 test a_pane_screen_is_not_read_in_its_first_seconds_nor_while_a_give_up_is_quiet {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    assert scan_ready(st[0..512], 1, 1000, 5000) == false;
-    assert scan_ready(st[0..512], 1, 1000, 11000);
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    assert scan_ready(st[0..1024], 1, 1000, 5000) == false;
+    assert scan_ready(st[0..1024], 1, 1000, 11000);
     st[G_PANEK + PK + PK_STOP] = 70000;
-    assert scan_ready(st[0..512], 1, 1000, 60000) == false;
-    assert scan_ready(st[0..512], 1, 1000, 70000);
+    assert scan_ready(st[0..1024], 1, 1000, 60000) == false;
+    assert scan_ready(st[0..1024], 1, 1000, 70000);
     assert scan_applies(0);
     assert scan_applies(1) == false;
     assert scan_applies(SHELL_CELL) == false;
 }
 
 test a_restored_pane_waits_for_a_key_of_its_provider_and_then_starts_with_it {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
     // the window has not connected: claude, codex, queen wait; a shell and an editor do not
     assert needs_key(0);
     assert needs_key(1);
     assert needs_key(4);
     assert needs_key(SHELL_CELL) == false;
-    assert restore_waits(st[0..512], 0);
-    assert restore_waits(st[0..512], 1);
-    assert restore_waits(st[0..512], SHELL_CELL) == false;
+    assert restore_waits(st[0..1024], 0);
+    assert restore_waits(st[0..1024], 1);
+    assert restore_waits(st[0..1024], SHELL_CELL) == false;
     assert wait_plan(wait_word(R_RESUME)) == R_RESUME;
     assert wait_plan(wait_word(R_RELAUNCH)) == R_RELAUNCH;
     assert waiting(wait_word(R_RESUME)) and waiting(wait_word(R_RELAUNCH));
@@ -2134,41 +2262,41 @@ test a_restored_pane_waits_for_a_key_of_its_provider_and_then_starts_with_it {
     assert waiting(W_DONE) == false;
     assert wait_plan(W_NONE) == R_SKIP;
     // 2 s after the server started, still nothing
-    assert restore_release(st[0..512], 0, 1002000, 1000000) == false;
+    assert restore_release(st[0..1024], 0, 1002000, 1000000) == false;
     // an OpenAI key arrives: claude reads no OpenAI key, codex does
-    t_key(st[0..512], P_OPENAI, 0);
-    assert restore_release(st[0..512], 0, 1003000, 1000000) == false;
-    assert restore_release(st[0..512], 1, 1003000, 1000000);
+    t_key(st[0..1024], P_OPENAI, 0);
+    assert restore_release(st[0..1024], 0, 1003000, 1000000) == false;
+    assert restore_release(st[0..1024], 1, 1003000, 1000000);
     // a z.ai key arrives: claude's profile has a provider now, and the pane starts on it
-    t_key(st[0..512], P_ZAI, 0);
-    assert restore_release(st[0..512], 0, 1003500, 1000000);
-    assert after_wait(st[0..512], 0) == W_NONE;
-    plan_pane_keys(st[0..512], 3, 0, 1003600);
-    assert t_prof(st[0..512], 3) == PR_ZAI;
-    assert pane_key_get(st[0..512], 3, P_ZAI) == 1;
+    t_key(st[0..1024], P_ZAI, 0);
+    assert restore_release(st[0..1024], 0, 1003500, 1000000);
+    assert after_wait(st[0..1024], 0) == W_NONE;
+    plan_pane_keys(st[0..1024], 3, 0, 1003600);
+    assert t_prof(st[0..1024], 3) == PR_ZAI;
+    assert pane_key_get(st[0..1024], 3, P_ZAI) == 1;
 }
 
 test a_restored_pane_whose_wait_runs_out_starts_keyless_and_is_respawned_once_when_a_key_arrives {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    assert restore_release(st[0..512], 0, 1019999, 1000000) == false;
-    assert restore_release(st[0..512], 0, 1020000, 1000000);
-    assert after_wait(st[0..512], 0) == W_KEYLESS;
-    plan_pane_keys(st[0..512], 0, 0, 1020100);
-    assert t_prof(st[0..512], 0) == PR_NONE;
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    assert restore_release(st[0..1024], 0, 1019999, 1000000) == false;
+    assert restore_release(st[0..1024], 0, 1020000, 1000000);
+    assert after_wait(st[0..1024], 0) == W_KEYLESS;
+    plan_pane_keys(st[0..1024], 0, 0, 1020100);
+    assert t_prof(st[0..1024], 0) == PR_NONE;
     st[G_PANEK + PK_WAIT] = W_KEYLESS;
     // still no key: no respawn
-    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0) == false;
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..1024], 0) == false;
     // the first key arrives
-    t_key(st[0..512], P_ZAI, 0);
-    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0);
+    t_key(st[0..1024], P_ZAI, 0);
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..1024], 0);
     // the respawn: the pane takes the profile and the key, and the one respawn is spent
-    plan_pane_keys(st[0..512], 0, 0, 1030000);
+    plan_pane_keys(st[0..1024], 0, 0, 1030000);
     st[G_PANEK + PK_WAIT] = W_DONE;
-    assert t_prof(st[0..512], 0) == PR_ZAI;
-    assert pane_key_shown(st[0..512], 0, 0) == 1;
-    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..512], 0) == false;
-    assert keyless_respawn(W_NONE, st[0..512], 0) == false;
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
+    assert pane_key_shown(st[0..1024], 0, 0) == 1;
+    assert keyless_respawn(st[G_PANEK + PK_WAIT], st[0..1024], 0) == false;
+    assert keyless_respawn(W_NONE, st[0..1024], 0) == false;
     // resume when the session is known, else a fresh start
     assert keyless_plan(0, "5f1c9a00-aaaa-bbbb-cccc-0123456789ab") == R_RESUME;
     assert keyless_plan(0, "-") == R_RELAUNCH;
@@ -2202,189 +2330,189 @@ test the_server_reads_the_providers_a_spawn_can_start_with {
 }
 
 test a_spawn_that_finds_no_key_reads_the_keychain_again_after_a_minute {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
     // nothing was read yet: due at once
-    assert keys_reload_due(st[0..512], 0, 5000, 0);
+    assert keys_reload_due(st[0..1024], 0, 5000, 0);
     // read 10 s ago and still no key: not yet; due exactly KEYS_RELOAD_MS after the read
     assert KEYS_RELOAD_MS == 60000;
-    assert keys_reload_due(st[0..512], 0, 1010000, 1000000) == false;
-    assert keys_reload_due(st[0..512], 0, 1059999, 1000000) == false;
-    assert keys_reload_due(st[0..512], 0, 1060000, 1000000);
+    assert keys_reload_due(st[0..1024], 0, 1010000, 1000000) == false;
+    assert keys_reload_due(st[0..1024], 0, 1059999, 1000000) == false;
+    assert keys_reload_due(st[0..1024], 0, 1060000, 1000000);
     // a shell or an editor reads no key: never due
-    assert keys_reload_due(st[0..512], SHELL_CELL, 1060000, 1000000) == false;
-    assert keys_reload_due(st[0..512], SHELL_CELL, 5000, 0) == false;
+    assert keys_reload_due(st[0..1024], SHELL_CELL, 1060000, 1000000) == false;
+    assert keys_reload_due(st[0..1024], SHELL_CELL, 5000, 0) == false;
     // a z.ai key is a key the claude cell starts with: nothing to look for
-    t_key(st[0..512], P_ZAI, 0);
-    assert keys_reload_due(st[0..512], 0, 1060000, 1000000) == false;
-    assert keys_reload_due(st[0..512], 0, 5000, 0) == false;
+    t_key(st[0..1024], P_ZAI, 0);
+    assert keys_reload_due(st[0..1024], 0, 1060000, 1000000) == false;
+    assert keys_reload_due(st[0..1024], 0, 5000, 0) == false;
     // codex reads OpenAI only: the z.ai key is no use to it, so a read is due for it
-    assert keys_reload_due(st[0..512], 1, 1060000, 1000000);
-    assert keys_reload_due(st[0..512], 1, 1010000, 1000000) == false;
-    t_key(st[0..512], P_OPENAI, 0);
-    assert keys_reload_due(st[0..512], 1, 1060000, 1000000) == false;
+    assert keys_reload_due(st[0..1024], 1, 1060000, 1000000);
+    assert keys_reload_due(st[0..1024], 1, 1010000, 1000000) == false;
+    t_key(st[0..1024], P_OPENAI, 0);
+    assert keys_reload_due(st[0..1024], 1, 1060000, 1000000) == false;
 }
 
 test a_read_of_the_keychain_fills_the_table_like_a_window_push {
     // the server's read goes through key_put exactly as OP_SETKEY does: the claude cell has a profile after it
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    assert has_key_for(st[0..512], 0) == false;
-    assert restore_waits(st[0..512], 0);
-    key_put(st[0..512], P_ZAI, 0, true, false);
-    key_put(st[0..512], P_ZAI, 1, true, false);
-    assert has_key_for(st[0..512], 0);
-    assert restore_waits(st[0..512], 0) == false;
-    plan_pane_keys(st[0..512], 5, 0, 1000000);
-    assert t_prof(st[0..512], 5) == PR_ZAI;
-    assert pane_key_shown(st[0..512], 5, 0) == 1;
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    assert has_key_for(st[0..1024], 0) == false;
+    assert restore_waits(st[0..1024], 0);
+    key_put(st[0..1024], P_ZAI, 0, true, false);
+    key_put(st[0..1024], P_ZAI, 1, true, false);
+    assert has_key_for(st[0..1024], 0);
+    assert restore_waits(st[0..1024], 0) == false;
+    plan_pane_keys(st[0..1024], 5, 0, 1000000);
+    assert t_prof(st[0..1024], 5) == PR_ZAI;
+    assert pane_key_shown(st[0..1024], 5, 0) == 1;
     // the window pushes the same keys a moment later: nothing changes, the key just used keeps its time
-    key_put(st[0..512], P_ZAI, 0, true, true);
+    key_put(st[0..1024], P_ZAI, 0, true, true);
     assert st[G_KLAST + key_index(P_ZAI, 0)] == 1000000;
     // a key that came from a terminal later is one more slot
-    assert key_count(st[0..512], P_ZAI) == 2;
-    key_put(st[0..512], P_ZAI, 2, true, false);
-    assert key_count(st[0..512], P_ZAI) == 3;
+    assert key_count(st[0..1024], P_ZAI) == 2;
+    key_put(st[0..1024], P_ZAI, 2, true, false);
+    assert key_count(st[0..1024], P_ZAI) == 3;
 }
 
 test an_opencode_pane_and_a_crush_pane_get_a_profile_and_their_own_variables_by_name {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var o : [700]u8 = undefined;
-    t_zai3(st[0..512]);
-    t_key(st[0..512], P_OPENROUTER, 0);
+    t_zai3(st[0..1024]);
+    t_key(st[0..1024], P_OPENROUTER, 0);
     // OpenCode (cell 3): z.ai first, key 1 by rotation, the key variable and the inline config by name
-    plan_pane_keys(st[0..512], 0, 3, 1000000);
-    assert t_prof(st[0..512], 0) == PR_ZAI;
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
-    assert pane_agent_get(st[0..512], 0) == 3;
-    assert agent_var_count(3, t_prof(st[0..512], 0)) == 2;
+    plan_pane_keys(st[0..1024], 0, 3, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_ZAI;
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
+    assert pane_agent_get(st[0..1024], 0) == 3;
+    assert agent_var_count(3, t_prof(st[0..1024], 0)) == 2;
     var n : usize = agent_var_name(3, PR_ZAI, 0, o[0..40]);
     assert n == 11 and begins_with(o[0..n], "ZAI_API_KEY");
     n = agent_var_name(3, PR_ZAI, 1, o[0..40]);
     assert begins_with(o[0..n], "OPENCODE_CONFIG_CONTENT");
     // Crush (cell 5) on pane 1: the next z.ai key, the config directory named from the pane's model step
-    plan_pane_keys(st[0..512], 1, 5, 1000100);
-    assert t_prof(st[0..512], 1) == PR_ZAI;
-    assert pane_key_get(st[0..512], 1, P_ZAI) == 2;
-    assert pane_agent_get(st[0..512], 1) == 5 and pane_agent_get(st[0..512], 0) == 3;
+    plan_pane_keys(st[0..1024], 1, 5, 1000100);
+    assert t_prof(st[0..1024], 1) == PR_ZAI;
+    assert pane_key_get(st[0..1024], 1, P_ZAI) == 2;
+    assert pane_agent_get(st[0..1024], 1) == 5 and pane_agent_get(st[0..1024], 0) == 3;
     n = agent_var_name(5, PR_ZAI, 1, o[0..40]);
     assert begins_with(o[0..n], "CRUSH_GLOBAL_CONFIG");
     // the model each starts with: glm-4.5-flash at step 0, glm-4.7-flash at step 1
-    assert agent_var_text_step(5, PR_ZAI, 1, pane_mstep_get(st[0..512], 1), "/h", o[0..700]) == 21;
-    n = launch_model(st[0..512], 1, 5, false, "x", o[0..64]);
+    assert agent_var_text_step(5, PR_ZAI, 1, pane_mstep_get(st[0..1024], 1), "/h", o[0..700]) == 21;
+    n = launch_model(st[0..1024], 1, 5, false, "x", o[0..64]);
     assert n == 13 and begins_with(o[0..n], "glm-4.5-flash");
     // a profile agent reads its error rows; a Codex pane (cell 1) still does not
     assert scan_applies(3) and scan_applies(5) and scan_applies(1) == false;
-    assert has_key_for(st[0..512], 3) and has_key_for(st[0..512], 5);
+    assert has_key_for(st[0..1024], 3) and has_key_for(st[0..1024], 5);
     assert load_mask_agent(3) == 25 and load_mask_agent(5) == 25;
     assert needs_key(3) and needs_key(5);
 }
 
 test an_opencode_pane_rotates_keys_models_and_profiles_like_claude_code_and_never_to_ollama {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_key(st[0..512], P_ZAI, 1);
-    t_key(st[0..512], P_OPENROUTER, 0);
-    t_key(st[0..512], P_OLLAMA, 0);
-    plan_pane_keys(st[0..512], 0, 3, 1000000);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 1;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_key(st[0..1024], P_ZAI, 1);
+    t_key(st[0..1024], P_OPENROUTER, 0);
+    t_key(st[0..1024], P_OLLAMA, 0);
+    plan_pane_keys(st[0..1024], 0, 3, 1000000);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 1;
     // key 1 is throttled: key 2, same profile
-    assert plan_failover(st[0..512], 0, FC_RATE_LIMITED, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 3, 1001500);
-    assert pane_key_get(st[0..512], 0, P_ZAI) == 2;
+    assert plan_failover(st[0..1024], 0, FC_RATE_LIMITED, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..1024], 0, 3, 1001500);
+    assert pane_key_get(st[0..1024], 0, P_ZAI) == 2;
     // key 2 too: no key left on glm-4.5-flash, the next model of the tier
-    assert plan_failover(st[0..512], 0, FC_RATE_LIMITED, 1002000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
-    assert pane_mstep_get(st[0..512], 0) == 1;
-    plan_pane_keys(st[0..512], 0, 3, 1002500);
+    assert plan_failover(st[0..1024], 0, FC_RATE_LIMITED, 1002000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
+    assert pane_mstep_get(st[0..1024], 0) == 1;
+    plan_pane_keys(st[0..1024], 0, 3, 1002500);
     var o : [64]u8 = undefined;
-    const n : usize = launch_model(st[0..512], 0, 3, false, "glm-4.5-flash", o[0..64]);
+    const n : usize = launch_model(st[0..1024], 0, 3, false, "glm-4.5-flash", o[0..64]);
     assert n == 13 and begins_with(o[0..n], "glm-4.7-flash");
     // both keys fail on it: OpenRouter, step 0, with the OpenAI-compatible base URL
-    assert plan_failover(st[0..512], 0, FC_RATE_LIMITED, 1003000, why[0..128], wl[0..2]) == FA_RESPAWN_KEY;
-    plan_pane_keys(st[0..512], 0, 3, 1003500);
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1004000, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
-    assert t_prof(st[0..512], 0) == PR_OPENROUTER;
-    assert pane_mstep_get(st[0..512], 0) == 0;
-    plan_pane_keys(st[0..512], 0, 3, 1004500);
-    assert pane_key_get(st[0..512], 0, P_OPENROUTER) == 1;
+    assert plan_failover(st[0..1024], 0, FC_RATE_LIMITED, 1003000, why[0..128], wl[0..2]) == FA_RESPAWN_KEY;
+    plan_pane_keys(st[0..1024], 0, 3, 1003500);
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1004000, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
+    assert t_prof(st[0..1024], 0) == PR_OPENROUTER;
+    assert pane_mstep_get(st[0..1024], 0) == 0;
+    plan_pane_keys(st[0..1024], 0, 3, 1004500);
+    assert pane_key_get(st[0..1024], 0, P_OPENROUTER) == 1;
     // OpenRouter's key fails on both ids; the Ollama key is no OpenCode profile, so the chain ends
-    assert plan_failover(st[0..512], 0, FC_RATE_LIMITED, 1005000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
-    plan_pane_keys(st[0..512], 0, 3, 1005500);
-    assert plan_failover(st[0..512], 0, FC_RATE_LIMITED, 1006000, why[0..128], wl[0..2]) == FA_GIVE_UP;
+    assert plan_failover(st[0..1024], 0, FC_RATE_LIMITED, 1005000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
+    plan_pane_keys(st[0..1024], 0, 3, 1005500);
+    assert plan_failover(st[0..1024], 0, FC_RATE_LIMITED, 1006000, why[0..128], wl[0..2]) == FA_GIVE_UP;
     assert st[G_PANEK + PK_STOP] > 1006000;
     // Claude Code in the same table still reaches Ollama cloud after OpenRouter
-    plan_pane_keys(st[0..512], 1, 0, 1007000);
-    assert pane_agent_get(st[0..512], 1) == 0;
+    plan_pane_keys(st[0..1024], 1, 0, 1007000);
+    assert pane_agent_get(st[0..1024], 1) == 0;
     assert agent_profile_ok(0, PR_OLLAMA_CLOUD);
 }
 
 test a_pane_with_only_an_ollama_key_is_keyless_for_opencode_and_crush {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_OLLAMA, 0);
-    assert has_key_for(st[0..512], 0);
-    assert has_key_for(st[0..512], 3) == false and has_key_for(st[0..512], 5) == false;
-    assert restore_waits(st[0..512], 3);
-    plan_pane_keys(st[0..512], 0, 3, 1000000);
-    assert t_prof(st[0..512], 0) == PR_NONE;
-    assert pane_light(st[0..512], 0, 3, 1000000) == L_RED;
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_OLLAMA, 0);
+    assert has_key_for(st[0..1024], 0);
+    assert has_key_for(st[0..1024], 3) == false and has_key_for(st[0..1024], 5) == false;
+    assert restore_waits(st[0..1024], 3);
+    plan_pane_keys(st[0..1024], 0, 3, 1000000);
+    assert t_prof(st[0..1024], 0) == PR_NONE;
+    assert pane_light(st[0..1024], 0, 3, 1000000) == L_RED;
 }
 
 test the_light_of_a_pane_follows_its_tier_its_keys_and_its_give_up {
-    var st : [512]u64 = undefined;
+    var st : [1024]u64 = undefined;
     var why : [128]u8 = undefined;
     var wl : [2]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    t_key(st[0..512], P_ANTHROPIC, 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    t_key(st[0..1024], P_ANTHROPIC, 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
     // a free z.ai profile with a usable key: yellow
-    assert pane_light(st[0..512], 0, 0, 1000000) == L_YELLOW;
-    assert pane_light(st[0..512], 0, 3, 1000000) == L_YELLOW;
+    assert pane_light(st[0..1024], 0, 0, 1000000) == L_YELLOW;
+    assert pane_light(st[0..1024], 0, 3, 1000000) == L_YELLOW;
     // an editor, a shell and a cell with no profile have none
-    assert pane_light(st[0..512], 0, SHELL_CELL, 1000000) == L_NONE;
-    assert pane_light(st[0..512], 0, 1, 1000000) == L_NONE;
+    assert pane_light(st[0..1024], 0, SHELL_CELL, 1000000) == L_NONE;
+    assert pane_light(st[0..1024], 0, 1, 1000000) == L_NONE;
     // the z.ai key has no balance on both flash models: the pane moves to the paid profile and is green
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
-    plan_pane_keys(st[0..512], 0, 0, 1001200);
-    assert pane_light(st[0..512], 0, 0, 1001200) == L_YELLOW;
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1001300, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
-    plan_pane_keys(st[0..512], 0, 0, 1001500);
-    assert t_prof(st[0..512], 0) == PR_ANTHROPIC;
-    assert pane_light(st[0..512], 0, 0, 1001500) == L_GREEN;
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1001000, why[0..128], wl[0..2]) == FA_RESPAWN_MODEL;
+    plan_pane_keys(st[0..1024], 0, 0, 1001200);
+    assert pane_light(st[0..1024], 0, 0, 1001200) == L_YELLOW;
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1001300, why[0..128], wl[0..2]) == FA_RESPAWN_NEXT;
+    plan_pane_keys(st[0..1024], 0, 0, 1001500);
+    assert t_prof(st[0..1024], 0) == PR_ANTHROPIC;
+    assert pane_light(st[0..1024], 0, 0, 1001500) == L_GREEN;
     // the paid key is out of balance too (rests 600 s): every usable key rests, and the chain gave up: red
-    assert plan_failover(st[0..512], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]) == FA_GIVE_UP;
-    assert pane_light(st[0..512], 0, 0, 1002000) == L_RED;
+    assert plan_failover(st[0..1024], 0, FC_NO_BALANCE, 1002000, why[0..128], wl[0..2]) == FA_GIVE_UP;
+    assert pane_light(st[0..1024], 0, 0, 1002000) == L_RED;
     // a throttled key (30 s) is busy, not empty: its pane stays yellow while the key is soon free
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    plan_pane_keys(st[0..512], 0, 0, 2000000);
-    key_rest(st[0..512], P_ZAI, 0, 2000 + 30);
-    assert keys_usable(st[0..512], P_ZAI, 2000000) == 1;
-    assert pane_light(st[0..512], 0, 0, 2000000) == L_YELLOW;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    plan_pane_keys(st[0..1024], 0, 0, 2000000);
+    key_rest(st[0..1024], P_ZAI, 0, 2000 + 30);
+    assert keys_usable(st[0..1024], P_ZAI, 2000000) == 1;
+    assert pane_light(st[0..1024], 0, 0, 2000000) == L_YELLOW;
     // an empty account (600 s) leaves no usable key: red; the clock far past the rest frees it again
-    key_rest(st[0..512], P_ZAI, 0, 2000 + 600);
-    assert keys_usable(st[0..512], P_ZAI, 2000000) == 0;
-    assert pane_light(st[0..512], 0, 0, 2000000) == L_RED;
-    assert pane_light(st[0..512], 0, 0, 2000000 + 590000) == L_YELLOW;
+    key_rest(st[0..1024], P_ZAI, 0, 2000 + 600);
+    assert keys_usable(st[0..1024], P_ZAI, 2000000) == 0;
+    assert pane_light(st[0..1024], 0, 0, 2000000) == L_RED;
+    assert pane_light(st[0..1024], 0, 0, 2000000 + 590000) == L_YELLOW;
     // a profile agent with no profile yet is red
-    t_table(st[0..512]);
-    plan_pane_keys(st[0..512], 2, 5, 1000000);
-    assert pane_light(st[0..512], 2, 5, 1000000) == L_RED;
+    t_table(st[0..1024]);
+    plan_pane_keys(st[0..1024], 2, 5, 1000000);
+    assert pane_light(st[0..1024], 2, 5, 1000000) == L_RED;
 }
 
 test the_listing_state_byte_carries_the_light_and_an_old_reader_can_mask_it {
-    var st : [512]u64 = undefined;
-    t_table(st[0..512]);
-    t_key(st[0..512], P_ZAI, 0);
-    plan_pane_keys(st[0..512], 0, 0, 1000000);
-    const b : u32 = list_shown(st[0..512], 0, 0, 3, 1000000);
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 0);
+    plan_pane_keys(st[0..1024], 0, 0, 1000000);
+    const b : u32 = list_shown(st[0..1024], 0, 0, 3, 1000000);
     assert b == 3 + 64 * L_YELLOW;
     assert shown_state_of(b) == 3 and shown_light_of(b) == L_YELLOW;
-    assert list_shown(st[0..512], 0, SHELL_CELL, 3, 1000000) == 3;
+    assert list_shown(st[0..1024], 0, SHELL_CELL, 3, 1000000) == 3;
 }
 
 test a_panes_path_starts_with_the_toolchain_folder_once {
@@ -2594,3 +2722,161 @@ test has_text_finds_a_substring {
     assert has_text("Missing openai API key", "log in") == false;
 }
 
+test a_free_key_is_one_not_resting_not_skipped_and_used_longest_ago {
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
+    key_used(st[0..1024], P_ZAI, 0, 900);
+    key_used(st[0..1024], P_ZAI, 1, 500);
+    key_used(st[0..1024], P_ZAI, 2, 700);
+    // the one used longest ago; the skipped one is passed over
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 1000000) == 1;
+    assert key_pick_free(st[0..1024], P_ZAI, 1, 1000000) == 2;
+    assert key_pick_free(st[0..1024], P_ZAI, 2, 1000000) == 1;
+    // a key that rests is passed over until the rest ends (at its second)
+    key_rest(st[0..1024], P_ZAI, 1, 5000);
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 1000000) == 2;
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 4999999) == 2;
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 5000000) == 1;
+    // every key resting or skipped: none (unlike key_pick, which falls back to the soonest rest)
+    key_rest(st[0..1024], P_ZAI, 0, 9000);
+    key_rest(st[0..1024], P_ZAI, 2, 9000);
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 1000000) == MAX_KEYS;
+    assert key_pick_free(st[0..1024], P_ZAI, 1, 6000000) == MAX_KEYS;
+    // a provider with no key has none to give; other providers are not touched by z.ai rests
+    assert key_pick_free(st[0..1024], P_OPENAI, MAX_KEYS, 1000000) == MAX_KEYS;
+    assert key_pick_free(st[0..1024], P_ANTHROPIC, MAX_KEYS, 1000000) == 0;
+    assert key_pick_free(st[0..1024], P_ANTHROPIC, 0, 1000000) == MAX_KEYS;
+}
+
+test lifting_the_rests_frees_every_key_of_one_provider_and_leaves_empty_slots_and_other_providers {
+    var st : [1024]u64 = undefined;
+    t_zai3(st[0..1024]);
+    key_rest(st[0..1024], P_ZAI, 0, 5000);
+    key_rest(st[0..1024], P_ZAI, 1, 6000);
+    key_rest(st[0..1024], P_ZAI, 2, 7000);
+    key_rest(st[0..1024], P_ANTHROPIC, 0, 7777);
+    key_rest(st[0..1024], P_ZAI, 3, 9999);
+    key_rests_lift(st[0..1024], P_ZAI);
+    assert st[G_KREST + key_index(P_ZAI, 0)] == 0;
+    assert st[G_KREST + key_index(P_ZAI, 1)] == 0;
+    assert st[G_KREST + key_index(P_ZAI, 2)] == 0;
+    // empty slots stay empty
+    assert st[G_KREST + key_index(P_ZAI, 3)] == KEY_NEVER;
+    assert st[G_KREST + key_index(P_ZAI, 7)] == KEY_NEVER;
+    assert key_present(st[0..1024], P_ZAI, 3) == false;
+    assert key_count(st[0..1024], P_ZAI) == 3;
+    // another provider keeps its rest
+    assert st[G_KREST + key_index(P_ANTHROPIC, 0)] == 7777;
+    // nothing to lift on a provider with no key
+    key_rests_lift(st[0..1024], P_OPENAI);
+    assert st[G_KREST + key_index(P_OPENAI, 0)] == KEY_NEVER;
+    assert key_pick_free(st[0..1024], P_ZAI, MAX_KEYS, 1000) == 0;
+}
+
+test a_pane_holds_five_bits_per_provider_and_setting_one_leaves_the_others {
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    pane_key_set(st[0..1024], 2, P_ZAI, 3);
+    assert pane_key_get(st[0..1024], 2, P_ZAI) == 3;
+    assert st[G_PANEK + 2 * PK + PK_KEYS] == 3 * pow32(P_ZAI);
+    pane_key_set(st[0..1024], 2, P_OPENAI, 5);
+    assert pane_key_get(st[0..1024], 2, P_OPENAI) == 5;
+    assert pane_key_get(st[0..1024], 2, P_ZAI) == 3;
+    assert st[G_PANEK + 2 * PK + PK_KEYS] == 3 * pow32(P_ZAI) + 5 * pow32(P_OPENAI);
+    // overwrite replaces the old value
+    pane_key_set(st[0..1024], 2, P_ZAI, 8);
+    assert pane_key_get(st[0..1024], 2, P_ZAI) == 8;
+    assert st[G_PANEK + 2 * PK + PK_KEYS] == 8 * pow32(P_ZAI) + 5 * pow32(P_OPENAI);
+    pane_key_set(st[0..1024], 2, P_ZAI, 0);
+    assert pane_key_get(st[0..1024], 2, P_ZAI) == 0;
+    assert pane_key_get(st[0..1024], 2, P_OPENAI) == 5;
+    // provider 0 and the largest number: key 16 (MAX_KEYS, held as 16) needs the fifth bit
+    pane_key_set(st[0..1024], 2, P_ANTHROPIC, 15);
+    assert pane_key_get(st[0..1024], 2, P_ANTHROPIC) == 15;
+    pane_key_set(st[0..1024], 2, P_ANTHROPIC, MAX_KEYS);
+    assert pane_key_get(st[0..1024], 2, P_ANTHROPIC) == MAX_KEYS;
+    assert pane_key_get(st[0..1024], 2, P_OPENAI) == 5;
+    // the last provider holds key 16 too and leaves the first one alone
+    pane_key_set(st[0..1024], 2, PROVIDER_COUNT - 1, MAX_KEYS);
+    assert pane_key_get(st[0..1024], 2, PROVIDER_COUNT - 1) == MAX_KEYS;
+    assert pane_key_get(st[0..1024], 2, P_ANTHROPIC) == MAX_KEYS;
+    // the other panes are untouched
+    assert st[G_PANEK + 1 * PK + PK_KEYS] == 0;
+    assert st[G_PANEK + 3 * PK + PK_KEYS] == 0;
+    assert pane_key_get(st[0..1024], 3, P_OPENAI) == 0;
+}
+
+test a_pane_remembers_the_agent_cell_it_was_planned_for_as_one_nibble_of_cell_plus_one {
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    assert st[G_AGENTS] == 0;
+    assert pane_agent_get(st[0..1024], 0) == 0;
+    // cell 0 is stored as 1, so a pane planned for Claude Code is told from one never planned
+    pane_agent_set(st[0..1024], 0, 0);
+    assert st[G_AGENTS] == 1;
+    assert pane_agent_get(st[0..1024], 0) == 0;
+    pane_agent_set(st[0..1024], 1, 3);
+    assert pane_agent_get(st[0..1024], 1) == 3;
+    assert pane_agent_get(st[0..1024], 0) == 0;
+    assert st[G_AGENTS] == 1 + 4 * 16;
+    // overwrite replaces the old value and keeps the neighbours
+    pane_agent_set(st[0..1024], 1, 7);
+    assert pane_agent_get(st[0..1024], 1) == 7;
+    assert st[G_AGENTS] == 1 + 8 * 16;
+    pane_agent_set(st[0..1024], 1, 0);
+    assert st[G_AGENTS] == 1 + 1 * 16;
+    assert pane_agent_get(st[0..1024], 1) == 0;
+    // the last pane of the word and the largest cell it can hold
+    pane_agent_set(st[0..1024], 15, 14);
+    assert pane_agent_get(st[0..1024], 15) == 14;
+    assert pane_agent_get(st[0..1024], 0) == 0;
+    assert pane_agent_get(st[0..1024], 14) == 0;
+    assert pane_agent_get(st[0..1024], 2) == 0;
+}
+
+test lifting_the_rests_reaches_the_last_key_slot {
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    t_key(st[0..1024], P_ZAI, 7);
+    key_rest(st[0..1024], P_ZAI, 7, 4000);
+    assert st[G_KREST + key_index(P_ZAI, 7)] == 4000;
+    key_rests_lift(st[0..1024], P_ZAI);
+    assert st[G_KREST + key_index(P_ZAI, 7)] == 0;
+    assert key_present(st[0..1024], P_ZAI, 7);
+}
+
+// The owner's 11 z.ai keys (2026-10-22): the server holds all of them, a pane rotates onto key 11 and key 16,
+// and the slots of the last provider end inside the table.
+test the_server_holds_sixteen_keys_a_provider_and_rotates_onto_the_last {
+    var st : [1024]u64 = undefined;
+    t_table(st[0..1024]);
+    var k : u32 = 0;
+    while (k < 11) {
+        t_key(st[0..1024], P_ZAI, k);
+        key_used(st[0..1024], P_ZAI, k, 1000 + @as(u64, k));
+        k = k + 1;
+    }
+    assert key_count(st[0..1024], P_ZAI) == 11;
+    // keys 1 to 10 were used, key 11 never: the rotation picks key 11 (number 10)
+    key_used(st[0..1024], P_ZAI, 10, 0);
+    assert key_pick(st[0..1024], P_ZAI, MAX_KEYS, 5000) == 10;
+    // fill to 16: key 16 (number 15) is held, picked when the others were used later, and its pane says 16
+    while (k < MAX_KEYS) {
+        t_key(st[0..1024], P_ZAI, k);
+        key_used(st[0..1024], P_ZAI, k, 9000);
+        k = k + 1;
+    }
+    key_used(st[0..1024], P_ZAI, 10, 9000);
+    key_used(st[0..1024], P_ZAI, 15, 1);
+    assert key_count(st[0..1024], P_ZAI) == 16;
+    assert key_pick(st[0..1024], P_ZAI, MAX_KEYS, 10000) == 15;
+    assert key_pick_free(st[0..1024], P_ZAI, 15, 10000) < 15;
+    pane_key_set(st[0..1024], 0, P_ZAI, 16);
+    assert pane_key_shown(st[0..1024], 0, 1) == 16;
+    // the last provider's last slot sits inside both tables, before the pane words
+    t_key(st[0..1024], PROVIDER_COUNT - 1, MAX_KEYS - 1);
+    assert key_present(st[0..1024], PROVIDER_COUNT - 1, MAX_KEYS - 1);
+    assert G_KREST + key_index(PROVIDER_COUNT - 1, MAX_KEYS - 1) < G_PANEK;
+    assert key_count(st[0..1024], P_ZAI) == 16;
+    assert pane_key_get(st[0..1024], 15, P_ZAI) == 0;
+}

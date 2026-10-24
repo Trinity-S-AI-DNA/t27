@@ -1,0 +1,565 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/peer_identity_probe.t27 -- a program that shows peer_identity_host.t27 working (Refs gHashTag/t27#11560).
+// Not part of the app. Prints one line per fact; the lines say what was OBSERVED and nothing more: "mDNSResponder
+// acknowledged the registration" is not "a friend sees me", and a service found in the browser is a service found.
+// PI_ROLE (default both):
+//   files     identity and friends files under $HOME/.t27os: new -> created, again -> same fingerprint, a flipped byte
+//             -> refused and the file left as it was, friends add/duplicate/typo/self/remove/save/reload, a damaged
+//             friends file refused. Run it with HOME=<an empty temp directory>.
+//   announce  open (or make) the identity, register _t27call._udp with TXT fp/port/nick and keep it for PI_SECONDS.
+//   browse    browse _t27call._udp for PI_SECONDS, resolve what is found (host, port, TXT), look up its IPv4 address,
+//             and print each service with its fingerprint, whether it is this identity (SELF) or in the friends table.
+//   both      announce and browse in one process.
+// PI_SECONDS (default 8), PI_PORT (default 47741), PI_NICK (default t27os), PI_NAME (instance name, default the nick).
+// Exit 0 only when every check this role makes passed (browse/both: at least one service resolved with a valid fp).
+// Build (Apple silicon):
+//   t27b build specs/t27os/peer_identity_probe.t27 -o pip.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -o pip pip.o
+module T27osPeerIdentityProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::keysync::put_hex;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::FT_OK;
+use t27os::peer_identity::INV_OK;
+use t27os::peer_identity::FA_OK;
+use t27os::peer_identity::FA_DUPLICATE;
+use t27os::peer_identity::FA_BAD_INVITE;
+use t27os::peer_identity::FA_SELF;
+use t27os::peer_identity::INVITE_LEN;
+use t27os::peer_identity::NICK_MAX;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::invite_parse;
+use t27os::peer_identity::txt_build;
+use t27os::peer_identity::txt_fp;
+use t27os::peer_identity::txt_port;
+use t27os::peer_identity::txt_get;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::ft_find;
+use t27os::peer_identity::ft_count;
+use t27os::peer_identity::ft_remove;
+use t27os::peer_identity::ft_check;
+use t27os::peer_identity::id_check;
+use t27os::peer_identity_host::IH_CREATED;
+use t27os::peer_identity_host::IH_LOADED;
+use t27os::peer_identity_host::BR_LEN;
+use t27os::peer_identity_host::BR_COUNT;
+use t27os::peer_identity_host::BE_NAME;
+use t27os::peer_identity_host::BE_IF;
+use t27os::peer_identity_host::BE_STATE;
+use t27os::peer_identity_host::BE_PORT;
+use t27os::peer_identity_host::BE_TXTLEN;
+use t27os::peer_identity_host::BE_TXT;
+use t27os::peer_identity_host::BE_HOST;
+use t27os::peer_identity_host::BE_IP;
+use t27os::peer_identity_host::BS_NEW;
+use t27os::peer_identity_host::BS_RESOLVING;
+use t27os::peer_identity_host::BS_RESOLVED;
+use t27os::peer_identity_host::BS_ADDRESSED;
+use t27os::peer_identity_host::ih_home;
+use t27os::peer_identity_host::ih_path;
+use t27os::peer_identity_host::ih_slurp;
+use t27os::peer_identity_host::ih_write_atomic;
+use t27os::peer_identity_host::ih_identity_open;
+use t27os::peer_identity_host::ih_friends_open;
+use t27os::peer_identity_host::ih_friends_save;
+use t27os::peer_identity_host::ih_entry;
+use t27os::peer_identity_host::ih_addr;
+use t27os::peer_identity_host::ih_register;
+use t27os::peer_identity_host::ih_browse;
+use t27os::peer_identity_host::ih_resolve;
+use t27os::peer_identity_host::ih_resolve_closure;
+use t27os::peer_identity_host::ih_addrinfo;
+use t27os::peer_identity_host::ih_pump;
+use t27os::peer_identity_host::ih_free;
+use t27os::peer_identity_host::ih_sleep_ms;
+
+fn pip_peek32(at: u64) -> u32 {
+    var c : [4]u8 = undefined;
+    sys_peek(c[0..4], at, 4);
+    return @as(u32, c[0]) | (@as(u32, c[1]) << 8) | (@as(u32, c[2]) << 16) | (@as(u32, c[3]) << 24);
+}
+
+fn pip_peek8(at: u64) -> u32 {
+    var c : [1]u8 = undefined;
+    sys_peek(c[0..1], at, 1);
+    return @as(u32, c[0]);
+}
+
+fn pip_say(s: []const u8) -> void { sys_write(1, s, @as(u64, s.len)); }
+
+fn pip_dec(v: u64) -> void {
+    var d : [24]u8 = undefined;
+    const n : usize = put_dec(d[0..24], 0, v);
+    sys_write(1, d[0..n], @as(u64, n));
+}
+
+fn pip_dec_i(v: i64) -> void {
+    if (v < 0) {
+        pip_say("-");
+        pip_dec(@as(u64, @intCast(0 - v)));
+    } else {
+        pip_dec(@as(u64, @intCast(v)));
+    }
+}
+
+fn pip_hex(b: []const u8) -> void {
+    var h : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < b.len) {
+        const hi : u32 = @as(u32, b[i]) >> 4;
+        const lo : u32 = @as(u32, b[i]) & 15;
+        var c1 : u32 = 87 + hi;
+        if (hi < 10) { c1 = 48 + hi; }
+        var c2 : u32 = 87 + lo;
+        if (lo < 10) { c2 = 48 + lo; }
+        h[2 * i] = @as(u8, @intCast(c1));
+        h[2 * i + 1] = @as(u8, @intCast(c2));
+        i = i + 1;
+    }
+    sys_write(1, h[0..2 * b.len], @as(u64, 2 * b.len));
+}
+
+fn pip_ok(label: []const u8, ok: bool) -> bool {
+    if (ok) { pip_say("PASS "); } else { pip_say("FAIL "); }
+    pip_say(label);
+    pip_say("\n");
+    return ok;
+}
+
+fn pip_env(name: []const u8, out: []u8) -> usize {
+    const p : u64 = sys_getenv(name);
+    if (p == 0) { return 0; }
+    var n : u64 = sys_strlen(p);
+    if (n >= @as(u64, out.len)) { n = @as(u64, out.len - 1); }
+    if (n > 0) { sys_peek(out[0..@as(usize, n)], p, n); }
+    out[@as(usize, n)] = 0;
+    return @as(usize, n);
+}
+
+fn pip_env_num(name: []const u8, dflt: u64) -> u64 {
+    var b : [24]u8 = undefined;
+    const n : usize = pip_env(name, b[0..24]);
+    if (n == 0) { return dflt; }
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (b[i] < 48 or b[i] > 57) { return dflt; }
+        v = v * 10 + @as(u64, b[i] - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn pip_now_ms() -> u64 {
+    var tv : [16]u8 = undefined;
+    sys_gettimeofday(tv[0..16], 0);
+    return get_u64(tv[0..16], 0) * 1000 + (get_u64(tv[0..16], 8) & 4294967295) / 1000;
+}
+
+fn pip_same(a: []const u8, b: []const u8, n: usize) -> bool {
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- role: files
+
+fn pip_files() -> bool {
+    var all : bool = true;
+    var id : [208]u8 = undefined;
+    var fp1 : [10]u8 = undefined;
+    var fp2 : [10]u8 = undefined;
+    const nick : [4]u8 = [78, 111, 100, 101];
+    var r : u32 = ih_identity_open(nick[0..4], 4, id[0..208], fp1[0..10]);
+    all = pip_ok("identity: no file -> created", r == IH_CREATED) and all;
+    var inv : [25]u8 = undefined;
+    invite_make(fp1[0..10], inv[0..25]);
+    pip_say("  invite ");
+    sys_write(1, inv[0..25], 25);
+    pip_say("  fp ");
+    pip_hex(fp1[0..10]);
+    pip_say("\n");
+    var id2 : [208]u8 = undefined;
+    r = ih_identity_open(nick[0..4], 4, id2[0..208], fp2[0..10]);
+    all = pip_ok("identity: second start -> loaded, same fingerprint", r == IH_LOADED and pip_same(fp1[0..10], fp2[0..10], 10)) and all;
+    // flip one byte of the key part in the file
+    var home : [256]u8 = undefined;
+    const hn : usize = ih_home(home[0..256]);
+    var dir : [256]u8 = undefined;
+    var path : [256]u8 = undefined;
+    var tmp : [256]u8 = undefined;
+    ih_path(home[0..256], hn, 0, false, dir[0..256]);
+    ih_path(home[0..256], hn, 1, false, path[0..256]);
+    ih_path(home[0..256], hn, 1, true, tmp[0..256]);
+    var raw : [208]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..256], raw[0..208], 208);
+    all = pip_ok("identity: file on disk is 207 bytes", got == 207) and all;
+    all = pip_ok("identity: file on disk passes id_check", id_check(raw[0..207]) == 0) and all;
+    var bad : [208]u8 = raw;
+    bad[ID_OFF_PUB + 20] = bad[ID_OFF_PUB + 20] ^ 1;
+    ih_write_atomic(dir[0..256], path[0..256], tmp[0..256], bad[0..207], 207);
+    var id3 : [208]u8 = undefined;
+    var fp3 : [10]u8 = undefined;
+    r = ih_identity_open(nick[0..4], 4, id3[0..208], fp3[0..10]);
+    pip_say("  open of a damaged file returned ");
+    pip_dec(@as(u64, r));
+    pip_say(" (3 = refused, status in bits 8..15)\n");
+    all = pip_ok("identity: damaged file -> refused", (r & 255) == 3) and all;
+    var after : [208]u8 = undefined;
+    const got2 : i64 = ih_slurp(path[0..256], after[0..208], 208);
+    all = pip_ok("identity: damaged file left byte for byte as found", got2 == 207 and pip_same(after[0..207], bad[0..207], 207)) and all;
+    // a truncated file is refused too
+    ih_write_atomic(dir[0..256], path[0..256], tmp[0..256], raw[0..100], 100);
+    r = ih_identity_open(nick[0..4], 4, id3[0..208], fp3[0..10]);
+    all = pip_ok("identity: truncated file -> refused", (r & 255) == 3) and all;
+    // friends
+    var t : [1109]u8 = undefined;
+    r = ih_friends_open(t[0..1109]);
+    all = pip_ok("friends: no file -> empty table created", r == IH_CREATED and ft_count(t[0..1108]) == 0) and all;
+    var other : [10]u8 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    var oinv : [25]u8 = undefined;
+    invite_make(other[0..10], oinv[0..25]);
+    all = pip_ok("friends: add by invite", ft_add(t[0..1108], oinv[0..25], fp1[0..10]) == FA_OK) and all;
+    all = pip_ok("friends: the same invite again -> duplicate", ft_add(t[0..1108], oinv[0..25], fp1[0..10]) == FA_DUPLICATE) and all;
+    var typo : [25]u8 = oinv;
+    typo[10] = 65;
+    if (oinv[10] == 65) { typo[10] = 66; }
+    all = pip_ok("friends: a typo -> refused", ft_add(t[0..1108], typo[0..25], fp1[0..10]) == FA_BAD_INVITE) and all;
+    all = pip_ok("friends: own invite -> refused", ft_add(t[0..1108], inv[0..25], fp1[0..10]) == FA_SELF) and all;
+    all = pip_ok("friends: save", ih_friends_save(t[0..1108])) and all;
+    var t2 : [1109]u8 = undefined;
+    r = ih_friends_open(t2[0..1109]);
+    all = pip_ok("friends: reload -> loaded, 1 friend, found by fingerprint", r == IH_LOADED and ft_count(t2[0..1108]) == 1 and ft_find(t2[0..1108], other[0..10]) == 0) and all;
+    all = pip_ok("friends: remove and save", ft_remove(t2[0..1108], other[0..10]) and ih_friends_save(t2[0..1108])) and all;
+    var t3 : [1109]u8 = undefined;
+    r = ih_friends_open(t3[0..1109]);
+    all = pip_ok("friends: after remove and reload -> 0 friends", r == IH_LOADED and ft_count(t3[0..1108]) == 0) and all;
+    var fpath : [256]u8 = undefined;
+    var ftmp : [256]u8 = undefined;
+    ih_path(home[0..256], hn, 2, false, fpath[0..256]);
+    ih_path(home[0..256], hn, 2, true, ftmp[0..256]);
+    var fraw : [1109]u8 = undefined;
+    ih_slurp(fpath[0..256], fraw[0..1109], 1109);
+    fraw[200] = fraw[200] ^ 1;
+    ih_write_atomic(dir[0..256], fpath[0..256], ftmp[0..256], fraw[0..1108], 1108);
+    r = ih_friends_open(t3[0..1109]);
+    var fafter : [1109]u8 = undefined;
+    const fg : i64 = ih_slurp(fpath[0..256], fafter[0..1109], 1109);
+    all = pip_ok("friends: damaged file -> refused and left as found", (r & 255) == 3 and fg == 1108 and pip_same(fafter[0..1108], fraw[0..1108], 1108)) and all;
+    return all;
+}
+
+// ---------------------------------------------------------------- roles: announce / browse
+
+fn pip_print_name(e: u64) -> void {
+    var nb : [64]u8 = undefined;
+    var i : usize = 0;
+    var n : usize = 0;
+    while (i < 64) {
+        nb[i] = @as(u8, @intCast(pip_peek8(e + BE_NAME + i)));
+        if (nb[i] == 0) { break; }
+        n = n + 1;
+        i = i + 1;
+    }
+    sys_write(1, nb[0..n], @as(u64, n));
+}
+
+fn pip_run(announce: bool, browse: bool) -> bool {
+    var all : bool = true;
+    var nickb : [32]u8 = undefined;
+    var nn : usize = pip_env("PI_NICK", nickb[0..32]);
+    if (nn == 0) {
+        nickb[0] = 116;
+        nickb[1] = 50;
+        nickb[2] = 55;
+        nickb[3] = 111;
+        nickb[4] = 115;
+        nn = 5;
+    }
+    if (nn > NICK_MAX) { nn = NICK_MAX; }
+    const secs : u64 = pip_env_num("PI_SECONDS", 8);
+    const port : u32 = @as(u32, @intCast(pip_env_num("PI_PORT", 47741)));
+    var id : [208]u8 = undefined;
+    var fp : [10]u8 = undefined;
+    const r : u32 = ih_identity_open(nickb[0..32], nn, id[0..208], fp[0..10]);
+    all = pip_ok("identity opened (created or loaded)", r == IH_CREATED or r == IH_LOADED) and all;
+    if (r != IH_CREATED and r != IH_LOADED) { return false; }
+    var inv : [25]u8 = undefined;
+    invite_make(fp[0..10], inv[0..25]);
+    pip_say("MY INVITE ");
+    sys_write(1, inv[0..25], 25);
+    pip_say("\nMY FP ");
+    pip_hex(fp[0..10]);
+    pip_say("\n");
+    var ft : [1109]u8 = undefined;
+    const fr : u32 = ih_friends_open(ft[0..1109]);
+    all = pip_ok("friends table opened", fr == IH_CREATED or fr == IH_LOADED) and all;
+
+    var rref : [8]u8 = undefined;
+    var res : [72]u8 = undefined;
+    var i : usize = 0;
+    while (i < 72) {
+        res[i] = 0;
+        i = i + 1;
+    }
+    var txt : [96]u8 = undefined;
+    var txn : usize = 0;
+    var name : [64]u8 = undefined;
+    // the state block of the browser lives here for the whole run
+    var block : [4112]u8 = undefined;
+    i = 0;
+    while (i < 4112) {
+        block[i] = 0;
+        i = i + 1;
+    }
+    var clo : [160]u8 = undefined;
+    i = 0;
+    while (i < 160) {
+        clo[i] = 0;
+        i = i + 1;
+    }
+    var bref : [8]u8 = undefined;
+    put_u64(bref[0..8], 0, 0);
+    put_u64(rref[0..8], 0, 0);
+    var refs : [256]u8 = undefined;
+    i = 0;
+    while (i < 256) {
+        refs[i] = 0;
+        i = i + 1;
+    }
+    var code : u64 = 0;
+    const block_at : u64 = ih_addr(block[0..4112]);
+
+    if (announce) {
+        txn = txt_build(inv[0..25], port, nickb[0..32], nn, txt[0..96]);
+        all = pip_ok("TXT record built", txn > 0) and all;
+        var nl : usize = pip_env("PI_NAME", name[0..64]);
+        if (nl == 0) {
+            i = 0;
+            while (i < nn) {
+                name[i] = nickb[i];
+                i = i + 1;
+            }
+            name[nn] = 0;
+        }
+        const rc : i32 = ih_register(rref[0..8], name[0..64], port, txt[0..96], txn, res[0..72]);
+        pip_say("DNSServiceRegister returned ");
+        pip_dec_i(@as(i64, rc));
+        pip_say(" (0 = the call was taken)\n");
+        all = pip_ok("DNSServiceRegister taken", rc == 0) and all;
+    }
+    if (browse) {
+        code = ih_resolve_closure(clo[0..160]);
+        all = pip_ok("libffi closure for the 10-argument resolve callback", code != 0) and all;
+        const bc : i32 = ih_browse(bref[0..8], block_at);
+        pip_say("DNSServiceBrowse returned ");
+        pip_dec_i(@as(i64, bc));
+        pip_say("\n");
+        all = pip_ok("DNSServiceBrowse taken", bc == 0) and all;
+    }
+    const start : u64 = pip_now_ms();
+    const end : u64 = start + secs * 1000;
+    var acked : bool = false;
+    var acked_ms : u64 = 0;
+    while (pip_now_ms() < end) {
+        if (announce) {
+            ih_pump(get_u64(rref[0..8], 0), 0);
+            if (acked == false and pip_peek32(ih_addr(res[0..72])) == 1) {
+                acked = true;
+                acked_ms = pip_now_ms() - start;
+            }
+        }
+        if (browse) {
+            ih_pump(get_u64(bref[0..8], 0), 0);
+            var k : usize = 0;
+            while (k < BR_COUNT) {
+                const e : u64 = ih_entry(block_at, k);
+                const st : u32 = pip_peek32(e + BE_STATE);
+                const rs : u64 = get_u64(refs[0..256], k * 16);
+                const as_ : u64 = get_u64(refs[0..256], k * 16 + 8);
+                if (st == BS_NEW and rs == 0) {
+                    var rb : [8]u8 = undefined;
+                    if (ih_resolve(rb[0..8], e, code) == 0) {
+                        put_u64(refs[0..256], k * 16, get_u64(rb[0..8], 0));
+                        ih_poke_state(e, BS_RESOLVING);
+                    }
+                }
+                if (st == BS_RESOLVING and rs != 0) { ih_pump(rs, 0); }
+                if (st == BS_RESOLVED and as_ == 0) {
+                    ih_free(rs);
+                    put_u64(refs[0..256], k * 16, 0);
+                    var ab : [8]u8 = undefined;
+                    if (ih_addrinfo(ab[0..8], e) == 0) { put_u64(refs[0..256], k * 16 + 8, get_u64(ab[0..8], 0)); }
+                }
+                if ((st == BS_RESOLVED or st == BS_ADDRESSED) and as_ != 0) { ih_pump(as_, 0); }
+                k = k + 1;
+            }
+        }
+        ih_sleep_ms(40);
+    }
+    if (announce) {
+        pip_say("REGISTER ack from mDNSResponder: ");
+        if (acked) {
+            pip_say("yes after ");
+            pip_dec(acked_ms);
+            pip_say(" ms, error code ");
+            pip_dec(@as(u64, pip_peek32(ih_addr(res[0..72]) + 4)));
+            pip_say(", instance name ");
+            var rn : [64]u8 = undefined;
+            var q : usize = 0;
+            var qn : usize = 0;
+            while (q < 64) {
+                rn[q] = res[8 + q];
+                if (rn[q] == 0) { break; }
+                qn = qn + 1;
+                q = q + 1;
+            }
+            sys_write(1, rn[0..qn], @as(u64, qn));
+            pip_say("\n");
+        } else {
+            pip_say("NO\n");
+        }
+        all = pip_ok("announcement acknowledged by the daemon with error 0", acked and pip_peek32(ih_addr(res[0..72]) + 4) == 0) and all;
+    }
+    var found_valid : u32 = 0;
+    if (browse) {
+        var k2 : usize = 0;
+        while (k2 < BR_COUNT) {
+            const e : u64 = ih_entry(block_at, k2);
+            const st : u32 = pip_peek32(e + BE_STATE);
+            if (st != 0) {
+                pip_say("SERVICE name=");
+                pip_print_name(e);
+                pip_say(" if=");
+                pip_dec(@as(u64, pip_peek32(e + BE_IF)));
+                pip_say(" state=");
+                pip_dec(@as(u64, st));
+                if (st >= BS_RESOLVED) {
+                    pip_say(" host=");
+                    var hb : [44]u8 = undefined;
+                    var h : usize = 0;
+                    var hl : usize = 0;
+                    while (h < 44) {
+                        hb[h] = @as(u8, @intCast(pip_peek8(e + BE_HOST + h)));
+                        if (hb[h] == 0) { break; }
+                        hl = hl + 1;
+                        h = h + 1;
+                    }
+                    sys_write(1, hb[0..hl], @as(u64, hl));
+                    pip_say(" port=");
+                    pip_dec(@as(u64, pip_peek32(e + BE_PORT)));
+                    var tb : [128]u8 = undefined;
+                    var z : usize = 0;
+                    while (z < 128) {
+                        tb[z] = @as(u8, @intCast(pip_peek8(e + BE_TXT + z)));
+                        z = z + 1;
+                    }
+                    const tl : usize = @as(usize, pip_peek32(e + BE_TXTLEN));
+                    var pfp : [10]u8 = undefined;
+                    const vs : u32 = txt_fp(tb[0..128], tl, pfp[0..10]);
+                    if (vs == INV_OK) {
+                        var pinv : [25]u8 = undefined;
+                        invite_make(pfp[0..10], pinv[0..25]);
+                        pip_say(" fp=");
+                        pip_hex(pfp[0..10]);
+                        pip_say(" invite=");
+                        sys_write(1, pinv[0..25], 25);
+                        pip_say(" txt_port=");
+                        pip_dec(@as(u64, txt_port(tb[0..128], tl)));
+                        var nk : [32]u8 = undefined;
+                        const key : [4]u8 = [110, 105, 99, 107];
+                        const kn : usize = txt_get(tb[0..128], tl, key[0..4], nk[0..32]);
+                        pip_say(" nick=");
+                        sys_write(1, nk[0..kn], @as(u64, kn));
+                        if (pip_same(pfp[0..10], fp[0..10], 10)) { pip_say(" SELF"); }
+                        if (ft_find(ft[0..1108], pfp[0..10]) != 32) { pip_say(" FRIEND"); }
+                        found_valid = found_valid + 1;
+                    } else {
+                        pip_say(" fp=INVALID(");
+                        pip_dec(@as(u64, vs));
+                        pip_say(")");
+                    }
+                }
+                if (st == BS_ADDRESSED) {
+                    const ip : u32 = pip_peek32(e + BE_IP);
+                    pip_say(" ipv4=");
+                    pip_dec(@as(u64, ip & 255));
+                    pip_say(".");
+                    pip_dec(@as(u64, (ip >> 8) & 255));
+                    pip_say(".");
+                    pip_dec(@as(u64, (ip >> 16) & 255));
+                    pip_say(".");
+                    pip_dec(@as(u64, (ip >> 24) & 255));
+                }
+                pip_say("\n");
+            }
+            k2 = k2 + 1;
+        }
+        pip_say("services resolved with a valid fingerprint: ");
+        pip_dec(@as(u64, found_valid));
+        pip_say("\n");
+        all = pip_ok("at least one service found with a valid fingerprint", found_valid > 0) and all;
+    }
+    // leave nothing behind: every ref is deallocated, which also withdraws the announcement
+    var q2 : usize = 0;
+    while (q2 < BR_COUNT) {
+        ih_free(get_u64(refs[0..256], q2 * 16));
+        ih_free(get_u64(refs[0..256], q2 * 16 + 8));
+        q2 = q2 + 1;
+    }
+    ih_free(get_u64(bref[0..8], 0));
+    ih_free(get_u64(rref[0..8], 0));
+    return all;
+}
+
+fn ih_poke_state(e: u64, v: u32) -> void {
+    var c : [4]u8 = undefined;
+    c[0] = @as(u8, @intCast(v & 255));
+    c[1] = 0;
+    c[2] = 0;
+    c[3] = 0;
+    pip_poke(e + BE_STATE, c[0..4], 4);
+}
+
+fn pip_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+pub fn main() -> void {
+    var rb : [16]u8 = undefined;
+    const rn : usize = pip_env("PI_ROLE", rb[0..16]);
+    var ok : bool = false;
+    if (rn == 5 and rb[0] == 102) {
+        pip_say("peer identity probe: files\n");
+        ok = pip_files();
+    } else if (rn == 8 and rb[0] == 97) {
+        pip_say("peer identity probe: announce\n");
+        ok = pip_run(true, false);
+    } else if (rn == 6 and rb[0] == 98 and rb[1] == 114) {
+        pip_say("peer identity probe: browse\n");
+        ok = pip_run(false, true);
+    } else {
+        pip_say("peer identity probe: both\n");
+        ok = pip_run(true, true);
+    }
+    if (ok) {
+        pip_say("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    pip_say("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}

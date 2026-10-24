@@ -1,0 +1,1516 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/friends_engine.t27 -- the host side of "call a friend by key" (owner, 2026-10-22; Refs gHashTag/t27#11560).
+// peer_identity.t27 decides what an identity, an invite and the friends table are; peer_identity_host.t27 reaches the
+// files and mDNSResponder; friends_view.t27 decides what the panel shows. This file joins them for the window:
+//   fe_identity   at launch, before the call socket: the identity file (made when absent, never overwritten when
+//                 damaged), the friends file, this device's invite; the 10-byte fingerprint the call session uses as
+//                 its own (call_core frames name the receiver's fingerprint, so only the owner of a fingerprint is
+//                 rung by a call addressed to it);
+//   fe_net        after the call socket is open: announce _t27call._udp (TXT: fp, port, nick) and browse it;
+//   fe_tick       every loop pass (it works at most every 50 ms): pump the daemon, resolve what the browser found
+//                 (host, port, TXT, IPv4), match the TXT fingerprints with the friends table, keep for every friend
+//                 whether it is announced now, the address to dial and when it was last met, rebuild the snapshot
+//                 the panel draws;
+//   fe_add        the invite typed in the add field -> the table -> the file;
+//   fe_call       a click on a friend: the address comes from the resolve, the fingerprint from the table, cs_call.
+// Everything lives in the CALL region of the text store (the engine part from FV_ENGINE): that array is a local of
+// main() and never moves, as the daemon's callbacks and the libffi closure need.
+//
+// Test aids (opt-in, off by default): T27OS_NICK (the nickname announced; default t27os), T27OS_FRIEND_ADD (an invite
+// added at launch), T27OS_FRIEND_DIAL (a friend's nickname, as the list shows it; the friend is called as a click would call
+// it, as soon as it is online), T27OS_FRIENDS_LOG (one line a second to stderr), T27OS_CALL_AUTODIAL (a friend's invite
+// T27-...: added if absent, then called once, as a click would, as soon as it is online), T27OS_CALL_AUTODIAL2 (with
+// AUTODIAL: a second friend's invite; both are picked for one group call as soon as both are online). Test aids, not
+// product behavior.
+// Flat namespace (the window build splices imported modules): every name here starts with fe_ / FE_.
+module T27osFriendsEngine;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_session::cs_call;
+use t27os::call_session::csg_add;
+use t27os::call_view::cv_lan_ok;
+use t27os::call_view::cv_txt_pub;
+use t27os::call_view::CV_N_REFUSED;
+use t27os::call_view::CV_N_SOCKET;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::NICK_MAX;
+use t27os::peer_identity::INVITE_LEN;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_NICK_LEN;
+use t27os::peer_identity::ID_OFF_NICK;
+use t27os::peer_identity::INV_OK;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::FT_HDR;
+use t27os::peer_identity::FT_ROW;
+use t27os::peer_identity::FT_MAX;
+use t27os::peer_identity::FA_OK;
+use t27os::peer_identity::FA_BAD_INVITE;
+use t27os::peer_identity::FA_DUPLICATE;
+use t27os::peer_identity::FA_FULL;
+use t27os::peer_identity::FA_SELF;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::invite_parse;
+use t27os::peer_identity::nick_ok;
+use t27os::peer_identity::txt_build;
+use t27os::peer_identity::txt_fp;
+use t27os::peer_identity::txt_port;
+use t27os::peer_identity::txt_get;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::ft_count;
+use t27os::peer_identity::ft_find;
+use t27os::peer_identity::ft_remove;
+use t27os::peer_identity::ft_fp_at;
+use t27os::peer_identity::ft_set_nick;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity_host::IH_CREATED;
+use t27os::peer_identity_host::IH_LOADED;
+use t27os::peer_identity_host::BR_COUNT;
+use t27os::peer_identity_host::BR_LEN;
+use t27os::peer_identity_host::BE_NAME;
+use t27os::peer_identity_host::BE_IF;
+use t27os::peer_identity_host::BE_STATE;
+use t27os::peer_identity_host::BE_PORT;
+use t27os::peer_identity_host::BE_TXTLEN;
+use t27os::peer_identity_host::BE_TXT;
+use t27os::peer_identity_host::BE_IP;
+use t27os::peer_identity_host::BS_NEW;
+use t27os::peer_identity_host::BS_RESOLVING;
+use t27os::peer_identity_host::BS_RESOLVED;
+use t27os::peer_identity_host::BS_ADDRESSED;
+use t27os::peer_identity_host::ih_identity_open;
+use t27os::peer_identity_host::ih_friends_open;
+use t27os::peer_identity_host::ih_friends_save;
+use t27os::peer_identity_host::ih_entry;
+use t27os::peer_identity_host::ih_addr;
+use t27os::peer_identity_host::ih_register;
+use t27os::peer_identity_host::ih_browse;
+use t27os::peer_identity_host::ih_resolve;
+use t27os::peer_identity_host::ih_resolve_closure;
+use t27os::peer_identity_host::ih_addrinfo;
+use t27os::peer_identity_host::ih_pump;
+use t27os::peer_identity_host::ih_free;
+use t27os::peer_identity_host::ih_reg_cb;
+use t27os::peer_identity_host::ih_browse_cb;
+use t27os::peer_identity_host::ih_resolve_h;
+use t27os::peer_identity_host::ih_addr_cb;
+use t27os::friends_view::FV_ENGINE;
+use t27os::friends_view::FV_COUNT;
+use t27os::friends_view::FV_SHOWN;
+use t27os::friends_view::FV_DEBUG;
+use t27os::friends_view::FV_INVLEN;
+use t27os::friends_view::FV_IDSTATE;
+use t27os::friends_view::FV_NICKLEN;
+use t27os::friends_view::FV_NET;
+use t27os::friends_view::FV_INV;
+use t27os::friends_view::FV_MYNICK;
+use t27os::friends_view::FV_TYPED;
+use t27os::friends_view::FV_SCROLL;
+use t27os::friends_view::FV_ROWS_SNAP;
+use t27os::friends_view::FV_NET_OFF;
+use t27os::friends_view::FV_NET_UP;
+use t27os::friends_view::FV_NET_FAIL;
+use t27os::friends_view::FV_NEVER;
+use t27os::friends_view::FV_R_ONLINE;
+use t27os::friends_view::FV_R_NEVER;
+use t27os::friends_view::FV_R_GONE;
+use t27os::friends_view::FV_R_ADDR;
+use t27os::friends_view::FV_R_LOOKUP;
+use t27os::friends_view::FV_R_NONET;
+use t27os::friends_view::FN_ADDED;
+use t27os::friends_view::FN_BAD;
+use t27os::friends_view::FN_DUP;
+use t27os::friends_view::FN_SELF;
+use t27os::friends_view::FN_FULL;
+use t27os::friends_view::FN_DAMAGED;
+use t27os::friends_view::FN_EMPTY;
+use t27os::friends_view::FN_NOSAVE;
+use t27os::friends_view::FN_REMOVED;
+use t27os::friends_view::FN_RM_NOSAVE;
+use t27os::friends_view::FN_OFF;
+use t27os::friends_view::FR_NICKLEN;
+use t27os::friends_view::FR_NICK;
+use t27os::friends_view::FR_FP;
+use t27os::friends_view::FR_ONLINE;
+use t27os::friends_view::FR_AGO;
+use t27os::friends_view::FR_IP;
+use t27os::friends_view::FR_PORT;
+use t27os::friends_view::FR_REASON;
+use t27os::friends_view::fv_row_at;
+use t27os::friends_view::fv_get32;
+use t27os::friends_view::fv_put32;
+use t27os::friends_view::fv_row_addr;
+use t27os::friends_view::fv_offline_note;
+use t27os::update_core::upd_txt_add;
+use t27os::update_core::upd_txt_add_port;
+use t27os::update_core::upd_txt_uport;
+use t27os::update_core::upd_txt_build;
+use t27os::update_core::upd_txt_version;
+use t27os::update_core::upd_neighbour_newer;
+use t27os::update_core::um_author_known;
+use t27os::update_core::um_ver_part;
+use t27os::update_view::upv_get32;
+use t27os::update_view::upv_put32;
+use t27os::update_view::UPV_TXTUP;
+use t27os::update_view::UPV_MYBUILD;
+use t27os::update_view::UPV_MYVEROK;
+use t27os::update_view::UPV_MYMAJ;
+use t27os::update_view::UPV_MYMIN;
+use t27os::update_view::UPV_MYPAT;
+use t27os::update_view::UPV_SPORT;
+use t27os::update_view::UPV_OBUILD;
+use t27os::update_view::UPV_OPORT;
+use t27os::update_view::UPV_OIP;
+use t27os::update_view::UPV_OMAJ;
+use t27os::update_view::UPV_OMIN;
+use t27os::update_view::UPV_OPAT;
+use t27os::update_view::UPV_NICK;
+use t27os::update_view::UPV_NICKLEN;
+
+fn fe_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn fe_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+// ---------------------------------------------------------------- 1. the engine's blocks inside the CALL region
+
+pub const FE_ID : usize = 1024;
+pub const FE_FP : usize = 1240;
+pub const FE_FT : usize = 1256;
+pub const FE_BR : usize = 2376;
+pub const FE_CLO : usize = 6488;
+pub const FE_REFS : usize = 6648;
+pub const FE_RREF : usize = 6904;
+pub const FE_BREF : usize = 6912;
+pub const FE_RES : usize = 6920;
+pub const FE_NAME : usize = 6992;
+pub const FE_TXT : usize = 7056;
+pub const FE_CODE : usize = 7152;
+pub const FE_SLOTS : usize = 7160;
+/// A scratch for the ref a new resolve or address lookup returns (8 bytes).
+pub const FE_TMP : usize = 7224;
+pub const FE_SEEN : usize = 7248;
+pub const FE_TONE : usize = 7760;
+/// The end of the engine's blocks; the CALL region is FE_END bytes at least.
+pub const FE_END : usize = 7952;
+
+/// Slots (u64) at FE_SLOTS: 0 last tick ms, 1 the nickname-to-dial armed (1) / done (2), 2 last log second, 3 resolve
+/// closure made, 4 entries resolved so far, 5 own port, 6 own IPv4 (big endian value), 7 friends file ok.
+pub const FE_S_TICK : usize = 0;
+pub const FE_S_DIAL : usize = 1;
+pub const FE_S_LOG : usize = 2;
+pub const FE_S_CLO : usize = 3;
+pub const FE_S_RESOLVED : usize = 4;
+pub const FE_S_PORT : usize = 5;
+pub const FE_S_IP : usize = 6;
+pub const FE_S_FILE : usize = 7;
+/// Per friend, 16 bytes at FE_SEEN + 16 * i: last met ms (u64), IPv4 big endian (u32), port (u32). 32 friends.
+pub const FE_SEEN_LEN : usize = 16;
+pub const FE_TICK_MS : u64 = 50;
+
+fn fe_sl(cl: []const u8, k: usize) -> u64 { return get_u64(cl, FE_SLOTS + k * 8); }
+fn fe_ss(cl: []u8, k: usize, v: u64) -> void { put_u64(cl, FE_SLOTS + k * 8, v); }
+
+fn fe_peek32(at: u64) -> u32 {
+    var c : [4]u8 = undefined;
+    sys_peek(c[0..4], at, 4);
+    return @as(u32, c[0]) | (@as(u32, c[1]) << 8) | (@as(u32, c[2]) << 16) | (@as(u32, c[3]) << 24);
+}
+
+fn fe_poke32(at: u64, v: u32) -> void {
+    var c : [4]u8 = undefined;
+    c[0] = @as(u8, @intCast(v & 255));
+    c[1] = @as(u8, @intCast((v >> 8) & 255));
+    c[2] = @as(u8, @intCast((v >> 16) & 255));
+    c[3] = @as(u8, @intCast((v >> 24) & 255));
+    fe_poke(at, c[0..4], 4);
+}
+
+/// The address of byte `at` of the region.
+fn fe_base(cl: []u8) -> u64 { return ih_addr(cl); }
+
+fn fe_env(name: []const u8, out: []u8) -> usize {
+    const a : u64 = sys_getenv(name);
+    if (a == 0) { return 0; }
+    var n : u64 = sys_strlen(a);
+    if (n >= @as(u64, out.len)) { n = @as(u64, out.len - 1); }
+    if (n > 0) { sys_peek(out[0..@as(usize, n)], a, n); }
+    return @as(usize, n);
+}
+
+// ---------------------------------------------------------------- 2. identity, friends file, this device's invite
+
+/// The identity and the friends file, and the invite and nickname the panel shows. The own fingerprint (10 bytes) goes
+/// to `fp`. False when the identity cannot be opened (calls are then off; a damaged file is left byte for byte as
+/// found). The friends file failing does not stop calls: the list is empty and FV_IDSTATE says so.
+pub fn fe_identity(cl: []u8, fp: []u8) -> bool {
+    if (fp.len < FP_BYTES or cl.len < FE_END) { return false; }
+    var nick : [32]u8 = undefined;
+    var nn : usize = fe_env("T27OS_NICK", nick[0..32]);
+    if (nn == 0 or nn > NICK_MAX or !nick_ok(nick[0..32], nn)) {
+        nick[0] = 116;
+        nick[1] = 50;
+        nick[2] = 55;
+        nick[3] = 111;
+        nick[4] = 115;
+        nn = 5;
+    }
+    const r : u32 = ih_identity_open(nick[0..32], nn, cl[FE_ID..FE_ID + ID_LEN + 1], cl[FE_FP..FE_FP + 16]);
+    cl[FV_IDSTATE] = @as(u8, @intCast(r & 255));
+    if ((r & 255) != IH_CREATED and (r & 255) != IH_LOADED) { return false; }
+    var i : usize = 0;
+    while (i < FP_BYTES) {
+        fp[i] = cl[FE_FP + i];
+        i = i + 1;
+    }
+    invite_make(cl[FE_FP..FE_FP + FP_BYTES], cl[FV_INV..FV_INV + INVITE_LEN]);
+    // the nickname this identity carries (the file's own, which a second start keeps)
+    const ln : usize = @as(usize, cl[FE_ID + ID_OFF_NICK_LEN]);
+    var k : usize = 0;
+    while (k < ln and k < NICK_MAX) {
+        cl[FV_MYNICK + k] = cl[FE_ID + ID_OFF_NICK + k];
+        k = k + 1;
+    }
+    cl[FV_NICKLEN] = @as(u8, @intCast(k));
+    const fr : u32 = ih_friends_open(cl[FE_FT..FE_FT + FT_LEN + 1]);
+    if ((fr & 255) == IH_CREATED or (fr & 255) == IH_LOADED) {
+        fe_ss(cl, FE_S_FILE, 1);
+    } else {
+        fe_ss(cl, FE_S_FILE, 0);
+        fe_ft_clear(cl);
+    }
+    // a friend named at launch (a test aid)
+    var inv : [32]u8 = undefined;
+    const n : usize = fe_env("T27OS_FRIEND_ADD", inv[0..32]);
+    if (n == INVITE_LEN and fe_ss_file(cl)) {
+        ft_add(cl[FE_FT..FE_FT + FT_LEN], inv[0..INVITE_LEN], cl[FE_FP..FE_FP + FP_BYTES]);
+        ih_friends_save(cl[FE_FT..FE_FT + FT_LEN]);
+    }
+    var dn : [32]u8 = undefined;
+    if (fe_env("T27OS_FRIEND_DIAL", dn[0..32]) > 0) { fe_ss(cl, FE_S_DIAL, 1); }
+    // T27OS_CALL_AUTODIAL (test aid, off by default, not product behavior): the invite is added, then called once
+    var afp : [10]u8 = undefined;
+    if (fe_autodial_fp(afp[0..10]) and fe_env("T27OS_CALL_AUTODIAL", inv[0..32]) == INVITE_LEN) {
+        if (fe_ss_file(cl)) {
+            ft_add(cl[FE_FT..FE_FT + FT_LEN], inv[0..INVITE_LEN], cl[FE_FP..FE_FP + FP_BYTES]);
+            ih_friends_save(cl[FE_FT..FE_FT + FT_LEN]);
+        }
+        fe_ss(cl, FE_S_DIAL, 1);
+    }
+    // T27OS_CALL_AUTODIAL2 (test aid): the second friend of a group call, added if absent
+    var bfp : [10]u8 = undefined;
+    if (fe_autodial2_fp(bfp[0..10]) and fe_env("T27OS_CALL_AUTODIAL2", inv[0..32]) == INVITE_LEN and fe_ss_file(cl)) {
+        ft_add(cl[FE_FT..FE_FT + FT_LEN], inv[0..INVITE_LEN], cl[FE_FP..FE_FP + FP_BYTES]);
+        ih_friends_save(cl[FE_FT..FE_FT + FT_LEN]);
+    }
+    fe_snapshot(cl, ckh_ms());
+    return true;
+}
+
+/// T27OS_CALL_AUTODIAL2 (a test aid): the 10-byte key of the invite it holds; false when unset or not a valid invite.
+fn fe_autodial2_fp(fp: []u8) -> bool {
+    var b : [32]u8 = undefined;
+    if (fe_env("T27OS_CALL_AUTODIAL2", b[0..32]) != INVITE_LEN) { return false; }
+    return invite_parse(b[0..INVITE_LEN], fp) == INV_OK;
+}
+
+/// The shown row of a friend by fingerprint, FV_ROWS_SNAP when none matches.
+fn fe_row_of_fp(cl: []const u8, fp: []const u8) -> usize {
+    var j : usize = 0;
+    while (j < @as(usize, cl[FV_SHOWN])) {
+        const rj : usize = fv_row_at(j);
+        var same : bool = true;
+        var m : usize = 0;
+        while (m < 10) {
+            if (cl[rj + FR_FP + m] != fp[m]) { same = false; }
+            m = m + 1;
+        }
+        if (same) { return j; }
+        j = j + 1;
+    }
+    return FV_ROWS_SNAP;
+}
+
+/// T27OS_CALL_AUTODIAL with T27OS_CALL_AUTODIAL2 (a test aid, off by default): as soon as both friends are online they are
+/// picked for one group call (csg_add, one link each); the single dial of AUTODIAL does not happen then. True once.
+pub fn fe_group_tick(cl: []u8, s: []u8) -> bool {
+    if (fe_sl(cl, FE_S_DIAL) != 1) { return false; }
+    var f1 : [10]u8 = undefined;
+    var f2 : [10]u8 = undefined;
+    if (!fe_autodial_fp(f1[0..10]) or !fe_autodial2_fp(f2[0..10])) { return false; }
+    const r1 : usize = fe_row_of_fp(cl, f1[0..10]);
+    const r2 : usize = fe_row_of_fp(cl, f2[0..10]);
+    if (r1 >= FV_ROWS_SNAP or r2 >= FV_ROWS_SNAP) { return false; }
+    if (cl[fv_row_at(r1) + FR_ONLINE] == 0 or cl[fv_row_at(r2) + FR_ONLINE] == 0) { return false; }
+    const a1 : u64 = fv_row_addr(cl, r1);
+    const a2 : u64 = fv_row_addr(cl, r2);
+    if (a1 == 0 or a2 == 0) { return false; }
+    const ok1 : bool = csg_add(s, f1[0..10], a1 / 65536, a1 % 65536);
+    const ok2 : bool = csg_add(s, f2[0..10], a2 / 65536, a2 % 65536);
+    fe_dial_done(cl);
+    return ok1 and ok2;
+}
+
+/// T27OS_CALL_AUTODIAL (a test aid): the 10-byte key of the invite it holds; false when unset or not a valid invite.
+fn fe_autodial_fp(fp: []u8) -> bool {
+    var b : [32]u8 = undefined;
+    if (fe_env("T27OS_CALL_AUTODIAL", b[0..32]) != INVITE_LEN) { return false; }
+    return invite_parse(b[0..INVITE_LEN], fp) == INV_OK;
+}
+
+fn fe_ss_file(cl: []const u8) -> bool { return fe_sl(cl, FE_S_FILE) != 0; }
+
+/// An empty in-memory table when the friends file cannot be used.
+fn fe_ft_clear(cl: []u8) -> void {
+    var i : usize = 0;
+    while (i < FT_LEN + 1) {
+        cl[FE_FT + i] = 0;
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 3. announce and browse
+
+fn fe_zero(cl: []u8, from: usize, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        cl[from + i] = 0;
+        i = i + 1;
+    }
+}
+
+/// Announce this device and start the browser. `port` is the call port (the socket is already bound). The instance
+/// name is the nickname and the first two bytes of the fingerprint, so two devices of one nickname do not collide.
+pub fn fe_net(cl: []u8, ip: u64, port: u64) -> bool {
+    if (cl[FV_IDSTATE] != IH_CREATED and cl[FV_IDSTATE] != IH_LOADED) { return false; }
+    fe_ss(cl, FE_S_PORT, port);
+    fe_ss(cl, FE_S_IP, ip);
+    fe_zero(cl, FE_BR, BR_LEN);
+    fe_zero(cl, FE_CLO, 160);
+    fe_zero(cl, FE_REFS, 256);
+    fe_zero(cl, FE_RES, 72);
+    fe_zero(cl, FE_NAME, 64);
+    fe_zero(cl, FE_TXT, 96);
+    put_u64(cl, FE_RREF, 0);
+    put_u64(cl, FE_BREF, 0);
+    put_u64(cl, FE_CODE, 0);
+    var nick : [24]u8 = undefined;
+    const nn : usize = @as(usize, cl[FV_NICKLEN]);
+    var i : usize = 0;
+    while (i < nn) {
+        nick[i] = cl[FV_MYNICK + i];
+        i = i + 1;
+    }
+    var tn : usize = txt_build(cl[FV_INV..FV_INV + INVITE_LEN], @as(u32, @intCast(port)), nick[0..24], nn, cl[FE_TXT..FE_TXT + 96]);
+    if (tn == 0) {
+        cl[FV_NET] = @as(u8, @intCast(FV_NET_FAIL));
+        return false;
+    }
+    // listening on all interfaces (T27OS_CALL_BIND=0.0.0.0, call_view section 7): the record says pub=1, before the
+    // update keys so it is never the one left out
+    tn = cv_txt_pub(cl[FE_TXT..FE_TXT + 96], tn, ip == 0);
+    tn = fe_txt_update(cl, tn);
+    // "<nick> <4 hex>" as the instance name (NUL-terminated)
+    var nm : usize = 0;
+    while (nm < nn) {
+        cl[FE_NAME + nm] = nick[nm];
+        nm = nm + 1;
+    }
+    cl[FE_NAME + nm] = 32;
+    nm = nm + 1;
+    var h : usize = 0;
+    while (h < 2) {
+        const b : u8 = cl[FE_FP + h];
+        cl[FE_NAME + nm] = fe_hexc(@as(u32, b >> 4));
+        cl[FE_NAME + nm + 1] = fe_hexc(@as(u32, b & 15));
+        nm = nm + 2;
+        h = h + 1;
+    }
+    cl[FE_NAME + nm] = 0;
+    const rc : i32 = ih_register(cl[FE_RREF..FE_RREF + 8], cl[FE_NAME..FE_NAME + 64], @as(u32, @intCast(port)), cl[FE_TXT..FE_TXT + 96], tn, cl[FE_RES..FE_RES + 72]);
+    const code : u64 = ih_resolve_closure(cl[FE_CLO..FE_CLO + 160]);
+    fe_ss(cl, FE_S_CLO, code);
+    const bc : i32 = ih_browse(cl[FE_BREF..FE_BREF + 8], fe_base(cl[FE_BR..FE_BR + BR_LEN]));
+    if (rc != 0 or code == 0 or bc != 0) {
+        cl[FV_NET] = @as(u8, @intCast(FV_NET_FAIL));
+        return false;
+    }
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_UP));
+    return true;
+}
+
+/// The update keys after fp/port/nick (update_view.t27): ver and build of this bundle when it has them, then "up=" when
+/// the window serves its bundle on a port. A record with no room for "up" keeps ver and build (UPV_TXTUP stays 0, the
+/// panel says "not announced"); a bundle with no build announces as before. The record's new length.
+fn fe_txt_update(cl: []u8, tn: usize) -> usize {
+    cl[UPV_TXTUP] = 0;
+    const build : u64 = upv_get32(cl, UPV_MYBUILD);
+    if (cl[UPV_MYVEROK] == 0 or build == 0) { return tn; }
+    var a : [96]u8 = undefined;
+    const k : usize = upd_txt_add(cl[FE_TXT..FE_TXT + 96], tn, @as(u32, cl[UPV_MYMAJ]), @as(u32, cl[UPV_MYMIN]), @as(u32, cl[UPV_MYPAT]), @as(u32, @intCast(build)), a[0..96]);
+    if (k == 0) { return tn; }
+    var b : [96]u8 = undefined;
+    var n : usize = k;
+    const sport : u64 = upv_get32(cl, UPV_SPORT);
+    var k2 : usize = 0;
+    if (sport != 0) { k2 = upd_txt_add_port(a[0..96], k, @as(u32, @intCast(sport)), b[0..96]); }
+    var i : usize = 0;
+    if (k2 > 0) {
+        n = k2;
+        while (i < n) {
+            cl[FE_TXT + i] = b[i];
+            i = i + 1;
+        }
+        cl[UPV_TXTUP] = 1;
+        return n;
+    }
+    while (i < n) {
+        cl[FE_TXT + i] = a[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The newest build a friend (or this device's own key, from another process) announces next to us with an update port:
+/// its address (the best allowed one, as fe_match picks), port, build, version and the nickname it announces, into the
+/// UPV_O* bytes. True when there is one; the bytes are cleared when there is none. own_ver/own_build: this bundle.
+pub fn fe_offer(cl: []u8, own_ver: u64, own_build: u32) -> bool {
+    const block_at : u64 = fe_base(cl[FE_BR..FE_BR + BR_LEN]);
+    var best_b : u32 = 0;
+    var best_ip : u64 = 0;
+    var best_port : u32 = 0;
+    var best_v : u64 = 0;
+    var best_k : usize = BR_COUNT;
+    var k : usize = 0;
+    while (k < BR_COUNT) {
+        const e : u64 = ih_entry(block_at, k);
+        if (fe_peek32(e + BE_STATE) == BS_ADDRESSED) {
+            var tb : [128]u8 = undefined;
+            const tl : usize = fe_read_txt(e, tb[0..128]);
+            var pfp : [10]u8 = undefined;
+            const ip : u64 = fe_entry_ip(e);
+            if (txt_fp(tb[0..128], tl, pfp[0..10]) == INV_OK and cv_lan_ok(ip)) {
+                const known : bool = um_author_known(cl[FE_FT..FE_FT + FT_LEN], cl[FE_FP..FE_FP + FP_BYTES], pfp[0..10]);
+                const up : u32 = upd_txt_uport(tb[0..128], tl);
+                const b : u32 = upd_txt_build(tb[0..128], tl);
+                if (known and up != 0 and upd_neighbour_newer(tb[0..128], tl, own_ver, own_build)) {
+                    if (b > best_b or (b == best_b and fe_better(best_ip, ip))) {
+                        best_b = b;
+                        best_ip = ip;
+                        best_port = up;
+                        best_v = upd_txt_version(tb[0..128], tl);
+                        best_k = k;
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if (best_k >= BR_COUNT) {
+        upv_put32(cl, UPV_OBUILD, 0);
+        upv_put32(cl, UPV_OPORT, 0);
+        upv_put32(cl, UPV_OIP, 0);
+        cl[UPV_NICKLEN] = 0;
+        return false;
+    }
+    upv_put32(cl, UPV_OBUILD, @as(u64, best_b));
+    upv_put32(cl, UPV_OPORT, @as(u64, best_port));
+    upv_put32(cl, UPV_OIP, best_ip);
+    cl[UPV_OMAJ] = @as(u8, @intCast(um_ver_part(best_v, 2) & 255));
+    cl[UPV_OMIN] = @as(u8, @intCast(um_ver_part(best_v, 1) & 255));
+    cl[UPV_OPAT] = @as(u8, @intCast(um_ver_part(best_v, 0) & 255));
+    var tb2 : [128]u8 = undefined;
+    const tl2 : usize = fe_read_txt(ih_entry(block_at, best_k), tb2[0..128]);
+    var nk : [32]u8 = undefined;
+    const key : [4]u8 = [110, 105, 99, 107];
+    var kn : usize = txt_get(tb2[0..128], tl2, key[0..4], nk[0..32]);
+    if (kn > NICK_MAX) { kn = NICK_MAX; }
+    var i : usize = 0;
+    while (i < kn) {
+        cl[UPV_NICK + i] = nk[i];
+        i = i + 1;
+    }
+    cl[UPV_NICKLEN] = @as(u8, @intCast(kn));
+    return true;
+}
+
+fn fe_hexc(v: u32) -> u8 {
+    if (v < 10) { return @as(u8, @intCast(48 + v)); }
+    return @as(u8, @intCast(87 + v));
+}
+
+// ---------------------------------------------------------------- 4. the browser: resolve, address, match
+
+fn fe_read_txt(e: u64, tb: []u8) -> usize {
+    var z : usize = 0;
+    while (z < 128) {
+        tb[z] = 0;
+        z = z + 1;
+    }
+    var tl : usize = @as(usize, fe_peek32(e + BE_TXTLEN));
+    if (tl > 128) { tl = 128; }
+    if (tl > 0) { sys_peek(tb[0..tl], e + BE_TXT, @as(u64, tl)); }
+    return tl;
+}
+
+/// The IPv4 the daemon gave an entry, as a big-endian number (the four bytes are kept in network order).
+pub fn fe_entry_ip(e: u64) -> u64 {
+    var c : [4]u8 = undefined;
+    sys_peek(c[0..4], e + BE_IP, 4);
+    return (@as(u64, c[0]) << 24) | (@as(u64, c[1]) << 16) | (@as(u64, c[2]) << 8) | @as(u64, c[3]);
+}
+
+/// A candidate address is better than the one held when it is allowed and the held one is not, or when it is a loopback
+/// address and the held one is not (a friend on this very machine is reached by 127.x, whatever its other interfaces say).
+pub fn fe_better(held: u64, cand: u64) -> bool {
+    if (!cv_lan_ok(cand)) { return false; }
+    if (held == 0) { return true; }
+    return (cand >> 24) == 127 and (held >> 24) != 127;
+}
+
+/// One entry at a time: start the resolve of a new one, pump the pending refs, and free a ref once its answer is in.
+fn fe_browse_step(cl: []u8) -> void {
+    const block_at : u64 = fe_base(cl[FE_BR..FE_BR + BR_LEN]);
+    const code : u64 = fe_sl(cl, FE_S_CLO);
+    ih_pump(get_u64(cl, FE_BREF), 0);
+    var k : usize = 0;
+    while (k < BR_COUNT) {
+        const e : u64 = ih_entry(block_at, k);
+        const st : u32 = fe_peek32(e + BE_STATE);
+        const rs : u64 = get_u64(cl, FE_REFS + k * 16);
+        const as_ : u64 = get_u64(cl, FE_REFS + k * 16 + 8);
+        if (st == 0) {
+            // the service went away: release what was held for it
+            if (rs != 0) { ih_free(rs); put_u64(cl, FE_REFS + k * 16, 0); }
+            if (as_ != 0) { ih_free(as_); put_u64(cl, FE_REFS + k * 16 + 8, 0); }
+        } else if (st == BS_NEW and rs == 0) {
+            if (ih_resolve(cl[FE_TMP..FE_TMP + 8], e, code) == 0) {
+                // the ref came back in the scratch (RREF); keep it in the entry's slot
+                put_u64(cl, FE_REFS + k * 16, get_u64(cl, FE_TMP));
+                fe_poke32(e + BE_STATE, BS_RESOLVING);
+            }
+        } else if (st == BS_RESOLVING and rs != 0) {
+            ih_pump(rs, 0);
+        } else if (st == BS_RESOLVED and as_ == 0) {
+            if (rs != 0) { ih_free(rs); put_u64(cl, FE_REFS + k * 16, 0); }
+            if (ih_addrinfo(cl[FE_TMP..FE_TMP + 8], e) == 0) { put_u64(cl, FE_REFS + k * 16 + 8, get_u64(cl, FE_TMP)); }
+        } else if (st == BS_RESOLVED and as_ != 0) {
+            ih_pump(as_, 0);
+        } else if (st == BS_ADDRESSED and as_ != 0) {
+            // the address is in: one answer is all this version needs; the browser still reports the service leaving
+            ih_free(as_);
+            put_u64(cl, FE_REFS + k * 16 + 8, 0);
+            fe_ss(cl, FE_S_RESOLVED, fe_sl(cl, FE_S_RESOLVED) + 1);
+        }
+        k = k + 1;
+    }
+}
+
+fn fe_put_u64_at(b: []u8, at: usize, v: u64) -> void { put_u64(b, at, v); }
+
+/// Match the browser's entries with the friends table: for every friend, the best allowed address of a service whose
+/// TXT claims its fingerprint, the time it was last met, and why it is not callable when it is not. Then the snapshot.
+fn fe_match(cl: []u8, now: u64) -> void {
+    const block_at : u64 = fe_base(cl[FE_BR..FE_BR + BR_LEN]);
+    const n : usize = @as(usize, ft_count(cl[FE_FT..FE_FT + FT_LEN]));
+    var i : usize = 0;
+    while (i < n and i < FT_MAX) {
+        var fpf : [10]u8 = undefined;
+        var q : usize = 0;
+        while (q < 10) {
+            fpf[q] = cl[FE_FT + FT_HDR + i * FT_ROW + q];
+            q = q + 1;
+        }
+        var best : u64 = 0;
+        var bport : u64 = 0;
+        var seen_entry : bool = false;
+        var bad_addr : bool = false;
+        var pending : bool = false;
+        var k : usize = 0;
+        while (k < BR_COUNT) {
+            const e : u64 = ih_entry(block_at, k);
+            const st : u32 = fe_peek32(e + BE_STATE);
+            if (st >= BS_RESOLVED) {
+                var tb : [128]u8 = undefined;
+                const tl : usize = fe_read_txt(e, tb[0..128]);
+                var pfp : [10]u8 = undefined;
+                if (txt_fp(tb[0..128], tl, pfp[0..10]) == INV_OK) {
+                    var same : bool = true;
+                    var z : usize = 0;
+                    while (z < 10) {
+                        if (pfp[z] != fpf[z]) { same = false; }
+                        z = z + 1;
+                    }
+                    if (same) {
+                        seen_entry = true;
+                        if (st == BS_ADDRESSED) {
+                            const ip : u64 = fe_entry_ip(e);
+                            if (cv_lan_ok(ip)) {
+                                if (fe_better(best, ip)) {
+                                    best = ip;
+                                    bport = @as(u64, txt_port(tb[0..128], tl));
+                                    if (bport == 0) { bport = @as(u64, fe_peek32(e + BE_PORT)); }
+                                }
+                            } else {
+                                bad_addr = true;
+                            }
+                        } else {
+                            pending = true;
+                        }
+                        fe_learn_nick(cl, fpf[0..10], tb[0..128], tl);
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        const sa : usize = FE_SEEN + i * FE_SEEN_LEN;
+        var reason : u32 = FV_R_NEVER;
+        if (best != 0 and bport != 0) {
+            put_u64(cl, sa, now);
+            fv_put32(cl, sa + 8, best);
+            fv_put32(cl, sa + 12, bport);
+            reason = FV_R_ONLINE;
+        } else if (cl[FV_NET] != FV_NET_UP) {
+            reason = FV_R_NONET;
+        } else if (bad_addr) {
+            reason = FV_R_ADDR;
+        } else if (pending or seen_entry) {
+            reason = FV_R_LOOKUP;
+        } else if (get_u64(cl, sa) != 0) {
+            reason = FV_R_GONE;
+        }
+        const sc : usize = @as(usize, cl[FV_SCROLL]);
+        if (i >= sc and i < sc + FV_ROWS_SNAP) { cl[fv_row_at(i - sc) + FR_REASON] = @as(u8, @intCast(reason)); }
+        i = i + 1;
+    }
+}
+
+/// A friend with no nickname yet takes the one it announces (the friend's own word for itself, shown as such; it proves
+/// nothing about the key). The table is saved when a nickname was written.
+fn fe_learn_nick(cl: []u8, fp: []const u8, tb: []const u8, tl: usize) -> void {
+    const idx : usize = ft_find(cl[FE_FT..FE_FT + FT_LEN], fp);
+    if (idx == FT_MAX) { return; }
+    if (cl[FE_FT + FT_HDR + idx * FT_ROW + FP_BYTES] != 0) { return; }
+    var nk : [32]u8 = undefined;
+    const key : [4]u8 = [110, 105, 99, 107];
+    const kn : usize = txt_get(tb, tl, key[0..4], nk[0..32]);
+    if (kn == 0 or kn > NICK_MAX) { return; }
+    if (ft_set_nick(cl[FE_FT..FE_FT + FT_LEN], fp, nk[0..32], kn)) { ih_friends_save(cl[FE_FT..FE_FT + FT_LEN]); }
+}
+
+// ---------------------------------------------------------------- 5. the snapshot the panel draws
+
+fn fe_row_copy(cl: []u8, i: usize, now: u64) -> void {
+    const r : usize = fv_row_at(i);
+    // snapshot row i shows table row i + scroll (the ACCOUNT panel scrolls a long list; the CALL panel stays at 0)
+    const ti : usize = i + @as(usize, cl[FV_SCROLL]);
+    const t : usize = FE_FT + FT_HDR + ti * FT_ROW;
+    var k : usize = 0;
+    while (k < 10) {
+        cl[r + FR_FP + k] = cl[t + k];
+        k = k + 1;
+    }
+    var nl : usize = 0;
+    while (nl < NICK_MAX and cl[t + FP_BYTES + nl] != 0) {
+        cl[r + FR_NICK + nl] = cl[t + FP_BYTES + nl];
+        nl = nl + 1;
+    }
+    var z : usize = nl;
+    while (z < NICK_MAX) {
+        cl[r + FR_NICK + z] = 0;
+        z = z + 1;
+    }
+    cl[r + FR_NICKLEN] = @as(u8, @intCast(nl));
+    const sa : usize = FE_SEEN + ti * FE_SEEN_LEN;
+    const last : u64 = get_u64(cl, sa);
+    const reason : u32 = @as(u32, cl[r + FR_REASON]);
+    if (reason == FV_R_ONLINE and last != 0) {
+        cl[r + FR_ONLINE] = 1;
+        const ip : u64 = fv_get32(cl, sa + 8);
+        cl[r + FR_IP] = @as(u8, @intCast((ip >> 24) & 255));
+        cl[r + FR_IP + 1] = @as(u8, @intCast((ip >> 16) & 255));
+        cl[r + FR_IP + 2] = @as(u8, @intCast((ip >> 8) & 255));
+        cl[r + FR_IP + 3] = @as(u8, @intCast(ip & 255));
+        const pt : u64 = fv_get32(cl, sa + 12);
+        cl[r + FR_PORT] = @as(u8, @intCast((pt >> 8) & 255));
+        cl[r + FR_PORT + 1] = @as(u8, @intCast(pt & 255));
+    } else {
+        cl[r + FR_ONLINE] = 0;
+        cl[r + FR_IP] = 0;
+        cl[r + FR_IP + 1] = 0;
+        cl[r + FR_IP + 2] = 0;
+        cl[r + FR_IP + 3] = 0;
+        cl[r + FR_PORT] = 0;
+        cl[r + FR_PORT + 1] = 0;
+    }
+    if (last == 0) {
+        fv_put32(cl, r + FR_AGO, FV_NEVER);
+    } else if (now >= last) {
+        fv_put32(cl, r + FR_AGO, (now - last) / 1000);
+    } else {
+        fv_put32(cl, r + FR_AGO, 0);
+    }
+}
+
+/// Rebuild the rows from the table and the seen records. The panel redraws when a byte changed.
+pub fn fe_snapshot(cl: []u8, now: u64) -> void {
+    const n : usize = @as(usize, ft_count(cl[FE_FT..FE_FT + FT_LEN]));
+    cl[FV_COUNT] = @as(u8, @intCast(n));
+    // the first friend in view stays inside the list: at most the last friend's place, 0 for an empty list
+    if (@as(usize, cl[FV_SCROLL]) >= n) {
+        if (n > 0) { cl[FV_SCROLL] = @as(u8, @intCast(n - 1)); } else { cl[FV_SCROLL] = 0; }
+    }
+    var shown : usize = n - @as(usize, cl[FV_SCROLL]);
+    if (shown > FV_ROWS_SNAP) { shown = FV_ROWS_SNAP; }
+    cl[FV_SHOWN] = @as(u8, @intCast(shown));
+    var i : usize = 0;
+    while (i < shown) {
+        fe_row_copy(cl, i, now);
+        i = i + 1;
+    }
+    while (i < FV_ROWS_SNAP) {
+        fe_zero(cl, fv_row_at(i), 48);
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 6. the pass of the main loop
+
+fn fe_log(cl: []const u8, now: u64) -> void {
+    var line : [320]u8 = undefined;
+    var n : usize = put_bytes(line[0..320], 0, "FRIENDS invite=");
+    var q : usize = 0;
+    while (q < INVITE_LEN) {
+        line[n + q] = cl[FV_INV + q];
+        q = q + 1;
+    }
+    n = n + INVITE_LEN;
+    n = put_bytes(line[0..320], n, " net=");
+    n = put_dec(line[0..320], n, @as(u64, cl[FV_NET]));
+    n = put_bytes(line[0..320], n, " friends=");
+    n = put_dec(line[0..320], n, @as(u64, cl[FV_COUNT]));
+    n = put_bytes(line[0..320], n, " resolved=");
+    n = put_dec(line[0..320], n, fe_sl(cl, FE_S_RESOLVED));
+    var i : usize = 0;
+    while (i < @as(usize, cl[FV_SHOWN])) {
+        n = put_bytes(line[0..320], n, " [");
+        n = put_dec(line[0..320], n, @as(u64, cl[fv_row_at(i) + FR_NICKLEN]));
+        if (cl[fv_row_at(i) + FR_ONLINE] != 0) {
+            n = put_bytes(line[0..320], n, " online ");
+            const a : u64 = fv_row_addr(cl, i);
+            n = put_dec(line[0..320], n, (a / 65536) >> 24);
+            n = put_bytes(line[0..320], n, ".");
+            n = put_dec(line[0..320], n, ((a / 65536) >> 16) & 255);
+            n = put_bytes(line[0..320], n, ".");
+            n = put_dec(line[0..320], n, ((a / 65536) >> 8) & 255);
+            n = put_bytes(line[0..320], n, ".");
+            n = put_dec(line[0..320], n, (a / 65536) & 255);
+            n = put_bytes(line[0..320], n, ":");
+            n = put_dec(line[0..320], n, a % 65536);
+        } else {
+            n = put_bytes(line[0..320], n, " offline why=");
+            n = put_dec(line[0..320], n, @as(u64, cl[fv_row_at(i) + FR_REASON]));
+        }
+        n = put_bytes(line[0..320], n, "]");
+        i = i + 1;
+    }
+    n = put_bytes(line[0..320], n, "\n");
+    sys_write(2, line[0..n], @as(u64, n));
+}
+
+/// The friend a test aid names (by the nickname the list shows): its row, FV_ROWS_SNAP when none matches.
+fn fe_dial_target(cl: []const u8) -> usize {
+    var afp : [10]u8 = undefined;
+    if (fe_autodial_fp(afp[0..10])) {
+        var j : usize = 0;
+        while (j < @as(usize, cl[FV_SHOWN])) {
+            const rj : usize = fv_row_at(j);
+            var same2 : bool = true;
+            var m : usize = 0;
+            while (m < 10) {
+                if (cl[rj + FR_FP + m] != afp[m]) { same2 = false; }
+                m = m + 1;
+            }
+            if (same2) { return j; }
+            j = j + 1;
+        }
+        return FV_ROWS_SNAP;
+    }
+    var want : [32]u8 = undefined;
+    const wn : usize = fe_env("T27OS_FRIEND_DIAL", want[0..32]);
+    if (wn == 0) { return FV_ROWS_SNAP; }
+    var i : usize = 0;
+    while (i < @as(usize, cl[FV_SHOWN])) {
+        const r : usize = fv_row_at(i);
+        if (@as(usize, cl[r + FR_NICKLEN]) == wn) {
+            var same : bool = true;
+            var k : usize = 0;
+            while (k < wn) {
+                if (cl[r + FR_NICK + k] != want[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { return i; }
+        }
+        i = i + 1;
+    }
+    return FV_ROWS_SNAP;
+}
+
+/// One pass: at most every FE_TICK_MS it pumps the daemon, matches the friends and rebuilds the snapshot. Returns the
+/// row of the friend a test aid asked to call once it is online (FV_ROWS_SNAP when there is nothing to do).
+pub fn fe_tick(cl: []u8, now: u64) -> usize {
+    if (cl.len < FE_END or cl[FV_NET] != FV_NET_UP) { return FV_ROWS_SNAP; }
+    if (fe_sl(cl, FE_S_TICK) != 0 and now < fe_sl(cl, FE_S_TICK) + FE_TICK_MS) { return FV_ROWS_SNAP; }
+    fe_ss(cl, FE_S_TICK, now);
+    ih_pump(get_u64(cl, FE_RREF), 0);
+    fe_browse_step(cl);
+    fe_match(cl, now);
+    fe_snapshot(cl, now);
+    if (fe_sl(cl, FE_S_LOG) == 0) { fe_ss(cl, FE_S_LOG, now); }
+    if (now >= fe_sl(cl, FE_S_LOG) + 1000 and fe_env_flag()) {
+        fe_ss(cl, FE_S_LOG, now);
+        fe_log(cl, now);
+    }
+    var b2 : [10]u8 = undefined;
+    if (fe_sl(cl, FE_S_DIAL) == 1 and !fe_autodial2_fp(b2[0..10])) {
+        const t : usize = fe_dial_target(cl);
+        if (t < FV_ROWS_SNAP and cl[fv_row_at(t) + FR_ONLINE] != 0) { return t; }
+    }
+    return FV_ROWS_SNAP;
+}
+
+fn fe_env_flag() -> bool {
+    var b : [8]u8 = undefined;
+    return fe_env("T27OS_FRIENDS_LOG", b[0..8]) > 0;
+}
+
+/// The test aid has dialled: it does not dial again.
+pub fn fe_dial_done(cl: []u8) -> void { fe_ss(cl, FE_S_DIAL, 2); }
+
+// ---------------------------------------------------------------- 7. the person's actions
+
+/// The invite typed in the add field -> the table -> the file. The note code to show (friends_view FN_*); the typed
+/// text is cleared on success.
+pub fn fe_add(cl: []u8, now: u64) -> u32 {
+    const n : usize = @as(usize, cl[FV_INVLEN]);
+    if (n == 0) { return FN_EMPTY; }
+    const r : u32 = ft_add(cl[FE_FT..FE_FT + FT_LEN], cl[FV_TYPED..FV_TYPED + n], cl[FE_FP..FE_FP + FP_BYTES]);
+    if (r == FA_BAD_INVITE) { return FN_BAD; }
+    if (r == FA_DUPLICATE) { return FN_DUP; }
+    if (r == FA_SELF) { return FN_SELF; }
+    if (r == FA_FULL) { return FN_FULL; }
+    if (r != FA_OK) { return FN_DAMAGED; }
+    var note : u32 = FN_ADDED;
+    if (!fe_ss_file(cl) or !ih_friends_save(cl[FE_FT..FE_FT + FT_LEN])) { note = FN_NOSAVE; }
+    cl[FV_INVLEN] = 0;
+    fe_zero(cl, FV_TYPED, 32);
+    fe_snapshot(cl, now);
+    return note;
+}
+
+/// ACCEPT of an invitation (invites.t27): the fingerprint of the row becomes a friend, named with the nickname the row
+/// holds (the peer's own word, it proves nothing), the table saved; the window then stores the row's key for it
+/// (ih_pin_put). The same notes as ADD: FN_ADDED, FN_DUP (already a friend: the key is still stored), FN_SELF, FN_FULL,
+/// FN_DAMAGED, FN_NOSAVE (kept in memory only). The add field is not touched.
+pub fn fe_accept(cl: []u8, fp: []const u8, nick: []const u8, nn: usize, now: u64) -> u32 {
+    if (fp.len < FP_BYTES) { return FN_DAMAGED; }
+    var inv : [25]u8 = undefined;
+    if (invite_make(fp[0..FP_BYTES], inv[0..25]) != INVITE_LEN) { return FN_DAMAGED; }
+    const r : u32 = ft_add(cl[FE_FT..FE_FT + FT_LEN], inv[0..25], cl[FE_FP..FE_FP + FP_BYTES]);
+    if (r == FA_DUPLICATE) { return FN_DUP; }
+    if (r == FA_SELF) { return FN_SELF; }
+    if (r == FA_FULL) { return FN_FULL; }
+    if (r != FA_OK) { return FN_DAMAGED; }
+    if (nn > 0) { ft_set_nick(cl[FE_FT..FE_FT + FT_LEN], fp[0..FP_BYTES], nick, nn); }
+    var note : u32 = FN_ADDED;
+    if (!fe_ss_file(cl) or !ih_friends_save(cl[FE_FT..FE_FT + FT_LEN])) { note = FN_NOSAVE; }
+    fe_snapshot(cl, now);
+    return note;
+}
+
+/// The nickname a service on the network announces for fp (its TXT "nick=", the peer's own word): its length into
+/// out, 0 when no resolved service names fp or it announces none. Used for an invitation from someone not yet a friend.
+pub fn fe_nick_for(cl: []u8, fp: []const u8, out: []u8) -> usize {
+    if (fp.len < FP_BYTES or out.len < 32 or cl[FV_NET] != @as(u8, @intCast(FV_NET_UP))) { return 0; }
+    const block_at : u64 = fe_base(cl[FE_BR..FE_BR + BR_LEN]);
+    if (block_at == 0) { return 0; }
+    var k : usize = 0;
+    while (k < BR_COUNT) {
+        const e : u64 = ih_entry(block_at, k);
+        if (fe_peek32(e + BE_STATE) >= BS_RESOLVED) {
+            var tb : [128]u8 = undefined;
+            const tl : usize = fe_read_txt(e, tb[0..128]);
+            var pfp : [10]u8 = undefined;
+            if (txt_fp(tb[0..128], tl, pfp[0..10]) == INV_OK) {
+                var same : bool = true;
+                var z : usize = 0;
+                while (z < 10) {
+                    if (pfp[z] != fp[z]) { same = false; }
+                    z = z + 1;
+                }
+                if (same) {
+                    const key : [4]u8 = [110, 105, 99, 107];
+                    const kn : usize = txt_get(tb[0..128], tl, key[0..4], out[0..32]);
+                    if (kn > 0 and kn <= NICK_MAX and nick_ok(out, kn)) { return kn; }
+                    return 0;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// The key typed in the add field, parsed (not added): its 10 bytes into fp. False when it is not a valid invite.
+pub fn fe_typed_key(cl: []const u8, fp: []u8) -> bool {
+    const n : usize = @as(usize, cl[FV_INVLEN]);
+    if (n != INVITE_LEN) { return false; }
+    return invite_parse(cl[FV_TYPED..FV_TYPED + n], fp) == INV_OK;
+}
+
+/// Move the first friend in view to table row `sc` (kept inside the list) and rebuild the rows from it: the matches are
+/// made again first, so a row that comes into view shows its own state, not the one of the friend that stood there.
+pub fn fe_scroll(cl: []u8, sc: usize, now: u64) -> void {
+    const n : usize = @as(usize, ft_count(cl[FE_FT..FE_FT + FT_LEN]));
+    var v : usize = sc;
+    if (n == 0) { v = 0; } else if (v >= n) { v = n - 1; }
+    cl[FV_SCROLL] = @as(u8, @intCast(v));
+    fe_match(cl, now);
+    fe_snapshot(cl, now);
+}
+
+/// Remove the friend of shown row `i` (the person confirmed): the table row goes, the seen records of the rows after it
+/// move up with them, the file is written, the snapshot is rebuilt. The note code to show (FN_REMOVED, FN_RM_NOSAVE);
+/// 0 when `i` is not a shown row.
+pub fn fe_remove(cl: []u8, i: usize, now: u64) -> u32 {
+    if (i >= @as(usize, cl[FV_SHOWN]) or i >= FV_ROWS_SNAP) { return 0; }
+    const ti : usize = i + @as(usize, cl[FV_SCROLL]);
+    var fp : [10]u8 = undefined;
+    if (!ft_fp_at(cl[FE_FT..FE_FT + FT_LEN], ti, fp[0..10])) { return 0; }
+    const n : usize = @as(usize, ft_count(cl[FE_FT..FE_FT + FT_LEN]));
+    if (!ft_remove(cl[FE_FT..FE_FT + FT_LEN], fp[0..10])) { return 0; }
+    var j : usize = ti;
+    while (j + 1 < n) {
+        var b : usize = 0;
+        while (b < FE_SEEN_LEN) {
+            cl[FE_SEEN + j * FE_SEEN_LEN + b] = cl[FE_SEEN + (j + 1) * FE_SEEN_LEN + b];
+            b = b + 1;
+        }
+        j = j + 1;
+    }
+    fe_zero(cl, FE_SEEN + (n - 1) * FE_SEEN_LEN, FE_SEEN_LEN);
+    var note : u32 = FN_REMOVED;
+    if (!fe_ss_file(cl) or !ih_friends_save(cl[FE_FT..FE_FT + FT_LEN])) { note = FN_RM_NOSAVE; }
+    fe_snapshot(cl, now);
+    return note;
+}
+
+/// A click on friend `i`: online -> the address of the resolve, the fingerprint of the table, cs_call; the result is
+/// a note code (0 when the call started). Offline -> the note that says why. This is the only way a friend is called.
+pub fn fe_call(cl: []u8, s: []u8, i: usize) -> u32 {
+    if (i >= @as(usize, cl[FV_SHOWN])) { return 0; }
+    const r : usize = fv_row_at(i);
+    if (cl[r + FR_ONLINE] == 0) { return fv_offline_note(@as(u32, cl[r + FR_REASON])); }
+    const a : u64 = fv_row_addr(cl, i);
+    if (a == 0) { return fv_offline_note(FV_R_LOOKUP); }
+    if (!cs_call(s, a / 65536, a % 65536, cl[r + FR_FP..r + FR_FP + 10])) { return CV_N_REFUSED; }
+    return 0;
+}
+
+/// Leave nothing behind: the daemon's refs are released, which also withdraws the announcement.
+pub fn fe_stop(cl: []u8) -> void {
+    var k : usize = 0;
+    while (k < BR_COUNT) {
+        ih_free(get_u64(cl, FE_REFS + k * 16));
+        ih_free(get_u64(cl, FE_REFS + k * 16 + 8));
+        put_u64(cl, FE_REFS + k * 16, 0);
+        put_u64(cl, FE_REFS + k * 16 + 8, 0);
+        k = k + 1;
+    }
+    ih_free(get_u64(cl, FE_BREF));
+    ih_free(get_u64(cl, FE_RREF));
+    put_u64(cl, FE_BREF, 0);
+    put_u64(cl, FE_RREF, 0);
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_OFF));
+}
+
+// ---------------------------------------------------------------- tests (the parts that need no daemon)
+
+test fe_the_blocks_do_not_overlap_and_end_inside_the_region {
+    assert FE_ID >= FV_ENGINE;
+    assert FE_ID + ID_LEN + 1 <= FE_FP;
+    assert FE_FP + 16 <= FE_FT;
+    assert FE_FT + FT_LEN + 1 <= FE_BR;
+    assert FE_BR + BR_LEN <= FE_CLO;
+    assert FE_CLO + 160 <= FE_REFS;
+    assert FE_REFS + BR_COUNT * 16 <= FE_RREF;
+    assert FE_RREF + 8 <= FE_BREF and FE_BREF + 8 <= FE_RES;
+    assert FE_RES + 72 <= FE_NAME and FE_NAME + 64 <= FE_TXT and FE_TXT + 96 <= FE_CODE;
+    assert FE_CODE + 8 <= FE_SLOTS;
+    assert FE_SLOTS + 8 * 8 <= FE_TMP and FE_TMP + 8 <= FE_SEEN;
+    assert FE_SEEN + FT_MAX * FE_SEEN_LEN <= FE_TONE;
+    assert FE_TONE + 192 <= FE_END;
+}
+
+test fe_a_loopback_address_beats_a_lan_one_and_a_forbidden_one_is_never_taken {
+    assert fe_better(0, 2130706433);
+    assert fe_better(0, 3232235786);
+    assert fe_better(0, 134744072) == false;
+    assert fe_better(0, 167772161);
+    assert fe_better(3232235786, 2130706433);
+    assert fe_better(2130706433, 3232235786) == false;
+    assert fe_better(3232235786, 3232235788) == false;
+    assert fe_better(2130706433, 2130706434) == false;
+}
+
+fn fe_t_blank(cl: []u8) -> void {
+    var i : usize = 0;
+    while (i < cl.len) {
+        cl[i] = 0;
+        i = i + 1;
+    }
+}
+
+test fe_a_typed_invite_is_added_once_and_a_typo_or_myself_is_refused {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    const own : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+    const other : [10]u8 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    var i : usize = 0;
+    while (i < 10) {
+        cl[FE_FP + i] = own[i];
+        i = i + 1;
+    }
+    fe_ss(cl[0..8000], FE_S_FILE, 0);
+    cl[FV_IDSTATE] = 1;
+    // an empty table made in memory, as when the friends file could not be used
+    assert ft_init(cl[FE_FT..FE_FT + FT_LEN]);
+    var inv : [25]u8 = undefined;
+    invite_make(other[0..10], inv[0..25]);
+    assert fe_add(cl[0..8000], 1000) == FN_EMPTY;
+    i = 0;
+    while (i < 25) {
+        cl[FV_TYPED + i] = inv[i];
+        i = i + 1;
+    }
+    cl[FV_INVLEN] = 24;
+    assert fe_add(cl[0..8000], 1000) == FN_BAD;
+    cl[FV_INVLEN] = 25;
+    // in memory only: the file is not there, so the add is kept but says it could not be written
+    assert fe_add(cl[0..8000], 1000) == FN_NOSAVE;
+    assert cl[FV_COUNT] == 1 and cl[FV_SHOWN] == 1 and cl[FV_INVLEN] == 0;
+    assert cl[fv_row_at(0) + FR_FP] == 10 and cl[fv_row_at(0) + FR_FP + 9] == 100;
+    assert cl[fv_row_at(0) + FR_ONLINE] == 0;
+    i = 0;
+    while (i < 25) {
+        cl[FV_TYPED + i] = inv[i];
+        i = i + 1;
+    }
+    cl[FV_INVLEN] = 25;
+    assert fe_add(cl[0..8000], 1000) == FN_DUP;
+    // my own invite
+    invite_make(own[0..10], inv[0..25]);
+    i = 0;
+    while (i < 25) {
+        cl[FV_TYPED + i] = inv[i];
+        i = i + 1;
+    }
+    assert fe_add(cl[0..8000], 1000) == FN_SELF;
+}
+
+test fe_a_friend_is_online_only_with_an_allowed_address_and_a_click_on_one_that_is_off_says_why {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    cl[FV_SHOWN] = 2;
+    const r0 : usize = fv_row_at(0);
+    const r1 : usize = fv_row_at(1);
+    cl[r0 + FR_ONLINE] = 1;
+    cl[r0 + FR_IP] = 127;
+    cl[r0 + FR_IP + 3] = 1;
+    cl[r0 + FR_PORT] = 186;
+    cl[r0 + FR_PORT + 1] = 112;
+    cl[r1 + FR_ONLINE] = 0;
+    cl[r1 + FR_REASON] = @as(u8, @intCast(FV_R_GONE));
+    var s : [16]u8 = undefined;
+    // a session block that is not open refuses the call: the answer is "could not be started", not a silent success
+    assert fe_call(cl[0..8000], s[0..16], 0) == CV_N_REFUSED;
+    assert fe_call(cl[0..8000], s[0..16], 1) == FN_OFF + FV_R_GONE;
+    assert fe_call(cl[0..8000], s[0..16], 5) == 0;
+}
+
+/// A table of `n` friends in memory: friend k has the fingerprint [k + 1, 2, 3, ..., 10] and the nickname "f<k>" is not
+/// set (the rows tell them apart by the first byte).
+fn fe_t_friends(cl: []u8, n: usize) -> void {
+    fe_t_blank(cl);
+    assert ft_init(cl[FE_FT..FE_FT + FT_LEN]);
+    var k : usize = 0;
+    while (k < n) {
+        var fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        fp[0] = @as(u8, @intCast(k + 1));
+        var inv : [25]u8 = undefined;
+        assert invite_make(fp[0..10], inv[0..25]) == 25;
+        assert ft_add(cl[FE_FT..FE_FT + FT_LEN], inv[0..25], cl[FE_FP..FE_FP + 10]) == FA_OK;
+        k = k + 1;
+    }
+}
+
+test fe_a_long_list_shows_the_window_the_scroll_names {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 12);
+    fe_snapshot(cl[0..8000], 1000);
+    assert cl[FV_COUNT] == 12 and cl[FV_SHOWN] == 8 and cl[FV_SCROLL] == 0;
+    assert cl[fv_row_at(0) + FR_FP] == 1 and cl[fv_row_at(7) + FR_FP] == 8;
+    // the window moves down: row 0 is now friend 6, and only 7 friends are left from there
+    cl[FV_SCROLL] = 5;
+    fe_snapshot(cl[0..8000], 1000);
+    assert cl[FV_SHOWN] == 7;
+    assert cl[fv_row_at(0) + FR_FP] == 6 and cl[fv_row_at(6) + FR_FP] == 12;
+    // the rows past the end are blank, not the old ones
+    assert cl[fv_row_at(7) + FR_FP] == 0 and cl[fv_row_at(7) + FR_NICKLEN] == 0;
+    // a scroll past the end comes back to the last friend
+    cl[FV_SCROLL] = 200;
+    fe_snapshot(cl[0..8000], 1000);
+    assert cl[FV_SCROLL] == 11 and cl[FV_SHOWN] == 1 and cl[fv_row_at(0) + FR_FP] == 12;
+    // an empty list has no window
+    fe_t_friends(cl[0..8000], 0);
+    cl[FV_SCROLL] = 3;
+    fe_snapshot(cl[0..8000], 1000);
+    assert cl[FV_COUNT] == 0 and cl[FV_SHOWN] == 0 and cl[FV_SCROLL] == 0;
+}
+
+test fe_a_friend_seen_before_keeps_its_time_under_the_scroll {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 10);
+    // friend 9 (table row 8) was last seen at 4000 ms
+    put_u64(cl[0..8000], FE_SEEN + 8 * FE_SEEN_LEN, 4000);
+    cl[FV_SCROLL] = 4;
+    fe_snapshot(cl[0..8000], 10000);
+    // table row 8 is snapshot row 4
+    assert cl[fv_row_at(4) + FR_FP] == 9;
+    assert fv_get32(cl[0..8000], fv_row_at(4) + FR_AGO) == 6;
+    assert fv_get32(cl[0..8000], fv_row_at(3) + FR_AGO) == FV_NEVER;
+}
+
+test fe_removing_a_friend_closes_the_list_and_moves_the_seen_records_with_it {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 4);
+    put_u64(cl[0..8000], FE_SEEN + 0 * FE_SEEN_LEN, 1000);
+    put_u64(cl[0..8000], FE_SEEN + 1 * FE_SEEN_LEN, 2000);
+    put_u64(cl[0..8000], FE_SEEN + 2 * FE_SEEN_LEN, 3000);
+    put_u64(cl[0..8000], FE_SEEN + 3 * FE_SEEN_LEN, 4000);
+    fe_snapshot(cl[0..8000], 10000);
+    assert cl[FV_COUNT] == 4;
+    // not a shown row: nothing happens
+    assert fe_remove(cl[0..8000], 4, 10000) == 0;
+    assert cl[FV_COUNT] == 4;
+    // remove friend 2 (row 1); the file is not there, so the note says it was removed in memory only
+    assert fe_remove(cl[0..8000], 1, 10000) == FN_RM_NOSAVE;
+    assert cl[FV_COUNT] == 3 and cl[FV_SHOWN] == 3;
+    assert cl[fv_row_at(0) + FR_FP] == 1 and cl[fv_row_at(1) + FR_FP] == 3 and cl[fv_row_at(2) + FR_FP] == 4;
+    // friend 3 and 4 keep the times they had (3000 and 4000), friend 1 keeps 1000
+    assert fv_get32(cl[0..8000], fv_row_at(0) + FR_AGO) == 9;
+    assert fv_get32(cl[0..8000], fv_row_at(1) + FR_AGO) == 7;
+    assert fv_get32(cl[0..8000], fv_row_at(2) + FR_AGO) == 6;
+    // the record of the freed place is cleared
+    assert get_u64(cl[0..8000], FE_SEEN + 3 * FE_SEEN_LEN) == 0;
+    // removing the last friend in view while scrolled to it keeps the window inside the list
+    cl[FV_SCROLL] = 2;
+    fe_snapshot(cl[0..8000], 10000);
+    assert cl[FV_SHOWN] == 1;
+    assert fe_remove(cl[0..8000], 0, 10000) == FN_RM_NOSAVE;
+    assert cl[FV_COUNT] == 2 and cl[FV_SCROLL] == 1 and cl[FV_SHOWN] == 1;
+    assert cl[fv_row_at(0) + FR_FP] == 3;
+}
+
+test fe_the_announcement_carries_ver_build_and_the_update_port {
+    var cl : [8192]u8 = undefined;
+    fe_zero(cl[0..8192], 0, 8192);
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    var inv : [25]u8 = undefined;
+    invite_make(fp[0..10], inv[0..25]);
+    const nick : [5]u8 = [116, 50, 55, 111, 115];
+    var tn : usize = txt_build(inv[0..25], 47727, nick[0..5], 5, cl[FE_TXT..FE_TXT + 96]);
+    // a bundle with no build announces exactly as before
+    assert fe_txt_update(cl[0..8192], tn) == tn and cl[UPV_TXTUP] == 0;
+    cl[UPV_MYVEROK] = 1;
+    cl[UPV_MYMAJ] = 0;
+    cl[UPV_MYMIN] = 1;
+    cl[UPV_MYPAT] = 3;
+    upv_put32(cl[0..8192], UPV_MYBUILD, 7068);
+    // no server port yet: ver and build only
+    const k : usize = fe_txt_update(cl[0..8192], tn);
+    assert k == tn + 21 and cl[UPV_TXTUP] == 0;
+    assert upd_txt_build(cl[FE_TXT..FE_TXT + 96], k) == 7068 and upd_txt_uport(cl[FE_TXT..FE_TXT + 96], k) == 0;
+    // with the server's port: "up=" too, and fp and port still read
+    tn = txt_build(inv[0..25], 47727, nick[0..5], 5, cl[FE_TXT..FE_TXT + 96]);
+    upv_put32(cl[0..8192], UPV_SPORT, 52144);
+    const k2 : usize = fe_txt_update(cl[0..8192], tn);
+    assert k2 == tn + 30 and cl[UPV_TXTUP] == 1;
+    assert upd_txt_uport(cl[FE_TXT..FE_TXT + 96], k2) == 52144;
+    assert txt_port(cl[FE_TXT..FE_TXT + 96], k2) == 47727;
+    var back : [10]u8 = undefined;
+    assert txt_fp(cl[FE_TXT..FE_TXT + 96], k2, back[0..10]) == INV_OK and back[9] == 10;
+}
+
+test fe_listening_on_all_interfaces_announces_pub_and_the_rest_still_reads {
+    var cl : [8192]u8 = undefined;
+    fe_zero(cl[0..8192], 0, 8192);
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    var inv : [25]u8 = undefined;
+    invite_make(fp[0..10], inv[0..25]);
+    const nick : [5]u8 = [116, 50, 55, 111, 115];
+    const key : [3]u8 = [112, 117, 98];
+    var v : [8]u8 = undefined;
+    // a private bind: no pub key, as before
+    var tn : usize = txt_build(inv[0..25], 47727, nick[0..5], 5, cl[FE_TXT..FE_TXT + 96]);
+    assert cv_txt_pub(cl[FE_TXT..FE_TXT + 96], tn, false) == tn;
+    assert txt_get(cl[FE_TXT..FE_TXT + 96], tn, key[0..3], v[0..8]) == 0;
+    // 0.0.0.0: pub=1, then the update keys, and fp, port and build still read
+    tn = cv_txt_pub(cl[FE_TXT..FE_TXT + 96], tn, true);
+    assert txt_get(cl[FE_TXT..FE_TXT + 96], tn, key[0..3], v[0..8]) == 1 and v[0] == 49;
+    cl[UPV_MYVEROK] = 1;
+    cl[UPV_MYMIN] = 1;
+    upv_put32(cl[0..8192], UPV_MYBUILD, 7068);
+    const k : usize = fe_txt_update(cl[0..8192], tn);
+    assert k == tn + 21 and upd_txt_build(cl[FE_TXT..FE_TXT + 96], k) == 7068;
+    assert txt_get(cl[FE_TXT..FE_TXT + 96], k, key[0..3], v[0..8]) == 1;
+    assert txt_port(cl[FE_TXT..FE_TXT + 96], k) == 47727;
+    var back : [10]u8 = undefined;
+    assert txt_fp(cl[FE_TXT..FE_TXT + 96], k, back[0..10]) == INV_OK and back[0] == 1;
+}
+
+test fe_the_typed_key_is_read_only_from_a_whole_invite {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    const fp : [10]u8 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    var inv : [25]u8 = undefined;
+    assert invite_make(fp[0..10], inv[0..25]) == 25;
+    var i : usize = 0;
+    while (i < 25) {
+        cl[FV_TYPED + i] = inv[i];
+        i = i + 1;
+    }
+    var out : [10]u8 = undefined;
+    // nothing typed yet
+    assert fe_typed_key(cl[0..8000], out[0..10]) == false;
+    cl[FV_INVLEN] = 25;
+    assert fe_typed_key(cl[0..8000], out[0..10]);
+    assert out[0] == 10 and out[4] == 50 and out[9] == 100;
+    // one character short is not a key
+    cl[FV_INVLEN] = 24;
+    assert fe_typed_key(cl[0..8000], out[0..10]) == false;
+    // a wrong prefix is not a key
+    cl[FV_INVLEN] = 25;
+    cl[FV_TYPED] = 88;
+    assert fe_typed_key(cl[0..8000], out[0..10]) == false;
+    // parsing does not add: the table and the typed text stay as they were
+    assert cl[FV_COUNT] == 0 and cl[FV_INVLEN] == 25;
+}
+
+test fe_the_dial_aid_is_spent_once_and_a_group_needs_it_armed {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    var s : [16]u8 = undefined;
+    // not armed: no group is picked (the environment is never read)
+    assert fe_group_tick(cl[0..8000], s[0..16]) == false;
+    fe_ss(cl[0..8000], FE_S_DIAL, 1);
+    fe_dial_done(cl[0..8000]);
+    assert fe_sl(cl[0..8000], FE_S_DIAL) == 2;
+    // spent: still no group
+    assert fe_group_tick(cl[0..8000], s[0..16]) == false;
+    // the other slots are not touched
+    assert fe_sl(cl[0..8000], FE_S_TICK) == 0 and fe_sl(cl[0..8000], FE_S_LOG) == 0;
+}
+
+test fe_a_pass_does_nothing_off_the_net_too_soon_or_on_a_short_region {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    // a region shorter than the engine's blocks, even on the net
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_UP));
+    assert fe_tick(cl[0..7000], 1000) == FV_ROWS_SNAP;
+    // announcing is off: the pass keeps no time
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_FAIL));
+    assert fe_tick(cl[0..8000], 1000) == FV_ROWS_SNAP;
+    assert fe_sl(cl[0..8000], FE_S_TICK) == 0;
+    // on the net, but the last pass was less than FE_TICK_MS ago: nothing moves
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_UP));
+    fe_ss(cl[0..8000], FE_S_TICK, 1000);
+    assert fe_tick(cl[0..8000], 1000 + FE_TICK_MS - 1) == FV_ROWS_SNAP;
+    assert fe_sl(cl[0..8000], FE_S_TICK) == 1000;
+}
+
+test fe_no_announcement_without_an_identity_and_no_identity_in_a_short_region {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    // the identity was neither created nor loaded: no announcement, the port and address are not kept
+    cl[FV_IDSTATE] = 0;
+    assert fe_net(cl[0..8000], 3232235786, 47727) == false;
+    assert fe_sl(cl[0..8000], FE_S_PORT) == 0 and fe_sl(cl[0..8000], FE_S_IP) == 0;
+    cl[FV_IDSTATE] = 3;
+    assert fe_net(cl[0..8000], 3232235786, 47727) == false;
+    assert fe_sl(cl[0..8000], FE_S_PORT) == 0;
+    // the fingerprint out is short, or the region is: no identity is opened
+    var fp : [10]u8 = undefined;
+    assert fe_identity(cl[0..8000], fp[0..9]) == false;
+    assert fe_identity(cl[0..7000], fp[0..10]) == false;
+}
+
+test fe_stop_takes_the_engine_off_the_net_and_holds_no_ref {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    cl[FV_NET] = @as(u8, @intCast(FV_NET_UP));
+    fe_stop(cl[0..8000]);
+    assert cl[FV_NET] == @as(u8, @intCast(FV_NET_OFF));
+    assert get_u64(cl[0..8000], FE_BREF) == 0 and get_u64(cl[0..8000], FE_RREF) == 0;
+    assert get_u64(cl[0..8000], FE_REFS) == 0 and get_u64(cl[0..8000], FE_REFS + (BR_COUNT - 1) * 16 + 8) == 0;
+    // a pass after the stop does nothing
+    assert fe_tick(cl[0..8000], 5000) == FV_ROWS_SNAP;
+    assert fe_sl(cl[0..8000], FE_S_TICK) == 0;
+}
+
+test fe_an_accepted_invitation_is_a_friend_with_its_nickname_and_only_once {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    const own : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+    const other : [10]u8 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    var i : usize = 0;
+    while (i < 10) {
+        cl[FE_FP + i] = own[i];
+        i = i + 1;
+    }
+    fe_ss(cl[0..8000], FE_S_FILE, 0);
+    cl[FV_IDSTATE] = 1;
+    assert ft_init(cl[FE_FT..FE_FT + FT_LEN]);
+    // something typed in the add field stays as it was
+    cl[FV_INVLEN] = 3;
+    assert fe_accept(cl[0..8000], other[0..10], "nodeb", 5, 1000) == FN_NOSAVE;
+    assert cl[FV_COUNT] == 1 and cl[FV_SHOWN] == 1 and cl[FV_INVLEN] == 3;
+    assert cl[fv_row_at(0) + FR_FP] == 10 and cl[fv_row_at(0) + FR_FP + 9] == 100;
+    assert cl[fv_row_at(0) + FR_NICKLEN] == 5 and cl[fv_row_at(0) + FR_NICK] == 110;
+    assert ft_find(cl[FE_FT..FE_FT + FT_LEN], other[0..10]) == 0;
+    // twice: one friend; myself: refused
+    assert fe_accept(cl[0..8000], other[0..10], "", 0, 1000) == FN_DUP and cl[FV_COUNT] == 1;
+    assert fe_accept(cl[0..8000], own[0..10], "", 0, 1000) == FN_SELF and cl[FV_COUNT] == 1;
+    assert fe_accept(cl[0..8000], own[0..9], "", 0, 1000) == FN_DAMAGED;
+}
+
+test fe_hexc_gives_lower_case_hex_digits_at_both_edges {
+    assert fe_hexc(0) == 48 and fe_hexc(9) == 57;
+    assert fe_hexc(10) == 97 and fe_hexc(15) == 102;
+}
+
+test fe_put_u64_at_writes_eight_little_endian_bytes_at_the_offset_only {
+    var b : [12]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    fe_put_u64_at(b[0..12], 2, 0x0102030405060708);
+    assert b[0] == 9 and b[1] == 9 and b[2] == 8 and b[3] == 7 and b[9] == 1 and b[10] == 9 and b[11] == 9;
+    assert get_u64(b[0..12], 2) == 0x0102030405060708;
+    fe_put_u64_at(b[0..12], 4, 0);
+    assert get_u64(b[0..12], 4) == 0 and b[2] == 8 and b[3] == 7;
+}
+
+test fe_ss_file_follows_the_friends_file_slot {
+    var cl : [8000]u8 = undefined;
+    fe_t_blank(cl[0..8000]);
+    assert fe_ss_file(cl[0..8000]) == false;
+    fe_ss(cl[0..8000], FE_S_FILE, 1);
+    assert fe_ss_file(cl[0..8000]);
+    fe_ss(cl[0..8000], FE_S_FILE, 0);
+    assert fe_ss_file(cl[0..8000]) == false;
+    fe_ss(cl[0..8000], FE_S_PORT, 5);
+    assert fe_ss_file(cl[0..8000]) == false;
+}
+
+test fe_ft_clear_empties_exactly_the_friends_table_block {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 3);
+    cl[FE_FT - 1] = 77;
+    cl[FE_FT + FT_LEN] = 55;
+    cl[FE_FT + FT_LEN + 1] = 78;
+    assert ft_count(cl[FE_FT..FE_FT + FT_LEN]) == 3;
+    fe_ft_clear(cl[0..8000]);
+    assert cl[FE_FT] == 0 and cl[FE_FT + FT_HDR] == 0 and cl[FE_FT + FT_LEN] == 0;
+    assert cl[FE_FT - 1] == 77 and cl[FE_FT + FT_LEN + 1] == 78;
+    assert ft_count(cl[FE_FT..FE_FT + FT_LEN]) == 0;
+}
+
+test fe_row_of_fp_finds_first_and_last_shown_rows_and_nothing_else {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 9);
+    fe_snapshot(cl[0..8000], 1000);
+    assert cl[FV_SHOWN] == 8;
+    var fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == 0;
+    fp[0] = 8;
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == 7;
+    // friend 9 exists but is not in view
+    fp[0] = 9;
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == FV_ROWS_SNAP;
+    // one byte off at the very end of the fingerprint
+    fp[0] = 3;
+    fp[9] = 11;
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == FV_ROWS_SNAP;
+    // scrolled: friend 9 is now in view as row 3
+    cl[FV_SCROLL] = 5;
+    fe_snapshot(cl[0..8000], 1000);
+    fp[9] = 10;
+    fp[0] = 9;
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == 3;
+    // an empty list holds nobody
+    fe_t_friends(cl[0..8000], 0);
+    fe_snapshot(cl[0..8000], 1000);
+    fp[0] = 1;
+    assert fe_row_of_fp(cl[0..8000], fp[0..10]) == FV_ROWS_SNAP;
+}
+
+test fe_row_copy_shows_an_online_friend_with_address_nickname_and_age {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 2);
+    var fp : [10]u8 = [2, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const nk : [24]u8 = [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120];
+    assert ft_set_nick(cl[FE_FT..FE_FT + FT_LEN], fp[0..10], nk[0..24], 24);
+    // friend 2 (table row 1): met at 4000 ms, 192.168.1.10, port 47727
+    const sa : usize = FE_SEEN + 1 * FE_SEEN_LEN;
+    put_u64(cl[0..8000], sa, 4000);
+    fv_put32(cl[0..8000], sa + 8, 3232235786);
+    fv_put32(cl[0..8000], sa + 12, 47727);
+    fe_snapshot(cl[0..8000], 4000);
+    cl[fv_row_at(1) + FR_REASON] = @as(u8, @intCast(FV_R_ONLINE));
+    fe_row_copy(cl[0..8000], 1, 9999);
+    const r : usize = fv_row_at(1);
+    assert cl[r + FR_FP] == 2 and cl[r + FR_FP + 9] == 10;
+    assert cl[r + FR_NICKLEN] == 24 and cl[r + FR_NICK] == 97 and cl[r + FR_NICK + 23] == 120;
+    assert cl[r + FR_ONLINE] == 1;
+    assert cl[r + FR_IP] == 192 and cl[r + FR_IP + 1] == 168 and cl[r + FR_IP + 2] == 1 and cl[r + FR_IP + 3] == 10;
+    assert cl[r + FR_PORT] == 186 and cl[r + FR_PORT + 1] == 111;
+    assert fv_get32(cl[0..8000], r + FR_AGO) == 5;
+}
+
+test fe_row_copy_shows_an_unmet_or_offline_friend_without_an_address {
+    var cl : [8000]u8 = undefined;
+    fe_t_friends(cl[0..8000], 2);
+    // stale bytes in the snapshot row must be cleared
+    const r : usize = fv_row_at(0);
+    cl[r + FR_NICK + 5] = 66;
+    cl[r + FR_IP] = 9;
+    cl[r + FR_PORT + 1] = 9;
+    cl[r + FR_ONLINE] = 1;
+    cl[r + FR_REASON] = @as(u8, @intCast(FV_R_ONLINE));
+    // never met: the age is FV_NEVER even when the reason says online
+    fe_row_copy(cl[0..8000], 0, 5000);
+    assert cl[r + FR_ONLINE] == 0 and cl[r + FR_IP] == 0 and cl[r + FR_PORT + 1] == 0;
+    assert cl[r + FR_NICKLEN] == 0 and cl[r + FR_NICK + 5] == 0;
+    assert fv_get32(cl[0..8000], r + FR_AGO) == FV_NEVER;
+    // met in the past but gone: offline, the age counts seconds
+    put_u64(cl[0..8000], FE_SEEN, 1500);
+    cl[r + FR_REASON] = @as(u8, @intCast(FV_R_GONE));
+    fe_row_copy(cl[0..8000], 0, 5000);
+    assert cl[r + FR_ONLINE] == 0 and fv_get32(cl[0..8000], r + FR_AGO) == 3;
+    // a clock behind the last meeting shows 0, not a wrap-around
+    fe_row_copy(cl[0..8000], 0, 1000);
+    assert fv_get32(cl[0..8000], r + FR_AGO) == 0;
+}

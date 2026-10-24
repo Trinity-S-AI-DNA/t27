@@ -1,0 +1,1675 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/reach_wire.t27 -- the bytes two friends send each other so each stays reachable over the internet, with
+// no server of ours (owner, 2026-10-23: "an ordinary user only shares his key; chat, calls and video then work on the
+// same Wi-Fi and over the internet without any server of ours"; step U2 of the reach plan; Refs gHashTag/t27#11560).
+// Pure: no @extern, no socket, no clock, no hash. The host (reach_host) computes SHA-256 and HMAC-SHA256 over the bytes
+// built here and gives the MAC back; the pure side writes it and compares it in constant time (call_core ck_same).
+// ASCII only (L3), English only (LANG-EN). Flat namespace (the window build splices imported modules): every name here
+// starts with rw_ / RW_.
+//
+// 't27q' DATAGRAMS  sent from the message socket (the call port P + 1) to a friend's message socket. Header, 36 bytes:
+//     "t27q" | version 1 | op | flags 0 | 0 | from fingerprint 10 | to fingerprint 10 | counter u64 LE
+//   then by op (every length exact; an endpoint is call_ip6's 18 bytes: the IPv6 address, an IPv4 as ::ffff:a.b.c.d,
+//   and the port big-endian):
+//     PING    1  MAC 8                                                                    44 bytes
+//     PONG    2  echo u64 LE (the counter of the PING) | seen-you-at endpoint 18 | MAC 8  70 bytes
+//     RING    3  nonce 8 | n 1 (0..2) | 2 endpoints (the first n used, the rest zero) | MAC 8   89 bytes
+//     RING_OK 4  the same as RING (the callee's call endpoints, the RING's nonce)             89 bytes
+//     CANCEL  5  nonce 8 | MAC 8                                                          52 bytes
+//     KNOCK   6  nick length 1 | nick 24 (printable ASCII, zero after it), no MAC             61 bytes
+//   A seen-you-at endpoint is all zero (not known) or has a port; a used endpoint of a RING has an address and a port.
+//   A datagram from a fingerprint to itself is never one. rw_q_op says which op a datagram that checks is.
+// THE MAC  HMAC-SHA256 under the pair key over the domain line t27os.reach.v1.q (and its newline) and every byte
+//   before the MAC; its first 8 bytes. rw_mac_input
+//   builds what the host hashes; rw_mac_put writes the MAC, rw_mac_ok compares it. A KNOCK has none: it is a claim (the
+//   nick a stranger who pasted my key gives), kept only until the session it announces proves the key (IDENT).
+// THE COUNTER  each sender's own, max(last + 1, unix ms) (rw_ctr_next), kept in reach.t27; a receiver takes a datagram
+//   only with a counter above the last one it took from that friend (rw_ctr_ok), so a replayed datagram never counts
+//   and the two clocks never have to agree.
+// THE PAIR KEY  SHA-256("t27os.reach.v1.pair\n" || lower fingerprint || higher fingerprint || the secret the device of
+//   the lower one made || the secret the device of the higher one made), its first 16 bytes. rw_pair_input builds the
+//   72 bytes in fingerprint order (call_core gr_fp_less), so both friends hash the same. Each secret is 16 random bytes
+//   one device made for that one friend and sent only to it (in the REACH record): a friend the two have in common
+//   never learns either, so it cannot make their key. A secret of all zeros is never one.
+// THE REACH RECORD  a chat payload of kind 7 in a trusted message session (a sealed CK_T_TEXT frame), up to 140 bytes:
+//   the payload header of chat_core (kind 7 | 0 | msg u32 LE = 1 | part u16 0 | parts u16 0 | time u64 0 | len u16 LE,
+//   the bytes after the 20), then version 1 | flags (bit 0 audio split for IPv6, bit 1 an IPv6 socket, bit 2 reach on;
+//   other bits are a later build's and are kept, not refused) | nick length 1 | nick 24 | the sender's pair secret 16 |
+//   n 1 (0..4) | n entries of role 1 + endpoint 18, the roles rising: 1 message IPv6, 2 message IPv4, 3 call IPv6,
+//   4 call IPv4. An IPv6 role holds a native IPv6 endpoint, an IPv4 role a v4-mapped one; each has a port. Which of
+//   them is dialled, and from where, is reach_core's rule, not this file's.
+// THE MAILBOX ENTRY  call_session keeps the 't27q' datagrams a message socket got (rw_q_looks) in a ring of 128-byte
+//   entries: length 1 | 0 | source endpoint 18 | 0 0 0 0 | the datagram (at most RW_Q_MAX = 104 bytes), zero after it.
+// OLDER BUILDS  a 't27q' datagram is no call frame (call_core ck_hdr_type: it is not "T27P"), no STUN message
+//   (call_nat cn_stun_looks: the top bits of 't' are 01) and no probe (cn_probe_is: "t27n", 16 bytes), so 7132 and
+//   earlier drop it. A REACH record is none of chat_core's kinds (ch_kind 0) and no group payload (group_core gi_is,
+//   gm_is_group), and chat_host's dispatch has no other branch, so they drop it too.
+module T27osReachWire;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::NICK_MAX;
+use t27os::peer_identity::nick_ok;
+use t27os::call_core::ck_same;
+use t27os::call_core::ck_hdr_type;
+use t27os::call_core::ck_put_header;
+use t27os::call_core::gr_fp_less;
+use t27os::call_core::CK_HDR;
+use t27os::call_core::CK_T_INVITE;
+use t27os::call_nat::cn_stun_looks;
+use t27os::call_nat::cn_stun_request;
+use t27os::call_nat::cn_probe;
+use t27os::call_nat::cn_probe_is;
+use t27os::call_ip6::IP6_EP;
+use t27os::call_ip6::ip6_port;
+use t27os::call_ip6::ip6_is_set;
+use t27os::call_ip6::ip6_mapped;
+use t27os::call_ip6::ip6_clear;
+use t27os::call_ip6::ip6_copy;
+use t27os::call_ip6::ip6_same;
+use t27os::call_ip6::ip6_parse;
+use t27os::chat_core::ch_kind;
+use t27os::chat_core::ch_put_text;
+use t27os::chat_core::ch_put_ack;
+use t27os::chat_core::ch_put_read;
+use t27os::chat_core::CH_PHDR;
+use t27os::chat_core::CH_PAYLOAD_MAX;
+use t27os::group_core::gi_is;
+use t27os::group_core::gm_is_group;
+use t27os::group_core::GM_K_TEXT;
+use t27os::group_core::GM_K_ACK;
+use t27os::group_core::GM_K_INFO;
+use t27os::editors::same_bytes;
+
+// ---------------------------------------------------------------- 1. the shape
+
+pub const RW_Q_VER : u32 = 1;
+/// The header of every datagram, the MAC, a nonce.
+pub const RW_Q_HDR : usize = 36;
+pub const RW_MAC : usize = 8;
+pub const RW_NONCE : usize = 8;
+/// The endpoints a RING or RING_OK has room for.
+pub const RW_RING_EPS : usize = 2;
+
+pub const RW_OP_PING : u32 = 1;
+pub const RW_OP_PONG : u32 = 2;
+pub const RW_OP_RING : u32 = 3;
+pub const RW_OP_RING_OK : u32 = 4;
+pub const RW_OP_CANCEL : u32 = 5;
+pub const RW_OP_KNOCK : u32 = 6;
+
+pub const RW_LEN_PING : usize = 44;
+pub const RW_LEN_PONG : usize = 70;
+pub const RW_LEN_RING : usize = 89;
+pub const RW_LEN_CANCEL : usize = 52;
+pub const RW_LEN_KNOCK : usize = 61;
+
+/// A mailbox entry, where its source endpoint and its datagram start; the longest datagram rw_q_looks takes (what an
+/// entry holds).
+pub const RW_PE_LEN : usize = 128;
+pub const RW_PE_SRC : usize = 2;
+pub const RW_PE_DATA : usize = 24;
+pub const RW_Q_MAX : usize = 104;
+
+/// What the MAC covers: the domain, then every byte of a datagram before its MAC (the longest is a RING's 81).
+pub const RW_MAC_DOMAIN : str = "t27os.reach.v1.q\n";
+pub const RW_MAC_DOMAIN_LEN : usize = 17;
+pub const RW_MACIN_MAX : usize = 98;
+
+/// What the pair key is the hash of: the domain, the two fingerprints and the two secrets.
+pub const RW_PAIR_DOMAIN : str = "t27os.reach.v1.pair\n";
+pub const RW_PAIR_DOMAIN_LEN : usize = 20;
+pub const RW_SECRET : usize = 16;
+pub const RW_PAIR_IN : usize = 72;
+/// The pair key: the first 16 bytes of the SHA-256 the host computes.
+pub const RW_PAIR_KEY : usize = 16;
+
+const RW_U64_MAX : u64 = 18446744073709551615;
+
+/// The exact length of a datagram of op; 0 for another op.
+pub fn rw_q_size(op: u32) -> usize {
+    if (op == RW_OP_PING) { return RW_LEN_PING; }
+    if (op == RW_OP_PONG) { return RW_LEN_PONG; }
+    if (op == RW_OP_RING or op == RW_OP_RING_OK) { return RW_LEN_RING; }
+    if (op == RW_OP_CANCEL) { return RW_LEN_CANCEL; }
+    if (op == RW_OP_KNOCK) { return RW_LEN_KNOCK; }
+    return 0;
+}
+
+/// An op whose datagrams carry a MAC: every one but KNOCK.
+pub fn rw_q_signed(op: u32) -> bool { return rw_q_size(op) != 0 and op != RW_OP_KNOCK; }
+
+// ---------------------------------------------------------------- 2. reading a datagram
+
+/// An endpoint with an address (not all zero) and a port.
+fn rw_ep_ok(e: []const u8) -> bool {
+    if (e.len < IP6_EP or ip6_port(e) == 0) { return false; }
+    var i : usize = 0;
+    while (i < 16) {
+        if (e[i] != 0) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A datagram that is a 't27q' one by its look: the magic and a length from the header to RW_Q_MAX. call_session takes
+/// it off a message block's socket before the call frames (as it takes STUN and probes) into the mailbox; rw_q_op then
+/// says whether it checks. A call frame ("T27P"), a STUN message and a probe ("t27n") never look like this.
+pub fn rw_q_looks(b: []const u8) -> bool {
+    if (b.len < RW_Q_HDR or b.len > RW_Q_MAX) { return false; }
+    return b[0] == 116 and b[1] == 50 and b[2] == 55 and b[3] == 113;
+}
+
+/// The op of a datagram that checks, 0 for anything else: the look, version 1, flags and the zero byte zero, a known op
+/// at its exact length, two fingerprints that differ, and the op's own fields (a seen-you-at endpoint all zero or with
+/// a port; a RING's n at most 2, its used endpoints with an address and a port and the rest zero; a KNOCK's nick
+/// printable, at most 24, zero after it). The MAC is not looked at here (rw_mac_ok).
+pub fn rw_q_op(b: []const u8) -> u32 {
+    if (!rw_q_looks(b)) { return 0; }
+    if (@as(u32, b[4]) != RW_Q_VER or b[6] != 0 or b[7] != 0) { return 0; }
+    const op : u32 = @as(u32, b[5]);
+    const n : usize = rw_q_size(op);
+    if (n == 0 or b.len != n) { return 0; }
+    if (ck_same(b[8..18], b[18..28])) { return 0; }
+    if (op == RW_OP_PONG) {
+        if (ip6_is_set(b[44..62]) and !rw_ep_ok(b[44..62])) { return 0; }
+    }
+    if (op == RW_OP_RING or op == RW_OP_RING_OK) {
+        const k : usize = @as(usize, b[44]);
+        if (k > RW_RING_EPS) { return 0; }
+        var i : usize = 0;
+        while (i < RW_RING_EPS) {
+            const e : []const u8 = b[45 + 18 * i .. 63 + 18 * i];
+            if (i < k and !rw_ep_ok(e)) { return 0; }
+            if (i >= k and ip6_is_set(e)) { return 0; }
+            i = i + 1;
+        }
+    }
+    if (op == RW_OP_KNOCK) {
+        const nn : usize = @as(usize, b[36]);
+        if (!nick_ok(b[37..61], nn)) { return 0; }
+        var i : usize = nn;
+        while (i < NICK_MAX) {
+            if (b[37 + i] != 0) { return 0; }
+            i = i + 1;
+        }
+    }
+    return op;
+}
+
+/// The op of a datagram that checks and is for me (fingerprint me, 10 bytes); 0 for anything else. It is never from me:
+/// a datagram's two fingerprints differ.
+pub fn rw_q_admit(b: []const u8, me: []const u8) -> u32 {
+    const op : u32 = rw_q_op(b);
+    if (op == 0 or me.len != FP_BYTES) { return 0; }
+    if (!ck_same(b[18..28], me)) { return 0; }
+    return op;
+}
+
+/// The fields of a datagram rw_q_op took; empty (or 0) when b is not one with that field.
+pub fn rw_q_from(b: []const u8) -> []const u8 {
+    if (b.len < RW_Q_HDR) { return b[0..0]; }
+    return b[8..18];
+}
+
+pub fn rw_q_to(b: []const u8) -> []const u8 {
+    if (b.len < RW_Q_HDR) { return b[0..0]; }
+    return b[18..28];
+}
+
+pub fn rw_q_ctr(b: []const u8) -> u64 {
+    if (b.len < RW_Q_HDR) { return 0; }
+    return get_u64(b, 28);
+}
+
+/// A PONG's echo: the counter of the PING it answers.
+pub fn rw_q_echo(b: []const u8) -> u64 {
+    if (b.len != RW_LEN_PONG or @as(u32, b[5]) != RW_OP_PONG) { return 0; }
+    return get_u64(b, 36);
+}
+
+/// A PONG's seen-you-at: the source endpoint its PING came from, as the friend saw it.
+pub fn rw_q_seen(b: []const u8) -> []const u8 {
+    if (b.len != RW_LEN_PONG or @as(u32, b[5]) != RW_OP_PONG) { return b[0..0]; }
+    return b[44..62];
+}
+
+/// The nonce of a RING, RING_OK or CANCEL.
+pub fn rw_q_nonce(b: []const u8) -> []const u8 {
+    if (b.len < RW_Q_HDR) { return b[0..0]; }
+    const op : u32 = @as(u32, b[5]);
+    if (op != RW_OP_RING and op != RW_OP_RING_OK and op != RW_OP_CANCEL) { return b[0..0]; }
+    if (b.len != rw_q_size(op)) { return b[0..0]; }
+    return b[36..44];
+}
+
+/// How many endpoints a RING or RING_OK names (at most RW_RING_EPS), and endpoint i of them.
+pub fn rw_q_neps(b: []const u8) -> usize {
+    if (b.len != RW_LEN_RING) { return 0; }
+    const op : u32 = @as(u32, b[5]);
+    if (op != RW_OP_RING and op != RW_OP_RING_OK) { return 0; }
+    const k : usize = @as(usize, b[44]);
+    if (k > RW_RING_EPS) { return 0; }
+    return k;
+}
+
+pub fn rw_q_ep(b: []const u8, i: usize) -> []const u8 {
+    if (i >= rw_q_neps(b)) { return b[0..0]; }
+    return b[45 + 18 * i .. 63 + 18 * i];
+}
+
+/// A KNOCK's nick (the claim).
+pub fn rw_q_nick(b: []const u8) -> []const u8 {
+    if (b.len != RW_LEN_KNOCK or @as(u32, b[5]) != RW_OP_KNOCK) { return b[0..0]; }
+    const nn : usize = @as(usize, b[36]);
+    if (nn > NICK_MAX) { return b[0..0]; }
+    return b[37 .. 37 + nn];
+}
+
+// ---------------------------------------------------------------- 3. writing a datagram
+
+/// The header of op from `from` to `to` with counter ctr into out, the rest of the datagram zeroed; false (nothing
+/// written) when out is short, a fingerprint is not 10 bytes or the two are the same.
+fn rw_hdr(out: []u8, op: u32, from: []const u8, to: []const u8, ctr: u64) -> bool {
+    const n : usize = rw_q_size(op);
+    if (n == 0 or out.len < n or from.len != FP_BYTES or to.len != FP_BYTES or ck_same(from, to)) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = 116;
+    out[1] = 50;
+    out[2] = 55;
+    out[3] = 113;
+    out[4] = @as(u8, @intCast(RW_Q_VER));
+    out[5] = @as(u8, @intCast(op));
+    i = 0;
+    while (i < FP_BYTES) {
+        out[8 + i] = from[i];
+        out[18 + i] = to[i];
+        i = i + 1;
+    }
+    put_u64(out, 28, ctr);
+    return true;
+}
+
+fn rw_copy(dst: []u8, at: usize, src: []const u8, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        dst[at + i] = src[i];
+        i = i + 1;
+    }
+}
+
+/// A PING into out: its length (44), 0 when it cannot be one. Every builder leaves the MAC zero: the host hashes
+/// rw_mac_input and writes the MAC with rw_mac_put.
+pub fn rw_ping(out: []u8, from: []const u8, to: []const u8, ctr: u64) -> usize {
+    if (!rw_hdr(out, RW_OP_PING, from, to, ctr)) { return 0; }
+    return RW_LEN_PING;
+}
+
+/// A PONG answering the PING with counter echo, which came from seen (an endpoint, or empty / all zero: not known).
+pub fn rw_pong(out: []u8, from: []const u8, to: []const u8, ctr: u64, echo: u64, seen: []const u8) -> usize {
+    if (seen.len != 0 and seen.len != IP6_EP) { return 0; }
+    if (seen.len == IP6_EP and ip6_is_set(seen) and !rw_ep_ok(seen)) { return 0; }
+    if (!rw_hdr(out, RW_OP_PONG, from, to, ctr)) { return 0; }
+    put_u64(out, 36, echo);
+    if (seen.len == IP6_EP) { rw_copy(out, 44, seen, IP6_EP); }
+    return RW_LEN_PONG;
+}
+
+/// A RING or RING_OK (op) with nonce (8 bytes) and the n (at most 2) endpoints in eps (18 bytes each, each with an
+/// address and a port).
+pub fn rw_ring(out: []u8, op: u32, from: []const u8, to: []const u8, ctr: u64, nonce: []const u8, eps: []const u8,
+               n: usize) -> usize {
+    if (op != RW_OP_RING and op != RW_OP_RING_OK) { return 0; }
+    if (nonce.len != RW_NONCE or n > RW_RING_EPS or eps.len < IP6_EP * n) { return 0; }
+    var i : usize = 0;
+    while (i < n) {
+        if (!rw_ep_ok(eps[IP6_EP * i .. IP6_EP * i + IP6_EP])) { return 0; }
+        i = i + 1;
+    }
+    if (!rw_hdr(out, op, from, to, ctr)) { return 0; }
+    rw_copy(out, 36, nonce, RW_NONCE);
+    out[44] = @as(u8, @intCast(n));
+    rw_copy(out, 45, eps, IP6_EP * n);
+    return RW_LEN_RING;
+}
+
+/// A CANCEL of the RING with this nonce.
+pub fn rw_cancel(out: []u8, from: []const u8, to: []const u8, ctr: u64, nonce: []const u8) -> usize {
+    if (nonce.len != RW_NONCE) { return 0; }
+    if (!rw_hdr(out, RW_OP_CANCEL, from, to, ctr)) { return 0; }
+    rw_copy(out, 36, nonce, RW_NONCE);
+    return RW_LEN_CANCEL;
+}
+
+/// A KNOCK claiming nick[0..nn] (printable ASCII, at most 24).
+pub fn rw_knock(out: []u8, from: []const u8, to: []const u8, ctr: u64, nick: []const u8, nn: usize) -> usize {
+    if (!nick_ok(nick, nn)) { return 0; }
+    if (!rw_hdr(out, RW_OP_KNOCK, from, to, ctr)) { return 0; }
+    out[36] = @as(u8, @intCast(nn));
+    rw_copy(out, 37, nick, nn);
+    return RW_LEN_KNOCK;
+}
+
+// ---------------------------------------------------------------- 4. the MAC
+
+/// What the host hashes for the MAC of datagram b (a signed op that checks): the domain, then every byte of b before
+/// its MAC. Into out; the length (17 + b.len - 8), 0 for a KNOCK, a datagram that does not check or a short out.
+pub fn rw_mac_input(b: []const u8, out: []u8) -> usize {
+    if (!rw_q_signed(rw_q_op(b))) { return 0; }
+    const m : usize = b.len - RW_MAC;
+    if (out.len < RW_MAC_DOMAIN_LEN + m) { return 0; }
+    const d : []const u8 = RW_MAC_DOMAIN;
+    rw_copy(out, 0, d, RW_MAC_DOMAIN_LEN);
+    rw_copy(out, RW_MAC_DOMAIN_LEN, b, m);
+    return RW_MAC_DOMAIN_LEN + m;
+}
+
+/// Write the first 8 bytes of mac (the host's HMAC-SHA256, 32 bytes) as the MAC of datagram b; false (nothing written)
+/// for a KNOCK, a datagram that does not check or a short mac.
+pub fn rw_mac_put(b: []u8, mac: []const u8) -> bool {
+    if (!rw_q_signed(rw_q_op(b)) or mac.len < RW_MAC) { return false; }
+    rw_copy(b, b.len - RW_MAC, mac, RW_MAC);
+    return true;
+}
+
+/// The MAC of datagram b is the first 8 bytes of mac (the HMAC the host computed over rw_mac_input with the friend's
+/// pair key); in constant time. False for a KNOCK, a datagram that does not check or a short mac.
+pub fn rw_mac_ok(b: []const u8, mac: []const u8) -> bool {
+    if (!rw_q_signed(rw_q_op(b)) or mac.len < RW_MAC) { return false; }
+    return ck_same(b[b.len - RW_MAC .. b.len], mac[0..RW_MAC]);
+}
+
+// ---------------------------------------------------------------- 5. the counter
+
+/// A datagram with counter ctr may be taken from a friend whose last one taken had last: only a higher one.
+pub fn rw_ctr_ok(ctr: u64, last: u64) -> bool { return ctr > last; }
+
+/// The counter to send after last at unix ms now_ms: max(last + 1, now_ms). It never goes down, also when the clock
+/// steps back; at the top of u64 it stays (and a friend then refuses it: no wrap to a low number that looks new).
+pub fn rw_ctr_next(last: u64, now_ms: u64) -> u64 {
+    if (now_ms > last) { return now_ms; }
+    if (last == RW_U64_MAX) { return last; }
+    return last + 1;
+}
+
+// ---------------------------------------------------------------- 6. the pair key
+
+/// A pair secret: 16 bytes, not all zero.
+pub fn rw_secret_ok(s: []const u8) -> bool {
+    if (s.len != RW_SECRET) { return false; }
+    var d : u8 = 0;
+    var i : usize = 0;
+    while (i < RW_SECRET) {
+        d = d | s[i];
+        i = i + 1;
+    }
+    return d != 0;
+}
+
+/// What the host hashes for the pair key of me and peer (fingerprints, 10 bytes each, not the same): the domain, the
+/// lower fingerprint, the higher, the secret of the lower one's device, the secret of the higher one's (mine: the one
+/// this device made for peer; theirs: the one peer's device made for me). Into out; 72, or 0 on a bad argument.
+pub fn rw_pair_input(me: []const u8, peer: []const u8, mine: []const u8, theirs: []const u8, out: []u8) -> usize {
+    if (me.len != FP_BYTES or peer.len != FP_BYTES or out.len < RW_PAIR_IN) { return 0; }
+    if (ck_same(me, peer) or !rw_secret_ok(mine) or !rw_secret_ok(theirs)) { return 0; }
+    const d : []const u8 = RW_PAIR_DOMAIN;
+    rw_copy(out, 0, d, RW_PAIR_DOMAIN_LEN);
+    const lo : usize = RW_PAIR_DOMAIN_LEN;
+    const hi : usize = RW_PAIR_DOMAIN_LEN + FP_BYTES;
+    const slo : usize = RW_PAIR_DOMAIN_LEN + 2 * FP_BYTES;
+    const shi : usize = slo + RW_SECRET;
+    if (gr_fp_less(me, peer)) {
+        rw_copy(out, lo, me, FP_BYTES);
+        rw_copy(out, hi, peer, FP_BYTES);
+        rw_copy(out, slo, mine, RW_SECRET);
+        rw_copy(out, shi, theirs, RW_SECRET);
+    } else {
+        rw_copy(out, lo, peer, FP_BYTES);
+        rw_copy(out, hi, me, FP_BYTES);
+        rw_copy(out, slo, theirs, RW_SECRET);
+        rw_copy(out, shi, mine, RW_SECRET);
+    }
+    return RW_PAIR_IN;
+}
+
+// ---------------------------------------------------------------- 7. the REACH record
+
+/// The chat payload kind of a REACH record, its version, its flags.
+pub const RW_K_REACH : u32 = 7;
+pub const RW_REC_VER : u32 = 1;
+pub const RW_RF_SPLIT : u32 = 1;
+pub const RW_RF_V6SOCK : u32 = 2;
+pub const RW_RF_REACH : u32 = 4;
+/// The roles of its endpoints, in the order they are written.
+pub const RW_ROLE_MSG6 : u32 = 1;
+pub const RW_ROLE_MSG4 : u32 = 2;
+pub const RW_ROLE_CALL6 : u32 = 3;
+pub const RW_ROLE_CALL4 : u32 = 4;
+pub const RW_ROLES : usize = 4;
+/// A record with no endpoint, one entry, the longest.
+pub const RW_REC_FIX : usize = 64;
+pub const RW_REC_ENT : usize = 19;
+pub const RW_REC_MAX : usize = 140;
+/// The record read flat (rw_rec_parse): flags | nick length | nick 24 | secret 16 | the 4 endpoints by role (role r at
+/// RW_RV_EPS + 18 * (r - 1), all zero when the record has none). rw_rec_build takes the endpoints the same way.
+pub const RW_RV_FLAGS : usize = 0;
+pub const RW_RV_NICKLEN : usize = 1;
+pub const RW_RV_NICK : usize = 2;
+pub const RW_RV_SECRET : usize = 26;
+pub const RW_RV_EPS : usize = 42;
+pub const RW_RV_LEN : usize = 114;
+
+fn rw_put16(b: []u8, at: usize, v: usize) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+}
+
+fn rw_get16(b: []const u8, at: usize) -> usize { return @as(usize, b[at]) | (@as(usize, b[at + 1]) << 8); }
+
+/// An endpoint of a role (1..4): an IPv6 role a native IPv6, an IPv4 role a v4-mapped one, with an address and a port.
+fn rw_role_ep_ok(role: u32, e: []const u8) -> bool {
+    if (!rw_ep_ok(e)) { return false; }
+    const v6 : bool = role == RW_ROLE_MSG6 or role == RW_ROLE_CALL6;
+    return ip6_mapped(e) != v6;
+}
+
+/// The chat payload p is a REACH record by its kind (chat_host hands it to the reach inbox before the group branches).
+pub fn rw_rec_is(p: []const u8) -> bool { return p.len > 0 and @as(u32, p[0]) == RW_K_REACH; }
+
+/// A REACH record into out: flags (0..255), nick[0..nn] (printable ASCII, at most 24), secret (16 bytes, not all zero)
+/// and the endpoints in eps (72 bytes, role r at 18 * (r - 1); an all-zero one is left out, a set one must fit its
+/// role). The length (64 + 19 per endpoint), 0 when it cannot be one.
+pub fn rw_rec_build(out: []u8, flags: u32, nick: []const u8, nn: usize, secret: []const u8, eps: []const u8) -> usize {
+    if (flags > 255 or !nick_ok(nick, nn) or !rw_secret_ok(secret) or eps.len < RW_ROLES * IP6_EP) { return 0; }
+    var k : usize = 0;
+    var r : usize = 0;
+    while (r < RW_ROLES) {
+        const e : []const u8 = eps[IP6_EP * r .. IP6_EP * r + IP6_EP];
+        if (ip6_is_set(e)) {
+            if (!rw_role_ep_ok(@as(u32, @intCast(r + 1)), e)) { return 0; }
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    const n : usize = RW_REC_FIX + RW_REC_ENT * k;
+    if (out.len < n) { return 0; }
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = @as(u8, @intCast(RW_K_REACH));
+    out[2] = 1;
+    rw_put16(out, 18, n - CH_PHDR);
+    out[20] = @as(u8, @intCast(RW_REC_VER));
+    out[21] = @as(u8, @intCast(flags));
+    out[22] = @as(u8, @intCast(nn));
+    rw_copy(out, 23, nick, nn);
+    rw_copy(out, 47, secret, RW_SECRET);
+    out[63] = @as(u8, @intCast(k));
+    var at : usize = RW_REC_FIX;
+    r = 0;
+    while (r < RW_ROLES) {
+        const e : []const u8 = eps[IP6_EP * r .. IP6_EP * r + IP6_EP];
+        if (ip6_is_set(e)) {
+            out[at] = @as(u8, @intCast(r + 1));
+            rw_copy(out, at + 1, e, IP6_EP);
+            at = at + RW_REC_ENT;
+        }
+        r = r + 1;
+    }
+    return n;
+}
+
+/// Read the REACH record p into v (RW_RV_LEN bytes, zeroed first): true when it checks. It checks: the payload header
+/// (kind 7, 0, msg 1, part, parts and time 0, len the bytes after it), version 1, the nick (at most 24 printable, zero
+/// after it), a secret not all zero, the length 64 + 19 n, roles 1..4 rising (none twice, so n is at most 4 and the
+/// record at most 140 bytes), each endpoint fitting its role. Flag bits this build does not know are kept.
+pub fn rw_rec_parse(p: []const u8, v: []u8) -> bool {
+    if (v.len < RW_RV_LEN) { return false; }
+    var i : usize = 0;
+    while (i < RW_RV_LEN) {
+        v[i] = 0;
+        i = i + 1;
+    }
+    if (p.len < RW_REC_FIX) { return false; }
+    if (@as(u32, p[0]) != RW_K_REACH or p[1] != 0 or p[2] != 1 or p[3] != 0 or p[4] != 0 or p[5] != 0) { return false; }
+    i = 6;
+    while (i < 18) {
+        if (p[i] != 0) { return false; }
+        i = i + 1;
+    }
+    if (rw_get16(p, 18) != p.len - CH_PHDR) { return false; }
+    if (@as(u32, p[20]) != RW_REC_VER) { return false; }
+    const nn : usize = @as(usize, p[22]);
+    if (!nick_ok(p[23..47], nn)) { return false; }
+    i = nn;
+    while (i < NICK_MAX) {
+        if (p[23 + i] != 0) { return false; }
+        i = i + 1;
+    }
+    if (!rw_secret_ok(p[47..63])) { return false; }
+    const k : usize = @as(usize, p[63]);
+    if (p.len != RW_REC_FIX + RW_REC_ENT * k) { return false; }
+    var last : u32 = 0;
+    var j : usize = 0;
+    while (j < k) {
+        const at : usize = RW_REC_FIX + RW_REC_ENT * j;
+        const role : u32 = @as(u32, p[at]);
+        if (role <= last or role > RW_ROLE_CALL4) { return false; }
+        if (!rw_role_ep_ok(role, p[at + 1 .. at + 1 + IP6_EP])) { return false; }
+        last = role;
+        j = j + 1;
+    }
+    v[RW_RV_FLAGS] = p[21];
+    v[RW_RV_NICKLEN] = p[22];
+    rw_copy(v, RW_RV_NICK, p[23..47], NICK_MAX);
+    rw_copy(v, RW_RV_SECRET, p[47..63], RW_SECRET);
+    j = 0;
+    while (j < k) {
+        const at : usize = RW_REC_FIX + RW_REC_ENT * j;
+        const r : usize = @as(usize, p[at]);
+        rw_copy(v, RW_RV_EPS + IP6_EP * (r - 1), p[at + 1 .. at + 1 + IP6_EP], IP6_EP);
+        j = j + 1;
+    }
+    return true;
+}
+
+/// The fields of a record rw_rec_parse read into v.
+pub fn rw_rv_flags(v: []const u8) -> u32 {
+    if (v.len < RW_RV_LEN) { return 0; }
+    return @as(u32, v[RW_RV_FLAGS]);
+}
+
+pub fn rw_rv_nick(v: []const u8) -> []const u8 {
+    if (v.len < RW_RV_LEN or @as(usize, v[RW_RV_NICKLEN]) > NICK_MAX) { return v[0..0]; }
+    return v[RW_RV_NICK .. RW_RV_NICK + @as(usize, v[RW_RV_NICKLEN])];
+}
+
+pub fn rw_rv_secret(v: []const u8) -> []const u8 {
+    if (v.len < RW_RV_LEN) { return v[0..0]; }
+    return v[RW_RV_SECRET .. RW_RV_SECRET + RW_SECRET];
+}
+
+/// The endpoint of role (1..4), all zero when the record had none; empty for another role.
+pub fn rw_rv_ep(v: []const u8, role: u32) -> []const u8 {
+    if (v.len < RW_RV_LEN or role < RW_ROLE_MSG6 or role > RW_ROLE_CALL4) { return v[0..0]; }
+    const at : usize = RW_RV_EPS + IP6_EP * (@as(usize, role) - 1);
+    return v[at .. at + IP6_EP];
+}
+
+// ---------------------------------------------------------------- 8. the mailbox entry
+
+/// Datagram d (rw_q_looks) that came from endpoint src into the mailbox entry e (128 bytes): length, 0, src, 4 zero
+/// bytes, d, zeros. False (nothing written) when e or src is short or d does not look like a 't27q' datagram.
+pub fn rw_pe_put(e: []u8, src: []const u8, d: []const u8) -> bool {
+    if (e.len < RW_PE_LEN or src.len < IP6_EP or !rw_q_looks(d)) { return false; }
+    var i : usize = 0;
+    while (i < RW_PE_LEN) {
+        e[i] = 0;
+        i = i + 1;
+    }
+    e[0] = @as(u8, @intCast(d.len));
+    rw_copy(e, RW_PE_SRC, src, IP6_EP);
+    rw_copy(e, RW_PE_DATA, d, d.len);
+    return true;
+}
+
+/// The entry e is one rw_pe_put wrote: its length a datagram's, its zero bytes zero, its datagram looks right.
+pub fn rw_pe_ok(e: []const u8) -> bool {
+    if (e.len < RW_PE_LEN) { return false; }
+    const n : usize = @as(usize, e[0]);
+    if (n > RW_Q_MAX or e[1] != 0) { return false; }
+    var i : usize = RW_PE_SRC + IP6_EP;
+    while (i < RW_PE_DATA) {
+        if (e[i] != 0) { return false; }
+        i = i + 1;
+    }
+    i = RW_PE_DATA + n;
+    while (i < RW_PE_LEN) {
+        if (e[i] != 0) { return false; }
+        i = i + 1;
+    }
+    return rw_q_looks(e[RW_PE_DATA .. RW_PE_DATA + n]);
+}
+
+/// Where the datagram of entry e came from, and the datagram; empty when e is not an entry (rw_pe_ok).
+pub fn rw_pe_src(e: []const u8) -> []const u8 {
+    if (!rw_pe_ok(e)) { return e[0..0]; }
+    return e[RW_PE_SRC .. RW_PE_SRC + IP6_EP];
+}
+
+pub fn rw_pe_data(e: []const u8) -> []const u8 {
+    if (!rw_pe_ok(e)) { return e[0..0]; }
+    return e[RW_PE_DATA .. RW_PE_DATA + @as(usize, e[0])];
+}
+
+// ---------------------------------------------------------------- tests
+
+/// The test devices A (the lower fingerprint, peer_identity's test one) and B, and the secret each made for the other.
+const RW_T_FPA : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+const RW_T_FPB : [10]u8 = [254, 220, 186, 152, 118, 84, 50, 16, 1, 35];
+const RW_T_SA : [16]u8 = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+const RW_T_SB : [16]u8 = [160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175];
+const RW_T_NONCE : [8]u8 = [9, 8, 7, 6, 5, 4, 3, 2];
+
+/// From an independent reference encoder (Python struct, hashlib.sha256, hmac), not from this file, as hex (a longer
+/// one in two halves, A then B): the pair input of A and B and its pair key (the first 16 bytes of its SHA-256); A's
+/// PING to B (counter 1761264000123), B's PONG (seen-you-at [3ffe:18:1917:f34e::1]:47728), A's RING (n 2:
+/// [3ffe:18:1917:f34e::1]:47727, 203.0.113.7:47727), B's RING_OK (n 1: [3ffe:ffff:abcd::7]:47727), A's CANCEL, B's
+/// KNOCK ("Dmitrii M1", no MAC), every MAC the real HMAC-SHA256 under that pair key (so the host's SHA-256 and HMAC can
+/// be checked against them); what the PING's MAC covers; A's REACH record with all 4 endpoints, B's with none, B's
+/// with the message IPv6 and the call IPv4.
+const RW_T_PAIRINA : str = "7432376f732e72656163682e76312e706169720a0123456789abcdeffedcfedcba987654";
+const RW_T_PAIRINB : str = "32100123101112131415161718191a1b1c1d1e1fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
+const RW_T_PAIRKEY : str = "aeb8221cca87ff46a40b2470fba196fd";
+const RW_T_PING : str = "74323771010100000123456789abcdeffedcfedcba987654321001237bdc83139a010000b4109cef271918ce";
+const RW_T_PONGA : str = "7432377101020000fedcba987654321001230123456789abcdeffedcc8dd83139a0100";
+const RW_T_PONGB : str = "007bdc83139a0100003ffe00181917f34e0000000000000001ba705eb3d55b14e98aa1";
+const RW_T_RINGA : str = "74323771010300000123456789abcdeffedcfedcba9876543210012315df83139a0100000908070605040302";
+const RW_T_RINGB : str = "023ffe00181917f34e0000000000000001ba6f00000000000000000000ffffcb007107ba6f15c99c0f37ecd3c2";
+const RW_T_RINGOKA : str = "7432377101040000fedcba987654321001230123456789abcdeffedce8df83139a0100000908070605040302";
+const RW_T_RINGOKB : str = "013ffeffffabcd00000000000000000007ba6f00000000000000000000000000000000000096c3371917525404";
+const RW_T_CANCEL : str = "74323771010500000123456789abcdeffedcfedcba98765432100123d0e383139a01000009080706050403026f07a5cfea4698a6";
+const RW_T_KNOCKA : str = "7432377101060000fedcba987654321001230123456789abcdeffedcb8e7";
+const RW_T_KNOCKB : str = "83139a0100000a446d6974726969204d310000000000000000000000000000";
+const RW_T_MACIN : str = "7432376f732e72656163682e76312e710a74323771010100000123456789abcdeffedcfedcba987654321001237bdc83139a010000";
+const RW_T_REC4A : str = "07000100000000000000000000000000000078000107034d6163000000000000000000000000000000000000000000101112131415161718191a1b1c1d1e1f04013ffe001819";
+const RW_T_REC4B : str = "17f34e0000000000000001ba700200000000000000000000ffffcb007107ba70033ffe00181917f34e0000000000000001ba6f0400000000000000000000ffffcb007107ba6f";
+const RW_T_REC0 : str = "0700010000000000000000000000000000002c00010000000000000000000000000000000000000000000000000000a0a1a2a3a4a5a6a7a8a9aaabacadaeaf00";
+const RW_T_REC2A : str = "07000100000000000000000000000000000052000104024d3100000000000000000000000000000000000000000000a0a1a2a3";
+const RW_T_REC2B : str = "a4a5a6a7a8a9aaabacadaeaf02013ffeffffabcd00000000000000000007ba700400000000000000000000ffffc63364c8c822";
+
+/// The three records of the older-build test in halves (4 entries, none, 2 entries), picked by index: a pick instead of
+/// arrays of slices, which gen-verilog cannot lower (W469), so the spec seals on every backend.
+fn rw_t_rec_a(i: usize) -> []const u8 {
+    if (i == 0) { return RW_T_REC4A; }
+    if (i == 1) { return RW_T_REC0; }
+    return RW_T_REC2A;
+}
+fn rw_t_rec_b(i: usize) -> []const u8 {
+    if (i == 0) { return RW_T_REC4B; }
+    if (i == 1) { return RW_T_REC0[0..0]; }
+    return RW_T_REC2B;
+}
+
+fn rw_t_nib(c: u8) -> u8 {
+    if (c >= 48 and c <= 57) { return c - 48; }
+    return c - 87;
+}
+
+/// The bytes of a lower-case hex text; how many.
+fn rw_t_hex(s: []const u8, out: []u8) -> usize {
+    var i : usize = 0;
+    while (2 * i + 1 < s.len and i < out.len) {
+        out[i] = rw_t_nib(s[2 * i]) * 16 + rw_t_nib(s[2 * i + 1]);
+        i = i + 1;
+    }
+    return i;
+}
+
+/// The bytes of a vector kept in two halves.
+fn rw_t_hex2(a: []const u8, b: []const u8, out: []u8) -> usize {
+    const n : usize = rw_t_hex(a, out);
+    return n + rw_t_hex(b, out[n..out.len]);
+}
+
+fn rw_t_ep(s: []const u8, ep: []u8) -> bool { return ip6_parse(s, s.len, ep); }
+
+/// The 4 endpoints of A's record by role (rw_rec_build's eps): message [3ffe:18:1917:f34e::1]:47728 and
+/// 203.0.113.7:47728, call the same at 47727.
+fn rw_t_eps4(eps: []u8) -> void {
+    rw_t_ep("[3ffe:18:1917:f34e::1]:47728", eps[0..18]);
+    rw_t_ep("203.0.113.7:47728", eps[18..36]);
+    rw_t_ep("[3ffe:18:1917:f34e::1]:47727", eps[36..54]);
+    rw_t_ep("203.0.113.7:47727", eps[54..72]);
+}
+
+/// Every datagram of the reference, op by op.
+fn rw_t_ref(op: u32, d: []u8) -> usize {
+    if (op == RW_OP_PING) { return rw_t_hex(RW_T_PING, d); }
+    if (op == RW_OP_PONG) { return rw_t_hex2(RW_T_PONGA, RW_T_PONGB, d); }
+    if (op == RW_OP_RING) { return rw_t_hex2(RW_T_RINGA, RW_T_RINGB, d); }
+    if (op == RW_OP_RING_OK) { return rw_t_hex2(RW_T_RINGOKA, RW_T_RINGOKB, d); }
+    if (op == RW_OP_CANCEL) { return rw_t_hex(RW_T_CANCEL, d); }
+    return rw_t_hex2(RW_T_KNOCKA, RW_T_KNOCKB, d);
+}
+
+/// The reference datagram of op built here (its MAC from the reference); its length.
+fn rw_t_build(op: u32, d: []u8) -> usize {
+    var e : [36]u8 = undefined;
+    var n : usize = 0;
+    if (op == RW_OP_PING) { n = rw_ping(d, RW_T_FPA[0..10], RW_T_FPB[0..10], 1761264000123); }
+    if (op == RW_OP_PONG) {
+        rw_t_ep("[3ffe:18:1917:f34e::1]:47728", e[0..18]);
+        n = rw_pong(d, RW_T_FPB[0..10], RW_T_FPA[0..10], 1761264000456, 1761264000123, e[0..18]);
+    }
+    if (op == RW_OP_RING) {
+        rw_t_ep("[3ffe:18:1917:f34e::1]:47727", e[0..18]);
+        rw_t_ep("203.0.113.7:47727", e[18..36]);
+        n = rw_ring(d, RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1761264000789, RW_T_NONCE[0..8], e[0..36], 2);
+    }
+    if (op == RW_OP_RING_OK) {
+        rw_t_ep("[3ffe:ffff:abcd::7]:47727", e[0..18]);
+        n = rw_ring(d, RW_OP_RING_OK, RW_T_FPB[0..10], RW_T_FPA[0..10], 1761264001000, RW_T_NONCE[0..8], e[0..18], 1);
+    }
+    if (op == RW_OP_CANCEL) { n = rw_cancel(d, RW_T_FPA[0..10], RW_T_FPB[0..10], 1761264002000, RW_T_NONCE[0..8]); }
+    if (op == RW_OP_KNOCK) { n = rw_knock(d, RW_T_FPB[0..10], RW_T_FPA[0..10], 1761264003000, "Dmitrii M1", 10); }
+    if (n != 0 and rw_q_signed(op)) {
+        var r : [104]u8 = undefined;
+        const m : usize = rw_t_ref(op, r[0..104]);
+        if (!rw_mac_put(d[0..n], r[m - 8 .. m])) { return 0; }
+    }
+    return n;
+}
+
+test rw_every_datagram_has_its_exact_size_and_fits_a_mailbox_entry {
+    assert RW_LEN_PING == RW_Q_HDR + RW_MAC and RW_LEN_PING == 44;
+    assert RW_LEN_PONG == RW_Q_HDR + 8 + IP6_EP + RW_MAC and RW_LEN_PONG == 70;
+    assert RW_LEN_RING == RW_Q_HDR + RW_NONCE + 1 + RW_RING_EPS * IP6_EP + RW_MAC and RW_LEN_RING == 89;
+    assert RW_LEN_CANCEL == RW_Q_HDR + RW_NONCE + RW_MAC and RW_LEN_CANCEL == 52;
+    assert RW_LEN_KNOCK == RW_Q_HDR + 1 + NICK_MAX and RW_LEN_KNOCK == 61;
+    // the header: magic 4, version, op, flags, 0, two fingerprints, the counter
+    assert RW_Q_HDR == 4 + 4 + 2 * FP_BYTES + 8;
+    const ops : [6]u32 = [RW_OP_PING, RW_OP_PONG, RW_OP_RING, RW_OP_RING_OK, RW_OP_CANCEL, RW_OP_KNOCK];
+    const lens : [6]usize = [44, 70, 89, 89, 52, 61];
+    var i : usize = 0;
+    while (i < 6) {
+        assert rw_q_size(ops[i]) == lens[i];
+        assert lens[i] >= RW_Q_HDR and lens[i] <= RW_Q_MAX and RW_Q_MAX <= 128;
+        assert rw_q_signed(ops[i]) == (ops[i] != RW_OP_KNOCK);
+        i = i + 1;
+    }
+    assert rw_q_size(0) == 0 and rw_q_size(7) == 0 and rw_q_size(255) == 0 and rw_q_size(256 + 1) == 0;
+    assert !rw_q_signed(0) and !rw_q_signed(7);
+    // a mailbox entry holds the longest datagram rw_q_looks takes; the MAC input of the longest one fits its buffer
+    assert RW_PE_SRC + IP6_EP + 4 == RW_PE_DATA and RW_PE_DATA + RW_Q_MAX == RW_PE_LEN and RW_PE_LEN == 128;
+    const md : []const u8 = RW_MAC_DOMAIN;
+    const pd : []const u8 = RW_PAIR_DOMAIN;
+    assert md.len == RW_MAC_DOMAIN_LEN and pd.len == RW_PAIR_DOMAIN_LEN;
+    assert RW_MACIN_MAX == RW_MAC_DOMAIN_LEN + RW_LEN_RING - RW_MAC;
+    assert RW_PAIR_IN == RW_PAIR_DOMAIN_LEN + 2 * FP_BYTES + 2 * RW_SECRET;
+    // the REACH record: 20 + 44 + 4 x 19 = 140, a chat payload; its flat view
+    assert RW_REC_FIX == CH_PHDR + 3 + NICK_MAX + RW_SECRET + 1;
+    assert RW_REC_ENT == 1 + IP6_EP and RW_REC_MAX == RW_REC_FIX + RW_ROLES * RW_REC_ENT and RW_REC_MAX == 140;
+    assert RW_REC_MAX <= CH_PAYLOAD_MAX;
+    assert RW_RV_NICK + NICK_MAX == RW_RV_SECRET and RW_RV_SECRET + RW_SECRET == RW_RV_EPS;
+    assert RW_RV_EPS + RW_ROLES * IP6_EP == RW_RV_LEN;
+}
+
+test rw_the_datagrams_and_the_pair_input_are_the_reference_encoders_bytes {
+    const ops : [6]u32 = [RW_OP_PING, RW_OP_PONG, RW_OP_RING, RW_OP_RING_OK, RW_OP_CANCEL, RW_OP_KNOCK];
+    var i : usize = 0;
+    while (i < 6) {
+        var d : [104]u8 = undefined;
+        var r : [104]u8 = undefined;
+        const n : usize = rw_t_build(ops[i], d[0..104]);
+        const m : usize = rw_t_ref(ops[i], r[0..104]);
+        assert n == m and n == rw_q_size(ops[i]);
+        assert same_bytes(d[0..n], r[0..m]);
+        assert rw_q_op(r[0..m]) == ops[i];
+        // the reference MAC checks; a KNOCK has none
+        assert rw_mac_ok(r[0..m], r[m - 8 .. m]) == rw_q_signed(ops[i]);
+        i = i + 1;
+    }
+    // what the PING's MAC covers
+    var p : [104]u8 = undefined;
+    const pn : usize = rw_t_hex(RW_T_PING, p[0..104]);
+    var mi : [98]u8 = undefined;
+    var mr : [98]u8 = undefined;
+    const k : usize = rw_mac_input(p[0..pn], mi[0..98]);
+    assert k == rw_t_hex(RW_T_MACIN, mr[0..98]) and k == 53;
+    assert same_bytes(mi[0..k], mr[0..k]);
+    // the pair input, from both sides
+    var a : [72]u8 = undefined;
+    var b : [72]u8 = undefined;
+    var ref : [72]u8 = undefined;
+    assert rw_t_hex2(RW_T_PAIRINA, RW_T_PAIRINB, ref[0..72]) == 72;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..72]) == 72;
+    assert rw_pair_input(RW_T_FPB[0..10], RW_T_FPA[0..10], RW_T_SB[0..16], RW_T_SA[0..16], b[0..72]) == 72;
+    assert same_bytes(a[0..72], ref[0..72]) and same_bytes(b[0..72], ref[0..72]);
+    var key : [16]u8 = undefined;
+    assert rw_t_hex(RW_T_PAIRKEY, key[0..16]) == RW_PAIR_KEY;
+}
+
+test rw_every_op_reads_back_its_fields {
+    var d : [104]u8 = undefined;
+    var e : [18]u8 = undefined;
+    // PING from A to B
+    var n : usize = rw_t_build(RW_OP_PING, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPB[0..10]) == RW_OP_PING and rw_q_admit(d[0..n], RW_T_FPA[0..10]) == 0;
+    assert same_bytes(rw_q_from(d[0..n]), RW_T_FPA[0..10]) and same_bytes(rw_q_to(d[0..n]), RW_T_FPB[0..10]);
+    assert rw_q_ctr(d[0..n]) == 1761264000123 and rw_q_echo(d[0..n]) == 0 and rw_q_seen(d[0..n]).len == 0;
+    assert rw_q_nonce(d[0..n]).len == 0 and rw_q_neps(d[0..n]) == 0 and rw_q_nick(d[0..n]).len == 0;
+    // PONG from B to A, with the echo and seen-you-at
+    n = rw_t_build(RW_OP_PONG, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPA[0..10]) == RW_OP_PONG and rw_q_admit(d[0..n], RW_T_FPB[0..10]) == 0;
+    assert rw_q_ctr(d[0..n]) == 1761264000456 and rw_q_echo(d[0..n]) == 1761264000123;
+    assert rw_t_ep("[3ffe:18:1917:f34e::1]:47728", e[0..18]) and ip6_same(rw_q_seen(d[0..n]), e[0..18]);
+    // a PONG with no seen-you-at, from an empty slice and from an all-zero endpoint
+    var z : [18]u8 = undefined;
+    ip6_clear(z[0..18]);
+    assert rw_pong(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 9, 8, z[0..0]) == RW_LEN_PONG;
+    assert rw_q_op(d[0..70]) == RW_OP_PONG and !ip6_is_set(rw_q_seen(d[0..70])) and rw_q_echo(d[0..70]) == 8;
+    assert rw_pong(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 9, 8, z[0..18]) == RW_LEN_PONG;
+    assert rw_q_op(d[0..70]) == RW_OP_PONG and !ip6_is_set(rw_q_seen(d[0..70]));
+    // RING with two endpoints, RING_OK with one
+    n = rw_t_build(RW_OP_RING, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPB[0..10]) == RW_OP_RING;
+    assert same_bytes(rw_q_nonce(d[0..n]), RW_T_NONCE[0..8]) and rw_q_neps(d[0..n]) == 2;
+    assert rw_t_ep("[3ffe:18:1917:f34e::1]:47727", e[0..18]) and ip6_same(rw_q_ep(d[0..n], 0), e[0..18]);
+    assert rw_t_ep("203.0.113.7:47727", e[0..18]) and ip6_same(rw_q_ep(d[0..n], 1), e[0..18]);
+    assert rw_q_ep(d[0..n], 2).len == 0;
+    n = rw_t_build(RW_OP_RING_OK, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPA[0..10]) == RW_OP_RING_OK and rw_q_neps(d[0..n]) == 1;
+    assert rw_t_ep("[3ffe:ffff:abcd::7]:47727", e[0..18]) and ip6_same(rw_q_ep(d[0..n], 0), e[0..18]);
+    assert rw_q_ep(d[0..n], 1).len == 0 and same_bytes(rw_q_nonce(d[0..n]), RW_T_NONCE[0..8]);
+    // a RING with no endpoint
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 5, RW_T_NONCE[0..8], e[0..0], 0) == 89;
+    assert rw_q_op(d[0..89]) == RW_OP_RING and rw_q_neps(d[0..89]) == 0 and rw_q_ep(d[0..89], 0).len == 0;
+    // CANCEL, KNOCK
+    n = rw_t_build(RW_OP_CANCEL, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPB[0..10]) == RW_OP_CANCEL and same_bytes(rw_q_nonce(d[0..n]), RW_T_NONCE[0..8]);
+    assert rw_q_neps(d[0..n]) == 0 and rw_q_ctr(d[0..n]) == 1761264002000;
+    n = rw_t_build(RW_OP_KNOCK, d[0..104]);
+    assert rw_q_admit(d[0..n], RW_T_FPA[0..10]) == RW_OP_KNOCK and same_bytes(rw_q_nick(d[0..n]), "Dmitrii M1");
+    assert rw_q_nonce(d[0..n]).len == 0 and rw_q_ctr(d[0..n]) == 1761264003000;
+    // a KNOCK with no nick, and one of 24 characters
+    assert rw_knock(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, "x", 0) == 61;
+    assert rw_q_op(d[0..61]) == RW_OP_KNOCK and rw_q_nick(d[0..61]).len == 0;
+    assert rw_knock(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, "abcdefghijklmnopqrstuvwx", 24) == 61;
+    assert rw_q_op(d[0..61]) == RW_OP_KNOCK and same_bytes(rw_q_nick(d[0..61]), "abcdefghijklmnopqrstuvwx");
+    // the counter is little-endian, as the call header's sequence
+    assert rw_ping(d[0..104], RW_T_FPA[0..10], RW_T_FPB[0..10], 258) == 44 and d[28] == 2 and d[29] == 1 and d[35] == 0;
+    assert rw_q_ctr(d[0..44]) == 258;
+    // short slices read as nothing
+    assert rw_q_from(d[0..35]).len == 0 and rw_q_to(d[0..35]).len == 0 and rw_q_ctr(d[0..35]) == 0;
+    assert rw_q_admit(d[0..44], RW_T_FPB[0..9]) == 0;
+}
+
+test rw_a_builder_refuses_what_rw_q_op_would_refuse {
+    var d : [104]u8 = undefined;
+    var e : [54]u8 = undefined;
+    // the same fingerprint both ways, a short one, a short out
+    assert rw_ping(d[0..104], RW_T_FPA[0..10], RW_T_FPA[0..10], 1) == 0;
+    assert rw_ping(d[0..104], RW_T_FPA[0..9], RW_T_FPB[0..10], 1) == 0;
+    assert rw_ping(d[0..104], RW_T_FPA[0..10], RW_T_FPB[0..9], 1) == 0;
+    assert rw_ping(d[0..43], RW_T_FPA[0..10], RW_T_FPB[0..10], 1) == 0;
+    assert rw_ping(d[0..44], RW_T_FPA[0..10], RW_T_FPB[0..10], 1) == 44;
+    // seen-you-at with no port, or of a wrong size
+    assert rw_t_ep("[3ffe:18:1917:f34e::1]:47728", e[0..18]);
+    e[16] = 0;
+    e[17] = 0;
+    assert rw_pong(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, 1, e[0..18]) == 0;
+    assert rw_pong(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, 1, e[0..17]) == 0;
+    assert rw_pong(d[0..69], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, 1, e[0..0]) == 0;
+    // a RING of another op, three endpoints, an endpoint with no port or no address, a short nonce or eps
+    assert rw_t_ep("[3ffe:18:1917:f34e::1]:47727", e[0..18]) and rw_t_ep("203.0.113.7:47727", e[18..36]);
+    assert rw_ring(d[0..104], RW_OP_PING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..36], 2) == 0;
+    assert rw_ring(d[0..104], RW_OP_CANCEL, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..36], 2) == 0;
+    assert rw_t_ep("[3ffe:ffff:abcd::7]:47727", e[36..54]);
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..54], 3) == 0;
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..7], e[0..36], 2) == 0;
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..35], 2) == 0;
+    assert rw_ring(d[0..88], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..36], 2) == 0;
+    e[34] = 0;
+    e[35] = 0;
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..36], 2) == 0;
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], e[0..36], 1) == 89;
+    var z : [18]u8 = undefined;
+    ip6_clear(z[0..18]);
+    z[17] = 80;
+    assert rw_ring(d[0..104], RW_OP_RING, RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..8], z[0..18], 1) == 0;
+    // a CANCEL with a short nonce, a KNOCK with 25 characters or a control character
+    assert rw_cancel(d[0..104], RW_T_FPA[0..10], RW_T_FPB[0..10], 1, RW_T_NONCE[0..7]) == 0;
+    assert rw_knock(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, "abcdefghijklmnopqrstuvwxy", 25) == 0;
+    assert rw_knock(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, "ab\ncd", 5) == 0;
+    assert rw_knock(d[0..104], RW_T_FPB[0..10], RW_T_FPA[0..10], 1, "abc", 4) == 0;
+}
+
+test rw_every_byte_before_the_mac_and_no_byte_of_it_is_what_the_host_hashes {
+    const ops : [5]u32 = [RW_OP_PING, RW_OP_PONG, RW_OP_RING, RW_OP_RING_OK, RW_OP_CANCEL];
+    var changed : u32 = 0;
+    var refused : u32 = 0;
+    var o : usize = 0;
+    while (o < 5) {
+        var d : [104]u8 = undefined;
+        const n : usize = rw_t_ref(ops[o], d[0..104]);
+        var m0 : [98]u8 = undefined;
+        const k0 : usize = rw_mac_input(d[0..n], m0[0..98]);
+        assert k0 == RW_MAC_DOMAIN_LEN + n - RW_MAC;
+        const md : []const u8 = RW_MAC_DOMAIN;
+        assert same_bytes(m0[0..RW_MAC_DOMAIN_LEN], md) and same_bytes(m0[RW_MAC_DOMAIN_LEN..k0], d[0 .. n - RW_MAC]);
+        var i : usize = 0;
+        while (i < n) {
+            var e : [104]u8 = d;
+            e[i] = e[i] ^ 1;
+            var m1 : [98]u8 = undefined;
+            const k1 : usize = rw_mac_input(e[0..n], m1[0..98]);
+            if (i >= n - RW_MAC) {
+                // a byte of the MAC: the same input
+                assert k1 == k0 and same_bytes(m1[0..k1], m0[0..k0]);
+            } else if (rw_q_op(e[0..n]) == 0) {
+                // the datagram no longer checks: nothing is hashed for it
+                assert k1 == 0;
+                refused = refused + 1;
+            } else {
+                assert k1 == k0 and m1[RW_MAC_DOMAIN_LEN + i] != m0[RW_MAC_DOMAIN_LEN + i];
+                changed = changed + 1;
+            }
+            i = i + 1;
+        }
+        o = o + 1;
+    }
+    // per op the 28 header bytes past "t27q" 1 op 0 0, the echo and seen-you-at (26), the nonce and the endpoints
+    // (8 + 36 for two, 8 + 18 for one), the nonce of a CANCEL
+    assert changed == 28 + 54 + 72 + 54 + 36;
+    // per op the 8 bytes "t27q" 1 op 0 0; a RING's n of 3; a RING_OK's n of 0 and its unused endpoint (18)
+    assert refused == 8 * 5 + 1 + 1 + 18;
+    // no input for a KNOCK, a datagram that does not check, a short out
+    var k : [104]u8 = undefined;
+    const kn : usize = rw_t_ref(RW_OP_KNOCK, k[0..104]);
+    var mi : [98]u8 = undefined;
+    assert rw_mac_input(k[0..kn], mi[0..98]) == 0;
+    var p : [104]u8 = undefined;
+    const pn : usize = rw_t_ref(RW_OP_PING, p[0..104]);
+    assert rw_mac_input(p[0 .. pn - 1], mi[0..98]) == 0;
+    assert rw_mac_input(p[0..pn], mi[0..52]) == 0 and rw_mac_input(p[0..pn], mi[0..53]) == 53;
+}
+
+test rw_the_mac_is_compared_whole_and_only_where_it_sits {
+    var d : [104]u8 = undefined;
+    const n : usize = rw_t_ref(RW_OP_RING, d[0..104]);
+    var mac : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) {
+        mac[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8) {
+        mac[i] = d[n - 8 + i];
+        i = i + 1;
+    }
+    // the first 8 bytes of the host's 32 are the MAC; the other 24 do not count
+    assert rw_mac_ok(d[0..n], mac[0..32]) and rw_mac_ok(d[0..n], mac[0..8]);
+    mac[8] = 99;
+    mac[31] = 1;
+    assert rw_mac_ok(d[0..n], mac[0..32]);
+    // any one bit of the MAC wrong, in the datagram or in what the host computed
+    const bits : [8]u8 = [1, 2, 4, 8, 16, 32, 64, 128];
+    var j : usize = 0;
+    while (j < 64) {
+        var w : [32]u8 = mac;
+        w[j / 8] = w[j / 8] ^ bits[j % 8];
+        assert !rw_mac_ok(d[0..n], w[0..32]);
+        var e : [104]u8 = d;
+        e[n - 8 + j / 8] = e[n - 8 + j / 8] ^ bits[j % 8];
+        assert !rw_mac_ok(e[0..n], mac[0..32]);
+        j = j + 1;
+    }
+    // a short mac, a KNOCK, a datagram that does not check
+    assert !rw_mac_ok(d[0..n], mac[0..7]);
+    var k : [104]u8 = undefined;
+    const kn : usize = rw_t_ref(RW_OP_KNOCK, k[0..104]);
+    assert !rw_mac_ok(k[0..kn], k[kn - 8 .. kn]) and !rw_mac_put(k[0..kn], mac[0..32]);
+    var e : [104]u8 = d;
+    e[4] = 2;
+    assert !rw_mac_ok(e[0..n], mac[0..32]) and !rw_mac_put(e[0..n], mac[0..32]);
+    // rw_mac_put writes the first 8 bytes at the end and nothing else
+    var f : [104]u8 = d;
+    var w : [32]u8 = undefined;
+    i = 0;
+    while (i < 32) {
+        w[i] = @as(u8, @intCast(200 + i % 50));
+        i = i + 1;
+    }
+    assert rw_mac_put(f[0..n], w[0..32]) and rw_mac_ok(f[0..n], w[0..32]) and !rw_mac_ok(f[0..n], mac[0..32]);
+    assert same_bytes(f[0 .. n - 8], d[0 .. n - 8]) and same_bytes(f[n - 8 .. n], w[0..8]);
+    assert !rw_mac_put(f[0..n], w[0..7]) and same_bytes(f[n - 8 .. n], w[0..8]);
+}
+
+test rw_older_builds_drop_every_t27q_datagram_and_it_is_no_frame_stun_or_probe {
+    const ops : [6]u32 = [RW_OP_PING, RW_OP_PONG, RW_OP_RING, RW_OP_RING_OK, RW_OP_CANCEL, RW_OP_KNOCK];
+    var i : usize = 0;
+    while (i < 6) {
+        var d : [104]u8 = undefined;
+        const n : usize = rw_t_ref(ops[i], d[0..104]);
+        assert ck_hdr_type(d[0..n]) == 0 and !cn_stun_looks(d[0..n]) and !cn_probe_is(d[0..n]);
+        assert rw_q_looks(d[0..n]);
+        i = i + 1;
+    }
+    // anything that starts "t27q", at any length rw_q_looks takes, whatever follows
+    var b : [104]u8 = undefined;
+    var j : usize = 0;
+    while (j < 104) {
+        b[j] = 255;
+        j = j + 1;
+    }
+    b[0] = 116;
+    b[1] = 50;
+    b[2] = 55;
+    b[3] = 113;
+    var n : usize = RW_Q_HDR;
+    while (n <= RW_Q_MAX) {
+        assert rw_q_looks(b[0..n]) and ck_hdr_type(b[0..n]) == 0 and !cn_stun_looks(b[0..n]) and !cn_probe_is(b[0..n]);
+        n = n + 1;
+    }
+    // a call frame, a STUN request and a probe are no 't27q' datagram
+    var f : [64]u8 = undefined;
+    var sid : [16]u8 = undefined;
+    j = 0;
+    while (j < 16) {
+        sid[j] = @as(u8, @intCast(j + 1));
+        j = j + 1;
+    }
+    assert ck_put_header(f[0..64], CK_T_INVITE, RW_T_FPA[0..10], RW_T_FPB[0..10], sid[0..16], 1) == CK_HDR;
+    assert !rw_q_looks(f[0..CK_HDR]) and rw_q_op(f[0..CK_HDR]) == 0;
+    var s : [20]u8 = undefined;
+    assert cn_stun_request(sid[0..12], s[0..20]) == 20 and !rw_q_looks(s[0..20]);
+    var p : [16]u8 = undefined;
+    assert cn_probe(RW_T_FPA[0..10], p[0..16]) == 16 and !rw_q_looks(p[0..16]);
+    // the look: each magic byte, the shortest and the longest
+    var d : [104]u8 = undefined;
+    const pn : usize = rw_t_ref(RW_OP_PING, d[0..104]);
+    j = 0;
+    while (j < 4) {
+        var e : [104]u8 = d;
+        e[j] = e[j] ^ 32;
+        assert !rw_q_looks(e[0..pn]) and rw_q_op(e[0..pn]) == 0;
+        j = j + 1;
+    }
+    assert !rw_q_looks(b[0 .. RW_Q_HDR - 1]) and rw_q_looks(b[0..RW_Q_MAX]);
+    var big : [106]u8 = undefined;
+    j = 0;
+    while (j < 106) {
+        big[j] = b[j % 104];
+        j = j + 1;
+    }
+    assert !rw_q_looks(big[0 .. RW_Q_MAX + 1]) and rw_q_looks(big[0..RW_Q_MAX]);
+}
+
+test rw_a_datagram_that_does_not_check_is_refused {
+    const ops : [6]u32 = [RW_OP_PING, RW_OP_PONG, RW_OP_RING, RW_OP_RING_OK, RW_OP_CANCEL, RW_OP_KNOCK];
+    var i : usize = 0;
+    while (i < 6) {
+        var d : [104]u8 = undefined;
+        const n : usize = rw_t_ref(ops[i], d[0..104]);
+        // every cut and one byte more
+        var c : usize = 0;
+        while (c < n) {
+            assert rw_q_op(d[0..c]) == 0 and rw_q_admit(d[0..c], rw_q_to(d[0..n])) == 0;
+            c = c + 1;
+        }
+        assert rw_q_op(d[0 .. n + 1]) == 0;
+        // version 0 and 2, flags, the zero byte, ops 0, 7 and 255, an op of another length
+        var e : [104]u8 = d;
+        e[4] = 0;
+        assert rw_q_op(e[0..n]) == 0;
+        e[4] = 2;
+        assert rw_q_op(e[0..n]) == 0;
+        e = d;
+        e[6] = 1;
+        assert rw_q_op(e[0..n]) == 0;
+        e = d;
+        e[6] = 128;
+        assert rw_q_op(e[0..n]) == 0;
+        e = d;
+        e[7] = 1;
+        assert rw_q_op(e[0..n]) == 0;
+        e = d;
+        e[5] = 0;
+        assert rw_q_op(e[0..n]) == 0;
+        e[5] = 7;
+        assert rw_q_op(e[0..n]) == 0;
+        e[5] = 255;
+        assert rw_q_op(e[0..n]) == 0;
+        var o : u32 = 1;
+        while (o <= 6) {
+            e = d;
+            e[5] = @as(u8, @intCast(o));
+            // only an op of the same length reads (RING and RING_OK are the same shape)
+            assert (rw_q_op(e[0..n]) != 0) == (rw_q_size(o) == n);
+            o = o + 1;
+        }
+        // from me to me
+        e = d;
+        var k : usize = 0;
+        while (k < 10) {
+            e[18 + k] = e[8 + k];
+            k = k + 1;
+        }
+        assert rw_q_op(e[0..n]) == 0;
+        i = i + 1;
+    }
+    // the RING and RING_OK: n of 3 or more; a used endpoint with no port or no address; an unused one not zero
+    var r : [104]u8 = undefined;
+    const rn : usize = rw_t_ref(RW_OP_RING, r[0..104]);
+    var e : [104]u8 = r;
+    e[44] = 3;
+    assert rw_q_op(e[0..rn]) == 0 and rw_q_neps(e[0..rn]) == 0 and rw_q_ep(e[0..rn], 2).len == 0;
+    e[44] = 255;
+    assert rw_q_op(e[0..rn]) == 0;
+    e = r;
+    e[61] = 0;
+    e[62] = 0;
+    assert rw_q_op(e[0..rn]) == 0;
+    e = r;
+    e[79] = 0;
+    e[80] = 0;
+    assert rw_q_op(e[0..rn]) == 0;
+    e = r;
+    var k : usize = 45;
+    while (k < 61) {
+        e[k] = 0;
+        k = k + 1;
+    }
+    assert rw_q_op(e[0..rn]) == 0;
+    e = r;
+    e[44] = 1;
+    assert rw_q_op(e[0..rn]) == 0;
+    var ok : [104]u8 = undefined;
+    const okn : usize = rw_t_ref(RW_OP_RING_OK, ok[0..104]);
+    k = 63;
+    while (k < 81) {
+        e = ok;
+        e[k] = 1;
+        assert rw_q_op(e[0..okn]) == 0;
+        k = k + 1;
+    }
+    e = ok;
+    e[44] = 0;
+    assert rw_q_op(e[0..okn]) == 0;
+    e[44] = 2;
+    assert rw_q_op(e[0..okn]) == 0;
+    // the PONG: seen-you-at with an address and no port, or a port and no address
+    var p : [104]u8 = undefined;
+    const pn : usize = rw_t_ref(RW_OP_PONG, p[0..104]);
+    e = p;
+    e[60] = 0;
+    e[61] = 0;
+    assert rw_q_op(e[0..pn]) == 0;
+    e = p;
+    k = 44;
+    while (k < 60) {
+        e[k] = 0;
+        k = k + 1;
+    }
+    assert rw_q_op(e[0..pn]) == 0;
+    e[60] = 0;
+    e[61] = 0;
+    assert rw_q_op(e[0..pn]) == RW_OP_PONG;
+    // the KNOCK: a nick longer than 24, a control or high byte in it, a byte after it
+    var kn : [104]u8 = undefined;
+    const knn : usize = rw_t_ref(RW_OP_KNOCK, kn[0..104]);
+    e = kn;
+    e[36] = 25;
+    assert rw_q_op(e[0..knn]) == 0 and rw_q_nick(e[0..knn]).len == 0;
+    e = kn;
+    e[38] = 10;
+    assert rw_q_op(e[0..knn]) == 0;
+    e = kn;
+    e[38] = 200;
+    assert rw_q_op(e[0..knn]) == 0;
+    k = 47;
+    while (k < 61) {
+        e = kn;
+        e[k] = 65;
+        assert rw_q_op(e[0..knn]) == 0;
+        k = k + 1;
+    }
+    e = kn;
+    e[36] = 11;
+    e[47] = 65;
+    assert rw_q_op(e[0..knn]) == RW_OP_KNOCK and same_bytes(rw_q_nick(e[0..knn]), "Dmitrii M1A");
+}
+
+test rw_the_counter_only_goes_up_and_never_needs_the_two_clocks_to_agree {
+    assert rw_ctr_ok(1, 0) and rw_ctr_ok(5, 4) and rw_ctr_ok(1761264000124, 1761264000123);
+    assert !rw_ctr_ok(4, 4) and !rw_ctr_ok(3, 4) and !rw_ctr_ok(0, 0) and !rw_ctr_ok(0, 18446744073709551615);
+    assert !rw_ctr_ok(18446744073709551615, 18446744073709551615) and rw_ctr_ok(18446744073709551615, 0);
+    // the next is the clock while it is ahead, else one more than the last
+    assert rw_ctr_next(0, 1761264000123) == 1761264000123;
+    assert rw_ctr_next(1761264000123, 1761264000124) == 1761264000124;
+    assert rw_ctr_next(1761264000123, 1761264000123) == 1761264000124;
+    assert rw_ctr_next(1761264000123, 5) == 1761264000124;
+    assert rw_ctr_next(0, 0) == 1;
+    // the top of u64 stays; a friend refuses it again
+    assert rw_ctr_next(18446744073709551615, 7) == 18446744073709551615;
+    assert rw_ctr_next(18446744073709551614, 0) == 18446744073709551615;
+    // a clock that steps back an hour: every counter sent is still taken by the friend, once
+    var last_sent : u64 = 0;
+    var last_taken : u64 = 0;
+    const clock : [8]u64 = [1761264000000, 1761264001000, 1761260400000, 1761260400000, 1761260401000, 1761264002000,
+                            1761264002000, 0];
+    var i : usize = 0;
+    while (i < 8) {
+        const c : u64 = rw_ctr_next(last_sent, clock[i]);
+        assert c > last_sent;
+        last_sent = c;
+        assert rw_ctr_ok(c, last_taken);
+        last_taken = c;
+        // the same datagram again is refused
+        assert !rw_ctr_ok(c, last_taken);
+        i = i + 1;
+    }
+    assert last_sent == 1761264002002;
+    // the counter in a datagram is what rw_q_ctr reads, all 64 bits
+    var d : [104]u8 = undefined;
+    assert rw_ping(d[0..104], RW_T_FPA[0..10], RW_T_FPB[0..10], 18446744073709551614) == 44;
+    assert rw_q_ctr(d[0..44]) == 18446744073709551614 and !rw_ctr_ok(rw_q_ctr(d[0..44]), 18446744073709551614);
+}
+
+test rw_the_pair_input_is_the_same_from_both_sides_and_only_theirs {
+    var a : [72]u8 = undefined;
+    var b : [72]u8 = undefined;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..72]) == 72;
+    assert rw_pair_input(RW_T_FPB[0..10], RW_T_FPA[0..10], RW_T_SB[0..16], RW_T_SA[0..16], b[0..72]) == 72;
+    assert same_bytes(a[0..72], b[0..72]);
+    // the lower fingerprint first, its device's secret first
+    assert same_bytes(a[20..30], RW_T_FPA[0..10]) and same_bytes(a[30..40], RW_T_FPB[0..10]);
+    assert same_bytes(a[40..56], RW_T_SA[0..16]) and same_bytes(a[56..72], RW_T_SB[0..16]);
+    // fingerprints equal in their first bytes: a later byte decides the order, from both sides
+    var f1 : [10]u8 = RW_T_FPA;
+    var f2 : [10]u8 = RW_T_FPA;
+    f1[9] = 1;
+    f2[9] = 2;
+    assert rw_pair_input(f2[0..10], f1[0..10], RW_T_SB[0..16], RW_T_SA[0..16], a[0..72]) == 72;
+    assert rw_pair_input(f1[0..10], f2[0..10], RW_T_SA[0..16], RW_T_SB[0..16], b[0..72]) == 72;
+    assert same_bytes(a[0..72], b[0..72]) and same_bytes(a[20..30], f1[0..10]);
+    assert same_bytes(a[40..56], RW_T_SA[0..16]);
+    // either secret changed (one bit) is another input, so another key; the two secrets swapped too
+    var r : [72]u8 = undefined;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], RW_T_SB[0..16], r[0..72]) == 72;
+    var s : [16]u8 = RW_T_SA;
+    s[15] = s[15] ^ 1;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], s[0..16], RW_T_SB[0..16], a[0..72]) == 72;
+    assert !same_bytes(a[0..72], r[0..72]);
+    s = RW_T_SB;
+    s[0] = s[0] ^ 128;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], s[0..16], a[0..72]) == 72;
+    assert !same_bytes(a[0..72], r[0..72]);
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SB[0..16], RW_T_SA[0..16], a[0..72]) == 72;
+    assert !same_bytes(a[0..72], r[0..72]);
+    // a friend C of both holds only the secrets made for C: whatever pair of them it puts in, never A and B's input
+    var sac : [16]u8 = RW_T_SA;
+    var sca : [16]u8 = RW_T_SB;
+    var sbc : [16]u8 = RW_T_SB;
+    var scb : [16]u8 = RW_T_SA;
+    sac[3] = 77;
+    sca[3] = 78;
+    sbc[3] = 79;
+    scb[3] = 80;
+    // the four side by side in one buffer (an array of slices does not lower to gen-verilog, W469)
+    var known : [64]u8 = undefined;
+    var k : usize = 0;
+    while (k < 16) {
+        known[k] = sac[k];
+        known[16 + k] = sca[k];
+        known[32 + k] = sbc[k];
+        known[48 + k] = scb[k];
+        k = k + 1;
+    }
+    var x : usize = 0;
+    while (x < 4) {
+        var y : usize = 0;
+        while (y < 4) {
+            assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], known[x * 16 .. x * 16 + 16], known[y * 16 .. y * 16 + 16], a[0..72]) == 72;
+            assert !same_bytes(a[0..72], r[0..72]);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    // A's pair with C is another input than A's pair with B, though A's own secret is the same one
+    var fc : [10]u8 = RW_T_FPB;
+    fc[9] = 99;
+    assert rw_pair_input(RW_T_FPA[0..10], fc[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..72]) == 72;
+    assert !same_bytes(a[0..72], r[0..72]);
+    // refused: the same fingerprint, a secret of zeros, a short one, a short fingerprint, a short out
+    var z : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 16) {
+        z[i] = 0;
+        i = i + 1;
+    }
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPA[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..72]) == 0;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], z[0..16], RW_T_SB[0..16], a[0..72]) == 0;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], z[0..16], a[0..72]) == 0;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..15], RW_T_SB[0..16], a[0..72]) == 0;
+    assert rw_pair_input(RW_T_FPA[0..9], RW_T_FPB[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..72]) == 0;
+    assert rw_pair_input(RW_T_FPA[0..10], RW_T_FPB[0..10], RW_T_SA[0..16], RW_T_SB[0..16], a[0..71]) == 0;
+    assert rw_secret_ok(RW_T_SA[0..16]) and !rw_secret_ok(z[0..16]) and !rw_secret_ok(RW_T_SA[0..15]);
+    z[7] = 1;
+    assert rw_secret_ok(z[0..16]);
+}
+
+test rw_the_reach_record_reads_back_and_older_builds_drop_it {
+    var eps : [72]u8 = undefined;
+    rw_t_eps4(eps[0..72]);
+    var o : [160]u8 = undefined;
+    var r : [140]u8 = undefined;
+    // A's record with all 4 endpoints: the reference bytes, 140 of them
+    const all : u32 = RW_RF_SPLIT | RW_RF_V6SOCK | RW_RF_REACH;
+    var n : usize = rw_rec_build(o[0..160], all, "Mac", 3, RW_T_SA[0..16], eps[0..72]);
+    assert n == RW_REC_MAX and rw_t_hex2(RW_T_REC4A, RW_T_REC4B, r[0..140]) == n and same_bytes(o[0..n], r[0..n]);
+    var v : [114]u8 = undefined;
+    assert rw_rec_parse(o[0..n], v[0..114]);
+    assert rw_rv_flags(v[0..114]) == 7 and same_bytes(rw_rv_nick(v[0..114]), "Mac");
+    assert same_bytes(rw_rv_secret(v[0..114]), RW_T_SA[0..16]) and same_bytes(v[RW_RV_EPS..RW_RV_LEN], eps[0..72]);
+    assert ip6_same(rw_rv_ep(v[0..114], RW_ROLE_MSG6), eps[0..18]);
+    assert ip6_same(rw_rv_ep(v[0..114], RW_ROLE_CALL4), eps[54..72]);
+    assert rw_rv_ep(v[0..114], 0).len == 0 and rw_rv_ep(v[0..114], 5).len == 0;
+    // B's with none, and B's with the message IPv6 and the call IPv4 (the others left out)
+    var e2 : [72]u8 = undefined;
+    var i : usize = 0;
+    while (i < 72) {
+        e2[i] = 0;
+        i = i + 1;
+    }
+    n = rw_rec_build(o[0..160], 0, "", 0, RW_T_SB[0..16], e2[0..72]);
+    assert n == RW_REC_FIX and rw_t_hex(RW_T_REC0, r[0..140]) == n and same_bytes(o[0..n], r[0..n]);
+    assert rw_rec_parse(o[0..n], v[0..114]) and rw_rv_flags(v[0..114]) == 0 and rw_rv_nick(v[0..114]).len == 0;
+    assert !ip6_is_set(rw_rv_ep(v[0..114], RW_ROLE_MSG6)) and !ip6_is_set(rw_rv_ep(v[0..114], RW_ROLE_CALL4));
+    assert rw_t_ep("[3ffe:ffff:abcd::7]:47728", e2[0..18]) and rw_t_ep("198.51.100.200:51234", e2[54..72]);
+    n = rw_rec_build(o[0..160], RW_RF_REACH, "M1", 2, RW_T_SB[0..16], e2[0..72]);
+    assert n == RW_REC_FIX + 2 * RW_REC_ENT and rw_t_hex2(RW_T_REC2A, RW_T_REC2B, r[0..140]) == n;
+    assert same_bytes(o[0..n], r[0..n]);
+    assert rw_rec_parse(o[0..n], v[0..114]) and same_bytes(v[RW_RV_EPS..RW_RV_LEN], e2[0..72]);
+    assert !ip6_is_set(rw_rv_ep(v[0..114], RW_ROLE_MSG4)) and !ip6_is_set(rw_rv_ep(v[0..114], RW_ROLE_CALL6));
+    // flag bits of a later build are kept
+    n = rw_rec_build(o[0..160], 255, "M1", 2, RW_T_SB[0..16], e2[0..72]);
+    assert rw_rec_parse(o[0..n], v[0..114]) and rw_rv_flags(v[0..114]) == 255;
+    assert rw_rec_build(o[0..160], 256, "M1", 2, RW_T_SB[0..16], e2[0..72]) == 0;
+    // older builds: no chat kind, no group payload; chat_host hands it to the reach inbox
+    i = 0;
+    while (i < 3) {
+        const m : usize = rw_t_hex2(rw_t_rec_a(i), rw_t_rec_b(i), r[0..140]);
+        assert m <= RW_REC_MAX and m <= CH_PAYLOAD_MAX;
+        assert rw_rec_is(r[0..m]) and ch_kind(r[0..m]) == 0 and !gi_is(r[0..m]) and !gm_is_group(r[0..m]);
+        i = i + 1;
+    }
+    // and no payload of chat_core or group_core is a REACH record
+    var c : [740]u8 = undefined;
+    n = ch_put_text(c[0..740], 3, 0, 1761264000000, "hello");
+    assert n > 0 and !rw_rec_is(c[0..n]) and !rw_rec_parse(c[0..n], v[0..114]);
+    n = ch_put_ack(c[0..740], 3, 0);
+    assert n > 0 and !rw_rec_is(c[0..n]);
+    n = ch_put_read(c[0..740], 3);
+    assert n > 0 and !rw_rec_is(c[0..n]);
+    const gk : [3]u32 = [GM_K_TEXT, GM_K_ACK, GM_K_INFO];
+    i = 0;
+    while (i < 3) {
+        c[0] = @as(u8, @intCast(gk[i]));
+        assert !rw_rec_is(c[0..64]) and gk[i] != RW_K_REACH;
+        i = i + 1;
+    }
+    assert !rw_rec_is(c[0..0]);
+}
+
+test rw_a_reach_record_that_does_not_check_is_refused {
+    var eps : [72]u8 = undefined;
+    rw_t_eps4(eps[0..72]);
+    var r : [140]u8 = undefined;
+    const n : usize = rw_t_hex2(RW_T_REC4A, RW_T_REC4B, r[0..140]);
+    var v : [114]u8 = undefined;
+    assert rw_rec_parse(r[0..n], v[0..114]);
+    // every cut, also with its length field made to match; one byte more, a short view; a refused record leaves the
+    // view all zero
+    var c : usize = 0;
+    while (c < n) {
+        assert !rw_rec_parse(r[0..c], v[0..114]);
+        if (c >= CH_PHDR) {
+            var cut : [140]u8 = r;
+            cut[18] = @as(u8, @intCast(c - CH_PHDR));
+            assert !rw_rec_parse(cut[0..c], v[0..114]);
+        }
+        c = c + 1;
+    }
+    var big : [141]u8 = undefined;
+    c = 0;
+    while (c < 140) {
+        big[c] = r[c];
+        c = c + 1;
+    }
+    big[140] = 0;
+    big[18] = 121;
+    assert !rw_rec_parse(big[0..141], v[0..114]);
+    // a fifth entry (n 5, 159 bytes, the length right): no fifth role after 4, and 4 again is twice
+    var five : [159]u8 = undefined;
+    c = 0;
+    while (c < 140) {
+        five[c] = r[c];
+        c = c + 1;
+    }
+    c = 0;
+    while (c < 19) {
+        five[140 + c] = r[121 + c];
+        c = c + 1;
+    }
+    five[18] = 139;
+    five[63] = 5;
+    assert !rw_rec_parse(five[0..159], v[0..114]);
+    five[140] = 5;
+    assert !rw_rec_parse(five[0..159], v[0..114]);
+    assert !rw_rec_parse(r[0..n], v[0..113]);
+    var z : u32 = 0;
+    c = 0;
+    while (c < 114) {
+        z = z | @as(u32, v[c]);
+        c = c + 1;
+    }
+    assert z == 0;
+    // the payload header: each of its bytes but the length's own
+    var i : usize = 0;
+    while (i < 18) {
+        var e : [140]u8 = r;
+        e[i] = e[i] ^ 1;
+        assert !rw_rec_parse(e[0..n], v[0..114]);
+        i = i + 1;
+    }
+    var e : [140]u8 = r;
+    e[18] = 119;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[19] = 1;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    // version 0 and 2
+    e = r;
+    e[20] = 0;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e[20] = 2;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    // the nick: 25 long, a control character, a byte after it
+    e = r;
+    e[22] = 25;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[24] = 9;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    i = 26;
+    while (i < 47) {
+        e = r;
+        e[i] = 65;
+        assert !rw_rec_parse(e[0..n], v[0..114]);
+        i = i + 1;
+    }
+    // a secret of zeros
+    e = r;
+    i = 47;
+    while (i < 63) {
+        e[i] = 0;
+        i = i + 1;
+    }
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    // n that does not match the length, n of 5
+    e = r;
+    e[63] = 3;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e[63] = 5;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    // roles: 0, 5, twice (the call IPv6 entry named message IPv6 again: its endpoint fits that role), 0 for an IPv4
+    // endpoint, falling (the message IPv6 and call IPv6 entries swapped: each still fits its role)
+    e = r;
+    e[64] = 0;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[121] = 5;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[102] = 1;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[83] = 0;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    e = r;
+    e[64] = 3;
+    e[102] = 1;
+    assert !rw_rec_parse(e[0..n], v[0..114]);
+    var s : [102]u8 = undefined;
+    const sn : usize = rw_t_hex2(RW_T_REC2A, RW_T_REC2B, s[0..102]);
+    assert rw_rec_parse(s[0..sn], v[0..114]);
+    var t : [102]u8 = s;
+    // entries swapped (call IPv4 first, then message IPv6): falling roles
+    t = s;
+    i = 0;
+    while (i < 19) {
+        t[64 + i] = s[83 + i];
+        t[83 + i] = s[64 + i];
+        i = i + 1;
+    }
+    assert !rw_rec_parse(t[0..sn], v[0..114]);
+    // an IPv6 role with an IPv4 endpoint and the other way, an endpoint with no port, one with no address
+    t = s;
+    t[64] = 2;
+    assert !rw_rec_parse(t[0..sn], v[0..114]);
+    t = s;
+    t[83] = 3;
+    assert !rw_rec_parse(t[0..sn], v[0..114]);
+    t = s;
+    t[83] = 2;
+    assert rw_rec_parse(t[0..sn], v[0..114]) and ip6_mapped(rw_rv_ep(v[0..114], RW_ROLE_MSG4));
+    t = s;
+    t[81] = 0;
+    t[82] = 0;
+    assert !rw_rec_parse(t[0..sn], v[0..114]);
+    t = s;
+    i = 65;
+    while (i < 81) {
+        t[i] = 0;
+        i = i + 1;
+    }
+    assert !rw_rec_parse(t[0..sn], v[0..114]);
+    // the builder refuses the same: an endpoint that does not fit its role, no port, a bad nick or secret, short out
+    var o : [160]u8 = undefined;
+    var w : [72]u8 = eps;
+    ip6_copy(w[0..18], eps[18..36]);
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, RW_T_SA[0..16], w[0..72]) == 0;
+    w = eps;
+    ip6_copy(w[54..72], eps[36..54]);
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, RW_T_SA[0..16], w[0..72]) == 0;
+    w = eps;
+    w[34] = 0;
+    w[35] = 0;
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, RW_T_SA[0..16], w[0..72]) == 0;
+    var zs : [16]u8 = undefined;
+    i = 0;
+    while (i < 16) {
+        zs[i] = 0;
+        i = i + 1;
+    }
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, zs[0..16], eps[0..72]) == 0;
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, RW_T_SA[0..15], eps[0..72]) == 0;
+    assert rw_rec_build(o[0..160], 7, "M\nc", 3, RW_T_SA[0..16], eps[0..72]) == 0;
+    assert rw_rec_build(o[0..160], 7, "abcdefghijklmnopqrstuvwxy", 25, RW_T_SA[0..16], eps[0..72]) == 0;
+    assert rw_rec_build(o[0..160], 7, "Mac", 3, RW_T_SA[0..16], eps[0..71]) == 0;
+    assert rw_rec_build(o[0..139], 7, "Mac", 3, RW_T_SA[0..16], eps[0..72]) == 0;
+    assert rw_rec_build(o[0..140], 7, "Mac", 3, RW_T_SA[0..16], eps[0..72]) == 140;
+}
+
+test rw_a_mailbox_entry_keeps_the_datagram_and_where_it_came_from {
+    var e : [128]u8 = undefined;
+    var i : usize = 0;
+    while (i < 128) {
+        e[i] = 170;
+        i = i + 1;
+    }
+    var src : [18]u8 = undefined;
+    assert rw_t_ep("[3ffe:18:1917:f34e::1]:47728", src[0..18]);
+    var d : [104]u8 = undefined;
+    const n : usize = rw_t_ref(RW_OP_RING, d[0..104]);
+    assert rw_pe_put(e[0..128], src[0..18], d[0..n]) and rw_pe_ok(e[0..128]);
+    assert e[0] == 89 and e[1] == 0 and ip6_same(rw_pe_src(e[0..128]), src[0..18]);
+    assert same_bytes(rw_pe_data(e[0..128]), d[0..n]) and rw_q_op(rw_pe_data(e[0..128])) == RW_OP_RING;
+    // the old bytes are gone: zeros after the source and after the datagram
+    i = RW_PE_SRC + IP6_EP;
+    while (i < RW_PE_DATA) {
+        assert e[i] == 0;
+        i = i + 1;
+    }
+    i = RW_PE_DATA + n;
+    while (i < RW_PE_LEN) {
+        assert e[i] == 0;
+        i = i + 1;
+    }
+    // an IPv4 sender is its v4-mapped endpoint; the shortest and the longest that look right
+    assert rw_t_ep("203.0.113.7:47728", src[0..18]);
+    var b : [104]u8 = undefined;
+    i = 0;
+    while (i < 104) {
+        b[i] = 7;
+        i = i + 1;
+    }
+    b[0] = 116;
+    b[1] = 50;
+    b[2] = 55;
+    b[3] = 113;
+    assert rw_pe_put(e[0..128], src[0..18], b[0..36]) and rw_pe_ok(e[0..128]) and rw_pe_data(e[0..128]).len == 36;
+    assert ip6_mapped(rw_pe_src(e[0..128]));
+    assert rw_pe_put(e[0..128], src[0..18], b[0..104]) and rw_pe_ok(e[0..128]) and rw_pe_data(e[0..128]).len == 104;
+    // refused: not 't27q', too short, too long, a short entry or source; nothing is written then
+    var f : [128]u8 = e;
+    var big : [105]u8 = undefined;
+    i = 0;
+    while (i < 105) {
+        big[i] = b[i % 104];
+        i = i + 1;
+    }
+    assert !rw_pe_put(e[0..128], src[0..18], big[0..105]);
+    assert !rw_pe_put(e[0..128], src[0..18], b[0..35]);
+    var p : [16]u8 = undefined;
+    assert cn_probe(RW_T_FPA[0..10], p[0..16]) == 16 and !rw_pe_put(e[0..128], src[0..18], p[0..16]);
+    assert !rw_pe_put(e[0..127], src[0..18], d[0..n]) and !rw_pe_put(e[0..128], src[0..17], d[0..n]);
+    assert same_bytes(e[0..128], f[0..128]);
+    // an entry that is not one: a length out of range, the zero bytes set, a byte after the datagram, not 't27q'
+    assert rw_pe_put(e[0..128], src[0..18], d[0..n]);
+    f = e;
+    f[0] = 35;
+    assert !rw_pe_ok(f[0..128]) and rw_pe_src(f[0..128]).len == 0 and rw_pe_data(f[0..128]).len == 0;
+    f[0] = 105;
+    assert !rw_pe_ok(f[0..128]);
+    f = e;
+    f[1] = 1;
+    assert !rw_pe_ok(f[0..128]);
+    i = RW_PE_SRC + IP6_EP;
+    while (i < RW_PE_DATA) {
+        f = e;
+        f[i] = 1;
+        assert !rw_pe_ok(f[0..128]);
+        i = i + 1;
+    }
+    f = e;
+    f[RW_PE_DATA + n] = 1;
+    assert !rw_pe_ok(f[0..128]);
+    f = e;
+    f[127] = 1;
+    assert !rw_pe_ok(f[0..128]);
+    f = e;
+    f[RW_PE_DATA + 3] = 110;
+    assert !rw_pe_ok(f[0..128]);
+    assert !rw_pe_ok(e[0..127]);
+}

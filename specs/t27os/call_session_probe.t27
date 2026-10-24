@@ -1,0 +1,872 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_session_probe.t27 -- drives call_session.t27 the way a window would: only the cs_* API, one
+// cs_poll per pass of its loop, a "person" who answers, reads the code and says match or differ. Not part of the
+// app; there is no screen here, so a pass means the session API carries a call, not that a call screen works.
+// Runs (one line per check; exit 0 only when every check passed):
+//   (no env)               two sessions in this process on 127.0.0.1:47751 / 47752 with the test pattern (no
+//                          devices), reused call after call: a full call (ring, answer, the same code on both
+//                          sides, ACTIVE, CS_FRAMES frames each way with the caller muted for 50 of them, a forged
+//                          plain BYE ignored, hang-up, IDLE), a person who says differ, a decline, a cancel while
+//                          ringing, a hang-up while the codes are shown. Bound to 127.0.0.1 the sockets are IPv4
+//                          ones (cs_dual_stack) with FD_CLOEXEC, and a dial to an IPv6 is refused.
+//   CS_V6=1 (no CS_ROLE)   the same two sessions on the dual-stack socket (call_ip6.t27), bound to :: on 47753 / 47754,
+//                          the IPv6 loopback allowed (CS_K_LOOP6, a test aid): a full call to [::1]:47754 (family v6,
+//                          every redundant audio copy sent and taken as a datagram of its own, none too big for
+//                          IPv6), then a call to 127.0.0.1:47754 on the same sockets (family v4-mapped, no copies alone),
+//                          and the refusals (multicast, the loopback without the test aid).
+//   CS_ROLE=caller|callee  one side in its own process. CS_BIND / CS_PORT (default 127.0.0.1, caller 47761,
+//                          callee 47762), CS_PEER / CS_PEER_PORT (the caller dials there; default 127.0.0.1 and the
+//                          other port), CS_FRAMES (200: the caller hangs up once it sent and received that many),
+//                          CS_AUDIO=dev (microphone and speakers through AudioQueue on this run loop, volume 0.05)
+//                          or test (default), CS_SAY=differ (this person says the codes differ), CS_ANSWER=0 (the
+//                          callee never answers), CS_MUTE=1 (the caller mutes frames 100..149), CS_VERIFY_MS,
+//                          CS_JB_TARGET / CS_JB_MAX, CS_EXPECT=active (default) or failed. Each side prints
+//                          CODE <6 digits>; the operator compares the two logs. Addresses: private networks or 127.x (call_view cv_lan_ok).
+//   CS_ROLE=relay          a man in the middle on CS_BIND:CS_PORT that forwards between the first sender and
+//                          CS_PEER:CS_PEER_PORT, changes one byte of the callee's ANSWER nonce and puts the hash of
+//                          the original ANSWER into the caller's REVEAL (so the callee does not notice): the two
+//                          sides then show different codes.
+// Build (Apple silicon):
+//   t27b build specs/t27os/call_session_probe.t27 -o csp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -framework AudioToolbox \
+//      -framework CoreGraphics -framework ImageIO -o csp csp.o
+// Test identities only (fixed fingerprints). Refs gHashTag/t27#11560.
+module T27osCallSessionProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::call_view::cv_lan_ok;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::keysync_host::ks_sha256;
+use t27os::call_core::ck_put_header;
+use t27os::call_core::ck_hdr_type;
+use t27os::call_core::ck_same;
+use t27os::call_core::ck_put;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::CK_ENDED;
+use t27os::call_core::CK_FAILED;
+use t27os::call_core::CK_T_ANSWER;
+use t27os::call_core::CK_T_REVEAL;
+use t27os::call_core::CK_T_BYE;
+use t27os::call_core::CK_ANSWER_LEN;
+use t27os::call_core::CK_REVEAL_LEN;
+use t27os::call_crypto_probe::ckh_line;
+use t27os::call_crypto_probe::ckh_num;
+use t27os::call_crypto_probe::ckh_check;
+use t27os::call_crypto_probe::ckh_env;
+use t27os::call_crypto_probe::ckh_env_num;
+use t27os::call_crypto_probe::ckh_fps;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_crypto_probe::ckh_usleep;
+use t27os::call_crypto_probe::ckh_addr4;
+use t27os::call_crypto_probe::ckh_sendto;
+use t27os::call_crypto_probe::ckh_recvfrom;
+use t27os::call_crypto_probe::ckh_fcntl;
+use t27os::call_crypto_probe::EP_ME;
+use t27os::call_crypto_probe::EP_PEER;
+use t27os::call_crypto_probe::EP_SID;
+use t27os::callback_probe::cbp_konst;
+use t27os::callback_probe::cbp_run;
+use t27os::callback_probe::cbp_fin;
+use t27os::callback_probe::cbp_fout;
+use t27os::call_session::cs_open;
+use t27os::call_session::cs_call;
+use t27os::call_session::cs_call6;
+use t27os::call_session::cs_net;
+use t27os::call_session::cs_peer_ep;
+use t27os::call_session::cs_probe_send6;
+use t27os::call_session::cs_nat;
+use t27os::call_session::CS_K_LOOP6;
+use t27os::call_session::CS_NET_FAM;
+use t27os::call_session::CS_NET_SOCK6;
+use t27os::call_session::CS_NET_BIG;
+use t27os::call_session::CS_NET_COPY_TX;
+use t27os::call_session::CS_NET_COPY_RX;
+use t27os::call_session::CS_NET_CLOEXEC;
+use t27os::call_session::CS_N_P6;
+use t27os::call_session::CS_N_P6TX;
+use t27os::call_session::CS_PEER_V6;
+use t27os::call_ip6::ip6_parse;
+use t27os::call_ip6::ip6_same;
+use t27os::call_ip6::IP6_F_V6;
+use t27os::call_ip6::IP6_F_MAPPED;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_incoming;
+use t27os::call_session::cs_peer;
+use t27os::call_session::cs_code;
+use t27os::call_session::cs_answer;
+use t27os::call_session::cs_decline;
+use t27os::call_session::cs_confirm;
+use t27os::call_session::cs_mute;
+use t27os::call_session::cs_muted;
+use t27os::call_session::cs_hangup;
+use t27os::call_session::cs_dismiss;
+use t27os::call_session::cs_reason;
+use t27os::call_session::cs_stat;
+use t27os::call_session::cs_set;
+use t27os::call_session::cs_close;
+use t27os::call_session::CS_LEN;
+use t27os::call_session::CS_AUDIO_DEV;
+use t27os::call_session::CS_AUDIO_TEST;
+use t27os::call_session::CS_EV_NONE;
+use t27os::call_session::CS_EV_CALLING;
+use t27os::call_session::CS_EV_RINGING;
+use t27os::call_session::CS_EV_CODE;
+use t27os::call_session::CS_EV_ACTIVE;
+use t27os::call_session::CS_EV_ENDED;
+use t27os::call_session::CS_EV_FAILED;
+use t27os::call_session::CS_EV_IDLE;
+use t27os::call_session::CS_ST_SENT;
+use t27os::call_session::CS_ST_ACCEPTED;
+use t27os::call_session::CS_ST_REJ_AEAD;
+use t27os::call_session::CS_ST_REJ_REPLAY;
+use t27os::call_session::CS_ST_REJ_STATE;
+use t27os::call_session::CS_ST_REJ_OTHER;
+use t27os::call_session::CS_ST_RESENDS;
+use t27os::call_session::CS_ST_ZERO_FRAMES;
+use t27os::call_session::CS_ST_BAD_CONTENT;
+use t27os::call_session::CS_ST_HI_INDEX;
+use t27os::call_session::CS_ST_MS_TO_ACTIVE;
+use t27os::call_session::CS_ST_SEND_ERR;
+use t27os::call_session::CS_ST_AUDIO_ERR;
+use t27os::call_session::CS_ST_AUDIO_ON;
+use t27os::call_session::CS_ST_MUTED_SENT;
+use t27os::call_session::CS_ST_NONZERO_RX;
+use t27os::call_session::CS_K_VERIFY_MS;
+use t27os::call_session::CS_K_JB_TARGET;
+use t27os::call_session::CS_K_JB_MAX;
+use t27os::call_session::CS_R_HANGUP;
+use t27os::call_session::CS_R_PEER_BYE;
+use t27os::call_session::CS_R_DECLINED;
+use t27os::call_session::CS_R_I_DECLINED;
+use t27os::call_session::CS_R_CANCELLED;
+use t27os::call_session::CS_R_I_SAID_DIFFER;
+use t27os::call_session::CS_R_PEER_SAID_DIFFER;
+use t27os::call_session::CS_R_NOT_CONFIRMED;
+
+// ---------------------------------------------------------------- the person in front of each window
+
+/// What this side's person does: 1 answers a ringing call, 2 declines it, 4 says the codes differ, 8 never
+/// presses match or differ, 16 hangs up after CS_FRAMES frames each way, 32 mutes frames 100..149,
+/// 64 hangs up as soon as the code is shown.
+const P_ANSWER : u64 = 1;
+const P_DECLINE : u64 = 2;
+const P_DIFFER : u64 = 4;
+const P_SILENT : u64 = 8;
+const P_HANGUP_N : u64 = 16;
+const P_MUTE : u64 = 32;
+const P_HANGUP_CODE : u64 = 64;
+
+/// The driver's own record per side (u64 slots): 0 what the person does, 1 events seen (bit per event),
+/// 2 events in order (4 bits each, the first 16), 3 count of events, 4 frames, 5 the call ended and was dismissed,
+/// 6 side letter, 7 mute stage, 8 reason at the end, 9 sent at the end, 10 accepted at the end, 11 ACTIVE seen
+/// at least once in this call; code digits at 96.
+const D_LEN : usize = 128;
+
+fn dg(d: []const u8, k: usize) -> u64 { return get_u64(d, k * 8); }
+fn dp(d: []u8, k: usize, v: u64) -> void { put_u64(d, k * 8, v); }
+
+fn csp_ev_name(ev: u32) -> []const u8 {
+    if (ev == CS_EV_CALLING) { return "CALLING"; }
+    if (ev == CS_EV_RINGING) { return "RINGING"; }
+    if (ev == CS_EV_CODE) { return "CODE"; }
+    if (ev == CS_EV_ACTIVE) { return "ACTIVE"; }
+    if (ev == CS_EV_ENDED) { return "ENDED"; }
+    if (ev == CS_EV_FAILED) { return "FAILED"; }
+    if (ev == CS_EV_IDLE) { return "IDLE"; }
+    return "?";
+}
+
+fn csp_side_tag(d: []const u8) -> void {
+    var t : [4]u8 = undefined;
+    t[0] = 91;
+    t[1] = @as(u8, @intCast(dg(d, 6)));
+    t[2] = 93;
+    t[3] = 32;
+    sys_write(1, t[0..4], 4);
+}
+
+fn csp_new_call(d: []u8) -> void {
+    dp(d, 1, 0);
+    dp(d, 2, 0);
+    dp(d, 3, 0);
+    dp(d, 5, 0);
+    dp(d, 7, 0);
+    dp(d, 11, 0);
+    ck_wipe(d[96..102]);
+}
+
+/// The window's reaction to one event.
+fn csp_react(s: []u8, d: []u8, ev: u32) -> void {
+    const what : u64 = dg(d, 0);
+    dp(d, 1, dg(d, 1) | csp_pow(2, @as(u64, ev)));
+    const n : u64 = dg(d, 3);
+    if (n < 16) { dp(d, 2, dg(d, 2) | (@as(u64, ev) * csp_pow(16, n))); }
+    dp(d, 3, n + 1);
+    csp_side_tag(d);
+    ckh_line("event ");
+    ckh_line(csp_ev_name(ev));
+    ckh_line("\n");
+    if (ev == CS_EV_RINGING) {
+        var fp : [10]u8 = undefined;
+        const ip : u64 = cs_peer(s, fp[0..10]);
+        csp_side_tag(d);
+        ckh_num("incoming call from IPv4 ", ip);
+        if (!cs_incoming(s)) { ckh_line("FAIL cs_incoming is false while RINGING\n"); }
+        if ((what & P_ANSWER) != 0) {
+            csp_side_tag(d);
+            ckh_line("the person presses Answer\n");
+            cs_answer(s);
+        } else if ((what & P_DECLINE) != 0) {
+            csp_side_tag(d);
+            ckh_line("the person presses Decline\n");
+            cs_decline(s);
+        }
+    }
+    if (ev == CS_EV_CODE) {
+        var c : [6]u8 = undefined;
+        if (cs_code(s, c[0..6])) {
+            ck_put(d, 96, c[0..6]);
+            csp_side_tag(d);
+            ckh_line("CODE ");
+            sys_write(1, c[0..6], 6);
+            ckh_line("\n");
+        }
+        if ((what & P_HANGUP_CODE) != 0) {
+            csp_side_tag(d);
+            ckh_line("the person hangs up while the code is shown\n");
+            cs_hangup(s);
+        } else if ((what & P_DIFFER) != 0) {
+            csp_side_tag(d);
+            ckh_line("the person says: the codes differ\n");
+            cs_confirm(s, false);
+        } else if ((what & P_SILENT) == 0) {
+            csp_side_tag(d);
+            ckh_line("the person says: the codes match\n");
+            cs_confirm(s, true);
+        }
+    }
+    if (ev == CS_EV_ACTIVE) { dp(d, 11, 1); }
+    if (ev == CS_EV_ENDED or ev == CS_EV_FAILED) {
+        dp(d, 8, @as(u64, cs_reason(s)));
+        dp(d, 9, cs_stat(s, CS_ST_SENT));
+        dp(d, 10, cs_stat(s, CS_ST_ACCEPTED));
+        csp_side_tag(d);
+        ckh_num("reason (cs_reason): ", @as(u64, cs_reason(s)));
+        csp_report(s, d);
+        cs_dismiss(s);
+    }
+    if (ev == CS_EV_IDLE) { dp(d, 5, 1); }
+}
+
+/// What the person does between events: mute and unmute, hang up after the frames.
+fn csp_tick(s: []u8, d: []u8) -> void {
+    if (cs_state(s) != CK_ACTIVE) { return; }
+    const what : u64 = dg(d, 0);
+    const sent : u64 = cs_stat(s, CS_ST_SENT);
+    if ((what & P_MUTE) != 0) {
+        if (dg(d, 7) == 0 and sent >= 100) {
+            cs_mute(s, true);
+            dp(d, 7, 1);
+            csp_side_tag(d);
+            ckh_num("muted at frames sent: ", sent);
+        } else if (dg(d, 7) == 1 and sent >= 150) {
+            cs_mute(s, false);
+            dp(d, 7, 2);
+            csp_side_tag(d);
+            ckh_num("unmuted at frames sent: ", sent);
+        }
+    }
+    if ((what & P_HANGUP_N) != 0 and sent >= dg(d, 4) and cs_stat(s, CS_ST_ACCEPTED) >= dg(d, 4)) {
+        csp_side_tag(d);
+        ckh_line("the person hangs up\n");
+        cs_hangup(s);
+    }
+}
+
+fn csp_report(s: []u8, d: []u8) -> void {
+    csp_side_tag(d);
+    ckh_num("sealed media frames sent: ", cs_stat(s, CS_ST_SENT));
+    csp_side_tag(d);
+    ckh_num("sealed media frames accepted: ", cs_stat(s, CS_ST_ACCEPTED));
+    csp_side_tag(d);
+    ckh_num("highest audio index received + 1: ", cs_stat(s, CS_ST_HI_INDEX));
+    csp_side_tag(d);
+    ckh_num("frames with wrong content (test pattern): ", cs_stat(s, CS_ST_BAD_CONTENT));
+    csp_side_tag(d);
+    ckh_num("silent frames received: ", cs_stat(s, CS_ST_ZERO_FRAMES));
+    csp_side_tag(d);
+    ckh_num("frames sent muted: ", cs_stat(s, CS_ST_MUTED_SENT));
+    csp_side_tag(d);
+    ckh_num("nonzero samples received: ", cs_stat(s, CS_ST_NONZERO_RX));
+    csp_side_tag(d);
+    ckh_num("refused: AEAD ", cs_stat(s, CS_ST_REJ_AEAD));
+    csp_side_tag(d);
+    ckh_num("refused: replay ", cs_stat(s, CS_ST_REJ_REPLAY));
+    csp_side_tag(d);
+    ckh_num("refused: state ", cs_stat(s, CS_ST_REJ_STATE));
+    csp_side_tag(d);
+    ckh_num("refused: not for this call ", cs_stat(s, CS_ST_REJ_OTHER));
+    csp_side_tag(d);
+    ckh_num("handshake resends: ", cs_stat(s, CS_ST_RESENDS));
+    csp_side_tag(d);
+    ckh_num("send errors: ", cs_stat(s, CS_ST_SEND_ERR));
+    csp_side_tag(d);
+    ckh_num("audio start error (0 none): ", cs_stat(s, CS_ST_AUDIO_ERR));
+    if (cs_stat(s, CS_ST_MS_TO_ACTIVE) > 0) {
+        csp_side_tag(d);
+        ckh_num("ms from dial / ring to ACTIVE: ", cs_stat(s, CS_ST_MS_TO_ACTIVE));
+    }
+    if (cs_stat(s, CS_ST_AUDIO_ON) != 0) {
+        csp_side_tag(d);
+        ckh_num("audio: frames captured (microphone callbacks, or test frames) ", cs_stat(s, 1000));
+        csp_side_tag(d);
+        ckh_num("audio: output callbacks ", cs_stat(s, 1001));
+        csp_side_tag(d);
+        ckh_num("audio: played primary ", cs_stat(s, 1000 + 27));
+        csp_side_tag(d);
+        ckh_num("audio: played from the redundant copy ", cs_stat(s, 1000 + 28));
+        csp_side_tag(d);
+        ckh_num("audio: concealed ", cs_stat(s, 1000 + 29));
+        csp_side_tag(d);
+        ckh_num("audio: underruns ", cs_stat(s, 1000 + 4));
+        csp_side_tag(d);
+        ckh_num("audio: capture ring overruns ", cs_stat(s, 1000 + 7));
+        csp_side_tag(d);
+        ckh_num("audio: nonzero samples played ", cs_stat(s, 1000 + 51));
+    }
+}
+
+fn csp_pow(base: u64, e: u64) -> u64 {
+    var r : u64 = 1;
+    var i : u64 = 0;
+    while (i < e) {
+        r = r * base;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The ordered events of a call as a number, 4 bits each, first event lowest.
+fn csp_seq(a: u32, b: u32, c: u32, e: u32, f: u32) -> u64 {
+    return @as(u64, a) | (@as(u64, b) << 4) | (@as(u64, c) << 8) | (@as(u64, e) << 12) | (@as(u64, f) << 16);
+}
+
+// ---------------------------------------------------------------- two sessions in this process
+
+/// Poll both sessions (as two windows would) until both are back in IDLE after a call, or ms pass.
+fn csp_pump(a: []u8, da: []u8, b: []u8, db: []u8, ms: u64) -> bool {
+    const t0 : u64 = ckh_ms();
+    while (ckh_ms() - t0 < ms) {
+        var ev : u32 = cs_poll(a);
+        while (ev != CS_EV_NONE) {
+            csp_react(a, da, ev);
+            ev = cs_poll(a);
+        }
+        csp_tick(a, da);
+        ev = cs_poll(b);
+        while (ev != CS_EV_NONE) {
+            csp_react(b, db, ev);
+            ev = cs_poll(b);
+        }
+        csp_tick(b, db);
+        if (dg(da, 5) != 0 and dg(db, 5) != 0) { return true; }
+        ckh_usleep(1000);
+    }
+    return false;
+}
+
+/// A plain BYE of A's call sent to B from a socket of its own: someone who knows the session id.
+fn csp_forge_bye(a: []const u8, port_b: u64) -> bool {
+    const fd : i32 = sys_socket(2, 2, 0);
+    if (fd < 0) { return false; }
+    var h : [52]u8 = undefined;
+    ck_put_header(h[0..52], CK_T_BYE, a[EP_ME..EP_ME + 10], a[EP_PEER..EP_PEER + 10], a[EP_SID..EP_SID + 16], 0);
+    var to : [16]u8 = undefined;
+    ckh_addr4(to[0..16], 2130706433, port_b);
+    const r : i64 = ckh_sendto(fd, h[0..52], 52, 0, to[0..16], 16);
+    sys_close(fd);
+    return r == 52;
+}
+
+/// CS_V6=1: two sessions in this process on the dual-stack socket, over the IPv6 loopback.
+fn csp_inproc6() -> bool {
+    var all : bool = true;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var a : [299648]u8 = undefined;
+    var b : [299648]u8 = undefined;
+    var da : [128]u8 = undefined;
+    var db : [128]u8 = undefined;
+    ck_wipe(da[0..D_LEN]);
+    ck_wipe(db[0..D_LEN]);
+    dp(da[0..D_LEN], 6, 65);
+    dp(db[0..D_LEN], 6, 66);
+    const frames : u64 = ckh_env_num("CS_FRAMES", 200);
+    dp(da[0..D_LEN], 4, frames);
+    dp(db[0..D_LEN], 4, frames);
+    const oa : bool = cs_open(a[0..CS_LEN], fa[0..10], 0, 47753, CS_AUDIO_TEST);
+    const ob : bool = cs_open(b[0..CS_LEN], fb[0..10], 0, 47754, CS_AUDIO_TEST);
+    all = ckh_check("6 open: two dual-stack sessions on [::]:47753 and :47754", oa and ob and cs_net(a[0..CS_LEN], CS_NET_SOCK6) == 1 and cs_net(b[0..CS_LEN], CS_NET_SOCK6) == 1) and all;
+    all = ckh_check("6 both call sockets are closed in a process the window starts (FD_CLOEXEC)", cs_net(a[0..CS_LEN], CS_NET_CLOEXEC) == 1 and cs_net(b[0..CS_LEN], CS_NET_CLOEXEC) == 1) and all;
+    if (!oa or !ob) { return false; }
+    cs_set(a[0..CS_LEN], CS_K_VERIFY_MS, 5000);
+    cs_set(b[0..CS_LEN], CS_K_VERIFY_MS, 5000);
+    var lo : [18]u8 = undefined;
+    var mc : [18]u8 = undefined;
+    ip6_parse("[::1]:47754", 11, lo[0..18]);
+    ip6_parse("[ff02::1]:47754", 15, mc[0..18]);
+    all = ckh_check("6 the loopback ::1 is refused without the test aid, multicast always", !cs_call6(a[0..CS_LEN], lo[0..18], fb[0..10]) and cs_state(a[0..CS_LEN]) == CK_IDLE and !cs_probe_send6(a[0..CS_LEN], lo[0..18])) and all;
+    cs_set(a[0..CS_LEN], CS_K_LOOP6, 1);
+    cs_set(b[0..CS_LEN], CS_K_LOOP6, 1);
+    all = ckh_check("6 multicast is refused with the test aid too", !cs_call6(a[0..CS_LEN], mc[0..18], fb[0..10]) and !cs_probe_send6(a[0..CS_LEN], mc[0..18])) and all;
+    // a probe over IPv6 is counted on the other side, by family
+    all = ckh_check("6 a probe to [::1]:47754 goes out", cs_probe_send6(a[0..CS_LEN], lo[0..18])) and all;
+    ckh_usleep(20000);
+    cs_poll(b[0..CS_LEN]);
+    all = ckh_check("6 B counted one probe from an IPv6 sender, A one sent to one", cs_nat(b[0..CS_LEN], CS_N_P6) == 1 and cs_nat(a[0..CS_LEN], CS_N_P6TX) == 1) and all;
+
+    ckh_line("--- 6 full call over [::1]: ring, answer, same code, ACTIVE, frames both ways, hang-up\n");
+    dp(da[0..D_LEN], 0, P_HANGUP_N);
+    dp(db[0..D_LEN], 0, P_ANSWER);
+    all = ckh_check("6 cs_call6 to [::1]:47754 accepted, A CALLING", cs_call6(a[0..CS_LEN], lo[0..18], fb[0..10])) and all;
+    var fam_a : u64 = 0;
+    var fam_b : u64 = 0;
+    var pip : u64 = 0;
+    var pep : [18]u8 = undefined;
+    var pep_ok : bool = false;
+    const t0 : u64 = ckh_ms();
+    while (ckh_ms() - t0 < 30000 and !(dg(da[0..D_LEN], 5) != 0 and dg(db[0..D_LEN], 5) != 0)) {
+        var ev : u32 = cs_poll(a[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(a[0..CS_LEN], da[0..D_LEN], ev); ev = cs_poll(a[0..CS_LEN]); }
+        csp_tick(a[0..CS_LEN], da[0..D_LEN]);
+        ev = cs_poll(b[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(b[0..CS_LEN], db[0..D_LEN], ev); ev = cs_poll(b[0..CS_LEN]); }
+        csp_tick(b[0..CS_LEN], db[0..D_LEN]);
+        if (cs_state(b[0..CS_LEN]) == CK_ACTIVE and fam_b == 0) {
+            fam_a = cs_net(a[0..CS_LEN], CS_NET_FAM);
+            fam_b = cs_net(b[0..CS_LEN], CS_NET_FAM);
+            var fp : [10]u8 = undefined;
+            pip = cs_peer(b[0..CS_LEN], fp[0..10]);
+            pep_ok = cs_peer_ep(b[0..CS_LEN], pep[0..18]);
+        }
+        ckh_usleep(1000);
+    }
+    ckh_line("  code A: ");
+    sys_write(1, da[96..102], 6);
+    ckh_line("   code B: ");
+    sys_write(1, db[96..102], 6);
+    ckh_line("\n");
+    ckh_num("  A copies alone sent: ", cs_net(a[0..CS_LEN], CS_NET_COPY_TX));
+    ckh_num("  B copies alone taken: ", cs_net(b[0..CS_LEN], CS_NET_COPY_RX));
+    all = ckh_check("6 events A: CALLING, CODE, ACTIVE, ENDED, IDLE in this order", dg(da[0..D_LEN], 2) == csp_seq(CS_EV_CALLING, CS_EV_CODE, CS_EV_ACTIVE, CS_EV_ENDED, CS_EV_IDLE) and dg(da[0..D_LEN], 3) == 5) and all;
+    all = ckh_check("6 events B: RINGING, CODE, ACTIVE, ENDED, IDLE in this order", dg(db[0..D_LEN], 2) == csp_seq(CS_EV_RINGING, CS_EV_CODE, CS_EV_ACTIVE, CS_EV_ENDED, CS_EV_IDLE) and dg(db[0..D_LEN], 3) == 5) and all;
+    all = ckh_check("6 both screens showed the same 6 digits", da[96] >= 48 and ck_same(da[96..102], db[96..102])) and all;
+    all = ckh_check("6 the family is v6 on both sides", fam_a == @as(u64, IP6_F_V6) and fam_b == @as(u64, IP6_F_V6)) and all;
+    var lo3 : [18]u8 = undefined;
+    ip6_parse("[::1]:47753", 11, lo3[0..18]);
+    all = ckh_check("6 B's peer is [::1]:47753 (cs_peer_ep), cs_peer says not an IPv4", pep_ok and ip6_same(pep[0..18], lo3[0..18]) and pip == CS_PEER_V6) and all;
+    all = ckh_check("6 each side sent and accepted at least CS_FRAMES sealed frames", dg(da[0..D_LEN], 9) >= frames and dg(da[0..D_LEN], 10) >= frames and dg(db[0..D_LEN], 9) >= frames and dg(db[0..D_LEN], 10) >= frames) and all;
+    all = ckh_check("6 nothing lost on ::1: accepted = highest index + 1, 0 wrong content", cs_stat(a[0..CS_LEN], CS_ST_ACCEPTED) == cs_stat(a[0..CS_LEN], CS_ST_HI_INDEX) and cs_stat(b[0..CS_LEN], CS_ST_ACCEPTED) == cs_stat(b[0..CS_LEN], CS_ST_HI_INDEX) and cs_stat(a[0..CS_LEN], CS_ST_BAD_CONTENT) == 0 and cs_stat(b[0..CS_LEN], CS_ST_BAD_CONTENT) == 0) and all;
+    const ca : u64 = cs_net(a[0..CS_LEN], CS_NET_COPY_TX);
+    const cb : u64 = cs_net(b[0..CS_LEN], CS_NET_COPY_RX);
+    all = ckh_check("6 every frame but the first had its copy sent alone, and the other side took them all", ca + 1 >= cs_stat(a[0..CS_LEN], CS_ST_SENT) and ca > 0 and cb == cs_net(a[0..CS_LEN], CS_NET_COPY_TX) and cs_net(a[0..CS_LEN], CS_NET_COPY_RX) == cs_net(b[0..CS_LEN], CS_NET_COPY_TX)) and all;
+    all = ckh_check("6 no datagram too big for IPv6 on either side, 0 AEAD failures", cs_net(a[0..CS_LEN], CS_NET_BIG) == 0 and cs_net(b[0..CS_LEN], CS_NET_BIG) == 0 and cs_stat(a[0..CS_LEN], CS_ST_REJ_AEAD) == 0 and cs_stat(b[0..CS_LEN], CS_ST_REJ_AEAD) == 0) and all;
+    all = ckh_check("6 reasons: A hung up, B heard the sealed BYE; both IDLE", dg(da[0..D_LEN], 8) == CS_R_HANGUP and dg(db[0..D_LEN], 8) == CS_R_PEER_BYE and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+
+    ckh_line("--- 7 the same sockets carry an IPv4 call: 127.0.0.1 as v4-mapped\n");
+    csp_new_call(da[0..D_LEN]);
+    csp_new_call(db[0..D_LEN]);
+    dp(da[0..D_LEN], 0, P_HANGUP_N);
+    dp(db[0..D_LEN], 0, P_ANSWER);
+    all = ckh_check("7 cs_call to 127.0.0.1:47754 accepted", cs_call(a[0..CS_LEN], 2130706433, 47754, fb[0..10])) and all;
+    var fam4 : u64 = 0;
+    var pip4 : u64 = 0;
+    const t1 : u64 = ckh_ms();
+    while (ckh_ms() - t1 < 30000 and !(dg(da[0..D_LEN], 5) != 0 and dg(db[0..D_LEN], 5) != 0)) {
+        var ev : u32 = cs_poll(a[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(a[0..CS_LEN], da[0..D_LEN], ev); ev = cs_poll(a[0..CS_LEN]); }
+        csp_tick(a[0..CS_LEN], da[0..D_LEN]);
+        ev = cs_poll(b[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(b[0..CS_LEN], db[0..D_LEN], ev); ev = cs_poll(b[0..CS_LEN]); }
+        csp_tick(b[0..CS_LEN], db[0..D_LEN]);
+        if (cs_state(b[0..CS_LEN]) == CK_ACTIVE and fam4 == 0) {
+            fam4 = cs_net(b[0..CS_LEN], CS_NET_FAM);
+            var fp : [10]u8 = undefined;
+            pip4 = cs_peer(b[0..CS_LEN], fp[0..10]);
+        }
+        ckh_usleep(1000);
+    }
+    all = ckh_check("7 ACTIVE and ended on both, family v4-mapped, B's peer is 127.0.0.1", dg(db[0..D_LEN], 11) != 0 and fam4 == @as(u64, IP6_F_MAPPED) and pip4 == 2130706433 and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+    all = ckh_check("7 over IPv4 the copy rides with the frame: no copy alone", cs_net(a[0..CS_LEN], CS_NET_COPY_TX) == 0 and cs_net(b[0..CS_LEN], CS_NET_COPY_RX) == 0 and dg(da[0..D_LEN], 9) >= frames and dg(db[0..D_LEN], 10) >= frames) and all;
+    cs_close(a[0..CS_LEN]);
+    cs_close(b[0..CS_LEN]);
+    return all;
+}
+
+fn csp_inproc() -> bool {
+    var all : bool = true;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var a : [299648]u8 = undefined;
+    var b : [299648]u8 = undefined;
+    var da : [128]u8 = undefined;
+    var db : [128]u8 = undefined;
+    ck_wipe(da[0..D_LEN]);
+    ck_wipe(db[0..D_LEN]);
+    dp(da[0..D_LEN], 6, 65);
+    dp(db[0..D_LEN], 6, 66);
+    const frames : u64 = ckh_env_num("CS_FRAMES", 200);
+    dp(da[0..D_LEN], 4, frames);
+    dp(db[0..D_LEN], 4, frames);
+    const oa : bool = cs_open(a[0..CS_LEN], fa[0..10], 2130706433, 47751, CS_AUDIO_TEST);
+    const ob : bool = cs_open(b[0..CS_LEN], fb[0..10], 2130706433, 47752, CS_AUDIO_TEST);
+    all = ckh_check("open: two sessions on 127.0.0.1:47751 and :47752, both IDLE", oa and ob and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+    if (!oa or !ob) { return false; }
+    // bound to an IPv4 address each is the IPv4 socket (call_session cs_dual_stack), closed in a started process, and
+    // a native IPv6 is never dialled from it
+    var g6 : [18]u8 = undefined;
+    const g6ok : bool = ip6_parse("[3ffe:18:1917:f34e::ff78]:47752", 31, g6[0..18]);
+    all = ckh_check("open: an IPv4 bind is an IPv4 socket (FD_CLOEXEC) and refuses a dial to an IPv6", g6ok and cs_net(a[0..CS_LEN], CS_NET_SOCK6) == 0 and cs_net(b[0..CS_LEN], CS_NET_SOCK6) == 0 and cs_net(a[0..CS_LEN], CS_NET_CLOEXEC) == 1 and cs_net(b[0..CS_LEN], CS_NET_CLOEXEC) == 1 and cs_call6(a[0..CS_LEN], g6[0..18], fb[0..10]) == false and cs_state(a[0..CS_LEN]) == CK_IDLE) and all;
+    cs_set(a[0..CS_LEN], CS_K_VERIFY_MS, 5000);
+    cs_set(b[0..CS_LEN], CS_K_VERIFY_MS, 5000);
+
+    // 1. the full call
+    ckh_line("--- 1 full call: ring, answer, same code, ACTIVE, frames both ways with a mute, hang-up\n");
+    dp(da[0..D_LEN], 0, P_HANGUP_N | P_MUTE);
+    dp(db[0..D_LEN], 0, P_ANSWER);
+    all = ckh_check("1 cs_call accepted, A CALLING", cs_call(a[0..CS_LEN], 2130706433, 47752, fb[0..10])) and all;
+    // pump until both are ACTIVE, forge a plain BYE then, and pump on to the end
+    var t0 : u64 = ckh_ms();
+    var forged : bool = false;
+    var b_alive : bool = false;
+    while (ckh_ms() - t0 < 30000 and !(dg(da[0..D_LEN], 5) != 0 and dg(db[0..D_LEN], 5) != 0)) {
+        var ev : u32 = cs_poll(a[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(a[0..CS_LEN], da[0..D_LEN], ev); ev = cs_poll(a[0..CS_LEN]); }
+        csp_tick(a[0..CS_LEN], da[0..D_LEN]);
+        ev = cs_poll(b[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(b[0..CS_LEN], db[0..D_LEN], ev); ev = cs_poll(b[0..CS_LEN]); }
+        csp_tick(b[0..CS_LEN], db[0..D_LEN]);
+        if (!forged and cs_stat(b[0..CS_LEN], CS_ST_ACCEPTED) >= 20) {
+            forged = csp_forge_bye(a[0..CS_LEN], 47752);
+            ckh_usleep(2000);
+            cs_poll(b[0..CS_LEN]);
+            b_alive = cs_state(b[0..CS_LEN]) == CK_ACTIVE;
+        }
+        ckh_usleep(1000);
+    }
+    ckh_line("  code A: ");
+    sys_write(1, da[96..102], 6);
+    ckh_line("   code B: ");
+    sys_write(1, db[96..102], 6);
+    ckh_line("\n");
+    all = ckh_check("1 events A: CALLING, CODE, ACTIVE, ENDED, IDLE in this order", dg(da[0..D_LEN], 2) == csp_seq(CS_EV_CALLING, CS_EV_CODE, CS_EV_ACTIVE, CS_EV_ENDED, CS_EV_IDLE) and dg(da[0..D_LEN], 3) == 5) and all;
+    all = ckh_check("1 events B: RINGING, CODE, ACTIVE, ENDED, IDLE in this order", dg(db[0..D_LEN], 2) == csp_seq(CS_EV_RINGING, CS_EV_CODE, CS_EV_ACTIVE, CS_EV_ENDED, CS_EV_IDLE) and dg(db[0..D_LEN], 3) == 5) and all;
+    all = ckh_check("1 both screens showed the same 6 digits", da[96] >= 48 and ck_same(da[96..102], db[96..102])) and all;
+    all = ckh_check("1 a forged plain BYE during ACTIVE is refused, B stays ACTIVE", forged and b_alive) and all;
+    all = ckh_check("1 each side sent and accepted at least CS_FRAMES sealed frames", dg(da[0..D_LEN], 9) >= frames and dg(da[0..D_LEN], 10) >= frames and dg(db[0..D_LEN], 9) >= frames and dg(db[0..D_LEN], 10) >= frames) and all;
+    all = ckh_check("1 nothing lost on 127.0.0.1: accepted = highest index + 1 on both, 0 wrong content", cs_stat(a[0..CS_LEN], CS_ST_ACCEPTED) == cs_stat(a[0..CS_LEN], CS_ST_HI_INDEX) and cs_stat(b[0..CS_LEN], CS_ST_ACCEPTED) == cs_stat(b[0..CS_LEN], CS_ST_HI_INDEX) and cs_stat(a[0..CS_LEN], CS_ST_BAD_CONTENT) == 0 and cs_stat(b[0..CS_LEN], CS_ST_BAD_CONTENT) == 0) and all;
+    all = ckh_check("1 A muted 50 frames; B received exactly 50 silent frames", cs_stat(a[0..CS_LEN], CS_ST_MUTED_SENT) == 50 and cs_stat(b[0..CS_LEN], CS_ST_ZERO_FRAMES) == 50 and cs_stat(a[0..CS_LEN], CS_ST_ZERO_FRAMES) == 0) and all;
+    all = ckh_check("1 reasons: A hung up, B heard the peer's sealed BYE; both IDLE", dg(da[0..D_LEN], 8) == CS_R_HANGUP and dg(db[0..D_LEN], 8) == CS_R_PEER_BYE and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+    all = ckh_check("1 0 AEAD failures on either side", cs_stat(a[0..CS_LEN], CS_ST_REJ_AEAD) == 0 and cs_stat(b[0..CS_LEN], CS_ST_REJ_AEAD) == 0) and all;
+
+    // 2. the callee's person says differ
+    ckh_line("--- 2 the callee's person says the codes differ\n");
+    csp_new_call(da[0..D_LEN]);
+    csp_new_call(db[0..D_LEN]);
+    dp(da[0..D_LEN], 0, P_HANGUP_N);
+    dp(db[0..D_LEN], 0, P_ANSWER | P_DIFFER);
+    cs_call(a[0..CS_LEN], 2130706433, 47752, fb[0..10]);
+    csp_pump(a[0..CS_LEN], da[0..D_LEN], b[0..CS_LEN], db[0..D_LEN], 15000);
+    all = ckh_check("2 both FAILED, never ACTIVE, 0 media frames either way", dg(da[0..D_LEN], 11) == 0 and dg(db[0..D_LEN], 11) == 0 and (dg(da[0..D_LEN], 1) & 64) != 0 and (dg(db[0..D_LEN], 1) & 64) != 0 and dg(da[0..D_LEN], 9) == 0 and dg(db[0..D_LEN], 9) == 0) and all;
+    all = ckh_check("2 reasons: B said differ, A heard it (sealed CONFIRM); both back in IDLE", dg(db[0..D_LEN], 8) == CS_R_I_SAID_DIFFER and dg(da[0..D_LEN], 8) == CS_R_PEER_SAID_DIFFER and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+
+    // 3. decline
+    ckh_line("--- 3 the callee declines\n");
+    csp_new_call(da[0..D_LEN]);
+    csp_new_call(db[0..D_LEN]);
+    dp(da[0..D_LEN], 0, P_HANGUP_N);
+    dp(db[0..D_LEN], 0, P_DECLINE);
+    cs_call(a[0..CS_LEN], 2130706433, 47752, fb[0..10]);
+    csp_pump(a[0..CS_LEN], da[0..D_LEN], b[0..CS_LEN], db[0..D_LEN], 10000);
+    all = ckh_check("3 B ENDED (declined here), A ENDED (declined there), no code, both IDLE", dg(db[0..D_LEN], 8) == CS_R_I_DECLINED and dg(da[0..D_LEN], 8) == CS_R_DECLINED and (dg(da[0..D_LEN], 1) & 8) == 0 and (dg(db[0..D_LEN], 1) & 8) == 0 and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+
+    // 4. the caller cancels while it rings
+    ckh_line("--- 4 the caller cancels while the callee rings\n");
+    csp_new_call(da[0..D_LEN]);
+    csp_new_call(db[0..D_LEN]);
+    dp(da[0..D_LEN], 0, 0);
+    dp(db[0..D_LEN], 0, 0);
+    cs_call(a[0..CS_LEN], 2130706433, 47752, fb[0..10]);
+    t0 = ckh_ms();
+    while (ckh_ms() - t0 < 5000 and !cs_incoming(b[0..CS_LEN])) {
+        var ev : u32 = cs_poll(a[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(a[0..CS_LEN], da[0..D_LEN], ev); ev = cs_poll(a[0..CS_LEN]); }
+        ev = cs_poll(b[0..CS_LEN]);
+        while (ev != CS_EV_NONE) { csp_react(b[0..CS_LEN], db[0..D_LEN], ev); ev = cs_poll(b[0..CS_LEN]); }
+        ckh_usleep(1000);
+    }
+    const rang : bool = cs_incoming(b[0..CS_LEN]);
+    ckh_line("[A] the person hangs up before an answer\n");
+    cs_hangup(a[0..CS_LEN]);
+    csp_pump(a[0..CS_LEN], da[0..D_LEN], b[0..CS_LEN], db[0..D_LEN], 5000);
+    all = ckh_check("4 B rang, then ENDED as cancelled; A ENDED by its hang-up; both IDLE", rang and dg(db[0..D_LEN], 8) == CS_R_CANCELLED and dg(da[0..D_LEN], 8) == CS_R_HANGUP and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+
+    // 5. a hang-up while the codes are on the screens
+    ckh_line("--- 5 the caller hangs up while the code is shown\n");
+    csp_new_call(da[0..D_LEN]);
+    csp_new_call(db[0..D_LEN]);
+    dp(da[0..D_LEN], 0, P_HANGUP_CODE);
+    dp(db[0..D_LEN], 0, P_ANSWER | P_SILENT);
+    cs_call(a[0..CS_LEN], 2130706433, 47752, fb[0..10]);
+    csp_pump(a[0..CS_LEN], da[0..D_LEN], b[0..CS_LEN], db[0..D_LEN], 10000);
+    all = ckh_check("5 both ENDED without ACTIVE (A hung up, B heard the plain BYE before keys were confirmed), both IDLE", dg(da[0..D_LEN], 11) == 0 and dg(db[0..D_LEN], 11) == 0 and dg(da[0..D_LEN], 8) == CS_R_HANGUP and dg(db[0..D_LEN], 8) == CS_R_PEER_BYE and cs_state(a[0..CS_LEN]) == CK_IDLE and cs_state(b[0..CS_LEN]) == CK_IDLE) and all;
+    cs_close(a[0..CS_LEN]);
+    cs_close(b[0..CS_LEN]);
+    return all;
+}
+
+// ---------------------------------------------------------------- one side per process
+
+fn csp_side(caller: bool) -> bool {
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var my_port : u64 = 47762;
+    var peer_port : u64 = 47761;
+    if (caller) {
+        my_port = 47761;
+        peer_port = 47762;
+    }
+    const bind_ip : u64 = ckh_env_num("CS_BIND", 2130706433);
+    my_port = ckh_env_num("CS_PORT", my_port);
+    const peer_ip : u64 = ckh_env_num("CS_PEER", 2130706433);
+    peer_port = ckh_env_num("CS_PEER_PORT", peer_port);
+    const frames : u64 = ckh_env_num("CS_FRAMES", 200);
+    var e : [32]u8 = undefined;
+    var mode : u32 = CS_AUDIO_TEST;
+    const en : usize = ckh_env("CS_AUDIO", e[0..32]);
+    if (en == 3 and ck_same(e[0..3], "dev")) { mode = CS_AUDIO_DEV; }
+    var what : u64 = 0;
+    if (caller) { what = P_HANGUP_N; } else { what = P_ANSWER; }
+    const an : usize = ckh_env("CS_ANSWER", e[0..32]);
+    if (!caller and an == 1 and e[0] == 48) { what = 0; }
+    const sn : usize = ckh_env("CS_SAY", e[0..32]);
+    if (sn == 6 and ck_same(e[0..6], "differ")) { what = what | P_DIFFER; }
+    const mn : usize = ckh_env("CS_MUTE", e[0..32]);
+    if (caller and mn == 1 and e[0] == 49) { what = what | P_MUTE; }
+    var expect_active : bool = true;
+    const xn : usize = ckh_env("CS_EXPECT", e[0..32]);
+    if (xn == 6 and ck_same(e[0..6], "failed")) { expect_active = false; }
+    if (bind_ip > 4294967295 or peer_ip > 4294967295 or my_port == 0 or my_port > 65535 or peer_port == 0 or peer_port > 65535 or frames == 0 or frames > 100000) {
+        ckh_line("NOT RUN: CS_BIND, CS_PORT, CS_PEER, CS_PEER_PORT or CS_FRAMES is malformed\n");
+        return false;
+    }
+    if (!cv_lan_ok(peer_ip) or !cv_lan_ok(bind_ip)) {
+        ckh_line("NOT RUN: CS_PEER and CS_BIND must be a private network address (10.x, 172.16-31.x, 192.168.x or 127.x)\n");
+        return false;
+    }
+    ckh_num("role (1 caller, 0 callee): ", @as(u64, cbool(caller)));
+    ckh_num("audio (1 microphone and speakers, 2 test pattern): ", @as(u64, mode));
+    ckh_num("bind IPv4: ", bind_ip);
+    ckh_num("port: ", my_port);
+    if (caller) {
+        ckh_num("peer IPv4: ", peer_ip);
+        ckh_num("peer port: ", peer_port);
+    }
+    ckh_num("frames: ", frames);
+    var s : [299648]u8 = undefined;
+    var d : [128]u8 = undefined;
+    ck_wipe(d[0..D_LEN]);
+    dp(d[0..D_LEN], 0, what);
+    dp(d[0..D_LEN], 4, frames);
+    if (caller) { dp(d[0..D_LEN], 6, 65); } else { dp(d[0..D_LEN], 6, 66); }
+    var me : [10]u8 = undefined;
+    if (caller) { ck_put(me[0..10], 0, fa[0..10]); } else { ck_put(me[0..10], 0, fb[0..10]); }
+    if (!cs_open(s[0..CS_LEN], me[0..10], bind_ip, my_port, mode)) {
+        ckh_line("NOT RUN: cs_open failed (socket or bind)\n");
+        return false;
+    }
+    const vms : u64 = ckh_env_num("CS_VERIFY_MS", 0);
+    if (vms > 0) { ckh_check("cs_set verify timeout", cs_set(s[0..CS_LEN], CS_K_VERIFY_MS, vms)); }
+    const jbt : u64 = ckh_env_num("CS_JB_TARGET", 0);
+    const jbm : u64 = ckh_env_num("CS_JB_MAX", 0);
+    if (jbm > 0) { ckh_check("cs_set jitter max", cs_set(s[0..CS_LEN], CS_K_JB_MAX, jbm)); }
+    if (jbt > 0) { ckh_check("cs_set jitter target", cs_set(s[0..CS_LEN], CS_K_JB_TARGET, jbt)); }
+    const rl_mode : u64 = cbp_konst("kCFRunLoopDefaultMode");
+    if (caller) {
+        if (!cs_call(s[0..CS_LEN], peer_ip, peer_port, fb[0..10])) {
+            ckh_line("NOT RUN: cs_call refused\n");
+            cs_close(s[0..CS_LEN]);
+            return false;
+        }
+    }
+    const t0 : u64 = ckh_ms();
+    const timeout_ms : u64 = 90000 + frames * 20;
+    while (ckh_ms() - t0 < timeout_ms and dg(d[0..D_LEN], 5) == 0) {
+        if (mode == CS_AUDIO_DEV) { cbp_run(rl_mode, 0.002, false); } else { ckh_usleep(1000); }
+        var ev : u32 = cs_poll(s[0..CS_LEN]);
+        while (ev != CS_EV_NONE) {
+            csp_react(s[0..CS_LEN], d[0..D_LEN], ev);
+            ev = cs_poll(s[0..CS_LEN]);
+        }
+        csp_tick(s[0..CS_LEN], d[0..D_LEN]);
+    }
+    const end_state : u32 = cs_state(s[0..CS_LEN]);
+    cs_close(s[0..CS_LEN]);
+    ckh_num("events in order (4 bits each, first lowest): ", dg(d[0..D_LEN], 2));
+    ckh_num("final state (0 IDLE): ", @as(u64, end_state));
+    var all : bool = ckh_check("the call ended and the session is back in IDLE", dg(d[0..D_LEN], 5) != 0 and end_state == CK_IDLE);
+    if (expect_active) {
+        var first : u32 = CS_EV_RINGING;
+        var reason : u64 = CS_R_PEER_BYE;
+        if (caller) {
+            first = CS_EV_CALLING;
+            reason = CS_R_HANGUP;
+        }
+        all = ckh_check("events: CALLING or RINGING, CODE, ACTIVE, ENDED, IDLE in this order", dg(d[0..D_LEN], 2) == csp_seq(first, CS_EV_CODE, CS_EV_ACTIVE, CS_EV_ENDED, CS_EV_IDLE) and dg(d[0..D_LEN], 3) == 5) and all;
+        all = ckh_check("sent and accepted at least CS_FRAMES sealed frames", dg(d[0..D_LEN], 9) >= frames and dg(d[0..D_LEN], 10) >= frames) and all;
+        all = ckh_check("ended by the caller's hang-up (caller HANGUP, callee PEER_BYE)", dg(d[0..D_LEN], 8) == reason) and all;
+        if (mode == CS_AUDIO_TEST) {
+            all = ckh_check("test pattern: accepted = highest index + 1 (nothing lost), 0 wrong content", cs_stat(s[0..CS_LEN], CS_ST_ACCEPTED) == cs_stat(s[0..CS_LEN], CS_ST_HI_INDEX) and cs_stat(s[0..CS_LEN], CS_ST_BAD_CONTENT) == 0) and all;
+        }
+        all = ckh_check("0 AEAD failures", cs_stat(s[0..CS_LEN], CS_ST_REJ_AEAD) == 0) and all;
+    } else {
+        all = ckh_check("never ACTIVE and 0 media frames sent or accepted", dg(d[0..D_LEN], 11) == 0 and dg(d[0..D_LEN], 9) == 0 and dg(d[0..D_LEN], 10) == 0) and all;
+        // FAILED here, or ENDED because the peer gave up first (its verify timeout sends a plain BYE)
+        all = ckh_check("the call FAILED here, or ended by the peer before any media", (dg(d[0..D_LEN], 1) & 64) != 0 or dg(d[0..D_LEN], 8) == CS_R_PEER_BYE) and all;
+    }
+    return all;
+}
+
+fn cbool(b: bool) -> u32 {
+    if (b) { return 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the man in the middle
+
+fn csp_relay() -> bool {
+    const bind_ip : u64 = ckh_env_num("CS_BIND", 2130706433);
+    const port : u64 = ckh_env_num("CS_PORT", 47763);
+    const peer_ip : u64 = ckh_env_num("CS_PEER", 2130706433);
+    const peer_port : u64 = ckh_env_num("CS_PEER_PORT", 47762);
+    if (!cv_lan_ok(bind_ip) or !cv_lan_ok(peer_ip) or port == 0 or port > 65535 or peer_port == 0 or peer_port > 65535) {
+        ckh_line("NOT RUN: relay addresses must be a private network address (10.x, 172.16-31.x, 192.168.x or 127.x)\n");
+        return false;
+    }
+    var me : [16]u8 = undefined;
+    var to_b : [16]u8 = undefined;
+    var to_a : [16]u8 = undefined;
+    ckh_addr4(me[0..16], bind_ip, port);
+    ckh_addr4(to_b[0..16], peer_ip, peer_port);
+    ck_wipe(to_a[0..16]);
+    const fd : i32 = sys_socket(2, 2, 0);
+    if (fd < 0 or sys_bind(fd, me[0..16], 16) != 0) {
+        ckh_line("NOT RUN: relay socket\n");
+        return false;
+    }
+    const fl : i32 = ckh_fcntl(fd, 3, 0);
+    ckh_fcntl(fd, 4, @as(u64, @intCast(fl | 4)));
+    var rx : [2048]u8 = undefined;
+    var from : [16]u8 = undefined;
+    var flen : [4]u8 = undefined;
+    var h0 : [32]u8 = undefined;
+    var have_h0 : bool = false;
+    var fwd : u64 = 0;
+    var answers : u64 = 0;
+    var reveals : u64 = 0;
+    const t0 : u64 = ckh_ms();
+    var t_last : u64 = t0;
+    while (ckh_ms() - t0 < 60000) {
+        ck_wipe(from[0..16]);
+        flen[0] = 16; flen[1] = 0; flen[2] = 0; flen[3] = 0;
+        const r : i64 = ckh_recvfrom(fd, rx[0..2048], 2048, 0, sys_addr(from[0..16], from[0..16], 0), sys_addr(flen[0..4], flen[0..4], 0));
+        if (r <= 0) {
+            if (fwd > 0 and ckh_ms() - t_last > 3000) { break; }
+            ckh_usleep(500);
+        } else {
+        t_last = ckh_ms();
+        const n : usize = @as(usize, @intCast(r));
+        const from_b : bool = ck_same(from[2..8], to_b[2..8]);
+        const typ : u32 = ck_hdr_type(rx[0..n]);
+        if (from_b) {
+            if (typ == CK_T_ANSWER and n == CK_ANSWER_LEN) {
+                ks_sha256(rx[0..n], h0[0..32]);
+                have_h0 = true;
+                rx[120] = rx[120] ^ 4;
+                answers = answers + 1;
+            }
+            ckh_sendto(fd, rx[0..n], @as(u64, n), 0, to_a[0..16], 16);
+        } else {
+            ck_put(to_a[0..16], 0, from[0..16]);
+            if (typ == CK_T_REVEAL and n == CK_REVEAL_LEN and have_h0) {
+                ck_put(rx[0..n], 68, h0[0..32]);
+                reveals = reveals + 1;
+            }
+            ckh_sendto(fd, rx[0..n], @as(u64, n), 0, to_b[0..16], 16);
+        }
+        fwd = fwd + 1;
+        }
+    }
+    sys_close(fd);
+    ckh_num("relay: datagrams forwarded ", fwd);
+    ckh_num("relay: ANSWERs with a changed nonce ", answers);
+    ckh_num("relay: REVEALs with the original ANSWER hash put back ", reveals);
+    return ckh_check("relay: changed at least one ANSWER and one REVEAL", answers > 0 and reveals > 0);
+}
+
+pub fn main() -> void {
+    // Never true: makes sure the audio callbacks are emitted and so exported for dlsym.
+    var z : [8]u8 = undefined;
+    put_u64(z[0..8], 0, 0);
+    if (get_u64(z[0..8], 0) == 99) {
+        cbp_fin(0, 0, 0, 0, 0, 0);
+        cbp_fout(0, 0, 0);
+    }
+    var rb : [32]u8 = undefined;
+    const rn : usize = ckh_env("CS_ROLE", rb[0..32]);
+    var ok : bool = false;
+    if (rn == 6 and ck_same(rb[0..6], "caller")) {
+        ok = csp_side(true);
+    } else if (rn == 6 and ck_same(rb[0..6], "callee")) {
+        ok = csp_side(false);
+    } else if (rn == 5 and ck_same(rb[0..5], "relay")) {
+        ok = csp_relay();
+    } else if (rn == 0 and ckh_env("CS_V6", rb[0..32]) == 1 and rb[0] == 49) {
+        ckh_line("T27 OS call session probe: two sessions in this process, test pattern, IPv6 loopback\n");
+        ok = csp_inproc6();
+    } else if (rn == 0) {
+        ckh_line("T27 OS call session probe: two sessions in this process, test pattern, 127.0.0.1\n");
+        ok = csp_inproc();
+    } else {
+        ckh_line("CS_ROLE must be caller, callee or relay\n");
+    }
+    if (ok) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}
+
+test the_driver_record_fits_and_the_event_order_packs_four_bits_each {
+    assert 12 * 8 <= 96 and 96 + 6 <= D_LEN;
+    assert csp_seq(1, 3, 4, 5, 7) == 1 + 3 * 16 + 4 * 256 + 5 * 4096 + 7 * 65536;
+    assert cv_lan_ok(2130706433);
+    assert cv_lan_ok(3232235786);
+    assert cv_lan_ok(2887778305) == false;
+    assert cv_lan_ok(134744072) == false;
+}

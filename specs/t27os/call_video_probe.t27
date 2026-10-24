@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_video_probe.t27 -- the video of a T27 OS call over the real socket, two processes on this machine
+// (owner, 2026-10-22). Not the T27 OS app and not the proof of the app: a headless driver that uses only the cs_* API
+// and the test generator (the camera is not touched). Both sides send CS_VFRAMES (200) video frames at 10 a second
+// through the sealed channel (CK_T_VIDEO parts of 1000 bytes), the audio test pattern runs beside it, and each side
+// reports what it made, sent, assembled, skipped and decoded. A frame the probe sees complete is decoded with ImageIO
+// (320x240 expected) and compared byte by byte with the frame the generator makes for the same number.
+//   CS_ROLE=caller|callee   (required) CS_BIND / CS_PORT / CS_PEER / CS_PEER_PORT as in call_session_probe
+//                            (127.0.0.1; caller 47781, callee 47782)
+//   CS_VFRAMES=200          frames each side sends
+//   CS_VDROP=N              (caller) the part 1 of video frame N is sealed and not sent: a lost datagram
+//   CS_VEXPECT_DROP=1       (callee) expects exactly one skipped frame
+//   CS_VCAMSIM=1            (caller) hands in a "camera" JPEG while it has sent frames 100..149, to show the source
+//                            switching generator -> camera -> generator; set it on both sides: the callee then expects
+//                            to see exactly the caller's camera frames differ from the generator
+// Each side prints its numbers and "VIDEO-SUM tx=<hash> rx=<hash> dropped=<hash>"; the operator compares the caller's
+// tx with the callee's rx (and the other way); with a dropped part, rx = tx - dropped (mod 2^64).
+// Build (Apple silicon):
+//   t27b build specs/t27os/call_video_probe.t27 -o cvp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -framework AudioToolbox \
+//      -framework CoreGraphics -framework ImageIO -o cvp cvp.o
+// Test identities only (fixed fingerprints). Refs gHashTag/t27#11560.
+module T27osCallVideoProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::VC_JPEG_MAX;
+use t27os::call_crypto_probe::ckh_line;
+use t27os::call_crypto_probe::ckh_num;
+use t27os::call_crypto_probe::ckh_check;
+use t27os::call_crypto_probe::ckh_env;
+use t27os::call_crypto_probe::ckh_env_num;
+use t27os::call_crypto_probe::ckh_fps;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_crypto_probe::ckh_usleep;
+use t27os::callback_probe::cbp_fin;
+use t27os::callback_probe::cbp_fout;
+use t27os::call_session::CS_LEN;
+use t27os::call_session::CS_AUDIO_TEST;
+use t27os::call_session::CS_VLAST;
+use t27os::call_session::CS_K_VIDEO;
+use t27os::call_session::CS_K_VDROP;
+use t27os::call_session::CS_K_VLIMIT;
+use t27os::call_session::CS_EV_NONE;
+use t27os::call_session::CS_EV_RINGING;
+use t27os::call_session::CS_EV_CODE;
+use t27os::call_session::CS_EV_ENDED;
+use t27os::call_session::CS_EV_FAILED;
+use t27os::call_session::CS_ST_REJ_AEAD;
+use t27os::call_session::CS_ST_REJ_REPLAY;
+use t27os::call_session::CS_ST_REJ_STATE;
+use t27os::call_session::CS_ST_REJ_OTHER;
+use t27os::call_session::CS_ST_SEND_ERR;
+use t27os::call_session::CS_V_SHOWN;
+use t27os::call_session::CS_V_SKIPPED;
+use t27os::call_session::CS_V_RXPARTS;
+use t27os::call_session::CS_V_REFUSED;
+use t27os::call_session::CS_V_STALE;
+use t27os::call_session::CS_V_RXHASH;
+use t27os::call_session::CS_V_LASTSIZE;
+use t27os::call_session::CS_V_LASTFRAME;
+use t27os::call_session::CS_V_TXFRAMES;
+use t27os::call_session::CS_V_TXPARTS;
+use t27os::call_session::CS_V_TXDROPPED;
+use t27os::call_session::CS_V_TXHASH;
+use t27os::call_session::CS_V_GEN;
+use t27os::call_session::CS_V_CAM;
+use t27os::call_session::CS_V_ERR;
+use t27os::call_session::CS_V_SENDERR;
+use t27os::call_session::CS_V_MAKE_MAX;
+use t27os::call_session::CS_V_SERIAL;
+use t27os::call_session::CS_V_DROPHASH;
+use t27os::call_session::cs_open;
+use t27os::call_session::cs_call;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_code;
+use t27os::call_session::cs_answer;
+use t27os::call_session::cs_confirm;
+use t27os::call_session::cs_hangup;
+use t27os::call_session::cs_dismiss;
+use t27os::call_session::cs_set;
+use t27os::call_session::cs_close;
+use t27os::call_session::cs_stat;
+use t27os::call_session::cs_vstat;
+use t27os::call_session::cs_vlen;
+use t27os::call_session::cs_video_feed;
+use t27os::call_vid::vid_make;
+use t27os::call_vid::vid_decode;
+use t27os::call_vid::vid_size;
+use t27os::call_vid::vid_release_image;
+
+fn vp_tag(caller: bool) -> void {
+    if (caller) { ckh_line("[A] "); } else { ckh_line("[B] "); }
+}
+
+fn vp_n(caller: bool, label: []const u8, v: u64) -> void {
+    vp_tag(caller);
+    ckh_num(label, v);
+}
+
+/// The last complete JPEG of the session is byte-identical to the generator's picture of its frame number.
+fn vp_same(v: []const u8, n: usize) -> bool {
+    var exp : [24000]u8 = undefined;
+    const en : usize = vid_make(cs_vstat(v, CS_V_LASTFRAME), exp[0..24000]);
+    if (en != n or n == 0) { return false; }
+    var j : usize = 0;
+    while (j < n) {
+        if (exp[j] != v[CS_VLAST + j]) { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// Hand in the "camera" picture (generator frame 9000, a picture no frame of the stream has).
+fn vp_feed(s: []u8) -> bool {
+    var cam : [24000]u8 = undefined;
+    const n : usize = vid_make(9000, cam[0..24000]);
+    return n > 0 and cs_video_feed(s, cam[0..n]);
+}
+
+fn vp_side(caller: bool) -> bool {
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var my_port : u64 = 47782;
+    var peer_port : u64 = 47781;
+    if (caller) {
+        my_port = 47781;
+        peer_port = 47782;
+    }
+    const bind_ip : u64 = ckh_env_num("CS_BIND", 2130706433);
+    my_port = ckh_env_num("CS_PORT", my_port);
+    const peer_ip : u64 = ckh_env_num("CS_PEER", 2130706433);
+    peer_port = ckh_env_num("CS_PEER_PORT", peer_port);
+    const frames : u64 = ckh_env_num("CS_VFRAMES", 200);
+    const vdrop : u64 = ckh_env_num("CS_VDROP", 0);
+    const expect_drop : u64 = ckh_env_num("CS_VEXPECT_DROP", 0);
+    const camsim_env : bool = ckh_env_num("CS_VCAMSIM", 0) == 1;
+    const camsim : bool = caller and camsim_env;
+    if (bind_ip != 2130706433 or peer_ip != 2130706433 or my_port == 0 or my_port > 65535 or peer_port == 0 or peer_port > 65535 or frames == 0 or frames > 5000) {
+        ckh_line("NOT RUN: this probe runs on 127.0.0.1 only; CS_PORT, CS_PEER_PORT or CS_VFRAMES is malformed\n");
+        return false;
+    }
+    vp_n(caller, "video frames each side sends: ", frames);
+    var s : [299648]u8 = undefined;
+    var me : [10]u8 = undefined;
+    var peer : [10]u8 = undefined;
+    var i : usize = 0;
+    while (i < 10) {
+        if (caller) {
+            me[i] = fa[i];
+            peer[i] = fb[i];
+        } else {
+            me[i] = fb[i];
+            peer[i] = fa[i];
+        }
+        i = i + 1;
+    }
+    if (!cs_open(s[0..CS_LEN], me[0..10], bind_ip, my_port, CS_AUDIO_TEST)) {
+        ckh_line("NOT RUN: cs_open failed (socket or bind)\n");
+        return false;
+    }
+    var all : bool = true;
+    all = ckh_check("video on, limit set", cs_set(s[0..CS_LEN], CS_K_VIDEO, 1) and cs_set(s[0..CS_LEN], CS_K_VLIMIT, frames)) and all;
+    if (vdrop != 0 and caller) { all = ckh_check("a lost part is armed", cs_set(s[0..CS_LEN], CS_K_VDROP, vdrop)) and all; }
+    if (caller) {
+        if (!cs_call(s[0..CS_LEN], peer_ip, peer_port, peer[0..10])) {
+            ckh_line("NOT RUN: cs_call refused\n");
+            cs_close(s[0..CS_LEN]);
+            return false;
+        }
+    }
+    var seen : u64 = 0;
+    var observed : u64 = 0;
+    var dec_ok : u64 = 0;
+    var dec_bad : u64 = 0;
+    var same : u64 = 0;
+    var differ : u64 = 0;
+    var t_done : u64 = 0;
+    var hung : bool = false;
+    var ended : bool = false;
+    var fed : u64 = 0;
+    var fed_at : u64 = 0;
+    const t0 : u64 = ckh_ms();
+    const limit_ms : u64 = 60000 + frames * 100;
+    while (ckh_ms() - t0 < limit_ms and !(ended and cs_state(s[0..CS_LEN]) == CK_IDLE)) {
+        ckh_usleep(1000);
+        var ev : u32 = cs_poll(s[0..CS_LEN]);
+        while (ev != CS_EV_NONE) {
+            if (ev == CS_EV_RINGING) { cs_answer(s[0..CS_LEN]); }
+            if (ev == CS_EV_CODE) {
+                var c : [6]u8 = undefined;
+                if (cs_code(s[0..CS_LEN], c[0..6])) {
+                    vp_tag(caller);
+                    ckh_line("CODE ");
+                    sys_write(1, c[0..6], 6);
+                    ckh_line("\n");
+                }
+                cs_confirm(s[0..CS_LEN], true);
+            }
+            if (ev == CS_EV_ENDED or ev == CS_EV_FAILED) {
+                ended = true;
+                cs_dismiss(s[0..CS_LEN]);
+            }
+            ev = cs_poll(s[0..CS_LEN]);
+        }
+        const act : bool = cs_state(s[0..CS_LEN]) == CK_ACTIVE;
+        if (act and camsim) {
+            const tx : u64 = cs_vstat(s[0..CS_LEN], CS_V_TXFRAMES);
+            if (tx >= 100 and tx < 150 and tx != fed_at) {
+                fed_at = tx;
+                if (vp_feed(s[0..CS_LEN])) { fed = fed + 1; }
+            }
+        }
+        // a complete frame the window would draw: decode it, compare it with what the generator makes for its number
+        const ser : u64 = cs_vstat(s[0..CS_LEN], CS_V_SERIAL);
+        if (ser != seen) {
+            seen = ser;
+            observed = observed + 1;
+            const n : usize = cs_vlen(s[0..CS_LEN]);
+            const img : u64 = vid_decode(s[CS_VLAST..CS_VLAST + n]);
+            if (img != 0 and vid_size(img) == ((320 << 16) | 240)) { dec_ok = dec_ok + 1; } else { dec_bad = dec_bad + 1; }
+            vid_release_image(img);
+            if (vp_same(s[0..CS_LEN], n)) { same = same + 1; } else { differ = differ + 1; }
+        }
+        if (caller and act and !hung) {
+            if (cs_vstat(s[0..CS_LEN], CS_V_TXFRAMES) >= frames and t_done == 0) { t_done = ckh_ms(); }
+            if (t_done != 0 and (cs_vstat(s[0..CS_LEN], CS_V_LASTFRAME) >= frames or ckh_ms() - t_done > 3000)) {
+                vp_tag(caller);
+                ckh_line("the person hangs up\n");
+                cs_hangup(s[0..CS_LEN]);
+                hung = true;
+            }
+        }
+    }
+    const v : []const u8 = s[0..CS_LEN];
+    const txf : u64 = cs_vstat(v, CS_V_TXFRAMES);
+    const shown : u64 = cs_vstat(v, CS_V_SHOWN);
+    const skipped : u64 = cs_vstat(v, CS_V_SKIPPED);
+    vp_n(caller, "TX frames made and sent: ", txf);
+    vp_n(caller, "TX parts sent: ", cs_vstat(v, CS_V_TXPARTS));
+    vp_n(caller, "TX parts left out on purpose: ", cs_vstat(v, CS_V_TXDROPPED));
+    vp_n(caller, "TX frames from the generator: ", cs_vstat(v, CS_V_GEN));
+    vp_n(caller, "TX frames from the camera hand-in: ", cs_vstat(v, CS_V_CAM));
+    vp_n(caller, "TX camera hand-ins: ", fed);
+    vp_n(caller, "TX errors / send errors: ", cs_vstat(v, CS_V_ERR) * 1000 + cs_vstat(v, CS_V_SENDERR));
+    vp_n(caller, "TX longest frame work in one poll, ms: ", cs_vstat(v, CS_V_MAKE_MAX));
+    vp_n(caller, "RX frames shown (complete): ", shown);
+    vp_n(caller, "RX frames skipped (lost part or frame): ", skipped);
+    vp_n(caller, "RX parts accepted: ", cs_vstat(v, CS_V_RXPARTS));
+    vp_n(caller, "RX parts refused / stale: ", cs_vstat(v, CS_V_REFUSED) * 1000 + cs_vstat(v, CS_V_STALE));
+    vp_n(caller, "RX highest frame number: ", cs_vstat(v, CS_V_LASTFRAME));
+    vp_n(caller, "RX last JPEG bytes: ", cs_vstat(v, CS_V_LASTSIZE));
+    vp_n(caller, "decoded pictures observed: ", observed);
+    vp_n(caller, "  decoded to 320x240: ", dec_ok);
+    vp_n(caller, "  not decoded: ", dec_bad);
+    vp_n(caller, "  byte-identical to the generator's frame: ", same);
+    vp_n(caller, "  different: ", differ);
+    vp_n(caller, "refused: AEAD ", cs_stat(s[0..CS_LEN], CS_ST_REJ_AEAD));
+    vp_n(caller, "refused: replay ", cs_stat(s[0..CS_LEN], CS_ST_REJ_REPLAY));
+    vp_n(caller, "refused: state ", cs_stat(s[0..CS_LEN], CS_ST_REJ_STATE));
+    vp_n(caller, "refused: not for this call ", cs_stat(s[0..CS_LEN], CS_ST_REJ_OTHER));
+    vp_n(caller, "audio send errors: ", cs_stat(s[0..CS_LEN], CS_ST_SEND_ERR));
+    vp_tag(caller);
+    ckh_num("VIDEO-SUM tx=", cs_vstat(v, CS_V_TXHASH));
+    vp_tag(caller);
+    ckh_num("VIDEO-SUM rx=", cs_vstat(v, CS_V_RXHASH));
+    vp_tag(caller);
+    ckh_num("VIDEO-SUM dropped=", cs_vstat(v, CS_V_DROPHASH));
+    cs_close(s[0..CS_LEN]);
+    all = ckh_check("the call ended and the session is back in IDLE", ended) and all;
+    all = ckh_check("this side made and sent every frame", txf == frames) and all;
+    all = ckh_check("0 errors making, sealing or sending video", cs_vstat(v, CS_V_ERR) == 0 and cs_vstat(v, CS_V_SENDERR) == 0) and all;
+    all = ckh_check("0 AEAD failures, 0 replays, 0 refused parts", cs_stat(s[0..CS_LEN], CS_ST_REJ_AEAD) == 0 and cs_stat(s[0..CS_LEN], CS_ST_REJ_REPLAY) == 0 and cs_vstat(v, CS_V_REFUSED) == 0) and all;
+    if (caller and vdrop != 0) {
+        all = ckh_check("exactly one part was left out", cs_vstat(v, CS_V_TXDROPPED) == 1) and all;
+    }
+    var want_skip : u64 = 0;
+    if (!caller) { want_skip = expect_drop; }
+    all = ckh_check("frames shown + skipped = frames the other side sent", shown + skipped == frames) and all;
+    all = ckh_check("skipped matches what was lost", skipped == want_skip) and all;
+    all = ckh_check("the stream stayed alive to the last frame", cs_vstat(v, CS_V_LASTFRAME) == frames) and all;
+    all = ckh_check("every picture the probe saw decoded to 320x240", dec_bad == 0 and dec_ok == observed and observed > 0) and all;
+    if (!camsim_env) {
+        all = ckh_check("every picture the probe saw is byte-identical to the generator's frame of that number", differ == 0 and same == observed) and all;
+    } else if (caller) {
+        all = ckh_check("camera hand-in switched the source and back", cs_vstat(v, CS_V_CAM) > 0 and cs_vstat(v, CS_V_GEN) > 0 and cs_vstat(v, CS_V_CAM) + cs_vstat(v, CS_V_GEN) == txf) and all;
+        all = ckh_check("the pictures it received (the other side's generator) are all identical", differ == 0 and same == observed) and all;
+    } else {
+        all = ckh_check("the pictures that differ from the generator are the other side's camera frames (compare with its count)", differ > 0 and same + differ == observed) and all;
+    }
+    return all;
+}
+
+pub fn main() -> void {
+    // Never true: makes sure the audio callbacks are emitted and so exported for dlsym.
+    var z : [8]u8 = undefined;
+    put_u64(z[0..8], 0, 0);
+    if (get_u64(z[0..8], 0) == 99) {
+        cbp_fin(0, 0, 0, 0, 0, 0);
+        cbp_fout(0, 0, 0);
+    }
+    var rb : [32]u8 = undefined;
+    const rn : usize = ckh_env("CS_ROLE", rb[0..32]);
+    var ok : bool = false;
+    if (rn == 6 and rb[0] == 99 and rb[1] == 97 and rb[2] == 108 and rb[3] == 108 and rb[4] == 101 and rb[5] == 114) {
+        ok = vp_side(true);
+    } else if (rn == 6 and rb[0] == 99 and rb[1] == 97 and rb[2] == 108 and rb[3] == 108 and rb[4] == 101 and rb[5] == 101) {
+        ok = vp_side(false);
+    } else {
+        ckh_line("CS_ROLE must be caller or callee\n");
+    }
+    if (ok) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}

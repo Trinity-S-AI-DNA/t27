@@ -1,0 +1,652 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/friends_view.t27 -- what the FRIENDS part of the CALL panel shows and what a click in it means. Pure
+// decisions only: no @extern, no socket, no clock. peer_identity.t27 holds the identity, the invite string and the
+// friends table; friends_engine.t27 (the host) announces this device, browses _t27call._udp and keeps the answers;
+// the window (glass_window.t27) draws the rows below and turns a hit into one engine call. Owner, 2026-10-22: a call
+// goes to a friend by key, not by IP. Refs gHashTag/t27#11560.
+//
+// What "online" means here, so the word is not read as more than it is: a service named _t27call._udp was found on this
+// network whose TXT record claims the friend's fingerprint, and its host answered with an IPv4 address this version may
+// dial (call_view cv_lan_ok). The TXT claim is not a proof of the key: anybody on the network can announce any
+// fingerprint. The 6-digit comparison of the call is what detects a stranger; binding the call keys to the identity
+// keys is the next slice.
+//
+// The snapshot of the list sits in the CALL region of the text store from FV_BASE (draw() reads only folded bytes):
+// a header (counts, flags, my invite, my nick, the invite being typed) and FV_ROWS_SNAP rows of FV_ROW bytes.
+// Flat namespace (the window build splices imported modules): every name here starts with fv_ / FV_.
+module T27osFriendsView;
+
+use t27os::queen::QP_PAD;
+use t27os::call_view::cv_field_x;
+use t27os::call_view::cv_field_w;
+use t27os::call_view::cv_btn_x;
+use t27os::call_view::cv_btn_w;
+use t27os::call_view::CV_BTN_H;
+use t27os::call_view::CV_FIELD_H;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+
+// ---------------------------------------------------------------- 1. the snapshot in the CALL region
+
+/// Where the snapshot starts inside the CALL region, and where the engine's own blocks start (not drawn, not folded).
+pub const FV_BASE : usize = 256;
+pub const FV_ENGINE : usize = 1024;
+
+pub const FV_COUNT : usize = 256;
+pub const FV_SHOWN : usize = 257;
+pub const FV_DEBUG : usize = 258;
+pub const FV_INVLEN : usize = 259;
+pub const FV_IDSTATE : usize = 260;
+pub const FV_NICKLEN : usize = 261;
+pub const FV_NET : usize = 262;
+pub const FV_OPEN : usize = 263;
+pub const FV_INV : usize = 264;
+/// The first friend in view (the table index of snapshot row 0); the ACCOUNT panel scrolls a long list with it.
+pub const FV_SCROLL : usize = 290;
+pub const FV_MYNICK : usize = 296;
+pub const FV_TYPED : usize = 320;
+pub const FV_ROWS : usize = 352;
+pub const FV_ROWS_SNAP : usize = 8;
+pub const FV_ROW : usize = 48;
+/// The end of the folded bytes of the friends snapshot.
+pub const FV_END : usize = 736;
+
+/// A row: nick length, nick (24), fingerprint (10), online flag, seconds since last seen (u32 little endian,
+/// 4294967295 = never), IPv4 big endian (4), port (2, big endian), reason code, one spare.
+pub const FR_NICKLEN : usize = 0;
+pub const FR_NICK : usize = 1;
+pub const FR_FP : usize = 25;
+pub const FR_ONLINE : usize = 35;
+pub const FR_AGO : usize = 36;
+pub const FR_IP : usize = 40;
+pub const FR_PORT : usize = 44;
+pub const FR_REASON : usize = 46;
+
+/// Net state of the engine (FV_NET): 0 not started, 1 announcing and browsing, 2 could not start.
+pub const FV_NET_OFF : u32 = 0;
+pub const FV_NET_UP : u32 = 1;
+pub const FV_NET_FAIL : u32 = 2;
+
+pub const FV_NEVER : u64 = 4294967295;
+
+pub fn fv_row_at(i: usize) -> usize { return FV_ROWS + i * FV_ROW; }
+
+pub fn fv_get32(cl: []const u8, at: usize) -> u64 {
+    return @as(u64, cl[at]) | (@as(u64, cl[at + 1]) << 8) | (@as(u64, cl[at + 2]) << 16) | (@as(u64, cl[at + 3]) << 24);
+}
+
+pub fn fv_put32(cl: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    if (x > 4294967295) { x = 4294967295; }
+    cl[at] = @as(u8, @intCast(x & 255));
+    cl[at + 1] = @as(u8, @intCast((x >> 8) & 255));
+    cl[at + 2] = @as(u8, @intCast((x >> 16) & 255));
+    cl[at + 3] = @as(u8, @intCast((x >> 24) & 255));
+}
+
+/// The IPv4 of a row as ip * 65536 + port, 0 when the row is not online.
+pub fn fv_row_addr(cl: []const u8, i: usize) -> u64 {
+    const r : usize = fv_row_at(i);
+    if (i >= FV_ROWS_SNAP or cl[r + FR_ONLINE] == 0) { return 0; }
+    const ip : u64 = (@as(u64, cl[r + FR_IP]) << 24) | (@as(u64, cl[r + FR_IP + 1]) << 16) | (@as(u64, cl[r + FR_IP + 2]) << 8) | @as(u64, cl[r + FR_IP + 3]);
+    const port : u64 = (@as(u64, cl[r + FR_PORT]) << 8) | @as(u64, cl[r + FR_PORT + 1]);
+    return ip * 65536 + port;
+}
+
+/// The row of a fingerprint among the shown rows; FV_ROWS_SNAP when it is none.
+pub fn fv_find_fp(cl: []const u8, fp: []const u8) -> usize {
+    if (fp.len < 10) { return FV_ROWS_SNAP; }
+    const n : usize = @as(usize, cl[FV_SHOWN]);
+    var i : usize = 0;
+    while (i < n and i < FV_ROWS_SNAP) {
+        var same : bool = true;
+        var k : usize = 0;
+        while (k < 10) {
+            if (cl[fv_row_at(i) + FR_FP + k] != fp[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return FV_ROWS_SNAP;
+}
+
+// ---------------------------------------------------------------- 2. why a friend is not callable, and the notes
+
+pub const FV_R_ONLINE : u32 = 0;
+pub const FV_R_NEVER : u32 = 1;
+pub const FV_R_GONE : u32 = 2;
+pub const FV_R_ADDR : u32 = 3;
+pub const FV_R_LOOKUP : u32 = 4;
+pub const FV_R_NONET : u32 = 5;
+
+pub fn fv_reason_text(r: u32) -> str {
+    if (r == FV_R_NEVER) { return "not found on this network"; }
+    if (r == FV_R_GONE) { return "no longer announcing"; }
+    if (r == FV_R_ADDR) { return "found, but its address is not allowed in this version"; }
+    if (r == FV_R_LOOKUP) { return "found, looking up its address"; }
+    if (r == FV_R_NONET) { return "this device does not look for friends (calls are off)"; }
+    return "";
+}
+
+/// Notes of the friends part (CL_NOTE values 16 and up; call_view's CV_N_* are 1..6). 32 + reason: a click on an
+/// offline friend says why the call is not made.
+pub const FN_ADDED : u32 = 16;
+pub const FN_BAD : u32 = 17;
+pub const FN_DUP : u32 = 18;
+pub const FN_SELF : u32 = 19;
+pub const FN_FULL : u32 = 20;
+pub const FN_DAMAGED : u32 = 21;
+pub const FN_EMPTY : u32 = 22;
+pub const FN_IDENT : u32 = 23;
+pub const FN_COPIED : u32 = 24;
+pub const FN_KEYNEED : u32 = 25;
+pub const FN_NOSAVE : u32 = 26;
+pub const FN_REMOVED : u32 = 27;
+pub const FN_FCOPIED : u32 = 28;
+pub const FN_BAD_LEN : u32 = 29;
+pub const FN_BAD_CHECK : u32 = 30;
+pub const FN_RM_NOSAVE : u32 = 31;
+pub const FN_OFF : u32 = 32;
+
+pub fn fv_note_text(code: u32) -> str {
+    if (code == FN_ADDED) { return "Friend added and saved."; }
+    if (code == FN_BAD) { return "That is not a valid invite: check the characters and the last symbol."; }
+    if (code == FN_DUP) { return "That friend is already in the list."; }
+    if (code == FN_SELF) { return "That is your own invite."; }
+    if (code == FN_FULL) { return "The list is full (32 friends)."; }
+    if (code == FN_DAMAGED) { return "The friends file is damaged and was left as it was. Nothing was added."; }
+    if (code == FN_EMPTY) { return "Paste or type the friend's invite first (T27-...)."; }
+    if (code == FN_IDENT) { return "Calls are off: the identity file could not be opened or is damaged (left as found)."; }
+    if (code == FN_COPIED) { return "Your key is on the clipboard. Send it to your friend."; }
+    if (code == FN_KEYNEED) { return "A debug call needs the friend's invite in the add field above, and a valid address."; }
+    if (code == FN_NOSAVE) { return "Added in memory, but the friends file could not be written."; }
+    if (code == FN_REMOVED) { return "Friend removed."; }
+    if (code == FN_FCOPIED) { return "Your friend's key is on the clipboard."; }
+    if (code == FN_BAD_LEN) { return "A key is 25 characters: T27-XXXX-XXXX-XXXX-XXXX-C. This one is shorter or longer."; }
+    if (code == FN_BAD_CHECK) { return "The last symbol does not match: a character was mistyped or the key was cut."; }
+    if (code == FN_RM_NOSAVE) { return "Removed in memory, but the friends file could not be written."; }
+    return "";
+}
+
+/// The note a click on an offline friend leaves.
+pub fn fv_offline_note(reason: u32) -> u32 { return FN_OFF + reason; }
+
+/// All note lines of the part, from the code (call_view's own codes are answered by call_view).
+pub fn fv_note_is_mine(code: u32) -> bool { return code >= FN_ADDED; }
+
+pub fn fv_offline_text(code: u32) -> str {
+    if (code >= FN_OFF and code < FN_OFF + 6) { return fv_reason_text(code - FN_OFF); }
+    return "";
+}
+
+// ---------------------------------------------------------------- 3. text
+
+fn fv_hex(v: u32) -> u8 {
+    if (v < 10) { return @as(u8, @intCast(48 + v)); }
+    return @as(u8, @intCast(87 + v));
+}
+
+/// The first four bytes of a fingerprint as "1234-5678" (9 bytes).
+pub fn fv_short_fp(fp: []const u8, out: []u8) -> usize {
+    if (fp.len < 4 or out.len < 9) { return 0; }
+    var o : usize = 0;
+    var i : usize = 0;
+    while (i < 4) {
+        out[o] = fv_hex(@as(u32, fp[i] >> 4));
+        out[o + 1] = fv_hex(@as(u32, fp[i] & 15));
+        o = o + 2;
+        i = i + 1;
+        if (i == 2) {
+            out[o] = 45;
+            o = o + 1;
+        }
+    }
+    return o;
+}
+
+/// "now", "5 s ago", "3 min ago", "2 h ago", "4 d ago".
+pub fn fv_ago_text(secs: u64, out: []u8) -> usize {
+    if (secs < 2) { return put_bytes(out, 0, "just now"); }
+    if (secs < 60) {
+        const n : usize = put_dec(out, 0, secs);
+        return put_bytes(out, n, " s ago");
+    }
+    if (secs < 3600) {
+        const n : usize = put_dec(out, 0, secs / 60);
+        return put_bytes(out, n, " min ago");
+    }
+    if (secs < 86400) {
+        const n : usize = put_dec(out, 0, secs / 3600);
+        return put_bytes(out, n, " h ago");
+    }
+    const n : usize = put_dec(out, 0, secs / 86400);
+    return put_bytes(out, n, " d ago");
+}
+
+// ---------------------------------------------------------------- 3a. trust: is this friend's key stored (owner, 2026-10-22)
+
+/// What the person sees about a friend's key (peer_identity.t27 pid_verdict): not verified (no key stored: the next
+/// call shows the 6-digit code), verified (a key is stored: calls and messages need no code), key mismatch (a key is
+/// stored and the last call or message session offered another key or a bad proof, so it was refused).
+pub const FV_T_UNVERIFIED : u32 = 0;
+pub const FV_T_VERIFIED : u32 = 1;
+pub const FV_T_MISMATCH : u32 = 2;
+
+/// The bits the window keeps per friend: a key is stored in the friends file; the last session was refused for its key.
+pub const FV_TB_PIN : u32 = 1;
+pub const FV_TB_BAD : u32 = 2;
+
+/// A refusal counts only while a key is stored (pid_verdict refuses nobody else).
+pub fn fv_trust_of(bits: u32) -> u32 {
+    if ((bits & FV_TB_PIN) == 0) { return FV_T_UNVERIFIED; }
+    if ((bits & FV_TB_BAD) != 0) { return FV_T_MISMATCH; }
+    return FV_T_VERIFIED;
+}
+
+/// One session's verdict on the bits: a stored or proven key is a pin, a proven key clears a refusal, a refusal sets it.
+pub fn fv_trust_step(bits: u32, stored: bool, proven: bool, refused: bool) -> u32 {
+    var b : u32 = bits;
+    if (stored) { b = b | FV_TB_PIN; }
+    if (proven or stored) { b = b & FV_TB_PIN; }
+    if (refused) { b = b | FV_TB_BAD; }
+    return b;
+}
+
+fn fv_check(out: []u8, at: usize) -> usize {
+    out[at] = 226;
+    out[at + 1] = 156;
+    out[at + 2] = 147;
+    return at + 3;
+}
+
+/// The mark after a friend's short key in a row: " <check mark>", " not verified", " key mismatch!".
+pub fn fv_trust_tag_put(out: []u8, at: usize, trust: u32) -> usize {
+    if (trust == FV_T_VERIFIED) { return fv_check(out, put_bytes(out, at, " ")); }
+    if (trust == FV_T_MISMATCH) { return put_bytes(out, at, " key mismatch!"); }
+    return put_bytes(out, at, " not verified");
+}
+
+/// The mark beside the key on a friend's card: "<check mark> verified", "not verified", "! key mismatch".
+pub fn fv_trust_word_put(out: []u8, trust: u32) -> usize {
+    if (trust == FV_T_VERIFIED) { return put_bytes(out, fv_check(out, 0), " verified"); }
+    if (trust == FV_T_MISMATCH) { return put_bytes(out, 0, "! key mismatch"); }
+    return put_bytes(out, 0, "not verified");
+}
+
+/// The line that says what the trust state means and what to do; the unverified one is the message session's refusal.
+pub fn fv_trust_hint(trust: u32) -> str {
+    if (trust == FV_T_VERIFIED) { return "Verified: the key is stored, calls and messages need no code."; }
+    if (trust == FV_T_MISMATCH) { return "Key mismatch: the last call offered another key than the stored one and was refused."; }
+    return "Not verified yet: your first message asks them to accept you; a call compares a code.";
+}
+
+/// The second line of a row: "fp 1234-5678 <mark>  online, seen just now" or "fp 1234-5678 <mark>  offline, <why>".
+pub fn fv_row_line(cl: []const u8, i: usize, trust: u32, out: []u8) -> usize {
+    const r : usize = fv_row_at(i);
+    var n : usize = put_bytes(out, 0, "fp ");
+    n = n + fv_short_fp(cl[r + FR_FP .. r + FR_FP + 10], out[n..out.len]);
+    n = fv_trust_tag_put(out, n, trust);
+    if (cl[r + FR_ONLINE] != 0) {
+        n = put_bytes(out, n, "  online, seen ");
+        n = n + fv_ago_text(fv_get32(cl, r + FR_AGO), out[n..out.len]);
+        return n;
+    }
+    n = put_bytes(out, n, "  offline");
+    const ago : u64 = fv_get32(cl, r + FR_AGO);
+    if (ago != FV_NEVER) {
+        n = put_bytes(out, n, ", last seen ");
+        n = n + fv_ago_text(ago, out[n..out.len]);
+    } else {
+        n = put_bytes(out, n, ", never seen");
+    }
+    return n;
+}
+
+/// A character of the invite field: ASCII letters (made capital), digits and the dash; 0 for anything else (spaces and
+/// line ends of a paste are dropped, so is a character outside ASCII).
+pub fn fv_inv_char(cp: u32) -> u32 {
+    if (cp >= 97 and cp <= 122) { return cp - 32; }
+    if ((cp >= 65 and cp <= 90) or (cp >= 48 and cp <= 57) or cp == 45) { return cp; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- 4. boxes (t = panel top, l = its left)
+
+pub const FV_INV_LABEL_Y : f64 = 86.0;
+pub const FV_INV_Y : f64 = 100.0;
+pub const FV_INV_BOX_Y : f64 = 88.0;
+pub const FV_INV_BOX_H : f64 = 18.0;
+pub const FV_FR_LABEL_Y : f64 = 126.0;
+pub const FV_ROWS_Y : f64 = 134.0;
+pub const FV_ROW_H : f64 = 30.0;
+pub const FV_ROWS_MAX : usize = 5;
+pub const FV_ADD_LABEL_Y : f64 = 296.0;
+pub const FV_IFIELD_Y : f64 = 304.0;
+pub const FV_BTN_Y : f64 = 338.0;
+pub const FV_NOTE_Y : f64 = 382.0;
+pub const FV_DBG_LABEL_Y : f64 = 428.0;
+pub const FV_DFIELD_Y : f64 = 436.0;
+pub const FV_DCALL_Y : f64 = 470.0;
+/// Under the debug CALL for a public address (call_view section 7): the row "public address -- allow?" and the hint.
+pub const FV_PUB_Y : f64 = 512.0;
+pub const FV_PUBHINT_Y : f64 = 528.0;
+
+pub const FV_H_NONE : u32 = 0;
+pub const FV_H_INVITE : u32 = 1;
+pub const FV_H_IFIELD : u32 = 2;
+pub const FV_H_ADD : u32 = 3;
+pub const FV_H_DEBUG : u32 = 4;
+pub const FV_H_DFIELD : u32 = 5;
+pub const FV_H_DCALL : u32 = 6;
+/// ALLOW, right of the debug CALL, drawn only while the typed public address waits for consent.
+pub const FV_H_DALLOW : u32 = 7;
+pub const FV_H_ROW : u32 = 16;
+
+pub fn fv_in(x: f64, y: f64, bx: f64, by: f64, bw: f64, bh: f64) -> bool {
+    return x >= bx and x < bx + bw and y >= by and y < by + bh;
+}
+
+/// How many rows the list draws: the friends shown, at most FV_ROWS_MAX.
+pub fn fv_rows_drawn(shown: u32) -> usize {
+    var n : usize = @as(usize, shown);
+    if (n > FV_ROWS_MAX) { n = FV_ROWS_MAX; }
+    return n;
+}
+
+pub fn fv_row_y(t: f64, i: usize) -> f64 { return t + FV_ROWS_Y + FV_ROW_H * @as(f64, @floatFromInt(i)); }
+
+pub fn fv_hit(x: f64, y: f64, l: f64, w: f64, t: f64, shown: u32, debug: bool, allow: bool) -> u32 {
+    if (fv_in(x, y, l + QP_PAD, t + FV_INV_BOX_Y, w - 2.0 * QP_PAD, FV_INV_BOX_H)) { return FV_H_INVITE; }
+    const rows : usize = fv_rows_drawn(shown);
+    var i : usize = 0;
+    while (i < rows) {
+        if (fv_in(x, y, l + QP_PAD, fv_row_y(t, i), w - 2.0 * QP_PAD, FV_ROW_H - 2.0)) { return FV_H_ROW + @as(u32, @intCast(i)); }
+        i = i + 1;
+    }
+    if (fv_in(x, y, cv_field_x(l), t + FV_IFIELD_Y, cv_field_w(w), CV_FIELD_H)) { return FV_H_IFIELD; }
+    if (fv_in(x, y, cv_btn_x(l, w, 0), t + FV_BTN_Y, cv_btn_w(w), CV_BTN_H)) { return FV_H_ADD; }
+    if (fv_in(x, y, cv_btn_x(l, w, 1), t + FV_BTN_Y, cv_btn_w(w), CV_BTN_H)) { return FV_H_DEBUG; }
+    if (debug) {
+        if (fv_in(x, y, cv_field_x(l), t + FV_DFIELD_Y, cv_field_w(w), CV_FIELD_H)) { return FV_H_DFIELD; }
+        if (fv_in(x, y, cv_btn_x(l, w, 0), t + FV_DCALL_Y, cv_btn_w(w), CV_BTN_H)) { return FV_H_DCALL; }
+        if (allow and fv_in(x, y, cv_btn_x(l, w, 1), t + FV_DCALL_Y, cv_btn_w(w), CV_BTN_H)) { return FV_H_DALLOW; }
+    }
+    return FV_H_NONE;
+}
+
+// ---------------------------------------------------------------- 5. the hint of an empty field
+
+/// The grey hint of a text field: "e.g. " and the example, drawn only while the field is empty (with or without the
+/// caret), so it never reads as an address or a key already typed; nothing once a character stands. 0 when out is short.
+pub fn fv_field_hint(tn: usize, example: []const u8, out: []u8) -> usize {
+    if (tn > 0 or out.len < example.len + 5) { return 0; }
+    const n : usize = put_bytes(out, 0, "e.g. ");
+    return put_bytes(out, n, example);
+}
+
+// ---------------------------------------------------------------- tests
+
+pub fn fv_eq(a: []const u8, n: usize, s: []const u8) -> bool {
+    if (n != s.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn fv_blank(cl: []u8) -> void {
+    var i : usize = 0;
+    while (i < cl.len) {
+        cl[i] = 0;
+        i = i + 1;
+    }
+}
+
+test fv_the_snapshot_fits_between_the_core_and_the_engine {
+    assert FV_BASE >= 256;
+    assert FV_COUNT == FV_BASE;
+    assert FV_INV + 25 <= FV_SCROLL and FV_SCROLL < FV_MYNICK;
+    assert FV_INV + 25 <= FV_MYNICK;
+    assert FV_MYNICK + 24 <= FV_TYPED;
+    assert FV_TYPED + 25 <= FV_ROWS;
+    assert fv_row_at(FV_ROWS_SNAP - 1) + FV_ROW == FV_END;
+    assert FV_END <= FV_ENGINE;
+    assert FR_NICK + 24 == FR_FP;
+    assert FR_FP + 10 == FR_ONLINE;
+    assert FR_AGO + 4 == FR_IP and FR_IP + 4 == FR_PORT and FR_PORT + 2 == FR_REASON;
+    assert FR_REASON < FV_ROW;
+}
+
+test fv_a_row_reads_back_as_the_address_to_dial {
+    var cl : [1024]u8 = undefined;
+    fv_blank(cl[0..1024]);
+    const r : usize = fv_row_at(1);
+    cl[r + FR_ONLINE] = 1;
+    cl[r + FR_IP] = 127;
+    cl[r + FR_IP + 3] = 1;
+    cl[r + FR_PORT] = 186;
+    cl[r + FR_PORT + 1] = 112;
+    assert fv_row_addr(cl[0..1024], 1) == 2130706433 * 65536 + 47728;
+    assert fv_row_addr(cl[0..1024], 0) == 0;
+    cl[r + FR_ONLINE] = 0;
+    assert fv_row_addr(cl[0..1024], 1) == 0;
+    assert fv_row_addr(cl[0..1024], 9) == 0;
+}
+
+test fv_a_fingerprint_finds_its_row {
+    var cl : [1024]u8 = undefined;
+    fv_blank(cl[0..1024]);
+    cl[FV_SHOWN] = 2;
+    var k : usize = 0;
+    while (k < 10) {
+        cl[fv_row_at(0) + FR_FP + k] = @as(u8, @intCast(k + 1));
+        cl[fv_row_at(1) + FR_FP + k] = @as(u8, @intCast(k + 11));
+        k = k + 1;
+    }
+    var fp : [10]u8 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+    assert fv_find_fp(cl[0..1024], fp[0..10]) == 1;
+    fp[9] = 99;
+    assert fv_find_fp(cl[0..1024], fp[0..10]) == FV_ROWS_SNAP;
+}
+
+test fv_short_fingerprints_and_ages_read_as_people_say_them {
+    var o : [64]u8 = undefined;
+    const fp : [10]u8 = [171, 205, 18, 52, 0, 0, 0, 0, 0, 0];
+    assert fv_eq(o[0..64], fv_short_fp(fp[0..10], o[0..64]), "abcd-1234");
+    assert fv_eq(o[0..64], fv_ago_text(0, o[0..64]), "just now");
+    assert fv_eq(o[0..64], fv_ago_text(5, o[0..64]), "5 s ago");
+    assert fv_eq(o[0..64], fv_ago_text(125, o[0..64]), "2 min ago");
+    assert fv_eq(o[0..64], fv_ago_text(7300, o[0..64]), "2 h ago");
+    assert fv_eq(o[0..64], fv_ago_text(200000, o[0..64]), "2 d ago");
+}
+
+test fv_a_row_line_says_online_or_offline_and_why {
+    var cl : [1024]u8 = undefined;
+    fv_blank(cl[0..1024]);
+    var o : [96]u8 = undefined;
+    const r : usize = fv_row_at(0);
+    var k : usize = 0;
+    while (k < 4) {
+        cl[r + FR_FP + k] = @as(u8, @intCast(16 * (k + 1) + k + 1));
+        k = k + 1;
+    }
+    cl[r + FR_ONLINE] = 1;
+    fv_put32(cl[0..1024], r + FR_AGO, 3);
+    assert fv_eq(o[0..96], fv_row_line(cl[0..1024], 0, FV_T_UNVERIFIED, o[0..96]), "fp 1122-3344 not verified  online, seen 3 s ago");
+    cl[r + FR_ONLINE] = 0;
+    fv_put32(cl[0..1024], r + FR_AGO, 125);
+    assert fv_eq(o[0..96], fv_row_line(cl[0..1024], 0, FV_T_MISMATCH, o[0..96]), "fp 1122-3344 key mismatch!  offline, last seen 2 min ago");
+    fv_put32(cl[0..1024], r + FR_AGO, FV_NEVER);
+    const vn : usize = fv_row_line(cl[0..1024], 0, FV_T_VERIFIED, o[0..96]);
+    assert vn == 37 and o[12] == 32 and o[13] == 226 and o[14] == 156 and o[15] == 147;
+    assert fv_eq(o[16..96], vn - 16, "  offline, never seen");
+    assert fv_reason_text(FV_R_ONLINE).len == 0;
+    var q : u32 = 1;
+    while (q <= 5) {
+        assert fv_reason_text(q).len > 0;
+        assert fv_offline_text(fv_offline_note(q)).len > 0;
+        q = q + 1;
+    }
+}
+
+test fv_trust_reads_as_verified_not_verified_or_key_mismatch {
+    var o : [96]u8 = undefined;
+    // the bits: nothing stored is not verified; a stored key is verified; a refusal with a stored key is a mismatch
+    assert fv_trust_of(0) == FV_T_UNVERIFIED;
+    assert fv_trust_of(FV_TB_PIN) == FV_T_VERIFIED;
+    assert fv_trust_of(FV_TB_PIN | FV_TB_BAD) == FV_T_MISMATCH;
+    assert fv_trust_of(FV_TB_BAD) == FV_T_UNVERIFIED;
+    // not verified -> verified once the key of a matched call is stored; a later refusal is a mismatch, a proof clears it
+    var b : u32 = 0;
+    b = fv_trust_step(b, false, false, false);
+    assert fv_trust_of(b) == FV_T_UNVERIFIED;
+    b = fv_trust_step(b, true, false, false);
+    assert fv_trust_of(b) == FV_T_VERIFIED;
+    b = fv_trust_step(b, false, false, true);
+    assert fv_trust_of(b) == FV_T_MISMATCH;
+    b = fv_trust_step(b, false, true, false);
+    assert fv_trust_of(b) == FV_T_VERIFIED;
+    // a code compared in a call with no key yet (neither stored nor proven) changes nothing
+    assert fv_trust_step(0, false, false, false) == 0;
+    // the card's words and the hints: the unverified one says a message invites (invites.t27)
+    assert fv_eq(o[0..96], fv_trust_word_put(o[0..96], FV_T_UNVERIFIED), "not verified");
+    assert fv_eq(o[0..96], fv_trust_word_put(o[0..96], FV_T_MISMATCH), "! key mismatch");
+    const n : usize = fv_trust_word_put(o[0..96], FV_T_VERIFIED);
+    assert n == 12 and o[0] == 226 and o[1] == 156 and o[2] == 147 and fv_eq(o[3..96], n - 3, " verified");
+    assert fv_eq(o[0..96], put_bytes(o[0..96], 0, fv_trust_hint(FV_T_UNVERIFIED)), "Not verified yet: your first message asks them to accept you; a call compares a code.");
+    assert fv_trust_hint(FV_T_VERIFIED).len > 0 and fv_trust_hint(FV_T_MISMATCH).len > 0;
+    assert fv_eq(o[0..96], put_bytes(o[0..96], 0, fv_trust_hint(FV_T_MISMATCH)), "Key mismatch: the last call offered another key than the stored one and was refused.");
+}
+
+test fv_every_note_has_its_line_and_a_click_on_a_friend_who_is_off_says_why {
+    var c : u32 = FN_ADDED;
+    while (c <= FN_RM_NOSAVE) {
+        assert fv_note_text(c).len > 0;
+        assert fv_note_is_mine(c);
+        c = c + 1;
+    }
+    assert fv_note_text(0).len == 0;
+    assert fv_note_is_mine(6) == false;
+    assert fv_offline_note(FV_R_GONE) == FN_OFF + 2;
+    // the person-facing codes stay below the offline notes (32 + reason)
+    assert FN_RM_NOSAVE < FN_OFF;
+}
+
+test fv_the_invite_field_takes_letters_digits_and_the_dash_only {
+    assert fv_inv_char(116) == 84;
+    assert fv_inv_char(84) == 84;
+    assert fv_inv_char(50) == 50;
+    assert fv_inv_char(45) == 45;
+    assert fv_inv_char(32) == 0;
+    assert fv_inv_char(10) == 0;
+    assert fv_inv_char(1103) == 0;
+    assert fv_inv_char(46) == 0;
+}
+
+test fv_the_boxes_hit_their_own_target_and_nothing_overlaps {
+    const l : f64 = 600.0;
+    const w : f64 = 300.0;
+    const t : f64 = 35.0;
+    assert fv_hit(l + 30.0, t + FV_INV_BOX_Y + 4.0, l, w, t, 2, false, false) == FV_H_INVITE;
+    assert fv_hit(l + 30.0, fv_row_y(t, 0) + 4.0, l, w, t, 2, false, false) == FV_H_ROW;
+    assert fv_hit(l + 30.0, fv_row_y(t, 1) + 4.0, l, w, t, 2, false, false) == FV_H_ROW + 1;
+    assert fv_hit(l + 30.0, fv_row_y(t, 2) + 4.0, l, w, t, 2, false, false) == FV_H_NONE;
+    assert fv_hit(l + 30.0, fv_row_y(t, 4) + 4.0, l, w, t, 9, false, false) == FV_H_ROW + 4;
+    assert fv_hit(l + 30.0, fv_row_y(t, 5) + 4.0, l, w, t, 9, false, false) == FV_H_NONE;
+    assert fv_hit(cv_field_x(l) + 4.0, t + FV_IFIELD_Y + 4.0, l, w, t, 0, false, false) == FV_H_IFIELD;
+    assert fv_hit(cv_btn_x(l, w, 0) + 4.0, t + FV_BTN_Y + 4.0, l, w, t, 0, false, false) == FV_H_ADD;
+    assert fv_hit(cv_btn_x(l, w, 1) + 4.0, t + FV_BTN_Y + 4.0, l, w, t, 0, false, false) == FV_H_DEBUG;
+    // the debug field and its CALL answer only while the debug part is shown
+    assert fv_hit(cv_field_x(l) + 4.0, t + FV_DFIELD_Y + 4.0, l, w, t, 0, false, false) == FV_H_NONE;
+    assert fv_hit(cv_field_x(l) + 4.0, t + FV_DFIELD_Y + 4.0, l, w, t, 0, true, false) == FV_H_DFIELD;
+    assert fv_hit(cv_btn_x(l, w, 0) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, true, false) == FV_H_DCALL;
+    assert fv_hit(cv_btn_x(l, w, 0) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, false, false) == FV_H_NONE;
+    // the order down the panel: invite, rows (5), add field, buttons, note, debug field, debug CALL
+    assert t + FV_INV_BOX_Y + FV_INV_BOX_H <= t + FV_FR_LABEL_Y;
+    assert fv_row_y(t, FV_ROWS_MAX) <= t + FV_ADD_LABEL_Y;
+    assert t + FV_IFIELD_Y + CV_FIELD_H < t + FV_BTN_Y;
+    assert t + FV_BTN_Y + CV_BTN_H < t + FV_NOTE_Y - 10.0;
+    assert t + FV_NOTE_Y + 28.0 < t + FV_DBG_LABEL_Y;
+    assert t + FV_DFIELD_Y + CV_FIELD_H < t + FV_DCALL_Y;
+    // ALLOW answers only while a public address waits for consent, right of the debug CALL; its row and hint below
+    assert fv_hit(cv_btn_x(l, w, 1) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, true, false) == FV_H_NONE;
+    assert fv_hit(cv_btn_x(l, w, 1) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, true, true) == FV_H_DALLOW;
+    assert fv_hit(cv_btn_x(l, w, 1) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, false, true) == FV_H_NONE;
+    assert fv_hit(cv_btn_x(l, w, 0) + 4.0, t + FV_DCALL_Y + 4.0, l, w, t, 0, true, true) == FV_H_DCALL;
+    assert t + FV_DCALL_Y + CV_BTN_H < t + FV_PUB_Y - 9.0 and FV_PUB_Y < FV_PUBHINT_Y;
+    assert fv_rows_drawn(0) == 0 and fv_rows_drawn(3) == 3 and fv_rows_drawn(8) == FV_ROWS_MAX;
+}
+
+test fv_an_empty_field_shows_a_hint_marked_as_a_hint_and_a_typed_one_shows_none {
+    var o : [40]u8 = undefined;
+    // empty, focused or not (the window draws the caret before it): the hint, led by "e.g. "
+    assert fv_eq(o[0..40], fv_field_hint(0, "192.168.1.10:47727", o[0..40]), "e.g. 192.168.1.10:47727");
+    assert fv_eq(o[0..40], fv_field_hint(0, "T27-XXXX-XXXX-XXXX-XXXX-C", o[0..40]), "e.g. T27-XXXX-XXXX-XXXX-XXXX-C");
+    assert o[0] == 101 and o[1] == 46 and o[2] == 103 and o[3] == 46 and o[4] == 32;
+    // one character typed: no hint at all
+    assert fv_field_hint(1, "192.168.1.10:47727", o[0..40]) == 0;
+    assert fv_field_hint(18, "192.168.1.10:47727", o[0..40]) == 0;
+    // a buffer too short for the prefix and the example is never overrun
+    assert fv_field_hint(0, "192.168.1.10:47727", o[0..20]) == 0;
+}
+
+test fv_get32_reads_little_endian_and_round_trips_put32_at_the_limits {
+    var b : [12]u8 = undefined;
+    b[3] = 1; b[4] = 2; b[5] = 0; b[6] = 0; b[7] = 0;
+    assert fv_get32(b[0..12], 3) == 513;
+    b[3] = 0x78; b[4] = 0x56; b[5] = 0x34; b[6] = 0x12;
+    assert fv_get32(b[0..12], 3) == 0x12345678;
+    b[3] = 255; b[4] = 255; b[5] = 255; b[6] = 255;
+    assert fv_get32(b[0..12], 3) == 4294967295;
+    fv_put32(b[0..12], 7, 0);
+    assert fv_get32(b[0..12], 7) == 0;
+    fv_put32(b[0..12], 7, 4294967296);
+    assert fv_get32(b[0..12], 7) == 4294967295;
+    fv_put32(b[0..12], 0, 0x80000001);
+    assert fv_get32(b[0..12], 0) == 0x80000001;
+    assert b[0] == 1 and b[3] == 0x80;
+}
+
+test fv_hex_gives_lowercase_digits_at_the_boundaries {
+    assert fv_hex(0) == 48;
+    assert fv_hex(9) == 57;
+    assert fv_hex(10) == 97;
+    assert fv_hex(15) == 102;
+}
+
+test fv_check_writes_the_three_byte_check_mark_and_returns_the_next_offset {
+    var b : [8]u8 = undefined;
+    b[0] = 7; b[5] = 9;
+    assert fv_check(b[0..8], 1) == 4;
+    assert b[0] == 7 and b[1] == 226 and b[2] == 156 and b[3] == 147 and b[5] == 9;
+    assert fv_check(b[0..8], 0) == 3;
+    assert b[0] == 226;
+}
+
+test fv_trust_tag_put_writes_the_mark_for_each_state_after_the_given_offset {
+    var o : [40]u8 = undefined;
+    var n : usize = fv_trust_tag_put(o[0..40], 0, FV_T_VERIFIED);
+    assert n == 4 and o[0] == 32 and o[1] == 226 and o[2] == 156 and o[3] == 147;
+    n = fv_trust_tag_put(o[0..40], 2, FV_T_UNVERIFIED);
+    assert fv_eq(o[2..40], n - 2, " not verified");
+    assert n == 2 + 13;
+    n = fv_trust_tag_put(o[0..40], 5, FV_T_MISMATCH);
+    assert fv_eq(o[5..40], n - 5, " key mismatch!");
+    assert n == 5 + 14;
+    // an unknown state reads as not verified
+    n = fv_trust_tag_put(o[0..40], 0, 77);
+    assert fv_eq(o[0..40], n, " not verified");
+}
+
+test fv_in_is_half_open_on_every_edge {
+    assert fv_in(10.0, 20.0, 10.0, 20.0, 5.0, 5.0);
+    assert fv_in(14.9, 24.9, 10.0, 20.0, 5.0, 5.0);
+    assert !fv_in(15.0, 22.0, 10.0, 20.0, 5.0, 5.0);
+    assert !fv_in(12.0, 25.0, 10.0, 20.0, 5.0, 5.0);
+    assert !fv_in(9.9, 22.0, 10.0, 20.0, 5.0, 5.0);
+    assert !fv_in(12.0, 19.9, 10.0, 20.0, 5.0, 5.0);
+    assert !fv_in(12.0, 22.0, 10.0, 20.0, 0.0, 5.0);
+}

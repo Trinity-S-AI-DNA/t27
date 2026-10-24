@@ -1,0 +1,624 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/qr_cam.t27 -- SCAN in the cabinet: point the camera at a friend's code and the key lands in the add field.
+// Pure decisions only: no @extern, no clock, no camera. The window (glass_window.t27, section QC) owns the camera block
+// (call_video.t27 cvl_scan_new, the call's capture path in "scan" mode: 640 x 480 grey, at most one frame in 100 ms),
+// turns this file's actions into calls and hands every grey frame to qr_scan.t27 qs_scan_key.
+//
+// What a person sees (owner, 2026-10-23): SCAN, a small chip at the right of the line "ADD A FRIEND BY KEY". A click
+// opens a preview (180 x 135 pt) over the friends part with "point the camera at the code" and CANCEL under it. When a
+// frame gives a key, the key stands in the add field, the line says "key found - press ADD", the camera stops and the
+// preview closes 1.5 s later; ADD is still the person's own click. CANCEL closes it at once; 20 s without a key close it
+// with "no code found"; a camera that is refused or missing says so and SCAN is drawn off; during a call SCAN is off.
+//
+// The states:
+//   IDLE --SCAN (allowed)--> PREVIEW --key--> FOUND --1.5 s--> IDLE
+//   PREVIEW --20 s / camera failed--> FAILED (closed, the reason on the note line);  PREVIEW, FOUND --CANCEL--> IDLE
+//   PREVIEW --a call--> IDLE ("SCAN is off during a call");  FAILED --SCAN--> PREVIEW
+// Flat namespace (the window build splices imported modules): every name here starts with qc_ / QC_.
+module T27osQrCam;
+
+use t27os::queen::QP_PAD;
+use t27os::friends_view::FV_TYPED;
+use t27os::friends_view::FV_INVLEN;
+use t27os::friends_view::fv_inv_char;
+use t27os::peer_identity::INVITE_LEN;
+
+// ---------------------------------------------------------------- 1. the state block (QC_CAP bytes, in the text store)
+
+pub const QC_CAP : usize = 64;
+pub const QC_STATE : usize = 0;
+/// The message: QC_W_* (what the line under the preview, or the note line once it is closed, says).
+pub const QC_WHY : usize = 1;
+/// The camera as last known: QC_CAM_OK, _RESTRICTED, _DENIED, _NONE.
+pub const QC_CAM : usize = 2;
+/// 1 when frames come from a file (T27OS_QR_FRAME, a test aid), not from the camera.
+pub const QC_SRC : usize = 3;
+/// 1 while the test aid T27OS_QR_SCAN waits to press SCAN once the cabinet is open.
+pub const QC_AID : usize = 4;
+pub const QC_T0 : usize = 8;
+pub const QC_LAST : usize = 16;
+pub const QC_FOUND_AT : usize = 24;
+pub const QC_FRAMES : usize = 32;
+pub const QC_FOUND_MS : usize = 36;
+/// Not drawn by this file: the preview picture the window made from the newest frame (a CGImage, 0 none).
+pub const QC_IMG : usize = 40;
+pub const QC_MSG_AT : usize = 48;
+/// Frames the scan of this session refused, by reason (NO_CODE, GEOMETRY, ECC, NOT_KEY and the rest in one count).
+pub const QC_MISS : usize = 56;
+
+pub const QC_IDLE : u32 = 0;
+pub const QC_PREVIEW : u32 = 1;
+pub const QC_FOUND : u32 = 2;
+pub const QC_FAILED : u32 = 3;
+
+pub const QC_W_NONE : u32 = 0;
+pub const QC_W_POINT : u32 = 1;
+pub const QC_W_FOUND : u32 = 2;
+pub const QC_W_NO_CODE : u32 = 3;
+pub const QC_W_DENIED : u32 = 4;
+pub const QC_W_NO_CAMERA : u32 = 5;
+pub const QC_W_IN_CALL : u32 = 6;
+pub const QC_W_CANCELLED : u32 = 7;
+
+pub const QC_CAM_OK : u32 = 0;
+pub const QC_CAM_RESTRICTED : u32 = 1;
+pub const QC_CAM_DENIED : u32 = 2;
+pub const QC_CAM_NONE : u32 = 3;
+
+/// At most one frame in this many ms reaches the reader (10 a second).
+pub const QC_PERIOD_MS : u64 = 100;
+/// No key in this many ms since SCAN: the camera stops, "no code found".
+pub const QC_TIMEOUT_MS : u64 = 20000;
+/// The preview stays this long after a key was found, then closes.
+pub const QC_CLOSE_MS : u64 = 1500;
+/// A message on the note line stays this long after the preview closed.
+pub const QC_MSG_MS : u64 = 8000;
+/// The grey frame the reader is given.
+pub const QC_FRAME_W : usize = 640;
+pub const QC_FRAME_H : usize = 480;
+pub const QC_FRAME_N : usize = 307200;
+
+/// What the window does after qc_tick: stop the camera, take one frame now.
+pub const QC_A_STOP : u32 = 1;
+pub const QC_A_TAKE : u32 = 2;
+
+fn qc_get64(q: []const u8, at: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < 8) {
+        v = v * 256 + @as(u64, q[at + 7 - i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn qc_put64(q: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    var i : usize = 0;
+    while (i < 8) {
+        q[at + i] = @as(u8, @intCast(x % 256));
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+pub fn qc_u64(q: []const u8, at: usize) -> u64 { return qc_get64(q, at); }
+pub fn qc_set_u64(q: []u8, at: usize, v: u64) -> void { qc_put64(q, at, v); }
+pub fn qc_state(q: []const u8) -> u32 { return @as(u32, q[QC_STATE]); }
+pub fn qc_why(q: []const u8) -> u32 { return @as(u32, q[QC_WHY]); }
+pub fn qc_frames(q: []const u8) -> u64 { return qc_get32(q, QC_FRAMES); }
+pub fn qc_found_ms(q: []const u8) -> u64 { return qc_get32(q, QC_FOUND_MS); }
+
+fn qc_put32(q: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    var i : usize = 0;
+    while (i < 4) {
+        q[at + i] = @as(u8, @intCast(x % 256));
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+fn qc_get32(q: []const u8, at: usize) -> u64 {
+    return @as(u64, q[at]) + 256 * @as(u64, q[at + 1]) + 65536 * @as(u64, q[at + 2]) + 16777216 * @as(u64, q[at + 3]);
+}
+
+/// All zero: IDLE, no message, the camera not known to be refused, frames from the camera.
+pub fn qc_boot(q: []u8, from_file: bool, aid: bool) -> void {
+    var i : usize = 0;
+    while (i < QC_CAP) {
+        q[i] = 0;
+        i = i + 1;
+    }
+    if (from_file) { q[QC_SRC] = 1; }
+    if (aid) { q[QC_AID] = 1; }
+}
+
+// ---------------------------------------------------------------- 2. the decisions
+
+/// AVCaptureDevice authorizationStatus (0 not asked yet, 1 restricted, 2 denied, 3 allowed) as QC_CAM_*: not asked yet
+/// is allowed here, the system asks at the first SCAN.
+pub fn qc_cam_of_auth(auth: u64) -> u32 {
+    if (auth == 1) { return QC_CAM_RESTRICTED; }
+    if (auth == 2) { return QC_CAM_DENIED; }
+    return QC_CAM_OK;
+}
+
+/// The reason SCAN is off, QC_W_NONE when it is on: a call is up, or the camera is refused or missing (frames from a
+/// file need no camera).
+pub fn qc_off_why(q: []const u8, in_call: bool) -> u32 {
+    if (in_call) { return QC_W_IN_CALL; }
+    if (q[QC_SRC] != 0) { return QC_W_NONE; }
+    const cam : u32 = @as(u32, q[QC_CAM]);
+    if (cam == QC_CAM_RESTRICTED or cam == QC_CAM_DENIED) { return QC_W_DENIED; }
+    if (cam == QC_CAM_NONE) { return QC_W_NO_CAMERA; }
+    return QC_W_NONE;
+}
+
+/// SCAN is drawn on (and starts a scan) only while it is off for no reason and no scan runs.
+pub fn qc_may_start(q: []const u8, in_call: bool) -> bool {
+    const s : u32 = qc_state(q);
+    if (s != QC_IDLE and s != QC_FAILED) { return false; }
+    return qc_off_why(q, in_call) == QC_W_NONE;
+}
+
+/// The preview is drawn (and covers the friends part) while scanning and for 1.5 s after the key.
+pub fn qc_open(q: []const u8) -> bool {
+    const s : u32 = qc_state(q);
+    return s == QC_PREVIEW or s == QC_FOUND;
+}
+
+/// A frame is due: none taken yet in this scan, or the last one QC_PERIOD_MS ago.
+pub fn qc_frame_due(last: u64, now: u64) -> bool {
+    if (last == 0) { return true; }
+    if (now < last) { return false; }
+    return now - last >= QC_PERIOD_MS;
+}
+
+/// 20 s since SCAN with no key.
+pub fn qc_timed_out(t0: u64, now: u64) -> bool {
+    if (now < t0) { return false; }
+    return now - t0 >= QC_TIMEOUT_MS;
+}
+
+/// 1.5 s since the key: the preview closes.
+pub fn qc_close_due(at: u64, now: u64) -> bool {
+    if (now < at) { return false; }
+    return now - at >= QC_CLOSE_MS;
+}
+
+/// SCAN pressed at now: true when a scan starts (the window then starts the camera, or opens the file); else the
+/// reason it is off becomes the message.
+pub fn qc_press(q: []u8, now: u64, in_call: bool) -> bool {
+    if (!qc_may_start(q, in_call)) {
+        if (!qc_open(q)) {
+            q[QC_WHY] = @as(u8, @intCast(qc_off_why(q, in_call)));
+            qc_put64(q, QC_MSG_AT, now);
+        }
+        return false;
+    }
+    q[QC_STATE] = @as(u8, @intCast(QC_PREVIEW));
+    q[QC_WHY] = @as(u8, @intCast(QC_W_POINT));
+    qc_put64(q, QC_T0, now);
+    qc_put64(q, QC_LAST, 0);
+    qc_put64(q, QC_FOUND_AT, 0);
+    qc_put32(q, QC_FRAMES, 0);
+    qc_put32(q, QC_FOUND_MS, 0);
+    qc_put64(q, QC_MISS, 0);
+    qc_put64(q, QC_MSG_AT, now);
+    return true;
+}
+
+/// CANCEL: true when the camera must be stopped (a scan was running); the preview closes either way.
+pub fn qc_cancel(q: []u8, now: u64) -> bool {
+    const s : u32 = qc_state(q);
+    if (!qc_open(q)) { return false; }
+    q[QC_STATE] = @as(u8, @intCast(QC_IDLE));
+    if (s == QC_PREVIEW) { q[QC_WHY] = @as(u8, @intCast(QC_W_CANCELLED)); }
+    qc_put64(q, QC_MSG_AT, now);
+    return s == QC_PREVIEW;
+}
+
+/// One pass of the window at now. `cam_failed` is the camera's capture state FAILED (refused, missing, or no frame in
+/// 3 s once the camera is allowed; the window does not count the 3 s while the system still asks) and `cam_why` the
+/// setup's answer then (0 none: no frame, 1 restricted, 2 denied, 3 no camera). QC_A_* bits.
+pub fn qc_tick(q: []u8, now: u64, in_call: bool, cam_failed: bool, cam_why: u64) -> u32 {
+    const s : u32 = qc_state(q);
+    if (s == QC_FOUND) {
+        if (qc_close_due(qc_get64(q, QC_FOUND_AT), now)) {
+            q[QC_STATE] = @as(u8, @intCast(QC_IDLE));
+            qc_put64(q, QC_MSG_AT, now);
+        }
+        return 0;
+    }
+    if (s != QC_PREVIEW) { return 0; }
+    if (in_call) {
+        q[QC_STATE] = @as(u8, @intCast(QC_IDLE));
+        q[QC_WHY] = @as(u8, @intCast(QC_W_IN_CALL));
+        qc_put64(q, QC_MSG_AT, now);
+        return QC_A_STOP;
+    }
+    if (cam_failed and q[QC_SRC] == 0) {
+        // the setup's answer turns SCAN off (refused, or no camera); no frame in 3 s (busy elsewhere) only ends this scan
+        if (cam_why == 1) { q[QC_CAM] = @as(u8, @intCast(QC_CAM_RESTRICTED)); }
+        if (cam_why == 2) { q[QC_CAM] = @as(u8, @intCast(QC_CAM_DENIED)); }
+        if (cam_why == 3) { q[QC_CAM] = @as(u8, @intCast(QC_CAM_NONE)); }
+        q[QC_STATE] = @as(u8, @intCast(QC_FAILED));
+        q[QC_WHY] = @as(u8, @intCast(QC_W_NO_CAMERA));
+        if (cam_why == 1 or cam_why == 2) { q[QC_WHY] = @as(u8, @intCast(QC_W_DENIED)); }
+        qc_put64(q, QC_MSG_AT, now);
+        return QC_A_STOP;
+    }
+    if (qc_timed_out(qc_get64(q, QC_T0), now)) {
+        q[QC_STATE] = @as(u8, @intCast(QC_FAILED));
+        q[QC_WHY] = @as(u8, @intCast(QC_W_NO_CODE));
+        qc_put64(q, QC_MSG_AT, now);
+        return QC_A_STOP;
+    }
+    if (qc_frame_due(qc_get64(q, QC_LAST), now)) { return QC_A_TAKE; }
+    return 0;
+}
+
+/// A frame was read at now with qs_scan_key's answer r (0 = a key). True when it is the key: the state is FOUND, the
+/// window fills the field and stops the camera. Frames counted, the next one not before QC_PERIOD_MS.
+pub fn qc_frame(q: []u8, now: u64, r: u32) -> bool {
+    if (qc_state(q) != QC_PREVIEW) { return false; }
+    qc_put64(q, QC_LAST, now);
+    qc_put32(q, QC_FRAMES, qc_get32(q, QC_FRAMES) + 1);
+    if (r != 0) {
+        qc_put64(q, QC_MISS, qc_get64(q, QC_MISS) + 1);
+        return false;
+    }
+    q[QC_STATE] = @as(u8, @intCast(QC_FOUND));
+    q[QC_WHY] = @as(u8, @intCast(QC_W_FOUND));
+    qc_put64(q, QC_FOUND_AT, now);
+    var took : u64 = 0;
+    const t0 : u64 = qc_get64(q, QC_T0);
+    if (now > t0) { took = now - t0; }
+    qc_put32(q, QC_FOUND_MS, took);
+    qc_put64(q, QC_MSG_AT, now);
+    return true;
+}
+
+/// The key into the add field of the cabinet (the friends snapshot's typed key, FV_TYPED / FV_INVLEN), in place of what
+/// stood there, through the field's own filter (upper case, A-Z 0-9 and the dash); the length written.
+pub fn qc_fill_field(cl: []u8, key: []const u8) -> usize {
+    var m : usize = 0;
+    var i : usize = 0;
+    while (i < key.len and m < INVITE_LEN) {
+        const c : u32 = fv_inv_char(@as(u32, key[i]));
+        if (c != 0) {
+            cl[FV_TYPED + m] = @as(u8, @intCast(c));
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    cl[FV_INVLEN] = @as(u8, @intCast(m));
+    return m;
+}
+
+/// The message on the note line once the preview is closed: shown for QC_MSG_MS, then the cabinet's own note again.
+pub fn qc_msg_shown(q: []const u8, now: u64) -> bool {
+    if (qc_open(q)) { return false; }
+    const w : u32 = qc_why(q);
+    if (w == QC_W_NONE or w == QC_W_POINT) { return false; }
+    const at : u64 = qc_get64(q, QC_MSG_AT);
+    if (now < at) { return true; }
+    return now - at < QC_MSG_MS;
+}
+
+/// Any other click in the cabinet takes the message away.
+pub fn qc_msg_clear(q: []u8) -> void {
+    if (!qc_open(q)) { q[QC_WHY] = @as(u8, @intCast(QC_W_NONE)); }
+}
+
+pub fn qc_text(why: u32) -> str {
+    if (why == QC_W_POINT) { return "point the camera at the code"; }
+    if (why == QC_W_FOUND) { return "key found - press ADD"; }
+    if (why == QC_W_NO_CODE) { return "no code found"; }
+    if (why == QC_W_DENIED) { return "camera not allowed: System Settings > Privacy & Security > Camera"; }
+    if (why == QC_W_NO_CAMERA) { return "camera unavailable"; }
+    if (why == QC_W_IN_CALL) { return "SCAN is off during a call"; }
+    if (why == QC_W_CANCELLED) { return "scan cancelled"; }
+    return "";
+}
+
+// ---------------------------------------------------------------- 3. the boxes (l = the panel's left, w = QP_W, t = its top, h = its height)
+
+/// SCAN: a chip at the right end of the line "ADD A FRIEND BY KEY", above PASTE and ADD.
+pub const QC_SCAN_W : f64 = 40.0;
+pub const QC_SCAN_H : f64 = 16.0;
+pub const QC_SCAN_FROM_BOTTOM : f64 = 102.0;
+/// The preview, centred, over the friends part; the line and CANCEL under it; the shade behind all three.
+pub const QC_PREV_W : f64 = 180.0;
+pub const QC_PREV_H : f64 = 135.0;
+pub const QC_PREV_FROM_BOTTOM : f64 = 288.0;
+pub const QC_LINE_FROM_BOTTOM : f64 = 132.0;
+pub const QC_CANCEL_W : f64 = 60.0;
+pub const QC_CANCEL_H : f64 = 18.0;
+pub const QC_CANCEL_FROM_BOTTOM : f64 = 145.0;
+pub const QC_SHADE_FROM_BOTTOM : f64 = 298.0;
+pub const QC_SHADE_TO_BOTTOM : f64 = 106.0;
+
+pub const QC_H_NONE : u32 = 0;
+pub const QC_H_SCAN : u32 = 230;
+pub const QC_H_CANCEL : u32 = 231;
+/// Inside the shade while the preview is open: no button, and nothing under it answers.
+pub const QC_H_SHADE : u32 = 232;
+
+pub fn qc_is_hit(hit: u32) -> bool { return hit >= QC_H_SCAN and hit <= QC_H_SHADE; }
+
+pub fn qc_scan_x(l: f64, w: f64) -> f64 { return l + w - QP_PAD - QC_SCAN_W; }
+pub fn qc_scan_y(t: f64, h: f64) -> f64 { return t + h - QC_SCAN_FROM_BOTTOM; }
+pub fn qc_prev_x(l: f64, w: f64) -> f64 { return l + (w - QC_PREV_W) / 2.0; }
+pub fn qc_prev_y(t: f64, h: f64) -> f64 { return t + h - QC_PREV_FROM_BOTTOM; }
+pub fn qc_line_y(t: f64, h: f64) -> f64 { return t + h - QC_LINE_FROM_BOTTOM; }
+pub fn qc_cancel_x(l: f64, w: f64) -> f64 { return l + w - QP_PAD - QC_CANCEL_W; }
+pub fn qc_cancel_y(t: f64, h: f64) -> f64 { return t + h - QC_CANCEL_FROM_BOTTOM; }
+pub fn qc_shade_y(t: f64, h: f64) -> f64 { return t + h - QC_SHADE_FROM_BOTTOM; }
+pub fn qc_shade_h() -> f64 { return QC_SHADE_FROM_BOTTOM - QC_SHADE_TO_BOTTOM; }
+
+fn qc_in(x: f64, y: f64, bx: f64, by: f64, bw: f64, bh: f64) -> bool {
+    return x >= bx and x < bx + bw and y >= by and y < by + bh;
+}
+
+/// What a point means with the scan part over the cabinet's own hit `under`: while the preview is open CANCEL, then
+/// the shade (swallowed), then SCAN (swallowed too: a scan runs); while it is closed SCAN, else `under`. SCAN answers
+/// even when it is off, so a click on it can say why.
+pub fn qc_hit(x: f64, y: f64, l: f64, w: f64, t: f64, h: f64, open: bool, under: u32) -> u32 {
+    if (open) {
+        if (qc_in(x, y, qc_cancel_x(l, w), qc_cancel_y(t, h), QC_CANCEL_W, QC_CANCEL_H)) { return QC_H_CANCEL; }
+        if (qc_in(x, y, l, qc_shade_y(t, h), w, qc_shade_h())) { return QC_H_SHADE; }
+        if (qc_in(x, y, qc_scan_x(l, w), qc_scan_y(t, h), QC_SCAN_W, QC_SCAN_H)) { return QC_H_SHADE; }
+        return under;
+    }
+    if (qc_in(x, y, qc_scan_x(l, w), qc_scan_y(t, h), QC_SCAN_W, QC_SCAN_H)) { return QC_H_SCAN; }
+    return under;
+}
+
+// ---------------------------------------------------------------- tests
+
+test idle_scan_preview_found_then_closed_after_one_and_a_half_seconds {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    assert qc_state(q[0..64]) == QC_IDLE and !qc_open(q[0..64]);
+    assert qc_press(q[0..64], 1000, false);
+    assert qc_state(q[0..64]) == QC_PREVIEW and qc_open(q[0..64]) and qc_why(q[0..64]) == QC_W_POINT;
+    // the first pass takes a frame at once; a frame with no code keeps the preview
+    assert qc_tick(q[0..64], 1000, false, false, 0) == QC_A_TAKE;
+    assert !qc_frame(q[0..64], 1000, 2);
+    assert qc_state(q[0..64]) == QC_PREVIEW and qc_frames(q[0..64]) == 1;
+    assert qc_tick(q[0..64], 1100, false, false, 0) == QC_A_TAKE;
+    assert qc_frame(q[0..64], 1100, 0);
+    assert qc_state(q[0..64]) == QC_FOUND and qc_why(q[0..64]) == QC_W_FOUND and qc_found_ms(q[0..64]) == 100;
+    assert qc_frames(q[0..64]) == 2;
+    // FOUND takes no frame, keeps the preview 1.5 s, then IDLE with the message on the note line
+    assert qc_tick(q[0..64], 2599, false, false, 0) == 0 and qc_state(q[0..64]) == QC_FOUND;
+    assert qc_tick(q[0..64], 2600, false, false, 0) == 0 and qc_state(q[0..64]) == QC_IDLE;
+    assert qc_msg_shown(q[0..64], 2600);
+    assert qc_eq(qc_text(QC_W_FOUND), "key found - press ADD");
+}
+
+test twenty_seconds_without_a_key_stop_the_camera_with_no_code_found {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    assert QC_TIMEOUT_MS == 20000;
+    assert qc_press(q[0..64], 5000, false);
+    assert !qc_timed_out(5000, 24999) and qc_timed_out(5000, 25000);
+    assert qc_tick(q[0..64], 24999, false, false, 0) == QC_A_TAKE;
+    assert qc_tick(q[0..64], 25000, false, false, 0) == QC_A_STOP;
+    assert qc_state(q[0..64]) == QC_FAILED and qc_why(q[0..64]) == QC_W_NO_CODE and !qc_open(q[0..64]);
+    assert qc_eq(qc_text(qc_why(q[0..64])), "no code found") and qc_msg_shown(q[0..64], 25000);
+    assert !qc_msg_shown(q[0..64], 25000 + QC_MSG_MS);
+    // nothing more is asked of a closed scan; SCAN again starts a new one
+    assert qc_tick(q[0..64], 30000, false, false, 0) == 0;
+    assert qc_press(q[0..64], 40000, false) and qc_state(q[0..64]) == QC_PREVIEW and qc_frames(q[0..64]) == 0;
+}
+
+test frames_reach_the_reader_at_most_ten_times_a_second {
+    assert QC_PERIOD_MS == 100;
+    assert qc_frame_due(0, 7);
+    assert !qc_frame_due(1000, 1099) and qc_frame_due(1000, 1100);
+    assert !qc_frame_due(1000, 999);
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], true, false);
+    assert qc_press(q[0..64], 1, false);
+    // one pass every 5 ms for 2 s, each due frame read: at most 21 frames (one at 1 ms, then one per 100 ms)
+    var now : u64 = 1;
+    var taken : u64 = 0;
+    while (now <= 2001) {
+        if ((qc_tick(q[0..64], now, false, false, 0) & QC_A_TAKE) != 0) {
+            qc_frame(q[0..64], now, 2);
+            taken = taken + 1;
+        }
+        now = now + 5;
+    }
+    assert taken == 21 and qc_frames(q[0..64]) == 21;
+}
+
+test the_found_key_fills_the_add_field_in_place_of_what_stood_there {
+    var cl : [1024]u8 = undefined;
+    var i : usize = 0;
+    while (i < 1024) {
+        cl[i] = 0;
+        i = i + 1;
+    }
+    cl[FV_TYPED] = 88;
+    cl[FV_INVLEN] = 1;
+    const key : []const u8 = "T27-ab12-CD34-EF56-GH78-K";
+    assert qc_fill_field(cl[0..1024], key) == 25;
+    assert cl[FV_INVLEN] == 25 and INVITE_LEN == 25;
+    assert cl[FV_TYPED] == 84 and cl[FV_TYPED + 3] == 45 and cl[FV_TYPED + 4] == 65 and cl[FV_TYPED + 24] == 75;
+    // a longer text stops at the key's length
+    assert qc_fill_field(cl[0..1024], "T27-ABCD-ABCD-ABCD-ABCD-AXXXX") == 25;
+}
+
+test scan_is_off_during_a_call_and_a_call_stops_a_running_scan {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    assert !qc_may_start(q[0..64], true);
+    assert !qc_press(q[0..64], 10, true);
+    assert qc_state(q[0..64]) == QC_IDLE and qc_why(q[0..64]) == QC_W_IN_CALL;
+    assert qc_eq(qc_text(QC_W_IN_CALL), "SCAN is off during a call");
+    // file frames do not open a way around it
+    qc_boot(q[0..64], true, false);
+    assert !qc_press(q[0..64], 10, true);
+    // a call that comes while scanning stops the camera and closes the preview
+    assert qc_press(q[0..64], 20, false);
+    assert qc_tick(q[0..64], 30, true, false, 0) == QC_A_STOP;
+    assert qc_state(q[0..64]) == QC_IDLE and !qc_open(q[0..64]) and qc_why(q[0..64]) == QC_W_IN_CALL;
+}
+
+test a_refused_or_missing_camera_says_so_and_turns_scan_off {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    assert qc_cam_of_auth(0) == QC_CAM_OK and qc_cam_of_auth(3) == QC_CAM_OK;
+    assert qc_cam_of_auth(1) == QC_CAM_RESTRICTED and qc_cam_of_auth(2) == QC_CAM_DENIED;
+    q[QC_CAM] = @as(u8, @intCast(QC_CAM_DENIED));
+    assert !qc_may_start(q[0..64], false) and qc_off_why(q[0..64], false) == QC_W_DENIED;
+    assert !qc_press(q[0..64], 5, false) and qc_why(q[0..64]) == QC_W_DENIED;
+    // a camera that fails while scanning: denied by the setup, or no camera
+    qc_boot(q[0..64], false, false);
+    assert qc_press(q[0..64], 5, false);
+    assert qc_tick(q[0..64], 9, false, true, 3) == QC_A_STOP;
+    assert qc_state(q[0..64]) == QC_FAILED and qc_why(q[0..64]) == QC_W_NO_CAMERA;
+    assert !qc_may_start(q[0..64], false) and qc_eq(qc_text(QC_W_NO_CAMERA), "camera unavailable");
+    qc_boot(q[0..64], false, false);
+    assert qc_press(q[0..64], 5, false);
+    assert qc_tick(q[0..64], 9, false, true, 2) == QC_A_STOP and qc_why(q[0..64]) == QC_W_DENIED;
+    // no frame in 3 s (the camera busy elsewhere): this scan ends, SCAN stays on for another try
+    qc_boot(q[0..64], false, false);
+    assert qc_press(q[0..64], 5, false);
+    assert qc_tick(q[0..64], 3005, false, true, 0) == QC_A_STOP and qc_why(q[0..64]) == QC_W_NO_CAMERA;
+    assert qc_may_start(q[0..64], false);
+}
+
+test cancel_closes_the_preview_and_stops_only_a_running_camera {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    assert !qc_cancel(q[0..64], 1);
+    assert qc_press(q[0..64], 1, false);
+    assert qc_cancel(q[0..64], 2) and qc_state(q[0..64]) == QC_IDLE and qc_why(q[0..64]) == QC_W_CANCELLED;
+    // after the key the camera is already stopped: CANCEL only closes the preview, the found message stays
+    assert qc_press(q[0..64], 3, false);
+    assert qc_frame(q[0..64], 4, 0);
+    assert !qc_cancel(q[0..64], 5) and qc_state(q[0..64]) == QC_IDLE and qc_why(q[0..64]) == QC_W_FOUND;
+    // a second SCAN while one runs starts nothing
+    assert qc_press(q[0..64], 6, false);
+    assert !qc_press(q[0..64], 7, false) and qc_state(q[0..64]) == QC_PREVIEW and qc_why(q[0..64]) == QC_W_POINT;
+}
+
+test the_preview_line_cancel_and_scan_fit_the_300_pt_panel {
+    const l : f64 = 0.0;
+    const w : f64 = 300.0;
+    const t : f64 = 0.0;
+    const h : f64 = 600.0;
+    // SCAN ends at the right text edge, right of the label "ADD A FRIEND BY KEY" (19 symbols at 9.5 pt)
+    assert qc_scan_x(l, w) + QC_SCAN_W == w - QP_PAD;
+    assert qc_scan_x(l, w) > QP_PAD + 19.0 * 0.62 * 9.5 + 8.0;
+    // SCAN stands above the field line (h - 82) and below the friends rows' end (h - 104)
+    assert qc_scan_y(t, h) >= t + h - 104.0 and qc_scan_y(t, h) + QC_SCAN_H <= t + h - 82.0;
+    // the preview is 180 x 135 (4:3, the frame's shape), centred, inside the shade, with CANCEL under it
+    assert QC_PREV_W == 180.0 and QC_PREV_H == 135.0 and QC_PREV_W * 3.0 == QC_PREV_H * 4.0;
+    assert qc_prev_x(l, w) - l == l + w - (qc_prev_x(l, w) + QC_PREV_W);
+    assert qc_prev_y(t, h) >= qc_shade_y(t, h) + 4.0;
+    assert qc_prev_y(t, h) + QC_PREV_H < qc_cancel_y(t, h);
+    assert qc_cancel_y(t, h) + QC_CANCEL_H <= qc_shade_y(t, h) + qc_shade_h() - 4.0;
+    assert qc_shade_y(t, h) + qc_shade_h() <= qc_scan_y(t, h);
+    // the line sits on CANCEL's row, its text ("point the camera at the code", 28 symbols) left of CANCEL
+    assert qc_line_y(t, h) > qc_cancel_y(t, h) and qc_line_y(t, h) < qc_cancel_y(t, h) + QC_CANCEL_H;
+    assert QP_PAD + 28.0 * 0.62 * 9.5 < qc_cancel_x(l, w) - 8.0;
+    assert qc_cancel_x(l, w) + QC_CANCEL_W == w - QP_PAD;
+    // in a panel of 600 pt the shade starts below the friends label (310)
+    assert qc_shade_y(t, h) >= t + 300.0;
+}
+
+test scan_and_cancel_answer_their_boxes_and_the_shade_swallows_the_rest {
+    const l : f64 = 700.0;
+    const w : f64 = 300.0;
+    const t : f64 = 40.0;
+    const h : f64 = 620.0;
+    const sx : f64 = qc_scan_x(l, w) + 4.0;
+    const sy : f64 = qc_scan_y(t, h) + 4.0;
+    // closed: SCAN, else what stood under it
+    assert qc_hit(sx, sy, l, w, t, h, false, 10) == QC_H_SCAN;
+    assert qc_hit(qc_scan_x(l, w) - 1.0, sy, l, w, t, h, false, 10) == 10;
+    assert qc_hit(qc_prev_x(l, w) + 10.0, qc_prev_y(t, h) + 10.0, l, w, t, h, false, 16) == 16;
+    // open: CANCEL, the shade swallows the rows under it, SCAN does nothing, the add part still answers
+    assert qc_hit(qc_cancel_x(l, w) + 2.0, qc_cancel_y(t, h) + 2.0, l, w, t, h, true, 16) == QC_H_CANCEL;
+    assert qc_hit(qc_prev_x(l, w) + 10.0, qc_prev_y(t, h) + 10.0, l, w, t, h, true, 16) == QC_H_SHADE;
+    assert qc_hit(sx, sy, l, w, t, h, true, 10) == QC_H_SHADE;
+    assert qc_hit(l + 20.0, t + h - 70.0, l, w, t, h, true, 8) == 8;
+    assert qc_hit(l + 20.0, t + 50.0, l, w, t, h, true, 1) == 1;
+    assert qc_is_hit(QC_H_SCAN) and qc_is_hit(QC_H_CANCEL) and qc_is_hit(QC_H_SHADE) and !qc_is_hit(216) and !qc_is_hit(144);
+}
+
+fn qc_eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test qc_u64_and_qc_set_u64_keep_eight_little_endian_bytes_and_leave_the_neighbours {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    qc_set_u64(q[0..64], QC_IMG, 72623859790382856);
+    assert q[QC_IMG] == 8 and q[QC_IMG + 1] == 7 and q[QC_IMG + 7] == 1;
+    assert qc_u64(q[0..64], QC_IMG) == 72623859790382856;
+    // the fields on both sides are not touched
+    assert q[QC_IMG - 1] == 0 and qc_found_ms(q[0..64]) == 0 and qc_u64(q[0..64], QC_MSG_AT) == 0;
+    qc_set_u64(q[0..64], QC_IMG, 18446744073709551615);
+    assert qc_u64(q[0..64], QC_IMG) == 18446744073709551615 and qc_u64(q[0..64], QC_MSG_AT) == 0;
+    qc_set_u64(q[0..64], QC_IMG, 0);
+    assert qc_u64(q[0..64], QC_IMG) == 0;
+    // the last field of the block reads back too
+    qc_set_u64(q[0..64], QC_MISS, 3);
+    assert qc_u64(q[0..64], QC_MISS) == 3 and q[QC_CAP - 1] == 0;
+    // they read what the state machine wrote: the time of the key and of the message
+    qc_boot(q[0..64], false, false);
+    assert qc_press(q[0..64], 1000, false);
+    assert qc_tick(q[0..64], 1000, false, false, 0) == QC_A_TAKE;
+    assert qc_frame(q[0..64], 1250, 0);
+    assert qc_u64(q[0..64], QC_FOUND_AT) == 1250 and qc_u64(q[0..64], QC_T0) == 1000;
+}
+
+test qc_close_due_waits_one_and_a_half_seconds_and_a_clock_that_went_back_waits {
+    assert QC_CLOSE_MS == 1500;
+    assert !qc_close_due(1000, 1000) and !qc_close_due(1000, 2499) and qc_close_due(1000, 2500);
+    assert qc_close_due(1000, 18446744073709551615);
+    assert !qc_close_due(1000, 999) and !qc_close_due(18446744073709551615, 0);
+    assert !qc_close_due(18446744073709551615, 18446744073709551615);
+    assert qc_close_due(0, 1500) and !qc_close_due(0, 1499);
+}
+
+test qc_msg_clear_takes_the_note_away_only_when_the_preview_is_closed {
+    var q : [64]u8 = undefined;
+    qc_boot(q[0..64], false, false);
+    // a closed scan with its reason on the note line: the next click clears it, the state stays
+    assert qc_press(q[0..64], 5000, false);
+    assert qc_tick(q[0..64], 25000, false, false, 0) == QC_A_STOP;
+    assert qc_why(q[0..64]) == QC_W_NO_CODE;
+    qc_msg_clear(q[0..64]);
+    assert qc_why(q[0..64]) == QC_W_NONE and qc_state(q[0..64]) == QC_FAILED;
+    assert qc_eq(qc_text(qc_why(q[0..64])), "");
+    // an open preview keeps its line ("point the camera", then "key found")
+    assert qc_press(q[0..64], 30000, false);
+    qc_msg_clear(q[0..64]);
+    assert qc_why(q[0..64]) == QC_W_POINT and qc_state(q[0..64]) == QC_PREVIEW;
+    assert qc_tick(q[0..64], 30000, false, false, 0) == QC_A_TAKE;
+    assert qc_frame(q[0..64], 30000, 0);
+    qc_msg_clear(q[0..64]);
+    assert qc_why(q[0..64]) == QC_W_FOUND and qc_state(q[0..64]) == QC_FOUND;
+    // SCAN refused during a call: the reason goes with the next click
+    qc_boot(q[0..64], false, false);
+    assert !qc_press(q[0..64], 10, true);
+    assert qc_why(q[0..64]) == QC_W_IN_CALL;
+    qc_msg_clear(q[0..64]);
+    assert qc_why(q[0..64]) == QC_W_NONE and qc_state(q[0..64]) == QC_IDLE;
+    qc_msg_clear(q[0..64]);
+    assert qc_why(q[0..64]) == QC_W_NONE;
+}

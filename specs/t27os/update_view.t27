@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/update_view.t27 -- the UPDATE part of the ACCOUNT panel: what it shows and what its one button means.
+// Pure decisions only: no @extern, no socket, no clock (Refs gHashTag/t27#11560). Owner, 2026-10-22: a friend nearby
+// runs a newer build, the panel says so with the friend's nickname, one click takes it (progress in percent and bytes,
+// CANCEL), the new copy is installed next to the running one and RESTART starts it; a failure names its reason.
+//
+// The work runs in helper processes of the app's own executable (update_agent.t27): one SERVES this device's bundle to
+// friends on a TCP port announced as "up=" in the mDNS TXT record, one TAKES an offered update (update_host.uh_update)
+// and writes its phase into a status record (update_core UW_*). The window only reads that record and the size of the
+// part file, so a slow friend never stops a frame. The state below lives in the CALL region of the text store, after the
+// friends engine (FE_END), and the bytes the panel draws are folded into the frame key (UPV_KEY_N).
+// Flat namespace (the window build splices imported modules): every name here starts with upv_ / UPV_.
+module T27osUpdateView;
+
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::update_core::fr_text;
+use t27os::update_core::um_pack;
+use t27os::update_core::uw_percent;
+use t27os::update_core::FR_NONE;
+use t27os::update_core::FR_OFFER;
+use t27os::update_core::FR_NET;
+use t27os::update_core::OF_BAD;
+use t27os::update_core::OF_FP;
+use t27os::update_core::OF_STRANGER;
+use t27os::update_core::OF_ROLLBACK;
+use t27os::update_core::OF_OLDVER;
+use t27os::update_core::OF_SIZE;
+use t27os::update_core::UW_P_MANIFEST;
+use t27os::update_core::UW_P_FETCH;
+use t27os::update_core::UW_P_INSTALL;
+use t27os::update_core::UW_P_DONE;
+use t27os::update_core::UW_P_FAILED;
+
+// ---------------------------------------------------------------- 1. the state (offsets in the CALL region)
+
+pub const UPV_BASE : usize = 7952;
+pub const UPV_ST : usize = 7952;
+pub const UPV_WHY : usize = 7953;
+pub const UPV_OFFER : usize = 7954;
+pub const UPV_FETCH : usize = 7955;
+pub const UPV_SRV : usize = 7956;
+pub const UPV_NICKLEN : usize = 7957;
+pub const UPV_AUTO : usize = 7958;
+pub const UPV_TXTUP : usize = 7959;
+pub const UPV_NICK : usize = 7960;
+pub const UPV_OBUILD : usize = 7984;
+pub const UPV_OMAJ : usize = 7988;
+pub const UPV_OMIN : usize = 7989;
+pub const UPV_OPAT : usize = 7990;
+pub const UPV_OIP : usize = 7992;
+pub const UPV_OPORT : usize = 7996;
+pub const UPV_TOTAL : usize = 8000;
+pub const UPV_HAVE : usize = 8008;
+pub const UPV_SPORT : usize = 8016;
+pub const UPV_SERVED : usize = 8020;
+pub const UPV_NEWBUILD : usize = 8024;
+pub const UPV_SBUILD : usize = 8028;
+/// The bytes up to here are drawn and folded into the frame key; the rest is the window's bookkeeping.
+pub const UPV_KEY_END : usize = 8032;
+pub const UPV_FPID : usize = 8032;
+pub const UPV_SPID : usize = 8036;
+pub const UPV_LFD : usize = 8040;
+pub const UPV_MYMAJ : usize = 8044;
+pub const UPV_MYMIN : usize = 8045;
+pub const UPV_MYPAT : usize = 8046;
+pub const UPV_MYVEROK : usize = 8047;
+pub const UPV_MYBUILD : usize = 8048;
+pub const UPV_LOGPCT : usize = 8052;
+pub const UPV_POLL : usize = 8056;
+pub const UPV_SHA : usize = 8064;
+pub const UPV_END : usize = 8096;
+
+/// What the part shows.
+pub const UPV_S_NONE : u32 = 0;
+pub const UPV_S_OFFER : u32 = 1;
+pub const UPV_S_FETCH : u32 = 2;
+pub const UPV_S_INSTALL : u32 = 3;
+pub const UPV_S_DONE : u32 = 4;
+pub const UPV_S_FAILED : u32 = 5;
+pub const UPV_S_CANCELLED : u32 = 6;
+
+/// This device's server: not started (no bundle, no identity, no port), serving, stopped or failed.
+pub const UPV_SRV_OFF : u32 = 0;
+pub const UPV_SRV_ON : u32 = 1;
+pub const UPV_SRV_FAIL : u32 = 2;
+
+/// The one button of the part.
+pub const UPV_B_NONE : u32 = 0;
+pub const UPV_B_UPDATE : u32 = 1;
+pub const UPV_B_CANCEL : u32 = 2;
+pub const UPV_B_RESTART : u32 = 3;
+
+pub fn upv_get32(cl: []const u8, at: usize) -> u64 {
+    return @as(u64, cl[at]) | (@as(u64, cl[at + 1]) << 8) | (@as(u64, cl[at + 2]) << 16) | (@as(u64, cl[at + 3]) << 24);
+}
+
+pub fn upv_put32(cl: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    if (x > 4294967295) { x = 4294967295; }
+    cl[at] = @as(u8, @intCast(x & 255));
+    cl[at + 1] = @as(u8, @intCast((x >> 8) & 255));
+    cl[at + 2] = @as(u8, @intCast((x >> 16) & 255));
+    cl[at + 3] = @as(u8, @intCast((x >> 24) & 255));
+}
+
+pub fn upv_get64(cl: []const u8, at: usize) -> u64 { return upv_get32(cl, at) | (upv_get32(cl, at + 4) << 32); }
+
+pub fn upv_put64(cl: []u8, at: usize, v: u64) -> void {
+    upv_put32(cl, at, v & 4294967295);
+    upv_put32(cl, at + 4, v >> 32);
+}
+
+/// The packed version of the offer.
+pub fn upv_offer_ver(cl: []const u8) -> u64 { return um_pack(@as(u32, cl[UPV_OMAJ]), @as(u32, cl[UPV_OMIN]), @as(u32, cl[UPV_OPAT])); }
+
+/// Is there an offer the panel can take (a friend's newer build with a port)?
+pub fn upv_has_offer(cl: []const u8) -> bool { return upv_get32(cl, UPV_OBUILD) != 0 and upv_get32(cl, UPV_OPORT) != 0; }
+
+// ---------------------------------------------------------------- 2. the state the helper's record says
+
+/// The panel's state for a phase of the take helper while it runs (MANIFEST and FETCH both read "downloading").
+pub fn upv_of_phase(phase: u32) -> u32 {
+    if (phase == UW_P_MANIFEST or phase == UW_P_FETCH) { return UPV_S_FETCH; }
+    if (phase == UW_P_INSTALL) { return UPV_S_INSTALL; }
+    if (phase == UW_P_DONE) { return UPV_S_DONE; }
+    if (phase == UW_P_FAILED) { return UPV_S_FAILED; }
+    return UPV_S_FETCH;
+}
+
+/// The state once the helper has ended: its last record decides; a helper that left no record (or a record still in a
+/// running phase) failed on the way (FR_NET is the reason the panel can give: nothing was installed).
+pub fn upv_of_end(have_rec: bool, phase: u32) -> u32 {
+    if (have_rec and phase == UW_P_DONE) { return UPV_S_DONE; }
+    return UPV_S_FAILED;
+}
+
+/// Does a new offer replace what the part shows? Only while nothing runs and nothing waits for a restart.
+pub fn upv_takes_offer(st: u32) -> bool {
+    return st == UPV_S_NONE or st == UPV_S_OFFER or st == UPV_S_FAILED or st == UPV_S_CANCELLED;
+}
+
+/// The button for a state: UPDATE for an offer (and again after a failure or a cancel, while the offer stands), CANCEL
+/// while downloading, nothing while installing (the swap is not cut halfway), RESTART once installed.
+pub fn upv_button(st: u32, offer: bool) -> u32 {
+    if (st == UPV_S_FETCH) { return UPV_B_CANCEL; }
+    if (st == UPV_S_INSTALL) { return UPV_B_NONE; }
+    if (st == UPV_S_DONE) { return UPV_B_RESTART; }
+    if (offer and (st == UPV_S_OFFER or st == UPV_S_FAILED or st == UPV_S_CANCELLED)) { return UPV_B_UPDATE; }
+    return UPV_B_NONE;
+}
+
+pub fn upv_button_word(b: u32) -> str {
+    if (b == UPV_B_UPDATE) { return "UPDATE"; }
+    if (b == UPV_B_CANCEL) { return "CANCEL"; }
+    if (b == UPV_B_RESTART) { return "RESTART"; }
+    return "";
+}
+
+// ---------------------------------------------------------------- 3. text
+
+fn upv_ver(out: []u8, at: usize, a: u32, b: u32, c: u32) -> usize {
+    var n : usize = put_dec(out, at, @as(u64, a));
+    n = put_bytes(out, n, ".");
+    n = put_dec(out, n, @as(u64, b));
+    n = put_bytes(out, n, ".");
+    return put_dec(out, n, @as(u64, c));
+}
+
+/// "available 0.1.3 (build 7068) from t27os"
+pub fn upv_offer_line(cl: []const u8, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "available ");
+    n = upv_ver(out, n, @as(u32, cl[UPV_OMAJ]), @as(u32, cl[UPV_OMIN]), @as(u32, cl[UPV_OPAT]));
+    n = put_bytes(out, n, " (build ");
+    n = put_dec(out, n, upv_get32(cl, UPV_OBUILD));
+    n = put_bytes(out, n, ") from ");
+    const nl : usize = @as(usize, cl[UPV_NICKLEN]);
+    if (nl == 0) { return put_bytes(out, n, "a friend"); }
+    var i : usize = 0;
+    while (i < nl and i < 24) {
+        out[n + i] = cl[UPV_NICK + i];
+        i = i + 1;
+    }
+    return n + i;
+}
+
+/// "42%  600000 of 1397067 bytes" (percent and bytes of the download; "connecting" before the size is known).
+pub fn upv_progress_line(have: u64, total: u64, out: []u8) -> usize {
+    if (total == 0) { return put_bytes(out, 0, "connecting, reading the manifest"); }
+    var n : usize = put_dec(out, 0, @as(u64, uw_percent(have, total)));
+    n = put_bytes(out, n, "%  ");
+    n = put_dec(out, n, have);
+    n = put_bytes(out, n, " of ");
+    n = put_dec(out, n, total);
+    return put_bytes(out, n, " bytes");
+}
+
+/// Why an offer was refused before any bundle byte (update_core OF_*, 10 = the signature is not true).
+pub fn upv_offer_why(code: u32) -> str {
+    if (code == OF_BAD) { return "the manifest does not parse"; }
+    if (code == OF_FP) { return "the key does not match its fingerprint"; }
+    if (code == OF_STRANGER) { return "the author is not a friend"; }
+    if (code == OF_ROLLBACK) { return "the build is not newer"; }
+    if (code == OF_OLDVER) { return "the version is older"; }
+    if (code == OF_SIZE) { return "the size is out of range"; }
+    if (code == 10) { return "the signature is not true"; }
+    return "";
+}
+
+/// The first line of the part for its state.
+pub fn upv_line1(cl: []const u8, out: []u8) -> usize {
+    const st : u32 = @as(u32, cl[UPV_ST]);
+    if (st == UPV_S_FETCH) {
+        var n : usize = put_bytes(out, 0, "downloading build ");
+        n = put_dec(out, n, upv_get32(cl, UPV_OBUILD));
+        n = put_bytes(out, n, " from ");
+        const nl : usize = @as(usize, cl[UPV_NICKLEN]);
+        var i : usize = 0;
+        while (i < nl and i < 24) {
+            out[n + i] = cl[UPV_NICK + i];
+            i = i + 1;
+        }
+        return n + i;
+    }
+    if (st == UPV_S_INSTALL) {
+        const n : usize = put_bytes(out, 0, "installing build ");
+        return put_dec(out, n, upv_get32(cl, UPV_OBUILD));
+    }
+    if (st == UPV_S_DONE) {
+        var n : usize = put_bytes(out, 0, "installed build ");
+        n = put_dec(out, n, upv_get32(cl, UPV_NEWBUILD));
+        return put_bytes(out, n, ", restart to use it");
+    }
+    if (st == UPV_S_FAILED) { return put_bytes(out, 0, "update failed"); }
+    if (st == UPV_S_CANCELLED) { return put_bytes(out, 0, "cancelled, the part is kept for resume"); }
+    if (upv_has_offer(cl)) { return upv_offer_line(cl, out); }
+    return put_bytes(out, 0, "update: no newer build nearby");
+}
+
+/// The footer's update item for this state (the window's footer upper-cases it): "update available" while a friend's
+/// offer stands (again after a failure or a cancel), "updating 42%" while it downloads or installs ("updating" before the
+/// size is known), "restart to update" once installed; 0 bytes when the part has nothing to say, and the footer keeps its
+/// own text (statusbar.upd_text, "up to date").
+pub fn upv_bar_text(st: u32, offer: bool, have: u64, total: u64, out: []u8) -> usize {
+    if (st == UPV_S_DONE) { return put_bytes(out, 0, "restart to update"); }
+    if (st == UPV_S_FETCH or st == UPV_S_INSTALL) {
+        var n : usize = put_bytes(out, 0, "updating");
+        if (total == 0) { return n; }
+        n = put_bytes(out, n, " ");
+        n = put_dec(out, n, @as(u64, uw_percent(have, total)));
+        return put_bytes(out, n, "%");
+    }
+    if (offer and upv_takes_offer(st)) { return put_bytes(out, 0, "update available"); }
+    return 0;
+}
+
+/// The second line: the progress while downloading, the reason after a failure, else what this device serves.
+pub fn upv_line2(cl: []const u8, out: []u8) -> usize {
+    const st : u32 = @as(u32, cl[UPV_ST]);
+    if (st == UPV_S_FETCH or st == UPV_S_INSTALL) { return upv_progress_line(upv_get64(cl, UPV_HAVE), upv_get64(cl, UPV_TOTAL), out); }
+    if (st == UPV_S_FAILED) {
+        const why : u32 = @as(u32, cl[UPV_WHY]);
+        if (why == FR_OFFER) {
+            const w : str = upv_offer_why(@as(u32, cl[UPV_OFFER]));
+            if (w.len > 0) {
+                const n : usize = put_bytes(out, 0, "refused before download: ");
+                return put_bytes(out, n, w);
+            }
+        }
+        if (why == FR_NONE) { return fr_text(FR_NET, out); }
+        return fr_text(why, out);
+    }
+    const srv : u32 = @as(u32, cl[UPV_SRV]);
+    if (srv == UPV_SRV_ON) {
+        var n : usize = put_bytes(out, 0, "serving ");
+        n = put_dec(out, n, upv_get32(cl, UPV_SBUILD));
+        n = put_bytes(out, n, " on port ");
+        n = put_dec(out, n, upv_get32(cl, UPV_SPORT));
+        if (cl[UPV_TXTUP] == 0) { n = put_bytes(out, n, " (not announced)"); }
+        n = put_bytes(out, n, ", sent ");
+        return put_dec(out, n, upv_get32(cl, UPV_SERVED));
+    }
+    if (srv == UPV_SRV_FAIL) { return put_bytes(out, 0, "not serving: the server stopped"); }
+    return put_bytes(out, 0, "not serving");
+}
+
+// ---------------------------------------------------------------- tests
+
+fn upv_eq(o: []const u8, n: usize, want: []const u8) -> bool {
+    if (n != want.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (o[i] != want[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn upv_blank(cl: []u8) -> void {
+    var i : usize = 0;
+    while (i < cl.len) {
+        cl[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn upv_offer_fixture(cl: []u8) -> void {
+    cl[UPV_OMAJ] = 0;
+    cl[UPV_OMIN] = 1;
+    cl[UPV_OPAT] = 3;
+    upv_put32(cl, UPV_OBUILD, 7068);
+    upv_put32(cl, UPV_OPORT, 52144);
+    upv_put32(cl, UPV_OIP, 2130706433);
+    cl[UPV_NICK] = 116;
+    cl[UPV_NICK + 1] = 50;
+    cl[UPV_NICK + 2] = 55;
+    cl[UPV_NICK + 3] = 111;
+    cl[UPV_NICK + 4] = 115;
+    cl[UPV_NICKLEN] = 5;
+}
+
+test upv_the_state_sits_after_the_friends_engine_inside_the_call_region {
+    assert UPV_BASE == 7952 and UPV_END <= 8192;
+    assert UPV_ST == UPV_BASE and UPV_NICK + 24 <= UPV_OBUILD and UPV_OBUILD + 4 <= UPV_OMAJ;
+    assert UPV_OPAT < UPV_OIP and UPV_OIP + 4 <= UPV_OPORT and UPV_OPORT + 4 <= UPV_TOTAL and UPV_TOTAL + 8 <= UPV_HAVE;
+    assert UPV_HAVE + 8 <= UPV_SPORT and UPV_SBUILD + 4 <= UPV_KEY_END and UPV_KEY_END <= UPV_FPID;
+    assert UPV_MYBUILD + 4 <= UPV_LOGPCT and UPV_POLL + 8 <= UPV_SHA and UPV_SHA + 32 <= UPV_END;
+    // the fields are written and read back through the module's own words: each keeps its value, the next stays zero
+    var cl : [8192]u8 = undefined;
+    var i : usize = 0;
+    while (i < 8192) { cl[i] = 0; i = i + 1; }
+    assert upv_has_offer(cl[0..8192]) == false;
+    upv_put32(cl[0..8192], UPV_OBUILD, 7136);
+    upv_put32(cl[0..8192], UPV_OPORT, 47760);
+    upv_put64(cl[0..8192], UPV_TOTAL, 4294967301);
+    assert upv_get32(cl[0..8192], UPV_OBUILD) == 7136 and upv_get32(cl[0..8192], UPV_OPORT) == 47760;
+    assert upv_get64(cl[0..8192], UPV_TOTAL) == 4294967301 and upv_get64(cl[0..8192], UPV_HAVE) == 0;
+    assert upv_has_offer(cl[0..8192]);
+    upv_put64(cl[0..8192], UPV_SHA + 24, 18446744073709551615);
+    assert upv_get64(cl[0..8192], UPV_SHA + 24) == 18446744073709551615 and cl[UPV_END - 1] == 255;
+}
+
+test upv_the_offer_line_names_version_build_and_friend {
+    var cl : [8192]u8 = undefined;
+    upv_blank(cl[0..8192]);
+    var o : [128]u8 = undefined;
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "update: no newer build nearby");
+    assert upv_has_offer(cl[0..8192]) == false;
+    upv_offer_fixture(cl[0..8192]);
+    assert upv_has_offer(cl[0..8192]);
+    assert upv_offer_ver(cl[0..8192]) == um_pack(0, 1, 3);
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "available 0.1.3 (build 7068) from t27os");
+    cl[UPV_NICKLEN] = 0;
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "available 0.1.3 (build 7068) from a friend");
+}
+
+test upv_the_progress_reads_in_percent_and_bytes {
+    var o : [96]u8 = undefined;
+    assert upv_eq(o[0..96], upv_progress_line(0, 0, o[0..96]), "connecting, reading the manifest");
+    assert upv_eq(o[0..96], upv_progress_line(0, 1397067, o[0..96]), "0%  0 of 1397067 bytes");
+    assert upv_eq(o[0..96], upv_progress_line(655360, 1397067, o[0..96]), "46%  655360 of 1397067 bytes");
+    assert upv_eq(o[0..96], upv_progress_line(1397067, 1397067, o[0..96]), "100%  1397067 of 1397067 bytes");
+}
+
+test upv_each_state_has_its_lines_and_its_button {
+    var cl : [8192]u8 = undefined;
+    upv_blank(cl[0..8192]);
+    upv_offer_fixture(cl[0..8192]);
+    var o : [128]u8 = undefined;
+    cl[UPV_ST] = @as(u8, @intCast(UPV_S_FETCH));
+    upv_put64(cl[0..8192], UPV_TOTAL, 1000);
+    upv_put64(cl[0..8192], UPV_HAVE, 250);
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "downloading build 7068 from t27os");
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "25%  250 of 1000 bytes");
+    cl[UPV_ST] = @as(u8, @intCast(UPV_S_INSTALL));
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "installing build 7068");
+    cl[UPV_ST] = @as(u8, @intCast(UPV_S_DONE));
+    upv_put32(cl[0..8192], UPV_NEWBUILD, 7068);
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "installed build 7068, restart to use it");
+    cl[UPV_ST] = @as(u8, @intCast(UPV_S_CANCELLED));
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "cancelled, the part is kept for resume");
+    // buttons
+    assert upv_button(UPV_S_NONE, false) == UPV_B_NONE;
+    assert upv_button(UPV_S_OFFER, true) == UPV_B_UPDATE;
+    assert upv_button(UPV_S_FETCH, true) == UPV_B_CANCEL;
+    assert upv_button(UPV_S_INSTALL, true) == UPV_B_NONE;
+    assert upv_button(UPV_S_DONE, false) == UPV_B_RESTART;
+    assert upv_button(UPV_S_FAILED, true) == UPV_B_UPDATE;
+    assert upv_button(UPV_S_FAILED, false) == UPV_B_NONE;
+    assert upv_button(UPV_S_CANCELLED, true) == UPV_B_UPDATE;
+    assert upv_button_word(UPV_B_RESTART).len == 7 and upv_button_word(UPV_B_NONE).len == 0;
+}
+
+test upv_a_failure_names_its_reason_from_the_existing_codes {
+    var cl : [8192]u8 = undefined;
+    upv_blank(cl[0..8192]);
+    var o : [128]u8 = undefined;
+    cl[UPV_ST] = @as(u8, @intCast(UPV_S_FAILED));
+    cl[UPV_WHY] = 3;
+    assert upv_eq(o[0..128], upv_line1(cl[0..8192], o[0..128]), "update failed");
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "bundle hash does not match, nothing installed");
+    cl[UPV_WHY] = @as(u8, @intCast(FR_OFFER));
+    cl[UPV_OFFER] = @as(u8, @intCast(OF_STRANGER));
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "refused before download: the author is not a friend");
+    cl[UPV_OFFER] = 10;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "refused before download: the signature is not true");
+    cl[UPV_OFFER] = 0;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "update refused before download");
+    // a helper that left no reason: the transfer broke, nothing installed
+    cl[UPV_WHY] = 0;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "transfer broken, part kept for resume");
+    cl[UPV_WHY] = 7;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "new copy failed its check, previous copy restored");
+}
+
+test upv_the_serving_line_says_port_and_whether_it_is_announced {
+    var cl : [8192]u8 = undefined;
+    upv_blank(cl[0..8192]);
+    var o : [128]u8 = undefined;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "not serving");
+    cl[UPV_SRV] = @as(u8, @intCast(UPV_SRV_ON));
+    upv_put32(cl[0..8192], UPV_SBUILD, 7067);
+    upv_put32(cl[0..8192], UPV_SPORT, 52144);
+    upv_put32(cl[0..8192], UPV_SERVED, 2);
+    cl[UPV_TXTUP] = 1;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "serving 7067 on port 52144, sent 2");
+    cl[UPV_TXTUP] = 0;
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "serving 7067 on port 52144 (not announced), sent 2");
+    cl[UPV_SRV] = @as(u8, @intCast(UPV_SRV_FAIL));
+    assert upv_eq(o[0..128], upv_line2(cl[0..8192], o[0..128]), "not serving: the server stopped");
+}
+
+test upv_the_footer_says_available_updating_restart_or_leaves_its_own_text {
+    var o : [64]u8 = undefined;
+    // nothing nearby: 0 bytes, the footer keeps "up to date"
+    assert upv_bar_text(UPV_S_NONE, false, 0, 0, o[0..64]) == 0;
+    assert upv_bar_text(UPV_S_FAILED, false, 0, 0, o[0..64]) == 0;
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_NONE, true, 0, 0, o[0..64]), "update available");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_OFFER, true, 0, 0, o[0..64]), "update available");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_FAILED, true, 0, 0, o[0..64]), "update available");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_CANCELLED, true, 0, 0, o[0..64]), "update available");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_FETCH, true, 0, 0, o[0..64]), "updating");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_FETCH, true, 655360, 1397067, o[0..64]), "updating 46%");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_INSTALL, true, 1397067, 1397067, o[0..64]), "updating 100%");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_DONE, false, 0, 0, o[0..64]), "restart to update");
+    assert upv_eq(o[0..64], upv_bar_text(UPV_S_DONE, true, 1, 1, o[0..64]), "restart to update");
+}
+
+test upv_the_helper_phases_map_to_the_panel_and_an_offer_waits_while_busy {
+    assert upv_of_phase(UW_P_MANIFEST) == UPV_S_FETCH and upv_of_phase(UW_P_FETCH) == UPV_S_FETCH;
+    assert upv_of_phase(UW_P_INSTALL) == UPV_S_INSTALL and upv_of_phase(UW_P_DONE) == UPV_S_DONE;
+    assert upv_of_phase(UW_P_FAILED) == UPV_S_FAILED;
+    assert upv_of_end(true, UW_P_DONE) == UPV_S_DONE;
+    assert upv_of_end(true, UW_P_FETCH) == UPV_S_FAILED;
+    assert upv_of_end(false, UW_P_DONE) == UPV_S_FAILED;
+    assert upv_takes_offer(UPV_S_NONE) and upv_takes_offer(UPV_S_FAILED) and upv_takes_offer(UPV_S_CANCELLED);
+    assert upv_takes_offer(UPV_S_FETCH) == false and upv_takes_offer(UPV_S_INSTALL) == false and upv_takes_offer(UPV_S_DONE) == false;
+}
+
+test upv_get32_reads_little_endian_and_covers_the_top_byte {
+    var b : [12]u8 = undefined;
+    var i : usize = 0;
+    while (i < 12) { b[i] = 0; i = i + 1; }
+    assert upv_get32(b[0..12], 0) == 0;
+    b[0] = 1;
+    b[1] = 2;
+    b[2] = 3;
+    b[3] = 4;
+    assert upv_get32(b[0..12], 0) == 67305985;
+    b[3] = 255;
+    b[2] = 255;
+    b[1] = 255;
+    b[0] = 255;
+    assert upv_get32(b[0..12], 0) == 4294967295;
+    assert upv_get32(b[0..12], 4) == 0;
+    b[8] = 128;
+    assert upv_get32(b[0..12], 8) == 128;
+    b[11] = 128;
+    assert upv_get32(b[0..12], 8) == 2147483776;
+}
+
+test upv_get64_joins_two_words_and_round_trips_put64 {
+    var b : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 16) { b[i] = 0; i = i + 1; }
+    assert upv_get64(b[0..16], 0) == 0;
+    upv_put64(b[0..16], 0, 4294967296);
+    assert upv_get64(b[0..16], 0) == 4294967296;
+    assert upv_get32(b[0..16], 0) == 0 and upv_get32(b[0..16], 4) == 1;
+    upv_put64(b[0..16], 8, 1397067);
+    assert upv_get64(b[0..16], 8) == 1397067;
+    upv_put64(b[0..16], 8, 1099511627777);
+    assert upv_get64(b[0..16], 8) == 1099511627777;
+    assert upv_get32(b[0..16], 8) == 1 and upv_get32(b[0..16], 12) == 256;
+}
+
+test upv_offer_line_prints_the_version_build_and_cuts_a_long_nick_at_24 {
+    var cl : [8192]u8 = undefined;
+    upv_blank(cl[0..8192]);
+    upv_offer_fixture(cl[0..8192]);
+    var o : [128]u8 = undefined;
+    var n : usize = upv_offer_line(cl[0..8192], o[0..128]);
+    assert upv_eq(o[0..128], n, "available 0.1.3 (build 7068) from t27os");
+    cl[UPV_OMAJ] = 255;
+    cl[UPV_OMIN] = 10;
+    cl[UPV_OPAT] = 0;
+    upv_put32(cl[0..8192], UPV_OBUILD, 4294967295);
+    n = upv_offer_line(cl[0..8192], o[0..128]);
+    assert upv_eq(o[0..128], n, "available 255.10.0 (build 4294967295) from t27os");
+    var i : usize = 0;
+    while (i < 24) { cl[UPV_NICK + i] = 97 + @as(u8, @intCast(i)); i = i + 1; }
+    cl[UPV_NICKLEN] = 24;
+    n = upv_offer_line(cl[0..8192], o[0..128]);
+    assert upv_eq(o[0..128], n, "available 255.10.0 (build 4294967295) from abcdefghijklmnopqrstuvwx");
+    cl[UPV_NICKLEN] = 200;
+    var m : usize = upv_offer_line(cl[0..8192], o[0..128]);
+    assert m == n;
+    cl[UPV_NICKLEN] = 1;
+    m = upv_offer_line(cl[0..8192], o[0..128]);
+    assert upv_eq(o[0..128], m, "available 255.10.0 (build 4294967295) from a");
+}
+
+test upv_offer_why_names_every_refusal_and_nothing_for_other_codes {
+    assert upv_offer_why(OF_BAD) == "the manifest does not parse";
+    assert upv_offer_why(OF_FP) == "the key does not match its fingerprint";
+    assert upv_offer_why(OF_STRANGER) == "the author is not a friend";
+    assert upv_offer_why(OF_ROLLBACK) == "the build is not newer";
+    assert upv_offer_why(OF_OLDVER) == "the version is older";
+    assert upv_offer_why(OF_SIZE) == "the size is out of range";
+    assert upv_offer_why(10) == "the signature is not true";
+    assert upv_offer_why(0) == "";
+    assert upv_offer_why(7) == "";
+    assert upv_offer_why(11) == "";
+    assert upv_offer_why(4294967295) == "";
+}
+
+test upv_ver_writes_dotted_numbers_at_an_offset_and_returns_the_end {
+    var o : [32]u8 = undefined;
+    var n : usize = upv_ver(o[0..32], 0, 0, 1, 3);
+    assert upv_eq(o[0..32], n, "0.1.3");
+    n = upv_ver(o[0..32], 0, 12, 0, 99);
+    assert upv_eq(o[0..32], n, "12.0.99");
+    o[0] = 120;
+    n = upv_ver(o[0..32], 1, 255, 255, 4294967295);
+    assert n == 1 + 3 + 1 + 3 + 1 + 10 and o[0] == 120 and o[1] == 50;
+}

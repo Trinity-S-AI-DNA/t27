@@ -1,0 +1,832 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/peer_identity_host.t27 -- where peer_identity.t27 touches the machine (Refs gHashTag/t27#11560).
+// Every decision (invite string, file layout, "no file -> new, damaged -> refuse", the friends table, the TXT record)
+// is a tested fn of peer_identity.t27; this file only moves bytes:
+//   * the identity key pair: a P-256 pair from the OS (keysync_host.ks_gen_pair, Security.framework), fingerprint =
+//     first 10 bytes of CC_SHA256 over the layout peer_identity.pi_fp_input makes;
+//   * ~/.t27os/invites.t27 (invites.t27: the invitations to accept or decline): read whole, a file that does not check
+//     is moved aside to invites.t27.bad (kept, never written over) and the table starts empty; written whole and
+//     atomically like the others.
+//   * ~/.t27os/identity and ~/.t27os/friends (v1 or v2 read, v2 written, with the friends' stored keys): read whole,
+//     checked by peer_identity, written atomically (creat of a
+//     .tmp with mode 0600, write, fsync, rename), the directory made with mode 0700. A file that is there and does not
+//     check is NEVER written over: the open returns IH_REFUSED and the file stays as found. The private key sits in
+//     the identity file in the clear (the owner's file mode, as ssh keys do); the Keychain route is keysync_host's.
+//   * ~/.t27os/trust.t27 (trust.t27: the key mismatch warnings): handled like invites.t27 (a damaged file goes to
+//     trust.t27.bad, kept; written whole and atomically, 0600).
+//   * mDNS-SD from <dns_sd.h> (libSystem, public): DNSServiceRegister announces _t27call._udp with a TXT record,
+//     DNSServiceBrowse finds announcements, DNSServiceResolve gives host, port and TXT, DNSServiceGetAddrInfo the
+//     IPv4 address; DNSServiceProcessResult runs the callbacks on the calling thread after a poll(2) on the
+//     service's socket, so no callback ever runs on a thread of the system's.
+//   * DNSServiceRegister takes 12 arguments and the resolve callback has 10 parameters; t27b passes and receives at
+//     most 8. The register call goes through libffi ffi_call (as call_crypto_probe does for AES-GCM), and the
+//     resolve callback is a libffi CLOSURE (ffi_closure_alloc + ffi_prep_closure_loc): the system calls the closure's
+//     native entry with all 10 arguments and the closure calls ih_resolve_h(cif, ret, args, user), 4 pointers.
+// The other callbacks (register reply 7 args, browse 8, getaddrinfo 8) are plain fns reached by their dlsym address,
+// the technique callback_probe.t27 proved. Their arguments are declared u64 and masked here.
+// Specs holding @extern are exercised by peer_identity_probe.t27; the decisions are tested in peer_identity.t27.
+module T27osPeerIdentityHost;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_bytes;
+use t27os::keysync_host::ks_sha256;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::PUB_BYTES;
+use t27os::peer_identity::PRIV_BYTES;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::ID_OFF_PRIV;
+use t27os::peer_identity::ID_OFF_NICK_LEN;
+use t27os::peer_identity::ID_OFF_NICK;
+use t27os::peer_identity::ID_OK;
+use t27os::peer_identity::ID_SHORT;
+use t27os::peer_identity::ACT_CREATE;
+use t27os::peer_identity::ACT_USE;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::FT_OK;
+use t27os::peer_identity::pi_fp_input;
+use t27os::peer_identity::pi_fp_from_digest;
+use t27os::peer_identity::id_build;
+use t27os::peer_identity::id_check;
+use t27os::peer_identity::id_action;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity::ft_check;
+use t27os::peer_identity::FT_SHORT;
+use t27os::peer_identity::FT2_LEN;
+use t27os::peer_identity::FK_LEN;
+use t27os::peer_identity::PIN_NEW;
+use t27os::peer_identity::PIN_BAD;
+use t27os::peer_identity::ft2_split;
+use t27os::peer_identity::ft2_join;
+use t27os::peer_identity::fk_get;
+use t27os::peer_identity::fk_pin;
+use t27os::peer_identity::fk_drop_unhashed;
+use t27os::peer_identity::FK_SLOT;
+use t27os::peer_identity::FT_MAX;
+use t27os::invites::IV_LEN;
+use t27os::invites::IV_OK;
+use t27os::invites::iv_init;
+use t27os::invites::iv_load;
+use t27os::invites::iv_check;
+use t27os::trust::TRU_LEN;
+use t27os::trust::TRU_OK;
+use t27os::trust::tru_init;
+use t27os::trust::tru_load;
+use t27os::trust::tru_check;
+
+pub const IH_CREATED : u32 = 1;
+pub const IH_LOADED : u32 = 2;
+/// The file is there and wrong: the low 8 bits are IH_REFUSED, the next 8 bits the id_check / ft_check status.
+pub const IH_REFUSED : u32 = 3;
+pub const IH_IOERR : u32 = 4;
+pub const IH_CRYPTO : u32 = 5;
+
+const IH_RTLD_DEFAULT : u64 = 18446744073709551614;
+const IH_FFI_SYSV : u32 = 1;
+
+fn ih_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn ih_access(path: []const u8, mode: i32) -> i32 { return @extern("access"); }
+fn ih_fsync(fd: i32) -> i32 { return @extern("fsync"); }
+fn ih_usleep(us: u32) -> i32 { return @extern("usleep"); }
+fn ih_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn ih_ffi_prep(cif: []u8, abi: u32, nargs: u32, rtype: u64, atypes: []const u8) -> i32 { return @extern("ffi_prep_cif"); }
+fn ih_ffi_call(cif: []const u8, f: u64, rv: []u8, avals: []const u8) -> void { @extern("ffi_call"); }
+fn ih_ffi_closure_alloc(size: u64, code: []u8) -> u64 { return @extern("ffi_closure_alloc"); }
+fn ih_ffi_closure_loc(closure: u64, cif: []const u8, fun: u64, user: u64, code: u64) -> i32 { return @extern("ffi_prep_closure_loc"); }
+fn ih_dns_browse(ref: []u8, flags: u32, ifx: u32, regtype: []const u8, domain: u64, cb: u64, ctx: u64) -> i32 { return @extern("DNSServiceBrowse"); }
+fn ih_dns_resolve(ref: []u8, flags: u32, ifx: u32, name: []const u8, regtype: []const u8, domain: []const u8, cb: u64, ctx: u64) -> i32 { return @extern("DNSServiceResolve"); }
+fn ih_dns_addr(ref: []u8, flags: u32, ifx: u32, proto: u32, host: []const u8, cb: u64, ctx: u64) -> i32 { return @extern("DNSServiceGetAddrInfo"); }
+fn ih_dns_process(ref: u64) -> i32 { return @extern("DNSServiceProcessResult"); }
+fn ih_dns_fd(ref: u64) -> i32 { return @extern("DNSServiceRefSockFD"); }
+fn ih_dns_free(ref: u64) -> void { @extern("DNSServiceRefDeallocate"); }
+
+// ---------------------------------------------------------------- raw memory
+
+fn ih_get8(at: u64) -> u32 {
+    var c : [1]u8 = undefined;
+    sys_peek(c[0..1], at, 1);
+    return @as(u32, c[0]);
+}
+
+fn ih_get16(at: u64) -> u32 {
+    var c : [2]u8 = undefined;
+    sys_peek(c[0..2], at, 2);
+    return @as(u32, c[0]) | (@as(u32, c[1]) << 8);
+}
+
+fn ih_get32(at: u64) -> u32 {
+    var c : [4]u8 = undefined;
+    sys_peek(c[0..4], at, 4);
+    return @as(u32, c[0]) | (@as(u32, c[1]) << 8) | (@as(u32, c[2]) << 16) | (@as(u32, c[3]) << 24);
+}
+
+fn ih_get64(at: u64) -> u64 {
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], at, 8);
+    return get_u64(c[0..8], 0);
+}
+
+fn ih_put32(at: u64, v: u32) -> void {
+    var c : [4]u8 = undefined;
+    c[0] = @as(u8, @intCast(v & 255));
+    c[1] = @as(u8, @intCast((v >> 8) & 255));
+    c[2] = @as(u8, @intCast((v >> 16) & 255));
+    c[3] = @as(u8, @intCast((v >> 24) & 255));
+    ih_poke(at, c[0..4], 4);
+}
+
+/// Copy a C string at address p into out, at most cap-1 bytes, NUL-terminated; the length copied.
+fn ih_cstr(p: u64, out: []u8, cap: usize) -> usize {
+    if (p == 0 or cap == 0) {
+        if (cap > 0) { out[0] = 0; }
+        return 0;
+    }
+    var n : u64 = sys_strlen(p);
+    if (n > @as(u64, cap - 1)) { n = @as(u64, cap - 1); }
+    if (n > 0) { sys_peek(out[0..@as(usize, n)], p, n); }
+    out[@as(usize, n)] = 0;
+    return @as(usize, n);
+}
+
+fn ih_at(p: []const u8, q: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+/// The address of a buffer: memmove(b, b, 0) returns its first argument.
+pub fn ih_addr(b: []const u8) -> u64 { return ih_at(b, b, 0); }
+
+/// The low 32 bits of a register as a signed int (DNSServiceErrorType is negative on error).
+fn ih_i32(v: u64) -> i32 {
+    const w : u64 = v & 4294967295;
+    if (w >= 2147483648) { return -@as(i32, @intCast(4294967296 - w)); }
+    return @as(i32, @intCast(w));
+}
+
+// ---------------------------------------------------------------- files
+
+pub const IH_PATH_MAX : usize = 256;
+
+/// $HOME into out (NUL-terminated); its length, 0 when HOME is unset or too long.
+pub fn ih_home(out: []u8) -> usize {
+    const p : u64 = sys_getenv("HOME");
+    if (p == 0) { return 0; }
+    const n : u64 = sys_strlen(p);
+    if (n == 0 or n + 40 > @as(u64, out.len) or n > 160) { return 0; }
+    return ih_cstr(p, out, out.len);
+}
+
+/// kind 0 = <home>/.t27os (the directory), 1 = identity, 2 = friends; tmp adds ".tmp". NUL-terminated; length.
+pub fn ih_path(home: []const u8, hn: usize, kind: u32, tmp: bool, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os");
+    if (kind == 1) { n = put_bytes(out, n, "/identity"); }
+    if (kind == 2) { n = put_bytes(out, n, "/friends"); }
+    if (tmp) { n = put_bytes(out, n, ".tmp"); }
+    out[n] = 0;
+    return n;
+}
+
+/// Read a whole file into buf (at most cap bytes); the byte count, -1 when it cannot be opened or read.
+pub fn ih_slurp(path: []const u8, buf: []u8, cap: usize) -> i64 {
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return -1; }
+    var n : usize = 0;
+    while (n < cap) {
+        const r : i64 = sys_read(fd, buf[n..cap], @as(u64, cap - n));
+        if (r < 0) {
+            sys_close(fd);
+            return -1;
+        }
+        if (r == 0) { break; }
+        n = n + @as(usize, @intCast(r));
+    }
+    sys_close(fd);
+    return @as(i64, @intCast(n));
+}
+
+/// Write buf[0..n] to path atomically through path.tmp. The directory is made (mode 0700) when absent.
+pub fn ih_write_atomic(dir: []const u8, path: []const u8, tmp: []const u8, buf: []const u8, n: usize) -> bool {
+    sys_mkdir(dir, 448);
+    const fd : i32 = sys_creat(tmp, 384);
+    if (fd < 0) { return false; }
+    var done : usize = 0;
+    while (done < n) {
+        const w : i64 = sys_write(fd, buf[done..n], @as(u64, n - done));
+        if (w <= 0) {
+            sys_close(fd);
+            return false;
+        }
+        done = done + @as(usize, @intCast(w));
+    }
+    ih_fsync(fd);
+    sys_close(fd);
+    return sys_rename(tmp, path) == 0;
+}
+
+/// The fingerprint of a public key (65 bytes): first 10 bytes of SHA-256 over peer_identity.pi_fp_input.
+pub fn ih_fingerprint(pubk: []const u8, fp: []u8) -> bool {
+    var inp : [82]u8 = undefined;
+    if (pi_fp_input(pubk, inp[0..82]) != 82) { return false; }
+    var dg : [32]u8 = undefined;
+    if (ks_sha256(inp[0..82], dg[0..32]) == false) { return false; }
+    return pi_fp_from_digest(dg[0..32], fp);
+}
+
+/// Open the identity: no file -> a new pair is made and written; a good file -> loaded; a file that is there and does
+/// not check -> IH_REFUSED | status << 8 and nothing is written. id gets the 207 bytes, fp the fingerprint.
+pub fn ih_identity_open(nick: []const u8, nn: usize, id: []u8, fp: []u8) -> u32 {
+    if (id.len < ID_LEN + 1 or fp.len < FP_BYTES) { return IH_IOERR; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return IH_IOERR; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 0, false, dir[0..IH_PATH_MAX]);
+    ih_path(home[0..IH_PATH_MAX], hn, 1, false, path[0..IH_PATH_MAX]);
+    ih_path(home[0..IH_PATH_MAX], hn, 1, true, tmp[0..IH_PATH_MAX]);
+    const exists : bool = ih_access(path[0..IH_PATH_MAX], 0) == 0;
+    var status : u32 = ID_SHORT;
+    var got : i64 = 0;
+    if (exists) {
+        got = ih_slurp(path[0..IH_PATH_MAX], id, ID_LEN + 1);
+        if (got >= 0) { status = id_check(id[0..@as(usize, @intCast(got))]); }
+    }
+    const act : u32 = id_action(exists, status);
+    if (act == ACT_USE) {
+        if (ih_fingerprint(id[ID_OFF_PUB..ID_OFF_PUB + PUB_BYTES], fp) == false) { return IH_CRYPTO; }
+        return IH_LOADED;
+    }
+    if (act != ACT_CREATE) { return IH_REFUSED | (status << 8); }
+    var priv : [97]u8 = undefined;
+    var pubk : [65]u8 = undefined;
+    if (ks_gen_pair(priv[0..97], pubk[0..65]) == false) { return IH_CRYPTO; }
+    if (id_build(pubk[0..65], priv[0..97], nick, nn, id) != ID_LEN) { return IH_IOERR; }
+    var i : usize = 0;
+    while (i < 97) {
+        priv[i] = 0;
+        i = i + 1;
+    }
+    if (id_check(id[0..ID_LEN]) != ID_OK) { return IH_CRYPTO; }
+    if (ih_write_atomic(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], id, ID_LEN) == false) { return IH_IOERR; }
+    if (ih_fingerprint(pubk[0..65], fp) == false) { return IH_CRYPTO; }
+    return IH_CREATED;
+}
+
+/// The paths of the friends file: dir, path, tmp. False when HOME is unusable.
+fn ih_friends_paths(dir: []u8, path: []u8, tmp: []u8) -> bool {
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    ih_path(home[0..IH_PATH_MAX], hn, 0, false, dir);
+    ih_path(home[0..IH_PATH_MAX], hn, 2, false, path);
+    ih_path(home[0..IH_PATH_MAX], hn, 2, true, tmp);
+    return true;
+}
+
+/// Read the friends file (v1 or v2) into the table t (the v1 shape) and the keys. FT_OK, the peer_identity status of
+/// what is wrong, or FT_SHORT when it cannot be read; exists[0] says whether the file is there, exists[1] (when given)
+/// how many stored keys were dropped because they do not hash to their friend's fingerprint (fk_drop_unhashed).
+fn ih_friends_read(path: []const u8, t: []u8, keys: []u8, exists: []u8) -> u32 {
+    exists[0] = 0;
+    if (exists.len > 1) { exists[1] = 0; }
+    if (ih_access(path, 0) != 0) { return FT_SHORT; }
+    exists[0] = 1;
+    var f : [3509]u8 = undefined;
+    const got : i64 = ih_slurp(path, f[0..3509], FT2_LEN + 1);
+    if (got < 0) { return FT_SHORT; }
+    const st : u32 = ft2_split(f[0..3509], @as(usize, @intCast(got)), t, keys);
+    if (st != FT_OK) { return st; }
+    var calc : [320]u8 = undefined;
+    var i : usize = 0;
+    while (i < FT_MAX) {
+        const a : usize = i * FK_SLOT;
+        if (!ih_fingerprint(keys[a + FP_BYTES .. a + FP_BYTES + PUB_BYTES], calc[i * FP_BYTES .. (i + 1) * FP_BYTES])) {
+            var k : usize = 0;
+            while (k < FP_BYTES) {
+                calc[i * FP_BYTES + k] = 0;
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    const bad : u32 = fk_drop_unhashed(keys, calc[0..320]);
+    if (exists.len > 1) { exists[1] = @as(u8, @intCast(bad)); }
+    return FT_OK;
+}
+
+/// Write the table and the keys as a v2 file, atomically.
+fn ih_friends_write(dir: []const u8, path: []const u8, tmp: []const u8, t: []const u8, keys: []const u8) -> bool {
+    var f : [3508]u8 = undefined;
+    if (ft2_join(t, keys, f[0..3508]) != FT2_LEN) { return false; }
+    return ih_write_atomic(dir, path, tmp, f[0..3508], FT2_LEN);
+}
+
+/// Open the friends table the same way: absent -> an empty table is written (v2); damaged -> refused and left alone.
+/// A v1 file is read as it is (its friends have no stored key) and stays v1 on disk until the next save. t gets the
+/// table in the v1 shape (FT_LEN bytes).
+pub fn ih_friends_open(t: []u8) -> u32 {
+    if (t.len < FT_LEN + 1) { return IH_IOERR; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (!ih_friends_paths(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX])) { return IH_IOERR; }
+    var keys : [2400]u8 = undefined;
+    var ex : [1]u8 = undefined;
+    const status : u32 = ih_friends_read(path[0..IH_PATH_MAX], t, keys[0..FK_LEN], ex[0..1]);
+    const act : u32 = id_action(ex[0] != 0, status);
+    if (act == ACT_USE) { return IH_LOADED; }
+    if (act != ACT_CREATE) { return IH_REFUSED | (status << 8); }
+    if (ft_init(t) == false) { return IH_IOERR; }
+    var i : usize = 0;
+    while (i < FK_LEN) {
+        keys[i] = 0;
+        i = i + 1;
+    }
+    if (!ih_friends_write(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], t, keys[0..FK_LEN])) { return IH_IOERR; }
+    return IH_CREATED;
+}
+
+/// Save a table that checks, as v2, keeping the keys the file on disk holds for the friends still in the table (a
+/// removed friend loses its key). False when the table does not check or the write failed.
+pub fn ih_friends_save(t: []const u8) -> bool {
+    if (t.len < FT_LEN or ft_check(t[0..FT_LEN]) != FT_OK) { return false; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (!ih_friends_paths(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX])) { return false; }
+    var old : [1108]u8 = undefined;
+    var keys : [2400]u8 = undefined;
+    var ex : [1]u8 = undefined;
+    if (ih_friends_read(path[0..IH_PATH_MAX], old[0..FT_LEN], keys[0..FK_LEN], ex[0..1]) != FT_OK) {
+        var i : usize = 0;
+        while (i < FK_LEN) {
+            keys[i] = 0;
+            i = i + 1;
+        }
+    }
+    return ih_friends_write(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], t[0..FT_LEN], keys[0..FK_LEN]);
+}
+
+/// The key stored for this friend into out (65 bytes): true when there is one. A missing, v1 or damaged file has none.
+pub fn ih_pin_get(fp: []const u8, out: []u8) -> bool {
+    if (fp.len < FP_BYTES or out.len < PUB_BYTES) { return false; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (!ih_friends_paths(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX])) { return false; }
+    var t : [1108]u8 = undefined;
+    var keys : [2400]u8 = undefined;
+    var ex : [1]u8 = undefined;
+    if (ih_friends_read(path[0..IH_PATH_MAX], t[0..FT_LEN], keys[0..FK_LEN], ex[0..1]) != FT_OK) { return false; }
+    return fk_get(keys[0..FK_LEN], fp[0..FP_BYTES], out);
+}
+
+/// The key slots of the friends file (FK_LEN bytes of fingerprints and public keys, no private key): true when the file
+/// checks. A missing, v1 or damaged file gives none (every slot zero), so every friend reads not verified.
+pub fn ih_friends_keys(keys: []u8) -> bool { return ih_friends_keys_n(keys) != IH_FK_FAIL; }
+
+/// ih_friends_keys_n when the file does not check (every slot zero).
+pub const IH_FK_FAIL : u32 = 4294967295;
+
+/// ih_friends_keys that says how many stored keys the read dropped for not hashing to their friend's fingerprint (those
+/// friends read not verified), or IH_FK_FAIL.
+pub fn ih_friends_keys_n(keys: []u8) -> u32 {
+    if (keys.len < FK_LEN) { return IH_FK_FAIL; }
+    var i : usize = 0;
+    while (i < FK_LEN) {
+        keys[i] = 0;
+        i = i + 1;
+    }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (!ih_friends_paths(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX])) { return IH_FK_FAIL; }
+    var t : [1108]u8 = undefined;
+    var ex : [2]u8 = undefined;
+    if (ih_friends_read(path[0..IH_PATH_MAX], t[0..FT_LEN], keys[0..FK_LEN], ex[0..2]) != FT_OK) {
+        i = 0;
+        while (i < FK_LEN) {
+            keys[i] = 0;
+            i = i + 1;
+        }
+        return IH_FK_FAIL;
+    }
+    return @as(u32, ex[1]);
+}
+
+/// Store a friend's proven key: it must hash to fp (else PIN_BAD), fp must be in the friends file (else
+/// PIN_NOT_FRIEND), and a friend keeps its first key (PIN_CONFLICT). The file is written (v2) only on PIN_NEW; a file
+/// that does not check is never written over (PIN_BAD).
+pub fn ih_pin_put(fp: []const u8, pubk: []const u8) -> u32 {
+    if (fp.len < FP_BYTES or pubk.len != PUB_BYTES) { return PIN_BAD; }
+    var calc : [10]u8 = undefined;
+    if (!ih_fingerprint(pubk, calc[0..10])) { return PIN_BAD; }
+    var i : usize = 0;
+    var d : u32 = 0;
+    while (i < FP_BYTES) {
+        d = d | @as(u32, calc[i] ^ fp[i]);
+        i = i + 1;
+    }
+    if (d != 0) { return PIN_BAD; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (!ih_friends_paths(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX])) { return PIN_BAD; }
+    var t : [1108]u8 = undefined;
+    var keys : [2400]u8 = undefined;
+    var ex : [1]u8 = undefined;
+    if (ih_friends_read(path[0..IH_PATH_MAX], t[0..FT_LEN], keys[0..FK_LEN], ex[0..1]) != FT_OK) { return PIN_BAD; }
+    const r : u32 = fk_pin(t[0..FT_LEN], keys[0..FK_LEN], fp[0..FP_BYTES], pubk);
+    if (r != PIN_NEW) { return r; }
+    if (!ih_friends_write(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], t[0..FT_LEN], keys[0..FK_LEN])) { return PIN_BAD; }
+    return PIN_NEW;
+}
+
+// ---------------------------------------------------------------- the invitations file
+
+/// <home>/.t27os/invites.t27; kind 1 adds ".tmp", kind 2 ".bad". NUL-terminated; the length, 0 when it does not fit.
+pub fn ih_invites_path(home: []const u8, hn: usize, kind: u32, out: []u8) -> usize {
+    if (hn + 32 > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os/invites.t27");
+    if (kind == 1) { n = put_bytes(out, n, ".tmp"); }
+    if (kind == 2) { n = put_bytes(out, n, ".bad"); }
+    out[n] = 0;
+    return n;
+}
+
+/// ih_invites_open: no file -> an empty table (nothing written until the first invitation); a good file -> loaded; a
+/// file that does not check -> moved to invites.t27.bad and an empty table (IH_REFUSED | status << 8).
+pub fn ih_invites_open(t: []u8) -> u32 {
+    if (t.len < IV_LEN or !iv_init(t)) { return IH_IOERR; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return IH_IOERR; }
+    var path : [IH_PATH_MAX]u8 = undefined;
+    if (ih_invites_path(home[0..IH_PATH_MAX], hn, 0, path[0..IH_PATH_MAX]) == 0) { return IH_IOERR; }
+    if (ih_access(path[0..IH_PATH_MAX], 0) != 0) { return IH_CREATED; }
+    var f : [8213]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..IH_PATH_MAX], f[0..8213], IV_LEN + 1);
+    if (got < 0) { return IH_IOERR; }
+    const st : u32 = iv_load(f[0..8213], @as(usize, @intCast(got)), t);
+    if (st == IV_OK) { return IH_LOADED; }
+    var bad : [IH_PATH_MAX]u8 = undefined;
+    ih_invites_path(home[0..IH_PATH_MAX], hn, 2, bad[0..IH_PATH_MAX]);
+    sys_rename(path[0..IH_PATH_MAX], bad[0..IH_PATH_MAX]);
+    return IH_REFUSED | (st << 8);
+}
+
+/// Write the table (it must check) whole and atomically, mode 0600, the directory 0700.
+pub fn ih_invites_save(t: []const u8) -> bool {
+    if (t.len < IV_LEN or iv_check(t[0..IV_LEN]) != IV_OK) { return false; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 0, false, dir[0..IH_PATH_MAX]);
+    ih_invites_path(home[0..IH_PATH_MAX], hn, 0, path[0..IH_PATH_MAX]);
+    ih_invites_path(home[0..IH_PATH_MAX], hn, 1, tmp[0..IH_PATH_MAX]);
+    return ih_write_atomic(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], t[0..IV_LEN], IV_LEN);
+}
+
+// ---------------------------------------------------------------- the trust file
+
+/// <home>/.t27os/trust.t27; kind 1 adds ".tmp", kind 2 ".bad". NUL-terminated; the length, 0 when it does not fit.
+pub fn ih_trust_path(home: []const u8, hn: usize, kind: u32, out: []u8) -> usize {
+    if (hn + 32 > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os/trust.t27");
+    if (kind == 1) { n = put_bytes(out, n, ".tmp"); }
+    if (kind == 2) { n = put_bytes(out, n, ".bad"); }
+    out[n] = 0;
+    return n;
+}
+
+/// ih_trust_open: no file -> an empty table (IH_CREATED, nothing written until the first refusal); a good file ->
+/// loaded; a file that does not check -> moved to trust.t27.bad and an empty table (IH_REFUSED | status << 8).
+pub fn ih_trust_open(t: []u8) -> u32 {
+    if (t.len < TRU_LEN or !tru_init(t)) { return IH_IOERR; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return IH_IOERR; }
+    var path : [IH_PATH_MAX]u8 = undefined;
+    if (ih_trust_path(home[0..IH_PATH_MAX], hn, 0, path[0..IH_PATH_MAX]) == 0) { return IH_IOERR; }
+    if (ih_access(path[0..IH_PATH_MAX], 0) != 0) { return IH_CREATED; }
+    var f : [1557]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..IH_PATH_MAX], f[0..1557], TRU_LEN + 1);
+    if (got < 0) { return IH_IOERR; }
+    const st : u32 = tru_load(f[0..1557], @as(usize, @intCast(got)), t);
+    if (st == TRU_OK) { return IH_LOADED; }
+    var bad : [IH_PATH_MAX]u8 = undefined;
+    ih_trust_path(home[0..IH_PATH_MAX], hn, 2, bad[0..IH_PATH_MAX]);
+    sys_rename(path[0..IH_PATH_MAX], bad[0..IH_PATH_MAX]);
+    return IH_REFUSED | (st << 8);
+}
+
+/// Write the table (it must check) whole and atomically, mode 0600, the directory 0700.
+pub fn ih_trust_save(t: []const u8) -> bool {
+    if (t.len < TRU_LEN or tru_check(t[0..TRU_LEN]) != TRU_OK) { return false; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 0, false, dir[0..IH_PATH_MAX]);
+    ih_trust_path(home[0..IH_PATH_MAX], hn, 0, path[0..IH_PATH_MAX]);
+    ih_trust_path(home[0..IH_PATH_MAX], hn, 1, tmp[0..IH_PATH_MAX]);
+    return ih_write_atomic(dir[0..IH_PATH_MAX], path[0..IH_PATH_MAX], tmp[0..IH_PATH_MAX], t[0..TRU_LEN], TRU_LEN);
+}
+
+// ---------------------------------------------------------------- mDNS state blocks
+
+pub const BR_COUNT : usize = 16;
+pub const BR_HDR : usize = 16;
+pub const BE_LEN : usize = 256;
+pub const BE_NAME : usize = 0;
+pub const BE_IF : usize = 64;
+pub const BE_STATE : usize = 68;
+pub const BE_PORT : usize = 72;
+pub const BE_TXTLEN : usize = 76;
+pub const BE_TXT : usize = 80;
+pub const BE_HOST : usize = 208;
+pub const BE_IP : usize = 252;
+pub const BR_LEN : usize = 4112;
+/// Entry states.
+pub const BS_NEW : u32 = 1;
+pub const BS_RESOLVING : u32 = 2;
+pub const BS_RESOLVED : u32 = 3;
+pub const BS_ADDRESSED : u32 = 4;
+
+pub fn ih_entry(block: u64, i: usize) -> u64 { return block + @as(u64, BR_HDR + i * BE_LEN); }
+
+/// The register reply (7 args): result block at ctx: +0 flag 1, +4 error code, +8 name (64 bytes).
+pub fn ih_reg_cb(ref: u64, flags: u64, err: u64, name: u64, regtype: u64, domain: u64, ctx: u64) -> void {
+    if (ctx == 0) { return; }
+    ih_put32(ctx + 4, @as(u32, @intCast(err & 4294967295)));
+    var nb : [64]u8 = undefined;
+    const n : usize = ih_cstr(name, nb[0..64], 64);
+    ih_poke(ctx + 8, nb[0..64], 64);
+    ih_put32(ctx, 1);
+}
+
+/// The browse reply (8 args): the block at ctx holds up to 8 services; an add (flag 2) is recorded as BS_NEW unless
+/// already known, a remove clears the entry's state.
+pub fn ih_browse_cb(ref: u64, flags: u64, ifx: u64, err: u64, name: u64, regtype: u64, domain: u64, ctx: u64) -> void {
+    if (ctx == 0 or (err & 4294967295) != 0) { return; }
+    var nb : [64]u8 = undefined;
+    const n : usize = ih_cstr(name, nb[0..64], 64);
+    const ifc : u32 = @as(u32, @intCast(ifx & 4294967295));
+    const add : bool = (flags & 2) != 0;
+    var i : usize = 0;
+    var free_at : usize = BR_COUNT;
+    while (i < BR_COUNT) {
+        const e : u64 = ih_entry(ctx, i);
+        const st : u32 = ih_get32(e + BE_STATE);
+        if (st == 0) {
+            if (free_at == BR_COUNT) { free_at = i; }
+        } else {
+            var cur : [64]u8 = undefined;
+            ih_cstr(e + BE_NAME, cur[0..64], 64);
+            var same : bool = ih_get32(e + BE_IF) == ifc;
+            var k : usize = 0;
+            while (k <= n) {
+                if (cur[k] != nb[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) {
+                if (add == false) { ih_put32(e + BE_STATE, 0); }
+                return;
+            }
+        }
+        i = i + 1;
+    }
+    if (add == false or free_at == BR_COUNT) { return; }
+    const e2 : u64 = ih_entry(ctx, free_at);
+    ih_poke(e2 + BE_NAME, nb[0..64], 64);
+    ih_put32(e2 + BE_IF, ifc);
+    ih_put32(e2 + BE_PORT, 0);
+    ih_put32(e2 + BE_TXTLEN, 0);
+    ih_put32(e2 + BE_IP, 0);
+    ih_put32(e2 + BE_STATE, BS_NEW);
+}
+
+/// The resolve reply as a libffi closure handler: args[0..10] = ref, flags, ifindex, error, fullname, hosttarget,
+/// port (u16, network order), txtLen (u16), txtRecord, context. context is the entry's address.
+pub fn ih_resolve_h(cif: u64, ret: u64, args: u64, user: u64) -> void {
+    if (args == 0) { return; }
+    const err : u32 = ih_get32(ih_get64(args + 24));
+    const ctx : u64 = ih_get64(ih_get64(args + 72));
+    if (ctx == 0 or err != 0) { return; }
+    const host : u64 = ih_get64(ih_get64(args + 40));
+    const pa : u64 = ih_get64(args + 48);
+    // the u16 is in memory as the host stores it; the port bytes are network order, so the first byte is the high one
+    const port : u32 = (ih_get8(pa) << 8) | ih_get8(pa + 1);
+    var tl : u32 = ih_get16(ih_get64(args + 56));
+    if (tl > 128) { tl = 128; }
+    const txt : u64 = ih_get64(ih_get64(args + 64));
+    var hb : [44]u8 = undefined;
+    ih_cstr(host, hb[0..44], 44);
+    ih_poke(ctx + BE_HOST, hb[0..44], 44);
+    var tb : [128]u8 = undefined;
+    var i : usize = 0;
+    while (i < 128) {
+        tb[i] = 0;
+        i = i + 1;
+    }
+    if (tl > 0 and txt != 0) { sys_peek(tb[0..@as(usize, tl)], txt, @as(u64, tl)); }
+    ih_poke(ctx + BE_TXT, tb[0..128], 128);
+    ih_put32(ctx + BE_TXTLEN, tl);
+    ih_put32(ctx + BE_PORT, port);
+    ih_put32(ctx + BE_STATE, BS_RESOLVED);
+}
+
+/// The address reply (8 args): the first IPv4 address (4 bytes, network order) goes to the entry at ctx.
+pub fn ih_addr_cb(ref: u64, flags: u64, ifx: u64, err: u64, host: u64, sa: u64, ttl: u64, ctx: u64) -> void {
+    if (ctx == 0 or sa == 0 or (err & 4294967295) != 0) { return; }
+    if (ih_get8(sa + 1) != 2) { return; }
+    ih_put32(ctx + BE_IP, ih_get32(sa + 4));
+    ih_put32(ctx + BE_STATE, BS_ADDRESSED);
+}
+
+// ---------------------------------------------------------------- mDNS calls
+
+/// Make the libffi closure for ih_resolve_h in mem (a block that must outlive every resolve): cif at 0 (64),
+/// argument types at 64 (80), closure and code pointers at 144 and 152. The native entry address, 0 on failure.
+pub fn ih_resolve_closure(mem: []u8) -> u64 {
+    if (mem.len < 160) { return 0; }
+    const tp : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_pointer");
+    const tu32 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_uint32");
+    const ti32 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_sint32");
+    const tu16 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_uint16");
+    const tv : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_void");
+    const h : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ih_resolve_h");
+    if (tp == 0 or tu32 == 0 or ti32 == 0 or tu16 == 0 or tv == 0 or h == 0) { return 0; }
+    put_u64(mem, 64, tp);
+    put_u64(mem, 72, tu32);
+    put_u64(mem, 80, tu32);
+    put_u64(mem, 88, ti32);
+    put_u64(mem, 96, tp);
+    put_u64(mem, 104, tp);
+    put_u64(mem, 112, tu16);
+    put_u64(mem, 120, tu16);
+    put_u64(mem, 128, tp);
+    put_u64(mem, 136, tp);
+    if (ih_ffi_prep(mem[0..64], IH_FFI_SYSV, 10, tv, mem[64..144]) != 0) { return 0; }
+    const clo : u64 = ih_ffi_closure_alloc(256, mem[152..160]);
+    if (clo == 0) { return 0; }
+    const code : u64 = get_u64(mem, 152);
+    if (code == 0) { return 0; }
+    if (ih_ffi_closure_loc(clo, mem[0..64], h, 0, code) != 0) { return 0; }
+    return code;
+}
+
+/// The 12 libffi argument types of DNSServiceRegister into ty (96 bytes): ref*, flags, ifindex, name, regtype, domain,
+/// host, port, txtLen, txt, callback, context.
+fn ih_reg_types(ty: []u8, tp: u64, tu32: u64, tu16: u64) -> void {
+    var k : usize = 0;
+    while (k < 12) {
+        put_u64(ty, k * 8, tp);
+        k = k + 1;
+    }
+    put_u64(ty, 8, tu32);
+    put_u64(ty, 16, tu32);
+    put_u64(ty, 56, tu16);
+    put_u64(ty, 64, tu16);
+}
+
+/// The first ten argument values (8-byte slots) of DNSServiceRegister.
+fn ih_reg_values(va: []u8, ref: u64, name: u64, port: u32, txt: u64, txtn: usize) -> void {
+    // the port in network byte order, as a uint16_t value on a little-endian host
+    const nport : u64 = @as(u64, ((port & 255) << 8) | (port >> 8));
+    put_u64(va, 0, ref);
+    put_u64(va, 8, 0);
+    put_u64(va, 16, 0);
+    put_u64(va, 24, name);
+    put_u64(va, 32, 0);
+    put_u64(va, 40, 0);
+    put_u64(va, 48, 0);
+    put_u64(va, 56, nport);
+    put_u64(va, 64, @as(u64, txtn));
+    put_u64(va, 72, txt);
+}
+
+/// The array of pointers to the 12 value slots that ffi_call wants.
+fn ih_ptrs(va: []u8, av: []u8) -> void {
+    const vb : u64 = ih_addr(va);
+    var k : usize = 0;
+    while (k < 12) {
+        put_u64(av, k * 8, vb + @as(u64, k) * 8);
+        k = k + 1;
+    }
+}
+
+/// Announce _t27call._udp: instance name (NUL-terminated), the UDP port, the TXT record. res is the 72-byte reply
+/// block ih_reg_cb fills; ref (8 bytes) receives the DNSServiceRef. The DNSServiceErrorType (0 = the call was taken;
+/// the daemon's verdict arrives later through ih_pump and res).
+pub fn ih_register(ref: []u8, name: []const u8, port: u32, txt: []const u8, txtn: usize, res: []u8) -> i32 {
+    const f : u64 = ih_dlsym(IH_RTLD_DEFAULT, "DNSServiceRegister");
+    const cb : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ih_reg_cb");
+    const tp : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_pointer");
+    const tu32 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_uint32");
+    const tu16 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_uint16");
+    const ts32 : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ffi_type_sint32");
+    if (f == 0 or cb == 0 or tp == 0 or tu32 == 0 or tu16 == 0 or ts32 == 0) { return -1; }
+    if (ref.len < 8 or res.len < 72 or txtn > txt.len or port == 0 or port > 65535) { return -1; }
+    var ty : [96]u8 = undefined;
+    ih_reg_types(ty[0..96], tp, tu32, tu16);
+    var va : [96]u8 = undefined;
+    var av : [96]u8 = undefined;
+    ih_reg_values(va[0..96], ih_addr(ref), ih_addr(name), port, ih_addr(txt), txtn);
+    const regtype : [14]u8 = [95, 116, 50, 55, 99, 97, 108, 108, 46, 95, 117, 100, 112, 0];
+    put_u64(va[0..96], 32, ih_addr(regtype[0..14]));
+    put_u64(va[0..96], 80, cb);
+    put_u64(va[0..96], 88, ih_addr(res));
+    ih_ptrs(va[0..96], av[0..96]);
+    put_u64(ref, 0, 0);
+    var cif : [64]u8 = undefined;
+    var k : usize = 0;
+    while (k < 64) {
+        cif[k] = 0;
+        k = k + 1;
+    }
+    if (ih_ffi_prep(cif[0..64], IH_FFI_SYSV, 12, ts32, ty[0..96]) != 0) { return -1; }
+    var rv : [8]u8 = undefined;
+    put_u64(rv[0..8], 0, 0);
+    ih_ffi_call(cif[0..64], f, rv[0..8], av[0..96]);
+    return ih_i32(get_u64(rv[0..8], 0));
+}
+
+/// Start browsing _t27call._udp; results fill the block at `block` through ih_browse_cb (pump the ref).
+pub fn ih_browse(ref: []u8, block: u64) -> i32 {
+    const cb : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ih_browse_cb");
+    if (cb == 0 or ref.len < 8) { return -1; }
+    const regtype : [14]u8 = [95, 116, 50, 55, 99, 97, 108, 108, 46, 95, 117, 100, 112, 0];
+    put_u64(ref, 0, 0);
+    return ih_dns_browse(ref, 0, 0, regtype[0..14], 0, cb, block);
+}
+
+/// Start resolving the entry at `e` (its name and interface); the closure `code` receives the reply.
+pub fn ih_resolve(ref: []u8, e: u64, code: u64) -> i32 {
+    if (code == 0 or ref.len < 8) { return -1; }
+    var nb : [64]u8 = undefined;
+    ih_cstr(e + BE_NAME, nb[0..64], 64);
+    const regtype : [14]u8 = [95, 116, 50, 55, 99, 97, 108, 108, 46, 95, 117, 100, 112, 0];
+    const dom : [6]u8 = [108, 111, 99, 97, 108, 0];
+    put_u64(ref, 0, 0);
+    return ih_dns_resolve(ref, 0, ih_get32(e + BE_IF), nb[0..64], regtype[0..14], dom[0..6], code, e);
+}
+
+/// Start looking up the IPv4 address of the entry's host target.
+pub fn ih_addrinfo(ref: []u8, e: u64) -> i32 {
+    const cb : u64 = ih_dlsym(IH_RTLD_DEFAULT, "ih_addr_cb");
+    if (cb == 0 or ref.len < 8) { return -1; }
+    var hb : [44]u8 = undefined;
+    ih_cstr(e + BE_HOST, hb[0..44], 44);
+    put_u64(ref, 0, 0);
+    return ih_dns_addr(ref, 0, ih_get32(e + BE_IF), 1, hb[0..44], cb, e);
+}
+
+/// Wait up to ms for the service socket of `ref` and run its callbacks. 1 = processed, 0 = nothing came, -1 = error.
+pub fn ih_pump(ref: u64, ms: i32) -> i32 {
+    if (ref == 0) { return -1; }
+    const fd : i32 = ih_dns_fd(ref);
+    if (fd < 0) { return -1; }
+    var p : [8]u8 = undefined;
+    var i : usize = 0;
+    while (i < 8) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    p[0] = @as(u8, @intCast(fd & 255));
+    p[1] = @as(u8, @intCast((fd >> 8) & 255));
+    p[2] = @as(u8, @intCast((fd >> 16) & 255));
+    p[3] = @as(u8, @intCast((fd >> 24) & 255));
+    p[4] = 1;
+    const r : i32 = sys_poll(p[0..8], 1, ms);
+    if (r < 0) { return -1; }
+    if (r == 0) { return 0; }
+    if (ih_dns_process(ref) != 0) { return -1; }
+    return 1;
+}
+
+pub fn ih_free(ref: u64) -> void {
+    if (ref != 0) { ih_dns_free(ref); }
+}
+
+pub fn ih_sleep_ms(ms: u32) -> void { ih_usleep(ms * 1000); }

@@ -1,0 +1,568 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_nat.t27 -- a call between two homes, each behind its own router, with no server of ours (owner,
+// 2026-10-23: "listen on the network by itself and call over the internet too"; Refs dmitrii-f-t27/t27#13,
+// gHashTag/t27#11560). Pure decisions only: no @extern, no socket, no clock. The window (glass_window.t27, block CN)
+// moves the bytes; call_session.t27 takes the answers below off the call socket before a call frame is looked at.
+//
+// Why: a home router lets a datagram in only to a port that a machine behind it sent from (NAT). Two things stop a call
+// between two homes: (1) a person does not know the public address and port their router gives to the call socket;
+// (2) the friend's router drops the first INVITE, because nothing behind it ever sent to the caller.
+//
+// 1. STUN: the one exchange with a host that is not a friend, an EXPLICIT and VISIBLE step. Nothing is sent before the
+//    person asks for it: LOOK UP in the cabinet (ME, the PUBLIC line) or T27OS_STUN=1 at launch. Then a Binding request
+//    (RFC 8489 section 5: 20 bytes, no attribute, a random transaction id) goes from the CALL socket itself to
+//    CN_STUN_HOST:CN_STUN_PORT (its IPv4 from the system resolver), so the answer names the very mapping a friend's
+//    INVITE must reach. The request is resent at 0, 0.5, 1.5 and 3.5 s and given up at 7.5 s (cn_stun_step); the
+//    resolver gets CN_DNS_MS. Only a Binding success with this request's transaction id and an IPv4 XOR-MAPPED-ADDRESS
+//    (or MAPPED-ADDRESS from an old server) that is a public or private unicast address, not 127/8, with a port in
+//    1..65535 is taken (cn_stun_parse); every other datagram that looks like STUN (cn_stun_looks) is counted and
+//    dropped, and none of them ever reaches the call code. The request carries nothing about this device: no key, no
+//    name. A router forgets an unused mapping after some tens of seconds, so while the address is shown the window asks
+//    again every CN_KEEP_MS for CN_KEEP_FOR_MS after the last LOOK UP and then stops and says the address may have
+//    changed (cn_keep). The address is shown in the cabinet and in the CALL panel only: never written to a file, never
+//    sent anywhere by the app. The person gives it to a friend.
+// 2. Punching. When both sides send to each other's public address at about the same time, both routers open. A probe
+//    is 16 bytes: "t27n", version 1, kind 1, this device's 10-byte fingerprint (cn_probe). It carries no key and no
+//    audio; the receiver only counts it (cn_probe_is): a probe never starts, answers or changes a call. The schedule
+//    (cn_punch_due): every 100 ms for the first 3 s, then once a second up to 30 s, CN_PUNCH_MAX probes in all. The
+//    caller's own INVITE repeats open the caller's router; the callee has to send as well. In this slice the callee's
+//    side is the test aid T27OS_PUNCH=<a.b.c.d:port> (acts only with T27OS_QA=1): the caller's public address, punched
+//    for 30 s from launch; a dial of a public address punches it too. The product step (both sides know each other's
+//    public address and punch when a friend dials) needs that address to travel in a signed record; it is NOT in the
+//    friends file v2 and is not done here (the report proposes the format).
+// 3. Which address to call (cn_pick): the friend's address on this network while its announcement is fresh; else its
+//    public address when one is known, unless it is this device's own public IP: a friend behind the same router is
+//    reached on this network only (most home routers do not loop a datagram back to themselves, cn_same_router).
+// Flat namespace (the window build splices imported modules): every name here starts with cn_ / CN_.
+module T27osCallNat;
+
+use t27os::call_view::cv_addr_class;
+use t27os::call_view::cv_addr_ip;
+use t27os::call_view::cv_addr_port;
+use t27os::call_view::cv_addr_text;
+use t27os::call_view::CV_AC_PUBLIC;
+use t27os::call_view::CV_AC_PRIVATE;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+
+// ---------------------------------------------------------------- 1. STUN messages (RFC 8489, IPv4 only)
+
+pub const CN_STUN_HOST : str = "stun.l.google.com";
+pub const CN_STUN_PORT : u64 = 19302;
+pub const CN_STUN_HDR : usize = 20;
+pub const CN_TXID : usize = 12;
+/// The magic cookie 0x2112A442, as a number and as its four bytes.
+pub const CN_COOKIE : u64 = 554869826;
+/// The longest answer read (a datagram of the call socket is at most 2048 bytes).
+pub const CN_STUN_MAX : usize = 2048;
+/// Message types: Binding request, Binding success response.
+pub const CN_T_REQ : u64 = 1;
+pub const CN_T_OK : u64 = 257;
+/// Attributes: MAPPED-ADDRESS, XOR-MAPPED-ADDRESS, and the code point some older servers still use for the latter.
+pub const CN_A_MAPPED : u64 = 1;
+pub const CN_A_XOR : u64 = 32;
+pub const CN_A_XOR_OLD : u64 = 32800;
+
+fn cn_get16(b: []const u8, at: usize) -> u64 { return (@as(u64, b[at]) << 8) | @as(u64, b[at + 1]); }
+
+fn cn_get32(b: []const u8, at: usize) -> u64 {
+    return (@as(u64, b[at]) << 24) | (@as(u64, b[at + 1]) << 16) | (@as(u64, b[at + 2]) << 8) | @as(u64, b[at + 3]);
+}
+
+/// The Binding request for transaction id txid (12 bytes) into out: type 0x0001, length 0, the cookie, the id. Its
+/// length, 20; 0 when txid is not 12 bytes or out is short.
+pub fn cn_stun_request(txid: []const u8, out: []u8) -> usize {
+    if (txid.len != CN_TXID or out.len < CN_STUN_HDR) { return 0; }
+    out[0] = 0;
+    out[1] = 1;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = 33;
+    out[5] = 18;
+    out[6] = 164;
+    out[7] = 66;
+    var i : usize = 0;
+    while (i < CN_TXID) {
+        out[8 + i] = txid[i];
+        i = i + 1;
+    }
+    return CN_STUN_HDR;
+}
+
+/// A datagram that is a STUN message by its shape (the two top bits zero, the cookie, a length that is the rest of the
+/// datagram and a multiple of 4). A call frame starts with "T27P" and a probe with "t27n": neither ever looks like this.
+pub fn cn_stun_looks(b: []const u8) -> bool {
+    if (b.len < CN_STUN_HDR or b.len > CN_STUN_MAX) { return false; }
+    if ((b[0] & 192) != 0) { return false; }
+    if (cn_get32(b, 4) != CN_COOKIE) { return false; }
+    const n : u64 = cn_get16(b, 2);
+    return n % 4 == 0 and n + 20 == @as(u64, b.len);
+}
+
+/// The address an IPv4 mapped-address value names (ip * 65536 + port), XORed with the cookie when xor; 0 when the value
+/// is not an IPv4 one (family 1, 8 bytes).
+fn cn_addr_value(b: []const u8, at: usize, len: u64, xor: bool) -> u64 {
+    if (len != 8 or b[at + 1] != 1) { return 0; }
+    var port : u64 = cn_get16(b, at + 2);
+    var ip : u64 = cn_get32(b, at + 4);
+    if (xor) {
+        port = port ^ (CN_COOKIE >> 16);
+        ip = ip ^ CN_COOKIE;
+    }
+    return ip * 65536 + port;
+}
+
+/// An address an answer may give: a public or private unicast IPv4 (call_view cv_addr_class), not this machine's
+/// 127/8, and a port in 1..65535.
+pub fn cn_mapped_ok(a: u64) -> bool {
+    const ip : u64 = cv_addr_ip(a);
+    const port : u64 = cv_addr_port(a);
+    if (port == 0 or port > 65535 or (ip >> 24) == 127) { return false; }
+    const k : u32 = cv_addr_class(ip);
+    return k == CV_AC_PUBLIC or k == CV_AC_PRIVATE;
+}
+
+/// The public address in a Binding success that answers txid, as ip * 65536 + port; 0 for anything else (another type,
+/// another transaction, a cut or padded-wrong attribute, no IPv4 address, an address cn_mapped_ok refuses).
+/// XOR-MAPPED-ADDRESS wins over MAPPED-ADDRESS when both are there.
+pub fn cn_stun_parse(b: []const u8, txid: []const u8) -> u64 {
+    if (txid.len != CN_TXID or !cn_stun_looks(b)) { return 0; }
+    if (cn_get16(b, 0) != CN_T_OK) { return 0; }
+    var i : usize = 0;
+    while (i < CN_TXID) {
+        if (b[8 + i] != txid[i]) { return 0; }
+        i = i + 1;
+    }
+    var xa : u64 = 0;
+    var ma : u64 = 0;
+    var at : usize = CN_STUN_HDR;
+    while (at + 4 <= b.len) {
+        const t : u64 = cn_get16(b, at);
+        const len : u64 = cn_get16(b, at + 2);
+        const v : usize = at + 4;
+        if (@as(u64, v) + len > @as(u64, b.len)) { return 0; }
+        if ((t == CN_A_XOR or t == CN_A_XOR_OLD) and xa == 0) { xa = cn_addr_value(b, v, len, true); }
+        if (t == CN_A_MAPPED and ma == 0) { ma = cn_addr_value(b, v, len, false); }
+        // the value is padded to a multiple of 4
+        at = v + @as(usize, (len + 3) / 4 * 4);
+    }
+    if (at != b.len) { return 0; }
+    var a : u64 = xa;
+    if (a == 0) { a = ma; }
+    if (a == 0 or !cn_mapped_ok(a)) { return 0; }
+    return a;
+}
+
+// ---------------------------------------------------------------- 2. the lookup: states, resends, refresh
+
+/// What the PUBLIC line says (one byte of the window's CALL region, drawn).
+pub const CN_S_NONE : u32 = 0;
+pub const CN_S_DNS : u32 = 1;
+pub const CN_S_ASK : u32 = 2;
+pub const CN_S_OK : u32 = 3;
+pub const CN_S_NODNS : u32 = 4;
+pub const CN_S_NOANSWER : u32 = 5;
+pub const CN_S_NOSOCK : u32 = 6;
+pub const CN_S_STALE : u32 = 7;
+
+/// The request goes out CN_STUN_SENDS times, at cn_stun_at(k) ms after the start, and is given up at CN_STUN_GIVEUP_MS.
+pub const CN_STUN_SENDS : u32 = 4;
+pub const CN_STUN_GIVEUP_MS : u64 = 7500;
+pub const CN_DNS_MS : u64 = 5000;
+/// While the address is shown: ask again every CN_KEEP_MS, for CN_KEEP_FOR_MS after the person last pressed LOOK UP.
+pub const CN_KEEP_MS : u64 = 25000;
+pub const CN_KEEP_FOR_MS : u64 = 600000;
+
+pub const CN_SS_WAIT : u32 = 0;
+pub const CN_SS_SEND : u32 = 1;
+pub const CN_SS_GIVEUP : u32 = 2;
+
+/// When send k (0..3) is due: 0, 500, 1500, 3500 ms.
+pub fn cn_stun_at(k: u32) -> u64 {
+    var t : u64 = 0;
+    var i : u32 = 0;
+    while (i < k and i < CN_STUN_SENDS) {
+        t = t * 2 + 500;
+        i = i + 1;
+    }
+    return t;
+}
+
+/// The lookup el ms after it started, with `sent` requests out and no answer yet: send one now, wait, or give up.
+pub fn cn_stun_step(el: u64, sent: u32) -> u32 {
+    if (sent >= CN_STUN_SENDS) {
+        if (el >= CN_STUN_GIVEUP_MS) { return CN_SS_GIVEUP; }
+        return CN_SS_WAIT;
+    }
+    if (el >= cn_stun_at(sent)) { return CN_SS_SEND; }
+    return CN_SS_WAIT;
+}
+
+pub const CN_K_NONE : u32 = 0;
+pub const CN_K_REFRESH : u32 = 1;
+pub const CN_K_STALE : u32 = 2;
+
+/// An address is shown (state OK): ask_ago = ms since LOOK UP was pressed (or the launch that had T27OS_STUN=1),
+/// ok_ago = ms since the last answer. After CN_KEEP_FOR_MS the address goes STALE (nothing more is sent); before
+/// that it is asked again once it is CN_KEEP_MS old.
+pub fn cn_keep(ask_ago: u64, ok_ago: u64) -> u32 {
+    if (ask_ago >= CN_KEEP_FOR_MS) { return CN_K_STALE; }
+    if (ok_ago >= CN_KEEP_MS) { return CN_K_REFRESH; }
+    return CN_K_NONE;
+}
+
+/// The value of the PUBLIC line: the address and how old it is, or why there is none. mins = whole minutes since the
+/// answer. out: at least CN_TEXT_CAP bytes; the length.
+pub const CN_TEXT_CAP : usize = 96;
+pub fn cn_pub_text(st: u32, a: u64, mins: u64, out: []u8) -> usize {
+    if (out.len < CN_TEXT_CAP) { return 0; }
+    if (st == CN_S_DNS or st == CN_S_ASK) {
+        var n : usize = put_bytes(out, 0, "asking ");
+        return put_bytes(out, n, CN_STUN_HOST);
+    }
+    if (st == CN_S_NODNS) {
+        return put_bytes(out, 0, "STUN server not found");
+    }
+    if (st == CN_S_NOANSWER) {
+        return put_bytes(out, 0, "no answer from STUN");
+    }
+    if (st == CN_S_NOSOCK) { return put_bytes(out, 0, "calls are off"); }
+    if ((st == CN_S_OK or st == CN_S_STALE) and a != 0) {
+        var n : usize = cv_addr_text(cv_addr_ip(a), cv_addr_port(a), out);
+        if (st == CN_S_STALE) { return put_bytes(out, n, " may have changed"); }
+        if (mins == 0) { return put_bytes(out, n, " just now"); }
+        n = put_bytes(out, n, " ");
+        n = put_dec(out, n, mins);
+        return put_bytes(out, n, " min ago");
+    }
+    return put_bytes(out, 0, "not looked up");
+}
+
+/// LOOK UP is offered (not while a lookup runs, not when calls are off).
+pub fn cn_can_ask(st: u32) -> bool { return st != CN_S_DNS and st != CN_S_ASK and st != CN_S_NOSOCK; }
+
+// ---------------------------------------------------------------- 3. punching
+
+pub const CN_PROBE_LEN : usize = 16;
+pub const CN_PUNCH_FAST_MS : u64 = 3000;
+pub const CN_PUNCH_FAST_GAP : u64 = 100;
+pub const CN_PUNCH_GAP : u64 = 1000;
+pub const CN_PUNCH_MS : u64 = 30000;
+/// 30 in the first 3 s, then one a second while el < 30 s: 27 more.
+pub const CN_PUNCH_MAX : u64 = 57;
+
+/// A probe from this device (fingerprint fp, 10 bytes): "t27n", version 1, kind 1, fp. Its length, 16; 0 otherwise.
+pub fn cn_probe(fp: []const u8, out: []u8) -> usize {
+    if (fp.len != 10 or out.len < CN_PROBE_LEN) { return 0; }
+    out[0] = 116;
+    out[1] = 50;
+    out[2] = 55;
+    out[3] = 110;
+    out[4] = 1;
+    out[5] = 1;
+    var i : usize = 0;
+    while (i < 10) {
+        out[6 + i] = fp[i];
+        i = i + 1;
+    }
+    return CN_PROBE_LEN;
+}
+
+/// A datagram that is a probe (exactly 16 bytes, "t27n", version 1, kind 1). It is only counted.
+pub fn cn_probe_is(b: []const u8) -> bool {
+    return b.len == CN_PROBE_LEN and b[0] == 116 and b[1] == 50 and b[2] == 55 and b[3] == 110 and b[4] == 1 and b[5] == 1;
+}
+
+/// How many probes should be out el ms after the punch started.
+pub fn cn_punch_quota(el: u64) -> u64 {
+    if (el >= CN_PUNCH_MS) { return CN_PUNCH_MAX; }
+    if (el < CN_PUNCH_FAST_MS) { return el / CN_PUNCH_FAST_GAP + 1; }
+    return CN_PUNCH_FAST_MS / CN_PUNCH_FAST_GAP + (el - CN_PUNCH_FAST_MS) / CN_PUNCH_GAP + 1;
+}
+
+/// One more probe is due el ms after the punch started, with `sent` out.
+pub fn cn_punch_due(el: u64, sent: u64) -> bool { return sent < cn_punch_quota(el); }
+
+/// A target a probe may go to: the same rule as a dial (a public or private unicast IPv4, never multicast, broadcast,
+/// 0/8, 240/4 or link-local, a port in 1..65535), and not this machine.
+pub fn cn_punch_ok(a: u64) -> bool { return cn_mapped_ok(a); }
+
+// ---------------------------------------------------------------- 4. which address to call
+
+/// The same public IP as this device's own (both behind one router).
+pub fn cn_same_router(a: u64, my_pub: u64) -> bool {
+    return a != 0 and my_pub != 0 and cv_addr_ip(a) == cv_addr_ip(my_pub);
+}
+
+/// The address to call a friend at: on this network (lan, while its announcement is fresh); else its public address
+/// (pub) when it is one and not behind this device's own router (my_pub); 0 when there is none.
+pub fn cn_pick(lan: u64, lan_fresh: bool, pub_a: u64, my_pub: u64) -> u64 {
+    if (lan_fresh and lan != 0) { return lan; }
+    if (pub_a == 0 or cv_addr_class(cv_addr_ip(pub_a)) != CV_AC_PUBLIC or !cn_mapped_ok(pub_a)) { return 0; }
+    if (cn_same_router(pub_a, my_pub)) { return 0; }
+    return pub_a;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn cn_eq(a: []const u8, n: usize, s: []const u8) -> bool {
+    if (n != s.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// RFC 5769 section 2.2, "Sample IPv4 Response": XOR-MAPPED-ADDRESS 192.0.2.1:32853, with SOFTWARE, MESSAGE-INTEGRITY
+/// and FINGERPRINT around it (80 bytes).
+fn cn_rfc5769(b: []u8) -> usize {
+    const v : [80]u8 = [1, 1, 0, 60, 33, 18, 164, 66, 183, 231, 167, 1, 188, 52, 214, 134, 250, 135, 223, 174, 128, 34, 0, 11, 116, 101, 115, 116, 32, 118, 101, 99, 116, 111, 114, 32, 0, 32, 0, 8, 0, 1, 161, 71, 225, 18, 166, 67, 0, 8, 0, 20, 43, 145, 245, 153, 253, 158, 144, 17, 156, 31, 138, 82, 63, 243, 254, 57, 200, 181, 253, 150, 128, 40, 0, 4, 192, 125, 76, 150];
+    var i : usize = 0;
+    while (i < 80) {
+        b[i] = v[i];
+        i = i + 1;
+    }
+    return 80;
+}
+
+fn cn_rfc_txid(t: []u8) -> void {
+    const v : [12]u8 = [183, 231, 167, 1, 188, 52, 214, 134, 250, 135, 223, 174];
+    var i : usize = 0;
+    while (i < 12) {
+        t[i] = v[i];
+        i = i + 1;
+    }
+}
+
+test cn_the_request_is_twenty_bytes_with_the_cookie_and_the_id {
+    var t : [12]u8 = undefined;
+    cn_rfc_txid(t[0..12]);
+    var r : [20]u8 = undefined;
+    assert cn_stun_request(t[0..12], r[0..20]) == 20;
+    assert r[0] == 0 and r[1] == 1 and r[2] == 0 and r[3] == 0;
+    assert r[4] == 33 and r[5] == 18 and r[6] == 164 and r[7] == 66;
+    assert r[8] == 183 and r[19] == 174;
+    // it looks like STUN, and it is no answer
+    assert cn_stun_looks(r[0..20]);
+    assert cn_stun_parse(r[0..20], t[0..12]) == 0;
+    assert cn_stun_request(t[0..11], r[0..20]) == 0;
+    assert cn_stun_request(t[0..12], r[0..19]) == 0;
+}
+
+test cn_the_rfc5769_answer_reads_as_192_0_2_1_port_32853 {
+    var b : [80]u8 = undefined;
+    const n : usize = cn_rfc5769(b[0..80]);
+    var t : [12]u8 = undefined;
+    cn_rfc_txid(t[0..12]);
+    assert cn_stun_looks(b[0..n]);
+    const a : u64 = cn_stun_parse(b[0..n], t[0..12]);
+    assert cv_addr_ip(a) == 3221225985 and cv_addr_port(a) == 32853;
+    // another transaction: nothing
+    t[11] = 0;
+    assert cn_stun_parse(b[0..n], t[0..12]) == 0;
+}
+
+test cn_anything_but_a_whole_answer_to_this_request_gives_nothing {
+    var b : [80]u8 = undefined;
+    var t : [12]u8 = undefined;
+    cn_rfc_txid(t[0..12]);
+    var n : usize = cn_rfc5769(b[0..80]);
+    // cut short: the length no longer matches the datagram
+    assert cn_stun_looks(b[0..76]) == false and cn_stun_parse(b[0..76], t[0..12]) == 0;
+    // an error response type (0x0111)
+    b[1] = 17;
+    assert cn_stun_parse(b[0..n], t[0..12]) == 0;
+    n = cn_rfc5769(b[0..80]);
+    // a request type
+    b[1] = 1;
+    b[0] = 0;
+    assert cn_stun_parse(b[0..n], t[0..12]) == 0;
+    n = cn_rfc5769(b[0..80]);
+    // the two top bits set: not STUN at all (a call frame starts with 'T' = 0x54, so never)
+    b[0] = 65;
+    assert cn_stun_looks(b[0..n]) == false;
+    n = cn_rfc5769(b[0..80]);
+    // another cookie
+    b[7] = 67;
+    assert cn_stun_looks(b[0..n]) == false;
+    n = cn_rfc5769(b[0..80]);
+    // an attribute that runs past the end (SOFTWARE says 200 bytes)
+    b[22] = 0;
+    b[23] = 200;
+    assert cn_stun_parse(b[0..n], t[0..12]) == 0;
+    n = cn_rfc5769(b[0..80]);
+    // an IPv6 family in XOR-MAPPED-ADDRESS (with an IPv4 length): not taken, and there is no MAPPED-ADDRESS
+    b[41] = 2;
+    assert cn_stun_parse(b[0..n], t[0..12]) == 0;
+    // a call frame head and a probe never look like STUN
+    const f : [20]u8 = [84, 50, 55, 80, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert cn_stun_looks(f[0..20]) == false;
+    var p : [16]u8 = undefined;
+    assert cn_probe(t[0..10], p[0..16]) == 16;
+    assert cn_stun_looks(p[0..16]) == false;
+}
+
+test cn_mapped_address_counts_when_there_is_no_xor_and_xor_wins_when_both_are_there {
+    var t : [12]u8 = undefined;
+    cn_rfc_txid(t[0..12]);
+    // header + MAPPED-ADDRESS 203.0.113.7:51234
+    var b : [44]u8 = undefined;
+    cn_stun_request(t[0..12], b[0..20]);
+    b[0] = 1;
+    b[1] = 1;
+    b[3] = 12;
+    const m : [12]u8 = [0, 1, 0, 8, 0, 1, 200, 34, 203, 0, 113, 7];
+    var i : usize = 0;
+    while (i < 12) {
+        b[20 + i] = m[i];
+        i = i + 1;
+    }
+    var a : u64 = cn_stun_parse(b[0..32], t[0..12]);
+    assert cv_addr_ip(a) == 3405803783 and cv_addr_port(a) == 51234;
+    // then an old-style XOR-MAPPED-ADDRESS (0x8020) naming 192.0.2.1:32853: it wins
+    b[3] = 24;
+    const x : [12]u8 = [128, 32, 0, 8, 0, 1, 161, 71, 225, 18, 166, 67];
+    i = 0;
+    while (i < 12) {
+        b[32 + i] = x[i];
+        i = i + 1;
+    }
+    a = cn_stun_parse(b[0..44], t[0..12]);
+    assert cv_addr_ip(a) == 3221225985 and cv_addr_port(a) == 32853;
+    // a mapped address that is no use: port 0, 127.0.0.1, multicast, link-local
+    b[3] = 12;
+    b[26] = 0;
+    b[27] = 0;
+    assert cn_stun_parse(b[0..32], t[0..12]) == 0;
+    b[27] = 1;
+    b[28] = 127;
+    b[29] = 0;
+    b[30] = 0;
+    b[31] = 1;
+    assert cn_stun_parse(b[0..32], t[0..12]) == 0;
+    b[28] = 224;
+    assert cn_stun_parse(b[0..32], t[0..12]) == 0;
+    b[28] = 169;
+    b[29] = 254;
+    assert cn_stun_parse(b[0..32], t[0..12]) == 0;
+    b[28] = 192;
+    b[29] = 168;
+    assert cn_stun_parse(b[0..32], t[0..12]) != 0;
+}
+
+test cn_the_request_goes_four_times_then_the_lookup_gives_up {
+    assert cn_stun_at(0) == 0 and cn_stun_at(1) == 500 and cn_stun_at(2) == 1500 and cn_stun_at(3) == 3500;
+    assert cn_stun_step(0, 0) == CN_SS_SEND;
+    assert cn_stun_step(499, 1) == CN_SS_WAIT and cn_stun_step(500, 1) == CN_SS_SEND;
+    assert cn_stun_step(1499, 2) == CN_SS_WAIT and cn_stun_step(1500, 2) == CN_SS_SEND;
+    assert cn_stun_step(3500, 3) == CN_SS_SEND;
+    assert cn_stun_step(7499, 4) == CN_SS_WAIT and cn_stun_step(7500, 4) == CN_SS_GIVEUP;
+    // a late tick sends one request at a time, never a burst
+    assert cn_stun_step(9000, 2) == CN_SS_SEND;
+    // count every send the schedule allows over 10 s, one tick per 10 ms
+    var sent : u32 = 0;
+    var el : u64 = 0;
+    var gave : bool = false;
+    while (el < 10000 and !gave) {
+        const d : u32 = cn_stun_step(el, sent);
+        if (d == CN_SS_SEND) { sent = sent + 1; }
+        if (d == CN_SS_GIVEUP) { gave = true; }
+        el = el + 10;
+    }
+    assert sent == 4 and gave;
+}
+
+test cn_a_shown_address_is_asked_again_and_goes_stale_after_ten_minutes {
+    assert cn_keep(0, 0) == CN_K_NONE;
+    assert cn_keep(30000, 24999) == CN_K_NONE;
+    assert cn_keep(30000, 25000) == CN_K_REFRESH;
+    assert cn_keep(599999, 25000) == CN_K_REFRESH;
+    assert cn_keep(600000, 0) == CN_K_STALE;
+    assert cn_keep(600000, 25000) == CN_K_STALE;
+}
+
+test cn_the_public_line_says_the_address_or_why_there_is_none {
+    var o : [96]u8 = undefined;
+    const a : u64 = 3405803783 * 65536 + 51234;
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_NONE, 0, 0, o[0..96]), "not looked up");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_DNS, 0, 0, o[0..96]), "asking stun.l.google.com");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_ASK, 0, 0, o[0..96]), "asking stun.l.google.com");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_OK, a, 0, o[0..96]), "203.0.113.7:51234 just now");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_OK, a, 3, o[0..96]), "203.0.113.7:51234 3 min ago");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_STALE, a, 12, o[0..96]), "203.0.113.7:51234 may have changed");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_NODNS, 0, 0, o[0..96]), "STUN server not found");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_NOANSWER, 0, 0, o[0..96]), "no answer from STUN");
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_NOSOCK, 0, 0, o[0..96]), "calls are off");
+    // OK with no address is never shown as one
+    assert cn_eq(o[0..96], cn_pub_text(CN_S_OK, 0, 0, o[0..96]), "not looked up");
+    assert cn_pub_text(CN_S_OK, a, 0, o[0..95]) == 0;
+    assert cn_can_ask(CN_S_NONE) and cn_can_ask(CN_S_OK) and cn_can_ask(CN_S_STALE) and cn_can_ask(CN_S_NODNS) and cn_can_ask(CN_S_NOANSWER);
+    assert cn_can_ask(CN_S_DNS) == false and cn_can_ask(CN_S_ASK) == false and cn_can_ask(CN_S_NOSOCK) == false;
+}
+
+test cn_a_probe_is_sixteen_bytes_and_only_that_reads_as_one {
+    const fp : [10]u8 = [9, 221, 205, 205, 1, 2, 3, 4, 5, 6];
+    var p : [16]u8 = undefined;
+    assert cn_probe(fp[0..10], p[0..16]) == 16;
+    assert p[0] == 116 and p[3] == 110 and p[4] == 1 and p[5] == 1 and p[6] == 9 and p[15] == 6;
+    assert cn_probe_is(p[0..16]);
+    assert cn_probe_is(p[0..15]) == false;
+    // a longer datagram that starts like a probe is no probe
+    var q : [17]u8 = undefined;
+    assert cn_probe(fp[0..10], q[0..17]) == 16;
+    q[16] = 0;
+    assert cn_probe_is(q[0..17]) == false and cn_probe_is(q[0..16]);
+    p[4] = 2;
+    assert cn_probe_is(p[0..16]) == false;
+    p[4] = 1;
+    p[0] = 84;
+    assert cn_probe_is(p[0..16]) == false;
+    assert cn_probe(fp[0..9], p[0..16]) == 0 and cn_probe(fp[0..10], p[0..15]) == 0;
+}
+
+test cn_the_punch_sends_fast_for_three_seconds_then_once_a_second_and_stops_at_thirty {
+    assert cn_punch_quota(0) == 1 and cn_punch_quota(99) == 1 and cn_punch_quota(100) == 2;
+    assert cn_punch_quota(2999) == 30 and cn_punch_quota(3000) == 31 and cn_punch_quota(3999) == 31;
+    assert cn_punch_quota(29999) == CN_PUNCH_MAX and cn_punch_quota(30000) == CN_PUNCH_MAX;
+    assert cn_punch_quota(1000000) == CN_PUNCH_MAX;
+    // ticks every 5 ms for 40 s: CN_PUNCH_MAX probes, never two in one tick, none after 30 s
+    var sent : u64 = 0;
+    var el : u64 = 0;
+    var late : u64 = 0;
+    while (el < 40000) {
+        if (cn_punch_due(el, sent)) {
+            sent = sent + 1;
+            if (el >= CN_PUNCH_MS) { late = late + 1; }
+        }
+        el = el + 5;
+    }
+    assert sent == CN_PUNCH_MAX and late == 0;
+    // the targets: a dial's rule, never this machine
+    assert cn_punch_ok(3405803783 * 65536 + 51234);
+    assert cn_punch_ok(3232235786 * 65536 + 47727);
+    assert cn_punch_ok(2130706433 * 65536 + 47727) == false;
+    assert cn_punch_ok(3758096635 * 65536 + 5353) == false;
+    assert cn_punch_ok(4294967295 * 65536 + 47727) == false;
+    assert cn_punch_ok(3405803783 * 65536) == false;
+}
+
+test cn_a_friend_is_called_on_this_network_first_then_at_its_public_address_but_never_behind_my_router {
+    const lan : u64 = 3232235786 * 65536 + 47727;
+    const pa : u64 = 3405803783 * 65536 + 51234;
+    const mine : u64 = 3405803783 * 65536 + 40000;
+    const other : u64 = 134744072 * 65536 + 47727;
+    assert cn_pick(lan, true, pa, other) == lan;
+    assert cn_pick(lan, false, pa, other) == pa;
+    assert cn_pick(0, true, pa, 0) == pa;
+    assert cn_pick(lan, false, 0, other) == 0;
+    // the same public IP as mine: that friend is behind my router, reached on this network only
+    assert cn_same_router(pa, mine) and cn_same_router(pa, other) == false and cn_same_router(pa, 0) == false;
+    assert cn_pick(lan, false, pa, mine) == 0;
+    assert cn_pick(lan, true, pa, mine) == lan;
+    // a "public" address that is private, multicast or has no port is no public address
+    assert cn_pick(0, false, lan, 0) == 0;
+    assert cn_pick(0, false, 3758096635 * 65536 + 5353, 0) == 0;
+    assert cn_pick(0, false, 3405803783 * 65536, 0) == 0;
+}

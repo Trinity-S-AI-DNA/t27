@@ -1,0 +1,906 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_vt.t27 -- the hardware H.264 encoder and decoder of a one to one call (owner, 2026-10-23), from
+// macOS VideoToolbox. Host code (@extern): build it with t27b. What a frame looks like on the wire, when a key frame
+// is needed, the bitrate and the picture size are call_h264.t27's decisions; this file only drives the codec.
+//
+// Encoder (vte_*): one block per window (vte_new), a VTCompressionSession at the picture size of a ladder rung
+// (call_h264 vl_w / vl_h), real time, no frame reordering (so no B-frames), Constrained Baseline with the low-latency
+// rate control when the system has it, else Main; the average bitrate and a one-second data rate limit of 1.5 times
+// it; 30 frames a second expected, a key frame every 2 s at most. The camera thread (call_video.t27 cvl_frame) hands
+// each 1280x720 frame to vte_encode; a frame at another size is scaled by VideoToolbox's own pixel transfer. The
+// encoder's thread (vte_out) writes each coded frame into a ring of VE_SLOTS entries, already in the wire layout of
+// call_h264 vh_pack (a key frame: its two parameter sets as length-prefixed units, then the picture as the encoder
+// gave it); the polling thread reads the oldest entry part by part (vte_ready / vte_len / vte_read / vte_pop) and
+// never waits. A full ring drops the frame and forces the next one to be a key frame. The rung, the bitrate and a
+// forced key frame are asked for by the polling thread (vte_want, vte_force) and applied by the camera thread before
+// its next frame, so the session is only ever touched from the camera's queue.
+// Decoder (vtd_*): one block and one serial queue per window (vtd_new). vtd_post copies one complete frame that
+// call_h264 vd_gate let through into a job and queues it, so the polling thread never waits for the codec (a session
+// takes about 70 ms to make); on the queue the job makes (or remakes, when the parameter sets change) the
+// VTDecompressionSession and hands it the picture without its parameter sets, asynchronously. The decoder's thread
+// (vtd_out) puts each picture (a BGRA CVPixelBuffer on an IOSurface) into a one-slot mailbox (vtm_put); the window
+// takes the newest (vtm_take) and shows it on a layer. A picture the decoder refuses is counted (vtd_errors) and the
+// window reports it to the gate (vd_error).
+// Nothing here touches the network or a file. Refs gHashTag/t27#11560.
+module T27osCallVt;
+
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::callback_probe::cbp_get;
+use t27os::callback_probe::cbp_put;
+use t27os::callback_probe::cbp_inc;
+use t27os::callback_probe::cbp_zero;
+use t27os::call_h264::VH_FRAME_MAX;
+use t27os::call_h264::VH_NAL_SPS;
+use t27os::call_h264::VH_NAL_PPS;
+use t27os::call_h264::VH_NONE;
+use t27os::call_h264::vh_find;
+use t27os::call_h264::vh_nal_len;
+use t27os::call_h264::vh_nals;
+use t27os::call_h264::vh_strip_len;
+use t27os::call_h264::vl_w;
+use t27os::call_h264::vl_h;
+use t27os::call_h264::VL_RUNGS;
+
+const VT_RTLD_DEFAULT : u64 = 18446744073709551614;
+const VT_FFI_SYSV : u32 = 1;
+/// 'avc1'
+pub const VT_AVC1 : u32 = 1635148593;
+/// kCVPixelFormatType_32BGRA
+pub const VT_BGRA : u32 = 1111970369;
+const VT_UTF8 : u32 = 134217984;
+/// kCFNumberSInt32Type, kCFNumberFloat64Type
+const VT_NUM_I32 : u64 = 3;
+const VT_NUM_F64 : u64 = 6;
+
+fn vt_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn vt_calloc(n: u64, size: u64) -> u64 { return @extern("calloc"); }
+fn vt_copy(dst: u64, src: u64, n: u64) -> u64 { return @extern("memmove"); }
+fn vt_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn vt_at(p: []const u8, q: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn vt_now() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn vt_release(x: u64) -> void { @extern("CFRelease"); }
+fn vt_fence() -> void { @extern("OSMemoryBarrier"); }
+fn vt_lock(p: u64) -> void { @extern("os_unfair_lock_lock"); }
+fn vt_unlock(p: u64) -> void { @extern("os_unfair_lock_unlock"); }
+fn vt_ffi_prep(cif: u64, abi: u32, nargs: u32, rtype: u64, atypes: u64) -> i32 { return @extern("ffi_prep_cif"); }
+fn vt_ffi_call(cif: u64, f: u64, rv: u64, avals: u64) -> void { @extern("ffi_call"); }
+fn vt_cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn vt_cf_num(alloc: u64, kind: u64, p: u64) -> u64 { return @extern("CFNumberCreate"); }
+fn vt_cf_dict(alloc: u64, keys: u64, vals: u64, n: u64, kcb: u64, vcb: u64) -> u64 { return @extern("CFDictionaryCreate"); }
+fn vt_cf_array(alloc: u64, vals: u64, n: u64, cb: u64) -> u64 { return @extern("CFArrayCreate"); }
+fn vt_arr_count(a: u64) -> i64 { return @extern("CFArrayGetCount"); }
+fn vt_arr_at(a: u64, i: i64) -> u64 { return @extern("CFArrayGetValueAtIndex"); }
+fn vt_dict_get(d: u64, k: u64) -> u64 { return @extern("CFDictionaryGetValue"); }
+fn vt_set_prop(s: u64, key: u64, val: u64) -> i32 { return @extern("VTSessionSetProperty"); }
+fn vt_enc_frame(s: u64, pb: u64, pts: u64, dur: u64, props: u64, src: u64, info: u64) -> i32 { return @extern("VTCompressionSessionEncodeFrame"); }
+fn vt_enc_complete(s: u64, until: u64) -> i32 { return @extern("VTCompressionSessionCompleteFrames"); }
+fn vt_enc_invalidate(s: u64) -> void { @extern("VTCompressionSessionInvalidate"); }
+fn vt_sb_data(sb: u64) -> u64 { return @extern("CMSampleBufferGetDataBuffer"); }
+fn vt_sb_fmt(sb: u64) -> u64 { return @extern("CMSampleBufferGetFormatDescription"); }
+fn vt_sb_attach(sb: u64, create: bool) -> u64 { return @extern("CMSampleBufferGetSampleAttachmentsArray"); }
+fn vt_bb_len(bb: u64) -> u64 { return @extern("CMBlockBufferGetDataLength"); }
+fn vt_bb_copy(bb: u64, off: u64, len: u64, dst: u64) -> i32 { return @extern("CMBlockBufferCopyDataBytes"); }
+fn vt_ps_at(fmt: u64, idx: u64, ptr_out: u64, size_out: u64, count_out: u64, nal_out: u64) -> i32 { return @extern("CMVideoFormatDescriptionGetH264ParameterSetAtIndex"); }
+fn vt_fmt_from_ps(alloc: u64, count: u64, ptrs: u64, sizes: u64, nal: i32, out: u64) -> i32 { return @extern("CMVideoFormatDescriptionCreateFromH264ParameterSets"); }
+fn vt_dims(fmt: u64) -> u64 { return @extern("CMVideoFormatDescriptionGetDimensions"); }
+fn vt_bb_empty(alloc: u64, cap: u32, flags: u32, out: u64) -> i32 { return @extern("CMBlockBufferCreateEmpty"); }
+fn vt_bb_append(bb: u64, mem: u64, len: u64, alloc: u64, src: u64, off: u64, dlen: u64, flags: u32) -> i32 { return @extern("CMBlockBufferAppendMemoryBlock"); }
+fn vt_bb_replace(src: u64, bb: u64, off: u64, len: u64) -> i32 { return @extern("CMBlockBufferReplaceDataBytes"); }
+fn vt_dec_create(alloc: u64, fmt: u64, spec: u64, attrs: u64, rec: u64, out: u64) -> i32 { return @extern("VTDecompressionSessionCreate"); }
+fn vt_dec_frame(s: u64, sb: u64, flags: u32, src: u64, info: u64) -> i32 { return @extern("VTDecompressionSessionDecodeFrame"); }
+fn vt_dec_wait(s: u64) -> i32 { return @extern("VTDecompressionSessionWaitForAsynchronousFrames"); }
+fn vt_dec_invalidate(s: u64) -> void { @extern("VTDecompressionSessionInvalidate"); }
+pub fn vt_pb_w(pb: u64) -> u64 { return @extern("CVPixelBufferGetWidth"); }
+pub fn vt_pb_h(pb: u64) -> u64 { return @extern("CVPixelBufferGetHeight"); }
+pub fn vt_pb_retain(pb: u64) -> u64 { return @extern("CVPixelBufferRetain"); }
+pub fn vt_pb_release(pb: u64) -> void { @extern("CVPixelBufferRelease"); }
+pub fn vt_pb_surface(pb: u64) -> u64 { return @extern("CVPixelBufferGetIOSurface"); }
+
+fn vt_us() -> u64 { return @as(u64, @intFromFloat(vt_now() * 1000000.0)); }
+
+fn vt_cf(s: []const u8) -> u64 { return vt_cf_str(0, s, s.len, VT_UTF8, false); }
+
+/// The value a framework constant holds (a CFStringRef key, kCFBooleanTrue ..), read through its dlsym address.
+pub fn vt_konst(name: []const u8) -> u64 {
+    const a : u64 = vt_dlsym(VT_RTLD_DEFAULT, name);
+    if (a == 0) { return 0; }
+    return cbp_get(a);
+}
+
+/// A CFNumber of an integer (SInt32) or of a double given as its IEEE-754 bits, made in `tmp` (8 bytes of memory).
+fn vt_num_i(tmp: u64, v: u64) -> u64 {
+    cbp_put(tmp, v & 4294967295);
+    return vt_cf_num(0, VT_NUM_I32, tmp);
+}
+
+fn vt_num_f(tmp: u64, bits: u64) -> u64 {
+    cbp_put(tmp, bits);
+    return vt_cf_num(0, VT_NUM_F64, tmp);
+}
+
+/// A dictionary of one key and value (CFType callbacks), made with `tmp` (16 bytes of memory).
+fn vt_dict1(tmp: u64, k: u64, v: u64) -> u64 {
+    cbp_put(tmp, k);
+    cbp_put(tmp + 8, v);
+    return vt_cf_dict(0, tmp, tmp + 8, 1, vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+}
+
+fn vt_dict2(tmp: u64, k1: u64, v1: u64, k2: u64, v2: u64) -> u64 {
+    cbp_put(tmp, k1);
+    cbp_put(tmp + 8, k2);
+    cbp_put(tmp + 16, v1);
+    cbp_put(tmp + 24, v2);
+    return vt_cf_dict(0, tmp, tmp + 16, 2, vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+}
+
+/// A big-endian u32 written at address a.
+fn vt_be32(a: u64, v: u64) -> void {
+    var b : [4]u8 = undefined;
+    b[0] = @as(u8, @intCast((v >> 24) & 255));
+    b[1] = @as(u8, @intCast((v >> 16) & 255));
+    b[2] = @as(u8, @intCast((v >> 8) & 255));
+    b[3] = @as(u8, @intCast(v & 255));
+    vt_poke(a, b[0..4], 4);
+}
+
+/// One call through libffi of a function with up to 12 integer or pointer arguments (VideoToolbox and CoreMedia have
+/// a few with 9 or 10: t27b passes at most 8). `mem` is 512 bytes of scratch memory that stays put during the call;
+/// kinds[i] 1 = pointer / u64, 4 = sint32, 5 = uint32; the value of each argument is vals[i]. The i32 result.
+fn vt_ffi(mem: u64, f: u64, kinds: []const u8, vals: []const u64) -> i32 {
+    const n : usize = kinds.len;
+    if (f == 0 or n > 12 or vals.len < n) { return -1; }
+    const tp : u64 = vt_dlsym(VT_RTLD_DEFAULT, "ffi_type_pointer");
+    const ts32 : u64 = vt_dlsym(VT_RTLD_DEFAULT, "ffi_type_sint32");
+    const tu32 : u64 = vt_dlsym(VT_RTLD_DEFAULT, "ffi_type_uint32");
+    if (tp == 0 or ts32 == 0 or tu32 == 0) { return -1; }
+    // cif at mem, the type list at mem + 64, the values at mem + 192, the pointers to them at mem + 320, result + 448
+    cbp_zero(mem, 512);
+    var i : usize = 0;
+    while (i < n) {
+        var t : u64 = tp;
+        if (kinds[i] == 4) { t = ts32; }
+        if (kinds[i] == 5) { t = tu32; }
+        cbp_put(mem + 64 + @as(u64, i) * 8, t);
+        cbp_put(mem + 192 + @as(u64, i) * 8, vals[i]);
+        cbp_put(mem + 320 + @as(u64, i) * 8, mem + 192 + @as(u64, i) * 8);
+        i = i + 1;
+    }
+    if (vt_ffi_prep(mem, VT_FFI_SYSV, @as(u32, @intCast(n)), ts32, mem + 64) != 0) { return -1; }
+    vt_ffi_call(mem, f, mem + 448, mem + 320);
+    const r : u64 = cbp_get(mem + 448) & 4294967295;
+    if (r >= 2147483648) { return @as(i32, @intCast(@as(i64, @intCast(r)) - 4294967296)); }
+    return @as(i32, @intCast(r));
+}
+
+// ---------------------------------------------------------------- the mailbox of one picture
+
+/// A one-slot mailbox at `at` (16 bytes: an os_unfair_lock, then the CVPixelBuffer): put keeps its own reference to
+/// pb and releases the one it replaces (the second result bit: 1 when a picture was there untaken); take hands the
+/// newest picture to the caller, who releases it. Any thread may put, one thread takes.
+pub fn vtm_put(at: u64, pb: u64) -> u64 {
+    if (at == 0 or pb == 0) { return 0; }
+    vt_pb_retain(pb);
+    vt_lock(at);
+    const old : u64 = cbp_get(at + 8);
+    cbp_put(at + 8, pb);
+    vt_unlock(at);
+    if (old != 0) {
+        vt_pb_release(old);
+        return 3;
+    }
+    return 1;
+}
+
+pub fn vtm_take(at: u64) -> u64 {
+    if (at == 0) { return 0; }
+    vt_lock(at);
+    const pb : u64 = cbp_get(at + 8);
+    cbp_put(at + 8, 0);
+    vt_unlock(at);
+    return pb;
+}
+
+// ---------------------------------------------------------------- the encoder
+
+const VE_MAGIC_V : u64 = 7505702094815069249;
+pub const VE_SESS : u64 = 1;
+pub const VE_W : u64 = 2;
+pub const VE_H : u64 = 3;
+pub const VE_RUNG : u64 = 4;
+pub const VE_WANT_RUNG : u64 = 5;
+pub const VE_WANT_KBPS : u64 = 6;
+pub const VE_KBPS : u64 = 7;
+pub const VE_FORCE : u64 = 8;
+pub const VE_GEN : u64 = 9;
+pub const VE_IN : u64 = 10;
+pub const VE_OUT : u64 = 11;
+pub const VE_DROP : u64 = 12;
+pub const VE_ERR : u64 = 13;
+pub const VE_KEYS : u64 = 14;
+pub const VE_BYTES : u64 = 15;
+pub const VE_OVER : u64 = 16;
+pub const VE_CFAIL : u64 = 17;
+pub const VE_WI : u64 = 18;
+pub const VE_RI : u64 = 19;
+pub const VE_CSTAT : u64 = 20;
+pub const VE_LAT_MAX : u64 = 21;
+pub const VE_LAT_SUM : u64 = 22;
+pub const VE_LAT_N : u64 = 23;
+pub const VE_LOWLAT : u64 = 24;
+pub const VE_CREATES : u64 = 25;
+pub const VE_FN_OUT : u64 = 26;
+pub const VE_BIG : u64 = 27;
+pub const VE_PROPFAIL : u64 = 28;
+pub const VE_NAL4 : u64 = 29;
+pub const VE_CALL_MAX : u64 = 30;
+pub const VE_SRCW : u64 = 31;
+pub const VE_SRCH : u64 = 32;
+/// Submit time of frame i at slot VE_TS + i % 64.
+const VE_TS : u64 = 64;
+/// Scratch: libffi (512 bytes), CF building (64), the presentation time and the duration (24 each), info flags,
+/// parameter set pointers and sizes.
+const VE_FFI : u64 = 1024;
+const VE_TMP : u64 = 1536;
+const VE_PTS : u64 = 1600;
+const VE_DUR : u64 = 1632;
+const VE_INFO : u64 = 1664;
+const VE_PSP : u64 = 1680;
+pub const VE_RING : u64 = 4096;
+pub const VE_SLOTS : u64 = 8;
+/// An entry: length, meta (1 = key frame, rung << 8, generation << 16), the time it came out of the encoder (us), then
+/// the frame.
+pub const VE_ENT : u64 = 131096;
+pub const VE_SIZE : u64 = 1052864;
+
+fn ve(e: u64, k: u64) -> u64 { return cbp_get(e + k * 8); }
+fn vep(e: u64, k: u64, v: u64) -> void { cbp_put(e + k * 8, v); }
+fn ve_ok(e: u64) -> bool { return e != 0 and cbp_get(e) == VE_MAGIC_V; }
+
+/// A new encoder block (no session yet: the camera thread makes it at its first frame). 0 without memory.
+pub fn vte_new() -> u64 {
+    const e : u64 = vt_calloc(1, VE_SIZE);
+    if (e == 0) { return 0; }
+    cbp_put(e, VE_MAGIC_V);
+    vep(e, VE_RUNG, 255);
+    vep(e, VE_WANT_RUNG, 0);
+    vep(e, VE_WANT_KBPS, 1200);
+    // Never true: makes sure the callbacks are emitted and exported for dlsym.
+    if (ve(e, VE_GEN) == 99) { vte_out(0, 0, 0, 0, 0); vtd_out(0, 0, 0, 0, 0, 0, 0); }
+    vep(e, VE_FN_OUT, vt_dlsym(VT_RTLD_DEFAULT, "vte_out"));
+    return e;
+}
+
+/// The rung and the bitrate the next frames should have (polling thread; the camera thread applies them).
+pub fn vte_want(e: u64, rung: u32, kbps: u64) -> void {
+    if (!ve_ok(e)) { return; }
+    var r : u64 = @as(u64, rung);
+    if (r >= @as(u64, VL_RUNGS)) { r = @as(u64, VL_RUNGS) - 1; }
+    vep(e, VE_WANT_RUNG, r);
+    vep(e, VE_WANT_KBPS, kbps);
+}
+
+/// The next frame is a key frame.
+pub fn vte_force(e: u64) -> void {
+    if (ve_ok(e)) { vep(e, VE_FORCE, 1); }
+}
+
+fn vte_rate(e: u64, s: u64, kbps: u64) -> void {
+    const tmp : u64 = e + VE_TMP;
+    const br : u64 = vt_num_i(tmp, kbps * 1000);
+    if (vt_set_prop(s, vt_konst("kVTCompressionPropertyKey_AverageBitRate"), br) != 0) { vep(e, VE_PROPFAIL, ve(e, VE_PROPFAIL) + 1); }
+    vt_release(br);
+    // at most 1.5 times the average in any one second: [bytes, seconds]
+    const by : u64 = vt_num_i(tmp, kbps * 1000 / 8 * 3 / 2);
+    // 1.0 = 0x3FF0000000000000
+    const one : u64 = vt_num_f(tmp + 8, 4607182418800017408);
+    cbp_put(tmp + 16, by);
+    cbp_put(tmp + 24, one);
+    const arr : u64 = vt_cf_array(0, tmp + 16, 2, vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeArrayCallBacks"));
+    if (arr != 0) {
+        if (vt_set_prop(s, vt_konst("kVTCompressionPropertyKey_DataRateLimits"), arr) != 0) { vep(e, VE_PROPFAIL, ve(e, VE_PROPFAIL) + 1); }
+        vt_release(arr);
+    }
+    vt_release(by);
+    vt_release(one);
+    vep(e, VE_KBPS, kbps);
+}
+
+fn vte_prop(e: u64, s: u64, key: []const u8, val: u64) -> void {
+    if (val == 0 or vt_set_prop(s, vt_konst(key), val) != 0) { vep(e, VE_PROPFAIL, ve(e, VE_PROPFAIL) + 1); }
+}
+
+/// Close the session of the block, if any: the frames it still holds come out first (camera queue).
+fn vte_drop_session(e: u64) -> void {
+    const s : u64 = ve(e, VE_SESS);
+    if (s == 0) { return; }
+    // kCMTimeInvalid: all zeros
+    cbp_zero(e + VE_DUR, 24);
+    vt_enc_complete(s, e + VE_DUR);
+    vt_enc_invalidate(s);
+    vt_release(s);
+    vep(e, VE_SESS, 0);
+    vep(e, VE_RUNG, 255);
+}
+
+/// A session at the size of rung r (camera queue). True when one runs.
+fn vte_open(e: u64, r: u64) -> bool {
+    vte_drop_session(e);
+    const w : u64 = vl_w(@as(u32, @intCast(r)));
+    const h : u64 = vl_h(@as(u32, @intCast(r)));
+    const f : u64 = vt_dlsym(VT_RTLD_DEFAULT, "VTCompressionSessionCreate");
+    const tmp : u64 = e + VE_TMP;
+    const tru : u64 = vt_konst("kCFBooleanTrue");
+    const fals : u64 = vt_konst("kCFBooleanFalse");
+    // the low-latency rate control first (macOS 11.3+); a plain real-time session when it is refused
+    const spec : u64 = vt_dict1(tmp, vt_konst("kVTVideoEncoderSpecification_EnableLowLatencyRateControl"), tru);
+    var kinds : [10]u8 = undefined;
+    kinds[0] = 1; kinds[1] = 4; kinds[2] = 4; kinds[3] = 5; kinds[4] = 1;
+    kinds[5] = 1; kinds[6] = 1; kinds[7] = 1; kinds[8] = 1; kinds[9] = 1;
+    var vals : [10]u64 = undefined;
+    vals[0] = 0; vals[1] = w; vals[2] = h; vals[3] = @as(u64, VT_AVC1); vals[4] = spec;
+    vals[5] = 0; vals[6] = 0; vals[7] = ve(e, VE_FN_OUT); vals[8] = e; vals[9] = e + VE_SESS * 8;
+    vep(e, VE_SESS, 0);
+    var st : i32 = vt_ffi(e + VE_FFI, f, kinds[0..10], vals[0..10]);
+    vep(e, VE_LOWLAT, 1);
+    if (spec != 0) { vt_release(spec); }
+    if (st != 0 or ve(e, VE_SESS) == 0) {
+        vals[4] = 0;
+        vep(e, VE_SESS, 0);
+        st = vt_ffi(e + VE_FFI, f, kinds[0..10], vals[0..10]);
+        vep(e, VE_LOWLAT, 0);
+    }
+    vep(e, VE_CSTAT, @as(u64, @intCast(@as(i64, st) & 4294967295)));
+    const s : u64 = ve(e, VE_SESS);
+    if (st != 0 or s == 0) {
+        vep(e, VE_SESS, 0);
+        vep(e, VE_CFAIL, ve(e, VE_CFAIL) + 1);
+        return false;
+    }
+    vte_prop(e, s, "kVTCompressionPropertyKey_RealTime", tru);
+    vte_prop(e, s, "kVTCompressionPropertyKey_AllowFrameReordering", fals);
+    if (ve(e, VE_LOWLAT) == 1) {
+        vte_prop(e, s, "kVTCompressionPropertyKey_ProfileLevel", vt_konst("kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel"));
+    } else {
+        vte_prop(e, s, "kVTCompressionPropertyKey_ProfileLevel", vt_konst("kVTProfileLevel_H264_Main_AutoLevel"));
+    }
+    const fr : u64 = vt_num_i(tmp, 30);
+    vte_prop(e, s, "kVTCompressionPropertyKey_ExpectedFrameRate", fr);
+    vt_release(fr);
+    const ki : u64 = vt_num_i(tmp, 60);
+    vte_prop(e, s, "kVTCompressionPropertyKey_MaxKeyFrameInterval", ki);
+    vt_release(ki);
+    // 2.0 = 0x4000000000000000
+    const kd : u64 = vt_num_f(tmp, 4611686018427387904);
+    vte_prop(e, s, "kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration", kd);
+    vt_release(kd);
+    vte_rate(e, s, ve(e, VE_WANT_KBPS));
+    vep(e, VE_W, w);
+    vep(e, VE_H, h);
+    vep(e, VE_RUNG, r);
+    vep(e, VE_GEN, ve(e, VE_GEN) + 1);
+    vep(e, VE_CREATES, ve(e, VE_CREATES) + 1);
+    // the first frame of a new session is a key frame by itself; asking makes sure
+    vep(e, VE_FORCE, 1);
+    return true;
+}
+
+/// Encode one camera frame (camera thread): the session follows the wanted rung and bitrate first. False when no
+/// session could be made or the encoder refused the frame.
+pub fn vte_encode(e: u64, pb: u64, now_us: u64) -> bool {
+    if (!ve_ok(e) or pb == 0) { return false; }
+    const t0 : u64 = vt_us();
+    const want : u64 = ve(e, VE_WANT_RUNG);
+    if (ve(e, VE_SESS) == 0 or ve(e, VE_RUNG) != want) {
+        if (!vte_open(e, want)) { return false; }
+    }
+    const s : u64 = ve(e, VE_SESS);
+    if (ve(e, VE_WANT_KBPS) != ve(e, VE_KBPS)) { vte_rate(e, s, ve(e, VE_WANT_KBPS)); }
+    vep(e, VE_SRCW, vt_pb_w(pb));
+    vep(e, VE_SRCH, vt_pb_h(pb));
+    var props : u64 = 0;
+    if (ve(e, VE_FORCE) != 0) {
+        vep(e, VE_FORCE, 0);
+        props = vt_dict1(e + VE_TMP, vt_konst("kVTEncodeFrameOptionKey_ForceKeyFrame"), vt_konst("kCFBooleanTrue"));
+    }
+    // presentation time: now in microseconds (value i64, timescale i32 1000000, flags 1 = valid, epoch 0)
+    cbp_put(e + VE_PTS, now_us);
+    cbp_put(e + VE_PTS + 8, 1000000 | (@as(u64, 1) << 32));
+    cbp_put(e + VE_PTS + 16, 0);
+    cbp_zero(e + VE_DUR, 24);
+    const idx : u64 = ve(e, VE_IN);
+    vep(e, VE_TS + idx % 64, t0);
+    vep(e, VE_IN, idx + 1);
+    const st : i32 = vt_enc_frame(s, pb, e + VE_PTS, e + VE_DUR, props, idx | (ve(e, VE_GEN) << 48), e + VE_INFO);
+    if (props != 0) { vt_release(props); }
+    const took : u64 = vt_us() - t0;
+    if (took > ve(e, VE_CALL_MAX)) { vep(e, VE_CALL_MAX, took); }
+    if (st != 0) {
+        vep(e, VE_ERR, ve(e, VE_ERR) + 1);
+        return false;
+    }
+    return true;
+}
+
+/// VTCompressionOutputCallback (the encoder's thread): one coded frame into the ring in the wire layout.
+pub fn vte_out(ref: u64, src: u64, status: i32, flags: u32, sb: u64) -> u64 {
+    const e : u64 = ref;
+    if (!ve_ok(e)) { return 0; }
+    if (status != 0 or sb == 0) {
+        vep(e, VE_DROP, ve(e, VE_DROP) + 1);
+        return 0;
+    }
+    const now : u64 = vt_us();
+    const idx : u64 = src & 281474976710655;
+    const t0 : u64 = ve(e, VE_TS + idx % 64);
+    if (t0 != 0 and now >= t0) {
+        const lat : u64 = now - t0;
+        if (lat > ve(e, VE_LAT_MAX)) { vep(e, VE_LAT_MAX, lat); }
+        vep(e, VE_LAT_SUM, ve(e, VE_LAT_SUM) + lat);
+        vep(e, VE_LAT_N, ve(e, VE_LAT_N) + 1);
+    }
+    const data : u64 = vt_sb_data(sb);
+    if (data == 0) { vep(e, VE_DROP, ve(e, VE_DROP) + 1); return 0; }
+    const len : u64 = vt_bb_len(data);
+    // a key frame has no kCMSampleAttachmentKey_NotSync (or it is false)
+    var key : bool = true;
+    const att : u64 = vt_sb_attach(sb, false);
+    if (att != 0 and vt_arr_count(att) > 0) {
+        const d : u64 = vt_arr_at(att, 0);
+        if (d != 0) {
+            const ns : u64 = vt_dict_get(d, vt_konst("kCMSampleAttachmentKey_NotSync"));
+            if (ns != 0 and ns != vt_konst("kCFBooleanFalse")) { key = false; }
+        }
+    }
+    var p0 : u64 = 0;
+    var s0 : u64 = 0;
+    var p1 : u64 = 0;
+    var s1 : u64 = 0;
+    const ps : u64 = e + VE_PSP;
+    if (key) {
+        const fmt : u64 = vt_sb_fmt(sb);
+        cbp_zero(ps, 48);
+        if (fmt == 0 or vt_ps_at(fmt, 0, ps, ps + 8, ps + 16, ps + 24) != 0) { vep(e, VE_ERR, ve(e, VE_ERR) + 1); return 0; }
+        p0 = cbp_get(ps);
+        s0 = cbp_get(ps + 8);
+        // the length prefix of the encoder's units must be 4 bytes, as call_h264 reads them
+        if ((cbp_get(ps + 24) & 4294967295) != 4) { vep(e, VE_NAL4, ve(e, VE_NAL4) + 1); return 0; }
+        if (vt_ps_at(fmt, 1, ps + 32, ps + 40, ps + 16, ps + 24) != 0) { vep(e, VE_ERR, ve(e, VE_ERR) + 1); return 0; }
+        p1 = cbp_get(ps + 32);
+        s1 = cbp_get(ps + 40);
+        if (p0 == 0 or p1 == 0 or s0 == 0 or s1 == 0 or s0 > 256 or s1 > 256) { vep(e, VE_ERR, ve(e, VE_ERR) + 1); return 0; }
+    }
+    var total : u64 = len;
+    if (key) { total = total + 8 + s0 + s1; }
+    if (len == 0 or total > @as(u64, VH_FRAME_MAX)) {
+        vep(e, VE_BIG, ve(e, VE_BIG) + 1);
+        vep(e, VE_FORCE, 1);
+        return 0;
+    }
+    const w : u64 = ve(e, VE_WI);
+    vt_fence();
+    const r : u64 = ve(e, VE_RI);
+    if (w - r >= VE_SLOTS) {
+        vep(e, VE_OVER, ve(e, VE_OVER) + 1);
+        vep(e, VE_FORCE, 1);
+        return 0;
+    }
+    const ent : u64 = e + VE_RING + (w % VE_SLOTS) * VE_ENT;
+    var at : u64 = ent + 24;
+    if (key) {
+        vt_be32(at, s0);
+        vt_copy(at + 4, p0, s0);
+        at = at + 4 + s0;
+        vt_be32(at, s1);
+        vt_copy(at + 4, p1, s1);
+        at = at + 4 + s1;
+    }
+    if (vt_bb_copy(data, 0, len, at) != 0) { vep(e, VE_ERR, ve(e, VE_ERR) + 1); return 0; }
+    cbp_put(ent, total);
+    var meta : u64 = (ve(e, VE_RUNG) & 255) << 8;
+    if (key) { meta = meta | 1; }
+    meta = meta | ((src >> 48) << 16);
+    cbp_put(ent + 8, meta);
+    cbp_put(ent + 16, now);
+    vt_fence();
+    vep(e, VE_WI, w + 1);
+    vep(e, VE_OUT, ve(e, VE_OUT) + 1);
+    vep(e, VE_BYTES, ve(e, VE_BYTES) + total);
+    if (key) { vep(e, VE_KEYS, ve(e, VE_KEYS) + 1); }
+    return 0;
+}
+
+/// A coded frame waits in the ring (polling thread).
+pub fn vte_ready(e: u64) -> bool {
+    if (!ve_ok(e)) { return false; }
+    const w : u64 = ve(e, VE_WI);
+    vt_fence();
+    return ve(e, VE_RI) < w;
+}
+
+/// Coded frames waiting.
+pub fn vte_waiting(e: u64) -> u64 {
+    if (!ve_ok(e)) { return 0; }
+    const w : u64 = ve(e, VE_WI);
+    vt_fence();
+    return w - ve(e, VE_RI);
+}
+
+fn vte_ent(e: u64) -> u64 { return e + VE_RING + (ve(e, VE_RI) % VE_SLOTS) * VE_ENT; }
+
+/// The oldest waiting frame: its length, its meta (1 = key, rung << 8), when it came out of the encoder (us).
+pub fn vte_len(e: u64) -> u64 { if (!vte_ready(e)) { return 0; } return cbp_get(vte_ent(e)); }
+pub fn vte_meta(e: u64) -> u64 { if (!vte_ready(e)) { return 0; } return cbp_get(vte_ent(e) + 8); }
+pub fn vte_at(e: u64) -> u64 { if (!vte_ready(e)) { return 0; } return cbp_get(vte_ent(e) + 16); }
+
+/// Bytes off .. off + out.len of the oldest waiting frame into out; false past its end.
+pub fn vte_read(e: u64, off: u64, out: []u8) -> bool {
+    if (!vte_ready(e)) { return false; }
+    const ent : u64 = vte_ent(e);
+    if (off + @as(u64, out.len) > cbp_get(ent)) { return false; }
+    sys_peek(out, ent + 24 + off, @as(u64, out.len));
+    return true;
+}
+
+/// The oldest waiting frame was sent (or dropped): its entry is free again.
+pub fn vte_pop(e: u64) -> void {
+    if (!vte_ready(e)) { return; }
+    vt_fence();
+    vep(e, VE_RI, ve(e, VE_RI) + 1);
+}
+
+/// The end of a call (camera queue, after the camera stopped): the session goes, the ring is emptied.
+pub fn vte_close(e: u64) -> void {
+    if (!ve_ok(e)) { return; }
+    vte_drop_session(e);
+    vt_fence();
+    vep(e, VE_RI, ve(e, VE_WI));
+}
+
+pub fn vte_stat(e: u64, k: u64) -> u64 {
+    if (!ve_ok(e) or k >= 64) { return 0; }
+    return ve(e, k);
+}
+
+// ---------------------------------------------------------------- the decoder
+
+// The decoder runs on its own serial queue, never on the polling thread (that thread carries the sound: a session is
+// made in about 70 ms). vtd_post copies the frame the gate let through -- its parameter sets apart, the picture without
+// them -- into a job of its own and queues it; vtd_job, on the queue, remakes the session when the parameter sets
+// changed and hands the picture to the decoder asynchronously; vtd_out, on the decoder's thread, puts the result in the
+// mailbox. The jobs run in the order they were queued, so the decoder sees the frames in order.
+const VD_MAGIC_V : u64 = 7505702094815069250;
+pub const VDK_SESS : u64 = 1;
+pub const VDK_FMT : u64 = 2;
+pub const VDK_SPSN : u64 = 3;
+pub const VDK_PPSN : u64 = 4;
+pub const VDK_W : u64 = 5;
+pub const VDK_H : u64 = 6;
+pub const VDK_FED : u64 = 7;
+pub const VDK_OUT : u64 = 8;
+pub const VDK_BAD : u64 = 9;
+pub const VDK_CREATES : u64 = 10;
+pub const VDK_CFAIL : u64 = 11;
+/// The mailbox: lock (slot 12) and picture (slot 13).
+pub const VDK_BOX : u64 = 12;
+pub const VDK_REPL : u64 = 15;
+pub const VDK_DERR : u64 = 16;
+pub const VDK_LAT_MAX : u64 = 17;
+pub const VDK_LAT_SUM : u64 = 18;
+pub const VDK_LAT_N : u64 = 19;
+pub const VDK_Q : u64 = 20;
+pub const VDK_FN : u64 = 21;
+pub const VDK_CALL_MAX : u64 = 22;
+pub const VDK_IDX : u64 = 23;
+pub const VDK_DROPPED : u64 = 24;
+pub const VDK_POSTED : u64 = 25;
+pub const VDK_DONE : u64 = 26;
+pub const VDK_BUSY : u64 = 27;
+pub const VDK_FN_JOB : u64 = 28;
+pub const VDK_FN_CLOSE : u64 = 29;
+pub const VDK_POST_MAX : u64 = 30;
+const VDK_TS : u64 = 32;
+const VDK_REC : u64 = 1024;
+const VDK_FFI : u64 = 1040;
+const VDK_TMP : u64 = 1552;
+const VDK_PSP : u64 = 1616;
+const VDK_SIZE1 : u64 = 1680;
+const VDK_OUTP : u64 = 1696;
+const VDK_SPS : u64 = 2048;
+const VDK_PPS : u64 = 2304;
+pub const VDK_SIZE : u64 = 4096;
+/// Jobs queued and not yet run past this: the frame is not queued (the caller asks for a key frame).
+pub const VDK_DEPTH : u64 = 6;
+/// A job: the block, the picture's length, the two parameter sets' lengths (0 for a frame without them), the
+/// parameter sets (256 bytes each), then the picture.
+const VJ_HDR : u64 = 544;
+
+fn vd(d: u64, k: u64) -> u64 { return cbp_get(d + k * 8); }
+fn vdp(d: u64, k: u64, v: u64) -> void { cbp_put(d + k * 8, v); }
+fn vd_ok(d: u64) -> bool { return d != 0 and cbp_get(d) == VD_MAGIC_V; }
+fn vt_malloc(n: u64) -> u64 { return @extern("malloc"); }
+fn vt_free(p: u64) -> void { @extern("free"); }
+fn vt_memcmp(a: u64, b: u64, n: u64) -> i32 { return @extern("memcmp"); }
+fn vt_queue(label: []const u8, attr: u64) -> u64 { return @extern("dispatch_queue_create"); }
+fn vt_async(q: u64, ctx: u64, f: u64) -> void { @extern("dispatch_async_f"); }
+fn vt_sync(q: u64, ctx: u64, f: u64) -> void { @extern("dispatch_sync_f"); }
+
+/// A new decoder block and its queue (the session comes with the first key frame). 0 without memory.
+pub fn vtd_new() -> u64 {
+    const d : u64 = vt_calloc(1, VDK_SIZE);
+    if (d == 0) { return 0; }
+    cbp_put(d, VD_MAGIC_V);
+    // Never true: makes sure the callbacks and the jobs are emitted and exported for dlsym.
+    if (vd(d, VDK_IDX) == 99) { vtd_out(0, 0, 0, 0, 0, 0, 0); vte_out(0, 0, 0, 0, 0); vtd_job(0); vtd_close_job(0); }
+    vdp(d, VDK_FN, vt_dlsym(VT_RTLD_DEFAULT, "vtd_out"));
+    vdp(d, VDK_FN_JOB, vt_dlsym(VT_RTLD_DEFAULT, "vtd_job"));
+    vdp(d, VDK_FN_CLOSE, vt_dlsym(VT_RTLD_DEFAULT, "vtd_close_job"));
+    vdp(d, VDK_Q, vt_queue("t27.callvideo.decode", 0));
+    if (vd(d, VDK_Q) == 0 or vd(d, VDK_FN_JOB) == 0 or vd(d, VDK_FN) == 0) { return 0; }
+    return d;
+}
+
+/// Jobs queued and not run yet.
+pub fn vtd_depth(d: u64) -> u64 {
+    if (!vd_ok(d)) { return 0; }
+    const done : u64 = vd(d, VDK_DONE);
+    vt_fence();
+    return vd(d, VDK_POSTED) - done;
+}
+
+/// Queue one complete frame that the gate let through (polling thread, returns at once). 0 queued; 1 not well formed
+/// or nothing to decode; 2 the queue is behind (VDK_DEPTH jobs wait) or no memory: the frame is not queued.
+pub fn vtd_post(d: u64, body: []const u8) -> u32 {
+    if (!vd_ok(d) or vh_nals(body) == 0) { return 1; }
+    const n : usize = vh_strip_len(body);
+    if (n == 0) { return 1; }
+    if (vtd_depth(d) >= VDK_DEPTH) {
+        vdp(d, VDK_BUSY, vd(d, VDK_BUSY) + 1);
+        return 2;
+    }
+    const t0 : u64 = vt_us();
+    const j : u64 = vt_malloc(VJ_HDR + @as(u64, n));
+    if (j == 0) { return 2; }
+    cbp_put(j, d);
+    cbp_put(j + 8, @as(u64, n));
+    cbp_put(j + 16, 0);
+    cbp_put(j + 24, 0);
+    const sps : usize = vh_find(body, VH_NAL_SPS);
+    const pps : usize = vh_find(body, VH_NAL_PPS);
+    if (sps != VH_NONE and pps != VH_NONE) {
+        const sl : usize = vh_nal_len(body, sps);
+        const pl : usize = vh_nal_len(body, pps);
+        if (sl <= 256 and pl <= 256) {
+            cbp_put(j + 16, @as(u64, sl));
+            cbp_put(j + 24, @as(u64, pl));
+            vt_poke(j + 32, body[sps + 4..sps + 4 + sl], @as(u64, sl));
+            vt_poke(j + 288, body[pps + 4..pps + 4 + pl], @as(u64, pl));
+        }
+    }
+    var at : usize = 0;
+    var w : u64 = 0;
+    while (at < body.len) {
+        const len : usize = vh_nal_len(body, at);
+        const t : u32 = @as(u32, body[at + 4] & 31);
+        if (t != VH_NAL_SPS and t != VH_NAL_PPS) {
+            vt_poke(j + VJ_HDR + w, body[at..at + 4 + len], @as(u64, 4 + len));
+            w = w + @as(u64, 4 + len);
+        }
+        at = at + 4 + len;
+    }
+    vdp(d, VDK_POSTED, vd(d, VDK_POSTED) + 1);
+    vt_async(vd(d, VDK_Q), j, vd(d, VDK_FN_JOB));
+    const took : u64 = vt_us() - t0;
+    if (took > vd(d, VDK_POST_MAX)) { vdp(d, VDK_POST_MAX, took); }
+    return 0;
+}
+
+fn vtd_drop_session(d: u64) -> void {
+    const s : u64 = vd(d, VDK_SESS);
+    if (s != 0) {
+        vt_dec_wait(s);
+        vt_dec_invalidate(s);
+        vt_release(s);
+        vdp(d, VDK_SESS, 0);
+    }
+    const f : u64 = vd(d, VDK_FMT);
+    if (f != 0) {
+        vt_release(f);
+        vdp(d, VDK_FMT, 0);
+    }
+}
+
+/// A format description and a session for the parameter sets of job j (the decode queue).
+fn vtd_open(d: u64, j: u64) -> bool {
+    vtd_drop_session(d);
+    const sl : u64 = cbp_get(j + 16);
+    const pl : u64 = cbp_get(j + 24);
+    const ps : u64 = d + VDK_PSP;
+    cbp_put(ps, j + 32);
+    cbp_put(ps + 8, j + 288);
+    cbp_put(ps + 16, sl);
+    cbp_put(ps + 24, pl);
+    cbp_put(d + VDK_OUTP, 0);
+    if (vt_fmt_from_ps(0, 2, ps, ps + 16, 4, d + VDK_OUTP) != 0 or cbp_get(d + VDK_OUTP) == 0) {
+        vdp(d, VDK_CFAIL, vd(d, VDK_CFAIL) + 1);
+        return false;
+    }
+    const fmt : u64 = cbp_get(d + VDK_OUTP);
+    vdp(d, VDK_FMT, fmt);
+    const dims : u64 = vt_dims(fmt);
+    vdp(d, VDK_W, dims & 4294967295);
+    vdp(d, VDK_H, dims >> 32);
+    // the pictures: BGRA on an IOSurface, so a layer shows them as they are
+    const tmp : u64 = d + VDK_TMP;
+    const empty : u64 = vt_cf_dict(0, 0, 0, 0, vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vt_dlsym(VT_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+    const fnum : u64 = vt_num_i(tmp + 32, @as(u64, VT_BGRA));
+    const attrs : u64 = vt_dict2(tmp, vt_konst("kCVPixelBufferPixelFormatTypeKey"), fnum, vt_konst("kCVPixelBufferIOSurfacePropertiesKey"), empty);
+    cbp_put(d + VDK_REC, vd(d, VDK_FN));
+    cbp_put(d + VDK_REC + 8, d);
+    cbp_put(d + VDK_OUTP, 0);
+    const st : i32 = vt_dec_create(0, fmt, 0, attrs, d + VDK_REC, d + VDK_OUTP);
+    if (attrs != 0) { vt_release(attrs); }
+    if (fnum != 0) { vt_release(fnum); }
+    if (empty != 0) { vt_release(empty); }
+    if (st != 0 or cbp_get(d + VDK_OUTP) == 0) {
+        vdp(d, VDK_CFAIL, vd(d, VDK_CFAIL) + 1);
+        return false;
+    }
+    vdp(d, VDK_SESS, cbp_get(d + VDK_OUTP));
+    vt_copy(d + VDK_SPS, j + 32, sl);
+    vt_copy(d + VDK_PPS, j + 288, pl);
+    vdp(d, VDK_SPSN, sl);
+    vdp(d, VDK_PPSN, pl);
+    vdp(d, VDK_CREATES, vd(d, VDK_CREATES) + 1);
+    return true;
+}
+
+/// One queued frame (the decode queue): the session follows the parameter sets, the picture goes to the decoder.
+pub fn vtd_job(j: u64) -> u64 {
+    if (j == 0) { return 0; }
+    const d : u64 = cbp_get(j);
+    if (!vd_ok(d)) { vt_free(j); return 0; }
+    const t0 : u64 = vt_us();
+    const sl : u64 = cbp_get(j + 16);
+    const pl : u64 = cbp_get(j + 24);
+    if (sl != 0 and pl != 0) {
+        const same : bool = vd(d, VDK_SESS) != 0 and sl == vd(d, VDK_SPSN) and pl == vd(d, VDK_PPSN) and vt_memcmp(d + VDK_SPS, j + 32, sl) == 0 and vt_memcmp(d + VDK_PPS, j + 288, pl) == 0;
+        if (!same and !vtd_open(d, j)) { vtd_job_end(d, j, t0); return 0; }
+    }
+    const s : u64 = vd(d, VDK_SESS);
+    const n : u64 = cbp_get(j + 8);
+    if (s == 0) {
+        // a picture before any key frame: nothing to decode it with
+        vdp(d, VDK_DERR, vd(d, VDK_DERR) + 1);
+        vtd_job_end(d, j, t0);
+        return 0;
+    }
+    cbp_put(d + VDK_OUTP, 0);
+    if (vt_bb_empty(0, 0, 0, d + VDK_OUTP) != 0 or cbp_get(d + VDK_OUTP) == 0) {
+        vdp(d, VDK_DERR, vd(d, VDK_DERR) + 1);
+        vtd_job_end(d, j, t0);
+        return 0;
+    }
+    const bb : u64 = cbp_get(d + VDK_OUTP);
+    if (vt_bb_append(bb, 0, n, 0, 0, 0, n, 1) != 0 or vt_bb_replace(j + VJ_HDR, bb, 0, n) != 0) {
+        vt_release(bb);
+        vdp(d, VDK_DERR, vd(d, VDK_DERR) + 1);
+        vtd_job_end(d, j, t0);
+        return 0;
+    }
+    // CMSampleBufferCreateReady(alloc, bb, fmt, 1 sample, 0 timings, NULL, 1 size, &size, &out): 9 arguments
+    cbp_put(d + VDK_SIZE1, n);
+    cbp_put(d + VDK_OUTP, 0);
+    var kinds : [9]u8 = undefined;
+    kinds[0] = 1; kinds[1] = 1; kinds[2] = 1; kinds[3] = 1; kinds[4] = 1;
+    kinds[5] = 1; kinds[6] = 1; kinds[7] = 1; kinds[8] = 1;
+    var vals : [9]u64 = undefined;
+    vals[0] = 0; vals[1] = bb; vals[2] = vd(d, VDK_FMT); vals[3] = 1; vals[4] = 0;
+    vals[5] = 0; vals[6] = 1; vals[7] = d + VDK_SIZE1; vals[8] = d + VDK_OUTP;
+    const cs : i32 = vt_ffi(d + VDK_FFI, vt_dlsym(VT_RTLD_DEFAULT, "CMSampleBufferCreateReady"), kinds[0..9], vals[0..9]);
+    vt_release(bb);
+    const sb : u64 = cbp_get(d + VDK_OUTP);
+    if (cs != 0 or sb == 0) {
+        vdp(d, VDK_DERR, vd(d, VDK_DERR) + 1);
+        vtd_job_end(d, j, t0);
+        return 0;
+    }
+    const idx : u64 = vd(d, VDK_IDX);
+    vdp(d, VDK_TS + idx % 64, t0);
+    vdp(d, VDK_IDX, idx + 1);
+    // kVTDecodeFrame_EnableAsynchronousDecompression
+    const ds : i32 = vt_dec_frame(s, sb, 1, idx, 0);
+    vt_release(sb);
+    if (ds != 0) { vdp(d, VDK_DERR, vd(d, VDK_DERR) + 1); } else { vdp(d, VDK_FED, vd(d, VDK_FED) + 1); }
+    vtd_job_end(d, j, t0);
+    return 0;
+}
+
+fn vtd_job_end(d: u64, j: u64, t0: u64) -> void {
+    const took : u64 = vt_us() - t0;
+    if (took > vd(d, VDK_CALL_MAX)) { vdp(d, VDK_CALL_MAX, took); }
+    vt_free(j);
+    vt_fence();
+    vdp(d, VDK_DONE, vd(d, VDK_DONE) + 1);
+}
+
+/// VTDecompressionOutputCallback (the decoder's thread): the picture into the mailbox, or a refusal counted.
+pub fn vtd_out(ref: u64, src: u64, status: i32, flags: u32, img: u64, pts: u64, dur: u64) -> u64 {
+    const d : u64 = ref;
+    if (!vd_ok(d)) { return 0; }
+    // kVTDecodeInfo_FrameDropped
+    if ((flags & 2) != 0) { vdp(d, VDK_DROPPED, vd(d, VDK_DROPPED) + 1); return 0; }
+    if (status != 0 or img == 0) {
+        vdp(d, VDK_BAD, vd(d, VDK_BAD) + 1);
+        return 0;
+    }
+    const now : u64 = vt_us();
+    const t0 : u64 = vd(d, VDK_TS + src % 64);
+    if (t0 != 0 and now >= t0) {
+        const lat : u64 = now - t0;
+        if (lat > vd(d, VDK_LAT_MAX)) { vdp(d, VDK_LAT_MAX, lat); }
+        vdp(d, VDK_LAT_SUM, vd(d, VDK_LAT_SUM) + lat);
+        vdp(d, VDK_LAT_N, vd(d, VDK_LAT_N) + 1);
+    }
+    if (vtm_put(d + VDK_BOX * 8, img) == 3) { vdp(d, VDK_REPL, vd(d, VDK_REPL) + 1); }
+    vdp(d, VDK_OUT, vd(d, VDK_OUT) + 1);
+    return 0;
+}
+
+/// The newest decoded picture, owned by the caller (vt_pb_release); 0 when none came since the last take.
+pub fn vtd_take(d: u64) -> u64 {
+    if (!vd_ok(d)) { return 0; }
+    return vtm_take(d + VDK_BOX * 8);
+}
+
+/// Refusals so far (the decoder said no, or a frame could not be built): the window compares it with what it saw.
+pub fn vtd_errors(d: u64) -> u64 {
+    if (!vd_ok(d)) { return 0; }
+    return vd(d, VDK_BAD) + vd(d, VDK_DERR) + vd(d, VDK_CFAIL);
+}
+
+/// The end of a call, on the decode queue after the jobs before it: the session goes.
+pub fn vtd_close_job(d: u64) -> u64 {
+    if (!vd_ok(d)) { return 0; }
+    vtd_drop_session(d);
+    vdp(d, VDK_SPSN, 0);
+    vdp(d, VDK_PPSN, 0);
+    return 0;
+}
+
+/// The end of a call (polling thread): waits for the queued jobs, the session goes, a picture not taken is released.
+pub fn vtd_close(d: u64) -> void {
+    if (!vd_ok(d)) { return; }
+    vt_sync(vd(d, VDK_Q), d, vd(d, VDK_FN_CLOSE));
+    const pb : u64 = vtm_take(d + VDK_BOX * 8);
+    if (pb != 0) { vt_pb_release(pb); }
+}
+
+pub fn vtd_stat(d: u64, k: u64) -> u64 {
+    if (!vd_ok(d) or k >= 32) { return 0; }
+    return vd(d, k);
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_blocks_keep_their_slots_apart {
+    assert VE_TS + 64 <= VE_FFI / 8 and VE_FFI + 512 <= VE_TMP and VE_TMP + 64 <= VE_PTS and VE_PTS + 24 <= VE_DUR;
+    assert VE_DUR + 24 <= VE_INFO and VE_INFO + 16 <= VE_PSP and VE_PSP + 48 <= VE_RING;
+    assert VE_ENT == 24 + 131072 and VE_SIZE == VE_RING + VE_SLOTS * VE_ENT;
+    assert VE_CALL_MAX < VE_TS and VE_SRCH < VE_TS;
+    assert VDK_TS + 64 <= VDK_REC / 8 and VDK_REC + 16 <= VDK_FFI and VDK_FFI + 512 <= VDK_TMP and VDK_TMP + 64 <= VDK_PSP;
+    assert VDK_PSP + 32 <= VDK_SIZE1 and VDK_SIZE1 + 8 <= VDK_OUTP and VDK_OUTP + 8 <= VDK_SPS and VDK_SPS + 256 <= VDK_PPS;
+    assert VDK_PPS + 256 <= VDK_SIZE and VDK_POST_MAX < VDK_TS and VDK_BOX + 1 < VDK_REPL and VJ_HDR == 32 + 256 + 256;
+    assert VT_AVC1 == 1635148593 and VT_BGRA == 1111970369;
+}
+
+test a_missing_block_does_nothing {
+    assert !vte_ready(0) and vte_len(0) == 0 and vte_waiting(0) == 0 and vte_stat(0, 1) == 0;
+    assert vtd_post(0, "abc") == 1 and vtd_take(0) == 0 and vtd_depth(0) == 0 and vtd_errors(0) == 0 and vtd_stat(0, 1) == 0;
+    assert vtm_take(0) == 0 and vtm_put(0, 5) == 0;
+    var b : [8]u8 = undefined;
+    assert !vte_read(0, 0, b[0..8]);
+    assert !vte_encode(0, 1, 0);
+}

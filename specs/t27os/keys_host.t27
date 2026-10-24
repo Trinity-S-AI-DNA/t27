@@ -3,6 +3,9 @@
 // decisions (the check button, which needs Foundation, is keys_probe.t27):
 //   - the macOS Keychain, one generic-password item per key (up to MAX_KEYS a provider; account = provider
 //     name, then "<name>#2" .. "<name>#8") under the service "ai.t27.os": kc_get_n / kc_put_n / kc_del_n.
+//     A read names the user's login keychain when HOME is another folder (keys.t27 kc_read_argv); OpenRouter's
+//     key 1 is also read from its older service "openrouter-api-key" (kc_source), never copied or deleted there;
+//     kc_count counts a provider's accounts past MAX_KEYS for the cabinet.
 //     The Keychain is reached ONLY by running /usr/bin/security (posix_spawn, pipes, poll, waitpid), never
 //     through SecItem calls. The window is signed ad hoc, so each rebuild is a new code identity and every
 //     SecItem read of an item asked for the login password again; the items trust /usr/bin/security, which
@@ -40,6 +43,12 @@ use t27os::keys::SEC_SIGNALED;
 use t27os::keys::SEC_OK;
 use t27os::keys::SEC_FAILED;
 use t27os::keys::sec_argv;
+use t27os::keys::kc_read_argv;
+use t27os::keys::kc_legacy_service;
+use t27os::keys::kc_source;
+use t27os::keys::KC_SRC_LEGACY;
+use t27os::keys::KC_COUNT_MAX;
+use t27os::keys::keychain_account_any;
 use t27os::keys::sec_add_line;
 use t27os::keys::sec_exit_code;
 use t27os::keys::sec_verdict;
@@ -52,6 +61,8 @@ use t27os::pty_proto::get_u64;
 use t27os::pty_proto::MAX_FRAME;
 use t27os::pty_logic::put_pollfd;
 use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
 use t27os::pty_sys::sys_environ;
 use t27os::pty_sys::sys_signal;
 use t27os::pty_sys::sys_read;
@@ -273,9 +284,99 @@ fn sec_op(op: u32, p: u32, k: u32, feed: []const u8, raw: []u8, res: []u32) -> u
         offs[z] = 0;
         z = z + 1;
     }
+    if (op == SEC_OP_READ) { return sec_read(KEYCHAIN_SERVICE, nm[0..nn], raw, res); }
     const argc : u32 = sec_argv(op, KEYCHAIN_SERVICE, nm[0..nn], words[0..160], offs[0..8]);
     if (argc == 0) { return SEC_FAILED; }
     return sec_run(words[0..160], offs[0..8], argc, feed, raw, res, @as(i32, @intCast(SEC_TIMEOUT_MS)));
+}
+
+/// The variable `name` of the environment into out, cut at out.len - 1; its length, 0 when unset.
+pub fn kc_env(name: []const u8, out: []u8) -> usize {
+    const a : u64 = sys_getenv(name);
+    if (a == 0) { return 0; }
+    var n : u64 = sys_strlen(a);
+    if (n > @as(u64, out.len - 1)) { n = @as(u64, out.len - 1); }
+    sys_peek(out, a, n);
+    return @as(usize, @intCast(n));
+}
+
+fn kc_getuid() -> u32 { return @extern("getuid"); }
+fn kc_getpwuid(uid: u32) -> u64 { return @extern("getpwuid"); }
+
+/// The user's own home folder (getpwuid(getuid())->pw_dir, at byte 48 of the macOS struct passwd) into out,
+/// cut at out.len - 1; its length, 0 when unknown.
+pub fn kc_user_home(out: []u8) -> usize {
+    const pw : u64 = kc_getpwuid(kc_getuid());
+    if (pw == 0) { return 0; }
+    var b : [8]u8 = undefined;
+    sys_peek(b[0..8], pw + 48, 8);
+    const d : u64 = get_u64(b[0..8], 0);
+    if (d == 0) { return 0; }
+    var n : u64 = sys_strlen(d);
+    if (n > @as(u64, out.len - 1)) { return 0; }
+    sys_peek(out, d, n);
+    return @as(usize, @intCast(n));
+}
+
+/// One read of `service` / `account` (empty: the first item of the service) into raw; the login keychain is
+/// named when HOME is not the user's own folder (keys.t27 kc_read_argv).
+fn sec_read(service: []const u8, account: []const u8, raw: []u8, res: []u32) -> u32 {
+    var words : [256]u8 = undefined;
+    var offs : [8]u32 = undefined;
+    wipe(words[0..256]);
+    var z : usize = 0;
+    while (z < 8) {
+        offs[z] = 0;
+        z = z + 1;
+    }
+    var home : [160]u8 = undefined;
+    const hn : usize = kc_env("HOME", home[0..160]);
+    var uh : [160]u8 = undefined;
+    const un : usize = kc_user_home(uh[0..160]);
+    const argc : u32 = kc_read_argv(service, account, home[0..hn], uh[0..un], words[0..256], offs[0..8]);
+    if (argc == 0) { return SEC_FAILED; }
+    return sec_run(words[0..256], offs[0..8], argc, "", raw, res, @as(i32, @intCast(SEC_TIMEOUT_MS)));
+}
+
+/// True when the Keychain holds account `account` of `service` (empty: any item of it); the copy is dropped.
+fn kc_seen(service: []const u8, account: []const u8) -> bool {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    var key : [256]u8 = undefined;
+    var n : usize = 0;
+    if (sec_read(service, account, raw[0..256], res[0..2]) == SEC_OK) { n = sec_key_from_output(raw[0 .. @as(usize, res[0])], key[0..256]); }
+    wipe(raw[0..256]);
+    wipe(key[0..256]);
+    return n > 0;
+}
+
+/// How many keys provider p has in the Keychain, past MAX_KEYS too (keys.t27 KC_COUNT_MAX): its accounts under
+/// ai.t27.os ("zai" .. "zai#11"; a scan stops after two misses in a row, scan rule of push_keys), plus its old
+/// service when key 1 is not in ai.t27.os (kc_source). Only for the count the cabinet shows; no key is kept.
+pub fn kc_count(p: u32) -> u32 {
+    if (p >= PROVIDER_COUNT) { return 0; }
+    var nm : [32]u8 = undefined;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    var misses : u32 = 0;
+    var first : bool = false;
+    while (k < KC_COUNT_MAX and misses < 2) {
+        wipe(nm[0..32]);
+        const nn : usize = keychain_account_any(p, k, nm[0..32]);
+        if (nn > 0 and kc_seen(KEYCHAIN_SERVICE, nm[0..nn])) {
+            c = c + 1;
+            misses = 0;
+            if (k == 0) { first = true; }
+        } else {
+            misses = misses + 1;
+        }
+        k = k + 1;
+    }
+    if (kc_source(p, 0, first) == KC_SRC_LEGACY and kc_seen(kc_legacy_service(p), "")) { c = c + 1; }
+    return c;
 }
 
 /// Store `key` as key k (0-based) of provider p, never replacing one. True when the Keychain accepted it;
@@ -312,6 +413,14 @@ pub fn kc_get_n(p: u32, k: u32, out: []u8) -> usize {
     const st : u32 = sec_op(SEC_OP_READ, p, k, "", raw[0..256], res[0..2]);
     var n : usize = 0;
     if (st == SEC_OK) { n = sec_key_from_output(raw[0 .. @as(usize, res[0])], out); }
+    // key 1 of a provider whose key was kept under an older service (OpenRouter: openrouter-api-key) is read
+    // from there; it is used, never copied into ai.t27.os and never deleted (keys.t27 kc_source)
+    if (kc_source(p, k, n > 0) == KC_SRC_LEGACY) {
+        wipe(raw[0..256]);
+        res[0] = 0;
+        res[1] = 0;
+        if (sec_read(kc_legacy_service(p), "", raw[0..256], res[0..2]) == SEC_OK) { n = sec_key_from_output(raw[0 .. @as(usize, res[0])], out); }
+    }
     wipe(raw[0..256]);
     return n;
 }

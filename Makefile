@@ -14,7 +14,7 @@ PAIRS := scripts/tri:bin/tri target/release/t27c:bin/t27c target/release/tri:tar
 T27OS_OUT := target/t27os
 T27OS_BUILD ?= $(shell git rev-list --count HEAD)
 T27OS_T27B := $(or $(CARGO_TARGET_DIR),target)/release/t27b
-T27OS_FRAMEWORKS := Foundation AppKit CoreGraphics CoreText CoreFoundation QuartzCore Security WebKit ImageIO
+T27OS_FRAMEWORKS := Foundation AppKit CoreGraphics CoreText CoreFoundation QuartzCore Security WebKit ImageIO AudioToolbox AVFoundation CoreMedia CoreVideo VideoToolbox IOSurface
 T27OS_MIN_MACOS := 11.0
 
 .PHONY: help install uninstall t27os verify seal-check seal warnings-baseline
@@ -57,9 +57,9 @@ t27os:
 	LD="ld -arch arm64 -platform_version macos $(T27OS_MIN_MACOS) $$SDKV -syslibroot $$SDK -e _main -lSystem"; \
 	$$LD -o $$O/t27os-pty $$O/pty_server.o; \
 	$$LD -o $$O/plist_main $$O/plist_main.o; \
-	$$LD -lobjc $(foreach f,$(T27OS_FRAMEWORKS),-framework $(f)) -o $$A/MacOS/T27OS $$O/glass_window.o; \
+	$$LD -lobjc -lffi -stack_size 0x1000000 $(foreach f,$(T27OS_FRAMEWORKS),-framework $(f)) -o $$A/MacOS/T27OS $$O/glass_window.o; \
 	T27OS_BUILD=$(T27OS_BUILD) $$O/plist_main > $$A/Info.plist; plutil -lint $$A/Info.plist >/dev/null; \
-	ID="$${T27OS_SIGN_ID:--}"; codesign --force --sign "$$ID" $$O/T27OS.app; codesign --force --sign "$$ID" $$O/t27os-pty; \
+	ID="$${T27OS_SIGN_ID:--}"; codesign --force --sign "$$ID" $$O/t27os-pty; cp $$O/t27os-pty $$A/MacOS/t27os-pty; codesign --force --sign "$$ID" $$O/T27OS.app; \
 	echo "built $$O/T27OS.app and $$O/t27os-pty (build $(T27OS_BUILD), signed with $$ID)"
 
 # Advisory umbrella: seal freshness, warnings baseline and a quick test; always exits 0.

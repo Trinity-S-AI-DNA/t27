@@ -1,0 +1,1460 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_view.t27 -- what the CALL panel of the T27 OS window shows and what a click in it means. Pure
+// decisions only: no @extern, no socket, no clock. call_session.t27 carries the call (cs_*), call_core.t27 decides
+// its states and its code; the window (glass_window.t27) keeps a snapshot of the session, draws it with the boxes
+// below and turns a hit into one cs_* call through cv_action. Owner, 2026-10-21: calls run inside the OS, explicit
+// consent, never auto-answer. Refs gHashTag/t27#11560.
+//
+// Views (cv_view): IDLE (an address field and CALL), CALLING (CANCEL), RINGING (who calls, ANSWER / DECLINE: the
+// code does not exist before the answer, call_core commits first and reveals after), KEYS (the code is being
+// derived, HANG UP), COMPARE (the 6 digits large, CODES MATCH / CODES DIFFER), WAIT (this person said match, the
+// other has not yet, HANG UP), ACTIVE (the duration, MUTE / UNMUTE and END CALL), ENDED and FAILED (the reason and
+// CLOSE). The panel sits in the slot of the Queen, DOCTOR, KEYS and PROFILE panels (queen::QP_W wide).
+//
+// Identity in this slice: a test fingerprint MADE FROM THE ADDRESS (cv_fp_of: the 4 bytes "t27c", the IPv4, the
+// port). call_core frames name the receiver's fingerprint, so a caller must know it; deriving it from the address
+// lets a person dial by address alone. It proves nothing about who answers -- the 6-digit comparison is what
+// detects a man in the middle -- and the binding to keysync device keys is the next slice. The nickname is not
+// carried by the handshake (call_core INVITE has no field for it), so the RINGING view names the address and the
+// fingerprint only.
+//
+// Addresses: a private IPv4 network (10.x, 172.16-31.x, 192.168.x) or this machine (127.x) (cv_lan_ok); a public
+// IPv4 only with the person's consent for that address (section 7); the port 47727 when none is typed (CV_PORT).
+// Flat namespace (the window build splices imported modules): every name here starts with cv_ / CV_.
+module T27osCallView;
+
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_CALLING;
+use t27os::call_core::CK_RINGING;
+use t27os::call_core::CK_VERIFY;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::CK_ENDED;
+use t27os::call_core::CK_FAILED;
+use t27os::call_core::CK_FP;
+use t27os::queen::QP_PAD;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::peer_identity::crc32;
+
+// ---------------------------------------------------------------- 1. views and actions
+
+pub const CV_IDLE : u32 = 0;
+pub const CV_CALLING : u32 = 1;
+pub const CV_RINGING : u32 = 2;
+pub const CV_KEYS : u32 = 3;
+pub const CV_COMPARE : u32 = 4;
+pub const CV_WAIT : u32 = 5;
+pub const CV_ACTIVE : u32 = 6;
+pub const CV_ENDED : u32 = 7;
+pub const CV_FAILED : u32 = 8;
+
+pub const CV_A_NONE : u32 = 0;
+pub const CV_A_FOCUS : u32 = 1;
+pub const CV_A_DIAL : u32 = 2;
+pub const CV_A_HANGUP : u32 = 3;
+pub const CV_A_ANSWER : u32 = 4;
+pub const CV_A_DECLINE : u32 = 5;
+pub const CV_A_MATCH : u32 = 6;
+pub const CV_A_DIFFER : u32 = 7;
+pub const CV_A_MUTE : u32 = 8;
+pub const CV_A_CLOSE : u32 = 9;
+
+pub const CV_H_NONE : u32 = 0;
+pub const CV_H_FIELD : u32 = 1;
+pub const CV_H_B0 : u32 = 2;
+pub const CV_H_B1 : u32 = 3;
+
+/// The view of a call state. have_code: cs_code answered; said: this person already pressed CODES MATCH.
+pub fn cv_view(state: u32, have_code: bool, said: bool) -> u32 {
+    if (state == CK_CALLING) { return CV_CALLING; }
+    if (state == CK_RINGING) { return CV_RINGING; }
+    if (state == CK_VERIFY) {
+        if (!have_code) { return CV_KEYS; }
+        if (said) { return CV_WAIT; }
+        return CV_COMPARE;
+    }
+    if (state == CK_ACTIVE) { return CV_ACTIVE; }
+    if (state == CK_ENDED) { return CV_ENDED; }
+    if (state == CK_FAILED) { return CV_FAILED; }
+    return CV_IDLE;
+}
+
+/// A call is up (dialled, ringing, comparing or talking): the window polls at least every 10 ms then.
+pub fn cv_live(view: u32) -> bool {
+    return view >= CV_CALLING and view <= CV_ACTIVE;
+}
+
+pub fn cv_btn_count(view: u32) -> u32 {
+    if (view == CV_RINGING or view == CV_COMPARE or view == CV_ACTIVE) { return 2; }
+    if (view > CV_FAILED) { return 0; }
+    return 1;
+}
+
+/// The word on button b of a view; "" where there is no button.
+pub fn cv_btn_word(view: u32, b: u32, muted: bool) -> str {
+    if (b >= cv_btn_count(view)) { return ""; }
+    if (view == CV_IDLE) { return "CALL"; }
+    if (view == CV_CALLING) { return "CANCEL"; }
+    if (view == CV_RINGING) {
+        if (b == 0) { return "ANSWER"; }
+        return "DECLINE";
+    }
+    if (view == CV_COMPARE) {
+        if (b == 0) { return "CODES MATCH"; }
+        return "CODES DIFFER";
+    }
+    if (view == CV_ACTIVE) {
+        if (b == 0) {
+            if (muted) { return "UNMUTE"; }
+            return "MUTE";
+        }
+        return "END CALL";
+    }
+    if (view == CV_ENDED or view == CV_FAILED) { return "CLOSE"; }
+    return "HANG UP";
+}
+
+/// What a hit in a view asks for. Nothing answers a button the view does not draw.
+pub fn cv_action(view: u32, hit: u32) -> u32 {
+    if (hit == CV_H_FIELD) {
+        if (view == CV_IDLE) { return CV_A_FOCUS; }
+        return CV_A_NONE;
+    }
+    if (hit != CV_H_B0 and hit != CV_H_B1) { return CV_A_NONE; }
+    const b : u32 = hit - CV_H_B0;
+    if (b >= cv_btn_count(view)) { return CV_A_NONE; }
+    if (view == CV_IDLE) { return CV_A_DIAL; }
+    if (view == CV_RINGING) {
+        if (b == 0) { return CV_A_ANSWER; }
+        return CV_A_DECLINE;
+    }
+    if (view == CV_COMPARE) {
+        if (b == 0) { return CV_A_MATCH; }
+        return CV_A_DIFFER;
+    }
+    if (view == CV_ACTIVE) {
+        if (b == 0) { return CV_A_MUTE; }
+        return CV_A_HANGUP;
+    }
+    if (view == CV_ENDED or view == CV_FAILED) { return CV_A_CLOSE; }
+    return CV_A_HANGUP;
+}
+
+pub fn cv_title(view: u32) -> str {
+    if (view == CV_CALLING) { return "CALLING"; }
+    if (view == CV_RINGING) { return "INCOMING CALL"; }
+    if (view == CV_KEYS) { return "SECURING THE CALL"; }
+    if (view == CV_COMPARE) { return "COMPARE THE CODE"; }
+    if (view == CV_WAIT) { return "WAITING FOR THE OTHER SIDE"; }
+    if (view == CV_ACTIVE) { return "IN CALL"; }
+    if (view == CV_ENDED) { return "CALL ENDED"; }
+    if (view == CV_FAILED) { return "CALL FAILED"; }
+    return "NEW CALL";
+}
+
+pub fn cv_hint(view: u32) -> str {
+    if (view == CV_CALLING) { return "Waiting for the other side to answer."; }
+    if (view == CV_RINGING) { return "Answer to see the code you both compare. Nothing is sent before you answer."; }
+    if (view == CV_KEYS) { return "Exchanging keys."; }
+    if (view == CV_COMPARE) { return "Read the code aloud. Press CODES MATCH only if both screens show the same digits."; }
+    if (view == CV_WAIT) { return "You said the codes match. The call opens when the other side says so too."; }
+    if (view == CV_ACTIVE) { return "Sealed audio, AES-128-GCM. Microphone and speakers at low volume."; }
+    return "";
+}
+
+// ---------------------------------------------------------------- 2. notes of the window (not call reasons)
+
+pub const CV_N_NONE : u32 = 0;
+pub const CV_N_ADDR : u32 = 1;
+pub const CV_N_LAN : u32 = 2;
+pub const CV_N_SOCKET : u32 = 3;
+pub const CV_N_BIND : u32 = 4;
+pub const CV_N_REFUSED : u32 = 5;
+pub const CV_N_SELF : u32 = 6;
+/// Every call port tried was taken (section 6); the window draws the list, cv_port_all_busy_text.
+pub const CV_N_PORTS : u32 = 7;
+/// A public address with no consent yet (section 7), and an address that is never called.
+pub const CV_N_PUBASK : u32 = 8;
+pub const CV_N_NEVER : u32 = 9;
+/// This router's own public address (call_nat cn_same_router): a friend behind it is called on this network.
+pub const CV_N_ROUTER : u32 = 10;
+
+pub fn cv_note_text(note: u32) -> str {
+    if (note == CV_N_ADDR) { return "Type an address like 192.168.1.10:47727."; }
+    if (note == CV_N_LAN) { return "Calls go only to a private network address (10.x, 172.16-31.x, 192.168.x or 127.x)."; }
+    if (note == CV_N_SOCKET) { return "Calls are off: the call port could not be opened (is it taken?)."; }
+    if (note == CV_N_BIND) { return "Calls are off: T27OS_CALL_BIND must be a private network address (10.x, 172.16-31.x, 192.168.x or 127.x) or 0.0.0.0."; }
+    if (note == CV_N_PUBASK) { return "That is a public address. Press ALLOW to call it once, or set T27OS_ALLOW_PUBLIC=1."; }
+    if (note == CV_N_NEVER) { return "Never called: a multicast, broadcast, 0.x, 240.x or link-local (169.254.x) address."; }
+    if (note == CV_N_REFUSED) { return "The call could not be started."; }
+    if (note == CV_N_SELF) { return "That is this device's own address."; }
+    if (note == CV_N_PORTS) { return "Calls are off: every call port tried is taken."; }
+    if (note == CV_N_ROUTER) { return "That is your router's own public address: call that friend at their address on this network."; }
+    return "";
+}
+
+// ---------------------------------------------------------------- 3. addresses and the test fingerprint
+
+pub const CV_PORT : u64 = 47727;
+/// "255.255.255.255:65535"
+pub const CV_ADDR_MAX : usize = 21;
+pub const CV_CODE_TEXT : usize = 7;
+
+/// A character the address field takes: a digit, a dot or a colon.
+pub fn cv_addr_char(cp: u32) -> bool {
+    return (cp >= 48 and cp <= 57) or cp == 46 or cp == 58;
+}
+
+/// "a.b.c.d" or "a.b.c.d:port" as ip * 65536 + port (port CV_PORT when none is typed); 0 when it is not that shape.
+pub fn cv_parse_addr(t: []const u8, n: usize) -> u64 {
+    if (n == 0 or n > CV_ADDR_MAX or n > t.len) { return 0; }
+    var ip : u64 = 0;
+    var part : u64 = 0;
+    var digits : u32 = 0;
+    var dots : u32 = 0;
+    var i : usize = 0;
+    while (i < n and t[i] != 58) {
+        const c : u8 = t[i];
+        if (c == 46) {
+            if (digits == 0 or dots == 3) { return 0; }
+            ip = ip * 256 + part;
+            part = 0;
+            digits = 0;
+            dots = dots + 1;
+        } else if (c >= 48 and c <= 57) {
+            part = part * 10 + @as(u64, c - 48);
+            digits = digits + 1;
+            if (digits > 3 or part > 255) { return 0; }
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if (dots != 3 or digits == 0) { return 0; }
+    ip = ip * 256 + part;
+    var port : u64 = CV_PORT;
+    if (i < n) {
+        i = i + 1;
+        if (i == n) { return 0; }
+        port = 0;
+        var pd : u32 = 0;
+        while (i < n) {
+            const c : u8 = t[i];
+            if (c < 48 or c > 57) { return 0; }
+            port = port * 10 + @as(u64, c - 48);
+            pd = pd + 1;
+            if (pd > 5 or port > 65535) { return 0; }
+            i = i + 1;
+        }
+        if (port == 0) { return 0; }
+    }
+    return ip * 65536 + port;
+}
+
+pub fn cv_addr_ip(a: u64) -> u64 { return a / 65536; }
+pub fn cv_addr_port(a: u64) -> u64 { return a % 65536; }
+
+/// A private IPv4 network (RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) or this machine (127.0.0.0/8).
+/// The one address rule of calls: the window, the friends engine and the call probes all ask it.
+pub fn cv_lan_ok(ip: u64) -> bool {
+    if (ip > 4294967295) { return false; }
+    const a : u64 = ip >> 24;
+    const b : u64 = (ip >> 16) & 255;
+    return a == 10 or a == 127 or (a == 172 and b >= 16 and b <= 31) or (a == 192 and b == 168);
+}
+
+fn cv_put1(out: []u8, at: usize, b: u8) -> usize {
+    if (at < out.len) { out[at] = b; }
+    return at + 1;
+}
+
+/// "a.b.c.d:port"; the length.
+pub fn cv_addr_text(ip: u64, port: u64, out: []u8) -> usize {
+    var o : usize = put_dec(out, 0, (ip >> 24) & 255);
+    o = cv_put1(out, o, 46);
+    o = put_dec(out, o, (ip >> 16) & 255);
+    o = cv_put1(out, o, 46);
+    o = put_dec(out, o, (ip >> 8) & 255);
+    o = cv_put1(out, o, 46);
+    o = put_dec(out, o, ip & 255);
+    o = cv_put1(out, o, 58);
+    o = put_dec(out, o, port);
+    return o;
+}
+
+/// The test fingerprint of an address: "t27c", the IPv4 big-endian, the port big-endian (10 bytes).
+pub fn cv_fp_of(ip: u64, port: u64, out: []u8) -> usize {
+    if (out.len < CK_FP) { return 0; }
+    out[0] = 116;
+    out[1] = 50;
+    out[2] = 55;
+    out[3] = 99;
+    out[4] = @as(u8, @intCast((ip >> 24) & 255));
+    out[5] = @as(u8, @intCast((ip >> 16) & 255));
+    out[6] = @as(u8, @intCast((ip >> 8) & 255));
+    out[7] = @as(u8, @intCast(ip & 255));
+    out[8] = @as(u8, @intCast((port >> 8) & 255));
+    out[9] = @as(u8, @intCast(port & 255));
+    return CK_FP;
+}
+
+/// The address a test fingerprint names, as ip * 65536 + port; 0 when it is not one (no "t27c" prefix).
+pub fn cv_fp_addr(fp: []const u8) -> u64 {
+    if (fp.len < CK_FP or fp[0] != 116 or fp[1] != 50 or fp[2] != 55 or fp[3] != 99) { return 0; }
+    const ip : u64 = (@as(u64, fp[4]) << 24) | (@as(u64, fp[5]) << 16) | (@as(u64, fp[6]) << 8) | @as(u64, fp[7]);
+    const port : u64 = (@as(u64, fp[8]) << 8) | @as(u64, fp[9]);
+    return ip * 65536 + port;
+}
+
+// ---------------------------------------------------------------- 4. the code and the clock
+
+/// "123 456": the six digits in two groups of three, as both people read them aloud.
+pub fn cv_code_text(code: []const u8, out: []u8) -> usize {
+    if (code.len < 6 or out.len < CV_CODE_TEXT) { return 0; }
+    var i : usize = 0;
+    var o : usize = 0;
+    while (i < 6) {
+        if (i == 3) {
+            out[o] = 32;
+            o = o + 1;
+        }
+        out[o] = code[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+fn cv_put2(out: []u8, at: usize, v: u64) -> usize {
+    const o : usize = cv_put1(out, at, @as(u8, @intCast(48 + (v / 10) % 10)));
+    return cv_put1(out, o, @as(u8, @intCast(48 + v % 10)));
+}
+
+/// The call's duration: "MM:SS", from an hour on "H:MM:SS".
+pub fn cv_clock(secs: u64, out: []u8) -> usize {
+    var o : usize = 0;
+    if (secs >= 3600) {
+        o = put_dec(out, 0, secs / 3600);
+        o = cv_put1(out, o, 58);
+    }
+    o = cv_put2(out, o, (secs / 60) % 60);
+    o = cv_put1(out, o, 58);
+    return cv_put2(out, o, secs % 60);
+}
+
+// ---------------------------------------------------------------- 5. the panel boxes (t = panel top, l = its left)
+
+pub const CV_ME_Y : f64 = 52.0;
+pub const CV_FPME_Y : f64 = 66.0;
+pub const CV_LABEL_Y : f64 = 100.0;
+pub const CV_FIELD_Y : f64 = 108.0;
+pub const CV_FIELD_H : f64 = 26.0;
+pub const CV_DIAL_Y : f64 = 146.0;
+pub const CV_NOTE_Y : f64 = 192.0;
+pub const CV_TITLE_Y : f64 = 108.0;
+pub const CV_PEER_Y : f64 = 132.0;
+pub const CV_PFP_Y : f64 = 148.0;
+pub const CV_BIG_Y : f64 = 200.0;
+pub const CV_ROW_Y : f64 = 224.0;
+pub const CV_HINT_Y : f64 = 270.0;
+pub const CV_BTN_H : f64 = 26.0;
+pub const CV_BTN_GAP : f64 = 8.0;
+/// The title bar's CALL control: a pill left of the profile circle.
+pub const CV_HEAD_W : f64 = 40.0;
+pub const CV_HEAD_H : f64 = 18.0;
+pub const CV_HEAD_GAP : f64 = 8.0;
+pub const CV_RESERVE : f64 = 48.0;
+
+fn cv_in(x: f64, y: f64, bx: f64, by: f64, bw: f64, bh: f64) -> bool {
+    return x >= bx and x < bx + bw and y >= by and y < by + bh;
+}
+
+pub fn cv_field_x(l: f64) -> f64 { return l + QP_PAD; }
+pub fn cv_field_y(t: f64) -> f64 { return t + CV_FIELD_Y; }
+pub fn cv_field_w(w: f64) -> f64 { return w - 2.0 * QP_PAD; }
+
+pub fn cv_btn_w(w: f64) -> f64 { return 0.5 * (w - 2.0 * QP_PAD - CV_BTN_GAP); }
+
+// The thumbnail strip of a group call (owner, 2026-10-23): under the video line, one picture per shown member (at most
+// two, call_core VG_SHOW), each 4:3. One member takes the width of the panel; two stand side by side with a gap.
+// When the window is short the tiles shrink to the room left, never past it.
+pub const CV_STRIP_GAP : f64 = 6.0;
+/// The space under a tile for the member's name.
+pub const CV_STRIP_LABEL : f64 = 14.0;
+
+/// The width of one tile for n shown members in a strip w wide with `room` of height left.
+pub fn cv_strip_w(n: u32, w: f64, room: f64) -> f64 {
+    var tw : f64 = w;
+    if (n >= 2) { tw = 0.5 * (w - CV_STRIP_GAP); }
+    const hmax : f64 = room - CV_STRIP_LABEL;
+    if (tw * 0.75 > hmax) { tw = hmax * 4.0 / 3.0; }
+    if (tw < 0.0) { tw = 0.0; }
+    return tw;
+}
+
+/// The height of a tile of width tw.
+pub fn cv_strip_h(tw: f64) -> f64 { return tw * 0.75; }
+
+/// The left edge of tile i of a strip starting at x.
+pub fn cv_strip_x(i: u32, x: f64, tw: f64) -> f64 { return x + @as(f64, @floatFromInt(i)) * (tw + CV_STRIP_GAP); }
+
+// Self-view (owner, 2026-10-23): in a one to one call with video the remote picture is large and the user's own camera
+// is a small mirrored inset in its bottom-right corner, named YOU. What the inset is (picture, waiting for the first
+// frame, or a "camera off" note) is cv_self_mode; where it goes is cv_self_*. The window only draws what these say.
+pub const CV_SELF_NONE : u32 = 0;
+pub const CV_SELF_PIP : u32 = 1;
+pub const CV_SELF_WAIT : u32 = 2;
+pub const CV_SELF_OFF : u32 = 3;
+/// The gap between the inset and the remote picture's edges.
+pub const CV_SELF_PAD : f64 = 6.0;
+pub const CV_SELF_MIN : f64 = 40.0;
+pub const CV_SELF_MAX : f64 = 120.0;
+
+/// What the self-view shows. `vsend`: the call sends video; `cam_cfg_off`: the camera is switched off for the run
+/// (T27OS_CALL_CAMERA=0, a generator is the source); `voice`: a voice-only call; `failed`: the camera gave up or was
+/// refused; `have_pic`: a local picture is held. A call with video and a running camera shows the picture (PIP) or, before
+/// the first frame, an empty inset (WAIT); every other case says "camera off" (OFF). NONE: not a call with video panel.
+pub fn cv_self_mode(view: u32, group: bool, vsend: bool, cam_cfg_off: bool, voice: bool, failed: bool, have_pic: bool) -> u32 {
+    if (view != CV_ACTIVE or group) { return CV_SELF_NONE; }
+    if (!vsend or cam_cfg_off or voice or failed) { return CV_SELF_OFF; }
+    if (have_pic) { return CV_SELF_PIP; }
+    return CV_SELF_WAIT;
+}
+
+/// The width of the inset for a remote picture rw wide: 30 %, between CV_SELF_MIN and CV_SELF_MAX.
+pub fn cv_self_w(rw: f64) -> f64 {
+    var w : f64 = rw * 0.3;
+    if (w < CV_SELF_MIN) { w = CV_SELF_MIN; }
+    if (w > CV_SELF_MAX) { w = CV_SELF_MAX; }
+    return w;
+}
+
+/// The inset takes at most half the remote picture's width and height (4:3 like the picture).
+pub fn cv_self_fits(rw: f64, rh: f64) -> bool {
+    const w : f64 = cv_self_w(rw);
+    return w * 2.0 <= rw and cv_strip_h(w) * 2.0 <= rh;
+}
+
+/// The left edge of the inset: the right edge of the remote picture less the inset and the gap.
+pub fn cv_self_x(rx: f64, rw: f64, sw: f64) -> f64 { return rx + rw - sw - CV_SELF_PAD; }
+
+/// The top of the inset: the bottom edge of the remote picture less the inset's height and the gap.
+pub fn cv_self_y(ry: f64, rh: f64, sw: f64) -> f64 { return ry + rh - cv_strip_h(sw) - CV_SELF_PAD; }
+
+// The picture of a one to one call (owner, 2026-10-23): two lines of numbers over it (what arrives, what leaves: frames
+// a second, size, kbit/s) and a third for a note (an older T27 OS on the other side ..), then the remote picture in the
+// width of the panel, 16:9 while H.264 arrives (the camera's 1280x720) and 4:3 for the JPEG of an older build, as high
+// as the room under it allows. The window draws the lines and an empty box; the picture itself is a layer over the box
+// at the same place (cv_vbox_*), so 30 pictures a second never redraw the window.
+pub const CV_VLINES_H : f64 = 36.0;
+
+/// The top of the picture under the video lines that start at y.
+pub fn cv_vbox_top(y: f64) -> f64 { return y + CV_VLINES_H; }
+
+/// The height of the picture box in a width w with `room` of height left: 9/16 (wide) or 3/4 of w, never past room.
+pub fn cv_vbox_h(w: f64, room: f64, wide: bool) -> f64 {
+    var h : f64 = w * 0.75;
+    if (wide) { h = w * 9.0 / 16.0; }
+    if (room < h) { h = room; }
+    if (h < 0.0) { h = 0.0; }
+    return h;
+}
+
+/// The width of the picture box: w, or less when the room cut its height (the aspect is kept).
+pub fn cv_vbox_w(w: f64, room: f64, wide: bool) -> f64 {
+    const h : f64 = cv_vbox_h(w, room, wide);
+    if (wide) {
+        if (h < w * 9.0 / 16.0) { return h * 16.0 / 9.0; }
+        return w;
+    }
+    if (h < w * 0.75) { return h * 4.0 / 3.0; }
+    return w;
+}
+
+/// The bottom edge of a box at `top` (h high) in the coordinates of a layer whose origin is the view's bottom-left
+/// corner (the view is vh high); the window draws from the top-left.
+pub fn cv_layer_y(vh: f64, top: f64, h: f64) -> f64 { return vh - top - h; }
+
+pub fn cv_self_label() -> str { return "YOU"; }
+pub fn cv_self_off_text() -> str { return "camera off"; }
+
+pub fn cv_btn_x(l: f64, w: f64, b: u32) -> f64 { return l + QP_PAD + @as(f64, @floatFromInt(b)) * (cv_btn_w(w) + CV_BTN_GAP); }
+
+/// The top of the button row: under the field while IDLE, under the big digits otherwise.
+pub fn cv_row_y(t: f64, view: u32) -> f64 {
+    if (view == CV_IDLE) { return t + CV_DIAL_Y; }
+    return t + CV_ROW_Y;
+}
+
+pub fn cv_hit(x: f64, y: f64, l: f64, w: f64, t: f64, view: u32) -> u32 {
+    if (view == CV_IDLE and cv_in(x, y, cv_field_x(l), cv_field_y(t), cv_field_w(w), CV_FIELD_H)) { return CV_H_FIELD; }
+    var b : u32 = 0;
+    while (b < cv_btn_count(view)) {
+        if (cv_in(x, y, cv_btn_x(l, w, b), cv_row_y(t, view), cv_btn_w(w), CV_BTN_H)) { return CV_H_B0 + b; }
+        b = b + 1;
+    }
+    return CV_H_NONE;
+}
+
+/// The CALL pill of the title bar ends at `right` (left of the profile circle), centred in the bar's height.
+pub fn cv_head_x(right: f64) -> f64 { return right - CV_HEAD_W; }
+pub fn cv_head_y(title_h: f64) -> f64 { return 0.5 * (title_h - CV_HEAD_H); }
+pub fn cv_head_hit(x: f64, y: f64, right: f64, title_h: f64) -> bool {
+    return cv_in(x, y, cv_head_x(right), cv_head_y(title_h), CV_HEAD_W, CV_HEAD_H);
+}
+
+// ---------------------------------------------------------------- 6. the call port when it is taken
+// Owner, 2026-10-23: a taken call port must not turn calls off. A launch tries at most CV_PORT_TRIES ports
+// (cv_port_plan): the configured base (T27OS_CALL_PORT, else CV_PORT) first, so a base that is free again is taken
+// back; then the port the last launch opened (~/.t27os/callport.t27) when it is one of base+1..base+9, as it was
+// proven to open; then the rest of base+1..base+9 upwards, never past 65535. The port that opens is the one the
+// session listens on and the one the mDNS TXT record names (friends_engine fe_net); the base is never rewritten.
+// What the launch keeps (cv_port_step, CV_PS_LEN words): the port that opened (0 = none), a mask with bit k set when
+// base+k was tried and did not open, and how many ports were tried.
+//
+// The file, version 1 (ASCII, three lines, no key):
+//   t27os-callport v1
+//   <port> <at>
+//   crc <crc32>
+// port 1..65535; at: unix seconds of the launch that opened it (never 0); crc: CRC-32 (peer_identity crc32) of every
+// byte before the crc line, in decimal. Anything else is ignored: the plan is then the base and its next nine.
+
+pub const CV_PORT_TRIES : usize = 10;
+pub const CV_PS_USED : usize = 0;
+pub const CV_PS_BUSY : usize = 1;
+pub const CV_PS_TRIED : usize = 2;
+pub const CV_PS_LEN : usize = 3;
+pub const CV_CP_MAGIC : str = "t27os-callport v1\n";
+pub const CV_CP_LEAF : str = "callport.t27";
+pub const CV_CP_LEAF_TMP : str = "callport.t27.tmp";
+/// The longest file: the head, two numbers of at most 20 digits, the crc line.
+pub const CV_CP_CAP : usize = 80;
+
+/// The ports a launch tries, in order, into out; how many (at most CV_PORT_TRIES and out.len, 0 for a bad base).
+pub fn cv_port_plan(base: u64, saved: u64, out: []u64) -> usize {
+    if (base == 0 or base > 65535 or out.len == 0) { return 0; }
+    const tries : u64 = @as(u64, CV_PORT_TRIES);
+    out[0] = base;
+    var n : usize = 1;
+    var keep : u64 = 0;
+    if (saved > base and saved - base < tries and saved <= 65535) { keep = saved; }
+    if (keep != 0 and n < out.len) {
+        out[n] = keep;
+        n = n + 1;
+    }
+    var k : u64 = 1;
+    while (k < tries and n < out.len and base + k <= 65535) {
+        if (base + k != keep) {
+            out[n] = base + k;
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The bit of port in the busy mask: 2^(port - base) for base..base+9, 0 for any other port.
+pub fn cv_port_bit(base: u64, port: u64) -> u64 {
+    if (port < base or port - base >= @as(u64, CV_PORT_TRIES)) { return 0; }
+    var b : u64 = 1;
+    var k : u64 = 0;
+    while (k < port - base) {
+        b = b * 2;
+        k = k + 1;
+    }
+    return b;
+}
+
+/// One try of the launch: port was tried and opened (ok) or not; st (CV_PS_LEN words) is updated. True when the next
+/// port of the plan is to be tried: this one did not open and fewer than CV_PORT_TRIES were tried.
+pub fn cv_port_step(st: []u64, base: u64, port: u64, ok: bool) -> bool {
+    if (st.len < CV_PS_LEN) { return false; }
+    st[CV_PS_TRIED] = st[CV_PS_TRIED] + 1;
+    if (ok) {
+        st[CV_PS_USED] = port;
+        return false;
+    }
+    st[CV_PS_BUSY] = st[CV_PS_BUSY] | cv_port_bit(base, port);
+    return st[CV_PS_TRIED] < @as(u64, CV_PORT_TRIES);
+}
+
+/// How many bits of the busy mask are set.
+pub fn cv_port_nbusy(busy: u64) -> u64 {
+    var n : u64 = 0;
+    var x : u64 = busy;
+    while (x > 0) {
+        n = n + (x & 1);
+        x = x / 2;
+    }
+    return n;
+}
+
+/// The busy ports, ascending, "47727" or "47727, 47728", at out[at]; the index after them.
+fn cv_port_list(base: u64, busy: u64, out: []u8, at: usize) -> usize {
+    var n : usize = at;
+    var first : bool = true;
+    var k : u64 = 0;
+    var x : u64 = busy;
+    while (x > 0) {
+        if ((x & 1) != 0) {
+            if (!first) { n = put_bytes(out, n, ", "); }
+            n = put_dec(out, n, base + k);
+            first = false;
+        }
+        x = x / 2;
+        k = k + 1;
+    }
+    return n;
+}
+
+/// "port 47727 busy, using 47728" (or "ports 47727, 47728 busy, using 47729") when the port that opened is not the
+/// base; nothing (0) when the base opened or none did.
+pub fn cv_port_busy_text(base: u64, used: u64, busy: u64, out: []u8) -> usize {
+    if (used == 0 or used == base or busy == 0) { return 0; }
+    var n : usize = 0;
+    if (cv_port_nbusy(busy) == 1) { n = put_bytes(out, 0, "port "); } else { n = put_bytes(out, 0, "ports "); }
+    n = cv_port_list(base, busy, out, n);
+    n = put_bytes(out, n, " busy, using ");
+    return put_dec(out, n, used);
+}
+
+/// "ONLINE  port 47728" while calls are up; "OFFLINE  10 call ports busy" when every port tried was taken;
+/// "OFFLINE  calls are off" otherwise.
+pub fn cv_port_line(up: bool, used: u64, busy: u64, tried: u64, out: []u8) -> usize {
+    if (up and used != 0) { return put_dec(out, put_bytes(out, 0, "ONLINE  port "), used); }
+    if (tried > 0 and cv_port_nbusy(busy) == tried) {
+        const n : usize = put_dec(out, put_bytes(out, 0, "OFFLINE  "), tried);
+        return put_bytes(out, n, " call ports busy");
+    }
+    return put_bytes(out, 0, "OFFLINE  calls are off");
+}
+
+/// The note when every port tried was taken, with each of them: "Calls are off: every call port tried is taken:
+/// 47727, 47728, ... 47736. Close what holds one, or set T27OS_CALL_PORT." 0 when one opened or none was tried; out
+/// needs CV_PORT_NOTE_CAP bytes.
+pub const CV_PORT_NOTE_CAP : usize = 200;
+pub fn cv_port_all_busy_text(base: u64, used: u64, busy: u64, tried: u64, out: []u8) -> usize {
+    if (used != 0 or tried == 0 or cv_port_nbusy(busy) != tried or out.len < CV_PORT_NOTE_CAP) { return 0; }
+    var n : usize = put_bytes(out, 0, "Calls are off: every call port tried is taken: ");
+    n = cv_port_list(base, busy, out, n);
+    return put_bytes(out, n, ". Close what holds one, or set T27OS_CALL_PORT.");
+}
+
+// ---------------------------------------------------------------- 7. addresses beyond the home network
+// Owner, 2026-10-23: a first step to calls over the internet, with no server and no relay. The decision on an address
+// (cv_dial_step) is one of three: a private network or this machine (cv_lan_ok) is called as before; a public IPv4 is
+// called only when the person typed it and pressed ALLOW for that very address and port (the consent is spent by the
+// call that uses it, never kept, never written anywhere), or when T27OS_ALLOW_PUBLIC=1 is set; multicast (224/4),
+// broadcast (255.255.255.255), 0.0.0/8, 240/4 and link-local (169.254/16) are never called, nor a port outside
+// 1..65535. The handshake, the keys and the 6-digit comparison are the same on every address.
+// Listening (owner, 2026-10-23: "make the app listen on the network by itself"): with no T27OS_CALL_BIND the window
+// listens on 0.0.0.0, every interface, so a friend on the same Wi-Fi reaches it with no variable set; the panel says
+// where in one line, "listening on <address>:<port>", the address being the one this Mac sends from on its default
+// route (cv_lan_pick, looked up by the window with a UDP connect that sends nothing). T27OS_CALL_BIND=127.0.0.1 (or
+// any 127.x) keeps calls on this Mac; a private address keeps them on that interface; anything else turns calls off
+// (cv_bind_class). The mDNS TXT record of a window on 0.0.0.0 carries pub=1 (cv_txt_pub). Listening wider changes no
+// rule of a call: the identity check by key, the sealed audio, the pause after five wrong codes and the addresses
+// that are never called stay as they are, and every call still rings for the person to ANSWER or DECLINE (cv_who).
+
+pub const CV_AC_INVALID : u32 = 0;
+pub const CV_AC_PRIVATE : u32 = 1;
+pub const CV_AC_PUBLIC : u32 = 2;
+pub const CV_AC_MULTICAST : u32 = 3;
+pub const CV_AC_BROADCAST : u32 = 4;
+pub const CV_AC_LINKLOCAL : u32 = 5;
+
+/// What kind of IPv4 an address is. 0.0.0/8 and 240/4 (reserved) are INVALID, as is anything past 32 bits.
+pub fn cv_addr_class(ip: u64) -> u32 {
+    if (ip > 4294967295) { return CV_AC_INVALID; }
+    if (ip == 4294967295) { return CV_AC_BROADCAST; }
+    const a : u64 = ip >> 24;
+    const b : u64 = (ip >> 16) & 255;
+    if (a == 0 or a >= 240) { return CV_AC_INVALID; }
+    if (a >= 224) { return CV_AC_MULTICAST; }
+    if (a == 169 and b == 254) { return CV_AC_LINKLOCAL; }
+    if (cv_lan_ok(ip)) { return CV_AC_PRIVATE; }
+    return CV_AC_PUBLIC;
+}
+
+pub const CV_D_OK : u32 = 0;
+pub const CV_D_ASK : u32 = 1;
+pub const CV_D_NO : u32 = 2;
+
+/// The decision on an address a (ip * 65536 + port) without spending anything: OK, ASK (public, no consent for it)
+/// or NO. env: T27OS_ALLOW_PUBLIC=1; consent: the one address ALLOW was pressed for (0 = none).
+pub fn cv_dial_decide(a: u64, env: bool, consent: u64) -> u32 {
+    const port : u64 = cv_addr_port(a);
+    if (port == 0 or port > 65535) { return CV_D_NO; }
+    const k : u32 = cv_addr_class(cv_addr_ip(a));
+    if (k == CV_AC_PRIVATE) { return CV_D_OK; }
+    if (k != CV_AC_PUBLIC) { return CV_D_NO; }
+    if (env or (consent != 0 and consent == a)) { return CV_D_OK; }
+    return CV_D_ASK;
+}
+
+/// ALLOW pressed for a: the consent becomes a when a is a public address; otherwise nothing changes.
+pub fn cv_allow(consent: []u64, a: u64) -> bool {
+    if (consent.len < 1 or cv_addr_port(a) == 0 or cv_addr_class(cv_addr_ip(a)) != CV_AC_PUBLIC) { return false; }
+    consent[0] = a;
+    return true;
+}
+
+/// One dial: the decision, and the consent is spent (back to 0) by any dial, so the next call to a public address asks
+/// again. Nothing about a public address outlives the call that used it.
+pub fn cv_dial_step(consent: []u64, a: u64, env: bool) -> u32 {
+    if (consent.len < 1) { return cv_dial_decide(a, env, 0); }
+    const d : u32 = cv_dial_decide(a, env, consent[0]);
+    consent[0] = 0;
+    return d;
+}
+
+/// The row under the debug CALL for the typed address: 0 = none (not public), 1 = "public address -- allow?" with
+/// ALLOW, 2 = allowed (by ALLOW for this address, or by T27OS_ALLOW_PUBLIC).
+pub fn cv_pub_row(a: u64, env: bool, consent: u64) -> u32 {
+    if (a == 0 or cv_addr_class(cv_addr_ip(a)) != CV_AC_PUBLIC) { return 0; }
+    if (cv_dial_decide(a, env, consent) == CV_D_OK) { return 2; }
+    return 1;
+}
+
+pub fn cv_pub_row_text(row: u32, env: bool) -> str {
+    if (row == 1) { return "public address -- allow?"; }
+    if (row == 2 and env) { return "public address -- allowed by T27OS_ALLOW_PUBLIC"; }
+    if (row == 2) { return "public address -- allowed for one call"; }
+    return "";
+}
+
+/// "Over the internet: forward UDP port 47727 on that router; the address is the one its provider gave."
+pub fn cv_pub_hint(port: u64, out: []u8) -> usize {
+    if (port == 0 or port > 65535 or out.len < 96) { return 0; }
+    var n : usize = put_bytes(out, 0, "Over the internet: forward UDP port ");
+    n = put_dec(out, n, port);
+    return put_bytes(out, n, " on that router; the address is the one its provider gave.");
+}
+
+pub const CV_B_NO : u32 = 0;
+pub const CV_B_LAN : u32 = 1;
+pub const CV_B_ANY : u32 = 2;
+/// Not an IPv4: what cv_bind_parse gives for a T27OS_CALL_BIND that does not parse.
+pub const CV_BIND_BAD : u64 = 4294967296;
+
+/// The address T27OS_CALL_BIND names: 0.0.0.0 (every interface) when unset (n = 0), CV_BIND_BAD when it is not an
+/// address.
+pub fn cv_bind_parse(t: []const u8, n: usize) -> u64 {
+    if (n == 0) { return 0; }
+    const a : u64 = cv_parse_addr(t, n);
+    if (a == 0) { return CV_BIND_BAD; }
+    return cv_addr_ip(a);
+}
+
+/// Where a window may listen: a private address (LAN), 0.0.0.0 (ANY: all interfaces, warned in the panel), nothing else.
+pub fn cv_bind_class(ip: u64) -> u32 {
+    if (ip == 0) { return CV_B_ANY; }
+    if (cv_lan_ok(ip)) { return CV_B_LAN; }
+    return CV_B_NO;
+}
+
+/// The warning on THIS DEVICE while listening on all interfaces; "" otherwise.
+pub fn cv_bind_warn(ip: u64) -> str {
+    if (cv_bind_class(ip) == CV_B_ANY) { return "listening on all interfaces"; }
+    return "";
+}
+
+/// The address a route lookup gave (the source this Mac uses on its default route) when it is one to show: a public
+/// or private unicast IPv4 that is not 127/8; 0 otherwise (no network, a link-local address).
+pub fn cv_lan_pick(ip: u64) -> u64 {
+    if (ip > 4294967295 or (ip >> 24) == 127) { return 0; }
+    const k : u32 = cv_addr_class(ip);
+    if (k != CV_AC_PUBLIC and k != CV_AC_PRIVATE) { return 0; }
+    return ip;
+}
+
+/// Where the window listens, for the CALL panel and the cabinet: "listening on 192.168.1.10:47727" (every interface,
+/// the address this Mac sends from), "listening on port 47727, no network yet" (every interface, no address),
+/// "listening on 127.0.0.1:47727, this Mac only" or "listening on 192.168.1.10:47727 only" (T27OS_CALL_BIND).
+/// out: at least 64 bytes; the length.
+pub fn cv_listen_text(bind: u64, lan: u64, port: u64, out: []u8) -> usize {
+    if (out.len < 64) { return 0; }
+    var n : usize = put_bytes(out, 0, "listening on ");
+    if (bind == 0) {
+        if (lan == 0) {
+            n = put_bytes(out, n, "port ");
+            n = put_dec(out, n, port);
+            return put_bytes(out, n, ", no network yet");
+        }
+        return n + cv_addr_text(lan, port, out[n..out.len]);
+    }
+    n = n + cv_addr_text(bind, port, out[n..out.len]);
+    if ((bind >> 24) == 127) { return put_bytes(out, n, ", this Mac only"); }
+    return put_bytes(out, n, " only");
+}
+
+/// Who gets through, one short line: every call rings for the person (never answered by itself); a friend's stored key
+/// is checked, anyone else compares the 6-digit code; a stranger's message waits in INVITATIONS (ACCEPT / DECLINE).
+pub fn cv_who() -> str { return "Every call rings for you; a friend's key is checked."; }
+
+/// The typed address is this device: its port and either the address it is bound to, or, on every interface, the
+/// address it sends from or any 127.x.
+pub fn cv_is_self(a: u64, bind: u64, lan: u64, port: u64) -> bool {
+    if (cv_addr_port(a) != port or a == 0) { return false; }
+    const ip : u64 = cv_addr_ip(a);
+    if (bind != 0) { return ip == bind; }
+    return (lan != 0 and ip == lan) or (ip >> 24) == 127;
+}
+
+/// The mDNS TXT record of a window listening on all interfaces gets "pub=1" at its end (in place); its new length.
+/// any false, or no room within out (at most 96 bytes, peer_identity TXT_MAX): the record as it was.
+pub fn cv_txt_pub(txt: []u8, n: usize, any: bool) -> usize {
+    if (!any or n + 6 > txt.len or n + 6 > 96) { return n; }
+    txt[n] = 5;
+    txt[n + 1] = 112;
+    txt[n + 2] = 117;
+    txt[n + 3] = 98;
+    txt[n + 4] = 61;
+    txt[n + 5] = 49;
+    return n + 6;
+}
+
+/// The file for the port that opened at unix second at; its length (at most CV_CP_CAP), 0 for a bad port or at = 0.
+pub fn cv_cp_text(port: u64, at: u64, out: []u8) -> usize {
+    if (port == 0 or port > 65535 or at == 0 or out.len < CV_CP_CAP) { return 0; }
+    var n : usize = put_bytes(out, 0, CV_CP_MAGIC);
+    n = put_dec(out, n, port);
+    n = put_bytes(out, n, " ");
+    n = put_dec(out, n, at);
+    n = put_bytes(out, n, "\n");
+    const c : u32 = crc32(out[0..n], n);
+    n = put_bytes(out, n, "crc ");
+    n = put_dec(out, n, @as(u64, c));
+    return put_bytes(out, n, "\n");
+}
+
+/// The decimal number at text[at] (1..19 digits) into v[0]; the index after it, text.len + 1 when there is none.
+fn cv_cp_num(text: []const u8, at: usize, v: []u64) -> usize {
+    var i : usize = at;
+    var x : u64 = 0;
+    while (i < text.len and text[i] >= 48 and text[i] <= 57 and i - at < 19) {
+        x = x * 10 + @as(u64, text[i] - 48);
+        i = i + 1;
+    }
+    if (i == at or (i < text.len and text[i] >= 48 and text[i] <= 57)) { return text.len + 1; }
+    v[0] = x;
+    return i;
+}
+
+/// The port a version 1 file names; 0 for anything else (another head, a bad number, a wrong CRC, bytes after it).
+pub fn cv_cp_parse(text: []const u8) -> u64 {
+    const ml : usize = CV_CP_MAGIC.len;
+    if (text.len > CV_CP_CAP or text.len < ml) { return 0; }
+    var i : usize = 0;
+    while (i < ml) {
+        if (text[i] != CV_CP_MAGIC[i]) { return 0; }
+        i = i + 1;
+    }
+    var v : [1]u64 = undefined;
+    i = cv_cp_num(text, i, v[0..1]);
+    if (i >= text.len or text[i] != 32) { return 0; }
+    const port : u64 = v[0];
+    i = cv_cp_num(text, i + 1, v[0..1]);
+    if (i >= text.len or text[i] != 10) { return 0; }
+    const at : u64 = v[0];
+    const body : usize = i + 1;
+    if (body + 4 > text.len or text[body] != 99 or text[body + 1] != 114 or text[body + 2] != 99 or text[body + 3] != 32) { return 0; }
+    i = cv_cp_num(text, body + 4, v[0..1]);
+    if (i >= text.len or text[i] != 10 or i + 1 != text.len) { return 0; }
+    if (v[0] != @as(u64, crc32(text[0..body], body))) { return 0; }
+    if (port == 0 or port > 65535 or at == 0) { return 0; }
+    return port;
+}
+
+/// What the launch writes once a port opened: the file naming that port (never the base unless the base opened);
+/// 0 when none opened (the file is then left as it was).
+pub fn cv_port_save_text(st: []const u64, at: u64, out: []u8) -> usize {
+    if (st.len < CV_PS_LEN or st[CV_PS_USED] == 0) { return 0; }
+    return cv_cp_text(st[CV_PS_USED], at, out);
+}
+
+// ---------------------------------------------------------------- tests
+
+fn cv_eq(a: []const u8, n: usize, s: []const u8) -> bool {
+    if (n != s.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test cv_every_call_state_has_one_view {
+    assert cv_view(CK_IDLE, false, false) == CV_IDLE;
+    assert cv_view(CK_CALLING, false, false) == CV_CALLING;
+    assert cv_view(CK_RINGING, false, false) == CV_RINGING;
+    assert cv_view(CK_VERIFY, false, false) == CV_KEYS;
+    assert cv_view(CK_VERIFY, true, false) == CV_COMPARE;
+    assert cv_view(CK_VERIFY, true, true) == CV_WAIT;
+    assert cv_view(CK_ACTIVE, true, true) == CV_ACTIVE;
+    assert cv_view(CK_ENDED, false, false) == CV_ENDED;
+    assert cv_view(CK_FAILED, true, false) == CV_FAILED;
+    assert cv_view(99, false, false) == CV_IDLE;
+    assert cv_live(CV_IDLE) == false;
+    assert cv_live(CV_CALLING) and cv_live(CV_RINGING) and cv_live(CV_COMPARE) and cv_live(CV_ACTIVE);
+    assert cv_live(CV_ENDED) == false and cv_live(CV_FAILED) == false;
+}
+
+test cv_ringing_never_answers_by_itself_and_shows_no_code_button {
+    // the only ways out of RINGING are the two buttons the person presses
+    assert cv_action(CV_RINGING, CV_H_NONE) == CV_A_NONE;
+    assert cv_action(CV_RINGING, CV_H_FIELD) == CV_A_NONE;
+    assert cv_action(CV_RINGING, CV_H_B0) == CV_A_ANSWER;
+    assert cv_action(CV_RINGING, CV_H_B1) == CV_A_DECLINE;
+    // MATCH exists only once the code is shown
+    var v : u32 = 0;
+    while (v <= CV_FAILED) {
+        if (v != CV_COMPARE) {
+            assert cv_action(v, CV_H_B0) != CV_A_MATCH;
+            assert cv_action(v, CV_H_B1) != CV_A_DIFFER;
+        }
+        v = v + 1;
+    }
+}
+
+test cv_each_view_has_its_buttons_and_nothing_answers_a_missing_one {
+    assert cv_action(CV_IDLE, CV_H_FIELD) == CV_A_FOCUS;
+    assert cv_action(CV_IDLE, CV_H_B0) == CV_A_DIAL;
+    assert cv_action(CV_IDLE, CV_H_B1) == CV_A_NONE;
+    assert cv_action(CV_CALLING, CV_H_B0) == CV_A_HANGUP;
+    assert cv_action(CV_CALLING, CV_H_B1) == CV_A_NONE;
+    assert cv_action(CV_KEYS, CV_H_B0) == CV_A_HANGUP;
+    assert cv_action(CV_COMPARE, CV_H_B0) == CV_A_MATCH;
+    assert cv_action(CV_COMPARE, CV_H_B1) == CV_A_DIFFER;
+    assert cv_action(CV_WAIT, CV_H_B0) == CV_A_HANGUP;
+    assert cv_action(CV_WAIT, CV_H_B1) == CV_A_NONE;
+    assert cv_action(CV_ACTIVE, CV_H_B0) == CV_A_MUTE;
+    assert cv_action(CV_ACTIVE, CV_H_B1) == CV_A_HANGUP;
+    assert cv_action(CV_ENDED, CV_H_B0) == CV_A_CLOSE;
+    assert cv_action(CV_FAILED, CV_H_B0) == CV_A_CLOSE;
+    assert cv_action(CV_FAILED, CV_H_B1) == CV_A_NONE;
+    assert cv_btn_word(CV_ACTIVE, 0, false) == "MUTE";
+    assert cv_btn_word(CV_ACTIVE, 0, true) == "UNMUTE";
+    assert cv_btn_word(CV_ACTIVE, 1, false) == "END CALL";
+    assert cv_btn_word(CV_COMPARE, 0, false) == "CODES MATCH";
+    assert cv_btn_word(CV_IDLE, 1, false) == "";
+    assert cv_btn_word(CV_WAIT, 0, false) == "HANG UP";
+}
+
+test cv_addresses_parse_with_and_without_a_port {
+    const a : u64 = cv_parse_addr("192.168.1.10:47728", 18);
+    assert cv_addr_ip(a) == 3232235786;
+    assert cv_addr_port(a) == 47728;
+    const b : u64 = cv_parse_addr("127.0.0.1", 9);
+    assert cv_addr_ip(b) == 2130706433;
+    assert cv_addr_port(b) == CV_PORT;
+    assert cv_parse_addr("", 0) == 0;
+    assert cv_parse_addr("127.0.0", 7) == 0;
+    assert cv_parse_addr("127.0.0.1.5", 11) == 0;
+    assert cv_parse_addr("256.0.0.1", 9) == 0;
+    assert cv_parse_addr("1..2.3", 6) == 0;
+    assert cv_parse_addr("127.0.0.1:", 10) == 0;
+    assert cv_parse_addr("127.0.0.1:0", 11) == 0;
+    assert cv_parse_addr("127.0.0.1:65536", 15) == 0;
+    assert cv_parse_addr("127.0.0.1:4x", 12) == 0;
+    assert cv_parse_addr("1270.0.0.1", 10) == 0;
+    assert cv_addr_char(48) and cv_addr_char(57) and cv_addr_char(46) and cv_addr_char(58);
+    assert cv_addr_char(32) == false and cv_addr_char(97) == false and cv_addr_char(1103) == false;
+}
+
+test cv_only_private_networks_and_this_machine_are_dialled {
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("10.1.2.3", 8)));
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("172.16.0.1", 10)));
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("172.31.255.254", 14)));
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("192.168.1.10", 12)));
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("127.0.0.1", 9)));
+    assert cv_lan_ok(2130706433);
+    assert cv_lan_ok(3232235786);
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("8.8.8.8", 7))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("172.32.0.1", 10))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("172.15.255.255", 14))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("169.254.1.1", 11))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("0.0.0.0", 7))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("255.255.255.255", 15))) == false;
+    assert cv_lan_ok(cv_addr_ip(cv_parse_addr("192.169.1.1", 11))) == false;
+    assert cv_lan_ok(134744072) == false;
+    assert cv_lan_ok(0) == false;
+    assert cv_lan_ok(4294967296 + 2130706433) == false;
+    assert cv_parse_addr("192.168.1.10:0", 14) == 0;
+    assert cv_parse_addr("192.168.1.10:65536", 18) == 0;
+    assert cv_parse_addr("192.168.1.10:99999", 18) == 0;
+    assert cv_parse_addr("10.1.2.3:1", 10) == cv_parse_addr("10.1.2.3", 8) - CV_PORT + 1;
+    assert cv_addr_port(cv_parse_addr("172.16.0.1:65535", 16)) == 65535;
+}
+
+test cv_the_test_fingerprint_names_its_address_and_reads_back {
+    var fp : [10]u8 = undefined;
+    assert cv_fp_of(3232235786, 47727, fp[0..10]) == 10;
+    assert fp[0] == 116 and fp[3] == 99 and fp[4] == 192 and fp[7] == 10 and fp[8] == 186 and fp[9] == 111;
+    const a : u64 = cv_fp_addr(fp[0..10]);
+    assert cv_addr_ip(a) == 3232235786 and cv_addr_port(a) == 47727;
+    var other : [10]u8 = undefined;
+    assert cv_fp_of(3232235786, 47728, other[0..10]) == 10;
+    assert other[9] != fp[9];
+    fp[0] = 0;
+    assert cv_fp_addr(fp[0..10]) == 0;
+    var t : [24]u8 = undefined;
+    const n : usize = cv_addr_text(3232235786, 47727, t[0..24]);
+    assert cv_eq(t[0..24], n, "192.168.1.10:47727");
+    const m : usize = cv_addr_text(2130706433, 1, t[0..24]);
+    assert cv_eq(t[0..24], m, "127.0.0.1:1");
+    assert cv_parse_addr(t[0..24], m) == 2130706433 * 65536 + 1;
+}
+
+test cv_the_code_reads_in_two_groups_and_the_clock_counts_minutes {
+    var o : [8]u8 = undefined;
+    const n : usize = cv_code_text("269684", o[0..8]);
+    assert cv_eq(o[0..8], n, "269 684");
+    assert cv_code_text("12345", o[0..8]) == 0;
+    var c : [12]u8 = undefined;
+    assert cv_eq(c[0..12], cv_clock(0, c[0..12]), "00:00");
+    assert cv_eq(c[0..12], cv_clock(10, c[0..12]), "00:10");
+    assert cv_eq(c[0..12], cv_clock(754, c[0..12]), "12:34");
+    assert cv_eq(c[0..12], cv_clock(3661, c[0..12]), "1:01:01");
+}
+
+test cv_the_panel_boxes_hit_their_own_button_inside_the_slot {
+    const l : f64 = 600.0;
+    const w : f64 = 300.0;
+    const t : f64 = 52.0;
+    assert cv_hit(cv_field_x(l) + 5.0, cv_field_y(t) + 5.0, l, w, t, CV_IDLE) == CV_H_FIELD;
+    assert cv_hit(cv_field_x(l) + 5.0, cv_field_y(t) + 5.0, l, w, t, CV_ACTIVE) == CV_H_NONE;
+    assert cv_hit(cv_btn_x(l, w, 0) + 5.0, cv_row_y(t, CV_IDLE) + 5.0, l, w, t, CV_IDLE) == CV_H_B0;
+    assert cv_hit(cv_btn_x(l, w, 1) + 5.0, cv_row_y(t, CV_IDLE) + 5.0, l, w, t, CV_IDLE) == CV_H_NONE;
+    assert cv_hit(cv_btn_x(l, w, 1) + 5.0, cv_row_y(t, CV_RINGING) + 5.0, l, w, t, CV_RINGING) == CV_H_B1;
+    assert cv_hit(cv_btn_x(l, w, 0) + 5.0, cv_row_y(t, CV_COMPARE) + 5.0, l, w, t, CV_COMPARE) == CV_H_B0;
+    // the gap between the two buttons is nobody's
+    assert cv_hit(cv_btn_x(l, w, 0) + cv_btn_w(w) + 0.5 * CV_BTN_GAP, cv_row_y(t, CV_ACTIVE) + 5.0, l, w, t, CV_ACTIVE) == CV_H_NONE;
+    // both buttons and the field end inside the slot's padding
+    assert cv_btn_x(l, w, 1) + cv_btn_w(w) <= l + w - QP_PAD + 0.001;
+    assert cv_field_x(l) + cv_field_w(w) <= l + w - QP_PAD + 0.001;
+    // the field row, the dial row and the note do not overlap; the big digits sit above the button row
+    assert cv_field_y(t) + CV_FIELD_H < cv_row_y(t, CV_IDLE);
+    assert cv_row_y(t, CV_IDLE) + CV_BTN_H < t + CV_NOTE_Y - 10.0;
+    assert t + CV_BIG_Y < cv_row_y(t, CV_ACTIVE);
+    assert cv_row_y(t, CV_ACTIVE) + CV_BTN_H < t + CV_HINT_Y - 10.0;
+    assert CV_RESERVE == CV_HEAD_W + CV_HEAD_GAP;
+    assert cv_head_hit(cv_head_x(500.0) + 2.0, cv_head_y(38.0) + 2.0, 500.0, 38.0);
+    assert cv_head_hit(500.0 + 1.0, cv_head_y(38.0) + 2.0, 500.0, 38.0) == false;
+}
+
+test cv_button_counts_are_one_or_two_and_none_past_the_last_view {
+    assert cv_btn_count(CV_IDLE) == 1;
+    assert cv_btn_count(CV_CALLING) == 1;
+    assert cv_btn_count(CV_RINGING) == 2;
+    assert cv_btn_count(CV_KEYS) == 1;
+    assert cv_btn_count(CV_COMPARE) == 2;
+    assert cv_btn_count(CV_WAIT) == 1;
+    assert cv_btn_count(CV_ACTIVE) == 2;
+    assert cv_btn_count(CV_ENDED) == 1;
+    assert cv_btn_count(CV_FAILED) == 1;
+    assert cv_btn_count(CV_FAILED + 1) == 0;
+    assert cv_btn_count(4294967295) == 0;
+}
+
+test cv_every_view_has_its_title_and_only_the_live_ones_have_a_hint {
+    assert cv_title(CV_IDLE) == "NEW CALL";
+    assert cv_title(CV_CALLING) == "CALLING";
+    assert cv_title(CV_RINGING) == "INCOMING CALL";
+    assert cv_title(CV_KEYS) == "SECURING THE CALL";
+    assert cv_title(CV_COMPARE) == "COMPARE THE CODE";
+    assert cv_title(CV_WAIT) == "WAITING FOR THE OTHER SIDE";
+    assert cv_title(CV_ACTIVE) == "IN CALL";
+    assert cv_title(CV_ENDED) == "CALL ENDED";
+    assert cv_title(CV_FAILED) == "CALL FAILED";
+    assert cv_title(99) == "NEW CALL";
+    assert cv_hint(CV_CALLING) == "Waiting for the other side to answer.";
+    assert cv_hint(CV_RINGING) == "Answer to see the code you both compare. Nothing is sent before you answer.";
+    assert cv_hint(CV_KEYS) == "Exchanging keys.";
+    assert cv_hint(CV_COMPARE) == "Read the code aloud. Press CODES MATCH only if both screens show the same digits.";
+    assert cv_hint(CV_WAIT) == "You said the codes match. The call opens when the other side says so too.";
+    assert cv_hint(CV_ACTIVE) == "Sealed audio, AES-128-GCM. Microphone and speakers at low volume.";
+    assert cv_hint(CV_IDLE).len == 0;
+    assert cv_hint(CV_ENDED).len == 0;
+    assert cv_hint(CV_FAILED).len == 0;
+    assert cv_hint(99).len == 0;
+}
+
+test cv_every_window_note_has_its_text_and_no_note_is_empty {
+    assert cv_note_text(CV_N_NONE).len == 0;
+    assert cv_note_text(CV_N_ADDR) == "Type an address like 192.168.1.10:47727.";
+    assert cv_note_text(CV_N_LAN) == "Calls go only to a private network address (10.x, 172.16-31.x, 192.168.x or 127.x).";
+    assert cv_note_text(CV_N_SOCKET) == "Calls are off: the call port could not be opened (is it taken?).";
+    assert cv_note_text(CV_N_BIND) == "Calls are off: T27OS_CALL_BIND must be a private network address (10.x, 172.16-31.x, 192.168.x or 127.x) or 0.0.0.0.";
+    assert cv_note_text(CV_N_REFUSED) == "The call could not be started.";
+    assert cv_note_text(CV_N_SELF) == "That is this device's own address.";
+    assert cv_note_text(CV_N_PORTS) == "Calls are off: every call port tried is taken.";
+    assert cv_note_text(CV_N_PUBASK) == "That is a public address. Press ALLOW to call it once, or set T27OS_ALLOW_PUBLIC=1.";
+    assert cv_note_text(CV_N_NEVER) == "Never called: a multicast, broadcast, 0.x, 240.x or link-local (169.254.x) address.";
+    assert cv_note_text(CV_N_ROUTER) == "That is your router's own public address: call that friend at their address on this network.";
+    assert cv_note_text(CV_N_ROUTER + 1).len == 0 and CV_N_ROUTER < 16;
+    assert cv_note_text(4294967295).len == 0;
+}
+
+test cv_the_port_plan_is_the_base_then_the_saved_port_then_the_next_nine {
+    var p : [16]u64 = undefined;
+    // no saved port: the base and its next nine, ten in all, never more
+    assert cv_port_plan(47727, 0, p[0..16]) == CV_PORT_TRIES;
+    assert p[0] == 47727 and p[1] == 47728 and p[9] == 47736;
+    // the saved port comes right after the base, and only once
+    assert cv_port_plan(47727, 47731, p[0..16]) == CV_PORT_TRIES;
+    assert p[0] == 47727 and p[1] == 47731 and p[2] == 47728 and p[5] == 47732 and p[9] == 47736;
+    var k : usize = 2;
+    while (k < 10) {
+        assert p[k] != 47731;
+        k = k + 1;
+    }
+    // a saved port that is the base or outside base+1..base+9 is not tried
+    assert cv_port_plan(47727, 47727, p[0..16]) == 10 and p[1] == 47728;
+    assert cv_port_plan(47727, 47737, p[0..16]) == 10 and p[1] == 47728 and p[9] == 47736;
+    assert cv_port_plan(47727, 1, p[0..16]) == 10 and p[1] == 47728;
+    // never past 65535, never past out, nothing for a bad base
+    assert cv_port_plan(65533, 0, p[0..16]) == 3 and p[2] == 65535;
+    assert cv_port_plan(47727, 0, p[0..4]) == 4;
+    assert cv_port_plan(0, 0, p[0..16]) == 0;
+    assert cv_port_plan(65536, 0, p[0..16]) == 0;
+}
+
+test cv_a_taken_port_moves_on_and_ten_taken_ports_stop {
+    var st : [3]u64 = undefined;
+    st[0] = 0;
+    st[1] = 0;
+    st[2] = 0;
+    // the base is taken: the next one is tried and opens
+    assert cv_port_step(st[0..3], 47727, 47727, false) == true;
+    assert cv_port_step(st[0..3], 47727, 47728, true) == false;
+    assert st[CV_PS_USED] == 47728 and st[CV_PS_BUSY] == 1 and st[CV_PS_TRIED] == 2;
+    // every one of the ten is taken: the tenth stops the launch, nothing is used
+    var p : [10]u64 = undefined;
+    const n : usize = cv_port_plan(47727, 0, p[0..10]);
+    st[0] = 0;
+    st[1] = 0;
+    st[2] = 0;
+    var i : usize = 0;
+    var go : bool = true;
+    while (go and i < n) {
+        go = cv_port_step(st[0..3], 47727, p[i], false);
+        i = i + 1;
+    }
+    assert i == 10 and go == false;
+    assert st[CV_PS_USED] == 0 and st[CV_PS_BUSY] == 1023 and st[CV_PS_TRIED] == 10;
+    assert cv_port_nbusy(1023) == 10 and cv_port_nbusy(0) == 0 and cv_port_nbusy(5) == 2;
+    // even past the plan a caller is told to stop
+    assert cv_port_step(st[0..3], 47727, 47737, false) == false;
+    assert cv_port_step(st[0..2], 47727, 47727, false) == false;
+    assert cv_port_bit(47727, 47727) == 1 and cv_port_bit(47727, 47736) == 512;
+    assert cv_port_bit(47727, 47737) == 0 and cv_port_bit(47727, 47726) == 0;
+}
+
+test cv_a_launch_takes_the_first_free_port_and_goes_back_to_a_free_base {
+    // the launch as the window runs it, over a set of taken ports
+    var taken : [3]u64 = undefined;
+    taken[0] = 47727;
+    taken[1] = 47729;
+    taken[2] = 0;
+    var round : usize = 0;
+    var saved : u64 = 0;
+    while (round < 2) {
+        var p : [10]u64 = undefined;
+        const n : usize = cv_port_plan(47727, saved, p[0..10]);
+        var st : [3]u64 = undefined;
+        st[0] = 0;
+        st[1] = 0;
+        st[2] = 0;
+        var i : usize = 0;
+        var go : bool = true;
+        while (go and i < n) {
+            const ok : bool = p[i] != taken[0] and p[i] != taken[1];
+            go = cv_port_step(st[0..3], 47727, p[i], ok);
+            i = i + 1;
+        }
+        var f : [80]u8 = undefined;
+        const fl : usize = cv_port_save_text(st[0..3], 1792000000, f[0..80]);
+        if (round == 0) {
+            // 47727 taken: 47728 opens, the file names it, the panel says so
+            assert st[CV_PS_USED] == 47728 and fl > 0;
+            var t : [96]u8 = undefined;
+            assert cv_eq(t[0..96], cv_port_busy_text(47727, st[CV_PS_USED], st[CV_PS_BUSY], t[0..96]), "port 47727 busy, using 47728");
+            assert cv_eq(t[0..96], cv_port_line(true, st[CV_PS_USED], st[CV_PS_BUSY], st[CV_PS_TRIED], t[0..96]), "ONLINE  port 47728");
+            // the next launch: the base is free again
+            taken[0] = 0;
+        } else {
+            assert st[CV_PS_USED] == 47727 and st[CV_PS_TRIED] == 1 and st[CV_PS_BUSY] == 0;
+            assert cv_cp_parse(f[0..fl]) == 47727;
+        }
+        saved = cv_cp_parse(f[0..fl]);
+        round = round + 1;
+    }
+}
+
+test cv_the_port_texts_name_what_is_busy_and_what_is_used {
+    var t : [200]u8 = undefined;
+    assert cv_port_busy_text(47727, 47727, 0, t[0..200]) == 0;
+    assert cv_port_busy_text(47727, 0, 1023, t[0..200]) == 0;
+    assert cv_eq(t[0..200], cv_port_busy_text(47727, 47729, 3, t[0..200]), "ports 47727, 47728 busy, using 47729");
+    assert cv_eq(t[0..200], cv_port_line(true, 47727, 0, 1, t[0..200]), "ONLINE  port 47727");
+    assert cv_eq(t[0..200], cv_port_line(false, 0, 1023, 10, t[0..200]), "OFFLINE  10 call ports busy");
+    assert cv_eq(t[0..200], cv_port_line(false, 0, 0, 0, t[0..200]), "OFFLINE  calls are off");
+    assert cv_eq(t[0..200], cv_port_line(false, 0, 1, 2, t[0..200]), "OFFLINE  calls are off");
+    assert cv_eq(t[0..200], cv_port_all_busy_text(47727, 0, 1023, 10, t[0..200]), "Calls are off: every call port tried is taken: 47727, 47728, 47729, 47730, 47731, 47732, 47733, 47734, 47735, 47736. Close what holds one, or set T27OS_CALL_PORT.");
+    assert cv_port_all_busy_text(47727, 47728, 1, 2, t[0..200]) == 0;
+    assert cv_port_all_busy_text(47727, 0, 0, 0, t[0..200]) == 0;
+    assert cv_port_all_busy_text(47727, 0, 1023, 10, t[0..199]) == 0;
+}
+
+test cv_the_port_file_reads_back_and_refuses_anything_else {
+    var f : [80]u8 = undefined;
+    const n : usize = cv_cp_text(47728, 1792000000, f[0..80]);
+    assert n > CV_CP_MAGIC.len and n <= CV_CP_CAP;
+    assert f[0] == 116 and f[n - 1] == 10;
+    assert cv_cp_parse(f[0..n]) == 47728;
+    // one byte changed, cut short, a byte after it: refused
+    f[CV_CP_MAGIC.len] = 57;
+    assert cv_cp_parse(f[0..n]) == 0;
+    f[CV_CP_MAGIC.len] = 52;
+    assert cv_cp_parse(f[0..n]) == 47728;
+    assert cv_cp_parse(f[0..n - 1]) == 0;
+    var g : [81]u8 = undefined;
+    var i : usize = 0;
+    while (i < n) {
+        g[i] = f[i];
+        i = i + 1;
+    }
+    g[n] = 10;
+    assert cv_cp_parse(g[0..n + 1]) == 0;
+    assert cv_cp_parse("t27os-callport v2\n47728 1\ncrc 0\n") == 0;
+    assert cv_cp_parse("") == 0;
+    // nothing to write for a bad port, a zero time or a launch where no port opened
+    assert cv_cp_text(0, 1792000000, f[0..80]) == 0;
+    assert cv_cp_text(65536, 1792000000, f[0..80]) == 0;
+    assert cv_cp_text(47728, 0, f[0..80]) == 0;
+    var st : [3]u64 = undefined;
+    st[0] = 0;
+    st[1] = 1023;
+    st[2] = 10;
+    assert cv_port_save_text(st[0..3], 1792000000, f[0..80]) == 0;
+    st[0] = 47730;
+    const m : usize = cv_port_save_text(st[0..3], 1792000000, f[0..80]);
+    assert cv_cp_parse(f[0..m]) == 47730;
+}
+
+fn cv_a(s: []const u8) -> u64 { return cv_parse_addr(s, s.len); }
+
+test cv_every_address_has_one_class {
+    assert cv_addr_class(cv_addr_ip(cv_a("192.168.1.10"))) == CV_AC_PRIVATE;
+    assert cv_addr_class(cv_addr_ip(cv_a("10.0.0.1"))) == CV_AC_PRIVATE;
+    assert cv_addr_class(cv_addr_ip(cv_a("172.31.0.1"))) == CV_AC_PRIVATE;
+    assert cv_addr_class(cv_addr_ip(cv_a("127.0.0.1"))) == CV_AC_PRIVATE;
+    assert cv_addr_class(cv_addr_ip(cv_a("8.8.8.8"))) == CV_AC_PUBLIC;
+    assert cv_addr_class(cv_addr_ip(cv_a("172.32.0.1"))) == CV_AC_PUBLIC;
+    assert cv_addr_class(cv_addr_ip(cv_a("223.255.255.254"))) == CV_AC_PUBLIC;
+    assert cv_addr_class(cv_addr_ip(cv_a("224.0.0.251"))) == CV_AC_MULTICAST;
+    assert cv_addr_class(cv_addr_ip(cv_a("239.255.255.250"))) == CV_AC_MULTICAST;
+    assert cv_addr_class(cv_addr_ip(cv_a("255.255.255.255"))) == CV_AC_BROADCAST;
+    assert cv_addr_class(cv_addr_ip(cv_a("169.254.10.20"))) == CV_AC_LINKLOCAL;
+    assert cv_addr_class(cv_addr_ip(cv_a("169.253.10.20"))) == CV_AC_PUBLIC;
+    assert cv_addr_class(cv_addr_ip(cv_a("0.0.0.0"))) == CV_AC_INVALID;
+    assert cv_addr_class(cv_addr_ip(cv_a("0.1.2.3"))) == CV_AC_INVALID;
+    assert cv_addr_class(cv_addr_ip(cv_a("240.0.0.1"))) == CV_AC_INVALID;
+    assert cv_addr_class(4294967296) == CV_AC_INVALID;
+}
+
+test cv_a_public_address_is_called_only_with_consent_and_the_rest_never {
+    var c : [1]u64 = undefined;
+    c[0] = 0;
+    const pa : u64 = cv_a("8.8.8.8:47727");
+    // private: as before, no question
+    assert cv_dial_step(c[0..1], cv_a("192.168.1.10:47727"), false) == CV_D_OK;
+    // public: asked until ALLOW, then called
+    assert cv_dial_step(c[0..1], pa, false) == CV_D_ASK;
+    assert cv_allow(c[0..1], pa) and c[0] == pa;
+    assert cv_dial_decide(cv_a("8.8.8.8:47728"), false, c[0]) == CV_D_ASK;
+    assert cv_dial_decide(cv_a("8.8.4.4:47727"), false, c[0]) == CV_D_ASK;
+    assert cv_dial_step(c[0..1], pa, false) == CV_D_OK;
+    // T27OS_ALLOW_PUBLIC=1 allows a public address without ALLOW
+    assert cv_dial_decide(cv_a("1.2.3.4:5000"), true, 0) == CV_D_OK;
+    // never, with or without consent or the variable
+    const never : [5]u64 = [cv_a("224.0.0.251:5353"), cv_a("255.255.255.255:47727"), cv_a("0.0.0.0:47727"), cv_a("169.254.1.1:47727"), cv_a("240.0.0.1:47727")];
+    var i : usize = 0;
+    while (i < 5) {
+        assert cv_allow(c[0..1], never[i]) == false;
+        c[0] = never[i];
+        assert cv_dial_decide(never[i], true, never[i]) == CV_D_NO;
+        assert cv_dial_step(c[0..1], never[i], true) == CV_D_NO;
+        i = i + 1;
+    }
+    assert cv_allow(c[0..1], cv_a("192.168.1.10:47727")) == false and c[0] == 0;
+}
+
+test cv_the_consent_is_never_remembered {
+    var c : [1]u64 = undefined;
+    c[0] = 0;
+    const pa : u64 = cv_a("203.0.113.7:47727");
+    assert cv_allow(c[0..1], pa);
+    assert cv_pub_row(pa, false, c[0]) == 2;
+    assert cv_dial_step(c[0..1], pa, false) == CV_D_OK;
+    // the call used it: the very same address asks again
+    assert c[0] == 0;
+    assert cv_pub_row(pa, false, c[0]) == 1;
+    assert cv_dial_step(c[0..1], pa, false) == CV_D_ASK;
+    // a refused or private dial spends it as well
+    assert cv_allow(c[0..1], pa);
+    assert cv_dial_step(c[0..1], cv_a("10.0.0.2:47727"), false) == CV_D_OK and c[0] == 0;
+    assert cv_dial_step(c[0..1], pa, false) == CV_D_ASK;
+}
+
+test cv_the_panel_rows_for_a_public_address {
+    const pa : u64 = cv_a("203.0.113.7:47800");
+    assert cv_pub_row(0, false, 0) == 0;
+    assert cv_pub_row(cv_a("192.168.1.10"), false, 0) == 0;
+    assert cv_pub_row(cv_a("224.0.0.1"), true, 0) == 0;
+    assert cv_pub_row(pa, false, 0) == 1;
+    assert cv_pub_row(pa, true, 0) == 2;
+    assert cv_pub_row_text(1, false) == "public address -- allow?";
+    assert cv_pub_row_text(2, false) == "public address -- allowed for one call";
+    assert cv_pub_row_text(2, true) == "public address -- allowed by T27OS_ALLOW_PUBLIC";
+    assert cv_pub_row_text(0, false).len == 0;
+    var t : [120]u8 = undefined;
+    assert cv_eq(t[0..120], cv_pub_hint(cv_addr_port(pa), t[0..120]), "Over the internet: forward UDP port 47800 on that router; the address is the one its provider gave.");
+    assert cv_pub_hint(0, t[0..120]) == 0 and cv_pub_hint(65536, t[0..120]) == 0;
+    assert cv_eq(t[0..120], cv_pub_hint(65535, t[0..120]), "Over the internet: forward UDP port 65535 on that router; the address is the one its provider gave.");
+}
+
+test cv_port_bounds_hold_on_every_class {
+    assert cv_dial_decide(cv_addr_ip(cv_a("8.8.8.8")) * 65536, true, 0) == CV_D_NO;
+    assert cv_dial_decide(cv_addr_ip(cv_a("192.168.1.10")) * 65536, false, 0) == CV_D_NO;
+    assert cv_dial_decide(cv_addr_ip(cv_a("8.8.8.8")) * 65536 + 1, true, 0) == CV_D_OK;
+    assert cv_dial_decide(cv_addr_ip(cv_a("8.8.8.8")) * 65536 + 65535, true, 0) == CV_D_OK;
+    var c : [1]u64 = undefined;
+    c[0] = 0;
+    assert cv_allow(c[0..1], cv_addr_ip(cv_a("8.8.8.8")) * 65536) == false;
+    assert cv_a("8.8.8.8:0") == 0 and cv_a("8.8.8.8:65536") == 0;
+}
+
+test cv_listening_on_all_interfaces_is_a_warned_choice {
+    assert cv_bind_parse("", 0) == 0;
+    assert cv_bind_parse("127.0.0.1", 9) == 2130706433;
+    assert cv_bind_parse("0.0.0.0", 7) == 0;
+    assert cv_bind_parse("0.0.0", 5) == CV_BIND_BAD;
+    assert cv_bind_parse("all", 3) == CV_BIND_BAD;
+    assert cv_bind_class(cv_bind_parse("0.0.0.0", 7)) == CV_B_ANY;
+    assert cv_bind_class(cv_bind_parse("192.168.1.10", 12)) == CV_B_LAN;
+    assert cv_bind_class(cv_bind_parse("", 0)) == CV_B_ANY;
+    assert cv_bind_class(cv_bind_parse("127.0.0.1", 9)) == CV_B_LAN;
+    assert cv_bind_class(cv_bind_parse("8.8.8.8", 7)) == CV_B_NO;
+    assert cv_bind_class(cv_bind_parse("224.0.0.1", 9)) == CV_B_NO;
+    assert cv_bind_class(CV_BIND_BAD) == CV_B_NO;
+    assert cv_bind_warn(0) == "listening on all interfaces";
+    assert cv_bind_warn(2130706433).len == 0;
+}
+
+test cv_with_no_variable_the_window_listens_on_the_network_and_says_where {
+    var o : [64]u8 = undefined;
+    const lan : u64 = cv_addr_ip(cv_a("192.168.15.8"));
+    // no T27OS_CALL_BIND: every interface, named by the address this Mac sends from
+    assert cv_eq(o[0..64], cv_listen_text(cv_bind_parse("", 0), lan, 47727, o[0..64]), "listening on 192.168.15.8:47727");
+    assert cv_eq(o[0..64], cv_listen_text(0, 0, 47728, o[0..64]), "listening on port 47728, no network yet");
+    // the explicit ways to stay narrower
+    assert cv_eq(o[0..64], cv_listen_text(cv_bind_parse("127.0.0.1", 9), lan, 47727, o[0..64]), "listening on 127.0.0.1:47727, this Mac only");
+    assert cv_eq(o[0..64], cv_listen_text(cv_bind_parse("192.168.15.8", 12), lan, 47727, o[0..64]), "listening on 192.168.15.8:47727 only");
+    assert cv_listen_text(0, lan, 47727, o[0..63]) == 0;
+    // the route lookup: a unicast address that is not this machine
+    assert cv_lan_pick(lan) == lan;
+    assert cv_lan_pick(cv_addr_ip(cv_a("10.1.2.3"))) != 0 and cv_lan_pick(cv_addr_ip(cv_a("8.8.8.8"))) != 0;
+    assert cv_lan_pick(0) == 0 and cv_lan_pick(2130706433) == 0;
+    assert cv_lan_pick(cv_addr_ip(cv_a("169.254.3.4"))) == 0 and cv_lan_pick(cv_addr_ip(cv_a("224.0.0.251"))) == 0;
+    assert cv_lan_pick(4294967296) == 0;
+    // the lines that say who gets through fit the panel's line (60 characters)
+    assert cv_who().len > 0 and cv_who().len <= 60;
+}
+
+test cv_the_own_address_is_found_on_every_interface {
+    const lan : u64 = cv_addr_ip(cv_a("192.168.15.8"));
+    assert cv_is_self(cv_a("192.168.15.8:47727"), 0, lan, 47727);
+    assert cv_is_self(cv_a("127.0.0.1:47727"), 0, lan, 47727);
+    assert cv_is_self(cv_a("192.168.15.8:47728"), 0, lan, 47727) == false;
+    assert cv_is_self(cv_a("192.168.15.4:47727"), 0, lan, 47727) == false;
+    assert cv_is_self(cv_a("192.168.15.8:47727"), 0, 0, 47727) == false;
+    // bound to one address: that address only
+    assert cv_is_self(cv_a("127.0.0.1:47727"), 2130706433, lan, 47727);
+    assert cv_is_self(cv_a("192.168.15.8:47727"), 2130706433, lan, 47727) == false;
+    assert cv_is_self(0, 0, lan, 47727) == false;
+}
+
+test cv_the_txt_record_says_pub_when_listening_on_all_interfaces {
+    var t : [96]u8 = undefined;
+    t[0] = 3;
+    t[1] = 97;
+    t[2] = 61;
+    t[3] = 98;
+    assert cv_txt_pub(t[0..96], 4, false) == 4;
+    const n : usize = cv_txt_pub(t[0..96], 4, true);
+    assert n == 10 and t[4] == 5 and t[5] == 112 and t[6] == 117 and t[7] == 98 and t[8] == 61 and t[9] == 49;
+    // no room: the record is left as it was
+    assert cv_txt_pub(t[0..96], 91, true) == 91;
+    assert cv_txt_pub(t[0..96], 90, true) == 96;
+}
+
+test cv_the_strip_holds_one_wide_tile_or_two_side_by_side_and_fits_the_room {
+    // one member: the width of the panel at 4:3
+    const w1 : f64 = cv_strip_w(1, 300.0, 1000.0);
+    assert w1 == 300.0 and cv_strip_h(w1) == 225.0 and cv_strip_x(0, 20.0, w1) == 20.0;
+    // two members: half the width each less the gap, the second right of the first
+    const w2 : f64 = cv_strip_w(2, 300.0, 1000.0);
+    assert w2 == 147.0 and cv_strip_h(w2) == 110.25;
+    assert cv_strip_x(1, 20.0, w2) == 20.0 + 147.0 + CV_STRIP_GAP and cv_strip_x(1, 20.0, w2) + w2 == 320.0;
+    // a short window: the tiles shrink to the room left under them (the label included), at 4:3
+    const ws : f64 = cv_strip_w(1, 300.0, 104.0);
+    assert ws == 120.0 and cv_strip_h(ws) + CV_STRIP_LABEL == 104.0;
+    assert cv_strip_w(2, 300.0, 104.0) == 120.0;
+    assert cv_strip_w(2, 300.0, 10.0) == 0.0;
+}
+
+test cv_self_view_shows_the_picture_waits_for_it_or_says_camera_off {
+    // not a one to one call with the ACTIVE panel: nothing
+    assert cv_self_mode(CV_IDLE, false, true, false, false, false, true) == CV_SELF_NONE;
+    assert cv_self_mode(CV_ACTIVE, true, true, false, false, false, true) == CV_SELF_NONE;
+    // video and a running camera: the picture, or an empty inset until the first frame
+    assert cv_self_mode(CV_ACTIVE, false, true, false, false, false, true) == CV_SELF_PIP;
+    assert cv_self_mode(CV_ACTIVE, false, true, false, false, false, false) == CV_SELF_WAIT;
+    // camera off for the run, no video sent, a voice call, a camera that gave up: the note
+    assert cv_self_mode(CV_ACTIVE, false, true, true, false, false, false) == CV_SELF_OFF;
+    assert cv_self_mode(CV_ACTIVE, false, false, false, false, false, false) == CV_SELF_OFF;
+    assert cv_self_mode(CV_ACTIVE, false, true, false, true, false, false) == CV_SELF_OFF;
+    assert cv_self_mode(CV_ACTIVE, false, true, false, false, true, true) == CV_SELF_OFF;
+    assert cv_self_label() == "YOU" and cv_self_off_text() == "camera off";
+}
+
+test cv_self_view_sits_in_the_bottom_right_corner_and_never_covers_more_than_a_quarter {
+    // a 300 wide remote picture: a 90 wide inset (30 %), 4:3
+    const sw : f64 = cv_self_w(300.0);
+    assert sw == 90.0 and cv_strip_h(sw) == 67.5;
+    assert cv_self_x(20.0, 300.0, sw) == 20.0 + 300.0 - 90.0 - CV_SELF_PAD;
+    assert cv_self_y(50.0, 225.0, sw) == 50.0 + 225.0 - 67.5 - CV_SELF_PAD;
+    // the inset ends inside the remote picture, the gap away from both edges
+    assert cv_self_x(20.0, 300.0, sw) + sw + CV_SELF_PAD == 320.0;
+    // clamps: a wide picture caps at CV_SELF_MAX, a narrow one floors at CV_SELF_MIN
+    assert cv_self_w(1000.0) == CV_SELF_MAX and cv_self_w(100.0) == CV_SELF_MIN;
+    assert cv_self_fits(300.0, 225.0) and cv_self_fits(120.0, 90.0);
+    // too small a picture: the inset would take more than half of it, so it is not drawn
+    assert cv_self_fits(60.0, 45.0) == false and cv_self_fits(300.0, 60.0) == false;
+}
+
+test cv_the_call_picture_is_16_by_9_for_h264_and_4_by_3_for_the_old_jpeg_and_fits_the_room {
+    assert cv_vbox_top(400.0) == 436.0;
+    // the panel's 268 points: 150.75 high for H.264, 201 for the JPEG
+    assert cv_vbox_h(268.0, 500.0, true) == 150.75 and cv_vbox_w(268.0, 500.0, true) == 268.0;
+    assert cv_vbox_h(268.0, 500.0, false) == 201.0 and cv_vbox_w(268.0, 500.0, false) == 268.0;
+    // a short window: the height is the room, the width keeps the aspect
+    assert cv_vbox_h(268.0, 90.0, true) == 90.0 and cv_vbox_w(268.0, 90.0, true) == 160.0;
+    assert cv_vbox_h(268.0, 90.0, false) == 90.0 and cv_vbox_w(268.0, 90.0, false) == 120.0;
+    assert cv_vbox_h(268.0, -5.0, true) == 0.0;
+    // a box 150 high whose top is 400 points from the top of an 800-point view stands 250 above its bottom
+    assert cv_layer_y(800.0, 400.0, 150.0) == 250.0;
+}

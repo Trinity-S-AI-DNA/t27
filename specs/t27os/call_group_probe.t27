@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_group_probe.t27 -- three members of a group call in one process: only the cs_* / csg_* API, one
+// cs_poll per member per pass, TONE audio (a quiet triangle wave that names its sender; a software speaker mixes the
+// members every 10 ms with the code of the device callback). Not part of the app and not the proof of the app: it
+// shows the mesh logic (A picks B and C, B and C link to each other, three members up at once, each hears the other
+// two, the mix is held inside 16 bits, no member hears itself, one leaving does not end the other two).
+// Build (Apple silicon):
+//   t27b build specs/t27os/call_group_probe.t27 -o cgp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -framework AudioToolbox -o cgp cgp.o
+// Test identities only (fixed fingerprints), 127.0.0.1:47771..47773. Refs gHashTag/t27#11560.
+// Since 2026-10-23 a member list is taken only from a trusted friend that called the link (call_core gr_list_admit).
+// This probe hands in no identity keys, so B and C refuse A's list ("not a trusted friend") and check 1 fails: the mesh
+// is now shown by the app with pinned friends (T27OS_QA=1 run), and this probe shows the refusal.
+module T27osCallGroupProbe;
+
+use t27os::pty_sys::sys_exit;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_RINGING;
+use t27os::call_core::CK_VERIFY;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::GR_WAITING;
+use t27os::call_core::GR_PARTIAL;
+use t27os::call_core::GR_FULL;
+use t27os::call_core::GR_ENDED;
+use t27os::call_crypto_probe::ckh_line;
+use t27os::call_crypto_probe::ckh_num;
+use t27os::call_crypto_probe::ckh_check;
+use t27os::call_crypto_probe::ckh_env_num;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_crypto_probe::ckh_usleep;
+use t27os::callback_probe::cbp_fin;
+use t27os::callback_probe::cbp_fout;
+use t27os::call_session::CS_LEN;
+use t27os::call_session::CS_AUDIO_TONE;
+use t27os::call_session::CS_K_GAUTO;
+use t27os::call_session::CS_K_VERIFY_MS;
+use t27os::call_session::CS_K_TONE_AMP;
+use t27os::call_session::cs_open;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_answer;
+use t27os::call_session::cs_confirm;
+use t27os::call_session::cs_set;
+use t27os::call_session::cs_close;
+use t27os::call_session::csg_add;
+use t27os::call_session::csg_leave;
+use t27os::call_session::csg_state;
+use t27os::call_session::csg_stat;
+use t27os::call_session::csg_link;
+use t27os::call_session::csg_fout;
+use t27os::call_session::csg_pull;
+
+const GL : usize = 898944;
+
+fn cgp_fp(f: []u8, who: u8) -> void {
+    var i : usize = 0;
+    while (i < 10) {
+        f[i] = who + @as(u8, @intCast(i));
+        i = i + 1;
+    }
+}
+
+/// Link 0 of a member: its person answers and says "match" (the further links do it by themselves, CS_K_GAUTO).
+fn cgp_person(s: []u8) -> void {
+    const st : u32 = cs_state(s);
+    if (st == CK_RINGING) { cs_answer(s); }
+    if (st == CK_VERIFY) { cs_confirm(s, true); }
+}
+
+fn cgp_pass(a: []u8, b: []u8, c: []u8) -> void {
+    cs_poll(a);
+    cs_poll(b);
+    cs_poll(c);
+    cgp_person(a[0..CS_LEN]);
+    cgp_person(b[0..CS_LEN]);
+    cgp_person(c[0..CS_LEN]);
+}
+
+fn cgp_run(ms: u64, a: []u8, b: []u8, c: []u8) -> void {
+    const t0 : u64 = ckh_ms();
+    while (ckh_ms() - t0 < ms) {
+        cgp_pass(a, b, c);
+        ckh_usleep(1000);
+    }
+}
+
+/// Link j of member s names the peer whose fingerprint starts with `first`.
+fn cgp_link_of(s: []u8, first: u64) -> usize {
+    var j : usize = 0;
+    while (j < 3) {
+        if ((csg_link(s, j, 7) >> 24) == first and csg_link(s, j, 6) != 0) { return j; }
+        j = j + 1;
+    }
+    return 3;
+}
+
+fn cgp_report(name: []const u8, s: []u8, fa: u64, fb: u64) -> void {
+    ckh_line(name);
+    ckh_line(": state ");
+    ckh_num("", @as(u64, csg_state(s[0..CS_LEN * 3])));
+    ckh_num("  up now ", csg_stat(s, 0));
+    ckh_num("  up most ", csg_stat(s, 1));
+    ckh_num("  frames mixed ", csg_stat(s, 2));
+    ckh_num("  samples clipped ", csg_stat(s, 3));
+    ckh_num("  mix peak ", csg_stat(s, 4));
+    ckh_num("  underruns all links ", csg_stat(s, 5));
+    var j : usize = 0;
+    while (j < 3) {
+        if (csg_link(s, j, 6) != 0) {
+            ckh_num("  link ", @as(u64, j));
+            ckh_num("    peer ", csg_link(s, j, 7));
+            ckh_num("    sent_to ", csg_link(s, j, 2));
+            ckh_num("    recv_from ", csg_link(s, j, 3));
+            ckh_num("    under ", csg_link(s, j, 4));
+            ckh_num("    peak ", csg_link(s, j, 5));
+            ckh_num("    echo ", csg_link(s, j, 0));
+            ckh_num("    tone_ok ", csg_link(s, j, 1));
+            ckh_num("    bad ", csg_link(s, j, 8));
+        }
+        j = j + 1;
+    }
+}
+
+fn cgp_main() -> bool {
+    var all : bool = true;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    var fc : [10]u8 = undefined;
+    cgp_fp(fa[0..10], 161);
+    cgp_fp(fb[0..10], 177);
+    cgp_fp(fc[0..10], 193);
+    var a : [898944]u8 = undefined;
+    var b : [898944]u8 = undefined;
+    var c : [898944]u8 = undefined;
+    const oa : bool = cs_open(a[0..GL], fa[0..10], 2130706433, 47771, CS_AUDIO_TONE);
+    const ob : bool = cs_open(b[0..GL], fb[0..10], 2130706433, 47772, CS_AUDIO_TONE);
+    const oc : bool = cs_open(c[0..GL], fc[0..10], 2130706433, 47773, CS_AUDIO_TONE);
+    all = ckh_check("open: three members on 127.0.0.1:47771, :47772, :47773, three link blocks each", oa and ob and oc) and all;
+    if (!oa or !ob or !oc) { return false; }
+    cs_set(a[0..GL], CS_K_VERIFY_MS, 8000);
+    cs_set(b[0..GL], CS_K_VERIFY_MS, 8000);
+    cs_set(c[0..GL], CS_K_VERIFY_MS, 8000);
+    cs_set(b[0..GL], CS_K_GAUTO, 1);
+    cs_set(c[0..GL], CS_K_GAUTO, 1);
+    cs_set(a[0..GL], CS_K_GAUTO, 1);
+    // A picks B and C
+    all = ckh_check("A picks B and C (two csg_add)", csg_add(a[0..GL], fb[0..10], 2130706433, 47772) and csg_add(a[0..GL], fc[0..10], 2130706433, 47773)) and all;
+    const t0 : u64 = ckh_ms();
+    var whole : u64 = 0;
+    var seen_partial : bool = false;
+    var seen_waiting : bool = false;
+    while (ckh_ms() - t0 < 40000 and whole == 0) {
+        cgp_pass(a[0..GL], b[0..GL], c[0..GL]);
+        const sa : u32 = csg_state(a[0..GL]);
+        if (sa == GR_WAITING) { seen_waiting = true; }
+        if (sa == GR_PARTIAL) { seen_partial = true; }
+        if (csg_state(a[0..GL]) == GR_FULL and csg_state(b[0..GL]) == GR_FULL and csg_state(c[0..GL]) == GR_FULL) { whole = ckh_ms(); }
+        ckh_usleep(1000);
+    }
+    var took : u64 = 0;
+    if (whole != 0) { took = whole - t0; }
+    ckh_num("ms until all three are in the group at once ", took);
+    all = ckh_check("1 all three members in state FULL at the same moment", whole != 0) and all;
+    all = ckh_check("1 A went through WAITING and PARTIAL on the way", seen_waiting and seen_partial) and all;
+    // let it run and the jitter buffers fill, then read
+    cgp_run(8000, a[0..GL], b[0..GL], c[0..GL]);
+    cgp_report("A", a[0..GL], 0, 0);
+    cgp_report("B", b[0..GL], 0, 0);
+    cgp_report("C", c[0..GL], 0, 0);
+    all = ckh_check("2 each member has two links ACTIVE and both brought tone frames", csg_stat(a[0..GL], 0) == 2 and csg_stat(b[0..GL], 0) == 2 and csg_stat(c[0..GL], 0) == 2) and all;
+    var echo : u64 = 0;
+    var bad : u64 = 0;
+    var ok_frames : u64 = 1000000;
+    var under : u64 = 0;
+    var clip : u64 = 0;
+    var j : usize = 0;
+    while (j < 3) {
+        echo = echo + csg_link(a[0..GL], j, 0) + csg_link(b[0..GL], j, 0) + csg_link(c[0..GL], j, 0);
+        bad = bad + csg_link(a[0..GL], j, 8) + csg_link(b[0..GL], j, 8) + csg_link(c[0..GL], j, 8);
+        if (csg_link(a[0..GL], j, 6) == CK_ACTIVE and csg_link(a[0..GL], j, 1) < ok_frames) { ok_frames = csg_link(a[0..GL], j, 1); }
+        if (csg_link(b[0..GL], j, 6) == CK_ACTIVE and csg_link(b[0..GL], j, 1) < ok_frames) { ok_frames = csg_link(b[0..GL], j, 1); }
+        if (csg_link(c[0..GL], j, 6) == CK_ACTIVE and csg_link(c[0..GL], j, 1) < ok_frames) { ok_frames = csg_link(c[0..GL], j, 1); }
+        j = j + 1;
+    }
+    under = csg_stat(a[0..GL], 5) + csg_stat(b[0..GL], 5) + csg_stat(c[0..GL], 5);
+    clip = csg_stat(a[0..GL], 3) + csg_stat(b[0..GL], 3) + csg_stat(c[0..GL], 3);
+    all = ckh_check("3 every link of every member brought at least 300 frames of the right sender's tone", ok_frames >= 300) and all;
+    all = ckh_check("3 nobody heard its own tone come back (echo 0) and no frame was the wrong tone", echo == 0 and bad == 0) and all;
+    all = ckh_check("4 the mix of two members never reached the ceiling: peak <= 12100 and 0 samples clipped", csg_stat(a[0..GL], 4) <= 12100 and csg_stat(b[0..GL], 4) <= 12100 and csg_stat(c[0..GL], 4) <= 12100 and csg_stat(a[0..GL], 4) > 0 and clip == 0) and all;
+    all = ckh_check("5 no underrun on any link of any member", under == 0) and all;
+    // B leaves: A and C go on
+    ckh_line("--- B leaves\n");
+    const sent_before : u64 = csg_link(a[0..GL], cgp_link_of(a[0..GL], 193), 3);
+    csg_leave(b[0..GL]);
+    cgp_run(6000, a[0..GL], b[0..GL], c[0..GL]);
+    cgp_report("A", a[0..GL], 0, 0);
+    cgp_report("C", c[0..GL], 0, 0);
+    all = ckh_check("6 B is out of the group (ENDED), A and C stay in it (PARTIAL: one member gone)", csg_state(b[0..GL]) == GR_ENDED and csg_state(a[0..GL]) == GR_PARTIAL and csg_state(c[0..GL]) == GR_PARTIAL) and all;
+    const la : usize = cgp_link_of(a[0..GL], 193);
+    const lc : usize = cgp_link_of(c[0..GL], 161);
+    all = ckh_check("6 the link A-C is still ACTIVE on both sides and still carries frames", la < 3 and lc < 3 and csg_link(a[0..GL], la, 6) == CK_ACTIVE and csg_link(c[0..GL], lc, 6) == CK_ACTIVE and csg_link(a[0..GL], la, 3) > sent_before + 300) and all;
+    all = ckh_check("6 still no underrun and no echo after B left", csg_stat(a[0..GL], 5) == 0 and csg_stat(c[0..GL], 5) == 0) and all;
+    cs_close(a[0..GL]);
+    cs_close(b[0..GL]);
+    cs_close(c[0..GL]);
+    return all;
+}
+
+pub fn main() -> void {
+    // Never true: makes sure the audio callbacks are emitted and so exported for dlsym.
+    var z : [8]u8 = undefined;
+    put_u64(z[0..8], 0, 0);
+    if (get_u64(z[0..8], 0) == 99) {
+        cbp_fin(0, 0, 0, 0, 0, 0);
+        cbp_fout(0, 0, 0);
+        csg_fout(0, 0, 0);
+        csg_pull(0, 0, 0);
+    }
+    ckh_line("T27 OS call group probe: three members in this process, TONE audio, 127.0.0.1\n");
+    if (cgp_main()) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}
+
+test the_probe_block_is_three_links {
+    assert GL == CS_LEN * 3;
+}

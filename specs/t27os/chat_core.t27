@@ -1,0 +1,1834 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/chat_core.t27 -- the core of person to person chat in T27 OS: pure decisions, no @extern, no crypto.
+// The transport is a "message session" of call_session.t27 (the call's handshake and AES-128-GCM channel, no audio,
+// no video: CS_AUDIO_NONE); the disk and the session driving are chat_host.t27. Owner, 2026-10-22. Refs
+// gHashTag/t27#11560. ASCII only (L3), English only (LANG-EN).
+//
+// PAYLOAD  the plaintext of one sealed CK_T_TEXT frame (call_core), CH_PHDR (20) bytes then the bytes of one part:
+//   kind u8 (CH_K_TEXT, CH_K_ACK, CH_K_READ) | 0 u8 | msg u32 LE | part u16 LE | parts u16 LE | time u64 LE (the
+//   sender's ms since 1970) | len u16 LE | len bytes.
+//   TEXT  one part of message `msg` (1, 2, 3 .. per direction of one pair): UTF-8, a message is 1..CH_MSG_MAX (2000)
+//         bytes cut into parts of CH_PART_MAX (700), so at most 3; every part but the last is full. A part may end
+//         inside a character: the receiver joins the parts before the line exists.
+//   ACK   "part `part` of message `msg` is here": len 0, parts 0, time 0. Sent for every TEXT part that checks,
+//         also for one already held (the first ACK may have been lost).
+//   READ  "every message of yours up to `msg` was shown": part 0, parts 0, time 0, len 0.
+//   A sealed TEXT frame is 52 + 20 + 700 + 16 = 788 bytes at most: one datagram on any LAN.
+// DELIVERY  the sender keeps each outgoing line PENDING until it is sent, SENT until every part is acknowledged
+//   (then DELIVERED), READ when a READ covers it. Unacknowledged parts go again every CH_RETRY_MS (2 s); after
+//   CH_TRIES (5) sends without every ACK the line is FAILED. A new session puts FAILED and SENT lines back to
+//   PENDING with no tries, so a message goes out again when the friend is reachable.
+// DEDUP AND ORDER  the receiver keeps a line per (direction, msg): a part of a message it already holds, or of a
+//   message at or below the trimmed floor, is a duplicate (ACKed, nothing added). Incoming lines are kept in the
+//   sender's order: a message is put before the first incoming line with a higher number, so a message that came
+//   late after a resend still stands where it was sent. Outgoing lines are appended.
+// UNREAD  incoming lines are DELIVERED until the chat is opened (cl_open_read), then READ; the unread count is the
+//   number of incoming DELIVERED lines of that friend's log.
+// LOG IN MEMORY  CL_HDR (40) bytes: magic "T27OSCH\n" | version u32 | count u32 | last outgoing msg u32 | incoming
+//   floor u32 (the highest incoming msg trimmed away) | cap u32 (lines kept, <= CL_KEEP) | peer fingerprint (10) |
+//   0 0; then cap lines of CL_LINE (2032) bytes: dir u8 | state u8 | len u16 | msg u32 | time u64 | tries u8 |
+//   acked parts mask u8 | parts u8 | 0 (5) | last send ms u64 | text (2000). A full log drops its oldest line.
+//   The 5 zero bytes (CL_EXT) stay zero in a person to person log; a group log (group_core.t27) keeps its per-member
+//   send and ACK state there. Neither the file nor this layout changes.
+// LOG ON DISK  ~/.t27os/chat/<20 hex of the fingerprint>.t27 (cf_name), written whole and atomically by the host:
+//   magic "T27OSCH\n" (8) | version u32 (4) | count u32 | last outgoing msg u32 | incoming floor u32 | peer
+//   fingerprint (10) | 0 0 | count records of dir u8 | state u8 | len u16 | msg u32 | time u64 | len bytes | CRC-32
+//   (peer_identity.crc32) of all before (4). Tries, ACK masks and send times are not kept: a line that was not
+//   DELIVERED is sent again after a restart. A file with more lines than the log holds keeps the newest ones.
+module T27osChatCore;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::peer_identity::crc32;
+use t27os::call_core::CK_HDR;
+use t27os::call_core::CK_TAG;
+use t27os::call_core::CK_T_TEXT;
+use t27os::call_core::CK_T_MEDIA;
+use t27os::call_core::CK_T_VIDEO;
+use t27os::call_core::CK_T_BYE;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::ck_same;
+use tri::t27b::text_escape::utf8_len;
+
+// ---------------------------------------------------------------- bytes
+
+fn put16(b: []u8, at: usize, v: u32) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+}
+
+fn get16(b: []const u8, at: usize) -> u32 { return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8); }
+
+fn put32(b: []u8, at: usize, v: u32) -> void {
+    put16(b, at, v & 65535);
+    put16(b, at + 2, v >> 16);
+}
+
+fn get32(b: []const u8, at: usize) -> u32 { return get16(b, at) | (get16(b, at + 2) << 16); }
+
+fn copy(dst: []u8, at: usize, src: []const u8, from: usize, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        dst[at + i] = src[from + i];
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- the payload
+
+pub const CH_K_TEXT : u32 = 1;
+pub const CH_K_ACK : u32 = 2;
+pub const CH_K_READ : u32 = 3;
+pub const CH_PHDR : usize = 20;
+pub const CH_PART_MAX : usize = 700;
+pub const CH_MSG_MAX : usize = 2000;
+pub const CH_PARTS_MAX : u32 = 3;
+pub const CH_PAYLOAD_MAX : usize = 720;
+pub const CH_SEALED_MAX : usize = 788;
+
+/// The parts a message of n bytes needs: 0 when it is empty or longer than CH_MSG_MAX.
+pub fn ch_parts_for(n: usize) -> u32 {
+    if (n == 0 or n > CH_MSG_MAX) { return 0; }
+    return @as(u32, @intCast((n + CH_PART_MAX - 1) / CH_PART_MAX));
+}
+
+/// Well-formed UTF-8: no stray continuation byte, no overlong form, no surrogate, nothing above U+10FFFF, no
+/// sequence cut at the end. NUL is refused too (a line is text, not a C string's end).
+pub fn ch_utf8_ok(b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < b.len) {
+        const c : u32 = @as(u32, b[i]);
+        var need : usize = 0;
+        var lo : u32 = 128;
+        var hi : u32 = 191;
+        if (c == 0) { return false; }
+        if (c >= 128) {
+            if (c >= 194 and c <= 223) { need = 1; }
+            else if (c == 224) { need = 2; lo = 160; }
+            else if (c >= 225 and c <= 236) { need = 2; }
+            else if (c == 237) { need = 2; hi = 159; }
+            else if (c >= 238 and c <= 239) { need = 2; }
+            else if (c == 240) { need = 3; lo = 144; }
+            else if (c >= 241 and c <= 243) { need = 3; }
+            else if (c == 244) { need = 3; hi = 143; }
+            else { return false; }
+            if (i + need >= b.len) { return false; }
+            const c1 : u32 = @as(u32, b[i + 1]);
+            if (c1 < lo or c1 > hi) { return false; }
+            var k : usize = 2;
+            while (k <= need) {
+                const ck : u32 = @as(u32, b[i + k]);
+                if (ck < 128 or ck > 191) { return false; }
+                k = k + 1;
+            }
+        }
+        i = i + need + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- clean text (audit P2, owner 2026-10-23)
+
+/// A code point that may hide or reorder what a line shows, or is no text at all: a C0 control (LF and TAB are taken
+/// before), DEL, a C1 control, U+061C, the zero-width and direction marks U+200B..U+200F, the embeddings and overrides
+/// U+202A..U+202E, the word joiner, invisible operators and isolates U+2060..U+206F, the BOM U+FEFF.
+pub fn ch_hidden(cp: u32) -> bool {
+    if (cp < 32 or cp == 127 or (cp >= 128 and cp <= 159) or cp == 1564) { return true; }
+    if ((cp >= 8203 and cp <= 8207) or (cp >= 8234 and cp <= 8238) or (cp >= 8288 and cp <= 8303)) { return true; }
+    return cp == 65279;
+}
+
+/// The code point of the w-byte character at b[i] (w from text_escape utf8_len).
+fn u8_cp(b: []const u8, i: usize, w: usize) -> u32 {
+    var cp : u32 = @as(u32, b[i]);
+    if (w == 2) { cp = cp & 31; }
+    if (w == 3) { cp = cp & 15; }
+    if (w == 4) { cp = cp & 7; }
+    var k : usize = 1;
+    while (k < w) {
+        cp = (cp << 6) | (@as(u32, b[i + k]) & 63);
+        k = k + 1;
+    }
+    return cp;
+}
+
+/// A line as a person may read it, into out; its length. The input is well-formed UTF-8 (ch_utf8_ok). CR LF, a lone
+/// CR, U+2028 and U+2029 become one LF; a TAB becomes a space; every ch_hidden character is dropped; the text is cut
+/// after the last whole character that fits out and CH_MSG_MAX. Applied to what is sent and to what comes in, so a
+/// line from another client cannot show reordered or hidden text either.
+pub fn ch_clean(src: []const u8, out: []u8) -> usize {
+    var lim : usize = out.len;
+    if (lim > CH_MSG_MAX) { lim = CH_MSG_MAX; }
+    var i : usize = 0;
+    var n : usize = 0;
+    while (i < src.len) {
+        var w : usize = utf8_len(src[i]);
+        if (i + w > src.len) { return n; }
+        const cp : u32 = u8_cp(src, i, w);
+        if (cp == 10 or cp == 13 or cp == 8232 or cp == 8233 or cp == 9) {
+            if (n + 1 > lim) { return n; }
+            if (cp == 9) { out[n] = 32; } else { out[n] = 10; }
+            n = n + 1;
+            if (cp == 13 and i + 1 < src.len and src[i + 1] == 10) { w = 2; }
+        } else if (!ch_hidden(cp)) {
+            if (n + w > lim) { return n; }
+            copy(out, n, src, i, w);
+            n = n + w;
+        }
+        i = i + w;
+    }
+    return n;
+}
+
+/// Text with no character ch_clean would drop or change (no control, no line break, no ch_hidden mark): a name.
+pub fn ch_plain(b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < b.len) {
+        const w : usize = utf8_len(b[i]);
+        if (i + w > b.len) { return false; }
+        const cp : u32 = u8_cp(b, i, w);
+        if (ch_hidden(cp) or cp == 8232 or cp == 8233) { return false; }
+        i = i + w;
+    }
+    return true;
+}
+
+/// U+FFFD, the line kept for a message that had nothing left once cleaned (it still counts as received).
+const CH_EMPTY : [3]u8 = [239, 191, 189];
+
+fn put_phdr(out: []u8, kind: u32, msg: u32, part: u32, parts: u32, time: u64, len: usize) -> void {
+    out[0] = @as(u8, @intCast(kind));
+    out[1] = 0;
+    put32(out, 2, msg);
+    put16(out, 6, part);
+    put16(out, 8, parts);
+    put_u64(out, 10, time);
+    put16(out, 18, @as(u32, @intCast(len)));
+}
+
+/// Part `part` of message `msg` (whole text `text`) into out: CH_PHDR + its bytes, 0 when the message or the part
+/// does not exist or out is short.
+pub fn ch_put_text(out: []u8, msg: u32, part: u32, time: u64, text: []const u8) -> usize {
+    const parts : u32 = ch_parts_for(text.len);
+    if (parts == 0 or msg == 0 or part >= parts) { return 0; }
+    const from : usize = @as(usize, part) * CH_PART_MAX;
+    var n : usize = text.len - from;
+    if (n > CH_PART_MAX) { n = CH_PART_MAX; }
+    if (out.len < CH_PHDR + n) { return 0; }
+    put_phdr(out, CH_K_TEXT, msg, part, parts, time, n);
+    copy(out, CH_PHDR, text, from, n);
+    return CH_PHDR + n;
+}
+
+/// One part already cut (`bytes`, part `part` of `parts`) into out: CH_PHDR + its bytes, 0 when it cannot be one.
+pub fn ch_put_part(out: []u8, msg: u32, part: u32, parts: u32, time: u64, bytes: []const u8) -> usize {
+    if (msg == 0 or parts == 0 or parts > CH_PARTS_MAX or part >= parts or bytes.len == 0 or bytes.len > CH_PART_MAX) { return 0; }
+    if (@as(usize, part) * CH_PART_MAX + bytes.len > CH_MSG_MAX) { return 0; }
+    if (out.len < CH_PHDR + bytes.len) { return 0; }
+    put_phdr(out, CH_K_TEXT, msg, part, parts, time, bytes.len);
+    copy(out, CH_PHDR, bytes, 0, bytes.len);
+    return CH_PHDR + bytes.len;
+}
+
+pub fn ch_put_ack(out: []u8, msg: u32, part: u32) -> usize {
+    if (out.len < CH_PHDR or msg == 0) { return 0; }
+    put_phdr(out, CH_K_ACK, msg, part, 0, 0, 0);
+    return CH_PHDR;
+}
+
+pub fn ch_put_read(out: []u8, upto: u32) -> usize {
+    if (out.len < CH_PHDR or upto == 0) { return 0; }
+    put_phdr(out, CH_K_READ, upto, 0, 0, 0, 0);
+    return CH_PHDR;
+}
+
+/// The kind of a payload that checks, 0 for anything else: the length matches, a TEXT part is inside its
+/// message (every part but the last full, and the message it ends no longer than CH_MSG_MAX, so a third part of
+/// 700 bytes cannot carry the join past the assembly slot and the line), an ACK names a part a message can have, a READ names a message.
+pub fn ch_kind(p: []const u8) -> u32 {
+    if (p.len < CH_PHDR or p.len > CH_PAYLOAD_MAX or p[1] != 0) { return 0; }
+    const kind : u32 = @as(u32, p[0]);
+    const msg : u32 = get32(p, 2);
+    const part : u32 = get16(p, 6);
+    const parts : u32 = get16(p, 8);
+    const len : usize = @as(usize, get16(p, 18));
+    if (msg == 0 or len != p.len - CH_PHDR) { return 0; }
+    if (kind == CH_K_TEXT) {
+        if (parts == 0 or parts > CH_PARTS_MAX or part >= parts or len == 0 or len > CH_PART_MAX) { return 0; }
+        if (part + 1 < parts and len != CH_PART_MAX) { return 0; }
+        if (@as(usize, part) * CH_PART_MAX + len > CH_MSG_MAX) { return 0; }
+        return kind;
+    }
+    if (kind == CH_K_ACK) {
+        if (len != 0 or parts != 0 or part >= CH_PARTS_MAX or get_u64(p, 10) != 0) { return 0; }
+        return kind;
+    }
+    if (kind == CH_K_READ) {
+        if (len != 0 or parts != 0 or part != 0 or get_u64(p, 10) != 0) { return 0; }
+        return kind;
+    }
+    return 0;
+}
+
+pub fn ch_msg(p: []const u8) -> u32 { return get32(p, 2); }
+pub fn ch_part(p: []const u8) -> u32 { return get16(p, 6); }
+pub fn ch_parts(p: []const u8) -> u32 { return get16(p, 8); }
+pub fn ch_time(p: []const u8) -> u64 { return get_u64(p, 10); }
+pub fn ch_len(p: []const u8) -> usize { return @as(usize, get16(p, 18)); }
+
+// ---------------------------------------------------------------- the log in memory
+
+pub const CH_DIR_OUT : u32 = 1;
+pub const CH_DIR_IN : u32 = 2;
+pub const CH_S_PENDING : u32 = 1;
+pub const CH_S_SENT : u32 = 2;
+pub const CH_S_DELIVERED : u32 = 3;
+pub const CH_S_READ : u32 = 4;
+pub const CH_S_FAILED : u32 = 5;
+
+pub const CL_HDR : usize = 40;
+pub const CL_LINE : usize = 2032;
+pub const CL_TEXT : usize = 32;
+/// History kept per friend.
+pub const CL_KEEP : u32 = 500;
+/// "no such line"
+pub const CL_NONE : usize = 4294967295;
+/// Message numbers run from 1 to below CH_MSG_TOP (2^31). A number at or above it never comes from a sender that
+/// counts from 1, so it is refused on receipt and on read and never becomes the floor: a floor of 0xFFFFFFFF would
+/// make every later message of that friend a duplicate.
+pub const CH_MSG_TOP : u32 = 2147483648;
+const CL_VERSION : u32 = 1;
+
+const LN_DIR : usize = 0;
+const LN_STATE : usize = 1;
+const LN_LEN : usize = 2;
+const LN_MSG : usize = 4;
+const LN_TIME : usize = 8;
+const LN_TRIES : usize = 16;
+const LN_ACKED : usize = 17;
+const LN_PARTS : usize = 18;
+const LN_LAST : usize = 24;
+/// The spare bytes of a line (offset in the line, length): zero here, group_core's in a group log.
+pub const CL_EXT : usize = 19;
+pub const CL_EXT_LEN : usize = 5;
+
+/// Bytes a log of cap lines needs.
+pub fn cl_bytes(cap: u32) -> usize { return CL_HDR + @as(usize, cap) * CL_LINE; }
+
+fn put_magic(b: []u8) -> void {
+    // "T27OSCH\n"
+    b[0] = 84; b[1] = 50; b[2] = 55; b[3] = 79; b[4] = 83; b[5] = 67; b[6] = 72; b[7] = 10;
+}
+
+fn magic_ok(b: []const u8) -> bool {
+    return b[0] == 84 and b[1] == 50 and b[2] == 55 and b[3] == 79 and b[4] == 83 and b[5] == 67 and b[6] == 72 and b[7] == 10;
+}
+
+/// An empty log for the friend peer_fp keeping cap lines (1..CL_KEEP). False when log is short or cap is wrong.
+/// The header and every line slot are zeroed, so a later shift or move of a slot copies only written bytes.
+pub fn cl_init(log: []u8, peer_fp: []const u8, cap: u32) -> bool {
+    if (cap == 0 or cap > CL_KEEP or log.len < cl_bytes(cap) or peer_fp.len != 10) { return false; }
+    var i : usize = 0;
+    while (i < cl_bytes(cap)) {
+        log[i] = 0;
+        i = i + 1;
+    }
+    put_magic(log);
+    put32(log, 8, CL_VERSION);
+    put32(log, 24, cap);
+    copy(log, 28, peer_fp, 0, 10);
+    return true;
+}
+
+pub fn cl_count(log: []const u8) -> u32 { return get32(log, 12); }
+pub fn cl_cap(log: []const u8) -> u32 { return get32(log, 24); }
+pub fn cl_last_out(log: []const u8) -> u32 { return get32(log, 16); }
+pub fn cl_floor(log: []const u8) -> u32 { return get32(log, 20); }
+/// A group log keeps the floor per sender itself (group_core) and clears this one after a drop.
+pub fn cl_set_floor(log: []u8, v: u32) -> void { put32(log, 20, v); }
+
+fn ln(i: usize) -> usize { return CL_HDR + i * CL_LINE; }
+
+pub fn cl_dir(log: []const u8, i: usize) -> u32 { return @as(u32, log[ln(i) + LN_DIR]); }
+pub fn cl_state(log: []const u8, i: usize) -> u32 { return @as(u32, log[ln(i) + LN_STATE]); }
+pub fn cl_msg(log: []const u8, i: usize) -> u32 { return get32(log, ln(i) + LN_MSG); }
+pub fn cl_len(log: []const u8, i: usize) -> usize { return @as(usize, get16(log, ln(i) + LN_LEN)); }
+pub fn cl_time(log: []const u8, i: usize) -> u64 { return get_u64(log, ln(i) + LN_TIME); }
+pub fn cl_tries(log: []const u8, i: usize) -> u32 { return @as(u32, log[ln(i) + LN_TRIES]); }
+pub fn cl_acked(log: []const u8, i: usize) -> u32 { return @as(u32, log[ln(i) + LN_ACKED]); }
+pub fn cl_parts(log: []const u8, i: usize) -> u32 { return @as(u32, log[ln(i) + LN_PARTS]); }
+pub fn cl_last_send(log: []const u8, i: usize) -> u64 { return get_u64(log, ln(i) + LN_LAST); }
+/// Where line i starts in the log.
+pub fn cl_line_at(i: usize) -> usize { return ln(i); }
+/// The text of line i.
+pub fn cl_text(log: []const u8, i: usize) -> []const u8 { return log[ln(i) + CL_TEXT..ln(i) + CL_TEXT + cl_len(log, i)]; }
+
+fn set_state(log: []u8, i: usize, st: u32) -> void { log[ln(i) + LN_STATE] = @as(u8, @intCast(st)); }
+
+/// The line of direction dir and number msg, CL_NONE when there is none.
+pub fn cl_find(log: []const u8, dir: u32, msg: u32) -> usize {
+    const n : usize = @as(usize, cl_count(log));
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == dir and cl_msg(log, i) == msg) { return i; }
+        i = i + 1;
+    }
+    return CL_NONE;
+}
+
+/// Drop the oldest line (the rest move up). An incoming line raises the floor, so its resend stays a duplicate.
+pub fn cl_drop_oldest(log: []u8) -> bool {
+    const n : usize = @as(usize, cl_count(log));
+    if (n == 0) { return false; }
+    if (cl_dir(log, 0) == CH_DIR_IN and cl_msg(log, 0) > cl_floor(log) and cl_msg(log, 0) < CH_MSG_TOP) { put32(log, 20, cl_msg(log, 0)); }
+    var b : usize = ln(0);
+    const end : usize = ln(n - 1);
+    while (b < end) {
+        log[b] = log[b + CL_LINE];
+        b = b + 1;
+    }
+    put32(log, 12, @as(u32, @intCast(n - 1)));
+    return true;
+}
+
+/// Keep the newest `keep` lines.
+pub fn cl_trim(log: []u8, keep: u32) -> void {
+    while (cl_count(log) > keep) { cl_drop_oldest(log); }
+}
+
+/// Open a hole at line `at` (lines at.. move down one) and fill it. The log must have room.
+fn put_line(log: []u8, at: usize, dir: u32, st: u32, msg: u32, time: u64, text: []const u8) -> void {
+    const n : usize = @as(usize, cl_count(log));
+    var b : usize = ln(n) + CL_LINE;
+    const lim : usize = ln(at) + CL_LINE;
+    while (b > lim) {
+        b = b - 1;
+        log[b] = log[b - CL_LINE];
+    }
+    const o : usize = ln(at);
+    var i : usize = 0;
+    while (i < CL_TEXT) {
+        log[o + i] = 0;
+        i = i + 1;
+    }
+    log[o + LN_DIR] = @as(u8, @intCast(dir));
+    log[o + LN_STATE] = @as(u8, @intCast(st));
+    put16(log, o + LN_LEN, @as(u32, @intCast(text.len)));
+    put32(log, o + LN_MSG, msg);
+    put_u64(log, o + LN_TIME, time);
+    log[o + LN_PARTS] = @as(u8, @intCast(ch_parts_for(text.len)));
+    copy(log, o + CL_TEXT, text, 0, text.len);
+    put32(log, 12, @as(u32, @intCast(n + 1)));
+}
+
+/// A new outgoing message: the next number, appended PENDING (a full log drops its oldest line first). Its number,
+/// or 0 when the text is empty, too long (the person is told, nothing is cut unseen), not UTF-8 or has nothing left
+/// once cleaned (ch_clean).
+pub fn cl_out_add(log: []u8, text: []const u8, now: u64) -> u32 {
+    if (ch_parts_for(text.len) == 0 or !ch_utf8_ok(text)) { return 0; }
+    var c : [2000]u8 = undefined;
+    const n : usize = ch_clean(text, c[0..CH_MSG_MAX]);
+    if (n == 0 or cl_last_out(log) >= CH_MSG_TOP - 1) { return 0; }
+    if (cl_count(log) >= cl_cap(log)) { cl_drop_oldest(log); }
+    const msg : u32 = cl_last_out(log) + 1;
+    put32(log, 16, msg);
+    put_line(log, @as(usize, cl_count(log)), CH_DIR_OUT, CH_S_PENDING, msg, now, c[0..n]);
+    ck_wipe(c[0..n]);
+    return msg;
+}
+
+/// put_line of a text from outside (the peer, the file): cleaned first; a text with nothing left is U+FFFD.
+fn put_clean(log: []u8, at: usize, dir: u32, st: u32, msg: u32, time: u64, text: []const u8) -> void {
+    var c : [2000]u8 = undefined;
+    const n : usize = ch_clean(text, c[0..CH_MSG_MAX]);
+    if (n == 0) {
+        put_line(log, at, dir, st, msg, time, CH_EMPTY[0..3]);
+    } else {
+        put_line(log, at, dir, st, msg, time, c[0..n]);
+    }
+    ck_wipe(c[0..CH_MSG_MAX]);
+}
+
+/// Where incoming message msg stands: before the first incoming line with a higher number, else at the end.
+pub fn cl_in_pos(log: []const u8, msg: u32) -> usize {
+    const n : usize = @as(usize, cl_count(log));
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_IN and cl_msg(log, i) > msg) { return i; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Is incoming message msg already here (a line, or at or below the trimmed floor)?
+pub fn cl_have_in(log: []const u8, msg: u32) -> bool {
+    return msg <= cl_floor(log) or cl_find(log, CH_DIR_IN, msg) != CL_NONE;
+}
+
+/// Put a whole incoming message in its place, DELIVERED (unread). False when it is already here.
+fn cl_in_put(log: []u8, msg: u32, time: u64, text: []const u8) -> bool {
+    if (cl_have_in(log, msg)) { return false; }
+    if (cl_count(log) >= cl_cap(log)) { cl_drop_oldest(log); }
+    // the drop may have raised the floor past this message: then it is the oldest one and stays out
+    if (cl_have_in(log, msg)) { return false; }
+    put_clean(log, cl_in_pos(log, msg), CH_DIR_IN, CH_S_DELIVERED, msg, time, text);
+    return true;
+}
+
+// ---------------------------------------------------------------- incoming parts
+
+/// Assembly of messages that came in parts: CA_SLOTS slots of msg u32 (0 = free) | parts u8 | mask u8 | last part
+/// length u16 | time u64 | CH_MSG_MAX bytes.
+pub const CA_SLOTS : usize = 4;
+pub const CA_SLOT : usize = 2016;
+pub const CA_LEN : usize = 8064;
+
+pub const CH_RX_BAD : u32 = 0;
+pub const CH_RX_PART : u32 = 1;
+pub const CH_RX_NEW : u32 = 2;
+pub const CH_RX_DUP : u32 = 3;
+pub const CH_RX_FULL : u32 = 4;
+
+/// Should the receiver ACK this result? Every part that checks and is kept or already held; not a refused one and
+/// not one there was no room for (the sender sends it again).
+pub fn ch_rx_acks(r: u32) -> bool { return r == CH_RX_PART or r == CH_RX_NEW or r == CH_RX_DUP; }
+
+fn ca(k: usize) -> usize { return k * CA_SLOT; }
+
+/// One TEXT payload in: CH_RX_NEW when it completed a message (a new line), CH_RX_PART when it was kept for later,
+/// CH_RX_DUP when that part or message is already here, CH_RX_FULL when no assembly slot is free, CH_RX_BAD when it
+/// does not check, is not UTF-8 once joined, or disagrees with the parts already held.
+pub fn ch_rx_text(log: []u8, asm: []u8, p: []const u8) -> u32 {
+    if (ch_kind(p) != CH_K_TEXT or asm.len < CA_LEN) { return CH_RX_BAD; }
+    const msg : u32 = ch_msg(p);
+    const part : u32 = ch_part(p);
+    const parts : u32 = ch_parts(p);
+    const n : usize = ch_len(p);
+    if (msg >= CH_MSG_TOP) { return CH_RX_BAD; }
+    if (cl_have_in(log, msg)) { return CH_RX_DUP; }
+    if (parts == 1) {
+        if (!ch_utf8_ok(p[CH_PHDR..CH_PHDR + n])) { return CH_RX_BAD; }
+        cl_in_put(log, msg, ch_time(p), p[CH_PHDR..CH_PHDR + n]);
+        return CH_RX_NEW;
+    }
+    var k : usize = 0;
+    var slot : usize = CA_SLOTS;
+    var free : usize = CA_SLOTS;
+    while (k < CA_SLOTS) {
+        const m : u32 = get32(asm, ca(k));
+        if (m == msg and slot == CA_SLOTS) { slot = k; }
+        if (m == 0 and free == CA_SLOTS) { free = k; }
+        k = k + 1;
+    }
+    if (slot == CA_SLOTS) {
+        if (free == CA_SLOTS) { return CH_RX_FULL; }
+        slot = free;
+        const o : usize = ca(slot);
+        put32(asm, o, msg);
+        asm[o + 4] = @as(u8, @intCast(parts));
+        asm[o + 5] = 0;
+        put16(asm, o + 6, 0);
+        put_u64(asm, o + 8, ch_time(p));
+    }
+    const o : usize = ca(slot);
+    if (@as(u32, asm[o + 4]) != parts) { return CH_RX_BAD; }
+    const bit : u32 = @as(u32, 1) << part;
+    if ((@as(u32, asm[o + 5]) & bit) != 0) { return CH_RX_DUP; }
+    copy(asm, o + 16 + @as(usize, part) * CH_PART_MAX, p, CH_PHDR, n);
+    asm[o + 5] = @as(u8, @intCast(@as(u32, asm[o + 5]) | bit));
+    if (part + 1 == parts) { put16(asm, o + 6, @as(u32, @intCast(n))); }
+    const all : u32 = (@as(u32, 1) << parts) - 1;
+    if (@as(u32, asm[o + 5]) != all) { return CH_RX_PART; }
+    const total : usize = @as(usize, parts - 1) * CH_PART_MAX + @as(usize, get16(asm, o + 6));
+    var ok : bool = ch_utf8_ok(asm[o + 16..o + 16 + total]);
+    if (ok) { cl_in_put(log, msg, get_u64(asm, o + 8), asm[o + 16..o + 16 + total]); }
+    // the joined plaintext goes from the slot whether it was kept or refused
+    ck_wipe(asm[o..o + 16 + CH_MSG_MAX]);
+    if (!ok) { return CH_RX_BAD; }
+    return CH_RX_NEW;
+}
+
+/// An ACK in: the part is marked; the line becomes DELIVERED once every part is. True when the line changed.
+pub fn ch_rx_ack(log: []u8, p: []const u8) -> bool {
+    if (ch_kind(p) != CH_K_ACK) { return false; }
+    const i : usize = cl_find(log, CH_DIR_OUT, ch_msg(p));
+    if (i == CL_NONE) { return false; }
+    const st : u32 = cl_state(log, i);
+    if (st == CH_S_DELIVERED or st == CH_S_READ) { return false; }
+    const parts : u32 = cl_parts(log, i);
+    const part : u32 = ch_part(p);
+    if (part >= parts) { return false; }
+    const bit : u32 = @as(u32, 1) << part;
+    const had : u32 = cl_acked(log, i);
+    if ((had & bit) != 0) { return false; }
+    const now : u32 = had | bit;
+    log[ln(i) + LN_ACKED] = @as(u8, @intCast(now));
+    if (now == (@as(u32, 1) << parts) - 1) { set_state(log, i, CH_S_DELIVERED); }
+    return true;
+}
+
+/// A READ in: every outgoing line up to its number that is not yet READ becomes READ (it was delivered, or it
+/// could not have been shown). The number of lines that changed.
+pub fn ch_rx_read(log: []u8, p: []const u8) -> u32 {
+    if (ch_kind(p) != CH_K_READ) { return 0; }
+    const upto : u32 = ch_msg(p);
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_OUT and cl_msg(log, i) <= upto and cl_state(log, i) != CH_S_READ) {
+            set_state(log, i, CH_S_READ);
+            log[ln(i) + LN_ACKED] = @as(u8, @intCast((@as(u32, 1) << cl_parts(log, i)) - 1));
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- unread
+
+/// Lines of direction dir.
+pub fn cl_count_dir(log: []const u8, dir: u32) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == dir) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Incoming lines not yet shown.
+pub fn cl_unread(log: []const u8) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_IN and cl_state(log, i) == CH_S_DELIVERED) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The chat was opened: every incoming line is READ. The number to put in a READ (the highest incoming message
+/// here), 0 when nothing was unread (no READ to send).
+pub fn cl_open_read(log: []u8) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var changed : bool = false;
+    var hi : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_IN) {
+            if (cl_msg(log, i) > hi) { hi = cl_msg(log, i); }
+            if (cl_state(log, i) == CH_S_DELIVERED) {
+                set_state(log, i, CH_S_READ);
+                changed = true;
+            }
+        }
+        i = i + 1;
+    }
+    if (!changed) { return 0; }
+    return hi;
+}
+
+// ---------------------------------------------------------------- sending
+
+pub const CH_RETRY_MS : u64 = 2000;
+pub const CH_TRIES : u32 = 5;
+pub const CH_R_WAIT : u32 = 0;
+pub const CH_R_SEND : u32 = 1;
+pub const CH_R_GIVEUP : u32 = 2;
+
+/// What to do with a line not yet acknowledged: send it now (never sent, or CH_RETRY_MS since the last send),
+/// wait, or give up after CH_TRIES sends.
+pub fn ch_retry(now: u64, last: u64, tries: u32) -> u32 {
+    if (tries == 0) { return CH_R_SEND; }
+    if (now < last or now - last < CH_RETRY_MS) { return CH_R_WAIT; }
+    if (tries >= CH_TRIES) { return CH_R_GIVEUP; }
+    return CH_R_SEND;
+}
+
+/// Is line i an outgoing one still waiting for ACKs (PENDING or SENT)?
+pub fn cl_open_out(log: []const u8, i: usize) -> bool {
+    if (cl_dir(log, i) != CH_DIR_OUT) { return false; }
+    const st : u32 = cl_state(log, i);
+    return st == CH_S_PENDING or st == CH_S_SENT;
+}
+
+/// The decision for line i at time now (CH_R_*); a give-up marks it FAILED here.
+pub fn cl_due(log: []u8, i: usize, now: u64) -> u32 {
+    if (!cl_open_out(log, i)) { return CH_R_WAIT; }
+    const r : u32 = ch_retry(now, get_u64(log, ln(i) + LN_LAST), cl_tries(log, i));
+    if (r == CH_R_GIVEUP) { set_state(log, i, CH_S_FAILED); }
+    return r;
+}
+
+/// Is part k of line i still unacknowledged (so it goes out)?
+pub fn cl_part_due(log: []const u8, i: usize, k: u32) -> bool {
+    if (k >= cl_parts(log, i)) { return false; }
+    return (cl_acked(log, i) & (@as(u32, 1) << k)) == 0;
+}
+
+/// The unacknowledged parts of line i went out at `now`: one more try, SENT.
+pub fn cl_mark_sent(log: []u8, i: usize, now: u64) -> void {
+    log[ln(i) + LN_TRIES] = @as(u8, @intCast(cl_tries(log, i) + 1));
+    put_u64(log, ln(i) + LN_LAST, now);
+    if (cl_state(log, i) == CH_S_PENDING) { set_state(log, i, CH_S_SENT); }
+}
+
+/// Line i goes out again from the start: PENDING, no tries, never sent.
+pub fn cl_restart(log: []u8, i: usize) -> void {
+    set_state(log, i, CH_S_PENDING);
+    log[ln(i) + LN_TRIES] = 0;
+    put_u64(log, ln(i) + LN_LAST, 0);
+}
+
+/// A session came up: every outgoing line not yet delivered starts again (PENDING, no tries, no ACKs kept from a
+/// session whose parts may not all have arrived). The number of lines that will go out.
+pub fn cl_session_start(log: []u8) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const st : u32 = cl_state(log, i);
+        if (cl_dir(log, i) == CH_DIR_OUT and (st == CH_S_PENDING or st == CH_S_SENT or st == CH_S_FAILED)) {
+            cl_restart(log, i);
+            log[ln(i) + LN_ACKED] = 0;
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Outgoing lines still waiting (PENDING or SENT).
+pub fn cl_pending(log: []const u8) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_open_out(log, i)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- the session
+
+/// A message session closes after this long without a chat frame either way, when nothing waits to go out.
+pub const CH_IDLE_MS : u64 = 30000;
+/// The session's own silence limit (call_session CS_K_SILENT_MS) stays above the idle close, so the side that is
+/// idle first ends it with a sealed BYE rather than both timing out.
+pub const CH_SILENT_MS : u64 = 35000;
+/// A message session that is not answered gives up after this long (call_session CS_K_CALLING_MS).
+pub const CH_CALLING_MS : u64 = 5000;
+
+pub fn ch_idle_close(now: u64, last: u64, pending: u32) -> bool {
+    return pending == 0 and now >= last and now - last >= CH_IDLE_MS;
+}
+
+/// Two friends who dial each other at once both wait in CALLING (call_session takes an INVITE only when idle) and
+/// time out: the one with the lower fingerprint dials again sooner, so the second try meets an idle peer.
+pub fn ch_redial_ms(me: []const u8, peer: []const u8) -> u64 {
+    var i : usize = 0;
+    while (i < 10) {
+        if (me[i] < peer[i]) { return 1000; }
+        if (me[i] > peer[i]) { return 3000; }
+        i = i + 1;
+    }
+    return 2000;
+}
+
+// ---------------------------------------------------------------- the file
+
+pub const CF_OK : u32 = 0;
+pub const CF_SHORT : u32 = 1;
+pub const CF_MAGIC : u32 = 2;
+pub const CF_VERSION : u32 = 3;
+pub const CF_CRC : u32 = 4;
+pub const CF_BAD : u32 = 5;
+pub const CF_PEER : u32 = 6;
+pub const CF_HDR : usize = 36;
+pub const CF_REC : usize = 16;
+/// The largest file: CL_KEEP full records.
+pub const CF_MAX : usize = 1008040;
+
+/// The file of a log into out; its length, 0 when out is short.
+pub fn cf_encode(log: []const u8, out: []u8) -> usize {
+    const n : usize = @as(usize, cl_count(log));
+    if (out.len < CF_HDR + 4) { return 0; }
+    put_magic(out);
+    put32(out, 8, CL_VERSION);
+    put32(out, 12, @as(u32, @intCast(n)));
+    put32(out, 16, cl_last_out(log));
+    put32(out, 20, cl_floor(log));
+    copy(out, 24, log, 28, 10);
+    out[34] = 0;
+    out[35] = 0;
+    var at : usize = CF_HDR;
+    var i : usize = 0;
+    while (i < n) {
+        const len : usize = cl_len(log, i);
+        if (at + CF_REC + len + 4 > out.len) { return 0; }
+        out[at] = @as(u8, @intCast(cl_dir(log, i)));
+        out[at + 1] = @as(u8, @intCast(cl_state(log, i)));
+        put16(out, at + 2, @as(u32, @intCast(len)));
+        put32(out, at + 4, cl_msg(log, i));
+        put_u64(out, at + 8, cl_time(log, i));
+        copy(out, at + CF_REC, log, ln(i) + CL_TEXT, len);
+        at = at + CF_REC + len;
+        i = i + 1;
+    }
+    put32(out, at, crc32(out, at));
+    return at + 4;
+}
+
+/// Read a file into an initialised log of the same friend: CF_OK, or why not (the log is then left empty). A file
+/// with more lines than the log holds keeps the newest; a line that was not delivered is sent again.
+pub fn cf_decode(b: []const u8, log: []u8) -> u32 {
+    if (b.len < CF_HDR + 4) { return CF_SHORT; }
+    if (!magic_ok(b)) { return CF_MAGIC; }
+    if (get32(b, 8) != CL_VERSION) { return CF_VERSION; }
+    if (get32(b, b.len - 4) != crc32(b, b.len - 4)) { return CF_CRC; }
+    var i : usize = 0;
+    while (i < 10) {
+        if (b[24 + i] != log[28 + i]) { return CF_PEER; }
+        i = i + 1;
+    }
+    if (get32(b, 16) >= CH_MSG_TOP or get32(b, 20) >= CH_MSG_TOP) { return CF_BAD; }
+    const n : usize = @as(usize, get32(b, 12));
+    // walk once to check every record before anything is taken
+    var at : usize = CF_HDR;
+    i = 0;
+    while (i < n) {
+        if (at + CF_REC > b.len - 4) { return CF_BAD; }
+        const len : usize = @as(usize, get16(b, at + 2));
+        const dir : u32 = @as(u32, b[at]);
+        const st : u32 = @as(u32, b[at + 1]);
+        if (len == 0 or len > CH_MSG_MAX or at + CF_REC + len > b.len - 4) { return CF_BAD; }
+        if ((dir != CH_DIR_OUT and dir != CH_DIR_IN) or st < CH_S_PENDING or st > CH_S_FAILED or get32(b, at + 4) == 0 or get32(b, at + 4) >= CH_MSG_TOP) { return CF_BAD; }
+        at = at + CF_REC + len;
+        i = i + 1;
+    }
+    if (at != b.len - 4) { return CF_BAD; }
+    put32(log, 12, 0);
+    put32(log, 16, get32(b, 16));
+    put32(log, 20, get32(b, 20));
+    const cap : u32 = cl_cap(log);
+    at = CF_HDR;
+    i = 0;
+    while (i < n) {
+        const len : usize = @as(usize, get16(b, at + 2));
+        if (cl_count(log) >= cap) { cl_drop_oldest(log); }
+        const k : usize = @as(usize, cl_count(log));
+        put_clean(log, k, @as(u32, b[at]), @as(u32, b[at + 1]), get32(b, at + 4), get_u64(b, at + 8), b[at + CF_REC..at + CF_REC + len]);
+        const st : u32 = @as(u32, b[at + 1]);
+        if (st == CH_S_DELIVERED or st == CH_S_READ) {
+            log[ln(k) + LN_ACKED] = @as(u8, @intCast((@as(u32, 1) << cl_parts(log, k)) - 1));
+        }
+        at = at + CF_REC + len;
+        i = i + 1;
+    }
+    return CF_OK;
+}
+
+/// "<20 lowercase hex digits of fp>.t27" into out; its length (24), 0 when out is short.
+pub fn cf_name(fp: []const u8, out: []u8) -> usize {
+    if (fp.len != 10 or out.len < 24) { return 0; }
+    var i : usize = 0;
+    while (i < 10) {
+        const hi : u8 = fp[i] >> 4;
+        const lo : u8 = fp[i] & 15;
+        if (hi < 10) { out[2 * i] = 48 + hi; } else { out[2 * i] = 87 + hi; }
+        if (lo < 10) { out[2 * i + 1] = 48 + lo; } else { out[2 * i + 1] = 87 + lo; }
+        i = i + 1;
+    }
+    out[20] = 46;
+    out[21] = 116;
+    out[22] = 50;
+    out[23] = 55;
+    return 24;
+}
+
+// ---------------------------------------------------------------- tests
+
+const T_A : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const T_B : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+const T_CAP : u32 = 8;
+const T_LOG : usize = 16296;
+
+fn t_fill(b: []u8, n: usize, seed: u8) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        b[i] = 97 + @as(u8, @intCast((i + @as(usize, seed)) % 26));
+        i = i + 1;
+    }
+}
+
+/// Deliver every part of outgoing line i of `from` into `to` (with its assembly), in the order given by `order`
+/// (a list of part numbers); the last result.
+fn t_carry(from: []const u8, i: usize, to: []u8, asm: []u8, order: []const u32) -> u32 {
+    var r : u32 = CH_RX_BAD;
+    var k : usize = 0;
+    while (k < order.len) {
+        var p : [720]u8 = undefined;
+        const n : usize = ch_put_text(p[0..720], cl_msg(from, i), order[k], cl_time(from, i), cl_text(from, i));
+        r = ch_rx_text(to, asm, p[0..n]);
+        k = k + 1;
+    }
+    return r;
+}
+
+test the_layout_fits_one_datagram_and_the_text_type_is_new {
+    assert CH_PAYLOAD_MAX == CH_PHDR + CH_PART_MAX;
+    assert CH_SEALED_MAX == CK_HDR + CH_PAYLOAD_MAX + CK_TAG;
+    assert CH_SEALED_MAX <= 1200;
+    assert @as(usize, CH_PARTS_MAX) * CH_PART_MAX >= CH_MSG_MAX;
+    assert CK_T_TEXT != CK_T_MEDIA and CK_T_TEXT != CK_T_VIDEO and CK_T_TEXT != CK_T_BYE;
+    assert CA_LEN == CA_SLOTS * CA_SLOT;
+    assert CA_SLOT >= 16 + CH_MSG_MAX;
+    assert CL_LINE >= CL_TEXT + CH_MSG_MAX;
+    assert cl_bytes(T_CAP) == T_LOG;
+    assert CF_MAX == CF_HDR + @as(usize, CL_KEEP) * (CF_REC + CH_MSG_MAX) + 4;
+}
+
+test a_message_is_cut_into_full_parts_and_at_most_three {
+    assert ch_parts_for(0) == 0;
+    assert ch_parts_for(1) == 1;
+    assert ch_parts_for(700) == 1;
+    assert ch_parts_for(701) == 2;
+    assert ch_parts_for(1400) == 2;
+    assert ch_parts_for(1401) == 3;
+    assert ch_parts_for(2000) == 3;
+    assert ch_parts_for(2001) == 0;
+}
+
+test utf8_takes_emoji_and_cyrillic_and_refuses_broken_forms {
+    // "Hi " + U+1F600 (grinning face), and the two Cyrillic letters "Da"
+    const e : [7]u8 = [72, 105, 32, 240, 159, 152, 128];
+    const ru : [4]u8 = [208, 148, 208, 176];
+    assert ch_utf8_ok(e[0..7]);
+    assert ch_utf8_ok(ru[0..4]);
+    assert ch_utf8_ok(e[0..3]);
+    // cut inside the emoji, a stray continuation byte, an overlong '/', a surrogate, above U+10FFFF, NUL
+    assert ch_utf8_ok(e[0..6]) == false;
+    const c1 : [1]u8 = [128];
+    const ov : [2]u8 = [192, 175];
+    const sg : [3]u8 = [237, 160, 128];
+    const big : [4]u8 = [244, 144, 128, 128];
+    const nul : [1]u8 = [0];
+    assert ch_utf8_ok(c1[0..1]) == false;
+    assert ch_utf8_ok(ov[0..2]) == false;
+    assert ch_utf8_ok(sg[0..3]) == false;
+    assert ch_utf8_ok(big[0..4]) == false;
+    assert ch_utf8_ok(nul[0..1]) == false;
+}
+
+test a_text_part_reads_back_and_malformed_payloads_are_refused {
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 3);
+    var p : [720]u8 = undefined;
+    const n0 : usize = ch_put_text(p[0..720], 7, 0, 123456789, t[0..1500]);
+    assert n0 == CH_PHDR + 700;
+    assert ch_kind(p[0..n0]) == CH_K_TEXT;
+    assert ch_msg(p[0..n0]) == 7 and ch_part(p[0..n0]) == 0 and ch_parts(p[0..n0]) == 3;
+    assert ch_time(p[0..n0]) == 123456789 and ch_len(p[0..n0]) == 700;
+    assert p[CH_PHDR] == t[0];
+    const n2 : usize = ch_put_text(p[0..720], 7, 2, 1, t[0..1500]);
+    assert n2 == CH_PHDR + 100;
+    assert p[CH_PHDR] == t[1400];
+    assert ch_put_text(p[0..720], 7, 3, 1, t[0..1500]) == 0;
+    assert ch_put_text(p[0..720], 0, 0, 1, t[0..1500]) == 0;
+    // a length that disagrees, a short part before the last, a reserved byte, an unknown kind
+    assert ch_kind(p[0..n2 - 1]) == 0;
+    const n1 : usize = ch_put_text(p[0..720], 7, 1, 1, t[0..1500]);
+    assert ch_kind(p[0..n1]) == CH_K_TEXT;
+    put16(p[0..720], 18, 699);
+    assert ch_kind(p[0..n1 - 1]) == 0;
+    ch_put_text(p[0..720], 7, 2, 1, t[0..1500]);
+    p[1] = 1;
+    assert ch_kind(p[0..n2]) == 0;
+    p[1] = 0;
+    p[0] = 9;
+    assert ch_kind(p[0..n2]) == 0;
+    var a : [20]u8 = undefined;
+    assert ch_put_ack(a[0..20], 7, 2) == CH_PHDR;
+    assert ch_kind(a[0..20]) == CH_K_ACK;
+    put16(a[0..20], 6, 3);
+    assert ch_kind(a[0..20]) == 0;
+    assert ch_put_read(a[0..20], 9) == CH_PHDR;
+    assert ch_kind(a[0..20]) == CH_K_READ and ch_msg(a[0..20]) == 9;
+    assert ch_put_read(a[0..20], 0) == 0;
+}
+
+test a_resent_message_never_makes_a_second_line {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    assert cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const hi : [5]u8 = [104, 101, 108, 108, 111];
+    assert cl_out_add(la[0..T_LOG], hi[0..5], 10) == 1;
+    const one : [1]u32 = [0];
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]) == CH_RX_NEW;
+    assert cl_count(lb[0..T_LOG]) == 1;
+    // the ACK was lost: the sender sends it again, the receiver ACKs again and adds nothing
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]) == CH_RX_DUP;
+    assert ch_rx_acks(CH_RX_DUP);
+    assert cl_count(lb[0..T_LOG]) == 1;
+    assert cl_unread(lb[0..T_LOG]) == 1;
+    // a long message in three parts, the middle one twice and out of order
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 5);
+    assert cl_out_add(la[0..T_LOG], t[0..1500], 20) == 2;
+    const ord : [4]u32 = [1, 1, 2, 0];
+    assert t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], ord[0..2]) == CH_RX_DUP;
+    assert t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], ord[2..3]) == CH_RX_PART;
+    assert cl_count(lb[0..T_LOG]) == 1;
+    assert t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], ord[3..4]) == CH_RX_NEW;
+    assert cl_count(lb[0..T_LOG]) == 2;
+    assert cl_len(lb[0..T_LOG], 1) == 1500;
+    assert cl_text(lb[0..T_LOG], 1)[0] == t[0] and cl_text(lb[0..T_LOG], 1)[1499] == t[1499];
+    assert cl_text(lb[0..T_LOG], 1)[700] == t[700];
+    // every part again after the line exists: duplicates, the slot was freed
+    const all : [3]u32 = [0, 1, 2];
+    assert t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], all[0..3]) == CH_RX_DUP;
+    assert cl_count(lb[0..T_LOG]) == 2;
+    assert get32(asm[0..CA_LEN], 0) == 0;
+}
+
+test incoming_lines_stand_in_the_order_they_were_sent {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const x : [1]u8 = [120];
+    const y : [1]u8 = [121];
+    const z : [1]u8 = [122];
+    cl_out_add(la[0..T_LOG], x[0..1], 1);
+    cl_out_add(la[0..T_LOG], y[0..1], 2);
+    cl_out_add(la[0..T_LOG], z[0..1], 3);
+    const one : [1]u32 = [0];
+    // 1 and 3 arrive, B answers, then 2 arrives after its resend
+    t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    t_carry(la[0..T_LOG], 2, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    const ok : [2]u8 = [111, 107];
+    cl_out_add(lb[0..T_LOG], ok[0..2], 4);
+    t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    assert cl_count(lb[0..T_LOG]) == 4;
+    assert cl_count_dir(lb[0..T_LOG], CH_DIR_IN) == 3 and cl_count_dir(lb[0..T_LOG], CH_DIR_OUT) == 1;
+    assert cl_msg(lb[0..T_LOG], 0) == 1 and cl_dir(lb[0..T_LOG], 0) == CH_DIR_IN;
+    assert cl_msg(lb[0..T_LOG], 1) == 2 and cl_dir(lb[0..T_LOG], 1) == CH_DIR_IN;
+    assert cl_text(lb[0..T_LOG], 1)[0] == 121;
+    assert cl_msg(lb[0..T_LOG], 2) == 3 and cl_dir(lb[0..T_LOG], 2) == CH_DIR_IN;
+    assert cl_dir(lb[0..T_LOG], 3) == CH_DIR_OUT;
+    assert cl_in_pos(lb[0..T_LOG], 9) == 4;
+}
+
+test acks_make_a_line_delivered_and_a_read_makes_it_read {
+    var la : [16296]u8 = undefined;
+    cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 1);
+    const hi : [2]u8 = [104, 105];
+    assert cl_out_add(la[0..T_LOG], t[0..1500], 1) == 1;
+    assert cl_out_add(la[0..T_LOG], hi[0..2], 2) == 2;
+    assert cl_state(la[0..T_LOG], 0) == CH_S_PENDING;
+    assert cl_due(la[0..T_LOG], 0, 100) == CH_R_SEND;
+    cl_mark_sent(la[0..T_LOG], 0, 100);
+    assert cl_state(la[0..T_LOG], 0) == CH_S_SENT;
+    var a : [20]u8 = undefined;
+    ch_put_ack(a[0..20], 1, 0);
+    assert ch_rx_ack(la[0..T_LOG], a[0..20]);
+    ch_put_ack(a[0..20], 1, 2);
+    assert ch_rx_ack(la[0..T_LOG], a[0..20]);
+    assert cl_state(la[0..T_LOG], 0) == CH_S_SENT;
+    assert cl_part_due(la[0..T_LOG], 0, 1);
+    assert cl_part_due(la[0..T_LOG], 0, 0) == false;
+    // the same ACK twice changes nothing; an ACK of a message never sent changes nothing
+    assert ch_rx_ack(la[0..T_LOG], a[0..20]) == false;
+    ch_put_ack(a[0..20], 9, 0);
+    assert ch_rx_ack(la[0..T_LOG], a[0..20]) == false;
+    ch_put_ack(a[0..20], 1, 1);
+    assert ch_rx_ack(la[0..T_LOG], a[0..20]);
+    assert cl_state(la[0..T_LOG], 0) == CH_S_DELIVERED;
+    assert cl_due(la[0..T_LOG], 0, 99999) == CH_R_WAIT;
+    assert cl_pending(la[0..T_LOG]) == 1;
+    ch_put_read(a[0..20], 1);
+    assert ch_rx_read(la[0..T_LOG], a[0..20]) == 1;
+    assert cl_state(la[0..T_LOG], 0) == CH_S_READ;
+    assert cl_state(la[0..T_LOG], 1) == CH_S_PENDING;
+    ch_put_read(a[0..20], 2);
+    assert ch_rx_read(la[0..T_LOG], a[0..20]) == 1;
+    assert ch_rx_read(la[0..T_LOG], a[0..20]) == 0;
+}
+
+test a_line_without_its_ack_goes_again_every_two_seconds_five_times {
+    assert ch_retry(0, 0, 0) == CH_R_SEND;
+    assert ch_retry(1999, 0, 1) == CH_R_WAIT;
+    assert ch_retry(2000, 0, 1) == CH_R_SEND;
+    assert ch_retry(2000, 0, 4) == CH_R_SEND;
+    assert ch_retry(2000, 0, 5) == CH_R_GIVEUP;
+    assert ch_retry(1999, 0, 5) == CH_R_WAIT;
+    // a clock that went back waits instead of sending at once
+    assert ch_retry(5, 10, 1) == CH_R_WAIT;
+    var la : [16296]u8 = undefined;
+    cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    const hi : [2]u8 = [104, 105];
+    cl_out_add(la[0..T_LOG], hi[0..2], 1);
+    var now : u64 = 1000;
+    var sends : u32 = 0;
+    while (now < 30000) {
+        if (cl_due(la[0..T_LOG], 0, now) == CH_R_SEND) {
+            cl_mark_sent(la[0..T_LOG], 0, now);
+            sends = sends + 1;
+        }
+        now = now + 100;
+    }
+    assert sends == CH_TRIES;
+    assert cl_state(la[0..T_LOG], 0) == CH_S_FAILED;
+    assert cl_pending(la[0..T_LOG]) == 0;
+    // the next session sends it again
+    assert cl_session_start(la[0..T_LOG]) == 1;
+    assert cl_state(la[0..T_LOG], 0) == CH_S_PENDING and cl_tries(la[0..T_LOG], 0) == 0;
+    assert cl_due(la[0..T_LOG], 0, 40000) == CH_R_SEND;
+}
+
+test unread_counts_incoming_lines_until_the_chat_is_opened {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const x : [1]u8 = [120];
+    const one : [1]u32 = [0];
+    assert cl_open_read(lb[0..T_LOG]) == 0;
+    cl_out_add(la[0..T_LOG], x[0..1], 1);
+    cl_out_add(la[0..T_LOG], x[0..1], 2);
+    cl_out_add(la[0..T_LOG], x[0..1], 3);
+    t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    t_carry(la[0..T_LOG], 1, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    cl_out_add(lb[0..T_LOG], x[0..1], 4);
+    assert cl_unread(lb[0..T_LOG]) == 2;
+    assert cl_open_read(lb[0..T_LOG]) == 2;
+    assert cl_unread(lb[0..T_LOG]) == 0;
+    assert cl_open_read(lb[0..T_LOG]) == 0;
+    t_carry(la[0..T_LOG], 2, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]);
+    assert cl_unread(lb[0..T_LOG]) == 1;
+    assert cl_open_read(lb[0..T_LOG]) == 3;
+}
+
+test a_full_log_keeps_the_newest_lines_and_a_trimmed_message_stays_a_duplicate {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    cl_init(la[0..T_LOG], T_B[0..10], 1);
+    cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const one : [1]u32 = [0];
+    var k : u32 = 0;
+    while (k < 10) {
+        var c : [1]u8 = undefined;
+        c[0] = 48 + @as(u8, @intCast(k));
+        assert cl_out_add(la[0..T_LOG], c[0..1], @as(u64, k)) == k + 1;
+        assert cl_count(la[0..T_LOG]) == 1;
+        assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], one[0..1]) == CH_RX_NEW;
+        k = k + 1;
+    }
+    assert cl_count(lb[0..T_LOG]) == T_CAP;
+    assert cl_msg(lb[0..T_LOG], 0) == 3;
+    assert cl_text(lb[0..T_LOG], 7)[0] == 57;
+    assert cl_floor(lb[0..T_LOG]) == 2;
+    // message 2 sent again long after it was trimmed: still a duplicate
+    var p : [720]u8 = undefined;
+    const two : [1]u8 = [49];
+    const n : usize = ch_put_text(p[0..720], 2, 0, 1, two[0..1]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_DUP;
+    assert cl_count(lb[0..T_LOG]) == T_CAP;
+    cl_trim(lb[0..T_LOG], 3);
+    assert cl_count(lb[0..T_LOG]) == 3 and cl_msg(lb[0..T_LOG], 0) == 8 and cl_floor(lb[0..T_LOG]) == 7;
+}
+
+test the_file_reads_back_and_a_damaged_one_is_refused {
+    var la : [16296]u8 = undefined;
+    cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 7);
+    const hi : [2]u8 = [104, 105];
+    cl_out_add(la[0..T_LOG], t[0..1500], 5);
+    cl_out_add(la[0..T_LOG], hi[0..2], 6);
+    var a : [20]u8 = undefined;
+    cl_mark_sent(la[0..T_LOG], 0, 7);
+    ch_put_ack(a[0..20], 1, 0);
+    ch_rx_ack(la[0..T_LOG], a[0..20]);
+    ch_put_ack(a[0..20], 1, 1);
+    ch_rx_ack(la[0..T_LOG], a[0..20]);
+    ch_put_ack(a[0..20], 1, 2);
+    ch_rx_ack(la[0..T_LOG], a[0..20]);
+    var f : [4000]u8 = undefined;
+    const n : usize = cf_encode(la[0..T_LOG], f[0..4000]);
+    assert n == CF_HDR + CF_REC + 1500 + CF_REC + 2 + 4;
+    var lc : [16296]u8 = undefined;
+    cl_init(lc[0..T_LOG], T_B[0..10], T_CAP);
+    assert cf_decode(f[0..n], lc[0..T_LOG]) == CF_OK;
+    assert cl_count(lc[0..T_LOG]) == 2 and cl_last_out(lc[0..T_LOG]) == 2;
+    assert cl_state(lc[0..T_LOG], 0) == CH_S_DELIVERED and cl_acked(lc[0..T_LOG], 0) == 7;
+    assert cl_state(lc[0..T_LOG], 1) == CH_S_PENDING;
+    assert cl_text(lc[0..T_LOG], 0)[1499] == t[1499] and cl_time(lc[0..T_LOG], 1) == 6;
+    // the next message continues the numbering
+    assert cl_out_add(lc[0..T_LOG], hi[0..2], 8) == 3;
+    // a smaller log keeps the newest line
+    var ld : [16296]u8 = undefined;
+    cl_init(ld[0..T_LOG], T_B[0..10], 1);
+    assert cf_decode(f[0..n], ld[0..T_LOG]) == CF_OK;
+    assert cl_count(ld[0..T_LOG]) == 1 and cl_msg(ld[0..T_LOG], 0) == 2;
+    // one flipped byte, a cut file, another friend's file, a wrong magic
+    f[100] = f[100] ^ 1;
+    assert cf_decode(f[0..n], lc[0..T_LOG]) == CF_CRC;
+    f[100] = f[100] ^ 1;
+    assert cf_decode(f[0..n - 1], lc[0..T_LOG]) == CF_CRC;
+    assert cf_decode(f[0..10], lc[0..T_LOG]) == CF_SHORT;
+    var le : [16296]u8 = undefined;
+    cl_init(le[0..T_LOG], T_A[0..10], T_CAP);
+    assert cf_decode(f[0..n], le[0..T_LOG]) == CF_PEER;
+    f[0] = 85;
+    assert cf_decode(f[0..n], lc[0..T_LOG]) == CF_MAGIC;
+    var nm : [24]u8 = undefined;
+    assert cf_name(T_B[0..10], nm[0..24]) == 24;
+    assert nm[0] == 48 and nm[1] == 49 and nm[18] == 48 and nm[19] == 98 and nm[20] == 46 and nm[23] == 55;
+}
+
+test a_session_closes_when_idle_and_dialling_at_once_is_broken_by_the_fingerprint {
+    assert ch_idle_close(30000, 0, 0);
+    assert ch_idle_close(29999, 0, 0) == false;
+    assert ch_idle_close(90000, 0, 1) == false;
+    assert CH_SILENT_MS > CH_IDLE_MS;
+    assert ch_redial_ms(T_A[0..10], T_B[0..10]) == 1000;
+    assert ch_redial_ms(T_B[0..10], T_A[0..10]) == 3000;
+    assert ch_redial_ms(T_A[0..10], T_A[0..10]) == 2000;
+}
+
+test the_little_endian_helpers_round_trip_the_edges {
+    var b : [8]u8 = undefined;
+    put32(b[0..8], 0, 4294967295);
+    assert b[0] == 255 and b[3] == 255 and get32(b[0..8], 0) == 4294967295 and get16(b[0..8], 2) == 65535;
+    put32(b[0..8], 2, 16909060);
+    assert b[2] == 4 and b[3] == 3 and b[4] == 2 and b[5] == 1;
+    assert get16(b[0..8], 2) == 772 and get16(b[0..8], 4) == 258 and get32(b[0..8], 2) == 16909060;
+    // the bytes outside the written window stay
+    assert b[0] == 255 and b[1] == 255;
+    put32(b[0..8], 4, 0);
+    assert get32(b[0..8], 4) == 0 and get16(b[0..8], 0) == 65535;
+    // a 16-bit value above 65535 keeps its low half only
+    put16(b[0..8], 0, 65536 + 513);
+    assert b[0] == 1 and b[1] == 2 and get16(b[0..8], 0) == 513;
+}
+
+test copy_moves_exactly_n_bytes_and_zero_moves_none {
+    const src : [6]u8 = [1, 2, 3, 4, 5, 6];
+    var dst : [8]u8 = [9, 9, 9, 9, 9, 9, 9, 9];
+    copy(dst[0..8], 1, src[0..6], 2, 3);
+    assert dst[0] == 9 and dst[1] == 3 and dst[2] == 4 and dst[3] == 5 and dst[4] == 9;
+    copy(dst[0..8], 0, src[0..6], 0, 0);
+    assert dst[0] == 9 and dst[1] == 3;
+    // up to the last byte of both
+    copy(dst[0..8], 7, src[0..6], 5, 1);
+    assert dst[7] == 6 and dst[6] == 9;
+}
+
+test the_magic_is_t27osch_newline_and_each_byte_counts {
+    var b : [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    assert magic_ok(b[0..8]) == false;
+    put_magic(b[0..8]);
+    assert b[0] == 84 and b[1] == 50 and b[2] == 55 and b[3] == 79 and b[4] == 83 and b[5] == 67 and b[6] == 72 and b[7] == 10;
+    assert magic_ok(b[0..8]);
+    var i : usize = 0;
+    while (i < 8) {
+        var c : [8]u8 = undefined;
+        copy(c[0..8], 0, b[0..8], 0, 8);
+        c[i] = c[i] + 1;
+        assert magic_ok(c[0..8]) == false;
+        i = i + 1;
+    }
+}
+
+test the_payload_header_puts_every_field_where_the_reader_looks {
+    var p : [20]u8 = undefined;
+    put_phdr(p[0..20], CH_K_TEXT, 4294967295, 2, 3, 1099511627776 + 5, 700);
+    assert p[0] == 1 and p[1] == 0 and get32(p[0..20], 2) == 4294967295 and get16(p[0..20], 6) == 2 and get16(p[0..20], 8) == 3;
+    assert get_u64(p[0..20], 10) == 1099511627781 and get16(p[0..20], 18) == 700;
+    put_phdr(p[0..20], CH_K_READ, 7, 0, 0, 0, 0);
+    assert p[0] == 3 and get32(p[0..20], 2) == 7 and get_u64(p[0..20], 10) == 0 and get16(p[0..20], 18) == 0;
+    assert ch_kind(p[0..20]) == CH_K_READ;
+}
+
+test line_offsets_and_header_fields_follow_the_layout {
+    assert ln(0) == CL_HDR and ln(1) == CL_HDR + CL_LINE and ln(7) == 40 + 7 * 2032;
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], 8);
+    assert cl_cap(log[0..T_LOG]) == 8 and cl_count(log[0..T_LOG]) == 0;
+    assert cl_init(log[0..T_LOG], T_A[0..10], 1) and cl_cap(log[0..T_LOG]) == 1;
+    assert cl_init(log[0..T_LOG], T_A[0..10], CL_KEEP) == false and cl_cap(log[0..T_LOG]) == 1;
+    assert cl_init(log[0..T_LOG], T_A[0..10], 0) == false;
+    assert cl_init(log[0..T_LOG], T_A[0..9], 8) == false;
+    var big : [1]u8 = undefined;
+    assert cl_init(log[0..T_LOG - 1], T_A[0..10], 8) == false and big.len == 1;
+}
+
+test cl_parts_counts_the_parts_of_each_stored_line {
+    var log : [16296]u8 = undefined;
+    var t : [2000]u8 = undefined;
+    t_fill(t[0..2000], 2000, 1);
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    assert cl_out_add(log[0..T_LOG], t[0..700], 1) == 1;
+    assert cl_out_add(log[0..T_LOG], t[0..701], 2) == 2;
+    assert cl_out_add(log[0..T_LOG], t[0..1400], 3) == 3;
+    assert cl_out_add(log[0..T_LOG], t[0..1401], 4) == 4;
+    assert cl_out_add(log[0..T_LOG], t[0..2000], 5) == 5;
+    assert cl_parts(log[0..T_LOG], 0) == 1 and cl_parts(log[0..T_LOG], 1) == 2 and cl_parts(log[0..T_LOG], 2) == 2;
+    assert cl_parts(log[0..T_LOG], 3) == 3 and cl_parts(log[0..T_LOG], 4) == 3;
+    assert cl_count(log[0..T_LOG]) == 5;
+}
+
+test cl_find_looks_for_the_direction_and_the_number_together {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    assert cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const x : [1]u8 = [120];
+    const zero : [1]u32 = [0];
+    assert cl_find(lb[0..T_LOG], CH_DIR_OUT, 1) == CL_NONE;
+    // lb sends message 1, and receives message 1 of the other side: the same number in two directions
+    assert cl_out_add(lb[0..T_LOG], x[0..1], 1) == 1;
+    assert cl_out_add(la[0..T_LOG], x[0..1], 2) == 1;
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], zero[0..1]) == CH_RX_NEW;
+    assert cl_find(lb[0..T_LOG], CH_DIR_OUT, 1) == 0 and cl_find(lb[0..T_LOG], CH_DIR_IN, 1) == 1;
+    assert cl_find(lb[0..T_LOG], CH_DIR_IN, 2) == CL_NONE and cl_find(lb[0..T_LOG], 0, 1) == CL_NONE;
+}
+
+test cl_open_out_is_true_only_for_outgoing_lines_still_waiting {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    assert cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    const x : [1]u8 = [120];
+    const zero : [1]u32 = [0];
+    assert cl_out_add(lb[0..T_LOG], x[0..1], 1) == 1;
+    assert cl_open_out(lb[0..T_LOG], 0);
+    set_state(lb[0..T_LOG], 0, CH_S_SENT);
+    assert cl_state(lb[0..T_LOG], 0) == CH_S_SENT and cl_open_out(lb[0..T_LOG], 0);
+    set_state(lb[0..T_LOG], 0, CH_S_DELIVERED);
+    assert cl_open_out(lb[0..T_LOG], 0) == false;
+    set_state(lb[0..T_LOG], 0, CH_S_READ);
+    assert cl_open_out(lb[0..T_LOG], 0) == false;
+    set_state(lb[0..T_LOG], 0, CH_S_FAILED);
+    assert cl_open_out(lb[0..T_LOG], 0) == false;
+    // an incoming line is never an open outgoing one, whatever its state
+    assert cl_out_add(la[0..T_LOG], x[0..1], 2) == 1;
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], zero[0..1]) == CH_RX_NEW;
+    assert cl_dir(lb[0..T_LOG], 1) == CH_DIR_IN and cl_open_out(lb[0..T_LOG], 1) == false;
+    set_state(lb[0..T_LOG], 1, CH_S_PENDING);
+    assert cl_open_out(lb[0..T_LOG], 1) == false;
+}
+
+test cl_drop_oldest_shifts_the_rest_and_raises_the_floor_only_for_incoming {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    assert cl_drop_oldest(log[0..T_LOG]) == false and cl_count(log[0..T_LOG]) == 0;
+    const a : [1]u8 = [97];
+    const b : [2]u8 = [98, 98];
+    assert cl_out_add(log[0..T_LOG], a[0..1], 1) == 1;
+    assert cl_out_add(log[0..T_LOG], b[0..2], 2) == 2;
+    // an outgoing oldest line leaves the floor at 0 and the second line moves to the front whole
+    assert cl_drop_oldest(log[0..T_LOG]);
+    assert cl_count(log[0..T_LOG]) == 1 and cl_floor(log[0..T_LOG]) == 0;
+    assert cl_msg(log[0..T_LOG], 0) == 2 and cl_len(log[0..T_LOG], 0) == 2 and cl_time(log[0..T_LOG], 0) == 2;
+    assert cl_text(log[0..T_LOG], 0)[0] == 98 and cl_text(log[0..T_LOG], 0)[1] == 98;
+    assert cl_drop_oldest(log[0..T_LOG]) and cl_count(log[0..T_LOG]) == 0 and cl_drop_oldest(log[0..T_LOG]) == false;
+    // an incoming oldest line raises the floor to its number
+    assert cl_in_put(log[0..T_LOG], 9, 5, a[0..1]);
+    assert cl_in_put(log[0..T_LOG], 12, 6, b[0..2]);
+    assert cl_drop_oldest(log[0..T_LOG]);
+    assert cl_floor(log[0..T_LOG]) == 9 and cl_count(log[0..T_LOG]) == 1 and cl_msg(log[0..T_LOG], 0) == 12;
+    // a floor never goes down: the line numbered below it (a late insert cannot get here) does not lower it
+    assert cl_drop_oldest(log[0..T_LOG]) and cl_floor(log[0..T_LOG]) == 12;
+}
+
+test cl_have_in_knows_lines_and_everything_at_or_below_the_floor {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    const a : [1]u8 = [97];
+    assert cl_have_in(log[0..T_LOG], 1) == false and cl_have_in(log[0..T_LOG], 0);
+    assert cl_in_put(log[0..T_LOG], 4, 1, a[0..1]);
+    assert cl_have_in(log[0..T_LOG], 4) and cl_have_in(log[0..T_LOG], 3) == false and cl_have_in(log[0..T_LOG], 5) == false;
+    // an outgoing line of the same number is not an incoming one
+    assert cl_out_add(log[0..T_LOG], a[0..1], 2) == 1;
+    assert cl_have_in(log[0..T_LOG], 1) == false;
+    assert cl_drop_oldest(log[0..T_LOG]);
+    assert cl_floor(log[0..T_LOG]) == 4 and cl_have_in(log[0..T_LOG], 4) and cl_have_in(log[0..T_LOG], 1);
+    assert cl_have_in(log[0..T_LOG], 5) == false;
+}
+
+test cl_in_put_orders_by_number_refuses_duplicates_and_keeps_out_what_the_cap_pushed_below_the_floor {
+    var log : [4104]u8 = undefined;
+    assert cl_init(log[0..4104], T_A[0..10], 2);
+    const a : [1]u8 = [97];
+    const b : [1]u8 = [98];
+    const c : [1]u8 = [99];
+    assert cl_in_put(log[0..4104], 5, 10, a[0..1]);
+    assert cl_in_put(log[0..4104], 5, 11, b[0..1]) == false and cl_count(log[0..4104]) == 1 and cl_text(log[0..4104], 0)[0] == 97;
+    // a lower number is put before: 3, 5
+    assert cl_in_put(log[0..4104], 3, 9, b[0..1]);
+    assert cl_count(log[0..4104]) == 2 and cl_msg(log[0..4104], 0) == 3 and cl_msg(log[0..4104], 1) == 5;
+    assert cl_state(log[0..4104], 0) == CH_S_DELIVERED and cl_dir(log[0..4104], 0) == CH_DIR_IN and cl_time(log[0..4104], 0) == 9;
+    // the log is full (cap 2): 4 pushes 3 out, raising the floor to 3, and lands between nothing and 5
+    assert cl_in_put(log[0..4104], 4, 12, c[0..1]);
+    assert cl_floor(log[0..4104]) == 3 and cl_count(log[0..4104]) == 2 and cl_msg(log[0..4104], 0) == 4 and cl_msg(log[0..4104], 1) == 5;
+    // full again: 2 is older than the floor the drop of 4 will raise, so it stays out and the drop still happened
+    assert cl_in_put(log[0..4104], 2, 13, c[0..1]) == false;
+    assert cl_floor(log[0..4104]) == 3 and cl_count(log[0..4104]) == 2;
+    // full again: 7 pushes 4 out
+    assert cl_in_put(log[0..4104], 7, 14, c[0..1]);
+    assert cl_floor(log[0..4104]) == 4 and cl_msg(log[0..4104], 0) == 5 and cl_msg(log[0..4104], 1) == 7;
+}
+
+test put_line_opens_a_hole_clears_the_text_head_and_counts_the_line {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    var t : [800]u8 = undefined;
+    t_fill(t[0..800], 800, 3);
+    const a : [1]u8 = [97];
+    put_line(log[0..T_LOG], 0, CH_DIR_OUT, CH_S_SENT, 6, 77, t[0..800]);
+    assert cl_count(log[0..T_LOG]) == 1 and cl_len(log[0..T_LOG], 0) == 800 and cl_parts(log[0..T_LOG], 0) == 2;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_SENT and cl_msg(log[0..T_LOG], 0) == 6 and cl_time(log[0..T_LOG], 0) == 77;
+    assert cl_text(log[0..T_LOG], 0)[799] == t[799];
+    // a line put in front moves the first one down with all of its text, and its own header starts clean
+    put_line(log[0..T_LOG], 0, CH_DIR_IN, CH_S_DELIVERED, 2, 5, a[0..1]);
+    assert cl_count(log[0..T_LOG]) == 2 and cl_msg(log[0..T_LOG], 0) == 2 and cl_msg(log[0..T_LOG], 1) == 6;
+    assert cl_len(log[0..T_LOG], 1) == 800 and cl_text(log[0..T_LOG], 1)[0] == t[0] and cl_text(log[0..T_LOG], 1)[799] == t[799];
+    assert cl_tries(log[0..T_LOG], 0) == 0 and cl_acked(log[0..T_LOG], 0) == 0 and cl_parts(log[0..T_LOG], 0) == 1;
+    assert cl_text(log[0..T_LOG], 0).len == 1 and cl_text(log[0..T_LOG], 0)[0] == 97;
+}
+
+test the_assembly_slot_offset_is_the_slot_size_times_the_slot_number {
+    assert ca(0) == 0 and ca(1) == CA_SLOT and ca(CA_SLOTS) == CA_LEN and ca(3) == 6048;
+    // two messages in parts keep their slots apart: each completes with its own text
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    assert cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 4);
+    var u : [1500]u8 = undefined;
+    t_fill(u[0..1500], 1500, 9);
+    assert cl_out_add(la[0..T_LOG], t[0..1500], 1) == 1;
+    assert cl_out_add(la[0..T_LOG], u[0..1500], 2) == 2;
+    var p : [720]u8 = undefined;
+    var n : usize = ch_put_text(p[0..720], 1, 0, 1, t[0..1500]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_PART;
+    n = ch_put_text(p[0..720], 2, 0, 2, u[0..1500]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_PART;
+    assert get32(asm[0..CA_LEN], ca(0)) == 1 and get32(asm[0..CA_LEN], ca(1)) == 2 and get32(asm[0..CA_LEN], ca(2)) == 0;
+    n = ch_put_text(p[0..720], 2, 2, 2, u[0..1500]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_PART;
+    n = ch_put_text(p[0..720], 2, 1, 2, u[0..1500]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_NEW;
+    assert get32(asm[0..CA_LEN], ca(1)) == 0 and get32(asm[0..CA_LEN], ca(0)) == 1;
+}
+
+test put_line_in_front_of_a_sent_line_leaves_no_trace_of_the_line_that_moved_down {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    const a : [1]u8 = [97];
+    assert cl_out_add(log[0..T_LOG], a[0..1], 1) == 1;
+    cl_mark_sent(log[0..T_LOG], 0, 72057594037927936 + 5);
+    log[ln(0) + LN_ACKED] = 7;
+    assert cl_tries(log[0..T_LOG], 0) == 1 and cl_acked(log[0..T_LOG], 0) == 7;
+    put_line(log[0..T_LOG], 0, CH_DIR_OUT, CH_S_PENDING, 9, 3, a[0..1]);
+    assert cl_tries(log[0..T_LOG], 0) == 0 and cl_acked(log[0..T_LOG], 0) == 0;
+    assert get_u64(log[0..T_LOG], ln(0) + LN_LAST) == 0;
+    // the line that moved down keeps its own marks
+    assert cl_tries(log[0..T_LOG], 1) == 1 and cl_acked(log[0..T_LOG], 1) == 7 and get_u64(log[0..T_LOG], ln(1) + LN_LAST) == 72057594037927941;
+}
+
+test cl_in_put_refuses_a_message_the_drop_for_room_just_put_below_the_floor {
+    var log : [4104]u8 = undefined;
+    assert cl_init(log[0..4104], T_A[0..10], 2);
+    const a : [1]u8 = [97];
+    assert cl_in_put(log[0..4104], 5, 1, a[0..1]);
+    assert cl_in_put(log[0..4104], 7, 2, a[0..1]);
+    assert cl_floor(log[0..4104]) == 0 and cl_have_in(log[0..4104], 4) == false;
+    // 4 is unknown, but making room drops 5 and the floor becomes 5: 4 is older than everything kept
+    assert cl_in_put(log[0..4104], 4, 3, a[0..1]) == false;
+    assert cl_floor(log[0..4104]) == 5 and cl_count(log[0..4104]) == 1 and cl_msg(log[0..4104], 0) == 7;
+    assert cl_have_in(log[0..4104], 4);
+}
+
+test a_message_numbered_0xffffffff_never_becomes_the_floor_and_the_next_message_still_comes_in {
+    var log : [4104]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    const a : [1]u8 = [97];
+    var f : [720]u8 = undefined;
+    // on receipt: 0xFFFFFFFF and 2^31 are refused (no ACK), 2^31 - 1 is the last number taken
+    assert cl_init(log[0..4104], T_A[0..10], 2);
+    var n : usize = ch_put_text(f[0..720], 4294967295, 0, 9, a[0..1]);
+    assert n > 0 and ch_rx_text(log[0..4104], asm[0..CA_LEN], f[0..n]) == CH_RX_BAD;
+    n = ch_put_text(f[0..720], CH_MSG_TOP, 0, 9, a[0..1]);
+    assert ch_rx_text(log[0..4104], asm[0..CA_LEN], f[0..n]) == CH_RX_BAD and cl_count(log[0..4104]) == 0;
+    n = ch_put_text(f[0..720], CH_MSG_TOP - 1, 0, 9, a[0..1]);
+    assert ch_rx_text(log[0..4104], asm[0..CA_LEN], f[0..n]) == CH_RX_NEW;
+    // a line numbered 0xFFFFFFFF that is pushed out (a log of one) leaves the floor where it was
+    assert cl_init(log[0..4104], T_A[0..10], 1);
+    assert cl_in_put(log[0..4104], 4294967295, 1, a[0..1]);
+    assert cl_in_put(log[0..4104], 3, 2, a[0..1]);
+    assert cl_floor(log[0..4104]) == 0 and cl_count(log[0..4104]) == 1 and cl_msg(log[0..4104], 0) == 3;
+    // and the friend's next normal message comes in
+    n = ch_put_text(f[0..720], 4, 0, 9, a[0..1]);
+    assert ch_rx_text(log[0..4104], asm[0..CA_LEN], f[0..n]) == CH_RX_NEW and cl_msg(log[0..4104], 0) == 4;
+    // a sender stops below 2^31 (no wrap to 0)
+    assert cl_init(log[0..4104], T_A[0..10], 2);
+    put32(log[0..4104], 16, CH_MSG_TOP - 2);
+    assert cl_out_add(log[0..4104], a[0..1], 5) == CH_MSG_TOP - 1;
+    assert cl_out_add(log[0..4104], a[0..1], 6) == 0;
+    put32(log[0..4104], 16, 4294967295);
+    assert cl_out_add(log[0..4104], a[0..1], 7) == 0;
+    // on read: a floor, a last number or a line number at or above 2^31 is a file that does not check
+    assert cl_init(log[0..4104], T_A[0..10], 2);
+    assert cl_in_put(log[0..4104], 6, 1, a[0..1]);
+    var b : [200]u8 = undefined;
+    const bn : usize = cf_encode(log[0..4104], b[0..200]);
+    var lc : [4104]u8 = undefined;
+    assert cl_init(lc[0..4104], T_A[0..10], 2) and cf_decode(b[0..bn], lc[0..4104]) == CF_OK;
+    var k : usize = 0;
+    while (k < 3) {
+        var g : [200]u8 = undefined;
+        copy(g[0..200], 0, b[0..200], 0, bn);
+        var at : usize = 20;
+        if (k == 0) { at = 16; }
+        if (k == 2) { at = CF_HDR + 4; }
+        put32(g[0..200], at, 4294967295);
+        put32(g[0..200], bn - 4, crc32(g[0..200], bn - 4));
+        assert cl_init(lc[0..4104], T_A[0..10], 2) and cf_decode(g[0..bn], lc[0..4104]) == CF_BAD;
+        k = k + 1;
+    }
+}
+
+test cl_drop_oldest_moves_the_last_byte_of_a_full_length_line {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    var t : [2000]u8 = undefined;
+    t_fill(t[0..2000], 2000, 2);
+    t[1999] = 122;
+    const a : [1]u8 = [97];
+    assert cl_out_add(log[0..T_LOG], a[0..1], 1) == 1;
+    assert cl_out_add(log[0..T_LOG], t[0..2000], 2) == 2;
+    t[1999] = 123;
+    assert cl_out_add(log[0..T_LOG], t[0..2000], 3) == 3;
+    assert cl_drop_oldest(log[0..T_LOG]);
+    assert cl_len(log[0..T_LOG], 0) == 2000 and cl_text(log[0..T_LOG], 0)[1999] == 122 and cl_text(log[0..T_LOG], 0)[0] == t[0];
+    assert cl_len(log[0..T_LOG], 1) == 2000 and cl_text(log[0..T_LOG], 1)[1999] == 123;
+}
+
+test ch_put_part_frames_one_cut_part_as_ch_put_text_would_and_refuses_what_cannot_be_one {
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 5);
+    var a : [720]u8 = undefined;
+    var b : [720]u8 = undefined;
+    // each part cut by hand is byte for byte the part ch_put_text cuts from the whole text
+    var k : u32 = 0;
+    while (k < 3) {
+        const from : usize = @as(usize, k) * CH_PART_MAX;
+        var n : usize = 1500 - from;
+        if (n > CH_PART_MAX) { n = CH_PART_MAX; }
+        const na : usize = ch_put_part(a[0..720], 11, k, 3, 1099511627781, t[from..from + n]);
+        const nb : usize = ch_put_text(b[0..720], 11, k, 1099511627781, t[0..1500]);
+        assert na == nb and na == CH_PHDR + n;
+        var i : usize = 0;
+        while (i < na) { assert a[i] == b[i]; i = i + 1; }
+        assert ch_kind(a[0..na]) == CH_K_TEXT;
+        k = k + 1;
+    }
+    // Cyrillic bytes travel unchanged; the last part may be short
+    const ru : [12]u8 = [208, 191, 209, 128, 208, 184, 208, 178, 208, 181, 209, 130];
+    const nr : usize = ch_put_part(a[0..720], 4, 1, 2, 9, ru[0..12]);
+    assert nr == CH_PHDR + 12 and ch_kind(a[0..nr]) == CH_K_TEXT;
+    assert ch_msg(a[0..nr]) == 4 and ch_part(a[0..nr]) == 1 and ch_parts(a[0..nr]) == 2 and ch_time(a[0..nr]) == 9 and ch_len(a[0..nr]) == 12;
+    assert a[CH_PHDR] == 208 and a[CH_PHDR + 11] == 130;
+    // a short part before the last frames, but the reader refuses it: the cut is the caller's job
+    const ns : usize = ch_put_part(a[0..720], 4, 0, 2, 9, ru[0..12]);
+    assert ns == CH_PHDR + 12 and ch_kind(a[0..ns]) == 0;
+    // what cannot be a part: no message, no parts, more than three, a part past the end, no bytes, too many bytes
+    assert ch_put_part(a[0..720], 0, 0, 1, 9, ru[0..12]) == 0;
+    assert ch_put_part(a[0..720], 4, 0, 0, 9, ru[0..12]) == 0;
+    assert ch_put_part(a[0..720], 4, 0, 4, 9, t[0..700]) == 0;
+    assert ch_put_part(a[0..720], 4, 2, 2, 9, ru[0..12]) == 0;
+    assert ch_put_part(a[0..720], 4, 0, 1, 9, ru[0..0]) == 0;
+    assert ch_put_part(a[0..720], 4, 0, 1, 9, t[0..701]) == 0;
+    assert ch_put_part(a[0..720], 4, 0, 1, 9, t[0..700]) == CH_PAYLOAD_MAX;
+    // out must hold the header and every byte: one byte short is nothing, exactly enough is the part
+    assert ch_put_part(a[0..31], 4, 0, 1, 9, ru[0..12]) == 0;
+    assert ch_put_part(a[0..32], 4, 0, 1, 9, ru[0..12]) == 32;
+}
+
+test cl_set_floor_moves_what_counts_as_already_received_and_touches_nothing_else {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    const a : [1]u8 = [97];
+    assert cl_out_add(log[0..T_LOG], a[0..1], 1) == 1;
+    assert cl_have_in(log[0..T_LOG], 9) == false;
+    cl_set_floor(log[0..T_LOG], 9);
+    assert cl_floor(log[0..T_LOG]) == 9 and cl_have_in(log[0..T_LOG], 9) and cl_have_in(log[0..T_LOG], 1);
+    assert cl_have_in(log[0..T_LOG], 10) == false;
+    assert cl_count(log[0..T_LOG]) == 1 and cl_cap(log[0..T_LOG]) == T_CAP and cl_last_out(log[0..T_LOG]) == 1;
+    // a group clears it back to 0 after a drop: nothing above 0 is known again
+    cl_set_floor(log[0..T_LOG], 0);
+    assert cl_floor(log[0..T_LOG]) == 0 and cl_have_in(log[0..T_LOG], 1) == false;
+    cl_set_floor(log[0..T_LOG], 4294967295);
+    assert cl_floor(log[0..T_LOG]) == 4294967295 and cl_have_in(log[0..T_LOG], 4294967295);
+    assert cl_count(log[0..T_LOG]) == 1 and cl_msg(log[0..T_LOG], 0) == 1;
+}
+
+test cl_line_at_is_where_the_readers_find_line_i {
+    assert cl_line_at(0) == CL_HDR and cl_line_at(1) == CL_HDR + CL_LINE;
+    // the end of the last line of a log of cap lines is the size that log needs
+    assert cl_line_at(@as(usize, T_CAP)) == cl_bytes(T_CAP) and cl_line_at(@as(usize, CL_KEEP)) == cl_bytes(CL_KEEP);
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    const x : [2]u8 = [120, 121];
+    const y : [3]u8 = [208, 175, 33];
+    assert cl_out_add(log[0..T_LOG], x[0..2], 1) == 1;
+    assert cl_out_add(log[0..T_LOG], y[0..3], 2) == 2;
+    assert log[cl_line_at(1) + CL_TEXT] == 208 and log[cl_line_at(1) + CL_TEXT + 2] == 33;
+    assert log[cl_line_at(0) + CL_TEXT + 1] == 121;
+    assert @as(u32, log[cl_line_at(1)]) == cl_dir(log[0..T_LOG], 1) and @as(u32, log[cl_line_at(1) + 1]) == cl_state(log[0..T_LOG], 1);
+}
+
+test cl_last_send_and_cl_restart_follow_each_send_and_a_restart_clears_the_tries {
+    var log : [16296]u8 = undefined;
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    const a : [1]u8 = [97];
+    const b : [1]u8 = [98];
+    assert cl_out_add(log[0..T_LOG], a[0..1], 7) == 1;
+    assert cl_out_add(log[0..T_LOG], b[0..1], 8) == 2;
+    // never sent: 0, so the first due check sends at once
+    assert cl_last_send(log[0..T_LOG], 0) == 0 and cl_due(log[0..T_LOG], 0, 1) == CH_R_SEND;
+    cl_mark_sent(log[0..T_LOG], 0, 5000);
+    assert cl_last_send(log[0..T_LOG], 0) == 5000 and cl_state(log[0..T_LOG], 0) == CH_S_SENT;
+    assert cl_due(log[0..T_LOG], 0, 6999) == CH_R_WAIT and cl_due(log[0..T_LOG], 0, 7000) == CH_R_SEND;
+    cl_mark_sent(log[0..T_LOG], 0, 72057594037927941);
+    assert cl_last_send(log[0..T_LOG], 0) == 72057594037927941 and cl_tries(log[0..T_LOG], 0) == 2;
+    // the other line is not touched
+    assert cl_last_send(log[0..T_LOG], 1) == 0 and cl_tries(log[0..T_LOG], 1) == 0;
+    // a restart: PENDING, no tries, never sent, the text and the number stay
+    set_state(log[0..T_LOG], 0, CH_S_FAILED);
+    cl_restart(log[0..T_LOG], 0);
+    assert cl_state(log[0..T_LOG], 0) == CH_S_PENDING and cl_tries(log[0..T_LOG], 0) == 0 and cl_last_send(log[0..T_LOG], 0) == 0;
+    assert cl_msg(log[0..T_LOG], 0) == 1 and cl_text(log[0..T_LOG], 0)[0] == 97 and cl_time(log[0..T_LOG], 0) == 7;
+    assert cl_due(log[0..T_LOG], 0, 1) == CH_R_SEND;
+    assert cl_state(log[0..T_LOG], 1) == CH_S_PENDING and cl_msg(log[0..T_LOG], 1) == 2;
+}
+
+test a_receiver_that_lost_its_half_built_message_gets_every_part_again_in_the_next_session {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP);
+    assert cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 6);
+    assert cl_out_add(la[0..T_LOG], t[0..1500], 1) == 1;
+    // part 0 arrives and is acknowledged; the others are lost
+    const zero : [1]u32 = [0];
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], zero[0..1]) == CH_RX_PART;
+    var ack : [20]u8 = undefined;
+    assert ch_put_ack(ack[0..20], 1, 0) == CH_PHDR;
+    assert ch_rx_ack(la[0..T_LOG], ack[0..20]);
+    assert cl_part_due(la[0..T_LOG], 0, 0) == false and cl_part_due(la[0..T_LOG], 0, 1);
+    // the receiver restarts: its assembly is empty again; a new session comes up
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_session_start(la[0..T_LOG]) == 1;
+    // the sender sends every part it now holds as due; the receiver must end with the message
+    var r : u32 = CH_RX_BAD;
+    var k : u32 = 0;
+    while (k < cl_parts(la[0..T_LOG], 0)) {
+        if (cl_part_due(la[0..T_LOG], 0, k)) {
+            var p : [720]u8 = undefined;
+            const n : usize = ch_put_text(p[0..720], 1, k, cl_time(la[0..T_LOG], 0), cl_text(la[0..T_LOG], 0));
+            r = ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]);
+        }
+        k = k + 1;
+    }
+    assert r == CH_RX_NEW;
+    assert cl_count(lb[0..T_LOG]) == 1 and cl_len(lb[0..T_LOG], 0) == 1500 and cl_text(lb[0..T_LOG], 0)[0] == t[0];
+}
+
+test a_third_part_that_would_make_the_message_longer_than_2000_bytes_is_refused_and_writes_nothing {
+    var log : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    assert cl_init(log[0..T_LOG], T_A[0..10], T_CAP);
+    var t : [700]u8 = undefined;
+    t_fill(t[0..700], 700, 2);
+    // a third part may carry 600 bytes at most: 2 * 700 + 600 = CH_MSG_MAX
+    var p : [720]u8 = undefined;
+    put_phdr(p[0..720], CH_K_TEXT, 5, 2, 3, 1, 600);
+    copy(p[0..720], CH_PHDR, t[0..700], 0, 600);
+    assert ch_kind(p[0..CH_PHDR + 600]) == CH_K_TEXT;
+    put_phdr(p[0..720], CH_K_TEXT, 5, 2, 3, 1, 601);
+    assert ch_kind(p[0..CH_PHDR + 601]) == 0;
+    put_phdr(p[0..720], CH_K_TEXT, 5, 2, 3, 1, 700);
+    copy(p[0..720], CH_PHDR, t[0..700], 0, 700);
+    assert ch_kind(p[0..CH_PHDR + 700]) == 0;
+    assert ch_put_part(p[0..720], 5, 2, 3, 1, t[0..700]) == 0;
+    assert ch_put_part(p[0..720], 5, 2, 3, 1, t[0..600]) == CH_PHDR + 600;
+    // the hostile third part after two full ones: refused, the next slot and the log untouched
+    var q : [720]u8 = undefined;
+    assert ch_put_part(q[0..720], 5, 0, 3, 1, t[0..700]) == CH_PHDR + 700;
+    assert ch_rx_text(log[0..T_LOG], asm[0..CA_LEN], q[0..CH_PHDR + 700]) == CH_RX_PART;
+    assert ch_put_part(q[0..720], 5, 1, 3, 1, t[0..700]) == CH_PHDR + 700;
+    assert ch_rx_text(log[0..T_LOG], asm[0..CA_LEN], q[0..CH_PHDR + 700]) == CH_RX_PART;
+    put_phdr(p[0..720], CH_K_TEXT, 5, 2, 3, 1, 700);
+    assert ch_rx_text(log[0..T_LOG], asm[0..CA_LEN], p[0..CH_PHDR + 700]) == CH_RX_BAD;
+    assert cl_count(log[0..T_LOG]) == 0;
+    var k : usize = CA_SLOT;
+    var clean : bool = true;
+    while (k < CA_SLOT + 16) {
+        if (asm[k] != 0) { clean = false; }
+        k = k + 1;
+    }
+    assert clean;
+}
+
+fn t_zero(b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < b.len) {
+        if (b[i] != 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test every_hidden_range_starts_and_ends_where_it_says_and_its_neighbours_are_text {
+    // C0: 0 and 31 are hidden, the space is not (LF and TAB are taken by ch_clean before this test)
+    assert ch_hidden(0) and ch_hidden(9) and ch_hidden(10) and ch_hidden(31);
+    assert ch_hidden(32) == false and ch_hidden(126) == false;
+    // DEL and C1 (128..159); 160 (no-break space) is text
+    assert ch_hidden(127) and ch_hidden(128) and ch_hidden(159);
+    assert ch_hidden(160) == false;
+    // U+061C, not its neighbours
+    assert ch_hidden(1564) and ch_hidden(1563) == false and ch_hidden(1565) == false;
+    // U+200B..U+200F
+    assert ch_hidden(8202) == false and ch_hidden(8203) and ch_hidden(8207) and ch_hidden(8208) == false;
+    // U+202A..U+202E
+    assert ch_hidden(8233) == false and ch_hidden(8234) and ch_hidden(8238) and ch_hidden(8239) == false;
+    // U+2060..U+206F
+    assert ch_hidden(8287) == false and ch_hidden(8288) and ch_hidden(8303) and ch_hidden(8304) == false;
+    // U+FEFF only; the line breaks U+2028 and U+2029 are not hidden (ch_clean makes them LF)
+    assert ch_hidden(65279) and ch_hidden(65278) == false and ch_hidden(65280) == false;
+    assert ch_hidden(8232) == false and ch_hidden(8233) == false;
+    // Cyrillic, an emoji and the last code point are text
+    assert ch_hidden(1044) == false and ch_hidden(128512) == false and ch_hidden(1114111) == false;
+}
+
+test the_cleaner_drops_bidi_zero_width_and_controls_and_keeps_text_cyrillic_and_emoji {
+    var o : [2100]u8 = undefined;
+    // "A" U+202E "B": the override that would show the rest backwards goes
+    const rlo : [5]u8 = [65, 226, 128, 174, 66];
+    assert ch_clean(rlo[0..5], o[0..2100]) == 2 and o[0] == 65 and o[1] == 66;
+    // "x" U+200B U+200F U+202A U+2066 U+2069 U+FEFF U+0085 ^A ESC DEL U+061C U+2060 "y" -> "xy"
+    const hid : [30]u8 = [120, 226, 128, 139, 226, 128, 143, 226, 128, 170, 226, 129, 166, 226, 129, 169, 239, 187, 191, 194, 133, 1, 27, 127, 216, 156, 226, 129, 160, 121];
+    assert ch_utf8_ok(hid[0..30]);
+    assert ch_clean(hid[0..30], o[0..2100]) == 2 and o[0] == 120 and o[1] == 121;
+    // "Hi " U+1F600, Cyrillic "Da", and the neighbours of the dropped ranges stay: U+2010, U+202F, U+2070, U+00A0
+    const keep : [22]u8 = [72, 105, 32, 240, 159, 152, 128, 208, 148, 208, 176, 226, 128, 144, 226, 128, 175, 226, 129, 176, 194, 160];
+    assert ch_clean(keep[0..22], o[0..2100]) == 22 and ck_same(o[0..22], keep[0..22]);
+    assert ch_plain(keep[0..22]) and ch_plain(rlo[0..5]) == false and ch_plain(hid[0..30]) == false;
+    // CR LF, a lone CR, U+2029 and U+2028 are one LF each; a TAB is a space
+    const br : [16]u8 = [97, 13, 10, 98, 13, 99, 9, 100, 226, 128, 169, 101, 226, 128, 168, 102];
+    const brc : [11]u8 = [97, 10, 98, 10, 99, 32, 100, 10, 101, 10, 102];
+    assert ch_clean(br[0..16], o[0..2100]) == 11 and ck_same(o[0..11], brc[0..11]);
+    // cut after the last whole character that fits: "abc" + Cyrillic "D" + "e" into 4 bytes keeps "abc"
+    const cut : [6]u8 = [97, 98, 99, 208, 148, 101];
+    assert ch_clean(cut[0..6], o[0..4]) == 3;
+    assert ch_clean(cut[0..6], o[0..5]) == 5 and o[3] == 208 and o[4] == 148;
+    // and never past CH_MSG_MAX
+    var big : [2010]u8 = undefined;
+    t_fill(big[0..2010], 2010, 0);
+    assert ch_clean(big[0..2010], o[0..2100]) == CH_MSG_MAX;
+}
+
+test what_is_sent_and_what_comes_in_is_cleaned_before_it_is_a_line {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP) and cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    ck_wipe(asm[0..CA_LEN]);
+    // sent: the override goes, and a text that is nothing but marks is refused
+    const rlo : [5]u8 = [65, 226, 128, 174, 66];
+    const only : [6]u8 = [226, 128, 174, 226, 128, 139];
+    assert cl_out_add(la[0..T_LOG], only[0..6], 10) == 0;
+    assert cl_out_add(la[0..T_LOG], rlo[0..5], 10) == 1;
+    assert cl_len(la[0..T_LOG], 0) == 2 and cl_text(la[0..T_LOG], 0)[1] == 66;
+    // a text longer than a message is refused as before (the person sees it), one of CH_MSG_MAX is kept whole
+    var big : [2300]u8 = undefined;
+    t_fill(big[0..2300], 2300, 1);
+    assert cl_out_add(la[0..T_LOG], big[0..2300], 11) == 0;
+    assert cl_out_add(la[0..T_LOG], big[0..CH_MSG_MAX], 11) == 2 and cl_len(la[0..T_LOG], 1) == CH_MSG_MAX;
+    // received from a client that does not clean: the line holds no override
+    var p : [720]u8 = undefined;
+    var n : usize = ch_put_text(p[0..720], 1, 0, 20, rlo[0..5]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_NEW;
+    assert cl_len(lb[0..T_LOG], 0) == 2 and cl_text(lb[0..T_LOG], 0)[0] == 65 and cl_text(lb[0..T_LOG], 0)[1] == 66;
+    // one with nothing left is kept as U+FFFD (it was received and is ACKed)
+    n = ch_put_text(p[0..720], 2, 0, 21, only[0..6]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_NEW;
+    assert cl_len(lb[0..T_LOG], 1) == 3 and cl_text(lb[0..T_LOG], 1)[0] == 239;
+    // a file written before this rule is cleaned as it is read (the file's layout is the same)
+    var f : [4200]u8 = undefined;
+    var lc : [16296]u8 = undefined;
+    assert cl_init(lc[0..T_LOG], T_A[0..10], T_CAP);
+    lb[cl_line_at(0) + CL_TEXT + 1] = 9;
+    const fn1 : usize = cf_encode(lb[0..T_LOG], f[0..4200]);
+    assert fn1 > 0 and cf_decode(f[0..fn1], lc[0..T_LOG]) == CF_OK;
+    assert cl_text(lc[0..T_LOG], 0)[1] == 32;
+}
+
+test the_assembly_slot_keeps_no_plaintext_after_a_message_is_joined_or_refused {
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    assert cl_init(la[0..T_LOG], T_B[0..10], T_CAP) and cl_init(lb[0..T_LOG], T_A[0..10], T_CAP);
+    ck_wipe(asm[0..CA_LEN]);
+    var t : [1500]u8 = undefined;
+    t_fill(t[0..1500], 1500, 8);
+    assert cl_out_add(la[0..T_LOG], t[0..1500], 30) == 1;
+    const order : [3]u32 = [0, 1, 2];
+    assert t_carry(la[0..T_LOG], 0, lb[0..T_LOG], asm[0..CA_LEN], order[0..3]) == CH_RX_NEW;
+    assert t_zero(asm[0..CA_LEN]);
+    // two parts that do not join into UTF-8 (the first ends inside a Cyrillic letter, the second is ASCII)
+    var a : [700]u8 = undefined;
+    t_fill(a[0..700], 700, 2);
+    a[699] = 208;
+    const b : [1]u8 = [97];
+    var p : [720]u8 = undefined;
+    var n : usize = ch_put_part(p[0..720], 5, 0, 2, 40, a[0..700]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_PART;
+    assert t_zero(asm[0..CA_LEN]) == false;
+    n = ch_put_part(p[0..720], 5, 1, 2, 40, b[0..1]);
+    assert ch_rx_text(lb[0..T_LOG], asm[0..CA_LEN], p[0..n]) == CH_RX_BAD;
+    assert t_zero(asm[0..CA_LEN]);
+}

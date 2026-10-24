@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/id_backup_probe.t27 -- a program that shows id_backup_host.t27 working (Refs gHashTag/t27#11560).
+// Not part of the app. One line per fact; exit 0 only when every check of the role passed. Never prints a password or
+// a private key; fingerprints are public (they are the T27-... key).
+// ID_ROLE (default check):
+//   check    PBKDF2-HMAC-SHA256 against published vectors (RFC 7914 section 11; the password/salt vectors c=1 and
+//            c=4096), then a fresh P-256 identity (keysync_host.ks_gen_pair) sealed and opened in memory: the right
+//            password opens it with the same fingerprint, a wrong one and an empty one are refused, every one of the
+//            297 bytes flipped is refused, a cut file and a padded file are refused. Sealed at BK_ITER_MIN rounds so the
+//            297 openings take seconds; the app writes BK_ITER.
+//   save     bkh_save: this HOME's ~/.t27os/identity to ~/Desktop/t27-backup-<date>.t27id with T27OS_ID_PASSWORD;
+//            prints the path, size, mode and the identity's fingerprint.
+//   restore  bkh_open of T27OS_ID_RESTORE with T27OS_ID_PASSWORD; with T27OS_ID_CONFIRM=yes also bkh_replace; prints
+//            the verdict, the fingerprint in the backup and the fingerprint of ~/.t27os/identity afterwards.
+// Build (Apple silicon):
+//   t27b build specs/t27os/id_backup_probe.t27 -o ibp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -o ibp ibp.o
+module T27osIdBackupProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::keysync::unhex;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::id_build;
+use t27os::peer_identity_host::ih_fingerprint;
+use t27os::peer_identity_host::ih_slurp;
+use t27os::id_backup::BK_OK;
+use t27os::id_backup::BK_AUTH;
+use t27os::id_backup::BK_SHORT;
+use t27os::id_backup::BK_LONG;
+use t27os::id_backup::BK_PASS_BAD;
+use t27os::id_backup::BK_LEN;
+use t27os::id_backup::BK_PT_LEN;
+use t27os::id_backup::BK_ITER_MIN;
+use t27os::id_backup::BK_N_SAVED;
+use t27os::id_backup::BK_PATH_MAX;
+use t27os::id_backup::bk_pt_build;
+use t27os::id_backup::bk_wipe;
+use t27os::id_backup::bk_iter_of;
+use t27os::id_backup::bk_mode_ok;
+use t27os::id_backup_host::bkh_pbkdf;
+use t27os::id_backup_host::bkh_seal;
+use t27os::id_backup_host::bkh_unseal;
+use t27os::id_backup_host::bkh_save;
+use t27os::id_backup_host::bkh_open;
+use t27os::id_backup_host::bkh_replace;
+use t27os::id_backup_host::bkh_current;
+use t27os::id_backup_host::bkh_mode;
+use t27os::id_backup_host::bkh_env;
+use t27os::id_backup_host::bkh_env_pass;
+use t27os::id_backup_host::bkh_fp_hex;
+
+fn ibp_say(s: []const u8) -> void { sys_write(1, s, @as(u64, s.len)); }
+
+fn ibp_check(s: []const u8, ok: bool) -> bool {
+    if (ok) { ibp_say("ok   "); } else { ibp_say("FAIL "); }
+    ibp_say(s);
+    ibp_say("\n");
+    return ok;
+}
+
+fn ibp_same(a: []const u8, b: []const u8, n: usize) -> bool {
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        d = d | @as(u32, a[i] ^ b[i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+fn ibp_vector(label: []const u8, pass: []const u8, salt: []const u8, c: u32, want_hex: []const u8) -> bool {
+    var want : [32]u8 = undefined;
+    const wn : usize = unhex(want_hex, want[0..32]);
+    var got : [32]u8 = undefined;
+    const ok : bool = bkh_pbkdf(pass, pass.len, salt, c, got[0..32]);
+    return ibp_check(label, ok and wn == 32 and ibp_same(got[0..32], want[0..32], 32));
+}
+
+fn ibp_line_fp(label: []const u8, fp: []const u8) -> void {
+    var h : [20]u8 = undefined;
+    bkh_fp_hex(fp, h[0..20]);
+    ibp_say(label);
+    ibp_say(h[0..20]);
+    ibp_say("\n");
+}
+
+fn ibp_check_role() -> bool {
+    var all : bool = true;
+    all = ibp_vector("PBKDF2-HMAC-SHA256 passwd/salt c=1 (RFC 7914 s.11, first 32 bytes)", "passwd", "salt", 1, "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc") and all;
+    all = ibp_vector("PBKDF2-HMAC-SHA256 password/salt c=1", "password", "salt", 1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b") and all;
+    all = ibp_vector("PBKDF2-HMAC-SHA256 password/salt c=4096", "password", "salt", 4096, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a") and all;
+    // a fresh identity, sealed and opened in memory
+    var priv : [97]u8 = undefined;
+    var pubk : [65]u8 = undefined;
+    all = ibp_check("a fresh P-256 pair from the OS", ks_gen_pair(priv[0..97], pubk[0..65])) and all;
+    var id : [207]u8 = undefined;
+    const nick : str = "probe";
+    all = ibp_check("its identity file builds", id_build(pubk[0..65], priv[0..97], nick, nick.len, id[0..207]) == ID_LEN) and all;
+    bk_wipe(priv[0..97], 0, 97);
+    var fp : [10]u8 = undefined;
+    ih_fingerprint(pubk[0..65], fp[0..10]);
+    var pt : [237]u8 = undefined;
+    all = ibp_check("the plaintext builds", bk_pt_build(id[0..207], 1792000000, 1792700000, fp[0..10], pt[0..237]) == BK_PT_LEN) and all;
+    const pass : str = "correct horse 27";
+    var f : [298]u8 = undefined;
+    all = ibp_check("sealed (AES-128-GCM under a PBKDF2 key, header as AAD)", bkh_seal(pass, pass.len, pt[0..237], BK_ITER_MIN, f[0..297]) == BK_OK) and all;
+    all = ibp_check("the file names its rounds", bk_iter_of(f[0..297]) == BK_ITER_MIN) and all;
+    var back : [237]u8 = undefined;
+    var fp2 : [10]u8 = undefined;
+    const v : u32 = bkh_unseal(f[0..297], BK_LEN, pass, pass.len, back[0..237], fp2[0..10]);
+    all = ibp_check("the right password opens it: same bytes, same fingerprint", v == BK_OK and ibp_same(back[0..237], pt[0..237], BK_PT_LEN) and ibp_same(fp2[0..10], fp[0..10], FP_BYTES)) and all;
+    const wrong : str = "correct horse 28";
+    const vw : u32 = bkh_unseal(f[0..297], BK_LEN, wrong, wrong.len, back[0..237], fp2[0..10]);
+    var z : u32 = 0;
+    var i : usize = 0;
+    while (i < BK_PT_LEN) {
+        z = z | @as(u32, back[i]);
+        i = i + 1;
+    }
+    all = ibp_check("a wrong password: BK_AUTH and nothing left in the output", vw == BK_AUTH and z == 0) and all;
+    all = ibp_check("an empty password never reaches the key", bkh_open("/tmp/none.t27id", 15, pass, 0, back[0..237], fp2[0..10]) == BK_PASS_BAD) and all;
+    // every byte flipped
+    var refused : usize = 0;
+    var pos : usize = 0;
+    while (pos < BK_LEN) {
+        var g : [298]u8 = f;
+        g[pos] = g[pos] ^ 1;
+        if (bkh_unseal(g[0..297], BK_LEN, pass, pass.len, back[0..237], fp2[0..10]) != BK_OK) { refused = refused + 1; }
+        pos = pos + 1;
+    }
+    var line : [96]u8 = undefined;
+    var n : usize = put_bytes(line[0..96], 0, "every flipped byte refused: ");
+    n = put_dec(line[0..96], n, @as(u64, refused));
+    n = put_bytes(line[0..96], n, " of 297");
+    all = ibp_check(line[0..n], refused == BK_LEN) and all;
+    all = ibp_check("a cut file (296 bytes) is refused before any key", bkh_unseal(f[0..297], 296, pass, pass.len, back[0..237], fp2[0..10]) == BK_SHORT) and all;
+    f[297] = 0;
+    all = ibp_check("a padded file (298 bytes) is refused", bkh_unseal(f[0..298], 298, pass, pass.len, back[0..237], fp2[0..10]) == BK_LONG) and all;
+    bk_wipe(pt[0..237], 0, 237);
+    bk_wipe(back[0..237], 0, 237);
+    bk_wipe(id[0..207], 0, 207);
+    return all;
+}
+
+fn ibp_save_role() -> bool {
+    var pw : [80]u8 = undefined;
+    const pn : usize = bkh_env_pass(pw[0..80]);
+    var id : [208]u8 = undefined;
+    var fp : [10]u8 = undefined;
+    const have : bool = bkh_current(id[0..208], fp[0..10]);
+    bk_wipe(id[0..208], 0, 208);
+    if (have) { ibp_line_fp("identity fp ", fp[0..10]); }
+    var out : [BK_PATH_MAX]u8 = undefined;
+    const note : u32 = bkh_save(pw[0..80], pn, out[0..BK_PATH_MAX]);
+    bk_wipe(pw[0..80], 0, 80);
+    var line : [96]u8 = undefined;
+    var n : usize = put_bytes(line[0..96], 0, "save note ");
+    n = put_dec(line[0..96], n, @as(u64, note));
+    ibp_say(line[0..n]);
+    ibp_say("\n");
+    if (note != BK_N_SAVED) { return false; }
+    var pl : usize = 0;
+    while (pl < BK_PATH_MAX and out[pl] != 0) { pl = pl + 1; }
+    ibp_say("path ");
+    ibp_say(out[0..pl]);
+    ibp_say("\n");
+    var f : [400]u8 = undefined;
+    const got : i64 = ih_slurp(out[0..BK_PATH_MAX], f[0..400], 400);
+    const md : u32 = bkh_mode(out[0..BK_PATH_MAX]);
+    n = put_bytes(line[0..96], 0, "size ");
+    n = put_dec(line[0..96], n, @as(u64, @intCast(got)));
+    n = put_bytes(line[0..96], n, " mode ");
+    n = put_dec(line[0..96], n, @as(u64, (md >> 6) & 7));
+    n = put_dec(line[0..96], n, @as(u64, (md >> 3) & 7));
+    n = put_dec(line[0..96], n, @as(u64, md & 7));
+    ibp_say(line[0..n]);
+    ibp_say("\n");
+    return ibp_check("the backup is 297 bytes, mode 600", got == @as(i64, @intCast(BK_LEN)) and bk_mode_ok(md));
+}
+
+fn ibp_restore_role() -> bool {
+    var p : [BK_PATH_MAX]u8 = undefined;
+    const pn : usize = bkh_env("T27OS_ID_RESTORE", p[0..BK_PATH_MAX]);
+    var pw : [80]u8 = undefined;
+    const wn : usize = bkh_env_pass(pw[0..80]);
+    var cf : [8]u8 = undefined;
+    const cn : usize = bkh_env("T27OS_ID_CONFIRM", cf[0..8]);
+    const yes : bool = cn == 3 and cf[0] == 121 and cf[1] == 101 and cf[2] == 115;
+    var id : [208]u8 = undefined;
+    var fp : [10]u8 = undefined;
+    if (bkh_current(id[0..208], fp[0..10])) { ibp_line_fp("identity fp before ", fp[0..10]); } else { ibp_say("identity fp before (none)\n"); }
+    var pt : [237]u8 = undefined;
+    var nfp : [10]u8 = undefined;
+    const v : u32 = bkh_open(p[0..BK_PATH_MAX], pn, pw[0..80], wn, pt[0..237], nfp[0..10]);
+    bk_wipe(pw[0..80], 0, 80);
+    var line : [96]u8 = undefined;
+    var n : usize = put_bytes(line[0..96], 0, "open verdict ");
+    n = put_dec(line[0..96], n, @as(u64, v));
+    ibp_say(line[0..n]);
+    ibp_say("\n");
+    if (v != BK_OK) { return false; }
+    ibp_line_fp("backup fp ", nfp[0..10]);
+    if (yes == false) {
+        bk_wipe(pt[0..237], 0, 237);
+        ibp_say("not replaced (T27OS_ID_CONFIRM is not yes)\n");
+        return true;
+    }
+    const r : u32 = bkh_replace(pt[0..237]);
+    bk_wipe(pt[0..237], 0, 237);
+    n = put_bytes(line[0..96], 0, "replace ");
+    n = put_dec(line[0..96], n, @as(u64, r));
+    ibp_say(line[0..n]);
+    ibp_say("\n");
+    var after : [10]u8 = undefined;
+    const ok : bool = r == BK_OK and bkh_current(id[0..208], after[0..10]);
+    bk_wipe(id[0..208], 0, 208);
+    if (ok) { ibp_line_fp("identity fp after ", after[0..10]); }
+    return ibp_check("the identity now is the backup's", ok and ibp_same(after[0..10], nfp[0..10], FP_BYTES));
+}
+
+pub fn main() -> void {
+    var rb : [16]u8 = undefined;
+    const rn : usize = bkh_env("ID_ROLE", rb[0..16]);
+    var ok : bool = false;
+    if (rn == 4 and rb[0] == 115) {
+        ibp_say("id backup probe: save\n");
+        ok = ibp_save_role();
+    } else if (rn == 7 and rb[0] == 114) {
+        ibp_say("id backup probe: restore\n");
+        ok = ibp_restore_role();
+    } else {
+        ibp_say("id backup probe: check\n");
+        ok = ibp_check_role();
+    }
+    if (ok) { sys_exit(0); }
+    sys_exit(1);
+}

@@ -1,0 +1,1037 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/keys_health.t27 -- the live state of the cabinet's three key rows (OpenRouter, Z.ai, NVIDIA): the file
+// ~/.t27os/keyshealth.t27 and what the cabinet says from it. Pure decisions only: no @extern, no socket, no clock.
+// keys_health_host.t27 reads and writes the file and sends the checks on a queue of its own; account_view.t27 draws the
+// line; glass_window.t27 kicks the check when the cabinet is open and folds the packed records into the frame key.
+// Owner, 2026-10-22: the cabinet must say whether a key is live and when it was checked, without the KEYS tab.
+//
+// The file, version 2 (text, ASCII, no key value, no part of one):
+//   t27os-keyshealth v2 <count>
+//   <row> <code> <at> <ms> <keys> <limit> <left> <flags>     one line a record, <count> of them, at most KH_MAX
+//   crc <crc32>
+// row: 0 OpenRouter, 1 Z.ai, 2 NVIDIA (account_view row order); code: the HTTP status of the one check, 0 when nothing
+// answered in KH_TIMEOUT_S; at: unix seconds of the check (never 0 in a record); ms: how long it took; keys: how many
+// keys were sent (one request a provider: 1, or 0 when none was stored). limit, left: the spend limit and what is left
+// of it in cents (whole numbers, no float; 0 = none or no data, at most KH_CENTS_MAX), flags: KH_F_KNOWN (the answer's
+// limits were read, so limit 0 then means "no limit") and KH_F_FREE (a free tier key). Only OpenRouter says these; the
+// others keep 0. Version 1 (five numbers a line: no limit, left or flags) is still read, the fields are 0, and the next
+// write makes it version 2. crc: CRC-32 (IEEE, peer_identity crc32) of
+// every byte before the "crc" line, in decimal. Anything else (another magic or version, a record over the limit, a
+// row twice, a bad number, a wrong CRC, bytes after the crc line) is a broken file: it is renamed to keyshealth.t27.bad
+// and the state starts empty (kh_load_plan). Written to keyshealth.t27.tmp with mode 0600, then renamed over the file.
+//
+// The check (kh_due): at most once in KH_PERIOD_S (60 minutes) counted from the newest record, so a restart does not
+// send it again; one GET a provider, KH_TIMEOUT_S each, Bearer header: KH_URLS.
+// Flat namespace (the window build splices imported modules): every name here starts with kh_ / KH_.
+// Refs gHashTag/t27#11560.
+module T27osKeysHealth;
+
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::session_store::csv_field;
+use t27os::peer_identity::crc32;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+
+// ---------------------------------------------------------------- 1. the records
+
+/// The rows the cabinet shows; the records a file may hold (rows past KH_ROWS are kept for later providers).
+pub const KH_ROWS : usize = 3;
+pub const KH_MAX : usize = 8;
+/// Words of a record in the table: the code, when, how long, how many keys.
+pub const KH_W : usize = 7;
+pub const KH_CODE : usize = 0;
+pub const KH_AT : usize = 1;
+pub const KH_MS : usize = 2;
+pub const KH_KEYS : usize = 3;
+pub const KH_LIMIT : usize = 4;
+pub const KH_LEFT : usize = 5;
+pub const KH_FLAGS : usize = 6;
+/// The table: KH_MAX records of KH_W words.
+pub const KH_TABLE : usize = 56;
+pub const KH_F_FREE : u64 = 1;
+pub const KH_F_KNOWN : u64 = 2;
+pub const KH_CENTS_MAX : u64 = 1000000000000;
+
+pub const KH_PERIOD_S : u64 = 3600;
+pub const KH_STALE_S : u64 = 86400;
+pub const KH_TIMEOUT_S : u32 = 6;
+pub const KH_CODE_MAX : u64 = 999;
+pub const KH_MS_MAX : u64 = 3600000;
+
+pub const KH_VERSION : u64 = 2;
+pub const KH_MAGIC : str = "t27os-keyshealth v";
+pub const KH_LEAF : str = "keyshealth.t27";
+pub const KH_LEAF_TMP : str = "keyshealth.t27.tmp";
+pub const KH_LEAF_BAD : str = "keyshealth.t27.bad";
+/// The longest file: the head, KH_MAX lines of eight numbers, the crc line.
+pub const KH_TEXT_CAP : usize = 1024;
+
+/// What kh_parse returns for a broken file.
+pub const KH_BAD : u32 = 4294967295;
+
+/// The three checks, one GET a row, the key as a Bearer token (never in the URL).
+pub const KH_URLS : str = "https://openrouter.ai/api/v1/key,https://api.z.ai/api/paas/v4/models,https://integrate.api.nvidia.com/v1/models";
+
+pub fn kh_clear(recs: []u64) -> void {
+    var i : usize = 0;
+    while (i < recs.len) {
+        recs[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// Record row's check: `code` (0 = no answer), at `at` (unix s), `ms` long, `keys` sent. A row past KH_MAX is ignored.
+pub fn kh_set(recs: []u64, row: usize, code: u64, at: u64, ms: u64, keys: u64) -> void {
+    if (row >= KH_MAX or recs.len < (row + 1) * KH_W) { return; }
+    recs[row * KH_W + KH_CODE] = code;
+    recs[row * KH_W + KH_AT] = at;
+    recs[row * KH_W + KH_MS] = ms;
+    recs[row * KH_W + KH_KEYS] = keys;
+    recs[row * KH_W + KH_LIMIT] = 0;
+    recs[row * KH_W + KH_LEFT] = 0;
+    recs[row * KH_W + KH_FLAGS] = 0;
+}
+
+/// Record row's limits (a check's answer): `limit` and `left` in cents (over KH_CENTS_MAX is cut to it), `flags`
+/// (KH_F_*). Call it after kh_set, which zeroes them.
+pub fn kh_set_limits(recs: []u64, row: usize, limit: u64, left: u64, flags: u64) -> void {
+    if (row >= KH_MAX or recs.len < (row + 1) * KH_W) { return; }
+    var l : u64 = limit;
+    var r : u64 = left;
+    if (l > KH_CENTS_MAX) { l = KH_CENTS_MAX; }
+    if (r > KH_CENTS_MAX) { r = KH_CENTS_MAX; }
+    recs[row * KH_W + KH_LIMIT] = l;
+    recs[row * KH_W + KH_LEFT] = r;
+    recs[row * KH_W + KH_FLAGS] = flags & 3;
+}
+
+pub fn kh_get(recs: []const u64, row: usize, w: usize) -> u64 {
+    if (row >= KH_MAX or w >= KH_W or recs.len < (row + 1) * KH_W) { return 0; }
+    return recs[row * KH_W + w];
+}
+
+/// How many records the table holds (rows with a time).
+pub fn kh_count(recs: []const u64) -> usize {
+    var c : usize = 0;
+    var r : usize = 0;
+    while (r < KH_MAX) {
+        if (kh_get(recs, r, KH_AT) != 0) { c = c + 1; }
+        r = r + 1;
+    }
+    return c;
+}
+
+/// The newest check of the cabinet's rows; 0 when none.
+pub fn kh_newest(recs: []const u64) -> u64 {
+    var t : u64 = 0;
+    var r : usize = 0;
+    while (r < KH_ROWS) {
+        if (kh_get(recs, r, KH_AT) > t) { t = kh_get(recs, r, KH_AT); }
+        r = r + 1;
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------- 2. the file, version 2 (version 1 is read)
+
+/// The file for the table; its length (at most KH_TEXT_CAP; out needs that much).
+pub fn kh_text(recs: []const u64, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, KH_MAGIC);
+    n = put_dec(out, n, KH_VERSION);
+    out[n] = 32;
+    n = put_dec(out, n + 1, @as(u64, kh_count(recs)));
+    out[n] = 10;
+    n = n + 1;
+    var r : usize = 0;
+    while (r < KH_MAX) {
+        if (kh_get(recs, r, KH_AT) != 0) {
+            n = put_dec(out, n, @as(u64, r));
+            var w : usize = 0;
+            while (w < KH_W) {
+                out[n] = 32;
+                n = put_dec(out, n + 1, kh_get(recs, r, w));
+                w = w + 1;
+            }
+            out[n] = 10;
+            n = n + 1;
+        }
+        r = r + 1;
+    }
+    const c : u32 = crc32(out[0..n], n);
+    n = put_bytes(out, n, "crc ");
+    n = put_dec(out, n, @as(u64, c));
+    out[n] = 10;
+    return n + 1;
+}
+
+/// The decimal number at text[at] into v[0] (at most 19 digits, no sign, no space before it); the index after it,
+/// text.len + 1 when there is none.
+fn kh_num(text: []const u8, at: usize, v: []u64) -> usize {
+    var i : usize = at;
+    var x : u64 = 0;
+    while (i < text.len and text[i] >= 48 and text[i] <= 57 and i - at < 19) {
+        x = x * 10 + @as(u64, text[i] - 48);
+        i = i + 1;
+    }
+    if (i == at) { return text.len + 1; }
+    if (i < text.len and text[i] >= 48 and text[i] <= 57) { return text.len + 1; }
+    v[0] = x;
+    return i;
+}
+
+/// True when text[at] is byte b.
+fn kh_at(text: []const u8, at: usize, b: u8) -> bool {
+    return at < text.len and text[at] == b;
+}
+
+/// Read a version 1 or 2 file into recs (KH_TABLE words, cleared first); the number of records, KH_BAD when the file is
+/// broken (recs then cleared).
+pub fn kh_parse(text: []const u8, recs: []u64) -> u32 {
+    kh_clear(recs);
+    if (recs.len < KH_TABLE or text.len > KH_TEXT_CAP) { return KH_BAD; }
+    var i : usize = 0;
+    const ml : usize = KH_MAGIC.len;
+    if (text.len < ml) { return KH_BAD; }
+    while (i < ml) {
+        if (text[i] != KH_MAGIC[i]) { return KH_BAD; }
+        i = i + 1;
+    }
+    var v : [1]u64 = undefined;
+    i = kh_num(text, i, v[0..1]);
+    if (i > text.len or (v[0] != 1 and v[0] != KH_VERSION) or kh_at(text, i, 32) == false) { return KH_BAD; }
+    // version 1: five numbers a line; version 2: eight
+    var nf : usize = 5;
+    if (v[0] == KH_VERSION) { nf = 8; }
+    i = kh_num(text, i + 1, v[0..1]);
+    if (i > text.len or v[0] > @as(u64, KH_MAX) or kh_at(text, i, 10) == false) { return KH_BAD; }
+    const count : u64 = v[0];
+    i = i + 1;
+    var k : u64 = 0;
+    var bad : bool = false;
+    while (k < count and bad == false) {
+        var f : [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+        var w : usize = 0;
+        while (w < nf and bad == false) {
+            i = kh_num(text, i, v[0..1]);
+            var sep : u8 = 32;
+            if (w == nf - 1) { sep = 10; }
+            if (i > text.len or kh_at(text, i, sep) == false) {
+                bad = true;
+            } else {
+                f[w] = v[0];
+                i = i + 1;
+            }
+            w = w + 1;
+        }
+        if (bad == false) {
+            const row : u64 = f[0];
+            if (row >= @as(u64, KH_MAX) or f[1] > KH_CODE_MAX or f[2] == 0 or f[3] > KH_MS_MAX or f[4] > 255 or f[5] > KH_CENTS_MAX or f[6] > KH_CENTS_MAX or f[7] > 3) {
+                bad = true;
+            } else if (recs[@as(usize, row) * KH_W + KH_AT] != 0) {
+                bad = true;
+            } else {
+                kh_set(recs, @as(usize, row), f[1], f[2], f[3], f[4]);
+                kh_set_limits(recs, @as(usize, row), f[5], f[6], f[7]);
+            }
+        }
+        k = k + 1;
+    }
+    if (bad) {
+        kh_clear(recs);
+        return KH_BAD;
+    }
+    // the crc line covers every byte before it, and nothing follows it
+    const body : usize = i;
+    if (body + 4 > text.len or text[body] != 99 or text[body + 1] != 114 or text[body + 2] != 99 or text[body + 3] != 32) {
+        kh_clear(recs);
+        return KH_BAD;
+    }
+    i = kh_num(text, body + 4, v[0..1]);
+    if (i > text.len or kh_at(text, i, 10) == false or i + 1 != text.len or v[0] != @as(u64, crc32(text[0..body], body))) {
+        kh_clear(recs);
+        return KH_BAD;
+    }
+    return @as(u32, @intCast(count));
+}
+
+/// What a load does with what it read: KH_L_FRESH (no file: start empty, nothing renamed), KH_L_USE (the records),
+/// KH_L_QUARANTINE (a broken file: rename it to KH_LEAF_BAD, then start empty; never write over it).
+pub const KH_L_FRESH : u32 = 0;
+pub const KH_L_USE : u32 = 1;
+pub const KH_L_QUARANTINE : u32 = 2;
+
+pub fn kh_load_plan(exists: bool, parsed: u32) -> u32 {
+    if (exists == false) { return KH_L_FRESH; }
+    if (parsed == KH_BAD) { return KH_L_QUARANTINE; }
+    return KH_L_USE;
+}
+
+// ---------------------------------------------------------------- 3. when to check
+
+/// True when the check is due: none in flight, none queued by this run in the last KH_PERIOD_S (`kicked`, 0 = none:
+/// rows without a stored key write no record, so the records alone would ask again every pass), and no record of the
+/// cabinet's rows, or the newest is KH_PERIOD_S old, or it lies more than KH_PERIOD_S ahead of `now` (clock set back).
+pub fn kh_due(recs: []const u64, now: u64, busy: bool, kicked: u64) -> bool {
+    if (busy) { return false; }
+    if (kicked != 0 and now >= kicked and now - kicked < KH_PERIOD_S) { return false; }
+    const t : u64 = kh_newest(recs);
+    if (t == 0) { return true; }
+    if (now < t) { return t - now > KH_PERIOD_S; }
+    return now - t >= KH_PERIOD_S;
+}
+
+/// The URL of row's check into out; its length, 0 for a row without one.
+pub fn kh_url(row: usize, out: []u8) -> usize {
+    if (row >= KH_ROWS) { return 0; }
+    return csv_field(KH_URLS, @as(u32, @intCast(row)), out);
+}
+
+/// The Authorization value for `key`: "Bearer " and the key; 0 when it does not fit out.
+pub fn kh_bearer(key: []const u8, out: []u8) -> usize {
+    if (key.len == 0 or key.len + 7 > out.len) { return 0; }
+    const n : usize = put_bytes(out, 0, "Bearer ");
+    return put_bytes(out, n, key);
+}
+
+/// Milliseconds between two CFAbsoluteTime readings, 0 when the clock went back, capped at KH_MS_MAX.
+pub fn kh_ms(t0: f64, t1: f64) -> u64 {
+    if (t1 <= t0) { return 0; }
+    const d : f64 = (t1 - t0) * 1000.0;
+    if (d >= @as(f64, @floatFromInt(KH_MS_MAX))) { return KH_MS_MAX; }
+    return @as(u64, @intFromFloat(d));
+}
+
+// ---------------------------------------------------------------- 4. what the cabinet says
+
+pub const KH_S_NONE : u32 = 0;
+pub const KH_S_LIVE : u32 = 1;
+pub const KH_S_STALE : u32 = 2;
+pub const KH_S_REFUSED : u32 = 3;
+pub const KH_S_LIMITED : u32 = 4;
+pub const KH_S_DOWN : u32 = 5;
+pub const KH_S_ERROR : u32 = 6;
+
+/// The state of row at `now`: none (never checked), stale (the check is more than KH_STALE_S old, whatever it said),
+/// live (2xx), refused (401/403), rate limited (429), down (no answer), error (any other code).
+pub fn kh_state(recs: []const u64, row: usize, now: u64) -> u32 {
+    const at : u64 = kh_get(recs, row, KH_AT);
+    if (at == 0) { return KH_S_NONE; }
+    if (now > at and now - at > KH_STALE_S) { return KH_S_STALE; }
+    const c : u64 = kh_get(recs, row, KH_CODE);
+    if (c >= 200 and c < 300) { return KH_S_LIVE; }
+    if (c == 401 or c == 403) { return KH_S_REFUSED; }
+    if (c == 429) { return KH_S_LIMITED; }
+    if (c == 0) { return KH_S_DOWN; }
+    return KH_S_ERROR;
+}
+
+/// "just now", "2 min ago", "1 h ago", "1 day ago", "3 days ago".
+pub fn kh_ago_text(secs: u64, out: []u8) -> usize {
+    if (secs < 60) { return put_bytes(out, 0, "just now"); }
+    if (secs < 3600) { return put_bytes(out, put_dec(out, 0, secs / 60), " min ago"); }
+    if (secs < 86400) { return put_bytes(out, put_dec(out, 0, secs / 3600), " h ago"); }
+    const d : u64 = secs / 86400;
+    if (d == 1) { return put_bytes(out, 0, "1 day ago"); }
+    return put_bytes(out, put_dec(out, 0, d), " days ago");
+}
+
+/// Row's state after the key count, into out at `at`: "live (200, checked 2 min ago)", "stale (200, checked 3 days
+/// ago)", "refused (401, checked ...)", "rate limited (429, ...)", "no answer (network, checked ...)", "error (500,
+/// ...)", "not checked yet". The new end.
+pub fn kh_status(recs: []const u64, row: usize, now: u64, out: []u8, at: usize) -> usize {
+    const st : u32 = kh_state(recs, row, now);
+    if (st == KH_S_NONE) { return put_bytes(out, at, "not checked yet"); }
+    var n : usize = at;
+    if (st == KH_S_LIVE) { n = put_bytes(out, n, "live ("); }
+    if (st == KH_S_STALE) { n = put_bytes(out, n, "stale ("); }
+    if (st == KH_S_REFUSED) { n = put_bytes(out, n, "refused ("); }
+    if (st == KH_S_LIMITED) { n = put_bytes(out, n, "rate limited ("); }
+    if (st == KH_S_DOWN) { n = put_bytes(out, n, "no answer ("); }
+    if (st == KH_S_ERROR) { n = put_bytes(out, n, "error ("); }
+    const c : u64 = kh_get(recs, row, KH_CODE);
+    if (c == 0) { n = put_bytes(out, n, "network"); } else { n = put_dec(out, n, c); }
+    n = put_bytes(out, n, ", checked ");
+    const t : u64 = kh_get(recs, row, KH_AT);
+    var age : u64 = 0;
+    if (now > t) { age = now - t; }
+    n = n + kh_ago_text(age, out[n..out.len]);
+    return put_bytes(out, n, ")");
+}
+
+// ---------------------------------------------------------------- 5. the records in the window's byte region
+
+/// The cabinet's rows as bytes (draw() reads bytes; the frame key folds them, so a new record redraws the frame).
+pub const KH_PACK_LEN : usize = 168;
+
+pub fn kh_pack(recs: []const u64, out: []u8) -> void {
+    if (out.len < KH_PACK_LEN) { return; }
+    var r : usize = 0;
+    while (r < KH_ROWS) {
+        var w : usize = 0;
+        while (w < KH_W) {
+            put_u64(out, (r * KH_W + w) * 8, kh_get(recs, r, w));
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+}
+
+pub fn kh_unpack(b: []const u8, recs: []u64) -> void {
+    kh_clear(recs);
+    if (b.len < KH_PACK_LEN) { return; }
+    var r : usize = 0;
+    while (r < KH_ROWS) {
+        kh_set(recs, r, get_u64(b, (r * KH_W) * 8), get_u64(b, (r * KH_W + 1) * 8), get_u64(b, (r * KH_W + 2) * 8), get_u64(b, (r * KH_W + 3) * 8));
+        kh_set_limits(recs, r, get_u64(b, (r * KH_W + 4) * 8), get_u64(b, (r * KH_W + 5) * 8), get_u64(b, (r * KH_W + 6) * 8));
+        r = r + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 6. the limit and what is left (OpenRouter's key answer)
+
+fn kh_lit(body: []const u8, at: usize, lit: []const u8) -> bool {
+    if (at + lit.len > body.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (body[at + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The index of the value after `"key":` (spaces skipped) in the JSON body; body.len + 1 when the key is not there.
+fn kh_find(body: []const u8, key: []const u8) -> usize {
+    var pat : [24]u8 = undefined;
+    if (key.len > 20) { return body.len + 1; }
+    pat[0] = 34;
+    var k : usize = 0;
+    while (k < key.len) {
+        pat[k + 1] = key[k];
+        k = k + 1;
+    }
+    pat[key.len + 1] = 34;
+    pat[key.len + 2] = 58;
+    const pl : usize = key.len + 3;
+    var i : usize = 0;
+    while (i + pl <= body.len) {
+        if (kh_lit(body, i, pat[0..pl])) {
+            var j : usize = i + pl;
+            while (j < body.len and body[j] == 32) { j = j + 1; }
+            return j;
+        }
+        i = i + 1;
+    }
+    return body.len + 1;
+}
+
+pub const KH_V_NULL : u32 = 0;
+pub const KH_V_NUM : u32 = 1;
+pub const KH_V_TRUE : u32 = 2;
+pub const KH_V_FALSE : u32 = 3;
+pub const KH_V_BAD : u32 = 4;
+
+/// The JSON value at body[at]: null, true, false, or a plain decimal number into v[0] as cents (the third decimal
+/// and the rest dropped, a minus sign is 0: an overspent key has nothing left; no exponent; at most 13 integer
+/// digits; cut to KH_CENTS_MAX). Anything else is KH_V_BAD.
+pub fn kh_value(body: []const u8, at: usize, v: []u64) -> u32 {
+    v[0] = 0;
+    if (at >= body.len) { return KH_V_BAD; }
+    if (kh_lit(body, at, "null")) { return KH_V_NULL; }
+    if (kh_lit(body, at, "true")) { return KH_V_TRUE; }
+    if (kh_lit(body, at, "false")) { return KH_V_FALSE; }
+    var i : usize = at;
+    var neg : bool = false;
+    if (body[i] == 45) {
+        neg = true;
+        i = i + 1;
+    }
+    var ip : u64 = 0;
+    var nd : usize = 0;
+    while (i < body.len and body[i] >= 48 and body[i] <= 57 and nd < 13) {
+        ip = ip * 10 + @as(u64, body[i] - 48);
+        nd = nd + 1;
+        i = i + 1;
+    }
+    if (nd == 0) { return KH_V_BAD; }
+    var fr : u64 = 0;
+    if (i < body.len and body[i] == 46) {
+        i = i + 1;
+        var fd : usize = 0;
+        while (i < body.len and body[i] >= 48 and body[i] <= 57) {
+            if (fd == 0) { fr = fr + @as(u64, body[i] - 48) * 10; }
+            if (fd == 1) { fr = fr + @as(u64, body[i] - 48); }
+            fd = fd + 1;
+            i = i + 1;
+        }
+        if (fd == 0) { return KH_V_BAD; }
+    }
+    // the number ends at a separator: a digit past 13, an exponent, a letter make the value unreadable
+    if (i < body.len and body[i] != 44 and body[i] != 125 and body[i] != 32 and body[i] != 10 and body[i] != 13) { return KH_V_BAD; }
+    var c : u64 = ip * 100 + fr;
+    if (neg) { c = 0; }
+    if (c > KH_CENTS_MAX) { c = KH_CENTS_MAX; }
+    v[0] = c;
+    return KH_V_NUM;
+}
+
+/// OpenRouter's GET /api/v1/key answer: o[0] = data.limit, o[1] = data.limit_remaining (cents; null is 0, "no
+/// limit"), o[2] = flags (KH_F_KNOWN, and KH_F_FREE for is_free_tier true). False, o all 0, when the body does not
+/// carry a readable limit and is_free_tier: then the cabinet says nothing about money. The body's label (a key
+/// hint) is never copied.
+pub fn kh_or_parse(body: []const u8, o: []u64) -> bool {
+    o[0] = 0;
+    o[1] = 0;
+    o[2] = 0;
+    var v : [1]u64 = undefined;
+    const a : usize = kh_find(body, "limit");
+    if (a > body.len) { return false; }
+    const sa : u32 = kh_value(body, a, v[0..1]);
+    if (sa != KH_V_NUM and sa != KH_V_NULL) { return false; }
+    const lim : u64 = v[0];
+    var left : u64 = 0;
+    const b : usize = kh_find(body, "limit_remaining");
+    if (b <= body.len) {
+        const sb : u32 = kh_value(body, b, v[0..1]);
+        if (sb != KH_V_NUM and sb != KH_V_NULL) { return false; }
+        left = v[0];
+    }
+    const c : usize = kh_find(body, "is_free_tier");
+    if (c > body.len) { return false; }
+    const sc : u32 = kh_value(body, c, v[0..1]);
+    if (sc != KH_V_TRUE and sc != KH_V_FALSE) { return false; }
+    o[0] = lim;
+    o[1] = left;
+    o[2] = KH_F_KNOWN;
+    if (sc == KH_V_TRUE) { o[2] = KH_F_KNOWN + KH_F_FREE; }
+    return true;
+}
+
+/// Cents as money: "$99.71", "$0.05", "$100.00".
+pub fn kh_dollars(cents: u64, out: []u8, at: usize) -> usize {
+    var n : usize = put_bytes(out, at, "$");
+    n = put_dec(out, n, cents / 100);
+    out[n] = 46;
+    const c : u64 = cents % 100;
+    out[n + 1] = @as(u8, @intCast(48 + c / 10));
+    out[n + 2] = @as(u8, @intCast(48 + c % 10));
+    return n + 3;
+}
+
+/// What row says about money: "free tier" (a free key), "no limit" (the answer had no limit), "$99.71 left", and
+/// "no data" when no check read the limits (kh_status_left never prints that one).
+pub fn kh_left_text(recs: []const u64, row: usize, out: []u8, at: usize) -> usize {
+    const fl : u64 = kh_get(recs, row, KH_FLAGS);
+    if ((fl & KH_F_KNOWN) == 0) { return put_bytes(out, at, "no data"); }
+    if ((fl & KH_F_FREE) != 0) { return put_bytes(out, at, "free tier"); }
+    const lim : u64 = kh_get(recs, row, KH_LIMIT);
+    if (lim == 0) { return put_bytes(out, at, "no limit"); }
+    const n : usize = kh_dollars(kh_get(recs, row, KH_LEFT), out, at);
+    return put_bytes(out, n, " left");
+}
+
+/// kh_status, but for a live row whose limits were read the money after the code instead of the age: "live (200),
+/// $99.71 left" / "live (200), no limit" / "live (200), free tier". A row with no data, or a check that is not live (stale, refused, down), gets
+/// the status alone: nothing is made up.
+pub fn kh_status_left(recs: []const u64, row: usize, now: u64, out: []u8, at: usize) -> usize {
+    if (kh_state(recs, row, now) != KH_S_LIVE or (kh_get(recs, row, KH_FLAGS) & KH_F_KNOWN) == 0) {
+        return kh_status(recs, row, now, out, at);
+    }
+    // the money is the news: the age is dropped so the whole line fits the cabinet's column ("live (200), $99.71 left")
+    var n : usize = put_bytes(out, at, "live (");
+    n = put_dec(out, n, kh_get(recs, row, KH_CODE));
+    return kh_left_text(recs, row, out, put_bytes(out, n, "), "));
+}
+
+// ---------------------------------------------------------------- tests
+
+fn kh_eq(a: []const u8, n: usize, s: []const u8) -> bool {
+    if (n != s.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test kh_the_file_v2_reads_back_what_was_written {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 0, 200, 1792700000, 312, 1);
+    kh_set(r[0..56], 1, 200, 1792700001, 410, 1);
+    kh_set(r[0..56], 2, 0, 1792700002, 6000, 1);
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(r[0..56], t[0..1024]);
+    var head : [64]u8 = undefined;
+    const hn : usize = put_bytes(head[0..64], 0, "t27os-keyshealth v2 3\n0 200 1792700000 312 1 0 0 0\n");
+    assert kh_eq(t[0..hn], hn, head[0..hn]);
+    var q : [56]u64 = undefined;
+    assert kh_parse(t[0..n], q[0..56]) == 3;
+    assert kh_get(q[0..56], 0, KH_CODE) == 200 and kh_get(q[0..56], 0, KH_AT) == 1792700000 and kh_get(q[0..56], 0, KH_MS) == 312;
+    assert kh_get(q[0..56], 1, KH_AT) == 1792700001 and kh_get(q[0..56], 1, KH_KEYS) == 1;
+    assert kh_get(q[0..56], 2, KH_CODE) == 0 and kh_get(q[0..56], 2, KH_MS) == 6000;
+    assert kh_count(q[0..56]) == 3 and kh_newest(q[0..56]) == 1792700002;
+    // an empty table is a valid file of no records
+    kh_clear(r[0..56]);
+    const e : usize = kh_text(r[0..56], t[0..1024]);
+    assert kh_parse(t[0..e], q[0..56]) == 0 and kh_count(q[0..56]) == 0;
+}
+
+test kh_the_crc_is_ieee_and_guards_every_byte {
+    // the IEEE check value of "123456789"
+    assert crc32("123456789", 9) == 3421780262;
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 1, 200, 1792700000, 99, 1);
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(r[0..56], t[0..1024]);
+    var q : [56]u64 = undefined;
+    assert kh_parse(t[0..n], q[0..56]) == 1;
+    // one changed digit of the code, of the time: the CRC no longer matches
+    t[24] = 51;
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD and kh_count(q[0..56]) == 0;
+    t[24] = 50;
+    assert kh_parse(t[0..n], q[0..56]) == 1;
+    t[n - 2] = t[n - 2] + 1;
+    if (t[n - 2] > 57) { t[n - 2] = 48; }
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+}
+
+test kh_a_broken_file_is_refused_whole {
+    var q : [56]u64 = undefined;
+    var t : [1100]u8 = undefined;
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 0, 200, 1792700000, 1, 1);
+    var n : usize = kh_text(r[0..56], t[0..1100]);
+    // cut short, a byte after the crc line, another version, another magic, nothing
+    assert kh_parse(t[0 .. n - 1], q[0..56]) == KH_BAD;
+    t[n] = 10;
+    assert kh_parse(t[0 .. n + 1], q[0..56]) == KH_BAD;
+    // the file says version 2: made to say 1 (a line of eight numbers, a wrong CRC) or 3, it is broken
+    t[18] = 49;
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    t[18] = 51;
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    t[18] = 50;
+    t[0] = 84;
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    assert kh_parse(t[0..0], q[0..56]) == KH_BAD;
+    assert kh_parse("garbage", q[0..56]) == KH_BAD;
+    // a record of time 0, a code over 999, a row twice: refused even with a right CRC
+    n = put_bytes(t[0..1100], 0, "t27os-keyshealth v1 1\n0 200 0 1 1\n");
+    var c : u32 = crc32(t[0..n], n);
+    var m : usize = put_bytes(t[0..1100], n, "crc ");
+    m = put_dec(t[0..1100], m, @as(u64, c));
+    t[m] = 10;
+    assert kh_parse(t[0 .. m + 1], q[0..56]) == KH_BAD;
+    n = put_bytes(t[0..1100], 0, "t27os-keyshealth v1 2\n0 200 5 1 1\n0 200 6 1 1\n");
+    c = crc32(t[0..n], n);
+    m = put_bytes(t[0..1100], n, "crc ");
+    m = put_dec(t[0..1100], m, @as(u64, c));
+    t[m] = 10;
+    assert kh_parse(t[0 .. m + 1], q[0..56]) == KH_BAD;
+    n = put_bytes(t[0..1100], 0, "t27os-keyshealth v1 1\n0 1000 5 1 1\n");
+    c = crc32(t[0..n], n);
+    m = put_bytes(t[0..1100], n, "crc ");
+    m = put_dec(t[0..1100], m, @as(u64, c));
+    t[m] = 10;
+    assert kh_parse(t[0 .. m + 1], q[0..56]) == KH_BAD;
+    // the same file with a valid code reads
+    n = put_bytes(t[0..1100], 0, "t27os-keyshealth v1 1\n0 999 5 1 1\n");
+    c = crc32(t[0..n], n);
+    m = put_bytes(t[0..1100], n, "crc ");
+    m = put_dec(t[0..1100], m, @as(u64, c));
+    t[m] = 10;
+    assert kh_parse(t[0 .. m + 1], q[0..56]) == 1;
+}
+
+test kh_the_record_limit_is_kh_max {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    var k : usize = 0;
+    while (k < KH_MAX) {
+        kh_set(r[0..56], k, 200, 1792700000 + @as(u64, k), 5, 1);
+        k = k + 1;
+    }
+    // a ninth row is not kept
+    kh_set(r[0..56], KH_MAX, 200, 1, 1, 1);
+    assert kh_count(r[0..56]) == KH_MAX;
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(r[0..56], t[0..1024]);
+    assert n <= KH_TEXT_CAP;
+    var q : [56]u64 = undefined;
+    assert kh_parse(t[0..n], q[0..56]) == 8;
+    // a head that claims nine records, or a row number 8, is broken
+    var b : [200]u8 = undefined;
+    var m : usize = put_bytes(b[0..200], 0, "t27os-keyshealth v1 9\n");
+    var c : u32 = crc32(b[0..m], m);
+    var e : usize = put_bytes(b[0..200], m, "crc ");
+    e = put_dec(b[0..200], e, @as(u64, c));
+    b[e] = 10;
+    assert kh_parse(b[0 .. e + 1], q[0..56]) == KH_BAD;
+    m = put_bytes(b[0..200], 0, "t27os-keyshealth v1 1\n8 200 5 1 1\n");
+    c = crc32(b[0..m], m);
+    e = put_bytes(b[0..200], m, "crc ");
+    e = put_dec(b[0..200], e, @as(u64, c));
+    b[e] = 10;
+    assert kh_parse(b[0 .. e + 1], q[0..56]) == KH_BAD;
+    // a file longer than KH_TEXT_CAP is broken
+    var big : [1100]u8 = undefined;
+    assert kh_parse(big[0..1025], q[0..56]) == KH_BAD;
+}
+
+test kh_a_broken_file_is_set_aside_never_written_over {
+    assert kh_load_plan(false, KH_BAD) == KH_L_FRESH;
+    assert kh_load_plan(false, 0) == KH_L_FRESH;
+    assert kh_load_plan(true, KH_BAD) == KH_L_QUARANTINE;
+    assert kh_load_plan(true, 0) == KH_L_USE;
+    assert kh_load_plan(true, 3) == KH_L_USE;
+    assert kh_eq(KH_LEAF_BAD, KH_LEAF_BAD.len, "keyshealth.t27.bad");
+    assert kh_eq(KH_LEAF_TMP, KH_LEAF_TMP.len, "keyshealth.t27.tmp");
+    assert kh_eq(KH_LEAF, KH_LEAF.len, "keyshealth.t27");
+}
+
+test kh_the_age_reads_as_people_say_it {
+    var o : [32]u8 = undefined;
+    assert kh_eq(o[0..32], kh_ago_text(0, o[0..32]), "just now");
+    assert kh_eq(o[0..32], kh_ago_text(59, o[0..32]), "just now");
+    assert kh_eq(o[0..32], kh_ago_text(60, o[0..32]), "1 min ago");
+    assert kh_eq(o[0..32], kh_ago_text(120, o[0..32]), "2 min ago");
+    assert kh_eq(o[0..32], kh_ago_text(3599, o[0..32]), "59 min ago");
+    assert kh_eq(o[0..32], kh_ago_text(3600, o[0..32]), "1 h ago");
+    assert kh_eq(o[0..32], kh_ago_text(86399, o[0..32]), "23 h ago");
+    assert kh_eq(o[0..32], kh_ago_text(86400, o[0..32]), "1 day ago");
+    assert kh_eq(o[0..32], kh_ago_text(3 * 86400 + 5, o[0..32]), "3 days ago");
+}
+
+test kh_stale_is_more_than_24_h {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    const now : u64 = 1792800000;
+    kh_set(r[0..56], 0, 200, now - KH_STALE_S, 300, 1);
+    assert kh_state(r[0..56], 0, now) == KH_S_LIVE;
+    kh_set(r[0..56], 0, 200, now - KH_STALE_S - 1, 300, 1);
+    assert kh_state(r[0..56], 0, now) == KH_S_STALE;
+    // stale wins over any code
+    kh_set(r[0..56], 0, 401, now - 3 * KH_STALE_S, 300, 1);
+    assert kh_state(r[0..56], 0, now) == KH_S_STALE;
+    assert kh_state(r[0..56], 1, now) == KH_S_NONE;
+    kh_set(r[0..56], 1, 403, now, 1, 1);
+    assert kh_state(r[0..56], 1, now) == KH_S_REFUSED;
+    kh_set(r[0..56], 1, 429, now, 1, 1);
+    assert kh_state(r[0..56], 1, now) == KH_S_LIMITED;
+    kh_set(r[0..56], 1, 0, now, 6000, 1);
+    assert kh_state(r[0..56], 1, now) == KH_S_DOWN;
+    kh_set(r[0..56], 1, 500, now, 1, 1);
+    assert kh_state(r[0..56], 1, now) == KH_S_ERROR;
+    kh_set(r[0..56], 1, 204, now + 100, 1, 1);
+    assert kh_state(r[0..56], 1, now) == KH_S_LIVE;
+}
+
+test kh_each_state_has_its_line {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    const now : u64 = 1792800000;
+    var o : [168]u8 = undefined;
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "not checked yet");
+    kh_set(r[0..56], 0, 200, now - 120, 300, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "live (200, checked 2 min ago)");
+    kh_set(r[0..56], 0, 200, now - 3 * 86400, 300, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "stale (200, checked 3 days ago)");
+    kh_set(r[0..56], 0, 401, now - 3600, 300, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "refused (401, checked 1 h ago)");
+    kh_set(r[0..56], 0, 429, now - 30, 300, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "rate limited (429, checked just now)");
+    kh_set(r[0..56], 0, 0, now - 600, 6000, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "no answer (network, checked 10 min ago)");
+    kh_set(r[0..56], 0, 503, now - 7200, 50, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "error (503, checked 2 h ago)");
+    // a record of an old network failure is stale too, and says so
+    kh_set(r[0..56], 0, 0, now - 2 * 86400, 6000, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], 0), "stale (network, checked 2 days ago)");
+    // the line goes after what is already in out
+    const p : usize = put_bytes(o[0..168], 0, "1 key, ");
+    kh_set(r[0..56], 0, 200, now, 300, 1);
+    assert kh_eq(o[0..168], kh_status(r[0..56], 0, now, o[0..168], p), "1 key, live (200, checked just now)");
+}
+
+test kh_the_check_runs_at_most_once_an_hour {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    const now : u64 = 1792800000;
+    assert kh_due(r[0..56], now, false, 0);
+    assert kh_due(r[0..56], now, true, 0) == false;
+    // a check queued by this run holds the next one back for the period, records or not
+    assert kh_due(r[0..56], now, false, now - KH_PERIOD_S + 1) == false;
+    assert kh_due(r[0..56], now, false, now - KH_PERIOD_S);
+    assert kh_due(r[0..56], now, false, now + 5);
+    kh_set(r[0..56], 1, 200, now - KH_PERIOD_S + 1, 300, 1);
+    assert kh_due(r[0..56], now, false, 0) == false;
+    kh_set(r[0..56], 1, 200, now - KH_PERIOD_S, 300, 1);
+    assert kh_due(r[0..56], now, false, 0);
+    // the newest row counts; a failed check counts as a check
+    kh_set(r[0..56], 2, 0, now - 10, 6000, 1);
+    assert kh_due(r[0..56], now, false, 0) == false;
+    // a record from the future: the clock was set back by more than the period
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 0, 200, now + KH_PERIOD_S, 300, 1);
+    assert kh_due(r[0..56], now, false, 0) == false;
+    kh_set(r[0..56], 0, 200, now + KH_PERIOD_S + 1, 300, 1);
+    assert kh_due(r[0..56], now, false, 0);
+    // rows past the cabinet's do not hold the check back
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 5, 200, now, 300, 1);
+    assert kh_due(r[0..56], now, false, 0);
+}
+
+test kh_the_three_checks_and_their_header {
+    var u : [168]u8 = undefined;
+    assert kh_eq(u[0..168], kh_url(0, u[0..168]), "https://openrouter.ai/api/v1/key");
+    assert kh_eq(u[0..168], kh_url(1, u[0..168]), "https://api.z.ai/api/paas/v4/models");
+    assert kh_eq(u[0..168], kh_url(2, u[0..168]), "https://integrate.api.nvidia.com/v1/models");
+    assert kh_url(3, u[0..168]) == 0;
+    var h : [16]u8 = undefined;
+    assert kh_eq(h[0..16], kh_bearer("abc", h[0..16]), "Bearer abc");
+    assert kh_bearer("", h[0..16]) == 0;
+    assert kh_bearer("123456789", h[0..16]) == 16;
+    assert kh_bearer("1234567890", h[0..16]) == 0;
+    assert kh_ms(1.0, 1.25) == 250;
+    assert kh_ms(2.0, 1.0) == 0;
+    assert kh_ms(0.0, 4000.0) == KH_MS_MAX;
+    assert KH_TIMEOUT_S == 6 and KH_PERIOD_S == 3600 and KH_STALE_S == 86400;
+}
+
+test kh_a_new_record_changes_the_packed_bytes_and_the_line {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    const now : u64 = 1792800000;
+    var a : [168]u8 = undefined;
+    var b : [168]u8 = undefined;
+    kh_pack(r[0..56], a[0..168]);
+    var q : [56]u64 = undefined;
+    kh_unpack(a[0..168], q[0..56]);
+    var o : [168]u8 = undefined;
+    assert kh_eq(o[0..168], kh_status(q[0..56], 2, now, o[0..168], 0), "not checked yet");
+    // the background check writes the file; the window reads it back and packs it again
+    kh_set(r[0..56], 2, 200, now - 720, 280, 1);
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(r[0..56], t[0..1024]);
+    var f : [56]u64 = undefined;
+    assert kh_parse(t[0..n], f[0..56]) == 1;
+    kh_pack(f[0..56], b[0..168]);
+    var diff : bool = false;
+    var i : usize = 0;
+    while (i < 168) {
+        if (a[i] != b[i]) { diff = true; }
+        i = i + 1;
+    }
+    assert diff;
+    kh_unpack(b[0..168], q[0..56]);
+    assert kh_eq(o[0..168], kh_status(q[0..56], 2, now, o[0..168], 0), "live (200, checked 12 min ago)");
+    // the same file packs to the same bytes: no redraw without a change
+    kh_pack(f[0..56], a[0..168]);
+    i = 0;
+    diff = false;
+    while (i < 168) {
+        if (a[i] != b[i]) { diff = true; }
+        i = i + 1;
+    }
+    assert diff == false;
+    // too short a region leaves the table empty
+    kh_unpack(b[0..8], q[0..56]);
+    assert kh_count(q[0..56]) == 0;
+}
+
+/// body (a file without its crc line) and a right crc line into out; the length.
+fn kh_mk(body: []const u8, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, body);
+    const c : u32 = crc32(out[0..n], n);
+    n = put_bytes(out, n, "crc ");
+    n = put_dec(out, n, @as(u64, c));
+    out[n] = 10;
+    return n + 1;
+}
+
+const KH_T_BODY : str = "{\"data\":{\"label\":\"sk-or-v1-abc...def\",\"limit\":100,\"limit_reset\":null,\"limit_remaining\":99.71,\"include_byok_in_limit\":false,\"usage\":0.2892,\"usage_daily\":0.1,\"is_free_tier\":false}}";
+
+test kh_a_version_1_file_is_read_with_no_limits_and_the_next_write_is_version_2 {
+    var t : [1100]u8 = undefined;
+    var q : [56]u64 = undefined;
+    const n : usize = kh_mk("t27os-keyshealth v1 2\n0 200 1792700000 312 1\n2 0 1792700002 6000 1\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == 2;
+    assert kh_get(q[0..56], 0, KH_CODE) == 200 and kh_get(q[0..56], 0, KH_AT) == 1792700000 and kh_get(q[0..56], 0, KH_KEYS) == 1;
+    assert kh_get(q[0..56], 0, KH_LIMIT) == 0 and kh_get(q[0..56], 0, KH_LEFT) == 0 and kh_get(q[0..56], 0, KH_FLAGS) == 0;
+    assert kh_get(q[0..56], 2, KH_CODE) == 0 and kh_get(q[0..56], 2, KH_FLAGS) == 0;
+    // a version 1 file with a v2 line, or a version 2 file with a v1 line, is broken
+    const a : usize = kh_mk("t27os-keyshealth v1 1\n0 200 1792700000 312 1 0 0 0\n", t[0..1100]);
+    assert kh_parse(t[0..a], q[0..56]) == KH_BAD;
+    const b : usize = kh_mk("t27os-keyshealth v2 1\n0 200 1792700000 312 1\n", t[0..1100]);
+    assert kh_parse(t[0..b], q[0..56]) == KH_BAD;
+    // the write of what was read says version 2
+    var u : [1024]u8 = undefined;
+    const m : usize = kh_mk("t27os-keyshealth v1 1\n0 200 1792700000 312 1\n", t[0..1100]);
+    assert kh_parse(t[0..m], q[0..56]) == 1;
+    const w : usize = kh_text(q[0..56], u[0..1024]);
+    var head : [64]u8 = undefined;
+    const hn : usize = put_bytes(head[0..64], 0, "t27os-keyshealth v2 1\n0 200 1792700000 312 1 0 0 0\n");
+    assert kh_eq(u[0..hn], hn, head[0..hn]);
+    assert kh_parse(u[0..w], q[0..56]) == 1;
+}
+
+test kh_the_file_v2_keeps_the_limit_the_rest_and_the_flags_under_the_crc {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 0, 200, 1792700000, 312, 1);
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    kh_set(r[0..56], 1, 200, 1792700001, 410, 11);
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(r[0..56], t[0..1024]);
+    var head : [96]u8 = undefined;
+    const hn : usize = put_bytes(head[0..96], 0, "t27os-keyshealth v2 2\n0 200 1792700000 312 1 10000 9971 2\n1 200 1792700001 410 11 0 0 0\n");
+    assert kh_eq(t[0..hn], hn, head[0..hn]);
+    var q : [56]u64 = undefined;
+    assert kh_parse(t[0..n], q[0..56]) == 2;
+    assert kh_get(q[0..56], 0, KH_LIMIT) == 10000 and kh_get(q[0..56], 0, KH_LEFT) == 9971 and kh_get(q[0..56], 0, KH_FLAGS) == KH_F_KNOWN;
+    assert kh_get(q[0..56], 1, KH_LIMIT) == 0 and kh_get(q[0..56], 1, KH_KEYS) == 11;
+    // one changed digit of the rest: the CRC refuses the file
+    t[51] = 56;
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD and kh_count(q[0..56]) == 0;
+    // a re-set check wipes the old answer's limits
+    kh_set(r[0..56], 0, 429, 1792700100, 5, 1);
+    assert kh_get(r[0..56], 0, KH_LIMIT) == 0 and kh_get(r[0..56], 0, KH_LEFT) == 0 and kh_get(r[0..56], 0, KH_FLAGS) == 0;
+    // the flags keep two bits; the amounts stop at KH_CENTS_MAX
+    kh_set_limits(r[0..56], 0, 5, 18446744073709551615, 255);
+    assert kh_get(r[0..56], 0, KH_FLAGS) == 3 and kh_get(r[0..56], 0, KH_LEFT) == KH_CENTS_MAX;
+    // eight full records still fit the cap
+    var k : usize = 0;
+    while (k < KH_MAX) {
+        kh_set(r[0..56], k, 999, 4294967295, 3600000, 255);
+        kh_set_limits(r[0..56], k, KH_CENTS_MAX, KH_CENTS_MAX, 3);
+        k = k + 1;
+    }
+    const f : usize = kh_text(r[0..56], t[0..1024]);
+    assert f <= KH_TEXT_CAP and kh_parse(t[0..f], q[0..56]) == 8;
+}
+
+test kh_a_v2_record_over_the_limits_is_refused_even_with_a_right_crc {
+    var t : [1100]u8 = undefined;
+    var q : [56]u64 = undefined;
+    var n : usize = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 100 99 3\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == 1;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 100 99 4\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 1000000000001 99 2\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 100 1000000000001 2\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 100 99\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 -1 99 2\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == KH_BAD;
+    n = kh_mk("t27os-keyshealth v2 1\n0 200 5 1 1 1000000000000 1000000000000 3\n", t[0..1100]);
+    assert kh_parse(t[0..n], q[0..56]) == 1;
+}
+
+test kh_openrouters_key_answer_gives_the_limit_the_rest_and_the_free_tier {
+    var o : [3]u64 = undefined;
+    assert kh_or_parse(KH_T_BODY, o[0..3]);
+    assert o[0] == 10000 and o[1] == 9971 and o[2] == KH_F_KNOWN;
+    // no limit: null and null
+    assert kh_or_parse("{\"data\":{\"limit\":null,\"limit_remaining\":null,\"usage\":3.5,\"is_free_tier\":false}}", o[0..3]);
+    assert o[0] == 0 and o[1] == 0 and o[2] == KH_F_KNOWN;
+    // a free tier key
+    assert kh_or_parse("{\"data\":{\"limit\":10,\"limit_remaining\":9.5,\"is_free_tier\":true}}", o[0..3]);
+    assert o[0] == 1000 and o[1] == 950 and o[2] == KH_F_KNOWN + KH_F_FREE;
+    // spaces after the colon; the third decimal is dropped, not rounded up
+    assert kh_or_parse("{\"data\": {\"limit\": 25, \"limit_remaining\": 0.019, \"is_free_tier\": false}}", o[0..3]);
+    assert o[0] == 2500 and o[1] == 1;
+    // an overspent key has 0 left, never a minus
+    assert kh_or_parse("{\"data\":{\"limit\":5,\"limit_remaining\":-0.5,\"is_free_tier\":false}}", o[0..3]);
+    assert o[0] == 500 and o[1] == 0 and o[2] == KH_F_KNOWN;
+    // a whole number of cents, none, a lone dot
+    assert kh_or_parse("{\"data\":{\"limit\":0,\"limit_remaining\":0,\"is_free_tier\":false}}", o[0..3]);
+    assert o[0] == 0 and o[1] == 0 and o[2] == KH_F_KNOWN;
+    // the rest absent: as null
+    assert kh_or_parse("{\"data\":{\"limit\":7,\"is_free_tier\":false}}", o[0..3]);
+    assert o[0] == 700 and o[1] == 0;
+    // nothing readable: false, nothing set
+    assert kh_or_parse("", o[0..3]) == false and o[0] == 0 and o[2] == 0;
+    assert kh_or_parse("{\"error\":{\"code\":401,\"message\":\"nope\"}}", o[0..3]) == false and o[2] == 0;
+    assert kh_or_parse("{\"data\":{\"limit\":1e2,\"limit_remaining\":9,\"is_free_tier\":false}}", o[0..3]) == false and o[2] == 0;
+    assert kh_or_parse("{\"data\":{\"limit\":\"100\",\"limit_remaining\":9,\"is_free_tier\":false}}", o[0..3]) == false;
+    assert kh_or_parse("{\"data\":{\"limit\":100,\"limit_remaining\":9}}", o[0..3]) == false;
+    assert kh_or_parse("{\"data\":{\"limit\":100,\"limit_remaining\":9,\"is_free_tier\":1}}", o[0..3]) == false;
+    assert kh_or_parse("{\"data\":{\"limit\":100.,\"is_free_tier\":false}}", o[0..3]) == false;
+    // a huge amount stops at KH_CENTS_MAX
+    assert kh_or_parse("{\"data\":{\"limit\":9999999999999,\"limit_remaining\":1,\"is_free_tier\":false}}", o[0..3]);
+    assert o[0] == KH_CENTS_MAX and o[1] == 100;
+}
+
+test kh_money_reads_as_dollars_and_the_rest_says_no_limit_free_tier_or_no_data {
+    var o : [64]u8 = undefined;
+    assert kh_eq(o[0..64], kh_dollars(9971, o[0..64], 0), "$99.71");
+    assert kh_eq(o[0..64], kh_dollars(5, o[0..64], 0), "$0.05");
+    assert kh_eq(o[0..64], kh_dollars(0, o[0..64], 0), "$0.00");
+    assert kh_eq(o[0..64], kh_dollars(10000, o[0..64], 0), "$100.00");
+    assert kh_eq(o[0..64], kh_dollars(123456789, o[0..64], 0), "$1234567.89");
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    kh_set(r[0..56], 0, 200, 1792800000, 300, 1);
+    // never read: "no data", and the status line gets nothing added
+    assert kh_eq(o[0..64], kh_left_text(r[0..56], 0, o[0..64], 0), "no data");
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "live (200, checked just now)");
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_left_text(r[0..56], 0, o[0..64], 0), "$99.71 left");
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "live (200), $99.71 left");
+    // spent to the cent: a limit with nothing left says so
+    kh_set_limits(r[0..56], 0, 10000, 0, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_left_text(r[0..56], 0, o[0..64], 0), "$0.00 left");
+    kh_set_limits(r[0..56], 0, 0, 0, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_left_text(r[0..56], 0, o[0..64], 0), "no limit");
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "live (200), no limit");
+    kh_set_limits(r[0..56], 0, 1000, 950, KH_F_KNOWN + KH_F_FREE);
+    assert kh_eq(o[0..64], kh_left_text(r[0..56], 0, o[0..64], 0), "free tier");
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "live (200), free tier");
+    // only a live check speaks for the money: stale, refused, down, rate limited, never checked: the status alone
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000 + 86400 + 1, o[0..64], 0), "stale (200, checked 1 day ago)");
+    kh_set(r[0..56], 0, 401, 1792800000, 300, 1);
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "refused (401, checked just now)");
+    kh_set(r[0..56], 0, 0, 1792800000, 6000, 1);
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 0, 1792800000, o[0..64], 0), "no answer (network, checked just now)");
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 1, 1792800000, o[0..64], 0), "not checked yet");
+    // a row of another provider (Z.ai, NVIDIA) keeps flags 0: no money
+    kh_set(r[0..56], 1, 200, 1792800000, 410, 11);
+    assert kh_eq(o[0..64], kh_status_left(r[0..56], 1, 1792800000, o[0..64], 0), "live (200, checked just now)");
+}
+
+test kh_the_packed_rows_carry_the_money {
+    var r : [56]u64 = undefined;
+    kh_clear(r[0..56]);
+    const now : u64 = 1792800000;
+    kh_set(r[0..56], 0, 200, now - 120, 300, 1);
+    kh_set_limits(r[0..56], 0, 10000, 9971, KH_F_KNOWN);
+    var a : [168]u8 = undefined;
+    var b : [168]u8 = undefined;
+    kh_pack(r[0..56], a[0..168]);
+    var q : [56]u64 = undefined;
+    kh_unpack(a[0..168], q[0..56]);
+    assert kh_get(q[0..56], 0, KH_LIMIT) == 10000 and kh_get(q[0..56], 0, KH_LEFT) == 9971 and kh_get(q[0..56], 0, KH_FLAGS) == KH_F_KNOWN;
+    var o : [96]u8 = undefined;
+    assert kh_eq(o[0..96], kh_status_left(q[0..56], 0, now, o[0..96], 0), "live (200), $99.71 left");
+    // a new rest alone changes the bytes: the frame key redraws
+    kh_set_limits(r[0..56], 0, 10000, 9970, KH_F_KNOWN);
+    kh_pack(r[0..56], b[0..168]);
+    var diff : bool = false;
+    var i : usize = 0;
+    while (i < 168) {
+        if (a[i] != b[i]) { diff = true; }
+        i = i + 1;
+    }
+    assert diff;
+    assert KH_PACK_LEN == 168 and KH_PACK_LEN == KH_ROWS * KH_W * 8 and KH_TABLE == KH_MAX * KH_W;
+}
