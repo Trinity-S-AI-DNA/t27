@@ -11,12 +11,12 @@ Give a SPICE netlist with IHP SG13G2 (PSP103) devices; get `.t27` specs that are
 | question | answer | source |
 |---|---|---|
 | Do your per-block checks run on our models? | yes: 13 blocks, 9 PASS, 0 FAIL, 4 NOT MODELLED (dff, DAC_control, DAC_control_top, neg_bottom_plate_logic); 30 rows, 26 / 0 / 4 | #11215, #11421 |
-| Is the dynamic comparator right? | decision time 613.07 ps against ngspice's 602.54 ps (+1.75 %) and your report's 607 ps; the same model with its charge removed decides in 5.40 ps and is refused | #11325 |
+| Is the dynamic comparator right? | decision time 613.07 ps against ngspice's 602.54 ps (+1.75 %) and your report's 607 ps; the same model with its charge removed decides in 5.40 ps and is refused; the body effect on the charge is not modelled, so the resolution time is 4.9 % early and the nodes differ from ngspice's by up to 83 mV during regeneration | #11325 |
 | Does a PSP103 circuit run on the board? | yes, one: the tt inverter, 1217 of 1217 receipt lines equal to the spec, 1426 LUT, 1219 FF, 0 DSP, tables in block RAM, 103.61 MHz after routing | #11220 |
 | Which corners? | tables and ngspice checks for all five (tt, ss, ff, fs, sf), each within 0.734 % at worst; a bitstream for tt only | #11123, #11214 |
-| Does the converter reproduce your published run? | our ngspice-47 run of the golden deck gives 30 of 31 codes of your RAW file; the converter model is predicted only with two fitted numbers | #10854, #10953 |
-| Are the waveforms usable in your tools? | yes: a `.t27` RAW writer; ngspice reads our files, largest difference 0 on the 8-conversion trace | #10940, #11151 |
-| Is it fast? | no claim: one 100 ps step takes 17.0 to 19.6 us on the board, 170000 to 196000 times slower than real time; ngspice is 195623 times slower on the same circuit, for different work | #11313 |
+| Does the converter reproduce your published run? | our ngspice-47 run of the golden deck gives 30 of 31 codes of your RAW file; the behavioural converter reaches 30 of 31 codes only with two fitted numbers (the top-plate load of 77 fF and an offset), so the converter is not predicted end to end | #10854, #10953 |
+| Are the waveforms usable in your tools? | yes: a `.t27` RAW writer; ngspice reads our files, on the 8-conversion trace, largest difference 0 on 32 doubles of the binary file | #10940, #11151 |
+| Is it fast? | no claim: one 100 ps step takes 17.0 to 19.6 us on the board, 170000 to 196000 times slower than real time; ngspice-47 took 19.56 us a time point (195623 times real time on a 4 us run) on one CPU thread for the same circuit, and the two are not the cost of the same work | #11313 |
 
 ## What is open
 
