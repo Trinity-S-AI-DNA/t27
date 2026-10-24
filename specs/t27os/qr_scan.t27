@@ -1,0 +1,1486 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/qr_scan.t27 -- read a T27 key (T27-XXXX-XXXX-XXXX-XXXX-C) from a grey frame, so a person points a camera
+// at another person's code and does not type the key. Pure: no @extern, no clock, no allocation; the caller gives the
+// frame and a work buffer of w * h bytes. The camera is another task; this is the core it will call.
+//
+// What it reads: only the codes this OS makes (specs/t27os/qr.t27) and codes like them: byte mode, error correction
+// level L, versions 1 to 4 (one block each), any of the 8 masks. Anything else is refused with a reason, never guessed.
+// The steps, in the order qs_read runs them:
+//   qs_binarize    every pixel against the mean of the 5 x 5 blocks of 8 x 8 pixels around its block; a block with
+//                  little contrast takes its neighbours' mean, so a large flat area (the finder's centre) stays one
+//                  colour (the scheme of ZXing's HybridBinarizer)
+//   qs_finders     every row scanned for dark-light-dark-light-dark runs in the ratio 1:1:3:1:1 (each run within half
+//                  a module), each hit checked down its column and again along its row (qs_cross); hits within a
+//                  module of each other are one finder with a count
+//   qs_pick3       the three finders that make the best right isosceles triangle; the corner is the top left, the
+//                  turn from the other two (a cross product) tells top right from bottom left
+//   qs_version_est the side in modules from the two legs and the finders' module size, the version from the side;
+//                  the version found and its two neighbours are tried
+//   qs_sample      the module centres through the affine map the three finder centres fix (a rotation, a scale, a
+//                  shear; no perspective)
+//   qs_format      both copies of the 15 format bits against the 32 words; at most 3 wrong bits
+//   qs_codewords   the mask taken off the data modules, the bits read in the order qr_place writes them
+//   qs_rs_fix      Reed-Solomon over GF(256) (0x11D, roots 2^0 .. 2^(e-1)): syndromes, Berlekamp-Massey, Chien,
+//                  Forney; the syndromes are checked again after the fix
+//   qs_bytes       mode 0100, the 8-bit count, the bytes
+//   qs_scan_key    the text must be a key: peer_identity.invite_parse (the prefix, the dashes, the alphabet, the check
+//                  symbol)
+// When the frame gives nothing, the binary picture is inverted and read once more (a light code on a dark ground).
+// Flat namespace (the window build splices imported modules): every name here starts with qs_ / QS_.
+module T27osQrScan;
+
+use t27os::qr::QR_FREE;
+use t27os::qr::qr_init;
+use t27os::qr::qr_reserve;
+use t27os::qr::qr_timing;
+use t27os::qr::qr_finders;
+use t27os::qr::qr_alignment;
+use t27os::qr::qr_mask_hit;
+use t27os::qr::qr_gf_tables;
+use t27os::qr::qr_gf_mul;
+use t27os::qr::qr_make;
+use t27os::qr::qr_make_at;
+use t27os::qr::qr_message;
+use t27os::qr::qr_data_codewords;
+use t27os::qr::qr_format_bits;
+use t27os::qr::QR_CELLS_MAX;
+use t27os::qr::QR_CW_MAX;
+use t27os::qr::QR_DATA_MAX;
+use t27os::peer_identity::INV_OK;
+use t27os::peer_identity::INVITE_LEN;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::invite_parse;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::sym_value;
+
+/// The largest frame (a block mean per 8 x 8 pixels is kept on the stack: 160 x 120 of them).
+pub const QS_W_MAX : usize = 1280;
+pub const QS_H_MAX : usize = 960;
+pub const QS_BLK_MAX : usize = 19200;
+/// Finder candidates kept per frame, four i64 each (x, y, module size, all times 16; the hit count).
+pub const QS_CAND_MAX : usize = 64;
+/// Versions 1 to 4: the side of version 4 and its cells.
+pub const QS_VER_MAX : u32 = 4;
+pub const QS_DIM_MAX : usize = 33;
+pub const QS_GRID : usize = 1089;
+/// The longest text a version 4-L code holds in byte mode.
+pub const QS_TEXT_MAX : usize = 78;
+
+/// The reasons, in the order the steps run (a later step that fails says more than an earlier one).
+pub const QS_OK : u32 = 0;
+pub const QS_ARG : u32 = 1;
+pub const QS_NO_CODE : u32 = 2;
+pub const QS_GEOMETRY : u32 = 3;
+pub const QS_FORMAT : u32 = 4;
+pub const QS_LEVEL : u32 = 5;
+pub const QS_ECC : u32 = 6;
+pub const QS_MODE : u32 = 7;
+pub const QS_NOT_KEY : u32 = 8;
+
+/// qs_read's answer is the text length * 16 + the reason.
+pub fn qs_reason(r: u32) -> u32 { return r % 16; }
+pub fn qs_len(r: u32) -> usize { return @as(usize, r / 16); }
+
+fn qs_absdiff(a: usize, b: usize) -> usize {
+    if (a > b) { return a - b; }
+    return b - a;
+}
+
+fn qs_iabs(a: i64) -> i64 {
+    if (a < 0) { return 0 - a; }
+    return a;
+}
+
+/// The integer square root (the largest x with x * x <= v; 0 for v <= 0).
+pub fn qs_isqrt(v: i64) -> i64 {
+    if (v <= 0) { return 0; }
+    var x : i64 = v;
+    var y : i64 = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    return x;
+}
+
+// ---------------------------------------------------------------- 1. versions 1 to 4 at level L (one block each)
+
+pub fn qs_total_cw(ver: u32) -> usize {
+    if (ver == 1) { return 26; }
+    if (ver == 2) { return 44; }
+    if (ver == 3) { return 70; }
+    if (ver == 4) { return 100; }
+    return 0;
+}
+
+pub fn qs_ec_cw(ver: u32) -> usize {
+    if (ver == 1) { return 7; }
+    if (ver == 2) { return 10; }
+    if (ver == 3) { return 15; }
+    if (ver == 4) { return 20; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- 2. binarization
+
+/// The frame g (w x h, one grey byte per pixel, row by row) into bin: 1 dark, 0 light. False when the frame is too
+/// small (less than a version 1 code), too big, or a buffer is short.
+pub fn qs_binarize(g: []const u8, w: usize, h: usize, bin: []u8) -> bool {
+    if (w < 21 or h < 21 or w > QS_W_MAX or h > QS_H_MAX) { return false; }
+    if (g.len < w * h or bin.len < w * h) { return false; }
+    const bw : usize = (w + 7) / 8;
+    const bh : usize = (h + 7) / 8;
+    var avg : [QS_BLK_MAX]u8 = undefined;
+    var by : usize = 0;
+    while (by < bh) {
+        var bx : usize = 0;
+        while (bx < bw) {
+            const x0 : usize = bx * 8;
+            const y0 : usize = by * 8;
+            var x1 : usize = x0 + 8;
+            if (x1 > w) { x1 = w; }
+            var y1 : usize = y0 + 8;
+            if (y1 > h) { y1 = h; }
+            var sum : u32 = 0;
+            var lo : u32 = 255;
+            var hi : u32 = 0;
+            var y : usize = y0;
+            while (y < y1) {
+                var x : usize = x0;
+                while (x < x1) {
+                    const p : u32 = @as(u32, g[y * w + x]);
+                    sum = sum + p;
+                    if (p < lo) { lo = p; }
+                    if (p > hi) { hi = p; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            var a : u32 = sum / @as(u32, @intCast((x1 - x0) * (y1 - y0)));
+            if (hi - lo <= 24) {
+                a = lo / 2;
+                if (bx > 0 and by > 0) {
+                    const nb : u32 = (@as(u32, avg[(by - 1) * bw + bx]) + 2 * @as(u32, avg[by * bw + bx - 1]) + @as(u32, avg[(by - 1) * bw + bx - 1])) / 4;
+                    if (lo < nb) { a = nb; }
+                }
+            }
+            avg[by * bw + bx] = @as(u8, @intCast(a));
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    by = 0;
+    while (by < bh) {
+        var bx : usize = 0;
+        while (bx < bw) {
+            var sum : u32 = 0;
+            var cnt : u32 = 0;
+            var yy : usize = 0;
+            if (by > 2) { yy = by - 2; }
+            while (yy <= by + 2 and yy < bh) {
+                var xx : usize = 0;
+                if (bx > 2) { xx = bx - 2; }
+                while (xx <= bx + 2 and xx < bw) {
+                    sum = sum + @as(u32, avg[yy * bw + xx]);
+                    cnt = cnt + 1;
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+            const t : u32 = sum / cnt;
+            var x1 : usize = bx * 8 + 8;
+            if (x1 > w) { x1 = w; }
+            var y1 : usize = by * 8 + 8;
+            if (y1 > h) { y1 = h; }
+            var y : usize = by * 8;
+            while (y < y1) {
+                var x : usize = bx * 8;
+                while (x < x1) {
+                    var d : u8 = 0;
+                    if (@as(u32, g[y * w + x]) <= t) { d = 1; }
+                    bin[y * w + x] = d;
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return true;
+}
+
+/// Swap dark and light in bin[0 .. n].
+pub fn qs_invert(bin: []u8, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        bin[i] = bin[i] ^ 1;
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 3. the finder patterns
+
+/// Five runs in the ratio 1:1:3:1:1, each 1-run within half a module of total / 7 and the 3-run within 1.5 modules.
+pub fn qs_ratio(c: []const usize) -> bool {
+    var total : usize = 0;
+    var i : usize = 0;
+    while (i < 5) {
+        if (c[i] == 0) { return false; }
+        total = total + c[i];
+        i = i + 1;
+    }
+    if (total < 7) { return false; }
+    if (qs_absdiff(2 * total, 14 * c[0]) >= total) { return false; }
+    if (qs_absdiff(2 * total, 14 * c[1]) >= total) { return false; }
+    if (qs_absdiff(6 * total, 14 * c[2]) >= 3 * total) { return false; }
+    if (qs_absdiff(2 * total, 14 * c[3]) >= total) { return false; }
+    if (qs_absdiff(2 * total, 14 * c[4]) >= total) { return false; }
+    return true;
+}
+
+/// The pixel at index i along a column (vertical) or a row, the other coordinate fixed: 1 dark, 0 light, 2 outside.
+fn qs_pxi(bin: []const u8, w: usize, h: usize, vertical: bool, fixed: usize, i: i64) -> u8 {
+    if (i < 0) { return 2; }
+    const k : usize = @as(usize, @intCast(i));
+    if (vertical) {
+        if (k >= h or fixed >= w) { return 2; }
+        return bin[k * w + fixed];
+    }
+    if (k >= w or fixed >= h) { return 2; }
+    return bin[fixed * w + k];
+}
+
+/// From the dark pixel at start, the five runs across a finder along a column (vertical) or a row: res[0] the centre
+/// (times 16), res[1] the total. False when the runs are not 1:1:3:1:1, a run is longer than maxc, or the total
+/// stands 40 % or more away from total0.
+pub fn qs_cross(bin: []const u8, w: usize, h: usize, vertical: bool, fixed: usize, start: usize, maxc: usize, total0: usize, res: []i64) -> bool {
+    var c : [5]usize = [0, 0, 0, 0, 0];
+    const s : i64 = @as(i64, @intCast(start));
+    var i : i64 = s;
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 1) {
+        c[2] = c[2] + 1;
+        i = i - 1;
+    }
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 0 and c[1] <= maxc) {
+        c[1] = c[1] + 1;
+        i = i - 1;
+    }
+    if (qs_pxi(bin, w, h, vertical, fixed, i) != 1) { return false; }
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 1 and c[0] <= maxc) {
+        c[0] = c[0] + 1;
+        i = i - 1;
+    }
+    if (c[0] > maxc) { return false; }
+    i = s + 1;
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 1) {
+        c[2] = c[2] + 1;
+        i = i + 1;
+    }
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 0 and c[3] <= maxc) {
+        c[3] = c[3] + 1;
+        i = i + 1;
+    }
+    if (qs_pxi(bin, w, h, vertical, fixed, i) != 1) { return false; }
+    while (qs_pxi(bin, w, h, vertical, fixed, i) == 1 and c[4] <= maxc) {
+        c[4] = c[4] + 1;
+        i = i + 1;
+    }
+    if (c[4] > maxc) { return false; }
+    const total : usize = c[0] + c[1] + c[2] + c[3] + c[4];
+    if (5 * qs_absdiff(total, total0) >= 2 * total0) { return false; }
+    if (qs_ratio(c[0..5]) == false) { return false; }
+    res[0] = (i - @as(i64, @intCast(c[4] + c[3]))) * 16 - @as(i64, @intCast(c[2])) * 8;
+    res[1] = @as(i64, @intCast(total));
+    return true;
+}
+
+/// A finder at (x, y) with module size m (all times 16) into cand: merged into a candidate within a module of it
+/// (the mean, the count up), else a new one while there is room. Returns the candidates.
+pub fn qs_add(cand: []i64, n: usize, x: i64, y: i64, m: i64) -> usize {
+    var k : usize = 0;
+    while (k < n) {
+        const b : usize = k * 4;
+        const mk : i64 = cand[b + 2];
+        if (qs_iabs(cand[b] - x) <= mk and qs_iabs(cand[b + 1] - y) <= mk and qs_iabs(mk - m) <= mk) {
+            const cnt : i64 = cand[b + 3];
+            cand[b] = (cand[b] * cnt + x) / (cnt + 1);
+            cand[b + 1] = (cand[b + 1] * cnt + y) / (cnt + 1);
+            cand[b + 2] = (mk * cnt + m) / (cnt + 1);
+            cand[b + 3] = cnt + 1;
+            return n;
+        }
+        k = k + 1;
+    }
+    if (n >= QS_CAND_MAX or cand.len < (n + 1) * 4) { return n; }
+    cand[n * 4] = x;
+    cand[n * 4 + 1] = y;
+    cand[n * 4 + 2] = m;
+    cand[n * 4 + 3] = 1;
+    return n + 1;
+}
+
+/// A row hit whose last dark run ends before x_end on row y: checked down its column, then along its row again.
+fn qs_hit(bin: []const u8, w: usize, h: usize, c: []const usize, x_end: usize, y: usize, cand: []i64, n: usize) -> usize {
+    const total : usize = c[0] + c[1] + c[2] + c[3] + c[4];
+    const cx16 : i64 = @as(i64, @intCast(x_end - c[4] - c[3])) * 16 - @as(i64, @intCast(c[2])) * 8;
+    if (cx16 < 0) { return n; }
+    const col : usize = @as(usize, @intCast(cx16 / 16));
+    var r : [2]i64 = [0, 0];
+    if (qs_cross(bin, w, h, true, col, y, c[2], total, r[0..2]) == false) { return n; }
+    const cy16 : i64 = r[0];
+    const vt : i64 = r[1];
+    if (cy16 < 0) { return n; }
+    const row : usize = @as(usize, @intCast(cy16 / 16));
+    if (qs_cross(bin, w, h, false, row, col, c[2], total, r[0..2]) == false) { return n; }
+    return qs_add(cand, n, r[0], cy16, (r[1] + vt) * 16 / 14);
+}
+
+/// Every row of bin scanned for finders into cand (QS_CAND_MAX * 4 i64); returns how many were found.
+pub fn qs_finders(bin: []const u8, w: usize, h: usize, cand: []i64) -> usize {
+    var n : usize = 0;
+    var y : usize = 0;
+    while (y < h) {
+        var c : [5]usize = [0, 0, 0, 0, 0];
+        var st : usize = 0;
+        var x : usize = 0;
+        while (x <= w) {
+            var d : u8 = 0;
+            if (x < w) { d = bin[y * w + x]; }
+            if (d == 1) {
+                if (st % 2 == 1) { st = st + 1; }
+                c[st] = c[st] + 1;
+            } else {
+                if (st % 2 == 0) {
+                    if (st == 4) {
+                        if (qs_ratio(c[0..5])) { n = qs_hit(bin, w, h, c[0..5], x, y, cand, n); }
+                        c[0] = c[2];
+                        c[1] = c[3];
+                        c[2] = c[4];
+                        c[3] = 1;
+                        c[4] = 0;
+                        st = 3;
+                    } else {
+                        if (st > 0 or c[0] > 0) {
+                            st = st + 1;
+                            c[st] = c[st] + 1;
+                        }
+                    }
+                } else {
+                    c[st] = c[st] + 1;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+fn qs_d2(cand: []const i64, a: usize, b: usize) -> i64 {
+    const dx : i64 = cand[a * 4] - cand[b * 4];
+    const dy : i64 = cand[a * 4 + 1] - cand[b * 4 + 1];
+    return dx * dx + dy * dy;
+}
+
+/// The three candidates that make the best right isosceles triangle into tri: the corner (top left), top right,
+/// bottom left. Only candidates seen on two rows or more take part when there are three of them. The legs differ by
+/// at most 20 % (squared), the hypotenuse meets Pythagoras within 20 %, the modules differ by at most 1.5 times and
+/// a leg is 10 to 30 modules long (versions 1 to 4 have 14 to 26). False when no three do.
+pub fn qs_pick3(cand: []const i64, n: usize, tri: []usize) -> bool {
+    var minc : i64 = 1;
+    var seen : usize = 0;
+    var k : usize = 0;
+    while (k < n) {
+        if (cand[k * 4 + 3] >= 2) { seen = seen + 1; }
+        k = k + 1;
+    }
+    if (seen >= 3) { minc = 2; }
+    var best : i64 = -1;
+    var i : usize = 0;
+    while (i < n) {
+        var j : usize = i + 1;
+        while (j < n) {
+            k = j + 1;
+            while (k < n) {
+                if (cand[i * 4 + 3] >= minc and cand[j * 4 + 3] >= minc and cand[k * 4 + 3] >= minc) {
+                    const mi : i64 = cand[i * 4 + 2];
+                    const mj : i64 = cand[j * 4 + 2];
+                    const mk : i64 = cand[k * 4 + 2];
+                    var mx : i64 = mi;
+                    if (mj > mx) { mx = mj; }
+                    if (mk > mx) { mx = mk; }
+                    var mn : i64 = mi;
+                    if (mj < mn) { mn = mj; }
+                    if (mk < mn) { mn = mk; }
+                    const dij : i64 = qs_d2(cand, i, j);
+                    const dik : i64 = qs_d2(cand, i, k);
+                    const djk : i64 = qs_d2(cand, j, k);
+                    var hyp : i64 = djk;
+                    var la : i64 = dij;
+                    var lb : i64 = dik;
+                    var c0 : usize = i;
+                    var c1 : usize = j;
+                    var c2 : usize = k;
+                    if (dij >= dik and dij >= djk) {
+                        hyp = dij;
+                        la = dik;
+                        lb = djk;
+                        c0 = k;
+                        c1 = i;
+                        c2 = j;
+                    } else {
+                        if (dik >= dij and dik >= djk) {
+                            hyp = dik;
+                            la = dij;
+                            lb = djk;
+                            c0 = j;
+                            c1 = i;
+                            c2 = k;
+                        }
+                    }
+                    var lmax : i64 = la;
+                    if (lb > lmax) { lmax = lb; }
+                    const m : i64 = (mi + mj + mk) / 3;
+                    const leg : i64 = qs_isqrt(lmax);
+                    var ok : bool = mx * 2 <= mn * 3;
+                    if (qs_iabs(la - lb) * 5 > lmax) { ok = false; }
+                    if (qs_iabs(hyp - la - lb) * 5 > hyp) { ok = false; }
+                    if (leg < 10 * m or leg > 30 * m) { ok = false; }
+                    if (ok) {
+                        const score : i64 = qs_iabs(la - lb) + qs_iabs(hyp - la - lb);
+                        if (best < 0 or score < best) {
+                            best = score;
+                            tri[0] = c0;
+                            tri[1] = c1;
+                            tri[2] = c2;
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (best < 0) { return false; }
+    const a : usize = tri[0] * 4;
+    const b : usize = tri[1] * 4;
+    const c : usize = tri[2] * 4;
+    const cross : i64 = (cand[b] - cand[a]) * (cand[c + 1] - cand[a + 1]) - (cand[b + 1] - cand[a + 1]) * (cand[c] - cand[a]);
+    if (cross < 0) {
+        const t : usize = tri[1];
+        tri[1] = tri[2];
+        tri[2] = t;
+    }
+    return true;
+}
+
+/// The version the three finders give: the side in modules is the mean leg over the mean module size, plus 7.
+/// 0 when the side is below 15.
+pub fn qs_version_est(cand: []const i64, tri: []const usize) -> u32 {
+    const m : i64 = (cand[tri[0] * 4 + 2] + cand[tri[1] * 4 + 2] + cand[tri[2] * 4 + 2]) / 3;
+    if (m <= 0) { return 0; }
+    const lab : i64 = qs_isqrt(qs_d2(cand, tri[0], tri[1]));
+    const lac : i64 = qs_isqrt(qs_d2(cand, tri[0], tri[2]));
+    const dim : i64 = (2 * (lab + lac) + 2 * m) / (4 * m) + 7;
+    if (dim < 15 or dim > 100) { return 0; }
+    return @as(u32, @intCast((dim - 15) / 4));
+}
+
+// ---------------------------------------------------------------- 4. the modules
+
+/// The dim x dim modules into grid (1 dark): the centre of module (r, c) is A + (c - 3) (B - A) / (dim - 7) +
+/// (r - 3) (C - A) / (dim - 7), A, B, C the finder centres (top left, top right, bottom left). Outside the frame
+/// reads light.
+pub fn qs_sample(bin: []const u8, w: usize, h: usize, cand: []const i64, tri: []const usize, dim: usize, grid: []u8) -> void {
+    const ax : i64 = cand[tri[0] * 4];
+    const ay : i64 = cand[tri[0] * 4 + 1];
+    const ux : i64 = cand[tri[1] * 4] - ax;
+    const uy : i64 = cand[tri[1] * 4 + 1] - ay;
+    const vx : i64 = cand[tri[2] * 4] - ax;
+    const vy : i64 = cand[tri[2] * 4 + 1] - ay;
+    const num : i64 = @as(i64, @intCast(dim)) - 7;
+    var r : usize = 0;
+    while (r < dim) {
+        var c : usize = 0;
+        while (c < dim) {
+            const u : i64 = @as(i64, @intCast(c)) - 3;
+            const v : i64 = @as(i64, @intCast(r)) - 3;
+            const px : i64 = ax + (u * ux + v * vx) / num;
+            const py : i64 = ay + (u * uy + v * vy) / num;
+            var bit : u8 = 0;
+            if (px >= 0 and py >= 0) {
+                const x : usize = @as(usize, @intCast(px / 16));
+                const y : usize = @as(usize, @intCast(py / 16));
+                if (x < w and y < h) { bit = bin[y * w + x]; }
+            }
+            grid[r * dim + c] = bit;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+}
+
+/// The 15-bit format word of the 5 data bits d (level bits, mask): BCH(15, 5) with 0x537, XOR 0x5412.
+pub fn qs_fmt_word(d: u32) -> u32 {
+    const x : u32 = (d & 31) << 10;
+    var r : u32 = x;
+    var k : u32 = 14;
+    while (k >= 10) {
+        if (((r >> k) & 1) != 0) { r = r ^ (1335 << (k - 10)); }
+        k = k - 1;
+    }
+    return (x | r) ^ 21522;
+}
+
+fn qs_popc(v: u32) -> u32 {
+    var n : u32 = 0;
+    var x : u32 = v;
+    while (x != 0) {
+        n = n + (x & 1);
+        x = x >> 1;
+    }
+    return n;
+}
+
+fn qs_g(grid: []const u8, dim: usize, r: usize, c: usize) -> u32 { return @as(u32, grid[r * dim + c] & 1); }
+
+/// The 5 data bits of the format (level bits * 8 + mask) from the two copies around the finders (as qr_put_format
+/// writes them), the nearest of the 32 words within 3 bits; 32 when none is that near.
+pub fn qs_format(grid: []const u8, dim: usize) -> u32 {
+    var f1 : u32 = 0;
+    var f2 : u32 = 0;
+    var i : usize = 0;
+    while (i < 8) {
+        var off : usize = 0;
+        if (i >= 6) { off = 1; }
+        const sh : u32 = @as(u32, @intCast(i));
+        f1 = f1 | (qs_g(grid, dim, i + off, 8) << sh);
+        f1 = f1 | (qs_g(grid, dim, 8, i + off) << (14 - sh));
+        f2 = f2 | (qs_g(grid, dim, 8, dim - 1 - i) << sh);
+        if (i < 7) { f2 = f2 | (qs_g(grid, dim, dim - 1 - i, 8) << (14 - sh)); }
+        i = i + 1;
+    }
+    var best : u32 = 99;
+    var bd : u32 = 32;
+    var d : u32 = 0;
+    while (d < 32) {
+        const fw : u32 = qs_fmt_word(d);
+        var e : u32 = qs_popc(f1 ^ fw);
+        const e2 : u32 = qs_popc(f2 ^ fw);
+        if (e2 < e) { e = e2; }
+        if (e < best) {
+            best = e;
+            bd = d;
+        }
+        d = d + 1;
+    }
+    if (best > 3) { return 32; }
+    return bd;
+}
+
+/// The n codewords of a version ver symbol from grid with mask taken off: the data cells (those qr.t27 leaves free
+/// once the function patterns stand) in qr_place order, the highest bit first. Returns the codewords read.
+pub fn qs_codewords(grid: []const u8, dim: usize, ver: u32, mask: u32, out: []u8, n: usize) -> usize {
+    var m : [QS_GRID]u8 = undefined;
+    qr_init(m[0..QS_GRID], dim);
+    qr_reserve(m[0..QS_GRID], dim, ver);
+    qr_timing(m[0..QS_GRID], dim);
+    qr_finders(m[0..QS_GRID], dim);
+    qr_alignment(m[0..QS_GRID], dim, ver);
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    var placed : usize = 0;
+    var right : usize = dim - 1;
+    var up : bool = true;
+    while (right >= 1) {
+        if (right == 6) { right = 5; }
+        var v : usize = 0;
+        while (v < dim) {
+            var r : usize = v;
+            if (up) { r = dim - 1 - v; }
+            var z : usize = 0;
+            while (z < 2) {
+                const c : usize = right - z;
+                if (m[r * dim + c] == QR_FREE and placed < n * 8) {
+                    var bit : u8 = grid[r * dim + c] & 1;
+                    if (qr_mask_hit(mask, r, c)) { bit = bit ^ 1; }
+                    if (bit != 0) { out[placed / 8] = out[placed / 8] | @as(u8, @intCast(128 >> @as(u32, @intCast(placed % 8)))); }
+                    placed = placed + 1;
+                }
+                z = z + 1;
+            }
+            v = v + 1;
+        }
+        up = up == false;
+        if (right < 2) { right = 0; } else { right = right - 2; }
+    }
+    return placed / 8;
+}
+
+// ---------------------------------------------------------------- 5. Reed-Solomon decoding
+
+fn qs_gf_div(exp: []const u8, lg: []const u8, a: u8, b: u8) -> u8 {
+    if (a == 0 or b == 0) { return 0; }
+    return exp[@as(usize, lg[@as(usize, a)]) + 255 - @as(usize, lg[@as(usize, b)])];
+}
+
+/// p[0] + p[1] x + .. + p[deg] x^deg at x.
+fn qs_poly_at(exp: []const u8, lg: []const u8, p: []const u8, deg: usize, x: u8) -> u8 {
+    var v : u8 = 0;
+    var i : usize = deg + 1;
+    while (i > 0) {
+        v = qr_gf_mul(exp, lg, v, x) ^ p[i - 1];
+        i = i - 1;
+    }
+    return v;
+}
+
+/// The e syndromes of the n codewords (the first the highest power) at 2^0 .. 2^(e-1) into s; true when all are 0.
+fn qs_syndromes(exp: []const u8, lg: []const u8, cw: []const u8, n: usize, e: usize, s: []u8) -> bool {
+    var clean : bool = true;
+    var i : usize = 0;
+    while (i < e) {
+        var v : u8 = 0;
+        var j : usize = 0;
+        while (j < n) {
+            v = qr_gf_mul(exp, lg, v, exp[i]) ^ cw[j];
+            j = j + 1;
+        }
+        s[i] = v;
+        if (v != 0) { clean = false; }
+        i = i + 1;
+    }
+    return clean;
+}
+
+/// Correct the block of n codewords with e error codewords in place: the errors fixed (0 for a clean block), or -1
+/// when they are more than e / 2 or the result does not check.
+pub fn qs_rs_fix(cw: []u8, n: usize, e: usize) -> i32 {
+    if (e == 0 or e > 30 or n > 255 or n <= e) { return -1; }
+    var exp : [512]u8 = undefined;
+    var lg : [256]u8 = undefined;
+    qr_gf_tables(exp[0..512], lg[0..256]);
+    var s : [32]u8 = undefined;
+    if (qs_syndromes(exp[0..512], lg[0..256], cw, n, e, s[0..32])) { return 0; }
+    // Berlekamp-Massey: the error locator C, degree el
+    var c : [33]u8 = undefined;
+    var b : [33]u8 = undefined;
+    var t : [33]u8 = undefined;
+    var i : usize = 0;
+    while (i < 33) {
+        c[i] = 0;
+        b[i] = 0;
+        i = i + 1;
+    }
+    c[0] = 1;
+    b[0] = 1;
+    var el : usize = 0;
+    var m : usize = 1;
+    var bb : u8 = 1;
+    var k : usize = 0;
+    while (k < e) {
+        var d : u8 = s[k];
+        i = 1;
+        while (i <= el) {
+            d = d ^ qr_gf_mul(exp[0..512], lg[0..256], c[i], s[k - i]);
+            i = i + 1;
+        }
+        if (d == 0) {
+            m = m + 1;
+        } else {
+            const coef : u8 = qs_gf_div(exp[0..512], lg[0..256], d, bb);
+            i = 0;
+            while (i < 33) {
+                t[i] = c[i];
+                i = i + 1;
+            }
+            i = 0;
+            while (i + m < 33) {
+                c[i + m] = c[i + m] ^ qr_gf_mul(exp[0..512], lg[0..256], coef, b[i]);
+                i = i + 1;
+            }
+            if (2 * el <= k) {
+                el = k + 1 - el;
+                i = 0;
+                while (i < 33) {
+                    b[i] = t[i];
+                    i = i + 1;
+                }
+                bb = d;
+                m = 1;
+            } else {
+                m = m + 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (el == 0 or 2 * el > e) { return -1; }
+    // Chien: codeword j stands at power n - 1 - j; an error there makes C(2^-(n-1-j)) zero
+    var pos : [16]usize = undefined;
+    var nf : usize = 0;
+    var j : usize = 0;
+    while (j < n) {
+        const p : usize = n - 1 - j;
+        const xi : u8 = exp[(255 - p) % 255];
+        if (qs_poly_at(exp[0..512], lg[0..256], c[0..33], el, xi) == 0) {
+            if (nf < 16) { pos[nf] = j; }
+            nf = nf + 1;
+        }
+        j = j + 1;
+    }
+    if (nf != el) { return -1; }
+    // Forney: Omega = S C mod x^e; the magnitude is X Omega(X^-1) / C'(X^-1)
+    var om : [32]u8 = undefined;
+    k = 0;
+    while (k < e) {
+        var v : u8 = 0;
+        i = 0;
+        while (i <= k and i <= el) {
+            v = v ^ qr_gf_mul(exp[0..512], lg[0..256], c[i], s[k - i]);
+            i = i + 1;
+        }
+        om[k] = v;
+        k = k + 1;
+    }
+    var dl : [33]u8 = undefined;
+    i = 0;
+    while (i < 33) {
+        dl[i] = 0;
+        if (i % 2 == 0 and i + 1 < 33) { dl[i] = c[i + 1]; }
+        i = i + 1;
+    }
+    var q : usize = 0;
+    while (q < nf) {
+        const jj : usize = pos[q];
+        const p : usize = n - 1 - jj;
+        const xx : u8 = exp[p % 255];
+        const xi : u8 = exp[(255 - p) % 255];
+        const num : u8 = qs_poly_at(exp[0..512], lg[0..256], om[0..32], e - 1, xi);
+        const den : u8 = qs_poly_at(exp[0..512], lg[0..256], dl[0..33], el, xi);
+        if (den == 0) { return -1; }
+        cw[jj] = cw[jj] ^ qr_gf_mul(exp[0..512], lg[0..256], xx, qs_gf_div(exp[0..512], lg[0..256], num, den));
+        q = q + 1;
+    }
+    if (qs_syndromes(exp[0..512], lg[0..256], cw, n, e, s[0..32]) == false) { return -1; }
+    return @as(i32, @intCast(el));
+}
+
+// ---------------------------------------------------------------- 6. the text
+
+fn qs_get(cw: []const u8, p: usize, k: usize) -> u32 {
+    var v : u32 = 0;
+    var i : usize = 0;
+    while (i < k) {
+        const q : usize = p + i;
+        v = (v << 1) | @as(u32, (cw[q / 8] >> @as(u8, @intCast(7 - q % 8))) & 1);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The bytes of the one byte-mode segment in the dn data codewords into text: the count, -1 when the mode is not
+/// 0100, -2 when the count does not fit the codewords or text.
+pub fn qs_bytes(cw: []const u8, dn: usize, text: []u8) -> i32 {
+    if (dn < 2) { return -2; }
+    if (qs_get(cw, 0, 4) != 4) { return -1; }
+    const cnt : usize = @as(usize, qs_get(cw, 4, 8));
+    if (12 + cnt * 8 > dn * 8 or cnt > text.len) { return -2; }
+    var i : usize = 0;
+    while (i < cnt) {
+        text[i] = @as(u8, @intCast(qs_get(cw, 12 + 8 * i, 8)));
+        i = i + 1;
+    }
+    return @as(i32, @intCast(cnt));
+}
+
+// ---------------------------------------------------------------- 7. the whole frame
+
+/// The code of version ver through the three finders tri: len * 16 + QS_OK with the text in text, or the reason.
+pub fn qs_decode_at(bin: []const u8, w: usize, h: usize, cand: []const i64, tri: []const usize, ver: u32, text: []u8) -> u32 {
+    if (ver < 1 or ver > QS_VER_MAX) { return QS_GEOMETRY; }
+    const dim : usize = 17 + 4 * @as(usize, ver);
+    var grid : [QS_GRID]u8 = undefined;
+    qs_sample(bin, w, h, cand, tri, dim, grid[0..QS_GRID]);
+    const d5 : u32 = qs_format(grid[0..QS_GRID], dim);
+    if (d5 > 31) { return QS_FORMAT; }
+    if ((d5 >> 3) != 1) { return QS_LEVEL; }
+    const n : usize = qs_total_cw(ver);
+    const e : usize = qs_ec_cw(ver);
+    var cw : [100]u8 = undefined;
+    _ = qs_codewords(grid[0..QS_GRID], dim, ver, d5 & 7, cw[0..100], n);
+    if (qs_rs_fix(cw[0..100], n, e) < 0) { return QS_ECC; }
+    const len : i32 = qs_bytes(cw[0..100], n - e, text);
+    if (len < 0) { return QS_MODE; }
+    return @as(u32, @intCast(len)) * 16 + QS_OK;
+}
+
+/// One reading of the binary picture: the finders, the triangle, the version found and its neighbours.
+fn qs_try(bin: []const u8, w: usize, h: usize, text: []u8) -> u32 {
+    var cand : [256]i64 = undefined;
+    const n : usize = qs_finders(bin, w, h, cand[0..256]);
+    if (n < 3) { return QS_NO_CODE; }
+    var tri : [3]usize = [0, 0, 0];
+    if (qs_pick3(cand[0..256], n, tri[0..3]) == false) { return QS_GEOMETRY; }
+    const v0 : u32 = qs_version_est(cand[0..256], tri[0..3]);
+    var best : u32 = QS_GEOMETRY;
+    var k : u32 = 0;
+    while (k < 3) {
+        var v : u32 = v0;
+        // the version below; there is none below 0 (three finders closer than a version 1 symbol)
+        if (k == 1) {
+            if (v0 > 0) { v = v0 - 1; } else { v = 0; }
+        }
+        if (k == 2) { v = v0 + 1; }
+        if (v >= 1 and v <= QS_VER_MAX) {
+            const r : u32 = qs_decode_at(bin, w, h, cand[0..256], tri[0..3], v, text);
+            if (qs_reason(r) == QS_OK) { return r; }
+            if (qs_reason(r) > best) { best = qs_reason(r); }
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+/// The text of the code in the frame g (w x h grey bytes) into text, bin a work buffer of w * h bytes: len * 16 +
+/// QS_OK, or the reason of the reading that got furthest (the picture as it is, then inverted).
+pub fn qs_read(g: []const u8, w: usize, h: usize, bin: []u8, text: []u8) -> u32 {
+    if (qs_binarize(g, w, h, bin) == false) { return QS_ARG; }
+    const r : u32 = qs_try(bin, w, h, text);
+    if (qs_reason(r) == QS_OK) { return r; }
+    qs_invert(bin, w * h);
+    const r2 : u32 = qs_try(bin, w, h, text);
+    if (qs_reason(r2) == QS_OK) { return r2; }
+    if (r2 > r) { return r2; }
+    return r;
+}
+
+/// The key in the frame into out (INVITE_LEN bytes): QS_OK, or the reason; QS_NOT_KEY when the code reads but its
+/// text is not a key (invite_parse: the shape, the alphabet, the check symbol).
+pub fn qs_scan_key(g: []const u8, w: usize, h: usize, bin: []u8, out: []u8) -> u32 {
+    if (out.len < INVITE_LEN) { return QS_ARG; }
+    var text : [QS_TEXT_MAX]u8 = undefined;
+    const r : u32 = qs_read(g, w, h, bin, text[0..QS_TEXT_MAX]);
+    if (qs_reason(r) != QS_OK) { return qs_reason(r); }
+    const len : usize = qs_len(r);
+    var fp : [FP_BYTES]u8 = undefined;
+    if (invite_parse(text[0..len], fp[0..FP_BYTES]) != INV_OK) { return QS_NOT_KEY; }
+    var i : usize = 0;
+    while (i < INVITE_LEN) {
+        out[i] = text[i];
+        i = i + 1;
+    }
+    return QS_OK;
+}
+
+// ---------------------------------------------------------------- 8. a frame from a file
+
+fn qs_space(c: u8) -> bool { return c == 32 or c == 9 or c == 10 or c == 13; }
+
+/// The header of a binary PGM ("P5", the width, the height, 255, one blank, # comments allowed): the offset of the
+/// pixels with dims[0] = w, dims[1] = h; 0 when it is not such a file or the pixels are short.
+pub fn qs_pgm(b: []const u8, n: usize, dims: []usize) -> usize {
+    if (n < 8 or b[0] != 80 or b[1] != 53) { return 0; }
+    var p : usize = 2;
+    var v : [3]usize = [0, 0, 0];
+    var k : usize = 0;
+    while (k < 3) {
+        var skipping : bool = true;
+        while (skipping and p < n) {
+            if (qs_space(b[p])) {
+                p = p + 1;
+            } else {
+                if (b[p] == 35) {
+                    while (p < n and b[p] != 10) { p = p + 1; }
+                } else {
+                    skipping = false;
+                }
+            }
+        }
+        var digits : usize = 0;
+        while (p < n and b[p] >= 48 and b[p] <= 57 and digits < 6) {
+            v[k] = v[k] * 10 + @as(usize, b[p] - 48);
+            p = p + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0 or p >= n or qs_space(b[p]) == false) { return 0; }
+        k = k + 1;
+    }
+    p = p + 1;
+    if (v[2] != 255 or v[0] == 0 or v[1] == 0 or p + v[0] * v[1] > n) { return 0; }
+    dims[0] = v[0];
+    dims[1] = v[1];
+    return p;
+}
+
+// ---------------------------------------------------------------- tests
+
+// The frames are drawn here from the codes qr.t27 makes (it matches segno 1.6.6 module for module) and from one
+// segno version 1 matrix; the camera-like files (segno + Pillow: rotation, noise, blur, inversion, a cut) are read
+// by specs/t27os/qr_scan_probe.t27, which also times a 640 x 480 frame.
+const QS_T_W : usize = 320;
+const QS_T_H : usize = 240;
+const QS_T_N : usize = 76800;
+
+// segno 1.6.6: make("https://t27.ai", error='L', mode='byte', boost_error=False, version=1), mask 3, row by row,
+// one hex digit per four modules
+const QS_T_V1 : str = "feabf8823208bac2e8bacae8ba92e8826208feabf8000000f2ece8c1e7f89f045839d15017cec8009e80fe54808221e8ba4cb0bacd10ba8b2082cb88fe92e0";
+
+fn qs_t_unhex(hex: []const u8, size: usize, t: []u8) -> void {
+    const d : usize = (size + 3) / 4;
+    var r : usize = 0;
+    while (r < size) {
+        var c : usize = 0;
+        while (c < size) {
+            const ch : u8 = hex[r * d + c / 4];
+            var nib : u8 = 0;
+            if (ch >= 48 and ch <= 57) { nib = ch - 48; }
+            if (ch >= 97 and ch <= 102) { nib = ch - 87; }
+            t[r * size + c] = (nib >> @as(u8, @intCast(3 - c % 4))) & 1;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+}
+
+/// The matrix t (size x size) drawn into g (w x h) at its centre: mod16 / 16 pixels a module, turned by the angle
+/// with cos and sin times 1024, dark 40 and light 215 (swapped when inverted), the ground light.
+fn qs_t_draw(t: []const u8, size: usize, g: []u8, w: usize, h: usize, mod16: i64, cs: i64, sn: i64, inverted: bool) -> void {
+    const half : i64 = @as(i64, @intCast(size)) * mod16 / 2;
+    const cx : i64 = @as(i64, @intCast(w)) * 8;
+    const cy : i64 = @as(i64, @intCast(h)) * 8;
+    const sz : i64 = @as(i64, @intCast(size));
+    var y : usize = 0;
+    while (y < h) {
+        var x : usize = 0;
+        while (x < w) {
+            const dx : i64 = @as(i64, @intCast(x)) * 16 + 8 - cx;
+            const dy : i64 = @as(i64, @intCast(y)) * 16 + 8 - cy;
+            const u : i64 = (dx * cs + dy * sn) / 1024 + half;
+            const v : i64 = (dy * cs - dx * sn) / 1024 + half;
+            var dark : bool = false;
+            if (u >= 0 and v >= 0) {
+                const col : i64 = u / mod16;
+                const row : i64 = v / mod16;
+                if (col < sz and row < sz) { dark = t[@as(usize, @intCast(row * sz + col))] == 1; }
+            }
+            var p : u8 = 215;
+            if (dark) { p = 40; }
+            if (inverted) { p = 255 - p; }
+            g[y * w + x] = p;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// Every pixel moved by a pseudo-random amount in -amp .. amp (a fixed LCG), clamped to 0 .. 255.
+fn qs_t_noise(g: []u8, n: usize, amp: u64, seed: u64) -> void {
+    var s : u64 = seed;
+    var i : usize = 0;
+    while (i < n) {
+        s = (s * 1103515245 + 12345) % 2147483648;
+        const d : i64 = @as(i64, @intCast((s >> 16) % (2 * amp + 1))) - @as(i64, @intCast(amp));
+        var v : i64 = @as(i64, g[i]) + d;
+        if (v < 0) { v = 0; }
+        if (v > 255) { v = 255; }
+        g[i] = @as(u8, @intCast(v));
+        i = i + 1;
+    }
+}
+
+/// The 3 x 3 mean of src into dst (the edge pixels copied).
+fn qs_t_blur(src: []const u8, dst: []u8, w: usize, h: usize) -> void {
+    var y : usize = 0;
+    while (y < h) {
+        var x : usize = 0;
+        while (x < w) {
+            if (x == 0 or y == 0 or x + 1 == w or y + 1 == h) {
+                dst[y * w + x] = src[y * w + x];
+            } else {
+                var s : u32 = 0;
+                var yy : usize = y - 1;
+                while (yy <= y + 1) {
+                    var xx : usize = x - 1;
+                    while (xx <= x + 1) {
+                        s = s + @as(u32, src[yy * w + xx]);
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                dst[y * w + x] = @as(u8, @intCast(s / 9));
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn qs_t_fill(g: []u8, w: usize, x0: usize, y0: usize, x1: usize, y1: usize, v: u8) -> void {
+    var y : usize = y0;
+    while (y < y1) {
+        var x : usize = x0;
+        while (x < x1) {
+            g[y * w + x] = v;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// A test key "T27-TEST-...": the symbols T, E, S, T, then twelve from k, through invite_make (so the check symbol
+/// is the real one). Returns the length (INVITE_LEN).
+fn qs_t_key(k: usize, out: []u8) -> usize {
+    var vals : [16]u32 = undefined;
+    vals[0] = sym_value(84);
+    vals[1] = sym_value(69);
+    vals[2] = sym_value(83);
+    vals[3] = sym_value(84);
+    var j : usize = 4;
+    while (j < 16) {
+        vals[j] = @as(u32, @intCast((k * 7 + j * 13 + k * j * 5 + 3) % 32));
+        j = j + 1;
+    }
+    var fp : [FP_BYTES]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    j = 0;
+    while (j < 80) {
+        const bit : u32 = (vals[j / 5] >> @as(u32, @intCast(4 - j % 5))) & 1;
+        if (bit != 0) { fp[j / 8] = fp[j / 8] | @as(u8, @intCast(128 >> @as(u32, @intCast(j % 8)))); }
+        j = j + 1;
+    }
+    return invite_make(fp[0..FP_BYTES], out);
+}
+
+fn qs_t_same(a: []const u8, b: []const u8, n: usize) -> bool {
+    var i : usize = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test qs_versions_one_to_four_are_one_block_each_at_level_l {
+    assert qs_total_cw(1) == 26 and qs_total_cw(2) == 44 and qs_total_cw(3) == 70 and qs_total_cw(4) == 100;
+    assert qs_ec_cw(1) == 7 and qs_ec_cw(2) == 10 and qs_ec_cw(3) == 15 and qs_ec_cw(4) == 20;
+    assert qs_total_cw(5) == 0 and qs_ec_cw(0) == 0;
+    assert qs_reason(25 * 16 + QS_NOT_KEY) == QS_NOT_KEY and qs_len(25 * 16 + QS_NOT_KEY) == 25;
+    assert qs_isqrt(0) == 0 and qs_isqrt(1) == 1 and qs_isqrt(99) == 9 and qs_isqrt(100) == 10 and qs_isqrt(-4) == 0;
+}
+
+test qs_the_format_words_are_qr_t27s_and_iso_tables {
+    // level L is data bits 01: qr.t27 makes these for masks 0..7
+    var k : u32 = 0;
+    while (k < 8) {
+        assert qs_fmt_word(8 + k) == qr_format_bits(k);
+        k = k + 1;
+    }
+    // ISO Table C.1: M with mask 0 (data 00000) is 101010000010010
+    assert qs_fmt_word(0) == 21522;
+}
+
+test qs_the_format_reads_back_with_three_wrong_bits_and_not_with_eight {
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    _ = qr_make_at("HELLO", 5, 2, 5, t[0..QR_CELLS_MAX]);
+    assert qs_format(t[0..QR_CELLS_MAX], 25) == 13;
+    // three bits of the first copy wrong, the second copy clean: still mask 5
+    t[0 * 25 + 8] = t[0 * 25 + 8] ^ 1;
+    t[1 * 25 + 8] = t[1 * 25 + 8] ^ 1;
+    t[8 * 25 + 2] = t[8 * 25 + 2] ^ 1;
+    assert qs_format(t[0..QR_CELLS_MAX], 25) == 13;
+    // both copies all light: every word is 5 bits or more away
+    var i : usize = 0;
+    while (i < 25) {
+        t[8 * 25 + i] = 0;
+        t[i * 25 + 8] = 0;
+        i = i + 1;
+    }
+    assert qs_format(t[0..QR_CELLS_MAX], 25) == 32;
+}
+
+test qs_reed_solomon_fixes_up_to_half_the_error_codewords_and_refuses_more {
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords("T27-TEST-0000-0000-0000-0", 25, 2, dc[0..QR_DATA_MAX]);
+    var msg : [QR_CW_MAX]u8 = undefined;
+    assert qr_message(dc[0..QR_DATA_MAX], 2, msg[0..QR_CW_MAX]) == 44;
+    var cw : [100]u8 = undefined;
+    var i : usize = 0;
+    while (i < 44) {
+        cw[i] = msg[i];
+        i = i + 1;
+    }
+    assert qs_rs_fix(cw[0..100], 44, 10) == 0;
+    // five codewords wrong (one in the error codewords): all five fixed
+    cw[0] = cw[0] ^ 255;
+    cw[7] = cw[7] ^ 1;
+    cw[20] = cw[20] ^ 77;
+    cw[33] = cw[33] ^ 128;
+    cw[43] = cw[43] ^ 9;
+    assert qs_rs_fix(cw[0..100], 44, 10) == 5;
+    assert qs_t_same(cw[0..44], msg[0..44], 44);
+    // six wrong: refused, not "fixed" into another block
+    cw[1] = cw[1] ^ 3;
+    cw[5] = cw[5] ^ 30;
+    cw[11] = cw[11] ^ 200;
+    cw[17] = cw[17] ^ 1;
+    cw[29] = cw[29] ^ 64;
+    cw[40] = cw[40] ^ 5;
+    assert qs_rs_fix(cw[0..100], 44, 10) == -1;
+    // version 4: ten of 100 fixed
+    var d4 : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords("T27-TEST-0000-0000-0000-0", 25, 4, d4[0..QR_DATA_MAX]);
+    var m4 : [QR_CW_MAX]u8 = undefined;
+    assert qr_message(d4[0..QR_DATA_MAX], 4, m4[0..QR_CW_MAX]) == 100;
+    i = 0;
+    while (i < 100) {
+        cw[i] = m4[i];
+        if (i % 10 == 3) { cw[i] = cw[i] ^ @as(u8, @intCast(i + 1)); }
+        i = i + 1;
+    }
+    assert qs_rs_fix(cw[0..100], 100, 20) == 10;
+    assert qs_t_same(cw[0..100], m4[0..100], 100);
+    assert qs_rs_fix(cw[0..100], 10, 20) == -1;
+}
+
+test qs_the_byte_segment_reads_its_count_and_refuses_another_mode {
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords("HELLO", 5, 2, dc[0..QR_DATA_MAX]);
+    var text : [QS_TEXT_MAX]u8 = undefined;
+    assert qs_bytes(dc[0..QR_DATA_MAX], 34, text[0..QS_TEXT_MAX]) == 5;
+    assert text[0] == 72 and text[4] == 79;
+    // a count longer than the codewords
+    assert qs_bytes(dc[0..QR_DATA_MAX], 3, text[0..QS_TEXT_MAX]) == -2;
+    // mode 0010 (alphanumeric) is not ours
+    dc[0] = 32;
+    assert qs_bytes(dc[0..QR_DATA_MAX], 34, text[0..QS_TEXT_MAX]) == -1;
+}
+
+test qs_a_pgm_header_gives_the_pixels_and_a_wrong_one_gives_nothing {
+    var dims : [2]usize = [0, 0];
+    const f : str = "P5\n# t27\n3 2\n255\nabcdef";
+    assert qs_pgm(f, f.len, dims[0..2]) == 17 and dims[0] == 3 and dims[1] == 2;
+    assert qs_pgm("P5 3 2 255 abcde", 16, dims[0..2]) == 0;
+    assert qs_pgm("P2 3 2 255 abcdef", 17, dims[0..2]) == 0;
+    assert qs_pgm("P5 3 2 65535 abcdef", 19, dims[0..2]) == 0;
+}
+
+test qs_binarize_keeps_a_flat_frame_light_and_finds_the_finders_of_a_code {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var i : usize = 0;
+    while (i < QS_T_N) {
+        g[i] = 128;
+        i = i + 1;
+    }
+    assert qs_binarize(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N]);
+    var dark : usize = 0;
+    i = 0;
+    while (i < QS_T_N) {
+        dark = dark + @as(usize, bin[i]);
+        i = i + 1;
+    }
+    assert dark == 0;
+    assert qs_binarize(g[0..QS_T_N], 20, 20, bin[0..QS_T_N]) == false;
+    assert qs_binarize(g[0..QS_T_N], 2000, 20, bin[0..QS_T_N]) == false;
+    assert qs_binarize(g[0..100], QS_T_W, QS_T_H, bin[0..QS_T_N]) == false;
+    // a version 2 key at 6 pixels a module: three finders, a right triangle, version 2
+    var key : [32]u8 = undefined;
+    _ = qs_t_key(1, key[0..32]);
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const made : u32 = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    assert qs_binarize(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N]);
+    var cand : [256]i64 = undefined;
+    const n : usize = qs_finders(bin[0..QS_T_N], QS_T_W, QS_T_H, cand[0..256]);
+    assert n >= 3;
+    var tri : [3]usize = [0, 0, 0];
+    assert qs_pick3(cand[0..256], n, tri[0..3]);
+    // the symbol is 150 pixels from x = 85, y = 45: the top left finder's centre at (85 + 21, 45 + 21)
+    const a : usize = tri[0] * 4;
+    assert qs_iabs(cand[a] - 106 * 16) <= 16 and qs_iabs(cand[a + 1] - 66 * 16) <= 16;
+    assert cand[tri[1] * 4] > cand[a] and cand[tri[2] * 4 + 1] > cand[a + 1];
+    assert qs_version_est(cand[0..256], tri[0..3]) == 2;
+    assert qs_iabs(cand[a + 2] - 96) <= 16;
+    // the runs: a 1:1:3:1:1 finder and a wrong one
+    const ok5 : [5]usize = [6, 6, 18, 6, 6];
+    const bad5 : [5]usize = [6, 6, 6, 6, 6];
+    assert qs_ratio(ok5[0..5]) and qs_ratio(bad5[0..5]) == false;
+    var r : [2]i64 = [0, 0];
+    assert qs_cross(bin[0..QS_T_N], QS_T_W, QS_T_H, true, 106, 66, 18, 42, r[0..2]);
+    assert qs_iabs(r[0] - 66 * 16) <= 16 and r[1] >= 40 and r[1] <= 44;
+    assert qs_cross(bin[0..QS_T_N], QS_T_W, QS_T_H, true, 5, 66, 18, 42, r[0..2]) == false;
+    // the merge of one finder seen twice, a new one apart
+    var c2 : [256]i64 = undefined;
+    var m : usize = qs_add(c2[0..256], 0, 1600, 1600, 96);
+    m = qs_add(c2[0..256], m, 1610, 1590, 96);
+    assert m == 1 and c2[3] == 2 and c2[0] == 1605;
+    m = qs_add(c2[0..256], m, 3200, 1600, 96);
+    assert m == 2;
+    // sampled modules equal the matrix
+    var grid : [QS_GRID]u8 = undefined;
+    qs_sample(bin[0..QS_T_N], QS_T_W, QS_T_H, cand[0..256], tri[0..3], 25, grid[0..QS_GRID]);
+    var same : usize = 0;
+    i = 0;
+    while (i < 625) {
+        if (grid[i] == t[i]) { same = same + 1; }
+        i = i + 1;
+    }
+    assert same == 625;
+    var text : [QS_TEXT_MAX]u8 = undefined;
+    assert qs_decode_at(bin[0..QS_T_N], QS_T_W, QS_T_H, cand[0..256], tri[0..3], 2, text[0..QS_TEXT_MAX]) == 25 * 16;
+    assert qs_decode_at(bin[0..QS_T_N], QS_T_W, QS_T_H, cand[0..256], tri[0..3], 5, text[0..QS_TEXT_MAX]) == QS_GEOMETRY;
+    // the codewords read back unmasked are the message qr.t27 placed
+    var cw : [100]u8 = undefined;
+    assert qs_codewords(t[0..QR_CELLS_MAX], 25, 2, made % 16, cw[0..100], 44) == 44;
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords(key[0..25], 25, 2, dc[0..QR_DATA_MAX]);
+    assert qs_t_same(cw[0..34], dc[0..34], 34);
+    // inverting twice is the picture again
+    qs_invert(bin[0..QS_T_N], QS_T_N);
+    assert bin[0] == 1;
+    qs_invert(bin[0..QS_T_N], QS_T_N);
+    assert bin[0] == 0;
+}
+
+test qs_this_oses_key_code_reads_back_from_a_640_by_480_frame {
+    // the code the cabinet draws (qr_make of the key), a test key, 8 pixels a module, in a camera-sized frame
+    var g : [307200]u8 = undefined;
+    var bin : [307200]u8 = undefined;
+    var key : [32]u8 = undefined;
+    assert qs_t_key(0, key[0..32]) == 25;
+    assert key[0] == 84 and key[4] == 84 and key[5] == 69 and key[6] == 83 and key[7] == 84 and key[8] == 45;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..307200], 640, 480, 128, 1024, 0, false);
+    var out : [32]u8 = undefined;
+    assert qs_scan_key(g[0..307200], 640, 480, bin[0..307200], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+    assert qs_scan_key(g[0..307200], 640, 480, bin[0..307200], out[0..10]) == QS_ARG;
+}
+
+test qs_ten_different_keys_read_back_at_their_sizes_and_turns {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var key : [32]u8 = undefined;
+    var out : [32]u8 = undefined;
+    // cos and sin times 1024 of 0, 5, -5, 10 and -10 degrees
+    const cs : [5]i64 = [1024, 1020, 1020, 1008, 1008];
+    const sn : [5]i64 = [0, 89, -89, 178, -178];
+    var k : usize = 0;
+    var good : usize = 0;
+    while (k < 10) {
+        _ = qs_t_key(k + 2, key[0..32]);
+        _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+        qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, @as(i64, @intCast(80 + 8 * (k % 4))), cs[k % 5], sn[k % 5], false);
+        if (qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK and qs_t_same(out[0..25], key[0..25], 25)) { good = good + 1; }
+        k = k + 1;
+    }
+    assert good == 10;
+}
+
+test qs_a_key_turned_ten_degrees_either_way_reads_back {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var key : [32]u8 = undefined;
+    var out : [32]u8 = undefined;
+    _ = qs_t_key(3, key[0..32]);
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1008, 178, false);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1008, -178, false);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+}
+
+test qs_a_noisy_a_blurred_and_an_inverted_key_read_back {
+    var g : [QS_T_N]u8 = undefined;
+    var g2 : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var key : [32]u8 = undefined;
+    var out : [32]u8 = undefined;
+    _ = qs_t_key(4, key[0..32]);
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    // noise of +-40 grey levels on every pixel
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1024, 0, false);
+    qs_t_noise(g[0..QS_T_N], QS_T_N, 40, 7);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+    // blurred twice by a 3 x 3 mean, turned 5 degrees
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1020, 89, false);
+    qs_t_blur(g[0..QS_T_N], g2[0..QS_T_N], QS_T_W, QS_T_H);
+    qs_t_blur(g2[0..QS_T_N], g[0..QS_T_N], QS_T_W, QS_T_H);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+    // light modules on a dark ground
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1024, 0, true);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+}
+
+test qs_three_wrong_modules_are_fixed_by_the_error_codewords {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var key : [32]u8 = undefined;
+    var out : [32]u8 = undefined;
+    _ = qs_t_key(5, key[0..32]);
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    // three data modules flipped, far apart (three codewords)
+    t[10 * 25 + 12] = t[10 * 25 + 12] ^ 1;
+    t[14 * 25 + 22] = t[14 * 25 + 22] ^ 1;
+    t[22 * 25 + 12] = t[22 * 25 + 12] ^ 1;
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_OK;
+    assert qs_t_same(out[0..25], key[0..25], 25);
+}
+
+test qs_longer_texts_read_back_at_versions_one_three_and_four {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var text : [QS_TEXT_MAX]u8 = undefined;
+    // version 1 made by segno (mask 3)
+    qs_t_unhex(QS_T_V1, 21, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 21, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1024, 0, false);
+    var r : u32 = qs_read(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], text[0..QS_TEXT_MAX]);
+    assert qs_reason(r) == QS_OK and qs_len(r) == 14 and qs_t_same(text[0..14], "https://t27.ai", 14);
+    // 40 bytes take version 3, 70 bytes version 4
+    const s40 : str = "T27-TEST-0000-0000-0000-0 and some more.";
+    _ = qr_make(s40, 40, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 29, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1020, -89, false);
+    r = qs_read(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], text[0..QS_TEXT_MAX]);
+    assert qs_reason(r) == QS_OK and qs_len(r) == 40 and qs_t_same(text[0..40], s40, 40);
+    const s70 : str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-_~+*/=";
+    _ = qr_make(s70, 70, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 33, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    r = qs_read(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], text[0..QS_TEXT_MAX]);
+    assert qs_reason(r) == QS_OK and qs_len(r) == 70 and qs_t_same(text[0..70], s70, 70);
+}
+
+test qs_a_code_that_is_not_a_key_is_refused_as_not_a_key {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var out : [32]u8 = undefined;
+    var text : [QS_TEXT_MAX]u8 = undefined;
+    const url : str = "https://example.com";
+    _ = qr_make(url, url.len, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    const r : u32 = qs_read(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], text[0..QS_TEXT_MAX]);
+    assert qs_reason(r) == QS_OK and qs_len(r) == 19 and qs_t_same(text[0..19], url, 19);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_NOT_KEY;
+    // a key with its check symbol changed: the code reads, the key does not
+    var key : [32]u8 = undefined;
+    assert qs_t_key(6, key[0..32]) == 25;
+    var wrong : u8 = 48;
+    if (key[24] == 48) { wrong = 49; }
+    key[24] = wrong;
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_NOT_KEY;
+    // the segno version 1 code is a URL, not a key
+    qs_t_unhex(QS_T_V1, 21, t[0..QR_CELLS_MAX]);
+    qs_t_draw(t[0..QR_CELLS_MAX], 21, g[0..QS_T_N], QS_T_W, QS_T_H, 112, 1024, 0, false);
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_NOT_KEY;
+}
+
+test qs_an_empty_frame_a_frame_without_a_code_and_a_bad_size_give_nothing {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var out : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < QS_T_N) {
+        g[i] = 128;
+        i = i + 1;
+    }
+    assert qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]) == QS_NO_CODE;
+    // stripes, a gradient and noise: no code
+    var y : usize = 0;
+    while (y < QS_T_H) {
+        var x : usize = 0;
+        while (x < QS_T_W) {
+            var v : usize = (x + 2 * y) % 200;
+            if ((x / 7) % 3 == 0) { v = v / 3; }
+            g[y * QS_T_W + x] = @as(u8, @intCast(v + 20));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    qs_t_noise(g[0..QS_T_N], QS_T_N, 30, 11);
+    const r : u32 = qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]);
+    assert r != QS_OK and r != QS_NOT_KEY;
+    assert qs_scan_key(g[0..QS_T_N], 0, 0, bin[0..QS_T_N], out[0..32]) == QS_ARG;
+}
+
+test qs_a_cut_code_and_a_badly_damaged_code_are_refused_not_misread {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    var key : [32]u8 = undefined;
+    var out : [32]u8 = undefined;
+    _ = qs_t_key(7, key[0..32]);
+    _ = qr_make(key[0..25], 25, t[0..QR_CELLS_MAX]);
+    // the right 40 % of the symbol cut off (the top right finder with it): the symbol spans x = 85 .. 235
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    qs_t_fill(g[0..QS_T_N], QS_T_W, 175, 0, QS_T_W, QS_T_H, 215);
+    var r : u32 = qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]);
+    assert r == QS_NO_CODE or r == QS_GEOMETRY;
+    // the bottom right quarter of the data (all three finders stand) painted over: the error codewords cannot
+    // carry it
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    qs_t_fill(g[0..QS_T_N], QS_T_W, 85 + 9 * 6, 45 + 9 * 6, 85 + 25 * 6, 45 + 25 * 6, 215);
+    qs_t_fill(g[0..QS_T_N], QS_T_W, 85 + 11 * 6, 45 + 11 * 6, 85 + 13 * 6, 45 + 21 * 6, 40);
+    r = qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]);
+    assert r == QS_ECC;
+    // a third of the data modules flipped in the matrix
+    var i : usize = 0;
+    while (i < 625) {
+        const row : usize = i / 25;
+        const col : usize = i % 25;
+        if (row > 8 and col > 8 and (row * 7 + col * 3) % 3 == 0) { t[i] = t[i] ^ 1; }
+        i = i + 1;
+    }
+    qs_t_draw(t[0..QR_CELLS_MAX], 25, g[0..QS_T_N], QS_T_W, QS_T_H, 96, 1024, 0, false);
+    r = qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]);
+    assert r == QS_ECC;
+}
+
+/// A finder pattern of module size md with its top left corner at (x, y): 7 x 7 dark, 5 x 5 light, 3 x 3 dark.
+fn qs_t_finder(g: []u8, w: usize, x: usize, y: usize, md: usize) -> void {
+    qs_t_fill(g, w, x, y, x + 7 * md, y + 7 * md, 40);
+    qs_t_fill(g, w, x + md, y + md, x + 6 * md, y + 6 * md, 215);
+    qs_t_fill(g, w, x + 2 * md, y + 2 * md, x + 5 * md, y + 5 * md, 40);
+}
+
+test qs_three_finders_too_close_for_a_version_give_no_key_and_do_not_stop_the_reader {
+    var g : [QS_T_N]u8 = undefined;
+    var bin : [QS_T_N]u8 = undefined;
+    var out : [32]u8 = undefined;
+    // three finders whose legs make a side of 15 .. 18 modules: the estimate is version 0, and the neighbour
+    // below it is not a version either
+    var side : usize = 15;
+    while (side <= 18) {
+        qs_t_fill(g[0..QS_T_N], QS_T_W, 0, 0, QS_T_W, QS_T_H, 215);
+        const md : usize = 6;
+        const leg : usize = (side - 7) * md;
+        qs_t_finder(g[0..QS_T_N], QS_T_W, 60, 40, md);
+        qs_t_finder(g[0..QS_T_N], QS_T_W, 60 + leg, 40, md);
+        qs_t_finder(g[0..QS_T_N], QS_T_W, 60, 40 + leg, md);
+        assert qs_binarize(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N]);
+        var cand : [256]i64 = undefined;
+        const n : usize = qs_finders(bin[0..QS_T_N], QS_T_W, QS_T_H, cand[0..256]);
+        var tri : [3]usize = [0, 0, 0];
+        if (n >= 3 and qs_pick3(cand[0..256], n, tri[0..3])) { assert qs_version_est(cand[0..256], tri[0..3]) == 0; }
+        const r : u32 = qs_scan_key(g[0..QS_T_N], QS_T_W, QS_T_H, bin[0..QS_T_N], out[0..32]);
+        assert r != QS_OK and r != QS_NOT_KEY;
+        side = side + 1;
+    }
+}

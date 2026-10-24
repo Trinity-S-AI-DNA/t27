@@ -1,0 +1,1409 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/chat_host.t27 -- where person to person chat touches the machine (owner, 2026-10-22; Refs
+// gHashTag/t27#11560). Every decision (payload, dedup, order, ACK, retry, read, unread, the file format, idle close)
+// is a tested fn of chat_core.t27; this file only moves bytes:
+//   * the log of one friend: ~/.t27os/chat/<20 hex of the fingerprint>.t27 (chat_core cf_name / cf_encode), read
+//     whole at start, written whole and atomically (peer_identity_host ih_write_atomic: .tmp with mode 0600, write,
+//     fsync, rename; the directory made with mode 0700). A file that does not check is moved aside to <name>.bad
+//     (kept, never written over) and the log starts empty. The log keeps the newest CL_KEEP (500) lines.
+//   * the message session: one call_session block opened with CS_AUDIO_NONE on its own UDP port (the chat port; the
+//     call port is not shared, so an INVITE that arrives here is a message session by construction). The same
+//     handshake, the same 6-digit code and the same AES-128-GCM channel as a call, with no audio and no video.
+//     chm_tick answers a RINGING session only when the caller is in the friends table and is the friend of this
+//     log. A session from someone who is not a friend is left ringing for the window (CHM_E_STRANGER): the window
+//     answers it to take an invitation (invites.t27) or declines it in the quiet hour after a DECLINE; the session
+//     then ends by itself with CS_R_INVITE (call_session) and chm_tick says so once (CHM_E_INVITE, cs_id_proven
+//     gives the fingerprint and the proven key). It never opens and none of its frames reaches a log. It never says "match" itself: no person compares a code in a message session,
+//     so the session opens only when the friend proves the identity key stored for it (call_session cs_identity,
+//     peer_identity pid_verdict TRUSTED); a friend whose key is not stored yet (never compared a code in a call, or
+//     a v1 friends file) is refused with CS_R_UNVERIFIED and the messages wait. Behaviour, not an audit.
+// A window drives one friend's chat with chm_init, chm_addr (the friend's address changed), chm_send, chm_open (the chat
+// is shown: READ) and chm_tick from its main loop; chm_stat reads the counters. One log is open at a time: a session
+// from another friend is left ringing and reported (CHM_E_OTHER, chm_ringing) so the window can open that friend's log
+// and answer on its next tick; chat_probe.t27 drives it headless, glass_window.t27 from the cabinet (chat_view.t27).
+// GROUPS (group_core.t27, owner 2026-10-23): ~/.t27os/groups.t27 is read whole (a file that does not check, or whose
+// ids are not the SHA-256 of their rosters, is moved aside to groups.t27.bad and the table starts empty) and written
+// whole and atomically, mode 0600. A group's log is a chat log at ~/.t27os/chat/g-<16 hex of the id>.t27. The window
+// opens one group at a time (grm_init, grm_load) and passes it to chm_tick_g for every friend's driver: a group
+// payload that comes over a friend's message session goes to the group (gr_gate first; dropped and counted with its
+// reason otherwise), and every line still owed to that member goes out over that session (fan-out). chm_tick is
+// chm_tick_g with no group, as before. A GROUP_INFO (group_core) is taken whatever group is open: an ANNOUNCE that
+// gi_apply keeps goes into the table (CHM_E_GINFO: the window writes groups.t27 and shows the group) and is answered
+// GI_HAVE; a HAVE clears the ANNOUNCE owed to that member (the window's owed block, a byte per group) and sends the
+// open group's lines owed to it again. The ANNOUNCEs owed go out over the session with that member, again every
+// CH_RETRY_MS while unanswered; a session with a member of a group this device made owes it the ANNOUNCE again.
+module T27osChatHost;
+
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_bytes;
+use t27os::peer_identity_host::ih_home;
+use t27os::peer_identity_host::ih_slurp;
+use t27os::peer_identity_host::ih_write_atomic;
+use t27os::peer_identity_host::IH_PATH_MAX;
+use t27os::peer_identity_host::ih_invites_path;
+use t27os::peer_identity_host::ih_path;
+use t27os::peer_identity_host::IH_CREATED;
+use t27os::peer_identity_host::IH_LOADED;
+use t27os::peer_identity_host::IH_REFUSED;
+use t27os::peer_identity_host::IH_IOERR;
+use t27os::peer_identity::ft_find;
+use t27os::peer_identity::FT_MAX;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::CK_RINGING;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::CK_ENDED;
+use t27os::call_core::CK_FAILED;
+use t27os::call_session::cs_call;
+use t27os::call_session::cs_call6;
+use t27os::call_ip6::ip6_copy;
+use t27os::call_ip6::ip6_clear;
+use t27os::call_ip6::ip6_is_set;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_peer;
+use t27os::call_session::cs_answer;
+use t27os::call_session::cs_decline;
+use t27os::call_session::cs_hangup;
+use t27os::call_session::cs_dismiss;
+use t27os::call_session::cs_text_send;
+use t27os::call_session::cs_text_take;
+use t27os::call_session::CS_EV_NONE;
+use t27os::call_session::CS_EV_ACTIVE;
+use t27os::call_session::CS_EV_ENDED;
+use t27os::call_session::CS_EV_FAILED;
+use t27os::call_session::CS_R_INVITE;
+use t27os::call_session::cs_reason;
+use t27os::chat_core::CH_K_TEXT;
+use t27os::chat_core::CH_K_ACK;
+use t27os::chat_core::CH_K_READ;
+use t27os::chat_core::CH_R_SEND;
+use t27os::chat_core::CH_R_GIVEUP;
+use t27os::chat_core::CH_RX_NEW;
+use t27os::chat_core::CH_RX_DUP;
+use t27os::chat_core::CH_CALLING_MS;
+use t27os::chat_core::CF_OK;
+use t27os::chat_core::CF_MAX;
+use t27os::chat_core::ch_kind;
+use t27os::chat_core::ch_msg;
+use t27os::chat_core::ch_part;
+use t27os::chat_core::ch_put_text;
+use t27os::chat_core::ch_put_ack;
+use t27os::chat_core::ch_put_read;
+use t27os::chat_core::ch_rx_text;
+use t27os::chat_core::ch_rx_acks;
+use t27os::chat_core::CH_PHDR;
+use t27os::chat_core::CH_RX_PART;
+use t27os::chat_core::CH_RX_FULL;
+use t27os::chat_core::ch_parts;
+use t27os::chat_core::ch_rx_ack;
+use t27os::chat_core::ch_rx_read;
+use t27os::chat_core::ch_idle_close;
+use t27os::chat_core::ch_redial_ms;
+use t27os::chat_core::cl_init;
+use t27os::chat_core::cl_count;
+use t27os::chat_core::cl_msg;
+use t27os::chat_core::cl_time;
+use t27os::chat_core::cl_text;
+use t27os::chat_core::cl_parts;
+use t27os::chat_core::cl_tries;
+use t27os::chat_core::cl_due;
+use t27os::chat_core::cl_part_due;
+use t27os::chat_core::cl_mark_sent;
+use t27os::chat_core::cl_session_start;
+use t27os::chat_core::cl_pending;
+use t27os::chat_core::cl_out_add;
+use t27os::chat_core::cl_open_read;
+use t27os::chat_core::cf_encode;
+use t27os::chat_core::cf_decode;
+use t27os::chat_core::cf_name;
+use t27os::chat_core::CH_RX_BAD;
+use t27os::chat_core::cl_text;
+use t27os::keysync_host::ks_sha256;
+use t27os::call_session::cs_id_state;
+use t27os::call_session::CS_ID_VERIFIED;
+use t27os::call_session::CS_ID_STORED;
+use t27os::group_core::GR_OK;
+use t27os::group_core::GR_NOBODY;
+use t27os::group_core::GR_ID;
+use t27os::group_core::GT_LEN;
+use t27os::group_core::GT_FILE_MAX;
+use t27os::group_core::GT_NONE;
+use t27os::group_core::GT_OK;
+use t27os::group_core::GT_REC_BAD;
+use t27os::group_core::GM_K_TEXT;
+use t27os::group_core::GM_HDR;
+use t27os::group_core::GL_FLOORS;
+use t27os::group_core::gr_plan;
+use t27os::group_core::gr_known;
+use t27os::group_core::gr_id_from_digest;
+use t27os::group_core::gr_gate;
+use t27os::group_core::gr_fanout;
+use t27os::group_core::gr_recipients;
+use t27os::group_core::gr_reach_mask;
+use t27os::group_core::gt_init;
+use t27os::group_core::gt_count;
+use t27os::group_core::gt_find;
+use t27os::group_core::gt_add;
+use t27os::group_core::gt_id;
+use t27os::group_core::gt_idx;
+use t27os::group_core::gt_n;
+use t27os::group_core::gt_roster;
+use t27os::group_core::gt_member;
+use t27os::group_core::gt_encode;
+use t27os::group_core::gt_decode;
+use t27os::group_core::gm_is_group;
+use t27os::group_core::gm_kind;
+use t27os::group_core::gm_gid;
+use t27os::group_core::gm_msg;
+use t27os::group_core::gm_part;
+use t27os::group_core::gm_put_text;
+use t27os::group_core::gm_put_ack;
+use t27os::group_core::gl_peer;
+use t27os::group_core::gl_name;
+use t27os::group_core::gl_after_load;
+use t27os::group_core::gl_log_ok;
+use t27os::group_core::gl_out_add;
+use t27os::group_core::gl_rx_text;
+use t27os::group_core::gl_rx_ack;
+use t27os::group_core::gl_due_for;
+use t27os::group_core::gl_part_due;
+use t27os::group_core::gl_session_start;
+use t27os::group_core::gl_pending_for;
+use t27os::group_core::GT_MAX;
+use t27os::group_core::GI_ANNOUNCE;
+use t27os::group_core::GI_HAVE;
+use t27os::group_core::GI_MAX;
+use t27os::group_core::GI_KEPT;
+use t27os::group_core::GI_ALREADY;
+use t27os::group_core::GI_JOINED;
+use t27os::group_core::GR_BAD;
+use t27os::group_core::gi_is;
+use t27os::group_core::gi_ok;
+use t27os::group_core::gi_gid;
+use t27os::group_core::gi_n;
+use t27os::group_core::gi_roster;
+use t27os::group_core::gi_put_rec;
+use t27os::group_core::gi_apply;
+use t27os::group_core::gi_mine;
+use t27os::chat_core::CH_RETRY_MS;
+
+fn chh_access(path: []const u8, mode: i32) -> i32 { return @extern("access"); }
+
+// ---------------------------------------------------------------- the file
+
+pub const CHH_NEW : u32 = 1;
+pub const CHH_LOADED : u32 = 2;
+/// The file did not check: it was moved to <name>.bad and the log starts empty. Low 8 bits CHH_MOVED, next 8 the
+/// cf_decode status.
+pub const CHH_MOVED : u32 = 3;
+pub const CHH_IOERR : u32 = 4;
+/// The status (next to CHH_MOVED) of a group log whose file checks but whose lines do not (gl_log_ok).
+pub const CHH_ST_GROUP : u32 = 7;
+
+/// kind 0 = <home>/.t27os/chat (the directory), 1 = the friend's log, 2 = its .tmp, 3 = its .bad; 4, 5, 6 the same for
+/// a group's log, fp being the log's peer (the group id first). NUL-terminated; the length, 0 when it does not fit.
+pub fn chh_path(home: []const u8, hn: usize, fp: []const u8, kind: u32, out: []u8) -> usize {
+    if (hn + 64 > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os/chat");
+    if (kind != 0) {
+        out[n] = 47;
+        n = n + 1;
+        if (kind >= 4) {
+            var gn : [22]u8 = undefined;
+            if (fp.len < GR_ID or gl_name(fp[0..GR_ID], gn[0..22]) != 22) { return 0; }
+            n = put_bytes(out, n, gn[0..22]);
+        } else {
+            var nm : [24]u8 = undefined;
+            if (cf_name(fp, nm[0..24]) != 24) { return 0; }
+            n = put_bytes(out, n, nm[0..24]);
+        }
+        if (kind == 2 or kind == 5) { n = put_bytes(out, n, ".tmp"); }
+        if (kind == 3 or kind == 6) { n = put_bytes(out, n, ".bad"); }
+    }
+    out[n] = 0;
+    return n;
+}
+
+/// Open the log of friend fp keeping cap lines: no file -> empty (CHH_NEW); a good file -> loaded; a file that does
+/// not check -> moved aside, empty (CHH_MOVED | status << 8). buf is scratch of CF_MAX bytes.
+pub fn chh_load(fp: []const u8, log: []u8, cap: u32, buf: []u8) -> u32 { return chh_load_k(fp, log, cap, buf, 0); }
+
+/// The log of group gid, the same way (~/.t27os/chat/g-<id>.t27).
+pub fn chh_load_group(gid: []const u8, log: []u8, cap: u32, buf: []u8) -> u32 {
+    var p : [10]u8 = undefined;
+    gl_peer(gid, p[0..10]);
+    return chh_load_k(p[0..10], log, cap, buf, 3);
+}
+
+/// base 0: a friend's log, 3: a group's (chh_path kinds base + 1 .. base + 3).
+fn chh_load_k(fp: []const u8, log: []u8, cap: u32, buf: []u8, base: u32) -> u32 {
+    if (!cl_init(log, fp, cap) or buf.len < CF_MAX + 1) { return CHH_IOERR; }
+    var home : [256]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return CHH_IOERR; }
+    var path : [256]u8 = undefined;
+    if (chh_path(home[0..256], hn, fp, base + 1, path[0..256]) == 0) { return CHH_IOERR; }
+    if (chh_access(path[0..256], 0) != 0) { return CHH_NEW; }
+    const got : i64 = ih_slurp(path[0..256], buf, CF_MAX + 1);
+    if (got < 0) { return CHH_IOERR; }
+    var st : u32 = 1;
+    if (@as(usize, @intCast(got)) <= CF_MAX) { st = cf_decode(buf[0..@as(usize, @intCast(got))], log); }
+    if (st == CF_OK and base == 3 and !gl_log_ok(log)) { st = CHH_ST_GROUP; }
+    if (st == CF_OK) { return CHH_LOADED; }
+    cl_init(log, fp, cap);
+    var bad : [256]u8 = undefined;
+    chh_path(home[0..256], hn, fp, base + 3, bad[0..256]);
+    if (sys_rename(path[0..256], bad[0..256]) != 0) { return CHH_IOERR; }
+    return CHH_MOVED | (st << 8);
+}
+
+/// Write the log of its friend whole and atomically. buf is scratch of CF_MAX bytes.
+pub fn chh_save(log: []const u8, buf: []u8) -> bool { return chh_save_k(log, buf, 0); }
+
+/// Write a group's log (its peer is the group id) whole and atomically.
+pub fn chh_save_group(log: []const u8, buf: []u8) -> bool { return chh_save_k(log, buf, 3); }
+
+fn chh_save_k(log: []const u8, buf: []u8, base: u32) -> bool {
+    const n : usize = cf_encode(log, buf);
+    if (n == 0) { return false; }
+    var home : [256]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    var dir : [256]u8 = undefined;
+    var path : [256]u8 = undefined;
+    var tmp : [256]u8 = undefined;
+    // the parent ~/.t27os first (mkdir of an existing one is a no-op)
+    var top : [256]u8 = undefined;
+    var tn : usize = put_bytes(top[0..256], 0, home[0..hn]);
+    tn = put_bytes(top[0..256], tn, "/.t27os");
+    top[tn] = 0;
+    chh_path(home[0..256], hn, log[28..38], 0, dir[0..256]);
+    chh_path(home[0..256], hn, log[28..38], base + 1, path[0..256]);
+    chh_path(home[0..256], hn, log[28..38], base + 2, tmp[0..256]);
+    sys_mkdir(top[0..256], 448);
+    return ih_write_atomic(dir[0..256], path[0..256], tmp[0..256], buf, n);
+}
+
+// ---------------------------------------------------------------- the groups file
+
+/// kind 0 = <home>/.t27os/groups.t27, 1 its .tmp, 2 its .bad. NUL-terminated; the length, 0 when it does not fit.
+pub fn ghh_path(home: []const u8, hn: usize, kind: u32, out: []u8) -> usize {
+    if (hn + 40 > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os/groups.t27");
+    if (kind == 1) { n = put_bytes(out, n, ".tmp"); }
+    if (kind == 2) { n = put_bytes(out, n, ".bad"); }
+    out[n] = 0;
+    return n;
+}
+
+/// The id of a sorted roster of n: SHA-256 of its n * 10 bytes, cut to GR_ID.
+pub fn ghh_id(roster: []const u8, n: usize, out: []u8) -> bool {
+    var dg : [32]u8 = undefined;
+    if (roster.len < n * 10 or !ks_sha256(roster[0..n * 10], dg[0..32])) { return false; }
+    return gr_id_from_digest(dg[0..32], out);
+}
+
+/// Open the groups table: no file -> empty (IH_CREATED, nothing written); a good file -> IH_LOADED; a file that does
+/// not check, or a record whose id is not its roster's -> moved to groups.t27.bad, empty, IH_REFUSED | status << 8.
+pub fn ghh_open(t: []u8) -> u32 {
+    if (!gt_init(t)) { return IH_IOERR; }
+    var home : [256]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return IH_IOERR; }
+    var path : [256]u8 = undefined;
+    if (ghh_path(home[0..256], hn, 0, path[0..256]) == 0) { return IH_IOERR; }
+    if (chh_access(path[0..256], 0) != 0) { return IH_CREATED; }
+    var f : [4245]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..256], f[0..4245], GT_FILE_MAX + 1);
+    if (got < 0) { return IH_IOERR; }
+    var st : u32 = gt_decode(f[0..@as(usize, @intCast(got))], t);
+    if (st == GT_OK) {
+        var gi : usize = 0;
+        while (gi < @as(usize, gt_count(t))) {
+            var id : [8]u8 = undefined;
+            if (!ghh_id(gt_roster(t, gi), gt_n(t, gi), id[0..8]) or gt_find(t, id[0..8]) != gi) { st = GT_REC_BAD; }
+            gi = gi + 1;
+        }
+    }
+    if (st == GT_OK) { return IH_LOADED; }
+    gt_init(t);
+    var bad : [256]u8 = undefined;
+    ghh_path(home[0..256], hn, 2, bad[0..256]);
+    sys_rename(path[0..256], bad[0..256]);
+    return IH_REFUSED | (st << 8);
+}
+
+/// Write the table whole and atomically (mode 0600, ~/.t27os made 0700 when absent).
+pub fn ghh_save(t: []const u8) -> bool {
+    var f : [4244]u8 = undefined;
+    const n : usize = gt_encode(t, f[0..GT_FILE_MAX]);
+    if (n == 0) { return false; }
+    var home : [256]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    var dir : [256]u8 = undefined;
+    var path : [256]u8 = undefined;
+    var tmp : [256]u8 = undefined;
+    var dn : usize = put_bytes(dir[0..256], 0, home[0..hn]);
+    dn = put_bytes(dir[0..256], dn, "/.t27os");
+    dir[dn] = 0;
+    ghh_path(home[0..256], hn, 0, path[0..256]);
+    ghh_path(home[0..256], hn, 1, tmp[0..256]);
+    return ih_write_atomic(dir[0..256], path[0..256], tmp[0..256], f[0..GT_FILE_MAX], n);
+}
+
+/// Not added to the table (low 8 bits), with the group_core GT_* status in the next 8.
+pub const GHH_TABLE : u32 = 32;
+
+/// A group this device makes with the k friends picked (others): checked (group_core gr_plan), its id hashed, added
+/// to t (not saved). GR_OK with the id in id_out, a GR_* reason, or GHH_TABLE | GT_* << 8.
+pub fn ghh_make(t: []u8, friends: []const u8, me_fp: []const u8, others: []const u8, k: usize, name: []const u8, now: u64, id_out: []u8) -> u32 {
+    var r : [80]u8 = undefined;
+    const why : u32 = gr_plan(friends, me_fp, others, k, r[0..80]);
+    if (why != GR_OK) { return why; }
+    if (!ghh_id(r[0..80], k + 1, id_out)) { return GHH_TABLE; }
+    var me : usize = 0;
+    while (me < k + 1 and !ck_eq10(r[0..80], me * 10, me_fp)) { me = me + 1; }
+    const st : u32 = gt_add(t, id_out[0..GR_ID], name, r[0..80], k + 1, me, now);
+    if (st != GT_OK) { return GHH_TABLE | (st << 8); }
+    return GR_OK;
+}
+
+/// A group someone else made (a sorted roster of n, its creator's index), kept as group_core gr_known says.
+pub fn ghh_keep(t: []u8, friends: []const u8, me_fp: []const u8, roster: []const u8, n: usize, creator: usize, name: []const u8, time: u64, id_out: []u8) -> u32 {
+    const why : u32 = gr_known(friends, me_fp, roster, n, creator);
+    if (why != GR_OK) { return why; }
+    if (!ghh_id(roster, n, id_out)) { return GHH_TABLE; }
+    const st : u32 = gt_add(t, id_out[0..GR_ID], name, roster, n, creator, time);
+    if (st != GT_OK) { return GHH_TABLE | (st << 8); }
+    return GR_OK;
+}
+
+fn ck_eq10(a: []const u8, ao: usize, b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < 10) {
+        if (a[ao + i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- the session driver
+
+/// The driver's block: CHM_LEN bytes of u64 slots (u64 k at 8 k), the friend's fingerprint at M_FP, the ACKs held
+/// for the log's save from M_HELD.
+pub const CHM_LEN : usize = 384;
+const M_IP : usize = 0;
+const M_PORT : usize = 1;
+const M_LAST : usize = 2;
+const M_REDIAL : usize = 3;
+const M_READ_UPTO : usize = 4;
+const M_READ_SENT : usize = 5;
+const M_DIRTY : usize = 6;
+/// Counters (chm_stat).
+pub const CHM_TX_FRAMES : u32 = 7;
+pub const CHM_TX_RESENDS : u32 = 8;
+pub const CHM_RX_NEW : u32 = 9;
+pub const CHM_RX_DUP : u32 = 10;
+pub const CHM_ACK_TX : u32 = 11;
+pub const CHM_ACK_RX : u32 = 12;
+pub const CHM_READ_TX : u32 = 13;
+pub const CHM_READ_RX : u32 = 14;
+pub const CHM_SESSIONS : u32 = 15;
+pub const CHM_IDLE_CLOSED : u32 = 16;
+pub const CHM_REFUSED : u32 = 17;
+pub const CHM_DROPPED : u32 = 18;
+pub const CHM_FAILED : u32 = 19;
+pub const CHM_DIALS : u32 = 20;
+pub const CHM_SEND_ERR : u32 = 21;
+/// Test aid: the n-th text frame this side sends (TEXT parts only, from 1) is sealed and dropped as a lost datagram;
+/// 0 = none.
+pub const CHM_K_DROP : u32 = 22;
+const M_TXN : usize = 23;
+const M_FP : usize = 192;
+/// After the fingerprint: when the ANNOUNCEs owed went out last (internal), then the GROUP_INFO counters (chm_stat):
+/// ANNOUNCEs sent, groups kept, HAVEs taken, GROUP_INFOs refused and the last reason (group_core GR_*).
+const M_INFO_AT : usize = 26;
+pub const CHM_INFO_TX : u32 = 27;
+pub const CHM_INFO_KEPT : u32 = 28;
+pub const CHM_INFO_HAVE : u32 = 29;
+pub const CHM_INFO_REFUSED : u32 = 30;
+pub const CHM_INFO_WHY : u32 = 31;
+/// The ACKs of incoming messages wait for the log's save: a message that came in is acknowledged only once the line is
+/// on disk, so a crash before the save leaves it unacknowledged and the sender sends it again under the same number.
+/// M_HELD: how many are held (internal); then the counters (chm_stat): ACKs held, ACKs sent after a save, holds that
+/// found the queue full (that ACK is not sent; the sender's resend is ACKed after the save). Each held entry is one
+/// u64 at M_OWED + k: the message number | its part count << 32.
+const M_HELD : usize = 32;
+pub const CHM_ACK_HELD : u32 = 33;
+pub const CHM_ACK_SAVED : u32 = 34;
+pub const CHM_ACK_FULL : u32 = 35;
+const M_OWED : usize = 36;
+pub const CHM_OWED_MAX : usize = 8;
+/// IP6 (owner, 2026-10-23; call_ip6.t27): the friend's chat endpoint over IPv6 (18 bytes at byte M_EP6, all zero =
+/// none), dialled when there is no IPv4 for it (M_IP 0). In memory only: the window gives it from the friend's last
+/// call over IPv6 (chm_addr6); nothing is written to a file.
+const M_EP6 : usize = 352;
+
+/// What the receiver does with the ACK of one TEXT result: nothing (refused, or no room), send it now (a part kept for
+/// later lives in memory only, and a new session drops it: the sender sends every part again), or hold it until the
+/// log is saved (a message that became a line; a duplicate while any line waits for its save).
+pub const CHM_ACK_NONE : u32 = 0;
+pub const CHM_ACK_NOW : u32 = 1;
+pub const CHM_ACK_HOLD : u32 = 2;
+pub fn chm_ack_plan(r: u32, held: u64) -> u32 {
+    if (!ch_rx_acks(r)) { return CHM_ACK_NONE; }
+    if (r == CH_RX_NEW) { return CHM_ACK_HOLD; }
+    if (r == CH_RX_DUP and held > 0) { return CHM_ACK_HOLD; }
+    return CHM_ACK_NOW;
+}
+
+/// chm_tick says what moved (bits): a new incoming line, a status of a line, the log needs saving.
+pub const CHM_E_NEW : u32 = 1;
+pub const CHM_E_STATUS : u32 = 2;
+pub const CHM_E_DIRTY : u32 = 4;
+/// Another friend than the one of this log rings: still ringing; chm_ringing names it.
+pub const CHM_E_OTHER : u32 = 8;
+/// A session from someone who is not a friend just ended as an invitation (CS_R_INVITE): said once, at its end.
+pub const CHM_E_INVITE : u32 = 16;
+/// Someone who is not a friend rings: still ringing; the window answers (an invitation) or declines (quiet hour).
+pub const CHM_E_STRANGER : u32 = 32;
+
+/// A group line came in, a group line changed, the group's log needs saving.
+pub const CHM_E_GNEW : u32 = 64;
+pub const CHM_E_GSTATUS : u32 = 128;
+pub const CHM_E_GDIRTY : u32 = 256;
+/// A GROUP_INFO put a new group into the table: the window writes groups.t27 and the group shows.
+pub const CHM_E_GINFO : u32 = 512;
+
+/// What the window does with a session that rings from someone who is not a friend: answer it, so the peer proves its
+/// key and the session ends as an invitation; or decline it while it rings, when the person declined this fingerprint
+/// less than an hour ago (invites.t27 iv_quiet).
+pub fn chm_stranger_answer(quiet: bool) -> bool { return quiet == false; }
+
+/// The bits a session's end adds: CHM_E_INVITE when it ended as an invitation.
+pub fn chm_end_bits(failed: bool, reason: u32) -> u32 {
+    if (failed and reason == CS_R_INVITE) { return CHM_E_INVITE; }
+    return 0;
+}
+
+fn mg(m: []const u8, k: usize) -> u64 { return get_u64(m, k * 8); }
+fn mp(m: []u8, k: usize, v: u64) -> void { put_u64(m, k * 8, v); }
+fn ma(m: []u8, k: usize) -> void { mp(m, k, mg(m, k) + 1); }
+
+/// The friend fp reachable at ip:port (its chat port).
+pub fn chm_init(m: []u8, fp: []const u8, ip: u64, port: u64) -> bool {
+    if (m.len < CHM_LEN or fp.len != 10) { return false; }
+    var i : usize = 0;
+    while (i < CHM_LEN) {
+        m[i] = 0;
+        i = i + 1;
+    }
+    mp(m, M_IP, ip);
+    mp(m, M_PORT, port);
+    i = 0;
+    while (i < 10) {
+        m[M_FP + i] = fp[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The friend's address changed (found again, or lost: ip 0 stops the dialing); the counters and the READ state stay.
+pub fn chm_addr(m: []u8, ip: u64, port: u64) -> void {
+    mp(m, M_IP, ip);
+    mp(m, M_PORT, port);
+}
+
+/// The friend's chat endpoint over IPv6 (an all-zero or short ep clears it). An IPv4 set by chm_addr comes first.
+pub fn chm_addr6(m: []u8, ep: []const u8) -> void {
+    if (m.len < CHM_LEN) { return; }
+    if (ep.len < 18 or !ip6_is_set(ep)) {
+        ip6_clear(m[M_EP6..M_EP6 + 18]);
+        return;
+    }
+    ip6_copy(m[M_EP6..M_EP6 + 18], ep);
+}
+
+/// The friend whose session rings unanswered, into fp[0..10]; false when none rings.
+pub fn chm_ringing(s: []const u8, fp: []u8) -> bool {
+    if (cs_state(s) != CK_RINGING) { return false; }
+    return cs_peer(s, fp) != 0;
+}
+
+pub fn chm_stat(m: []const u8, k: u32) -> u64 {
+    if (@as(usize, k) * 8 + 8 > M_FP and (k < CHM_INFO_TX or k > CHM_INFO_WHY) and (k < CHM_ACK_HELD or k > CHM_ACK_FULL)) { return 0; }
+    return mg(m, @as(usize, k));
+}
+
+/// How many incoming messages wait for the log's save before their ACK.
+pub fn chm_held(m: []const u8) -> u64 {
+    if (m.len < CHM_LEN) { return 0; }
+    return mg(m, M_HELD);
+}
+
+/// Hold the ACK of message msg (parts parts) until the save; one entry per message. False when the queue is full.
+pub fn chm_hold(m: []u8, msg: u32, parts: u32) -> bool {
+    if (m.len < CHM_LEN or msg == 0 or parts == 0) { return false; }
+    const n : usize = @as(usize, mg(m, M_HELD));
+    var k : usize = 0;
+    while (k < n) {
+        if ((mg(m, M_OWED + k) & 4294967295) == @as(u64, msg)) {
+            ma(m, CHM_ACK_HELD);
+            return true;
+        }
+        k = k + 1;
+    }
+    if (n >= CHM_OWED_MAX) {
+        ma(m, CHM_ACK_FULL);
+        return false;
+    }
+    mp(m, M_OWED + n, @as(u64, msg) | (@as(u64, parts) << 32));
+    mp(m, M_HELD, @as(u64, n + 1));
+    ma(m, CHM_ACK_HELD);
+    return true;
+}
+
+/// The log's save ended (ok: written). Written: the ACK of every part of every held message is laid out in out (CH_PHDR
+/// bytes each, as many as fit) and the queue empties; their count. Not written: nothing goes out and the queue stays,
+/// for the save that is tried again.
+pub fn chm_saved_acks(m: []u8, ok: bool, out: []u8) -> usize {
+    if (!ok or m.len < CHM_LEN) { return 0; }
+    const n : usize = @as(usize, mg(m, M_HELD));
+    var c : usize = 0;
+    var k : usize = 0;
+    while (k < n) {
+        const e : u64 = mg(m, M_OWED + k);
+        const msg : u32 = @as(u32, @intCast(e & 4294967295));
+        const parts : u32 = @as(u32, @intCast(e >> 32));
+        var p : u32 = 0;
+        while (p < parts and (c + 1) * CH_PHDR <= out.len) {
+            ch_put_ack(out[c * CH_PHDR .. (c + 1) * CH_PHDR], msg, p);
+            c = c + 1;
+            p = p + 1;
+        }
+        mp(m, M_OWED + k, 0);
+        k = k + 1;
+    }
+    mp(m, M_HELD, 0);
+    return c;
+}
+
+/// chm_saved_acks sent over the session (an ACK that cannot go now is not kept: the sender's resend is a duplicate,
+/// ACKed at once once nothing is held). The ACKs sent.
+pub fn chm_saved(m: []u8, s: []u8, ok: bool) -> u32 {
+    var a : [3200]u8 = undefined;
+    const c : usize = chm_saved_acks(m, ok, a[0..3200]);
+    var sent : u32 = 0;
+    var i : usize = 0;
+    while (i < c) {
+        if (cs_state(s) == CK_ACTIVE and chm_tx(m, s, a[i * CH_PHDR .. (i + 1) * CH_PHDR])) {
+            ma(m, CHM_ACK_SAVED);
+            sent = sent + 1;
+        }
+        i = i + 1;
+    }
+    return sent;
+}
+
+pub fn chm_set(m: []u8, k: u32, v: u64) -> bool {
+    if (k != CHM_K_DROP) { return false; }
+    mp(m, @as(usize, k), v);
+    return true;
+}
+
+/// A message typed by the person: queued PENDING (chm_tick dials and sends it). Its number, 0 when refused.
+pub fn chm_send(m: []u8, log: []u8, text: []const u8, now: u64) -> u32 {
+    const msg : u32 = cl_out_add(log, text, now);
+    if (msg != 0) { mp(m, M_DIRTY, 1); }
+    return msg;
+}
+
+/// The chat is shown: every incoming line is READ; the READ goes out with the next tick of a session.
+pub fn chm_open(m: []u8, log: []u8) -> bool {
+    const upto : u32 = cl_open_read(log);
+    if (upto == 0) { return false; }
+    if (@as(u64, upto) > mg(m, M_READ_UPTO)) { mp(m, M_READ_UPTO, @as(u64, upto)); }
+    mp(m, M_DIRTY, 1);
+    return true;
+}
+
+fn chm_peer_is(m: []const u8, s: []const u8) -> bool {
+    var fp : [10]u8 = undefined;
+    if (cs_peer(s, fp[0..10]) == 0) { return false; }
+    var i : usize = 0;
+    while (i < 10) {
+        if (fp[i] != m[M_FP + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn chm_tx(m: []u8, s: []u8, pt: []const u8) -> bool {
+    if (cs_text_send(s, pt)) { return true; }
+    ma(m, CHM_SEND_ERR);
+    return false;
+}
+
+// ---------------------------------------------------------------- the open group
+
+/// The group block: GRM_LEN bytes of u64 slots (k at 8 k), the floors per sender (group_core GL_FLOORS) at G_FLOORS,
+/// the id at G_GID.
+pub const GRM_LEN : usize = 256;
+const G_ON : usize = 0;
+const G_ME : usize = 1;
+/// Counters (grm_stat): lines in, duplicates, text parts sent, ACKs sent and received, payloads refused by gr_gate
+/// (and the last reason), resent rounds, lines failed, payloads of a known group whose log is not the open one.
+pub const GRM_RX_NEW : u32 = 2;
+pub const GRM_RX_DUP : u32 = 3;
+pub const GRM_TX_FRAMES : u32 = 4;
+pub const GRM_ACK_TX : u32 = 5;
+pub const GRM_ACK_RX : u32 = 6;
+pub const GRM_REFUSED : u32 = 7;
+pub const GRM_LAST_WHY : u32 = 8;
+pub const GRM_RESENDS : u32 = 9;
+pub const GRM_FAILED : u32 = 10;
+pub const GRM_NOT_OPEN : u32 = 11;
+/// Test aid: the n-th group ACK this side sends is dropped as a lost datagram (its sender sends the part again and
+/// this side sees a duplicate); 0 = none.
+pub const GRM_K_DROP_ACK : u32 = 12;
+const G_ACKN : usize = 13;
+pub const GRM_ACK_DROPPED : u32 = 14;
+const G_FLOORS : usize = 160;
+const G_GID : usize = 200;
+
+/// Open group gid of the table t for this device (me_fp must be a member). False when it is not there.
+pub fn grm_init(g: []u8, t: []const u8, gid: []const u8, me_fp: []const u8) -> bool {
+    if (g.len < GRM_LEN or gid.len != GR_ID) { return false; }
+    var i : usize = 0;
+    while (i < GRM_LEN) {
+        g[i] = 0;
+        i = i + 1;
+    }
+    const gi : usize = gt_find(t, gid);
+    if (gi == GT_NONE) { return false; }
+    const me : u32 = gt_idx(t, gi, me_fp);
+    if (me == GR_NOBODY) { return false; }
+    mp(g, G_ON, @as(u64, gi + 1));
+    mp(g, G_ME, @as(u64, me));
+    i = 0;
+    while (i < GR_ID) {
+        g[G_GID + i] = gid[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn grm_stat(g: []const u8, k: u32) -> u64 {
+    if (@as(usize, k) * 8 + 8 > G_FLOORS) { return 0; }
+    return mg(g, @as(usize, k));
+}
+
+pub fn grm_set(g: []u8, k: u32, v: u64) -> bool {
+    if (k != GRM_K_DROP_ACK) { return false; }
+    mp(g, @as(usize, k), v);
+    return true;
+}
+
+fn grm_gi(g: []const u8) -> usize { return @as(usize, mg(g, G_ON)) - 1; }
+fn grm_me(g: []const u8) -> u32 { return @as(u32, @intCast(mg(g, G_ME))); }
+
+/// The members of the open group this device can reach (friends), by member index.
+pub fn grm_reach(g: []const u8, t: []const u8, friends: []const u8) -> u32 {
+    return gr_reach_mask(t, grm_gi(g), friends) & (255 ^ (@as(u32, 1) << grm_me(g)));
+}
+
+/// Read the open group's log (cap lines) from its file; the floors per sender and the recipients of lines not yet
+/// delivered (the reachable members) are set again. chh_load's answer.
+pub fn grm_load(g: []u8, t: []const u8, friends: []const u8, glog: []u8, cap: u32, buf: []u8) -> u32 {
+    const r : u32 = chh_load_group(g[G_GID..G_GID + GR_ID], glog, cap, buf);
+    gl_after_load(glog, g[G_FLOORS..G_FLOORS + GL_FLOORS], grm_reach(g, t, friends));
+    return r;
+}
+
+/// A message typed into the open group: the fan-out plan (online: the members reachable now, by index) fixes its
+/// recipients. Its number, 0 when refused (bad text, or nobody to send to).
+pub fn grm_send(g: []u8, t: []const u8, friends: []const u8, glog: []u8, text: []const u8, now: u64, online: u32) -> u32 {
+    const gi : usize = grm_gi(g);
+    const plan : u32 = gr_fanout(t, gi, gt_member(t, gi, @as(usize, grm_me(g))), online, grm_reach(g, t, friends));
+    return gl_out_add(glog, g[G_FLOORS..G_FLOORS + GL_FLOORS], grm_me(g), text, now, gr_recipients(plan));
+}
+
+/// One group payload that came over the session with this driver's friend.
+fn grm_rx(m: []u8, s: []u8, g: []u8, t: []const u8, glog: []u8, gasm: []u8, me_fp: []const u8, p: []const u8) -> u32 {
+    var peer : [10]u8 = undefined;
+    if (cs_peer(s, peer[0..10]) == 0) { return 0; }
+    const ids : u32 = cs_id_state(s);
+    const why : u32 = gr_gate(t, p, me_fp, peer[0..10], ids == CS_ID_VERIFIED or ids == CS_ID_STORED);
+    if (why != GR_OK) {
+        ma(g, @as(usize, GRM_REFUSED));
+        mp(g, @as(usize, GRM_LAST_WHY), @as(u64, why));
+        return 0;
+    }
+    const gi : usize = grm_gi(g);
+    if (gt_find(t, gm_gid(p)) != gi) {
+        ma(g, @as(usize, GRM_NOT_OPEN));
+        return 0;
+    }
+    const pidx : u32 = gt_idx(t, gi, peer[0..10]);
+    if (gm_kind(p) == GM_K_TEXT) {
+        var ev : u32 = 0;
+        const r : u32 = gl_rx_text(glog, gasm, g[G_FLOORS..G_FLOORS + GL_FLOORS], grm_me(g), pidx, p);
+        if (r == CH_RX_NEW) {
+            ma(g, @as(usize, GRM_RX_NEW));
+            ev = CHM_E_GNEW | CHM_E_GDIRTY;
+        }
+        if (r == CH_RX_DUP) { ma(g, @as(usize, GRM_RX_DUP)); }
+        if (ch_rx_acks(r)) {
+            var a : [38]u8 = undefined;
+            gm_put_ack(a[0..38], gt_id(t, gi), peer[0..10], gm_msg(p), gm_part(p));
+            ma(g, G_ACKN);
+            if (mg(g, G_ACKN) == mg(g, @as(usize, GRM_K_DROP_ACK))) {
+                ma(g, @as(usize, GRM_ACK_DROPPED));
+            } else if (chm_tx(m, s, a[0..GM_HDR])) {
+                ma(g, @as(usize, GRM_ACK_TX));
+            }
+        }
+        return ev;
+    }
+    ma(g, @as(usize, GRM_ACK_RX));
+    if (gl_rx_ack(glog, pidx, p)) { return CHM_E_GSTATUS | CHM_E_GDIRTY; }
+    return 0;
+}
+
+/// Every line of the open group still owed to member pidx goes out over this session (the parts it has not
+/// acknowledged), as group_core gl_due_for says.
+fn grm_out(m: []u8, s: []u8, g: []u8, t: []const u8, glog: []u8, pidx: u32, now: u64) -> u32 {
+    var ev : u32 = 0;
+    const gi : usize = grm_gi(g);
+    const me_fp : []const u8 = gt_member(t, gi, @as(usize, grm_me(g)));
+    const cnt : usize = @as(usize, cl_count(glog));
+    var i : usize = 0;
+    while (i < cnt) {
+        const d : u32 = gl_due_for(glog, i, pidx, now);
+        if (d == CH_R_GIVEUP) {
+            ma(g, @as(usize, GRM_FAILED));
+            ev = ev | CHM_E_GSTATUS | CHM_E_GDIRTY;
+        }
+        if (d == CH_R_SEND) {
+            if (cl_tries(glog, i) > 1) { ma(g, @as(usize, GRM_RESENDS)); }
+            var k : u32 = 0;
+            while (k < cl_parts(glog, i)) {
+                if (gl_part_due(glog, i, pidx, k)) {
+                    var p : [738]u8 = undefined;
+                    const pn : usize = gm_put_text(p[0..738], gt_id(t, gi), me_fp, cl_msg(glog, i), k, cl_time(glog, i), cl_text(glog, i));
+                    if (pn > 0 and chm_tx(m, s, p[0..pn])) { ma(g, @as(usize, GRM_TX_FRAMES)); }
+                    ck_wipe(p[0..738]);
+                }
+                k = k + 1;
+            }
+            mp(m, M_LAST, now);
+            ev = ev | CHM_E_GSTATUS;
+        }
+        i = i + 1;
+    }
+    return ev;
+}
+
+// ---------------------------------------------------------------- GROUP_INFO
+
+/// The ANNOUNCEs owed to this driver's friend (own: a byte per group, a bit per member index; groups this device
+/// made only).
+pub fn ghm_owed(m: []const u8, t: []const u8, own: []const u8, me_fp: []const u8) -> u32 {
+    if (own.len < GT_MAX or t.len < GT_LEN) { return 0; }
+    var c : u32 = 0;
+    var gi : usize = 0;
+    while (gi < @as(usize, gt_count(t))) {
+        const k : u32 = gt_idx(t, gi, m[M_FP..M_FP + 10]);
+        if (k != GR_NOBODY and (@as(u32, own[gi]) & (@as(u32, 1) << k)) != 0 and gi_mine(t, gi, me_fp)) { c = c + 1; }
+        gi = gi + 1;
+    }
+    return c;
+}
+
+/// A session with this driver's friend came up: every group this device made with the friend in it owes the friend
+/// its ANNOUNCE again (it may have been lost, or this device restarted before the answer), sent at once.
+fn ghm_session(m: []u8, t: []const u8, own: []u8, me_fp: []const u8) -> void {
+    mp(m, M_INFO_AT, 0);
+    if (own.len < GT_MAX or t.len < GT_LEN) { return; }
+    var gi : usize = 0;
+    while (gi < @as(usize, gt_count(t))) {
+        const k : u32 = gt_idx(t, gi, m[M_FP..M_FP + 10]);
+        if (k != GR_NOBODY and gi_mine(t, gi, me_fp)) { own[gi] = own[gi] | @as(u8, @intCast(@as(u32, 1) << k)); }
+        gi = gi + 1;
+    }
+}
+
+/// The ANNOUNCEs owed to this driver's friend go out over its session, once every CH_RETRY_MS. How many.
+fn ghm_info_out(m: []u8, s: []u8, t: []const u8, own: []u8, me_fp: []const u8, now: u64) -> u32 {
+    if (own.len < GT_MAX or t.len < GT_LEN) { return 0; }
+    const at : u64 = mg(m, M_INFO_AT);
+    if (at != 0 and now < at + CH_RETRY_MS) { return 0; }
+    var c : u32 = 0;
+    var gi : usize = 0;
+    while (gi < @as(usize, gt_count(t))) {
+        const k : u32 = gt_idx(t, gi, m[M_FP..M_FP + 10]);
+        if (k != GR_NOBODY and (@as(u32, own[gi]) & (@as(u32, 1) << k)) != 0) {
+            if (gi_mine(t, gi, me_fp)) {
+                var a : [142]u8 = undefined;
+                const an : usize = gi_put_rec(a[0..GI_MAX], GI_ANNOUNCE, t, gi);
+                if (an > 0 and chm_tx(m, s, a[0..an])) {
+                    ma(m, @as(usize, CHM_INFO_TX));
+                    c = c + 1;
+                }
+            } else {
+                own[gi] = own[gi] & @as(u8, @intCast(255 ^ (@as(u32, 1) << k)));
+            }
+        }
+        gi = gi + 1;
+    }
+    if (c > 0) { mp(m, M_INFO_AT, now + 1); }
+    return c;
+}
+
+/// One GROUP_INFO that came over the session with this driver's friend: group_core gi_apply on the id this device
+/// hashes from its roster. A group kept or already here is answered GI_HAVE; a HAVE clears the ANNOUNCE owed to the
+/// friend, and the open group's lines owed to it go again. A refusal is counted with its reason.
+fn ghm_info_rx(m: []u8, s: []u8, g: []const u8, t: []u8, own: []u8, glog: []u8, friends: []const u8, me_fp: []const u8, p: []const u8) -> u32 {
+    var peer : [10]u8 = undefined;
+    if (cs_peer(s, peer[0..10]) == 0) { return 0; }
+    const ids : u32 = cs_id_state(s);
+    const pinned : bool = ids == CS_ID_VERIFIED or ids == CS_ID_STORED;
+    var idc : [8]u8 = undefined;
+    var r : u32 = GR_BAD;
+    if (gi_ok(p) and ghh_id(gi_roster(p), gi_n(p), idc[0..8])) {
+        if (g.len >= GRM_LEN and mg(g, G_ON) != 0) {
+            r = gi_apply(t, friends, me_fp, peer[0..10], pinned, p, idc[0..8], glog, grm_gi(g));
+        } else {
+            r = gi_apply(t, friends, me_fp, peer[0..10], pinned, p, idc[0..8], glog[0..0], GT_NONE);
+        }
+    }
+    const code : u32 = r & 255;
+    if (code == GI_KEPT or code == GI_ALREADY) {
+        var ev : u32 = 0;
+        if (code == GI_KEPT) {
+            ma(m, @as(usize, CHM_INFO_KEPT));
+            ev = CHM_E_GINFO;
+        }
+        var a : [142]u8 = undefined;
+        const an : usize = gi_put_rec(a[0..GI_MAX], GI_HAVE, t, gt_find(t, gi_gid(p)));
+        if (an > 0) { chm_tx(m, s, a[0..an]); }
+        return ev;
+    }
+    if (code == GI_JOINED) {
+        ma(m, @as(usize, CHM_INFO_HAVE));
+        const gi : usize = gt_find(t, gi_gid(p));
+        const k : u32 = gt_idx(t, gi, peer[0..10]);
+        if (gi < own.len and k != GR_NOBODY) { own[gi] = own[gi] & @as(u8, @intCast(255 ^ (@as(u32, 1) << k))); }
+        if ((r >> 8) > 0) { return CHM_E_GSTATUS | CHM_E_GDIRTY; }
+        return 0;
+    }
+    ma(m, @as(usize, CHM_INFO_REFUSED));
+    mp(m, @as(usize, CHM_INFO_WHY), @as(u64, code));
+    return 0;
+}
+
+/// One pass: run the session (answer a friend, dismiss an ended one), take every received chat frame,
+/// send what is due, send a pending READ, dial when something waits, close when idle. me_fp is this device's
+/// fingerprint, friends the peer_identity table. Returns CHM_E_* bits.
+pub fn chm_tick(m: []u8, s: []u8, log: []u8, asm: []u8, friends: []const u8, me_fp: []const u8, now: u64) -> u32 {
+    var z : [1]u8 = undefined;
+    return chm_tick_g(m, s, log, asm, friends, me_fp, now, z[0..0], z[0..0], z[0..0], z[0..0], z[0..0]);
+}
+
+/// chm_tick with the open group: g its block (grm_init), t the groups table, glog its log, gasm the log's assembly
+/// (chat_core CA_LEN), own the ANNOUNCEs owed (GT_MAX bytes). A g shorter than GRM_LEN, or not initialised, is no
+/// group; a t shorter than GT_LEN takes no GROUP_INFO; an own shorter than GT_MAX owes none.
+pub fn chm_tick_g(m: []u8, s: []u8, log: []u8, asm: []u8, friends: []const u8, me_fp: []const u8, now: u64, g: []u8, t: []u8, glog: []u8, gasm: []u8, own: []u8) -> u32 {
+    var pidx : u32 = GR_NOBODY;
+    if (g.len >= GRM_LEN and mg(g, G_ON) != 0) { pidx = gt_idx(t, grm_gi(g), m[M_FP..M_FP + 10]); }
+    const grp : bool = g.len >= GRM_LEN and mg(g, G_ON) != 0;
+    var ev : u32 = 0;
+    var e : u32 = cs_poll(s);
+    var guard : u32 = 0;
+    while (e != CS_EV_NONE and guard < 32) {
+        if (e == CS_EV_ACTIVE) {
+            ma(m, CHM_SESSIONS);
+            mp(m, M_LAST, now);
+            mp(m, M_READ_SENT, 0);
+            if (cl_session_start(log) > 0) { ev = ev | CHM_E_STATUS; }
+            if (pidx != GR_NOBODY and gl_session_start(glog, pidx) > 0) { ev = ev | CHM_E_GSTATUS; }
+            ghm_session(m, t, own, me_fp);
+        } else if (e == CS_EV_ENDED or e == CS_EV_FAILED) {
+            ev = ev | chm_end_bits(e == CS_EV_FAILED, cs_reason(s));
+            cs_dismiss(s);
+        }
+        e = cs_poll(s);
+        guard = guard + 1;
+    }
+    // an invitation just ended: nothing else this pass, so the window reads its proven key (cs_id_proven) before a dial
+    // of this log's friend starts the next session
+    if ((ev & CHM_E_INVITE) != 0) { return ev; }
+    // a session that rings: the friend of this log is answered, another friend is left ringing for the window, so is
+    // anyone who is not a friend (an invitation: the window answers or declines it; read from the state, so a session
+    // the window switched logs for is answered on this tick)
+    if (cs_state(s) == CK_RINGING) {
+        var rf : [10]u8 = undefined;
+        cs_peer(s, rf[0..10]);
+        if (ft_find(friends, rf[0..10]) == FT_MAX) {
+            ev = ev | CHM_E_STRANGER;
+        } else if (chm_peer_is(m, s)) {
+            cs_answer(s);
+        } else {
+            ev = ev | CHM_E_OTHER;
+        }
+    }
+    const st : u32 = cs_state(s);
+    if (st == CK_ACTIVE) {
+        var pt : [740]u8 = undefined;
+        var n : usize = cs_text_take(s, pt[0..740]);
+        while (n > 0) {
+            mp(m, M_LAST, now);
+            const kind : u32 = ch_kind(pt[0..n]);
+            if (gi_is(pt[0..n])) {
+                if (t.len >= GT_LEN) { ev = ev | ghm_info_rx(m, s, g, t, own, glog, friends, me_fp, pt[0..n]); }
+            } else if (grp and gm_is_group(pt[0..n])) {
+                ev = ev | grm_rx(m, s, g, t, glog, gasm, me_fp, pt[0..n]);
+            } else if (kind == CH_K_TEXT) {
+                const r : u32 = ch_rx_text(log, asm, pt[0..n]);
+                if (r == CH_RX_NEW) {
+                    ma(m, CHM_RX_NEW);
+                    ev = ev | CHM_E_NEW | CHM_E_DIRTY;
+                }
+                if (r == CH_RX_DUP) { ma(m, CHM_RX_DUP); }
+                // a line is ACKed only once it is on disk (chm_saved after the window's save); a part kept, at once
+                const plan : u32 = chm_ack_plan(r, mg(m, M_HELD));
+                if (plan == CHM_ACK_HOLD) {
+                    chm_hold(m, ch_msg(pt[0..n]), ch_parts(pt[0..n]));
+                    ev = ev | CHM_E_DIRTY;
+                }
+                if (plan == CHM_ACK_NOW) {
+                    var a : [20]u8 = undefined;
+                    ch_put_ack(a[0..20], ch_msg(pt[0..n]), ch_part(pt[0..n]));
+                    if (chm_tx(m, s, a[0..20])) { ma(m, CHM_ACK_TX); }
+                }
+            } else if (kind == CH_K_ACK) {
+                ma(m, CHM_ACK_RX);
+                if (ch_rx_ack(log, pt[0..n])) { ev = ev | CHM_E_STATUS | CHM_E_DIRTY; }
+            } else if (kind == CH_K_READ) {
+                ma(m, CHM_READ_RX);
+                if (ch_rx_read(log, pt[0..n]) > 0) { ev = ev | CHM_E_STATUS | CHM_E_DIRTY; }
+            }
+            n = cs_text_take(s, pt[0..740]);
+        }
+        ck_wipe(pt[0..740]);
+        // what is due goes out: every part still without its ACK
+        const cnt : usize = @as(usize, cl_count(log));
+        var i : usize = 0;
+        while (i < cnt) {
+            const d : u32 = cl_due(log, i, now);
+            if (d == CH_R_GIVEUP) {
+                ma(m, CHM_FAILED);
+                ev = ev | CHM_E_STATUS | CHM_E_DIRTY;
+            }
+            if (d == CH_R_SEND) {
+                if (cl_tries(log, i) > 0) { ma(m, CHM_TX_RESENDS); }
+                var k : u32 = 0;
+                while (k < cl_parts(log, i)) {
+                    if (cl_part_due(log, i, k)) {
+                        var p : [720]u8 = undefined;
+                        const pn : usize = ch_put_text(p[0..720], cl_msg(log, i), k, cl_time(log, i), cl_text(log, i));
+                        ma(m, M_TXN);
+                        if (mg(m, M_TXN) == mg(m, @as(usize, CHM_K_DROP))) {
+                            ma(m, CHM_DROPPED);
+                        } else if (pn > 0 and chm_tx(m, s, p[0..pn])) {
+                            ma(m, CHM_TX_FRAMES);
+                        }
+                        ck_wipe(p[0..720]);
+                    }
+                    k = k + 1;
+                }
+                cl_mark_sent(log, i, now);
+                mp(m, M_LAST, now);
+                ev = ev | CHM_E_STATUS;
+            }
+            i = i + 1;
+        }
+        if (ghm_info_out(m, s, t, own, me_fp, now) > 0) { mp(m, M_LAST, now); }
+        if (pidx != GR_NOBODY) { ev = ev | grm_out(m, s, g, t, glog, pidx, now); }
+        // a READ is sent once per session for the highest message shown
+        const upto : u64 = mg(m, M_READ_UPTO);
+        if (upto > mg(m, M_READ_SENT)) {
+            var r : [20]u8 = undefined;
+            ch_put_read(r[0..20], @as(u32, @intCast(upto)));
+            if (chm_tx(m, s, r[0..20])) {
+                ma(m, CHM_READ_TX);
+                mp(m, M_READ_SENT, upto);
+                mp(m, M_LAST, now);
+            }
+        }
+        var waiting : u32 = cl_pending(log);
+        if (upto > mg(m, M_READ_SENT)) { waiting = waiting + 1; }
+        if (pidx != GR_NOBODY) { waiting = waiting + gl_pending_for(glog, pidx); }
+        waiting = waiting + ghm_owed(m, t, own, me_fp);
+        waiting = waiting + @as(u32, @intCast(mg(m, M_HELD)));
+        if (ch_idle_close(now, mg(m, M_LAST), waiting)) {
+            ma(m, CHM_IDLE_CLOSED);
+            cs_hangup(s);
+            cs_dismiss(s);
+        }
+    } else if (st == CK_IDLE or st == CK_ENDED or st == CK_FAILED) {
+        if (st != CK_IDLE) { cs_dismiss(s); }
+        // something waits: dial the friend's chat port; a dial that was not answered is retried after the redial gap
+        var need : bool = cl_pending(log) > 0 or mg(m, M_READ_UPTO) > mg(m, M_READ_SENT);
+        if (pidx != GR_NOBODY and gl_pending_for(glog, pidx) > 0) { need = true; }
+        if (ghm_owed(m, t, own, me_fp) > 0) { need = true; }
+        if (need and now >= mg(m, M_REDIAL) and (mg(m, M_IP) != 0 or ip6_is_set(m[M_EP6..M_EP6 + 18]))) {
+            var dialled : bool = false;
+            if (mg(m, M_IP) != 0) {
+                dialled = cs_call(s, mg(m, M_IP), mg(m, M_PORT), m[M_FP..M_FP + 10]);
+            } else {
+                dialled = cs_call6(s, m[M_EP6..M_EP6 + 18], m[M_FP..M_FP + 10]);
+            }
+            if (dialled) { ma(m, CHM_DIALS); }
+            mp(m, M_REDIAL, now + CH_CALLING_MS + ch_redial_ms(me_fp, m[M_FP..M_FP + 10]));
+        }
+    }
+    if (mg(m, M_DIRTY) != 0) {
+        mp(m, M_DIRTY, 0);
+        ev = ev | CHM_E_DIRTY;
+    }
+    return ev;
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_log_path_is_the_chat_folder_and_the_fingerprint {
+    const home : [10]u8 = [47, 85, 115, 101, 114, 115, 47, 120, 121, 122];
+    const fp : [10]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 171];
+    var out : [256]u8 = undefined;
+    const d : usize = chh_path(home[0..10], 10, fp[0..10], 0, out[0..256]);
+    assert d == 10 + 12 and out[d] == 0 and out[17] == 47 and out[21] == 116;
+    const f : usize = chh_path(home[0..10], 10, fp[0..10], 1, out[0..256]);
+    assert f == d + 1 + 24 and out[d] == 47 and out[d + 1] == 48 and out[d + 19] == 97 and out[d + 20] == 98;
+    assert chh_path(home[0..10], 10, fp[0..10], 2, out[0..256]) == f + 4;
+    assert chh_path(home[0..10], 10, fp[0..10], 3, out[0..256]) == f + 4;
+    assert out[f + 1] == 98;
+    assert chh_path(home[0..10], 10, fp[0..9], 1, out[0..256]) == 0;
+    assert chh_path(home[0..10], 10, fp[0..10], 1, out[0..60]) == 0;
+    var m : [384]u8 = undefined;
+    assert chm_init(m[0..384], fp[0..10], 2130706433, 47800);
+    assert chm_stat(m[0..384], CHM_SESSIONS) == 0;
+    assert chm_set(m[0..384], CHM_K_DROP, 5) and chm_stat(m[0..384], CHM_K_DROP) == 5;
+    assert chm_set(m[0..384], CHM_SESSIONS, 5) == false;
+    assert chm_stat(m[0..384], 40) == 0;
+    // a new address keeps the counters
+    chm_addr(m[0..384], 3232235786, 47728);
+    assert chm_stat(m[0..384], CHM_K_DROP) == 5 and mg(m[0..384], M_IP) == 3232235786 and mg(m[0..384], M_PORT) == 47728;
+    assert CHM_E_OTHER != CHM_E_NEW and CHM_E_OTHER != CHM_E_STATUS and CHM_E_OTHER != CHM_E_DIRTY;
+}
+
+test the_invitations_file_lives_beside_the_friends_file {
+    const home : [10]u8 = [47, 85, 115, 101, 114, 115, 47, 120, 121, 122];
+    var out : [256]u8 = undefined;
+    const n : usize = ih_invites_path(home[0..10], 10, 0, out[0..256]);
+    assert n == 10 + 19 and out[n] == 0 and out[10] == 47 and out[18] == 105 and out[n - 4] == 46 and out[n - 1] == 55;
+    assert ih_invites_path(home[0..10], 10, 1, out[0..256]) == n + 4 and out[n + 1] == 116;
+    assert ih_invites_path(home[0..10], 10, 2, out[0..256]) == n + 4 and out[n + 1] == 98;
+    assert ih_invites_path(home[0..10], 10, 0, out[0..40]) == 0;
+    var f : [256]u8 = undefined;
+    const m : usize = ih_path(home[0..10], 10, 2, false, f[0..256]);
+    assert m == 10 + 15 and f[17] == 47;
+}
+
+test a_stranger_is_answered_for_its_invitation_unless_declined_this_hour_and_its_end_is_said_once {
+    assert chm_stranger_answer(false) and chm_stranger_answer(true) == false;
+    assert chm_end_bits(true, CS_R_INVITE) == CHM_E_INVITE;
+    assert chm_end_bits(false, CS_R_INVITE) == 0 and chm_end_bits(true, 15) == 0 and chm_end_bits(true, 0) == 0;
+    assert CHM_E_INVITE != CHM_E_OTHER and CHM_E_STRANGER != CHM_E_INVITE and (CHM_E_STRANGER & (CHM_E_NEW | CHM_E_STATUS | CHM_E_DIRTY | CHM_E_OTHER)) == 0;
+}
+
+test the_counter_slots_store_and_add_one_without_touching_the_neighbours {
+    var m : [384]u8 = undefined;
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert chm_init(m[0..384], fp[0..10], 1, 2);
+    mp(m[0..384], CHM_ACK_TX, 4294967296);
+    assert mg(m[0..384], CHM_ACK_TX) == 4294967296 and chm_stat(m[0..384], CHM_ACK_TX) == 4294967296;
+    assert mg(m[0..384], CHM_ACK_TX - 1) == 0 and mg(m[0..384], CHM_ACK_TX + 1) == 0;
+    ma(m[0..384], CHM_ACK_TX);
+    assert chm_stat(m[0..384], CHM_ACK_TX) == 4294967297;
+    ma(m[0..384], CHM_DROPPED);
+    ma(m[0..384], CHM_DROPPED);
+    assert chm_stat(m[0..384], CHM_DROPPED) == 2 and chm_stat(m[0..384], CHM_ACK_TX) == 4294967297;
+    // the last counter slot is addressable, the fingerprint area is not a counter
+    ma(m[0..384], CHM_SEND_ERR);
+    assert chm_stat(m[0..384], CHM_SEND_ERR) == 1 and chm_stat(m[0..384], 24) == 0 and chm_stat(m[0..384], 23) == 0;
+    assert m[M_FP] == 1 and m[M_FP + 9] == 10;
+}
+
+test chm_an_ipv6_chat_endpoint_is_kept_beside_the_ipv4_and_never_over_the_owed_acks {
+    var m : [384]u8 = undefined;
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert chm_init(m[0..384], fp[0..10], 0, 0);
+    assert ip6_is_set(m[M_EP6..M_EP6 + 18]) == false;
+    const ep : [18]u8 = [32, 1, 72, 96, 72, 96, 0, 0, 0, 0, 0, 0, 0, 0, 136, 136, 186, 112];
+    chm_addr6(m[0..384], ep[0..18]);
+    assert m[M_EP6] == 32 and m[M_EP6 + 17] == 112 and mg(m[0..384], M_IP) == 0;
+    // the held ACKs end before it, the block holds it
+    assert (M_OWED + CHM_OWED_MAX) * 8 <= M_EP6 and M_EP6 + 18 <= CHM_LEN and M_FP + 10 <= M_INFO_AT * 8;
+    // an empty or all-zero endpoint clears it; a new driver starts with none
+    chm_addr6(m[0..384], ep[0..0]);
+    assert ip6_is_set(m[M_EP6..M_EP6 + 18]) == false;
+    chm_addr6(m[0..384], ep[0..18]);
+    assert chm_init(m[0..384], fp[0..10], 1, 2) and ip6_is_set(m[M_EP6..M_EP6 + 18]) == false;
+    chm_addr6(m[0..383], ep[0..18]);
+}
+
+// a session block that holds only what chm_ringing reads: the state byte, the peer fingerprint and the peer address slot
+fn t_ses(buf: []u8, state: u8, ip: u64) -> void {
+    var i : usize = 0;
+    while (i < buf.len) {
+        buf[i] = 0;
+        i = i + 1;
+    }
+    buf[1] = state;
+    i = 0;
+    while (i < 10) {
+        buf[18 + i] = 50 + @as(u8, @intCast(i));
+        i = i + 1;
+    }
+    put_u64(buf, 960 + 37 * 8, ip);
+}
+
+test chm_ringing_names_the_peer_only_while_a_session_rings_from_a_known_address {
+    var s : [1300]u8 = undefined;
+    var fp : [10]u8 = undefined;
+    t_ses(s[0..1300], 2, 2130706433);
+    assert chm_ringing(s[0..1300], fp[0..10]);
+    assert fp[0] == 50 and fp[9] == 59;
+    // idle, active, ended: not ringing
+    t_ses(s[0..1300], 0, 2130706433);
+    assert chm_ringing(s[0..1300], fp[0..10]) == false;
+    t_ses(s[0..1300], 1, 2130706433);
+    assert chm_ringing(s[0..1300], fp[0..10]) == false;
+    t_ses(s[0..1300], 5, 2130706433);
+    assert chm_ringing(s[0..1300], fp[0..10]) == false;
+    // ringing with no peer address: no friend to name
+    t_ses(s[0..1300], 2, 0);
+    assert chm_ringing(s[0..1300], fp[0..10]) == false;
+    // a short answer slice is refused
+    t_ses(s[0..1300], 2, 7);
+    assert chm_ringing(s[0..1300], fp[0..9]) == false;
+}
+
+test chm_peer_is_matches_only_the_whole_fingerprint_of_this_driver {
+    var s : [1300]u8 = undefined;
+    var m : [384]u8 = undefined;
+    const same : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    t_ses(s[0..1300], 2, 99);
+    assert chm_init(m[0..384], same[0..10], 1, 2);
+    assert chm_peer_is(m[0..384], s[0..1300]);
+    // the first and the last byte each decide
+    const first : [10]u8 = [51, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    const last : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 60];
+    assert chm_init(m[0..384], first[0..10], 1, 2);
+    assert chm_peer_is(m[0..384], s[0..1300]) == false;
+    assert chm_init(m[0..384], last[0..10], 1, 2);
+    assert chm_peer_is(m[0..384], s[0..1300]) == false;
+    // an idle session has no peer
+    assert chm_init(m[0..384], same[0..10], 1, 2);
+    t_ses(s[0..1300], 0, 99);
+    assert chm_peer_is(m[0..384], s[0..1300]) == false;
+}
+
+test chm_send_queues_a_message_and_marks_the_log_dirty_only_when_accepted {
+    var m : [384]u8 = undefined;
+    var log : [2072]u8 = undefined;
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert chm_init(m[0..384], fp[0..10], 1, 2);
+    assert cl_init(log[0..2072], fp[0..10], 1);
+    const empty : [1]u8 = [0];
+    assert chm_send(m[0..384], log[0..2072], empty[0..0], 5) == 0;
+    assert mg(m[0..384], M_DIRTY) == 0 and cl_count(log[0..2072]) == 0;
+    // broken UTF-8 (a lone continuation byte) is refused
+    const bad : [2]u8 = [104, 128];
+    assert chm_send(m[0..384], log[0..2072], bad[0..2], 5) == 0;
+    assert mg(m[0..384], M_DIRTY) == 0;
+    // Cyrillic is accepted and numbered from 1
+    const ru : [4]u8 = [208, 159, 209, 128];
+    assert chm_send(m[0..384], log[0..2072], ru[0..4], 6) == 1;
+    assert mg(m[0..384], M_DIRTY) == 1 and cl_count(log[0..2072]) == 1 and cl_pending(log[0..2072]) == 1;
+    // the cap of 1 line: the next message drops the oldest and takes number 2
+    const hi : [2]u8 = [104, 105];
+    assert chm_send(m[0..384], log[0..2072], hi[0..2], 7) == 2;
+    assert cl_count(log[0..2072]) == 1 and cl_msg(log[0..2072], 0) == 2;
+    // too long for one message
+    var big : [3000]u8 = undefined;
+    var i : usize = 0;
+    while (i < 3000) {
+        big[i] = 97;
+        i = i + 1;
+    }
+    mp(m[0..384], M_DIRTY, 0);
+    assert chm_send(m[0..384], log[0..2072], big[0..3000], 8) == 0;
+    assert mg(m[0..384], M_DIRTY) == 0 and cl_msg(log[0..2072], 0) == 2;
+}
+
+test chm_open_reads_incoming_lines_once_and_keeps_the_highest_read_number {
+    var m : [384]u8 = undefined;
+    var la : [2072]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var z : usize = 0;
+    while (z < 8064) {
+        asm[z] = 0;
+        z = z + 1;
+    }
+    const fa : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const fb : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+    assert chm_init(m[0..384], fb[0..10], 1, 2);
+    assert cl_init(la[0..2072], fb[0..10], 1);
+    assert cl_init(lb[0..16296], fa[0..10], 8);
+    // nothing incoming: nothing to read, no dirty mark
+    assert chm_open(m[0..384], lb[0..16296]) == false;
+    assert mg(m[0..384], M_READ_UPTO) == 0 and mg(m[0..384], M_DIRTY) == 0;
+    // two incoming lines arrive (messages 1 and 2 of the sender)
+    const x : [1]u8 = [120];
+    var k : u32 = 0;
+    while (k < 2) {
+        assert cl_out_add(la[0..2072], x[0..1], 10 + @as(u64, k)) == k + 1;
+        var p : [720]u8 = undefined;
+        const pn : usize = ch_put_text(p[0..720], k + 1, 0, 10, x[0..1]);
+        assert ch_rx_text(lb[0..16296], asm[0..8064], p[0..pn]) == CH_RX_NEW;
+        k = k + 1;
+    }
+    assert chm_open(m[0..384], lb[0..16296]);
+    assert mg(m[0..384], M_READ_UPTO) == 2 and mg(m[0..384], M_DIRTY) == 1;
+    // opened again: nothing new, the number stays
+    mp(m[0..384], M_DIRTY, 0);
+    assert chm_open(m[0..384], lb[0..16296]) == false;
+    assert mg(m[0..384], M_READ_UPTO) == 2 and mg(m[0..384], M_DIRTY) == 0;
+    // a stored higher number is never lowered by a lower one
+    mp(m[0..384], M_READ_UPTO, 9);
+    var p3 : [720]u8 = undefined;
+    const n3 : usize = ch_put_text(p3[0..720], 3, 0, 10, x[0..1]);
+    assert ch_rx_text(lb[0..16296], asm[0..8064], p3[0..n3]) == CH_RX_NEW;
+    assert chm_open(m[0..384], lb[0..16296]);
+    assert mg(m[0..384], M_READ_UPTO) == 9;
+}
+
+test a_group_log_and_the_groups_file_have_their_own_names {
+    const home : [10]u8 = [47, 85, 115, 101, 114, 115, 47, 120, 121, 122];
+    const gid : [10]u8 = [72, 40, 111, 183, 63, 186, 44, 71, 0, 0];
+    var out : [256]u8 = undefined;
+    const d : usize = chh_path(home[0..10], 10, gid[0..10], 0, out[0..256]);
+    // <home>/.t27os/chat/g-48286fb73fba2c47.t27, its .tmp and .bad
+    const f : usize = chh_path(home[0..10], 10, gid[0..10], 4, out[0..256]);
+    assert f == d + 1 + 22 and out[d + 1] == 103 and out[d + 2] == 45 and out[d + 3] == 52 and out[f - 4] == 46 and out[f] == 0;
+    assert chh_path(home[0..10], 10, gid[0..10], 5, out[0..256]) == f + 4 and out[f + 1] == 116;
+    assert chh_path(home[0..10], 10, gid[0..10], 6, out[0..256]) == f + 4 and out[f + 1] == 98;
+    // a friend's log keeps its 20-hex name
+    assert chh_path(home[0..10], 10, gid[0..10], 1, out[0..256]) == d + 1 + 24;
+    const g : usize = ghh_path(home[0..10], 10, 0, out[0..256]);
+    assert g == 10 + 18 and out[17] == 47 and out[18] == 103 and out[g - 1] == 55 and out[g] == 0;
+    assert ghh_path(home[0..10], 10, 1, out[0..256]) == g + 4 and ghh_path(home[0..10], 10, 2, out[0..256]) == g + 4;
+    assert ghh_path(home[0..10], 10, 0, out[0..40]) == 0;
+}
+
+test the_group_block_opens_only_a_known_group_with_this_device_in_it {
+    var t : [4240]u8 = undefined;
+    gt_init(t[0..GT_LEN]);
+    const r : [30]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 200, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const gid : [8]u8 = [72, 40, 111, 183, 63, 186, 44, 71];
+    assert gt_add(t[0..GT_LEN], gid[0..8], "trio", r[0..30], 3, 0, 1) == GT_OK;
+    var g : [256]u8 = undefined;
+    const x : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    assert grm_init(g[0..GRM_LEN], t[0..GT_LEN], gid[0..8], x[0..10]) == false;
+    const other : [8]u8 = [1, 1, 1, 1, 1, 1, 1, 1];
+    assert grm_init(g[0..GRM_LEN], t[0..GT_LEN], other[0..8], r[0..10]) == false;
+    assert grm_init(g[0..GRM_LEN], t[0..GT_LEN], gid[0..8], r[20..30]);
+    assert grm_gi(g[0..GRM_LEN]) == 0 and grm_me(g[0..GRM_LEN]) == 2;
+    assert g[G_GID] == 72 and g[G_GID + 7] == 71;
+    assert grm_stat(g[0..GRM_LEN], GRM_RX_NEW) == 0 and grm_stat(g[0..GRM_LEN], 40) == 0;
+    assert grm_set(g[0..GRM_LEN], GRM_K_DROP_ACK, 3) and grm_stat(g[0..GRM_LEN], GRM_K_DROP_ACK) == 3;
+    assert grm_set(g[0..GRM_LEN], GRM_RX_NEW, 3) == false;
+    // the counter slots end before the floors and the id
+    assert @as(usize, GRM_ACK_DROPPED) * 8 + 8 <= G_FLOORS and G_FLOORS + GL_FLOORS <= G_GID and G_GID + GR_ID <= GRM_LEN;
+    assert (CHM_E_GNEW | CHM_E_GSTATUS | CHM_E_GDIRTY) & (CHM_E_NEW | CHM_E_STATUS | CHM_E_DIRTY | CHM_E_OTHER | CHM_E_INVITE | CHM_E_STRANGER) == 0;
+}
+
+test the_announces_owed_follow_the_groups_this_device_made_and_the_info_counters_read_back {
+    // A made {A, B} and holds B's {B, C} too (a group B made)
+    var t : [4240]u8 = undefined;
+    gt_init(t[0..GT_LEN]);
+    const ab : [20]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+    const bc : [20]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 200, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const id1 : [8]u8 = [4, 23, 205, 1, 40, 87, 215, 222];
+    const id2 : [8]u8 = [7, 7, 7, 7, 7, 7, 7, 7];
+    assert gt_add(t[0..GT_LEN], id1[0..8], "pair", ab[0..20], 2, 0, 1) == GT_OK;
+    assert gt_add(t[0..GT_LEN], id2[0..8], "bc", bc[0..20], 2, 0, 1) == GT_OK;
+    var own : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) {
+        own[i] = 0;
+        i = i + 1;
+    }
+    var m : [384]u8 = undefined;
+    assert chm_init(m[0..384], ab[10..20], 1, 2);
+    // nothing owed until a session with B comes up; then A's own group owes B its ANNOUNCE, B's group owes nothing
+    assert ghm_owed(m[0..384], t[0..GT_LEN], own[0..32], ab[0..10]) == 0;
+    ghm_session(m[0..384], t[0..GT_LEN], own[0..32], ab[0..10]);
+    assert own[0] == 2 and own[1] == 0;
+    assert ghm_owed(m[0..384], t[0..GT_LEN], own[0..32], ab[0..10]) == 1;
+    // an owed bit on a group this device did not make counts for nothing
+    own[1] = 1;
+    assert ghm_owed(m[0..384], t[0..GT_LEN], own[0..32], ab[0..10]) == 1;
+    // C's driver: C is in no group A made
+    assert chm_init(m[0..384], bc[10..20], 1, 2);
+    assert ghm_owed(m[0..384], t[0..GT_LEN], own[0..32], ab[0..10]) == 0;
+    // no table, no owed block: nothing
+    assert ghm_owed(m[0..384], t[0..10], own[0..32], ab[0..10]) == 0 and ghm_owed(m[0..384], t[0..GT_LEN], own[0..4], ab[0..10]) == 0;
+    // the GROUP_INFO counters sit after the fingerprint and read back; the time slot is not a counter
+    mp(m[0..384], @as(usize, CHM_INFO_WHY), 11);
+    ma(m[0..384], @as(usize, CHM_INFO_KEPT));
+    assert chm_stat(m[0..384], CHM_INFO_WHY) == 11 and chm_stat(m[0..384], CHM_INFO_KEPT) == 1 and chm_stat(m[0..384], CHM_INFO_TX) == 0;
+    mp(m[0..384], M_INFO_AT, 5);
+    assert chm_stat(m[0..384], 26) == 0 and chm_stat(m[0..384], 32) == 0;
+    assert M_INFO_AT * 8 >= M_FP + 10 and @as(usize, CHM_INFO_WHY) * 8 + 8 <= CHM_LEN;
+    assert m[M_FP] == 200 and m[M_FP + 9] == 9;
+    assert (CHM_E_GINFO & (CHM_E_NEW | CHM_E_STATUS | CHM_E_DIRTY | CHM_E_OTHER | CHM_E_INVITE | CHM_E_STRANGER | CHM_E_GNEW | CHM_E_GSTATUS | CHM_E_GDIRTY)) == 0;
+}
+
+test an_incoming_line_is_acked_only_after_the_log_is_saved_and_a_failed_save_sends_nothing {
+    // a part kept for later is ACKed at once; a message that became a line, or a duplicate while one waits, is held
+    assert chm_ack_plan(CH_RX_PART, 0) == CHM_ACK_NOW and chm_ack_plan(CH_RX_DUP, 0) == CHM_ACK_NOW;
+    assert chm_ack_plan(CH_RX_NEW, 0) == CHM_ACK_HOLD and chm_ack_plan(CH_RX_NEW, 3) == CHM_ACK_HOLD;
+    assert chm_ack_plan(CH_RX_DUP, 1) == CHM_ACK_HOLD;
+    assert chm_ack_plan(CH_RX_BAD, 0) == CHM_ACK_NONE and chm_ack_plan(CH_RX_FULL, 1) == CHM_ACK_NONE;
+    var m : [384]u8 = undefined;
+    const fp : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert chm_init(m[0..384], fp[0..10], 1, 2);
+    assert chm_hold(m[0..384], 5, 3) and chm_hold(m[0..384], 6, 1);
+    // the sender resends message 5 while the save is pending: still one entry
+    assert chm_hold(m[0..384], 5, 3);
+    assert chm_held(m[0..384]) == 2 and chm_stat(m[0..384], CHM_ACK_HELD) == 3;
+    // the write failed: no ACK, the queue stays for the retry
+    var a : [400]u8 = undefined;
+    assert chm_saved_acks(m[0..384], false, a[0..400]) == 0 and chm_held(m[0..384]) == 2;
+    // the write went through: every part of 5 and the one part of 6, then nothing is held
+    assert chm_saved_acks(m[0..384], true, a[0..400]) == 4 and chm_held(m[0..384]) == 0;
+    assert ch_kind(a[0..20]) == CH_K_ACK and ch_msg(a[0..20]) == 5 and ch_part(a[0..20]) == 0;
+    assert ch_msg(a[40..60]) == 5 and ch_part(a[40..60]) == 2;
+    assert ch_msg(a[60..80]) == 6 and ch_part(a[60..80]) == 0;
+    assert chm_saved_acks(m[0..384], true, a[0..400]) == 0;
+    // the queue is bounded: the ninth message is not held, counted, and its resend is ACKed after the save
+    var k : u32 = 1;
+    while (k <= 8) {
+        assert chm_hold(m[0..384], k + 10, 1);
+        k = k + 1;
+    }
+    assert chm_hold(m[0..384], 99, 1) == false and chm_stat(m[0..384], CHM_ACK_FULL) == 1 and chm_held(m[0..384]) == 8;
+    // the slots of the queue sit after the group counters and inside the block
+    assert (M_OWED + CHM_OWED_MAX) * 8 <= CHM_LEN and M_HELD > @as(usize, CHM_INFO_WHY);
+}

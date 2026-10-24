@@ -1,0 +1,945 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/qr.t27 -- a QR code (ISO/IEC 18004) of a byte string, so a phone reads the key a person would otherwise
+// type. Pure: no @extern, no clock, no allocation; the caller gives the matrix buffer. Owner, 2026-10-22: the
+// cabinet shows this device's key (T27-XXXX-XXXX-XXXX-XXXX-C) as a code; the code carries exactly the bytes of the
+// key, nothing added, so what a phone reads is what a person types (no second format). Scanning is another task.
+//
+// What it makes: byte mode, error correction level L, the smallest version from 2 to 10 that holds the bytes (32 to
+// 271 bytes), the mask chosen by the four penalty rules. The steps, in the order qr_make runs them:
+//   qr_version_for     the version for a length
+//   qr_data_codewords  the byte segment (mode 0100, the count, the bytes), the terminator, the padding bits to the
+//                      codeword boundary (only when the stream does not end on it, ISO 7.4.10) and the pad codewords
+//                      236 / 17 alternately
+//   qr_rs_ec           the Reed-Solomon codewords of a block (GF(256), polynomial 0x11D)
+//   qr_message         the blocks interleaved: the data codewords, then the error codewords
+//   qr_init, qr_finders (with the separators), qr_timing, qr_alignment, qr_reserve (format and version areas, the
+//                      dark module)
+//   qr_place           the bits up and down the two-module columns, right to left, around the patterns
+//   qr_masked          one mask over the data modules only
+//   qr_penalty         N1 + N2 + N3 + N4 (qr_n1 .. qr_n4); the lowest wins, the first of equals
+//   qr_put_format, qr_put_version   the format bits (level L, the mask, BCH, XOR 0x5412) and, from version 7, the
+//                      version bits (BCH 0x1F25)
+//
+// The masks are scored as segno 1.6.6 scores them: before the format and version bits are written (those areas and
+// the dark module read light), N3 finds 1011101 with four light modules (or the edge) on one side and, after a hit,
+// looks again seven modules on. The tests compare the whole matrix module by module with segno's for five strings.
+// Flat namespace (the window build splices imported modules): every name here starts with qr_ / QR_.
+module T27osQr;
+
+pub const QR_VER_MIN : u32 = 2;
+pub const QR_VER_MAX : u32 = 10;
+/// The side of a version 10 matrix and its cells: the size of the buffer qr_make needs at most.
+pub const QR_SIZE_MAX : usize = 57;
+pub const QR_CELLS_MAX : usize = 3249;
+/// The codewords of version 10 (data and error), the data codewords of version 10.
+pub const QR_CW_MAX : usize = 346;
+pub const QR_DATA_MAX : usize = 274;
+/// The mask argument that asks qr_make to choose; 0..7 forces that mask.
+pub const QR_MASK_AUTO : u32 = 8;
+/// The light border a reader needs around the symbol, in modules.
+pub const QR_QUIET : usize = 4;
+
+/// The cells while the symbol is built: a function module is 0 or 1, a free cell QR_FREE, a data module
+/// QR_DATA plus its bit.
+pub const QR_FREE : u8 = 2;
+pub const QR_DATA : u8 = 4;
+
+// ---------------------------------------------------------------- 1. versions (level L)
+
+pub fn qr_size(ver: u32) -> usize { return 17 + 4 * @as(usize, ver); }
+
+/// All codewords of the symbol (ISO Table 1).
+pub fn qr_total_cw(ver: u32) -> usize {
+    if (ver == 2) { return 44; }
+    if (ver == 3) { return 70; }
+    if (ver == 4) { return 100; }
+    if (ver == 5) { return 134; }
+    if (ver == 6) { return 172; }
+    if (ver == 7) { return 196; }
+    if (ver == 8) { return 242; }
+    if (ver == 9) { return 292; }
+    if (ver == 10) { return 346; }
+    return 0;
+}
+
+/// The error codewords of one block at level L, and the blocks (ISO Table 9).
+pub fn qr_ec_per_block(ver: u32) -> usize {
+    if (ver == 2) { return 10; }
+    if (ver == 3) { return 15; }
+    if (ver == 4) { return 20; }
+    if (ver == 5) { return 26; }
+    if (ver == 6) { return 18; }
+    if (ver == 7) { return 20; }
+    if (ver == 8) { return 24; }
+    if (ver == 9) { return 30; }
+    if (ver == 10) { return 18; }
+    return 0;
+}
+
+pub fn qr_blocks(ver: u32) -> usize {
+    if (ver >= 2 and ver <= 5) { return 1; }
+    if (ver >= 6 and ver <= 9) { return 2; }
+    if (ver == 10) { return 4; }
+    return 0;
+}
+
+pub fn qr_data_cw(ver: u32) -> usize { return qr_total_cw(ver) - qr_ec_per_block(ver) * qr_blocks(ver); }
+
+/// The data codewords of block b: the short blocks first, the last (data mod blocks) one longer.
+pub fn qr_block_len(ver: u32, b: usize) -> usize {
+    const nb : usize = qr_blocks(ver);
+    const short : usize = qr_data_cw(ver) / nb;
+    const long : usize = qr_data_cw(ver) % nb;
+    if (b >= nb - long) { return short + 1; }
+    return short;
+}
+
+/// The bits of the character count in byte mode: 8 up to version 9, 16 from version 10.
+pub fn qr_count_bits(ver: u32) -> usize {
+    if (ver < 10) { return 8; }
+    return 16;
+}
+
+/// The bytes a version holds in byte mode at level L.
+pub fn qr_capacity(ver: u32) -> usize { return (qr_data_cw(ver) * 8 - 4 - qr_count_bits(ver)) / 8; }
+
+/// The smallest version from QR_VER_MIN to QR_VER_MAX that holds n bytes; 0 when none does (or n is 0).
+pub fn qr_version_for(n: usize) -> u32 {
+    if (n == 0) { return 0; }
+    var v : u32 = QR_VER_MIN;
+    while (v <= QR_VER_MAX) {
+        if (n <= qr_capacity(v)) { return v; }
+        v = v + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- 2. the byte segment and the filling
+
+/// Write the k low bits of v, the highest first, at bit p of out (out zeroed by the caller); the next bit position.
+pub fn qr_put_bits(out: []u8, p: usize, v: u32, k: usize) -> usize {
+    var i : usize = 0;
+    while (i < k) {
+        const bit : u32 = (v >> @as(u32, @intCast(k - 1 - i))) & 1;
+        if (bit != 0) {
+            const q : usize = p + i;
+            out[q / 8] = out[q / 8] | @as(u8, @intCast(128 >> @as(u32, @intCast(q % 8))));
+        }
+        i = i + 1;
+    }
+    return p + k;
+}
+
+/// The data codewords of n bytes at version ver into out: mode 0100, the count, the bytes, up to four terminator
+/// zeros, zeros to the codeword boundary, then 236 and 17 alternately. Returns qr_data_cw(ver), or 0 when the bytes
+/// do not fit.
+pub fn qr_data_codewords(data: []const u8, n: usize, ver: u32, out: []u8) -> usize {
+    const dc : usize = qr_data_cw(ver);
+    if (dc == 0 or n > qr_capacity(ver) or out.len < dc) { return 0; }
+    var i : usize = 0;
+    while (i < dc) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    var p : usize = qr_put_bits(out, 0, 4, 4);
+    p = qr_put_bits(out, p, @as(u32, @intCast(n)), qr_count_bits(ver));
+    i = 0;
+    while (i < n) {
+        p = qr_put_bits(out, p, @as(u32, data[i]), 8);
+        i = i + 1;
+    }
+    var term : usize = dc * 8 - p;
+    if (term > 4) { term = 4; }
+    p = p + term;
+    p = (p + 7) / 8;
+    var pad : u8 = 236;
+    while (p < dc) {
+        out[p] = pad;
+        if (pad == 236) { pad = 17; } else { pad = 236; }
+        p = p + 1;
+    }
+    return dc;
+}
+
+// ---------------------------------------------------------------- 3. Reed-Solomon over GF(256)
+
+/// The powers of 2 (exp, 512 bytes so a sum of two logs needs no reduction) and their logs (lg, 256 bytes) in
+/// GF(256) with the polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D).
+pub fn qr_gf_tables(exp: []u8, lg: []u8) -> void {
+    var x : u32 = 1;
+    var i : usize = 0;
+    while (i < 255) {
+        exp[i] = @as(u8, @intCast(x));
+        lg[@as(usize, x)] = @as(u8, @intCast(i));
+        x = x * 2;
+        if (x >= 256) { x = x ^ 285; }
+        i = i + 1;
+    }
+    while (i < 512) {
+        exp[i] = exp[i - 255];
+        i = i + 1;
+    }
+    lg[0] = 0;
+}
+
+pub fn qr_gf_mul(exp: []const u8, lg: []const u8, a: u8, b: u8) -> u8 {
+    if (a == 0 or b == 0) { return 0; }
+    return exp[@as(usize, lg[@as(usize, a)]) + @as(usize, lg[@as(usize, b)])];
+}
+
+/// The generator polynomial of degree e, (x - 2^0)(x - 2^1)..(x - 2^(e-1)), its coefficients highest first in
+/// g[0 .. e + 1] (g[0] = 1).
+pub fn qr_rs_gen(exp: []const u8, lg: []const u8, e: usize, g: []u8) -> void {
+    g[0] = 1;
+    var k : usize = 1;
+    while (k <= e) {
+        g[k] = 0;
+        k = k + 1;
+    }
+    var i : usize = 0;
+    while (i < e) {
+        const r : u8 = exp[i];
+        var j : usize = i + 1;
+        while (j > 0) {
+            g[j] = g[j] ^ qr_gf_mul(exp, lg, g[j - 1], r);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// The e error codewords of the dn data codewords d: the remainder of d(x) x^e divided by the generator.
+pub fn qr_rs_ec(exp: []const u8, lg: []const u8, d: []const u8, dn: usize, e: usize, out: []u8) -> void {
+    var g : [32]u8 = undefined;
+    qr_rs_gen(exp, lg, e, g[0..32]);
+    var j : usize = 0;
+    while (j < e) {
+        out[j] = 0;
+        j = j + 1;
+    }
+    var i : usize = 0;
+    while (i < dn) {
+        const f : u8 = d[i] ^ out[0];
+        j = 0;
+        while (j + 1 < e) {
+            out[j] = out[j + 1] ^ qr_gf_mul(exp, lg, g[j + 1], f);
+            j = j + 1;
+        }
+        out[e - 1] = qr_gf_mul(exp, lg, g[e], f);
+        i = i + 1;
+    }
+}
+
+/// The final message of version ver from its data codewords dc: the data codewords of the blocks interleaved (the
+/// i-th of every block that has one), then their error codewords the same way. Returns qr_total_cw(ver).
+pub fn qr_message(dc: []const u8, ver: u32, out: []u8) -> usize {
+    var exp : [512]u8 = undefined;
+    var lg : [256]u8 = undefined;
+    qr_gf_tables(exp[0..512], lg[0..256]);
+    const nb : usize = qr_blocks(ver);
+    const e : usize = qr_ec_per_block(ver);
+    var ec : [128]u8 = undefined;
+    var start : [4]usize = [0, 0, 0, 0];
+    var b : usize = 0;
+    var at : usize = 0;
+    while (b < nb) {
+        start[b] = at;
+        qr_rs_ec(exp[0..512], lg[0..256], dc[at .. at + qr_block_len(ver, b)], qr_block_len(ver, b), e, ec[b * 32 .. b * 32 + 32]);
+        at = at + qr_block_len(ver, b);
+        b = b + 1;
+    }
+    var o : usize = 0;
+    var i : usize = 0;
+    while (i <= qr_block_len(ver, nb - 1)) {
+        b = 0;
+        while (b < nb) {
+            if (i < qr_block_len(ver, b)) {
+                out[o] = dc[start[b] + i];
+                o = o + 1;
+            }
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < e) {
+        b = 0;
+        while (b < nb) {
+            out[o] = ec[b * 32 + i];
+            o = o + 1;
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+// ---------------------------------------------------------------- 4. the function patterns
+
+fn qr_set(m: []u8, size: usize, r: usize, c: usize, v: u8) -> void { m[r * size + c] = v; }
+
+/// Every cell free.
+pub fn qr_init(m: []u8, size: usize) -> void {
+    var i : usize = 0;
+    while (i < size * size) {
+        m[i] = QR_FREE;
+        i = i + 1;
+    }
+}
+
+/// One finder (7 x 7: a dark ring, a light ring, a dark 3 x 3) with its light separator, top left corner at (r0, c0)
+/// of the 9 x 9 square around it; the cells of that square outside the matrix are skipped.
+fn qr_finder_at(m: []u8, size: usize, r0: i64, c0: i64) -> void {
+    var dr : i64 = 0;
+    while (dr < 9) {
+        var dc : i64 = 0;
+        while (dc < 9) {
+            const r : i64 = r0 + dr;
+            const c : i64 = c0 + dc;
+            if (r >= 0 and c >= 0 and r < @as(i64, @intCast(size)) and c < @as(i64, @intCast(size))) {
+                var v : u8 = 0;
+                const y : i64 = dr - 1;
+                const x : i64 = dc - 1;
+                if (y >= 0 and y <= 6 and x >= 0 and x <= 6) {
+                    if (y == 0 or y == 6 or x == 0 or x == 6) { v = 1; }
+                    if (y >= 2 and y <= 4 and x >= 2 and x <= 4) { v = 1; }
+                }
+                qr_set(m, size, @as(usize, @intCast(r)), @as(usize, @intCast(c)), v);
+            }
+            dc = dc + 1;
+        }
+        dr = dr + 1;
+    }
+}
+
+/// The three finders with their separators: top left, top right, bottom left.
+pub fn qr_finders(m: []u8, size: usize) -> void {
+    const far : i64 = @as(i64, @intCast(size)) - 8;
+    qr_finder_at(m, size, -1, -1);
+    qr_finder_at(m, size, -1, far);
+    qr_finder_at(m, size, far, -1);
+}
+
+/// Row 6 and column 6 between the finders: dark on the even index.
+pub fn qr_timing(m: []u8, size: usize) -> void {
+    var i : usize = 8;
+    while (i < size - 8) {
+        var v : u8 = 0;
+        if (i % 2 == 0) { v = 1; }
+        qr_set(m, size, 6, i, v);
+        qr_set(m, size, i, 6, v);
+        i = i + 1;
+    }
+}
+
+/// The centre rows (and columns) of the alignment patterns: version 2 to 6 have 6 and size - 7, version 7 to 10
+/// a third between (ISO Annex E).
+pub fn qr_align_n(ver: u32) -> usize {
+    if (ver < 2) { return 0; }
+    if (ver < 7) { return 2; }
+    return 3;
+}
+
+pub fn qr_align_pos(ver: u32, k: usize) -> usize {
+    if (k == 0) { return 6; }
+    const last : usize = qr_size(ver) - 7;
+    if (k + 1 == qr_align_n(ver)) { return last; }
+    if (ver == 7) { return 22; }
+    if (ver == 8) { return 24; }
+    if (ver == 9) { return 26; }
+    return 28;
+}
+
+/// The 5 x 5 alignment patterns at every pair of centres except the three the finders hold.
+pub fn qr_alignment(m: []u8, size: usize, ver: u32) -> void {
+    const n : usize = qr_align_n(ver);
+    const last : usize = size - 7;
+    var a : usize = 0;
+    while (a < n) {
+        var b : usize = 0;
+        while (b < n) {
+            const r : usize = qr_align_pos(ver, a);
+            const c : usize = qr_align_pos(ver, b);
+            const corner : bool = (r == 6 and c == 6) or (r == 6 and c == last) or (r == last and c == 6);
+            if (corner == false) {
+                var dr : usize = 0;
+                while (dr < 5) {
+                    var dc : usize = 0;
+                    while (dc < 5) {
+                        var v : u8 = 0;
+                        if (dr == 0 or dr == 4 or dc == 0 or dc == 4 or (dr == 2 and dc == 2)) { v = 1; }
+                        qr_set(m, size, r - 2 + dr, c - 2 + dc, v);
+                        dc = dc + 1;
+                    }
+                    dr = dr + 1;
+                }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+}
+
+/// The format areas (row 8 and column 8 by the finders), the dark module's cell and, from version 7, the two
+/// version areas: taken, light until qr_put_format / qr_put_version write them.
+pub fn qr_reserve(m: []u8, size: usize, ver: u32) -> void {
+    var i : usize = 0;
+    while (i < 9) {
+        qr_set(m, size, i, 8, 0);
+        qr_set(m, size, 8, i, 0);
+        i = i + 1;
+    }
+    i = 1;
+    while (i <= 8) {
+        qr_set(m, size, size - i, 8, 0);
+        qr_set(m, size, 8, size - i, 0);
+        i = i + 1;
+    }
+    if (ver >= 7) {
+        i = 0;
+        while (i < 6) {
+            var k : usize = 9;
+            while (k <= 11) {
+                qr_set(m, size, i, size - k, 0);
+                qr_set(m, size, size - k, i, 0);
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 5. placement and the masks
+
+/// The n codewords of msg, the highest bit first, into the free cells: two-module columns from the right, the
+/// right one of the pair first, upwards then downwards in turn, column 6 (timing) skipped. Free cells left over
+/// (the remainder bits) are data zeros. Returns the bits placed.
+pub fn qr_place(m: []u8, size: usize, msg: []const u8, n: usize) -> usize {
+    var placed : usize = 0;
+    var right : usize = size - 1;
+    var up : bool = true;
+    while (right >= 1) {
+        if (right == 6) { right = 5; }
+        var v : usize = 0;
+        while (v < size) {
+            var r : usize = v;
+            if (up) { r = size - 1 - v; }
+            var z : usize = 0;
+            while (z < 2) {
+                const c : usize = right - z;
+                if (m[r * size + c] == QR_FREE) {
+                    var bit : u8 = 0;
+                    if (placed < n * 8) {
+                        bit = (msg[placed / 8] >> @as(u8, @intCast(7 - placed % 8))) & 1;
+                        placed = placed + 1;
+                    }
+                    m[r * size + c] = QR_DATA | bit;
+                }
+                z = z + 1;
+            }
+            v = v + 1;
+        }
+        up = up == false;
+        if (right < 2) { right = 0; } else { right = right - 2; }
+    }
+    return placed;
+}
+
+/// Mask k flips the data module at row i, column j (ISO Table 10).
+pub fn qr_mask_hit(k: u32, i: usize, j: usize) -> bool {
+    if (k == 0) { return (i + j) % 2 == 0; }
+    if (k == 1) { return i % 2 == 0; }
+    if (k == 2) { return j % 3 == 0; }
+    if (k == 3) { return (i + j) % 3 == 0; }
+    if (k == 4) { return (i / 2 + j / 3) % 2 == 0; }
+    if (k == 5) { return (i * j) % 2 + (i * j) % 3 == 0; }
+    if (k == 6) { return ((i * j) % 2 + (i * j) % 3) % 2 == 0; }
+    return ((i + j) % 2 + (i * j) % 3) % 2 == 0;
+}
+
+/// The built matrix m with mask k over its data modules, as 0 / 1 into t.
+pub fn qr_masked(m: []const u8, size: usize, k: u32, t: []u8) -> void {
+    var i : usize = 0;
+    while (i < size) {
+        var j : usize = 0;
+        while (j < size) {
+            const v : u8 = m[i * size + j];
+            var b : u8 = v & 1;
+            if ((v & QR_DATA) != 0 and qr_mask_hit(k, i, j)) { b = b ^ 1; }
+            t[i * size + j] = b;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 6. the penalty (ISO 7.8.3, as segno scores it)
+
+fn qr_at(t: []const u8, size: usize, line: usize, k: usize, col: bool) -> u8 {
+    if (col) { return t[k * size + line]; }
+    return t[line * size + k];
+}
+
+/// N1: a run of 5 + i modules of one colour in a row or a column scores 3 + i.
+pub fn qr_n1(t: []const u8, size: usize) -> u32 {
+    var s : u32 = 0;
+    var pass : usize = 0;
+    while (pass < 2) {
+        var line : usize = 0;
+        while (line < size) {
+            var run : u32 = 1;
+            var k : usize = 1;
+            while (k <= size) {
+                if (k < size and qr_at(t, size, line, k, pass == 1) == qr_at(t, size, line, k - 1, pass == 1)) {
+                    run = run + 1;
+                } else {
+                    if (run >= 5) { s = s + run - 2; }
+                    run = 1;
+                }
+                k = k + 1;
+            }
+            line = line + 1;
+        }
+        pass = pass + 1;
+    }
+    return s;
+}
+
+/// N2: every 2 x 2 block of one colour scores 3 (blocks may overlap).
+pub fn qr_n2(t: []const u8, size: usize) -> u32 {
+    var s : u32 = 0;
+    var i : usize = 1;
+    while (i < size) {
+        var j : usize = 1;
+        while (j < size) {
+            const v : u8 = t[i * size + j];
+            if (v == t[i * size + j - 1] and v == t[(i - 1) * size + j] and v == t[(i - 1) * size + j - 1]) { s = s + 3; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn qr_n3_line(t: []const u8, size: usize, line: usize, col: bool) -> u32 {
+    var s : u32 = 0;
+    var idx : usize = 0;
+    while (idx + 7 <= size) {
+        const hit : bool = qr_at(t, size, line, idx, col) == 1 and qr_at(t, size, line, idx + 1, col) == 0 and qr_at(t, size, line, idx + 2, col) == 1 and qr_at(t, size, line, idx + 3, col) == 1 and qr_at(t, size, line, idx + 4, col) == 1 and qr_at(t, size, line, idx + 5, col) == 0 and qr_at(t, size, line, idx + 6, col) == 1;
+        if (hit) {
+            var before : bool = true;
+            var k : usize = 0;
+            if (idx > 4) { k = idx - 4; }
+            while (k < idx) {
+                if (qr_at(t, size, line, k, col) != 0) { before = false; }
+                k = k + 1;
+            }
+            var after : bool = true;
+            k = idx + 7;
+            while (k < idx + 11 and k < size) {
+                if (qr_at(t, size, line, k, col) != 0) { after = false; }
+                k = k + 1;
+            }
+            if (before or after) {
+                s = s + 40;
+                idx = idx + 7;
+            } else {
+                idx = idx + 4;
+            }
+        } else {
+            idx = idx + 1;
+        }
+    }
+    return s;
+}
+
+/// N3: dark-light-dark-dark-dark-light-dark with four light modules (or the edge) before or after it scores 40.
+pub fn qr_n3(t: []const u8, size: usize) -> u32 {
+    var s : u32 = 0;
+    var line : usize = 0;
+    while (line < size) {
+        s = s + qr_n3_line(t, size, line, false) + qr_n3_line(t, size, line, true);
+        line = line + 1;
+    }
+    return s;
+}
+
+/// N4: 10 for every full 5 % the dark share stands away from 50 %.
+pub fn qr_n4(t: []const u8, size: usize) -> u32 {
+    var dark : usize = 0;
+    var i : usize = 0;
+    while (i < size * size) {
+        dark = dark + @as(usize, t[i]);
+        i = i + 1;
+    }
+    const total : usize = size * size;
+    var off : usize = 0;
+    if (dark * 100 >= 50 * total) { off = dark * 100 - 50 * total; } else { off = 50 * total - dark * 100; }
+    return 10 * @as(u32, @intCast(off / (5 * total)));
+}
+
+pub fn qr_penalty(t: []const u8, size: usize) -> u32 { return qr_n1(t, size) + qr_n2(t, size) + qr_n3(t, size) + qr_n4(t, size); }
+
+// ---------------------------------------------------------------- 7. format and version information
+
+/// The 15 format bits: level L (01) and the mask, their BCH(15, 5) check (0x537), XOR 0x5412.
+pub fn qr_format_bits(mask: u32) -> u32 {
+    const d : u32 = (8 + mask) << 10;
+    var r : u32 = d;
+    var k : u32 = 14;
+    while (k >= 10) {
+        if (((r >> k) & 1) != 0) { r = r ^ (1335 << (k - 10)); }
+        k = k - 1;
+    }
+    return (d | r) ^ 21522;
+}
+
+/// The 18 version bits from version 7: the version and its BCH(18, 6) check (0x1F25).
+pub fn qr_version_bits(ver: u32) -> u32 {
+    const d : u32 = ver << 12;
+    var r : u32 = d;
+    var k : u32 = 17;
+    while (k >= 12) {
+        if (((r >> k) & 1) != 0) { r = r ^ (7973 << (k - 12)); }
+        k = k - 1;
+    }
+    return d | r;
+}
+
+/// The format bits into t (0 / 1): bit i down column 8 from the top (row 6, the timing, skipped) and right to left
+/// along row 8 from the right edge; bit 14 - i along row 8 from the left (column 6 skipped) and up column 8 from the
+/// bottom; then the dark module at (size - 8, 8).
+pub fn qr_put_format(t: []u8, size: usize, mask: u32) -> void {
+    const f : u32 = qr_format_bits(mask);
+    var i : usize = 0;
+    while (i < 8) {
+        const vb : u8 = @as(u8, @intCast((f >> @as(u32, @intCast(i))) & 1));
+        const hb : u8 = @as(u8, @intCast((f >> @as(u32, @intCast(14 - i))) & 1));
+        var off : usize = 0;
+        if (i >= 6) { off = 1; }
+        qr_set(t, size, i + off, 8, vb);
+        qr_set(t, size, 8, i + off, hb);
+        qr_set(t, size, 8, size - 1 - i, vb);
+        qr_set(t, size, size - 1 - i, 8, hb);
+        i = i + 1;
+    }
+    qr_set(t, size, size - 8, 8, 1);
+}
+
+/// The version bits into t from version 7: bit 3i + k at row i, column size - 11 + k and mirrored at row
+/// size - 11 + k, column i.
+pub fn qr_put_version(t: []u8, size: usize, ver: u32) -> void {
+    if (ver < 7) { return; }
+    const v : u32 = qr_version_bits(ver);
+    var i : usize = 0;
+    while (i < 6) {
+        var k : usize = 0;
+        while (k < 3) {
+            const b : u8 = @as(u8, @intCast((v >> @as(u32, @intCast(3 * i + k))) & 1));
+            qr_set(t, size, i, size - 11 + k, b);
+            qr_set(t, size, size - 11 + k, i, b);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 8. the whole symbol
+
+/// The code's version and mask from qr_make's answer (0 = nothing made).
+pub fn qr_ver_of(r: u32) -> u32 { return r / 16; }
+pub fn qr_mask_of(r: u32) -> u32 { return r % 16; }
+
+/// The unmasked symbol of n bytes at version ver into m (QR_CELLS_MAX cells): the function patterns as 0 / 1, the
+/// format and version areas light, the message as QR_DATA plus its bit. Returns the side, or 0 when it does not fit.
+pub fn qr_build(data: []const u8, n: usize, ver: u32, m: []u8) -> usize {
+    if (ver < QR_VER_MIN or ver > QR_VER_MAX or n == 0 or n > qr_capacity(ver) or m.len < QR_CELLS_MAX) { return 0; }
+    const size : usize = qr_size(ver);
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords(data, n, ver, dc[0..QR_DATA_MAX]);
+    var msg : [QR_CW_MAX]u8 = undefined;
+    const mn : usize = qr_message(dc[0..QR_DATA_MAX], ver, msg[0..QR_CW_MAX]);
+    qr_init(m, size);
+    qr_reserve(m, size, ver);
+    qr_timing(m, size);
+    qr_finders(m, size);
+    qr_alignment(m, size, ver);
+    _ = qr_place(m, size, msg[0..QR_CW_MAX], mn);
+    return size;
+}
+
+/// The symbol of n bytes at version ver into out (size x size, row by row, 1 = dark), mask mask (0..7) or the best
+/// (QR_MASK_AUTO). Returns ver * 16 + mask, or 0 when the bytes do not fit or out is short.
+pub fn qr_make_at(data: []const u8, n: usize, ver: u32, mask: u32, out: []u8) -> u32 {
+    if (ver < QR_VER_MIN or ver > QR_VER_MAX or n == 0 or n > qr_capacity(ver)) { return 0; }
+    const size : usize = qr_size(ver);
+    if (out.len < size * size) { return 0; }
+    var m : [QR_CELLS_MAX]u8 = undefined;
+    _ = qr_build(data, n, ver, m[0..QR_CELLS_MAX]);
+    var best : u32 = mask;
+    if (mask >= QR_MASK_AUTO) {
+        var low : u32 = 4294967295;
+        var k : u32 = 0;
+        while (k < 8) {
+            qr_masked(m[0..QR_CELLS_MAX], size, k, out);
+            const p : u32 = qr_penalty(out, size);
+            if (p < low) {
+                low = p;
+                best = k;
+            }
+            k = k + 1;
+        }
+    }
+    qr_masked(m[0..QR_CELLS_MAX], size, best, out);
+    qr_put_format(out, size, best);
+    qr_put_version(out, size, ver);
+    return ver * 16 + best;
+}
+
+/// The symbol of n bytes at the smallest version that holds them, the best mask (qr_make_at).
+pub fn qr_make(data: []const u8, n: usize, out: []u8) -> u32 { return qr_make_at(data, n, qr_version_for(n), QR_MASK_AUTO, out); }
+
+/// The module at row r, column c is dark.
+pub fn qr_dark(t: []const u8, size: usize, r: usize, c: usize) -> bool { return t[r * size + c] != 0; }
+
+/// How many modules of t equal the reference written as hex: size rows of (size + 3) / 4 digits each, the leftmost
+/// module the highest bit of the first digit (the form the tests carry segno's matrices in).
+pub fn qr_hex_match(t: []const u8, size: usize, hex: []const u8) -> usize {
+    const d : usize = (size + 3) / 4;
+    if (hex.len != size * d) { return 0; }
+    var same : usize = 0;
+    var r : usize = 0;
+    while (r < size) {
+        var c : usize = 0;
+        while (c < size) {
+            const ch : u8 = hex[r * d + c / 4];
+            var nib : u8 = 0;
+            if (ch >= 48 and ch <= 57) { nib = ch - 48; }
+            if (ch >= 97 and ch <= 102) { nib = ch - 87; }
+            const bit : u8 = (nib >> @as(u8, @intCast(3 - c % 4))) & 1;
+            if (bit == t[r * size + c]) { same = same + 1; }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return same;
+}
+
+// ---------------------------------------------------------------- tests
+
+// segno 1.6.6 reference matrices (make(s, error='L', mode='byte', boost_error=False, version=max(2, auto))), one
+// hex digit per four modules, row by row. segno writes one extra 0x00 codeword after the terminator when the stream
+// already ends on a codeword boundary (write_padding_bits: 8 - length % 8); ISO/IEC 18004 7.4.10 pads only to the
+// boundary, so these were made with that one line corrected. The pattern strings are qr_t_pattern(k, n).
+const QR_T_HELLO : str = "fe99bf882eea08ba3bae8ba222e8baf72e88291208feaabf800bb800e6e679844e6460fe110e899c42500b5d9e809489e0f72ef68041bdc0d786ff000a78e0fe71a8882c4890ba3dfe8ba09160baefbd882ba760fe865e8";
+const QR_T_KEY : str = "fe9d3f882eaa08ba3fae8ba25ae8baf2ae88292a08feaabf800ba000e6e579835636586617a9870c27880b5cf581d88e78da4f53814ba940f28cfe800e48d0fe56aa882e88d0ba6dff0ba4ed70baf7ab8828b9c0feeb8e8";
+const QR_T_P60 : str = "fef3773f882946ca08ba455d2e8ba183aae8ba9b2aae882ee64a08feaaaabf800c590000e6dd54798dc0932e509eefdffc8ecbb3b118ebe6356806ce6aef000271772c859e5397804b3d2ab90bd28ea920ef6ffdb28953a80d508a86cdbf831e688940e291139881044818d8fa9dddff80088cd8f8fe6f56ad882bbb28c0ba4755fa0ba6732dd8bab1d73b882a419100fefd34988";
+const QR_T_P160 : str = "fe74feeeb8bf8824ba09433a08ba988ab3e9ae8ba2a2094452e8ba32abffe42e8827e6621c2208feaaaaaaaabf80091562769000ef8f3ffdade20254525c184050dfb22547bcbf8107019016f7005ffaafddcb3f878d88a5d990206bce61d4e3ab8285acb748449897afeab89dce015b44799980702ab550ae33a38916ef55541b482a3ddddd99dd83c155489080d0efc5bbfbeafd808e77236348885ad6eabfffae8b8d8463488888afb2bbfcfafa8b5698654e3910debaad7efe9a854308d61506709ace006256e18bdf888481794096caf52fba758151a111140f488fa5d8e342b08b0d77d4e11a103a7dd9cbfabb885b5541805808463bb96abcf08719154854b990e34afbfdacfa800a20620588e0fea326abceaf882a1162a55880ba8aabeddbff0ba6888f98cc18baa060be3c9a082ccab0709510fe8f3fb9c84b8";
+const QR_T_P260 : str = "feb32ea3d3ab3f8829ccbf54749208baa3932174572e8bae1923903f12e8ba59f9ffd2a92e88292eaa3cec6208feaaaaaaaaaabf8002e07222ce3000ce33acbeeb28978798e49bfceedb201771aa2d764756045c5f90fc59b98862bf5915bd3eb304d0b2efeca35b087b3c2de0a9365f0744dd7597451c18b2737d74ba6f2700c8768faca34b38e7e61a3a21bb1707183504156e3a98b6313de2bb6ff78110e41e69bf1af83e8ec85485d0170706199cc29a79801209bcb4cb4af28d8364de74fe5a883f9fdeff6686f902896912374518981ab53d6ade2aaf8b8c568e35b248b80fafc3fe21baf9074f02c3d56625802f8265e2de2ac68909179d10261f18ce8bc1b884d1810a99ec4d02c87fd066403ce2af4e74814d9ddd55e7c9785ecb7ba87e4f54029a45d6d839d990a68779739f1c838d41d2ef15b25928421ab6c8a933450d1926a7d5203d80caa045f0984c260c00b39d01379918a6fef0a884c99d0f80ee2d028866c803ce24fec90afc800995de243688e0fe4d02aa7c48a8082acb22221be890baf978be9f1cfb0ba622fe1c76db98ba78870976861a08283ec0d7457c00fe8061a4fc08768";
+
+/// The test strings: n characters of 0-9A-Z, character i the (7 i + k) mod 36-th (the same rule as the reference
+/// script).
+fn qr_t_pattern(k: usize, n: usize, out: []u8) -> usize {
+    const a : str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    var i : usize = 0;
+    while (i < n) {
+        out[i] = a[(i * 7 + k) % 36];
+        i = i + 1;
+    }
+    return n;
+}
+
+test qr_versions_two_to_ten_hold_what_iso_table_7_says_at_level_l {
+    assert qr_capacity(2) == 32 and qr_capacity(3) == 53 and qr_capacity(4) == 78 and qr_capacity(5) == 106;
+    assert qr_capacity(6) == 134 and qr_capacity(7) == 154 and qr_capacity(8) == 192 and qr_capacity(9) == 230;
+    assert qr_capacity(10) == 271;
+    assert qr_version_for(1) == 2 and qr_version_for(25) == 2 and qr_version_for(32) == 2 and qr_version_for(33) == 3;
+    assert qr_version_for(271) == 10 and qr_version_for(272) == 0 and qr_version_for(0) == 0;
+    assert qr_size(2) == 25 and qr_size(10) == QR_SIZE_MAX and QR_SIZE_MAX * QR_SIZE_MAX == QR_CELLS_MAX;
+    assert qr_total_cw(10) == QR_CW_MAX and qr_data_cw(10) == QR_DATA_MAX;
+    assert qr_block_len(10, 0) == 68 and qr_block_len(10, 1) == 68 and qr_block_len(10, 2) == 69 and qr_block_len(10, 3) == 69;
+    assert qr_block_len(6, 0) == 68 and qr_block_len(6, 1) == 68 and qr_block_len(2, 0) == 34;
+    assert qr_count_bits(9) == 8 and qr_count_bits(10) == 16;
+}
+
+test qr_the_byte_segment_ends_on_the_boundary_and_pads_with_236_and_17 {
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    assert qr_data_codewords("HELLO", 5, 2, dc[0..QR_DATA_MAX]) == 34;
+    // 0100 00000101 'H' 'E' 'L' 'L' 'O' 0000: 64 84 132 84 196 196 240, then the pad codewords at once (no 0)
+    assert dc[0] == 64 and dc[1] == 84 and dc[2] == 132 and dc[3] == 84 and dc[4] == 196 and dc[5] == 196 and dc[6] == 240;
+    assert dc[7] == 236 and dc[8] == 17 and dc[9] == 236 and dc[32] == 17 and dc[33] == 236;
+    // version 10 counts in 16 bits: 0100, 0x0001, 'A' = 0100 0000 0000 0000 0001 0100 0001 0000
+    assert qr_data_codewords("A", 1, 10, dc[0..QR_DATA_MAX]) == 274;
+    assert dc[0] == 64 and dc[1] == 0 and dc[2] == 20 and dc[3] == 16 and dc[4] == 236;
+    assert qr_data_codewords("HELLO", 33, 2, dc[0..QR_DATA_MAX]) == 0;
+}
+
+test qr_reed_solomon_gives_the_known_error_codewords {
+    // HELLO WORLD at 1-M (the worked example of thonky.com and the ISO annex style): 16 data, 10 error codewords
+    var exp : [512]u8 = undefined;
+    var lg : [256]u8 = undefined;
+    qr_gf_tables(exp[0..512], lg[0..256]);
+    assert exp[8] == 29 and exp[255] == 1 and lg[2] == 1 and qr_gf_mul(exp[0..512], lg[0..256], 2, 128) == 29;
+    const d : [16]u8 = [32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17];
+    var ec : [10]u8 = undefined;
+    qr_rs_ec(exp[0..512], lg[0..256], d[0..16], 16, 10, ec[0..10]);
+    assert ec[0] == 196 and ec[1] == 35 and ec[2] == 39 and ec[3] == 119 and ec[4] == 235;
+    assert ec[5] == 215 and ec[6] == 231 and ec[7] == 226 and ec[8] == 93 and ec[9] == 23;
+}
+
+test qr_format_and_version_bits_are_the_iso_table_values {
+    // ISO Table C.1: L with mask 0 is 111011111000100; L with mask 7 is 110100101110110 (0x6976)
+    assert qr_format_bits(0) == 30660 and qr_format_bits(7) == 26998;
+    // ISO Table D.1: version 7 is 000111110010010100 (0x07C94), version 10 is 0x0A4D3
+    assert qr_version_bits(7) == 31892 and qr_version_bits(10) == 42195;
+}
+
+test qr_every_mask_scores_as_segno_scores_it {
+    // segno.encoder.mask_scores on the HELLO version 2 symbol, masks 0..7: (N1, N2, N3, N4)
+    var m : [QR_CELLS_MAX]u8 = undefined;
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    assert qr_build("HELLO", 5, 2, m[0..QR_CELLS_MAX]) == 25;
+    const n1 : [8]u32 = [202, 225, 271, 255, 233, 269, 283, 263];
+    const n2 : [8]u32 = [252, 240, 246, 255, 207, 261, 249, 255];
+    const n3 : [8]u32 = [800, 720, 760, 720, 760, 760, 720, 760];
+    var k : u32 = 0;
+    while (k < 8) {
+        qr_masked(m[0..QR_CELLS_MAX], 25, k, t[0..QR_CELLS_MAX]);
+        const i : usize = @as(usize, k);
+        assert qr_n1(t[0..QR_CELLS_MAX], 25) == n1[i] and qr_n2(t[0..QR_CELLS_MAX], 25) == n2[i];
+        assert qr_n3(t[0..QR_CELLS_MAX], 25) == n3[i] and qr_n4(t[0..QR_CELLS_MAX], 25) == 0;
+        k = k + 1;
+    }
+    // the lowest is mask 1 (1185)
+    qr_masked(m[0..QR_CELLS_MAX], 25, 1, t[0..QR_CELLS_MAX]);
+    assert qr_penalty(t[0..QR_CELLS_MAX], 25) == 1185;
+}
+
+test qr_hello_matches_segno_module_for_module {
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const r : u32 = qr_make("HELLO", 5, t[0..QR_CELLS_MAX]);
+    assert qr_ver_of(r) == 2 and qr_mask_of(r) == 1;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 25, QR_T_HELLO) == 625;
+}
+
+test qr_this_devices_key_matches_segno_and_carries_only_the_key {
+    // the owner's key as the cabinet showed it on 2026-10-23 (a key is given to people; it is not a secret); Apple
+    // Vision read the code the window drew back as these 25 bytes
+    const key : str = "T27-EMGV-78S2-H19T-QAHY-M";
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const r : u32 = qr_make(key, key.len, t[0..QR_CELLS_MAX]);
+    assert key.len == 25 and qr_ver_of(r) == 2 and qr_mask_of(r) == 1;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 25, QR_T_KEY) == 625;
+}
+
+test qr_sixty_bytes_take_version_4_and_match_segno {
+    var s : [64]u8 = undefined;
+    _ = qr_t_pattern(3, 60, s[0..64]);
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const r : u32 = qr_make(s[0..60], 60, t[0..QR_CELLS_MAX]);
+    assert qr_ver_of(r) == 4 and qr_mask_of(r) == 1;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 33, QR_T_P60) == 1089;
+}
+
+test qr_160_bytes_take_version_8_with_its_version_bits_and_match_segno {
+    var s : [160]u8 = undefined;
+    _ = qr_t_pattern(5, 160, s[0..160]);
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const r : u32 = qr_make(s[0..160], 160, t[0..QR_CELLS_MAX]);
+    assert qr_ver_of(r) == 8 and qr_mask_of(r) == 0;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 49, QR_T_P160) == 2401;
+}
+
+test qr_260_bytes_take_version_10_in_four_blocks_and_match_segno {
+    var s : [260]u8 = undefined;
+    _ = qr_t_pattern(11, 260, s[0..260]);
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    const r : u32 = qr_make(s[0..260], 260, t[0..QR_CELLS_MAX]);
+    assert qr_ver_of(r) == 10 and qr_mask_of(r) == 4;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 57, QR_T_P260) == 3249;
+}
+
+test qr_a_wrong_module_or_a_forced_mask_does_not_pass_the_comparison {
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    _ = qr_make("HELLO", 5, t[0..QR_CELLS_MAX]);
+    t[12 * 25 + 12] = t[12 * 25 + 12] ^ 1;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 25, QR_T_HELLO) == 624;
+    assert qr_make_at("HELLO", 5, 2, 4, t[0..QR_CELLS_MAX]) == 36;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 25, QR_T_HELLO) < 625;
+    assert qr_hex_match(t[0..QR_CELLS_MAX], 25, "fe") == 0;
+    // too long, too short a buffer, nothing to encode
+    var s : [272]u8 = undefined;
+    const sn : usize = qr_t_pattern(1, 272, s[0..272]);
+    assert qr_make(s[0..272], sn, t[0..QR_CELLS_MAX]) == 0;
+    assert qr_make("HELLO", 5, t[0..100]) == 0;
+    assert qr_make("HELLO", 0, t[0..QR_CELLS_MAX]) == 0;
+}
+
+test qr_the_function_patterns_stand_where_a_reader_looks {
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    _ = qr_make("HELLO", 5, t[0..QR_CELLS_MAX]);
+    // the three finders' centres, their separators, the timing, the alignment centre (18, 18), the dark module
+    assert qr_dark(t[0..QR_CELLS_MAX], 25, 3, 3) and qr_dark(t[0..QR_CELLS_MAX], 25, 3, 21) and qr_dark(t[0..QR_CELLS_MAX], 25, 21, 3);
+    assert qr_dark(t[0..QR_CELLS_MAX], 25, 7, 7) == false and qr_dark(t[0..QR_CELLS_MAX], 25, 7, 17) == false;
+    assert qr_dark(t[0..QR_CELLS_MAX], 25, 6, 8) and qr_dark(t[0..QR_CELLS_MAX], 25, 6, 9) == false and qr_dark(t[0..QR_CELLS_MAX], 25, 9, 6) == false;
+    assert qr_dark(t[0..QR_CELLS_MAX], 25, 18, 18) and qr_dark(t[0..QR_CELLS_MAX], 25, 17, 18) == false and qr_dark(t[0..QR_CELLS_MAX], 25, 16, 18);
+    assert qr_dark(t[0..QR_CELLS_MAX], 25, 17, 8);
+    assert qr_align_n(2) == 2 and qr_align_pos(2, 1) == 18 and qr_align_n(7) == 3 and qr_align_pos(7, 1) == 22 and qr_align_pos(10, 2) == 50;
+    assert qr_mask_hit(0, 0, 0) and qr_mask_hit(1, 1, 0) == false and qr_mask_hit(2, 0, 3) and qr_mask_hit(7, 0, 0);
+}
+
+test qr_each_step_builds_its_own_part_of_the_symbol {
+    // the blocks of level L and the bits of a codeword stream
+    assert qr_blocks(2) == 1 and qr_blocks(6) == 2 and qr_blocks(10) == 4 and qr_blocks(11) == 0;
+    assert qr_ec_per_block(2) == 10 and qr_ec_per_block(9) == 30 and qr_ec_per_block(1) == 0;
+    var b : [4]u8 = [0, 0, 0, 0];
+    assert qr_put_bits(b[0..4], 0, 4, 4) == 4 and qr_put_bits(b[0..4], 4, 5, 8) == 12;
+    assert b[0] == 64 and b[1] == 80;
+    // the generator of degree 2 is x^2 + 3x + 2
+    var exp : [512]u8 = undefined;
+    var lg : [256]u8 = undefined;
+    qr_gf_tables(exp[0..512], lg[0..256]);
+    var g : [32]u8 = undefined;
+    qr_rs_gen(exp[0..512], lg[0..256], 2, g[0..32]);
+    assert g[0] == 1 and g[1] == 3 and g[2] == 2;
+    // the message of HELLO: 34 data codewords then 10 error codewords, 44 in all
+    var dc : [QR_DATA_MAX]u8 = undefined;
+    _ = qr_data_codewords("HELLO", 5, 2, dc[0..QR_DATA_MAX]);
+    var msg : [QR_CW_MAX]u8 = undefined;
+    assert qr_message(dc[0..QR_DATA_MAX], 2, msg[0..QR_CW_MAX]) == 44 and msg[0] == 64 and msg[33] == 236;
+    // the patterns one by one: free cells, finders, timing, alignment, the reserved areas, then the data fills the rest
+    var m : [QR_CELLS_MAX]u8 = undefined;
+    qr_init(m[0..QR_CELLS_MAX], 25);
+    assert m[0] == QR_FREE and m[624] == QR_FREE;
+    qr_finders(m[0..QR_CELLS_MAX], 25);
+    assert m[0] == 1 and m[7 * 25 + 7] == 0 and m[3 * 25 + 21] == 1 and m[8 * 25 + 8] == QR_FREE;
+    qr_timing(m[0..QR_CELLS_MAX], 25);
+    assert m[6 * 25 + 8] == 1 and m[6 * 25 + 9] == 0 and m[9 * 25 + 6] == 0;
+    qr_alignment(m[0..QR_CELLS_MAX], 25, 2);
+    assert m[18 * 25 + 18] == 1 and m[17 * 25 + 18] == 0 and m[16 * 25 + 16] == 1;
+    qr_reserve(m[0..QR_CELLS_MAX], 25, 2);
+    assert m[8 * 25 + 8] == 0 and m[17 * 25 + 8] == 0 and m[8 * 25 + 24] == 0;
+    // version 2: 44 codewords are 352 bits; the 7 remainder cells are data zeros
+    assert qr_place(m[0..QR_CELLS_MAX], 25, msg[0..QR_CW_MAX], 44) == 352;
+    var i : usize = 0;
+    var free : usize = 0;
+    while (i < 625) {
+        if (m[i] == QR_FREE) { free = free + 1; }
+        i = i + 1;
+    }
+    assert free == 0;
+    // the format bits of mask 0 (111011111000100) read back from row 8, and the dark module
+    var t : [QR_CELLS_MAX]u8 = undefined;
+    qr_masked(m[0..QR_CELLS_MAX], 25, 0, t[0..QR_CELLS_MAX]);
+    qr_put_format(t[0..QR_CELLS_MAX], 25, 0);
+    assert t[8 * 25 + 0] == 1 and t[8 * 25 + 1] == 1 and t[8 * 25 + 2] == 1 and t[8 * 25 + 3] == 0 and t[8 * 25 + 24] == 0;
+    assert t[17 * 25 + 8] == 1;
+    // version bits only from version 7: bit 0 of 0x07C94 is 0, bit 2 is 1
+    t[0 * 25 + 14] = 7;
+    qr_put_version(t[0..QR_CELLS_MAX], 25, 2);
+    assert t[0 * 25 + 14] == 7;
+    var v : [QR_CELLS_MAX]u8 = undefined;
+    qr_init(v[0..QR_CELLS_MAX], 45);
+    qr_put_version(v[0..QR_CELLS_MAX], 45, 7);
+    assert v[0 * 45 + 34] == 0 and v[0 * 45 + 36] == 1 and v[34 * 45 + 0] == 0 and v[36 * 45 + 0] == 1;
+}

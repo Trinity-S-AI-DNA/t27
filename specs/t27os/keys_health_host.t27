@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS keys_health_host: where the cabinet's key health (keys_health.t27) touches the machine. No decisions:
+//   - kh_file_load / kh_file_save: ~/.t27os/keyshealth.t27, read whole; a broken file is renamed to
+//     keyshealth.t27.bad (kh_load_plan) and the table starts empty; written to keyshealth.t27.tmp with mode 0600
+//     and renamed over the file.
+//   - the check on a serial queue of its own (as call_vid.t27 makes the camera frame): the window's pass only asks
+//     (khq_kick: a few stores and dispatch_async_f) and later sees the job counted done (khq_done); the job reads one
+//     key a provider from the Keychain into its own stack frame, sends one GET (keys_probe.t27 probe_get, KH_TIMEOUT_S),
+//     wipes the key and the header, and writes the code, the time, the milliseconds and the count to the file. No key
+//     is kept in the window's loop, printed, or written. A provider without a stored key is not asked.
+// Only the window imports this module (keys_probe needs Foundation). Specs holding @extern cannot run tests under
+// t27c; every rule here is a tested fn in keys_health.t27.
+// Refs gHashTag/t27#11560.
+module T27osKeysHealthHost;
+
+use t27os::keys::P_OPENROUTER;
+use t27os::keys::P_ZAI;
+use t27os::keys_host::kc_get_n;
+use t27os::keys_host::kc_env;
+use t27os::nvidia_host::nv_load;
+use t27os::nvidia_direct::nv_pick;
+use t27os::nvidia_direct::NV_BAD;
+use t27os::nvidia_direct::NV_NONE;
+use t27os::keys_probe::probe_get;
+use t27os::keys_probe::probe_get_body;
+use t27os::keys_health::KH_ROWS;
+use t27os::keys_health::KH_TABLE;
+use t27os::keys_health::KH_TEXT_CAP;
+use t27os::keys_health::KH_TIMEOUT_S;
+use t27os::keys_health::KH_LEAF;
+use t27os::keys_health::KH_LEAF_TMP;
+use t27os::keys_health::KH_LEAF_BAD;
+use t27os::keys_health::KH_BAD;
+use t27os::keys_health::KH_L_USE;
+use t27os::keys_health::KH_L_QUARANTINE;
+use t27os::keys_health::kh_clear;
+use t27os::keys_health::kh_set;
+use t27os::keys_health::kh_set_limits;
+use t27os::keys_health::kh_or_parse;
+use t27os::keys_health::kh_text;
+use t27os::keys_health::kh_parse;
+use t27os::keys_health::kh_load_plan;
+use t27os::keys_health::kh_url;
+use t27os::keys_health::kh_bearer;
+use t27os::keys_health::kh_ms;
+use t27os::session_store::put_bytes;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_mkdir;
+
+const KHQ_RTLD_DEFAULT : u64 = 18446744073709551614;
+fn khq_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn khq_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn khq_calloc(n: u64, size: u64) -> u64 { return @extern("calloc"); }
+fn khq_free(p: u64) -> void { @extern("free"); }
+fn khq_queue(label: []const u8, attr: u64) -> u64 { return @extern("dispatch_queue_create"); }
+fn khq_async(q: u64, ctx: u64, f: u64) -> void { @extern("dispatch_async_f"); }
+fn khq_fence() -> void { @extern("OSMemoryBarrier"); }
+fn khq_clock() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn khq_time(t: u64) -> u64 { return @extern("time"); }
+
+fn kh_wipe(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- the file
+
+/// ~/.t27os, then `leaf` after a slash, NUL-ended in out; the length without the NUL, 0 without HOME.
+fn kh_path(leaf: []const u8, out: []u8) -> usize {
+    var home : [256]u8 = undefined;
+    const hn : usize = kc_env("HOME", home[0..256]);
+    if (hn == 0) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os");
+    if (leaf.len > 0) {
+        n = put_bytes(out, n, "/");
+        n = put_bytes(out, n, leaf);
+    }
+    out[n] = 0;
+    return n;
+}
+
+/// Read the file into recs (KH_TABLE words); the records read, 0 for no file or a broken one (renamed to .bad).
+pub fn kh_file_load(recs: []u64) -> u32 {
+    kh_clear(recs);
+    var p : [320]u8 = undefined;
+    if (kh_path(KH_LEAF, p[0..320]) == 0) { return 0; }
+    var text : [1040]u8 = undefined;
+    var got : i64 = 0;
+    const fd : i32 = sys_open_ro(p[0..320], 0);
+    const exists : bool = fd >= 0;
+    if (exists) {
+        // one byte past the cap: a longer file is broken, not cut to fit
+        var more : bool = true;
+        while (more and got < 1040) {
+            const r : i64 = sys_read(fd, text[@as(usize, @intCast(got)) .. 1040], @as(u64, @intCast(1040 - got)));
+            if (r <= 0) { more = false; } else { got = got + r; }
+        }
+        sys_close(fd);
+    }
+    var parsed : u32 = KH_BAD;
+    if (exists) { parsed = kh_parse(text[0 .. @as(usize, @intCast(got))], recs); }
+    const plan : u32 = kh_load_plan(exists, parsed);
+    if (plan == KH_L_QUARANTINE) {
+        var bad : [320]u8 = undefined;
+        kh_path(KH_LEAF_BAD, bad[0..320]);
+        sys_rename(p[0..320], bad[0..320]);
+        kh_clear(recs);
+        return 0;
+    }
+    if (plan == KH_L_USE) { return parsed; }
+    kh_clear(recs);
+    return 0;
+}
+
+/// Write recs to the file (no key in it): a temporary file of mode 0600, renamed over the old one. True when renamed.
+pub fn kh_file_save(recs: []const u64) -> bool {
+    var d : [320]u8 = undefined;
+    if (kh_path("", d[0..320]) == 0) { return false; }
+    sys_mkdir(d[0..320], 448);
+    var t : [1024]u8 = undefined;
+    const n : usize = kh_text(recs, t[0..1024]);
+    var tmp : [320]u8 = undefined;
+    var fin : [320]u8 = undefined;
+    kh_path(KH_LEAF_TMP, tmp[0..320]);
+    kh_path(KH_LEAF, fin[0..320]);
+    const fd : i32 = sys_creat(tmp[0..320], 384);
+    if (fd < 0) { return false; }
+    const w : i64 = sys_write(fd, t[0..1024], @as(u64, n));
+    sys_close(fd);
+    if (w != @as(i64, @intCast(n))) { return false; }
+    return sys_rename(tmp[0..320], fin[0..320]) == 0;
+}
+
+// ---------------------------------------------------------------- the check, on its own queue
+
+const KHQ_MAGIC : u64 = 7731852339082561585;
+const KHQ_REQ : u64 = 1;
+const KHQ_DONE : u64 = 2;
+const KHQ_Q : u64 = 3;
+const KHQ_FN : u64 = 4;
+const KHQ_LEN : u64 = 64;
+
+fn khq_put(at: u64, v: u64) -> void {
+    var c : [8]u8 = undefined;
+    put_u64(c[0..8], 0, v);
+    khq_poke(at, c[0..8], 8);
+}
+
+fn khq_get(at: u64) -> u64 {
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], at, 8);
+    return get_u64(c[0..8], 0);
+}
+
+fn khq_ok(st: u64) -> bool { return st != 0 and khq_get(st) == KHQ_MAGIC; }
+
+/// A new check block with its serial queue; 0 when memory or the queue is missing (then no check is sent).
+pub fn khq_new() -> u64 {
+    const st : u64 = khq_calloc(1, KHQ_LEN);
+    if (st == 0) { return 0; }
+    // Never true: makes sure khq_job is emitted and exported for dlsym.
+    if (khq_get(st + 8) == 99) { khq_job(0); }
+    const q : u64 = khq_queue("t27.keys.health", 0);
+    const f : u64 = khq_dlsym(KHQ_RTLD_DEFAULT, "khq_job");
+    if (q == 0 or f == 0) {
+        khq_free(st);
+        return 0;
+    }
+    khq_put(st + KHQ_Q * 8, q);
+    khq_put(st + KHQ_FN * 8, f);
+    khq_put(st, KHQ_MAGIC);
+    return st;
+}
+
+/// True while a check is queued or running.
+pub fn khq_busy(st: u64) -> bool {
+    if (!khq_ok(st)) { return false; }
+    const done : u64 = khq_get(st + KHQ_DONE * 8);
+    khq_fence();
+    return khq_get(st + KHQ_REQ * 8) != done;
+}
+
+/// How many checks have finished (the window reloads the file when this moves).
+pub fn khq_done(st: u64) -> u64 {
+    if (!khq_ok(st)) { return 0; }
+    const d : u64 = khq_get(st + KHQ_DONE * 8);
+    khq_fence();
+    return d;
+}
+
+/// Queue one check (the window's pass, returns at once). False while one is in flight or without a block.
+pub fn khq_kick(st: u64) -> bool {
+    if (!khq_ok(st)) { return false; }
+    const req : u64 = khq_get(st + KHQ_REQ * 8);
+    if (req != khq_get(st + KHQ_DONE * 8)) { return false; }
+    khq_put(st + KHQ_REQ * 8, req + 1);
+    khq_fence();
+    khq_async(khq_get(st + KHQ_Q * 8), st, khq_get(st + KHQ_FN * 8));
+    return true;
+}
+
+/// One stored key of the cabinet's row into key (wiped by the caller); its length, 0 when none is stored.
+/// OpenRouter and Z.ai: key 1 (keys_host kc_get_n); NVIDIA: the current live key of its list (nvidia_direct nv_pick).
+fn kh_row_key(row: usize, key: []u8) -> usize {
+    if (row == 0) { return kc_get_n(P_OPENROUTER, 0, key); }
+    if (row == 1) { return kc_get_n(P_ZAI, 0, key); }
+    if (row != 2) { return 0; }
+    var st : [964]u32 = undefined;
+    var json : [8192]u8 = undefined;
+    var offs : [64]u32 = undefined;
+    var lens : [64]u32 = undefined;
+    const listed : u32 = nv_load(st[0..964], json[0..8192], offs[0..64], lens[0..64]);
+    var n : usize = 0;
+    if (listed != NV_BAD and listed > 0) {
+        const k : u32 = nv_pick(st[0..964]);
+        if (k != NV_NONE) {
+            const o : usize = @as(usize, offs[k]);
+            const l : usize = @as(usize, lens[k]);
+            if (l <= key.len) {
+                var i : usize = 0;
+                while (i < l) {
+                    key[i] = json[o + i];
+                    i = i + 1;
+                }
+                n = l;
+            }
+        }
+    }
+    kh_wipe(json[0..8192]);
+    return n;
+}
+
+/// The job, on the block's serial queue (never the window's pass): one GET a row with a stored key, its result into
+/// the file; then counted done.
+pub fn khq_job(st: u64) -> u64 {
+    if (!khq_ok(st)) { return 0; }
+    var recs : [56]u64 = undefined;
+    kh_file_load(recs[0..KH_TABLE]);
+    var row : usize = 0;
+    while (row < KH_ROWS) {
+        var key : [256]u8 = undefined;
+        const kn : usize = kh_row_key(row, key[0..256]);
+        var hv : [300]u8 = undefined;
+        const hl : usize = kh_bearer(key[0..kn], hv[0..300]);
+        kh_wipe(key[0..256]);
+        if (hl > 0) {
+            var ub : [96]u8 = undefined;
+            const un : usize = kh_url(row, ub[0..96]);
+            const at : u64 = khq_time(0);
+            const t0 : f64 = khq_clock();
+            // OpenRouter's key answer carries the limit and what is left (its body is read, parsed, wiped); the other
+            // two providers say nothing of money, so their check is the status alone
+            var body : [1024]u8 = undefined;
+            var got : [1]u64 = undefined;
+            var code : u32 = 0;
+            if (row == 0) {
+                code = probe_get_body(ub[0..un], hv[0..hl], KH_TIMEOUT_S, body[0..1024], got[0..1]);
+            } else {
+                got[0] = 0;
+                code = probe_get(ub[0..un], hv[0..hl], KH_TIMEOUT_S);
+            }
+            const ms : u64 = kh_ms(t0, khq_clock());
+            kh_set(recs[0..KH_TABLE], row, @as(u64, code), at, ms, 1);
+            if (row == 0 and code >= 200 and code < 300 and got[0] > 0) {
+                var lim : [3]u64 = undefined;
+                if (kh_or_parse(body[0..@as(usize, got[0])], lim[0..3])) {
+                    kh_set_limits(recs[0..KH_TABLE], row, lim[0], lim[1], lim[2]);
+                }
+            }
+            kh_wipe(body[0..1024]);
+        }
+        kh_wipe(hv[0..300]);
+        row = row + 1;
+    }
+    kh_file_save(recs[0..KH_TABLE]);
+    khq_fence();
+    khq_put(st + KHQ_DONE * 8, khq_get(st + KHQ_DONE * 8) + 1);
+    return 0;
+}
+
+test the_host_module_is_declared {
+    var b : [2]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1 and KHQ_LEN == 64 and KH_TEXT_CAP == 1024 and KH_L_USE == 1;
+}

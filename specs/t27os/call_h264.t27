@@ -1,0 +1,1530 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_h264.t27 -- the decisions of a one to one call's H.264 video (owner, 2026-10-23): how a coded
+// frame is cut into parts that fit the call's sealed datagrams and put together again, when the decoder may take a
+// frame and when it must wait for a key frame, when to ask the sender for one and when the sender gives it, which
+// video the two ends agree on (H.264, or the 320x240 JPEG of an older T27 OS), how the sender's bitrate and picture
+// size follow the receiver's reports, how fast the parts may leave so the sound goes first, and how frames and bytes
+// a second are counted for the panel. Pure decisions only: no @extern, no clock, no codec. The host side is
+// call_vt.t27 (VideoToolbox: the hardware H.264 encoder and decoder), call_video.t27 (the camera at 1280x720, 30
+// frames a second), call_session.t27 (the sealed channel) and glass_window.t27 (the picture on screen).
+//
+// Why: the JPEG video of call_core (320x240, quality 0.5, one picture in 90 ms) gave 9 frames a second on build 7132
+// (live, Mac <-> nodeb, both ways). A hardware encoder makes 1280x720 at 30 frames a second in about 1.2 Mbit/s.
+//
+// Wire. Both new frame types ride the call's sealed channel (call_core: AES-128-GCM per direction, the whole header as
+// associated data, the replay window), only while the call is ACTIVE, between the two people who compared the code or
+// whose keys were proven. Nothing new leaves the machine for anyone else.
+//   CK_T_H264 (35), one part of one coded frame. Plaintext: VH_HDR (16) bytes then the cut:
+//     frame u32 LE (the stream's number, 1, 2, 3 .. given when the frame is sent), part u16 LE (0 ..),
+//     parts u16 LE (of this frame), total u32 LE (the frame's length), flags u8 (1 = a key frame), rung u8 (the
+//     picture size, VL_*), version u8, 0; then bytes part * P .. min(total, part * P + P) of the frame, where the part
+//     size P follows the version (vh_psz): version 3 (this build) cuts at VH_PART = 1148, so a sealed part is at most
+//     52 + 16 + 1148 + 16 = 1232 bytes, the most an IPv6 datagram carries without fragments (1280 - 40 - 8); version
+//     2 (build 7136, the first with H.264) cut at VH_PART_V2 = 1160 (1244 bytes sealed). A receiver takes both; a
+//     sender cuts for the version the peer's HELLO named (vh_send_ver), so 7136 and this build keep their H.264.
+//   The frame itself is a run of NAL units, each a 4-byte big-endian length then the unit (the AVCC layout the
+//   encoder gives). A key frame starts with the sequence and picture parameter sets (NAL types 7 and 8), then the IDR
+//   picture (type 5); any other frame is the coded picture only. So every key frame carries all a decoder needs.
+//   CK_T_VCTL (36), VX_LEN (32) bytes: kind u8 (HELLO, KEYREQ, REPORT), version u8, caps u8 (1 = can decode H.264,
+//     2 = can encode H.264), rung u8, then u32 LE fields by kind (see vx_*).
+// An older build does not know these two types: it counts them as refused and changes nothing (call_session
+// cs_on_packet, the last line), and never sends a HELLO. A new build sends the JPEG of call_core until the peer's
+// HELLO says it decodes H.264, so an old and a new build keep their video (320x240, as before) and their sound; the
+// panel says why the picture is small (vn_note).
+//
+// Loss. The receiver keeps one frame in assembly (as call_core's vr_take does for JPEG): a part of a newer frame drops
+// the half-built one. A P-frame refers to the frame before it, so the decoder takes a frame only when it is a key frame
+// or the very next frame after the last one it took (vd_gate); anything else waits for a key frame and the picture on
+// screen stays the last good one, never a torn one. The receiver then asks for a key frame (vk_due: at once, again
+// every VK_RETRY_MS while none came), naming the newest frame it has seen; the sender forces one unless the last key
+// frame it sent is newer than that (it is still on its way), and never two within VK_MIN_GAP_MS. The encoder makes a
+// key frame every 2 s by itself as well (call_vt).
+//
+// Rate. The receiver reports once a second (frames completed and lost, bytes, its audio underruns); the sender's
+// ladder (vl_step) cuts the bitrate by 30 % on a bad second, raises it by 15 % after three good ones, steps the
+// picture down (720p -> 480p -> 360p) when the bitrate falls under the rung's floor or when fewer than VL_FPS_MIN
+// frames a second get through for two reports in a row, and back up only after a long clean run. Audio goes first:
+// the parts leave through a token bucket (vp_*) at three times the bitrate, at most VP_PASS_MAX parts per poll pass,
+// and a frame that waited longer than VQ_MAX_MS is dropped with a key frame forced in its place (vq_stale).
+// Behaviour rules with tests, not a security audit. Refs gHashTag/t27#11560.
+module T27osCallH264;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::call_core::CK_T_H264;
+use t27os::call_core::CK_T_VCTL;
+
+/// The video protocol version this build speaks; an older build sends no HELLO at all (version 0 to us). Version 2
+/// (build 7136) is still read and spoken to a peer that names it.
+pub const VH_VERSION : u8 = 3;
+pub const VH_V2 : u8 = 2;
+
+// ---------------------------------------------------------------- parts
+
+pub const VH_HDR : usize = 16;
+pub const VH_PART : usize = 1148;
+pub const VH_PART_V2 : usize = 1160;
+/// The longest part plaintext of either version.
+pub const VH_PT_MAX : usize = 1176;
+/// The longest coded frame (a key frame of 720p at 2.5 Mbit/s is 40-90 KB); a longer one is not sent.
+pub const VH_FRAME_MAX : usize = 131072;
+/// 131072 / 1148 rounded up (version 2: 113).
+pub const VH_PARTS_MAX : usize = 115;
+pub const VH_F_KEY : u8 = 1;
+
+/// The part size of a video version: VH_PART for 3 and later, VH_PART_V2 for 2, 0 for anything older.
+pub fn vh_psz(ver: u64) -> usize {
+    if (ver >= @as(u64, VH_VERSION)) { return VH_PART; }
+    if (ver == @as(u64, VH_V2)) { return VH_PART_V2; }
+    return 0;
+}
+
+/// The version a sender cuts for: the peer's (its HELLO), never above this build's; this build's own when the peer
+/// named none.
+pub fn vh_send_ver(peer_ver: u64) -> u8 {
+    if (peer_ver == @as(u64, VH_V2)) { return VH_V2; }
+    return VH_VERSION;
+}
+
+/// The parts a frame of `total` bytes needs at part size psz: 0 when it is empty, longer than VH_FRAME_MAX, or psz
+/// is not a part size.
+pub fn vh_parts_of(total: usize, psz: usize) -> usize {
+    if (total == 0 or total > VH_FRAME_MAX or (psz != VH_PART and psz != VH_PART_V2)) { return 0; }
+    return (total + psz - 1) / psz;
+}
+
+/// The length of part k of a frame of `total` bytes at part size psz, 0 when k is out of range.
+pub fn vh_cut_of(total: usize, k: usize, psz: usize) -> usize {
+    const n : usize = vh_parts_of(total, psz);
+    if (n == 0 or k >= n) { return 0; }
+    if (k + 1 < n) { return psz; }
+    return total - k * psz;
+}
+
+/// The same at this build's own part size.
+pub fn vh_parts(total: usize) -> usize { return vh_parts_of(total, VH_PART); }
+pub fn vh_cut(total: usize, k: usize) -> usize { return vh_cut_of(total, k, VH_PART); }
+
+fn vh_put16(b: []u8, at: usize, v: u64) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+}
+
+fn vh_put32(b: []u8, at: usize, v: u64) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 3] = @as(u8, @intCast((v >> 24) & 255));
+}
+
+pub fn vh_get16(b: []const u8, at: usize) -> u64 {
+    return @as(u64, b[at]) | (@as(u64, b[at + 1]) << 8);
+}
+
+pub fn vh_get32(b: []const u8, at: usize) -> u64 {
+    return @as(u64, b[at]) | (@as(u64, b[at + 1]) << 8) | (@as(u64, b[at + 2]) << 16) | (@as(u64, b[at + 3]) << 24);
+}
+
+/// The plaintext of part k of a frame of `total` bytes (number `frame`, key or not, picture rung `rung`) into out, at
+/// this build's version; `cut` is that part's bytes (vh_cut long). Its length, 0 on a bad part or a short out.
+pub fn vh_part(out: []u8, frame: u64, total: usize, k: usize, key: bool, rung: u32, cut: []const u8) -> usize {
+    return vh_part_v(out, frame, total, k, key, rung, VH_VERSION, cut);
+}
+
+/// The same for video version ver (its part size, vh_psz).
+pub fn vh_part_v(out: []u8, frame: u64, total: usize, k: usize, key: bool, rung: u32, ver: u8, cut: []const u8) -> usize {
+    const psz : usize = vh_psz(@as(u64, ver));
+    const n : usize = vh_parts_of(total, psz);
+    const len : usize = vh_cut_of(total, k, psz);
+    if (n == 0 or len == 0 or cut.len != len or out.len < VH_HDR + len or frame == 0 or frame > 4294967295 or rung > 255) { return 0; }
+    vh_put32(out, 0, frame);
+    vh_put16(out, 4, @as(u64, k));
+    vh_put16(out, 6, @as(u64, n));
+    vh_put32(out, 8, @as(u64, total));
+    out[12] = 0;
+    if (key) { out[12] = VH_F_KEY; }
+    out[13] = @as(u8, @intCast(rung));
+    out[14] = ver;
+    out[15] = 0;
+    var i : usize = 0;
+    while (i < len) {
+        out[VH_HDR + i] = cut[i];
+        i = i + 1;
+    }
+    return VH_HDR + len;
+}
+
+/// A well-formed part: a frame number, counts and length that agree at its version's part size, a known version, the
+/// reserved byte zero.
+pub fn vh_ok(pt: []const u8) -> bool {
+    if (pt.len < VH_HDR + 1 or pt.len > VH_PT_MAX) { return false; }
+    const total : usize = @as(usize, @intCast(vh_get32(pt, 8)));
+    const n : usize = @as(usize, @intCast(vh_get16(pt, 6)));
+    const k : usize = @as(usize, @intCast(vh_get16(pt, 4)));
+    const psz : usize = vh_psz(@as(u64, pt[14]));
+    if (vh_get32(pt, 0) == 0 or n == 0 or k >= n or psz == 0 or pt[15] != 0) { return false; }
+    return n == vh_parts_of(total, psz) and pt.len == VH_HDR + vh_cut_of(total, k, psz);
+}
+
+pub fn vh_frame(pt: []const u8) -> u64 { return vh_get32(pt, 0); }
+pub fn vh_index(pt: []const u8) -> usize { return @as(usize, @intCast(vh_get16(pt, 4))); }
+pub fn vh_count(pt: []const u8) -> usize { return @as(usize, @intCast(vh_get16(pt, 6))); }
+pub fn vh_total(pt: []const u8) -> usize { return @as(usize, @intCast(vh_get32(pt, 8))); }
+pub fn vh_key(pt: []const u8) -> bool { return (pt[12] & VH_F_KEY) != 0; }
+pub fn vh_rung(pt: []const u8) -> u32 { return @as(u32, pt[13]); }
+
+// ---------------------------------------------------------------- assembly
+
+/// The receiver's state (u64 LE slots in VA_LEN bytes). The frame in assembly, its mask of parts (two words), its
+/// length, its flags, the last frame completed, frames completed, frames lost (numbers that never completed between
+/// two completed ones, and half-built frames dropped), parts kept, parts refused, parts stale, the size, number and
+/// time of the last complete frame, key frames completed, the newest frame number seen in any part, bytes completed.
+pub const VA_LEN : usize = 256;
+pub const VA_CUR : usize = 0;
+pub const VA_M0 : usize = 1;
+pub const VA_M1 : usize = 2;
+pub const VA_TOTAL : usize = 3;
+pub const VA_FLAGS : usize = 4;
+pub const VA_LAST : usize = 5;
+pub const VA_DONE : usize = 6;
+pub const VA_LOST : usize = 7;
+pub const VA_PARTS : usize = 8;
+pub const VA_REFUSED : usize = 9;
+pub const VA_STALE : usize = 10;
+pub const VA_SIZE : usize = 11;
+pub const VA_AT : usize = 12;
+pub const VA_KEYS : usize = 13;
+pub const VA_SEEN : usize = 14;
+pub const VA_BYTES : usize = 15;
+pub const VA_RUNG : usize = 16;
+pub const VA_DROPPED : usize = 17;
+
+pub const VH_NO : u32 = 0;
+pub const VH_STORED : u32 = 1;
+pub const VH_COMPLETE : u32 = 2;
+pub const VH_OLD : u32 = 3;
+
+pub fn va_get(st: []const u8, k: usize) -> u64 {
+    if (st.len < VA_LEN or k * 8 + 8 > VA_LEN) { return 0; }
+    return get_u64(st, k * 8);
+}
+fn va_p(st: []u8, k: usize, v: u64) -> void { put_u64(st, k * 8, v); }
+fn va_add(st: []u8, k: usize, v: u64) -> void { put_u64(st, k * 8, get_u64(st, k * 8) + v); }
+
+/// Bit k of the two-word mask.
+fn va_has(st: []const u8, k: usize) -> bool {
+    if (k < 64) { return (get_u64(st, VA_M0 * 8) & (@as(u64, 1) << @as(u64, @intCast(k)))) != 0; }
+    return (get_u64(st, VA_M1 * 8) & (@as(u64, 1) << @as(u64, @intCast(k - 64)))) != 0;
+}
+
+fn va_set(st: []u8, k: usize) -> void {
+    if (k < 64) { va_p(st, VA_M0, get_u64(st, VA_M0 * 8) | (@as(u64, 1) << @as(u64, @intCast(k)))); }
+    else { va_p(st, VA_M1, get_u64(st, VA_M1 * 8) | (@as(u64, 1) << @as(u64, @intCast(k - 64)))); }
+}
+
+/// Parts held for the frame in assembly.
+pub fn va_held(st: []const u8) -> u64 {
+    var c : u64 = 0;
+    var x : u64 = get_u64(st, VA_M0 * 8);
+    while (x != 0) { c = c + (x & 1); x = x >> 1; }
+    x = get_u64(st, VA_M1 * 8);
+    while (x != 0) { c = c + (x & 1); x = x >> 1; }
+    return c;
+}
+
+/// Take one opened part into buf (at least VH_FRAME_MAX bytes). VH_NO a malformed part; VH_STORED kept; VH_OLD a
+/// duplicate or a part of a frame already completed or dropped; VH_COMPLETE every part is in buf[0..VA_SIZE] and the
+/// frame is newer than the last completed one. Frame numbers between two completed frames count as lost (not those
+/// before the first one: the stream may start above 1 after a switch from JPEG).
+pub fn vh_take(st: []u8, buf: []u8, pt: []const u8, now: u64) -> u32 {
+    if (st.len < VA_LEN or buf.len < VH_FRAME_MAX or !vh_ok(pt)) {
+        if (st.len >= VA_LEN) { va_add(st, VA_REFUSED, 1); }
+        return VH_NO;
+    }
+    const f : u64 = vh_frame(pt);
+    const total : usize = vh_total(pt);
+    const k : usize = vh_index(pt);
+    const n : usize = vh_count(pt);
+    if (f > get_u64(st, VA_SEEN * 8)) { va_p(st, VA_SEEN, f); }
+    if (f <= get_u64(st, VA_LAST * 8) or f < get_u64(st, VA_CUR * 8)) {
+        va_add(st, VA_STALE, 1);
+        return VH_OLD;
+    }
+    if (f > get_u64(st, VA_CUR * 8)) {
+        // a newer frame: the half-built one is dropped, never shown
+        if (get_u64(st, VA_CUR * 8) > get_u64(st, VA_LAST * 8) and va_held(st) > 0) { va_add(st, VA_DROPPED, 1); }
+        va_p(st, VA_CUR, f);
+        va_p(st, VA_M0, 0);
+        va_p(st, VA_M1, 0);
+        va_p(st, VA_TOTAL, @as(u64, total));
+        va_p(st, VA_FLAGS, @as(u64, pt[12]) | (@as(u64, pt[13]) << 8));
+    } else if (get_u64(st, VA_TOTAL * 8) != @as(u64, total)) {
+        va_add(st, VA_REFUSED, 1);
+        return VH_NO;
+    }
+    if (va_has(st, k)) {
+        va_add(st, VA_STALE, 1);
+        return VH_OLD;
+    }
+    const at : usize = k * vh_psz(@as(u64, pt[14]));
+    var i : usize = 0;
+    while (i < pt.len - VH_HDR) {
+        buf[at + i] = pt[VH_HDR + i];
+        i = i + 1;
+    }
+    va_set(st, k);
+    va_add(st, VA_PARTS, 1);
+    if (va_held(st) != @as(u64, n)) { return VH_STORED; }
+    const last : u64 = get_u64(st, VA_LAST * 8);
+    if (get_u64(st, VA_DONE * 8) > 0 and f > last + 1) { va_add(st, VA_LOST, f - last - 1); }
+    va_p(st, VA_LAST, f);
+    va_add(st, VA_DONE, 1);
+    va_p(st, VA_SIZE, @as(u64, total));
+    va_p(st, VA_AT, now);
+    va_add(st, VA_BYTES, @as(u64, total));
+    va_p(st, VA_RUNG, @as(u64, pt[13]));
+    if ((pt[12] & VH_F_KEY) != 0) { va_add(st, VA_KEYS, 1); }
+    va_p(st, VA_M0, 0);
+    va_p(st, VA_M1, 0);
+    return VH_COMPLETE;
+}
+
+// ---------------------------------------------------------------- the coded frame: NAL units
+
+pub const VH_NALS_MAX : u64 = 64;
+pub const VH_NAL_IDR : u32 = 5;
+pub const VH_NAL_SPS : u32 = 7;
+pub const VH_NAL_PPS : u32 = 8;
+pub const VH_NONE : usize = 4294967295;
+
+fn vh_be32(b: []const u8, at: usize) -> usize {
+    return (@as(usize, b[at]) << 24) | (@as(usize, b[at + 1]) << 16) | (@as(usize, b[at + 2]) << 8) | @as(usize, b[at + 3]);
+}
+
+fn vh_put_be32(b: []u8, at: usize, v: usize) -> void {
+    b[at] = @as(u8, @intCast((v >> 24) & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 3] = @as(u8, @intCast(v & 255));
+}
+
+/// The NAL units of a frame: their count when the 4-byte lengths walk exactly to the end, every unit is at least one
+/// byte and has the forbidden bit clear, and there are at most VH_NALS_MAX; 0 for anything else.
+pub fn vh_nals(body: []const u8) -> u64 {
+    var at : usize = 0;
+    var c : u64 = 0;
+    while (at < body.len) {
+        if (body.len - at < 5) { return 0; }
+        const n : usize = vh_be32(body, at);
+        if (n == 0 or n > body.len - at - 4 or (body[at + 4] & 128) != 0) { return 0; }
+        c = c + 1;
+        if (c > VH_NALS_MAX) { return 0; }
+        at = at + 4 + n;
+    }
+    return c;
+}
+
+/// The offset of the length word of the first NAL unit of type typ, VH_NONE when there is none (or the frame is not
+/// well formed).
+pub fn vh_find(body: []const u8, typ: u32) -> usize {
+    if (vh_nals(body) == 0) { return VH_NONE; }
+    var at : usize = 0;
+    while (at < body.len) {
+        const n : usize = vh_be32(body, at);
+        if (@as(u32, body[at + 4] & 31) == typ) { return at; }
+        at = at + 4 + n;
+    }
+    return VH_NONE;
+}
+
+/// The length of the NAL unit whose length word is at `at`.
+pub fn vh_nal_len(body: []const u8, at: usize) -> usize { return vh_be32(body, at); }
+
+/// A key frame carries its parameter sets and an IDR picture.
+pub fn vh_is_key(body: []const u8) -> bool {
+    return vh_find(body, VH_NAL_SPS) != VH_NONE and vh_find(body, VH_NAL_PPS) != VH_NONE and vh_find(body, VH_NAL_IDR) != VH_NONE;
+}
+
+/// The frame the sender sends: the parameter sets first when sps is not empty (a key frame), then the coded
+/// picture as the encoder gave it (already length-prefixed). Its length, 0 when out is short or the result is longer
+/// than VH_FRAME_MAX.
+pub fn vh_pack(out: []u8, sps: []const u8, pps: []const u8, pic: []const u8) -> usize {
+    var need : usize = pic.len;
+    if (sps.len > 0) { need = need + 8 + sps.len + pps.len; }
+    if (need == 0 or need > VH_FRAME_MAX or out.len < need or (sps.len > 0 and pps.len == 0)) { return 0; }
+    var w : usize = 0;
+    var i : usize = 0;
+    if (sps.len > 0) {
+        vh_put_be32(out, 0, sps.len);
+        while (i < sps.len) { out[4 + i] = sps[i]; i = i + 1; }
+        w = 4 + sps.len;
+        vh_put_be32(out, w, pps.len);
+        i = 0;
+        while (i < pps.len) { out[w + 4 + i] = pps[i]; i = i + 1; }
+        w = w + 4 + pps.len;
+    }
+    i = 0;
+    while (i < pic.len) { out[w + i] = pic[i]; i = i + 1; }
+    return w + pic.len;
+}
+
+/// The coded picture without its parameter sets, as the decoder takes it, into out: its length, 0 when the frame is
+/// not well formed, out is short or nothing is left.
+pub fn vh_strip(body: []const u8, out: []u8) -> usize {
+    if (vh_nals(body) == 0) { return 0; }
+    var at : usize = 0;
+    var w : usize = 0;
+    while (at < body.len) {
+        const n : usize = vh_be32(body, at);
+        const t : u32 = @as(u32, body[at + 4] & 31);
+        if (t != VH_NAL_SPS and t != VH_NAL_PPS) {
+            if (out.len < w + 4 + n) { return 0; }
+            var i : usize = 0;
+            while (i < 4 + n) { out[w + i] = body[at + i]; i = i + 1; }
+            w = w + 4 + n;
+        }
+        at = at + 4 + n;
+    }
+    return w;
+}
+
+/// The length vh_strip writes, without writing: 0 when the frame is not well formed or holds nothing but parameter sets.
+pub fn vh_strip_len(body: []const u8) -> usize {
+    if (vh_nals(body) == 0) { return 0; }
+    var at : usize = 0;
+    var w : usize = 0;
+    while (at < body.len) {
+        const n : usize = vh_be32(body, at);
+        const t : u32 = @as(u32, body[at + 4] & 31);
+        if (t != VH_NAL_SPS and t != VH_NAL_PPS) { w = w + 4 + n; }
+        at = at + 4 + n;
+    }
+    return w;
+}
+
+// ---------------------------------------------------------------- the decoder's gate and the key frame request
+
+/// The gate's slots, in the receiver's state after VA_*: 1 while a key frame is needed (a new call needs one), the
+/// last frame given to the decoder, frames given, frames held back, decoder errors reported, and the request side:
+/// when the last request went out, requests sent.
+pub const VD_NEED : usize = 20;
+pub const VD_LASTDEC : usize = 21;
+pub const VD_FED : usize = 22;
+pub const VD_HELD : usize = 23;
+pub const VD_ERRS : usize = 24;
+pub const VK_AT : usize = 25;
+pub const VK_SENT : usize = 26;
+pub const VK_RETRY_MS : u64 = 250;
+pub const VK_MIN_GAP_MS : u64 = 150;
+
+/// A new call: nothing assembled, a key frame needed first.
+pub fn va_reset(st: []u8) -> void {
+    var i : usize = 0;
+    while (i < VA_LEN) {
+        st[i] = 0;
+        i = i + 1;
+    }
+    va_p(st, VD_NEED, 1);
+}
+
+/// May the decoder take complete frame `frame` now? A key frame always (and the chain starts again from it); any
+/// other only while no key frame is needed and it is the very next frame after the last one taken. A refused frame
+/// means a key frame is needed from now on.
+pub fn vd_gate(st: []u8, frame: u64, key: bool) -> bool {
+    if (st.len < VA_LEN) { return false; }
+    if (key) {
+        va_p(st, VD_NEED, 0);
+        va_p(st, VD_LASTDEC, frame);
+        va_add(st, VD_FED, 1);
+        return true;
+    }
+    if (get_u64(st, VD_NEED * 8) == 0 and frame == get_u64(st, VD_LASTDEC * 8) + 1) {
+        va_p(st, VD_LASTDEC, frame);
+        va_add(st, VD_FED, 1);
+        return true;
+    }
+    va_p(st, VD_NEED, 1);
+    va_add(st, VD_HELD, 1);
+    return false;
+}
+
+/// The decoder refused a frame (its status was not zero): nothing more until a key frame.
+pub fn vd_error(st: []u8) -> void {
+    if (st.len < VA_LEN) { return; }
+    va_p(st, VD_NEED, 1);
+    va_add(st, VD_ERRS, 1);
+}
+
+/// Is a key frame request due: a key frame is needed, some part of the stream has arrived (a call's first key frame
+/// comes by itself), and no request went out in the last VK_RETRY_MS.
+pub fn vk_due(st: []const u8, now: u64) -> bool {
+    if (st.len < VA_LEN or get_u64(st, VD_NEED * 8) == 0 or get_u64(st, VA_SEEN * 8) == 0) { return false; }
+    const at : u64 = get_u64(st, VK_AT * 8);
+    return at == 0 or now < at or now - at >= VK_RETRY_MS;
+}
+
+pub fn vk_sent(st: []u8, now: u64) -> void {
+    if (st.len < VA_LEN) { return; }
+    va_p(st, VK_AT, now);
+    va_add(st, VK_SENT, 1);
+}
+
+/// The sender's slots (VS_LEN bytes): the next frame number, the number of the last key frame sent, when a key frame
+/// was last forced, key frames forced by a request, requests not followed (a key frame was already on its way or one
+/// was forced a moment ago), key frames sent, frames sent, frames dropped because they waited too long, then the
+/// ladder (VL_*), the bucket (VP_*) and the negotiation (VN_*).
+pub const VS_LEN : usize = 512;
+pub const VS_NEXT : usize = 0;
+pub const VS_KEYF : usize = 1;
+pub const VS_FORCED_AT : usize = 2;
+pub const VS_FORCES : usize = 3;
+pub const VS_IGNORED : usize = 4;
+pub const VS_KEYS : usize = 5;
+pub const VS_FRAMES : usize = 6;
+pub const VS_STALE : usize = 7;
+
+/// A request came naming `seen`, the newest frame the receiver has any part of: force a key frame when the last one
+/// sent is not newer than that (it was lost, or the receiver broke after it) and none was forced in the last
+/// VK_MIN_GAP_MS. True = force one now.
+pub fn vk_on_request(ss: []u8, seen: u64, now: u64) -> bool {
+    if (ss.len < VS_LEN) { return false; }
+    const forced : u64 = get_u64(ss, VS_FORCED_AT * 8);
+    const keyf : u64 = get_u64(ss, VS_KEYF * 8);
+    if ((keyf > seen and keyf != 0) or (forced != 0 and now >= forced and now - forced < VK_MIN_GAP_MS)) {
+        put_u64(ss, VS_IGNORED * 8, get_u64(ss, VS_IGNORED * 8) + 1);
+        return false;
+    }
+    put_u64(ss, VS_FORCED_AT * 8, now);
+    put_u64(ss, VS_FORCES * 8, get_u64(ss, VS_FORCES * 8) + 1);
+    return true;
+}
+
+/// The number the next frame goes out with, and the sent frame noted (a key frame moves VS_KEYF).
+pub fn vs_number(ss: []u8, key: bool) -> u64 {
+    if (ss.len < VS_LEN) { return 0; }
+    const f : u64 = get_u64(ss, VS_NEXT * 8) + 1;
+    put_u64(ss, VS_NEXT * 8, f);
+    put_u64(ss, VS_FRAMES * 8, get_u64(ss, VS_FRAMES * 8) + 1);
+    if (key) {
+        put_u64(ss, VS_KEYF * 8, f);
+        put_u64(ss, VS_KEYS * 8, get_u64(ss, VS_KEYS * 8) + 1);
+    }
+    return f;
+}
+
+pub fn vs_get(ss: []const u8, k: usize) -> u64 {
+    if (ss.len < VS_LEN or k * 8 + 8 > VS_LEN) { return 0; }
+    return get_u64(ss, k * 8);
+}
+
+// ---------------------------------------------------------------- the send queue
+
+/// A coded frame that waited longer than this before its first part could go is dropped (the next one is forced to
+/// be a key frame): the picture is never more than a quarter second behind the sound.
+pub const VQ_MAX_MS : u64 = 250;
+/// A frame of this many parts or more is never cut into a pass that already sent this many: 8 parts a pass.
+pub const VP_PASS_MAX : u64 = 8;
+
+/// Drop the frame that waits (and force a key frame): it waited too long, or the frames behind it pile up.
+pub fn vq_stale(age_ms: u64, behind: u64) -> bool { return age_ms > VQ_MAX_MS or behind >= 6; }
+
+// ---------------------------------------------------------------- the bucket (audio first)
+
+pub const VP_CREDIT : usize = 20;
+pub const VP_AT : usize = 21;
+/// Most bytes that may leave at once; the bucket's rate is three times the bitrate, at least 4 Mbit/s.
+pub const VP_BURST : u64 = 16000;
+pub const VP_MIN_KBPS : u64 = 4000;
+
+/// The bucket's rate in kbit/s for a bitrate of kbps.
+pub fn vp_rate(kbps: u64) -> u64 {
+    if (kbps * 3 < VP_MIN_KBPS) { return VP_MIN_KBPS; }
+    return kbps * 3;
+}
+
+/// Fill the bucket for the time since the last fill (microseconds), at most VP_BURST bytes; the credit now.
+pub fn vp_refill(ss: []u8, now_us: u64, kbps: u64) -> u64 {
+    if (ss.len < VS_LEN) { return 0; }
+    const at : u64 = get_u64(ss, VP_AT * 8);
+    var c : u64 = get_u64(ss, VP_CREDIT * 8);
+    if (at == 0 or now_us < at) {
+        c = VP_BURST;
+    } else {
+        // bytes = kbit/s * 1000 / 8 * us / 1e6 = kbit/s * us / 8000
+        const dt : u64 = now_us - at;
+        if (dt >= 1000000) { c = VP_BURST; } else { c = c + vp_rate(kbps) * dt / 8000; }
+    }
+    if (c > VP_BURST) { c = VP_BURST; }
+    put_u64(ss, VP_CREDIT * 8, c);
+    put_u64(ss, VP_AT * 8, now_us);
+    return c;
+}
+
+/// Spend n bytes when the bucket holds them.
+pub fn vp_take(ss: []u8, n: u64) -> bool {
+    if (ss.len < VS_LEN) { return false; }
+    const c : u64 = get_u64(ss, VP_CREDIT * 8);
+    if (c < n) { return false; }
+    put_u64(ss, VP_CREDIT * 8, c - n);
+    return true;
+}
+
+// ---------------------------------------------------------------- the ladder: bitrate and picture size
+
+pub const VL_RUNGS : u32 = 3;
+pub const VL_720 : u32 = 0;
+pub const VL_480 : u32 = 1;
+pub const VL_360 : u32 = 2;
+/// The fewest frames a second worth keeping a picture size for.
+pub const VL_FPS_MIN : u64 = 20;
+/// After a step down, no step up for this long.
+pub const VL_HOLD_MS : u64 = 10000;
+pub const VL_FLOOR_KBPS : u64 = 300;
+/// The first reports of a stream count its start (the encoder's session, the first key frame): too few frames a second
+/// in them is not a reason to step down.
+pub const VL_WARM_MS : u64 = 3000;
+pub const VL_TOP_KBPS : u64 = 2500;
+
+pub const VL_RUNG : usize = 30;
+pub const VL_KBPS : usize = 31;
+pub const VL_GOOD : usize = 32;
+pub const VL_STREAK : usize = 33;
+pub const VL_LOWFPS : usize = 34;
+pub const VL_AT : usize = 35;
+pub const VL_DOWNS : usize = 36;
+pub const VL_UPS : usize = 37;
+pub const VL_CUTS : usize = 38;
+pub const VL_RAISES : usize = 39;
+/// When the stream started (vl_init).
+pub const VL_T0 : usize = 46;
+pub const VL_A_RATE : u32 = 1;
+pub const VL_A_RUNG : u32 = 2;
+
+/// The picture of a rung: 1280x720, 848x480, 640x360 (widths a multiple of 16).
+pub fn vl_w(r: u32) -> u64 {
+    if (r == VL_720) { return 1280; }
+    if (r == VL_480) { return 848; }
+    return 640;
+}
+
+pub fn vl_h(r: u32) -> u64 {
+    if (r == VL_720) { return 720; }
+    if (r == VL_480) { return 480; }
+    return 360;
+}
+
+/// The bitrates of a rung in kbit/s: the floor under which the picture steps down, where a call starts, the top.
+pub fn vl_min(r: u32) -> u64 {
+    if (r == VL_720) { return 700; }
+    if (r == VL_480) { return 400; }
+    return VL_FLOOR_KBPS;
+}
+
+pub fn vl_start(r: u32) -> u64 {
+    if (r == VL_720) { return 1200; }
+    if (r == VL_480) { return 700; }
+    return 450;
+}
+
+pub fn vl_max(r: u32) -> u64 {
+    if (r == VL_720) { return VL_TOP_KBPS; }
+    if (r == VL_480) { return 1200; }
+    return 800;
+}
+
+fn vl_clamp(v: u64, r: u32) -> u64 {
+    if (v < vl_min(r)) { return vl_min(r); }
+    if (v > vl_max(r)) { return vl_max(r); }
+    return v;
+}
+
+/// The ladder at the start of a stream (now), on rung r (720p when the camera gives it, else 480p).
+pub fn vl_init(ss: []u8, r: u32, now: u64) -> void {
+    if (ss.len < VS_LEN) { return; }
+    var rr : u32 = r;
+    if (rr >= VL_RUNGS) { rr = VL_360; }
+    put_u64(ss, VL_RUNG * 8, @as(u64, rr));
+    put_u64(ss, VL_KBPS * 8, vl_start(rr));
+    put_u64(ss, VL_GOOD * 8, 0);
+    put_u64(ss, VL_STREAK * 8, 0);
+    put_u64(ss, VL_LOWFPS * 8, 0);
+    put_u64(ss, VL_AT * 8, now);
+    put_u64(ss, VL_T0 * 8, now);
+}
+
+pub fn vl_rung(ss: []const u8) -> u32 { return @as(u32, @intCast(vs_get(ss, VL_RUNG))); }
+pub fn vl_kbps(ss: []const u8) -> u64 { return vs_get(ss, VL_KBPS); }
+
+/// Loss in per mille of the frames of a report.
+pub fn vl_loss_pm(done: u64, lost: u64) -> u64 {
+    if (done + lost == 0) { return 0; }
+    return lost * 1000 / (done + lost);
+}
+
+/// One receiver report (frames completed and lost in it, its audio underruns, the frames a second it showed) and the
+/// frames a second this side sent: the new bitrate and rung. Returns VL_A_RATE when the bitrate changed and VL_A_RUNG
+/// when the picture size did.
+///   bad  (loss over 5 % or 4+ underruns): bitrate x 0.7 (never under the floor)
+///   mild (loss over 1.5 % or an underrun): hold
+///   good: after three good reports in a row, bitrate x 1.15 (+50 at least), up to the rung's top
+///   step down when the bitrate is under the rung's floor, or when fewer than VL_FPS_MIN frames a second got through
+///   (sent or shown) in two reports in a row (not in the stream's first VL_WARM_MS); step up from a smaller rung after
+///   8 good reports in a row at its top, 28+ frames a second both ways, and VL_HOLD_MS since the last change (or the
+///   start).
+pub fn vl_step(ss: []u8, done: u64, lost: u64, under: u64, rx_fps: u64, tx_fps: u64, now: u64) -> u32 {
+    if (ss.len < VS_LEN) { return 0; }
+    var r : u32 = vl_rung(ss);
+    var k : u64 = vl_kbps(ss);
+    const k0 : u64 = k;
+    const r0 : u32 = r;
+    const pm : u64 = vl_loss_pm(done, lost);
+    const bad : bool = pm > 50 or under >= 4;
+    const mild : bool = pm > 15 or under >= 1;
+    var good : u64 = vs_get(ss, VL_GOOD);
+    var streak : u64 = vs_get(ss, VL_STREAK);
+    if (bad) {
+        k = k * 70 / 100;
+        if (k < VL_FLOOR_KBPS) { k = VL_FLOOR_KBPS; }
+        good = 0;
+        streak = 0;
+        put_u64(ss, VL_CUTS * 8, vs_get(ss, VL_CUTS) + 1);
+    } else if (mild) {
+        good = 0;
+        streak = 0;
+    } else {
+        good = good + 1;
+        streak = streak + 1;
+        if (good >= 3 and k < vl_max(r)) {
+            var up : u64 = k * 115 / 100;
+            if (up < k + 50) { up = k + 50; }
+            if (up > vl_max(r)) { up = vl_max(r); }
+            k = up;
+            good = 0;
+            put_u64(ss, VL_RAISES * 8, vs_get(ss, VL_RAISES) + 1);
+        }
+    }
+    var low : u64 = vs_get(ss, VL_LOWFPS);
+    var slow : u64 = rx_fps;
+    if (tx_fps < slow) { slow = tx_fps; }
+    if (done + lost > 0 and slow < VL_FPS_MIN and now >= vs_get(ss, VL_T0) + VL_WARM_MS) { low = low + 1; } else { low = 0; }
+    if (r + 1 < VL_RUNGS and (k < vl_min(r) or low >= 2)) {
+        r = r + 1;
+        k = vl_clamp(k, r);
+        low = 0;
+        good = 0;
+        streak = 0;
+        put_u64(ss, VL_AT * 8, now);
+        put_u64(ss, VL_DOWNS * 8, vs_get(ss, VL_DOWNS) + 1);
+    } else if (r > 0 and k >= vl_max(r) and streak >= 8 and rx_fps >= 28 and tx_fps >= 28 and now >= vs_get(ss, VL_AT) + VL_HOLD_MS) {
+        r = r - 1;
+        k = vl_clamp(vl_start(r), r);
+        good = 0;
+        streak = 0;
+        put_u64(ss, VL_AT * 8, now);
+        put_u64(ss, VL_UPS * 8, vs_get(ss, VL_UPS) + 1);
+    }
+    put_u64(ss, VL_RUNG * 8, @as(u64, r));
+    put_u64(ss, VL_KBPS * 8, k);
+    put_u64(ss, VL_GOOD * 8, good);
+    put_u64(ss, VL_STREAK * 8, streak);
+    put_u64(ss, VL_LOWFPS * 8, low);
+    var a : u32 = 0;
+    if (k != k0) { a = a | VL_A_RATE; }
+    if (r != r0) { a = a | VL_A_RUNG; }
+    return a;
+}
+
+// ---------------------------------------------------------------- control messages
+
+pub const VX_LEN : usize = 32;
+pub const VX_HELLO : u8 = 1;
+pub const VX_KEYREQ : u8 = 2;
+pub const VX_REPORT : u8 = 3;
+pub const VC_CAP_DEC : u8 = 1;
+pub const VC_CAP_ENC : u8 = 2;
+
+fn vx_head(out: []u8, kind: u8, caps: u8, rung: u32) -> void {
+    var i : usize = 0;
+    while (i < VX_LEN) { out[i] = 0; i = i + 1; }
+    out[0] = kind;
+    out[1] = VH_VERSION;
+    out[2] = caps;
+    out[3] = @as(u8, @intCast(rung & 255));
+}
+
+/// HELLO: what this side can do and the picture it sends.
+pub fn vx_hello(out: []u8, caps: u8, rung: u32) -> usize {
+    if (out.len < VX_LEN) { return 0; }
+    vx_head(out, VX_HELLO, caps, rung);
+    return VX_LEN;
+}
+
+/// KEYREQ: a key frame, please; the newest frame seen (4) and the last one decoded (8).
+pub fn vx_keyreq(out: []u8, caps: u8, seen: u64, lastdec: u64) -> usize {
+    if (out.len < VX_LEN) { return 0; }
+    vx_head(out, VX_KEYREQ, caps, 0);
+    vh_put32(out, 4, seen & 4294967295);
+    vh_put32(out, 8, lastdec & 4294967295);
+    return VX_LEN;
+}
+
+/// REPORT of the last second: the window in ms (4), frames completed (8), lost (12), bytes (16), the audio
+/// underruns (20, u16), frames held back by the gate (22, u16), the frames a second shown (24).
+pub fn vx_report(out: []u8, caps: u8, rep: []const u64) -> usize {
+    if (out.len < VX_LEN or rep.len < 7) { return 0; }
+    vx_head(out, VX_REPORT, caps, 0);
+    vh_put32(out, 4, rep[0] & 4294967295);
+    vh_put32(out, 8, rep[1] & 4294967295);
+    vh_put32(out, 12, rep[2] & 4294967295);
+    vh_put32(out, 16, rep[3] & 4294967295);
+    var u : u64 = rep[4];
+    if (u > 65535) { u = 65535; }
+    vh_put16(out, 20, u);
+    var h : u64 = rep[5];
+    if (h > 65535) { h = 65535; }
+    vh_put16(out, 22, h);
+    vh_put32(out, 24, rep[6] & 4294967295);
+    return VX_LEN;
+}
+
+/// Byte 28 of every control message: bit 0 = "I have heard you" (this side has a control message of the peer).
+pub const VX_F_HEARD : u8 = 1;
+
+/// Mark a built control message as sent by a side that has heard the peer (or not).
+pub fn vx_heard(out: []u8, heard: bool) -> void {
+    if (out.len < VX_LEN) { return; }
+    out[28] = 0;
+    if (heard) { out[28] = VX_F_HEARD; }
+}
+
+/// A control message this build reads: its length, a known kind, a version, no unknown flag, the unused bytes zero.
+pub fn vx_ok(pt: []const u8) -> bool {
+    if (pt.len != VX_LEN or pt[1] < VH_V2) { return false; }
+    if (pt[0] != VX_HELLO and pt[0] != VX_KEYREQ and pt[0] != VX_REPORT) { return false; }
+    return (pt[28] & 254) == 0 and pt[29] == 0 and pt[30] == 0 and pt[31] == 0;
+}
+
+pub fn vx_kind(pt: []const u8) -> u8 { return pt[0]; }
+pub fn vx_ver(pt: []const u8) -> u8 { return pt[1]; }
+pub fn vx_caps(pt: []const u8) -> u8 { return pt[2]; }
+pub fn vx_u32(pt: []const u8, at: usize) -> u64 { return vh_get32(pt, at); }
+pub fn vx_u16(pt: []const u8, at: usize) -> u64 { return vh_get16(pt, at); }
+
+// ---------------------------------------------------------------- which video the two ends agree on
+
+/// The negotiation's slots in the sender's state: the peer's version and caps (0 until its first control message),
+/// when this side last sent a HELLO, when the call became ACTIVE, 1 once the peer said it heard this side, 1 once this
+/// side sent a HELLO saying it heard the peer. A control message sent before the other side is ACTIVE is refused there
+/// (call_core: media only while ACTIVE), so the HELLOs go on until both sides know that both heard.
+pub const VN_PVER : usize = 40;
+pub const VN_PCAPS : usize = 41;
+pub const VN_HELLO_AT : usize = 42;
+pub const VN_T0 : usize = 43;
+pub const VN_PHEARD : usize = 44;
+pub const VN_SAIDHEARD : usize = 45;
+pub const VN_HELLO_MS : u64 = 500;
+/// No word from the peer in this long: it is an older T27 OS.
+pub const VN_WAIT_MS : u64 = 3000;
+
+pub const VN_WAIT : u32 = 0;
+pub const VN_H264 : u32 = 1;
+pub const VN_JPEG_OLD : u32 = 2;
+pub const VN_JPEG_HERE : u32 = 3;
+pub const VN_JPEG_PEER : u32 = 4;
+
+/// A control message from the peer: its version and caps are what it can do (the newest message counts).
+pub fn vn_take(ss: []u8, pt: []const u8) -> void {
+    if (ss.len < VS_LEN or !vx_ok(pt)) { return; }
+    put_u64(ss, VN_PVER * 8, @as(u64, pt[1]));
+    put_u64(ss, VN_PCAPS * 8, @as(u64, pt[2]));
+    if ((pt[28] & VX_F_HEARD) != 0) { put_u64(ss, VN_PHEARD * 8, 1); }
+}
+
+/// What this side sends: H.264 when it can encode and the peer said it decodes; until the peer said anything, the
+/// JPEG of call_core (VN_WAIT for VN_WAIT_MS, VN_JPEG_OLD after it: an older build); JPEG when this Mac has no H.264
+/// encoder (VN_JPEG_HERE) or the peer has no decoder (VN_JPEG_PEER). A HELLO that comes late still switches to H.264.
+pub fn vn_mode(my_caps: u8, peer_ver: u64, peer_caps: u64, since_ms: u64) -> u32 {
+    if (peer_ver == 0) {
+        if (since_ms < VN_WAIT_MS) { return VN_WAIT; }
+        return VN_JPEG_OLD;
+    }
+    if ((my_caps & VC_CAP_ENC) == 0) { return VN_JPEG_HERE; }
+    if ((peer_caps & @as(u64, VC_CAP_DEC)) == 0) { return VN_JPEG_PEER; }
+    return VN_H264;
+}
+
+/// A peer silent this long after the call became ACTIVE is an older build: no more HELLOs to it (it only counts them).
+pub const VN_HELLO_STOP_MS : u64 = 10000;
+
+/// A HELLO is due every VN_HELLO_MS until the peer has said something, said it heard this side, and this side has said
+/// in a HELLO that it heard the peer. Then none: the REPORTs carry the caps from there on. None either to a peer that
+/// said nothing for VN_HELLO_STOP_MS since the call became ACTIVE (since_ms).
+pub fn vn_hello_due(peer_ver: u64, peer_heard: u64, said_heard: u64, last_at: u64, now: u64, since_ms: u64) -> bool {
+    if (peer_ver != 0 and peer_heard != 0 and said_heard != 0) { return false; }
+    if (peer_ver == 0 and since_ms >= VN_HELLO_STOP_MS) { return false; }
+    return last_at == 0 or now < last_at or now - last_at >= VN_HELLO_MS;
+}
+
+/// The panel's note for a call whose video is not H.264 (empty for H.264 and while waiting).
+pub fn vn_note(mode: u32) -> str {
+    if (mode == VN_JPEG_OLD) { return "the other side runs an older T27 OS: video 320x240"; }
+    if (mode == VN_JPEG_HERE) { return "no H.264 encoder on this Mac: video 320x240"; }
+    if (mode == VN_JPEG_PEER) { return "no H.264 decoder on the other side: video 320x240"; }
+    return "";
+}
+
+// ---------------------------------------------------------------- frames and bytes a second
+
+/// A meter (VF_LEN bytes): the second being counted (ms / 1000), frames and bytes in it, and the last whole second.
+pub const VF_LEN : usize = 40;
+const VF_SEC : usize = 0;
+const VF_N : usize = 1;
+const VF_B : usize = 2;
+const VF_LN : usize = 3;
+const VF_LB : usize = 4;
+
+/// Move the meter to the second of now: the second just ended becomes the last whole one; a gap of more than one
+/// second leaves a last second of nothing.
+fn vf_roll(m: []u8, now_ms: u64) -> void {
+    const s : u64 = now_ms / 1000;
+    const cur : u64 = get_u64(m, VF_SEC * 8);
+    if (s == cur) { return; }
+    if (s == cur + 1) {
+        put_u64(m, VF_LN * 8, get_u64(m, VF_N * 8));
+        put_u64(m, VF_LB * 8, get_u64(m, VF_B * 8));
+    } else {
+        put_u64(m, VF_LN * 8, 0);
+        put_u64(m, VF_LB * 8, 0);
+    }
+    put_u64(m, VF_SEC * 8, s);
+    put_u64(m, VF_N * 8, 0);
+    put_u64(m, VF_B * 8, 0);
+}
+
+/// One frame of `bytes` at now.
+pub fn vf_note(m: []u8, now_ms: u64, bytes: u64) -> void {
+    if (m.len < VF_LEN) { return; }
+    vf_roll(m, now_ms);
+    put_u64(m, VF_N * 8, get_u64(m, VF_N * 8) + 1);
+    put_u64(m, VF_B * 8, get_u64(m, VF_B * 8) + bytes);
+}
+
+/// Frames in the last whole second before now.
+pub fn vf_fps(m: []const u8, now_ms: u64) -> u64 {
+    if (m.len < VF_LEN) { return 0; }
+    const s : u64 = now_ms / 1000;
+    const cur : u64 = get_u64(m, VF_SEC * 8);
+    if (s == cur) { return get_u64(m, VF_LN * 8); }
+    if (s == cur + 1) { return get_u64(m, VF_N * 8); }
+    return 0;
+}
+
+/// Kilobits in the last whole second before now.
+pub fn vf_kbps(m: []const u8, now_ms: u64) -> u64 {
+    if (m.len < VF_LEN) { return 0; }
+    const s : u64 = now_ms / 1000;
+    const cur : u64 = get_u64(m, VF_SEC * 8);
+    var b : u64 = 0;
+    if (s == cur) { b = get_u64(m, VF_LB * 8); } else if (s == cur + 1) { b = get_u64(m, VF_B * 8); }
+    return b * 8 / 1000;
+}
+
+/// One side of the panel's video line: "<label> 30 fps 1280x720 1150 kbit/s" appended at n; the new length. Nothing
+/// is made up: no frames in the last second says "<label> -".
+pub fn vh_side_text(out: []u8, n: usize, label: []const u8, fps: u64, w: u64, h: u64, kbps: u64) -> usize {
+    if (out.len < n + label.len + 48) { return n; }
+    var m : usize = put_bytes(out, n, label);
+    if (fps == 0) { return put_bytes(out, m, " -"); }
+    m = put_bytes(out, m, " ");
+    m = put_dec(out, m, fps);
+    m = put_bytes(out, m, " fps ");
+    if (w > 0 and h > 0) {
+        m = put_dec(out, m, w);
+        m = put_bytes(out, m, "x");
+        m = put_dec(out, m, h);
+        m = put_bytes(out, m, " ");
+    }
+    m = put_dec(out, m, kbps);
+    return put_bytes(out, m, " kbit/s");
+}
+
+// ---------------------------------------------------------------- tests
+
+fn t_fill(b: []u8, seed: u64) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = @as(u8, @intCast((seed + @as(u64, i) * 7 + @as(u64, i) / 251) & 255));
+        i = i + 1;
+    }
+}
+
+fn vh_t_zero(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// Every part of a frame of n bytes (seeded) into the receiver; the verdict of the last part.
+fn t_send(st: []u8, buf: []u8, frame: u64, n: usize, seed: u64, key: bool, skip: usize) -> u32 {
+    var src : [6000]u8 = undefined;
+    t_fill(src[0..n], seed);
+    var pt : [1176]u8 = undefined;
+    const parts : usize = vh_parts(n);
+    var k : usize = 0;
+    var v : u32 = VH_NO;
+    while (k < parts) {
+        if (k != skip) {
+            const c : usize = vh_cut(n, k);
+            const len : usize = vh_part(pt[0..1176], frame, n, k, key, 0, src[k * VH_PART..k * VH_PART + c]);
+            v = vh_take(st, buf, pt[0..len], 1000 + frame);
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+test the_sealed_part_fits_one_datagram_and_the_largest_frame_fits_the_mask {
+    assert VH_HDR + VH_PART_V2 == VH_PT_MAX;
+    // version 3: the 52-byte header + plaintext + the 16-byte tag is exactly 1232, an IPv6 datagram without fragments
+    assert 52 + VH_HDR + VH_PART + 16 == 1232;
+    // version 2 (build 7136) still fits IPv4 over Ethernet or Wi-Fi (1500 less IPv4 and UDP headers)
+    assert 52 + VH_PT_MAX + 16 <= 1472;
+    assert vh_parts(VH_FRAME_MAX) == VH_PARTS_MAX and VH_PARTS_MAX <= 128 and vh_parts_of(VH_FRAME_MAX, VH_PART_V2) == 113;
+    assert vh_parts(0) == 0 and vh_parts(VH_FRAME_MAX + 1) == 0 and vh_parts_of(100, 1000) == 0;
+    assert vh_parts(1) == 1 and vh_parts(1148) == 1 and vh_parts(1149) == 2;
+    assert vh_cut(1149, 0) == 1148 and vh_cut(1149, 1) == 1 and vh_cut(1149, 2) == 0;
+    assert vh_cut_of(1161, 0, VH_PART_V2) == 1160 and vh_cut_of(1161, 1, VH_PART_V2) == 1;
+    assert vh_psz(3) == 1148 and vh_psz(4) == 1148 and vh_psz(2) == 1160 and vh_psz(1) == 0 and vh_psz(0) == 0;
+    assert CK_T_H264 == 35 and CK_T_VCTL == 36 and VH_VERSION == 3 and VH_V2 == 2;
+    // every slot stands inside its block
+    assert VA_DROPPED * 8 + 8 <= VA_LEN and VK_SENT * 8 + 8 <= VA_LEN and VA_DROPPED < VD_NEED;
+    assert VS_STALE < VP_CREDIT and VP_AT < VL_RUNG and VL_RAISES < VN_PVER and VN_SAIDHEARD < VL_T0 and VL_T0 * 8 + 8 <= VS_LEN;
+}
+
+test a_part_says_its_frame_index_count_total_key_and_rung {
+    var src : [3000]u8 = undefined;
+    t_fill(src[0..3000], 9);
+    var pt : [1176]u8 = undefined;
+    const n : usize = vh_part(pt[0..1176], 77, 3000, 2, true, VL_480, src[2296..3000]);
+    assert n == VH_HDR + 704;
+    assert vh_ok(pt[0..n]);
+    assert vh_frame(pt[0..n]) == 77 and vh_index(pt[0..n]) == 2 and vh_count(pt[0..n]) == 3 and vh_total(pt[0..n]) == 3000;
+    assert vh_key(pt[0..n]) and vh_rung(pt[0..n]) == VL_480 and pt[14] == VH_VERSION;
+    assert pt[VH_HDR] == src[2296] and pt[n - 1] == src[2999];
+    // a cut of the wrong length, frame 0, a frame number past 32 bits, a short out, a version with no part size
+    assert vh_part(pt[0..1176], 77, 3000, 2, true, 0, src[2296..2999]) == 0;
+    assert vh_part(pt[0..1176], 0, 3000, 2, true, 0, src[2296..3000]) == 0;
+    assert vh_part(pt[0..1176], 4294967296, 3000, 2, true, 0, src[2296..3000]) == 0;
+    assert vh_part(pt[0..100], 77, 3000, 2, true, 0, src[2296..3000]) == 0;
+    assert vh_part_v(pt[0..1176], 77, 3000, 2, true, 0, 1, src[2296..3000]) == 0;
+}
+
+test a_malformed_part_is_refused {
+    var src : [3000]u8 = undefined;
+    t_fill(src[0..3000], 1);
+    var pt : [1176]u8 = undefined;
+    const n : usize = vh_part(pt[0..1176], 5, 3000, 0, false, 0, src[0..1148]);
+    assert vh_ok(pt[0..n]);
+    // one byte short, the count changed, an older version, the reserved byte set, an index past the count
+    assert !vh_ok(pt[0..n - 1]);
+    pt[6] = 4;
+    assert !vh_ok(pt[0..n]);
+    pt[6] = 3;
+    pt[14] = 1;
+    assert !vh_ok(pt[0..n]);
+    // version 2 cuts at 1160: this 1148-byte part does not add up as a version 2 part
+    pt[14] = VH_V2;
+    assert !vh_ok(pt[0..n]);
+    pt[14] = VH_VERSION;
+    pt[15] = 1;
+    assert !vh_ok(pt[0..n]);
+    pt[15] = 0;
+    pt[4] = 3;
+    assert !vh_ok(pt[0..n]);
+    pt[4] = 0;
+    assert vh_ok(pt[0..n]);
+}
+
+test a_frame_comes_back_byte_for_byte_whatever_the_order_of_its_parts {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    var buf : [131072]u8 = undefined;
+    var src : [5000]u8 = undefined;
+    t_fill(src[0..5000], 3);
+    var pt : [1176]u8 = undefined;
+    // parts 4, 0, 2, 3, 1 (5 parts)
+    var order : [5]usize = undefined;
+    order[0] = 4; order[1] = 0; order[2] = 2; order[3] = 3; order[4] = 1;
+    var i : usize = 0;
+    var v : u32 = VH_NO;
+    while (i < 5) {
+        const k : usize = order[i];
+        const c : usize = vh_cut(5000, k);
+        const len : usize = vh_part(pt[0..1176], 1, 5000, k, true, 0, src[k * VH_PART..k * VH_PART + c]);
+        v = vh_take(st[0..256], buf[0..131072], pt[0..len], 500);
+        if (i < 4) { assert v == VH_STORED; }
+        i = i + 1;
+    }
+    assert v == VH_COMPLETE;
+    assert va_get(st[0..256], VA_SIZE) == 5000 and va_get(st[0..256], VA_LAST) == 1 and va_get(st[0..256], VA_DONE) == 1;
+    assert va_get(st[0..256], VA_KEYS) == 1 and va_get(st[0..256], VA_AT) == 500 and va_get(st[0..256], VA_BYTES) == 5000;
+    i = 0;
+    var same : bool = true;
+    while (i < 5000) {
+        if (buf[i] != src[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same;
+}
+
+test a_frame_of_more_than_64_parts_uses_both_words_of_the_mask {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    var buf : [131072]u8 = undefined;
+    var pt : [1176]u8 = undefined;
+    var cut : [1160]u8 = undefined;
+    const total : usize = 100000;
+    const n : usize = vh_parts(total);
+    assert n == 88;
+    var k : usize = 0;
+    var v : u32 = VH_NO;
+    while (k < n) {
+        const c : usize = vh_cut(total, k);
+        t_fill(cut[0..c], @as(u64, k));
+        const len : usize = vh_part(pt[0..1176], 9, total, k, false, 0, cut[0..c]);
+        v = vh_take(st[0..256], buf[0..131072], pt[0..len], 7);
+        if (k == 70) { assert va_held(st[0..256]) == 71; }
+        k = k + 1;
+    }
+    assert v == VH_COMPLETE and va_get(st[0..256], VA_SIZE) == 100000;
+    // the last part (87) landed at 87 * 1148
+    assert buf[87 * 1148] == cut[0];
+}
+
+test a_duplicate_part_is_old_and_a_lost_part_drops_the_frame_when_the_next_one_starts {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    var buf : [131072]u8 = undefined;
+    var src : [3000]u8 = undefined;
+    t_fill(src[0..3000], 5);
+    var pt : [1176]u8 = undefined;
+    const len : usize = vh_part(pt[0..1176], 1, 3000, 0, true, 0, src[0..1148]);
+    assert vh_take(st[0..256], buf[0..131072], pt[0..len], 1) == VH_STORED;
+    assert vh_take(st[0..256], buf[0..131072], pt[0..len], 1) == VH_OLD;
+    // a frame completed is never taken twice: a copy of its part comes back stale
+    assert t_send(st[0..256], buf[0..131072], 1, 3000, 5, true, 99) == VH_COMPLETE;
+    const again : usize = vh_part(pt[0..1176], 1, 3000, 1, true, 0, src[1148..2296]);
+    assert vh_take(st[0..256], buf[0..131072], pt[0..again], 2) == VH_OLD and va_get(st[0..256], VA_DONE) == 1;
+    // frame 2 loses its part 1; frame 3 arrives whole: frame 2 was dropped, never completed, and counts as lost
+    t_send(st[0..256], buf[0..131072], 2, 3000, 6, false, 1);
+    assert t_send(st[0..256], buf[0..131072], 3, 3000, 6, false, 99) == VH_COMPLETE;
+    assert va_get(st[0..256], VA_DROPPED) == 1 and va_get(st[0..256], VA_DONE) == 2 and va_get(st[0..256], VA_LAST) == 3;
+    assert va_get(st[0..256], VA_LOST) == 1;
+    // a late part of frame 2 is stale now
+    const late : usize = vh_part(pt[0..1176], 2, 3000, 1, false, 0, src[1148..2296]);
+    assert vh_take(st[0..256], buf[0..131072], pt[0..late], 3) == VH_OLD;
+    // frames 4 and 5 never come, 6 does: two more frames lost
+    assert t_send(st[0..256], buf[0..131072], 6, 2000, 7, false, 99) == VH_COMPLETE;
+    assert va_get(st[0..256], VA_LOST) == 3 and va_get(st[0..256], VA_SEEN) == 6;
+    // a part whose total disagrees with the frame in assembly is refused
+    t_send(st[0..256], buf[0..131072], 7, 3000, 8, false, 1);
+    const odd : usize = vh_part(pt[0..1176], 7, 2500, 1, false, 0, src[1148..2296]);
+    assert vh_take(st[0..256], buf[0..131072], pt[0..odd], 9) == VH_NO and va_get(st[0..256], VA_REFUSED) == 1;
+}
+
+test the_first_frame_numbers_before_any_completion_are_not_lost {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    var buf : [131072]u8 = undefined;
+    // the stream starts at 40 (after JPEG frames, or a late join)
+    assert t_send(st[0..256], buf[0..131072], 40, 1500, 1, true, 99) == VH_COMPLETE;
+    assert va_get(st[0..256], VA_LOST) == 0;
+    assert t_send(st[0..256], buf[0..131072], 41, 1500, 2, false, 99) == VH_COMPLETE;
+    assert va_get(st[0..256], VA_LOST) == 0 and va_get(st[0..256], VA_DONE) == 2;
+}
+
+test the_decoder_takes_a_key_frame_then_only_the_next_frame {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    // a new call needs a key frame: a P-frame first is held back
+    assert !vd_gate(st[0..256], 1, false);
+    assert vd_gate(st[0..256], 2, true);
+    assert vd_gate(st[0..256], 3, false) and vd_gate(st[0..256], 4, false);
+    // frame 5 lost: 6 is held back, and so is 7 even though it follows 6
+    assert !vd_gate(st[0..256], 6, false);
+    assert !vd_gate(st[0..256], 7, false);
+    assert va_get(st[0..256], VD_HELD) == 3 and va_get(st[0..256], VD_FED) == 3;
+    // the key frame 8 starts the chain again
+    assert vd_gate(st[0..256], 8, true) and vd_gate(st[0..256], 9, false);
+    // a decoder error: nothing until a key frame
+    vd_error(st[0..256]);
+    assert !vd_gate(st[0..256], 10, false) and va_get(st[0..256], VD_ERRS) == 1;
+    assert vd_gate(st[0..256], 11, true);
+}
+
+test a_key_frame_is_asked_for_once_something_arrived_and_again_every_250_ms {
+    var st : [256]u8 = undefined;
+    va_reset(st[0..256]);
+    var buf : [131072]u8 = undefined;
+    // nothing arrived: the first key frame comes by itself, no request
+    assert !vk_due(st[0..256], 100);
+    t_send(st[0..256], buf[0..131072], 1, 1000, 1, false, 99);
+    assert vk_due(st[0..256], 100);
+    vk_sent(st[0..256], 100);
+    assert !vk_due(st[0..256], 349) and vk_due(st[0..256], 350);
+    vk_sent(st[0..256], 350);
+    assert va_get(st[0..256], VK_SENT) == 2;
+    // the key frame came: no more requests
+    assert vd_gate(st[0..256], 2, true);
+    assert !vk_due(st[0..256], 2000);
+}
+
+test the_sender_forces_a_key_frame_unless_one_is_on_its_way_or_was_just_forced {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    assert vs_number(ss[0..512], true) == 1;
+    var f : u64 = 2;
+    while (f <= 10) { assert vs_number(ss[0..512], false) == f; f = f + 1; }
+    assert vs_get(ss[0..512], VS_KEYF) == 1 and vs_get(ss[0..512], VS_KEYS) == 1 and vs_get(ss[0..512], VS_FRAMES) == 10;
+    // the receiver saw up to 9 and broke: key frame 1 is older -> force
+    assert vk_on_request(ss[0..512], 9, 5000);
+    // again 100 ms later: too soon
+    assert !vk_on_request(ss[0..512], 9, 5100);
+    // the forced key frame goes out as 11; a request naming 10 (it has not seen 11 yet) is not followed
+    assert vs_number(ss[0..512], true) == 11;
+    assert !vk_on_request(ss[0..512], 10, 5400);
+    // a request naming 12: key frame 11 was lost -> force again
+    assert vk_on_request(ss[0..512], 12, 5500);
+    assert vs_get(ss[0..512], VS_FORCES) == 2 and vs_get(ss[0..512], VS_IGNORED) == 2;
+}
+
+test a_frame_that_waited_too_long_is_dropped {
+    assert !vq_stale(250, 0) and vq_stale(251, 0);
+    assert !vq_stale(10, 5) and vq_stale(10, 6);
+}
+
+test the_bucket_lets_a_burst_go_then_three_times_the_bitrate {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    assert vp_rate(1200) == 4000 and vp_rate(2000) == 6000;
+    assert vp_refill(ss[0..512], 1000000, 1200) == VP_BURST;
+    assert vp_take(ss[0..512], 15000) and !vp_take(ss[0..512], 1001) and vp_take(ss[0..512], 1000);
+    // 10 ms at 4000 kbit/s = 5000 bytes
+    assert vp_refill(ss[0..512], 1010000, 1200) == 5000;
+    // 2000 kbit/s for 10 ms: 6000 kbit/s = 7500 bytes more, capped at the burst
+    assert vp_refill(ss[0..512], 1020000, 2000) == 12500;
+    assert vp_refill(ss[0..512], 1030000, 2000) == VP_BURST;
+    // a clock that went back or a long pause: a full bucket
+    vp_take(ss[0..512], 16000);
+    assert vp_refill(ss[0..512], 5, 2000) == VP_BURST;
+    vp_take(ss[0..512], 16000);
+    assert vp_refill(ss[0..512], 3000000, 2000) == VP_BURST;
+}
+
+test the_rungs_are_720p_480p_360p_with_their_bitrates {
+    assert vl_w(VL_720) == 1280 and vl_h(VL_720) == 720 and vl_w(VL_480) == 848 and vl_h(VL_480) == 480;
+    assert vl_w(VL_360) == 640 and vl_h(VL_360) == 360;
+    assert vl_w(VL_480) % 16 == 0 and vl_w(VL_360) % 16 == 0;
+    assert vl_start(VL_720) == 1200 and vl_max(VL_720) == 2500 and vl_min(VL_360) == 300;
+    var r : u32 = 0;
+    while (r < VL_RUNGS) {
+        assert vl_min(r) < vl_start(r) and vl_start(r) < vl_max(r);
+        r = r + 1;
+    }
+    assert vl_loss_pm(0, 0) == 0 and vl_loss_pm(95, 5) == 50 and vl_loss_pm(0, 3) == 1000;
+}
+
+test a_bad_second_cuts_the_bitrate_and_good_ones_raise_it {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_720, 0);
+    assert vl_kbps(ss[0..512]) == 1200 and vl_rung(ss[0..512]) == VL_720;
+    // 10 % loss: x0.7
+    assert vl_step(ss[0..512], 27, 3, 0, 27, 30, 1000) == VL_A_RATE;
+    assert vl_kbps(ss[0..512]) == 840;
+    // 4 underruns with no loss: bad too (the floor's step down needs no warm-up)
+    assert vl_step(ss[0..512], 30, 0, 4, 30, 30, 2000) == VL_A_RUNG | VL_A_RATE;
+    // 840 * 0.7 = 588, under 720p's floor of 700: down to 480p
+    assert vl_rung(ss[0..512]) == VL_480 and vl_kbps(ss[0..512]) == 588;
+    // one underrun: hold
+    assert vl_step(ss[0..512], 30, 0, 1, 30, 30, 3000) == 0 and vl_kbps(ss[0..512]) == 588;
+    // three good seconds: x1.15
+    assert vl_step(ss[0..512], 30, 0, 0, 30, 30, 4000) == 0;
+    assert vl_step(ss[0..512], 30, 0, 0, 30, 30, 5000) == 0;
+    assert vl_step(ss[0..512], 30, 0, 0, 30, 30, 6000) == VL_A_RATE;
+    assert vl_kbps(ss[0..512]) == 676;
+    assert vs_get(ss[0..512], VL_CUTS) == 2 and vs_get(ss[0..512], VL_RAISES) == 1 and vs_get(ss[0..512], VL_DOWNS) == 1;
+}
+
+test the_bitrate_never_falls_under_the_floor_nor_climbs_over_the_top {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_360, 0);
+    var i : u64 = 0;
+    while (i < 10) {
+        vl_step(ss[0..512], 10, 10, 9, 10, 30, 1000 * i);
+        i = i + 1;
+    }
+    assert vl_kbps(ss[0..512]) == VL_FLOOR_KBPS and vl_rung(ss[0..512]) == VL_360;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_720, 0);
+    i = 0;
+    while (i < 60) {
+        vl_step(ss[0..512], 30, 0, 0, 30, 30, 1000 * i);
+        i = i + 1;
+    }
+    assert vl_kbps(ss[0..512]) == VL_TOP_KBPS and vl_rung(ss[0..512]) == VL_720;
+}
+
+test too_few_frames_a_second_twice_steps_the_picture_down {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_720, 0);
+    // the stream's start: few frames a second in its first 3 s are not a reason to step down
+    // (one underrun in each: a held bitrate, so only the frames a second are looked at)
+    assert vl_step(ss[0..512], 5, 0, 1, 5, 18, 1000) == 0 and vl_step(ss[0..512], 12, 0, 1, 12, 18, 2000) == 0;
+    assert vl_step(ss[0..512], 15, 0, 1, 15, 30, 2999) == 0 and vl_rung(ss[0..512]) == VL_720;
+    assert vs_get(ss[0..512], VL_LOWFPS) == 0;
+    // the camera or the encoder gives only 18 a second: once is not enough
+    assert vl_step(ss[0..512], 18, 0, 0, 18, 18, 4000) == 0;
+    assert vl_step(ss[0..512], 18, 0, 0, 18, 18, 5000) == VL_A_RUNG;
+    assert vl_rung(ss[0..512]) == VL_480 and vl_kbps(ss[0..512]) == 1200;
+    // a report with no frames at all (video paused) does not count as slow
+    assert vl_step(ss[0..512], 0, 0, 0, 0, 0, 6000) == 0 and vs_get(ss[0..512], VL_LOWFPS) == 0;
+    // slow on the receiving side only counts as well
+    vl_step(ss[0..512], 30, 0, 0, 15, 30, 7000);
+    assert vl_step(ss[0..512], 30, 0, 0, 15, 30, 8000) == VL_A_RUNG | VL_A_RATE;
+    assert vl_rung(ss[0..512]) == VL_360 and vl_kbps(ss[0..512]) == 800;
+    // 360p is the last rung
+    vl_step(ss[0..512], 30, 0, 0, 15, 30, 9000);
+    vl_step(ss[0..512], 30, 0, 0, 15, 30, 10000);
+    assert vl_rung(ss[0..512]) == VL_360;
+}
+
+test the_picture_steps_up_only_after_a_long_clean_run_at_the_rungs_top {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_720, 0);
+    vl_step(ss[0..512], 18, 0, 0, 18, 18, 4000);
+    vl_step(ss[0..512], 18, 0, 0, 18, 18, 5000);
+    assert vl_rung(ss[0..512]) == VL_480 and vl_kbps(ss[0..512]) == 1200;
+    // at 480p's top, 30 both ways, clean: but not before 10 s since the step down (at 5000)
+    var t : u64 = 6000;
+    while (t <= 14000) {
+        assert vl_step(ss[0..512], 30, 0, 0, 30, 30, t) == 0;
+        t = t + 1000;
+    }
+    assert vl_rung(ss[0..512]) == VL_480;
+    assert vl_step(ss[0..512], 30, 0, 0, 30, 30, 15000) == VL_A_RUNG;
+    assert vl_rung(ss[0..512]) == VL_720 and vl_kbps(ss[0..512]) == 1200 and vs_get(ss[0..512], VL_UPS) == 1;
+}
+
+test a_slow_side_keeps_the_smaller_picture {
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    vl_init(ss[0..512], VL_480, 0);
+    put_u64(ss[0..512], VL_KBPS * 8, 1200);
+    var t : u64 = 20000;
+    while (t <= 40000) {
+        // 25 a second shown: clean, but not the 28 a step up needs
+        vl_step(ss[0..512], 25, 0, 0, 25, 30, t);
+        t = t + 1000;
+    }
+    assert vl_rung(ss[0..512]) == VL_480;
+}
+
+test control_messages_carry_their_fields_and_an_old_or_odd_one_is_refused {
+    var b : [32]u8 = undefined;
+    assert vx_hello(b[0..32], VC_CAP_DEC | VC_CAP_ENC, VL_480) == VX_LEN;
+    assert vx_ok(b[0..32]) and vx_kind(b[0..32]) == VX_HELLO and vx_ver(b[0..32]) == VH_VERSION and vx_caps(b[0..32]) == 3 and b[3] == 1;
+    assert vx_keyreq(b[0..32], VC_CAP_DEC, 4294967300, 7) == VX_LEN;
+    assert vx_kind(b[0..32]) == VX_KEYREQ and vx_u32(b[0..32], 4) == 4 and vx_u32(b[0..32], 8) == 7;
+    var rep : [7]u64 = undefined;
+    rep[0] = 1000; rep[1] = 29; rep[2] = 1; rep[3] = 150000; rep[4] = 70000; rep[5] = 3; rep[6] = 29;
+    assert vx_report(b[0..32], 1, rep[0..7]) == VX_LEN;
+    assert vx_ok(b[0..32]) and vx_u32(b[0..32], 4) == 1000 and vx_u32(b[0..32], 8) == 29 and vx_u32(b[0..32], 12) == 1;
+    assert vx_u32(b[0..32], 16) == 150000 and vx_u16(b[0..32], 20) == 65535 and vx_u16(b[0..32], 22) == 3 and vx_u32(b[0..32], 24) == 29;
+    // a wrong length, an older version, an unknown kind, the tail not zero
+    assert !vx_ok(b[0..31]);
+    b[1] = 1;
+    assert !vx_ok(b[0..32]);
+    // build 7136 speaks version 2: read
+    b[1] = VH_V2;
+    assert vx_ok(b[0..32]);
+    b[1] = VH_VERSION;
+    b[0] = 9;
+    assert !vx_ok(b[0..32]);
+    b[0] = VX_REPORT;
+    b[30] = 1;
+    assert !vx_ok(b[0..32]);
+    b[30] = 0;
+    vx_heard(b[0..32], true);
+    assert vx_ok(b[0..32]);
+    vx_heard(b[0..32], false);
+    assert b[28] == 0;
+    assert vx_hello(b[0..31], 1, 0) == 0 and vx_report(b[0..32], 1, rep[0..6]) == 0;
+}
+
+test an_old_build_gets_the_jpeg_and_a_new_one_h264 {
+    const both : u8 = VC_CAP_DEC | VC_CAP_ENC;
+    // nothing from the peer yet: JPEG while waiting, then "an older T27 OS"
+    assert vn_mode(both, 0, 0, 0) == VN_WAIT and vn_mode(both, 0, 0, 2999) == VN_WAIT;
+    assert vn_mode(both, 0, 0, 3000) == VN_JPEG_OLD;
+    // the peer's HELLO says it decodes: H.264, even if it came late
+    assert vn_mode(both, 2, 3, 100) == VN_H264 and vn_mode(both, 2, 1, 60000) == VN_H264;
+    // no encoder here, no decoder there
+    assert vn_mode(VC_CAP_DEC, 2, 3, 100) == VN_JPEG_HERE;
+    assert vn_mode(both, 2, 2, 100) == VN_JPEG_PEER;
+    assert vn_note(VN_H264).len == 0 and vn_note(VN_WAIT).len == 0;
+    assert vn_note(VN_JPEG_OLD).len > 20 and vn_note(VN_JPEG_HERE).len > 20 and vn_note(VN_JPEG_PEER).len > 20;
+    // the HELLO repeats every 500 ms until the peer answered, said it heard us, and we said we heard it
+    assert vn_hello_due(0, 0, 0, 0, 5, 0) and !vn_hello_due(0, 0, 0, 1000, 1499, 499) and vn_hello_due(0, 0, 0, 1000, 1500, 500);
+    assert vn_hello_due(2, 0, 1, 1000, 1500, 500) and vn_hello_due(2, 1, 0, 1000, 1500, 500) and vn_hello_due(0, 1, 1, 1000, 1500, 500);
+    assert !vn_hello_due(2, 1, 1, 0, 5, 0);
+    // an older build never answers: after 10 s it gets no more HELLOs; a peer that answered still gets the last ones
+    assert vn_hello_due(0, 0, 0, 9000, 9999, 9999) and !vn_hello_due(0, 0, 0, 9000, 10000, 10000);
+    assert vn_hello_due(2, 0, 0, 20000, 20500, 20500);
+    var ss : [512]u8 = undefined;
+    vh_t_zero(ss[0..512]);
+    var b : [32]u8 = undefined;
+    vx_hello(b[0..32], both, 0);
+    vn_take(ss[0..512], b[0..32]);
+    assert vs_get(ss[0..512], VN_PVER) == @as(u64, VH_VERSION) and vs_get(ss[0..512], VN_PCAPS) == 3 and vs_get(ss[0..512], VN_PHEARD) == 0;
+    // the peer heard us
+    vx_heard(b[0..32], true);
+    assert vx_ok(b[0..32]) and b[28] == VX_F_HEARD;
+    vn_take(ss[0..512], b[0..32]);
+    assert vs_get(ss[0..512], VN_PHEARD) == 1;
+    // an unknown flag is refused
+    b[28] = 2;
+    assert !vx_ok(b[0..32]);
+    b[28] = 0;
+    // an odd message changes nothing
+    b[0] = 7;
+    vn_take(ss[0..512], b[0..32]);
+    assert vs_get(ss[0..512], VN_PCAPS) == 3;
+}
+
+test a_key_frame_carries_its_parameter_sets_and_the_decoder_gets_the_picture_without_them {
+    var sps : [10]u8 = undefined;
+    t_fill(sps[0..10], 1);
+    sps[0] = 103;
+    var pps : [4]u8 = undefined;
+    t_fill(pps[0..4], 2);
+    pps[0] = 104;
+    // the encoder's picture: one IDR unit of 6 bytes, length-prefixed
+    var pic : [10]u8 = undefined;
+    pic[0] = 0; pic[1] = 0; pic[2] = 0; pic[3] = 6;
+    pic[4] = 101; pic[5] = 1; pic[6] = 2; pic[7] = 3; pic[8] = 4; pic[9] = 5;
+    var out : [64]u8 = undefined;
+    const n : usize = vh_pack(out[0..64], sps[0..10], pps[0..4], pic[0..10]);
+    assert n == 8 + 10 + 4 + 10;
+    assert vh_nals(out[0..n]) == 3 and vh_is_key(out[0..n]);
+    assert vh_find(out[0..n], VH_NAL_SPS) == 0 and vh_nal_len(out[0..n], 0) == 10;
+    assert vh_find(out[0..n], VH_NAL_PPS) == 14 and vh_find(out[0..n], VH_NAL_IDR) == 22;
+    var dec : [64]u8 = undefined;
+    const m : usize = vh_strip(out[0..n], dec[0..64]);
+    assert m == 10 and dec[3] == 6 and dec[4] == 101 and dec[9] == 5;
+    assert vh_strip_len(out[0..n]) == m and vh_strip_len(out[0..n - 1]) == 0;
+    // parameter sets alone: nothing for the decoder
+    assert vh_strip_len(out[0..22]) == 0 and vh_strip(out[0..22], dec[0..64]) == 0;
+    // a P-frame: the picture alone, no parameter sets, not a key frame
+    pic[4] = 65;
+    const p : usize = vh_pack(out[0..64], sps[0..0], pps[0..0], pic[0..10]);
+    assert p == 10 and !vh_is_key(out[0..p]) and vh_find(out[0..p], VH_NAL_SPS) == VH_NONE;
+    // parameter sets in front of a P-picture: not a key frame either (no IDR)
+    const q : usize = vh_pack(out[0..64], sps[0..10], pps[0..4], pic[0..10]);
+    assert q == 32 and vh_nals(out[0..q]) == 3 and !vh_is_key(out[0..q]);
+    // SPS without PPS, too long for out, nothing at all: no frame
+    assert vh_pack(out[0..64], sps[0..10], pps[0..0], pic[0..10]) == 0;
+    assert vh_pack(out[0..20], sps[0..10], pps[0..4], pic[0..10]) == 0;
+    assert vh_pack(out[0..64], sps[0..0], pps[0..0], pic[0..0]) == 0;
+}
+
+test a_frame_whose_lengths_do_not_walk_to_its_end_is_refused {
+    var b : [16]u8 = undefined;
+    b[0] = 0; b[1] = 0; b[2] = 0; b[3] = 3; b[4] = 65; b[5] = 1; b[6] = 2;
+    b[7] = 0; b[8] = 0; b[9] = 0; b[10] = 2; b[11] = 1; b[12] = 9;
+    assert vh_nals(b[0..13]) == 2;
+    // one byte short, one too many, a zero length, the forbidden bit, a length past the end
+    assert vh_nals(b[0..12]) == 0 and vh_nals(b[0..14]) == 0;
+    b[10] = 0;
+    assert vh_nals(b[0..13]) == 0;
+    b[10] = 2;
+    b[4] = 193;
+    assert vh_nals(b[0..13]) == 0;
+    b[4] = 65;
+    b[3] = 200;
+    assert vh_nals(b[0..13]) == 0 and vh_find(b[0..13], 1) == VH_NONE;
+    var o : [16]u8 = undefined;
+    assert vh_strip(b[0..13], o[0..16]) == 0;
+}
+
+test the_meter_counts_the_last_whole_second {
+    var m : [40]u8 = undefined;
+    vh_t_zero(m[0..40]);
+    var i : u64 = 0;
+    while (i < 30) {
+        vf_note(m[0..40], 5000 + i * 33, 5000);
+        i = i + 1;
+    }
+    // still inside second 5: the last whole second is empty; at 6.0 s the 30 frames of second 5 are it
+    assert vf_fps(m[0..40], 5990) == 0;
+    assert vf_fps(m[0..40], 6000) == 30 and vf_kbps(m[0..40], 6100) == 1200;
+    vf_note(m[0..40], 6010, 1000);
+    assert vf_fps(m[0..40], 6500) == 30 and vf_kbps(m[0..40], 6500) == 1200;
+    // a second with one frame, then a pause of three seconds: nothing
+    assert vf_fps(m[0..40], 7000) == 1 and vf_kbps(m[0..40], 7000) == 8;
+    assert vf_fps(m[0..40], 9000) == 0 and vf_kbps(m[0..40], 9000) == 0;
+    vf_note(m[0..40], 9500, 10);
+    assert vf_fps(m[0..40], 9600) == 0;
+}
+
+test the_panel_line_says_fps_size_and_kbits_and_nothing_made_up {
+    var b : [120]u8 = undefined;
+    var n : usize = vh_side_text(b[0..120], 0, "rx", 30, 1280, 720, 1150);
+    n = put_bytes(b[0..120], n, "  ");
+    n = vh_side_text(b[0..120], n, "tx", 0, 1280, 720, 0);
+    const want : []const u8 = "rx 30 fps 1280x720 1150 kbit/s  tx -";
+    assert n == want.len;
+    var i : usize = 0;
+    var same : bool = true;
+    while (i < n) {
+        if (b[i] != want[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same;
+    // no room: nothing added
+    assert vh_side_text(b[0..20], 0, "rx", 30, 1280, 720, 1150) == 0;
+}
+
+test build_7136_and_this_build_read_each_others_parts {
+    var src : [5000]u8 = undefined;
+    t_fill(src[0..5000], 11);
+    var st : [256]u8 = undefined;
+    var buf : [131072]u8 = undefined;
+    var pt : [1176]u8 = undefined;
+    // a version 2 sender (7136) cuts at 1160: five parts of 5000 bytes, put together here byte for byte
+    va_reset(st[0..256]);
+    var k : usize = 0;
+    var v : u32 = VH_NO;
+    while (k < vh_parts_of(5000, VH_PART_V2)) {
+        const c : usize = vh_cut_of(5000, k, VH_PART_V2);
+        const len : usize = vh_part_v(pt[0..1176], 3, 5000, k, true, 0, VH_V2, src[k * 1160..k * 1160 + c]);
+        assert len == VH_HDR + c and vh_ok(pt[0..len]) and pt[14] == VH_V2;
+        v = vh_take(st[0..256], buf[0..131072], pt[0..len], 1);
+        k = k + 1;
+    }
+    assert v == VH_COMPLETE and buf[4639] == src[4639] and buf[1160] == src[1160];
+    // this build sends a 7136 peer version 2 parts, any other peer (or none heard yet) version 3
+    assert vh_send_ver(2) == VH_V2 and vh_send_ver(3) == VH_VERSION and vh_send_ver(9) == VH_VERSION and vh_send_ver(0) == VH_VERSION;
+    // a version 3 part of 1148 is never taken for a version 2 one, nor the other way round
+    const p3 : usize = vh_part_v(pt[0..1176], 4, 5000, 0, false, 0, VH_VERSION, src[0..1148]);
+    assert p3 == VH_HDR + 1148 and vh_ok(pt[0..p3]);
+    pt[14] = VH_V2;
+    assert !vh_ok(pt[0..p3]);
+}

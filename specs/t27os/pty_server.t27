@@ -186,6 +186,7 @@ use t27os::pty_logic::pane_keys_reset;
 use t27os::pty_logic::pane_key_get;
 use t27os::pty_logic::pane_key_shown;
 use t27os::pty_logic::list_flags_key;
+use t27os::pty_logic::list_key_of;
 use t27os::pty_logic::key_put;
 use t27os::pty_logic::plan_pane_keys;
 use t27os::pty_logic::plan_failover;
@@ -218,6 +219,13 @@ use t27os::keys::agent_uses;
 use t27os::keys::provider_env;
 use t27os::keys::env_stripped;
 use t27os::keys::key_fits;
+use t27os::keys::key_fp;
+use t27os::keys::health_pack;
+use t27os::keys::NO_LIVE_KEYS;
+use t27os::pty_logic::hold_set;
+use t27os::pty_logic::load_held;
+use t27os::pty_logic::slot_held;
+use t27os::pty_logic::no_live_note;
 use t27os::keys::profile_agent;
 use t27os::keys::claude_strips;
 use t27os::keys::PROFILE_PROVIDER;
@@ -621,6 +629,36 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32, spawned: bool) -> bool {
     return true;
 }
 
+/// How many key slots hold a dead key back now (pty_logic slot_held).
+fn keys_held(mem: []u8) -> u32 {
+    const now_s : u64 = now_ms(mem) / 1000;
+    var c : u32 = 0;
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        var k : u32 = 0;
+        while (k < MAX_KEYS) {
+            if (slot_held(mem[key_slot(p, k) .. key_slot(p, k) + KEY_CAP], now_s)) { c = c + 1; }
+            k = k + 1;
+        }
+        p = p + 1;
+    }
+    return c;
+}
+
+/// A claude pane that just started with no profile while dead keys are held back gets keys.t27 NO_LIVE_KEYS in
+/// its scrollback (pty_logic no_live_note), not a silent login screen and never a dead key.
+fn note_no_live(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    if (st[base + PF_LIVE] == 0) { return; }
+    if (no_live_note(@as(u32, @intCast(st[base + PF_AGENT])), st[G_PANEK + i * PK + PK_PROF], keys_held(mem)) == false) { return; }
+    mem[O_OUT] = 13;
+    mem[O_OUT + 1] = 10;
+    const n : usize = put_bytes(mem[O_OUT .. O_OUT + 200], 2, NO_LIVE_KEYS);
+    mem[O_OUT + n] = 13;
+    mem[O_OUT + n + 1] = 10;
+    st[base + PF_TOTAL] = ring_append(ring_of(mem, i), st[base + PF_TOTAL], mem[O_OUT .. O_OUT + n + 2], n + 2);
+}
+
 /// In the child: PATH starts with <home>/.t27os/bin, where the updater installs the release's t27b, t27c and tri,
 /// so every pane on every machine runs the same ones (pty_logic path_first).
 fn pane_path_first(st: []const u64, mem: []u8) -> void {
@@ -748,10 +786,14 @@ fn scan_pane(st: []u64, mem: []u8, i: usize, n: usize) -> void {
 /// window's OP_SETKEY frame and a read of the Keychain (load_keys) take. An empty key (plen 0) empties the slot.
 /// False when the provider or number is out of range or the bytes are no key (keys.t27 key_fits); nothing
 /// changes then. The table of times and rests follows the slot: the same key put again keeps its cooldown.
-fn put_key(st: []u64, mem: []u8, sp: u32, sk: u32, src: usize, plen: usize) -> bool {
+/// `taken_back`: the window emptied the slot after a failed check, so the emptied slot holds the old key back from
+/// load_keys (pty_logic hold_set; the fingerprint, never the key).
+fn put_key(st: []u64, mem: []u8, sp: u32, sk: u32, src: usize, plen: usize, taken_back: bool) -> bool {
     if (sp >= PROVIDER_COUNT or sk >= MAX_KEYS or plen > KEY_CAP - 2) { return false; }
     if (plen > 0 and !key_fits(mem[src .. src + plen])) { return false; }
     const ka : usize = key_slot(sp, sk);
+    var old_fp : u64 = 0;
+    if (taken_back and plen == 0 and mem[ka] > 0) { old_fp = key_fp(mem[ka + 1 .. ka + 1 + @as(usize, mem[ka])]); }
     var same : bool = plen > 0 and @as(usize, mem[ka]) == plen;
     var j : usize = 0;
     while (j < plen) {
@@ -766,6 +808,7 @@ fn put_key(st: []u64, mem: []u8, sp: u32, sk: u32, src: usize, plen: usize) -> b
         mem[ka + wp] = 0;
         wp = wp + 1;
     }
+    if (old_fp != 0) { hold_set(mem[ka .. ka + KEY_CAP], old_fp, health_pack(now_ms(mem) / 1000, 401)); }
     key_put(st, sp, sk, plen > 0, same);
     return true;
 }
@@ -789,7 +832,9 @@ fn load_keys(st: []u64, mem: []u8, mask: u32) -> u32 {
                 const n : usize = kc_get_n(p, k, mem[at .. at + KEY_CAP]);
                 if (n > 0) {
                     misses = 0;
-                    if (put_key(st, mem, p, k, at, n)) { got = got + 1; }
+                    // a key the window took back as dead stays out while it is the same key (pty_logic load_held)
+                    const held : bool = load_held(mem[key_slot(p, k) .. key_slot(p, k) + KEY_CAP], key_fp(mem[at .. at + n]), now_ms(mem) / 1000);
+                    if (held == false and put_key(st, mem, p, k, at, n, false)) { got = got + 1; }
                 } else {
                     misses = misses + 1;
                 }
@@ -870,6 +915,7 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         const spawn_agent : u32 = @as(u32, mem[p0]);
         if (keys_reload_due(st, spawn_agent, now_ms(mem), st[G_KLOAD])) { load_keys(st, mem, load_mask_agent(spawn_agent)); }
         launch(st, mem, @as(usize, slot), R_RELAUNCH, true);
+        note_no_live(st, mem, @as(usize, slot));
         save_pane(st, mem, @as(usize, slot));
         reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
         return;
@@ -877,7 +923,7 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
     if (op == OP_SETKEY) {
         // the pane byte is the provider in its low nibble and the key number (0 = key 1) in the high one
         // (keys.t27 setkey_byte): key 1 is the frame this op always had, an older client changes nothing
-        if (!put_key(st, mem, setkey_provider(pane), setkey_number(pane), p0, plen)) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        if (!put_key(st, mem, setkey_provider(pane), setkey_number(pane), p0, plen, true)) { reply(fd, mem, RE_ERR, 0, 0); return; }
         reply(fd, mem, RE_OK, @as(u8, @intCast(pane)), 0);
         return;
     }
@@ -1118,7 +1164,8 @@ fn prepare_dirs(st: []u64, mem: []u8) -> void {
     var n : usize = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], 0, home);
     n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/.t27os");
     mem[O_TMP2 + n] = 0;
-    sys_mkdir(mem[O_TMP2 .. O_TMP2 + n + 1], 493);
+    // the owner's alone (audit P2): 0700
+    sys_mkdir(mem[O_TMP2 .. O_TMP2 + n + 1], 448);
     n = put_bytes(mem[O_TMP2 .. O_TMP2 + 255], n, "/sessions");
     mem[O_TMP2 + n] = 0;
     sys_mkdir(mem[O_TMP2 .. O_TMP2 + n + 1], 493);
@@ -1295,9 +1342,16 @@ fn run_ctl(st: []u64, mem: []u8, wl: usize) -> void {
             say(" agent ");
             print_dec(@as(u64, out[at + 1]), mem);
             say(" state ");
-            print_dec(@as(u64, out[at + 2]), mem);
+            print_dec(@as(u64, shown_state_of(@as(u32, out[at + 2]))), mem);
+            say(" light ");
+            const ln : usize = light_name(shown_light_of(@as(u32, out[at + 2])), mem[O_TMP1 + 3900 .. O_TMP1 + 3930]);
+            sys_write(1, mem[O_TMP1 + 3900 .. O_TMP1 + 3900 + ln], @as(u64, ln));
+            // bits 0 to 2 of the flags byte as before; the rest is the key number (1 to 16) the pane holds (list_key_of)
+            const kof : u32 = list_key_of(@as(u32, out[at + 3]));
             say(" flags ");
-            print_dec(@as(u64, out[at + 3]), mem);
+            print_dec(@as(u64, out[at + 3] % 8), mem);
+            say(" key ");
+            if (kof == 0) { say("-"); } else { print_dec(@as(u64, kof), mem); }
             say("\n");
             at = at + 4;
         }
@@ -1383,8 +1437,8 @@ fn run_install(st: []u64, mem: []u8) -> void {
 }
 
 pub fn main() -> void {
-    var st : [512]u64 = undefined;
-    var mem : [1171712]u8 = undefined;
+    var st : [1024]u64 = undefined;
+    var mem : [1190144]u8 = undefined;
     var z : usize = 0;
     while (z < ST_SIZE) {
         st[z] = 0;
@@ -1427,7 +1481,7 @@ test the_arena_regions_do_not_overlap {
     assert O_KEYS + @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS) * KEY_CAP <= O_CARRY;
     assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
     assert O_SCAN + SCAN_CAP <= MEM_SIZE;
-    assert MEM_SIZE == 1171712;
-    assert ST_SIZE == 512;
+    assert MEM_SIZE == 1190144;
+    assert ST_SIZE == 1024;
     assert CARRY_SLOT == CARRY_CAP + 4;
 }
