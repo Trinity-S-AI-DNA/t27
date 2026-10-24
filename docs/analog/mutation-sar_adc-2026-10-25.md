@@ -45,7 +45,7 @@ The gate line: 13 not killed (5 survived, 8 hung), 13 accepted by the file, 0 ac
 | `miss_margins` (370) | 1 | equivalent: at a margin equal to `worst` the assignment writes the value `worst` already holds | 1 accepted |
 | `err_range` (387, 388) | 2 | equivalent: at an error equal to `lo` or `hi` the assignment writes the value already held | 2 accepted |
 | `fit_grid`, the loop bounds `while (a < FIT_NA)` and `while (b < FIT_NB)` (413, 417) | 2 | test gap: nothing read the grids at their last point or one past it | 2 killed |
-| `fit_cp`, the loop bound (439), the `hits >= best.hits` test (443) and the three mutants of the improvement test `hits > best.hits \|\| v < best.viol` (445) | 5 | test gap: the choice of the first point of most matches and least margin was never pinned against a hand scan | 5 killed |
+| `fit_cp`, the loop bound (439), the `hits >= best.hits` test (443) and the three mutants of the improvement test `hits > best.hits \|\| v < best.viol` (445) | 5 | test gap: the choice of the first point of most matches and least margin was never pinned against a reference scan | 5 killed |
 
 Totals: 14 survivors, of which 9 killed and 5 accepted as equivalent (the rows add up: 4 + 1 + 2 + 2 + 5 = 14; killed
 2 + 2 + 5 = 9; accepted 2 + 1 + 2 = 5). The After runs show exactly the 5 accepted lines alive, which is the check that
@@ -60,8 +60,10 @@ accepted file with that reason. There are no unviable mutants.
 ## The 3 tests added (appended after the last original test, so the accepted line numbers did not move)
 
 - the ideal quantizer clamps below the first code and above the last (7 asserts);
-- `fit_cp` returns the first point of most matches and least margin, equal to a hand scan of the 41 Cp points, on every
-  one of the 41 offsets of the fit grid (164 runtime asserts);
+- `fit_cp` returns the first point of most matches and least margin, equal to a reference scan of the 41 Cp points, on
+  every one of the 41 offsets of the fit grid (164 runtime asserts); the scan is written in the test and reuses
+  `match_count` and `miss_margins`, so it checks the choice rule and not those two functions (the third test pins the
+  first-of-the-ties case on a model built for it);
 - a model one step past the end of a fit grid is not found, and one in the middle of an interval is found at its first
   point; the 31 inputs are built by bisection on the model itself, a low-edge and a high-edge placement alternating, and
   bracketed by 80 mV so that a 2 % gain error cannot slip through (290 runtime asserts).
