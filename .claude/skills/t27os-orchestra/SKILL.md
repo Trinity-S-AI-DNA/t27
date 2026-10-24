@@ -92,3 +92,4 @@ Measured 2026-10-20 on the bench Mac: a claude pane spawned in such a worktree s
 
 - 2026-10-24 2026-10-24: t27os-pty list answered 'no server' (rc 10) from a Terminal tab and from ~/.t27os/t27os-pty while lsof ~/.t27os/pty.sock still showed server 57133 listening and idle; a peer rebuilt the client at 22:11 local. Do not kill the server (it owns peer panes): file a request, keep to non-heavy work. (t27-12028)
 - 2026-10-24 A pane started from a script has a different PATH: its bare tri may lack newer commands such as coverage; call ~/.local/bin/tri by full path. The Bash sandbox cannot reach pty.sock at all; use the Terminal tool, and keep each command short so Allow once stays active. (t27-12028)
+- 2026-10-24 t27b test prints left/right of a failing assert_eq, t27c test-report does not. On this Mac T27_OPENXC7 is unset so t27c preflight returns rc 1; the tools are in ~/openxc7-src and ~/.local/bin (yosys, nextpnr-xilinx, xc7frames2bit) and need no preflight.
