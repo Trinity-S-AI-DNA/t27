@@ -75,4 +75,20 @@ For all 16 faults the FAIL count of `--save` equals the count `tri mutate plant`
 
 Proposed text for the row of `docs/analog/v0.1-release-notes.md` (the release notes are edited after #12063 lands, because the lines next to the row differ on that branch):
 
-> SC-002 met for `t27c seal --save` and `--verify`, not met for the bare `t27c seal <spec>`: with one planted single-line fault in each of the 16 milestone specs, one fault at a time, `--save` refuses 16 of 16 on failing tests of the spec and `--verify` refuses 16 of 16 on a hash mismatch; the bare form runs no tests and exits 0 on all 16 (`docs/analog/seal-refusal-2026-10-25.md`, #12065). Four further single-line faults are caught by no test (the note, finding 4).
+> SC-002 met for `t27c seal --save` and `--verify`, not met for the bare `t27c seal <spec>`: with one planted single-line fault in each of the 16 milestone specs, one fault at a time, `--save` refuses 16 of 16 on failing tests of the spec and `--verify` refuses 16 of 16 on a hash mismatch; the bare form runs no tests and exits 0 on all 16 (`docs/analog/seal-refusal-2026-10-25.md`, #12065). Of four further single-line faults that no test caught, two are now caught (#12067) and two (a step of 1 in `SL_DC_LOAD_R` and in `SL_TG_IN_LOAD`) change no output of the integer-ps model (the note, section 7).
+
+## 7. Finding 4 after #12067 (2026-10-25)
+
+Seven plants, one at a time, with the master-built compiler (`tri mutate plant --t27c <master-built t27c>`; the tool hashes the original before and after, and it was unchanged each time). Tests of the changed specs: `sar_kick_net` 23 -> 24, `sar_logic` 17 -> 18, all pass; the coverage row of both specs reads gaps 0, seal MATCH.
+
+| Line | Plant | Result | Killed by |
+|---|---|---|---|
+| `sar_kick_net.t27:153` | `DR_UP : u8 = 1` -> 7 | KILLED | `the_five_drive_mode_codes_are_the_dense_table_zero_to_four_and_up_is_the_pmos_driver_by_its_number` |
+| `sar_logic.t27:1093` | `return 9999` -> `9998` (rise) | KILLED | `a_chain_error_asked_for_an_edge_the_run_never_made_is_exactly_9999_for_the_fall_and_for_the_rise` |
+| `sar_logic.t27:1085` | `return 9999` -> `9998` (fall; not in the first list) | KILLED | the same test |
+| `sar_logic.t27:177` | `SL_DC_LOAD_R` 33380 -> 33381 and -> 33379 | SURVIVED both | none |
+| `sar_logic.t27:183` | `SL_TG_IN_LOAD` 430 -> 431 and -> 429 | SURVIVED both | none |
+
+The second sources of the three new pins: the arrays of `sar_kick_net` start as `[0] ** 10`, so idle must be code 0, and the five codes are a strictly ascending chain below 5; `p_drive`'s doc comment gives UP through the pmos and DOWN through the nmos; for the 9999 marker, the doc comments of `sl_chain_err_f` and `sl_chain_err_r` ("9999 when there is no such edge") and the run's own edge counts (4 falls and 5 rises, so p = 4 names edges that are not there).
+
+Why the two load constants are not pinned. `sl_arc` is `d0 + k * load / 10000` in whole picoseconds, with k from 246 to 2159, so a step of 1 in the load moves an arc by k / 10000 = 0.02 to 0.22 ps and reaches an output only when it crosses a whole picosecond. Measured on a scratch copy with `t27b test` (two probe tests that sum raw edge times in ps, not committed): the first sums the eleven CK11..CK1 rise times with weights 1 to 11 and reads 22924022; the second sums, over the 21 calibration chains with weights 1 to 21, the fourth clkc fall plus three times the fifth clkc rise and reads 352034858. With `SL_TG_IN_LOAD` 431, `SL_DC_LOAD_R` 33381 and 33379 both sums are identical to the digit, so no output these probes read can tell them apart; with `SL_TG_IN_LOAD` 429 the first sum is 22923967 (55 lower) and the second is unchanged, but no test has a bound that tight (all 18 tests still pass, row above). The probes read the CK edges and the calibration chains; the other edges the 18 tests read were not summed, and the plant tool's SURVIVED on all four plants is the check for those. These are equivalent mutants of the model as it is built, not missing tests. A test that wrote 33380 or 430 as its own expected value would only copy the line. To pin them for real the load would have to become a parameter of the model (then a fit property against ngspice's CK edges could be tested), which changes a constant-bearing function and is outside #12067's boundary.
