@@ -28,6 +28,14 @@
 ; id, the constant-leaf law, i32 arithmetic) is not duplicated. The floor-6 capstone composes
 ; the first TWO-function module: an exported wrapper whose body is one call to a callee that
 ; adds two i64 constants -- 48 bytes, every one pinned.
+; Floor 7 (the emit() composer, ported from cli/t27b/src/wasm32_emitter.rs, PR #11983, port epic
+; #6198) answers the #9103 gap the way macho.t27 does: no slice of slices, but a DESCRIPTOR RECORD
+; AREA -- 24 bytes per fn (name offset and length into a names blob, parameter count, result
+; valtype byte, body offset and length into a bodies blob) -- plus one compose path that assembles
+; the whole module (preamble, type, function, export, code) through the floor-1..5 law fns above.
+; The capstone tests pin the live-scalar closure byte for byte: the 87-byte two-fn module
+; (arrival_frame + latency_ms, the build Node's WebAssembly verified on the emitter branch) and
+; the 117-byte trio (paints_due joined, Node-verified 2026-10-24).
 ; Every fn writes into a caller buffer at an offset and returns the new offset -- the same contract
 ; as the Mach-O port (specs/tri/t27b/macho.t27) -- so the emitter composes sections without an
 ; intermediate allocation. The tests pin the canonical LEB128 vectors, the exact preamble bytes, the
@@ -1260,4 +1268,540 @@ test whole_module_calling_an_i64_callee_pins_every_byte {
     assert buf[39] == 0x42 and buf[40] == 0x16 and buf[41] == 0x7C and buf[42] == 0x0B;
     assert buf[43] == 0x04 and buf[44] == 0x00 and buf[45] == 0x10 and buf[46] == 0x00;
     assert buf[47] == 0x0B;
+}
+
+// -- Floor 7: the emit() composer (port epic #6198, ported from the working
+// reference cli/t27b/src/wasm32_emitter.rs, PR #11983). t27 has no slice of
+// slices (#9103), so the export set arrives as a DESCRIPTOR RECORD AREA -- the
+// macho.t27 pattern: two blobs (names, bodies) plus one fixed-stride record
+// per fn. The compose path assembles preamble + type + function + export +
+// code sections through the floor-1..5 law fns and nothing else. --
+
+/// One fn descriptor: 24 bytes, six little-endian u32 words.
+pub const DESC_ROW : usize = 24;
+
+/// The parameter-count bound of a descriptor: the i32-carrier params scratch
+/// the type-section builder fills is this wide. The M-B law carries scalar
+/// exports (the live-closure trio tops out at two parameters); a descriptor
+/// beyond the bound fails closed below, exactly as the emitter refuses the
+/// fn by name.
+pub const MAX_DESC_PARAMS : usize = 32;
+
+/// The u32 at byte `at` of a table, little-endian (the macho.t27 reader shape).
+pub fn get_u32le(t: []const u8, at: usize) -> u32 {
+    var v : u32 = t[at] as u32;
+    v = v | ((t[at + 1] as u32) << 8);
+    v = v | ((t[at + 2] as u32) << 16);
+    v = v | ((t[at + 3] as u32) << 24);
+    return v;
+}
+
+/// One u32 into out at at, little-endian; returns the new offset.
+pub fn put_u32le(out: []u8, at: usize, v: u32) -> usize {
+    out[at] = @intCast(v & 0xFF);
+    out[at + 1] = @intCast((v >> 8) & 0xFF);
+    out[at + 2] = @intCast((v >> 16) & 0xFF);
+    out[at + 3] = @intCast((v >> 24) & 0xFF);
+    return at + 4;
+}
+
+/// One fn descriptor into out at at: where its export name lives in the names
+/// blob (offset, length), how many i32-carrier parameters it takes, its result
+/// valtype byte, and where its lowered body lives in the bodies blob (offset,
+/// length). Returns at + DESC_ROW; the caller strides records back to back.
+pub fn desc_put(out: []u8, at: usize, name_off: u32, name_len: u32, nparams: u32, result: u8, body_off: u32, body_len: u32) -> usize {
+    var n : usize = put_u32le(out, at, name_off);
+    n = put_u32le(out, n, name_len);
+    n = put_u32le(out, n, nparams);
+    n = put_u32le(out, n, result as u32);
+    n = put_u32le(out, n, body_off);
+    return put_u32le(out, n, body_len);
+}
+
+/// How many fn descriptors the area holds; a partial row is no record at all.
+pub fn desc_count(descs: []const u8) -> usize {
+    return descs.len / DESC_ROW;
+}
+
+/// Fn i's export name: offset into the names blob.
+pub fn desc_name_off(descs: []const u8, i: usize) -> u32 {
+    return get_u32le(descs, DESC_ROW * i);
+}
+
+/// Fn i's export name length.
+pub fn desc_name_len(descs: []const u8, i: usize) -> u32 {
+    return get_u32le(descs, DESC_ROW * i + 4);
+}
+
+/// Fn i's parameter count (all on the i32 carrier).
+pub fn desc_nparams(descs: []const u8, i: usize) -> u32 {
+    return get_u32le(descs, DESC_ROW * i + 8);
+}
+
+/// Fn i's result valtype byte.
+pub fn desc_result(descs: []const u8, i: usize) -> u8 {
+    return @intCast(get_u32le(descs, DESC_ROW * i + 12) & 0xFF);
+}
+
+/// Fn i's lowered body: offset into the bodies blob.
+pub fn desc_body_off(descs: []const u8, i: usize) -> u32 {
+    return get_u32le(descs, DESC_ROW * i + 16);
+}
+
+/// Fn i's lowered body length -- the instruction program WITH its trailing
+/// 0x0B end byte, locals always the zero-group count 0x00 (code_entry writes
+/// that byte itself).
+pub fn desc_body_len(descs: []const u8, i: usize) -> u32 {
+    return get_u32le(descs, DESC_ROW * i + 20);
+}
+
+/// True when every descriptor is on the law: whole rows only, names and
+/// bodies inside their blobs, a legal valtype result, and a parameter count
+/// the params scratch holds. The composer and every section builder fail
+/// closed (write nothing, return 0) unless this holds.
+pub fn descs_ok(names: []const u8, descs: []const u8, bodies: []const u8) -> bool {
+    if (descs.len % DESC_ROW != 0) { return false; }
+    var i : usize = 0;
+    while (i < desc_count(descs)) {
+        if (desc_name_off(descs, i) + desc_name_len(descs, i) > names.len as u32) { return false; }
+        if (desc_body_off(descs, i) + desc_body_len(descs, i) > bodies.len as u32) { return false; }
+        var r : u8 = desc_result(descs, i);
+        if (r != VT_I32 and r != VT_I64 and r != VT_F32 and r != VT_F64) { return false; }
+        if (desc_nparams(descs, i) as usize > MAX_DESC_PARAMS) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Copies src to out at at; the position after it.
+pub fn copy_bytes(out: []u8, at: usize, src: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < src.len) {
+        out[at + i] = src[i];
+        i = i + 1;
+    }
+    return at + src.len;
+}
+
+/// The type-section body over the descriptors: vec_prefix(count), then one
+/// functype_full per fn -- its own parameter vector of i32-carrier bytes and
+/// its own result byte. One type per fn, no dedup: exactly the emitter's walk.
+pub fn type_body(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    var n : usize = vec_prefix(out, 0, k as u32);
+    var i : usize = 0;
+    while (i < k) {
+        var ps : [MAX_DESC_PARAMS]u8 = undefined;
+        var np : usize = desc_nparams(descs, i) as usize;
+        var j : usize = 0;
+        while (j < np) {
+            ps[j] = VT_I32;
+            j = j + 1;
+        }
+        var rs : [1]u8 = undefined;
+        rs[0] = desc_result(descs, i);
+        n = functype_full(out, n, ps[0..np], rs[0..1]);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The function-section body: vec_prefix(count), then one func_entry per fn --
+/// fn i has type index i (the type section carries one type per fn).
+pub fn func_body(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    var n : usize = vec_prefix(out, 0, k as u32);
+    var i : usize = 0;
+    while (i < k) {
+        n = func_entry(out, n, i as u32);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The export-section body: vec_prefix(count), then one export_entry per fn
+/// under its own name at function index i.
+pub fn export_body(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    var n : usize = vec_prefix(out, 0, k as u32);
+    var i : usize = 0;
+    while (i < k) {
+        var a : usize = desc_name_off(descs, i) as usize;
+        var b : usize = a + desc_name_len(descs, i) as usize;
+        n = export_entry(out, n, names[a..b], i as u32);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The joined, size-prefixed code entries (code_section's entries_joined, no
+/// vector count -- code_section writes that): one code_entry per fn, locals
+/// zero groups, over the fn's lowered body straight from the blob.
+pub fn code_entries(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < k) {
+        var a : usize = desc_body_off(descs, i) as usize;
+        var b : usize = a + desc_body_len(descs, i) as usize;
+        n = code_entry(out, n, 0, bodies[a..b]);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The whole module: preamble, then the type, function, export and code
+/// sections, each body built in the caller's scratch and framed through the
+/// law fns -- the emit() composer with per-fn descriptors instead of a
+/// Vec<(index, Ty, nparams, Body)>. Returns the module's end offset, or 0
+/// (nothing written) when the descriptors are off the law or the set is
+/// empty -- the emitter refuses the empty module by name, and so does this.
+pub fn compose_module(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8, scratch: []u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    if (k == 0) { return 0; }
+    var n : usize = module_preamble(out, 0);
+    var sn : usize = type_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_TYPE, scratch[0..sn]);
+    sn = func_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_FUNC, scratch[0..sn]);
+    sn = export_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_EXPORT, scratch[0..sn]);
+    sn = code_entries(scratch, names, descs, bodies);
+    n = code_section(out, n, k as u32, scratch[0..sn]);
+    return n;
+}
+
+test desc_put_and_the_accessors_round_trip {
+    var d : [48]u8 = undefined;
+    var dn : usize = desc_put(d[0..48], 0, 3, 13, 1, VT_I32, 7, 9);
+    dn = desc_put(d[0..48], dn, 16, 10, 2, VT_I64, 16, 12);
+    assert dn == 48 and desc_count(d[0..48]) == 2;
+    // the first record, read back word by word
+    assert desc_name_off(d[0..48], 0) == 3 and desc_name_len(d[0..48], 0) == 13;
+    assert desc_nparams(d[0..48], 0) == 1 and desc_result(d[0..48], 0) == VT_I32;
+    assert desc_body_off(d[0..48], 0) == 7 and desc_body_len(d[0..48], 0) == 9;
+    // the second record sits one row down -- a stride confusion is caught here
+    assert desc_name_off(d[0..48], 1) == 16 and desc_nparams(d[0..48], 1) == 2;
+    assert desc_result(d[0..48], 1) == VT_I64 and desc_body_len(d[0..48], 1) == 12;
+    // the bytes ARE little-endian u32s: record 0's name_off 3 is 03 00 00 00
+    assert d[0] == 0x03 and d[1] == 0x00 and d[2] == 0x00 and d[3] == 0x00;
+    // word 3 carries the valtype byte 0x7F in its low byte only
+    assert d[12] == 0x7F and d[13] == 0x00 and d[14] == 0x00 and d[15] == 0x00;
+}
+
+test desc_count_reads_whole_rows_only {
+    var d : [72]u8 = undefined;
+    var i : usize = 0;
+    while (i < 72) { d[i] = 0; i = i + 1; }
+    assert desc_count(d[0..72]) == 3;
+    assert desc_count(d[0..71]) == 2;
+    assert desc_count(d[0..24]) == 1;
+    assert desc_count(d[0..0]) == 0;
+    assert descs_ok(d[0..71], d[0..71], d[0..71]) == false;
+}
+
+test descs_ok_gates_the_blob_bounds {
+    var names : [6]u8 = undefined;
+    var i : usize = 0;
+    while (i < 6) { names[i] = 0x61; i = i + 1; }
+    var bodies : [4]u8 = undefined;
+    i = 0;
+    while (i < 4) { bodies[i] = 0x0B; i = i + 1; }
+    var d : [24]u8 = undefined;
+    var w : usize = desc_put(d[0..24], 0, 0, 6, 0, VT_I32, 0, 4);
+    assert w == 24;
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == true;
+    // a name run past the names blob
+    w = desc_put(d[0..24], 0, 0, 7, 0, VT_I32, 0, 4);
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == false;
+    // a body run past the bodies blob
+    w = desc_put(d[0..24], 0, 0, 6, 0, VT_I32, 0, 5);
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == false;
+    // a result byte no valtype maps to
+    w = desc_put(d[0..24], 0, 0, 6, 0, 0x43, 0, 4);
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == false;
+    // more parameters than the scratch holds
+    w = desc_put(d[0..24], 0, 0, 6, 33, VT_I32, 0, 4);
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == false;
+    // 32 parameters is inside the law
+    w = desc_put(d[0..24], 0, 0, 6, 32, VT_I32, 0, 4);
+    assert descs_ok(names[0..6], d[0..24], bodies[0..4]) == true;
+}
+
+test type_body_pins_the_trio_functypes {
+    // one row per fn: (name_off, name_len, nparams, VT_I32, body_off, body_len)
+    var d : [72]u8 = undefined;
+    desc_put(d[0..72], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..72], DESC_ROW, 13, 10, 1, VT_I32, 9, 9);
+    desc_put(d[0..72], 2 * DESC_ROW, 23, 10, 2, VT_I32, 18, 12);
+    // the blobs only need to cover the runs the descriptors name
+    var names : [33]u8 = undefined;
+    var bodies : [30]u8 = undefined;
+    var i : usize = 0;
+    while (i < 33) { names[i] = 0x61; i = i + 1; }
+    i = 0;
+    while (i < 30) { bodies[i] = 0x0B; i = i + 1; }
+    var out : [24]u8 = undefined;
+    const n : usize = type_body(out[0..24], names[0..33], d[0..72], bodies[0..30]);
+    assert n == 17;
+    // vec count 3, then (i32)->(i32), (i32)->(i32), (i32,i32)->(i32)
+    assert out[0] == 0x03;
+    assert out[1] == 0x60 and out[2] == 0x01 and out[3] == VT_I32 and out[4] == 0x01 and out[5] == VT_I32;
+    assert out[6] == 0x60 and out[7] == 0x01 and out[8] == VT_I32 and out[9] == 0x01 and out[10] == VT_I32;
+    assert out[11] == 0x60 and out[12] == 0x02 and out[13] == VT_I32 and out[14] == VT_I32;
+    assert out[15] == 0x01 and out[16] == VT_I32;
+}
+
+test func_body_and_export_body_pin_the_trio {
+    var d : [72]u8 = undefined;
+    desc_put(d[0..72], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..72], DESC_ROW, 13, 10, 1, VT_I32, 9, 9);
+    desc_put(d[0..72], 2 * DESC_ROW, 23, 10, 2, VT_I32, 18, 12);
+    // names blob: arrival_frame paints_due latency_ms, 33 bytes back to back
+    var names : [33]u8 = undefined;
+    var nn : usize = copy_bytes(names[0..33], 0, "arrival_frame");
+    nn = copy_bytes(names[0..33], nn, "paints_due");
+    nn = copy_bytes(names[0..33], nn, "latency_ms");
+    assert nn == 33;
+    var bodies : [30]u8 = undefined;
+    var i : usize = 0;
+    while (i < 30) { bodies[i] = 0x0B; i = i + 1; }
+    // the function section body: count 3, type index i for fn i
+    var fb : [8]u8 = undefined;
+    const fn3 : usize = func_body(fb[0..8], names[0..33], d[0..72], bodies[0..30]);
+    assert fn3 == 4;
+    assert fb[0] == 0x03 and fb[1] == 0x00 and fb[2] == 0x01 and fb[3] == 0x02;
+    // the export section body: count 3, then name/kind/index per fn -- 43 bytes
+    var eb : [48]u8 = undefined;
+    const en : usize = export_body(eb[0..48], names[0..33], d[0..72], bodies[0..30]);
+    assert en == 43;
+    assert eb[0] == 0x03;
+    // arrival_frame (13), kind func, index 0
+    assert eb[1] == 0x0D and eb[2] == 'a' and eb[14] == 'e' and eb[15] == 0x00 and eb[16] == 0x00;
+    // paints_due (10), kind func, index 1
+    assert eb[17] == 0x0A and eb[18] == 'p' and eb[27] == 'e' and eb[28] == 0x00 and eb[29] == 0x01;
+    // latency_ms (10), kind func, index 2
+    assert eb[30] == 0x0A and eb[31] == 'l' and eb[40] == 's' and eb[41] == 0x00 and eb[42] == 0x02;
+}
+
+test code_entries_pin_the_trio_bodies {
+    var d : [72]u8 = undefined;
+    desc_put(d[0..72], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..72], DESC_ROW, 13, 10, 1, VT_I32, 9, 9);
+    desc_put(d[0..72], 2 * DESC_ROW, 23, 10, 2, VT_I32, 18, 12);
+    var names : [33]u8 = undefined;
+    var i : usize = 0;
+    while (i < 33) { names[i] = 0x61; i = i + 1; }
+    // the bodies blob: three lowered programs, each with its end byte
+    var bodies : [30]u8 = undefined;
+    var s : [16]u8 = undefined;
+    var z : usize = local_get(s[0..16], 0, 0);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_div_u(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = end(s[0..16], z);
+    var bn : usize = copy_bytes(bodies[0..30], 0, s[0..z]);
+    assert bn == 9;
+    z = i32_const(s[0..16], 0, 0);
+    z = i32_const(s[0..16], z, 1);
+    z = local_get(s[0..16], z, 0);
+    z = i32_eqz(s[0..16], z);
+    z = select(s[0..16], z);
+    z = end(s[0..16], z);
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    assert bn == 18;
+    z = local_get(s[0..16], 0, 1);
+    z = local_get(s[0..16], z, 0);
+    z = i32_sub(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_mul(s[0..16], z);
+    z = end(s[0..16], z);
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    assert bn == 30;
+    // the joined entries: 11 + 11 + 14 = 36 bytes, no vector count
+    var out : [40]u8 = undefined;
+    const n : usize = code_entries(out[0..40], names[0..33], d[0..72], bodies[0..30]);
+    assert n == 36;
+    // arrival_frame: size 0A, locals 00, get 0, const 16, div_u, const 1, add, end
+    assert out[0] == 0x0A and out[1] == 0x00 and out[2] == 0x20 and out[3] == 0x00;
+    assert out[4] == 0x41 and out[5] == 0x10 and out[6] == 0x6E and out[7] == 0x41;
+    assert out[8] == 0x01 and out[9] == 0x6A and out[10] == 0x0B;
+    // paints_due: size 0A, locals 00, const 0, const 1, get 0, eqz, select, end
+    assert out[11] == 0x0A and out[12] == 0x00 and out[13] == 0x41 and out[14] == 0x00;
+    assert out[15] == 0x41 and out[16] == 0x01 and out[17] == 0x20 and out[18] == 0x00;
+    assert out[19] == 0x45 and out[20] == 0x1B and out[21] == 0x0B;
+    // latency_ms: size 0D, locals 00, get 1, get 0, sub, const 1, add, const 16, mul, end
+    assert out[22] == 0x0D and out[23] == 0x00 and out[24] == 0x20 and out[25] == 0x01;
+    assert out[26] == 0x20 and out[27] == 0x00 and out[28] == 0x6B and out[29] == 0x41;
+    assert out[30] == 0x01 and out[31] == 0x6A and out[32] == 0x41 and out[33] == 0x10;
+    assert out[34] == 0x6C and out[35] == 0x0B;
+}
+
+test compose_module_pins_the_87_byte_live_scalar_duo {
+    // The live-scalar closure as Node's WebAssembly verified it on the emitter
+    // branch: arrival_frame + latency_ms, the 87-byte two-fn module, every
+    // byte pinned. (Node, 2026-10-24: arrival_frame(33)=3, latency_ms(2,7)=96.)
+    var names : [23]u8 = undefined;
+    var nn : usize = copy_bytes(names[0..23], 0, "arrival_frame");
+    nn = copy_bytes(names[0..23], nn, "latency_ms");
+    assert nn == 23;
+    var bodies : [21]u8 = undefined;
+    var s : [16]u8 = undefined;
+    var z : usize = local_get(s[0..16], 0, 0);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_div_u(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = end(s[0..16], z);
+    var bn : usize = copy_bytes(bodies[0..21], 0, s[0..z]);
+    assert bn == 9;
+    z = local_get(s[0..16], 0, 1);
+    z = local_get(s[0..16], z, 0);
+    z = i32_sub(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_mul(s[0..16], z);
+    z = end(s[0..16], z);
+    bn = copy_bytes(bodies[0..21], bn, s[0..z]);
+    assert bn == 21;
+    var d : [48]u8 = undefined;
+    desc_put(d[0..48], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..48], DESC_ROW, 13, 10, 2, VT_I32, 9, 12);
+    var buf : [96]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    const n : usize = compose_module(buf[0..96], names[0..23], d[0..48], bodies[0..21], scratch[0..64]);
+    assert n == 87;
+    // preamble: magic and version
+    assert buf[0] == 0x00 and buf[1] == 0x61 and buf[2] == 0x73 and buf[3] == 0x6D;
+    assert buf[4] == 0x01 and buf[5] == 0x00 and buf[6] == 0x00 and buf[7] == 0x00;
+    // type section: 12-byte body -- count 2, (i32)->(i32), (i32,i32)->(i32)
+    assert buf[8] == 0x01 and buf[9] == 0x0C and buf[10] == 0x02;
+    assert buf[11] == 0x60 and buf[12] == 0x01 and buf[13] == VT_I32 and buf[14] == 0x01 and buf[15] == VT_I32;
+    assert buf[16] == 0x60 and buf[17] == 0x02 and buf[18] == VT_I32 and buf[19] == VT_I32;
+    assert buf[20] == 0x01 and buf[21] == VT_I32;
+    // function section: count 2, types 0 and 1
+    assert buf[22] == 0x03 and buf[23] == 0x03 and buf[24] == 0x02 and buf[25] == 0x00 and buf[26] == 0x01;
+    // export section: 30-byte body -- count 2, both names, kind func
+    assert buf[27] == 0x07 and buf[28] == 0x1E and buf[29] == 0x02;
+    assert buf[30] == 0x0D and buf[31] == 'a' and buf[43] == 'e' and buf[44] == 0x00 and buf[45] == 0x00;
+    assert buf[46] == 0x0A and buf[47] == 'l' and buf[56] == 's' and buf[57] == 0x00 and buf[58] == 0x01;
+    // code section: 26-byte body -- count 2, the two size-prefixed entries
+    assert buf[59] == 0x0A and buf[60] == 0x1A and buf[61] == 0x02;
+    assert buf[62] == 0x0A and buf[63] == 0x00 and buf[64] == 0x20 and buf[65] == 0x00;
+    assert buf[66] == 0x41 and buf[67] == 0x10 and buf[68] == 0x6E and buf[69] == 0x41;
+    assert buf[70] == 0x01 and buf[71] == 0x6A and buf[72] == 0x0B;
+    assert buf[73] == 0x0D and buf[74] == 0x00 and buf[75] == 0x20 and buf[76] == 0x01;
+    assert buf[77] == 0x20 and buf[78] == 0x00 and buf[79] == 0x6B and buf[80] == 0x41;
+    assert buf[81] == 0x01 and buf[82] == 0x6A and buf[83] == 0x41 and buf[84] == 0x10;
+    assert buf[85] == 0x6C and buf[86] == 0x0B;
+}
+
+test compose_module_pins_the_117_byte_live_scalar_trio {
+    // The full closure with paints_due (the select pattern): 117 bytes, every
+    // one pinned. Node's WebAssembly instantiated this exact shape 2026-10-24
+    // (arrival_frame(16)=2, paints_due(0)=0, paints_due(5)=1, latency_ms(2,7)=96).
+    var names : [33]u8 = undefined;
+    var nn : usize = copy_bytes(names[0..33], 0, "arrival_frame");
+    nn = copy_bytes(names[0..33], nn, "paints_due");
+    nn = copy_bytes(names[0..33], nn, "latency_ms");
+    var bodies : [30]u8 = undefined;
+    var s : [16]u8 = undefined;
+    var z : usize = local_get(s[0..16], 0, 0);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_div_u(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = end(s[0..16], z);
+    var bn : usize = copy_bytes(bodies[0..30], 0, s[0..z]);
+    z = i32_const(s[0..16], 0, 0);
+    z = i32_const(s[0..16], z, 1);
+    z = local_get(s[0..16], z, 0);
+    z = i32_eqz(s[0..16], z);
+    z = select(s[0..16], z);
+    z = end(s[0..16], z);
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    z = local_get(s[0..16], 0, 1);
+    z = local_get(s[0..16], z, 0);
+    z = i32_sub(s[0..16], z);
+    z = i32_const(s[0..16], z, 1);
+    z = i32_add(s[0..16], z);
+    z = i32_const(s[0..16], z, 16);
+    z = i32_mul(s[0..16], z);
+    z = end(s[0..16], z);
+    bn = copy_bytes(bodies[0..30], bn, s[0..z]);
+    assert bn == 30;
+    var d : [72]u8 = undefined;
+    desc_put(d[0..72], 0, 0, 13, 1, VT_I32, 0, 9);
+    desc_put(d[0..72], DESC_ROW, 13, 10, 1, VT_I32, 9, 9);
+    desc_put(d[0..72], 2 * DESC_ROW, 23, 10, 2, VT_I32, 18, 12);
+    var buf : [128]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    const n : usize = compose_module(buf[0..128], names[0..33], d[0..72], bodies[0..30], scratch[0..64]);
+    assert n == 117;
+    // preamble
+    assert buf[0] == 0x00 and buf[1] == 0x61 and buf[2] == 0x73 and buf[3] == 0x6D;
+    assert buf[4] == 0x01 and buf[5] == 0x00 and buf[6] == 0x00 and buf[7] == 0x00;
+    // type section: 17-byte body, three functypes
+    assert buf[8] == 0x01 and buf[9] == 0x11 and buf[10] == 0x03;
+    assert buf[11] == 0x60 and buf[12] == 0x01 and buf[13] == VT_I32 and buf[14] == 0x01 and buf[15] == VT_I32;
+    assert buf[16] == 0x60 and buf[17] == 0x01 and buf[18] == VT_I32 and buf[19] == 0x01 and buf[20] == VT_I32;
+    assert buf[21] == 0x60 and buf[22] == 0x02 and buf[23] == VT_I32 and buf[24] == VT_I32;
+    assert buf[25] == 0x01 and buf[26] == VT_I32;
+    // function section: count 3, type indices 0 1 2
+    assert buf[27] == 0x03 and buf[28] == 0x04 and buf[29] == 0x03;
+    assert buf[30] == 0x00 and buf[31] == 0x01 and buf[32] == 0x02;
+    // export section: 43-byte body, three names
+    assert buf[33] == 0x07 and buf[34] == 0x2B and buf[35] == 0x03;
+    assert buf[36] == 0x0D and buf[37] == 'a' and buf[49] == 'e' and buf[50] == 0x00 and buf[51] == 0x00;
+    assert buf[52] == 0x0A and buf[53] == 'p' and buf[62] == 'e' and buf[63] == 0x00 and buf[64] == 0x01;
+    assert buf[65] == 0x0A and buf[66] == 'l' and buf[75] == 's' and buf[76] == 0x00 and buf[77] == 0x02;
+    // code section: 37-byte body, count 3
+    assert buf[78] == 0x0A and buf[79] == 0x25 and buf[80] == 0x03;
+    // arrival_frame entry: size 0A, locals 00, the 8-byte program, end
+    assert buf[81] == 0x0A and buf[82] == 0x00 and buf[83] == 0x20 and buf[84] == 0x00;
+    assert buf[85] == 0x41 and buf[86] == 0x10 and buf[87] == 0x6E and buf[88] == 0x41;
+    assert buf[89] == 0x01 and buf[90] == 0x6A and buf[91] == 0x0B;
+    // paints_due entry: size 0A, locals 00, the select program, end
+    assert buf[92] == 0x0A and buf[93] == 0x00 and buf[94] == 0x41 and buf[95] == 0x00;
+    assert buf[96] == 0x41 and buf[97] == 0x01 and buf[98] == 0x20 and buf[99] == 0x00;
+    assert buf[100] == 0x45 and buf[101] == 0x1B and buf[102] == 0x0B;
+    // latency_ms entry: size 0D, locals 00, the 11-byte program, end
+    assert buf[103] == 0x0D and buf[104] == 0x00 and buf[105] == 0x20 and buf[106] == 0x01;
+    assert buf[107] == 0x20 and buf[108] == 0x00 and buf[109] == 0x6B and buf[110] == 0x41;
+    assert buf[111] == 0x01 and buf[112] == 0x6A and buf[113] == 0x41 and buf[114] == 0x10;
+    assert buf[115] == 0x6C and buf[116] == 0x0B;
+}
+
+test compose_module_fails_closed {
+    var names : [5]u8 = undefined;
+    var i : usize = 0;
+    while (i < 5) { names[i] = 0x61; i = i + 1; }
+    var bodies : [3]u8 = undefined;
+    i = 0;
+    while (i < 3) { bodies[i] = 0x0B; i = i + 1; }
+    var buf : [16]u8 = undefined;
+    var scratch : [16]u8 = undefined;
+    i = 0;
+    while (i < 16) { buf[i] = 0xAA; i = i + 1; }
+    // an empty descriptor set is the module the emitter refuses by name
+    var none : [1]u8 = [0];
+    assert compose_module(buf[0..16], names[0..5], none[0..0], bodies[0..3], scratch[0..16]) == 0;
+    // a descriptor off the law: nothing written, the buffer stands
+    var bad : [24]u8 = undefined;
+    desc_put(bad[0..24], 0, 0, 9, 0, VT_I32, 0, 3);
+    assert compose_module(buf[0..16], names[0..5], bad[0..24], bodies[0..3], scratch[0..16]) == 0;
+    assert buf[0] == 0xAA and buf[15] == 0xAA;
+    // a partial row is no record set at all
+    desc_put(bad[0..24], 0, 0, 5, 0, VT_I32, 0, 3);
+    assert descs_ok(names[0..5], bad[0..23], bodies[0..3]) == false;
+    assert compose_module(buf[0..16], names[0..5], bad[0..23], bodies[0..3], scratch[0..16]) == 0;
 }
