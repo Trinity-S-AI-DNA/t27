@@ -17,7 +17,7 @@ Build A is the form of the ss control in the tt note. It is a receipt of the sf 
 
 ## 2. The run
 
-- Source: the specs of this PR with `BOARD_CORNER = 4` set for the generation only (the committed value is 0). `top.v` is `t27b verilog` of the board spec, `data.v` is `t27c gen-verilog` of the data spec.
+- Source: the data spec as it stood before the four runs were typed into it, with `BOARD_CORNER = 4` and the expected word read from the tt run (`ex <= TT_RUN[idx]` in the generated `data.v`). The committed spec differs from that in the runs and the tests it adds, in the committed value of `BOARD_CORNER` (0), and in `ex = rom_ex(BOARD_CORNER, idx)`, which is the form of Build B. `top.v` is `t27b verilog` of the board spec, `data.v` is `t27c gen-verilog` of the data spec.
 - Toolchain: yosys 0.67+post (git b8e7da6f40ae8f552c116bf6c359b07c6533e159), nextpnr-xilinx git b608fd2c950f3b4e2814540efbbc5841dd35263e, prjxray c9f02d8576042325425824647ab5555b1bc77833 with prjxray-db-full 517d66a383676cb971177ea92b0ff3b6ea6e8690, chipdb `xc7a200tfbg484-2.bin` md5 `59f828c441e6e6081bfee63ff994660e`, `openFPGALoader v1.1.1`. The yosys script, the nextpnr, fasm2frames and xc7frames2bit commands are the ones of section 2 of the tt note, run in the T27 OS pane.
 - Board and cable: ALINX AX7203, `xc7a200tfbg484-2`; Digilent HS2 found by `openFPGALoader -c digilent_hs2 --detect` (idcode 0x3636093) at `--busdev-num 0:4` (the bus renumbers, so it is detected first). UART: CP2102N, 115200 baud 8N1, pin N15, one reader started before the load, 7 s capture.
 - Programming: SRAM only (no `-f`, no `-m`). No flash and no eFUSE was written.
@@ -60,7 +60,9 @@ Y is the sf sample and E the tt one, so the FAIL lines here are the prediction, 
 
 ## 5. Tests
 
-`t27c test-report specs/fpga/psp103_inv_ax7203.t27`: 16 tests, 16 pass, 0 fail, 0 vacuous; the new `the_spec_runs_of_the_other_four_corners_are_the_words_the_board_printed` runs the machine on each corner's tables and checks every one of the 400 samples and the fold against `EXP_S_<c>_Q` and `PIN_<c>_RUN`. `t27c test-report specs/analog/mos_psp103_data.t27`: 13 tests; the new `the_rom_choice_reads_each_corners_tables_and_run` reads all five corners through the ROM port the board uses.
+`t27c test-report specs/fpga/psp103_inv_ax7203.t27`: 16 tests, 16 pass, 0 fail, 0 vacuous; the new `the_spec_runs_of_the_other_four_corners_are_the_words_the_board_printed` runs the machine on each corner's tables and checks every one of the 400 samples and the fold against `EXP_S_<c>_Q` and `PIN_<c>_RUN`. `t27c test-report specs/analog/mos_psp103_data.t27`: 13 tests, 13 pass, 0 fail, 0 vacuous; the new `the_rom_choice_reads_each_corners_tables_and_run` reads all five corners through the ROM port the board uses.
+
+Both counts are from the T27 OS lab (`Trinity-S-AI-DNA/t27os`, workflow `lab.yml`, run on commit `6d705836fedebbf5bdfe1c8ec3418814d5f78954`, receipt `runs/6d705836fedebbf5bdfe1c8ec3418814d5f78954.5ff8b0d1.summary.txt`), on the t27c leg and on the t27b leg; they were not run on the Mac.
 
 ## 6. Build B
 
