@@ -3284,6 +3284,20 @@ the parser used to read it as `{}` followed by a negation",
         // Parse parameter list
         self.expect(TokenKind::LParen)?;
         while self.current.kind != TokenKind::RParen && self.current.kind != TokenKind::Eof {
+            // #11940 slice 1: comptime TYPE param, stored (name, "type").
+            // A param NAMED comptime is followed by ':'; a value param is
+            // refused at the 'type' check.
+            if self.current.kind == TokenKind::Ident && self.current.lexeme == "comptime" && self.peek.kind == TokenKind::Ident {
+                self.advance(); let name = self.current.lexeme.clone(); self.advance(); self.expect(TokenKind::Colon)?;
+                if self.current.kind != TokenKind::Ident || self.current.lexeme != "type" {
+                    return Err(format!("Comptime fn parameters must be ': type' (slice 1 of #11940), got '{}' at line {}", self.current.lexeme, self.current.line));
+                }
+                self.advance(); // consume 'type'
+                decl.params.push((name, "type".to_string()));
+                if self.current.kind == TokenKind::Comma { self.advance(); }
+                continue;
+            }
+
             // Parse param name.
             //
             // A KEYWORD HERE IS A NAME. The skip below was written as error recovery and
@@ -9095,7 +9109,7 @@ impl Codegen {
         // to pick @truncate vs @intCast).
         self.zig_var_types.clear();
         for (pname, ptype) in &node.params {
-            if pname != "self" {
+            if pname != "self" && ptype != "type" { // #11940: a type param is not a value
                 self.zig_var_types.insert(pname.clone(), ptype.clone());
             }
         }
@@ -9130,7 +9144,7 @@ impl Codegen {
         let shadowed: Vec<String> = node
             .params
             .iter()
-            .filter(|(pname, ptype)| pname != "self" && body_muts.contains(pname) && (!(ptype.trim_start().starts_with('*') || ptype.trim_start().starts_with("[]")) || reassigned(&node.children, pname)))
+            .filter(|(pname, ptype)| pname != "self" && ptype.trim() != "type" && body_muts.contains(pname) && (!(ptype.trim_start().starts_with('*') || ptype.trim_start().starts_with("[]")) || reassigned(&node.children, pname)))
             .map(|(pname, _)| pname.clone())
             .collect();
 
@@ -9138,8 +9152,10 @@ impl Codegen {
         // way -- signature and body -- because the `_arg` RE-BINDING used for
         // mutable parameters would recreate the collision as a local.
         self.param_renames.clear();
-        for (pname, _) in node.params.iter() {
-            if pname != "self"
+        for (pname, ptype) in node.params.iter() {
+            // #11940: the W735 rename must not touch a type param -- a renamed
+            // `T_arg` would break every `T` the signature and body still spell.
+            if pname != "self" && ptype != "type"
                 && !shadowed.contains(pname)
                 && self.module_decl_names.contains(pname.as_str())
             {
@@ -9163,6 +9179,11 @@ impl Codegen {
         for (i, (pname, ptype)) in node.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
+            }
+            // #11940 slice 1: type text "type" renders Zig's `comptime T: type`.
+            if ptype == "type" {
+                self.write(&format!("comptime {}: type", Self::zig_ident(pname)));
+                continue;
             }
             let arg_name = if shadowed.contains(pname) {
                 format!("{}_arg", pname)
@@ -9282,11 +9303,19 @@ impl Codegen {
                     ))
                     || (n.kind == NodeKind::ExprArrayLiteral
                         && text_has_ident(&n.extra_size, name))
+                    // #11940: a call-attached literal is TEXT on `value`, no
+                    // child nodes -- scan it too.
+                    || (n.kind == NodeKind::ExprCall && !n.value.is_empty() && text_has_ident(&n.value, name))
                     || param_referenced(&n.children, name)
             })
         }
-        for (pname, _) in &node.params {
-            if pname != "self" && !param_referenced(&node.children, pname) {
+        for (pname, ptype) in &node.params {
+            // #11940: a type param is used by the signature alone (`value: T`);
+            // discarding one the signature names is "pointless discard".
+            let signature_uses = ptype == "type"
+                && (node.extra_return_type.contains(pname.as_str())
+                    || node.params.iter().any(|(op, ot)| op != pname && ot != "type" && ot.contains(pname.as_str())));
+            if pname != "self" && !signature_uses && !param_referenced(&node.children, pname) {
                 self.write_indent();
                 // W735: an unused parameter that was RENAMED must be discarded
                 // under its new name, or Zig reports "unused function
@@ -10677,8 +10706,7 @@ impl Codegen {
                     // `[]i32` ("expected type '[]i32', found 'struct { comptime
                     // T = 0, ... }'"), and only the callee's signature says what
                     // the element type is.
-                    let param_types = self.declared_fn_params.get(&node.name).cloned();
-                    for (i, arg) in node.children.iter().enumerate() {
+                    let param_types = self.declared_fn_params.get(&node.name).cloned();                    for (i, arg) in node.children.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
                         }
@@ -10733,6 +10761,9 @@ impl Codegen {
                         }
                     }
                     self.write(")");
+                    // #11940: a call-attached literal (`Box(T){ ... }`) is captured
+                    // as text on `value`; write it or the body emits a bare type.
+                    if !node.value.is_empty() { self.write(&node.value); }
                 }
             }
             NodeKind::ExprBinary => {
@@ -40906,30 +40937,6 @@ mod tests_compiler_rejects {
             .unwrap_or_else(|e| panic!("compile_verilog failed unexpectedly: {}", e))
     }
 
-    /// Assert the recovered function body is left unimplemented and the bogus
-    /// token never leaked into codegen.
-    fn assert_dropped(v: &str, fn_name: &str, bogus_tokens: &[&str]) {
-        assert!(
-            v.contains("// TODO: implement"),
-            "recovered body should be left unimplemented, got:\n{}",
-            v
-        );
-        assert!(
-            !v.contains(&format!("{} = ", fn_name)),
-            "the rejected statement must be dropped, not lowered (no `{} = `), got:\n{}",
-            fn_name,
-            v
-        );
-        for tok in bogus_tokens {
-            assert!(
-                !v.contains(tok),
-                "bogus token `{}` must never reach codegen, got:\n{}",
-                tok,
-                v
-            );
-        }
-    }
-
     // Case 1: unknown cast type. `x as widget` -> the type is not in
     // VALID_CAST_TYPES, so the statement is dropped; `widget` never emitted.
     #[test]
@@ -41151,24 +41158,6 @@ mod tests_compiler_rejects {
     //
     // All outcomes below were observed empirically before being asserted.
     // -----------------------------------------------------------------------
-
-    /// Helper: assert a bogus top-level token was dropped during recovery and
-    /// never leaked into codegen, while the module skeleton still emitted.
-    fn assert_decl_dropped(v: &str, module_name: &str, bogus_tokens: &[&str]) {
-        assert!(
-            v.contains(&format!("module {} (", module_name)),
-            "the module skeleton must still emit after declaration recovery, got:\n{}",
-            v
-        );
-        for tok in bogus_tokens {
-            assert!(
-                !v.contains(tok),
-                "bogus top-level token `{}` must never reach codegen, got:\n{}",
-                tok,
-                v
-            );
-        }
-    }
 
     // (a) Unknown leading top-level token (`gibberish foo`) -> the declaration
     // parser errors, `skip_to_next_top_level()` drops the bogus tokens, and the
