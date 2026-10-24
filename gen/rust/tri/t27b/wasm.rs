@@ -495,15 +495,6 @@ pub fn descs_ok(names: &[u8], descs: &[u8], bodies: &[u8]) -> bool {
     return true;
 }
 
-pub fn copy_bytes(out: &mut [u8], at: usize, src: &[u8]) -> usize {
-    let mut i: usize = 0;
-    while (i < src.len()) {
-        out[((at + i)) as usize] = src[(i) as usize];
-        i = (i + 1);
-    }
-    return (at + src.len());
-}
-
 pub fn type_body(out: &mut [u8], names: &[u8], descs: &[u8], bodies: &[u8]) -> usize {
     if !(descs_ok(names, descs, bodies)) {
         return 0;
@@ -791,41 +782,31 @@ pub fn refusal_detail(code: u8) -> &'static str {
 }
 
 pub fn uncarried_return_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = copy_bytes(out, at, b"the wasm32 emitter exports scalar returns, `");
-    n = copy_bytes(out, n, ty);
-    return copy_bytes(out, n, b"` here");
+    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter exports scalar returns, `");
+    n = put_bytes(out, n, ty);
+    return put_bytes(out, n, b"` here");
 }
 
 pub fn i32_params_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = copy_bytes(out, at, b"the wasm32 emitter carries i32 parameters, `");
-    n = copy_bytes(out, n, ty);
-    return copy_bytes(out, n, b"` here");
+    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter carries i32 parameters, `");
+    n = put_bytes(out, n, ty);
+    return put_bytes(out, n, b"` here");
 }
 
 pub fn i32_results_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = copy_bytes(out, at, b"the wasm32 emitter carries i32 results here, `");
-    n = copy_bytes(out, n, ty);
-    return copy_bytes(out, n, b"` instead");
+    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter carries i32 results here, `");
+    n = put_bytes(out, n, ty);
+    return put_bytes(out, n, b"` instead");
 }
 
 pub fn arith_op_detail(out: &mut [u8], at: usize, op: u8) -> usize {
-    let mut n: usize = copy_bytes(out, at, b"the wasm32 emitter lowers + - * / on the i32 carrier, `");
-    n = copy_bytes(out, n, arith_debug_name(op).as_bytes());
-    return copy_bytes(out, n, b"` here");
-}
-
-pub fn u32_dec_len(v: u32) -> usize {
-    let mut n: usize = 1;
-    let mut x: u32 = v;
-    while (x >= 10) {
-        x = (x / 10);
-        n = (n + 1);
-    }
-    return n;
+    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter lowers + - * / on the i32 carrier, `");
+    n = put_bytes(out, n, arith_debug_name(op).as_bytes());
+    return put_bytes(out, n, b"` here");
 }
 
 pub fn put_u32_dec(out: &mut [u8], at: usize, v: u32) -> usize {
-    let mut n: usize = u32_dec_len(v);
+    let mut n: usize = dec_len((v as usize));
     let mut x: u32 = v;
     let mut i: usize = n;
     while (i > 0) {
@@ -837,15 +818,15 @@ pub fn put_u32_dec(out: &mut [u8], at: usize, v: u32) -> usize {
 }
 
 pub fn refusal_message(out: &mut [u8], at: usize, construct: &[u8], line: u32, func: &[u8], detail: &[u8]) -> usize {
-    let mut n: usize = copy_bytes(out, at, b"unsupported construct ");
-    n = copy_bytes(out, n, construct);
-    n = copy_bytes(out, n, b" at line ");
+    let mut n: usize = put_bytes(out, at, b"unsupported construct ");
+    n = put_bytes(out, n, construct);
+    n = put_bytes(out, n, b" at line ");
     n = put_u32_dec(out, n, line);
-    n = copy_bytes(out, n, b" (fn ");
-    n = copy_bytes(out, n, func);
-    n = copy_bytes(out, n, b": ");
-    n = copy_bytes(out, n, detail);
-    return copy_bytes(out, n, b")");
+    n = put_bytes(out, n, b" (fn ");
+    n = put_bytes(out, n, func);
+    n = put_bytes(out, n, b": ");
+    n = put_bytes(out, n, detail);
+    return put_bytes(out, n, b")");
 }
 
 pub fn refused_local_variable(var_idx: u32, nparams: u32) -> bool {
@@ -1309,7 +1290,7 @@ pub fn walk_prog(names_out: &mut [u8], descs_out: &mut [u8], bodies_out: &mut [u
                 return 0;
             }
             let mut a: usize = (fact_name_off(facts, i) as usize);
-            nn = copy_bytes(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
+            nn = put_bytes(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
             let mut ro: usize = (fact_ret_off(facts, i) as usize);
             let mut rl: usize = (fact_ret_len(facts, i) as usize);
             let mut bo: usize = bn;
@@ -1406,5 +1387,57 @@ pub fn eqz_uses(out: &mut [u8], at: usize, uses: u8) -> usize {
         i = (i + 1);
     }
     return n;
+}
+
+pub const AT: u8 = 64;
+
+pub const ROW: usize = 16;
+
+pub fn dec_len(v: usize) -> usize {
+    let mut n: usize = 1;
+    let mut x: usize = v;
+    while (x >= 10) {
+        x = (x / 10);
+        n = (n + 1);
+    }
+    return n;
+}
+
+pub fn exported(names: &[u8], fns: &[u8], i: usize, at: usize) -> bool {
+    if (fn_at(fns, i) == 0) {
+        return false;
+    }
+    return ((names[(at) as usize] != 0) && (names[(at) as usize] != AT));
+}
+
+pub fn fn_at(fns: &[u8], i: usize) -> usize {
+    return get_u64(fns, (ROW * i));
+}
+
+pub fn get_u64(t: &[u8], at: usize) -> usize {
+    let mut v: usize = 0;
+    let mut i: usize = 8;
+    while (i > 0) {
+        i = (i - 1);
+        v = ((v << 8) | (t[((at + i)) as usize] as usize));
+    }
+    return v;
+}
+
+pub fn name_len(names: &[u8], at: usize) -> usize {
+    let mut n: usize = 0;
+    while (names[((at + n)) as usize] != 0) {
+        n = (n + 1);
+    }
+    return n;
+}
+
+pub fn put_bytes(out: &mut [u8], at: usize, src: &[u8]) -> usize {
+    let mut i: usize = 0;
+    while (i < src.len()) {
+        out[((at + i)) as usize] = src[(i) as usize];
+        i = (i + 1);
+    }
+    return (at + src.len());
 }
 
