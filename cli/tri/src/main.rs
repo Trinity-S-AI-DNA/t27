@@ -56,6 +56,8 @@ mod rj; // t27c gen-rust of specs/tri/remote/remote_job.t27: every command line 
 mod land; // t27c gen-rust of specs/tri/land/land.t27: every rule and command line of `tri land` (#11068)
 #[path = "../../../gen/rust/tri/land/golden_land.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod golden_land; // t27c gen-rust of specs/tri/land/golden_land.t27: the verbs and command lines of `tri golden` (#11275)
+#[path = "../../../gen/rust/queen/local_dispatch.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod qld; // t27c gen-rust of specs/queen/local_dispatch.t27: the rules and command lines of `tri queen` (#11415)
 #[path = "../../../gen/rust/tri/trigit/verbs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod tv; // t27c gen-rust of specs/tri/trigit/verbs.t27: the trigit verbs (#11601, epic #11385 items 24-26)
 #[path = "../../../gen/rust/t27os/release.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
@@ -460,6 +462,8 @@ enum Commands {
     /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
     /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
+    /// The local Queen: `tick` reads the open P0 then P1 issues of gHashTag/t27, orders them by priority.t27, claims each pick by creating refs/swarm/claims/<n> on origin (shared by every machine), makes a worktree /tmp/claude-501/lane-<n> on claude/evolve-lane-<n>-<host> and starts the lane (a T27 OS pane when T27OS_PTY names the pty server, else a detached shell) on the free z.ai tier; a lane silent for 30 min loses its claim. --plan prints the picks and the reasons and starts nothing; --lanes N starts at most N; --host names this machine; --issues FILE reads the candidates from a feed file (rules: specs/queen/local_dispatch.t27, #11415).
+    Queen { action: String, #[arg(long)] plan: bool, #[arg(long, default_value_t = 0)] lanes: u32, #[arg(long)] host: Option<String>, #[arg(long)] issues: Option<String> },
     Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
     /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
     Trigit { #[arg(trailing_var_arg = true)] argv: Vec<String> },
@@ -1389,6 +1393,7 @@ fn main() -> Result<()> {
         Commands::Payout { epoch, pool, json } => std::process::exit(payout::cmd(*epoch, *pool, *json)? as i32),
         Commands::T27o { file, name, oracle, check, t27c, emit_cell } => std::process::exit(cmd_t27o(file, name.as_deref(), *oracle, *check, t27c.as_deref(), *emit_cell)? as i32),
         Commands::T27oSweep { paths, repo, max_bytes, cache, top } => std::process::exit(cmd_t27o_sweep(paths, repo, *max_bytes, cache.as_deref(), *top)? as i32),
+        Commands::Queen { action, plan, lanes, host, issues } => std::process::exit(cmd_queen(action, *plan, *lanes, host.as_deref(), issues.as_deref())? as i32),
         Commands::Golden { action, plan, queued, issue } => std::process::exit(cmd_golden(action, *plan, *queued, *issue)? as i32),
         Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
         Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
@@ -1548,6 +1553,98 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bo
     let n = land::refusal_detail(r, ev, at.0, at.1, &mut buf);
     println!("{}{}: {}", land::code_name(code), if code >= land::L_STEP { format!(" {}", String::from_utf8_lossy(&buf[..n])) } else { String::new() }, land::code_why(code));
     Ok(land::exit_code(code))
+}
+
+/// `tri queen tick` (#11415): every rule and command line is specs/queen/local_dispatch.t27; this reads the machine and origin into the texts it takes, runs the argument vectors it returns (no shell but the lane's own line) and prints its plan.
+fn cmd_queen(action: &str, plan: bool, lanes: u32, host: Option<&str>, issues: Option<&str>) -> Result<u8> {
+    use qld as q;
+    anyhow::ensure!(action == "tick", "tri queen: the verb is `tick`");
+    let run = |a: &[&str]| -> (u32, String) { match Command::new(a[0]).args(&a[1..]).output() { Ok(o) => (o.status.code().unwrap_or(255) as u32, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (255, e.to_string()) } };
+    let runv = |b: &[u8]| { let t = String::from_utf8_lossy(b).into_owned(); run(&t.lines().collect::<Vec<_>>()) };
+    let (mut b, now) = (vec![0u8; 65536], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs());
+    let n = q::host_name(host.map(str::to_string).or_else(|| Some(run(&["scutil", "--get", "LocalHostName"]).1).filter(|h| !h.starts_with("Unknown") && !h.contains("rror"))).unwrap_or_else(|| run(&["hostname", "-s"]).1).as_bytes(), &mut b);
+    let hn = String::from_utf8_lossy(&b[..n]).into_owned();
+    let _ = run(&["git", "fetch", "-q", "origin", "+refs/swarm/*:refs/swarm/*"]);
+    let (mut dirs, mut rows, mut held, mut mine, mut fin, mut running) = (String::new(), String::new(), String::new(), vec![], vec![], 0u32);
+    let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    for e in std::fs::read_dir("/tmp/claude-501").into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(k) = name.strip_prefix("lane-").and_then(|s| s.parse::<u64>().ok()) else { continue };
+        dirs.push_str(&format!("{name}\n"));
+        let (p, log) = (e.path(), std::fs::read(e.path().join(".lane.log")).unwrap_or_default());
+        let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(2000)..]).into_owned();
+        let st = if tail.contains("LANE-DONE exit=0") { 'D' } else if tail.contains("LANE-DONE") || tail.contains("LANE-BLOCKED") { 'B' } else { 'R' };
+        let md = |f: &str| std::fs::metadata(p.join(f));
+        rows.push_str(&format!("{k}\t{}\t{}\t0\t{st}\n", secs(std::fs::metadata(&p).and_then(|m| m.created())), secs(md(".lane.log").and_then(|m| m.modified()))));
+        if st != 'B' { held.push_str(&std::fs::read_to_string(p.join(".lane_regions")).unwrap_or_default()); }
+        if st == 'R' { running += 1; mine.push(k); }
+        if st == 'D' && !p.join(".lane_pushed").exists() { fin.push((k, p.clone())); }
+    }
+    for l in run(&["git", "for-each-ref", "--format=%(refname) %(committerdate:unix)", "refs/swarm/alive"]).1.lines() {
+        let (r, ct) = l.split_once(' ').unwrap_or((l, "0"));
+        let (h, k) = r.rsplit_once('-').unwrap_or((r, "0"));
+        if !h.ends_with(&format!("/{hn}")) { rows.push_str(&format!("{k}\t0\t0\t{ct}\tR\n")); }
+    }
+    let w = q::release_plan(rows.as_bytes(), now, &mut b);
+    let released: Vec<u64> = String::from_utf8_lossy(&b[..w]).lines().filter_map(|l| l.strip_prefix("RELEASE|")?.parse().ok()).collect();
+    for k in &released {
+        println!("{}RELEASE claim of #{k}", if plan { "would " } else { "" });
+        if !plan { for br in [false, true] { let m = q::release_argv(*k, br, &mut b); let _ = runv(&b[..m].to_vec()); } let _ = run(&["git", "push", "-q", "origin", "--delete", &format!("refs/swarm/alive/{hn}-{k}")]); }
+    }
+    for (k, p) in fin.iter().filter(|_| !plan) { let m = q::push_argv(*k, hn.as_bytes(), &mut b); if runv(&b[..m].to_vec()).0 == 0 { let _ = std::fs::write(p.join(".lane_pushed"), ""); println!("#{k} lane branch pushed for trigit"); } }
+    let sh = |a: &[&str]| run(a).1.trim().to_string();
+    let (mem, ncpu) = (sh(&["memory_pressure"]).split_whitespace().nth(3).and_then(|m| m.parse::<u64>().ok()).unwrap_or(0), sh(&["getconf", "_NPROCESSORS_ONLN"]).parse::<u32>().unwrap_or(1));
+    let (vm, load, batt) = (sh(&["vm_stat"]), sh(&["uptime"]).split("averages: ").nth(1).unwrap_or("").to_string(), sh(&["pmset", "-g", "batt"]));
+    let running = running - mine.iter().filter(|k| released.contains(k)).count() as u32;
+    let slots = q::tick_slots(mem, vm.as_bytes(), ncpu, load.as_bytes(), batt.as_bytes(), running, lanes);
+    println!("queen tick host={hn} cap={} running={running} slots={slots}", q::cap_of(mem, vm.as_bytes(), ncpu, load.as_bytes(), batt.as_bytes()));
+    if !plan {
+        let tree = sh(&["git", "rev-parse", "origin/master^{tree}"]);
+        for k in mine.iter().filter(|k| !released.contains(k)) {
+            let sha = sh(&["git", "commit-tree", &tree, "-m", "alive"]);
+            let m = q::alive_argv(*k, hn.as_bytes(), sha.as_bytes(), &mut b); let _ = runv(&b[..m].to_vec());
+        }
+    }
+    let feed = match issues {
+        Some(f) => std::fs::read_to_string(f)?,
+        None => ["P0", "P1"].iter().map(|l| run(&["gh", "issue", "list", "-R", "gHashTag/t27", "--label", l, "--state", "open", "--limit", "100", "--json", "number,title,body,labels,createdAt", "--jq", r#".[] | [.number, (.createdAt|fromdateiso8601), (.labels|map(.name)|join(",")), (.title|gsub("[\t\n]";" ")), (.body|gsub("[\t\r]";" ")|gsub("\n";"\u001f"))] | map(tostring) | join("\t")"#]).1).collect::<String>(),
+    };
+    let (ok, refs) = run(&["git", "ls-remote", "origin", "refs/swarm/claims/*", "refs/heads/claude/claim-*"]);
+    anyhow::ensure!(ok == 0, "tri queen: origin's claims could not be read, so nothing is picked: {refs}");
+    let w = q::plan(feed.as_bytes(), now, refs.as_bytes(), dirs.as_bytes(), held.as_bytes(), slots, &mut b, &mut vec![0u64; 400], &mut vec![0u8; 5120]);
+    let text = String::from_utf8_lossy(&b[..w]).into_owned();
+    print!("{text}");
+    if plan { return Ok(0); }
+    let (ptyb, sha) = (std::env::var("T27OS_PTY").unwrap_or_default(), sh(&["git", "rev-parse", "origin/master"]));
+    let mut started = 0;
+    for l in text.lines().filter(|l| l.starts_with("PICK|")) {
+        let f: Vec<&str> = l.splitn(5, '|').collect();
+        let k: u64 = f[1].parse()?;
+        let mut c = { let m = q::claim_argv(k, sha.as_bytes(), false, &mut b); let (x, s) = runv(&b[..m].to_vec()); q::claim_outcome(x, s.as_bytes()) };
+        if c == q::CL_REFUSED { let m = q::claim_argv(k, sha.as_bytes(), true, &mut b); let (x, s) = runv(&b[..m].to_vec()); c = q::claim_final(c, q::claim_outcome(x, s.as_bytes())); }
+        if !q::claim_may_go_on(c) { println!("#{k} claim not won (code {c}), next"); continue; }
+        let m = q::worktree_argv(k, hn.as_bytes(), &mut b);
+        let (x, s) = runv(&b[..m].to_vec());
+        let m = q::lane_dir(k, &mut b);
+        let dir = String::from_utf8_lossy(&b[..m]).into_owned();
+        if x != 0 { println!("#{k} worktree failed, claim released: {}", s.trim()); for br in [false, true] { let m = q::release_argv(k, br, &mut b); let _ = runv(&b[..m].to_vec()); } continue; }
+        let body = feed.lines().find(|r| r.starts_with(&format!("{k}\t"))).and_then(|r| r.splitn(5, '\t').nth(4)).unwrap_or("");
+        let m = q::brief(k, f[3].as_bytes(), body.as_bytes(), hn.as_bytes(), &mut b);
+        std::fs::write(format!("{dir}/.lane_brief.md"), &b[..m])?;
+        std::fs::write(format!("{dir}/.lane_regions"), f[4].replace(',', "\n") + "\n")?;
+        let m = q::lane_model(&mut b[..64]);
+        let model = String::from_utf8_lossy(&b[..m]).into_owned();
+        let m = q::lane_meta(k, model.as_bytes(), b"zai", hn.as_bytes(), now, &mut b);
+        std::fs::write(format!("{dir}/.lane.meta"), &b[..m])?;
+        let m = q::lane_cmd(k, model.as_bytes(), &mut b);
+        let line = String::from_utf8_lossy(&b[..m]).into_owned();
+        let pane = !ptyb.is_empty() && Command::new(&ptyb).env("T27OS_CTL", "spawn").env("T27OS_AGENT", "9").env("T27OS_CWD", &dir).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().strip_prefix("spawned pane ")?.parse::<u32>().ok()).and_then(|pn| Command::new(&ptyb).env("T27OS_CTL", "write").env("T27OS_PANE", pn.to_string()).env("T27OS_KEYS", &line).output().ok()).is_some();
+        if !pane { Command::new("sh").args(["-c", &format!("nohup sh -c '{}' >/dev/null 2>&1 &", line.replace('\'', "'\\''"))]).current_dir(&dir).status()?; }
+        println!("#{k} lane started in {dir} ({})", if pane { "T27 OS pane" } else { "detached shell" });
+        started += 1;
+    }
+    println!("{started} lane(s) started");
+    Ok(0)
 }
 
 /// `tri golden land|push|status` (#11275): every rule is specs/tri/land/golden_land.t27 over golden_chain.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence and stops where the spec says.

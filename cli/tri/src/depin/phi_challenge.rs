@@ -170,19 +170,6 @@ mod tests {
     }
 }
 
-pub fn gf16_inv(a: u8) -> u8 {
-    let a = a & 0xF;
-    if a == 0 {
-        return 0;
-    }
-    for x in 1u8..16 {
-        if gf16_mul(a, x) == 1 {
-            return x;
-        }
-    }
-    0
-}
-
 pub fn gf16_matmul(a: &[[u8; 16]; 16], b: &[[u8; 16]; 16]) -> [[u8; 16]; 16] {
     let mut c = [[0u8; 16]; 16];
     for i in 0..16 {
