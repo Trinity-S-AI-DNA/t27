@@ -96,3 +96,4 @@ fails: the `reopened` event runs the check and closes it again. Do not file a du
 ## Traps
 
 - 2026-10-24 Success Criteria counts only a number with a unit, exit 0, a backticked file ending swift/ts/rs/md/json/zig/v (NOT .t27) or a backticked make/swift/bun/cargo/git command; a bare tri or t27c command does not. Requirements needs ' must ' or FR-001. A fixed body reopens only when the queued gate run executes. (t27-12026)
+- 2026-10-24 2026-10-25 A night-loop issue was filed with Requirements prose lacking ' must ' and FR-NNN: the gate closed it NOT_PLANNED about 1 s later while its PR was open. Load this skill before gh issue create, and read gh issue view N --json state,labels once after. A rewritten body reopened the issue 14 min later (the queued gate run).
