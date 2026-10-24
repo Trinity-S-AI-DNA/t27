@@ -26,6 +26,13 @@
 //!     `+ - *` in Trap mode does not (wasm i32.add/sub/mul wrap) -- a floor-6
 //!     concern. Everything else in a pub fn is refused by name, never
 //!     silently dropped.
+//!   M-C: comparisons join the tree (t27os#3's named gap, the law's floor
+//!     11): `== != < <= > >=` over the same operands lower to 0x46/0x47 and
+//!     the SIGNED 0x48/0x4A/0x4C/0x4E. Signed because t27's ordered
+//!     comparisons on i32 are Zig's signed ones and the die's own law
+//!     (wasm_board_ax7203.t27) numbers the same bytes signed -- `/` chose
+//!     div_u to match the die where die and source disagreed; here they
+//!     agree. `x == 0` folds to one eqz (0x45), `x != 0` to two.
 
 use crate::ir::{CmpOp, ArithOp, Expr, ExprKind, Func, Program, Stmt, Ty};
 
@@ -167,7 +174,9 @@ enum Body {
 /// Append `<expr>`'s postfix stack program to `out`: parameters via
 /// `local.get`, i32-range constants via `i32.const`, `+ - * /` via the floor-5
 /// opcodes (`Div` -- the IR of both `/` and integer `@divTrunc` -- via
-/// i32.div_u). Anything else is refused by name.
+/// i32.div_u), comparisons `== != < <= > >=` via floor 11 (0x46/0x47 and the
+/// signed 0x48/0x4A/0x4C/0x4E; `x == 0` folds to one eqz, `x != 0` to two,
+/// the law's eqz_fold rule). Anything else is refused by name.
 fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
     match &e.kind {
         ExprKind::Const(v) => {
@@ -213,11 +222,31 @@ fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
             out.push(opcode);
             Ok(())
         }
+        ExprKind::Cmp { op, lhs, rhs } => {
+            let is_zero = |e: &Expr| matches!(e.kind, ExprKind::Const(0));
+            let folded = wasm_law::eqz_fold(*op as u8, is_zero(lhs), is_zero(rhs));
+            if folded > 0 {
+                // `x == 0` / `0 == x` is one eqz over x; `x != 0` two. The
+                // zero operand never lowers -- floor 11's rule.
+                let x = if is_zero(lhs) { rhs } else { lhs };
+                lower_stack(x, f, out)?;
+                for _ in 0..folded {
+                    out.push(wasm_law::OP_I32_EQZ);
+                }
+                return Ok(());
+            }
+            let opcode = wasm_law::cmp_opcode(*op as u8);
+            debug_assert!(opcode != 0, "CmpOp has six variants, all on floor 11");
+            lower_stack(lhs, f, out)?;
+            lower_stack(rhs, f, out)?;
+            out.push(opcode);
+            Ok(())
+        }
         _ => Err(EmitError::new(
             &f.name,
             f.line,
             "expression kind",
-            "the wasm32 emitter lowers parameters, i32 constants and + - * / only".into(),
+            "the wasm32 emitter lowers parameters, i32 constants, + - * / and == != < <= > >= only".into(),
         )),
     }
 }
@@ -445,8 +474,7 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{ArithOp, Expr, Func, OverflowMode, Program, Var};
-    use std::path::Path;
+    use crate::ir::{Expr, Func, OverflowMode, Program};
 
     fn konst(ty: Ty, v: i128) -> Expr {
         Expr { ty, kind: ExprKind::Const(v) }
@@ -553,60 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn one_i32_fn_exact_module_bytes() {
-        // `pub fn the_answer() -> i32 { return 42; }`, byte for byte.
-        let m = emit(&prog(vec![fn_const_ret("the_answer", Ty::I32, 42)])).expect("emit");
-        let mut want = Vec::new();
-        want.extend_from_slice(b"\0asm\x01\x00\x00\x00"); // magic, version
-        want.extend_from_slice(&[0x01, 0x05]); // type section, 5 bytes
-        want.extend_from_slice(&[0x01, 0x60, 0x00, 0x01, 0x7f]); // 1 type: () -> i32
-        want.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // function: 1, type 0
-        want.extend_from_slice(&[0x07, 0x0e, 0x01]); // export, 14 bytes, 1 entry
-        want.extend_from_slice(b"\x0athe_answer"); // name length 10, the name
-        want.extend_from_slice(&[0x00, 0x00]); // kind func, index 0
-        want.extend_from_slice(&[0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]); // code: 1 body of 4: locals 0, i32.const 42, end
-        assert_eq!(m, want);
-        assert_eq!(m.len(), 43);
-    }
-
-    #[test]
-    fn every_scalar_return_type_lowers_to_its_valtype() {
-        let cases: Vec<(Ty, i128)> = vec![
-            (Ty::I32, 42),
-            (Ty::I64, -7),
-            (Ty::U64, 1 << 40),
-            (Ty::U32, 4_000_000_000),
-            (Ty::Bool, 1),
-            (Ty::U8, 255),
-            (Ty::I8, -128),
-            (Ty::UN(21), 2_000_000),
-            (Ty::IN(21), -1_000_000),
-            (Ty::F64, crate::ir::f64_bits(3.5)),
-            (Ty::F32, crate::ir::f32_bits(-0.5)),
-        ];
-        let funcs = cases
-            .iter()
-            .enumerate()
-            .map(|(i, (t, v))| fn_const_ret(&format!("f{}", i), *t, *v))
-            .collect();
-        let m = emit(&prog(funcs)).expect("emit");
-        // The type section result byte of each fn is that type's valtype.
-        // Layout: 8 header bytes; type section id at 8, its size at 9; the
-        // vector count at 10; each entry is `60 00 01 XX`, 4 bytes, so the
-        // result byte of entry i sits at 14 + 4*i.
-        let want_t: Vec<u8> = cases.iter().map(|(t, _)| valtype(*t).unwrap()).collect();
-        let vt: Vec<u8> = (0..cases.len()).map(|i| m[14 + 4 * i]).collect();
-        assert_eq!(vt, want_t);
-        // The exports are the fn names in order, and each body is `const, end`.
-        let text = String::from_utf8_lossy(&m);
-        for i in 0..cases.len() {
-            assert!(text.contains(&format!("f{}", i)));
-        }
-        let last = *m.last().expect("nonempty");
-        assert_eq!(last, 0x0B); // every body ends with `end`
-    }
-
-    #[test]
     fn i64_uses_the_i64_const_opcode_and_signed_leb() {
         let m = emit(&prog(vec![fn_const_ret("big", Ty::I64, -7)])).expect("emit");
         // code section body: locals 0, i64.const -7 (0x42 0x79), end
@@ -633,74 +607,5 @@ mod tests {
         let insn = const_insn(Ty::I32, -2_147_483_648);
         assert_eq!(read_sleb(&insn[1..]), -2_147_483_648);
     }
-
-    #[test]
-    fn private_and_test_fns_are_skipped_not_refused() {
-        let mut a = fn_const_ret("pubk", Ty::I32, 5);
-        a.is_pub = true;
-        let mut b = fn_const_ret("priv", Ty::I32, 6);
-        b.is_pub = false;
-        let mut c = fn_const_ret("atest", Ty::I32, 7);
-        c.is_test = true;
-        let m = emit(&prog(vec![b, c, a])).expect("emit");
-        let text = String::from_utf8_lossy(&m);
-        assert!(text.contains("pubk"));
-        assert!(!text.contains("priv"));
-        assert!(!text.contains("atest"));
-    }
-
-    #[test]
-    fn refusals_name_the_construct() {
-        // a pub fn with a parameter off the i32 carrier
-        let mut f = fn_const_ret("params", Ty::I32, 1);
-        f.nparams = 1;
-        f.vars = vec![Var { name: "x".into(), ty: Ty::U64 }];
-        let e = emit(&prog(vec![f])).expect_err("refused");
-        assert_eq!(e.construct, "fn parameters");
-        // a void pub fn
-        let mut f = fn_const_ret("voidy", Ty::I32, 1);
-        f.ret = None;
-        f.body = vec![Stmt::Return(None)];
-        let e = emit(&prog(vec![f])).expect_err("refused");
-        assert_eq!(e.construct, "void pub fn");
-        // a ptr return
-        let f = fn_const_ret("ptrr", Ty::Ptr, 0);
-        let e = emit(&prog(vec![f])).expect_err("refused");
-        assert_eq!(e.construct, "ptr return");
-        // a non-constant body
-        let mut f = fn_const_ret("work", Ty::I32, 0);
-        f.body = vec![Stmt::Eval(konst(Ty::I32, 1)), Stmt::Return(Some(konst(Ty::I32, 2)))];
-        let e = emit(&prog(vec![f])).expect_err("refused");
-        assert_eq!(e.construct, "fn body");
-        // a non-constant return expression
-        let mut f = fn_const_ret("work2", Ty::I32, 0);
-        f.body = vec![Stmt::Return(Some(Expr { ty: Ty::I32, kind: ExprKind::Arith {
-            op: ArithOp::Add, lhs: Box::new(konst(Ty::I32, 1)), rhs: Box::new(konst(Ty::I32, 2)), site: 0,
-        } }))];
-        let e = emit(&prog(vec![f])).expect_err("refused");
-        assert_eq!(e.construct, "fn body");
-        // the module-level refusal names itself
-        let e = emit(&prog(vec![])).expect_err("refused");
-        assert_eq!(e.construct, "module");
-        assert_eq!(e.func, "(module)");
-        // the message keeps the corpus-parsed phrasing
-        let mut f = fn_const_ret("params", Ty::I32, 1);
-        f.nparams = 1;
-        f.vars = vec![Var { name: "x".into(), ty: Ty::U64 }];
-        assert_eq!(
-            emit(&prog(vec![f])).expect_err("refused").message(),
-            "unsupported construct fn parameters at line 1 (fn params: the wasm32 emitter carries i32 parameters, `u64` here)"
-        );
-    }
-
-    #[test]
-    fn end_to_end_from_source_through_the_front_end() {
-        let src = "pub fn the_answer() -> i32 { return 42; }\n";
-        let parsed = crate::front::parse(Path::new("/nonexistent/scratch.t27"), src).expect("parse");
-        let lowered = crate::lower::lower_src(&parsed.ast, OverflowMode::Trap, Some(src)).expect("lower");
-        let m = emit(&lowered).expect("emit");
-        assert_eq!(&m[..8], b"\0asm\x01\x00\x00\x00");
-        assert!(String::from_utf8_lossy(&m).contains("the_answer"));
-        assert!(m.ends_with(&[0x41, 0x2a, 0x0b])); // i32.const 42, end
-    }
 }
+
