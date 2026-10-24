@@ -24849,6 +24849,18 @@ fn collect_mutable_names(stmts: &[Node], set: &mut std::collections::HashSet<Str
     }
 }
 
+/// #5980 (E0596): names of locals DECLARED mutable (`var x ...`), whether or
+/// not the body ever writes them. `collect_mutable_names` answers "who is
+/// written"; a read-only `var` is exactly what a caller reslices.
+fn collect_mutable_decls(stmts: &[Node], set: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        if stmt.kind == NodeKind::StmtLocal && stmt.extra_mutable && !stmt.name.is_empty() {
+            set.insert(stmt.name.clone());
+        }
+        collect_mutable_decls(&stmt.children, set);
+    }
+}
+
 fn collect_mutable_names_one(stmt: &Node, set: &mut std::collections::HashSet<String>) {
     match stmt.kind {
         NodeKind::StmtAssign if !stmt.children.is_empty() => {
@@ -27574,6 +27586,11 @@ impl RustCodegen {
         // Infer which locals need `let mut`: scan body for any assignment.
         self.mut_names.clear();
         collect_mutable_names(&node.children, &mut self.mut_names);
+        // #5980 (E0596): a `var` declaration is mutable without any write.
+        // The kw arms read `extra_mutable` off the node, but a call site
+        // only has this set, so the declared names join it here. No `let
+        // mut` decision changes: those arms accept `extra_mutable || this`.
+        collect_mutable_decls(&node.children, &mut self.mut_names);
 
         // Same reason as bool_fns, for parameters and locals declared `bool`.
         self.bool_vars.clear();
@@ -28876,6 +28893,20 @@ impl RustCodegen {
         }
     }
 
+    /// #5980 (E0596): is this call argument a bare range-slice of a mut
+    /// local -- `buf[a..b]`? The base must be an identifier the `let mut`
+    /// machinery made mutable, and the index must be the two-ended `..`
+    /// range, the exact shape the renderer lowers to `&base[a..b]`.
+    fn is_mut_local_range_slice(&self, c: &Node) -> bool {
+        c.kind == NodeKind::ExprIndex
+            && c.children.len() >= 2
+            && c.children[0].kind == NodeKind::ExprIdentifier
+            && self.mut_names.contains(&c.children[0].name)
+            && c.children[1].kind == NodeKind::ExprBinary
+            && c.children[1].extra_op == ".."
+            && c.children[1].children.len() == 2
+    }
+
     fn expr_to_rust(&self, node: &Node) -> String {
         match node.kind {
             // Same hole as the C emitter had, in the same place: the lexer's
@@ -28987,13 +29018,31 @@ impl RustCodegen {
                 if let Some(callee_params) = self.param_names.get(&node.name) {
                     if let Some(callee_written) = self.written_slice_params.get(&node.name) {
                         for (i, a) in args.iter_mut().enumerate() {
-                            let Some((pname, _)) = callee_params.get(i) else {
+                            let Some((pname, t)) = callee_params.get(i) else {
                                 continue;
                             };
                             if !callee_written.contains(pname) {
                                 continue;
                             }
                             if self.current_mut_slice_params.contains(a.as_str()) {
+                                continue;
+                            }
+                            // #5980 (E0596): a BARE range-slice of a mut
+                            // local -- `take(buf[1..3])`, the spelling Zig
+                            // wants -- rendered `&buf[a..b]`, and the plain
+                            // wrap below made `&mut &buf[a..b]`: a mutable
+                            // reference TO a shared reference. The callee's
+                            // mut `[]T` param borrows the caller's mut local
+                            // THROUGH the slice, so borrow the slice itself:
+                            // strip the renderer's own `&` and borrow
+                            // mutably. Mutability comes from the same set
+                            // the `let mut` arms read, not from the text.
+                            if t.trim().starts_with("[]")
+                                && !t.trim().starts_with("[]const")
+                                && a.starts_with('&')
+                                && self.is_mut_local_range_slice(&node.children[i])
+                            {
+                                *a = format!("&mut {}", &a[1..]);
                                 continue;
                             }
                             *a = format!("&mut {}", a);
