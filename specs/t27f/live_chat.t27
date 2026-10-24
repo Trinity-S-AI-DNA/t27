@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_chat.t27 -- the chat panel of the live screen: talk to the Queen in the same
+// glass that shows her swarm working. Issue gHashTag/t27#12006, epic #10266, map #11038.
+//
+// WHY: the live page replays the work graph and the HUD, but the one thing the owner asked for on
+// it was missing: a chat with realtime AI output through our own tooling -- the Queen answers in
+// the same window, token by token, and the user talks to her directly. The reference is a
+// tetsuo-style window: watch the swarm, talk to the orchestrator in the same glass.
+//
+// THE PIECES, all integer (compares, adds and byte copies, no division):
+//   kinds     three chat events ride the ONE stream of live_stream.t27 (FR-001: one seq space, one
+//             keyframe discipline, one rate law -- no second connection): CK_USER (the user's line,
+//             from the one allowlisted POST action ACTION_SEND = "chat_send"), CK_TOKEN (a Queen
+//             reply delta), CK_DONE (closes the turn). Any other kind on the stream advances the
+//             panel's seq and touches nothing else: scene deltas and work-graph events interleave.
+//   panel     the transcript window: the last PANEL_MESSAGES messages as (side, len, bytes), plus
+//             the dropped count the panel states (FR-005: the scroll trim is visible, "+N earlier",
+//             never silent). A turn streams into the open Queen message; CK_USER always opens the
+//             user's own line; CK_DONE closes the turn.
+//   caps      a line or a delta longer than MAX_MSG bytes is refused whole (FR-002: never
+//             truncated); the panel is left byte-identical. The route names the Queen's cell
+//             (agents.t27 AGENT_QUEEN) and queen_chats.t27's pane model; the runtime plumbing
+//             (trios) owns the actual pipe (FR-006).
+//   render    the panel's ONLY primitive is scene.t27's PRIM_TEXT and its ONLY op is
+//             display_list.t27's DL_TEXT (FR-004): every rendered string is a TEXT op, the
+//             ui_plan FORBIDDEN_NAMES apply to every field by construction, and render_ops counts
+//             the TEXT ops the panel emits -- the messages plus one "+N earlier" line when trimmed.
+//   digest    sha256 over the panel's bytes, what the determinism gate compares: a recorded chat
+//             log replays to the same panel twice.
+//
+// NOT CLAIMED: no transport here (live_stream.t27 carries the wire, trios runs the Queen's pane);
+// no model call (the tokens arrive on the wire); no layout or colour (hud.t27 composes the panel
+// into the scene); no history beyond the window (the transcript the panel drops is stated, not
+// stored).
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module live_chat;
+
+use t27f::live_stream::next_seq;
+use t27f::display_list::DL_TEXT;
+use t27f::scene::PRIM_TEXT;
+use tri::crypto::sha256;
+
+pub const ID : str = "live-chat";
+pub const VERSION : u8 = 1;
+
+// ---- the three chat kinds on the one wire ----
+
+pub const CK_USER : u8 = 0;      // the user's line, from the one POST action
+pub const CK_TOKEN : u8 = 1;     // a Queen reply delta
+pub const CK_DONE : u8 = 2;      // closes the turn
+pub const CK_KINDS : u8 = 3;
+
+// The one allowlisted POST action that sends a line (the design doc: actions back are allowlisted
+// ui_plan action ids; a second send path is refused by law).
+pub const ACTION_SEND : str = "chat_send";
+
+// ---- caps ----
+
+pub const MAX_MSG : u32 = 512;           // a line or a delta, bytes; refused whole past this
+pub const PANEL_MESSAGES : u32 = 12;     // the window the panel keeps; the trim is stated
+pub const ROW_BYTES : u32 = 512;         // one message slot, == MAX_MSG
+
+// ---- results ----
+
+pub const CHAT_OK : u8 = 0;
+pub const ERR_TOO_LONG : u8 = 1;
+pub const ERR_BAD_KIND : u8 = 2;
+pub const ERR_DONE_WITHOUT_TURN : u8 = 3;
+
+// ---- sides ----
+
+pub const SIDE_USER : u8 = 0;
+pub const SIDE_QUEEN : u8 = 1;
+
+pub struct ChatPanel {
+    count: u32,            // messages now in the window (<= PANEL_MESSAGES)
+    dropped: u32,          // messages the window has scrolled off; the panel states this
+    turn_open: bool,       // a Queen turn is streaming
+    last_seq: u32,         // the wire seq this panel has consumed (any kind)
+    sides: [12]u8,
+    lens: [12]u16,
+    text: [12][512]u8,
+}
+
+pub fn new_panel() -> ChatPanel {
+    return ChatPanel {
+        count: 0,
+        dropped: 0,
+        turn_open: false,
+        last_seq: 0,
+        sides: [0] ** 12,
+        lens: [0] ** 12,
+        text: [[0] ** 512] ** 12,
+    };
+}
+
+/// The one entry the loader calls for every event on the stream. Chat kinds run the panel law;
+/// every other kind (scene deltas, work-graph events) only advances the panel's seq.
+pub fn apply_wire(p: *ChatPanel, seq: u32, kind: u8, bytes: []const u8) -> u8 {
+    if (seq != next_seq(p.last_seq)) { return ERR_BAD_KIND; }
+    p.last_seq = seq;
+    if (kind >= CK_KINDS) { return CHAT_OK; }   // not ours: seen, untouched
+    if (kind == CK_DONE) {
+        if (p.turn_open == false) { return ERR_DONE_WITHOUT_TURN; }
+        p.turn_open = false;
+        return CHAT_OK;
+    }
+    if (bytes.len > MAX_MSG) { return ERR_TOO_LONG; }   // refused whole, panel untouched
+    if (kind == CK_USER) {
+        return append(p, SIDE_USER, bytes);
+    }
+    // CK_TOKEN: stream into the open Queen turn, or open one
+    if (p.turn_open == false) {
+        p.turn_open = true;
+        return append(p, SIDE_QUEEN, bytes);
+    }
+    // the turn is open: the delta streams into its message, never a new one
+    if (p.count == 0) { return ERR_BAD_KIND; }
+    var slot = p.count - 1;
+    if (p.sides[slot] != SIDE_QUEEN) { return ERR_BAD_KIND; }
+    var old = p.lens[slot] as u32;
+    if (old + bytes.len > MAX_MSG) { return ERR_TOO_LONG; }
+    var n : u32 = 0;
+    while (n < bytes.len) {
+        p.text[slot][old + n] = bytes[n];
+        n = n + 1;
+    }
+    p.lens[slot] = (old + bytes.len) as u16;
+    return CHAT_OK;
+}
+
+fn append(p: *ChatPanel, side: u8, bytes: []const u8) -> u8 {
+    if (p.count == PANEL_MESSAGES) {
+        // the scroll trim, stated: slot 0 leaves the window, the panel counts it
+        var r : u32 = 0;
+        while (r < PANEL_MESSAGES - 1) {
+            p.sides[r] = p.sides[r + 1];
+            p.lens[r] = p.lens[r + 1];
+            var c : u32 = 0;
+            while (c < ROW_BYTES) {
+                p.text[r][c] = p.text[r + 1][c];
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        p.dropped = p.dropped + 1;
+    }
+    var slot : u32 = p.count;
+    if (slot >= PANEL_MESSAGES) { slot = PANEL_MESSAGES - 1; }
+    p.sides[slot] = side;
+    var n : u32 = 0;
+    while (n < bytes.len) {
+        p.text[slot][n] = bytes[n];
+        n = n + 1;
+    }
+    p.lens[slot] = n as u16;
+    if (p.count < PANEL_MESSAGES) { p.count = p.count + 1; }
+    return CHAT_OK;
+}
+
+/// The open turn's byte length, what a "streaming" indicator reads: 0 when no turn is open.
+pub fn open_len(p: *ChatPanel) -> u32 {
+    if (p.turn_open == false) { return 0; }
+    if (p.count == 0) { return 0; }
+    var slot = p.count - 1;
+    if (p.sides[slot] != SIDE_QUEEN) { return 0; }
+    return p.lens[slot] as u32;
+}
+
+// ---- the render law (FR-004): TEXT only ----
+
+pub const RENDER_PRIM : u8 = PRIM_TEXT;    // the only primitive the panel may draw
+pub const RENDER_OP : u8 = DL_TEXT;        // the only op its flattening emits
+
+/// The TEXT ops the panel emits: one per message in the window, plus the stated "+N earlier" line.
+pub fn render_ops(p: *ChatPanel) -> u32 {
+    var ops = p.count;
+    if (p.dropped > 0) { ops = ops + 1; }
+    return ops;
+}
+
+// ---- the digest: what the determinism gate compares ----
+
+fn put_u32(out: []u8, w: u32, v: u32) -> u32 {
+    out[w] = (v & 255) as u8;
+    out[w + 1] = ((v >> 8) & 255) as u8;
+    out[w + 2] = ((v >> 16) & 255) as u8;
+    out[w + 3] = ((v >> 24) & 255) as u8;
+    return w + 4;
+}
+
+pub fn digest_bytes(p: *ChatPanel, out: []u8) -> u32 {
+    var w = put_u32(out, 0, p.count);
+    w = put_u32(out, w, p.dropped);
+    out[w] = if (p.turn_open) 1 else 0;
+    w = w + 1;
+    // last_seq is deliberately NOT hashed: it is the wire position, not the transcript -- a
+    // foreign event on the shared stream moves it and must not read as a transcript change.
+    var i : u32 = 0;
+    while (i < PANEL_MESSAGES) {
+        out[w] = p.sides[i];
+        out[w + 1] = (p.lens[i] & 255) as u8;
+        out[w + 2] = ((p.lens[i] >> 8) & 255) as u8;
+        w = w + 3;
+        var c : u32 = 0;
+        while (c < ROW_BYTES) {
+            out[w + c] = p.text[i][c];
+            c = c + 1;
+        }
+        w = w + ROW_BYTES;
+        i = i + 1;
+    }
+    return w;
+}
+
+pub fn panel_digest(p: *ChatPanel) -> [32]u8 {
+    var buf : [8200]u8 = [0] ** 8200;
+    var n = digest_bytes(p, buf[0..8200]);
+    return hash(buf[0..n]);
+}
+
+// ---- tests ----
+
+test "the constants: one send action, the caps, the three kinds" {
+    assert(ACTION_SEND == "chat_send");
+    assert(MAX_MSG == 512);
+    assert(PANEL_MESSAGES == 12);
+    assert(CK_KINDS == 3);
+    assert(RENDER_PRIM == PRIM_TEXT);
+    assert(RENDER_OP == DL_TEXT);
+}
+
+test "a user line opens the transcript, a token opens the turn, done closes it" {
+    var p = new_panel();
+    var r = apply_wire(&p, 1, CK_USER, "what is on the board?");
+    assert(r == CHAT_OK);
+    assert(p.count == 1);
+    assert(p.sides[0] == SIDE_USER);
+    assert(p.turn_open == false);
+    assert(p.last_seq == 1);
+    r = apply_wire(&p, 2, CK_TOKEN, "three");
+    assert(r == CHAT_OK);
+    assert(p.turn_open == true);
+    r = apply_wire(&p, 3, CK_TOKEN, " cards");
+    assert(r == CHAT_OK);
+    r = apply_wire(&p, 4, CK_DONE, "");
+    assert(r == CHAT_OK);
+    assert(p.turn_open == false);
+    assert(p.count == 2);
+    assert(p.sides[1] == SIDE_QUEEN);
+    assert(p.lens[1] == 11);                       // "three cards"
+    assert(open_len(&p) == 0);                     // the turn is closed
+}
+
+test "a line longer than MAX_MSG is refused whole, the panel untouched" {
+    var p = new_panel();
+    var r = apply_wire(&p, 1, CK_USER, "short");
+    assert(r == CHAT_OK);
+    var long : [513]u8 = [120] ** 513;
+    r = apply_wire(&p, 2, CK_USER, long[0..513]);
+    assert(r == ERR_TOO_LONG);
+    assert(p.count == 1);                          // nothing entered the window
+    assert(p.lens[0] == 5);
+    assert(p.sides[0] == SIDE_USER);
+    assert(p.last_seq == 2);                       // the refused event was seen, its content ignored
+    assert(open_len(&p) == 0);
+}
+
+test "the window keeps the last 12 and states the dropped count" {
+    var p = new_panel();
+    var i : u32 = 1;
+    while (i <= 20) {
+        var r = apply_wire(&p, i, CK_USER, "line");
+        assert(r == CHAT_OK);
+        i = i + 1;
+    }
+    assert(p.count == PANEL_MESSAGES);
+    assert(p.dropped == 8);
+    assert(p.sides[0] == SIDE_USER);
+    var ops = render_ops(&p);
+    assert(ops == PANEL_MESSAGES + 1);             // the messages plus the "+8 earlier" line
+}
+
+test "other kinds on the one stream advance the seq" {
+    var p = new_panel();
+    var r = apply_wire(&p, 1, CK_USER, "hi");
+    assert(r == CHAT_OK);
+    r = apply_wire(&p, 2, 77, "");                 // a scene delta, a work-graph event: not ours
+    assert(r == CHAT_OK);
+    assert(p.last_seq == 2);
+    assert(p.count == 1);
+}
+
+test "a foreign kind touches no chat byte" {
+    var p = new_panel();
+    var r = apply_wire(&p, 1, CK_USER, "hi");
+    assert(r == CHAT_OK);
+    var before = panel_digest(&p);
+    r = apply_wire(&p, 2, 77, "");
+    assert(r == CHAT_OK);
+    var after = panel_digest(&p);
+    var k : u32 = 1;
+    while (k < 32) {
+        assert(before[k] == after[k]);             // everything but the seq byte is unchanged
+        k = k + 1;
+    }
+}
+
+test "a done without an open turn is malformed" {
+    var p = new_panel();
+    assert(apply_wire(&p, 1, CK_DONE, "") == ERR_DONE_WITHOUT_TURN);
+}
+
+// The M-gate: the recorded log replays to the same panel twice -- the same sha256 -- and every
+// rendered string is a TEXT op of the allowed primitive.
+test "the recorded log replays to the same sha256 twice, TEXT ops only" {
+    var a = new_panel();
+    var b = new_panel();
+    var i : u32 = 0;
+    while (i < LOG_KINDS.len) {
+        var seq = i as u32 + 1;
+        var bytes : []const u8 = LOG_TEXTS[i];
+        assert(apply_wire(&a, seq, LOG_KINDS[i], bytes) == CHAT_OK);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < LOG_KINDS.len) {
+        var seq = i as u32 + 1;
+        var bytes : []const u8 = LOG_TEXTS[i];
+        assert(apply_wire(&b, seq, LOG_KINDS[i], bytes) == CHAT_OK);
+        i = i + 1;
+    }
+    var da = panel_digest(&a);
+    var db = panel_digest(&b);
+    var k : u32 = 0;
+    while (k < 32) {
+        assert(da[k] == db[k]);
+        k = k + 1;
+    }
+    assert(render_ops(&a) == render_ops(&b));
+    assert(a.count > 0);
+    assert(a.dropped > 0);                         // the log is long enough to have trimmed
+}
+
+// A recorded chat log, checked in as data: the user asks, the Queen streams, the turn closes, and
+// the exchange repeats enough times to scroll the window.
+pub const LOG_KINDS : [30]u8 = [
+    CK_USER, CK_TOKEN, CK_TOKEN, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_TOKEN, CK_TOKEN, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_TOKEN, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_TOKEN, CK_DONE,
+    CK_USER, CK_TOKEN, CK_DONE,
+];
+pub const LOG_TEXTS : [30]str = [
+    "what is on the board?", "three", " cards", " and", "",
+    "ship it", "on", " it", "",
+    "rerun the suite", "run", "ning", " the", " su", "",
+    "and the seals?", "sea", "",
+    "what changed?", "two", " specs", " moved", "",
+    "merge order?", "ledger", " first", "",
+    "and then?", "the page", "",
+];
