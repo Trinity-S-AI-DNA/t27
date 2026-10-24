@@ -27760,6 +27760,8 @@ impl RustCodegen {
                         if child.children.is_empty() || Self::is_undefined_init(&child.children) {
                             if child.extra_type.is_empty() {
                                 self.write_line(&format!("{} {};", kw, var_name));
+                            } else if let Some(zero) = Self::rust_array_zero_init(&typ) {
+                                self.write_line(&format!("{} {}: {} = {};", kw, var_name, typ, zero));
                             } else {
                                 self.write_line(&format!("{} {}: {};", kw, var_name, typ));
                             }
@@ -27962,6 +27964,27 @@ impl RustCodegen {
             && children[0].name == "undefined"
     }
 
+    /// Zero-initialiser for a Rust ARRAY type, for a local the spec declares
+    /// `= undefined` (or with no initialiser) and then fills through a
+    /// `&mut arr[0..n]` handed to a callee. rustc cannot see that write --
+    /// it does not count as initialising the array -- so the later read was
+    /// E0381 (#12036). `[0; n]` matches the interpreter, which reads only
+    /// the written prefix. NOT `Default::default()` (withdrawn #3223:
+    /// `[usize; 256]` has none), and not scalars: there a bare `let x: T;`
+    /// is legal and a read before a real assignment should fail loudly.
+    fn rust_array_zero_init(rust_type: &str) -> Option<String> {
+        let inner = rust_type.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (elem, count) = inner.split_once(';')?;
+        let zero = match elem.trim() {
+            "bool" => "false",
+            "f32" | "f64" => "0.0",
+            "usize" | "isize" => "0",
+            e if e.starts_with(['u', 'i']) && e[1..].bytes().all(|b| b.is_ascii_digit()) => "0",
+            _ => return None,
+        };
+        Some(format!("[{}; {}]", zero, count.trim()))
+    }
+
     fn rust_body_has_tail_expr(stmts: &[Node]) -> bool {
         stmts.last().is_some_and(|stmt| match stmt.kind {
             NodeKind::StmtExpr => stmt.children.len() == 1,
@@ -28047,6 +28070,8 @@ impl RustCodegen {
                 if stmt.children.is_empty() || Self::is_undefined_init(&stmt.children) {
                     if stmt.extra_type.is_empty() {
                         self.write_line(&format!("{} {};", kw, stmt.name));
+                    } else if let Some(zero) = Self::rust_array_zero_init(&typ) {
+                        self.write_line(&format!("{} {}: {} = {};", kw, stmt.name, typ, zero));
                     } else {
                         self.write_line(&format!("{} {}: {};", kw, stmt.name, typ));
                     }
@@ -29091,7 +29116,12 @@ impl RustCodegen {
                             if self.current_mut_slice_params.contains(a.as_str()) {
                                 continue;
                             }
-                            *a = format!("&mut {}", a);
+                            // The slice arm of `expr_to_rust` emits a SHARED
+                            // borrow (`&buf[0..5]`); wrapping it wholesale gave
+                            // `&mut &buf[0..5]`, a mut borrow OF a reference
+                            // (E0596, #12036). Borrow the place instead.
+                            let place = a.strip_prefix('&').filter(|r| !r.starts_with('&')).unwrap_or(a);
+                            *a = format!("&mut {}", place);
                         }
                     }
                     // `gen_fn` makes a bare `*T` parameter `&mut T`, so `&x` for it borrows

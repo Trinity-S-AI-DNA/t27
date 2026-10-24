@@ -335,11 +335,11 @@ pub fn select(out: &mut [u8], at: usize) -> usize {
 }
 
 pub fn export_section(out: &mut [u8], at: usize, count: u32, entries_joined: &[u8]) -> usize {
-    let mut vtmp: [u8; 5];
-    let mut vl: usize = uleb(&mut &vtmp[(0) as usize..(5) as usize], 0, (count as u64));
+    let mut vtmp: [u8; 5] = [0; 5];
+    let mut vl: usize = uleb(&mut vtmp[(0) as usize..(5) as usize], 0, (count as u64));
     let mut body_len: u64 = ((vl as u64) + (entries_joined.len() as u64));
-    let mut htmp: [u8; 5];
-    let mut hl: usize = uleb(&mut &htmp[(0) as usize..(5) as usize], 0, body_len);
+    let mut htmp: [u8; 5] = [0; 5];
+    let mut hl: usize = uleb(&mut htmp[(0) as usize..(5) as usize], 0, body_len);
     let mut n: usize = vec_prefix(out, ((at + 1) + hl), count);
     let mut i: usize = 0;
     while (i < entries_joined.len()) {
@@ -512,14 +512,14 @@ pub fn type_body(out: &mut [u8], names: &[u8], descs: &[u8], bodies: &[u8]) -> u
     let mut n: usize = vec_prefix(out, 0, (k as u32));
     let mut i: usize = 0;
     while (i < k) {
-        let mut ps: [u8; MAX_DESC_PARAMS as usize];
+        let mut ps: [u8; MAX_DESC_PARAMS as usize] = [0; MAX_DESC_PARAMS as usize];
         let mut np: usize = (desc_nparams(descs, i) as usize);
         let mut j: usize = 0;
         while (j < np) {
             ps[(j) as usize] = VT_I32;
             j = (j + 1);
         }
-        let mut rs: [u8; 1];
+        let mut rs: [u8; 1] = [0; 1];
         rs[0] = desc_result(descs, i);
         n = functype_full(out, n, &ps[(0) as usize..(np) as usize], &rs[(0) as usize..(1) as usize]);
         i = (i + 1);
