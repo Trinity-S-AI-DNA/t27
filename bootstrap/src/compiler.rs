@@ -8416,30 +8416,22 @@ impl Codegen {
             self.write("pub ");
         }
 
-        // W729: `pub const GFTernary = u8;` is a TYPE ALIAS, and the identifier
-        // on the right is the builtin type, not a name to look up. `zig_ident`
-        // escapes primitives as `@"u8"` -- correct for something NAMED u8,
-        // fatal here: Zig reports `use of undeclared identifier 'u8'` and the
-        // whole spec stops compiling, so its 18 test blocks had never run.
-        // The C backend has detected this pattern since it was written
-        // (`typedef uint8_t GFTernary;`); the Zig backend never did.
-        if node.children.len() == 1
-            && node.children[0].kind == NodeKind::ExprIdentifier
-            && {
-                // Same predicate `zig_ident` uses to decide something is a
-                // builtin type name -- uN/iN/fN plus the named primitives.
-                let n = &node.children[0].name;
-                matches!(
-                    n.as_str(),
-                    "bool" | "void" | "type" | "usize" | "isize"
-                        | "comptime_int" | "comptime_float"
-                ) || (n.len() >= 2
+        // W729: `pub const GFTernary = u8;` is a TYPE ALIAS -- the identifier on the
+        // right is a type, not a name to look up (`zig_ident` escapes primitives as
+        // @"u8"`, so the raw path emitted `use of undeclared identifier 'u8'`).
+        // #11940 sub-slice 3: a fn type is the same alias shape; its mapper removes
+        // the arrow Zig does not have.
+        if node.children.len() == 1 && node.children[0].kind == NodeKind::ExprIdentifier {
+            let n = node.children[0].name.clone();
+            let builtin = matches!(n.as_str(), "bool" | "void" | "type" | "usize" | "isize"
+                | "comptime_int" | "comptime_float")
+                || (n.len() >= 2
                     && (n.starts_with('u') || n.starts_with('i') || n.starts_with('f'))
-                    && n[1..].chars().all(|c| c.is_ascii_digit()))
+                    && n[1..].chars().all(|c| c.is_ascii_digit()));
+            if let Some(ty) = Self::t27_fn_type_to_zig(&n).or_else(|| builtin.then_some(n)) {
+                self.write_line(&format!("const {} = {};", node.name, ty));
+                return;
             }
-        {
-            self.write_line(&format!("const {} = {};", node.name, node.children[0].name));
-            return;
         }
 
         // A module-level `var` is MUTABLE. The parser records that in
@@ -8764,6 +8756,11 @@ impl Codegen {
 
     fn t27_array_type_to_zig(ty: &str) -> String {
         let t = ty.trim();
+        // #11940 sub-slice 3: a t27 fn TYPE is a type in every position this
+        // mapper serves; it used to pass through verbatim, arrow and all.
+        if let Some(mapped) = Self::t27_fn_type_to_zig(t) {
+            return mapped;
+        }
         // #6451: t27 also spells an optional Rust/TypeScript-style, AFTER the
         // type -- `OrgID?`, `str?`. Zig spells it `?T`; the suffix reached the
         // output verbatim and Zig answered "expected ',' after field" at the
@@ -8889,6 +8886,27 @@ impl Codegen {
             return t.to_string();
         }
         format!("{}{}", prefix, mapped)
+    }
+
+    /// #11940 sub-slice 3: a t27 fn TYPE renders as Zig's `fn (S) R`; a
+    /// multi-value return is the anonymous struct the tuple mapper builds.
+    /// Shape mirrors `fn_type_alias` (return after the FIRST `)`, a named
+    /// parameter keeps only its type) and Zig's fn TYPE spells a void return.
+    fn t27_fn_type_to_zig(text: &str) -> Option<String> {
+        let (args, ret) = text.trim().strip_prefix("fn")?.trim_start()
+            .strip_prefix('(')?.split_once(')')?;
+        let args: Vec<String> = args.split(',').map(str::trim).filter(|a| !a.is_empty())
+            .map(|a| Self::t27_array_type_to_zig(a.rsplit(':').next().unwrap_or(a).trim()))
+            .collect();
+        let ret = ret.trim();
+        let ret = ret.strip_prefix("->").map(str::trim).unwrap_or(ret);
+        let tail = if ret.is_empty() || ret == "void" {
+            " void".to_string()
+        } else {
+            format!(" {}", Self::t27_tuple_type_to_zig(ret)
+                .unwrap_or_else(|| Self::t27_array_type_to_zig(ret)))
+        };
+        Some(format!("fn ({}){}", args.join(", "), tail))
     }
 
     fn t27_tuple_type_to_zig(ty: &str) -> Option<String> {
@@ -31888,12 +31906,6 @@ impl LinkerConfig {
         self.data_base.saturating_add(self.stack_size)
     }
 
-    pub fn heap_start(&self) -> u32 {
-        self.data_base
-            .saturating_add(self.data_base)
-            .saturating_add(self.stack_size)
-    }
-
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
         if self.entry.is_empty() {
@@ -33597,14 +33609,6 @@ impl HirRetimer {
         }
     }
 
-    pub fn retime_forward(&mut self, from: &str, to: &str, regs: u32) {
-        self.operations.push(RetimingOp::forward(from, to, regs));
-    }
-
-    pub fn retime_backward(&mut self, from: &str, to: &str, regs: u32) {
-        self.operations.push(RetimingOp::backward(from, to, regs));
-    }
-
     pub fn improvement_percent(&self) -> u32 {
         if self.original_crit_ps == 0 {
             return 0;
@@ -33661,9 +33665,6 @@ impl ConfigReg {
             writable: false,
             description: String::new(),
         }
-    }
-    pub fn byte_offset(&self) -> u32 {
-        self.offset / 8
     }
 }
 
@@ -42599,11 +42600,6 @@ impl HirSvEmitter {
         self.output.push_str("endpackage\n\n");
     }
 
-    pub fn emit_interface(&mut self, iface: &SvInterface) {
-        self.output.push_str(&iface.emit());
-        self.output.push('\n');
-    }
-
     pub fn emit_module_sv(&mut self, hir: &HirModule) {
         self.output.push_str(&format!("module {} (\n", hir.name));
         for (i, port) in hir.ports.iter().enumerate() {
@@ -42977,9 +42973,6 @@ impl HirLinter {
             }
         }
         violations
-    }
-    pub fn lint_count(module: &HirModule) -> u32 {
-        Self::lint(module).len() as u32
     }
 }
 
