@@ -2,8 +2,10 @@
 
 A minimum viable operating surface written in [t27](https://github.com/gHashTag/t27).
 Its home screen is the 27-petal 999 triangle: three realms of nine petals each. Pressing a petal opens that
-petal's menu, a grid of cards for existing widgets. The same spec drives the trios macOS app today
-and an FPGA board (AX7203) at the end.
+petal's menu, a grid of cards for existing widgets. The same spec is meant to drive two targets,
+the trios macOS app and an FPGA board (AX7203); `specs/os/home.t27` marks neither as running yet: it holds
+both as PLANNED (`TARGET_STATUS`) and its test `no_target_is_claimed_to_run_before_its_milestone`
+fails the day one is marked running without its milestone.
 
 - **Epic:** [gHashTag/t27#10782](https://github.com/gHashTag/t27/issues/10782). The milestones live there, not here.
 - **The menu spec:** `specs/t27f/petal_menu.t27` in gHashTag/t27 (module `T27fPetalMenu`).
@@ -30,7 +32,7 @@ come from TRI CLAW (gHashTag/t27#9271), not from hand-written workflow files. Se
 
 ## Where the specs live (SSOT rule, 2026-10-23)
 
-The operating specs of T27 OS -- kernel and agent cap, evolve, domain pulse, devices, panel surfaces -- live in gHashTag/t27 under `specs/t27os/` and are gated there by the compiler, seals and CI. This repo holds the OS shell that mounts them and the build recipe for the three surfaces (trios app, site, FPGA). The epic and its milestones live in gHashTag/t27#10782.
+The operating specs of T27 OS -- kernel and agent cap, evolve, domain pulse, devices, panel surfaces -- live in gHashTag/t27 under `specs/t27os/` and are gated there by the compiler, seals and CI. This repo holds the OS shell that mounts them; the build recipe for the three surfaces (trios app, site, FPGA) is not written yet. The epic and its milestones live in gHashTag/t27#10782.
 
 A change to an OS rule belongs in t27; a change to a surface belongs here. Sync check: petal count, the tool-letter registry and the kernel agent cap must match between the two trees -- a mismatch is a defect, not a fork.
 
