@@ -27653,39 +27653,9 @@ impl RustCodegen {
                         self.write_line(&format!("let ({}) = {};", child.extra_field, val));
                     }
                     NodeKind::StmtLocal => {
-                        let mutable = child.extra_mutable || self.mut_names.contains(&child.name);
-                        let kw = if mutable { "let mut" } else { "let" };
-                        let var_name = &child.name;
-                        let typ = Self::t27_type_to_rust(&child.extra_type);
-                        // The same question `gen_rust_stmt` asks. This function carries its
-                        // own copy of the local-emission logic, and a fix applied to only
-                        // one of the two is not applied: the first attempt at this patched
-                        // `gen_rust_stmt` alone and changed no output at all.
-                        if child.children.is_empty() || Self::is_undefined_init(&child.children) {
-                            if child.extra_type.is_empty() {
-                                self.write_line(&format!("{} {};", kw, var_name));
-                            } else {
-                                self.write_line(&format!("{} {}: {};", kw, var_name, typ));
-                            }
-                        } else {
-                            let val = self.expr_to_rust(&child.children[0]);
-                            // Same question, second copy of the same logic. See
-                            // `is_undefined_init`: a fix applied to one of these two is
-                            // not applied.
-                            let val = if Self::is_vec_from_array_literal(&typ, &child.children) {
-                                format!("vec!{val}")
-                            } else {
-                                val
-                            };
-                            if child.extra_type.is_empty() {
-                                self.write_line(&format!("{} {} = {};", kw, var_name, val));
-                            } else {
-                                self.write_line(&format!(
-                                    "{} {}: {} = {};",
-                                    kw, var_name, typ, val
-                                ));
-                            }
-                        }
+                        let mutable =
+                            child.extra_mutable || self.mut_names.contains(&child.name);
+                        self.gen_rust_local(child, mutable);
                     }
                     NodeKind::StmtAssign => {
                         let target = if child.children.is_empty() {
@@ -27919,6 +27889,56 @@ impl RustCodegen {
         }
     }
 
+    /// The ONE copy of the Rust local-emission logic; a one-copy fix once changed no output at all.
+    fn gen_rust_local(&mut self, local: &Node, mutable: bool) {
+        let kw = if mutable { "let mut" } else { "let" };
+        let typ = Self::t27_type_to_rust(&local.extra_type);
+        if local.children.is_empty() || Self::is_undefined_init(&local.children) {
+            if local.extra_type.is_empty() {
+                self.write_line(&format!("{} {};", kw, local.name));
+            } else if let Some(fill) = Self::rust_array_zero(&typ) {
+                // #5980 (E0381): a later PARTIAL write never initializes a
+                // bare `let mut x: [T; N];`; the fill is unobservable to a
+                // lawful spec (`undefined` guarantees nothing: t27b 0, zig 0xAA).
+                self.write_line(&format!("{} {}: {} = {};", kw, local.name, typ, fill));
+            } else {
+                self.write_line(&format!("{} {}: {};", kw, local.name, typ));
+            }
+        } else {
+            let mut val = self.expr_to_rust(&local.children[0]);
+            if Self::is_vec_from_array_literal(&typ, &local.children) {
+                val = format!("vec!{val}");
+            }
+            if local.extra_type.is_empty() {
+                self.write_line(&format!("{} {} = {};", kw, local.name, val));
+            } else {
+                self.write_line(&format!("{} {}: {} = {};", kw, local.name, typ, val));
+            }
+        }
+    }
+    /// The zero-fill literal of a rendered Rust array type, else None; the
+    /// LAST `;` inside the brackets splits element from count. The zero is
+    /// the element type's (`0.0` for floats, `false` for bool), and a nested
+    /// array element recurses: `[[u8; 4]; 2]` -> `[[0; 4]; 2]`.
+    fn rust_array_zero(typ: &str) -> Option<String> {
+        let inner = typ.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (elem, n) = inner.rsplit_once(';')?;
+        let n = n.trim();
+        if n.is_empty() {
+            return None;
+        }
+        let e = elem.trim();
+        if e.starts_with('[') {
+            return Self::rust_array_zero(e).map(|z| format!("[{}; {}]", z, n));
+        }
+        let zero = match e {
+            "f32" | "f64" => "0.0",
+            "bool" => "false",
+            _ => "0",
+        };
+        Some(format!("[{}; {}]", zero, n))
+    }
+
     fn gen_rust_stmt(&mut self, stmt: &Node) {
         match stmt.kind {
             NodeKind::ExprReturn => {
@@ -27946,27 +27966,8 @@ impl RustCodegen {
                     self.write_line(&format!("let ({}) = {};", stmt.extra_field, val));
                     return;
                 }
-                let kw = if stmt.extra_mutable || self.mut_names.contains(&stmt.name) { "let mut" } else { "let" };
-                let typ = Self::t27_type_to_rust(&stmt.extra_type);
-                if stmt.children.is_empty() || Self::is_undefined_init(&stmt.children) {
-                    if stmt.extra_type.is_empty() {
-                        self.write_line(&format!("{} {};", kw, stmt.name));
-                    } else {
-                        self.write_line(&format!("{} {}: {};", kw, stmt.name, typ));
-                    }
-                } else {
-                    let val = self.expr_to_rust(&stmt.children[0]);
-                    let val = if Self::is_vec_from_array_literal(&typ, &stmt.children) {
-                        format!("vec!{val}")
-                    } else {
-                        val
-                    };
-                    if stmt.extra_type.is_empty() {
-                        self.write_line(&format!("{} {} = {};", kw, stmt.name, val));
-                    } else {
-                        self.write_line(&format!("{} {}: {} = {};", kw, stmt.name, typ, val));
-                    }
-                }
+                let mutable = stmt.extra_mutable || self.mut_names.contains(&stmt.name);
+                self.gen_rust_local(stmt, mutable);
             }
             NodeKind::StmtAssign => {
                 if stmt.children.len() >= 2 {
