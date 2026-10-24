@@ -87,3 +87,8 @@ Measured 2026-10-20 on the bench Mac: a claude pane spawned in such a worktree s
 - **At most as many panes as the machine allows.** On the 8 GB bench Mac that is about 3 working lanes. Stop starting lanes when free disk is under 4 GB, swap is over 6 GB or the load is over 40.
 - **Never read, print or store a key.** Panes get their keys from the KEYS tab; a lane that needs a key asks the owner, and no brief, report or log contains one.
 - **Nothing runs on a partner's machine beyond what its owner agreed.** A lane runs on this Mac or the lab, never on a partner's computer by this skill.
+
+## Traps
+
+- 2026-10-24 2026-10-24: t27os-pty list answered 'no server' (rc 10) from a Terminal tab and from ~/.t27os/t27os-pty while lsof ~/.t27os/pty.sock still showed server 57133 listening and idle; a peer rebuilt the client at 22:11 local. Do not kill the server (it owns peer panes): file a request, keep to non-heavy work. (t27-12028)
+- 2026-10-24 A pane started from a script has a different PATH: its bare tri may lack newer commands such as coverage; call ~/.local/bin/tri by full path. The Bash sandbox cannot reach pty.sock at all; use the Terminal tool, and keep each command short so Allow once stays active. (t27-12028)
