@@ -27,7 +27,7 @@
 //!     concern. Everything else in a pub fn is refused by name, never
 //!     silently dropped.
 
-use crate::ir::{ArithOp, Expr, ExprKind, Func, Program, Stmt, Ty};
+use crate::ir::{CmpOp, ArithOp, Expr, ExprKind, Func, Program, Stmt, Ty};
 
 /// The byte law (specs/tri/t27b/wasm.t27, floors 1-4): valtypes, varints,
 /// section framing, constant instructions. Landed on master by #11964; since
@@ -295,16 +295,76 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
                     ));
                 }
             }
-            let [Stmt::Return(Some(e))] = f.body.as_slice() else {
-                return Err(EmitError::new(
-                    &f.name,
-                    f.line,
-                    "fn body",
-                    "the wasm32 emitter lowers a single `return <expr>;` body only".into(),
-                ));
-            };
             let mut stack = Vec::new();
-            lower_stack(e, f, &mut stack)?;
+            match f.body.as_slice() {
+                [Stmt::Return(Some(e))] => {
+                    lower_stack(e, f, &mut stack)?;
+                }
+                // The select pattern: `if (<param> == 0) { return <x>; }
+                // return <y>;` -- eqz (0x45) is the law's comparison floor,
+                // select (0x1B) its branch-free join; the operands are i32
+                // constants, so the whole body is five instructions.
+                [Stmt::If { cond, then: tb, els }, Stmt::Return(Some(fall))] => {
+                    let refuse_body = || EmitError::new(
+                        &f.name,
+                        f.line,
+                        "fn body",
+                        "the wasm32 emitter lowers `return <expr>;` or `if (<param> == 0) { return <const>; } return <const>;` only".into(),
+                    );
+                    if !els.is_empty() {
+                        return Err(refuse_body());
+                    }
+                    let [Stmt::Return(Some(te))] = tb.as_slice() else {
+                        return Err(refuse_body());
+                    };
+                    let (ExprKind::Const(x), ExprKind::Const(y)) = (&te.kind, &fall.kind) else {
+                        return Err(refuse_body());
+                    };
+                    let ExprKind::Cmp { op: CmpOp::Eq, lhs, rhs } = &cond.kind else {
+                        return Err(EmitError::new(
+                            &f.name,
+                            f.line,
+                            "if condition",
+                            "the wasm32 emitter compares a parameter against 0 (eqz, the law's comparison floor) only".into(),
+                        ));
+                    };
+                    // `<param> == 0` or `0 == <param>`: either spelling is eqz(param).
+                    let pv = match (&lhs.kind, &rhs.kind) {
+                        (ExprKind::Var(p), ExprKind::Const(0)) => *p,
+                        (ExprKind::Const(0), ExprKind::Var(p)) => *p,
+                        _ => {
+                            return Err(EmitError::new(
+                                &f.name,
+                                f.line,
+                                "if condition",
+                                "the wasm32 emitter compares a parameter against 0 only (`== 0`, eqz's exact shape)".into(),
+                            ));
+                        }
+                    };
+                    if pv as usize >= f.nparams {
+                        return Err(refuse_body());
+                    }
+                    // select's stack: the true value, the false value, the condition.
+                    let sv = |v: &i128| if *v > i32::MAX as i128 { *v - (1i128 << 32) } else { *v };
+                    let mut b = [0u8; 11];
+                    let end = wasm_law::i32_const(&mut b, 0, sv(x) as i32);
+                    stack.extend_from_slice(&b[..end]);
+                    let end = wasm_law::i32_const(&mut b, 0, sv(y) as i32);
+                    stack.extend_from_slice(&b[..end]);
+                    let end = wasm_law::local_get(&mut b, 0, pv);
+                    stack.extend_from_slice(&b[..end]);
+                    stack.push(wasm_law::OP_I32_EQZ);
+                    stack.push(wasm_law::OP_SELECT);
+                }
+                _ => {
+                    return Err(EmitError::new(
+                        &f.name,
+                        f.line,
+                        "fn body",
+                        "the wasm32 emitter lowers `return <expr>;` or `if (<param> == 0) { return <const>; } return <const>;` only".into(),
+                    ));
+                }
+            }
             fns.push((i, ret, f.nparams, Body::Stack(stack)));
         }
     }
