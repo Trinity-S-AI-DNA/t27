@@ -18,10 +18,22 @@ extension, but it was never installed, and the grammar inside it was wrong in th
 ## Install
 
 ```bash
-code --install-extension vscode-trinity-swe/vscode-trinity-swe-0.2.0.vsix
+code --install-extension vscode-trinity-swe/vscode-trinity-swe-0.2.1.vsix --force
 ```
 
 For Insiders use `code-insiders`, for Cursor `cursor`. Reload the window afterwards.
+
+## File icon
+
+`.t27` tabs and the Explorer show the 27-petal Trinity logo: white on a transparent background in dark themes
+(`icons/dark.png`), the same shape in near-black in light themes (`icons/light.png`). The vector source is
+`icons/logo.svg`, the 27 paths of `favicon.svg` in gHashTag/trinity recoloured white. Regenerate the PNGs with
+plain commands:
+
+```bash
+rsvg-convert -w 256 -h 256 icons/logo.svg -o icons/dark.png
+magick icons/dark.png -fill '#1f1f1f' -colorize 100 icons/light.png
+```
 
 ## Rebuild the `.vsix` after editing the grammar
 
@@ -31,7 +43,7 @@ folder that holds this directory's `package.json`, `README.md` as `readme.md`, `
 replace the changed files under `extension/`, then zip it again:
 
 ```bash
-zip -X -r vscode-trinity-swe-0.2.0.vsix '[Content_Types].xml' extension.vsixmanifest extension
+zip -X -r vscode-trinity-swe-0.2.1.vsix '[Content_Types].xml' extension.vsixmanifest extension
 ```
 
 ## What is highlighted
