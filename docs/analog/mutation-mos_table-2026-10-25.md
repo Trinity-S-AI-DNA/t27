@@ -134,8 +134,8 @@ T14 makes the rv words rise by 1000 per gate node.
 rounding half of an argument from `+ k` to `- k`. At vd = 0 the u64 `(0 - 2048)` and the `E * F - 8388608` subtraction
 underflow, and Zig in safe mode traps; the trap is reported as a FAIL of that one test, so T12 kills those three **by a
 trap**, not by pinning a value at a rounding boundary. The asserts at vd = 0 (`p0`, `n0`) and at vd = 1000 (`p1`) are the
-witnesses: 469 and 472 trap at vd = 0 only, 471 at vd = 0 and at vd = 1000 on `tabp`. Whether the gate's mutant build
-traps the same way was not checked, because the gate was not run. The fourth mutant (474, `cx * nd1` to `cx / nd1`) is
+witnesses: 469 and 472 trap at vd = 0 only, 471 at vd = 0 and at vd = 1000 on `tabp`. The gate run
+(see "Gate result") lists none of the four lines among the survivors, so its mutant build kills them too. The fourth mutant (474, `cx * nd1` to `cx / nd1`) is
 killed by a value: on the cross-term table the mutant gives 0, 34 and 63 against 1, 56 and 9155 (measured).
 
 ### Equivalent (25), accepted
@@ -176,10 +176,21 @@ and all were killed; unviable mutants are counted nowhere), the 4 unviable entri
 carry an entry for an equivalent flip-cmp mutant while T4 and T5 kill other mutants of the same line; those killed
 mutants are of other kinds, or (631) of the same kind as a surviving one, so neither entry is stale.
 
-Predicted gate figures, not measured: 632 mutants, 583 killed (493 + 41 + 48 + 1), 25 survived (115 - 41 - 48 - 1: the 25
-equivalent), 20 hung, 4 unviable; the 25 survivors and the 20 hung are accepted, 0 accepted lines are killed. If the
-prediction holds the gate has no unaccepted survivor and no stale entry. If it reports a mutant of group K or of line 835
-as surviving, the hand edit differed from the census mutant and the gap is real; it is not to be entered as accepted.
+## Gate result (measured)
+
+`tri mutate spec --file specs/analog/mos_table.t27 --accepted docs/analog/mutation-accepted-mos_table.txt --jobs 3
+--timeout 45` with the master-built compiler, run in a T27 OS pane on this tree from 18:06 to 18:23 +07 on 2026-10-25
+(17.5 minutes; 1-min load 9.3 at the start; three earlier attempts the same day were killed by the load rule at 16:17,
+16:46 and 17:35 and a fourth at 17:54, all by other sessions' load, none produced a result). Exit 0, "Gate passed":
+
+- 632 mutants: drop-guard 22, flip-cmp 64, swap-logic 5, drop-step 64, swap-arith 406, ret-default 71.
+- 583 killed (583 by a failing test, 0 by an invariant at compile time), 25 survived, 20 hung, 4 unviable.
+- The survivor gate counts 45 not killed (25 survived, 20 hung), 45 accepted by the file, 0 accepted lines now killed.
+- Lines 469, 471, 472, 474 (T12), 835 (T16) and 910 (group K) are not among the 49 non-killed mutants, so the hand
+  edits of the table above matched the census mutants and the gaps they closed are closed.
+
+These figures equal the ones predicted before the run (632 / 583 / 25 / 20 / 4); the prediction was derived from the
+hand-run kills (493 + 41 + 48 + 1 killed, 115 - 41 - 48 - 1 = 25 equivalent) and is now confirmed, not replaced.
 
 ## Caveats (what is by hand or not established)
 
