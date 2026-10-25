@@ -197,13 +197,29 @@ pub const OP_LOCAL_GET : u8 = 0x20;
 pub const OP_LOCAL_SET : u8 = 0x21;
 pub const OP_LOCAL_TEE : u8 = 0x22;
 pub const OP_I32_CONST : u8 = 0x41;
-; P3 (2026-10-24): i64.const joins as the LOW-32 floor. OP_I64_CONST decodes the
-; same five-byte SLEB128 submachine as OP_I32_CONST and pushes the same u32 word:
-; for every i64 whose low 32 bits are what the answer contract expresses, a
-; canonical SLEB of five bytes or fewer exists (the fleet's 987654321 and -5 both
-; fit); a longer continuation at imm_cnt == 4 refuses with ERR_LEB, the same honest
-; boundary as i32. The 64-bit datapath itself stays a separate increment.
+; P3 (2026-10-24): i64.const joined as the LOW-32 floor. It decoded the same
+; five-byte SLEB128 submachine as OP_I32_CONST and pushed one u32 word. P7 (#12371)
+; replaces that floor with a real pair: OP_I64_CONST now pushes TWO stack slots, the
+; HIGH word deeper and the LOW word on top, decodes up to ten SLEB bytes, and refuses
+; a continuation on the tenth byte with ERR_LEB. The root end still answers
+; st[sp - 1], now the LOW word of the i64 on top, so the P3 answers stand (987654321
+; answers B1 68 DE, -5 answers FB FF FF).
 pub const OP_I64_CONST : u8 = 0x42;
+; P7 (#12371): the nine i64 bytes the cell executes on the pair layout. Every one
+; works on i64 values held as two consecutive u32 slots, HIGH deeper, LOW on top.
+; Only the low-24-bit answer window and the 32-bit words of the stack ever exist in
+; the datapath: no u64 value beyond 32 bits is formed (the t27c Verilog emitter
+; emits an as u64 cast verbatim, #12296), so a carry is detected as sum < operand
+; and a borrow as a < b, never by a shift of a wide sum.
+pub const OP_I32_WRAP_I64 : u8 = 0xA7;
+pub const OP_I64_EXTEND_I32_S : u8 = 0xAC;
+pub const OP_I64_EXTEND_I32_U : u8 = 0xAD;
+pub const OP_I64_ADD : u8 = 0x7C;
+pub const OP_I64_SUB : u8 = 0x7D;
+pub const OP_I64_MUL : u8 = 0x7E;
+pub const OP_I64_SHL : u8 = 0x86;
+pub const OP_I64_SHR_S : u8 = 0x87;
+pub const OP_I64_SHR_U : u8 = 0x88;
 ; P4 (2026-10-24): the float consts join as RAW-BIT words -- no LEB at all. A real
 ; wasm f32.const carries its four IEEE-754 bytes little-endian right after the
 ; opcode, f64.const its eight; the floor pushes those bits as the u32 stack word:
@@ -307,6 +323,10 @@ var mul_run : u8 = 0
 var mul_a : u32 = 0
 var mul_b : u32 = 0
 var mul_acc : u32 = 0
+var mul_a_hi : u32 = 0
+var mul_b_hi : u32 = 0
+var mul_acc_hi : u32 = 0
+var mul_wide : u8 = 0
 var res : u32 = 0
 var scrap_op : u8 = 0
 var scrap_imm : u8 = 0
@@ -334,6 +354,8 @@ var run_len : u32 = 0
 var imm_run : u8 = 0
 var imm_cnt : u8 = 0
 var imm_acc : u32 = 0
+var imm_hi : u32 = 0
+var imm_wide : u8 = 0
 var dv_run : u8 = 0
 var dv_kind : u8 = 0
 var dv_negq : u8 = 0
@@ -791,6 +813,142 @@ fn mem_extend(op : u8, acc : u32) -> u32 {
     return acc;
 }
 
+; --- P7 helpers (issue #12371): an i64 is TWO u32 stack slots, the HIGH word deeper and the
+; --- LOW word on top, so the root end (which answers st[sp - 1]) answers the LOW 32 bits of
+; --- an i64 left on the stack and the P3 answers stand. Nothing below forms a u64 value
+; --- beyond 32 bits (#12296: the Verilog emitter emits an as u64 cast verbatim, so a u64 is
+; --- 32 bits in hardware): a sum is masked with wrap32 and nothing else, a carry is "the sum
+; --- is below an addend", a borrow is "a < b", and the subtract keeps the proven form
+; --- wrap32((a as u64) + (4294967296 - (b as u64))). Flat if-chains, no loop, no `*`.
+
+; 1 for the nine bytes P7 executes in the tick besides i64.const (which has its own
+; immediate decode): wrap, the two extends, add, sub, mul and the three shifts.
+fn is_p7_op(b : u8) -> u8 {
+    if (b == OP_I32_WRAP_I64 || b == OP_I64_EXTEND_I32_S || b == OP_I64_EXTEND_I32_U) { return 1; }
+    if (b == OP_I64_ADD || b == OP_I64_SUB || b == OP_I64_MUL) { return 1; }
+    if (b == OP_I64_SHL || b == OP_I64_SHR_S || b == OP_I64_SHR_U) { return 1; }
+    return 0;
+}
+
+; the HIGH word of a sign extension: all ones when bit 31 of x is set, else zero
+fn i64_sign_word(x : u32) -> u32 {
+    if ((x & 0x80000000) != 0) { return 0xFFFFFFFF; }
+    return 0;
+}
+
+; 1 when a + b wraps past 32 bits: the masked sum is then below an addend
+fn carry32(a : u32, b : u32) -> u32 {
+    if (wrap32((a as u64) + (b as u64)) < b) { return 1; }
+    return 0;
+}
+
+fn i64_add_lo(alo : u32, blo : u32) -> u32 {
+    return wrap32((alo as u64) + (blo as u64));
+}
+
+; the HIGH word of a + b: the two high words plus the carry out of the low words
+fn i64_add_hi(ahi : u32, bhi : u32, alo : u32, blo : u32) -> u32 {
+    var c : u32 = carry32(alo, blo);
+    return wrap32((ahi as u64) + (bhi as u64) + (c as u64));
+}
+
+fn i64_sub_lo(alo : u32, blo : u32) -> u32 {
+    return wrap32((alo as u64) + (4294967296 - (blo as u64)));
+}
+
+; the HIGH word of a - b: the high difference, one less when the low words borrow
+fn i64_sub_hi(ahi : u32, bhi : u32, alo : u32, blo : u32) -> u32 {
+    var d : u32 = wrap32((ahi as u64) + (4294967296 - (bhi as u64)));
+    if (alo < blo) {
+        return wrap32((d as u64) + 4294967295);
+    }
+    return d;
+}
+
+; the shifts take the count k = (low word of the count operand) & 63; the high word of the
+; count is ignored. Left: a count of 32 or more moves the low word up and clears the low.
+fn i64_shl_hi(ahi : u32, alo : u32, k : u32) -> u32 {
+    if (k == 0) { return ahi; }
+    if (k < 32) { return shl32(ahi, k) | shr_u32(alo, 32 - k); }
+    return shl32(alo, k - 32);
+}
+
+fn i64_shl_lo(alo : u32, k : u32) -> u32 {
+    if (k < 32) { return shl32(alo, k); }
+    return 0;
+}
+
+; Logical right: a count of 32 or more moves the high word down and clears the high.
+fn i64_shru_hi(ahi : u32, k : u32) -> u32 {
+    if (k < 32) { return shr_u32(ahi, k); }
+    return 0;
+}
+
+fn i64_shru_lo(ahi : u32, alo : u32, k : u32) -> u32 {
+    if (k == 0) { return alo; }
+    if (k < 32) { return shr_u32(alo, k) | shl32(ahi, 32 - k); }
+    return shr_u32(ahi, k - 32);
+}
+
+; Arithmetic right: the same, with the sign of the high word filling in.
+fn i64_shrs_hi(ahi : u32, k : u32) -> u32 {
+    if (k < 32) { return sar32(ahi, k); }
+    return i64_sign_word(ahi);
+}
+
+fn i64_shrs_lo(ahi : u32, alo : u32, k : u32) -> u32 {
+    if (k == 0) { return alo; }
+    if (k < 32) { return shr_u32(alo, k) | shl32(ahi, 32 - k); }
+    return sar32(ahi, k - 32);
+}
+
+; The wide LEB128 decode of i64.const. Group k (k = 0..9) is 7 bits at bit 7k. The first
+; group is taken by the const arm; group k = 1..9 arrives in the submachine. Where the group
+; lands: k = 1, 2, 3 in the low word at bits 7, 14, 21; k = 4 straddles (its low four bits
+; at low bits 28..31, its top three at high bits 0..2); k = 5..8 in the high word at bits
+; 3, 10, 17, 24; k = 9 gives bit 63 (the group's bit 0) and nothing else -- the rest does not
+; fit and is dropped, as the MVP drops the excess of a fifth i32 byte.
+fn leb_lo_part(g : u32, k : u32) -> u32 {
+    if (k == 1) { return shl32(g, 7); }
+    if (k == 2) { return shl32(g, 14); }
+    if (k == 3) { return shl32(g, 21); }
+    if (k == 4) { return shl32(g & 15, 28); }
+    return 0;
+}
+
+fn leb_hi_part(g : u32, k : u32) -> u32 {
+    if (k == 4) { return g >> 4; }
+    if (k == 5) { return shl32(g, 3); }
+    if (k == 6) { return shl32(g, 10); }
+    if (k == 7) { return shl32(g, 17); }
+    if (k == 8) { return shl32(g, 24); }
+    if (k == 9) { return shl32(g, 31); }
+    return 0;
+}
+
+; Sign fill after the FINAL byte, group index k. The sign is bit 6 of that group, bit 7k + 6
+; of the value: 13, 20, 27 (low word), 34, 41, 48, 55, 62 (high word bits 2, 9, 16, 23, 30);
+; for k = 9 it is bit 69, past the word, so nothing fills. The HIGH fill reads the low word
+; before the low fill touches it, so the caller takes hi first.
+fn leb_fill_hi(lo : u32, hi : u32, k : u32) -> u32 {
+    if (k == 1) { if ((lo & 0x2000) != 0) { return 0xFFFFFFFF; } return hi; }
+    if (k == 2) { if ((lo & 0x100000) != 0) { return 0xFFFFFFFF; } return hi; }
+    if (k == 3) { if ((lo & 0x8000000) != 0) { return 0xFFFFFFFF; } return hi; }
+    if (k == 4) { if ((hi & 0x4) != 0) { return hi | 0xFFFFFFF8; } return hi; }
+    if (k == 5) { if ((hi & 0x200) != 0) { return hi | 0xFFFFFC00; } return hi; }
+    if (k == 6) { if ((hi & 0x10000) != 0) { return hi | 0xFFFE0000; } return hi; }
+    if (k == 7) { if ((hi & 0x800000) != 0) { return hi | 0xFF000000; } return hi; }
+    if (k == 8) { if ((hi & 0x40000000) != 0) { return hi | 0x80000000; } return hi; }
+    return hi;
+}
+
+fn leb_fill_lo(lo : u32, k : u32) -> u32 {
+    if (k == 1) { if ((lo & 0x2000) != 0) { return lo | 0xFFFFC000; } return lo; }
+    if (k == 2) { if ((lo & 0x100000) != 0) { return lo | 0xFFE00000; } return lo; }
+    if (k == 3) { if ((lo & 0x8000000) != 0) { return lo | 0xF0000000; } return lo; }
+    return lo;
+}
+
 ; How the forward scan (issue #12010) steps over byte b when a branch skips it: 0 one byte
 ; and no immediate, 1 one LEB immediate (also the reserved byte of memory.size and
 ; memory.grow), 2 block or loop (one block-type byte, opens a nested label), 3 end, 4
@@ -800,6 +958,10 @@ fn mem_extend(op : u8, acc : u32) -> u32 {
 ; P6: if opens a nested label like block and loop (class 2), call and the global ops carry one
 ; LEB (class 1), and else is class 7: one byte, no immediate, a delimiter only for the scan
 ; of an if-false skip.
+; P7 (#12371): i64.const carries one LEB immediate like i32.const (class 1; the scan skips a
+; ten-byte LEB as readily as a five-byte one), and the nine other i64 bytes take no immediate
+; (class 0) -- the scan is as strict as the fetch, so the bytes the cell now runs must not
+; answer ERR_OPCODE when a branch skips over them.
 fn scan_class(b : u8) -> u8 {
     if (alu_arity(b) != 0) { return 0; }
     if (b >= OP_I32_MUL && b <= OP_I32_REM_U) { return 0; }
@@ -812,6 +974,8 @@ fn scan_class(b : u8) -> u8 {
     if (b == OP_BR_TABLE) { return 4; }
     if (mem_width(b) != 0 || b == OP_CALL_INDIRECT) { return 6; }
     if (b == OP_MEMORY_SIZE || b == OP_MEMORY_GROW) { return 1; }
+    if (b == OP_I64_CONST) { return 1; }
+    if (is_p7_op(b) == 1) { return 0; }
     return 5;
 }
 
@@ -840,6 +1004,8 @@ fn fail_rsp(e : u8) {
     br_run = 0;
     sc_run = 0;
     mem_run = 0;
+    mul_wide = 0;
+    imm_wide = 0;
 }
 
 fn ok_rsp() {
@@ -1092,6 +1258,8 @@ fn step_all(rxd : u8) {
                 br_run = 0;
                 sc_run = 0;
                 mem_run = 0;
+                mul_wide = 0;
+                imm_wide = 0;
                 lsp = 0;
                 csp = 0;
                 lbase = 0;
@@ -1156,6 +1324,8 @@ fn step_all(rxd : u8) {
             br_run = 0;
             sc_run = 0;
             mem_run = 0;
+            mul_wide = 0;
+            imm_wide = 0;
             lsp = 0;
             csp = 0;
             lbase = 0;
@@ -1177,6 +1347,23 @@ fn step_all(rxd : u8) {
             drops = drops + 1;
         }
         if (ms == 1 && phase == 1) {
+            if (mul_run > 0 && mul_wide == 1) {
+                if ((mul_b & 1) == 1) {
+                    mul_acc_hi = i64_add_hi(mul_acc_hi, mul_a_hi, mul_acc, mul_a);
+                    mul_acc = wrap32((mul_acc as u64) + (mul_a as u64));
+                }
+                mul_a_hi = shl32(mul_a_hi, 1) | shr_u32(mul_a, 31);
+                mul_a = shl32(mul_a, 1);
+                mul_b = shr_u32(mul_b, 1) | shl32(mul_b_hi & 1, 31);
+                mul_b_hi = shr_u32(mul_b_hi, 1);
+                mul_run = mul_run - 1;
+                if (mul_run == 0) {
+                    st[sp - 2] = mul_acc_hi;
+                    st[sp - 1] = mul_acc;
+                    mul_wide = 0;
+                    pc = pc + 1;
+                }
+            } else {
             if (mul_run > 0) {
                 if ((mul_b & 1) == 1) {
                     mul_acc = wrap32((mul_acc as u64) + (mul_a as u64));
@@ -1220,6 +1407,28 @@ fn step_all(rxd : u8) {
                     }
                     }
                     pc = pc + 1;
+                }
+            } else {
+            if (imm_run > 0 && imm_wide == 1) {
+                scrap_imm = code[run_base + pc];
+                if ((scrap_imm & 0x80) != 0 && imm_cnt == 9) {
+                    fail_rsp(ERR_LEB);
+                } else {
+                    imm_acc = imm_acc | leb_lo_part((scrap_imm & 0x7F) as u32, imm_cnt as u32);
+                    imm_hi = imm_hi | leb_hi_part((scrap_imm & 0x7F) as u32, imm_cnt as u32);
+                    if ((scrap_imm & 0x80) != 0) {
+                        imm_cnt = imm_cnt + 1;
+                        pc = pc + 1;
+                    } else {
+                        imm_hi = leb_fill_hi(imm_acc, imm_hi, imm_cnt as u32);
+                        imm_acc = leb_fill_lo(imm_acc, imm_cnt as u32);
+                        st[sp] = imm_hi;
+                        st[sp + 1] = imm_acc;
+                        sp = sp + 2;
+                        imm_run = 0;
+                        imm_wide = 0;
+                        pc = pc + 1;
+                    }
                 }
             } else {
             if (imm_run > 0) {
@@ -1632,6 +1841,116 @@ fn step_all(rxd : u8) {
                     }
                     }
                 } else {
+                if (is_p7_op(scrap_op) == 1 || scrap_op == OP_I64_CONST) {
+                    if (scrap_op == OP_I64_CONST) {
+                        scrap_imm = code[run_base + pc + 1];
+                        if (sp + 1 < STACK_MAX) {
+                            if ((scrap_imm & 0x80) != 0) {
+                                imm_acc = (scrap_imm & 0x7F) as u32;
+                                imm_hi = 0;
+                                imm_cnt = 1;
+                                imm_wide = 1;
+                                imm_run = 1;
+                                pc = pc + 2;
+                            } else {
+                                st[sp] = i64_sign_word(sleb8(scrap_imm));
+                                st[sp + 1] = sleb8(scrap_imm);
+                                sp = sp + 2;
+                                pc = pc + 2;
+                            }
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I32_WRAP_I64) {
+                        if (sp >= 2) {
+                            st[sp - 2] = st[sp - 1];
+                            sp = sp - 1;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_EXTEND_I32_S || scrap_op == OP_I64_EXTEND_I32_U) {
+                        if (sp >= 1 && sp < STACK_MAX) {
+                            st[sp] = st[sp - 1];
+                            if (scrap_op == OP_I64_EXTEND_I32_S) {
+                                st[sp - 1] = i64_sign_word(st[sp]);
+                            } else {
+                                st[sp - 1] = 0;
+                            }
+                            sp = sp + 1;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_ADD) {
+                        if (sp >= 4) {
+                            st[sp - 4] = i64_add_hi(st[sp - 4], st[sp - 2], st[sp - 3], st[sp - 1]);
+                            st[sp - 3] = i64_add_lo(st[sp - 3], st[sp - 1]);
+                            sp = sp - 2;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_SUB) {
+                        if (sp >= 4) {
+                            st[sp - 4] = i64_sub_hi(st[sp - 4], st[sp - 2], st[sp - 3], st[sp - 1]);
+                            st[sp - 3] = i64_sub_lo(st[sp - 3], st[sp - 1]);
+                            sp = sp - 2;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_MUL) {
+                        if (sp >= 4) {
+                            mul_a_hi = st[sp - 4];
+                            mul_a = st[sp - 3];
+                            mul_b_hi = st[sp - 2];
+                            mul_b = st[sp - 1];
+                            mul_acc_hi = 0;
+                            mul_acc = 0;
+                            mul_wide = 1;
+                            mul_run = 64;
+                            sp = sp - 2;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_SHL) {
+                        if (sp >= 4) {
+                            st[sp - 4] = i64_shl_hi(st[sp - 4], st[sp - 3], st[sp - 1] & 63);
+                            st[sp - 3] = i64_shl_lo(st[sp - 3], st[sp - 1] & 63);
+                            sp = sp - 2;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_SHR_U) {
+                        if (sp >= 4) {
+                            st[sp - 3] = i64_shru_lo(st[sp - 4], st[sp - 3], st[sp - 1] & 63);
+                            st[sp - 4] = i64_shru_hi(st[sp - 4], st[sp - 1] & 63);
+                            sp = sp - 2;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                    if (scrap_op == OP_I64_SHR_S) {
+                        if (sp >= 4) {
+                            st[sp - 3] = i64_shrs_lo(st[sp - 4], st[sp - 3], st[sp - 1] & 63);
+                            st[sp - 4] = i64_shrs_hi(st[sp - 4], st[sp - 1] & 63);
+                            sp = sp - 2;
+                            pc = pc + 1;
+                        } else {
+                            fail_rsp(ERR_STACK);
+                        }
+                    }
+                } else {
                 if (scrap_op == OP_BLOCK || scrap_op == OP_LOOP) {
                     scrap_imm = code[run_base + pc + 1];
                     if (scrap_imm != BT_VOID && scrap_imm != BT_I32) {
@@ -1736,12 +2055,13 @@ fn step_all(rxd : u8) {
                                     fail_rsp(ERR_LOCAL);
                                 }
                             } else {
-                                if (scrap_op == OP_I32_CONST or scrap_op == OP_I64_CONST) {
+                                if (scrap_op == OP_I32_CONST) {
                                     scrap_imm = code[run_base + pc + 1];
                                     if ((scrap_imm & 0x80) != 0) {
                                         if (sp < STACK_MAX) {
                                             imm_acc = (scrap_imm & 0x7F) as u32;
                                             imm_cnt = 1;
+                                            imm_wide = 0;
                                             imm_run = 1;
                                             pc = pc + 2;
                                         } else {
@@ -1976,6 +2296,9 @@ fn step_all(rxd : u8) {
                 }
                 }
                 }
+                }
+            }
+            }
             }
             }
             }
@@ -2483,16 +2806,20 @@ pub const P2_VECS : u32 = 29;
 pub const TOTAL_REQUESTS : u32 = 163;
 
 ; --- cost, pre-registered before any synthesis -------------------------------------------
-; The engine is a 61-byte decode (24 ALU bytes through the shared alu_arity/alu_eval pair
-; since #12011, 18 other arms -- the const arm takes i32.const and i64.const, the float arm
-; f32.const and f64.const, since P3/P4; block and loop share one arm, br, br_if and br_table
+; The engine is a 70-byte decode (24 ALU bytes through the shared alu_arity/alu_eval pair
+; since #12011, 18 other arms -- the const arm took i32.const and i64.const until P7 moved
+; i64.const behind the is_p7_op gate, the float arm f32.const and f64.const, since P3/P4;
+; block and loop share one arm, br, br_if and br_table
 ; have their own, since #12010 -- 10 memory bytes through two arms since P5 #12202, and the six
 ; bytes of P6 #12323: if, else, call, call_indirect, global.get and global.set, behind one
-; is_p6_op gate; return and end share the frame-aware arm), a 16-deep 32-bit stack, a
-; 20-entry local file (CALL_MAX + 1 windows of LOCALS), a 4-frame call stack, a 32-clock
-; restoring divider, two rotators, a loadable 128-byte code RAM and, since P5, one 64 KiB
-; memory page; the UART is counters and shifters. The P6 cost is unmeasured: nothing was
-; synthesised. Measured: yosys logic cells of the generated module alone.
+; is_p6_op gate, and the nine bytes of P7 #12371: i32.wrap_i64, the two i64 extends, i64.add,
+; sub, mul and the three i64 shifts, behind one is_p7_op gate -- i64.const now decodes up to
+; ten LEB bytes into a two-slot pair; return and end share the frame-aware arm), a 16-deep
+; 32-bit stack, a 20-entry local file (CALL_MAX + 1 windows of LOCALS), a 4-frame call stack,
+; a 32-clock restoring divider, a 64-clock i64 shift-add multiplier sequence, two rotators,
+; a loadable 128-byte code RAM and, since P5, one 64 KiB memory page; the UART is counters
+; and shifters. The P6 and P7 costs are unmeasured: nothing was synthesised. Measured: yosys
+; logic cells of the generated module alone.
 ; Predicted: under PREDICT_LUT_MAX; a larger count refutes it.
 ; REFUTED on synthesis: 10425 yosys LUTs for the module alone (10814 SLICE_LUTX in
 ; nextpnr with the bring-up top). The loadable store costs more than the ROM it
@@ -2989,11 +3316,12 @@ test alu_sweep_signedness_negative_control {
     assert total >= 5;
 }
 
-; The bytes the cell executes (61: the 40 of #12011 and P3/P4 -- 24 ALU, mul and the four
+; The bytes the cell executes (70: the 40 of #12011 and P3/P4 -- 24 ALU, mul and the four
 ; div/rem, the four const bytes 0x41-0x44, local.get/set/tee, return, end, drop, select --
 ; plus block, loop, br, br_if, br_table of #12010, plus the ten memory bytes of P5 #12202:
 ; i32.load, the four 8/16-bit loads, i32.store, store8, store16, memory.size, memory.grow,
-; plus the six of P6 #12323: if, else, call, call_indirect, global.get, global.set)
+; plus the six of P6 #12323: if, else, call, call_indirect, global.get, global.set, plus the
+; nine of P7 #12371: i32.wrap_i64, the two extends, i64.add, sub, mul, shl, shr_s, shr_u)
 ; are independent of the ALU pair: every other byte of the opcode space -- 0x29 i64.load
 ; among them, a generated byte of the table the cell does not run -- answers RESP_BADOP with
 ; ERR_OPCODE, as before the refactor.
@@ -3007,6 +3335,8 @@ fn cell_runs(b : u32) -> u32 {
     if (b == 0x02 || b == 0x03 || b == 0x0C || b == 0x0D || b == 0x0E) { return 1; }
     if (b == 0x28 || (b >= 0x2C && b <= 0x2F)) { return 1; }
     if (b == 0x36 || b == 0x3A || b == 0x3B || b == 0x3F || b == 0x40) { return 1; }
+    if (b == 0x7C || b == 0x7D || b == 0x7E || (b >= 0x86 && b <= 0x88)) { return 1; }
+    if (b == 0xA7 || b == 0xAC || b == 0xAD) { return 1; }
     return 0;
 }
 
@@ -3038,10 +3368,10 @@ test alu_unexecuted_bytes_are_opcode_errors {
     assert c == 1;
     c = cell_runs(0x29);
     assert c == 0;
-    assert runs == 61;
-    assert tried == 195;
+    assert runs == 70;
+    assert tried == 186;
     assert bad == 0;
-    assert frames - f0 == 195;
+    assert frames - f0 == 186;
 }
 
 ; --- control flow (issue #12010) ----------------------------------------------------------
@@ -5229,6 +5559,1149 @@ test cl_load_tables_over_the_wire {
     assert elem[3] == 6;
     assert glob[2] == 0xDEADBEEF;
     assert fn_off[7] == NO_FUNC;
+}
+
+; --- P7 i64 pairs (issue #12371): builders, oracles and the tests ---------------------------------
+; Host side only (the cl_ precedent): none of these functions is called from step_all, so none
+; reaches the Verilog. An i64 is two stack slots, the HIGH word deeper at st[sp - 2] and the LOW
+; word on top at st[sp - 1]. The root end answers the LOW word and leaves sp and st alone, so after
+; host_run_user returns, st[0] is the high word and st[1] the low word of a one-pair run (the P3
+; contract: the answer of an i64 program is its low 32 bits). Every helper that checks a run
+; returns 0 when all is as expected and a distinct code otherwise: no assert lives inside a
+; function, and a test binds the code to a local before it asserts. Nothing here forms a u64
+; beyond 32 bits (#12296): every expected value is a u32 word, the oracle works on 8-bit limbs
+; whose column sums stay below 2^20, and a program never exceeds the 27 bytes of code[101..127].
+
+; The SLEB128 encoder of an i64.const: the opcode, then the 7-bit groups of hi:lo from the low end,
+; each group taken from the low 7 bits of a 64-bit pair that is shifted right 7 per round with the
+; sign kept (sar on the high word). The last byte is the one after which the rest of the pair is
+; all zeros with bit 6 of that byte clear, or all ones with bit 6 set; every earlier byte carries
+; the continuation bit 0x80. At most ten rounds (a 64-bit value needs ten groups at most).
+fn i64_put_const(at : u32, hi : u32, lo : u32) -> u32 {
+    var k : u32 = cl_put(at, OP_I64_CONST);
+    var h : u32 = hi;
+    var l : u32 = lo;
+    var b : u32 = 0;
+    var n : u32 = 0;
+    var last : u32 = 0;
+    while (n < 10 && last == 0) {
+        b = l & 0x7F;
+        l = shr_u32(l, 7) | shl32(h, 25);
+        h = sar32(h, 7);
+        if (h == 0 && l == 0 && (b & 0x40) == 0) { last = 1; }
+        if (h == 0xFFFFFFFF && l == 0xFFFFFFFF && (b & 0x40) != 0) { last = 1; }
+        if (last == 0) { b = b | 0x80; }
+        k = cl_put(k, b as u8);
+        n = n + 1;
+    }
+    return k;
+}
+
+; n copies of byte b at code[at..]; returns the next position
+fn i64_fill(at : u32, b : u8, n : u32) -> u32 {
+    var k : u32 = at;
+    var i : u32 = 0;
+    while (i < n) {
+        k = cl_put(k, b);
+        i = i + 1;
+    }
+    return k;
+}
+
+; a run that ended with one i64 on the stack: RESP_OK, the echoed seq, no error, sp 2, st[0] the
+; high word, st[1] the low word, res and the 24-bit answer word the low word, fu fetches
+fn i64_chk(s : u8, hi : u32, lo : u32, fu : u32) -> u32 {
+    var w : u32 = cf_word();
+    if (cap[0] != RESP_OK) { return 1; }
+    if (cap[1] != s) { return 2; }
+    if (err != ERR_NONE) { return 3; }
+    if (sp != 2) { return 4; }
+    if (st[0] != hi) { return 5; }
+    if (st[1] != lo) { return 6; }
+    if (res != lo) { return 7; }
+    if (w != (lo & 0xFFFFFF)) { return 8; }
+    if (fuel != fu) { return 9; }
+    return 0;
+}
+
+; a run that ended with exactly one i32 (or the low word of a wrapped i64) on the stack
+fn i64_chk1(s : u8, v : u32, fu : u32) -> u32 {
+    var w : u32 = cf_word();
+    if (cap[0] != RESP_OK) { return 1; }
+    if (cap[1] != s) { return 2; }
+    if (err != ERR_NONE) { return 3; }
+    if (sp != 1) { return 4; }
+    if (st[0] != v) { return 5; }
+    if (res != v) { return 7; }
+    if (w != (v & 0xFFFFFF)) { return 8; }
+    if (fuel != fu) { return 9; }
+    return 0;
+}
+
+; a run that ended with an empty stack: the root end answers 0
+fn i64_chk0(s : u8, fu : u32) -> u32 {
+    var w : u32 = cf_word();
+    if (cap[0] != RESP_OK) { return 1; }
+    if (cap[1] != s) { return 2; }
+    if (err != ERR_NONE) { return 3; }
+    if (sp != 0) { return 4; }
+    if (res != 0) { return 7; }
+    if (w != 0) { return 8; }
+    if (fuel != fu) { return 9; }
+    return 0;
+}
+
+; a refused run: RESP_BADOP, the echoed seq, error e, fu fetches including the failing one
+fn i64_chk_err(s : u8, e : u8, fu : u32) -> u32 {
+    if (cap[0] != RESP_BADOP) { return 1; }
+    if (cap[1] != s) { return 2; }
+    if (err != e) { return 3; }
+    if (fuel != fu) { return 9; }
+    return 0;
+}
+
+; i64.const a ; i64.const b ; op ; end at code[101..]: at most 11 + 11 + 2 = 24 bytes, 4 fetches
+; whatever the LEB lengths. Runs it and checks the pair (hi, lo) it leaves.
+fn i64_bin(s : u8, op : u8, ahi : u32, alo : u32, bhi : u32, blo : u32, hi : u32, lo : u32) -> u32 {
+    var k : u32 = i64_put_const(101, ahi, alo);
+    var r : u32 = 0;
+    k = i64_put_const(k, bhi, blo);
+    k = cl_put(k, op);
+    k = cl_put(k, OP_END);
+    if (k > 128) { return 20; }
+    r = host_run_user((k - 101) as u8, 101, s, 0, 0);
+    if (r != 0) { return 21; }
+    return i64_chk(s, hi, lo, 4);
+}
+
+; i64.const (hi, lo) ; end: the encoder must produce nbytes LEB bytes, and the cell must read the
+; pair back (2 fetches)
+fn i64_const_case(s : u8, hi : u32, lo : u32, nbytes : u32) -> u32 {
+    var k : u32 = i64_put_const(101, hi, lo);
+    var r : u32 = 0;
+    if (k - 101 != nbytes + 1) { return 30; }
+    k = cl_put(k, OP_END);
+    r = host_run_user((k - 101) as u8, 101, s, 0, 0);
+    if (r != 0) { return 31; }
+    return i64_chk(s, hi, lo, 2);
+}
+
+; the 12-byte FixedMul chain of DOOM, written at code[at..]: local.get 0 ; i64.extend_i32_s ;
+; local.get 1 ; i64.extend_i32_s ; i64.mul ; i64.const 16 ; i64.shr_s ; i32.wrap_i64 ; end.
+; 9 fetches; it leaves one i32 slot, bits 16..47 of the signed 64-bit product.
+fn i64_put_fixedmul(at : u32) -> u32 {
+    var k : u32 = at;
+    k = cl_put2(k, OP_LOCAL_GET, 0x00);
+    k = cl_put(k, OP_I64_EXTEND_I32_S);
+    k = cl_put2(k, OP_LOCAL_GET, 0x01);
+    k = cl_put(k, OP_I64_EXTEND_I32_S);
+    k = cl_put(k, OP_I64_MUL);
+    k = cl_put2(k, OP_I64_CONST, 0x10);
+    k = cl_put(k, OP_I64_SHR_S);
+    k = cl_put(k, OP_I32_WRAP_I64);
+    k = cl_put(k, OP_END);
+    return k;
+}
+
+fn i64_fm_case(s : u8, x : u32, y : u32, want : u32) -> u32 {
+    var k : u32 = i64_put_fixedmul(101);
+    var r : u32 = 0;
+    r = host_run_user((k - 101) as u8, 101, s, x, y);
+    if (r != 0) { return 40; }
+    return i64_chk1(s, want, 9);
+}
+
+; how many bytes b of lo..hi the tick's P7 gate takes
+fn p7_count(lo : u32, hi : u32) -> u32 {
+    var b : u32 = lo;
+    var n : u32 = 0;
+    while (b <= hi) {
+        if (is_p7_op(b as u8) == 1) { n = n + 1; }
+        b = b + 1;
+    }
+    return n;
+}
+
+; the sum of the forward-scan classes of lo..hi
+fn p7_scan_sum(lo : u32, hi : u32) -> u32 {
+    var b : u32 = lo;
+    var s : u32 = 0;
+    var cl : u8 = 0;
+    while (b <= hi) {
+        cl = scan_class(b as u8);
+        s = s + (cl as u32);
+        b = b + 1;
+    }
+    return s;
+}
+
+; --- the 64-bit product oracle, on 8-bit limbs: never a u64, never the cell's own helpers -------
+; Limb i (0..7) of the pair hi:lo is byte i of the 64-bit value, little-endian.
+fn ref_limb(hi : u32, lo : u32, i : u32) -> u32 {
+    if (i < 4) { return shr_u32(lo, 8 * i) & 255; }
+    return shr_u32(hi, 8 * (i - 4)) & 255;
+}
+
+; column n of the schoolbook product: the sum of limb(a, i) * limb(b, n - i) for i = 0..n; at most
+; 8 products of 255 * 255 = 65025, so the sum is below 520200
+fn ref_col(ahi : u32, alo : u32, bhi : u32, blo : u32, n : u32) -> u32 {
+    var s : u32 = 0;
+    var i : u32 = 0;
+    while (i <= n) {
+        s = s + (ref_limb(ahi, alo, i) * ref_limb(bhi, blo, n - i));
+        i = i + 1;
+    }
+    return s;
+}
+
+; byte n (0..7) of the low 64 bits of a * b: columns 0..n with the carry of each divided by 256
+fn ref_mul64_byte(ahi : u32, alo : u32, bhi : u32, blo : u32, n : u32) -> u32 {
+    var carry : u32 = 0;
+    var t : u32 = 0;
+    var m : u32 = 0;
+    while (m <= n) {
+        t = ref_col(ahi, alo, bhi, blo, m) + carry;
+        carry = t / 256;
+        m = m + 1;
+    }
+    return t % 256;
+}
+
+fn ref_mul64_lo(ahi : u32, alo : u32, bhi : u32, blo : u32) -> u32 {
+    var b0 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 0);
+    var b1 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 1);
+    var b2 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 2);
+    var b3 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn ref_mul64_hi(ahi : u32, alo : u32, bhi : u32, blo : u32) -> u32 {
+    var b4 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 4);
+    var b5 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 5);
+    var b6 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 6);
+    var b7 : u32 = ref_mul64_byte(ahi, alo, bhi, blo, 7);
+    return b4 | (b5 << 8) | (b6 << 16) | (b7 << 24);
+}
+
+; the magnitude of an i32 (0x80000000 keeps its value: its magnitude is 2^31)
+fn ref_mag(x : u32) -> u32 {
+    var t : u32 = 0xFFFFFFFF - x;
+    if (x >= 0x80000000) { return wrap32((t as u64) + 1); }
+    return x;
+}
+
+; two-word negation of the pair hi:lo: the low word is ~lo + 1; the high word is ~hi, plus one
+; exactly when the low word is zero (the +1 carried out of it)
+fn ref_neg_lo(lo : u32) -> u32 {
+    var t : u32 = 0xFFFFFFFF - lo;
+    return wrap32((t as u64) + 1);
+}
+
+fn ref_neg_hi(hi : u32, lo : u32) -> u32 {
+    var t : u32 = 0xFFFFFFFF - hi;
+    if (lo == 0) { return wrap32((t as u64) + 1); }
+    return t;
+}
+
+; DOOM's FixedMul from magnitudes: |a| * |b| as an unsigned 64-bit product, two-word negation
+; when exactly one operand is negative, then bits 16..47 of the two's-complement result
+fn ref_fixedmul(a : u32, b : u32) -> u32 {
+    var ma : u32 = ref_mag(a);
+    var mb : u32 = ref_mag(b);
+    var neg : u32 = 0;
+    var phi : u32 = ref_mul64_hi(0, ma, 0, mb);
+    var plo : u32 = ref_mul64_lo(0, ma, 0, mb);
+    var nhi : u32 = 0;
+    var nlo : u32 = 0;
+    if (a >= 0x80000000 && b < 0x80000000) { neg = 1; }
+    if (a < 0x80000000 && b >= 0x80000000) { neg = 1; }
+    if (neg == 1) {
+        nhi = ref_neg_hi(phi, plo);
+        nlo = ref_neg_lo(plo);
+        phi = nhi;
+        plo = nlo;
+    }
+    return (plo >> 16) | (phi << 16);
+}
+
+; the eight values of the product sweep: 0, 1, -1, 2^32 - 1, -2^63, 2^63 - 1, a mixed word pair,
+; 2^31 + 1 -- zero, one, both signs, a full low word, and a carry out of the low word
+fn sw64_hi(i : u32) -> u32 {
+    if (i == 2) { return 0xFFFFFFFF; }
+    if (i == 4) { return 0x80000000; }
+    if (i == 5) { return 0x7FFFFFFF; }
+    if (i == 6) { return 0x12345678; }
+    return 0;
+}
+
+fn sw64_lo(i : u32) -> u32 {
+    if (i == 1) { return 1; }
+    if (i == 2) { return 0xFFFFFFFF; }
+    if (i == 3) { return 0xFFFFFFFF; }
+    if (i == 5) { return 0xFFFFFFFF; }
+    if (i == 6) { return 0x9ABCDEF0; }
+    if (i == 7) { return 0x80000001; }
+    return 0;
+}
+
+; --- P7 tests ------------------------------------------------------------------------------------
+
+; Law (FR-001): the nine new bytes have the WASM values, and the places that name them agree.
+; p7_count counts is_p7_op (the gate the tick takes) over a window of bytes: 3 in [0x7C..0x7E],
+; 3 in [0x86..0x88], 1 at 0xA7, 2 in [0xAC..0xAD], 9 over all 256 bytes, and 0 at 0x42 (i64.const
+; has its own immediate decode, not this gate). scan_class (the forward scan of a skipped arm)
+; gives i64.const class 1 and the nine others class 0; the bytes just outside the windows stay
+; class 5 -- the scan is as strict as the fetch: 0x7B 5, 0x7F..0x85 is 7 x 5 = 35, 0x89 5, 0xA6 5,
+; 0xA8..0xAB is 4 x 5 = 20, 0xAE 5.
+test i64_opcode_consts {
+    var n : u32 = 0;
+    var s : u32 = 0;
+    var c : u8 = 0;
+    assert (OP_I64_CONST as u32) == 0x42;
+    assert (OP_I32_WRAP_I64 as u32) == 0xA7;
+    assert (OP_I64_EXTEND_I32_S as u32) == 0xAC;
+    assert (OP_I64_EXTEND_I32_U as u32) == 0xAD;
+    assert (OP_I64_ADD as u32) == 0x7C;
+    assert (OP_I64_SUB as u32) == 0x7D;
+    assert (OP_I64_MUL as u32) == 0x7E;
+    assert (OP_I64_SHL as u32) == 0x86;
+    assert (OP_I64_SHR_S as u32) == 0x87;
+    assert (OP_I64_SHR_U as u32) == 0x88;
+    n = p7_count(0x7C, 0x7E);
+    assert n == 3;
+    n = p7_count(0x86, 0x88);
+    assert n == 3;
+    n = p7_count(0xA7, 0xA7);
+    assert n == 1;
+    n = p7_count(0xAC, 0xAD);
+    assert n == 2;
+    n = p7_count(0, 255);
+    assert n == 9;
+    n = p7_count(0x42, 0x42);
+    assert n == 0;
+    c = scan_class(0x42);
+    assert c == 1;
+    s = p7_scan_sum(0x7C, 0x7E);
+    assert s == 0;
+    s = p7_scan_sum(0x86, 0x88);
+    assert s == 0;
+    s = p7_scan_sum(0xA7, 0xA7);
+    assert s == 0;
+    s = p7_scan_sum(0xAC, 0xAD);
+    assert s == 0;
+    s = p7_scan_sum(0x7B, 0x7B);
+    assert s == 5;
+    s = p7_scan_sum(0x7F, 0x85);
+    assert s == 35;
+    s = p7_scan_sum(0x89, 0x89);
+    assert s == 5;
+    s = p7_scan_sum(0xA6, 0xA6);
+    assert s == 5;
+    s = p7_scan_sum(0xA8, 0xAB);
+    assert s == 20;
+    s = p7_scan_sum(0xAE, 0xAE);
+    assert s == 5;
+}
+
+; Law (FR-003): the test-side SLEB128 encoder is itself pinned to hand-written bytes before any
+; run trusts it. (0, 16) is 42 10. All ones is 42 7F (the pair is -1: the first group is 0x7F with
+; bit 6 set and the rest all ones). (0, 0x3ADE68B1) is 42 B1 D1 F9 D6 03: the groups from the low
+; end are 0x31, 0x51, 0x79, 0x56, 0x03 (0x3ADE68B1 = 0x03 << 28 | 0x56 << 21 | 0x79 << 14 |
+; 0x51 << 7 | 0x31), each but the last with the continuation bit: B1 D1 F9 D6 03. (1, 0) is 2^32:
+; four zero groups and a fifth of 0x10, so 42 80 80 80 80 10. (0x40000000, 0) is 2^62: eight zero
+; groups, then 0x40 (group 8, which needs a continuation because bit 6 is set but the value is
+; positive) and 0x00: 42, eight 80, C0, 00 -- ten LEB bytes, 11 with the opcode.
+test i64_const_encoder_matches_hand_bytes {
+    var k : u32 = 0;
+    k = i64_put_const(101, 0, 16);
+    assert k == 103;
+    assert code[101] == 0x42;
+    assert code[102] == 0x10;
+    k = i64_put_const(101, 0xFFFFFFFF, 0xFFFFFFFF);
+    assert k == 103;
+    assert code[101] == 0x42;
+    assert code[102] == 0x7F;
+    k = i64_put_const(101, 0, 0x3ADE68B1);
+    assert k == 107;
+    assert code[101] == 0x42;
+    assert code[102] == 0xB1;
+    assert code[103] == 0xD1;
+    assert code[104] == 0xF9;
+    assert code[105] == 0xD6;
+    assert code[106] == 0x03;
+    k = i64_put_const(101, 1, 0);
+    assert k == 107;
+    assert code[101] == 0x42;
+    assert code[102] == 0x80;
+    assert code[103] == 0x80;
+    assert code[104] == 0x80;
+    assert code[105] == 0x80;
+    assert code[106] == 0x10;
+    k = i64_put_const(101, 0x40000000, 0);
+    assert k == 112;
+    assert code[101] == 0x42;
+    assert code[102] == 0x80;
+    assert code[109] == 0x80;
+    assert code[110] == 0xC0;
+    assert code[111] == 0x00;
+}
+
+; Law (FR-003): i64.const pushes a pair, HIGH word deeper, from a one- or five-byte LEB; the
+; bytes below are written by hand, not by the encoder. 42 10 0B: (0, 16) in 2 fetches (the
+; const counts as one fetch however long its LEB, and the root end is the second). Dropping the
+; LOW word leaves the high word: 42 10 1A 0B answers 0 with sp 1 (3 fetches), and 42 7F 1A 0B
+; answers 0xFFFFFFFF with sp 1. 42 7F is -1 (all ones), 42 40 is -64 (hi 0xFFFFFFFF, lo
+; 0xFFFFFFC0: the one-byte sign extension of 0x40), 42 3F is 63 (0, 0x3F). The five-byte
+; B1 D1 F9 D6 03 is (0, 0x3ADE68B1): the answer word is its low 24 bits 0xDE68B1.
+test i64_const_pair_small_and_minus_one {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 101;
+    k = cl_put2(k, OP_I64_CONST, 0x10);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 210, 0, 0);
+    assert r == 0;
+    c = i64_chk(210, 0, 16, 2);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x10);
+    k = cl_put(k, OP_DROP);
+    k = cl_put(k, OP_END);
+    r = host_run_user(4, 101, 211, 0, 0);
+    assert r == 0;
+    c = i64_chk1(211, 0, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x7F);
+    k = cl_put(k, OP_DROP);
+    k = cl_put(k, OP_END);
+    r = host_run_user(4, 101, 212, 0, 0);
+    assert r == 0;
+    c = i64_chk1(212, 0xFFFFFFFF, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x7F);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 213, 0, 0);
+    assert r == 0;
+    c = i64_chk(213, 0xFFFFFFFF, 0xFFFFFFFF, 2);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x40);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 214, 0, 0);
+    assert r == 0;
+    c = i64_chk(214, 0xFFFFFFFF, 0xFFFFFFC0, 2);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x3F);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 215, 0, 0);
+    assert r == 0;
+    c = i64_chk(215, 0, 0x3F, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = cl_put2(k, 0xB1, 0xD1);
+    k = cl_put2(k, 0xF9, 0xD6);
+    k = cl_put2(k, 0x03, OP_END);
+    assert k == 108;
+    r = host_run_user(7, 101, 216, 0, 0);
+    assert r == 0;
+    c = i64_chk(216, 0, 0x3ADE68B1, 2);
+    assert c == 0;
+    assert cf_word() == 0xDE68B1;
+    assert frames - f0 == 7;
+}
+
+; Law (FR-004): the wide LEB, spelled out. 42 80 80 80 80 10 is 2^32 = (1, 0): group 4 is 0x10,
+; whose low four bits (0) go to the top of the low word and whose bits 4..6 (1) to the low bits
+; of the high word. 42, eight 80, C0, 00 is 2^62 = (0x40000000, 0): group 8 is 0x40, and group 8
+; lands at high-word bits 24..30. 42, nine FF, 7F is -1: groups 0..9 are all 0x7F and the last
+; group's bit 0 is bit 63. 42, nine 80, 7F is -2^63 = (0x80000000, 0): only group 9 (0x7F) has a
+; bit in the value, bit 63 of the pair. 42 and TEN FF bytes (the tenth still carrying the
+; continuation bit) is an overlong LEB: ERR_LEB on the const, 1 fetch -- and the next program
+; runs clean, the half-built immediate gone. The last program is i64.const 2^32 ; i32.const
+; 0x3ADE68B1 ; end: the stack is [1, 0, 0x3ADE68B1], sp 3, 3 fetches -- an i32 beside an i64.
+test i64_const_ten_byte_hand_bytes {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0x80, 4);
+    k = cl_put2(k, 0x10, OP_END);
+    assert k == 108;
+    r = host_run_user(7, 101, 217, 0, 0);
+    assert r == 0;
+    c = i64_chk(217, 1, 0, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0x80, 8);
+    k = cl_put2(k, 0xC0, 0x00);
+    k = cl_put(k, OP_END);
+    assert k == 113;
+    r = host_run_user(12, 101, 218, 0, 0);
+    assert r == 0;
+    c = i64_chk(218, 0x40000000, 0, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0xFF, 9);
+    k = cl_put2(k, 0x7F, OP_END);
+    assert k == 113;
+    r = host_run_user(12, 101, 219, 0, 0);
+    assert r == 0;
+    c = i64_chk(219, 0xFFFFFFFF, 0xFFFFFFFF, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0x80, 9);
+    k = cl_put2(k, 0x7F, OP_END);
+    assert k == 113;
+    r = host_run_user(12, 101, 220, 0, 0);
+    assert r == 0;
+    c = i64_chk(220, 0x80000000, 0, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0xFF, 10);
+    k = cl_put(k, OP_END);
+    assert k == 113;
+    r = host_run_user(12, 101, 221, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(221, ERR_LEB, 1);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x10);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 222, 0, 0);
+    assert r == 0;
+    c = i64_chk(222, 0, 16, 2);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = i64_fill(k, 0x80, 4);
+    k = cl_put(k, 0x10);
+    k = cl_put2(k, OP_I32_CONST, 0xB1);
+    k = cl_put2(k, 0xD1, 0xF9);
+    k = cl_put2(k, 0xD6, 0x03);
+    k = cl_put(k, OP_END);
+    assert k == 114;
+    r = host_run_user(13, 101, 223, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 223;
+    assert err == ERR_NONE;
+    assert sp == 3;
+    assert st[0] == 1;
+    assert st[1] == 0;
+    assert st[2] == 0x3ADE68B1;
+    assert res == 0x3ADE68B1;
+    assert fuel == 3;
+    assert frames - f0 == 7;
+}
+
+; Law (FR-004): every LEB length from 2 to 10 bytes, through the encoder (pinned to hand bytes
+; above) and back through the cell, 2 fetches each. The length is the shortest SLEB128 of the
+; value, n bytes covering [-2^(7n-1), 2^(7n-1)):
+;   100 (0x64) 2 bytes (E4 00)           -100 (0xFFFFFF9C) 2 bytes (9C 7F)
+;   0x2000 = 2^13 3 bytes                0x100000 = 2^20 4 bytes
+;   0x3ADE68B1, 0xFFFFFFFF (FF FF FF FF 0F), 2^32 (hi 1), 2^31 (80 80 80 80 08) and
+;   -2^31 (hi 0xFFFFFFFF, lo 0x80000000: 80 80 80 80 78) all 5 bytes
+;   hi 0x100 = 2^40 6 bytes (80 x5 20)   hi 0xFFFF0000 = -2^48 7 bytes (80 x6 40)
+;   hi 0x10000 = 2^48 8 bytes            hi 0x800000 = 2^55 9 bytes
+;   hi 0x40000000 = 2^62, 2^63 - 1 (FF x9 00) and -2^63 (80 x9 7F) all 10 bytes
+test i64_const_wide_leb_every_length {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_const_case(230, 0, 0x64, 2);
+    assert c == 0;
+    c = i64_const_case(231, 0xFFFFFFFF, 0xFFFFFF9C, 2);
+    assert c == 0;
+    c = i64_const_case(232, 0, 0x2000, 3);
+    assert c == 0;
+    c = i64_const_case(233, 0, 0x100000, 4);
+    assert c == 0;
+    c = i64_const_case(234, 0, 0x3ADE68B1, 5);
+    assert c == 0;
+    c = i64_const_case(235, 0, 0xFFFFFFFF, 5);
+    assert c == 0;
+    c = i64_const_case(236, 1, 0, 5);
+    assert c == 0;
+    c = i64_const_case(237, 0, 0x80000000, 5);
+    assert c == 0;
+    c = i64_const_case(238, 0xFFFFFFFF, 0x80000000, 5);
+    assert c == 0;
+    c = i64_const_case(239, 0x100, 0, 6);
+    assert c == 0;
+    c = i64_const_case(240, 0xFFFF0000, 0, 7);
+    assert c == 0;
+    c = i64_const_case(241, 0x10000, 0, 8);
+    assert c == 0;
+    c = i64_const_case(242, 0x800000, 0, 9);
+    assert c == 0;
+    c = i64_const_case(243, 0x40000000, 0, 10);
+    assert c == 0;
+    c = i64_const_case(244, 0x7FFFFFFF, 0xFFFFFFFF, 10);
+    assert c == 0;
+    c = i64_const_case(245, 0x80000000, 0, 10);
+    assert c == 0;
+    assert frames - f0 == 16;
+}
+
+; Law (FR-002): i64.extend_i32_s turns the i32 on top into a pair whose HIGH word is the sign
+; (0xFFFFFFFF when bit 31 is set, else 0) and whose LOW word is the value. local.get 0 ;
+; i64.extend_i32_s ; end is 3 fetches. x = 0x80000000 gives (0xFFFFFFFF, 0x80000000), x = 5 gives
+; (0, 5), x = 0xFFFFFFFF gives (0xFFFFFFFF, 0xFFFFFFFF). With a drop before the end (4 fetches)
+; the LOW word goes and the sign word is what is left: sp 1.
+test i64_extend_s_pushes_sign_pair {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    k = cl_put2(101, OP_LOCAL_GET, 0x00);
+    k = cl_put(k, OP_I64_EXTEND_I32_S);
+    k = cl_put(k, OP_END);
+    r = host_run_user(4, 101, 16, 0x80000000, 0);
+    assert r == 0;
+    c = i64_chk(16, 0xFFFFFFFF, 0x80000000, 3);
+    assert c == 0;
+    r = host_run_user(4, 101, 17, 5, 0);
+    assert r == 0;
+    c = i64_chk(17, 0, 5, 3);
+    assert c == 0;
+    r = host_run_user(4, 101, 18, 0xFFFFFFFF, 0);
+    assert r == 0;
+    c = i64_chk(18, 0xFFFFFFFF, 0xFFFFFFFF, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_LOCAL_GET, 0x00);
+    k = cl_put(k, OP_I64_EXTEND_I32_S);
+    k = cl_put(k, OP_DROP);
+    k = cl_put(k, OP_END);
+    r = host_run_user(5, 101, 19, 0x80000000, 0);
+    assert r == 0;
+    c = i64_chk1(19, 0xFFFFFFFF, 4);
+    assert c == 0;
+    r = host_run_user(5, 101, 20, 5, 0);
+    assert r == 0;
+    c = i64_chk1(20, 0, 4);
+    assert c == 0;
+    assert frames - f0 == 5;
+}
+
+; Law (FR-002): i64.extend_i32_u zero-extends: the HIGH word is always 0. x = 0x80000000 gives
+; (0, 0x80000000), x = 5 gives (0, 5), x = 0xFFFFFFFF gives (0, 0xFFFFFFFF); with a drop
+; the zero high word is what is left.
+test i64_extend_u_pushes_zero_pair {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    k = cl_put2(101, OP_LOCAL_GET, 0x00);
+    k = cl_put(k, OP_I64_EXTEND_I32_U);
+    k = cl_put(k, OP_END);
+    r = host_run_user(4, 101, 32, 0x80000000, 0);
+    assert r == 0;
+    c = i64_chk(32, 0, 0x80000000, 3);
+    assert c == 0;
+    r = host_run_user(4, 101, 33, 5, 0);
+    assert r == 0;
+    c = i64_chk(33, 0, 5, 3);
+    assert c == 0;
+    r = host_run_user(4, 101, 34, 0xFFFFFFFF, 0);
+    assert r == 0;
+    c = i64_chk(34, 0, 0xFFFFFFFF, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_LOCAL_GET, 0x00);
+    k = cl_put(k, OP_I64_EXTEND_I32_U);
+    k = cl_put(k, OP_DROP);
+    k = cl_put(k, OP_END);
+    r = host_run_user(5, 101, 35, 0xFFFFFFFF, 0);
+    assert r == 0;
+    c = i64_chk1(35, 0, 4);
+    assert c == 0;
+    assert frames - f0 == 4;
+}
+
+; Law (FR-002): i32.wrap_i64 drops the HIGH word and keeps the LOW one: 42 7F A7 0B (-1, wrapped)
+; leaves one slot 0xFFFFFFFF, answer word 0xFFFFFF, 3 fetches. 42 B1 D1 F9 D6 03 A7 0B wraps
+; (0, 0x3ADE68B1) to 0x3ADE68B1. 42 7F A7 1A 0B drops the wrapped slot and leaves nothing: sp 0,
+; the root end answers 0, 4 fetches. One more drop (42 7F A7 1A 1A 0B) hits the empty stack:
+; ERR_STACK on the fifth byte's fetch, 4 fetches counted.
+test i64_wrap_drops_high_word {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    k = cl_put2(101, OP_I64_CONST, 0x7F);
+    k = cl_put(k, OP_I32_WRAP_I64);
+    k = cl_put(k, OP_END);
+    r = host_run_user(4, 101, 48, 0, 0);
+    assert r == 0;
+    c = i64_chk1(48, 0xFFFFFFFF, 3);
+    assert c == 0;
+    k = cl_put(101, OP_I64_CONST);
+    k = cl_put2(k, 0xB1, 0xD1);
+    k = cl_put2(k, 0xF9, 0xD6);
+    k = cl_put2(k, 0x03, OP_I32_WRAP_I64);
+    k = cl_put(k, OP_END);
+    assert k == 109;
+    r = host_run_user(8, 101, 49, 0, 0);
+    assert r == 0;
+    c = i64_chk1(49, 0x3ADE68B1, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x7F);
+    k = cl_put2(k, OP_I32_WRAP_I64, OP_DROP);
+    k = cl_put(k, OP_END);
+    r = host_run_user(5, 101, 50, 0, 0);
+    assert r == 0;
+    c = i64_chk0(50, 4);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x7F);
+    k = cl_put2(k, OP_I32_WRAP_I64, OP_DROP);
+    k = cl_put2(k, OP_DROP, OP_END);
+    r = host_run_user(6, 101, 51, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(51, ERR_STACK, 4);
+    assert c == 0;
+    assert frames - f0 == 4;
+}
+
+; Law (FR-002): i64.add adds the two pairs, the carry out of the low words going into the high
+; word. Each program is i64.const a ; i64.const b ; i64.add ; end: 4 fetches.
+;   (0, FFFFFFFF) + (0, 1): low 0x100000000 wraps to 0, carry 1, high 0 + 0 + 1 = (1, 0)
+;   -1 + 1: low 0 with carry, high 0xFFFFFFFF + 0 + 1 wraps to 0 = (0, 0)
+;   5 + 7 = (0, 0xC)
+;   (1, 0x80000000) + (2, 0x80000000): low wraps to 0, carry 1, high 1 + 2 + 1 = (4, 0)
+;   (0x7FFFFFFF, FFFFFFFF) + 1: low 0 carry 1, high 0x80000000 = (0x80000000, 0)
+;   -1 + -1 = -2: low 0xFFFFFFFE with carry, high 0xFFFFFFFF + 0xFFFFFFFF + 1 = 0x1FFFFFFFF
+;   wraps to (0xFFFFFFFF, 0xFFFFFFFE)
+;   (3, 5) + (4, 6) = (7, 0xB)
+;   (0, 0x7FFFFFFF) + (0, 0x80000000) = 0xFFFFFFFF: no carry, (0, 0xFFFFFFFF)
+test i64_add_carries_across_words {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(64, OP_I64_ADD, 0, 0xFFFFFFFF, 0, 1, 1, 0);
+    assert c == 0;
+    c = i64_bin(65, OP_I64_ADD, 0xFFFFFFFF, 0xFFFFFFFF, 0, 1, 0, 0);
+    assert c == 0;
+    c = i64_bin(66, OP_I64_ADD, 0, 5, 0, 7, 0, 0xC);
+    assert c == 0;
+    c = i64_bin(67, OP_I64_ADD, 1, 0x80000000, 2, 0x80000000, 4, 0);
+    assert c == 0;
+    c = i64_bin(68, OP_I64_ADD, 0x7FFFFFFF, 0xFFFFFFFF, 0, 1, 0x80000000, 0);
+    assert c == 0;
+    c = i64_bin(69, OP_I64_ADD, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFE);
+    assert c == 0;
+    c = i64_bin(70, OP_I64_ADD, 3, 5, 4, 6, 7, 0xB);
+    assert c == 0;
+    c = i64_bin(71, OP_I64_ADD, 0, 0x7FFFFFFF, 0, 0x80000000, 0, 0xFFFFFFFF);
+    assert c == 0;
+    assert frames - f0 == 8;
+}
+
+; Law (FR-002): i64.sub subtracts b (the top pair) from a, a borrow out of the low words taking
+; one from the high word. Each program is i64.const a ; i64.const b ; i64.sub ; end: 4 fetches.
+;   0 - 1: low 0 - 1 wraps to 0xFFFFFFFF, borrow, high 0 - 0 - 1 = (0xFFFFFFFF, 0xFFFFFFFF)
+;   (1, 0) - (0, 1): low 0xFFFFFFFF with borrow, high 1 - 0 - 1 = (0, 0xFFFFFFFF)
+;   10 - 3 = (0, 7)
+;   3 - 10 = -7: low 0xFFFFFFF9, borrow, high 0xFFFFFFFF = (0xFFFFFFFF, 0xFFFFFFF9)
+;   (0x80000000, 0) - 1: low 0xFFFFFFFF, borrow, high 0x80000000 - 1 = (0x7FFFFFFF, 0xFFFFFFFF)
+;   x - x = (0, 0) for x = (0x12345678, 0x9ABCDEF0)
+;   (2, 7) - (1, 9): low 7 - 9 = 0xFFFFFFFE with borrow, high 2 - 1 - 1 = (0, 0xFFFFFFFE)
+;   (9, 8) - (3, 5) = (6, 3)
+test i64_sub_borrows_across_words {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(80, OP_I64_SUB, 0, 0, 0, 1, 0xFFFFFFFF, 0xFFFFFFFF);
+    assert c == 0;
+    c = i64_bin(81, OP_I64_SUB, 1, 0, 0, 1, 0, 0xFFFFFFFF);
+    assert c == 0;
+    c = i64_bin(82, OP_I64_SUB, 0, 10, 0, 3, 0, 7);
+    assert c == 0;
+    c = i64_bin(83, OP_I64_SUB, 0, 3, 0, 10, 0xFFFFFFFF, 0xFFFFFFF9);
+    assert c == 0;
+    c = i64_bin(84, OP_I64_SUB, 0x80000000, 0, 0, 1, 0x7FFFFFFF, 0xFFFFFFFF);
+    assert c == 0;
+    c = i64_bin(85, OP_I64_SUB, 0x12345678, 0x9ABCDEF0, 0x12345678, 0x9ABCDEF0, 0, 0);
+    assert c == 0;
+    c = i64_bin(86, OP_I64_SUB, 2, 7, 1, 9, 0, 0xFFFFFFFE);
+    assert c == 0;
+    c = i64_bin(87, OP_I64_SUB, 9, 8, 3, 5, 6, 3);
+    assert c == 0;
+    assert frames - f0 == 8;
+}
+
+; Law (FR-002, FR-006): i64.mul keeps the low 64 bits of the product, a 64-clock shift-add
+; microsequence (no `*` in the tick). Each program is i64.const a ; i64.const b ; i64.mul ;
+; end: 4 fetches, the 64 steps are not fetches. Hand arithmetic (2^32 = 4294967296):
+;   0x10000 * 0x10000 = 2^32 = (1, 0)
+;   -1 * -1 = 1 = (0, 1)
+;   (2^32 - 1)^2 = 2^64 - 2^33 + 1 = 0xFFFFFFFE00000001 mod 2^64 = (0xFFFFFFFE, 1)
+;   3 * -7 = -21 = (0xFFFFFFFF, 0xFFFFFFEB)
+;   x * 1 = x and x * 0 = 0 for x = (0x12345678, 0x9ABCDEF0)
+;   (2^32 + 2) * (3 * 2^32 + 4) = 3 * 2^64 + 10 * 2^32 + 8 = (0xA, 8) mod 2^64
+;   2^31 * 4 = 2^33 = (2, 0)
+;   (2^32 - 1) * 0x10001 = 2^48 + 2^32 - 2^16 - 1 = 0x00010000FFFEFFFF = (0x10000, 0xFFFEFFFF)
+;   -2 * 3 = -6 = (0xFFFFFFFF, 0xFFFFFFFA)
+;   2^32 * 2^32 = 2^64 = (0, 0) mod 2^64
+;   (2^32 + 2^32 - 1) * 2 = (2^33 - 1) * 2 = 2^34 - 2 = 0x3FFFFFFFE = (3, 0xFFFFFFFE)
+;   3 * 2^63 = 2^64 + 2^63 = (0x80000000, 0) mod 2^64
+test i64_mul_low_64_bits {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(96, OP_I64_MUL, 0, 0x10000, 0, 0x10000, 1, 0);
+    assert c == 0;
+    c = i64_bin(97, OP_I64_MUL, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0, 1);
+    assert c == 0;
+    c = i64_bin(98, OP_I64_MUL, 0, 0xFFFFFFFF, 0, 0xFFFFFFFF, 0xFFFFFFFE, 1);
+    assert c == 0;
+    c = i64_bin(99, OP_I64_MUL, 0, 3, 0xFFFFFFFF, 0xFFFFFFF9, 0xFFFFFFFF, 0xFFFFFFEB);
+    assert c == 0;
+    c = i64_bin(100, OP_I64_MUL, 0x12345678, 0x9ABCDEF0, 0, 1, 0x12345678, 0x9ABCDEF0);
+    assert c == 0;
+    c = i64_bin(101, OP_I64_MUL, 0x12345678, 0x9ABCDEF0, 0, 0, 0, 0);
+    assert c == 0;
+    c = i64_bin(102, OP_I64_MUL, 1, 2, 3, 4, 0xA, 8);
+    assert c == 0;
+    c = i64_bin(103, OP_I64_MUL, 0, 0x80000000, 0, 4, 2, 0);
+    assert c == 0;
+    c = i64_bin(104, OP_I64_MUL, 0, 0xFFFFFFFF, 0, 0x10001, 0x10000, 0xFFFEFFFF);
+    assert c == 0;
+    c = i64_bin(105, OP_I64_MUL, 0xFFFFFFFF, 0xFFFFFFFE, 0, 3, 0xFFFFFFFF, 0xFFFFFFFA);
+    assert c == 0;
+    c = i64_bin(106, OP_I64_MUL, 1, 0, 1, 0, 0, 0);
+    assert c == 0;
+    c = i64_bin(107, OP_I64_MUL, 1, 0xFFFFFFFF, 0, 2, 3, 0xFFFFFFFE);
+    assert c == 0;
+    c = i64_bin(108, OP_I64_MUL, 0, 3, 0x80000000, 0, 0x80000000, 0);
+    assert c == 0;
+    assert frames - f0 == 13;
+}
+
+; Law (FR-002): i64.shl takes the count from the LOW word of the top pair, & 63; the count's
+; high word is ignored. A count of 32 or more moves the low word up; a count of 0 or 64 (64 & 63
+; = 0) leaves the pair. Each program is i64.const a ; i64.const count ; i64.shl ; end: 4 fetches.
+;   (0, 1) << 32 = (1, 0)
+;   (0, 0x80000000) << 1 = 2^32 = (1, 0)
+;   (0x12345678, 0x9ABCDEF0) << 0 and << 64 are unchanged
+;   count word (5, 4): the 5 is ignored; (0, 1) << 4 = (0, 0x10)
+;   (1, 0xF0000000) << 4 = 0x1F0000000 << 4 = 0x1F00000000 = (0x1F, 0)
+;   (0, 1) << 63 = (0x80000000, 0)
+;   (0, 3) << 31 = 3 * 2^31 = 0x180000000 = (1, 0x80000000)
+;   (0, 0x40000001) << 33: the low word moves up one: (0x80000002, 0)
+test i64_shl_across_words {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(112, OP_I64_SHL, 0, 1, 0, 32, 1, 0);
+    assert c == 0;
+    c = i64_bin(113, OP_I64_SHL, 0, 0x80000000, 0, 1, 1, 0);
+    assert c == 0;
+    c = i64_bin(114, OP_I64_SHL, 0x12345678, 0x9ABCDEF0, 0, 0, 0x12345678, 0x9ABCDEF0);
+    assert c == 0;
+    c = i64_bin(115, OP_I64_SHL, 0x12345678, 0x9ABCDEF0, 0, 64, 0x12345678, 0x9ABCDEF0);
+    assert c == 0;
+    c = i64_bin(116, OP_I64_SHL, 0, 1, 5, 4, 0, 0x10);
+    assert c == 0;
+    c = i64_bin(117, OP_I64_SHL, 1, 0xF0000000, 0, 4, 0x1F, 0);
+    assert c == 0;
+    c = i64_bin(118, OP_I64_SHL, 0, 1, 0, 63, 0x80000000, 0);
+    assert c == 0;
+    c = i64_bin(119, OP_I64_SHL, 0, 3, 0, 31, 1, 0x80000000);
+    assert c == 0;
+    c = i64_bin(120, OP_I64_SHL, 0, 0x40000001, 0, 33, 0x80000002, 0);
+    assert c == 0;
+    assert frames - f0 == 9;
+}
+
+; Law (FR-002): i64.shr_u shifts right, zeros filling in; a count of 32 or more moves the high
+; word down and clears it. Each program is i64.const a ; i64.const count ; i64.shr_u ; end.
+;   (1, 0) >> 32 = (0, 1)
+;   (1, 0) >> 1 = 2^31 = (0, 0x80000000)
+;   all ones >> 63 = 1 = (0, 1)
+;   (0x12345678, 0x9ABCDEF0) >> 0 and >> 64 are unchanged
+;   (0x80000000, 0) >> 4 = (0x08000000, 0)
+;   (0x12345678, 0x9ABCDEF0) >> 8: high 0x00123456, low 0x9ABCDEF0 >> 8 = 0x009ABCDE with the
+;   dropped high byte 0x78 entering at the top: (0x00123456, 0x789ABCDE)
+;   the same >> 40 = high word >> 8: (0, 0x00123456)
+test i64_shr_u_across_words {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(128, OP_I64_SHR_U, 1, 0, 0, 32, 0, 1);
+    assert c == 0;
+    c = i64_bin(129, OP_I64_SHR_U, 1, 0, 0, 1, 0, 0x80000000);
+    assert c == 0;
+    c = i64_bin(130, OP_I64_SHR_U, 0xFFFFFFFF, 0xFFFFFFFF, 0, 63, 0, 1);
+    assert c == 0;
+    c = i64_bin(131, OP_I64_SHR_U, 0x12345678, 0x9ABCDEF0, 0, 0, 0x12345678, 0x9ABCDEF0);
+    assert c == 0;
+    c = i64_bin(132, OP_I64_SHR_U, 0x12345678, 0x9ABCDEF0, 0, 64, 0x12345678, 0x9ABCDEF0);
+    assert c == 0;
+    c = i64_bin(133, OP_I64_SHR_U, 0x80000000, 0, 0, 4, 0x08000000, 0);
+    assert c == 0;
+    c = i64_bin(134, OP_I64_SHR_U, 0x12345678, 0x9ABCDEF0, 0, 8, 0x00123456, 0x789ABCDE);
+    assert c == 0;
+    c = i64_bin(135, OP_I64_SHR_U, 0x12345678, 0x9ABCDEF0, 0, 40, 0, 0x00123456);
+    assert c == 0;
+    assert frames - f0 == 8;
+}
+
+; Law (FR-002): i64.shr_s shifts right with the sign filling in. Each program is i64.const a ;
+; i64.const count ; i64.shr_s ; end.
+;   -1 >> 63 = -1 = all ones
+;   (0x80000000, 0) >> 32 = (0xFFFFFFFF, 0x80000000)
+;   (0x80000000, 0) >> 1 = (0xC0000000, 0)
+;   (0, 0x80000000) >> 4 = (0, 0x08000000): a non-negative pair, zeros fill in
+;   (0x7FFFFFFF, 0) >> 32 = (0, 0x7FFFFFFF)
+;   (0xF0000000, 0xF) >> 36: the high word is negative so the high result is 0xFFFFFFFF, the low
+;   result is the high word >> 4 arithmetic = 0xFF000000
+;   (0xC0000000, 1) >> 31: v = -(2^62 - 1), v / 2^31 floors to -2^31 = (0xFFFFFFFF, 0x80000000)
+;   (0xF1234567, 0x89ABCDEF) >> 0 and >> 64 are unchanged
+test i64_shr_s_across_words {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_bin(144, OP_I64_SHR_S, 0xFFFFFFFF, 0xFFFFFFFF, 0, 63, 0xFFFFFFFF, 0xFFFFFFFF);
+    assert c == 0;
+    c = i64_bin(145, OP_I64_SHR_S, 0x80000000, 0, 0, 32, 0xFFFFFFFF, 0x80000000);
+    assert c == 0;
+    c = i64_bin(146, OP_I64_SHR_S, 0x80000000, 0, 0, 1, 0xC0000000, 0);
+    assert c == 0;
+    c = i64_bin(147, OP_I64_SHR_S, 0, 0x80000000, 0, 4, 0, 0x08000000);
+    assert c == 0;
+    c = i64_bin(148, OP_I64_SHR_S, 0x7FFFFFFF, 0, 0, 32, 0, 0x7FFFFFFF);
+    assert c == 0;
+    c = i64_bin(149, OP_I64_SHR_S, 0xF0000000, 0xF, 0, 36, 0xFFFFFFFF, 0xFF000000);
+    assert c == 0;
+    c = i64_bin(150, OP_I64_SHR_S, 0xC0000000, 1, 0, 31, 0xFFFFFFFF, 0x80000000);
+    assert c == 0;
+    c = i64_bin(151, OP_I64_SHR_S, 0xF1234567, 0x89ABCDEF, 0, 0, 0xF1234567, 0x89ABCDEF);
+    assert c == 0;
+    c = i64_bin(152, OP_I64_SHR_S, 0xF1234567, 0x89ABCDEF, 0, 64, 0xF1234567, 0x89ABCDEF);
+    assert c == 0;
+    assert frames - f0 == 9;
+}
+
+; Law (FR-005): DOOM's FixedMul as one program, local.get 0 ; i64.extend_i32_s ; local.get 1 ;
+; i64.extend_i32_s ; i64.mul ; i64.const 16 ; i64.shr_s ; i32.wrap_i64 ; end (12 bytes, 9
+; fetches): bits 16..47 of the signed product, one i32 slot. Hand arithmetic, products as
+; 64-bit two's complement:
+;   0x10000 * 0x10000 = 2^32, >> 16 = 0x10000
+;   0x20000 * 0x18000 = 2^17 * 3 * 2^15 = 3 * 2^32, >> 16 = 0x30000
+;   0xFFFF0000 (-2^16) * 0x10000 = -2^32 = 0xFFFFFFFF00000000, >> 16 = 0xFFFF0000
+;   (-2^16) * (-2^16) = 2^32, >> 16 = 0x10000
+;   0 * 0x7FFFFFFF = 0
+;   -1 * -1 = 1, >> 16 = 0
+;   0x8000 * 0x8000 = 2^30, >> 16 = 0x4000
+;   0x7FFF0000 * 0x20000 = 0x7FFF * 2^33 = 0xFFFE * 2^32, >> 16 = 0xFFFE0000
+;   -2^31 * 2^16 = -2^47 = 0xFFFF800000000000, >> 16 = 0xFFFFFFFF80000000, wrapped 0x80000000
+;   0x7FFFFFFF^2 = 2^62 - 2^32 + 1 = 0x3FFFFFFF00000001, >> 16 = 0x00003FFFFFFF0000, wrapped
+;   0xFFFF0000
+test i64_fixedmul_vectors {
+    var f0 : u32 = frames;
+    var c : u32 = 0;
+    c = i64_fm_case(160, 0x10000, 0x10000, 0x10000);
+    assert c == 0;
+    c = i64_fm_case(161, 0x20000, 0x18000, 0x30000);
+    assert c == 0;
+    c = i64_fm_case(162, 0xFFFF0000, 0x10000, 0xFFFF0000);
+    assert c == 0;
+    c = i64_fm_case(163, 0xFFFF0000, 0xFFFF0000, 0x10000);
+    assert c == 0;
+    c = i64_fm_case(164, 0, 0x7FFFFFFF, 0);
+    assert c == 0;
+    c = i64_fm_case(165, 0xFFFFFFFF, 0xFFFFFFFF, 0);
+    assert c == 0;
+    c = i64_fm_case(166, 0x8000, 0x8000, 0x4000);
+    assert c == 0;
+    c = i64_fm_case(167, 0x7FFF0000, 0x20000, 0xFFFE0000);
+    assert c == 0;
+    c = i64_fm_case(168, 0x80000000, 0x10000, 0x80000000);
+    assert c == 0;
+    c = i64_fm_case(169, 0x7FFFFFFF, 0x7FFFFFFF, 0xFFFF0000);
+    assert c == 0;
+    assert frames - f0 == 10;
+}
+
+; Law (FR-005): the same FixedMul chain inside a called function. A callee's end copies only the
+; top slot above its frame, so the callee's own wrap_i64 has already made the result one i32.
+; Row 0 is loaded here (np 2, body at code[108]): root local.get 0 ; local.get 1 ; call 0 ; end
+; (7 bytes at 101), the 12-byte chain at 108..119. 4 + 9 = 13 fetches. 0x10000 * 0x10000 answers
+; 0x10000, 0xFFFF0000 * 0x10000 answers 0xFFFF0000 (the arithmetic of the vectors above); the
+; frame is gone afterwards: csp 0, one slot on the stack.
+test i64_fixedmul_inside_a_call {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 101;
+    r = host_fn(0, 108, 2, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    k = cl_put2(k, OP_LOCAL_GET, 0x00);
+    k = cl_put2(k, OP_LOCAL_GET, 0x01);
+    k = cl_put2(k, OP_CALL, 0x00);
+    k = cl_put(k, OP_END);
+    assert k == 108;
+    k = i64_put_fixedmul(k);
+    assert k == 120;
+    r = host_run_user(7, 101, 176, 0x10000, 0x10000);
+    assert r == 0;
+    c = i64_chk1(176, 0x10000, 13);
+    assert c == 0;
+    assert csp == 0;
+    r = host_run_user(7, 101, 177, 0xFFFF0000, 0x10000);
+    assert r == 0;
+    c = i64_chk1(177, 0xFFFF0000, 13);
+    assert c == 0;
+    assert csp == 0;
+    assert frames - f0 == 2;
+}
+
+; Law (FR-007): the operand stack bounds hold for pairs, and nothing is left half-done. i64.add
+; on an empty stack (7C 0B), i64.mul with one pair only (42 01 7E 0B), i32.wrap_i64 with one slot
+; (41 01 A7 0B) and i64.extend_i32_s on an empty stack (AC 0B) are ERR_STACK on the op's fetch
+; (1, 2, 2, 1 fetches). Eight pairs fill the 16-slot stack, so a ninth i64.const (nine 42 00
+; and an end) is ERR_STACK on the ninth fetch, and an extend on the full stack (eight 42 00 and
+; AC) is ERR_STACK on the ninth fetch. i64.shl with a pair and an i32 (42 01 41 02 86 0B, sp 3)
+; is ERR_STACK on the third fetch. Then 42 10 0B still answers (0, 16).
+test i64_pair_stack_underflow_and_overflow_trap {
+    var f0 : u32 = frames;
+    var r : u32 = 0;
+    var c : u32 = 0;
+    var k : u32 = 0;
+    k = cl_put2(101, OP_I64_ADD, OP_END);
+    r = host_run_user(2, 101, 192, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(192, ERR_STACK, 1);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x01);
+    k = cl_put2(k, OP_I64_MUL, OP_END);
+    r = host_run_user(4, 101, 193, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(193, ERR_STACK, 2);
+    assert c == 0;
+    k = cl_put2(101, OP_I32_CONST, 0x01);
+    k = cl_put2(k, OP_I32_WRAP_I64, OP_END);
+    r = host_run_user(4, 101, 194, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(194, ERR_STACK, 2);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_EXTEND_I32_S, OP_END);
+    r = host_run_user(2, 101, 195, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(195, ERR_STACK, 1);
+    assert c == 0;
+    k = 101;
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put(k, OP_END);
+    assert k == 120;
+    r = host_run_user(19, 101, 196, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(196, ERR_STACK, 9);
+    assert c == 0;
+    k = 101;
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_CONST, 0x00);
+    k = cl_put2(k, OP_I64_EXTEND_I32_S, OP_END);
+    assert k == 119;
+    r = host_run_user(18, 101, 197, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(197, ERR_STACK, 9);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x01);
+    k = cl_put2(k, OP_I32_CONST, 0x02);
+    k = cl_put2(k, OP_I64_SHL, OP_END);
+    r = host_run_user(6, 101, 198, 0, 0);
+    assert r == 0;
+    c = i64_chk_err(198, ERR_STACK, 3);
+    assert c == 0;
+    k = cl_put2(101, OP_I64_CONST, 0x10);
+    k = cl_put(k, OP_END);
+    r = host_run_user(3, 101, 199, 0, 0);
+    assert r == 0;
+    c = i64_chk(199, 0, 16, 2);
+    assert c == 0;
+    assert frames - f0 == 8;
+}
+
+; The product oracle is checked against literals before the sweep trusts it, so the sweep is not
+; one formula compared with itself. ref_fixedmul rebuilds the ten vectors of
+; i64_fixedmul_vectors from magnitudes and a two-word negation; the limb product gives
+; (0xFFFFFFFF)^2 = (0xFFFFFFFE, 1) -- limb columns 65025, 130050, 195075, 260100, 195075,
+; 130050, 65025 with carries give the bytes 01 00 00 00 FE FF FF FF -- and (1, 2) * (3, 4) =
+; (10, 8) (columns 8 at limb 0 and 2 * 3 + 1 * 4 = 10 at limb 4).
+test i64_oracle_limbs_agree_with_literals {
+    var v : u32 = 0;
+    v = ref_fixedmul(0x10000, 0x10000);
+    assert v == 0x10000;
+    v = ref_fixedmul(0x20000, 0x18000);
+    assert v == 0x30000;
+    v = ref_fixedmul(0xFFFF0000, 0x10000);
+    assert v == 0xFFFF0000;
+    v = ref_fixedmul(0xFFFF0000, 0xFFFF0000);
+    assert v == 0x10000;
+    v = ref_fixedmul(0, 0x7FFFFFFF);
+    assert v == 0;
+    v = ref_fixedmul(0xFFFFFFFF, 0xFFFFFFFF);
+    assert v == 0;
+    v = ref_fixedmul(0x8000, 0x8000);
+    assert v == 0x4000;
+    v = ref_fixedmul(0x7FFF0000, 0x20000);
+    assert v == 0xFFFE0000;
+    v = ref_fixedmul(0x80000000, 0x10000);
+    assert v == 0x80000000;
+    v = ref_fixedmul(0x7FFFFFFF, 0x7FFFFFFF);
+    assert v == 0xFFFF0000;
+    v = ref_mul64_hi(0, 0xFFFFFFFF, 0, 0xFFFFFFFF);
+    assert v == 0xFFFFFFFE;
+    v = ref_mul64_lo(0, 0xFFFFFFFF, 0, 0xFFFFFFFF);
+    assert v == 1;
+    v = ref_mul64_hi(1, 2, 3, 4);
+    assert v == 10;
+    v = ref_mul64_lo(1, 2, 3, 4);
+    assert v == 8;
+}
+
+; Law (FR-006): i64.mul against the limb oracle over all 64 ordered pairs of eight values (see
+; sw64_hi and sw64_lo: 0, 1, -1, 2^32 - 1, -2^63, 2^63 - 1, a mixed pair and 2^31 + 1). The
+; expected pair of each run is the oracle's, built from 8-bit limbs and never from the cell's
+; shift-add. 64 runs, 4 fetches each.
+test i64_mul_sweep_agrees_with_the_limb_oracle {
+    var f0 : u32 = frames;
+    var i : u32 = 0;
+    var j : u32 = 0;
+    var n : u32 = 0;
+    var bad : u32 = 0;
+    var c : u32 = 0;
+    var ahi : u32 = 0;
+    var alo : u32 = 0;
+    var bhi : u32 = 0;
+    var blo : u32 = 0;
+    var whi : u32 = 0;
+    var wlo : u32 = 0;
+    while (i < 8) {
+        j = 0;
+        while (j < 8) {
+            ahi = sw64_hi(i);
+            alo = sw64_lo(i);
+            bhi = sw64_hi(j);
+            blo = sw64_lo(j);
+            whi = ref_mul64_hi(ahi, alo, bhi, blo);
+            wlo = ref_mul64_lo(ahi, alo, bhi, blo);
+            c = i64_bin((n & 255) as u8, OP_I64_MUL, ahi, alo, bhi, blo, whi, wlo);
+            if (c != 0) { bad = bad + 1; }
+            n = n + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert bad == 0;
+    assert n == 64;
+    assert frames - f0 == 64;
 }
 
 ; --- P2 blocks: the loaded image -------------------------------------------------------------
