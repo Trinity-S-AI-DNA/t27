@@ -5,8 +5,13 @@ This note covers the tests appended to the spec, the accepted file `docs/analog/
 what has not been done. Where the numbers come from:
 
 - **Census** (252 mutants, 195 killed, 30 survived, 27 hung, 0 unviable; the 29 hung of the first census became 27 after
-  the constant-element audit of #12166, the 30 survivors being byte-identical in both) is copied from the issue. The
-  lane that wrote this note ran no `tri mutate spec`; the orchestrator runs the gate (see "Not done").
+  the constant-element audit of #12166, the 30 survivors being byte-identical in both) is copied from the issue.
+- **Gate** (`tri mutate spec --file specs/analog/linear_zoh.t27 --accepted docs/analog/mutation-accepted-linear_zoh.txt
+  --jobs 3 --timeout 45`, T27 OS pane, 14:36 to 14:49 +07 = 13 min 35 s, load average 17.98 at the start): 252 mutants,
+  223 killed (195 + the 28 test gaps), 2 survived (176 and 433, both equivalent and accepted), 27 hung (all accepted),
+  0 unviable. The gate exited 2 on one line only: accepted line 177 (`nrm / 2.0` to `nrm * 2.0`) was killed, so it was
+  removed from the accepted file and left as a comment there, with the reason. The full gate was not repeated on the
+  final accepted file; the removal cannot change a verdict, since the 29 other not-killed mutants are all accepted.
 - **Tests** are the lane's own: `tri test specs/analog/linear_zoh.t27 --t27c <compiler>` in a T27 OS pane, 12:24 +07,
   exit 0, load average 13.75 at the start, 21 GiB free. The compiler is the shared release build of the compiler (the
   lane brief calls it slightly old), not a fresh master build. Lane base: master `f81a02f36a`.
@@ -89,10 +94,14 @@ absence of mutant 256 in the survivor and hung lists). Two further pieces of evi
   `cli/tri/src/mutate.rs`), and neither `bootstrap/src` nor `cli/tri/src` contains `setRuntimeSafety`, `ReleaseFast` or
   `ReleaseSmall`. So the mutants should trap the same way.
 
-That is a reading of the code, not a gate result: the 15 group D mutants are counted killed only after the gate run. If it
-names any of them as survived, the inference failed for that line, and its commented line in the accepted file is
-activated (the file says how). They are not active by default because an accepted line whose mutant is killed fails the
-gate (`specs/tri/mutate/survivors.t27`).
+The gate run (gate 12276c, above) confirmed it: no group D mutant is among the 2 survivors or the 27 hung, so all 15
+are killed. The commented lines in the accepted file for them stay comments (an accepted line whose mutant is killed
+fails the gate, `specs/tri/mutate/survivors.t27`).
+
+Mutant 177 is a second case of the same kind as 452 and 468 below: `nrm * 2.0` drives nrm to infinity, the halving loop
+then runs until the u32 counter overflows, and whether that ends before the clock depends on load. The first gate run
+(timeout 30, high load) listed it as hung; gate 12276c (timeout 45, load 18) killed it. That is a reading of the source
+plus two verdicts, not a trace of the overflow.
 
 ## Caveats of the classification
 
@@ -117,11 +126,8 @@ gate (`specs/tri/mutate/survivors.t27`).
 
 ## Not done
 
-- The mutation gate has not been run: `tri mutate spec --file specs/analog/linear_zoh.t27 --accepted docs/analog/mutation-accepted-linear_zoh.txt`
-  (SC-001). The counts 252 / 195 / 30 / 27 / 0 were not compared with a fresh run on the unmodified spec (FR-001), so
-  neither the load at its start nor a difference is recorded here; the 28 test gaps are therefore not yet confirmed
-  killed, and the 15 group D mutants are the ones most worth reading in its output.
-- The seal of `AnalogLinearZoh` is not re-saved (`tri seals changed`, SC-006), and `.trinity/seals/` is untouched.
-- `tri coverage 'specs/analog/*.t27' --strict` has not been run (SC-007).
-- No target mutant was run against the new tests; the kills above are a hand reading.
-- No pull request is open for this branch.
+- The full gate was not repeated after line 177 left the accepted file (see "Gate" above); mutants 452 and 468 were not
+  named by the gate as hung or survived, so they stay out of the accepted file as the caveat above says.
+- The seal of `AnalogLinearZoh` is re-saved with the tests; it is checked again by `tri seals changed` after the rebase on
+  master, before the push.
+- `tri coverage 'specs/analog/*.t27' --strict` was not run here; CI runs it (SC-007).
