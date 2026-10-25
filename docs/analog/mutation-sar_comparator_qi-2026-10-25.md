@@ -16,7 +16,7 @@ accepted file; the survivor gate was then run on this tree and the seal re-saved
   The measured numbers equal the forecast made before the run (308, 262, 14, 18, 14; 32 accepted lines alive, 0 now
   killed), so nothing in this note needed correcting beyond marking them measured.
 - **Seal**: `.trinity/seals/analog_AnalogSarComparatorQi.json` was re-saved by `tri seals changed` with a master-built
-  t27c at 11:13-11:14 +07 on 2026-10-25, after the gate run (built_by `t27c-bootstrap@0.5.2+1941409a6`, tests 11 of 11);
+  t27c; the save ran at 11:13-11:14 +07 on 2026-10-25, after the gate run (built_by `t27c-bootstrap@0.5.2+1941409a6`, tests 11 of 11);
   no importer seal moved. The 11 tests were also run once on their own with `tri test` (below).
 
 Kinds in the census (before): drop-guard 5, flip-cmp 46, drop-step 43, swap-arith 193, ret-default 21.
