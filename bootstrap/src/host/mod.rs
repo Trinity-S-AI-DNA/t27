@@ -41,7 +41,6 @@ pub mod errors;
 pub mod eventlog;
 pub mod firmware;
 pub mod health;
-pub mod histogram;
 pub mod irq;
 pub mod irqrouter;
 pub mod mempool;
@@ -83,7 +82,6 @@ pub use errors::{by_domain, by_severity, lookup, CatalogEntry, ErrorCode, ErrorD
 pub use eventlog::{Event, EventKind, EventLog, EventLogStats};
 pub use firmware::{FirmwareHeader, FirmwareImage, ImageError, SectionHeader};
 pub use health::{Health, HealthMonitor, HealthSummary, Subsystem, SubsystemHealth};
-pub use histogram::{Histogram, HistogramSummary};
 pub use irq::{IrqCallback, IrqCounters, IrqDrivenDriver, IrqHandler, IrqSource, ServiceReport};
 pub use irqrouter::{IrqAction, IrqEvent, IrqRouter, IrqSource as RouterIrqSource, RouteError};
 pub use mempool::{MemBlock, MemPool, PoolError, PoolStats, BLOCK_SIZE, MAX_BLOCKS};
