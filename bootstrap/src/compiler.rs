@@ -10518,6 +10518,24 @@ impl Codegen {
                 self.write(&Self::zig_ident(&node.name));
             }
             NodeKind::ExprCall => {
+                // #5980: an import's body (`return @extern("sym");`, #8946)
+                // rendered verbatim is a two-argument Zig builtin with one
+                // argument -- the whole module refuses to compile under the
+                // reference, so even a spec's PURE tests never run
+                // (glass_window.t27: spec.zig:220, and pty_server beside it).
+                // The reference cannot reach the host across this boundary by
+                // construction; the import renders as the stub of the
+                // enclosing fn's own result type, and the pure tests run. The
+                // stub's value is deliberately useless: a verdict about host
+                // behaviour stays t27b's.
+                if node.name == "@extern" {
+                    match self.current_return_type.trim() {
+                        "" | "void" | "none" => {}
+                        t if t.contains("bool") => self.write("false"),
+                        _ => self.write("0"),
+                    }
+                    return;
+                }
                 // W572: a method call whose receiver could not be folded into
                 // the name keeps it as children[0].
                 if node.extra_kind == "method" && !node.children.is_empty() {
