@@ -1,13 +1,13 @@
 # Mutation test gaps of specs/analog/accept_sar.t27, 2026-10-25
 
 Issue #12431, part of epic #10486 (weak spots of the analog v0.1 release). This lane wrote the missing asserts, the
-accepted file and this note. The mutation gate has not been run and the seal has not been saved (section "Not done").
-Where each number comes from:
+accepted file and this note. The orchestrator then ran the mutation gate (it passed, section "The accepted file") and
+saved the seal (section "Not done"). Where each number comes from:
 
 - **Census** (281 mutants, 218 killed, 58 survived, 4 hung, 1 unviable) is the analog-loop census of the unmodified
   spec on 2026-10-25, run by `tri mutate spec`; the census spec is commit 89a747eefc (1787 lines). The output records
   neither the run time nor the t27c version. The 58 survivors were classified by reading the spec after that census.
-  No census mutant was re-run in this lane.
+  The writing of the tests re-ran no census mutant; the gate run in section "The accepted file" re-ran all 281.
 - **Tests** are measured: `tri test specs/analog/accept_sar.t27` in a T27 OS pane on this tree (base origin/master
   1b1a27d4d8 plus 209 added lines, all after line 1787, so no existing line moved): tests 26, pass 26, FAIL 0,
   vacuous passes 0 of 26.
@@ -122,18 +122,27 @@ killed, probably by an out-of-range index or an overflow trap; that is inferred,
 
 The 1 unviable mutant is 631, `[swap-arith]` in `as_clk_golden`: `f11 - (80100 + 10 * 40000)` becomes
 `f11 - (80100 - 10 * 40000)`. The constant is -319900, which `usize` cannot hold, and zig refuses it at compile time:
-the type rejects the mutant, it is not a gap.
+the type rejects the mutant, it is not a gap. The gate lists it as "UNVIABLE -- not killed" and does not count it among
+the 39 not killed.
 
 ## The accepted file
 
-`docs/analog/mutation-accepted-accept_sar.txt` has 40 entries: 7 equivalent, 27 not constructed, 1 dead line (kept), 4
-hung, 1 unviable, in the form `path:line [kind] note` that `tri mutate spec --accepted` reads, one entry per mutant (the
-accepted file of linear.t27 does the same). It has no entry for any of the 23 mutants the tests kill. Reading the
-gate's rule (an entry is checked per line and kind, and it is stale only when mutants of that line and kind ran and all
-were killed; unviable mutants are left out of that test), the unviable entry is inert today.
+`docs/analog/mutation-accepted-accept_sar.txt` has 39 entries: 7 equivalent, 27 not constructed, 1 dead line (kept), 4
+hung, in the form `path:line [kind] note` that `tri mutate spec --accepted` reads, one entry per mutant (the accepted
+file of linear.t27 does the same). It has no entry for any of the 23 mutants the tests kill, and none for the unviable
+mutant of line 631.
 
-Predicted for the gate on this tree, not measured: 241 killed, 35 survived, 4 hung, 1 unviable; the 39 not killed are
-all accepted by the file, and no accepted line is now killed.
+**Measured gate run** (`tri mutate spec --file specs/analog/accept_sar.t27 --accepted
+docs/analog/mutation-accepted-accept_sar.txt`, the master-built compiler, `--jobs 2 --timeout 45`, 2026-10-25
+22:21-22:42 +07, 20 minutes, 1-minute load 25-44): 281 mutants, 241 killed (all 241 by a failing test, 0 by an invariant
+at compile time), 35 survived, 4 hung, 1 unviable; 39 not killed, 39 accepted, 0 accepted lines now killed; "Gate
+passed", exit 0. The census had 218 killed, so the 23 new kills are exactly the 23 test gaps.
+
+**The first gate run** (21:56-22:19, same options and tree, with a 40th entry for line 631) ended with exit 2: the
+gate reported "1 accepted line(s) now killed" for `accept_sar.t27:631 [swap-arith]`. An entry for an unviable mutant
+counts as killed, not as ignored, so unviable mutants must not be listed in the accepted file; the entry was removed
+and the second run passed. An earlier reading of the gate's rule in this note (unviable entries are inert) was wrong
+for this mutant.
 
 ## Caveats (what is by hand or not established)
 
@@ -150,10 +159,9 @@ all accepted by the file, and no accepted line is now killed.
 
 ## Not done
 
-- The mutation gate was not run: `tri mutate spec --file specs/analog/accept_sar.t27 --accepted
-  docs/analog/mutation-accepted-accept_sar.txt` is the orchestrator's step.
-- The seal was not saved (`.trinity/seals/` is untouched); the new tests change the test count of the module.
-- `tri coverage --strict` and the CI docs check were not run in this lane.
+- The seal of `analog_AnalogAcceptSar` was saved with the master-built compiler after the gate passed (save, verify and
+  `tri seals changed` all exit 0); the new tests change the test count of the module.
+- `tri coverage --strict` and the CI docs check were not run in this lane; CI decides.
 - 651 keep or delete is the owner's call.
-- The 4 hung lines and the unviable line were not re-run; they come from the census output.
-- No PR was opened.
+- The 27 "not constructed" survivors are accepted on reading the code, not on a constructed input; the gate only
+  confirms that they survive.
