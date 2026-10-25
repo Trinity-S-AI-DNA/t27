@@ -212,6 +212,6 @@ The page is a single HTML file whose data sits in four arrays at the top of its 
 - 2026-10-25 A `<ci-monitor-event>` can repeat the reds of an old head. Compare the head sha, the merge state and the fix PRs with the event before acting on it. (#12474)
 - 2026-10-25 The dashboard-bot comment on a PR is not a review: do not cite it as one, and read the PR's reviews (gh pr view N --json reviews) instead. (#12474)
 - 2026-10-25 GitHub Actions queued required checks for about 55 minutes: required checks decide a merge, other reds are read in their logs and tied to an issue and a fix PR, and the basis comment is posted before the merge. (#12474)
-- 2026-10-25 A seal can be re-saved in a second pane while a gate runs in the first, so do not wait for the gate to end before the seal step. (#12474)
+- 2026-10-25 A seal can be re-saved in a second pane while a gate runs in the first, so the seal of another lane's spec need not wait for the gate to end; the seal of the gated spec itself still waits until its gate has passed. (#12474)
 - 2026-10-25 BSD grep has no `-P`, and an alternation with an anchor needs `-E`; a token such as "766 x2" in an accepted note is matched literally. (#12474)
 - 2026-10-25 `gh issue create --label analog` fails because the label does not exist: create the issue without it. The lane tree lane-12137 no longer exists, so do not brief an agent to work in it. (#12474)
