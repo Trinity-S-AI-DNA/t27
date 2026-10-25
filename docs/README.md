@@ -49,6 +49,7 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/T27-UNIFIED-AXIOM-THEOREM-FORMAT-SYSTEM.md`](nona-03-manifest/T27-UNIFIED-AXIOM-THEOREM-FORMAT-SYSTEM.md) | Axioms/theorems/catalog + `FORMAT-SPEC-001` / `axiom_system.json` |
 | [`nona-03-manifest/CLAIM_TIERS.md`](nona-03-manifest/CLAIM_TIERS.md) | Policy: `claim_tier` for math/physics |
 | [`nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md`](nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md) | t27o on the roadmap repositories (coverage, refusal kinds, timing), its field and ten weaknesses (#10522) |
+| [`nona-03-manifest/VIZ-DISTILL-GRAPH.md`](nona-03-manifest/VIZ-DISTILL-GRAPH.md) | The spec corpus as one interactive Distill-style graph; materialise `build/viz/spec-graph.html` (#12218) |
 
 ## External Projects
 
