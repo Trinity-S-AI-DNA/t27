@@ -2,19 +2,24 @@
 
 Issue #12229, part of epic #10486 (weak spots of the analog v0.1 release). This lane wrote the missing asserts of
 groups A and B and the accepted file; groups C, D, E and the dead lines are left to the second issue #12230. The
-mutation gate was not run on this tree and the seal was not re-saved: both are the orchestrator's next steps. Where each
-number comes from:
+analog loop then ran the mutation gate on this tree (it passed, see "After" below) and re-saved the seal. Where
+each number comes from:
 
 - **Before** (336 mutants, 266 killed, 40 survived, 17 hung, 13 unviable) is the analog-loop census of the unmodified
   spec, 10:25-10:39 +07, exit 0, 14 min 13 s, `tri mutate spec` 3 mutants at a time with zig `-j2` each, t27c 0.5.2
   ("build 0 commit unknown"), tree at 035df5ce60. Kinds: drop-guard 20, flip-cmp 66, swap-logic 3, drop-step 34,
   swap-arith 181, ret-default 32. The spec in this lane's tree is byte-identical to master's, and the 40 survivor lines
-  below were re-read against it in this lane; no mutant was re-run, and the first step of FR-001 (one gate run on the
-  unmodified spec with the master-built t27c) was not done, so there is no second count to set beside the census.
-- **After** is a forecast, not a measurement: if the 12 mutants of groups A and B are killed, 278 killed, 28 survived
-  (17 equivalent, 11 pending for #12230), 17 hung, 13 unviable (278 + 28 + 17 + 13 = 336), and the gate sees 45 not
-  killed mutants against 41 accepted entries (15 + 9 + 17) that name all 45.
-- **Tests**: `tri test specs/analog/sar_comparator_q.t27 --t27c /Users/playra/t27-build/target/release/t27c` in a T27 OS
+  below were re-read against it in this lane; the first step of FR-001 (one gate run on the unmodified spec with the
+  master-built compiler) was not done, so the census is the only count of the unmodified spec.
+- **After** (measured): 336 mutants, 278 killed (all 278 by a failing test, 0 by an invariant at compile time), 28
+  survived, 17 hung, 13 unviable (278 + 28 + 17 + 13 = 336). Run: `tri mutate spec --file
+  specs/analog/sar_comparator_q.t27 --accepted docs/analog/mutation-accepted-sar_comparator_q.txt --jobs 3 --timeout 30`
+  with a master-built compiler (the build that also re-saved the seal), in a T27 OS pane, 11:49:10-12:02:56 +07 (13 min
+  46 s), 1-min load 10.5 at the start, base `368ce03b6d`. The gate printed "45 not killed (28 survived, 17 hung), 45
+  accepted by the file; 0 accepted line(s) now killed" and "Gate passed", exit 0. The 28 survivors are exactly the
+  lines the table below marks equivalent (17), pending test gap (7) or dead line (4); none of the lines of groups A and
+  B (530, 533, 549, 555, 561, 562, 564) is among them. The forecast written before the run was the same four numbers.
+- **Tests**: `tri test specs/analog/sar_comparator_q.t27` with the old 0.5.2 binary in a T27 OS
   pane, last run 11:46 +07 (after the final comment edit; the 11:41 run before it read the same): 12 tests (8 before), 12 pass, 0 fail, **0 vacuous passes of 12**, exit 0.
   The same t27c prints the same version text as the census's ("t27c 0.5.2", "build 0 commit unknown"); whether the build
   is the same cannot be told from that text.
@@ -92,7 +97,7 @@ group B.
 `sq_t_res` on the long run is **2664251** (650.452 steps, 1040.72 ps at 1.6 ps a step), read in the lab on the spec
 as it stands (the functions untouched, only tests appended). How: the existing window `tr > 1040.6`, `tr < 1040.8` is
 the words 2663936 to 2664448; ten temporary tests, not committed, each asserted one bit (0 to 9) of `sq_t_res - 2663936`;
-run with `tri test specs/analog/sar_comparator_q.t27 --t27c /Users/playra/t27-build/target/release/t27c` in a T27 OS
+run with `tri test specs/analog/sar_comparator_q.t27` and the old 0.5.2 binary in a T27 OS
 pane before the final run, bits 0, 1, 3, 4, 5, 8 passed and bits 2, 6, 7, 9 failed, giving 315, so 2663936 + 315 =
 2664251; one temporary test asserted that the word of the first 700 steps equals the word of the full run, and it
 passed. The pinned `assert_eq(tl, 2664251)` then passed on the full run (the final run above), which also rules out
@@ -118,21 +123,18 @@ differs from the issue's "58 entries (17 equivalent, 11 pending, 17 hung, 13 unv
 - The 13 unviable mutants (8 ret-default of functions with no return value, answered `zig: error: not yet implemented`;
   5 swap-arith at lines 499, 500, 502, 503, 544 whose `SQ_OFF - SC_VCM` is -4194304, which u32 cannot hold) are counted
   nowhere by the gate, so they are comment lines with a one-line reason, as in the accepted file of
-  `sar_comparator_qi` (whose gate run passed with the same arrangement). An entry for them could only matter in one
-  way: the gate exits 2 on an accepted line whose viable mutants are all killed, and this lane did not run the gate to
-  see which of those lines carry a viable mutant of the same kind. In `sar_comparator_qi` four of the five did.
+  `sar_comparator_qi` (whose gate run passed with the same arrangement). The gate run above passed with this file as
+  it stands, so the arrangement holds for this spec too.
 
 ## Not done, not claimed
 
-- The mutation gate was not run (`tri mutate spec --file specs/analog/sar_comparator_q.t27 --accepted
-  docs/analog/mutation-accepted-sar_comparator_q.txt --t27c <master-built t27c> --jobs 3 --timeout 30`), so SC-001 and
-  the after-counts are unmeasured; the 12 kills are shown by reading each mutated line against its assert. If the gate
-  says a mutant of group A or B survived, the assert is wrong and is to be fixed from the function body, not from the
-  mutant.
-- The seal of `AnalogSarComparatorQ` was not re-saved and `.trinity/seals/` was not touched (SC-004 is the
-  orchestrator's). `tri coverage --strict` was not run locally; CI runs it.
-- The census was not repeated with the master-built t27c (FR-001); the survivor lines were re-read against the spec in
-  this tree and the spec is byte-identical to master's, but the counts are the census's.
+- The tool names no killing test, so "killed by test N, assert x" in the table is a reading of the mutated line
+  against the assert; what the gate shows is that the 12 mutants of groups A and B are no longer among the survivors
+  (40 survivors before, 28 after, and none of the 12 lines is listed).
+- The seal of `AnalogSarComparatorQ` was re-saved by the loop with the master-built compiler after the branch was
+  brought up to master; `tri coverage --strict` was not run locally, CI runs it.
+- The census was not repeated with the master-built compiler on the unmodified spec (FR-001); the before-counts are the
+  census's, the after-counts are the gate's.
 - The 17 equivalent survivors are classified by reading the arithmetic and the helpers (`sc_pack(0, .)` is 0,
   `sc_sadd(q, 0)` is q), not proved equivalent by a tool; the 17 hung are classified by construction (the tool reports
   each as outliving `--timeout`, which is consistent with an endless loop but was not shown by a run that was let to
