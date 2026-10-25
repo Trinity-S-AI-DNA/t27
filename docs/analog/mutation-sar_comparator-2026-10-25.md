@@ -2,8 +2,8 @@
 
 Issue #12432, census 4 of 6 on issue #12241, part of epic #10486 (weak spots of the analog v0.1 release). This lane
 wrote the missing asserts of groups A to M and the accepted file. Groups N and O and line 522 need a figure from the
-lab and are left open. The mutation gate was not run on this tree and the seal was not saved: the analog loop does
-both. Where each number comes from:
+lab: they are deferred to issue #12512 and sit in the accepted file as "deferred test gap" entries. The analog loop ran
+the mutation gate on the committed tree and re-saved the seal (see "After"). Where each number comes from:
 
 - **Before** (868 mutants, 659 killed, 98 survived, 78 hung, 33 unviable) is the analog-loop census of the unmodified
   spec, 18:57-19:27 +07, exit 0, 29 min 32 s, load 14.25 15.99 15.42 at the start, t27c 0.5.2. Kinds: drop-guard,
@@ -12,7 +12,15 @@ both. Where each number comes from:
 - **Tests**: `tri test specs/analog/sar_comparator.t27 --t27c <release t27c>` in a T27 OS pane, 21:39-21:40 +07 (about
   one minute), 1-min load 27.4 at the start: 33 tests (20 before, 13 new), 33 pass, 0 fail, **0 vacuous passes of 33**,
   exit 0. Every new test executed runtime asserts: A 8, B 7, C 2, D 5, E 5, F 8, G 8, H 8, I 2, J 5, K 1, L 3, M 16.
-- **After**: not measured. The census was not repeated and the gate was not run; see "Not done".
+- **After** (the gate on the committed tree, head bde919952c, before the deferred block was added): 868 mutants, 707
+  killed, 49 survived, 79 hung, 33 unviable; 128 not killed, 121 accepted by the entries of the file, 0 accepted lines
+  now killed, 7 not accepted (six keys, the seven deferred mutants below). `tri mutate spec ... --jobs 2 --timeout 45`
+  in a T27 OS pane, 2026-10-25 23:40 to 2026-10-26 00:36 +07 (about 56 min), 1-min load 9.07 at the start (10.83 and
+  11.70 for 5 and 15 min), exit 2 because of the 7 not accepted. The six deferred entries were added after that run, so
+  the run with them in place was not repeated; exit 0 follows from the run's own list (the 7 are exactly the 6 keys now
+  accepted as deferred) and is inferred, not measured. The census went 659 -> 707 killed and 98 -> 49 survivors.
+- **Seal**: `AnalogSarComparator` re-saved with the master-built t27c (exit 0, verify 0); only
+  `.trinity/seals/analog_AnalogSarComparator.json` changed.
 
 ## The 98 survivors, and what became of each
 
@@ -32,13 +40,15 @@ both. Where each number comes from:
 | 422, 425 `jd = jp + jn` | `sc_resid_at` read directly | test gap, group K | killed by the residual with a non-zero J- (reading) |
 | 389, 391 x2 | `sc_stamp_cap` into a non-empty register | test gap, group L | killed by G+ 1000, J+ 5000 (reading) |
 | 544, 933 | back substitution on a dirty x | test gap, group M | killed by x pre-filled with 5 (reading) |
-| 1396, 1397, 1404 | `sc_headroom` with swap = true | test gap, group N | **not done**: needs a lab figure |
-| 1291, 1322 x2 | loose windows of the transposed control and `sc_gap_g` | test gap, group O | **not done**: needs lab windows |
-| 522 | `k < 9` to `k <= 9` in `sc_eliminate` | not decided | **not done**: needs a lab trace |
+| 1396, 1397, 1404 | `sc_headroom` with swap = true | test gap, group N | **deferred** (issue 12512): needs a lab figure; survived the gate |
+| 1291, 1322 x2 | loose windows of the transposed control and `sc_gap_g` | test gap, group O | **deferred** (issue 12512): needs lab windows; survived the gate |
+| 522 | `k < 9` to `k <= 9` in `sc_eliminate` | not decided | **deferred** (issue 12512): needs a lab trace; survived the gate |
 
-Totals: 42 equivalent + 49 test gaps of groups A to M (killed by reading) + 6 test gaps of groups N and O (open) + 1 not
-decided = 98. The tool names no killing test, so "killed by" is a reading of the mutated line against the assert, not a
-measurement; each expected word is hand arithmetic from the arrays the test builds, traced against the function bodies,
+Totals: 42 equivalent + 49 test gaps of groups A to M + 6 test gaps of groups N and O (deferred) + 1 not decided
+(deferred) = 98. The gate run after the tests measured 49 survivors: 42 equivalent plus the 7 deferred mutants, so the 49
+test gaps of groups A to M are measured as killed (the survivor count dropped from 98 to 49 and the gate lists no other
+line). The tool still names no killing test, so the per-line "killed by" column is a reading of the mutated line against
+the assert; each expected word is hand arithmetic from the arrays the test builds, traced against the function bodies,
 and the unmutated tree passes all of them.
 
 The 78 hung are all drop-step mutants of loop counters, `x = x + 1` turned into `x = x`, so each loop never ends. They are
@@ -78,8 +88,9 @@ nothing. The tests are appended after the last existing test, so no line above m
 
 ## The accepted file
 
-`docs/analog/mutation-accepted-sar_comparator.txt` has 118 entries: 39 equivalent (naming the 42 equivalent mutants) and
-79 hung. It is read per line and kind (`cli/tri/src/mutate.rs`, `gate_counts`; `specs/tri/mutate/survivors.t27`), which
+`docs/analog/mutation-accepted-sar_comparator.txt` has 124 entries: 39 equivalent (naming the 42 equivalent mutants), 79
+hung and 6 deferred test gaps (issue 12512, naming the 7 deferred mutants; they keep the gate green without claiming
+equivalence, as in `mutation-accepted-sar_kick_net.txt`). It is read per line and kind (`cli/tri/src/mutate.rs`, `gate_counts`; `specs/tri/mutate/survivors.t27`), which
 has three consequences, each written in the header of the file:
 
 - One entry covers every mutant of its line and kind: 782 (2 mutants) and 1070 flip-cmp (3) are one entry each.
@@ -93,12 +104,15 @@ The 33 unviable mutants are counted nowhere by the gate, so they are comment lin
 
 ## Not done, not claimed
 
-- The mutation gate was not run on this tree and the census was not repeated, so "killed" for groups A to M is a reading,
-  and the after-counts are not known. The seal of `AnalogSarComparator` was not saved (`.trinity/seals/` is untouched).
+- The gate was run once, on the committed tree before the deferred block was added (see "After"); the run with the
+  deferred block in place was not repeated, so exit 0 of the final tree is inferred from that run's list, not measured.
+  The census itself was not repeated; the gate run is the only measurement of the new kill counts.
+- All seven open mutants are tracked in issue #12512 and listed as "deferred test gap (12512)" entries; each needs a lab
+  figure, and none was guessed:
 - **Line 522** (`k < 9` to `k <= 9` in the row update of `sc_eliminate`) is not decided: it needs a lab trace of the words at
-  the extra pass and, if a matrix with a non-zero column-0 residue exists, an assert; otherwise an accepted entry.
+  the extra pass and, if a matrix with a non-zero column-0 residue exists, an assert; otherwise an equivalent entry.
 - **Group N** (1396, 1397, 1404, `sc_headroom` with swap = true): the figure of `sc_headroom(&t, SC_H2, true, SC_K,
-  &SC_DV_M)` is a lab measurement and was not guessed. Line 1404 (the last step dropped) goes to the accepted file if the
+  &SC_DV_M)` is a lab measurement and was not guessed. Line 1404 (the last step dropped) goes to the equivalent block if the
   lab finds no stimulus that puts the maximum in step 140.
 - **Group O** (1291, 1322 x2): the two-sided windows for the `wrong` figure of the transposed control and the `wg` figure of
   `sc_gap_g` come from lab values and were not guessed. These mutants stay survivors until then.
@@ -106,6 +120,6 @@ The 33 unviable mutants are counted nowhere by the gate, so they are comment lin
   reason (symmetric conductance on the same four entries at vd = vs) is an inference from the stamp. The 79 hung are
   classified by construction (the tool reports each as outliving `--timeout`, which is consistent with an endless loop
   but was not shown by a run that was let to finish).
-- 914 [drop-step] was a survivor and becomes a hung mutant once the group A test runs the swap branch; that is a
-  forecast from reading, not a measurement.
+- 914 [drop-step] was a survivor and became a hung mutant once the group A test runs the swap branch; the gate counted
+  79 hung against 78 in the census, which is consistent with that reading (the single mutant is not named by the tool).
 - Only `specs/analog/sar_comparator.t27` was touched among the specs.
