@@ -1397,7 +1397,7 @@ fn main() -> Result<()> {
         Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
         Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
-        Commands::Preflight => std::process::exit(cmd_preflight() as i32),
+        Commands::Preflight => { let mut wg = pf::GATE_COUNT; std::process::exit(pf::pf_exit_code(pf_run(&mut wg)) as i32) },
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
@@ -1523,19 +1523,18 @@ fn cmd_serve(addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
-/// `tri preflight` (#11783): the nine local gates of specs/t27os/labs.t27 as one command before a push. Every rule -- which gate, which command, the timeout ceiling, the verdict, the exit -- is specs/tri/preflight/preflight.t27; this glue spawns `sh -c` per gate, kills it at the spec's ceiling (a kill is no-verdict, never ok), prints the spec's one line per gate, and refuses on anything but ok (exit 1 red, exit 2 no verdict).
-fn cmd_preflight() -> u8 {
+/// The preflight runner (#11783): the nine local gates of specs/t27os/labs.t27 once, one line per gate, the summary line printed, the run's worst verdict returned and `wg` set to the gate a refusal names. `tri preflight` and the push path (tri land step 28) share it: one table, one runner, no push-only gate; every rule is specs/tri/preflight/preflight.t27.
+fn pf_run(wg: &mut u8) -> u8 {
     let (mut worst, mut line) = (pf::PF_OK, vec![0u8; 64]);
     for i in 0..pf::GATE_COUNT {
         let x = match Command::new("sh").arg("-c").arg(pf::pf_command(i)).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() { Ok(mut c) => { let dl = std::time::Instant::now() + std::time::Duration::from_secs(pf::pf_timeout(i) as u64); loop { match c.try_wait() { Ok(Some(s)) => break s.code().unwrap_or(255) as u8, Ok(None) if std::time::Instant::now() >= dl => { let _ = c.kill(); let _ = c.wait(); break 255; } Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)), Err(_) => break 255 } } } Err(_) => 255 };
         let n = pf::pf_line(&mut line, 64, i, x);
         println!("{}", String::from_utf8_lossy(&line[..n]));
-        if pf::pf_refuses(pf::pf_classify(x)) { eprintln!("  red gate: {} | inspect: {}", pf::pf_name(i), pf::pf_command(i)); }
+        if pf::pf_refuses(pf::pf_classify(x)) { if pf::pf_worse(worst, pf::pf_classify(x)) != worst { *wg = i; } eprintln!("  red gate: {} | inspect: {}", pf::pf_name(i), pf::pf_command(i)); }
         worst = pf::pf_worse(worst, pf::pf_classify(x));
     }
     if worst == pf::PF_OK { println!("tri preflight: {}/{} gates ok, push may go", pf::GATE_COUNT, pf::GATE_COUNT); } else { eprintln!("tri preflight: REFUSED ({}) -- fix the red gate above, re-run `tri preflight`, then push", if worst == pf::PF_RED { "a gate is RED" } else { "a gate gave no verdict" }); }
-    pf::pf_exit_code(worst)
+    worst
 }
 
 fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bool) -> Result<u8> {
@@ -1551,6 +1550,7 @@ fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bo
         at = ((s / land::SLOT) as u8, s % land::SLOT);
         let n = land::step_argv(r, ev, at.0, at.1, &mut buf);
         anyhow::ensure!(n > 0, "tri land: step {} does not fit", land::step_name(at.0));
+        if at.0 == land::L_PUSH { let mut wg = pf::GATE_COUNT; let w = pf_run(&mut wg); if pf::pf_refuses(w) { let m = land::step_argv(r, ev, land::L_CLEAN, 0, &mut buf); if m > 0 { let cl = argv(&buf[..m]); let _ = Command::new(&cl[0]).args(&cl[1..]).output(); } let mut o = vec![0u8; 256]; let k = pf::pf_push_refusal(&mut o, 256, w, wg); eprintln!("{}", String::from_utf8_lossy(&o[..k])); return Ok(pf::pf_exit_code(w)); } }
         let a = argv(&buf[..n]);
         let (mut x, mut text, mut tries) = (0u64, String::new(), 0u64);
         while tries <= land::RETRIES { (x, text) = match Command::new(&a[0]).args(&a[1..]).current_dir(if land::cwd_scratch(r, at.0) { r.scratch } else { "." }).output() { Ok(o) => (o.status.code().unwrap_or(255) as u64, format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))), Err(e) => (127, e.to_string()) }; tries += 1; if !land::transient(at.0, x, leak(text.clone())) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
