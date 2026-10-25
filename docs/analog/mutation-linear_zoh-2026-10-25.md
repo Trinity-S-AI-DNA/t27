@@ -131,3 +131,5 @@ plus two verdicts, not a trace of the overflow.
 - The seal of `AnalogLinearZoh` is re-saved with the tests; it is checked again by `tri seals changed` after the rebase on
   master, before the push.
 - `tri coverage 'specs/analog/*.t27' --strict` was not run here; CI runs it (SC-007).
+- The spec diff is a pure append (218 lines added, 0 removed, one hunk at the end), so no function body changed. The four
+  generated-code hashes in the seal still move, because the generated output contains the tests.
